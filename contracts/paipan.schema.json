@@ -8,7 +8,7 @@
       "required": ["case_id", "op", "input"],
       "properties": {
         "case_id": { "type": "string" },
-        "op": { "type": "string", "enum": ["year_pillar"] },
+        "op": { "type": "string", "enum": ["year_pillar", "four_pillars"] },
         "input": { "type": "object" }
       },
       "additionalProperties": false
@@ -40,6 +40,56 @@
         "case_id": { "type": ["string", "null"] },
         "ok": { "const": false },
         "error": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "four_pillars_input": {
+      "type": "object",
+      "required": ["t_unix", "lichun_unix", "local", "month_ctx", "zi_hour_mode"],
+      "properties": {
+        "t_unix": { "type": "integer" },
+        "lichun_unix": { "type": "integer" },
+        "local": {
+          "type": "object",
+          "required": ["y", "m", "d", "hh", "mm", "ss"],
+          "properties": {
+            "y": { "type": "integer", "minimum": 1 },
+            "m": { "type": "integer" }, "d": { "type": "integer" },
+            "hh": { "type": "integer" }, "mm": { "type": "integer" }, "ss": { "type": "integer" }
+          },
+          "additionalProperties": false
+        },
+        "month_ctx": {
+          "type": "object",
+          "required": ["jie_seq", "jie_unix", "next_jie_unix"],
+          "properties": {
+            "jie_seq": { "type": "integer", "minimum": 0, "maximum": 11 },
+            "jie_unix": { "type": "integer" },
+            "next_jie_unix": { "type": "integer" }
+          },
+          "additionalProperties": false
+        },
+        "zi_hour_mode": { "type": "string", "enum": ["split", "unified"] }
+      },
+      "additionalProperties": false
+    },
+    "pillar": {
+      "type": "object",
+      "required": ["stem", "branch", "ganzhi"],
+      "properties": {
+        "stem": { "type": "string" }, "branch": { "type": "string" }, "ganzhi": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "four_pillars_output": {
+      "type": "object",
+      "required": ["bazi_year", "year", "month", "day", "hour"],
+      "properties": {
+        "bazi_year": { "type": "integer" },
+        "year": { "$ref": "#/$defs/pillar" },
+        "month": { "$ref": "#/$defs/pillar" },
+        "day": { "$ref": "#/$defs/pillar" },
+        "hour": { "$ref": "#/$defs/pillar" }
       },
       "additionalProperties": false
     },
