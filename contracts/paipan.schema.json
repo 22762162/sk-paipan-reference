@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sanjian/contracts/paipan.schema.json",
+  "title": "排盘对拍 I/O 协议(JSONL 逐行;paipan-spec 附录 A)",
+  "$defs": {
+    "request": {
+      "type": "object",
+      "required": ["case_id", "op", "input"],
+      "properties": {
+        "case_id": { "type": "string" },
+        "op": { "type": "string", "enum": ["year_pillar"] },
+        "input": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "year_pillar_input": {
+      "type": "object",
+      "required": ["civil_year", "t_unix", "lichun_unix"],
+      "properties": {
+        "civil_year": { "type": "integer" },
+        "t_unix": { "type": "integer" },
+        "lichun_unix": { "type": "integer" }
+      },
+      "additionalProperties": false
+    },
+    "response_ok": {
+      "type": "object",
+      "required": ["case_id", "ok", "output"],
+      "properties": {
+        "case_id": { "type": "string" },
+        "ok": { "const": true },
+        "output": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "response_err": {
+      "type": "object",
+      "required": ["case_id", "ok", "error"],
+      "properties": {
+        "case_id": { "type": ["string", "null"] },
+        "ok": { "const": false },
+        "error": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "year_pillar_output": {
+      "type": "object",
+      "required": ["bazi_year", "stem", "branch", "ganzhi"],
+      "properties": {
+        "bazi_year": { "type": "integer" },
+        "stem": { "type": "string", "minLength": 1, "maxLength": 3 },
+        "branch": { "type": "string", "minLength": 1, "maxLength": 3 },
+        "ganzhi": { "type": "string", "minLength": 2, "maxLength": 6 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/request" },
+    { "$ref": "#/$defs/response_ok" },
+    { "$ref": "#/$defs/response_err" }
+  ],
+  "$comment": "编码 UTF-8;输出字段顺序不作要求,比较按字段语义严格相等;未知 op / 缺字段 / 类型不符(含浮点、布尔混入整型字段)→ ok:false 且进程不得崩溃。op 枚举随规格版本扩充。"
+}

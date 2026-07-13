@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sanjian/contracts/run-manifest.schema.json",
+  "title": "模型调用落盘清单(run manifest,dev-plan V2.1 3.3,单人精简版)",
+  "type": "object",
+  "required": [
+    "run_id", "timestamp", "provider", "model_id",
+    "input_hash", "system_prompt_hash", "sampling_parameters",
+    "output_schema_version", "response_hash"
+  ],
+  "properties": {
+    "run_id": { "type": "string" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "provider": { "type": "string" },
+    "model_id": { "type": "string" },
+    "model_release": { "type": ["string", "null"], "$comment": "服务端版本信息,能取到什么记什么" },
+    "input_hash": { "type": "string" },
+    "system_prompt_hash": { "type": "string" },
+    "prompt_bundle_hash": { "type": ["string", "null"] },
+    "rulebase_commit": { "type": ["string", "null"] },
+    "retrieval_manifest": {
+      "type": "array", "items": { "type": "string" },
+      "$comment": "检索到的 chunk id 列表"
+    },
+    "sampling_parameters": {
+      "type": "object",
+      "$comment": "温度、种子等,普通字段而非复现保证"
+    },
+    "output_schema_version": { "type": "string" },
+    "response_hash": { "type": "string" },
+    "token_usage": { "type": ["object", "null"] },
+    "cost": { "type": ["number", "null"], "$comment": "周度汇总用(成本熔断,dev-plan 9.1)" }
+  },
+  "additionalProperties": false
+}

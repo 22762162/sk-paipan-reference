@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sanjian/contracts/claim.schema.json",
+  "title": "运行态论断结构(claim,dev-plan V2.1 3.4)",
+  "type": "object",
+  "required": ["claim_type", "claim", "rule_ids", "source_ids", "confidence"],
+  "properties": {
+    "claim_type": {
+      "type": "string",
+      "enum": ["computed_fact", "school_rule", "model_synthesis", "reflective_prompt"],
+      "$comment": "分层验收:computed_fact 可讨论计算正确性;其余只讨论规则忠实度、一致性与来源"
+    },
+    "claim": { "type": "string", "minLength": 1 },
+    "rule_ids": { "type": "array", "items": { "type": "string" } },
+    "source_ids": { "type": "array", "items": { "type": "string" } },
+    "confidence": { "type": "string", "enum": ["high", "medium", "low", "abstain"] },
+    "disagreement": { "type": ["string", "null"] },
+    "limitations": { "type": ["string", "null"] }
+  },
+  "additionalProperties": false,
+  "$comment": "无规则依据的论断(rule_ids 与 source_ids 均空且 claim_type != reflective_prompt)计入 unsupported_claim_rate;鼓励 abstain 而非编造"
+}
