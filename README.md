@@ -7,7 +7,7 @@
 
 - 本仓库**不挂载主仓库、不持有主仓库凭据**;实现的唯一依据是本仓库携带的 `contracts/` 镜像。
 - 正式流程中由 **Codex 独立会话盲写**(任务说明:`TASK.md`);触碰过主仓库 L1 代码的会话不得承接本仓库工作。
-- ⚠️ **当前内容为第一周端到端彩排的临时占位实现**(不满足异源独立性)。四柱扩展前须由 Codex 按 `TASK.md` 整体盲写替换,本段声明随之删除。
+- `paipan_ref/` 已由独立 Codex 会话仅依据 `contracts/paipan-spec.md` v0.2 与 `contracts/schemas/paipan.schema.json` 盲写重构；现实现 `year_pillar`、`four_pillars` 全部 YP/LT/MP/DP/HP 条款及附录 A JSONL 协议，并以合成注入值覆盖各判界三连测。
 
 ## 约束
 
