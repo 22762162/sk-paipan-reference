@@ -1,0 +1,5 @@
+# 契约钉版锁:contracts/ 为 sk-contracts 在下述 tag 的精确副本(勿手改;同步由主仓维护者执行)。
+repo: https://github.com/22762162/sk-contracts
+contract_version: v0.2.0
+contract_commit: bf59b09c50dabb4975f8f905b624bbaa013487c9
+contract_content_hash: 3b6ce31e2e5f393e4cf2b6fb69ee8606053675617e44ca0140149c11099e61dc

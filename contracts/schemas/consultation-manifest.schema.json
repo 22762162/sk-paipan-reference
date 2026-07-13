@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sanjian/contracts/consultation-manifest.schema.json",
+  "title": "会诊清单(每场会诊落盘,DESIGN V3.0 §3.3)",
+  "type": "object",
+  "required": [
+    "consultation_id", "protocol_version", "case_id", "case_input_hash",
+    "experiment_arm", "model_school_assignments", "evidence_pack",
+    "randomization", "outputs"
+  ],
+  "properties": {
+    "consultation_id": { "type": "string" },
+    "protocol_version": { "type": "string" },
+    "case_id": { "type": "string" },
+    "case_input_hash": { "type": "string" },
+    "experiment_arm": { "type": "string", "enum": ["S1", "P3", "D3", "D3J"] },
+    "model_school_assignments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["role", "provider", "resolved_model_id", "school", "run_ids"],
+        "properties": {
+          "role": { "type": "string", "enum": ["debater_a", "debater_b", "debater_c"] },
+          "provider": { "type": "string" },
+          "resolved_model_id": { "type": "string" },
+          "reasoning_mode": { "type": ["string", "null"] },
+          "school": { "type": "string" },
+          "run_ids": { "type": "array", "items": { "type": "string" } }
+        },
+        "additionalProperties": false
+      }
+    },
+    "judge": {
+      "type": ["object", "null"],
+      "properties": {
+        "provider": { "type": "string" },
+        "resolved_model_id": { "type": "string" },
+        "run_id": { "type": "string" },
+        "candidate_order_seed": { "type": ["string", "integer"] }
+      },
+      "additionalProperties": false,
+      "$comment": "S1/P3/D3 臂无 judge → null"
+    },
+    "evidence_pack": {
+      "type": "object",
+      "required": ["version", "content_hash"],
+      "properties": {
+        "version": { "type": "string" },
+        "content_hash": { "type": "string" },
+        "retrieved_chunk_hashes": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "randomization": {
+      "type": "object",
+      "properties": {
+        "assignment_seed": { "type": ["string", "integer"] },
+        "candidate_order_seed": { "type": ["string", "integer"] },
+        "decoy_selection_seed": { "type": ["string", "integer", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "outputs": {
+      "type": "object",
+      "required": ["final_claim_set_hash", "verdict"],
+      "properties": {
+        "final_claim_set_hash": { "type": "string" },
+        "verdict": { "type": "string", "enum": ["A", "B", "C", "partial", "unresolved"] },
+        "unresolved_claim_ids": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "evaluation": {
+      "type": ["object", "null"],
+      "properties": {
+        "dataset_version": { "type": "string" },
+        "evaluator_version": { "type": "string" },
+        "human_rating_lock_timestamp": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
