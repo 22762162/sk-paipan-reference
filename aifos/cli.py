@@ -207,6 +207,12 @@ def _cmd_stats(app):
         print("(无额度限制的 Provider)")
     for row in rows:
         print(f"{row['provider']:<12} 已用 {row['used']}/{row['quota_limit']}")
+    for name, provider in app.router.providers.items():
+        if provider.enabled and hasattr(provider, "credit"):
+            try:
+                print(f"{name} 实时余额: {provider.credit()}")
+            except Exception as exc:
+                print(f"{name} 余额查询失败: {exc}")
     return 0
 
 

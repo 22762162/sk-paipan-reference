@@ -49,15 +49,57 @@ video: 即梦CLI(订阅额度内) → API 备用 → mock
 image: Codex → API 备用 → mock
 ```
 
-- **即梦 CLI 优先使用订阅额度**:`quota` 表计数,额度耗尽自动降级 API;
+- **即梦 CLI 优先使用订阅额度**:`quota` 表本地计数 + `dreamina
+  user_credit` 实时余额(`aifos stats` 展示;配 `min_credit` 可在余额不足
+  时自动降级),额度耗尽自动回退 API;
 - **外部 Provider 默认关闭**(`enabled: false`),未接入真实 CLI/API 时
   由内置 **Mock Provider** 确定性生成占位产物,保证全流程离线可跑、可测;
 - 接入真实产线:`workspace/config.json` 中把对应 Provider `enabled` 置
   `true` 并配置 `command`(CLI)或 `endpoint`/`api_key`(API)。
 
-CLI Provider 协议:stdin 传入一行 JSON
+通用 CLI Provider 协议:stdin 传入一行 JSON
 `{"capability", "payload", "out_dir"}`,stdout 返回
 `{"ok", "data", "uri", "cost"}`。
+
+### 即梦官方 CLI(dreamina)原生接入
+
+`jimeng` Provider(`production/dreamina.py`)直接调用即梦官方 CLI,
+无需适配脚本。视频阶段自动执行(与即梦 CLI 规范对齐):
+
+```bash
+dreamina frames2video \
+  --first=<首帧> --last=<尾帧> --prompt=<分镜提示词> \
+  --duration=8 --video_resolution=720p \
+  --model_version=seedance2.0fast_vip --poll=30
+```
+
+> ⚠️ `model_version` 平台默认钉死 **`seedance2.0fast_vip`**(Fast VIP),
+> 不要使用旧脚本(submit-seedance2.py)中的 `seedance2.0_vip`;
+> 测试项 `test_default_config_pins_fast_vip` 防止回归。
+> `ark-seedance2.py` 属火山方舟 API 路线,对应本平台的 `api` 备用
+> Provider,不走 dreamina 适配器。
+
+macOS 实机 `workspace/config.json` 示例:
+
+```json
+{
+  "providers": {
+    "jimeng": {
+      "enabled": true,
+      "command": ["/Users/sk/.local/bin/dreamina"]
+    },
+    "codex": {
+      "enabled": true,
+      "command": ["/Users/sk/.local/node22/bin/codex", "exec", "--json"]
+    }
+  }
+}
+```
+
+注:`codex` 走通用 CLI 协议,接真实 Codex 需一个把上述 JSON 协议转为
+`codex exec` 调用的薄包装脚本;`dreamina` 无需包装,开箱即用。
+每次 dreamina 调用的完整命令与原始输出都会落盘到
+`artifacts/.../videos/shot_XXX.dreamina.log` 便于排查。
 
 ## 常用命令
 

@@ -7,12 +7,14 @@
 
 from ..errors import ProviderError, ProviderUnavailable
 from .base import ProviderResult  # noqa: F401  (re-export for callers)
+from .dreamina import DreaminaProvider
 from .external import ApiProvider, CliProvider
 from .mock import MockProvider
 
 PROVIDER_TYPES = {
     "cli": CliProvider,
     "api": ApiProvider,
+    "dreamina": DreaminaProvider,
     "mock": MockProvider,
 }
 

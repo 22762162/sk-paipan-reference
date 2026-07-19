@@ -6,6 +6,15 @@ from pathlib import Path
 SEVERITY_PENALTY = {"error": 15, "warn": 5}
 
 
+def _artifact_exists(uri):
+    """产物存在性:本地文件须落盘;远程 URL(如即梦返回的 mp4)视为存在。"""
+    if not uri:
+        return False
+    if uri.startswith("http://") or uri.startswith("https://"):
+        return True
+    return Path(uri).exists()
+
+
 class QcCenter:
     def __init__(self, config):
         self.config = config
@@ -120,7 +129,7 @@ class QcCenter:
         total_lines = sum(len(s["lines"]) for s in script["scenes"])
         for line_no in range(1, total_lines + 1):
             voice = voices.get(line_no)
-            if voice is None or not Path(voice.get("uri", "")).exists():
+            if voice is None or not _artifact_exists(voice.get("uri", "")):
                 issues.append({
                     "check": "voice", "severity": "error",
                     "line_no": line_no, "rerunnable": True,
@@ -134,7 +143,7 @@ class QcCenter:
         videos = {v["shot_no"]: v for v in ctx.get("videos", [])}
         for shot in storyboard["shots"]:
             video = videos.get(shot["shot_no"])
-            if video is None or not Path(video.get("uri", "")).exists():
+            if video is None or not _artifact_exists(video.get("uri", "")):
                 issues.append({
                     "check": "video", "severity": "error",
                     "shot_no": shot["shot_no"], "rerunnable": True,

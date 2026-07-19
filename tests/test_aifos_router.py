@@ -49,26 +49,26 @@ def test_failing_command_falls_back(make_app):
 
 
 def test_enabled_cli_provider_is_used(make_app):
-    app = make_app({"providers": {"jimeng": {
+    app = make_app({"providers": {"codex": {
         "enabled": True, "command": OK_CLI, "quota": 10}}})
-    result = app.router.call("video", {"shot_no": 1},
+    result = app.router.call("image", {"shot_no": 1},
                              app.workspace.artifacts_dir)
-    assert result.provider == "jimeng"
+    assert result.provider == "codex"
     assert result.cost == 2.0
-    assert app.router.quota_remaining("jimeng") == 9
+    assert app.router.quota_remaining("codex") == 9
 
 
 def test_quota_exhausted_falls_back(make_app):
-    app = make_app({"providers": {"jimeng": {
+    app = make_app({"providers": {"codex": {
         "enabled": True, "command": OK_CLI, "quota": 1}}})
-    first = app.router.call("video", {"shot_no": 1},
+    first = app.router.call("image", {"shot_no": 1},
                             app.workspace.artifacts_dir)
-    second = app.router.call("video", {"shot_no": 2},
+    second = app.router.call("image", {"shot_no": 2},
                              app.workspace.artifacts_dir)
-    assert first.provider == "jimeng"
+    assert first.provider == "codex"
     # 订阅额度耗尽 → 回退链下一个可用 Provider(api 未配置 → mock)
     assert second.provider == "mock"
-    assert app.router.quota_remaining("jimeng") == 0
+    assert app.router.quota_remaining("codex") == 0
 
 
 def test_no_provider_available_raises(make_app):

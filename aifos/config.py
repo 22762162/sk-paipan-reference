@@ -38,10 +38,15 @@ DEFAULTS = {
             "cost_per_call": 1.0, "timeout": 600,
         },
         "jimeng": {
-            "type": "cli", "enabled": False,
-            "capabilities": ["video", "voice"],
-            "command": ["jimeng"],
-            "cost_per_call": 2.0, "timeout": 1200,
+            # 即梦官方 CLI(dreamina)原生适配;配音能力待即梦 CLI 提供 TTS 后再接入
+            "type": "dreamina", "enabled": False,
+            "capabilities": ["video"],
+            "command": ["dreamina"],
+            "model_version": "seedance2.0fast_vip",  # 必须 fast_vip,勿用旧 seedance2.0_vip
+            "video_resolution": "720p",
+            "duration": 8,
+            "poll": 30,
+            "cost_per_call": 2.0, "timeout": 1800,
             "quota": 1000,             # 订阅额度(次);耗尽后路由自动回退 API
         },
         "jianying": {
