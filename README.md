@@ -21,6 +21,18 @@ echo '{"case_id":"x","op":"year_pillar","input":{"civil_year":1984,"t_unix":1,"l
   | python3 -m paipan_ref.cli       # 对拍 CLI(contracts/paipan-spec.md 附录 A 协议)
 ```
 
+## 附带工具：jimeng_video（与排盘无关）
+
+`jimeng_video/` 是一个独立小工具，用于把《卡卡学姐的第一课》手机 Seedance 2 首尾帧
+逐段生成的成果**校验并拼接成 102 秒成片**（视频生成本身仍在手机端完成）。
+它不依赖也不影响 `paipan_ref/`，用法见 `jimeng_video/README.md`：
+
+```bash
+python3 -m jimeng_video plan                 # 分段/变速/102 秒计划
+python3 -m jimeng_video check    <生成包目录>  # 校验参考帧/衔接帧/提示词/视频规格
+python3 -m jimeng_video assemble <生成包目录>  # 变速拼接（需本机 ffmpeg）
+```
+
 ## contracts 镜像同步
 
 `contracts/` 为主仓库同名目录的只读镜像,以主仓库 main 的 commit 对齐;
