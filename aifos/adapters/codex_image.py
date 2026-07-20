@@ -24,6 +24,34 @@ import sys
 from pathlib import Path
 
 
+# 非交互出图必需:可写沙箱 + 跳过 git 仓库检查(产物目录不是 git 仓库)。
+# 旧版 codex 不认识这些参数时,run() 会自动去掉重试。
+DEFAULT_EXEC_ARGS = ["--sandbox", "workspace-write", "--skip-git-repo-check"]
+
+# 强制真实出图:Codex 是编码代理,放任它就会用 Pillow 画示意图充数
+GEN_DIRECTIVE = (
+    "你必须使用你环境里可用的图像生成能力(图像生成技能 / 工具 / MCP,"
+    "如 gpt-image 等)真实生成图片;禁止用 Pillow / matplotlib / SVG 等"
+    "代码绘制示意图或占位图充数。如果完全没有图像生成能力,打印错误"
+    "并以非零码退出,不要伪造图片。")
+
+
+def _style_line(payload):
+    style = payload.get("style") or "国风漫剧"
+    return (f"画风要求:{style},2D 动画质感,高细节;整部作品所有画面"
+            "保持同一画风、同一人物造型。")
+
+
+def _ref_line(payload):
+    refs = [f"人物设定图 {r}" for r in payload.get("character_refs", [])]
+    if payload.get("scene_ref"):
+        refs.append(f"场景概念图 {payload['scene_ref']}")
+    if not refs:
+        return ""
+    return ("参考图(文件可直接读取;人物发型/服装/配色和场景陈设"
+            "必须与参考图一致):" + ";".join(refs) + "。")
+
+
 def build_instruction(capability, payload, out_dir):
     """返回 (给 codex 的指令, 期望产出的文件列表, 应答的 data 字段)。"""
     out_dir = Path(out_dir)
@@ -35,6 +63,7 @@ def build_instruction(capability, payload, out_dir):
         payload = dict(payload)
         payload["prompt"] = (f"{payload.get('prompt', '')}。"
                              f"修改意见(必须落实):{feedback}")
+    common = f"{_style_line(payload)}{GEN_DIRECTIVE}"
     if capability == "image":
         safe = "".join(c if c.isalnum() else "_"
                        for c in str(payload.get("art_name", "")))[:40]
@@ -42,13 +71,15 @@ def build_instruction(capability, payload, out_dir):
             target = out_dir / f"portrait_{safe}.png"
             instruction = (
                 f"为角色生成立绘并保存到 {target}(PNG,{size})。"
-                f"{payload.get('prompt', '')}。只产出该文件。")
+                f"{payload.get('prompt', '')}。这张立绘是全剧的人物设定基准,"
+                f"之后所有镜头都会参考它。{common}只产出该文件。")
             return instruction, [target], {"name": payload.get("art_name")}
         if payload.get("scene_art"):
             target = out_dir / f"scene_{safe}.png"
             instruction = (
                 f"为场景生成概念图并保存到 {target}(PNG,{size})。"
-                f"{payload.get('prompt', '')}。只产出该文件。")
+                f"{payload.get('prompt', '')}。这张概念图是该场景的美术基准。"
+                f"{common}只产出该文件。")
             return instruction, [target], {"name": payload.get("art_name")}
         shot_no = int(payload["shot_no"])
         target = out_dir / f"shot_{shot_no:03d}.keyframe.png"
@@ -56,21 +87,21 @@ def build_instruction(capability, payload, out_dir):
             f"为漫剧分镜生成一张关键图并保存到 {target}"
             f"(PNG,{size})。画面内容:{payload.get('prompt', '')}。"
             f"出场角色:{'、'.join(payload.get('characters', []))}。"
-            "可用 Python(Pillow/绘制 SVG 后转换)或其他可用工具完成;"
-            "只产出该文件,不要改动其他文件。"
-        )
+            f"镜头语言:{payload.get('camera', '')}。"
+            f"{_ref_line(payload)}{common}"
+            "只产出该文件,不要改动其他文件。")
         return instruction, [target], {"shot_no": shot_no}
     if capability == "frames":
         shot_no = int(payload["shot_no"])
         first = out_dir / f"shot_{shot_no:03d}.first.png"
         last = out_dir / f"shot_{shot_no:03d}.last.png"
         instruction = (
-            f"基于关键图 {payload.get('image_uri', '')} 为镜头生成首帧与尾帧,"
-            f"分别保存到 {first} 和 {last}(PNG,{size})。"
-            f"镜头内容:{payload.get('prompt', '')}。"
-            "首帧为动作起始、尾帧为动作结束,保持角色与场景一致;"
-            "只产出这两个文件。"
-        )
+            f"基于关键图 {payload.get('image_uri', '')}(文件可直接读取)"
+            f"为镜头生成首帧与尾帧,分别保存到 {first} 和 {last}"
+            f"(PNG,{size})。镜头内容:{payload.get('prompt', '')}。"
+            "首帧为动作起始、尾帧为动作结束,构图与关键图连贯,"
+            f"角色与场景保持完全一致。{_ref_line(payload)}{common}"
+            "只产出这两个文件。")
         return instruction, [first, last], {
             "first": str(first), "last": str(last)}
     if capability == "cover":
@@ -78,13 +109,21 @@ def build_instruction(capability, payload, out_dir):
         instruction = (
             f"为账号内容生成封面并保存到 {target}(PNG,{size})。"
             f"作品《{payload.get('title', '')}》第{payload.get('episode', 0)}集,"
-            f"主题:{payload.get('tagline', '')}。只产出该文件。"
-        )
+            f"主题:{payload.get('tagline', '')}。构图吸睛、适合短视频封面,"
+            f"可留出大标题排版空间。{common}只产出该文件。")
         return instruction, [target], {}
     raise ValueError(f"codex 适配桥不支持能力: {capability}")
 
 
-def run(request, codex, timeout, extra_args):
+def _flags_unsupported(stderr):
+    """旧版 codex 不认识默认参数时的报错特征。"""
+    text = (stderr or "").lower()
+    return any(marker in text for marker in (
+        "unexpected argument", "unrecognized", "unknown option",
+        "invalid option", "unknown argument"))
+
+
+def run(request, codex, timeout, extra_args, plain=False):
     capability = request["capability"]
     payload = request.get("payload", {})
     out_dir = Path(request["out_dir"]).resolve()
@@ -93,16 +132,24 @@ def run(request, codex, timeout, extra_args):
         return {"ok": False, "error": f"codex 命令不存在: {codex}"}
     instruction, targets, data = build_instruction(
         capability, payload, out_dir)
-    cmd = [codex, "exec", *extra_args, instruction]
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
+    exec_args = [] if plain else list(DEFAULT_EXEC_ARGS)
+
+    def invoke(args):
+        return subprocess.run(
+            [codex, "exec", *args, *extra_args, instruction],
+            capture_output=True, text=True, timeout=timeout,
             cwd=str(out_dir))
+
+    try:
+        proc = invoke(exec_args)
+        if proc.returncode != 0 and exec_args and \
+                _flags_unsupported(proc.stderr):
+            proc = invoke([])   # 旧版 codex:去掉默认参数重试
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ok": False, "error": f"codex 调用失败: {exc}"}
     log_path = out_dir / f"codex_{capability}.log"
     with open(log_path, "a", encoding="utf-8") as f:
-        f.write(f"$ {' '.join(cmd[:2])} …\n{proc.stdout}\n{proc.stderr}\n")
+        f.write(f"$ codex exec …\n{proc.stdout}\n{proc.stderr}\n")
     if proc.returncode != 0:
         return {"ok": False,
                 "error": f"codex 退出码 {proc.returncode}: "
@@ -120,10 +167,13 @@ def main(argv=None):
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--extra", action="append", default=[],
                         help="附加给 codex exec 的参数,可多次指定")
+    parser.add_argument("--plain", action="store_true",
+                        help="不带默认的 --sandbox/--skip-git-repo-check")
     args = parser.parse_args(argv)
     try:
         request = json.loads(sys.stdin.read())
-        reply = run(request, args.codex, args.timeout, args.extra)
+        reply = run(request, args.codex, args.timeout, args.extra,
+                    plain=args.plain)
     except Exception as exc:  # 协议层兜底:任何异常都以 ok:false 应答
         reply = {"ok": False, "error": str(exc)}
     # 始终退出 0:失败经 ok:false 应答传递错误详情(协议层约定)

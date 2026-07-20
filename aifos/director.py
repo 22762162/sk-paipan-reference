@@ -307,6 +307,7 @@ class Director:
                 "portrait": True, "art_name": name, "role": role,
                 "shot_no": 0, "characters": [name], "location": "",
                 "prompt": f"角色立绘:{name}({role}),{style},全身,正面",
+                "style": style,
                 "aspect": ctx["aspect"], **ctx["dims"],
             }, "cast")
             self.assets.register(
@@ -325,6 +326,7 @@ class Director:
                 "shot_no": 0, "characters": [], "location": location,
                 "action": scene.get("action", ""),
                 "prompt": f"场景概念图:{location},{style},空镜,氛围感",
+                "style": style,
                 "aspect": ctx["aspect"], **ctx["dims"],
             }, "cast")
             self.assets.register(
@@ -339,17 +341,34 @@ class Director:
         return {s["scene_no"]: s["location"]
                 for s in ctx["script"]["scenes"]}
 
+    def _art_refs(self, ctx, characters, location):
+        """人物立绘/场景概念图路径 → 出图参考(跨镜头角色一致性)。"""
+        project_id = ctx["project"]["id"]
+        refs = {"character_refs": []}
+        for name in characters or []:
+            row = self.assets.latest(project_id, "character_art", name)
+            if row and row["uri"] and Path(row["uri"]).exists():
+                refs["character_refs"].append(row["uri"])
+        if location:
+            row = self.assets.latest(project_id, "scene_art", location)
+            if row and row["uri"] and Path(row["uri"]).exists():
+                refs["scene_ref"] = row["uri"]
+        return refs
+
     def _shot_payload(self, ctx, shot):
         locations = self._scene_locations(ctx)
+        location = locations.get(shot["scene_no"], "")
         return {
             "shot_no": shot["shot_no"],
             "prompt": shot["prompt"],
             "characters": shot["characters"],
-            "location": locations.get(shot["scene_no"], ""),
+            "location": location,
             "dialogue": shot.get("dialogue"),
             "camera": shot.get("camera", ""),
             "action": shot.get("description", ""),
+            "style": ctx["project"]["style"] or "",
             "aspect": ctx["aspect"], **ctx["dims"],
+            **self._art_refs(ctx, shot["characters"], location),
         }
 
     def _stage_images(self, ctx):
@@ -669,7 +688,7 @@ class Director:
                 "portrait": True, "art_name": name, "role": role,
                 "shot_no": 0, "characters": [name], "location": "",
                 "prompt": f"角色立绘:{name}({role}),{style},全身,正面",
-                "feedback": feedback,
+                "style": style, "feedback": feedback,
                 "aspect": aspect, **ctx["dims"],
             }, "cast")
             self.assets.register(project["id"], "character_art", name,
@@ -684,7 +703,7 @@ class Director:
                 "shot_no": 0, "characters": [], "location": name,
                 "action": scene.get("action", ""),
                 "prompt": f"场景概念图:{name},{style},空镜,氛围感",
-                "feedback": feedback,
+                "style": style, "feedback": feedback,
                 "aspect": aspect, **ctx["dims"],
             }, "cast")
             self.assets.register(project["id"], "scene_art", name,

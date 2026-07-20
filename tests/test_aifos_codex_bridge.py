@@ -11,14 +11,31 @@ import pytest
 
 from aifos.app import App
 
-# 假 codex:从指令文本中提取目标 png 路径并创建之
+# 假 codex:记录完整参数,从指令文本中提取目标 png 路径并创建之
 FAKE_CODEX = '''#!/usr/bin/env python3
-import re, sys
+import json, os, re, sys
 instruction = sys.argv[-1]
+log = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                   "codex_argv.jsonl")
+with open(log, "a", encoding="utf-8") as f:
+    f.write(json.dumps(sys.argv[1:], ensure_ascii=False) + "\\n")
 paths = re.findall(r"(/\\S+?\\.png)", instruction)
 for p in paths:
     open(p, "wb").write(b"fake-png")
 print("codex done:", len(paths), "files")
+'''
+
+# 假旧版 codex:不认识 --sandbox,报 unexpected argument;去掉后才成功
+FAKE_OLD_CODEX = '''#!/usr/bin/env python3
+import re, sys
+args = sys.argv[1:]
+if "--sandbox" in args or "--skip-git-repo-check" in args:
+    print("error: unexpected argument '--sandbox' found", file=sys.stderr)
+    sys.exit(2)
+instruction = args[-1]
+for p in re.findall(r"(/\\S+?\\.png)", instruction):
+    open(p, "wb").write(b"fake-png")
+print("old codex ok")
 '''
 
 REPO_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -79,6 +96,76 @@ def test_unknown_capability(tmp_path, fake_codex):
         "capability": "video", "payload": {},
         "out_dir": str(tmp_path / "out")}, fake_codex)
     assert not reply["ok"]
+
+
+def test_instruction_quality(tmp_path, fake_codex):
+    """出图指令:真实出图指令 + 画风统一 + 参考图 + 默认非交互参数。"""
+    out = tmp_path / "out"
+    ref = tmp_path / "portrait_林昭.png"
+    ref.write_bytes(b"x")
+    scene = tmp_path / "scene_古镇.png"
+    scene.write_bytes(b"x")
+    reply = _bridge({
+        "capability": "image",
+        "payload": {"shot_no": 1, "prompt": "古镇长街夜景",
+                    "characters": ["林昭"], "camera": "远景推近",
+                    "style": "水墨国风",
+                    "character_refs": [str(ref)],
+                    "scene_ref": str(scene)},
+        "out_dir": str(out)}, fake_codex)
+    assert reply["ok"], reply
+    argv = [json.loads(line) for line in
+            (fake_codex.parent / "codex_argv.jsonl")
+            .read_text(encoding="utf-8").splitlines()]
+    args = argv[-1]
+    # 默认非交互参数
+    assert "--sandbox" in args and "workspace-write" in args
+    assert "--skip-git-repo-check" in args
+    instruction = args[-1]
+    # 禁止代码画图充数,必须真实出图
+    assert "禁止用 Pillow" in instruction
+    assert "图像生成能力" in instruction
+    # 画风统一 + 参考图一致性
+    assert "水墨国风" in instruction
+    assert str(ref) in instruction and str(scene) in instruction
+    assert "人物设定图" in instruction and "场景概念图" in instruction
+
+
+def test_old_codex_flags_fallback(tmp_path):
+    """旧版 codex 不认默认参数 → 自动去掉重试,依然成功。"""
+    binary = tmp_path / "bin" / "codex"
+    binary.parent.mkdir(parents=True)
+    binary.write_text(FAKE_OLD_CODEX, encoding="utf-8")
+    binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+    reply = _bridge({
+        "capability": "image",
+        "payload": {"shot_no": 3, "prompt": "x", "characters": []},
+        "out_dir": str(tmp_path / "out")}, binary)
+    assert reply["ok"], reply
+    assert Path(reply["uri"]).exists()
+
+
+def test_produce_passes_reference_art(tmp_path, fake_codex, monkeypatch):
+    """整集制作时,镜头出图指令必须带上人物立绘/场景图做一致性参考。"""
+    monkeypatch.setenv("PYTHONPATH", REPO_ROOT)
+    app = App(tmp_path / "ws", config_overrides={"providers": {"codex": {
+        "enabled": True,
+        "command": [sys.executable, "-m", "aifos.adapters.codex_image",
+                    "--codex", str(fake_codex)],
+    }}})
+    try:
+        app.director.produce("参考图验证", 1)
+    finally:
+        app.close()
+    log = fake_codex.parent / "codex_argv.jsonl"
+    instructions = [json.loads(line)[-1] for line in
+                    log.read_text(encoding="utf-8").splitlines()]
+    keyframe_calls = [i for i in instructions if "keyframe" in i]
+    assert keyframe_calls
+    # 对白镜头的指令引用人物设定图(portrait_*.png 真实路径)
+    assert any("人物设定图" in i and "portrait_" in i
+               for i in keyframe_calls)
+    assert any("场景概念图" in i and "scene_" in i for i in keyframe_calls)
 
 
 def test_router_integration(tmp_path, fake_codex, monkeypatch):
