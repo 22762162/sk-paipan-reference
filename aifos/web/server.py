@@ -329,6 +329,9 @@ def make_handler(workspace, jobs):
                     if job is None:
                         return self._error(404, "任务不存在")
                     return self._json(job)
+                match = re.match(r"^/api/export/(\d+)$", route)
+                if match:
+                    return self._export(int(match.group(1)))
                 return self._error(404, "未知路径")
             except BrokenPipeError:
                 pass
@@ -393,6 +396,38 @@ def make_handler(workspace, jobs):
             if items is None:
                 return self._error(404, f"项目不存在: {title}")
             return self._json(items)
+
+        def _export(self, episode_id):
+            """成品包 zip 下载。"""
+            from urllib.parse import quote as _quote
+
+            from ..export_kit import build_export_zip
+
+            def task(app):
+                episode = app.projects.get_episode(episode_id)
+                if episode is None:
+                    return None
+                project = app.db.query_one(
+                    "SELECT * FROM projects WHERE id=?",
+                    (episode["project_id"],))
+                return build_export_zip(
+                    app, project["title"], episode["number"])
+
+            try:
+                result = self._with_app(task)
+            except Exception as exc:
+                return self._error(400, str(exc))
+            if result is None:
+                return self._error(404, "剧集不存在")
+            data, filename = result
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header(
+                "Content-Disposition",
+                f"attachment; filename*=UTF-8''{_quote(filename)}")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
 
         def _produce(self):
             length = int(self.headers.get("Content-Length", "0"))

@@ -123,6 +123,12 @@ def _build_parser():
     igroup.add_argument("--character", help="人物名")
     igroup.add_argument("--scene", help="场景名")
 
+    p_export = sub.add_parser(
+        "export", help="导出成品包 zip(成片/封面/文案/配音/草稿/剧本)")
+    p_export.add_argument("--project", required=True)
+    p_export.add_argument("--episode", type=int, required=True)
+    p_export.add_argument("--out", help="输出路径(默认当前目录按集命名)")
+
     p_asset = sub.add_parser("asset", help="IP 资产中心")
     p_asset.add_argument("action", choices=["list", "stats"])
     p_asset.add_argument("--project", required=True, help="项目名")
@@ -493,6 +499,15 @@ def main(argv=None):
                 result = app.director.import_image(
                     args.project, args.episode, target, data, ext)
             print(f"已导入: {result['uri']}")
+            return 0
+        if args.command == "export":
+            from .export_kit import build_export_zip
+            data, filename = build_export_zip(
+                app, args.project, args.episode)
+            out = args.out or filename
+            with open(out, "wb") as f:
+                f.write(data)
+            print(f"成品包已导出: {out}({len(data) // 1024} KB)")
             return 0
         if args.command == "asset":
             return _cmd_asset(app, args)

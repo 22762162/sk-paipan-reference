@@ -1443,8 +1443,111 @@ window.__SEED__ = {"projects": [{"id": 1, "title": "小澜同学", "description"
     return [404, { error: "演示模式无此数据" }];
   }
 
+  /* ---- 浏览器内 zip 打包(存储式)与成品包导出 ---- */
+  const CRC_TABLE = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n += 1) {
+      let c = n;
+      for (let k = 0; k < 8; k += 1)
+        c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      t[n] = c >>> 0;
+    }
+    return t;
+  })();
+  function crc32(bytes) {
+    let c = 0xffffffff;
+    for (let i = 0; i < bytes.length; i += 1)
+      c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  }
+  const te = new TextEncoder();
+  function buildZip(entries) {
+    const chunks = [], central = [];
+    let offset = 0;
+    const num = (n, len) => {
+      const a = new Uint8Array(len);
+      for (let i = 0; i < len; i += 1) a[i] = (n >>> (8 * i)) & 0xff;
+      return a;
+    };
+    for (const { name, data } of entries) {
+      const nameB = te.encode(name);
+      const crc = crc32(data);
+      const local = [num(0x04034b50, 4), num(20, 2), num(0x0800, 2),
+        num(0, 2), num(0, 2), num(0, 2), num(crc, 4),
+        num(data.length, 4), num(data.length, 4),
+        num(nameB.length, 2), num(0, 2), nameB, data];
+      central.push({ nameB, crc, size: data.length, offset });
+      for (const part of local) { chunks.push(part); offset += part.length; }
+    }
+    const cdStart = offset;
+    for (const e of central) {
+      const rec = [num(0x02014b50, 4), num(20, 2), num(20, 2),
+        num(0x0800, 2), num(0, 2), num(0, 2), num(0, 2), num(e.crc, 4),
+        num(e.size, 4), num(e.size, 4), num(e.nameB.length, 2),
+        num(0, 2), num(0, 2), num(0, 2), num(0, 2), num(0, 4),
+        num(e.offset, 4), e.nameB];
+      for (const part of rec) { chunks.push(part); offset += part.length; }
+    }
+    chunks.push(num(0x06054b50, 4), num(0, 2), num(0, 2),
+      num(central.length, 2), num(central.length, 2),
+      num(offset - cdStart, 4), num(cdStart, 4), num(0, 2));
+    return new Blob(chunks, { type: "application/zip" });
+  }
+  function dataUriBytes(uri) {
+    const b64 = (uri.split(",")[1] || "");
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  const EXT_BY_MIME = { "image/svg+xml": ".svg", "image/png": ".png",
+    "image/jpeg": ".jpg", "video/mp4": ".mp4",
+    "application/json": ".json", "audio/wav": ".wav" };
+  function extOf(uri) {
+    const mime = (uri.split(";")[0] || "").replace("data:", "");
+    return EXT_BY_MIME[mime] || ".bin";
+  }
+  function scriptText(script) {
+    return script.scenes.map((s) => {
+      const rows = [`第${s.scene_no}场 ${s.location}`];
+      if (s.action) rows.push(s.action);
+      (s.lines || []).forEach((l) => rows.push(`${l.character}:${l.dialogue}`));
+      return rows.join("\n");
+    }).join("\n\n");
+  }
+  function exportZipBlob(id) {
+    const pl = state.payloads[id];
+    if (!pl) return null;
+    const art = pl.artifacts;
+    const entries = [];
+    const addText = (name, text) => entries.push({ name, data: te.encode(text) });
+    const addUri = (name, uri) => {
+      if (uri) entries.push({ name: name + extOf(uri), data: dataUriBytes(uri) });
+    };
+    addText("剧本.txt", scriptText(pl.script));
+    const full = state.fullResults[id] || {};
+    addText("标题与话题.txt", ["【候选标题】", ...(art.titles || []), "",
+      "【话题标签】", (full.hashtags || []).join(" ")].join("\n"));
+    Object.entries(art.images).forEach(([n, u]) => addUri(`画面/shot_${n}`, u));
+    Object.entries(art.videos).forEach(([n, u]) => addUri(`视频/shot_${n}`, u));
+    Object.entries(art.voices).forEach(([n, u]) => addUri(`配音/line_${n}`, u));
+    (art.cast_art || []).forEach((c) => addUri(`人物设定/${c.name}`, c.url));
+    (art.scene_art || []).forEach((s) => addUri(`场景设定/${s.name}`, s.url));
+    addUri("封面", art.cover);
+    addUri("成片", art.final);
+    return buildZip(entries);
+  }
+
   load();
   window.fetch = async (path, opts) => {
+    const exportMatch = /^\/api\/export\/(\d+)$/.exec(path.split("#")[0]);
+    if (exportMatch) {
+      const blob = exportZipBlob(parseInt(exportMatch[1], 10));
+      if (!blob) return { ok: false, status: 404,
+        json: async () => ({ error: "剧集不存在" }) };
+      return { ok: true, status: 200, blob: async () => blob,
+        json: async () => ({}) };
+    }
     const [status, data] = route(path, opts);
     return { ok: status < 400, status,
       json: async () => JSON.parse(JSON.stringify(data)) };
@@ -1990,6 +2093,24 @@ function showScriptOverlay(data, episodeId) {
   };
 }
 
+/* 成品包一键下载 */
+async function exportEpisode(data) {
+  try {
+    showToast("正在打包成品…", "ok");
+    const res = await fetch(`/api/export/${data.episode.id}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || "导出失败");
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    downloadUrl(url,
+      `${data.project.title}_第${data.episode.number}集_成品包.zip`);
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    showToast("成品包已开始下载", "ok");
+  } catch (e) { showToast(e.message, "error"); }
+}
+
 /* 素材下载 / 人工修改后上传 */
 function downloadUrl(url, filename) {
   const a = document.createElement("a");
@@ -2314,6 +2435,7 @@ function renderTheater(data, canvas) {
         <div class="hero-actions">
           <button class="primary" id="hero-play">▶ 播放本集</button>
           <button id="hero-script">📖 剧本</button>
+          <button id="hero-export" title="成片/封面/文案/配音/草稿一键打包">⬇ 下载成品包</button>
         </div>
       </div>
     </div>
@@ -2348,6 +2470,7 @@ function renderTheater(data, canvas) {
   el.querySelector("#hero-play").onclick = () => openPlayer(data);
   el.querySelector("#hero-script").onclick = () =>
     document.getElementById("btn-script").click();
+  el.querySelector("#hero-export").onclick = () => exportEpisode(data);
   el.querySelectorAll(".t-card").forEach((card) => {
     card.addEventListener("click", () =>
       openPlayer(data, Number(card.dataset.shot)));
@@ -2483,6 +2606,7 @@ class StoryboardCanvas {
       panel.innerHTML = `
         <h3>本集总览</h3>
         <button class="primary play-cta" id="panel-play">▶ 播放本集(${fmt(this.data.storyboard.shots.reduce((a, s) => a + s.duration, 0), 0)}秒)</button>
+        <button class="play-cta" id="panel-export">⬇ 下载成品包(成片/封面/文案)</button>
         ${(art.cast_art || []).length ? `<h4>人物 · 不满意可附意见重画</h4>
         <div class="art-grid">${art.cast_art.map((c) => `
           <figure><img src="${esc(c.url)}" alt="${esc(c.name)}">
@@ -2522,6 +2646,8 @@ class StoryboardCanvas {
         </ul>`;
       const playBtn = panel.querySelector("#panel-play");
       if (playBtn) playBtn.onclick = () => openPlayer(this.data);
+      const exportBtn = panel.querySelector("#panel-export");
+      if (exportBtn) exportBtn.onclick = () => exportEpisode(this.data);
       bindRegen(panel, this.data.episode.id, () => this.data);
       bindIo(panel, this.data.episode.id,
              () => renderCanvasView(this.data.episode.id));

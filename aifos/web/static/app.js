@@ -532,6 +532,24 @@ function showScriptOverlay(data, episodeId) {
   };
 }
 
+/* 成品包一键下载 */
+async function exportEpisode(data) {
+  try {
+    showToast("正在打包成品…", "ok");
+    const res = await fetch(`/api/export/${data.episode.id}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || "导出失败");
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    downloadUrl(url,
+      `${data.project.title}_第${data.episode.number}集_成品包.zip`);
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    showToast("成品包已开始下载", "ok");
+  } catch (e) { showToast(e.message, "error"); }
+}
+
 /* 素材下载 / 人工修改后上传 */
 function downloadUrl(url, filename) {
   const a = document.createElement("a");
@@ -856,6 +874,7 @@ function renderTheater(data, canvas) {
         <div class="hero-actions">
           <button class="primary" id="hero-play">▶ 播放本集</button>
           <button id="hero-script">📖 剧本</button>
+          <button id="hero-export" title="成片/封面/文案/配音/草稿一键打包">⬇ 下载成品包</button>
         </div>
       </div>
     </div>
@@ -890,6 +909,7 @@ function renderTheater(data, canvas) {
   el.querySelector("#hero-play").onclick = () => openPlayer(data);
   el.querySelector("#hero-script").onclick = () =>
     document.getElementById("btn-script").click();
+  el.querySelector("#hero-export").onclick = () => exportEpisode(data);
   el.querySelectorAll(".t-card").forEach((card) => {
     card.addEventListener("click", () =>
       openPlayer(data, Number(card.dataset.shot)));
@@ -1025,6 +1045,7 @@ class StoryboardCanvas {
       panel.innerHTML = `
         <h3>本集总览</h3>
         <button class="primary play-cta" id="panel-play">▶ 播放本集(${fmt(this.data.storyboard.shots.reduce((a, s) => a + s.duration, 0), 0)}秒)</button>
+        <button class="play-cta" id="panel-export">⬇ 下载成品包(成片/封面/文案)</button>
         ${(art.cast_art || []).length ? `<h4>人物 · 不满意可附意见重画</h4>
         <div class="art-grid">${art.cast_art.map((c) => `
           <figure><img src="${esc(c.url)}" alt="${esc(c.name)}">
@@ -1064,6 +1085,8 @@ class StoryboardCanvas {
         </ul>`;
       const playBtn = panel.querySelector("#panel-play");
       if (playBtn) playBtn.onclick = () => openPlayer(this.data);
+      const exportBtn = panel.querySelector("#panel-export");
+      if (exportBtn) exportBtn.onclick = () => exportEpisode(this.data);
       bindRegen(panel, this.data.episode.id, () => this.data);
       bindIo(panel, this.data.episode.id,
              () => renderCanvasView(this.data.episode.id));

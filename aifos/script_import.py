@@ -119,6 +119,19 @@ def parse_any(text, project_title, episode_number):
     return parse_text_script(text, project_title, episode_number)
 
 
+def script_to_text(script):
+    """标准剧本 JSON → 可读/可再导入的文本格式。"""
+    blocks = []
+    for scene in script.get("scenes", []):
+        lines = [f"第{scene['scene_no']}场 {scene.get('location', '')}"]
+        if scene.get("action"):
+            lines.append(scene["action"])
+        for line in scene.get("lines", []):
+            lines.append(f"{line['character']}:{line['dialogue']}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
 def load_script_file(path, project_title, episode_number):
     with open(path, encoding="utf-8") as f:
         return parse_any(f.read(), project_title, episode_number)
