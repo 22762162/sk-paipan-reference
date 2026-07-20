@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 
 from .db import now
-from .errors import BudgetExceeded
+from .errors import AifosError, BudgetExceeded
 
 # 画幅 → 像素尺寸(视频/图片);封面用竖版比例
 ASPECT_DIMS = {
@@ -53,7 +53,7 @@ class Director:
     # ---- 入口:一句话开工 ----
     def produce(self, project_title, episode_number, premise="", style="",
                 force=False, script=None, pause_for_confirm=False,
-                kind=None):
+                kind=None, feedback=""):
         """force=False 时增量生产:已有且落盘完好的产物直接复用,
         只补齐缺失部分——真实产线(即梦按镜头计费)断点续产的关键。
         script:用户自带剧本(标准 JSON);提供时跳过 AI 编剧,
@@ -87,6 +87,7 @@ class Director:
             "aspect": aspect,
             "dims": ASPECT_DIMS.get(aspect, ASPECT_DIMS["9:16"]),
             "provided_script": script,
+            "feedback": feedback,
         }
         stage_reports = []
         failed = False
@@ -239,14 +240,22 @@ class Director:
                 self.log.info("director", f"复用已有剧本 v{version}")
                 return {"version": version, "reused": True,
                         "scenes": len(existing["scenes"])}
-        result = self._call(ctx, "script", {
+        payload = {
             "project_title": ctx["project"]["title"],
             "episode_number": episode["number"],
             "premise": episode["premise"],
             "style": ctx["project"]["style"],
             "template": ctx["project"]["kind"],       # drama / idol
             "persona": ctx["project"]["title"],       # 偶像人设名=项目名
-        }, "script")
+        }
+        if ctx.get("feedback"):
+            # 修改意见:连同上一版剧本一起交给编剧重写
+            payload["feedback"] = ctx["feedback"]
+            previous, _ = self.projects.latest_document(
+                episode["id"], "script")
+            if previous is not None:
+                payload["previous_script"] = previous
+        result = self._call(ctx, "script", payload, "script")
         script = result.data
         version = self.projects.save_document(episode["id"], "script", script)
         ctx["script"] = script
@@ -605,3 +614,113 @@ class Director:
         self.assets.register(
             ctx["project"]["id"], kind,
             f"e{ctx['episode']['number']:03d}_shot{shot_no:03d}", uri=uri)
+
+    # ---- 打磨:剧本意见重写 / 单张图片附意见重画 ----
+    def revise_script(self, project_title, episode_number, feedback):
+        """按修改意见重写剧本并重跑预生产,回到待确认。"""
+        project = self.projects.get_project(project_title)
+        if project is not None:
+            episode = self.db.query_one(
+                "SELECT * FROM episodes WHERE project_id=? AND number=?",
+                (project["id"], episode_number))
+            if episode is not None:
+                self.data.record(
+                    "case", "failure", prompt=feedback,
+                    meta={"reason": "script_revision"},
+                    episode_id=episode["id"])
+        return self.produce(
+            project_title, episode_number, force=True,
+            pause_for_confirm=True, feedback=feedback)
+
+    def regen_image(self, project_title, episode_number, target,
+                    feedback=""):
+        """重画单张图:target = {"kind": character_art|scene_art|shot,
+        "name"|"shot_no"};附意见时新画面按意见调整。
+        镜头画面重画会连带重生成首尾帧并作废旧视频(补齐时重拍)。"""
+        project = self.projects.get_project(project_title)
+        if project is None:
+            raise AifosError(f"项目不存在: {project_title}")
+        episode = self.db.query_one(
+            "SELECT * FROM episodes WHERE project_id=? AND number=?",
+            (project["id"], episode_number))
+        if episode is None:
+            raise AifosError(f"剧集不存在: 第{episode_number}集")
+        script, _ = self.projects.latest_document(episode["id"], "script")
+        if script is None:
+            raise AifosError("本集尚无剧本,先完成预生产")
+        aspect = (project["aspect"]
+                  or self.config.get("defaults", "aspect", default="9:16"))
+        ctx = {
+            "project": dict(project), "episode": dict(episode),
+            "out_root": self._episode_dir(project, episode),
+            "aspect": aspect,
+            "dims": ASPECT_DIMS.get(aspect, ASPECT_DIMS["9:16"]),
+            "script": script, "force": True,
+        }
+        self._task_cost = 0.0
+        self._task_providers = set()
+        style = project["style"] or "国风漫剧"
+        kind = target.get("kind")
+        if kind == "character_art":
+            name = target["name"]
+            role = next((c.get("role", "") for c in script["characters"]
+                         if c["name"] == name), "")
+            result = self._call(ctx, "image", {
+                "portrait": True, "art_name": name, "role": role,
+                "shot_no": 0, "characters": [name], "location": "",
+                "prompt": f"角色立绘:{name}({role}),{style},全身,正面",
+                "feedback": feedback,
+                "aspect": aspect, **ctx["dims"],
+            }, "cast")
+            self.assets.register(project["id"], "character_art", name,
+                                 uri=result.uri, meta={"role": role},
+                                 new_version=True)
+        elif kind == "scene_art":
+            name = target["name"]
+            scene = next((s for s in script["scenes"]
+                          if s["location"] == name), {})
+            result = self._call(ctx, "image", {
+                "scene_art": True, "art_name": name,
+                "shot_no": 0, "characters": [], "location": name,
+                "action": scene.get("action", ""),
+                "prompt": f"场景概念图:{name},{style},空镜,氛围感",
+                "feedback": feedback,
+                "aspect": aspect, **ctx["dims"],
+            }, "cast")
+            self.assets.register(project["id"], "scene_art", name,
+                                 uri=result.uri, new_version=True)
+        elif kind == "shot":
+            shot_no = int(target["shot_no"])
+            storyboard, _ = self.projects.latest_document(
+                episode["id"], "storyboard")
+            shot = next((s for s in storyboard["shots"]
+                         if s["shot_no"] == shot_no), None)
+            if shot is None:
+                raise AifosError(f"镜头不存在: {shot_no}")
+            ctx["storyboard"] = storyboard
+            payload = self._shot_payload(ctx, shot)
+            payload["feedback"] = feedback
+            asset_name = self._shot_name(ctx, shot_no)
+            result = self._call(ctx, "image", payload, "images")
+            self.assets.register(project["id"], "image", asset_name,
+                                 uri=result.uri, new_version=True)
+            frames = self._call(ctx, "frames", {
+                **payload, "image_uri": result.uri}, "frames")
+            self.assets.register(project["id"], "first_frame", asset_name,
+                                 uri=frames.data["first"], new_version=True)
+            self.assets.register(project["id"], "last_frame", asset_name,
+                                 uri=frames.data["last"], new_version=True)
+            # 画面变了 → 旧视频作废,「继续补齐」时重拍并重剪
+            self.assets.delete(project["id"], "video", asset_name)
+        else:
+            raise AifosError(f"不支持的重画目标: {kind}")
+        if feedback:
+            self.data.record(
+                "case", "failure", prompt=feedback,
+                meta={"reason": "image_revision", "target": target},
+                episode_id=episode["id"])
+        self.log.info(
+            "director",
+            f"重画完成: {target}(意见: {feedback or '无'})")
+        return {"target": target, "uri": result.uri,
+                "cost": round(self._task_cost, 2)}

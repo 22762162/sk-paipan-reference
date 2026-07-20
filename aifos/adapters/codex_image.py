@@ -30,6 +30,11 @@ def build_instruction(capability, payload, out_dir):
     width = int(payload.get("width", 1080))
     height = int(payload.get("height", 1920))
     size = f"{width}x{height},画幅 {payload.get('aspect', '9:16')}"
+    feedback = payload.get("feedback", "")
+    if feedback:
+        payload = dict(payload)
+        payload["prompt"] = (f"{payload.get('prompt', '')}。"
+                             f"修改意见(必须落实):{feedback}")
     if capability == "image":
         safe = "".join(c if c.isalnum() else "_"
                        for c in str(payload.get("art_name", "")))[:40]

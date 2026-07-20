@@ -97,6 +97,22 @@ def _build_parser():
     p_confirm.add_argument("--project", required=True)
     p_confirm.add_argument("--episode", type=int, required=True)
 
+    p_revise = sub.add_parser(
+        "revise", help="按修改意见重写剧本并重出人物/分镜(回到待确认)")
+    p_revise.add_argument("--project", required=True)
+    p_revise.add_argument("--episode", type=int, required=True)
+    p_revise.add_argument("--feedback", required=True, help="修改意见")
+
+    p_regen = sub.add_parser(
+        "regen", help="附意见重画单张图(人物立绘/场景图/镜头画面)")
+    p_regen.add_argument("--project", required=True)
+    p_regen.add_argument("--episode", type=int, required=True)
+    group = p_regen.add_mutually_exclusive_group(required=True)
+    group.add_argument("--shot", type=int, help="镜头号")
+    group.add_argument("--character", help="人物名")
+    group.add_argument("--scene", help="场景名")
+    p_regen.add_argument("--feedback", default="", help="修改意见(可选)")
+
     p_asset = sub.add_parser("asset", help="IP 资产中心")
     p_asset.add_argument("action", choices=["list", "stats"])
     p_asset.add_argument("--project", required=True, help="项目名")
@@ -424,6 +440,27 @@ def main(argv=None):
             return _cmd_publish(app, args)
         if args.command == "confirm":
             return _cmd_confirm(app, args)
+        if args.command == "revise":
+            app.system.require(args.user, "produce")
+            summary = app.director.revise_script(
+                args.project, args.episode, args.feedback)
+            print(f"剧本已按意见重写,{_status_cn(summary['status'])};"
+                  f"检查后用 confirm 继续")
+            return 0
+        if args.command == "regen":
+            app.system.require(args.user, "produce")
+            if args.shot is not None:
+                target = {"kind": "shot", "shot_no": args.shot}
+            elif args.character:
+                target = {"kind": "character_art", "name": args.character}
+            else:
+                target = {"kind": "scene_art", "name": args.scene}
+            result = app.director.regen_image(
+                args.project, args.episode, target, feedback=args.feedback)
+            print(f"已重画: {result['uri']}(成本 {result['cost']})")
+            if target["kind"] == "shot":
+                print("该镜头旧视频已作废;运行 produce(增量)重拍并重剪")
+            return 0
         if args.command == "asset":
             return _cmd_asset(app, args)
         if args.command == "qc":

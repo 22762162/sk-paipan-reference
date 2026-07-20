@@ -65,12 +65,32 @@ class JobRegistry:
                 "started_at": time.time(),
             }
 
+        def task(app):
+            return app.director.produce(
+                title, number, premise=premise, style=style, force=force,
+                script=script, pause_for_confirm=review, kind=kind)
+
+        self._run(job_id, task)
+        return job_id
+
+    def start_task(self, title, number, task):
+        """通用后台任务(打磨重写/重画)。task(app) → summary。"""
+        with self._lock:
+            self._seq += 1
+            job_id = f"j{self._seq}"
+            self._jobs[job_id] = {
+                "id": job_id, "status": "running",
+                "title": title, "episode": number,
+                "started_at": time.time(),
+            }
+        self._run(job_id, task)
+        return job_id
+
+    def _run(self, job_id, task):
         def run():
             app = App(self.workspace)
             try:
-                summary = app.director.produce(
-                    title, number, premise=premise, style=style, force=force,
-                    script=script, pause_for_confirm=review, kind=kind)
+                summary = task(app)
                 self._jobs[job_id].update(
                     status="done", summary=summary, finished_at=time.time())
             except Exception as exc:  # 后台任务兜底,错误进任务状态
@@ -80,7 +100,6 @@ class JobRegistry:
                 app.close()
 
         threading.Thread(target=run, daemon=True).start()
-        return job_id
 
     def get(self, job_id):
         return self._jobs.get(job_id)
@@ -88,6 +107,13 @@ class JobRegistry:
     def list(self):
         return sorted(self._jobs.values(),
                       key=lambda j: j["started_at"], reverse=True)
+
+
+def _versioned(url, row):
+    """重画同名文件后靠版本参数破除浏览器缓存。"""
+    if url and url.startswith("/artifacts/"):
+        return f"{url}?v={row['version']}"
+    return url
 
 
 def _artifact_url(app, uri):
@@ -120,7 +146,7 @@ def _collect_artifacts(app, project_id, ep_num):
                 "last_frame": "last", "video": "videos"}
     for row in rows:
         kind, name = row["kind"], row["name"]
-        url = _artifact_url(app, row["uri"])
+        url = _versioned(_artifact_url(app, row["uri"]), row)
         shot = shot_re.match(name)
         if shot and kind in kind_map:
             out[kind_map[kind]][int(shot.group(1))] = url
@@ -142,17 +168,24 @@ def _collect_artifacts(app, project_id, ep_num):
                     {"scene_no": int(clip.group(1)), "url": url})
     out["clips"].sort(key=lambda c: c["scene_no"])
     # 人物立绘与场景概念图(项目级资产,跨集复用)
+    def latest_rows(kind):
+        rows_ = app.db.query(
+            "SELECT * FROM assets WHERE project_id=? AND kind=? "
+            "ORDER BY name, version", (project_id, kind))
+        latest = {}
+        for row in rows_:
+            latest[row["name"]] = row
+        return latest.values()
+
     out["cast_art"] = [
-        {"name": row["name"], "url": _artifact_url(app, row["uri"]),
+        {"name": row["name"],
+         "url": _versioned(_artifact_url(app, row["uri"]), row),
          "role": json.loads(row["meta"]).get("role", "")}
-        for row in app.db.query(
-            "SELECT * FROM assets WHERE project_id=? AND kind='character_art' "
-            "ORDER BY id", (project_id,))]
+        for row in latest_rows("character_art")]
     out["scene_art"] = [
-        {"name": row["name"], "url": _artifact_url(app, row["uri"])}
-        for row in app.db.query(
-            "SELECT * FROM assets WHERE project_id=? AND kind='scene_art' "
-            "ORDER BY id", (project_id,))]
+        {"name": row["name"],
+         "url": _versioned(_artifact_url(app, row["uri"]), row)}
+        for row in latest_rows("scene_art")]
     return out
 
 
@@ -309,6 +342,10 @@ def make_handler(workspace, jobs):
                     return self._produce()
                 if parsed.path == "/api/confirm":
                     return self._confirm()
+                if parsed.path == "/api/revise":
+                    return self._revise()
+                if parsed.path == "/api/regen_image":
+                    return self._regen_image()
                 return self._error(404, "未知路径")
             except BrokenPipeError:
                 pass
@@ -416,6 +453,67 @@ def make_handler(workspace, jobs):
             if found is None:
                 return self._error(404, "剧集不存在")
             job_id = jobs.start(found[0], found[1], review=False)
+            return self._json({"job_id": job_id}, status=202)
+
+        def _episode_ref(self, body):
+            episode_id = body.get("episode_id")
+            if not episode_id:
+                return None
+
+            def lookup(app):
+                episode = app.projects.get_episode(int(episode_id))
+                if episode is None:
+                    return None
+                project = app.db.query_one(
+                    "SELECT * FROM projects WHERE id=?",
+                    (episode["project_id"],))
+                return project["title"], episode["number"]
+
+            return self._with_app(lookup)
+
+        def _read_body(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                return json.loads(
+                    self.rfile.read(length).decode("utf-8")) if length else {}
+            except ValueError:
+                return None
+
+        def _revise(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            feedback = (body.get("feedback") or "").strip()
+            if not feedback:
+                return self._error(400, "请填写修改意见")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            job_id = jobs.start_task(
+                title, number,
+                lambda app: app.director.revise_script(
+                    title, number, feedback))
+            return self._json({"job_id": job_id}, status=202)
+
+        def _regen_image(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            target = body.get("target") or {}
+            if target.get("kind") not in ("character_art", "scene_art",
+                                          "shot"):
+                return self._error(400, "target.kind 需为 "
+                                        "character_art/scene_art/shot")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            feedback = (body.get("feedback") or "").strip()
+            job_id = jobs.start_task(
+                title, number,
+                lambda app: app.director.regen_image(
+                    title, number, target, feedback=feedback))
             return self._json({"job_id": job_id}, status=202)
 
     return Handler

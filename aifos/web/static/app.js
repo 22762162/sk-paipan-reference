@@ -392,8 +392,32 @@ function buildLineIndex(script) {
   };
 }
 
-/* 剧本阅读视图(覆盖层) */
-function showScriptOverlay(script) {
+/* 剧本 → 可编辑文本(与导入格式一致) */
+function scriptToText(script) {
+  return script.scenes.map((s) => {
+    const lines = [`第${s.scene_no}场 ${s.location}`];
+    if (s.action) lines.push(s.action);
+    (s.lines || []).forEach((l) => lines.push(`${l.character}:${l.dialogue}`));
+    return lines.join("\n");
+  }).join("\n\n");
+}
+
+async function pollJob(jobId, onDone) {
+  const timer = setInterval(async () => {
+    try {
+      const job = await api(`/api/jobs/${jobId}`);
+      if (job.status !== "running") {
+        clearInterval(timer);
+        if (job.status === "failed") showToast(job.error || "任务失败", "error");
+        onDone(job);
+      }
+    } catch (e) { clearInterval(timer); }
+  }, 1200);
+}
+
+/* 剧本阅读 + 打磨(意见重写 / 直接编辑) */
+function showScriptOverlay(data, episodeId) {
+  const script = data.script;
   if (!script) return;
   const overlay = document.createElement("div");
   overlay.className = "script-overlay";
@@ -403,6 +427,18 @@ function showScriptOverlay(script) {
         <h3>《${esc(script.project_title)}》第${script.episode_number}集
             ${script.episode_title ? " · " + esc(script.episode_title) : ""}</h3>
         <button class="close">关闭 Esc</button>
+      </div>
+      <div class="revise-bar">
+        <textarea id="revise-feedback" rows="2"
+          placeholder="对剧本的修改意见,例如:节奏太慢,第2场加冲突;台词更口语化"></textarea>
+        <div class="revise-actions">
+          <button class="primary" id="btn-revise">✏️ 按意见重写剧本</button>
+          <button id="btn-edit-toggle">📝 直接编辑文字</button>
+        </div>
+      </div>
+      <div id="edit-area" hidden>
+        <textarea id="edit-text" rows="14"></textarea>
+        <button class="primary" id="btn-edit-submit">用这版剧本重做</button>
       </div>
       <p class="logline">${esc(script.logline || "")}</p>
       <div class="cast">${(script.characters || []).map((c) =>
@@ -421,6 +457,81 @@ function showScriptOverlay(script) {
   overlay.querySelector(".close").onclick = close;
   document.addEventListener("keydown", onKey);
   document.body.appendChild(overlay);
+
+  const post = (path, body) => api(path, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body) });
+  overlay.querySelector("#btn-revise").onclick = async () => {
+    const feedback = overlay.querySelector("#revise-feedback").value.trim();
+    if (!feedback) { showToast("先写一句修改意见", "error"); return; }
+    try {
+      await post("/api/revise", { episode_id: data.episode.id, feedback });
+      close();
+      showToast("正在按你的意见重写剧本并重出人物/分镜…", "ok");
+      pollTimer = setInterval(() => renderCanvasView(episodeId), 3000);
+    } catch (e) { showToast(e.message, "error"); }
+  };
+  const editArea = overlay.querySelector("#edit-area");
+  overlay.querySelector("#btn-edit-toggle").onclick = () => {
+    editArea.hidden = !editArea.hidden;
+    if (!editArea.hidden) {
+      overlay.querySelector("#edit-text").value = scriptToText(script);
+    }
+  };
+  overlay.querySelector("#btn-edit-submit").onclick = async () => {
+    try {
+      await post("/api/produce", {
+        title: data.project.title,
+        episode: data.episode.number,
+        script_text: overlay.querySelector("#edit-text").value,
+        review: true,
+      });
+      close();
+      showToast("已按你的文字重做,人物/分镜将自动更新…", "ok");
+      pollTimer = setInterval(() => renderCanvasView(episodeId), 3000);
+    } catch (e) { showToast(e.message, "error"); }
+  };
+}
+
+/* 单张图片附意见重画 */
+function regenControls(target, label) {
+  return `<div class="regen-box" data-target="${esc(JSON.stringify(target))}">
+    <button class="regen-toggle">🔄 ${esc(label)}</button>
+    <div class="regen-form" hidden>
+      <input placeholder="修改意见,如:换成夜晚/表情更凶(可留空)">
+      <button class="primary regen-go">重画</button>
+    </div></div>`;
+}
+
+function bindRegen(container, episodeId, getData) {
+  container.querySelectorAll(".regen-box").forEach((box) => {
+    const form = box.querySelector(".regen-form");
+    box.querySelector(".regen-toggle").onclick = () => {
+      form.hidden = !form.hidden;
+      if (!form.hidden) form.querySelector("input").focus();
+    };
+    box.querySelector(".regen-go").onclick = async () => {
+      const target = JSON.parse(box.dataset.target);
+      const feedback = form.querySelector("input").value.trim();
+      const btn = box.querySelector(".regen-go");
+      btn.disabled = true; btn.textContent = "重画中…";
+      try {
+        const reply = await api("/api/regen_image", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ episode_id: episodeId, target, feedback }),
+        });
+        pollJob(reply.job_id, (job) => {
+          if (job.status === "done") {
+            showToast("已重画完成", "ok");
+            renderCanvasView(episodeId);
+          } else { btn.disabled = false; btn.textContent = "重画"; }
+        });
+      } catch (e) {
+        showToast(e.message, "error");
+        btn.disabled = false; btn.textContent = "重画";
+      }
+    };
+  });
 }
 
 /* 可内联播放的媒体标签(真实产线 mp4/wav;mock 的 json 描述文件回退为链接) */
@@ -564,7 +675,7 @@ async function renderCanvasView(episodeId) {
     armConfirm(ev.target, "补齐", () => reproduce(false));
   document.getElementById("btn-reproduce-force").onclick = (ev) =>
     armConfirm(ev.target, "重做", () => reproduce(true));
-  document.getElementById("btn-script").onclick = () => showScriptOverlay(script);
+  document.getElementById("btn-script").onclick = () => showScriptOverlay(data, episodeId);
   document.getElementById("btn-play").onclick = () => openPlayer(data);
   const btnConfirm = document.getElementById("btn-confirm");
   if (btnConfirm) btnConfirm.onclick = async () => {
@@ -716,15 +827,17 @@ class StoryboardCanvas {
       panel.innerHTML = `
         <h3>本集总览</h3>
         <button class="primary play-cta" id="panel-play">▶ 播放本集(${fmt(this.data.storyboard.shots.reduce((a, s) => a + s.duration, 0), 0)}秒)</button>
-        ${(art.cast_art || []).length ? `<h4>人物</h4>
+        ${(art.cast_art || []).length ? `<h4>人物 · 不满意可附意见重画</h4>
         <div class="art-grid">${art.cast_art.map((c) => `
           <figure><img src="${esc(c.url)}" alt="${esc(c.name)}">
-          <figcaption>${esc(c.name)}${c.role ? " · " + esc(c.role) : ""}</figcaption></figure>`).join("")}
+          <figcaption>${esc(c.name)}${c.role ? " · " + esc(c.role) : ""}</figcaption>
+          ${regenControls({ kind: "character_art", name: c.name }, "重画")}</figure>`).join("")}
         </div>` : ""}
         ${(art.scene_art || []).length ? `<h4>场景</h4>
         <div class="art-grid">${art.scene_art.map((s) => `
           <figure><img src="${esc(s.url)}" alt="${esc(s.name)}">
-          <figcaption>${esc(s.name)}</figcaption></figure>`).join("")}
+          <figcaption>${esc(s.name)}</figcaption>
+          ${regenControls({ kind: "scene_art", name: s.name }, "重画")}</figure>`).join("")}
         </div>` : ""}
         ${art.cover ? `<img class="preview" src="${esc(art.cover)}" alt="封面">` : ""}
         ${art.titles.length ? `<h4>候选标题</h4><ul class="titles-list">
@@ -749,6 +862,7 @@ class StoryboardCanvas {
         </ul>`;
       const playBtn = panel.querySelector("#panel-play");
       if (playBtn) playBtn.onclick = () => openPlayer(this.data);
+      bindRegen(panel, this.data.episode.id, () => this.data);
       return;
     }
     const shot = this.data.storyboard.shots.find((s) => s.shot_no === shotNo);
@@ -781,8 +895,11 @@ class StoryboardCanvas {
         ${this.link("视频", art.videos[shotNo])}
         ${lineNo != null ? this.link("配音", art.voices[lineNo]) : ""}
       </ul>
+      <h4>画面不满意?</h4>
+      ${regenControls({ kind: "shot", shot_no: shotNo }, "附意见重画本镜头")}
       ${issues.length ? `<h4>质检问题</h4>${issues.map((i) => `
         <div class="issue ${esc(i.severity)}">[${esc(i.check)}] ${esc(i.message)}</div>`).join("")}` : ""}`;
+    bindRegen(panel, this.data.episode.id, () => this.data);
   }
 
   link(label, url) {

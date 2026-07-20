@@ -137,6 +137,7 @@ def run(request, claude, timeout):
     if shutil.which(claude) is None and not Path(claude).exists():
         return {"ok": False, "error": f"claude 命令不存在: {claude}"}
     if capability == "script":
+        feedback = payload.get("feedback", "")
         if payload.get("template") == "idol":
             prompt = IDOL_PROMPT.format(
                 persona=payload.get("persona")
@@ -150,6 +151,13 @@ def run(request, claude, timeout):
                 episode=payload.get("episode_number", 0),
                 style=payload.get("style", "") or "国风漫剧",
                 premise=payload.get("premise", "") or "自由发挥")
+        if feedback:
+            previous = json.dumps(
+                payload.get("previous_script", {}), ensure_ascii=False)
+            prompt = (
+                f"这是上一版剧本:\n{previous}\n\n"
+                f"用户的修改意见(必须逐条落实):{feedback}\n\n"
+                f"请在保留可取之处的前提下按意见重写。{prompt}")
     elif capability == "storyboard":
         prompt = STORYBOARD_PROMPT.format(
             script=json.dumps(payload.get("script", {}), ensure_ascii=False))

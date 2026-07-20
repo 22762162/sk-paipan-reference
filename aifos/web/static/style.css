@@ -27,6 +27,7 @@
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   background: var(--page);
@@ -323,6 +324,24 @@ td.num, th.num { text-align: right; }
   font-size: 11px; color: var(--ink-2); text-align: center; margin-top: 3px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+
+/* 打磨:剧本重写与图片重画 */
+.revise-bar { margin: 12px 0; display: grid; gap: 8px; }
+.revise-bar textarea, #edit-area textarea {
+  width: 100%; font-family: inherit; font-size: 13px;
+  background: var(--surface-2); color: var(--ink);
+  border: 1px solid var(--hairline); border-radius: 8px;
+  padding: 8px 12px; resize: vertical;
+}
+.revise-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+#edit-area { display: grid; gap: 8px; margin-bottom: 8px; }
+.regen-box { margin-top: 4px; }
+.regen-toggle { width: 100%; font-size: 11px; padding: 4px 6px; }
+.regen-form { display: flex; gap: 6px; margin-top: 4px; }
+.regen-form input {
+  flex: 1; min-width: 0; font-size: 11px; padding: 5px 8px;
+}
+.regen-form button { font-size: 11px; padding: 4px 10px; white-space: nowrap; }
 
 /* 整集播放器 */
 .player-overlay {

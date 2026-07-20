@@ -74,6 +74,12 @@ class AssetCenter:
             "SELECT * FROM assets WHERE project_id=? AND kind=? "
             "ORDER BY name, version", (project_id, kind))
 
+    def delete(self, project_id, kind, name):
+        """删除某资产全部版本(用于作废需重新生成的产物)。"""
+        self.db.execute(
+            "DELETE FROM assets WHERE project_id=? AND kind=? AND name=?",
+            (project_id, kind, name))
+
     def stats(self, project_id):
         return self.db.query(
             "SELECT kind, COUNT(*) AS total, SUM(reuse_count) AS reused "
