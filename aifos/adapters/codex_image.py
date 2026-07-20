@@ -65,7 +65,7 @@ def build_instruction(capability, payload, out_dir):
 def run(request, codex, timeout, extra_args):
     capability = request["capability"]
     payload = request.get("payload", {})
-    out_dir = Path(request["out_dir"])
+    out_dir = Path(request["out_dir"]).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     if shutil.which(codex) is None and not Path(codex).exists():
         return {"ok": False, "error": f"codex 命令不存在: {codex}"}

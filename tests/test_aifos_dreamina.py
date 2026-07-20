@@ -60,8 +60,10 @@ def test_frames2video_command_shape(tmp_path, fake_dreamina):
             "duration": 3.0,
         }, app.workspace.artifacts_dir)
         assert result.provider == "jimeng"
-        assert result.uri.endswith("result.mp4")
+        # 成片从即梦输出路径归档进平台产物目录
+        assert result.uri.endswith("shot_001.mp4")
         assert os.path.exists(result.uri)
+        assert str(app.workspace.artifacts_dir.resolve()) in result.uri
         assert result.data["model_version"] == REQUIRED_MODEL_VERSION
 
         (call,) = _calls(fake_dreamina)

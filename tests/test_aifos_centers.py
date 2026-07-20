@@ -74,6 +74,20 @@ def test_permissions(app):
     app.system.require("admin", "manage")
 
 
+def test_workspace_paths_absolute(tmp_path, monkeypatch):
+    """产物 uri 会交给外部子进程,workspace 必须解析为绝对路径。"""
+    monkeypatch.chdir(tmp_path)
+    relative = App("rel_ws")
+    try:
+        assert relative.workspace.root.is_absolute()
+        assert relative.workspace.artifacts_dir.is_absolute()
+        summary = relative.director.produce("路径剧", 1)
+        from pathlib import Path
+        assert Path(summary["outputs"]["final"]).is_absolute()
+    finally:
+        relative.close()
+
+
 def test_logs_recorded(app):
     app.logger.info("test", "你好日志")
     rows = app.logger.tail(5)

@@ -439,24 +439,31 @@ class Director:
         if not ctx.get("qc_report", {}).get("passed", False):
             self.log.warn("ops", "质检未通过,跳过封面/标题/拆条")
             return {"skipped": True}
-        cover = self.ops.make_cover(ctx["script"], ctx["out_root"] / "ops")
-        self._task_cost += cover.cost
-        self._task_providers.add(cover.provider)
-        self.projects.add_episode_cost(ctx["episode"]["id"], cover.cost)
-        ctx["cover_uri"] = cover.uri
+        ep_name = f"e{ctx['episode']['number']:03d}"
+        existing_cover = self._existing_asset_uri(ctx, "cover", ep_name)
+        if existing_cover:
+            ctx["cover_uri"] = existing_cover
+        else:
+            cover = self.ops.make_cover(
+                ctx["script"], ctx["out_root"] / "ops")
+            self._task_cost += cover.cost
+            self._task_providers.add(cover.provider)
+            self.projects.add_episode_cost(ctx["episode"]["id"], cover.cost)
+            ctx["cover_uri"] = cover.uri
         ctx["titles"] = self.ops.make_titles(ctx["script"])
         ctx["clips"] = self.ops.make_clips(
             ctx["storyboard"], ctx["out_root"] / "ops")
         project_id = ctx["project"]["id"]
-        ep = f"e{ctx['episode']['number']:03d}"
-        self.assets.register(project_id, "cover", ep, uri=cover.uri)
         self.assets.register(
-            project_id, "title", ep, meta={"candidates": ctx["titles"]})
+            project_id, "cover", ep_name, uri=ctx["cover_uri"])
+        self.assets.register(
+            project_id, "title", ep_name, meta={"candidates": ctx["titles"]})
         for clip in ctx["clips"]:
             self.assets.register(
-                project_id, "clip", f"{ep}_scene{clip['scene_no']:02d}",
+                project_id, "clip", f"{ep_name}_scene{clip['scene_no']:02d}",
                 uri=clip["uri"])
-        return {"titles": len(ctx["titles"]), "clips": len(ctx["clips"])}
+        return {"titles": len(ctx["titles"]), "clips": len(ctx["clips"]),
+                "cover_reused": bool(existing_cover)}
 
     def _stage_archive(self, ctx):
         """数据沉淀:Prompt、图片、视频、配音、成/败案例入库。"""

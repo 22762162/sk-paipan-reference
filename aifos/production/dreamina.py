@@ -20,6 +20,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+
+
 from ..errors import ProviderError
 from .base import Provider, ProviderResult
 
@@ -49,12 +51,17 @@ class DreaminaProvider(Provider):
     def generate(self, capability, payload, out_dir):
         if capability != "video":
             raise ProviderError(f"dreamina 适配器不支持能力: {capability}")
-        out_dir = Path(out_dir)
+        out_dir = Path(out_dir).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
         first = payload.get("first", "")
         last = payload.get("last", "")
         if not first or not last:
             raise ProviderError("dreamina frames2video 需要首尾帧(first/last)")
+        # 首尾帧以绝对路径交给外部 CLI,避免随子进程 cwd 漂移
+        if not first.startswith(("http://", "https://")):
+            first = str(Path(first).resolve())
+        if not last.startswith(("http://", "https://")):
+            last = str(Path(last).resolve())
         shot_no = int(payload.get("shot_no", 0))
         model_version = self.conf.get(
             "model_version", REQUIRED_MODEL_VERSION)
@@ -87,6 +94,7 @@ class DreaminaProvider(Provider):
         if not uri:
             raise ProviderError(
                 f"未能从 dreamina 输出解析出视频地址(详见 {log_path})")
+        uri = self._ingest(uri, out_dir, shot_no)
         return ProviderResult(
             provider=self.name,
             cost=self.cost_per_call,
@@ -98,6 +106,21 @@ class DreaminaProvider(Provider):
             },
             uri=uri,
         )
+
+    @staticmethod
+    def _ingest(uri, out_dir, shot_no):
+        """把即梦落在外部路径的成片归档进平台产物目录(资产沉淀),
+        以便 Web 端服务、质检与跨次复用;远程 URL 原样保留。"""
+        if uri.startswith(("http://", "https://")):
+            return uri
+        source = Path(uri).resolve()
+        managed = (Path(out_dir) / f"shot_{shot_no:03d}.mp4").resolve()
+        if source == managed:
+            return str(managed)
+        if not source.exists():
+            raise ProviderError(f"dreamina 返回的视频不存在: {source}")
+        shutil.copy2(source, managed)
+        return str(managed)
 
     # ---- 输出解析:优先 JSON 行,回退正则找 .mp4 地址 ----
     @staticmethod

@@ -16,7 +16,9 @@ from .system_center import Logger, SystemCenter
 
 class Workspace:
     def __init__(self, root):
-        self.root = Path(root)
+        # 绝对路径:产物 uri 会交给外部 Provider 子进程(codex/dreamina),
+        # 相对路径会随子进程 cwd 漂移
+        self.root = Path(root).resolve()
         self.config_path = self.root / "config.json"
         self.db_path = self.root / "aifos.db"
         self.logs_dir = self.root / "logs"
