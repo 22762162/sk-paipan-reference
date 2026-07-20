@@ -27,12 +27,15 @@ from pathlib import Path
 def build_instruction(capability, payload, out_dir):
     """返回 (给 codex 的指令, 期望产出的文件列表, 应答的 data 字段)。"""
     out_dir = Path(out_dir)
+    width = int(payload.get("width", 1080))
+    height = int(payload.get("height", 1920))
+    size = f"{width}x{height},画幅 {payload.get('aspect', '9:16')}"
     if capability == "image":
         shot_no = int(payload["shot_no"])
         target = out_dir / f"shot_{shot_no:03d}.keyframe.png"
         instruction = (
             f"为漫剧分镜生成一张关键图并保存到 {target}"
-            f"(PNG,1280x720,16:9)。画面内容:{payload.get('prompt', '')}。"
+            f"(PNG,{size})。画面内容:{payload.get('prompt', '')}。"
             f"出场角色:{'、'.join(payload.get('characters', []))}。"
             "可用 Python(Pillow/绘制 SVG 后转换)或其他可用工具完成;"
             "只产出该文件,不要改动其他文件。"
@@ -44,7 +47,7 @@ def build_instruction(capability, payload, out_dir):
         last = out_dir / f"shot_{shot_no:03d}.last.png"
         instruction = (
             f"基于关键图 {payload.get('image_uri', '')} 为镜头生成首帧与尾帧,"
-            f"分别保存到 {first} 和 {last}(PNG,1280x720)。"
+            f"分别保存到 {first} 和 {last}(PNG,{size})。"
             f"镜头内容:{payload.get('prompt', '')}。"
             "首帧为动作起始、尾帧为动作结束,保持角色与场景一致;"
             "只产出这两个文件。"
@@ -54,7 +57,7 @@ def build_instruction(capability, payload, out_dir):
     if capability == "cover":
         target = out_dir / "cover.png"
         instruction = (
-            f"为漫剧生成竖版封面并保存到 {target}(PNG,810x1080)。"
+            f"为账号内容生成封面并保存到 {target}(PNG,{size})。"
             f"作品《{payload.get('title', '')}》第{payload.get('episode', 0)}集,"
             f"主题:{payload.get('tagline', '')}。只产出该文件。"
         )

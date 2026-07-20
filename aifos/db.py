@@ -10,6 +10,9 @@ CREATE TABLE IF NOT EXISTS projects(
   description TEXT NOT NULL DEFAULT '',
   style TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'active',
+  kind TEXT NOT NULL DEFAULT 'drama',     -- drama 漫剧 / idol AI虚拟偶像
+  account TEXT NOT NULL DEFAULT '',       -- 绑定的抖音等平台账号
+  aspect TEXT NOT NULL DEFAULT '',        -- 画幅:空=用全局默认(9:16)
   created_at REAL NOT NULL
 );
 
@@ -108,6 +111,14 @@ def now():
     return time.time()
 
 
+# 既有库的列级迁移:(表, 列, 声明)
+MIGRATIONS = [
+    ("projects", "kind", "TEXT NOT NULL DEFAULT 'drama'"),
+    ("projects", "account", "TEXT NOT NULL DEFAULT ''"),
+    ("projects", "aspect", "TEXT NOT NULL DEFAULT ''"),
+]
+
+
 class Database:
     def __init__(self, path):
         self.path = str(path)
@@ -115,7 +126,16 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self):
+        for table, column, decl in MIGRATIONS:
+            cols = {row[1] for row in self.conn.execute(
+                f"PRAGMA table_info({table})")}
+            if column not in cols:
+                self.conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def execute(self, sql, params=()):
         cur = self.conn.execute(sql, params)

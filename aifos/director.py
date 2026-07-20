@@ -11,6 +11,12 @@ from pathlib import Path
 from .db import now
 from .errors import BudgetExceeded
 
+# 画幅 → 像素尺寸(视频/图片);封面用竖版比例
+ASPECT_DIMS = {
+    "9:16": {"width": 1080, "height": 1920},
+    "16:9": {"width": 1920, "height": 1080},
+}
+
 STAGES = [
     ("script", "剧本"),
     ("storyboard", "分镜"),
@@ -54,11 +60,15 @@ class Director:
             f"开始制作《{project_title}》第{episode_number}集 "
             f"(episode_id={episode['id']},force={force})")
 
+        aspect = (project["aspect"]
+                  or self.config.get("defaults", "aspect", default="9:16"))
         ctx = {
             "project": dict(project),
             "episode": dict(episode),
             "out_root": self._episode_dir(project, episode),
             "force": force,
+            "aspect": aspect,
+            "dims": ASPECT_DIMS.get(aspect, ASPECT_DIMS["9:16"]),
         }
         stage_reports = []
         failed = False
@@ -92,7 +102,9 @@ class Director:
                 "cover": ctx.get("cover_uri", ""),
                 "titles": ctx.get("titles", []),
                 "clips": [c["uri"] for c in ctx.get("clips", [])],
+                "publish": ctx.get("publish_kit", {}).get("uri", ""),
             },
+            "aspect": ctx["aspect"],
         }
         (ctx["out_root"] / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2),
@@ -192,6 +204,8 @@ class Director:
             "episode_number": episode["number"],
             "premise": episode["premise"],
             "style": ctx["project"]["style"],
+            "template": ctx["project"]["kind"],       # drama / idol
+            "persona": ctx["project"]["title"],       # 偶像人设名=项目名
         }, "script")
         script = result.data
         version = self.projects.save_document(episode["id"], "script", script)
@@ -259,6 +273,7 @@ class Director:
                 "shot_no": shot["shot_no"],
                 "prompt": shot["prompt"],
                 "characters": shot["characters"],
+                "aspect": ctx["aspect"], **ctx["dims"],
             }, "images")
             self._register_shot_asset(ctx, "image", shot["shot_no"],
                                       result.uri)
@@ -283,6 +298,7 @@ class Director:
                 "shot_no": shot["shot_no"],
                 "image_uri": images[shot["shot_no"]],
                 "prompt": shot["prompt"],
+                "aspect": ctx["aspect"], **ctx["dims"],
             }, "frames")
             self._register_shot_asset(
                 ctx, "first_frame", shot["shot_no"], result.data["first"])
@@ -319,6 +335,7 @@ class Director:
             "duration": shot["duration"],
             "first": frame["first"],
             "last": frame["last"],
+            "aspect": ctx["aspect"], **ctx["dims"],
         }, "videos")
         self._register_shot_asset(ctx, "video", shot["shot_no"], result.uri)
         return {"shot_no": shot["shot_no"], "uri": result.uri,
@@ -372,6 +389,7 @@ class Director:
             "shots": ctx["videos"],
             "voices": ctx["voices"],
             "subtitles": ctx["subtitles"],
+            "aspect": ctx["aspect"], **ctx["dims"],
         }, "edit")
         ctx["final_uri"] = result.uri
         ctx["edit_data"] = result.data
@@ -445,12 +463,13 @@ class Director:
             ctx["cover_uri"] = existing_cover
         else:
             cover = self.ops.make_cover(
-                ctx["script"], ctx["out_root"] / "ops")
+                ctx["script"], ctx["out_root"] / "ops", aspect=ctx["aspect"])
             self._task_cost += cover.cost
             self._task_providers.add(cover.provider)
             self.projects.add_episode_cost(ctx["episode"]["id"], cover.cost)
             ctx["cover_uri"] = cover.uri
-        ctx["titles"] = self.ops.make_titles(ctx["script"])
+        ctx["titles"] = self.ops.make_titles(
+            ctx["script"], kind=ctx["project"]["kind"])
         ctx["clips"] = self.ops.make_clips(
             ctx["storyboard"], ctx["out_root"] / "ops")
         project_id = ctx["project"]["id"]
@@ -462,8 +481,14 @@ class Director:
             self.assets.register(
                 project_id, "clip", f"{ep_name}_scene{clip['scene_no']:02d}",
                 uri=clip["uri"])
+        # 发布包:成片/封面/标题/话题标签一站式,供人工一键上传
+        kit = self.ops.make_publish_kit(
+            ctx["project"], ctx["episode"], ctx,
+            ctx["out_root"] / "publish")
+        ctx["publish_kit"] = kit
         return {"titles": len(ctx["titles"]), "clips": len(ctx["clips"]),
-                "cover_reused": bool(existing_cover)}
+                "cover_reused": bool(existing_cover),
+                "hashtags": len(kit["hashtags"])}
 
     def _stage_archive(self, ctx):
         """数据沉淀:Prompt、图片、视频、配音、成/败案例入库。"""

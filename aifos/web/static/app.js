@@ -110,12 +110,20 @@ async function renderDashboard() {
     </div>
 
     <div class="panel">
-      <h2>IP 资产沉淀</h2>
-      ${Object.keys(data.asset_stats).length ? Object.entries(data.asset_stats).map(([proj, rows]) => `
-        <div style="margin-bottom:8px"><b>${esc(proj)}</b></div>
+      <h2>账号矩阵 · IP 资产沉淀</h2>
+      ${Object.keys(data.asset_stats).length ? Object.entries(data.asset_stats).map(([proj, rows]) => {
+        const p = data.projects.find((x) => x.title === proj) || {};
+        const kindCN = { drama: "漫剧", idol: "AI虚拟偶像" }[p.kind] || p.kind || "";
+        return `
+        <div style="margin-bottom:8px"><b>${esc(proj)}</b>
+          <span class="chip" style="margin-left:8px">${esc(kindCN)}</span>
+          ${p.account ? `<span class="chip">@${esc(p.account)}</span>` : ""}
+          <span class="chip">${esc(p.aspect || "9:16")}</span>
+        </div>
         <div class="asset-chips" style="margin-bottom:12px">
           ${rows.map((r) => `<span class="chip">${esc(KIND_CN[r.kind] || r.kind)} ×${r.total}${r.reused ? ` · 复用${r.reused}` : ""}</span>`).join("")}
-        </div>`).join("") : `<div class="empty">暂无资产</div>`}
+        </div>`;
+      }).join("") : `<div class="empty">暂无资产</div>`}
     </div>
 
     <div class="panel">

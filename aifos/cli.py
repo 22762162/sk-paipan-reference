@@ -66,10 +66,22 @@ def _build_parser():
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8619)
 
-    p_project = sub.add_parser("project", help="项目管理")
-    p_project.add_argument("action", choices=["list", "create"])
-    p_project.add_argument("--title", help="项目名")
-    p_project.add_argument("--style", default="", help="画风")
+    p_project = sub.add_parser("project", help="项目管理(账号矩阵)")
+    p_project.add_argument("action", choices=["list", "create", "set"])
+    p_project.add_argument("--title", help="项目名(偶像项目=偶像人设名)")
+    p_project.add_argument("--style", default=None, help="画风/人设风格")
+    p_project.add_argument("--kind", default=None,
+                           choices=["drama", "idol"],
+                           help="内容类型:drama 漫剧 / idol AI虚拟偶像")
+    p_project.add_argument("--account", default=None,
+                           help="绑定的抖音等平台账号名")
+    p_project.add_argument("--aspect", default=None,
+                           choices=["9:16", "16:9"],
+                           help="画幅(默认跟随全局 9:16)")
+
+    p_publish = sub.add_parser("publish", help="查看某集发布包(成片/封面/标题/话题)")
+    p_publish.add_argument("--project", required=True)
+    p_publish.add_argument("--episode", type=int, required=True)
 
     p_asset = sub.add_parser("asset", help="IP 资产中心")
     p_asset.add_argument("action", choices=["list", "stats"])
@@ -178,18 +190,57 @@ def _cmd_status(app):
 
 
 def _cmd_project(app, args):
-    if args.action == "create":
+    if args.action in ("create", "set"):
         if not args.title:
             print("--title 必填", file=sys.stderr)
             return 2
         app.system.require(args.user, "write")
         _, created = app.projects.get_or_create_project(
-            args.title, style=args.style)
-        print(("已创建" if created else "已存在") + f"项目《{args.title}》")
+            args.title, style=args.style or "",
+            kind=args.kind or "drama",
+            account=args.account or "", aspect=args.aspect or "")
+        if not created:
+            app.projects.update_project(
+                args.title, style=args.style, kind=args.kind,
+                account=args.account, aspect=args.aspect)
+        row = app.projects.get_project(args.title)
+        kind_cn = {"drama": "漫剧", "idol": "AI虚拟偶像"}.get(
+            row["kind"], row["kind"])
+        print(("已创建" if created else "已更新") + f"项目《{args.title}》 "
+              f"类型={kind_cn} 账号={row['account'] or '-'} "
+              f"画幅={row['aspect'] or '默认(9:16)'}")
         return 0
     for row in app.projects.list_projects():
-        print(f"[{row['id']}] {row['title']} 风格={row['style'] or '-'} "
-              f"状态={row['status']}")
+        kind_cn = {"drama": "漫剧", "idol": "偶像"}.get(
+            row["kind"], row["kind"])
+        print(f"[{row['id']}] {row['title']} 类型={kind_cn} "
+              f"账号={row['account'] or '-'} "
+              f"画幅={row['aspect'] or '9:16'} 状态={row['status']}")
+    return 0
+
+
+def _cmd_publish(app, args):
+    project = app.projects.get_project(args.project)
+    if project is None:
+        print(f"项目不存在: {args.project}", file=sys.stderr)
+        return 2
+    kit_path = (app.workspace.artifacts_dir / f"p{project['id']:03d}"
+                / f"e{args.episode:03d}" / "publish" / "publish.json")
+    if not kit_path.exists():
+        print("发布包不存在(该集尚未制作完成或质检未过)", file=sys.stderr)
+        return 1
+    kit = json.loads(kit_path.read_text(encoding="utf-8"))
+    print(f"=== 发布包 · {kit['account']} · 第{kit['episode']}集 "
+          f"({kit['aspect']}) ===")
+    print(f"成片: {kit['video']}")
+    print(f"封面: {kit['cover']}")
+    for title in kit["titles"]:
+        print(f"候选标题: {title}")
+    print(f"话题: {' '.join(kit['hashtags'])}")
+    for clip in kit["clips"]:
+        print(f"拆条: 场{clip['scene_no']}({clip['duration']}s) {clip['uri']}")
+    print(f"建议: {kit['publish_hint']}")
+    print(f"包文件: {kit_path}")
     return 0
 
 
@@ -326,6 +377,8 @@ def main(argv=None):
             return _cmd_status(app)
         if args.command == "project":
             return _cmd_project(app, args)
+        if args.command == "publish":
+            return _cmd_publish(app, args)
         if args.command == "asset":
             return _cmd_asset(app, args)
         if args.command == "qc":

@@ -136,6 +136,8 @@ def test_auto_rerun_repairs_missing_video(tmp_path):
             "cast": [c["name"] for c in script["characters"]],
             "images": [], "frames": [], "videos": [], "voices": [],
             "subtitles": [],
+            "aspect": "9:16",
+            "dims": {"width": 1080, "height": 1920},
         }
         # 重建产物索引(videos 索引指向已删除文件 → 触发重跑)
         ctx["frames"] = [

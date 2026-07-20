@@ -9,19 +9,33 @@ class ProjectCenter:
     def __init__(self, db):
         self.db = db
 
-    # ---- 项目 ----
-    def get_or_create_project(self, title, description="", style=""):
+    # ---- 项目(账号矩阵:一个项目 = 一个账号的内容线) ----
+    def get_or_create_project(self, title, description="", style="",
+                              kind="drama", account="", aspect=""):
         row = self.db.query_one(
             "SELECT * FROM projects WHERE title=?", (title,))
         if row is not None:
             return row, False
         self.db.execute(
-            "INSERT INTO projects(title, description, style, created_at) "
-            "VALUES(?,?,?,?)",
-            (title, description, style, now()),
+            "INSERT INTO projects(title, description, style, kind, account, "
+            "aspect, created_at) VALUES(?,?,?,?,?,?,?)",
+            (title, description, style, kind, account, aspect, now()),
         )
         return self.db.query_one(
             "SELECT * FROM projects WHERE title=?", (title,)), True
+
+    def update_project(self, title, **fields):
+        allowed = {"description", "style", "kind", "account", "aspect",
+                   "status"}
+        updates = {k: v for k, v in fields.items()
+                   if k in allowed and v is not None}
+        if not updates:
+            return self.get_project(title)
+        assignments = ", ".join(f"{k}=?" for k in updates)
+        self.db.execute(
+            f"UPDATE projects SET {assignments} WHERE title=?",
+            (*updates.values(), title))
+        return self.get_project(title)
 
     def get_project(self, title):
         return self.db.query_one("SELECT * FROM projects WHERE title=?", (title,))

@@ -13,6 +13,9 @@ from pathlib import Path
 # 外部 Provider 默认 enabled=false:未接入真实 CLI/API 时自动回退到内置 mock,
 # 保证完整生产流程离线可跑;接入后把对应 enabled 置 true 即切换为真实产线。
 DEFAULTS = {
+    "defaults": {
+        "aspect": "9:16",              # 全局默认画幅(抖音竖屏);项目可设 16:9
+    },
     "budget": {
         "per_episode": 200.0,          # 单集成本预算(成本单位)
     },

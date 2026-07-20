@@ -20,6 +20,15 @@ VILLAINS = ["蚀骨妖王", "夜枭真君", "赤瞳魔尊", "幽泉老祖"]
 LOCATIONS = ["古镇长街", "藏经阁", "迷雾山谷", "断桥残雪", "妖市地穴", "青云峰顶"]
 CAMERAS = ["远景推近", "特写", "过肩镜头", "俯拍全景", "手持跟拍", "环绕运镜"]
 
+# AI 虚拟偶像模板素材池
+IDOL_TOPICS = ["新歌翻唱", "今日穿搭", "粉丝问答", "日常vlog", "舞蹈挑战"]
+IDOL_SPOTS = ["直播间", "天台夕阳", "便利店门口", "录音棚", "地铁站台"]
+
+
+def _dims(payload, default_w=1080, default_h=1920):
+    return (int(payload.get("width", default_w)),
+            int(payload.get("height", default_h)))
+
 
 def _digest(payload):
     blob = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -63,8 +72,10 @@ class MockProvider(Provider):
         return ProviderResult(
             provider=self.name, cost=self.cost_per_call, data=data, uri=uri)
 
-    # ---- 剧本 ----
+    # ---- 剧本(drama 漫剧 / idol AI虚拟偶像) ----
     def _gen_script(self, payload, out_dir):
+        if payload.get("template") == "idol":
+            return self._gen_idol_script(payload, out_dir)
         seed = _digest(payload)
         title = payload.get("project_title", "未命名")
         number = payload.get("episode_number", 1)
@@ -111,6 +122,50 @@ class MockProvider(Provider):
                 {"name": partner, "role": "同伴"},
                 {"name": villain, "role": "反派"},
             ],
+            "scenes": scenes,
+        }
+        uri = _json_artifact(out_dir / "script.json", script)
+        return script, uri
+
+    def _gen_idol_script(self, payload, out_dir):
+        """虚拟偶像口播短视频:开场钩子 → 主体内容 → 引导关注。"""
+        seed = _digest(payload)
+        idol = payload.get("persona") or payload.get("project_title", "小艾")
+        number = payload.get("episode_number", 1)
+        premise = payload.get("premise", "")
+        topic = premise or _pick(IDOL_TOPICS, seed, 0)
+        spot = _pick(IDOL_SPOTS, seed, 1)
+        scenes = [
+            {"scene_no": 1, "location": "直播间",
+             "characters": [idol],
+             "action": f"{idol}对镜头挥手开场",
+             "lines": [
+                 {"character": idol,
+                  "dialogue": f"哈喽大家好,我是{idol}!今天聊聊{topic}~"},
+             ]},
+            {"scene_no": 2, "location": spot,
+             "characters": [idol],
+             "action": f"{idol}在{spot}展示{topic}",
+             "lines": [
+                 {"character": idol,
+                  "dialogue": f"这次{topic}我准备了一个小惊喜。"},
+                 {"character": idol,
+                  "dialogue": "三、二、一,一起来看!"},
+             ]},
+            {"scene_no": 3, "location": "直播间",
+             "characters": [idol],
+             "action": f"{idol}比心收尾",
+             "lines": [
+                 {"character": idol,
+                  "dialogue": f"喜欢的话点个关注,第{number}期我们下期见!"},
+             ]},
+        ]
+        script = {
+            "project_title": payload.get("project_title", idol),
+            "episode_number": number,
+            "episode_title": f"{topic}篇",
+            "logline": f"{idol}的第{number}期:{topic}。",
+            "characters": [{"name": idol, "role": "主角"}],
             "scenes": scenes,
         }
         uri = _json_artifact(out_dir / "script.json", script)
@@ -165,10 +220,11 @@ class MockProvider(Provider):
     def _gen_image(self, payload, out_dir):
         seed = _digest(payload)
         shot_no = payload["shot_no"]
+        width, height = _dims(payload)
         uri = _svg(
             out_dir / f"shot_{shot_no:03d}.keyframe.svg",
             [f"Shot {shot_no:03d}", payload.get("prompt", "")[:36]],
-            seed,
+            seed, width=width, height=height,
         )
         return {"shot_no": shot_no}, uri
 
@@ -176,10 +232,13 @@ class MockProvider(Provider):
     def _gen_frames(self, payload, out_dir):
         seed = _digest(payload)
         shot_no = payload["shot_no"]
+        width, height = _dims(payload)
         first = _svg(out_dir / f"shot_{shot_no:03d}.first.svg",
-                     [f"Shot {shot_no:03d} 首帧"], seed)
+                     [f"Shot {shot_no:03d} 首帧"], seed,
+                     width=width, height=height)
         last = _svg(out_dir / f"shot_{shot_no:03d}.last.svg",
-                    [f"Shot {shot_no:03d} 尾帧"], seed[::-1])
+                    [f"Shot {shot_no:03d} 尾帧"], seed[::-1],
+                    width=width, height=height)
         return {"first": first, "last": last}, first
 
     # ---- 视频 ----
@@ -249,11 +308,12 @@ class MockProvider(Provider):
     # ---- 封面 ----
     def _gen_cover(self, payload, out_dir):
         seed = _digest(payload)
+        width, height = _dims(payload, 1080, 1920)
         uri = _svg(
             out_dir / "cover.svg",
             [f"《{payload.get('title', '')}》",
              f"第{payload.get('episode', 0)}集",
              payload.get("tagline", "")[:32]],
-            seed, width=810, height=1080,
+            seed, width=width, height=height,
         )
         return {}, uri

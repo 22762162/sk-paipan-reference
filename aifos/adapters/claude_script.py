@@ -34,6 +34,23 @@ JSON 格式(字段必须齐全):
    "characters": ["出场角色名"], "action": "本场动作描述",
    "lines": [{{"character": "角色名", "dialogue": "台词"}}]}}]}}"""
 
+IDOL_PROMPT = """你是 AI 虚拟偶像「{persona}」的内容策划。为第{episode}期短视频写口播脚本。
+人设风格:{style};本期主题:{premise}。
+
+要求:
+- 竖屏短视频节奏:开场 3 秒钩子 → 主体内容 → 结尾引导关注;
+- 2 到 3 场(场=背景/机位切换),全部台词由「{persona}」一人口播;
+- 台词口语化、有网感,单句不超过 22 个字;
+- 只输出一个 JSON 对象,不要任何其他文字、解释或 Markdown 代码块。
+
+JSON 格式(字段必须齐全,characters 只含「{persona}」一人):
+{{"project_title": "{persona}", "episode_number": {episode},
+ "episode_title": "本期小标题", "logline": "一句话内容概要",
+ "characters": [{{"name": "{persona}", "role": "主角"}}],
+ "scenes": [{{"scene_no": 1, "location": "场景",
+   "characters": ["{persona}"], "action": "画面动作描述",
+   "lines": [{{"character": "{persona}", "dialogue": "口播台词"}}]}}]}}"""
+
 STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成分镜表。
 
 剧本:
@@ -118,11 +135,19 @@ def run(request, claude, timeout):
     if shutil.which(claude) is None and not Path(claude).exists():
         return {"ok": False, "error": f"claude 命令不存在: {claude}"}
     if capability == "script":
-        prompt = SCRIPT_PROMPT.format(
-            title=payload.get("project_title", ""),
-            episode=payload.get("episode_number", 0),
-            style=payload.get("style", "") or "国风漫剧",
-            premise=payload.get("premise", "") or "自由发挥")
+        if payload.get("template") == "idol":
+            prompt = IDOL_PROMPT.format(
+                persona=payload.get("persona")
+                or payload.get("project_title", ""),
+                episode=payload.get("episode_number", 0),
+                style=payload.get("style", "") or "元气少女",
+                premise=payload.get("premise", "") or "自选一个日常主题")
+        else:
+            prompt = SCRIPT_PROMPT.format(
+                title=payload.get("project_title", ""),
+                episode=payload.get("episode_number", 0),
+                style=payload.get("style", "") or "国风漫剧",
+                premise=payload.get("premise", "") or "自由发挥")
     elif capability == "storyboard":
         prompt = STORYBOARD_PROMPT.format(
             script=json.dumps(payload.get("script", {}), ensure_ascii=False))
