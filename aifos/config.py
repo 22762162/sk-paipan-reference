@@ -71,6 +71,31 @@ DEFAULTS = {
             "command": ["jianying-cli"],
             "cost_per_call": 0.5, "timeout": 1200,
         },
+        "claude_api": {
+            # Claude 官方 API 直连(Messages API):Claude CLI 的 API 模式
+            "type": "claude_api", "enabled": False,
+            "capabilities": ["script", "storyboard"],
+            "endpoint": "https://api.anthropic.com", "api_key": "",
+            "model": "claude-opus-4-8", "max_tokens": 16000,
+            "cost_per_call": 0.8, "timeout": 600,
+        },
+        "image_api": {
+            # OpenAI 兼容出图 API:Codex 出图的 API 模式
+            "type": "image_api", "enabled": False,
+            "capabilities": ["image", "frames", "cover"],
+            "endpoint": "https://api.openai.com", "api_key": "",
+            "model": "gpt-image-1",
+            "cost_per_call": 1.5, "timeout": 300,
+        },
+        "ark": {
+            # 火山方舟 Ark 视频 API:Seedance2 的 API 模式(即梦 CLI 备用)
+            "type": "ark_video", "enabled": False,
+            "capabilities": ["video"],
+            "endpoint": "https://ark.cn-beijing.volces.com", "api_key": "",
+            "model": "seedance-2.0-fast",   # 按实际开通的模型/接入点 ID 填
+            "video_resolution": "720p", "duration": 8, "poll": 5,
+            "cost_per_call": 2.5, "timeout": 1800,
+        },
         "api": {
             "type": "api", "enabled": False,
             "capabilities": ["image", "video", "voice"],
@@ -84,16 +109,16 @@ DEFAULTS = {
             "cost_per_call": 0.1,
         },
     },
-    # 能力路由:按顺序尝试,前者不可用/失败自动回退后者
+    # 能力路由:按顺序尝试,前者不可用/失败自动回退后者(CLI → API → mock)
     "routing": {
-        "script": ["claude", "mock"],
-        "storyboard": ["claude", "mock"],
-        "image": ["codex", "api", "mock"],
-        "frames": ["codex", "mock"],
-        "video": ["jimeng", "api", "mock"],
+        "script": ["claude", "claude_api", "mock"],
+        "storyboard": ["claude", "claude_api", "mock"],
+        "image": ["codex", "image_api", "api", "mock"],
+        "frames": ["codex", "image_api", "mock"],
+        "video": ["jimeng", "ark", "api", "mock"],
         "voice": ["jimeng", "say", "api", "mock"],
         "edit": ["jianying", "mock"],
-        "cover": ["codex", "mock"],
+        "cover": ["codex", "image_api", "mock"],
     },
 }
 

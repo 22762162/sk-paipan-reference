@@ -127,10 +127,11 @@ def test_produce_flow_and_episode_api(server):
 
 
 def test_produce_rejects_bad_input(server):
+    # 自由识别后随便一句话都能开工;只有空输入才拒绝
     status, reply = _json_request(
-        server["port"], "POST", "/api/produce", {"sentence": "随便说说"})
+        server["port"], "POST", "/api/produce", {"sentence": ""})
     assert status == 400
-    assert "无法识别" in reply["error"]
+    assert "作品名" in reply["error"]
     status, _ = _json_request(server["port"], "POST", "/api/produce", {})
     assert status == 400
 

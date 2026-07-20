@@ -39,9 +39,10 @@ def _build_parser():
     sub.add_parser("init", help="初始化工作区(数据库/配置/目录)")
 
     p_produce = sub.add_parser(
-        "produce", help="制作一集:produce \"开始制作《万妖图录》第15集\"")
+        "produce", help="制作一集:produce \"万妖图录 第15集\"(格式随意,"
+                        "自动匹配作品名;不写集数自动接着做下一集)")
     p_produce.add_argument("sentence", nargs="?", default="",
-                           help="一句话指令,含《作品名》第N集")
+                           help="一句话指令,写作品名即可,集数可省略")
     p_produce.add_argument("--title", help="作品名(与 sentence 二选一)")
     p_produce.add_argument("--episode", type=int, help="集数")
     p_produce.add_argument("--premise", default="", help="本集前提/梗概")
@@ -76,8 +77,11 @@ def _build_parser():
     p_serve.add_argument("--port", type=int, default=8619)
 
     p_project = sub.add_parser("project", help="项目管理(账号矩阵)")
-    p_project.add_argument("action", choices=["list", "create", "set"])
+    p_project.add_argument("action",
+                           choices=["list", "create", "set", "rename"])
     p_project.add_argument("--title", help="项目名(偶像项目=偶像人设名)")
+    p_project.add_argument("--new-title", dest="new_title",
+                           help="rename 用:新项目名")
     p_project.add_argument("--style", default=None, help="画风/人设风格")
     p_project.add_argument("--kind", default=None,
                            choices=["drama", "idol"],
@@ -153,19 +157,46 @@ def _build_parser():
     p_user.add_argument("--name")
     p_user.add_argument("--role", default="operator",
                         choices=["admin", "operator", "viewer"])
+
+    p_config = sub.add_parser(
+        "config", help="设置中心:各环节 AI 用 CLI 还是 API,自由配置")
+    p_config.add_argument("action", choices=["list", "set", "route", "test"])
+    p_config.add_argument("--provider",
+                          help="provider 名,如 claude/claude_api/codex/"
+                               "image_api/jimeng/ark")
+    p_config.add_argument("--enable", action="store_true", help="启用")
+    p_config.add_argument("--disable", action="store_true", help="停用")
+    p_config.add_argument("--api-key", dest="api_key", help="API Key")
+    p_config.add_argument("--endpoint", help="API 地址")
+    p_config.add_argument("--model", help="模型名(API 模式)")
+    p_config.add_argument("--model-version", dest="model_version",
+                          help="即梦 CLI 模型版本")
+    # dest 不能叫 command:会覆盖子命令本身的 dest="command"
+    p_config.add_argument("--command", dest="cli_command",
+                          help='CLI 命令整串,如 "dreamina" 或 '
+                               '"python3 -m aifos.adapters.claude_script '
+                               '--claude /path/claude"')
+    p_config.add_argument("--timeout", type=int, help="超时(秒)")
+    p_config.add_argument("--capability",
+                          help="route 用:能力名(script/image/video…)")
+    p_config.add_argument("--chain",
+                          help="route 用:调用顺序,逗号分隔,"
+                               "如 jimeng,ark,mock")
     return parser
 
 
 def _cmd_produce(app, args):
     title, number = args.title, args.episode
-    if args.sentence:
-        parsed = parse_produce_sentence(args.sentence)
-        if parsed:
-            title, number = parsed
-    if not title or not number:
-        print("无法识别制作目标。示例:produce \"开始制作《万妖图录》第15集\""
-              " 或 produce --title 万妖图录 --episode 15", file=sys.stderr)
-        return 2
+    if args.sentence or not (title and number):
+        from .smart_input import resolve_produce_target
+        try:
+            title, number, note = resolve_produce_target(
+                app, args.sentence, title=title, number=number)
+        except AifosError as exc:
+            print(f"{exc}", file=sys.stderr)
+            return 2
+        if note:
+            print(f"({note})")
     app.system.require(args.user, "produce")
     script = None
     if getattr(args, "script_file", None):
@@ -265,6 +296,14 @@ def _cmd_status(app):
 
 
 def _cmd_project(app, args):
+    if args.action == "rename":
+        if not args.title or not args.new_title:
+            print("rename 需要 --title 与 --new-title", file=sys.stderr)
+            return 2
+        app.system.require(args.user, "write")
+        app.projects.rename_project(args.title, args.new_title)
+        print(f"项目已改名:《{args.title}》 → 《{args.new_title}》")
+        return 0
     if args.action in ("create", "set"):
         if not args.title:
             print("--title 必填", file=sys.stderr)
@@ -413,6 +452,80 @@ def _cmd_user(app, args):
     return 0
 
 
+def _cmd_config(app, args):
+    from .settings import (CAPABILITY_CN, set_routing, settings_payload,
+                           test_provider, update_provider)
+    if args.action == "list":
+        view = settings_payload(app)
+        print("== 能力路由(按顺序尝试,自动回退)==")
+        for cap, chain in view["routing"].items():
+            print(f"  {CAPABILITY_CN.get(cap, cap):<4} "
+                  f"{cap:<12} {' → '.join(chain)}")
+        print("\n== Provider ==")
+        for p in view["providers"]:
+            state = "✓启用" if p["enabled"] else "－停用"
+            ready = "就绪" if p["ready"] else \
+                (p["checks"][0]["reason"] if p["checks"] else "")
+            detail = p["command"] or p["endpoint"] or ""
+            if p["api_key_set"]:
+                detail += f"  key={p['api_key_masked']}"
+            model = p["model"] or p["model_version"]
+            if model:
+                detail += f"  model={model}"
+            print(f"  [{p['mode']:<3}] {p['name']:<12} {state:<4} "
+                  f"{p['label']:<24} {ready}")
+            if detail.strip():
+                print(f"        {detail.strip()}")
+        print(f"\n配置文件: {view['config_path']}")
+        return 0
+    if args.action == "set":
+        if not args.provider:
+            print("--provider 必填", file=sys.stderr)
+            return 2
+        fields = {}
+        if args.enable:
+            fields["enabled"] = True
+        if args.disable:
+            fields["enabled"] = False
+        for key in ("api_key", "endpoint", "model", "model_version",
+                    "timeout"):
+            value = getattr(args, key, None)
+            if value is not None:
+                fields[key] = value
+        if args.cli_command is not None:
+            fields["command"] = args.cli_command
+        written = update_provider(
+            app.workspace.config_path, args.provider, fields)
+        if not written:
+            print("没有要修改的字段(用 --enable/--api-key/--command 等)",
+                  file=sys.stderr)
+            return 2
+        shown = {k: ("****" if k == "api_key" else v)
+                 for k, v in written.items()}
+        print(f"已更新 {args.provider}: {shown}(下次运行生效)")
+        return 0
+    if args.action == "route":
+        if not args.capability or not args.chain:
+            print("route 需要 --capability 与 --chain", file=sys.stderr)
+            return 2
+        chain = [c.strip() for c in args.chain.split(",") if c.strip()]
+        set_routing(app.workspace.config_path, args.capability, chain)
+        print(f"已更新路由 {args.capability}: {' → '.join(chain)}")
+        return 0
+    if not args.provider:
+        print("--provider 必填", file=sys.stderr)
+        return 2
+    report = test_provider(app, args.provider)
+    print(f"== {args.provider} 连通性 ==")
+    for r in report["results"]:
+        mark = "✓" if r["ok"] else "✗"
+        print(f"  {mark} {CAPABILITY_CN.get(r['capability'], r['capability'])}"
+              f"({r['capability']}): {r['reason']}")
+    if report["extra"]:
+        print(f"  {report['extra']}")
+    return 0 if report["ok"] else 1
+
+
 def main(argv=None):
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -521,6 +634,8 @@ def main(argv=None):
             return _cmd_logs(app, args)
         if args.command == "user":
             return _cmd_user(app, args)
+        if args.command == "config":
+            return _cmd_config(app, args)
         parser.print_help()
         return 0
     except AifosError as exc:

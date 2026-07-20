@@ -3,6 +3,7 @@
 import json
 
 from .db import now
+from .errors import AifosError
 
 
 class ProjectCenter:
@@ -36,6 +37,22 @@ class ProjectCenter:
             f"UPDATE projects SET {assignments} WHERE title=?",
             (*updates.values(), title))
         return self.get_project(title)
+
+    def rename_project(self, title, new_title):
+        """项目改名:剧集/资产/产物都按 project_id 关联,改名不动数据。"""
+        new_title = (new_title or "").strip()
+        if not new_title:
+            raise AifosError("新名字不能为空")
+        row = self.get_project(title)
+        if row is None:
+            raise AifosError(f"项目不存在: {title}")
+        if new_title == title:
+            return row
+        if self.get_project(new_title) is not None:
+            raise AifosError(f"已存在同名项目: {new_title}")
+        self.db.execute(
+            "UPDATE projects SET title=? WHERE id=?", (new_title, row["id"]))
+        return self.get_project(new_title)
 
     def get_project(self, title):
         return self.db.query_one("SELECT * FROM projects WHERE title=?", (title,))

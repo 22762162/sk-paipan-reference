@@ -43,7 +43,8 @@ def test_cli_init_and_produce(tmp_path, capsys):
 
 def test_cli_produce_rejects_unparsable(tmp_path, capsys):
     ws = str(tmp_path / "ws")
-    assert main(["--workspace", ws, "produce", "做点什么"]) == 2
+    # 自由识别后,随便一句话都能开工;只有空输入才拒绝
+    assert main(["--workspace", ws, "produce", ""]) == 2
 
 
 def test_cli_viewer_cannot_produce(tmp_path, capsys):

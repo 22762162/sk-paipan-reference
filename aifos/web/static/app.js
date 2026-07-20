@@ -67,6 +67,7 @@ function route() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   const m = location.hash.match(/^#\/episode\/(\d+)$/);
   if (m) renderCanvasView(Number(m[1]));
+  else if (location.hash === "#/settings") renderSettings();
   else renderDashboard();
 }
 
@@ -96,7 +97,7 @@ async function renderDashboard() {
         <button type="button" class="kind-tab" data-kind="drama">🎬 剧情短剧</button>
         <button type="button" class="kind-tab" data-kind="idol">💫 虚拟偶像/女团</button>
       </div>
-      <input name="sentence" placeholder='写下作品名和集数,例如:开始制作《苏念的一天》第1集' required>
+      <input name="sentence" placeholder='写作品名就行,例如:苏念的一天(集数可不写,自动接着做下一集)' required>
       <input name="premise" placeholder="内容方向,例如:偶像女团 / 都市职场 / 仙侠(可不填)">
       <button class="primary" type="submit">开始制作</button>
       <textarea name="script" rows="5" hidden placeholder="把你的剧本粘贴到这里,人物、场次、分镜会自动识别。写法示例:
@@ -166,6 +167,7 @@ async function renderDashboard() {
           <span class="chip" style="margin-left:8px">${esc(kindCN)}</span>
           ${p.account ? `<span class="chip">@${esc(p.account)}</span>` : ""}
           <span class="chip">${esc(p.aspect || "9:16")}</span>
+          <button class="mini-btn proj-rename" data-title="${esc(proj)}" title="修改项目名">✎ 改名</button>
         </div>
         <div class="asset-chips" style="margin-bottom:12px">
           ${rows.map((r) => `<span class="chip">${esc(KIND_CN[r.kind] || r.kind)} ×${r.total}${r.reused ? ` · 复用${r.reused}` : ""}</span>`).join("")}
@@ -197,6 +199,9 @@ async function renderDashboard() {
   renderProgressBanner(data);
   app.querySelectorAll("tr.clickable").forEach((tr) =>
     tr.addEventListener("click", () => { location.hash = `#/episode/${tr.dataset.ep}`; }));
+  app.querySelectorAll(".proj-rename").forEach((btn) =>
+    btn.addEventListener("click", () =>
+      renameProject(btn.dataset.title, renderDashboard)));
 
   api("/api/logs?limit=30").then((rows) => {
     const el = document.getElementById("log-list");
@@ -218,7 +223,7 @@ async function onProduce(ev) {
   const btn = form.querySelector("button");
   btn.disabled = true; btn.textContent = "提交中…";
   try {
-    await api("/api/produce", {
+    const reply = await api("/api/produce", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -228,12 +233,195 @@ async function onProduce(ev) {
         kind: form.dataset.kind || "",
       }),
     });
-    showToast("制作任务已提交,进度会自动刷新", "ok");
+    showToast(reply.note
+      ? `${reply.note},任务已提交`
+      : `《${reply.title}》第${reply.episode}集 制作任务已提交`, "ok");
     renderDashboard();
   } catch (e) {
     showToast(e.message, "error");
     btn.disabled = false; btn.textContent = "开始制作";
   }
+}
+
+/* ================= 项目改名 ================= */
+function renameProject(title, onDone) {
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay";
+  overlay.innerHTML = `
+    <div class="script-panel rename-panel">
+      <div class="script-head"><h3>项目改名</h3>
+        <button class="close">关闭 Esc</button></div>
+      <p class="logline">剧集、素材、成片都按项目关联,改名不影响已有内容。</p>
+      <div class="rename-row">
+        <input id="rename-input" value="${esc(title)}" maxlength="40">
+        <button class="primary" id="rename-go">保存</button>
+      </div>
+    </div>`;
+  const close = () => {
+    overlay.remove();
+    document.removeEventListener("keydown", onKey);
+  };
+  const onKey = (ev) => { if (ev.key === "Escape") close(); };
+  document.addEventListener("keydown", onKey);
+  overlay.addEventListener("click", (ev) => { if (ev.target === overlay) close(); });
+  overlay.querySelector(".close").onclick = close;
+  document.body.appendChild(overlay);
+  const input = overlay.querySelector("#rename-input");
+  input.focus(); input.select();
+  const go = async () => {
+    const value = input.value.trim();
+    if (!value || value === title) { close(); return; }
+    try {
+      await api("/api/project/rename", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, new_title: value }),
+      });
+      showToast(`已改名:《${title}》 → 《${value}》`, "ok");
+      close();
+      if (onDone) onDone(value);
+    } catch (e) { showToast(e.message, "error"); }
+  };
+  overlay.querySelector("#rename-go").onclick = go;
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") go();
+  });
+}
+
+/* ================= 设置中心:每个环节 CLI / API 自由配置 ================= */
+const CAP_LABEL = {
+  script: "剧本", storyboard: "分镜", image: "图片", frames: "首尾帧",
+  video: "视频", voice: "配音", edit: "剪辑", cover: "封面",
+};
+
+async function renderSettings() {
+  topbarRight.innerHTML = "";
+  let data;
+  try { data = await api("/api/settings"); }
+  catch (e) { app.innerHTML = `<div class="loading">加载失败:${esc(e.message)}</div>`; return; }
+  drawSettings(data);
+}
+
+function drawSettings(data) {
+  app.innerHTML = `
+  <div class="settings">
+    <div class="settings-head">
+      <button id="btn-back">← 仪表盘</button>
+      <h1>⚙️ AI 产线设置</h1>
+      <span class="hint">剧本 / 图片 / 视频每个环节都能选 CLI 或 API,按顺序自动回退;都没配好也有内置产线兜底,流程不会断</span>
+    </div>
+    <div class="panel">
+      <h2>能力路由 · 每个环节谁来干(按顺序尝试)</h2>
+      <table class="route-table">
+        <thead><tr><th>环节</th><th>调用顺序(逗号分隔,前面不可用自动用后面)</th><th></th></tr></thead>
+        <tbody>
+        ${Object.entries(data.routing).map(([cap, chain]) => `
+          <tr data-cap="${esc(cap)}">
+            <td>${esc(CAP_LABEL[cap] || cap)} <small class="dim">${esc(cap)}</small></td>
+            <td><input class="route-input" value="${esc(chain.join(", "))}"></td>
+            <td><button class="route-save">保存</button></td>
+          </tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+    <div class="settings-grid">
+      ${data.providers.map(providerCard).join("")}
+    </div>
+    <div class="panel dim" style="font-size:12px">
+      配置文件:${esc(data.config_path)}(改动即存,下一次制作生效;API Key 只存本机,不回显)
+    </div>
+  </div>`;
+  document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
+  const post = (body) => api("/api/settings", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  app.querySelectorAll("tr[data-cap]").forEach((tr) => {
+    tr.querySelector(".route-save").onclick = async () => {
+      try {
+        const fresh = await post({
+          capability: tr.dataset.cap,
+          chain: tr.querySelector(".route-input").value,
+        });
+        showToast("路由已保存", "ok");
+        drawSettings(fresh);
+      } catch (e) { showToast(e.message, "error"); }
+    };
+  });
+  app.querySelectorAll(".provider-card").forEach((card) => {
+    const name = card.dataset.provider;
+    card.querySelector(".pc-save").onclick = async () => {
+      const fields = {};
+      card.querySelectorAll("[data-field]").forEach((input) => {
+        if (input.type === "checkbox") fields[input.dataset.field] = input.checked;
+        else if (input.value.trim() !== "") fields[input.dataset.field] = input.value.trim();
+      });
+      try {
+        const fresh = await post({ provider: name, fields });
+        showToast("已保存,下一次制作生效", "ok");
+        drawSettings(fresh);
+      } catch (e) { showToast(e.message, "error"); }
+    };
+    card.querySelector(".pc-test").onclick = async () => {
+      const el = card.querySelector(".pc-status");
+      el.innerHTML = `<div class="dim">测试中…</div>`;
+      try {
+        const r = await api("/api/settings/test", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider: name }),
+        });
+        el.innerHTML = checksHtml(r.results) +
+          (r.extra ? `<div class="dim">${esc(r.extra)}</div>` : "");
+      } catch (e) {
+        el.innerHTML = `<div class="miss">✗ ${esc(e.message)}</div>`;
+      }
+    };
+  });
+}
+
+function checksHtml(checks) {
+  return (checks || []).map((c) => `
+    <div class="${c.ok ? "ok" : "miss"}">${c.ok ? "✓" : "✗"}
+      ${esc(CAP_LABEL[c.capability] || c.capability)}:${esc(c.reason)}</div>`).join("");
+}
+
+function providerCard(p) {
+  const isApi = ["api", "claude_api", "image_api", "ark_video"].includes(p.type);
+  const isCli = ["cli", "dreamina"].includes(p.type);
+  const state = p.ready ? ["done", "就绪"]
+    : p.enabled ? ["qc_failed", "待配置"] : ["", "未启用"];
+  return `
+  <div class="panel provider-card" data-provider="${esc(p.name)}">
+    <div class="pc-head">
+      <h2>${esc(p.label)}</h2>
+      <span class="chip">${esc(p.mode)}</span>
+      <span class="chip ${state[0]}">${state[1]}</span>
+    </div>
+    <div class="pc-caps">${p.capabilities.map((c) =>
+      `<span class="chip">${esc(CAP_LABEL[c] || c)}</span>`).join("")}</div>
+    <label class="set-row toggle"><span>启用</span>
+      <input type="checkbox" data-field="enabled" ${p.enabled ? "checked" : ""}>
+      <em>${p.enabled ? "参与自动路由" : "跳过,用下一个"}</em></label>
+    ${isCli ? `<label class="set-row"><span>命令</span>
+      <input data-field="command" value="${esc(p.command)}"
+        placeholder="可执行文件或整串命令"></label>` : ""}
+    ${p.type === "dreamina" ? `<label class="set-row"><span>模型版本</span>
+      <input data-field="model_version" value="${esc(p.model_version)}"></label>` : ""}
+    ${isApi ? `
+      <label class="set-row"><span>接口地址</span>
+        <input data-field="endpoint" value="${esc(p.endpoint)}"></label>
+      <label class="set-row"><span>API Key</span>
+        <input data-field="api_key" type="password"
+          placeholder="${p.api_key_set
+            ? `已保存(${esc(p.api_key_masked)}),留空保持不变`
+            : "粘贴 API Key"}"></label>
+      ${p.type !== "api" ? `<label class="set-row"><span>模型</span>
+        <input data-field="model" value="${esc(p.model)}"></label>` : ""}` : ""}
+    <div class="pc-actions">
+      <button class="primary pc-save">保存</button>
+      <button class="pc-test">测试连接</button>
+    </div>
+    <div class="pc-status">${checksHtml(p.checks)}</div>
+  </div>`;
 }
 
 /* ================= 整集播放器(动态分镜连播) ================= */
@@ -863,7 +1051,8 @@ function renderTheater(data, canvas) {
   el.innerHTML = `
     <div class="hero" style="background-image:url('${hero.replace(/'/g, "%27")}')">
       <div class="hero-content">
-        <h1>${esc(data.project.title)}</h1>
+        <h1>${esc(data.project.title)}
+          <button class="mini-btn" id="hero-rename" title="修改项目名">✎</button></h1>
         <div class="hero-meta">
           <span class="chip">${esc(kindCN)}</span>
           <span class="chip">第${data.episode.number}集${data.episode.title ? " · " + esc(data.episode.title) : ""}</span>
@@ -910,6 +1099,9 @@ function renderTheater(data, canvas) {
   el.querySelector("#hero-script").onclick = () =>
     document.getElementById("btn-script").click();
   el.querySelector("#hero-export").onclick = () => exportEpisode(data);
+  el.querySelector("#hero-rename").onclick = () =>
+    renameProject(data.project.title,
+      () => renderCanvasView(data.episode.id));
   el.querySelectorAll(".t-card").forEach((card) => {
     card.addEventListener("click", () =>
       openPlayer(data, Number(card.dataset.shot)));

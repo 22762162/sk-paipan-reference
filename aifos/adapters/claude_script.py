@@ -131,11 +131,8 @@ def validate_storyboard(storyboard):
     return None
 
 
-def run(request, claude, timeout):
-    capability = request["capability"]
-    payload = request.get("payload", {})
-    if shutil.which(claude) is None and not Path(claude).exists():
-        return {"ok": False, "error": f"claude 命令不存在: {claude}"}
+def build_prompt(capability, payload):
+    """构造编剧/分镜提示词(CLI 桥与 Claude API Provider 共用)。"""
     if capability == "script":
         feedback = payload.get("feedback", "")
         if payload.get("template") == "idol":
@@ -158,11 +155,22 @@ def run(request, claude, timeout):
                 f"这是上一版剧本:\n{previous}\n\n"
                 f"用户的修改意见(必须逐条落实):{feedback}\n\n"
                 f"请在保留可取之处的前提下按意见重写。{prompt}")
-    elif capability == "storyboard":
-        prompt = STORYBOARD_PROMPT.format(
+        return prompt
+    if capability == "storyboard":
+        return STORYBOARD_PROMPT.format(
             script=json.dumps(payload.get("script", {}), ensure_ascii=False))
-    else:
-        return {"ok": False, "error": f"claude 适配桥不支持能力: {capability}"}
+    raise ValueError(f"claude 编剧不支持能力: {capability}")
+
+
+def run(request, claude, timeout):
+    capability = request["capability"]
+    payload = request.get("payload", {})
+    if shutil.which(claude) is None and not Path(claude).exists():
+        return {"ok": False, "error": f"claude 命令不存在: {claude}"}
+    try:
+        prompt = build_prompt(capability, payload)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     try:
         proc = subprocess.run(
             [claude, "-p", prompt], capture_output=True, text=True,

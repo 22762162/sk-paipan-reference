@@ -519,3 +519,62 @@ audio.player { background: var(--surface-2); }
 .script-panel .action { color: var(--ink-3); font-size: 13px; margin-bottom: 8px; }
 .script-panel .line { padding: 4px 0; font-size: 14px; }
 .script-panel .line b { color: var(--ink-2); margin-right: 10px; }
+
+/* ---------- 项目改名 ---------- */
+.topbar-actions { display: flex; gap: 14px; align-items: center; }
+.nav-link {
+  color: var(--ink-2); text-decoration: none; font-size: 13px;
+  padding: 6px 12px; border: 1px solid var(--hairline); border-radius: 8px;
+}
+.nav-link:hover { color: var(--ink); border-color: var(--accent); }
+.mini-btn {
+  font-size: 12px; padding: 3px 9px; margin-left: 8px;
+  background: var(--surface-2); color: var(--ink-2);
+  border: 1px solid var(--hairline); border-radius: 7px; cursor: pointer;
+  vertical-align: middle;
+}
+.mini-btn:hover { color: var(--ink); border-color: var(--accent); }
+.hero-content h1 .mini-btn {
+  background: rgba(0, 0, 0, .35); font-size: 14px; padding: 4px 11px;
+}
+.rename-panel { width: min(460px, 100%); }
+.rename-row { display: flex; gap: 10px; margin-top: 6px; }
+.rename-row input {
+  flex: 1; background: var(--surface-2); border: 1px solid var(--hairline);
+  border-radius: 9px; color: var(--ink); padding: 10px 14px; font-size: 15px;
+}
+
+/* ---------- 设置中心 ---------- */
+.settings { display: flex; flex-direction: column; gap: 18px; }
+.settings-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.settings-head h1 { font-size: 20px; }
+.settings-head .hint { color: var(--ink-3); font-size: 13px; }
+.dim { color: var(--ink-3); }
+.route-table { width: 100%; }
+.route-table small { margin-left: 6px; }
+.route-input {
+  width: 100%; background: var(--surface-2); border: 1px solid var(--hairline);
+  border-radius: 8px; color: var(--ink); padding: 7px 11px; font-size: 13px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.settings-grid {
+  display: grid; gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+}
+.provider-card .pc-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.provider-card .pc-head h2 { margin: 0; flex: 1; min-width: 0; }
+.provider-card .pc-caps { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0 4px; }
+.set-row { display: flex; align-items: center; gap: 10px; margin: 9px 0; font-size: 13px; }
+.set-row > span { width: 76px; flex: none; color: var(--ink-3); }
+.set-row input:not([type="checkbox"]) {
+  flex: 1; min-width: 0; background: var(--surface-2);
+  border: 1px solid var(--hairline); border-radius: 8px;
+  color: var(--ink); padding: 8px 11px; font-size: 13px;
+}
+.set-row input:focus { border-color: var(--accent); outline: none; }
+.set-row.toggle input { width: 17px; height: 17px; accent-color: var(--accent); }
+.set-row.toggle em { color: var(--ink-3); font-style: normal; font-size: 12px; }
+.pc-actions { display: flex; gap: 10px; margin-top: 12px; }
+.pc-status { margin-top: 10px; font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
+.pc-status .ok { color: var(--good); }
+.pc-status .miss { color: var(--serious); }

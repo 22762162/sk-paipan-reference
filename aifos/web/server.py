@@ -24,7 +24,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import __version__
 from ..app import App
-from ..cli import parse_produce_sentence
+from ..errors import AifosError
+from ..smart_input import resolve_produce_target
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -332,6 +333,9 @@ def make_handler(workspace, jobs):
                 match = re.match(r"^/api/export/(\d+)$", route)
                 if match:
                     return self._export(int(match.group(1)))
+                if route == "/api/settings":
+                    from ..settings import settings_payload
+                    return self._json(self._with_app(settings_payload))
                 return self._error(404, "未知路径")
             except BrokenPipeError:
                 pass
@@ -351,6 +355,12 @@ def make_handler(workspace, jobs):
                     return self._regen_image()
                 if parsed.path == "/api/upload":
                     return self._upload()
+                if parsed.path == "/api/settings":
+                    return self._settings_update()
+                if parsed.path == "/api/settings/test":
+                    return self._settings_test()
+                if parsed.path == "/api/project/rename":
+                    return self._project_rename()
                 return self._error(404, "未知路径")
             except BrokenPipeError:
                 pass
@@ -439,13 +449,15 @@ def make_handler(workspace, jobs):
             title = body.get("title")
             number = body.get("episode")
             sentence = body.get("sentence", "")
-            if sentence:
-                parsed = parse_produce_sentence(sentence)
-                if parsed:
-                    title, number = parsed
-            if not title or not number:
-                return self._error(
-                    400, "无法识别制作目标;示例:开始制作《万妖图录》第15集")
+            note = ""
+            if sentence or not (title and number):
+                try:
+                    title, number, note = self._with_app(
+                        lambda app: resolve_produce_target(
+                            app, sentence, title=title,
+                            number=int(number) if number else None))
+                except AifosError as exc:
+                    return self._error(400, str(exc))
             script = None
             if body.get("script_text"):
                 from ..script_import import ScriptImportError, parse_any
@@ -464,7 +476,9 @@ def make_handler(workspace, jobs):
                 review=bool(body.get("review", True)),
                 kind=body.get("kind")
                 if body.get("kind") in ("drama", "idol") else None)
-            return self._json({"job_id": job_id}, status=202)
+            return self._json(
+                {"job_id": job_id, "title": title,
+                 "episode": int(number), "note": note}, status=202)
 
         def _confirm(self):
             length = int(self.headers.get("Content-Length", "0"))
@@ -552,6 +566,71 @@ def make_handler(workspace, jobs):
                 lambda app: app.director.regen_image(
                     title, number, target, feedback=feedback))
             return self._json({"job_id": job_id}, status=202)
+
+        def _settings_update(self):
+            """设置中心保存:{provider, fields} 或 {capability, chain}。"""
+            from ..settings import set_routing, settings_payload, \
+                update_provider
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+
+            def task(app):
+                if body.get("provider"):
+                    update_provider(app.workspace.config_path,
+                                    body["provider"],
+                                    body.get("fields") or {})
+                elif body.get("capability"):
+                    chain = body.get("chain") or []
+                    if isinstance(chain, str):
+                        chain = [c.strip() for c in chain.split(",")
+                                 if c.strip()]
+                    set_routing(app.workspace.config_path,
+                                body["capability"], chain)
+                else:
+                    raise AifosError("缺少 provider 或 capability")
+
+            try:
+                self._with_app(task)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            # 重新加载,回传保存后的完整视图
+            return self._json(self._with_app(settings_payload))
+
+        def _settings_test(self):
+            from ..settings import test_provider
+            body = self._read_body()
+            if body is None or not body.get("provider"):
+                return self._error(400, "缺少 provider")
+            try:
+                report = self._with_app(
+                    lambda app: test_provider(app, body["provider"]))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(report)
+
+        def _project_rename(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+
+            def task(app):
+                title = body.get("title")
+                if not title and body.get("project_id"):
+                    row = app.db.query_one(
+                        "SELECT * FROM projects WHERE id=?",
+                        (int(body["project_id"]),))
+                    if row is None:
+                        raise AifosError("项目不存在")
+                    title = row["title"]
+                return dict(app.projects.rename_project(
+                    title, body.get("new_title", "")))
+
+            try:
+                project = self._with_app(task)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(project)
 
         def _upload(self):
             """人工修改素材上传:{episode_id, target, filename, data_base64}。
