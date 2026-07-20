@@ -17,6 +17,35 @@ async function api(path, opts) {
   return data;
 }
 
+/* 页面内置提示(不用 alert/confirm——沙箱环境会静默拦截弹窗) */
+function showToast(message, kind = "info") {
+  document.querySelectorAll(".toast").forEach((t) => t.remove());
+  const toast = document.createElement("div");
+  toast.className = `toast ${kind}`;
+  toast.textContent = message;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 5000);
+}
+
+/* 二次点击确认:第一次点击进入待确认态,3 秒内再点执行 */
+function armConfirm(btn, label, action) {
+  if (btn.dataset.armed === "1") {
+    btn.dataset.armed = "";
+    btn.textContent = btn.dataset.original;
+    action();
+    return;
+  }
+  btn.dataset.armed = "1";
+  btn.dataset.original = btn.textContent;
+  btn.textContent = `再点一次确认${label}`;
+  setTimeout(() => {
+    if (btn.dataset.armed === "1") {
+      btn.dataset.armed = "";
+      btn.textContent = btn.dataset.original;
+    }
+  }, 3000);
+}
+
 const STATUS_CN = {
   done: "完成", failed: "失败", qc_failed: "质检未过", created: "已建",
   script: "剧本中", storyboard: "分镜中", assets: "调资产", images: "出图中",
@@ -164,9 +193,10 @@ async function onProduce(ev) {
         premise: form.premise.value,
       }),
     });
+    showToast("制作任务已提交,进度会自动刷新", "ok");
     renderDashboard();
   } catch (e) {
-    alert("提交失败:" + e.message);
+    showToast(e.message, "error");
     btn.disabled = false; btn.textContent = "开始制作";
   }
 }
@@ -279,8 +309,6 @@ async function renderCanvasView(episodeId) {
 
   document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
   const reproduce = async (force) => {
-    const label = force ? "强制重制(全部重新生成,会消耗额度)" : "增量重制(只补齐缺失产物)";
-    if (!confirm(`确认${label}本集?`)) return;
     try {
       await api("/api/produce", {
         method: "POST",
@@ -289,11 +317,14 @@ async function renderCanvasView(episodeId) {
           title: data.project.title, episode: ep.number, force,
         }),
       });
+      showToast(force ? "已提交强制重制,画布将自动刷新" : "已提交增量重制,画布将自动刷新", "ok");
       pollTimer = setInterval(() => renderCanvasView(episodeId), 3000);
-    } catch (e) { alert("提交失败:" + e.message); }
+    } catch (e) { showToast(e.message, "error"); }
   };
-  document.getElementById("btn-reproduce").onclick = () => reproduce(false);
-  document.getElementById("btn-reproduce-force").onclick = () => reproduce(true);
+  document.getElementById("btn-reproduce").onclick = (ev) =>
+    armConfirm(ev.target, "增量重制", () => reproduce(false));
+  document.getElementById("btn-reproduce-force").onclick = (ev) =>
+    armConfirm(ev.target, "(消耗额度)", () => reproduce(true));
   document.getElementById("btn-script").onclick = () => showScriptOverlay(script);
   // 制作进行中自动刷新画布
   if (!["done", "failed", "qc_failed", "created"].includes(ep.status))

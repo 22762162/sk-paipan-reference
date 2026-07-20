@@ -260,6 +260,18 @@ td.num, th.num { text-align: right; }
   #sidepanel { position: absolute; right: 0; top: 0; bottom: 0; z-index: 5; box-shadow: -8px 0 24px rgba(0,0,0,.5); }
 }
 
+/* 页面内置提示 */
+.toast {
+  position: fixed; bottom: 26px; left: 50%; transform: translateX(-50%);
+  z-index: 50; max-width: min(560px, 90vw);
+  background: var(--surface-2); color: var(--ink);
+  border: 1px solid var(--hairline); border-radius: 10px;
+  padding: 11px 18px; font-size: 13.5px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, .55);
+}
+.toast.error { border-color: rgba(208, 59, 59, .55); color: #ffb0b0; }
+.toast.ok { border-color: rgba(12, 163, 12, .5); color: #8fdd8f; }
+
 /* 内联播放器 */
 .player { width: 100%; border-radius: 8px; border: 1px solid var(--hairline); margin: 6px 0; display: block; background: #000; }
 audio.player { background: var(--surface-2); }
