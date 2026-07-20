@@ -346,6 +346,8 @@ def make_handler(workspace, jobs):
                     return self._revise()
                 if parsed.path == "/api/regen_image":
                     return self._regen_image()
+                if parsed.path == "/api/upload":
+                    return self._upload()
                 return self._error(404, "未知路径")
             except BrokenPipeError:
                 pass
@@ -515,6 +517,41 @@ def make_handler(workspace, jobs):
                 lambda app: app.director.regen_image(
                     title, number, target, feedback=feedback))
             return self._json({"job_id": job_id}, status=202)
+
+        def _upload(self):
+            """人工修改素材上传:{episode_id, target, filename, data_base64}。
+            target.kind: character_art / scene_art / shot / shot_video。"""
+            import base64
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            target = body.get("target") or {}
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            try:
+                data = base64.b64decode(body.get("data_base64", ""))
+            except Exception:
+                return self._error(400, "data_base64 解码失败")
+            if not data:
+                return self._error(400, "文件为空")
+            if len(data) > 200 * 1024 * 1024:
+                return self._error(400, "文件超过 200MB")
+            ext = Path(body.get("filename", "")).suffix.lower() or ".png"
+
+            def task(app):
+                if target.get("kind") == "shot_video":
+                    return app.director.import_video(
+                        title, number, int(target["shot_no"]), data, ext)
+                return app.director.import_image(
+                    title, number, target, data, ext)
+
+            try:
+                result = self._with_app(task)
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
 
     return Handler
 

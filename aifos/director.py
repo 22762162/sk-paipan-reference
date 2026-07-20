@@ -724,3 +724,108 @@ class Director:
             f"重画完成: {target}(意见: {feedback or '无'})")
         return {"target": target, "uri": result.uri,
                 "cost": round(self._task_cost, 2)}
+
+    # ---- 人工修改素材导入(下载 → 外部修图/剪辑 → 上传替换) ----
+    IMAGE_MAGIC = {".png": b"\x89PNG", ".jpg": b"\xff\xd8\xff",
+                   ".jpeg": b"\xff\xd8\xff", ".webp": b"RIFF",
+                   ".svg": b"<"}
+
+    def _episode_ctx(self, project_title, episode_number):
+        project = self.projects.get_project(project_title)
+        if project is None:
+            raise AifosError(f"项目不存在: {project_title}")
+        episode = self.db.query_one(
+            "SELECT * FROM episodes WHERE project_id=? AND number=?",
+            (project["id"], episode_number))
+        if episode is None:
+            raise AifosError(f"剧集不存在: 第{episode_number}集")
+        return project, episode
+
+    def import_image(self, project_title, episode_number, target,
+                     file_bytes, ext):
+        """上传替换图片:character_art / scene_art / shot(镜头画面)。
+        镜头画面替换后自动按新图重做首尾帧并作废旧视频。"""
+        ext = ext.lower()
+        magic = self.IMAGE_MAGIC.get(ext)
+        if magic is None:
+            raise AifosError(f"不支持的图片格式: {ext}(png/jpg/webp/svg)")
+        if not file_bytes or not file_bytes.lstrip()[:8].startswith(magic) \
+                and not file_bytes.startswith(magic):
+            raise AifosError("文件内容与图片格式不符")
+        project, episode = self._episode_ctx(project_title, episode_number)
+        out_root = self._episode_dir(project, episode)
+        kind = target.get("kind")
+        if kind in ("character_art", "scene_art"):
+            name = target["name"]
+            latest = self.assets.latest(project["id"], kind, name)
+            if latest is None:
+                raise AifosError(f"资产不存在: {kind}/{name}")
+            version = latest["version"] + 1
+            safe = "".join(c if c.isalnum() else "_" for c in name)[:40]
+            path = (out_root / "cast"
+                    / f"upload_{kind}_{safe}_v{version}{ext}")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(file_bytes)
+            self.assets.register(project["id"], kind, name,
+                                 uri=str(path), meta={"uploaded": True},
+                                 new_version=True)
+            self.log.info("director", f"已上传替换 {kind}/{name}")
+            return {"uri": str(path)}
+        if kind == "shot":
+            shot_no = int(target["shot_no"])
+            storyboard, _ = self.projects.latest_document(
+                episode["id"], "storyboard")
+            script, _ = self.projects.latest_document(episode["id"], "script")
+            shot = next((s for s in (storyboard or {}).get("shots", [])
+                         if s["shot_no"] == shot_no), None)
+            if shot is None:
+                raise AifosError(f"镜头不存在: {shot_no}")
+            asset_name = f"e{episode['number']:03d}_shot{shot_no:03d}"
+            path = (out_root / "images"
+                    / f"shot_{shot_no:03d}.upload{ext}")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(file_bytes)
+            self.assets.register(project["id"], "image", asset_name,
+                                 uri=str(path), meta={"uploaded": True},
+                                 new_version=True)
+            # 按新图重做首尾帧(真实产线由 Codex 依据新图推导)
+            aspect = (project["aspect"] or self.config.get(
+                "defaults", "aspect", default="9:16"))
+            ctx = {"project": dict(project), "episode": dict(episode),
+                   "out_root": out_root, "aspect": aspect,
+                   "dims": ASPECT_DIMS.get(aspect, ASPECT_DIMS["9:16"]),
+                   "script": script, "storyboard": storyboard,
+                   "force": True}
+            self._task_cost = 0.0
+            self._task_providers = set()
+            payload = self._shot_payload(ctx, shot)
+            frames = self._call(ctx, "frames", {
+                **payload, "image_uri": str(path)}, "frames")
+            self.assets.register(project["id"], "first_frame", asset_name,
+                                 uri=frames.data["first"], new_version=True)
+            self.assets.register(project["id"], "last_frame", asset_name,
+                                 uri=frames.data["last"], new_version=True)
+            self.assets.delete(project["id"], "video", asset_name)
+            self.log.info(
+                "director", f"已上传替换镜头{shot_no}画面,旧视频作废")
+            return {"uri": str(path)}
+        raise AifosError(f"不支持的上传目标: {kind}")
+
+    def import_video(self, project_title, episode_number, shot_no,
+                     file_bytes, ext=".mp4"):
+        """上传替换镜头视频(人工剪辑后的成片)。"""
+        if ext.lower() != ".mp4":
+            raise AifosError("视频仅支持 mp4")
+        if b"ftyp" not in file_bytes[:32]:
+            raise AifosError("文件内容不是合法 mp4")
+        project, episode = self._episode_ctx(project_title, episode_number)
+        out_root = self._episode_dir(project, episode)
+        asset_name = f"e{episode['number']:03d}_shot{shot_no:03d}"
+        path = out_root / "videos" / f"shot_{shot_no:03d}.upload.mp4"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(file_bytes)
+        self.assets.register(project["id"], "video", asset_name,
+                             uri=str(path), meta={"uploaded": True},
+                             new_version=True)
+        self.log.info("director", f"已上传替换镜头{shot_no}视频")
+        return {"uri": str(path)}

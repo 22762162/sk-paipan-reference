@@ -447,6 +447,8 @@ function showScriptOverlay(data, episodeId) {
         <div class="revise-actions">
           <button class="primary" id="btn-revise">✏️ 按意见重写剧本</button>
           <button id="btn-edit-toggle">📝 直接编辑文字</button>
+          <button id="btn-script-down">⬇ 下载剧本</button>
+          <button id="btn-script-up">⬆ 上传剧本文件</button>
         </div>
       </div>
       <div id="edit-area" hidden>
@@ -491,19 +493,101 @@ function showScriptOverlay(data, episodeId) {
       overlay.querySelector("#edit-text").value = scriptToText(script);
     }
   };
-  overlay.querySelector("#btn-edit-submit").onclick = async () => {
+  const submitScriptText = async (text, source) => {
     try {
       await post("/api/produce", {
         title: data.project.title,
         episode: data.episode.number,
-        script_text: overlay.querySelector("#edit-text").value,
+        script_text: text,
         review: true,
       });
       close();
-      showToast("已按你的文字重做,人物/分镜将自动更新…", "ok");
+      showToast(`已按${source}重做,人物/分镜将自动更新…`, "ok");
       pollTimer = setInterval(() => renderCanvasView(episodeId), 3000);
     } catch (e) { showToast(e.message, "error"); }
   };
+  overlay.querySelector("#btn-edit-submit").onclick = () =>
+    submitScriptText(overlay.querySelector("#edit-text").value, "你的文字");
+  overlay.querySelector("#btn-script-down").onclick = () => {
+    const blob = new Blob([scriptToText(script)],
+      { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    downloadUrl(url,
+      `${script.project_title}_第${script.episode_number}集_剧本.txt`);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  };
+  overlay.querySelector("#btn-script-up").onclick = () => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".txt,.json,text/plain,application/json";
+    input.onchange = () => {
+      const file = input.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => submitScriptText(
+        String(reader.result), `文件「${file.name}」`);
+      reader.readAsText(file, "utf-8");
+    };
+    input.click();
+  };
+}
+
+/* 素材下载 / 人工修改后上传 */
+function downloadUrl(url, filename) {
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename || "";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+function uploadFile(episodeId, target, accept, onDone) {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = accept;
+  input.onchange = () => {
+    const file = input.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        showToast("上传中…", "ok");
+        await api("/api/upload", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            episode_id: episodeId, target, filename: file.name,
+            data_base64: String(reader.result).split(",")[1] || "",
+          }),
+        });
+        showToast("已替换为你的版本", "ok");
+        onDone();
+      } catch (e) { showToast(e.message, "error"); }
+    };
+    reader.readAsDataURL(file);
+  };
+  input.click();
+}
+
+function ioControls(target, url, filename) {
+  return `<div class="io-box" data-target="${esc(JSON.stringify(target))}"
+    data-url="${esc(url || "")}" data-name="${esc(filename)}">
+    ${url ? `<button class="io-down">⬇ 下载</button>` : ""}
+    <button class="io-up">⬆ 上传替换</button>
+  </div>`;
+}
+
+function bindIo(container, episodeId, reload) {
+  container.querySelectorAll(".io-box").forEach((box) => {
+    const target = JSON.parse(box.dataset.target);
+    const down = box.querySelector(".io-down");
+    if (down) down.onclick = () =>
+      downloadUrl(box.dataset.url, box.dataset.name);
+    box.querySelector(".io-up").onclick = () => uploadFile(
+      episodeId, target,
+      target.kind === "shot_video" ? "video/mp4" : "image/*",
+      reload);
+  });
 }
 
 /* 单张图片附意见重画 */
@@ -945,13 +1029,17 @@ class StoryboardCanvas {
         <div class="art-grid">${art.cast_art.map((c) => `
           <figure><img src="${esc(c.url)}" alt="${esc(c.name)}">
           <figcaption>${esc(c.name)}${c.role ? " · " + esc(c.role) : ""}</figcaption>
-          ${regenControls({ kind: "character_art", name: c.name }, "重画")}</figure>`).join("")}
+          ${regenControls({ kind: "character_art", name: c.name }, "重画")}
+          ${ioControls({ kind: "character_art", name: c.name }, c.url,
+            `${c.name}.png`)}</figure>`).join("")}
         </div>` : ""}
         ${(art.scene_art || []).length ? `<h4>场景</h4>
         <div class="art-grid">${art.scene_art.map((s) => `
           <figure><img src="${esc(s.url)}" alt="${esc(s.name)}">
           <figcaption>${esc(s.name)}</figcaption>
-          ${regenControls({ kind: "scene_art", name: s.name }, "重画")}</figure>`).join("")}
+          ${regenControls({ kind: "scene_art", name: s.name }, "重画")}
+          ${ioControls({ kind: "scene_art", name: s.name }, s.url,
+            `${s.name}.png`)}</figure>`).join("")}
         </div>` : ""}
         ${art.cover ? `<img class="preview" src="${esc(art.cover)}" alt="封面">` : ""}
         ${art.titles.length ? `<h4>候选标题</h4><ul class="titles-list">
@@ -977,6 +1065,8 @@ class StoryboardCanvas {
       const playBtn = panel.querySelector("#panel-play");
       if (playBtn) playBtn.onclick = () => openPlayer(this.data);
       bindRegen(panel, this.data.episode.id, () => this.data);
+      bindIo(panel, this.data.episode.id,
+             () => renderCanvasView(this.data.episode.id));
       return;
     }
     const shot = this.data.storyboard.shots.find((s) => s.shot_no === shotNo);
@@ -1011,9 +1101,18 @@ class StoryboardCanvas {
       </ul>
       <h4>画面不满意?</h4>
       ${regenControls({ kind: "shot", shot_no: shotNo }, "附意见重画本镜头")}
+      <h4>下载修改后上传</h4>
+      <div class="io-row"><span>画面</span>
+        ${ioControls({ kind: "shot", shot_no: shotNo },
+          art.images[shotNo], `shot_${shotNo}.png`)}</div>
+      <div class="io-row"><span>视频</span>
+        ${ioControls({ kind: "shot_video", shot_no: shotNo },
+          art.videos[shotNo], `shot_${shotNo}.mp4`)}</div>
       ${issues.length ? `<h4>质检问题</h4>${issues.map((i) => `
         <div class="issue ${esc(i.severity)}">[${esc(i.check)}] ${esc(i.message)}</div>`).join("")}` : ""}`;
-    bindRegen(panel, this.data.episode.id, () => this.data);
+    const epId = this.data.episode.id;
+    bindRegen(panel, epId, () => this.data);
+    bindIo(panel, epId, () => renderCanvasView(epId));
   }
 
   link(label, url) {

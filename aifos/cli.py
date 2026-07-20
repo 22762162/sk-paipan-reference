@@ -113,6 +113,16 @@ def _build_parser():
     group.add_argument("--scene", help="场景名")
     p_regen.add_argument("--feedback", default="", help="修改意见(可选)")
 
+    p_import = sub.add_parser(
+        "import", help="上传人工修改后的素材(图片/mp4,按扩展名识别)")
+    p_import.add_argument("--project", required=True)
+    p_import.add_argument("--episode", type=int, required=True)
+    p_import.add_argument("--file", required=True, help="素材文件路径")
+    igroup = p_import.add_mutually_exclusive_group(required=True)
+    igroup.add_argument("--shot", type=int, help="镜头号")
+    igroup.add_argument("--character", help="人物名")
+    igroup.add_argument("--scene", help="场景名")
+
     p_asset = sub.add_parser("asset", help="IP 资产中心")
     p_asset.add_argument("action", choices=["list", "stats"])
     p_asset.add_argument("--project", required=True, help="项目名")
@@ -460,6 +470,29 @@ def main(argv=None):
             print(f"已重画: {result['uri']}(成本 {result['cost']})")
             if target["kind"] == "shot":
                 print("该镜头旧视频已作废;运行 produce(增量)重拍并重剪")
+            return 0
+        if args.command == "import":
+            app.system.require(args.user, "produce")
+            from pathlib import Path as _P
+            data = _P(args.file).read_bytes()
+            ext = _P(args.file).suffix.lower()
+            if ext == ".mp4":
+                if args.shot is None:
+                    print("mp4 需配合 --shot", file=sys.stderr)
+                    return 2
+                result = app.director.import_video(
+                    args.project, args.episode, args.shot, data, ext)
+            else:
+                if args.shot is not None:
+                    target = {"kind": "shot", "shot_no": args.shot}
+                elif args.character:
+                    target = {"kind": "character_art",
+                              "name": args.character}
+                else:
+                    target = {"kind": "scene_art", "name": args.scene}
+                result = app.director.import_image(
+                    args.project, args.episode, target, data, ext)
+            print(f"已导入: {result['uri']}")
             return 0
         if args.command == "asset":
             return _cmd_asset(app, args)
