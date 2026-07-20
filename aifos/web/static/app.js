@@ -237,7 +237,7 @@ async function onProduce(ev) {
 }
 
 /* ================= 整集播放器(动态分镜连播) ================= */
-function openPlayer(data) {
+function openPlayer(data, startShotNo) {
   const art = data.artifacts;
   const lineNoIndex = buildLineIndex(data.script);
   const shots = data.storyboard.shots.map((s) => {
@@ -374,7 +374,20 @@ function openPlayer(data) {
   document.addEventListener("keydown", onKey);
   overlay.querySelector("#pl-close").onclick = close;
   overlay.addEventListener("click", (ev) => { if (ev.target === overlay) close(); });
-  showShot(0, false);
+  const aspect = data.project.aspect || "9:16";
+  overlay.querySelector(".player-stage").style.aspectRatio =
+    aspect === "16:9" ? "16 / 9" : "9 / 16";
+  if (aspect === "16:9")
+    overlay.querySelector(".player-box").style.width = "min(960px, 96vw)";
+  const startIndex = startShotNo
+    ? Math.max(0, shots.findIndex((x) => x.shot.shot_no === startShotNo))
+    : 0;
+  if (startShotNo) {
+    setPlaying(true);
+    showShot(startIndex, true);
+  } else {
+    showShot(0, false);
+  }
 }
 
 function buildLineIndex(script) {
@@ -637,7 +650,10 @@ async function renderCanvasView(episodeId) {
       ${chip(ep.status)}
       <span class="hint">质检 ${ep.qc_score == null ? "-" : fmt(ep.qc_score, 0)} 分 · 成本 ${fmt(ep.cost)}</span>
       <span class="spacer"></span>
-      <span class="hint">滚轮缩放 · 拖动查看 · 点镜头看详情</span>
+      <div class="zoom-group view-toggle">
+        <button id="view-theater">🎬 剧场</button>
+        <button id="view-canvas">🗺 画布</button>
+      </div>
       <button id="btn-play" class="primary">▶ 播放本集</button>
       <button id="btn-script">剧本</button>
       <button id="btn-reproduce" title="复用已完成的部分,只补做缺失内容">继续补齐</button>
@@ -651,10 +667,11 @@ async function renderCanvasView(episodeId) {
       </div>
     </div>
     <div class="canvas-body">
-      <div id="viewport"><div id="world"></div></div>
+      <div id="theater"></div>
+      <div id="viewport" hidden><div id="world"></div></div>
       <aside id="sidepanel"></aside>
     </div>
-    <div class="timeline" id="timeline"></div>
+    <div class="timeline" id="timeline" hidden></div>
   </div>`;
 
   document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
@@ -702,6 +719,103 @@ async function renderCanvasView(episodeId) {
 
   const canvas = new StoryboardCanvas(data, shotIssues, lineIssues);
   canvas.mount();
+  renderTheater(data, canvas);
+
+  // 剧场(影视站观感,默认)/ 自由画布 双视图
+  const theaterEl = document.getElementById("theater");
+  const viewportEl = document.getElementById("viewport");
+  const timelineEl = document.getElementById("timeline");
+  const btnTheater = document.getElementById("view-theater");
+  const btnCanvas = document.getElementById("view-canvas");
+  const setView = (mode) => {
+    localStorage.setItem("aifos.view", mode);
+    const theaterMode = mode !== "canvas";
+    theaterEl.hidden = !theaterMode;
+    viewportEl.hidden = theaterMode;
+    timelineEl.hidden = theaterMode;
+    btnTheater.classList.toggle("active", theaterMode);
+    btnCanvas.classList.toggle("active", !theaterMode);
+    if (!theaterMode) canvas.fit();
+  };
+  btnTheater.onclick = () => setView("theater");
+  btnCanvas.onclick = () => setView("canvas");
+  setView(localStorage.getItem("aifos.view") || "theater");
+}
+
+/* ---- 剧场模式:Hero 横幅 + 人物条 + 每场一条横向镜头海报行 ---- */
+function renderTheater(data, canvas) {
+  const el = document.getElementById("theater");
+  const art = data.artifacts;
+  const script = data.script;
+  const shots = data.storyboard.shots;
+  const aspect = data.project.aspect || "9:16";
+  const hero = art.cover || art.images[shots[0] && shots[0].shot_no] || "";
+  const total = shots.reduce((a, s) => a + s.duration, 0);
+  const kindCN = { drama: "剧情短剧", idol: "AI虚拟偶像" }[data.project.kind]
+    || data.project.kind;
+  const sceneOf = (no) => script.scenes.find((s) => s.scene_no === no) || {};
+  const rows = [...new Set(shots.map((s) => s.scene_no))].map((no) => ({
+    scene: sceneOf(no),
+    shots: shots.filter((s) => s.scene_no === no),
+  }));
+  el.innerHTML = `
+    <div class="hero" style="background-image:url('${hero.replace(/'/g, "%27")}')">
+      <div class="hero-content">
+        <h1>${esc(data.project.title)}</h1>
+        <div class="hero-meta">
+          <span class="chip">${esc(kindCN)}</span>
+          <span class="chip">第${data.episode.number}集${data.episode.title ? " · " + esc(data.episode.title) : ""}</span>
+          <span class="chip">${fmt(total, 0)} 秒 · ${shots.length} 镜</span>
+          ${data.episode.qc_score != null ? `<span class="chip">质检 ${fmt(data.episode.qc_score, 0)} 分</span>` : ""}
+        </div>
+        <p class="hero-logline">${esc(script.logline || "")}</p>
+        <div class="hero-actions">
+          <button class="primary" id="hero-play">▶ 播放本集</button>
+          <button id="hero-script">📖 剧本</button>
+        </div>
+      </div>
+    </div>
+    ${(art.cast_art || []).length ? `
+    <div class="cast-strip">
+      ${art.cast_art.map((c) => `
+        <figure title="${esc(c.name)}">
+          <img src="${esc(c.url)}" alt="${esc(c.name)}">
+          <figcaption>${esc(c.name)}</figcaption>
+        </figure>`).join("")}
+    </div>` : ""}
+    ${rows.map(({ scene, shots: ss }) => `
+    <section class="scene-row">
+      <h3>场 ${scene.scene_no} · ${esc(scene.location || "")}
+        <span>${fmt(ss.reduce((a, s) => a + s.duration, 0), 1)}s · ${ss.length} 镜</span></h3>
+      <div class="row-scroll">
+        ${ss.map((s) => `
+        <div class="t-card ${aspect === "16:9" ? "landscape" : ""}" data-shot="${s.shot_no}">
+          ${art.images[s.shot_no]
+            ? `<img src="${esc(art.images[s.shot_no])}" alt="镜头${s.shot_no}" loading="lazy">`
+            : `<div class="t-empty">画面生成中</div>`}
+          <button class="t-detail" data-shot="${s.shot_no}" title="镜头详情">ⓘ</button>
+          <div class="t-play">▶</div>
+          <div class="t-info">
+            <b>#${String(s.shot_no).padStart(2, "0")}</b> ${esc(s.camera || "")} · ${fmt(s.duration, 1)}s
+            ${s.dialogue ? `<div class="t-line">${esc(s.dialogue.character)}:${esc(s.dialogue.dialogue)}</div>` : ""}
+          </div>
+        </div>`).join("")}
+      </div>
+    </section>`).join("")}`;
+
+  el.querySelector("#hero-play").onclick = () => openPlayer(data);
+  el.querySelector("#hero-script").onclick = () =>
+    document.getElementById("btn-script").click();
+  el.querySelectorAll(".t-card").forEach((card) => {
+    card.addEventListener("click", () =>
+      openPlayer(data, Number(card.dataset.shot)));
+  });
+  el.querySelectorAll(".t-detail").forEach((btn) => {
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      canvas.select(Number(btn.dataset.shot));
+    });
+  });
 }
 
 class StoryboardCanvas {
