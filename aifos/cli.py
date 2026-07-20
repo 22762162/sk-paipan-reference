@@ -46,6 +46,8 @@ def _build_parser():
     p_produce.add_argument("--episode", type=int, help="集数")
     p_produce.add_argument("--premise", default="", help="本集前提/梗概")
     p_produce.add_argument("--style", default="", help="画风/风格")
+    p_produce.add_argument("--force", action="store_true",
+                           help="强制全部重新生成(默认增量:已有产物直接复用)")
     p_produce.add_argument("--verbose", action="store_true",
                            help="实时输出内部日志")
 
@@ -100,7 +102,8 @@ def _cmd_produce(app, args):
         return 2
     app.system.require(args.user, "produce")
     summary = app.director.produce(
-        title, number, premise=args.premise, style=args.style)
+        title, number, premise=args.premise, style=args.style,
+        force=args.force)
     print(f"\n=== 《{title}》第{number}集 制作{_status_cn(summary['status'])} ===")
     print(f"质检得分: {summary['qc_score']}   "
           f"成本: {summary['cost']}/{summary['budget']}")

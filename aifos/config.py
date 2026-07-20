@@ -32,10 +32,13 @@ DEFAULTS = {
             "cost_per_call": 0.5, "timeout": 600,
         },
         "codex": {
+            # 经 aifos.adapters.codex_image 桥接真实 codex exec;
+            # 实机把 --codex 指到 codex 绝对路径后 enabled 置 true
             "type": "cli", "enabled": False,
             "capabilities": ["image", "frames", "cover"],
-            "command": ["codex", "exec", "--json"],
-            "cost_per_call": 1.0, "timeout": 600,
+            "command": ["python3", "-m", "aifos.adapters.codex_image",
+                        "--codex", "codex"],
+            "cost_per_call": 1.0, "timeout": 900,
         },
         "jimeng": {
             # 即梦官方 CLI(dreamina)原生适配;配音能力待即梦 CLI 提供 TTS 后再接入

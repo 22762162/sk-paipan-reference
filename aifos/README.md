@@ -53,6 +53,11 @@ Web 控制台为纯标准库 http.server + 原生 JS,离线可用)。
 复检,最多 `retry.max_retries` 轮;不可修复问题(敏感词、角色不一致)
 写入质检报告。
 
+**增量生产(断点续产)**:默认复用已落盘完好的剧本/分镜/图片/首尾帧/
+视频/配音,只补齐缺失部分——真实产线(即梦按镜头消耗额度)中断后
+重跑 `produce` 不会重复烧钱;`--force`(或画布"强制重制")全量重新
+生成。
+
 ## 模型协同与 Provider 路由
 
 能力(script/storyboard/image/frames/video/voice/edit/cover)按
@@ -104,16 +109,18 @@ macOS 实机 `workspace/config.json` 示例:
     },
     "codex": {
       "enabled": true,
-      "command": ["/Users/sk/.local/node22/bin/codex", "exec", "--json"]
+      "command": ["python3", "-m", "aifos.adapters.codex_image",
+                  "--codex", "/Users/sk/.local/node22/bin/codex"]
     }
   }
 }
 ```
 
-注:`codex` 走通用 CLI 协议,接真实 Codex 需一个把上述 JSON 协议转为
-`codex exec` 调用的薄包装脚本;`dreamina` 无需包装,开箱即用。
-每次 dreamina 调用的完整命令与原始输出都会落盘到
-`artifacts/.../videos/shot_XXX.dreamina.log` 便于排查。
+注:`codex` 经内置适配桥 `aifos.adapters.codex_image` 转为
+`codex exec` 出图指令(image/frames/cover 三能力,产出后校验文件
+落盘),按上例把 `--codex` 指向绝对路径即可;`dreamina` 无需包装,
+开箱即用。每次外部调用的完整命令与原始输出都会落盘
+(`shot_XXX.dreamina.log` / `codex_*.log`)便于排查。
 
 ## 常用命令
 

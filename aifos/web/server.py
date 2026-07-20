@@ -54,13 +54,13 @@ class JobRegistry:
         self._lock = threading.Lock()
         self._seq = 0
 
-    def start(self, title, number, premise="", style=""):
+    def start(self, title, number, premise="", style="", force=False):
         with self._lock:
             self._seq += 1
             job_id = f"j{self._seq}"
             self._jobs[job_id] = {
                 "id": job_id, "status": "running",
-                "title": title, "episode": number,
+                "title": title, "episode": number, "force": force,
                 "started_at": time.time(),
             }
 
@@ -68,7 +68,7 @@ class JobRegistry:
             app = App(self.workspace)
             try:
                 summary = app.director.produce(
-                    title, number, premise=premise, style=style)
+                    title, number, premise=premise, style=style, force=force)
                 self._jobs[job_id].update(
                     status="done", summary=summary, finished_at=time.time())
             except Exception as exc:  # 后台任务兜底,错误进任务状态
@@ -359,7 +359,8 @@ def make_handler(workspace, jobs):
             job_id = jobs.start(
                 title, int(number),
                 premise=body.get("premise", ""),
-                style=body.get("style", ""))
+                style=body.get("style", ""),
+                force=bool(body.get("force")))
             return self._json({"job_id": job_id}, status=202)
 
     return Handler

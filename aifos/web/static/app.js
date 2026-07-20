@@ -179,6 +179,7 @@ const KIND_CN = {
 const CARD_W = 220, CARD_H = 218, GAP_X = 26, GAP_Y = 56, LANE_X = 150;
 
 async function renderCanvasView(episodeId) {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   let data;
   try { data = await api(`/api/episode/${episodeId}`); }
   catch (e) { app.innerHTML = `<div class="loading">加载失败:${esc(e.message)}</div>`; return; }
@@ -208,6 +209,8 @@ async function renderCanvasView(episodeId) {
       <span class="hint">质检 ${ep.qc_score == null ? "-" : fmt(ep.qc_score, 0)} 分 · 成本 ${fmt(ep.cost)}</span>
       <span class="spacer"></span>
       <span class="hint">滚轮缩放 · 拖拽空白平移 · 拖动卡片摆放 · 点击查看详情</span>
+      <button id="btn-reproduce" title="增量:已有产物复用,只补齐缺失">增量重制</button>
+      <button id="btn-reproduce-force" title="全部重新生成(消耗额度)">强制重制</button>
       <div class="zoom-group">
         <button id="zoom-out">−</button>
         <span class="zoom-pct" id="zoom-pct">100%</span>
@@ -224,6 +227,25 @@ async function renderCanvasView(episodeId) {
   </div>`;
 
   document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
+  const reproduce = async (force) => {
+    const label = force ? "强制重制(全部重新生成,会消耗额度)" : "增量重制(只补齐缺失产物)";
+    if (!confirm(`确认${label}本集?`)) return;
+    try {
+      await api("/api/produce", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: data.project.title, episode: ep.number, force,
+        }),
+      });
+      pollTimer = setInterval(() => renderCanvasView(episodeId), 3000);
+    } catch (e) { alert("提交失败:" + e.message); }
+  };
+  document.getElementById("btn-reproduce").onclick = () => reproduce(false);
+  document.getElementById("btn-reproduce-force").onclick = () => reproduce(true);
+  // 制作进行中自动刷新画布
+  if (!["done", "failed", "qc_failed", "created"].includes(ep.status))
+    pollTimer = setInterval(() => renderCanvasView(episodeId), 3000);
 
   const canvas = new StoryboardCanvas(data, shotIssues, lineIssues);
   canvas.mount();

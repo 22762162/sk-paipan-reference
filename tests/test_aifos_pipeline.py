@@ -71,8 +71,8 @@ def test_deterministic_script(app):
         "SELECT * FROM episodes WHERE project_id=? AND number=3",
         (project["id"],))
     script_a, _ = app.projects.latest_document(episode["id"], "script")
-    # 相同输入重跑 → 相同剧本(确定性),文档版本 +1
-    app.director.produce("万妖图录", 3)
+    # force 重跑:相同输入 → 相同剧本(确定性),文档版本 +1
+    app.director.produce("万妖图录", 3, force=True)
     script_b, version = app.projects.latest_document(episode["id"], "script")
     assert version == 2
     assert script_a == script_b

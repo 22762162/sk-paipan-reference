@@ -41,7 +41,10 @@ class Director:
         self.artifacts_root = Path(artifacts_root)
 
     # ---- 入口:一句话开工 ----
-    def produce(self, project_title, episode_number, premise="", style=""):
+    def produce(self, project_title, episode_number, premise="", style="",
+                force=False):
+        """force=False 时增量生产:已有且落盘完好的产物直接复用,
+        只补齐缺失部分——真实产线(即梦按镜头计费)断点续产的关键。"""
         project, _ = self.projects.get_or_create_project(
             project_title, style=style)
         episode, _ = self.projects.get_or_create_episode(
@@ -49,12 +52,13 @@ class Director:
         self.log.info(
             "director",
             f"开始制作《{project_title}》第{episode_number}集 "
-            f"(episode_id={episode['id']})")
+            f"(episode_id={episode['id']},force={force})")
 
         ctx = {
             "project": dict(project),
             "episode": dict(episode),
             "out_root": self._episode_dir(project, episode),
+            "force": force,
         }
         stage_reports = []
         failed = False
@@ -128,7 +132,8 @@ class Director:
                  now(), task_id))
             return {"stage": stage, "name": stage_cn, "status": "done",
                     "cost": round(self._task_cost, 2),
-                    "providers": sorted(self._task_providers)}
+                    "providers": sorted(self._task_providers),
+                    "detail": result or {}}
         except Exception as exc:
             self.db.execute(
                 "UPDATE tasks SET status='failed', provider=?, cost=?, "
@@ -153,9 +158,35 @@ class Director:
         self.projects.add_episode_cost(ctx["episode"]["id"], result.cost)
         return result
 
+    # ---- 增量复用:已有资产落盘完好则直接使用 ----
+    def _existing_asset_uri(self, ctx, kind, name):
+        if ctx.get("force"):
+            return None
+        row = self.assets.latest(ctx["project"]["id"], kind, name)
+        if row is None or not row["uri"]:
+            return None
+        uri = row["uri"]
+        if uri.startswith("http://") or uri.startswith("https://"):
+            return uri
+        return uri if Path(uri).exists() else None
+
+    def _shot_name(self, ctx, shot_no):
+        return f"e{ctx['episode']['number']:03d}_shot{shot_no:03d}"
+
+    def _line_name(self, ctx, line_no):
+        return f"e{ctx['episode']['number']:03d}_line{line_no:03d}"
+
     # ---- 各阶段实现 ----
     def _stage_script(self, ctx):
         episode = ctx["episode"]
+        if not ctx.get("force"):
+            existing, version = self.projects.latest_document(
+                episode["id"], "script")
+            if existing is not None:
+                ctx["script"] = existing
+                self.log.info("director", f"复用已有剧本 v{version}")
+                return {"version": version, "reused": True,
+                        "scenes": len(existing["scenes"])}
         result = self._call(ctx, "script", {
             "project_title": ctx["project"]["title"],
             "episode_number": episode["number"],
@@ -172,6 +203,14 @@ class Director:
         return {"version": version, "scenes": len(script["scenes"])}
 
     def _stage_storyboard(self, ctx):
+        if not ctx.get("force"):
+            existing, version = self.projects.latest_document(
+                ctx["episode"]["id"], "storyboard")
+            if existing is not None:
+                ctx["storyboard"] = existing
+                self.log.info("director", f"复用已有分镜 v{version}")
+                return {"version": version, "reused": True,
+                        "shots": len(existing["shots"])}
         result = self._call(
             ctx, "storyboard", {"script": ctx["script"]}, "storyboard")
         storyboard = result.data
@@ -207,7 +246,15 @@ class Director:
 
     def _stage_images(self, ctx):
         ctx["images"] = []
+        reused = 0
         for shot in ctx["storyboard"]["shots"]:
+            existing = self._existing_asset_uri(
+                ctx, "image", self._shot_name(ctx, shot["shot_no"]))
+            if existing:
+                ctx["images"].append(
+                    {"shot_no": shot["shot_no"], "uri": existing})
+                reused += 1
+                continue
             result = self._call(ctx, "image", {
                 "shot_no": shot["shot_no"],
                 "prompt": shot["prompt"],
@@ -217,12 +264,21 @@ class Director:
                                       result.uri)
             ctx["images"].append(
                 {"shot_no": shot["shot_no"], "uri": result.uri})
-        return {"count": len(ctx["images"])}
+        return {"count": len(ctx["images"]), "reused": reused}
 
     def _stage_frames(self, ctx):
         images = {i["shot_no"]: i["uri"] for i in ctx["images"]}
         ctx["frames"] = []
+        reused = 0
         for shot in ctx["storyboard"]["shots"]:
+            name = self._shot_name(ctx, shot["shot_no"])
+            first = self._existing_asset_uri(ctx, "first_frame", name)
+            last = self._existing_asset_uri(ctx, "last_frame", name)
+            if first and last:
+                ctx["frames"].append({"shot_no": shot["shot_no"],
+                                      "first": first, "last": last})
+                reused += 1
+                continue
             result = self._call(ctx, "frames", {
                 "shot_no": shot["shot_no"],
                 "image_uri": images[shot["shot_no"]],
@@ -237,14 +293,23 @@ class Director:
                 "first": result.data["first"],
                 "last": result.data["last"],
             })
-        return {"count": len(ctx["frames"])}
+        return {"count": len(ctx["frames"]), "reused": reused}
 
     def _stage_videos(self, ctx):
         frames = {f["shot_no"]: f for f in ctx["frames"]}
         ctx["videos"] = []
+        reused = 0
         for shot in ctx["storyboard"]["shots"]:
+            existing = self._existing_asset_uri(
+                ctx, "video", self._shot_name(ctx, shot["shot_no"]))
+            if existing:
+                ctx["videos"].append({
+                    "shot_no": shot["shot_no"], "uri": existing,
+                    "duration": shot["duration"]})
+                reused += 1
+                continue
             ctx["videos"].append(self._make_video(ctx, shot, frames))
-        return {"count": len(ctx["videos"])}
+        return {"count": len(ctx["videos"]), "reused": reused}
 
     def _make_video(self, ctx, shot, frames):
         frame = frames[shot["shot_no"]]
@@ -263,17 +328,30 @@ class Director:
         ctx["voices"] = []
         ctx["subtitles"] = []
         line_no = 0
+        reused = 0
         for scene in ctx["script"]["scenes"]:
             for line in scene["lines"]:
                 line_no += 1
-                ctx["voices"].append(
-                    self._make_voice(ctx, line_no, line))
+                name = self._line_name(ctx, line_no)
+                existing = self._existing_asset_uri(ctx, "voice", name)
+                if existing:
+                    row = self.assets.latest(
+                        ctx["project"]["id"], "voice", name)
+                    meta = json.loads(row["meta"]) if row else {}
+                    ctx["voices"].append({
+                        "line_no": line_no, "uri": existing,
+                        "duration": meta.get("duration") or round(
+                            max(1.0, len(line["dialogue"]) * 0.18), 2)})
+                    reused += 1
+                else:
+                    ctx["voices"].append(
+                        self._make_voice(ctx, line_no, line))
                 ctx["subtitles"].append({
                     "line_no": line_no,
                     "character": line["character"],
                     "text": line["dialogue"],
                 })
-        return {"count": len(ctx["voices"])}
+        return {"count": len(ctx["voices"]), "reused": reused}
 
     def _make_voice(self, ctx, line_no, line):
         result = self._call(ctx, "voice", {
@@ -284,7 +362,8 @@ class Director:
         self.assets.register(
             ctx["project"]["id"], "voice",
             f"e{ctx['episode']['number']:03d}_line{line_no:03d}",
-            uri=result.uri)
+            uri=result.uri,
+            meta={"duration": result.data.get("duration", 0)})
         return {"line_no": line_no, "uri": result.uri,
                 "duration": result.data.get("duration", 0)}
 
