@@ -51,6 +51,11 @@ def _build_parser():
 
     sub.add_parser("status", help="制作状态看板")
 
+    p_serve = sub.add_parser(
+        "serve", help="启动 Web 控制台(仪表盘 + 分镜画布)")
+    p_serve.add_argument("--host", default="127.0.0.1")
+    p_serve.add_argument("--port", type=int, default=8619)
+
     p_project = sub.add_parser("project", help="项目管理")
     p_project.add_argument("action", choices=["list", "create"])
     p_project.add_argument("--title", help="项目名")
@@ -260,6 +265,19 @@ def main(argv=None):
         print(f"  配置: {app.workspace.config_path}")
         print(f"  数据库: {app.workspace.db_path}")
         app.close()
+        return 0
+    if args.command == "serve":
+        from .web.server import serve
+        App(args.workspace).close()  # 确保工作区就绪
+        httpd = serve(args.workspace, host=args.host, port=args.port)
+        print(f"AIFOS 控制台: http://{args.host}:{httpd.server_address[1]}/")
+        print("Ctrl+C 停止")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\n已停止")
+        finally:
+            httpd.server_close()
         return 0
     echo = getattr(args, "verbose", False)
     app = App(args.workspace, echo_logs=echo)

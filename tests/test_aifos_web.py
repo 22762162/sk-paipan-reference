@@ -1,0 +1,145 @@
+"""Web 控制台测试:API、后台制作任务、产物服务与目录穿越防护。"""
+
+import http.client
+import json
+import threading
+import time
+
+import pytest
+
+from aifos.app import App
+from aifos.web.server import serve
+
+
+@pytest.fixture()
+def server(tmp_path):
+    ws = tmp_path / "ws"
+    App(ws).close()  # 初始化工作区
+    httpd = serve(ws, host="127.0.0.1", port=0)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    yield {"port": httpd.server_address[1], "workspace": ws}
+    httpd.shutdown()
+    httpd.server_close()
+
+
+def _request(port, method, path, body=None):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    headers = {}
+    payload = None
+    if body is not None:
+        payload = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    conn.request(method, path, body=payload, headers=headers)
+    resp = conn.getresponse()
+    raw = resp.read()
+    conn.close()
+    return resp.status, resp.getheader("Content-Type", ""), raw
+
+
+def _json_request(port, method, path, body=None):
+    status, _, raw = _request(port, method, path, body)
+    return status, json.loads(raw)
+
+
+def _wait_job(port, job_id, timeout=60):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        _, job = _json_request(port, "GET", f"/api/jobs/{job_id}")
+        if job["status"] != "running":
+            return job
+        time.sleep(0.2)
+    raise TimeoutError("制作任务超时")
+
+
+def test_index_and_static(server):
+    status, ctype, raw = _request(server["port"], "GET", "/")
+    assert status == 200 and "text/html" in ctype
+    assert "AIFOS" in raw.decode("utf-8")
+    status, ctype, _ = _request(server["port"], "GET", "/static/app.js")
+    assert status == 200 and "javascript" in ctype
+    status, ctype, _ = _request(server["port"], "GET", "/static/style.css")
+    assert status == 200 and "css" in ctype
+
+
+def test_overview_empty(server):
+    status, data = _json_request(server["port"], "GET", "/api/overview")
+    assert status == 200
+    assert data["stats"]["episodes"] == 0
+    assert data["episodes"] == []
+
+
+def test_produce_flow_and_episode_api(server):
+    port = server["port"]
+    status, reply = _json_request(port, "POST", "/api/produce", {
+        "sentence": "开始制作《万妖图录》第15集"})
+    assert status == 202
+    job = _wait_job(port, reply["job_id"])
+    assert job["status"] == "done"
+    assert job["summary"]["status"] == "done"
+
+    _, overview = _json_request(port, "GET", "/api/overview")
+    assert overview["stats"]["episodes"] == 1
+    episode_id = overview["episodes"][0]["id"]
+
+    status, detail = _json_request(port, "GET", f"/api/episode/{episode_id}")
+    assert status == 200
+    assert detail["script"]["scenes"]
+    assert detail["storyboard"]["shots"]
+    assert detail["qc_report"]["passed"]
+    assert len(detail["tasks"]) == 11
+
+    art = detail["artifacts"]
+    shot_keys = list(art["images"].keys())
+    assert shot_keys, "关键图索引不能为空"
+    assert art["cover"] and art["final"]
+    assert len(art["titles"]) == 3
+    # 产物 URL 可访问且类型正确
+    status, ctype, _ = _request(port, "GET", art["images"][shot_keys[0]])
+    assert status == 200 and ctype == "image/svg+xml"
+    status, _, _ = _request(port, "GET", art["cover"])
+    assert status == 200
+
+    # 资产 API
+    status, assets = _json_request(
+        port, "GET", "/api/assets?project=%E4%B8%87%E5%A6%96%E5%9B%BE%E5%BD%95")
+    assert status == 200
+    assert any(a["kind"] == "character" for a in assets)
+
+    # 日志 API
+    status, logs = _json_request(port, "GET", "/api/logs?limit=10")
+    assert status == 200 and logs
+
+
+def test_produce_rejects_bad_input(server):
+    status, reply = _json_request(
+        server["port"], "POST", "/api/produce", {"sentence": "随便说说"})
+    assert status == 400
+    assert "无法识别" in reply["error"]
+    status, _ = _json_request(server["port"], "POST", "/api/produce", {})
+    assert status == 400
+
+
+def test_artifact_traversal_blocked(server):
+    status, _, _ = _request(
+        server["port"], "GET", "/artifacts/../config.json")
+    assert status == 404
+    status, _, _ = _request(
+        server["port"], "GET", "/artifacts/..%2F..%2Fetc%2Fpasswd")
+    assert status == 404
+    status, _, _ = _request(
+        server["port"], "GET", "/static/../server.py")
+    assert status == 404
+
+
+def test_unknown_routes(server):
+    status, _ = _json_request(server["port"], "GET", "/api/nothing")
+    assert status == 404
+    status, _ = _json_request(server["port"], "GET", "/api/episode/999")
+    assert status == 404
+    status, _ = _json_request(server["port"], "GET", "/api/jobs/nope")
+    assert status == 404
+    from urllib.parse import quote
+    status, _ = _json_request(
+        server["port"], "GET", "/api/assets?project=" + quote("不存在"))
+    assert status == 404

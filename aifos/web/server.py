@@ -1,0 +1,372 @@
+"""AIFOS Web 服务:http.server 实现的 JSON API + 静态页面 + 产物文件服务。
+
+启动:python3 -m aifos serve [--host 127.0.0.1] [--port 8619]
+
+API:
+  GET  /api/overview            全局看板(项目/剧集/成本/额度/任务)
+  GET  /api/episode/<id>        单集详情(阶段/剧本/分镜/质检/产物索引)
+  GET  /api/assets?project=T    项目资产列表
+  GET  /api/logs?limit=N        最近日志
+  GET  /api/jobs  /api/jobs/<id>后台制作任务
+  POST /api/produce             {"sentence": "开始制作《万妖图录》第15集"}
+静态:
+  GET  /                        控制台单页应用
+  GET  /artifacts/<path>        workspace/artifacts 下的产物(防目录穿越)
+"""
+
+import json
+import re
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+
+from .. import __version__
+from ..app import App
+from ..cli import parse_produce_sentence
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+MIME = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".json": "application/json; charset=utf-8",
+    ".jsonl": "application/x-ndjson; charset=utf-8",
+    ".log": "text/plain; charset=utf-8",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".mp4": "video/mp4",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+}
+
+
+class JobRegistry:
+    """produce 后台任务:制作可能耗时(真实产线更久),Web 端异步执行。"""
+
+    def __init__(self, workspace):
+        self.workspace = workspace
+        self._jobs = {}
+        self._lock = threading.Lock()
+        self._seq = 0
+
+    def start(self, title, number, premise="", style=""):
+        with self._lock:
+            self._seq += 1
+            job_id = f"j{self._seq}"
+            self._jobs[job_id] = {
+                "id": job_id, "status": "running",
+                "title": title, "episode": number,
+                "started_at": time.time(),
+            }
+
+        def run():
+            app = App(self.workspace)
+            try:
+                summary = app.director.produce(
+                    title, number, premise=premise, style=style)
+                self._jobs[job_id].update(
+                    status="done", summary=summary, finished_at=time.time())
+            except Exception as exc:  # 后台任务兜底,错误进任务状态
+                self._jobs[job_id].update(
+                    status="failed", error=str(exc), finished_at=time.time())
+            finally:
+                app.close()
+
+        threading.Thread(target=run, daemon=True).start()
+        return job_id
+
+    def get(self, job_id):
+        return self._jobs.get(job_id)
+
+    def list(self):
+        return sorted(self._jobs.values(),
+                      key=lambda j: j["started_at"], reverse=True)
+
+
+def _artifact_url(app, uri):
+    """文件系统路径 → /artifacts/ 相对 URL;远程 URL 原样;其余 None。"""
+    if not uri:
+        return None
+    if uri.startswith("http://") or uri.startswith("https://"):
+        return uri
+    try:
+        rel = Path(uri).resolve().relative_to(
+            app.workspace.artifacts_dir.resolve())
+    except ValueError:
+        return None
+    return "/artifacts/" + rel.as_posix()
+
+
+def _collect_artifacts(app, project_id, ep_num):
+    """从资产表重建单集产物索引(按镜头/台词编号)。"""
+    prefix = f"e{ep_num:03d}"
+    rows = app.db.query(
+        "SELECT * FROM assets WHERE project_id=? AND name LIKE ?",
+        (project_id, prefix + "%"))
+    shot_re = re.compile(rf"^{prefix}_shot(\d+)$")
+    line_re = re.compile(rf"^{prefix}_line(\d+)$")
+    clip_re = re.compile(rf"^{prefix}_scene(\d+)$")
+    out = {"images": {}, "first": {}, "last": {}, "videos": {},
+           "voices": {}, "cover": None, "final": None,
+           "titles": [], "clips": []}
+    kind_map = {"image": "images", "first_frame": "first",
+                "last_frame": "last", "video": "videos"}
+    for row in rows:
+        kind, name = row["kind"], row["name"]
+        url = _artifact_url(app, row["uri"])
+        shot = shot_re.match(name)
+        if shot and kind in kind_map:
+            out[kind_map[kind]][int(shot.group(1))] = url
+            continue
+        line = line_re.match(name)
+        if line and kind == "voice":
+            out["voices"][int(line.group(1))] = url
+            continue
+        if kind == "cover" and name == prefix:
+            out["cover"] = url
+        elif kind == "edit" and name == f"{prefix}_final":
+            out["final"] = url
+        elif kind == "title" and name == prefix:
+            out["titles"] = json.loads(row["meta"]).get("candidates", [])
+        elif kind == "clip":
+            clip = clip_re.match(name)
+            if clip:
+                out["clips"].append(
+                    {"scene_no": int(clip.group(1)), "url": url})
+    out["clips"].sort(key=lambda c: c["scene_no"])
+    return out
+
+
+def _episode_payload(app, episode_id):
+    episode = app.projects.get_episode(episode_id)
+    if episode is None:
+        return None
+    project = app.db.query_one(
+        "SELECT * FROM projects WHERE id=?", (episode["project_id"],))
+    script, script_v = app.projects.latest_document(episode_id, "script")
+    storyboard, sb_v = app.projects.latest_document(episode_id, "storyboard")
+    tasks = [dict(t) for t in app.db.query(
+        "SELECT id, stage, name, status, provider, cost, error, created_at, "
+        "updated_at FROM tasks WHERE episode_id=? ORDER BY id",
+        (episode_id,))]
+    out_dir = (app.workspace.artifacts_dir / f"p{project['id']:03d}"
+               / f"e{episode['number']:03d}")
+    qc_report = None
+    qc_path = out_dir / "qc_report.json"
+    if qc_path.exists():
+        qc_report = json.loads(qc_path.read_text(encoding="utf-8"))
+    return {
+        "episode": dict(episode),
+        "project": dict(project),
+        "tasks": tasks,
+        "script": script,
+        "script_version": script_v,
+        "storyboard": storyboard,
+        "storyboard_version": sb_v,
+        "qc_report": qc_report,
+        "artifacts": _collect_artifacts(
+            app, project["id"], episode["number"]),
+    }
+
+
+def _overview_payload(app, jobs):
+    episodes = [dict(r) for r in app.db.query(
+        "SELECT e.id, e.number, e.title, e.status, e.qc_score, e.cost, "
+        "e.updated_at, p.title AS project "
+        "FROM episodes e JOIN projects p ON p.id=e.project_id "
+        "ORDER BY e.updated_at DESC")]
+    done = [e for e in episodes if e["status"] == "done"]
+    scored = [e["qc_score"] for e in episodes if e["qc_score"] is not None]
+    return {
+        "version": __version__,
+        "projects": [dict(r) for r in app.projects.list_projects()],
+        "episodes": episodes,
+        "stats": {
+            "episodes": len(episodes),
+            "done": len(done),
+            "total_cost": round(sum(e["cost"] for e in episodes), 2),
+            "avg_qc": round(sum(scored) / len(scored), 1) if scored else None,
+            "budget": app.config.get("budget", "per_episode", default=0),
+        },
+        "cost_by_stage": [dict(r) for r in app.system.cost_by_stage()],
+        "cost_by_provider": [dict(r) for r in app.system.cost_by_provider()],
+        "quota": [dict(r) for r in app.system.quota_status()],
+        "asset_stats": {
+            p["title"]: [dict(r) for r in app.assets.stats(p["id"])]
+            for p in app.projects.list_projects()
+        },
+        "jobs": jobs.list(),
+    }
+
+
+def make_handler(workspace, jobs):
+    workspace = Path(workspace)
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):  # 静默访问日志(平台日志走系统中心)
+            pass
+
+        # ---- 响应助手 ----
+        def _json(self, data, status=200):
+            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type",
+                             "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _error(self, status, message):
+            self._json({"error": message}, status=status)
+
+        def _file(self, path):
+            path = Path(path)
+            if not path.is_file():
+                return self._error(404, "文件不存在")
+            body = path.read_bytes()
+            self.send_response(200)
+            self.send_header(
+                "Content-Type",
+                MIME.get(path.suffix.lower(), "application/octet-stream"))
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _with_app(self, fn):
+            app = App(workspace)
+            try:
+                return fn(app)
+            finally:
+                app.close()
+
+        # ---- 路由 ----
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            route = unquote(parsed.path)
+            query = parse_qs(parsed.query)
+            try:
+                if route in ("/", "/index.html"):
+                    return self._file(STATIC_DIR / "index.html")
+                if route.startswith("/static/"):
+                    return self._static(STATIC_DIR, route[len("/static/"):])
+                if route.startswith("/artifacts/"):
+                    return self._artifact(route[len("/artifacts/"):])
+                if route == "/api/overview":
+                    return self._json(self._with_app(
+                        lambda app: _overview_payload(app, jobs)))
+                match = re.match(r"^/api/episode/(\d+)$", route)
+                if match:
+                    payload = self._with_app(
+                        lambda app: _episode_payload(
+                            app, int(match.group(1))))
+                    if payload is None:
+                        return self._error(404, "剧集不存在")
+                    return self._json(payload)
+                if route == "/api/assets":
+                    return self._assets(query)
+                if route == "/api/logs":
+                    limit = int(query.get("limit", ["50"])[0])
+                    return self._json(self._with_app(
+                        lambda app: [dict(r)
+                                     for r in app.logger.tail(limit)]))
+                if route == "/api/jobs":
+                    return self._json(jobs.list())
+                match = re.match(r"^/api/jobs/(\w+)$", route)
+                if match:
+                    job = jobs.get(match.group(1))
+                    if job is None:
+                        return self._error(404, "任务不存在")
+                    return self._json(job)
+                return self._error(404, "未知路径")
+            except BrokenPipeError:
+                pass
+            except Exception as exc:
+                self._error(500, str(exc))
+
+        def do_POST(self):
+            parsed = urlparse(self.path)
+            try:
+                if parsed.path == "/api/produce":
+                    return self._produce()
+                return self._error(404, "未知路径")
+            except BrokenPipeError:
+                pass
+            except Exception as exc:
+                self._error(500, str(exc))
+
+        # ---- 各端点 ----
+        def _static(self, root, rel):
+            target = (root / rel).resolve()
+            if not str(target).startswith(str(root.resolve()) + "/"):
+                return self._error(404, "非法路径")
+            return self._file(target)
+
+        def _artifact(self, rel):
+            app = App(workspace)
+            try:
+                root = app.workspace.artifacts_dir.resolve()
+            finally:
+                app.close()
+            target = (root / rel).resolve()
+            if not str(target).startswith(str(root) + "/"):
+                return self._error(404, "非法路径")
+            return self._file(target)
+
+        def _assets(self, query):
+            title = query.get("project", [""])[0]
+            kind = query.get("kind", [None])[0]
+
+            def fetch(app):
+                project = app.projects.get_project(title)
+                if project is None:
+                    return None
+                rows = app.assets.list(project["id"], kind=kind)
+                items = []
+                for row in rows:
+                    item = dict(row)
+                    item["meta"] = json.loads(item["meta"])
+                    item["url"] = _artifact_url(app, item["uri"])
+                    items.append(item)
+                return items
+
+            items = self._with_app(fetch)
+            if items is None:
+                return self._error(404, f"项目不存在: {title}")
+            return self._json(items)
+
+        def _produce(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                body = json.loads(
+                    self.rfile.read(length).decode("utf-8")) if length else {}
+            except ValueError:
+                return self._error(400, "请求体不是合法 JSON")
+            title = body.get("title")
+            number = body.get("episode")
+            sentence = body.get("sentence", "")
+            if sentence:
+                parsed = parse_produce_sentence(sentence)
+                if parsed:
+                    title, number = parsed
+            if not title or not number:
+                return self._error(
+                    400, "无法识别制作目标;示例:开始制作《万妖图录》第15集")
+            job_id = jobs.start(
+                title, int(number),
+                premise=body.get("premise", ""),
+                style=body.get("style", ""))
+            return self._json({"job_id": job_id}, status=202)
+
+    return Handler
+
+
+def serve(workspace, host="127.0.0.1", port=8619):
+    """构建并返回 HTTP 服务器(调用方负责 serve_forever)。"""
+    jobs = JobRegistry(workspace)
+    handler = make_handler(workspace, jobs)
+    return ThreadingHTTPServer((host, port), handler)
