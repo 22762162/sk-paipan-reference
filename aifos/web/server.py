@@ -336,6 +336,11 @@ def make_handler(workspace, jobs):
                 if route == "/api/settings":
                     from ..settings import settings_payload
                     return self._json(self._with_app(settings_payload))
+                if route == "/api/doctor":
+                    from ..doctor import run_doctor
+                    ping = query.get("ping", ["0"])[0] == "1"
+                    return self._json(self._with_app(
+                        lambda app: run_doctor(app, do_ping=ping)))
                 return self._error(404, "未知路径")
             except BrokenPipeError:
                 pass
@@ -359,6 +364,8 @@ def make_handler(workspace, jobs):
                     return self._settings_update()
                 if parsed.path == "/api/settings/test":
                     return self._settings_test()
+                if parsed.path == "/api/settings/detect":
+                    return self._settings_detect()
                 if parsed.path == "/api/project/rename":
                     return self._project_rename()
                 return self._error(404, "未知路径")
@@ -608,6 +615,23 @@ def make_handler(workspace, jobs):
             except AifosError as exc:
                 return self._error(400, str(exc))
             return self._json(report)
+
+        def _settings_detect(self):
+            """自动检测本机 CLI 并接线,返回检测结果 + 最新设置视图。"""
+            from ..doctor import apply_detected, detect_clis
+            from ..settings import settings_payload
+
+            def task(app):
+                found = detect_clis()
+                applied = apply_detected(app.workspace.config_path, found)
+                return found, applied
+
+            found, applied = self._with_app(task)
+            view = self._with_app(settings_payload)
+            view["detected"] = found
+            view["applied"] = [{"provider": p, "path": path}
+                               for p, path in applied]
+            return self._json(view)
 
         def _project_rename(self):
             body = self._read_body()

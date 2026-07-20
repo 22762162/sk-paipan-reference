@@ -581,6 +581,24 @@ audio.player { background: var(--surface-2); }
 .pc-status .ok { color: var(--good); }
 .pc-status .miss { color: var(--serious); }
 
+/* ---------- 产线状态条 / 实际产线标注 ---------- */
+.pipeline-row {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  background: var(--surface); border: 1px solid var(--hairline);
+  border-radius: 12px; padding: 10px 14px; margin-bottom: 16px;
+  font-size: 12.5px;
+}
+.pipeline-label { color: var(--ink-3); margin-right: 2px; }
+.pipe-chip {
+  padding: 3px 10px; border-radius: 999px; border: 1px solid var(--hairline);
+  color: var(--ink-3); background: var(--surface-2);
+}
+.pipe-chip.real { color: var(--good); border-color: rgba(12, 163, 12, .45); }
+.pipe-link { margin-left: auto; color: var(--accent); text-decoration: none; }
+.pipe-link:hover { text-decoration: underline; }
+.stage-list .prov { color: var(--ink-3); font-size: 11px; }
+.stage-list .prov.real { color: var(--good); }
+
 .demo-note {
   background: var(--surface-2); border-bottom: 1px solid var(--hairline);
   color: var(--ink-2); font-size: 12.5px; padding: 7px 20px;
@@ -1793,6 +1811,37 @@ JSON 格式:{"project_title":"${project.title}","episode_number":${number},"epis
       save();
       return [200, { ...project }];
     }
+    if (key.startsWith("/api/doctor")) {
+      const view = settingsView();
+      const caps = Object.entries(state.config.routing).map(
+        ([cap, chain]) => {
+          let chosen = "mock", detail = "内置模拟";
+          for (const n of chain) {
+            const c = state.config.providers[n];
+            if (!c || !c.enabled) continue;
+            if (c.type === "mock") { chosen = n; break; }
+            if (MODE_CN[c.type] === "API" && c.api_key) {
+              chosen = n; detail = "API 已配置(真实调用)"; break;
+            }
+            // CLI 在浏览器演示中不可用 → 看下一个
+          }
+          const real = chosen !== "mock";
+          return { capability: cap,
+            label: view.capabilities[cap] || cap,
+            provider: chosen,
+            provider_label: (state.config.providers[chosen] || {}).label
+              || chosen,
+            real, detail,
+            hint: real ? null
+              : "在 ⚙️ 设置里配 API Key(浏览器演示无法调 CLI)" };
+        });
+      return [200, { capabilities: caps, providers: [],
+        real_count: caps.filter((c) => c.real).length,
+        total: caps.length, pinged: false }];
+    }
+    if (opts && opts.method === "POST" && key === "/api/settings/detect")
+      return [400, { error: "浏览器演示无法扫描本机 CLI;本机正式版的" +
+        "启动脚本会自动检测(install_aifos.sh / start_aifos.command)" }];
     if (key === "/api/settings" && (!opts || opts.method !== "POST"))
       return [200, settingsView()];
     if (opts && opts.method === "POST" && key === "/api/settings") {
@@ -2289,6 +2338,7 @@ async function renderDashboard() {
       <div class="produce-hint">全自动完成:剧本 → 分镜 → 画面 → 配音 → 成片。做完后点下方剧集,再点「▶ 播放本集」观看。</div>
     </form>
     <div id="progress-banner"></div>
+    <div id="pipeline-strip"></div>
 
     <div class="tiles">
       <div class="tile"><div class="label">剧集总数</div><div class="value">${s.episodes}</div></div>
@@ -2383,6 +2433,23 @@ async function renderDashboard() {
   app.querySelectorAll(".proj-rename").forEach((btn) =>
     btn.addEventListener("click", () =>
       renameProject(btn.dataset.title, renderDashboard)));
+
+  api("/api/doctor").then((doc) => {
+    const el = document.getElementById("pipeline-strip");
+    if (!el) return;
+    el.innerHTML = `
+      <div class="pipeline-row">
+        <span class="pipeline-label">产线状态</span>
+        ${doc.capabilities.map((c) => `
+          <span class="pipe-chip ${c.real ? "real" : "mockp"}"
+            title="${esc(c.detail)}${c.hint ? " · " + esc(c.hint) : ""}">
+            ${c.real ? "✓" : "○"} ${esc(c.label)}·${c.real
+              ? esc(c.provider_label.split(" ")[0].split("·")[0]) : "内置模拟"}</span>`).join("")}
+        <a class="pipe-link" href="#/settings">${doc.real_count
+          ? `${doc.real_count}/${doc.total} 环节已接真实 AI · 去设置`
+          : "全部为内置模拟(占位画面)· 去接入真实 AI →"}</a>
+      </div>`;
+  }).catch(() => {});
 
   api("/api/logs?limit=30").then((rows) => {
     const el = document.getElementById("log-list");
@@ -2488,6 +2555,8 @@ function drawSettings(data) {
     <div class="settings-head">
       <button id="btn-back">← 仪表盘</button>
       <h1>⚙️ AI 产线设置</h1>
+      <button class="primary" id="btn-detect"
+        title="扫描本机的 claude / codex / dreamina / 剪映 CLI,找到即自动填好并启用">🔍 自动检测本机 CLI</button>
       <span class="hint">剧本 / 图片 / 视频每个环节都能选 CLI 或 API,按顺序自动回退;都没配好也有内置产线兜底,流程不会断</span>
     </div>
     <div class="panel">
@@ -2516,6 +2585,22 @@ function drawSettings(data) {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+  document.getElementById("btn-detect").onclick = async (ev) => {
+    const btn = ev.target;
+    btn.disabled = true; btn.textContent = "检测中…";
+    try {
+      const fresh = await api("/api/settings/detect", { method: "POST" });
+      const names = (fresh.applied || []).map((a) => a.provider);
+      showToast(names.length
+        ? `✓ 找到并已启用:${names.join("、")}`
+        : "本机没找到 claude / codex / dreamina;装好后重试,或改用 API 模式",
+        names.length ? "ok" : "error");
+      drawSettings(fresh);
+    } catch (e) {
+      showToast(e.message, "error");
+      btn.disabled = false; btn.textContent = "🔍 自动检测本机 CLI";
+    }
+  };
   app.querySelectorAll("tr[data-cap]").forEach((tr) => {
     tr.querySelector(".route-save").onclick = async () => {
       try {
@@ -3452,10 +3537,11 @@ class StoryboardCanvas {
         ${art.cover ? `<img class="preview" src="${esc(art.cover)}" alt="封面">` : ""}
         ${art.titles.length ? `<h4>候选标题</h4><ul class="titles-list">
           ${art.titles.map((t) => `<li>${esc(t)}</li>`).join("")}</ul>` : ""}
-        <h4>制作阶段</h4>
+        <h4>制作阶段 · 括号内为实际产线</h4>
         <ul class="stage-list">
           ${this.data.tasks.map((t) => `<li>
-            <span>${esc(t.name)}</span>
+            <span>${esc(t.name)}${t.provider
+              ? ` <small class="prov ${t.provider.includes("mock") ? "" : "real"}">${t.provider.includes("mock") ? "内置模拟" : esc(t.provider)}</small>` : ""}</span>
             <span style="display:flex;gap:8px;align-items:center">
               <span class="cost">${fmt(t.cost)}</span>${chip(t.status === "done" ? "done" : t.status === "failed" ? "failed" : "running")}
             </span></li>`).join("")}

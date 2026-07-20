@@ -158,9 +158,17 @@ def _build_parser():
     p_user.add_argument("--role", default="operator",
                         choices=["admin", "operator", "viewer"])
 
+    p_doctor = sub.add_parser(
+        "doctor", help="体检:每个环节实际由谁生产(真实产线/内置模拟)")
+    p_doctor.add_argument("--ping", action="store_true",
+                          help="对已配置的 API 发真实请求验证连通")
+
     p_config = sub.add_parser(
         "config", help="设置中心:各环节 AI 用 CLI 还是 API,自由配置")
-    p_config.add_argument("action", choices=["list", "set", "route", "test"])
+    p_config.add_argument("action",
+                          choices=["list", "set", "route", "test", "detect"])
+    p_config.add_argument("--apply", action="store_true",
+                          help="detect 用:把找到的 CLI 写入配置并启用")
     p_config.add_argument("--provider",
                           help="provider 名,如 claude/claude_api/codex/"
                                "image_api/jimeng/ark")
@@ -452,9 +460,50 @@ def _cmd_user(app, args):
     return 0
 
 
+def _cmd_doctor(app, args):
+    from .doctor import run_doctor
+    report = run_doctor(app, do_ping=args.ping)
+    print("== AIFOS 体检:每个环节实际由谁生产 ==")
+    for cap in report["capabilities"]:
+        mark = "✓" if cap["real"] else "○"
+        line = (f"  {mark} {cap['label']:<4}({cap['capability']}) → "
+                f"{cap['provider_label']}")
+        print(line + ("" if cap["real"] else "  [内置模拟]"))
+        if not cap["real"] and cap["hint"]:
+            print(f"      接入: {cap['hint']}")
+    print(f"\n真实产线 {report['real_count']}/{report['total']} 个环节;"
+          "未接入的环节由内置模拟兜底(流程能跑,产物是占位内容)。")
+    if not report["pinged"]:
+        print("提示:aifos doctor --ping 会对已配置的 API 发真实请求验证。")
+    problems = [p for p in report["providers"]
+                if p["enabled"] and not p["ok"]]
+    if problems:
+        print("\n已启用但当前不可用:")
+        for p in problems:
+            print(f"  ✗ {p['name']}({p['label']}): {p['detail']}")
+    return 0 if report["real_count"] else 1
+
+
 def _cmd_config(app, args):
     from .settings import (CAPABILITY_CN, set_routing, settings_payload,
                            test_provider, update_provider)
+    if args.action == "detect":
+        from .doctor import apply_detected, detect_clis
+        found = detect_clis()
+        if not found:
+            print("本机没找到 claude / codex / dreamina / jianying-cli;"
+                  "装好后重试,或在设置里配 API 模式")
+            return 1
+        for cli, path in found.items():
+            print(f"  找到 {cli}: {path}")
+        if not args.apply:
+            print("加 --apply 即写入配置并启用这些 CLI")
+            return 0
+        applied = apply_detected(app.workspace.config_path, found)
+        for provider, path in applied:
+            print(f"  ✓ 已启用 {provider} → {path}")
+        print("完成;运行 aifos doctor 查看每个环节现在由谁生产")
+        return 0
     if args.action == "list":
         view = settings_payload(app)
         print("== 能力路由(按顺序尝试,自动回退)==")
@@ -636,6 +685,8 @@ def main(argv=None):
             return _cmd_user(app, args)
         if args.command == "config":
             return _cmd_config(app, args)
+        if args.command == "doctor":
+            return _cmd_doctor(app, args)
         parser.print_help()
         return 0
     except AifosError as exc:

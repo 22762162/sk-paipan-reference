@@ -1,0 +1,69 @@
+# AIFOS 快速上手(真实可用版)
+
+AIFOS 是本机运行的 AI 漫剧生产平台:一句话开工,自动完成
+剧本 → 人物/场景图 → 分镜 → 首尾帧 →(确认)→ 视频 → 配音 → 剪辑 → 质检 → 成品包。
+零第三方依赖,只需要 macOS 自带的 `python3` 和 `git`。
+
+## 一条命令装好并启动
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/22762162/sk-paipan-reference/claude/sk-manga-drama-platform-b8nbe3/install_aifos.sh | bash
+```
+
+脚本会:装到 `~/AIFOS`(已装过则更新)→ **自动检测本机的
+claude / codex / dreamina / 剪映 CLI 并接线** → 体检打印每个环节由谁生产 →
+启动控制台并打开浏览器(http://127.0.0.1:8619)。
+
+以后每次启动:双击 `~/AIFOS/start_aifos.command`,或
+`cd ~/AIFOS && python3 -m aifos serve`。
+
+## 接入真实 AI(三种方式任选)
+
+| 环节 | CLI 方式(推荐,用订阅额度) | API 方式(备用/扩容) |
+|---|---|---|
+| 剧本/分镜 | Claude CLI(自动检测) | Claude API:填 Key,模型默认 claude-opus-4-8 |
+| 图片/首尾帧/封面 | Codex CLI(自动检测) | 出图 API(OpenAI 兼容):填 Key |
+| 视频 | 即梦 CLI dreamina(自动检测,锁定 seedance2.0fast_vip) | 火山方舟 Ark:填 Key + 模型 ID |
+| 配音 | macOS say(自动开启) | 通用 API |
+
+- 网页配置:右上角 **⚙️ AI 设置** → 「🔍 自动检测本机 CLI」一键接线;
+  API 填 Key 后点 **测试连接**(会发真实请求验证,Key 错了直接报 HTTP 错误)。
+- 命令行配置:
+  ```bash
+  python3 -m aifos config detect --apply          # 自动接线本机 CLI
+  python3 -m aifos config set --provider claude_api --enable --api-key sk-ant-xxx
+  python3 -m aifos config test --provider claude_api   # 真实连通验证
+  python3 -m aifos doctor --ping                  # 全面体检(含 API 真实验证)
+  ```
+
+## 怎么确认「是真的在生产」
+
+- 仪表盘顶部有 **产线状态条**:每个环节标明 `✓ 真实产线` 还是 `○ 内置模拟`;
+  全模拟时会显著提示去接入。
+- 每集侧栏「制作阶段」逐项标注实际使用的产线(claude / codex / jimeng /
+  claude_api… 或 内置模拟)。
+- `python3 -m aifos doctor`:命令行体检,未接入的环节会给出接入命令。
+
+> 内置模拟是兜底:没接任何 AI 时流程也能完整跑通,但画面是占位图。
+> 接入 Codex/出图 API 后,人物立绘、场景图、分镜画面都是真实生成。
+
+## 一句话开工
+
+```bash
+python3 -m aifos produce "万妖图录"        # 不用《》不用集数,自动接着做下一集
+python3 -m aifos produce "苏念的一天 第3期" --kind idol
+```
+
+网页里直接在首页输入框输入作品名即可;预生产完成后进画布检查
+剧本/人物/场景/分镜 → 点「✅ 确认」→ 自动完成视频/配音/成片 →
+「⬇ 下载成品包」拿到 zip(成片/封面/文案/配音/剪映草稿)。
+
+## 常见问题
+
+- **点测试连接报错** → 信息里带 HTTP 状态码:401 是 Key 错,404 是接口地址错,
+  超时是网络不通。改完再点(会自动保存表单再测)。
+- **图片还是占位图** → 看仪表盘产线状态条:图片环节若是「内置模拟」,
+  说明 Codex CLI 没检测到且出图 API 没配;任接一个即可。
+- **视频没有生成 mp4** → 视频环节需要即梦 CLI(`dreamina`)或 Ark API;
+  即梦额度耗尽会自动回退 Ark。
+- 在线演示页(claude.ai)是浏览器沙箱,**禁止外联**,真实生产请用本机版。

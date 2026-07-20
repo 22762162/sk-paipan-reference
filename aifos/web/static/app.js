@@ -108,6 +108,7 @@ async function renderDashboard() {
       <div class="produce-hint">全自动完成:剧本 → 分镜 → 画面 → 配音 → 成片。做完后点下方剧集,再点「▶ 播放本集」观看。</div>
     </form>
     <div id="progress-banner"></div>
+    <div id="pipeline-strip"></div>
 
     <div class="tiles">
       <div class="tile"><div class="label">剧集总数</div><div class="value">${s.episodes}</div></div>
@@ -202,6 +203,23 @@ async function renderDashboard() {
   app.querySelectorAll(".proj-rename").forEach((btn) =>
     btn.addEventListener("click", () =>
       renameProject(btn.dataset.title, renderDashboard)));
+
+  api("/api/doctor").then((doc) => {
+    const el = document.getElementById("pipeline-strip");
+    if (!el) return;
+    el.innerHTML = `
+      <div class="pipeline-row">
+        <span class="pipeline-label">产线状态</span>
+        ${doc.capabilities.map((c) => `
+          <span class="pipe-chip ${c.real ? "real" : "mockp"}"
+            title="${esc(c.detail)}${c.hint ? " · " + esc(c.hint) : ""}">
+            ${c.real ? "✓" : "○"} ${esc(c.label)}·${c.real
+              ? esc(c.provider_label.split(" ")[0].split("·")[0]) : "内置模拟"}</span>`).join("")}
+        <a class="pipe-link" href="#/settings">${doc.real_count
+          ? `${doc.real_count}/${doc.total} 环节已接真实 AI · 去设置`
+          : "全部为内置模拟(占位画面)· 去接入真实 AI →"}</a>
+      </div>`;
+  }).catch(() => {});
 
   api("/api/logs?limit=30").then((rows) => {
     const el = document.getElementById("log-list");
@@ -307,6 +325,8 @@ function drawSettings(data) {
     <div class="settings-head">
       <button id="btn-back">← 仪表盘</button>
       <h1>⚙️ AI 产线设置</h1>
+      <button class="primary" id="btn-detect"
+        title="扫描本机的 claude / codex / dreamina / 剪映 CLI,找到即自动填好并启用">🔍 自动检测本机 CLI</button>
       <span class="hint">剧本 / 图片 / 视频每个环节都能选 CLI 或 API,按顺序自动回退;都没配好也有内置产线兜底,流程不会断</span>
     </div>
     <div class="panel">
@@ -335,6 +355,22 @@ function drawSettings(data) {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+  document.getElementById("btn-detect").onclick = async (ev) => {
+    const btn = ev.target;
+    btn.disabled = true; btn.textContent = "检测中…";
+    try {
+      const fresh = await api("/api/settings/detect", { method: "POST" });
+      const names = (fresh.applied || []).map((a) => a.provider);
+      showToast(names.length
+        ? `✓ 找到并已启用:${names.join("、")}`
+        : "本机没找到 claude / codex / dreamina;装好后重试,或改用 API 模式",
+        names.length ? "ok" : "error");
+      drawSettings(fresh);
+    } catch (e) {
+      showToast(e.message, "error");
+      btn.disabled = false; btn.textContent = "🔍 自动检测本机 CLI";
+    }
+  };
   app.querySelectorAll("tr[data-cap]").forEach((tr) => {
     tr.querySelector(".route-save").onclick = async () => {
       try {
@@ -1271,10 +1307,11 @@ class StoryboardCanvas {
         ${art.cover ? `<img class="preview" src="${esc(art.cover)}" alt="封面">` : ""}
         ${art.titles.length ? `<h4>候选标题</h4><ul class="titles-list">
           ${art.titles.map((t) => `<li>${esc(t)}</li>`).join("")}</ul>` : ""}
-        <h4>制作阶段</h4>
+        <h4>制作阶段 · 括号内为实际产线</h4>
         <ul class="stage-list">
           ${this.data.tasks.map((t) => `<li>
-            <span>${esc(t.name)}</span>
+            <span>${esc(t.name)}${t.provider
+              ? ` <small class="prov ${t.provider.includes("mock") ? "" : "real"}">${t.provider.includes("mock") ? "内置模拟" : esc(t.provider)}</small>` : ""}</span>
             <span style="display:flex;gap:8px;align-items:center">
               <span class="cost">${fmt(t.cost)}</span>${chip(t.status === "done" ? "done" : t.status === "failed" ? "failed" : "running")}
             </span></li>`).join("")}

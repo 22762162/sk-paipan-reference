@@ -578,3 +578,21 @@ audio.player { background: var(--surface-2); }
 .pc-status { margin-top: 10px; font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
 .pc-status .ok { color: var(--good); }
 .pc-status .miss { color: var(--serious); }
+
+/* ---------- 产线状态条 / 实际产线标注 ---------- */
+.pipeline-row {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  background: var(--surface); border: 1px solid var(--hairline);
+  border-radius: 12px; padding: 10px 14px; margin-bottom: 16px;
+  font-size: 12.5px;
+}
+.pipeline-label { color: var(--ink-3); margin-right: 2px; }
+.pipe-chip {
+  padding: 3px 10px; border-radius: 999px; border: 1px solid var(--hairline);
+  color: var(--ink-3); background: var(--surface-2);
+}
+.pipe-chip.real { color: var(--good); border-color: rgba(12, 163, 12, .45); }
+.pipe-link { margin-left: auto; color: var(--accent); text-decoration: none; }
+.pipe-link:hover { text-decoration: underline; }
+.stage-list .prov { color: var(--ink-3); font-size: 11px; }
+.stage-list .prov.real { color: var(--good); }
