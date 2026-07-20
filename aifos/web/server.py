@@ -55,7 +55,7 @@ class JobRegistry:
         self._seq = 0
 
     def start(self, title, number, premise="", style="", force=False,
-              script=None):
+              script=None, review=False):
         with self._lock:
             self._seq += 1
             job_id = f"j{self._seq}"
@@ -70,7 +70,7 @@ class JobRegistry:
             try:
                 summary = app.director.produce(
                     title, number, premise=premise, style=style, force=force,
-                    script=script)
+                    script=script, pause_for_confirm=review)
                 self._jobs[job_id].update(
                     status="done", summary=summary, finished_at=time.time())
             except Exception as exc:  # 后台任务兜底,错误进任务状态
@@ -141,6 +141,18 @@ def _collect_artifacts(app, project_id, ep_num):
                 out["clips"].append(
                     {"scene_no": int(clip.group(1)), "url": url})
     out["clips"].sort(key=lambda c: c["scene_no"])
+    # 人物立绘与场景概念图(项目级资产,跨集复用)
+    out["cast_art"] = [
+        {"name": row["name"], "url": _artifact_url(app, row["uri"]),
+         "role": json.loads(row["meta"]).get("role", "")}
+        for row in app.db.query(
+            "SELECT * FROM assets WHERE project_id=? AND kind='character_art' "
+            "ORDER BY id", (project_id,))]
+    out["scene_art"] = [
+        {"name": row["name"], "url": _artifact_url(app, row["uri"])}
+        for row in app.db.query(
+            "SELECT * FROM assets WHERE project_id=? AND kind='scene_art' "
+            "ORDER BY id", (project_id,))]
     return out
 
 
@@ -295,6 +307,8 @@ def make_handler(workspace, jobs):
             try:
                 if parsed.path == "/api/produce":
                     return self._produce()
+                if parsed.path == "/api/confirm":
+                    return self._confirm()
                 return self._error(404, "未知路径")
             except BrokenPipeError:
                 pass
@@ -366,12 +380,40 @@ def make_handler(workspace, jobs):
                         body["script_text"], title, int(number))
                 except ScriptImportError as exc:
                     return self._error(400, str(exc))
+            # Web 端默认走「预生产 → 确认 → 自动生产」流程
             job_id = jobs.start(
                 title, int(number),
                 premise=body.get("premise", ""),
                 style=body.get("style", ""),
                 force=bool(body.get("force")),
-                script=script)
+                script=script,
+                review=bool(body.get("review", True)))
+            return self._json({"job_id": job_id}, status=202)
+
+        def _confirm(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                body = json.loads(
+                    self.rfile.read(length).decode("utf-8")) if length else {}
+            except ValueError:
+                return self._error(400, "请求体不是合法 JSON")
+            episode_id = body.get("episode_id")
+            if not episode_id:
+                return self._error(400, "缺少 episode_id")
+
+            def lookup(app):
+                episode = app.projects.get_episode(int(episode_id))
+                if episode is None:
+                    return None
+                project = app.db.query_one(
+                    "SELECT * FROM projects WHERE id=?",
+                    (episode["project_id"],))
+                return project["title"], episode["number"]
+
+            found = self._with_app(lookup)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            job_id = jobs.start(found[0], found[1], review=False)
             return self._json({"job_id": job_id}, status=202)
 
     return Handler

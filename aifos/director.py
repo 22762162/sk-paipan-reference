@@ -19,9 +19,9 @@ ASPECT_DIMS = {
 
 STAGES = [
     ("script", "剧本"),
+    ("cast", "人物/场景图"),
     ("storyboard", "分镜"),
-    ("assets", "资产调用"),
-    ("images", "图片"),
+    ("images", "镜头画面"),
     ("frames", "首尾帧"),
     ("videos", "视频"),
     ("voices", "配音"),
@@ -30,6 +30,10 @@ STAGES = [
     ("package", "封面/标题/拆条"),
     ("archive", "数据沉淀"),
 ]
+
+# 预生产检查点:此阶段完成后可暂停等待用户确认,
+# 确认后才进入视频生产(真实产线从这里开始消耗即梦额度)
+CONFIRM_AFTER = "frames"
 
 
 class Director:
@@ -48,11 +52,14 @@ class Director:
 
     # ---- 入口:一句话开工 ----
     def produce(self, project_title, episode_number, premise="", style="",
-                force=False, script=None):
+                force=False, script=None, pause_for_confirm=False):
         """force=False 时增量生产:已有且落盘完好的产物直接复用,
         只补齐缺失部分——真实产线(即梦按镜头计费)断点续产的关键。
         script:用户自带剧本(标准 JSON);提供时跳过 AI 编剧,
-        人物/场次/分镜等全部从该剧本自动推导。"""
+        人物/场次/分镜等全部从该剧本自动推导。
+        pause_for_confirm=True:预生产(剧本/人物图/场景图/分镜/首尾帧)
+        完成后暂停等待确认(status=awaiting_confirm);确认后再次调用
+        produce(不带该参数)即从断点继续自动完成视频→配音→剪辑→质检。"""
         if script is not None:
             force = True  # 剧本变了,旧镜头/配音不可复用
         project, _ = self.projects.get_or_create_project(
@@ -77,16 +84,27 @@ class Director:
         }
         stage_reports = []
         failed = False
+        paused = False
         for stage, stage_cn in STAGES:
             report = self._run_stage(stage, stage_cn, ctx)
             stage_reports.append(report)
             if report["status"] == "failed":
                 failed = True
                 break
+            if pause_for_confirm and stage == CONFIRM_AFTER:
+                paused = True
+                break
 
         episode = self.projects.get_episode(episode["id"])
         if failed:
             self.projects.set_episode_status(episode["id"], "failed")
+        elif paused:
+            self.projects.set_episode_status(
+                episode["id"], "awaiting_confirm")
+            self.log.info(
+                "director",
+                f"预生产完成,等待确认后进入视频生产"
+                f"(episode_id={episode['id']})")
         elif not ctx.get("qc_report", {}).get("passed", True):
             self.projects.set_episode_status(episode["id"], "qc_failed")
         else:
@@ -247,32 +265,77 @@ class Director:
         version = self.projects.save_document(
             ctx["episode"]["id"], "storyboard", storyboard)
         ctx["storyboard"] = storyboard
+        for shot in storyboard["shots"]:
+            self.assets.register(
+                ctx["project"]["id"], "prompt",
+                f"e{ctx['episode']['number']:03d}_shot{shot['shot_no']:03d}",
+                meta={"prompt": shot["prompt"]})
         return {"version": version, "shots": len(storyboard["shots"])}
 
-    def _stage_assets(self, ctx):
-        """资产调用:角色/场景优先复用 IP 资产中心已有资产。"""
+    def _stage_cast(self, ctx):
+        """人物立绘与场景概念图:项目级资产,跨集复用保证形象一致。"""
         project_id = ctx["project"]["id"]
+        style = ctx["project"]["style"] or "国风漫剧"
         reused, created = 0, 0
         cast = []
         for character in ctx["script"].get("characters", []):
-            row, was_reused = self.assets.acquire(
-                project_id, "character", character["name"],
-                meta={"role": character.get("role", "")})
-            cast.append(character["name"])
-            reused += int(was_reused)
-            created += int(not was_reused)
-        for scene in ctx["script"]["scenes"]:
-            _, was_reused = self.assets.acquire(
-                project_id, "scene", scene["location"])
-            reused += int(was_reused)
-            created += int(not was_reused)
-        for shot in ctx["storyboard"]["shots"]:
+            name = character["name"]
+            role = character.get("role", "")
+            self.assets.acquire(
+                project_id, "character", name, meta={"role": role})
+            cast.append(name)
+            existing = self._existing_asset_uri(ctx, "character_art", name)
+            if existing:
+                reused += 1
+                continue
+            result = self._call(ctx, "image", {
+                "portrait": True, "art_name": name, "role": role,
+                "shot_no": 0, "characters": [name], "location": "",
+                "prompt": f"角色立绘:{name}({role}),{style},全身,正面",
+                "aspect": ctx["aspect"], **ctx["dims"],
+            }, "cast")
             self.assets.register(
-                project_id, "prompt",
-                f"e{ctx['episode']['number']:03d}_shot{shot['shot_no']:03d}",
-                meta={"prompt": shot["prompt"]})
+                project_id, "character_art", name, uri=result.uri,
+                meta={"role": role})
+            created += 1
+        for scene in ctx["script"]["scenes"]:
+            location = scene["location"]
+            self.assets.acquire(project_id, "scene", location)
+            existing = self._existing_asset_uri(ctx, "scene_art", location)
+            if existing:
+                reused += 1
+                continue
+            result = self._call(ctx, "image", {
+                "scene_art": True, "art_name": location,
+                "shot_no": 0, "characters": [], "location": location,
+                "action": scene.get("action", ""),
+                "prompt": f"场景概念图:{location},{style},空镜,氛围感",
+                "aspect": ctx["aspect"], **ctx["dims"],
+            }, "cast")
+            self.assets.register(
+                project_id, "scene_art", location, uri=result.uri)
+            created += 1
         ctx["cast"] = cast
-        return {"reused": reused, "created": created}
+        return {"reused": reused, "created": created,
+                "characters": len(cast),
+                "scenes": len(ctx["script"]["scenes"])}
+
+    def _scene_locations(self, ctx):
+        return {s["scene_no"]: s["location"]
+                for s in ctx["script"]["scenes"]}
+
+    def _shot_payload(self, ctx, shot):
+        locations = self._scene_locations(ctx)
+        return {
+            "shot_no": shot["shot_no"],
+            "prompt": shot["prompt"],
+            "characters": shot["characters"],
+            "location": locations.get(shot["scene_no"], ""),
+            "dialogue": shot.get("dialogue"),
+            "camera": shot.get("camera", ""),
+            "action": shot.get("description", ""),
+            "aspect": ctx["aspect"], **ctx["dims"],
+        }
 
     def _stage_images(self, ctx):
         ctx["images"] = []
@@ -285,12 +348,8 @@ class Director:
                     {"shot_no": shot["shot_no"], "uri": existing})
                 reused += 1
                 continue
-            result = self._call(ctx, "image", {
-                "shot_no": shot["shot_no"],
-                "prompt": shot["prompt"],
-                "characters": shot["characters"],
-                "aspect": ctx["aspect"], **ctx["dims"],
-            }, "images")
+            result = self._call(
+                ctx, "image", self._shot_payload(ctx, shot), "images")
             self._register_shot_asset(ctx, "image", shot["shot_no"],
                                       result.uri)
             ctx["images"].append(
@@ -311,10 +370,8 @@ class Director:
                 reused += 1
                 continue
             result = self._call(ctx, "frames", {
-                "shot_no": shot["shot_no"],
+                **self._shot_payload(ctx, shot),
                 "image_uri": images[shot["shot_no"]],
-                "prompt": shot["prompt"],
-                "aspect": ctx["aspect"], **ctx["dims"],
             }, "frames")
             self._register_shot_asset(
                 ctx, "first_frame", shot["shot_no"], result.data["first"])

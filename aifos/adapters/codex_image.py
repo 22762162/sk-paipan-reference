@@ -31,6 +31,20 @@ def build_instruction(capability, payload, out_dir):
     height = int(payload.get("height", 1920))
     size = f"{width}x{height},画幅 {payload.get('aspect', '9:16')}"
     if capability == "image":
+        safe = "".join(c if c.isalnum() else "_"
+                       for c in str(payload.get("art_name", "")))[:40]
+        if payload.get("portrait"):
+            target = out_dir / f"portrait_{safe}.png"
+            instruction = (
+                f"为角色生成立绘并保存到 {target}(PNG,{size})。"
+                f"{payload.get('prompt', '')}。只产出该文件。")
+            return instruction, [target], {"name": payload.get("art_name")}
+        if payload.get("scene_art"):
+            target = out_dir / f"scene_{safe}.png"
+            instruction = (
+                f"为场景生成概念图并保存到 {target}(PNG,{size})。"
+                f"{payload.get('prompt', '')}。只产出该文件。")
+            return instruction, [target], {"name": payload.get("art_name")}
         shot_no = int(payload["shot_no"])
         target = out_dir / f"shot_{shot_no:03d}.keyframe.png"
         instruction = (

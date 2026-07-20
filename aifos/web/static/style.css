@@ -132,6 +132,7 @@ td.num, th.num { text-align: right; }
 .chip.running { color: #ffd77a; } .chip.running::before { background: var(--warning); animation: pulse 1.2s infinite; }
 .chip.qc_failed { color: #ffb598; } .chip.qc_failed::before { background: var(--serious); }
 .chip.failed { color: #ff9d9d; } .chip.failed::before { background: var(--critical); }
+.chip.awaiting_confirm { color: #ffd77a; } .chip.awaiting_confirm::before { background: var(--warning); }
 @keyframes pulse { 50% { opacity: .3; } }
 
 /* 成本条:单色蓝阶(数量级编码) */
@@ -266,6 +267,101 @@ td.num, th.num { text-align: right; }
 @media (max-width: 860px) {
   #sidepanel { position: absolute; right: 0; top: 0; bottom: 0; z-index: 5; box-shadow: -8px 0 24px rgba(0,0,0,.5); }
 }
+
+/* 开工向导 */
+.mode-tabs { display: flex; gap: 8px; width: 100%; }
+.mode-tab {
+  flex: 1; padding: 10px 14px; font-size: 14px;
+  background: var(--surface-2); border: 1px solid var(--hairline);
+}
+.mode-tab.active { background: var(--accent-soft); border-color: var(--accent); color: #cfe4ff; }
+.produce-bar button.primary { font-size: 15px; padding: 10px 26px; }
+
+/* 制作进度条 */
+.progress-card {
+  background: var(--surface); border: 1px solid rgba(250, 178, 25, .4);
+  border-radius: var(--radius); padding: 14px 16px;
+}
+.progress-text { font-size: 14px; margin-bottom: 10px; }
+.progress-text span { color: var(--ink-2); margin-left: 10px; font-size: 13px; }
+.progress-track { height: 10px; background: var(--surface-2); border-radius: 5px; overflow: hidden; }
+.progress-fill {
+  height: 100%; background: var(--warning); border-radius: 5px;
+  transition: width .6s ease;
+}
+
+/* 确认横幅与人物/场景画廊 */
+.confirm-banner {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  background: rgba(250, 178, 25, .1);
+  border-bottom: 1px solid rgba(250, 178, 25, .4);
+  padding: 12px 18px; flex: none;
+}
+.confirm-banner b { display: block; margin-bottom: 2px; }
+.confirm-banner span { color: var(--ink-2); font-size: 13px; }
+.confirm-banner > div { flex: 1; min-width: 260px; }
+.confirm-banner button { font-size: 15px; padding: 11px 22px; white-space: nowrap; }
+.progress-card.confirm {
+  border-color: rgba(250, 178, 25, .5);
+  display: flex; align-items: center; gap: 14px;
+}
+.progress-card.confirm .progress-text { flex: 1; margin: 0; }
+.art-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.art-grid figure { margin: 0; }
+.art-grid img {
+  width: 100%; aspect-ratio: 9 / 16; object-fit: cover;
+  border-radius: 8px; border: 1px solid var(--hairline); display: block;
+}
+.art-grid figcaption {
+  font-size: 11px; color: var(--ink-2); text-align: center; margin-top: 3px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* 整集播放器 */
+.player-overlay {
+  position: fixed; inset: 0; z-index: 30;
+  background: rgba(0, 0, 0, .82);
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+}
+.player-box {
+  width: min(560px, 96vw); max-height: 96vh;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.player-head { display: flex; align-items: center; gap: 12px; color: var(--ink); font-size: 14px; }
+.player-head .player-pos { color: var(--ink-3); font-size: 12px; flex: 1; }
+.player-stage {
+  position: relative; width: 100%; aspect-ratio: 9 / 16;
+  max-height: 74vh; background: #000; border-radius: 14px;
+  overflow: hidden; border: 1px solid var(--hairline);
+  align-self: center;
+}
+.player-stage img, .player-stage video {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: contain; background: #000;
+}
+#pl-b { opacity: 0; }
+#pl-b.fade-in { opacity: 1; transition-property: opacity; transition-timing-function: linear; }
+.player-sub {
+  position: absolute; left: 6%; right: 6%; bottom: 5%;
+  background: rgba(0, 0, 0, .58); border-radius: 10px;
+  padding: 10px 14px; font-size: 15px; color: #fff; text-align: center;
+}
+.player-sub b { color: var(--accent); margin-right: 10px; }
+.player-big {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: 84px; height: 84px; border-radius: 50%; font-size: 30px;
+  background: rgba(57, 135, 229, .92); border: none; color: #fff;
+}
+.player-big:hover { background: var(--accent); }
+.player-bar { display: flex; align-items: center; gap: 12px; }
+.player-track {
+  flex: 1; height: 10px; background: var(--surface-2);
+  border-radius: 5px; cursor: pointer; overflow: hidden;
+}
+.player-fill { height: 100%; background: var(--accent); transition: width .3s; }
+.player-time { color: var(--ink-3); font-size: 12px; font-variant-numeric: tabular-nums; }
+.play-cta { width: 100%; margin-bottom: 12px; font-size: 14px; padding: 11px; }
 
 /* 页面内置提示 */
 .toast {

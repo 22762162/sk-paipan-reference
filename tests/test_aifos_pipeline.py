@@ -22,7 +22,7 @@ def test_full_pipeline_produces_episode(app):
     assert summary["qc_score"] == 100
     assert all(s["status"] == "done" for s in summary["stages"])
     assert [s["stage"] for s in summary["stages"]] == [
-        "script", "storyboard", "assets", "images", "frames", "videos",
+        "script", "cast", "storyboard", "images", "frames", "videos",
         "voices", "edit", "qc", "package", "archive"]
 
     # 产物落盘

@@ -71,23 +71,38 @@ def test_overview_empty(server):
 
 def test_produce_flow_and_episode_api(server):
     port = server["port"]
+    # Web 默认流程:预生产 → 待确认
     status, reply = _json_request(port, "POST", "/api/produce", {
         "sentence": "开始制作《万妖图录》第15集"})
     assert status == 202
     job = _wait_job(port, reply["job_id"])
     assert job["status"] == "done"
-    assert job["summary"]["status"] == "done"
+    assert job["summary"]["status"] == "awaiting_confirm"
 
     _, overview = _json_request(port, "GET", "/api/overview")
     assert overview["stats"]["episodes"] == 1
     episode_id = overview["episodes"][0]["id"]
+    assert overview["episodes"][0]["status"] == "awaiting_confirm"
+
+    status, pre = _json_request(port, "GET", f"/api/episode/{episode_id}")
+    assert status == 200
+    assert pre["script"]["scenes"]
+    assert pre["storyboard"]["shots"]
+    assert pre["artifacts"]["cast_art"], "确认页需要人物立绘"
+    assert pre["artifacts"]["scene_art"], "确认页需要场景概念图"
+    assert pre["artifacts"]["videos"] == {}, "确认前不应生产视频"
+
+    # 确认 → 自动完成剩余全部阶段
+    status, reply = _json_request(port, "POST", "/api/confirm", {
+        "episode_id": episode_id})
+    assert status == 202
+    job = _wait_job(port, reply["job_id"])
+    assert job["summary"]["status"] == "done"
 
     status, detail = _json_request(port, "GET", f"/api/episode/{episode_id}")
     assert status == 200
-    assert detail["script"]["scenes"]
-    assert detail["storyboard"]["shots"]
     assert detail["qc_report"]["passed"]
-    assert len(detail["tasks"]) == 11
+    assert len(detail["tasks"]) >= 11
 
     art = detail["artifacts"]
     shot_keys = list(art["images"].keys())

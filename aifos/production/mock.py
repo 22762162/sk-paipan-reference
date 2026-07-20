@@ -12,6 +12,11 @@ from html import escape
 from pathlib import Path
 
 from .base import Provider, ProviderResult
+from .cinematic import render_cover, render_portrait, render_shot
+
+
+def _safe_name(name):
+    return "".join(c if c.isalnum() else "_" for c in str(name))[:40]
 
 SURNAMES = ["林", "苏", "顾", "沈", "陆", "叶", "秦", "白"]
 GIVEN = ["昭", "砚", "青", "澈", "离", "澜", "霁", "衡"]
@@ -216,30 +221,61 @@ class MockProvider(Provider):
         uri = _json_artifact(out_dir / "storyboard.json", storyboard)
         return storyboard, uri
 
-    # ---- 镜头关键图 ----
-    def _gen_image(self, payload, out_dir):
-        seed = _digest(payload)
-        shot_no = payload["shot_no"]
+    # ---- 镜头关键图(电影感分镜画面) ----
+    def _shot_svg(self, payload, variant):
+        seed = int.from_bytes(_digest(payload)[:4], "big")
         width, height = _dims(payload)
-        uri = _svg(
-            out_dir / f"shot_{shot_no:03d}.keyframe.svg",
-            [f"Shot {shot_no:03d}", payload.get("prompt", "")[:36]],
-            seed, width=width, height=height,
+        return render_shot(
+            width, height, seed,
+            payload.get("location", "")
+            or self._location_from_prompt(payload.get("prompt", "")),
+            characters=payload.get("characters", []),
+            dialogue=payload.get("dialogue"),
+            shot_no=payload.get("shot_no", 0),
+            camera=payload.get("camera", ""),
+            action=payload.get("action", ""),
+            variant=variant,
         )
-        return {"shot_no": shot_no}, uri
 
-    # ---- 首尾帧 ----
-    def _gen_frames(self, payload, out_dir):
-        seed = _digest(payload)
-        shot_no = payload["shot_no"]
+    @staticmethod
+    def _location_from_prompt(prompt):
+        # 分镜 Prompt 形如「漫剧风格,<地点>,<内容>…」,取地点段
+        parts = (prompt or "").split(",")
+        return parts[1] if len(parts) > 1 else ""
+
+    def _gen_image(self, payload, out_dir):
+        seed = int.from_bytes(_digest(payload)[:4], "big")
         width, height = _dims(payload)
-        first = _svg(out_dir / f"shot_{shot_no:03d}.first.svg",
-                     [f"Shot {shot_no:03d} 首帧"], seed,
-                     width=width, height=height)
-        last = _svg(out_dir / f"shot_{shot_no:03d}.last.svg",
-                    [f"Shot {shot_no:03d} 尾帧"], seed[::-1],
-                    width=width, height=height)
-        return {"first": first, "last": last}, first
+        if payload.get("portrait"):
+            name = payload.get("art_name", "")
+            path = out_dir / f"portrait_{_safe_name(name)}.svg"
+            path.write_text(
+                render_portrait(width, height, seed, name,
+                                payload.get("role", "")),
+                encoding="utf-8")
+            return {"name": name}, str(path)
+        if payload.get("scene_art"):
+            name = payload.get("art_name", "")
+            path = out_dir / f"scene_{_safe_name(name)}.svg"
+            path.write_text(
+                render_shot(width, height, seed, name,
+                            action=payload.get("action", ""),
+                            variant="key"),
+                encoding="utf-8")
+            return {"name": name}, str(path)
+        shot_no = payload["shot_no"]
+        path = out_dir / f"shot_{shot_no:03d}.keyframe.svg"
+        path.write_text(self._shot_svg(payload, "key"), encoding="utf-8")
+        return {"shot_no": shot_no}, str(path)
+
+    # ---- 首尾帧(带轻微位移,连播产生动感) ----
+    def _gen_frames(self, payload, out_dir):
+        shot_no = payload["shot_no"]
+        first = out_dir / f"shot_{shot_no:03d}.first.svg"
+        last = out_dir / f"shot_{shot_no:03d}.last.svg"
+        first.write_text(self._shot_svg(payload, "first"), encoding="utf-8")
+        last.write_text(self._shot_svg(payload, "last"), encoding="utf-8")
+        return {"first": str(first), "last": str(last)}, str(first)
 
     # ---- 视频 ----
     def _gen_video(self, payload, out_dir):
@@ -307,13 +343,13 @@ class MockProvider(Provider):
 
     # ---- 封面 ----
     def _gen_cover(self, payload, out_dir):
-        seed = _digest(payload)
+        seed = int.from_bytes(_digest(payload)[:4], "big")
         width, height = _dims(payload, 1080, 1920)
-        uri = _svg(
-            out_dir / "cover.svg",
-            [f"《{payload.get('title', '')}》",
-             f"第{payload.get('episode', 0)}集",
-             payload.get("tagline", "")[:32]],
-            seed, width=width, height=height,
-        )
-        return {}, uri
+        path = out_dir / "cover.svg"
+        path.write_text(
+            render_cover(width, height, seed,
+                         payload.get("title", ""),
+                         payload.get("episode", 0),
+                         payload.get("tagline", "")),
+            encoding="utf-8")
+        return {}, str(path)

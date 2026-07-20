@@ -49,6 +49,9 @@ def _build_parser():
     p_produce.add_argument("--script-file",
                            help="自带剧本文件(纯文本或 JSON);提供时跳过 AI "
                                 "编剧,人物/分镜自动从剧本推导")
+    p_produce.add_argument("--review", action="store_true",
+                           help="预生产(剧本/人物/场景/分镜)完成后暂停,"
+                                "确认后用 confirm 命令继续视频生产")
     p_produce.add_argument("--force", action="store_true",
                            help="强制全部重新生成(默认增量:已有产物直接复用)")
     p_produce.add_argument("--verbose", action="store_true",
@@ -85,6 +88,11 @@ def _build_parser():
     p_publish = sub.add_parser("publish", help="查看某集发布包(成片/封面/标题/话题)")
     p_publish.add_argument("--project", required=True)
     p_publish.add_argument("--episode", type=int, required=True)
+
+    p_confirm = sub.add_parser(
+        "confirm", help="确认预生产,继续自动完成视频/配音/剪辑/质检")
+    p_confirm.add_argument("--project", required=True)
+    p_confirm.add_argument("--episode", type=int, required=True)
 
     p_asset = sub.add_parser("asset", help="IP 资产中心")
     p_asset.add_argument("action", choices=["list", "stats"])
@@ -136,7 +144,8 @@ def _cmd_produce(app, args):
               f"{len(script['characters'])} 个角色")
     summary = app.director.produce(
         title, number, premise=args.premise, style=args.style,
-        force=args.force, script=script)
+        force=args.force, script=script,
+        pause_for_confirm=args.review)
     print(f"\n=== 《{title}》第{number}集 制作{_status_cn(summary['status'])} ===")
     print(f"质检得分: {summary['qc_score']}   "
           f"成本: {summary['cost']}/{summary['budget']}")
@@ -156,12 +165,30 @@ def _cmd_produce(app, args):
     for candidate in outputs["titles"]:
         print(f"候选标题: {candidate}")
     print(f"产物目录: {summary['artifacts_dir']}")
+    if summary["status"] == "awaiting_confirm":
+        print("\n预生产完成(剧本/人物图/场景图/分镜/首尾帧)。检查满意后运行:")
+        print(f"  python3 -m aifos confirm --project {title} --episode {number}")
+        print("即可自动完成 视频 → 配音 → 剪辑 → 质检 → 发布包。")
+        return 0
     return 0 if summary["status"] == "done" else 1
 
 
 def _status_cn(status):
-    return {"done": "完成", "failed": "失败", "qc_failed": "完成(质检未过)"}.get(
-        status, status)
+    return {"done": "完成", "failed": "失败", "qc_failed": "完成(质检未过)",
+            "awaiting_confirm": "待确认"}.get(status, status)
+
+
+def _cmd_confirm(app, args):
+    project = app.projects.get_project(args.project)
+    if project is None:
+        print(f"项目不存在: {args.project}", file=sys.stderr)
+        return 2
+    app.system.require(args.user, "produce")
+    print(f"已确认,继续生产《{args.project}》第{args.episode}集 …")
+    summary = app.director.produce(args.project, args.episode)
+    print(f"制作{_status_cn(summary['status'])},"
+          f"质检 {summary['qc_score']},成本 {summary['cost']}")
+    return 0 if summary["status"] == "done" else 1
 
 
 def _cmd_batch(app, args):
@@ -392,6 +419,8 @@ def main(argv=None):
             return _cmd_project(app, args)
         if args.command == "publish":
             return _cmd_publish(app, args)
+        if args.command == "confirm":
+            return _cmd_confirm(app, args)
         if args.command == "asset":
             return _cmd_asset(app, args)
         if args.command == "qc":

@@ -48,12 +48,14 @@ function armConfirm(btn, label, action) {
 
 const STATUS_CN = {
   done: "完成", failed: "失败", qc_failed: "质检未过", created: "已建",
-  script: "剧本中", storyboard: "分镜中", assets: "调资产", images: "出图中",
+  awaiting_confirm: "待确认", script: "剧本中", cast: "画人物场景",
+  storyboard: "分镜中", images: "出图中",
   frames: "首尾帧", videos: "视频中", voices: "配音中", edit: "剪辑中",
   qc: "质检中", package: "包装中", archive: "沉淀中", running: "制作中",
 };
 function chip(status) {
-  const cls = ["done", "failed", "qc_failed"].includes(status) ? status : "running";
+  const cls = ["done", "failed", "qc_failed", "awaiting_confirm"].includes(status)
+    ? status : "running";
   return `<span class="chip ${cls}">${esc(STATUS_CN[status] || status)}</span>`;
 }
 
@@ -84,15 +86,21 @@ async function renderDashboard() {
   app.innerHTML = `
   <div class="dash">
     <form class="produce-bar" id="produce-form">
-      <input name="sentence" placeholder='一句话开工:开始制作《万妖图录》第15集' required>
-      <input name="premise" placeholder="本集前提/梗概(可选)">
+      <div class="mode-tabs">
+        <button type="button" class="mode-tab active" data-mode="ai">✨ AI 自动编剧</button>
+        <button type="button" class="mode-tab" data-mode="script">📄 我有剧本</button>
+      </div>
+      <input name="sentence" placeholder='写下作品名和集数,例如:开始制作《万妖图录》第16集' required>
+      <input name="premise" placeholder="想要的剧情方向(可不填)">
       <button class="primary" type="submit">开始制作</button>
-      <textarea name="script" rows="3" placeholder="可选:粘贴你的剧本 —— 留空则 AI 自动编剧;提供剧本时,人物/场次/分镜自动从剧本推导。格式示例:
+      <textarea name="script" rows="5" hidden placeholder="把你的剧本粘贴到这里,人物、场次、分镜会自动识别。写法示例:
 第1场 古镇长街
+夜色渐深,妖气翻涌。
 林昭:这股妖气不对劲。
 小狐:小心,它就在附近!"></textarea>
-      <div class="produce-hint">平台将自动完成:剧本 → 分镜 → 资产 → 图片 → 首尾帧 → 视频 → 配音 → 剪辑 → 质检 → 封面/标题/拆条 → 数据沉淀</div>
+      <div class="produce-hint">全自动完成:剧本 → 分镜 → 画面 → 配音 → 成片。做完后点下方剧集,再点「▶ 播放本集」观看。</div>
     </form>
+    <div id="progress-banner"></div>
 
     <div class="tiles">
       <div class="tile"><div class="label">剧集总数</div><div class="value">${s.episodes}</div></div>
@@ -165,7 +173,16 @@ async function renderDashboard() {
     </div>
   </div>`;
 
-  document.getElementById("produce-form").addEventListener("submit", onProduce);
+  const form = document.getElementById("produce-form");
+  form.addEventListener("submit", onProduce);
+  form.querySelectorAll(".mode-tab").forEach((tab) =>
+    tab.addEventListener("click", () => {
+      form.querySelectorAll(".mode-tab").forEach((t) =>
+        t.classList.toggle("active", t === tab));
+      form.script.hidden = tab.dataset.mode !== "script";
+      if (tab.dataset.mode === "script") form.script.focus();
+    }));
+  renderProgressBanner(data);
   app.querySelectorAll("tr.clickable").forEach((tr) =>
     tr.addEventListener("click", () => { location.hash = `#/episode/${tr.dataset.ep}`; }));
 
@@ -195,7 +212,7 @@ async function onProduce(ev) {
       body: JSON.stringify({
         sentence: form.sentence.value,
         premise: form.premise.value,
-        script_text: form.script.value,
+        script_text: form.script.hidden ? "" : form.script.value,
       }),
     });
     showToast("制作任务已提交,进度会自动刷新", "ok");
@@ -204,6 +221,162 @@ async function onProduce(ev) {
     showToast(e.message, "error");
     btn.disabled = false; btn.textContent = "开始制作";
   }
+}
+
+/* ================= 整集播放器(动态分镜连播) ================= */
+function openPlayer(data) {
+  const art = data.artifacts;
+  const lineNoIndex = buildLineIndex(data.script);
+  const shots = data.storyboard.shots.map((s) => {
+    const video = art.videos[s.shot_no] || "";
+    const lineNo = s.dialogue ? lineNoIndex(s) : null;
+    return {
+      shot: s,
+      mp4: /\.mp4($|\?)/.test((video || "").split("#")[0]) ? video : null,
+      first: art.first[s.shot_no] || art.images[s.shot_no] || "",
+      last: art.last[s.shot_no] || art.images[s.shot_no] || "",
+      audio: lineNo != null &&
+        /\.(wav|mp3|m4a|aiff)($|\?)/.test((art.voices[lineNo] || ""))
+        ? art.voices[lineNo] : null,
+    };
+  }).filter((x) => x.first || x.mp4);
+  if (!shots.length) return;
+  const total = shots.reduce((a, x) => a + x.shot.duration, 0);
+
+  const overlay = document.createElement("div");
+  overlay.className = "player-overlay";
+  overlay.innerHTML = `
+    <div class="player-box">
+      <div class="player-head">
+        <span>《${esc(data.project.title)}》第${data.episode.number}集</span>
+        <span class="player-pos" id="pl-pos"></span>
+        <button class="close" id="pl-close">关闭 Esc</button>
+      </div>
+      <div class="player-stage" id="pl-stage">
+        <img id="pl-a" alt=""><img id="pl-b" alt="">
+        <video id="pl-video" playsinline hidden></video>
+        <div class="player-sub" id="pl-sub" hidden></div>
+        <button class="player-big" id="pl-big">▶</button>
+      </div>
+      <div class="player-bar">
+        <button id="pl-toggle">▶ 播放</button>
+        <div class="player-track" id="pl-track"><div class="player-fill" id="pl-fill"></div></div>
+        <span class="player-time" id="pl-time"></span>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const elA = overlay.querySelector("#pl-a");
+  const elB = overlay.querySelector("#pl-b");
+  const elVideo = overlay.querySelector("#pl-video");
+  const elSub = overlay.querySelector("#pl-sub");
+  const elFill = overlay.querySelector("#pl-fill");
+  const elPos = overlay.querySelector("#pl-pos");
+  const elTime = overlay.querySelector("#pl-time");
+  const btnToggle = overlay.querySelector("#pl-toggle");
+  const btnBig = overlay.querySelector("#pl-big");
+
+  let index = -1, playing = false, timer = null, elapsedBefore = 0;
+  let currentAudio = null;
+
+  function fmtTime(sec) {
+    return `${Math.floor(sec / 60)}:${String(Math.round(sec % 60)).padStart(2, "0")}`;
+  }
+  function stopMedia() {
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+    elVideo.pause();
+  }
+  function showShot(i, autoplay) {
+    index = i;
+    const item = shots[i];
+    elapsedBefore = shots.slice(0, i).reduce((a, x) => a + x.shot.duration, 0);
+    elPos.textContent = `镜头 ${i + 1}/${shots.length} · 场${item.shot.scene_no}`;
+    elTime.textContent = `${fmtTime(elapsedBefore)} / ${fmtTime(total)}`;
+    elFill.style.width = `${(elapsedBefore / total) * 100}%`;
+    if (item.shot.dialogue) {
+      elSub.innerHTML = `<b>${esc(item.shot.dialogue.character)}</b>${esc(item.shot.dialogue.dialogue)}`;
+      elSub.hidden = false;
+    } else { elSub.hidden = true; }
+    if (item.mp4) {
+      elA.hidden = elB.hidden = true;
+      elVideo.hidden = false;
+      elVideo.src = item.mp4;
+      elVideo.muted = !item.audio ? false : true;
+      if (autoplay) elVideo.play().catch(() => {});
+      elVideo.onended = () => { if (playing) next(); };
+    } else {
+      elVideo.hidden = true;
+      elA.hidden = elB.hidden = false;
+      elA.src = item.first;
+      elB.src = item.last;
+      elB.classList.remove("fade-in");
+      void elB.offsetWidth;  // 重置过渡
+      if (autoplay) {
+        elB.style.transitionDuration = `${item.shot.duration}s`;
+        elB.classList.add("fade-in");
+        timer = setTimeout(next, item.shot.duration * 1000);
+      }
+    }
+    if (autoplay && item.audio) {
+      currentAudio = new Audio(item.audio);
+      currentAudio.play().catch(() => {});
+    }
+  }
+  function next() {
+    stopMedia();
+    if (index + 1 >= shots.length) { setPlaying(false); showShot(0, false); return; }
+    showShot(index + 1, true);
+  }
+  function setPlaying(value) {
+    playing = value;
+    btnToggle.textContent = playing ? "⏸ 暂停" : "▶ 播放";
+    btnBig.hidden = playing;
+    if (!playing) stopMedia();
+  }
+  function start() {
+    setPlaying(true);
+    showShot(index < 0 ? 0 : index, true);
+  }
+  btnToggle.onclick = () => (playing ? setPlaying(false) : start());
+  btnBig.onclick = start;
+  overlay.querySelector("#pl-track").onclick = (ev) => {
+    const rect = ev.currentTarget.getBoundingClientRect();
+    const target = ((ev.clientX - rect.left) / rect.width) * total;
+    let acc = 0;
+    for (let i = 0; i < shots.length; i += 1) {
+      acc += shots[i].shot.duration;
+      if (target < acc) { stopMedia(); showShot(i, playing); return; }
+    }
+  };
+  const close = () => {
+    stopMedia();
+    overlay.remove();
+    document.removeEventListener("keydown", onKey);
+  };
+  const onKey = (ev) => {
+    if (ev.key === "Escape") close();
+    if (ev.key === " ") { ev.preventDefault(); btnToggle.click(); }
+  };
+  document.addEventListener("keydown", onKey);
+  overlay.querySelector("#pl-close").onclick = close;
+  overlay.addEventListener("click", (ev) => { if (ev.target === overlay) close(); });
+  showShot(0, false);
+}
+
+function buildLineIndex(script) {
+  return (shot) => {
+    let n = 0;
+    for (const scene of script.scenes) {
+      for (const line of scene.lines) {
+        n += 1;
+        if (scene.scene_no === shot.scene_no &&
+            line.character === shot.dialogue.character &&
+            line.dialogue === shot.dialogue.dialogue) return n;
+      }
+    }
+    return null;
+  };
 }
 
 /* 剧本阅读视图(覆盖层) */
@@ -249,10 +422,47 @@ function mediaTag(url) {
 }
 
 const STAGE_CN = {
-  script: "剧本", storyboard: "分镜", assets: "资产调用", images: "图片",
+  script: "剧本", cast: "人物/场景图", storyboard: "分镜", images: "镜头画面",
   frames: "首尾帧", videos: "视频", voices: "配音", edit: "剪映剪辑",
   qc: "AI质检", package: "封面/标题", archive: "数据沉淀",
+  assets: "资产调用",
 };
+const STAGE_ORDER = ["script", "cast", "storyboard", "images", "frames",
+  "videos", "voices", "edit", "qc", "package", "archive"];
+const STAGE_PLAIN = {
+  script: "正在写剧本", cast: "正在画人物和场景", storyboard: "正在画分镜",
+  images: "正在生成镜头画面", frames: "正在生成首尾帧", videos: "正在生成视频",
+  voices: "正在配音", edit: "正在剪辑成片", qc: "正在质量检查",
+  package: "正在做封面和标题", archive: "正在归档素材",
+};
+
+/* 制作中的醒目进度条 */
+function renderProgressBanner(data) {
+  const el = document.getElementById("progress-banner");
+  if (!el) return;
+  const awaiting = data.episodes.filter(
+    (e) => e.status === "awaiting_confirm");
+  const producing = data.episodes.filter(
+    (e) => !["done", "failed", "qc_failed", "created",
+             "awaiting_confirm"].includes(e.status));
+  if (!producing.length && !awaiting.length) { el.innerHTML = ""; return; }
+  el.innerHTML = awaiting.map((e) => `
+    <div class="progress-card confirm">
+      <div class="progress-text">《${esc(e.project)}》第${e.number}集 预生产完成,等你过目
+        <span>剧本、人物、场景、分镜已就绪</span></div>
+      <button class="primary" onclick="location.hash='#/episode/${e.id}'">去确认 →</button>
+    </div>`).join("") + producing.map((e) => {
+    const idx = STAGE_ORDER.indexOf(e.status);
+    const step = idx >= 0 ? idx + 1 : 1;
+    const pct = Math.round(step / STAGE_ORDER.length * 100);
+    return `
+    <div class="progress-card">
+      <div class="progress-text">正在制作《${esc(e.project)}》第${e.number}集
+        <span>第 ${step} 步 / 共 ${STAGE_ORDER.length} 步 · ${esc(STAGE_PLAIN[e.status] || e.status)}…</span></div>
+      <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
+    </div>`;
+  }).join("");
+}
 const KIND_CN = {
   character: "角色", scene: "场景", action: "动作", shot: "镜头",
   prompt: "Prompt", first_frame: "首帧", last_frame: "尾帧", image: "图片",
@@ -285,18 +495,29 @@ async function renderCanvasView(episodeId) {
     if (i.line_no != null) (lineIssues[i.line_no] = lineIssues[i.line_no] || []).push(i);
   });
 
+  const awaiting = ep.status === "awaiting_confirm";
   app.innerHTML = `
   <div class="canvas-view">
+    ${awaiting ? `
+    <div class="confirm-banner">
+      <div>
+        <b>预生产完成,请过目 👀</b>
+        <span>剧本、人物、场景、分镜都已生成(见画布与右侧面板)。满意就点确认,
+        视频 → 配音 → 剪辑 → 质检会全自动完成;不满意可改剧本后重新制作。</span>
+      </div>
+      <button class="primary" id="btn-confirm">✅ 确认,开始生产</button>
+    </div>` : ""}
     <div class="canvas-toolbar">
       <button id="btn-back">← 仪表盘</button>
       <span class="title">《${esc(ep.project_title || data.project.title)}》第${ep.number}集</span>
       ${chip(ep.status)}
       <span class="hint">质检 ${ep.qc_score == null ? "-" : fmt(ep.qc_score, 0)} 分 · 成本 ${fmt(ep.cost)}</span>
       <span class="spacer"></span>
-      <span class="hint">滚轮缩放 · 拖拽空白平移 · 拖动卡片摆放 · 点击查看详情</span>
+      <span class="hint">滚轮缩放 · 拖动查看 · 点镜头看详情</span>
+      <button id="btn-play" class="primary">▶ 播放本集</button>
       <button id="btn-script">剧本</button>
-      <button id="btn-reproduce" title="增量:已有产物复用,只补齐缺失">增量重制</button>
-      <button id="btn-reproduce-force" title="全部重新生成(消耗额度)">强制重制</button>
+      <button id="btn-reproduce" title="复用已完成的部分,只补做缺失内容">继续补齐</button>
+      <button id="btn-reproduce-force" title="从头全部重新制作(真实产线会消耗额度)">全部重做</button>
       <div class="zoom-group">
         <button id="zoom-out">−</button>
         <span class="zoom-pct" id="zoom-pct">100%</span>
@@ -327,12 +548,32 @@ async function renderCanvasView(episodeId) {
     } catch (e) { showToast(e.message, "error"); }
   };
   document.getElementById("btn-reproduce").onclick = (ev) =>
-    armConfirm(ev.target, "增量重制", () => reproduce(false));
+    armConfirm(ev.target, "补齐", () => reproduce(false));
   document.getElementById("btn-reproduce-force").onclick = (ev) =>
-    armConfirm(ev.target, "(消耗额度)", () => reproduce(true));
+    armConfirm(ev.target, "重做", () => reproduce(true));
   document.getElementById("btn-script").onclick = () => showScriptOverlay(script);
-  // 制作进行中自动刷新画布
-  if (!["done", "failed", "qc_failed", "created"].includes(ep.status))
+  document.getElementById("btn-play").onclick = () => openPlayer(data);
+  const btnConfirm = document.getElementById("btn-confirm");
+  if (btnConfirm) btnConfirm.onclick = async () => {
+    btnConfirm.disabled = true;
+    btnConfirm.textContent = "已确认,生产中…";
+    try {
+      await api("/api/confirm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ episode_id: ep.id }),
+      });
+      showToast("已确认!正在自动生产视频、配音与成片,完成后即可播放", "ok");
+      pollTimer = setInterval(() => renderCanvasView(episodeId), 3000);
+    } catch (e) {
+      showToast(e.message, "error");
+      btnConfirm.disabled = false;
+      btnConfirm.textContent = "✅ 确认,开始生产";
+    }
+  };
+  // 制作进行中自动刷新画布(待确认是稳定状态,不轮询)
+  if (!["done", "failed", "qc_failed", "created",
+        "awaiting_confirm"].includes(ep.status))
     pollTimer = setInterval(() => renderCanvasView(episodeId), 3000);
 
   const canvas = new StoryboardCanvas(data, shotIssues, lineIssues);
@@ -461,6 +702,17 @@ class StoryboardCanvas {
       const qc = this.data.qc_report;
       panel.innerHTML = `
         <h3>本集总览</h3>
+        <button class="primary play-cta" id="panel-play">▶ 播放本集(${fmt(this.data.storyboard.shots.reduce((a, s) => a + s.duration, 0), 0)}秒)</button>
+        ${(art.cast_art || []).length ? `<h4>人物</h4>
+        <div class="art-grid">${art.cast_art.map((c) => `
+          <figure><img src="${esc(c.url)}" alt="${esc(c.name)}">
+          <figcaption>${esc(c.name)}${c.role ? " · " + esc(c.role) : ""}</figcaption></figure>`).join("")}
+        </div>` : ""}
+        ${(art.scene_art || []).length ? `<h4>场景</h4>
+        <div class="art-grid">${art.scene_art.map((s) => `
+          <figure><img src="${esc(s.url)}" alt="${esc(s.name)}">
+          <figcaption>${esc(s.name)}</figcaption></figure>`).join("")}
+        </div>` : ""}
         ${art.cover ? `<img class="preview" src="${esc(art.cover)}" alt="封面">` : ""}
         ${art.titles.length ? `<h4>候选标题</h4><ul class="titles-list">
           ${art.titles.map((t) => `<li>${esc(t)}</li>`).join("")}</ul>` : ""}
@@ -482,6 +734,8 @@ class StoryboardCanvas {
           ${art.final ? `<li><span>成片</span><a href="${esc(art.final)}" target="_blank">打开</a></li>` : ""}
           ${art.clips.map((c) => `<li><span>拆条 · 场${c.scene_no}</span><a href="${esc(c.url)}" target="_blank">打开</a></li>`).join("")}
         </ul>`;
+      const playBtn = panel.querySelector("#panel-play");
+      if (playBtn) playBtn.onclick = () => openPlayer(this.data);
       return;
     }
     const shot = this.data.storyboard.shots.find((s) => s.shot_no === shotNo);
