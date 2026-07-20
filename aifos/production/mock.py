@@ -8,6 +8,7 @@
 
 import hashlib
 import json
+import re
 from html import escape
 from pathlib import Path
 
@@ -28,6 +29,102 @@ CAMERAS = ["远景推近", "特写", "过肩镜头", "俯拍全景", "手持跟�
 # AI 虚拟偶像模板素材池
 IDOL_TOPICS = ["新歌翻唱", "今日穿搭", "粉丝问答", "日常vlog", "舞蹈挑战"]
 IDOL_SPOTS = ["直播间", "天台夕阳", "便利店门口", "录音棚", "地铁站台"]
+IDOL_MEMBERS = ["林小鹿", "夏栀", "程果", "阿柒", "白桃", "乐乐"]
+GROUP_TOPICS = ["首秀舞台", "新歌打歌", "团综日常", "练习室初舞台"]
+
+# 题材关键词 → 模板;开工时未明确类型则按 标题+前提+风格 自动识别
+GENRE_KEYWORDS = {
+    "idol": ("女团", "男团", "偶像", "爱豆", "打歌", "出道", "组合",
+             "主播", "虚拟人"),
+    "urban": ("都市", "职场", "公司", "白领", "创业", "办公室"),
+    "campus": ("校园", "同学", "高中", "大学", "社团", "毕业"),
+    "xianxia": ("仙侠", "修仙", "妖", "灵", "剑", "封印", "宗门"),
+}
+
+# 剧情短剧题材素材(三幕:发现 → 对峙 → 解决)
+DRAMA_FLAVORS = {
+    "xianxia": {
+        "locations": LOCATIONS,
+        "partners": PARTNERS,
+        "villains": VILLAINS,
+        "beats": [
+            ("{hero}察觉{loc}妖气异动,循迹而至。", [
+                ("{hero}", "这股妖气……和《{title}》里记载的一模一样。"),
+                ("{partner}", "{hero},小心!它就藏在附近。")]),
+            ("{villain}现身{loc},双方对峙。", [
+                ("{villain}", "区区凡人,也敢窥探《{title}》的秘密?"),
+                ("{hero}", "第{number}页的封印,今天必须取回!"),
+                ("{partner}", "我来引开它,你去取封印!")]),
+            ("{hero}在{loc}完成封印,收获新一页图录。", [
+                ("{hero}", "《{title}》第{number}页,收录完成。"),
+                ("{partner}", "下一站,我们去哪儿?")]),
+        ],
+        "logline": "{hero}与{partner}在{loc}追查《{title}》的线索,直面{villain}。",
+    },
+    "urban": {
+        "locations": ["写字楼大厅", "深夜办公室", "咖啡店", "天台",
+                      "会议室", "地铁站"],
+        "partners": ["同事阿凯", "实习生小雨", "闺蜜安安", "老同学大树"],
+        "villains": ["竞对周总", "甲方王总", "空降李总监"],
+        "beats": [
+            ("{hero}在{loc}发现项目出了大问题。", [
+                ("{hero}", "这份数据不对劲,方案要出事。"),
+                ("{partner}", "{hero},现在改还来得及吗?")]),
+            ("{villain}在{loc}施压,气氛剑拔弩张。", [
+                ("{villain}", "明早交不出方案,这单就归我了。"),
+                ("{hero}", "第{number}版方案,今晚一定拿下!"),
+                ("{partner}", "我陪你通宵,资料我来整!")]),
+            ("{hero}在{loc}漂亮翻盘,赢得掌声。", [
+                ("{hero}", "《{title}》第{number}关,通关!"),
+                ("{partner}", "走,庆功奶茶我请!")]),
+        ],
+        "logline": "{hero}和{partner}在{loc}迎战{villain},一夜逆风翻盘。",
+    },
+    "campus": {
+        "locations": ["教室", "操场", "天台", "社团活动室", "图书馆", "小卖部"],
+        "partners": ["同桌小七", "学委安然", "篮球队阿豪"],
+        "villains": ["隔壁班学霸", "毒舌评委", "神秘转学生"],
+        "beats": [
+            ("{hero}在{loc}接下了一个大挑战。", [
+                ("{hero}", "这次比赛,我想试试。"),
+                ("{partner}", "{hero},我们都陪你练!")]),
+            ("{villain}在{loc}放话,火药味十足。", [
+                ("{villain}", "就凭你们,也想赢?"),
+                ("{hero}", "第{number}轮,见真章!"),
+                ("{partner}", "别怕,我们练的比谁都多!")]),
+            ("{hero}在{loc}稳稳拿下,全场欢呼。", [
+                ("{hero}", "《{title}》第{number}战,赢了!"),
+                ("{partner}", "说好的,一起去吃火锅!")]),
+        ],
+        "logline": "{hero}带着{partner}在{loc}迎战{villain},青春全力一搏。",
+    },
+}
+
+
+def _detect_genre(payload):
+    """开工未明确类型时,按 标题+前提+风格 关键词识别题材。"""
+    if payload.get("template") == "idol":
+        return "idol"
+    text = " ".join(str(payload.get(k) or "")
+                    for k in ("project_title", "premise", "style"))
+    for genre, keywords in GENRE_KEYWORDS.items():
+        if any(k in text for k in keywords):
+            return genre
+    return "xianxia"
+
+
+def _persona_from_title(title):
+    """「苏念的一天」→「苏念」:标题带『X的…』时取 X 作人设名。"""
+    match = re.match(r"^(.{1,4}?)的.+", title or "")
+    return match.group(1) if match else (title or "小艾")
+
+
+def _strip_genre_words(text):
+    out = text or ""
+    for words in GENRE_KEYWORDS.values():
+        for w in words:
+            out = out.replace(w, "")
+    return out.strip(" ,,、的")
 
 
 def _dims(payload, default_w=1080, default_h=1920):
@@ -77,50 +174,50 @@ class MockProvider(Provider):
         return ProviderResult(
             provider=self.name, cost=self.cost_per_call, data=data, uri=uri)
 
-    # ---- 剧本(drama 漫剧 / idol AI虚拟偶像) ----
+    # ---- 剧本:按题材分流(偶像/都市/校园/仙侠) ----
     def _gen_script(self, payload, out_dir):
-        if payload.get("template") == "idol":
+        genre = _detect_genre(payload)
+        if genre == "idol":
             return self._gen_idol_script(payload, out_dir)
+        return self._gen_drama_script(payload, out_dir, genre)
+
+    def _gen_drama_script(self, payload, out_dir, genre):
+        flavor = DRAMA_FLAVORS[genre]
         seed = _digest(payload)
         title = payload.get("project_title", "未命名")
         number = payload.get("episode_number", 1)
         premise = payload.get("premise", "")
-        hero = _pick(SURNAMES, seed, 0) + _pick(GIVEN, seed, 1)
-        partner = _pick(PARTNERS, seed, 2)
-        villain = _pick(VILLAINS, seed, 3)
-        locations = [_pick(LOCATIONS, seed, 4 + i) for i in range(3)]
-        logline = (
-            f"{hero}与{partner}在{locations[0]}追查《{title}》的线索,"
-            f"直面{villain}。" + (f"背景:{premise}" if premise else "")
-        )
+        hero = (_persona_from_title(title)
+                if _persona_from_title(title) != title
+                else _pick(SURNAMES, seed, 0) + _pick(GIVEN, seed, 1))
+        partner = _pick(flavor["partners"], seed, 2)
+        villain = _pick(flavor["villains"], seed, 3)
+        locations = [_pick(flavor["locations"], seed, 4 + i)
+                     for i in range(3)]
+        fmt = dict(hero=hero, partner=partner, villain=villain,
+                   title=title, number=number)
+        logline = (flavor["logline"].format(loc=locations[0], **fmt)
+                   + (f"背景:{premise}" if premise else ""))
         scenes = []
-        beats = [
-            (f"{hero}察觉{locations[0]}妖气异动,循迹而至。",
-             [(hero, f"这股妖气……和《{title}》里记载的一模一样。"),
-              (partner, f"{hero},小心!它就藏在附近。")]),
-            (f"{villain}现身{locations[1]},双方对峙。",
-             [(villain, f"区区凡人,也敢窥探《{title}》的秘密?"),
-              (hero, f"第{number}页的封印,今天必须取回!"),
-              (partner, "我来引开它,你去取封印!")]),
-            (f"{hero}在{locations[2]}完成封印,收获新一页图录。",
-             [(hero, f"《{title}》第{number}页,收录完成。"),
-              (partner, "下一站,我们去哪儿?")]),
-        ]
-        for idx, (action, lines) in enumerate(beats, start=1):
+        for idx, (action_tpl, line_tpls) in enumerate(
+                flavor["beats"], start=1):
+            lines = [
+                {"character": who.format(**fmt),
+                 "dialogue": text.format(**fmt)}
+                for who, text in line_tpls
+            ]
             scenes.append({
                 "scene_no": idx,
                 "location": locations[idx - 1],
-                "characters": sorted({name for name, _ in lines}),
-                "action": action,
-                "lines": [
-                    {"character": name, "dialogue": text}
-                    for name, text in lines
-                ],
+                "characters": sorted({ln["character"] for ln in lines}),
+                "action": action_tpl.format(loc=locations[idx - 1], **fmt),
+                "lines": lines,
             })
         script = {
             "project_title": title,
             "episode_number": number,
-            "episode_title": f"{villain}之章",
+            "episode_title": f"{villain}之章" if genre == "xianxia"
+            else f"对决{villain}",
             "logline": logline,
             "characters": [
                 {"name": hero, "role": "主角"},
@@ -133,12 +230,21 @@ class MockProvider(Provider):
         return script, uri
 
     def _gen_idol_script(self, payload, out_dir):
-        """虚拟偶像口播短视频:开场钩子 → 主体内容 → 引导关注。"""
+        """虚拟偶像:单人口播或女团/男团多成员,开场钩子 → 内容 → 引导关注。"""
         seed = _digest(payload)
-        idol = payload.get("persona") or payload.get("project_title", "小艾")
+        text = " ".join(str(payload.get(k) or "")
+                        for k in ("project_title", "premise", "style"))
+        group = any(k in text for k in ("女团", "男团", "组合", "团"))
+        raw = payload.get("persona") or payload.get("project_title", "小艾")
+        idol = _persona_from_title(raw)
         number = payload.get("episode_number", 1)
         premise = payload.get("premise", "")
-        topic = premise or _pick(IDOL_TOPICS, seed, 0)
+        topic = (_strip_genre_words(premise)
+                 or (_pick(GROUP_TOPICS, seed, 0) if group
+                     else _pick(IDOL_TOPICS, seed, 0)))
+        if group:
+            return self._gen_idol_group_script(
+                payload, out_dir, idol, number, topic, seed)
         spot = _pick(IDOL_SPOTS, seed, 1)
         scenes = [
             {"scene_no": 1, "location": "直播间",
@@ -171,6 +277,57 @@ class MockProvider(Provider):
             "episode_title": f"{topic}篇",
             "logline": f"{idol}的第{number}期:{topic}。",
             "characters": [{"name": idol, "role": "主角"}],
+            "scenes": scenes,
+        }
+        uri = _json_artifact(out_dir / "script.json", script)
+        return script, uri
+
+    def _gen_idol_group_script(self, payload, out_dir, lead, number,
+                               topic, seed):
+        """女团/男团:队长带队,练习室 → 舞台 → 后台三幕。"""
+        pool = [m for m in IDOL_MEMBERS if m != lead]
+        m2 = _pick(pool, seed, 1)
+        m3 = _pick([m for m in pool if m != m2], seed, 2)
+        members = [lead, m2, m3]
+        roles = ["队长", "主唱", "舞担"]
+        m1 = lead
+        scenes = [
+            {"scene_no": 1, "location": "练习室",
+             "characters": members,
+             "action": f"清晨的练习室,{m1}带队热身,镜面墙映出三人身影",
+             "lines": [
+                 {"character": m1,
+                  "dialogue": f"今天{topic},大家状态怎么样?"},
+                 {"character": m2, "dialogue": "早就准备好了,走一遍!"},
+                 {"character": m3, "dialogue": "音乐起,五、六、七、八!"},
+             ]},
+            {"scene_no": 2, "location": "舞台",
+             "characters": members,
+             "action": f"灯光亮起,{topic}正式开始,三人走位干净利落",
+             "lines": [
+                 {"character": m1, "dialogue": f"这一段副歌,交给{m2}!"},
+                 {"character": m2, "dialogue": "看我的,高音稳住!"},
+                 {"character": m3, "dialogue": "队形变换,跟上节奏!"},
+             ]},
+            {"scene_no": 3, "location": "后台",
+             "characters": members,
+             "action": "演出结束,三人击掌相拥,汗水与笑容",
+             "lines": [
+                 {"character": m1,
+                  "dialogue": f"第{number}期{topic},圆满完成!"},
+                 {"character": m2,
+                  "dialogue": "喜欢我们就点关注,别错过下一期!"},
+             ]},
+        ]
+        script = {
+            "project_title": payload.get("project_title", lead),
+            "episode_number": number,
+            "episode_title": f"{topic}篇",
+            "logline": f"{m1}、{m2}、{m3}的第{number}期:{topic}。",
+            "characters": [
+                {"name": name, "role": role}
+                for name, role in zip(members, roles)
+            ],
             "scenes": scenes,
         }
         uri = _json_artifact(out_dir / "script.json", script)

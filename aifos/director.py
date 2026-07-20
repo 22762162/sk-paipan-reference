@@ -52,7 +52,8 @@ class Director:
 
     # ---- 入口:一句话开工 ----
     def produce(self, project_title, episode_number, premise="", style="",
-                force=False, script=None, pause_for_confirm=False):
+                force=False, script=None, pause_for_confirm=False,
+                kind=None):
         """force=False 时增量生产:已有且落盘完好的产物直接复用,
         只补齐缺失部分——真实产线(即梦按镜头计费)断点续产的关键。
         script:用户自带剧本(标准 JSON);提供时跳过 AI 编剧,
@@ -62,8 +63,13 @@ class Director:
         produce(不带该参数)即从断点继续自动完成视频→配音→剪辑→质检。"""
         if script is not None:
             force = True  # 剧本变了,旧镜头/配音不可复用
-        project, _ = self.projects.get_or_create_project(
-            project_title, style=style)
+        project, created = self.projects.get_or_create_project(
+            project_title, style=style,
+            kind=kind if kind in ("drama", "idol") else "drama")
+        if (not created and kind in ("drama", "idol")
+                and project["kind"] != kind):
+            # 用户明确改了内容类型 → 更新项目
+            project = self.projects.update_project(project_title, kind=kind)
         episode, _ = self.projects.get_or_create_episode(
             project["id"], episode_number, premise=premise)
         self.log.info(

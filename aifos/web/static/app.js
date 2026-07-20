@@ -90,8 +90,14 @@ async function renderDashboard() {
         <button type="button" class="mode-tab active" data-mode="ai">✨ AI 自动编剧</button>
         <button type="button" class="mode-tab" data-mode="script">📄 我有剧本</button>
       </div>
-      <input name="sentence" placeholder='写下作品名和集数,例如:开始制作《万妖图录》第16集' required>
-      <input name="premise" placeholder="想要的剧情方向(可不填)">
+      <div class="kind-tabs">
+        <span class="kind-label">内容类型</span>
+        <button type="button" class="kind-tab active" data-kind="">自动识别</button>
+        <button type="button" class="kind-tab" data-kind="drama">🎬 剧情短剧</button>
+        <button type="button" class="kind-tab" data-kind="idol">💫 虚拟偶像/女团</button>
+      </div>
+      <input name="sentence" placeholder='写下作品名和集数,例如:开始制作《苏念的一天》第1集' required>
+      <input name="premise" placeholder="内容方向,例如:偶像女团 / 都市职场 / 仙侠(可不填)">
       <button class="primary" type="submit">开始制作</button>
       <textarea name="script" rows="5" hidden placeholder="把你的剧本粘贴到这里,人物、场次、分镜会自动识别。写法示例:
 第1场 古镇长街
@@ -182,6 +188,12 @@ async function renderDashboard() {
       form.script.hidden = tab.dataset.mode !== "script";
       if (tab.dataset.mode === "script") form.script.focus();
     }));
+  form.querySelectorAll(".kind-tab").forEach((tab) =>
+    tab.addEventListener("click", () => {
+      form.querySelectorAll(".kind-tab").forEach((t) =>
+        t.classList.toggle("active", t === tab));
+      form.dataset.kind = tab.dataset.kind;
+    }));
   renderProgressBanner(data);
   app.querySelectorAll("tr.clickable").forEach((tr) =>
     tr.addEventListener("click", () => { location.hash = `#/episode/${tr.dataset.ep}`; }));
@@ -213,6 +225,7 @@ async function onProduce(ev) {
         sentence: form.sentence.value,
         premise: form.premise.value,
         script_text: form.script.hidden ? "" : form.script.value,
+        kind: form.dataset.kind || "",
       }),
     });
     showToast("制作任务已提交,进度会自动刷新", "ok");

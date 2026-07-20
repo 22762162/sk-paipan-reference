@@ -55,7 +55,7 @@ class JobRegistry:
         self._seq = 0
 
     def start(self, title, number, premise="", style="", force=False,
-              script=None, review=False):
+              script=None, review=False, kind=None):
         with self._lock:
             self._seq += 1
             job_id = f"j{self._seq}"
@@ -70,7 +70,7 @@ class JobRegistry:
             try:
                 summary = app.director.produce(
                     title, number, premise=premise, style=style, force=force,
-                    script=script, pause_for_confirm=review)
+                    script=script, pause_for_confirm=review, kind=kind)
                 self._jobs[job_id].update(
                     status="done", summary=summary, finished_at=time.time())
             except Exception as exc:  # 后台任务兜底,错误进任务状态
@@ -387,7 +387,9 @@ def make_handler(workspace, jobs):
                 style=body.get("style", ""),
                 force=bool(body.get("force")),
                 script=script,
-                review=bool(body.get("review", True)))
+                review=bool(body.get("review", True)),
+                kind=body.get("kind")
+                if body.get("kind") in ("drama", "idol") else None)
             return self._json({"job_id": job_id}, status=202)
 
         def _confirm(self):

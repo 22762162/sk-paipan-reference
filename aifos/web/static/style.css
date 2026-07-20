@@ -269,6 +269,13 @@ td.num, th.num { text-align: right; }
 }
 
 /* 开工向导 */
+.kind-tabs { display: flex; gap: 8px; width: 100%; align-items: center; flex-wrap: wrap; }
+.kind-label { color: var(--ink-3); font-size: 12px; }
+.kind-tab {
+  padding: 6px 14px; font-size: 13px; border-radius: 999px;
+  background: var(--surface-2); border: 1px solid var(--hairline);
+}
+.kind-tab.active { background: var(--accent-soft); border-color: var(--accent); color: #cfe4ff; }
 .mode-tabs { display: flex; gap: 8px; width: 100%; }
 .mode-tab {
   flex: 1; padding: 10px 14px; font-size: 14px;

@@ -46,6 +46,9 @@ def _build_parser():
     p_produce.add_argument("--episode", type=int, help="集数")
     p_produce.add_argument("--premise", default="", help="本集前提/梗概")
     p_produce.add_argument("--style", default="", help="画风/风格")
+    p_produce.add_argument("--kind", choices=["drama", "idol"],
+                           help="内容类型:drama 剧情短剧 / idol 虚拟偶像;"
+                                "不填按标题/前提关键词自动识别")
     p_produce.add_argument("--script-file",
                            help="自带剧本文件(纯文本或 JSON);提供时跳过 AI "
                                 "编剧,人物/分镜自动从剧本推导")
@@ -145,7 +148,7 @@ def _cmd_produce(app, args):
     summary = app.director.produce(
         title, number, premise=args.premise, style=args.style,
         force=args.force, script=script,
-        pause_for_confirm=args.review)
+        pause_for_confirm=args.review, kind=args.kind)
     print(f"\n=== 《{title}》第{number}集 制作{_status_cn(summary['status'])} ===")
     print(f"质检得分: {summary['qc_score']}   "
           f"成本: {summary['cost']}/{summary['budget']}")
