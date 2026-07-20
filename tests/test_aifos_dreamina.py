@@ -20,7 +20,7 @@ if args and args[0] == "user_credit":
     sys.exit(0)
 if args and args[0] == "frames2video":
     out = os.path.join(here, "result.mp4")
-    open(out, "wb").write(b"fake-mp4")
+    open(out, "wb").write(b"\\x00\\x00\\x00 ftypisom-fake")
     print(json.dumps({"status": "done", "video_path": out}))
     sys.exit(0)
 sys.exit(2)

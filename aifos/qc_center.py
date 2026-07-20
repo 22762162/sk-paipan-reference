@@ -31,6 +31,7 @@ class QcCenter:
         issues += self._check_subtitles(script, ctx)
         issues += self._check_voices(script, ctx)
         issues += self._check_videos(storyboard, ctx)
+        issues += self._check_media_sanity(ctx)
         issues += self._check_sensitive(script, ctx)
 
         score = 100
@@ -150,6 +151,58 @@ class QcCenter:
                     "message": f"镜头{shot['shot_no']}视频缺失",
                 })
         return issues
+
+    # ---- 媒体健全性:魔数与空文件(识别真实产线的损坏输出) ----
+    MAGIC = {
+        ".png": (b"\x89PNG",),
+        ".mp4": (b"ftyp",),      # 在文件头 32 字节内出现
+        ".wav": (b"RIFF",),
+        ".aiff": (b"FORM",),
+        ".svg": (b"<svg", b"<?xml"),
+    }
+
+    def _check_media_sanity(self, ctx):
+        issues = []
+        for image in ctx.get("images", []):
+            issues += self._sanity(
+                image.get("uri", ""), "image",
+                shot_no=image.get("shot_no"), rerunnable=False)
+        for video in ctx.get("videos", []):
+            issues += self._sanity(
+                video.get("uri", ""), "video",
+                shot_no=video.get("shot_no"), rerunnable=True)
+        for voice in ctx.get("voices", []):
+            issues += self._sanity(
+                voice.get("uri", ""), "voice",
+                line_no=voice.get("line_no"), rerunnable=True)
+        return issues
+
+    def _sanity(self, uri, kind, shot_no=None, line_no=None,
+                rerunnable=False):
+        if not uri or uri.startswith(("http://", "https://")):
+            return []
+        path = Path(uri)
+        suffix = path.suffix.lower()
+        if suffix == ".json" or not path.exists():
+            return []  # mock 描述文件不校验;缺失由存在性检查负责
+        issue = {
+            "check": "media_sanity", "severity": "error",
+            "shot_no": shot_no, "line_no": line_no,
+            "rerunnable": rerunnable,
+        }
+        if path.stat().st_size == 0:
+            issue["message"] = f"{kind} 产物为空文件: {path.name}"
+            return [issue]
+        magics = self.MAGIC.get(suffix)
+        if not magics:
+            return []
+        head = path.open("rb").read(64)
+        if not any(m in head[:32] if m == b"ftyp" else head.startswith(m)
+                   for m in magics):
+            issue["message"] = (
+                f"{kind} 产物疑似损坏(魔数不符): {path.name}")
+            return [issue]
+        return []
 
     # ---- 敏感内容:剧本与字幕全文扫描 ----
     def _check_sensitive(self, script, ctx):

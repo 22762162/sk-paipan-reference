@@ -259,3 +259,29 @@ td.num, th.num { text-align: right; }
 @media (max-width: 860px) {
   #sidepanel { position: absolute; right: 0; top: 0; bottom: 0; z-index: 5; box-shadow: -8px 0 24px rgba(0,0,0,.5); }
 }
+
+/* 内联播放器 */
+.player { width: 100%; border-radius: 8px; border: 1px solid var(--hairline); margin: 6px 0; display: block; background: #000; }
+audio.player { background: var(--surface-2); }
+
+/* 剧本阅读覆盖层 */
+.script-overlay {
+  position: fixed; inset: 0; z-index: 20;
+  background: rgba(0, 0, 0, .62);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: 40px 16px; overflow-y: auto;
+}
+.script-panel {
+  width: min(720px, 100%); background: var(--surface);
+  border: 1px solid var(--hairline); border-radius: 14px;
+  padding: 24px 28px; margin-bottom: 40px;
+}
+.script-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.script-head h3 { font-size: 17px; }
+.script-panel .logline { color: var(--ink-2); margin: 10px 0 12px; }
+.script-panel .cast { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.script-panel .scene { margin-top: 18px; border-top: 1px solid var(--grid); padding-top: 14px; }
+.script-panel .scene h4 { font-size: 14px; margin-bottom: 8px; color: var(--accent); }
+.script-panel .action { color: var(--ink-3); font-size: 13px; margin-bottom: 8px; }
+.script-panel .line { padding: 4px 0; font-size: 14px; }
+.script-panel .line b { color: var(--ink-2); margin-right: 10px; }

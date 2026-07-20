@@ -163,6 +163,48 @@ async function onProduce(ev) {
   }
 }
 
+/* 剧本阅读视图(覆盖层) */
+function showScriptOverlay(script) {
+  if (!script) return;
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay";
+  overlay.innerHTML = `
+    <div class="script-panel">
+      <div class="script-head">
+        <h3>《${esc(script.project_title)}》第${script.episode_number}集
+            ${script.episode_title ? " · " + esc(script.episode_title) : ""}</h3>
+        <button class="close">关闭 Esc</button>
+      </div>
+      <p class="logline">${esc(script.logline || "")}</p>
+      <div class="cast">${(script.characters || []).map((c) =>
+        `<span class="chip">${esc(c.name)} · ${esc(c.role || "")}</span>`).join("")}</div>
+      ${script.scenes.map((s) => `
+        <section class="scene">
+          <h4>场 ${s.scene_no} · ${esc(s.location)}</h4>
+          ${s.action ? `<p class="action">${esc(s.action)}</p>` : ""}
+          ${(s.lines || []).map((l) => `
+            <p class="line"><b>${esc(l.character)}</b>${esc(l.dialogue)}</p>`).join("")}
+        </section>`).join("")}
+    </div>`;
+  const close = () => { overlay.remove(); document.removeEventListener("keydown", onKey); };
+  const onKey = (ev) => { if (ev.key === "Escape") close(); };
+  overlay.addEventListener("click", (ev) => { if (ev.target === overlay) close(); });
+  overlay.querySelector(".close").onclick = close;
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(overlay);
+}
+
+/* 可内联播放的媒体标签(真实产线 mp4/wav;mock 的 json 描述文件回退为链接) */
+function mediaTag(url) {
+  if (!url) return "";
+  const clean = url.split("?")[0].toLowerCase();
+  if (clean.endsWith(".mp4"))
+    return `<video class="player" controls preload="metadata" src="${esc(url)}"></video>`;
+  if ([".wav", ".mp3", ".m4a", ".aiff"].some((ext) => clean.endsWith(ext)))
+    return `<audio class="player" controls preload="metadata" src="${esc(url)}"></audio>`;
+  return "";
+}
+
 const STAGE_CN = {
   script: "剧本", storyboard: "分镜", assets: "资产调用", images: "图片",
   frames: "首尾帧", videos: "视频", voices: "配音", edit: "剪映剪辑",
@@ -209,6 +251,7 @@ async function renderCanvasView(episodeId) {
       <span class="hint">质检 ${ep.qc_score == null ? "-" : fmt(ep.qc_score, 0)} 分 · 成本 ${fmt(ep.cost)}</span>
       <span class="spacer"></span>
       <span class="hint">滚轮缩放 · 拖拽空白平移 · 拖动卡片摆放 · 点击查看详情</span>
+      <button id="btn-script">剧本</button>
       <button id="btn-reproduce" title="增量:已有产物复用,只补齐缺失">增量重制</button>
       <button id="btn-reproduce-force" title="全部重新生成(消耗额度)">强制重制</button>
       <div class="zoom-group">
@@ -243,6 +286,7 @@ async function renderCanvasView(episodeId) {
   };
   document.getElementById("btn-reproduce").onclick = () => reproduce(false);
   document.getElementById("btn-reproduce-force").onclick = () => reproduce(true);
+  document.getElementById("btn-script").onclick = () => showScriptOverlay(script);
   // 制作进行中自动刷新画布
   if (!["done", "failed", "qc_failed", "created"].includes(ep.status))
     pollTimer = setInterval(() => renderCanvasView(episodeId), 3000);
@@ -389,6 +433,7 @@ class StoryboardCanvas {
             <div class="issue ${esc(i.severity)}">[${esc(i.check)}] ${esc(i.message)}</div>`).join("")
           : `<div class="empty">全部检查通过</div>`}` : ""}
         <h4>成片与产物</h4>
+        ${mediaTag(art.final)}
         <ul class="links">
           ${art.final ? `<li><span>成片</span><a href="${esc(art.final)}" target="_blank">打开</a></li>` : ""}
           ${art.clips.map((c) => `<li><span>拆条 · 场${c.scene_no}</span><a href="${esc(c.url)}" target="_blank">打开</a></li>`).join("")}
@@ -406,7 +451,9 @@ class StoryboardCanvas {
         <figure>${art.first[shotNo] ? `<img src="${esc(art.first[shotNo])}">` : ""}<figcaption>首帧</figcaption></figure>
         <figure>${art.last[shotNo] ? `<img src="${esc(art.last[shotNo])}">` : ""}<figcaption>尾帧</figcaption></figure>
       </div>
+      ${mediaTag(art.videos[shotNo]) ? `<h4>镜头视频</h4>${mediaTag(art.videos[shotNo])}` : ""}
       ${shot.dialogue ? `<h4>台词</h4><div class="dialogue"><b>${esc(shot.dialogue.character)}</b>:${esc(shot.dialogue.dialogue)}</div>` : ""}
+      ${lineNo != null && mediaTag(art.voices[lineNo]) ? mediaTag(art.voices[lineNo]) : ""}
       <h4>镜头信息</h4>
       <ul class="links">
         <li><span>机位</span><span>${esc(shot.camera || "-")}</span></li>

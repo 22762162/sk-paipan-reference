@@ -26,10 +26,20 @@ DEFAULTS = {
     },
     "providers": {
         "claude": {
+            # 经 aifos.adapters.claude_script 桥接 claude -p 实际编剧
             "type": "cli", "enabled": False,
             "capabilities": ["script", "storyboard"],
-            "command": ["claude", "-p"],
+            "command": ["python3", "-m", "aifos.adapters.claude_script",
+                        "--claude", "claude"],
             "cost_per_call": 0.5, "timeout": 600,
+        },
+        "say": {
+            # macOS 内置 TTS 过渡配音产线(即梦 TTS 上线前)
+            "type": "cli", "enabled": False,
+            "capabilities": ["voice"],
+            "command": ["python3", "-m", "aifos.adapters.say_voice",
+                        "--voice", "Tingting"],
+            "cost_per_call": 0.0, "timeout": 120,
         },
         "codex": {
             # 经 aifos.adapters.codex_image 桥接真实 codex exec;
@@ -78,7 +88,7 @@ DEFAULTS = {
         "image": ["codex", "api", "mock"],
         "frames": ["codex", "mock"],
         "video": ["jimeng", "api", "mock"],
-        "voice": ["jimeng", "api", "mock"],
+        "voice": ["jimeng", "say", "api", "mock"],
         "edit": ["jianying", "mock"],
         "cover": ["codex", "mock"],
     },

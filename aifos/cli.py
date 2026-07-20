@@ -51,6 +51,14 @@ def _build_parser():
     p_produce.add_argument("--verbose", action="store_true",
                            help="实时输出内部日志")
 
+    p_batch = sub.add_parser(
+        "batch", help="批量制作:batch 万妖图录 --from 1 --to 5")
+    p_batch.add_argument("title", help="作品名")
+    p_batch.add_argument("--from", dest="start", type=int, required=True)
+    p_batch.add_argument("--to", dest="end", type=int, required=True)
+    p_batch.add_argument("--style", default="")
+    p_batch.add_argument("--force", action="store_true")
+
     sub.add_parser("status", help="制作状态看板")
 
     p_serve = sub.add_parser(
@@ -129,6 +137,31 @@ def _cmd_produce(app, args):
 def _status_cn(status):
     return {"done": "完成", "failed": "失败", "qc_failed": "完成(质检未过)"}.get(
         status, status)
+
+
+def _cmd_batch(app, args):
+    """批量制作:逐集执行,单集失败不中断整批。"""
+    if args.end < args.start:
+        print("--to 不能小于 --from", file=sys.stderr)
+        return 2
+    app.system.require(args.user, "produce")
+    rows = []
+    for number in range(args.start, args.end + 1):
+        print(f"—— 制作《{args.title}》第{number}集 ——")
+        try:
+            summary = app.director.produce(
+                args.title, number, style=args.style, force=args.force)
+            rows.append((number, summary["status"], summary["qc_score"],
+                         summary["cost"]))
+        except Exception as exc:
+            rows.append((number, "failed", None, None))
+            print(f"  第{number}集异常: {exc}", file=sys.stderr)
+    print(f"\n{'集':<6}{'状态':<12}{'质检':<8}{'成本':<8}")
+    for number, status, score, cost in rows:
+        score_s = "-" if score is None else f"{score:.0f}"
+        cost_s = "-" if cost is None else f"{cost:.2f}"
+        print(f"{number:<6}{_status_cn(status):<12}{score_s:<8}{cost_s:<8}")
+    return 0 if all(r[1] == "done" for r in rows) else 1
 
 
 def _cmd_status(app):
@@ -287,6 +320,8 @@ def main(argv=None):
     try:
         if args.command == "produce":
             return _cmd_produce(app, args)
+        if args.command == "batch":
+            return _cmd_batch(app, args)
         if args.command == "status":
             return _cmd_status(app)
         if args.command == "project":
