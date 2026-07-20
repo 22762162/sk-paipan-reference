@@ -84,6 +84,13 @@ input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent)
 }
 .produce-bar input[name="sentence"] { flex: 2 1 320px; }
 .produce-bar input[name="premise"] { flex: 1 1 200px; }
+.produce-bar textarea {
+  width: 100%; font-family: inherit; font-size: 13px;
+  background: var(--surface); color: var(--ink);
+  border: 1px solid var(--hairline); border-radius: 8px;
+  padding: 8px 12px; resize: vertical;
+}
+.produce-bar textarea:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
 .produce-hint { width: 100%; color: var(--ink-3); font-size: 12px; }
 
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }

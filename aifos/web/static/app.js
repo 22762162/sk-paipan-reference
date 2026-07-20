@@ -87,6 +87,10 @@ async function renderDashboard() {
       <input name="sentence" placeholder='一句话开工:开始制作《万妖图录》第15集' required>
       <input name="premise" placeholder="本集前提/梗概(可选)">
       <button class="primary" type="submit">开始制作</button>
+      <textarea name="script" rows="3" placeholder="可选:粘贴你的剧本 —— 留空则 AI 自动编剧;提供剧本时,人物/场次/分镜自动从剧本推导。格式示例:
+第1场 古镇长街
+林昭:这股妖气不对劲。
+小狐:小心,它就在附近!"></textarea>
       <div class="produce-hint">平台将自动完成:剧本 → 分镜 → 资产 → 图片 → 首尾帧 → 视频 → 配音 → 剪辑 → 质检 → 封面/标题/拆条 → 数据沉淀</div>
     </form>
 
@@ -191,6 +195,7 @@ async function onProduce(ev) {
       body: JSON.stringify({
         sentence: form.sentence.value,
         premise: form.premise.value,
+        script_text: form.script.value,
       }),
     });
     showToast("制作任务已提交,进度会自动刷新", "ok");

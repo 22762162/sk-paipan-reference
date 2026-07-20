@@ -54,7 +54,8 @@ class JobRegistry:
         self._lock = threading.Lock()
         self._seq = 0
 
-    def start(self, title, number, premise="", style="", force=False):
+    def start(self, title, number, premise="", style="", force=False,
+              script=None):
         with self._lock:
             self._seq += 1
             job_id = f"j{self._seq}"
@@ -68,7 +69,8 @@ class JobRegistry:
             app = App(self.workspace)
             try:
                 summary = app.director.produce(
-                    title, number, premise=premise, style=style, force=force)
+                    title, number, premise=premise, style=style, force=force,
+                    script=script)
                 self._jobs[job_id].update(
                     status="done", summary=summary, finished_at=time.time())
             except Exception as exc:  # 后台任务兜底,错误进任务状态
@@ -356,11 +358,20 @@ def make_handler(workspace, jobs):
             if not title or not number:
                 return self._error(
                     400, "无法识别制作目标;示例:开始制作《万妖图录》第15集")
+            script = None
+            if body.get("script_text"):
+                from ..script_import import ScriptImportError, parse_any
+                try:
+                    script = parse_any(
+                        body["script_text"], title, int(number))
+                except ScriptImportError as exc:
+                    return self._error(400, str(exc))
             job_id = jobs.start(
                 title, int(number),
                 premise=body.get("premise", ""),
                 style=body.get("style", ""),
-                force=bool(body.get("force")))
+                force=bool(body.get("force")),
+                script=script)
             return self._json({"job_id": job_id}, status=202)
 
     return Handler

@@ -48,9 +48,13 @@ class Director:
 
     # ---- 入口:一句话开工 ----
     def produce(self, project_title, episode_number, premise="", style="",
-                force=False):
+                force=False, script=None):
         """force=False 时增量生产:已有且落盘完好的产物直接复用,
-        只补齐缺失部分——真实产线(即梦按镜头计费)断点续产的关键。"""
+        只补齐缺失部分——真实产线(即梦按镜头计费)断点续产的关键。
+        script:用户自带剧本(标准 JSON);提供时跳过 AI 编剧,
+        人物/场次/分镜等全部从该剧本自动推导。"""
+        if script is not None:
+            force = True  # 剧本变了,旧镜头/配音不可复用
         project, _ = self.projects.get_or_create_project(
             project_title, style=style)
         episode, _ = self.projects.get_or_create_episode(
@@ -69,6 +73,7 @@ class Director:
             "force": force,
             "aspect": aspect,
             "dims": ASPECT_DIMS.get(aspect, ASPECT_DIMS["9:16"]),
+            "provided_script": script,
         }
         stage_reports = []
         failed = False
@@ -191,6 +196,17 @@ class Director:
     # ---- 各阶段实现 ----
     def _stage_script(self, ctx):
         episode = ctx["episode"]
+        provided = ctx.get("provided_script")
+        if provided is not None:
+            provided.setdefault("project_title", ctx["project"]["title"])
+            provided.setdefault("episode_number", episode["number"])
+            version = self.projects.save_document(
+                episode["id"], "script", provided)
+            ctx["script"] = provided
+            self.log.info("director", f"使用用户自带剧本(v{version}),"
+                          "人物/分镜将自动推导")
+            return {"version": version, "provided": True,
+                    "scenes": len(provided["scenes"])}
         if not ctx.get("force"):
             existing, version = self.projects.latest_document(
                 episode["id"], "script")

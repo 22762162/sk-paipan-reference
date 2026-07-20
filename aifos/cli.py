@@ -46,6 +46,9 @@ def _build_parser():
     p_produce.add_argument("--episode", type=int, help="集数")
     p_produce.add_argument("--premise", default="", help="本集前提/梗概")
     p_produce.add_argument("--style", default="", help="画风/风格")
+    p_produce.add_argument("--script-file",
+                           help="自带剧本文件(纯文本或 JSON);提供时跳过 AI "
+                                "编剧,人物/分镜自动从剧本推导")
     p_produce.add_argument("--force", action="store_true",
                            help="强制全部重新生成(默认增量:已有产物直接复用)")
     p_produce.add_argument("--verbose", action="store_true",
@@ -121,9 +124,19 @@ def _cmd_produce(app, args):
               " 或 produce --title 万妖图录 --episode 15", file=sys.stderr)
         return 2
     app.system.require(args.user, "produce")
+    script = None
+    if getattr(args, "script_file", None):
+        from .script_import import ScriptImportError, load_script_file
+        try:
+            script = load_script_file(args.script_file, title, number)
+        except (OSError, ScriptImportError) as exc:
+            print(f"剧本导入失败: {exc}", file=sys.stderr)
+            return 2
+        print(f"已导入剧本:{len(script['scenes'])} 场,"
+              f"{len(script['characters'])} 个角色")
     summary = app.director.produce(
         title, number, premise=args.premise, style=args.style,
-        force=args.force)
+        force=args.force, script=script)
     print(f"\n=== 《{title}》第{number}集 制作{_status_cn(summary['status'])} ===")
     print(f"质检得分: {summary['qc_score']}   "
           f"成本: {summary['cost']}/{summary['budget']}")
