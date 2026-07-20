@@ -69,6 +69,8 @@ class _FakeApi(BaseHTTPRequestHandler):
         result = handler(body)
         if isinstance(result, bytes):
             return self._reply(None, raw=result, ctype="video/mp4")
+        if isinstance(result, tuple):          # (状态码, 应答体)
+            return self._reply(result[1], status=result[0])
         return self._reply(result)
 
     def do_POST(self):
@@ -274,6 +276,61 @@ def test_ark_video_task_failed(fake_api, tmp_path):
         "endpoint": endpoint, "api_key": "k", "poll": 0.01, "timeout": 30})
     with pytest.raises(ProviderError, match="内容审核未通过"):
         provider.generate("video", {"shot_no": 1, "prompt": "x"}, tmp_path)
+
+
+# ---------------- 真实连通性测试(ping) ----------------
+
+def test_pings(fake_api, tmp_path):
+    endpoint, fake = fake_api
+    fake.routes[("POST", "/v1/messages")] = lambda body: {
+        "content": [{"type": "text", "text": "pong"}]}
+    claude = ClaudeApiProvider("claude_api", _claude_conf(endpoint))
+    ok, detail = claude.ping()
+    assert ok and "claude-opus-4-8" in detail
+    assert fake.calls[-1]["body"]["max_tokens"] == 1
+
+    fake.routes[("GET", "/v1/models")] = lambda body: {
+        "data": [{"id": "gpt-image-1"}, {"id": "dall-e-3"}]}
+    image = OpenAIImageProvider("image_api", _image_conf(endpoint))
+    ok, detail = image.ping()
+    assert ok and "2" in detail
+
+    # Ark:空任务 HTTP 400 = 端点可达且鉴权通过;401 = Key 错误
+    fake.routes[("POST", "/api/v3/contents/generations/tasks")] = \
+        lambda body: (400, {"error": {"message": "InvalidParameter"}})
+    ark = ArkVideoProvider("ark", {
+        "type": "ark_video", "enabled": True, "capabilities": ["video"],
+        "endpoint": endpoint, "api_key": "k", "timeout": 30})
+    ok, detail = ark.ping()
+    assert ok and "鉴权通过" in detail
+    fake.routes[("POST", "/api/v3/contents/generations/tasks")] = \
+        lambda body: (401, {"error": {"message": "invalid api key"}})
+    ok, detail = ark.ping()
+    assert not ok and "401" in detail
+
+
+def test_settings_test_provider_real_ping(fake_api, tmp_path):
+    """设置中心「测试连接」= 配置检查 + 真实请求。"""
+    from aifos.settings import test_provider
+    endpoint, fake = fake_api
+    fake.routes[("POST", "/v1/messages")] = lambda body: {
+        "content": [{"type": "text", "text": "pong"}]}
+    app = App(tmp_path / "ws", config_overrides={
+        "providers": {"claude_api": {
+            "enabled": True, "endpoint": endpoint,
+            "api_key": "sk-ping", "timeout": 30}}})
+    try:
+        report = test_provider(app, "claude_api")
+        assert report["ok"] is True
+        assert "真实连通成功" in report["extra"]
+        # Key 失效 → 401 → 测试必须报失败,而不是显示配置正常
+        fake.routes[("POST", "/v1/messages")] = lambda body: (
+            401, {"error": {"message": "invalid x-api-key"}})
+        report = test_provider(app, "claude_api")
+        assert report["ok"] is False
+        assert "401" in report["extra"]
+    finally:
+        app.close()
 
 
 # ---------------- 路由回退:CLI 不可用 → API ----------------

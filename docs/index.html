@@ -1177,7 +1177,8 @@ window.__SEED__ = {"projects": [{"id": 1, "title": "小澜同学", "description"
       if (!conf.api_key)
         return { capability: cap, ok: false, reason: "未配置 api_key" };
       return { capability: cap, ok: true,
-        reason: "已配置(演示环境不实际调用扣费)" };
+        reason: "已配置 Key。点「测试连接」真实验证;" +
+          "剧本/图片配好后会实际调用生成" };
     });
   }
   function maskKey(v) {
@@ -1202,6 +1203,184 @@ window.__SEED__ = {"projects": [{"id": 1, "title": "小澜同学", "description"
         cover: "封面" },
       config_path: "浏览器演示 · 存于本机 localStorage" +
         "(正式版为 workspace/config.json)" };
+  }
+
+  /* ---- 真实 API 直连:配好 Key 后剧本/图片真实调用,失败自动回退 ---- */
+  const realFetch = window.fetch.bind(window);
+  const SANDBOX_HINT = "若在 claude.ai 演示页打开,沙箱会拦截外联;" +
+    "请把页面另存为本地 html 打开(或用外链版 / 本机运行正式版)再试";
+  function apiConf(name) {
+    const c = ((state && state.config && state.config.providers) || {})[name];
+    return c && c.enabled && c.api_key ? c : null;
+  }
+  function endpointOf(conf, dflt) {
+    return (conf.endpoint || dflt).replace(/\/+$/, "");
+  }
+  async function claudeMessages(conf, prompt, maxTokens) {
+    const r = await realFetch(
+      endpointOf(conf, "https://api.anthropic.com") + "/v1/messages", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": conf.api_key,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: conf.model || "claude-opus-4-8",
+          max_tokens: maxTokens || 8000,
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+    if (!r.ok)
+      throw new Error(`HTTP ${r.status} ${(await r.text()).slice(0, 200)}`);
+    const data = await r.json();
+    return (data.content || []).filter((b) => b.type === "text")
+      .map((b) => b.text).join("");
+  }
+  function extractJsonLoose(text) {
+    const start = text.indexOf("{");
+    if (start === -1) return null;
+    let depth = 0, inStr = false, escNext = false;
+    for (let i = start; i < text.length; i += 1) {
+      const ch = text[i];
+      if (inStr) {
+        if (escNext) escNext = false;
+        else if (ch === "\\") escNext = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') inStr = true;
+      else if (ch === "{") depth += 1;
+      else if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          try { return JSON.parse(text.slice(start, i + 1)); }
+          catch (e) { return null; }
+        }
+      }
+    }
+    return null;
+  }
+  function claudePrompt(project, number, premise) {
+    const style = project.style ||
+      (project.kind === "idol" ? "元气偶像" : "国风漫剧");
+    if (project.kind === "idol") {
+      const persona = personaFromTitle(project.title);
+      return `你是 AI 虚拟偶像「${persona}」的内容策划。为第${number}期短视频写口播脚本。
+人设风格:${style};本期主题:${premise || "自选一个日常主题"}。
+
+要求:3 场;台词口语化有网感,单句不超过 22 个字;若主题涉及女团/组合,设 2-4 名成员并分配台词;只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块。
+
+JSON 格式:{"project_title":"${project.title}","episode_number":${number},"episode_title":"本期小标题","logline":"一句话概要","characters":[{"name":"${persona}","role":"主角"}],"scenes":[{"scene_no":1,"location":"场景","characters":["${persona}"],"action":"画面动作","lines":[{"character":"${persona}","dialogue":"口播台词"}]}]}`;
+    }
+    return `你是漫剧编剧。为作品《${project.title}》第${number}集创作一集完整剧本。
+风格:${style};本集前提:${premise || "自由发挥"}。
+
+要求:3 到 5 场,每场 2-4 句台词,适合 1-2 分钟短剧;台词口语化,单句不超过 25 个字;只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块。
+
+JSON 格式:{"project_title":"${project.title}","episode_number":${number},"episode_title":"本集小标题","logline":"一句话梗概","characters":[{"name":"角色名","role":"主角/同伴/反派"}],"scenes":[{"scene_no":1,"location":"地点","characters":["出场角色名"],"action":"本场动作描述","lines":[{"character":"角色名","dialogue":"台词"}]}]}`;
+  }
+  function validateScriptLoose(s, project, number) {
+    if (!s || !Array.isArray(s.scenes) || !s.scenes.length ||
+        !Array.isArray(s.characters) || !s.characters.length) return null;
+    s.project_title = s.project_title || project.title;
+    s.episode_number = number;
+    s.episode_title = s.episode_title || "";
+    s.logline = s.logline || "";
+    s.scenes.forEach((sc, i) => {
+      sc.scene_no = i + 1;
+      sc.location = sc.location || `场景${i + 1}`;
+      sc.action = sc.action || "";
+      sc.lines = (sc.lines || []).filter(
+        (l) => l && l.character && l.dialogue);
+      sc.characters = [...new Set(sc.lines.map((l) => l.character))].sort();
+    });
+    if (!s.scenes.some((sc) => sc.lines.length)) return null;
+    return s;
+  }
+  async function realScriptFor(project, number, premise, conf) {
+    const text = await claudeMessages(
+      conf, claudePrompt(project, number, premise), 8000);
+    const obj = validateScriptLoose(
+      extractJsonLoose(text), project, number);
+    if (!obj) throw new Error("Claude 输出未通过剧本校验");
+    return obj;
+  }
+  function sizeOf(aspect) {
+    return aspect === "16:9" ? "1536x1024"
+      : aspect === "9:16" ? "1024x1536" : "1024x1024";
+  }
+  async function realImage(conf, prompt, aspect) {
+    const r = await realFetch(
+      endpointOf(conf, "https://api.openai.com") + "/v1/images/generations", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${conf.api_key}`,
+        },
+        body: JSON.stringify({ model: conf.model || "gpt-image-1",
+          prompt, n: 1, size: sizeOf(aspect) }),
+      });
+    if (!r.ok)
+      throw new Error(`HTTP ${r.status} ${(await r.text()).slice(0, 200)}`);
+    const data = await r.json();
+    const item = (data.data || [])[0] || {};
+    if (item.b64_json) return "data:image/png;base64," + item.b64_json;
+    if (item.url) return item.url;
+    throw new Error("应答缺少 b64_json/url");
+  }
+  /* 人物/场景图渐进替换为真实出图(成一张换一张,失败保留占位图) */
+  async function enhanceWithRealImages(epId, project, full) {
+    const conf = apiConf("image_api");
+    if (!conf) return;
+    const style = project.style || "国风漫剧";
+    const aspect = project.aspect || "9:16";
+    const each = (fn) => {
+      [state.payloads[epId], state.fullResults[epId], full].forEach(
+        (p) => { if (p) fn(p); });
+    };
+    const wanted = [];
+    (full.artifacts.cast_art || []).forEach((c) => wanted.push({
+      label: `人物立绘「${c.name}」`,
+      prompt: `角色立绘:${c.name}(${c.role || "主角"}),${style},` +
+        "全身,正面,高质量,统一画风",
+      apply: (url) => each((p) => {
+        const item = (p.artifacts.cast_art || []).find(
+          (x) => x.name === c.name);
+        if (item) item.url = url;
+      }),
+    }));
+    (full.artifacts.scene_art || []).forEach((s) => wanted.push({
+      label: `场景图「${s.name}」`,
+      prompt: `场景概念图:${s.name},${style},空镜,氛围感`,
+      apply: (url) => each((p) => {
+        const item = (p.artifacts.scene_art || []).find(
+          (x) => x.name === s.name);
+        if (item) item.url = url;
+      }),
+    }));
+    let done = 0;
+    for (const job of wanted) {
+      try {
+        const url = await realImage(conf, job.prompt, aspect);
+        job.apply(url);
+        done += 1;
+        save();
+        log("INFO", "router", `出图 API 已真实生成:${job.label}`);
+        if (location.hash === `#/episode/${epId}` && window.renderCanvasView)
+          renderCanvasView(epId);
+      } catch (e) {
+        log("WARN", "router",
+          `出图 API 失败(${job.label}):${e.message}`);
+        if (window.showToast)
+          showToast(`出图 API 调用失败:${e.message}。${SANDBOX_HINT}`,
+            "error");
+        return;   // 大概率是网络/沙箱问题,后面的不再尝试
+      }
+    }
+    if (done && window.showToast)
+      showToast(`出图 API 已真实生成 ${done} 张人物/场景图`, "ok");
   }
 
   function buildStoryboard(script, seed) {
@@ -1406,10 +1585,30 @@ window.__SEED__ = {"projects": [{"id": 1, "title": "小澜同学", "description"
     const jobId = `j${jobSeq}`;
     jobs[jobId] = { id: jobId, status: "running", title, episode: number,
       started_at: Date.now() / 1000 };
-    log("INFO", "director", `开始制作《${title}》第${number}集(浏览器 Mock 产线)`);
+    log("INFO", "director", `开始制作《${title}》第${number}集`);
 
+    const run = async () => {
+    let script = providedScript || null;
+    const claudeConf = apiConf("claude_api");
+    if (!script && claudeConf) {
+      ep.status = "script";
+      save();
+      try {
+        script = await realScriptFor(
+          project, number, premise || "", claudeConf);
+        log("INFO", "router",
+          `剧本:Claude API(${claudeConf.model || "claude-opus-4-8"})真实生成成功`);
+        if (window.showToast) showToast("Claude API 已真实生成剧本", "ok");
+      } catch (e) {
+        log("WARN", "router",
+          `Claude API 失败(${e.message}),回退内置编剧`);
+        if (window.showToast)
+          showToast(`Claude API 调用失败,已回退内置编剧:${e.message}。` +
+            SANDBOX_HINT, "error");
+      }
+    }
     const result = produceEpisode(project, number, premise || "",
-      providedScript || null);
+      script);
     const full = {
       episode: null, project: { ...project },
       tasks: result.tasks, script: result.script, script_version: 1,
@@ -1418,6 +1617,7 @@ window.__SEED__ = {"projects": [{"id": 1, "title": "小澜同学", "description"
       cost: result.cost,
     };
     state.fullResults[ep.id] = full;
+    enhanceWithRealImages(ep.id, project, full);
 
     const finishAll = () => {
       ep.status = "done";
@@ -1447,6 +1647,8 @@ window.__SEED__ = {"projects": [{"id": 1, "title": "小澜同学", "description"
     } else {
       runStages(ep, PHASE1.concat(PHASE2), finishAll);
     }
+    };
+    run();
     save();
     return jobId;
   }
@@ -1536,7 +1738,7 @@ window.__SEED__ = {"projects": [{"id": 1, "title": "小澜同学", "description"
     };
   }
 
-  function route(path, opts) {
+  async function route(path, opts) {
     const key = path.split("#")[0];
     if (opts && opts.method === "POST" && key === "/api/produce") {
       const body = JSON.parse(opts.body || "{}");
@@ -1631,8 +1833,34 @@ window.__SEED__ = {"projects": [{"id": 1, "title": "小澜同学", "description"
       const conf = state.config.providers[body.provider];
       if (!conf) return [400, { error: `未知 Provider: ${body.provider}` }];
       const results = providerChecks(body.provider, conf);
-      return [200, { provider: body.provider,
-        ok: results.every((r) => r.ok), results, extra: null }];
+      let ok = results.every((r) => r.ok);
+      let extra = null;
+      // 配好 Key 的 API Provider:从浏览器发真实请求验证
+      if (conf.enabled && conf.api_key) {
+        try {
+          if (conf.type === "claude_api") {
+            await claudeMessages(conf, "ping", 8);
+            ok = true;
+            extra = "✓ 真实连通成功:剧本将由 Claude API 实际生成";
+          } else if (conf.type === "image_api") {
+            const r = await realFetch(
+              endpointOf(conf, "https://api.openai.com") + "/v1/models",
+              { headers: { authorization: `Bearer ${conf.api_key}` } });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            ok = true;
+            extra = "✓ 真实连通成功:人物/场景图将由出图 API 实际生成";
+          } else if (conf.type === "ark_video" || conf.type === "api") {
+            await realFetch(endpointOf(conf, "https://example.com"),
+              { method: "GET", mode: "no-cors" });
+            extra = "✓ 端点可达;视频生成需在本机正式版执行" +
+              "(浏览器无法回传 mp4 大文件)";
+          }
+        } catch (e) {
+          ok = false;
+          extra = `✗ 浏览器直连失败:${e.message}。${SANDBOX_HINT}`;
+        }
+      }
+      return [200, { provider: body.provider, ok, results, extra }];
     }
     if (opts && opts.method === "POST" && key === "/api/revise") {
       const body = JSON.parse(opts.body || "{}");
@@ -1660,6 +1888,65 @@ window.__SEED__ = {"projects": [{"id": 1, "title": "小澜同学", "description"
       const s2 = hash(`${body.feedback || ""}#${state.bump}#${target.kind}`);
       const full = state.fullResults[id];
       const each = (fn) => { fn(pl); if (full) fn(full); };
+      // 配好出图 API → 单张真实重画(附修改意见),失败任务报错不装死
+      const imgConf = apiConf("image_api");
+      if (imgConf) {
+        const style = project.style || "国风漫剧";
+        let prompt = null, apply = null;
+        if (target.kind === "character_art") {
+          const role = (pl.script.characters.find(
+            (c) => c.name === target.name) || {}).role || "主角";
+          prompt = `角色立绘:${target.name}(${role}),${style},全身,正面`;
+          apply = (url) => each((p) => {
+            const item = (p.artifacts.cast_art || []).find(
+              (c) => c.name === target.name);
+            if (item) item.url = url;
+          });
+        } else if (target.kind === "scene_art") {
+          prompt = `场景概念图:${target.name},${style},空镜,氛围感`;
+          apply = (url) => each((p) => {
+            const item = (p.artifacts.scene_art || []).find(
+              (c) => c.name === target.name);
+            if (item) item.url = url;
+          });
+        } else if (target.kind === "shot") {
+          const shot = pl.storyboard.shots.find(
+            (s) => s.shot_no === target.shot_no);
+          if (!shot) return [404, { error: "镜头不存在" }];
+          prompt = shot.prompt;
+          apply = (url) => each((p) => {
+            p.artifacts.images[shot.shot_no] = url;
+            p.artifacts.first[shot.shot_no] = url;
+            p.artifacts.last[shot.shot_no] = url;
+          });
+        }
+        if (prompt) {
+          if (body.feedback)
+            prompt += `。修改意见(必须落实):${body.feedback}`;
+          jobSeq += 1;
+          const jid = `j${jobSeq}`;
+          jobs[jid] = { id: jid, status: "running", title: project.title,
+            episode: pl.episode.number, started_at: Date.now() / 1000 };
+          (async () => {
+            try {
+              const url = await realImage(
+                imgConf, prompt, project.aspect || "9:16");
+              apply(url);
+              save();
+              jobs[jid].status = "done";
+              log("INFO", "router",
+                `出图 API 已真实重画 ${target.kind}` +
+                `(意见:${body.feedback || "无"})`);
+            } catch (e) {
+              jobs[jid].status = "failed";
+              jobs[jid].error =
+                `出图 API 调用失败:${e.message}。${SANDBOX_HINT}`;
+              log("WARN", "router", jobs[jid].error);
+            }
+          })();
+          return [202, { job_id: jid }];
+        }
+      }
       if (target.kind === "character_art") {
         const role = (pl.script.characters.find(
           (c) => c.name === target.name) || {}).role || "";
@@ -1870,6 +2157,9 @@ window.__SEED__ = {"projects": [{"id": 1, "title": "小澜同学", "description"
 
   load();
   window.fetch = async (path, opts) => {
+    // 外部地址(真实 API 直连)放行给浏览器原生 fetch
+    if (typeof path !== "string" || /^https?:\/\//i.test(path))
+      return realFetch(path, opts);
     const exportMatch = /^\/api\/export\/(\d+)$/.exec(path.split("#")[0]);
     if (exportMatch) {
       const blob = exportZipBlob(parseInt(exportMatch[1], 10));
@@ -1878,7 +2168,7 @@ window.__SEED__ = {"projects": [{"id": 1, "title": "小澜同学", "description"
       return { ok: true, status: 200, blob: async () => blob,
         json: async () => ({}) };
     }
-    const [status, data] = route(path, opts);
+    const [status, data] = await route(path, opts);
     return { ok: status < 400, status,
       json: async () => JSON.parse(JSON.stringify(data)) };
   };
@@ -2238,32 +2528,46 @@ function drawSettings(data) {
       } catch (e) { showToast(e.message, "error"); }
     };
   });
+  const collectFields = (card) => {
+    const fields = {};
+    card.querySelectorAll("[data-field]").forEach((input) => {
+      if (input.type === "checkbox") fields[input.dataset.field] = input.checked;
+      else if (input.value.trim() !== "") fields[input.dataset.field] = input.value.trim();
+    });
+    return fields;
+  };
   app.querySelectorAll(".provider-card").forEach((card) => {
     const name = card.dataset.provider;
     card.querySelector(".pc-save").onclick = async () => {
-      const fields = {};
-      card.querySelectorAll("[data-field]").forEach((input) => {
-        if (input.type === "checkbox") fields[input.dataset.field] = input.checked;
-        else if (input.value.trim() !== "") fields[input.dataset.field] = input.value.trim();
-      });
       try {
-        const fresh = await post({ provider: name, fields });
+        const fresh = await post({ provider: name, fields: collectFields(card) });
         showToast("已保存,下一次制作生效", "ok");
         drawSettings(fresh);
       } catch (e) { showToast(e.message, "error"); }
     };
     card.querySelector(".pc-test").onclick = async () => {
       const el = card.querySelector(".pc-status");
-      el.innerHTML = `<div class="dim">测试中…</div>`;
+      const btn = card.querySelector(".pc-test");
+      btn.disabled = true; btn.textContent = "测试中…";
+      el.innerHTML = `<div class="dim">正在保存配置并真实请求接口…</div>`;
       try {
+        // 先把表单里填的保存下来再测,避免「填了没保存」白测一场
+        await post({ provider: name, fields: collectFields(card) });
         const r = await api("/api/settings/test", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ provider: name }),
         });
-        el.innerHTML = checksHtml(r.results) +
-          (r.extra ? `<div class="dim">${esc(r.extra)}</div>` : "");
+        el.innerHTML = checksHtml(r.results) + (r.extra
+          ? `<div class="${r.ok ? "ok" : "miss"}">${esc(r.extra)}</div>` : "");
+        const bad = (r.results || []).find((x) => !x.ok);
+        showToast(r.ok ? "✓ 测试通过,该产线已就绪"
+          : `✗ 测试未通过:${r.extra || (bad && bad.reason) || "未知原因"}`,
+          r.ok ? "ok" : "error");
       } catch (e) {
         el.innerHTML = `<div class="miss">✗ ${esc(e.message)}</div>`;
+        showToast(`✗ 测试失败:${e.message}`, "error");
+      } finally {
+        btn.disabled = false; btn.textContent = "测试连接";
       }
     };
   });

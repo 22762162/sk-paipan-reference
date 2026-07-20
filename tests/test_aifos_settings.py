@@ -140,10 +140,13 @@ def test_cli_config_commands(tmp_path, capsys):
     assert main(["--workspace", ws, "config", "route",
                  "--capability", "video", "--chain", "nope"]) == 1
     capsys.readouterr()
-    # test:claude_api 配好 key → 就绪;jimeng 命令缺失 → 非零
+    # test:mock 无需外联 → 通过;claude_api 假 Key 真实 ping 必失败
     assert main(["--workspace", ws, "config", "test",
-                 "--provider", "claude_api"]) == 0
+                 "--provider", "mock"]) == 0
     assert "✓" in capsys.readouterr().out
+    assert main(["--workspace", ws, "config", "test",
+                 "--provider", "claude_api"]) == 1
+    assert "✗" in capsys.readouterr().out
     assert main(["--workspace", ws, "config", "set",
                  "--provider", "jimeng", "--enable"]) == 0
     capsys.readouterr()
@@ -190,9 +193,11 @@ def test_web_settings_endpoints(tmp_path):
         assert status == 200
         assert fresh["routing"]["video"] == ["ark", "jimeng", "mock"]
 
+        # 假 Key 会发真实 ping → 必须明确报失败(而不是显示配置正常)
         status, report = post("/api/settings/test",
                               {"provider": "claude_api"})
-        assert status == 200 and report["ok"] is True
+        assert status == 200 and report["ok"] is False
+        assert report["extra"] and "✗" in report["extra"]
         status, _ = post("/api/settings", {"provider": "不存在",
                                            "fields": {"enabled": True}})
         assert status == 400

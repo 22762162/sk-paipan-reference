@@ -159,18 +159,26 @@ def set_routing(config_path, capability, chain):
 
 
 def test_provider(app, name):
-    """连通性测试:逐能力 available 检查;即梦额外查实时余额。"""
+    """连通性测试:先查配置可用性,配好的 API Provider 再发真实请求。"""
     provider = app.router.providers.get(name)
     if provider is None:
         raise AifosError(f"未知 Provider: {name}")
     results = [{"capability": cap, "ok": bool(ok), "reason": reason or "就绪"}
                for cap in sorted(provider.capabilities)
                for ok, reason in [provider.available(cap)]]
+    ok_overall = all(r["ok"] for r in results)
     extra = None
     if provider.enabled and hasattr(provider, "credit"):
         try:
             extra = f"实时余额: {provider.credit()}"
         except Exception as exc:
             extra = f"余额查询失败: {exc}"
-    return {"provider": name, "ok": all(r["ok"] for r in results),
+    if ok_overall and hasattr(provider, "ping"):
+        try:
+            ping_ok, detail = provider.ping()
+        except Exception as exc:
+            ping_ok, detail = False, str(exc)
+        extra = ("✓ " if ping_ok else "✗ ") + detail
+        ok_overall = ok_overall and ping_ok
+    return {"provider": name, "ok": ok_overall,
             "results": results, "extra": extra}

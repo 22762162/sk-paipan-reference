@@ -71,6 +71,25 @@ class ClaudeApiProvider(Provider):
             return False, "未配置 api_key"
         return True, ""
 
+    def ping(self):
+        """真实连通性测试:发 1 token 的最小请求,返回 (ok, 说明)。"""
+        endpoint = (self.conf.get("endpoint")
+                    or self.DEFAULT_ENDPOINT).rstrip("/")
+        model = self.conf.get("model") or self.DEFAULT_MODEL
+        try:
+            _request_json(
+                self.name, f"{endpoint}/v1/messages",
+                headers={
+                    "x-api-key": self.conf["api_key"],
+                    "anthropic-version": "2023-06-01",
+                },
+                body={"model": model, "max_tokens": 1,
+                      "messages": [{"role": "user", "content": "ping"}]},
+                timeout=30)
+        except ProviderError as exc:
+            return False, str(exc)
+        return True, f"真实连通成功(model={model})"
+
     def generate(self, capability, payload, out_dir):
         try:
             prompt = build_prompt(capability, payload)
@@ -120,6 +139,21 @@ class OpenAIImageProvider(Provider):
         if not self.conf.get("api_key"):
             return False, "未配置 api_key"
         return True, ""
+
+    def ping(self):
+        """真实连通性测试:GET /v1/models 验证端点与 Key。"""
+        endpoint = (self.conf.get("endpoint")
+                    or self.DEFAULT_ENDPOINT).rstrip("/")
+        try:
+            reply = _request_json(
+                self.name, f"{endpoint}/v1/models",
+                headers={"Authorization": f"Bearer {self.conf['api_key']}"},
+                timeout=30)
+        except ProviderError as exc:
+            return False, str(exc)
+        count = len(reply.get("data") or [])
+        return True, ("真实连通成功" +
+                      (f"(可用模型 {count} 个)" if count else ""))
 
     def _size(self, payload):
         aspect = payload.get("aspect", "9:16")
@@ -216,6 +250,25 @@ class ArkVideoProvider(Provider):
         if not self.conf.get("api_key"):
             return False, "未配置 api_key"
         return True, ""
+
+    def ping(self):
+        """真实连通性测试:提交空任务,HTTP 400 = 端点可达且鉴权通过。"""
+        endpoint = (self.conf.get("endpoint")
+                    or self.DEFAULT_ENDPOINT).rstrip("/")
+        try:
+            _request_json(
+                self.name,
+                f"{endpoint}/api/v3/contents/generations/tasks",
+                {"Authorization": f"Bearer {self.conf['api_key']}"},
+                body={"model": self.conf.get("model") or self.DEFAULT_MODEL,
+                      "content": []},
+                timeout=30)
+        except ProviderError as exc:
+            message = str(exc)
+            if "HTTP 400" in message:
+                return True, "真实连通成功(端点可达,鉴权通过)"
+            return False, message
+        return True, "真实连通成功"
 
     def _frame_content(self, path, role):
         raw = Path(path).read_bytes()

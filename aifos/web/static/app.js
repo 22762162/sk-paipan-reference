@@ -347,32 +347,46 @@ function drawSettings(data) {
       } catch (e) { showToast(e.message, "error"); }
     };
   });
+  const collectFields = (card) => {
+    const fields = {};
+    card.querySelectorAll("[data-field]").forEach((input) => {
+      if (input.type === "checkbox") fields[input.dataset.field] = input.checked;
+      else if (input.value.trim() !== "") fields[input.dataset.field] = input.value.trim();
+    });
+    return fields;
+  };
   app.querySelectorAll(".provider-card").forEach((card) => {
     const name = card.dataset.provider;
     card.querySelector(".pc-save").onclick = async () => {
-      const fields = {};
-      card.querySelectorAll("[data-field]").forEach((input) => {
-        if (input.type === "checkbox") fields[input.dataset.field] = input.checked;
-        else if (input.value.trim() !== "") fields[input.dataset.field] = input.value.trim();
-      });
       try {
-        const fresh = await post({ provider: name, fields });
+        const fresh = await post({ provider: name, fields: collectFields(card) });
         showToast("已保存,下一次制作生效", "ok");
         drawSettings(fresh);
       } catch (e) { showToast(e.message, "error"); }
     };
     card.querySelector(".pc-test").onclick = async () => {
       const el = card.querySelector(".pc-status");
-      el.innerHTML = `<div class="dim">测试中…</div>`;
+      const btn = card.querySelector(".pc-test");
+      btn.disabled = true; btn.textContent = "测试中…";
+      el.innerHTML = `<div class="dim">正在保存配置并真实请求接口…</div>`;
       try {
+        // 先把表单里填的保存下来再测,避免「填了没保存」白测一场
+        await post({ provider: name, fields: collectFields(card) });
         const r = await api("/api/settings/test", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ provider: name }),
         });
-        el.innerHTML = checksHtml(r.results) +
-          (r.extra ? `<div class="dim">${esc(r.extra)}</div>` : "");
+        el.innerHTML = checksHtml(r.results) + (r.extra
+          ? `<div class="${r.ok ? "ok" : "miss"}">${esc(r.extra)}</div>` : "");
+        const bad = (r.results || []).find((x) => !x.ok);
+        showToast(r.ok ? "✓ 测试通过,该产线已就绪"
+          : `✗ 测试未通过:${r.extra || (bad && bad.reason) || "未知原因"}`,
+          r.ok ? "ok" : "error");
       } catch (e) {
         el.innerHTML = `<div class="miss">✗ ${esc(e.message)}</div>`;
+        showToast(`✗ 测试失败:${e.message}`, "error");
+      } finally {
+        btn.disabled = false; btn.textContent = "测试连接";
       }
     };
   });
