@@ -389,15 +389,62 @@ class Director:
         return f"e{ctx['episode']['number']:03d}_line{line_no:03d}"
 
     # ---- 图片生产清单:每张图的分类/提示词/实时状态(Web 实时可见) ----
-    def _portrait_prompt(self, name, role, style):
-        return f"角色立绘:{name}({role}),{style},全身,正面"
+    # 每类资产套件重点采用的人物设定字段(全用会超长,按图取材)
+    SHEET_DESIGN_KEYS = {
+        "turnaround": ("appearance", "hair", "costume", "palette"),
+        "closeup": ("appearance", "hair", "eyes", "temperament"),
+        "features": ("signature", "appearance", "hair", "palette"),
+        "makeup": ("makeup", "eyes", "palette"),
+        "costume": ("costume", "palette", "accessories"),
+        "costume_detail": ("costume_detail", "accessories"),
+    }
+    DESIGN_LABELS = (
+        ("appearance", "外貌"), ("hair", "发型"), ("eyes", "眼睛"),
+        ("temperament", "气质"), ("personality", "性格"),
+        ("makeup", "妆容"), ("costume", "服装"),
+        ("costume_detail", "服装细节"), ("accessories", "配饰"),
+        ("palette", "配色"), ("signature", "标志特征"))
+
+    def _design_line(self, design, keys=None):
+        """人物设定 → 提示词片段;keys 限定只取某几个字段。"""
+        if not design:
+            return ""
+        parts = []
+        for key, label in self.DESIGN_LABELS:
+            if keys is not None and key not in keys:
+                continue
+            value = str(design.get(key) or "").strip()
+            if value:
+                parts.append(f"{label}:{value}")
+        return ",".join(parts)
+
+    def _character_design(self, project_id, name):
+        row = self.assets.latest(project_id, "character", name)
+        if row is None:
+            return None
+        meta = row["meta"]
+        if isinstance(meta, str):
+            meta = json.loads(meta or "{}")
+        return (meta or {}).get("design")
+
+    def _portrait_prompt(self, name, role, style, design=None):
+        detail = self._design_line(
+            design, keys=("appearance", "hair", "eyes", "temperament",
+                          "personality", "costume", "palette"))
+        return (f"角色立绘:{name}({role}),{style}"
+                + (f",{detail},表情站姿体现其性格" if detail else "")
+                + ",全身,正面")
 
     def _scene_prompt(self, location, style):
         return f"场景概念图:{location},{style},空镜,氛围感"
 
-    def _sheet_prompt(self, name, role, style, label, desc):
-        return (f"角色{label}:{name}({role}),{style},{desc};"
-                "与立绘同一人物、同一发型服装配色,严格保持形象一致")
+    def _sheet_prompt(self, name, role, style, label, desc, key=None,
+                      design=None):
+        detail = self._design_line(
+            design, keys=self.SHEET_DESIGN_KEYS.get(key))
+        return (f"角色{label}:{name}({role}),{style},{desc}"
+                + (f";人物设定:{detail}" if detail else "")
+                + ";与立绘同一人物、同一发型服装配色,严格保持形象一致")
 
     def _plan_path(self, ctx):
         return ctx["out_root"] / "render_plan.json"
@@ -633,6 +680,49 @@ class Director:
         return {"version": version, "shots": len(storyboard["shots"]),
                 "pipeline_version": storyboard["pipeline_version"]}
 
+    def _ensure_character_designs(self, ctx, characters):
+        """人物设定:编剧 AI 为每个角色写性格/外貌/妆容/服装细节。
+        项目级一次生成(存 character 资产 meta),跨集复用保证形象一致;
+        缺谁补谁,占位产线也会给出具体可画的设定。"""
+        project_id = ctx["project"]["id"]
+        designs, missing = {}, []
+        for character in characters:
+            name = character["name"]
+            design = self._character_design(project_id, name)
+            if design:
+                designs[name] = design
+            else:
+                missing.append(character)
+        if not missing:
+            return designs
+        result = self._call(ctx, "script", {
+            "character_design": True,
+            "project_title": ctx["project"]["title"],
+            "style": ctx["project"]["style"] or "",
+            "logline": (ctx.get("script") or {}).get("logline", ""),
+            "characters": [{"name": c["name"],
+                            "role": c.get("role", "")}
+                           for c in missing],
+        }, "script")
+        by_name = {d.get("name"): d
+                   for d in result.data.get("designs", [])}
+        for character in missing:
+            name = character["name"]
+            design = by_name.get(name)
+            if not design:
+                continue
+            self.assets.register(
+                project_id, "character", name,
+                meta={"role": character.get("role", ""),
+                      "design": design}, new_version=True)
+            designs[name] = design
+        if designs:
+            self.log.info(
+                "director",
+                "人物设定已就绪(性格/外貌/妆容/服装细节),"
+                f"覆盖角色: {'、'.join(designs)}")
+        return designs
+
     def _stage_cast(self, ctx):
         """人物立绘与场景概念图:项目级资产,跨集复用保证形象一致。"""
         project_id = ctx["project"]["id"]
@@ -642,12 +732,16 @@ class Director:
         for scene in ctx["script"]["scenes"]:
             if scene["location"] not in locations:
                 locations.append(scene["location"])
+        # 先由编剧 AI 写人物设定(性格/外貌/妆容/服装细节),
+        # 立绘与全部资产套件的提示词据此丰富;项目级一次,跨集复用
+        designs = self._ensure_character_designs(ctx, characters)
         self._plan_seed(ctx, "character_art", [
             {"id": f"char:{c['name']}", "category": "character_art",
              "label": f"{c['name']}({c.get('role') or '角色'})",
              "name": c["name"],
              "prompt": self._portrait_prompt(
-                 c["name"], c.get("role", ""), style)}
+                 c["name"], c.get("role", ""), style,
+                 design=designs.get(c["name"]))}
             for c in characters])
         self._plan_seed(ctx, "character_sheet", [
             {"id": f"sheet:{c['name']}:{key}",
@@ -655,7 +749,8 @@ class Director:
              "label": f"{c['name']} · {label}",
              "name": c["name"], "sheet": key,
              "prompt": self._sheet_prompt(
-                 c["name"], c.get("role", ""), style, label, desc)}
+                 c["name"], c.get("role", ""), style, label, desc,
+                 key=key, design=designs.get(c["name"]))}
             for c in characters
             for key, label, desc in CHARACTER_SHEETS])
         self._plan_seed(ctx, "scene_art", [
@@ -682,7 +777,8 @@ class Director:
                 ctx, "image", {
                     "portrait": True, "art_name": name, "role": role,
                     "shot_no": 0, "characters": [name], "location": "",
-                    "prompt": self._portrait_prompt(name, role, style),
+                    "prompt": self._portrait_prompt(
+                        name, role, style, design=designs.get(name)),
                     "style": style,
                     "reference_images": reference,
                     "aspect": ctx["aspect"], **ctx["dims"],
@@ -717,7 +813,8 @@ class Director:
                             "shot_no": 0, "characters": [name],
                             "location": "",
                             "prompt": self._sheet_prompt(
-                                name, role, style, label, desc),
+                                name, role, style, label, desc,
+                                key=key, design=designs.get(name)),
                             "style": style,
                             "character_refs": (
                                 [portrait_uri] if portrait_uri else []),
@@ -1344,7 +1441,8 @@ class Director:
             role = next((c.get("role", "") for c in script["characters"]
                          if c["name"] == name), "")
             prompt = prompt_override or self._portrait_prompt(
-                name, role, style)
+                name, role, style,
+                design=self._character_design(project["id"], name))
             result = self._plan_run(ctx, f"char:{name}", lambda: self._call(
                 ctx, "image", {
                     "portrait": True, "art_name": name, "role": role,
@@ -1377,7 +1475,8 @@ class Director:
                             if portrait and portrait["uri"]
                             and Path(portrait["uri"]).exists() else None)
             prompt = prompt_override or self._sheet_prompt(
-                name, role, style, label, desc)
+                name, role, style, label, desc, key=sheet_key,
+                design=self._character_design(project["id"], name))
             result = self._plan_run(
                 ctx, f"sheet:{name}:{sheet_key}", lambda: self._call(
                     ctx, "image", {

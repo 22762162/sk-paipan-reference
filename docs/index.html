@@ -1678,6 +1678,39 @@ textarea:focus-visible, select:focus-visible {
   .standard-nav { top: calc(56px + env(safe-area-inset-top)); }
 }
 
+/* ---- 人物设定展示 + 图片灯箱 ---- */
+.design-box { margin: 4px 0 10px; }
+.design-box summary {
+  cursor: pointer; font-size: 12.5px; color: var(--ink-2);
+}
+.design-grid {
+  display: grid; gap: 6px 14px; margin-top: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  background: var(--surface-2); border: 1px solid var(--hairline);
+  border-radius: var(--radius); padding: 10px 12px;
+}
+.design-row { font-size: 12.5px; line-height: 1.7; display: flex; gap: 8px; }
+.design-row b { flex: 0 0 62px; color: var(--accent); font-weight: 650; }
+.design-row span { color: var(--ink-2); }
+.pc-media img.zoomable { cursor: zoom-in; }
+.img-lightbox { z-index: 300; }
+.lightbox-box {
+  position: relative; max-width: 92vw; max-height: 92vh;
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+}
+.lightbox-box img {
+  max-width: 92vw; max-height: 84vh; object-fit: contain;
+  border-radius: 12px; background: #000;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, .6);
+}
+.lightbox-box figcaption { color: var(--ink-2); font-size: 13px; }
+.lightbox-box .close {
+  position: absolute; top: -2px; right: -2px;
+  background: var(--surface-3); color: var(--ink);
+  border: 1px solid var(--hairline); border-radius: 8px;
+  padding: 6px 10px; cursor: pointer;
+}
+
 .demo-note {
   background: var(--surface-2); border-bottom: 1px solid var(--hairline);
   color: var(--ink-2); font-size: 12.5px; padding: 7px 20px;
@@ -5876,6 +5909,59 @@ async function showPlanOverlay(episodeId) {
 
 /* ================= 资产中心 =================
    人物资产套件/场景概念图/参考图:浏览、上传参考、替换、单张重画 */
+const DESIGN_LABELS_JS = [
+  ["personality", "性格"], ["temperament", "气质"], ["appearance", "外貌"],
+  ["hair", "发型"], ["eyes", "眼睛"], ["makeup", "妆容"],
+  ["costume", "服装"], ["costume_detail", "服装细节"],
+  ["accessories", "配饰"], ["palette", "配色"], ["signature", "标志特征"]];
+
+function designHtml(design) {
+  if (!design) return "";
+  const rows = DESIGN_LABELS_JS
+    .filter(([key]) => (design[key] || "").trim())
+    .map(([key, label]) =>
+      `<div class="design-row"><b>${label}</b><span>${esc(design[key])}</span></div>`);
+  if (!rows.length) return "";
+  const brief = [design.personality, design.temperament]
+    .filter(Boolean).join(" · ");
+  return `<details class="design-box">
+    <summary>🧬 人物设定${brief ? ` · ${esc(brief)}` : ""}(点开看全部,出图提示词按它生成)</summary>
+    <div class="design-grid">${rows.join("")}</div></details>`;
+}
+
+/* 图片点击放大(资产中心/参考图通用灯箱) */
+function showImageLightbox(url, label) {
+  if (!url) return;
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay img-lightbox";
+  overlay.innerHTML = `
+    <figure class="lightbox-box">
+      <img src="${esc(url)}" alt="${esc(label || "")}">
+      ${label ? `<figcaption>${esc(label)}</figcaption>` : ""}
+      <button class="close">关闭 Esc</button>
+    </figure>`;
+  const close = () => {
+    overlay.remove(); document.removeEventListener("keydown", onKey);
+  };
+  const onKey = (ev) => { if (ev.key === "Escape") close(); };
+  overlay.addEventListener("click", (ev) => {
+    if (ev.target === overlay) close();
+  });
+  overlay.querySelector(".close").onclick = close;
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(overlay);
+}
+
+function bindLightbox(container) {
+  container.querySelectorAll(".plan-card .pc-media img").forEach((img) => {
+    img.classList.add("zoomable");
+    img.onclick = () => {
+      const card = img.closest(".plan-card");
+      const label = card ? (card.querySelector(".pc-label") || {}).textContent : "";
+      showImageLightbox(img.src, (label || "").trim());
+    };
+  });
+}
 function assetCardHtml(ep, target, url, label, mock) {
   const img = url && !url.split("?")[0].endsWith(".json")
     ? `<img src="${esc(url)}" loading="lazy" alt="">`
@@ -5965,6 +6051,7 @@ async function renderAssetsCenter(selectedTitle) {
         const sheets = (art.character_sheets || {})[c.name] || [];
         return `<div class="char-suite">
           <h3>${esc(c.name)} <span class="dim">${esc(c.role || "")}</span></h3>
+          ${designHtml(c.design)}
           <div class="pb-grid">
             ${assetCardHtml(ep, { kind: "character_art", name: c.name },
                             c.url, "立绘", isMock(`char:${c.name}`))}
@@ -5988,6 +6075,7 @@ async function renderAssetsCenter(selectedTitle) {
   document.getElementById("asset-project").onchange = (ev) =>
     renderAssetsCenter(ev.target.value);
   const reload = () => renderAssetsCenter(title);
+  bindLightbox(app);
   if (ep) {
     bindRegen(app, ep.id, () => null, reload);
     bindIo(app, ep.id, reload);

@@ -2109,6 +2109,59 @@ async function showPlanOverlay(episodeId) {
 
 /* ================= 资产中心 =================
    人物资产套件/场景概念图/参考图:浏览、上传参考、替换、单张重画 */
+const DESIGN_LABELS_JS = [
+  ["personality", "性格"], ["temperament", "气质"], ["appearance", "外貌"],
+  ["hair", "发型"], ["eyes", "眼睛"], ["makeup", "妆容"],
+  ["costume", "服装"], ["costume_detail", "服装细节"],
+  ["accessories", "配饰"], ["palette", "配色"], ["signature", "标志特征"]];
+
+function designHtml(design) {
+  if (!design) return "";
+  const rows = DESIGN_LABELS_JS
+    .filter(([key]) => (design[key] || "").trim())
+    .map(([key, label]) =>
+      `<div class="design-row"><b>${label}</b><span>${esc(design[key])}</span></div>`);
+  if (!rows.length) return "";
+  const brief = [design.personality, design.temperament]
+    .filter(Boolean).join(" · ");
+  return `<details class="design-box">
+    <summary>🧬 人物设定${brief ? ` · ${esc(brief)}` : ""}(点开看全部,出图提示词按它生成)</summary>
+    <div class="design-grid">${rows.join("")}</div></details>`;
+}
+
+/* 图片点击放大(资产中心/参考图通用灯箱) */
+function showImageLightbox(url, label) {
+  if (!url) return;
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay img-lightbox";
+  overlay.innerHTML = `
+    <figure class="lightbox-box">
+      <img src="${esc(url)}" alt="${esc(label || "")}">
+      ${label ? `<figcaption>${esc(label)}</figcaption>` : ""}
+      <button class="close">关闭 Esc</button>
+    </figure>`;
+  const close = () => {
+    overlay.remove(); document.removeEventListener("keydown", onKey);
+  };
+  const onKey = (ev) => { if (ev.key === "Escape") close(); };
+  overlay.addEventListener("click", (ev) => {
+    if (ev.target === overlay) close();
+  });
+  overlay.querySelector(".close").onclick = close;
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(overlay);
+}
+
+function bindLightbox(container) {
+  container.querySelectorAll(".plan-card .pc-media img").forEach((img) => {
+    img.classList.add("zoomable");
+    img.onclick = () => {
+      const card = img.closest(".plan-card");
+      const label = card ? (card.querySelector(".pc-label") || {}).textContent : "";
+      showImageLightbox(img.src, (label || "").trim());
+    };
+  });
+}
 function assetCardHtml(ep, target, url, label, mock) {
   const img = url && !url.split("?")[0].endsWith(".json")
     ? `<img src="${esc(url)}" loading="lazy" alt="">`
@@ -2198,6 +2251,7 @@ async function renderAssetsCenter(selectedTitle) {
         const sheets = (art.character_sheets || {})[c.name] || [];
         return `<div class="char-suite">
           <h3>${esc(c.name)} <span class="dim">${esc(c.role || "")}</span></h3>
+          ${designHtml(c.design)}
           <div class="pb-grid">
             ${assetCardHtml(ep, { kind: "character_art", name: c.name },
                             c.url, "立绘", isMock(`char:${c.name}`))}
@@ -2221,6 +2275,7 @@ async function renderAssetsCenter(selectedTitle) {
   document.getElementById("asset-project").onchange = (ev) =>
     renderAssetsCenter(ev.target.value);
   const reload = () => renderAssetsCenter(title);
+  bindLightbox(app);
   if (ep) {
     bindRegen(app, ep.id, () => null, reload);
     bindIo(app, ep.id, reload);

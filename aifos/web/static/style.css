@@ -1669,3 +1669,36 @@ textarea:focus-visible, select:focus-visible {
   #app { min-height: calc(100dvh - 56px - env(safe-area-inset-top)); }
   .standard-nav { top: calc(56px + env(safe-area-inset-top)); }
 }
+
+/* ---- 人物设定展示 + 图片灯箱 ---- */
+.design-box { margin: 4px 0 10px; }
+.design-box summary {
+  cursor: pointer; font-size: 12.5px; color: var(--ink-2);
+}
+.design-grid {
+  display: grid; gap: 6px 14px; margin-top: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  background: var(--surface-2); border: 1px solid var(--hairline);
+  border-radius: var(--radius); padding: 10px 12px;
+}
+.design-row { font-size: 12.5px; line-height: 1.7; display: flex; gap: 8px; }
+.design-row b { flex: 0 0 62px; color: var(--accent); font-weight: 650; }
+.design-row span { color: var(--ink-2); }
+.pc-media img.zoomable { cursor: zoom-in; }
+.img-lightbox { z-index: 300; }
+.lightbox-box {
+  position: relative; max-width: 92vw; max-height: 92vh;
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+}
+.lightbox-box img {
+  max-width: 92vw; max-height: 84vh; object-fit: contain;
+  border-radius: 12px; background: #000;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, .6);
+}
+.lightbox-box figcaption { color: var(--ink-2); font-size: 13px; }
+.lightbox-box .close {
+  position: absolute; top: -2px; right: -2px;
+  background: var(--surface-3); color: var(--ink);
+  border: 1px solid var(--hairline); border-radius: 8px;
+  padding: 6px 10px; cursor: pointer;
+}

@@ -281,10 +281,14 @@ def _collect_artifacts(app, project_id, ep_num):
             latest[row["name"]] = row
         return latest.values()
 
+    designs = {
+        row["name"]: json.loads(row["meta"] or "{}").get("design")
+        for row in latest_rows("character")}
     out["cast_art"] = [
         {"name": row["name"],
          "url": _versioned(_artifact_url(app, row["uri"]), row),
-         "role": json.loads(row["meta"]).get("role", "")}
+         "role": json.loads(row["meta"]).get("role", ""),
+         "design": designs.get(row["name"])}
         for row in latest_rows("character_art")]
     out["scene_art"] = [
         {"name": row["name"],

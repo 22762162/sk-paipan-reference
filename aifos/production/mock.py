@@ -178,10 +178,61 @@ class MockProvider(Provider):
 
     # ---- 剧本:按题材分流(偶像/都市/校园/仙侠) ----
     def _gen_script(self, payload, out_dir):
+        if payload.get("character_design"):
+            return self._gen_character_design(payload, out_dir)
         genre = _detect_genre(payload)
         if genre == "idol":
             return self._gen_idol_script(payload, out_dir)
         return self._gen_drama_script(payload, out_dir, genre)
+
+    # ---- 人物设定:占位版也给出具体可画的丰富描述 ----
+    DESIGN_POOLS = {
+        "personality": ["外冷内热,神态克制,眼神却藏锋",
+                       "活泼张扬,嘴角常带笑,站姿重心随性",
+                       "沉稳可靠,表情不多但目光坚定",
+                       "亦正亦邪,似笑非笑,气场压人"],
+        "temperament": ["清冷疏离", "明快灵动", "温润如玉", "凌厉威压"],
+        "appearance": ["瓜子脸,冷白皮,身形挺拔修长(八头身)",
+                      "圆脸带婴儿肥,健康小麦色,身形娇小灵活",
+                      "方正轮廓,古铜肤色,肩宽背直",
+                      "锋利下颌线,苍白肤色,清瘦高挑"],
+        "hair": ["墨黑长发高马尾,发尾微卷,额前碎发",
+                "栗色双丸子头,缀红绳", "银白短发,鬓角利落",
+                "深紫长发披肩,一缕挑染"],
+        "eyes": ["狭长丹凤眼,琥珀瞳,眼神清亮",
+                "圆杏眼,深棕瞳,笑时弯成月牙",
+                "细长剑眉压目,墨黑瞳", "上挑桃花眼,绯红瞳,妖气"],
+        "makeup": ["淡妆,眼尾一点朱砂,唇色豆沙",
+                  "元气妆,腮红明显,唇色蜜桃",
+                  "素面无妆,眉形浓正", "烟熏眼影,唇色暗红"],
+        "costume": ["交领束腰长衫,外罩纱质大氅,层次三层",
+                   "短打劲装配护腕,束腿裤,轻便利落",
+                   "宽袖道袍,腰悬玉牌,内衬素白",
+                   "玄色长袍金线滚边,高领半遮面"],
+        "costume_detail": ["袖口云纹刺绣,盘扣为铜钱式,靴面暗纹",
+                         "衣摆虎头补丁,草编腰带,布鞋",
+                         "领口锁子纹,玉牌刻符,云头履",
+                         "金线蟒纹,肩甲鎏金,长靴嵌铆钉"],
+        "accessories": ["青玉发簪,腕间佛珠", "红绳铃铛,背小竹篓",
+                       "铜制罗盘,腰间酒葫芦", "赤金耳坠,指骨戒"],
+        "palette": ["月白+黛青,点缀朱砂红", "藕荷+鹅黄,点缀草绿",
+                   "玄黑+石青,点缀鎏金", "绛紫+暗金,点缀猩红"],
+        "signature": ["左眼下泪痣", "笑起来的虎牙", "眉骨旧疤",
+                     "颈侧妖纹"],
+    }
+
+    def _gen_character_design(self, payload, out_dir):
+        seed = _digest(payload)
+        designs = []
+        for idx, character in enumerate(payload.get("characters", [])):
+            design = {"name": character.get("name", "")}
+            for f_no, (field, pool) in enumerate(
+                    sorted(self.DESIGN_POOLS.items())):
+                design[field] = _pick(pool, seed, idx * 13 + f_no)
+            designs.append(design)
+        data = {"designs": designs}
+        uri = _json_artifact(out_dir / "character_designs.json", data)
+        return data, uri
 
     def _gen_drama_script(self, payload, out_dir, genre):
         flavor = DRAMA_FLAVORS[genre]

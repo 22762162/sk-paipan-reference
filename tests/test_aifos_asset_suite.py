@@ -213,3 +213,75 @@ def test_regen_always_produces_new_image(app):
         encoding="utf-8")
     assert before != first
     assert first != second      # 同意见再画一次也必须换新画面
+
+
+def test_character_designs_enrich_prompts(app):
+    """编剧 AI 人物设定:性格/外貌/服装细节进入立绘与套件提示词。"""
+    project = _preproduce(app)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    name = script["characters"][0]["name"]
+    design = app.director._character_design(project["id"], name)
+    assert design, "人物设定未生成"
+    for field in ("personality", "appearance", "costume", "makeup",
+                  "palette", "signature"):
+        assert design.get(field), f"设定缺少 {field}"
+    plan = json.loads(
+        (app.workspace.artifacts_dir / f"p{project['id']:03d}" / "e001"
+         / "render_plan.json").read_text(encoding="utf-8"))
+    portrait = next(i for i in plan["items"] if i["id"] == f"char:{name}")
+    assert design["personality"] in portrait["prompt"]
+    assert design["costume"] in portrait["prompt"]
+    makeup = next(i for i in plan["items"]
+                  if i["id"] == f"sheet:{name}:makeup")
+    assert design["makeup"] in makeup["prompt"]
+    detail = next(i for i in plan["items"]
+                  if i["id"] == f"sheet:{name}:costume_detail")
+    assert design["costume_detail"] in detail["prompt"]
+
+
+def test_character_designs_reused_across_episodes(app):
+    """人物设定项目级复用:第二集不重新生成,形象稳定。"""
+    project = _preproduce(app)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    name = script["characters"][0]["name"]
+    first = app.director._character_design(project["id"], name)
+    _preproduce(app, number=2)
+    assert app.director._character_design(project["id"], name) == first
+
+
+def test_design_prompt_and_validation(tmp_path):
+    """Claude 设定提示词与校验:名单齐全,空泛设定被拒。"""
+    from aifos.adapters.claude_script import (build_prompt,
+                                              validate_script)
+    payload = {"character_design": True, "project_title": "雪夜狐仙",
+               "style": "水墨国风",
+               "characters": [{"name": "洛尘", "role": "主角"}]}
+    prompt = build_prompt("script", payload)
+    assert "人物设定" in prompt and "洛尘" in prompt and "designs" in prompt
+    ok = {"designs": [{"name": "洛尘", "personality": "外冷内热",
+                       "appearance": "瓜子脸冷白皮", "costume": "交领长衫"}]}
+    assert validate_script(ok, payload) is None
+    assert ok["designs"][0]["makeup"] == ""      # 缺省字段自动补空
+    bad = {"designs": [{"name": "洛尘", "personality": "好"}]}
+    assert "空泛" in validate_script(bad, payload)
+    missing = {"designs": [{"name": "别人", "personality": "x",
+                            "appearance": "y", "costume": "z"}]}
+    assert "缺少角色设定" in validate_script(missing, payload)
+
+
+def test_asset_center_has_design_and_lightbox():
+    """资产中心展示人物设定,图片可点击放大。"""
+    root = Path(__file__).resolve().parents[1]
+    app_js = (root / "aifos/web/static/app.js").read_text(encoding="utf-8")
+    css = (root / "aifos/web/static/style.css").read_text(encoding="utf-8")
+    assert "function designHtml" in app_js
+    assert "function showImageLightbox" in app_js
+    assert "bindLightbox(app)" in app_js
+    assert ".lightbox-box img" in css
+    assert "cursor: zoom-in" in css

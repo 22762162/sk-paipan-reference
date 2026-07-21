@@ -89,6 +89,8 @@ def extract_json(text):
 
 
 def validate_script(script, payload):
+    if payload.get("character_design"):
+        return validate_design(script, payload)
     if not isinstance(script, dict):
         return "输出不是 JSON 对象"
     if not script.get("scenes"):
@@ -134,8 +136,64 @@ def validate_storyboard(storyboard):
     return None
 
 
+DESIGN_PROMPT = """你是漫剧人物设定师。为作品《{title}》的角色写生产级人物设定,
+供 AI 出图使用(立绘/四视图/特写/妆容/服装设定全部依据它)。
+画风:{style}。剧情梗概:{logline}。
+
+角色名单(全部要写,名字必须逐字一致):{names}
+
+要求:
+- 每个字段是一段具体、可画出来的描述(不要空话套话);
+- 性格要能从表情神态与站姿体现;外貌含脸型/肤色/身材比例;
+- 服装要具体到款式、材质、层次;配色给出主色与点缀色;
+- 只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块。
+
+JSON 格式:
+{{"designs": [{{
+  "name": "角色名", "personality": "性格(外化到神态)",
+  "temperament": "气质", "appearance": "外貌(脸型/肤色/身材)",
+  "hair": "发型发色", "eyes": "眼睛(形状/瞳色/眼神)",
+  "makeup": "妆容细节", "costume": "服装(款式/材质/层次)",
+  "costume_detail": "服装细节(纹样/扣饰/鞋履)",
+  "accessories": "配饰", "palette": "主配色与点缀色",
+  "signature": "标志性辨识特征"}}]}}"""
+
+# 人物设定必填字段;缺失时置空串,提示词侧自动跳过
+DESIGN_FIELDS = ("personality", "temperament", "appearance", "hair",
+                 "eyes", "makeup", "costume", "costume_detail",
+                 "accessories", "palette", "signature")
+
+
+def validate_design(data, payload):
+    designs = data.get("designs")
+    if not isinstance(designs, list) or not designs:
+        return "缺少 designs"
+    wanted = [c.get("name") for c in payload.get("characters", [])]
+    got = {d.get("name"): d for d in designs if d.get("name")}
+    missing = [n for n in wanted if n not in got]
+    if missing:
+        return f"缺少角色设定: {'、'.join(missing)}"
+    for design in designs:
+        for key in DESIGN_FIELDS:
+            design.setdefault(key, "")
+        if not (design.get("personality") and design.get("appearance")
+                and design.get("costume")):
+            return f"角色「{design.get('name')}」设定过于空泛" \
+                   "(personality/appearance/costume 必填)"
+    return None
+
+
 def build_prompt(capability, payload):
-    """构造编剧/分镜提示词(CLI 桥与 Claude API Provider 共用)。"""
+    """构造编剧/分镜/人物设定提示词(CLI 桥与 Claude API Provider 共用)。"""
+    if capability == "script" and payload.get("character_design"):
+        names = "、".join(
+            f"{c.get('name')}({c.get('role') or '角色'})"
+            for c in payload.get("characters", []))
+        return DESIGN_PROMPT.format(
+            title=payload.get("project_title", ""),
+            style=payload.get("style", "") or "国风漫剧",
+            logline=payload.get("logline", "") or "见角色名单",
+            names=names)
     if capability == "script":
         feedback = payload.get("feedback", "")
         if payload.get("template") == "idol":
