@@ -157,25 +157,37 @@ def _deep_merge(base, override):
 def _normalize_legacy(data):
     """兼容旧工作区：移除平台曾内置的低质量 macOS say 过渡产线。
 
-    只迁移 AIFOS 自己生成的旧桥接配置；用户手工注册的同名自定义
-    Provider 不动，避免升级时吞掉自定义能力。
+    覆盖两代遗留形态:更早的内置类型(type="say")与后来的桥接命令
+    (aifos.adapters.say_voice);用户手工注册的其他同名自定义
+    Provider 不动,避免升级时吞掉自定义能力。清除后同步剔除所有
+    路由链里的 say 引用,否则 router 每次请求都会告警刷日志。
     """
     providers = data.get("providers") or {}
     legacy_say = providers.get("say")
-    command = legacy_say.get("command") if isinstance(legacy_say, dict) else []
-    command_parts = command if isinstance(command, list) else [command]
-    command_text = " ".join(str(part) for part in command_parts)
-    builtin_signature = (
-        command_text == "python3 -m aifos.adapters.say_voice --voice Tingting"
-        and legacy_say.get("cost_per_call") == 0.0
-        and legacy_say.get("timeout") == 120
-    ) if isinstance(legacy_say, dict) else False
-    if not builtin_signature:
+    remove = False
+    if isinstance(legacy_say, dict):
+        command = legacy_say.get("command") or []
+        command_parts = command if isinstance(command, list) else [command]
+        command_text = " ".join(str(part) for part in command_parts)
+        builtin_signature = (
+            command_text == "python3 -m aifos.adapters.say_voice "
+                            "--voice Tingting"
+            and legacy_say.get("cost_per_call") == 0.0
+            and legacy_say.get("timeout") == 120)
+        # type="say" 是平台最早的内置类型,从未开放自定义,放心移除;
+        # 桥接命令形态只清除与内置完全一致的签名(自定义 --say 保留)
+        remove = legacy_say.get("type") == "say" or builtin_signature
+    if not remove:
         return data
     providers.pop("say", None)
     routing = data.get("routing") or {}
     if routing.get("voice") == ["jimeng", "say", "api", "mock"]:
         routing["voice"] = copy.deepcopy(DEFAULTS["routing"]["voice"])
+    for capability, chain in list(routing.items()):
+        if isinstance(chain, list) and "say" in chain:
+            cleaned = [name for name in chain if name != "say"]
+            routing[capability] = cleaned or copy.deepcopy(
+                DEFAULTS["routing"].get(capability, ["mock"]))
     return data
 
 

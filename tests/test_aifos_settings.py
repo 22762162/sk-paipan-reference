@@ -276,3 +276,22 @@ def test_web_settings_endpoints(tmp_path):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_config_load_migrates_oldest_say_type(tmp_path):
+    """最早一代内置 say(type="say")也要迁移:否则 router 每次请求
+    都告警"未知 provider 类型: say"刷爆产线日志。"""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "providers": {
+            "say": {"type": "say", "enabled": True,
+                    "capabilities": ["voice"]},
+        },
+        "routing": {"voice": ["say", "doubao_tts", "mock"],
+                    "edit": ["say"]},
+    }), encoding="utf-8")
+    migrated = Config.load(config_path)
+    assert "say" not in migrated.get("providers")
+    assert migrated.get("routing", "voice") == ["doubao_tts", "mock"]
+    # 链清空时落回默认,产线不断链
+    assert migrated.get("routing", "edit") == ["jianying", "mock"]
