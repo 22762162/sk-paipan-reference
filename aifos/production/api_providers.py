@@ -132,7 +132,7 @@ class OpenAIImageProvider(Provider):
     """
 
     DEFAULT_ENDPOINT = "https://api.openai.com"
-    DEFAULT_MODEL = "gpt-image-1"
+    DEFAULT_MODEL = "gpt-image-2"
 
     def available(self, capability):
         ok, reason = super().available(capability)

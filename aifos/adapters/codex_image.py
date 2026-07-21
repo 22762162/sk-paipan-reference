@@ -195,7 +195,7 @@ def run(request, codex, timeout, extra_args, plain=False):
         return {"ok": False,
                 "error": f"codex 未产出期望文件: {', '.join(missing)}"}
     return {"ok": True, "data": data, "uri": str(targets[0]),
-            "model": "codex/image_gen-managed (底层模型未披露)"}
+            "model": "gpt-image-2 (Codex 内置 image_gen)"}
 
 
 def main(argv=None):

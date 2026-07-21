@@ -2104,7 +2104,7 @@ window.__DEFAULT_STANDARD_FINGERPRINT__ = 'edd4f89f575f39f01568406ea902fb5abebfe
       image_api: { type: "image_api", label: "出图 API · OpenAI 兼容",
         enabled: false, capabilities: ["image", "frames", "cover"],
         endpoint: "https://api.openai.com", api_key: "",
-        model: "gpt-image-1" },
+        model: "gpt-image-2" },
       jimeng: { type: "dreamina", label: "即梦 CLI · 视频(自带配音)",
         enabled: false, capabilities: ["video"], command: "dreamina",
         model_version: "seedance2.0fast_vip", audio_in_video: true },
@@ -2302,7 +2302,7 @@ JSON 格式:{"project_title":"${project.title}","episode_number":${number},"epis
           "content-type": "application/json",
           authorization: `Bearer ${conf.api_key}`,
         },
-        body: JSON.stringify({ model: conf.model || "gpt-image-1",
+        body: JSON.stringify({ model: conf.model || "gpt-image-2",
           prompt, n: 1, size: sizeOf(aspect) }),
       });
     if (!r.ok)

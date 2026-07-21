@@ -169,4 +169,4 @@ def test_codex_bridge_declares_managed_model(monkeypatch, tmp_path):
         "out_dir": str(tmp_path),
     }, "codex", 30, [])
     assert reply["ok"] is True
-    assert reply["model"].startswith("codex/image_gen-managed")
+    assert reply["model"] == "gpt-image-2 (Codex 内置 image_gen)"

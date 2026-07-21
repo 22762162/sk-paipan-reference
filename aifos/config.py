@@ -90,7 +90,7 @@ DEFAULTS = {
             "type": "image_api", "enabled": False,
             "capabilities": ["image", "frames", "cover"],
             "endpoint": "https://api.openai.com", "api_key": "",
-            "model": "gpt-image-1",
+            "model": "gpt-image-2",
             "cost_per_call": 1.5, "timeout": 300,
         },
         "ark": {
