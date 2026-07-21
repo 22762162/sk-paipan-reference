@@ -74,8 +74,17 @@ def check_and_update(root, runner=None):
 
 
 def restart_process():
-    """原地重启同一条启动命令(aifos serve …),监听端口自动重挂。"""
-    os.execv(sys.executable, [sys.executable, *sys.argv])
+    """原地重启同一条启动命令(aifos serve …),监听端口自动重挂。
+
+    `python3 -m aifos` 启动时 sys.argv[0] 是包内 __main__.py 的路径,
+    直接 exec 会破坏相对导入;识别后重组回 -m 形式。"""
+    argv = list(sys.argv)
+    if argv and argv[0].endswith("__main__.py"):
+        package = Path(argv[0]).resolve().parent.name
+        args = [sys.executable, "-m", package, *argv[1:]]
+    else:
+        args = [sys.executable, *argv]
+    os.execv(sys.executable, args)
 
 
 def start_auto_updater(jobs_idle, on_log, interval=600, initial_delay=90):
