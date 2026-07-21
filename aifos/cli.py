@@ -620,7 +620,18 @@ def main(argv=None):
     if args.command == "serve":
         from .web.server import serve
         App(args.workspace).close()  # 确保工作区就绪
-        httpd = serve(args.workspace, host=args.host, port=args.port)
+        httpd = None
+        for offset in range(10):   # 端口被占自动顺延,免得启动直接失败
+            try:
+                httpd = serve(args.workspace, host=args.host,
+                              port=args.port + offset)
+                break
+            except OSError as exc:
+                print(f"端口 {args.port + offset} 不可用({exc}),试下一个 …")
+        if httpd is None:
+            print("连续 10 个端口都不可用;用 --port 指定一个空闲端口",
+                  file=sys.stderr)
+            return 1
         print(f"AIFOS 控制台: http://{args.host}:{httpd.server_address[1]}/")
         print("Ctrl+C 停止")
         try:
