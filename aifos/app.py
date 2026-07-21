@@ -7,6 +7,7 @@ from .config import Config
 from .data_center import DataCenter
 from .db import Database
 from .director import Director
+from .history_center import HistoryCenter
 from .ops_center import OpsCenter
 from .production.router import ProviderRouter
 from .project_center import ProjectCenter
@@ -40,6 +41,7 @@ class App:
         self.config = Config.load(
             self.workspace.config_path, overrides=config_overrides)
         self.db = Database(self.workspace.db_path)
+        self.history = HistoryCenter(self.db)
         self.standards = StandardCenter(self.db, self.config)
         self.logger = Logger(self.db, self.workspace.logs_dir, echo=echo_logs)
         self.system = SystemCenter(self.db, self.logger)

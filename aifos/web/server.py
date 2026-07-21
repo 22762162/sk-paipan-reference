@@ -8,6 +8,8 @@ API:
   GET  /api/assets?project=T    项目资产列表
   GET  /api/logs?limit=N        最近日志
   GET  /api/jobs  /api/jobs/<id>后台制作任务
+  GET  /api/history             持久生产历史(跨重启)
+  GET  /api/history/<id>        单次生产详情与阶段记录
   GET  /api/standards           当前制作标准 + 版本历史
   GET  /api/standards/export    导出不含密钥的制作标准包
   POST /api/produce             {"sentence": "开始制作《万妖图录》第15集"}
@@ -58,37 +60,61 @@ class JobRegistry:
         self._jobs = {}
         self._lock = threading.Lock()
         self._seq = 0
+        app = App(self.workspace)
+        try:
+            app.history.bootstrap()
+        finally:
+            app.close()
+
+    def _create_history(self, title, number, action, force=False,
+                        request=None):
+        app = App(self.workspace)
+        try:
+            return app.history.create_run(
+                title, number, action=action, force=force,
+                request=request, source="web")
+        finally:
+            app.close()
 
     def start(self, title, number, premise="", style="", force=False,
-              script=None, review=False, kind=None):
+              script=None, review=False, kind=None, action="produce"):
+        run_id = self._create_history(
+            title, number, action, force=force,
+            request={"premise": premise, "style": style,
+                     "review": bool(review), "kind": kind,
+                     "script_supplied": script is not None})
         with self._lock:
             self._seq += 1
             job_id = f"j{self._seq}"
             self._jobs[job_id] = {
                 "id": job_id, "status": "running",
                 "title": title, "episode": number, "force": force,
-                "started_at": time.time(),
+                "started_at": time.time(), "run_id": run_id,
             }
 
         def task(app):
             return app.director.produce(
                 title, number, premise=premise, style=style, force=force,
-                script=script, pause_for_confirm=review, kind=kind)
+                script=script, pause_for_confirm=review, kind=kind,
+                run_id=run_id)
 
         self._run(job_id, task)
         return job_id
 
-    def start_task(self, title, number, task):
+    def start_task(self, title, number, task, action="adjustment",
+                   request=None):
         """通用后台任务(打磨重写/重画)。task(app) → summary。"""
+        run_id = self._create_history(
+            title, number, action, request=request)
         with self._lock:
             self._seq += 1
             job_id = f"j{self._seq}"
             self._jobs[job_id] = {
                 "id": job_id, "status": "running",
                 "title": title, "episode": number,
-                "started_at": time.time(),
+                "started_at": time.time(), "run_id": run_id,
             }
-        self._run(job_id, task)
+        self._run(job_id, lambda app: task(app, run_id))
         return job_id
 
     def _run(self, job_id, task):
@@ -98,9 +124,13 @@ class JobRegistry:
                 summary = task(app)
                 self._jobs[job_id].update(
                     status="done", summary=summary, finished_at=time.time())
+                app.history.finish_run(
+                    self._jobs[job_id]["run_id"], summary=summary)
             except Exception as exc:  # 后台任务兜底,错误进任务状态
                 self._jobs[job_id].update(
                     status="failed", error=str(exc), finished_at=time.time())
+                app.history.finish_run(
+                    self._jobs[job_id]["run_id"], error=str(exc))
             finally:
                 app.close()
 
@@ -112,6 +142,13 @@ class JobRegistry:
     def list(self):
         return sorted(self._jobs.values(),
                       key=lambda j: j["started_at"], reverse=True)
+
+    def running_for(self, title, number):
+        with self._lock:
+            return [job for job in self._jobs.values()
+                    if job["status"] == "running"
+                    and job["title"] == title
+                    and int(job["episode"]) == int(number)]
 
 
 def _versioned(url, row):
@@ -362,6 +399,22 @@ def make_handler(workspace, jobs):
                     return self._json(self._with_app(
                         lambda app: [dict(r)
                                      for r in app.logger.tail(limit)]))
+                if route == "/api/history":
+                    limit = int(query.get("limit", ["200"])[0])
+                    status = query.get("status", [None])[0]
+                    action = query.get("action", [None])[0]
+                    search = query.get("q", [""])[0]
+                    return self._json(self._with_app(
+                        lambda app: app.history.list(
+                            limit=limit, status=status, action=action,
+                            query=search)))
+                match = re.match(r"^/api/history/(\d+)$", route)
+                if match:
+                    payload = self._with_app(
+                        lambda app: app.history.get(int(match.group(1))))
+                    if payload is None:
+                        return self._error(404, "历史记录不存在")
+                    return self._json(payload)
                 if route == "/api/jobs":
                     return self._json(jobs.list())
                 if route == "/api/standards":
@@ -643,7 +696,10 @@ def make_handler(workspace, jobs):
                 script=script,
                 review=bool(body.get("review", True)),
                 kind=body.get("kind")
-                if body.get("kind") in ("drama", "idol") else None)
+                if body.get("kind") in ("drama", "idol") else None,
+                action=("force_rebuild" if body.get("force") else
+                        "script_import" if script is not None else
+                        "produce"))
             return self._json(
                 {"job_id": job_id, "title": title,
                  "episode": int(number), "note": note}, status=202)
@@ -675,8 +731,10 @@ def make_handler(workspace, jobs):
             title, number, status = found
             # 剧本确认 → 继续预生产(画完人物/分镜再停一次);
             # 开拍确认 → 自动完成视频/配音/剪辑/质检
-            job_id = jobs.start(title, number,
-                                review=(status == "awaiting_script"))
+            job_id = jobs.start(
+                title, number, review=(status == "awaiting_script"),
+                action=("confirm_script" if status == "awaiting_script"
+                        else "confirm_preflight"))
             return self._json(
                 {"job_id": job_id, "phase": status}, status=202)
 
@@ -717,8 +775,9 @@ def make_handler(workspace, jobs):
             title, number = found
             job_id = jobs.start_task(
                 title, number,
-                lambda app: app.director.revise_script(
-                    title, number, feedback))
+                lambda app, run_id: app.director.revise_script(
+                    title, number, feedback, run_id=run_id),
+                action="revise_script", request={"feedback": feedback})
             return self._json({"job_id": job_id}, status=202)
 
         def _regen_image(self):
@@ -737,8 +796,10 @@ def make_handler(workspace, jobs):
             feedback = (body.get("feedback") or "").strip()
             job_id = jobs.start_task(
                 title, number,
-                lambda app: app.director.regen_image(
-                    title, number, target, feedback=feedback))
+                lambda app, run_id: app.director.regen_image(
+                    title, number, target, feedback=feedback),
+                action="regen_image",
+                request={"target": target, "feedback": feedback})
             return self._json({"job_id": job_id}, status=202)
 
         def _settings_update(self):
@@ -809,21 +870,39 @@ def make_handler(workspace, jobs):
             stable = {"done", "failed", "qc_failed", "created",
                       "awaiting_script", "awaiting_confirm"}
 
-            def task(app):
+            def inspect(app):
                 episode = app.projects.get_episode(int(body["episode_id"]))
                 if episode is None:
                     raise AifosError("剧集不存在")
                 if episode["status"] in stable:
                     raise AifosError("当前没有正在进行的生成")
-                app.projects.set_episode_status(episode["id"], "cancelling")
-                return episode["status"]
+                project = app.db.query_one(
+                    "SELECT * FROM projects WHERE id=?",
+                    (episode["project_id"],))
+                return dict(episode), project["title"]
 
             try:
-                previous = self._with_app(task)
+                episode, title = self._with_app(inspect)
             except AifosError as exc:
                 return self._error(400, str(exc))
+            active = jobs.running_for(title, episode["number"])
+            if not active:
+                landing = self._with_app(
+                    lambda app: app.history.recover_episode(
+                        episode["id"], "停止时未发现活动进程，已清理失联任务"))
+                return self._json({"status": landing,
+                                   "previous": episode["status"],
+                                   "recovered": True})
+
+            def cancel(app):
+                app.projects.set_episode_status(episode["id"], "cancelling")
+                for job in active:
+                    app.history.mark_cancelling(job.get("run_id"))
+
+            self._with_app(cancel)
             return self._json({"status": "cancelling",
-                               "previous": previous})
+                               "previous": episode["status"],
+                               "run_ids": [j.get("run_id") for j in active]})
 
         def _project_rename(self):
             body = self._read_body()

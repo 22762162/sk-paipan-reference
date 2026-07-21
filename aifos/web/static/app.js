@@ -13,6 +13,15 @@ let standardsDirty = false;
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmt = (n, d = 2) => n == null ? "-" : Number(n).toFixed(d);
+const dateTime = (ts) => ts ? new Date(Number(ts) * 1000).toLocaleString("zh-CN", {
+  month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
+}) : "-";
+const durationText = (seconds) => {
+  const value = Math.max(0, Number(seconds) || 0);
+  if (value < 60) return `${Math.round(value)} 秒`;
+  if (value < 3600) return `${Math.floor(value / 60)} 分 ${Math.round(value % 60)} 秒`;
+  return `${Math.floor(value / 3600)} 小时 ${Math.round(value % 3600 / 60)} 分`;
+};
 
 async function api(path, opts) {
   const res = await fetch(path, opts);
@@ -65,6 +74,21 @@ const STATUS_CN = {
   videos: "视频中", voices: "声音/口型", edit: "剪辑中",
   qc: "质检中", package: "包装中", archive: "沉淀中", running: "制作中",
 };
+const RUN_STATUS_CN = {
+  running: "运行中", cancelling: "停止中", completed: "完成",
+  paused: "阶段暂停", failed: "失败", stopped: "已停止",
+  interrupted: "意外中断",
+};
+const ACTION_CN = {
+  produce: "开始制作", script_import: "导入剧本制作",
+  confirm_script: "确认剧本后续产", confirm_preflight: "确认开拍后续产",
+  force_rebuild: "全部重做", revise_script: "修改剧本",
+  regen_image: "重画图片", adjustment: "制作调整",
+  legacy_import: "历史记录回填",
+};
+function runChip(status) {
+  return `<span class="run-status ${esc(status)}">${esc(RUN_STATUS_CN[status] || status)}</span>`;
+}
 function chip(status) {
   const cls = ["done", "failed", "qc_failed", "awaiting_confirm",
     "awaiting_script"].includes(status)
@@ -76,9 +100,11 @@ function chip(status) {
 function route() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   const standards = location.hash.match(/^#\/standards(?:\/([a-z_]+))?$/);
+  const history = location.hash.match(/^#\/history(?:\/(\d+))?$/);
   const m = location.hash.match(/^#\/episode\/(\d+)$/);
   const settings = location.hash === "#/settings";
-  const area = standards ? "standards" : settings ? "settings" : "dashboard";
+  const area = standards ? "standards" : history ? "history" :
+    settings ? "settings" : "dashboard";
   document.querySelectorAll(".main-nav a").forEach((link) => {
     const active = link.dataset.nav === area;
     link.classList.toggle("active", active);
@@ -86,9 +112,138 @@ function route() {
     else link.removeAttribute("aria-current");
   });
   if (standards) renderStandards(standards[1] || "production");
+  else if (history) renderHistory(history[1] ? Number(history[1]) : null);
   else if (m) renderCanvasView(Number(m[1]));
   else if (settings) renderSettings();
   else renderDashboard();
+}
+
+/* ================= 持久生产历史 ================= */
+const HISTORY_STAGE_CN = {
+  script: "剧本", continuity: "连续性圣经", cast: "人物/场景图",
+  storyboard: "五维分镜", images: "关键帧", text_assets: "文字锁定",
+  frames: "首尾帧", preflight: "生产门禁", videos: "Seedance 视频",
+  voices: "声音/口型", edit: "剪辑", qc: "三层质检",
+  package: "封面/标题", archive: "数据沉淀",
+};
+
+function historyTable(items) {
+  if (!items.length) return `<div class="history-empty">
+    <strong>没有符合条件的记录</strong><span>调整筛选条件，或开始一次新的制作。</span></div>`;
+  return `<div class="history-table-wrap"><table class="history-table">
+    <thead><tr><th>开始时间</th><th>作品 / 剧集</th><th>操作</th><th>结果</th>
+      <th>最后阶段</th><th class="num">耗时</th><th class="num">本次成本</th></tr></thead>
+    <tbody>${items.map((run) => `<tr>
+      <td><a class="history-time" href="#/history/${run.id}">${dateTime(run.started_at)}</a>
+        <small>#${run.id}${run.source === "migration" ? " · 旧记录" : ""}</small></td>
+      <td><a class="history-project" href="#/history/${run.id}">${esc(run.current_project || run.project_title)}</a>
+        <small>第 ${run.episode_number} 集${run.force ? " · 全部重做" : ""}</small></td>
+      <td><span class="action-tag">${esc(ACTION_CN[run.action] || run.action)}</span></td>
+      <td>${runChip(run.status)}${run.error ? `<small class="history-error-mini">${esc(run.error)}</small>` : ""}</td>
+      <td>${esc(HISTORY_STAGE_CN[run.last_stage] || run.last_stage || "尚未进入阶段")}
+        <small>${run.stage_count} 个阶段 · ${(run.providers || []).map(esc).join(" / ") || "无 Provider"}</small></td>
+      <td class="num">${durationText(run.duration_seconds)}</td>
+      <td class="num">${fmt(run.cost)}</td>
+    </tr>`).join("")}</tbody></table></div>`;
+}
+
+async function renderHistory(runId = null) {
+  topbarRight.innerHTML = `<span class="history-live">SQLite 持久记录 · 重启不丢失</span>`;
+  if (runId) return renderHistoryDetail(runId);
+  app.innerHTML = `<div class="loading">正在读取生产历史…</div>`;
+  let data;
+  try { data = await api("/api/history?limit=500"); }
+  catch (e) { app.innerHTML = `<div class="loading">历史加载失败：${esc(e.message)}</div>`; return; }
+  const s = data.stats;
+  app.innerHTML = `<div class="history-page">
+    <div class="history-hero">
+      <div><p class="eyebrow">PRODUCTION LEDGER</p><h1>生产历史</h1>
+        <p>每次开工、续产、重做、修改和失败都永久记录。点击任意记录查看阶段、Provider、耗时与错误。</p></div>
+      <div class="history-assurance"><b>持久化</b><span>记录保存在正式工作区数据库，不依赖浏览器或当前服务进程。</span></div>
+    </div>
+    <section class="history-kpis">
+      <div><span>全部运行</span><strong>${s.total}</strong></div>
+      <div><span>完成</span><strong>${s.completed}</strong></div>
+      <div><span>暂停待确认</span><strong>${s.paused}</strong></div>
+      <div><span>失败 / 中断</span><strong>${s.failed + s.interrupted}</strong></div>
+      <div><span>累计运行成本</span><strong>${fmt(s.total_cost)}</strong></div>
+    </section>
+    <section class="history-ledger panel">
+      <div class="history-toolbar">
+        <div><h2>运行台账</h2><p>新记录实时写入，旧剧集已自动回填。</p></div>
+        <label class="history-search"><span>搜索</span><input id="history-query" placeholder="作品名或集数"></label>
+        <label><span>状态</span><select id="history-status"><option value="">全部状态</option>
+          ${Object.entries(RUN_STATUS_CN).map(([value, label]) => `<option value="${value}">${label}</option>`).join("")}</select></label>
+        <label><span>操作</span><select id="history-action"><option value="">全部操作</option>
+          ${(data.filters.actions || []).map((value) => `<option value="${esc(value)}">${esc(ACTION_CN[value] || value)}</option>`).join("")}</select></label>
+      </div>
+      <div id="history-results">${historyTable(data.items)}</div>
+    </section>
+  </div>`;
+
+  const applyFilters = () => {
+    const query = document.getElementById("history-query").value.trim().toLowerCase();
+    const status = document.getElementById("history-status").value;
+    const action = document.getElementById("history-action").value;
+    const filtered = data.items.filter((run) => {
+      const haystack = `${run.current_project || run.project_title} ${run.episode_number}`.toLowerCase();
+      return (!query || haystack.includes(query)) && (!status || run.status === status) &&
+        (!action || run.action === action);
+    });
+    document.getElementById("history-results").innerHTML = historyTable(filtered);
+  };
+  document.getElementById("history-query").addEventListener("input", applyFilters);
+  document.getElementById("history-status").addEventListener("change", applyFilters);
+  document.getElementById("history-action").addEventListener("change", applyFilters);
+}
+
+async function renderHistoryDetail(runId) {
+  app.innerHTML = `<div class="loading">正在读取运行 #${runId}…</div>`;
+  let run;
+  try { run = await api(`/api/history/${runId}`); }
+  catch (e) { app.innerHTML = `<div class="loading">记录加载失败：${esc(e.message)}</div>`; return; }
+  const stages = (run.summary?.stages?.length ? run.summary.stages : run.tasks) || [];
+  const project = run.current_project || run.project_title;
+  app.innerHTML = `<div class="history-page history-detail-page">
+    <div class="history-detail-head">
+      <a href="#/history" class="back-link">← 返回全部历史</a>
+      <div class="history-detail-title"><div><p class="eyebrow">RUN #${run.id}</p>
+        <h1>${esc(project)} · 第 ${run.episode_number} 集</h1>
+        <p>${esc(ACTION_CN[run.action] || run.action)} · ${dateTime(run.started_at)}</p></div>${runChip(run.status)}</div>
+      <div class="history-detail-actions">
+        ${run.episode_id ? `<a class="button-link primary" href="#/episode/${run.episode_id}">打开本集</a>` : ""}
+        <a class="button-link" href="#/history">查看全部记录</a>
+      </div>
+    </div>
+    <section class="history-kpis detail-kpis">
+      <div><span>最终状态</span><strong>${esc(STATUS_CN[run.result_status] || RUN_STATUS_CN[run.status] || run.result_status || "-")}</strong></div>
+      <div><span>总耗时</span><strong>${durationText(run.duration_seconds)}</strong></div>
+      <div><span>本次成本</span><strong>${fmt(run.cost)}</strong></div>
+      <div><span>阶段</span><strong>${run.stage_count || stages.length}</strong></div>
+      <div><span>Provider</span><strong class="provider-value">${(run.providers || []).map(esc).join(" / ") || "-"}</strong></div>
+    </section>
+    ${run.error ? `<section class="history-error"><b>运行异常</b><p>${esc(run.error)}</p></section>` : ""}
+    <section class="history-detail-grid">
+      <div class="panel history-stage-panel"><div class="section-title"><div><h2>阶段时间线</h2><p>按实际执行顺序保留每一步结果。</p></div></div>
+        <ol class="run-timeline">${stages.length ? stages.map((stage, index) => {
+          const status = stage.status || "done";
+          const providers = Array.isArray(stage.providers) ? stage.providers.join(" / ") : stage.provider;
+          return `<li class="${esc(status)}"><span class="timeline-index">${String(index + 1).padStart(2, "0")}</span>
+            <div><div class="timeline-title"><b>${esc(stage.name || HISTORY_STAGE_CN[stage.stage] || stage.stage || "运行阶段")}</b>${runChip(status === "done" ? "completed" : status === "stopped" ? "stopped" : status === "interrupted" ? "interrupted" : status === "failed" ? "failed" : "running")}</div>
+            <p>${esc(providers || "无外部 Provider")} · 成本 ${fmt(stage.cost || 0)}${stage.error ? ` · ${esc(stage.error)}` : ""}</p></div></li>`;
+        }).join("") : `<li class="empty-stage"><span class="timeline-index">–</span><div><b>尚无阶段记录</b><p>任务可能在进入生产阶段前结束。</p></div></li>`}</ol>
+      </div>
+      <aside class="panel history-meta-panel"><h2>运行信息</h2><dl>
+        <div><dt>运行编号</dt><dd>#${run.id}</dd></div>
+        <div><dt>操作类型</dt><dd>${esc(ACTION_CN[run.action] || run.action)}</dd></div>
+        <div><dt>数据来源</dt><dd>${run.source === "migration" ? "旧记录自动回填" : "正式 Web 工作台"}</dd></div>
+        <div><dt>开始</dt><dd>${dateTime(run.started_at)}</dd></div>
+        <div><dt>结束</dt><dd>${dateTime(run.finished_at)}</dd></div>
+        <div><dt>最后阶段</dt><dd>${esc(HISTORY_STAGE_CN[run.last_stage] || run.last_stage || "-")}</dd></div>
+        <div><dt>强制重做</dt><dd>${run.force ? "是" : "否"}</dd></div>
+      </dl></aside>
+    </section>
+  </div>`;
 }
 
 /* ================= 制作标准中心 ================= */

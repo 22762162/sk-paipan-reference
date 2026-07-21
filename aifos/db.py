@@ -30,6 +30,37 @@ CREATE TABLE IF NOT EXISTS episodes(
   UNIQUE(project_id, number)
 );
 
+-- 每次生产/续产/重做/打磨的持久运行记录。Web Job 可以随服务重启消失，
+-- production_runs 作为用户可追溯的历史事实源永久保留。
+CREATE TABLE IF NOT EXISTS production_runs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  episode_id INTEGER REFERENCES episodes(id),
+  project_title TEXT NOT NULL,
+  episode_number INTEGER NOT NULL,
+  action TEXT NOT NULL DEFAULT 'produce',
+  source TEXT NOT NULL DEFAULT 'web',
+  status TEXT NOT NULL DEFAULT 'running',
+  result_status TEXT NOT NULL DEFAULT '',
+  force INTEGER NOT NULL DEFAULT 0,
+  cost REAL NOT NULL DEFAULT 0,
+  providers TEXT NOT NULL DEFAULT '',
+  stage_count INTEGER NOT NULL DEFAULT 0,
+  last_stage TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  request TEXT NOT NULL DEFAULT '{}',
+  summary TEXT NOT NULL DEFAULT '{}',
+  started_at REAL NOT NULL,
+  finished_at REAL,
+  updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS production_runs_started_idx
+ON production_runs(started_at DESC);
+CREATE INDEX IF NOT EXISTS production_runs_episode_idx
+ON production_runs(episode_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS production_runs_status_idx
+ON production_runs(status, started_at DESC);
+
 -- 剧本 / 分镜等结构化文档,按版本沉淀
 CREATE TABLE IF NOT EXISTS documents(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,6 +90,7 @@ CREATE TABLE IF NOT EXISTS assets(
 CREATE TABLE IF NOT EXISTS tasks(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   episode_id INTEGER NOT NULL REFERENCES episodes(id),
+  run_id INTEGER REFERENCES production_runs(id),
   stage TEXT NOT NULL,
   name TEXT NOT NULL,
   status TEXT NOT NULL,
@@ -150,6 +182,7 @@ MIGRATIONS = [
     ("projects", "kind", "TEXT NOT NULL DEFAULT 'drama'"),
     ("projects", "account", "TEXT NOT NULL DEFAULT ''"),
     ("projects", "aspect", "TEXT NOT NULL DEFAULT ''"),
+    ("tasks", "run_id", "INTEGER REFERENCES production_runs(id)"),
 ]
 
 

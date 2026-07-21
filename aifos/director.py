@@ -95,7 +95,7 @@ class Director:
     # ---- 入口:一句话开工 ----
     def produce(self, project_title, episode_number, premise="", style="",
                 force=False, script=None, pause_for_confirm=False,
-                kind=None, feedback=""):
+                kind=None, feedback="", run_id=None):
         """force=False 时增量生产:已有且落盘完好的产物直接复用,
         只补齐缺失部分——真实产线(即梦按镜头计费)断点续产的关键。
         script:用户自带剧本(标准 JSON);提供时跳过 AI 编剧,
@@ -136,6 +136,7 @@ class Director:
             "feedback": feedback,
             "production_standard": standard_snapshot,
             "production_profile": profile,
+            "run_id": run_id,
         }
         stage_reports = []
         failed = False
@@ -245,9 +246,10 @@ class Director:
         episode_id = ctx["episode"]["id"]
         ts = now()
         cur = self.db.execute(
-            "INSERT INTO tasks(episode_id, stage, name, status, created_at, "
-            "updated_at) VALUES(?,?,?,?,?,?)",
-            (episode_id, stage, stage_cn, "running", ts, ts))
+            "INSERT INTO tasks(episode_id, run_id, stage, name, status, "
+            "created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
+            (episode_id, ctx.get("run_id"), stage, stage_cn, "running", ts,
+             ts))
         task_id = cur.lastrowid
         # 用户点了停止(状态=cancelling)时不要覆盖停止信号
         current = self.projects.get_episode(episode_id)
@@ -993,7 +995,8 @@ class Director:
             meta=meta)
 
     # ---- 打磨:剧本意见重写 / 单张图片附意见重画 ----
-    def revise_script(self, project_title, episode_number, feedback):
+    def revise_script(self, project_title, episode_number, feedback,
+                      run_id=None):
         """按修改意见重写剧本并重跑预生产,回到待确认。"""
         project = self.projects.get_project(project_title)
         if project is not None:
@@ -1007,7 +1010,7 @@ class Director:
                     episode_id=episode["id"])
         return self.produce(
             project_title, episode_number, force=True,
-            pause_for_confirm=True, feedback=feedback)
+            pause_for_confirm=True, feedback=feedback, run_id=run_id)
 
     def regen_image(self, project_title, episode_number, target,
                     feedback=""):

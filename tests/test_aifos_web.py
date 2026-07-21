@@ -56,7 +56,9 @@ def _wait_job(port, job_id, timeout=60):
 def test_index_and_static(server):
     status, ctype, raw = _request(server["port"], "GET", "/")
     assert status == 200 and "text/html" in ctype
-    assert "AIFOS" in raw.decode("utf-8")
+    html = raw.decode("utf-8")
+    assert "AIFOS" in html
+    assert "历史记录" in html
     status, ctype, _ = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     status, ctype, _ = _request(server["port"], "GET", "/static/style.css")
@@ -160,6 +162,19 @@ def test_produce_flow_and_episode_api(server):
     job = _wait_job(port, reply["job_id"])
     assert job["status"] == "done"
     assert job["summary"]["status"] == "awaiting_script"
+
+    # 每次生产运行都立即沉淀到 SQLite，刷新或重启后仍可查看。
+    status, history = _json_request(port, "GET", "/api/history")
+    assert status == 200
+    assert history["stats"]["total"] == 1
+    run = history["items"][0]
+    assert run["status"] == "paused"
+    assert run["action"] == "produce"
+    status, run_detail = _json_request(
+        port, "GET", f"/api/history/{run['id']}")
+    assert status == 200
+    assert run_detail["summary"]["status"] == "awaiting_script"
+    assert run_detail["tasks"][0]["stage"] == "script"
 
     _, overview = _json_request(port, "GET", "/api/overview")
     assert overview["stats"]["episodes"] == 1
