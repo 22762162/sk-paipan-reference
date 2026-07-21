@@ -69,8 +69,10 @@ def _character(x, ground_y, scale, name, accent, show_name):
 
 def render_shot(width, height, seed, location, characters=None,
                 dialogue=None, shot_no=0, camera="", action="",
-                variant="key", annotations=False):
-    """variant: key | first | last(首尾帧带轻微位移,连播时产生动感)。"""
+                variant="key", annotations=False, watermark=True):
+    """variant: key | first | last(首尾帧带轻微位移,连播时产生动感)。
+    watermark=False 用于分镜关键帧/首尾帧:正式产线镜头画面不允许
+    任何画面文字(无字幕母版),占位标识改由界面清单红标承担。"""
     sky_top, sky_bottom, glow, far, near, accent = _theme(location, seed)
     shift = {"key": 0, "first": -1, "last": 1}.get(variant, 0)
     uid = f"g{seed % 99999}{shot_no}{variant}"
@@ -154,8 +156,27 @@ def render_shot(width, height, seed, location, characters=None,
             f"</text>")
     svg.append(f'<rect width="{width}" height="{height}" '
                f'fill="url(#{uid}v)"/>')
+    if watermark:
+        svg.append(_mock_watermark(width, height))
     svg.append("</svg>")
     return "".join(svg)
+
+
+def _mock_watermark(width, height):
+    """右下角占位标识:mock 产线画的是示意图,须与真实 AI 图区分。"""
+    fs = max(14, round(min(width, height) * 0.03))
+    pad = round(fs * 0.6)
+    label = "占位示意图 · 未接真实出图产线"
+    box_w = fs * len(label) + pad * 2
+    box_h = round(fs * 1.9)
+    x = width - box_w - pad
+    y = height - box_h - pad
+    return (
+        f'<rect x="{x}" y="{y}" width="{box_w}" height="{box_h}" '
+        f'rx="{box_h // 2}" fill="#000000" opacity="0.55"/>'
+        f'<text x="{x + box_w // 2}" y="{y + round(box_h * 0.68)}" '
+        f'text-anchor="middle" font-size="{fs}" fill="#ffb199">'
+        f"{label}</text>")
 
 
 def render_portrait(width, height, seed, name, role=""):
@@ -188,6 +209,7 @@ def render_portrait(width, height, seed, name, role=""):
             f'<text x="{cx}" y="{round(height * 0.198)}" '
             f'text-anchor="middle" font-size="{round(width * 0.055)}" '
             f'fill="{accent}">{escape(role)}</text>')
+    svg.append(_mock_watermark(width, height))
     svg.append("</svg>")
     return "".join(svg)
 

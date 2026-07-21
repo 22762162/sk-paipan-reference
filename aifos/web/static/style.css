@@ -1099,3 +1099,25 @@ textarea:focus-visible, select:focus-visible {
 }
 .plan-note { font-size: 11px; margin-top: 4px; }
 .plan-overlay { max-width: 780px; }
+
+/* ---- 真假产线透明:占位图标注与接线指引 ---- */
+.plan-badges { display: flex; align-items: center; gap: 6px; }
+.plan-st.st-real { background: var(--accent-soft); color: #7db4ef; }
+.plan-st.st-mock {
+  background: rgba(208, 59, 59, .22); color: #ef8f8f;
+  border: 1px solid rgba(208, 59, 59, .5);
+}
+.plan-item:has(.st-mock) { border-color: rgba(208, 59, 59, .45); }
+.plan-fallback {
+  color: var(--serious); font-size: 12px; margin-top: 4px;
+  line-height: 1.6; word-break: break-all;
+}
+.mock-warn {
+  display: flex; flex-direction: column; gap: 4px;
+  border: 1px solid rgba(208, 59, 59, .55);
+  background: rgba(208, 59, 59, .12);
+  border-radius: var(--radius); padding: 10px 14px; margin: 10px 0;
+}
+.mock-warn b { color: #ef8f8f; }
+.mock-warn span { color: var(--ink-2); font-size: 13px; line-height: 1.7; }
+.mock-warn a { color: var(--accent); font-weight: 650; }

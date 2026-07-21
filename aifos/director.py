@@ -365,6 +365,9 @@ class Director:
             if prev is not None:
                 item["status"] = prev.get("status", "pending")
                 item["error"] = prev.get("error", "")
+                for key in ("provider", "real", "fallbacks"):
+                    if key in prev:
+                        item[key] = prev[key]
                 if prev.get("custom_prompt"):
                     item["prompt"] = prev.get("prompt", item["prompt"])
                     item["custom_prompt"] = True
@@ -372,7 +375,7 @@ class Director:
         self._plan_write(ctx, plan)
 
     def _plan_mark(self, ctx, item_id, status, error="", prompt=None,
-                   only_pending=False):
+                   only_pending=False, extra=None):
         plan = self._plan_read(ctx)
         for item in plan["items"]:
             if item["id"] != item_id:
@@ -385,11 +388,14 @@ class Director:
             if prompt is not None and prompt != item.get("prompt"):
                 item["prompt"] = prompt
                 item["custom_prompt"] = True
+            if extra:
+                item.update(extra)
             self._plan_write(ctx, plan)
             return
 
     def _plan_run(self, ctx, item_id, fn, prompt=None):
-        """包住一次出图调用:生成中 → 完成/失败;手动停止落回排队。"""
+        """包住一次出图调用:生成中 → 完成/失败;手动停止落回排队。
+        完成时记录实际使用的产线(真实/占位)与回退原因,界面透明可见。"""
         self._plan_mark(ctx, item_id, "generating", prompt=prompt)
         try:
             result = fn()
@@ -399,7 +405,12 @@ class Director:
         except Exception as exc:
             self._plan_mark(ctx, item_id, "failed", error=str(exc)[:300])
             raise
-        self._plan_mark(ctx, item_id, "done")
+        extra = None
+        if getattr(result, "provider", None):
+            extra = {"provider": result.provider,
+                     "real": result.provider != "mock",
+                     "fallbacks": getattr(result, "fallbacks", [])}
+        self._plan_mark(ctx, item_id, "done", extra=extra)
         return result
 
     def _plan_seed_shots(self, ctx):

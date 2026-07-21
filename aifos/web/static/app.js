@@ -1456,6 +1456,24 @@ const PLAN_STATUS_CN = {
   pending: "排队中", generating: "生成中", done: "已完成",
   failed: "失败", reused: "复用已有",
 };
+const PROVIDER_LABEL = {
+  codex: "Codex CLI", image_api: "图片API", api: "通用API",
+  claude: "Claude CLI", claude_api: "Claude API", jimeng: "即梦CLI",
+  ark: "火山Ark", mock: "占位产线",
+};
+
+/* 占位图判定:mock 产线画的是灰底示意图,不是真实 AI 图 */
+function planIsMock(item) {
+  return item.status === "done" && item.real === false;
+}
+
+function planMockReasonHtml(item) {
+  const parts = (item.fallbacks || []).map((f) =>
+    `${PROVIDER_LABEL[f.provider] || f.provider}:${f.reason}`);
+  return parts.length
+    ? `<div class="plan-fallback">真实出图产线没接通,逐个回退:${esc(parts.join(";"))}</div>`
+    : "";
+}
 
 function planItemThumbs(data, item) {
   const art = data.artifacts || {};
@@ -1494,8 +1512,14 @@ function planItemHtml(data, item, editable) {
     <div class="plan-main">
       <div class="plan-row">
         <b>${esc(item.label)}</b>
+        <span class="plan-badges">
+        ${planIsMock(item) ? `<span class="plan-st st-mock">⚠ 占位图</span>`
+          : (item.provider && item.real
+            ? `<span class="plan-st st-real">${esc(PROVIDER_LABEL[item.provider] || item.provider)}</span>` : "")}
         <span class="plan-st st-${st}">${PLAN_STATUS_CN[st] || st}${item.custom_prompt ? " · 已改词" : ""}</span>
+        </span>
       </div>
+      ${planIsMock(item) ? planMockReasonHtml(item) : ""}
       ${item.error ? `<div class="plan-err">${esc(item.error)}</div>` : ""}
       <details class="plan-prompt"><summary>提示词</summary>
         <pre>${esc(item.prompt || "")}</pre></details>
@@ -1510,6 +1534,22 @@ function planItemHtml(data, item, editable) {
     </div></div>`;
 }
 
+/* 占位图警示条:真实出图产线没接通时,大字告知原因与接入方法 */
+function mockWarnHtml(data) {
+  const items = ((data.render_plan || {}).items) || [];
+  const mocks = items.filter(planIsMock);
+  if (!mocks.length) return "";
+  const reasons = [...new Set((mocks[0].fallbacks || []).map((f) =>
+    `${PROVIDER_LABEL[f.provider] || f.provider}(${f.reason})`))];
+  return `<div class="mock-warn">
+    <b>⚠️ ${mocks.length} 张图是内置占位示意图,不是真实 AI 生成的画面</b>
+    <span>真实出图产线未接通:${esc(reasons.join(";") || "未检测到可用产线")}。
+    接入方法:打开 <a href="#/settings">AI 设置</a> → 点「自动检测」接 Codex CLI,
+    或在「图片生成 API」粘贴 Key 保存;接好后回到本集点「全部重做」,
+    或在「🖼 图片清单」里单张重画。</span>
+  </div>`;
+}
+
 function renderPlanHtml(data, editable) {
   const items = ((data.render_plan || {}).items) || [];
   if (!items.length) return "";
@@ -1519,6 +1559,7 @@ function renderPlanHtml(data, editable) {
     (i) => ["done", "reused"].includes(i.status)).length;
   return `<div class="plan-panel">
     <h2>🖼 图片生产清单 <span class="dim">共 ${items.length} 张 · 已就绪 ${ready}</span></h2>
+    ${mockWarnHtml(data)}
     ${editable ? "" : `<div class="dim plan-hint">列表实时更新;要修改某张的提示词重画,等生成停下后点工具栏「🖼 图片清单」。</div>`}
     ${cats.map((cat) => {
       const list = items.filter((i) => i.category === cat);
@@ -1845,6 +1886,7 @@ async function renderCanvasView(episodeId) {
       <strong>${gates.filter((g) => g.passed).length}/${gates.length || 0} 门禁通过</strong>
       <a href="#/standards/history">查看制作标准</a>
     </div>
+    ${mockWarnHtml(data)}
     <div class="canvas-toolbar">
       <button id="btn-back">← 仪表盘</button>
       <span class="title">《${esc(ep.project_title || data.project.title)}》第${ep.number}集</span>

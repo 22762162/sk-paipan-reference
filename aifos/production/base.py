@@ -16,6 +16,9 @@ class ProviderResult:
     cost: float
     data: dict = field(default_factory=dict)
     uri: str = ""
+    # 路由回退轨迹:本次调用之前被跳过的真实产线及原因
+    # [{"provider": "codex", "reason": "命令不存在: codex"}, ...]
+    fallbacks: list = field(default_factory=list)
 
 
 class Provider:

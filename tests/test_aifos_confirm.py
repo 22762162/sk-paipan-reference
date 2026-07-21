@@ -196,6 +196,25 @@ def test_regen_image_prompt_override(app):
     assert item["prompt"] == "红衣持剑,雪夜屋顶,月光逆光,全身立绘"
 
 
+def test_plan_marks_mock_images_with_fallback_reason(app):
+    """真假产线透明:占位图必须标注 mock 与回退原因,SVG 自带水印。"""
+    app.director.produce("万妖图录", 1, pause_for_confirm=True)
+    app.director.produce("万妖图录", 1, pause_for_confirm=True)
+    plan = _plan_of(app, "万妖图录", 1)
+    done = [i for i in plan["items"] if i["status"] == "done"]
+    assert done
+    for item in done:
+        assert item["provider"] == "mock"
+        assert item["real"] is False
+        assert any(f["provider"] == "codex" for f in item["fallbacks"])
+    # 占位图片自带水印,播放器/画布里也能一眼识别
+    art = next(i for i in plan["items"]
+               if i["category"] == "character_art")
+    project = app.projects.get_project("万妖图录")
+    row = app.assets.latest(project["id"], "character_art", art["name"])
+    assert "占位示意图" in Path(row["uri"]).read_text(encoding="utf-8")
+
+
 def test_stop_interrupts_long_provider_call(tmp_path):
     """停止信号能在 2 秒级中断外部产线子进程,而不是等它跑完。"""
     import stat

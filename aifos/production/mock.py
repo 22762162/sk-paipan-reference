@@ -392,6 +392,7 @@ class MockProvider(Provider):
             camera=payload.get("camera", ""),
             action=payload.get("action", ""),
             variant=variant,
+            watermark=False,   # 镜头画面禁一切文字(无字幕母版)
         )
 
     @staticmethod
