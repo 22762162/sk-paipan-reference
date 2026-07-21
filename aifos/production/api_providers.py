@@ -92,7 +92,7 @@ class ClaudeApiProvider(Provider):
             return False, str(exc)
         return True, f"真实连通成功(model={model})"
 
-    def generate(self, capability, payload, out_dir):
+    def generate(self, capability, payload, out_dir, cancel=None):
         try:
             prompt = build_prompt(capability, payload)
         except ValueError as exc:
@@ -185,7 +185,7 @@ class OpenAIImageProvider(Provider):
         else:
             raise ProviderError(f"{self.name} 应答缺少 b64_json/url")
 
-    def generate(self, capability, payload, out_dir):
+    def generate(self, capability, payload, out_dir, cancel=None):
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         size = self._size(payload)
@@ -216,6 +216,9 @@ class OpenAIImageProvider(Provider):
             last = out_dir / f"shot_{shot_no:03d}.last.png"
             self._gen_image(
                 f"{prompt}。首帧:动作起始瞬间,构图稳定", size, first)
+            if cancel is not None and cancel():
+                from ..errors import ProduceCancelled
+                raise ProduceCancelled("已手动停止")
             self._gen_image(
                 f"{prompt}。尾帧:动作结束瞬间,与首帧同场景同角色",
                 size, last)
@@ -299,7 +302,7 @@ class DoubaoTtsProvider(Provider):
         voice = self.conf.get("voice_type") or self.DEFAULT_VOICE
         return True, f"真实连通成功(voice_type={voice})"
 
-    def generate(self, capability, payload, out_dir):
+    def generate(self, capability, payload, out_dir, cancel=None):
         if capability != "voice":
             raise ProviderError(f"{self.name} 不支持能力: {capability}")
         text = payload.get("text", "")
@@ -371,7 +374,7 @@ class ArkVideoProvider(Provider):
             "image_url": {"url": f"data:image/{suffix};base64,{encoded}"},
         }
 
-    def generate(self, capability, payload, out_dir):
+    def generate(self, capability, payload, out_dir, cancel=None):
         if capability != "video":
             raise ProviderError(f"{self.name} 不支持能力: {capability}")
         endpoint = (self.conf.get("endpoint")
@@ -421,6 +424,10 @@ class ArkVideoProvider(Provider):
                     f"{error.get('message', status)}")
             if time.monotonic() >= deadline:
                 raise ProviderError(f"{self.name} 任务超时: {task_id}")
+            if cancel is not None and cancel():
+                from ..errors import ProduceCancelled
+                raise ProduceCancelled(
+                    f"已手动停止(不再等待 {self.name} 任务 {task_id})")
             time.sleep(poll)
         video_url = (status_reply.get("content") or {}).get("video_url")
         if not video_url:

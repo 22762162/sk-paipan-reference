@@ -538,7 +538,12 @@ async function stopEpisode(episodeId) {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ episode_id: episodeId }),
     });
-    showToast("正在停止…将安全落回可调整的检查点", "ok");
+    showToast("✓ 停止信号已发出:2 秒内终止当前产线调用,落回可调整的检查点", "ok");
+    // 立即刷新,马上看到「正在停止…」状态,不等下一轮轮询
+    if (location.hash === `#/episode/${episodeId}`)
+      setTimeout(() => renderCanvasView(episodeId), 400);
+    else if (location.hash === "" || location.hash === "#/")
+      setTimeout(refreshIfIdle, 400);
   } catch (e) { showToast(e.message, "error"); }
 }
 
@@ -1248,10 +1253,14 @@ function showScriptOverlay(data, episodeId) {
         `<span class="chip">${esc(c.name)} · ${esc(c.role || "")}</span>`).join("")}</div>
       ${script.scenes.map((s) => `
         <section class="scene">
-          <h4>场 ${s.scene_no} · ${esc(s.location)}</h4>
-          ${s.action ? `<p class="action">${esc(s.action)}</p>` : ""}
+          <div class="scene-head"><span class="scene-no">第 ${s.scene_no} 场</span>
+            <span class="scene-loc">${esc(s.location)}</span></div>
+          ${s.action ? `<p class="action">△ ${esc(s.action)}</p>` : ""}
           ${(s.lines || []).map((l) => `
-            <p class="line"><b>${esc(l.character)}</b>${esc(l.dialogue)}</p>`).join("")}
+            <div class="line-block">
+              <div class="speaker">${esc(l.character)}</div>
+              <div class="speech">${esc(l.dialogue)}</div>
+            </div>`).join("")}
         </section>`).join("")}
     </div>`;
   const close = () => { overlay.remove(); document.removeEventListener("keydown", onKey); };
@@ -1437,6 +1446,157 @@ function bindRegen(container, episodeId, getData) {
   });
 }
 
+/* ================= 图片生产清单 =================
+   每张要生成的图:分类/名称/提示词/实时状态;可单张改提示词重画 */
+const PLAN_CAT_CN = {
+  character_art: "人物立绘", scene_art: "场景概念图",
+  shot_image: "分镜画面(关键帧)", frames: "首尾帧",
+};
+const PLAN_STATUS_CN = {
+  pending: "排队中", generating: "生成中", done: "已完成",
+  failed: "失败", reused: "复用已有",
+};
+
+function planItemThumbs(data, item) {
+  const art = data.artifacts || {};
+  let urls = [];
+  if (item.category === "character_art") {
+    const row = (art.cast_art || []).find((c) => c.name === item.name);
+    if (row && row.url) urls = [row.url];
+  } else if (item.category === "scene_art") {
+    const row = (art.scene_art || []).find((s) => s.name === item.name);
+    if (row && row.url) urls = [row.url];
+  } else if (item.category === "shot_image") {
+    if ((art.images || {})[item.shot_no]) urls = [art.images[item.shot_no]];
+  } else if (item.category === "frames") {
+    if ((art.first || {})[item.shot_no]) urls.push(art.first[item.shot_no]);
+    if ((art.last || {})[item.shot_no]) urls.push(art.last[item.shot_no]);
+  }
+  return urls.filter((u) => u && !u.split("?")[0].endsWith(".json"));
+}
+
+function planTargetOf(item) {
+  if (item.category === "character_art")
+    return { kind: "character_art", name: item.name };
+  if (item.category === "scene_art")
+    return { kind: "scene_art", name: item.name };
+  return { kind: "shot", shot_no: item.shot_no };
+}
+
+function planItemHtml(data, item, editable) {
+  const thumbs = planItemThumbs(data, item);
+  const st = item.status || "pending";
+  const canEdit = editable && item.category !== "frames";
+  return `<div class="plan-item st-${st}" data-plan-id="${esc(item.id)}">
+    <div class="plan-thumbs">${thumbs.length
+      ? thumbs.map((u) => `<img src="${esc(u)}" loading="lazy" alt="">`).join("")
+      : `<span class="plan-thumb-empty">${st === "generating" ? "⏳" : "🖼"}</span>`}</div>
+    <div class="plan-main">
+      <div class="plan-row">
+        <b>${esc(item.label)}</b>
+        <span class="plan-st st-${st}">${PLAN_STATUS_CN[st] || st}${item.custom_prompt ? " · 已改词" : ""}</span>
+      </div>
+      ${item.error ? `<div class="plan-err">${esc(item.error)}</div>` : ""}
+      <details class="plan-prompt"><summary>提示词</summary>
+        <pre>${esc(item.prompt || "")}</pre></details>
+      ${canEdit ? `<div class="plan-edit" data-target="${esc(JSON.stringify(planTargetOf(item)))}">
+        <button class="plan-edit-toggle">🔄 修改提示词/重画这张</button>
+        <div class="plan-edit-form" hidden>
+          <textarea class="plan-edit-prompt" rows="3">${esc(item.prompt || "")}</textarea>
+          <input class="plan-edit-feedback" placeholder="补充意见(可留空),如:换成夜晚/表情更凶">
+          <button class="primary plan-edit-go">按上面的提示词重画这张</button>
+        </div></div>`
+      : (editable ? `<div class="dim plan-note">首尾帧随对应的分镜画面一起重画</div>` : "")}
+    </div></div>`;
+}
+
+function renderPlanHtml(data, editable) {
+  const items = ((data.render_plan || {}).items) || [];
+  if (!items.length) return "";
+  const cats = ["character_art", "scene_art", "shot_image", "frames"]
+    .filter((c) => items.some((i) => i.category === c));
+  const ready = items.filter(
+    (i) => ["done", "reused"].includes(i.status)).length;
+  return `<div class="plan-panel">
+    <h2>🖼 图片生产清单 <span class="dim">共 ${items.length} 张 · 已就绪 ${ready}</span></h2>
+    ${editable ? "" : `<div class="dim plan-hint">列表实时更新;要修改某张的提示词重画,等生成停下后点工具栏「🖼 图片清单」。</div>`}
+    ${cats.map((cat) => {
+      const list = items.filter((i) => i.category === cat);
+      const ok = list.filter(
+        (i) => ["done", "reused"].includes(i.status)).length;
+      return `<div class="plan-cat"><h3>${PLAN_CAT_CN[cat]} <span class="dim">${ok}/${list.length}</span></h3>
+        <div class="plan-list">${list.map((i) => planItemHtml(data, i, editable)).join("")}</div></div>`;
+    }).join("")}</div>`;
+}
+
+function bindPlanRegen(container, episodeId, onDone) {
+  container.querySelectorAll(".plan-edit").forEach((box) => {
+    const form = box.querySelector(".plan-edit-form");
+    box.querySelector(".plan-edit-toggle").onclick = () => {
+      form.hidden = !form.hidden;
+      if (!form.hidden) form.querySelector("textarea").focus();
+    };
+    box.querySelector(".plan-edit-go").onclick = async () => {
+      const target = JSON.parse(box.dataset.target);
+      const prompt = form.querySelector(".plan-edit-prompt").value.trim();
+      const feedback = form.querySelector(".plan-edit-feedback").value.trim();
+      const btn = box.querySelector(".plan-edit-go");
+      btn.disabled = true; btn.textContent = "已提交,重画中…";
+      try {
+        const reply = await api("/api/regen_image", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ episode_id: episodeId, target,
+                                 feedback, prompt }),
+        });
+        pollJob(reply.job_id, (job) => {
+          if (job.status === "done") {
+            showToast("这张图已按新提示词重画完成", "ok");
+            if (onDone) onDone(); else renderCanvasView(episodeId);
+          } else {
+            showToast(job.error || "重画失败", "error");
+            btn.disabled = false;
+            btn.textContent = "按上面的提示词重画这张";
+          }
+        });
+      } catch (e) {
+        showToast(e.message, "error");
+        btn.disabled = false; btn.textContent = "按上面的提示词重画这张";
+      }
+    };
+  });
+}
+
+async function showPlanOverlay(episodeId) {
+  let data;
+  try { data = await api(`/api/episode/${episodeId}`); }
+  catch (e) { showToast(e.message, "error"); return; }
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay";
+  overlay.innerHTML = `
+    <div class="script-panel plan-overlay">
+      <div class="script-head">
+        <h3>🖼 图片生产清单 · 《${esc(data.project.title)}》第${data.episode.number}集</h3>
+        <button class="close">关闭 Esc</button>
+      </div>
+      <div class="dim" style="margin:4px 0 10px">每张图的分类、状态与提示词都在这里;
+        可以直接改提示词或附意见,单独重画某一张(不影响其他图)。
+        镜头画面重画后会自动重做首尾帧并作废旧视频。</div>
+      ${renderPlanHtml(data, true)
+        || `<div class="dim">本集还没有图片生产计划(确认剧本、开始画图后就会出现)。</div>`}
+    </div>`;
+  const close = () => {
+    overlay.remove(); document.removeEventListener("keydown", onKey);
+  };
+  const onKey = (ev) => { if (ev.key === "Escape") close(); };
+  overlay.addEventListener("click", (ev) => {
+    if (ev.target === overlay) close();
+  });
+  overlay.querySelector(".close").onclick = close;
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(overlay);
+  bindPlanRegen(overlay, episodeId, () => { close(); showPlanOverlay(episodeId); });
+}
+
 /* 可内联播放的媒体标签(真实产线 mp4/wav;mock 的 json 描述文件回退为链接) */
 function mediaTag(url) {
   if (!url) return "";
@@ -1530,12 +1690,22 @@ function liveCounts(data) {
   const art = data.artifacts || {};
   const total = data.storyboard ? data.storyboard.shots.length : 0;
   const parts = [];
+  const plan = ((data.render_plan || {}).items) || [];
+  if (plan.length) {
+    const ok = plan.filter(
+      (i) => ["done", "reused"].includes(i.status)).length;
+    const gen = plan.find((i) => i.status === "generating");
+    parts.push(`图片 ${ok}/${plan.length}`);
+    if (gen)
+      parts.push(`正在画:${PLAN_CAT_CN[gen.category] || ""}「${gen.label}」`);
+  }
   if (total) {
-    parts.push(`关键帧 ${Object.keys(art.images || {}).length}/${total}`);
     parts.push(`视频 ${Object.keys(art.videos || {}).length}/${total}`);
   }
-  const cast = (art.cast_art || []).length;
-  if (cast) parts.push(`人物图 ${cast}`);
+  if (!plan.length) {
+    const cast = (art.cast_art || []).length;
+    if (cast) parts.push(`人物图 ${cast}`);
+  }
   return parts.join(" · ");
 }
 
@@ -1603,6 +1773,8 @@ function canvasSig(data) {
     ((data.artifacts || {}).cast_art || []).map((c) => c.url),
     ((data.artifacts || {}).scene_art || []).map((x) => x.url),
     (data.artifacts || {}).final, (data.artifacts || {}).cover,
+    (((data.render_plan || {}).items) || []).map(
+      (i) => [i.id, i.status, i.custom_prompt ? i.prompt : ""]),
   ]);
 }
 
@@ -1685,6 +1857,7 @@ async function renderCanvasView(episodeId) {
       </div>
       <button id="btn-play" class="primary">▶ 播放本集</button>
       <button id="btn-script">剧本</button>
+      <button id="btn-plan" title="每张图的状态与提示词;可单张改词重画">🖼 图片清单</button>
       <button id="btn-stop-live" class="stop-btn" hidden
         title="停止当前生成,落回可调整的检查点">⏹ 停止生成</button>
       <button id="btn-reproduce" title="复用已完成的部分,只补做缺失内容">继续补齐</button>
@@ -1739,6 +1912,7 @@ async function renderCanvasView(episodeId) {
   document.getElementById("btn-reproduce-force").onclick = (ev) =>
     armConfirm(ev.target, "重做", () => reproduce(true));
   document.getElementById("btn-script").onclick = () => showScriptOverlay(data, episodeId);
+  document.getElementById("btn-plan").onclick = () => showPlanOverlay(episodeId);
   document.getElementById("btn-play").onclick = () => openPlayer(data);
   const btnConfirm = document.getElementById("btn-confirm");
   if (btnConfirm) btnConfirm.onclick = async () => {
@@ -1797,10 +1971,14 @@ function scriptBodyHtml(script) {
         `<span class="chip">${esc(c.name)} · ${esc(c.role || "")}</span>`).join("")}</div>
       ${script.scenes.map((s) => `
         <section class="scene">
-          <h4>场 ${s.scene_no} · ${esc(s.location)}</h4>
-          ${s.action ? `<p class="action">${esc(s.action)}</p>` : ""}
+          <div class="scene-head"><span class="scene-no">第 ${s.scene_no} 场</span>
+            <span class="scene-loc">${esc(s.location)}</span></div>
+          ${s.action ? `<p class="action">△ ${esc(s.action)}</p>` : ""}
           ${(s.lines || []).map((l) => `
-            <p class="line"><b>${esc(l.character)}</b>${esc(l.dialogue)}</p>`).join("")}
+            <div class="line-block">
+              <div class="speaker">${esc(l.character)}</div>
+              <div class="speech">${esc(l.dialogue)}</div>
+            </div>`).join("")}
         </section>`).join("")}`;
 }
 
@@ -1842,6 +2020,7 @@ function renderProductionView(data, episodeId) {
         </ol>
         <div class="dim">每完成一步自动点亮;真实产线(出图/视频)单步可能要几分钟,
         看上方状态条的秒表在走就没卡住。</div>
+        ${renderPlanHtml(data, false)}
         <h2 style="margin-top:14px">产线实时日志</h2>
         <div class="log-list" id="live-log"><div class="dim">加载中…</div></div>
       </div>
@@ -1882,19 +2061,7 @@ function renderScriptReview(data, episodeId) {
       <span class="spacer"></span>
       <button id="btn-polish">✏️ 打磨剧本(意见重写/直接编辑/上传下载)</button>
     </div>
-    <div class="script-review">
-      <h1>${esc(script.episode_title || "本集剧本")}</h1>
-      <p class="logline">${esc(script.logline || "")}</p>
-      <div class="cast">${(script.characters || []).map((c) =>
-        `<span class="chip">${esc(c.name)} · ${esc(c.role || "")}</span>`).join("")}</div>
-      ${script.scenes.map((s) => `
-        <section class="scene">
-          <h4>场 ${s.scene_no} · ${esc(s.location)}</h4>
-          ${s.action ? `<p class="action">${esc(s.action)}</p>` : ""}
-          ${(s.lines || []).map((l) => `
-            <p class="line"><b>${esc(l.character)}</b>${esc(l.dialogue)}</p>`).join("")}
-        </section>`).join("")}
-    </div>
+    <div class="script-review">${scriptBodyHtml(script)}</div>
   </div>`;
   document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
   document.getElementById("btn-polish").onclick = () =>

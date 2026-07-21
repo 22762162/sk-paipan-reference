@@ -231,6 +231,13 @@ def _episode_payload(app, episode_id):
     qc_path = out_dir / "qc_report.json"
     if qc_path.exists():
         qc_report = json.loads(qc_path.read_text(encoding="utf-8"))
+    render_plan = None
+    plan_path = out_dir / "render_plan.json"
+    if plan_path.exists():
+        try:
+            render_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        except ValueError:
+            render_plan = None
     return {
         "episode": dict(episode),
         "project": dict(project),
@@ -251,6 +258,7 @@ def _episode_payload(app, episode_id):
         "production_standard": production_standard,
         "production_standard_version": production_standard_v,
         "qc_report": qc_report,
+        "render_plan": render_plan,
         "artifacts": _collect_artifacts(
             app, project["id"], episode["number"]),
     }
@@ -735,10 +743,12 @@ def make_handler(workspace, jobs):
                 return self._error(404, "剧集不存在")
             title, number = found
             feedback = (body.get("feedback") or "").strip()
+            prompt = (body.get("prompt") or "").strip()
             job_id = jobs.start_task(
                 title, number,
                 lambda app: app.director.regen_image(
-                    title, number, target, feedback=feedback))
+                    title, number, target, feedback=feedback,
+                    prompt_override=prompt))
             return self._json({"job_id": job_id}, status=202)
 
         def _settings_update(self):
@@ -813,7 +823,16 @@ def make_handler(workspace, jobs):
                 episode = app.projects.get_episode(int(body["episode_id"]))
                 if episode is None:
                     raise AifosError("剧集不存在")
-                if episode["status"] in stable:
+                project = app.db.query_one(
+                    "SELECT * FROM projects WHERE id=?",
+                    (episode["project_id"],))
+                # 有正在运行的制作任务时,无论状态都允许停止
+                job_running = any(
+                    j["status"] == "running"
+                    and j.get("title") == project["title"]
+                    and j.get("episode") == episode["number"]
+                    for j in jobs.list())
+                if episode["status"] in stable and not job_running:
                     raise AifosError("当前没有正在进行的生成")
                 app.projects.set_episode_status(episode["id"], "cancelling")
                 return episode["status"]

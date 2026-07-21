@@ -164,7 +164,7 @@ def _json_artifact(path, data):
 
 
 class MockProvider(Provider):
-    def generate(self, capability, payload, out_dir):
+    def generate(self, capability, payload, out_dir, cancel=None):
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         handler = getattr(self, f"_gen_{capability}", None)

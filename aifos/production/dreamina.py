@@ -24,6 +24,7 @@ from pathlib import Path
 
 from ..errors import ProviderError
 from .base import Provider, ProviderResult
+from .external import run_interruptible
 
 REQUIRED_MODEL_VERSION = "seedance2.0fast_vip"
 _MP4_PATTERN = re.compile(r"(https?://\S+?\.mp4|/\S+?\.mp4)")
@@ -48,7 +49,7 @@ class DreaminaProvider(Provider):
                 return False, f"订阅额度不足({balance} < {min_credit})"
         return True, ""
 
-    def generate(self, capability, payload, out_dir):
+    def generate(self, capability, payload, out_dir, cancel=None):
         if capability != "video":
             raise ProviderError(f"dreamina 适配器不支持能力: {capability}")
         out_dir = Path(out_dir).resolve()
@@ -87,21 +88,19 @@ class DreaminaProvider(Provider):
             f"--poll={int(self.conf.get('poll', 30))}",
         ]
         cmd += list(self.conf.get("extra_args") or [])
-        try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True,
-                timeout=self.conf.get("timeout", 1800))
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise ProviderError(f"dreamina 调用失败: {exc}") from exc
+        # 可中断执行:用户点「停止生成」时 2 秒内终止即梦调用
+        returncode, stdout, stderr = run_interruptible(
+            "dreamina", cmd, None, self.conf.get("timeout", 1800),
+            cancel=cancel)
         log_path = out_dir / f"shot_{shot_no:03d}.dreamina.log"
         log_path.write_text(
-            f"$ {' '.join(cmd)}\n--- stdout ---\n{proc.stdout}\n"
-            f"--- stderr ---\n{proc.stderr}\n", encoding="utf-8")
-        if proc.returncode != 0:
+            f"$ {' '.join(cmd)}\n--- stdout ---\n{stdout}\n"
+            f"--- stderr ---\n{stderr}\n", encoding="utf-8")
+        if returncode != 0:
             raise ProviderError(
-                f"dreamina 退出码 {proc.returncode}: "
-                f"{proc.stderr.strip()[:500]}")
-        uri = self._extract_uri(proc.stdout)
+                f"dreamina 退出码 {returncode}: "
+                f"{stderr.strip()[:500]}")
+        uri = self._extract_uri(stdout)
         if not uri:
             raise ProviderError(
                 f"未能从 dreamina 输出解析出视频地址(详见 {log_path})")

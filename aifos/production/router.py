@@ -68,7 +68,7 @@ class ProviderRouter:
             "UPDATE quota SET used = used + 1 WHERE provider=?", (name,))
 
     # ---- 调用 ----
-    def call(self, capability, payload, out_dir):
+    def call(self, capability, payload, out_dir, cancel=None):
         chain = self.config.get("routing", capability, default=None) or ["mock"]
         for name in chain:
             provider = self.providers.get(name)
@@ -88,7 +88,8 @@ class ProviderRouter:
                     "router", f"{name} 不可用({reason}),回退({capability})")
                 continue
             try:
-                result = provider.generate(capability, payload, out_dir)
+                result = provider.generate(capability, payload, out_dir,
+                                           cancel=cancel)
             except ProviderError as exc:
                 self.log.warn(
                     "router", f"{name} 执行失败({exc}),回退({capability})")

@@ -35,5 +35,7 @@ class Provider:
             return False, f"不支持能力 {capability}"
         return True, ""
 
-    def generate(self, capability, payload, out_dir):
+    def generate(self, capability, payload, out_dir, cancel=None):
+        """cancel: 可选回调,返回 True 表示用户已请求停止,
+        长调用(子进程/轮询)应尽快安全终止并抛 ProduceCancelled。"""
         raise NotImplementedError
