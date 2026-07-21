@@ -335,7 +335,7 @@ def make_handler(workspace, jobs):
         def _error(self, status, message):
             self._json({"error": message}, status=status)
 
-        def _file(self, path):
+        def _file(self, path, no_cache=False):
             path = Path(path)
             if not path.is_file():
                 return self._error(404, "文件不存在")
@@ -345,6 +345,10 @@ def make_handler(workspace, jobs):
                 "Content-Type",
                 MIME.get(path.suffix.lower(), "application/octet-stream"))
             self.send_header("Content-Length", str(len(body)))
+            if no_cache:
+                # 界面文件禁缓存:git pull 更新后刷新即生效,
+                # 避免浏览器缓存旧版界面导致"更新了却看不到新功能"
+                self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self.wfile.write(body)
 
@@ -362,7 +366,8 @@ def make_handler(workspace, jobs):
             query = parse_qs(parsed.query)
             try:
                 if route in ("/", "/index.html"):
-                    return self._file(STATIC_DIR / "index.html")
+                    return self._file(STATIC_DIR / "index.html",
+                                      no_cache=True)
                 if route.startswith("/static/"):
                     return self._static(STATIC_DIR, route[len("/static/"):])
                 if route.startswith("/artifacts/"):
@@ -462,7 +467,7 @@ def make_handler(workspace, jobs):
             target = (root / rel).resolve()
             if not str(target).startswith(str(root.resolve()) + "/"):
                 return self._error(404, "非法路径")
-            return self._file(target)
+            return self._file(target, no_cache=True)
 
         def _artifact(self, rel):
             app = App(workspace)
