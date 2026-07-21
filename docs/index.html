@@ -6715,6 +6715,17 @@ function imageLineControlsHtml() {
   </div>`;
 }
 
+/* 界面已更新但服务进程还是旧版时,接口会报旧错误 → 给出重启指引 */
+function staleServerHint(e) {
+  const msg = String((e && e.message) || e);
+  if (msg.includes("缺少 provider") || msg.includes("未知能力")
+      || msg.includes("不支持的默认项")) {
+    return "服务还在运行旧版本(界面已是新版):关掉 AIFOS 窗口再双击"
+      + " start_aifos.command 重启一次即可;此后更新全自动,无需再手动重启";
+  }
+  return msg;
+}
+
 async function bindImageLineControls() {
   const lineSel = document.getElementById("image-line");
   const parSel = document.getElementById("parallel-images");
@@ -6747,7 +6758,7 @@ async function bindImageLineControls() {
       }
       showToast(`出图产线已切换:${pick === "codex"
         ? "Codex CLI 优先" : "OpenAI 图片API 优先"}(不可用自动回退)`, "ok");
-    } catch (e) { showToast(e.message, "error"); }
+    } catch (e) { showToast(staleServerHint(e), "error"); }
   };
   parSel.innerHTML = [1, 2, 3, 4, 6, 8].map(
     (n) => `<option value="${n}">${n} 路并行</option>`).join("");
@@ -6761,7 +6772,9 @@ async function bindImageLineControls() {
           defaults: { parallel_images: Number(parSel.value) } }),
       });
       showToast(`并行出图已设为 ${parSel.value} 路,下一批生效`, "ok");
-    } catch (e) { showToast(e.message, "error"); }
+    } catch (e) {
+      showToast(staleServerHint(e), "error");
+    }
   };
   const hint = document.getElementById("image-line-hint");
   if (hint) hint.textContent =
