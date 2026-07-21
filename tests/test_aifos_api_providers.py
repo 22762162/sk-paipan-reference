@@ -264,6 +264,28 @@ def test_ark_video_task_flow(fake_api, tmp_path):
     assert polls["n"] == 2
 
 
+def test_ark_requires_real_model_id(fake_api, tmp_path):
+    """模型 ID 必须从方舟控制台复制;404 NotFound 给中文开通指引。"""
+    conf = {"type": "ark_video", "enabled": True, "capabilities": ["video"],
+            "endpoint": "http://127.0.0.1:1", "api_key": "k", "model": ""}
+    provider = ArkVideoProvider("ark", conf)
+    ok, reason = provider.available("video")
+    assert not ok and "doubao-seedance" in reason
+
+    endpoint, fake = fake_api
+    fake.routes[("POST", "/api/v3/contents/generations/tasks")] = \
+        lambda body: (404, {"error": {
+            "code": "InvalidEndpointOrModel.NotFound",
+            "message": "The model or endpoint x does not exist"}})
+    provider = ArkVideoProvider("ark", {
+        "type": "ark_video", "enabled": True, "capabilities": ["video"],
+        "endpoint": endpoint, "api_key": "k", "model": "错的ID",
+        "timeout": 30})
+    ok, detail = provider.ping()
+    assert not ok
+    assert "Key 已通过" in detail and "开通管理" in detail
+
+
 def test_ark_video_task_failed(fake_api, tmp_path):
     endpoint, fake = fake_api
     fake.routes[("POST", "/api/v3/contents/generations/tasks")] = \
@@ -273,7 +295,9 @@ def test_ark_video_task_failed(fake_api, tmp_path):
                       "error": {"message": "内容审核未通过"}}
     provider = ArkVideoProvider("ark", {
         "type": "ark_video", "enabled": True, "capabilities": ["video"],
-        "endpoint": endpoint, "api_key": "k", "poll": 0.01, "timeout": 30})
+        "endpoint": endpoint, "api_key": "k",
+        "model": "doubao-seedance-2-0-test",
+        "poll": 0.01, "timeout": 30})
     with pytest.raises(ProviderError, match="内容审核未通过"):
         provider.generate("video", {"shot_no": 1, "prompt": "x"}, tmp_path)
 

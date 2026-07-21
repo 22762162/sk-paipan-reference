@@ -325,7 +325,8 @@ class ArkVideoProvider(Provider):
     """
 
     DEFAULT_ENDPOINT = "https://ark.cn-beijing.volces.com"
-    DEFAULT_MODEL = "seedance-2.0-fast"   # 按实际开通的模型/接入点 ID 配置
+    MODEL_HINT = ("模型 ID 需从方舟控制台【开通管理】复制:形如 "
+                  "doubao-seedance-2-0-…(带日期后缀)或推理接入点 ep-…")
 
     def available(self, capability):
         ok, reason = super().available(capability)
@@ -333,6 +334,8 @@ class ArkVideoProvider(Provider):
             return ok, reason
         if not self.conf.get("api_key"):
             return False, "未配置 api_key"
+        if not self.conf.get("model"):
+            return False, f"未配置模型 ID;{self.MODEL_HINT}"
         return True, ""
 
     def ping(self):
@@ -344,13 +347,18 @@ class ArkVideoProvider(Provider):
                 self.name,
                 f"{endpoint}/api/v3/contents/generations/tasks",
                 {"Authorization": f"Bearer {self.conf['api_key']}"},
-                body={"model": self.conf.get("model") or self.DEFAULT_MODEL,
+                body={"model": self.conf.get("model", ""),
                       "content": []},
                 timeout=30)
         except ProviderError as exc:
             message = str(exc)
             if "HTTP 400" in message:
                 return True, "真实连通成功(端点可达,鉴权通过)"
+            if "NotFound" in message or "HTTP 404" in message:
+                return False, (f"Key 已通过,但模型 ID 不存在或未开通。"
+                               f"{self.MODEL_HINT};开通入口:方舟控制台 "
+                               f"console.volcengine.com/ark → 开通管理 → "
+                               f"Doubao-Seedance 2.0")
             return False, message
         return True, "真实连通成功"
 
@@ -387,9 +395,11 @@ class ArkVideoProvider(Provider):
             if payload.get(key):
                 content.append(self._frame_content(payload[key], role))
         tasks_url = f"{endpoint}/api/v3/contents/generations/tasks"
+        if not self.conf.get("model"):
+            raise ProviderError(f"{self.name} 未配置模型 ID;{self.MODEL_HINT}")
         created = _request_json(
             self.name, tasks_url, headers,
-            body={"model": self.conf.get("model") or self.DEFAULT_MODEL,
+            body={"model": self.conf["model"],
                   "content": content},
             timeout=self.conf.get("timeout", 1800))
         task_id = created.get("id")

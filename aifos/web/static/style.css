@@ -965,3 +965,18 @@ textarea:focus-visible, select:focus-visible {
 .stop-btn:hover { background: rgba(236, 131, 90, .22); }
 .stop-btn.big { padding: 8px 16px; font-size: 13.5px; }
 .progress-card .stop-btn { margin-right: 10px; }
+
+/* ---------- 实时工作状态条 ---------- */
+.live-strip {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 18px; font-size: 13px; flex: none;
+  background: rgba(250, 178, 25, .08);
+  border-bottom: 1px solid rgba(250, 178, 25, .35);
+}
+.live-strip b { color: #ffd77a; }
+.live-dot {
+  width: 9px; height: 9px; border-radius: 50%; background: var(--warning);
+  animation: pulse 1.2s infinite; flex: none;
+}
+.live-dot.stopping { background: var(--serious); }
+.live-last { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 48vw; }
