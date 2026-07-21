@@ -1,6 +1,7 @@
 """数据层:SQLite 统一存储全部结构化数据(项目/资产/任务/额度/日志/沉淀)。"""
 
 import sqlite3
+import threading
 import time
 
 SCHEMA = """
@@ -189,8 +190,11 @@ MIGRATIONS = [
 class Database:
     def __init__(self, path):
         self.path = str(path)
-        self.conn = sqlite3.connect(self.path)
+        # 并行出图产线的 worker 线程会经由 router/logger 读写库:
+        # 连接允许跨线程 + 进程内互斥锁串行化,保证线程安全
+        self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
         # 标准保存会使用 BEGIN IMMEDIATE；给并发 UI/API 写入留出等待窗口，
         # 避免短暂锁竞争直接抛出 "database is locked"。
         self.conn.execute("PRAGMA busy_timeout = 5000")
@@ -208,15 +212,19 @@ class Database:
                     f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def execute(self, sql, params=()):
-        cur = self.conn.execute(sql, params)
-        self.conn.commit()
-        return cur
+        with self._lock:
+            cur = self.conn.execute(sql, params)
+            self.conn.commit()
+            return cur
 
     def query(self, sql, params=()):
-        return self.conn.execute(sql, params).fetchall()
+        with self._lock:
+            return self.conn.execute(sql, params).fetchall()
 
     def query_one(self, sql, params=()):
-        return self.conn.execute(sql, params).fetchone()
+        with self._lock:
+            return self.conn.execute(sql, params).fetchone()
 
     def close(self):
-        self.conn.close()
+        with self._lock:
+            self.conn.close()

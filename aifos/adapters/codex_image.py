@@ -49,10 +49,16 @@ def _ref_line(payload):
         refs.append(f"场景概念图 {payload['scene_ref']}")
     refs.extend(f"用户参考图 {r}"
                 for r in payload.get("reference_images", []))
-    if not refs:
-        return ""
-    return ("参考图(文件可直接读取;人物发型/服装/配色和场景陈设"
-            "必须与参考图一致):" + ";".join(refs) + "。")
+    lines = []
+    if payload.get("style_ref"):
+        lines.append(
+            f"风格基准图 {payload['style_ref']}(全项目画风统一的唯一基准:"
+            "绘画风格、线条、上色、光影、质感必须与这张图完全一致,"
+            "禁止任何风格漂移)。")
+    if refs:
+        lines.append("参考图(文件可直接读取;人物发型/服装/配色和场景陈设"
+                     "必须与参考图一致):" + ";".join(refs) + "。")
+    return "".join(lines)
 
 
 def build_instruction(capability, payload, out_dir):

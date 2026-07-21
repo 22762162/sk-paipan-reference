@@ -1711,6 +1711,26 @@ textarea:focus-visible, select:focus-visible {
   padding: 6px 10px; cursor: pointer;
 }
 
+/* ---- 断点续画横幅 + 重画表单动作行 ---- */
+.resume-banner {
+  margin: 0 18px; padding: 10px 14px;
+  border: 1px solid rgba(250, 178, 25, .5);
+  background: rgba(250, 178, 25, .1);
+  border-radius: var(--radius); color: var(--ink-2); font-size: 13px;
+}
+.resume-banner b { color: var(--warning); }
+.plan-edit-actions { display: flex; gap: 8px; }
+.plan-edit-actions .plan-edit-go { flex: 1; }
+.regen-form .regen-ref { font-size: 12px; }
+
+/* ---- 出图产线切换 ---- */
+.image-line-row select {
+  background: var(--page); color: var(--ink);
+  border: 1px solid var(--hairline); border-radius: 8px;
+  padding: 8px 10px; font-size: 13px;
+}
+.image-line-row .il-label { flex: 0 0 auto; }
+
 .demo-note {
   background: var(--surface-2); border-bottom: 1px solid var(--hairline);
   color: var(--ink-2); font-size: 12.5px; padding: 7px 20px;
@@ -3967,7 +3987,7 @@ function armConfirm(btn, label, action) {
 const STATUS_CN = {
   done: "完成", failed: "失败", qc_failed: "质检未过", created: "已建",
   awaiting_confirm: "待确认", awaiting_script: "剧本待确认",
-  cancelling: "正在停止…",
+  cancelling: "正在暂停…",
   script: "剧本中", continuity: "锁连续性",
   cast: "画人物场景", storyboard: "五维分镜中", images: "关键帧中",
   text_assets: "锁文字", frames: "首尾帧", preflight: "门禁检查",
@@ -3975,7 +3995,7 @@ const STATUS_CN = {
   qc: "质检中", package: "包装中", archive: "沉淀中", running: "制作中",
 };
 const RUN_STATUS_CN = {
-  running: "运行中", cancelling: "停止中", completed: "完成",
+  running: "运行中", cancelling: "暂停中", completed: "完成",
   paused: "阶段暂停", failed: "失败", stopped: "已停止",
   interrupted: "意外中断",
 };
@@ -5483,8 +5503,49 @@ function regenControls(target, label) {
     <button class="regen-toggle">🔄 ${esc(label)}</button>
     <div class="regen-form" hidden>
       <input placeholder="修改意见,如:换成夜晚/表情更凶(可留空)">
+      <button class="regen-ref" title="上传参考图并自动挂到本对象,点重画立即生效">📎 参考图</button>
       <button class="primary regen-go">重画</button>
     </div></div>`;
+}
+
+/* 重画对象 → 参考图关联名(镜头类挂全项目) */
+function refAttachOf(target) {
+  if (target.kind === "character_art" || target.kind === "scene_art")
+    return target.name;
+  if (target.kind === "character_sheet")
+    return String(target.name).split(":")[0];
+  return "";
+}
+
+function uploadRegenReference(episodeId, target, btn) {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = "image/*";
+  input.onchange = () => {
+    const file = input.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        if (btn) btn.disabled = true;
+        await api("/api/reference/upload", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            episode_id: episodeId,
+            name: file.name.replace(/\.[^.]+$/, ""),
+            attach_to: refAttachOf(target),
+            filename: file.name,
+            data_base64: String(reader.result).split(",")[1] || "",
+          }),
+        });
+        const attach = refAttachOf(target);
+        showToast(`参考图已挂到「${attach || "全项目"}」,点重画立即参考它`, "ok");
+      } catch (e) { showToast(e.message, "error"); }
+      if (btn) btn.disabled = false;
+    };
+    reader.readAsDataURL(file);
+  };
+  input.click();
 }
 
 function bindRegen(container, episodeId, getData, onDone) {
@@ -5494,6 +5555,9 @@ function bindRegen(container, episodeId, getData, onDone) {
       form.hidden = !form.hidden;
       if (!form.hidden) form.querySelector("input").focus();
     };
+    const refBtn = box.querySelector(".regen-ref");
+    if (refBtn) refBtn.onclick = () => uploadRegenReference(
+      episodeId, JSON.parse(box.dataset.target), refBtn);
     box.querySelector(".regen-go").onclick = async () => {
       const target = JSON.parse(box.dataset.target);
       const feedback = form.querySelector("input").value.trim();
@@ -5617,7 +5681,10 @@ function planItemHtml(data, item, editable) {
         <div class="plan-edit-form" hidden>
           <textarea class="plan-edit-prompt" rows="3">${esc(item.prompt || "")}</textarea>
           <input class="plan-edit-feedback" placeholder="补充意见(可留空),如:换成夜晚/表情更凶">
-          <button class="primary plan-edit-go">按上面的提示词重画这张</button>
+          <div class="plan-edit-actions">
+            <button class="plan-edit-ref" title="上传参考图并自动挂到本对象,重画立即生效">📎 加参考图</button>
+            <button class="primary plan-edit-go">按上面的提示词重画这张</button>
+          </div>
         </div></div>`
       : (editable ? `<div class="dim plan-note">首尾帧随对应的分镜画面一起重画</div>` : "")}
     </div></div>`;
@@ -5666,6 +5733,9 @@ function bindPlanRegen(container, episodeId, onDone) {
       form.hidden = !form.hidden;
       if (!form.hidden) form.querySelector("textarea").focus();
     };
+    const planRefBtn = box.querySelector(".plan-edit-ref");
+    if (planRefBtn) planRefBtn.onclick = () => uploadRegenReference(
+      episodeId, JSON.parse(box.dataset.target), planRefBtn);
     box.querySelector(".plan-edit-go").onclick = async () => {
       const target = JSON.parse(box.dataset.target);
       const prompt = form.querySelector(".plan-edit-prompt").value.trim();
@@ -5707,7 +5777,7 @@ function showPlanItemPreview(data, item, episodeId) {
   overlay.className = "script-overlay image-preview-overlay";
   const gallery = thumbs.length
     ? `<div class="plan-preview-gallery">
-        <img class="plan-preview-main" src="${esc(thumbs[0])}"
+        <img class="plan-preview-main zoomable" src="${esc(thumbs[0])}"
           alt="${esc(item.label)}大图">
         ${thumbs.length > 1 ? `<div class="plan-preview-thumbs">${thumbs.map((url, index) =>
           `<button type="button" class="plan-preview-thumb${index === 0 ? " active" : ""}"
@@ -5955,13 +6025,18 @@ function showImageLightbox(url, label) {
 function bindLightbox(container) {
   container.querySelectorAll(".plan-card .pc-media img").forEach((img) => {
     img.classList.add("zoomable");
-    img.onclick = () => {
-      const card = img.closest(".plan-card");
-      const label = card ? (card.querySelector(".pc-label") || {}).textContent : "";
-      showImageLightbox(img.src, (label || "").trim());
-    };
   });
 }
+
+/* 全局委托:任何带 zoomable 的图片点击即放大(含生产预览大图) */
+document.addEventListener("click", (ev) => {
+  const img = ev.target.closest("img.zoomable");
+  if (!img || img.closest(".img-lightbox")) return;
+  const card = img.closest(".plan-card");
+  const label = (card && (card.querySelector(".pc-label") || {}).textContent)
+    || img.alt || "";
+  showImageLightbox(img.src, String(label).trim());
+});
 function assetCardHtml(ep, target, url, label, mock) {
   const img = url && !url.split("?")[0].endsWith(".json")
     ? `<img src="${esc(url)}" loading="lazy" alt="">`
@@ -6024,6 +6099,22 @@ async function renderAssetsCenter(selectedTitle) {
     </div>
     ${epData ? mockWarnHtml(epData) : ""}
     <section class="panel asset-panel">
+      <h2>🎨 画风管理 <span class="dim">更换画风后一键重做全部形象:
+        主角立绘最先重做并成为新的风格基准,其余全部对齐它,保证统一</span></h2>
+      <div class="style-row">
+        <label>本剧画风</label>
+        <input id="restyle-input" list="style-presets"
+          value="${esc((projects.find((pp) => pp.title === title) || {}).style || "")}"
+          placeholder="如:水墨国风,淡彩,留白构图">
+        <datalist id="style-presets">${STYLE_PRESETS.map((x) =>
+          `<option>${esc(x)}</option>`).join("")}</datalist>
+        <button class="primary" id="btn-restyle" ${ep ? "" : "disabled"}>🎨 按此画风重做全部形象</button>
+      </div>
+      ${imageLineControlsHtml()}
+      <div class="dim">重做会消耗出图额度(每张一次);过程在本集页面实况可见,
+        可随时暂停,已完成的保留。分镜画面如需同步新画风,重做完成后到本集点「全部重做」。</div>
+    </section>
+    <section class="panel asset-panel">
       <h2>📎 参考图 <span class="dim">上传后,生成人物/场景/分镜画面时自动作为参考
         (可全项目通用,或只关联某个角色/场景)</span></h2>
       <div class="ref-form">
@@ -6074,6 +6165,22 @@ async function renderAssetsCenter(selectedTitle) {
   </div>`;
   document.getElementById("asset-project").onchange = (ev) =>
     renderAssetsCenter(ev.target.value);
+  bindImageLineControls();
+  const restyleBtn = document.getElementById("btn-restyle");
+  if (restyleBtn && ep) restyleBtn.onclick = (ev) =>
+    armConfirm(ev.target, "重做", async () => {
+      try {
+        await api("/api/restyle", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            episode_id: ep.id,
+            style: document.getElementById("restyle-input").value.trim(),
+          }),
+        });
+        showToast("已开始按新画风重做全部形象,跳转到实况页…", "ok");
+        location.hash = `#/episode/${ep.id}`;
+      } catch (e) { showToast(e.message, "error"); }
+    });
   const reload = () => renderAssetsCenter(title);
   bindLightbox(app);
   if (ep) {
@@ -6153,7 +6260,7 @@ const STAGE_ORDER = ["script", "continuity", "cast", "storyboard", "images",
   "text_assets", "frames", "preflight", "videos", "voices", "edit", "qc",
   "package", "archive"];
 const STAGE_PLAIN = {
-  cancelling: "正在停止,等当前一步做完就落回可调整的检查点",
+  cancelling: "正在暂停,已完成的图片全部保留,随时可从断点继续",
   script: "正在写剧本", continuity: "正在锁定角色、场景和文字规则",
   cast: "正在画人物和场景", storyboard: "正在生成五维分镜",
   images: "正在生成关键帧", text_assets: "正在锁定可读文字",
@@ -6193,7 +6300,7 @@ function renderProgressBanner(data) {
     const pct = Math.round(step / STAGE_ORDER.length * 100);
     return `
     <div class="progress-card">
-      <button class="stop-btn" onclick="stopEpisode(${e.id})" title="停止生成,落回可调整的检查点">⏹ 停止</button>
+      <button class="stop-btn" onclick="stopEpisode(${e.id})" title="暂停生成:已完成的图片全部保留,可从断点继续">⏸ 暂停</button>
       <div class="progress-text">正在制作《${esc(e.project)}》第${e.number}集
         <span>第 ${step} 步 / 共 ${STAGE_ORDER.length} 步 · ${esc(STAGE_PLAIN[e.status] || e.status)}…</span></div>
       <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
@@ -6398,7 +6505,7 @@ async function renderCanvasView(episodeId) {
       <button id="btn-script">剧本</button>
       <button id="btn-plan" title="每张图的状态与提示词;可单张改词重画">🖼 图片清单</button>
       <button id="btn-stop-live" class="stop-btn" hidden
-        title="停止当前生成,落回可调整的检查点">⏹ 停止生成</button>
+        title="暂停生成:已完成的图片全部保留,可从断点继续">⏸ 暂停生成</button>
       <button id="btn-reproduce" title="复用已完成的部分,只补做缺失内容">继续补齐</button>
       <button id="btn-reproduce-force" title="从头全部重新制作(真实产线会消耗额度)">全部重做</button>
       <div class="zoom-group">
@@ -6429,7 +6536,7 @@ async function renderCanvasView(episodeId) {
     stopLive.hidden = !producingNow;
     stopLive.onclick = () => {
       stopLive.disabled = true;
-      stopLive.textContent = "停止中…";
+      stopLive.textContent = "暂停中…";
       stopEpisode(ep.id);
     };
   }
@@ -6538,12 +6645,12 @@ function renderProductionView(data, episodeId) {
       ${chip(ep.status)}
       <span class="spacer"></span>
       <button id="btn-stop" class="stop-btn big" ${stopping ? "disabled" : ""}
-        title="在当前产线调用结束后安全停下,落回可调整的检查点">${stopping ? "停止中…" : "⏹ 停止生成"}</button>
+        title="暂停生成:已完成的图片全部保留,可从断点继续">${stopping ? "暂停中…" : "⏸ 暂停生成"}</button>
     </div>
     <div id="live-strip" class="live-strip"></div>
     <div class="produce-live">
       <div class="panel">
-        <h2>${stopping ? "⏹ 正在停止,等当前一步做完…" : "制作进行中"} · ${esc(STAGE_PLAIN[runningStage] || "准备中")}…</h2>
+        <h2>${stopping ? "⏸ 正在暂停,已画完的全部保留…" : "制作进行中"} · ${esc(STAGE_PLAIN[runningStage] || "准备中")}…</h2>
         <ol class="stage-steps">
           ${STAGE_ORDER.map((stage) => {
             const state = done.has(stage) ? "done"
@@ -6583,6 +6690,70 @@ function renderProductionView(data, episodeId) {
   pollCanvas(episodeId);
 }
 
+/* ---- 出图产线快速切换:Codex CLI / OpenAI 图片API + 并行路数 ---- */
+function imageLineControlsHtml() {
+  return `<div class="style-row image-line-row">
+    <label>出图产线</label>
+    <select id="image-line" disabled><option>加载中…</option></select>
+    <label class="il-label">并行路数</label>
+    <select id="parallel-images" disabled><option>…</option></select>
+    <span class="dim" id="image-line-hint"></span>
+  </div>`;
+}
+
+async function bindImageLineControls() {
+  const lineSel = document.getElementById("image-line");
+  const parSel = document.getElementById("parallel-images");
+  if (!lineSel || !parSel) return;
+  let st;
+  try { st = await api("/api/settings"); } catch (e) { return; }
+  const byName = {};
+  (st.providers || []).forEach((pv) => { byName[pv.name] = pv; });
+  const ready = (n) => {
+    const pv = byName[n];
+    return pv && pv.enabled && (pv.checks || []).some(
+      (c) => c.capability === "image" && c.ok) ? "已接通" : "未接通";
+  };
+  const chain = (st.routing || {}).image || [];
+  lineSel.innerHTML = `
+    <option value="codex">Codex CLI · GPT Image 2(${ready("codex")})</option>
+    <option value="image_api">OpenAI 图片 API(${ready("image_api")})</option>`;
+  lineSel.value = chain[0] === "image_api" ? "image_api" : "codex";
+  lineSel.disabled = false;
+  lineSel.onchange = async () => {
+    const pick = lineSel.value;
+    const others = ["codex", "image_api"].filter((x) => x !== pick);
+    try {
+      for (const cap of ["image", "frames", "cover"]) {
+        await api("/api/settings", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ capability: cap,
+            chain: [pick, ...others, "api", "mock"] }),
+        });
+      }
+      showToast(`出图产线已切换:${pick === "codex"
+        ? "Codex CLI 优先" : "OpenAI 图片API 优先"}(不可用自动回退)`, "ok");
+    } catch (e) { showToast(e.message, "error"); }
+  };
+  parSel.innerHTML = [1, 2, 3, 4, 6, 8].map(
+    (n) => `<option value="${n}">${n} 路并行</option>`).join("");
+  parSel.value = String((st.defaults || {}).parallel_images || 3);
+  parSel.disabled = false;
+  parSel.onchange = async () => {
+    try {
+      await api("/api/settings", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          defaults: { parallel_images: Number(parSel.value) } }),
+      });
+      showToast(`并行出图已设为 ${parSel.value} 路,下一批生效`, "ok");
+    } catch (e) { showToast(e.message, "error"); }
+  };
+  const hint = document.getElementById("image-line-hint");
+  if (hint) hint.textContent =
+    "立即生效;主角立绘先出作风格基准,批量并行不会跑偏";
+}
+
 /* ---- 剧本审阅页:剧本确认后才开始画图(第一道确认) ----
    开画前在这里确定画风、上传参考图,出图全程按它们执行 */
 const STYLE_PRESETS = ["国风漫剧", "现代都市漫剧", "校园清新日系",
@@ -6592,6 +6763,11 @@ const STYLE_PRESETS = ["国风漫剧", "现代都市漫剧", "校园清新日系
 function renderScriptReview(data, episodeId) {
   const script = data.script;
   const refs = (data.artifacts || {}).references || [];
+  const planItems = ((data.render_plan || {}).items) || [];
+  const planReady = planItems.filter(
+    (i) => ["done", "reused"].includes(i.status)).length;
+  const resuming = planItems.length > 0 && planReady > 0
+    && planReady < planItems.length;
   const attachOptions = [
     ...(script.characters || []).map((c) => c.name),
     ...[...new Set((script.scenes || []).map((s) => s.location))]];
@@ -6603,8 +6779,12 @@ function renderScriptReview(data, episodeId) {
         <span>看剧本 → 定画风 → 传参考图(可选)→ 点确认才开始画
         (此刻还没花出图额度);剧本不满意可意见重写或直接编辑。</span>
       </div>
-      <button class="primary" id="btn-script-ok">✅ 剧本OK,按此风格开始画图</button>
+      <button class="primary" id="btn-script-ok">${resuming
+        ? "▶ 从断点继续画图" : "✅ 剧本OK,按此风格开始画图"}</button>
     </div>
+    ${resuming ? `<div class="resume-banner">⏸ 上次生成已暂停:
+      图片 <b>${planReady}/${planItems.length}</b> 已完成并全部保留。
+      点「▶ 从断点继续画图」只画剩余的,不重复消耗额度。</div>` : ""}
     <div class="canvas-toolbar">
       <button id="btn-back">← 仪表盘</button>
       <span class="title">《${esc(data.project.title)}》第${data.episode.number}集</span>
@@ -6623,6 +6803,7 @@ function renderScriptReview(data, episodeId) {
           `<option>${esc(s)}</option>`).join("")}</datalist>
         <button id="style-save">保存画风</button>
       </div>
+      ${imageLineControlsHtml()}
       <div class="style-row">
         <label>参考图</label>
         <input id="ref-name" placeholder="名称,如:女主官方设定(可留空)">
@@ -6647,6 +6828,8 @@ function renderScriptReview(data, episodeId) {
   document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
   document.getElementById("btn-polish").onclick = () =>
     showScriptOverlay(data, episodeId);
+  bindLightbox(app);
+  bindImageLineControls();
   const post = (path, body) => api(path, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body) });

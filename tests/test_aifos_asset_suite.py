@@ -285,3 +285,82 @@ def test_asset_center_has_design_and_lightbox():
     assert "bindLightbox(app)" in app_js
     assert ".lightbox-box img" in css
     assert "cursor: zoom-in" in css
+
+
+def test_style_anchor_unifies_all_art(app):
+    """风格统一:主角立绘先画,其余立绘/套件/场景全部引用风格基准图。"""
+    payloads = []
+    original = app.director.router.call
+
+    def recording(capability, payload, out_dir, cancel=None):
+        if capability == "image":
+            payloads.append(dict(payload))
+        return original(capability, payload, out_dir, cancel=cancel)
+
+    app.director.router.call = recording
+    project = _preproduce(app)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    anchor = app.director._anchor_character(project["id"])
+    assert anchor  # 主角优先
+    anchor_uri = app.assets.latest(
+        project["id"], "character_art", anchor)["uri"]
+    portraits = [p for p in payloads if p.get("portrait")]
+    # 锚角色最先画且不引用自己
+    assert portraits[0]["art_name"] == anchor
+    assert not portraits[0].get("style_ref")
+    for p in portraits[1:]:
+        assert p["style_ref"] == anchor_uri, f"{p['art_name']} 未对齐风格锚"
+    for p in payloads:
+        if p.get("character_sheet") or p.get("scene_art"):
+            assert p.get("style_ref") == anchor_uri
+    # 分镜画面同样携带风格基准
+    shots = [p for p in payloads if p.get("shot_no")]
+    assert shots and all(p.get("style_ref") == anchor_uri for p in shots)
+
+
+def test_restyle_project_regenerates_all_art(app):
+    """一键换画风:全部形象按新画风重做,主角先做,画风入库。"""
+    project = _preproduce(app)
+    before = {(r["kind"], r["name"]): r["version"]
+              for r in app.assets.list(project["id"])
+              if r["kind"] in ("character_art", "character_sheet",
+                               "scene_art")}
+    summary = app.director.restyle_project(
+        project["title"], 1, style="赛博朋克霓虹,冷紫主色")
+    assert summary["status"] == "done"
+    assert summary["style"] == "赛博朋克霓虹,冷紫主色"
+    assert app.projects.get_project(
+        project["title"])["style"] == "赛博朋克霓虹,冷紫主色"
+    after = {(r["kind"], r["name"]): r["version"]
+             for r in app.assets.list(project["id"])
+             if r["kind"] in ("character_art", "character_sheet",
+                              "scene_art")}
+    assert after.keys() == before.keys()
+    for key, version in after.items():
+        assert version == before[key] + 1, f"{key} 未重做"
+    # 状态回落到重做前的稳定状态
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    assert episode["status"] == "awaiting_confirm"
+    # 新画风进入清单提示词
+    plan = json.loads(
+        (app.workspace.artifacts_dir / f"p{project['id']:03d}" / "e001"
+         / "render_plan.json").read_text(encoding="utf-8"))
+    item = next(i for i in plan["items"]
+                if i["category"] == "character_art")
+    assert "赛博朋克霓虹" in item["prompt"]
+
+
+def test_codex_instruction_includes_style_anchor(tmp_path):
+    """Codex 指令包含风格基准图硬约束。"""
+    instruction, _, _ = build_instruction("image", {
+        "portrait": True, "art_name": "石头", "role": "同伴",
+        "prompt": "角色立绘:石头", "style_ref": "/tmp/anchor.png",
+        "width": 1080, "height": 1920,
+    }, tmp_path)
+    assert "风格基准图 /tmp/anchor.png" in instruction
+    assert "禁止任何风格漂移" in instruction

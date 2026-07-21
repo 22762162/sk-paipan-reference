@@ -1702,3 +1702,23 @@ textarea:focus-visible, select:focus-visible {
   border: 1px solid var(--hairline); border-radius: 8px;
   padding: 6px 10px; cursor: pointer;
 }
+
+/* ---- 断点续画横幅 + 重画表单动作行 ---- */
+.resume-banner {
+  margin: 0 18px; padding: 10px 14px;
+  border: 1px solid rgba(250, 178, 25, .5);
+  background: rgba(250, 178, 25, .1);
+  border-radius: var(--radius); color: var(--ink-2); font-size: 13px;
+}
+.resume-banner b { color: var(--warning); }
+.plan-edit-actions { display: flex; gap: 8px; }
+.plan-edit-actions .plan-edit-go { flex: 1; }
+.regen-form .regen-ref { font-size: 12px; }
+
+/* ---- 出图产线切换 ---- */
+.image-line-row select {
+  background: var(--page); color: var(--ink);
+  border: 1px solid var(--hairline); border-radius: 8px;
+  padding: 8px 10px; font-size: 13px;
+}
+.image-line-row .il-label { flex: 0 0 auto; }

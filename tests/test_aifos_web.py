@@ -312,3 +312,25 @@ def test_project_style_api(server):
     status, _ = _json_request(port, "POST", "/api/project/style", {
         "project": "不存在", "style": "x"})
     assert status == 400
+
+
+def test_image_line_switch_and_parallel(server):
+    """页面切换出图产线(Codex/OpenAI API)与并行路数。"""
+    port = server["port"]
+    # 切到 OpenAI 图片 API 优先
+    status, _ = _json_request(port, "POST", "/api/settings", {
+        "capability": "image",
+        "chain": ["image_api", "codex", "api", "mock"]})
+    assert status == 200
+    status, view = _json_request(port, "GET", "/api/settings")
+    assert view["routing"]["image"][0] == "image_api"
+    # 并行路数写入 defaults
+    status, _ = _json_request(port, "POST", "/api/settings", {
+        "defaults": {"parallel_images": 6}})
+    assert status == 200
+    status, view = _json_request(port, "GET", "/api/settings")
+    assert view["defaults"]["parallel_images"] == 6
+    # 非法值被拒
+    status, _ = _json_request(port, "POST", "/api/settings", {
+        "defaults": {"parallel_images": "abc"}})
+    assert status == 400

@@ -96,6 +96,10 @@ def settings_payload(app):
         "providers": providers,
         "routing": app.config.get("routing") or {},
         "capabilities": CAPABILITY_CN,
+        "defaults": {
+            "parallel_images": app.config.get(
+                "defaults", "parallel_images", default=3),
+        },
         "config_path": str(app.workspace.config_path),
     }
 
@@ -168,6 +172,25 @@ def set_routing(config_path, capability, chain):
     data.setdefault("routing", {})[capability] = list(chain)
     _save_file(config_path, data)
     return list(chain)
+
+
+def set_defaults(config_path, mapping):
+    """写入 defaults 配置(如 parallel_images 并行出图路数)。"""
+    allowed = {"parallel_images"}
+    updates = {}
+    for key, value in (mapping or {}).items():
+        if key not in allowed:
+            raise AifosError(f"不支持的默认项: {key}")
+        try:
+            updates[key] = max(1, min(int(value), 8))
+        except (TypeError, ValueError):
+            raise AifosError(f"{key} 需为 1-8 的整数")
+    if not updates:
+        raise AifosError("没有要保存的默认项")
+    data = _load_file(config_path)
+    data.setdefault("defaults", {}).update(updates)
+    _save_file(config_path, data)
+    return updates
 
 
 def test_provider(app, name):

@@ -513,6 +513,7 @@ class StandardCenter:
         serialized = _canonical_json(candidate)
         fingerprint = _fingerprint(candidate)
         conn = self.db.conn
+        self.db._lock.acquire()   # 与并行产线共享连接,事务期间独占
         try:
             conn.execute("BEGIN IMMEDIATE")
             state = conn.execute(
@@ -548,10 +549,13 @@ class StandardCenter:
         except Exception:
             conn.rollback()
             raise
+        finally:
+            self.db._lock.release()
         return self.get(version_id)
 
     def activate(self, version_id):
         conn = self.db.conn
+        self.db._lock.acquire()
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -570,6 +574,8 @@ class StandardCenter:
         except Exception:
             conn.rollback()
             raise
+        finally:
+            self.db._lock.release()
         return self.get(version_id)
 
     def reset(self, change_note=""):

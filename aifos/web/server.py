@@ -558,6 +558,8 @@ def make_handler(workspace, jobs):
                     return self._settings_test()
                 if parsed.path == "/api/settings/detect":
                     return self._settings_detect()
+                if parsed.path == "/api/restyle":
+                    return self._restyle()
                 if parsed.path == "/api/reference/upload":
                     return self._reference_upload()
                 if parsed.path == "/api/reference/delete":
@@ -917,6 +919,10 @@ def make_handler(workspace, jobs):
                     update_provider(app.workspace.config_path,
                                     body["provider"],
                                     body.get("fields") or {})
+                elif body.get("defaults"):
+                    from ..settings import set_defaults
+                    set_defaults(app.workspace.config_path,
+                                 body["defaults"])
                 elif body.get("capability"):
                     chain = body.get("chain") or []
                     if isinstance(chain, str):
@@ -1064,16 +1070,36 @@ def make_handler(workspace, jobs):
                 return self._error(400, str(exc))
             return self._json(project)
 
+        def _restyle(self):
+            """一键换画风:{episode_id|project+episode, style?}。
+            后台按新画风重做全部形象(立绘/套件/场景),可暂停续做。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            style = (body.get("style") or "").strip()
+            job_id = jobs.start_task(
+                title, number,
+                lambda app: app.director.restyle_project(
+                    title, number, style=style))
+            return self._json({"job_id": job_id}, status=202)
+
         def _reference_upload(self):
-            """参考图上传:{project, name, attach_to, note, filename,
-            data_base64};出图时自动注入提示(全局或关联角色/场景)。"""
+            """参考图上传:{project|episode_id, name, attach_to, note,
+            filename, data_base64};出图时自动注入提示。"""
             import base64
             body = self._read_body()
             if body is None:
                 return self._error(400, "请求体不是合法 JSON")
             title = (body.get("project") or "").strip()
             if not title:
-                return self._error(400, "缺少 project")
+                found = self._episode_ref(body)
+                if found is None:
+                    return self._error(400, "缺少 project(或有效 episode_id)")
+                title = found[0]
             try:
                 data = base64.b64decode(body.get("data_base64", ""))
             except Exception:

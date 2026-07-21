@@ -418,6 +418,35 @@ class Director:
                 parts.append(f"{label}:{value}")
         return ",".join(parts)
 
+    def _anchor_character(self, project_id, characters=None):
+        """风格锚角色:主角优先,否则名单第一位;记入 style_anchor 资产。"""
+        row = self.assets.latest(project_id, "style_anchor", "default")
+        if row is not None:
+            meta = row["meta"]
+            if isinstance(meta, str):
+                meta = json.loads(meta or "{}")
+            if meta.get("character"):
+                return meta["character"]
+        if not characters:
+            return None
+        anchor = next((c["name"] for c in characters
+                       if "主" in (c.get("role") or "")),
+                      characters[0]["name"])
+        self.assets.register(project_id, "style_anchor", "default",
+                             meta={"character": anchor})
+        return anchor
+
+    def _style_anchor_uri(self, project_id, exclude_name=None):
+        """风格基准图:锚角色的最新立绘;全项目所有形象向它对齐。
+        exclude_name=锚角色自己画立绘时不引用自己。"""
+        anchor = self._anchor_character(project_id)
+        if not anchor or anchor == exclude_name:
+            return None
+        row = self.assets.latest(project_id, "character_art", anchor)
+        if row and row["uri"] and Path(row["uri"]).exists():
+            return row["uri"]
+        return None
+
     def _character_design(self, project_id, name):
         row = self.assets.latest(project_id, "character", name)
         if row is None:
@@ -537,6 +566,86 @@ class Director:
                      "fallbacks": getattr(result, "fallbacks", [])}
         self._plan_mark(ctx, item_id, "done", extra=extra)
         return result
+
+    def _parallel_workers(self):
+        try:
+            workers = int(self.config.get(
+                "defaults", "parallel_images", default=3))
+        except (TypeError, ValueError):
+            workers = 3
+        return max(1, min(workers, 8))
+
+    def _run_parallel(self, ctx, tasks, line="出图产线"):
+        """并行批量出图产线:风格锚定后同池并行,互不影响一致性。
+        worker 线程只做产线调用;记账/资产登记/清单状态全在主线程。
+        tasks: [{"item_id","capability","payload","sub_dir","tag"}]
+        返回 {tag: ProviderResult};暂停时未完成条目回到排队并保留已完成。"""
+        if not tasks:
+            return {}
+        workers = self._parallel_workers()
+        if workers == 1 or len(tasks) == 1:
+            out = {}
+            for task in tasks:
+                result = self._plan_run(
+                    ctx, task["item_id"], lambda task=task: self._call(
+                        ctx, task["capability"], task["payload"],
+                        task["sub_dir"]))
+                out[task["tag"]] = result
+            return out
+        if self._cancel_requested(ctx):
+            raise ProduceCancelled("已手动停止生成")
+        episode = self.projects.get_episode(ctx["episode"]["id"])
+        budget = self.config.get("budget", "per_episode", default=0)
+        if budget and episode["cost"] >= budget:
+            raise BudgetExceeded(
+                f"单集成本 {episode['cost']:.2f} 已达预算 {budget},停止调度")
+        from concurrent.futures import (FIRST_COMPLETED, ThreadPoolExecutor,
+                                        wait)
+        self.log.info(
+            "director",
+            f"{line}并行开工:共 {len(tasks)} 张,{workers} 路同时生成")
+        for task in tasks:
+            self._plan_mark(ctx, task["item_id"], "generating")
+        cancel = lambda: self._cancel_requested(ctx)   # noqa: E731
+        results, failures = {}, []
+        cancelled = False
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(
+                self.router.call, task["capability"], task["payload"],
+                ctx["out_root"] / task["sub_dir"], cancel): task
+                for task in tasks}
+            pending = set(futures)
+            while pending:
+                done_now, pending = wait(pending, timeout=2,
+                                         return_when=FIRST_COMPLETED)
+                for future in done_now:
+                    task = futures[future]
+                    try:
+                        result = future.result()
+                    except ProduceCancelled:
+                        cancelled = True
+                        self._plan_mark(ctx, task["item_id"], "pending")
+                        continue
+                    except Exception as exc:
+                        failures.append((task, exc))
+                        self._plan_mark(ctx, task["item_id"], "failed",
+                                        error=str(exc)[:300])
+                        continue
+                    self._task_cost += result.cost
+                    self._task_providers.add(result.provider)
+                    self.projects.add_episode_cost(
+                        ctx["episode"]["id"], result.cost)
+                    self._plan_mark(ctx, task["item_id"], "done", extra={
+                        "provider": result.provider,
+                        "real": result.provider != "mock",
+                        "fallbacks": getattr(result, "fallbacks", [])})
+                    results[task["tag"]] = result
+        if cancelled or self._cancel_requested(ctx):
+            raise ProduceCancelled(
+                "已手动暂停(本批已完成的图片全部保留)")
+        if failures:
+            raise failures[0][1]
+        return results
 
     def _plan_seed_shots(self, ctx):
         """分镜确定后,把每个镜头的关键帧与首尾帧登记进清单。"""
@@ -735,6 +844,10 @@ class Director:
         # 先由编剧 AI 写人物设定(性格/外貌/妆容/服装细节),
         # 立绘与全部资产套件的提示词据此丰富;项目级一次,跨集复用
         designs = self._ensure_character_designs(ctx, characters)
+        # 风格锚:主角立绘最先画,成为全项目形象的风格基准图
+        anchor_name = self._anchor_character(project_id, characters)
+        characters = sorted(
+            characters, key=lambda c: c["name"] != anchor_name)
         self._plan_seed(ctx, "character_art", [
             {"id": f"char:{c['name']}", "category": "character_art",
              "label": f"{c['name']}({c.get('role') or '角色'})",
@@ -760,34 +873,90 @@ class Director:
             for loc in locations])
         reused, created = 0, 0
         cast = []
+
+        def portrait_payload(character):
+            name = character["name"]
+            return {
+                "portrait": True, "art_name": name,
+                "role": character.get("role", ""),
+                "shot_no": 0, "characters": [name], "location": "",
+                "prompt": self._portrait_prompt(
+                    name, character.get("role", ""), style,
+                    design=designs.get(name)),
+                "style": style,
+                "reference_images": self._reference_uris(
+                    project_id, [name]),
+                "style_ref": self._style_anchor_uri(
+                    project_id, exclude_name=name),
+                "aspect": ctx["aspect"], **ctx["dims"],
+            }
+
+        # 阶段1:风格锚(主角立绘)先行,后续所有形象向它对齐
+        pending_portraits = []
         for character in characters:
             name = character["name"]
-            role = character.get("role", "")
             self.assets.acquire(
-                project_id, "character", name, meta={"role": role})
+                project_id, "character", name,
+                meta={"role": character.get("role", "")})
             cast.append(name)
-            existing = self._existing_asset_uri(ctx, "character_art", name)
-            if existing:
+            if self._existing_asset_uri(ctx, "character_art", name):
                 reused += 1
                 self._plan_mark(ctx, f"char:{name}", "reused",
                                 only_pending=True)
                 continue
-            reference = self._reference_uris(project_id, [name])
-            result = self._plan_run(ctx, f"char:{name}", lambda: self._call(
-                ctx, "image", {
-                    "portrait": True, "art_name": name, "role": role,
-                    "shot_no": 0, "characters": [name], "location": "",
-                    "prompt": self._portrait_prompt(
-                        name, role, style, design=designs.get(name)),
+            if name == anchor_name:
+                result = self._plan_run(
+                    ctx, f"char:{name}",
+                    lambda c=character: self._call(
+                        ctx, "image", portrait_payload(c), "cast"))
+                self.assets.register(
+                    project_id, "character_art", name, uri=result.uri,
+                    meta={"role": character.get("role", "")})
+                created += 1
+            else:
+                pending_portraits.append(character)
+        # 阶段2:人物立绘产线 + 场景产线 并行批量(全部引用风格基准图)
+        tasks = [{
+            "item_id": f"char:{c['name']}", "capability": "image",
+            "payload": portrait_payload(c), "sub_dir": "cast",
+            "tag": ("char", c["name"], c.get("role", "")),
+        } for c in pending_portraits]
+        for scene in ctx["script"]["scenes"]:
+            location = scene["location"]
+            self.assets.acquire(project_id, "scene", location)
+            if self._existing_asset_uri(ctx, "scene_art", location):
+                reused += 1
+                self._plan_mark(ctx, f"scene:{location}", "reused",
+                                only_pending=True)
+                continue
+            if any(t["tag"] == ("scene", location, "") for t in tasks):
+                continue
+            tasks.append({
+                "item_id": f"scene:{location}", "capability": "image",
+                "payload": {
+                    "scene_art": True, "art_name": location,
+                    "shot_no": 0, "characters": [], "location": location,
+                    "action": scene.get("action", ""),
+                    "prompt": self._scene_prompt(location, style),
                     "style": style,
-                    "reference_images": reference,
+                    "reference_images": self._reference_uris(
+                        project_id, [location]),
+                    "style_ref": self._style_anchor_uri(project_id),
                     "aspect": ctx["aspect"], **ctx["dims"],
-                }, "cast"))
-            self.assets.register(
-                project_id, "character_art", name, uri=result.uri,
-                meta={"role": role})
+                }, "sub_dir": "cast", "tag": ("scene", location, "")})
+        for tag, result in self._run_parallel(
+                ctx, tasks, line="人物立绘+场景概念图").items():
+            kind, name, role = tag
+            if kind == "char":
+                self.assets.register(
+                    project_id, "character_art", name, uri=result.uri,
+                    meta={"role": role})
+            else:
+                self.assets.register(
+                    project_id, "scene_art", name, uri=result.uri)
             created += 1
-        # 人物完整资产套件:四视图/特写/特征/妆容/服装/服装细节
+        # 阶段3:人物资产套件产线 并行批量(引用各自立绘+风格基准图)
+        tasks = []
         for character in characters:
             name = character["name"]
             role = character.get("role", "")
@@ -798,56 +967,36 @@ class Director:
             reference = self._reference_uris(project_id, [name])
             for key, label, desc in CHARACTER_SHEETS:
                 asset_name = f"{name}:{key}"
-                existing = self._existing_asset_uri(
-                    ctx, "character_sheet", asset_name)
-                if existing:
+                if self._existing_asset_uri(
+                        ctx, "character_sheet", asset_name):
                     reused += 1
                     self._plan_mark(ctx, f"sheet:{name}:{key}", "reused",
                                     only_pending=True)
                     continue
-                result = self._plan_run(
-                    ctx, f"sheet:{name}:{key}", lambda: self._call(
-                        ctx, "image", {
-                            "character_sheet": key, "sheet_label": label,
-                            "art_name": name, "role": role,
-                            "shot_no": 0, "characters": [name],
-                            "location": "",
-                            "prompt": self._sheet_prompt(
-                                name, role, style, label, desc,
-                                key=key, design=designs.get(name)),
-                            "style": style,
-                            "character_refs": (
-                                [portrait_uri] if portrait_uri else []),
-                            "reference_images": reference,
-                            "aspect": ctx["aspect"], **ctx["dims"],
-                        }, "cast"))
-                self.assets.register(
-                    project_id, "character_sheet", asset_name,
-                    uri=result.uri,
-                    meta={"character": name, "sheet": key, "label": label})
-                created += 1
-        for scene in ctx["script"]["scenes"]:
-            location = scene["location"]
-            self.assets.acquire(project_id, "scene", location)
-            existing = self._existing_asset_uri(ctx, "scene_art", location)
-            if existing:
-                reused += 1
-                self._plan_mark(ctx, f"scene:{location}", "reused",
-                                only_pending=True)
-                continue
-            result = self._plan_run(
-                ctx, f"scene:{location}", lambda: self._call(ctx, "image", {
-                    "scene_art": True, "art_name": location,
-                    "shot_no": 0, "characters": [], "location": location,
-                    "action": scene.get("action", ""),
-                    "prompt": self._scene_prompt(location, style),
-                    "style": style,
-                    "reference_images": self._reference_uris(
-                        project_id, [location]),
-                    "aspect": ctx["aspect"], **ctx["dims"],
-                }, "cast"))
+                tasks.append({
+                    "item_id": f"sheet:{name}:{key}",
+                    "capability": "image",
+                    "payload": {
+                        "character_sheet": key, "sheet_label": label,
+                        "art_name": name, "role": role,
+                        "shot_no": 0, "characters": [name], "location": "",
+                        "prompt": self._sheet_prompt(
+                            name, role, style, label, desc,
+                            key=key, design=designs.get(name)),
+                        "style": style,
+                        "character_refs": (
+                            [portrait_uri] if portrait_uri else []),
+                        "reference_images": reference,
+                        "style_ref": self._style_anchor_uri(project_id),
+                        "aspect": ctx["aspect"], **ctx["dims"],
+                    }, "sub_dir": "cast",
+                    "tag": (name, key, label)})
+        for (name, key, label), result in self._run_parallel(
+                ctx, tasks, line="人物资产套件").items():
             self.assets.register(
-                project_id, "scene_art", location, uri=result.uri)
+                project_id, "character_sheet", f"{name}:{key}",
+                uri=result.uri,
+                meta={"character": name, "sheet": key, "label": label})
             created += 1
         ctx["cast"] = cast
         return {"reused": reused, "created": created,
@@ -892,6 +1041,9 @@ class Director:
                                                   else []))
         if reference:
             refs["reference_images"] = reference
+        anchor = self._style_anchor_uri(project_id)
+        if anchor:
+            refs["style_ref"] = anchor
         return refs
 
     def _shot_payload(self, ctx, shot):
@@ -931,6 +1083,7 @@ class Director:
         self._plan_seed_shots(ctx)
         ctx["images"] = []
         reused = 0
+        tasks = []
         for shot in ctx["storyboard"]["shots"]:
             existing = self._existing_asset_uri(
                 ctx, "image", self._shot_name(ctx, shot["shot_no"]))
@@ -941,13 +1094,17 @@ class Director:
                 self._plan_mark(ctx, f"shot:{shot['shot_no']}", "reused",
                                 only_pending=True)
                 continue
-            result = self._plan_run(
-                ctx, f"shot:{shot['shot_no']}", lambda: self._call(
-                    ctx, "image", self._shot_payload(ctx, shot), "images"))
-            self._register_shot_asset(ctx, "image", shot["shot_no"],
-                                      result.uri)
-            ctx["images"].append(
-                {"shot_no": shot["shot_no"], "uri": result.uri})
+            tasks.append({
+                "item_id": f"shot:{shot['shot_no']}",
+                "capability": "image",
+                "payload": self._shot_payload(ctx, shot),
+                "sub_dir": "images", "tag": shot["shot_no"]})
+        results = self._run_parallel(ctx, tasks, line="分镜画面")
+        for shot_no in sorted(results):
+            result = results[shot_no]
+            self._register_shot_asset(ctx, "image", shot_no, result.uri)
+            ctx["images"].append({"shot_no": shot_no, "uri": result.uri})
+        ctx["images"].sort(key=lambda i: i["shot_no"])
         return {"count": len(ctx["images"]), "reused": reused}
 
     def _stage_text_assets(self, ctx):
@@ -983,6 +1140,7 @@ class Director:
         images = {i["shot_no"]: i["uri"] for i in ctx["images"]}
         ctx["frames"] = []
         reused = 0
+        tasks = []
         for shot in ctx["storyboard"]["shots"]:
             name = self._shot_name(ctx, shot["shot_no"])
             first = self._existing_asset_uri(ctx, "first_frame", name)
@@ -994,21 +1152,25 @@ class Director:
                 self._plan_mark(ctx, f"frames:{shot['shot_no']}", "reused",
                                 only_pending=True)
                 continue
-            result = self._plan_run(
-                ctx, f"frames:{shot['shot_no']}", lambda: self._call(
-                    ctx, "frames", {
-                        **self._shot_payload(ctx, shot),
-                        "image_uri": images[shot["shot_no"]],
-                    }, "frames"))
+            tasks.append({
+                "item_id": f"frames:{shot['shot_no']}",
+                "capability": "frames",
+                "payload": {**self._shot_payload(ctx, shot),
+                            "image_uri": images[shot["shot_no"]]},
+                "sub_dir": "frames", "tag": shot["shot_no"]})
+        results = self._run_parallel(ctx, tasks, line="首尾帧")
+        for shot_no in sorted(results):
+            result = results[shot_no]
             self._register_shot_asset(
-                ctx, "first_frame", shot["shot_no"], result.data["first"])
+                ctx, "first_frame", shot_no, result.data["first"])
             self._register_shot_asset(
-                ctx, "last_frame", shot["shot_no"], result.data["last"])
+                ctx, "last_frame", shot_no, result.data["last"])
             ctx["frames"].append({
-                "shot_no": shot["shot_no"],
+                "shot_no": shot_no,
                 "first": result.data["first"],
                 "last": result.data["last"],
             })
+        ctx["frames"].sort(key=lambda f: f["shot_no"])
         return {"count": len(ctx["frames"]), "reused": reused}
 
     def _stage_preflight(self, ctx):
@@ -1452,6 +1614,8 @@ class Director:
                     "revision": next_revision("character_art", name),
                     "reference_images": self._reference_uris(
                         project["id"], [name]),
+                    "style_ref": self._style_anchor_uri(
+                        project["id"], exclude_name=name),
                     "aspect": aspect, **ctx["dims"],
                 }, "cast"), prompt=prompt)
             self.assets.register(project["id"], "character_art", name,
@@ -1490,6 +1654,7 @@ class Director:
                             [portrait_uri] if portrait_uri else []),
                         "reference_images": self._reference_uris(
                             project["id"], [name]),
+                        "style_ref": self._style_anchor_uri(project["id"]),
                         "aspect": aspect, **ctx["dims"],
                     }, "cast"), prompt=prompt)
             self.assets.register(
@@ -1511,6 +1676,7 @@ class Director:
                     "revision": next_revision("scene_art", name),
                     "reference_images": self._reference_uris(
                         project["id"], [name]),
+                    "style_ref": self._style_anchor_uri(project["id"]),
                     "aspect": aspect, **ctx["dims"],
                 }, "cast"), prompt=prompt)
             self.assets.register(project["id"], "scene_art", name,
@@ -1645,6 +1811,67 @@ class Director:
                 "director", f"已上传替换镜头{shot_no}画面,旧视频作废")
             return {"uri": str(path)}
         raise AifosError(f"不支持的上传目标: {kind}")
+
+    def restyle_project(self, project_title, episode_number, style=None):
+        """一键换画风:更新项目画风并按新风格重做全部形象
+        (立绘 → 资产套件 → 场景概念图;主角立绘最先重做,其余全部
+        对齐它,保证新画风下依旧全员统一)。可随时暂停,已完成保留。"""
+        project, episode = self._episode_ctx(project_title, episode_number)
+        if style and style.strip():
+            self.projects.update_project(project_title, style=style.strip())
+            project = self.projects.get_project(project_title)
+        script, _ = self.projects.latest_document(episode["id"], "script")
+        if script is None:
+            raise AifosError("本集尚无剧本,先完成剧本确认")
+        previous_status = episode["status"]
+        # 重做期间进入 cast 状态:看板/实况/暂停按钮全部可用
+        self.projects.set_episode_status(episode["id"], "cast")
+        self.log.info(
+            "director",
+            f"开始按新画风重做全部形象: {project['style']}")
+        anchor = self._anchor_character(
+            project["id"], script.get("characters", []))
+        ordered = sorted(script.get("characters", []),
+                         key=lambda c: c["name"] != anchor)
+        done, failed = 0, 0
+        try:
+            for character in ordered:
+                name = character["name"]
+                self.regen_image(project_title, episode_number,
+                                 {"kind": "character_art", "name": name})
+                done += 1
+                for key, _label, _desc in CHARACTER_SHEETS:
+                    self.regen_image(
+                        project_title, episode_number,
+                        {"kind": "character_sheet",
+                         "name": f"{name}:{key}"})
+                    done += 1
+            seen = []
+            for scene in script.get("scenes", []):
+                location = scene["location"]
+                if location in seen:
+                    continue
+                seen.append(location)
+                self.regen_image(project_title, episode_number,
+                                 {"kind": "scene_art", "name": location})
+                done += 1
+        except ProduceCancelled:
+            self.projects.set_episode_status(
+                episode["id"], previous_status)
+            self.log.info(
+                "director",
+                f"换风格重做已暂停:完成 {done} 张并保留,可再次执行继续")
+            return {"status": "paused", "done": done,
+                    "style": project["style"]}
+        finally:
+            row = self.projects.get_episode(episode["id"])
+            if row and row["status"] in ("cast", "cancelling"):
+                self.projects.set_episode_status(
+                    episode["id"], previous_status)
+        self.log.info(
+            "director", f"全部形象已按新画风重做完成(共 {done} 张)。"
+            "分镜画面如需同步新画风,点「全部重做」重制本集")
+        return {"status": "done", "done": done, "style": project["style"]}
 
     # ---- 参考图管理:上传的参考图会自动进入出图提示(关联角色/场景) ----
     def add_reference(self, project_title, name, file_bytes, ext,
