@@ -93,6 +93,15 @@ input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent)
 }
 .produce-bar input[name="sentence"] { flex: 2 1 320px; }
 .produce-bar input[name="premise"] { flex: 1 1 200px; }
+.style-field {
+  flex: 1 1 230px; display: grid; gap: 3px; color: var(--ink-3);
+  font-size: 10px;
+}
+.style-field select {
+  width: 100%; min-height: 38px; padding: 8px 10px;
+  color: var(--ink); background: var(--surface-2);
+  border: 1px solid var(--hairline); border-radius: 8px;
+}
 .produce-bar textarea {
   width: 100%; font-family: inherit; font-size: 13px;
   background: var(--surface); color: var(--ink);
@@ -974,6 +983,138 @@ textarea:focus-visible, select:focus-visible {
 .stop-btn.big { padding: 8px 16px; font-size: 13.5px; }
 .progress-card .stop-btn { margin-right: 10px; }
 
+/* ---------- 持久生产历史 ---------- */
+.history-page {
+  flex: 1; overflow-y: auto; padding: 26px 28px 56px;
+  background:
+    radial-gradient(circle at 88% 0, rgba(57, 135, 229, .13), transparent 28%),
+    radial-gradient(circle at 5% 20%, rgba(12, 163, 12, .05), transparent 24%),
+    var(--page);
+}
+.history-page > * { max-width: 1540px; margin-left: auto; margin-right: auto; }
+.history-live { color: #9fcaff; }
+.history-hero {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, 380px);
+  gap: 22px; align-items: end; margin-bottom: 18px;
+}
+.history-hero h1, .history-detail-title h1 {
+  font-size: clamp(27px, 3vw, 40px); line-height: 1.12; letter-spacing: -.025em;
+}
+.history-hero > div:first-child > p:last-child,
+.history-detail-title p { color: var(--ink-2); margin-top: 8px; }
+.history-assurance {
+  display: grid; grid-template-columns: auto 1fr; gap: 10px;
+  align-items: start; padding: 14px 16px; border-radius: 10px;
+  border: 1px solid rgba(12, 163, 12, .25); background: rgba(12, 163, 12, .065);
+}
+.history-assurance b { color: #82d982; }
+.history-assurance span { color: var(--ink-2); font-size: 12px; }
+.history-kpis {
+  display: grid; grid-template-columns: repeat(5, minmax(130px, 1fr));
+  border: 1px solid var(--hairline); border-radius: 12px;
+  background: rgba(26, 26, 25, .88); margin-bottom: 16px; overflow: hidden;
+}
+.history-kpis > div { min-height: 86px; padding: 14px 16px; border-right: 1px solid var(--hairline); }
+.history-kpis > div:last-child { border-right: 0; }
+.history-kpis span { display: block; color: var(--ink-3); font-size: 11px; margin-bottom: 4px; }
+.history-kpis strong { font-size: 24px; font-variant-numeric: tabular-nums; }
+.history-ledger { padding: 0; overflow: hidden; }
+.history-toolbar {
+  display: grid; grid-template-columns: minmax(220px, 1fr) minmax(220px, .7fr) auto auto;
+  gap: 12px; align-items: end; padding: 15px 17px; border-bottom: 1px solid var(--hairline);
+}
+.history-toolbar h2 { font-size: 15px; }
+.history-toolbar p { color: var(--ink-3); font-size: 11px; margin-top: 2px; }
+.history-toolbar label { display: grid; gap: 4px; }
+.history-toolbar label span { color: var(--ink-3); font-size: 10px; }
+.history-toolbar input { width: 100%; }
+.history-table-wrap { overflow-x: auto; }
+.history-table { min-width: 980px; }
+.history-table th { background: rgba(13, 13, 13, .35); }
+.history-table td { vertical-align: middle; padding-top: 12px; padding-bottom: 12px; }
+.history-table tbody tr { transition: background .15s ease; }
+.history-table tbody tr:hover { background: rgba(57, 135, 229, .055); }
+.history-table td small { display: block; color: var(--ink-3); font-size: 10px; margin-top: 3px; }
+.history-time, .history-project { color: var(--ink); font-weight: 650; }
+.history-time { font-variant-numeric: tabular-nums; }
+.history-error-mini {
+  max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: #ffadad !important;
+}
+.action-tag {
+  display: inline-flex; padding: 3px 8px; border-radius: 999px;
+  color: #bcd9fb; background: rgba(57, 135, 229, .1);
+  border: 1px solid rgba(57, 135, 229, .22); font-size: 11px;
+}
+.run-status {
+  display: inline-flex; align-items: center; white-space: nowrap; padding: 3px 8px;
+  border-radius: 999px; font-size: 10.5px; font-weight: 700;
+  border: 1px solid var(--hairline); color: var(--ink-2); background: var(--surface-2);
+}
+.run-status.completed { color: #8be58b; border-color: rgba(12, 163, 12, .3); background: rgba(12, 163, 12, .1); }
+.run-status.paused { color: #9fcaff; border-color: rgba(57, 135, 229, .32); background: rgba(57, 135, 229, .11); }
+.run-status.failed { color: #ffadad; border-color: rgba(208, 59, 59, .38); background: rgba(208, 59, 59, .1); }
+.run-status.interrupted, .run-status.stopped { color: #ffc89b; border-color: rgba(236, 131, 90, .38); background: rgba(236, 131, 90, .1); }
+.run-status.running, .run-status.cancelling { color: #ffe09a; border-color: rgba(250, 178, 25, .35); background: rgba(250, 178, 25, .1); }
+.history-empty { min-height: 190px; display: grid; place-content: center; gap: 4px; text-align: center; }
+.history-empty span { color: var(--ink-3); font-size: 12px; }
+
+.history-detail-page { padding-top: 20px; }
+.history-detail-head { margin-bottom: 16px; }
+.back-link { display: inline-flex; margin-bottom: 18px; color: var(--ink-3); }
+.history-detail-title { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; }
+.history-detail-actions { display: flex; gap: 8px; margin-top: 16px; }
+.button-link.primary { color: #fff; background: var(--accent); border-color: transparent; }
+.history-error {
+  max-width: 1540px; margin-bottom: 16px; padding: 13px 16px; border-radius: 10px;
+  border: 1px solid rgba(208, 59, 59, .38); background: rgba(208, 59, 59, .075);
+}
+.history-error b { color: #ffadad; }
+.history-error p { color: var(--ink-2); margin-top: 4px; white-space: pre-wrap; }
+.history-detail-grid { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(280px, .6fr); gap: 16px; }
+.history-stage-panel, .history-meta-panel { align-self: start; }
+.section-title { padding-bottom: 12px; border-bottom: 1px solid var(--hairline); }
+.section-title h2 { font-size: 15px; }
+.section-title p { color: var(--ink-3); font-size: 11px; margin-top: 2px; }
+.run-timeline { list-style: none; margin-top: 4px; }
+.run-timeline li {
+  position: relative; display: grid; grid-template-columns: 38px 1fr; gap: 10px;
+  padding: 13px 0; border-bottom: 1px solid var(--grid);
+}
+.run-timeline li:last-child { border-bottom: 0; }
+.timeline-index {
+  display: grid; place-items: center; width: 30px; height: 30px; border-radius: 50%;
+  color: #9fcaff; background: var(--accent-soft); border: 1px solid rgba(57, 135, 229, .3);
+  font-size: 10px; font-weight: 750; font-variant-numeric: tabular-nums;
+}
+.timeline-title { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+.timeline-title b { font-size: 13px; }
+.run-timeline p { color: var(--ink-3); font-size: 11px; margin-top: 3px; }
+.history-meta-panel dl { margin-top: 6px; }
+.history-meta-panel dl > div { display: flex; justify-content: space-between; gap: 15px; padding: 10px 0; border-bottom: 1px solid var(--grid); }
+.history-meta-panel dt { color: var(--ink-3); font-size: 11px; }
+.history-meta-panel dd { text-align: right; color: var(--ink-2); font-size: 12px; }
+.provider-value { font-size: 13px !important; overflow-wrap: anywhere; }
+
+@media (max-width: 1000px) {
+  .history-hero { grid-template-columns: 1fr; align-items: start; }
+  .history-kpis { grid-template-columns: repeat(3, 1fr); }
+  .history-kpis > div { border-bottom: 1px solid var(--hairline); }
+  .history-toolbar { grid-template-columns: 1fr 1fr 1fr; }
+  .history-toolbar > div:first-child { grid-column: 1 / -1; }
+  .history-detail-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 680px) {
+  .history-page { padding: 18px 12px 42px; }
+  .history-kpis { grid-template-columns: 1fr 1fr; }
+  .history-kpis > div { min-height: 76px; }
+  .history-kpis strong { font-size: 20px; }
+  .history-toolbar { grid-template-columns: 1fr; }
+  .history-toolbar > div:first-child { grid-column: auto; }
+  .history-detail-title { align-items: flex-start; flex-direction: column; }
+  .history-detail-actions { flex-wrap: wrap; }
+  .history-live { display: none; }
+}
 /* ---------- 实时工作状态条 ---------- */
 .live-strip {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
@@ -1111,6 +1252,7 @@ textarea:focus-visible, select:focus-visible {
 /* ---- 真假产线透明:占位图标注与接线指引 ---- */
 .plan-badges { display: flex; align-items: center; gap: 6px; }
 .plan-st.st-real { background: var(--accent-soft); color: #7db4ef; }
+.plan-st.st-model { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
 .plan-st.st-mock {
   background: rgba(208, 59, 59, .22); color: #ef8f8f;
   border: 1px solid rgba(208, 59, 59, .5);
@@ -1183,6 +1325,10 @@ textarea:focus-visible, select:focus-visible {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .pc-state { font-size: 11.5px; line-height: 1.5; }
+.pc-model {
+  color: #9fcaff; font-size: 10.5px; line-height: 1.35;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .pc-timer { color: var(--warning); font-weight: 650; }
 .pc-ok { color: var(--good); }
 .pc-ok .pc-mock { color: var(--serious); }
@@ -1266,6 +1412,7 @@ textarea:focus-visible, select:focus-visible {
     </a>
     <nav class="main-nav" aria-label="主导航">
       <a href="#/" data-nav="dashboard">生产总览</a>
+      <a href="#/history" data-nav="history">历史记录</a>
       <a href="#/assets" data-nav="assets" title="人物资产套件/场景概念图/参考图,可复用可重画">资产中心</a>
       <a href="#/standards/production" data-nav="standards">制作标准</a>
       <a href="#/settings" data-nav="settings" title="各环节 AI 使用 CLI 或 API，自由配置">AI 设置</a>
@@ -3340,11 +3487,21 @@ let standardsDraft = null;
 let standardsBaseline = null;
 let standardsMeta = null;
 let standardsDirty = false;
+const MODERN_OTOME_STYLE = "现代都市乙女游戏CG，精致3D半写实角色渲染，亚洲当代青年，现代发型与时尚通勤服装，清透自然皮肤，细腻五官，柔和电影灯光，高级时尚杂志质感；禁止古装、汉服、发簪、长袍、水墨、国风、2D平涂、动漫线稿和历史建筑";
 
 /* ---------- 工具 ---------- */
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmt = (n, d = 2) => n == null ? "-" : Number(n).toFixed(d);
+const dateTime = (ts) => ts ? new Date(Number(ts) * 1000).toLocaleString("zh-CN", {
+  month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
+}) : "-";
+const durationText = (seconds) => {
+  const value = Math.max(0, Number(seconds) || 0);
+  if (value < 60) return `${Math.round(value)} 秒`;
+  if (value < 3600) return `${Math.floor(value / 60)} 分 ${Math.round(value % 60)} 秒`;
+  return `${Math.floor(value / 3600)} 小时 ${Math.round(value % 3600 / 60)} 分`;
+};
 
 async function api(path, opts) {
   const res = await fetch(path, opts);
@@ -3397,6 +3554,21 @@ const STATUS_CN = {
   videos: "视频中", voices: "声音/口型", edit: "剪辑中",
   qc: "质检中", package: "包装中", archive: "沉淀中", running: "制作中",
 };
+const RUN_STATUS_CN = {
+  running: "运行中", cancelling: "停止中", completed: "完成",
+  paused: "阶段暂停", failed: "失败", stopped: "已停止",
+  interrupted: "意外中断",
+};
+const ACTION_CN = {
+  produce: "开始制作", script_import: "导入剧本制作",
+  confirm_script: "确认剧本后续产", confirm_preflight: "确认开拍后续产",
+  force_rebuild: "全部重做", revise_script: "修改剧本",
+  regen_image: "重画图片", adjustment: "制作调整",
+  legacy_import: "历史记录回填",
+};
+function runChip(status) {
+  return `<span class="run-status ${esc(status)}">${esc(RUN_STATUS_CN[status] || status)}</span>`;
+}
 function chip(status) {
   const cls = ["done", "failed", "qc_failed", "awaiting_confirm",
     "awaiting_script"].includes(status)
@@ -3411,11 +3583,12 @@ function route() {
     clearInterval(liveTicker); liveTicker = null;
   }
   const standards = location.hash.match(/^#\/standards(?:\/([a-z_]+))?$/);
+  const history = location.hash.match(/^#\/history(?:\/(\d+))?$/);
   const m = location.hash.match(/^#\/episode\/(\d+)$/);
   const settings = location.hash === "#/settings";
   const assets = location.hash === "#/assets";
-  const area = standards ? "standards" : settings ? "settings"
-    : assets ? "assets" : "dashboard";
+  const area = standards ? "standards" : history ? "history"
+    : settings ? "settings" : assets ? "assets" : "dashboard";
   document.querySelectorAll(".main-nav a").forEach((link) => {
     const active = link.dataset.nav === area;
     link.classList.toggle("active", active);
@@ -3423,10 +3596,139 @@ function route() {
     else link.removeAttribute("aria-current");
   });
   if (standards) renderStandards(standards[1] || "production");
+  else if (history) renderHistory(history[1] ? Number(history[1]) : null);
   else if (m) renderCanvasView(Number(m[1]));
   else if (settings) renderSettings();
   else if (assets) renderAssetsCenter();
   else renderDashboard();
+}
+
+/* ================= 持久生产历史 ================= */
+const HISTORY_STAGE_CN = {
+  script: "剧本", continuity: "连续性圣经", cast: "人物/场景图",
+  storyboard: "五维分镜", images: "关键帧", text_assets: "文字锁定",
+  frames: "首尾帧", preflight: "生产门禁", videos: "Seedance 视频",
+  voices: "声音/口型", edit: "剪辑", qc: "三层质检",
+  package: "封面/标题", archive: "数据沉淀",
+};
+
+function historyTable(items) {
+  if (!items.length) return `<div class="history-empty">
+    <strong>没有符合条件的记录</strong><span>调整筛选条件，或开始一次新的制作。</span></div>`;
+  return `<div class="history-table-wrap"><table class="history-table">
+    <thead><tr><th>开始时间</th><th>作品 / 剧集</th><th>操作</th><th>结果</th>
+      <th>最后阶段</th><th class="num">耗时</th><th class="num">本次成本</th></tr></thead>
+    <tbody>${items.map((run) => `<tr>
+      <td><a class="history-time" href="#/history/${run.id}">${dateTime(run.started_at)}</a>
+        <small>#${run.id}${run.source === "migration" ? " · 旧记录" : ""}</small></td>
+      <td><a class="history-project" href="#/history/${run.id}">${esc(run.current_project || run.project_title)}</a>
+        <small>第 ${run.episode_number} 集${run.force ? " · 全部重做" : ""}</small></td>
+      <td><span class="action-tag">${esc(ACTION_CN[run.action] || run.action)}</span></td>
+      <td>${runChip(run.status)}${run.error ? `<small class="history-error-mini">${esc(run.error)}</small>` : ""}</td>
+      <td>${esc(HISTORY_STAGE_CN[run.last_stage] || run.last_stage || "尚未进入阶段")}
+        <small>${run.stage_count} 个阶段 · ${(run.providers || []).map(esc).join(" / ") || "无 Provider"}</small></td>
+      <td class="num">${durationText(run.duration_seconds)}</td>
+      <td class="num">${fmt(run.cost)}</td>
+    </tr>`).join("")}</tbody></table></div>`;
+}
+
+async function renderHistory(runId = null) {
+  topbarRight.innerHTML = `<span class="history-live">SQLite 持久记录 · 重启不丢失</span>`;
+  if (runId) return renderHistoryDetail(runId);
+  app.innerHTML = `<div class="loading">正在读取生产历史…</div>`;
+  let data;
+  try { data = await api("/api/history?limit=500"); }
+  catch (e) { app.innerHTML = `<div class="loading">历史加载失败：${esc(e.message)}</div>`; return; }
+  const s = data.stats;
+  app.innerHTML = `<div class="history-page">
+    <div class="history-hero">
+      <div><p class="eyebrow">PRODUCTION LEDGER</p><h1>生产历史</h1>
+        <p>每次开工、续产、重做、修改和失败都永久记录。点击任意记录查看阶段、Provider、耗时与错误。</p></div>
+      <div class="history-assurance"><b>持久化</b><span>记录保存在正式工作区数据库，不依赖浏览器或当前服务进程。</span></div>
+    </div>
+    <section class="history-kpis">
+      <div><span>全部运行</span><strong>${s.total}</strong></div>
+      <div><span>完成</span><strong>${s.completed}</strong></div>
+      <div><span>暂停待确认</span><strong>${s.paused}</strong></div>
+      <div><span>失败 / 中断</span><strong>${s.failed + s.interrupted}</strong></div>
+      <div><span>累计运行成本</span><strong>${fmt(s.total_cost)}</strong></div>
+    </section>
+    <section class="history-ledger panel">
+      <div class="history-toolbar">
+        <div><h2>运行台账</h2><p>新记录实时写入，旧剧集已自动回填。</p></div>
+        <label class="history-search"><span>搜索</span><input id="history-query" placeholder="作品名或集数"></label>
+        <label><span>状态</span><select id="history-status"><option value="">全部状态</option>
+          ${Object.entries(RUN_STATUS_CN).map(([value, label]) => `<option value="${value}">${label}</option>`).join("")}</select></label>
+        <label><span>操作</span><select id="history-action"><option value="">全部操作</option>
+          ${(data.filters.actions || []).map((value) => `<option value="${esc(value)}">${esc(ACTION_CN[value] || value)}</option>`).join("")}</select></label>
+      </div>
+      <div id="history-results">${historyTable(data.items)}</div>
+    </section>
+  </div>`;
+
+  const applyFilters = () => {
+    const query = document.getElementById("history-query").value.trim().toLowerCase();
+    const status = document.getElementById("history-status").value;
+    const action = document.getElementById("history-action").value;
+    const filtered = data.items.filter((run) => {
+      const haystack = `${run.current_project || run.project_title} ${run.episode_number}`.toLowerCase();
+      return (!query || haystack.includes(query)) && (!status || run.status === status) &&
+        (!action || run.action === action);
+    });
+    document.getElementById("history-results").innerHTML = historyTable(filtered);
+  };
+  document.getElementById("history-query").addEventListener("input", applyFilters);
+  document.getElementById("history-status").addEventListener("change", applyFilters);
+  document.getElementById("history-action").addEventListener("change", applyFilters);
+}
+
+async function renderHistoryDetail(runId) {
+  app.innerHTML = `<div class="loading">正在读取运行 #${runId}…</div>`;
+  let run;
+  try { run = await api(`/api/history/${runId}`); }
+  catch (e) { app.innerHTML = `<div class="loading">记录加载失败：${esc(e.message)}</div>`; return; }
+  const stages = (run.summary?.stages?.length ? run.summary.stages : run.tasks) || [];
+  const project = run.current_project || run.project_title;
+  app.innerHTML = `<div class="history-page history-detail-page">
+    <div class="history-detail-head">
+      <a href="#/history" class="back-link">← 返回全部历史</a>
+      <div class="history-detail-title"><div><p class="eyebrow">RUN #${run.id}</p>
+        <h1>${esc(project)} · 第 ${run.episode_number} 集</h1>
+        <p>${esc(ACTION_CN[run.action] || run.action)} · ${dateTime(run.started_at)}</p></div>${runChip(run.status)}</div>
+      <div class="history-detail-actions">
+        ${run.episode_id ? `<a class="button-link primary" href="#/episode/${run.episode_id}">打开本集</a>` : ""}
+        <a class="button-link" href="#/history">查看全部记录</a>
+      </div>
+    </div>
+    <section class="history-kpis detail-kpis">
+      <div><span>最终状态</span><strong>${esc(STATUS_CN[run.result_status] || RUN_STATUS_CN[run.status] || run.result_status || "-")}</strong></div>
+      <div><span>总耗时</span><strong>${durationText(run.duration_seconds)}</strong></div>
+      <div><span>本次成本</span><strong>${fmt(run.cost)}</strong></div>
+      <div><span>阶段</span><strong>${run.stage_count || stages.length}</strong></div>
+      <div><span>Provider</span><strong class="provider-value">${(run.providers || []).map(esc).join(" / ") || "-"}</strong></div>
+    </section>
+    ${run.error ? `<section class="history-error"><b>运行异常</b><p>${esc(run.error)}</p></section>` : ""}
+    <section class="history-detail-grid">
+      <div class="panel history-stage-panel"><div class="section-title"><div><h2>阶段时间线</h2><p>按实际执行顺序保留每一步结果。</p></div></div>
+        <ol class="run-timeline">${stages.length ? stages.map((stage, index) => {
+          const status = stage.status || "done";
+          const providers = Array.isArray(stage.providers) ? stage.providers.join(" / ") : stage.provider;
+          return `<li class="${esc(status)}"><span class="timeline-index">${String(index + 1).padStart(2, "0")}</span>
+            <div><div class="timeline-title"><b>${esc(stage.name || HISTORY_STAGE_CN[stage.stage] || stage.stage || "运行阶段")}</b>${runChip(status === "done" ? "completed" : status === "stopped" ? "stopped" : status === "interrupted" ? "interrupted" : status === "failed" ? "failed" : "running")}</div>
+            <p>${esc(providers || "无外部 Provider")} · 成本 ${fmt(stage.cost || 0)}${stage.error ? ` · ${esc(stage.error)}` : ""}</p></div></li>`;
+        }).join("") : `<li class="empty-stage"><span class="timeline-index">–</span><div><b>尚无阶段记录</b><p>任务可能在进入生产阶段前结束。</p></div></li>`}</ol>
+      </div>
+      <aside class="panel history-meta-panel"><h2>运行信息</h2><dl>
+        <div><dt>运行编号</dt><dd>#${run.id}</dd></div>
+        <div><dt>操作类型</dt><dd>${esc(ACTION_CN[run.action] || run.action)}</dd></div>
+        <div><dt>数据来源</dt><dd>${run.source === "migration" ? "旧记录自动回填" : "正式 Web 工作台"}</dd></div>
+        <div><dt>开始</dt><dd>${dateTime(run.started_at)}</dd></div>
+        <div><dt>结束</dt><dd>${dateTime(run.finished_at)}</dd></div>
+        <div><dt>最后阶段</dt><dd>${esc(HISTORY_STAGE_CN[run.last_stage] || run.last_stage || "-")}</dd></div>
+        <div><dt>强制重做</dt><dd>${run.force ? "是" : "否"}</dd></div>
+      </dl></aside>
+    </section>
+  </div>`;
 }
 
 /* ================= 制作标准中心 ================= */
@@ -3973,6 +4275,14 @@ async function renderDashboard() {
       </div>
       <input name="sentence" placeholder='写作品名就行,例如:苏念的一天(集数可不写,自动接着做下一集)' required>
       <input name="premise" placeholder="内容方向,例如:偶像女团 / 都市职场 / 仙侠(可不填)">
+      <label class="style-field">
+        <span>视觉风格</span>
+        <select name="style" aria-label="视觉风格">
+          <option value="${esc(MODERN_OTOME_STYLE)}" selected>现代乙女 · 3D半写实</option>
+          <option value="现代都市电影感，写实人物，现代时装，自然皮肤，电影级灯光；禁止古装、汉服、水墨和2D线稿">现代都市 · 电影写实</option>
+          <option value="国风漫剧，精致2D动画质感，服装与建筑严格符合剧情时代，高细节，统一人物造型">国风漫剧 · 2D</option>
+        </select>
+      </label>
       <button class="primary" type="submit">开始制作</button>
       <textarea name="script" rows="5" hidden placeholder="把你的剧本粘贴到这里,人物、场次、分镜会自动识别。写法示例:
 第1场 古镇长街
@@ -4126,6 +4436,7 @@ async function onProduce(ev) {
       body: JSON.stringify({
         sentence: form.sentence.value,
         premise: form.premise.value,
+        style: form.style.value,
         script_text: form.script.hidden ? "" : form.script.value,
         kind: form.dataset.kind || "",
       }),
@@ -4862,6 +5173,7 @@ function planItemHtml(data, item, editable) {
         ${planIsMock(item) ? `<span class="plan-st st-mock">⚠ 占位图</span>`
           : (item.provider && item.real
             ? `<span class="plan-st st-real">${esc(PROVIDER_LABEL[item.provider] || item.provider)}</span>` : "")}
+        ${item.model ? `<span class="plan-st st-model" title="实际记录的模型/托管通道">${esc(item.model)}</span>` : ""}
         <span class="plan-st st-${st}">${PLAN_STATUS_CN[st] || st}${item.custom_prompt ? " · 已改词" : ""}</span>
         </span>
       </div>
@@ -4995,6 +5307,7 @@ function planCardHtml(data, item, avg) {
     <div class="pc-media">${media}</div>
     <div class="pc-label" title="${esc(item.label)}">${esc(item.label)}</div>
     ${state}
+    ${item.model ? `<div class="pc-model" title="实际记录的模型/托管通道">${esc(item.model)}</div>` : ""}
     <details class="plan-prompt"><summary>提示词</summary>
       <pre>${esc(item.prompt || "")}</pre></details>
   </div>`;

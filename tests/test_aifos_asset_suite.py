@@ -163,6 +163,9 @@ def test_codex_bridge_declares_managed_model(monkeypatch, tmp_path):
         return Reply()
 
     monkeypatch.setattr(codex_image.subprocess, "run", fake_run)
+    # 本测试不依赖本机真的装了 codex(CI/沙盒环境同样可跑)
+    monkeypatch.setattr(codex_image.shutil, "which",
+                        lambda _cmd: "/usr/bin/codex")
     reply = codex_image.run({
         "capability": "image",
         "payload": {"portrait": True, "art_name": "周鹿"},
