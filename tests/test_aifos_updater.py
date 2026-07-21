@@ -24,14 +24,14 @@ def test_no_repo_skipped(tmp_path):
 
 def test_dirty_worktree_never_touched():
     status, detail = check_and_update(Path("/x"), runner=_runner({
-        ("status", "--porcelain"): _R("M aifos/app.py\n")}))
+        ("status", "--porcelain", "--untracked-files=no"): _R("M aifos/app.py\n")}))
     assert status == "dirty"
     assert "跳过" in detail
 
 
 def test_up_to_date():
     status, _ = check_and_update(Path("/x"), runner=_runner({
-        ("status", "--porcelain"): _R(""),
+        ("status", "--porcelain", "--untracked-files=no"): _R(""),
         ("rev-parse", "--abbrev-ref", "HEAD"): _R("main\n"),
         ("rev-parse", "HEAD"): _R("abc123\n"),
         ("rev-parse", "origin/main"): _R("abc123\n")}))
@@ -44,7 +44,7 @@ def test_updates_when_behind():
     def run(*args):
         calls.append(args)
         table = {
-            ("status", "--porcelain"): _R(""),
+            ("status", "--porcelain", "--untracked-files=no"): _R(""),
             ("rev-parse", "--abbrev-ref", "HEAD"): _R("main\n"),
             ("rev-parse", "HEAD"): _R("old\n"),
             ("rev-parse", "origin/main"): _R("new\n"),
@@ -60,7 +60,7 @@ def test_updates_when_behind():
 
 def test_fetch_failure_is_safe():
     status, detail = check_and_update(Path("/x"), runner=_runner({
-        ("status", "--porcelain"): _R(""),
+        ("status", "--porcelain", "--untracked-files=no"): _R(""),
         ("rev-parse", "--abbrev-ref", "HEAD"): _R("main\n"),
         ("fetch", "origin", "main"): _R(returncode=1, stderr="offline")}))
     assert status == "error"

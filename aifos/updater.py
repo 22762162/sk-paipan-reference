@@ -47,7 +47,8 @@ def check_and_update(root, runner=None):
         return "no_repo", "非 git 安装,跳过自动更新"
     run = runner or _git_runner(root)
     try:
-        status = run("status", "--porcelain")
+        # 只看已跟踪文件:workspace/日志等未跟踪目录不算"有改动"
+        status = run("status", "--porcelain", "--untracked-files=no")
         if status.returncode != 0:
             return "error", status.stderr.strip()[:200]
         if status.stdout.strip():
