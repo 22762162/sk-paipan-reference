@@ -414,6 +414,8 @@ def make_handler(workspace, jobs):
                     return self._settings_detect()
                 if parsed.path == "/api/project/rename":
                     return self._project_rename()
+                if parsed.path == "/api/stop":
+                    return self._stop()
                 if parsed.path == "/api/standards/save":
                     return self._standards_save()
                 if parsed.path == "/api/standards/activate":
@@ -664,13 +666,19 @@ def make_handler(workspace, jobs):
                 project = app.db.query_one(
                     "SELECT * FROM projects WHERE id=?",
                     (episode["project_id"],))
-                return project["title"], episode["number"]
+                return (project["title"], episode["number"],
+                        episode["status"])
 
             found = self._with_app(lookup)
             if found is None:
                 return self._error(404, "剧集不存在")
-            job_id = jobs.start(found[0], found[1], review=False)
-            return self._json({"job_id": job_id}, status=202)
+            title, number, status = found
+            # 剧本确认 → 继续预生产(画完人物/分镜再停一次);
+            # 开拍确认 → 自动完成视频/配音/剪辑/质检
+            job_id = jobs.start(title, number,
+                                review=(status == "awaiting_script"))
+            return self._json(
+                {"job_id": job_id, "phase": status}, status=202)
 
         def _episode_ref(self, body):
             episode_id = body.get("episode_id")
@@ -791,6 +799,31 @@ def make_handler(workspace, jobs):
             view["applied"] = [{"provider": p, "path": path}
                                for p, path in applied]
             return self._json(view)
+
+        def _stop(self):
+            """停止生成:置 cancelling,流水线在下一次产线调用前安全停下,
+            落回最近的可调整检查点(剧本确认/开拍确认)。"""
+            body = self._read_body()
+            if body is None or not body.get("episode_id"):
+                return self._error(400, "缺少 episode_id")
+            stable = {"done", "failed", "qc_failed", "created",
+                      "awaiting_script", "awaiting_confirm"}
+
+            def task(app):
+                episode = app.projects.get_episode(int(body["episode_id"]))
+                if episode is None:
+                    raise AifosError("剧集不存在")
+                if episode["status"] in stable:
+                    raise AifosError("当前没有正在进行的生成")
+                app.projects.set_episode_status(episode["id"], "cancelling")
+                return episode["status"]
+
+            try:
+                previous = self._with_app(task)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json({"status": "cancelling",
+                               "previous": previous})
 
         def _project_rename(self):
             body = self._read_body()

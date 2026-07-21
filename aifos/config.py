@@ -70,10 +70,12 @@ DEFAULTS = {
             "quota": 1000,             # 订阅额度(次);耗尽后路由自动回退 API
         },
         "jianying": {
-            "type": "cli", "enabled": False,
+            # 剪映真实草稿:剪辑结果自动进剪映草稿库(需 pyJianYingDraft),
+            # 打开剪映微调后导出;剪映无官方 CLI/新版无自动导出
+            "type": "jianying_draft", "enabled": False,
             "capabilities": ["edit"],
-            "command": ["jianying-cli"],
-            "cost_per_call": 0.5, "timeout": 1200,
+            "draft_dir": "",   # 留空自动找 ~/Movies/JianyingPro Drafts 等
+            "cost_per_call": 0.3,
         },
         "claude_api": {
             # Claude 官方 API 直连(Messages API):Claude CLI 的 API 模式

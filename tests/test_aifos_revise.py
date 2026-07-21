@@ -34,7 +34,7 @@ def test_revise_script_regenerates(app):
     before, v1 = _script_of(app, "万妖图录", 1)
     summary = app.director.revise_script(
         "万妖图录", 1, "节奏太慢,加一场打斗")
-    assert summary["status"] == "awaiting_confirm"
+    assert summary["status"] == "awaiting_script"   # 重写后先看剧本再画图
     after, v2 = _script_of(app, "万妖图录", 1)
     assert v2 == v1 + 1
     assert after != before  # 意见进入 payload → 确定性变化
@@ -45,6 +45,7 @@ def test_revise_script_regenerates(app):
 
 def test_regen_character_art(app):
     app.director.produce("万妖图录", 1, pause_for_confirm=True)
+    app.director.produce("万妖图录", 1, pause_for_confirm=True)  # 剧本确认
     project = app.projects.get_project("万妖图录")
     name = app.assets.list(project["id"], "character_art")[0]["name"]
     v1 = app.assets.latest(project["id"], "character_art", name)["version"]
@@ -75,6 +76,7 @@ def test_regen_shot_invalidates_video(app):
 
 def test_regen_scene_art_and_errors(app):
     app.director.produce("万妖图录", 1, pause_for_confirm=True)
+    app.director.produce("万妖图录", 1, pause_for_confirm=True)  # 剧本确认
     project = app.projects.get_project("万妖图录")
     scene = app.assets.list(project["id"], "scene_art")[0]["name"]
     result = app.director.regen_image(
@@ -130,6 +132,10 @@ def test_cli_revise_and_regen(tmp_path, capsys):
     assert main(["--workspace", ws, "revise", "--project", "万妖图录",
                  "--episode", "1", "--feedback", "更热血"]) == 0
     assert "重写" in capsys.readouterr().out
+    # 剧本确认 → 画出人物/分镜后才能重画单镜头
+    assert main(["--workspace", ws, "confirm", "--project", "万妖图录",
+                 "--episode", "1"]) == 0
+    capsys.readouterr()
     assert main(["--workspace", ws, "regen", "--project", "万妖图录",
                  "--episode", "1", "--shot", "1",
                  "--feedback", "夜晚"]) == 0

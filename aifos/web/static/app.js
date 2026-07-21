@@ -57,14 +57,17 @@ function armConfirm(btn, label, action) {
 
 const STATUS_CN = {
   done: "完成", failed: "失败", qc_failed: "质检未过", created: "已建",
-  awaiting_confirm: "待确认", script: "剧本中", continuity: "锁连续性",
+  awaiting_confirm: "待确认", awaiting_script: "剧本待确认",
+  cancelling: "正在停止…",
+  script: "剧本中", continuity: "锁连续性",
   cast: "画人物场景", storyboard: "五维分镜中", images: "关键帧中",
   text_assets: "锁文字", frames: "首尾帧", preflight: "门禁检查",
   videos: "视频中", voices: "声音/口型", edit: "剪辑中",
   qc: "质检中", package: "包装中", archive: "沉淀中", running: "制作中",
 };
 function chip(status) {
-  const cls = ["done", "failed", "qc_failed", "awaiting_confirm"].includes(status)
+  const cls = ["done", "failed", "qc_failed", "awaiting_confirm",
+    "awaiting_script"].includes(status)
     ? status : "running";
   return `<span class="chip ${cls}">${esc(STATUS_CN[status] || status)}</span>`;
 }
@@ -525,6 +528,79 @@ function bindStandards(sectionId) {
   });
 }
 
+/* 停止生成:流水线在当前产线调用后安全停下,落回可调整检查点 */
+async function stopEpisode(episodeId) {
+  try {
+    await api("/api/stop", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ episode_id: episodeId }),
+    });
+    showToast("正在停止…将安全落回可调整的检查点", "ok");
+  } catch (e) { showToast(e.message, "error"); }
+}
+
+/* 轮询防闪烁:数据没变一个字都不动;变了也只补丁更新变化区块 */
+let dashSignature = "";
+
+function dashSig(data) {
+  return JSON.stringify([
+    data.episodes.map((e) => [e.id, e.status, e.qc_score, e.cost]),
+    data.jobs.map((j) => [j.id, j.status]),
+    data.stats,
+  ]);
+}
+
+function tilesHtml(data) {
+  const s = data.stats;
+  const running = data.jobs.filter((j) => j.status === "running").length;
+  return `
+      <div class="tile"><div class="label">剧集总数</div><div class="value">${s.episodes}</div></div>
+      <div class="tile"><div class="label">已完成</div><div class="value">${s.done}<small> / ${s.episodes}</small></div></div>
+      <div class="tile"><div class="label">总成本</div><div class="value">${fmt(s.total_cost)}<small> 单集预算 ${fmt(s.budget, 0)}</small></div></div>
+      <div class="tile"><div class="label">平均质检分</div><div class="value">${s.avg_qc == null ? "-" : fmt(s.avg_qc, 1)}</div></div>
+      <div class="tile"><div class="label">制作任务</div><div class="value">${running}<small> 进行中</small></div></div>`;
+}
+
+function episodesPanelHtml(data) {
+  return `
+      <h2>剧集 · 点击进入分镜画布</h2>
+      ${data.episodes.length ? `
+      <table><thead><tr><th>项目</th><th>集</th><th>状态</th><th class="num">质检</th><th class="num">成本</th></tr></thead>
+      <tbody>${data.episodes.map((e) => `
+        <tr class="clickable" data-ep="${e.id}">
+          <td>${esc(e.project)}</td><td>第${e.number}集</td>
+          <td>${chip(e.status)}</td>
+          <td class="num">${e.qc_score == null ? "-" : fmt(e.qc_score, 0)}</td>
+          <td class="num">${fmt(e.cost)}</td>
+        </tr>`).join("")}</tbody></table>`
+      : `<div class="empty">暂无剧集,输入一句话开始制作。</div>`}`;
+}
+
+function bindEpisodeRows() {
+  app.querySelectorAll("tr.clickable").forEach((tr) =>
+    tr.addEventListener("click", () => { location.hash = `#/episode/${tr.dataset.ep}`; }));
+}
+
+function updateTopbar(data) {
+  const running = data.jobs.filter((j) => j.status === "running").length;
+  const activeStandard = data.production_standard || {};
+  topbarRight.innerHTML = `<a class="standard-live" href="#/standards/history">标准 v${esc(activeStandard.version || 1)}</a>` + (running
+    ? `<span class="chip running">${running} 个制作任务进行中</span>` : "");
+}
+
+/* 局部刷新:只动进度条/数字/剧集表,不重画表单和图片区 → 不闪 */
+function updateDashboard(data) {
+  updateTopbar(data);
+  renderProgressBanner(data);
+  const tiles = document.getElementById("tiles");
+  if (tiles) tiles.innerHTML = tilesHtml(data);
+  const panel = document.getElementById("episodes-panel");
+  if (panel) {
+    panel.innerHTML = episodesPanelHtml(data);
+    bindEpisodeRows();
+  }
+}
+
 /* ================= 仪表盘 ================= */
 async function renderDashboard() {
   topbarRight.innerHTML = "";
@@ -532,11 +608,11 @@ async function renderDashboard() {
   try { data = await api("/api/overview"); }
   catch (e) { app.innerHTML = `<div class="loading">加载失败:${esc(e.message)}</div>`; return; }
 
+  dashSignature = dashSig(data);
   const s = data.stats;
   const runningJobs = data.jobs.filter((j) => j.status === "running");
   const activeStandard = data.production_standard || {};
-  topbarRight.innerHTML = `<a class="standard-live" href="#/standards/history">标准 v${esc(activeStandard.version || 1)}</a>` + (runningJobs.length
-    ? `<span class="chip running">${runningJobs.length} 个制作任务进行中</span>` : "");
+  updateTopbar(data);
 
   const maxStage = Math.max(1, ...data.cost_by_stage.map((r) => r.total || 0));
   app.innerHTML = `
@@ -572,27 +648,9 @@ async function renderDashboard() {
     <div id="progress-banner"></div>
     <div id="pipeline-strip"></div>
 
-    <div class="tiles">
-      <div class="tile"><div class="label">剧集总数</div><div class="value">${s.episodes}</div></div>
-      <div class="tile"><div class="label">已完成</div><div class="value">${s.done}<small> / ${s.episodes}</small></div></div>
-      <div class="tile"><div class="label">总成本</div><div class="value">${fmt(s.total_cost)}<small> 单集预算 ${fmt(s.budget, 0)}</small></div></div>
-      <div class="tile"><div class="label">平均质检分</div><div class="value">${s.avg_qc == null ? "-" : fmt(s.avg_qc, 1)}</div></div>
-      <div class="tile"><div class="label">制作任务</div><div class="value">${runningJobs.length}<small> 进行中</small></div></div>
-    </div>
+    <div class="tiles" id="tiles">${tilesHtml(data)}</div>
 
-    <div class="panel">
-      <h2>剧集 · 点击进入分镜画布</h2>
-      ${data.episodes.length ? `
-      <table><thead><tr><th>项目</th><th>集</th><th>状态</th><th class="num">质检</th><th class="num">成本</th></tr></thead>
-      <tbody>${data.episodes.map((e) => `
-        <tr class="clickable" data-ep="${e.id}">
-          <td>${esc(e.project)}</td><td>第${e.number}集</td>
-          <td>${chip(e.status)}</td>
-          <td class="num">${e.qc_score == null ? "-" : fmt(e.qc_score, 0)}</td>
-          <td class="num">${fmt(e.cost)}</td>
-        </tr>`).join("")}</tbody></table>`
-      : `<div class="empty">暂无剧集,输入一句话开始制作。</div>`}
-    </div>
+    <div class="panel" id="episodes-panel">${episodesPanelHtml(data)}</div>
 
     <div class="grid-2">
       <div class="panel">
@@ -660,8 +718,7 @@ async function renderDashboard() {
       form.dataset.kind = tab.dataset.kind;
     }));
   renderProgressBanner(data);
-  app.querySelectorAll("tr.clickable").forEach((tr) =>
-    tr.addEventListener("click", () => { location.hash = `#/episode/${tr.dataset.ep}`; }));
+  bindEpisodeRows();
   app.querySelectorAll(".proj-rename").forEach((btn) =>
     btn.addEventListener("click", () =>
       renameProject(btn.dataset.title, renderDashboard)));
@@ -690,11 +747,28 @@ async function renderDashboard() {
       : `<div class="empty">暂无日志</div>`;
   }).catch(() => {});
 
-  if (runningJobs.length) pollTimer = setInterval(refreshIfIdle, 2500);
+  const producing = data.episodes.some((e) =>
+    !["done", "failed", "qc_failed", "created", "awaiting_script",
+      "awaiting_confirm"].includes(e.status));
+  if (runningJobs.length || producing)
+    pollTimer = setInterval(refreshIfIdle, 2500);
 }
 
-function refreshIfIdle() {
-  if (location.hash === "" || location.hash === "#/") renderDashboard();
+async function refreshIfIdle() {
+  if (!(location.hash === "" || location.hash === "#/")) return;
+  try {
+    const data = await api("/api/overview");
+    // 顺带静默刷新日志(纯文本,不引起闪烁)
+    api("/api/logs?limit=30").then((rows) => {
+      const el = document.getElementById("log-list");
+      if (el && rows.length) el.innerHTML = rows.reverse().map((r) =>
+        `<div class="lv-${esc(r.level)}">[${esc(r.level)}] ${esc(r.source)}: ${esc(r.message)}</div>`).join("");
+    }).catch(() => {});
+    const sig = dashSig(data);
+    if (sig === dashSignature) return;   // 没变化:整页纹丝不动
+    dashSignature = sig;
+    updateDashboard(data);
+  } catch (e) { /* 网络抖动下一轮再试 */ }
 }
 
 async function onProduce(ev) {
@@ -1194,7 +1268,7 @@ function showScriptOverlay(data, episodeId) {
       await post("/api/revise", { episode_id: data.episode.id, feedback });
       close();
       showToast("正在按你的意见重写剧本并重出人物/分镜…", "ok");
-      pollTimer = setInterval(() => renderCanvasView(episodeId), 3000);
+      pollCanvas(episodeId);
     } catch (e) { showToast(e.message, "error"); }
   };
   const editArea = overlay.querySelector("#edit-area");
@@ -1214,7 +1288,7 @@ function showScriptOverlay(data, episodeId) {
       });
       close();
       showToast(`已按${source}重做,人物/分镜将自动更新…`, "ok");
-      pollTimer = setInterval(() => renderCanvasView(episodeId), 3000);
+      pollCanvas(episodeId);
     } catch (e) { showToast(e.message, "error"); }
   };
   overlay.querySelector("#btn-edit-submit").onclick = () =>
@@ -1402,13 +1476,22 @@ const STAGE_PLAIN = {
 function renderProgressBanner(data) {
   const el = document.getElementById("progress-banner");
   if (!el) return;
+  const awaitingScript = data.episodes.filter(
+    (e) => e.status === "awaiting_script");
   const awaiting = data.episodes.filter(
     (e) => e.status === "awaiting_confirm");
   const producing = data.episodes.filter(
-    (e) => !["done", "failed", "qc_failed", "created",
+    (e) => !["done", "failed", "qc_failed", "created", "awaiting_script",
              "awaiting_confirm"].includes(e.status));
-  if (!producing.length && !awaiting.length) { el.innerHTML = ""; return; }
-  el.innerHTML = awaiting.map((e) => `
+  if (!producing.length && !awaiting.length && !awaitingScript.length) {
+    el.innerHTML = ""; return;
+  }
+  el.innerHTML = awaitingScript.map((e) => `
+    <div class="progress-card confirm">
+      <div class="progress-text">《${esc(e.project)}》第${e.number}集 剧本写好了,先过目 📖
+        <span>看过剧本点确认才开始画图(还没花出图额度);不满意可附意见重写</span></div>
+      <button class="primary" onclick="location.hash='#/episode/${e.id}'">去看剧本 →</button>
+    </div>`).join("") + awaiting.map((e) => `
     <div class="progress-card confirm">
       <div class="progress-text">《${esc(e.project)}》第${e.number}集 预生产完成,等你过目
         <span>连续性、五维分镜、关键帧与生产门禁均已通过</span></div>
@@ -1419,6 +1502,7 @@ function renderProgressBanner(data) {
     const pct = Math.round(step / STAGE_ORDER.length * 100);
     return `
     <div class="progress-card">
+      <button class="stop-btn" onclick="stopEpisode(${e.id})" title="停止生成,落回可调整的检查点">⏹ 停止</button>
       <div class="progress-text">正在制作《${esc(e.project)}》第${e.number}集
         <span>第 ${step} 步 / 共 ${STAGE_ORDER.length} 步 · ${esc(STAGE_PLAIN[e.status] || e.status)}…</span></div>
       <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
@@ -1433,6 +1517,33 @@ const KIND_CN = {
 };
 
 /* ================= 分镜画布 ================= */
+
+/* 画布轮询防闪烁:内容签名没变就不重画 */
+let canvasSignature = "";
+
+function canvasSig(data) {
+  return JSON.stringify([
+    data.episode.status, data.episode.qc_score, data.episode.title,
+    (data.tasks || []).map((t) => [t.stage, t.status]),
+    data.script_version, data.storyboard_version,
+    Object.values((data.artifacts || {}).images || {}),
+    Object.values((data.artifacts || {}).videos || {}),
+    ((data.artifacts || {}).cast_art || []).map((c) => c.url),
+    ((data.artifacts || {}).scene_art || []).map((x) => x.url),
+    (data.artifacts || {}).final, (data.artifacts || {}).cover,
+  ]);
+}
+
+function pollCanvas(episodeId) {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(async () => {
+    try {
+      const data = await api(`/api/episode/${episodeId}`);
+      if (canvasSig(data) !== canvasSignature) renderCanvasView(episodeId);
+    } catch (e) { /* 下一轮再试 */ }
+  }, 3000);
+}
+
 const CARD_W = 220, CARD_H = 218, GAP_X = 26, GAP_Y = 56, LANE_X = 150;
 
 async function renderCanvasView(episodeId) {
@@ -1440,13 +1551,24 @@ async function renderCanvasView(episodeId) {
   let data;
   try { data = await api(`/api/episode/${episodeId}`); }
   catch (e) { app.innerHTML = `<div class="loading">加载失败:${esc(e.message)}</div>`; return; }
+  canvasSignature = canvasSig(data);
 
   const ep = data.episode, sb = data.storyboard, script = data.script;
   topbarRight.innerHTML = chip(ep.status);
+  if (ep.status === "awaiting_script" && script) {
+    renderScriptReview(data, episodeId);
+    return;
+  }
   if (!sb) {
+    const stable = ["done", "failed", "qc_failed", "created",
+      "awaiting_script", "awaiting_confirm"];
+    if (!stable.includes(ep.status)) {
+      renderProductionView(data, episodeId);
+      return;
+    }
     app.innerHTML = `<div class="loading">本集尚无分镜(制作进行中或未开始)。<a href="#/">返回仪表盘</a></div>`;
     if (!["done", "failed", "qc_failed"].includes(ep.status))
-      pollTimer = setInterval(() => renderCanvasView(episodeId), 3000);
+      pollCanvas(episodeId);
     return;
   }
 
@@ -1490,6 +1612,8 @@ async function renderCanvasView(episodeId) {
       </div>
       <button id="btn-play" class="primary">▶ 播放本集</button>
       <button id="btn-script">剧本</button>
+      <button id="btn-stop-live" class="stop-btn" hidden
+        title="停止当前生成,落回可调整的检查点">⏹ 停止生成</button>
       <button id="btn-reproduce" title="复用已完成的部分,只补做缺失内容">继续补齐</button>
       <button id="btn-reproduce-force" title="从头全部重新制作(真实产线会消耗额度)">全部重做</button>
       <div class="zoom-group">
@@ -1509,6 +1633,17 @@ async function renderCanvasView(episodeId) {
   </div>`;
 
   document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
+  const stopLive = document.getElementById("btn-stop-live");
+  if (stopLive) {
+    const producingNow = !["done", "failed", "qc_failed", "created",
+      "awaiting_script", "awaiting_confirm"].includes(ep.status);
+    stopLive.hidden = !producingNow;
+    stopLive.onclick = () => {
+      stopLive.disabled = true;
+      stopLive.textContent = "停止中…";
+      stopEpisode(ep.id);
+    };
+  }
   const reproduce = async (force) => {
     try {
       await api("/api/produce", {
@@ -1519,7 +1654,7 @@ async function renderCanvasView(episodeId) {
         }),
       });
       showToast(force ? "已提交强制重制,画布将自动刷新" : "已提交增量重制,画布将自动刷新", "ok");
-      pollTimer = setInterval(() => renderCanvasView(episodeId), 3000);
+      pollCanvas(episodeId);
     } catch (e) { showToast(e.message, "error"); }
   };
   document.getElementById("btn-reproduce").onclick = (ev) =>
@@ -1539,7 +1674,7 @@ async function renderCanvasView(episodeId) {
         body: JSON.stringify({ episode_id: ep.id }),
       });
       showToast("已确认!正在生成 Seedance 视频、随视频配音/口型与无字幕母版", "ok");
-      pollTimer = setInterval(() => renderCanvasView(episodeId), 3000);
+      pollCanvas(episodeId);
     } catch (e) {
       showToast(e.message, "error");
       btnConfirm.disabled = false;
@@ -1548,8 +1683,8 @@ async function renderCanvasView(episodeId) {
   };
   // 制作进行中自动刷新画布(待确认是稳定状态,不轮询)
   if (!["done", "failed", "qc_failed", "created",
-        "awaiting_confirm"].includes(ep.status))
-    pollTimer = setInterval(() => renderCanvasView(episodeId), 3000);
+        "awaiting_script", "awaiting_confirm"].includes(ep.status))
+    pollCanvas(episodeId);
 
   const canvas = new StoryboardCanvas(data, shotIssues, lineIssues);
   canvas.mount();
@@ -1574,6 +1709,122 @@ async function renderCanvasView(episodeId) {
   btnTheater.onclick = () => setView("theater");
   btnCanvas.onclick = () => setView("canvas");
   setView(localStorage.getItem("aifos.view") || "theater");
+}
+
+/* ---- 剧本正文(审阅页与生产直播页共用) ---- */
+function scriptBodyHtml(script) {
+  return `
+      <h1>${esc(script.episode_title || "本集剧本")}</h1>
+      <p class="logline">${esc(script.logline || "")}</p>
+      <div class="cast">${(script.characters || []).map((c) =>
+        `<span class="chip">${esc(c.name)} · ${esc(c.role || "")}</span>`).join("")}</div>
+      ${script.scenes.map((s) => `
+        <section class="scene">
+          <h4>场 ${s.scene_no} · ${esc(s.location)}</h4>
+          ${s.action ? `<p class="action">${esc(s.action)}</p>` : ""}
+          ${(s.lines || []).map((l) => `
+            <p class="line"><b>${esc(l.character)}</b>${esc(l.dialogue)}</p>`).join("")}
+        </section>`).join("")}`;
+}
+
+/* ---- 生产直播页:每一步实时可见,剧本一出即可阅读,可随时停止 ---- */
+function renderProductionView(data, episodeId) {
+  const ep = data.episode;
+  const done = new Set((data.tasks || [])
+    .filter((t) => t.status === "done").map((t) => t.stage));
+  const runningTask = (data.tasks || []).find((t) => t.status === "running");
+  const runningStage = (runningTask && runningTask.stage) || ep.status;
+  app.innerHTML = `
+  <div class="canvas-view">
+    <div class="canvas-toolbar">
+      <button id="btn-back">← 仪表盘</button>
+      <span class="title">《${esc(data.project.title)}》第${ep.number}集</span>
+      ${chip(ep.status)}
+      <span class="spacer"></span>
+      <button id="btn-stop" class="stop-btn big"
+        title="在当前产线调用结束后安全停下,落回可调整的检查点">⏹ 停止生成</button>
+    </div>
+    <div class="produce-live">
+      <div class="panel">
+        <h2>制作进行中 · ${esc(STAGE_PLAIN[runningStage] || "准备中")}…</h2>
+        <ol class="stage-steps">
+          ${STAGE_ORDER.map((stage) => {
+            const state = done.has(stage) ? "done"
+              : stage === runningStage ? "run" : "todo";
+            return `<li class="${state}">${state === "done" ? "✓"
+              : state === "run" ? "⏳" : "○"} ${esc(STAGE_CN[stage] || stage)}</li>`;
+          }).join("")}
+        </ol>
+        <div class="dim">每完成一步页面自动更新(不闪);
+        点「⏹ 停止生成」可先调整剧本/图片细节再继续。</div>
+      </div>
+      ${data.script ? `<div class="script-review">
+        <div class="dim" style="margin-bottom:6px">📖 剧本已就绪,可边生产边阅读:</div>
+        ${scriptBodyHtml(data.script)}
+      </div>` : `<div class="panel dim">剧本生成中,写好会第一时间显示在这里…</div>`}
+    </div>
+  </div>`;
+  document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
+  document.getElementById("btn-stop").onclick = (ev) => {
+    ev.target.disabled = true;
+    ev.target.textContent = "停止中…";
+    stopEpisode(ep.id);
+  };
+  pollCanvas(episodeId);
+}
+
+/* ---- 剧本审阅页:剧本确认后才开始画图(第一道确认) ---- */
+function renderScriptReview(data, episodeId) {
+  const script = data.script;
+  app.innerHTML = `
+  <div class="canvas-view">
+    <div class="confirm-banner">
+      <div>
+        <b>剧本写好了,先过目 📖</b>
+        <span>看完满意点确认,才开始画人物/场景/分镜(此刻还没花出图额度);
+        不满意在下方写修改意见重写,或直接编辑文字。</span>
+      </div>
+      <button class="primary" id="btn-script-ok">✅ 剧本OK,开始画图</button>
+    </div>
+    <div class="canvas-toolbar">
+      <button id="btn-back">← 仪表盘</button>
+      <span class="title">《${esc(data.project.title)}》第${data.episode.number}集</span>
+      ${chip(data.episode.status)}
+      <span class="spacer"></span>
+      <button id="btn-polish">✏️ 打磨剧本(意见重写/直接编辑/上传下载)</button>
+    </div>
+    <div class="script-review">
+      <h1>${esc(script.episode_title || "本集剧本")}</h1>
+      <p class="logline">${esc(script.logline || "")}</p>
+      <div class="cast">${(script.characters || []).map((c) =>
+        `<span class="chip">${esc(c.name)} · ${esc(c.role || "")}</span>`).join("")}</div>
+      ${script.scenes.map((s) => `
+        <section class="scene">
+          <h4>场 ${s.scene_no} · ${esc(s.location)}</h4>
+          ${s.action ? `<p class="action">${esc(s.action)}</p>` : ""}
+          ${(s.lines || []).map((l) => `
+            <p class="line"><b>${esc(l.character)}</b>${esc(l.dialogue)}</p>`).join("")}
+        </section>`).join("")}
+    </div>
+  </div>`;
+  document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
+  document.getElementById("btn-polish").onclick = () =>
+    showScriptOverlay(data, episodeId);
+  document.getElementById("btn-script-ok").onclick = async (ev) => {
+    const btn = ev.target;
+    btn.disabled = true; btn.textContent = "已确认,画图中…";
+    try {
+      await api("/api/confirm", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ episode_id: data.episode.id }),
+      });
+      showToast("剧本已确认!正在画人物/场景/分镜,完成后再来确认开拍", "ok");
+      pollCanvas(episodeId);
+    } catch (e) {
+      showToast(e.message, "error");
+      btn.disabled = false; btn.textContent = "✅ 剧本OK,开始画图";
+    }
+  };
 }
 
 /* ---- 剧场模式:Hero 横幅 + 人物条 + 每场一条横向镜头海报行 ---- */

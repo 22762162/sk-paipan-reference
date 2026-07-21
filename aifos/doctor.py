@@ -20,7 +20,6 @@ CLI_CANDIDATES = {
               "/opt/homebrew/bin/codex", "/usr/local/bin/codex"],
     "dreamina": ["~/.local/bin/dreamina", "/opt/homebrew/bin/dreamina",
                  "/usr/local/bin/dreamina"],
-    "jianying-cli": ["~/.local/bin/jianying-cli"],
 }
 
 # CLI → (provider 名, 生成 command 的方式)
@@ -32,7 +31,6 @@ _BRIDGES = {
                                   "aifos.adapters.codex_image",
                                   "--codex", p]),
     "dreamina": ("jimeng", lambda p: [p]),
-    "jianying-cli": ("jianying", lambda p: [p]),
 }
 
 
@@ -119,7 +117,8 @@ _HINTS = {
     "voice": "接好即梦/Ark 后配音随视频自动生成(有声视频);"
              "或配豆包 TTS:aifos config set --provider doubao_tts "
              "--enable --appid … --api-key …",
-    "edit": "接剪映 CLI 后 detect;未接时用内置合成",
+    "edit": "pip3 install pyJianYingDraft 并在设置里启用「剪映草稿」:"
+            "剪辑后草稿自动进剪映,打开剪映导出即可",
 }
 
 

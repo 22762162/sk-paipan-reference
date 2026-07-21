@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 
 from .db import now
-from .errors import AifosError, BudgetExceeded
+from .errors import AifosError, BudgetExceeded, ProduceCancelled
 from .workflow import (
     PIPELINE_VERSION,
     build_content_review,
@@ -139,20 +139,53 @@ class Director:
         }
         stage_reports = []
         failed = False
-        paused = False
+        paused = ""
         for stage, stage_cn in STAGES:
-            report = self._run_stage(stage, stage_cn, ctx)
+            if self._cancel_requested(ctx):
+                paused = "cancelled"
+                break
+            try:
+                report = self._run_stage(stage, stage_cn, ctx)
+            except ProduceCancelled:
+                paused = "cancelled"
+                break
             stage_reports.append(report)
             if report["status"] == "failed":
                 failed = True
                 break
+            # 第一道确认:新生成的剧本先给用户过目,确认后才开始画图
+            if (pause_for_confirm and stage == "script"
+                    and ctx.get("script_is_new")):
+                paused = "script"
+                break
             if pause_for_confirm and stage == CONFIRM_AFTER:
-                paused = True
+                paused = "preflight"
                 break
 
         episode = self.projects.get_episode(episode["id"])
         if failed:
             self.projects.set_episode_status(episode["id"], "failed")
+        elif paused == "cancelled":
+            # 手动停止:安全落回最近的可调整检查点
+            gate_done = self.db.query_one(
+                "SELECT COUNT(*) AS n FROM tasks WHERE episode_id=? "
+                "AND stage=? AND status='done'",
+                (episode["id"], CONFIRM_AFTER))
+            script_doc, _ = self.projects.latest_document(
+                episode["id"], "script")
+            landing = ("awaiting_confirm" if gate_done and gate_done["n"]
+                       else "awaiting_script" if script_doc else "created")
+            self.projects.set_episode_status(episode["id"], landing)
+            self.log.info(
+                "director",
+                f"已手动停止生成,回到「{landing}」;调整后确认即可继续")
+        elif paused == "script":
+            self.projects.set_episode_status(
+                episode["id"], "awaiting_script")
+            self.log.info(
+                "director",
+                f"剧本已生成,等待确认后再画人物/场景/分镜"
+                f"(episode_id={episode['id']})")
         elif paused:
             self.projects.set_episode_status(
                 episode["id"], "awaiting_confirm")
@@ -216,7 +249,10 @@ class Director:
             "updated_at) VALUES(?,?,?,?,?,?)",
             (episode_id, stage, stage_cn, "running", ts, ts))
         task_id = cur.lastrowid
-        self.projects.set_episode_status(episode_id, stage)
+        # 用户点了停止(状态=cancelling)时不要覆盖停止信号
+        current = self.projects.get_episode(episode_id)
+        if current is None or current["status"] != "cancelling":
+            self.projects.set_episode_status(episode_id, stage)
         self._task_cost = 0.0
         self._task_providers = set()
         try:
@@ -231,6 +267,13 @@ class Director:
                     "cost": round(self._task_cost, 2),
                     "providers": sorted(self._task_providers),
                     "detail": result or {}}
+        except ProduceCancelled:
+            self.db.execute(
+                "UPDATE tasks SET status='stopped', provider=?, cost=?, "
+                "error=?, updated_at=? WHERE id=?",
+                (",".join(sorted(self._task_providers)), self._task_cost,
+                 "已手动停止", now(), task_id))
+            raise
         except Exception as exc:
             self.db.execute(
                 "UPDATE tasks SET status='failed', provider=?, cost=?, "
@@ -241,8 +284,15 @@ class Director:
             return {"stage": stage, "name": stage_cn, "status": "failed",
                     "cost": round(self._task_cost, 2), "error": str(exc)}
 
+    def _cancel_requested(self, ctx):
+        """用户是否在 Web/CLI 点了「停止生成」(状态置为 cancelling)。"""
+        row = self.projects.get_episode(ctx["episode"]["id"])
+        return row is not None and row["status"] == "cancelling"
+
     def _call(self, ctx, capability, payload, sub_dir):
         """经由路由器调用 Provider,并做预算与成本记账。"""
+        if self._cancel_requested(ctx):
+            raise ProduceCancelled("已手动停止生成")
         episode = self.projects.get_episode(ctx["episode"]["id"])
         budget = self.config.get("budget", "per_episode", default=0)
         if budget and episode["cost"] >= budget:
@@ -283,6 +333,8 @@ class Director:
             version = self.projects.save_document(
                 episode["id"], "script", provided)
             ctx["script"] = provided
+            ctx["script_version"] = version
+            # 用户自己写的剧本不需要再过目 → 不触发剧本确认暂停
             self.log.info("director", f"使用用户自带剧本(v{version}),"
                           "人物/分镜将自动推导")
             return {"version": version, "provided": True,
@@ -292,6 +344,7 @@ class Director:
                 episode["id"], "script")
             if existing is not None:
                 ctx["script"] = existing
+                ctx["script_version"] = version
                 self.log.info("director", f"复用已有剧本 v{version}")
                 return {"version": version, "reused": True,
                         "scenes": len(existing["scenes"])}
@@ -314,6 +367,8 @@ class Director:
         script = result.data
         version = self.projects.save_document(episode["id"], "script", script)
         ctx["script"] = script
+        ctx["script_version"] = version
+        ctx["script_is_new"] = True     # 新写的剧本 → 触发剧本确认暂停
         self.data.record(
             "prompt", "success", prompt=f"script:{ctx['project']['title']}"
             f":e{episode['number']}", uri=result.uri,
@@ -327,6 +382,8 @@ class Director:
                 ctx["episode"]["id"], "continuity")
             if (existing is not None
                     and existing.get("pipeline_version") == PIPELINE_VERSION
+                    and existing.get("script_version") == ctx.get(
+                        "script_version")
                     and existing.get("production_profile", {}).get(
                         "standard_fingerprint") == ctx[
                             "production_profile"].get(
@@ -337,6 +394,7 @@ class Director:
                         "scenes": len(existing.get("scenes", []))}
         continuity = build_continuity_bible(
             ctx["project"], ctx["script"], ctx["production_profile"])
+        continuity["script_version"] = ctx.get("script_version")
         version = self.projects.save_document(
             ctx["episode"]["id"], "continuity", continuity)
         ctx["continuity"] = continuity
@@ -350,6 +408,8 @@ class Director:
                 ctx["episode"]["id"], "storyboard")
             if (existing is not None
                     and existing.get("pipeline_version") == PIPELINE_VERSION
+                    and existing.get("script_version") == ctx.get(
+                        "script_version")
                     and existing.get("profile", {}).get(
                         "standard_fingerprint") == ctx[
                             "production_profile"].get(
@@ -358,6 +418,9 @@ class Director:
                 self.log.info("director", f"复用已有五维分镜 v{version}")
                 return {"version": version, "reused": True,
                         "shots": len(existing["shots"])}
+            if existing is not None:
+                self.log.info(
+                    "director", "剧本/标准已更新,重出分镜并重制后续画面")
         result = self._call(
             ctx, "storyboard", {
                 "script": ctx["script"],
@@ -367,9 +430,12 @@ class Director:
         storyboard = enrich_storyboard(
             ctx["script"], result.data, ctx["continuity"],
             ctx["production_profile"], style=ctx["project"].get("style", ""))
+        storyboard["script_version"] = ctx.get("script_version")
         version = self.projects.save_document(
             ctx["episode"]["id"], "storyboard", storyboard)
         ctx["storyboard"] = storyboard
+        # 分镜变了 → 旧的关键帧/首尾帧/视频全部作废重做
+        ctx["force"] = True
         for shot in storyboard["shots"]:
             self.assets.register(
                 ctx["project"]["id"], "prompt",
@@ -736,6 +802,8 @@ class Director:
             "voice_mode": ctx.get("voice_mode", ""),
             "lip_sync": ctx.get("lip_sync", False),
             "forbid_subtitles": not ctx["production_profile"]["burn_subtitles"],
+            "project_title": ctx["project"]["title"],
+            "episode_number": ctx["episode"]["number"],
             "aspect": ctx["aspect"], **ctx["dims"],
         }, "edit")
         ctx["final_uri"] = result.uri

@@ -26,7 +26,7 @@ PROVIDER_CN = {
     "ark": "火山方舟 API · 视频(Seedance2,自带配音)",
     "doubao_tts": "豆包 TTS · 配音备选",
     "say": "say 配音 · macOS(已弃用)",
-    "jianying": "剪映 CLI · 剪辑",
+    "jianying": "剪映草稿 · 剪辑(自动进剪映)",
     "api": "通用 API 备用",
     "mock": "内置模拟产线",
 }
@@ -34,7 +34,8 @@ PROVIDER_CN = {
 MODE_CN = {
     "cli": "CLI", "dreamina": "CLI",
     "api": "API", "claude_api": "API", "image_api": "API",
-    "ark_video": "API", "doubao_tts": "API", "mock": "内置",
+    "ark_video": "API", "doubao_tts": "API",
+    "jianying_draft": "本机", "mock": "内置",
 }
 
 # 允许经设置中心修改的字段(其余请直接编辑 workspace/config.json)
@@ -42,7 +43,7 @@ EDITABLE_FIELDS = {
     "enabled", "command", "endpoint", "api_key", "model", "model_version",
     "max_tokens", "video_resolution", "duration", "poll", "timeout",
     "cost_per_call", "quota", "appid", "cluster", "voice_type",
-    "speed_ratio", "audio_in_video",
+    "speed_ratio", "audio_in_video", "draft_dir",
 }
 _INT_FIELDS = {"max_tokens", "duration", "quota", "timeout"}
 _FLOAT_FIELDS = {"cost_per_call", "poll"}
@@ -83,6 +84,7 @@ def settings_payload(app):
             "model_version": conf.get("model_version", ""),
             "appid": conf.get("appid", ""),
             "voice_type": conf.get("voice_type", ""),
+            "draft_dir": conf.get("draft_dir", ""),
             "api_key_masked": mask_key(conf.get("api_key", "")),
             "api_key_set": bool(conf.get("api_key")),
             "timeout": conf.get("timeout"),

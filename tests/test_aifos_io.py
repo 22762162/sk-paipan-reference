@@ -26,6 +26,7 @@ def app(tmp_path):
 
 def test_import_character_art(app):
     app.director.produce("万妖图录", 1, pause_for_confirm=True)
+    app.director.produce("万妖图录", 1, pause_for_confirm=True)  # 剧本确认
     project = app.projects.get_project("万妖图录")
     name = app.assets.list(project["id"], "character_art")[0]["name"]
     v1 = app.assets.latest(project["id"], "character_art", name)["version"]
@@ -64,6 +65,7 @@ def test_import_video(app):
 
 def test_import_rejects_bad_content(app):
     app.director.produce("万妖图录", 1, pause_for_confirm=True)
+    app.director.produce("万妖图录", 1, pause_for_confirm=True)  # 剧本确认
     with pytest.raises(AifosError):
         app.director.import_image(
             "万妖图录", 1, {"kind": "shot", "shot_no": 1},
@@ -79,6 +81,7 @@ def test_web_upload_endpoint(tmp_path):
     ws = tmp_path / "ws"
     boot = App(ws)
     boot.director.produce("万妖图录", 1, pause_for_confirm=True)
+    boot.director.produce("万妖图录", 1, pause_for_confirm=True)  # 剧本确认
     boot.close()
     httpd = serve(ws, host="127.0.0.1", port=0)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)

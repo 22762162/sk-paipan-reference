@@ -13,6 +13,10 @@ class PermissionDenied(AifosError):
     """系统中心权限校验失败。"""
 
 
+class ProduceCancelled(AifosError):
+    """用户手动停止生成:流水线安全落回可调整状态,不算失败。"""
+
+
 class ProviderError(AifosError):
     """生产 Provider 执行失败(可由路由器回退到下一个 Provider)。"""
 

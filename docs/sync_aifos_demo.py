@@ -53,8 +53,10 @@ MIME = {
     ".svg": "image/svg+xml", ".json": "application/json",
     ".html": "text/html", ".mp4": "video/mp4", ".png": "image/png",
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".wav": "audio/wav",
+    ".py": "text/x-python",
 }
-TEXT_ARTIFACTS = {".svg", ".json", ".html", ".txt", ".md"}
+# 文本类产物在打包成 data URI 前要做路径脱敏(交付脚本 .py 也含绝对路径)
+TEXT_ARTIFACTS = {".svg", ".json", ".html", ".txt", ".md", ".py"}
 
 
 def _canonical_json(value):

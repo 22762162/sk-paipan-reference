@@ -153,28 +153,40 @@ def test_standard_center_api_lifecycle(server):
 
 def test_produce_flow_and_episode_api(server):
     port = server["port"]
-    # Web 默认流程:预生产 → 待确认
+    # Web 默认流程:剧本 → 剧本确认 → 预生产 → 开拍确认
     status, reply = _json_request(port, "POST", "/api/produce", {
         "sentence": "开始制作《万妖图录》第15集"})
     assert status == 202
     job = _wait_job(port, reply["job_id"])
     assert job["status"] == "done"
-    assert job["summary"]["status"] == "awaiting_confirm"
+    assert job["summary"]["status"] == "awaiting_script"
 
     _, overview = _json_request(port, "GET", "/api/overview")
     assert overview["stats"]["episodes"] == 1
     episode_id = overview["episodes"][0]["id"]
-    assert overview["episodes"][0]["status"] == "awaiting_confirm"
+    assert overview["episodes"][0]["status"] == "awaiting_script"
 
+    # 剧本审阅页:有剧本、但一张图都还没画
     status, pre = _json_request(port, "GET", f"/api/episode/{episode_id}")
     assert status == 200
     assert pre["script"]["scenes"]
+    assert pre["storyboard"] is None
+    assert pre["artifacts"]["cast_art"] == []
+
+    # 第一道确认(剧本 OK)→ 画人物/场景/分镜/首尾帧后再停
+    status, reply = _json_request(port, "POST", "/api/confirm", {
+        "episode_id": episode_id})
+    assert status == 202 and reply["phase"] == "awaiting_script"
+    job = _wait_job(port, reply["job_id"])
+    assert job["summary"]["status"] == "awaiting_confirm"
+
+    status, pre = _json_request(port, "GET", f"/api/episode/{episode_id}")
     assert pre["storyboard"]["shots"]
     assert pre["artifacts"]["cast_art"], "确认页需要人物立绘"
     assert pre["artifacts"]["scene_art"], "确认页需要场景概念图"
     assert pre["artifacts"]["videos"] == {}, "确认前不应生产视频"
 
-    # 确认 → 自动完成剩余全部阶段
+    # 第二道确认(开拍)→ 自动完成剩余全部阶段
     status, reply = _json_request(port, "POST", "/api/confirm", {
         "episode_id": episode_id})
     assert status == 202

@@ -15,6 +15,9 @@ def test_five_dimension_preflight_and_delivery(tmp_path):
         paused = app.director.produce(
             "逆光成团", 1, premise="女团第一次直播前的后台危机",
             pause_for_confirm=True)
+        assert paused["status"] == "awaiting_script"
+        paused = app.director.produce(
+            "逆光成团", 1, pause_for_confirm=True)  # 剧本确认
         assert paused["status"] == "awaiting_confirm"
 
         project = app.projects.get_project("逆光成团")

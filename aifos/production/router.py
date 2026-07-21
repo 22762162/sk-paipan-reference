@@ -11,6 +11,7 @@ from .api_providers import (ArkVideoProvider, ClaudeApiProvider,
 from .base import ProviderResult  # noqa: F401  (re-export for callers)
 from .dreamina import DreaminaProvider
 from .external import ApiProvider, CliProvider
+from .jianying_draft import JianyingDraftProvider
 from .mock import MockProvider
 
 PROVIDER_TYPES = {
@@ -21,6 +22,7 @@ PROVIDER_TYPES = {
     "image_api": OpenAIImageProvider,
     "ark_video": ArkVideoProvider,
     "doubao_tts": DoubaoTtsProvider,
+    "jianying_draft": JianyingDraftProvider,
     "mock": MockProvider,
 }
 

@@ -101,6 +101,11 @@ def _build_parser():
     p_confirm.add_argument("--project", required=True)
     p_confirm.add_argument("--episode", type=int, required=True)
 
+    p_stop = sub.add_parser(
+        "stop", help="停止正在进行的生成(落回可调整的检查点)")
+    p_stop.add_argument("--project", required=True)
+    p_stop.add_argument("--episode", type=int, required=True)
+
     p_revise = sub.add_parser(
         "revise", help="按修改意见重写剧本并重出人物/分镜(回到待确认)")
     p_revise.add_argument("--project", required=True)
@@ -242,6 +247,12 @@ def _cmd_produce(app, args):
     for candidate in outputs["titles"]:
         print(f"候选标题: {candidate}")
     print(f"产物目录: {summary['artifacts_dir']}")
+    if summary["status"] == "awaiting_script":
+        print("\n剧本已生成,先过目(还没开始画图,不花出图/视频额度)。")
+        print("满意 → 运行 confirm 开始画人物/场景/分镜;")
+        print("不满意 → 运行 revise --feedback \"你的意见\" 重写:")
+        print(f"  python3 -m aifos confirm --project {title} --episode {number}")
+        return 0
     if summary["status"] == "awaiting_confirm":
         print("\n预生产完成(剧本/人物图/场景图/分镜/首尾帧)。检查满意后运行:")
         print(f"  python3 -m aifos confirm --project {title} --episode {number}")
@@ -252,7 +263,8 @@ def _cmd_produce(app, args):
 
 def _status_cn(status):
     return {"done": "完成", "failed": "失败", "qc_failed": "完成(质检未过)",
-            "awaiting_confirm": "待确认"}.get(status, status)
+            "awaiting_confirm": "待确认",
+            "awaiting_script": "剧本待确认"}.get(status, status)
 
 
 def _cmd_confirm(app, args):
@@ -261,6 +273,18 @@ def _cmd_confirm(app, args):
         print(f"项目不存在: {args.project}", file=sys.stderr)
         return 2
     app.system.require(args.user, "produce")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=?",
+        (project["id"], args.episode))
+    if episode is not None and episode["status"] == "awaiting_script":
+        # 第一道确认:剧本 OK → 画人物/场景/分镜,再停一次等开拍确认
+        print(f"剧本已确认,开始画《{args.project}》第{args.episode}集"
+              "的人物/场景/分镜 …")
+        summary = app.director.produce(
+            args.project, args.episode, pause_for_confirm=True)
+        print(f"{_status_cn(summary['status'])};满意后再运行一次 "
+              "confirm 即开始视频生产")
+        return 0
     print(f"已确认,继续生产《{args.project}》第{args.episode}集 …")
     summary = app.director.produce(args.project, args.episode)
     print(f"制作{_status_cn(summary['status'])},"
@@ -621,6 +645,23 @@ def main(argv=None):
             return _cmd_publish(app, args)
         if args.command == "confirm":
             return _cmd_confirm(app, args)
+        if args.command == "stop":
+            project = app.projects.get_project(args.project)
+            if project is None:
+                print(f"项目不存在: {args.project}", file=sys.stderr)
+                return 2
+            episode = app.db.query_one(
+                "SELECT * FROM episodes WHERE project_id=? AND number=?",
+                (project["id"], args.episode))
+            stable = {"done", "failed", "qc_failed", "created",
+                      "awaiting_script", "awaiting_confirm"}
+            if episode is None or episode["status"] in stable:
+                print("当前没有正在进行的生成", file=sys.stderr)
+                return 1
+            app.projects.set_episode_status(episode["id"], "cancelling")
+            print("已发出停止信号;流水线将在当前产线调用结束后安全停下,"
+                  "落回可调整的检查点")
+            return 0
         if args.command == "revise":
             app.system.require(args.user, "produce")
             summary = app.director.revise_script(

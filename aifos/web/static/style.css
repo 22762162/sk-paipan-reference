@@ -931,3 +931,37 @@ textarea:focus-visible, select:focus-visible {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
 }
+/* ---------- 剧本审阅页(第一道确认) ---------- */
+.script-review {
+  max-width: 760px; margin: 8px auto 40px; background: var(--surface);
+  border: 1px solid var(--hairline); border-radius: 14px;
+  padding: 28px 34px;
+}
+.script-review h1 { font-size: 22px; margin-bottom: 6px; }
+.script-review .logline { color: var(--ink-2); margin-bottom: 12px; }
+.script-review .cast { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
+.script-review .scene { margin-top: 18px; border-top: 1px solid var(--grid); padding-top: 14px; }
+.script-review .scene h4 { font-size: 14px; margin-bottom: 8px; color: var(--accent); }
+.script-review .action { color: var(--ink-3); font-size: 13px; margin-bottom: 8px; }
+.script-review .line { padding: 4px 0; font-size: 15px; }
+.script-review .line b { color: var(--ink-2); margin-right: 10px; }
+
+/* ---------- 生产直播页 / 停止生成 ---------- */
+.produce-live {
+  display: grid; gap: 16px; align-items: start;
+  grid-template-columns: 320px minmax(0, 1fr);
+  padding: 14px 18px 40px;
+}
+@media (max-width: 900px) { .produce-live { grid-template-columns: 1fr; } }
+.stage-steps { list-style: none; margin: 10px 0 12px; display: flex; flex-direction: column; gap: 7px; }
+.stage-steps li { font-size: 13.5px; color: var(--ink-3); }
+.stage-steps li.done { color: var(--good); }
+.stage-steps li.run { color: var(--accent); font-weight: 600; }
+.stop-btn {
+  background: rgba(236, 131, 90, .12); color: var(--serious);
+  border: 1px solid rgba(236, 131, 90, .5); border-radius: 8px;
+  padding: 6px 12px; cursor: pointer; font-size: 12.5px; flex: none;
+}
+.stop-btn:hover { background: rgba(236, 131, 90, .22); }
+.stop-btn.big { padding: 8px 16px; font-size: 13.5px; }
+.progress-card .stop-btn { margin-right: 10px; }
