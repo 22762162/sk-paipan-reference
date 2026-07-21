@@ -163,3 +163,54 @@ def test_full_pipeline_with_fake_dreamina(tmp_path, fake_dreamina):
             "--model_version=seedance2.0fast_vip" in c for c in calls)
     finally:
         app.close()
+
+
+def test_dialogue_voiced_in_video_prompt(tmp_path, fake_dreamina):
+    """有台词的镜头:台词写进视频提示词,Seedance2 自动配音。"""
+    app = _make_app(tmp_path, fake_dreamina)
+    try:
+        app.router.call("video", {
+            "shot_no": 2, "prompt": "特写镜头",
+            "dialogue": {"character": "林昭", "dialogue": "妖气不对劲"},
+            "first": "/tmp/first.png", "last": "/tmp/last.png",
+            "duration": 3.0,
+        }, app.workspace.artifacts_dir)
+    finally:
+        app.close()
+    (call,) = _calls(fake_dreamina)
+    prompt = next(a for a in call if a.startswith("--prompt="))
+    assert "妖气不对劲" in prompt and "自动配音" in prompt
+
+
+def test_produce_skips_tts_when_video_carries_audio(tmp_path, fake_dreamina):
+    """即梦产视频(有声)→ 配音阶段跳过独立 TTS,质检不再要求配音文件。"""
+    app = _make_app(tmp_path, fake_dreamina)
+    try:
+        summary = app.director.produce("有声视频验证", 1)
+        assert summary["status"] == "done"
+        assert summary["qc_score"] >= 80
+        voices_stage = next(s for s in summary["stages"]
+                            if s["stage"] == "voices")
+        assert voices_stage["status"] == "done"
+        assert "随视频配音(seedance2)" in voices_stage["providers"]
+        # 不再登记独立配音资产
+        project = app.projects.get_project("有声视频验证")
+        rows = app.db.query(
+            "SELECT * FROM assets WHERE project_id=? AND kind='voice'",
+            (project["id"],))
+        assert list(rows) == []
+    finally:
+        app.close()
+
+
+def test_doctor_voice_carried_by_video(tmp_path, fake_dreamina):
+    from aifos.doctor import run_doctor
+    app = _make_app(tmp_path, fake_dreamina)
+    try:
+        report = run_doctor(app)
+        voice = next(c for c in report["capabilities"]
+                     if c["capability"] == "voice")
+        assert voice["real"] is True
+        assert "随视频自动配音" in voice["provider_label"]
+    finally:
+        app.close()

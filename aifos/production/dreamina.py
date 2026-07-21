@@ -65,11 +65,17 @@ class DreaminaProvider(Provider):
         shot_no = int(payload.get("shot_no", 0))
         model_version = self.conf.get(
             "model_version", REQUIRED_MODEL_VERSION)
+        prompt = payload.get("prompt", "")
+        dialogue = payload.get("dialogue") or {}
+        if self.conf.get("audio_in_video", True) and dialogue.get("dialogue"):
+            # Seedance2 有声视频:台词随视频自动配音,免单独 TTS
+            prompt += (f"。让角色开口说出这句台词并自动配音"
+                       f"(中文自然人声,口型对应):「{dialogue['dialogue']}」")
         cmd = self._command() + [
             "frames2video",
             f"--first={first}",
             f"--last={last}",
-            f"--prompt={payload.get('prompt', '')}",
+            f"--prompt={prompt}",
             f"--duration={int(self.conf.get('duration', 8))}",
             f"--video_resolution={self.conf.get('video_resolution', '720p')}",
             f"--model_version={model_version}",

@@ -7,7 +7,6 @@ aifos doctor [--ping]         体检:每个环节现在实际由谁生产
 """
 
 import os
-import platform
 import shutil
 from pathlib import Path
 
@@ -50,22 +49,15 @@ def find_cli(name):
 
 
 def detect_clis():
-    """→ {cli名: 绝对路径}(只含找到的;say 仅 macOS)。"""
-    found = {name: path for name in CLI_CANDIDATES
-             if (path := find_cli(name))}
-    if platform.system() == "Darwin" and shutil.which("say"):
-        found["say"] = shutil.which("say")
-    return found
+    """→ {cli名: 绝对路径}(只含找到的)。"""
+    return {name: path for name in CLI_CANDIDATES
+            if (path := find_cli(name))}
 
 
 def apply_detected(config_path, found):
     """把检测到的 CLI 写入配置并启用。→ [(provider, path), ...]"""
     applied = []
     for cli, path in found.items():
-        if cli == "say":
-            update_provider(config_path, "say", {"enabled": True})
-            applied.append(("say", path))
-            continue
         provider, build = _BRIDGES[cli]
         update_provider(config_path, provider,
                         {"enabled": True, "command": build(path)})
@@ -124,7 +116,9 @@ _HINTS = {
     "cover": "同「图片」:接 Codex CLI 或 image_api",
     "video": "接即梦 CLI(detect)或火山方舟:aifos config set "
              "--provider ark --enable --api-key …",
-    "voice": "macOS 用 say(detect 自动开),或配通用 API",
+    "voice": "接好即梦/Ark 后配音随视频自动生成(有声视频);"
+             "或配豆包 TTS:aifos config set --provider doubao_tts "
+             "--enable --appid … --api-key …",
     "edit": "接剪映 CLI 后 detect;未接时用内置合成",
 }
 
@@ -158,6 +152,22 @@ def run_doctor(app, do_ping=False):
             "real": is_real, "detail": chosen_detail,
             "hint": None if is_real else _HINTS.get(capability, ""),
         })
+    # 配音默认随 Seedance2 视频生成:视频产线可用且自带配音 → 配音视为已接
+    voice = next((c for c in capabilities if c["capability"] == "voice"),
+                 None)
+    video = next((c for c in capabilities if c["capability"] == "video"),
+                 None)
+    if voice and not voice["real"] and video and video["real"]:
+        video_provider = app.router.providers.get(video["provider"])
+        if video_provider is not None and \
+                video_provider.conf.get("audio_in_video"):
+            real += 1
+            voice.update({
+                "real": True, "provider": video["provider"],
+                "provider_label": "随视频自动配音(Seedance2 有声视频)",
+                "detail": "配音在视频生成时自动完成,无需单独 TTS",
+                "hint": None,
+            })
     return {
         "providers": list(providers.values()),
         "capabilities": capabilities,

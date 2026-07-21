@@ -423,12 +423,16 @@ class Director:
         ctx["videos"] = []
         reused = 0
         for shot in ctx["storyboard"]["shots"]:
-            existing = self._existing_asset_uri(
-                ctx, "video", self._shot_name(ctx, shot["shot_no"]))
+            name = self._shot_name(ctx, shot["shot_no"])
+            existing = self._existing_asset_uri(ctx, "video", name)
             if existing:
+                row = self.assets.latest(
+                    ctx["project"]["id"], "video", name)
+                meta = json.loads(row["meta"]) if row else {}
                 ctx["videos"].append({
                     "shot_no": shot["shot_no"], "uri": existing,
-                    "duration": shot["duration"]})
+                    "duration": shot["duration"],
+                    "provider": meta.get("provider", "")})
                 reused += 1
                 continue
             ctx["videos"].append(self._make_video(ctx, shot, frames))
@@ -439,18 +443,48 @@ class Director:
         result = self._call(ctx, "video", {
             "shot_no": shot["shot_no"],
             "prompt": shot["prompt"],
+            "dialogue": shot.get("dialogue"),
             "duration": shot["duration"],
             "first": frame["first"],
             "last": frame["last"],
             "aspect": ctx["aspect"], **ctx["dims"],
         }, "videos")
-        self._register_shot_asset(ctx, "video", shot["shot_no"], result.uri)
+        self._register_shot_asset(ctx, "video", shot["shot_no"], result.uri,
+                                  meta={"provider": result.provider})
         return {"shot_no": shot["shot_no"], "uri": result.uri,
-                "duration": shot["duration"]}
+                "duration": shot["duration"], "provider": result.provider}
+
+    def _videos_carry_audio(self, ctx):
+        """视频是否自带配音(Seedance2 有声视频)→ 免单独 TTS。"""
+        videos = ctx.get("videos") or []
+        if not videos:
+            return False
+        for video in videos:
+            provider = self.router.providers.get(video.get("provider", ""))
+            if provider is None or \
+                    not provider.conf.get("audio_in_video"):
+                return False
+        return True
 
     def _stage_voices(self, ctx):
         ctx["voices"] = []
         ctx["subtitles"] = []
+        line_no = 0
+        for scene in ctx["script"]["scenes"]:
+            for line in scene["lines"]:
+                line_no += 1
+                ctx["subtitles"].append({
+                    "line_no": line_no,
+                    "character": line["character"],
+                    "text": line["dialogue"],
+                })
+        # 默认方案:Seedance2 有声视频,配音随视频生成,无需单独 TTS
+        if self._videos_carry_audio(ctx):
+            ctx["voice_carried"] = True
+            self._task_providers.add("随视频配音(seedance2)")
+            self.log.info(
+                "director", "视频产线自带配音(有声视频),跳过独立 TTS")
+            return {"count": 0, "carried_by_video": True}
         line_no = 0
         reused = 0
         for scene in ctx["script"]["scenes"]:
@@ -470,11 +504,6 @@ class Director:
                 else:
                     ctx["voices"].append(
                         self._make_voice(ctx, line_no, line))
-                ctx["subtitles"].append({
-                    "line_no": line_no,
-                    "character": line["character"],
-                    "text": line["dialogue"],
-                })
         return {"count": len(ctx["voices"]), "reused": reused}
 
     def _make_voice(self, ctx, line_no, line):
@@ -629,10 +658,11 @@ class Director:
             episode_id=episode_id)
         return {"label": label}
 
-    def _register_shot_asset(self, ctx, kind, shot_no, uri):
+    def _register_shot_asset(self, ctx, kind, shot_no, uri, meta=None):
         self.assets.register(
             ctx["project"]["id"], kind,
-            f"e{ctx['episode']['number']:03d}_shot{shot_no:03d}", uri=uri)
+            f"e{ctx['episode']['number']:03d}_shot{shot_no:03d}", uri=uri,
+            meta=meta)
 
     # ---- 打磨:剧本意见重写 / 单张图片附意见重画 ----
     def revise_script(self, project_title, episode_number, feedback):

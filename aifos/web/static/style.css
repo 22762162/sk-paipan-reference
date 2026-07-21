@@ -596,3 +596,14 @@ audio.player { background: var(--surface-2); }
 .pipe-link:hover { text-decoration: underline; }
 .stage-list .prov { color: var(--ink-3); font-size: 11px; }
 .stage-list .prov.real { color: var(--good); }
+
+/* ---------- 设置简化:高级折叠 / 提示 ---------- */
+.pc-note { color: var(--ink-3); font-size: 12px; margin: 2px 0 4px; }
+.pc-advanced, .route-panel { margin-top: 8px; }
+.pc-advanced summary, .route-panel summary {
+  cursor: pointer; color: var(--ink-3); font-size: 12.5px;
+  padding: 6px 0; user-select: none;
+}
+.pc-advanced summary:hover, .route-panel summary:hover { color: var(--ink); }
+.route-panel { padding: 14px 18px; }
+.route-panel table { margin-top: 10px; }

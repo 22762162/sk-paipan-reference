@@ -125,6 +125,8 @@ class QcCenter:
 
     # ---- 配音:每句台词有配音文件且落盘存在 ----
     def _check_voices(self, script, ctx):
+        if ctx.get("voice_carried"):
+            return []          # Seedance2 有声视频:配音随视频,无独立文件
         issues = []
         voices = {v["line_no"]: v for v in ctx.get("voices", [])}
         total_lines = sum(len(s["lines"]) for s in script["scenes"])

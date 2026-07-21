@@ -7,7 +7,7 @@
 
 from ..errors import ProviderError, ProviderUnavailable
 from .api_providers import (ArkVideoProvider, ClaudeApiProvider,
-                            OpenAIImageProvider)
+                            DoubaoTtsProvider, OpenAIImageProvider)
 from .base import ProviderResult  # noqa: F401  (re-export for callers)
 from .dreamina import DreaminaProvider
 from .external import ApiProvider, CliProvider
@@ -20,6 +20,7 @@ PROVIDER_TYPES = {
     "claude_api": ClaudeApiProvider,
     "image_api": OpenAIImageProvider,
     "ark_video": ArkVideoProvider,
+    "doubao_tts": DoubaoTtsProvider,
     "mock": MockProvider,
 }
 

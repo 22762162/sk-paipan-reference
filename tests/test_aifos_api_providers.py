@@ -278,6 +278,59 @@ def test_ark_video_task_failed(fake_api, tmp_path):
         provider.generate("video", {"shot_no": 1, "prompt": "x"}, tmp_path)
 
 
+# ---------------- 豆包 TTS 配音 API ----------------
+
+def _doubao_conf(endpoint):
+    return {"type": "doubao_tts", "enabled": True,
+            "capabilities": ["voice"],
+            "endpoint": f"{endpoint}/api/v1/tts",
+            "appid": "app-123", "api_key": "tok-456",
+            "cluster": "volcano_tts", "voice_type": "BV700_streaming",
+            "cost_per_call": 0.2, "timeout": 30}
+
+
+def test_doubao_tts_voice(fake_api, tmp_path):
+    from aifos.production.api_providers import DoubaoTtsProvider
+    endpoint, fake = fake_api
+    mp3 = b"ID3fake-mp3-bytes"
+    fake.routes[("POST", "/api/v1/tts")] = lambda body: {
+        "code": 3000, "message": "success",
+        "data": base64.b64encode(mp3).decode(),
+        "addition": {"duration": "2350"}}
+    provider = DoubaoTtsProvider("doubao_tts", _doubao_conf(endpoint))
+    assert provider.available("voice") == (True, "")
+    result = provider.generate("voice", {
+        "line_no": 3, "character": "林昭", "text": "妖气不对劲",
+    }, tmp_path)
+    assert result.uri.endswith("line_003.mp3")
+    assert (tmp_path / "line_003.mp3").read_bytes() == mp3
+    assert result.data["duration"] == 2.35
+    call = fake.calls[-1]
+    assert call["headers"]["authorization"] == "Bearer;tok-456"
+    assert call["body"]["app"]["appid"] == "app-123"
+    assert call["body"]["app"]["cluster"] == "volcano_tts"
+    assert call["body"]["audio"]["voice_type"] == "BV700_streaming"
+    assert call["body"]["request"]["text"] == "妖气不对劲"
+
+    ok, detail = provider.ping()
+    assert ok and "BV700_streaming" in detail
+
+    # 鉴权失败 code≠3000 → 明确报错
+    fake.routes[("POST", "/api/v1/tts")] = lambda body: {
+        "code": 4001, "message": "invalid token"}
+    with pytest.raises(ProviderError, match="4001"):
+        provider.generate("voice", {"line_no": 1, "text": "你好"}, tmp_path)
+
+
+def test_doubao_tts_requires_appid(tmp_path):
+    from aifos.production.api_providers import DoubaoTtsProvider
+    conf = _doubao_conf("http://127.0.0.1:1")
+    conf["appid"] = ""
+    provider = DoubaoTtsProvider("doubao_tts", conf)
+    ok, reason = provider.available("voice")
+    assert not ok and "appid" in reason
+
+
 # ---------------- 真实连通性测试(ping) ----------------
 
 def test_pings(fake_api, tmp_path):

@@ -21,17 +21,21 @@ claude / codex / dreamina / 剪映 CLI 并接线** → 体检打印每个环节�
 
 | 环节 | CLI 方式(推荐,用订阅额度) | API 方式(备用/扩容) |
 |---|---|---|
-| 剧本/分镜 | Claude CLI(自动检测) | Claude API:填 Key,模型默认 claude-opus-4-8 |
-| 图片/首尾帧/封面 | Codex CLI(自动检测) | 出图 API(OpenAI 兼容):填 Key |
-| 视频 | 即梦 CLI dreamina(自动检测,锁定 seedance2.0fast_vip) | 火山方舟 Ark:填 Key + 模型 ID |
-| 配音 | macOS say(自动开启) | 通用 API |
+| 剧本/分镜 | Claude CLI(自动检测) | Claude API:只填 Key |
+| 图片/首尾帧/封面 | Codex CLI(自动检测) | 出图 API(OpenAI 兼容):只填 Key |
+| 视频 | 即梦 CLI dreamina(自动检测,锁定 seedance2.0fast_vip) | 火山方舟 Ark:只填 Key |
+| 配音 | **随 Seedance2 视频自动配音(默认,台词写进视频提示词)** | 豆包 TTS:填 APPID + Key |
 
-- 网页配置:右上角 **⚙️ AI 设置** → 「🔍 自动检测本机 CLI」一键接线;
-  API 填 Key 后点 **测试连接**(会发真实请求验证,Key 错了直接报 HTTP 错误)。
+- **API 只需要填 Key**:接口地址和模型都内置了官方默认(高级设置里可改),
+  **粘贴 Key 保存即自动启用**;点 **测试连接** 会发真实请求验证,
+  Key 错了直接报 HTTP 错误。
+- 配音不再使用 macOS 本地 say(效果差,已移除):默认由 Seedance2
+  生成视频时自动配音(有声视频);视频产线不带配音时才走豆包 TTS。
 - 命令行配置:
   ```bash
   python3 -m aifos config detect --apply          # 自动接线本机 CLI
-  python3 -m aifos config set --provider claude_api --enable --api-key sk-ant-xxx
+  python3 -m aifos config set --provider claude_api --api-key sk-ant-xxx  # 填 Key 即启用
+  python3 -m aifos config set --provider doubao_tts --appid 12345 --api-key tok-xxx
   python3 -m aifos config test --provider claude_api   # 真实连通验证
   python3 -m aifos doctor --ping                  # 全面体检(含 API 真实验证)
   ```

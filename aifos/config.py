@@ -36,14 +36,6 @@ DEFAULTS = {
                         "--claude", "claude"],
             "cost_per_call": 0.5, "timeout": 600,
         },
-        "say": {
-            # macOS 内置 TTS 过渡配音产线(即梦 TTS 上线前)
-            "type": "cli", "enabled": False,
-            "capabilities": ["voice"],
-            "command": ["python3", "-m", "aifos.adapters.say_voice",
-                        "--voice", "Tingting"],
-            "cost_per_call": 0.0, "timeout": 120,
-        },
         "codex": {
             # 经 aifos.adapters.codex_image 桥接真实 codex exec;
             # 实机把 --codex 指到 codex 绝对路径后 enabled 置 true
@@ -54,7 +46,7 @@ DEFAULTS = {
             "cost_per_call": 1.0, "timeout": 900,
         },
         "jimeng": {
-            # 即梦官方 CLI(dreamina)原生适配;配音能力待即梦 CLI 提供 TTS 后再接入
+            # 即梦官方 CLI(dreamina)原生适配
             "type": "dreamina", "enabled": False,
             "capabilities": ["video"],
             "command": ["dreamina"],
@@ -62,6 +54,7 @@ DEFAULTS = {
             "video_resolution": "720p",
             "duration": 8,
             "poll": 30,
+            "audio_in_video": True,    # Seedance2 有声视频:配音随视频,免单独 TTS
             "cost_per_call": 2.0, "timeout": 1800,
             "quota": 1000,             # 订阅额度(次);耗尽后路由自动回退 API
         },
@@ -94,7 +87,18 @@ DEFAULTS = {
             "endpoint": "https://ark.cn-beijing.volces.com", "api_key": "",
             "model": "seedance-2.0-fast",   # 按实际开通的模型/接入点 ID 填
             "video_resolution": "720p", "duration": 8, "poll": 5,
+            "audio_in_video": True,    # Seedance2 有声视频:配音随视频生成
             "cost_per_call": 2.5, "timeout": 1800,
+        },
+        "doubao_tts": {
+            # 豆包(火山引擎)语音合成:视频产线不带配音时的 TTS 备选
+            "type": "doubao_tts", "enabled": False,
+            "capabilities": ["voice"],
+            "endpoint": "https://openspeech.bytedance.com/api/v1/tts",
+            "appid": "", "api_key": "",     # api_key = access token
+            "cluster": "volcano_tts",
+            "voice_type": "BV700_streaming",
+            "cost_per_call": 0.2, "timeout": 60,
         },
         "api": {
             "type": "api", "enabled": False,
@@ -116,7 +120,9 @@ DEFAULTS = {
         "image": ["codex", "image_api", "api", "mock"],
         "frames": ["codex", "image_api", "mock"],
         "video": ["jimeng", "ark", "api", "mock"],
-        "voice": ["jimeng", "say", "api", "mock"],
+        # 配音默认随 Seedance2 视频自动生成(有声视频),此链只在
+        # 视频产线不带配音时才会用到;豆包 TTS 为首选备选
+        "voice": ["doubao_tts", "api", "mock"],
         "edit": ["jianying", "mock"],
         "cover": ["codex", "image_api", "mock"],
     },

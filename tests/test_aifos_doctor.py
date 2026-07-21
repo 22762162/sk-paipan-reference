@@ -81,7 +81,11 @@ def test_doctor_with_real_cli(tmp_path, monkeypatch):
         claude = next(p for p in report["providers"]
                       if p["name"] == "claude")
         assert not claude["ok"] and "/no/such/claude" in claude["detail"]
-        assert report["real_count"] == 1
+        # 视频真实 + 配音随视频自动完成 → 2 个环节已接
+        voice = next(c for c in report["capabilities"]
+                     if c["capability"] == "voice")
+        assert voice["real"] and "随视频" in voice["provider_label"]
+        assert report["real_count"] == 2
     finally:
         app.close()
 
@@ -103,7 +107,9 @@ def test_cli_doctor_and_detect(tmp_path, monkeypatch, capsys):
     assert main(["--workspace", ws, "doctor"]) == 0
     out = capsys.readouterr().out
     assert "视频" in out and "即梦" in out
-    assert "内置模拟" in out and "真实产线 1/8" in out
+    # 配音随视频自动完成 → 与视频一起算作已接真实产线
+    assert "随视频自动配音" in out
+    assert "内置模拟" in out and "真实产线 2/8" in out
 
 
 def test_cli_doctor_all_mock_exit(tmp_path, monkeypatch, capsys):

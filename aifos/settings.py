@@ -22,9 +22,10 @@ PROVIDER_CN = {
     "claude_api": "Claude API · 编剧",
     "codex": "Codex CLI · 出图",
     "image_api": "出图 API · OpenAI 兼容",
-    "jimeng": "即梦 CLI · 视频",
-    "ark": "火山方舟 API · 视频(Seedance2)",
-    "say": "say 配音 · macOS",
+    "jimeng": "即梦 CLI · 视频(自带配音)",
+    "ark": "火山方舟 API · 视频(Seedance2,自带配音)",
+    "doubao_tts": "豆包 TTS · 配音备选",
+    "say": "say 配音 · macOS(已弃用)",
     "jianying": "剪映 CLI · 剪辑",
     "api": "通用 API 备用",
     "mock": "内置模拟产线",
@@ -33,14 +34,15 @@ PROVIDER_CN = {
 MODE_CN = {
     "cli": "CLI", "dreamina": "CLI",
     "api": "API", "claude_api": "API", "image_api": "API",
-    "ark_video": "API", "mock": "内置",
+    "ark_video": "API", "doubao_tts": "API", "mock": "内置",
 }
 
 # 允许经设置中心修改的字段(其余请直接编辑 workspace/config.json)
 EDITABLE_FIELDS = {
     "enabled", "command", "endpoint", "api_key", "model", "model_version",
     "max_tokens", "video_resolution", "duration", "poll", "timeout",
-    "cost_per_call", "quota",
+    "cost_per_call", "quota", "appid", "cluster", "voice_type",
+    "speed_ratio", "audio_in_video",
 }
 _INT_FIELDS = {"max_tokens", "duration", "quota", "timeout"}
 _FLOAT_FIELDS = {"cost_per_call", "poll"}
@@ -78,6 +80,8 @@ def settings_payload(app):
             "endpoint": conf.get("endpoint", ""),
             "model": conf.get("model", ""),
             "model_version": conf.get("model_version", ""),
+            "appid": conf.get("appid", ""),
+            "voice_type": conf.get("voice_type", ""),
             "api_key_masked": mask_key(conf.get("api_key", "")),
             "api_key_set": bool(conf.get("api_key")),
             "timeout": conf.get("timeout"),
@@ -135,6 +139,11 @@ def update_provider(config_path, name, fields):
             clean[key] = str(value).strip()
     if not clean:
         return {}
+    # 填了 Key 就是要用:未显式给 enabled 时自动启用,省一步开关
+    if clean.get("api_key") and "enabled" not in clean:
+        current = (merged.get("providers") or {}).get(name) or {}
+        if not current.get("enabled"):
+            clean["enabled"] = True
     data = _load_file(config_path)
     data.setdefault("providers", {}).setdefault(name, {}).update(clean)
     _save_file(config_path, data)

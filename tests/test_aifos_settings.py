@@ -87,6 +87,23 @@ def test_update_provider_and_masked_key_kept(tmp_path):
         update_provider(config_path, "claude_api", {"type": "mock"})
 
 
+def test_update_provider_key_auto_enables(tmp_path):
+    """只填 Key 不用再点启用:保存 Key 即自动 enabled=true。"""
+    app = App(tmp_path / "ws")
+    config_path = app.workspace.config_path
+    app.close()
+    written = update_provider(config_path, "image_api",
+                              {"api_key": "sk-only-key"})
+    assert written["enabled"] is True
+    conf = Config.load(config_path)
+    assert conf.get("providers", "image_api", "enabled") is True
+    # 显式给了 enabled=False 则尊重用户选择,不强行启用
+    update_provider(config_path, "image_api",
+                    {"api_key": "sk-other", "enabled": False})
+    conf = Config.load(config_path)
+    assert conf.get("providers", "image_api", "enabled") is False
+
+
 def test_set_routing_validation(tmp_path):
     app = App(tmp_path / "ws")
     config_path = app.workspace.config_path

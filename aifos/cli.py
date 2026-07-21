@@ -179,6 +179,9 @@ def _build_parser():
     p_config.add_argument("--model", help="模型名(API 模式)")
     p_config.add_argument("--model-version", dest="model_version",
                           help="即梦 CLI 模型版本")
+    p_config.add_argument("--appid", help="豆包 TTS 的 appid")
+    p_config.add_argument("--voice-type", dest="voice_type",
+                          help="豆包 TTS 音色,如 BV700_streaming")
     # dest 不能叫 command:会覆盖子命令本身的 dest="command"
     p_config.add_argument("--command", dest="cli_command",
                           help='CLI 命令整串,如 "dreamina" 或 '
@@ -537,7 +540,7 @@ def _cmd_config(app, args):
         if args.disable:
             fields["enabled"] = False
         for key in ("api_key", "endpoint", "model", "model_version",
-                    "timeout"):
+                    "appid", "voice_type", "timeout"):
             value = getattr(args, key, None)
             if value is not None:
                 fields[key] = value

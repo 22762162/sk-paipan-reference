@@ -155,13 +155,17 @@ def test_say_empty_text(tmp_path):
     assert not reply["ok"]
 
 
-def test_voice_routing_prefers_say_over_mock(tmp_path, monkeypatch):
+def test_voice_routing_custom_cli_provider(tmp_path, monkeypatch):
+    """say 已不在默认配置/路由里;手动声明完整 Provider 仍可接入。"""
     monkeypatch.setenv("PYTHONPATH", REPO_ROOT)
     say = _make_bin(tmp_path, "say", FAKE_SAY)
-    app = App(tmp_path / "ws", config_overrides={"providers": {"say": {
-        "enabled": True,
-        "command": [sys.executable, "-m", "aifos.adapters.say_voice",
-                    "--say", str(say)]}}})
+    app = App(tmp_path / "ws", config_overrides={
+        "providers": {"say": {
+            "type": "cli", "enabled": True, "capabilities": ["voice"],
+            "command": [sys.executable, "-m", "aifos.adapters.say_voice",
+                        "--say", str(say)],
+            "cost_per_call": 0.0, "timeout": 120}},
+        "routing": {"voice": ["say", "mock"]}})
     try:
         result = app.router.call(
             "voice", {"line_no": 1, "character": "甲", "text": "测试"},
@@ -170,3 +174,12 @@ def test_voice_routing_prefers_say_over_mock(tmp_path, monkeypatch):
         assert result.uri.endswith(".wav")
     finally:
         app.close()
+
+
+def test_say_absent_from_defaults():
+    """本地 say 配音已从默认产线移除(效果差):配音默认随视频/豆包。"""
+    from aifos.config import DEFAULTS
+    assert "say" not in DEFAULTS["providers"]
+    assert DEFAULTS["routing"]["voice"] == ["doubao_tts", "api", "mock"]
+    assert DEFAULTS["providers"]["jimeng"]["audio_in_video"] is True
+    assert DEFAULTS["providers"]["ark"]["audio_in_video"] is True

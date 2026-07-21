@@ -327,10 +327,13 @@ function drawSettings(data) {
       <h1>⚙️ AI 产线设置</h1>
       <button class="primary" id="btn-detect"
         title="扫描本机的 claude / codex / dreamina / 剪映 CLI,找到即自动填好并启用">🔍 自动检测本机 CLI</button>
-      <span class="hint">剧本 / 图片 / 视频每个环节都能选 CLI 或 API,按顺序自动回退;都没配好也有内置产线兜底,流程不会断</span>
+      <span class="hint">CLI 点「自动检测」,API 只要粘贴 Key(接口地址已内置官方默认),保存即启用;没配好的环节由内置产线兜底</span>
     </div>
-    <div class="panel">
-      <h2>能力路由 · 每个环节谁来干(按顺序尝试)</h2>
+    <div class="settings-grid">
+      ${data.providers.map(providerCard).join("")}
+    </div>
+    <details class="panel route-panel">
+      <summary>高级 · 能力路由(每个环节谁来干,按顺序自动回退;一般不用改)</summary>
       <table class="route-table">
         <thead><tr><th>环节</th><th>调用顺序(逗号分隔,前面不可用自动用后面)</th><th></th></tr></thead>
         <tbody>
@@ -342,10 +345,7 @@ function drawSettings(data) {
           </tr>`).join("")}
         </tbody>
       </table>
-    </div>
-    <div class="settings-grid">
-      ${data.providers.map(providerCard).join("")}
-    </div>
+    </details>
     <div class="panel dim" style="font-size:12px">
       配置文件:${esc(data.config_path)}(改动即存,下一次制作生效;API Key 只存本机,不回显)
     </div>
@@ -389,6 +389,8 @@ function drawSettings(data) {
       if (input.type === "checkbox") fields[input.dataset.field] = input.checked;
       else if (input.value.trim() !== "") fields[input.dataset.field] = input.value.trim();
     });
+    // 粘贴了 Key = 就是要用:自动启用,省去再点开关
+    if (fields.api_key && !fields.enabled) fields.enabled = true;
     return fields;
   };
   app.querySelectorAll(".provider-card").forEach((card) => {
@@ -435,10 +437,27 @@ function checksHtml(checks) {
 }
 
 function providerCard(p) {
-  const isApi = ["api", "claude_api", "image_api", "ark_video"].includes(p.type);
+  const isApi = ["api", "claude_api", "image_api", "ark_video",
+    "doubao_tts"].includes(p.type);
   const isCli = ["cli", "dreamina"].includes(p.type);
   const state = p.ready ? ["done", "就绪"]
     : p.enabled ? ["qc_failed", "待配置"] : ["", "未启用"];
+  // 高级设置(接口地址/模型/命令都有内置默认,平时不用碰)
+  const advanced = [];
+  if (isCli) advanced.push(`<label class="set-row"><span>命令</span>
+      <input data-field="command" value="${esc(p.command)}"
+        placeholder="可执行文件或整串命令(「自动检测」会自动填)"></label>`);
+  if (p.type === "dreamina") advanced.push(`<label class="set-row"><span>模型版本</span>
+      <input data-field="model_version" value="${esc(p.model_version)}"></label>`);
+  if (isApi) advanced.push(`<label class="set-row"><span>接口地址</span>
+      <input data-field="endpoint" value="${esc(p.endpoint)}"
+        placeholder="官方地址已内置"></label>`);
+  if (isApi && !["api", "doubao_tts"].includes(p.type))
+    advanced.push(`<label class="set-row"><span>模型</span>
+      <input data-field="model" value="${esc(p.model)}"></label>`);
+  if (p.type === "doubao_tts") advanced.push(`<label class="set-row"><span>音色</span>
+      <input data-field="voice_type" value="${esc(p.voice_type || "")}"
+        placeholder="如 BV700_streaming"></label>`);
   return `
   <div class="panel provider-card" data-provider="${esc(p.name)}">
     <div class="pc-head">
@@ -451,21 +470,19 @@ function providerCard(p) {
     <label class="set-row toggle"><span>启用</span>
       <input type="checkbox" data-field="enabled" ${p.enabled ? "checked" : ""}>
       <em>${p.enabled ? "参与自动路由" : "跳过,用下一个"}</em></label>
-    ${isCli ? `<label class="set-row"><span>命令</span>
-      <input data-field="command" value="${esc(p.command)}"
-        placeholder="可执行文件或整串命令"></label>` : ""}
-    ${p.type === "dreamina" ? `<label class="set-row"><span>模型版本</span>
-      <input data-field="model_version" value="${esc(p.model_version)}"></label>` : ""}
     ${isApi ? `
-      <label class="set-row"><span>接口地址</span>
-        <input data-field="endpoint" value="${esc(p.endpoint)}"></label>
+      ${p.type === "doubao_tts" ? `<label class="set-row"><span>APPID</span>
+        <input data-field="appid" value="${esc(p.appid || "")}"
+          placeholder="火山引擎语音的 appid"></label>` : ""}
       <label class="set-row"><span>API Key</span>
         <input data-field="api_key" type="password"
           placeholder="${p.api_key_set
             ? `已保存(${esc(p.api_key_masked)}),留空保持不变`
-            : "粘贴 API Key"}"></label>
-      ${p.type !== "api" ? `<label class="set-row"><span>模型</span>
-        <input data-field="model" value="${esc(p.model)}"></label>` : ""}` : ""}
+            : "粘贴 Key,保存即自动启用"}"></label>
+      <div class="pc-note">只需要填 Key:接口地址与模型已内置官方默认。</div>` : ""}
+    ${advanced.length ? `<details class="pc-advanced">
+      <summary>高级设置(一般不用改)</summary>
+      ${advanced.join("")}</details>` : ""}
     <div class="pc-actions">
       <button class="primary pc-save">保存</button>
       <button class="pc-test">测试连接</button>
