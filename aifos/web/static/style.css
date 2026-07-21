@@ -1361,3 +1361,26 @@ textarea:focus-visible, select:focus-visible {
 }
 .ref-card .ref-del:hover { color: #ef8f8f; border-color: var(--critical); }
 .asset-card .regen-box, .asset-card .io-box { margin-top: 2px; }
+
+/* ---- 剧本确认页:画风与参考面板 ---- */
+.style-panel {
+  margin: 0 18px; background: var(--surface);
+  border: 1px solid var(--hairline); border-radius: var(--radius);
+  padding: 14px 16px;
+}
+.style-panel h2 { font-size: 15px; margin-bottom: 10px; }
+.style-panel h2 .dim { font-size: 12px; font-weight: 400; }
+.style-row {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.style-row label {
+  flex: 0 0 64px; font-size: 13px; color: var(--ink-2); font-weight: 650;
+}
+.style-row input {
+  flex: 1; min-width: 180px; background: var(--page); color: var(--ink);
+  border: 1px solid var(--hairline); border-radius: 8px;
+  padding: 8px 10px; font-size: 13px;
+}
+#style-input { font-weight: 650; }
+.style-panel .ref-grid { margin-top: 10px; }

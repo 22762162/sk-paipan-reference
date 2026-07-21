@@ -497,6 +497,8 @@ def make_handler(workspace, jobs):
                     return self._reference_upload()
                 if parsed.path == "/api/reference/delete":
                     return self._reference_delete()
+                if parsed.path == "/api/project/style":
+                    return self._project_style()
                 if parsed.path == "/api/project/rename":
                     return self._project_rename()
                 if parsed.path == "/api/stop":
@@ -947,6 +949,32 @@ def make_handler(workspace, jobs):
             return self._json({"status": "cancelling",
                                "previous": episode["status"],
                                "run_ids": [j.get("run_id") for j in active]})
+
+        def _project_style(self):
+            """画风确认:{project, style}。剧本确认页在开画前设定,
+            之后所有人物/场景/分镜出图提示都会带上该画风。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            title = (body.get("project") or "").strip()
+            style = (body.get("style") or "").strip()
+            if not title:
+                return self._error(400, "缺少 project")
+            if not style:
+                return self._error(400, "画风不能为空")
+
+            def task(app):
+                if app.projects.get_project(title) is None:
+                    raise AifosError(f"项目不存在: {title}")
+                project = app.projects.update_project(title, style=style)
+                app.logger.info("director", f"画风已确认: {style}")
+                return dict(project)
+
+            try:
+                project = self._with_app(task)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(project)
 
         def _project_rename(self):
             body = self._read_body()

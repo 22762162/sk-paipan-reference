@@ -271,3 +271,23 @@ def test_unknown_routes(server):
     status, _ = _json_request(
         server["port"], "GET", "/api/assets?project=" + quote("不存在"))
     assert status == 404
+
+
+def test_project_style_api(server):
+    """剧本确认页的画风确认:保存后所有出图提示按新画风执行。"""
+    port = server["port"]
+    status, reply = _json_request(port, "POST", "/api/produce", {
+        "sentence": "开始制作《风格测试》第1集"})
+    assert status == 202
+    _wait_job(port, reply["job_id"])
+    status, project = _json_request(port, "POST", "/api/project/style", {
+        "project": "风格测试", "style": "水墨国风,淡彩留白"})
+    assert status == 200
+    assert project["style"] == "水墨国风,淡彩留白"
+    # 空画风/不存在的项目要报错
+    status, _ = _json_request(port, "POST", "/api/project/style", {
+        "project": "风格测试", "style": ""})
+    assert status == 400
+    status, _ = _json_request(port, "POST", "/api/project/style", {
+        "project": "不存在", "style": "x"})
+    assert status == 400

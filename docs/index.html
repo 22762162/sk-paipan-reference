@@ -1224,6 +1224,29 @@ textarea:focus-visible, select:focus-visible {
 .ref-card .ref-del:hover { color: #ef8f8f; border-color: var(--critical); }
 .asset-card .regen-box, .asset-card .io-box { margin-top: 2px; }
 
+/* ---- 剧本确认页:画风与参考面板 ---- */
+.style-panel {
+  margin: 0 18px; background: var(--surface);
+  border: 1px solid var(--hairline); border-radius: var(--radius);
+  padding: 14px 16px;
+}
+.style-panel h2 { font-size: 15px; margin-bottom: 10px; }
+.style-panel h2 .dim { font-size: 12px; font-weight: 400; }
+.style-row {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.style-row label {
+  flex: 0 0 64px; font-size: 13px; color: var(--ink-2); font-weight: 650;
+}
+.style-row input {
+  flex: 1; min-width: 180px; background: var(--page); color: var(--ink);
+  border: 1px solid var(--hairline); border-radius: 8px;
+  padding: 8px 10px; font-size: 13px;
+}
+#style-input { font-weight: 650; }
+.style-panel .ref-grid { margin-top: 10px; }
+
 .demo-note {
   background: var(--surface-2); border-bottom: 1px solid var(--hairline);
   color: var(--ink-2); font-size: 12.5px; padding: 7px 20px;
@@ -5649,18 +5672,27 @@ function renderProductionView(data, episodeId) {
   pollCanvas(episodeId);
 }
 
-/* ---- 剧本审阅页:剧本确认后才开始画图(第一道确认) ---- */
+/* ---- 剧本审阅页:剧本确认后才开始画图(第一道确认) ----
+   开画前在这里确定画风、上传参考图,出图全程按它们执行 */
+const STYLE_PRESETS = ["国风漫剧", "现代都市漫剧", "校园清新日系",
+  "水墨国风", "赛博朋克霓虹", "日系少年漫", "欧美卡通",
+  "3D 渲染动画", "复古港漫", "治愈系水彩"];
+
 function renderScriptReview(data, episodeId) {
   const script = data.script;
+  const refs = (data.artifacts || {}).references || [];
+  const attachOptions = [
+    ...(script.characters || []).map((c) => c.name),
+    ...[...new Set((script.scenes || []).map((s) => s.location))]];
   app.innerHTML = `
   <div class="canvas-view">
     <div class="confirm-banner">
       <div>
         <b>剧本写好了,先过目 📖</b>
-        <span>看完满意点确认,才开始画人物/场景/分镜(此刻还没花出图额度);
-        不满意在下方写修改意见重写,或直接编辑文字。</span>
+        <span>看剧本 → 定画风 → 传参考图(可选)→ 点确认才开始画
+        (此刻还没花出图额度);剧本不满意可意见重写或直接编辑。</span>
       </div>
-      <button class="primary" id="btn-script-ok">✅ 剧本OK,开始画图</button>
+      <button class="primary" id="btn-script-ok">✅ 剧本OK,按此风格开始画图</button>
     </div>
     <div class="canvas-toolbar">
       <button id="btn-back">← 仪表盘</button>
@@ -5669,24 +5701,106 @@ function renderScriptReview(data, episodeId) {
       <span class="spacer"></span>
       <button id="btn-polish">✏️ 打磨剧本(意见重写/直接编辑/上传下载)</button>
     </div>
+    <div class="style-panel">
+      <h2>🎨 画风与参考 <span class="dim">开始画图前确认;人物/场景/分镜全部按这里执行</span></h2>
+      <div class="style-row">
+        <label>本剧画风</label>
+        <input id="style-input" list="style-presets"
+          value="${esc(data.project.style || "国风漫剧")}"
+          placeholder="选一个预设,或自己写,如:水墨国风,淡彩,留白构图">
+        <datalist id="style-presets">${STYLE_PRESETS.map((s) =>
+          `<option>${esc(s)}</option>`).join("")}</datalist>
+        <button id="style-save">保存画风</button>
+      </div>
+      <div class="style-row">
+        <label>参考图</label>
+        <input id="ref-name" placeholder="名称,如:女主官方设定(可留空)">
+        <input id="ref-attach" list="ref-attach-list"
+          placeholder="关联对象(留空=全项目):角色或场景名">
+        <datalist id="ref-attach-list">${attachOptions.map((n) =>
+          `<option>${esc(n)}</option>`).join("")}</datalist>
+        <button class="primary" id="ref-upload">⬆ 上传参考图</button>
+      </div>
+      ${refs.length ? `<div class="pb-grid ref-grid">${refs.map((r) => `
+        <div class="plan-card ref-card">
+          <div class="pc-media">${r.url ? `<img src="${esc(r.url)}" loading="lazy" alt="">` : `<div class="pc-empty">🖼</div>`}</div>
+          <div class="pc-label" title="${esc(r.name)}">${esc(r.name)}</div>
+          <div class="dim">${r.attach_to ? "关联:" + esc(r.attach_to) : "全项目通用"}</div>
+          <button class="ref-del" data-name="${esc(r.name)}">删除</button>
+        </div>`).join("")}</div>`
+      : `<div class="dim" style="margin-top:6px">还没有参考图。有官方设定图/画风样例就传上来,
+         人物形象和画风会稳定得多;之后在「资产中心」也能管理。</div>`}
+    </div>
     <div class="script-review">${scriptBodyHtml(script)}</div>
   </div>`;
   document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
   document.getElementById("btn-polish").onclick = () =>
     showScriptOverlay(data, episodeId);
+  const post = (path, body) => api(path, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body) });
+  const saveStyle = async () => {
+    const style = document.getElementById("style-input").value.trim();
+    if (!style || style === data.project.style) return style;
+    await post("/api/project/style", {
+      project: data.project.title, style });
+    return style;
+  };
+  document.getElementById("style-save").onclick = async (ev) => {
+    try {
+      await saveStyle();
+      showToast("画风已保存,出图会按这个风格执行", "ok");
+      ev.target.textContent = "✓ 已保存";
+      setTimeout(() => { ev.target.textContent = "保存画风"; }, 1500);
+    } catch (e) { showToast(e.message, "error"); }
+  };
+  document.getElementById("ref-upload").onclick = () => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*";
+    input.onchange = () => {
+      const file = input.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = async () => {
+        try {
+          await post("/api/reference/upload", {
+            project: data.project.title,
+            name: document.getElementById("ref-name").value.trim()
+                  || file.name.replace(/\.[^.]+$/, ""),
+            attach_to: document.getElementById("ref-attach").value.trim(),
+            filename: file.name,
+            data_base64: String(reader.result).split(",")[1] || "",
+          });
+          showToast("参考图已上传,画图时会自动参考", "ok");
+          renderCanvasView(episodeId);
+        } catch (e) { showToast(e.message, "error"); }
+      };
+      reader.readAsDataURL(file);
+    };
+    input.click();
+  };
+  app.querySelectorAll(".ref-del").forEach((btn) => {
+    btn.onclick = (ev) => armConfirm(ev.target, "删除", async () => {
+      try {
+        await post("/api/reference/delete", {
+          project: data.project.title, name: btn.dataset.name });
+        showToast("参考图已删除", "ok");
+        renderCanvasView(episodeId);
+      } catch (e) { showToast(e.message, "error"); }
+    });
+  });
   document.getElementById("btn-script-ok").onclick = async (ev) => {
     const btn = ev.target;
     btn.disabled = true; btn.textContent = "已确认,画图中…";
     try {
-      await api("/api/confirm", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ episode_id: data.episode.id }),
-      });
-      showToast("剧本已确认!正在画人物/场景/分镜,完成后再来确认开拍", "ok");
+      await saveStyle();   // 确认时顺手保存画风,忘点保存也不丢
+      await post("/api/confirm", { episode_id: data.episode.id });
+      showToast("已确认!按选定画风画人物/场景/分镜,完成后再来确认开拍", "ok");
       pollCanvas(episodeId);
     } catch (e) {
       showToast(e.message, "error");
-      btn.disabled = false; btn.textContent = "✅ 剧本OK,开始画图";
+      btn.disabled = false; btn.textContent = "✅ 剧本OK,按此风格开始画图";
     }
   };
 }

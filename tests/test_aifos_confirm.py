@@ -217,6 +217,17 @@ def test_regen_image_prompt_override(app):
     assert item["prompt"] == "红衣持剑,雪夜屋顶,月光逆光,全身立绘"
 
 
+def test_style_confirmed_at_script_step_flows_into_prompts(app):
+    """剧本确认时改画风 → 之后人物/场景/分镜提示词全部按新画风。"""
+    app.director.produce("万妖图录", 1, pause_for_confirm=True)   # 剧本停
+    app.projects.update_project("万妖图录", style="水墨国风,淡彩留白")
+    app.director.produce("万妖图录", 1, pause_for_confirm=True)   # 开画
+    plan = _plan_of(app, "万妖图录", 1)
+    for cat in ("character_art", "character_sheet", "scene_art"):
+        item = next(i for i in plan["items"] if i["category"] == cat)
+        assert "水墨国风" in item["prompt"], f"{cat} 未按新画风"
+
+
 def test_plan_marks_mock_images_with_fallback_reason(app):
     """真假产线透明:占位图必须标注 mock 与回退原因,SVG 自带水印。"""
     app.director.produce("万妖图录", 1, pause_for_confirm=True)
