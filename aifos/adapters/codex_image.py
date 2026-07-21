@@ -37,15 +37,18 @@ GEN_DIRECTIVE = (
 
 
 def _style_line(payload):
-    style = payload.get("style") or "国风漫剧"
-    return (f"画风要求:{style},2D 动画质感,高细节;整部作品所有画面"
-            "保持同一画风、同一人物造型。")
+    style = payload.get("style") or (
+        "现代都市精品漫剧，电影级半写实人物与场景，现代服装和现代建筑")
+    return (f"画风要求:{style}；高细节；严格按该媒介、时代和服装要求执行；"
+            "整部作品所有画面保持同一画风、同一人物造型。")
 
 
 def _ref_line(payload):
     refs = [f"人物设定图 {r}" for r in payload.get("character_refs", [])]
     if payload.get("scene_ref"):
         refs.append(f"场景概念图 {payload['scene_ref']}")
+    refs.extend(f"用户参考图 {r}"
+                for r in payload.get("reference_images", []))
     if not refs:
         return ""
     return ("参考图(文件可直接读取;人物发型/服装/配色和场景陈设"
@@ -72,14 +75,26 @@ def build_instruction(capability, payload, out_dir):
             instruction = (
                 f"为角色生成立绘并保存到 {target}(PNG,{size})。"
                 f"{payload.get('prompt', '')}。这张立绘是全剧的人物设定基准,"
-                f"之后所有镜头都会参考它。{common}只产出该文件。")
+                f"之后所有镜头都会参考它。{_ref_line(payload)}{common}"
+                "只产出该文件。")
             return instruction, [target], {"name": payload.get("art_name")}
+        if payload.get("character_sheet"):
+            key = payload["character_sheet"]
+            target = out_dir / f"sheet_{safe}_{key}.png"
+            instruction = (
+                f"为角色生成{payload.get('sheet_label', key)}设定资产并保存到"
+                f" {target}(PNG,{size})。{payload.get('prompt', '')}。"
+                "这是人物资产库的生产级设定图,必须与立绘/参考图为同一人物,"
+                f"发型服装配色完全一致。{_ref_line(payload)}{common}"
+                "只产出该文件。")
+            return instruction, [target], {
+                "name": payload.get("art_name"), "sheet": key}
         if payload.get("scene_art"):
             target = out_dir / f"scene_{safe}.png"
             instruction = (
                 f"为场景生成概念图并保存到 {target}(PNG,{size})。"
                 f"{payload.get('prompt', '')}。这张概念图是该场景的美术基准。"
-                f"{common}只产出该文件。")
+                f"{_ref_line(payload)}{common}只产出该文件。")
             return instruction, [target], {"name": payload.get("art_name")}
         shot_no = int(payload["shot_no"])
         target = out_dir / f"shot_{shot_no:03d}.keyframe.png"
@@ -179,7 +194,8 @@ def run(request, codex, timeout, extra_args, plain=False):
     if missing:
         return {"ok": False,
                 "error": f"codex 未产出期望文件: {', '.join(missing)}"}
-    return {"ok": True, "data": data, "uri": str(targets[0])}
+    return {"ok": True, "data": data, "uri": str(targets[0]),
+            "model": "codex/image_gen-managed (底层模型未披露)"}
 
 
 def main(argv=None):

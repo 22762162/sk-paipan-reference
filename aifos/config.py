@@ -98,7 +98,9 @@ DEFAULTS = {
             "type": "ark_video", "enabled": False,
             "capabilities": ["video"],
             "endpoint": "https://ark.cn-beijing.volces.com", "api_key": "",
-            "model": "seedance-2.0-fast",   # 按实际开通的模型/接入点 ID 填
+            # 模型 ID 必须从方舟控制台复制(形如 doubao-seedance-2-0-…
+            # 带日期后缀,或推理接入点 ep-…);留空时设置页会明确提示
+            "model": "",
             "video_resolution": "720p", "duration": 8, "poll": 5,
             "audio_in_video": True,    # Seedance2 有声视频:配音随视频生成
             "cost_per_call": 2.5, "timeout": 1800,

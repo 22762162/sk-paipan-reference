@@ -92,7 +92,7 @@ class ClaudeApiProvider(Provider):
             return False, str(exc)
         return True, f"真实连通成功(model={model})"
 
-    def generate(self, capability, payload, out_dir):
+    def generate(self, capability, payload, out_dir, cancel=None):
         try:
             prompt = build_prompt(capability, payload)
         except ValueError as exc:
@@ -185,7 +185,7 @@ class OpenAIImageProvider(Provider):
         else:
             raise ProviderError(f"{self.name} 应答缺少 b64_json/url")
 
-    def generate(self, capability, payload, out_dir):
+    def generate(self, capability, payload, out_dir, cancel=None):
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         size = self._size(payload)
@@ -209,20 +209,26 @@ class OpenAIImageProvider(Provider):
             self._gen_image(prompt, size, target)
             return ProviderResult(provider=self.name,
                                   cost=self.cost_per_call,
-                                  data=data, uri=str(target))
+                                  data=data, uri=str(target),
+                                  model=(self.conf.get("model")
+                                         or self.DEFAULT_MODEL))
         if capability == "frames":
             shot_no = int(payload["shot_no"])
             first = out_dir / f"shot_{shot_no:03d}.first.png"
             last = out_dir / f"shot_{shot_no:03d}.last.png"
             self._gen_image(
                 f"{prompt}。首帧:动作起始瞬间,构图稳定", size, first)
+            if cancel is not None and cancel():
+                from ..errors import ProduceCancelled
+                raise ProduceCancelled("已手动停止")
             self._gen_image(
                 f"{prompt}。尾帧:动作结束瞬间,与首帧同场景同角色",
                 size, last)
             return ProviderResult(
                 provider=self.name, cost=self.cost_per_call * 2,
                 data={"first": str(first), "last": str(last)},
-                uri=str(first))
+                uri=str(first), model=(self.conf.get("model")
+                                       or self.DEFAULT_MODEL))
         if capability == "cover":
             target = out_dir / "cover.png"
             self._gen_image(
@@ -231,7 +237,9 @@ class OpenAIImageProvider(Provider):
                 f"{payload.get('tagline', '')}。{prompt}", size, target)
             return ProviderResult(provider=self.name,
                                   cost=self.cost_per_call,
-                                  data={}, uri=str(target))
+                                  data={}, uri=str(target),
+                                  model=(self.conf.get("model")
+                                         or self.DEFAULT_MODEL))
         raise ProviderError(f"{self.name} 不支持能力: {capability}")
 
 
@@ -299,7 +307,7 @@ class DoubaoTtsProvider(Provider):
         voice = self.conf.get("voice_type") or self.DEFAULT_VOICE
         return True, f"真实连通成功(voice_type={voice})"
 
-    def generate(self, capability, payload, out_dir):
+    def generate(self, capability, payload, out_dir, cancel=None):
         if capability != "voice":
             raise ProviderError(f"{self.name} 不支持能力: {capability}")
         text = payload.get("text", "")
@@ -325,7 +333,8 @@ class ArkVideoProvider(Provider):
     """
 
     DEFAULT_ENDPOINT = "https://ark.cn-beijing.volces.com"
-    DEFAULT_MODEL = "seedance-2.0-fast"   # 按实际开通的模型/接入点 ID 配置
+    MODEL_HINT = ("模型 ID 需从方舟控制台【开通管理】复制:形如 "
+                  "doubao-seedance-2-0-…(带日期后缀)或推理接入点 ep-…")
 
     def available(self, capability):
         ok, reason = super().available(capability)
@@ -333,6 +342,8 @@ class ArkVideoProvider(Provider):
             return ok, reason
         if not self.conf.get("api_key"):
             return False, "未配置 api_key"
+        if not self.conf.get("model"):
+            return False, f"未配置模型 ID;{self.MODEL_HINT}"
         return True, ""
 
     def ping(self):
@@ -344,13 +355,18 @@ class ArkVideoProvider(Provider):
                 self.name,
                 f"{endpoint}/api/v3/contents/generations/tasks",
                 {"Authorization": f"Bearer {self.conf['api_key']}"},
-                body={"model": self.conf.get("model") or self.DEFAULT_MODEL,
+                body={"model": self.conf.get("model", ""),
                       "content": []},
                 timeout=30)
         except ProviderError as exc:
             message = str(exc)
             if "HTTP 400" in message:
                 return True, "真实连通成功(端点可达,鉴权通过)"
+            if "NotFound" in message or "HTTP 404" in message:
+                return False, (f"Key 已通过,但模型 ID 不存在或未开通。"
+                               f"{self.MODEL_HINT};开通入口:方舟控制台 "
+                               f"console.volcengine.com/ark → 开通管理 → "
+                               f"Doubao-Seedance 2.0")
             return False, message
         return True, "真实连通成功"
 
@@ -363,7 +379,7 @@ class ArkVideoProvider(Provider):
             "image_url": {"url": f"data:image/{suffix};base64,{encoded}"},
         }
 
-    def generate(self, capability, payload, out_dir):
+    def generate(self, capability, payload, out_dir, cancel=None):
         if capability != "video":
             raise ProviderError(f"{self.name} 不支持能力: {capability}")
         endpoint = (self.conf.get("endpoint")
@@ -387,9 +403,11 @@ class ArkVideoProvider(Provider):
             if payload.get(key):
                 content.append(self._frame_content(payload[key], role))
         tasks_url = f"{endpoint}/api/v3/contents/generations/tasks"
+        if not self.conf.get("model"):
+            raise ProviderError(f"{self.name} 未配置模型 ID;{self.MODEL_HINT}")
         created = _request_json(
             self.name, tasks_url, headers,
-            body={"model": self.conf.get("model") or self.DEFAULT_MODEL,
+            body={"model": self.conf["model"],
                   "content": content},
             timeout=self.conf.get("timeout", 1800))
         task_id = created.get("id")
@@ -411,6 +429,10 @@ class ArkVideoProvider(Provider):
                     f"{error.get('message', status)}")
             if time.monotonic() >= deadline:
                 raise ProviderError(f"{self.name} 任务超时: {task_id}")
+            if cancel is not None and cancel():
+                from ..errors import ProduceCancelled
+                raise ProduceCancelled(
+                    f"已手动停止(不再等待 {self.name} 任务 {task_id})")
             time.sleep(poll)
         video_url = (status_reply.get("content") or {}).get("video_url")
         if not video_url:

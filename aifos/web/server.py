@@ -237,6 +237,21 @@ def _collect_artifacts(app, project_id, ep_num):
         {"name": row["name"],
          "url": _versioned(_artifact_url(app, row["uri"]), row)}
         for row in latest_rows("scene_art")]
+    # 人物资产套件(四视图/特写/特征/妆容/服装/服装细节)按角色分组
+    sheets = {}
+    for row in latest_rows("character_sheet"):
+        meta = json.loads(row["meta"] or "{}")
+        sheets.setdefault(meta.get("character", ""), []).append({
+            "name": row["name"], "sheet": meta.get("sheet", ""),
+            "label": meta.get("label", ""),
+            "url": _versioned(_artifact_url(app, row["uri"]), row)})
+    out["character_sheets"] = sheets
+    out["references"] = [
+        {"name": row["name"],
+         "attach_to": json.loads(row["meta"] or "{}").get("attach_to", ""),
+         "note": json.loads(row["meta"] or "{}").get("note", ""),
+         "url": _versioned(_artifact_url(app, row["uri"]), row)}
+        for row in latest_rows("reference")]
     return out
 
 
@@ -268,6 +283,13 @@ def _episode_payload(app, episode_id):
     qc_path = out_dir / "qc_report.json"
     if qc_path.exists():
         qc_report = json.loads(qc_path.read_text(encoding="utf-8"))
+    render_plan = None
+    plan_path = out_dir / "render_plan.json"
+    if plan_path.exists():
+        try:
+            render_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        except ValueError:
+            render_plan = None
     return {
         "episode": dict(episode),
         "project": dict(project),
@@ -288,6 +310,7 @@ def _episode_payload(app, episode_id):
         "production_standard": production_standard,
         "production_standard_version": production_standard_v,
         "qc_report": qc_report,
+        "render_plan": render_plan,
         "artifacts": _collect_artifacts(
             app, project["id"], episode["number"]),
     }
@@ -349,7 +372,7 @@ def make_handler(workspace, jobs):
         def _error(self, status, message):
             self._json({"error": message}, status=status)
 
-        def _file(self, path):
+        def _file(self, path, no_cache=False):
             path = Path(path)
             if not path.is_file():
                 return self._error(404, "文件不存在")
@@ -359,6 +382,10 @@ def make_handler(workspace, jobs):
                 "Content-Type",
                 MIME.get(path.suffix.lower(), "application/octet-stream"))
             self.send_header("Content-Length", str(len(body)))
+            if no_cache:
+                # 界面文件禁缓存:git pull 更新后刷新即生效,
+                # 避免浏览器缓存旧版界面导致"更新了却看不到新功能"
+                self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self.wfile.write(body)
 
@@ -376,7 +403,8 @@ def make_handler(workspace, jobs):
             query = parse_qs(parsed.query)
             try:
                 if route in ("/", "/index.html"):
-                    return self._file(STATIC_DIR / "index.html")
+                    return self._file(STATIC_DIR / "index.html",
+                                      no_cache=True)
                 if route.startswith("/static/"):
                     return self._static(STATIC_DIR, route[len("/static/"):])
                 if route.startswith("/artifacts/"):
@@ -465,6 +493,10 @@ def make_handler(workspace, jobs):
                     return self._settings_test()
                 if parsed.path == "/api/settings/detect":
                     return self._settings_detect()
+                if parsed.path == "/api/reference/upload":
+                    return self._reference_upload()
+                if parsed.path == "/api/reference/delete":
+                    return self._reference_delete()
                 if parsed.path == "/api/project/rename":
                     return self._project_rename()
                 if parsed.path == "/api/stop":
@@ -488,7 +520,7 @@ def make_handler(workspace, jobs):
             target = (root / rel).resolve()
             if not str(target).startswith(str(root.resolve()) + "/"):
                 return self._error(404, "非法路径")
-            return self._file(target)
+            return self._file(target, no_cache=True)
 
         def _artifact(self, rel):
             app = App(workspace)
@@ -786,20 +818,23 @@ def make_handler(workspace, jobs):
                 return self._error(400, "请求体不是合法 JSON")
             target = body.get("target") or {}
             if target.get("kind") not in ("character_art", "scene_art",
-                                          "shot"):
-                return self._error(400, "target.kind 需为 "
-                                        "character_art/scene_art/shot")
+                                          "shot", "character_sheet"):
+                return self._error(400, "target.kind 需为 character_art/"
+                                        "scene_art/shot/character_sheet")
             found = self._episode_ref(body)
             if found is None:
                 return self._error(404, "剧集不存在")
             title, number = found
             feedback = (body.get("feedback") or "").strip()
+            prompt = (body.get("prompt") or "").strip()
             job_id = jobs.start_task(
                 title, number,
                 lambda app, run_id: app.director.regen_image(
-                    title, number, target, feedback=feedback),
+                    title, number, target, feedback=feedback,
+                    prompt_override=prompt),
                 action="regen_image",
-                request={"target": target, "feedback": feedback})
+                request={"target": target, "feedback": feedback,
+                         "prompt": prompt})
             return self._json({"job_id": job_id}, status=202)
 
         def _settings_update(self):
@@ -874,7 +909,16 @@ def make_handler(workspace, jobs):
                 episode = app.projects.get_episode(int(body["episode_id"]))
                 if episode is None:
                     raise AifosError("剧集不存在")
-                if episode["status"] in stable:
+                project = app.db.query_one(
+                    "SELECT * FROM projects WHERE id=?",
+                    (episode["project_id"],))
+                # 有正在运行的制作任务时,无论状态都允许停止
+                job_running = any(
+                    j["status"] == "running"
+                    and j.get("title") == project["title"]
+                    and j.get("episode") == episode["number"]
+                    for j in jobs.list())
+                if episode["status"] in stable and not job_running:
                     raise AifosError("当前没有正在进行的生成")
                 project = app.db.query_one(
                     "SELECT * FROM projects WHERE id=?",
@@ -926,6 +970,48 @@ def make_handler(workspace, jobs):
             except AifosError as exc:
                 return self._error(400, str(exc))
             return self._json(project)
+
+        def _reference_upload(self):
+            """参考图上传:{project, name, attach_to, note, filename,
+            data_base64};出图时自动注入提示(全局或关联角色/场景)。"""
+            import base64
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            title = (body.get("project") or "").strip()
+            if not title:
+                return self._error(400, "缺少 project")
+            try:
+                data = base64.b64decode(body.get("data_base64", ""))
+            except Exception:
+                return self._error(400, "data_base64 解码失败")
+            if not data:
+                return self._error(400, "文件为空")
+            if len(data) > 50 * 1024 * 1024:
+                return self._error(400, "参考图超过 50MB")
+            ext = Path(body.get("filename", "")).suffix.lower() or ".png"
+            try:
+                result = self._with_app(
+                    lambda app: app.director.add_reference(
+                        title, body.get("name", ""), data, ext,
+                        attach_to=(body.get("attach_to") or "").strip(),
+                        note=(body.get("note") or "").strip()))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _reference_delete(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.delete_reference(
+                        (body.get("project") or "").strip(),
+                        (body.get("name") or "").strip()))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
 
         def _upload(self):
             """人工修改素材上传:{episode_id, target, filename, data_base64}。

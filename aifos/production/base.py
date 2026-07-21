@@ -16,6 +16,11 @@ class ProviderResult:
     cost: float
     data: dict = field(default_factory=dict)
     uri: str = ""
+    # 精确模型可知时写模型 ID；托管工具不披露时写明确的 managed 标识。
+    model: str = ""
+    # 路由回退轨迹:本次调用之前被跳过的真实产线及原因
+    # [{"provider": "codex", "reason": "命令不存在: codex"}, ...]
+    fallbacks: list = field(default_factory=list)
 
 
 class Provider:
@@ -35,5 +40,7 @@ class Provider:
             return False, f"不支持能力 {capability}"
         return True, ""
 
-    def generate(self, capability, payload, out_dir):
+    def generate(self, capability, payload, out_dir, cancel=None):
+        """cancel: 可选回调,返回 True 表示用户已请求停止,
+        长调用(子进程/轮询)应尽快安全终止并抛 ProduceCancelled。"""
         raise NotImplementedError

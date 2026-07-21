@@ -70,7 +70,7 @@ class JianyingDraftProvider(Provider):
                            "或在设置的「草稿目录」里手动指定)")
         return True, ""
 
-    def generate(self, capability, payload, out_dir):
+    def generate(self, capability, payload, out_dir, cancel=None):
         if capability != "edit":
             raise ProviderError(f"剪映草稿产线不支持能力: {capability}")
         try:

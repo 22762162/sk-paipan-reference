@@ -1,19 +1,39 @@
-# AGENTS.md(sk-paipan-reference · Codex 参考实现工作区)
+# AIFOS 双 AI 协作规则
 
-你是三鉴项目的**参考实现者**,在本独立仓库依据 `contracts/` 盲写排盘参考实现(Python)。
+本分支用于 AIFOS（AI 精品漫剧工业化生产平台）。Claude Code 与 Codex
+共同开发同一产品，任何一方的新增功能都必须通过 Git 合并进入共同分支，
+禁止用整目录或整文件覆盖另一方的工作。
 
-## 不可违反的规则
+## 共同基线
 
-1. **盲写**:接口契约以 `contracts/paipan-spec.md` + `contracts/paipan.schema.json` 为唯一依据。禁止访问、检索或推测主仓库(22762162/sk)的任何实现细节;对规格的疑问写入 `SPEC-QUESTIONS.md` 并停止相关实现,不得自行猜测补齐。
-2. **确定性**:禁止 LLM 调用、网络请求、系统时钟、无种子随机、按环境变量分支。历法事实(节气时刻、时区、夏令时)只能来自注入的参数或数据文件,禁止凭模型记忆写历法常量。
-3. **零第三方依赖**:仅 Python 标准库;测试可用 pytest。
-4. **协议稳健**:`python3 -m paipan_ref.cli` 实现 spec 附录 A 的 JSONL 协议;未知 op、缺字段、类型不符(含浮点/布尔混入整型字段)→ 该行 `ok:false`,进程不崩溃、继续处理后续行。
-5. **判界测试**:每个判界函数必须含边界三连测(界前 1 秒、恰好等于、界后 1 秒)。
+- 正式仓库：`/Users/sk/AIFOS`
+- 共同分支：`claude/sk-manga-drama-platform-b8nbe3`
+- 正式测试服务：`http://127.0.0.1:8619/`
+- 每次开始开发前先执行 `git fetch origin`、`git status --short --branch`。
+- 工作区不干净时禁止 `pull`、`rebase`、`stash`、`reset` 或切换分支。
+- 禁止强推；远端前进时只允许再次普通 merge。
 
-## 会话隔离
+## 并行开发
 
-本仓库工作会话不得同时(或曾经)持有主仓库 L1 代码上下文;主仓库工作会话亦不得承接本仓库任务。
+- Claude Code 与 Codex 应使用各自的 branch/worktree；不要同时修改同一工作树。
+- 每项功能独立提交，提交信息说明功能与测试结果。
+- 合并冲突必须逐段做功能级整合，保留双方能力；禁止用 `ours`、`theirs`
+  或复制整文件快速覆盖。
+- 发现他人未提交改动时停止写入并等待，不得代为整理或提交。
 
-## 任务入口
+## 生产安全
 
-当前任务见 `TASK.md`。
+- 修改、合并或重启前检查 `/api/jobs`，以及 `aifos.adapters`、`codex exec`、
+  `dreamina`、`seedance`、测试和 Git 写入进程。
+- 真实生成期间不得改代码、数据库、素材或服务进程。
+- 8619 服务只能在确认 PID 的 cwd 为 `/Users/sk/AIFOS`、命令包含
+  `python -m aifos serve` 后优雅 TERM；禁止强杀未知进程。
+- 不删除或覆盖已有生成资产；重做使用新版本并保留历史记录。
+
+## 交付门槛
+
+- 至少运行 `node --check aifos/web/static/app.js`、
+  `python3 -m compileall -q aifos tests`、`git diff --check` 和完整测试。
+- 漫剧产线遵守 `sk-manju-storyboard-skill`：先五维分镜，再关键帧，再视频；
+  人物、服装、文字、段间状态及无字幕规则必须通过硬门禁。
+- 新 UI/API 必须有测试；失败原因必须在用户界面可见，不能只写后台日志。

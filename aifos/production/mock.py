@@ -105,11 +105,13 @@ def _detect_genre(payload):
     """开工未明确类型时,按 标题+前提+风格 关键词识别题材。"""
     if payload.get("template") == "idol":
         return "idol"
-    text = " ".join(str(payload.get(k) or "")
-                    for k in ("project_title", "premise", "style"))
-    for genre, keywords in GENRE_KEYWORDS.items():
-        if any(k in text for k in keywords):
-            return genre
+    # 标题和剧情前提决定故事题材；视觉风格只做最后兜底。否则现代默认
+    # 画风中的“都市”会盖过《万妖图录》标题里的“妖”。
+    for fields in (("project_title", "premise"), ("style",)):
+        text = " ".join(str(payload.get(k) or "") for k in fields)
+        for genre, keywords in GENRE_KEYWORDS.items():
+            if any(k in text for k in keywords):
+                return genre
     return "xianxia"
 
 
@@ -164,7 +166,7 @@ def _json_artifact(path, data):
 
 
 class MockProvider(Provider):
-    def generate(self, capability, payload, out_dir):
+    def generate(self, capability, payload, out_dir, cancel=None):
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         handler = getattr(self, f"_gen_{capability}", None)
@@ -392,6 +394,7 @@ class MockProvider(Provider):
             camera=payload.get("camera", ""),
             action=payload.get("action", ""),
             variant=variant,
+            watermark=False,   # 镜头画面禁一切文字(无字幕母版)
         )
 
     @staticmethod
@@ -411,6 +414,15 @@ class MockProvider(Provider):
                                 payload.get("role", "")),
                 encoding="utf-8")
             return {"name": name}, str(path)
+        if payload.get("character_sheet"):
+            name = payload.get("art_name", "")
+            key = payload["character_sheet"]
+            path = out_dir / f"sheet_{_safe_name(name)}_{key}.svg"
+            path.write_text(
+                render_portrait(width, height, seed, name,
+                                payload.get("sheet_label", key)),
+                encoding="utf-8")
+            return {"name": name, "sheet": key}, str(path)
         if payload.get("scene_art"):
             name = payload.get("art_name", "")
             path = out_dir / f"scene_{_safe_name(name)}.svg"

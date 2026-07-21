@@ -6,6 +6,7 @@ import pytest
 
 from aifos.app import App
 from aifos.cli import main
+from aifos.director import MODERN_OTOME_STYLE, infer_visual_style
 
 
 @pytest.fixture()
@@ -23,6 +24,22 @@ def test_review_pauses_at_script_first(app):
     project = app.projects.get_project("万妖图录")
     assert app.assets.list(project["id"], "character_art") == []
     assert app.assets.latest(project["id"], "image", "e001_shot001") is None
+
+
+def test_modern_otome_style_is_inferred_and_persisted(app):
+    assert infer_visual_style("现代 / 时尚 / 3D / 乙女风格") == MODERN_OTOME_STYLE
+    app.projects.get_or_create_project("现代乙女项目")
+    app.director.produce(
+        "现代乙女项目", 1, premise="现代偶像女团", style=MODERN_OTOME_STYLE,
+        pause_for_confirm=True)
+    project = app.projects.get_project("现代乙女项目")
+    assert project["style"] == MODERN_OTOME_STYLE
+
+
+def test_xianxia_title_is_not_overridden_by_modern_default():
+    style = infer_visual_style("", "万妖图录")
+    assert "国风漫剧" in style
+    assert "现代都市" not in style
 
 
 def test_script_confirm_pauses_before_video(app):
@@ -152,3 +169,88 @@ def test_cli_stop(tmp_path, capsys):
     # 稳定状态没有可停的生成
     assert main(["--workspace", ws, "stop", "--project", "万妖图录",
                  "--episode", "1"]) == 1
+
+
+def _plan_of(app, title, number):
+    import json
+    project = app.projects.get_project(title)
+    out_root = (app.workspace.artifacts_dir
+                / f"p{project['id']:03d}" / f"e{number:03d}")
+    return json.loads(
+        (out_root / "render_plan.json").read_text(encoding="utf-8"))
+
+
+def test_render_plan_lists_every_image_with_prompt(app):
+    """图片生产清单:四类图全部列出,每张带提示词,状态全部就绪。"""
+    app.director.produce("万妖图录", 1, pause_for_confirm=True)   # 剧本停
+    app.director.produce("万妖图录", 1, pause_for_confirm=True)   # 预生产停
+    plan = _plan_of(app, "万妖图录", 1)
+    cats = {i["category"] for i in plan["items"]}
+    assert cats == {"character_art", "character_sheet", "scene_art",
+                    "shot_image", "frames"}
+    assert all(i["prompt"] for i in plan["items"])
+    assert all(i["status"] in ("done", "reused") for i in plan["items"])
+    # 现画的图都有单张耗时(前端据此估算剩余时间)
+    drawn = [i for i in plan["items"] if i["status"] == "done"]
+    assert drawn and all(i.get("duration") is not None for i in drawn)
+    shots = [i for i in plan["items"] if i["category"] == "shot_image"]
+    storyboard, _ = app.projects.latest_document(
+        app.db.query_one(
+            "SELECT e.id FROM episodes e JOIN projects p "
+            "ON p.id=e.project_id WHERE p.title=? AND e.number=1",
+            ("万妖图录",))["id"], "storyboard")
+    assert len(shots) == len(storyboard["shots"])
+
+
+def test_regen_image_prompt_override(app):
+    """单张图可改提示词重画:清单记录自定义提示词并标记已改词。"""
+    app.director.produce("万妖图录", 1, pause_for_confirm=True)
+    app.director.produce("万妖图录", 1, pause_for_confirm=True)
+    name = _plan_of(app, "万妖图录", 1)["items"][0]["name"]
+    app.director.regen_image(
+        "万妖图录", 1, {"kind": "character_art", "name": name},
+        prompt_override="红衣持剑,雪夜屋顶,月光逆光,全身立绘")
+    plan = _plan_of(app, "万妖图录", 1)
+    item = next(i for i in plan["items"] if i["id"] == f"char:{name}")
+    assert item["status"] == "done"
+    assert item["custom_prompt"] is True
+    assert item["prompt"] == "红衣持剑,雪夜屋顶,月光逆光,全身立绘"
+
+
+def test_plan_marks_mock_images_with_fallback_reason(app):
+    """真假产线透明:占位图必须标注 mock 与回退原因,SVG 自带水印。"""
+    app.director.produce("万妖图录", 1, pause_for_confirm=True)
+    app.director.produce("万妖图录", 1, pause_for_confirm=True)
+    plan = _plan_of(app, "万妖图录", 1)
+    done = [i for i in plan["items"] if i["status"] == "done"]
+    assert done
+    for item in done:
+        assert item["provider"] == "mock"
+        assert item["real"] is False
+        assert any(f["provider"] == "codex" for f in item["fallbacks"])
+    # 占位图片自带水印,播放器/画布里也能一眼识别
+    art = next(i for i in plan["items"]
+               if i["category"] == "character_art")
+    project = app.projects.get_project("万妖图录")
+    row = app.assets.latest(project["id"], "character_art", art["name"])
+    assert "占位示意图" in Path(row["uri"]).read_text(encoding="utf-8")
+
+
+def test_stop_interrupts_long_provider_call(tmp_path):
+    """停止信号能在 2 秒级中断外部产线子进程,而不是等它跑完。"""
+    import stat
+    import time as _time
+
+    from aifos.errors import ProduceCancelled
+    from aifos.production.external import CliProvider
+
+    slow = tmp_path / "slow.py"
+    slow.write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+    provider = CliProvider("slowcli", {
+        "type": "cli", "enabled": True, "capabilities": ["image"],
+        "command": ["python3", str(slow)], "timeout": 120})
+    start = _time.monotonic()
+    with pytest.raises(ProduceCancelled):
+        provider.generate("image", {"shot_no": 1}, tmp_path,
+                          cancel=lambda: True)
+    assert _time.monotonic() - start < 10   # 不等 60 秒,秒级返回
