@@ -14,8 +14,8 @@ from .settings import CAPABILITY_CN, PROVIDER_CN, update_provider
 
 # 各 CLI 的常见安装位置(PATH 之外的兜底;按顺序找)
 CLI_CANDIDATES = {
-    "claude": ["~/.claude/local/claude", "/opt/homebrew/bin/claude",
-               "/usr/local/bin/claude"],
+    "claude": ["~/.local/bin/claude", "~/.claude/local/claude",
+               "/opt/homebrew/bin/claude", "/usr/local/bin/claude"],
     "codex": ["~/.local/node22/bin/codex", "~/.local/bin/codex",
               "/opt/homebrew/bin/codex", "/usr/local/bin/codex"],
     "dreamina": ["~/.local/bin/dreamina", "/opt/homebrew/bin/dreamina",
