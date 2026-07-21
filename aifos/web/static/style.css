@@ -1294,6 +1294,29 @@ textarea:focus-visible, select:focus-visible {
   background: var(--surface-2); padding: 8px;
   display: flex; flex-direction: column; gap: 5px; min-width: 0;
 }
+.plan-selectable {
+  cursor: pointer; position: relative;
+  transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
+}
+.plan-selectable:hover {
+  border-color: rgba(57, 135, 229, .7); transform: translateY(-1px);
+}
+.plan-selectable:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+.plan-selectable.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(57, 135, 229, .35);
+}
+.plan-selectable.selected::after {
+  content: "✓ 已选择"; position: absolute; top: 6px; right: 6px;
+  z-index: 2; padding: 2px 7px; border-radius: 999px;
+  color: white; background: var(--accent); font-size: 10.5px; font-weight: 700;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .28);
+}
+.pb-select-hint {
+  color: var(--ink-3); font-size: 11.5px; margin-top: 7px;
+}
 .plan-card.st-generating {
   border-color: var(--warning);
   box-shadow: 0 0 0 1px rgba(250, 178, 25, .3);
@@ -1328,6 +1351,43 @@ textarea:focus-visible, select:focus-visible {
 .pc-wait { color: var(--ink-3); }
 .plan-card .plan-prompt summary { font-size: 11.5px; }
 .plan-card .plan-prompt pre { font-size: 11.5px; max-height: 150px; overflow: auto; }
+
+/* ---- 图片选择与大图预览 ---- */
+.image-preview-panel { width: min(920px, 94vw); }
+.image-preview-panel .script-head > div { min-width: 0; }
+.image-preview-panel .script-head h3 { margin: 0; }
+.plan-preview-gallery {
+  display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px;
+  margin-top: 12px;
+}
+.plan-preview-main {
+  display: block; max-width: 100%; width: auto; max-height: 66vh;
+  margin: 0 auto; object-fit: contain; border-radius: 10px;
+  background: #080a0d; border: 1px solid var(--hairline);
+}
+.plan-preview-thumbs {
+  display: flex; justify-content: center; flex-wrap: wrap; gap: 8px;
+}
+.plan-preview-thumb {
+  padding: 3px; border: 1px solid var(--hairline); background: var(--surface-2);
+  border-radius: 8px;
+}
+.plan-preview-thumb.active { border-color: var(--accent); }
+.plan-preview-thumb img {
+  display: block; width: 56px; height: 56px; object-fit: cover; border-radius: 5px;
+}
+.plan-preview-empty {
+  min-height: 260px; margin-top: 12px; border: 1px dashed var(--hairline);
+  border-radius: 10px; display: grid; place-items: center;
+  color: var(--ink-3); background: var(--surface-2); padding: 30px;
+  text-align: center;
+}
+.plan-preview-meta {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  margin: 12px 0 8px; color: var(--ink-2); font-size: 12px;
+}
+.plan-preview-meta .preview-download { margin-left: auto; }
+.image-preview-panel .plan-prompt pre { max-height: 180px; overflow: auto; }
 
 /* ---- 资产中心 ---- */
 .assets-center { padding: 14px 18px 40px; display: flex; flex-direction: column; gap: 14px; }

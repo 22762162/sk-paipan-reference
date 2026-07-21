@@ -1683,7 +1683,9 @@ function planItemHtml(data, item, editable) {
   const thumbs = planItemThumbs(data, item);
   const st = item.status || "pending";
   const canEdit = editable && item.category !== "frames";
-  return `<div class="plan-item st-${st}" data-plan-id="${esc(item.id)}">
+  return `<div class="plan-item plan-selectable st-${st}" data-plan-select="${esc(item.id)}"
+    role="button" tabindex="0" aria-pressed="false"
+    aria-label="选择查看 ${esc(item.label)}">
     <div class="plan-thumbs">${thumbs.length
       ? thumbs.map((u) => `<img src="${esc(u)}" loading="lazy" alt="">`).join("")
       : `<span class="plan-thumb-empty">${st === "generating" ? "⏳" : "🖼"}</span>`}</div>
@@ -1786,6 +1788,101 @@ function bindPlanRegen(container, episodeId, onDone) {
   });
 }
 
+/* 图片卡片选择/大图查看:直播看板和图片清单共用。
+   选中项跨实时轮询保留；点击提示词、编辑控件时不误开预览。 */
+const selectedPlanByEpisode = new Map();
+
+function showPlanItemPreview(data, item, episodeId) {
+  const thumbs = planItemThumbs(data, item);
+  const st = item.status || "pending";
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay image-preview-overlay";
+  const gallery = thumbs.length
+    ? `<div class="plan-preview-gallery">
+        <img class="plan-preview-main" src="${esc(thumbs[0])}"
+          alt="${esc(item.label)}大图">
+        ${thumbs.length > 1 ? `<div class="plan-preview-thumbs">${thumbs.map((url, index) =>
+          `<button type="button" class="plan-preview-thumb${index === 0 ? " active" : ""}"
+            data-preview-url="${esc(url)}" aria-label="查看第 ${index + 1} 张">
+            <img src="${esc(url)}" alt=""></button>`).join("")}</div>` : ""}
+      </div>`
+    : `<div class="plan-preview-empty">${st === "generating" ? "⏳ 正在生成，完成后这里会自动出现大图"
+      : st === "failed" ? `生成失败：${esc(item.error || "未提供原因")}`
+      : "🖼 图片尚未生成"}</div>`;
+  overlay.innerHTML = `<div class="script-panel image-preview-panel">
+    <div class="script-head">
+      <div><h3>${esc(item.label)}</h3>
+        <span class="dim">${esc(PLAN_CAT_CN[item.category] || item.category || "图片")}</span></div>
+      <button class="close">关闭 Esc</button>
+    </div>
+    ${gallery}
+    <div class="plan-preview-meta">
+      <span class="plan-st st-${st}">${esc(PLAN_STATUS_CN[st] || st)}</span>
+      ${item.provider ? `<span>${esc(PROVIDER_LABEL[item.provider] || item.provider)}</span>` : ""}
+      ${item.model ? `<span>${esc(item.model)}</span>` : ""}
+      ${thumbs.length ? `<button type="button" class="preview-download">⬇ 下载当前图片</button>` : ""}
+    </div>
+    ${item.error ? `<div class="plan-err">${esc(item.error)}</div>` : ""}
+    <details class="plan-prompt" open><summary>提示词</summary>
+      <pre>${esc(item.prompt || "")}</pre></details>
+  </div>`;
+  const close = () => {
+    overlay.remove();
+    document.removeEventListener("keydown", onKey);
+  };
+  const onKey = (ev) => { if (ev.key === "Escape") close(); };
+  overlay.addEventListener("click", (ev) => {
+    if (ev.target === overlay) close();
+  });
+  overlay.querySelector(".close").onclick = close;
+  overlay.querySelectorAll(".plan-preview-thumb").forEach((btn) => {
+    btn.onclick = () => {
+      overlay.querySelector(".plan-preview-main").src = btn.dataset.previewUrl;
+      overlay.querySelectorAll(".plan-preview-thumb").forEach((other) =>
+        other.classList.toggle("active", other === btn));
+    };
+  });
+  const download = overlay.querySelector(".preview-download");
+  if (download) download.onclick = () => {
+    const current = overlay.querySelector(".plan-preview-main").src;
+    downloadUrl(current, `${item.label || "AIFOS图片"}.png`);
+  };
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(overlay);
+  selectedPlanByEpisode.set(episodeId, item.id);
+}
+
+function bindPlanSelection(container, data, episodeId) {
+  const items = ((data.render_plan || {}).items) || [];
+  const byId = new Map(items.map((item) => [String(item.id), item]));
+  const cards = [...container.querySelectorAll("[data-plan-select]")];
+  const saved = selectedPlanByEpisode.get(episodeId);
+  const select = (card, item, openPreview) => {
+    cards.forEach((other) => {
+      const active = other === card;
+      other.classList.toggle("selected", active);
+      other.setAttribute("aria-pressed", active ? "true" : "false");
+    });
+    selectedPlanByEpisode.set(episodeId, item.id);
+    if (openPreview) showPlanItemPreview(data, item, episodeId);
+  };
+  cards.forEach((card) => {
+    const item = byId.get(card.dataset.planSelect);
+    if (!item) return;
+    if (String(item.id) === String(saved)) select(card, item, false);
+    card.onclick = (ev) => {
+      if (ev.target.closest("button, a, input, textarea, select, details, summary, label")) return;
+      select(card, item, true);
+    };
+    card.onkeydown = (ev) => {
+      if (ev.key !== "Enter" && ev.key !== " ") return;
+      if (ev.target.closest("button, a, input, textarea, select, details, summary, label")) return;
+      ev.preventDefault();
+      select(card, item, true);
+    };
+  });
+}
+
 /* ---- 生产直播大看板:每张图一张卡,秒表+预计耗时,画完立刻上图 ---- */
 function fmtDur(sec) {
   sec = Math.max(0, Math.round(sec));
@@ -1824,7 +1921,9 @@ function planCardHtml(data, item, avg) {
   } else {
     state = `<span class="pc-state pc-wait">排队中</span>`;
   }
-  return `<div class="plan-card st-${st}">
+  return `<div class="plan-card plan-selectable st-${st}" data-plan-select="${esc(item.id)}"
+    role="button" tabindex="0" aria-pressed="false"
+    aria-label="选择查看 ${esc(item.label)}">
     <div class="pc-media">${media}</div>
     <div class="pc-label" title="${esc(item.label)}">${esc(item.label)}</div>
     ${state}
@@ -1852,6 +1951,7 @@ function renderPlanBoardHtml(data) {
         ${etaTotal ? ` · 预计还需 ~${fmtDur(etaTotal)}`
           : (remainN ? " · 第一张完成后开始估算剩余时间" : "")}</div>
       <div class="pb-track"><div class="pb-fill" style="width:${pct}%"></div></div>
+      <div class="pb-select-hint">点击任意图片卡片可选择并查看大图、状态和提示词</div>
     </div>
     ${mockWarnHtml(data)}
     ${cats.map((cat) => {
@@ -1895,6 +1995,7 @@ async function showPlanOverlay(episodeId) {
   overlay.querySelector(".close").onclick = close;
   document.addEventListener("keydown", onKey);
   document.body.appendChild(overlay);
+  bindPlanSelection(overlay, data, episodeId);
   bindPlanRegen(overlay, episodeId, () => { close(); showPlanOverlay(episodeId); });
 }
 
@@ -2502,6 +2603,7 @@ function renderProductionView(data, episodeId) {
     stopEpisode(ep.id);
   };
   updateLiveStrip(data);
+  bindPlanSelection(app, data, episodeId);
   startLiveTicker(episodeId);
   pollCanvas(episodeId);
 }
