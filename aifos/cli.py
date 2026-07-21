@@ -75,6 +75,9 @@ def _build_parser():
         "serve", help="启动 Web 控制台(仪表盘 + 分镜画布)")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8619)
+    p_serve.add_argument(
+        "--lan", action="store_true",
+        help="允许同一 Wi-Fi 下的手机访问(等同 --host 0.0.0.0)")
 
     p_project = sub.add_parser("project", help="项目管理(账号矩阵)")
     p_project.add_argument("action",
@@ -618,12 +621,13 @@ def main(argv=None):
         app.close()
         return 0
     if args.command == "serve":
-        from .web.server import serve
+        from .web.server import access_payload, serve
         App(args.workspace).close()  # 确保工作区就绪
+        host = "0.0.0.0" if args.lan else args.host
         httpd = None
         for offset in range(10):   # 端口被占自动顺延,免得启动直接失败
             try:
-                httpd = serve(args.workspace, host=args.host,
+                httpd = serve(args.workspace, host=host,
                               port=args.port + offset)
                 break
             except OSError as exc:
@@ -632,7 +636,14 @@ def main(argv=None):
             print("连续 10 个端口都不可用;用 --port 指定一个空闲端口",
                   file=sys.stderr)
             return 1
-        print(f"AIFOS 控制台: http://{args.host}:{httpd.server_address[1]}/")
+        access = access_payload(host, httpd.server_address[1])
+        print(f"AIFOS 本机控制台: {access['local_url']}")
+        if access["lan_enabled"]:
+            print("手机访问(手机与电脑需连接同一 Wi-Fi):")
+            for url in access["lan_urls"]:
+                print(f"  {url}")
+            if access["hostname_url"]:
+                print(f"  {access['hostname_url']}")
         print("Ctrl+C 停止")
         try:
             httpd.serve_forever()

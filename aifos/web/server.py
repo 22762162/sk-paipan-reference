@@ -19,8 +19,10 @@ API:
   GET  /artifacts/<path>        workspace/artifacts 下的产物(防目录穿越)
 """
 
+import ipaddress
 import json
 import re
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,6 +43,7 @@ MIME = {
     ".css": "text/css; charset=utf-8",
     ".svg": "image/svg+xml",
     ".json": "application/json; charset=utf-8",
+    ".webmanifest": "application/manifest+json; charset=utf-8",
     ".jsonl": "application/x-ndjson; charset=utf-8",
     ".log": "text/plain; charset=utf-8",
     ".png": "image/png",
@@ -50,6 +53,56 @@ MIME = {
     ".mp3": "audio/mpeg",
     ".wav": "audio/wav",
 }
+
+
+def _private_lan_addresses():
+    """返回可供同一局域网手机访问的本机 IPv4 地址。"""
+    addresses = set()
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+        addresses.update(info[4][0] for info in infos)
+    except OSError:
+        pass
+    # UDP connect 不发送数据，但能可靠取到当前默认网卡地址。
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("10.255.255.255", 1))
+        addresses.add(probe.getsockname()[0])
+    except OSError:
+        pass
+    finally:
+        probe.close()
+    result = []
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            continue
+        if ip.version == 4 and ip.is_private and not ip.is_loopback:
+            result.append(address)
+    return sorted(set(result))
+
+
+def access_payload(bound_host, port):
+    """构造桌面与手机端都能理解的访问/安装信息。"""
+    lan_enabled = bound_host in ("0.0.0.0", "::", "")
+    hostname = socket.gethostname().split(".")[0]
+    lan_urls = ([f"http://{address}:{port}/"
+                 for address in _private_lan_addresses()]
+                if lan_enabled else [])
+    hostname_url = (f"http://{hostname}.local:{port}/"
+                    if lan_enabled and hostname else None)
+    return {
+        "lan_enabled": lan_enabled,
+        "local_url": f"http://127.0.0.1:{port}/",
+        "lan_urls": lan_urls,
+        "hostname_url": hostname_url,
+        "same_wifi_required": True,
+        "install": {
+            "ios": "用 Safari 打开后点分享，再选‘添加到主屏幕’",
+            "android": "用 Chrome 打开后点菜单，再选‘安装应用’或‘添加到主屏幕’",
+        },
+    }
 
 
 class JobRegistry:
@@ -405,10 +458,18 @@ def make_handler(workspace, jobs):
                 if route in ("/", "/index.html"):
                     return self._file(STATIC_DIR / "index.html",
                                       no_cache=True)
+                if route == "/manifest.webmanifest":
+                    return self._file(STATIC_DIR / "manifest.webmanifest",
+                                      no_cache=True)
+                if route == "/sw.js":
+                    return self._file(STATIC_DIR / "sw.js", no_cache=True)
                 if route.startswith("/static/"):
                     return self._static(STATIC_DIR, route[len("/static/"):])
                 if route.startswith("/artifacts/"):
                     return self._artifact(route[len("/artifacts/"):])
+                if route == "/api/access":
+                    host, port = self.server.server_address[:2]
+                    return self._json(access_payload(host, port))
                 if route == "/api/overview":
                     return self._json(self._with_app(
                         lambda app: _overview_payload(app, jobs)))

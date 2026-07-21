@@ -8,6 +8,7 @@ let standardsDraft = null;
 let standardsBaseline = null;
 let standardsMeta = null;
 let standardsDirty = false;
+let deferredInstallPrompt = null;
 const MODERN_OTOME_STYLE = "现代都市乙女游戏CG，精致3D半写实角色渲染，亚洲当代青年，现代发型与时尚通勤服装，清透自然皮肤，细腻五官，柔和电影灯光，高级时尚杂志质感；禁止古装、汉服、发簪、长袍、水墨、国风、2D平涂、动漫线稿和历史建筑";
 
 /* ---------- 工具 ---------- */
@@ -44,6 +45,104 @@ function showToast(message, kind = "info") {
   toast.textContent = message;
   document.body.appendChild(toast);
   setTimeout(() => toast.remove(), 5000);
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (_) {
+    const input = document.createElement("textarea");
+    input.value = text;
+    input.setAttribute("readonly", "");
+    input.style.position = "fixed";
+    input.style.opacity = "0";
+    document.body.appendChild(input);
+    input.select();
+    document.execCommand("copy");
+    input.remove();
+  }
+}
+
+function bindMobileAccessButtons(root = document) {
+  root.querySelectorAll("[data-mobile-access], #mobile-access-global").forEach((button) => {
+    if (button.dataset.mobileBound) return;
+    button.dataset.mobileBound = "1";
+    button.addEventListener("click", showMobileAccess);
+  });
+}
+
+async function showMobileAccess() {
+  document.getElementById("mobile-access-overlay")?.remove();
+  let access;
+  try {
+    access = await api("/api/access");
+  } catch (error) {
+    showToast(`读取手机访问地址失败：${error.message}`, "error");
+    return;
+  }
+  const browserIsLocal = ["127.0.0.1", "localhost", "::1"].includes(location.hostname);
+  const urls = [...(access.lan_urls || [])];
+  if (access.hostname_url) urls.push(access.hostname_url);
+  if (!browserIsLocal && !urls.includes(`${location.origin}/`)) urls.unshift(`${location.origin}/`);
+  const preferred = urls[0] || access.local_url;
+  const standalone = matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay mobile-access-overlay";
+  overlay.id = "mobile-access-overlay";
+  overlay.setAttribute("role", "dialog");
+  overlay.setAttribute("aria-modal", "true");
+  overlay.setAttribute("aria-label", "手机访问与安装");
+  overlay.innerHTML = `<div class="script-panel mobile-access-panel">
+    <div class="script-head">
+      <div><span class="mobile-kicker">AIFOS MOBILE</span><h3>手机打开与安装</h3></div>
+      <button type="button" class="mobile-access-close" aria-label="关闭">✕</button>
+    </div>
+    <div class="mobile-access-hero">
+      <img src="/static/assets/icon-192.png" alt="AIFOS 应用图标">
+      <div><strong>把漫剧工作台装进口袋</strong>
+        <p>手机和这台电脑连接同一 Wi-Fi，即可审片、看历史、选图和调整制作标准。</p></div>
+    </div>
+    ${access.lan_enabled ? `<div class="mobile-url-list">
+      <span>手机浏览器输入</span>
+      ${urls.length ? urls.map((url, index) => `<a href="${esc(url)}" data-mobile-url="${esc(url)}"${index ? "" : ' class="preferred"'}>${esc(url)}</a>`).join("")
+        : `<p class="mobile-access-warning">暂未识别到 Wi-Fi 地址，请确认电脑已经连接 Wi-Fi 后重试。</p>`}
+    </div>` : `<p class="mobile-access-warning">当前服务仅允许本机访问。请用“启动 AIFOS”启动器重新打开，或使用 <code>aifos serve --lan</code>。</p>`}
+    <div class="mobile-access-actions">
+      <button type="button" class="primary" id="mobile-copy-url" ${urls.length ? "" : "disabled"}>复制手机网址</button>
+      <button type="button" id="mobile-share-url" ${urls.length ? "" : "disabled"}>发送到手机</button>
+      ${standalone ? `<button type="button" disabled>已在主屏幕运行</button>`
+        : deferredInstallPrompt ? `<button type="button" id="mobile-pwa-install">安装到桌面</button>` : ""}
+    </div>
+    <div class="mobile-install-guide">
+      <div><b>iPhone / iPad</b><span>${esc(access.install.ios)}</span></div>
+      <div><b>Android</b><span>${esc(access.install.android)}</span></div>
+    </div>
+    <p class="mobile-security-note">仅在你信任的同一 Wi-Fi 内使用；不要把此地址公开到互联网。</p>
+  </div>`;
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  overlay.querySelector(".mobile-access-close").addEventListener("click", close);
+  overlay.addEventListener("click", (event) => { if (event.target === overlay) close(); });
+  overlay.querySelector("#mobile-copy-url")?.addEventListener("click", async () => {
+    await copyText(preferred);
+    showToast("手机网址已复制", "ok");
+  });
+  overlay.querySelector("#mobile-share-url")?.addEventListener("click", async () => {
+    if (navigator.share) {
+      try { await navigator.share({ title: "AIFOS 手机工作台", text: "打开 AIFOS", url: preferred }); }
+      catch (_) { /* 用户取消分享 */ }
+    } else {
+      await copyText(preferred);
+      showToast("当前浏览器不支持直接分享，网址已复制", "ok");
+    }
+  });
+  overlay.querySelector("#mobile-pwa-install")?.addEventListener("click", async () => {
+    deferredInstallPrompt.prompt();
+    await deferredInstallPrompt.userChoice;
+    deferredInstallPrompt = null;
+    close();
+  });
+  overlay.querySelector(".mobile-access-close").focus();
 }
 
 /* 二次点击确认:第一次点击进入待确认态,3 秒内再点执行 */
@@ -783,6 +882,11 @@ async function renderDashboard() {
   const maxStage = Math.max(1, ...data.cost_by_stage.map((r) => r.total || 0));
   app.innerHTML = `
   <div class="dash">
+    <section class="mobile-access-card" aria-label="手机版入口">
+      <img src="/static/assets/icon-192.png" alt="" aria-hidden="true">
+      <div><b>手机版已就绪</b><span>同一 Wi-Fi 打开 · 可添加到主屏幕 · 审片选图更顺手</span></div>
+      <button type="button" data-mobile-access>查看手机网址</button>
+    </section>
     <form class="produce-bar" id="produce-form">
       <div class="mode-tabs">
         <button type="button" class="mode-tab active" data-mode="ai">✨ AI 自动编剧</button>
@@ -877,6 +981,7 @@ async function renderDashboard() {
   </div>`;
 
   const form = document.getElementById("produce-form");
+  bindMobileAccessButtons(app);
   form.addEventListener("submit", onProduce);
   form.querySelectorAll(".mode-tab").forEach((tab) =>
     tab.addEventListener("click", () => {
@@ -3242,5 +3347,21 @@ class StoryboardCanvas {
 }
 
 /* 所有路由依赖的常量、渲染函数与画布类均完成初始化后再启动应用。 */
+window.addEventListener("beforeinstallprompt", (event) => {
+  event.preventDefault();
+  deferredInstallPrompt = event;
+});
+window.addEventListener("appinstalled", () => {
+  deferredInstallPrompt = null;
+  showToast("AIFOS 已添加到主屏幕", "ok");
+});
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js").catch(() => {
+      // 局域网 HTTP 在部分浏览器不是安全上下文；不影响在线使用。
+    });
+  });
+}
+bindMobileAccessButtons();
 window.addEventListener("hashchange", route);
 route();
