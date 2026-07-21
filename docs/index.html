@@ -1302,6 +1302,29 @@ textarea:focus-visible, select:focus-visible {
   background: var(--surface-2); padding: 8px;
   display: flex; flex-direction: column; gap: 5px; min-width: 0;
 }
+.plan-selectable {
+  cursor: pointer; position: relative;
+  transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
+}
+.plan-selectable:hover {
+  border-color: rgba(57, 135, 229, .7); transform: translateY(-1px);
+}
+.plan-selectable:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+.plan-selectable.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(57, 135, 229, .35);
+}
+.plan-selectable.selected::after {
+  content: "✓ 已选择"; position: absolute; top: 6px; right: 6px;
+  z-index: 2; padding: 2px 7px; border-radius: 999px;
+  color: white; background: var(--accent); font-size: 10.5px; font-weight: 700;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .28);
+}
+.pb-select-hint {
+  color: var(--ink-3); font-size: 11.5px; margin-top: 7px;
+}
 .plan-card.st-generating {
   border-color: var(--warning);
   box-shadow: 0 0 0 1px rgba(250, 178, 25, .3);
@@ -1336,6 +1359,43 @@ textarea:focus-visible, select:focus-visible {
 .pc-wait { color: var(--ink-3); }
 .plan-card .plan-prompt summary { font-size: 11.5px; }
 .plan-card .plan-prompt pre { font-size: 11.5px; max-height: 150px; overflow: auto; }
+
+/* ---- 图片选择与大图预览 ---- */
+.image-preview-panel { width: min(920px, 94vw); }
+.image-preview-panel .script-head > div { min-width: 0; }
+.image-preview-panel .script-head h3 { margin: 0; }
+.plan-preview-gallery {
+  display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px;
+  margin-top: 12px;
+}
+.plan-preview-main {
+  display: block; max-width: 100%; width: auto; max-height: 66vh;
+  margin: 0 auto; object-fit: contain; border-radius: 10px;
+  background: #080a0d; border: 1px solid var(--hairline);
+}
+.plan-preview-thumbs {
+  display: flex; justify-content: center; flex-wrap: wrap; gap: 8px;
+}
+.plan-preview-thumb {
+  padding: 3px; border: 1px solid var(--hairline); background: var(--surface-2);
+  border-radius: 8px;
+}
+.plan-preview-thumb.active { border-color: var(--accent); }
+.plan-preview-thumb img {
+  display: block; width: 56px; height: 56px; object-fit: cover; border-radius: 5px;
+}
+.plan-preview-empty {
+  min-height: 260px; margin-top: 12px; border: 1px dashed var(--hairline);
+  border-radius: 10px; display: grid; place-items: center;
+  color: var(--ink-3); background: var(--surface-2); padding: 30px;
+  text-align: center;
+}
+.plan-preview-meta {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  margin: 12px 0 8px; color: var(--ink-2); font-size: 12px;
+}
+.plan-preview-meta .preview-download { margin-left: auto; }
+.image-preview-panel .plan-prompt pre { max-height: 180px; overflow: auto; }
 
 /* ---- 资产中心 ---- */
 .assets-center { padding: 14px 18px 40px; display: flex; flex-direction: column; gap: 14px; }
@@ -1393,6 +1453,231 @@ textarea:focus-visible, select:focus-visible {
 #style-input { font-weight: 650; }
 .style-panel .ref-grid { margin-top: 10px; }
 
+/* ---------- PWA / 手机访问包装 ---------- */
+.nav-icon { display: none; }
+.mobile-install-trigger {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  min-height: 40px; padding: 7px 12px; white-space: nowrap;
+  color: #cfe4ff; background: var(--accent-soft);
+  border-color: rgba(57, 135, 229, .42);
+}
+.mobile-install-trigger:hover { border-color: var(--accent); }
+.mobile-access-card {
+  display: flex; align-items: center; gap: 12px; padding: 12px 14px;
+  border-radius: var(--radius); border: 1px solid rgba(57, 135, 229, .34);
+  background: #111b28;
+}
+.mobile-access-card img {
+  width: 44px; height: 44px; flex: none; border-radius: 11px;
+  box-shadow: 0 5px 16px rgba(0, 0, 0, .34);
+}
+.mobile-access-card > div { display: grid; gap: 2px; min-width: 0; }
+.mobile-access-card b { font-size: 14px; }
+.mobile-access-card span { color: var(--ink-2); font-size: 11.5px; }
+.mobile-access-card button { margin-left: auto; min-height: 40px; flex: none; }
+.mobile-access-overlay { z-index: 60; }
+.mobile-access-panel { width: min(620px, 100%); padding: 22px; }
+.mobile-kicker {
+  color: #8fc2ff; font-size: 10px; font-weight: 750;
+  letter-spacing: .13em;
+}
+.mobile-access-close { width: 44px; height: 44px; padding: 0; flex: none; }
+.mobile-access-hero {
+  display: grid; grid-template-columns: 76px 1fr; gap: 16px; align-items: center;
+  margin: 18px 0; padding: 16px; border-radius: 12px;
+  background: #101923; border: 1px solid rgba(57, 135, 229, .24);
+}
+.mobile-access-hero img { width: 76px; height: 76px; border-radius: 18px; }
+.mobile-access-hero strong { display: block; font-size: 16px; margin-bottom: 4px; }
+.mobile-access-hero p { color: var(--ink-2); font-size: 12.5px; }
+.mobile-url-list { display: grid; gap: 8px; }
+.mobile-url-list > span { color: var(--ink-3); font-size: 11px; }
+.mobile-url-list a {
+  display: block; padding: 12px 14px; border-radius: 9px;
+  color: var(--ink-2); border: 1px solid var(--hairline);
+  background: var(--surface-2); overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+.mobile-url-list a.preferred { color: #cfe4ff; border-color: rgba(57, 135, 229, .5); }
+.mobile-access-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 16px 0; }
+.mobile-access-actions button { min-height: 44px; }
+.mobile-install-guide { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.mobile-install-guide > div {
+  display: grid; gap: 3px; padding: 11px 12px; border-radius: 9px;
+  border: 1px solid var(--hairline); background: var(--surface-2);
+}
+.mobile-install-guide b { font-size: 12px; }
+.mobile-install-guide span { color: var(--ink-3); font-size: 11px; }
+.mobile-access-warning {
+  padding: 12px; color: #ffd39a; border: 1px solid rgba(250, 178, 25, .36);
+  background: rgba(250, 178, 25, .08); border-radius: 9px;
+}
+.mobile-security-note { color: var(--ink-3); font-size: 10.5px; margin-top: 14px; }
+
+@media (max-width: 780px) {
+  :root { --radius: 12px; }
+  html { min-height: 100%; background: var(--page); }
+  body { min-height: 100dvh; height: auto; padding-bottom: env(safe-area-inset-bottom); }
+  button, a, input, select, textarea { -webkit-tap-highlight-color: transparent; }
+  button, input, select { min-height: 44px; }
+  input, select, textarea { font-size: 16px; }
+
+  #topbar {
+    position: sticky; top: 0; z-index: 16; min-height: 56px; height: 56px;
+    padding: 0 max(12px, env(safe-area-inset-left)); gap: 8px;
+    /* backdrop-filter 会把 position:fixed 的底部导航困在顶栏坐标系内。 */
+    background: #141413; backdrop-filter: none;
+  }
+  .topbar-main { flex: 0 1 auto; min-width: 0; }
+  .brand { min-width: 0; }
+  .brand-mark { font-size: 16px; letter-spacing: .05em; }
+  .brand-sub, #topbar-right { display: none; }
+  #mobile-access-global { margin-left: auto; min-width: 44px; padding: 7px 10px; }
+  #mobile-access-global > span:last-child { display: none; }
+
+  .main-nav {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+    display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0;
+    min-height: calc(66px + env(safe-area-inset-bottom));
+    padding: 4px max(4px, env(safe-area-inset-right)) env(safe-area-inset-bottom) max(4px, env(safe-area-inset-left));
+    background: rgba(20, 20, 19, .97); border-top: 1px solid var(--hairline);
+    box-shadow: 0 -10px 28px rgba(0, 0, 0, .35); backdrop-filter: blur(18px);
+  }
+  .main-nav a {
+    min-width: 0; min-height: 58px; padding: 5px 2px 4px;
+    display: flex; flex-direction: column; justify-content: center; gap: 2px;
+    color: var(--ink-3); font-size: 10px; line-height: 1.2; border-radius: 10px;
+  }
+  .main-nav a:hover { text-decoration: none; }
+  .main-nav a.active { color: #bcdcff; background: var(--accent-soft); }
+  .main-nav a.active::after { display: none; }
+  .nav-icon { display: block; font-size: 20px; line-height: 1; font-weight: 500; }
+
+  #app { min-height: calc(100dvh - 56px); padding-bottom: calc(70px + env(safe-area-inset-bottom)); }
+  .loading { padding: 42px 16px; }
+  .dash, .settings, .assets-center, .produce-live { padding: 12px 12px 26px; gap: 12px; }
+  .history-page { padding: 16px 12px 28px; }
+  .standards-page { padding: 16px 12px calc(152px + env(safe-area-inset-bottom)); }
+
+  .mobile-access-card { align-items: center; padding: 11px 12px; }
+  .mobile-access-card img { width: 40px; height: 40px; border-radius: 10px; }
+  .mobile-access-card span { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .mobile-access-card button { width: 44px; padding: 0; overflow: hidden; color: transparent; position: relative; }
+  .mobile-access-card button::after { content: "›"; position: absolute; inset: 0; display: grid; place-items: center; color: #cfe4ff; font-size: 25px; }
+
+  .produce-bar { display: grid; grid-template-columns: minmax(0, 1fr); padding: 13px; gap: 10px; }
+  .produce-bar input, .produce-bar select, .produce-bar textarea,
+  .produce-bar .style-field, .produce-bar button.primary { width: 100%; min-width: 0; }
+  .produce-bar button.primary { min-height: 50px; font-size: 15px; }
+  .mode-tabs { display: grid; grid-template-columns: 1fr 1fr; }
+  .mode-tab { min-width: 0; padding: 9px 7px; font-size: 12px; }
+  .kind-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+  .kind-label { grid-column: 1 / -1; }
+  .kind-tab { min-width: 0; padding: 7px 8px; font-size: 11.5px; }
+  .kind-tab:last-child { grid-column: 1 / -1; }
+  .produce-hint { font-size: 11px; }
+
+  .workflow-map { padding: 14px; }
+  .workflow-lead { padding-right: 0; }
+  .workflow-steps {
+    display: flex; grid-template-columns: none; gap: 8px; overflow-x: auto;
+    padding: 2px 0 5px; scroll-snap-type: x proximity; scrollbar-width: none;
+  }
+  .workflow-steps::-webkit-scrollbar { display: none; }
+  .workflow-step { flex: 0 0 118px; min-height: 64px; scroll-snap-align: start; }
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+  .tile { min-width: 0; padding: 12px; }
+  .panel, .asset-panel, .plan-board, .progress-card { padding: 13px; overflow: hidden; }
+  .grid-2 { gap: 12px; }
+  table, .route-table, .history-table { font-size: 12px; }
+  .panel > table, .history-table-wrap, .route-table { display: block; max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  th, td { padding: 10px 9px; }
+
+  .canvas-toolbar {
+    padding: 9px 12px; gap: 8px; flex-wrap: nowrap; overflow-x: auto;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none;
+  }
+  .canvas-toolbar::-webkit-scrollbar { display: none; }
+  .canvas-toolbar .title { flex: 0 0 auto; font-size: 13px; }
+  .canvas-toolbar .hint { display: none; }
+  .canvas-toolbar .spacer { flex: 0 0 4px; }
+  .canvas-toolbar button, .canvas-toolbar select { flex: 0 0 auto; }
+  .profile-strip { padding: 7px 12px; flex-wrap: nowrap; overflow-x: auto; }
+  .profile-strip > * { flex: 0 0 auto; }
+  .canvas-view { min-height: calc(100dvh - 126px); }
+  .canvas-body { min-height: 480px; position: relative; }
+  #sidepanel { width: min(330px, 88vw); padding: 14px; }
+  .timeline { padding: 7px 10px; overflow-x: auto; }
+  .tl-seg { min-width: 52px; }
+
+  .produce-live { grid-template-columns: minmax(0, 1fr); }
+  .produce-main, .plan-board { min-width: 0; }
+  .pb-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .plan-card { padding: 7px; }
+  .pc-media img, .pc-empty { height: auto; aspect-ratio: 3 / 4; object-fit: cover; }
+  .plan-selectable:hover { transform: none; }
+  .plan-selectable { touch-action: manipulation; }
+  .plan-selectable.selected::after { top: 5px; right: 5px; font-size: 9.5px; }
+
+  .script-overlay { align-items: flex-end; padding: 0; overflow: hidden; }
+  .script-panel {
+    width: 100%; max-height: 94dvh; overflow-y: auto; margin: 0;
+    padding: 18px 16px calc(20px + env(safe-area-inset-bottom));
+    border-radius: 18px 18px 0 0; border-left: 0; border-right: 0; border-bottom: 0;
+  }
+  .script-head { position: sticky; top: -18px; z-index: 2; padding: 6px 0 10px; background: var(--surface); }
+  .image-preview-panel { width: 100%; }
+  .plan-preview-main { max-height: 64dvh; border-radius: 8px; }
+  .plan-preview-meta .preview-download { width: 100%; margin-left: 0; text-align: center; min-height: 44px; }
+  .plan-preview-thumbs { flex-wrap: nowrap; justify-content: flex-start; overflow-x: auto; }
+  .plan-preview-thumb { flex: 0 0 auto; }
+  .rename-row { flex-direction: column; }
+
+  .mobile-access-panel { padding: 18px 16px calc(20px + env(safe-area-inset-bottom)); }
+  .mobile-access-hero { grid-template-columns: 58px 1fr; gap: 12px; margin: 12px 0; padding: 13px; }
+  .mobile-access-hero img { width: 58px; height: 58px; border-radius: 14px; }
+  .mobile-access-actions { display: grid; grid-template-columns: 1fr 1fr; }
+  .mobile-access-actions button:last-child:nth-child(3) { grid-column: 1 / -1; }
+  .mobile-install-guide { grid-template-columns: 1fr; }
+
+  .settings-head, .history-detail-title, .standards-hero { gap: 12px; }
+  .settings-grid, .history-detail-grid { grid-template-columns: minmax(0, 1fr); }
+  .history-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .history-toolbar { grid-template-columns: minmax(0, 1fr); }
+  .history-toolbar > div:first-child { grid-column: auto; }
+  .history-table { min-width: 760px; }
+  .assets-center .canvas-toolbar { margin: 0; }
+  .ref-form { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .ref-form input { min-width: 0; }
+  .style-panel { margin: 0 12px; padding: 13px; }
+  .style-row { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .style-row label { flex-basis: auto; }
+  .style-row input { min-width: 0; width: 100%; }
+
+  .standard-nav { top: 56px; }
+  .standard-savebar {
+    bottom: calc(66px + env(safe-area-inset-bottom));
+    padding: 9px 12px; min-height: 68px;
+  }
+  .standard-savebar input { width: 100%; min-width: 0; }
+  .standard-savebar button { min-width: 102px; }
+  .toast { bottom: calc(78px + env(safe-area-inset-bottom)); max-width: calc(100vw - 24px); }
+}
+
+@media (max-width: 380px) {
+  .main-nav a { font-size: 9px; }
+  .nav-icon { font-size: 18px; }
+  .mobile-access-card span { display: none; }
+  .tiles { grid-template-columns: 1fr 1fr; }
+  .pb-grid { grid-template-columns: 1fr; }
+}
+
+@media (display-mode: standalone) and (max-width: 780px) {
+  #topbar { height: calc(56px + env(safe-area-inset-top)); padding-top: env(safe-area-inset-top); }
+  #app { min-height: calc(100dvh - 56px - env(safe-area-inset-top)); }
+  .standard-nav { top: calc(56px + env(safe-area-inset-top)); }
+}
+
 .demo-note {
   background: var(--surface-2); border-bottom: 1px solid var(--hairline);
   color: var(--ink-2); font-size: 12.5px; padding: 7px 20px;
@@ -1411,13 +1696,16 @@ textarea:focus-visible, select:focus-visible {
       <span class="brand-sub">V3.2 · AI 漫剧工业生产系统</span>
     </a>
     <nav class="main-nav" aria-label="主导航">
-      <a href="#/" data-nav="dashboard">生产总览</a>
-      <a href="#/history" data-nav="history">历史记录</a>
-      <a href="#/assets" data-nav="assets" title="人物资产套件/场景概念图/参考图,可复用可重画">资产中心</a>
-      <a href="#/standards/production" data-nav="standards">制作标准</a>
-      <a href="#/settings" data-nav="settings" title="各环节 AI 使用 CLI 或 API，自由配置">AI 设置</a>
+      <a href="#/" data-nav="dashboard"><span class="nav-icon" aria-hidden="true">⌂</span><span>生产总览</span></a>
+      <a href="#/history" data-nav="history"><span class="nav-icon" aria-hidden="true">◷</span><span>历史记录</span></a>
+      <a href="#/assets" data-nav="assets" title="人物资产套件/场景概念图/参考图,可复用可重画"><span class="nav-icon" aria-hidden="true">◇</span><span>资产中心</span></a>
+      <a href="#/standards/production" data-nav="standards"><span class="nav-icon" aria-hidden="true">✓</span><span>制作标准</span></a>
+      <a href="#/settings" data-nav="settings" title="各环节 AI 使用 CLI 或 API，自由配置"><span class="nav-icon" aria-hidden="true">⚙</span><span>AI 设置</span></a>
     </nav>
   </div>
+  <button class="mobile-install-trigger" id="mobile-access-global" type="button" title="在手机打开或安装 AIFOS">
+    <span aria-hidden="true">▣</span><span>手机打开</span>
+  </button>
   <div id="topbar-right"></div>
 </header>
 <div class="demo-note"><b>V3.2 可试玩演示</b> · 先到「制作标准」查看或调整 SK 五维分镜、人物连续性、节奏、声音与质检门禁；保存后再开新集，系统会给该集绑定当时的标准版本与指纹。默认由 Seedance2 在视频内同步生成人声与口型，交付无字幕母版；豆包 TTS 只作为无声视频兼容模式的备选。数据只存在本浏览器<a href="javascript:void(0)" id="demo-reset">重置演示数据</a></div>
@@ -3487,6 +3775,7 @@ let standardsDraft = null;
 let standardsBaseline = null;
 let standardsMeta = null;
 let standardsDirty = false;
+let deferredInstallPrompt = null;
 const MODERN_OTOME_STYLE = "现代都市乙女游戏CG，精致3D半写实角色渲染，亚洲当代青年，现代发型与时尚通勤服装，清透自然皮肤，细腻五官，柔和电影灯光，高级时尚杂志质感；禁止古装、汉服、发簪、长袍、水墨、国风、2D平涂、动漫线稿和历史建筑";
 
 /* ---------- 工具 ---------- */
@@ -3523,6 +3812,104 @@ function showToast(message, kind = "info") {
   toast.textContent = message;
   document.body.appendChild(toast);
   setTimeout(() => toast.remove(), 5000);
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (_) {
+    const input = document.createElement("textarea");
+    input.value = text;
+    input.setAttribute("readonly", "");
+    input.style.position = "fixed";
+    input.style.opacity = "0";
+    document.body.appendChild(input);
+    input.select();
+    document.execCommand("copy");
+    input.remove();
+  }
+}
+
+function bindMobileAccessButtons(root = document) {
+  root.querySelectorAll("[data-mobile-access], #mobile-access-global").forEach((button) => {
+    if (button.dataset.mobileBound) return;
+    button.dataset.mobileBound = "1";
+    button.addEventListener("click", showMobileAccess);
+  });
+}
+
+async function showMobileAccess() {
+  document.getElementById("mobile-access-overlay")?.remove();
+  let access;
+  try {
+    access = await api("/api/access");
+  } catch (error) {
+    showToast(`读取手机访问地址失败：${error.message}`, "error");
+    return;
+  }
+  const browserIsLocal = ["127.0.0.1", "localhost", "::1"].includes(location.hostname);
+  const urls = [...(access.lan_urls || [])];
+  if (access.hostname_url) urls.push(access.hostname_url);
+  if (!browserIsLocal && !urls.includes(`${location.origin}/`)) urls.unshift(`${location.origin}/`);
+  const preferred = urls[0] || access.local_url;
+  const standalone = matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay mobile-access-overlay";
+  overlay.id = "mobile-access-overlay";
+  overlay.setAttribute("role", "dialog");
+  overlay.setAttribute("aria-modal", "true");
+  overlay.setAttribute("aria-label", "手机访问与安装");
+  overlay.innerHTML = `<div class="script-panel mobile-access-panel">
+    <div class="script-head">
+      <div><span class="mobile-kicker">AIFOS MOBILE</span><h3>手机打开与安装</h3></div>
+      <button type="button" class="mobile-access-close" aria-label="关闭">✕</button>
+    </div>
+    <div class="mobile-access-hero">
+      <img src="/static/assets/icon-192.png" alt="AIFOS 应用图标">
+      <div><strong>把漫剧工作台装进口袋</strong>
+        <p>手机和这台电脑连接同一 Wi-Fi，即可审片、看历史、选图和调整制作标准。</p></div>
+    </div>
+    ${access.lan_enabled ? `<div class="mobile-url-list">
+      <span>手机浏览器输入</span>
+      ${urls.length ? urls.map((url, index) => `<a href="${esc(url)}" data-mobile-url="${esc(url)}"${index ? "" : ' class="preferred"'}>${esc(url)}</a>`).join("")
+        : `<p class="mobile-access-warning">暂未识别到 Wi-Fi 地址，请确认电脑已经连接 Wi-Fi 后重试。</p>`}
+    </div>` : `<p class="mobile-access-warning">当前服务仅允许本机访问。请用“启动 AIFOS”启动器重新打开，或使用 <code>aifos serve --lan</code>。</p>`}
+    <div class="mobile-access-actions">
+      <button type="button" class="primary" id="mobile-copy-url" ${urls.length ? "" : "disabled"}>复制手机网址</button>
+      <button type="button" id="mobile-share-url" ${urls.length ? "" : "disabled"}>发送到手机</button>
+      ${standalone ? `<button type="button" disabled>已在主屏幕运行</button>`
+        : deferredInstallPrompt ? `<button type="button" id="mobile-pwa-install">安装到桌面</button>` : ""}
+    </div>
+    <div class="mobile-install-guide">
+      <div><b>iPhone / iPad</b><span>${esc(access.install.ios)}</span></div>
+      <div><b>Android</b><span>${esc(access.install.android)}</span></div>
+    </div>
+    <p class="mobile-security-note">仅在你信任的同一 Wi-Fi 内使用；不要把此地址公开到互联网。</p>
+  </div>`;
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  overlay.querySelector(".mobile-access-close").addEventListener("click", close);
+  overlay.addEventListener("click", (event) => { if (event.target === overlay) close(); });
+  overlay.querySelector("#mobile-copy-url")?.addEventListener("click", async () => {
+    await copyText(preferred);
+    showToast("手机网址已复制", "ok");
+  });
+  overlay.querySelector("#mobile-share-url")?.addEventListener("click", async () => {
+    if (navigator.share) {
+      try { await navigator.share({ title: "AIFOS 手机工作台", text: "打开 AIFOS", url: preferred }); }
+      catch (_) { /* 用户取消分享 */ }
+    } else {
+      await copyText(preferred);
+      showToast("当前浏览器不支持直接分享，网址已复制", "ok");
+    }
+  });
+  overlay.querySelector("#mobile-pwa-install")?.addEventListener("click", async () => {
+    deferredInstallPrompt.prompt();
+    await deferredInstallPrompt.userChoice;
+    deferredInstallPrompt = null;
+    close();
+  });
+  overlay.querySelector(".mobile-access-close").focus();
 }
 
 /* 二次点击确认:第一次点击进入待确认态,3 秒内再点执行 */
@@ -4262,6 +4649,11 @@ async function renderDashboard() {
   const maxStage = Math.max(1, ...data.cost_by_stage.map((r) => r.total || 0));
   app.innerHTML = `
   <div class="dash">
+    <section class="mobile-access-card" aria-label="手机版入口">
+      <img src="/static/assets/icon-192.png" alt="" aria-hidden="true">
+      <div><b>手机版已就绪</b><span>同一 Wi-Fi 打开 · 可添加到主屏幕 · 审片选图更顺手</span></div>
+      <button type="button" data-mobile-access>查看手机网址</button>
+    </section>
     <form class="produce-bar" id="produce-form">
       <div class="mode-tabs">
         <button type="button" class="mode-tab active" data-mode="ai">✨ AI 自动编剧</button>
@@ -4356,6 +4748,7 @@ async function renderDashboard() {
   </div>`;
 
   const form = document.getElementById("produce-form");
+  bindMobileAccessButtons(app);
   form.addEventListener("submit", onProduce);
   form.querySelectorAll(".mode-tab").forEach((tab) =>
     tab.addEventListener("click", () => {
@@ -5082,7 +5475,10 @@ function bindRegen(container, episodeId, getData, onDone) {
           if (job.status === "done") {
             showToast("已重画完成", "ok");
             if (onDone) onDone(); else renderCanvasView(episodeId);
-          } else { btn.disabled = false; btn.textContent = "重画"; }
+          } else {
+            showToast("重画失败:" + (job.error || "未知错误"), "error");
+            btn.disabled = false; btn.textContent = "重画";
+          }
         });
       } catch (e) {
         showToast(e.message, "error");
@@ -5162,7 +5558,9 @@ function planItemHtml(data, item, editable) {
   const thumbs = planItemThumbs(data, item);
   const st = item.status || "pending";
   const canEdit = editable && item.category !== "frames";
-  return `<div class="plan-item st-${st}" data-plan-id="${esc(item.id)}">
+  return `<div class="plan-item plan-selectable st-${st}" data-plan-select="${esc(item.id)}"
+    role="button" tabindex="0" aria-pressed="false"
+    aria-label="选择查看 ${esc(item.label)}">
     <div class="plan-thumbs">${thumbs.length
       ? thumbs.map((u) => `<img src="${esc(u)}" loading="lazy" alt="">`).join("")
       : `<span class="plan-thumb-empty">${st === "generating" ? "⏳" : "🖼"}</span>`}</div>
@@ -5265,6 +5663,101 @@ function bindPlanRegen(container, episodeId, onDone) {
   });
 }
 
+/* 图片卡片选择/大图查看:直播看板和图片清单共用。
+   选中项跨实时轮询保留；点击提示词、编辑控件时不误开预览。 */
+const selectedPlanByEpisode = new Map();
+
+function showPlanItemPreview(data, item, episodeId) {
+  const thumbs = planItemThumbs(data, item);
+  const st = item.status || "pending";
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay image-preview-overlay";
+  const gallery = thumbs.length
+    ? `<div class="plan-preview-gallery">
+        <img class="plan-preview-main" src="${esc(thumbs[0])}"
+          alt="${esc(item.label)}大图">
+        ${thumbs.length > 1 ? `<div class="plan-preview-thumbs">${thumbs.map((url, index) =>
+          `<button type="button" class="plan-preview-thumb${index === 0 ? " active" : ""}"
+            data-preview-url="${esc(url)}" aria-label="查看第 ${index + 1} 张">
+            <img src="${esc(url)}" alt=""></button>`).join("")}</div>` : ""}
+      </div>`
+    : `<div class="plan-preview-empty">${st === "generating" ? "⏳ 正在生成，完成后这里会自动出现大图"
+      : st === "failed" ? `生成失败：${esc(item.error || "未提供原因")}`
+      : "🖼 图片尚未生成"}</div>`;
+  overlay.innerHTML = `<div class="script-panel image-preview-panel">
+    <div class="script-head">
+      <div><h3>${esc(item.label)}</h3>
+        <span class="dim">${esc(PLAN_CAT_CN[item.category] || item.category || "图片")}</span></div>
+      <button class="close">关闭 Esc</button>
+    </div>
+    ${gallery}
+    <div class="plan-preview-meta">
+      <span class="plan-st st-${st}">${esc(PLAN_STATUS_CN[st] || st)}</span>
+      ${item.provider ? `<span>${esc(PROVIDER_LABEL[item.provider] || item.provider)}</span>` : ""}
+      ${item.model ? `<span>${esc(item.model)}</span>` : ""}
+      ${thumbs.length ? `<button type="button" class="preview-download">⬇ 下载当前图片</button>` : ""}
+    </div>
+    ${item.error ? `<div class="plan-err">${esc(item.error)}</div>` : ""}
+    <details class="plan-prompt" open><summary>提示词</summary>
+      <pre>${esc(item.prompt || "")}</pre></details>
+  </div>`;
+  const close = () => {
+    overlay.remove();
+    document.removeEventListener("keydown", onKey);
+  };
+  const onKey = (ev) => { if (ev.key === "Escape") close(); };
+  overlay.addEventListener("click", (ev) => {
+    if (ev.target === overlay) close();
+  });
+  overlay.querySelector(".close").onclick = close;
+  overlay.querySelectorAll(".plan-preview-thumb").forEach((btn) => {
+    btn.onclick = () => {
+      overlay.querySelector(".plan-preview-main").src = btn.dataset.previewUrl;
+      overlay.querySelectorAll(".plan-preview-thumb").forEach((other) =>
+        other.classList.toggle("active", other === btn));
+    };
+  });
+  const download = overlay.querySelector(".preview-download");
+  if (download) download.onclick = () => {
+    const current = overlay.querySelector(".plan-preview-main").src;
+    downloadUrl(current, `${item.label || "AIFOS图片"}.png`);
+  };
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(overlay);
+  selectedPlanByEpisode.set(episodeId, item.id);
+}
+
+function bindPlanSelection(container, data, episodeId) {
+  const items = ((data.render_plan || {}).items) || [];
+  const byId = new Map(items.map((item) => [String(item.id), item]));
+  const cards = [...container.querySelectorAll("[data-plan-select]")];
+  const saved = selectedPlanByEpisode.get(episodeId);
+  const select = (card, item, openPreview) => {
+    cards.forEach((other) => {
+      const active = other === card;
+      other.classList.toggle("selected", active);
+      other.setAttribute("aria-pressed", active ? "true" : "false");
+    });
+    selectedPlanByEpisode.set(episodeId, item.id);
+    if (openPreview) showPlanItemPreview(data, item, episodeId);
+  };
+  cards.forEach((card) => {
+    const item = byId.get(card.dataset.planSelect);
+    if (!item) return;
+    if (String(item.id) === String(saved)) select(card, item, false);
+    card.onclick = (ev) => {
+      if (ev.target.closest("button, a, input, textarea, select, details, summary, label")) return;
+      select(card, item, true);
+    };
+    card.onkeydown = (ev) => {
+      if (ev.key !== "Enter" && ev.key !== " ") return;
+      if (ev.target.closest("button, a, input, textarea, select, details, summary, label")) return;
+      ev.preventDefault();
+      select(card, item, true);
+    };
+  });
+}
+
 /* ---- 生产直播大看板:每张图一张卡,秒表+预计耗时,画完立刻上图 ---- */
 function fmtDur(sec) {
   sec = Math.max(0, Math.round(sec));
@@ -5303,7 +5796,9 @@ function planCardHtml(data, item, avg) {
   } else {
     state = `<span class="pc-state pc-wait">排队中</span>`;
   }
-  return `<div class="plan-card st-${st}">
+  return `<div class="plan-card plan-selectable st-${st}" data-plan-select="${esc(item.id)}"
+    role="button" tabindex="0" aria-pressed="false"
+    aria-label="选择查看 ${esc(item.label)}">
     <div class="pc-media">${media}</div>
     <div class="pc-label" title="${esc(item.label)}">${esc(item.label)}</div>
     ${state}
@@ -5331,6 +5826,7 @@ function renderPlanBoardHtml(data) {
         ${etaTotal ? ` · 预计还需 ~${fmtDur(etaTotal)}`
           : (remainN ? " · 第一张完成后开始估算剩余时间" : "")}</div>
       <div class="pb-track"><div class="pb-fill" style="width:${pct}%"></div></div>
+      <div class="pb-select-hint">点击任意图片卡片可选择并查看大图、状态和提示词</div>
     </div>
     ${mockWarnHtml(data)}
     ${cats.map((cat) => {
@@ -5374,19 +5870,21 @@ async function showPlanOverlay(episodeId) {
   overlay.querySelector(".close").onclick = close;
   document.addEventListener("keydown", onKey);
   document.body.appendChild(overlay);
+  bindPlanSelection(overlay, data, episodeId);
   bindPlanRegen(overlay, episodeId, () => { close(); showPlanOverlay(episodeId); });
 }
 
 /* ================= 资产中心 =================
    人物资产套件/场景概念图/参考图:浏览、上传参考、替换、单张重画 */
-function assetCardHtml(ep, target, url, label) {
+function assetCardHtml(ep, target, url, label, mock) {
   const img = url && !url.split("?")[0].endsWith(".json")
     ? `<img src="${esc(url)}" loading="lazy" alt="">`
     : `<div class="pc-empty">🖼</div>`;
   const safe = `${target.kind}_${(target.name || "").replace(/[^\w:]/g, "_")}`;
   return `<div class="plan-card asset-card">
     <div class="pc-media">${img}</div>
-    <div class="pc-label" title="${esc(label)}">${esc(label)}</div>
+    <div class="pc-label" title="${esc(label)}">${esc(label)}
+      ${mock ? `<span class="plan-st st-mock" title="占位产线画的示意图,不理解修改意见;接入真实出图产线后重画才会按意见改样式">⚠ 占位图</span>` : ""}</div>
     ${ep ? `${regenControls(target, "重画")}
             ${ioControls(target, url || "", safe + ".png")}` : ""}
   </div>`;
@@ -5413,12 +5911,20 @@ async function renderAssetsCenter(selectedTitle) {
   localStorage.setItem("aifos.assets.project", title);
   const eps = (ov.episodes || []).filter((e) => e.project === title);
   const ep = eps[0] || null;
+  let epData = null;
   let art = { cast_art: [], scene_art: [], character_sheets: {},
               references: [] };
   if (ep) {
-    try { art = (await api(`/api/episode/${ep.id}`)).artifacts || art; }
-    catch (e) { /* 项目还没有产物 */ }
+    try {
+      epData = await api(`/api/episode/${ep.id}`);
+      art = epData.artifacts || art;
+    } catch (e) { /* 项目还没有产物 */ }
   }
+  // 占位图标注:该资产最后一次是占位产线画的 → 卡片红标提醒
+  const mockIds = new Set(
+    (((epData || {}).render_plan || {}).items || [])
+      .filter(planIsMock).map((i) => i.id));
+  const isMock = (id) => mockIds.has(id);
   const attachOptions = [
     ...(art.cast_art || []).map((c) => c.name),
     ...(art.scene_art || []).map((s) => s.name)];
@@ -5430,6 +5936,7 @@ async function renderAssetsCenter(selectedTitle) {
         `<option ${p.title === title ? "selected" : ""}>${esc(p.title)}</option>`).join("")}</select>
       <span class="hint">人物资产套件与场景概念图跨集复用;参考图自动进入出图提示</span>
     </div>
+    ${epData ? mockWarnHtml(epData) : ""}
     <section class="panel asset-panel">
       <h2>📎 参考图 <span class="dim">上传后,生成人物/场景/分镜画面时自动作为参考
         (可全项目通用,或只关联某个角色/场景)</span></h2>
@@ -5459,10 +5966,12 @@ async function renderAssetsCenter(selectedTitle) {
         return `<div class="char-suite">
           <h3>${esc(c.name)} <span class="dim">${esc(c.role || "")}</span></h3>
           <div class="pb-grid">
-            ${assetCardHtml(ep, { kind: "character_art", name: c.name }, c.url, "立绘")}
+            ${assetCardHtml(ep, { kind: "character_art", name: c.name },
+                            c.url, "立绘", isMock(`char:${c.name}`))}
             ${sheets.map((s) => assetCardHtml(
               ep, { kind: "character_sheet", name: s.name }, s.url,
-              s.label || s.sheet)).join("")}
+              s.label || s.sheet,
+              isMock(`sheet:${c.name}:${s.sheet}`))).join("")}
           </div></div>`;
       }).join("")
       : `<div class="dim">本项目还没有人物资产。开始制作一集并确认剧本后,
@@ -5472,7 +5981,7 @@ async function renderAssetsCenter(selectedTitle) {
       <h2>🏞 场景概念图</h2>
       <div class="pb-grid">${(art.scene_art || []).map((s) =>
         assetCardHtml(ep, { kind: "scene_art", name: s.name }, s.url,
-                      s.name)).join("")
+                      s.name, isMock(`scene:${s.name}`))).join("")
         || `<div class="dim">暂无场景概念图。</div>`}</div>
     </section>
   </div>`;
@@ -5981,6 +6490,7 @@ function renderProductionView(data, episodeId) {
     stopEpisode(ep.id);
   };
   updateLiveStrip(data);
+  bindPlanSelection(app, data, episodeId);
   startLiveTicker(episodeId);
   pollCanvas(episodeId);
 }
@@ -6619,6 +7129,22 @@ class StoryboardCanvas {
 }
 
 /* 所有路由依赖的常量、渲染函数与画布类均完成初始化后再启动应用。 */
+window.addEventListener("beforeinstallprompt", (event) => {
+  event.preventDefault();
+  deferredInstallPrompt = event;
+});
+window.addEventListener("appinstalled", () => {
+  deferredInstallPrompt = null;
+  showToast("AIFOS 已添加到主屏幕", "ok");
+});
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js").catch(() => {
+      // 局域网 HTTP 在部分浏览器不是安全上下文；不影响在线使用。
+    });
+  });
+}
+bindMobileAccessButtons();
 window.addEventListener("hashchange", route);
 route();
 </script>

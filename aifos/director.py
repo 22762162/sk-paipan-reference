@@ -1333,6 +1333,12 @@ class Director:
         style = project["style"] or DEFAULT_VISUAL_STYLE
         kind = target.get("kind")
         prompt_override = (prompt_override or "").strip()
+
+        def next_revision(asset_kind, asset_name):
+            """每次重画都进入提示词/占位种子,保证重画必然产生新画面。"""
+            row = self.assets.latest(project["id"], asset_kind, asset_name)
+            return (row["version"] + 1) if row else 1
+
         if kind == "character_art":
             name = target["name"]
             role = next((c.get("role", "") for c in script["characters"]
@@ -1345,6 +1351,7 @@ class Director:
                     "shot_no": 0, "characters": [name], "location": "",
                     "prompt": prompt,
                     "style": style, "feedback": feedback,
+                    "revision": next_revision("character_art", name),
                     "reference_images": self._reference_uris(
                         project["id"], [name]),
                     "aspect": aspect, **ctx["dims"],
@@ -1379,6 +1386,7 @@ class Director:
                         "shot_no": 0, "characters": [name], "location": "",
                         "prompt": prompt, "style": style,
                         "feedback": feedback,
+                        "revision": next_revision("character_sheet", raw),
                         "character_refs": (
                             [portrait_uri] if portrait_uri else []),
                         "reference_images": self._reference_uris(
@@ -1401,6 +1409,7 @@ class Director:
                     "action": scene.get("action", ""),
                     "prompt": prompt,
                     "style": style, "feedback": feedback,
+                    "revision": next_revision("scene_art", name),
                     "reference_images": self._reference_uris(
                         project["id"], [name]),
                     "aspect": aspect, **ctx["dims"],
@@ -1418,6 +1427,8 @@ class Director:
             ctx["storyboard"] = storyboard
             payload = self._shot_payload(ctx, shot)
             payload["feedback"] = feedback
+            payload["revision"] = next_revision(
+                "image", self._shot_name(ctx, shot_no))
             if prompt_override:
                 payload["prompt"] = prompt_override
                 payload["seedance_prompt"] = prompt_override

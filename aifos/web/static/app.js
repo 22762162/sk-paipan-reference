@@ -1708,7 +1708,10 @@ function bindRegen(container, episodeId, getData, onDone) {
           if (job.status === "done") {
             showToast("已重画完成", "ok");
             if (onDone) onDone(); else renderCanvasView(episodeId);
-          } else { btn.disabled = false; btn.textContent = "重画"; }
+          } else {
+            showToast("重画失败:" + (job.error || "未知错误"), "error");
+            btn.disabled = false; btn.textContent = "重画";
+          }
         });
       } catch (e) {
         showToast(e.message, "error");
@@ -2106,14 +2109,15 @@ async function showPlanOverlay(episodeId) {
 
 /* ================= 资产中心 =================
    人物资产套件/场景概念图/参考图:浏览、上传参考、替换、单张重画 */
-function assetCardHtml(ep, target, url, label) {
+function assetCardHtml(ep, target, url, label, mock) {
   const img = url && !url.split("?")[0].endsWith(".json")
     ? `<img src="${esc(url)}" loading="lazy" alt="">`
     : `<div class="pc-empty">🖼</div>`;
   const safe = `${target.kind}_${(target.name || "").replace(/[^\w:]/g, "_")}`;
   return `<div class="plan-card asset-card">
     <div class="pc-media">${img}</div>
-    <div class="pc-label" title="${esc(label)}">${esc(label)}</div>
+    <div class="pc-label" title="${esc(label)}">${esc(label)}
+      ${mock ? `<span class="plan-st st-mock" title="占位产线画的示意图,不理解修改意见;接入真实出图产线后重画才会按意见改样式">⚠ 占位图</span>` : ""}</div>
     ${ep ? `${regenControls(target, "重画")}
             ${ioControls(target, url || "", safe + ".png")}` : ""}
   </div>`;
@@ -2140,12 +2144,20 @@ async function renderAssetsCenter(selectedTitle) {
   localStorage.setItem("aifos.assets.project", title);
   const eps = (ov.episodes || []).filter((e) => e.project === title);
   const ep = eps[0] || null;
+  let epData = null;
   let art = { cast_art: [], scene_art: [], character_sheets: {},
               references: [] };
   if (ep) {
-    try { art = (await api(`/api/episode/${ep.id}`)).artifacts || art; }
-    catch (e) { /* 项目还没有产物 */ }
+    try {
+      epData = await api(`/api/episode/${ep.id}`);
+      art = epData.artifacts || art;
+    } catch (e) { /* 项目还没有产物 */ }
   }
+  // 占位图标注:该资产最后一次是占位产线画的 → 卡片红标提醒
+  const mockIds = new Set(
+    (((epData || {}).render_plan || {}).items || [])
+      .filter(planIsMock).map((i) => i.id));
+  const isMock = (id) => mockIds.has(id);
   const attachOptions = [
     ...(art.cast_art || []).map((c) => c.name),
     ...(art.scene_art || []).map((s) => s.name)];
@@ -2157,6 +2169,7 @@ async function renderAssetsCenter(selectedTitle) {
         `<option ${p.title === title ? "selected" : ""}>${esc(p.title)}</option>`).join("")}</select>
       <span class="hint">人物资产套件与场景概念图跨集复用;参考图自动进入出图提示</span>
     </div>
+    ${epData ? mockWarnHtml(epData) : ""}
     <section class="panel asset-panel">
       <h2>📎 参考图 <span class="dim">上传后,生成人物/场景/分镜画面时自动作为参考
         (可全项目通用,或只关联某个角色/场景)</span></h2>
@@ -2186,10 +2199,12 @@ async function renderAssetsCenter(selectedTitle) {
         return `<div class="char-suite">
           <h3>${esc(c.name)} <span class="dim">${esc(c.role || "")}</span></h3>
           <div class="pb-grid">
-            ${assetCardHtml(ep, { kind: "character_art", name: c.name }, c.url, "立绘")}
+            ${assetCardHtml(ep, { kind: "character_art", name: c.name },
+                            c.url, "立绘", isMock(`char:${c.name}`))}
             ${sheets.map((s) => assetCardHtml(
               ep, { kind: "character_sheet", name: s.name }, s.url,
-              s.label || s.sheet)).join("")}
+              s.label || s.sheet,
+              isMock(`sheet:${c.name}:${s.sheet}`))).join("")}
           </div></div>`;
       }).join("")
       : `<div class="dim">本项目还没有人物资产。开始制作一集并确认剧本后,
@@ -2199,7 +2214,7 @@ async function renderAssetsCenter(selectedTitle) {
       <h2>🏞 场景概念图</h2>
       <div class="pb-grid">${(art.scene_art || []).map((s) =>
         assetCardHtml(ep, { kind: "scene_art", name: s.name }, s.url,
-                      s.name)).join("")
+                      s.name, isMock(`scene:${s.name}`))).join("")
         || `<div class="dim">暂无场景概念图。</div>`}</div>
     </section>
   </div>`;

@@ -189,3 +189,27 @@ def test_production_board_images_are_selectable():
     assert "bindPlanSelection(overlay, data, episodeId)" in app_js
     assert ".plan-selectable.selected" in css
     assert ".plan-preview-main" in css
+
+
+def test_regen_always_produces_new_image(app):
+    """重画必然产生新画面:同一意见连续重画两次,内容也不能相同。
+    (占位产线是确定性生成,靠 payload 里的 revision 保证变化。)"""
+    from pathlib import Path
+    project = _preproduce(app)
+    name = app.assets.list(project["id"], "character")[0]["name"]
+    target = {"kind": "character_art", "name": name}
+    before = Path(app.assets.latest(
+        project["id"], "character_art", name)["uri"]).read_text(
+        encoding="utf-8")
+    app.director.regen_image(project["title"], 1, target,
+                             feedback="换成红色衣服")
+    first = Path(app.assets.latest(
+        project["id"], "character_art", name)["uri"]).read_text(
+        encoding="utf-8")
+    app.director.regen_image(project["title"], 1, target,
+                             feedback="换成红色衣服")
+    second = Path(app.assets.latest(
+        project["id"], "character_art", name)["uri"]).read_text(
+        encoding="utf-8")
+    assert before != first
+    assert first != second      # 同意见再画一次也必须换新画面
