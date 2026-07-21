@@ -1121,3 +1121,64 @@ textarea:focus-visible, select:focus-visible {
 .mock-warn b { color: #ef8f8f; }
 .mock-warn span { color: var(--ink-2); font-size: 13px; line-height: 1.7; }
 .mock-warn a { color: var(--accent); font-weight: 650; }
+
+/* ---- 图片生产实况看板 ---- */
+.produce-main { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.plan-board {
+  background: var(--surface); border: 1px solid var(--hairline);
+  border-radius: var(--radius); padding: 14px 16px;
+}
+.pb-head h2 { font-size: 16px; }
+.pb-meta { color: var(--ink-2); font-size: 13px; margin: 6px 0 8px; }
+.pb-meta b { color: var(--ink); font-size: 15px; }
+.pb-track {
+  height: 8px; border-radius: 999px; background: var(--surface-3);
+  overflow: hidden;
+}
+.pb-fill {
+  height: 100%; border-radius: 999px; background: var(--accent);
+  transition: width .6s ease;
+}
+.pb-cat h3 {
+  font-size: 13px; margin: 14px 0 8px; color: var(--ink-2);
+  display: flex; align-items: baseline; gap: 8px;
+}
+.pb-grid {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+}
+.plan-card {
+  border: 1px solid var(--hairline); border-radius: var(--radius);
+  background: var(--surface-2); padding: 8px;
+  display: flex; flex-direction: column; gap: 5px; min-width: 0;
+}
+.plan-card.st-generating {
+  border-color: var(--warning);
+  box-shadow: 0 0 0 1px rgba(250, 178, 25, .3);
+  animation: planPulse 1.6s ease-in-out infinite;
+}
+.plan-card.st-failed { border-color: var(--critical); }
+.pc-media img {
+  width: 100%; height: 150px; object-fit: cover;
+  border-radius: 8px; background: #000; display: block;
+}
+.pc-empty {
+  width: 100%; height: 150px; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--surface-3); font-size: 28px; color: var(--ink-3);
+  border: 1px dashed var(--hairline);
+}
+.pc-empty.gen { color: var(--warning); border-color: var(--warning); }
+.pc-empty.fail { color: var(--critical); border-color: var(--critical); }
+.pc-label {
+  font-size: 12.5px; font-weight: 650; color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pc-state { font-size: 11.5px; line-height: 1.5; }
+.pc-timer { color: var(--warning); font-weight: 650; }
+.pc-ok { color: var(--good); }
+.pc-ok .pc-mock { color: var(--serious); }
+.pc-fail { color: #e57a7a; word-break: break-all; }
+.pc-wait { color: var(--ink-3); }
+.plan-card .plan-prompt summary { font-size: 11.5px; }
+.plan-card .plan-prompt pre { font-size: 11.5px; max-height: 150px; overflow: auto; }

@@ -172,6 +172,9 @@ def test_render_plan_lists_every_image_with_prompt(app):
     assert cats == {"character_art", "scene_art", "shot_image", "frames"}
     assert all(i["prompt"] for i in plan["items"])
     assert all(i["status"] in ("done", "reused") for i in plan["items"])
+    # 现画的图都有单张耗时(前端据此估算剩余时间)
+    drawn = [i for i in plan["items"] if i["status"] == "done"]
+    assert drawn and all(i.get("duration") is not None for i in drawn)
     shots = [i for i in plan["items"] if i["category"] == "shot_image"]
     storyboard, _ = app.projects.latest_document(
         app.db.query_one(

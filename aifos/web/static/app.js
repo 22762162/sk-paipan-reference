@@ -1607,6 +1607,86 @@ function bindPlanRegen(container, episodeId, onDone) {
   });
 }
 
+/* ---- 生产直播大看板:每张图一张卡,秒表+预计耗时,画完立刻上图 ---- */
+function fmtDur(sec) {
+  sec = Math.max(0, Math.round(sec));
+  if (sec < 60) return `${sec} 秒`;
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return s ? `${m} 分 ${s} 秒` : `${m} 分钟`;
+}
+
+function planAvgDuration(items, category) {
+  const durs = (list) => list.filter((i) => i.duration > 0)
+    .map((i) => i.duration);
+  let pool = category
+    ? durs(items.filter((i) => i.category === category)) : [];
+  if (!pool.length) pool = durs(items);
+  if (!pool.length) return null;
+  return pool.reduce((a, b) => a + b, 0) / pool.length;
+}
+
+function planCardHtml(data, item, avg) {
+  const thumbs = planItemThumbs(data, item);
+  const st = item.status || "pending";
+  let media;
+  if (["done", "reused"].includes(st) && thumbs.length)
+    media = `<img src="${esc(thumbs[0])}" loading="lazy" alt="">`;
+  else if (st === "generating") media = `<div class="pc-empty gen">⏳</div>`;
+  else if (st === "failed") media = `<div class="pc-empty fail">✗</div>`;
+  else media = `<div class="pc-empty">🖼</div>`;
+  let state;
+  if (st === "generating") {
+    state = `<span class="pc-state pc-timer" data-started="${item.started_at || ""}"
+      data-eta="${avg ? Math.round(avg) : ""}">正在画 0:00${avg ? ` · 预计 ~${fmtDur(avg)}` : ""}</span>`;
+  } else if (["done", "reused"].includes(st)) {
+    state = `<span class="pc-state pc-ok">✓ ${st === "reused" ? "复用已有" : "已完成"}${item.duration ? ` · 用时 ${fmtDur(item.duration)}` : ""}${planIsMock(item) ? ` · <b class="pc-mock">占位图</b>` : ""}</span>`;
+  } else if (st === "failed") {
+    state = `<span class="pc-state pc-fail" title="${esc(item.error || "")}">失败:${esc((item.error || "").slice(0, 40))}</span>`;
+  } else {
+    state = `<span class="pc-state pc-wait">排队中</span>`;
+  }
+  return `<div class="plan-card st-${st}">
+    <div class="pc-media">${media}</div>
+    <div class="pc-label" title="${esc(item.label)}">${esc(item.label)}</div>
+    ${state}
+    <details class="plan-prompt"><summary>提示词</summary>
+      <pre>${esc(item.prompt || "")}</pre></details>
+  </div>`;
+}
+
+function renderPlanBoardHtml(data) {
+  const items = ((data.render_plan || {}).items) || [];
+  if (!items.length) return "";
+  const ready = items.filter(
+    (i) => ["done", "reused"].includes(i.status)).length;
+  const pct = Math.round(ready / items.length * 100);
+  const remainN = items.length - ready;
+  const avgAll = planAvgDuration(items, null);
+  const etaTotal = avgAll && remainN ? avgAll * remainN : null;
+  const cats = ["character_art", "scene_art", "shot_image", "frames"]
+    .filter((c) => items.some((i) => i.category === c));
+  return `<div class="plan-board">
+    <div class="pb-head">
+      <h2>🖼 图片生产实况</h2>
+      <div class="pb-meta"><b>${ready}/${items.length}</b> 张完成 · ${pct}%
+        ${etaTotal ? ` · 预计还需 ~${fmtDur(etaTotal)}`
+          : (remainN ? " · 第一张完成后开始估算剩余时间" : "")}</div>
+      <div class="pb-track"><div class="pb-fill" style="width:${pct}%"></div></div>
+    </div>
+    ${mockWarnHtml(data)}
+    ${cats.map((cat) => {
+      const list = items.filter((i) => i.category === cat);
+      const ok = list.filter(
+        (i) => ["done", "reused"].includes(i.status)).length;
+      const avg = planAvgDuration(items, cat);
+      return `<div class="pb-cat">
+        <h3>${PLAN_CAT_CN[cat]} <span class="dim">${ok}/${list.length}</span></h3>
+        <div class="pb-grid">${list.map(
+          (i) => planCardHtml(data, i, avg)).join("")}</div></div>`;
+    }).join("")}
+  </div>`;
+}
+
 async function showPlanOverlay(episodeId) {
   let data;
   try { data = await api(`/api/episode/${episodeId}`); }
@@ -1798,6 +1878,16 @@ function startLiveTicker(episodeId) {
         dim.textContent = dim.textContent.replace(/本步已进行 \d+:\d+/, `本步已进行 ${mm}:${ss}`);
       }
     }
+    // 看板上"正在画"的卡片:秒表每秒走字
+    document.querySelectorAll(".pc-timer[data-started]").forEach((el) => {
+      const started = Number(el.dataset.started);
+      if (!started) return;
+      const s = Math.max(0, Math.floor(Date.now() / 1000 - started));
+      const mm2 = Math.floor(s / 60), ss2 = String(s % 60).padStart(2, "0");
+      const eta = Number(el.dataset.eta);
+      el.textContent = `正在画 ${mm2}:${ss2}`
+        + (eta ? ` · 预计 ~${fmtDur(eta)}` : "");
+    });
   }, 1000);
 }
 
@@ -1845,13 +1935,14 @@ async function renderCanvasView(episodeId) {
     renderScriptReview(data, episodeId);
     return;
   }
+  // 制作进行中一律进生产直播页(实况看板+日志+停止),画布留给审阅/成片
+  const stable = ["done", "failed", "qc_failed", "created",
+    "awaiting_script", "awaiting_confirm"];
+  if (!stable.includes(ep.status)) {
+    renderProductionView(data, episodeId);
+    return;
+  }
   if (!sb) {
-    const stable = ["done", "failed", "qc_failed", "created",
-      "awaiting_script", "awaiting_confirm"];
-    if (!stable.includes(ep.status)) {
-      renderProductionView(data, episodeId);
-      return;
-    }
     app.innerHTML = `<div class="loading">本集尚无分镜(制作进行中或未开始)。<a href="#/">返回仪表盘</a></div>`;
     if (!["done", "failed", "qc_failed"].includes(ep.status))
       pollCanvas(episodeId);
@@ -2062,14 +2153,16 @@ function renderProductionView(data, episodeId) {
         </ol>
         <div class="dim">每完成一步自动点亮;真实产线(出图/视频)单步可能要几分钟,
         看上方状态条的秒表在走就没卡住。</div>
-        ${renderPlanHtml(data, false)}
         <h2 style="margin-top:14px">产线实时日志</h2>
         <div class="log-list" id="live-log"><div class="dim">加载中…</div></div>
       </div>
-      ${data.script ? `<div class="script-review">
-        <div class="dim" style="margin-bottom:6px">📖 剧本已就绪,可边生产边阅读:</div>
-        ${scriptBodyHtml(data.script)}
-      </div>` : `<div class="panel dim">剧本生成中,写好会第一时间显示在这里…</div>`}
+      <div class="produce-main">
+        ${renderPlanBoardHtml(data)}
+        ${data.script ? `<div class="script-review">
+          <div class="dim" style="margin-bottom:6px">📖 剧本已就绪,可边生产边阅读:</div>
+          ${scriptBodyHtml(data.script)}
+        </div>` : `<div class="panel dim">剧本生成中,写好会第一时间显示在这里…</div>`}
+      </div>
     </div>
   </div>`;
   document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
