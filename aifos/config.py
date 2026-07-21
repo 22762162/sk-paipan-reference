@@ -16,6 +16,17 @@ DEFAULTS = {
     "defaults": {
         "aspect": "9:16",              # 全局默认画幅(抖音竖屏);项目可设 16:9
     },
+    # SK 漫剧工业流的项目级硬门槛。每集另存 production_profile，避免
+    # workspace 配置改变后无法还原当时使用的生成规格。
+    "production": {
+        "pipeline_version": "sk-manju-v5",
+        "preferred_segment_seconds": [5, 8],
+        "max_segment_seconds": 15,
+        "voice": "jimeng_builtin",
+        "lip_sync": True,
+        "burn_subtitles": False,
+        "text_lock_provider": "ChatGPT关键帧",
+    },
     "budget": {
         "per_episode": 200.0,          # 单集成本预算(成本单位)
     },
@@ -139,6 +150,31 @@ def _deep_merge(base, override):
     return out
 
 
+def _normalize_legacy(data):
+    """兼容旧工作区：移除平台曾内置的低质量 macOS say 过渡产线。
+
+    只迁移 AIFOS 自己生成的旧桥接配置；用户手工注册的同名自定义
+    Provider 不动，避免升级时吞掉自定义能力。
+    """
+    providers = data.get("providers") or {}
+    legacy_say = providers.get("say")
+    command = legacy_say.get("command") if isinstance(legacy_say, dict) else []
+    command_parts = command if isinstance(command, list) else [command]
+    command_text = " ".join(str(part) for part in command_parts)
+    builtin_signature = (
+        command_text == "python3 -m aifos.adapters.say_voice --voice Tingting"
+        and legacy_say.get("cost_per_call") == 0.0
+        and legacy_say.get("timeout") == 120
+    ) if isinstance(legacy_say, dict) else False
+    if not builtin_signature:
+        return data
+    providers.pop("say", None)
+    routing = data.get("routing") or {}
+    if routing.get("voice") == ["jimeng", "say", "api", "mock"]:
+        routing["voice"] = copy.deepcopy(DEFAULTS["routing"]["voice"])
+    return data
+
+
 class Config:
     def __init__(self, data):
         self.data = data
@@ -151,7 +187,7 @@ class Config:
             data = _deep_merge(data, json.loads(path.read_text(encoding="utf-8")))
         if overrides:
             data = _deep_merge(data, overrides)
-        return cls(data)
+        return cls(_normalize_legacy(data))
 
     @staticmethod
     def write_default(config_path):

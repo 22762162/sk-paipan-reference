@@ -3,10 +3,12 @@
 import json
 import os
 import stat
+from pathlib import Path
 
 import pytest
 
 from aifos.app import App
+from aifos.errors import AifosError
 from aifos.production.dreamina import REQUIRED_MODEL_VERSION, DreaminaProvider
 
 FAKE_DREAMINA = '''#!/usr/bin/env python3
@@ -57,7 +59,7 @@ def test_frames2video_command_shape(tmp_path, fake_dreamina):
         result = app.router.call("video", {
             "shot_no": 1, "prompt": "妖气翻涌的古镇长街",
             "first": "/tmp/first.png", "last": "/tmp/last.png",
-            "duration": 3.0,
+            "duration": 2.5,
         }, app.workspace.artifacts_dir)
         assert result.provider == "jimeng"
         # 成片从即梦输出路径归档进平台产物目录
@@ -68,10 +70,10 @@ def test_frames2video_command_shape(tmp_path, fake_dreamina):
 
         (call,) = _calls(fake_dreamina)
         assert call[0] == "frames2video"
-        assert "--first=/tmp/first.png" in call
-        assert "--last=/tmp/last.png" in call
+        assert f"--first={Path('/tmp/first.png').resolve()}" in call
+        assert f"--last={Path('/tmp/last.png').resolve()}" in call
         assert "--prompt=妖气翻涌的古镇长街" in call
-        assert "--duration=8" in call
+        assert "--duration=3" in call
         assert "--video_resolution=720p" in call
         assert "--model_version=seedance2.0fast_vip" in call
         assert "--poll=30" in call
@@ -199,6 +201,38 @@ def test_produce_skips_tts_when_video_carries_audio(tmp_path, fake_dreamina):
             "SELECT * FROM assets WHERE project_id=? AND kind='voice'",
             (project["id"],))
         assert list(rows) == []
+    finally:
+        app.close()
+
+
+@pytest.mark.parametrize(("audio_states", "message"), [
+    ([True, False], "禁止混用有声与无声"),
+    ([False, False], "已阻止错位的独立 TTS"),
+])
+def test_professional_voice_stage_blocks_invalid_audio_modes(
+        tmp_path, audio_states, message):
+    """V3.2 禁止混声道或把分镜台词静默退化为独立 TTS。"""
+    app = App(tmp_path / "ws")
+    try:
+        ctx = {
+            "production_profile": {
+                "pipeline_version": "sk-manju-v5",
+                "voice": "jimeng_builtin",
+                "lip_sync": True,
+                "burn_subtitles": False,
+            },
+            "script": {"scenes": [{"lines": [
+                {"character": "林昭", "dialogue": "妖气不对劲"},
+            ]}]},
+            "videos": [
+                {"shot_no": index, "audio_in_video": state}
+                for index, state in enumerate(audio_states, 1)
+            ],
+        }
+        with pytest.raises(AifosError, match=message):
+            app.director._stage_voices(ctx)
+        assert ctx["voices"] == []
+        assert ctx["subtitles"] == []
     finally:
         app.close()
 

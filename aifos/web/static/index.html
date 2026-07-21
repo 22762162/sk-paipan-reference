@@ -3,20 +3,24 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AIFOS V3.0 · AI 漫剧生产控制台</title>
+<title>AIFOS V3.2 · AI 漫剧生产工作台</title>
 <link rel="stylesheet" href="/static/style.css">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%233987e5'/%3E%3Ctext x='16' y='22' font-size='16' text-anchor='middle' fill='%23fff' font-family='sans-serif'%3E片%3C/text%3E%3C/svg%3E">
 </head>
 <body>
 <header id="topbar">
-  <a class="brand" href="#/">
-    <span class="brand-mark">AIFOS</span>
-    <span class="brand-sub">V3.0 · AI 精品漫剧工业化生产平台</span>
-  </a>
-  <div class="topbar-actions">
-    <div id="topbar-right"></div>
-    <a class="nav-link" href="#/settings" title="各环节 AI 用 CLI 还是 API,自由配置">⚙️ AI 设置</a>
+  <div class="topbar-main">
+    <a class="brand" href="#/">
+      <span class="brand-mark">AIFOS</span>
+      <span class="brand-sub">V3.2 · AI 漫剧工业生产系统</span>
+    </a>
+    <nav class="main-nav" aria-label="主导航">
+      <a href="#/" data-nav="dashboard">生产总览</a>
+      <a href="#/standards/production" data-nav="standards">制作标准</a>
+      <a href="#/settings" data-nav="settings" title="各环节 AI 使用 CLI 或 API，自由配置">AI 设置</a>
+    </nav>
   </div>
+  <div id="topbar-right"></div>
 </header>
 <main id="app">
   <div class="loading">加载中…</div>

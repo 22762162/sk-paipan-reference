@@ -19,9 +19,17 @@ def test_review_pauses_before_video(app):
     summary = app.director.produce("万妖图录", 1, pause_for_confirm=True)
     assert summary["status"] == "awaiting_confirm"
     stages = [s["stage"] for s in summary["stages"]]
-    assert stages == ["script", "cast", "storyboard", "images", "frames"]
-    # 预生产阶段不消耗视频产线
+    assert stages == [
+        "script", "continuity", "cast", "storyboard", "images",
+        "text_assets", "frames", "preflight"]
     project = app.projects.get_project("万妖图录")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    preflight, _ = app.projects.latest_document(episode["id"], "preflight")
+    assert preflight["passed"]
+    assert len(preflight["gates"]) == 11
+    # 预生产阶段不消耗视频产线
     assert app.assets.latest(project["id"], "video", "e001_shot001") is None
     # 但人物立绘/场景概念图与首尾帧已就绪
     assert app.assets.latest(project["id"], "character_art",

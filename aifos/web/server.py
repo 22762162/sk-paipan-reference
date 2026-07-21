@@ -8,7 +8,10 @@ API:
   GET  /api/assets?project=T    项目资产列表
   GET  /api/logs?limit=N        最近日志
   GET  /api/jobs  /api/jobs/<id>后台制作任务
+  GET  /api/standards           当前制作标准 + 版本历史
+  GET  /api/standards/export    导出不含密钥的制作标准包
   POST /api/produce             {"sentence": "开始制作《万妖图录》第15集"}
+  POST /api/standards/save|activate|reset|import
 静态:
   GET  /                        控制台单页应用
   GET  /artifacts/<path>        workspace/artifacts 下的产物(防目录穿越)
@@ -26,6 +29,7 @@ from .. import __version__
 from ..app import App
 from ..errors import AifosError
 from ..smart_input import resolve_produce_target
+from ..standard_center import StandardConflictError, StandardValidationError
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -141,8 +145,9 @@ def _collect_artifacts(app, project_id, ep_num):
     line_re = re.compile(rf"^{prefix}_line(\d+)$")
     clip_re = re.compile(rf"^{prefix}_scene(\d+)$")
     out = {"images": {}, "first": {}, "last": {}, "videos": {},
-           "voices": {}, "cover": None, "final": None,
-           "titles": [], "clips": []}
+           "video_audio": {}, "video_providers": {}, "voices": {},
+           "cover": None, "final": None,
+           "titles": [], "clips": [], "review_board": None}
     kind_map = {"image": "images", "first_frame": "first",
                 "last_frame": "last", "video": "videos"}
     for row in rows:
@@ -150,7 +155,13 @@ def _collect_artifacts(app, project_id, ep_num):
         url = _versioned(_artifact_url(app, row["uri"]), row)
         shot = shot_re.match(name)
         if shot and kind in kind_map:
-            out[kind_map[kind]][int(shot.group(1))] = url
+            shot_no = int(shot.group(1))
+            out[kind_map[kind]][shot_no] = url
+            if kind == "video":
+                meta = json.loads(row["meta"] or "{}")
+                out["video_audio"][shot_no] = bool(
+                    meta.get("audio_in_video"))
+                out["video_providers"][shot_no] = meta.get("provider", "")
             continue
         line = line_re.match(name)
         if line and kind == "voice":
@@ -160,6 +171,8 @@ def _collect_artifacts(app, project_id, ep_num):
             out["cover"] = url
         elif kind == "edit" and name == f"{prefix}_final":
             out["final"] = url
+        elif kind == "review_board" and name == prefix:
+            out["review_board"] = url
         elif kind == "title" and name == prefix:
             out["titles"] = json.loads(row["meta"]).get("candidates", [])
         elif kind == "clip":
@@ -198,6 +211,16 @@ def _episode_payload(app, episode_id):
         "SELECT * FROM projects WHERE id=?", (episode["project_id"],))
     script, script_v = app.projects.latest_document(episode_id, "script")
     storyboard, sb_v = app.projects.latest_document(episode_id, "storyboard")
+    continuity, continuity_v = app.projects.latest_document(
+        episode_id, "continuity")
+    text_assets, text_assets_v = app.projects.latest_document(
+        episode_id, "text_assets")
+    preflight, preflight_v = app.projects.latest_document(
+        episode_id, "preflight")
+    content_review, content_review_v = app.projects.latest_document(
+        episode_id, "content_review")
+    production_standard, production_standard_v = app.projects.latest_document(
+        episode_id, "production_standard")
     tasks = [dict(t) for t in app.db.query(
         "SELECT id, stage, name, status, provider, cost, error, created_at, "
         "updated_at FROM tasks WHERE episode_id=? ORDER BY id",
@@ -216,6 +239,17 @@ def _episode_payload(app, episode_id):
         "script_version": script_v,
         "storyboard": storyboard,
         "storyboard_version": sb_v,
+        "continuity": continuity,
+        "continuity_version": continuity_v,
+        "text_assets": text_assets,
+        "text_assets_version": text_assets_v,
+        "preflight": preflight,
+        "preflight_version": preflight_v,
+        "content_review": content_review,
+        "content_review_version": content_review_v,
+        "production_profile": (storyboard or {}).get("profile", {}),
+        "production_standard": production_standard,
+        "production_standard_version": production_standard_v,
         "qc_report": qc_report,
         "artifacts": _collect_artifacts(
             app, project["id"], episode["number"]),
@@ -230,8 +264,14 @@ def _overview_payload(app, jobs):
         "ORDER BY e.updated_at DESC")]
     done = [e for e in episodes if e["status"] == "done"]
     scored = [e["qc_score"] for e in episodes if e["qc_score"] is not None]
+    active_standard = app.standards.active()
     return {
         "version": __version__,
+        "production_standard": {
+            key: active_standard.get(key) for key in (
+                "version_id", "profile_key", "version", "name",
+                "fingerprint", "created_at")
+        },
         "projects": [dict(r) for r in app.projects.list_projects()],
         "episodes": episodes,
         "stats": {
@@ -324,6 +364,12 @@ def make_handler(workspace, jobs):
                                      for r in app.logger.tail(limit)]))
                 if route == "/api/jobs":
                     return self._json(jobs.list())
+                if route == "/api/standards":
+                    return self._standards()
+                if route == "/api/standards/export":
+                    version_id = query.get("version_id", [None])[0]
+                    return self._standards_export(
+                        int(version_id) if version_id else None)
                 match = re.match(r"^/api/jobs/(\w+)$", route)
                 if match:
                     job = jobs.get(match.group(1))
@@ -368,6 +414,14 @@ def make_handler(workspace, jobs):
                     return self._settings_detect()
                 if parsed.path == "/api/project/rename":
                     return self._project_rename()
+                if parsed.path == "/api/standards/save":
+                    return self._standards_save()
+                if parsed.path == "/api/standards/activate":
+                    return self._standards_activate()
+                if parsed.path == "/api/standards/reset":
+                    return self._standards_reset()
+                if parsed.path == "/api/standards/import":
+                    return self._standards_import()
                 return self._error(404, "未知路径")
             except BrokenPipeError:
                 pass
@@ -413,6 +467,111 @@ def make_handler(workspace, jobs):
             if items is None:
                 return self._error(404, f"项目不存在: {title}")
             return self._json(items)
+
+        def _standards(self):
+            def fetch(app):
+                active = app.standards.active()
+                return {
+                    "active": active,
+                    "history": app.standards.history(
+                        active.get("profile_key")),
+                    "capabilities": {
+                        "versioned": True,
+                        "episode_snapshot": True,
+                        "import_export": True,
+                        "locked_paths": [
+                            "rules.production.video_model",
+                            "rules.production.resolution",
+                            "rules.production.voice",
+                            "rules.production.lip_sync",
+                            "rules.production.burn_subtitles",
+                            "rules.production.fast_vip_real_face_conflict",
+                        ],
+                    },
+                }
+            return self._json(self._with_app(fetch))
+
+        def _standards_export(self, version_id=None):
+            return self._json(self._with_app(
+                lambda app: app.standards.export_bundle(version_id)))
+
+        def _standard_error(self, exc, status=400):
+            issues = getattr(exc, "issues", None) or []
+            return self._json({
+                "error": "制作标准校验失败",
+                "message": str(exc),
+                "issues": issues,
+            }, status=status)
+
+        def _standards_save(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            if not isinstance(body.get("content"), dict):
+                return self._error(400, "缺少 content 制作标准")
+            try:
+                snapshot = self._with_app(lambda app: app.standards.save(
+                    body["content"],
+                    change_note=(body.get("change_note") or "").strip(),
+                    activate=bool(body.get("activate", True)),
+                    expected_active_id=body.get("expected_active_id")))
+            except StandardValidationError as exc:
+                return self._standard_error(exc)
+            except StandardConflictError as exc:
+                return self._json({
+                    "error": "制作标准已被其他操作更新",
+                    "message": str(exc),
+                    "expected_active_id": exc.expected_active_id,
+                    "actual_active_id": exc.actual_active_id,
+                }, status=409)
+            return self._json({"standard": snapshot}, status=201)
+
+        def _standards_activate(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                version_id = int(body.get("version_id"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少合法 version_id")
+            try:
+                snapshot = self._with_app(
+                    lambda app: app.standards.activate(version_id))
+            except (StandardValidationError, ValueError, KeyError) as exc:
+                return self._standard_error(exc)
+            return self._json({"standard": snapshot})
+
+        def _standards_reset(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                snapshot = self._with_app(lambda app: app.standards.reset(
+                    change_note=(body.get("change_note")
+                                 or "恢复 SK 五维漫剧 V5 官方标准").strip()))
+            except StandardValidationError as exc:
+                return self._standard_error(exc)
+            return self._json({"standard": snapshot}, status=201)
+
+        def _standards_import(self):
+            if int(self.headers.get("Content-Length", "0")) > 2 * 1024 * 1024:
+                return self._error(400, "制作标准包不能超过 2MB")
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            bundle = body.get("bundle")
+            if not isinstance(bundle, dict):
+                return self._error(400, "缺少 bundle 标准包")
+            try:
+                snapshot = self._with_app(
+                    lambda app: app.standards.import_bundle(
+                        bundle,
+                        change_note=(body.get("change_note")
+                                     or "导入制作标准").strip(),
+                        activate=bool(body.get("activate", True))))
+            except StandardValidationError as exc:
+                return self._standard_error(exc)
+            return self._json({"standard": snapshot}, status=201)
 
         def _export(self, episode_id):
             """成品包 zip 下载。"""

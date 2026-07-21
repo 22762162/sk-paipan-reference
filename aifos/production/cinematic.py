@@ -1,7 +1,8 @@
 """电影感分镜画面生成(SVG):Mock 产线的正式出图。
 
 按场景关键词自动配色与构图:天空渐变、光源、远近景剪影、雾带、
-人物剪影与名牌、台词字幕条、暗角。确定性(相同输入相同画面)。
+人物剪影与暗角。镜头画面默认不绘制名牌、台词字幕条或说明文字；
+对白只用于表演和口型，避免 Mock 预览给正式产线错误示范。
 真实图片产线(Codex/即梦)接入后自动取代;此实现保证"未接产线
 也能看到成品级的动态分镜"。
 """
@@ -68,7 +69,7 @@ def _character(x, ground_y, scale, name, accent, show_name):
 
 def render_shot(width, height, seed, location, characters=None,
                 dialogue=None, shot_no=0, camera="", action="",
-                variant="key"):
+                variant="key", annotations=False):
     """variant: key | first | last(首尾帧带轻微位移,连播时产生动感)。"""
     sky_top, sky_bottom, glow, far, near, accent = _theme(location, seed)
     shift = {"key": 0, "first": -1, "last": 1}.get(variant, 0)
@@ -112,8 +113,8 @@ def render_shot(width, height, seed, location, characters=None,
             x = spread * (i + 1) + shift * width // 40
             svg.append(_character(
                 x, ground_y + 8, min(width, height) / 900,
-                name, accent, show_name=True))
-    if dialogue:
+                name, accent, show_name=annotations))
+    if annotations and dialogue:
         bar_h = round(height * 0.105)
         bar_y = height - bar_h - round(height * 0.035)
         text = dialogue.get("dialogue", "")
@@ -131,7 +132,7 @@ def render_shot(width, height, seed, location, characters=None,
             f'y="{bar_y + bar_h - round(bar_h * 0.22)}" '
             f'font-size="{round(bar_h * 0.36)}" fill="#ffffff">'
             f'{escape(text)}</text>')
-    elif location or action:
+    elif annotations and (location or action):
         base_y = height - round(height * 0.05)
         if action:
             act = action if len(action) <= width // 30 else \
@@ -145,7 +146,7 @@ def render_shot(width, height, seed, location, characters=None,
             f'y="{base_y - round(height * 0.045)}" '
             f'font-size="{round(height * 0.036)}" fill="{accent}">'
             f'{escape(location or "")}</text>')
-    if shot_no:
+    if annotations and shot_no:
         svg.append(
             f'<text x="{round(width * 0.05)}" y="{round(height * 0.07)}" '
             f'font-size="{round(height * 0.024)}" fill="#ffffff" '

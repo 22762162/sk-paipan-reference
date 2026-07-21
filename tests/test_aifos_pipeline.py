@@ -22,8 +22,9 @@ def test_full_pipeline_produces_episode(app):
     assert summary["qc_score"] == 100
     assert all(s["status"] == "done" for s in summary["stages"])
     assert [s["stage"] for s in summary["stages"]] == [
-        "script", "cast", "storyboard", "images", "frames", "videos",
-        "voices", "edit", "qc", "package", "archive"]
+        "script", "continuity", "cast", "storyboard", "images",
+        "text_assets", "frames", "preflight", "videos", "voices",
+        "edit", "qc", "package", "archive"]
 
     # 产物落盘
     out = Path(summary["artifacts_dir"])
@@ -107,6 +108,6 @@ def test_budget_exceeded_stops_pipeline(tmp_path):
         failed = [s for s in summary["stages"] if s["status"] == "failed"]
         assert failed and "预算" in failed[0]["error"]
         # 预算之后的阶段不再执行
-        assert len(summary["stages"]) < 11
+        assert len(summary["stages"]) < 14
     finally:
         app.close()

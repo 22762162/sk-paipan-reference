@@ -35,11 +35,14 @@ def test_second_run_reuses_everything(app):
         (project["id"],))
     _, version = app.projects.latest_document(episode["id"], "script")
     assert version == 1
-    # 图片/首尾帧/视频/配音全部复用,零生成成本
-    for stage in ("images", "frames", "videos", "voices"):
+    # 图片/首尾帧/视频全部复用,零生成成本
+    for stage in ("images", "frames", "videos"):
         report = _stage(second, stage)
         assert report["cost"] == 0
         assert report["detail"]["reused"] == report["detail"]["count"]
+    voice = _stage(second, "voices")
+    assert voice["cost"] == 0
+    assert voice["detail"]["integrated_in_video"] is True
 
 
 def test_missing_artifact_regenerated_only(app):
@@ -62,8 +65,11 @@ def test_missing_artifact_regenerated_only(app):
 def test_force_regenerates_all(app):
     app.director.produce("万妖图录", 3)
     forced = app.director.produce("万妖图录", 3, force=True)
-    for stage in ("images", "frames", "videos", "voices"):
+    for stage in ("images", "frames", "videos"):
         report = _stage(forced, stage)
         assert report["detail"].get("reused", 0) == 0
         assert report["cost"] > 0
+    voice = _stage(forced, "voices")
+    assert voice["cost"] == 0
+    assert voice["detail"]["mode"] == "jimeng_builtin"
     assert forced["status"] == "done"

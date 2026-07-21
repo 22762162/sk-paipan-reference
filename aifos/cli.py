@@ -28,7 +28,7 @@ def parse_produce_sentence(text):
 def _build_parser():
     parser = argparse.ArgumentParser(
         prog="aifos",
-        description="AIFOS V3.0 —— AI 精品漫剧工业化生产平台")
+        description="AIFOS V3.2 —— AI 精品漫剧工业化生产平台")
     parser.add_argument("--workspace", default="workspace",
                         help="工作区目录(默认 ./workspace)")
     parser.add_argument("--user", default="admin", help="操作用户")
@@ -245,7 +245,7 @@ def _cmd_produce(app, args):
     if summary["status"] == "awaiting_confirm":
         print("\n预生产完成(剧本/人物图/场景图/分镜/首尾帧)。检查满意后运行:")
         print(f"  python3 -m aifos confirm --project {title} --episode {number}")
-        print("即可自动完成 视频 → 配音 → 剪辑 → 质检 → 发布包。")
+        print("即可自动完成 Seedance 声画 → 无字幕剪辑 → 三层质检 → 发布包。")
         return 0
     return 0 if summary["status"] == "done" else 1
 

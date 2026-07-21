@@ -46,6 +46,7 @@ EDITABLE_FIELDS = {
 }
 _INT_FIELDS = {"max_tokens", "duration", "quota", "timeout"}
 _FLOAT_FIELDS = {"cost_per_call", "poll"}
+_BOOL_FIELDS = {"enabled", "audio_in_video"}
 
 
 def mask_key(value):
@@ -125,7 +126,7 @@ def update_provider(config_path, name, fields):
             if is_masked(value):
                 continue           # 掩码原样回传 → 保持已存的 key
             clean[key] = str(value).strip()
-        elif key == "enabled":
+        elif key in _BOOL_FIELDS:
             clean[key] = value if isinstance(value, bool) else \
                 str(value).lower() in ("1", "true", "on", "yes")
         elif key == "command":
@@ -177,11 +178,12 @@ def test_provider(app, name):
                for ok, reason in [provider.available(cap)]]
     ok_overall = all(r["ok"] for r in results)
     extra = None
-    if provider.enabled and hasattr(provider, "credit"):
+    if provider.enabled and ok_overall and hasattr(provider, "credit"):
         try:
             extra = f"实时余额: {provider.credit()}"
         except Exception as exc:
-            extra = f"余额查询失败: {exc}"
+            extra = f"✗ 余额查询失败: {exc}"
+            ok_overall = False
     if ok_overall and hasattr(provider, "ping"):
         try:
             ping_ok, detail = provider.ping()

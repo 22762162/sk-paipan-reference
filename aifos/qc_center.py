@@ -1,5 +1,5 @@
-"""AI 质检中心:角色一致性、镜头连续性、字幕、配音、敏感内容自动检测,
-输出评分;不达标项目由 AI 导演中心按评分自动重跑。"""
+"""AI 质检中心:五维生产合同、角色/状态连续性、内置声画、无字幕、
+复核证据与敏感内容自动检测；不达标项目由 AI 导演中心自动重跑。"""
 
 from pathlib import Path
 
@@ -26,13 +26,52 @@ class QcCenter:
              /cast 等产物索引。
         """
         issues = []
+        professional = storyboard.get("pipeline_version") == "sk-manju-v5"
         issues += self._check_character_consistency(script, storyboard, ctx)
         issues += self._check_continuity(script, storyboard)
-        issues += self._check_subtitles(script, ctx)
-        issues += self._check_voices(script, ctx)
+        if professional:
+            issues += self._check_professional_contract(
+                script, storyboard, ctx)
+            issues += self._check_no_subtitles(ctx)
+            issues += self._check_integrated_audio(ctx)
+            issues += self._check_review_evidence(ctx)
+        else:
+            # 兼容旧项目/单元测试输入；新产线强制走无字幕与内置声画同步。
+            issues += self._check_subtitles(script, ctx)
+            issues += self._check_voices(script, ctx)
         issues += self._check_videos(storyboard, ctx)
         issues += self._check_media_sanity(ctx)
         issues += self._check_sensitive(script, ctx)
+
+        if professional:
+            profile = ctx.get("production_profile") or storyboard.get("profile") or {}
+            settings = {
+                item.get("id"): item
+                for item in profile.get("rules", {}).get("quality_gates", [])
+                if isinstance(item, dict) and item.get("id")
+            }
+            check_to_gate = {
+                "continuity": "continuity",
+                "state_continuity": "continuity",
+                "five_dimensions": "five_dimensions",
+                "duration": "duration",
+                "dialogue_integrity": "dialogue",
+                "performance": "performance",
+                "camera": "camera",
+                "character_consistency": "people",
+                "text_asset": "text",
+                "integrated_audio": "audio",
+            }
+            filtered = []
+            for issue in issues:
+                gate_id = check_to_gate.get(issue.get("check"))
+                setting = settings.get(gate_id, {}) if gate_id else {}
+                if gate_id and setting.get("enabled", True) is False:
+                    continue
+                if gate_id and setting.get("severity") == "warning":
+                    issue = dict(issue, severity="warn")
+                filtered.append(issue)
+            issues = filtered
 
         score = 100
         for issue in issues:
@@ -45,14 +84,202 @@ class QcCenter:
         rerun_lines = sorted({
             i["line_no"] for i in issues
             if i.get("line_no") is not None and i.get("rerunnable")})
+        hard_failed = professional and any(
+            issue["severity"] == "error" for issue in issues)
+        domains = {
+            "structure": not any(i["check"] in (
+                "continuity", "five_dimensions", "duration",
+                "dialogue_integrity", "performance", "camera")
+                and i["severity"] == "error" for i in issues),
+            "visual_continuity": not any(i["check"] in (
+                "character_consistency", "state_continuity", "text_asset")
+                and i["severity"] == "error" for i in issues),
+            "audio_delivery": not any(i["check"] in (
+                "voice", "integrated_audio", "subtitle", "review_evidence")
+                and i["severity"] == "error" for i in issues),
+        }
         return {
             "score": score,
-            "passed": score >= pass_score,
+            "passed": score >= pass_score and not hard_failed,
             "pass_score": pass_score,
             "issues": issues,
             "rerun_shots": rerun_shots,
             "rerun_lines": rerun_lines,
+            "pipeline_version": storyboard.get("pipeline_version", "legacy"),
+            "domains": domains,
         }
+
+    def _check_professional_contract(self, script, storyboard, ctx):
+        issues = []
+        profile = (ctx.get("production_profile")
+                   or storyboard.get("profile") or {})
+        rules = profile.get("rules", {})
+        gate_settings = {
+            item.get("id"): item for item in rules.get("quality_gates", [])
+            if isinstance(item, dict) and item.get("id")
+        }
+
+        def enabled(gate_id):
+            return gate_settings.get(gate_id, {}).get("enabled", True)
+
+        max_seconds = float(profile.get("max_segment_seconds", 15))
+        precision = float(profile.get("time_precision_seconds", 0.5))
+        required_columns = rules.get("storyboard", {}).get(
+            "required_columns", [])
+        required = (
+            "unit_id", "character_count", "start_state", "end_state",
+            "shot_function", "script_reference", "readable_text",
+            "visual_hook", "performance", "five_dimensions",
+            "seedance_prompt", "shot_contract", "sound_design", "timecode",
+        )
+        shots = storyboard.get("shots", [])
+        if (enabled("continuity") and storyboard.get("standard_fingerprint")
+                != profile.get("standard_fingerprint")):
+            issues.append({
+                "check": "preflight", "severity": "error",
+                "shot_no": None, "rerunnable": False,
+                "message": "分镜与本集制作标准快照不一致",
+            })
+        for shot in shots:
+            missing = ([field for field in required if field not in shot]
+                       if enabled("five_dimensions") else [])
+            if missing:
+                issues.append({
+                    "check": "duration", "severity": "error",
+                    "shot_no": shot.get("shot_no"), "rerunnable": False,
+                    "message": f"{shot.get('unit_id', '镜头')}缺少生产字段:"
+                    + "、".join(missing),
+                })
+            duration = float(shot.get("duration") or 0)
+            if (enabled("duration") and (duration > max_seconds
+                    or abs(duration / precision
+                           - round(duration / precision)) > 1e-7)):
+                issues.append({
+                    "check": "five_dimensions", "severity": "error",
+                    "shot_no": shot.get("shot_no"), "rerunnable": False,
+                    "message": f"{shot.get('unit_id')}时长须为{precision:g}秒粒度"
+                    f"且不超过{max_seconds:g}秒",
+                })
+            if (enabled("people") and shot.get("character_count")
+                    != len(shot.get("characters", []))):
+                issues.append({
+                    "check": "character_consistency", "severity": "error",
+                    "shot_no": shot.get("shot_no"), "rerunnable": False,
+                    "message": f"{shot.get('unit_id')}人物名单与数量不一致",
+                })
+            text_asset = shot.get("readable_text") or {}
+            if enabled("text") and text_asset.get("required") and not (
+                    text_asset.get("locked_by") and text_asset.get("keyframe_uri")):
+                issues.append({
+                    "check": "text_asset", "severity": "error",
+                    "shot_no": shot.get("shot_no"), "rerunnable": False,
+                    "message": f"{shot.get('unit_id')}可读文字未绑定ChatGPT关键帧",
+                })
+            if enabled("five_dimensions") and required_columns and not all(
+                    column in (shot.get("shot_contract") or {})
+                    for column in required_columns):
+                issues.append({
+                    "check": "five_dimensions", "severity": "error",
+                    "shot_no": shot.get("shot_no"), "rerunnable": False,
+                    "message": f"{shot.get('unit_id')}镜头合同未覆盖全部"
+                    f"{len(required_columns)}列",
+                })
+            if (enabled("audio")
+                    and not (shot.get("sound_design") or {}).get("environment")):
+                issues.append({
+                    "check": "integrated_audio", "severity": "error",
+                    "shot_no": shot.get("shot_no"), "rerunnable": False,
+                    "message": f"{shot.get('unit_id')}缺少环境声设计",
+                })
+
+        # 同名角色跨单元出现时，下一单元起始状态必须继承上一结尾状态。
+        if enabled("continuity"):
+            previous = {}
+            for shot in shots:
+                for name, start in (shot.get("start_state") or {}).items():
+                    if name in previous and start != previous[name]:
+                        issues.append({
+                            "check": "state_continuity", "severity": "error",
+                            "shot_no": shot.get("shot_no"), "rerunnable": False,
+                            "message": f"{shot.get('unit_id')}的{name}未继承上一单元结尾状态",
+                        })
+                previous.update(shot.get("end_state") or {})
+
+        script_lines = [
+            line.get("dialogue", "")
+            for scene in script.get("scenes", [])
+            for line in scene.get("lines", [])
+        ]
+        storyboard_lines = []
+        for shot in shots:
+            if not shot.get("dialogue"):
+                continue
+            part = shot.get("dialogue_part") or {"index": 1}
+            if part.get("index", 1) == 1:
+                storyboard_lines.append(
+                    shot.get("dialogue_source")
+                    or shot["dialogue"].get("dialogue", ""))
+        if enabled("dialogue") and script_lines != storyboard_lines:
+            issues.append({
+                "check": "dialogue_integrity", "severity": "error",
+                "shot_no": None, "rerunnable": False,
+                "message": "分镜台词未逐字、逐句覆盖原剧本",
+            })
+        preflight = ctx.get("preflight") or {}
+        if not preflight.get("passed"):
+            issues.append({
+                "check": "preflight", "severity": "error",
+                "shot_no": None, "rerunnable": False,
+                "message": "生产前硬门禁没有通过记录",
+            })
+        return issues
+
+    @staticmethod
+    def _check_no_subtitles(ctx):
+        subtitles = ctx.get("subtitles") or []
+        edit_subs = ((ctx.get("edit_data") or {}).get("tracks") or {}).get(
+            "subtitle", [])
+        if not subtitles and not edit_subs:
+            return []
+        return [{
+            "check": "subtitle", "severity": "error",
+            "shot_no": None, "line_no": None, "rerunnable": False,
+            "message": "无字幕版本检测到对白字幕轨或字幕条",
+        }]
+
+    @staticmethod
+    def _check_integrated_audio(ctx):
+        requested = (ctx.get("voice_mode") == "jimeng_builtin"
+                     and bool(ctx.get("lip_sync")))
+        carried = ctx.get("voice_carried") is True
+        videos = ctx.get("videos") or []
+        # Mock 的 *.video.json 是离线契约产物，用于无真实模型时
+        # 验证整条工业流；实产 mp4/URL 不使用这个例外。
+        mock_evidence = bool(videos) and all(
+            video.get("provider") == "mock"
+            or str(video.get("uri", "")).endswith(".video.json")
+            for video in videos)
+        if requested and (carried or mock_evidence):
+            return []
+        return [{
+            "check": "integrated_audio", "severity": "error",
+            "shot_no": None, "line_no": None, "rerunnable": False,
+            "message": "缺少实际随视频配音证据(voice_carried)"
+                       "或未锁定即梦对口型",
+        }]
+
+    @staticmethod
+    def _check_review_evidence(ctx):
+        board = ctx.get("review_board", "")
+        review = ctx.get("content_review") or {}
+        board_ok = bool(board) and _artifact_exists(board)
+        if board_ok and review.get("passed"):
+            return []
+        return [{
+            "check": "review_evidence", "severity": "error",
+            "shot_no": None, "line_no": None, "rerunnable": False,
+            "message": "抽帧检查板或逐段内容复核缺失/未通过",
+        }]
 
     # ---- 角色一致性:分镜引用的角色必须在剧本角色表(即已登记资产)中 ----
     def _check_character_consistency(self, script, storyboard, ctx):

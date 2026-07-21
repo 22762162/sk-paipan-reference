@@ -71,12 +71,17 @@ class DreaminaProvider(Provider):
             # Seedance2 有声视频:台词随视频自动配音,免单独 TTS
             prompt += (f"。让角色开口说出这句台词并自动配音"
                        f"(中文自然人声,口型对应):「{dialogue['dialogue']}」")
+        requested_duration = float(payload.get(
+            "duration", self.conf.get("duration", 8)))
+        # 即梦 CLI 接受整秒；0.5 秒分镜用常规四舍五入，避免 Python
+        # bankers rounding 把 2.5 秒意外压成 2 秒。
+        duration = max(1, min(15, int(requested_duration + 0.5)))
         cmd = self._command() + [
             "frames2video",
             f"--first={first}",
             f"--last={last}",
             f"--prompt={prompt}",
-            f"--duration={int(self.conf.get('duration', 8))}",
+            f"--duration={duration}",
             f"--video_resolution={self.conf.get('video_resolution', '720p')}",
             f"--model_version={model_version}",
             f"--poll={int(self.conf.get('poll', 30))}",
@@ -106,8 +111,11 @@ class DreaminaProvider(Provider):
             cost=self.cost_per_call,
             data={
                 "shot_no": shot_no,
-                "duration": int(self.conf.get("duration", 8)),
+                "duration": duration,
                 "model_version": model_version,
+                "voice": payload.get("voice", "jimeng_builtin"),
+                "lip_sync": bool(payload.get("lip_sync", True)),
+                "forbid_subtitles": bool(payload.get("forbid_subtitles", True)),
                 "log": str(log_path),
             },
             uri=uri,

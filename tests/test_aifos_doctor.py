@@ -20,9 +20,20 @@ def _fake_cli(tmp_path, name):
     return path
 
 
+def _only_path_candidates(monkeypatch):
+    """隔离宿主机常见安装目录，只验证当前测试注入的 PATH。"""
+    import aifos.doctor as doctor
+
+    monkeypatch.setattr(
+        doctor, "CLI_CANDIDATES",
+        {name: [] for name in doctor.CLI_CANDIDATES},
+    )
+
+
 def test_detect_and_apply(tmp_path, monkeypatch):
     dreamina = _fake_cli(tmp_path, "dreamina")
     codex = _fake_cli(tmp_path, "codex")
+    _only_path_candidates(monkeypatch)
     monkeypatch.setenv("PATH", str(tmp_path / "bin"))
     found = detect_clis()
     assert found["dreamina"] == str(dreamina.resolve())
@@ -92,6 +103,7 @@ def test_doctor_with_real_cli(tmp_path, monkeypatch):
 
 def test_cli_doctor_and_detect(tmp_path, monkeypatch, capsys):
     _fake_cli(tmp_path, "dreamina")
+    _only_path_candidates(monkeypatch)
     monkeypatch.setenv("PATH", str(tmp_path / "bin"))
     ws = str(tmp_path / "ws")
     assert main(["--workspace", ws, "init"]) == 0
@@ -121,6 +133,7 @@ def test_cli_doctor_all_mock_exit(tmp_path, monkeypatch, capsys):
 
 def test_web_doctor_and_detect(tmp_path, monkeypatch):
     dreamina = _fake_cli(tmp_path, "dreamina")
+    _only_path_candidates(monkeypatch)
     monkeypatch.setenv("PATH", str(tmp_path / "bin"))
     ws = tmp_path / "ws"
     App(ws).close()

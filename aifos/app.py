@@ -1,4 +1,4 @@
-"""应用装配:workspace + 八大中心统一初始化。"""
+"""应用装配:workspace + 八大业务中心 + 制作标准中心统一初始化。"""
 
 from pathlib import Path
 
@@ -11,6 +11,7 @@ from .ops_center import OpsCenter
 from .production.router import ProviderRouter
 from .project_center import ProjectCenter
 from .qc_center import QcCenter
+from .standard_center import StandardCenter
 from .system_center import Logger, SystemCenter
 
 
@@ -39,6 +40,7 @@ class App:
         self.config = Config.load(
             self.workspace.config_path, overrides=config_overrides)
         self.db = Database(self.workspace.db_path)
+        self.standards = StandardCenter(self.db, self.config)
         self.logger = Logger(self.db, self.workspace.logs_dir, echo=echo_logs)
         self.system = SystemCenter(self.db, self.logger)
         self.system.ensure_user("admin", "admin")
@@ -51,7 +53,7 @@ class App:
         self.director = Director(
             self.db, self.config, self.logger, self.projects, self.assets,
             self.router, self.qc, self.ops, self.data,
-            self.workspace.artifacts_dir)
+            self.workspace.artifacts_dir, standards=self.standards)
 
     def close(self):
         self.db.close()

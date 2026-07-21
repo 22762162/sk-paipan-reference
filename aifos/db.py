@@ -104,6 +104,40 @@ CREATE TABLE IF NOT EXISTS users(
   name TEXT NOT NULL UNIQUE,
   role TEXT NOT NULL DEFAULT 'operator'
 );
+
+-- 制作标准中心:版本记录只追加不修改，state 只保存各 profile 的激活指针。
+CREATE TABLE IF NOT EXISTS production_standard_versions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  profile_key TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL,
+  change_note TEXT NOT NULL DEFAULT '',
+  fingerprint TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  UNIQUE(profile_key, version)
+);
+
+CREATE TABLE IF NOT EXISTS production_standard_state(
+  profile_key TEXT PRIMARY KEY,
+  active_version_id INTEGER NOT NULL
+    REFERENCES production_standard_versions(id) ON DELETE RESTRICT,
+  updated_at REAL NOT NULL
+);
+
+-- 数据库级保护，避免绕过 StandardCenter 意外篡改历史版本。
+CREATE TRIGGER IF NOT EXISTS production_standard_versions_immutable_update
+BEFORE UPDATE ON production_standard_versions
+BEGIN
+  SELECT RAISE(ABORT, 'production standard versions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS production_standard_versions_immutable_delete
+BEFORE DELETE ON production_standard_versions
+BEGIN
+  SELECT RAISE(ABORT, 'production standard versions are immutable');
+END;
 """
 
 
@@ -124,6 +158,9 @@ class Database:
         self.path = str(path)
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
+        # 标准保存会使用 BEGIN IMMEDIATE；给并发 UI/API 写入留出等待窗口，
+        # 避免短暂锁竞争直接抛出 "database is locked"。
+        self.conn.execute("PRAGMA busy_timeout = 5000")
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
         self._migrate()

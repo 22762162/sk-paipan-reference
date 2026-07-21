@@ -100,6 +100,17 @@ def test_long_subtitle_warns(tmp_path):
                for i in report["issues"])
 
 
+def test_integrated_audio_requires_runtime_evidence():
+    ctx = {
+        "voice_mode": "jimeng_builtin", "lip_sync": True,
+        "videos": [{"provider": "jimeng", "uri": "https://cdn.x/v.mp4"}],
+    }
+    issues = QcCenter._check_integrated_audio(ctx)
+    assert issues and issues[0]["check"] == "integrated_audio"
+    ctx["voice_carried"] = True
+    assert QcCenter._check_integrated_audio(ctx) == []
+
+
 def test_discontinuous_shots_error(tmp_path):
     bad = {"shots": [dict(STORYBOARD["shots"][0], shot_no=1),
                      dict(STORYBOARD["shots"][1], shot_no=5)]}
@@ -120,6 +131,10 @@ def test_auto_rerun_repairs_missing_video(tmp_path):
         script, _ = app.projects.latest_document(episode["id"], "script")
         storyboard, _ = app.projects.latest_document(
             episode["id"], "storyboard")
+        continuity, _ = app.projects.latest_document(
+            episode["id"], "continuity")
+        preflight, _ = app.projects.latest_document(
+            episode["id"], "preflight")
         out_root = app.workspace.artifacts_dir / f"p{project['id']:03d}" / "e001"
         # 构造质检上下文,人为删除镜头1的视频
         import pathlib
@@ -133,9 +148,14 @@ def test_auto_rerun_repairs_missing_video(tmp_path):
             "out_root": out_root,
             "script": script,
             "storyboard": storyboard,
+            "continuity": continuity,
+            "preflight": preflight,
+            "production_profile": storyboard["profile"],
             "cast": [c["name"] for c in script["characters"]],
             "images": [], "frames": [], "videos": [], "voices": [],
             "subtitles": [],
+            "voice_mode": "jimeng_builtin", "lip_sync": True,
+            "final_uri": summary["outputs"]["final"], "edit_data": {},
             "aspect": "9:16",
             "dims": {"width": 1080, "height": 1920},
         }
@@ -144,23 +164,17 @@ def test_auto_rerun_repairs_missing_video(tmp_path):
             {"shot_no": s["shot_no"],
              "first": str(out_root / "frames" / f"shot_{s['shot_no']:03d}.first.svg"),
              "last": str(out_root / "frames" / f"shot_{s['shot_no']:03d}.last.svg")}
+                for s in storyboard["shots"]]
+        ctx["images"] = [
+            {"shot_no": s["shot_no"],
+             "uri": str(out_root / "images" /
+                        f"shot_{s['shot_no']:03d}.keyframe.svg")}
             for s in storyboard["shots"]]
         ctx["videos"] = [
             {"shot_no": s["shot_no"],
              "uri": str(video_dir / f"shot_{s['shot_no']:03d}.video.json"),
              "duration": s["duration"]}
-            for s in storyboard["shots"]]
-        line_no = 0
-        for scene in script["scenes"]:
-            for line in scene["lines"]:
-                line_no += 1
-                ctx["voices"].append({
-                    "line_no": line_no,
-                    "uri": str(out_root / "voices" / f"line_{line_no:03d}.voice.json"),
-                    "duration": 1.0})
-                ctx["subtitles"].append({
-                    "line_no": line_no, "character": line["character"],
-                    "text": line["dialogue"]})
+                for s in storyboard["shots"]]
         app.director._task_cost = 0.0
         app.director._task_providers = set()
         result = app.director._stage_qc(ctx)

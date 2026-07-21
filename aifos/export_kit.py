@@ -1,7 +1,7 @@
 """成品包导出:一集的全部成品打成 zip,自行下载分发。
 
-内容:成片/镜头视频、封面、标题文案+话题标签、配音、镜头画面、
-剪映草稿、剧本文本、拆条建议、发布信息。
+内容:成片/镜头视频、封面、标题文案+话题标签、镜头画面、五维分镜、
+连续性圣经、生产门禁、图文检查板、内容复核与实际运行的交付检查脚本。
 """
 
 import io
@@ -60,6 +60,17 @@ def build_export_zip(app, project_title, episode_number):
         script, _ = app.projects.latest_document(episode["id"], "script")
         if script:
             add_text("剧本.txt", script_to_text(script))
+        for kind, filename in (
+                ("production_standard", "制作合同/本集制作标准.json"),
+                ("continuity", "制作合同/连续性圣经.json"),
+                ("storyboard", "制作合同/五维分镜.json"),
+                ("text_assets", "制作合同/文字资产白名单.json"),
+                ("preflight", "制作合同/生产门禁.json"),
+                ("content_review", "质检/逐段内容复核.json")):
+            document, _ = app.projects.latest_document(episode["id"], kind)
+            if document is not None:
+                add_text(filename, json.dumps(
+                    document, ensure_ascii=False, indent=2))
         kit_path = out_root / "publish" / "publish.json"
         if kit_path.exists():
             kit = json.loads(kit_path.read_text(encoding="utf-8"))
@@ -90,6 +101,12 @@ def build_export_zip(app, project_title, episode_number):
             add_file(final["uri"], f"成片{Path(final['uri']).suffix}")
         draft = out_root / "edit" / "draft_content.json"
         add_file(str(draft), "剪映草稿.json")
+        for source, target in (
+                (out_root / "review_board.html", "质检/图文检查板.html"),
+                (out_root / "qc_report.json", "质检/三层质检报告.json"),
+                (out_root / "delivery_check.json", "质检/交付复核结果.json"),
+                (out_root / "check-delivery.py", "质检/check-delivery.py")):
+            add_file(str(source), target)
 
         # 人物与场景设定图(项目级)
         for kind, folder in (("character_art", "人物设定"),

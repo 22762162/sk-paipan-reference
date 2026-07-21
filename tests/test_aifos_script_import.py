@@ -73,10 +73,13 @@ def test_produce_with_provided_script(tmp_path):
         # 人物从剧本自动登记为 IP 资产
         assert app.assets.latest(project["id"], "character", "林昭")
         assert app.assets.latest(project["id"], "character", "妖王")
-        # 分镜从剧本推导:2 场 + 4 句台词 = 6 镜
+        # 原 6 个叙事镜完整保留，并自动补听者反应镜和场尾留白镜。
         storyboard, _ = app.projects.latest_document(
             episode["id"], "storyboard")
-        assert len(storyboard["shots"]) == 6
+        shots = storyboard["shots"]
+        assert len([s for s in shots if s.get("dialogue")]) == 4
+        assert {"reaction", "beat"} <= {s["kind"] for s in shots}
+        assert len(shots) > 6
     finally:
         app.close()
 

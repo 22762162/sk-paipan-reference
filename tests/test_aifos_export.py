@@ -2,6 +2,7 @@
 
 import http.client
 import io
+import json
 import threading
 import zipfile
 
@@ -27,11 +28,23 @@ def test_export_zip_contents(tmp_path):
         assert "发布信息.json" in names
         assert "剪映草稿.json" in names
         assert any(n.startswith("视频/") for n in names)
-        assert any(n.startswith("配音/") for n in names)
+        # 标准产线的配音/口型已集成在即梦视频内，不再导出独立 TTS。
+        assert not any(n.startswith("配音/") for n in names)
+        assert "制作合同/本集制作标准.json" in names
+        assert "制作合同/连续性圣经.json" in names
+        assert "制作合同/五维分镜.json" in names
+        assert "制作合同/生产门禁.json" in names
+        assert "质检/图文检查板.html" in names
+        assert "质检/check-delivery.py" in names
         assert any(n.startswith("人物设定/") for n in names)
         assert any(n.startswith("封面") for n in names)
         script_text = bundle.read("剧本.txt").decode("utf-8")
         assert "第1场" in script_text and ":" in script_text
+        standard = json.loads(bundle.read(
+            "制作合同/本集制作标准.json").decode("utf-8"))
+        assert standard["profile_key"] == "sk-manju-v5"
+        assert standard["version_id"] == app.standards.active()["version_id"]
+        assert standard["fingerprint"] == app.standards.active()["fingerprint"]
     finally:
         app.close()
 

@@ -83,25 +83,46 @@ def build_instruction(capability, payload, out_dir):
             return instruction, [target], {"name": payload.get("art_name")}
         shot_no = int(payload["shot_no"])
         target = out_dir / f"shot_{shot_no:03d}.keyframe.png"
+        text_asset = payload.get("readable_text") or {}
+        text_rule = (
+            f"画面文字载体:{text_asset.get('carrier', '')};只允许逐字出现:"
+            f"{'、'.join(text_asset.get('whitelist', [])) or '白名单为空'};"
+            "不得新增乱码或字幕条。"
+            if text_asset.get("required") else
+            "画面中不要生成字幕条、对白字幕或无关可读文字。")
         instruction = (
             f"为漫剧分镜生成一张关键图并保存到 {target}"
             f"(PNG,{size})。画面内容:{payload.get('prompt', '')}。"
-            f"出场角色:{'、'.join(payload.get('characters', []))}。"
+            f"出场角色:{'、'.join(payload.get('characters', []))}，"
+            f"严格共{payload.get('character_count', len(payload.get('characters', [])))}人，"
+            f"禁止新增或复制人物。{text_rule}"
             f"镜头语言:{payload.get('camera', '')}。"
             f"{_ref_line(payload)}{common}"
-            "只产出该文件,不要改动其他文件。")
+            "只产出该文件,不要改动其他文件。"
+        )
         return instruction, [target], {"shot_no": shot_no}
     if capability == "frames":
         shot_no = int(payload["shot_no"])
         first = out_dir / f"shot_{shot_no:03d}.first.png"
         last = out_dir / f"shot_{shot_no:03d}.last.png"
+        image_uri = payload.get("image_uri", "")
+        # 协议测试或人工恢复时可能给一个尚未挂载的占位路径；不要让
+        # Codex 把它误判成目标文件。正式流水线的关键图已落盘，仍传绝对路径。
+        if (image_uri and not image_uri.startswith(("http://", "https://"))
+                and not Path(image_uri).exists()):
+            image_uri = Path(image_uri).name
         instruction = (
-            f"基于关键图 {payload.get('image_uri', '')}(文件可直接读取)"
-            f"为镜头生成首帧与尾帧,分别保存到 {first} 和 {last}"
-            f"(PNG,{size})。镜头内容:{payload.get('prompt', '')}。"
-            "首帧为动作起始、尾帧为动作结束,构图与关键图连贯,"
-            f"角色与场景保持完全一致。{_ref_line(payload)}{common}"
-            "只产出这两个文件。")
+            f"基于关键图 {image_uri}(文件可直接读取)"
+            "为镜头生成首帧与尾帧,"
+            f"分别保存到 {first} 和 {last}(PNG,{size})。"
+            f"镜头内容:{payload.get('prompt', '')}。"
+            f"起始状态:{payload.get('start_state', {})};"
+            f"结尾状态:{payload.get('end_state', {})};"
+            "首帧为动作起始、尾帧为动作结束，构图与关键图连贯，"
+            "保持人物、服装、道具、场景与任何已锁定文字完全一致，"
+            f"不新增字幕条。{_ref_line(payload)}{common}"
+            "只产出这两个文件。"
+        )
         return instruction, [first, last], {
             "first": str(first), "last": str(last)}
     if capability == "cover":

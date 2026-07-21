@@ -445,8 +445,16 @@ class MockProvider(Provider):
             "first_frame": payload.get("first", ""),
             "last_frame": payload.get("last", ""),
             "prompt": payload.get("prompt", ""),
+            "voice": payload.get("voice", "jimeng_builtin"),
+            "lip_sync": bool(payload.get("lip_sync", True)),
+            "forbid_subtitles": bool(payload.get("forbid_subtitles", True)),
         })
-        return {"shot_no": shot_no, "duration": duration}, uri
+        return {
+            "shot_no": shot_no, "duration": duration,
+            "voice": payload.get("voice", "jimeng_builtin"),
+            "lip_sync": bool(payload.get("lip_sync", True)),
+            "forbid_subtitles": bool(payload.get("forbid_subtitles", True)),
+        }, uri
 
     # ---- 配音 ----
     def _gen_voice(self, payload, out_dir):

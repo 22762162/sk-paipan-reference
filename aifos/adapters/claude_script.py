@@ -53,16 +53,19 @@ JSON 格式(字段必须齐全,characters 只含「{persona}」一人):
    "characters": ["{persona}"], "action": "画面动作描述",
    "lines": [{{"character": "{persona}", "dialogue": "口播台词"}}]}}]}}"""
 
-STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成分镜表。
+STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可交给工业流继续校验的原始分镜表。
 
 剧本:
 {script}
 
 要求:
-- 每场先给 1 个环境镜头(kind="environment",dialogue=null),
-  再为每句台词给 1 个对白镜头(kind="dialogue",dialogue 填对应台词对象);
-- shot_no 从 1 连续编号;duration 单位秒(2.0-4.0);
-- prompt 为该镜头的文生图提示词(含场景、角色、镜头语言);
+- 每段只承载一个主要动作或一次情绪转折；台词逐字照抄，禁止改写；
+- 每场先给 1 个环境/肢体镜头，再为每句台词给 1 个对白镜头；
+- 关键台词后的听者反应与情绪高潮留白由平台补齐，不要用空镜凑时长；
+- shot_no 从 1 连续编号；duration 单位秒，优先 5-8 秒，最长 15 秒；
+- prompt 含场景、准确人物名单、主体动作、光影、机位与结尾状态；
+- 不生成对白字幕。手机屏、弹幕、合同等可读文字只描述载体与准确文字，
+  后续由 ChatGPT 关键帧锁定，不能交给视频模型从零生成；
 - 只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块。
 
 JSON 格式:

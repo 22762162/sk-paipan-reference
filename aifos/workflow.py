@@ -1,0 +1,956 @@
+"""SK 漫剧工业流：连续性圣经、五维分镜、生产门禁与交付复核。
+
+本模块只做确定性的结构化编排，不调用模型。Provider 负责创作原始剧本/分镜，
+这里把结果收敛成可审、可机检、可交接给 Seedance 的生产合同。
+"""
+
+import copy
+import html
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+
+PIPELINE_VERSION = "sk-manju-v5"
+TEXT_CARRIERS = (
+    "弹幕", "聊天框", "直播屏", "手机屏", "电脑", "后台", "合同",
+    "欠条", "门牌", "榜单", "公司标识", "大字", "屏幕", "字幕",
+)
+SHOT_FUNCTIONS = {
+    "environment": "铺垫", "dialogue": "信息交代", "reaction": "反应",
+    "beat": "留白", "physical": "蓄势",
+}
+
+
+def _rules_from_standard(standard):
+    content = (standard or {}).get("content", standard or {})
+    rules = content.get("rules", {}) if isinstance(content, dict) else {}
+    return rules if isinstance(rules, dict) else {}
+
+
+def content_key(standard, key, default=None):
+    """兼容标准快照与裸内容的顶层字段读取。"""
+    content = (standard or {}).get("content", standard or {})
+    return content.get(key, default) if isinstance(content, dict) else default
+
+
+def production_profile(config, standard=None):
+    """返回每集随包归档的不可漂移生产配置与规则快照。"""
+    configured = config.get("production", default={}) or {}
+    jimeng = config.get("providers", "jimeng", default={}) or {}
+    rules = _rules_from_standard(standard)
+    production = rules.get("production", {})
+    dialogue = rules.get("dialogue", {})
+    performance = rules.get("performance", {})
+    storyboard = rules.get("storyboard", {})
+    delivery = rules.get("delivery", {})
+    return {
+        "pipeline_version": PIPELINE_VERSION,
+        "standard_profile_key": (standard or {}).get(
+            "profile_key", content_key(standard, "profile_key", PIPELINE_VERSION)),
+        "standard_version": (standard or {}).get("version", 1),
+        "standard_version_id": (standard or {}).get("version_id", 0),
+        "standard_name": (standard or {}).get(
+            "name", content_key(standard, "name", "SK 五维漫剧标准")),
+        "standard_fingerprint": (standard or {}).get(
+            "fingerprint", "legacy-config"),
+        "video_model": production.get(
+            "video_model", jimeng.get("model_version", "seedance2.0fast_vip")),
+        "resolution": production.get(
+            "resolution", jimeng.get("video_resolution", "720p")),
+        "preferred_segment_seconds": production.get(
+            "preferred_segment_seconds", configured.get(
+                "preferred_segment_seconds", [5, 8])),
+        "max_segment_seconds": production.get(
+            "max_segment_seconds", configured.get("max_segment_seconds", 15)),
+        "time_precision_seconds": production.get("time_precision_seconds", 0.5),
+        "voice": production.get(
+            "voice", configured.get("voice", "jimeng_builtin")),
+        "lip_sync": bool(production.get(
+            "lip_sync", configured.get("lip_sync", True))),
+        "burn_subtitles": bool(production.get(
+            "burn_subtitles", configured.get("burn_subtitles", False))),
+        "text_lock_provider": production.get(
+            "text_lock_provider", configured.get(
+                "text_lock_provider", "ChatGPT关键帧")),
+        "max_dialogue_chars": dialogue.get("max_chars_per_shot", 25),
+        "reaction_min_ratio": performance.get(
+            "listener_duration_ratio", 2 / 3),
+        "reaction_seconds": performance.get("reaction_seconds", [1.5, 3]),
+        "beat_seconds": performance.get("beat_seconds", [2, 4]),
+        "minimum_vertical_angles": storyboard.get(
+            "minimum_vertical_angles_per_segment", 2),
+        "shot_contract_columns": len(storyboard.get("required_columns", [])),
+        "review_layers": delivery.get(
+            "review_layers", ["自动文件检查", "抽帧检查板", "逐段内容复核"]),
+        "rules": copy.deepcopy(rules),
+    }
+
+
+def build_continuity_bible(project, script, profile):
+    """锁定项目级角色、场景、文字与生成配置。"""
+    rules = profile.get("rules", {})
+    continuity_rules = rules.get("continuity", {})
+    text_rules = rules.get("text_assets", {})
+    delivery_rules = rules.get("delivery", {})
+    characters = []
+    for index, character in enumerate(script.get("characters", []), 1):
+        name = character["name"]
+        characters.append({
+            "name": name,
+            "role": character.get("role", ""),
+            "identity_anchor": f"{name}角色参考图 + 同名禁令",
+            "face_hair_anchor": "继承项目角色参考，不改脸型、发型、发色与年龄感",
+            "costume_anchor": "继承本场服装参考，不跨镜换装",
+            "signature_prop": "无",
+            "default_position": ["画面左1/3", "画面中", "画面右2/3"][
+                (index - 1) % 3],
+        })
+    seen = set()
+    scenes = []
+    for scene in script.get("scenes", []):
+        location = scene.get("location", "")
+        if location in seen:
+            continue
+        seen.add(location)
+        scenes.append({
+            "name": location,
+            "layout_anchor": f"{location}空间布局在本集内固定",
+            "equipment_anchor": "设备现代且统一；旧空间也必须干净、可拍摄",
+            "light_anchor": "主光方向与色温跨镜保持一致",
+        })
+    return {
+        "pipeline_version": PIPELINE_VERSION,
+        "standard_fingerprint": profile.get("standard_fingerprint", ""),
+        "project": project.get("title", ""),
+        "episode": script.get("episode_number", 0),
+        "same_name_rule": ("同一实体全程使用完全相同的名字"
+                           if continuity_rules.get(
+                               "canonical_entity_names", True)
+                           else "按项目自定义命名"),
+        "state_fields": continuity_rules.get(
+            "state_labels", ["姿态", "伤势", "持有道具", "情绪", "朝向关系"]),
+        "characters": characters,
+        "scenes": scenes,
+        "text_policy": {
+            "whitelist": [],
+            "readable_text_requires_keyframe": text_rules.get(
+                "readable_text_requires_keyframe", True),
+            "forbid_generated_gibberish": text_rules.get(
+                "forbid_generated_gibberish", True),
+        },
+        "delivery_policy": {
+            "forbid_dialogue_subtitles": not profile["burn_subtitles"],
+            "forbid_unknown_people": continuity_rules.get(
+                "on_stage_characters_only", True),
+            "require_start_end_state": continuity_rules.get(
+                "end_state_to_next_start", True),
+            "require_contact_sheet": delivery_rules.get(
+                "html_review_board_required", True),
+            "require_content_review": delivery_rules.get(
+                "content_review_required", True),
+            "require_delivery_verifier": delivery_rules.get(
+                "delivery_verifier_required", True),
+        },
+        "production_profile": copy.deepcopy(profile),
+    }
+
+
+def _scene_map(script):
+    return {s["scene_no"]: s for s in script.get("scenes", [])}
+
+
+def _type_word(scene, shot):
+    text = " ".join((scene.get("action", ""), shot.get("description", "")))
+    if any(word in text for word in ("打", "追", "冲", "摔", "击", "逃")):
+        return "动作打斗"
+    if len(scene.get("characters", [])) >= 3:
+        return "群戏调度"
+    if shot.get("kind") == "dialogue" and len(scene.get("characters", [])) >= 2:
+        return "对峙冲突"
+    return "独白抒情" if shot.get("kind") in ("dialogue", "beat") else "大场面定场"
+
+
+def _camera_plan(camera, kind, index, rules=None):
+    library = (rules or {}).get("camera_library", {})
+    storyboard_rules = (rules or {}).get("storyboard", {})
+    scales = library.get(
+        "shot_scales", ["远景", "全景", "中景", "近景", "特写", "大特写"])
+    angles = library.get(
+        "angles", ["平视", "俯拍", "仰拍", "高机位", "低机位"])
+    positions = library.get(
+        "positions", ["正面", "斜侧", "过肩", "侧面"])
+    movements = library.get(
+        "movements", ["固定", "推", "拉", "摇", "移", "跟", "环绕", "手持", "升降"])
+    compositions = library.get(
+        "compositions", ["黄金分割", "引导线", "中心构图", "对称构图"])
+    camera = camera or ""
+    if "特写" in camera:
+        scale = "特写"
+    elif "全景" in camera or "远景" in camera:
+        scale = "全景"
+    elif kind in ("reaction", "beat"):
+        scale = "近景" if "近景" in scales else scales[0]
+    else:
+        fallback_scales = [s for s in ("中景", "近景", "特写") if s in scales]
+        scale = fallback_scales[(index - 1) % len(fallback_scales)] if fallback_scales else scales[0]
+    if "俯" in camera:
+        angle = "俯拍"
+    elif "仰" in camera:
+        angle = "仰拍"
+    else:
+        angle = angles[(index - 1) % len(angles)]
+    movement = "固定" if "固定" in movements else movements[0]
+    for candidate in sorted(movements, key=len, reverse=True):
+        if candidate in camera:
+            movement = candidate
+            break
+    if kind in ("reaction", "beat"):
+        movement = ("推" if kind == "reaction" and "推" in movements
+                    else "固定" if "固定" in movements else movements[0])
+    return {
+        "shot_scale": scale,
+        "angle": angle,
+        "lens": "85mm" if scale in ("近景", "特写") else "35mm",
+        "camera_position": ("过肩" if "过肩" in camera and "过肩" in positions
+                            else positions[(index - 1) % len(positions)]),
+        "movement": movement,
+        "composition": compositions[(index - 1) % len(compositions)],
+        "speed": "正常",
+        "axis_offset_degrees": (
+            ((index - 1) % 3 - 1) * float(storyboard_rules.get(
+                "adjacent_camera_axis_change_degrees", 30))),
+        "movement_motivation": "靠近角色情绪" if movement in ("推", "急推", "微推")
+        else "建立清晰空间关系",
+    }
+
+
+def _state(name, continuity, emotion="专注", pose="站立，重心稳定"):
+    anchor = next(
+        (c for c in continuity.get("characters", []) if c["name"] == name), {})
+    return {
+        "pose": pose,
+        "injury": "无伤",
+        "prop": anchor.get("signature_prop", "无"),
+        "emotion": emotion,
+        "direction": "面向本镜主体，视线不越轴",
+        "position": anchor.get("default_position", "画面中"),
+    }
+
+
+def _text_asset(shot, rules=None):
+    blob = " ".join((shot.get("description", ""), shot.get("prompt", "")))
+    carriers = (rules or {}).get("text_assets", {}).get(
+        "carriers", list(TEXT_CARRIERS))
+    carrier = next((word for word in carriers if word in blob), "")
+    # 仅在存在文字载体时提取书名号/引号内容，避免把口头台词当画面文字。
+    texts = re.findall(r"[《「『【]([^》」』】]{1,40})[》」』】]", blob) if carrier else []
+    required = bool(carrier)
+    return {
+        "required": required,
+        "carrier": carrier,
+        "whitelist": texts,
+        "locked_by": "",
+        "keyframe_uri": "",
+        "rule": "文字必须由ChatGPT关键帧锁定，Seedance只保持原字" if required else "无可读文字",
+    }
+
+
+def _emotion_band(raw, dialogue_rules):
+    hint = " ".join((str(raw.get("emotion", "")),
+                     str((raw.get("dialogue") or {}).get("dialogue", "")),
+                     str(raw.get("description", ""))))
+    if any(word in hint for word in ("颤", "哽咽", "发抖", "恐惧")):
+        return "trembling"
+    if any(word in hint for word in ("悲", "哭", "温柔", "低声", "伤心")):
+        return "sad_gentle"
+    if any(word in hint for word in ("怒", "吼", "紧张", "质问", "威胁", "!", "！")):
+        return "tense_angry"
+    return "daily"
+
+
+def _round_duration(value, precision):
+    precision = float(precision or 0.5)
+    units = int(value / precision)
+    if units * precision < value - 1e-9:
+        units += 1
+    return round(max(precision, units * precision), 3)
+
+
+def _format_timecode(seconds):
+    minutes = int(seconds // 60)
+    remainder = seconds - minutes * 60
+    return f"{minutes:02d}:{remainder:04.1f}"
+
+
+def _dialogue_duration(dialogue, rules=None, emotion="daily"):
+    if not dialogue:
+        preferred = (rules or {}).get("production", {}).get(
+            "preferred_segment_seconds", [5, 8])
+        return float(preferred[0])
+    text = dialogue.get("dialogue", "")
+    dialogue_rules = (rules or {}).get("dialogue", {})
+    profiles = (dialogue_rules.get("speech_profiles")
+                or dialogue_rules.get("speech_rates") or {})
+    band = (profiles.get(emotion) or profiles.get("daily")
+            or {"chars_per_second": [4, 5], "buffer_seconds": [0.5, 0.8]})
+    rate_range = band.get(
+        "chars_per_second", [band.get("min", 4), band.get("max", 5)])
+    rate = sum(float(x) for x in rate_range) / len(rate_range)
+    buffer_range = band.get("buffer_seconds", band.get("buffer", [0.5, 0.8]))
+    buffer_seconds = sum(float(x) for x in buffer_range) / len(buffer_range)
+    precision = (rules or {}).get("production", {}).get(
+        "time_precision_seconds", 0.5)
+    raw_duration = max(float(precision), len(text) / rate + buffer_seconds)
+    return _round_duration(raw_duration, precision)
+
+
+def _split_dialogue_text(text, max_chars):
+    """优先按自然停顿拆台词；仅在极端长词组时才做硬切。"""
+    if len(text) <= max_chars:
+        return [text]
+    tokens = re.findall(r"[^，。！？!?；;、,]+[，。！？!?；;、,~～]?", text)
+    pieces, current = [], ""
+    for token in tokens or [text]:
+        if current and len(current) + len(token) > max_chars:
+            pieces.append(current)
+            current = ""
+        while len(token) > max_chars:
+            if current:
+                pieces.append(current)
+                current = ""
+            pieces.append(token[:max_chars])
+            token = token[max_chars:]
+        current += token
+    if current:
+        pieces.append(current)
+    return [piece for piece in pieces if piece]
+
+
+def _split_dialogue_shots(raw_shots, rules):
+    dialogue_rules = rules.get("dialogue", {})
+    performance_rules = rules.get("performance", {})
+    if not dialogue_rules.get("split_at_natural_pause", True):
+        return [copy.deepcopy(raw) for raw in raw_shots]
+    max_chars = int(dialogue_rules.get("max_chars_per_shot", 25))
+    out = []
+    for raw in raw_shots:
+        dialogue = raw.get("dialogue")
+        if not dialogue:
+            out.append(copy.deepcopy(raw))
+            continue
+        working = copy.deepcopy(raw)
+        description = str(raw.get("description", ""))
+        physical_cues = (
+            "转身", "起身", "坐下", "跪", "握拳", "抬手", "扇", "推开",
+            "抓住", "摔", "冲向", "拔剑", "挥刀", "拥抱", "后退",
+        )
+        if (performance_rules.get("physical_action_separate_shot", True)
+                and any(cue in description for cue in physical_cues)):
+            physical = copy.deepcopy(raw)
+            physical["kind"] = "physical"
+            physical["dialogue"] = None
+            physical["duration"] = max(
+                2.0, min(4.0, float(raw.get("duration") or 3.0) / 2))
+            physical["prompt"] = f"独立肢体动作镜：{description}"
+            out.append(physical)
+            speaker = dialogue.get("character", "角色")
+            working["description"] = f"{speaker}完成动作后稳定状态，说出台词"
+            working["prompt"] = f"{speaker}说话，动作已在上一镜完成"
+        source = dialogue.get("dialogue", "")
+        parts = _split_dialogue_text(source, max_chars)
+        emotion = _emotion_band(working, dialogue_rules)
+        source_duration = sum(
+            _dialogue_duration({**dialogue, "dialogue": part}, rules, emotion)
+            for part in parts)
+        for part_index, part in enumerate(parts, 1):
+            split = copy.deepcopy(working)
+            split["dialogue"]["dialogue"] = part
+            split["dialogue_source"] = source
+            split["dialogue_part"] = {
+                "index": part_index, "total": len(parts),
+                "source_duration": source_duration,
+            }
+            split["duration"] = _dialogue_duration(
+                split["dialogue"], rules, emotion)
+            split["speech_emotion"] = emotion
+            out.append(split)
+    return out
+
+
+def _append_performance_beats(raw_shots, script, rules=None):
+    """关键台词后补听者反应镜，每场结尾补有内容的留白镜。"""
+    rules = rules or {}
+    performance_rules = rules.get("performance", {})
+    raw_shots = _split_dialogue_shots(raw_shots, rules)
+    add_reaction = performance_rules.get("reaction_after_key_dialogue", True)
+    reaction_ratio = float(performance_rules.get(
+        "listener_duration_ratio", performance_rules.get(
+            "reaction_min_ratio", 2 / 3)))
+    reaction_range = performance_rules.get(
+        "reaction_seconds", performance_rules.get(
+            "reaction_duration_seconds", [2, 4]))
+    beat_range = performance_rules.get(
+        "beat_seconds", performance_rules.get("beat_duration_seconds", [2, 4]))
+    add_beat = performance_rules.get("beat_at_emotional_peak", True)
+    scenes = _scene_map(script)
+    out = []
+    grouped = {}
+    for raw in raw_shots:
+        grouped.setdefault(raw.get("scene_no"), []).append(copy.deepcopy(raw))
+    for scene_no in sorted(grouped):
+        scene = scenes.get(scene_no, {})
+        scene_people = list(scene.get("characters", []))
+        for raw in grouped[scene_no]:
+            out.append(raw)
+            dialogue = raw.get("dialogue")
+            part = raw.get("dialogue_part") or {"index": 1, "total": 1}
+            if (not dialogue or not add_reaction
+                    or part.get("index") != part.get("total")):
+                continue
+            speaker = dialogue.get("character")
+            listeners = [name for name in scene_people if name != speaker]
+            if listeners:
+                out.append({
+                    "scene_no": scene_no,
+                    "kind": "reaction",
+                    "description": f"{listeners[0]}消化{speaker}刚说的话，眼神发生变化",
+                    "camera": "近景微推",
+                    # 听者镜头 ≥ 当前说话镜的 2/3 是硬规则；reaction_seconds
+                    # 仅作为常规建议区间，不能反过来截短有效反应。
+                    "duration": max(
+                        float(reaction_range[0]),
+                        float(raw.get("duration", 3)) * reaction_ratio),
+                    "characters": listeners[:2],
+                    "dialogue": None,
+                    "prompt": f"{listeners[0]}听完{speaker}的话后的近景反应",
+                    "source_dialogue": dialogue.get("dialogue", ""),
+                })
+        lead = scene_people[:1]
+        if lead and add_beat:
+            out.append({
+                "scene_no": scene_no,
+                "kind": "beat",
+                "description": f"{lead[0]}用呼吸、眼神和细微肢体完成本场情绪余波",
+                "camera": "特写定镜",
+                "duration": sum(float(x) for x in beat_range) / len(beat_range),
+                "characters": lead,
+                "dialogue": None,
+                "prompt": f"{lead[0]}无台词留白表演，具体微表情与呼吸变化",
+            })
+    return out
+
+
+def enrich_storyboard(script, storyboard, continuity, profile, style=""):
+    """把 Provider 的轻量分镜升级为五维生产分镜。"""
+    rules = profile.get("rules", {})
+    scenes = _scene_map(script)
+    raw_shots = _append_performance_beats(
+        storyboard.get("shots", []), script, rules)
+    previous = {}
+    shots = []
+    elapsed = 0.0
+    for index, raw in enumerate(raw_shots, 1):
+        scene = scenes.get(raw.get("scene_no"), {})
+        kind = raw.get("kind") or ("dialogue" if raw.get("dialogue") else "environment")
+        characters = list(dict.fromkeys(raw.get("characters", [])))
+        if not characters:
+            characters = list(scene.get("characters", []))[:1]
+        start_state = {
+            name: copy.deepcopy(previous.get(name) or _state(name, continuity))
+            for name in characters
+        }
+        emotion = "消化信息" if kind == "reaction" else (
+            "情绪余波" if kind == "beat" else "推进事件")
+        end_state = {
+            name: _state(
+                name, continuity, emotion=emotion,
+                pose="保持原位，完成眼神与呼吸变化" if kind in ("reaction", "beat")
+                else "完成本镜主要动作，重心可供下一镜继承")
+            for name in characters
+        }
+        previous.update(copy.deepcopy(end_state))
+        camera = _camera_plan(raw.get("camera", ""), kind, index, rules)
+        text_asset = _text_asset(raw, rules)
+        dialogue = raw.get("dialogue")
+        speech_emotion = raw.get("speech_emotion") or _emotion_band(
+            raw, rules.get("dialogue", {}))
+        duration = float(raw.get("duration") or _dialogue_duration(
+            dialogue, rules, speech_emotion))
+        if kind == "dialogue":
+            duration = max(duration, _dialogue_duration(
+                dialogue, rules, speech_emotion))
+        precision = float(profile.get("time_precision_seconds", 0.5))
+        duration = min(
+            profile["max_segment_seconds"], _round_duration(duration, precision))
+        start_time = elapsed
+        elapsed = round(elapsed + duration, 3)
+        timecode = f"{_format_timecode(start_time)}-{_format_timecode(elapsed)}"
+        script_reference = (raw.get("dialogue_source")
+                            or (dialogue or {}).get("dialogue")
+                            or raw.get("description")
+                            or scene.get("action", ""))
+        people = "、".join(characters) or "无人"
+        end_summary = "；".join(
+            f"{name}{state['pose']}" for name, state in end_state.items())
+        text_rule = ("保持首帧中文字完全一致，不新增文字" if text_asset["required"]
+                     else "不生成字幕条或任何画面文字")
+        seedance_prompt = (
+            f"使用首帧参考。画面内人物：{people}，共{len(characters)}人，"
+            f"禁止新增或复制人物。{text_rule}。"
+            f"动作：{raw.get('description', '')}。"
+            f"镜头：{camera['shot_scale']}·{camera['angle']}·{camera['movement']}。"
+            f"结尾：{end_summary}。"
+        )
+        station = "；".join(
+            f"{name}{state['position']}" for name, state in start_state.items())
+        gaze = "主体 → 凝视/瞥向 → 对手或核心物件"
+        micro_expression = "眉眼变化·下颌张力·呼吸节奏"
+        performance_goal = raw.get("description") or "完成本镜叙事任务"
+        environment_sound = (
+            f"{scene.get('location', '场景')}环境底噪·空间空气声·动作触发声")
+        visual_hook = "主体视线或动作方向承接下一镜"
+        sound_design = {
+            "environment": environment_sound,
+            "effects": "动作发生时同步真实拟音",
+            "music": "无BGM" if rules.get("delivery", {}).get(
+                "no_bgm", True) else "按项目音乐策略",
+        }
+        shot_contract = {
+            "时间码": timecode,
+            "景别": camera["shot_scale"],
+            "角度": camera["angle"],
+            "焦段": camera["lens"],
+            "机位": camera["camera_position"],
+            "运镜": camera["movement"],
+            "构图": camera["composition"],
+            "拍摄速度": camera["speed"],
+            "站位": station or "画面中",
+            "视线": gaze,
+            "画面内容描述": raw.get("description", ""),
+            "台词": (dialogue or {}).get("dialogue", ""),
+            "表演重点": performance_goal,
+            "微表情": micro_expression,
+            "音效": environment_sound,
+            "视觉钩子": visual_hook,
+            "镜头功能": SHOT_FUNCTIONS.get(kind, "信息交代"),
+        }
+        shot = {
+            **raw,
+            "shot_no": index,
+            "unit_id": f"U{index:02d}",
+            "pipeline_version": PIPELINE_VERSION,
+            "kind": kind,
+            "duration": duration,
+            "timecode": timecode,
+            "characters": characters,
+            "character_count": len(characters),
+            "type_word": _type_word(scene, raw),
+            "shot_function": SHOT_FUNCTIONS.get(kind, "信息交代"),
+            "start_state": start_state,
+            "end_state": end_state,
+            "script_reference": script_reference,
+            "readable_text": text_asset,
+            "visual_hook": visual_hook,
+            "performance": {
+                "goal": performance_goal,
+                "gaze": gaze,
+                "micro_expression": micro_expression,
+                "beat": kind if kind in ("reaction", "beat") else "acting",
+            },
+            "speech_timing": ({
+                "emotion": speech_emotion,
+                "source_dialogue": raw.get("dialogue_source")
+                    or (dialogue or {}).get("dialogue", ""),
+                "part": copy.deepcopy(raw.get("dialogue_part", {})),
+            } if dialogue else None),
+            "sound_design": sound_design,
+            "shot_contract": shot_contract,
+            "five_dimensions": {
+                "subject_motion": raw.get("description") or "主体保持明确动势",
+                "environment_light": f"{scene.get('location', '')}参与叙事，主光方向稳定",
+                "camera_design": camera,
+                "time_state": {
+                    "start": "继承上一镜结尾状态",
+                    "evolution": f"{raw.get('description', '')} → {emotion}",
+                    "end": end_summary,
+                },
+                "aesthetics": {
+                    "style": style or "项目既定美术风格",
+                    "render": "高反差、暗部保留层次、轻微胶片颗粒",
+                    "purpose": "服务事件可读性与角色情绪",
+                },
+            },
+            "seedance_prompt": seedance_prompt,
+            "transition": "硬切",
+        }
+        shots.append(shot)
+    return {
+        "episode_title": storyboard.get("episode_title", script.get("episode_title", "")),
+        "pipeline_version": PIPELINE_VERSION,
+        "profile": copy.deepcopy(profile),
+        "standard_fingerprint": profile.get("standard_fingerprint", ""),
+        "total_duration": elapsed,
+        "shots": shots,
+    }
+
+
+def lock_text_assets(storyboard, image_uris, provider_name):
+    """关键帧落盘后锁定所有可读文字资产。"""
+    locked = copy.deepcopy(storyboard)
+    manifest = []
+    for shot in locked.get("shots", []):
+        asset = shot.get("readable_text") or {}
+        if not asset.get("required"):
+            continue
+        uri = image_uris.get(shot["shot_no"], "")
+        if uri:
+            asset["locked_by"] = provider_name
+            asset["keyframe_uri"] = uri
+        manifest.append({
+            "unit_id": shot.get("unit_id"),
+            "shot_no": shot["shot_no"],
+            "carrier": asset.get("carrier", ""),
+            "whitelist": asset.get("whitelist", []),
+            "locked_by": asset.get("locked_by", ""),
+            "keyframe_uri": asset.get("keyframe_uri", ""),
+        })
+    return locked, {
+        "pipeline_version": PIPELINE_VERSION,
+        "assets": manifest,
+        "passed": all(item["locked_by"] and item["keyframe_uri"] for item in manifest),
+        "note": "无文字镜头自动通过" if not manifest else "逐字白名单已绑定关键帧",
+    }
+
+
+def _gate(gate_id, label, passed, detail):
+    return {"id": gate_id, "label": label, "passed": bool(passed), "detail": detail}
+
+
+def build_preflight(script, storyboard, continuity, text_manifest, frames, profile):
+    shots = storyboard.get("shots", [])
+    rules = profile.get("rules", {})
+    production_rules = rules.get("production", {})
+    dialogue_rules = rules.get("dialogue", {})
+    performance_rules = rules.get("performance", {})
+    storyboard_rules = rules.get("storyboard", {})
+    gate_config = {
+        item.get("id"): item for item in rules.get("quality_gates", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    frame_map = {f["shot_no"]: f for f in frames}
+    required = (
+        "unit_id", "character_count", "start_state", "end_state",
+        "shot_function", "script_reference", "readable_text", "visual_hook",
+        "performance", "five_dimensions", "seedance_prompt", "shot_contract",
+        "sound_design", "timecode",
+    )
+    precision = float(profile.get("time_precision_seconds", 0.5))
+    config_ok = (
+        profile["video_model"] == "seedance2.0fast_vip"
+        and profile["resolution"].lower() == "720p"
+        and profile["voice"] == "jimeng_builtin"
+        and profile["lip_sync"]
+        and not profile["burn_subtitles"]
+    )
+    script_dialogue = [
+        (scene.get("scene_no"), line.get("character"), line.get("dialogue", ""))
+        for scene in script.get("scenes", []) for line in scene.get("lines", [])
+    ]
+    storyboard_dialogue = []
+    dialogue_lengths_ok = True
+    max_chars = int(dialogue_rules.get("max_chars_per_shot", 25))
+    for shot in shots:
+        dialogue = shot.get("dialogue")
+        if not dialogue:
+            continue
+        part = shot.get("dialogue_part") or {"index": 1, "total": 1}
+        if part.get("index", 1) == 1:
+            storyboard_dialogue.append((
+                shot.get("scene_no"), dialogue.get("character"),
+                shot.get("dialogue_source") or dialogue.get("dialogue", "")))
+        dialogue_lengths_ok = dialogue_lengths_ok and (
+            len(dialogue.get("dialogue", "")) <= max_chars)
+
+    reaction_ok = True
+    reaction_ratio = float(performance_rules.get(
+        "listener_duration_ratio", performance_rules.get(
+            "reaction_min_ratio", 2 / 3)))
+    if performance_rules.get("reaction_after_key_dialogue", True):
+        scene_people = {
+            scene.get("scene_no"): set(scene.get("characters", []))
+            for scene in script.get("scenes", [])
+        }
+        for index, shot in enumerate(shots):
+            dialogue = shot.get("dialogue")
+            part = shot.get("dialogue_part") or {"index": 1, "total": 1}
+            if (not dialogue or part.get("index") != part.get("total")
+                    or len(scene_people.get(shot.get("scene_no"), set())) < 2):
+                continue
+            following = shots[index + 1] if index + 1 < len(shots) else {}
+            reaction_ok = reaction_ok and (
+                following.get("kind") == "reaction"
+                and float(following.get("duration", 0)) + 1e-9
+                >= float(shot.get("duration", 0)) * reaction_ratio)
+
+    beat_ok = True
+    if performance_rules.get("beat_at_emotional_peak", True):
+        beat_range = performance_rules.get(
+            "beat_seconds", performance_rules.get(
+                "beat_duration_seconds", [2, 4]))
+        for scene in script.get("scenes", []):
+            beats = [shot for shot in shots
+                     if shot.get("scene_no") == scene.get("scene_no")
+                     and shot.get("kind") == "beat"]
+            beat_ok = beat_ok and bool(beats) and all(
+                float(beat_range[0]) <= float(shot.get("duration", 0))
+                <= float(beat_range[1]) for shot in beats)
+
+    required_columns = storyboard_rules.get("required_columns", [
+        "时间码", "景别", "角度", "焦段", "机位", "运镜", "构图", "拍摄速度",
+        "站位", "视线", "画面内容描述", "台词", "表演重点", "微表情", "音效",
+        "视觉钩子", "镜头功能",
+    ])
+    contract_ok = bool(shots) and all(
+        all(column in (shot.get("shot_contract") or {})
+            for column in required_columns) for shot in shots)
+    sound_required = (storyboard_rules.get("environment_sound_required", True)
+                      or rules.get("delivery", {}).get(
+                          "environment_sound_required", True))
+    sound_ok = bool(shots) and (not sound_required or all(
+        bool((shot.get("sound_design") or {}).get("environment"))
+        for shot in shots))
+
+    min_angles = int(storyboard_rules.get(
+        "minimum_vertical_angles_per_segment", storyboard_rules.get(
+            "min_vertical_angles_per_segment", 2)))
+    camera_ok = True
+    scale_library = rules.get("camera_library", {}).get("shot_scales", [])
+    jump_levels = int(storyboard_rules.get(
+        "adjacent_shot_scale_jump_levels", 2))
+    axis_change = float(storyboard_rules.get(
+        "adjacent_camera_axis_change_degrees", 30))
+    for scene in script.get("scenes", []):
+        scene_shots = [shot for shot in shots
+                       if shot.get("scene_no") == scene.get("scene_no")]
+        angles = {
+            ((shot.get("five_dimensions") or {}).get("camera_design") or {}).get(
+                "angle") for shot in scene_shots
+        }
+        angles.discard(None)
+        camera_ok = camera_ok and len(angles) >= min(
+            min_angles, len(scene_shots))
+        for previous_shot, current_shot in zip(scene_shots, scene_shots[1:]):
+            previous_camera = ((previous_shot.get("five_dimensions") or {}).get(
+                "camera_design") or {})
+            current_camera = ((current_shot.get("five_dimensions") or {}).get(
+                "camera_design") or {})
+            try:
+                scale_jump = abs(
+                    scale_library.index(previous_camera.get("shot_scale"))
+                    - scale_library.index(current_camera.get("shot_scale")))
+            except ValueError:
+                scale_jump = 0
+            offset_jump = abs(
+                float(previous_camera.get("axis_offset_degrees", 0))
+                - float(current_camera.get("axis_offset_degrees", 0)))
+            if storyboard_rules.get("forbid_repeated_scale_and_angle", True):
+                camera_ok = camera_ok and (
+                    scale_jump >= jump_levels or offset_jump >= axis_change)
+
+    cast = {character.get("name") for character in continuity.get("characters", [])}
+    people_ok = all(
+        shot.get("character_count") == len(shot.get("characters", []))
+        and set(shot.get("characters", [])) <= cast
+        for shot in shots)
+    available_gates = [
+        _gate("continuity", "连续性圣经", bool(continuity.get("characters"))
+              and bool(continuity.get("scenes"))
+              and continuity.get("standard_fingerprint") == profile.get(
+                  "standard_fingerprint"), "角色、场景、文字规则与本集标准已锁定"),
+        _gate("five_dimensions", "五维分镜字段", bool(shots) and all(
+            all(key in shot for key in required) for shot in shots)
+            and contract_ok,
+            f"{len(shots)} 个单元均含五维参数与 {len(required_columns)} 列镜头合同"),
+        _gate("duration", "时长与时间粒度", bool(shots) and all(
+            0 < float(shot.get("duration", 0)) <= profile["max_segment_seconds"]
+            and abs(float(shot["duration"]) / precision
+                    - round(float(shot["duration"]) / precision)) < 1e-7
+            for shot in shots),
+            f"时间码精确到{precision:g}秒，单元不超过{profile['max_segment_seconds']:g}秒"),
+        _gate("dialogue", "台词保真与语速", script_dialogue == storyboard_dialogue
+              and dialogue_lengths_ok,
+              f"原台词逐字覆盖，单镜台词不超过 {max_chars} 字并按情绪计算语速"),
+        _gate("performance", "反应镜与表演节拍", reaction_ok and beat_ok
+              and (not performance_rules.get("performance_goal_required", True)
+                   or all(bool((shot.get("performance") or {}).get("goal"))
+                          for shot in shots)),
+              "关键台词后保留听者反应，高潮含2–4秒留白，逐镜有表演目标"),
+        _gate("camera", "镜头语言与防重复", camera_ok,
+              f"每段至少 {min_angles} 种纵向角度；相邻景别跳 {jump_levels} 级"
+              f"或机位偏转 {axis_change:g}°"),
+        _gate("people", "人物数量", people_ok,
+              "人物名单与人数逐单元一致，禁止新增路人"),
+        _gate("text", "文字关键帧", bool(text_manifest.get("passed", False)),
+              text_manifest.get("note", "")),
+        _gate("frames", "首尾帧与段间状态", len(frame_map) == len(shots)
+              and all(f.get("first") and f.get("last") for f in frames),
+              f"{len(frame_map)}/{len(shots)} 个单元首尾帧就绪"),
+        _gate("audio", "环境声与声音策略", sound_ok,
+              "每镜均含环境声设计，声音与空间共同参与叙事"),
+        _gate("profile", "即梦生产配置", config_ok,
+              "Seedance 2.0 Fast VIP / 720P / 随视频配音与口型 / 无字幕母版"),
+    ]
+    gates = []
+    for gate in available_gates:
+        setting = gate_config.get(gate["id"], {})
+        if setting.get("enabled", True) is False:
+            continue
+        if setting.get("label"):
+            gate["label"] = setting["label"]
+        gate["severity"] = setting.get("severity", "hard")
+        gates.append(gate)
+    return {
+        "pipeline_version": PIPELINE_VERSION,
+        "standard_fingerprint": profile.get("standard_fingerprint", ""),
+        "standard_version": profile.get("standard_version"),
+        "passed": all(gate["passed"] for gate in gates
+                      if gate.get("severity") != "warning"),
+        "gates": gates,
+        "profile": copy.deepcopy(profile),
+        "script_lines": sum(len(s.get("lines", [])) for s in script.get("scenes", [])),
+        "units": len(shots),
+    }
+
+
+def build_content_review(script, storyboard, continuity):
+    cast = {c["name"] for c in continuity.get("characters", [])}
+    units = []
+    for shot in storyboard.get("shots", []):
+        characters_ok = set(shot.get("characters", [])) <= cast
+        text_asset = shot.get("readable_text") or {}
+        text_ok = not text_asset.get("required") or bool(text_asset.get("locked_by"))
+        event_ok = bool(shot.get("script_reference"))
+        passed = characters_ok and text_ok and event_ok
+        units.append({
+            "unit_id": shot.get("unit_id"),
+            "script_reference": shot.get("script_reference", ""),
+            "event_visible": event_ok,
+            "character_consistency": characters_ok,
+            "costume_consistency": bool(continuity.get("characters")),
+            "prop_scene_consistency": bool(continuity.get("scenes")),
+            "text_accuracy": text_ok if text_asset.get("required") else None,
+            "drift_issue": "" if passed else "结构化映射或文字锁定缺失",
+            "verdict": "PASS" if passed else "FAIL",
+        })
+    return {
+        "pipeline_version": PIPELINE_VERSION,
+        "standard_fingerprint": storyboard.get("standard_fingerprint", ""),
+        "passed": bool(units) and all(u["verdict"] == "PASS" for u in units),
+        "review_basis": "剧本映射 + 连续性圣经 + 关键帧/首尾帧检查板",
+        "units": units,
+    }
+
+
+def write_review_board(ctx, content_review):
+    """生成可在浏览器打开的逐段图文检查板。"""
+    out_root = Path(ctx["out_root"])
+    path = out_root / "review_board.html"
+    images = {i["shot_no"]: i.get("uri", "") for i in ctx.get("images", [])}
+    frames = {f["shot_no"]: f for f in ctx.get("frames", [])}
+    rows = []
+    review_map = {u["unit_id"]: u for u in content_review.get("units", [])}
+    profile = (ctx.get("storyboard") or {}).get("profile", {})
+    for shot in ctx["storyboard"].get("shots", []):
+        frame = frames.get(shot["shot_no"], {})
+        review = review_map.get(shot.get("unit_id"), {})
+        thumbs = []
+        for label, uri in (("关键帧", images.get(shot["shot_no"])),
+                           ("首帧", frame.get("first")),
+                           ("尾帧", frame.get("last"))):
+            if uri and not uri.startswith(("http://", "https://")):
+                uri = Path(uri).resolve().as_uri()
+            if uri:
+                thumbs.append(
+                    f'<figure><img src="{html.escape(uri)}"><figcaption>{label}</figcaption></figure>')
+        rows.append(
+            f'<section><header><b>{shot.get("unit_id")}</b> '
+            f'<span>{html.escape(shot.get("shot_function", ""))} · '
+            f'{shot.get("duration")}s · {review.get("verdict", "PENDING")}</span></header>'
+            f'<p>剧本对应：{html.escape(shot.get("script_reference", ""))}</p>'
+            f'<div class="thumbs">{"".join(thumbs)}</div></section>')
+    document = """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AIFOS 图文检查板</title>
+<style>body{font:14px system-ui;background:#0d0d0d;color:#fff;margin:24px}.meta{background:#12243a;border:1px solid #31567e;border-radius:12px;padding:14px}.meta small{display:block;color:#9fb4cb;margin-top:4px}section{background:#1a1a19;border:1px solid #333;border-radius:12px;padding:14px;margin:12px 0}header{display:flex;justify-content:space-between}p{color:#bbb}.thumbs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}figure{margin:0}img{width:100%;max-height:360px;object-fit:contain;background:#111}figcaption{color:#999;text-align:center}</style>"""
+    standard_meta = (
+        f'<div class="meta"><b>{html.escape(profile.get("standard_name", "SK 五维漫剧标准"))} '
+        f'v{profile.get("standard_version", 1)}</b><small>制作标准指纹：'
+        f'{html.escape(profile.get("standard_fingerprint", ""))}</small></div>')
+    path.write_text(
+        document + standard_meta + "".join(rows) + "</html>",
+        encoding="utf-8")
+    return str(path)
+
+
+def write_delivery_verifier(ctx, review_board, content_review):
+    """落盘并实际运行每集交付复核脚本。"""
+    out_root = Path(ctx["out_root"])
+    script_path = out_root / "check-delivery.py"
+    expected = {
+        "files": [
+            *(i.get("uri", "") for i in ctx.get("images", [])),
+            *(f.get(key, "") for f in ctx.get("frames", []) for key in ("first", "last")),
+            *(v.get("uri", "") for v in ctx.get("videos", [])),
+            ctx.get("final_uri", ""), review_board,
+        ],
+        "unit_count": len(ctx["storyboard"].get("shots", [])),
+        "image_count": len(ctx.get("images", [])),
+        "frame_count": len(ctx.get("frames", [])),
+        "video_count": len(ctx.get("videos", [])),
+        "final_uri": ctx.get("final_uri", ""),
+        "width": ctx.get("dims", {}).get("width"),
+        "height": ctx.get("dims", {}).get("height"),
+        "duration": sum(float(s.get("duration", 0))
+                        for s in ctx["storyboard"].get("shots", [])),
+        "content_review_passed": bool(content_review.get("passed")),
+        "standard_fingerprint": ctx.get("production_profile", {}).get(
+            "standard_fingerprint", ""),
+    }
+    body = """import json
+from pathlib import Path
+
+EXPECTED = __EXPECTED__
+missing = [p for p in EXPECTED["files"] if p and not p.startswith(("http://", "https://")) and not Path(p).exists()]
+counts_ok = (EXPECTED["unit_count"] == EXPECTED["image_count"] == EXPECTED["frame_count"] == EXPECTED["video_count"])
+final_ok = bool(EXPECTED["final_uri"])
+standard_ok = bool(EXPECTED["standard_fingerprint"])
+if final_ok and EXPECTED["final_uri"].endswith(".json") and Path(EXPECTED["final_uri"]).exists():
+    data = json.loads(Path(EXPECTED["final_uri"]).read_text(encoding="utf-8"))
+    final_ok = data.get("shot_count") == EXPECTED["unit_count"] and data.get("total_duration", 0) > 0
+result = {
+    "passed": not missing and counts_ok and final_ok and standard_ok and EXPECTED["content_review_passed"],
+    "missing": missing, "counts_ok": counts_ok, "final_ok": final_ok,
+    "content_review_passed": EXPECTED["content_review_passed"],
+    "resolution": [EXPECTED["width"], EXPECTED["height"]],
+    "duration": EXPECTED["duration"], "unit_count": EXPECTED["unit_count"],
+    "standard_fingerprint": EXPECTED["standard_fingerprint"],
+    "standard_ok": standard_ok,
+}
+print(json.dumps(result, ensure_ascii=False))
+raise SystemExit(0 if result["passed"] else 1)
+""".replace("__EXPECTED__", repr(expected))
+    script_path.write_text(body, encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(script_path)], capture_output=True, text=True,
+        timeout=30)
+    try:
+        result = json.loads((proc.stdout or "{}").splitlines()[-1])
+    except (ValueError, IndexError):
+        result = {"passed": False, "error": proc.stderr.strip() or "复核脚本无有效输出"}
+    result["script"] = str(script_path)
+    result["executed"] = True
+    result_path = out_root / "delivery_check.json"
+    result_path.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result

@@ -1,9 +1,13 @@
-/* AIFOS 控制台单页应用:仪表盘 + 分镜画布(原生 JS,零依赖) */
+/* AIFOS V3.2 工作台:生产总览 + 制作标准中心 + 分镜画布(原生 JS,零依赖) */
 "use strict";
 
 const app = document.getElementById("app");
 const topbarRight = document.getElementById("topbar-right");
 let pollTimer = null;
+let standardsDraft = null;
+let standardsBaseline = null;
+let standardsMeta = null;
+let standardsDirty = false;
 
 /* ---------- 工具 ---------- */
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
@@ -13,7 +17,11 @@ const fmt = (n, d = 2) => n == null ? "-" : Number(n).toFixed(d);
 async function api(path, opts) {
   const res = await fetch(path, opts);
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  if (!res.ok) {
+    const error = new Error(data.message || data.error || `HTTP ${res.status}`);
+    error.details = data;
+    throw error;
+  }
   return data;
 }
 
@@ -22,6 +30,7 @@ function showToast(message, kind = "info") {
   document.querySelectorAll(".toast").forEach((t) => t.remove());
   const toast = document.createElement("div");
   toast.className = `toast ${kind}`;
+  toast.setAttribute("role", kind === "error" ? "alert" : "status");
   toast.textContent = message;
   document.body.appendChild(toast);
   setTimeout(() => toast.remove(), 5000);
@@ -48,9 +57,10 @@ function armConfirm(btn, label, action) {
 
 const STATUS_CN = {
   done: "完成", failed: "失败", qc_failed: "质检未过", created: "已建",
-  awaiting_confirm: "待确认", script: "剧本中", cast: "画人物场景",
-  storyboard: "分镜中", images: "出图中",
-  frames: "首尾帧", videos: "视频中", voices: "配音中", edit: "剪辑中",
+  awaiting_confirm: "待确认", script: "剧本中", continuity: "锁连续性",
+  cast: "画人物场景", storyboard: "五维分镜中", images: "关键帧中",
+  text_assets: "锁文字", frames: "首尾帧", preflight: "门禁检查",
+  videos: "视频中", voices: "声音/口型", edit: "剪辑中",
   qc: "质检中", package: "包装中", archive: "沉淀中", running: "制作中",
 };
 function chip(status) {
@@ -60,15 +70,459 @@ function chip(status) {
 }
 
 /* ---------- 路由 ---------- */
-window.addEventListener("hashchange", route);
-route();
-
 function route() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  const standards = location.hash.match(/^#\/standards(?:\/([a-z_]+))?$/);
   const m = location.hash.match(/^#\/episode\/(\d+)$/);
-  if (m) renderCanvasView(Number(m[1]));
-  else if (location.hash === "#/settings") renderSettings();
+  const settings = location.hash === "#/settings";
+  const area = standards ? "standards" : settings ? "settings" : "dashboard";
+  document.querySelectorAll(".main-nav a").forEach((link) => {
+    const active = link.dataset.nav === area;
+    link.classList.toggle("active", active);
+    if (active) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  });
+  if (standards) renderStandards(standards[1] || "production");
+  else if (m) renderCanvasView(Number(m[1]));
+  else if (settings) renderSettings();
   else renderDashboard();
+}
+
+/* ================= 制作标准中心 ================= */
+const STANDARD_SECTIONS = [
+  {
+    id: "production", label: "基础生产", icon: "01",
+    blurb: "决定视频模型、画质、声音、字幕与每个生成单元的基本边界。",
+    fields: [
+      { path: "name", label: "标准名称", help: "用于新剧集快照、版本历史和交付包标识。" },
+      { path: "description", label: "标准说明", help: "写清适用题材、画面目标和团队共识。" },
+      { path: "profile_key", label: "标准标识", locked: true, help: "版本链的稳定标识，保存后不可更换。" },
+      { path: "rules.production.video_model", label: "视频模型", locked: true,
+        help: "锁定 Seedance 2.0 Fast VIP；遇到真人脸限制时暂停，不静默切普通 VIP。" },
+      { path: "rules.production.resolution", label: "输出分辨率", locked: true,
+        help: "当前标准锁定 720P，避免不同阶段分辨率漂移。" },
+      { path: "rules.production.voice", label: "对白声音", locked: true,
+        help: "Seedance2 在视频单元内同步生成角色人声与口型；豆包 TTS 仅作为无声视频兼容模式的备选。" },
+      { path: "rules.production.lip_sync", label: "即梦对口型", type: "boolean", locked: true,
+        help: "硬规则：必须开启。" },
+      { path: "rules.production.burn_subtitles", label: "烧录对白字幕", type: "boolean", locked: true,
+        help: "硬规则：保持关闭，交付无字幕母版。" },
+      { path: "rules.production.text_lock_provider", label: "文字关键帧 Provider",
+        help: "画面出现手机屏、合同、门牌等可读文字时，先用关键帧逐字锁定。" },
+      { path: "rules.production.fast_vip_real_face_conflict", label: "真人脸受限策略", locked: true,
+        help: "固定为 pause_for_confirmation，需要人工决定，不自动降级模型。" },
+    ],
+  },
+  {
+    id: "timing", label: "分段节奏", icon: "02",
+    blurb: "控制镜头时长、生成粒度和长台词拆分，直接影响节奏与生成成本。",
+    fields: [
+      { path: "rules.production.preferred_segment_seconds", label: "建议单元时长", type: "range", min: 1, max: 15, step: .5, unit: "秒",
+        help: "优先把一个动作或一句台词控制在这个区间。" },
+      { path: "rules.production.max_segment_seconds", label: "单元最长时长", type: "number", min: 5, max: 15, step: .5, unit: "秒",
+        help: "任何 Seedance 单元不得超过此上限。" },
+      { path: "rules.production.time_precision_seconds", label: "时间码精度", type: "number", min: .5, max: 2, step: .5, unit: "秒",
+        help: "镜头时长会向上对齐到该粒度。" },
+      { path: "rules.dialogue.max_chars_per_shot", label: "单镜台词上限", type: "number", min: 8, max: 25, step: 1, unit: "字",
+        help: "超过上限时优先在逗号、句号、问号等自然停顿处拆镜。" },
+      { path: "rules.dialogue.preserve_verbatim", label: "台词逐字保真", type: "boolean",
+        help: "禁止改写、缩写、意译或同义替换。" },
+      { path: "rules.dialogue.split_at_natural_pause", label: "只在自然停顿拆分", type: "boolean",
+        help: "避免把词组从中间切断。" },
+    ],
+  },
+  {
+    id: "dialogue", label: "台词与表演", icon: "03",
+    blurb: "语速跟随情绪，台词后给听者反应，高点给演员留白。",
+    fields: [
+      { path: "rules.dialogue.speech_profiles.tense_angry.chars_per_second", label: "紧张/愤怒语速", type: "range", min: 1, max: 10, step: .5, unit: "字/秒" },
+      { path: "rules.dialogue.speech_profiles.tense_angry.buffer_seconds", label: "紧张/愤怒缓冲", type: "range", min: 0, max: 3, step: .1, unit: "秒" },
+      { path: "rules.dialogue.speech_profiles.daily.chars_per_second", label: "日常语速", type: "range", min: 1, max: 10, step: .5, unit: "字/秒" },
+      { path: "rules.dialogue.speech_profiles.daily.buffer_seconds", label: "日常缓冲", type: "range", min: 0, max: 3, step: .1, unit: "秒" },
+      { path: "rules.dialogue.speech_profiles.sad_gentle.chars_per_second", label: "悲伤/温柔语速", type: "range", min: 1, max: 10, step: .5, unit: "字/秒" },
+      { path: "rules.dialogue.speech_profiles.sad_gentle.buffer_seconds", label: "悲伤/温柔缓冲", type: "range", min: 0, max: 3, step: .1, unit: "秒" },
+      { path: "rules.dialogue.speech_profiles.trembling.chars_per_second", label: "颤抖/哽咽语速", type: "range", min: 1, max: 10, step: .5, unit: "字/秒" },
+      { path: "rules.dialogue.speech_profiles.trembling.buffer_seconds", label: "颤抖/哽咽缓冲", type: "range", min: 0, max: 3, step: .1, unit: "秒" },
+      { path: "rules.performance.reaction_after_key_dialogue", label: "关键台词后补反应镜", type: "boolean",
+        help: "有听者时，不能说完就切走。" },
+      { path: "rules.performance.listener_duration_ratio", label: "听者反应镜最短比例", type: "number", min: .6667, max: 1, step: .01, unit: "×说话镜",
+        help: "默认不少于说话者镜头的 2/3。" },
+      { path: "rules.performance.reaction_seconds", label: "反应镜建议范围", type: "range", min: .5, max: 10, step: .5, unit: "秒", help: "作为常规范围；若与听者时长比例冲突，2/3 比例优先。" },
+      { path: "rules.performance.beat_seconds", label: "情绪留白时长", type: "range", min: 2, max: 4, step: .5, unit: "秒" },
+      { path: "rules.performance.physical_action_separate_shot", label: "重要肢体动作独立成镜", type: "boolean" },
+      { path: "rules.performance.performance_goal_required", label: "逐镜表演目标必填", type: "boolean" },
+    ],
+  },
+  {
+    id: "continuity", label: "人物连续性", icon: "04",
+    blurb: "锁定角色、服装、道具、空间和每段起止状态，避免人物与场景漂移。",
+    fields: [
+      { path: "rules.continuity.on_stage_characters_only", label: "禁止新增路人与复制人物", type: "boolean" },
+      { path: "rules.continuity.character_count_lock", label: "逐镜人物数量锁定", type: "boolean" },
+      { path: "rules.continuity.end_state_to_next_start", label: "首尾状态必须完整继承", type: "boolean" },
+      { path: "rules.continuity.canonical_entity_names", label: "同一实体全程同名", type: "boolean" },
+      { path: "rules.continuity.costume_and_prop_lock", label: "服装与关键道具锁定", type: "boolean" },
+      { path: "rules.continuity.scene_change_starts_new_segment", label: "换场景强制新段", type: "boolean" },
+      { path: "rules.continuity.position_uses_frame_geometry", label: "站位使用画面几何", type: "boolean" },
+      { path: "rules.continuity.state_labels", label: "角色状态字段", type: "list", locked: true,
+        help: "每段节头和节尾都必须记录这些字段。" },
+    ],
+  },
+  {
+    id: "storyboard", label: "五维镜头", icon: "05",
+    blurb: "把轻量分镜升级为可执行的摄影合同，而不是一段泛化提示词。",
+    fields: [
+      { path: "rules.storyboard.minimum_vertical_angles_per_segment", label: "每段纵向角度数量", type: "number", min: 2, max: 4, step: 1 },
+      { path: "rules.storyboard.adjacent_shot_scale_jump_levels", label: "相邻景别最小跳级", type: "number", min: 1, max: 4, step: 1 },
+      { path: "rules.storyboard.adjacent_camera_axis_change_degrees", label: "替代机位偏转", type: "number", min: 15, max: 180, step: 5, unit: "°" },
+      { path: "rules.storyboard.environment_sound_required", label: "逐镜环境声必填", type: "boolean" },
+      { path: "rules.storyboard.forbid_repeated_scale_and_angle", label: "禁止连续同景别同角度", type: "boolean" },
+      { path: "rules.storyboard.visual_hook_required", label: "逐镜视觉钩子必填", type: "boolean" },
+      { path: "rules.storyboard.eye_line_required", label: "逐镜视线关系必填", type: "boolean" },
+      { path: "rules.storyboard.required_columns", label: "镜头合同字段", type: "list",
+        help: "标准模板为 17 列：时间码、摄影、站位、视线、表演、音效与镜头功能。" },
+      { path: "rules.storyboard.scene_type_words", label: "段落类型词", type: "list",
+        help: "每段必须从类型词库中选择一个。" },
+      { path: "rules.storyboard.shot_functions", label: "镜头功能词库", type: "list" },
+    ],
+  },
+  {
+    id: "text_audio", label: "文字与声音", icon: "06",
+    blurb: "可读文字先锁关键帧；对白不做字幕条；环境声是氛围的核心层。",
+    fields: [
+      { path: "rules.production.text_lock_provider", label: "可读文字关键帧锁定方", locked: true },
+      { path: "rules.delivery.no_burned_subtitles", label: "禁止画面对白字幕条", type: "boolean" },
+      { path: "rules.delivery.subtitle_track_must_be_empty", label: "字幕轨必须为空", type: "boolean" },
+      { path: "rules.delivery.external_voice_track_must_be_empty", label: "外部对白轨必须为空", type: "boolean" },
+      { path: "rules.delivery.no_bgm", label: "母版不加 BGM", type: "boolean" },
+      { path: "rules.delivery.environment_sound_required", label: "逐镜环境声必填", type: "boolean" },
+      { path: "rules.delivery.html_review_board_required", label: "生成图文检查板", type: "boolean" },
+      { path: "rules.delivery.content_review_required", label: "逐段内容复核", type: "boolean" },
+      { path: "rules.delivery.delivery_verifier_required", label: "实跑交付检查脚本", type: "boolean" },
+      { path: "rules.delivery.archive_standard_snapshot", label: "成品包归档标准快照", type: "boolean" },
+    ],
+  },
+  { id: "gates", label: "门禁质检", icon: "07", blurb: "生产前逐项拦截；关闭门禁会降低交付可靠性。", fields: [] },
+  { id: "camera", label: "镜头词库", icon: "08", blurb: "统一摄影词汇，避免模型收到互相冲突或不存在的运镜指令。", fields: [
+    { path: "rules.camera_library.shot_scales", label: "景别词库", type: "list" },
+    { path: "rules.camera_library.angles", label: "角度词库", type: "list" },
+    { path: "rules.camera_library.positions", label: "机位词库", type: "list" },
+    { path: "rules.camera_library.movements", label: "运镜词库", type: "list" },
+    { path: "rules.camera_library.compositions", label: "构图词库", type: "list" },
+    { path: "rules.camera_library.focal_lengths_mm", label: "焦段词库", type: "numberList" },
+    { path: "rules.camera_library.speeds", label: "拍摄速度词库", type: "list" },
+  ] },
+  { id: "history", label: "版本历史", icon: "09", blurb: "每次保存创建不可变版本；历史版本可以一键重新激活。", fields: [] },
+];
+
+function getByPath(root, path) {
+  return path.split(".").reduce((node, key) => node == null ? undefined : node[key], root);
+}
+
+function setByPath(root, path, value) {
+  const keys = path.split(".");
+  let node = root;
+  keys.slice(0, -1).forEach((key) => {
+    if (!node[key] || typeof node[key] !== "object") node[key] = {};
+    node = node[key];
+  });
+  node[keys[keys.length - 1]] = value;
+}
+
+function cloneJson(value) { return JSON.parse(JSON.stringify(value)); }
+
+function diffCount(a, b) {
+  if (JSON.stringify(a) === JSON.stringify(b)) return 0;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object") return 1;
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  return [...keys].reduce((count, key) => count + diffCount(a[key], b[key]), 0);
+}
+
+function validateStandardDraft(draft) {
+  const errors = [];
+  const add = (path, message) => errors.push({ path, message });
+  const p = draft?.rules?.production || {};
+  const d = draft?.rules?.dialogue || {};
+  const perf = draft?.rules?.performance || {};
+  const preferred = p.preferred_segment_seconds || [];
+  if (preferred.length !== 2 || Number(preferred[0]) > Number(preferred[1]))
+    add("rules.production.preferred_segment_seconds", "建议时长下限不能大于上限");
+  if (Number(p.max_segment_seconds) < Number(preferred[1] || 0) || Number(p.max_segment_seconds) > 15)
+    add("rules.production.max_segment_seconds", "最长时长需覆盖建议区间且不能超过 15 秒");
+  if (Number(p.time_precision_seconds) <= 0)
+    add("rules.production.time_precision_seconds", "时间精度必须大于 0");
+  if (Number(d.max_chars_per_shot) < 8 || Number(d.max_chars_per_shot) > 25)
+    add("rules.dialogue.max_chars_per_shot", "单镜台词上限应在 8–25 字之间");
+  if (Number(perf.listener_duration_ratio) < (2 / 3) || Number(perf.listener_duration_ratio) > 1)
+    add("rules.performance.listener_duration_ratio", "反应镜比例应在 2/3–1 之间");
+  const beat = perf.beat_seconds || [];
+  if (beat.length !== 2 || Number(beat[0]) > Number(beat[1]))
+    add("rules.performance.beat_seconds", "留白时长下限不能大于上限");
+  for (const [key, band] of Object.entries(d.speech_profiles || {})) {
+    const speed = band.chars_per_second || [];
+    if (Number(speed[0]) <= 0 || Number(speed[0]) > Number(speed[1]))
+      add(`rules.dialogue.speech_profiles.${key}`, "语速最小值必须大于 0 且不高于最大值");
+  }
+  const hard = [
+    [p.video_model === "seedance2.0fast_vip", "视频模型必须为 Seedance 2.0 Fast VIP"],
+    [String(p.resolution).toLowerCase() === "720p", "分辨率必须为 720P"],
+    [p.voice === "jimeng_builtin", "声音模式必须为 Seedance2 随视频配音"],
+    [p.lip_sync === true, "即梦对口型必须开启"],
+    [p.burn_subtitles === false, "无字幕母版不能烧录对白字幕"],
+  ];
+  hard.forEach(([ok, message]) => { if (!ok) add("rules.production", message); });
+  return errors;
+}
+
+function renderStandardField(field) {
+  const value = getByPath(standardsDraft, field.path);
+  const id = `sf-${field.path.replace(/[^a-z0-9]+/gi, "-")}`;
+  const helpId = `${id}-help`;
+  const disabled = field.locked ? "disabled" : "";
+  let control;
+  if (field.type === "boolean") {
+    control = `<label class="switch"><input id="${id}" type="checkbox" data-standard-path="${esc(field.path)}" ${value ? "checked" : ""} ${disabled}><span aria-hidden="true"></span><em>${value ? "开启" : "关闭"}</em></label>`;
+  } else if (field.type === "range") {
+    const range = Array.isArray(value) ? value : ["", ""];
+    control = `<div class="range-control"><input id="${id}" type="number" data-standard-path="${esc(field.path)}" data-range-index="0" value="${esc(range[0])}" min="${field.min}" max="${field.max}" step="${field.step}" ${disabled} aria-describedby="${helpId}"><span>至</span><input type="number" data-standard-path="${esc(field.path)}" data-range-index="1" value="${esc(range[1])}" min="${field.min}" max="${field.max}" step="${field.step}" ${disabled} aria-label="${esc(field.label)}上限"><small>${esc(field.unit || "")}</small></div>`;
+  } else if (field.type === "list" || field.type === "numberList") {
+    control = `<textarea id="${id}" rows="3" data-standard-path="${esc(field.path)}" data-standard-type="${field.type}" ${disabled} aria-describedby="${helpId}">${esc(Array.isArray(value) ? value.join("、") : value || "")}</textarea>`;
+  } else {
+    const type = field.type === "number" ? "number" : "text";
+    control = `<div class="unit-control"><input id="${id}" type="${type}" data-standard-path="${esc(field.path)}" value="${esc(value ?? "")}" ${field.min != null ? `min="${field.min}"` : ""} ${field.max != null ? `max="${field.max}"` : ""} ${field.step != null ? `step="${field.step}"` : ""} ${disabled} aria-describedby="${helpId}"><small>${esc(field.unit || "")}</small></div>`;
+  }
+  return `<div class="standard-field ${field.locked ? "locked" : ""}">
+    <div class="field-copy"><label for="${id}">${esc(field.label)}</label>${field.locked ? `<span class="rule-badge hard">硬规则</span>` : `<span class="rule-badge adjustable">可调整</span>`}<p id="${helpId}">${esc(field.help || "保存后从下一集开始生效；已绑定剧集继续使用原快照。")}</p></div>
+    <div class="field-control">${control}</div>
+  </div>`;
+}
+
+function renderGatesEditor() {
+  const gates = standardsDraft?.rules?.quality_gates || [];
+  return `<div class="gate-editor">${gates.map((gate, index) => `
+    <div class="gate-rule">
+      <div><span class="gate-index">${String(index + 1).padStart(2, "0")}</span><b>${esc(gate.label || gate.id)}</b><p>${esc(gate.description || "生产前自动检查，未通过则停止消耗视频额度。")}</p></div>
+      <div class="gate-controls"><label><span>失败级别</span><select data-gate-severity="${index}" aria-label="${esc(gate.label || gate.id)}失败级别"><option value="block" ${gate.severity !== "warning" ? "selected" : ""}>阻断开拍</option><option value="warning" ${gate.severity === "warning" ? "selected" : ""}>只警告</option></select></label><label class="switch"><input type="checkbox" data-gate-index="${index}" ${gate.enabled !== false ? "checked" : ""}><span aria-hidden="true"></span><em>${gate.enabled !== false ? "启用" : "停用"}</em></label></div>
+    </div>`).join("") || `<div class="empty">当前标准没有门禁定义</div>`}</div>`;
+}
+
+function renderVersionHistory() {
+  const activeId = standardsMeta?.active?.version_id;
+  const history = standardsMeta?.history || [];
+  return `<div class="version-list">${history.map((item) => `
+    <article class="version-item ${item.version_id === activeId ? "active" : ""}">
+      <div class="version-line"><b>v${esc(item.version)}</b>${item.version_id === activeId ? `<span class="rule-badge live">当前生效</span>` : ""}<time>${item.created_at ? new Date(item.created_at * 1000).toLocaleString("zh-CN") : ""}</time></div>
+      <p>${esc(item.change_note || "创建制作标准版本")}</p>
+      <code>${esc((item.fingerprint || "").slice(0, 12))}</code>
+      ${item.version_id !== activeId ? `<button type="button" data-activate-version="${item.version_id}">恢复并激活此版本</button>` : ""}
+    </article>`).join("")}</div>`;
+}
+
+function standardImpactHtml() {
+  const rules = standardsDraft?.rules || {};
+  const p = rules.production || {};
+  const d = rules.dialogue || {};
+  const perf = rules.performance || {};
+  const columns = rules.storyboard?.required_columns || [];
+  const enabledGates = (rules.quality_gates || []).filter((g) => g.enabled !== false).length;
+  const preferred = p.preferred_segment_seconds || [5, 8];
+  const averageSegment = (Number(preferred[0]) + Number(preferred[1])) / 2 || 6.5;
+  const estimatedUnits = Math.ceil(60 / averageSegment);
+  const changes = diffCount(standardsBaseline, standardsDraft);
+  const errors = validateStandardDraft(standardsDraft);
+  return `<div class="impact-card ${errors.length ? "has-errors" : ""}">
+    <div class="impact-status"><span class="status-dot"></span><b>${errors.length ? `${errors.length} 项需要修正` : "规则结构有效"}</b></div>
+    <dl>
+      <div><dt>视频单元</dt><dd>${esc((p.preferred_segment_seconds || []).join("–"))}s · 最长 ${esc(p.max_segment_seconds)}s</dd></div>
+      <div><dt>60秒基准量</dt><dd>约 ${estimatedUnits} 个叙事单元 + 反应/留白</dd></div>
+      <div><dt>时间精度</dt><dd>${esc(p.time_precision_seconds)}s</dd></div>
+      <div><dt>台词拆分</dt><dd>≤ ${esc(d.max_chars_per_shot)} 字/镜</dd></div>
+      <div><dt>反应镜</dt><dd>≥ ${fmt((perf.listener_duration_ratio || 0) * 100, 0)}% 说话镜</dd></div>
+      <div><dt>情绪留白</dt><dd>${esc((perf.beat_seconds || []).join("–"))}s</dd></div>
+      <div><dt>镜头合同</dt><dd>${columns.length} 列字段</dd></div>
+      <div><dt>开拍门禁</dt><dd>${enabledGates} 项启用</dd></div>
+      <div><dt>交付声音</dt><dd>Seedance2 随视频配音/口型 · 无字幕母版</dd></div>
+    </dl>
+    <div class="change-summary">${changes ? `已修改 ${changes} 个值，尚未保存` : "与当前生效版本一致"}</div>
+    ${errors.length ? `<ul class="validation-list">${errors.map((e) => `<li>${esc(e.message)}</li>`).join("")}</ul>` : ""}
+  </div>`;
+}
+
+async function renderStandards(sectionId) {
+  const section = STANDARD_SECTIONS.find((item) => item.id === sectionId) || STANDARD_SECTIONS[0];
+  if (!standardsMeta || !standardsDirty) {
+    try {
+      standardsMeta = await api("/api/standards");
+      standardsBaseline = cloneJson(standardsMeta.active.content);
+      standardsDraft = cloneJson(standardsMeta.active.content);
+      standardsDirty = false;
+    } catch (e) {
+      app.innerHTML = `<div class="loading">制作标准加载失败：${esc(e.message)}</div>`;
+      return;
+    }
+  }
+  const active = standardsMeta.active;
+  topbarRight.innerHTML = `<span class="standard-live">标准 v${esc(active.version)} 生效中</span>`;
+  const source = standardsDraft.source_skill || {};
+  const skillManifest = section.id === "production" ? `
+    <article class="skill-manifest">
+      <div><span>SKILL SOURCE</span><b>${esc(source.name || "SK 漫剧五维分镜制作 Skill")}</b></div>
+      <dl><div><dt>技能 ID</dt><dd>${esc(source.id || "sk-manju-storyboard-skill")}</dd></div><div><dt>模板</dt><dd>${esc(source.reference || "five-dimension-storyboard-template-v5.txt")}</dd></div></dl>
+      <p>${esc(source.principle || "先完成五维分镜和硬门校验，再进入关键帧与 Seedance 生产。")}</p>
+    </article>` : "";
+  const content = section.id === "gates" ? renderGatesEditor()
+    : section.id === "history" ? renderVersionHistory()
+    : `${skillManifest}<div class="standard-fields">${section.fields.map(renderStandardField).join("")}</div>`;
+  app.innerHTML = `<div class="standards-page">
+    <header class="standards-hero">
+      <div><div class="eyebrow">PRODUCTION STANDARD CENTER</div><h1 tabindex="-1">制作标准中心</h1><p>把漫剧 Skill、分镜模板和质检规则变成真正驱动生产的版本化合同。</p></div>
+      <div class="standard-actions">
+        <button type="button" id="standard-import">导入</button>
+        <button type="button" id="standard-export">导出</button>
+        <button type="button" id="standard-reset">恢复官方标准</button>
+        <input type="file" id="standard-import-file" accept="application/json,.json" hidden>
+      </div>
+    </header>
+    <section class="standard-identity">
+      <div class="identity-main"><span class="live-pulse"></span><div><b>${esc(active.name)}</b><small>${esc(active.profile_key)} · v${esc(active.version)} · ${esc((active.fingerprint || "").slice(0, 12))}</small></div></div>
+      <div class="skill-source"><span>规则来源</span><b>${esc(source.name || "sk-manju-storyboard-skill")}</b><small>${esc(source.version || source.spec_version || "五维分镜 V5")}</small></div>
+      <div class="identity-stat"><span>保存策略</span><b>新版本 + 每集快照</b><small>历史剧集不随标准变化</small></div>
+    </section>
+    <div class="standards-layout">
+      <nav class="standard-nav" aria-label="制作标准分类">${STANDARD_SECTIONS.map((item) => `<a href="#/standards/${item.id}" class="${item.id === section.id ? "active" : ""}" ${item.id === section.id ? `aria-current="page"` : ""}><em>${item.icon}</em><span>${item.label}</span></a>`).join("")}</nav>
+      <section class="standard-editor" aria-labelledby="standard-section-title">
+        <div class="section-heading"><div><span>${section.icon}</span><h2 id="standard-section-title">${esc(section.label)}</h2></div><p>${esc(section.blurb)}</p></div>
+        ${content}
+      </section>
+      <aside class="impact-panel"><h2>生产影响预览</h2><p>这些值会进入新剧集的制作快照，并驱动分镜、门禁和交付。</p><div id="impact-preview">${standardImpactHtml()}</div></aside>
+    </div>
+    <footer class="standard-savebar">
+      <div><span id="dirty-status">${standardsDirty ? "有未保存修改" : "当前无修改"}</span><input id="change-note" placeholder="版本说明，例如：动作戏反应镜延长"></div>
+      <button type="button" class="primary" id="standard-save" ${validateStandardDraft(standardsDraft).length || !standardsDirty ? "disabled" : ""}>保存并生效</button>
+    </footer>
+  </div>`;
+  bindStandards(section.id);
+  requestAnimationFrame(() => app.querySelector("h1")?.focus());
+}
+
+function refreshStandardDraftUi() {
+  standardsDirty = diffCount(standardsBaseline, standardsDraft) > 0;
+  const preview = document.getElementById("impact-preview");
+  if (preview) preview.innerHTML = standardImpactHtml();
+  const status = document.getElementById("dirty-status");
+  if (status) status.textContent = standardsDirty ? "有未保存修改" : "当前无修改";
+  const save = document.getElementById("standard-save");
+  if (save) save.disabled = validateStandardDraft(standardsDraft).length > 0 || !standardsDirty;
+}
+
+function downloadJson(data, filename) {
+  const url = URL.createObjectURL(new Blob(
+    [JSON.stringify(data, null, 2)], { type: "application/json" }));
+  downloadUrl(url, filename);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function bindStandards(sectionId) {
+  app.querySelectorAll("[data-standard-path]").forEach((input) => {
+    input.addEventListener("input", () => {
+      const path = input.dataset.standardPath;
+      let value;
+      if (input.type === "checkbox") value = input.checked;
+      else if (input.dataset.standardType === "list")
+        value = input.value.split(/[、,，\n]/).map((item) => item.trim()).filter(Boolean);
+      else if (input.dataset.standardType === "numberList")
+        value = input.value.split(/[、,，\n]/).map((item) => Number(item.trim())).filter((item) => Number.isFinite(item));
+      else if (input.type === "number") value = Number(input.value);
+      else value = input.value;
+      if (input.dataset.rangeIndex != null) {
+        const range = [...(getByPath(standardsDraft, path) || [0, 0])];
+        range[Number(input.dataset.rangeIndex)] = value;
+        setByPath(standardsDraft, path, range);
+      } else setByPath(standardsDraft, path, value);
+      const switchLabel = input.closest(".switch")?.querySelector("em");
+      if (switchLabel) switchLabel.textContent = input.checked ? "开启" : "关闭";
+      refreshStandardDraftUi();
+    });
+  });
+  app.querySelectorAll("[data-gate-index]").forEach((input) => {
+    input.addEventListener("change", () => {
+      standardsDraft.rules.quality_gates[Number(input.dataset.gateIndex)].enabled = input.checked;
+      input.closest(".switch").querySelector("em").textContent = input.checked ? "启用" : "停用";
+      refreshStandardDraftUi();
+    });
+  });
+  app.querySelectorAll("[data-gate-severity]").forEach((select) => {
+    select.addEventListener("change", () => {
+      standardsDraft.rules.quality_gates[Number(select.dataset.gateSeverity)].severity = select.value;
+      refreshStandardDraftUi();
+    });
+  });
+  document.getElementById("standard-save")?.addEventListener("click", async (ev) => {
+    const btn = ev.currentTarget;
+    btn.disabled = true; btn.textContent = "保存中…";
+    try {
+      const reply = await api("/api/standards/save", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: standardsDraft,
+          change_note: document.getElementById("change-note").value.trim() || "调整制作标准",
+          activate: true, expected_active_id: standardsMeta.active.version_id }),
+      });
+      standardsMeta = null; standardsDirty = false;
+      showToast(`制作标准 v${reply.standard.version} 已保存并生效`, "ok");
+      renderStandards(sectionId);
+    } catch (e) {
+      showToast(e.message, "error");
+      btn.disabled = false; btn.textContent = "保存并生效";
+    }
+  });
+  document.getElementById("standard-export")?.addEventListener("click", async () => {
+    try {
+      const bundle = await api(`/api/standards/export?version_id=${standardsMeta.active.version_id}`);
+      downloadJson(bundle, `AIFOS_${standardsMeta.active.profile_key}_v${standardsMeta.active.version}.json`);
+      showToast("制作标准已导出", "ok");
+    } catch (e) { showToast(e.message, "error"); }
+  });
+  const fileInput = document.getElementById("standard-import-file");
+  document.getElementById("standard-import")?.addEventListener("click", () => fileInput.click());
+  fileInput?.addEventListener("change", async () => {
+    try {
+      const bundle = JSON.parse(await fileInput.files[0].text());
+      const reply = await api("/api/standards/import", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bundle, change_note: `导入 ${fileInput.files[0].name}`, activate: true }),
+      });
+      standardsMeta = null; standardsDirty = false;
+      showToast(`已导入并激活 v${reply.standard.version}`, "ok");
+      renderStandards(sectionId);
+    } catch (e) { showToast(`导入失败：${e.message}`, "error"); }
+    fileInput.value = "";
+  });
+  document.getElementById("standard-reset")?.addEventListener("click", (ev) => {
+    armConfirm(ev.currentTarget, "恢复", async () => {
+      try {
+        const reply = await api("/api/standards/reset", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ change_note: "恢复 SK 五维漫剧 V5 官方标准" }),
+        });
+        standardsMeta = null; standardsDirty = false;
+        showToast(`已恢复并激活官方标准 v${reply.standard.version}`, "ok");
+        renderStandards(sectionId);
+      } catch (e) { showToast(e.message, "error"); }
+    });
+  });
+  app.querySelectorAll("[data-activate-version]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      try {
+        const reply = await api("/api/standards/activate", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ version_id: Number(btn.dataset.activateVersion) }),
+        });
+        standardsMeta = null; standardsDirty = false;
+        showToast(`已激活制作标准 v${reply.standard.version}`, "ok");
+        renderStandards("history");
+      } catch (e) { showToast(e.message, "error"); }
+    });
+  });
 }
 
 /* ================= 仪表盘 ================= */
@@ -80,8 +534,9 @@ async function renderDashboard() {
 
   const s = data.stats;
   const runningJobs = data.jobs.filter((j) => j.status === "running");
-  topbarRight.innerHTML = runningJobs.length
-    ? `<span class="chip running">${runningJobs.length} 个制作任务进行中</span>` : "";
+  const activeStandard = data.production_standard || {};
+  topbarRight.innerHTML = `<a class="standard-live" href="#/standards/history">标准 v${esc(activeStandard.version || 1)}</a>` + (runningJobs.length
+    ? `<span class="chip running">${runningJobs.length} 个制作任务进行中</span>` : "");
 
   const maxStage = Math.max(1, ...data.cost_by_stage.map((r) => r.total || 0));
   app.innerHTML = `
@@ -105,8 +560,15 @@ async function renderDashboard() {
 夜色渐深,妖气翻涌。
 林昭:这股妖气不对劲。
 小狐:小心,它就在附近!"></textarea>
-      <div class="produce-hint">全自动完成:剧本 → 分镜 → 画面 → 配音 → 成片。做完后点下方剧集,再点「▶ 播放本集」观看。</div>
+      <div class="produce-hint">SK 工业流:连续性圣经 → 五维分镜 → 关键帧/文字锁定 → 生产门禁 → Seedance → 三层质检 → 交付脚本。</div>
     </form>
+    <section class="workflow-map" aria-label="AIFOS 漫剧工业流">
+      <div class="workflow-lead"><b>不把长剧本直接塞给视频模型</b><span>先锁定画面、人物与段间状态，再让 Seedance 只执行动作、镜头和情绪。</span><a href="#/standards/production">${esc(activeStandard.name || "SK 五维漫剧标准")} · v${esc(activeStandard.version || 1)} 正在驱动新剧集 →</a></div>
+      <div class="workflow-steps">
+        ${["连续性", "五维分镜", "文字关键帧", "首尾帧", "生产门禁", "视频/口型", "抽帧+内容复核", "交付脚本"].map((name, i) =>
+          `<div class="workflow-step"><em>${String(i + 1).padStart(2, "0")}</em><span>${name}</span></div>`).join("")}
+      </div>
+    </section>
     <div id="progress-banner"></div>
     <div id="pipeline-strip"></div>
 
@@ -238,7 +700,7 @@ function refreshIfIdle() {
 async function onProduce(ev) {
   ev.preventDefault();
   const form = ev.target;
-  const btn = form.querySelector("button");
+  const btn = form.querySelector('button[type="submit"]');
   btn.disabled = true; btn.textContent = "提交中…";
   try {
     const reply = await api("/api/produce", {
@@ -523,7 +985,6 @@ function openPlayer(data, startShotNo) {
       <div class="player-stage" id="pl-stage">
         <img id="pl-a" alt=""><img id="pl-b" alt="">
         <video id="pl-video" playsinline hidden></video>
-        <div class="player-sub" id="pl-sub" hidden></div>
         <button class="player-big" id="pl-big">▶</button>
       </div>
       <div class="player-bar">
@@ -537,7 +998,6 @@ function openPlayer(data, startShotNo) {
   const elA = overlay.querySelector("#pl-a");
   const elB = overlay.querySelector("#pl-b");
   const elVideo = overlay.querySelector("#pl-video");
-  const elSub = overlay.querySelector("#pl-sub");
   const elFill = overlay.querySelector("#pl-fill");
   const elPos = overlay.querySelector("#pl-pos");
   const elTime = overlay.querySelector("#pl-time");
@@ -562,10 +1022,6 @@ function openPlayer(data, startShotNo) {
     elPos.textContent = `镜头 ${i + 1}/${shots.length} · 场${item.shot.scene_no}`;
     elTime.textContent = `${fmtTime(elapsedBefore)} / ${fmtTime(total)}`;
     elFill.style.width = `${(elapsedBefore / total) * 100}%`;
-    if (item.shot.dialogue) {
-      elSub.innerHTML = `<b>${esc(item.shot.dialogue.character)}</b>${esc(item.shot.dialogue.dialogue)}`;
-      elSub.hidden = false;
-    } else { elSub.hidden = true; }
     if (item.mp4) {
       elA.hidden = elB.hidden = true;
       elVideo.hidden = false;
@@ -653,7 +1109,7 @@ function buildLineIndex(script) {
         n += 1;
         if (scene.scene_no === shot.scene_no &&
             line.character === shot.dialogue.character &&
-            line.dialogue === shot.dialogue.dialogue) return n;
+            line.dialogue === (shot.dialogue_source || shot.dialogue.dialogue)) return n;
       }
     }
     return null;
@@ -915,18 +1371,30 @@ function mediaTag(url) {
   return "";
 }
 
+function stateInline(states) {
+  return Object.entries(states || {}).map(([name, state]) =>
+    `${name}:${state.position || ""}·${state.pose || ""}·${state.emotion || ""}`
+  ).join("；") || "-";
+}
+
 const STAGE_CN = {
-  script: "剧本", cast: "人物/场景图", storyboard: "分镜", images: "镜头画面",
-  frames: "首尾帧", videos: "视频", voices: "配音", edit: "剪映剪辑",
-  qc: "AI质检", package: "封面/标题", archive: "数据沉淀",
+  script: "剧本", continuity: "连续性圣经", cast: "人物/场景图",
+  storyboard: "五维分镜", images: "关键帧", text_assets: "文字资产锁定",
+  frames: "首尾帧", preflight: "生产门禁", videos: "Seedance 视频",
+  voices: "随视频配音/口型", edit: "剪映剪辑",
+  qc: "三层质检", package: "封面/标题", archive: "数据沉淀",
   assets: "资产调用",
 };
-const STAGE_ORDER = ["script", "cast", "storyboard", "images", "frames",
-  "videos", "voices", "edit", "qc", "package", "archive"];
+const STAGE_ORDER = ["script", "continuity", "cast", "storyboard", "images",
+  "text_assets", "frames", "preflight", "videos", "voices", "edit", "qc",
+  "package", "archive"];
 const STAGE_PLAIN = {
-  script: "正在写剧本", cast: "正在画人物和场景", storyboard: "正在画分镜",
-  images: "正在生成镜头画面", frames: "正在生成首尾帧", videos: "正在生成视频",
-  voices: "正在配音", edit: "正在剪辑成片", qc: "正在质量检查",
+  script: "正在写剧本", continuity: "正在锁定角色、场景和文字规则",
+  cast: "正在画人物和场景", storyboard: "正在生成五维分镜",
+  images: "正在生成关键帧", text_assets: "正在锁定可读文字",
+  frames: "正在生成首尾帧", preflight: "正在执行生产硬门禁",
+  videos: "正在生成 Seedance 视频", voices: "正在确认随视频声音与口型",
+  edit: "正在剪辑无字幕成片", qc: "正在做自动检查、检查板和内容复核",
   package: "正在做封面和标题", archive: "正在归档素材",
 };
 
@@ -943,7 +1411,7 @@ function renderProgressBanner(data) {
   el.innerHTML = awaiting.map((e) => `
     <div class="progress-card confirm">
       <div class="progress-text">《${esc(e.project)}》第${e.number}集 预生产完成,等你过目
-        <span>剧本、人物、场景、分镜已就绪</span></div>
+        <span>连续性、五维分镜、关键帧与生产门禁均已通过</span></div>
       <button class="primary" onclick="location.hash='#/episode/${e.id}'">去确认 →</button>
     </div>`).join("") + producing.map((e) => {
     const idx = STAGE_ORDER.indexOf(e.status);
@@ -990,17 +1458,26 @@ async function renderCanvasView(episodeId) {
   });
 
   const awaiting = ep.status === "awaiting_confirm";
+  const profile = data.production_profile || {};
+  const gates = data.preflight?.gates || [];
   app.innerHTML = `
   <div class="canvas-view">
     ${awaiting ? `
     <div class="confirm-banner">
       <div>
-        <b>预生产完成,请过目 👀</b>
-        <span>剧本、人物、场景、分镜都已生成(见画布与右侧面板)。满意就点确认,
-        视频 → 配音 → 剪辑 → 质检会全自动完成;不满意可改剧本后重新制作。</span>
+        <b>${data.preflight?.passed ? `${gates.length} 项生产门禁通过，请做最终视觉确认` : "生产门禁未通过"}</b>
+        <span>角色/场景连续性、五维分镜、文字关键帧、首尾帧和即梦配置均已机检。
+        确认后才会消耗 Seedance 额度；成片仍须通过检查板、内容复核与交付脚本。</span>
       </div>
-      <button class="primary" id="btn-confirm">✅ 确认,开始生产</button>
+      <button class="primary" id="btn-confirm" ${data.preflight?.passed ? "" : "disabled"}>✅ 确认,开始 Seedance 生产</button>
     </div>` : ""}
+    <div class="profile-strip">
+      <span><b>${esc(profile.standard_name || "SK 五维工业流")}</b> v${esc(profile.standard_version || 1)}</span>
+      <span>Seedance 2.0 Fast VIP</span><span>${esc(profile.resolution || "720p")}</span>
+      <span>Seedance2 随视频配音</span><span>口型同步</span><span>无字幕母版</span>
+      <strong>${gates.filter((g) => g.passed).length}/${gates.length || 0} 门禁通过</strong>
+      <a href="#/standards/history">查看制作标准</a>
+    </div>
     <div class="canvas-toolbar">
       <button id="btn-back">← 仪表盘</button>
       <span class="title">《${esc(ep.project_title || data.project.title)}》第${ep.number}集</span>
@@ -1061,7 +1538,7 @@ async function renderCanvasView(episodeId) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ episode_id: ep.id }),
       });
-      showToast("已确认!正在自动生产视频、配音与成片,完成后即可播放", "ok");
+      showToast("已确认!正在生成 Seedance 视频、随视频配音/口型与无字幕母版", "ok");
       pollTimer = setInterval(() => renderCanvasView(episodeId), 3000);
     } catch (e) {
       showToast(e.message, "error");
@@ -1124,12 +1601,14 @@ function renderTheater(data, canvas) {
           <span class="chip">${esc(kindCN)}</span>
           <span class="chip">第${data.episode.number}集${data.episode.title ? " · " + esc(data.episode.title) : ""}</span>
           <span class="chip">${fmt(total, 0)} 秒 · ${shots.length} 镜</span>
+          <span class="chip">SK 五维分镜</span><span class="chip">无字幕</span>
           ${data.episode.qc_score != null ? `<span class="chip">质检 ${fmt(data.episode.qc_score, 0)} 分</span>` : ""}
         </div>
         <p class="hero-logline">${esc(script.logline || "")}</p>
         <div class="hero-actions">
           <button class="primary" id="hero-play">▶ 播放本集</button>
           <button id="hero-script">📖 剧本</button>
+          ${art.review_board ? `<a class="button-link" href="${esc(art.review_board)}" target="_blank">🧪 图文检查板</a>` : ""}
           <button id="hero-export" title="成片/封面/文案/配音/草稿一键打包">⬇ 下载成品包</button>
         </div>
       </div>
@@ -1249,7 +1728,13 @@ class StoryboardCanvas {
       const issues = this.shotIssues[shot.shot_no] || [];
       const hasVideo = !!art.videos[shot.shot_no];
       const lineNo = this.lineNoOf(shot);
-      const voiceOk = lineNo != null && !!art.voices[lineNo];
+      const videoAudio = art.video_audio || {};
+      const hasAudioEvidence = Object.prototype.hasOwnProperty.call(
+        videoAudio, shot.shot_no);
+      const integratedVoice = hasAudioEvidence
+        ? !!videoAudio[shot.shot_no]
+        : this.data.production_profile?.voice === "jimeng_builtin";
+      const voiceOk = integratedVoice ? hasVideo : lineNo != null && !!art.voices[lineNo];
       html += `
       <div class="shot-card${this.selected === shot.shot_no ? " selected" : ""}"
            data-shot="${shot.shot_no}" style="left:${p.x}px;top:${p.y}px">
@@ -1261,7 +1746,7 @@ class StoryboardCanvas {
           <div class="desc">${esc(shot.dialogue ? `${shot.dialogue.character}:「${shot.dialogue.dialogue}」` : shot.description)}</div>
           <div class="badges">
             <span class="badge ${hasVideo ? "ok" : "miss"}">${hasVideo ? "✓ 视频" : "✗ 视频"}</span>
-            ${shot.dialogue ? `<span class="badge ${voiceOk ? "ok" : "miss"}">${voiceOk ? "✓ 配音" : "✗ 配音"}</span>` : ""}
+            ${shot.dialogue ? `<span class="badge ${voiceOk ? "ok" : "miss"}">${voiceOk ? "✓ 配音/口型" : "✗ 配音/口型"}</span>` : ""}
             ${issues.length ? `<span class="badge qc">⚠ 质检${issues.length}</span>` : ""}
           </div>
         </div>
@@ -1301,10 +1786,41 @@ class StoryboardCanvas {
     if (shotNo == null) {
       const ep = this.data.episode;
       const qc = this.data.qc_report;
+      const preflight = this.data.preflight;
+      const continuity = this.data.continuity;
+      const contentReview = this.data.content_review || qc?.content_review;
+      const delivery = qc?.delivery_check;
+      const standard = this.data.production_standard || {};
       panel.innerHTML = `
         <h3>本集总览</h3>
         <button class="primary play-cta" id="panel-play">▶ 播放本集(${fmt(this.data.storyboard.shots.reduce((a, s) => a + s.duration, 0), 0)}秒)</button>
         <button class="play-cta" id="panel-export">⬇ 下载成品包(成片/封面/文案)</button>
+        <h4>本集制作标准</h4>
+        <div class="standard-snapshot">
+          <div><b>${esc(standard.name || "SK 五维漫剧标准")}</b><span>v${esc(standard.version || 1)}</span></div>
+          <code>${esc((standard.fingerprint || "").slice(0, 12))}</code>
+          <small>本集已锁快照，后续修改厂标不会改变当前制作合同。</small>
+        </div>
+        <h4>生产门禁 · ${preflight?.passed ? "PASS" : "待检查"}</h4>
+        <div class="gate-list">${(preflight?.gates || []).map((gate) => `
+          <div class="gate-item ${gate.passed ? "pass" : "fail"}">
+            <span>${gate.passed ? "✓" : "×"} ${esc(gate.label)}</span>
+            <small>${esc(gate.detail)}</small>
+          </div>`).join("") || `<div class="empty">预生产后显示门禁结果</div>`}</div>
+        ${continuity ? `<div class="contract-summary">
+          <span><b>${continuity.characters?.length || 0}</b> 角色锚点</span>
+          <span><b>${continuity.scenes?.length || 0}</b> 场景锚点</span>
+          <span><b>${this.data.storyboard.shots.length}</b> 五维单元</span>
+          <span><b>${this.data.text_assets?.assets?.length || 0}</b> 文字资产</span>
+        </div>` : ""}
+        <h4>三层质检</h4>
+        <div class="qc-layers">
+          <span class="${qc?.technical_passed ? "pass" : "pending"}">① 自动文件检查 ${qc?.technical_passed ? "PASS" : "待完成"}</span>
+          <span class="${art.review_board ? "pass" : "pending"}">② 抽帧图文检查板 ${art.review_board ? "READY" : "待生成"}</span>
+          <span class="${contentReview?.passed ? "pass" : "pending"}">③ 逐段内容复核 ${contentReview?.passed ? "PASS" : "待完成"}</span>
+          <span class="${delivery?.passed ? "pass" : "pending"}">④ 交付脚本实跑 ${delivery?.passed ? "PASS" : "待完成"}</span>
+        </div>
+        ${art.review_board ? `<a class="review-link" href="${esc(art.review_board)}" target="_blank">打开图文检查板 →</a>` : ""}
         ${(art.cast_art || []).length ? `<h4>人物 · 不满意可附意见重画</h4>
         <div class="art-grid">${art.cast_art.map((c) => `
           <figure><img src="${esc(c.url)}" alt="${esc(c.name)}">
@@ -1333,7 +1849,7 @@ class StoryboardCanvas {
               <span class="cost">${fmt(t.cost)}</span>${chip(t.status === "done" ? "done" : t.status === "failed" ? "failed" : "running")}
             </span></li>`).join("")}
         </ul>
-        ${qc ? `<h4>质检 · ${qc.score}分(线${qc.pass_score})</h4>
+        ${qc ? `<h4>问题清单 · ${qc.score}分(线${qc.pass_score})</h4>
           ${qc.issues.length ? qc.issues.map((i) => `
             <div class="issue ${esc(i.severity)}">[${esc(i.check)}] ${esc(i.message)}</div>`).join("")
           : `<div class="empty">全部检查通过</div>`}` : ""}
@@ -1355,8 +1871,11 @@ class StoryboardCanvas {
     const shot = this.data.storyboard.shots.find((s) => s.shot_no === shotNo);
     const issues = this.shotIssues[shotNo] || [];
     const lineNo = this.lineNoOf(shot);
+    const dims = shot.five_dimensions || {};
+    const cam = dims.camera_design || {};
+    const textAsset = shot.readable_text || {};
     panel.innerHTML = `
-      <h3>镜头 #${String(shotNo).padStart(2, "0")} · 场${shot.scene_no}</h3>
+      <h3>${esc(shot.unit_id || `镜头 #${String(shotNo).padStart(2, "0")}`)} · 场${shot.scene_no}</h3>
       ${art.images[shotNo] ? `<img class="preview" src="${esc(art.images[shotNo])}" alt="关键图">` : ""}
       <h4>首尾帧</h4>
       <div class="thumbs">
@@ -1365,15 +1884,43 @@ class StoryboardCanvas {
       </div>
       ${mediaTag(art.videos[shotNo]) ? `<h4>镜头视频</h4>${mediaTag(art.videos[shotNo])}` : ""}
       ${shot.dialogue ? `<h4>台词</h4><div class="dialogue"><b>${esc(shot.dialogue.character)}</b>:${esc(shot.dialogue.dialogue)}</div>` : ""}
+      ${shot.dialogue_part?.total > 1 ? `<div class="dialogue-part">原句拆分 ${shot.dialogue_part.index}/${shot.dialogue_part.total} · ${esc(shot.dialogue_source || "")}</div>` : ""}
       ${lineNo != null && mediaTag(art.voices[lineNo]) ? mediaTag(art.voices[lineNo]) : ""}
-      <h4>镜头信息</h4>
+      <h4>生产合同</h4>
       <ul class="links">
-        <li><span>机位</span><span>${esc(shot.camera || "-")}</span></li>
-        <li><span>时长</span><span>${fmt(shot.duration, 1)}s</span></li>
-        <li><span>类型</span><span>${shot.kind === "dialogue" ? "对白镜头" : "环境镜头"}</span></li>
+        <li><span>镜头功能</span><span>${esc(shot.shot_function || "-")}</span></li>
+        <li><span>人物</span><span>${esc((shot.characters || []).join("、"))} · ${shot.character_count ?? 0}人</span></li>
+        <li><span>时间码</span><span>${esc(shot.timecode || "-")} · ${fmt(shot.duration, 1)}s</span></li>
+        <li><span>类型词</span><span>${esc(shot.type_word || shot.kind || "-")}</span></li>
+        <li><span>剧本对应</span><span>${esc(shot.script_reference || "-")}</span></li>
       </ul>
-      <h4>生成 Prompt</h4>
-      <div class="prompt">${esc(shot.prompt)}</div>
+      <h4>段间状态</h4>
+      <div class="state-box"><b>起</b>${esc(stateInline(shot.start_state))}</div>
+      <div class="state-box"><b>止</b>${esc(stateInline(shot.end_state))}</div>
+      <h4>五维分镜</h4>
+      <div class="dimension-list">
+        <div><b>主体动势</b><span>${esc(dims.subject_motion || "-")}</span></div>
+        <div><b>环境光影</b><span>${esc(dims.environment_light || "-")}</span></div>
+        <div><b>摄影调度</b><span>${esc([cam.shot_scale, cam.angle, cam.lens, cam.camera_position, cam.movement].filter(Boolean).join(" · "))}</span></div>
+        <div><b>时间状态</b><span>${esc(dims.time_state?.evolution || "-")}</span></div>
+        <div><b>美学参数</b><span>${esc(dims.aesthetics?.render || "-")}</span></div>
+      </div>
+      <h4>表演与声音</h4>
+      <div class="dimension-list">
+        <div><b>表演目标</b><span>${esc(shot.performance?.goal || "-")}</span></div>
+        <div><b>视线</b><span>${esc(shot.performance?.gaze || "-")}</span></div>
+        <div><b>微表情</b><span>${esc(shot.performance?.micro_expression || "-")}</span></div>
+        <div><b>环境声</b><span>${esc(shot.sound_design?.environment || "-")}</span></div>
+        <div><b>音乐策略</b><span>${esc(shot.sound_design?.music || "-")}</span></div>
+      </div>
+      <h4>文字资产</h4>
+      <div class="text-contract ${textAsset.required ? "required" : "clear"}">
+        ${textAsset.required
+          ? `需关键帧锁定 · ${esc(textAsset.carrier)} · 白名单:${esc((textAsset.whitelist || []).join("、") || "空")}`
+          : "无可读文字 · 禁止字幕条与乱码"}
+      </div>
+      <h4>Seedance 执行提示词</h4>
+      <div class="prompt">${esc(shot.seedance_prompt || shot.prompt)}</div>
       <h4>产物</h4>
       <ul class="links">
         ${this.link("关键图", art.images[shotNo])}
@@ -1410,7 +1957,7 @@ class StoryboardCanvas {
         n += 1;
         if (scene.scene_no === shot.scene_no &&
             line.character === shot.dialogue.character &&
-            line.dialogue === shot.dialogue.dialogue) return n;
+            line.dialogue === (shot.dialogue_source || shot.dialogue.dialogue)) return n;
       }
     }
     return null;
@@ -1528,3 +2075,7 @@ class StoryboardCanvas {
     this.renderSidePanel(shotNo);
   }
 }
+
+/* 所有路由依赖的常量、渲染函数与画布类均完成初始化后再启动应用。 */
+window.addEventListener("hashchange", route);
+route();

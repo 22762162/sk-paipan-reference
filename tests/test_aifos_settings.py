@@ -38,6 +38,38 @@ def test_defaults_include_api_providers(tmp_path):
         app.close()
 
 
+def test_config_load_migrates_only_builtin_legacy_say(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "providers": {
+            "say": {
+                "type": "cli", "enabled": True,
+                "capabilities": ["voice"],
+                "command": ["python3", "-m", "aifos.adapters.say_voice",
+                            "--voice", "Tingting"],
+                "cost_per_call": 0.0, "timeout": 120,
+            },
+        },
+        "routing": {"voice": ["jimeng", "say", "api", "mock"]},
+    }), encoding="utf-8")
+    migrated = Config.load(config_path)
+    assert "say" not in migrated.get("providers")
+    assert migrated.get("routing", "voice") == ["doubao_tts", "api", "mock"]
+
+    config_path.write_text(json.dumps({
+        "providers": {
+            "say": {
+                "type": "cli", "enabled": True,
+                "capabilities": ["voice"], "command": ["custom-say"],
+            },
+        },
+        "routing": {"voice": ["say", "mock"]},
+    }), encoding="utf-8")
+    custom = Config.load(config_path)
+    assert custom.get("providers", "say", "command") == ["custom-say"]
+    assert custom.get("routing", "voice") == ["say", "mock"]
+
+
 def test_settings_payload_masks_key(tmp_path):
     app = App(tmp_path / "ws", config_overrides={
         "providers": {"claude_api": {"api_key": "sk-ant-api-0123456789"}}})
@@ -81,6 +113,9 @@ def test_update_provider_and_masked_key_kept(tmp_path):
     conf = Config.load(config_path)
     assert conf.get("providers", "claude", "command")[-1] == \
         "/usr/local/bin/claude"
+    update_provider(config_path, "jimeng", {"audio_in_video": "false"})
+    conf = Config.load(config_path)
+    assert conf.get("providers", "jimeng", "audio_in_video") is False
     with pytest.raises(AifosError):
         update_provider(config_path, "不存在", {"enabled": True})
     with pytest.raises(AifosError):
@@ -135,6 +170,24 @@ def test_check_provider(tmp_path):
         app.close()
 
 
+def test_check_provider_credit_failure_is_connection_failure(tmp_path):
+    dreamina = tmp_path / "dreamina"
+    dreamina.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    dreamina.chmod(0o755)
+    app = App(tmp_path / "ws", config_overrides={
+        "providers": {"jimeng": {
+            "enabled": True, "command": [str(dreamina)],
+        }},
+    })
+    try:
+        report = check_provider(app, "jimeng")
+        assert report["ok"] is False
+        assert report["results"][0]["ok"] is True
+        assert "余额查询失败" in report["extra"]
+    finally:
+        app.close()
+
+
 def test_cli_config_commands(tmp_path, capsys):
     ws = str(tmp_path / "ws")
     assert main(["--workspace", ws, "init"]) == 0
@@ -165,7 +218,8 @@ def test_cli_config_commands(tmp_path, capsys):
                  "--provider", "claude_api"]) == 1
     assert "✗" in capsys.readouterr().out
     assert main(["--workspace", ws, "config", "set",
-                 "--provider", "jimeng", "--enable"]) == 0
+                 "--provider", "jimeng", "--enable", "--command",
+                 str(tmp_path / "missing-dreamina")]) == 0
     capsys.readouterr()
     assert main(["--workspace", ws, "config", "test",
                  "--provider", "jimeng"]) == 1

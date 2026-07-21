@@ -1,8 +1,9 @@
 """AI 导演中心:总控。拆解任务、调度 Provider、控制流程与成本。
 
-生产流程(总体设计方案·五):
-  需求 → 剧本 → 分镜 → 资产调用 → 图片 → 首尾帧 → 视频 → 配音
-       → 剪映 → AI质检 → 封面/标题 → 数据沉淀
+生产流程(SK 漫剧工业流):
+  需求 → 剧本 → 连续性圣经 → 五维分镜 → 关键帧/文字锁定 → 首尾帧
+       → 生产门禁 → Seedance2 视频(随视频声音/口型) → 剪辑
+       → 抽帧检查板 + 内容复核 + 交付脚本 → 包装 → 数据沉淀
 """
 
 import json
@@ -10,6 +11,17 @@ from pathlib import Path
 
 from .db import now
 from .errors import AifosError, BudgetExceeded
+from .workflow import (
+    PIPELINE_VERSION,
+    build_content_review,
+    build_continuity_bible,
+    build_preflight,
+    enrich_storyboard,
+    lock_text_assets,
+    production_profile,
+    write_delivery_verifier,
+    write_review_board,
+)
 
 # 画幅 → 像素尺寸(视频/图片);封面用竖版比例
 ASPECT_DIMS = {
@@ -19,26 +31,29 @@ ASPECT_DIMS = {
 
 STAGES = [
     ("script", "剧本"),
+    ("continuity", "连续性圣经"),
     ("cast", "人物/场景图"),
-    ("storyboard", "分镜"),
-    ("images", "镜头画面"),
+    ("storyboard", "五维分镜"),
+    ("images", "关键帧"),
+    ("text_assets", "文字资产锁定"),
     ("frames", "首尾帧"),
-    ("videos", "视频"),
-    ("voices", "配音"),
+    ("preflight", "生产门禁"),
+    ("videos", "Seedance视频"),
+    ("voices", "Seedance2随视频声音/口型"),
     ("edit", "剪映剪辑"),
-    ("qc", "AI质检"),
+    ("qc", "三层质检"),
     ("package", "封面/标题/拆条"),
     ("archive", "数据沉淀"),
 ]
 
 # 预生产检查点:此阶段完成后可暂停等待用户确认,
 # 确认后才进入视频生产(真实产线从这里开始消耗即梦额度)
-CONFIRM_AFTER = "frames"
+CONFIRM_AFTER = "preflight"
 
 
 class Director:
     def __init__(self, db, config, logger, projects, assets, router, qc, ops,
-                 data_center, artifacts_root):
+                 data_center, artifacts_root, standards=None):
         self.db = db
         self.config = config
         self.log = logger
@@ -49,6 +64,33 @@ class Director:
         self.ops = ops
         self.data = data_center
         self.artifacts_root = Path(artifacts_root)
+        self.standards = standards
+
+    def _resolve_standard_snapshot(self, episode_id, force=False):
+        """为一集绑定不可漂移的制作标准。
+
+        新集与强制重做读取当前生效标准；确认续产和普通断点续产始终恢复
+        本集首次绑定的快照，避免出现旧分镜搭配新声画参数的混合产线。
+        """
+        if not force:
+            existing, _ = self.projects.latest_document(
+                episode_id, "production_standard")
+            if existing is not None:
+                return existing
+        if self.standards is None:
+            snapshot = {
+                "profile_key": "sk-manju-v5",
+                "version": 1,
+                "version_id": 0,
+                "name": "SK 五维漫剧标准",
+                "fingerprint": "legacy-config",
+                "content": {},
+            }
+        else:
+            snapshot = self.standards.active()
+        self.projects.save_document(
+            episode_id, "production_standard", snapshot)
+        return snapshot
 
     # ---- 入口:一句话开工 ----
     def produce(self, project_title, episode_number, premise="", style="",
@@ -58,9 +100,10 @@ class Director:
         只补齐缺失部分——真实产线(即梦按镜头计费)断点续产的关键。
         script:用户自带剧本(标准 JSON);提供时跳过 AI 编剧,
         人物/场次/分镜等全部从该剧本自动推导。
-        pause_for_confirm=True:预生产(剧本/人物图/场景图/分镜/首尾帧)
+        pause_for_confirm=True:预生产(连续性、五维分镜、关键帧、首尾帧、门禁)
         完成后暂停等待确认(status=awaiting_confirm);确认后再次调用
-        produce(不带该参数)即从断点继续自动完成视频→配音→剪辑→质检。"""
+        produce(不带该参数)即从断点继续自动完成 Seedance 声画、无字幕剪辑
+        与三层质检。"""
         if script is not None:
             force = True  # 剧本变了,旧镜头/配音不可复用
         project, created = self.projects.get_or_create_project(
@@ -77,6 +120,9 @@ class Director:
             f"开始制作《{project_title}》第{episode_number}集 "
             f"(episode_id={episode['id']},force={force})")
 
+        standard_snapshot = self._resolve_standard_snapshot(
+            episode["id"], force=force)
+        profile = production_profile(self.config, standard_snapshot)
         aspect = (project["aspect"]
                   or self.config.get("defaults", "aspect", default="9:16"))
         ctx = {
@@ -88,6 +134,8 @@ class Director:
             "dims": ASPECT_DIMS.get(aspect, ASPECT_DIMS["9:16"]),
             "provided_script": script,
             "feedback": feedback,
+            "production_standard": standard_snapshot,
+            "production_profile": profile,
         }
         stage_reports = []
         failed = False
@@ -135,6 +183,13 @@ class Director:
                 "publish": ctx.get("publish_kit", {}).get("uri", ""),
             },
             "aspect": ctx["aspect"],
+            "production_standard": {
+                "profile_key": standard_snapshot.get("profile_key", ""),
+                "version": standard_snapshot.get("version"),
+                "version_id": standard_snapshot.get("version_id"),
+                "name": standard_snapshot.get("name", ""),
+                "fingerprint": standard_snapshot.get("fingerprint", ""),
+            },
         }
         (ctx["out_root"] / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2),
@@ -265,18 +320,53 @@ class Director:
             meta={"version": version}, episode_id=episode["id"])
         return {"version": version, "scenes": len(script["scenes"])}
 
+    def _stage_continuity(self, ctx):
+        """项目角色/场景/文字规则与生产配置的单集快照。"""
+        if not ctx.get("force"):
+            existing, version = self.projects.latest_document(
+                ctx["episode"]["id"], "continuity")
+            if (existing is not None
+                    and existing.get("pipeline_version") == PIPELINE_VERSION
+                    and existing.get("production_profile", {}).get(
+                        "standard_fingerprint") == ctx[
+                            "production_profile"].get(
+                                "standard_fingerprint")):
+                ctx["continuity"] = existing
+                return {"version": version, "reused": True,
+                        "characters": len(existing.get("characters", [])),
+                        "scenes": len(existing.get("scenes", []))}
+        continuity = build_continuity_bible(
+            ctx["project"], ctx["script"], ctx["production_profile"])
+        version = self.projects.save_document(
+            ctx["episode"]["id"], "continuity", continuity)
+        ctx["continuity"] = continuity
+        return {"version": version,
+                "characters": len(continuity["characters"]),
+                "scenes": len(continuity["scenes"])}
+
     def _stage_storyboard(self, ctx):
         if not ctx.get("force"):
             existing, version = self.projects.latest_document(
                 ctx["episode"]["id"], "storyboard")
-            if existing is not None:
+            if (existing is not None
+                    and existing.get("pipeline_version") == PIPELINE_VERSION
+                    and existing.get("profile", {}).get(
+                        "standard_fingerprint") == ctx[
+                            "production_profile"].get(
+                                "standard_fingerprint")):
                 ctx["storyboard"] = existing
-                self.log.info("director", f"复用已有分镜 v{version}")
+                self.log.info("director", f"复用已有五维分镜 v{version}")
                 return {"version": version, "reused": True,
                         "shots": len(existing["shots"])}
         result = self._call(
-            ctx, "storyboard", {"script": ctx["script"]}, "storyboard")
-        storyboard = result.data
+            ctx, "storyboard", {
+                "script": ctx["script"],
+                "continuity": ctx["continuity"],
+                "production_profile": ctx["production_profile"],
+            }, "storyboard")
+        storyboard = enrich_storyboard(
+            ctx["script"], result.data, ctx["continuity"],
+            ctx["production_profile"], style=ctx["project"].get("style", ""))
         version = self.projects.save_document(
             ctx["episode"]["id"], "storyboard", storyboard)
         ctx["storyboard"] = storyboard
@@ -284,8 +374,11 @@ class Director:
             self.assets.register(
                 ctx["project"]["id"], "prompt",
                 f"e{ctx['episode']['number']:03d}_shot{shot['shot_no']:03d}",
-                meta={"prompt": shot["prompt"]})
-        return {"version": version, "shots": len(storyboard["shots"])}
+                meta={"prompt": shot["prompt"],
+                      "seedance_prompt": shot["seedance_prompt"],
+                      "unit_id": shot["unit_id"]})
+        return {"version": version, "shots": len(storyboard["shots"]),
+                "pipeline_version": storyboard["pipeline_version"]}
 
     def _stage_cast(self, ctx):
         """人物立绘与场景概念图:项目级资产,跨集复用保证形象一致。"""
@@ -358,14 +451,31 @@ class Director:
     def _shot_payload(self, ctx, shot):
         locations = self._scene_locations(ctx)
         location = locations.get(shot["scene_no"], "")
+        profile = (ctx.get("production_profile")
+                   or (ctx.get("storyboard") or {}).get("profile")
+                   or production_profile(
+                       self.config, ctx.get("production_standard")))
         return {
             "shot_no": shot["shot_no"],
+            "unit_id": shot.get("unit_id"),
             "prompt": shot["prompt"],
+            "seedance_prompt": shot.get("seedance_prompt", shot["prompt"]),
             "characters": shot["characters"],
+            "character_count": shot.get(
+                "character_count", len(shot["characters"])),
             "location": location,
             "dialogue": shot.get("dialogue"),
             "camera": shot.get("camera", ""),
             "action": shot.get("description", ""),
+            "start_state": shot.get("start_state", {}),
+            "end_state": shot.get("end_state", {}),
+            "five_dimensions": shot.get("five_dimensions", {}),
+            "readable_text": shot.get("readable_text", {}),
+            "performance": shot.get("performance", {}),
+            "shot_contract": shot.get("shot_contract", {}),
+            "sound_design": shot.get("sound_design", {}),
+            "standard_fingerprint": profile.get("standard_fingerprint", ""),
+            "forbid_subtitles": not profile["burn_subtitles"],
             "style": ctx["project"]["style"] or "",
             "aspect": ctx["aspect"], **ctx["dims"],
             **self._art_refs(ctx, shot["characters"], location),
@@ -389,6 +499,34 @@ class Director:
             ctx["images"].append(
                 {"shot_no": shot["shot_no"], "uri": result.uri})
         return {"count": len(ctx["images"]), "reused": reused}
+
+    def _stage_text_assets(self, ctx):
+        """所有可读文字先由关键帧锁定；无文字单元自动通过。"""
+        existing, version = self.projects.latest_document(
+            ctx["episode"]["id"], "text_assets")
+        if (not ctx.get("force") and existing is not None
+                and existing.get("passed")):
+            ctx["text_assets"] = existing
+            return {"version": version, "reused": True,
+                    "assets": len(existing.get("assets", [])),
+                    "passed": True}
+        images = {i["shot_no"]: i["uri"] for i in ctx["images"]}
+        storyboard, manifest = lock_text_assets(
+            ctx["storyboard"], images,
+            ctx["production_profile"]["text_lock_provider"])
+        if storyboard != ctx["storyboard"]:
+            sb_version = self.projects.save_document(
+                ctx["episode"]["id"], "storyboard", storyboard)
+        else:
+            _, sb_version = self.projects.latest_document(
+                ctx["episode"]["id"], "storyboard")
+        version = self.projects.save_document(
+            ctx["episode"]["id"], "text_assets", manifest)
+        ctx["storyboard"] = storyboard
+        ctx["text_assets"] = manifest
+        return {"version": version, "storyboard_version": sb_version,
+                "assets": len(manifest["assets"]),
+                "passed": manifest["passed"]}
 
     def _stage_frames(self, ctx):
         images = {i["shot_no"]: i["uri"] for i in ctx["images"]}
@@ -418,6 +556,24 @@ class Director:
             })
         return {"count": len(ctx["frames"]), "reused": reused}
 
+    def _stage_preflight(self, ctx):
+        """确认前硬门禁：任一项未过都不能消耗 Seedance 额度。"""
+        report = build_preflight(
+            ctx["script"], ctx["storyboard"], ctx["continuity"],
+            ctx["text_assets"], ctx["frames"], ctx["production_profile"])
+        version = self.projects.save_document(
+            ctx["episode"]["id"], "preflight", report)
+        (ctx["out_root"] / "preflight_report.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        ctx["preflight"] = report
+        if not report["passed"]:
+            failed = [g["label"] for g in report["gates"]
+                      if not g["passed"] and g.get("severity") != "warning"]
+            raise AifosError("生产门禁未通过: " + "、".join(failed))
+        return {"version": version, "passed": True,
+                "gates": len(report["gates"]), "units": report["units"]}
+
     def _stage_videos(self, ctx):
         frames = {f["shot_no"]: f for f in ctx["frames"]}
         ctx["videos"] = []
@@ -432,7 +588,8 @@ class Director:
                 ctx["videos"].append({
                     "shot_no": shot["shot_no"], "uri": existing,
                     "duration": shot["duration"],
-                    "provider": meta.get("provider", "")})
+                    "provider": meta.get("provider", ""),
+                    "audio_in_video": meta.get("audio_in_video")})
                 reused += 1
                 continue
             ctx["videos"].append(self._make_video(ctx, shot, frames))
@@ -442,49 +599,89 @@ class Director:
         frame = frames[shot["shot_no"]]
         result = self._call(ctx, "video", {
             "shot_no": shot["shot_no"],
-            "prompt": shot["prompt"],
-            "dialogue": shot.get("dialogue"),
+            "unit_id": shot.get("unit_id"),
+            "prompt": shot.get("seedance_prompt", shot["prompt"]),
             "duration": shot["duration"],
             "first": frame["first"],
             "last": frame["last"],
+            "dialogue": shot.get("dialogue"),
+            "voice": ctx["production_profile"]["voice"],
+            "lip_sync": ctx["production_profile"]["lip_sync"],
+            "forbid_subtitles": not ctx["production_profile"]["burn_subtitles"],
+            "standard_fingerprint": ctx["production_profile"].get(
+                "standard_fingerprint", ""),
             "aspect": ctx["aspect"], **ctx["dims"],
         }, "videos")
+        provider = self.router.providers.get(result.provider)
+        audio_in_video = bool(
+            provider and provider.conf.get("audio_in_video"))
+        # mock 是正式有声产线的离线契约模拟；它会把实际执行的
+        # voice/lip_sync 回写结果，用结果而不是仅凭 production profile 判定。
+        if (provider and "audio_in_video" not in provider.conf
+                and provider.conf.get("type") == "mock"
+                and result.data.get("voice") == "jimeng_builtin"
+                and result.data.get("lip_sync")):
+            audio_in_video = True
         self._register_shot_asset(ctx, "video", shot["shot_no"], result.uri,
-                                  meta={"provider": result.provider})
+                                  meta={"provider": result.provider,
+                                        "audio_in_video": audio_in_video})
         return {"shot_no": shot["shot_no"], "uri": result.uri,
-                "duration": shot["duration"], "provider": result.provider}
+                "duration": shot["duration"], "provider": result.provider,
+                "audio_in_video": audio_in_video}
+
+    def _video_audio_states(self, ctx):
+        """按实际视频资产/Provider 声明返回每镜是否内置配音。"""
+        states = []
+        for video in ctx.get("videos") or []:
+            provider = self.router.providers.get(video.get("provider", ""))
+            declared = (video.get("audio_in_video")
+                        if video.get("audio_in_video") is not None
+                        else (provider.conf.get("audio_in_video")
+                              if provider is not None else False))
+            states.append(bool(declared))
+        return states
 
     def _videos_carry_audio(self, ctx):
-        """视频是否自带配音(Seedance2 有声视频)→ 免单独 TTS。"""
-        videos = ctx.get("videos") or []
-        if not videos:
+        """视频是否全部自带配音(Seedance2 有声视频)。"""
+        states = self._video_audio_states(ctx)
+        if not states:
             return False
-        for video in videos:
-            provider = self.router.providers.get(video.get("provider", ""))
-            if provider is None or \
-                    not provider.conf.get("audio_in_video"):
-                return False
-        return True
+        return all(states)
 
     def _stage_voices(self, ctx):
         ctx["voices"] = []
         ctx["subtitles"] = []
-        line_no = 0
-        for scene in ctx["script"]["scenes"]:
-            for line in scene["lines"]:
-                line_no += 1
-                ctx["subtitles"].append({
-                    "line_no": line_no,
-                    "character": line["character"],
-                    "text": line["dialogue"],
-                })
-        # 默认方案:Seedance2 有声视频,配音随视频生成,无需单独 TTS
-        if self._videos_carry_audio(ctx):
+        ctx["voice_mode"] = ctx["production_profile"]["voice"]
+        ctx["lip_sync"] = ctx["production_profile"]["lip_sync"]
+        lines = sum(len(scene.get("lines", []))
+                    for scene in ctx["script"].get("scenes", []))
+        audio_states = self._video_audio_states(ctx)
+        all_videos_carry_audio = self._videos_carry_audio(ctx)
+        if audio_states and any(audio_states) and not all(audio_states):
+            raise AifosError(
+                "同一集禁止混用有声与无声视频 Provider：会造成重复配音、"
+                "口型错位或部分镜头无声")
+        # 标准漫剧产线的声音与口型在即梦视频单元内完成，不再生成独立
+        # 对白字幕或二次 TTS，避免音色、嘴型与镜头时长三者漂移。
+        if all_videos_carry_audio:
             ctx["voice_carried"] = True
             self._task_providers.add("随视频配音(seedance2)")
             self.log.info(
-                "director", "视频产线自带配音(有声视频),跳过独立 TTS")
-            return {"count": 0, "carried_by_video": True}
+                "director", "Seedance2 有声视频内置配音与口型，"
+                "跳过独立 TTS 和对白字幕轨")
+            return {"mode": "jimeng_builtin", "count": 0,
+                    "reused": 0, "lines": lines,
+                    "lip_sync": bool(ctx["lip_sync"]), "subtitles": 0,
+                    "integrated_in_video": True,
+                    "carried_by_video": True,
+                    "provider_audio_confirmed": True}
+        if (ctx["production_profile"].get("pipeline_version")
+                == PIPELINE_VERSION
+                and ctx["voice_mode"] == "jimeng_builtin"):
+            raise AifosError(
+                "SK V3.2 专业标准要求所有视频随 Seedance2 内置"
+                "配音与对口型；当前视频 Provider 未声明 "
+                "audio_in_video，已阻止错位的独立 TTS")
         line_no = 0
         reused = 0
         for scene in ctx["script"]["scenes"]:
@@ -504,7 +701,17 @@ class Director:
                 else:
                     ctx["voices"].append(
                         self._make_voice(ctx, line_no, line))
-        return {"count": len(ctx["voices"]), "reused": reused}
+                if ctx["production_profile"]["burn_subtitles"]:
+                    ctx["subtitles"].append({
+                        "line_no": line_no,
+                        "character": line["character"],
+                        "text": line["dialogue"],
+                    })
+        return {"mode": ctx["voice_mode"],
+                "count": len(ctx["voices"]), "reused": reused,
+                "lines": lines, "lip_sync": bool(ctx["lip_sync"]),
+                "subtitles": len(ctx["subtitles"]),
+                "integrated_in_video": False}
 
     def _make_voice(self, ctx, line_no, line):
         result = self._call(ctx, "voice", {
@@ -524,7 +731,11 @@ class Director:
         result = self._call(ctx, "edit", {
             "shots": ctx["videos"],
             "voices": ctx["voices"],
-            "subtitles": ctx["subtitles"],
+            "subtitles": [] if not ctx["production_profile"]["burn_subtitles"]
+            else ctx["subtitles"],
+            "voice_mode": ctx.get("voice_mode", ""),
+            "lip_sync": ctx.get("lip_sync", False),
+            "forbid_subtitles": not ctx["production_profile"]["burn_subtitles"],
             "aspect": ctx["aspect"], **ctx["dims"],
         }, "edit")
         ctx["final_uri"] = result.uri
@@ -536,7 +747,22 @@ class Director:
         return result.data
 
     def _stage_qc(self, ctx):
-        """质检 + 按评分自动重跑(重生成缺失镜头/配音后重剪、复检)。"""
+        """自动检查 + 图文检查板 + 逐段内容复核 + 交付脚本。"""
+        content_review = build_content_review(
+            ctx["script"], ctx["storyboard"], ctx["continuity"])
+        content_path = ctx["out_root"] / "content_review.json"
+        content_path.write_text(
+            json.dumps(content_review, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        self.projects.save_document(
+            ctx["episode"]["id"], "content_review", content_review)
+        review_board = write_review_board(ctx, content_review)
+        ctx["content_review"] = content_review
+        ctx["review_board"] = review_board
+        ep_name = f"e{ctx['episode']['number']:03d}"
+        self.assets.register(
+            ctx["project"]["id"], "review_board", ep_name,
+            uri=review_board, meta={"passed": content_review["passed"]})
         max_retries = self.config.get("retry", "max_retries", default=2)
         report = None
         for attempt in range(max_retries + 1):
@@ -549,6 +775,23 @@ class Director:
             if not fixable or attempt == max_retries:
                 break
             self._rerun(ctx, report)
+        delivery = write_delivery_verifier(
+            ctx, review_board, content_review)
+        if not delivery.get("passed"):
+            report["issues"].append({
+                "check": "delivery", "severity": "error",
+                "shot_no": None, "line_no": None, "rerunnable": False,
+                "message": "交付复核脚本未通过",
+            })
+            report["score"] = max(0, report["score"] - 15)
+            report["passed"] = False
+        report["content_review"] = content_review
+        report["review_board"] = review_board
+        report["delivery_check"] = delivery
+        report["technical_passed"] = not any(
+            i["severity"] == "error" and i["check"] not in ("content",)
+            for i in report["issues"])
+        report["content_passed"] = content_review["passed"]
         ctx["qc_report"] = report
         self.projects.set_qc_score(ctx["episode"]["id"], report["score"])
         report_path = ctx["out_root"] / "qc_report.json"
@@ -560,7 +803,9 @@ class Director:
                 "qc", f"质检未通过(得分 {report['score']}),"
                 "不可自动修复的问题已写入报告")
         return {"score": report["score"], "passed": report["passed"],
-                "issues": len(report["issues"])}
+                "issues": len(report["issues"]),
+                "content_passed": content_review["passed"],
+                "delivery_passed": delivery.get("passed", False)}
 
     def _rerun(self, ctx, report):
         shots = {s["shot_no"]: s for s in ctx["storyboard"]["shots"]}
@@ -647,6 +892,17 @@ class Director:
             self.data.record(
                 "voice", label, uri=voice["uri"],
                 meta={"line_no": voice["line_no"]}, episode_id=episode_id)
+        if not ctx.get("voices") and ctx.get("voice_mode") == "jimeng_builtin":
+            self.data.record(
+                "voice", label, uri=ctx.get("final_uri", ""),
+                meta={"mode": "jimeng_builtin", "lip_sync": True,
+                      "integrated_in_video": True}, episode_id=episode_id)
+        self.data.record(
+            "review", label, uri=ctx.get("review_board", ""),
+            meta={"content_passed": ctx.get("content_review", {}).get("passed"),
+                  "delivery_passed": ctx.get("qc_report", {}).get(
+                      "delivery_check", {}).get("passed")},
+            episode_id=episode_id)
         self.data.record(
             "case", label,
             prompt=f"《{ctx['project']['title']}》第{ctx['episode']['number']}集",
@@ -654,6 +910,10 @@ class Director:
             meta={
                 "qc_score": ctx.get("qc_report", {}).get("score"),
                 "cost": self.projects.get_episode(episode_id)["cost"],
+                "standard_version": ctx.get("production_profile", {}).get(
+                    "standard_version"),
+                "standard_fingerprint": ctx.get(
+                    "production_profile", {}).get("standard_fingerprint", ""),
             },
             episode_id=episode_id)
         return {"label": label}

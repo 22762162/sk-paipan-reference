@@ -1,5 +1,6 @@
 """Web 控制台测试:API、后台制作任务、产物服务与目录穿越防护。"""
 
+import copy
 import http.client
 import json
 import threading
@@ -69,6 +70,87 @@ def test_overview_empty(server):
     assert data["episodes"] == []
 
 
+def test_standard_center_api_lifecycle(server):
+    """标准中心 API 覆盖读取、校验、版本、激活、重置与交换包。"""
+    port = server["port"]
+    status, initial = _json_request(port, "GET", "/api/standards")
+    assert status == 200
+    assert initial["active"]["version"] == 1
+    assert len(initial["active"]["content"]["rules"]["quality_gates"]) == 11
+    assert initial["capabilities"] == {
+        "versioned": True,
+        "episode_snapshot": True,
+        "import_export": True,
+        "locked_paths": [
+            "rules.production.video_model",
+            "rules.production.resolution",
+            "rules.production.voice",
+                "rules.production.lip_sync",
+                "rules.production.burn_subtitles",
+                "rules.production.fast_vip_real_face_conflict",
+            ],
+    }
+
+    content = copy.deepcopy(initial["active"]["content"])
+    content["name"] = "API 高密度测试标准"
+    content["rules"]["dialogue"]["max_chars_per_shot"] = 20
+    status, saved = _json_request(port, "POST", "/api/standards/save", {
+        "content": content,
+        "change_note": "缩短单镜台词",
+        "activate": False,
+        "expected_active_id": initial["active"]["version_id"],
+    })
+    assert status == 201
+    draft = saved["standard"]
+    assert draft["version"] == 2
+    assert draft["active"] is False
+
+    invalid = copy.deepcopy(content)
+    invalid["rules"]["production"]["video_model"] = "seedance2.0_vip"
+    status, rejected = _json_request(
+        port, "POST", "/api/standards/save", {"content": invalid})
+    assert status == 400
+    assert rejected["error"] == "制作标准校验失败"
+    assert any(item["path"] == "rules.production.video_model"
+               for item in rejected["issues"])
+
+    status, activated = _json_request(
+        port, "POST", "/api/standards/activate",
+        {"version_id": draft["version_id"]})
+    assert status == 200
+    assert activated["standard"]["active"] is True
+
+    status, bundle = _json_request(
+        port, "GET", f"/api/standards/export?version_id={draft['version_id']}")
+    assert status == 200
+    assert bundle["schema"] == "aifos.production-standard/v1"
+    assert bundle["standard"]["fingerprint"] == draft["fingerprint"]
+
+    status, reset = _json_request(
+        port, "POST", "/api/standards/reset",
+        {"change_note": "API 恢复厂标"})
+    assert status == 201
+    assert reset["standard"]["version"] == 3
+    assert reset["standard"]["content"]["name"] == "SK AI 漫剧工业制作标准 V5"
+
+    status, imported = _json_request(
+        port, "POST", "/api/standards/import", {
+            "bundle": bundle,
+            "change_note": "API 重新导入高密度标准",
+            "activate": True,
+        })
+    assert status == 201
+    assert imported["standard"]["version"] == 4
+    assert imported["standard"]["active"] is True
+    assert imported["standard"]["content"]["rules"]["dialogue"][
+        "max_chars_per_shot"] == 20
+
+    status, final = _json_request(port, "GET", "/api/standards")
+    assert status == 200
+    assert final["active"]["version_id"] == imported["standard"]["version_id"]
+    assert len(final["history"]) == 4
+
+
 def test_produce_flow_and_episode_api(server):
     port = server["port"]
     # Web 默认流程:预生产 → 待确认
@@ -107,6 +189,9 @@ def test_produce_flow_and_episode_api(server):
     art = detail["artifacts"]
     shot_keys = list(art["images"].keys())
     assert shot_keys, "关键图索引不能为空"
+    assert art["video_audio"] and all(art["video_audio"].values())
+    assert set(art["video_providers"].values()) == {"mock"}
+    assert art["voices"] == {}, "随视频配音模式不应产生外挂对白音轨"
     assert art["cover"] and art["final"]
     assert len(art["titles"]) == 3
     # 产物 URL 可访问且类型正确
