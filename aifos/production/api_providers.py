@@ -117,8 +117,13 @@ class ClaudeApiProvider(Provider):
         data = extract_json(text)
         if data is None:
             raise ProviderError(f"{self.name} 应答中未找到 JSON 对象")
-        error = (validate_script(data, payload) if capability == "script"
-                 else validate_storyboard(data))
+        try:
+            error = (validate_script(data, payload)
+                     if capability == "script"
+                     else validate_storyboard(data))
+        except Exception as exc:   # 任何畸形结构都转产线错误,可自动回退
+            raise ProviderError(
+                f"{self.name} 输出结构异常: {exc}") from exc
         if error:
             raise ProviderError(f"{self.name} 输出校验失败: {error}")
         return ProviderResult(

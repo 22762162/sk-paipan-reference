@@ -117,11 +117,19 @@ def validate_script(script, payload):
 def validate_storyboard(storyboard):
     if not isinstance(storyboard, dict) or not storyboard.get("shots"):
         return "缺少 shots"
+    if not isinstance(storyboard["shots"], list):
+        return "shots 需为数组"
     for shot in storyboard["shots"]:
+        if not isinstance(shot, dict):
+            return f"镜头需为对象,收到: {str(shot)[:80]}"
         for field in ("scene_no", "duration", "prompt"):
             if field not in shot:
                 return f"镜头缺少字段 {field}: {shot}"
-        if not shot["duration"] or shot["duration"] <= 0:
+        try:
+            shot["duration"] = float(shot["duration"])
+        except (TypeError, ValueError):
+            return f"镜头时长非法: {shot}"
+        if shot["duration"] <= 0:
             return f"镜头时长非法: {shot}"
         shot.setdefault("characters", [])
         shot.setdefault("kind",

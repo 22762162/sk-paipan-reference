@@ -868,6 +868,10 @@ function updateTopbar(data) {
 /* 局部刷新:只动进度条/数字/剧集表,不重画表单和图片区 → 不闪 */
 function updateDashboard(data) {
   watchBuild(data);
+  // 左上角显示当前运行版本(git 短哈希):一眼判断自动更新是否生效
+  const sub = document.querySelector(".brand-sub");
+  if (sub && data.build && !sub.textContent.includes(data.build))
+    sub.textContent = `V3.2 · ${data.build} · AI 漫剧工业生产系统`;
   updateTopbar(data);
   renderProgressBanner(data);
   const tiles = document.getElementById("tiles");

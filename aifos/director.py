@@ -777,9 +777,23 @@ class Director:
                 "continuity": ctx["continuity"],
                 "production_profile": ctx["production_profile"],
             }, "storyboard")
-        storyboard = enrich_storyboard(
-            ctx["script"], result.data, ctx["continuity"],
-            ctx["production_profile"], style=ctx["project"].get("style", ""))
+        # 原始分镜落盘:加工若出错,凭这份文件即可复现定位
+        raw_path = ctx["out_root"] / "storyboard" / "raw_provider.json"
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_path.write_text(
+            json.dumps(result.data, ensure_ascii=False, indent=1,
+                       default=str),
+            encoding="utf-8")
+        try:
+            storyboard = enrich_storyboard(
+                ctx["script"], result.data, ctx["continuity"],
+                ctx["production_profile"],
+                style=ctx["project"].get("style", ""))
+        except (AttributeError, TypeError, KeyError, ValueError) as exc:
+            # 最后兜底:未知畸形结构给出可行动的错误与原始文件位置
+            raise AifosError(
+                f"分镜产出结构异常({exc});原始分镜已保存在 "
+                f"{raw_path},把该文件发给开发助手即可定位") from exc
         storyboard["script_version"] = ctx.get("script_version")
         version = self.projects.save_document(
             ctx["episode"]["id"], "storyboard", storyboard)
