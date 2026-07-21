@@ -31,11 +31,16 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import __version__
 from ..app import App
+from ..updater import (check_and_update, current_build, repo_root,
+                       restart_process, start_auto_updater)
 from ..errors import AifosError
 from ..smart_input import resolve_produce_target
 from ..standard_center import StandardConflictError, StandardValidationError
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+# 当前代码版本(git 短哈希):前端据此发现服务已自动更新并自动刷新页面
+BUILD = current_build()
 
 MIME = {
     ".html": "text/html; charset=utf-8",
@@ -348,6 +353,7 @@ def _episode_payload(app, episode_id):
         except ValueError:
             render_plan = None
     return {
+        "build": BUILD,
         "episode": dict(episode),
         "project": dict(project),
         "tasks": tasks,
@@ -384,6 +390,7 @@ def _overview_payload(app, jobs):
     active_standard = app.standards.active()
     return {
         "version": __version__,
+        "build": BUILD,
         "production_standard": {
             key: active_standard.get(key) for key in (
                 "version_id", "profile_key", "version", "name",
@@ -558,6 +565,8 @@ def make_handler(workspace, jobs):
                     return self._settings_test()
                 if parsed.path == "/api/settings/detect":
                     return self._settings_detect()
+                if parsed.path == "/api/update":
+                    return self._update_now()
                 if parsed.path == "/api/restyle":
                     return self._restyle()
                 if parsed.path == "/api/reference/upload":
@@ -1070,6 +1079,19 @@ def make_handler(workspace, jobs):
                 return self._error(400, str(exc))
             return self._json(project)
 
+        def _update_now(self):
+            """手动触发自更新:更新成功后 1 秒重启服务(自动恢复)。"""
+            busy = any(j["status"] == "running" for j in jobs.list())
+            if busy:
+                return self._error(409, "有生产任务在跑,空闲后会自动更新")
+            status, detail = check_and_update(repo_root())
+            if status == "updated":
+                def later():
+                    time.sleep(1)
+                    restart_process()
+                threading.Thread(target=later, daemon=True).start()
+            return self._json({"status": status, "detail": detail})
+
         def _restyle(self):
             """一键换画风:{episode_id|project+episode, style?}。
             后台按新画风重做全部形象(立绘/套件/场景),可暂停续做。"""
@@ -1083,8 +1105,9 @@ def make_handler(workspace, jobs):
             style = (body.get("style") or "").strip()
             job_id = jobs.start_task(
                 title, number,
-                lambda app: app.director.restyle_project(
-                    title, number, style=style))
+                lambda app, run_id: app.director.restyle_project(
+                    title, number, style=style),
+                action="restyle", request={"style": style})
             return self._json({"job_id": job_id}, status=202)
 
         def _reference_upload(self):
@@ -1174,4 +1197,23 @@ def serve(workspace, host="127.0.0.1", port=8619):
     """构建并返回 HTTP 服务器(调用方负责 serve_forever)。"""
     jobs = JobRegistry(workspace)
     handler = make_handler(workspace, jobs)
-    return ThreadingHTTPServer((host, port), handler)
+    httpd = ThreadingHTTPServer((host, port), handler)
+    # 零操作自动更新:空闲时拉取新版并自愈重启(可用
+    # defaults.auto_update=false 关闭;非 git 安装自动跳过)
+    app = App(workspace)
+    try:
+        auto = app.config.get("defaults", "auto_update", default=True)
+    finally:
+        app.close()
+    if auto:
+        def on_log(message):
+            worker = App(workspace)
+            try:
+                worker.logger.info("updater", message)
+            finally:
+                worker.close()
+        start_auto_updater(
+            jobs_idle=lambda: all(
+                j["status"] != "running" for j in jobs.list()),
+            on_log=on_log)
+    return httpd

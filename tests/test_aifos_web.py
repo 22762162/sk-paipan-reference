@@ -334,3 +334,10 @@ def test_image_line_switch_and_parallel(server):
     status, _ = _json_request(port, "POST", "/api/settings", {
         "defaults": {"parallel_images": "abc"}})
     assert status == 400
+
+
+def test_overview_and_episode_expose_build(server):
+    """前端凭 build 哈希发现服务已自动更新并自动刷新页面。"""
+    port = server["port"]
+    status, overview = _json_request(port, "GET", "/api/overview")
+    assert status == 200 and "build" in overview

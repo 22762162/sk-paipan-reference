@@ -25,6 +25,18 @@ const durationText = (seconds) => {
   return `${Math.floor(value / 3600)} 小时 ${Math.round(value % 3600 / 60)} 分`;
 };
 
+/* 服务自动更新后 build 变化 → 页面自动刷新,用户零操作 */
+let appBuild = null;
+function watchBuild(data) {
+  if (!data || !data.build) return;
+  if (appBuild === null) { appBuild = data.build; return; }
+  if (appBuild !== data.build) {
+    showToast("平台已自动更新到新版本,页面即将自动刷新…", "ok");
+    setTimeout(() => location.reload(), 1500);
+    appBuild = data.build;
+  }
+}
+
 async function api(path, opts) {
   const res = await fetch(path, opts);
   const data = await res.json().catch(() => ({}));
@@ -855,6 +867,7 @@ function updateTopbar(data) {
 
 /* 局部刷新:只动进度条/数字/剧集表,不重画表单和图片区 → 不闪 */
 function updateDashboard(data) {
+  watchBuild(data);
   updateTopbar(data);
   renderProgressBanner(data);
   const tiles = document.getElementById("tiles");
@@ -2607,6 +2620,7 @@ function pollCanvas(episodeId) {
   pollTimer = setInterval(async () => {
     try {
       const data = await api(`/api/episode/${episodeId}`);
+      watchBuild(data);
       updateLiveStrip(data);          // 状态条每轮都刷新(不重画整页)
       if (canvasSig(data) !== canvasSignature) renderCanvasView(episodeId);
     } catch (e) { /* 下一轮再试 */ }
