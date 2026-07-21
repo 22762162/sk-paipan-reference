@@ -344,7 +344,11 @@ class Director:
                 "error=?, updated_at=? WHERE id=?",
                 (",".join(sorted(self._task_providers)), self._task_cost,
                  str(exc)[:1000], now(), task_id))
-            self.log.error("director", f"阶段 {stage} 失败: {exc}")
+            import traceback
+            trace = traceback.format_exc(limit=3).strip()
+            self.log.error(
+                "director",
+                f"阶段 {stage} 失败: {exc}\n{trace[-600:]}")
             return {"stage": stage, "name": stage_cn, "status": "failed",
                     "cost": round(self._task_cost, 2), "error": str(exc)}
 
@@ -725,7 +729,9 @@ class Director:
                     and existing.get("pipeline_version") == PIPELINE_VERSION
                     and existing.get("script_version") == ctx.get(
                         "script_version")
-                    and existing.get("production_profile", {}).get(
+                    and (existing.get("production_profile")
+                         if isinstance(existing.get("production_profile"),
+                                       dict) else {}).get(
                         "standard_fingerprint") == ctx[
                             "production_profile"].get(
                                 "standard_fingerprint")):
@@ -751,7 +757,9 @@ class Director:
                     and existing.get("pipeline_version") == PIPELINE_VERSION
                     and existing.get("script_version") == ctx.get(
                         "script_version")
-                    and existing.get("profile", {}).get(
+                    and (existing.get("profile")
+                         if isinstance(existing.get("profile"), dict)
+                         else {}).get(
                         "standard_fingerprint") == ctx[
                             "production_profile"].get(
                                 "standard_fingerprint")):

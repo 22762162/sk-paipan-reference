@@ -443,12 +443,73 @@ def _append_performance_beats(raw_shots, script, rules=None):
     return out
 
 
+def _normalize_ai_shot(raw):
+    """AI 分镜的宽松产出 → 统一结构。
+
+    真实编剧模型偶尔会把 dialogue 写成字符串、characters 写成单个名字、
+    camera 写成对象、duration 写成带单位字符串;逐项纠正,
+    避免 'str' object has no attribute 'get' 之类的崩溃。"""
+    if isinstance(raw, str):
+        raw = {"description": raw}
+    elif not isinstance(raw, dict):
+        return None
+    shot = dict(raw)
+    dialogue = shot.get("dialogue")
+    if isinstance(dialogue, str):
+        text = dialogue.strip()
+        shot["dialogue"] = ({"character": "", "dialogue": text}
+                            if text else None)
+    elif isinstance(dialogue, dict):
+        text = str(dialogue.get("dialogue") or "").strip()
+        shot["dialogue"] = ({"character": str(dialogue.get("character")
+                                              or ""),
+                             "dialogue": text} if text else None)
+    else:
+        shot["dialogue"] = None
+    characters = shot.get("characters")
+    if isinstance(characters, str):
+        characters = [characters]
+    shot["characters"] = [str(c) for c in (characters or []) if c]
+    if shot["dialogue"] and not shot["dialogue"]["character"]:
+        shot["dialogue"]["character"] = (shot["characters"][0]
+                                         if shot["characters"] else "")
+    if not isinstance(shot.get("camera"), str):
+        shot["camera"] = str(shot.get("camera") or "")
+    if not isinstance(shot.get("description"), str):
+        shot["description"] = str(shot.get("description") or "")
+    if not isinstance(shot.get("prompt"), str):
+        shot["prompt"] = str(shot.get("prompt") or "")
+    try:
+        shot["scene_no"] = int(shot.get("scene_no"))
+    except (TypeError, ValueError):
+        shot["scene_no"] = None
+    if shot.get("duration") is not None:
+        try:
+            shot["duration"] = float(shot["duration"])
+        except (TypeError, ValueError):
+            shot["duration"] = None
+    return shot
+
+
 def enrich_storyboard(script, storyboard, continuity, profile, style=""):
     """把 Provider 的轻量分镜升级为五维生产分镜。"""
     rules = profile.get("rules", {})
     scenes = _scene_map(script)
-    raw_shots = _append_performance_beats(
-        storyboard.get("shots", []), script, rules)
+    normalized = []
+    fallback_scene = next(
+        (s.get("scene_no") for s in script.get("scenes", [])), 1)
+    last_scene = None
+    for raw in (storyboard or {}).get("shots", []):
+        shot = _normalize_ai_shot(raw)
+        if shot is None:
+            continue
+        if shot.get("scene_no") is None:
+            # AI 忘写场次 → 继承上一镜(开头则归入第一场)
+            shot["scene_no"] = (last_scene if last_scene is not None
+                                else fallback_scene)
+        last_scene = shot["scene_no"]
+        normalized.append(shot)
+    raw_shots = _append_performance_beats(normalized, script, rules)
     previous = {}
     shots = []
     elapsed = 0.0

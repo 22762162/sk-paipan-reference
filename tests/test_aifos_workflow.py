@@ -92,3 +92,47 @@ def test_five_dimension_preflight_and_delivery(tmp_path):
         assert payload["artifacts"]["review_board"]
     finally:
         app.close()
+
+
+def test_enrich_tolerates_loose_ai_storyboard(tmp_path):
+    """真实编剧模型的宽松分镜产出不再崩溃:
+    dialogue 字符串/characters 单名/camera 对象/duration 带单位/整镜字符串。"""
+    from aifos.workflow import (build_continuity_bible, enrich_storyboard,
+                                production_profile)
+
+    script = {
+        "project_title": "容错测试", "episode_number": 1,
+        "episode_title": "T", "logline": "L",
+        "characters": [{"name": "周鹿", "role": "主角"}],
+        "scenes": [{"scene_no": 1, "location": "夜市",
+                    "characters": ["周鹿"], "action": "追查线索",
+                    "lines": [{"character": "周鹿",
+                               "dialogue": "跟上"}]}],
+    }
+    app = App(tmp_path / "ws")
+    try:
+        profile = production_profile(app.config, app.standards.active())
+    finally:
+        app.close()
+    continuity = build_continuity_bible(
+        {"title": "容错测试", "style": ""}, script, profile)
+    loose = {"shots": [
+        "开场空镜一句话描述",                            # 整镜是字符串
+        {"scene_no": "1", "dialogue": "直接一句台词",     # 台词是字符串
+         "characters": "周鹿",                          # 单名而非列表
+         "camera": {"scale": "近景"},                    # 镜头是对象
+         "duration": "2.5"},                            # 数字字符串
+        {"scene_no": 1, "dialogue": {"character": "周鹿",
+                                     "dialogue": ""}},   # 空台词
+        12345,                                           # 非法条目
+    ]}
+    storyboard = enrich_storyboard(script, loose, continuity, profile)
+    shots = storyboard["shots"]
+    assert shots, "宽松产出应被归一化而不是崩溃"
+    talk = next(s for s in shots
+                if (s.get("dialogue") or {}).get("dialogue") == "直接一句台词")
+    assert talk["dialogue"]["character"] == "周鹿"
+    assert talk["characters"] == ["周鹿"]
+    assert all(isinstance(s.get("camera_plan", s.get("camera")), (dict, str))
+               for s in shots)
+    assert all(s["seedance_prompt"] for s in shots)
