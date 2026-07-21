@@ -81,7 +81,9 @@ function route() {
   const standards = location.hash.match(/^#\/standards(?:\/([a-z_]+))?$/);
   const m = location.hash.match(/^#\/episode\/(\d+)$/);
   const settings = location.hash === "#/settings";
-  const area = standards ? "standards" : settings ? "settings" : "dashboard";
+  const assets = location.hash === "#/assets";
+  const area = standards ? "standards" : settings ? "settings"
+    : assets ? "assets" : "dashboard";
   document.querySelectorAll(".main-nav a").forEach((link) => {
     const active = link.dataset.nav === area;
     link.classList.toggle("active", active);
@@ -91,6 +93,7 @@ function route() {
   if (standards) renderStandards(standards[1] || "production");
   else if (m) renderCanvasView(Number(m[1]));
   else if (settings) renderSettings();
+  else if (assets) renderAssetsCenter();
   else renderDashboard();
 }
 
@@ -1415,7 +1418,7 @@ function regenControls(target, label) {
     </div></div>`;
 }
 
-function bindRegen(container, episodeId, getData) {
+function bindRegen(container, episodeId, getData, onDone) {
   container.querySelectorAll(".regen-box").forEach((box) => {
     const form = box.querySelector(".regen-form");
     box.querySelector(".regen-toggle").onclick = () => {
@@ -1435,7 +1438,7 @@ function bindRegen(container, episodeId, getData) {
         pollJob(reply.job_id, (job) => {
           if (job.status === "done") {
             showToast("已重画完成", "ok");
-            renderCanvasView(episodeId);
+            if (onDone) onDone(); else renderCanvasView(episodeId);
           } else { btn.disabled = false; btn.textContent = "重画"; }
         });
       } catch (e) {
@@ -1449,9 +1452,13 @@ function bindRegen(container, episodeId, getData) {
 /* ================= 图片生产清单 =================
    每张要生成的图:分类/名称/提示词/实时状态;可单张改提示词重画 */
 const PLAN_CAT_CN = {
-  character_art: "人物立绘", scene_art: "场景概念图",
+  character_art: "人物立绘",
+  character_sheet: "人物资产套件(四视图/特写/特征/妆容/服装)",
+  scene_art: "场景概念图",
   shot_image: "分镜画面(关键帧)", frames: "首尾帧",
 };
+const PLAN_CATS = ["character_art", "character_sheet", "scene_art",
+  "shot_image", "frames"];
 const PLAN_STATUS_CN = {
   pending: "排队中", generating: "生成中", done: "已完成",
   failed: "失败", reused: "复用已有",
@@ -1481,6 +1488,10 @@ function planItemThumbs(data, item) {
   if (item.category === "character_art") {
     const row = (art.cast_art || []).find((c) => c.name === item.name);
     if (row && row.url) urls = [row.url];
+  } else if (item.category === "character_sheet") {
+    const sheets = (art.character_sheets || {})[item.name] || [];
+    const row = sheets.find((s) => s.sheet === item.sheet);
+    if (row && row.url) urls = [row.url];
   } else if (item.category === "scene_art") {
     const row = (art.scene_art || []).find((s) => s.name === item.name);
     if (row && row.url) urls = [row.url];
@@ -1496,6 +1507,9 @@ function planItemThumbs(data, item) {
 function planTargetOf(item) {
   if (item.category === "character_art")
     return { kind: "character_art", name: item.name };
+  if (item.category === "character_sheet")
+    return { kind: "character_sheet",
+             name: `${item.name}:${item.sheet}` };
   if (item.category === "scene_art")
     return { kind: "scene_art", name: item.name };
   return { kind: "shot", shot_no: item.shot_no };
@@ -1553,7 +1567,7 @@ function mockWarnHtml(data) {
 function renderPlanHtml(data, editable) {
   const items = ((data.render_plan || {}).items) || [];
   if (!items.length) return "";
-  const cats = ["character_art", "scene_art", "shot_image", "frames"]
+  const cats = PLAN_CATS
     .filter((c) => items.some((i) => i.category === c));
   const ready = items.filter(
     (i) => ["done", "reused"].includes(i.status)).length;
@@ -1663,7 +1677,7 @@ function renderPlanBoardHtml(data) {
   const remainN = items.length - ready;
   const avgAll = planAvgDuration(items, null);
   const etaTotal = avgAll && remainN ? avgAll * remainN : null;
-  const cats = ["character_art", "scene_art", "shot_image", "frames"]
+  const cats = PLAN_CATS
     .filter((c) => items.some((i) => i.category === c));
   return `<div class="plan-board">
     <div class="pb-head">
@@ -1716,6 +1730,156 @@ async function showPlanOverlay(episodeId) {
   document.addEventListener("keydown", onKey);
   document.body.appendChild(overlay);
   bindPlanRegen(overlay, episodeId, () => { close(); showPlanOverlay(episodeId); });
+}
+
+/* ================= 资产中心 =================
+   人物资产套件/场景概念图/参考图:浏览、上传参考、替换、单张重画 */
+function assetCardHtml(ep, target, url, label) {
+  const img = url && !url.split("?")[0].endsWith(".json")
+    ? `<img src="${esc(url)}" loading="lazy" alt="">`
+    : `<div class="pc-empty">🖼</div>`;
+  const safe = `${target.kind}_${(target.name || "").replace(/[^\w:]/g, "_")}`;
+  return `<div class="plan-card asset-card">
+    <div class="pc-media">${img}</div>
+    <div class="pc-label" title="${esc(label)}">${esc(label)}</div>
+    ${ep ? `${regenControls(target, "重画")}
+            ${ioControls(target, url || "", safe + ".png")}` : ""}
+  </div>`;
+}
+
+async function renderAssetsCenter(selectedTitle) {
+  topbarRight.innerHTML = "";
+  let ov;
+  try { ov = await api("/api/overview"); }
+  catch (e) {
+    app.innerHTML = `<div class="loading">加载失败:${esc(e.message)}</div>`;
+    return;
+  }
+  const projects = ov.projects || [];
+  if (!projects.length) {
+    app.innerHTML = `<div class="loading">还没有项目。先在生产总览用一句话开始制作,
+      剧本确认后会自动生成完整人物资产套件。</div>`;
+    return;
+  }
+  const stored = localStorage.getItem("aifos.assets.project");
+  const title = selectedTitle
+    || (projects.some((p) => p.title === stored) ? stored
+        : projects[0].title);
+  localStorage.setItem("aifos.assets.project", title);
+  const eps = (ov.episodes || []).filter((e) => e.project === title);
+  const ep = eps[0] || null;
+  let art = { cast_art: [], scene_art: [], character_sheets: {},
+              references: [] };
+  if (ep) {
+    try { art = (await api(`/api/episode/${ep.id}`)).artifacts || art; }
+    catch (e) { /* 项目还没有产物 */ }
+  }
+  const attachOptions = [
+    ...(art.cast_art || []).map((c) => c.name),
+    ...(art.scene_art || []).map((s) => s.name)];
+  app.innerHTML = `
+  <div class="assets-center">
+    <div class="canvas-toolbar">
+      <span class="title">🗂 资产中心</span>
+      <select id="asset-project">${projects.map((p) =>
+        `<option ${p.title === title ? "selected" : ""}>${esc(p.title)}</option>`).join("")}</select>
+      <span class="hint">人物资产套件与场景概念图跨集复用;参考图自动进入出图提示</span>
+    </div>
+    <section class="panel asset-panel">
+      <h2>📎 参考图 <span class="dim">上传后,生成人物/场景/分镜画面时自动作为参考
+        (可全项目通用,或只关联某个角色/场景)</span></h2>
+      <div class="ref-form">
+        <input id="ref-name" placeholder="参考图名称,如:女主官方设定">
+        <input id="ref-attach" list="ref-attach-list"
+          placeholder="关联对象(留空=全项目通用):角色名或场景名">
+        <datalist id="ref-attach-list">${attachOptions.map((n) =>
+          `<option>${esc(n)}</option>`).join("")}</datalist>
+        <button class="primary" id="ref-upload">⬆ 上传参考图</button>
+      </div>
+      <div class="pb-grid ref-grid">${(art.references || []).map((r) => `
+        <div class="plan-card ref-card">
+          <div class="pc-media">${r.url ? `<img src="${esc(r.url)}" loading="lazy" alt="">` : `<div class="pc-empty">🖼</div>`}</div>
+          <div class="pc-label" title="${esc(r.name)}">${esc(r.name)}</div>
+          <div class="dim">${r.attach_to ? "关联:" + esc(r.attach_to) : "全项目通用"}</div>
+          <button class="ref-del" data-name="${esc(r.name)}">删除</button>
+        </div>`).join("")
+        || `<div class="dim">还没有参考图。上传后所有出图自动参考,人物形象更稳定。</div>`}
+      </div>
+    </section>
+    <section class="panel asset-panel">
+      <h2>👤 人物资产 <span class="dim">立绘 + 四视图/面部特写/特征/妆容/服装/服装细节,
+        全部可重画、可上传替换、可下载</span></h2>
+      ${(art.cast_art || []).length ? art.cast_art.map((c) => {
+        const sheets = (art.character_sheets || {})[c.name] || [];
+        return `<div class="char-suite">
+          <h3>${esc(c.name)} <span class="dim">${esc(c.role || "")}</span></h3>
+          <div class="pb-grid">
+            ${assetCardHtml(ep, { kind: "character_art", name: c.name }, c.url, "立绘")}
+            ${sheets.map((s) => assetCardHtml(
+              ep, { kind: "character_sheet", name: s.name }, s.url,
+              s.label || s.sheet)).join("")}
+          </div></div>`;
+      }).join("")
+      : `<div class="dim">本项目还没有人物资产。开始制作一集并确认剧本后,
+         会自动生成每个角色的完整资产套件。</div>`}
+    </section>
+    <section class="panel asset-panel">
+      <h2>🏞 场景概念图</h2>
+      <div class="pb-grid">${(art.scene_art || []).map((s) =>
+        assetCardHtml(ep, { kind: "scene_art", name: s.name }, s.url,
+                      s.name)).join("")
+        || `<div class="dim">暂无场景概念图。</div>`}</div>
+    </section>
+  </div>`;
+  document.getElementById("asset-project").onchange = (ev) =>
+    renderAssetsCenter(ev.target.value);
+  const reload = () => renderAssetsCenter(title);
+  if (ep) {
+    bindRegen(app, ep.id, () => null, reload);
+    bindIo(app, ep.id, reload);
+  }
+  document.getElementById("ref-upload").onclick = () => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*";
+    input.onchange = () => {
+      const file = input.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = async () => {
+        try {
+          await api("/api/reference/upload", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              project: title,
+              name: document.getElementById("ref-name").value.trim()
+                    || file.name.replace(/\.[^.]+$/, ""),
+              attach_to: document.getElementById("ref-attach").value.trim(),
+              filename: file.name,
+              data_base64: String(reader.result).split(",")[1] || "",
+            }),
+          });
+          showToast("参考图已上传,之后出图会自动参考", "ok");
+          reload();
+        } catch (e) { showToast(e.message, "error"); }
+      };
+      reader.readAsDataURL(file);
+    };
+    input.click();
+  };
+  app.querySelectorAll(".ref-del").forEach((btn) => {
+    btn.onclick = (ev) => armConfirm(ev.target, "删除", async () => {
+      try {
+        await api("/api/reference/delete", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ project: title, name: btn.dataset.name }),
+        });
+        showToast("参考图已删除", "ok");
+        reload();
+      } catch (e) { showToast(e.message, "error"); }
+    });
+  });
 }
 
 /* 可内联播放的媒体标签(真实产线 mp4/wav;mock 的 json 描述文件回退为链接) */

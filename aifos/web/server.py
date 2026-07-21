@@ -200,6 +200,21 @@ def _collect_artifacts(app, project_id, ep_num):
         {"name": row["name"],
          "url": _versioned(_artifact_url(app, row["uri"]), row)}
         for row in latest_rows("scene_art")]
+    # 人物资产套件(四视图/特写/特征/妆容/服装/服装细节)按角色分组
+    sheets = {}
+    for row in latest_rows("character_sheet"):
+        meta = json.loads(row["meta"] or "{}")
+        sheets.setdefault(meta.get("character", ""), []).append({
+            "name": row["name"], "sheet": meta.get("sheet", ""),
+            "label": meta.get("label", ""),
+            "url": _versioned(_artifact_url(app, row["uri"]), row)})
+    out["character_sheets"] = sheets
+    out["references"] = [
+        {"name": row["name"],
+         "attach_to": json.loads(row["meta"] or "{}").get("attach_to", ""),
+         "note": json.loads(row["meta"] or "{}").get("note", ""),
+         "url": _versioned(_artifact_url(app, row["uri"]), row)}
+        for row in latest_rows("reference")]
     return out
 
 
@@ -420,6 +435,10 @@ def make_handler(workspace, jobs):
                     return self._settings_test()
                 if parsed.path == "/api/settings/detect":
                     return self._settings_detect()
+                if parsed.path == "/api/reference/upload":
+                    return self._reference_upload()
+                if parsed.path == "/api/reference/delete":
+                    return self._reference_delete()
                 if parsed.path == "/api/project/rename":
                     return self._project_rename()
                 if parsed.path == "/api/stop":
@@ -735,9 +754,9 @@ def make_handler(workspace, jobs):
                 return self._error(400, "请求体不是合法 JSON")
             target = body.get("target") or {}
             if target.get("kind") not in ("character_art", "scene_art",
-                                          "shot"):
-                return self._error(400, "target.kind 需为 "
-                                        "character_art/scene_art/shot")
+                                          "shot", "character_sheet"):
+                return self._error(400, "target.kind 需为 character_art/"
+                                        "scene_art/shot/character_sheet")
             found = self._episode_ref(body)
             if found is None:
                 return self._error(404, "剧集不存在")
@@ -866,6 +885,48 @@ def make_handler(workspace, jobs):
             except AifosError as exc:
                 return self._error(400, str(exc))
             return self._json(project)
+
+        def _reference_upload(self):
+            """参考图上传:{project, name, attach_to, note, filename,
+            data_base64};出图时自动注入提示(全局或关联角色/场景)。"""
+            import base64
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            title = (body.get("project") or "").strip()
+            if not title:
+                return self._error(400, "缺少 project")
+            try:
+                data = base64.b64decode(body.get("data_base64", ""))
+            except Exception:
+                return self._error(400, "data_base64 解码失败")
+            if not data:
+                return self._error(400, "文件为空")
+            if len(data) > 50 * 1024 * 1024:
+                return self._error(400, "参考图超过 50MB")
+            ext = Path(body.get("filename", "")).suffix.lower() or ".png"
+            try:
+                result = self._with_app(
+                    lambda app: app.director.add_reference(
+                        title, body.get("name", ""), data, ext,
+                        attach_to=(body.get("attach_to") or "").strip(),
+                        note=(body.get("note") or "").strip()))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _reference_delete(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.delete_reference(
+                        (body.get("project") or "").strip(),
+                        (body.get("name") or "").strip()))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
 
         def _upload(self):
             """人工修改素材上传:{episode_id, target, filename, data_base64}。

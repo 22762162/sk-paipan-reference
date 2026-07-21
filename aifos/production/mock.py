@@ -412,6 +412,15 @@ class MockProvider(Provider):
                                 payload.get("role", "")),
                 encoding="utf-8")
             return {"name": name}, str(path)
+        if payload.get("character_sheet"):
+            name = payload.get("art_name", "")
+            key = payload["character_sheet"]
+            path = out_dir / f"sheet_{_safe_name(name)}_{key}.svg"
+            path.write_text(
+                render_portrait(width, height, seed, name,
+                                payload.get("sheet_label", key)),
+                encoding="utf-8")
+            return {"name": name, "sheet": key}, str(path)
         if payload.get("scene_art"):
             name = payload.get("art_name", "")
             path = out_dir / f"scene_{_safe_name(name)}.svg"

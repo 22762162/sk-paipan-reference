@@ -169,7 +169,8 @@ def test_render_plan_lists_every_image_with_prompt(app):
     app.director.produce("万妖图录", 1, pause_for_confirm=True)   # 预生产停
     plan = _plan_of(app, "万妖图录", 1)
     cats = {i["category"] for i in plan["items"]}
-    assert cats == {"character_art", "scene_art", "shot_image", "frames"}
+    assert cats == {"character_art", "character_sheet", "scene_art",
+                    "shot_image", "frames"}
     assert all(i["prompt"] for i in plan["items"])
     assert all(i["status"] in ("done", "reused") for i in plan["items"])
     # 现画的图都有单张耗时(前端据此估算剩余时间)

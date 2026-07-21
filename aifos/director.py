@@ -7,6 +7,7 @@
 """
 
 import json
+import time
 from pathlib import Path
 
 from .db import now
@@ -49,6 +50,24 @@ STAGES = [
 # 预生产检查点:此阶段完成后可暂停等待用户确认,
 # 确认后才进入视频生产(真实产线从这里开始消耗即梦额度)
 CONFIRM_AFTER = "preflight"
+
+# 人物完整资产套件:立绘之外每个角色补齐的生产级设定资产
+# (项目级,跨集复用;全部以立绘和用户参考图为基准保证同一形象)
+CHARACTER_SHEETS = [
+    ("turnaround", "四视图",
+     "标准四视图设定:正面/侧面/背面/四分之三视角并排一张图,"
+     "全身等比例,发型服装配色完全一致"),
+    ("closeup", "面部特写",
+     "面部大特写:五官、发际线、瞳色细节清晰,中性表情"),
+    ("features", "特征设定",
+     "辨识特征拆解:发型、瞳色、体态、标志性配饰逐项放大标注"),
+    ("makeup", "妆容设定",
+     "妆容细节:底妆、眉眼妆、唇色、特殊纹样,正面半身"),
+    ("costume", "服装设定",
+     "全身服装设定:正面站姿,服装配色、材质与层次清晰完整"),
+    ("costume_detail", "服装细节",
+     "服装细节拆解:纹样、扣饰、腰带、鞋履、佩饰逐项放大展示"),
+]
 
 
 class Director:
@@ -331,6 +350,10 @@ class Director:
     def _scene_prompt(self, location, style):
         return f"场景概念图:{location},{style},空镜,氛围感"
 
+    def _sheet_prompt(self, name, role, style, label, desc):
+        return (f"角色{label}:{name}({role}),{style},{desc};"
+                "与立绘同一人物、同一发型服装配色,严格保持形象一致")
+
     def _plan_path(self, ctx):
         return ctx["out_root"] / "render_plan.json"
 
@@ -365,7 +388,8 @@ class Director:
             if prev is not None:
                 item["status"] = prev.get("status", "pending")
                 item["error"] = prev.get("error", "")
-                for key in ("provider", "real", "fallbacks"):
+                for key in ("provider", "real", "fallbacks",
+                            "started_at", "finished_at", "duration"):
                     if key in prev:
                         item[key] = prev[key]
                 if prev.get("custom_prompt"):
@@ -385,6 +409,14 @@ class Director:
                 return
             item["status"] = status
             item["error"] = error
+            # 计时:生成中记起点,完成/失败记单张耗时(供前端估算剩余时间)
+            if status == "generating":
+                item["started_at"] = round(time.time(), 1)
+                item.pop("finished_at", None)
+            elif status in ("done", "failed") and item.get("started_at"):
+                item["finished_at"] = round(time.time(), 1)
+                item["duration"] = round(
+                    item["finished_at"] - item["started_at"], 1)
             if prompt is not None and prompt != item.get("prompt"):
                 item["prompt"] = prompt
                 item["custom_prompt"] = True
@@ -571,6 +603,15 @@ class Director:
              "prompt": self._portrait_prompt(
                  c["name"], c.get("role", ""), style)}
             for c in characters])
+        self._plan_seed(ctx, "character_sheet", [
+            {"id": f"sheet:{c['name']}:{key}",
+             "category": "character_sheet",
+             "label": f"{c['name']} · {label}",
+             "name": c["name"], "sheet": key,
+             "prompt": self._sheet_prompt(
+                 c["name"], c.get("role", ""), style, label, desc)}
+            for c in characters
+            for key, label, desc in CHARACTER_SHEETS])
         self._plan_seed(ctx, "scene_art", [
             {"id": f"scene:{loc}", "category": "scene_art",
              "label": loc, "name": loc,
@@ -590,18 +631,58 @@ class Director:
                 self._plan_mark(ctx, f"char:{name}", "reused",
                                 only_pending=True)
                 continue
+            reference = self._reference_uris(project_id, [name])
             result = self._plan_run(ctx, f"char:{name}", lambda: self._call(
                 ctx, "image", {
                     "portrait": True, "art_name": name, "role": role,
                     "shot_no": 0, "characters": [name], "location": "",
                     "prompt": self._portrait_prompt(name, role, style),
                     "style": style,
+                    "reference_images": reference,
                     "aspect": ctx["aspect"], **ctx["dims"],
                 }, "cast"))
             self.assets.register(
                 project_id, "character_art", name, uri=result.uri,
                 meta={"role": role})
             created += 1
+        # 人物完整资产套件:四视图/特写/特征/妆容/服装/服装细节
+        for character in characters:
+            name = character["name"]
+            role = character.get("role", "")
+            portrait = self.assets.latest(project_id, "character_art", name)
+            portrait_uri = (portrait["uri"]
+                            if portrait and portrait["uri"]
+                            and Path(portrait["uri"]).exists() else None)
+            reference = self._reference_uris(project_id, [name])
+            for key, label, desc in CHARACTER_SHEETS:
+                asset_name = f"{name}:{key}"
+                existing = self._existing_asset_uri(
+                    ctx, "character_sheet", asset_name)
+                if existing:
+                    reused += 1
+                    self._plan_mark(ctx, f"sheet:{name}:{key}", "reused",
+                                    only_pending=True)
+                    continue
+                result = self._plan_run(
+                    ctx, f"sheet:{name}:{key}", lambda: self._call(
+                        ctx, "image", {
+                            "character_sheet": key, "sheet_label": label,
+                            "art_name": name, "role": role,
+                            "shot_no": 0, "characters": [name],
+                            "location": "",
+                            "prompt": self._sheet_prompt(
+                                name, role, style, label, desc),
+                            "style": style,
+                            "character_refs": (
+                                [portrait_uri] if portrait_uri else []),
+                            "reference_images": reference,
+                            "aspect": ctx["aspect"], **ctx["dims"],
+                        }, "cast"))
+                self.assets.register(
+                    project_id, "character_sheet", asset_name,
+                    uri=result.uri,
+                    meta={"character": name, "sheet": key, "label": label})
+                created += 1
         for scene in ctx["script"]["scenes"]:
             location = scene["location"]
             self.assets.acquire(project_id, "scene", location)
@@ -618,6 +699,8 @@ class Director:
                     "action": scene.get("action", ""),
                     "prompt": self._scene_prompt(location, style),
                     "style": style,
+                    "reference_images": self._reference_uris(
+                        project_id, [location]),
                     "aspect": ctx["aspect"], **ctx["dims"],
                 }, "cast"))
             self.assets.register(
@@ -632,18 +715,40 @@ class Director:
         return {s["scene_no"]: s["location"]
                 for s in ctx["script"]["scenes"]}
 
+    def _reference_uris(self, project_id, attach_names):
+        """用户上传的参考图:关联到指定角色/场景的 + 全局的。"""
+        uris = []
+        for row in self.assets.list(project_id, kind="reference"):
+            meta = json.loads(row["meta"] or "{}") if isinstance(
+                row["meta"], str) else (row["meta"] or {})
+            attach = meta.get("attach_to", "")
+            if attach and attach not in (attach_names or []):
+                continue
+            if row["uri"] and Path(row["uri"]).exists():
+                uris.append(row["uri"])
+        return uris
+
     def _art_refs(self, ctx, characters, location):
-        """人物立绘/场景概念图路径 → 出图参考(跨镜头角色一致性)。"""
+        """人物立绘/四视图/场景概念图/用户参考图 → 出图参考
+        (跨镜头角色一致性)。"""
         project_id = ctx["project"]["id"]
         refs = {"character_refs": []}
         for name in characters or []:
-            row = self.assets.latest(project_id, "character_art", name)
-            if row and row["uri"] and Path(row["uri"]).exists():
-                refs["character_refs"].append(row["uri"])
+            for kind, asset_name in (("character_art", name),
+                                     ("character_sheet",
+                                      f"{name}:turnaround")):
+                row = self.assets.latest(project_id, kind, asset_name)
+                if row and row["uri"] and Path(row["uri"]).exists():
+                    refs["character_refs"].append(row["uri"])
         if location:
             row = self.assets.latest(project_id, "scene_art", location)
             if row and row["uri"] and Path(row["uri"]).exists():
                 refs["scene_ref"] = row["uri"]
+        reference = self._reference_uris(
+            project_id, list(characters or []) + ([location] if location
+                                                  else []))
+        if reference:
+            refs["reference_images"] = reference
         return refs
 
     def _shot_payload(self, ctx, shot):
@@ -1193,11 +1298,50 @@ class Director:
                     "shot_no": 0, "characters": [name], "location": "",
                     "prompt": prompt,
                     "style": style, "feedback": feedback,
+                    "reference_images": self._reference_uris(
+                        project["id"], [name]),
                     "aspect": aspect, **ctx["dims"],
                 }, "cast"), prompt=prompt)
             self.assets.register(project["id"], "character_art", name,
                                  uri=result.uri, meta={"role": role},
                                  new_version=True)
+        elif kind == "character_sheet":
+            raw = target["name"]
+            if ":" not in raw:
+                raise AifosError(f"资产名需为 角色:套件键,收到 {raw}")
+            name, sheet_key = raw.split(":", 1)
+            entry = next((s for s in CHARACTER_SHEETS
+                          if s[0] == sheet_key), None)
+            if entry is None:
+                raise AifosError(f"未知人物资产套件: {sheet_key}")
+            _, label, desc = entry
+            role = next((c.get("role", "") for c in script["characters"]
+                         if c["name"] == name), "")
+            portrait = self.assets.latest(
+                project["id"], "character_art", name)
+            portrait_uri = (portrait["uri"]
+                            if portrait and portrait["uri"]
+                            and Path(portrait["uri"]).exists() else None)
+            prompt = prompt_override or self._sheet_prompt(
+                name, role, style, label, desc)
+            result = self._plan_run(
+                ctx, f"sheet:{name}:{sheet_key}", lambda: self._call(
+                    ctx, "image", {
+                        "character_sheet": sheet_key, "sheet_label": label,
+                        "art_name": name, "role": role,
+                        "shot_no": 0, "characters": [name], "location": "",
+                        "prompt": prompt, "style": style,
+                        "feedback": feedback,
+                        "character_refs": (
+                            [portrait_uri] if portrait_uri else []),
+                        "reference_images": self._reference_uris(
+                            project["id"], [name]),
+                        "aspect": aspect, **ctx["dims"],
+                    }, "cast"), prompt=prompt)
+            self.assets.register(
+                project["id"], "character_sheet", raw, uri=result.uri,
+                meta={"character": name, "sheet": sheet_key,
+                      "label": label}, new_version=True)
         elif kind == "scene_art":
             name = target["name"]
             scene = next((s for s in script["scenes"]
@@ -1210,6 +1354,8 @@ class Director:
                     "action": scene.get("action", ""),
                     "prompt": prompt,
                     "style": style, "feedback": feedback,
+                    "reference_images": self._reference_uris(
+                        project["id"], [name]),
                     "aspect": aspect, **ctx["dims"],
                 }, "cast"), prompt=prompt)
             self.assets.register(project["id"], "scene_art", name,
@@ -1287,7 +1433,7 @@ class Director:
         project, episode = self._episode_ctx(project_title, episode_number)
         out_root = self._episode_dir(project, episode)
         kind = target.get("kind")
-        if kind in ("character_art", "scene_art"):
+        if kind in ("character_art", "scene_art", "character_sheet"):
             name = target["name"]
             latest = self.assets.latest(project["id"], kind, name)
             if latest is None:
@@ -1342,6 +1488,47 @@ class Director:
                 "director", f"已上传替换镜头{shot_no}画面,旧视频作废")
             return {"uri": str(path)}
         raise AifosError(f"不支持的上传目标: {kind}")
+
+    # ---- 参考图管理:上传的参考图会自动进入出图提示(关联角色/场景) ----
+    def add_reference(self, project_title, name, file_bytes, ext,
+                      attach_to="", note=""):
+        """上传参考图:attach_to 为空=全项目通用,否则只用于该角色/场景。"""
+        ext = ext.lower()
+        magic = self.IMAGE_MAGIC.get(ext)
+        if magic is None:
+            raise AifosError(f"不支持的图片格式: {ext}(png/jpg/webp/svg)")
+        if not file_bytes or not file_bytes.lstrip()[:8].startswith(magic) \
+                and not file_bytes.startswith(magic):
+            raise AifosError("文件内容与图片格式不符")
+        project = self.projects.get_project(project_title)
+        if project is None:
+            raise AifosError(f"项目不存在: {project_title}")
+        name = (name or "").strip() or f"参考图{ext}"
+        safe = "".join(c if c.isalnum() else "_" for c in name)[:40]
+        existing = self.assets.latest(project["id"], "reference", name)
+        version = (existing["version"] + 1) if existing else 1
+        path = (self.artifacts_root / f"p{project['id']:03d}"
+                / "references" / f"{safe}_v{version}{ext}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(file_bytes)
+        self.assets.register(
+            project["id"], "reference", name, uri=str(path),
+            meta={"attach_to": attach_to or "", "note": note or ""},
+            new_version=existing is not None)
+        self.log.info(
+            "director", f"已上传参考图「{name}」"
+            f"(关联: {attach_to or '全项目'});后续出图将自动参考")
+        return {"name": name, "uri": str(path)}
+
+    def delete_reference(self, project_title, name):
+        project = self.projects.get_project(project_title)
+        if project is None:
+            raise AifosError(f"项目不存在: {project_title}")
+        if self.assets.latest(project["id"], "reference", name) is None:
+            raise AifosError(f"参考图不存在: {name}")
+        self.assets.delete(project["id"], "reference", name)
+        self.log.info("director", f"已删除参考图「{name}」")
+        return {"deleted": name}
 
     def import_video(self, project_title, episode_number, shot_no,
                      file_bytes, ext=".mp4"):
