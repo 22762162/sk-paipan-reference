@@ -1,6 +1,7 @@
 """资产中心:人物完整资产套件 + 参考图上传与出图复用。"""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -173,3 +174,18 @@ def test_codex_bridge_declares_managed_model(monkeypatch, tmp_path):
     }, "codex", 30, [])
     assert reply["ok"] is True
     assert reply["model"] == "gpt-image-2 (Codex 内置 image_gen)"
+
+
+def test_production_board_images_are_selectable():
+    """直播看板和图片清单都应支持选中、键盘操作与大图预览。"""
+    root = Path(__file__).resolve().parents[1]
+    app_js = (root / "aifos/web/static/app.js").read_text(encoding="utf-8")
+    css = (root / "aifos/web/static/style.css").read_text(encoding="utf-8")
+    assert 'data-plan-select="${esc(item.id)}"' in app_js
+    assert 'role="button" tabindex="0" aria-pressed="false"' in app_js
+    assert "function bindPlanSelection" in app_js
+    assert "function showPlanItemPreview" in app_js
+    assert "bindPlanSelection(app, data, episodeId)" in app_js
+    assert "bindPlanSelection(overlay, data, episodeId)" in app_js
+    assert ".plan-selectable.selected" in css
+    assert ".plan-preview-main" in css
