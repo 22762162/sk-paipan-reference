@@ -17,7 +17,7 @@ echo
 echo "== 体检:每个环节实际由谁生产 =="
 python3 -m aifos doctor || true
 echo
-echo "== 启动控制台(关闭本窗口即停止)=="
+echo "== 启动控制台 + 手机访问(关闭本窗口即停止)=="
 # 等服务真的监听成功后再开浏览器,避免打开一个「拒绝连接」的空页
 (
   for _ in $(seq 1 40); do
@@ -31,7 +31,7 @@ echo "== 启动控制台(关闭本窗口即停止)=="
     done
   done
 ) &
-python3 -m aifos serve --port "$PORT"
+python3 -m aifos serve --lan --port "$PORT"
 status=$?
 if [ "$status" -ne 0 ]; then
   echo

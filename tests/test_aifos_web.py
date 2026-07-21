@@ -63,6 +63,27 @@ def test_index_and_static(server):
     assert status == 200 and "javascript" in ctype
     status, ctype, _ = _request(server["port"], "GET", "/static/style.css")
     assert status == 200 and "css" in ctype
+    status, ctype, raw = _request(
+        server["port"], "GET", "/manifest.webmanifest")
+    assert status == 200 and "application/manifest+json" in ctype
+    manifest = json.loads(raw)
+    assert manifest["display"] == "standalone"
+    assert manifest["start_url"] == "/#/"
+    assert {icon["sizes"] for icon in manifest["icons"]} == {
+        "192x192", "512x512"}
+    status, ctype, raw = _request(server["port"], "GET", "/sw.js")
+    assert status == 200 and "javascript" in ctype
+    assert b"aifos-mobile-shell" in raw
+
+
+def test_mobile_access_api_is_safe_by_default(server):
+    status, data = _json_request(server["port"], "GET", "/api/access")
+    assert status == 200
+    assert data["lan_enabled"] is False
+    assert data["lan_urls"] == []
+    assert data["local_url"].startswith("http://127.0.0.1:")
+    assert "Safari" in data["install"]["ios"]
+    assert "Chrome" in data["install"]["android"]
 
 
 def test_overview_empty(server):
