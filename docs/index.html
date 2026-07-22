@@ -4036,6 +4036,9 @@ async function showMobileAccess() {
       <div><b>iPhone / iPad</b><span>${esc(access.install.ios)}</span></div>
       <div><b>Android</b><span>${esc(access.install.android)}</span></div>
     </div>
+    <p class="mobile-access-warning">地址必须以 <code>http://</code> 开头。手机若提示
+    “TLS 错误/安全连接失败”，是因为用了 <code>https://</code>——本地服务是普通 HTTP，
+    把服务器地址改成上面的 http:// 开头地址即可。</p>
     <p class="mobile-security-note">仅在你信任的同一 Wi-Fi 内使用；不要把此地址公开到互联网。</p>
   </div>`;
   document.body.appendChild(overlay);
