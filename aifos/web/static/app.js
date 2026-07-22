@@ -1885,6 +1885,9 @@ function planItemHtml(data, item, editable) {
       : `<span class="plan-thumb-empty">${st === "generating" ? "⏳" : "🖼"}</span>`}</div>
     <div class="plan-main">
       <div class="plan-row">
+        ${canEdit && ["done", "reused"].includes(st) ? `<label class="plan-pick"
+          onclick="event.stopPropagation()"><input type="checkbox"
+          class="plan-pick-box" data-pick="${esc(item.id)}"> 选</label>` : ""}
         <b>${esc(item.label)}</b>
         <span class="plan-badges">
         ${planIsMock(item) ? `<span class="plan-st st-mock">⚠ 占位图</span>`
@@ -1970,7 +1973,13 @@ function renderPlanHtml(data, editable) {
       <button class="batch-redo-failed" onclick="redoFailed(${data.episode.id}, this)"
         ${qcFailed ? "" : "disabled"}
         title="重画所有质检未过的图">🔁 重画质检未过的${qcFailed ? ` (${qcFailed})` : ""}</button>
-      <span class="dim">${qcFailed ? `${qcFailed} 张待重画` : "质检未过的图会在这里汇总"}</span>
+      <span class="batch-sep">|</span>
+      <button class="batch-selall" onclick="planSelectAll(true)">全选</button>
+      <button class="batch-selnone" onclick="planSelectAll(false)">清空</button>
+      <button class="batch-sel-frames" onclick="planSelectCat('frames')"
+        title="快速勾选全部首尾帧">选中全部首尾帧</button>
+      <button class="primary batch-redo-sel" onclick="redoSelected(${data.episode.id}, this)"
+        disabled>🔁 重画选中的 <span class="sel-count">0</span> 张</button>
     </div>` : ""}
     ${editable ? "" : `<div class="dim plan-hint">列表实时更新;要修改某张的提示词重画,等生成停下后点工具栏「🖼 图片清单」。</div>`}
     ${cats.map((cat) => {
@@ -2021,6 +2030,55 @@ async function qcAll(episodeId, btn) {
   }
 }
 
+/* 勾选批量重画:选中若干张 → 一次性重画 */
+function planPickedIds() {
+  return [...document.querySelectorAll(".plan-pick-box:checked")]
+    .map((b) => b.dataset.pick);
+}
+function planUpdateSelCount() {
+  const n = planPickedIds().length;
+  document.querySelectorAll(".sel-count").forEach((s) => {
+    s.textContent = n;
+  });
+  document.querySelectorAll(".batch-redo-sel").forEach((b) => {
+    b.disabled = n === 0;
+  });
+}
+function planSelectAll(on) {
+  document.querySelectorAll(".plan-pick-box").forEach((b) => {
+    b.checked = on;
+  });
+  planUpdateSelCount();
+}
+function planSelectCat(cat) {
+  document.querySelectorAll(".plan-pick-box").forEach((b) => {
+    b.checked = b.dataset.pick.startsWith(cat + ":");
+  });
+  planUpdateSelCount();
+}
+async function redoSelected(episodeId, btn) {
+  const ids = planPickedIds();
+  if (!ids.length) return;
+  if (btn) { btn.disabled = true; btn.textContent = "已提交,重画中…"; }
+  try {
+    const reply = await api("/api/redo_items", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ episode_id: episodeId, item_ids: ids }),
+    });
+    pollJob(reply.job_id, (job) => {
+      if (job.status === "done")
+        showToast(`已重画选中的 ${(job.summary || {}).redone || 0} 张`, "ok");
+      renderCanvasView(episodeId);
+    });
+    showToast(`开始重画选中的 ${ids.length} 张,进度看实况看板`, "ok");
+    pollCanvas(episodeId);
+  } catch (e) {
+    showToast(staleServerHint(e), "error");
+    if (btn) { btn.disabled = false; btn.innerHTML =
+      `🔁 重画选中的 <span class="sel-count">${ids.length}</span> 张`; }
+  }
+}
+
 async function redoFailed(episodeId, btn) {
   if (btn) { btn.disabled = true; btn.textContent = "已提交,重画中…"; }
   try {
@@ -2042,6 +2100,9 @@ async function redoFailed(episodeId, btn) {
 }
 
 function bindPlanRegen(container, episodeId, onDone) {
+  container.querySelectorAll(".plan-pick-box").forEach((box) => {
+    box.onchange = planUpdateSelCount;
+  });
   container.querySelectorAll(".plan-qc-one").forEach((btn) => {
     btn.onclick = (ev) => {
       ev.stopPropagation();
@@ -3089,6 +3150,8 @@ function imageLineControlsHtml() {
     <select id="image-line" disabled><option>加载中…</option></select>
     <label class="il-label">并行路数</label>
     <select id="parallel-images" disabled><option>…</option></select>
+    <label class="il-label">质检产线</label>
+    <select id="qc-line" disabled><option>…</option></select>
     <span class="dim" id="image-line-hint"></span>
   </div>`;
 }
@@ -3162,7 +3225,41 @@ async function bindImageLineControls() {
       showToast(staleServerHint(e), "error");
     }
   };
-  updateHint();
+  const qcSel = document.getElementById("qc-line");
+  if (qcSel) {
+    const qready = (n) => {
+      const pv = byName[n];
+      return pv && pv.enabled && (pv.checks || []).some(
+        (c) => c.capability === "image_qc" && c.ok) ? "已接通" : "未接通";
+    };
+    const qchain = (st.routing || {}).image_qc || [];
+    qcSel.innerHTML = `
+      <option value="codex">Codex 视觉质检(${qready("codex")})</option>
+      <option value="image_api">OpenAI 视觉(${qready("image_api")})</option>
+      <option value="claude">Claude 视觉(${qready("claude")})</option>
+      <option value="claude_api">Claude API 视觉(${qready("claude_api")})</option>`;
+    qcSel.value = ["codex", "image_api", "claude", "claude_api"]
+      .find((x) => qchain[0] === x) || "codex";
+    qcSel.disabled = false;
+    qcSel.onchange = async () => {
+      const pick = qcSel.value;
+      const rest = ["codex", "image_api", "claude", "claude_api"]
+        .filter((x) => x !== pick);
+      try {
+        await api("/api/settings", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ capability: "image_qc",
+            chain: [pick, ...rest, "mock"] }),
+        });
+        showToast(`质检产线已切换为 ${pick === "codex" ? "Codex 视觉"
+          : pick.includes("claude") ? "Claude 视觉" : "OpenAI 视觉"}`, "ok");
+      } catch (e) { showToast(staleServerHint(e), "error"); }
+    };
+  }
+  if (typeof updateHint === "function") updateHint();
+  const hint = document.getElementById("image-line-hint");
+  if (hint && !hint.textContent) hint.textContent =
+    "立即生效;主角立绘先出作风格基准,批量并行不会跑偏";
 }
 
 /* ---- 剧本审阅页:剧本确认后才开始画图(第一道确认) ----

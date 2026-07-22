@@ -2277,11 +2277,15 @@ class Director:
             row = self.assets.latest(project_id, "scene_art", name)
             spec = self._qc_spec(project_id, [], location=name,
                                  forbid=self._FORBID)
-        elif cat in ("shot_image", "frames"):
-            kind = "image" if cat == "shot_image" else "first_frame"
+        elif cat == "shot_image":
             row = self.assets.latest(
-                project_id, kind, f"{prefix}_shot{shot_no:03d}")
-            spec = None   # 分镜/首尾帧的人物名单在下面按分镜补
+                project_id, "image", f"{prefix}_shot{shot_no:03d}")
+            spec = None   # 分镜人物名单在下面按分镜补
+        elif cat == "frames":
+            # 首尾帧两张都要检:返回首帧,尾帧在 _qc_one 里另查
+            row = self.assets.latest(
+                project_id, "first_frame", f"{prefix}_shot{shot_no:03d}")
+            spec = None
         else:
             return None, None
         uri = row["uri"] if row and row["uri"] else None
@@ -2333,17 +2337,32 @@ class Director:
                 spec["camera"] = payload.get("camera", "")
             else:
                 spec = self._qc_spec(project_id, [], forbid=self._FORBID)
+        # 首尾帧:首帧 + 尾帧两张都要检,任一不符即整组不合格
+        uris = [("首帧", uri)]
+        if item.get("category") == "frames":
+            last = self.assets.latest(
+                project_id, "last_frame",
+                f"e{episode['number']:03d}_shot{item.get('shot_no'):03d}")
+            if last and last["uri"] and (last["uri"].startswith("http")
+                                         or Path(last["uri"]).exists()):
+                uris.append(("尾帧", last["uri"]))
+        passed_all, issues, cost = True, [], 0.0
         try:
-            result = self.router.call(
-                "image_qc", {**spec, "image_uri": uri}, ctx["out_root"],
-                cancel=lambda: self._cancel_requested(ctx))
+            for label, one in uris:
+                result = self.router.call(
+                    "image_qc", {**spec, "image_uri": one}, ctx["out_root"],
+                    cancel=lambda: self._cancel_requested(ctx))
+                cost += result.cost
+                verdict = result.data or {}
+                if not bool(verdict.get("pass")):
+                    passed_all = False
+                    issues.extend(f"{label}:{x}"
+                                  for x in (verdict.get("issues") or []))
         except (ProviderUnavailable, ProviderError) as exc:
             raise AifosError(f"质检产线不可用: {exc}") from exc
-        verdict = result.data or {}
-        report = {"passed": bool(verdict.get("pass")),
-                  "issues": list(verdict.get("issues") or []),
+        report = {"passed": passed_all, "issues": issues,
                   "attempts": (item.get("qc") or {}).get("attempts", 0)}
-        self.projects.add_episode_cost(episode["id"], result.cost)
+        self.projects.add_episode_cost(episode["id"], cost)
         self._plan_mark(ctx, item["id"], item.get("status", "done"),
                         extra={"qc": report})
         self.log.info(

@@ -322,3 +322,61 @@ def test_single_and_batch_qc_and_redo(app):
                          encoding="utf-8")
     redo = app.director.redo_items("质检三件套", 1, only_failed=True)
     assert redo["status"] == "done" and redo["redone"] == 2
+
+
+def test_codex_qc_instruction_and_parse(tmp_path, monkeypatch):
+    """Codex 图像质检:构造读图指令,从 stdout 解析判定 JSON。"""
+    from aifos.adapters import codex_image
+    instruction, targets, data = codex_image.build_instruction(
+        "image_qc", {"image_uri": "/tmp/f.png",
+                     "characters": ["小鹿"], "count": 1,
+                     "designs": "小鹿(发型:银白短发)",
+                     "location": "地铁站", "forbid": ["悬挂衣物"]}, tmp_path)
+    assert "/tmp/f.png" in instruction and "小鹿" in instruction
+    assert '"pass"' in instruction
+    assert targets == [] and data["qc"] is True
+
+    stdout = '思考中…\n{"pass": false, "issues": ["尾帧换了个人"]}\n完成'
+
+    class FakePopen:
+        def __init__(self, *a, **k):
+            self.args = a[0] if a else []
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return stdout, ""
+
+    monkeypatch.setattr(codex_image.shutil, "which",
+                        lambda _c: "/usr/bin/codex")
+    monkeypatch.setattr(codex_image.subprocess, "Popen", FakePopen)
+    reply = codex_image.run({
+        "capability": "image_qc",
+        "payload": {"image_uri": "/tmp/f.png", "characters": ["小鹿"]},
+        "out_dir": str(tmp_path)}, "codex", 30, [])
+    assert reply["ok"] is True
+    assert reply["data"]["pass"] is False
+    assert reply["data"]["issues"] == ["尾帧换了个人"]
+
+
+def test_frames_qc_checks_both_frames(app, monkeypatch):
+    """首尾帧质检:首帧或尾帧任一不符即整组不合格。"""
+    project = _preproduce(app, title="首尾帧质检")
+    calls = {"n": 0}
+    real_call = app.director.router.call
+
+    def qc_router(capability, payload, out_dir, cancel=None):
+        if capability == "image_qc":
+            calls["n"] += 1
+            # 第 2 次(尾帧)判不合格
+            from aifos.production.base import ProviderResult
+            return ProviderResult(
+                provider="codex", cost=0.1,
+                data={"pass": calls["n"] != 2,
+                      "issues": [] if calls["n"] != 2 else ["尾帧人物不符"]})
+        return real_call(capability, payload, out_dir, cancel=cancel)
+
+    app.director.router.call = qc_router
+    report = app.director.qc_item("首尾帧质检", 1, "frames:2")
+    assert calls["n"] == 2                 # 首帧 + 尾帧都检了
+    assert report["passed"] is False
+    assert any("尾帧" in x for x in report["issues"])

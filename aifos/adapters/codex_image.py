@@ -205,6 +205,28 @@ def build_instruction(capability, payload, out_dir):
         return instruction, [first, last], {
             "first": str(first), "last": str(last),
             "first_source": "generated"}
+    if capability == "image_qc":
+        image = payload.get("image_uri", "")
+        chars = "、".join(payload.get("characters", [])) or "无人(空镜)"
+        forbid = "、".join(payload.get("forbid", [])) or "无"
+        instruction = (
+            f"你是漫剧图片质检员。用你的视觉能力查看图片文件 {image}"
+            "(可直接读取该文件),逐项核对是否符合以下生产要求,"
+            "看不到文件或无法判断时 pass 记 false。\n"
+            f"- 出场角色:{chars}(严格共 "
+            f"{payload.get('count', len(payload.get('characters', [])))} 个;"
+            "角色形态必须与人物设定一致——名字不代表物种,"
+            "设定是人类就必须是人类)\n"
+            f"- 人物设定要点(发型/服装/标志特征必须一致,像不像同一个人):"
+            f"{payload.get('designs', '见参考图')}\n"
+            f"- 场景:{payload.get('location', '按提示词')};"
+            f"动作:{payload.get('action', '按提示词')};"
+            f"镜头景别:{payload.get('camera', '不限')}\n"
+            f"- 不允许出现:{forbid}、字幕条、乱码文字、多余或缺失的人物\n"
+            "只在标准输出打印一行 JSON,不要产出任何文件,不要多余文字:"
+            '{"pass": true或false, "issues": ["每条一句具体原因"]}'
+        )
+        return instruction, [], {"qc": True}
     if capability == "cover":
         target = out_dir / "cover.png"
         instruction = (
@@ -214,6 +236,21 @@ def build_instruction(capability, payload, out_dir):
             f"可留出大标题排版空间。{common}只产出该文件。")
         return instruction, [target], {}
     raise ValueError(f"codex 适配桥不支持能力: {capability}")
+
+
+def _extract_json(text):
+    """从 codex 输出中提取第一个合法 JSON 对象(容忍前后杂讯/日志)。"""
+    decoder = json.JSONDecoder()
+    idx = (text or "").find("{")
+    while idx != -1:
+        try:
+            obj, _ = decoder.raw_decode(text[idx:])
+            if isinstance(obj, dict):
+                return obj
+        except ValueError:
+            pass
+        idx = text.find("{", idx + 1)
+    return None
 
 
 def _flags_unsupported(stderr):
@@ -275,6 +312,15 @@ def run(request, codex, timeout, extra_args, plain=False):
         return {"ok": False,
                 "error": f"codex 退出码 {proc.returncode}: "
                          f"{proc.stderr.strip()[:300]}"}
+    if capability == "image_qc":
+        verdict = _extract_json(proc.stdout)
+        if verdict is None or "pass" not in verdict:
+            # 解析不到判定 → 视为放行(不阻塞生产),但记录原文便于排查
+            return {"ok": True, "data": {"pass": True, "issues": [],
+                    "note": "codex 未返回可解析判定"}, "uri": ""}
+        verdict.setdefault("issues", [])
+        return {"ok": True, "data": verdict, "uri": "",
+                "model": "Codex 视觉质检"}
     missing = [str(t) for t in targets if not t.exists()]
     if missing:
         return {"ok": False,

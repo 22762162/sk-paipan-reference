@@ -51,7 +51,7 @@ DEFAULTS = {
             # 经 aifos.adapters.codex_image 桥接真实 codex exec;
             # 实机把 --codex 指到 codex 绝对路径后 enabled 置 true
             "type": "cli", "enabled": False,
-            "capabilities": ["image", "frames", "cover"],
+            "capabilities": ["image", "frames", "cover", "image_qc"],
             "command": ["python3", "-m", "aifos.adapters.codex_image",
                         "--codex", "codex"],
             "cost_per_call": 1.0, "timeout": 900,
@@ -88,7 +88,7 @@ DEFAULTS = {
         "image_api": {
             # OpenAI 兼容出图 API:Codex 出图的 API 模式
             "type": "image_api", "enabled": False,
-            "capabilities": ["image", "frames", "cover"],
+            "capabilities": ["image", "frames", "cover", "image_qc"],
             "endpoint": "https://api.openai.com", "api_key": "",
             "model": "gpt-image-2",
             "cost_per_call": 1.5, "timeout": 300,
@@ -131,7 +131,7 @@ DEFAULTS = {
     # 能力路由:按顺序尝试,前者不可用/失败自动回退后者(CLI → API → mock)
     "routing": {
         "script": ["claude", "claude_api", "mock"],
-        "image_qc": ["claude", "claude_api", "mock"],
+        "image_qc": ["codex", "image_api", "claude", "claude_api", "mock"],
         "storyboard": ["claude", "claude_api", "mock"],
         "image": ["codex", "image_api", "api", "mock"],
         "frames": ["codex", "image_api", "mock"],
@@ -182,6 +182,12 @@ def _normalize_legacy(data):
         conf = providers.get(name)
         caps = conf.get("capabilities") if isinstance(conf, dict) else None
         if isinstance(caps, list) and "script" in caps \
+                and "image_qc" not in caps:
+            caps.append("image_qc")
+    for name in ("codex", "image_api"):
+        conf = providers.get(name)
+        caps = conf.get("capabilities") if isinstance(conf, dict) else None
+        if isinstance(caps, list) and "image" in caps \
                 and "image_qc" not in caps:
             caps.append("image_qc")
     mock_conf = providers.get("mock")

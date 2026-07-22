@@ -1792,3 +1792,20 @@ textarea:focus-visible, select:focus-visible {
   border-color: rgba(208, 59, 59, .5);
 }
 .plan-batchbar button:disabled { opacity: .5; cursor: default; }
+
+/* ---- 勾选批量重画 ---- */
+.plan-pick { font-size: 11px; color: var(--ink-3); cursor: pointer; margin-right: 6px; white-space: nowrap; }
+.plan-pick input { vertical-align: middle; }
+.plan-item:has(.plan-pick-box:checked) {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-soft);
+}
+.plan-batchbar .batch-sep { color: var(--ink-3); }
+.plan-batchbar .batch-redo-sel:not(:disabled) {
+  background: var(--accent); color: #fff; border-color: var(--accent);
+}
+.image-line-row #qc-line {
+  background: var(--page); color: var(--ink);
+  border: 1px solid var(--hairline); border-radius: 8px;
+  padding: 8px 10px; font-size: 13px;
+}
