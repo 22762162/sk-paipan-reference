@@ -49,7 +49,7 @@ def test_script_confirm_pauses_before_video(app):
     assert summary["status"] == "awaiting_confirm"
     stages = [s["stage"] for s in summary["stages"]]
     assert stages == [
-        "script", "continuity", "cast", "storyboard", "images",
+        "script", "continuity", "cast", "storyboard", "blocking", "images",
         "text_assets", "frames", "preflight"]
     # 剧本复用不再重写
     script = next(s for s in summary["stages"] if s["stage"] == "script")
@@ -61,7 +61,7 @@ def test_script_confirm_pauses_before_video(app):
         (project["id"],))
     preflight, _ = app.projects.latest_document(episode["id"], "preflight")
     assert preflight["passed"]
-    assert len(preflight["gates"]) == 11
+    assert len(preflight["gates"]) == 12
     # 预生产阶段不消耗视频产线
     assert app.assets.latest(project["id"], "video", "e001_shot001") is None
     # 但人物立绘/场景概念图与首尾帧已就绪

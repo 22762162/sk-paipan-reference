@@ -154,16 +154,16 @@ def test_codex_bridge_declares_managed_model(monkeypatch, tmp_path):
 
     target = tmp_path / "portrait_周鹿.png"
 
-    class Reply:
-        returncode = 0
-        stdout = ""
-        stderr = ""
+    class FakePopen:
+        def __init__(self, args, **_kwargs):
+            self.args = args
+            self.returncode = 0
 
-    def fake_run(*_args, **_kwargs):
-        target.write_bytes(PNG)
-        return Reply()
+        def communicate(self, timeout=None):
+            target.write_bytes(PNG)
+            return "", ""
 
-    monkeypatch.setattr(codex_image.subprocess, "run", fake_run)
+    monkeypatch.setattr(codex_image.subprocess, "Popen", FakePopen)
     # 本测试不依赖本机真的装了 codex(CI/沙盒环境同样可跑)
     monkeypatch.setattr(codex_image.shutil, "which",
                         lambda _cmd: "/usr/bin/codex")
@@ -174,6 +174,23 @@ def test_codex_bridge_declares_managed_model(monkeypatch, tmp_path):
     }, "codex", 30, [])
     assert reply["ok"] is True
     assert reply["model"] == "gpt-image-2 (Codex 内置 image_gen)"
+
+
+def test_codex_frames_reuse_keyframe_and_lock_space(tmp_path):
+    keyframe = tmp_path / "shot_001.keyframe.png"
+    keyframe.write_bytes(PNG)
+    (tmp_path / "frames").mkdir()
+    instruction, targets, data = build_instruction("frames", {
+        "shot_no": 1, "image_uri": str(keyframe), "prompt": "三人走进大厅",
+        "characters": ["甲", "乙", "丙"], "character_count": 3,
+        "spatial_constraint": "空间调度锁：严格 3 人；P01 左→中；机位不越轴。",
+        "width": 1080, "height": 1920,
+    }, tmp_path / "frames")
+    assert targets[0].read_bytes() == PNG
+    assert data["first_source"] == "keyframe"
+    assert "只生成本镜尾帧" in instruction
+    assert "最终画面不得画出坐标、节点、箭头" in instruction
+    assert "$imagegen" in instruction
 
 
 def test_production_board_images_are_selectable():

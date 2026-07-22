@@ -110,6 +110,7 @@ DEFAULT_STANDARD = {
             "environment_sound_required": True,
             "visual_hook_required": True,
             "eye_line_required": True,
+            "spatial_blocking_required_for_group": 3,
         },
         "continuity": {
             "state_labels": ["姿态", "伤势", "持有道具", "情绪", "朝向关系"],
@@ -132,6 +133,7 @@ DEFAULT_STANDARD = {
         },
         "quality_gates": [
             {"id": "continuity", "label": "连续性", "enabled": True, "severity": "block", "description": "人物、服装、道具、站位及段间状态无跳变。"},
+            {"id": "spatial", "label": "空间调度", "enabled": True, "severity": "block", "description": "逐场锁定人物走位、机位、视锥和屏幕轴线，防止多人漂移或增殖。"},
             {"id": "five_dimensions", "label": "五维分镜", "enabled": True, "severity": "block", "description": "每镜包含主体、环境、摄影机、时间状态和审美信息。"},
             {"id": "duration", "label": "时长与时间码", "enabled": True, "severity": "block", "description": "分段时长及 0.5 秒精度符合生产规格。"},
             {"id": "dialogue", "label": "台词与语速", "enabled": True, "severity": "block", "description": "台词逐字一致、自然拆分，并按情绪计算语速。"},
@@ -168,7 +170,7 @@ LOCKED_PRODUCTION_RULES = {
 }
 
 REQUIRED_GATE_IDS = [
-    "continuity", "five_dimensions", "duration", "dialogue", "performance",
+    "continuity", "spatial", "five_dimensions", "duration", "dialogue", "performance",
     "camera", "people", "text", "frames", "audio", "profile",
 ]
 
@@ -369,6 +371,11 @@ class StandardCenter:
         axis = storyboard.get("adjacent_camera_axis_change_degrees")
         if not _is_number(axis) or not 0 < axis <= 180:
             issue("rules.storyboard.adjacent_camera_axis_change_degrees", "必须大于 0 且不超过 180")
+        spatial_group = storyboard.get("spatial_blocking_required_for_group")
+        if (not isinstance(spatial_group, int)
+                or isinstance(spatial_group, bool) or spatial_group < 2):
+            issue("rules.storyboard.spatial_blocking_required_for_group",
+                  "必须是至少 2 的整数")
 
         continuity = required_dict(rules, "continuity", "rules.continuity")
         state_labels = continuity.get("state_labels")
@@ -449,8 +456,44 @@ class StandardCenter:
                 "WHERE profile_key=? ORDER BY version DESC LIMIT 1",
                 (DEFAULT_PROFILE_KEY,))
             if latest is not None:
-                return self.activate(latest["id"])
-        return self.active()
+                return self._upgrade_spatial_standard(
+                    self.activate(latest["id"]))
+        return self._upgrade_spatial_standard(self.active())
+
+    def _upgrade_spatial_standard(self, snapshot):
+        """把既有 V5 标准无损补齐空间调度规则，保留旧版本可追溯。"""
+        if not snapshot:
+            return snapshot
+        content = copy.deepcopy(snapshot.get("content") or {})
+        rules = content.get("rules") if isinstance(content, dict) else None
+        if not isinstance(rules, dict):
+            return snapshot
+        changed = False
+        storyboard = rules.get("storyboard")
+        if isinstance(storyboard, dict) \
+                and "spatial_blocking_required_for_group" not in storyboard:
+            storyboard["spatial_blocking_required_for_group"] = 3
+            changed = True
+        gates = rules.get("quality_gates")
+        if isinstance(gates, list) and not any(
+                isinstance(gate, dict) and gate.get("id") == "spatial"
+                for gate in gates):
+            gate = copy.deepcopy(DEFAULT_STANDARD["rules"][
+                "quality_gates"][1])
+            insert_at = next((index + 1 for index, item in enumerate(gates)
+                              if isinstance(item, dict)
+                              and item.get("id") == "continuity"), 0)
+            gates.insert(insert_at, gate)
+            changed = True
+        if not changed:
+            return snapshot
+        try:
+            return self.save(
+                content, change_note="自动升级：加入空间调度图与多人走位门禁",
+                expected_active_id=snapshot.get("version_id"))
+        except StandardConflictError:
+            # 多个 App 同时启动时由先完成者负责升级。
+            return self.active()
 
     def _row_to_snapshot(self, row):
         if row is None:

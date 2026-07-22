@@ -12,6 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .spatial_blocking import build_spatial_plan, validate_spatial_plan
+
 
 PIPELINE_VERSION = "sk-manju-v5"
 TEXT_CARRIERS = (
@@ -715,7 +717,8 @@ def _gate(gate_id, label, passed, detail):
     return {"id": gate_id, "label": label, "passed": bool(passed), "detail": detail}
 
 
-def build_preflight(script, storyboard, continuity, text_manifest, frames, profile):
+def build_preflight(script, storyboard, continuity, text_manifest, frames,
+                    profile, blocking=None):
     shots = storyboard.get("shots", [])
     rules = profile.get("rules", {})
     production_rules = rules.get("production", {})
@@ -851,11 +854,25 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames, profi
         shot.get("character_count") == len(shot.get("characters", []))
         and set(shot.get("characters", [])) <= cast
         for shot in shots)
+    threshold = storyboard_rules.get(
+        "spatial_blocking_required_for_group", 3)
+    expected_blocking = build_spatial_plan(
+        script, storyboard, continuity, group_threshold=threshold)
+    if blocking is None:
+        blocking = expected_blocking
+    spatial_validation = validate_spatial_plan(blocking, storyboard)
+    spatial_ok = (spatial_validation["passed"]
+                  and (blocking.get("source_fingerprint")
+                       == expected_blocking.get("source_fingerprint")))
     available_gates = [
         _gate("continuity", "连续性圣经", bool(continuity.get("characters"))
               and bool(continuity.get("scenes"))
               and continuity.get("standard_fingerprint") == profile.get(
                   "standard_fingerprint"), "角色、场景、文字规则与本集标准已锁定"),
+        _gate("spatial", "空间调度图", spatial_ok,
+              f"{blocking.get('summary', {}).get('scenes', 0)} 场 / "
+              f"{blocking.get('summary', {}).get('shots', 0)} 镜已锁定人物走位、"
+              "机位、视锥与屏幕轴线"),
         _gate("five_dimensions", "五维分镜字段", bool(shots) and all(
             all(key in shot for key in required) for shot in shots)
             and contract_ok,

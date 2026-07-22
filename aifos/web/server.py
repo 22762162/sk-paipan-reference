@@ -19,6 +19,7 @@ API:
   GET  /artifacts/<path>        workspace/artifacts 下的产物(防目录穿越)
 """
 
+import copy
 import ipaddress
 import json
 import shutil
@@ -329,6 +330,8 @@ def _episode_payload(app, episode_id):
     storyboard, sb_v = app.projects.latest_document(episode_id, "storyboard")
     continuity, continuity_v = app.projects.latest_document(
         episode_id, "continuity")
+    blocking, blocking_v = app.projects.latest_document(
+        episode_id, "blocking")
     text_assets, text_assets_v = app.projects.latest_document(
         episode_id, "text_assets")
     preflight, preflight_v = app.projects.latest_document(
@@ -354,6 +357,11 @@ def _episode_payload(app, episode_id):
             render_plan = json.loads(plan_path.read_text(encoding="utf-8"))
         except ValueError:
             render_plan = None
+    if blocking is not None:
+        blocking = copy.deepcopy(blocking)
+        for scene in blocking.get("scenes", []):
+            scene["svg_url"] = _artifact_url(
+                app, scene.get("svg_uri", ""))
     return {
         "build": BUILD,
         "episode": dict(episode),
@@ -365,6 +373,8 @@ def _episode_payload(app, episode_id):
         "storyboard_version": sb_v,
         "continuity": continuity,
         "continuity_version": continuity_v,
+        "blocking": blocking,
+        "blocking_version": blocking_v,
         "text_assets": text_assets,
         "text_assets_version": text_assets_v,
         "preflight": preflight,

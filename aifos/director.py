@@ -1,7 +1,7 @@
 """AI 导演中心:总控。拆解任务、调度 Provider、控制流程与成本。
 
 生产流程(SK 漫剧工业流):
-  需求 → 剧本 → 连续性圣经 → 五维分镜 → 关键帧/文字锁定 → 首尾帧
+  需求 → 剧本 → 连续性圣经 → 五维分镜 → 空间调度图 → 关键帧/文字锁定 → 首尾帧
        → 生产门禁 → Seedance2 视频(随视频声音/口型) → 剪辑
        → 抽帧检查板 + 内容复核 + 交付脚本 → 包装 → 数据沉淀
 """
@@ -13,6 +13,8 @@ from pathlib import Path
 from .db import now
 from .errors import (AifosError, BudgetExceeded, ProduceCancelled,
                      ProviderError, ProviderUnavailable)
+from .spatial_blocking import (build_spatial_plan, shot_blocking,
+                               write_spatial_svgs)
 from .workflow import (
     PIPELINE_VERSION,
     build_content_review,
@@ -66,6 +68,7 @@ STAGES = [
     ("continuity", "连续性圣经"),
     ("cast", "人物/场景图"),
     ("storyboard", "五维分镜"),
+    ("blocking", "空间调度图"),
     ("images", "关键帧"),
     ("text_assets", "文字资产锁定"),
     ("frames", "首尾帧"),
@@ -647,6 +650,10 @@ class Director:
         extra = {"provider": result.provider,
                  "real": result.provider != "mock",
                  "fallbacks": getattr(result, "fallbacks", [])}
+        data = getattr(result, "data", {}) or {}
+        for key in ("first_source", "generation_calls"):
+            if key in data:
+                extra[key] = data[key]
         qc = getattr(result, "qc", None)
         if qc is not None:
             extra["qc"] = qc
@@ -685,12 +692,17 @@ class Director:
         return max(1, min(workers, 8))
 
     def _run_parallel(self, ctx, tasks, line="出图产线"):
-        """并行批量出图产线:风格锚定后同池并行,互不影响一致性。
+        """有界并行出图:只把 worker 数量的任务标为生成中。
+
+        多人/文字/场首等高风险镜头可通过 priority 提前；尚未真正开工的
+        条目保持 pending，因此计时与暂停后的恢复都反映真实状态。
         worker 线程只做产线调用;记账/资产登记/清单状态全在主线程。
-        tasks: [{"item_id","capability","payload","sub_dir","tag"}]
+        tasks: [{"item_id","capability","payload","sub_dir","tag","priority"}]
         返回 {tag: ProviderResult};暂停时未完成条目回到排队并保留已完成。"""
         if not tasks:
             return {}
+        tasks = sorted(tasks, key=lambda task: (
+            -int(task.get("priority", 0)), str(task.get("item_id", ""))))
         workers = self._parallel_workers()
         if workers == 1 or len(tasks) == 1:
             out = {}
@@ -704,28 +716,38 @@ class Director:
         if budget and episode["cost"] >= budget:
             raise BudgetExceeded(
                 f"单集成本 {episode['cost']:.2f} 已达预算 {budget},停止调度")
-        from concurrent.futures import (FIRST_COMPLETED, ThreadPoolExecutor,
-                                        wait)
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
         self.log.info(
             "director",
             f"{line}并行开工:共 {len(tasks)} 张,{workers} 路同时生成")
-        for task in tasks:
-            self._plan_mark(ctx, task["item_id"], "generating")
         cancel = lambda: self._cancel_requested(ctx)   # noqa: E731
         results, failures = {}, []
         cancelled = False
+        started_at = time.monotonic()
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(
-                self._generate_image_with_qc, task["capability"],
-                task["payload"], ctx["out_root"] / task["sub_dir"],
-                cancel, task.get("qc_spec")): task
-                for task in tasks}
-            pending = set(futures)
-            while pending:
-                done_now, pending = wait(pending, timeout=2,
-                                         return_when=FIRST_COMPLETED)
+            iterator = iter(tasks)
+            futures = {}
+
+            def submit_next():
+                try:
+                    task = next(iterator)
+                except StopIteration:
+                    return False
+                self._plan_mark(ctx, task["item_id"], "generating")
+                future = pool.submit(
+                    self._generate_image_with_qc, task["capability"],
+                    task["payload"], ctx["out_root"] / task["sub_dir"],
+                    cancel, task.get("qc_spec"))
+                futures[future] = task
+                return True
+
+            for _ in range(min(workers, len(tasks))):
+                submit_next()
+            while futures:
+                done_now, _ = wait(set(futures), timeout=2,
+                                   return_when=FIRST_COMPLETED)
                 for future in done_now:
-                    task = futures[future]
+                    task = futures.pop(future)
                     try:
                         result = future.result()
                     except ProduceCancelled:
@@ -744,12 +766,36 @@ class Director:
                     self._plan_mark(ctx, task["item_id"], "done",
                                     extra=self._plan_done_extra(result))
                     results[task["tag"]] = result
+                if not cancelled and not failures \
+                        and not self._cancel_requested(ctx):
+                    while len(futures) < workers and submit_next():
+                        pass
+        elapsed = max(.001, time.monotonic() - started_at)
+        self.log.info(
+            "director", f"{line}本批完成 {len(results)}/{len(tasks)}，"
+            f"墙钟 {elapsed:.1f}s，吞吐 {len(results) * 60 / elapsed:.2f} 张/分钟")
         if cancelled or self._cancel_requested(ctx):
             raise ProduceCancelled(
                 "已手动暂停(本批已完成的图片全部保留)")
         if failures:
             raise failures[0][1]
         return results
+
+    @staticmethod
+    def _shot_priority(shot, scene_first=False):
+        """失败代价最高的镜头先出，尽早暴露多人/文字/运动问题。"""
+        people = int(shot.get("character_count", len(
+            shot.get("characters", []))))
+        text = shot.get("readable_text") or {}
+        camera = str(shot.get("camera") or "")
+        action = str(shot.get("description") or shot.get("prompt") or "")
+        return (people * 30
+                + (45 if text.get("required") else 0)
+                + (25 if scene_first else 0)
+                + (15 if any(word in camera for word in
+                             ("跟", "移", "摇", "环绕")) else 0)
+                + (10 if any(word in action for word in
+                             ("走", "跑", "进入", "离开", "追")) else 0))
 
     def _plan_seed_shots(self, ctx):
         """分镜确定后,把每个镜头的关键帧与首尾帧登记进清单。"""
@@ -910,6 +956,39 @@ class Director:
         self._plan_seed_shots(ctx)
         return {"version": version, "shots": len(storyboard["shots"]),
                 "pipeline_version": storyboard["pipeline_version"]}
+
+    def _stage_blocking(self, ctx):
+        """五维分镜 → 确定性俯视空间图，不消耗任何出图额度。"""
+        rules = ctx["production_profile"].get("rules", {}).get(
+            "storyboard", {})
+        threshold = int(rules.get(
+            "spatial_blocking_required_for_group", 3))
+        candidate = build_spatial_plan(
+            ctx["script"], ctx["storyboard"], ctx["continuity"],
+            group_threshold=threshold)
+        existing, version = self.projects.latest_document(
+            ctx["episode"]["id"], "blocking")
+        reused = (not ctx.get("force") and existing is not None
+                  and existing.get("source_fingerprint")
+                  == candidate["source_fingerprint"]
+                  and (existing.get("validation") or {}).get("passed"))
+        blocking = existing if reused else candidate
+        paths = write_spatial_svgs(
+            blocking, ctx["out_root"] / "blocking")
+        if not reused:
+            version = self.projects.save_document(
+                ctx["episode"]["id"], "blocking", blocking)
+        ctx["blocking"] = blocking
+        return {
+            "version": version,
+            "reused": reused,
+            "scenes": len(blocking.get("scenes", [])),
+            "required_scenes": blocking.get("summary", {}).get(
+                "required_scenes", 0),
+            "shots": blocking.get("summary", {}).get("shots", 0),
+            "svgs": len(paths),
+            "passed": blocking.get("validation", {}).get("passed", False),
+        }
 
     def _ensure_character_designs(self, ctx, characters):
         """人物设定:编剧 AI 为每个角色写性格/外貌/妆容/服装细节。
@@ -1184,6 +1263,7 @@ class Director:
                    or (ctx.get("storyboard") or {}).get("profile")
                    or production_profile(
                        self.config, ctx.get("production_standard")))
+        spatial = shot_blocking(ctx.get("blocking"), shot["shot_no"])
         return {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
@@ -1203,6 +1283,8 @@ class Director:
             "performance": shot.get("performance", {}),
             "shot_contract": shot.get("shot_contract", {}),
             "sound_design": shot.get("sound_design", {}),
+            "spatial_blocking": spatial or {},
+            "spatial_constraint": (spatial or {}).get("constraint", ""),
             "standard_fingerprint": profile.get("standard_fingerprint", ""),
             "forbid_subtitles": not profile["burn_subtitles"],
             "style": ctx["project"]["style"] or "",
@@ -1215,7 +1297,10 @@ class Director:
         ctx["images"] = []
         reused = 0
         tasks = []
+        seen_scenes = set()
         for shot in ctx["storyboard"]["shots"]:
+            scene_first = shot.get("scene_no") not in seen_scenes
+            seen_scenes.add(shot.get("scene_no"))
             existing = self._existing_asset_uri(
                 ctx, "image", self._shot_name(ctx, shot["shot_no"]))
             if existing:
@@ -1231,6 +1316,7 @@ class Director:
                 "capability": "image",
                 "payload": payload,
                 "sub_dir": "images", "tag": shot["shot_no"],
+                "priority": self._shot_priority(shot, scene_first),
                 "qc_spec": {**self._qc_spec(
                     ctx["project"]["id"], payload.get("characters", []),
                     location=payload.get("location", ""),
@@ -1315,6 +1401,8 @@ class Director:
                     "capability": "frames",
                     "payload": payload,
                     "sub_dir": "frames", "tag": shot["shot_no"],
+                    "priority": self._shot_priority(
+                        shot, scene_first=round_no == 0),
                     "scene": scene_no})
             if not round_tasks:
                 continue
@@ -1343,7 +1431,8 @@ class Director:
         """确认前硬门禁：任一项未过都不能消耗 Seedance 额度。"""
         report = build_preflight(
             ctx["script"], ctx["storyboard"], ctx["continuity"],
-            ctx["text_assets"], ctx["frames"], ctx["production_profile"])
+            ctx["text_assets"], ctx["frames"], ctx["production_profile"],
+            ctx.get("blocking"))
         version = self.projects.save_document(
             ctx["episode"]["id"], "preflight", report)
         (ctx["out_root"] / "preflight_report.json").write_text(
@@ -1746,12 +1835,19 @@ class Director:
             raise AifosError("本集尚无剧本,先完成预生产")
         aspect = (project["aspect"]
                   or self.config.get("defaults", "aspect", default="9:16"))
+        standard, _ = self.projects.latest_document(
+            episode["id"], "production_standard")
+        blocking, _ = self.projects.latest_document(
+            episode["id"], "blocking")
         ctx = {
             "project": dict(project), "episode": dict(episode),
             "out_root": self._episode_dir(project, episode),
             "aspect": aspect,
             "dims": ASPECT_DIMS.get(aspect, ASPECT_DIMS["9:16"]),
             "script": script, "force": True,
+            "production_standard": standard,
+            "production_profile": production_profile(self.config, standard),
+            "blocking": blocking,
         }
         self._task_cost = 0.0
         self._task_providers = set()

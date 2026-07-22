@@ -238,7 +238,7 @@ function route() {
 /* ================= 持久生产历史 ================= */
 const HISTORY_STAGE_CN = {
   script: "剧本", continuity: "连续性圣经", cast: "人物/场景图",
-  storyboard: "五维分镜", images: "关键帧", text_assets: "文字锁定",
+  storyboard: "五维分镜", blocking: "空间调度图", images: "关键帧", text_assets: "文字锁定",
   frames: "首尾帧", preflight: "生产门禁", videos: "Seedance 视频",
   voices: "声音/口型", edit: "剪辑", qc: "三层质检",
   package: "封面/标题", archive: "数据沉淀",
@@ -931,12 +931,12 @@ async function renderDashboard() {
 夜色渐深,妖气翻涌。
 林昭:这股妖气不对劲。
 小狐:小心,它就在附近!"></textarea>
-      <div class="produce-hint">SK 工业流:连续性圣经 → 五维分镜 → 关键帧/文字锁定 → 生产门禁 → Seedance → 三层质检 → 交付脚本。</div>
+      <div class="produce-hint">SK 工业流:连续性圣经 → 五维分镜 → 空间调度图 → 关键帧/文字锁定 → 生产门禁 → Seedance → 三层质检 → 交付脚本。</div>
     </form>
     <section class="workflow-map" aria-label="AIFOS 漫剧工业流">
       <div class="workflow-lead"><b>不把长剧本直接塞给视频模型</b><span>先锁定画面、人物与段间状态，再让 Seedance 只执行动作、镜头和情绪。</span><a href="#/standards/production">${esc(activeStandard.name || "SK 五维漫剧标准")} · v${esc(activeStandard.version || 1)} 正在驱动新剧集 →</a></div>
       <div class="workflow-steps">
-        ${["连续性", "五维分镜", "文字关键帧", "首尾帧", "生产门禁", "视频/口型", "抽帧+内容复核", "交付脚本"].map((name, i) =>
+        ${["连续性", "五维分镜", "空间调度", "文字关键帧", "首尾帧", "生产门禁", "视频/口型", "抽帧+内容复核", "交付脚本"].map((name, i) =>
           `<div class="workflow-step"><em>${String(i + 1).padStart(2, "0")}</em><span>${name}</span></div>`).join("")}
       </div>
     </section>
@@ -2136,9 +2136,11 @@ function planCardHtml(data, item, avg) {
       data-eta="${avg ? Math.round(avg) : ""}">正在画 0:00${avg ? ` · 预计 ~${fmtDur(avg)}` : ""}</span>`;
   } else if (["done", "reused"].includes(st)) {
     const qc = item.qc;
+    const sourceNote = item.first_source === "keyframe" ? " · 首帧复用✓"
+      : item.first_source === "previous_tail" ? " · 帧链复用✓" : "";
     const qcNote = !qc ? "" : (qc.passed ? " · 质检✓"
       : ` · <b class="pc-mock" title="${esc((qc.issues || []).join(";"))}">⚠质检未过</b>`);
-    state = `<span class="pc-state pc-ok">✓ ${st === "reused" ? "复用已有" : "已完成"}${item.duration ? ` · 用时 ${fmtDur(item.duration)}` : ""}${planIsMock(item) ? ` · <b class="pc-mock">占位图</b>` : ""}${qcNote}</span>`;
+    state = `<span class="pc-state pc-ok">✓ ${st === "reused" ? "复用已有" : "已完成"}${item.duration ? ` · 用时 ${fmtDur(item.duration)}` : ""}${sourceNote}${planIsMock(item) ? ` · <b class="pc-mock">占位图</b>` : ""}${qcNote}</span>`;
   } else if (st === "failed") {
     state = `<span class="pc-state pc-fail" title="${esc(item.error || "")}">失败:${esc((item.error || "").slice(0, 40))}</span>`;
   } else {
@@ -2220,6 +2222,62 @@ async function showPlanOverlay(episodeId) {
   document.body.appendChild(overlay);
   bindPlanSelection(overlay, data, episodeId);
   bindPlanRegen(overlay, episodeId, () => { close(); showPlanOverlay(episodeId); });
+}
+
+async function showBlockingOverlay(episodeId) {
+  let data;
+  try { data = await api(`/api/episode/${episodeId}`); }
+  catch (e) { showToast(e.message, "error"); return; }
+  const blocking = data.blocking || {};
+  const scenes = blocking.scenes || [];
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay";
+  const sceneHtml = scenes.map((scene) => `
+    <section class="blocking-scene">
+      <div class="blocking-scene-head">
+        <div><h3>第 ${scene.scene_no} 场 · ${esc(scene.location || "未命名场景")}</h3>
+          <span class="dim">${esc((scene.reasons || []).join(" · "))}</span></div>
+        <span class="${scene.required ? "warn" : "pass"}">${scene.required ? "重点调度" : "连续性参考"}</span>
+      </div>
+      ${scene.svg_url
+        ? `<button class="blocking-map-btn" data-map="${esc(scene.svg_url)}" data-label="第${scene.scene_no}场空间调度图"><img src="${esc(scene.svg_url)}" loading="lazy" alt="第${scene.scene_no}场空间调度图"></button>`
+        : `<div class="blocking-empty">SVG 尚未生成</div>`}
+      <div class="blocking-shot-list">${(scene.shots || []).map((shot) => {
+        const actors = (shot.actors || []).map((actor) => {
+          const start = actor.start || {}, end = actor.end || {};
+          return `${actor.actor_id} ${actor.name} (${start.x},${start.y})→(${end.x},${end.y})`;
+        }).join("；");
+        const camera = shot.camera || {};
+        return `<div class="blocking-shot">
+          <b>S${shot.shot_no}</b><span>${esc(actors || "空镜")}</span>
+          <em>🎥 ${esc(camera.lens_mm || "-")}mm · ${esc(camera.movement || "固定")} · ${esc(camera.position || "-")}</em>
+        </div>`;
+      }).join("")}</div>
+    </section>`).join("");
+  overlay.innerHTML = `
+    <div class="script-panel blocking-overlay">
+      <div class="script-head">
+        <h3>🧭 空间调度图 · 《${esc(data.project.title)}》第${data.episode.number}集</h3>
+        <button class="close">关闭 Esc</button>
+      </div>
+      <div class="blocking-summary">
+        <b>${blocking.summary?.scenes || 0}</b> 场 ·
+        <b>${blocking.summary?.shots || 0}</b> 镜 ·
+        <b>${blocking.summary?.required_scenes || 0}</b> 个重点调度场景
+        <span class="${blocking.validation?.passed ? "pass" : "warn"}">${blocking.validation?.passed ? "空间门禁 PASS" : "空间门禁待生成"}</span>
+      </div>
+      <p class="dim">俯视图锁定人物编号、起止位置、走位、机位、焦段视锥和 180° 轴线；坐标只约束构图，不会画进最终画面。</p>
+      ${sceneHtml || `<div class="blocking-empty">本集还没有空间调度图；确认剧本并完成五维分镜后会自动生成。</div>`}
+    </div>`;
+  const close = () => { overlay.remove(); document.removeEventListener("keydown", onKey); };
+  const onKey = (ev) => { if (ev.key === "Escape") close(); };
+  overlay.addEventListener("click", (ev) => { if (ev.target === overlay) close(); });
+  overlay.querySelector(".close").onclick = close;
+  overlay.querySelectorAll(".blocking-map-btn").forEach((button) => {
+    button.onclick = () => showImageLightbox(button.dataset.map, button.dataset.label);
+  });
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(overlay);
 }
 
 /* ================= 资产中心 =================
@@ -2497,19 +2555,20 @@ function stateInline(states) {
 
 const STAGE_CN = {
   script: "剧本", continuity: "连续性圣经", cast: "人物/场景图",
-  storyboard: "五维分镜", images: "关键帧", text_assets: "文字资产锁定",
+  storyboard: "五维分镜", blocking: "空间调度图", images: "关键帧", text_assets: "文字资产锁定",
   frames: "首尾帧", preflight: "生产门禁", videos: "Seedance 视频",
   voices: "随视频配音/口型", edit: "剪映剪辑",
   qc: "三层质检", package: "封面/标题", archive: "数据沉淀",
   assets: "资产调用",
 };
-const STAGE_ORDER = ["script", "continuity", "cast", "storyboard", "images",
+const STAGE_ORDER = ["script", "continuity", "cast", "storyboard", "blocking", "images",
   "text_assets", "frames", "preflight", "videos", "voices", "edit", "qc",
   "package", "archive"];
 const STAGE_PLAIN = {
   cancelling: "正在暂停,已完成的图片全部保留,随时可从断点继续",
   script: "正在写剧本", continuity: "正在锁定角色、场景和文字规则",
   cast: "正在画人物和场景", storyboard: "正在生成五维分镜",
+  blocking: "正在锁定人物走位、机位与屏幕轴线",
   images: "正在生成关键帧", text_assets: "正在锁定可读文字",
   frames: "正在生成首尾帧", preflight: "正在执行生产硬门禁",
   videos: "正在生成 Seedance 视频", voices: "正在确认随视频声音与口型",
@@ -2755,6 +2814,7 @@ async function renderCanvasView(episodeId) {
       </div>
       <button id="btn-play" class="primary">▶ 播放本集</button>
       <button id="btn-script">剧本</button>
+      <button id="btn-blocking" title="人物走位、镜头位置、视锥和轴线">🧭 空间调度</button>
       <button id="btn-plan" title="每张图的状态与提示词;可单张改词重画">🖼 图片清单</button>
       <button id="btn-stop-live" class="stop-btn" hidden
         title="暂停生成:已完成的图片全部保留,可从断点继续">⏸ 暂停生成</button>
@@ -2810,6 +2870,7 @@ async function renderCanvasView(episodeId) {
   document.getElementById("btn-reproduce-force").onclick = (ev) =>
     armConfirm(ev.target, "重做", () => reproduce(true));
   document.getElementById("btn-script").onclick = () => showScriptOverlay(data, episodeId);
+  document.getElementById("btn-blocking").onclick = () => showBlockingOverlay(episodeId);
   document.getElementById("btn-plan").onclick = () => showPlanOverlay(episodeId);
   document.getElementById("btn-play").onclick = () => openPlayer(data);
   const btnConfirm = document.getElementById("btn-confirm");
@@ -2983,6 +3044,13 @@ async function bindImageLineControls() {
     <option value="image_api">OpenAI 图片 API(${ready("image_api")})</option>`;
   lineSel.value = chain[0] === "image_api" ? "image_api" : "codex";
   lineSel.disabled = false;
+  const updateHint = () => {
+    const hint = document.getElementById("image-line-hint");
+    if (!hint) return;
+    hint.textContent = lineSel.value === "image_api"
+      ? "极速直连：通常最快，按 API 单独计费；推荐 4–6 路"
+      : "套餐内 Codex 出图：不增加 API 账单；推荐 3–4 路，过高并发未必更快";
+  };
   lineSel.onchange = async () => {
     const pick = lineSel.value;
     const others = ["codex", "image_api"].filter((x) => x !== pick);
@@ -2996,6 +3064,7 @@ async function bindImageLineControls() {
       }
       showToast(`出图产线已切换:${pick === "codex"
         ? "Codex CLI 优先" : "OpenAI 图片API 优先"}(不可用自动回退)`, "ok");
+      updateHint();
     } catch (e) { showToast(staleServerHint(e), "error"); }
   };
   parSel.innerHTML = [1, 2, 3, 4, 6, 8].map(
@@ -3014,9 +3083,7 @@ async function bindImageLineControls() {
       showToast(staleServerHint(e), "error");
     }
   };
-  const hint = document.getElementById("image-line-hint");
-  if (hint) hint.textContent =
-    "立即生效;主角立绘先出作风格基准,批量并行不会跑偏";
+  updateHint();
 }
 
 /* ---- 剧本审阅页:剧本确认后才开始画图(第一道确认) ----

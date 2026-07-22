@@ -18,6 +18,8 @@
 
 import argparse
 import json
+import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -38,10 +40,19 @@ SUBJECT_DIRECTIVE = (
     "不要出现无关杂物(如悬挂的衣物、衣架、多余的人形)。")
 
 GEN_DIRECTIVE = (
-    "你必须使用你环境里可用的图像生成能力(图像生成技能 / 工具 / MCP,"
-    "如 gpt-image 等)真实生成图片;禁止用 Pillow / matplotlib / SVG 等"
+    "收到任务后第一步立即调用内置 $imagegen 图像生成能力，不要搜索资料、"
+    "解释方案或编写绘图代码。你必须真实生成图片;禁止用 Pillow / "
+    "matplotlib / SVG 等"
     "代码绘制示意图或占位图充数。如果完全没有图像生成能力,打印错误"
     "并以非零码退出,不要伪造图片。")
+
+
+def _space_line(payload):
+    constraint = str(payload.get("spatial_constraint") or "").strip()
+    if not constraint:
+        return ""
+    return (constraint + "这些俯视坐标只用于锁定人物相对位置、人数、机位和"
+            "运动方向；最终画面不得画出坐标、节点、箭头、标签或示意图。")
 
 
 def _style_line(payload):
@@ -80,7 +91,8 @@ def build_instruction(capability, payload, out_dir):
         payload = dict(payload)
         payload["prompt"] = (f"{payload.get('prompt', '')}。"
                              f"修改意见(必须落实):{feedback}")
-    common = f"{_style_line(payload)}{SUBJECT_DIRECTIVE}{GEN_DIRECTIVE}"
+    common = (f"{_style_line(payload)}{_space_line(payload)}"
+              f"{SUBJECT_DIRECTIVE}{GEN_DIRECTIVE}")
     if capability == "image":
         safe = "".join(c if c.isalnum() else "_"
                        for c in str(payload.get("art_name", "")))[:40]
@@ -158,7 +170,26 @@ def build_instruction(capability, payload, out_dir):
                 "只产出尾帧这一个文件。"
             )
             return instruction, [first, last], {
-                "first": str(first), "last": str(last)}
+                "first": str(first), "last": str(last),
+                "first_source": "previous_tail"}
+        keyframe = Path(image_uri) if image_uri else None
+        if (keyframe and keyframe.exists()
+                and keyframe.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")):
+            # 每场第一镜已有通过质检的关键帧。复用为首帧可少生成一张图，
+            # 同时比重新绘制首帧更能锁住人物身份、服装与构图。
+            shutil.copyfile(keyframe, first)
+            instruction = (
+                f"本镜首帧已直接复用通过质检的关键图(文件已就位:{first},"
+                "不要改动它)。请基于该首帧只生成本镜尾帧,"
+                f"保存到 {last}(PNG,{size})。"
+                f"镜头内容:{payload.get('prompt', '')}。"
+                f"结尾状态:{payload.get('end_state', {})};"
+                "画面从首帧自然演进到结尾状态，人物、服装、道具、场景与"
+                f"首帧完全一致，不新增字幕条。{_ref_line(payload)}{common}"
+                "只产出尾帧这一个文件。")
+            return instruction, [first, last], {
+                "first": str(first), "last": str(last),
+                "first_source": "keyframe"}
         instruction = (
             f"基于关键图 {image_uri}(文件可直接读取)"
             "为镜头生成首帧与尾帧,"
@@ -172,7 +203,8 @@ def build_instruction(capability, payload, out_dir):
             "只产出这两个文件。"
         )
         return instruction, [first, last], {
-            "first": str(first), "last": str(last)}
+            "first": str(first), "last": str(last),
+            "first_source": "generated"}
     if capability == "cover":
         target = out_dir / "cover.png"
         instruction = (
@@ -204,10 +236,30 @@ def run(request, codex, timeout, extra_args, plain=False):
     exec_args = [] if plain else list(DEFAULT_EXEC_ARGS)
 
     def invoke(args):
-        return subprocess.run(
+        proc = subprocess.Popen(
             [codex, "exec", *args, *extra_args, instruction],
-            capture_output=True, text=True, timeout=timeout,
-            cwd=str(out_dir))
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cwd=str(out_dir), start_new_session=True)
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # subprocess.run 只会终止直接子进程；Codex 内置 imagegen 可能继续
+            # 留在后台占用并发。整组 TERM→KILL，保证超时后没有孤儿进程。
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.communicate()
+            raise
+        return subprocess.CompletedProcess(
+            proc.args, proc.returncode, stdout, stderr)
 
     try:
         proc = invoke(exec_args)
@@ -234,7 +286,7 @@ def run(request, codex, timeout, extra_args, plain=False):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="AIFOS Codex 图片适配桥")
     parser.add_argument("--codex", default="codex", help="codex 可执行文件路径")
-    parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--timeout", type=int, default=1200)
     parser.add_argument("--extra", action="append", default=[],
                         help="附加给 codex exec 的参数,可多次指定")
     parser.add_argument("--plain", action="store_true",

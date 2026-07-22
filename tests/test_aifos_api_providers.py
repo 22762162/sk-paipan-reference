@@ -6,6 +6,7 @@
 
 import base64
 import json
+from pathlib import Path
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -212,6 +213,27 @@ def test_image_api_frames_url_mode(fake_api, tmp_path):
     assert result.data["first"].endswith("shot_002.first.png")
     # 首尾两张 → 双倍单价
     assert result.cost == 3.0
+
+
+def test_image_api_frames_reuse_keyframe_charges_one_call(fake_api, tmp_path):
+    endpoint, fake = fake_api
+    fake.routes[("POST", "/v1/images/edits")] = lambda body: {
+        "data": [{"b64_json": base64.b64encode(PNG_1PX).decode()}]}
+    keyframe = tmp_path / "shot_004.keyframe.png"
+    keyframe.write_bytes(PNG_1PX)
+    provider = OpenAIImageProvider("image_api", _image_conf(endpoint))
+    result = provider.generate("frames", {
+        "shot_no": 4, "prompt": "镜头", "aspect": "9:16",
+        "image_uri": str(keyframe),
+        "spatial_constraint": "空间调度锁：严格 2 人，保持轴线。",
+    }, tmp_path / "frames")
+    assert Path(result.data["first"]).read_bytes() == PNG_1PX
+    assert result.data["first_source"] == "keyframe"
+    assert result.data["generation_calls"] == 1
+    assert result.cost == 1.5
+    assert len(fake.calls) == 1
+    assert "空间调度锁" in provider._semantic_prompt(
+        "镜头", {"spatial_constraint": "空间调度锁：严格 2 人。"}, [])
 
 
 def test_image_api_feedback_into_prompt(fake_api, tmp_path):

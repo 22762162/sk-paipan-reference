@@ -59,8 +59,10 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    status, ctype, _ = _request(server["port"], "GET", "/static/app.js")
+    status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
+    assert b"showBlockingOverlay" in app_js
+    assert "空间调度".encode() in app_js
     status, ctype, _ = _request(server["port"], "GET", "/static/style.css")
     assert status == 200 and "css" in ctype
     status, ctype, raw = _request(
@@ -99,7 +101,7 @@ def test_standard_center_api_lifecycle(server):
     status, initial = _json_request(port, "GET", "/api/standards")
     assert status == 200
     assert initial["active"]["version"] == 1
-    assert len(initial["active"]["content"]["rules"]["quality_gates"]) == 11
+    assert len(initial["active"]["content"]["rules"]["quality_gates"]) == 12
     assert initial["capabilities"] == {
         "versioned": True,
         "episode_snapshot": True,

@@ -1241,6 +1241,41 @@ textarea:focus-visible, select:focus-visible {
 .plan-note { font-size: 11px; margin-top: 4px; }
 .plan-overlay { max-width: 780px; }
 
+/* ---- 空间调度图 ---- */
+.blocking-overlay { width: min(980px, 100%); max-width: 980px; }
+.blocking-summary {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  margin: 12px 0 4px; padding: 10px 12px;
+  border: 1px solid var(--hairline); border-radius: 10px;
+  background: var(--surface-2);
+}
+.blocking-summary span { margin-left: auto; }
+.blocking-scene {
+  margin-top: 18px; padding: 14px; border: 1px solid var(--hairline);
+  border-radius: 12px; background: var(--page);
+}
+.blocking-scene-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 12px; margin-bottom: 10px;
+}
+.blocking-scene-head h3 { margin: 0 0 2px; font-size: 15px; }
+.blocking-map-btn {
+  display: block; width: 100%; padding: 0; overflow: hidden; cursor: zoom-in;
+  border: 1px solid var(--hairline); border-radius: 10px; background: #111827;
+}
+.blocking-map-btn img { display: block; width: 100%; height: auto; }
+.blocking-shot-list { display: grid; gap: 6px; margin-top: 10px; }
+.blocking-shot {
+  display: grid; grid-template-columns: 42px minmax(0, 1fr) auto;
+  align-items: center; gap: 8px; padding: 7px 9px;
+  border-radius: 8px; background: var(--surface);
+  font-size: 12px; line-height: 1.45;
+}
+.blocking-shot b { color: var(--accent); }
+.blocking-shot span { color: var(--ink-2); word-break: break-word; }
+.blocking-shot em { color: var(--ink-3); font-style: normal; white-space: nowrap; }
+.blocking-empty { padding: 36px; text-align: center; color: var(--ink-3); }
+
 /* ---- 真假产线透明:占位图标注与接线指引 ---- */
 .plan-badges { display: flex; align-items: center; gap: 6px; }
 .plan-st.st-real { background: var(--accent-soft); color: #7db4ef; }
@@ -1618,6 +1653,11 @@ textarea:focus-visible, select:focus-visible {
     border-radius: 18px 18px 0 0; border-left: 0; border-right: 0; border-bottom: 0;
   }
   .script-head { position: sticky; top: -18px; z-index: 2; padding: 6px 0 10px; background: var(--surface); }
+  .blocking-summary span { width: 100%; margin-left: 0; }
+  .blocking-scene { padding: 10px; }
+  .blocking-scene-head { flex-direction: column; }
+  .blocking-shot { grid-template-columns: 36px minmax(0, 1fr); }
+  .blocking-shot em { grid-column: 2; white-space: normal; }
   .image-preview-panel { width: 100%; }
   .plan-preview-main { max-height: 64dvh; border-radius: 8px; }
   .plan-preview-meta .preview-download { width: 100%; margin-left: 0; text-align: center; min-height: 44px; }
