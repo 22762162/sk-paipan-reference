@@ -63,14 +63,14 @@ _IMG_MEDIA = {".png": "image/png", ".jpg": "image/jpeg",
 
 
 def _local_refs(payload):
-    """本地参考图路径:风格基准图 + 人物设定图 + 用户参考图(去重存在的)。"""
+    """本地参考图路径：最终立绘优先，其后才是衔接/场景/风格/用户图。"""
     order = []
-    for key in ("style_ref", "chain_first_uri", "scene_ref"):
+    order.extend(payload.get("character_refs") or [])
+    for key in ("chain_first_uri", "scene_ref", "style_ref"):
         val = payload.get(key)
         if val:
             order.append(val)
-    for key in ("character_refs", "reference_images"):
-        order.extend(payload.get(key) or [])
+    order.extend(payload.get("reference_images") or [])
     seen, refs = set(), []
     for uri in order:
         if not uri or uri in seen:
@@ -79,7 +79,9 @@ def _local_refs(payload):
         path = Path(uri)
         if path.exists() and path.suffix.lower() in _IMG_MEDIA:
             refs.append(path)
-    return refs[:4]   # gpt-image edits 上限,取最关键的几张
+    # 不能为迁就接口静默丢弃人物参考图。若目标端点有数量上限，应明确
+    # 报错并回退到能接收全部参考图的 Provider，而不是退化成文字描述。
+    return refs
 
 
 def _multipart_post(name, url, headers, fields, files, timeout):
@@ -159,24 +161,34 @@ class ClaudeApiProvider(Provider):
                 ".jpeg": "image/jpeg", ".webp": "image/webp"}
 
     def _qc_content(self, prompt, payload):
-        """图片质检:图片以 base64 随请求送入(视觉核验)。"""
+        """图片质检：待检图和每个最终立绘都作为真实图像块上传。"""
         import base64
         from pathlib import Path as _P
-        image_path = _P(payload.get("image_uri", ""))
-        if not image_path.exists():
-            raise ProviderError(f"质检图片不存在: {image_path}")
-        media = self.QC_MEDIA.get(image_path.suffix.lower())
-        if media is None:
-            raise ProviderError(f"质检不支持的图片格式: {image_path.suffix}")
-        data = image_path.read_bytes()
-        if len(data) > 20 * 1024 * 1024:
-            raise ProviderError("质检图片超过 20MB")
-        return [
-            {"type": "image", "source": {
+        def image_block(uri, label):
+            path = _P(uri)
+            if not path.exists():
+                raise ProviderError(f"{label}不存在: {path}")
+            media = self.QC_MEDIA.get(path.suffix.lower())
+            if media is None:
+                raise ProviderError(f"质检不支持的图片格式: {path.suffix}")
+            data = path.read_bytes()
+            if len(data) > 20 * 1024 * 1024:
+                raise ProviderError(f"{label}超过 20MB")
+            return {"type": "image", "source": {
                 "type": "base64", "media_type": media,
-                "data": base64.b64encode(data).decode()}},
-            {"type": "text", "text": prompt},
-        ]
+                "data": base64.b64encode(data).decode()}}
+
+        content = [{"type": "text", "text": "下面第一张是待检图。"},
+                   image_block(payload.get("image_uri", ""), "待检图")]
+        for ref in payload.get("identity_references") or []:
+            if not isinstance(ref, dict) or not ref.get("uri"):
+                continue
+            name = ref.get("character", "角色")
+            content.append({"type": "text",
+                            "text": f"下面是{name}人工锁定的最终立绘。"})
+            content.append(image_block(ref["uri"], f"{name}最终立绘"))
+        content.append({"type": "text", "text": prompt})
+        return content
 
     def generate(self, capability, payload, out_dir, cancel=None):
         try:
@@ -270,8 +282,8 @@ class OpenAIImageProvider(Provider):
                  _SUBJECT_DIRECTIVE]
         if refs:
             parts.append(
-                "已随请求附上参考图(第一张为全项目风格基准/上一镜衔接图,"
-                "其余为该角色的人物设定图与用户参考图):画风、线条、上色、"
+                "已随请求真实上传参考图(人物镜头第一组为人工锁定最终立绘,"
+                "其后为上一镜衔接/场景/风格与用户参考):画风、线条、上色、"
                 "光影,以及人物的脸型、发型、发色、服装、配色和标志特征"
                 "必须与参考图完全一致,是同一个人/同一实体,禁止漂移。")
         return "".join(p for p in parts if p)
@@ -282,6 +294,18 @@ class OpenAIImageProvider(Provider):
         timeout = self.conf.get("timeout", 300)
         model = self.conf.get("model") or self.DEFAULT_MODEL
         refs = _local_refs(payload or {})
+        if (payload or {}).get("require_reference_images") and not refs:
+            raise ProviderError(
+                f"{self.name} 人物出图要求参考图，但没有可上传的本地图片")
+        if (payload or {}).get("require_reference_images"):
+            declared = [Path(uri) for uri in
+                        ((payload or {}).get("character_refs") or [])]
+            missing = [str(path) for path in declared
+                       if not path.exists() or path not in refs]
+            if missing:
+                raise ProviderError(
+                    f"{self.name} 未能上传全部人物参考图: "
+                    + "、".join(missing))
         full_prompt = self._semantic_prompt(prompt, payload or {}, refs)
         if refs:
             # 有参考图 → images/edits 多图输入(真正把参考图喂给模型),

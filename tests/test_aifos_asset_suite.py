@@ -22,7 +22,18 @@ def app(tmp_path):
 
 def _preproduce(app, title="万妖图录", number=1):
     app.director.produce(title, number, pause_for_confirm=True)   # 剧本停
-    app.director.produce(title, number, pause_for_confirm=True)   # 预生产停
+    summary = app.director.produce(
+        title, number, pause_for_confirm=True)   # 人物候选停
+    if summary["status"] == "awaiting_cast":
+        project = app.projects.get_project(title)
+        episode = app.db.query_one(
+            "SELECT * FROM episodes WHERE project_id=? AND number=?",
+            (project["id"], number))
+        script, _ = app.projects.latest_document(episode["id"], "script")
+        for character in script["characters"]:
+            app.director.select_character_candidate(
+                title, number, character["name"], 1)
+        app.director.produce(title, number, pause_for_confirm=True)
     return app.projects.get_project(title)
 
 
@@ -213,20 +224,20 @@ def test_regen_always_produces_new_image(app):
     (占位产线是确定性生成,靠 payload 里的 revision 保证变化。)"""
     from pathlib import Path
     project = _preproduce(app)
-    name = app.assets.list(project["id"], "character")[0]["name"]
-    target = {"kind": "character_art", "name": name}
+    name = app.assets.list(project["id"], "scene_art")[0]["name"]
+    target = {"kind": "scene_art", "name": name}
     before = Path(app.assets.latest(
-        project["id"], "character_art", name)["uri"]).read_text(
+        project["id"], "scene_art", name)["uri"]).read_text(
         encoding="utf-8")
     app.director.regen_image(project["title"], 1, target,
                              feedback="换成红色衣服")
     first = Path(app.assets.latest(
-        project["id"], "character_art", name)["uri"]).read_text(
+        project["id"], "scene_art", name)["uri"]).read_text(
         encoding="utf-8")
     app.director.regen_image(project["title"], 1, target,
                              feedback="换成红色衣服")
     second = Path(app.assets.latest(
-        project["id"], "character_art", name)["uri"]).read_text(
+        project["id"], "scene_art", name)["uri"]).read_text(
         encoding="utf-8")
     assert before != first
     assert first != second      # 同意见再画一次也必须换新画面
@@ -305,7 +316,7 @@ def test_asset_center_has_design_and_lightbox():
 
 
 def test_style_anchor_unifies_all_art(app):
-    """风格统一:主角立绘先画,其余立绘/套件/场景全部引用风格基准图。"""
+    """风格统一:候选定版后，套件/场景/镜头全部引用最终锚点。"""
     payloads = []
     original = app.director.router.call
 
@@ -325,11 +336,8 @@ def test_style_anchor_unifies_all_art(app):
     anchor_uri = app.assets.latest(
         project["id"], "character_art", anchor)["uri"]
     portraits = [p for p in payloads if p.get("portrait")]
-    # 锚角色最先画且不引用自己
-    assert portraits[0]["art_name"] == anchor
-    assert not portraits[0].get("style_ref")
-    for p in portraits[1:]:
-        assert p["style_ref"] == anchor_uri, f"{p['art_name']} 未对齐风格锚"
+    assert len(portraits) == len(script["characters"]) * 5
+    assert all(p.get("portrait_candidate") for p in portraits)
     for p in payloads:
         if p.get("character_sheet") or p.get("scene_art"):
             assert p.get("style_ref") == anchor_uri
@@ -339,36 +347,36 @@ def test_style_anchor_unifies_all_art(app):
 
 
 def test_restyle_project_regenerates_all_art(app):
-    """一键换画风:全部形象按新画风重做,主角先做,画风入库。"""
+    """换画风:旧身份失效，重新生成5张候选并等待人工定版。"""
     project = _preproduce(app)
     before = {(r["kind"], r["name"]): r["version"]
               for r in app.assets.list(project["id"])
-              if r["kind"] in ("character_art", "character_sheet",
-                               "scene_art")}
+              if r["kind"] in ("character_candidate", "character_sheet",
+                               "scene_art", "character_identity")}
     summary = app.director.restyle_project(
         project["title"], 1, style="赛博朋克霓虹,冷紫主色")
-    assert summary["status"] == "done"
+    assert summary["status"] == "awaiting_cast"
     assert summary["style"] == "赛博朋克霓虹,冷紫主色"
     assert app.projects.get_project(
         project["title"])["style"] == "赛博朋克霓虹,冷紫主色"
     after = {(r["kind"], r["name"]): r["version"]
              for r in app.assets.list(project["id"])
-             if r["kind"] in ("character_art", "character_sheet",
-                              "scene_art")}
+             if r["kind"] in ("character_candidate", "character_sheet",
+                              "scene_art", "character_identity")}
     assert after.keys() == before.keys()
     for key, version in after.items():
         assert version == before[key] + 1, f"{key} 未重做"
-    # 状态回落到重做前的稳定状态
+    # 新画风必须重新人工定版，不能自动覆盖最终立绘
     episode = app.db.query_one(
         "SELECT * FROM episodes WHERE project_id=? AND number=1",
         (project["id"],))
-    assert episode["status"] == "awaiting_confirm"
+    assert episode["status"] == "awaiting_cast"
     # 新画风进入清单提示词
     plan = json.loads(
         (app.workspace.artifacts_dir / f"p{project['id']:03d}" / "e001"
          / "render_plan.json").read_text(encoding="utf-8"))
     item = next(i for i in plan["items"]
-                if i["category"] == "character_art")
+                if i["category"] == "character_candidate")
     assert "赛博朋克霓虹" in item["prompt"]
 
 

@@ -7,6 +7,7 @@ import pytest
 from aifos.app import App
 from aifos.cli import main
 from aifos.director import MODERN_OTOME_STYLE, infer_visual_style
+from aifos.errors import AifosError
 
 
 @pytest.fixture()
@@ -14,6 +15,25 @@ def app(tmp_path):
     instance = App(tmp_path / "ws")
     yield instance
     instance.close()
+
+
+def _lock_all(app, title, number):
+    project = app.projects.get_project(title)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=?",
+        (project["id"], number))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    for character in script["characters"]:
+        app.director.select_character_candidate(
+            title, number, character["name"], 1)
+
+
+def _to_preflight(app, title="万妖图录", number=1):
+    app.director.produce(title, number, pause_for_confirm=True)
+    cast = app.director.produce(title, number, pause_for_confirm=True)
+    assert cast["status"] == "awaiting_cast"
+    _lock_all(app, title, number)
+    return app.director.produce(title, number, pause_for_confirm=True)
 
 
 def test_review_pauses_at_script_first(app):
@@ -43,8 +63,14 @@ def test_xianxia_title_is_not_overridden_by_modern_default():
 
 
 def test_script_confirm_pauses_before_video(app):
-    """第二道确认:剧本确认后画人物/场景/分镜/首尾帧,再停等开拍。"""
+    """人物五选一后才画场景/分镜/首尾帧,再停等开拍。"""
     app.director.produce("万妖图录", 1, pause_for_confirm=True)
+    summary = app.director.produce("万妖图录", 1, pause_for_confirm=True)
+    assert summary["status"] == "awaiting_cast"
+    project = app.projects.get_project("万妖图录")
+    assert len(app.assets.list(project["id"], "character_candidate")) >= 5
+    assert app.assets.list(project["id"], "scene_art") == []
+    _lock_all(app, "万妖图录", 1)
     summary = app.director.produce("万妖图录", 1, pause_for_confirm=True)
     assert summary["status"] == "awaiting_confirm"
     stages = [s["stage"] for s in summary["stages"]]
@@ -55,7 +81,6 @@ def test_script_confirm_pauses_before_video(app):
     script = next(s for s in summary["stages"] if s["stage"] == "script")
     assert script["cost"] == 0
     # 预生产阶段不消耗视频产线
-    project = app.projects.get_project("万妖图录")
     episode = app.db.query_one(
         "SELECT * FROM episodes WHERE project_id=? AND number=1",
         (project["id"],))
@@ -73,8 +98,8 @@ def test_script_confirm_pauses_before_video(app):
 
 
 def test_confirm_continues_to_done(app):
-    app.director.produce("万妖图录", 2, pause_for_confirm=True)   # 剧本停
-    app.director.produce("万妖图录", 2, pause_for_confirm=True)   # 预生产停
+    summary = _to_preflight(app, "万妖图录", 2)
+    assert summary["status"] == "awaiting_confirm"
     summary = app.director.produce("万妖图录", 2)  # 开拍确认 = 无暂停再次调用
     assert summary["status"] == "done"
     # 预生产产物全部复用,只补视频之后的部分
@@ -89,7 +114,7 @@ def test_confirm_continues_to_done(app):
 
 
 def test_provided_script_skips_script_pause(app):
-    """用户自带剧本(自己写的不用再过目)→ 直接停在开拍确认。"""
+    """用户自带剧本不用再过目，但仍必须停在人物五选一。"""
     script = {
         "project_title": "万妖图录", "episode_number": 9,
         "episode_title": "自带剧本", "logline": "测试",
@@ -101,10 +126,17 @@ def test_provided_script_skips_script_pause(app):
     }
     summary = app.director.produce(
         "万妖图录", 9, script=script, pause_for_confirm=True)
+    assert summary["status"] == "awaiting_cast"
+    _lock_all(app, "万妖图录", 9)
+    summary = app.director.produce(
+        "万妖图录", 9, pause_for_confirm=True)
     assert summary["status"] == "awaiting_confirm"
 
 
 def test_cast_art_reused_across_episodes(app):
+    first = app.director.produce("万妖图录", 1)
+    assert first["status"] == "awaiting_cast"
+    _lock_all(app, "万妖图录", 1)
     app.director.produce("万妖图录", 1)
     project = app.projects.get_project("万妖图录")
     first_arts = {r["name"]: r["uri"]
@@ -132,7 +164,22 @@ def test_cli_review_and_confirm(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 0
     assert "剧本已确认" in out
-    # 第二停:预生产完成 → 再确认开拍
+    assert "人物待选" in out
+    # 人工定角门禁:未选不能继续。
+    assert main(["--workspace", ws, "confirm", "--project", "万妖图录",
+                 "--episode", "1"]) == 1
+    assert "尚未全部选定" in capsys.readouterr().err
+    locked = App(ws)
+    try:
+        _lock_all(locked, "万妖图录", 1)
+    finally:
+        locked.close()
+    # 第二停:人物已定版，完成预生产 → 再确认开拍
+    code = main(["--workspace", ws, "confirm", "--project", "万妖图录",
+                 "--episode", "1"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "待确认" in out
     code = main(["--workspace", ws, "confirm", "--project", "万妖图录",
                  "--episode", "1"])
     out = capsys.readouterr().out
@@ -151,8 +198,14 @@ def test_stop_lands_back_to_reviewable_state(app):
     app.projects.set_episode_status(episode["id"], "cancelling")
     summary = app.director.produce("停一下", 1, pause_for_confirm=True)
     assert summary["status"] == "awaiting_script"
+    # 人物候选已生成 → 停止后落回人物选择。
+    app.director.produce("停一下", 1, pause_for_confirm=True)
+    app.projects.set_episode_status(episode["id"], "cancelling")
+    summary = app.director.produce("停一下", 1)
+    assert summary["status"] == "awaiting_cast"
+    _lock_all(app, "停一下", 1)
     # 预生产门禁已过 → 停止后落回开拍确认
-    app.director.produce("停一下", 1, pause_for_confirm=True)  # 剧本确认
+    app.director.produce("停一下", 1, pause_for_confirm=True)
     app.projects.set_episode_status(episode["id"], "cancelling")
     summary = app.director.produce("停一下", 1)
     assert summary["status"] == "awaiting_confirm"
@@ -182,12 +235,11 @@ def _plan_of(app, title, number):
 
 def test_render_plan_lists_every_image_with_prompt(app):
     """图片生产清单:四类图全部列出,每张带提示词,状态全部就绪。"""
-    app.director.produce("万妖图录", 1, pause_for_confirm=True)   # 剧本停
-    app.director.produce("万妖图录", 1, pause_for_confirm=True)   # 预生产停
+    _to_preflight(app)
     plan = _plan_of(app, "万妖图录", 1)
     cats = {i["category"] for i in plan["items"]}
-    assert cats == {"character_art", "character_sheet", "scene_art",
-                    "shot_image", "frames"}
+    assert cats == {"character_candidate", "character_art",
+                    "character_sheet", "scene_art", "shot_image", "frames"}
     assert all(i["prompt"] for i in plan["items"])
     assert all(i["status"] in ("done", "reused") for i in plan["items"])
     # 现画的图都有单张耗时(前端据此估算剩余时间)
@@ -203,35 +255,41 @@ def test_render_plan_lists_every_image_with_prompt(app):
 
 
 def test_regen_image_prompt_override(app):
-    """单张图可改提示词重画:清单记录自定义提示词并标记已改词。"""
-    app.director.produce("万妖图录", 1, pause_for_confirm=True)
-    app.director.produce("万妖图录", 1, pause_for_confirm=True)
-    name = _plan_of(app, "万妖图录", 1)["items"][0]["name"]
-    app.director.regen_image(
-        "万妖图录", 1, {"kind": "character_art", "name": name},
-        prompt_override="红衣持剑,雪夜屋顶,月光逆光,全身立绘")
+    """最终立绘禁止绕过五选一直接重画；镜头图仍可改词重画。"""
+    _to_preflight(app)
     plan = _plan_of(app, "万妖图录", 1)
-    item = next(i for i in plan["items"] if i["id"] == f"char:{name}")
+    name = next(i["name"] for i in plan["items"]
+                if i["category"] == "character_candidate")
+    with pytest.raises(AifosError, match="5张.*候选"):
+        app.director.regen_image(
+            "万妖图录", 1, {"kind": "character_art", "name": name})
+    shot = next(i for i in plan["items"] if i["category"] == "shot_image")
+    app.director.regen_image(
+        "万妖图录", 1, {"kind": "shot", "shot_no": shot["shot_no"]},
+        prompt_override="红衣持剑,雪夜屋顶,月光逆光,电影远景")
+    plan = _plan_of(app, "万妖图录", 1)
+    item = next(i for i in plan["items"] if i["id"] == shot["id"])
     assert item["status"] == "done"
     assert item["custom_prompt"] is True
-    assert item["prompt"] == "红衣持剑,雪夜屋顶,月光逆光,全身立绘"
+    assert item["prompt"] == "红衣持剑,雪夜屋顶,月光逆光,电影远景"
 
 
 def test_style_confirmed_at_script_step_flows_into_prompts(app):
     """剧本确认时改画风 → 之后人物/场景/分镜提示词全部按新画风。"""
     app.director.produce("万妖图录", 1, pause_for_confirm=True)   # 剧本停
     app.projects.update_project("万妖图录", style="水墨国风,淡彩留白")
-    app.director.produce("万妖图录", 1, pause_for_confirm=True)   # 开画
+    app.director.produce("万妖图录", 1, pause_for_confirm=True)
+    _lock_all(app, "万妖图录", 1)
+    app.director.produce("万妖图录", 1, pause_for_confirm=True)
     plan = _plan_of(app, "万妖图录", 1)
-    for cat in ("character_art", "character_sheet", "scene_art"):
+    for cat in ("character_candidate", "character_sheet", "scene_art"):
         item = next(i for i in plan["items"] if i["category"] == cat)
         assert "水墨国风" in item["prompt"], f"{cat} 未按新画风"
 
 
 def test_plan_marks_mock_images_with_fallback_reason(app):
     """真假产线透明:占位图必须标注 mock 与回退原因,SVG 自带水印。"""
-    app.director.produce("万妖图录", 1, pause_for_confirm=True)
-    app.director.produce("万妖图录", 1, pause_for_confirm=True)
+    _to_preflight(app)
     plan = _plan_of(app, "万妖图录", 1)
     done = [i for i in plan["items"] if i["status"] == "done"]
     assert done
@@ -241,9 +299,11 @@ def test_plan_marks_mock_images_with_fallback_reason(app):
         assert any(f["provider"] == "codex" for f in item["fallbacks"])
     # 占位图片自带水印,播放器/画布里也能一眼识别
     art = next(i for i in plan["items"]
-               if i["category"] == "character_art")
+               if i["category"] == "character_candidate")
     project = app.projects.get_project("万妖图录")
-    row = app.assets.latest(project["id"], "character_art", art["name"])
+    row = app.assets.latest(
+        project["id"], "character_candidate",
+        f"{art['name']}:{art['candidate_index']:02d}")
     assert "占位示意图" in Path(row["uri"]).read_text(encoding="utf-8")
 
 

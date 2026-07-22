@@ -1,5 +1,6 @@
 """CLI 测试:一句话指令解析与主要子命令。"""
 
+from aifos.app import App
 from aifos.cli import main, parse_produce_sentence
 
 
@@ -18,6 +19,23 @@ def test_cli_init_and_produce(tmp_path, capsys):
     code = main(["--workspace", ws, "produce", "开始制作《万妖图录》第15集"])
     out = capsys.readouterr().out
     assert code == 0
+    assert "制作人物待选" in out
+    assert "5张候选立绘" in out
+    app = App(ws)
+    try:
+        project = app.projects.get_project("万妖图录")
+        episode = app.db.query_one(
+            "SELECT * FROM episodes WHERE project_id=? AND number=15",
+            (project["id"],))
+        script, _ = app.projects.latest_document(episode["id"], "script")
+        for character in script["characters"]:
+            app.director.select_character_candidate(
+                "万妖图录", 15, character["name"], 1)
+    finally:
+        app.close()
+    assert main(["--workspace", ws, "produce",
+                 "开始制作《万妖图录》第15集"]) == 0
+    out = capsys.readouterr().out
     assert "制作完成" in out
     assert "质检得分: 100" in out
 

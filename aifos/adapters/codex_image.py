@@ -63,7 +63,14 @@ def _style_line(payload):
 
 
 def _ref_line(payload):
-    refs = [f"人物设定图 {r}" for r in payload.get("character_refs", [])]
+    identity_refs = payload.get("identity_references") or []
+    refs = [
+        f"{r.get('character', '角色')}人工锁定最终立绘 {r.get('uri', '')}"
+        for r in identity_refs if isinstance(r, dict) and r.get("uri")]
+    locked_uris = {r.get("uri") for r in identity_refs
+                   if isinstance(r, dict)}
+    refs.extend(f"人物设定图 {r}" for r in payload.get("character_refs", [])
+                if r not in locked_uris)
     if payload.get("scene_ref"):
         refs.append(f"场景概念图 {payload['scene_ref']}")
     refs.extend(f"用户参考图 {r}"
@@ -75,8 +82,9 @@ def _ref_line(payload):
             "绘画风格、线条、上色、光影、质感必须与这张图完全一致,"
             "禁止任何风格漂移)。")
     if refs:
-        lines.append("参考图(文件可直接读取;人物发型/服装/配色和场景陈设"
-                     "必须与参考图一致):" + ";".join(refs) + "。")
+        lines.append("参考图(必须真实打开读取，不得只使用文字描述；人物身份以"
+                     "人工锁定最终立绘为最高基准，发型/服装/配色和场景陈设"
+                     "必须与相应参考图一致):" + ";".join(refs) + "。")
     return "".join(lines)
 
 
@@ -98,10 +106,13 @@ def build_instruction(capability, payload, out_dir):
                        for c in str(payload.get("art_name", "")))[:40]
         if payload.get("portrait"):
             target = out_dir / f"portrait_{safe}.png"
+            purpose = ("这只是供人工挑选的定妆候选，尚不是最终身份锚点"
+                       if payload.get("portrait_candidate") else
+                       "这张立绘是全剧的人物设定基准，之后所有镜头都会参考它")
             instruction = (
                 f"为角色生成立绘并保存到 {target}(PNG,{size})。"
-                f"{payload.get('prompt', '')}。这张立绘是全剧的人物设定基准,"
-                f"之后所有镜头都会参考它。{_ref_line(payload)}{common}"
+                f"{payload.get('prompt', '')}。{purpose}。"
+                f"{_ref_line(payload)}{common}"
                 "只产出该文件。")
             return instruction, [target], {"name": payload.get("art_name")}
         if payload.get("character_sheet"):
@@ -209,6 +220,10 @@ def build_instruction(capability, payload, out_dir):
         image = payload.get("image_uri", "")
         chars = "、".join(payload.get("characters", [])) or "无人(空镜)"
         forbid = "、".join(payload.get("forbid", [])) or "无"
+        identity_refs = payload.get("identity_references") or []
+        identity_line = "；".join(
+            f"{r.get('character', '角色')}={r.get('uri', '')}"
+            for r in identity_refs if isinstance(r, dict)) or "无人空镜"
         instruction = (
             f"你是漫剧图片质检员。用你的视觉能力查看图片文件 {image}"
             "(可直接读取该文件),逐项核对是否符合以下生产要求,"
@@ -219,12 +234,17 @@ def build_instruction(capability, payload, out_dir):
             "设定是人类就必须是人类)\n"
             f"- 人物设定要点(发型/服装/标志特征必须一致,像不像同一个人):"
             f"{payload.get('designs', '见参考图')}\n"
+            f"- 人工锁定的最终立绘:{identity_line}\n"
+            "必须真实打开待检图和上述最终立绘逐人做视觉比对；脸型、五官比例、"
+            "眼鼻嘴、发际线、发型轮廓、年龄感和体型以最终立绘为准。"
+            "不得只根据文字判断；文字与最终立绘冲突时，身份以最终立绘为准。\n"
             f"- 场景:{payload.get('location', '按提示词')};"
             f"动作:{payload.get('action', '按提示词')};"
             f"镜头景别:{payload.get('camera', '不限')}\n"
             f"- 不允许出现:{forbid}、字幕条、乱码文字、多余或缺失的人物\n"
             "只在标准输出打印一行 JSON,不要产出任何文件,不要多余文字:"
-            '{"pass": true或false, "issues": ["每条一句具体原因"]}'
+            '{"pass": true或false, "identity_checked": true或false, '
+            '"issues": ["每条一句具体原因"]}'
         )
         return instruction, [], {"qc": True}
     if capability == "cover":
@@ -266,6 +286,23 @@ def run(request, codex, timeout, extra_args, plain=False):
     payload = request.get("payload", {})
     out_dir = Path(request["out_dir"]).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    if payload.get("require_reference_images"):
+        declared = payload.get("character_refs") or []
+        missing = [str(uri) for uri in declared if not Path(uri).exists()]
+        if not declared:
+            return {"ok": False, "error": "人物出图要求最终立绘，但请求未携带参考图"}
+        if missing:
+            return {"ok": False,
+                    "error": "人物参考图不存在: " + "、".join(missing)}
+    if payload.get("identity_required"):
+        identity_refs = payload.get("identity_references") or []
+        missing = [str(ref.get("uri", "")) for ref in identity_refs
+                   if not isinstance(ref, dict)
+                   or not ref.get("uri") or not Path(ref["uri"]).exists()]
+        if not identity_refs or missing:
+            return {"ok": False,
+                    "error": "人物质检缺少可读取的最终立绘"
+                             + ((":" + "、".join(missing)) if missing else "")}
     if shutil.which(codex) is None and not Path(codex).exists():
         return {"ok": False, "error": f"codex 命令不存在: {codex}"}
     instruction, targets, data = build_instruction(

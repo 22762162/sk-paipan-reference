@@ -154,6 +154,16 @@ def test_produce_passes_reference_art(tmp_path, fake_codex, monkeypatch):
                     "--codex", str(fake_codex)],
     }}})
     try:
+        summary = app.director.produce("参考图验证", 1)
+        assert summary["status"] == "awaiting_cast"
+        project = app.projects.get_project("参考图验证")
+        episode = app.db.query_one(
+            "SELECT * FROM episodes WHERE project_id=? AND number=1",
+            (project["id"],))
+        script, _ = app.projects.latest_document(episode["id"], "script")
+        for character in script["characters"]:
+            app.director.select_character_candidate(
+                "参考图验证", 1, character["name"], 1)
         app.director.produce("参考图验证", 1)
     finally:
         app.close()
@@ -162,8 +172,8 @@ def test_produce_passes_reference_art(tmp_path, fake_codex, monkeypatch):
                     log.read_text(encoding="utf-8").splitlines()]
     keyframe_calls = [i for i in instructions if "keyframe" in i]
     assert keyframe_calls
-    # 对白镜头的指令引用人物设定图(portrait_*.png 真实路径)
-    assert any("人物设定图" in i and "portrait_" in i
+    # 对白镜头的指令引用人工锁定立绘(portrait_*.png 真实路径)
+    assert any("人工锁定最终立绘" in i and "portrait_" in i
                for i in keyframe_calls)
     assert any("场景概念图" in i and "scene_" in i for i in keyframe_calls)
 

@@ -181,8 +181,13 @@ class MockProvider(Provider):
         blob = json.dumps(payload, ensure_ascii=False)
         if "质检必挂" in blob:
             return {"pass": False,
+                    "identity_checked": bool(
+                        payload.get("identity_references")),
                     "issues": ["测试触发:画面与要求不符"]}, ""
-        return {"pass": True, "issues": []}, ""
+        return {"pass": True,
+                "identity_checked": (not payload.get("identity_required")
+                                     or bool(payload.get("identity_references"))),
+                "issues": []}, ""
 
     # ---- 剧本:按题材分流(偶像/都市/校园/仙侠) ----
     def _gen_script(self, payload, out_dir):

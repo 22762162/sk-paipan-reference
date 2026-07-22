@@ -31,6 +31,9 @@ class Provider:
         self.cost_per_call = float(conf.get("cost_per_call", 0.0))
         self.enabled = bool(conf.get("enabled", False))
         self.quota_limit = int(conf.get("quota", 0))
+        # 人物生产硬契约：只有明确声明并实现真实图像参考输入的 Provider
+        # 才能接收 require_reference_images 任务。
+        self.reference_images = bool(conf.get("reference_images", False))
 
     def available(self, capability):
         """返回 (是否可用, 不可用原因)。"""

@@ -18,8 +18,22 @@ def _stage(summary, name):
     return next(s for s in summary["stages"] if s["stage"] == name)
 
 
+def _finish(app, title, number):
+    summary = app.director.produce(title, number)
+    assert summary["status"] == "awaiting_cast"
+    project = app.projects.get_project(title)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=?",
+        (project["id"], number))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    for character in script["characters"]:
+        app.director.select_character_candidate(
+            title, number, character["name"], 1)
+    return app.director.produce(title, number)
+
+
 def test_second_run_reuses_everything(app):
-    first = app.director.produce("万妖图录", 1)
+    first = _finish(app, "万妖图录", 1)
     assert first["status"] == "done"
     videos_cost_1 = _stage(first, "videos")["cost"]
     assert videos_cost_1 > 0
@@ -46,7 +60,7 @@ def test_second_run_reuses_everything(app):
 
 
 def test_missing_artifact_regenerated_only(app):
-    first = app.director.produce("万妖图录", 2)
+    first = _finish(app, "万妖图录", 2)
     videos = _stage(first, "videos")["detail"]["count"]
     # 删除一个镜头视频,模拟真实产线中断/损坏
     project = app.projects.get_project("万妖图录")
@@ -63,7 +77,7 @@ def test_missing_artifact_regenerated_only(app):
 
 
 def test_force_regenerates_all(app):
-    app.director.produce("万妖图录", 3)
+    _finish(app, "万妖图录", 3)
     forced = app.director.produce("万妖图录", 3, force=True)
     for stage in ("images", "frames", "videos"):
         report = _stage(forced, stage)

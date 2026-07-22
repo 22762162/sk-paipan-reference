@@ -60,7 +60,7 @@ def test_strip_genre_words():
 def test_su_nian_idol_group_not_xianxia(app):
     """回归:《苏念的一天》+ 偶像女团 → 女团内容,无任何仙侠元素。"""
     summary = app.director.produce("苏念的一天", 1, premise="偶像女团")
-    assert summary["status"] == "done"
+    assert summary["status"] == "awaiting_cast"
     script = _script_of(app, "苏念的一天", 1)
     text = _all_text(script)
     for word in XIANXIA_WORDS:
@@ -97,7 +97,7 @@ def test_xianxia_title_keeps_xianxia(app):
 def test_explicit_kind_overrides(app):
     """显式选类型:即使无关键词也走偶像模板,且项目类型更新。"""
     summary = app.director.produce("晨间日记", 1, kind="idol")
-    assert summary["status"] == "done"
+    assert summary["status"] == "awaiting_cast"
     project = app.projects.get_project("晨间日记")
     assert project["kind"] == "idol"
     script = _script_of(app, "晨间日记", 1)
