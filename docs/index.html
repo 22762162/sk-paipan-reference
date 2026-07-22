@@ -709,6 +709,12 @@ td.num, th.num { text-align: right; }
 }
 .confirm-banner b { display: block; margin-bottom: 2px; }
 .confirm-banner span { color: var(--ink-2); font-size: 13px; }
+/* 失败横幅:红色示警,一键从断点继续 */
+.confirm-banner.fail-banner {
+  background: rgba(248, 81, 73, .1);
+  border-bottom: 1px solid rgba(248, 81, 73, .45);
+}
+.episode-resume { white-space: nowrap; }
 .confirm-banner > div { flex: 1; min-width: 260px; }
 .confirm-banner button { font-size: 15px; padding: 11px 22px; white-space: nowrap; }
 .cast-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -5610,7 +5616,11 @@ function episodesPanelHtml(data) {
           <td>${chip(e.status)}</td>
           <td class="num">${e.qc_score == null ? "-" : fmt(e.qc_score, 0)}</td>
           <td class="num">${fmt(e.cost)}</td>
-          <td><button class="danger episode-delete-work" data-episode-id="${e.id}"
+          <td>${["failed", "qc_failed"].includes(e.status) && !running
+            ? `<button class="primary episode-resume" data-episode-id="${e.id}"
+                data-title="${esc(e.project)}" data-number="${e.number}"
+                title="从上次失败的断点接着做,已完成部分全部保留">▶ 继续</button> ` : ""}
+          <button class="danger episode-delete-work" data-episode-id="${e.id}"
             ${running ? "disabled" : ""} title="${running
               ? "本集正在生成，请先安全停止" : "删除本集作品，可选择是否保留资产中心图片"}">删除</button></td>
         </tr>`;
@@ -5626,6 +5636,26 @@ function bindEpisodeRows(data) {
     }));
   const episodes = new Map(data.episodes.map((episode) =>
     [String(episode.id), episode]));
+  app.querySelectorAll("#episodes-panel .episode-resume").forEach((button) =>
+    button.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      button.disabled = true;
+      button.textContent = "续跑中…";
+      try {
+        await api("/api/produce", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: button.dataset.title,
+                                 episode: Number(button.dataset.number),
+                                 review: true }),
+        });
+        showToast("已从断点继续:复用已完成部分,只重跑剩余步骤", "ok");
+        location.hash = `#/episode/${button.dataset.episodeId}`;
+      } catch (e) {
+        showToast(e.message, "error");
+        button.disabled = false;
+        button.textContent = "▶ 继续";
+      }
+    }));
   app.querySelectorAll("#episodes-panel .episode-delete-work").forEach((button) =>
     button.addEventListener("click", (event) => {
       event.stopPropagation();
@@ -9033,13 +9063,14 @@ async function renderCanvasView(episodeId) {
     return;
   }
   if (!sb) {
-    if (script) {
+    // 只要有剧本、或制作已失败/中断,都必须给"从断点接着做"的入口,
+    // 不能让用户面对一句"尚无分镜"无路可走
+    if (script || ["failed", "qc_failed"].includes(ep.status)) {
       renderRecoveryView(data, episodeId);
       return;
     }
     app.innerHTML = `<div class="loading">本集尚无分镜(制作进行中或未开始)。<a href="#/">返回仪表盘</a></div>`;
-    if (!["done", "failed", "qc_failed"].includes(ep.status))
-      pollCanvas(episodeId);
+    pollCanvas(episodeId);
     return;
   }
 
@@ -9054,8 +9085,21 @@ async function renderCanvasView(episodeId) {
   const profile = data.production_profile || {};
   const videoDefault = (data.quality_policy || {}).video_default || "auto";
   const gates = data.preflight?.gates || [];
+  const lastFailed = ["failed", "qc_failed"].includes(ep.status)
+    ? [...(data.tasks || [])].reverse().find((t) => t.status === "failed")
+    : null;
   app.innerHTML = `
   <div class="canvas-view">
+    ${["failed", "qc_failed"].includes(ep.status) ? `
+    <div class="confirm-banner fail-banner">
+      <div>
+        <b>${lastFailed ? `上次制作在「${esc(STAGE_CN[lastFailed.stage] || lastFailed.stage)}」失败 ⚠️`
+          : (ep.status === "qc_failed" ? "成片质检未通过 ⚠️" : "上次制作失败 ⚠️")}</b>
+        <span>${lastFailed ? esc((lastFailed.error || "").slice(0, 200)) + ";" : ""}
+        已完成的剧本/人物/图片/视频全部保留,点右侧按钮从断点接着做,只补缺失部分,不重复消耗额度。</span>
+      </div>
+      <button class="primary" id="btn-resume-canvas">▶ 从断点继续制作</button>
+    </div>` : ""}
     ${awaiting ? `
     <div class="confirm-banner">
       <div>
@@ -9149,6 +9193,12 @@ async function renderCanvasView(episodeId) {
     armConfirm(ev.target, "补齐", () => reproduce(false));
   document.getElementById("btn-reproduce-force").onclick = (ev) =>
     armConfirm(ev.target, "重做", () => reproduce(true));
+  const btnResumeCanvas = document.getElementById("btn-resume-canvas");
+  if (btnResumeCanvas) btnResumeCanvas.onclick = () => {
+    btnResumeCanvas.disabled = true;
+    btnResumeCanvas.textContent = "已提交,续跑中…";
+    reproduce(false);
+  };
   document.getElementById("btn-script").onclick = () => showScriptOverlay(data, episodeId);
   document.getElementById("btn-blocking").onclick = () => showBlockingOverlay(episodeId);
   document.getElementById("btn-plan").onclick = () => showPlanOverlay(episodeId);
@@ -9581,6 +9631,7 @@ function renderScriptReview(data, episodeId) {
 /* ---- 生产恢复页:阶段失败/中断后的一键续跑入口 ---- */
 function renderRecoveryView(data, episodeId) {
   const ep = data.episode;
+  const hasScript = !!data.script;
   const failedTask = [...(data.tasks || [])].reverse()
     .find((t) => t.status === "failed");
   app.innerHTML = `
@@ -9589,7 +9640,8 @@ function renderRecoveryView(data, episodeId) {
       <div>
         <b>${failedTask ? `上次生产在「${esc(STAGE_CN[failedTask.stage] || failedTask.stage)}」失败 ⚠️` : "生产已中断"}</b>
         <span>${failedTask ? esc((failedTask.error || "").slice(0, 200)) : "可从断点继续"};
-        剧本、人物设定和已画好的图全部保留,点继续只重跑未完成的部分,不重复消耗额度。</span>
+        ${hasScript ? "剧本、人物设定和已画好的图全部保留,点继续只重跑未完成的部分,不重复消耗额度。"
+          : "剧本还没写完;点继续会从剧本这一步接着做,写好后照常停下等你确认。"}</span>
       </div>
       <button class="primary" id="btn-resume">▶ 继续补齐(从断点重跑)</button>
     </div>
@@ -9598,7 +9650,7 @@ function renderRecoveryView(data, episodeId) {
       <span class="title">《${esc(data.project.title)}》第${ep.number}集</span>
       ${chip(ep.status)}
       <span class="spacer"></span>
-      <button id="btn-script2">📖 看剧本</button>
+      ${hasScript ? `<button id="btn-script2">📖 看剧本</button>` : ""}
       <button id="btn-plan2">🖼 图片清单</button>
     </div>
     <div class="produce-main" style="padding:0 18px 40px">
@@ -9607,8 +9659,8 @@ function renderRecoveryView(data, episodeId) {
     </div>
   </div>`;
   document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
-  document.getElementById("btn-script2").onclick = () =>
-    showScriptOverlay(data, episodeId);
+  document.getElementById("btn-script2")?.addEventListener("click", () =>
+    showScriptOverlay(data, episodeId));
   document.getElementById("btn-plan2").onclick = () =>
     showPlanOverlay(episodeId);
   bindImageAccelerationLivebar(episodeId);
