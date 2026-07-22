@@ -1913,6 +1913,9 @@ class Director:
                               "feedback": feedback,
                               "revision": next_revision("first_frame",
                                                         asset_name)}
+            if prompt_override:
+                frames_payload["prompt"] = prompt_override
+                frames_payload["seedance_prompt"] = prompt_override
             prev = None
             for candidate in storyboard["shots"]:
                 if candidate["shot_no"] >= shot_no:
@@ -1927,7 +1930,8 @@ class Director:
                     frames_payload["chain_first_uri"] = row["uri"]
             result = self._plan_run(
                 ctx, f"frames:{shot_no}", lambda: self._call(
-                    ctx, "frames", frames_payload, "frames"))
+                    ctx, "frames", frames_payload, "frames"),
+                prompt=prompt_override or None)
             self.assets.register(project["id"], "first_frame", asset_name,
                                  uri=result.data["first"],
                                  new_version=True)

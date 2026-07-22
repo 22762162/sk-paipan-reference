@@ -898,9 +898,11 @@ def make_handler(workspace, jobs):
                 return self._error(400, "请求体不是合法 JSON")
             target = body.get("target") or {}
             if target.get("kind") not in ("character_art", "scene_art",
-                                          "shot", "character_sheet"):
+                                          "shot", "character_sheet",
+                                          "frames"):
                 return self._error(400, "target.kind 需为 character_art/"
-                                        "scene_art/shot/character_sheet")
+                                        "scene_art/shot/character_sheet/"
+                                        "frames")
             found = self._episode_ref(body)
             if found is None:
                 return self._error(404, "剧集不存在")

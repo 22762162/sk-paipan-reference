@@ -201,3 +201,22 @@ def test_regen_frames_only(app):
     from pathlib import Path as _P
     assert _P(prev_last["uri"]).read_bytes() == \
         _P(cur_first["uri"]).read_bytes()
+
+
+def test_regen_frames_with_prompt_override(app):
+    """首尾帧可改提示词单独重画:清单标记已改词,版本递增。"""
+    import json as _json
+    project = _preproduce(app, title="帧改词测试")
+    name = "e001_shot002"
+    before = app.assets.latest(project["id"], "first_frame", name)
+    app.director.regen_image(
+        "帧改词测试", 1, {"kind": "frames", "shot_no": 2},
+        prompt_override="尾帧定格在角色回头的瞬间,逆光剪影")
+    after = app.assets.latest(project["id"], "first_frame", name)
+    assert after["version"] == before["version"] + 1
+    plan = _json.loads(
+        (app.workspace.artifacts_dir / f"p{project['id']:03d}" / "e001"
+         / "render_plan.json").read_text(encoding="utf-8"))
+    item = next(i for i in plan["items"] if i["id"] == "frames:2")
+    assert item["custom_prompt"] is True
+    assert "逆光剪影" in item["prompt"]

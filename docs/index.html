@@ -5685,13 +5685,15 @@ function planTargetOf(item) {
              name: `${item.name}:${item.sheet}` };
   if (item.category === "scene_art")
     return { kind: "scene_art", name: item.name };
+  if (item.category === "frames")
+    return { kind: "frames", shot_no: item.shot_no };
   return { kind: "shot", shot_no: item.shot_no };
 }
 
 function planItemHtml(data, item, editable) {
   const thumbs = planItemThumbs(data, item);
   const st = item.status || "pending";
-  const canEdit = editable && item.category !== "frames";
+  const canEdit = editable;
   return `<div class="plan-item plan-selectable st-${st}" data-plan-select="${esc(item.id)}"
     role="button" tabindex="0" aria-pressed="false"
     aria-label="选择查看 ${esc(item.label)}">
@@ -5725,7 +5727,7 @@ function planItemHtml(data, item, editable) {
             <button class="primary plan-edit-go">按上面的提示词重画这张</button>
           </div>
         </div></div>`
-      : (editable ? `<div class="dim plan-note">首尾帧随对应的分镜画面一起重画</div>` : "")}
+      : ""}
     </div></div>`;
 }
 
