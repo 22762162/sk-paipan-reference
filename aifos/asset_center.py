@@ -11,6 +11,14 @@ KINDS = (
     "cover", "title", "clip", "edit",
 )
 
+# 资产中心里可直接预览、筛选与软删除的图片类型。人物身份锚点通常与
+# character_art 指向同一文件，不单独展示，避免用户看到重复卡片。
+IMAGE_KINDS = (
+    "character_candidate", "character_art", "character_sheet",
+    "scene_art", "image", "first_frame", "last_frame", "cover",
+    "reference",
+)
+
 
 class AssetCenter:
     def __init__(self, db):

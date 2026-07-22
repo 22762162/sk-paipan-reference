@@ -1,7 +1,9 @@
 """生产历史中心：持久记录每次运行，并恢复服务重启遗留的幽灵任务。"""
 
 import json
+import re
 
+from .asset_center import AssetCenter, IMAGE_KINDS
 from .db import now
 
 
@@ -304,3 +306,123 @@ class HistoryCenter:
         else:
             item["tasks"] = []
         return item
+
+    def delete_work(self, run_id, delete_assets=False):
+        """删除某次历史所对应的整集作品，并可选软删除关联图片。
+
+        删除对象是 ``《项目》第 N 集``，因此该集的全部运行记录会一起
+        删除；项目壳与物理产物文件始终保留。多集项目中的人物/场景等
+        公共母资产不会因为删除其中一集而被误删。
+        """
+        run = self.db.query_one(
+            "SELECT r.*, e.project_id, p.title AS current_project "
+            "FROM production_runs r LEFT JOIN episodes e ON e.id=r.episode_id "
+            "LEFT JOIN projects p ON p.id=e.project_id WHERE r.id=?",
+            (int(run_id),))
+        if run is None:
+            return None
+
+        # 极早期未绑定到剧集的迁移记录只能删除历史本身。
+        if run["episode_id"] is None or run["project_id"] is None:
+            task_count = self.db.query_one(
+                "SELECT COUNT(*) AS n FROM tasks WHERE run_id=?",
+                (int(run_id),))["n"]
+            self.db.execute("DELETE FROM tasks WHERE run_id=?", (int(run_id),))
+            self.db.execute(
+                "DELETE FROM production_runs WHERE id=?", (int(run_id),))
+            return {
+                "project": run["project_title"],
+                "episode_number": run["episode_number"],
+                "episode_deleted": False,
+                "history_only": True,
+                "runs_deleted": 1,
+                "tasks_deleted": task_count,
+                "assets_requested": bool(delete_assets),
+                "assets_soft_deleted": 0,
+                "asset_files_preserved": True,
+                "project_retained": True,
+            }
+
+        episode_id = int(run["episode_id"])
+        project_id = int(run["project_id"])
+        episode_number = int(run["episode_number"])
+        project_title = run["current_project"] or run["project_title"]
+        prefix = f"e{episode_number:03d}"
+        counts = {
+            "runs": self.db.query_one(
+                "SELECT COUNT(*) AS n FROM production_runs WHERE episode_id=?",
+                (episode_id,))["n"],
+            "tasks": self.db.query_one(
+                "SELECT COUNT(*) AS n FROM tasks WHERE episode_id=?",
+                (episode_id,))["n"],
+            "documents": self.db.query_one(
+                "SELECT COUNT(*) AS n FROM documents WHERE episode_id=?",
+                (episode_id,))["n"],
+        }
+        episode_count = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM episodes WHERE project_id=?",
+            (project_id,))["n"]
+
+        assets_deleted = 0
+        if delete_assets:
+            center = AssetCenter(self.db)
+            for asset in center.active_list(project_id):
+                if asset["kind"] not in IMAGE_KINDS:
+                    continue
+                meta = center.meta(asset)
+                source_id = meta.get("source_episode_id")
+                source_number = meta.get(
+                    "source_episode_number", meta.get("episode_number"))
+                episode_scoped = bool(
+                    re.match(rf"^{re.escape(prefix)}(?:_|$)", asset["name"])
+                    or str(source_id or "") == str(episode_id)
+                    or str(source_number or "") == str(episode_number))
+                # 单集项目中的所有可见图片都属于这一作品；多集项目只删
+                # 明确绑定本集的图片，保住跨集人物/场景/服装母资产。
+                if episode_count == 1 or episode_scoped:
+                    deleted = center.soft_delete(
+                        project_id, asset["kind"], asset["name"], meta={
+                            "reason": "deleted_with_history_work",
+                            "deleted_episode_id": episode_id,
+                            "deleted_episode_number": episode_number,
+                        })
+                    assets_deleted += int(deleted is not None)
+
+        batch_ids = [row["batch_id"] for row in self.db.query(
+            "SELECT DISTINCT batch_id FROM series_batch_items WHERE episode_id=?",
+            (episode_id,))]
+        self.db.execute(
+            "DELETE FROM series_batch_items WHERE episode_id=?", (episode_id,))
+        for batch_id in batch_ids:
+            remaining = self.db.query_one(
+                "SELECT COUNT(*) AS n FROM series_batch_items WHERE batch_id=?",
+                (batch_id,))["n"]
+            if remaining:
+                self.db.execute(
+                    "UPDATE series_batches SET total=?, updated_at=? WHERE id=?",
+                    (remaining, now(), batch_id))
+            else:
+                self.db.execute(
+                    "DELETE FROM series_batches WHERE id=?", (batch_id,))
+
+        # 所有外键子表先删，最后删除剧集；项目保留以承载用户选择保留的
+        # 资产，以及软删除图片的可追溯版本链。
+        self.db.execute("DELETE FROM archive WHERE episode_id=?", (episode_id,))
+        self.db.execute("DELETE FROM tasks WHERE episode_id=?", (episode_id,))
+        self.db.execute("DELETE FROM documents WHERE episode_id=?", (episode_id,))
+        self.db.execute(
+            "DELETE FROM production_runs WHERE episode_id=?", (episode_id,))
+        self.db.execute("DELETE FROM episodes WHERE id=?", (episode_id,))
+        return {
+            "project": project_title,
+            "episode_number": episode_number,
+            "episode_deleted": True,
+            "history_only": False,
+            "runs_deleted": counts["runs"],
+            "tasks_deleted": counts["tasks"],
+            "documents_deleted": counts["documents"],
+            "assets_requested": bool(delete_assets),
+            "assets_soft_deleted": assets_deleted,
+            "asset_files_preserved": True,
+            "project_retained": True,
+        }

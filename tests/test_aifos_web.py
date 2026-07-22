@@ -85,6 +85,10 @@ def test_index_and_static(server):
     assert b"/api/character/select" in app_js
     assert b"/api/character/regenerate" in app_js
     assert b"/api/asset/delete" in app_js
+    assert b"/api/history/delete" in app_js
+    assert "保留资产中心图片（推荐）".encode() in app_js
+    assert "资产分类".encode() in app_js
+    assert "查看提示词".encode() in app_js
     assert b"/api/video/references" in app_js
     assert "质检没有通过的原因".encode() in app_js
     assert "本次质检/重画实际附上的参考图".encode() in app_js
@@ -153,6 +157,74 @@ def test_asset_delete_and_video_reference_api(server):
     assert len(assets) == 2
     assert assets[-1]["meta"]["deleted"] is True
     assert path.exists(), "删除资产中心卡片不应物理删除历史文件"
+
+
+def test_asset_image_catalog_has_category_origin_time_and_prompt(server):
+    app2 = App(server["workspace"])
+    try:
+        project, _ = app2.projects.get_or_create_project("资产溯源测试")
+        episode, _ = app2.projects.get_or_create_episode(
+            project["id"], 3, title="定妆")
+        plan_dir = (app2.workspace.artifacts_dir / f"p{project['id']:03d}"
+                    / "e003")
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        (plan_dir / "render_plan.json").write_text(json.dumps({
+            "items": [{
+                "id": "sheet:林昭:costume",
+                "prompt": "林昭现代通勤服装设定，正面全身",
+            }],
+        }, ensure_ascii=False), encoding="utf-8")
+        path = plan_dir / "costume.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+        app2.assets.register(
+            project["id"], "character_sheet", "林昭:costume",
+            uri=str(path), meta={"character": "林昭", "sheet": "costume",
+                                  "image_quality": "high",
+                                  "source_episode_number": 3})
+    finally:
+        app2.close()
+
+    status, catalog = _json_request(
+        server["port"], "GET",
+        "/api/asset-images?project=%E8%B5%84%E4%BA%A7%E6%BA%AF%E6%BA%90%E6%B5%8B%E8%AF%95")
+    assert status == 200
+    item = catalog["items"][0]
+    assert item["category"] == "costume"
+    assert item["category_label"] == "服装"
+    assert item["source_project"] == "资产溯源测试"
+    assert item["source_episode"] == 3
+    assert item["generated_at"] > 0
+    assert item["prompt"] == "林昭现代通勤服装设定，正面全身"
+    assert item["prompt_status"] == "recorded"
+
+
+def test_history_delete_api_can_keep_asset_center_images(server):
+    app2 = App(server["workspace"])
+    try:
+        project, _ = app2.projects.get_or_create_project("历史删除接口")
+        episode, _ = app2.projects.get_or_create_episode(project["id"], 1)
+        run_id = app2.history.create_run("历史删除接口", 1)
+        path = app2.workspace.artifacts_dir / "history-delete" / "image.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+        asset = app2.assets.register(
+            project["id"], "image", "e001_shot001", uri=str(path))
+    finally:
+        app2.close()
+
+    status, deleted = _json_request(
+        server["port"], "POST", "/api/history/delete",
+        {"run_id": run_id, "delete_assets": False})
+    assert status == 200
+    assert deleted["episode_deleted"] is True
+    assert deleted["assets_soft_deleted"] == 0
+    app3 = App(server["workspace"])
+    try:
+        assert app3.projects.get_episode(episode["id"]) is None
+        assert app3.assets.get(asset["id"])["uri"] == str(path)
+        assert path.exists()
+    finally:
+        app3.close()
 
 
 def test_mobile_access_api_is_safe_by_default(server):

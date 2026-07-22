@@ -36,6 +36,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import __version__
 from ..app import App
+from ..asset_center import IMAGE_KINDS
 from ..updater import (check_and_update, current_build, repo_root,
                        restart_process, start_auto_updater)
 from ..errors import AifosError
@@ -297,25 +298,132 @@ def _artifact_url(app, uri):
 
 
 def _image_asset_catalog(app, project_id):
-    """资产中心当前可见图片；携带稳定 asset_id 供删除和视频选图。"""
-    kinds = {
-        "character_art", "character_sheet", "scene_art",
-        "image", "first_frame", "last_frame", "cover", "reference",
-    }
+    """资产中心当前可见图片，补齐分类、作品、时间与提示词溯源。"""
     labels = {
+        "character_candidate": "人物候选",
         "character_art": "人物立绘", "character_sheet": "人物设定",
         "scene_art": "场景概念图", "image": "镜头关键图",
         "first_frame": "首帧", "last_frame": "尾帧",
         "cover": "封面", "reference": "上传参考图",
     }
+    category_labels = {
+        "character": "人物", "scene": "场景", "costume": "服装",
+        "shot": "镜头", "frame": "首尾帧", "cover": "封面",
+        "reference": "参考图",
+    }
+    project = app.db.query_one(
+        "SELECT id, title FROM projects WHERE id=?", (project_id,))
+    if project is None:
+        return []
+
+    episodes = [dict(row) for row in app.db.query(
+        "SELECT id, number, title, updated_at FROM episodes "
+        "WHERE project_id=? ORDER BY updated_at DESC, number DESC",
+        (project_id,))]
+    episode_by_number = {int(row["number"]): row for row in episodes}
+    prompts_by_episode = {}
+    project_prompts = {}
+    for episode in episodes:
+        plan_path = (app.workspace.artifacts_dir
+                     / f"p{project_id:03d}"
+                     / f"e{int(episode['number']):03d}"
+                     / "render_plan.json")
+        try:
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            plan = {"items": []}
+        for plan_item in plan.get("items", []):
+            item_id = str(plan_item.get("id") or "")
+            prompt = str(plan_item.get("prompt") or "").strip()
+            if not item_id or not prompt:
+                continue
+            prompts_by_episode.setdefault(
+                (int(episode["number"]), item_id), prompt)
+            project_prompts.setdefault(item_id, prompt)
+
+    active_rows = app.assets.active_list(project_id)
+    stored_prompts = {}
+    for row in active_rows:
+        if row["kind"] != "prompt":
+            continue
+        meta = app.assets.meta(row)
+        prompt = str(meta.get("prompt") or "").strip()
+        if prompt:
+            stored_prompts[row["name"]] = prompt
+
+    def category_for(kind, meta):
+        if kind in {"character_candidate", "character_art"}:
+            return "character"
+        if kind == "character_sheet":
+            return ("costume" if meta.get("sheet") in {
+                "costume", "costume_detail"} else "character")
+        if kind == "scene_art":
+            return "scene"
+        if kind == "image":
+            return "shot"
+        if kind in {"first_frame", "last_frame"}:
+            return "frame"
+        return kind
+
+    def prompt_key(row, meta, episode_number):
+        kind, name = row["kind"], row["name"]
+        if kind == "character_candidate":
+            character = meta.get("character") or name.rsplit(":", 1)[0]
+            index = int(meta.get("candidate_index") or name.rsplit(":", 1)[-1])
+            return f"candidate:{character}:{index}"
+        if kind == "character_art":
+            index = meta.get("candidate_index")
+            return (f"candidate:{name}:{int(index)}" if index
+                    else f"char:{name}")
+        if kind == "character_sheet":
+            character = meta.get("character") or name.split(":", 1)[0]
+            sheet = meta.get("sheet") or name.split(":", 1)[-1]
+            return f"sheet:{character}:{sheet}"
+        if kind == "scene_art":
+            return f"scene:{name}"
+        if kind == "image":
+            return f"shot:{int(meta.get('shot_no') or name.rsplit('shot', 1)[-1])}"
+        if kind in {"first_frame", "last_frame"}:
+            return f"frames:{int(meta.get('shot_no') or name.rsplit('shot', 1)[-1])}"
+        return ""
+
     items = []
-    for row in app.assets.active_list(project_id):
-        if row["kind"] not in kinds:
+    for row in active_rows:
+        if row["kind"] not in IMAGE_KINDS:
             continue
         url = _versioned(_artifact_url(app, row["uri"]), row)
         if not url:
             continue
-        meta = json.loads(row["meta"] or "{}")
+        meta = app.assets.meta(row)
+        episode_number = meta.get(
+            "source_episode_number", meta.get("episode_number"))
+        match = re.match(r"^e(\d{3})(?:_|$)", row["name"])
+        if episode_number is None and match:
+            episode_number = int(match.group(1))
+        try:
+            episode_number = int(episode_number) if episode_number else None
+        except (TypeError, ValueError):
+            episode_number = None
+        episode = episode_by_number.get(episode_number)
+        direct_prompt = str(
+            meta.get("prompt") or meta.get("seedance_prompt") or "").strip()
+        key = ""
+        try:
+            key = prompt_key(row, meta, episode_number)
+        except (TypeError, ValueError):
+            key = ""
+        prompt = (direct_prompt or stored_prompts.get(row["name"]) or
+                  prompts_by_episode.get((episode_number, key)) or
+                  project_prompts.get(key) or "")
+        prompt_status = "recorded"
+        if not prompt:
+            if meta.get("uploaded") or row["kind"] == "reference":
+                prompt_status = "not_applicable"
+                prompt = "人工上传图片，无生成提示词"
+            else:
+                prompt_status = "legacy_missing"
+                prompt = "早期资产未留存完整提示词"
+        category = category_for(row["kind"], meta)
         quality = meta.get("image_quality", "medium")
         items.append({
             "asset_id": row["id"], "kind": row["kind"],
@@ -323,9 +431,18 @@ def _image_asset_catalog(app, project_id):
             "label": f"{labels[row['kind']]} · {row['name']}",
             "url": url, "quality": quality,
             "usable_for_video": quality != "low",
+            "category": category,
+            "category_label": category_labels.get(category, category),
+            "generated_at": row["created_at"],
+            "source_project": project["title"],
+            "source_episode": episode_number,
+            "source_episode_title": (episode or {}).get("title", ""),
+            "prompt": prompt,
+            "prompt_status": prompt_status,
             "meta": meta,
         })
-    items.sort(key=lambda item: (item["kind"], item["name"]))
+    items.sort(key=lambda item: (
+        item["category"], -float(item["generated_at"]), item["name"]))
     return items
 
 
@@ -651,6 +768,8 @@ def make_handler(workspace, jobs):
                     return self._json(payload)
                 if route == "/api/assets":
                     return self._assets(query)
+                if route == "/api/asset-images":
+                    return self._asset_images(query)
                 if route == "/api/logs":
                     limit = int(query.get("limit", ["50"])[0])
                     return self._json(self._with_app(
@@ -759,6 +878,8 @@ def make_handler(workspace, jobs):
                     return self._reference_delete()
                 if parsed.path == "/api/asset/delete":
                     return self._asset_delete()
+                if parsed.path == "/api/history/delete":
+                    return self._history_delete()
                 if parsed.path == "/api/video/references":
                     return self._video_references()
                 if parsed.path == "/api/project/style":
@@ -861,6 +982,23 @@ def make_handler(workspace, jobs):
             if items is None:
                 return self._error(404, f"项目不存在: {title}")
             return self._json(items)
+
+        def _asset_images(self, query):
+            """资产中心图片索引：按作品读取当前有效版本及完整溯源。"""
+            title = query.get("project", [""])[0].strip()
+            if not title:
+                return self._error(400, "缺少 project")
+
+            def fetch(app):
+                project = app.projects.get_project(title)
+                if project is None:
+                    return None
+                return _image_asset_catalog(app, project["id"])
+
+            items = self._with_app(fetch)
+            if items is None:
+                return self._error(404, f"项目不存在: {title}")
+            return self._json({"project": title, "items": items})
 
         def _standards(self):
             def fetch(app):
@@ -1674,6 +1812,29 @@ def make_handler(workspace, jobs):
                         title, int(body["asset_id"])))
             except Exception as exc:
                 return self._error(400, str(exc))
+            return self._json(result)
+
+        def _history_delete(self):
+            """删除历史对应的整集作品；关联图片由用户明确选择是否软删。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                run_id = int(body.get("run_id"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少合法 run_id")
+            run = self._with_app(lambda app: app.history.get(run_id))
+            if run is None:
+                return self._error(404, "历史记录不存在")
+            if run.get("episode_id") is not None and jobs.running_for(
+                    run.get("current_project") or run["project_title"],
+                    run["episode_number"]):
+                return self._error(409, "本集仍在生成，请先安全停止后再删除")
+            result = self._with_app(
+                lambda app: app.history.delete_work(
+                    run_id, delete_assets=body.get("delete_assets") is True))
+            if result is None:
+                return self._error(404, "历史记录不存在")
             return self._json(result)
 
         def _video_references(self):
