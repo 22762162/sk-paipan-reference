@@ -7,7 +7,7 @@ from .db import now
 
 STABLE_EPISODE_STATUSES = {
     "done", "failed", "qc_failed", "created",
-    "awaiting_script", "awaiting_confirm",
+    "awaiting_script", "awaiting_cast", "awaiting_confirm", "queued_script",
 }
 
 
@@ -79,7 +79,8 @@ class HistoryCenter:
             status = "failed"
         elif result_status in {"failed", "qc_failed"}:
             status = "failed"
-        elif result_status in {"awaiting_script", "awaiting_confirm"}:
+        elif result_status in {"awaiting_script", "awaiting_cast",
+                               "awaiting_confirm", "queued_script"}:
             status = "paused"
         elif result_status == "created":
             status = "stopped"
@@ -161,7 +162,7 @@ class HistoryCenter:
         active = self.db.query(
             "SELECT id FROM episodes WHERE status NOT IN "
             "('done','failed','qc_failed','created','awaiting_script',"
-            "'awaiting_confirm')")
+            "'awaiting_cast','awaiting_confirm','queued_script')")
         for episode in active:
             self.recover_episode(
                 episode["id"], "服务重启，生成任务已安全恢复")
@@ -195,7 +196,8 @@ class HistoryCenter:
                       "completed" if episode["status"] == "done" else
                       "failed" if episode["status"] in {"failed", "qc_failed"}
                       else "paused" if episode["status"] in {
-                          "awaiting_script", "awaiting_confirm"} else
+                          "awaiting_script", "awaiting_cast",
+                          "awaiting_confirm", "queued_script"} else
                       "stopped")
             started = min((t["created_at"] for t in tasks),
                           default=episode["created_at"])

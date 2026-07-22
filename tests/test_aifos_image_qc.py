@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from aifos.app import App
+from aifos.errors import AifosError
 from aifos.production.base import ProviderResult
 
 
@@ -85,13 +86,33 @@ def test_qc_fail_triggers_auto_redraw(app, tmp_path):
 
 
 def test_qc_report_lands_in_plan(app):
-    """端到端:清单条目带质检结果(mock 质检默认通过)。"""
+    """初始母资产不空耗视觉 QC；正式镜头图必须带通过结果。"""
     import json
     project = _preproduce(app)
     plan = json.loads(
         (app.workspace.artifacts_dir / f"p{project['id']:03d}" / "e001"
          / "render_plan.json").read_text(encoding="utf-8"))
-    for cat in ("character_candidate", "character_sheet", "shot_image"):
+    for cat in ("character_candidate", "character_sheet", "scene_art"):
+        drawn = [i for i in plan["items"]
+                 if i["category"] == cat
+                 and i["status"] in ("done", "reused")]
+        assert drawn, f"{cat} 无生成条目"
+        assert all("qc" not in i for i in drawn), f"{cat} 不应做初始视觉质检"
+    # 关键帧在生成阶段自动质检；首尾帧由整集批量质检同时核对
+    # 首、尾两张，避免把帧容器条目误当成单张生成结果。
+    drawn = [i for i in plan["items"]
+             if i["category"] == "shot_image"
+             and i["status"] in ("done", "reused")]
+    assert drawn, "shot_image 无生成条目"
+    assert all(i.get("qc", {}).get("passed") for i in drawn), \
+        "shot_image 缺质检结果"
+
+    report = app.director.qc_all(project["title"], 1)
+    assert report["failed"] == 0
+    plan = json.loads(
+        (app.workspace.artifacts_dir / f"p{project['id']:03d}" / "e001"
+         / "render_plan.json").read_text(encoding="utf-8"))
+    for cat in ("shot_image", "frames"):
         drawn = [i for i in plan["items"]
                  if i["category"] == cat
                  and i["status"] in ("done", "reused")]
@@ -308,10 +329,13 @@ def test_single_and_batch_qc_and_redo(app):
     project = _preproduce(app, title="质检三件套")
     plan_path = (app.workspace.artifacts_dir
                  / f"p{project['id']:03d}" / "e001" / "render_plan.json")
-    # 单张质检:mock 默认通过
-    item = next(i for i in _json.loads(
-        plan_path.read_text(encoding="utf-8"))["items"]
-        if i["category"] == "scene_art")
+    plan_before = _json.loads(plan_path.read_text(encoding="utf-8"))["items"]
+    initial = next(i for i in plan_before if i["category"] == "scene_art")
+    with pytest.raises(AifosError, match="初始人物/场景母资产不做视觉质检"):
+        app.director.qc_item("质检三件套", 1, initial["id"])
+    # 正式镜头单张质检:mock 默认通过
+    item = next(i for i in plan_before
+                if i["category"] == "shot_image")
     report = app.director.qc_item("质检三件套", 1, item["id"])
     assert report["passed"] is True
     after = next(i for i in _json.loads(
@@ -324,7 +348,7 @@ def test_single_and_batch_qc_and_redo(app):
     # 人为标记两张未过 → 批量重画未过
     plan = _json.loads(plan_path.read_text(encoding="utf-8"))
     fail_ids = [i["id"] for i in plan["items"]
-                if i["category"] == "scene_art"][:2]
+                if i["category"] == "shot_image"][:2]
     vers = {}
     for i in plan["items"]:
         if i["id"] in fail_ids:

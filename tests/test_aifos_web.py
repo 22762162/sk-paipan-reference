@@ -1,5 +1,6 @@
 """Web 控制台测试:API、后台制作任务、产物服务与目录穿越防护。"""
 
+import base64
 import copy
 import http.client
 import json
@@ -77,6 +78,10 @@ def test_index_and_static(server):
     assert "全部 Seedream 5.0 Lite 优先".encode() in app_js
     assert "全部 OpenAI 图片 API 优先".encode() in app_js
     assert b"image_strategy" in app_js
+    assert b"/api/series/preview" in app_js
+    assert b"/api/series/import" in app_js
+    assert "选择多集剧本文档".encode() in app_js
+    assert "始终只激活一集".encode() in app_js
     assert b"/api/character/select" in app_js
     assert b"/api/asset/delete" in app_js
     assert b"/api/video/references" in app_js
@@ -371,6 +376,73 @@ def test_produce_rejects_bad_input(server):
     assert "作品名" in reply["error"]
     status, _ = _json_request(server["port"], "POST", "/api/produce", {})
     assert status == 400
+
+
+def test_multi_episode_document_preview_import_and_serial_queue(server):
+    port = server["port"]
+    text = """第1集 初见
+第1场 办公室
+林昭:这里就是新公司?
+团长:先把第一场直播做好。
+
+第2集 开播
+第1场 直播间
+林昭:数据怎么突然涨了?
+团长:有人在帮我们。
+"""
+    request = {
+        "sentence": "《串行导入测试》第5集",
+        "filename": "整季剧本.txt",
+        "data_base64": base64.b64encode(text.encode()).decode(),
+        "auto_advance": True,
+    }
+    status, preview = _json_request(
+        port, "POST", "/api/series/preview", request)
+    assert status == 200
+    assert preview["project_title"] == "串行导入测试"
+    assert preview["start_number"] == 5
+    assert preview["total"] == 2
+    assert [item["mode"] for item in preview["episodes"]] == [
+        "script", "script"]
+    assert preview["can_import"] is True
+
+    status, imported = _json_request(
+        port, "POST", "/api/series/import", request)
+    assert status == 201 and imported["job_id"] is None
+    batch = imported["batch"]
+    assert batch["total"] == 2 and batch["auto_advance"] is True
+    assert batch["current"]["episode_number"] == 5
+    assert batch["next"]["episode_number"] == 6
+
+    _, overview = _json_request(port, "GET", "/api/overview")
+    statuses = {item["number"]: item["status"]
+                for item in overview["episodes"]}
+    assert statuses == {5: "awaiting_script", 6: "queued_script"}
+    assert overview["series_batches"][0]["completed"] == 0
+
+    status, blocked = _json_request(
+        port, "POST", "/api/series/next", {"batch_id": batch["id"]})
+    assert status == 409 and "尚未完成" in blocked["error"]
+
+    app_state = App(server["workspace"])
+    try:
+        app_state.projects.set_episode_status(
+            batch["current"]["episode_id"], "done")
+    finally:
+        app_state.close()
+    status, advanced = _json_request(
+        port, "POST", "/api/series/next", {"batch_id": batch["id"]})
+    assert status == 202 and advanced["job_id"] is None
+    assert advanced["step"]["number"] == 6
+    _, detail = _json_request(
+        port, "GET", f"/api/episode/{advanced['step']['episode_id']}")
+    assert detail["episode"]["status"] == "awaiting_script"
+    assert detail["series_source"]["filename"] == "整季剧本.txt"
+
+    # 同集数再次导入只报告冲突，绝不覆盖已经确认的剧本。
+    status, conflict = _json_request(
+        port, "POST", "/api/series/import", request)
+    assert status == 409 and "未覆盖任何内容" in conflict["error"]
 
 
 def test_artifact_traversal_blocked(server):

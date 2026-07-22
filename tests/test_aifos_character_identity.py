@@ -115,6 +115,12 @@ def test_visual_qc_requires_identity_ack_and_reuses_signature(app, tmp_path):
     title = "视觉身份质检"
     project, episode, script = _to_cast_selection(app, title)
     _lock_all(app, title, script)
+    summary = app.director.produce(title, 1, pause_for_confirm=True)
+    assert summary["status"] == "awaiting_confirm"
+    storyboard, _ = app.projects.latest_document(episode["id"], "storyboard")
+    name = script["characters"][0]["name"]
+    shot = next(item for item in storyboard["shots"]
+                if name in item.get("characters", []))
     target = tmp_path / "target.png"
     target.write_bytes(b"\x89PNG\r\n\x1a\n" + b"1" * 16)
     calls = []
@@ -128,20 +134,11 @@ def test_visual_qc_requires_identity_ack_and_reuses_signature(app, tmp_path):
                       "issues": []})
 
     app.director.router = Router()
-    name = script["characters"][0]["name"]
-    app.assets.register(project["id"], "character_sheet",
-                        f"{name}:turnaround", uri=str(target),
-                        meta={"character": name, "sheet": "turnaround"})
-    ctx = {"episode": dict(episode),
-           "out_root": app.director._episode_dir(project, episode)}
-    app.director._plan_seed(ctx, "character_sheet", [{
-        "id": f"sheet:{name}:turnaround", "category": "character_sheet",
-        "label": "四视图", "name": name, "sheet": "turnaround",
-        "prompt": "x", "status": "done"}])
-    report1 = app.director.qc_item(
-        title, 1, f"sheet:{name}:turnaround")
-    report2 = app.director.qc_item(
-        title, 1, f"sheet:{name}:turnaround")
+    app.assets.register(
+        project["id"], "image", f"e001_shot{shot['shot_no']:03d}",
+        uri=str(target), meta={"shot_no": shot["shot_no"]}, new_version=True)
+    report1 = app.director.qc_item(title, 1, f"shot:{shot['shot_no']}")
+    report2 = app.director.qc_item(title, 1, f"shot:{shot['shot_no']}")
     assert report1["passed"] and report1["identity_checked"]
     assert report2["cached"] is True
     assert len(calls) == 1
