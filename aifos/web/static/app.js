@@ -1898,6 +1898,9 @@ function planItemHtml(data, item, editable) {
       ${planIsMock(item) ? planMockReasonHtml(item) : ""}
       ${planQcIssuesHtml(item)}
       ${item.error ? `<div class="plan-err">${esc(item.error)}</div>` : ""}
+      ${canEdit && ["done", "reused"].includes(st) ? `<div class="plan-qc-row">
+        <button class="plan-qc-one" data-plan-id="${esc(item.id)}"
+          title="用 AI 视觉核对这张是否符合剧本/人物设定">🔍 质检这张</button></div>` : ""}
       <details class="plan-prompt"><summary>提示词</summary>
         <pre>${esc(item.prompt || "")}</pre></details>
       ${canEdit ? `<div class="plan-edit" data-target="${esc(JSON.stringify(planTargetOf(item)))}">
@@ -1955,9 +1958,20 @@ function renderPlanHtml(data, editable) {
     .filter((c) => items.some((i) => i.category === c));
   const ready = items.filter(
     (i) => ["done", "reused"].includes(i.status)).length;
+  const qcFailed = items.filter(
+    (i) => (i.qc || {}).passed === false
+      && ["done", "reused"].includes(i.status)).length;
   return `<div class="plan-panel">
     <h2>🖼 图片生产清单 <span class="dim">共 ${items.length} 张 · 已就绪 ${ready}</span></h2>
     ${mockWarnHtml(data)}
+    ${editable ? `<div class="plan-batchbar">
+      <button class="batch-qc" onclick="qcAll(${data.episode.id}, this)"
+        title="用 AI 逐张核对全部图片是否符合剧本/人物设定">🔍 批量质检全部</button>
+      <button class="batch-redo-failed" onclick="redoFailed(${data.episode.id}, this)"
+        ${qcFailed ? "" : "disabled"}
+        title="重画所有质检未过的图">🔁 重画质检未过的${qcFailed ? ` (${qcFailed})` : ""}</button>
+      <span class="dim">${qcFailed ? `${qcFailed} 张待重画` : "质检未过的图会在这里汇总"}</span>
+    </div>` : ""}
     ${editable ? "" : `<div class="dim plan-hint">列表实时更新;要修改某张的提示词重画,等生成停下后点工具栏「🖼 图片清单」。</div>`}
     ${cats.map((cat) => {
       const list = items.filter((i) => i.category === cat);
@@ -1968,7 +1982,72 @@ function renderPlanHtml(data, editable) {
     }).join("")}</div>`;
 }
 
+/* 单张质检 / 批量质检 / 批量重画未过 */
+async function qcOne(episodeId, itemId, btn, onDone) {
+  if (btn) { btn.disabled = true; btn.textContent = "质检中…"; }
+  try {
+    const r = await api("/api/qc_item", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ episode_id: episodeId, item_id: itemId }),
+    });
+    showToast(r.passed ? "质检通过 ✓"
+      : "质检未过:" + (r.issues || []).join(";"), r.passed ? "ok" : "error");
+    if (onDone) onDone(); else renderCanvasView(episodeId);
+  } catch (e) {
+    showToast(staleServerHint(e), "error");
+    if (btn) { btn.disabled = false; btn.textContent = "🔍 质检这张"; }
+  }
+}
+
+async function qcAll(episodeId, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "批量质检中…"; }
+  try {
+    const reply = await api("/api/qc_all", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ episode_id: episodeId }),
+    });
+    pollJob(reply.job_id, (job) => {
+      const s = job.summary || {};
+      if (job.status === "done")
+        showToast(`批量质检完成:核对 ${s.checked || 0} 张,`
+          + `通过 ${s.passed || 0},未过 ${s.failed || 0}`, "ok");
+      else showToast(job.error || "批量质检结束", "info");
+      renderCanvasView(episodeId);
+    });
+    showToast("已开始批量质检,逐张核对中…", "ok");
+  } catch (e) {
+    showToast(staleServerHint(e), "error");
+    if (btn) { btn.disabled = false; btn.textContent = "🔍 批量质检全部"; }
+  }
+}
+
+async function redoFailed(episodeId, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "已提交,重画中…"; }
+  try {
+    const reply = await api("/api/redo_items", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ episode_id: episodeId, only_failed: true }),
+    });
+    pollJob(reply.job_id, (job) => {
+      if (job.status === "done")
+        showToast(`已重画 ${(job.summary || {}).redone || 0} 张质检未过的图`, "ok");
+      renderCanvasView(episodeId);
+    });
+    showToast("开始重画质检未过的图,进度看实况看板", "ok");
+    pollCanvas(episodeId);
+  } catch (e) {
+    showToast(staleServerHint(e), "error");
+    if (btn) { btn.disabled = false; btn.textContent = "🔁 重画质检未过的"; }
+  }
+}
+
 function bindPlanRegen(container, episodeId, onDone) {
+  container.querySelectorAll(".plan-qc-one").forEach((btn) => {
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      qcOne(episodeId, btn.dataset.planId, btn, onDone);
+    };
+  });
   container.querySelectorAll(".plan-edit").forEach((box) => {
     const form = box.querySelector(".plan-edit-form");
     box.querySelector(".plan-edit-toggle").onclick = () => {

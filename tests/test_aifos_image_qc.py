@@ -289,3 +289,36 @@ def test_openai_api_no_reference_falls_back_to_generations(tmp_path,
         "portrait": True, "art_name": "小鹿", "prompt": "立绘",
         "aspect": "9:16"}, tmp_path)
     assert used.get("gen") and "edit" not in used
+
+
+def test_single_and_batch_qc_and_redo(app):
+    """单张质检 / 批量质检 / 批量重画未过 三件套。"""
+    import json as _json
+    project = _preproduce(app, title="质检三件套")
+    plan_path = (app.workspace.artifacts_dir
+                 / f"p{project['id']:03d}" / "e001" / "render_plan.json")
+    # 单张质检:mock 默认通过
+    item = _json.loads(plan_path.read_text(encoding="utf-8"))["items"][0]
+    report = app.director.qc_item("质检三件套", 1, item["id"])
+    assert report["passed"] is True
+    after = next(i for i in _json.loads(
+        plan_path.read_text(encoding="utf-8"))["items"]
+        if i["id"] == item["id"])
+    assert after["qc"]["passed"] is True
+    # 批量质检:全部核对
+    summary = app.director.qc_all("质检三件套", 1)
+    assert summary["status"] == "done" and summary["checked"] > 0
+    # 人为标记两张未过 → 批量重画未过
+    plan = _json.loads(plan_path.read_text(encoding="utf-8"))
+    fail_ids = [plan["items"][0]["id"], plan["items"][1]["id"]]
+    vers = {}
+    for i in plan["items"]:
+        if i["id"] in fail_ids:
+            i["qc"] = {"passed": False, "issues": ["测试标记未过"],
+                       "attempts": 1}
+            t = app.director._plan_item_target(i["id"])
+            vers[i["id"]] = t
+    plan_path.write_text(_json.dumps(plan, ensure_ascii=False),
+                         encoding="utf-8")
+    redo = app.director.redo_items("质检三件套", 1, only_failed=True)
+    assert redo["status"] == "done" and redo["redone"] == 2

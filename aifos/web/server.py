@@ -585,6 +585,12 @@ def make_handler(workspace, jobs):
                     return self._update_now()
                 if parsed.path == "/api/redo_mock":
                     return self._redo_mock()
+                if parsed.path == "/api/qc_item":
+                    return self._qc_item()
+                if parsed.path == "/api/qc_all":
+                    return self._qc_all()
+                if parsed.path == "/api/redo_items":
+                    return self._redo_items()
                 if parsed.path == "/api/restyle":
                     return self._restyle()
                 if parsed.path == "/api/reference/upload":
@@ -1152,6 +1158,59 @@ def make_handler(workspace, jobs):
                     restart_process()
                 threading.Thread(target=later, daemon=True).start()
             return self._json({"status": status, "detail": detail})
+
+        def _qc_item(self):
+            """单张质检:{episode_id|project+episode, item_id}(同步返回结果)。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            item_id = (body.get("item_id") or "").strip()
+            if not item_id:
+                return self._error(400, "缺少 item_id")
+            title, number = found
+            try:
+                report = self._with_app(
+                    lambda app: app.director.qc_item(title, number, item_id))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(report)
+
+        def _qc_all(self):
+            """批量质检:后台逐张核对(可暂停)。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id: app.director.qc_all(title, number),
+                action="qc_all")
+            return self._json({"job_id": job_id}, status=202)
+
+        def _redo_items(self):
+            """批量重画:{item_ids:[...]} 或 {only_failed:true}。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            item_ids = body.get("item_ids") or []
+            only_failed = bool(body.get("only_failed"))
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id: app.director.redo_items(
+                    title, number, item_ids=item_ids,
+                    only_failed=only_failed),
+                action="redo_items")
+            return self._json({"job_id": job_id}, status=202)
 
         def _redo_mock(self):
             """一键补真:{episode_id|project+episode} → 只重画占位图。"""
