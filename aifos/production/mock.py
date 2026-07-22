@@ -534,6 +534,8 @@ class MockProvider(Provider):
             "forbid_subtitles": bool(payload.get("forbid_subtitles", True)),
             "video_quality": payload.get("video_quality", "medium"),
             "video_resolution": payload.get("video_resolution", "720p"),
+            "reference_images": list(payload.get("reference_images") or []),
+            "reference_assets": list(payload.get("reference_assets") or []),
         })
         return {
             "shot_no": shot_no, "duration": duration,
@@ -542,6 +544,9 @@ class MockProvider(Provider):
             "forbid_subtitles": bool(payload.get("forbid_subtitles", True)),
             "video_quality": payload.get("video_quality", "medium"),
             "video_resolution": payload.get("video_resolution", "720p"),
+            "reference_images_used": list(
+                payload.get("reference_images") or []),
+            "reference_assets": list(payload.get("reference_assets") or []),
         }, uri
 
     # ---- 配音 ----

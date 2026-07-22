@@ -20,7 +20,7 @@ with open(os.path.join(here, "calls.log"), "a") as f:
 if args and args[0] == "user_credit":
     print("credit balance: 420")
     sys.exit(0)
-if args and args[0] == "frames2video":
+if args and args[0] in ("frames2video", "multimodal2video"):
     out = os.path.join(here, "result.mp4")
     open(out, "wb").write(b"\\x00\\x00\\x00 ftypisom-fake")
     print(json.dumps({"status": "done", "video_path": out}))
@@ -95,6 +95,29 @@ def test_frames2video_command_shape(tmp_path, fake_dreamina):
         assert "--model_version=seedance2.0_vip" not in call
         # 订阅额度本地计数 -1
         assert app.router.quota_remaining("jimeng") == 999
+    finally:
+        app.close()
+
+
+def test_asset_references_use_multimodal2video(tmp_path, fake_dreamina):
+    app = _make_app(tmp_path, fake_dreamina)
+    try:
+        result = app.router.call("video", {
+            "shot_no": 2, "prompt": "人物走进会议室",
+            "first": "/tmp/first.png", "last": "/tmp/last.png",
+            "reference_images": ["/tmp/hero.png", "/tmp/room.png"],
+            "reference_assets": [{"asset_id": 8, "name": "女主立绘"}],
+        }, app.workspace.artifacts_dir)
+        (call,) = _calls(fake_dreamina)
+        assert call[0] == "multimodal2video"
+        images = [arg for arg in call if arg.startswith("--image=")]
+        assert len(images) == 4
+        assert images[0].endswith(str(Path("/tmp/first.png").resolve()))
+        assert images[1].endswith(str(Path("/tmp/last.png").resolve()))
+        assert result.data["reference_images_used"] == [
+            str(Path("/tmp/hero.png").resolve()),
+            str(Path("/tmp/room.png").resolve())]
+        assert result.data["reference_assets"][0]["asset_id"] == 8
     finally:
         app.close()
 

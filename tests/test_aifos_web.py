@@ -78,6 +78,10 @@ def test_index_and_static(server):
     assert "全部 OpenAI 图片 API 优先".encode() in app_js
     assert b"image_strategy" in app_js
     assert b"/api/character/select" in app_js
+    assert b"/api/asset/delete" in app_js
+    assert b"/api/video/references" in app_js
+    assert "质检没有通过的原因".encode() in app_js
+    assert "本次质检/重画实际附上的参考图".encode() in app_js
     assert "人物定版".encode() in app_js
     status, ctype, style_css = _request(
         server["port"], "GET", "/static/style.css")
@@ -85,6 +89,8 @@ def test_index_and_static(server):
     assert b".image-cost-guide" in style_css
     assert b".blocking-actor-legend" in style_css
     assert b".blocking-map-scroll" in style_css
+    assert b".video-ref-picker-grid" in style_css
+    assert b".plan-ref-gallery" in style_css
     status, ctype, raw = _request(
         server["port"], "GET", "/manifest.webmanifest")
     assert status == 200 and "application/manifest+json" in ctype
@@ -96,6 +102,51 @@ def test_index_and_static(server):
     status, ctype, raw = _request(server["port"], "GET", "/sw.js")
     assert status == 200 and "javascript" in ctype
     assert b"aifos-mobile-shell" in raw
+
+
+def test_asset_delete_and_video_reference_api(server):
+    app2 = App(server["workspace"])
+    try:
+        project, _ = app2.projects.get_or_create_project("资产接口测试")
+        episode, _ = app2.projects.get_or_create_episode(project["id"], 1)
+        app2.projects.save_document(episode["id"], "storyboard", {
+            "shots": [{"shot_no": 1}]})
+        path = app2.workspace.artifacts_dir / "p001" / "scene.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+        row = app2.assets.register(
+            project["id"], "scene_art", "会议室", uri=str(path),
+            meta={"image_quality": "medium"})
+        asset_id = row["id"]
+        episode_id = episode["id"]
+    finally:
+        app2.close()
+
+    status, saved = _json_request(
+        server["port"], "POST", "/api/video/references", {
+            "episode_id": episode_id, "shot_no": 1,
+            "asset_ids": [asset_id]})
+    assert status == 200
+    assert saved["shots"]["1"][0]["asset_id"] == asset_id
+    status, detail = _json_request(
+        server["port"], "GET", f"/api/episode/{episode_id}")
+    assert status == 200
+    assert detail["video_references"]["shots"]["1"][0]["asset_id"] == asset_id
+    catalog = detail["artifacts"]["image_assets"]
+    assert catalog[0]["asset_id"] == asset_id
+    assert catalog[0]["usable_for_video"] is True
+
+    status, deleted = _json_request(
+        server["port"], "POST", "/api/asset/delete", {
+            "project": "资产接口测试", "asset_id": asset_id})
+    assert status == 200 and deleted["history_preserved"] is True
+    status, assets = _json_request(
+        server["port"], "GET",
+        "/api/assets?project=%E8%B5%84%E4%BA%A7%E6%8E%A5%E5%8F%A3%E6%B5%8B%E8%AF%95&kind=scene_art")
+    assert status == 200
+    assert len(assets) == 2
+    assert assets[-1]["meta"]["deleted"] is True
+    assert path.exists(), "删除资产中心卡片不应物理删除历史文件"
 
 
 def test_mobile_access_api_is_safe_by_default(server):

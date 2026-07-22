@@ -259,12 +259,44 @@ def _artifact_url(app, uri):
     return "/artifacts/" + rel.as_posix()
 
 
+def _image_asset_catalog(app, project_id):
+    """资产中心当前可见图片；携带稳定 asset_id 供删除和视频选图。"""
+    kinds = {
+        "character_art", "character_sheet", "scene_art",
+        "image", "first_frame", "last_frame", "cover", "reference",
+    }
+    labels = {
+        "character_art": "人物立绘", "character_sheet": "人物设定",
+        "scene_art": "场景概念图", "image": "镜头关键图",
+        "first_frame": "首帧", "last_frame": "尾帧",
+        "cover": "封面", "reference": "上传参考图",
+    }
+    items = []
+    for row in app.assets.active_list(project_id):
+        if row["kind"] not in kinds:
+            continue
+        url = _versioned(_artifact_url(app, row["uri"]), row)
+        if not url:
+            continue
+        meta = json.loads(row["meta"] or "{}")
+        quality = meta.get("image_quality", "medium")
+        items.append({
+            "asset_id": row["id"], "kind": row["kind"],
+            "name": row["name"], "version": row["version"],
+            "label": f"{labels[row['kind']]} · {row['name']}",
+            "url": url, "quality": quality,
+            "usable_for_video": quality != "low",
+            "meta": meta,
+        })
+    items.sort(key=lambda item: (item["kind"], item["name"]))
+    return items
+
+
 def _collect_artifacts(app, project_id, ep_num):
     """从资产表重建单集产物索引(按镜头/台词编号)。"""
     prefix = f"e{ep_num:03d}"
-    rows = app.db.query(
-        "SELECT * FROM assets WHERE project_id=? AND name LIKE ?",
-        (project_id, prefix + "%"))
+    rows = [row for row in app.assets.active_list(project_id)
+            if row["name"].startswith(prefix)]
     shot_re = re.compile(rf"^{prefix}_shot(\d+)$")
     line_re = re.compile(rf"^{prefix}_line(\d+)$")
     clip_re = re.compile(rf"^{prefix}_scene(\d+)$")
@@ -307,25 +339,19 @@ def _collect_artifacts(app, project_id, ep_num):
     out["clips"].sort(key=lambda c: c["scene_no"])
     # 人物立绘与场景概念图(项目级资产,跨集复用)
     def latest_rows(kind):
-        rows_ = app.db.query(
-            "SELECT * FROM assets WHERE project_id=? AND kind=? "
-            "ORDER BY name, version", (project_id, kind))
-        latest = {}
-        for row in rows_:
-            latest[row["name"]] = row
-        return latest.values()
+        return app.assets.active_list(project_id, kind=kind)
 
     designs = {
         row["name"]: json.loads(row["meta"] or "{}").get("design")
         for row in latest_rows("character")}
     out["cast_art"] = [
-        {"name": row["name"],
+        {"asset_id": row["id"], "kind": row["kind"], "name": row["name"],
          "url": _versioned(_artifact_url(app, row["uri"]), row),
          "role": json.loads(row["meta"]).get("role", ""),
          "design": designs.get(row["name"])}
         for row in latest_rows("character_art")]
     out["scene_art"] = [
-        {"name": row["name"],
+        {"asset_id": row["id"], "kind": row["kind"], "name": row["name"],
          "url": _versioned(_artifact_url(app, row["uri"]), row)}
         for row in latest_rows("scene_art")]
     # 人物资产套件(四视图/特写/特征/妆容/服装/服装细节)按角色分组
@@ -333,16 +359,18 @@ def _collect_artifacts(app, project_id, ep_num):
     for row in latest_rows("character_sheet"):
         meta = json.loads(row["meta"] or "{}")
         sheets.setdefault(meta.get("character", ""), []).append({
+            "asset_id": row["id"], "kind": row["kind"],
             "name": row["name"], "sheet": meta.get("sheet", ""),
             "label": meta.get("label", ""),
             "url": _versioned(_artifact_url(app, row["uri"]), row)})
     out["character_sheets"] = sheets
     out["references"] = [
-        {"name": row["name"],
+        {"asset_id": row["id"], "kind": row["kind"], "name": row["name"],
          "attach_to": json.loads(row["meta"] or "{}").get("attach_to", ""),
          "note": json.loads(row["meta"] or "{}").get("note", ""),
          "url": _versioned(_artifact_url(app, row["uri"]), row)}
         for row in latest_rows("reference")]
+    out["image_assets"] = _image_asset_catalog(app, project_id)
     return out
 
 
@@ -368,6 +396,8 @@ def _episode_payload(app, episode_id):
         episode_id, "production_standard")
     quality_policy, quality_policy_v = app.projects.latest_document(
         episode_id, "quality_policy")
+    video_references, video_references_v = app.projects.latest_document(
+        episode_id, "video_references")
     cast_selection = app.director.character_selection_status(
         project["id"], (script or {}).get("characters", []))
     for character in cast_selection.get("characters", []):
@@ -393,6 +423,11 @@ def _episode_payload(app, episode_id):
             render_plan = json.loads(plan_path.read_text(encoding="utf-8"))
         except ValueError:
             render_plan = None
+    if render_plan is not None:
+        render_plan = copy.deepcopy(render_plan)
+        for item in render_plan.get("items", []):
+            for ref in (item.get("reference_inputs") or {}).get("items", []):
+                ref["url"] = _artifact_url(app, ref.get("uri", ""))
     if blocking is not None:
         blocking = copy.deepcopy(blocking)
         for scene in blocking.get("scenes", []):
@@ -422,6 +457,9 @@ def _episode_payload(app, episode_id):
         "production_standard_version": production_standard_v,
         "quality_policy": normalize_quality_policy(quality_policy),
         "quality_policy_version": quality_policy_v,
+        "video_references": video_references or {
+            "schema": "aifos.video-references/v1", "shots": {}},
+        "video_references_version": video_references_v,
         "cast_selection": cast_selection,
         "qc_report": qc_report,
         "render_plan": render_plan,
@@ -659,6 +697,10 @@ def make_handler(workspace, jobs):
                     return self._reference_upload()
                 if parsed.path == "/api/reference/delete":
                     return self._reference_delete()
+                if parsed.path == "/api/asset/delete":
+                    return self._asset_delete()
+                if parsed.path == "/api/video/references":
+                    return self._video_references()
                 if parsed.path == "/api/project/style":
                     return self._project_style()
                 if parsed.path == "/api/project/rename":
@@ -1413,6 +1455,38 @@ def make_handler(workspace, jobs):
                     lambda app: app.director.delete_reference(
                         (body.get("project") or "").strip(),
                         (body.get("name") or "").strip()))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _asset_delete(self):
+            """资产中心删图：软删除当前版本，历史文件保持可恢复。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            title = (body.get("project") or "").strip()
+            if not title or body.get("asset_id") is None:
+                return self._error(400, "缺少 project/asset_id")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.delete_image_asset(
+                        title, int(body["asset_id"])))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _video_references(self):
+            """按镜头保存从资产中心选择的 Seedance 多图参考。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            if body.get("episode_id") is None or body.get("shot_no") is None:
+                return self._error(400, "缺少 episode_id/shot_no")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.set_video_references(
+                        int(body["episode_id"]), int(body["shot_no"]),
+                        body.get("asset_ids") or []))
             except Exception as exc:
                 return self._error(400, str(exc))
             return self._json(result)

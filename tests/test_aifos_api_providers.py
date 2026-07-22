@@ -254,8 +254,10 @@ def test_ark_video_task_flow(fake_api, tmp_path):
     endpoint, fake = fake_api
     first = tmp_path / "first.png"
     last = tmp_path / "last.png"
+    reference = tmp_path / "reference.png"
     first.write_bytes(PNG_1PX)
     last.write_bytes(PNG_1PX)
+    reference.write_bytes(PNG_1PX)
     polls = {"n": 0}
 
     def poll(body):
@@ -279,6 +281,8 @@ def test_ark_video_task_flow(fake_api, tmp_path):
     result = provider.generate("video", {
         "shot_no": 3, "prompt": "古镇夜景 镜头缓推", "duration": 8,
         "first": str(first), "last": str(last), "aspect": "9:16",
+        "reference_images": [str(reference)],
+        "reference_assets": [{"asset_id": 9, "name": "角色立绘"}],
         "video_quality": "high", "video_resolution": "1080p",
     }, out_dir)
     assert result.uri.endswith("shot_003.mp4")
@@ -291,10 +295,11 @@ def test_ark_video_task_flow(fake_api, tmp_path):
     assert result.data["video_quality"] == "high"
     assert result.data["video_resolution"] == "1080p"
     roles = [c.get("role") for c in create["body"]["content"][1:]]
-    assert roles == ["first_frame", "last_frame"]
+    assert roles == ["first_frame", "last_frame", "reference_image"]
     assert create["body"]["content"][1]["image_url"]["url"].startswith(
         "data:image/png;base64,")
     assert polls["n"] == 2
+    assert result.data["reference_assets"][0]["asset_id"] == 9
 
 
 def test_ark_requires_real_model_id(fake_api, tmp_path):

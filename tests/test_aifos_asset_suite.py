@@ -106,6 +106,70 @@ def test_reference_upload_and_injection(app):
         app.director.delete_reference(project["title"], "画风参考")
 
 
+def test_produced_image_soft_delete_preserves_history(app):
+    """资产中心删图写墓碑版本，不物理删除历史文件。"""
+    project = _preproduce(app)
+    row = app.assets.active_list(project["id"], "scene_art")[0]
+    original = Path(row["uri"])
+    history_before = len(app.assets.history(
+        project["id"], row["kind"], row["name"]))
+    result = app.director.delete_image_asset(project["title"], row["id"])
+    latest = app.assets.latest(
+        project["id"], row["kind"], row["name"], include_deleted=True)
+    assert result["history_preserved"] is True
+    assert app.assets.is_deleted(latest)
+    assert latest["uri"] == ""
+    assert original.exists()
+    assert len(app.assets.history(
+        project["id"], row["kind"], row["name"])) == history_before + 1
+    assert row["name"] not in {
+        item["name"] for item in app.assets.active_list(
+            project["id"], "scene_art")}
+    with pytest.raises(AifosError):
+        app.director.delete_image_asset(project["title"], row["id"])
+
+
+def test_video_references_are_versioned_and_used(app):
+    """按镜头选择资产图后，视频资产记录实际引用的 asset_id。"""
+    project = _preproduce(app)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    storyboard, _ = app.projects.latest_document(episode["id"], "storyboard")
+    shot_no = storyboard["shots"][0]["shot_no"]
+    scene = app.assets.active_list(project["id"], "character_art")[0]
+    document = app.director.set_video_references(
+        episode["id"], shot_no, [scene["id"]])
+    assert document["shots"][str(shot_no)][0]["asset_id"] == scene["id"]
+    summary = app.director.produce(project["title"], 1)
+    assert summary["status"] == "done"
+    video = app.assets.latest(
+        project["id"], "video", f"e001_shot{shot_no:03d}")
+    meta = json.loads(video["meta"])
+    assert meta["reference_assets"][0]["asset_id"] == scene["id"]
+
+
+def test_shot_generation_prioritizes_matching_asset_center_images(app):
+    project = _preproduce(app)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    storyboard, _ = app.projects.latest_document(episode["id"], "storyboard")
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    shot = storyboard["shots"][0]
+    location = next(scene["location"] for scene in script["scenes"]
+                    if scene["scene_no"] == shot["scene_no"])
+    ctx = {"project": dict(project)}
+    refs = app.director._art_refs(
+        ctx, shot["characters"], location, shot_no=9999)
+    matches = [item for item in refs["asset_matches"]
+               if item["kind"] in ("image", "first_frame", "last_frame")]
+    assert matches, "应优先匹配同人物/同场景的已生产资产"
+    assert refs["reference_images"][0] == matches[0]["uri"]
+    trace = app.director._reference_inputs(refs)
+    assert any(item["source"] == "asset_center" for item in trace["items"])
+
+
 def test_regen_character_sheet_with_prompt(app):
     """套件单张可按自定义提示词重画,清单标记已改词。"""
     project = _preproduce(app)

@@ -21,19 +21,26 @@ class AssetCenter:
 
         返回 (row, reused)。
         """
-        row = self.latest(project_id, kind, name)
-        if row is not None:
+        row = self.latest(project_id, kind, name, include_deleted=True)
+        if row is not None and not self.is_deleted(row):
             self.db.execute(
                 "UPDATE assets SET reuse_count = reuse_count + 1 WHERE id=?",
                 (row["id"],))
             return self.db.query_one(
                 "SELECT * FROM assets WHERE id=?", (row["id"],)), True
-        return self.register(project_id, kind, name, uri=uri, meta=meta), False
+        return self.register(
+            project_id, kind, name, uri=uri, meta=meta,
+            new_version=row is not None), False
 
     def register(self, project_id, kind, name, uri="", meta=None,
                  new_version=False):
         """登记资产;new_version=True 时在已有资产上叠加新版本。"""
-        latest = self.latest(project_id, kind, name)
+        latest = self.latest(
+            project_id, kind, name, include_deleted=True)
+        if latest is not None and self.is_deleted(latest):
+            # 删除采用墓碑版本；同名资产再次生产时必须另起新版本，
+            # 不能覆盖删除记录和它之前的历史版本。
+            new_version = True
         if latest is not None and not new_version:
             # 同名资产重复登记视为更新最新版本的 uri/meta
             self.db.execute(
@@ -55,10 +62,13 @@ class AssetCenter:
             "SELECT * FROM assets WHERE project_id=? AND kind=? AND name=? "
             "AND version=?", (project_id, kind, name, version))
 
-    def latest(self, project_id, kind, name):
-        return self.db.query_one(
+    def latest(self, project_id, kind, name, include_deleted=False):
+        row = self.db.query_one(
             "SELECT * FROM assets WHERE project_id=? AND kind=? AND name=? "
             "ORDER BY version DESC LIMIT 1", (project_id, kind, name))
+        if row is not None and self.is_deleted(row) and not include_deleted:
+            return None
+        return row
 
     def history(self, project_id, kind, name):
         return self.db.query(
@@ -74,11 +84,55 @@ class AssetCenter:
             "SELECT * FROM assets WHERE project_id=? AND kind=? "
             "ORDER BY name, version", (project_id, kind))
 
+    @staticmethod
+    def meta(row):
+        if row is None:
+            return {}
+        value = row["meta"]
+        if isinstance(value, str):
+            try:
+                return json.loads(value or "{}")
+            except ValueError:
+                return {}
+        return value or {}
+
+    @classmethod
+    def is_deleted(cls, row):
+        return bool(cls.meta(row).get("deleted"))
+
+    def active_list(self, project_id, kind=None):
+        """每个 kind/name 只返回当前未删除的最新版本。"""
+        rows = self.list(project_id, kind=kind)
+        latest = {}
+        for row in rows:
+            latest[(row["kind"], row["name"])] = row
+        return [row for row in latest.values() if not self.is_deleted(row)]
+
+    def get(self, asset_id):
+        return self.db.query_one(
+            "SELECT * FROM assets WHERE id=?", (int(asset_id),))
+
+    def soft_delete(self, project_id, kind, name, meta=None):
+        """以墓碑新版本隐藏当前资产；文件和历史版本保持可恢复。"""
+        latest = self.latest(
+            project_id, kind, name, include_deleted=True)
+        if latest is None or self.is_deleted(latest):
+            return None
+        tombstone = {
+            "deleted": True,
+            "deleted_at": now(),
+            "source_asset_id": latest["id"],
+            "source_version": latest["version"],
+        }
+        if meta:
+            tombstone.update(meta)
+        return self.register(
+            project_id, kind, name, uri="", meta=tombstone,
+            new_version=True)
+
     def delete(self, project_id, kind, name):
-        """删除某资产全部版本(用于作废需重新生成的产物)。"""
-        self.db.execute(
-            "DELETE FROM assets WHERE project_id=? AND kind=? AND name=?",
-            (project_id, kind, name))
+        """兼容旧调用：作废资产但不物理删除文件或历史。"""
+        return self.soft_delete(project_id, kind, name)
 
     def stats(self, project_id):
         return self.db.query(

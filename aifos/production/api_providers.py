@@ -763,6 +763,11 @@ class ArkVideoProvider(Provider):
         return True, "真实连通成功"
 
     def _frame_content(self, path, role):
+        if str(path).startswith(("http://", "https://")):
+            return {
+                "type": "image_url", "role": role,
+                "image_url": {"url": str(path)},
+            }
         raw = Path(path).read_bytes()
         suffix = Path(path).suffix.lower().lstrip(".") or "png"
         encoded = base64.b64encode(raw).decode("ascii")
@@ -800,6 +805,8 @@ class ArkVideoProvider(Provider):
         for key, role in (("first", "first_frame"), ("last", "last_frame")):
             if payload.get(key):
                 content.append(self._frame_content(payload[key], role))
+        for uri in (payload.get("reference_images") or [])[:7]:
+            content.append(self._frame_content(uri, "reference_image"))
         tasks_url = f"{endpoint}/api/v3/contents/generations/tasks"
         if not self.conf.get("model"):
             raise ProviderError(f"{self.name} 未配置模型 ID;{self.MODEL_HINT}")
@@ -845,5 +852,9 @@ class ArkVideoProvider(Provider):
             provider=self.name, cost=self.cost_per_call,
             data={"task_id": task_id, "duration": duration,
                   "video_quality": video_quality,
-                  "video_resolution": video_resolution},
+                  "video_resolution": video_resolution,
+                  "reference_images_used": list(
+                      (payload.get("reference_images") or [])[:7]),
+                  "reference_assets": list(
+                      payload.get("reference_assets") or [])},
             uri=str(dest))

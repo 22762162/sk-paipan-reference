@@ -1,6 +1,7 @@
 """即梦官方 CLI(dreamina)原生适配器。
 
-视频生成走 `dreamina frames2video`,与即梦 CLI 规范对齐:
+视频生成默认走 `dreamina frames2video`；选了资产中心参考图时改走
+`dreamina multimodal2video`，首帧、尾帧和资产参考图一起提交。
 
   dreamina frames2video \
     --first=/path/start.png --last=/path/end.png \
@@ -63,6 +64,14 @@ class DreaminaProvider(Provider):
             first = str(Path(first).resolve())
         if not last.startswith(("http://", "https://")):
             last = str(Path(last).resolve())
+        references = []
+        for uri in payload.get("reference_images") or []:
+            value = str(uri)
+            if not value.startswith(("http://", "https://")):
+                value = str(Path(value).resolve())
+            if value not in references and value not in (first, last):
+                references.append(value)
+        references = references[:7]
         shot_no = int(payload.get("shot_no", 0))
         model_version = self.conf.get(
             "model_version", REQUIRED_MODEL_VERSION)
@@ -83,10 +92,17 @@ class DreaminaProvider(Provider):
         # 即梦 CLI 接受整秒；0.5 秒分镜用常规四舍五入，避免 Python
         # bankers rounding 把 2.5 秒意外压成 2 秒。
         duration = max(1, min(15, int(requested_duration + 0.5)))
-        cmd = self._command() + [
-            "frames2video",
-            f"--first={first}",
-            f"--last={last}",
+        if references:
+            prompt += (
+                "。多图用途必须严格遵守：图1是首帧，图2是尾帧；"
+                "图3及之后是资产中心参考图，仅用于锁定人物身份、服装、"
+                "场景和画风连续性，不得把参考图拼贴进画面。")
+            cmd = self._command() + ["multimodal2video"]
+            cmd.extend(f"--image={uri}" for uri in [first, last, *references])
+        else:
+            cmd = self._command() + [
+                "frames2video", f"--first={first}", f"--last={last}"]
+        cmd += [
             f"--prompt={prompt}",
             f"--duration={duration}",
             f"--video_resolution={video_resolution}",
@@ -123,6 +139,8 @@ class DreaminaProvider(Provider):
                 "voice": payload.get("voice", "jimeng_builtin"),
                 "lip_sync": bool(payload.get("lip_sync", True)),
                 "forbid_subtitles": bool(payload.get("forbid_subtitles", True)),
+                "reference_images_used": references,
+                "reference_assets": list(payload.get("reference_assets") or []),
                 "log": str(log_path),
             },
             uri=uri,

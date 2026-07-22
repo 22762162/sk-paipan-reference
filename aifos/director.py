@@ -117,6 +117,11 @@ CHARACTER_SHEETS = [
      "服装细节拆解:纹样、扣饰、腰带、鞋履、佩饰逐项放大展示"),
 ]
 
+IMAGE_ASSET_KINDS = {
+    "character_art", "character_sheet", "scene_art", "character_candidate",
+    "image", "first_frame", "last_frame", "cover", "reference",
+}
+
 
 class Director:
     def __init__(self, db, config, logger, projects, assets, router, qc, ops,
@@ -634,15 +639,27 @@ class Director:
         payload = payload or {}
         rows = []
 
+        asset_by_uri = {
+            str(item.get("uri")): item
+            for item in (payload.get("asset_matches") or [])
+            if item.get("uri")
+        }
+
         def add(kind, uri, label=""):
             if not uri:
                 return
             value = str(uri)
             if any(row["uri"] == value for row in rows):
                 return
-            rows.append({"kind": kind, "label": label or kind,
-                         "name": Path(value).name or value,
-                         "uri": value})
+            match = asset_by_uri.get(value) or {}
+            rows.append({
+                "kind": kind,
+                "label": match.get("label") or label or kind,
+                "name": match.get("name") or Path(value).name or value,
+                "uri": value,
+                "asset_id": match.get("asset_id"),
+                "source": "asset_center" if match else "upload",
+            })
 
         for ref in payload.get("identity_references") or []:
             if isinstance(ref, dict):
@@ -655,7 +672,8 @@ class Director:
         add("scene", payload.get("scene_ref"), "场景概念图")
         add("style", payload.get("style_ref"), "全项目风格基准图")
         for uri in payload.get("reference_images") or []:
-            add("user", uri, "用户参考图")
+            add("asset" if str(uri) in asset_by_uri else "user", uri,
+                "资产中心匹配图" if str(uri) in asset_by_uri else "用户参考图")
         return {"attached": bool(rows), "count": len(rows),
                 "required": bool(payload.get("require_reference_images")),
                 "items": rows}
@@ -709,6 +727,7 @@ class Director:
                 continue
             refs.append({
                 "character": name,
+                "asset_id": row["id"],
                 "uri": row["uri"],
                 "version": row["version"],
             })
@@ -1242,6 +1261,21 @@ class Director:
             "quality_reasons": list(decision.get("reasons") or []),
         }
 
+    def _shot_image_meta(self, ctx, shot, decision, extra=None):
+        """镜头图写入可检索上下文，供跨集资产匹配和复用。"""
+        location = self._scene_locations(ctx).get(shot.get("scene_no"), "")
+        value = {
+            **self._quality_meta(decision),
+            "episode_number": ctx["episode"]["number"],
+            "shot_no": shot.get("shot_no"),
+            "scene_no": shot.get("scene_no"),
+            "characters": list(shot.get("characters") or []),
+            "location": location,
+        }
+        if extra:
+            value.update(extra)
+        return value
+
     @staticmethod
     def _quality_meets(actual, required):
         order = {"low": 0, "medium": 1, "high": 2}
@@ -1380,10 +1414,8 @@ class Director:
                     },
                     "sub_dir": "cast/candidates",
                     "tag": (name, index, role),
-                    "qc_spec": self._qc_spec(
-                        project_id, [name], require_identity=False,
-                        forbid=["与设定形态不符的角色", "悬挂的衣物或衣架",
-                                "与设定不符的人"]),
+                    # 初始人物母资产只按剧本性格、角色参考图和风格生成，
+                    # 不在候选阶段做视觉 QC；人工选定后供后续镜头质检引用。
                 })
         self._plan_seed(ctx, "character_candidate", seed)
         # 已存在的候选明确标成复用，避免重新排队。
@@ -1656,9 +1688,9 @@ class Director:
                         "aspect": ctx["aspect"], **ctx["dims"],
                     }, "sub_dir": "cast",
                     "tag": (name, key, label),
-                    "qc_spec": self._qc_spec(
-                        project_id, [name],
-                        forbid=["与设定形态不符的角色", "悬挂的衣物或衣架", "与设定不符的人"])})
+                    # 人物资产套件仍属于初始母资产阶段，不做视觉 QC；
+                    # 分镜/首尾帧等后续镜头才使用已锁定人物立绘质检。
+                })
         for (name, key, label), result in self._run_parallel(
                 ctx, tasks, line="人物资产套件").items():
             self.assets.register(
@@ -1682,7 +1714,7 @@ class Director:
     def _reference_uris(self, project_id, attach_names):
         """用户上传的参考图:关联到指定角色/场景的 + 全局的。"""
         uris = []
-        for row in self.assets.list(project_id, kind="reference"):
+        for row in self.assets.active_list(project_id, kind="reference"):
             meta = json.loads(row["meta"] or "{}") if isinstance(
                 row["meta"], str) else (row["meta"] or {})
             attach = meta.get("attach_to", "")
@@ -1692,30 +1724,88 @@ class Director:
                 uris.append(row["uri"])
         return uris
 
-    def _art_refs(self, ctx, characters, location):
+    def _matching_produced_image_rows(self, project_id, characters,
+                                      location, shot_no=None, limit=3):
+        """从资产中心找同人物/同场景的正式成图，优先作为连续性参考。"""
+        wanted = set(characters or [])
+        ranked = []
+        for row in self.assets.active_list(project_id):
+            if row["kind"] not in ("image", "first_frame", "last_frame"):
+                continue
+            if not formal_reference_allowed(self._asset_quality(row)):
+                continue
+            meta = self._asset_meta(row)
+            if shot_no is not None and meta.get("shot_no") == shot_no:
+                continue
+            uri = row["uri"]
+            if (not uri.startswith(("http://", "https://"))
+                    and not Path(uri).exists()):
+                continue
+            row_chars = set(meta.get("characters") or [])
+            same_location = bool(location and meta.get("location") == location)
+            overlap = len(wanted & row_chars)
+            if not same_location and not overlap:
+                continue
+            score = (6 if same_location else 0) + overlap * 4
+            if wanted and row_chars == wanted:
+                score += 3
+            ranked.append((score, row["id"], row))
+        ranked.sort(key=lambda item: (-item[0], -item[1]))
+        return [item[2] for item in ranked[:limit]]
+
+    def _art_refs(self, ctx, characters, location, shot_no=None):
         """最终立绘/四视图/场景图/用户参考 → 真实多图参考输入。
 
         含人物画面缺任何一个最终立绘都直接阻断；禁止静默退化为文字生图。
         """
         project_id = ctx["project"]["id"]
-        refs = {"character_refs": [], "identity_references": []}
+        refs = {"character_refs": [], "identity_references": [],
+                "asset_matches": []}
         identities = self._identity_references(
             project_id, characters, required=bool(characters))
         for identity in identities:
             refs["character_refs"].append(identity["uri"])
             refs["identity_references"].append(identity)
+            refs["asset_matches"].append({
+                "asset_id": identity.get("asset_id"),
+                "kind": "character_identity",
+                "name": identity.get("character", ""),
+                "label": f"{identity.get('character', '角色')}最终立绘",
+                "uri": identity["uri"],
+            })
         for name in characters or []:
             row = self.assets.latest(
                 project_id, "character_sheet", f"{name}:turnaround")
             if (row and formal_reference_allowed(self._asset_quality(row))
                     and row["uri"] and Path(row["uri"]).exists()):
                 refs["character_refs"].append(row["uri"])
+                refs["asset_matches"].append({
+                    "asset_id": row["id"], "kind": row["kind"],
+                    "name": row["name"], "label": f"{name}四视图",
+                    "uri": row["uri"],
+                })
         if location:
             row = self.assets.latest(project_id, "scene_art", location)
             if (row and formal_reference_allowed(self._asset_quality(row))
                     and row["uri"] and Path(row["uri"]).exists()):
                 refs["scene_ref"] = row["uri"]
-        reference = self._reference_uris(
+                refs["asset_matches"].append({
+                    "asset_id": row["id"], "kind": row["kind"],
+                    "name": row["name"], "label": f"场景:{location}",
+                    "uri": row["uri"],
+                })
+        matched_rows = (self._matching_produced_image_rows(
+            project_id, characters, location, shot_no=shot_no)
+            if shot_no is not None else [])
+        matched = []
+        for row in matched_rows:
+            matched.append(row["uri"])
+            refs["asset_matches"].append({
+                "asset_id": row["id"], "kind": row["kind"],
+                "name": row["name"], "label": "同人物/同场景已生产图",
+                "uri": row["uri"],
+            })
+        reference = matched + self._reference_uris(
             project_id, list(characters or []) + ([location] if location
                                                   else []))
         if reference:
@@ -1818,7 +1908,8 @@ class Director:
             "forbid_subtitles": not profile["burn_subtitles"],
             "style": ctx["project"]["style"] or "",
             "aspect": ctx["aspect"], **ctx["dims"],
-            **self._art_refs(ctx, shot["characters"], location),
+            **self._art_refs(ctx, shot["characters"], location,
+                             shot_no=shot["shot_no"]),
         }
         actor_ids = {
             actor.get("name"): actor.get("actor_id")
@@ -1887,7 +1978,9 @@ class Director:
             quality = quality_by_shot[shot_no]
             self._register_shot_asset(
                 ctx, "image", shot_no, result.uri,
-                meta=self._quality_meta(quality))
+                meta=self._shot_image_meta(
+                    ctx, next(s for s in ctx["storyboard"]["shots"]
+                              if s["shot_no"] == shot_no), quality))
             ctx["images"].append({
                 "shot_no": shot_no, "uri": result.uri,
                 "image_quality": quality["level"]})
@@ -2064,6 +2157,78 @@ class Director:
             ctx["videos"].append(self._make_video(ctx, shot, frames))
         return {"count": len(ctx["videos"]), "reused": reused}
 
+    def set_video_references(self, episode_id, shot_no, asset_ids):
+        """保存某镜头从资产中心人工选定的 Seedance 参考图。"""
+        episode = self.projects.get_episode(int(episode_id))
+        if episode is None:
+            raise AifosError("剧集不存在")
+        storyboard, _ = self.projects.latest_document(
+            episode["id"], "storyboard")
+        shots = (storyboard or {}).get("shots", [])
+        if not any(int(shot.get("shot_no", -1)) == int(shot_no)
+                   for shot in shots):
+            raise AifosError(f"镜头不存在: {shot_no}")
+        unique_ids = []
+        for value in asset_ids or []:
+            asset_id = int(value)
+            if asset_id not in unique_ids:
+                unique_ids.append(asset_id)
+        # multimodal2video 最多 9 张；首尾帧占 2 张。
+        if len(unique_ids) > 7:
+            raise AifosError("每个镜头最多选择 7 张资产参考图")
+        selected = []
+        for asset_id in unique_ids:
+            row = self.assets.get(asset_id)
+            if row is None or row["project_id"] != episode["project_id"]:
+                raise AifosError(f"资产不存在或不属于本项目: {asset_id}")
+            latest = self.assets.latest(
+                row["project_id"], row["kind"], row["name"])
+            if (latest is None or latest["id"] != row["id"]
+                    or self.assets.is_deleted(row) or not row["uri"]):
+                raise AifosError(f"资产已删除或不是最新版本: {asset_id}")
+            if row["kind"] not in IMAGE_ASSET_KINDS:
+                raise AifosError(f"资产不是可用图片: {row['kind']}")
+            if not formal_reference_allowed(self._asset_quality(row)):
+                raise AifosError(f"低质量候选图不能交给 Seedance: {row['name']}")
+            uri = row["uri"]
+            if (not uri.startswith(("http://", "https://"))
+                    and not Path(uri).exists()):
+                raise AifosError(f"资产文件不存在: {row['name']}")
+            selected.append({
+                "asset_id": row["id"], "kind": row["kind"],
+                "name": row["name"], "version": row["version"],
+            })
+        document, _ = self.projects.latest_document(
+            episode["id"], "video_references")
+        document = document or {
+            "schema": "aifos.video-references/v1", "shots": {}}
+        document.setdefault("shots", {})[str(int(shot_no))] = selected
+        document["updated_at"] = now()
+        version = self.projects.save_document(
+            episode["id"], "video_references", document)
+        return {**document, "version": version}
+
+    def _video_reference_rows(self, ctx, shot_no):
+        document, _ = self.projects.latest_document(
+            ctx["episode"]["id"], "video_references")
+        selected = (document or {}).get("shots", {}).get(str(int(shot_no)), [])
+        rows = []
+        for item in selected:
+            row = self.assets.get(item.get("asset_id"))
+            if row is None or row["project_id"] != ctx["project"]["id"]:
+                continue
+            latest = self.assets.latest(
+                row["project_id"], row["kind"], row["name"])
+            if (latest is None or latest["id"] != row["id"]
+                    or self.assets.is_deleted(row) or not row["uri"]
+                    or not formal_reference_allowed(self._asset_quality(row))):
+                continue
+            uri = row["uri"]
+            if (uri.startswith(("http://", "https://"))
+                    or Path(uri).exists()):
+                rows.append(row)
+        return rows[:7]
+
     def _make_video(self, ctx, shot, frames):
         frame = frames[shot["shot_no"]]
         if not formal_reference_allowed(
@@ -2073,6 +2238,11 @@ class Director:
         quality = resolve_video_quality(
             ctx.get("quality_policy") or default_quality_policy(),
             shot_no=shot["shot_no"])
+        reference_rows = self._video_reference_rows(ctx, shot["shot_no"])
+        reference_assets = [{
+            "asset_id": row["id"], "kind": row["kind"],
+            "name": row["name"], "version": row["version"],
+        } for row in reference_rows]
         result = self._call(ctx, "video", {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
@@ -2080,6 +2250,8 @@ class Director:
             "duration": shot["duration"],
             "first": frame["first"],
             "last": frame["last"],
+            "reference_images": [row["uri"] for row in reference_rows],
+            "reference_assets": reference_assets,
             "dialogue": shot.get("dialogue"),
             "voice": ctx["production_profile"]["voice"],
             "lip_sync": ctx["production_profile"]["lip_sync"],
@@ -2105,12 +2277,14 @@ class Director:
                                         "audio_in_video": audio_in_video,
                                         "video_quality": quality["level"],
                                         "video_resolution": quality["resolution"],
-                                        "quality_source": quality["source"]})
+                                        "quality_source": quality["source"],
+                                        "reference_assets": reference_assets})
         return {"shot_no": shot["shot_no"], "uri": result.uri,
                 "duration": shot["duration"], "provider": result.provider,
                 "audio_in_video": audio_in_video,
                 "video_quality": quality["level"],
-                "video_resolution": quality["resolution"]}
+                "video_resolution": quality["resolution"],
+                "reference_assets": reference_assets}
 
     def _video_audio_states(self, ctx):
         """按实际视频资产/Provider 声明返回每镜是否内置配音。"""
@@ -2618,8 +2792,9 @@ class Director:
                 payload=payload, revision_source=revision_source)
             self.assets.register(project["id"], "image", asset_name,
                                  uri=result.uri,
-                                 meta=self._quality_meta(
-                                     payload["quality_decision"]),
+                                 meta=self._shot_image_meta(
+                                     ctx, shot, payload["quality_decision"],
+                                     {"revision": payload["revision"]}),
                                  new_version=True)
             scene_shots = [candidate for candidate in storyboard["shots"]
                            if candidate.get("scene_no") == shot.get("scene_no")]
@@ -2823,14 +2998,6 @@ class Director:
                     / f"shot_{shot_no:03d}.upload{ext}")
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(file_bytes)
-            self.assets.register(project["id"], "image", asset_name,
-                                 uri=str(path),
-                                 meta={"uploaded": True,
-                                       "image_quality": "high",
-                                       "recommended_quality": "high",
-                                       "quality_source": "manual_upload"},
-                                 new_version=True)
-            # 按新图重做首尾帧(真实产线由 Codex 依据新图推导)
             aspect = (project["aspect"] or self.config.get(
                 "defaults", "aspect", default="9:16"))
             ctx = {"project": dict(project), "episode": dict(episode),
@@ -2838,6 +3005,18 @@ class Director:
                    "dims": ASPECT_DIMS.get(aspect, ASPECT_DIMS["9:16"]),
                    "script": script, "storyboard": storyboard,
                    "force": True}
+            self.assets.register(project["id"], "image", asset_name,
+                                 uri=str(path),
+                                 meta=self._shot_image_meta(
+                                     ctx, shot,
+                                     {"level": "high",
+                                      "recommended": "high",
+                                      "source": "manual_upload",
+                                      "rule": "manual_upload",
+                                      "reasons": ["人工上传正式图"]},
+                                     {"uploaded": True}),
+                                 new_version=True)
+            # 按新图重做首尾帧(真实产线由 Codex 依据新图推导)
             self._task_cost = 0.0
             self._task_providers = set()
             payload = self._shot_payload(ctx, shot)
@@ -2935,6 +3114,11 @@ class Director:
         "frames": lambda parts: {"kind": "frames",
                                  "shot_no": int(parts[0])},
     }
+    # 初始母资产只负责建立人物/场景基准；视觉 QC 只对后续镜头图执行。
+    INITIAL_ASSET_CATEGORIES = frozenset({
+        "character_candidate", "character_art", "character_sheet", "scene_art",
+    })
+    SHOT_QC_CATEGORIES = frozenset({"shot_image", "frames"})
 
     # ---- 单张/批量质检:核对已生成的图是否符合剧本要求 ----
     _FORBID = ["与设定形态不符的角色", "悬挂的衣物或衣架", "与设定不符的人"]
@@ -3004,6 +3188,12 @@ class Director:
         item = next((i for i in plan["items"] if i["id"] == item_id), None)
         if item is None:
             raise AifosError(f"清单里没有该条目: {item_id}")
+        category = item.get("category")
+        if category in self.INITIAL_ASSET_CATEGORIES:
+            raise AifosError(
+                "初始人物/场景母资产不做视觉质检；请在分镜关键帧或首尾帧生成后质检")
+        if category not in self.SHOT_QC_CATEGORIES:
+            raise AifosError("该清单条目不支持镜头视觉质检")
         return self._qc_one(project, episode, ctx, item)
 
     def _qc_one(self, project, episode, ctx, item):
@@ -3100,7 +3290,7 @@ class Director:
         plan = self._plan_read(ctx)
         items = [i for i in plan["items"]
                  if i.get("status") in ("done", "reused")
-                 and i.get("category") != "character_candidate"]
+                 and i.get("category") in self.SHOT_QC_CATEGORIES]
         previous_status = episode["status"]
         self.projects.set_episode_status(episode["id"], "cast")
         checked = passed = failed = 0
@@ -3144,6 +3334,7 @@ class Director:
         if only_failed:
             targets = [i["id"] for i in plan["items"]
                        if (i.get("qc") or {}).get("passed") is False
+                       and i.get("category") in self.SHOT_QC_CATEGORIES
                        and i.get("status") in ("done", "reused")]
         else:
             targets = [tid for tid in (item_ids or []) if tid in by_id]
@@ -3375,11 +3566,60 @@ class Director:
         project = self.projects.get_project(project_title)
         if project is None:
             raise AifosError(f"项目不存在: {project_title}")
-        if self.assets.latest(project["id"], "reference", name) is None:
+        row = self.assets.latest(project["id"], "reference", name)
+        if row is None or self.assets.is_deleted(row):
             raise AifosError(f"参考图不存在: {name}")
         self.assets.delete(project["id"], "reference", name)
         self.log.info("director", f"已删除参考图「{name}」")
-        return {"deleted": name}
+        return {"deleted": name, "history_preserved": True}
+
+    def delete_image_asset(self, project_title, asset_id):
+        """资产中心删除已生产图：隐藏当前版本并安全作废下游产物。"""
+        project = self.projects.get_project(project_title)
+        if project is None:
+            raise AifosError(f"项目不存在: {project_title}")
+        row = self.assets.get(int(asset_id))
+        if row is None or row["project_id"] != project["id"]:
+            raise AifosError("图片资产不存在或不属于本项目")
+        latest = self.assets.latest(project["id"], row["kind"], row["name"])
+        if (latest is None or latest["id"] != row["id"]
+                or self.assets.is_deleted(row)):
+            raise AifosError("图片资产已删除或不是当前版本")
+        if row["kind"] not in IMAGE_ASSET_KINDS - {"reference"}:
+            raise AifosError(f"该资产不是可删除图片: {row['kind']}")
+        self.assets.soft_delete(
+            project["id"], row["kind"], row["name"],
+            meta={"deleted_by": "asset_center"})
+        invalidated = []
+
+        def invalidate(kind, name):
+            current = self.assets.latest(project["id"], kind, name)
+            if current is not None and not self.assets.is_deleted(current):
+                self.assets.soft_delete(
+                    project["id"], kind, name,
+                    meta={"invalidated_by_asset_id": row["id"]})
+                invalidated.append(kind)
+
+        if row["kind"] == "character_art":
+            identity = self.assets.latest(
+                project["id"], "character_identity", row["name"])
+            if (identity is not None and identity["uri"] == row["uri"]
+                    and not self.assets.is_deleted(identity)):
+                invalidate("character_identity", row["name"])
+        if row["kind"] == "image":
+            for kind in ("first_frame", "last_frame", "video"):
+                invalidate(kind, row["name"])
+        elif row["kind"] in ("first_frame", "last_frame"):
+            invalidate("video", row["name"])
+        self.log.info(
+            "director", f"资产中心已删除图片 {row['kind']}/{row['name']}"
+            f"（历史保留；作废下游:{'、'.join(invalidated) or '无'}）")
+        return {
+            "deleted": {"asset_id": row["id"], "kind": row["kind"],
+                        "name": row["name"]},
+            "invalidated": invalidated,
+            "history_preserved": True,
+        }
 
     def import_video(self, project_title, episode_number, shot_no,
                      file_bytes, ext=".mp4"):

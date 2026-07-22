@@ -1883,6 +1883,8 @@ const PLAN_STATUS_CN = {
   pending: "排队中", generating: "生成中", done: "已完成",
   failed: "失败", reused: "复用已有", selected: "已选定",
 };
+const PLAN_QC_CATS = new Set(["shot_image", "frames"]);
+function planQcEnabled(item) { return PLAN_QC_CATS.has(item.category); }
 const PROVIDER_LABEL = {
   codex: "Codex 订阅", image_api: "GPT Image 2 API", api: "通用API",
   seedream5_lite: "Seedream 5.0 Lite", seedream_lite: "Seedream 5.0 Lite",
@@ -1907,8 +1909,23 @@ function planQcBadge(item) {
 function planQcIssuesHtml(item) {
   const qc = item.qc;
   if (!qc || qc.passed || !(qc.issues || []).length) return "";
-  return `<div class="plan-err">质检:${esc(qc.issues.join(";"))}
+  return `<div class="plan-err qc-fail-reason"><b>质检没有通过的原因：</b>${esc(qc.issues.join("；"))}
     <span class="dim">(已自动重画 ${qc.attempts} 次仍未过,可改提示词手动重画)</span></div>`;
+}
+
+function planQcReferenceGalleryHtml(item) {
+  const qc = item.qc;
+  if (!qc || qc.passed) return "";
+  const refs = ((item.reference_inputs || {}).items || [])
+    .filter((ref) => ref.url);
+  if (!refs.length)
+    return `<div class="plan-ref-gallery missing"><b>本次参考图：</b>未附可显示的参考图</div>`;
+  return `<div class="plan-ref-gallery"><b>本次质检/重画实际附上的参考图：</b>
+    <div class="plan-ref-grid">${refs.map((ref) => `<figure>
+      <img class="zoomable" src="${esc(thumbUrl(ref.url, 220))}" loading="lazy"
+        alt="${esc(ref.label || ref.name || "参考图")}">
+      <figcaption>${esc(ref.label || ref.name || "参考图")}</figcaption>
+    </figure>`).join("")}</div></div>`;
 }
 
 function planTraceBadges(item) {
@@ -2049,14 +2066,15 @@ function planItemHtml(data, item, editable) {
         </span>
       </div>
       ${planIsMock(item) ? planMockReasonHtml(item) : ""}
-      ${planQcIssuesHtml(item)}
-      ${planTraceHtml(item)}
       ${item.error ? `<div class="plan-err">${esc(item.error)}</div>` : ""}
-      ${canEdit && ["done", "reused"].includes(st) ? `<div class="plan-qc-row">
+      ${canEdit && planQcEnabled(item) && ["done", "reused"].includes(st) ? `<div class="plan-qc-row">
         <button class="plan-qc-one" data-plan-id="${esc(item.id)}"
-          title="用 AI 视觉核对这张是否符合剧本/人物设定">🔍 质检这张</button></div>` : ""}
+          title="用 AI 视觉核对这张是否符合已锁定人物/场景设定">🔍 质检这张</button></div>` : ""}
       <details class="plan-prompt"><summary>提示词</summary>
         <pre>${esc(item.prompt || "")}</pre></details>
+      ${planQcIssuesHtml(item)}
+      ${planQcReferenceGalleryHtml(item)}
+      ${planTraceHtml(item)}
       ${canEdit ? `<div class="plan-edit" data-target="${esc(JSON.stringify(planTargetOf(item)))}">
         <button class="plan-edit-toggle">🔄 修改提示词/重画这张</button>
         <div class="plan-edit-form" hidden>
@@ -2114,16 +2132,17 @@ function renderPlanHtml(data, editable) {
   const ready = items.filter(
     (i) => ["done", "reused"].includes(i.status)).length;
   const qcFailed = items.filter(
-    (i) => (i.qc || {}).passed === false
+    (i) => planQcEnabled(i) && (i.qc || {}).passed === false
       && ["done", "reused"].includes(i.status)).length;
+  const qcItems = items.filter(planQcEnabled);
   return `<div class="plan-panel">
     <h2>🖼 图片生产清单 <span class="dim">共 ${items.length} 张 · 已就绪 ${ready}</span></h2>
     ${qualityPolicyHtml()}
     ${imageCostGuideHtml(true)}
     ${mockWarnHtml(data)}
     ${editable ? `<div class="plan-batchbar">
-      <button class="batch-qc" onclick="qcAll(${data.episode.id}, this)"
-        title="用 AI 逐张核对全部图片是否符合剧本/人物设定">🔍 批量质检全部</button>
+      ${qcItems.length ? `<button class="batch-qc" onclick="qcAll(${data.episode.id}, this)"
+        title="只核对后续分镜关键帧和首尾帧">🔍 批量质检镜头图</button>` : ""}
       <button class="batch-redo-failed" onclick="redoFailed(${data.episode.id}, this)"
         ${qcFailed ? "" : "disabled"}
         title="重画所有质检未过的图">🔁 重画质检未过的${qcFailed ? ` (${qcFailed})` : ""}</button>
@@ -2525,6 +2544,9 @@ function planCardHtml(data, item, avg) {
     ${item.model ? `<div class="pc-model" title="实际记录的模型/托管通道">${esc(item.model)}</div>` : ""}
     <details class="plan-prompt"><summary>提示词</summary>
       <pre>${esc(item.prompt || "")}</pre></details>
+    ${planQcIssuesHtml(item)}
+    ${planQcReferenceGalleryHtml(item)}
+    ${planTraceHtml(item)}
   </div>`;
 }
 
@@ -2821,7 +2843,7 @@ document.addEventListener("click", (ev) => {
   const full = img.src.replace(/([?&])w=\d+&?/, "$1").replace(/[?&]$/, "");
   showImageLightbox(full, String(label).trim());
 });
-function assetCardHtml(ep, target, url, label, mock) {
+function assetCardHtml(ep, target, url, label, mock, assetId = null) {
   const img = url && !url.split("?")[0].endsWith(".json")
     ? `<img src="${esc(thumbUrl(url, 480))}" loading="lazy" alt="">`
     : `<div class="pc-empty">🖼</div>`;
@@ -2832,6 +2854,8 @@ function assetCardHtml(ep, target, url, label, mock) {
       ${mock ? `<span class="plan-st st-mock" title="占位产线画的示意图,不理解修改意见;接入真实出图产线后重画才会按意见改样式">⚠ 占位图</span>` : ""}</div>
     ${ep ? `${regenControls(target, "重画")}
             ${ioControls(target, url || "", safe + ".png")}` : ""}
+    ${assetId ? `<button class="asset-del danger" data-asset-id="${assetId}"
+      title="从资产中心隐藏当前版本；历史版本和原文件仍会保留">🗑 删除</button>` : ""}
   </div>`;
 }
 
@@ -2929,11 +2953,11 @@ async function renderAssetsCenter(selectedTitle) {
           ${designHtml(c.design)}
           <div class="pb-grid">
             ${assetCardHtml(ep, { kind: "character_art", name: c.name },
-                            c.url, "立绘", isMock(`char:${c.name}`))}
+                            c.url, "立绘", isMock(`char:${c.name}`), c.asset_id)}
             ${sheets.map((s) => assetCardHtml(
               ep, { kind: "character_sheet", name: s.name }, s.url,
               s.label || s.sheet,
-              isMock(`sheet:${c.name}:${s.sheet}`))).join("")}
+              isMock(`sheet:${c.name}:${s.sheet}`), s.asset_id)).join("")}
           </div></div>`;
       }).join("")
       : `<div class="dim">本项目还没有人物资产。开始制作一集并确认剧本后,
@@ -2943,8 +2967,23 @@ async function renderAssetsCenter(selectedTitle) {
       <h2>🏞 场景概念图</h2>
       <div class="pb-grid">${(art.scene_art || []).map((s) =>
         assetCardHtml(ep, { kind: "scene_art", name: s.name }, s.url,
-                      s.name, isMock(`scene:${s.name}`))).join("")
+                      s.name, isMock(`scene:${s.name}`), s.asset_id)).join("")
         || `<div class="dim">暂无场景概念图。</div>`}</div>
+    </section>
+    <section class="panel asset-panel">
+      <h2>🎞 镜头图片 <span class="dim">关键图、首帧和尾帧均可删除；
+        删除关键图会同时安全作废对应首尾帧和旧视频，避免误复用。</span></h2>
+      <div class="pb-grid">${(art.image_assets || [])
+        .filter((item) => ["image", "first_frame", "last_frame", "cover"].includes(item.kind))
+        .map((item) => {
+          const shotNo = Number((item.meta || {}).shot_no || 0);
+          const target = item.kind === "image" && shotNo
+            ? { kind: "shot", shot_no: shotNo }
+            : (["first_frame", "last_frame"].includes(item.kind) && shotNo
+              ? { kind: "frames", shot_no: shotNo } : null);
+          return assetCardHtml(target ? ep : null, target || {}, item.url,
+            item.label, false, item.asset_id);
+        }).join("") || `<div class="dim">暂无镜头图片。</div>`}</div>
     </section>
   </div>`;
   document.getElementById("asset-project").onchange = (ev) =>
@@ -3009,6 +3048,19 @@ async function renderAssetsCenter(selectedTitle) {
           body: JSON.stringify({ project: title, name: btn.dataset.name }),
         });
         showToast("参考图已删除", "ok");
+        reload();
+      } catch (e) { showToast(e.message, "error"); }
+    });
+  });
+  app.querySelectorAll(".asset-del").forEach((btn) => {
+    btn.onclick = (ev) => armConfirm(ev.target, "删除", async () => {
+      try {
+        await api("/api/asset/delete", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ project: title,
+            asset_id: Number(btn.dataset.assetId) }),
+        });
+        showToast("图片已从资产中心删除，历史版本仍保留", "ok");
         reload();
       } catch (e) { showToast(e.message, "error"); }
     });
@@ -3310,6 +3362,88 @@ function renderCastSelection(data, episodeId) {
   };
 }
 
+function videoReferencePanelHtml(data) {
+  const shots = (data.storyboard || {}).shots || [];
+  const library = (data.artifacts || {}).image_assets || [];
+  const byId = new Map(library.map((item) => [Number(item.asset_id), item]));
+  const selected = (data.video_references || {}).shots || {};
+  return `<section class="panel video-ref-panel">
+    <h2>🧷 Seedance 资产参考图
+      <span class="dim">按镜头从资产中心选择；首尾帧之外最多再附 7 张，
+      只允许中/高质量且当前未删除的图。</span></h2>
+    <div class="video-ref-list">${shots.map((shot) => {
+      const rows = (selected[String(shot.shot_no)] || [])
+        .map((entry) => byId.get(Number(entry.asset_id))).filter(Boolean);
+      return `<div class="video-ref-row">
+        <b>镜头 ${shot.shot_no}</b>
+        <div class="video-ref-thumbs">${rows.map((item) =>
+          `<img src="${esc(thumbUrl(item.url, 120))}" alt="${esc(item.label)}"
+            title="${esc(item.label)}">`).join("")
+          || `<span class="dim">未额外选择（仍使用首尾帧）</span>`}</div>
+        <button class="video-ref-edit" data-shot-no="${shot.shot_no}">
+          从资产中心选择${rows.length ? `（已选 ${rows.length}）` : ""}</button>
+      </div>`;
+    }).join("")}</div>
+  </section>`;
+}
+
+function showVideoReferencePicker(data, episodeId, shotNo) {
+  const library = (data.artifacts || {}).image_assets || [];
+  const selectedRows = ((data.video_references || {}).shots || {})[String(shotNo)] || [];
+  const selected = new Set(selectedRows.map((row) => Number(row.asset_id)));
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay video-ref-overlay";
+  overlay.innerHTML = `<div class="script-box video-ref-box">
+    <div class="script-head"><h2>镜头 ${shotNo} · 选择资产参考图</h2>
+      <button class="close">关闭</button></div>
+    <p class="dim">图片会与本镜首尾帧一起交给 Seedance 2.0 Fast VIP。
+      低质量候选不能勾选；最多选 7 张。</p>
+    <div class="video-ref-picker-grid">${library.map((item) => `
+      <label class="video-ref-choice${item.usable_for_video ? "" : " disabled"}">
+        <input type="checkbox" value="${item.asset_id}"
+          ${selected.has(Number(item.asset_id)) ? "checked" : ""}
+          ${item.usable_for_video ? "" : "disabled"}>
+        <img src="${esc(thumbUrl(item.url, 260))}" loading="lazy" alt="${esc(item.label)}">
+        <span>${esc(item.label)}</span>
+        <small>${esc(item.quality || "medium")}${item.usable_for_video ? "" : " · 低质量禁用"}</small>
+      </label>`).join("") || `<div class="dim">资产中心还没有可选图片。</div>`}</div>
+    <div class="script-actions"><button class="primary save">保存参考图</button></div>
+  </div>`;
+  const close = () => overlay.remove();
+  overlay.querySelector(".close").onclick = close;
+  overlay.addEventListener("click", (ev) => { if (ev.target === overlay) close(); });
+  overlay.querySelector(".save").onclick = async (ev) => {
+    const ids = [...overlay.querySelectorAll("input:checked")]
+      .map((input) => Number(input.value));
+    if (ids.length > 7) {
+      showToast("每个镜头最多选择 7 张资产参考图", "error");
+      return;
+    }
+    ev.target.disabled = true; ev.target.textContent = "保存中…";
+    try {
+      await api("/api/video/references", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ episode_id: episodeId, shot_no: shotNo,
+          asset_ids: ids }),
+      });
+      close();
+      showToast(`镜头 ${shotNo} 已保存 ${ids.length} 张资产参考图`, "ok");
+      renderCanvasView(episodeId);
+    } catch (e) {
+      showToast(e.message, "error");
+      ev.target.disabled = false; ev.target.textContent = "保存参考图";
+    }
+  };
+  document.body.appendChild(overlay);
+}
+
+function bindVideoReferenceControls(data, episodeId) {
+  document.querySelectorAll(".video-ref-edit").forEach((button) => {
+    button.onclick = () => showVideoReferencePicker(
+      data, episodeId, Number(button.dataset.shotNo));
+  });
+}
+
 async function renderCanvasView(episodeId) {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   let data;
@@ -3374,7 +3508,8 @@ async function renderCanvasView(episodeId) {
         </label>
       </div>
       <button class="primary" id="btn-confirm" ${data.preflight?.passed ? "" : "disabled"}>✅ 确认,开始 Seedance 生产</button>
-    </div>` : ""}
+    </div>
+    ${videoReferencePanelHtml(data)}` : ""}
     <div class="profile-strip">
       <span><b>${esc(profile.standard_name || "SK 五维工业流")}</b> v${esc(profile.standard_version || 1)}</span>
       <span>Seedance 2.0 Fast VIP</span><span>${esc(profile.resolution || "720p")}</span>
@@ -3454,6 +3589,7 @@ async function renderCanvasView(episodeId) {
   document.getElementById("btn-blocking").onclick = () => showBlockingOverlay(episodeId);
   document.getElementById("btn-plan").onclick = () => showPlanOverlay(episodeId);
   document.getElementById("btn-play").onclick = () => openPlayer(data);
+  if (awaiting) bindVideoReferenceControls(data, episodeId);
   const btnConfirm = document.getElementById("btn-confirm");
   if (btnConfirm) btnConfirm.onclick = async () => {
     btnConfirm.disabled = true;
