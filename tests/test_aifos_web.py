@@ -63,10 +63,24 @@ def test_index_and_static(server):
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
     assert "空间调度".encode() in app_js
+    assert "人物编号图例".encode() in app_js
+    assert "人物路线".encode() in app_js
+    assert "镜头路线".encode() in app_js
+    assert "Codex 订阅".encode() in app_js
+    assert "Seedream 5.0 Lite".encode() in app_js
+    assert "¥0.22/张".encode() in app_js
+    assert "GPT Image 2 medium".encode() in app_js
+    assert "约 ¥0.28/张".encode() in app_js
+    assert "GPT Image 2 high".encode() in app_js
+    assert "仅终稿/复杂文字".encode() in app_js
     assert b"/api/character/select" in app_js
     assert "人物定版".encode() in app_js
-    status, ctype, _ = _request(server["port"], "GET", "/static/style.css")
+    status, ctype, style_css = _request(
+        server["port"], "GET", "/static/style.css")
     assert status == 200 and "css" in ctype
+    assert b".image-cost-guide" in style_css
+    assert b".blocking-actor-legend" in style_css
+    assert b".blocking-map-scroll" in style_css
     status, ctype, raw = _request(
         server["port"], "GET", "/manifest.webmanifest")
     assert status == 200 and "application/manifest+json" in ctype
@@ -349,8 +363,21 @@ def test_project_style_api(server):
 
 
 def test_image_line_switch_and_parallel(server):
-    """页面切换出图产线(Codex/OpenAI API)与并行路数。"""
+    """设置 API 暴露按用途出图策略，并保留高级路由与并行数写入。"""
     port = server["port"]
+    status, view = _json_request(port, "GET", "/api/settings")
+    assert status == 200
+    seedream = next(
+        provider for provider in view["providers"]
+        if provider["name"] == "seedream5_lite")
+    assert seedream["type"] == "seedream_image"
+    assert seedream["model"] == "doubao-seedream-5-0-lite-260128"
+    assert seedream["cost_per_call"] == pytest.approx(0.22)
+    assert {"image", "frames", "cover"}.issubset(seedream["capabilities"])
+    assert view["image_routing"]["batch"][0] == "seedream5_lite"
+    assert view["image_routing"]["important"][0] == "codex"
+    assert view["image_routing"]["final"][0] == "codex"
+    assert view["image_routing"]["complex_text"][0] == "codex"
     # 切到 OpenAI 图片 API 优先
     status, _ = _json_request(port, "POST", "/api/settings", {
         "capability": "image",

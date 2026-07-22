@@ -5,6 +5,7 @@
 
   claude_api  script/storyboard —— Anthropic Messages API(默认 claude-opus-4-8)
   image_api   image/frames/cover —— OpenAI 兼容 /v1/images/generations
+  seedream5_lite image/frames/cover —— 火山方舟 Seedream 图片生成
   ark_video   video —— 火山方舟 Ark 内容生成任务(创建 → 轮询 → 下载 mp4)
   doubao_tts  voice —— 豆包(火山引擎)语音合成;仅当视频产线不带配音时使用
 """
@@ -65,6 +66,9 @@ _IMG_MEDIA = {".png": "image/png", ".jpg": "image/jpeg",
 def _local_refs(payload):
     """本地参考图路径：最终立绘优先，其后才是衔接/场景/风格/用户图。"""
     order = []
+    order.extend(
+        ref.get("uri") for ref in (payload.get("identity_references") or [])
+        if isinstance(ref, dict) and ref.get("uri"))
     order.extend(payload.get("character_refs") or [])
     for key in ("chain_first_uri", "scene_ref", "style_ref"):
         val = payload.get(key)
@@ -82,6 +86,47 @@ def _local_refs(payload):
     # 不能为迁就接口静默丢弃人物参考图。若目标端点有数量上限，应明确
     # 报错并回退到能接收全部参考图的 Provider，而不是退化成文字描述。
     return refs
+
+
+def _reference_entries(payload):
+    """按人物身份优先级收集参考图，并保留 Seedream 需要的
+    图序语义。identity_references 的顺序就是 P01/P02/... 的顺序；
+    character_refs 中重复的最终立绘不再二次上传。
+    """
+    entries, seen = [], set()
+
+    def add(uri, label):
+        value = str(uri or "").strip()
+        if not value or value in seen:
+            return
+        seen.add(value)
+        entries.append({"uri": value, "label": label})
+
+    identities = payload.get("identity_references") or []
+    for index, ref in enumerate(identities, 1):
+        if not isinstance(ref, dict) or not ref.get("uri"):
+            continue
+        actor_id = str(ref.get("actor_id") or f"P{index:02d}")
+        character = str(ref.get("character") or "角色")
+        add(ref["uri"], f"{actor_id}/{character}最终立绘")
+    for uri in payload.get("character_refs") or []:
+        add(uri, "人物设定图")
+    for key, label in (
+            ("chain_first_uri", "上一镜尾帧"),
+            ("scene_ref", "场景基准图"),
+            ("style_ref", "风格基准图")):
+        add(payload.get(key), label)
+    for uri in payload.get("reference_images") or []:
+        add(uri, "用户参考图")
+    return entries
+
+
+def _data_image(path):
+    media = _IMG_MEDIA.get(path.suffix.lower())
+    if media is None:
+        raise ProviderError(f"不支持的参考图格式: {path}")
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{media};base64,{encoded}"
 
 
 def _multipart_post(name, url, headers, fields, files, timeout):
@@ -242,6 +287,8 @@ class OpenAIImageProvider(Provider):
 
     DEFAULT_ENDPOINT = "https://api.openai.com"
     DEFAULT_MODEL = "gpt-image-2"
+    QUALITY_MAP = {"lite": "low", "medium": "medium", "high": "high"}
+    HIGH_QUALITY_TASKS = {"final", "complex_text"}
 
     def available(self, capability):
         ok, reason = super().available(capability)
@@ -274,6 +321,36 @@ class OpenAIImageProvider(Provider):
             return "1024x1536"
         return "1024x1024"
 
+    def _quality(self, payload):
+        """返回 (AIFOS 质量档, OpenAI quality)。GPT high 是硬隔离
+        资源：只允许 final/complex_text；batch/important 即使误传
+        high 也钳制为 medium，防止批量或人物候选图误消耗高档。
+        """
+        quality = str(payload.get("image_quality") or "medium")
+        if quality not in self.QUALITY_MAP:
+            allowed = "|".join(self.QUALITY_MAP)
+            raise ProviderError(
+                f"未知 image_quality={quality!r};只允许 {allowed}")
+        task_class = payload.get("image_task_class")
+        if quality == "high" and task_class not in self.HIGH_QUALITY_TASKS:
+            quality = "medium"
+        return quality, self.QUALITY_MAP[quality]
+
+    def _call_cost(self, payload):
+        quality, _api_quality = self._quality(payload)
+        costs = self.conf.get("cost_by_quality") or {}
+        return float(costs.get(quality, self.cost_per_call))
+
+    def _audit_data(self, data, payload, unit_cost):
+        quality, _api_quality = self._quality(payload)
+        return {
+            **data,
+            "model": self.conf.get("model") or self.DEFAULT_MODEL,
+            "image_task_class": payload.get("image_task_class", "legacy"),
+            "image_quality": quality,
+            "unit_cost": unit_cost,
+        }
+
     def _semantic_prompt(self, prompt, payload, refs):
         """API 提示词补齐与 CLI 一致的语义约束;有参考图时点明"以所附
         图片为准",保证同一角色跨图一致。"""
@@ -293,20 +370,23 @@ class OpenAIImageProvider(Provider):
                     or self.DEFAULT_ENDPOINT).rstrip("/")
         timeout = self.conf.get("timeout", 300)
         model = self.conf.get("model") or self.DEFAULT_MODEL
-        refs = _local_refs(payload or {})
-        if (payload or {}).get("require_reference_images") and not refs:
+        payload = payload or {}
+        refs = _local_refs(payload)
+        _quality, api_quality = self._quality(payload)
+        if payload.get("require_reference_images") and not refs:
             raise ProviderError(
                 f"{self.name} 人物出图要求参考图，但没有可上传的本地图片")
-        if (payload or {}).get("require_reference_images"):
-            declared = [Path(uri) for uri in
-                        ((payload or {}).get("character_refs") or [])]
-            missing = [str(path) for path in declared
-                       if not path.exists() or path not in refs]
+        if payload.get("require_reference_images"):
+            declared = _reference_entries(payload)
+            accepted = {str(path) for path in refs}
+            missing = [entry["uri"] for entry in declared
+                       if (not Path(entry["uri"]).exists()
+                           or str(Path(entry["uri"])) not in accepted)]
             if missing:
                 raise ProviderError(
-                    f"{self.name} 未能上传全部人物参考图: "
+                    f"{self.name} 未能上传全部必需参考图: "
                     + "、".join(missing))
-        full_prompt = self._semantic_prompt(prompt, payload or {}, refs)
+        full_prompt = self._semantic_prompt(prompt, payload, refs)
         if refs:
             # 有参考图 → images/edits 多图输入(真正把参考图喂给模型),
             # 与 CLI 用参考图一致
@@ -314,7 +394,7 @@ class OpenAIImageProvider(Provider):
                 self.name, f"{endpoint}/v1/images/edits",
                 headers={"Authorization": f"Bearer {self.conf['api_key']}"},
                 fields={"model": model, "prompt": full_prompt[:32000],
-                        "size": size, "n": "1"},
+                        "size": size, "quality": api_quality, "n": "1"},
                 files=[("image[]", path) for path in refs],
                 timeout=timeout)
         else:
@@ -322,7 +402,7 @@ class OpenAIImageProvider(Provider):
                 self.name, f"{endpoint}/v1/images/generations",
                 headers={"Authorization": f"Bearer {self.conf['api_key']}"},
                 body={"model": model, "prompt": full_prompt[:32000],
-                      "n": 1, "size": size},
+                      "n": 1, "size": size, "quality": api_quality},
                 timeout=timeout)
         item = (reply.get("data") or [{}])[0]
         if item.get("b64_json"):
@@ -336,6 +416,7 @@ class OpenAIImageProvider(Provider):
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         size = self._size(payload)
+        call_cost = self._call_cost(payload)
         prompt = payload.get("prompt", "")
         if payload.get("feedback"):
             prompt = f"{prompt}。修改意见(必须落实):{payload['feedback']}"
@@ -359,8 +440,10 @@ class OpenAIImageProvider(Provider):
                 data = {"shot_no": shot_no}
             self._gen_image(prompt, size, target, payload)
             return ProviderResult(provider=self.name,
-                                  cost=self.cost_per_call,
-                                  data=data, uri=str(target),
+                                  cost=call_cost,
+                                  data=self._audit_data(
+                                      data, payload, call_cost),
+                                  uri=str(target),
                                   model=(self.conf.get("model")
                                          or self.DEFAULT_MODEL))
         if capability == "frames":
@@ -397,10 +480,12 @@ class OpenAIImageProvider(Provider):
                 size, last, {**payload, "chain_first_uri": str(first)})
             calls += 1
             return ProviderResult(
-                provider=self.name, cost=self.cost_per_call * calls,
-                data={"first": str(first), "last": str(last),
-                      "first_source": first_source,
-                      "generation_calls": calls},
+                provider=self.name, cost=call_cost * calls,
+                data=self._audit_data({
+                    "first": str(first), "last": str(last),
+                    "first_source": first_source,
+                    "generation_calls": calls,
+                }, payload, call_cost),
                 uri=str(first), model=(self.conf.get("model")
                                        or self.DEFAULT_MODEL))
         if capability == "cover":
@@ -411,11 +496,137 @@ class OpenAIImageProvider(Provider):
                 f"{payload.get('tagline', '')}。{prompt}", size, target,
                 payload)
             return ProviderResult(provider=self.name,
-                                  cost=self.cost_per_call,
-                                  data={}, uri=str(target),
+                                  cost=call_cost,
+                                  data=self._audit_data(
+                                      {}, payload, call_cost),
+                                  uri=str(target),
                                   model=(self.conf.get("model")
                                          or self.DEFAULT_MODEL))
         raise ProviderError(f"{self.name} 不支持能力: {capability}")
+
+
+class SeedreamImageProvider(OpenAIImageProvider):
+    """火山方舟 Seedream 5.0 Lite 批量出图。
+
+    与 OpenAIImageProvider 共用产物命名/帧链逻辑，但调用 Ark
+    /api/v3/images/generations，参考图以 URL 或 Base64 data URL
+    真实放入 image[]。组图功能始终关闭，保证每次只计费一张。
+    """
+
+    DEFAULT_ENDPOINT = "https://ark.cn-beijing.volces.com"
+    DEFAULT_MODEL = "doubao-seedream-5-0-lite-260128"
+
+    def available(self, capability):
+        ok, reason = Provider.available(self, capability)
+        if not ok:
+            return ok, reason
+        if not self.conf.get("api_key"):
+            return False, "未配置 api_key"
+        if not (self.conf.get("model") or self.DEFAULT_MODEL):
+            return False, "未配置模型 ID"
+        return True, ""
+
+    def _size(self, payload):
+        configured = str(self.conf.get("image_size") or "2K")
+        if configured.upper() != "2K":
+            return configured
+        # 2K 档使用明确像素尺寸，避免只传 "2K" 时画幅被模型猜错。
+        return {
+            "16:9": "2560x1440",
+            "9:16": "1440x2560",
+            "4:3": "2304x1728",
+            "3:4": "1728x2304",
+            "3:2": "2496x1664",
+            "2:3": "1664x2496",
+            "1:1": "2048x2048",
+        }.get(payload.get("aspect", "9:16"), "2048x2048")
+
+    def _audit_data(self, data, payload, unit_cost):
+        return {
+            **data,
+            "model": self.conf.get("model") or self.DEFAULT_MODEL,
+            "image_task_class": payload.get("image_task_class", "legacy"),
+            "image_quality": "lite",
+            "unit_cost": unit_cost,
+        }
+
+    def _seedream_references(self, payload):
+        entries = _reference_entries(payload)
+        if payload.get("require_reference_images") and not entries:
+            raise ProviderError(
+                f"{self.name} 任务要求参考图，但请求未携带图片")
+        max_refs = int(self.conf.get("max_reference_images", 10))
+        if len(entries) > max_refs:
+            raise ProviderError(
+                f"{self.name} 参考图 {len(entries)} 张超过上限 {max_refs};"
+                "禁止丢图后降级生成")
+        max_bytes = int(self.conf.get(
+            "max_reference_bytes", 10 * 1024 * 1024))
+        images = []
+        for entry in entries:
+            uri = entry["uri"]
+            if uri.startswith(("https://", "http://", "data:image/")):
+                images.append(uri)
+                continue
+            path = Path(uri)
+            if not path.exists() or not path.is_file():
+                raise ProviderError(
+                    f"{self.name} 必需参考图不存在: {uri};"
+                    "禁止退化为纯文字生图")
+            if path.suffix.lower() not in _IMG_MEDIA:
+                raise ProviderError(
+                    f"{self.name} 不支持参考图格式: {path.suffix}")
+            if path.stat().st_size > max_bytes:
+                raise ProviderError(
+                    f"{self.name} 参考图超过 {max_bytes} 字节: {uri}")
+            images.append(_data_image(path))
+        return entries, images
+
+    def _seedream_prompt(self, prompt, payload, entries):
+        full_prompt = self._semantic_prompt(prompt, payload, entries)
+        if not entries:
+            return full_prompt
+        mapping = "；".join(
+            f"图{index}={entry['label']}"
+            for index, entry in enumerate(entries, 1))
+        return (
+            f"{full_prompt}\n参考图顺序与身份硬映射:{mapping}。"
+            "必须按该映射识别并保持每位角色身份，不得串角。"
+            "P01/P02 等空间编号、图序、箭头、坐标和标签只用于"
+            "规划与身份映射，最终成片不得画出任何这类编号、箭头或标签。")
+
+    def _gen_image(self, prompt, size, dest, payload=None):
+        payload = payload or {}
+        endpoint = (self.conf.get("endpoint")
+                    or self.DEFAULT_ENDPOINT).rstrip("/")
+        timeout = self.conf.get("timeout", 300)
+        model = self.conf.get("model") or self.DEFAULT_MODEL
+        entries, images = self._seedream_references(payload)
+        body = {
+            "model": model,
+            "prompt": self._seedream_prompt(prompt, payload, entries)[:32000],
+            "size": size,
+            "sequential_image_generation": "disabled",
+            "response_format": "b64_json",
+            "watermark": bool(self.conf.get("watermark", False)),
+        }
+        if images:
+            body["image"] = images
+        reply = _request_json(
+            self.name, f"{endpoint}/api/v3/images/generations",
+            headers={"Authorization": f"Bearer {self.conf['api_key']}"},
+            body=body, timeout=timeout)
+        items = reply.get("data") or []
+        if len(items) != 1:
+            raise ProviderError(
+                f"{self.name} 已强制单图但应答包含 {len(items)} 张图")
+        item = items[0]
+        if item.get("b64_json"):
+            dest.write_bytes(base64.b64decode(item["b64_json"]))
+        elif item.get("url"):
+            _download(self.name, item["url"], dest, timeout)
+        else:
+            raise ProviderError(f"{self.name} 应答缺少 b64_json/url")
 
 
 class DoubaoTtsProvider(Provider):

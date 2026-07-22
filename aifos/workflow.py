@@ -12,7 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .spatial_blocking import build_spatial_plan, validate_spatial_plan
+from .spatial_blocking import (build_character_number_map, build_spatial_plan,
+                               validate_spatial_plan)
 
 
 PIPELINE_VERSION = "sk-manju-v5"
@@ -529,6 +530,12 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
         last_scene = shot["scene_no"]
         normalized.append(shot)
     raw_shots = _append_performance_beats(normalized, script, rules)
+    character_number_map = build_character_number_map(
+        continuity, {"shots": raw_shots})
+    character_by_name = {
+        character["name"]: character
+        for character in character_number_map.values()
+    }
     previous = {}
     shots = []
     elapsed = 0.0
@@ -581,16 +588,26 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
                             or raw.get("description")
                             or scene.get("action", ""))
         people = "、".join(characters) or "无人"
+        shot_character_map = {
+            character_by_name[name]["actor_id"]: copy.deepcopy(
+                character_by_name[name])
+            for name in characters if name in character_by_name
+        }
+        numbered_people = "、".join(
+            f"{item['actor_id']}（{item['role']}·{item['name']}）"
+            for item in shot_character_map.values()) or "无人"
         end_summary = "；".join(
             f"{name}{state['pose']}" for name, state in end_state.items())
         text_rule = ("保持首帧中文字完全一致，不新增文字" if text_asset["required"]
                      else "不生成字幕条或任何画面文字")
         seedance_prompt = (
-            f"使用首帧参考。画面内人物：{people}，共{len(characters)}人，"
+            f"使用首帧参考。人物编号映射（仅用于提示词引用，不生成画面文字）："
+            f"{numbered_people}。画面内人物：{people}，共{len(characters)}人，"
             f"禁止新增或复制人物。{text_rule}。"
             f"动作：{raw.get('description', '')}。"
             f"镜头：{camera['shot_scale']}·{camera['angle']}·{camera['movement']}。"
-            f"结尾：{end_summary}。"
+            f"结尾：{end_summary}。最终画面不得出现P01等人物编号、姓名标签、"
+            "坐标、箭头或空间调度图符号。"
         )
         station = "；".join(
             f"{name}{state['position']}" for name, state in start_state.items())
@@ -635,6 +652,8 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             "timecode": timecode,
             "characters": characters,
             "character_count": len(characters),
+            "character_number_map": shot_character_map,
+            "character_number_ids": list(shot_character_map),
             "type_word": _type_word(scene, raw),
             "shot_function": SHOT_FUNCTIONS.get(kind, "信息交代"),
             "start_state": start_state,
@@ -681,6 +700,11 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
         "profile": copy.deepcopy(profile),
         "standard_fingerprint": profile.get("standard_fingerprint", ""),
         "total_duration": elapsed,
+        "character_number_map": character_number_map,
+        "character_ids_by_name": {
+            character["name"]: actor_id
+            for actor_id, character in character_number_map.items()
+        },
         "shots": shots,
     }
 

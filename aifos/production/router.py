@@ -7,7 +7,8 @@
 
 from ..errors import ProviderError, ProviderUnavailable
 from .api_providers import (ArkVideoProvider, ClaudeApiProvider,
-                            DoubaoTtsProvider, OpenAIImageProvider)
+                            DoubaoTtsProvider, OpenAIImageProvider,
+                            SeedreamImageProvider)
 from .base import ProviderResult  # noqa: F401  (re-export for callers)
 from .dreamina import DreaminaProvider
 from .external import ApiProvider, CliProvider
@@ -20,6 +21,7 @@ PROVIDER_TYPES = {
     "dreamina": DreaminaProvider,
     "claude_api": ClaudeApiProvider,
     "image_api": OpenAIImageProvider,
+    "seedream_image": SeedreamImageProvider,
     "ark_video": ArkVideoProvider,
     "doubao_tts": DoubaoTtsProvider,
     "jianying_draft": JianyingDraftProvider,
@@ -28,6 +30,9 @@ PROVIDER_TYPES = {
 
 
 class ProviderRouter:
+    IMAGE_CAPABILITIES = {"image", "frames", "cover"}
+    IMAGE_TASK_CLASSES = {"batch", "important", "final", "complex_text"}
+
     def __init__(self, config, db, logger):
         self.config = config
         self.db = db
@@ -67,9 +72,38 @@ class ProviderRouter:
         self.db.execute(
             "UPDATE quota SET used = used + 1 WHERE provider=?", (name,))
 
+    def _routing_chain(self, capability, payload):
+        """显式分类的图片任务使用成本分层；未分类的旧请求保持
+        routing.<capability> 原顺序。分层链只调整已知首选，其余
+        自定义 Provider 仍按用户配置作为回退。
+        """
+        base = list(self.config.get(
+            "routing", capability, default=None) or ["mock"])
+        if capability not in self.IMAGE_CAPABILITIES:
+            return base
+        task_class = payload.get("image_task_class")
+        if task_class is None:
+            return base
+        if task_class not in self.IMAGE_TASK_CLASSES:
+            allowed = "|".join(sorted(self.IMAGE_TASK_CLASSES))
+            raise ProviderUnavailable(
+                f"未知 image_task_class={task_class!r};只允许 {allowed}")
+        preferred = list(self.config.get(
+            "image_routing", task_class, default=None) or [])
+        if task_class == "batch":
+            # 普通批量先用两条按张计费 API；两者都未配置/
+            # 失败时，Codex 订阅才作应急真实出图，避免直接落
+            # mock 占位图。通用 api 不进批量链，免得绕过质量档闸。
+            return list(dict.fromkeys(
+                preferred
+                + (["codex"] if "codex" in base else [])
+                + (["mock"] if "mock" in base else [])))
+        # 去重但保持顺序：分层首选 → 旧/用户 routing 回退。
+        return list(dict.fromkeys(preferred + base))
+
     # ---- 调用 ----
     def call(self, capability, payload, out_dir, cancel=None):
-        chain = self.config.get("routing", capability, default=None) or ["mock"]
+        chain = self._routing_chain(capability, payload)
         fallbacks = []
         requires_refs = bool(payload.get("require_reference_images")
                              or payload.get("identity_required"))

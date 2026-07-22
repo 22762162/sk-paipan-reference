@@ -545,6 +545,7 @@ class Director:
                 item["status"] = prev.get("status", "pending")
                 item["error"] = prev.get("error", "")
                 for key in ("provider", "model", "real", "fallbacks",
+                            "image_task_class", "image_quality", "unit_cost",
                             "qc", "started_at", "finished_at", "duration"):
                     if key in prev:
                         item[key] = prev[key]
@@ -593,12 +594,8 @@ class Director:
         except Exception as exc:
             self._plan_mark(ctx, item_id, "failed", error=str(exc)[:300])
             raise
-        extra = None
-        if getattr(result, "provider", None):
-            extra = {"provider": result.provider,
-                     "model": getattr(result, "model", ""),
-                     "real": result.provider != "mock",
-                     "fallbacks": getattr(result, "fallbacks", [])}
+        extra = (self._plan_done_extra(result)
+                 if getattr(result, "provider", None) else None)
         self._plan_mark(ctx, item_id, "done", extra=extra)
         return result
 
@@ -704,9 +701,13 @@ class Director:
                  "real": result.provider != "mock",
                  "fallbacks": getattr(result, "fallbacks", [])}
         data = getattr(result, "data", {}) or {}
-        for key in ("first_source", "generation_calls"):
+        for key in ("first_source", "generation_calls", "model",
+                    "image_task_class", "image_quality", "unit_cost"):
             if key in data:
                 extra[key] = data[key]
+        model = getattr(result, "model", "")
+        if model and "model" not in extra:
+            extra["model"] = model
         qc = getattr(result, "qc", None)
         if qc is not None:
             extra["qc"] = qc
@@ -1210,6 +1211,8 @@ class Director:
                     "payload": {
                         "portrait": True,
                         "portrait_candidate": True,
+                        "image_task_class": "important",
+                        "image_quality": "high",
                         "art_name": f"{name}_candidate_{index:02d}",
                         "role": role, "shot_no": 0,
                         "characters": [name], "location": "",
@@ -1396,6 +1399,8 @@ class Director:
                 "item_id": f"scene:{location}", "capability": "image",
                 "payload": {
                     "scene_art": True, "art_name": location,
+                    "image_task_class": "batch",
+                    "image_quality": "lite",
                     "shot_no": 0, "characters": [], "location": location,
                     "action": scene.get("action", ""),
                     "prompt": self._scene_prompt(location, style),
@@ -1434,6 +1439,8 @@ class Director:
                     "capability": "image",
                     "payload": {
                         "character_sheet": key, "sheet_label": label,
+                        "image_task_class": "important",
+                        "image_quality": "high",
                         "art_name": name, "role": role,
                         "shot_no": 0, "characters": [name], "location": "",
                         "prompt": self._sheet_prompt(
@@ -1563,7 +1570,9 @@ class Director:
                    or production_profile(
                        self.config, ctx.get("production_standard")))
         spatial = shot_blocking(ctx.get("blocking"), shot["shot_no"])
-        return {
+        readable_text = shot.get("readable_text", {}) or {}
+        text_required = bool(readable_text.get("required"))
+        payload = {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
             "prompt": self._rich_shot_prompt(ctx, shot, location),
@@ -1578,7 +1587,12 @@ class Director:
             "start_state": shot.get("start_state", {}),
             "end_state": shot.get("end_state", {}),
             "five_dimensions": shot.get("five_dimensions", {}),
-            "readable_text": shot.get("readable_text", {}),
+            "readable_text": readable_text,
+            # 批量关键帧优先走低成本 Seedream 5.0 Lite / GPT Image 2
+            # medium；只有复杂文字镜头才允许进入高档图片链。
+            "image_task_class": ("complex_text" if text_required
+                                 else "batch"),
+            "image_quality": "high" if text_required else "medium",
             "performance": shot.get("performance", {}),
             "shot_contract": shot.get("shot_contract", {}),
             "sound_design": shot.get("sound_design", {}),
@@ -1590,6 +1604,25 @@ class Director:
             "aspect": ctx["aspect"], **ctx["dims"],
             **self._art_refs(ctx, shot["characters"], location),
         }
+        actor_ids = {
+            actor.get("name"): actor.get("actor_id")
+            for actor in (spatial or {}).get("actors", [])
+            if actor.get("name") and actor.get("actor_id")
+        }
+        mapped_refs = []
+        for reference in payload.get("identity_references", []):
+            mapped = dict(reference)
+            if actor_ids.get(mapped.get("character")):
+                mapped["actor_id"] = actor_ids[mapped["character"]]
+            mapped_refs.append(mapped)
+        payload["identity_references"] = mapped_refs
+        payload["character_reference_map"] = [{
+            "actor_id": actor_ids.get(name, ""),
+            "character": name,
+            "uri": next((ref.get("uri") for ref in mapped_refs
+                         if ref.get("character") == name), ""),
+        } for name in shot.get("characters", [])]
+        return payload
 
     def _stage_images(self, ctx):
         self._plan_seed_shots(ctx)
@@ -2016,8 +2049,15 @@ class Director:
         if existing_cover:
             ctx["cover_uri"] = existing_cover
         else:
+            cover_characters = [c.get("name") for c in
+                                ctx["script"].get("characters", [])
+                                if c.get("name")]
+            identity_refs = self._identity_references(
+                ctx["project"]["id"], cover_characters,
+                required=bool(cover_characters))
             cover = self.ops.make_cover(
-                ctx["script"], ctx["out_root"] / "ops", aspect=ctx["aspect"])
+                ctx["script"], ctx["out_root"] / "ops", aspect=ctx["aspect"],
+                identity_references=identity_refs)
             self._task_cost += cover.cost
             self._task_providers.add(cover.provider)
             self.projects.add_episode_cost(ctx["episode"]["id"], cover.cost)
@@ -2185,22 +2225,24 @@ class Director:
                 design=self._character_design(project["id"], name))
             result = self._plan_run(
                 ctx, f"sheet:{name}:{sheet_key}", lambda: self._call(
-                    ctx, "image", {
-                        "character_sheet": sheet_key, "sheet_label": label,
-                        "art_name": name, "role": role,
-                        "shot_no": 0, "characters": [name], "location": "",
-                        "prompt": prompt, "style": style,
-                        "feedback": feedback,
-                        "revision": next_revision("character_sheet", raw),
-                        "character_refs": (
-                            [portrait_uri] if portrait_uri else []),
-                        "identity_references": self._identity_references(
-                            project["id"], [name]),
-                        "require_reference_images": True,
-                        "reference_images": self._reference_uris(
-                            project["id"], [name]),
-                        "style_ref": self._style_anchor_uri(project["id"]),
-                        "aspect": aspect, **ctx["dims"],
+                ctx, "image", {
+                    "character_sheet": sheet_key, "sheet_label": label,
+                    "image_task_class": "important",
+                    "image_quality": "high",
+                    "art_name": name, "role": role,
+                    "shot_no": 0, "characters": [name], "location": "",
+                    "prompt": prompt, "style": style,
+                    "feedback": feedback,
+                    "revision": next_revision("character_sheet", raw),
+                    "character_refs": (
+                        [portrait_uri] if portrait_uri else []),
+                    "identity_references": self._identity_references(
+                        project["id"], [name]),
+                    "require_reference_images": True,
+                    "reference_images": self._reference_uris(
+                        project["id"], [name]),
+                    "style_ref": self._style_anchor_uri(project["id"]),
+                    "aspect": aspect, **ctx["dims"],
                     }, "cast"), prompt=prompt)
             self.assets.register(
                 project["id"], "character_sheet", raw, uri=result.uri,
@@ -2214,6 +2256,8 @@ class Director:
             result = self._plan_run(ctx, f"scene:{name}", lambda: self._call(
                 ctx, "image", {
                     "scene_art": True, "art_name": name,
+                    "image_task_class": "batch",
+                    "image_quality": "lite",
                     "shot_no": 0, "characters": [], "location": name,
                     "action": scene.get("action", ""),
                     "prompt": prompt,

@@ -22,6 +22,7 @@ PROVIDER_CN = {
     "claude_api": "Claude API · 编剧",
     "codex": "Codex CLI · 出图",
     "image_api": "出图 API · OpenAI 兼容",
+    "seedream5_lite": "Seedream 5.0 Lite · 批量出图",
     "jimeng": "即梦 CLI · 视频(自带配音)",
     "ark": "火山方舟 API · 视频(Seedance2,自带配音)",
     "doubao_tts": "豆包 TTS · 配音备选",
@@ -34,6 +35,7 @@ PROVIDER_CN = {
 MODE_CN = {
     "cli": "CLI", "dreamina": "CLI",
     "api": "API", "claude_api": "API", "image_api": "API",
+    "seedream_image": "API",
     "ark_video": "API", "doubao_tts": "API",
     "jianying_draft": "本机", "mock": "内置",
 }
@@ -95,6 +97,7 @@ def settings_payload(app):
     return {
         "providers": providers,
         "routing": app.config.get("routing") or {},
+        "image_routing": app.config.get("image_routing") or {},
         "capabilities": CAPABILITY_CN,
         "defaults": {
             "parallel_images": app.config.get(
