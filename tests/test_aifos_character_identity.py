@@ -6,6 +6,7 @@ import pytest
 
 from aifos.app import App
 from aifos.adapters.codex_image import _ref_line, _style_line
+from aifos.director import character_candidate_target
 from aifos.errors import AifosError, ProviderUnavailable
 from aifos.production.base import ProviderResult
 
@@ -32,21 +33,24 @@ def _to_cast_selection(app, title="人物定版测试"):
 
 def _lock_all(app, title, script, index=3):
     for character in script["characters"]:
+        chosen = min(index, character_candidate_target(character))
         app.director.select_character_candidate(
-            title, 1, character["name"], index)
+            title, 1, character["name"], chosen)
 
 
-def test_five_candidates_pause_before_downstream_images(app):
+def test_role_based_candidates_pause_before_downstream_images(app):
     project, episode, script = _to_cast_selection(app)
     status = app.director.character_selection_status(
         project["id"], script["characters"])
     assert status["candidate_target"] == 5
     assert status["locked"] == 0
-    assert all(item["candidate_count"] == 5
+    assert all(item["candidate_count"] == character_candidate_target(
+        next(c for c in script["characters"] if c["name"] == item["character"]))
                for item in status["characters"])
     for character in status["characters"]:
-        assert len({item["variant_id"] for item in character["candidates"]}) == 5
-        assert len({item["variant_label"] for item in character["candidates"]}) == 5
+        target = character["candidate_target"]
+        assert len({item["variant_id"] for item in character["candidates"]}) == target
+        assert len({item["variant_label"] for item in character["candidates"]}) == target
         assert all(item["variant_source"] == "generated"
                    for item in character["candidates"])
         assert all(set(item["look_variant"]) == {
@@ -79,10 +83,22 @@ def test_candidate_prompts_create_real_look_variants_without_locking_style(app):
     assert len({item["variant_id"] for item in variants}) == 5
     assert len({tuple(item["look_variant"].values()) for item in variants}) == 5
     assert all("不是同一套衣服只换动作" in prompt for prompt in prompts)
-    assert all("不要复制参考图的发型、妆容、服装" in prompt
+    assert all("人物立绘必须是纯净、无文字的单人物资产背景" in prompt
                for prompt in prompts)
-    assert all("禁止换发型" not in prompt for prompt in prompts)
+    assert all("无参考图时" in prompt for prompt in prompts)
     assert "齐肩内扣短发" in prompts[0]
+
+
+def test_reference_portrait_locks_face_and_hair_and_workwear(app):
+    design = {"appearance": "鹅蛋脸", "hair": "齐肩短发", "costume": "外卖制服"}
+    variant = app.director._candidate_variant(1, design)
+    prompt = app.director._candidate_portrait_prompt(
+        "外卖小哥", "非重要配角", "现代半写实", design, variant,
+        has_reference=True)
+    assert "人物脸和发型是最高标准" in prompt
+    assert "严格保持参考图发型轮廓" in prompt
+    assert "外卖小哥" in prompt and "工作服/制服" in prompt
+    assert "纯净、无文字的单人物资产背景" in prompt
 
 
 def test_candidate_reference_semantics_lock_face_but_release_look():
@@ -92,9 +108,9 @@ def test_candidate_reference_semantics_lock_face_but_release_look():
         "reference_images": ["/tmp/identity.png"],
     }
     ref_line = _ref_line(payload)
-    assert "参考图只锁定脸型" in ref_line
-    assert "发型轮廓、妆容或面部修饰、服装" in ref_line
-    assert "禁止换发型" not in ref_line
+    assert "脸和发型是最高标准" in ref_line
+    assert "不得改脸或改发型" in ref_line
+    assert "妆容、服装、配色、姿态可按本候选造型方向设计" in ref_line
     style_line = _style_line(payload)
     assert "不得用同一造型只换动作" in style_line
     normal = _ref_line({"reference_images": ["/tmp/identity.png"]})

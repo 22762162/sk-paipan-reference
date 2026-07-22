@@ -20,7 +20,7 @@ def test_cli_init_and_produce(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 0
     assert "制作人物待选" in out
-    assert "5张候选立绘" in out
+    assert "主角5张" in out
     app = App(ws)
     try:
         project = app.projects.get_project("万妖图录")

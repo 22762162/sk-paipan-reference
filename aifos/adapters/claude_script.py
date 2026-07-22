@@ -29,7 +29,7 @@ SCRIPT_PROMPT = """你是漫剧编剧。为作品《{title}》第{episode}集创
 JSON 格式(字段必须齐全):
 {{"project_title": "{title}", "episode_number": {episode},
  "episode_title": "本集小标题", "logline": "一句话梗概",
- "characters": [{{"name": "角色名", "role": "主角/同伴/反派"}}],
+ "characters": [{{"name": "角色名", "role": "主角/重要配角/非重要配角/背景路人"}}],
  "scenes": [{{"scene_no": 1, "location": "地点",
    "characters": ["出场角色名"], "action": "本场动作描述",
    "lines": [{{"character": "角色名", "dialogue": "台词"}}]}}]}}"""
@@ -154,8 +154,14 @@ DESIGN_PROMPT = """你是漫剧人物设定师。为作品《{title}》的角色
 {references}
 要求:
 - 每个字段是一段具体、可画出来的描述(不要空话套话);
+- 给每个角色标注重要度角色:主角、重要配角、非重要配角或背景路人;背景路人不单独生成角色立绘;
 - 性格要能从表情神态与站姿体现;外貌含脸型/肤色/身材比例;
 - 服装要具体到款式、材质、层次;配色给出主色与点缀色;
+- 如果角色有职业或工作身份(如外卖小哥、快递员、医生、护士、警察、消防员、
+  保安、服务员、厨师、工人等),costume 必须写清该职业真实可辨认的工作服/制服
+  和必要装备,禁止用普通便服代替;
+- 有参考图时,参考图人物的脸和发型是最高标准;appearance/hair/eyes/makeup/
+  signature/temperament 必须先看图再写,不得凭空换脸或换发型;
 - 只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块。
 
 JSON 格式:
@@ -276,7 +282,7 @@ def build_prompt(capability, payload):
                 "(脸型/五官比例/眼鼻嘴/年龄感)、发型发色、妆容、气质和"
                 "整体风格为最高标准逐项撰写 appearance/hair/eyes/makeup/"
                 "signature/temperament 等字段,与参考图冲突的描述一律"
-                "以参考图为准,不得凭空想象;服装可按剧情另行设计。\n")
+                "以参考图为准,不得凭空想象;脸和发型不得漂移;服装可按剧情另行设计。\n")
         return DESIGN_PROMPT.format(
             title=payload.get("project_title", ""),
             style=payload.get("style", "") or "国风漫剧",

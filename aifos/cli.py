@@ -12,6 +12,7 @@ import sys
 
 from . import __version__
 from .app import App
+from .director import character_candidate_policy_text
 from .errors import AifosError
 
 PRODUCE_PATTERN = re.compile(r"《(?P<title>.+?)》\s*第\s*(?P<number>\d+)\s*集")
@@ -276,7 +277,8 @@ def _cmd_produce(app, args):
         print(f"  python3 -m aifos confirm --project {title} --episode {number}")
         return 0
     if summary["status"] == "awaiting_cast":
-        print("\n每名角色的5张候选立绘已生成。请在 AIFOS 网页中逐个选定最终形象。")
+        print(f"\n按角色重要度生成候选立绘：{character_candidate_policy_text()}。"
+              "请在 AIFOS 网页中逐个选定最终形象。")
         print("全部锁定后再运行 confirm；未锁定前不会生成任何后续图片。")
         return 0
     if summary["status"] == "awaiting_confirm":
@@ -349,7 +351,7 @@ def _cmd_confirm(app, args):
         "SELECT * FROM episodes WHERE project_id=? AND number=?",
         (project["id"], args.episode))
     if episode is not None and episode["status"] == "awaiting_script":
-        # 第一道确认:剧本 OK → 每名人物生成5张候选，再停下来人工定角。
+        # 第一道确认:剧本 OK → 按角色重要度生成候选，再停下来人工定角。
         print(f"剧本已确认,开始画《{args.project}》第{args.episode}集"
               "的人物候选立绘 …")
         summary = app.director.produce(
@@ -363,7 +365,7 @@ def _cmd_confirm(app, args):
             project["id"], (script_doc or {}).get("characters", []))
         if not selection["passed"]:
             pending = "、".join(selection.get("pending", [])) or "未锁定人物"
-            print(f"人物尚未全部选定: {pending}。请先在 AIFOS 网页完成五选一。",
+            print(f"人物尚未全部选定: {pending}。请先在 AIFOS 网页按候选数量逐一选定。",
                   file=sys.stderr)
             return 1
         print(f"人物已锁定,开始画《{args.project}》第{args.episode}集"
@@ -403,7 +405,7 @@ def _cmd_batch(app, args):
         cost_s = "-" if cost is None else f"{cost:.2f}"
         print(f"{number:<6}{_status_cn(status):<12}{score_s:<8}{cost_s:<8}")
     # 批量命令也必须尊重人工定角门禁：候选立绘生成完成即算本轮成功，
-    # 待用户在网页完成五选一后再继续，不得自动猜选人物。
+    # 待用户在网页完成逐角色定版后再继续，不得自动猜选人物。
     successful = {"done", "awaiting_script", "awaiting_cast",
                   "awaiting_confirm"}
     return 0 if all(r[1] in successful for r in rows) else 1

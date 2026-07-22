@@ -260,7 +260,7 @@ def test_regen_image_prompt_override(app):
     plan = _plan_of(app, "万妖图录", 1)
     name = next(i["name"] for i in plan["items"]
                 if i["category"] == "character_candidate")
-    with pytest.raises(AifosError, match="5张.*候选"):
+    with pytest.raises(AifosError, match="最终立绘不能从文字直接重画"):
         app.director.regen_image(
             "万妖图录", 1, {"kind": "character_art", "name": name})
     shot = next(i for i in plan["items"] if i["category"] == "shot_image")

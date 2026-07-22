@@ -19,6 +19,9 @@ import uuid
 from pathlib import Path
 
 from ..adapters.codex_image import SUBJECT_DIRECTIVE as _SUBJECT_DIRECTIVE
+from ..adapters.codex_image import (
+    CHARACTER_BACKGROUND_DIRECTIVE as _CHARACTER_BACKGROUND_DIRECTIVE,
+)
 from ..adapters.codex_image import _style_line as _api_style_line
 from ..adapters.codex_image import _space_line as _api_space_line
 from ..adapters.claude_script import (build_prompt, extract_json,
@@ -431,13 +434,16 @@ class OpenAIImageProvider(Provider):
         parts = [prompt, _api_style_line(payload),
                  _api_space_line(payload),
                  _SUBJECT_DIRECTIVE]
+        if (payload.get("portrait") or payload.get("portrait_candidate")
+                or payload.get("character_sheet")):
+            parts.append(_CHARACTER_BACKGROUND_DIRECTIVE)
         if refs:
             if payload.get("portrait_candidate"):
                 parts.append(
-                    "已随请求真实上传定角参考图。参考图只锁定脸型、五官比例、"
-                    "眼鼻嘴结构、肤色、年龄感、发际线和稳定身份特征，必须保持"
-                    "同一个人；发型、妆容或面部修饰、服装、配色和姿态必须服从"
-                    "本候选的独立造型方向，不得复制参考图造型。")
+                    "已随请求真实上传定角参考图。参考图人物的脸和发型是最高标准；"
+                    "脸型、五官比例、眼鼻嘴结构、肤色、年龄感、发际线、发型轮廓、"
+                    "发色和稳定身份特征必须保持同一个人，不得改脸或改发型；妆容、"
+                    "服装、配色和姿态可服从本候选的独立造型方向。")
             else:
                 parts.append(
                     "已随请求真实上传参考图(人物镜头第一组为人工锁定最终立绘,"

@@ -39,6 +39,12 @@ SUBJECT_DIRECTIVE = (
     "物体;同一角色在所有画面中形态必须一致。除剧情明确需要的道具外,"
     "不要出现无关杂物(如悬挂的衣物、衣架、多余的人形)。")
 
+CHARACTER_BACKGROUND_DIRECTIVE = (
+    "人物立绘/人物设定图必须使用纯净无场景背景，只允许纯色、柔和渐变或"
+    "干净棚拍底；禁止文字、字幕、Logo、水印、建筑、室内、街道、自然场景、"
+    "道具和其他人物。若角色有职业身份，必须穿真实可辨认的工作服或制服，"
+    "不得用普通便服代替。")
+
 GEN_DIRECTIVE = (
     "收到任务后第一步立即调用内置 $imagegen 图像生成能力，不要搜索资料、"
     "解释方案或编写绘图代码。你必须真实生成图片;禁止用 Pillow / "
@@ -60,8 +66,9 @@ def _style_line(payload):
         "现代都市精品漫剧，电影级半写实人物与场景，现代服装和现代建筑")
     if payload.get("portrait_candidate"):
         return (f"画风要求:{style}；高细节；严格按该媒介和时代执行；"
-                "五张定角候选必须保持同一项目画风，但服装、发型、妆容或面部"
-                "修饰和外显气质要按各自造型方向明显不同；不得用同一造型只换动作。")
+                "定角候选必须保持同一项目画风；无参考图时服装、妆容或面部修饰"
+                "和外显气质按各自造型方向明显不同，有参考图时脸和发型不得改变；"
+                "不得用同一造型只换动作。")
     return (f"画风要求:{style}；高细节；严格按该媒介、时代和服装要求执行；"
             "整部作品所有画面保持同一画风、同一人物造型。")
 
@@ -88,10 +95,10 @@ def _ref_line(payload):
     if refs:
         if payload.get("portrait_candidate"):
             lines.append(
-                "定角候选参考图(必须真实打开读取，不得只使用文字描述；参考图只锁定"
-                "脸型、五官比例、眼鼻嘴结构、肤色、年龄感、发际线和稳定身份特征，"
-                "保持同一个人；发型轮廓、妆容或面部修饰、服装、配色、姿态必须按"
-                "本候选造型方向重新设计，不得复制参考图造型):"
+                "定角候选参考图(必须真实打开读取，不得只使用文字描述；参考图人物的"
+                "脸和发型是最高标准，脸型、五官比例、眼鼻嘴结构、肤色、年龄感、"
+                "发际线、发型轮廓、发色和稳定身份特征必须保持同一个人；妆容、"
+                "服装、配色、姿态可按本候选造型方向设计，但不得改脸或改发型):"
                 + ";".join(refs) + "。")
         else:
             lines.append("参考图(必须真实打开读取，不得只使用文字描述；人物身份以"
@@ -127,7 +134,7 @@ def build_instruction(capability, payload, out_dir):
             instruction = (
                 f"为角色生成立绘并保存到 {target}(PNG,{size})。"
                 f"{payload.get('prompt', '')}。{purpose}。"
-                f"{_ref_line(payload)}{common}"
+                f"{CHARACTER_BACKGROUND_DIRECTIVE}{_ref_line(payload)}{common}"
                 "只产出该文件。")
             return instruction, [target], {"name": payload.get("art_name")}
         if payload.get("character_sheet"):
@@ -137,7 +144,8 @@ def build_instruction(capability, payload, out_dir):
                 f"为角色生成{payload.get('sheet_label', key)}设定资产并保存到"
                 f" {target}(PNG,{size})。{payload.get('prompt', '')}。"
                 "这是人物资产库的生产级设定图,必须与立绘/参考图为同一人物,"
-                f"发型服装配色完全一致。{_ref_line(payload)}{common}"
+                f"发型服装配色完全一致。{CHARACTER_BACKGROUND_DIRECTIVE}"
+                f"{_ref_line(payload)}{common}"
                 "只产出该文件。")
             return instruction, [target], {
                 "name": payload.get("art_name"), "sheet": key}

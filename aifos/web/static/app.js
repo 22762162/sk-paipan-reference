@@ -2177,7 +2177,7 @@ function bindRegen(container, episodeId, getData, onDone) {
 /* ================= 图片生产清单 =================
    每张要生成的图:分类/名称/提示词/实时状态;可单张改提示词重画 */
 const PLAN_CAT_CN = {
-  character_candidate: "人物定妆候选(每人5张)",
+  character_candidate: "人物定妆候选(按角色重要度)",
   character_art: "人物立绘",
   character_sheet: "人物资产套件(四视图/特写/特征/妆容/服装)",
   scene_art: "场景概念图",
@@ -3785,7 +3785,7 @@ function renderProgressBanner(data) {
     </div>`).join("") + awaitingCast.map((e) => `
     <div class="progress-card confirm">
       <div class="progress-text">《${esc(e.project)}》第${e.number}集 人物候选已就绪 👤
-        <span>每名角色从5张候选中选定1张；全部定版后才生成后续图片</span></div>
+        <span>候选数量按角色重要度分配（主角5张、重要配角3张、非重要配角1张，非主要角色不超过3张；背景路人不单独生成立绘）；全部定版后才生成后续图片</span></div>
       <button class="primary" onclick="location.hash='#/episode/${e.id}'">去选人物 →</button>
     </div>`).join("") + awaiting.map((e) => `
     <div class="progress-card confirm">
@@ -3956,15 +3956,18 @@ function castLookHtml(candidate) {
 function renderCastSelection(data, episodeId) {
   const selection = data.cast_selection || {};
   const characters = selection.characters || [];
+  const policy = selection.candidate_policy
+    || "主角5张；重要配角3张；非重要配角1张（非主要角色不超过3张）；背景路人不单独生成立绘";
   app.innerHTML = `<div class="canvas-view cast-select-view">
     <div class="confirm-banner">
       <div><b>先定人物，再生产后续图片 👤</b>
-        <span>每名角色有 ${selection.candidate_target || 5} 套独立造型候选，不再只是换动作；
+        <span>${esc(policy)}；有参考图时人物脸和发型是最高标准，职业角色必须穿工作服；人物候选统一使用纯背景，不得出现文字或场景。
+        每名角色按重要度生成独立造型候选，不再只是换动作；
         请比较服装、发型、妆容和气质后各选1张作为最终立绘。
         后续四视图、关键帧、首尾帧和其他图片 API 都会真实携带这张参考图，
         视觉质检也会将成图与它逐人比对。</span></div>
       <div class="cast-actions">
-        <button id="cast-regenerate" title="保留旧图并按五套独立造型重新生成">↻ 按5套新造型重生成</button>
+        <button id="cast-regenerate" title="保留旧图并按角色重要度重新生成">↻ 按角色重要度重生成</button>
         <button class="primary" id="cast-continue" ${selection.passed ? "" : "disabled"}>
           ${selection.passed ? "✅ 全部定版，继续预生产" : `已定版 ${selection.locked || 0}/${selection.total || characters.length}`}
         </button>
@@ -3980,9 +3983,9 @@ function renderCastSelection(data, episodeId) {
     <div class="cast-selection-list">${characters.map((character) => `
       <section class="cast-choice panel">
         <div class="cast-choice-head"><div><h2>${esc(character.character)}</h2>
-          <span class="dim">${esc(character.role || "角色")} · ${character.candidate_count || 0}/${selection.candidate_target || 5} 张候选</span></div>
-          <strong class="${character.locked ? "cast-locked" : "cast-unlocked"}">
-            ${character.locked ? "✓ 已锁定最终立绘" : "请选择1张"}</strong></div>
+          <span class="dim">${esc(character.role || "角色")} · ${character.candidate_count || 0}/${character.candidate_target || selection.candidate_target || 5} 张候选</span></div>
+          <strong class="${character.candidate_target === 0 ? "cast-locked" : (character.locked ? "cast-locked" : "cast-unlocked")}">
+            ${character.candidate_target === 0 ? "无需单独立绘" : (character.locked ? "✓ 已锁定最终立绘" : "请选择1张")}</strong></div>
         <div class="cast-candidate-grid" role="list" aria-label="${esc(character.character)}的造型候选">${(character.candidates || []).map((candidate) => {
           const variant = candidate.variant_source === "legacy" || !candidate.variant_label
             ? "历史候选" : candidate.variant_label;
@@ -4019,7 +4022,7 @@ function renderCastSelection(data, episodeId) {
       } catch (e) {
         showToast(e.message, "error");
         ev.currentTarget.disabled = false;
-        ev.currentTarget.textContent = "↻ 按5套新造型重生成";
+        ev.currentTarget.textContent = "↻ 按角色重要度重生成";
       }
     });
   app.querySelectorAll(".cast-image").forEach((button) => {

@@ -28,10 +28,10 @@ def test_candidate_api_prompt_locks_face_but_releases_look():
     provider = OpenAIImageProvider("image_api", {"enabled": True})
     payload = {"portrait_candidate": True, "style": "现代都市半写实"}
     prompt = provider._semantic_prompt("五套造型候选", payload, [object()])
-    assert "只锁定脸型" in prompt
-    assert "发型、妆容或面部修饰、服装" in prompt
+    assert "脸和发型是最高标准" in prompt
+    assert "不得改脸或改发型" in prompt
+    assert "纯净无场景背景" in prompt
     assert "不得用同一造型只换动作" in prompt
-    assert "禁止脸和发型漂移" not in prompt
 
 SCRIPT_JSON = {
     "project_title": "万妖图录", "episode_number": 15,
