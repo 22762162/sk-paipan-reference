@@ -13,11 +13,21 @@ class OpsCenter:
         "16:9": {"width": 1920, "height": 1080},
     }
 
-    def make_cover(self, script, out_dir, aspect="9:16"):
+    def make_cover(self, script, out_dir, aspect="9:16",
+                   identity_references=None):
+        identity_references = list(identity_references or [])
         payload = {
             "title": script["project_title"],
             "episode": script["episode_number"],
             "tagline": script.get("logline", ""),
+            "image_task_class": "final",
+            "image_quality": "high",
+            "characters": [ref.get("character") for ref in
+                           identity_references if ref.get("character")],
+            "character_refs": [ref.get("uri") for ref in
+                               identity_references if ref.get("uri")],
+            "identity_references": identity_references,
+            "require_reference_images": bool(identity_references),
             "aspect": aspect,
             **self.COVER_DIMS.get(aspect, self.COVER_DIMS["9:16"]),
         }

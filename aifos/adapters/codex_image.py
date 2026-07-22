@@ -253,7 +253,9 @@ def build_instruction(capability, payload, out_dir):
             f"为账号内容生成封面并保存到 {target}(PNG,{size})。"
             f"作品《{payload.get('title', '')}》第{payload.get('episode', 0)}集,"
             f"主题:{payload.get('tagline', '')}。构图吸睛、适合短视频封面,"
-            f"可留出大标题排版空间。{common}只产出该文件。")
+            f"可留出大标题排版空间。封面若出现人物，只允许出现并严格对应:"
+            f"{'、'.join(payload.get('characters', [])) or '无人'}。"
+            f"{_ref_line(payload)}{common}只产出该文件。")
         return instruction, [target], {}
     raise ValueError(f"codex 适配桥不支持能力: {capability}")
 

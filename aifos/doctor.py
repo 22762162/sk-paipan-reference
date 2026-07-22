@@ -108,10 +108,11 @@ _HINTS = {
     "script": "接 Claude:aifos config detect --apply(有 CLI)或 "
               "aifos config set --provider claude_api --enable --api-key …",
     "storyboard": "同「剧本」:接 Claude CLI 或 claude_api",
-    "image": "接 Codex CLI(detect)或出图 API:aifos config set "
-             "--provider image_api --enable --api-key …",
-    "frames": "同「图片」:接 Codex CLI 或 image_api",
-    "cover": "同「图片」:接 Codex CLI 或 image_api",
+    "image": "批量图优先接 Seedream 5.0 Lite:aifos config set "
+             "--provider seedream5_lite --enable --api-key …;"
+             "或接 Codex CLI(detect) / image_api",
+    "frames": "同「图片」:Seedream 5.0 Lite / image_api / Codex",
+    "cover": "终稿封面优先 Codex，备用 image_api high",
     "video": "接即梦 CLI(detect)或火山方舟:aifos config set "
              "--provider ark --enable --api-key …",
     "voice": "接好即梦/Ark 后配音随视频自动生成(有声视频);"

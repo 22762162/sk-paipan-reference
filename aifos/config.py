@@ -89,13 +89,33 @@ DEFAULTS = {
             "cost_per_call": 0.8, "timeout": 600,
         },
         "image_api": {
-            # OpenAI 兼容出图 API:Codex 出图的 API 模式
+            # GPT Image 2 高质量备用。普通批量只用 medium,
+            # high 留给终稿/复杂文字等已明确分类的任务。
             "type": "image_api", "enabled": False,
             "capabilities": ["image", "frames", "cover", "image_qc"],
             "endpoint": "https://api.openai.com", "api_key": "",
             "model": "gpt-image-2",
             "reference_images": True,
-            "cost_per_call": 1.5, "timeout": 300,
+            "cost_per_call": 0.28,
+            "cost_by_quality": {
+                "lite": 0.07, "medium": 0.28, "high": 1.12,
+            },
+            "timeout": 300,
+        },
+        "seedream5_lite": {
+            # 火山方舟 Seedream 5.0 Lite:普通批量图的低成本首选。
+            # image 参数真实上传单/多张参考图；强制单图模式，
+            # 防止提示词触发组图导致隐性成本。
+            "type": "seedream_image", "enabled": False,
+            "capabilities": ["image", "frames", "cover"],
+            "endpoint": "https://ark.cn-beijing.volces.com",
+            "api_key": "",
+            "model": "doubao-seedream-5-0-lite-260128",
+            "reference_images": True,
+            "image_size": "2K",
+            "watermark": False,
+            "max_reference_images": 10,
+            "cost_per_call": 0.22, "timeout": 300,
         },
         "ark": {
             # 火山方舟 Ark 视频 API:Seedance2 的 API 模式(即梦 CLI 备用)
@@ -146,6 +166,14 @@ DEFAULTS = {
         "voice": ["doubao_tts", "api", "mock"],
         "edit": ["jianying", "mock"],
         "cover": ["codex", "image_api", "mock"],
+    },
+    # 图片任务的动态成本路由。只当 payload 显式携带
+    # image_task_class 时生效；旧工作区/自定义 routing 仍保留为后续回退链。
+    "image_routing": {
+        "batch": ["seedream5_lite", "image_api"],
+        "important": ["codex", "image_api"],
+        "final": ["codex", "image_api"],
+        "complex_text": ["codex", "image_api"],
     },
 }
 

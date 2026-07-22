@@ -1157,6 +1157,46 @@ const CAP_LABEL = {
   video: "视频", voice: "配音", edit: "剪辑", cover: "封面",
 };
 
+const IMAGE_COST_GUIDE = [
+  { kind: "subscription", name: "Codex 订阅", price: "订阅内",
+    use: "重要高清图优先", note: "不增加图片 API 账单" },
+  { kind: "batch", name: "Seedream 5.0 Lite", price: "¥0.22/张",
+    use: "批量优先", note: "分镜关键帧、场景批量稿" },
+  { kind: "standard", name: "GPT Image 2 medium", price: "约 ¥0.28/张",
+    use: "常规精修", note: "质量与成本平衡" },
+  { kind: "expensive", name: "GPT Image 2 high", price: "高成本",
+    use: "仅终稿/复杂文字", note: "不要用于批量候选" },
+];
+
+function imageCostGuideHtml(compact = false) {
+  return `<section class="image-cost-guide${compact ? " compact" : ""}"
+    aria-label="图片模型成本与推荐用途">
+    <div class="image-cost-guide-head"><b>图片成本护栏</b>
+      <span>先按用途选，避免把 high 用在整批候选图</span></div>
+    <div class="image-cost-options">${IMAGE_COST_GUIDE.map((item) => `
+      <div class="image-cost-option ${item.kind}">
+        <strong>${esc(item.name)}</strong><b>${esc(item.price)}</b>
+        <span>${esc(item.use)}</span><small>${esc(item.note)}</small>
+      </div>`).join("")}</div>
+    <div class="image-cost-rule"><b>默认分流</b>
+      <span>批量 → Seedream 5.0 Lite</span>
+      <span>重要高清 / 终稿 / 复杂文字 → Codex 订阅优先</span>
+      <span class="danger">GPT Image 2 high 不进入批量路线</span>
+    </div>
+  </section>`;
+}
+
+function providerCostHint(provider) {
+  const id = `${provider.name || ""} ${provider.type || ""} ${provider.model || ""}`.toLowerCase();
+  if (id.includes("seedream"))
+    return `<div class="pc-cost batch"><b>¥0.22/张</b> · Seedream 5.0 Lite 批量优先</div>`;
+  if (provider.name === "codex")
+    return `<div class="pc-cost subscription"><b>Codex 订阅内</b> · 重要高清图优先</div>`;
+  if (provider.name === "image_api" || id.includes("gpt-image-2"))
+    return `<div class="pc-cost standard"><b>medium 约 ¥0.28/张</b> · high 高成本，仅终稿/复杂文字</div>`;
+  return "";
+}
+
 async function renderSettings() {
   topbarRight.innerHTML = "";
   let data;
@@ -1175,6 +1215,7 @@ function drawSettings(data) {
         title="扫描本机的 claude / codex / dreamina / 剪映 CLI,找到即自动填好并启用">🔍 自动检测本机 CLI</button>
       <span class="hint">CLI 点「自动检测」,API 只要粘贴 Key(接口地址已内置官方默认),保存即启用;没配好的环节由内置产线兜底</span>
     </div>
+    ${imageCostGuideHtml()}
     <div class="settings-grid">
       ${data.providers.map(providerCard).join("")}
     </div>
@@ -1283,8 +1324,9 @@ function checksHtml(checks) {
 }
 
 function providerCard(p) {
-  const isApi = ["api", "claude_api", "image_api", "ark_video",
-    "doubao_tts"].includes(p.type);
+  const isApi = ["api", "claude_api", "image_api", "seedream_image", "seedream",
+    "seedream_lite", "seedream5_lite", "ark_video", "doubao_tts"].includes(p.type)
+    || ["seedream5_lite", "seedream_lite", "seedream"].includes(p.name);
   const isCli = ["cli", "dreamina"].includes(p.type);
   const state = p.ready ? ["done", "就绪"]
     : p.enabled ? ["qc_failed", "待配置"] : ["", "未启用"];
@@ -1313,6 +1355,7 @@ function providerCard(p) {
     </div>
     <div class="pc-caps">${p.capabilities.map((c) =>
       `<span class="chip">${esc(CAP_LABEL[c] || c)}</span>`).join("")}</div>
+    ${providerCostHint(p)}
     <label class="set-row toggle"><span>启用</span>
       <input type="checkbox" data-field="enabled" ${p.enabled ? "checked" : ""}>
       <em>${p.enabled ? "参与自动路由" : "跳过,用下一个"}</em></label>
@@ -1811,7 +1854,9 @@ const PLAN_STATUS_CN = {
   failed: "失败", reused: "复用已有", selected: "已选定",
 };
 const PROVIDER_LABEL = {
-  codex: "Codex CLI", image_api: "图片API", api: "通用API",
+  codex: "Codex 订阅", image_api: "GPT Image 2 API", api: "通用API",
+  seedream5_lite: "Seedream 5.0 Lite", seedream_lite: "Seedream 5.0 Lite",
+  seedream: "Seedream 5.0 Lite",
   claude: "Claude CLI", claude_api: "Claude API", jimeng: "即梦CLI",
   ark: "火山Ark", mock: "占位产线",
 };
@@ -1842,6 +1887,22 @@ function planMockReasonHtml(item) {
   return parts.length
     ? `<div class="plan-fallback">真实出图产线没接通,逐个回退:${esc(parts.join(";"))}</div>`
     : "";
+}
+
+function planCostBadge(item) {
+  const provider = String(item.provider || "").toLowerCase();
+  const model = `${item.model || ""} ${item.quality || item.image_quality || ""}`.toLowerCase();
+  if (provider === "codex")
+    return `<span class="plan-st st-cost subscription" title="Codex 订阅内，不增加图片 API 账单">订阅内 · 高清优先</span>`;
+  if (["seedream5_lite", "seedream_lite", "seedream"].includes(provider)
+      || model.includes("seedream"))
+    return `<span class="plan-st st-cost batch" title="Seedream 5.0 Lite 参考价">¥0.22 · 批量优先</span>`;
+  if (provider === "image_api" || model.includes("gpt-image-2")) {
+    if (model.includes("high"))
+      return `<span class="plan-st st-cost expensive" title="高成本模式，不应用于批量候选">高成本 · 仅终稿/复杂文字</span>`;
+    return `<span class="plan-st st-cost standard" title="GPT Image 2 medium 参考价">medium 约 ¥0.28</span>`;
+  }
+  return "";
 }
 
 /* 列表用缩略图(服务端按需缩放缓存);灯箱/预览仍加载原图 */
@@ -1915,6 +1976,7 @@ function planItemHtml(data, item, editable) {
             ? `<span class="plan-st st-real">${esc(PROVIDER_LABEL[item.provider] || item.provider)}</span>` : "")}
         ${planQcBadge(item)}
         ${item.model ? `<span class="plan-st st-model" title="实际记录的模型/托管通道">${esc(item.model)}</span>` : ""}
+        ${planCostBadge(item)}
         <span class="plan-st st-${st}">${PLAN_STATUS_CN[st] || st}${item.custom_prompt ? " · 已改词" : ""}</span>
         </span>
       </div>
@@ -1986,6 +2048,7 @@ function renderPlanHtml(data, editable) {
       && ["done", "reused"].includes(i.status)).length;
   return `<div class="plan-panel">
     <h2>🖼 图片生产清单 <span class="dim">共 ${items.length} 张 · 已就绪 ${ready}</span></h2>
+    ${imageCostGuideHtml(true)}
     ${mockWarnHtml(data)}
     ${editable ? `<div class="plan-batchbar">
       <button class="batch-qc" onclick="qcAll(${data.episode.id}, this)"
@@ -2384,6 +2447,118 @@ async function showPlanOverlay(episodeId) {
   bindPlanRegen(overlay, episodeId, () => { close(); showPlanOverlay(episodeId); });
 }
 
+function blockingPoint(value) {
+  const point = value && (value.point || value.position || value);
+  if (!point || point.x == null || point.y == null) return null;
+  return { x: point.x, y: point.y };
+}
+
+function blockingRoutePoints(entity) {
+  const route = entity && entity.route;
+  let candidates = [];
+  if (Array.isArray(route)) candidates = route;
+  else if (route && typeof route === "object") {
+    candidates = [route.start, ...(route.points || []), route.end];
+  }
+  if (!candidates.filter(Boolean).length)
+    candidates = [entity && entity.start, entity && entity.end];
+  const result = candidates.map(blockingPoint).filter(Boolean);
+  return result.filter((point, index) => !index
+    || point.x !== result[index - 1].x || point.y !== result[index - 1].y);
+}
+
+function blockingPointText(point) {
+  return point ? `(${point.x},${point.y})` : "未标注";
+}
+
+function blockingRouteText(entity, labels = ["起点", "终点"]) {
+  const points = blockingRoutePoints(entity || {});
+  if (!points.length) return "路线待生成";
+  if (points.length === 1) return `原地 ${blockingPointText(points[0])}`;
+  return `${labels[0]} ${blockingPointText(points[0])} → ${labels[1]} ${blockingPointText(points[points.length - 1])}`;
+}
+
+function blockingSafeColor(value) {
+  return /^#[0-9a-f]{3,8}$/i.test(String(value || "")) ? value : "#94a3b8";
+}
+
+function blockingCharacterMapRows(blocking) {
+  const map = blocking.character_number_map || {};
+  if (Array.isArray(map)) return map;
+  return Object.entries(map).map(([name, value]) => typeof value === "string"
+    ? { name, actor_id: value }
+    : { name, ...(value || {}) });
+}
+
+function blockingSceneActors(scene, blocking) {
+  const declared = scene.actors || scene.actor_legend || scene.character_legend
+    || (scene.legend && scene.legend.actors) || [];
+  const fromShots = (scene.shots || []).flatMap((shot) => shot.actors || []);
+  const mapped = blockingCharacterMapRows(blocking);
+  const all = [...declared, ...fromShots, ...mapped];
+  const sceneNames = new Set(fromShots.map((actor) => actor.name).filter(Boolean));
+  const rows = [];
+  const seen = new Set();
+  all.forEach((raw) => {
+    const actor = typeof raw === "string" ? { name: raw } : raw || {};
+    if (sceneNames.size && !sceneNames.has(actor.name)
+        && !fromShots.some((row) => row.actor_id && row.actor_id === actor.actor_id)) return;
+    const key = actor.actor_id || actor.id || actor.name || actor.display_label;
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    const shotActor = fromShots.find((row) => (actor.actor_id && row.actor_id === actor.actor_id)
+      || (actor.name && row.name === actor.name)) || {};
+    const mappedActor = mapped.find((row) => (actor.actor_id && row.actor_id === actor.actor_id)
+      || (actor.name && row.name === actor.name)) || {};
+    rows.push({ ...mappedActor, ...actor, ...shotActor,
+      display_label: shotActor.display_label || actor.display_label || mappedActor.display_label });
+  });
+  return rows;
+}
+
+function blockingActorLabel(actor) {
+  if (actor.display_label) return actor.display_label;
+  const identity = actor.role && actor.name ? `${actor.role}·${actor.name}` : actor.name;
+  return [actor.actor_id || actor.id, identity].filter(Boolean).join(" ") || "未编号人物";
+}
+
+function blockingLegendHtml(scene, blocking) {
+  const actors = blockingSceneActors(scene, blocking);
+  return `<div class="blocking-legend" aria-label="空间调度图例">
+    <div class="blocking-route-key">
+      <span><i class="route-symbol actor"></i>彩色实线：人物路线</span>
+      <span><i class="route-symbol camera"></i>蓝色虚线：镜头路线</span>
+      <span>○ / △ 起点</span><span>● / ▲ 终点</span>
+    </div>
+    ${actors.length ? `<div class="blocking-actor-legend" aria-label="人物编号图例">
+      ${actors.map((actor) => `<span style="--actor-color:${blockingSafeColor(actor.color)}">
+        <i></i><b>${esc(blockingActorLabel(actor))}</b></span>`).join("")}
+    </div>` : `<div class="blocking-legend-empty">人物编号会在空间调度生成后显示</div>`}
+  </div>`;
+}
+
+function blockingShotHtml(shot) {
+  const actors = shot.actors || [];
+  const actorRoutes = actors.length ? actors.map((actor) => `
+    <div class="blocking-route actor" style="--actor-color:${blockingSafeColor(actor.color)}">
+      <i></i><b>${esc(blockingActorLabel(actor))}</b>
+      <span>${esc(blockingRouteText(actor))}${actor.route_label ? ` · ${esc(actor.route_label)}` : ""}</span>
+    </div>`).join("") : `<div class="blocking-route empty">本镜为空镜</div>`;
+  const camera = shot.camera || {};
+  const cameraMove = camera.direction_label || camera.movement
+    || (camera.moving ? "移动镜头" : "固定镜头");
+  return `<article class="blocking-shot">
+    <div class="blocking-shot-head"><b>S${esc(shot.shot_no)}</b>
+      <span>${esc(shot.character_count == null ? actors.length : shot.character_count)} 人</span></div>
+    <div class="blocking-routes">${actorRoutes}
+      <div class="blocking-route camera"><i></i><b>🎥 镜头</b>
+        <span>${esc(blockingRouteText(camera, ["机位起点", "机位终点"]))}</span>
+        <em>${esc(camera.lens_mm || "-")}mm · ${esc(cameraMove)} · ${esc(camera.position || "-")}</em>
+      </div>
+    </div>
+  </article>`;
+}
+
 async function showBlockingOverlay(episodeId) {
   let data;
   try { data = await api(`/api/episode/${episodeId}`); }
@@ -2392,28 +2567,23 @@ async function showBlockingOverlay(episodeId) {
   const scenes = blocking.scenes || [];
   const overlay = document.createElement("div");
   overlay.className = "script-overlay";
-  const sceneHtml = scenes.map((scene) => `
+  const sceneHtml = scenes.map((scene) => {
+    const svgUrl = scene.svg_url || scene.map_url || scene.svg || "";
+    return `
     <section class="blocking-scene">
       <div class="blocking-scene-head">
         <div><h3>第 ${scene.scene_no} 场 · ${esc(scene.location || "未命名场景")}</h3>
           <span class="dim">${esc((scene.reasons || []).join(" · "))}</span></div>
         <span class="${scene.required ? "warn" : "pass"}">${scene.required ? "重点调度" : "连续性参考"}</span>
       </div>
-      ${scene.svg_url
-        ? `<button class="blocking-map-btn" data-map="${esc(scene.svg_url)}" data-label="第${scene.scene_no}场空间调度图"><img src="${esc(scene.svg_url)}" loading="lazy" alt="第${scene.scene_no}场空间调度图"></button>`
+      ${blockingLegendHtml(scene, blocking)}
+      ${svgUrl
+        ? `<div class="blocking-map-scroll"><button class="blocking-map-btn" data-map="${esc(svgUrl)}" data-label="第${scene.scene_no}场空间调度图"><img src="${esc(svgUrl)}" loading="lazy" alt="第${scene.scene_no}场空间调度图，点击放大"></button></div>
+          <div class="blocking-map-mobile-hint">↔ 左右滑动查看全图 · 点图放大</div>`
         : `<div class="blocking-empty">SVG 尚未生成</div>`}
-      <div class="blocking-shot-list">${(scene.shots || []).map((shot) => {
-        const actors = (shot.actors || []).map((actor) => {
-          const start = actor.start || {}, end = actor.end || {};
-          return `${actor.actor_id} ${actor.name} (${start.x},${start.y})→(${end.x},${end.y})`;
-        }).join("；");
-        const camera = shot.camera || {};
-        return `<div class="blocking-shot">
-          <b>S${shot.shot_no}</b><span>${esc(actors || "空镜")}</span>
-          <em>🎥 ${esc(camera.lens_mm || "-")}mm · ${esc(camera.movement || "固定")} · ${esc(camera.position || "-")}</em>
-        </div>`;
-      }).join("")}</div>
-    </section>`).join("");
+      <div class="blocking-shot-list">${(scene.shots || []).map(blockingShotHtml).join("")}</div>
+    </section>`;
+  }).join("");
   overlay.innerHTML = `
     <div class="script-panel blocking-overlay">
       <div class="script-head">
@@ -2426,7 +2596,7 @@ async function showBlockingOverlay(episodeId) {
         <b>${blocking.summary?.required_scenes || 0}</b> 个重点调度场景
         <span class="${blocking.validation?.passed ? "pass" : "warn"}">${blocking.validation?.passed ? "空间门禁 PASS" : "空间门禁待生成"}</span>
       </div>
-      <p class="dim">俯视图锁定人物编号、起止位置、走位、机位、焦段视锥和 180° 轴线；坐标只约束构图，不会画进最终画面。</p>
+      <p class="dim">人物编号在每场保持一致；人物与镜头的起点、终点分开标记。坐标只约束构图，不会画进最终画面。</p>
       ${sceneHtml || `<div class="blocking-empty">本集还没有空间调度图；确认剧本并完成五维分镜后会自动生成。</div>`}
     </div>`;
   const close = () => { overlay.remove(); document.removeEventListener("keydown", onKey); };
@@ -2434,7 +2604,8 @@ async function showBlockingOverlay(episodeId) {
   overlay.addEventListener("click", (ev) => { if (ev.target === overlay) close(); });
   overlay.querySelector(".close").onclick = close;
   overlay.querySelectorAll(".blocking-map-btn").forEach((button) => {
-    button.onclick = () => showImageLightbox(button.dataset.map, button.dataset.label);
+    button.onclick = () => showImageLightbox(
+      button.dataset.map, button.dataset.label, "blocking-map-lightbox");
   });
   document.addEventListener("keydown", onKey);
   document.body.appendChild(overlay);
@@ -2463,10 +2634,10 @@ function designHtml(design) {
 }
 
 /* 图片点击放大(资产中心/参考图通用灯箱) */
-function showImageLightbox(url, label) {
+function showImageLightbox(url, label, variant = "") {
   if (!url) return;
   const overlay = document.createElement("div");
-  overlay.className = "script-overlay img-lightbox";
+  overlay.className = `script-overlay img-lightbox ${variant}`.trim();
   overlay.innerHTML = `
     <figure class="lightbox-box">
       <img src="${esc(url)}" alt="${esc(label || "")}">
@@ -3256,10 +3427,10 @@ function renderProductionView(data, episodeId) {
   pollCanvas(episodeId);
 }
 
-/* ---- 出图产线快速切换:Codex CLI / OpenAI 图片API + 并行路数 ---- */
+/* ---- 出图产线快速切换:Codex / Seedream / OpenAI 图片API + 并行路数 ---- */
 function imageLineControlsHtml() {
   return `<div class="style-row image-line-row">
-    <label>出图产线</label>
+    <label>出图策略</label>
     <select id="image-line" disabled><option>加载中…</option></select>
     <label class="il-label">并行路数</label>
     <select id="parallel-images" disabled><option>…</option></select>
@@ -3289,39 +3460,22 @@ async function bindImageLineControls() {
   const byName = {};
   (st.providers || []).forEach((pv) => { byName[pv.name] = pv; });
   const ready = (n) => {
-    const pv = byName[n];
+    const pv = byName[n] || (n === "seedream5_lite"
+      ? byName.seedream_lite || byName.seedream : null);
     return pv && pv.enabled && (pv.checks || []).some(
       (c) => c.capability === "image" && c.ok) ? "已接通" : "未接通";
   };
-  const chain = (st.routing || {}).image || [];
   lineSel.innerHTML = `
-    <option value="codex">Codex CLI · GPT Image 2(${ready("codex")})</option>
-    <option value="image_api">OpenAI 图片 API(${ready("image_api")})</option>`;
-  lineSel.value = chain[0] === "image_api" ? "image_api" : "codex";
-  lineSel.disabled = false;
-  const updateHint = () => {
-    const hint = document.getElementById("image-line-hint");
-    if (!hint) return;
-    hint.textContent = lineSel.value === "image_api"
-      ? "极速直连：通常最快，按 API 单独计费；推荐 4–6 路"
-      : "套餐内 Codex 出图：不增加 API 账单；推荐 3–4 路，过高并发未必更快";
-  };
-  lineSel.onchange = async () => {
-    const pick = lineSel.value;
-    const others = ["codex", "image_api"].filter((x) => x !== pick);
-    try {
-      for (const cap of ["image", "frames", "cover"]) {
-        await api("/api/settings", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ capability: cap,
-            chain: [pick, ...others, "api", "mock"] }),
-        });
-      }
-      showToast(`出图产线已切换:${pick === "codex"
-        ? "Codex CLI 优先" : "OpenAI 图片API 优先"}(不可用自动回退)`, "ok");
-      updateHint();
-    } catch (e) { showToast(staleServerHint(e), "error"); }
-  };
+    <option value="smart">智能分流 · 批量 Seedream / 重要高清 Codex</option>`;
+  lineSel.value = "smart";
+  lineSel.title = "按图片用途自动选择产线；如需改底层链路，请到 AI 设置的高级能力路由";
+  const policy = st.image_routing || {};
+  const routeLabel = (kind, fallback) => ((policy[kind] || []).map((name) =>
+    PROVIDER_LABEL[name] || name).join(" → ") || fallback);
+  const hint = document.getElementById("image-line-hint");
+  if (hint) hint.textContent = `批量：${routeLabel("batch", "Seedream 5.0 Lite → GPT Image 2 medium")}`
+    + `；重要高清：${routeLabel("important", "Codex 订阅 → GPT Image 2 medium")}`
+    + `。Seedream ${ready("seedream5_lite")}，Codex ${ready("codex")}；high 不进入批量路线`;
   parSel.innerHTML = [1, 2, 3, 4, 6, 8].map(
     (n) => `<option value="${n}">${n} 路并行</option>`).join("");
   parSel.value = String((st.defaults || {}).parallel_images || 3);
@@ -3369,10 +3523,6 @@ async function bindImageLineControls() {
       } catch (e) { showToast(staleServerHint(e), "error"); }
     };
   }
-  if (typeof updateHint === "function") updateHint();
-  const hint = document.getElementById("image-line-hint");
-  if (hint && !hint.textContent) hint.textContent =
-    "立即生效;主角立绘先出作风格基准,批量并行不会跑偏";
 }
 
 /* ---- 剧本审阅页:剧本确认后才开始画图(第一道确认) ----
