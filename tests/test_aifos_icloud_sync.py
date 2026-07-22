@@ -48,11 +48,13 @@ def test_registered_image_is_mirrored_after_app_close(tmp_path, monkeypatch):
     app.close()
 
     copies = list((cloud_docs / "AIFOS").glob(
-        "P001_手机查看项目__W*/第002集/10_关键帧/*.png"))
+        "P001_W*_手机查看项目__E002__关键帧__A*__v001__*.png"))
     assert len(copies) == 1
     assert copies[0].read_bytes() == source.read_bytes()
-    assert (f"关键帧__e002_shot001__A{row['id']:06d}__v001.png"
+    assert (f"P001_W{app.icloud_sync.workspace_id}_手机查看项目__E002__"
+            f"关键帧__A{row['id']:06d}__v001__e002_shot001.png"
             == copies[0].name)
+    assert copies[0].parent == cloud_docs / "AIFOS"
     manifest = json.loads((cloud_docs / "AIFOS"
                            / ".aifos-image-sync.json").read_text())
     assert any(key.endswith(f":{row['id']}:v1")
@@ -83,8 +85,9 @@ def test_backfill_is_incremental_and_excludes_thumbnail_cache(
     assert first["failed"] == 0
     assert second["synced"] == 0 and second["skipped"] == 1
     assert len(list((cloud_docs / "AIFOS").rglob("*.png"))) == 1
-    assert list((cloud_docs / "AIFOS").glob(
-        "P001_手机查看项目__W*/00_项目素材/01_人物候选/*.png"))
+    copies = list((cloud_docs / "AIFOS").glob(
+        "P001_W*_手机查看项目__E000__候选__*.png"))
+    assert len(copies) == 1 and copies[0].parent == cloud_docs / "AIFOS"
 
 
 def test_sync_failure_never_rolls_back_asset_registration(
@@ -225,7 +228,9 @@ def test_two_workspaces_cannot_overwrite_each_other(tmp_path, monkeypatch):
         app.close()
     copies = list((cloud_docs / "AIFOS").rglob("*.png"))
     assert len(copies) == 2
-    assert len({path.parent.parent.parent.name for path in copies}) == 2
+    assert all(path.parent == cloud_docs / "AIFOS" for path in copies)
+    assert len({path.name.split("_W", 1)[1].split("_", 1)[0]
+                for path in copies}) == 2
     assert {path.read_bytes() for path in copies} == {
         b"workspace-1", b"workspace-2"}
     manifest = json.loads((cloud_docs / "AIFOS"
@@ -263,6 +268,251 @@ def test_long_chinese_names_stay_within_filesystem_byte_limit(
     assert target.read_bytes() == b"long-name"
     assert all(len(part.encode("utf-8")) <= 255
                for part in target.relative_to(cloud_docs / "AIFOS").parts)
+
+
+def test_flat_filename_budget_handles_maximum_sqlite_identifiers(
+        tmp_path, monkeypatch):
+    cloud_docs = tmp_path / "CloudDocs"
+    cloud_docs.mkdir()
+    _use_cloud_docs(monkeypatch, cloud_docs)
+    app = App(tmp_path / "ws", config_overrides=_config(cloud_docs))
+    source = app.workspace.artifacts_dir / "p001/e001/images/source.jpeg"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"large-identifiers")
+    maximum = 9223372036854775807
+    row = {
+        "id": maximum, "project_id": maximum, "project_title": "长项目" * 80,
+        "kind": "image", "name": "长资产" * 120, "version": maximum,
+        "meta": {"episode_number": maximum},
+    }
+    target = app.icloud_sync._target(
+        row, source, source.relative_to(app.workspace.artifacts_dir))
+    app.close()
+    assert target.parent == cloud_docs / "AIFOS"
+    assert len(target.name.encode("utf-8")) <= 255
+    assert f"A{maximum}" in target.name and f"v{maximum}" in target.name
+
+
+def test_backfill_flattens_registered_legacy_mirror_and_prunes_empty_dirs(
+        tmp_path, monkeypatch):
+    cloud_docs = tmp_path / "CloudDocs"
+    cloud_docs.mkdir()
+    _use_cloud_docs(monkeypatch, cloud_docs)
+    ws = tmp_path / "ws"
+    app = App(ws, config_overrides=_config(cloud_docs))
+    row, source = _make_asset(app)
+    app.close()
+
+    root = cloud_docs / "AIFOS"
+    flat = next(root.glob("*.png"))
+    legacy = root / "P001_手机查看项目" / "第002集" / "10_关键帧" / flat.name
+    legacy.parent.mkdir(parents=True)
+    flat.replace(legacy)
+    manifest_path = root / ".aifos-image-sync.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    key = next(key for key in manifest["entries"]
+               if key.endswith(f":{row['id']}:v1"))
+    manifest["entries"][key]["target"] = legacy.relative_to(root).as_posix()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    app = App(ws, config_overrides=_config(cloud_docs))
+    report = app.icloud_sync.backfill()
+    app.close()
+    copies = list(root.glob("*.png"))
+    assert report["migrated"] == 1 and report["failed"] == 0
+    assert len(copies) == 1 and copies[0].read_bytes() == source.read_bytes()
+    assert not (root / "P001_手机查看项目").exists()
+
+
+def test_backfill_flattens_historical_versions_from_v1_manifest(
+        tmp_path, monkeypatch):
+    cloud_docs = tmp_path / "CloudDocs"
+    cloud_docs.mkdir()
+    _use_cloud_docs(monkeypatch, cloud_docs)
+    ws = tmp_path / "ws"
+    app = App(ws, config_overrides=_config(cloud_docs))
+    first, _ = _make_asset(app, episode=3, name="e003_shot001",
+                           payload=b"version-one")
+    app.close()
+
+    app = App(ws, config_overrides=_config(cloud_docs))
+    project = app.projects.get_project("手机查看项目")
+    source = app.workspace.artifacts_dir / "p001/e003/images/version-two.png"
+    source.write_bytes(b"version-two")
+    second = dict(app.assets.register(
+        project["id"], "image", "e003_shot001", uri=str(source),
+        meta={"episode_number": 3}, new_version=True))
+    app.close()
+
+    root = cloud_docs / "AIFOS"
+    manifest_path = root / ".aifos-image-sync.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema"] = "aifos.icloud-image-sync/v1"
+    manifest.pop("layout", None)
+    for row in (first, second):
+        key = next(key for key in manifest["entries"]
+                   if key.endswith(f":{row['id']}:v{row['version']}"))
+        flat = root / manifest["entries"][key]["target"]
+        legacy = (root / "P001_手机查看项目" / "第003集"
+                  / "10_关键帧" / flat.name)
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        flat.replace(legacy)
+        manifest["entries"][key]["target"] = (
+            legacy.relative_to(root).as_posix())
+        manifest["entries"][key].pop("layout", None)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    app = App(ws, config_overrides=_config(cloud_docs))
+    report = app.icloud_sync.backfill()
+    app.close()
+    copies = list(root.glob("*.png"))
+    upgraded = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert report["migrated"] == 2 and report["failed"] == 0
+    assert len(copies) == 2
+    assert {path.read_bytes() for path in copies} == {
+        b"version-one", b"version-two"}
+    assert not [path for path in root.iterdir() if path.is_dir()]
+    assert upgraded["schema"] == "aifos.icloud-image-sync/v2"
+    assert all(entry["layout"] == "flat-v1"
+               for entry in upgraded["entries"].values())
+
+
+def test_pending_historical_retirement_recovers_after_restart(
+        tmp_path, monkeypatch):
+    cloud_docs = tmp_path / "CloudDocs"
+    cloud_docs.mkdir()
+    _use_cloud_docs(monkeypatch, cloud_docs)
+    ws = tmp_path / "ws"
+    app = App(ws, config_overrides=_config(cloud_docs))
+    row, _ = _make_asset(app, payload=b"history")
+    app.close()
+
+    root = cloud_docs / "AIFOS"
+    manifest_path = root / ".aifos-image-sync.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    key = next(key for key in manifest["entries"]
+               if key.endswith(f":{row['id']}:v1"))
+    entry = manifest["entries"][key]
+    flat = root / entry["target"]
+    legacy = root / "legacy" / flat.name
+    legacy.parent.mkdir()
+    legacy.write_bytes(flat.read_bytes())
+    entry["previous_target"] = legacy.relative_to(root).as_posix()
+    entry["previous_sha256"] = entry["sha256"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    app = App(ws, config_overrides=_config(cloud_docs))
+    report = app.icloud_sync.backfill()
+    app.close()
+    recovered = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert report["migrated"] == 1 and report["failed"] == 0
+    assert not legacy.exists() and not legacy.parent.exists()
+    assert "previous_target" not in recovered["entries"][key]
+
+
+def test_legacy_symlink_is_never_followed_or_unlinked(
+        tmp_path, monkeypatch):
+    cloud_docs = tmp_path / "CloudDocs"
+    cloud_docs.mkdir()
+    _use_cloud_docs(monkeypatch, cloud_docs)
+    ws = tmp_path / "ws"
+    app = App(ws, config_overrides=_config(cloud_docs))
+    row, _ = _make_asset(app, payload=b"source")
+    app.close()
+
+    root = cloud_docs / "AIFOS"
+    manifest_path = root / ".aifos-image-sync.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    key = next(key for key in manifest["entries"]
+               if key.endswith(f":{row['id']}:v1"))
+    victim = root / "用户保留.png"
+    victim.write_bytes(b"do-not-delete")
+    legacy = root / "legacy" / "linked.png"
+    legacy.parent.mkdir()
+    legacy.symlink_to(victim)
+    manifest["entries"][key]["target"] = legacy.relative_to(root).as_posix()
+    manifest["entries"][key]["sha256"] = icloud_module._hash_file(victim)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    app = App(ws, config_overrides=_config(cloud_docs))
+    report = app.icloud_sync.backfill()
+    app.close()
+    assert report["failed"] >= 1
+    assert legacy.is_symlink()
+    assert victim.read_bytes() == b"do-not-delete"
+
+
+def test_legacy_parent_symlink_cannot_escape_managed_root(
+        tmp_path, monkeypatch):
+    cloud_docs = tmp_path / "CloudDocs"
+    cloud_docs.mkdir()
+    _use_cloud_docs(monkeypatch, cloud_docs)
+    ws = tmp_path / "ws"
+    app = App(ws, config_overrides=_config(cloud_docs))
+    row, _ = _make_asset(app, payload=b"source")
+    app.close()
+
+    root = cloud_docs / "AIFOS"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "victim.png"
+    victim.write_bytes(b"outside-must-survive")
+    (root / "legacy").symlink_to(outside, target_is_directory=True)
+    manifest_path = root / ".aifos-image-sync.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    key = next(key for key in manifest["entries"]
+               if key.endswith(f":{row['id']}:v1"))
+    manifest["entries"][key]["target"] = "legacy/victim.png"
+    manifest["entries"][key]["sha256"] = icloud_module._hash_file(victim)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    app = App(ws, config_overrides=_config(cloud_docs))
+    report = app.icloud_sync.backfill()
+    app.close()
+    assert report["failed"] >= 1
+    assert victim.read_bytes() == b"outside-must-survive"
+    assert (root / "legacy").is_symlink()
+
+
+def test_corrupt_flat_replacement_keeps_historical_legacy_copy(
+        tmp_path, monkeypatch):
+    cloud_docs = tmp_path / "CloudDocs"
+    cloud_docs.mkdir()
+    _use_cloud_docs(monkeypatch, cloud_docs)
+    ws = tmp_path / "ws"
+    app = App(ws, config_overrides=_config(cloud_docs))
+    first, _ = _make_asset(app, episode=4, name="e004_shot001",
+                           payload=b"historical-good")
+    app.close()
+    app = App(ws, config_overrides=_config(cloud_docs))
+    project = app.projects.get_project("手机查看项目")
+    newer = app.workspace.artifacts_dir / "p001/e004/images/newer.png"
+    newer.write_bytes(b"current-good")
+    app.assets.register(
+        project["id"], "image", "e004_shot001", uri=str(newer),
+        meta={"episode_number": 4}, new_version=True)
+    app.close()
+
+    root = cloud_docs / "AIFOS"
+    manifest_path = root / ".aifos-image-sync.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    key = next(key for key in manifest["entries"]
+               if key.endswith(f":{first['id']}:v1"))
+    entry = manifest["entries"][key]
+    flat = root / entry["target"]
+    legacy = root / "legacy" / flat.name
+    legacy.parent.mkdir()
+    legacy.write_bytes(flat.read_bytes())
+    flat.write_bytes(b"corrupted-flat")
+    entry["previous_target"] = legacy.relative_to(root).as_posix()
+    entry["previous_sha256"] = entry["sha256"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    app = App(ws, config_overrides=_config(cloud_docs))
+    report = app.icloud_sync.backfill()
+    app.close()
+    assert report["failed"] >= 1
+    assert legacy.read_bytes() == b"historical-good"
 
 
 def test_concurrent_stale_snapshot_cannot_overwrite_new_image(
