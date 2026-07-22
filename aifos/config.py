@@ -42,7 +42,7 @@ DEFAULTS = {
         "claude": {
             # 经 aifos.adapters.claude_script 桥接 claude -p 实际编剧
             "type": "cli", "enabled": False,
-            "capabilities": ["script", "storyboard"],
+            "capabilities": ["script", "storyboard", "image_qc"],
             "command": ["python3", "-m", "aifos.adapters.claude_script",
                         "--claude", "claude"],
             "cost_per_call": 0.5, "timeout": 600,
@@ -80,7 +80,7 @@ DEFAULTS = {
         "claude_api": {
             # Claude 官方 API 直连(Messages API):Claude CLI 的 API 模式
             "type": "claude_api", "enabled": False,
-            "capabilities": ["script", "storyboard"],
+            "capabilities": ["script", "storyboard", "image_qc"],
             "endpoint": "https://api.anthropic.com", "api_key": "",
             "model": "claude-opus-4-8", "max_tokens": 16000,
             "cost_per_call": 0.8, "timeout": 600,
@@ -123,7 +123,7 @@ DEFAULTS = {
         },
         "mock": {
             "type": "mock", "enabled": True,
-            "capabilities": ["script", "storyboard", "image", "frames",
+            "capabilities": ["script", "storyboard", "image_qc", "image", "frames",
                              "video", "voice", "edit", "cover"],
             "cost_per_call": 0.1,
         },
@@ -131,6 +131,7 @@ DEFAULTS = {
     # 能力路由:按顺序尝试,前者不可用/失败自动回退后者(CLI → API → mock)
     "routing": {
         "script": ["claude", "claude_api", "mock"],
+        "image_qc": ["claude", "claude_api", "mock"],
         "storyboard": ["claude", "claude_api", "mock"],
         "image": ["codex", "image_api", "api", "mock"],
         "frames": ["codex", "image_api", "mock"],
@@ -177,6 +178,17 @@ def _normalize_legacy(data):
         # type="say" 是平台最早的内置类型,从未开放自定义,放心移除;
         # 桥接命令形态只清除与内置完全一致的签名(自定义 --say 保留)
         remove = legacy_say.get("type") == "say" or builtin_signature
+    for name in ("claude", "claude_api"):
+        conf = providers.get(name)
+        caps = conf.get("capabilities") if isinstance(conf, dict) else None
+        if isinstance(caps, list) and "script" in caps \
+                and "image_qc" not in caps:
+            caps.append("image_qc")
+    mock_conf = providers.get("mock")
+    mock_caps = (mock_conf.get("capabilities")
+                 if isinstance(mock_conf, dict) else None)
+    if isinstance(mock_caps, list) and "image_qc" not in mock_caps:
+        mock_caps.append("image_qc")
     if not remove:
         return data
     providers.pop("say", None)

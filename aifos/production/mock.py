@@ -176,6 +176,14 @@ class MockProvider(Provider):
         return ProviderResult(
             provider=self.name, cost=self.cost_per_call, data=data, uri=uri)
 
+    # ---- 图片质检:占位版按标记回应(真实核验需 Claude 产线) ----
+    def _gen_image_qc(self, payload, out_dir):
+        blob = json.dumps(payload, ensure_ascii=False)
+        if "质检必挂" in blob:
+            return {"pass": False,
+                    "issues": ["测试触发:画面与要求不符"]}, ""
+        return {"pass": True, "issues": []}, ""
+
     # ---- 剧本:按题材分流(偶像/都市/校园/仙侠) ----
     def _gen_script(self, payload, out_dir):
         if payload.get("character_design"):

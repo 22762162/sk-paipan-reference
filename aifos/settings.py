@@ -15,7 +15,7 @@ CAPABILITY_CN = {
     "script": "剧本", "storyboard": "分镜", "image": "图片",
     "frames": "首尾帧", "video": "视频", "voice": "配音",
     "edit": "剪辑", "cover": "封面",
-}
+    "image_qc": "图片质检",}
 
 PROVIDER_CN = {
     "claude": "Claude CLI · 编剧",

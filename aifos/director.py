@@ -11,7 +11,8 @@ import time
 from pathlib import Path
 
 from .db import now
-from .errors import AifosError, BudgetExceeded, ProduceCancelled
+from .errors import (AifosError, BudgetExceeded, ProduceCancelled,
+                     ProviderError, ProviderUnavailable)
 from .workflow import (
     PIPELINE_VERSION,
     build_content_review,
@@ -514,7 +515,7 @@ class Director:
                 item["status"] = prev.get("status", "pending")
                 item["error"] = prev.get("error", "")
                 for key in ("provider", "model", "real", "fallbacks",
-                            "started_at", "finished_at", "duration"):
+                            "qc", "started_at", "finished_at", "duration"):
                     if key in prev:
                         item[key] = prev[key]
                 if prev.get("custom_prompt"):
@@ -571,6 +572,105 @@ class Director:
         self._plan_mark(ctx, item_id, "done", extra=extra)
         return result
 
+    # ---- 图片视觉质检:生成后核对剧本要求,不合格自动带意见重画 ----
+    def _image_qc_enabled(self):
+        return bool(self.config.get("defaults", "image_qc", default=True))
+
+    def _qc_retries(self):
+        try:
+            return max(0, min(int(self.config.get(
+                "defaults", "image_qc_retries", default=1)), 3))
+        except (TypeError, ValueError):
+            return 1
+
+    def _qc_spec(self, project_id, characters, location="", action="",
+                 forbid=None):
+        """质检要求:人物名单+人数+设定要点+场景动作+违禁物。"""
+        designs = []
+        for name in characters:
+            design = self._character_design(project_id, name)
+            line = self._design_line(design, keys=(
+                "hair", "costume", "signature")) if design else ""
+            designs.append(f"{name}({line})" if line else name)
+        return {
+            "characters": list(characters),
+            "count": len(characters),
+            "designs": ";".join(designs),
+            "location": location or "",
+            "action": action or "",
+            "forbid": list(forbid or []),
+        }
+
+    def _generate_image_with_qc(self, capability, payload, out_dir,
+                                cancel, qc_spec):
+        """出图 + 视觉质检 + 不合格自动重画(worker 线程安全:只调产线)。
+        质检产线不可用/出错时放行不阻塞;结果附在 result.qc。"""
+        attempts = 0
+        spent = 0.0
+        while True:
+            result = self.router.call(capability, payload, out_dir,
+                                      cancel=cancel)
+            result.cost += spent
+            if not qc_spec or not self._image_qc_enabled():
+                return result
+            uri = result.uri
+            if not uri or not Path(uri).exists():
+                return result
+            try:
+                qc_result = self.router.call(
+                    "image_qc", {**qc_spec, "image_uri": uri}, out_dir,
+                    cancel=cancel)
+            except (ProviderUnavailable, ProviderError):
+                return result      # 质检产线故障不阻塞生产
+            result.cost += qc_result.cost
+            verdict = qc_result.data or {}
+            report = {"passed": bool(verdict.get("pass")),
+                      "issues": list(verdict.get("issues") or []),
+                      "attempts": attempts + 1}
+            result.qc = report
+            if report["passed"] or attempts >= self._qc_retries():
+                return result
+            spent = result.cost
+            attempts += 1
+            payload = dict(payload)
+            payload["feedback"] = ((payload.get("feedback") or "")
+                                   + ";图片质检不通过,必须修正:"
+                                   + "；".join(report["issues"]))[:800]
+            payload["qc_attempt"] = attempts
+
+    def _plan_done_extra(self, result):
+        extra = {"provider": result.provider,
+                 "real": result.provider != "mock",
+                 "fallbacks": getattr(result, "fallbacks", [])}
+        qc = getattr(result, "qc", None)
+        if qc is not None:
+            extra["qc"] = qc
+        return extra
+
+    def _run_one_task(self, ctx, task):
+        """串行执行单个出图任务(含质检),记账并更新清单。"""
+        if self._cancel_requested(ctx):
+            raise ProduceCancelled("已手动停止生成")
+        self._plan_mark(ctx, task["item_id"], "generating")
+        try:
+            result = self._generate_image_with_qc(
+                task["capability"], task["payload"],
+                ctx["out_root"] / task["sub_dir"],
+                lambda: self._cancel_requested(ctx), task.get("qc_spec"))
+        except ProduceCancelled:
+            self._plan_mark(ctx, task["item_id"], "pending")
+            raise
+        except Exception as exc:
+            self._plan_mark(ctx, task["item_id"], "failed",
+                            error=str(exc)[:300])
+            raise
+        self._task_cost += result.cost
+        self._task_providers.add(result.provider)
+        self.projects.add_episode_cost(ctx["episode"]["id"], result.cost)
+        self._plan_mark(ctx, task["item_id"], "done",
+                        extra=self._plan_done_extra(result))
+        return result
+
     def _parallel_workers(self):
         try:
             workers = int(self.config.get(
@@ -590,11 +690,7 @@ class Director:
         if workers == 1 or len(tasks) == 1:
             out = {}
             for task in tasks:
-                result = self._plan_run(
-                    ctx, task["item_id"], lambda task=task: self._call(
-                        ctx, task["capability"], task["payload"],
-                        task["sub_dir"]))
-                out[task["tag"]] = result
+                out[task["tag"]] = self._run_one_task(ctx, task)
             return out
         if self._cancel_requested(ctx):
             raise ProduceCancelled("已手动停止生成")
@@ -615,8 +711,9 @@ class Director:
         cancelled = False
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(
-                self.router.call, task["capability"], task["payload"],
-                ctx["out_root"] / task["sub_dir"], cancel): task
+                self._generate_image_with_qc, task["capability"],
+                task["payload"], ctx["out_root"] / task["sub_dir"],
+                cancel, task.get("qc_spec")): task
                 for task in tasks}
             pending = set(futures)
             while pending:
@@ -639,10 +736,8 @@ class Director:
                     self._task_providers.add(result.provider)
                     self.projects.add_episode_cost(
                         ctx["episode"]["id"], result.cost)
-                    self._plan_mark(ctx, task["item_id"], "done", extra={
-                        "provider": result.provider,
-                        "real": result.provider != "mock",
-                        "fallbacks": getattr(result, "fallbacks", [])})
+                    self._plan_mark(ctx, task["item_id"], "done",
+                                    extra=self._plan_done_extra(result))
                     results[task["tag"]] = result
         if cancelled or self._cancel_requested(ctx):
             raise ProduceCancelled(
@@ -927,10 +1022,13 @@ class Director:
                                 only_pending=True)
                 continue
             if name == anchor_name:
-                result = self._plan_run(
-                    ctx, f"char:{name}",
-                    lambda c=character: self._call(
-                        ctx, "image", portrait_payload(c), "cast"))
+                result = self._run_one_task(ctx, {
+                    "item_id": f"char:{name}", "capability": "image",
+                    "payload": portrait_payload(character),
+                    "sub_dir": "cast",
+                    "qc_spec": self._qc_spec(
+                        project_id, [name],
+                        forbid=["动物化角色", "悬挂的衣物或衣架", "与设定不符的人"])})
                 self.assets.register(
                     project_id, "character_art", name, uri=result.uri,
                     meta={"role": character.get("role", "")})
@@ -942,6 +1040,9 @@ class Director:
             "item_id": f"char:{c['name']}", "capability": "image",
             "payload": portrait_payload(c), "sub_dir": "cast",
             "tag": ("char", c["name"], c.get("role", "")),
+            "qc_spec": self._qc_spec(
+                project_id, [c["name"]],
+                forbid=["动物化角色", "悬挂的衣物或衣架", "与设定不符的人"]),
         } for c in pending_portraits]
         for scene in ctx["script"]["scenes"]:
             location = scene["location"]
@@ -1012,7 +1113,10 @@ class Director:
                         "style_ref": self._style_anchor_uri(project_id),
                         "aspect": ctx["aspect"], **ctx["dims"],
                     }, "sub_dir": "cast",
-                    "tag": (name, key, label)})
+                    "tag": (name, key, label),
+                    "qc_spec": self._qc_spec(
+                        project_id, [name],
+                        forbid=["动物化角色", "悬挂的衣物或衣架", "与设定不符的人"])})
         for (name, key, label), result in self._run_parallel(
                 ctx, tasks, line="人物资产套件").items():
             self.assets.register(
@@ -1116,11 +1220,18 @@ class Director:
                 self._plan_mark(ctx, f"shot:{shot['shot_no']}", "reused",
                                 only_pending=True)
                 continue
+            payload = self._shot_payload(ctx, shot)
             tasks.append({
                 "item_id": f"shot:{shot['shot_no']}",
                 "capability": "image",
-                "payload": self._shot_payload(ctx, shot),
-                "sub_dir": "images", "tag": shot["shot_no"]})
+                "payload": payload,
+                "sub_dir": "images", "tag": shot["shot_no"],
+                "qc_spec": {**self._qc_spec(
+                    ctx["project"]["id"], payload.get("characters", []),
+                    location=payload.get("location", ""),
+                    action=payload.get("action", ""),
+                    forbid=["动物化角色", "悬挂的衣物或衣架", "与设定不符的人"] + ["字幕条"]),
+                    "camera": payload.get("camera", "")}})
         results = self._run_parallel(ctx, tasks, line="分镜画面")
         for shot_no in sorted(results):
             result = results[shot_no]

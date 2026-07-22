@@ -92,11 +92,36 @@ class ClaudeApiProvider(Provider):
             return False, str(exc)
         return True, f"真实连通成功(model={model})"
 
+    QC_MEDIA = {".png": "image/png", ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg", ".webp": "image/webp"}
+
+    def _qc_content(self, prompt, payload):
+        """图片质检:图片以 base64 随请求送入(视觉核验)。"""
+        import base64
+        from pathlib import Path as _P
+        image_path = _P(payload.get("image_uri", ""))
+        if not image_path.exists():
+            raise ProviderError(f"质检图片不存在: {image_path}")
+        media = self.QC_MEDIA.get(image_path.suffix.lower())
+        if media is None:
+            raise ProviderError(f"质检不支持的图片格式: {image_path.suffix}")
+        data = image_path.read_bytes()
+        if len(data) > 20 * 1024 * 1024:
+            raise ProviderError("质检图片超过 20MB")
+        return [
+            {"type": "image", "source": {
+                "type": "base64", "media_type": media,
+                "data": base64.b64encode(data).decode()}},
+            {"type": "text", "text": prompt},
+        ]
+
     def generate(self, capability, payload, out_dir, cancel=None):
         try:
             prompt = build_prompt(capability, payload)
         except ValueError as exc:
             raise ProviderError(str(exc)) from exc
+        content = (self._qc_content(prompt, payload)
+                   if capability == "image_qc" else prompt)
         endpoint = (self.conf.get("endpoint")
                     or self.DEFAULT_ENDPOINT).rstrip("/")
         reply = _request_json(
@@ -108,7 +133,7 @@ class ClaudeApiProvider(Provider):
             body={
                 "model": self.conf.get("model") or self.DEFAULT_MODEL,
                 "max_tokens": int(self.conf.get("max_tokens", 16000)),
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [{"role": "user", "content": content}],
             },
             timeout=self.conf.get("timeout", 600))
         text = "".join(block.get("text", "")
@@ -118,9 +143,13 @@ class ClaudeApiProvider(Provider):
         if data is None:
             raise ProviderError(f"{self.name} 应答中未找到 JSON 对象")
         try:
-            error = (validate_script(data, payload)
-                     if capability == "script"
-                     else validate_storyboard(data))
+            if capability == "image_qc":
+                from ..adapters.claude_script import validate_image_qc
+                error = validate_image_qc(data)
+            elif capability == "script":
+                error = validate_script(data, payload)
+            else:
+                error = validate_storyboard(data)
         except Exception as exc:   # 任何畸形结构都转产线错误,可自动回退
             raise ProviderError(
                 f"{self.name} 输出结构异常: {exc}") from exc

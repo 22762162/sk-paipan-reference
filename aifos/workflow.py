@@ -173,7 +173,8 @@ def _type_word(scene, shot):
     return "独白抒情" if shot.get("kind") in ("dialogue", "beat") else "大场面定场"
 
 
-def _camera_plan(camera, kind, index, rules=None):
+def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
+                 scene_start=False):
     library = (rules or {}).get("camera_library", {})
     storyboard_rules = (rules or {}).get("storyboard", {})
     scales = library.get(
@@ -187,15 +188,31 @@ def _camera_plan(camera, kind, index, rules=None):
     compositions = library.get(
         "compositions", ["黄金分割", "引导线", "中心构图", "对称构图"])
     camera = camera or ""
-    if "特写" in camera:
-        scale = "特写"
-    elif "全景" in camera or "远景" in camera:
-        scale = "全景"
-    elif kind in ("reaction", "beat"):
+    explicit = next((mark for mark in ("大特写", "特写", "近景", "中景",
+                                       "全景", "远景") if mark in camera),
+                    None)
+    if explicit:
+        scale = explicit if explicit in scales else (
+            "全景" if "全景" in scales else scales[0])
+    elif scene_start:
+        # 每场开场环境镜:远景/全景交替定场,避免整集都是近景
+        wide = [s for s in ("远景", "全景") if s in scales]
+        scale = wide[(index - 1) % len(wide)] if wide else scales[0]
+    elif kind == "reaction":
         scale = "近景" if "近景" in scales else scales[0]
+    elif kind == "beat":
+        scale = "中景" if "中景" in scales else scales[0]
     else:
-        fallback_scales = [s for s in ("中景", "近景", "特写") if s in scales]
-        scale = fallback_scales[(index - 1) % len(fallback_scales)] if fallback_scales else scales[0]
+        # 对白/动作镜:中近全轮换,保证纵向景别有变化
+        fallback_scales = [s for s in ("中景", "近景", "全景", "特写")
+                           if s in scales]
+        scale = (fallback_scales[(index - 1) % len(fallback_scales)]
+                 if fallback_scales else scales[0])
+    if (prev_scale and scale == prev_scale and not explicit
+            and not scene_start):
+        # 标准要求相邻景别变化:与上一镜相同时顺位换一档
+        scale = next((s for s in ("中景", "全景", "近景", "特写")
+                      if s in scales and s != prev_scale), scale)
     if "俯" in camera:
         angle = "俯拍"
     elif "仰" in camera:
@@ -513,6 +530,8 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
     previous = {}
     shots = []
     elapsed = 0.0
+    prev_camera_scale = None
+    prev_scene_no = None
     for index, raw in enumerate(raw_shots, 1):
         scene = scenes.get(raw.get("scene_no"), {})
         kind = raw.get("kind") or ("dialogue" if raw.get("dialogue") else "environment")
@@ -533,7 +552,13 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             for name in characters
         }
         previous.update(copy.deepcopy(end_state))
-        camera = _camera_plan(raw.get("camera", ""), kind, index, rules)
+        camera = _camera_plan(
+            raw.get("camera", ""), kind, index, rules,
+            prev_scale=prev_camera_scale,
+            scene_start=(raw.get("scene_no") != prev_scene_no
+                         and kind == "environment"))
+        prev_camera_scale = camera["shot_scale"]
+        prev_scene_no = raw.get("scene_no")
         text_asset = _text_asset(raw, rules)
         dialogue = raw.get("dialogue")
         speech_emotion = raw.get("speech_emotion") or _emotion_band(

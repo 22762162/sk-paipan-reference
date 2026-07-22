@@ -29,6 +29,13 @@ from pathlib import Path
 DEFAULT_EXEC_ARGS = ["--sandbox", "workspace-write", "--skip-git-repo-check"]
 
 # 强制真实出图:Codex 是编码代理,放任它就会用 Pillow 画示意图充数
+# 画面语义硬约束:角色名不是物种;不画剧情外的杂物
+SUBJECT_DIRECTIVE = (
+    "画面语义约束:所有角色一律画成人类,角色名只是称呼——"
+    "「小鹿」「石头」「小狐」等名字绝不能画成动物、植物或物体;"
+    "除剧情明确需要的道具外,不要出现无关杂物"
+    "(如悬挂的衣物、衣架、多余的人形)。")
+
 GEN_DIRECTIVE = (
     "你必须使用你环境里可用的图像生成能力(图像生成技能 / 工具 / MCP,"
     "如 gpt-image 等)真实生成图片;禁止用 Pillow / matplotlib / SVG 等"
@@ -72,7 +79,7 @@ def build_instruction(capability, payload, out_dir):
         payload = dict(payload)
         payload["prompt"] = (f"{payload.get('prompt', '')}。"
                              f"修改意见(必须落实):{feedback}")
-    common = f"{_style_line(payload)}{GEN_DIRECTIVE}"
+    common = f"{_style_line(payload)}{SUBJECT_DIRECTIVE}{GEN_DIRECTIVE}"
     if capability == "image":
         safe = "".join(c if c.isalnum() else "_"
                        for c in str(payload.get("art_name", "")))[:40]

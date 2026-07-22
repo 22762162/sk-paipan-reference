@@ -64,6 +64,7 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
 - 关键台词后的听者反应与情绪高潮留白由平台补齐，不要用空镜凑时长；
 - shot_no 从 1 连续编号；duration 单位秒，优先 5-8 秒，最长 15 秒；
 - prompt 含场景、准确人物名单、主体动作、光影、机位与结尾状态；
+- prompt 中所有人物一律按人类角色描写(名字只是称呼,不能当作动物);
 - 不生成对白字幕。手机屏、弹幕、合同等可读文字只描述载体与准确文字，
   后续由 ChatGPT 关键帧锁定，不能交给视频模型从零生成；
 - 只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块。
@@ -191,6 +192,49 @@ def validate_design(data, payload):
     return None
 
 
+IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(可直接读取),
+逐项核对是否符合生产要求。
+
+画面要求:
+- 出场角色:{characters}(严格共 {count} 人;所有角色必须是人类,
+  角色名只是称呼——「小鹿」「石头」等绝不能是动物/物体)
+- 人物设定要点(发型/服装/标志特征必须一致,不能像换了一个人):{designs}
+- 场景:{location};动作:{action};镜头:{camera}
+  (景别需大致相符:要求全景/远景不能给成特写,反之亦然)
+- 不允许出现:动物化的角色、与剧情无关的杂物(悬挂的衣物/衣架)、
+  字幕条、乱码文字、多余或缺失的人物{extra}
+
+只输出一个 JSON 对象,不要任何其他文字:
+{{"pass": true或false, "issues": ["不通过的具体原因,每条一句,指出在画面哪里"]}}"""
+
+
+def build_qc_prompt(payload):
+    characters = payload.get("characters") or []
+    return IMAGE_QC_PROMPT.format(
+        image=payload.get("image_uri", ""),
+        characters="、".join(characters) or "无人(空镜)",
+        count=payload.get("count", len(characters)),
+        designs=payload.get("designs") or "见参考图",
+        location=payload.get("location") or "按提示词",
+        action=payload.get("action") or "按提示词",
+        camera=payload.get("camera") or "按提示词",
+        extra=("、" + "、".join(payload.get("forbid", []))
+               if payload.get("forbid") else ""))
+
+
+def validate_image_qc(data):
+    if not isinstance(data, dict) or "pass" not in data:
+        return "缺少 pass 字段"
+    data["pass"] = bool(data["pass"])
+    issues = data.get("issues")
+    if not isinstance(issues, list):
+        issues = [str(issues)] if issues else []
+    data["issues"] = [str(item) for item in issues][:8]
+    if not data["pass"] and not data["issues"]:
+        data["issues"] = ["未给出具体原因"]
+    return None
+
+
 def build_prompt(capability, payload):
     """构造编剧/分镜/人物设定提示词(CLI 桥与 Claude API Provider 共用)。"""
     if capability == "script" and payload.get("character_design"):
@@ -228,6 +272,8 @@ def build_prompt(capability, payload):
     if capability == "storyboard":
         return STORYBOARD_PROMPT.format(
             script=json.dumps(payload.get("script", {}), ensure_ascii=False))
+    if capability == "image_qc":
+        return build_qc_prompt(payload)
     raise ValueError(f"claude 编剧不支持能力: {capability}")
 
 
@@ -253,8 +299,12 @@ def run(request, claude, timeout):
     data = extract_json(proc.stdout)
     if data is None:
         return {"ok": False, "error": "claude 输出中未找到 JSON 对象"}
-    error = (validate_script(data, payload) if capability == "script"
-             else validate_storyboard(data))
+    if capability == "image_qc":
+        error = validate_image_qc(data)
+    elif capability == "script":
+        error = validate_script(data, payload)
+    else:
+        error = validate_storyboard(data)
     if error:
         return {"ok": False, "error": f"claude 输出校验失败: {error}"}
     return {"ok": True, "data": data, "uri": ""}

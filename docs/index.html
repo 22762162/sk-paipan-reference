@@ -1731,6 +1731,9 @@ textarea:focus-visible, select:focus-visible {
 }
 .image-line-row .il-label { flex: 0 0 auto; }
 
+/* ---- 图片质检徽标 ---- */
+.plan-st.st-qc-ok { background: rgba(12, 163, 12, .14); color: #58c558; }
+
 .demo-note {
   background: var(--surface-2); border-bottom: 1px solid var(--hairline);
   color: var(--ink-2); font-size: 12.5px; padding: 7px 20px;
@@ -5627,6 +5630,21 @@ function planIsMock(item) {
   return item.status === "done" && item.real === false;
 }
 
+function planQcBadge(item) {
+  const qc = item.qc;
+  if (!qc) return "";
+  if (qc.passed)
+    return `<span class="plan-st st-qc-ok" title="视觉质检通过${qc.attempts > 1 ? `(重画 ${qc.attempts - 1} 次后通过)` : ""}">质检✓</span>`;
+  return `<span class="plan-st st-mock" title="${esc((qc.issues || []).join(";"))}">⚠ 质检未过</span>`;
+}
+
+function planQcIssuesHtml(item) {
+  const qc = item.qc;
+  if (!qc || qc.passed || !(qc.issues || []).length) return "";
+  return `<div class="plan-err">质检:${esc(qc.issues.join(";"))}
+    <span class="dim">(已自动重画 ${qc.attempts} 次仍未过,可改提示词手动重画)</span></div>`;
+}
+
 function planMockReasonHtml(item) {
   const parts = (item.fallbacks || []).map((f) =>
     `${PROVIDER_LABEL[f.provider] || f.provider}:${f.reason}`);
@@ -5685,11 +5703,13 @@ function planItemHtml(data, item, editable) {
         ${planIsMock(item) ? `<span class="plan-st st-mock">⚠ 占位图</span>`
           : (item.provider && item.real
             ? `<span class="plan-st st-real">${esc(PROVIDER_LABEL[item.provider] || item.provider)}</span>` : "")}
+        ${planQcBadge(item)}
         ${item.model ? `<span class="plan-st st-model" title="实际记录的模型/托管通道">${esc(item.model)}</span>` : ""}
         <span class="plan-st st-${st}">${PLAN_STATUS_CN[st] || st}${item.custom_prompt ? " · 已改词" : ""}</span>
         </span>
       </div>
       ${planIsMock(item) ? planMockReasonHtml(item) : ""}
+      ${planQcIssuesHtml(item)}
       ${item.error ? `<div class="plan-err">${esc(item.error)}</div>` : ""}
       <details class="plan-prompt"><summary>提示词</summary>
         <pre>${esc(item.prompt || "")}</pre></details>
@@ -5910,7 +5930,10 @@ function planCardHtml(data, item, avg) {
     state = `<span class="pc-state pc-timer" data-started="${item.started_at || ""}"
       data-eta="${avg ? Math.round(avg) : ""}">正在画 0:00${avg ? ` · 预计 ~${fmtDur(avg)}` : ""}</span>`;
   } else if (["done", "reused"].includes(st)) {
-    state = `<span class="pc-state pc-ok">✓ ${st === "reused" ? "复用已有" : "已完成"}${item.duration ? ` · 用时 ${fmtDur(item.duration)}` : ""}${planIsMock(item) ? ` · <b class="pc-mock">占位图</b>` : ""}</span>`;
+    const qc = item.qc;
+    const qcNote = !qc ? "" : (qc.passed ? " · 质检✓"
+      : ` · <b class="pc-mock" title="${esc((qc.issues || []).join(";"))}">⚠质检未过</b>`);
+    state = `<span class="pc-state pc-ok">✓ ${st === "reused" ? "复用已有" : "已完成"}${item.duration ? ` · 用时 ${fmtDur(item.duration)}` : ""}${planIsMock(item) ? ` · <b class="pc-mock">占位图</b>` : ""}${qcNote}</span>`;
   } else if (st === "failed") {
     state = `<span class="pc-state pc-fail" title="${esc(item.error || "")}">失败:${esc((item.error || "").slice(0, 40))}</span>`;
   } else {

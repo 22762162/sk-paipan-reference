@@ -1722,3 +1722,6 @@ textarea:focus-visible, select:focus-visible {
   padding: 8px 10px; font-size: 13px;
 }
 .image-line-row .il-label { flex: 0 0 auto; }
+
+/* ---- 图片质检徽标 ---- */
+.plan-st.st-qc-ok { background: rgba(12, 163, 12, .14); color: #58c558; }
