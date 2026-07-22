@@ -219,6 +219,20 @@ def test_production_board_images_are_selectable():
     assert ".plan-preview-main" in css
 
 
+def test_batch_redraw_is_live_and_auditable_on_mobile():
+    """图片清单必须实时展示批量进度、自动改词与实际参考图。"""
+    root = Path(__file__).resolve().parents[1]
+    app_js = (root / "aifos/web/static/app.js").read_text(encoding="utf-8")
+    css = (root / "aifos/web/static/style.css").read_text(encoding="utf-8")
+    assert "function watchBatchRedraw" in app_js
+    assert "function updateBatchRedrawProgress" in app_js
+    assert "function refreshOpenPlanOverlay" in app_js
+    assert "提示词已自动修正" in app_js
+    assert "本次实际交给出图产线的参考图" in app_js
+    assert ".batch-job-progress" in css
+    assert ".plan-trace" in css
+
+
 def test_regen_always_produces_new_image(app):
     """重画必然产生新画面:同一意见连续重画两次,内容也不能相同。
     (占位产线是确定性生成,靠 payload 里的 revision 保证变化。)"""

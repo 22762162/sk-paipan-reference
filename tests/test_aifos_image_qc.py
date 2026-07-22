@@ -334,8 +334,21 @@ def test_single_and_batch_qc_and_redo(app):
             vers[i["id"]] = t
     plan_path.write_text(_json.dumps(plan, ensure_ascii=False),
                          encoding="utf-8")
-    redo = app.director.redo_items("质检三件套", 1, only_failed=True)
+    updates = []
+    redo = app.director.redo_items(
+        "质检三件套", 1, only_failed=True,
+        progress=lambda **fields: updates.append(fields))
     assert redo["status"] == "done" and redo["redone"] == 2
+    assert redo["checked"] == 2
+    assert {u["phase"] for u in updates} >= {
+        "queued", "redrawing", "checking", "done"}
+    final_plan = _json.loads(plan_path.read_text(encoding="utf-8"))
+    redrawn = [i for i in final_plan["items"] if i["id"] in fail_ids]
+    assert all(i["revision"]["source"] == "batch_qc" for i in redrawn)
+    assert all(i["revision"]["prompt_modified"] for i in redrawn)
+    assert all("测试标记未过" in i["prompt"] for i in redrawn)
+    assert all(i["reference_inputs"]["attached"] for i in redrawn)
+    assert all(i["reference_inputs"]["count"] >= 1 for i in redrawn)
 
 
 def test_codex_qc_instruction_and_parse(tmp_path, monkeypatch):

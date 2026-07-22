@@ -172,8 +172,12 @@ class JobRegistry:
         return job_id
 
     def start_task(self, title, number, task, action="adjustment",
-                   request=None):
-        """通用后台任务(打磨重写/重画)。task(app) → summary。"""
+                   request=None, tracked=False):
+        """通用后台任务(打磨重写/重画)。
+
+        普通任务签名为 ``task(app, run_id)``；tracked=True 时额外传入
+        ``report(**fields)``，让长批次把逐项进度写进 job，前端无需猜测。
+        """
         run_id = self._create_history(
             title, number, action, request=request)
         with self._lock:
@@ -184,7 +188,19 @@ class JobRegistry:
                 "title": title, "episode": number,
                 "started_at": time.time(), "run_id": run_id,
             }
-        self._run(job_id, lambda app: task(app, run_id))
+        def report(**fields):
+            with self._lock:
+                job = self._jobs.get(job_id)
+                if job is None:
+                    return
+                progress = dict(job.get("progress") or {})
+                progress.update(fields)
+                progress["updated_at"] = time.time()
+                job["progress"] = progress
+
+        runner = ((lambda app: task(app, run_id, report))
+                  if tracked else (lambda app: task(app, run_id)))
+        self._run(job_id, runner)
         return job_id
 
     def _run(self, job_id, task):
@@ -1056,9 +1072,9 @@ def make_handler(workspace, jobs):
             return self._json({"job_id": job_id}, status=202)
 
         def _settings_update(self):
-            """设置中心保存:{provider, fields} 或 {capability, chain}。"""
-            from ..settings import set_routing, settings_payload, \
-                update_provider
+            """设置中心保存 Provider、能力路由或整套图片策略。"""
+            from ..settings import set_image_strategy, set_routing, \
+                settings_payload, update_provider
             body = self._read_body()
             if body is None:
                 return self._error(400, "请求体不是合法 JSON")
@@ -1068,6 +1084,9 @@ def make_handler(workspace, jobs):
                     update_provider(app.workspace.config_path,
                                     body["provider"],
                                     body.get("fields") or {})
+                elif body.get("image_strategy"):
+                    set_image_strategy(app.workspace.config_path,
+                                       body["image_strategy"])
                 elif body.get("defaults"):
                     from ..settings import set_defaults
                     set_defaults(app.workspace.config_path,
@@ -1279,10 +1298,12 @@ def make_handler(workspace, jobs):
             only_failed = bool(body.get("only_failed"))
             job_id = jobs.start_task(
                 title, number,
-                lambda app, run_id: app.director.redo_items(
+                lambda app, run_id, report: app.director.redo_items(
                     title, number, item_ids=item_ids,
-                    only_failed=only_failed),
-                action="redo_items")
+                    only_failed=only_failed, progress=report),
+                action="redo_items", tracked=True,
+                request={"item_ids": item_ids,
+                         "only_failed": only_failed})
             return self._json({"job_id": job_id}, status=202)
 
         def _redo_mock(self):

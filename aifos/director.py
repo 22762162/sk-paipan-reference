@@ -546,7 +546,8 @@ class Director:
                 item["error"] = prev.get("error", "")
                 for key in ("provider", "model", "real", "fallbacks",
                             "image_task_class", "image_quality", "unit_cost",
-                            "qc", "started_at", "finished_at", "duration"):
+                            "qc", "started_at", "finished_at", "duration",
+                            "reference_inputs", "revision"):
                     if key in prev:
                         item[key] = prev[key]
                 if prev.get("custom_prompt"):
@@ -582,10 +583,61 @@ class Director:
             self._plan_write(ctx, plan)
             return
 
-    def _plan_run(self, ctx, item_id, fn, prompt=None):
+    @staticmethod
+    def _prompt_with_feedback(prompt, feedback):
+        prompt = (prompt or "").strip()
+        feedback = (feedback or "").strip()
+        return (f"{prompt}。修改意见(必须落实):{feedback}"
+                if feedback else prompt)
+
+    @staticmethod
+    def _reference_inputs(payload):
+        """把本次真实传入产线的参考图做成人可读清单，供手机端核验。"""
+        payload = payload or {}
+        rows = []
+
+        def add(kind, uri, label=""):
+            if not uri:
+                return
+            value = str(uri)
+            if any(row["uri"] == value for row in rows):
+                return
+            rows.append({"kind": kind, "label": label or kind,
+                         "name": Path(value).name or value,
+                         "uri": value})
+
+        for ref in payload.get("identity_references") or []:
+            if isinstance(ref, dict):
+                add("identity", ref.get("uri"),
+                    f"{ref.get('character', '角色')}最终立绘")
+        for uri in payload.get("character_refs") or []:
+            add("character", uri, "人物设定/资产图")
+        add("keyframe", payload.get("image_uri"), "本镜关键图")
+        add("continuity", payload.get("chain_first_uri"), "上一镜尾帧")
+        add("scene", payload.get("scene_ref"), "场景概念图")
+        add("style", payload.get("style_ref"), "全项目风格基准图")
+        for uri in payload.get("reference_images") or []:
+            add("user", uri, "用户参考图")
+        return {"attached": bool(rows), "count": len(rows),
+                "required": bool(payload.get("require_reference_images")),
+                "items": rows}
+
+    def _plan_run(self, ctx, item_id, fn, prompt=None, payload=None,
+                  revision_source="manual"):
         """包住一次出图调用:生成中 → 完成/失败;手动停止落回排队。
         完成时记录实际使用的产线(真实/占位)与回退原因,界面透明可见。"""
-        self._plan_mark(ctx, item_id, "generating", prompt=prompt)
+        feedback = (payload or {}).get("feedback", "")
+        self._plan_mark(ctx, item_id, "generating", prompt=prompt,
+                        extra={
+                            "qc": None,
+                            "reference_inputs": self._reference_inputs(
+                                payload),
+                            "revision": {
+                                "source": revision_source,
+                                "prompt_modified": bool(feedback),
+                                "feedback": feedback,
+                            },
+                        })
         try:
             result = fn()
         except ProduceCancelled:
@@ -717,7 +769,12 @@ class Director:
         """串行执行单个出图任务(含质检),记账并更新清单。"""
         if self._cancel_requested(ctx):
             raise ProduceCancelled("已手动停止生成")
-        self._plan_mark(ctx, task["item_id"], "generating")
+        payload = task.get("payload") or {}
+        self._plan_mark(ctx, task["item_id"], "generating", extra={
+            "image_task_class": payload.get("image_task_class"),
+            "image_quality": payload.get("image_quality"),
+            "reference_inputs": self._reference_inputs(payload),
+        })
         try:
             result = self._generate_image_with_qc(
                 task["capability"], task["payload"],
@@ -787,7 +844,12 @@ class Director:
                     task = next(iterator)
                 except StopIteration:
                     return False
-                self._plan_mark(ctx, task["item_id"], "generating")
+                payload = task.get("payload") or {}
+                self._plan_mark(ctx, task["item_id"], "generating", extra={
+                    "image_task_class": payload.get("image_task_class"),
+                    "image_quality": payload.get("image_quality"),
+                    "reference_inputs": self._reference_inputs(payload),
+                })
                 future = pool.submit(
                     self._generate_image_with_qc, task["capability"],
                     task["payload"], ctx["out_root"] / task["sub_dir"],
@@ -1518,7 +1580,11 @@ class Director:
         anchor = self._style_anchor_uri(project_id)
         if anchor:
             refs["style_ref"] = anchor
-        refs["require_reference_images"] = bool(characters)
+        # 只要本次已经有任何锚点，就必须路由到能真实接收图片的产线；
+        # 空镜同样不能把场景/风格/用户参考静默丢掉。
+        refs["require_reference_images"] = bool(
+            characters or refs.get("scene_ref")
+            or refs.get("reference_images") or refs.get("style_ref"))
         return refs
 
     def _rich_shot_prompt(self, ctx, shot, location):
@@ -2156,7 +2222,8 @@ class Director:
             pause_for_confirm=True, feedback=feedback, run_id=run_id)
 
     def regen_image(self, project_title, episode_number, target,
-                    feedback="", prompt_override=""):
+                    feedback="", prompt_override="",
+                    revision_source="manual"):
         """重画单张图:target = {"kind": character_art|scene_art|shot,
         "name"|"shot_no"};附意见时新画面按意见调整;
         prompt_override 非空则整句替换默认提示词(所见即所得)。
@@ -2223,9 +2290,7 @@ class Director:
             prompt = prompt_override or self._sheet_prompt(
                 name, role, style, label, desc, key=sheet_key,
                 design=self._character_design(project["id"], name))
-            result = self._plan_run(
-                ctx, f"sheet:{name}:{sheet_key}", lambda: self._call(
-                ctx, "image", {
+            payload = {
                     "character_sheet": sheet_key, "sheet_label": label,
                     "image_task_class": "important",
                     "image_quality": "high",
@@ -2243,7 +2308,12 @@ class Director:
                         project["id"], [name]),
                     "style_ref": self._style_anchor_uri(project["id"]),
                     "aspect": aspect, **ctx["dims"],
-                    }, "cast"), prompt=prompt)
+            }
+            result = self._plan_run(
+                ctx, f"sheet:{name}:{sheet_key}",
+                lambda: self._call(ctx, "image", payload, "cast"),
+                prompt=self._prompt_with_feedback(prompt, feedback),
+                payload=payload, revision_source=revision_source)
             self.assets.register(
                 project["id"], "character_sheet", raw, uri=result.uri,
                 meta={"character": name, "sheet": sheet_key,
@@ -2253,8 +2323,9 @@ class Director:
             scene = next((s for s in script["scenes"]
                           if s["location"] == name), {})
             prompt = prompt_override or self._scene_prompt(name, style)
-            result = self._plan_run(ctx, f"scene:{name}", lambda: self._call(
-                ctx, "image", {
+            references = self._reference_uris(project["id"], [name])
+            style_ref = self._style_anchor_uri(project["id"])
+            payload = {
                     "scene_art": True, "art_name": name,
                     "image_task_class": "batch",
                     "image_quality": "lite",
@@ -2263,11 +2334,17 @@ class Director:
                     "prompt": prompt,
                     "style": style, "feedback": feedback,
                     "revision": next_revision("scene_art", name),
-                    "reference_images": self._reference_uris(
-                        project["id"], [name]),
-                    "style_ref": self._style_anchor_uri(project["id"]),
+                    "reference_images": references,
+                    "style_ref": style_ref,
+                    "require_reference_images": bool(
+                        references or style_ref),
                     "aspect": aspect, **ctx["dims"],
-                }, "cast"), prompt=prompt)
+            }
+            result = self._plan_run(
+                ctx, f"scene:{name}",
+                lambda: self._call(ctx, "image", payload, "cast"),
+                prompt=self._prompt_with_feedback(prompt, feedback),
+                payload=payload, revision_source=revision_source)
             self.assets.register(project["id"], "scene_art", name,
                                  uri=result.uri, new_version=True)
         elif kind == "shot":
@@ -2290,7 +2367,9 @@ class Director:
             result = self._plan_run(
                 ctx, f"shot:{shot_no}",
                 lambda: self._call(ctx, "image", payload, "images"),
-                prompt=payload["prompt"])
+                prompt=self._prompt_with_feedback(
+                    payload["prompt"], feedback),
+                payload=payload, revision_source=revision_source)
             self.assets.register(project["id"], "image", asset_name,
                                  uri=result.uri, new_version=True)
             frames_payload = {**payload, "image_uri": result.uri}
@@ -2309,7 +2388,10 @@ class Director:
                     frames_payload["chain_first_uri"] = row["uri"]
             frames = self._plan_run(
                 ctx, f"frames:{shot_no}", lambda: self._call(
-                    ctx, "frames", frames_payload, "frames"))
+                    ctx, "frames", frames_payload, "frames"),
+                prompt=self._prompt_with_feedback(
+                    frames_payload["prompt"], feedback),
+                payload=frames_payload, revision_source=revision_source)
             self.assets.register(project["id"], "first_frame", asset_name,
                                  uri=frames.data["first"], new_version=True)
             self.assets.register(project["id"], "last_frame", asset_name,
@@ -2354,7 +2436,9 @@ class Director:
             result = self._plan_run(
                 ctx, f"frames:{shot_no}", lambda: self._call(
                     ctx, "frames", frames_payload, "frames"),
-                prompt=prompt_override or None)
+                prompt=self._prompt_with_feedback(
+                    frames_payload["prompt"], feedback),
+                payload=frames_payload, revision_source=revision_source)
             self.assets.register(project["id"], "first_frame", asset_name,
                                  uri=result.data["first"],
                                  new_version=True)
@@ -2749,11 +2833,11 @@ class Director:
                 "passed": passed, "failed": failed}
 
     def redo_items(self, project_title, episode_number, item_ids=None,
-                   only_failed=False):
+                   only_failed=False, progress=None):
         """批量重画:按 item_ids 重画;only_failed=True 时重画所有质检
         未过的图。可暂停,重画后自动复检。"""
         project, episode = self._episode_ctx(project_title, episode_number)
-        ctx = {"episode": dict(episode),
+        ctx = {"project": dict(project), "episode": dict(episode),
                "out_root": self._episode_dir(project, episode)}
         plan = self._plan_read(ctx)
         by_id = {i["id"]: i for i in plan["items"]}
@@ -2764,6 +2848,9 @@ class Director:
         else:
             targets = [tid for tid in (item_ids or []) if tid in by_id]
         if not targets:
+            if progress:
+                progress(phase="done", total=0, completed=0, redone=0,
+                         failed=0, note="没有需要重画的图")
             return {"status": "done", "redone": 0,
                     "note": "没有需要重画的图"}
         if only_failed:
@@ -2780,39 +2867,135 @@ class Director:
                     "director",
                     f"批量重画熔断:{len(systemic)}张出现同类人物身份问题；"
                     "应先修复/重新选择最终立绘，禁止沿用错误锚点逐张重画")
-                return {
+                result = {
                     "status": "blocked", "redone": 0,
                     "reason": "systemic_identity_failure",
                     "affected": len(systemic),
                     "note": "检测到系统性人物身份/发型/服装漂移，请先回人物定版，避免无效批量重画",
                 }
+                if progress:
+                    progress(phase="blocked", total=len(targets),
+                             completed=0, redone=0, failed=0,
+                             note=result["note"])
+                return result
         previous_status = episode["status"]
         self.projects.set_episode_status(episode["id"], "cast")
         self.log.info("director", f"开始批量重画 {len(targets)} 张")
-        redone = 0
+        total = len(targets)
+        redone = failed = checked = qc_passed = qc_failed = processed = 0
+        if progress:
+            progress(phase="queued", total=total, completed=0, redone=0,
+                     failed=0, checked=0, qc_passed=0, qc_failed=0,
+                     prompt_policy="auto_revision",
+                     reference_policy="auto_attach")
         try:
-            for item_id in targets:
+            for index, item_id in enumerate(targets, 1):
                 if self._cancel_requested(ctx):
                     raise ProduceCancelled("已手动暂停重画")
                 target = self._plan_item_target(item_id)
+                item = by_id[item_id]
+                label = item.get("label") or item_id
                 if target is None:
+                    failed += 1
+                    processed += 1
+                    if progress:
+                        progress(phase="redrawing", total=total,
+                                 completed=processed, current_index=index,
+                                 current_item=item_id, current_label=label,
+                                 redone=redone, failed=failed)
                     continue
+                issues = list((item.get("qc") or {}).get("issues") or [])
+                if issues:
+                    feedback = (
+                        "批量重画自动修正：必须逐项解决上一版质检问题："
+                        + "；".join(issues))[:800]
+                    revision_source = "batch_qc"
+                else:
+                    feedback = (
+                        "批量重新画：生成与上一版明显不同的有效新版本；"
+                        "严格保持已锁定的人物身份、服装、场景、文字白名单"
+                        "和前后镜头连续性")
+                    revision_source = "batch_redraw"
+                prompt_override = (item.get("prompt", "")
+                                   if item.get("custom_prompt") else "")
+                if progress:
+                    progress(phase="redrawing", total=total,
+                             completed=processed, current_index=index,
+                             current_item=item_id, current_label=label,
+                             redone=redone, failed=failed,
+                             prompt_modified=True,
+                             revision_note=feedback)
                 try:
-                    self.regen_image(project_title, episode_number, target)
+                    self.regen_image(
+                        project_title, episode_number, target,
+                        feedback=feedback, prompt_override=prompt_override,
+                        revision_source=revision_source)
                     redone += 1
                 except AifosError as exc:
+                    failed += 1
                     self.log.warn("director",
                                   f"重画 {item_id} 跳过: {exc}")
+                    processed += 1
+                    if progress:
+                        progress(phase="redrawing", total=total,
+                                 completed=processed, current_index=index,
+                                 current_item=item_id, current_label=label,
+                                 redone=redone, failed=failed,
+                                 error=str(exc))
+                    continue
+
+                refreshed = next((entry for entry in self._plan_read(ctx)[
+                    "items"] if entry["id"] == item_id), item)
+                refs = refreshed.get("reference_inputs") or {}
+                if progress:
+                    progress(phase="checking", total=total,
+                             completed=processed, current_index=index,
+                             current_item=item_id, current_label=label,
+                             redone=redone, failed=failed,
+                             references_attached=bool(refs.get("attached")),
+                             reference_count=int(refs.get("count") or 0))
+                try:
+                    report = self._qc_one(
+                        project, episode, ctx, refreshed)
+                    checked += 1
+                    if report.get("passed"):
+                        qc_passed += 1
+                    else:
+                        qc_failed += 1
+                except AifosError as exc:
+                    self.log.warn(
+                        "director", f"重画后复检 {item_id} 跳过: {exc}")
+                processed += 1
+                if progress:
+                    progress(phase="running", total=total,
+                             completed=processed, current_index=index,
+                             current_item=item_id, current_label=label,
+                             redone=redone, failed=failed, checked=checked,
+                             qc_passed=qc_passed, qc_failed=qc_failed,
+                             references_attached=bool(refs.get("attached")),
+                             reference_count=int(refs.get("count") or 0))
         except ProduceCancelled:
             self.projects.set_episode_status(episode["id"], previous_status)
-            return {"status": "paused", "redone": redone}
+            if progress:
+                progress(phase="paused", total=total, completed=processed,
+                         redone=redone, failed=failed, checked=checked,
+                         qc_passed=qc_passed, qc_failed=qc_failed)
+            return {"status": "paused", "redone": redone,
+                    "failed": failed, "checked": checked}
         finally:
             row = self.projects.get_episode(episode["id"])
             if row and row["status"] in ("cast", "cancelling"):
                 self.projects.set_episode_status(
                     episode["id"], previous_status)
         self.log.info("director", f"批量重画完成:{redone} 张")
-        return {"status": "done", "redone": redone}
+        if progress:
+            progress(phase="done", total=total, completed=processed,
+                     redone=redone, failed=failed, checked=checked,
+                     qc_passed=qc_passed, qc_failed=qc_failed,
+                     current_item="", current_label="")
+        return {"status": "done", "total": total, "redone": redone,
+                "failed": failed, "checked": checked,
+                "qc_passed": qc_passed, "qc_failed": qc_failed}
 
     def redo_placeholders(self, project_title, episode_number):
         """一键补真:把清单里落到占位产线的图,逐张用真实产线重画。

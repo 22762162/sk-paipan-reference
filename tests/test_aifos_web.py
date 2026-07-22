@@ -73,6 +73,10 @@ def test_index_and_static(server):
     assert "约 ¥0.28/张".encode() in app_js
     assert "GPT Image 2 high".encode() in app_js
     assert "仅终稿/复杂文字".encode() in app_js
+    assert "全部 Codex 优先".encode() in app_js
+    assert "全部 Seedream 5.0 Lite 优先".encode() in app_js
+    assert "全部 OpenAI 图片 API 优先".encode() in app_js
+    assert b"image_strategy" in app_js
     assert b"/api/character/select" in app_js
     assert "人物定版".encode() in app_js
     status, ctype, style_css = _request(
@@ -378,6 +382,29 @@ def test_image_line_switch_and_parallel(server):
     assert view["image_routing"]["important"][0] == "codex"
     assert view["image_routing"]["final"][0] == "codex"
     assert view["image_routing"]["complex_text"][0] == "codex"
+    assert view["image_strategy"] == "smart"
+    # 快捷策略必须同时改分类图片和未分类旧调用，不能只切界面显示。
+    for strategy, provider in (
+            ("codex", "codex"),
+            ("seedream5_lite", "seedream5_lite"),
+            ("image_api", "image_api")):
+        status, view = _json_request(port, "POST", "/api/settings", {
+            "image_strategy": strategy})
+        assert status == 200
+        assert view["image_strategy"] == strategy
+        assert all(view["image_routing"][kind][0] == provider
+                   for kind in ("batch", "important", "final",
+                                "complex_text"))
+        assert all(view["routing"][capability][0] == provider
+                   for capability in ("image", "frames", "cover"))
+    status, view = _json_request(port, "POST", "/api/settings", {
+        "image_strategy": "smart"})
+    assert status == 200 and view["image_strategy"] == "smart"
+    assert view["image_routing"]["batch"][0] == "seedream5_lite"
+    assert view["image_routing"]["important"][0] == "codex"
+    status, reply = _json_request(port, "POST", "/api/settings", {
+        "image_strategy": "not-a-strategy"})
+    assert status == 400 and "未知出图策略" in reply["error"]
     # 切到 OpenAI 图片 API 优先
     status, _ = _json_request(port, "POST", "/api/settings", {
         "capability": "image",

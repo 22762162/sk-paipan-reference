@@ -1553,17 +1553,26 @@ function scriptToText(script) {
   }).join("\n\n");
 }
 
-async function pollJob(jobId, onDone) {
-  const timer = setInterval(async () => {
+async function pollJob(jobId, onDone, onProgress) {
+  let timer = null;
+  let finished = false;
+  const tick = async () => {
     try {
       const job = await api(`/api/jobs/${jobId}`);
+      if (onProgress) onProgress(job);
       if (job.status !== "running") {
-        clearInterval(timer);
+        finished = true;
+        if (timer) clearInterval(timer);
         if (job.status === "failed") showToast(job.error || "任务失败", "error");
         onDone(job);
       }
-    } catch (e) { clearInterval(timer); }
-  }, 1200);
+    } catch (e) {
+      finished = true;
+      if (timer) clearInterval(timer);
+    }
+  };
+  await tick();
+  if (!finished) timer = setInterval(tick, 1200);
 }
 
 /* 剧本阅读 + 打磨(意见重写 / 直接编辑) */
@@ -1881,6 +1890,32 @@ function planQcIssuesHtml(item) {
     <span class="dim">(已自动重画 ${qc.attempts} 次仍未过,可改提示词手动重画)</span></div>`;
 }
 
+function planTraceBadges(item) {
+  const revision = item.revision || {};
+  const refs = item.reference_inputs || {};
+  const auto = String(revision.source || "").startsWith("batch_");
+  return `${auto && revision.prompt_modified
+    ? `<span class="plan-st st-auto" title="批量重画已自动加入修正要求">自动改词✓</span>` : ""}
+    ${refs.count
+      ? `<span class="plan-st st-refs" title="本次实际交给出图产线的参考图">参考图 ×${refs.count}</span>`
+      : (refs.required
+        ? `<span class="plan-st st-mock">⚠ 缺参考图</span>` : "")}`;
+}
+
+function planTraceHtml(item) {
+  const revision = item.revision || {};
+  const refs = item.reference_inputs || {};
+  const refItems = refs.items || [];
+  if (!revision.prompt_modified && !refItems.length && !refs.required) return "";
+  return `<details class="plan-trace" ${item.status === "generating" ? "open" : ""}>
+    <summary>本次重画记录 · ${revision.prompt_modified ? "提示词已自动修正" : "提示词未改"}
+      · ${refItems.length ? `已附 ${refItems.length} 张参考图` : (refs.required ? "缺少必需参考图" : "无需参考图")}</summary>
+    ${revision.feedback ? `<div><b>自动修正：</b>${esc(revision.feedback)}</div>` : ""}
+    ${refItems.length ? `<div><b>参考图：</b>${refItems.map((ref) =>
+      `${esc(ref.label || ref.kind)}「${esc(ref.name || "未命名") }」`).join("；")}</div>` : ""}
+  </details>`;
+}
+
 function planMockReasonHtml(item) {
   const parts = (item.fallbacks || []).map((f) =>
     `${PROVIDER_LABEL[f.provider] || f.provider}:${f.reason}`);
@@ -1975,6 +2010,7 @@ function planItemHtml(data, item, editable) {
           : (item.provider && item.real
             ? `<span class="plan-st st-real">${esc(PROVIDER_LABEL[item.provider] || item.provider)}</span>` : "")}
         ${planQcBadge(item)}
+        ${planTraceBadges(item)}
         ${item.model ? `<span class="plan-st st-model" title="实际记录的模型/托管通道">${esc(item.model)}</span>` : ""}
         ${planCostBadge(item)}
         <span class="plan-st st-${st}">${PLAN_STATUS_CN[st] || st}${item.custom_prompt ? " · 已改词" : ""}</span>
@@ -1982,6 +2018,7 @@ function planItemHtml(data, item, editable) {
       </div>
       ${planIsMock(item) ? planMockReasonHtml(item) : ""}
       ${planQcIssuesHtml(item)}
+      ${planTraceHtml(item)}
       ${item.error ? `<div class="plan-err">${esc(item.error)}</div>` : ""}
       ${canEdit && ["done", "reused"].includes(st) ? `<div class="plan-qc-row">
         <button class="plan-qc-one" data-plan-id="${esc(item.id)}"
@@ -2139,6 +2176,75 @@ function planSelectCat(cat) {
   });
   planUpdateSelCount();
 }
+
+const batchRedrawSignatures = new Map();
+
+function updateBatchRedrawProgress(episodeId, job, fallbackTotal = 0) {
+  const box = document.querySelector(
+    `.plan-overlay[data-episode="${episodeId}"] .batch-job-progress`);
+  if (!box) return;
+  const p = job.progress || {};
+  const s = job.summary || {};
+  const total = Number(p.total || s.total || fallbackTotal || 0);
+  const completed = Number(p.completed || (job.status === "done" ? s.redone : 0) || 0);
+  const pct = total ? Math.min(100, Math.round(completed / total * 100)) : 0;
+  const phase = p.phase || (job.status === "done" ? "done" : "queued");
+  const phaseCN = {
+    queued: "排队中", redrawing: "正在重新画", checking: "正在自动复检",
+    running: "继续下一张", done: "批量重画完成", paused: "已暂停",
+    blocked: "已阻止无效重画",
+  }[phase] || phase;
+  const current = p.current_label
+    ? ` · 当前：${esc(p.current_label)}` : "";
+  const refText = p.references_attached
+    ? `已自动附上 ${Number(p.reference_count || 0)} 张参考图`
+    : "参考图将在每张开画前自动挂载并显示";
+  const note = p.note || s.note || "";
+  box.hidden = false;
+  box.innerHTML = `<div class="batch-job-head"><b>${esc(phaseCN)}</b>
+      <span>${completed}/${total || "?"} 张${current}</span></div>
+    <div class="batch-job-track"><i style="width:${pct}%"></i></div>
+    <div class="batch-job-meta">
+      <span>提示词：${p.prompt_modified || p.prompt_policy === "auto_revision"
+        ? "已自动加入本次修正要求 ✓" : "等待处理"}</span>
+      <span>参考图：${esc(refText)}</span>
+      ${p.checked != null ? `<span>复检：${p.qc_passed || 0} 通过 / ${p.qc_failed || 0} 未过</span>` : ""}
+      ${note ? `<span class="plan-err">${esc(note)}</span>` : ""}
+    </div>`;
+}
+
+async function refreshOpenPlanOverlay(episodeId) {
+  const panel = document.querySelector(
+    `.plan-overlay[data-episode="${episodeId}"] .plan-overlay-content`);
+  if (!panel) return;
+  try {
+    const data = await api(`/api/episode/${episodeId}`);
+    panel.innerHTML = renderPlanHtml(data, true)
+      || `<div class="dim">本集还没有图片生产计划。</div>`;
+    bindPlanSelection(panel, data, episodeId);
+    bindPlanRegen(panel, episodeId, () => refreshOpenPlanOverlay(episodeId));
+  } catch (e) { /* 下一次任务进度更新再试 */ }
+}
+
+function watchBatchRedraw(episodeId, jobId, total, onDone) {
+  pollJob(jobId, (job) => {
+    updateBatchRedrawProgress(episodeId, job, total);
+    refreshOpenPlanOverlay(episodeId);
+    onDone(job);
+  }, (job) => {
+    updateBatchRedrawProgress(episodeId, job, total);
+    const p = job.progress || {};
+    const signature = JSON.stringify([
+      p.phase, p.completed, p.current_item, p.reference_count,
+      p.qc_passed, p.qc_failed,
+    ]);
+    if (batchRedrawSignatures.get(jobId) !== signature) {
+      batchRedrawSignatures.set(jobId, signature);
+      refreshOpenPlanOverlay(episodeId);
+    }
+  });
+}
+
 async function redoSelected(episodeId, btn) {
   const ids = planPickedIds();
   if (!ids.length) return;
@@ -2148,7 +2254,7 @@ async function redoSelected(episodeId, btn) {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ episode_id: episodeId, item_ids: ids }),
     });
-    pollJob(reply.job_id, (job) => {
+    watchBatchRedraw(episodeId, reply.job_id, ids.length, (job) => {
       if (job.status === "done")
         showToast(`已重画选中的 ${(job.summary || {}).redone || 0} 张`, "ok");
       renderCanvasView(episodeId);
@@ -2169,9 +2275,12 @@ async function redoFailed(episodeId, btn) {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ episode_id: episodeId, only_failed: true }),
     });
-    pollJob(reply.job_id, (job) => {
-      if (job.status === "done")
-        showToast(`已重画 ${(job.summary || {}).redone || 0} 张质检未过的图`, "ok");
+    watchBatchRedraw(episodeId, reply.job_id, 0, (job) => {
+      const summary = job.summary || {};
+      if (summary.status === "blocked")
+        showToast(summary.note || "检测到系统性人物漂移，已停止批量重画", "error");
+      else if (job.status === "done")
+        showToast(`已重画 ${summary.redone || 0} 张质检未过的图`, "ok");
       renderCanvasView(episodeId);
     });
     showToast("开始重画质检未过的图,进度看实况看板", "ok");
@@ -2422,7 +2531,7 @@ async function showPlanOverlay(episodeId) {
   const overlay = document.createElement("div");
   overlay.className = "script-overlay";
   overlay.innerHTML = `
-    <div class="script-panel plan-overlay">
+    <div class="script-panel plan-overlay" data-episode="${episodeId}">
       <div class="script-head">
         <h3>🖼 图片生产清单 · 《${esc(data.project.title)}》第${data.episode.number}集</h3>
         <button class="close">关闭 Esc</button>
@@ -2430,8 +2539,9 @@ async function showPlanOverlay(episodeId) {
       <div class="dim" style="margin:4px 0 10px">每张图的分类、状态与提示词都在这里;
         可以直接改提示词或附意见,单独重画某一张(不影响其他图)。
         镜头画面重画后会自动重做首尾帧并作废旧视频。</div>
-      ${renderPlanHtml(data, true)
-        || `<div class="dim">本集还没有图片生产计划(确认剧本、开始画图后就会出现)。</div>`}
+      <div class="batch-job-progress" hidden></div>
+      <div class="plan-overlay-content">${renderPlanHtml(data, true)
+        || `<div class="dim">本集还没有图片生产计划(确认剧本、开始画图后就会出现)。</div>`}</div>
     </div>`;
   const close = () => {
     overlay.remove(); document.removeEventListener("keydown", onKey);
@@ -3466,16 +3576,51 @@ async function bindImageLineControls() {
       (c) => c.capability === "image" && c.ok) ? "已接通" : "未接通";
   };
   lineSel.innerHTML = `
-    <option value="smart">智能分流 · 批量 Seedream / 重要高清 Codex</option>`;
-  lineSel.value = "smart";
-  lineSel.title = "按图片用途自动选择产线；如需改底层链路，请到 AI 设置的高级能力路由";
-  const policy = st.image_routing || {};
-  const routeLabel = (kind, fallback) => ((policy[kind] || []).map((name) =>
-    PROVIDER_LABEL[name] || name).join(" → ") || fallback);
+    <option value="smart">智能分流 · 批量 Seedream / 重要高清 Codex</option>
+    <option value="codex">全部 Codex 优先(${ready("codex")})</option>
+    <option value="seedream5_lite">全部 Seedream 5.0 Lite 优先(${ready("seedream5_lite")})</option>
+    <option value="image_api">全部 OpenAI 图片 API 优先(${ready("image_api")})</option>`;
+  const currentStrategy = st.image_strategy || "smart";
+  if (currentStrategy === "custom")
+    lineSel.insertAdjacentHTML("afterbegin",
+      `<option value="custom">当前：高级自定义路由</option>`);
+  lineSel.value = currentStrategy;
+  lineSel.disabled = false;
+  lineSel.title = "选择后同步应用到人物、场景、镜头、首尾帧和封面；不可用时自动回退";
   const hint = document.getElementById("image-line-hint");
-  if (hint) hint.textContent = `批量：${routeLabel("batch", "Seedream 5.0 Lite → GPT Image 2 medium")}`
-    + `；重要高清：${routeLabel("important", "Codex 订阅 → GPT Image 2 medium")}`
-    + `。Seedream ${ready("seedream5_lite")}，Codex ${ready("codex")}；high 不进入批量路线`;
+  let savedStrategy = currentStrategy;
+  const updateImageLineHint = () => {
+    if (!hint) return;
+    const notes = {
+      smart: "按用途自动选择；批量：Seedream 5.0 Lite → GPT Image 2 medium"
+        + "；重要高清：Codex 订阅 → GPT Image 2 medium",
+      codex: "人物、场景、镜头、首尾帧、封面全部 Codex 优先；失败自动回退",
+      seedream5_lite: "全部图片 Seedream 5.0 Lite 优先；复杂文字/终稿也会按此选择",
+      image_api: "全部图片 OpenAI 图片 API 优先；按 API 实际用量计费",
+      custom: "当前使用设置中心保存的高级自定义图片路由",
+    };
+    hint.textContent = notes[lineSel.value] || notes.smart;
+  };
+  updateImageLineHint();
+  lineSel.onchange = async () => {
+    const pick = lineSel.value;
+    if (pick === "custom") return;
+    lineSel.disabled = true;
+    try {
+      await api("/api/settings", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image_strategy: pick }),
+      });
+      showToast(`出图策略已切换：${lineSel.options[lineSel.selectedIndex].textContent}`
+        + "，下一张图开始生效", "ok");
+      savedStrategy = pick;
+      updateImageLineHint();
+    } catch (e) {
+      lineSel.value = savedStrategy;
+      updateImageLineHint();
+      showToast(staleServerHint(e), "error");
+    } finally { lineSel.disabled = false; }
+  };
   parSel.innerHTML = [1, 2, 3, 4, 6, 8].map(
     (n) => `<option value="${n}">${n} 路并行</option>`).join("");
   parSel.value = String((st.defaults || {}).parallel_images || 3);

@@ -40,6 +40,28 @@ MODE_CN = {
     "jianying_draft": "本机", "mock": "内置",
 }
 
+IMAGE_TASK_CLASSES = ("batch", "important", "final", "complex_text")
+IMAGE_STRATEGIES = {
+    "smart": {
+        "batch": ["seedream5_lite", "image_api"],
+        "important": ["codex", "image_api"],
+        "final": ["codex", "image_api"],
+        "complex_text": ["codex", "image_api"],
+    },
+    "codex": {
+        key: ["codex", "image_api", "seedream5_lite"]
+        for key in IMAGE_TASK_CLASSES
+    },
+    "seedream5_lite": {
+        key: ["seedream5_lite", "image_api", "codex"]
+        for key in IMAGE_TASK_CLASSES
+    },
+    "image_api": {
+        key: ["image_api", "codex", "seedream5_lite"]
+        for key in IMAGE_TASK_CLASSES
+    },
+}
+
 # 允许经设置中心修改的字段(其余请直接编辑 workspace/config.json)
 EDITABLE_FIELDS = {
     "enabled", "command", "endpoint", "api_key", "model", "model_version",
@@ -94,10 +116,12 @@ def settings_payload(app):
             "checks": checks,
             "ready": bool(checks) and all(c["ok"] for c in checks),
         })
+    image_routing = app.config.get("image_routing") or {}
     return {
         "providers": providers,
         "routing": app.config.get("routing") or {},
-        "image_routing": app.config.get("image_routing") or {},
+        "image_routing": image_routing,
+        "image_strategy": image_strategy_name(image_routing),
         "capabilities": CAPABILITY_CN,
         "defaults": {
             "parallel_images": app.config.get(
@@ -175,6 +199,63 @@ def set_routing(config_path, capability, chain):
     data.setdefault("routing", {})[capability] = list(chain)
     _save_file(config_path, data)
     return list(chain)
+
+
+def image_strategy_name(image_routing):
+    """从实际分层路由反推快捷策略；不匹配预设时保留为高级自定义。"""
+    first = {
+        key: ((image_routing.get(key) or [None])[0])
+        for key in IMAGE_TASK_CLASSES
+    }
+    if (first["batch"] == "seedream5_lite"
+            and all(first[key] == "codex"
+                    for key in IMAGE_TASK_CLASSES if key != "batch")):
+        return "smart"
+    values = set(first.values())
+    if len(values) == 1:
+        value = next(iter(values))
+        if value in ("codex", "seedream5_lite", "image_api"):
+            return value
+    return "custom"
+
+
+def set_image_strategy(config_path, strategy):
+    """原子切换整套图片策略，分类图片与未分类旧调用同步生效。"""
+    if strategy not in IMAGE_STRATEGIES:
+        allowed = "、".join(IMAGE_STRATEGIES)
+        raise AifosError(f"未知出图策略: {strategy}；只允许 {allowed}")
+    merged = Config.load(config_path)
+    known = set(merged.get("providers") or {})
+    image_routing = {
+        key: list(chain)
+        for key, chain in IMAGE_STRATEGIES[strategy].items()
+    }
+    unknown = sorted({
+        provider for chain in image_routing.values() for provider in chain
+        if provider not in known
+    })
+    if unknown:
+        raise AifosError(f"未知 Provider: {', '.join(unknown)}")
+
+    if strategy == "smart":
+        base = ["codex", "image_api", "api", "mock"]
+    else:
+        first = strategy
+        base = [first] + [
+            provider for provider in
+            ("codex", "image_api", "seedream5_lite", "api", "mock")
+            if provider != first
+        ]
+    base = [provider for provider in base if provider in known]
+    data = _load_file(config_path)
+    data["image_routing"] = image_routing
+    routes = data.setdefault("routing", {})
+    for capability in ("image", "frames", "cover"):
+        routes[capability] = list(base)
+    _save_file(config_path, data)
+    return {"strategy": strategy, "image_routing": image_routing,
+            "routing": {cap: list(base)
+                        for cap in ("image", "frames", "cover")}}
 
 
 def set_defaults(config_path, mapping):
