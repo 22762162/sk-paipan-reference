@@ -64,6 +64,14 @@ def check_and_update(root, runner=None):
             return "error", "远端分支不可读"
         if head == remote:
             return "up_to_date", head[:8]
+        # 只有远端领先(本地是 origin/branch 的祖先)才更新。本地有未推送
+        # 提交或分叉时,head != remote 但本地并不落后——绝不能 pull/重启,
+        # 否则每一轮自动更新都会把“本地领先”误判为“有新版本”而反复 os.execv
+        # 重启服务(在测试进程里则表现为无限重跑)。
+        ancestor = run("merge-base", "--is-ancestor", "HEAD",
+                       f"origin/{branch}")
+        if ancestor.returncode != 0:
+            return "up_to_date", head[:8]
         pull = run("pull", "--ff-only", "origin", branch)
         if pull.returncode != 0:
             return "error", pull.stderr.strip()[:200]
@@ -93,6 +101,10 @@ def start_auto_updater(jobs_idle, on_log, interval=600, initial_delay=90):
     jobs_idle(): 当前没有生产任务在跑才返回 True;
     on_log(message): 更新动作写入平台日志,前端日志流可见。
     """
+    # 测试进程内绝不启动自愈重启:否则 os.execv 会把 pytest 进程原地替换,
+    # 导致整套测试被无限重跑(serve() 在 Web 测试里会拉起本线程)。
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return None
     root = repo_root()
     if root is None:
         return None
