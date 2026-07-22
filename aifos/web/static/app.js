@@ -3852,17 +3852,34 @@ function pollCanvas(episodeId) {
 
 const CARD_W = 220, CARD_H = 218, GAP_X = 26, GAP_Y = 56, LANE_X = 150;
 
+function castLookHtml(candidate) {
+  const look = candidate.look_variant;
+  const valid = candidate.variant_source !== "legacy"
+    && candidate.variant_label && look && typeof look === "object";
+  if (!valid) return `<div class="cast-look legacy">
+    <b>历史候选</b><span>未记录独立造型方向；建议按新规则重新生成后再比较。</span>
+  </div>`;
+  const rows = [
+    ["服装", look.costume], ["发型", look.hair],
+    ["妆容", look.makeup], ["气质", look.temperament],
+  ].filter(([, value]) => value);
+  return `<div class="cast-look">
+    <dl>${rows.map(([label, value]) => `<div><dt>${label}</dt><dd>${esc(value)}</dd></div>`).join("")}</dl>
+  </div>`;
+}
+
 function renderCastSelection(data, episodeId) {
   const selection = data.cast_selection || {};
   const characters = selection.characters || [];
   app.innerHTML = `<div class="canvas-view cast-select-view">
     <div class="confirm-banner">
       <div><b>先定人物，再生产后续图片 👤</b>
-        <span>每名角色已有 ${selection.candidate_target || 5} 张候选。请各选1张作为最终立绘；
+        <span>每名角色有 ${selection.candidate_target || 5} 套独立造型候选，不再只是换动作；
+        请比较服装、发型、妆容和气质后各选1张作为最终立绘。
         后续四视图、关键帧、首尾帧和其他图片 API 都会真实携带这张参考图，
         视觉质检也会将成图与它逐人比对。</span></div>
       <div class="cast-actions">
-        <button id="cast-regenerate" title="放弃当前已选人物并重新生成候选">↻ 不选，返回重新生成</button>
+        <button id="cast-regenerate" title="保留旧图并按五套独立造型重新生成">↻ 按5套新造型重生成</button>
         <button class="primary" id="cast-continue" ${selection.passed ? "" : "disabled"}>
           ${selection.passed ? "✅ 全部定版，继续预生产" : `已定版 ${selection.locked || 0}/${selection.total || characters.length}`}
         </button>
@@ -3881,17 +3898,23 @@ function renderCastSelection(data, episodeId) {
           <span class="dim">${esc(character.role || "角色")} · ${character.candidate_count || 0}/${selection.candidate_target || 5} 张候选</span></div>
           <strong class="${character.locked ? "cast-locked" : "cast-unlocked"}">
             ${character.locked ? "✓ 已锁定最终立绘" : "请选择1张"}</strong></div>
-        <div class="cast-candidate-grid">${(character.candidates || []).map((candidate) => `
-          <article class="cast-candidate${candidate.selected ? " selected" : ""}">
-            <button type="button" class="cast-image" data-full="${esc(candidate.url || "")}" aria-label="查看${esc(character.character)}候选${candidate.index}">
-              ${candidate.url ? `<img src="${esc(thumbUrl(candidate.url, 520))}" loading="lazy" alt="${esc(character.character)}候选${candidate.index}">`
+        <div class="cast-candidate-grid" role="list" aria-label="${esc(character.character)}的造型候选">${(character.candidates || []).map((candidate) => {
+          const variant = candidate.variant_source === "legacy" || !candidate.variant_label
+            ? "历史候选" : candidate.variant_label;
+          const title = `${character.character} · 候选${candidate.index} · ${variant}`;
+          return `<article class="cast-candidate${candidate.selected ? " selected" : ""}" role="listitem">
+            <button type="button" class="cast-image" data-full="${esc(candidate.url || "")}" data-title="${esc(title)}" aria-label="查看${esc(title)}大图">
+              ${candidate.url ? `<img src="${esc(thumbUrl(candidate.url, 520))}" loading="lazy" alt="${esc(title)}">`
                 : `<span class="plan-thumb-empty">图片缺失</span>`}
             </button>
-            <div class="cast-candidate-foot"><b>候选 ${candidate.index}</b>
+            <div class="cast-candidate-foot"><div class="cast-candidate-title"><span>候选 ${candidate.index}</span><b>${esc(variant)}</b></div>
+              ${castLookHtml(candidate)}
               <button type="button" class="${candidate.selected ? "selected" : "primary"} cast-pick"
-                data-character="${esc(character.character)}" data-index="${candidate.index}">
-                ${candidate.selected ? "✓ 当前最终立绘" : "选定这张"}</button></div>
-          </article>`).join("")}</div>
+                data-character="${esc(character.character)}" data-index="${candidate.index}"
+                aria-pressed="${candidate.selected ? "true" : "false"}" ${candidate.selected ? "disabled" : ""}>
+                ${candidate.selected ? "✓ 当前最终立绘" : "选定这套造型"}</button></div>
+          </article>`;
+        }).join("")}</div>
       </section>`).join("")}</div>
   </div>`;
   bindImageAccelerationLivebar(episodeId);
@@ -3911,17 +3934,19 @@ function renderCastSelection(data, episodeId) {
       } catch (e) {
         showToast(e.message, "error");
         ev.currentTarget.disabled = false;
-        ev.currentTarget.textContent = "↻ 不选，返回重新生成";
+        ev.currentTarget.textContent = "↻ 按5套新造型重生成";
       }
     });
   app.querySelectorAll(".cast-image").forEach((button) => {
     button.onclick = () => {
-      if (button.dataset.full) showImageLightbox(button.dataset.full, "人物候选大图");
+      if (button.dataset.full) showImageLightbox(button.dataset.full, button.dataset.title || "人物候选大图");
     };
   });
   app.querySelectorAll(".cast-pick").forEach((button) => {
     button.onclick = async () => {
-      button.disabled = true;
+      const group = [...app.querySelectorAll(".cast-pick")]
+        .filter((item) => item.dataset.character === button.dataset.character);
+      group.forEach((item) => { item.disabled = true; });
       button.textContent = "锁定中…";
       try {
         await api("/api/character/select", {
@@ -3934,7 +3959,10 @@ function renderCastSelection(data, episodeId) {
         renderCanvasView(episodeId);
       } catch (e) {
         showToast(e.message, "error");
-        button.disabled = false; button.textContent = "选定这张";
+        group.forEach((item) => {
+          item.disabled = item.getAttribute("aria-pressed") === "true";
+        });
+        button.textContent = "选定这套造型";
       }
     };
   });

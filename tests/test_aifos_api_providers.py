@@ -23,6 +23,16 @@ PNG_1PX = base64.b64decode(
     "z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
 MP4_FAKE = b"\x00\x00\x00 ftypisom" + b"\x00" * 64
 
+
+def test_candidate_api_prompt_locks_face_but_releases_look():
+    provider = OpenAIImageProvider("image_api", {"enabled": True})
+    payload = {"portrait_candidate": True, "style": "现代都市半写实"}
+    prompt = provider._semantic_prompt("五套造型候选", payload, [object()])
+    assert "只锁定脸型" in prompt
+    assert "发型、妆容或面部修饰、服装" in prompt
+    assert "不得用同一造型只换动作" in prompt
+    assert "禁止脸和发型漂移" not in prompt
+
 SCRIPT_JSON = {
     "project_title": "万妖图录", "episode_number": 15,
     "episode_title": "夜探古镇", "logline": "少年初遇妖影",

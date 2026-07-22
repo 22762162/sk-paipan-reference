@@ -60,8 +60,8 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260722-storyboard-table" in html
-    assert "/static/app.js?v=20260722-storyboard-table" in html
+    assert "/static/style.css?v=20260723-cast-variants" in html
+    assert "/static/app.js?v=20260723-cast-variants" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -433,6 +433,12 @@ def test_produce_flow_and_episode_api(server):
     assert not selection["passed"]
     assert all(len(c["candidates"]) == 5 for c in selection["characters"])
     assert all(candidate["url"].startswith("/artifacts/")
+               for c in selection["characters"]
+               for candidate in c["candidates"])
+    assert all(candidate["variant_source"] == "generated"
+               for c in selection["characters"]
+               for candidate in c["candidates"])
+    assert all(candidate["variant_label"] and candidate["look_variant"]
                for c in selection["characters"]
                for candidate in c["candidates"])
     assert pre["artifacts"]["cast_art"] == []

@@ -45,6 +45,10 @@ def test_mobile_ui_contract_and_pwa_registration():
     assert ".storyboard-table-row > [data-label]::before" in css
     assert ".storyboard-frame-pair" in css
     assert "scroll-snap-type: x mandatory" in css
+    assert ".cast-look" in css
+    assert "flex: 0 0 min(78vw, 310px)" in css
+    assert "castLookHtml(candidate)" in js
+    assert 'aria-pressed="${candidate.selected ? "true" : "false"}"' in js
     assert 'serviceWorker.register("/sw.js",' in js
     assert 'updateViaCache: "none"' in js
     assert "/api/access" in js

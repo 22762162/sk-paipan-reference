@@ -100,6 +100,62 @@ STAGES = [
 CONFIRM_AFTER = "preflight"
 CHARACTER_CANDIDATES = 5
 
+# 人物定版不是“同一套造型换五个动作”。五张候选分别承担不同的选角方向，
+# 但都受角色年龄、职业、物种、时代和项目画风约束。候选被人工锁定后，
+# 其完整脸、发型、妆容与服装才成为后续镜头不可漂移的身份锚点。
+CHARACTER_LOOK_VARIANTS = (
+    {
+        "variant_id": "story_baseline",
+        "variant_label": "角色本色",
+        "look_variant": {
+            "hair": "采用剧本人物设定中的基准发型",
+            "makeup": "采用剧本人物设定中的基准妆容或面部修饰",
+            "costume": "采用剧本人物设定中的基准服装与配色",
+            "temperament": "准确呈现剧本设定的核心性格与气质",
+        },
+    },
+    {
+        "variant_id": "clean_minimal",
+        "variant_label": "清爽极简",
+        "look_variant": {
+            "hair": "相对基准明显改变梳法和轮廓，整洁、轻盈、露出更多面部",
+            "makeup": "低饱和清透妆或自然克制修饰，保留真实肤质",
+            "costume": "简洁轻量、符合角色时代的层次与明亮中性色，轮廓不得复刻基准服装",
+            "temperament": "清爽、亲近、可信赖，表演自然不刻意",
+        },
+    },
+    {
+        "variant_id": "sharp_professional",
+        "variant_label": "干练正式",
+        "look_variant": {
+            "hair": "相对基准改为利落收束、侧分或更有结构的正式轮廓",
+            "makeup": "眉眼与面部轮廓更清晰的正式妆或精致理容，克制不过浓",
+            "costume": "挺括、有结构感的正式造型与更深配色，符合角色身份和时代",
+            "temperament": "冷静、专业、有掌控力，站姿更坚定",
+        },
+    },
+    {
+        "variant_id": "soft_relaxed",
+        "variant_label": "松弛亲和",
+        "look_variant": {
+            "hair": "相对基准改为自然松散、柔软纹理或轻微碎发的生活化轮廓",
+            "makeup": "暖调轻透妆或柔和自然修饰，降低攻击性",
+            "costume": "柔软面料、舒展层次和温暖配色的日常造型，不复刻其他候选",
+            "temperament": "温暖、松弛、有生活气和亲近感",
+        },
+    },
+    {
+        "variant_id": "signature_statement",
+        "variant_label": "高辨识造型",
+        "look_variant": {
+            "hair": "在剧情允许范围内采用最有记忆点的轮廓、编束或非对称梳法",
+            "makeup": "强化一个清晰重点的镜头妆或面部修饰，精致但不舞台化过度",
+            "costume": "用标志性剪裁、材质或强调色建立角色记忆点，仍符合身份与时代",
+            "temperament": "更强的镜头存在感和角色辨识度，不改变核心性格",
+        },
+    },
+)
+
 # 人物完整资产套件:立绘之外每个角色补齐的生产级设定资产
 # (项目级,跨集复用;全部以立绘和用户参考图为基准保证同一形象)
 CHARACTER_SHEETS = [
@@ -548,6 +604,50 @@ class Director:
                 "睫毛、唇妆和身份配饰,必须是同一个人;服装、服装颜色/材质、动作、"
                 "场景和光影按本剧本及当集造型生成,允许与参考图服装不同,除非明确"
                 "要求保留参考图服装")
+
+    def _candidate_variant(self, index, design=None):
+        """返回真实写入提示词和资产元数据的候选造型方向。"""
+        template = CHARACTER_LOOK_VARIANTS[index - 1]
+        look = dict(template["look_variant"])
+        if index == 1 and design:
+            look.update({
+                "hair": str(design.get("hair") or look["hair"]),
+                "makeup": str(design.get("makeup") or look["makeup"]),
+                "costume": ";".join(filter(None, (
+                    str(design.get("costume") or "").strip(),
+                    str(design.get("costume_detail") or "").strip(),
+                ))) or look["costume"],
+                "temperament": str(
+                    design.get("temperament") or look["temperament"]),
+            })
+        return {
+            "variant_id": template["variant_id"],
+            "variant_label": template["variant_label"],
+            "look_variant": look,
+            "variant_source": "generated",
+        }
+
+    def _candidate_portrait_prompt(self, name, role, style, design, variant):
+        """定角候选只锁角色边界，显式放开尚未定版的造型变量。"""
+        identity = self._design_line(
+            design, keys=("species", "appearance", "eyes", "personality"))
+        look = variant["look_variant"]
+        return (
+            f"角色定角候选:{name}({role}),{style}"
+            + (f";角色不可越界特征:{identity}" if identity else "")
+            + ";这是用于选择最终人物形象的五套互斥造型之一，不是同一套衣服只换动作"
+            f";本套造型方向:{variant['variant_label']}"
+            f";发型:{look['hair']};妆容或面部修饰:{look['makeup']}"
+            f";服装:{look['costume']};气质:{look['temperament']}"
+            ";服装轮廓、发型轮廓、妆容强度和外显气质必须与其他四套明显不同，"
+            "但必须适配角色的性别表达、年龄、职业、物种、时代背景和项目画风"
+            ";若有角色参考图，只锁脸型、五官比例、眼鼻嘴结构、肤色、年龄感、"
+            "发际线和稳定身份特征，必须是同一个人；不要复制参考图的发型、妆容、"
+            "服装和姿态，本套造型指令优先"
+            ";若没有身份参考图，允许在角色外貌类型范围内让脸部骨相、五官细节和"
+            "神态产生可辨别差异，供人工选角，但不得改变年龄、物种和核心人物气质"
+            ";全身正面自然站姿，动作只服务造型展示；干净均匀肤质，禁止塑料脸、"
+            "脏污毛孔；单人，禁止新增人物")
 
     def _scene_prompt(self, location, style):
         return f"场景概念图:{location},{style},空镜,氛围感"
@@ -1711,11 +1811,21 @@ class Director:
                                and not Path(uri).exists()):
                     continue
                 index = int(meta.get("candidate_index") or 0)
+                look_variant = meta.get("look_variant")
+                variant_source = meta.get("variant_source")
+                if not isinstance(look_variant, dict) or not meta.get(
+                        "variant_label"):
+                    look_variant = None
+                    variant_source = "legacy"
                 candidates.append({
                     "id": f"candidate:{name}:{index}",
                     "index": index,
                     "uri": uri,
                     "version": row["version"],
+                    "variant_id": meta.get("variant_id", ""),
+                    "variant_label": meta.get("variant_label", ""),
+                    "look_variant": look_variant,
+                    "variant_source": variant_source or "generated",
                     "selected": bool(
                         locked and selected_meta.get("candidate_asset_id") == row["id"]),
                 })
@@ -1746,6 +1856,7 @@ class Director:
         seed = []
         tasks = []
         quality_by_candidate = {}
+        variant_by_candidate = {}
         for character in characters:
             name = character["name"]
             role = character.get("role", "")
@@ -1766,8 +1877,6 @@ class Director:
                 # 人工上传的最终立绘没有候选集，仍视为明确人工定版。
                 continue
             refs = self._reference_uris(project_id, [name])
-            base_prompt = self._portrait_prompt(
-                name, role, style, design=designs.get(name))
             quality = resolve_image_quality(
                 recommend_asset_quality("character_candidate"),
                 ctx.get("quality_policy") or default_quality_policy(),
@@ -1775,16 +1884,36 @@ class Director:
             for index in range(1, CHARACTER_CANDIDATES + 1):
                 item_id = f"candidate:{name}:{index}"
                 quality_by_candidate[(name, index)] = quality
-                prompt = (
-                    f"{base_prompt};人物候选{index}/{CHARACTER_CANDIDATES};"
-                    "身份核心设定不变，只允许在脸部骨相细节、神态感染力和"
-                    "自然真实感上做克制差异；干净均匀肤质，禁止塑料脸、"
-                    "脏污毛孔；参考图锁定脸型、五官、发型、发色、妆容和年龄感；"
-                    "服装与配色按当前剧本和本集造型，可与参考图不同；禁止新增人物")
+                variant = self._candidate_variant(index, designs.get(name))
+                if index in existing:
+                    existing_meta = self._asset_meta(existing[index])
+                    if (existing_meta.get("variant_label")
+                            and isinstance(existing_meta.get("look_variant"), dict)):
+                        variant = {
+                            key: existing_meta[key] for key in (
+                                "variant_id", "variant_label", "look_variant",
+                                "variant_source") if key in existing_meta
+                        }
+                        variant.setdefault("variant_source", "generated")
+                    else:
+                        variant = {
+                            "variant_id": "",
+                            "variant_label": "历史候选",
+                            "look_variant": None,
+                            "variant_source": "legacy",
+                        }
+                variant_by_candidate[(name, index)] = variant
+                if variant["variant_source"] == "legacy":
+                    prompt = "历史候选未记录独立造型方向，请重新生成后比较五套造型"
+                else:
+                    prompt = self._candidate_portrait_prompt(
+                        name, role, style, designs.get(name), variant)
                 seed.append({
                     "id": item_id, "category": "character_candidate",
-                    "label": f"{name} · 候选 {index}", "name": name,
+                    "label": (f"{name} · 候选 {index} · "
+                              f"{variant['variant_label']}"), "name": name,
                     "candidate_index": index, "prompt": prompt,
+                    **variant,
                     **self._quality_meta(quality),
                 })
                 if index in existing or locked:
@@ -1795,6 +1924,7 @@ class Director:
                     "payload": {
                         "portrait": True,
                         "portrait_candidate": True,
+                        **variant,
                         "image_task_class": image_task_class_for(
                             quality["level"]),
                         "image_quality": quality["level"],
@@ -1825,11 +1955,21 @@ class Director:
         for (name, index, role), result in self._run_parallel(
                 ctx, tasks, line="人物定妆候选(每人5张)").items():
             quality = quality_by_candidate[(name, index)]
+            variant = variant_by_candidate[(name, index)]
             self.assets.register(
                 project_id, "character_candidate", f"{name}:{index:02d}",
                 uri=result.uri,
                 meta={"character": name, "role": role,
                       "candidate_index": index,
+                      **variant,
+                      "prompt": next(
+                          item["prompt"] for item in seed
+                          if item["id"] == f"candidate:{name}:{index}"),
+                      "reference_images": list(
+                          next(task["payload"].get("reference_images", [])
+                               for task in tasks
+                               if task["item_id"] ==
+                               f"candidate:{name}:{index}")),
                       "provider": result.provider,
                       "model": getattr(result, "model", ""),
                       **self._quality_meta(quality)})
@@ -1859,6 +1999,12 @@ class Director:
         if not formal_reference_allowed(candidate_quality):
             raise AifosError(
                 "低质量试错图不能锁为正式人物参考，请把选中形象以高质量重生后再定版")
+        candidate_meta = self._asset_meta(candidate)
+        variant_meta = {
+            key: candidate_meta[key] for key in (
+                "variant_id", "variant_label", "look_variant",
+                "variant_source") if key in candidate_meta
+        }
         meta = {
             "character": character_name,
             "role": character.get("role", ""),
@@ -1870,6 +2016,7 @@ class Director:
             "image_quality": candidate_quality,
             "recommended_quality": "high",
             "quality_source": "selected_mother_asset",
+            **variant_meta,
         }
         identity = self.assets.register(
             project["id"], "character_identity", character_name,

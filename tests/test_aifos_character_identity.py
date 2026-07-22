@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from aifos.app import App
+from aifos.adapters.codex_image import _ref_line, _style_line
 from aifos.errors import AifosError, ProviderUnavailable
 from aifos.production.base import ProviderResult
 
@@ -43,6 +44,14 @@ def test_five_candidates_pause_before_downstream_images(app):
     assert status["locked"] == 0
     assert all(item["candidate_count"] == 5
                for item in status["characters"])
+    for character in status["characters"]:
+        assert len({item["variant_id"] for item in character["candidates"]}) == 5
+        assert len({item["variant_label"] for item in character["candidates"]}) == 5
+        assert all(item["variant_source"] == "generated"
+                   for item in character["candidates"])
+        assert all(set(item["look_variant"]) == {
+            "hair", "makeup", "costume", "temperament"}
+                   for item in character["candidates"])
     assert app.projects.latest_document(episode["id"], "storyboard")[0] is None
     assert app.assets.list(project["id"], "character_sheet") == []
     assert app.assets.list(project["id"], "scene_art") == []
@@ -54,6 +63,60 @@ def test_portrait_prompt_prioritizes_identity_over_reference_clothing(app):
         design={"hair": "长直发", "makeup": "清透妆", "costume": "通勤装"})
     assert "发型轮廓" in prompt and "眉眼妆" in prompt
     assert "允许与参考图服装不同" in prompt
+
+
+def test_candidate_prompts_create_real_look_variants_without_locking_style(app):
+    design = {
+        "species": "人类", "appearance": "暖白肤色鹅蛋脸，约25岁",
+        "eyes": "深棕杏眼", "personality": "认真但有亲和力",
+        "hair": "齐肩内扣短发", "makeup": "清透妆",
+        "costume": "浅灰通勤套装", "temperament": "温柔克制",
+    }
+    variants = [app.director._candidate_variant(i, design) for i in range(1, 6)]
+    prompts = [app.director._candidate_portrait_prompt(
+        "林昭", "主角", "现代都市半写实", design, variant)
+        for variant in variants]
+    assert len({item["variant_id"] for item in variants}) == 5
+    assert len({tuple(item["look_variant"].values()) for item in variants}) == 5
+    assert all("不是同一套衣服只换动作" in prompt for prompt in prompts)
+    assert all("不要复制参考图的发型、妆容、服装" in prompt
+               for prompt in prompts)
+    assert all("禁止换发型" not in prompt for prompt in prompts)
+    assert "齐肩内扣短发" in prompts[0]
+
+
+def test_candidate_reference_semantics_lock_face_but_release_look():
+    payload = {
+        "portrait_candidate": True,
+        "style": "现代都市半写实",
+        "reference_images": ["/tmp/identity.png"],
+    }
+    ref_line = _ref_line(payload)
+    assert "参考图只锁定脸型" in ref_line
+    assert "发型轮廓、妆容或面部修饰、服装" in ref_line
+    assert "禁止换发型" not in ref_line
+    style_line = _style_line(payload)
+    assert "不得用同一造型只换动作" in style_line
+    normal = _ref_line({"reference_images": ["/tmp/identity.png"]})
+    assert "禁止换脸或换发型" in normal
+
+
+def test_legacy_candidate_is_not_given_a_fake_look_label(app):
+    project, _episode, script = _to_cast_selection(app, "历史候选兼容")
+    name = script["characters"][0]["name"]
+    old = app.assets.latest(project["id"], "character_candidate", f"{name}:01")
+    app.assets.register(
+        project["id"], "character_candidate", f"{name}:01",
+        uri=old["uri"],
+        meta={"character": name, "candidate_index": 1},
+        new_version=True,
+    )
+    status = app.director.character_selection_status(
+        project["id"], script["characters"])
+    candidate = status["characters"][0]["candidates"][0]
+    assert candidate["variant_source"] == "legacy"
+    assert candidate["variant_label"] == ""
+    assert candidate["look_variant"] is None
 
 
 def test_locked_candidate_becomes_only_identity_reference(app):
