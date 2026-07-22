@@ -21,6 +21,8 @@ API:
 
 import ipaddress
 import json
+import shutil
+import subprocess
 import re
 import socket
 import threading
@@ -436,7 +438,7 @@ def make_handler(workspace, jobs):
         def _error(self, status, message):
             self._json({"error": message}, status=status)
 
-        def _file(self, path, no_cache=False):
+        def _file(self, path, no_cache=False, cache_seconds=None):
             path = Path(path)
             if not path.is_file():
                 return self._error(404, "文件不存在")
@@ -450,6 +452,9 @@ def make_handler(workspace, jobs):
                 # 界面文件禁缓存:git pull 更新后刷新即生效,
                 # 避免浏览器缓存旧版界面导致"更新了却看不到新功能"
                 self.send_header("Cache-Control", "no-cache")
+            elif cache_seconds:
+                self.send_header("Cache-Control",
+                                 f"public, max-age={int(cache_seconds)}")
             self.end_headers()
             self.wfile.write(body)
 
@@ -477,7 +482,8 @@ def make_handler(workspace, jobs):
                 if route.startswith("/static/"):
                     return self._static(STATIC_DIR, route[len("/static/"):])
                 if route.startswith("/artifacts/"):
-                    return self._artifact(route[len("/artifacts/"):])
+                    return self._artifact(route[len("/artifacts/"):],
+                                          query)
                 if route == "/api/access":
                     host, port = self.server.server_address[:2]
                     return self._json(access_payload(host, port))
@@ -602,7 +608,40 @@ def make_handler(workspace, jobs):
                 return self._error(404, "非法路径")
             return self._file(target, no_cache=True)
 
-        def _artifact(self, rel):
+        THUMB_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+        def _thumbnail(self, root, target, width):
+            """列表用缩略图:按需生成并缓存(macOS 自带 sips,备选
+            ffmpeg;都没有时回退原图)。点开大图仍加载原图。"""
+            if target.suffix.lower() not in self.THUMB_EXTS:
+                return target
+            width = max(64, min(width, 960))
+            try:
+                rel = target.relative_to(root)
+            except ValueError:
+                return target
+            thumb = root / ".thumbs" / f"w{width}" / rel
+            try:
+                if thumb.exists() and                         thumb.stat().st_mtime >= target.stat().st_mtime:
+                    return thumb
+                thumb.parent.mkdir(parents=True, exist_ok=True)
+                for command in (
+                        ["sips", "-Z", str(width), str(target),
+                         "--out", str(thumb)],
+                        ["ffmpeg", "-y", "-loglevel", "error",
+                         "-i", str(target),
+                         "-vf", f"scale={width}:-2", str(thumb)]):
+                    if shutil.which(command[0]) is None:
+                        continue
+                    proc = subprocess.run(command, capture_output=True,
+                                          timeout=30)
+                    if proc.returncode == 0 and thumb.exists():
+                        return thumb
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            return target
+
+        def _artifact(self, rel, query=None):
             app = App(workspace)
             try:
                 root = app.workspace.artifacts_dir.resolve()
@@ -611,7 +650,15 @@ def make_handler(workspace, jobs):
             target = (root / rel).resolve()
             if not str(target).startswith(str(root) + "/"):
                 return self._error(404, "非法路径")
-            return self._file(target)
+            width = 0
+            try:
+                width = int((query or {}).get("w", ["0"])[0])
+            except (TypeError, ValueError):
+                width = 0
+            if width and target.is_file():
+                target = self._thumbnail(root, target, width)
+            # 产物带 ?v= 版本参数,可放心长缓存;重画后版本号变化自动失效
+            return self._file(target, cache_seconds=86400)
 
         def _assets(self, query):
             title = query.get("project", [""])[0]

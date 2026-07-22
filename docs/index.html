@@ -5655,6 +5655,14 @@ function planMockReasonHtml(item) {
     : "";
 }
 
+/* 列表用缩略图(服务端按需缩放缓存);灯箱/预览仍加载原图 */
+function thumbUrl(url, w = 480) {
+  if (!url || !url.startsWith("/artifacts/")) return url;
+  const clean = url.split("?")[0].toLowerCase();
+  if (!/[.](png|jpe?g|webp)$/.test(clean)) return url;
+  return url + (url.includes("?") ? "&" : "?") + "w=" + w;
+}
+
 function planItemThumbs(data, item) {
   const art = data.artifacts || {};
   let urls = [];
@@ -5698,7 +5706,7 @@ function planItemHtml(data, item, editable) {
     role="button" tabindex="0" aria-pressed="false"
     aria-label="选择查看 ${esc(item.label)}">
     <div class="plan-thumbs">${thumbs.length
-      ? thumbs.map((u) => `<img src="${esc(u)}" loading="lazy" alt="">`).join("")
+      ? thumbs.map((u) => `<img src="${esc(thumbUrl(u, 240))}" loading="lazy" alt="">`).join("")
       : `<span class="plan-thumb-empty">${st === "generating" ? "⏳" : "🖼"}</span>`}</div>
     <div class="plan-main">
       <div class="plan-row">
@@ -5943,7 +5951,7 @@ function planCardHtml(data, item, avg) {
   const st = item.status || "pending";
   let media;
   if (["done", "reused"].includes(st) && thumbs.length)
-    media = `<img src="${esc(thumbs[0])}" loading="lazy" alt="">`;
+    media = `<img src="${esc(thumbUrl(thumbs[0], 480))}" loading="lazy" alt="">`;
   else if (st === "generating") media = `<div class="pc-empty gen">⏳</div>`;
   else if (st === "failed") media = `<div class="pc-empty fail">✗</div>`;
   else media = `<div class="pc-empty">🖼</div>`;
@@ -6097,11 +6105,13 @@ document.addEventListener("click", (ev) => {
   const card = img.closest(".plan-card");
   const label = (card && (card.querySelector(".pc-label") || {}).textContent)
     || img.alt || "";
-  showImageLightbox(img.src, String(label).trim());
+  // 灯箱看原图:去掉缩略图参数
+  const full = img.src.replace(/([?&])w=\d+&?/, "$1").replace(/[?&]$/, "");
+  showImageLightbox(full, String(label).trim());
 });
 function assetCardHtml(ep, target, url, label, mock) {
   const img = url && !url.split("?")[0].endsWith(".json")
-    ? `<img src="${esc(url)}" loading="lazy" alt="">`
+    ? `<img src="${esc(thumbUrl(url, 480))}" loading="lazy" alt="">`
     : `<div class="pc-empty">🖼</div>`;
   const safe = `${target.kind}_${(target.name || "").replace(/[^\w:]/g, "_")}`;
   return `<div class="plan-card asset-card">
@@ -6189,7 +6199,7 @@ async function renderAssetsCenter(selectedTitle) {
       </div>
       <div class="pb-grid ref-grid">${(art.references || []).map((r) => `
         <div class="plan-card ref-card">
-          <div class="pc-media">${r.url ? `<img src="${esc(r.url)}" loading="lazy" alt="">` : `<div class="pc-empty">🖼</div>`}</div>
+          <div class="pc-media">${r.url ? `<img src="${esc(thumbUrl(r.url, 480))}" loading="lazy" alt="">` : `<div class="pc-empty">🖼</div>`}</div>
           <div class="pc-label" title="${esc(r.name)}">${esc(r.name)}</div>
           <div class="dim">${r.attach_to ? "关联:" + esc(r.attach_to) : "全项目通用"}</div>
           <button class="ref-del" data-name="${esc(r.name)}">删除</button>
@@ -6895,7 +6905,7 @@ function renderScriptReview(data, episodeId) {
       </div>
       ${refs.length ? `<div class="pb-grid ref-grid">${refs.map((r) => `
         <div class="plan-card ref-card">
-          <div class="pc-media">${r.url ? `<img src="${esc(r.url)}" loading="lazy" alt="">` : `<div class="pc-empty">🖼</div>`}</div>
+          <div class="pc-media">${r.url ? `<img src="${esc(thumbUrl(r.url, 480))}" loading="lazy" alt="">` : `<div class="pc-empty">🖼</div>`}</div>
           <div class="pc-label" title="${esc(r.name)}">${esc(r.name)}</div>
           <div class="dim">${r.attach_to ? "关联:" + esc(r.attach_to) : "全项目通用"}</div>
           <button class="ref-del" data-name="${esc(r.name)}">删除</button>

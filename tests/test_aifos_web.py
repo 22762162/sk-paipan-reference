@@ -341,3 +341,31 @@ def test_overview_and_episode_expose_build(server):
     port = server["port"]
     status, overview = _json_request(port, "GET", "/api/overview")
     assert status == 200 and "build" in overview
+
+
+def test_artifact_thumbnail_and_cache(server):
+    """列表缩略图:?w= 请求 200 且带长缓存头;无缩放工具时回退原图。"""
+    port = server["port"]
+    status, reply = _json_request(port, "POST", "/api/produce", {
+        "sentence": "开始制作《缩略图测试》第1集", "review": False})
+    assert status == 202
+    _wait_job(port, reply["job_id"], timeout=120)
+    status, episode = _json_request(port, "GET", "/api/episode/1")
+    from urllib.parse import quote
+    art = episode["artifacts"]["cast_art"][0]
+    url = art["url"]
+    assert url.startswith("/artifacts/")
+    path, _, ver = url.partition("?")
+    url = quote(path) + (f"?{ver}" if ver else "")
+    sep = "&" if "?" in url else "?"
+    conn_status, headers_ct, raw = _request(
+        port, "GET", f"{url}{sep}w=240")
+    assert conn_status == 200 and raw
+    import http.client as _hc
+    conn = _hc.HTTPConnection("127.0.0.1", port, timeout=30)
+    conn.request("GET", f"{url}{sep}w=240")
+    resp = conn.getresponse()
+    cache = resp.getheader("Cache-Control", "")
+    resp.read()
+    conn.close()
+    assert "max-age" in cache
