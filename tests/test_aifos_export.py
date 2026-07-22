@@ -15,10 +15,24 @@ from aifos.export_kit import build_export_zip
 from aifos.web.server import serve
 
 
+def _finish(app, title="万妖图录", number=1):
+    summary = app.director.produce(title, number)
+    assert summary["status"] == "awaiting_cast"
+    project = app.projects.get_project(title)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=?",
+        (project["id"], number))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    for character in script["characters"]:
+        app.director.select_character_candidate(
+            title, number, character["name"], 1)
+    return app.director.produce(title, number)
+
+
 def test_export_zip_contents(tmp_path):
     app = App(tmp_path / "ws")
     try:
-        app.director.produce("万妖图录", 15)
+        _finish(app, "万妖图录", 15)
         data, filename = build_export_zip(app, "万妖图录", 15)
         assert filename == "万妖图录_第15集_成品包.zip"
         bundle = zipfile.ZipFile(io.BytesIO(data))
@@ -61,7 +75,7 @@ def test_export_empty_episode_raises(tmp_path):
 def test_web_export_endpoint(tmp_path):
     ws = tmp_path / "ws"
     boot = App(ws)
-    boot.director.produce("万妖图录", 1)
+    _finish(boot)
     boot.close()
     httpd = serve(ws, host="127.0.0.1", port=0)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -86,6 +100,11 @@ def test_cli_export(tmp_path, capsys):
     ws = str(tmp_path / "ws")
     assert main(["--workspace", ws, "produce", "--title", "万妖图录",
                  "--episode", "1"]) == 0
+    app = App(ws)
+    try:
+        _finish(app)
+    finally:
+        app.close()
     out = tmp_path / "bundle.zip"
     capsys.readouterr()
     assert main(["--workspace", ws, "export", "--project", "万妖图录",

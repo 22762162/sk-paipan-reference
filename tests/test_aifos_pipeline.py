@@ -15,8 +15,23 @@ def app(tmp_path):
     instance.close()
 
 
+def _finish(app, title, number, **kwargs):
+    summary = app.director.produce(title, number, **kwargs)
+    if summary["status"] != "awaiting_cast":
+        return summary
+    project = app.projects.get_project(title)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=?",
+        (project["id"], number))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    for character in script["characters"]:
+        app.director.select_character_candidate(
+            title, number, character["name"], 1)
+    return app.director.produce(title, number)
+
+
 def test_full_pipeline_produces_episode(app):
-    summary = app.director.produce("万妖图录", 15)
+    summary = _finish(app, "万妖图录", 15)
 
     assert summary["status"] == "done"
     assert summary["qc_score"] == 100
@@ -45,9 +60,9 @@ def test_full_pipeline_produces_episode(app):
     storyboard, _ = app.projects.latest_document(episode["id"], "storyboard")
     assert len(storyboard["shots"]) > len(script["scenes"])
 
-    # 成本记账:剧集成本 = 各阶段成本之和,且在预算内
+    # 成本记账:总成本还包含上一轮生成的五选一候选，且在预算内。
     stage_cost = round(sum(s["cost"] for s in summary["stages"]), 2)
-    assert summary["cost"] == stage_cost > 0
+    assert summary["cost"] >= stage_cost > 0
     assert summary["cost"] <= summary["budget"]
 
     # 数据沉淀:prompt/image/video/voice/case 均有记录
@@ -57,8 +72,8 @@ def test_full_pipeline_produces_episode(app):
 
 
 def test_asset_reuse_across_episodes(app):
-    app.director.produce("万妖图录", 1)
-    app.director.produce("万妖图录", 2)
+    _finish(app, "万妖图录", 1)
+    _finish(app, "万妖图录", 2)
     project = app.projects.get_project("万妖图录")
     scenes = app.assets.list(project["id"], kind="scene")
     # 场景池有限,两集之间必然存在复用
@@ -66,7 +81,7 @@ def test_asset_reuse_across_episodes(app):
 
 
 def test_deterministic_script(app):
-    s1 = app.director.produce("万妖图录", 3)
+    s1 = _finish(app, "万妖图录", 3)
     project = app.projects.get_project("万妖图录")
     episode = app.db.query_one(
         "SELECT * FROM episodes WHERE project_id=? AND number=3",
@@ -84,8 +99,8 @@ def test_sensitive_premise_fails_qc(tmp_path):
     app = App(tmp_path / "ws", config_overrides={
         "qc": {"pass_score": 95, "sensitive_words": ["禁忌之血"]}})
     try:
-        summary = app.director.produce(
-            "万妖图录", 7, premise="主角误饮禁忌之血,妖化失控")
+        summary = _finish(
+            app, "万妖图录", 7, premise="主角误饮禁忌之血,妖化失控")
         assert summary["status"] == "qc_failed"
         assert summary["qc_score"] < 95
         report = json.loads(

@@ -63,6 +63,8 @@ def test_index_and_static(server):
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
     assert "空间调度".encode() in app_js
+    assert b"/api/character/select" in app_js
+    assert "人物定版".encode() in app_js
     status, ctype, _ = _request(server["port"], "GET", "/static/style.css")
     assert status == 200 and "css" in ctype
     status, ctype, raw = _request(
@@ -178,7 +180,7 @@ def test_standard_center_api_lifecycle(server):
 
 def test_produce_flow_and_episode_api(server):
     port = server["port"]
-    # Web 默认流程:剧本 → 剧本确认 → 预生产 → 开拍确认
+    # Web 默认流程:剧本 → 每人五选一 → 预生产 → 开拍确认
     status, reply = _json_request(port, "POST", "/api/produce", {
         "sentence": "开始制作《万妖图录》第15集"})
     assert status == 202
@@ -211,20 +213,50 @@ def test_produce_flow_and_episode_api(server):
     assert pre["storyboard"] is None
     assert pre["artifacts"]["cast_art"] == []
 
-    # 第一道确认(剧本 OK)→ 画人物/场景/分镜/首尾帧后再停
+    # 第一道确认(剧本 OK)→ 只生成每名人物5张候选后停下。
     status, reply = _json_request(port, "POST", "/api/confirm", {
         "episode_id": episode_id})
     assert status == 202 and reply["phase"] == "awaiting_script"
     job = _wait_job(port, reply["job_id"])
-    assert job["summary"]["status"] == "awaiting_confirm"
+    assert job["summary"]["status"] == "awaiting_cast"
 
     status, pre = _json_request(port, "GET", f"/api/episode/{episode_id}")
+    assert pre["storyboard"] is None
+    selection = pre["cast_selection"]
+    assert not selection["passed"]
+    assert all(len(c["candidates"]) == 5 for c in selection["characters"])
+    assert all(candidate["url"].startswith("/artifacts/")
+               for c in selection["characters"]
+               for candidate in c["candidates"])
+    assert pre["artifacts"]["cast_art"] == []
+    assert pre["artifacts"]["scene_art"] == []
+    # 未完成五选一，后端也必须拒绝绕过门禁。
+    status, blocked = _json_request(port, "POST", "/api/confirm", {
+        "episode_id": episode_id})
+    assert status == 409 and "最终立绘" in blocked["error"]
+    for character in selection["characters"]:
+        status, selected = _json_request(
+            port, "POST", "/api/character/select", {
+                "episode_id": episode_id,
+                "character": character["character"],
+                "candidate_index": 1,
+            })
+        assert status == 200
+    assert selected["passed"] is True
+
+    # 人物已锁定 → 才生成场景/分镜/首尾帧，再停等开拍。
+    status, reply = _json_request(port, "POST", "/api/confirm", {
+        "episode_id": episode_id})
+    assert status == 202 and reply["phase"] == "awaiting_cast"
+    job = _wait_job(port, reply["job_id"])
+    assert job["summary"]["status"] == "awaiting_confirm"
+    status, pre = _json_request(port, "GET", f"/api/episode/{episode_id}")
     assert pre["storyboard"]["shots"]
-    assert pre["artifacts"]["cast_art"], "确认页需要人物立绘"
+    assert pre["artifacts"]["cast_art"], "确认页需要最终人物立绘"
     assert pre["artifacts"]["scene_art"], "确认页需要场景概念图"
     assert pre["artifacts"]["videos"] == {}, "确认前不应生产视频"
 
-    # 第二道确认(开拍)→ 自动完成剩余全部阶段
+    # 开拍确认 → 自动完成剩余全部阶段
     status, reply = _json_request(port, "POST", "/api/confirm", {
         "episode_id": episode_id})
     assert status == 202
@@ -354,7 +386,7 @@ def test_artifact_thumbnail_and_cache(server):
     _wait_job(port, reply["job_id"], timeout=120)
     status, episode = _json_request(port, "GET", "/api/episode/1")
     from urllib.parse import quote
-    art = episode["artifacts"]["cast_art"][0]
+    art = episode["cast_selection"]["characters"][0]["candidates"][0]
     url = art["url"]
     assert url.startswith("/artifacts/")
     path, _, ver = url.partition("?")

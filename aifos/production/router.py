@@ -71,6 +71,20 @@ class ProviderRouter:
     def call(self, capability, payload, out_dir, cancel=None):
         chain = self.config.get("routing", capability, default=None) or ["mock"]
         fallbacks = []
+        requires_refs = bool(payload.get("require_reference_images")
+                             or payload.get("identity_required"))
+        supplied_refs = []
+        for key in ("style_ref", "scene_ref", "chain_first_uri"):
+            if payload.get(key):
+                supplied_refs.append(payload[key])
+        for key in ("character_refs", "reference_images"):
+            supplied_refs.extend(payload.get(key) or [])
+        supplied_refs.extend(
+            ref.get("uri") for ref in (payload.get("identity_references") or [])
+            if isinstance(ref, dict) and ref.get("uri"))
+        if requires_refs and not supplied_refs:
+            raise ProviderUnavailable(
+                f"能力 {capability} 要求真实参考图，但请求未携带任何图片")
         for name in chain:
             provider = self.providers.get(name)
             if provider is None:
@@ -90,6 +104,12 @@ class ProviderRouter:
             if not ok:
                 self.log.info(
                     "router", f"{name} 不可用({reason}),回退({capability})")
+                fallbacks.append({"provider": name, "reason": reason})
+                continue
+            if requires_refs and not provider.reference_images:
+                reason = "不支持真实参考图输入，禁止退化为纯文字生图/质检"
+                self.log.info(
+                    "router", f"{name} {reason},回退({capability})")
                 fallbacks.append({"provider": name, "reason": reason})
                 continue
             try:

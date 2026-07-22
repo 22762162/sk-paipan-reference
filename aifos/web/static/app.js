@@ -190,6 +190,7 @@ function armConfirm(btn, label, action) {
 const STATUS_CN = {
   done: "完成", failed: "失败", qc_failed: "质检未过", created: "已建",
   awaiting_confirm: "待确认", awaiting_script: "剧本待确认",
+  awaiting_cast: "人物待定版",
   cancelling: "正在暂停…",
   script: "剧本中", continuity: "锁连续性",
   cast: "画人物场景", storyboard: "五维分镜中", images: "关键帧中",
@@ -204,7 +205,8 @@ const RUN_STATUS_CN = {
 };
 const ACTION_CN = {
   produce: "开始制作", script_import: "导入剧本制作",
-  confirm_script: "确认剧本后续产", confirm_preflight: "确认开拍后续产",
+  confirm_script: "确认剧本后续产", confirm_cast: "确认人物定版后续产",
+  confirm_preflight: "确认开拍后续产",
   force_rebuild: "全部重做", revise_script: "修改剧本",
   regen_image: "重画图片", adjustment: "制作调整",
   legacy_import: "历史记录回填",
@@ -214,7 +216,7 @@ function runChip(status) {
 }
 function chip(status) {
   const cls = ["done", "failed", "qc_failed", "awaiting_confirm",
-    "awaiting_script"].includes(status)
+    "awaiting_script", "awaiting_cast"].includes(status)
     ? status : "running";
   return `<span class="chip ${cls}">${esc(STATUS_CN[status] || status)}</span>`;
 }
@@ -1056,7 +1058,7 @@ async function renderDashboard() {
 
   const producing = data.episodes.some((e) =>
     !["done", "failed", "qc_failed", "created", "awaiting_script",
-      "awaiting_confirm"].includes(e.status));
+      "awaiting_cast", "awaiting_confirm"].includes(e.status));
   if (runningJobs.length || producing)
     pollTimer = setInterval(refreshIfIdle, 2500);
 }
@@ -1796,16 +1798,17 @@ function bindRegen(container, episodeId, getData, onDone) {
 /* ================= 图片生产清单 =================
    每张要生成的图:分类/名称/提示词/实时状态;可单张改提示词重画 */
 const PLAN_CAT_CN = {
+  character_candidate: "人物定妆候选(每人5张)",
   character_art: "人物立绘",
   character_sheet: "人物资产套件(四视图/特写/特征/妆容/服装)",
   scene_art: "场景概念图",
   shot_image: "分镜画面(关键帧)", frames: "首尾帧",
 };
-const PLAN_CATS = ["character_art", "character_sheet", "scene_art",
+const PLAN_CATS = ["character_candidate", "character_art", "character_sheet", "scene_art",
   "shot_image", "frames"];
 const PLAN_STATUS_CN = {
   pending: "排队中", generating: "生成中", done: "已完成",
-  failed: "失败", reused: "复用已有",
+  failed: "失败", reused: "复用已有", selected: "已选定",
 };
 const PROVIDER_LABEL = {
   codex: "Codex CLI", image_api: "图片API", api: "通用API",
@@ -1855,6 +1858,12 @@ function planItemThumbs(data, item) {
   if (item.category === "character_art") {
     const row = (art.cast_art || []).find((c) => c.name === item.name);
     if (row && row.url) urls = [row.url];
+  } else if (item.category === "character_candidate") {
+    const group = ((data.cast_selection || {}).characters || [])
+      .find((c) => c.character === item.name);
+    const row = group && (group.candidates || [])
+      .find((c) => c.index === item.candidate_index);
+    if (row && row.url) urls = [row.url];
   } else if (item.category === "character_sheet") {
     const sheets = (art.character_sheets || {})[item.name] || [];
     const row = sheets.find((s) => s.sheet === item.sheet);
@@ -1887,7 +1896,7 @@ function planTargetOf(item) {
 function planItemHtml(data, item, editable) {
   const thumbs = planItemThumbs(data, item);
   const st = item.status || "pending";
-  const canEdit = editable;
+  const canEdit = editable && item.category !== "character_candidate";
   return `<div class="plan-item plan-selectable st-${st}" data-plan-select="${esc(item.id)}"
     role="button" tabindex="0" aria-pressed="false"
     aria-label="选择查看 ${esc(item.label)}">
@@ -2733,12 +2742,15 @@ function renderProgressBanner(data) {
   if (!el) return;
   const awaitingScript = data.episodes.filter(
     (e) => e.status === "awaiting_script");
+  const awaitingCast = data.episodes.filter(
+    (e) => e.status === "awaiting_cast");
   const awaiting = data.episodes.filter(
     (e) => e.status === "awaiting_confirm");
   const producing = data.episodes.filter(
     (e) => !["done", "failed", "qc_failed", "created", "awaiting_script",
-             "awaiting_confirm"].includes(e.status));
-  if (!producing.length && !awaiting.length && !awaitingScript.length) {
+             "awaiting_cast", "awaiting_confirm"].includes(e.status));
+  if (!producing.length && !awaiting.length && !awaitingScript.length
+      && !awaitingCast.length) {
     el.innerHTML = ""; return;
   }
   el.innerHTML = awaitingScript.map((e) => `
@@ -2746,6 +2758,11 @@ function renderProgressBanner(data) {
       <div class="progress-text">《${esc(e.project)}》第${e.number}集 剧本写好了,先过目 📖
         <span>看过剧本点确认才开始画图(还没花出图额度);不满意可附意见重写</span></div>
       <button class="primary" onclick="location.hash='#/episode/${e.id}'">去看剧本 →</button>
+    </div>`).join("") + awaitingCast.map((e) => `
+    <div class="progress-card confirm">
+      <div class="progress-text">《${esc(e.project)}》第${e.number}集 人物候选已就绪 👤
+        <span>每名角色从5张候选中选定1张；全部定版后才生成后续图片</span></div>
+      <button class="primary" onclick="location.hash='#/episode/${e.id}'">去选人物 →</button>
     </div>`).join("") + awaiting.map((e) => `
     <div class="progress-card confirm">
       <div class="progress-text">《${esc(e.project)}》第${e.number}集 预生产完成,等你过目
@@ -2893,6 +2910,87 @@ function pollCanvas(episodeId) {
 
 const CARD_W = 220, CARD_H = 218, GAP_X = 26, GAP_Y = 56, LANE_X = 150;
 
+function renderCastSelection(data, episodeId) {
+  const selection = data.cast_selection || {};
+  const characters = selection.characters || [];
+  app.innerHTML = `<div class="canvas-view cast-select-view">
+    <div class="confirm-banner">
+      <div><b>先定人物，再生产后续图片 👤</b>
+        <span>每名角色已有 ${selection.candidate_target || 5} 张候选。请各选1张作为最终立绘；
+        后续四视图、关键帧、首尾帧和其他图片 API 都会真实携带这张参考图，
+        视觉质检也会将成图与它逐人比对。</span></div>
+      <button class="primary" id="cast-continue" ${selection.passed ? "" : "disabled"}>
+        ${selection.passed ? "✅ 全部定版，继续预生产" : `已定版 ${selection.locked || 0}/${selection.total || characters.length}`}
+      </button>
+    </div>
+    <div class="canvas-toolbar">
+      <button id="cast-back">← 仪表盘</button>
+      <span class="title">《${esc(data.project.title)}》第${data.episode.number}集 · 人物定版</span>
+      ${chip(data.episode.status)}<span class="spacer"></span>
+      <button id="cast-script">📖 看剧本</button>
+    </div>
+    <div class="cast-selection-list">${characters.map((character) => `
+      <section class="cast-choice panel">
+        <div class="cast-choice-head"><div><h2>${esc(character.character)}</h2>
+          <span class="dim">${esc(character.role || "角色")} · ${character.candidate_count || 0}/${selection.candidate_target || 5} 张候选</span></div>
+          <strong class="${character.locked ? "cast-locked" : "cast-unlocked"}">
+            ${character.locked ? "✓ 已锁定最终立绘" : "请选择1张"}</strong></div>
+        <div class="cast-candidate-grid">${(character.candidates || []).map((candidate) => `
+          <article class="cast-candidate${candidate.selected ? " selected" : ""}">
+            <button type="button" class="cast-image" data-full="${esc(candidate.url || "")}" aria-label="查看${esc(character.character)}候选${candidate.index}">
+              ${candidate.url ? `<img src="${esc(thumbUrl(candidate.url, 520))}" loading="lazy" alt="${esc(character.character)}候选${candidate.index}">`
+                : `<span class="plan-thumb-empty">图片缺失</span>`}
+            </button>
+            <div class="cast-candidate-foot"><b>候选 ${candidate.index}</b>
+              <button type="button" class="${candidate.selected ? "selected" : "primary"} cast-pick"
+                data-character="${esc(character.character)}" data-index="${candidate.index}">
+                ${candidate.selected ? "✓ 当前最终立绘" : "选定这张"}</button></div>
+          </article>`).join("")}</div>
+      </section>`).join("")}</div>
+  </div>`;
+  document.getElementById("cast-back").onclick = () => { location.hash = "#/"; };
+  document.getElementById("cast-script").onclick = () => showScriptOverlay(data, episodeId);
+  app.querySelectorAll(".cast-image").forEach((button) => {
+    button.onclick = () => {
+      if (button.dataset.full) showImageLightbox(button.dataset.full, "人物候选大图");
+    };
+  });
+  app.querySelectorAll(".cast-pick").forEach((button) => {
+    button.onclick = async () => {
+      button.disabled = true;
+      button.textContent = "锁定中…";
+      try {
+        await api("/api/character/select", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ episode_id: data.episode.id,
+            character: button.dataset.character,
+            candidate_index: Number(button.dataset.index) }),
+        });
+        showToast(`${button.dataset.character} 已锁定候选 ${button.dataset.index}`, "ok");
+        renderCanvasView(episodeId);
+      } catch (e) {
+        showToast(e.message, "error");
+        button.disabled = false; button.textContent = "选定这张";
+      }
+    };
+  });
+  const next = document.getElementById("cast-continue");
+  if (next && selection.passed) next.onclick = async () => {
+    next.disabled = true; next.textContent = "已确认，继续生产中…";
+    try {
+      await api("/api/confirm", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ episode_id: data.episode.id }),
+      });
+      showToast("人物已全部定版，开始生成资产套件和后续图片", "ok");
+      pollCanvas(episodeId);
+    } catch (e) {
+      showToast(e.message, "error");
+      next.disabled = false; next.textContent = "✅ 全部定版，继续预生产";
+    }
+  };
+}
+
 async function renderCanvasView(episodeId) {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   let data;
@@ -2906,9 +3004,13 @@ async function renderCanvasView(episodeId) {
     renderScriptReview(data, episodeId);
     return;
   }
+  if (ep.status === "awaiting_cast" && script) {
+    renderCastSelection(data, episodeId);
+    return;
+  }
   // 制作进行中一律进生产直播页(实况看板+日志+停止),画布留给审阅/成片
   const stable = ["done", "failed", "qc_failed", "created",
-    "awaiting_script", "awaiting_confirm"];
+    "awaiting_script", "awaiting_cast", "awaiting_confirm"];
   if (!stable.includes(ep.status)) {
     renderProductionView(data, episodeId);
     return;
@@ -2992,7 +3094,7 @@ async function renderCanvasView(episodeId) {
   const stopLive = document.getElementById("btn-stop-live");
   if (stopLive) {
     const producingNow = !["done", "failed", "qc_failed", "created",
-      "awaiting_script", "awaiting_confirm"].includes(ep.status);
+      "awaiting_script", "awaiting_cast", "awaiting_confirm"].includes(ep.status);
     const strip = document.getElementById("live-strip");
     if (strip) strip.hidden = !producingNow;
     if (producingNow) { updateLiveStrip(data); startLiveTicker(episodeId); }
@@ -3044,7 +3146,7 @@ async function renderCanvasView(episodeId) {
   };
   // 制作进行中自动刷新画布(待确认是稳定状态,不轮询)
   if (!["done", "failed", "qc_failed", "created",
-        "awaiting_script", "awaiting_confirm"].includes(ep.status))
+        "awaiting_script", "awaiting_cast", "awaiting_confirm"].includes(ep.status))
     pollCanvas(episodeId);
 
   const canvas = new StoryboardCanvas(data, shotIssues, lineIssues);

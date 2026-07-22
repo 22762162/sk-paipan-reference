@@ -201,6 +201,12 @@ def validate_design(data, payload):
 IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(可直接读取),
 逐项核对是否符合生产要求。
 
+最终立绘视觉基准(这些图片是身份事实来源，优先级高于早期文字描述):
+{identity_references}
+只要画面中有人物，就必须把待检图与对应最终立绘逐人做视觉比对：脸型、
+五官比例、眼鼻嘴结构、发际线、发型轮廓、年龄感、体型和标志特征。
+文字设定只补充剧情、动作、场景和当镜服装；与最终立绘冲突时以最终立绘为准。
+
 画面要求:
 - 出场角色:{characters}(严格共 {count} 个;角色形态必须与人物设定
   一致——设定写明物种就按设定画,没写明的默认人类;名字不代表物种,
@@ -212,13 +218,19 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
   字幕条、乱码文字、多余或缺失的人物{extra}
 
 只输出一个 JSON 对象,不要任何其他文字:
-{{"pass": true或false, "issues": ["不通过的具体原因,每条一句,指出在画面哪里"]}}"""
+{{"pass": true或false, "identity_checked": true或false,
+"issues": ["不通过的具体原因,每条一句,指出在画面哪里"]}}"""
 
 
 def build_qc_prompt(payload):
     characters = payload.get("characters") or []
+    identity_refs = payload.get("identity_references") or []
+    ref_lines = "\n".join(
+        f"- {ref.get('character', '角色')}: {ref.get('uri', '')}"
+        for ref in identity_refs if isinstance(ref, dict))
     return IMAGE_QC_PROMPT.format(
         image=payload.get("image_uri", ""),
+        identity_references=(ref_lines or "无人空镜，无需人物身份比对"),
         characters="、".join(characters) or "无人(空镜)",
         count=payload.get("count", len(characters)),
         designs=payload.get("designs") or "见参考图",
@@ -237,6 +249,8 @@ def validate_image_qc(data):
     if not isinstance(issues, list):
         issues = [str(issues)] if issues else []
     data["issues"] = [str(item) for item in issues][:8]
+    if "identity_checked" in data:
+        data["identity_checked"] = bool(data["identity_checked"])
     if not data["pass"] and not data["issues"]:
         data["issues"] = ["未给出具体原因"]
     return None

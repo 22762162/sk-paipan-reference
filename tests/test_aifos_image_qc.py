@@ -17,7 +17,17 @@ def app(tmp_path):
 
 def _preproduce(app, title="小鹿的一天Vlog", number=1):
     app.director.produce(title, number, pause_for_confirm=True)
-    app.director.produce(title, number, pause_for_confirm=True)
+    summary = app.director.produce(title, number, pause_for_confirm=True)
+    if summary["status"] == "awaiting_cast":
+        project = app.projects.get_project(title)
+        episode = app.db.query_one(
+            "SELECT * FROM episodes WHERE project_id=? AND number=?",
+            (project["id"], number))
+        script, _ = app.projects.latest_document(episode["id"], "script")
+        for character in script["characters"]:
+            app.director.select_character_candidate(
+                title, number, character["name"], 1)
+        app.director.produce(title, number, pause_for_confirm=True)
     return app.projects.get_project(title)
 
 
@@ -81,9 +91,10 @@ def test_qc_report_lands_in_plan(app):
     plan = json.loads(
         (app.workspace.artifacts_dir / f"p{project['id']:03d}" / "e001"
          / "render_plan.json").read_text(encoding="utf-8"))
-    for cat in ("character_art", "character_sheet", "shot_image"):
+    for cat in ("character_candidate", "character_sheet", "shot_image"):
         drawn = [i for i in plan["items"]
-                 if i["category"] == cat and i["status"] == "done"]
+                 if i["category"] == cat
+                 and i["status"] in ("done", "reused")]
         assert drawn, f"{cat} 无生成条目"
         assert all(i.get("qc", {}).get("passed") for i in drawn), \
             f"{cat} 缺质检结果"
@@ -160,24 +171,24 @@ def test_redo_placeholders_only_redraws_mock_items(app):
                  / f"p{project['id']:03d}" / "e001" / "render_plan.json")
     plan = _json.loads(plan_path.read_text(encoding="utf-8"))
     target_item = next(i for i in plan["items"]
-                       if i["category"] == "character_art")
+                       if i["category"] == "scene_art")
     for item in plan["items"]:
         item["real"] = item["id"] == target_item["id"] and False or True
     target_item["real"] = False
     plan_path.write_text(_json.dumps(plan, ensure_ascii=False),
                          encoding="utf-8")
     name = target_item["name"]
-    before = app.assets.latest(project["id"], "character_art", name)
+    before = app.assets.latest(project["id"], "scene_art", name)
     others_before = app.assets.latest(
-        project["id"], "scene_art",
+        project["id"], "character_sheet",
         next(i["name"] for i in plan["items"]
-             if i["category"] == "scene_art"))
+             if i["category"] == "character_sheet") + ":turnaround")
     summary = app.director.redo_placeholders("补真测试", 1)
     assert summary["status"] == "done" and summary["redone"] == 1
-    after = app.assets.latest(project["id"], "character_art", name)
+    after = app.assets.latest(project["id"], "scene_art", name)
     assert after["version"] == before["version"] + 1
     others_after = app.assets.latest(
-        project["id"], "scene_art", others_before["name"])
+        project["id"], "character_sheet", others_before["name"])
     assert others_after["version"] == others_before["version"]
 
 
@@ -256,9 +267,9 @@ def test_openai_api_uses_reference_images(tmp_path, monkeypatch):
         "character_refs": [str(portrait)],
         "style_ref": str(anchor)}, tmp_path)
     assert "images/edits" in captured["url"]
-    # 风格基准图排在最前,人物设定图随后
-    assert captured["files"][0] == "anchor.png"
-    assert "portrait.png" in captured["files"]
+    # 人工锁定人物图优先于风格图，不能因接口上限被挤掉
+    assert captured["files"][0] == "portrait.png"
+    assert "anchor.png" in captured["files"]
     assert "禁止漂移" in captured["prompt"]
     assert "fell_back_to_generations" not in captured
     assert result.provider == "image_api"
@@ -298,7 +309,9 @@ def test_single_and_batch_qc_and_redo(app):
     plan_path = (app.workspace.artifacts_dir
                  / f"p{project['id']:03d}" / "e001" / "render_plan.json")
     # 单张质检:mock 默认通过
-    item = _json.loads(plan_path.read_text(encoding="utf-8"))["items"][0]
+    item = next(i for i in _json.loads(
+        plan_path.read_text(encoding="utf-8"))["items"]
+        if i["category"] == "scene_art")
     report = app.director.qc_item("质检三件套", 1, item["id"])
     assert report["passed"] is True
     after = next(i for i in _json.loads(
@@ -310,7 +323,8 @@ def test_single_and_batch_qc_and_redo(app):
     assert summary["status"] == "done" and summary["checked"] > 0
     # 人为标记两张未过 → 批量重画未过
     plan = _json.loads(plan_path.read_text(encoding="utf-8"))
-    fail_ids = [plan["items"][0]["id"], plan["items"][1]["id"]]
+    fail_ids = [i["id"] for i in plan["items"]
+                if i["category"] == "scene_art"][:2]
     vers = {}
     for i in plan["items"]:
         if i["id"] in fail_ids:

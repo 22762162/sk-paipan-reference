@@ -123,11 +123,17 @@ def test_auto_rerun_repairs_missing_video(tmp_path):
     app = App(tmp_path / "ws")
     try:
         summary = app.director.produce("重跑剧", 1)
-        assert summary["status"] == "done"
+        assert summary["status"] == "awaiting_cast"
         project = app.projects.get_project("重跑剧")
         episode = app.db.query_one(
             "SELECT * FROM episodes WHERE project_id=? AND number=1",
             (project["id"],))
+        script, _ = app.projects.latest_document(episode["id"], "script")
+        for character in script["characters"]:
+            app.director.select_character_candidate(
+                "重跑剧", 1, character["name"], 1)
+        summary = app.director.produce("重跑剧", 1)
+        assert summary["status"] == "done"
         script, _ = app.projects.latest_document(episode["id"], "script")
         storyboard, _ = app.projects.latest_document(
             episode["id"], "storyboard")

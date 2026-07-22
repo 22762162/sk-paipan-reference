@@ -10,6 +10,7 @@ import pytest
 
 from aifos.app import App
 from aifos.cli import main
+from aifos.errors import AifosError
 
 REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 
@@ -29,6 +30,17 @@ def _script_of(app, title, number):
     return app.projects.latest_document(episode["id"], "script")
 
 
+def _to_preflight(app, title="万妖图录", number=1, finish=False):
+    summary = app.director.produce(title, number)
+    assert summary["status"] == "awaiting_cast"
+    script, _ = _script_of(app, title, number)
+    for character in script["characters"]:
+        app.director.select_character_candidate(
+            title, number, character["name"], 1)
+    return app.director.produce(
+        title, number, pause_for_confirm=not finish)
+
+
 def test_revise_script_regenerates(app):
     app.director.produce("万妖图录", 1, pause_for_confirm=True)
     before, v1 = _script_of(app, "万妖图录", 1)
@@ -46,19 +58,16 @@ def test_revise_script_regenerates(app):
 def test_regen_character_art(app):
     app.director.produce("万妖图录", 1, pause_for_confirm=True)
     app.director.produce("万妖图录", 1, pause_for_confirm=True)  # 剧本确认
-    project = app.projects.get_project("万妖图录")
-    name = app.assets.list(project["id"], "character_art")[0]["name"]
-    v1 = app.assets.latest(project["id"], "character_art", name)["version"]
-    result = app.director.regen_image(
-        "万妖图录", 1, {"kind": "character_art", "name": name},
-        feedback="表情更凶")
-    assert Path(result["uri"]).exists()
-    v2 = app.assets.latest(project["id"], "character_art", name)["version"]
-    assert v2 == v1 + 1
+    script, _ = _script_of(app, "万妖图录", 1)
+    name = script["characters"][0]["name"]
+    with pytest.raises(AifosError, match="最终立绘不能从文字直接重画"):
+        app.director.regen_image(
+            "万妖图录", 1, {"kind": "character_art", "name": name},
+            feedback="表情更凶")
 
 
 def test_regen_shot_invalidates_video(app):
-    app.director.produce("万妖图录", 2)  # 完整制作,含视频
+    _to_preflight(app, "万妖图录", 2, finish=True)
     project = app.projects.get_project("万妖图录")
     assert app.assets.latest(project["id"], "video", "e002_shot001")
     app.director.regen_image(
@@ -75,14 +84,12 @@ def test_regen_shot_invalidates_video(app):
 
 
 def test_regen_scene_art_and_errors(app):
-    app.director.produce("万妖图录", 1, pause_for_confirm=True)
-    app.director.produce("万妖图录", 1, pause_for_confirm=True)  # 剧本确认
+    _to_preflight(app)
     project = app.projects.get_project("万妖图录")
     scene = app.assets.list(project["id"], "scene_art")[0]["name"]
     result = app.director.regen_image(
         "万妖图录", 1, {"kind": "scene_art", "name": scene})
     assert Path(result["uri"]).exists()
-    from aifos.errors import AifosError
     with pytest.raises(AifosError):
         app.director.regen_image("万妖图录", 1, {"kind": "shot",
                                                  "shot_no": 999})
@@ -133,6 +140,17 @@ def test_cli_revise_and_regen(tmp_path, capsys):
                  "--episode", "1", "--feedback", "更热血"]) == 0
     assert "重写" in capsys.readouterr().out
     # 剧本确认 → 画出人物/分镜后才能重画单镜头
+    assert main(["--workspace", ws, "confirm", "--project", "万妖图录",
+                 "--episode", "1"]) == 0
+    capsys.readouterr()
+    locked = App(ws)
+    try:
+        script, _ = _script_of(locked, "万妖图录", 1)
+        for character in script["characters"]:
+            locked.director.select_character_candidate(
+                "万妖图录", 1, character["name"], 1)
+    finally:
+        locked.close()
     assert main(["--workspace", ws, "confirm", "--project", "万妖图录",
                  "--episode", "1"]) == 0
     capsys.readouterr()

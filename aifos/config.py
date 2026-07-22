@@ -45,6 +45,7 @@ DEFAULTS = {
             "capabilities": ["script", "storyboard", "image_qc"],
             "command": ["python3", "-m", "aifos.adapters.claude_script",
                         "--claude", "claude"],
+            "reference_images": True,
             "cost_per_call": 0.5, "timeout": 600,
         },
         "codex": {
@@ -54,6 +55,7 @@ DEFAULTS = {
             "capabilities": ["image", "frames", "cover", "image_qc"],
             "command": ["python3", "-m", "aifos.adapters.codex_image",
                         "--codex", "codex"],
+            "reference_images": True,
             "cost_per_call": 1.0, "timeout": 900,
         },
         "jimeng": {
@@ -83,6 +85,7 @@ DEFAULTS = {
             "capabilities": ["script", "storyboard", "image_qc"],
             "endpoint": "https://api.anthropic.com", "api_key": "",
             "model": "claude-opus-4-8", "max_tokens": 16000,
+            "reference_images": True,
             "cost_per_call": 0.8, "timeout": 600,
         },
         "image_api": {
@@ -91,6 +94,7 @@ DEFAULTS = {
             "capabilities": ["image", "frames", "cover", "image_qc"],
             "endpoint": "https://api.openai.com", "api_key": "",
             "model": "gpt-image-2",
+            "reference_images": True,
             "cost_per_call": 1.5, "timeout": 300,
         },
         "ark": {
@@ -125,6 +129,7 @@ DEFAULTS = {
             "type": "mock", "enabled": True,
             "capabilities": ["script", "storyboard", "image_qc", "image", "frames",
                              "video", "voice", "edit", "cover"],
+            "reference_images": True,
             "cost_per_call": 0.1,
         },
     },

@@ -6,6 +6,7 @@
        → 抽帧检查板 + 内容复核 + 交付脚本 → 包装 → 数据沉淀
 """
 
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -84,6 +85,7 @@ STAGES = [
 # 预生产检查点:此阶段完成后可暂停等待用户确认,
 # 确认后才进入视频生产(真实产线从这里开始消耗即梦额度)
 CONFIRM_AFTER = "preflight"
+CHARACTER_CANDIDATES = 5
 
 # 人物完整资产套件:立绘之外每个角色补齐的生产级设定资产
 # (项目级,跨集复用;全部以立绘和用户参考图为基准保证同一形象)
@@ -153,8 +155,8 @@ class Director:
         只补齐缺失部分——真实产线(即梦按镜头计费)断点续产的关键。
         script:用户自带剧本(标准 JSON);提供时跳过 AI 编剧,
         人物/场次/分镜等全部从该剧本自动推导。
-        pause_for_confirm=True:预生产(连续性、五维分镜、关键帧、首尾帧、门禁)
-        完成后暂停等待确认(status=awaiting_confirm);确认后再次调用
+        pause_for_confirm=True:剧本确认后先生成每人5张定妆候选并暂停，
+        所有人物人工锁定后才继续五维分镜、关键帧、首尾帧和门禁；确认后再次调用
         produce(不带该参数)即从断点继续自动完成 Seedance 声画、无字幕剪辑
         与三层质检。"""
         if script is not None:
@@ -225,6 +227,11 @@ class Director:
                     and ctx.get("script_is_new")):
                 paused = "script"
                 break
+            # 第二道确认:每名角色5张候选必须人工选定1张。没有最终立绘时，
+            # 禁止继续生成资产套件、分镜画面和首尾帧。
+            if (stage == "cast" and ctx.get("cast_selection_required")):
+                paused = "cast"
+                break
             if pause_for_confirm and stage == CONFIRM_AFTER:
                 paused = "preflight"
                 break
@@ -240,7 +247,15 @@ class Director:
                 (episode["id"], CONFIRM_AFTER))
             script_doc, _ = self.projects.latest_document(
                 episode["id"], "script")
+            selection = self.character_selection_status(
+                ctx["project"]["id"],
+                (script_doc or {}).get("characters", []))
+            candidates_started = any(
+                item.get("candidate_count", 0)
+                for item in selection.get("characters", []))
             landing = ("awaiting_confirm" if gate_done and gate_done["n"]
+                       else "awaiting_cast" if (
+                           selection.get("required") and candidates_started)
                        else "awaiting_script" if script_doc else "created")
             self.projects.set_episode_status(episode["id"], landing)
             self.log.info(
@@ -252,6 +267,14 @@ class Director:
             self.log.info(
                 "director",
                 f"剧本已生成,等待确认后再画人物/场景/分镜"
+                f"(episode_id={episode['id']})")
+        elif paused == "cast":
+            self.projects.set_episode_status(
+                episode["id"], "awaiting_cast")
+            self.log.info(
+                "director",
+                "人物候选已生成，等待逐个选定最终立绘；"
+                "全部锁定前不生成后续图片"
                 f"(episode_id={episode['id']})")
         elif paused:
             self.projects.set_episode_status(
@@ -453,7 +476,7 @@ class Director:
         anchor = self._anchor_character(project_id)
         if not anchor or anchor == exclude_name:
             return None
-        row = self.assets.latest(project_id, "character_art", anchor)
+        row = self._locked_identity(project_id, anchor)
         if row and row["uri"] and Path(row["uri"]).exists():
             return row["uri"]
         return None
@@ -590,9 +613,26 @@ class Director:
         except (TypeError, ValueError):
             return 1
 
+    def _identity_references(self, project_id, characters, required=True):
+        refs, missing = [], []
+        for name in characters or []:
+            row = self._locked_identity(project_id, name)
+            if row is None:
+                missing.append(name)
+                continue
+            refs.append({
+                "character": name,
+                "uri": row["uri"],
+                "version": row["version"],
+            })
+        if required and missing:
+            raise AifosError(
+                "以下角色尚未锁定最终立绘，禁止出图/质检: " + "、".join(missing))
+        return refs
+
     def _qc_spec(self, project_id, characters, location="", action="",
-                 forbid=None):
-        """质检要求:人物名单+人数+设定要点+场景动作+违禁物。"""
+                 forbid=None, require_identity=True):
+        """视觉质检规格：待检图必须与人工锁定的最终立绘逐人比对。"""
         designs = []
         for name in characters:
             design = self._character_design(project_id, name)
@@ -600,6 +640,9 @@ class Director:
                 "species", "hair", "costume",
                 "signature")) if design else ""
             designs.append(f"{name}({line})" if line else name)
+        identity_refs = self._identity_references(
+            project_id, characters,
+            required=bool(characters and require_identity))
         return {
             "characters": list(characters),
             "count": len(characters),
@@ -607,6 +650,8 @@ class Director:
             "location": location or "",
             "action": action or "",
             "forbid": list(forbid or []),
+            "identity_references": identity_refs,
+            "identity_required": bool(characters and require_identity),
         }
 
     def _generate_image_with_qc(self, capability, payload, out_dir,
@@ -632,9 +677,17 @@ class Director:
                 return result      # 质检产线故障不阻塞生产
             result.cost += qc_result.cost
             verdict = qc_result.data or {}
-            report = {"passed": bool(verdict.get("pass")),
-                      "issues": list(verdict.get("issues") or []),
-                      "attempts": attempts + 1}
+            identity_checked = (not qc_spec.get("identity_required")
+                                or bool(verdict.get("identity_checked")))
+            issues = list(verdict.get("issues") or [])
+            if not identity_checked:
+                issues.append("质检未确认已逐人比对最终立绘")
+            report = {"passed": bool(verdict.get("pass")) and identity_checked,
+                      "issues": issues,
+                      "attempts": attempts + 1,
+                      "identity_checked": identity_checked,
+                      "identity_references": len(
+                          qc_spec.get("identity_references") or [])}
             result.qc = report
             if report["passed"] or attempts >= self._qc_retries():
                 return result
@@ -1037,6 +1090,220 @@ class Director:
                 f"覆盖角色: {'、'.join(designs)}")
         return designs
 
+    @staticmethod
+    def _asset_meta(row):
+        if row is None:
+            return {}
+        meta = row["meta"]
+        if isinstance(meta, str):
+            try:
+                return json.loads(meta or "{}")
+            except ValueError:
+                return {}
+        return meta or {}
+
+    def _locked_identity(self, project_id, name):
+        """返回人工选定的最终立绘；普通 character_art 不视为已定版。"""
+        row = self.assets.latest(project_id, "character_identity", name)
+        if row is None or not self._asset_meta(row).get("locked"):
+            return None
+        uri = row["uri"]
+        if not uri:
+            return None
+        if not uri.startswith(("http://", "https://")) and not Path(uri).exists():
+            return None
+        return row
+
+    def character_selection_status(self, project_id, characters):
+        """项目级人物定版状态：每人5候选、最终只锁1张，跨集复用。"""
+        result = []
+        candidate_rows = {}
+        for row in self.assets.list(project_id, "character_candidate"):
+            candidate_rows[row["name"]] = row
+        for character in characters or []:
+            name = character["name"] if isinstance(character, dict) else str(character)
+            locked = self._locked_identity(project_id, name)
+            selected_meta = self._asset_meta(locked)
+            candidates = []
+            for row in candidate_rows.values():
+                meta = self._asset_meta(row)
+                if meta.get("character") != name:
+                    continue
+                uri = row["uri"]
+                if not uri or (not uri.startswith(("http://", "https://"))
+                               and not Path(uri).exists()):
+                    continue
+                index = int(meta.get("candidate_index") or 0)
+                candidates.append({
+                    "id": f"candidate:{name}:{index}",
+                    "index": index,
+                    "uri": uri,
+                    "version": row["version"],
+                    "selected": bool(
+                        locked and selected_meta.get("candidate_asset_id") == row["id"]),
+                })
+            candidates.sort(key=lambda item: item["index"])
+            result.append({
+                "character": name,
+                "role": character.get("role", "") if isinstance(character, dict) else "",
+                "locked": locked is not None,
+                "identity_uri": locked["uri"] if locked else "",
+                "identity_version": locked["version"] if locked else None,
+                "candidates": candidates,
+                "candidate_count": len(candidates),
+            })
+        locked_count = sum(1 for item in result if item["locked"])
+        return {
+            "schema": "aifos.character-selection/v1",
+            "candidate_target": CHARACTER_CANDIDATES,
+            "characters": result,
+            "locked": locked_count,
+            "total": len(result),
+            "passed": bool(result) and locked_count == len(result),
+            "required": any(not item["locked"] for item in result),
+        }
+
+    def _ensure_character_candidates(self, ctx, characters, designs, style):
+        """为尚未定版的角色补足5张候选；候选之间并行，后续等待人工选择。"""
+        project_id = ctx["project"]["id"]
+        seed = []
+        tasks = []
+        for character in characters:
+            name = character["name"]
+            role = character.get("role", "")
+            locked = self._locked_identity(project_id, name)
+            existing = {}
+            for index in range(1, CHARACTER_CANDIDATES + 1):
+                row = self.assets.latest(
+                    project_id, "character_candidate", f"{name}:{index:02d}")
+                if row is None:
+                    continue
+                meta = self._asset_meta(row)
+                idx = int(meta.get("candidate_index") or 0)
+                uri = row["uri"]
+                if idx and uri and (uri.startswith(("http://", "https://"))
+                                    or Path(uri).exists()):
+                    existing[idx] = row
+            if locked and not existing:
+                # 人工上传的最终立绘没有候选集，仍视为明确人工定版。
+                continue
+            refs = self._reference_uris(project_id, [name])
+            base_prompt = self._portrait_prompt(
+                name, role, style, design=designs.get(name))
+            for index in range(1, CHARACTER_CANDIDATES + 1):
+                item_id = f"candidate:{name}:{index}"
+                prompt = (
+                    f"{base_prompt};人物候选{index}/{CHARACTER_CANDIDATES};"
+                    "身份核心设定不变，只允许在脸部骨相细节、神态感染力和"
+                    "自然真实感上做克制差异；干净均匀肤质，禁止塑料脸、"
+                    "脏污毛孔、改变发型服装或增加人物")
+                seed.append({
+                    "id": item_id, "category": "character_candidate",
+                    "label": f"{name} · 候选 {index}", "name": name,
+                    "candidate_index": index, "prompt": prompt,
+                })
+                if index in existing or locked:
+                    continue
+                tasks.append({
+                    "item_id": item_id,
+                    "capability": "image",
+                    "payload": {
+                        "portrait": True,
+                        "portrait_candidate": True,
+                        "art_name": f"{name}_candidate_{index:02d}",
+                        "role": role, "shot_no": 0,
+                        "characters": [name], "location": "",
+                        "prompt": prompt, "style": style,
+                        "reference_images": refs,
+                        # 初次定妆尚不存在最终立绘；若用户上传过身份参考，
+                        # API 也必须真实使用这些图，不能只读文字。
+                        "require_reference_images": bool(refs),
+                        "aspect": ctx["aspect"], **ctx["dims"],
+                    },
+                    "sub_dir": "cast/candidates",
+                    "tag": (name, index, role),
+                    "qc_spec": self._qc_spec(
+                        project_id, [name], require_identity=False,
+                        forbid=["与设定形态不符的角色", "悬挂的衣物或衣架",
+                                "与设定不符的人"]),
+                })
+        self._plan_seed(ctx, "character_candidate", seed)
+        # 已存在的候选明确标成复用，避免重新排队。
+        for item in seed:
+            name, index = item["name"], item["candidate_index"]
+            status = self.character_selection_status(project_id, [name])
+            if any(c["index"] == index
+                   for c in status["characters"][0]["candidates"]):
+                self._plan_mark(ctx, item["id"], "reused", only_pending=True)
+        for (name, index, role), result in self._run_parallel(
+                ctx, tasks, line="人物定妆候选(每人5张)").items():
+            self.assets.register(
+                project_id, "character_candidate", f"{name}:{index:02d}",
+                uri=result.uri,
+                meta={"character": name, "role": role,
+                      "candidate_index": index,
+                      "provider": result.provider,
+                      "model": getattr(result, "model", "")})
+        return self.character_selection_status(project_id, characters)
+
+    def select_character_candidate(self, project_title, episode_number,
+                                   character_name, candidate_index):
+        """人工选择并锁定最终立绘；下游只能引用该不可变身份锚点。"""
+        project, episode = self._episode_ctx(project_title, episode_number)
+        script, _ = self.projects.latest_document(episode["id"], "script")
+        characters = (script or {}).get("characters", [])
+        character = next((c for c in characters
+                          if c.get("name") == character_name), None)
+        if character is None:
+            raise AifosError(f"剧本中没有角色: {character_name}")
+        if episode["status"] != "awaiting_cast":
+            raise AifosError("只能在人物定版阶段选择候选；后续已生产时请先重开定版")
+        candidate = self.assets.latest(
+            project["id"], "character_candidate",
+            f"{character_name}:{int(candidate_index):02d}")
+        if candidate is None or not candidate["uri"]:
+            raise AifosError(f"人物候选不存在: {character_name}/{candidate_index}")
+        if (not candidate["uri"].startswith(("http://", "https://"))
+                and not Path(candidate["uri"]).exists()):
+            raise AifosError("候选图片文件已丢失，请重新生成候选")
+        meta = {
+            "character": character_name,
+            "role": character.get("role", ""),
+            "locked": True,
+            "candidate_index": int(candidate_index),
+            "candidate_asset_id": candidate["id"],
+            "candidate_version": candidate["version"],
+            "locked_at": now(),
+        }
+        identity = self.assets.register(
+            project["id"], "character_identity", character_name,
+            uri=candidate["uri"], meta=meta, new_version=True)
+        # character_art 是旧代码/资产中心的兼容别名，但其来源明确指向
+        # 人工锁定的 identity，不能再由文字直接生成。
+        self.assets.register(
+            project["id"], "character_art", character_name,
+            uri=candidate["uri"], meta=meta, new_version=True)
+        ctx = {"episode": dict(episode),
+               "out_root": self._episode_dir(project, episode)}
+        plan = self._plan_read(ctx)
+        for item in plan.get("items", []):
+            if item.get("category") == "character_candidate" \
+                    and item.get("name") == character_name:
+                self._plan_mark(
+                    ctx, item["id"], item.get("status", "done"),
+                    extra={"selected": int(item.get("candidate_index", 0))
+                           == int(candidate_index)})
+        self._plan_mark(
+            ctx, f"char:{character_name}", "reused",
+            extra={"selected": True, "identity_version": identity["version"]})
+        status = self.character_selection_status(project["id"], characters)
+        self.projects.save_document(episode["id"], "cast_selection", status)
+        self.log.info(
+            "director",
+            f"人物定版: {character_name} 选中候选{int(candidate_index)}，"
+            f"进度 {status['locked']}/{status['total']}")
+        return status
+
     def _stage_cast(self, ctx):
         """人物立绘与场景概念图:项目级资产,跨集复用保证形象一致。"""
         project_id = ctx["project"]["id"]
@@ -1053,6 +1320,24 @@ class Director:
         anchor_name = self._anchor_character(project_id, characters)
         characters = sorted(
             characters, key=lambda c: c["name"] != anchor_name)
+        selection = self._ensure_character_candidates(
+            ctx, characters, designs, style)
+        self.projects.save_document(
+            ctx["episode"]["id"], "cast_selection", selection)
+        if selection["required"]:
+            ctx["cast"] = [c["name"] for c in characters]
+            ctx["cast_selection"] = selection
+            ctx["cast_selection_required"] = True
+            return {
+                "characters": len(characters),
+                "candidates": sum(item["candidate_count"]
+                                  for item in selection["characters"]),
+                "candidate_target": CHARACTER_CANDIDATES * len(characters),
+                "locked": selection["locked"],
+                "awaiting_selection": True,
+                "created": 0, "reused": 0, "scenes": 0,
+            }
+        ctx["cast_selection"] = selection
         self._plan_seed(ctx, "character_art", [
             {"id": f"char:{c['name']}", "category": "character_art",
              "label": f"{c['name']}({c.get('role') or '角色'})",
@@ -1079,59 +1364,24 @@ class Director:
         reused, created = 0, 0
         cast = []
 
-        def portrait_payload(character):
-            name = character["name"]
-            return {
-                "portrait": True, "art_name": name,
-                "role": character.get("role", ""),
-                "shot_no": 0, "characters": [name], "location": "",
-                "prompt": self._portrait_prompt(
-                    name, character.get("role", ""), style,
-                    design=designs.get(name)),
-                "style": style,
-                "reference_images": self._reference_uris(
-                    project_id, [name]),
-                "style_ref": self._style_anchor_uri(
-                    project_id, exclude_name=name),
-                "aspect": ctx["aspect"], **ctx["dims"],
-            }
-
-        # 阶段1:风格锚(主角立绘)先行,后续所有形象向它对齐
-        pending_portraits = []
+        # 最终立绘只能来自人工锁定的候选；此处绝不再从文字直接生成。
         for character in characters:
             name = character["name"]
             self.assets.acquire(
                 project_id, "character", name,
                 meta={"role": character.get("role", "")})
             cast.append(name)
-            if self._existing_asset_uri(ctx, "character_art", name):
+            locked = self._locked_identity(project_id, name)
+            if locked:
                 reused += 1
                 self._plan_mark(ctx, f"char:{name}", "reused",
-                                only_pending=True)
+                                only_pending=True,
+                                extra={"selected": True,
+                                       "identity_version": locked["version"]})
                 continue
-            if name == anchor_name:
-                result = self._run_one_task(ctx, {
-                    "item_id": f"char:{name}", "capability": "image",
-                    "payload": portrait_payload(character),
-                    "sub_dir": "cast",
-                    "qc_spec": self._qc_spec(
-                        project_id, [name],
-                        forbid=["与设定形态不符的角色", "悬挂的衣物或衣架", "与设定不符的人"])})
-                self.assets.register(
-                    project_id, "character_art", name, uri=result.uri,
-                    meta={"role": character.get("role", "")})
-                created += 1
-            else:
-                pending_portraits.append(character)
-        # 阶段2:人物立绘产线 + 场景产线 并行批量(全部引用风格基准图)
-        tasks = [{
-            "item_id": f"char:{c['name']}", "capability": "image",
-            "payload": portrait_payload(c), "sub_dir": "cast",
-            "tag": ("char", c["name"], c.get("role", "")),
-            "qc_spec": self._qc_spec(
-                project_id, [c["name"]],
-                forbid=["与设定形态不符的角色", "悬挂的衣物或衣架", "与设定不符的人"]),
-        } for c in pending_portraits]
+            raise AifosError(f"角色{name}尚未锁定最终立绘")
+        # 场景可与人物资产套件继续并行；人物出图全部引用最终身份锚点。
+        tasks = []
         for scene in ctx["script"]["scenes"]:
             location = scene["location"]
             self.assets.acquire(project_id, "scene", location)
@@ -1156,15 +1406,10 @@ class Director:
                     "aspect": ctx["aspect"], **ctx["dims"],
                 }, "sub_dir": "cast", "tag": ("scene", location, "")})
         for tag, result in self._run_parallel(
-                ctx, tasks, line="人物立绘+场景概念图").items():
+                ctx, tasks, line="场景概念图").items():
             kind, name, role = tag
-            if kind == "char":
-                self.assets.register(
-                    project_id, "character_art", name, uri=result.uri,
-                    meta={"role": role})
-            else:
-                self.assets.register(
-                    project_id, "scene_art", name, uri=result.uri)
+            self.assets.register(
+                project_id, "scene_art", name, uri=result.uri)
             created += 1
         # 阶段3:人物资产套件产线 并行批量(引用各自立绘+风格基准图)
         tasks = []
@@ -1197,6 +1442,9 @@ class Director:
                         "style": style,
                         "character_refs": (
                             [portrait_uri] if portrait_uri else []),
+                        "identity_references": self._identity_references(
+                            project_id, [name]),
+                        "require_reference_images": True,
                         "reference_images": reference,
                         "style_ref": self._style_anchor_uri(project_id),
                         "aspect": ctx["aspect"], **ctx["dims"],
@@ -1235,17 +1483,22 @@ class Director:
         return uris
 
     def _art_refs(self, ctx, characters, location):
-        """人物立绘/四视图/场景概念图/用户参考图 → 出图参考
-        (跨镜头角色一致性)。"""
+        """最终立绘/四视图/场景图/用户参考 → 真实多图参考输入。
+
+        含人物画面缺任何一个最终立绘都直接阻断；禁止静默退化为文字生图。
+        """
         project_id = ctx["project"]["id"]
-        refs = {"character_refs": []}
+        refs = {"character_refs": [], "identity_references": []}
+        identities = self._identity_references(
+            project_id, characters, required=bool(characters))
+        for identity in identities:
+            refs["character_refs"].append(identity["uri"])
+            refs["identity_references"].append(identity)
         for name in characters or []:
-            for kind, asset_name in (("character_art", name),
-                                     ("character_sheet",
-                                      f"{name}:turnaround")):
-                row = self.assets.latest(project_id, kind, asset_name)
-                if row and row["uri"] and Path(row["uri"]).exists():
-                    refs["character_refs"].append(row["uri"])
+            row = self.assets.latest(
+                project_id, "character_sheet", f"{name}:turnaround")
+            if row and row["uri"] and Path(row["uri"]).exists():
+                refs["character_refs"].append(row["uri"])
         if location:
             row = self.assets.latest(project_id, "scene_art", location)
             if row and row["uri"] and Path(row["uri"]).exists():
@@ -1258,6 +1511,7 @@ class Director:
         anchor = self._style_anchor_uri(project_id)
         if anchor:
             refs["style_ref"] = anchor
+        refs["require_reference_images"] = bool(characters)
         return refs
 
     def _rich_shot_prompt(self, ctx, shot, location):
@@ -1906,28 +2160,9 @@ class Director:
             return (row["version"] + 1) if row else 1
 
         if kind == "character_art":
-            name = target["name"]
-            role = next((c.get("role", "") for c in script["characters"]
-                         if c["name"] == name), "")
-            prompt = prompt_override or self._portrait_prompt(
-                name, role, style,
-                design=self._character_design(project["id"], name))
-            result = self._plan_run(ctx, f"char:{name}", lambda: self._call(
-                ctx, "image", {
-                    "portrait": True, "art_name": name, "role": role,
-                    "shot_no": 0, "characters": [name], "location": "",
-                    "prompt": prompt,
-                    "style": style, "feedback": feedback,
-                    "revision": next_revision("character_art", name),
-                    "reference_images": self._reference_uris(
-                        project["id"], [name]),
-                    "style_ref": self._style_anchor_uri(
-                        project["id"], exclude_name=name),
-                    "aspect": aspect, **ctx["dims"],
-                }, "cast"), prompt=prompt)
-            self.assets.register(project["id"], "character_art", name,
-                                 uri=result.uri, meta={"role": role},
-                                 new_version=True)
+            raise AifosError(
+                "最终立绘不能从文字直接重画。请重新生成5张人物候选并人工定版，"
+                "或上传经过确认的最终立绘")
         elif kind == "character_sheet":
             raw = target["name"]
             if ":" not in raw:
@@ -1959,6 +2194,9 @@ class Director:
                         "revision": next_revision("character_sheet", raw),
                         "character_refs": (
                             [portrait_uri] if portrait_uri else []),
+                        "identity_references": self._identity_references(
+                            project["id"], [name]),
+                        "require_reference_images": True,
                         "reference_images": self._reference_uris(
                             project["id"], [name]),
                         "style_ref": self._style_anchor_uri(project["id"]),
@@ -2126,8 +2364,15 @@ class Director:
             name = target["name"]
             latest = self.assets.latest(project["id"], kind, name)
             if latest is None:
-                raise AifosError(f"资产不存在: {kind}/{name}")
-            version = latest["version"] + 1
+                if kind != "character_art":
+                    raise AifosError(f"资产不存在: {kind}/{name}")
+                script, _ = self.projects.latest_document(
+                    episode["id"], "script")
+                known = {c.get("name") for c in
+                         (script or {}).get("characters", [])}
+                if name not in known:
+                    raise AifosError(f"剧本中没有角色: {name}")
+            version = (latest["version"] + 1) if latest else 1
             safe = "".join(c if c.isalnum() else "_" for c in name)[:40]
             path = (out_root / "cast"
                     / f"upload_{kind}_{safe}_v{version}{ext}")
@@ -2136,6 +2381,14 @@ class Director:
             self.assets.register(project["id"], kind, name,
                                  uri=str(path), meta={"uploaded": True},
                                  new_version=True)
+            if kind == "character_art":
+                # 人工上传等同于明确确认最终立绘，同时建立真正的身份锚点。
+                self.assets.register(
+                    project["id"], "character_identity", name,
+                    uri=str(path),
+                    meta={"character": name, "locked": True,
+                          "uploaded": True, "locked_at": now()},
+                    new_version=True)
             self.log.info("director", f"已上传替换 {kind}/{name}")
             return {"uri": str(path)}
         if kind == "shot":
@@ -2179,9 +2432,7 @@ class Director:
         raise AifosError(f"不支持的上传目标: {kind}")
 
     def restyle_project(self, project_title, episode_number, style=None):
-        """一键换画风:更新项目画风并按新风格重做全部形象
-        (立绘 → 资产套件 → 场景概念图;主角立绘最先重做,其余全部
-        对齐它,保证新画风下依旧全员统一)。可随时暂停,已完成保留。"""
+        """一键换画风后重新生成每人5张候选，禁止直接覆盖最终立绘。"""
         project, episode = self._episode_ctx(project_title, episode_number)
         if style and style.strip():
             self.projects.update_project(project_title, style=style.strip())
@@ -2189,55 +2440,63 @@ class Director:
         script, _ = self.projects.latest_document(episode["id"], "script")
         if script is None:
             raise AifosError("本集尚无剧本,先完成剧本确认")
-        previous_status = episode["status"]
-        # 重做期间进入 cast 状态:看板/实况/暂停按钮全部可用
+        # 新画风使旧身份锚点和下游人物资产失效，但保留历史版本/文件。
+        # 用空的新版本遮蔽旧最新版，重新走5选1，不做破坏性删除。
+        for character in script.get("characters", []):
+            name = character["name"]
+            self.assets.register(
+                project["id"], "character_identity", name, uri="",
+                meta={"character": name, "locked": False,
+                      "reason": "restyle"}, new_version=True)
+            for index in range(1, CHARACTER_CANDIDATES + 1):
+                self.assets.register(
+                    project["id"], "character_candidate",
+                    f"{name}:{index:02d}", uri="",
+                    meta={"character": name,
+                          "role": character.get("role", ""),
+                          "candidate_index": index,
+                          "invalidated": "restyle"}, new_version=True)
+            for key, label, _desc in CHARACTER_SHEETS:
+                self.assets.register(
+                    project["id"], "character_sheet", f"{name}:{key}",
+                    uri="", meta={"character": name, "sheet": key,
+                                   "label": label,
+                                   "invalidated": "restyle"},
+                    new_version=True)
+        for location in dict.fromkeys(
+                scene["location"] for scene in script.get("scenes", [])):
+            self.assets.register(
+                project["id"], "scene_art", location, uri="",
+                meta={"invalidated": "restyle"}, new_version=True)
+
         self.projects.set_episode_status(episode["id"], "cast")
         self.log.info(
             "director",
-            f"开始按新画风重做全部形象: {project['style']}")
-        anchor = self._anchor_character(
-            project["id"], script.get("characters", []))
-        ordered = sorted(script.get("characters", []),
-                         key=lambda c: c["name"] != anchor)
-        done, failed = 0, 0
+            f"新画风已生效，重新生成每人5张定妆候选: {project['style']}")
+        aspect = (project["aspect"]
+                  or self.config.get("defaults", "aspect", default="9:16"))
+        ctx = {"project": dict(project), "episode": dict(episode),
+               "out_root": self._episode_dir(project, episode),
+               "script": script, "force": False, "aspect": aspect,
+               "dims": ASPECT_DIMS.get(aspect, ASPECT_DIMS["9:16"])}
+        self._task_cost = 0.0
+        self._task_providers = set()
         try:
-            for character in ordered:
-                name = character["name"]
-                self.regen_image(project_title, episode_number,
-                                 {"kind": "character_art", "name": name})
-                done += 1
-                for key, _label, _desc in CHARACTER_SHEETS:
-                    self.regen_image(
-                        project_title, episode_number,
-                        {"kind": "character_sheet",
-                         "name": f"{name}:{key}"})
-                    done += 1
-            seen = []
-            for scene in script.get("scenes", []):
-                location = scene["location"]
-                if location in seen:
-                    continue
-                seen.append(location)
-                self.regen_image(project_title, episode_number,
-                                 {"kind": "scene_art", "name": location})
-                done += 1
+            report = self._stage_cast(ctx)
         except ProduceCancelled:
-            self.projects.set_episode_status(
-                episode["id"], previous_status)
+            self.projects.set_episode_status(episode["id"], "awaiting_cast")
             self.log.info(
                 "director",
-                f"换风格重做已暂停:完成 {done} 张并保留,可再次执行继续")
-            return {"status": "paused", "done": done,
+                "换风格候选生成已暂停，已完成候选保留，可从断点继续")
+            return {"status": "paused", "done": 0,
                     "style": project["style"]}
-        finally:
-            row = self.projects.get_episode(episode["id"])
-            if row and row["status"] in ("cast", "cancelling"):
-                self.projects.set_episode_status(
-                    episode["id"], previous_status)
+        self.projects.set_episode_status(episode["id"], "awaiting_cast")
         self.log.info(
-            "director", f"全部形象已按新画风重做完成(共 {done} 张)。"
-            "分镜画面如需同步新画风,点「全部重做」重制本集")
-        return {"status": "done", "done": done, "style": project["style"]}
+            "director", "新画风人物候选已就绪，请逐个选定最终立绘；"
+            "选定后才重做资产套件和场景")
+        return {"status": "awaiting_cast",
+                "done": report.get("candidates", 0),
+                "style": project["style"]}
 
     PLAN_TARGETS = {
         "char": lambda parts: {"kind": "character_art", "name": parts[0]},
@@ -2293,6 +2552,21 @@ class Director:
             uri = None
         return uri, spec
 
+    def _qc_signature(self, uris, spec):
+        """图片内容、最终立绘版本和质检规格都没变时复用质检结果。"""
+        digest = hashlib.sha256()
+        digest.update(json.dumps(spec, ensure_ascii=False, sort_keys=True,
+                                 separators=(",", ":")).encode("utf-8"))
+        for label, uri in uris:
+            digest.update(label.encode("utf-8"))
+            digest.update(str(uri).encode("utf-8"))
+            path = Path(uri)
+            if path.exists() and path.is_file():
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+        return digest.hexdigest()
+
     def qc_item(self, project_title, episode_number, item_id):
         """单张质检:对清单里某条目的最新图做视觉核对,写回 qc 结果。"""
         project, episode = self._episode_ctx(project_title, episode_number)
@@ -2346,7 +2620,15 @@ class Director:
             if last and last["uri"] and (last["uri"].startswith("http")
                                          or Path(last["uri"]).exists()):
                 uris.append(("尾帧", last["uri"]))
+        signature = self._qc_signature(uris, spec)
+        previous = item.get("qc") or {}
+        if previous.get("signature") == signature \
+                and "passed" in previous:
+            cached = dict(previous)
+            cached["cached"] = True
+            return cached
         passed_all, issues, cost = True, [], 0.0
+        identity_checked_all = True
         try:
             for label, one in uris:
                 result = self.router.call(
@@ -2354,6 +2636,12 @@ class Director:
                     cancel=lambda: self._cancel_requested(ctx))
                 cost += result.cost
                 verdict = result.data or {}
+                identity_checked = (not spec.get("identity_required")
+                                    or bool(verdict.get("identity_checked")))
+                if not identity_checked:
+                    identity_checked_all = False
+                    passed_all = False
+                    issues.append(f"{label}:质检未确认已逐人比对最终立绘")
                 if not bool(verdict.get("pass")):
                     passed_all = False
                     issues.extend(f"{label}:{x}"
@@ -2361,7 +2649,11 @@ class Director:
         except (ProviderUnavailable, ProviderError) as exc:
             raise AifosError(f"质检产线不可用: {exc}") from exc
         report = {"passed": passed_all, "issues": issues,
-                  "attempts": (item.get("qc") or {}).get("attempts", 0)}
+                  "attempts": previous.get("attempts", 0),
+                  "identity_checked": identity_checked_all,
+                  "identity_references": len(
+                      spec.get("identity_references") or []),
+                  "signature": signature, "cached": False}
         self.projects.add_episode_cost(episode["id"], cost)
         self._plan_mark(ctx, item["id"], item.get("status", "done"),
                         extra={"qc": report})
@@ -2379,7 +2671,8 @@ class Director:
                "out_root": self._episode_dir(project, episode)}
         plan = self._plan_read(ctx)
         items = [i for i in plan["items"]
-                 if i.get("status") in ("done", "reused")]
+                 if i.get("status") in ("done", "reused")
+                 and i.get("category") != "character_candidate"]
         previous_status = episode["status"]
         self.projects.set_episode_status(episode["id"], "cast")
         checked = passed = failed = 0
@@ -2429,6 +2722,26 @@ class Director:
         if not targets:
             return {"status": "done", "redone": 0,
                     "note": "没有需要重画的图"}
+        if only_failed:
+            identity_words = ("人物不一致", "人物形象", "身份", "同一个人",
+                              "脸", "发型", "发色", "服装")
+            systemic = []
+            for item_id in targets:
+                item = by_id[item_id]
+                text = "；".join((item.get("qc") or {}).get("issues") or [])
+                if any(word in text for word in identity_words):
+                    systemic.append(item_id)
+            if len(systemic) >= 3:
+                self.log.warn(
+                    "director",
+                    f"批量重画熔断:{len(systemic)}张出现同类人物身份问题；"
+                    "应先修复/重新选择最终立绘，禁止沿用错误锚点逐张重画")
+                return {
+                    "status": "blocked", "redone": 0,
+                    "reason": "systemic_identity_failure",
+                    "affected": len(systemic),
+                    "note": "检测到系统性人物身份/发型/服装漂移，请先回人物定版，避免无效批量重画",
+                }
         previous_status = episode["status"]
         self.projects.set_episode_status(episode["id"], "cast")
         self.log.info("director", f"开始批量重画 {len(targets)} 张")

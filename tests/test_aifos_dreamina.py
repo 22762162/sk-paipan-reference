@@ -53,6 +53,20 @@ def _make_app(tmp_path, binary, extra=None):
         "providers": {"jimeng": conf}})
 
 
+def _lock_cast_and_continue(app, title, number):
+    summary = app.director.produce(title, number)
+    assert summary["status"] == "awaiting_cast"
+    project = app.projects.get_project(title)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=?",
+        (project["id"], number))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    for character in script["characters"]:
+        app.director.select_character_candidate(
+            title, number, character["name"], 1)
+    return app.director.produce(title, number)
+
+
 def test_frames2video_command_shape(tmp_path, fake_dreamina):
     app = _make_app(tmp_path, fake_dreamina)
     try:
@@ -155,7 +169,7 @@ def test_full_pipeline_with_fake_dreamina(tmp_path, fake_dreamina):
     """启用假 dreamina 后端到端制作:视频阶段应全部由 jimeng 产出。"""
     app = _make_app(tmp_path, fake_dreamina)
     try:
-        summary = app.director.produce("万妖图录", 15)
+        summary = _lock_cast_and_continue(app, "万妖图录", 15)
         assert summary["status"] == "done"
         videos_stage = next(
             s for s in summary["stages"] if s["stage"] == "videos")
@@ -188,7 +202,7 @@ def test_produce_skips_tts_when_video_carries_audio(tmp_path, fake_dreamina):
     """即梦产视频(有声)→ 配音阶段跳过独立 TTS,质检不再要求配音文件。"""
     app = _make_app(tmp_path, fake_dreamina)
     try:
-        summary = app.director.produce("有声视频验证", 1)
+        summary = _lock_cast_and_continue(app, "有声视频验证", 1)
         assert summary["status"] == "done"
         assert summary["qc_score"] >= 80
         voices_stage = next(s for s in summary["stages"]

@@ -349,6 +349,14 @@ def _episode_payload(app, episode_id):
         episode_id, "content_review")
     production_standard, production_standard_v = app.projects.latest_document(
         episode_id, "production_standard")
+    cast_selection = app.director.character_selection_status(
+        project["id"], (script or {}).get("characters", []))
+    for character in cast_selection.get("characters", []):
+        if character.get("identity_uri"):
+            character["identity_url"] = _artifact_url(
+                app, character["identity_uri"])
+        for candidate in character.get("candidates", []):
+            candidate["url"] = _artifact_url(app, candidate.get("uri", ""))
     tasks = [dict(t) for t in app.db.query(
         "SELECT id, stage, name, status, provider, cost, error, created_at, "
         "updated_at FROM tasks WHERE episode_id=? ORDER BY id",
@@ -393,6 +401,7 @@ def _episode_payload(app, episode_id):
         "production_profile": (storyboard or {}).get("profile", {}),
         "production_standard": production_standard,
         "production_standard_version": production_standard_v,
+        "cast_selection": cast_selection,
         "qc_report": qc_report,
         "render_plan": render_plan,
         "artifacts": _collect_artifacts(
@@ -599,6 +608,8 @@ def make_handler(workspace, jobs):
                     return self._produce()
                 if parsed.path == "/api/confirm":
                     return self._confirm()
+                if parsed.path == "/api/character/select":
+                    return self._character_select()
                 if parsed.path == "/api/revise":
                     return self._revise()
                 if parsed.path == "/api/regen_image":
@@ -928,20 +939,52 @@ def make_handler(workspace, jobs):
                     "SELECT * FROM projects WHERE id=?",
                     (episode["project_id"],))
                 return (project["title"], episode["number"],
-                        episode["status"])
+                        episode["status"], project["id"], episode["id"])
 
             found = self._with_app(lookup)
             if found is None:
                 return self._error(404, "剧集不存在")
-            title, number, status = found
+            title, number, status, project_id, found_episode_id = found
+            if status == "awaiting_cast":
+                selection = self._with_app(
+                    lambda app: app.director.character_selection_status(
+                        project_id,
+                        (app.projects.latest_document(
+                            found_episode_id, "script")[0] or {}).get(
+                                "characters", [])))
+                if not selection.get("passed"):
+                    return self._error(
+                        409, "请先为每名角色选定1张最终立绘，再继续生产")
             # 剧本确认 → 继续预生产(画完人物/分镜再停一次);
             # 开拍确认 → 自动完成视频/配音/剪辑/质检
             job_id = jobs.start(
-                title, number, review=(status == "awaiting_script"),
+                title, number,
+                review=(status in ("awaiting_script", "awaiting_cast")),
                 action=("confirm_script" if status == "awaiting_script"
+                        else "confirm_cast" if status == "awaiting_cast"
                         else "confirm_preflight"))
             return self._json(
                 {"job_id": job_id, "phase": status}, status=202)
+
+        def _character_select(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            name = str(body.get("character") or "").strip()
+            index = body.get("candidate_index")
+            if not name or index is None:
+                return self._error(400, "缺少 character/candidate_index")
+            title, number = found
+            try:
+                result = self._with_app(
+                    lambda app: app.director.select_character_candidate(
+                        title, number, name, int(index)))
+            except (AifosError, TypeError, ValueError) as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
 
         def _episode_ref(self, body):
             episode_id = body.get("episode_id")
