@@ -131,7 +131,9 @@ def character_candidate_target(character):
         return CHARACTER_CANDIDATES
     if any(token in role for token in ("非重要", "非主要", "次要")):
         return NONIMPORTANT_CHARACTER_CANDIDATES
-    if any(token in role for token in ("重要", "核心", "配角")):
+    if any(token in role for token in (
+            "重要", "核心", "配角", "同伴", "反派", "对手",
+            "队长", "主唱", "舞担", "成员", "男二", "女二")):
         return IMPORTANT_CHARACTER_CANDIDATES
     return NONIMPORTANT_CHARACTER_CANDIDATES
 
