@@ -79,6 +79,25 @@ def _build_parser():
         "--lan", action="store_true",
         help="允许同一 Wi-Fi 下的手机访问(等同 --host 0.0.0.0)")
 
+    p_tunnel = sub.add_parser(
+        "tunnel", help="外网访问:用 cloudflared 起隧道并显示当前公网地址+二维码,"
+                       "手机扫码即连(地址变了也不用重装 App)")
+    p_tunnel.add_argument("--port", type=int, default=8619,
+                          help="本机 serve 的端口(默认 8619)")
+    p_tunnel.add_argument("--cloudflared", default="cloudflared",
+                          help="cloudflared 可执行路径(默认在 PATH 里找)")
+    p_tunnel.add_argument("--name", default=None,
+                          help="命名隧道名:走稳定域名,地址永不变(需先在本机 "
+                               "cloudflared 配好 ingress 指向本机端口)")
+    p_tunnel.add_argument("--url", dest="public_url", default=None,
+                          help="命名隧道的稳定公网地址,如 "
+                               "https://aifos.example.com")
+    p_tunnel.add_argument("--record", dest="record_url", default=None,
+                          help="只登记一条已有的外网地址(自己在别处跑隧道时用),"
+                               "不启动 cloudflared")
+    p_tunnel.add_argument("--no-qr", action="store_true",
+                          help="不在终端打印二维码")
+
     p_project = sub.add_parser("project", help="项目管理(账号矩阵)")
     p_project.add_argument("action",
                            choices=["list", "create", "set", "rename"])
@@ -268,6 +287,51 @@ def _status_cn(status):
     return {"done": "完成", "failed": "失败", "qc_failed": "完成(质检未过)",
             "awaiting_confirm": "待确认",
             "awaiting_script": "剧本待确认"}.get(status, status)
+
+
+def _cmd_tunnel(args):
+    """起 cloudflared 隧道并显示当前公网地址与二维码。"""
+    from .app import Workspace
+    from . import qrcode, tunnel
+    root = Workspace(args.workspace).root
+    root.mkdir(parents=True, exist_ok=True)
+
+    def show(url, mode):
+        print(f"\n当前公网地址({'稳定域名' if mode == 'named' else '临时地址'})"
+              f":\n  {url}")
+        if not args.no_qr:
+            print("\n手机扫下面的二维码即可打开(也会显示在网页面板“外网访问”里):\n")
+            print(qrcode.render_terminal(qrcode.encode(url, "M")))
+        print("\n手机 App 里把上面的地址粘贴到“服务器地址”即可;地址变了重跑本命令"
+              "拿新二维码,无需重装 App。")
+
+    # 只登记一条已有地址(自己在别处跑隧道)
+    if args.record_url:
+        data = tunnel.write_public_url(root, args.record_url, mode="manual")
+        show(data["url"], "manual")
+        return 0
+    # 命名隧道:地址稳定,先展示再拉起进程
+    if args.name and args.public_url:
+        show(tunnel.write_public_url(
+            root, args.public_url, mode="named", note=args.name)["url"],
+            "named")
+
+    def on_event(kind, payload):
+        if kind == "url":
+            show(payload, "named" if args.name else "quick")
+        elif kind == "error":
+            print(payload, file=sys.stderr)
+        elif kind == "log":
+            print(f"[cloudflared] {payload}")
+
+    print("正在启动外网隧道 …(Ctrl+C 停止)")
+    try:
+        return tunnel.run_tunnel(
+            root, args.port, cloudflared=args.cloudflared,
+            name=args.name, public_url=args.public_url, on_event=on_event)
+    except KeyboardInterrupt:
+        print("\n已停止外网隧道")
+        return 0
 
 
 def _cmd_confirm(app, args):
@@ -636,7 +700,8 @@ def main(argv=None):
             print("连续 10 个端口都不可用;用 --port 指定一个空闲端口",
                   file=sys.stderr)
             return 1
-        access = access_payload(host, httpd.server_address[1])
+        access = access_payload(host, httpd.server_address[1],
+                                workspace=args.workspace)
         print(f"AIFOS 本机控制台: {access['local_url']}")
         if access["lan_enabled"]:
             print("手机访问(手机与电脑需连接同一 Wi-Fi):")
@@ -644,6 +709,11 @@ def main(argv=None):
                 print(f"  {url}")
             if access["hostname_url"]:
                 print(f"  {access['hostname_url']}")
+        if access.get("public_url"):
+            print(f"外网访问(当前公网地址): {access['public_url']}")
+        else:
+            print("外网访问:另开一个终端运行 `aifos tunnel` 起隧道,"
+                  "手机扫码即可(地址会显示在这里与网页面板)")
         print("Ctrl+C 停止")
         try:
             httpd.serve_forever()
@@ -652,6 +722,8 @@ def main(argv=None):
         finally:
             httpd.server_close()
         return 0
+    if args.command == "tunnel":
+        return _cmd_tunnel(args)
     echo = getattr(args, "verbose", False)
     app = App(args.workspace, echo_logs=echo)
     try:

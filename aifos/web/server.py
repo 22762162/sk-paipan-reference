@@ -91,7 +91,7 @@ def _private_lan_addresses():
     return sorted(set(result))
 
 
-def access_payload(bound_host, port):
+def access_payload(bound_host, port, workspace=None):
     """构造桌面与手机端都能理解的访问/安装信息。"""
     lan_enabled = bound_host in ("0.0.0.0", "::", "")
     hostname = socket.gethostname().split(".")[0]
@@ -100,12 +100,21 @@ def access_payload(bound_host, port):
                 if lan_enabled else [])
     hostname_url = (f"http://{hostname}.local:{port}/"
                     if lan_enabled and hostname else None)
+    # 外网地址(cloudflared 隧道):`aifos tunnel` 起隧道后写入 workspace,
+    # 网页据此显示二维码,手机扫码即得最新地址(免去手动粘贴/猜网址)
+    public = None
+    if workspace is not None:
+        from ..app import Workspace
+        from .. import tunnel
+        public = tunnel.read_public_url(Workspace(workspace).root)
     return {
         "lan_enabled": lan_enabled,
         "local_url": f"http://127.0.0.1:{port}/",
         "lan_urls": lan_urls,
         "hostname_url": hostname_url,
         "same_wifi_required": True,
+        "public_url": public["url"] if public else None,
+        "public": public,
         "install": {
             "ios": "用 Safari 打开后点分享，再选‘添加到主屏幕’",
             "android": "用 Chrome 打开后点菜单，再选‘安装应用’或‘添加到主屏幕’",
@@ -448,6 +457,21 @@ def make_handler(workspace, jobs):
         def _error(self, status, message):
             self._json({"error": message}, status=status)
 
+        def _qr_svg(self, data):
+            """把任意文本(通常是外网地址)渲染成 QR 二维码 SVG。"""
+            from .. import qrcode
+            try:
+                matrix = qrcode.encode(data, "M")
+            except ValueError as exc:
+                return self._error(400, str(exc))
+            svg = qrcode.render_svg(matrix).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+            self.send_header("Content-Length", str(len(svg)))
+            self.send_header("Cache-Control", "public, max-age=60")
+            self.end_headers()
+            self.wfile.write(svg)
+
         def _file(self, path, no_cache=False, cache_seconds=None):
             path = Path(path)
             if not path.is_file():
@@ -496,7 +520,13 @@ def make_handler(workspace, jobs):
                                           query)
                 if route == "/api/access":
                     host, port = self.server.server_address[:2]
-                    return self._json(access_payload(host, port))
+                    return self._json(
+                        access_payload(host, port, workspace=workspace))
+                if route == "/qr.svg":
+                    data = query.get("data", [""])[0]
+                    if not data:
+                        return self._error(400, "缺少 data 参数")
+                    return self._qr_svg(data)
                 if route == "/api/overview":
                     return self._json(self._with_app(
                         lambda app: _overview_payload(app, jobs)))

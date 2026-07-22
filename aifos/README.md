@@ -26,11 +26,45 @@ Web 控制台为纯标准库 http.server + 原生 JS,离线可用)。
 python3 -m aifos serve --lan --port 8619
 ```
 
-页面右上角的“手机打开”会列出当前可用地址，并支持复制或发送到手机。
+页面右上角的“手机打开”会列出当前可用地址，并支持复制或发送到手机，同时
+生成一张**局域网地址二维码**——手机扫一扫即可直接打开，免去手输 IP。
 iPhone/iPad 用 Safari 的“分享 → 添加到主屏幕”；Android 用 Chrome 的
 “菜单 → 安装应用/添加到主屏幕”。安装后以独立窗口运行，底部提供生产总览、
-历史、资产、标准和 AI 设置五栏导航。手机访问只面向可信的同一 Wi-Fi；
-当前版本没有公网身份认证，不应把局域网地址通过端口转发暴露到互联网。
+历史、资产、标准和 AI 设置五栏导航。手机访问只面向可信的同一 Wi-Fi。
+
+## 外网访问 / 隧道(`aifos tunnel`)
+
+不在同一 Wi-Fi(如在外面用手机)时,用 `cloudflared` 把本机 AIFOS 暴露到
+公网。免费的 trycloudflare 快速隧道**每次重启都会换新网址**,手机里存的旧
+网址一连就 TLS 失败——`aifos tunnel` 把“当前公网地址”做成随时可见、可扫码,
+不用再猜:
+
+```bash
+# 先在本机装好 cloudflared(brew install cloudflared),然后:
+python3 -m aifos serve --lan            # 一个终端跑控制台
+python3 -m aifos tunnel                 # 另一个终端起隧道
+```
+
+`aifos tunnel` 会:自动解析 cloudflared 分配的公网地址 → 写入
+`workspace/public_url.json` → 在终端打印**二维码**(与终端配色无关,深色终端
+也不反相)→ 运行中的 `serve` 进程据此在网页“手机打开 → 外网访问”里显示同一
+二维码。手机扫码即得最新地址,地址换了重跑本命令刷新即可,**无需重装 App**。
+
+想要**永不改变的稳定地址**(一次配置长期可用),用命名隧道:
+
+```bash
+# 先用 cloudflared 建好命名隧道并把 ingress 指向本机端口,拿到稳定域名后:
+python3 -m aifos tunnel --name my-aifos --url https://aifos.example.com
+```
+
+若你已经用别的方式拿到了外网地址,只想让平台展示地址与二维码:
+
+```bash
+python3 -m aifos tunnel --record https://xxxx.trycloudflare.com/
+```
+
+安全提示:外网隧道会把控制台暴露到公网,当前版本没有身份认证,仅在需要时
+开启,并优先使用命名隧道 + Cloudflare Access 等鉴权;不用时关掉隧道进程即可。
 
 ## Web 控制台(`aifos serve` → http://127.0.0.1:8619)
 

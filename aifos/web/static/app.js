@@ -118,7 +118,15 @@ async function showMobileAccess() {
       <span>手机浏览器输入</span>
       ${urls.length ? urls.map((url, index) => `<a href="${esc(url)}" data-mobile-url="${esc(url)}"${index ? "" : ' class="preferred"'}>${esc(url)}</a>`).join("")
         : `<p class="mobile-access-warning">暂未识别到 Wi-Fi 地址，请确认电脑已经连接 Wi-Fi 后重试。</p>`}
+      ${access.lan_enabled && preferred ? `<div class="mobile-qr"><img src="/qr.svg?data=${encodeURIComponent(preferred)}" width="168" height="168" alt="局域网地址二维码" loading="lazy"><span>同一 Wi-Fi：手机扫码直接打开</span></div>` : ""}
     </div>` : `<p class="mobile-access-warning">当前服务仅允许本机访问。请用“启动 AIFOS”启动器重新打开，或使用 <code>aifos serve --lan</code>。</p>`}
+    <div class="mobile-public-access${access.public_url ? "" : " muted"}">
+      <span>外网访问（不在同一 Wi-Fi 也能连）</span>
+      ${access.public_url ? `<a href="${esc(access.public_url)}" data-mobile-url="${esc(access.public_url)}" class="preferred">${esc(access.public_url)}</a>
+      <div class="mobile-qr"><img src="/qr.svg?data=${encodeURIComponent(access.public_url)}" width="200" height="200" alt="外网地址二维码" loading="lazy"><span>手机扫一扫对准二维码即可打开</span></div>
+      <p class="mobile-hint">地址变了就在电脑上重跑 <code>aifos tunnel</code> 刷新二维码，手机无需重装 App。</p>`
+        : `<p class="mobile-hint">在电脑上开一个终端运行 <code>aifos tunnel</code>，这里会自动出现公网地址与二维码，手机扫码即连——外网地址换了也不用重装 App。命名隧道可获得永不改变的稳定地址。</p>`}
+    </div>
     <div class="mobile-access-actions">
       <button type="button" class="primary" id="mobile-copy-url" ${urls.length ? "" : "disabled"}>复制手机网址</button>
       <button type="button" id="mobile-share-url" ${urls.length ? "" : "disabled"}>发送到手机</button>
