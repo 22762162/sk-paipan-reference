@@ -1165,7 +1165,7 @@ const IMAGE_COST_GUIDE = [
   { kind: "standard", name: "GPT Image 2 medium", price: "约 ¥0.28/张",
     use: "常规精修", note: "质量与成本平衡" },
   { kind: "expensive", name: "GPT Image 2 high", price: "高成本",
-    use: "仅终稿/复杂文字", note: "不要用于批量候选" },
+    use: "核心/高风险图", note: "母资产、文字、群像、近脸、连续性" },
 ];
 
 function imageCostGuideHtml(compact = false) {
@@ -1180,9 +1180,19 @@ function imageCostGuideHtml(compact = false) {
       </div>`).join("")}</div>
     <div class="image-cost-rule"><b>默认分流</b>
       <span>批量 → Seedream 5.0 Lite</span>
-      <span>重要高清 / 终稿 / 复杂文字 → Codex 订阅优先</span>
-      <span class="danger">GPT Image 2 high 不进入批量路线</span>
+      <span>重要高清 / 母资产 / 文字 / 群像 / 连续性 → Codex 订阅优先</span>
+      <span class="danger">低质量图禁止进入 Seedance 正式参考链</span>
     </div>
+  </section>`;
+}
+
+function qualityPolicyHtml() {
+  return `<section class="quality-policy-card">
+    <b>默认质量分级 · 按“出错会污染多少后续镜头”判断</b>
+    <div><span>低：方向/构图/提示词试错（50%～60%）</span>
+      <span>中：普通正式关键帧（30%～40%）</span>
+      <span>高：人物母资产、复用场景、近脸情绪、文字、群像、连续性（10%～20%）</span></div>
+    <small>自动判级是默认值；重画时可逐张覆盖。只有中、高质量审核通过的图片可交给 Seedance。</small>
   </section>`;
 }
 
@@ -1760,11 +1770,21 @@ function bindIo(container, episodeId, reload) {
 }
 
 /* 单张图片附意见重画 */
+function qualitySelectHtml(cls = "quality-select", selected = "auto") {
+  const values = [
+    ["auto", "自动（按错误影响范围）"], ["low", "低 · 仅试错"],
+    ["medium", "中 · 普通正式图"], ["high", "高 · 核心/高风险"],
+  ];
+  return `<select class="${cls}" title="可覆盖系统推荐质量">${values.map(([v, label]) =>
+    `<option value="${v}" ${selected === v ? "selected" : ""}>${label}</option>`).join("")}</select>`;
+}
+
 function regenControls(target, label) {
   return `<div class="regen-box" data-target="${esc(JSON.stringify(target))}">
     <button class="regen-toggle">🔄 ${esc(label)}</button>
     <div class="regen-form" hidden>
       <input placeholder="修改意见,如:换成夜晚/表情更凶(可留空)">
+      ${qualitySelectHtml("regen-quality")}
       <button class="regen-ref" title="上传参考图并自动挂到本对象,点重画立即生效">📎 参考图</button>
       <button class="primary regen-go">重画</button>
     </div></div>`;
@@ -1823,12 +1843,13 @@ function bindRegen(container, episodeId, getData, onDone) {
     box.querySelector(".regen-go").onclick = async () => {
       const target = JSON.parse(box.dataset.target);
       const feedback = form.querySelector("input").value.trim();
+      const quality = form.querySelector(".regen-quality").value;
       const btn = box.querySelector(".regen-go");
       btn.disabled = true; btn.textContent = "重画中…";
       try {
         const reply = await api("/api/regen_image", {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ episode_id: episodeId, target, feedback }),
+          body: JSON.stringify({ episode_id: episodeId, target, feedback, quality }),
         });
         pollJob(reply.job_id, (job) => {
           if (job.status === "done") {
@@ -1940,6 +1961,16 @@ function planCostBadge(item) {
   return "";
 }
 
+function planQualityBadge(item) {
+  const quality = item.image_quality || item.recommended_quality;
+  if (!quality) return "";
+  const labels = { low: "低", lite: "低", medium: "中", high: "高" };
+  const reasons = (item.quality_reasons || []).join("；");
+  const source = item.quality_source === "manual" ? "手动" : "自动";
+  return `<span class="plan-st st-quality quality-${esc(quality)}"
+    title="${esc(`${source}判级${reasons ? `：${reasons}` : ""}`)}">质量 ${labels[quality] || quality}${item.recommended_quality && item.image_quality !== item.recommended_quality ? ` · 建议${labels[item.recommended_quality] || item.recommended_quality}` : ""}</span>`;
+}
+
 /* 列表用缩略图(服务端按需缩放缓存);灯箱/预览仍加载原图 */
 function thumbUrl(url, w = 480) {
   if (!url || !url.startsWith("/artifacts/")) return url;
@@ -2012,6 +2043,7 @@ function planItemHtml(data, item, editable) {
         ${planQcBadge(item)}
         ${planTraceBadges(item)}
         ${item.model ? `<span class="plan-st st-model" title="实际记录的模型/托管通道">${esc(item.model)}</span>` : ""}
+        ${planQualityBadge(item)}
         ${planCostBadge(item)}
         <span class="plan-st st-${st}">${PLAN_STATUS_CN[st] || st}${item.custom_prompt ? " · 已改词" : ""}</span>
         </span>
@@ -2030,6 +2062,7 @@ function planItemHtml(data, item, editable) {
         <div class="plan-edit-form" hidden>
           <textarea class="plan-edit-prompt" rows="3">${esc(item.prompt || "")}</textarea>
           <input class="plan-edit-feedback" placeholder="补充意见(可留空),如:换成夜晚/表情更凶">
+          ${qualitySelectHtml("plan-edit-quality")}
           <div class="plan-edit-actions">
             <button class="plan-edit-ref" title="上传参考图并自动挂到本对象,重画立即生效">📎 加参考图</button>
             <button class="primary plan-edit-go">按上面的提示词重画这张</button>
@@ -2085,6 +2118,7 @@ function renderPlanHtml(data, editable) {
       && ["done", "reused"].includes(i.status)).length;
   return `<div class="plan-panel">
     <h2>🖼 图片生产清单 <span class="dim">共 ${items.length} 张 · 已就绪 ${ready}</span></h2>
+    ${qualityPolicyHtml()}
     ${imageCostGuideHtml(true)}
     ${mockWarnHtml(data)}
     ${editable ? `<div class="plan-batchbar">
@@ -2098,6 +2132,7 @@ function renderPlanHtml(data, editable) {
       <button class="batch-selnone" onclick="planSelectAll(false)">清空</button>
       <button class="batch-sel-frames" onclick="planSelectCat('frames')"
         title="快速勾选全部首尾帧">选中全部首尾帧</button>
+      ${qualitySelectHtml("batch-quality")}
       <button class="primary batch-redo-sel" onclick="redoSelected(${data.episode.id}, this)"
         disabled>🔁 重画选中的 <span class="sel-count">0</span> 张</button>
     </div>` : ""}
@@ -2248,11 +2283,12 @@ function watchBatchRedraw(episodeId, jobId, total, onDone) {
 async function redoSelected(episodeId, btn) {
   const ids = planPickedIds();
   if (!ids.length) return;
+  const quality = btn?.closest(".plan-panel")?.querySelector(".batch-quality")?.value || "auto";
   if (btn) { btn.disabled = true; btn.textContent = "已提交,重画中…"; }
   try {
     const reply = await api("/api/redo_items", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ episode_id: episodeId, item_ids: ids }),
+      body: JSON.stringify({ episode_id: episodeId, item_ids: ids, quality }),
     });
     watchBatchRedraw(episodeId, reply.job_id, ids.length, (job) => {
       if (job.status === "done")
@@ -2269,11 +2305,12 @@ async function redoSelected(episodeId, btn) {
 }
 
 async function redoFailed(episodeId, btn) {
+  const quality = btn?.closest(".plan-panel")?.querySelector(".batch-quality")?.value || "auto";
   if (btn) { btn.disabled = true; btn.textContent = "已提交,重画中…"; }
   try {
     const reply = await api("/api/redo_items", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ episode_id: episodeId, only_failed: true }),
+      body: JSON.stringify({ episode_id: episodeId, only_failed: true, quality }),
     });
     watchBatchRedraw(episodeId, reply.job_id, 0, (job) => {
       const summary = job.summary || {};
@@ -2314,13 +2351,14 @@ function bindPlanRegen(container, episodeId, onDone) {
       const target = JSON.parse(box.dataset.target);
       const prompt = form.querySelector(".plan-edit-prompt").value.trim();
       const feedback = form.querySelector(".plan-edit-feedback").value.trim();
+      const quality = form.querySelector(".plan-edit-quality").value;
       const btn = box.querySelector(".plan-edit-go");
       btn.disabled = true; btn.textContent = "已提交,重画中…";
       try {
         const reply = await api("/api/regen_image", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ episode_id: episodeId, target,
-                                 feedback, prompt }),
+                                 feedback, prompt, quality }),
         });
         pollJob(reply.job_id, (job) => {
           if (job.status === "done") {
@@ -3316,6 +3354,7 @@ async function renderCanvasView(episodeId) {
 
   const awaiting = ep.status === "awaiting_confirm";
   const profile = data.production_profile || {};
+  const videoDefault = (data.quality_policy || {}).video_default || "auto";
   const gates = data.preflight?.gates || [];
   app.innerHTML = `
   <div class="canvas-view">
@@ -3325,6 +3364,14 @@ async function renderCanvasView(episodeId) {
         <b>${data.preflight?.passed ? `${gates.length} 项生产门禁通过，请做最终视觉确认` : "生产门禁未通过"}</b>
         <span>角色/场景连续性、五维分镜、文字关键帧、首尾帧和即梦配置均已机检。
         确认后才会消耗 Seedance 额度；成片仍须通过检查板、内容复核与交付脚本。</span>
+        <label class="video-quality-choice">Seedance 质量
+          <select id="seedance-quality">
+            <option value="auto" ${videoDefault === "auto" ? "selected" : ""}>自动 · 中档 720P（默认）</option>
+            <option value="low" ${videoDefault === "low" ? "selected" : ""}>低档 · 480P</option>
+            <option value="medium" ${videoDefault === "medium" ? "selected" : ""}>中档 · 720P</option>
+            <option value="high" ${videoDefault === "high" ? "selected" : ""}>高档 · 1080P</option>
+          </select>
+        </label>
       </div>
       <button class="primary" id="btn-confirm" ${data.preflight?.passed ? "" : "disabled"}>✅ 确认,开始 Seedance 生产</button>
     </div>` : ""}
@@ -3415,7 +3462,8 @@ async function renderCanvasView(episodeId) {
       await api("/api/confirm", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ episode_id: ep.id }),
+        body: JSON.stringify({ episode_id: ep.id,
+          video_quality: document.getElementById("seedance-quality")?.value || "auto" }),
       });
       showToast("已确认!正在生成 Seedance 视频、随视频配音/口型与无字幕母版", "ok");
       pollCanvas(episodeId);

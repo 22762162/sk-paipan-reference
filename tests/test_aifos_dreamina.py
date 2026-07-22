@@ -107,6 +107,26 @@ def test_default_config_pins_fast_vip():
     assert jimeng["video_resolution"] == "720p"
 
 
+@pytest.mark.parametrize(("quality", "resolution"), [
+    ("low", "480p"), ("medium", "720p"), ("high", "1080p"),
+])
+def test_payload_can_select_three_seedance_quality_levels(
+        tmp_path, fake_dreamina, quality, resolution):
+    app = _make_app(tmp_path, fake_dreamina)
+    try:
+        result = app.router.call("video", {
+            "shot_no": 1, "prompt": "镜头缓推",
+            "first": "/tmp/first.png", "last": "/tmp/last.png",
+            "video_quality": quality, "video_resolution": resolution,
+        }, app.workspace.artifacts_dir)
+        (call,) = _calls(fake_dreamina)
+        assert f"--video_resolution={resolution}" in call
+        assert result.data["video_quality"] == quality
+        assert result.data["video_resolution"] == resolution
+    finally:
+        app.close()
+
+
 def test_missing_binary_falls_back_to_mock(tmp_path):
     app = _make_app(tmp_path, "/definitely/missing/dreamina")
     try:

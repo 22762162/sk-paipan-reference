@@ -532,12 +532,16 @@ class MockProvider(Provider):
             "voice": payload.get("voice", "jimeng_builtin"),
             "lip_sync": bool(payload.get("lip_sync", True)),
             "forbid_subtitles": bool(payload.get("forbid_subtitles", True)),
+            "video_quality": payload.get("video_quality", "medium"),
+            "video_resolution": payload.get("video_resolution", "720p"),
         })
         return {
             "shot_no": shot_no, "duration": duration,
             "voice": payload.get("voice", "jimeng_builtin"),
             "lip_sync": bool(payload.get("lip_sync", True)),
             "forbid_subtitles": bool(payload.get("forbid_subtitles", True)),
+            "video_quality": payload.get("video_quality", "medium"),
+            "video_resolution": payload.get("video_resolution", "720p"),
         }, uri
 
     # ---- 配音 ----

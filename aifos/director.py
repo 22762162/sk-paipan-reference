@@ -14,6 +14,18 @@ from pathlib import Path
 from .db import now
 from .errors import (AifosError, BudgetExceeded, ProduceCancelled,
                      ProviderError, ProviderUnavailable)
+from .quality_policy import (
+    default_quality_policy,
+    formal_reference_allowed,
+    image_task_class_for,
+    normalize_quality,
+    normalize_quality_policy,
+    recommend_asset_quality,
+    recommend_shot_image_quality,
+    resolve_image_quality,
+    resolve_video_quality,
+    set_policy_choices,
+)
 from .spatial_blocking import (build_spatial_plan, shot_blocking,
                                write_spatial_svgs)
 from .workflow import (
@@ -147,6 +159,30 @@ class Director:
             episode_id, "production_standard", snapshot)
         return snapshot
 
+    def _episode_quality_policy(self, episode_id, *, persist=False):
+        policy, _ = self.projects.latest_document(episode_id, "quality_policy")
+        normalized = normalize_quality_policy(policy)
+        if persist and policy is None:
+            self.projects.save_document(
+                episode_id, "quality_policy", normalized)
+        return normalized
+
+    def update_quality_policy(self, episode_id, *, image_default=None,
+                              video_default=None, image_overrides=None,
+                              video_overrides=None):
+        """保存本集自动/手动质量选择，供续产和逐镜审计复用。"""
+        episode = self.projects.get_episode(int(episode_id))
+        if episode is None:
+            raise AifosError("剧集不存在")
+        current = self._episode_quality_policy(episode["id"])
+        policy = set_policy_choices(
+            current, image_default=image_default,
+            video_default=video_default,
+            image_overrides=image_overrides,
+            video_overrides=video_overrides)
+        self.projects.save_document(episode["id"], "quality_policy", policy)
+        return policy
+
     # ---- 入口:一句话开工 ----
     def produce(self, project_title, episode_number, premise="", style="",
                 force=False, script=None, pause_for_confirm=False,
@@ -204,6 +240,8 @@ class Director:
             "feedback": feedback,
             "production_standard": standard_snapshot,
             "production_profile": profile,
+            "quality_policy": self._episode_quality_policy(
+                episode["id"], persist=True),
             "run_id": run_id,
         }
         stage_reports = []
@@ -918,21 +956,42 @@ class Director:
         清单里展示的是详细提示词(含人物设定与故事情境),所见即所得。"""
         shots = (ctx.get("storyboard") or {}).get("shots") or []
         locations = self._scene_locations(ctx) if ctx.get("script") else {}
-        self._plan_seed(ctx, "shot_image", [
-            {"id": f"shot:{s['shot_no']}", "category": "shot_image",
-             "label": f"镜头 {s['shot_no']:02d}"
-                      + (f" · 第{s['scene_no']}场" if s.get("scene_no")
-                         else ""),
-             "shot_no": s["shot_no"],
-             "prompt": self._rich_shot_prompt(
-                 ctx, s, locations.get(s.get("scene_no"), ""))}
-            for s in shots])
-        self._plan_seed(ctx, "frames", [
-            {"id": f"frames:{s['shot_no']}", "category": "frames",
-             "label": f"镜头 {s['shot_no']:02d} 首尾帧",
-             "shot_no": s["shot_no"],
-             "prompt": s.get("seedance_prompt", s["prompt"])}
-            for s in shots])
+        scene_counts = {}
+        for shot in shots:
+            scene_counts[shot.get("scene_no")] = (
+                scene_counts.get(shot.get("scene_no"), 0) + 1)
+        image_items, frame_items = [], []
+        for shot in shots:
+            shot_no = shot["shot_no"]
+            image_quality = resolve_image_quality(
+                recommend_shot_image_quality(shot),
+                ctx.get("quality_policy") or default_quality_policy(),
+                f"shot:{shot_no}")
+            frame_quality = resolve_image_quality(
+                recommend_shot_image_quality(
+                    shot, continuity_anchor=(
+                        scene_counts.get(shot.get("scene_no"), 0) > 1)),
+                ctx.get("quality_policy") or default_quality_policy(),
+                f"frames:{shot_no}")
+            image_items.append({
+                "id": f"shot:{shot_no}", "category": "shot_image",
+                "label": f"镜头 {shot_no:02d}"
+                         + (f" · 第{shot['scene_no']}场"
+                            if shot.get("scene_no") else ""),
+                "shot_no": shot_no,
+                "prompt": self._rich_shot_prompt(
+                    ctx, shot, locations.get(shot.get("scene_no"), "")),
+                **self._quality_meta(image_quality),
+            })
+            frame_items.append({
+                "id": f"frames:{shot_no}", "category": "frames",
+                "label": f"镜头 {shot_no:02d} 首尾帧",
+                "shot_no": shot_no,
+                "prompt": shot.get("seedance_prompt", shot["prompt"]),
+                **self._quality_meta(frame_quality),
+            })
+        self._plan_seed(ctx, "shot_image", image_items)
+        self._plan_seed(ctx, "frames", frame_items)
 
     # ---- 各阶段实现 ----
     def _stage_script(self, ctx):
@@ -1165,10 +1224,35 @@ class Director:
                 return {}
         return meta or {}
 
+    def _asset_quality(self, row, default="medium"):
+        """旧资产没有质量元数据时按中档兼容；新资产必须显式记录。"""
+        value = self._asset_meta(row).get("image_quality", default)
+        try:
+            return normalize_quality(value, field="asset.image_quality")
+        except AifosError:
+            return default
+
+    def _quality_meta(self, decision):
+        return {
+            "image_quality": decision["level"],
+            "recommended_quality": decision.get("recommended",
+                                                decision["level"]),
+            "quality_source": decision.get("source", "auto"),
+            "quality_rule": decision.get("rule", ""),
+            "quality_reasons": list(decision.get("reasons") or []),
+        }
+
+    @staticmethod
+    def _quality_meets(actual, required):
+        order = {"low": 0, "medium": 1, "high": 2}
+        return order.get(actual, 1) >= order.get(required, 1)
+
     def _locked_identity(self, project_id, name):
         """返回人工选定的最终立绘；普通 character_art 不视为已定版。"""
         row = self.assets.latest(project_id, "character_identity", name)
         if row is None or not self._asset_meta(row).get("locked"):
+            return None
+        if not formal_reference_allowed(self._asset_quality(row)):
             return None
         uri = row["uri"]
         if not uri:
@@ -1231,6 +1315,7 @@ class Director:
         project_id = ctx["project"]["id"]
         seed = []
         tasks = []
+        quality_by_candidate = {}
         for character in characters:
             name = character["name"]
             role = character.get("role", "")
@@ -1253,8 +1338,13 @@ class Director:
             refs = self._reference_uris(project_id, [name])
             base_prompt = self._portrait_prompt(
                 name, role, style, design=designs.get(name))
+            quality = resolve_image_quality(
+                recommend_asset_quality("character_candidate"),
+                ctx.get("quality_policy") or default_quality_policy(),
+                f"candidate:{name}")
             for index in range(1, CHARACTER_CANDIDATES + 1):
                 item_id = f"candidate:{name}:{index}"
+                quality_by_candidate[(name, index)] = quality
                 prompt = (
                     f"{base_prompt};人物候选{index}/{CHARACTER_CANDIDATES};"
                     "身份核心设定不变，只允许在脸部骨相细节、神态感染力和"
@@ -1264,6 +1354,7 @@ class Director:
                     "id": item_id, "category": "character_candidate",
                     "label": f"{name} · 候选 {index}", "name": name,
                     "candidate_index": index, "prompt": prompt,
+                    **self._quality_meta(quality),
                 })
                 if index in existing or locked:
                     continue
@@ -1273,8 +1364,10 @@ class Director:
                     "payload": {
                         "portrait": True,
                         "portrait_candidate": True,
-                        "image_task_class": "important",
-                        "image_quality": "high",
+                        "image_task_class": image_task_class_for(
+                            quality["level"]),
+                        "image_quality": quality["level"],
+                        "quality_decision": quality,
                         "art_name": f"{name}_candidate_{index:02d}",
                         "role": role, "shot_no": 0,
                         "characters": [name], "location": "",
@@ -1302,13 +1395,15 @@ class Director:
                 self._plan_mark(ctx, item["id"], "reused", only_pending=True)
         for (name, index, role), result in self._run_parallel(
                 ctx, tasks, line="人物定妆候选(每人5张)").items():
+            quality = quality_by_candidate[(name, index)]
             self.assets.register(
                 project_id, "character_candidate", f"{name}:{index:02d}",
                 uri=result.uri,
                 meta={"character": name, "role": role,
                       "candidate_index": index,
                       "provider": result.provider,
-                      "model": getattr(result, "model", "")})
+                      "model": getattr(result, "model", ""),
+                      **self._quality_meta(quality)})
         return self.character_selection_status(project_id, characters)
 
     def select_character_candidate(self, project_title, episode_number,
@@ -1331,6 +1426,10 @@ class Director:
         if (not candidate["uri"].startswith(("http://", "https://"))
                 and not Path(candidate["uri"]).exists()):
             raise AifosError("候选图片文件已丢失，请重新生成候选")
+        candidate_quality = self._asset_quality(candidate, default="high")
+        if not formal_reference_allowed(candidate_quality):
+            raise AifosError(
+                "低质量试错图不能锁为正式人物参考，请把选中形象以高质量重生后再定版")
         meta = {
             "character": character_name,
             "role": character.get("role", ""),
@@ -1339,6 +1438,9 @@ class Director:
             "candidate_asset_id": candidate["id"],
             "candidate_version": candidate["version"],
             "locked_at": now(),
+            "image_quality": candidate_quality,
+            "recommended_quality": "high",
+            "quality_source": "selected_mother_asset",
         }
         identity = self.assets.register(
             project["id"], "character_identity", character_name,
@@ -1378,6 +1480,19 @@ class Director:
         for scene in ctx["script"]["scenes"]:
             if scene["location"] not in locations:
                 locations.append(scene["location"])
+        location_reuse = {
+            location: sum(1 for scene in ctx["script"]["scenes"]
+                          if scene.get("location") == location)
+            for location in locations
+        }
+        scene_quality = {
+            location: resolve_image_quality(
+                recommend_asset_quality(
+                    "scene_art", reuse_count=location_reuse[location]),
+                ctx.get("quality_policy") or default_quality_policy(),
+                f"scene:{location}")
+            for location in locations
+        }
         # 先由编剧 AI 写人物设定(性格/外貌/妆容/服装细节),
         # 立绘与全部资产套件的提示词据此丰富;项目级一次,跨集复用
         designs = self._ensure_character_designs(ctx, characters)
@@ -1407,6 +1522,9 @@ class Director:
             {"id": f"char:{c['name']}", "category": "character_art",
              "label": f"{c['name']}({c.get('role') or '角色'})",
              "name": c["name"],
+             "image_quality": "high", "recommended_quality": "high",
+             "quality_source": "auto", "quality_rule": "mother_asset",
+             "quality_reasons": ["人物母资产会被后续全部镜头引用"],
              "prompt": self._portrait_prompt(
                  c["name"], c.get("role", ""), style,
                  design=designs.get(c["name"]))}
@@ -1416,6 +1534,9 @@ class Director:
              "category": "character_sheet",
              "label": f"{c['name']} · {label}",
              "name": c["name"], "sheet": key,
+             "image_quality": "high", "recommended_quality": "high",
+             "quality_source": "auto", "quality_rule": "mother_asset",
+             "quality_reasons": ["人物母资产会被后续全部镜头引用"],
              "prompt": self._sheet_prompt(
                  c["name"], c.get("role", ""), style, label, desc,
                  key=key, design=designs.get(c["name"]))}
@@ -1424,7 +1545,8 @@ class Director:
         self._plan_seed(ctx, "scene_art", [
             {"id": f"scene:{loc}", "category": "scene_art",
              "label": loc, "name": loc,
-             "prompt": self._scene_prompt(loc, style)}
+             "prompt": self._scene_prompt(loc, style),
+             **self._quality_meta(scene_quality[loc])}
             for loc in locations])
         reused, created = 0, 0
         cast = []
@@ -1450,19 +1572,27 @@ class Director:
         for scene in ctx["script"]["scenes"]:
             location = scene["location"]
             self.assets.acquire(project_id, "scene", location)
-            if self._existing_asset_uri(ctx, "scene_art", location):
-                reused += 1
-                self._plan_mark(ctx, f"scene:{location}", "reused",
-                                only_pending=True)
-                continue
+            existing_scene = self._existing_asset_uri(
+                ctx, "scene_art", location)
+            if existing_scene:
+                row = self.assets.latest(project_id, "scene_art", location)
+                if self._quality_meets(
+                        self._asset_quality(row),
+                        scene_quality[location]["level"]):
+                    reused += 1
+                    self._plan_mark(ctx, f"scene:{location}", "reused",
+                                    only_pending=True)
+                    continue
             if any(t["tag"] == ("scene", location, "") for t in tasks):
                 continue
             tasks.append({
                 "item_id": f"scene:{location}", "capability": "image",
                 "payload": {
                     "scene_art": True, "art_name": location,
-                    "image_task_class": "batch",
-                    "image_quality": "lite",
+                    "image_task_class": image_task_class_for(
+                        scene_quality[location]["level"]),
+                    "image_quality": scene_quality[location]["level"],
+                    "quality_decision": scene_quality[location],
                     "shot_no": 0, "characters": [], "location": location,
                     "action": scene.get("action", ""),
                     "prompt": self._scene_prompt(location, style),
@@ -1476,7 +1606,8 @@ class Director:
                 ctx, tasks, line="场景概念图").items():
             kind, name, role = tag
             self.assets.register(
-                project_id, "scene_art", name, uri=result.uri)
+                project_id, "scene_art", name, uri=result.uri,
+                meta=self._quality_meta(scene_quality[name]))
             created += 1
         # 阶段3:人物资产套件产线 并行批量(引用各自立绘+风格基准图)
         tasks = []
@@ -1490,12 +1621,18 @@ class Director:
             reference = self._reference_uris(project_id, [name])
             for key, label, desc in CHARACTER_SHEETS:
                 asset_name = f"{name}:{key}"
-                if self._existing_asset_uri(
-                        ctx, "character_sheet", asset_name):
-                    reused += 1
-                    self._plan_mark(ctx, f"sheet:{name}:{key}", "reused",
-                                    only_pending=True)
-                    continue
+                existing_sheet = self._existing_asset_uri(
+                    ctx, "character_sheet", asset_name)
+                if existing_sheet:
+                    row = self.assets.latest(
+                        project_id, "character_sheet", asset_name)
+                    if self._quality_meets(
+                            self._asset_quality(row), "high"):
+                        reused += 1
+                        self._plan_mark(
+                            ctx, f"sheet:{name}:{key}", "reused",
+                            only_pending=True)
+                        continue
                 tasks.append({
                     "item_id": f"sheet:{name}:{key}",
                     "capability": "image",
@@ -1527,7 +1664,11 @@ class Director:
             self.assets.register(
                 project_id, "character_sheet", f"{name}:{key}",
                 uri=result.uri,
-                meta={"character": name, "sheet": key, "label": label})
+                meta={"character": name, "sheet": key, "label": label,
+                      "image_quality": "high",
+                      "recommended_quality": "high",
+                      "quality_source": "auto",
+                      "quality_rule": "mother_asset"})
             created += 1
         ctx["cast"] = cast
         return {"reused": reused, "created": created,
@@ -1566,11 +1707,13 @@ class Director:
         for name in characters or []:
             row = self.assets.latest(
                 project_id, "character_sheet", f"{name}:turnaround")
-            if row and row["uri"] and Path(row["uri"]).exists():
+            if (row and formal_reference_allowed(self._asset_quality(row))
+                    and row["uri"] and Path(row["uri"]).exists()):
                 refs["character_refs"].append(row["uri"])
         if location:
             row = self.assets.latest(project_id, "scene_art", location)
-            if row and row["uri"] and Path(row["uri"]).exists():
+            if (row and formal_reference_allowed(self._asset_quality(row))
+                    and row["uri"] and Path(row["uri"]).exists()):
                 refs["scene_ref"] = row["uri"]
         reference = self._reference_uris(
             project_id, list(characters or []) + ([location] if location
@@ -1628,7 +1771,8 @@ class Director:
             parts.append(f"剧情依据:{ref}")
         return "。".join(p for p in parts if p)
 
-    def _shot_payload(self, ctx, shot):
+    def _shot_payload(self, ctx, shot, *, continuity_anchor=False,
+                      quality_override=None, item_id=None):
         locations = self._scene_locations(ctx)
         location = locations.get(shot["scene_no"], "")
         profile = (ctx.get("production_profile")
@@ -1638,6 +1782,12 @@ class Director:
         spatial = shot_blocking(ctx.get("blocking"), shot["shot_no"])
         readable_text = shot.get("readable_text", {}) or {}
         text_required = bool(readable_text.get("required"))
+        quality = resolve_image_quality(
+            recommend_shot_image_quality(
+                shot, continuity_anchor=continuity_anchor),
+            ctx.get("quality_policy") or default_quality_policy(),
+            item_id or f"shot:{shot['shot_no']}",
+            explicit_override=quality_override)
         payload = {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
@@ -1654,11 +1804,11 @@ class Director:
             "end_state": shot.get("end_state", {}),
             "five_dimensions": shot.get("five_dimensions", {}),
             "readable_text": readable_text,
-            # 批量关键帧优先走低成本 Seedream 5.0 Lite / GPT Image 2
-            # medium；只有复杂文字镜头才允许进入高档图片链。
-            "image_task_class": ("complex_text" if text_required
-                                 else "batch"),
-            "image_quality": "high" if text_required else "medium",
+            # 正式关键帧默认中档；文字/群像/人脸情绪/连续性自动升高。
+            "image_task_class": image_task_class_for(
+                quality["level"], readable_text=text_required),
+            "image_quality": quality["level"],
+            "quality_decision": quality,
             "performance": shot.get("performance", {}),
             "shot_contract": shot.get("shot_contract", {}),
             "sound_design": shot.get("sound_design", {}),
@@ -1695,20 +1845,30 @@ class Director:
         ctx["images"] = []
         reused = 0
         tasks = []
+        quality_by_shot = {}
         seen_scenes = set()
         for shot in ctx["storyboard"]["shots"]:
             scene_first = shot.get("scene_no") not in seen_scenes
             seen_scenes.add(shot.get("scene_no"))
+            payload = self._shot_payload(ctx, shot)
+            required_quality = payload["quality_decision"]["level"]
             existing = self._existing_asset_uri(
                 ctx, "image", self._shot_name(ctx, shot["shot_no"]))
             if existing:
-                ctx["images"].append(
-                    {"shot_no": shot["shot_no"], "uri": existing})
-                reused += 1
-                self._plan_mark(ctx, f"shot:{shot['shot_no']}", "reused",
-                                only_pending=True)
-                continue
-            payload = self._shot_payload(ctx, shot)
+                row = self.assets.latest(
+                    ctx["project"]["id"], "image",
+                    self._shot_name(ctx, shot["shot_no"]))
+                actual_quality = self._asset_quality(row)
+                if self._quality_meets(actual_quality, required_quality):
+                    ctx["images"].append(
+                        {"shot_no": shot["shot_no"], "uri": existing,
+                         "image_quality": actual_quality})
+                    reused += 1
+                    self._plan_mark(
+                        ctx, f"shot:{shot['shot_no']}", "reused",
+                        only_pending=True)
+                    continue
+            quality_by_shot[shot["shot_no"]] = payload["quality_decision"]
             tasks.append({
                 "item_id": f"shot:{shot['shot_no']}",
                 "capability": "image",
@@ -1724,8 +1884,13 @@ class Director:
         results = self._run_parallel(ctx, tasks, line="分镜画面")
         for shot_no in sorted(results):
             result = results[shot_no]
-            self._register_shot_asset(ctx, "image", shot_no, result.uri)
-            ctx["images"].append({"shot_no": shot_no, "uri": result.uri})
+            quality = quality_by_shot[shot_no]
+            self._register_shot_asset(
+                ctx, "image", shot_no, result.uri,
+                meta=self._quality_meta(quality))
+            ctx["images"].append({
+                "shot_no": shot_no, "uri": result.uri,
+                "image_quality": quality["level"]})
         ctx["images"].sort(key=lambda i: i["shot_no"])
         return {"count": len(ctx["images"]), "reused": reused}
 
@@ -1762,7 +1927,7 @@ class Director:
         两段视频拼接处画面连贯;不同场之间是剪辑硬切,各自独立,
         因此按轮推进——每轮并行处理各场的第 N 镜,场内保持串行。"""
         self._plan_seed_shots(ctx)
-        images = {i["shot_no"]: i["uri"] for i in ctx["images"]}
+        images = {i["shot_no"]: i for i in ctx["images"]}
         ctx["frames"] = []
         reused = 0
         chains = {}
@@ -1779,21 +1944,44 @@ class Director:
                 shot = chain[round_no]
                 scene_no = shot.get("scene_no")
                 name = self._shot_name(ctx, shot["shot_no"])
+                payload = self._shot_payload(
+                    ctx, shot, continuity_anchor=len(chain) > 1,
+                    item_id=f"frames:{shot['shot_no']}")
+                required_quality = payload["quality_decision"]["level"]
                 first = self._existing_asset_uri(ctx, "first_frame", name)
                 last = self._existing_asset_uri(ctx, "last_frame", name)
                 if first and last:
-                    ctx["frames"].append({"shot_no": shot["shot_no"],
-                                          "first": first, "last": last})
-                    reused += 1
-                    self._plan_mark(ctx, f"frames:{shot['shot_no']}",
-                                    "reused", only_pending=True)
-                    last_by_scene[scene_no] = last
-                    continue
-                payload = {**self._shot_payload(ctx, shot),
-                           "image_uri": images[shot["shot_no"]]}
+                    first_row = self.assets.latest(
+                        ctx["project"]["id"], "first_frame", name)
+                    last_row = self.assets.latest(
+                        ctx["project"]["id"], "last_frame", name)
+                    levels = (self._asset_quality(first_row),
+                              self._asset_quality(last_row))
+                    frame_quality = min(
+                        levels, key=("low", "medium", "high").index)
+                    if self._quality_meets(
+                            frame_quality, required_quality):
+                        ctx["frames"].append({
+                            "shot_no": shot["shot_no"], "first": first,
+                            "last": last, "image_quality": frame_quality})
+                        reused += 1
+                        self._plan_mark(ctx, f"frames:{shot['shot_no']}",
+                                        "reused", only_pending=True)
+                        last_by_scene[scene_no] = {
+                            "uri": last, "image_quality": frame_quality}
+                        continue
+                image = images[shot["shot_no"]]
+                if formal_reference_allowed(
+                        image.get("image_quality", "medium")):
+                    payload["image_uri"] = image["uri"]
+                else:
+                    payload["draft_image_rejected"] = image["uri"]
                 chain_first = last_by_scene.get(scene_no)
-                if round_no > 0 and chain_first                         and Path(chain_first).exists():
-                    payload["chain_first_uri"] = chain_first
+                if (round_no > 0 and chain_first
+                        and formal_reference_allowed(
+                            chain_first.get("image_quality", "medium"))
+                        and Path(chain_first["uri"]).exists()):
+                    payload["chain_first_uri"] = chain_first["uri"]
                 round_tasks.append({
                     "item_id": f"frames:{shot['shot_no']}",
                     "capability": "frames",
@@ -1812,16 +2000,24 @@ class Director:
                 if result is None:
                     continue
                 shot_no = task["tag"]
+                decision = task["payload"]["quality_decision"]
+                meta = self._quality_meta(decision)
                 self._register_shot_asset(
-                    ctx, "first_frame", shot_no, result.data["first"])
+                    ctx, "first_frame", shot_no, result.data["first"],
+                    meta=meta)
                 self._register_shot_asset(
-                    ctx, "last_frame", shot_no, result.data["last"])
+                    ctx, "last_frame", shot_no, result.data["last"],
+                    meta=meta)
                 ctx["frames"].append({
                     "shot_no": shot_no,
                     "first": result.data["first"],
                     "last": result.data["last"],
+                    "image_quality": decision["level"],
                 })
-                last_by_scene[task["scene"]] = result.data["last"]
+                last_by_scene[task["scene"]] = {
+                    "uri": result.data["last"],
+                    "image_quality": decision["level"],
+                }
         ctx["frames"].sort(key=lambda f: f["shot_no"])
         return {"count": len(ctx["frames"]), "reused": reused}
 
@@ -1830,7 +2026,7 @@ class Director:
         report = build_preflight(
             ctx["script"], ctx["storyboard"], ctx["continuity"],
             ctx["text_assets"], ctx["frames"], ctx["production_profile"],
-            ctx.get("blocking"))
+            ctx.get("blocking"), ctx.get("quality_policy"))
         version = self.projects.save_document(
             ctx["episode"]["id"], "preflight", report)
         (ctx["out_root"] / "preflight_report.json").write_text(
@@ -1859,7 +2055,10 @@ class Director:
                     "shot_no": shot["shot_no"], "uri": existing,
                     "duration": shot["duration"],
                     "provider": meta.get("provider", ""),
-                    "audio_in_video": meta.get("audio_in_video")})
+                    "audio_in_video": meta.get("audio_in_video"),
+                    "video_quality": meta.get("video_quality", "medium"),
+                    "video_resolution": meta.get(
+                        "video_resolution", "720p")})
                 reused += 1
                 continue
             ctx["videos"].append(self._make_video(ctx, shot, frames))
@@ -1867,6 +2066,13 @@ class Director:
 
     def _make_video(self, ctx, shot, frames):
         frame = frames[shot["shot_no"]]
+        if not formal_reference_allowed(
+                frame.get("image_quality", "medium")):
+            raise AifosError(
+                f"镜头{shot['shot_no']}首尾帧为低质量试错图，禁止交给 Seedance")
+        quality = resolve_video_quality(
+            ctx.get("quality_policy") or default_quality_policy(),
+            shot_no=shot["shot_no"])
         result = self._call(ctx, "video", {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
@@ -1878,6 +2084,8 @@ class Director:
             "voice": ctx["production_profile"]["voice"],
             "lip_sync": ctx["production_profile"]["lip_sync"],
             "forbid_subtitles": not ctx["production_profile"]["burn_subtitles"],
+            "video_quality": quality["level"],
+            "video_resolution": quality["resolution"],
             "standard_fingerprint": ctx["production_profile"].get(
                 "standard_fingerprint", ""),
             "aspect": ctx["aspect"], **ctx["dims"],
@@ -1894,10 +2102,15 @@ class Director:
             audio_in_video = True
         self._register_shot_asset(ctx, "video", shot["shot_no"], result.uri,
                                   meta={"provider": result.provider,
-                                        "audio_in_video": audio_in_video})
+                                        "audio_in_video": audio_in_video,
+                                        "video_quality": quality["level"],
+                                        "video_resolution": quality["resolution"],
+                                        "quality_source": quality["source"]})
         return {"shot_no": shot["shot_no"], "uri": result.uri,
                 "duration": shot["duration"], "provider": result.provider,
-                "audio_in_video": audio_in_video}
+                "audio_in_video": audio_in_video,
+                "video_quality": quality["level"],
+                "video_resolution": quality["resolution"]}
 
     def _video_audio_states(self, ctx):
         """按实际视频资产/Provider 声明返回每镜是否内置配音。"""
@@ -2222,7 +2435,7 @@ class Director:
             pause_for_confirm=True, feedback=feedback, run_id=run_id)
 
     def regen_image(self, project_title, episode_number, target,
-                    feedback="", prompt_override="",
+                    feedback="", prompt_override="", quality_override=None,
                     revision_source="manual"):
         """重画单张图:target = {"kind": character_art|scene_art|shot,
         "name"|"shot_no"};附意见时新画面按意见调整;
@@ -2260,6 +2473,22 @@ class Director:
         style = project["style"] or DEFAULT_VISUAL_STYLE
         kind = target.get("kind")
         prompt_override = (prompt_override or "").strip()
+        quality_choice = (normalize_quality(
+            quality_override, allow_auto=True, field="image_quality")
+            if quality_override is not None else "auto")
+        item_id = {
+            "character_sheet": lambda: f"sheet:{target.get('name', '')}",
+            "scene_art": lambda: f"scene:{target.get('name', '')}",
+            "shot": lambda: f"shot:{int(target.get('shot_no', 0))}",
+            "frames": lambda: f"frames:{int(target.get('shot_no', 0))}",
+        }.get(kind, lambda: "")()
+        policy = self._episode_quality_policy(episode["id"])
+        if quality_override is not None and item_id:
+            policy = set_policy_choices(
+                policy, image_overrides={item_id: quality_choice})
+            self.projects.save_document(
+                episode["id"], "quality_policy", policy)
+        ctx["quality_policy"] = policy
 
         def next_revision(asset_kind, asset_name):
             """每次重画都进入提示词/占位种子,保证重画必然产生新画面。"""
@@ -2290,10 +2519,15 @@ class Director:
             prompt = prompt_override or self._sheet_prompt(
                 name, role, style, label, desc, key=sheet_key,
                 design=self._character_design(project["id"], name))
+            quality = resolve_image_quality(
+                recommend_asset_quality("character_sheet"), policy,
+                f"sheet:{raw}", explicit_override=quality_choice)
             payload = {
                     "character_sheet": sheet_key, "sheet_label": label,
-                    "image_task_class": "important",
-                    "image_quality": "high",
+                    "image_task_class": image_task_class_for(
+                        quality["level"]),
+                    "image_quality": quality["level"],
+                    "quality_decision": quality,
                     "art_name": name, "role": role,
                     "shot_no": 0, "characters": [name], "location": "",
                     "prompt": prompt, "style": style,
@@ -2317,7 +2551,8 @@ class Director:
             self.assets.register(
                 project["id"], "character_sheet", raw, uri=result.uri,
                 meta={"character": name, "sheet": sheet_key,
-                      "label": label}, new_version=True)
+                      "label": label, **self._quality_meta(quality)},
+                new_version=True)
         elif kind == "scene_art":
             name = target["name"]
             scene = next((s for s in script["scenes"]
@@ -2325,10 +2560,17 @@ class Director:
             prompt = prompt_override or self._scene_prompt(name, style)
             references = self._reference_uris(project["id"], [name])
             style_ref = self._style_anchor_uri(project["id"])
+            reuse_count = sum(1 for value in script["scenes"]
+                              if value.get("location") == name)
+            quality = resolve_image_quality(
+                recommend_asset_quality("scene_art", reuse_count=reuse_count),
+                policy, f"scene:{name}", explicit_override=quality_choice)
             payload = {
                     "scene_art": True, "art_name": name,
-                    "image_task_class": "batch",
-                    "image_quality": "lite",
+                    "image_task_class": image_task_class_for(
+                        quality["level"]),
+                    "image_quality": quality["level"],
+                    "quality_decision": quality,
                     "shot_no": 0, "characters": [], "location": name,
                     "action": scene.get("action", ""),
                     "prompt": prompt,
@@ -2346,7 +2588,9 @@ class Director:
                 prompt=self._prompt_with_feedback(prompt, feedback),
                 payload=payload, revision_source=revision_source)
             self.assets.register(project["id"], "scene_art", name,
-                                 uri=result.uri, new_version=True)
+                                 uri=result.uri,
+                                 meta=self._quality_meta(quality),
+                                 new_version=True)
         elif kind == "shot":
             shot_no = int(target["shot_no"])
             storyboard, _ = self.projects.latest_document(
@@ -2356,7 +2600,9 @@ class Director:
             if shot is None:
                 raise AifosError(f"镜头不存在: {shot_no}")
             ctx["storyboard"] = storyboard
-            payload = self._shot_payload(ctx, shot)
+            payload = self._shot_payload(
+                ctx, shot, quality_override=quality_choice,
+                item_id=f"shot:{shot_no}")
             payload["feedback"] = feedback
             payload["revision"] = next_revision(
                 "image", self._shot_name(ctx, shot_no))
@@ -2371,8 +2617,25 @@ class Director:
                     payload["prompt"], feedback),
                 payload=payload, revision_source=revision_source)
             self.assets.register(project["id"], "image", asset_name,
-                                 uri=result.uri, new_version=True)
-            frames_payload = {**payload, "image_uri": result.uri}
+                                 uri=result.uri,
+                                 meta=self._quality_meta(
+                                     payload["quality_decision"]),
+                                 new_version=True)
+            scene_shots = [candidate for candidate in storyboard["shots"]
+                           if candidate.get("scene_no") == shot.get("scene_no")]
+            frames_payload = self._shot_payload(
+                ctx, shot, continuity_anchor=len(scene_shots) > 1,
+                item_id=f"frames:{shot_no}")
+            if formal_reference_allowed(payload["image_quality"]):
+                frames_payload["image_uri"] = result.uri
+            else:
+                frames_payload["draft_image_rejected"] = result.uri
+            frames_payload["feedback"] = feedback
+            frames_payload["revision"] = next_revision(
+                "first_frame", asset_name)
+            if prompt_override:
+                frames_payload["prompt"] = prompt_override
+                frames_payload["seedance_prompt"] = prompt_override
             prev = None
             for candidate in storyboard["shots"]:
                 if candidate["shot_no"] >= shot_no:
@@ -2383,7 +2646,8 @@ class Director:
                 row = self.assets.latest(
                     project["id"], "last_frame",
                     self._shot_name(ctx, prev["shot_no"]))
-                if row and row["uri"] and Path(row["uri"]).exists():
+                if (row and formal_reference_allowed(self._asset_quality(row))
+                        and row["uri"] and Path(row["uri"]).exists()):
                     # 帧链衔接:重画也保持与上一镜尾帧连贯
                     frames_payload["chain_first_uri"] = row["uri"]
             frames = self._plan_run(
@@ -2392,10 +2656,13 @@ class Director:
                 prompt=self._prompt_with_feedback(
                     frames_payload["prompt"], feedback),
                 payload=frames_payload, revision_source=revision_source)
+            frame_meta = self._quality_meta(frames_payload["quality_decision"])
             self.assets.register(project["id"], "first_frame", asset_name,
-                                 uri=frames.data["first"], new_version=True)
+                                 uri=frames.data["first"], meta=frame_meta,
+                                 new_version=True)
             self.assets.register(project["id"], "last_frame", asset_name,
-                                 uri=frames.data["last"], new_version=True)
+                                 uri=frames.data["last"], meta=frame_meta,
+                                 new_version=True)
             # 画面变了 → 旧视频作废,「继续补齐」时重拍并重剪
             self.assets.delete(project["id"], "video", asset_name)
         elif kind == "frames":
@@ -2413,11 +2680,20 @@ class Director:
             if not (image_row and image_row["uri"]
                     and Path(image_row["uri"]).exists()):
                 raise AifosError(f"镜头{shot_no}尚无关键图,请先重画镜头")
-            frames_payload = {**self._shot_payload(ctx, shot),
-                              "image_uri": image_row["uri"],
-                              "feedback": feedback,
-                              "revision": next_revision("first_frame",
-                                                        asset_name)}
+            scene_shots = [candidate for candidate in storyboard["shots"]
+                           if candidate.get("scene_no") == shot.get("scene_no")]
+            frames_payload = {
+                **self._shot_payload(
+                    ctx, shot, continuity_anchor=len(scene_shots) > 1,
+                    quality_override=quality_choice,
+                    item_id=f"frames:{shot_no}"),
+                "feedback": feedback,
+                "revision": next_revision("first_frame", asset_name),
+            }
+            if formal_reference_allowed(self._asset_quality(image_row)):
+                frames_payload["image_uri"] = image_row["uri"]
+            else:
+                frames_payload["draft_image_rejected"] = image_row["uri"]
             if prompt_override:
                 frames_payload["prompt"] = prompt_override
                 frames_payload["seedance_prompt"] = prompt_override
@@ -2431,7 +2707,8 @@ class Director:
                 row = self.assets.latest(
                     project["id"], "last_frame",
                     self._shot_name(ctx, prev["shot_no"]))
-                if row and row["uri"] and Path(row["uri"]).exists():
+                if (row and formal_reference_allowed(self._asset_quality(row))
+                        and row["uri"] and Path(row["uri"]).exists()):
                     frames_payload["chain_first_uri"] = row["uri"]
             result = self._plan_run(
                 ctx, f"frames:{shot_no}", lambda: self._call(
@@ -2441,9 +2718,14 @@ class Director:
                 payload=frames_payload, revision_source=revision_source)
             self.assets.register(project["id"], "first_frame", asset_name,
                                  uri=result.data["first"],
+                                 meta=self._quality_meta(
+                                     frames_payload["quality_decision"]),
                                  new_version=True)
             self.assets.register(project["id"], "last_frame", asset_name,
-                                 uri=result.data["last"], new_version=True)
+                                 uri=result.data["last"],
+                                 meta=self._quality_meta(
+                                     frames_payload["quality_decision"]),
+                                 new_version=True)
             self.assets.delete(project["id"], "video", asset_name)
         else:
             raise AifosError(f"不支持的重画目标: {kind}")
@@ -2456,6 +2738,8 @@ class Director:
             "director",
             f"重画完成: {target}(意见: {feedback or '无'})")
         return {"target": target, "uri": result.uri,
+                "quality": (result.data or {}).get(
+                    "image_quality", quality_choice),
                 "cost": round(self._task_cost, 2)}
 
     # ---- 人工修改素材导入(下载 → 外部修图/剪辑 → 上传替换) ----
@@ -2506,8 +2790,11 @@ class Director:
                     / f"upload_{kind}_{safe}_v{version}{ext}")
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(file_bytes)
+            uploaded_meta = {"uploaded": True, "image_quality": "high",
+                             "recommended_quality": "high",
+                             "quality_source": "manual_upload"}
             self.assets.register(project["id"], kind, name,
-                                 uri=str(path), meta={"uploaded": True},
+                                 uri=str(path), meta=uploaded_meta,
                                  new_version=True)
             if kind == "character_art":
                 # 人工上传等同于明确确认最终立绘，同时建立真正的身份锚点。
@@ -2515,7 +2802,10 @@ class Director:
                     project["id"], "character_identity", name,
                     uri=str(path),
                     meta={"character": name, "locked": True,
-                          "uploaded": True, "locked_at": now()},
+                          "uploaded": True, "locked_at": now(),
+                          "image_quality": "high",
+                          "recommended_quality": "high",
+                          "quality_source": "manual_upload"},
                     new_version=True)
             self.log.info("director", f"已上传替换 {kind}/{name}")
             return {"uri": str(path)}
@@ -2534,7 +2824,11 @@ class Director:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(file_bytes)
             self.assets.register(project["id"], "image", asset_name,
-                                 uri=str(path), meta={"uploaded": True},
+                                 uri=str(path),
+                                 meta={"uploaded": True,
+                                       "image_quality": "high",
+                                       "recommended_quality": "high",
+                                       "quality_source": "manual_upload"},
                                  new_version=True)
             # 按新图重做首尾帧(真实产线由 Codex 依据新图推导)
             aspect = (project["aspect"] or self.config.get(
@@ -2550,9 +2844,15 @@ class Director:
             frames = self._call(ctx, "frames", {
                 **payload, "image_uri": str(path)}, "frames")
             self.assets.register(project["id"], "first_frame", asset_name,
-                                 uri=frames.data["first"], new_version=True)
+                                 uri=frames.data["first"],
+                                 meta={"image_quality": "high",
+                                       "quality_source": "manual_upload"},
+                                 new_version=True)
             self.assets.register(project["id"], "last_frame", asset_name,
-                                 uri=frames.data["last"], new_version=True)
+                                 uri=frames.data["last"],
+                                 meta={"image_quality": "high",
+                                       "quality_source": "manual_upload"},
+                                 new_version=True)
             self.assets.delete(project["id"], "video", asset_name)
             self.log.info(
                 "director", f"已上传替换镜头{shot_no}画面,旧视频作废")
@@ -2833,7 +3133,7 @@ class Director:
                 "passed": passed, "failed": failed}
 
     def redo_items(self, project_title, episode_number, item_ids=None,
-                   only_failed=False, progress=None):
+                   only_failed=False, quality_override=None, progress=None):
         """批量重画:按 item_ids 重画;only_failed=True 时重画所有质检
         未过的图。可暂停,重画后自动复检。"""
         project, episode = self._episode_ctx(project_title, episode_number)
@@ -2929,6 +3229,7 @@ class Director:
                     self.regen_image(
                         project_title, episode_number, target,
                         feedback=feedback, prompt_override=prompt_override,
+                        quality_override=quality_override,
                         revision_source=revision_source)
                     redone += 1
                 except AifosError as exc:

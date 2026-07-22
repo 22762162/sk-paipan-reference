@@ -105,12 +105,12 @@ def test_batch_fallback_is_seedream_then_gpt_then_codex_emergency(tmp_path):
 
 @pytest.mark.parametrize(("task_class", "requested", "sent", "cost"), [
     ("batch", "high", "medium", 0.28),
-    ("important", "high", "medium", 0.28),
+    ("important", "high", "high", 1.12),
     ("final", "high", "high", 1.12),
     ("complex_text", "high", "high", 1.12),
     ("batch", "lite", "low", 0.07),
 ])
-def test_gpt_quality_gate_only_allows_high_for_final_and_complex_text(
+def test_gpt_quality_gate_allows_high_for_classified_important_assets(
         tmp_path, monkeypatch, task_class, requested, sent, cost):
     captured = {}
 
@@ -134,13 +134,12 @@ def test_gpt_quality_gate_only_allows_high_for_final_and_complex_text(
     assert result.cost == cost
     assert result.data["model"] == "gpt-image-2"
     assert result.data["image_task_class"] == task_class
-    assert result.data["image_quality"] == (
-        "lite" if sent == "low" else sent)
+    assert result.data["image_quality"] == sent
     assert result.data["unit_cost"] == cost
 
 
-def test_gpt_reference_edit_also_clamps_important_high(tmp_path,
-                                                        monkeypatch):
+def test_gpt_reference_edit_keeps_classified_important_high(tmp_path,
+                                                             monkeypatch):
     ref = _png(tmp_path / "identity.png")
     captured = {}
 
@@ -158,7 +157,7 @@ def test_gpt_reference_edit_also_clamps_important_high(tmp_path,
         "image_task_class": "important", "image_quality": "high",
         "character_refs": [ref], "require_reference_images": True,
     }, tmp_path / "edit")
-    assert captured["quality"] == "medium"
+    assert captured["quality"] == "high"
 
 
 def test_seedream_uploads_ordered_identity_refs_and_forces_one_image(
@@ -211,7 +210,7 @@ def test_seedream_uploads_ordered_identity_refs_and_forces_one_image(
     assert result.model == "doubao-seedream-5-0-lite-260128"
     assert result.data["model"] == "doubao-seedream-5-0-lite-260128"
     assert result.data["image_task_class"] == "batch"
-    assert result.data["image_quality"] == "lite"
+    assert result.data["image_quality"] == "medium"
     assert result.data["unit_cost"] == 0.22
     assert (tmp_path / "out" / "shot_008.keyframe.png").read_bytes() == \
         b"seedream"

@@ -279,6 +279,7 @@ def test_ark_video_task_flow(fake_api, tmp_path):
     result = provider.generate("video", {
         "shot_no": 3, "prompt": "古镇夜景 镜头缓推", "duration": 8,
         "first": str(first), "last": str(last), "aspect": "9:16",
+        "video_quality": "high", "video_resolution": "1080p",
     }, out_dir)
     assert result.uri.endswith("shot_003.mp4")
     assert (out_dir / "shot_003.mp4").read_bytes() == MP4_FAKE
@@ -286,7 +287,9 @@ def test_ark_video_task_flow(fake_api, tmp_path):
     assert create["headers"]["authorization"] == "Bearer ark-key-1"
     assert create["body"]["model"] == "seedance-2.0-fast"
     text = create["body"]["content"][0]["text"]
-    assert "--duration 8" in text and "720p" in text
+    assert "--duration 8" in text and "1080p" in text
+    assert result.data["video_quality"] == "high"
+    assert result.data["video_resolution"] == "1080p"
     roles = [c.get("role") for c in create["body"]["content"][1:]]
     assert roles == ["first_frame", "last_frame"]
     assert create["body"]["content"][1]["image_url"]["url"].startswith(

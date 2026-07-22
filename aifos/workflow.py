@@ -12,6 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .quality_policy import default_quality_policy, resolve_video_quality
+
 from .spatial_blocking import (build_character_number_map, build_spatial_plan,
                                validate_spatial_plan)
 
@@ -742,7 +744,7 @@ def _gate(gate_id, label, passed, detail):
 
 
 def build_preflight(script, storyboard, continuity, text_manifest, frames,
-                    profile, blocking=None):
+                    profile, blocking=None, quality_policy=None):
     shots = storyboard.get("shots", [])
     rules = profile.get("rules", {})
     production_rules = rules.get("production", {})
@@ -754,6 +756,9 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
         if isinstance(item, dict) and item.get("id")
     }
     frame_map = {f["shot_no"]: f for f in frames}
+    formal_frame_quality_ok = all(
+        str(frame.get("image_quality", "medium")).lower()
+        in ("medium", "high") for frame in frames)
     required = (
         "unit_id", "character_count", "start_state", "end_state",
         "shot_function", "script_reference", "readable_text", "visual_hook",
@@ -761,6 +766,8 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
         "sound_design", "timecode",
     )
     precision = float(profile.get("time_precision_seconds", 0.5))
+    video_quality = resolve_video_quality(
+        quality_policy or default_quality_policy())
     config_ok = (
         profile["video_model"] == "seedance2.0fast_vip"
         and profile["resolution"].lower() == "720p"
@@ -923,12 +930,16 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
         _gate("text", "文字关键帧", bool(text_manifest.get("passed", False)),
               text_manifest.get("note", "")),
         _gate("frames", "首尾帧与段间状态", len(frame_map) == len(shots)
-              and all(f.get("first") and f.get("last") for f in frames),
-              f"{len(frame_map)}/{len(shots)} 个单元首尾帧就绪"),
+              and all(f.get("first") and f.get("last") for f in frames)
+              and formal_frame_quality_ok,
+              f"{len(frame_map)}/{len(shots)} 个单元首尾帧就绪；"
+              "正式参考仅允许中/高质量"),
         _gate("audio", "环境声与声音策略", sound_ok,
               "每镜均含环境声设计，声音与空间共同参与叙事"),
         _gate("profile", "即梦生产配置", config_ok,
-              "Seedance 2.0 Fast VIP / 720P / 随视频配音与口型 / 无字幕母版"),
+              "Seedance 2.0 Fast VIP / "
+              f"{video_quality['level']}档 {video_quality['resolution']} / "
+              "随视频配音与口型 / 无字幕母版"),
     ]
     gates = []
     for gate in available_gates:
@@ -947,6 +958,9 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
                       if gate.get("severity") != "warning"),
         "gates": gates,
         "profile": copy.deepcopy(profile),
+        "quality_policy": copy.deepcopy(
+            quality_policy or default_quality_policy()),
+        "selected_video_quality": video_quality,
         "script_lines": sum(len(s.get("lines", [])) for s in script.get("scenes", [])),
         "units": len(shots),
     }

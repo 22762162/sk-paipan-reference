@@ -276,7 +276,7 @@ def test_produce_flow_and_episode_api(server):
 
     # 开拍确认 → 自动完成剩余全部阶段
     status, reply = _json_request(port, "POST", "/api/confirm", {
-        "episode_id": episode_id})
+        "episode_id": episode_id, "video_quality": "high"})
     assert status == 202
     job = _wait_job(port, reply["job_id"])
     assert job["summary"]["status"] == "done"
@@ -284,6 +284,7 @@ def test_produce_flow_and_episode_api(server):
     status, detail = _json_request(port, "GET", f"/api/episode/{episode_id}")
     assert status == 200
     assert detail["qc_report"]["passed"]
+    assert detail["quality_policy"]["video_default"] == "high"
     assert len(detail["tasks"]) >= 11
 
     art = detail["artifacts"]
