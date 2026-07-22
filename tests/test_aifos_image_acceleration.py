@@ -99,6 +99,50 @@ def test_preflight_blocks_text_only_and_wrong_model(tmp_path):
         app.close()
 
 
+def test_removed_plan_item_cannot_reappear_in_acceleration_queue(tmp_path):
+    """模式切换清掉计划后，历史派发契约只能审计、不能继续生产。"""
+    app, _project, _episode, ctx, _task = _setup(tmp_path)
+    try:
+        app.director._plan_write(ctx, {"items": []})
+        options = app.director.image_acceleration_options("加速测试", 1)
+        assert not any(item["item_id"] == "shot:1"
+                       for item in options["items"])
+        report = app.director.preflight_image_acceleration(
+            "加速测试", 1, ["shot:1"], "image_api", "gpt-image-2")
+        assert report["passed"] is False
+        assert "不在当前生产计划" in "；".join(
+            report["items"][0]["issues"])
+        with pytest.raises(AifosError, match="未通过放行"):
+            app.director.queue_image_acceleration(
+                "加速测试", 1, ["shot:1"],
+                "image_api", "gpt-image-2")
+    finally:
+        app.close()
+
+
+def test_simple_policy_blocks_stale_character_sheet_contract(tmp_path):
+    """即使旧套件计划尚未刷新，简化策略也必须立即阻断 API 派发。"""
+    app, _project, episode, _ctx, _task = _setup(tmp_path)
+    try:
+        app.db.execute(
+            "UPDATE image_dispatch_contracts SET category='character_sheet' "
+            "WHERE episode_id=? AND item_id='shot:1'", (episode["id"],))
+        app.projects.save_document(episode["id"], "character_asset_policy", {
+            "schema": "aifos.character-assets/v1",
+            "mode": "simple", "source": "user",
+        })
+        options = app.director.image_acceleration_options("加速测试", 1)
+        assert not any(item["item_id"] == "shot:1"
+                       for item in options["items"])
+        report = app.director.preflight_image_acceleration(
+            "加速测试", 1, ["shot:1"], "image_api", "gpt-image-2")
+        assert report["passed"] is False
+        assert "简化人物资产模式" in "；".join(
+            report["items"][0]["issues"])
+    finally:
+        app.close()
+
+
 def test_original_scheduler_claims_queued_api_without_fallback(tmp_path):
     app, _project, episode, ctx, task = _setup(tmp_path)
     calls = []

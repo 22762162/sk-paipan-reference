@@ -445,6 +445,33 @@ def test_produce_flow_and_episode_api(server):
                for candidate in c["candidates"])
     assert pre["artifacts"]["cast_art"] == []
     assert pre["artifacts"]["scene_art"] == []
+    assert pre["character_asset_policy"]["mode"] == "auto"
+    policy_version = pre["character_asset_policy_version"]
+    status, missing_version = _json_request(
+        port, "POST", "/api/character/assets-policy", {
+            "episode_id": episode_id, "mode": "simple",
+        })
+    assert status == 400 and "expected_version" in missing_version["error"]
+    status, null_version = _json_request(
+        port, "POST", "/api/character/assets-policy", {
+            "episode_id": episode_id, "mode": "simple",
+            "expected_version": None,
+        })
+    assert status == 400 and "非负整数" in null_version["error"]
+    status, saved_policy = _json_request(
+        port, "POST", "/api/character/assets-policy", {
+            "episode_id": episode_id, "mode": "simple",
+            "expected_version": policy_version,
+        })
+    assert status == 200
+    assert saved_policy["policy"]["resolved_mode"] == "simple"
+    assert saved_policy["policy"]["generate_sheets"] is False
+    status, stale = _json_request(
+        port, "POST", "/api/character/assets-policy", {
+            "episode_id": episode_id, "mode": "full",
+            "expected_version": policy_version,
+        })
+    assert status == 409 and "刷新" in stale["error"]
     # 未完成五选一，后端也必须拒绝绕过门禁。
     status, blocked = _json_request(port, "POST", "/api/confirm", {
         "episode_id": episode_id})
@@ -481,6 +508,9 @@ def test_produce_flow_and_episode_api(server):
     assert job["summary"]["status"] == "awaiting_confirm"
     status, pre = _json_request(port, "GET", f"/api/episode/{episode_id}")
     assert pre["storyboard"]["shots"]
+    assert pre["character_asset_policy"]["resolved_mode"] == "simple"
+    assert not [item for item in pre["render_plan"]["items"]
+                if item["category"] == "character_sheet"]
     assert pre["artifacts"]["cast_art"], "确认页需要最终人物立绘"
     assert pre["artifacts"]["scene_art"], "确认页需要场景概念图"
     assert pre["artifacts"]["videos"] == {}, "确认前不应生产视频"

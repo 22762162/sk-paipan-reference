@@ -7,8 +7,13 @@ import pytest
 
 from aifos.adapters.codex_image import build_instruction
 from aifos.app import App
-from aifos.director import CHARACTER_SHEETS, character_candidate_target
+from aifos.director import (
+    CHARACTER_SHEETS,
+    character_candidate_target,
+    resolve_character_asset_policy,
+)
 from aifos.errors import AifosError
+from aifos.production.base import ProviderResult
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 16
 
@@ -20,7 +25,7 @@ def app(tmp_path):
     instance.close()
 
 
-def _preproduce(app, title="万妖图录", number=1):
+def _preproduce(app, title="万妖图录", number=1, asset_mode=None):
     app.director.produce(title, number, pause_for_confirm=True)   # 剧本停
     summary = app.director.produce(
         title, number, pause_for_confirm=True)   # 人物候选停
@@ -33,13 +38,16 @@ def _preproduce(app, title="万妖图录", number=1):
         for character in script["characters"]:
             app.director.select_character_candidate(
                 title, number, character["name"], 1)
+        if asset_mode:
+            app.director.update_character_asset_policy(
+                episode["id"], asset_mode)
         app.director.produce(title, number, pause_for_confirm=True)
     return app.projects.get_project(title)
 
 
 def test_character_suite_generated(app):
     """每个角色除立绘外生成完整资产套件:四视图/特写/特征/妆容/服装。"""
-    project = _preproduce(app)
+    project = _preproduce(app, asset_mode="full")
     episode = app.db.query_one(
         "SELECT * FROM episodes WHERE project_id=? AND number=1",
         (project["id"],))
@@ -61,6 +69,151 @@ def test_character_suite_generated(app):
                    if i["category"] == "character_sheet"]
     assert len(sheet_items) == len(script["characters"]) * 6
     assert all(i["status"] in ("done", "reused") for i in sheet_items)
+
+
+def test_auto_character_asset_policy_is_conservative():
+    simple = resolve_character_asset_policy({"mode": "auto"}, {
+        "characters": [{"name": "林昭", "role": "主角"}],
+        "scenes": [{"location": "书房", "action": "对镜头说一句话"}],
+    })
+    assert simple["resolved_mode"] == "simple"
+    complex_policy = resolve_character_asset_policy({"mode": "auto"}, {
+        "characters": [
+            {"name": "林昭", "role": "主角"},
+            {"name": "周鹿", "role": "重要配角"},
+        ],
+        "scenes": [{"location": "书房", "action": "两人对话"}],
+    })
+    assert complex_policy["resolved_mode"] == "full"
+
+
+def test_simple_character_assets_skip_all_sheets_and_keep_identity_qc(app):
+    """简化版真正省掉全部四视图/细节图，不削弱最终立绘门禁。"""
+    project = _preproduce(app, title="单人短片", asset_mode="simple")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    policy = app.director.character_asset_policy(episode["id"])
+    assert policy["mode"] == "simple"
+    assert policy["resolved_mode"] == "simple"
+    assert policy["generate_sheets"] is False
+    assert app.assets.active_list(project["id"], "character_sheet") == []
+    out_root = (app.workspace.artifacts_dir
+                / f"p{project['id']:03d}" / "e001")
+    plan = json.loads((out_root / "render_plan.json").read_text(
+        encoding="utf-8"))
+    assert not [item for item in plan["items"]
+                if item["category"] == "character_sheet"]
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    hero = script["characters"][0]["name"]
+    refs = app.director._art_refs(
+        {"project": dict(project), "character_asset_policy": policy},
+        [hero], "")
+    assert any(item["kind"] == "character_identity"
+               for item in refs["asset_matches"])
+    assert not any(item["kind"] == "character_sheet"
+                   for item in refs["asset_matches"])
+    with pytest.raises(AifosError, match="简化人物资产模式"):
+        app.director.regen_image(
+            project["title"], 1,
+            {"kind": "character_sheet", "name": f"{hero}:turnaround"})
+
+
+def test_simple_upload_shot_frames_never_reinject_old_turnaround(app):
+    """上传替换镜头重做首尾帧也必须遵守简化版参考链。"""
+    project = _preproduce(app, title="上传镜头", asset_mode="simple")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    hero = script["characters"][0]["name"]
+    old_turnaround = (app.workspace.artifacts_dir / "legacy-turnaround.png")
+    old_turnaround.write_bytes(PNG)
+    app.assets.register(
+        project["id"], "character_sheet", f"{hero}:turnaround",
+        uri=str(old_turnaround), meta={"image_quality": "high"})
+    storyboard, _ = app.projects.latest_document(episode["id"], "storyboard")
+    shot_no = next(shot["shot_no"] for shot in storyboard["shots"]
+                   if hero in shot.get("characters", []))
+    captured = {}
+
+    def fake_call(_ctx, capability, payload, _sub_dir):
+        assert capability == "frames"
+        captured.update(payload)
+        first = app.workspace.artifacts_dir / "uploaded-first.png"
+        last = app.workspace.artifacts_dir / "uploaded-last.png"
+        first.write_bytes(PNG)
+        last.write_bytes(PNG)
+        return ProviderResult(
+            provider="mock", model="mock", cost=0,
+            data={"first": str(first), "last": str(last)},
+            uri=str(first))
+
+    app.director._call = fake_call
+    app.director.import_image(
+        project["title"], 1, {"kind": "shot", "shot_no": shot_no},
+        PNG, ".png")
+    assert str(old_turnaround) not in captured.get("character_refs", [])
+    assert captured.get("identity_references")
+
+
+def test_character_asset_policy_rejects_active_persistent_run(app):
+    """即使内存 Job 尚未登记，持久运行记录也能阻断模式竞态。"""
+    app.director.produce("并发策略", 1, pause_for_confirm=True)
+    app.director.produce("并发策略", 1, pause_for_confirm=True)
+    project = app.projects.get_project("并发策略")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    app.history.create_run(project["title"], 1, action="regen_image")
+    with pytest.raises(AifosError, match="正在生产"):
+        app.director.update_character_asset_policy(
+            episode["id"], "simple")
+
+
+def test_legacy_sheet_plan_migrates_to_full_without_silent_downgrade(app):
+    project, _ = app.projects.get_or_create_project("旧项目")
+    episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+    ctx = {"project": dict(project), "episode": dict(episode),
+           "out_root": app.director._episode_dir(project, episode)}
+    app.director._plan_write(ctx, {"items": [{
+        "id": "sheet:林昭:turnaround", "category": "character_sheet",
+        "status": "done",
+    }]})
+    policy = app.director.character_asset_policy(episode["id"])
+    assert policy["mode"] == "full"
+    assert policy["source"] == "legacy_migration"
+    assert policy["generate_sheets"] is True
+
+
+def test_switching_to_simple_keeps_history_but_excludes_old_turnaround(app):
+    """切到简化版不删旧资产，但旧四视图不再污染后续参考链。"""
+    app.director.produce("保留历史", 1, pause_for_confirm=True)
+    app.director.produce("保留历史", 1, pause_for_confirm=True)
+    project = app.projects.get_project("保留历史")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    hero = script["characters"][0]["name"]
+    candidate = app.assets.latest(
+        project["id"], "character_candidate", f"{hero}:01")
+    app.assets.register(
+        project["id"], "character_sheet", f"{hero}:turnaround",
+        uri=candidate["uri"], meta={"image_quality": "high"})
+    for character in script["characters"]:
+        app.director.select_character_candidate(
+            project["title"], 1, character["name"], 1)
+    app.director.update_character_asset_policy(episode["id"], "simple")
+    app.director.produce(project["title"], 1, pause_for_confirm=True)
+    policy = app.director.character_asset_policy(episode["id"])
+    refs = app.director._art_refs(
+        {"project": dict(project), "character_asset_policy": policy},
+        [hero], "")
+    assert len(app.assets.active_list(
+        project["id"], "character_sheet")) == 1
+    assert not any(item["kind"] == "character_sheet"
+                   for item in refs["asset_matches"])
 
 
 def test_character_suite_reused_across_episodes(app):

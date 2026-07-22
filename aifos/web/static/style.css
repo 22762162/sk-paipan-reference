@@ -705,6 +705,15 @@ td.num, th.num { text-align: right; }
 .confirm-banner button { font-size: 15px; padding: 11px 22px; white-space: nowrap; }
 .cast-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .cast-actions button:not(.primary) { color: var(--ink-2); }
+.cast-asset-policy {
+  display: grid; gap: 5px; min-width: min(100%, 300px);
+  padding: 9px 11px; border: 1px solid rgba(250, 178, 25, .3);
+  border-radius: 9px; background: rgba(0, 0, 0, .08);
+}
+.cast-asset-policy label { display: grid; gap: 5px; }
+.cast-asset-policy label b { margin: 0; font-size: 12px; }
+.cast-asset-policy select { width: 100%; min-height: 44px; }
+.cast-asset-policy > span { line-height: 1.45; }
 
 /* 人物5选1定版：最终立绘是后续所有含人物图片的视觉身份锚点 */
 .cast-selection-list { padding: 18px; display: grid; gap: 18px; overflow: auto; }
@@ -742,6 +751,7 @@ td.num, th.num { text-align: right; }
   .cast-look dd { font-size: 11px; }
   .cast-select-view .confirm-banner { align-items: stretch; }
   .cast-select-view .confirm-banner button { width: 100%; }
+  .cast-asset-policy { width: 100%; }
   .cast-actions { width: 100%; }
 }
 .progress-card.confirm {

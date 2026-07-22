@@ -3581,7 +3581,7 @@ async function renderAssetsCenter(selectedTitle) {
   const projects = ov.projects || [];
   if (!projects.length) {
     app.innerHTML = `<div class="loading">还没有项目。先在生产总览用一句话开始制作,
-      剧本确认后会自动生成完整人物资产套件。</div>`;
+      剧本确认后可选择只用最终人物形象图，或生成完整人物资产套件。</div>`;
     return;
   }
   const stored = localStorage.getItem("aifos.assets.project");
@@ -3618,13 +3618,17 @@ async function renderAssetsCenter(selectedTitle) {
   const activeCategory = storedCategory === "all"
     || assetCategories.some(([value]) => value === storedCategory)
     ? storedCategory : "all";
+  const characterAssetPolicy = (epData || {}).character_asset_policy || {};
+  const characterAssetHint = characterAssetPolicy.resolved_mode === "simple"
+    ? "当前为简化版：只使用人工锁定的最终人物形象图；历史扩展资产保留但不会自动注入后续出图"
+    : "当前为完整版：最终人物形象图 + 四视图/面部特写/特征/妆容/服装/服装细节";
   app.innerHTML = `
   <div class="assets-center">
     <div class="canvas-toolbar">
       <span class="title">🗂 资产中心</span>
       <select id="asset-project">${projects.map((p) =>
         `<option ${p.title === title ? "selected" : ""}>${esc(p.title)}</option>`).join("")}</select>
-      <span class="hint">人物资产套件与场景概念图跨集复用;参考图自动进入出图提示</span>
+      <span class="hint">人物资产范围可按集选择;最终人物形象图始终进入出图与质检</span>
     </div>
     <section class="panel asset-panel asset-catalog-panel">
       <div class="asset-catalog-toolbar"><div><h2>🧭 资产索引</h2>
@@ -3676,8 +3680,7 @@ async function renderAssetsCenter(selectedTitle) {
       </div>
     </section>
     <section class="panel asset-panel">
-      <h2>👤 人物资产 <span class="dim">立绘 + 四视图/面部特写/特征/妆容/服装/服装细节,
-        全部可重画、可上传替换、可下载</span></h2>
+      <h2>👤 人物资产 <span class="dim">${esc(characterAssetHint)}；现有资产均可查看和下载</span></h2>
       ${(art.cast_art || []).length ? art.cast_art.map((c) => {
         const sheets = (art.character_sheets || {})[c.name] || [];
         return `<div class="char-suite">
@@ -3693,7 +3696,7 @@ async function renderAssetsCenter(selectedTitle) {
           </div></div>`;
       }).join("")
       : `<div class="dim">本项目还没有人物资产。开始制作一集并确认剧本后,
-         会自动生成每个角色的完整资产套件。</div>`}
+         可选择只生成最终人物形象图，或生成每个角色的完整扩展套件。</div>`}
     </section>
     <section class="panel asset-panel">
       <h2>🏞 场景概念图</h2>
@@ -3998,6 +4001,9 @@ function canvasSig(data) {
     data.episode.status, data.episode.qc_score, data.episode.title,
     (data.tasks || []).map((t) => [t.stage, t.status]),
     data.script_version, data.storyboard_version,
+    data.character_asset_policy_version,
+    (data.character_asset_policy || {}).mode,
+    (data.character_asset_policy || {}).resolved_mode,
     Object.values((data.artifacts || {}).images || {}),
     Object.values((data.artifacts || {}).first || {}),
     Object.values((data.artifacts || {}).last || {}),
@@ -4044,6 +4050,18 @@ function castLookHtml(candidate) {
 function renderCastSelection(data, episodeId) {
   const selection = data.cast_selection || {};
   const characters = selection.characters || [];
+  const assetPolicy = data.character_asset_policy || {
+    mode: "auto", resolved_mode: "full", generate_sheets: true, reasons: [],
+  };
+  const assetMode = assetPolicy.mode || "auto";
+  const resolvedLabel = assetPolicy.resolved_mode === "simple"
+    ? "简化版（仅最终人物形象图）" : "完整版（每人增加 6 张扩展资产）";
+  const assetPolicyStatus = assetMode === "auto"
+    ? `自动判断结果：${resolvedLabel}${(assetPolicy.reasons || []).length
+      ? ` · ${assetPolicy.reasons.join("；")}` : ""}`
+    : (assetMode === "simple"
+      ? "已选择简化版：不生成四视图和任何面部、特征、妆容、服装类细节图"
+      : "已选择完整版：为每名非背景角色生成全部 6 类扩展资产");
   const policy = selection.candidate_policy
     || "主角5张；重要配角3张；非重要配角1张（非主要角色不超过3张）；背景路人不单独生成立绘";
   app.innerHTML = `<div class="canvas-view cast-select-view">
@@ -4052,8 +4070,18 @@ function renderCastSelection(data, episodeId) {
         <span>${esc(policy)}；有参考图时人物脸和发型是最高标准，职业角色必须穿工作服；人物候选统一使用纯背景，不得出现文字或场景。
         每名角色按重要度生成独立造型候选，不再只是换动作；
         请比较服装、发型、妆容和气质后各选1张作为最终立绘。
-        后续四视图、关键帧、首尾帧和其他图片 API 都会真实携带这张参考图，
+        后续关键帧、首尾帧和其他图片 API 都会真实携带这张参考图，
         视觉质检也会将成图与它逐人比对。</span></div>
+        <div class="cast-asset-policy">
+          <label for="cast-asset-mode"><b>人物扩展资产</b>
+            <select id="cast-asset-mode">
+              <option value="auto" ${assetMode === "auto" ? "selected" : ""}>自动判断（推荐）</option>
+              <option value="simple" ${assetMode === "simple" ? "selected" : ""}>简化版 · 只用人物形象图</option>
+              <option value="full" ${assetMode === "full" ? "selected" : ""}>完整版 · 四视图与细节图</option>
+            </select>
+          </label>
+          <span id="cast-asset-policy-status" class="dim" aria-live="polite">${esc(assetPolicyStatus)}</span>
+        </div>
       <div class="cast-actions">
         <button id="cast-regenerate" title="保留旧图并按角色重要度重新生成">↻ 按角色重要度重生成</button>
         <button class="primary" id="cast-continue" ${selection.passed ? "" : "disabled"}>
@@ -4143,6 +4171,32 @@ function renderCastSelection(data, episodeId) {
     };
   });
   const next = document.getElementById("cast-continue");
+  const assetModeSelect = document.getElementById("cast-asset-mode");
+  const assetModeStatus = document.getElementById("cast-asset-policy-status");
+  if (assetModeSelect) assetModeSelect.onchange = async () => {
+    const previous = assetMode;
+    assetModeSelect.disabled = true;
+    if (next) next.disabled = true;
+    assetModeStatus.textContent = "正在保存人物资产设置…";
+    try {
+      const result = await api("/api/character/assets-policy", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ episode_id: data.episode.id,
+          mode: assetModeSelect.value,
+          expected_version: Number(data.character_asset_policy_version || 0) }),
+      });
+      const resolved = (result.policy || {}).resolved_mode === "simple"
+        ? "简化版" : "完整版";
+      showToast(`人物资产模式已保存：${resolved}`, "ok");
+      await renderCanvasView(episodeId);
+    } catch (e) {
+      assetModeSelect.value = previous;
+      assetModeSelect.disabled = false;
+      assetModeStatus.textContent = `保存失败：${e.message}`;
+      if (next) next.disabled = !selection.passed;
+      showToast(e.message, "error");
+    }
+  };
   if (next && selection.passed) next.onclick = async () => {
     next.disabled = true; next.textContent = "已确认，继续生产中…";
     try {
@@ -4150,7 +4204,9 @@ function renderCastSelection(data, episodeId) {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ episode_id: data.episode.id }),
       });
-      showToast("人物已全部定版，开始生成资产套件和后续图片", "ok");
+      showToast(assetPolicy.generate_sheets
+        ? "人物已全部定版，开始生成完整人物资产套件和后续图片"
+        : "人物已全部定版，跳过四视图与细节图，开始生成后续图片", "ok");
       pollCanvas(episodeId);
     } catch (e) {
       showToast(e.message, "error");
