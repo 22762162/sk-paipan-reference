@@ -17,9 +17,9 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-from ..adapters.codex_image import GEN_DIRECTIVE as _GEN_DIRECTIVE
 from ..adapters.codex_image import SUBJECT_DIRECTIVE as _SUBJECT_DIRECTIVE
 from ..adapters.codex_image import _style_line as _api_style_line
+from ..adapters.codex_image import _space_line as _api_space_line
 from ..adapters.claude_script import (build_prompt, extract_json,
                                       validate_script, validate_storyboard)
 from ..errors import ProviderError
@@ -65,7 +65,7 @@ _IMG_MEDIA = {".png": "image/png", ".jpg": "image/jpeg",
 def _local_refs(payload):
     """本地参考图路径:风格基准图 + 人物设定图 + 用户参考图(去重存在的)。"""
     order = []
-    for key in ("style_ref", "chain_first_uri"):
+    for key in ("style_ref", "chain_first_uri", "scene_ref"):
         val = payload.get(key)
         if val:
             order.append(val)
@@ -266,7 +266,8 @@ class OpenAIImageProvider(Provider):
         """API 提示词补齐与 CLI 一致的语义约束;有参考图时点明"以所附
         图片为准",保证同一角色跨图一致。"""
         parts = [prompt, _api_style_line(payload),
-                 _SUBJECT_DIRECTIVE, _GEN_DIRECTIVE]
+                 _api_space_line(payload),
+                 _SUBJECT_DIRECTIVE]
         if refs:
             parts.append(
                 "已随请求附上参考图(第一张为全项目风格基准/上一镜衔接图,"
@@ -343,14 +344,25 @@ class OpenAIImageProvider(Provider):
             first = out_dir / f"shot_{shot_no:03d}.first.png"
             last = out_dir / f"shot_{shot_no:03d}.last.png"
             chain_first = payload.get("chain_first_uri", "")
+            first_source = "generated"
+            calls = 0
             if chain_first and Path(chain_first).exists():
                 # 帧链:首帧固定为上一镜尾帧,只生成尾帧(拼接连贯)
                 import shutil as _sh
                 _sh.copyfile(chain_first, first)
+                first_source = "previous_tail"
             else:
-                self._gen_image(
-                    f"{prompt}。首帧:动作起始瞬间,构图稳定", size,
-                    first, payload)
+                keyframe = Path(payload.get("image_uri", ""))
+                if (keyframe.exists() and keyframe.suffix.lower()
+                        in _IMG_MEDIA):
+                    import shutil as _sh
+                    _sh.copyfile(keyframe, first)
+                    first_source = "keyframe"
+                else:
+                    self._gen_image(
+                        f"{prompt}。首帧:动作起始瞬间,构图稳定", size,
+                        first, payload)
+                    calls += 1
             if cancel is not None and cancel():
                 from ..errors import ProduceCancelled
                 raise ProduceCancelled("已手动停止")
@@ -359,9 +371,12 @@ class OpenAIImageProvider(Provider):
                 f"{prompt}。尾帧:动作结束瞬间,与首帧同场景同角色、"
                 "人物服装道具一致",
                 size, last, {**payload, "chain_first_uri": str(first)})
+            calls += 1
             return ProviderResult(
-                provider=self.name, cost=self.cost_per_call * 2,
-                data={"first": str(first), "last": str(last)},
+                provider=self.name, cost=self.cost_per_call * calls,
+                data={"first": str(first), "last": str(last),
+                      "first_source": first_source,
+                      "generation_calls": calls},
                 uri=str(first), model=(self.conf.get("model")
                                        or self.DEFAULT_MODEL))
         if capability == "cover":

@@ -40,7 +40,7 @@ def test_five_dimension_preflight_and_delivery(tmp_path):
         assert profile["burn_subtitles"] is False
         assert preflight["passed"]
         assert [gate["id"] for gate in preflight["gates"]] == [
-            "continuity", "five_dimensions", "duration", "dialogue",
+            "continuity", "spatial", "five_dimensions", "duration", "dialogue",
             "performance", "camera", "people", "text", "frames",
             "audio", "profile"]
 
@@ -87,6 +87,9 @@ def test_five_dimension_preflight_and_delivery(tmp_path):
 
         payload = _episode_payload(app, episode["id"])
         assert payload["continuity"]
+        assert payload["blocking"]["validation"]["passed"]
+        assert payload["blocking"]["scenes"][0]["svg_url"].startswith(
+            "/artifacts/")
         assert payload["preflight"]["passed"]
         assert payload["content_review"]["passed"]
         assert payload["artifacts"]["review_board"]
