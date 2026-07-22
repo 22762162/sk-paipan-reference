@@ -287,8 +287,9 @@ class OpenAIImageProvider(Provider):
 
     DEFAULT_ENDPOINT = "https://api.openai.com"
     DEFAULT_MODEL = "gpt-image-2"
-    QUALITY_MAP = {"lite": "low", "medium": "medium", "high": "high"}
-    HIGH_QUALITY_TASKS = {"final", "complex_text"}
+    QUALITY_MAP = {"low": "low", "medium": "medium", "high": "high"}
+    QUALITY_ALIASES = {"lite": "low"}
+    HIGH_QUALITY_TASKS = {"important", "final", "complex_text"}
 
     def available(self, capability):
         ok, reason = super().available(capability)
@@ -326,7 +327,8 @@ class OpenAIImageProvider(Provider):
         资源：只允许 final/complex_text；batch/important 即使误传
         high 也钳制为 medium，防止批量或人物候选图误消耗高档。
         """
-        quality = str(payload.get("image_quality") or "medium")
+        quality = str(payload.get("image_quality") or "medium").lower()
+        quality = self.QUALITY_ALIASES.get(quality, quality)
         if quality not in self.QUALITY_MAP:
             allowed = "|".join(self.QUALITY_MAP)
             raise ProviderError(
@@ -339,7 +341,9 @@ class OpenAIImageProvider(Provider):
     def _call_cost(self, payload):
         quality, _api_quality = self._quality(payload)
         costs = self.conf.get("cost_by_quality") or {}
-        return float(costs.get(quality, self.cost_per_call))
+        return float(costs.get(
+            quality, costs.get("lite") if quality == "low"
+            else self.cost_per_call))
 
     def _audit_data(self, data, payload, unit_cost):
         quality, _api_quality = self._quality(payload)
@@ -542,11 +546,13 @@ class SeedreamImageProvider(OpenAIImageProvider):
         }.get(payload.get("aspect", "9:16"), "2048x2048")
 
     def _audit_data(self, data, payload, unit_cost):
+        quality = str(payload.get("image_quality") or "medium").lower()
+        quality = self.QUALITY_ALIASES.get(quality, quality)
         return {
             **data,
             "model": self.conf.get("model") or self.DEFAULT_MODEL,
             "image_task_class": payload.get("image_task_class", "legacy"),
-            "image_quality": "lite",
+            "image_quality": quality,
             "unit_cost": unit_cost,
         }
 
@@ -773,6 +779,12 @@ class ArkVideoProvider(Provider):
         headers = {"Authorization": f"Bearer {self.conf['api_key']}"}
         duration = int(payload.get("duration")
                        or self.conf.get("duration", 8))
+        video_quality = str(payload.get("video_quality") or "medium")
+        video_resolution = str(payload.get(
+            "video_resolution") or self.conf.get("video_resolution", "720p"))
+        if video_resolution.lower() not in ("480p", "720p", "1080p"):
+            raise ProviderError(
+                "Seedance video_resolution 只允许 480p/720p/1080p")
         prompt = payload.get("prompt", "")
         dialogue = payload.get("dialogue") or {}
         if self.conf.get("audio_in_video", True) and dialogue.get("dialogue"):
@@ -783,7 +795,7 @@ class ArkVideoProvider(Provider):
             "type": "text",
             "text": f"{prompt} "
                     f"--duration {duration} --resolution "
-                    f"{self.conf.get('video_resolution', '720p')}",
+                    f"{video_resolution}",
         }]
         for key, role in (("first", "first_frame"), ("last", "last_frame")):
             if payload.get(key):
@@ -831,5 +843,7 @@ class ArkVideoProvider(Provider):
                   self.conf.get("timeout", 1800))
         return ProviderResult(
             provider=self.name, cost=self.cost_per_call,
-            data={"task_id": task_id, "duration": duration},
+            data={"task_id": task_id, "duration": duration,
+                  "video_quality": video_quality,
+                  "video_resolution": video_resolution},
             uri=str(dest))

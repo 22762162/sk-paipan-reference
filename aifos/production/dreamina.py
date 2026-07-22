@@ -74,6 +74,12 @@ class DreaminaProvider(Provider):
                        f"(中文自然人声,口型对应):「{dialogue['dialogue']}」")
         requested_duration = float(payload.get(
             "duration", self.conf.get("duration", 8)))
+        video_quality = str(payload.get("video_quality") or "medium")
+        video_resolution = str(payload.get(
+            "video_resolution") or self.conf.get("video_resolution", "720p"))
+        if video_resolution.lower() not in ("480p", "720p", "1080p"):
+            raise ProviderError(
+                "Seedance video_resolution 只允许 480p/720p/1080p")
         # 即梦 CLI 接受整秒；0.5 秒分镜用常规四舍五入，避免 Python
         # bankers rounding 把 2.5 秒意外压成 2 秒。
         duration = max(1, min(15, int(requested_duration + 0.5)))
@@ -83,7 +89,7 @@ class DreaminaProvider(Provider):
             f"--last={last}",
             f"--prompt={prompt}",
             f"--duration={duration}",
-            f"--video_resolution={self.conf.get('video_resolution', '720p')}",
+            f"--video_resolution={video_resolution}",
             f"--model_version={model_version}",
             f"--poll={int(self.conf.get('poll', 30))}",
         ]
@@ -112,6 +118,8 @@ class DreaminaProvider(Provider):
                 "shot_no": shot_no,
                 "duration": duration,
                 "model_version": model_version,
+                "video_quality": video_quality,
+                "video_resolution": video_resolution,
                 "voice": payload.get("voice", "jimeng_builtin"),
                 "lip_sync": bool(payload.get("lip_sync", True)),
                 "forbid_subtitles": bool(payload.get("forbid_subtitles", True)),

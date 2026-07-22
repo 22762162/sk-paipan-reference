@@ -98,7 +98,8 @@ DEFAULTS = {
             "reference_images": True,
             "cost_per_call": 0.28,
             "cost_by_quality": {
-                "lite": 0.07, "medium": 0.28, "high": 1.12,
+                "low": 0.07, "lite": 0.07,
+                "medium": 0.28, "high": 1.12,
             },
             "timeout": 300,
         },

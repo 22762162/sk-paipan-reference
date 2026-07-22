@@ -37,6 +37,7 @@ from ..app import App
 from ..updater import (check_and_update, current_build, repo_root,
                        restart_process, start_auto_updater)
 from ..errors import AifosError
+from ..quality_policy import normalize_quality, normalize_quality_policy
 from ..smart_input import resolve_produce_target
 from ..standard_center import StandardConflictError, StandardValidationError
 
@@ -349,6 +350,8 @@ def _episode_payload(app, episode_id):
         episode_id, "content_review")
     production_standard, production_standard_v = app.projects.latest_document(
         episode_id, "production_standard")
+    quality_policy, quality_policy_v = app.projects.latest_document(
+        episode_id, "quality_policy")
     cast_selection = app.director.character_selection_status(
         project["id"], (script or {}).get("characters", []))
     for character in cast_selection.get("characters", []):
@@ -401,6 +404,8 @@ def _episode_payload(app, episode_id):
         "production_profile": (storyboard or {}).get("profile", {}),
         "production_standard": production_standard,
         "production_standard_version": production_standard_v,
+        "quality_policy": normalize_quality_policy(quality_policy),
+        "quality_policy_version": quality_policy_v,
         "cast_selection": cast_selection,
         "qc_report": qc_report,
         "render_plan": render_plan,
@@ -945,6 +950,18 @@ def make_handler(workspace, jobs):
             if found is None:
                 return self._error(404, "剧集不存在")
             title, number, status, project_id, found_episode_id = found
+            video_quality = body.get("video_quality")
+            if video_quality is not None:
+                try:
+                    video_quality = normalize_quality(
+                        video_quality, allow_auto=True,
+                        field="video_quality")
+                    self._with_app(
+                        lambda app: app.director.update_quality_policy(
+                            found_episode_id,
+                            video_default=video_quality))
+                except AifosError as exc:
+                    return self._error(400, str(exc))
             if status == "awaiting_cast":
                 selection = self._with_app(
                     lambda app: app.director.character_selection_status(
@@ -1045,14 +1062,21 @@ def make_handler(workspace, jobs):
             title, number = found
             feedback = (body.get("feedback") or "").strip()
             prompt = (body.get("prompt") or "").strip()
+            quality = body.get("quality")
+            if quality is not None:
+                try:
+                    quality = normalize_quality(
+                        quality, allow_auto=True, field="image_quality")
+                except AifosError as exc:
+                    return self._error(400, str(exc))
             job_id = jobs.start_task(
                 title, number,
                 lambda app, run_id: app.director.regen_image(
                     title, number, target, feedback=feedback,
-                    prompt_override=prompt),
+                    prompt_override=prompt, quality_override=quality),
                 action="regen_image",
                 request={"target": target, "feedback": feedback,
-                         "prompt": prompt})
+                         "prompt": prompt, "quality": quality})
             return self._json({"job_id": job_id}, status=202)
 
         def _settings_update(self):
@@ -1277,12 +1301,19 @@ def make_handler(workspace, jobs):
             title, number = found
             item_ids = body.get("item_ids") or []
             only_failed = bool(body.get("only_failed"))
+            quality = body.get("quality")
+            if quality is not None:
+                try:
+                    quality = normalize_quality(
+                        quality, allow_auto=True, field="image_quality")
+                except AifosError as exc:
+                    return self._error(400, str(exc))
             job_id = jobs.start_task(
                 title, number,
                 lambda app, run_id: app.director.redo_items(
                     title, number, item_ids=item_ids,
-                    only_failed=only_failed),
-                action="redo_items")
+                    only_failed=only_failed, quality_override=quality),
+                action="redo_items", request={"quality": quality})
             return self._json({"job_id": job_id}, status=202)
 
         def _redo_mock(self):
