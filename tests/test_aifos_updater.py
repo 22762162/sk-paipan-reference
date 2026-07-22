@@ -58,6 +58,29 @@ def test_updates_when_behind():
     assert ("pull", "--ff-only", "origin", "main") in calls
 
 
+def test_local_ahead_never_restarts():
+    """本地有未推送提交(领先远端):head != remote,但绝不能 pull/重启,
+    否则服务会每轮误判“有新版本”而反复自愈重启。"""
+    calls = []
+
+    def run(*args):
+        calls.append(args)
+        table = {
+            ("status", "--porcelain", "--untracked-files=no"): _R(""),
+            ("rev-parse", "--abbrev-ref", "HEAD"): _R("feat\n"),
+            ("rev-parse", "HEAD"): _R("localahead\n"),
+            ("rev-parse", "origin/feat"): _R("behind\n"),
+            # 本地不是远端的祖先(本地领先)→ 非零退出码
+            ("merge-base", "--is-ancestor", "HEAD", "origin/feat"):
+                _R(returncode=1),
+        }
+        return table.get(args, _R())
+
+    status, _ = check_and_update(Path("/x"), runner=run)
+    assert status == "up_to_date"
+    assert ("pull", "--ff-only", "origin", "feat") not in calls
+
+
 def test_fetch_failure_is_safe():
     status, detail = check_and_update(Path("/x"), runner=_runner({
         ("status", "--porcelain", "--untracked-files=no"): _R(""),

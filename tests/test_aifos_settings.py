@@ -295,3 +295,57 @@ def test_config_load_migrates_oldest_say_type(tmp_path):
     assert migrated.get("routing", "voice") == ["doubao_tts", "mock"]
     # 链清空时落回默认,产线不断链
     assert migrated.get("routing", "edit") == ["jianying", "mock"]
+
+
+def _fake_bin(directory, name):
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def test_test_provider_diagnoses_disabled_cli(tmp_path, monkeypatch):
+    """未启用的 CLI 也要能诊断:命令就绪则报通过并标记 disabled,
+    不改配置文件——前端据此顺手打开「启用」,而不是卡在“未启用”。"""
+    monkeypatch.setenv("PATH", str(tmp_path / "bin"))
+    claude = _fake_bin(tmp_path / "bin", "claude")
+    app = App(tmp_path / "ws")
+    try:
+        update_provider(app.workspace.config_path, "claude", {
+            "command": ["python3", "-m", "aifos.adapters.claude_script",
+                        "--claude", str(claude)]})
+        app2 = App(tmp_path / "ws")
+        try:
+            report = check_provider(app2, "claude")
+            assert report["ok"] and report["disabled"]
+            assert all(r["ok"] for r in report["results"])
+            # 诊断只在内存里临时启用,不落盘
+            conf = Config.load(app2.workspace.config_path)
+            assert conf.get("providers", "claude", "enabled") in (False, None)
+        finally:
+            app2.close()
+    finally:
+        app.close()
+
+
+def test_test_provider_reports_missing_bridge_binary(tmp_path, monkeypatch):
+    """桥接命令(python3 -m …claude_script --claude X)诊断要核验真正的 X,
+    而不是只查到启动器 python3 就误报就绪。"""
+    monkeypatch.setenv("PATH", str(tmp_path / "bin"))
+    _fake_bin(tmp_path / "bin", "python3")   # 只有启动器,没有 claude
+    app = App(tmp_path / "ws")
+    try:
+        update_provider(app.workspace.config_path, "claude", {
+            "command": ["python3", "-m", "aifos.adapters.claude_script",
+                        "--claude", "/no/such/claude"]})
+        app2 = App(tmp_path / "ws")
+        try:
+            report = check_provider(app2, "claude")
+            assert report["ok"] is False and report["disabled"]
+            assert any("/no/such/claude" in r["reason"]
+                       for r in report["results"])
+        finally:
+            app2.close()
+    finally:
+        app.close()

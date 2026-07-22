@@ -278,27 +278,38 @@ def set_defaults(config_path, mapping):
 
 
 def test_provider(app, name):
-    """连通性测试:先查配置可用性,配好的 API Provider 再发真实请求。"""
+    """连通性诊断:按“已启用”真实探测命令/密钥是否就绪。
+
+    这样即使「启用」开关还没打开,也能告诉你命令(如 claude CLI)能不能用,
+    而不是只回一句“未启用”——测通了再由前端顺手打开开关即可。诊断只临时
+    改内存里的 enabled,函数结束立即还原,不写配置文件。
+    """
     provider = app.router.providers.get(name)
     if provider is None:
         raise AifosError(f"未知 Provider: {name}")
-    results = [{"capability": cap, "ok": bool(ok), "reason": reason or "就绪"}
-               for cap in sorted(provider.capabilities)
-               for ok, reason in [provider.available(cap)]]
-    ok_overall = all(r["ok"] for r in results)
-    extra = None
-    if provider.enabled and ok_overall and hasattr(provider, "credit"):
-        try:
-            extra = f"实时余额: {provider.credit()}"
-        except Exception as exc:
-            extra = f"✗ 余额查询失败: {exc}"
-            ok_overall = False
-    if ok_overall and hasattr(provider, "ping"):
-        try:
-            ping_ok, detail = provider.ping()
-        except Exception as exc:
-            ping_ok, detail = False, str(exc)
-        extra = ("✓ " if ping_ok else "✗ ") + detail
-        ok_overall = ok_overall and ping_ok
-    return {"provider": name, "ok": ok_overall,
-            "results": results, "extra": extra}
+    was_enabled = provider.enabled
+    provider.enabled = True
+    try:
+        results = [{"capability": cap, "ok": bool(ok),
+                    "reason": reason or "就绪"}
+                   for cap in sorted(provider.capabilities)
+                   for ok, reason in [provider.available(cap)]]
+        ok_overall = all(r["ok"] for r in results)
+        extra = None
+        if ok_overall and hasattr(provider, "credit"):
+            try:
+                extra = f"实时余额: {provider.credit()}"
+            except Exception as exc:
+                extra = f"✗ 余额查询失败: {exc}"
+                ok_overall = False
+        if ok_overall and hasattr(provider, "ping"):
+            try:
+                ping_ok, detail = provider.ping()
+            except Exception as exc:
+                ping_ok, detail = False, str(exc)
+            extra = ("✓ " if ping_ok else "✗ ") + detail
+            ok_overall = ok_overall and ping_ok
+    finally:
+        provider.enabled = was_enabled
+    return {"provider": name, "ok": ok_overall, "results": results,
+            "extra": extra, "disabled": not was_enabled}

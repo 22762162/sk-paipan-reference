@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import time
 import urllib.request
+from pathlib import Path
 
 from ..errors import ProduceCancelled, ProviderError, ProviderUnavailable
 from .base import Provider, ProviderResult
@@ -67,6 +68,20 @@ def run_interruptible(name, command, input_text, timeout, cancel=None,
 class CliProvider(Provider):
     """通过子进程调用外部 CLI(即梦 CLI、Codex、剪映等)。"""
 
+    @staticmethod
+    def _real_binary(command):
+        """桥接命令真正调用的可执行文件:``--claude/--codex/--say`` 等旗标
+        后面的值,否则命令本体。避免只查到启动器 python3 就误报“就绪”。"""
+        for flag in ("--claude", "--codex", "--say", "--dreamina",
+                     "--jianying"):
+            if flag in command:
+                index = command.index(flag)
+                if index + 1 < len(command):
+                    return command[index + 1]
+        if "aifos.adapters.say_voice" in command:
+            return "say"
+        return command[0]
+
     def available(self, capability):
         ok, reason = super().available(capability)
         if not ok:
@@ -74,8 +89,9 @@ class CliProvider(Provider):
         command = self.conf.get("command") or []
         if not command:
             return False, "未配置 command"
-        if shutil.which(command[0]) is None:
-            return False, f"命令不存在: {command[0]}"
+        binary = self._real_binary(command)
+        if shutil.which(binary) is None and not Path(binary).exists():
+            return False, f"命令不存在: {binary}"
         return True, ""
 
     def generate(self, capability, payload, out_dir, cancel=None):
