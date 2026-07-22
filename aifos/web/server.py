@@ -1914,22 +1914,55 @@ def make_handler(workspace, jobs):
             body = self._read_body()
             if body is None:
                 return self._error(400, "请求体不是合法 JSON")
-            try:
-                run_id = int(body.get("run_id"))
-            except (TypeError, ValueError):
-                return self._error(400, "缺少合法 run_id")
-            run = self._with_app(lambda app: app.history.get(run_id))
-            if run is None:
-                return self._error(404, "历史记录不存在")
-            if run.get("episode_id") is not None and jobs.running_for(
-                    run.get("current_project") or run["project_title"],
-                    run["episode_number"]):
+            has_run = body.get("run_id") is not None
+            has_episode = body.get("episode_id") is not None
+            if has_run == has_episode:
+                return self._error(400, "请且仅请提供 run_id 或 episode_id")
+            delete_assets = body.get("delete_assets") is True
+
+            if has_run:
+                try:
+                    run_id = int(body["run_id"])
+                except (TypeError, ValueError):
+                    return self._error(400, "缺少合法 run_id")
+                run = self._with_app(lambda app: app.history.get(run_id))
+                if run is None:
+                    return self._error(404, "历史记录不存在")
+                title = run.get("current_project") or run["project_title"]
+                number = run["episode_number"]
+
+                def delete_target(app):
+                    return app.history.delete_work(
+                        run_id, delete_assets=delete_assets)
+            else:
+                try:
+                    episode_id = int(body["episode_id"])
+                except (TypeError, ValueError):
+                    return self._error(400, "缺少合法 episode_id")
+
+                def lookup(app):
+                    episode = app.projects.get_episode(episode_id)
+                    if episode is None:
+                        return None
+                    project = app.db.query_one(
+                        "SELECT title FROM projects WHERE id=?",
+                        (episode["project_id"],))
+                    return project["title"], episode["number"]
+
+                target = self._with_app(lookup)
+                if target is None:
+                    return self._error(404, "剧集不存在")
+                title, number = target
+
+                def delete_target(app):
+                    return app.history.delete_episode_work(
+                        episode_id, delete_assets=delete_assets)
+
+            if jobs.running_for(title, number):
                 return self._error(409, "本集仍在生成，请先安全停止后再删除")
-            result = self._with_app(
-                lambda app: app.history.delete_work(
-                    run_id, delete_assets=body.get("delete_assets") is True))
+            result = self._with_app(delete_target)
             if result is None:
-                return self._error(404, "历史记录不存在")
+                return self._error(404, "作品不存在或已删除")
             return self._json(result)
 
         def _video_references(self):

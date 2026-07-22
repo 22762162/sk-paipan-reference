@@ -86,6 +86,9 @@ def test_index_and_static(server):
     assert b"/api/character/regenerate" in app_js
     assert b"/api/asset/delete" in app_js
     assert b"/api/history/delete" in app_js
+    assert b"history-delete-row" in app_js
+    assert b"episode-delete-work" in app_js
+    assert "删除作品".encode() in app_js
     assert "保留资产中心图片（推荐）".encode() in app_js
     assert "资产分类".encode() in app_js
     assert "查看提示词".encode() in app_js
@@ -235,6 +238,32 @@ def test_history_delete_api_can_keep_asset_center_images(server):
         assert app3.projects.get_episode(episode["id"]) is None
         assert app3.assets.get(asset["id"])["uri"] == str(path)
         assert path.exists()
+    finally:
+        app3.close()
+
+
+def test_history_delete_api_accepts_episode_from_overview(server):
+    app2 = App(server["workspace"])
+    try:
+        project, _ = app2.projects.get_or_create_project("总览删除接口")
+        episode, _ = app2.projects.get_or_create_episode(project["id"], 2)
+        app2.projects.save_document(
+            episode["id"], "script", {"scenes": [{"location": "办公室"}]})
+    finally:
+        app2.close()
+
+    status, deleted = _json_request(
+        server["port"], "POST", "/api/history/delete",
+        {"episode_id": episode["id"], "delete_assets": False})
+
+    assert status == 200
+    assert deleted["episode_deleted"] is True
+    assert deleted["episode_number"] == 2
+    assert deleted["documents_deleted"] == 1
+    app3 = App(server["workspace"])
+    try:
+        assert app3.projects.get_episode(episode["id"]) is None
+        assert app3.projects.get_project("总览删除接口") is not None
     finally:
         app3.close()
 

@@ -263,8 +263,8 @@ function historyTable(items) {
   if (!items.length) return `<div class="history-empty">
     <strong>没有符合条件的记录</strong><span>调整筛选条件，或开始一次新的制作。</span></div>`;
   return `<div class="history-table-wrap"><table class="history-table">
-    <thead><tr><th>开始时间</th><th>作品 / 剧集</th><th>操作</th><th>结果</th>
-      <th>最后阶段</th><th class="num">耗时</th><th class="num">本次成本</th></tr></thead>
+    <thead><tr><th>开始时间</th><th>作品 / 剧集</th><th>生产操作</th><th>结果</th>
+      <th>最后阶段</th><th class="num">耗时</th><th class="num">本次成本</th><th>管理</th></tr></thead>
     <tbody>${items.map((run) => `<tr>
       <td><a class="history-time" href="#/history/${run.id}">${dateTime(run.started_at)}</a>
         <small>#${run.id}${run.source === "migration" ? " · 旧记录" : ""}</small></td>
@@ -276,7 +276,21 @@ function historyTable(items) {
         <small>${run.stage_count} 个阶段 · ${(run.providers || []).map(esc).join(" / ") || "无 Provider"}</small></td>
       <td class="num">${durationText(run.duration_seconds)}</td>
       <td class="num">${fmt(run.cost)}</td>
+      <td><button class="danger history-delete-row" data-run-id="${run.id}"
+        title="删除这集作品，可选择是否保留资产中心图片">删除作品</button></td>
     </tr>`).join("")}</tbody></table></div>`;
+}
+
+function bindHistoryDeleteButtons(items) {
+  const runs = new Map(items.map((run) => [String(run.id), run]));
+  document.querySelectorAll(".history-delete-row").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const run = runs.get(button.dataset.runId);
+      if (run) showHistoryDeleteDialog(
+        { ...run, run_id: run.id }, () => renderHistory());
+    });
+  });
 }
 
 async function renderHistory(runId = null) {
@@ -323,7 +337,9 @@ async function renderHistory(runId = null) {
         (!action || run.action === action);
     });
     document.getElementById("history-results").innerHTML = historyTable(filtered);
+    bindHistoryDeleteButtons(filtered);
   };
+  bindHistoryDeleteButtons(data.items);
   document.getElementById("history-query").addEventListener("input", applyFilters);
   document.getElementById("history-status").addEventListener("change", applyFilters);
   document.getElementById("history-action").addEventListener("change", applyFilters);
@@ -378,16 +394,17 @@ async function renderHistoryDetail(runId) {
     </section>
   </div>`;
   document.getElementById("history-delete-work").onclick = () =>
-    showHistoryDeleteDialog(run);
+    showHistoryDeleteDialog({ ...run, run_id: run.id });
 }
 
-function showHistoryDeleteDialog(run) {
-  const project = run.current_project || run.project_title;
+function showHistoryDeleteDialog(target, onDeleted = null) {
+  const project = target.current_project || target.project_title || target.project;
+  const episodeNumber = target.episode_number ?? target.number;
   const overlay = document.createElement("div");
   overlay.className = "script-overlay history-delete-overlay";
   overlay.innerHTML = `<div class="history-delete-dialog">
     <p class="eyebrow">DELETE WORK</p>
-    <h2>删除《${esc(project)}》第 ${run.episode_number} 集？</h2>
+    <h2>删除《${esc(project)}》第 ${episodeNumber} 集？</h2>
     <p class="history-delete-warning">这会删除本集、全部生产运行记录、任务和文档。
       项目本身保留，已生成的物理文件不会被直接抹掉。</p>
     <fieldset class="history-delete-options">
@@ -411,15 +428,19 @@ function showHistoryDeleteDialog(run) {
     button.disabled = true;
     button.textContent = "正在删除…";
     try {
+      const request = target.run_id != null
+        ? { run_id: target.run_id } : { episode_id: target.episode_id };
+      request.delete_assets = deleteAssets;
       const result = await api("/api/history/delete", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ run_id: run.id, delete_assets: deleteAssets }),
+        body: JSON.stringify(request),
       });
       close();
       showToast(deleteAssets
         ? `作品已删除，${result.assets_soft_deleted || 0} 张关联图片已从资产中心移除`
         : "作品已删除，资产中心图片已保留", "ok");
-      location.hash = "#/history";
+      if (onDeleted) await onDeleted(result);
+      else location.hash = "#/history";
     } catch (e) {
       showToast(e.message, "error");
       button.disabled = false;
@@ -907,23 +928,47 @@ function tilesHtml(data) {
 }
 
 function episodesPanelHtml(data) {
+  const runningEpisodes = new Set(data.jobs
+    .filter((job) => job.status === "running")
+    .map((job) => `${job.title}\u0000${job.episode}`));
   return `
       <h2>剧集 · 点击进入分镜画布</h2>
       ${data.episodes.length ? `
-      <table><thead><tr><th>项目</th><th>集</th><th>状态</th><th class="num">质检</th><th class="num">成本</th></tr></thead>
-      <tbody>${data.episodes.map((e) => `
+      <table><thead><tr><th>项目</th><th>集</th><th>状态</th><th class="num">质检</th><th class="num">成本</th><th>管理</th></tr></thead>
+      <tbody>${data.episodes.map((e) => {
+        const running = runningEpisodes.has(`${e.project}\u0000${e.number}`);
+        return `
         <tr class="clickable" data-ep="${e.id}">
           <td>${esc(e.project)}</td><td>第${e.number}集</td>
           <td>${chip(e.status)}</td>
           <td class="num">${e.qc_score == null ? "-" : fmt(e.qc_score, 0)}</td>
           <td class="num">${fmt(e.cost)}</td>
-        </tr>`).join("")}</tbody></table>`
+          <td><button class="danger episode-delete-work" data-episode-id="${e.id}"
+            ${running ? "disabled" : ""} title="${running
+              ? "本集正在生成，请先安全停止" : "删除本集作品，可选择是否保留资产中心图片"}">删除</button></td>
+        </tr>`;
+      }).join("")}</tbody></table>`
       : `<div class="empty">暂无剧集,输入一句话开始制作。</div>`}`;
 }
 
-function bindEpisodeRows() {
-  app.querySelectorAll("tr.clickable").forEach((tr) =>
-    tr.addEventListener("click", () => { location.hash = `#/episode/${tr.dataset.ep}`; }));
+function bindEpisodeRows(data) {
+  app.querySelectorAll("#episodes-panel tr.clickable").forEach((tr) =>
+    tr.addEventListener("click", (event) => {
+      if (event.target.closest("button")) return;
+      location.hash = `#/episode/${tr.dataset.ep}`;
+    }));
+  const episodes = new Map(data.episodes.map((episode) =>
+    [String(episode.id), episode]));
+  app.querySelectorAll("#episodes-panel .episode-delete-work").forEach((button) =>
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const episode = episodes.get(button.dataset.episodeId);
+      if (episode) showHistoryDeleteDialog({
+        episode_id: episode.id,
+        project: episode.project,
+        episode_number: episode.number,
+      }, () => renderDashboard());
+    }));
 }
 
 function updateTopbar(data) {
@@ -952,7 +997,7 @@ function updateDashboard(data) {
   const panel = document.getElementById("episodes-panel");
   if (panel) {
     panel.innerHTML = episodesPanelHtml(data);
-    bindEpisodeRows();
+    bindEpisodeRows(data);
   }
 }
 
@@ -1189,7 +1234,7 @@ async function renderDashboard() {
   });
   renderProgressBanner(data);
   bindSeriesBatches();
-  bindEpisodeRows();
+  bindEpisodeRows(data);
   app.querySelectorAll(".proj-rename").forEach((btn) =>
     btn.addEventListener("click", () =>
       renameProject(btn.dataset.title, renderDashboard)));

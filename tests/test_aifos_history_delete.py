@@ -43,6 +43,29 @@ def test_delete_work_keeps_asset_center_images_by_default(tmp_path):
         app.close()
 
 
+def test_delete_episode_work_supports_overview_items_without_history(tmp_path):
+    app = App(tmp_path / "ws")
+    try:
+        project, _ = app.projects.get_or_create_project("总览直接删除")
+        episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+        app.projects.save_document(episode["id"], "script", {"scenes": []})
+        asset, path = _image(
+            app, project["id"], "image", "e001_shot001", "overview.png")
+
+        result = app.history.delete_episode_work(
+            episode["id"], delete_assets=False)
+
+        assert result["episode_deleted"] is True
+        assert result["runs_deleted"] == 0
+        assert result["documents_deleted"] == 1
+        assert app.projects.get_episode(episode["id"]) is None
+        assert app.assets.get(asset["id"])["uri"] == str(path)
+        assert path.exists()
+        assert app.projects.get_project("总览直接删除") is not None
+    finally:
+        app.close()
+
+
 def test_delete_one_episode_only_soft_deletes_its_scoped_images(tmp_path):
     app = App(tmp_path / "ws")
     try:

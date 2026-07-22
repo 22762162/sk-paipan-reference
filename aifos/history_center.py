@@ -343,10 +343,29 @@ class HistoryCenter:
                 "project_retained": True,
             }
 
-        episode_id = int(run["episode_id"])
-        project_id = int(run["project_id"])
-        episode_number = int(run["episode_number"])
-        project_title = run["current_project"] or run["project_title"]
+        return self._delete_episode_target(
+            int(run["episode_id"]), int(run["project_id"]),
+            int(run["episode_number"]),
+            run["current_project"] or run["project_title"],
+            delete_assets=delete_assets)
+
+    def delete_episode_work(self, episode_id, delete_assets=False):
+        """从生产总览直接删除整集作品，不要求该集已有历史运行。"""
+        episode = self.db.query_one(
+            "SELECT e.id, e.project_id, e.number, p.title AS project_title "
+            "FROM episodes e JOIN projects p ON p.id=e.project_id "
+            "WHERE e.id=?", (int(episode_id),))
+        if episode is None:
+            return None
+        return self._delete_episode_target(
+            int(episode["id"]), int(episode["project_id"]),
+            int(episode["number"]), episode["project_title"],
+            delete_assets=delete_assets)
+
+    def _delete_episode_target(self, episode_id, project_id,
+                               episode_number, project_title,
+                               delete_assets=False):
+        """执行整集清理；所有入口共用这一套资产保护和统计规则。"""
         prefix = f"e{episode_number:03d}"
         counts = {
             "runs": self.db.query_one(
