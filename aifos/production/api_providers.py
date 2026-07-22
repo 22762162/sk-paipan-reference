@@ -17,6 +17,9 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+from ..adapters.codex_image import GEN_DIRECTIVE as _GEN_DIRECTIVE
+from ..adapters.codex_image import SUBJECT_DIRECTIVE as _SUBJECT_DIRECTIVE
+from ..adapters.codex_image import _style_line as _api_style_line
 from ..adapters.claude_script import (build_prompt, extract_json,
                                       validate_script, validate_storyboard)
 from ..errors import ProviderError
@@ -53,6 +56,66 @@ def _download(name, url, dest, timeout=600):
             dest.write_bytes(resp.read())
     except Exception as exc:
         raise ProviderError(f"{name} 下载产物失败: {exc}") from exc
+
+
+_IMG_MEDIA = {".png": "image/png", ".jpg": "image/jpeg",
+             ".jpeg": "image/jpeg", ".webp": "image/webp"}
+
+
+def _local_refs(payload):
+    """本地参考图路径:风格基准图 + 人物设定图 + 用户参考图(去重存在的)。"""
+    order = []
+    for key in ("style_ref", "chain_first_uri"):
+        val = payload.get(key)
+        if val:
+            order.append(val)
+    for key in ("character_refs", "reference_images"):
+        order.extend(payload.get(key) or [])
+    seen, refs = set(), []
+    for uri in order:
+        if not uri or uri in seen:
+            continue
+        seen.add(uri)
+        path = Path(uri)
+        if path.exists() and path.suffix.lower() in _IMG_MEDIA:
+            refs.append(path)
+    return refs[:4]   # gpt-image edits 上限,取最关键的几张
+
+
+def _multipart_post(name, url, headers, fields, files, timeout):
+    """multipart/form-data POST(stdlib);files=[(field, Path)]。"""
+    boundary = "----aifos" + uuid.uuid4().hex
+    body = bytearray()
+    for key, value in fields.items():
+        body += (f"--{boundary}\r\n"
+                 f'Content-Disposition: form-data; name="{key}"\r\n\r\n'
+                 f"{value}\r\n").encode("utf-8")
+    for field, path in files:
+        media = _IMG_MEDIA.get(path.suffix.lower(), "image/png")
+        body += (f"--{boundary}\r\n"
+                 f'Content-Disposition: form-data; name="{field}"; '
+                 f'filename="{path.name}"\r\n'
+                 f"Content-Type: {media}\r\n\r\n").encode("utf-8")
+        body += path.read_bytes()
+        body += b"\r\n"
+    body += f"--{boundary}--\r\n".encode("utf-8")
+    request = urllib.request.Request(
+        url, data=bytes(body), method="POST",
+        headers={**headers,
+                 "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            pass
+        raise ProviderError(
+            f"{name} API HTTP {exc.code}: {detail or exc.reason}") from exc
+    except Exception as exc:
+        raise ProviderError(f"{name} API 调用失败: {exc}") from exc
 
 
 def _safe_name(value):
@@ -199,18 +262,43 @@ class OpenAIImageProvider(Provider):
             return "1024x1536"
         return "1024x1024"
 
-    def _gen_image(self, prompt, size, dest):
+    def _semantic_prompt(self, prompt, payload, refs):
+        """API 提示词补齐与 CLI 一致的语义约束;有参考图时点明"以所附
+        图片为准",保证同一角色跨图一致。"""
+        parts = [prompt, _api_style_line(payload),
+                 _SUBJECT_DIRECTIVE, _GEN_DIRECTIVE]
+        if refs:
+            parts.append(
+                "已随请求附上参考图(第一张为全项目风格基准/上一镜衔接图,"
+                "其余为该角色的人物设定图与用户参考图):画风、线条、上色、"
+                "光影,以及人物的脸型、发型、发色、服装、配色和标志特征"
+                "必须与参考图完全一致,是同一个人/同一实体,禁止漂移。")
+        return "".join(p for p in parts if p)
+
+    def _gen_image(self, prompt, size, dest, payload=None):
         endpoint = (self.conf.get("endpoint")
                     or self.DEFAULT_ENDPOINT).rstrip("/")
         timeout = self.conf.get("timeout", 300)
-        reply = _request_json(
-            self.name, f"{endpoint}/v1/images/generations",
-            headers={"Authorization": f"Bearer {self.conf['api_key']}"},
-            body={
-                "model": self.conf.get("model") or self.DEFAULT_MODEL,
-                "prompt": prompt, "n": 1, "size": size,
-            },
-            timeout=timeout)
+        model = self.conf.get("model") or self.DEFAULT_MODEL
+        refs = _local_refs(payload or {})
+        full_prompt = self._semantic_prompt(prompt, payload or {}, refs)
+        if refs:
+            # 有参考图 → images/edits 多图输入(真正把参考图喂给模型),
+            # 与 CLI 用参考图一致
+            reply = _multipart_post(
+                self.name, f"{endpoint}/v1/images/edits",
+                headers={"Authorization": f"Bearer {self.conf['api_key']}"},
+                fields={"model": model, "prompt": full_prompt[:32000],
+                        "size": size, "n": "1"},
+                files=[("image[]", path) for path in refs],
+                timeout=timeout)
+        else:
+            reply = _request_json(
+                self.name, f"{endpoint}/v1/images/generations",
+                headers={"Authorization": f"Bearer {self.conf['api_key']}"},
+                body={"model": model, "prompt": full_prompt[:32000],
+                      "n": 1, "size": size},
+                timeout=timeout)
         item = (reply.get("data") or [{}])[0]
         if item.get("b64_json"):
             dest.write_bytes(base64.b64decode(item["b64_json"]))
@@ -231,6 +319,10 @@ class OpenAIImageProvider(Provider):
             if payload.get("portrait"):
                 target = out_dir / f"portrait_{safe}.png"
                 data = {"name": payload.get("art_name")}
+            elif payload.get("character_sheet"):
+                key = payload["character_sheet"]
+                target = out_dir / f"sheet_{safe}_{key}.png"
+                data = {"name": payload.get("art_name"), "sheet": key}
             elif payload.get("scene_art"):
                 target = out_dir / f"scene_{safe}.png"
                 data = {"name": payload.get("art_name")}
@@ -240,7 +332,7 @@ class OpenAIImageProvider(Provider):
                 prompt = (f"{prompt}。出场角色:"
                           f"{'、'.join(payload.get('characters', []))}")
                 data = {"shot_no": shot_no}
-            self._gen_image(prompt, size, target)
+            self._gen_image(prompt, size, target, payload)
             return ProviderResult(provider=self.name,
                                   cost=self.cost_per_call,
                                   data=data, uri=str(target),
@@ -250,14 +342,23 @@ class OpenAIImageProvider(Provider):
             shot_no = int(payload["shot_no"])
             first = out_dir / f"shot_{shot_no:03d}.first.png"
             last = out_dir / f"shot_{shot_no:03d}.last.png"
-            self._gen_image(
-                f"{prompt}。首帧:动作起始瞬间,构图稳定", size, first)
+            chain_first = payload.get("chain_first_uri", "")
+            if chain_first and Path(chain_first).exists():
+                # 帧链:首帧固定为上一镜尾帧,只生成尾帧(拼接连贯)
+                import shutil as _sh
+                _sh.copyfile(chain_first, first)
+            else:
+                self._gen_image(
+                    f"{prompt}。首帧:动作起始瞬间,构图稳定", size,
+                    first, payload)
             if cancel is not None and cancel():
                 from ..errors import ProduceCancelled
                 raise ProduceCancelled("已手动停止")
+            # 尾帧以首帧为参考,保证同角色同场景连贯
             self._gen_image(
-                f"{prompt}。尾帧:动作结束瞬间,与首帧同场景同角色",
-                size, last)
+                f"{prompt}。尾帧:动作结束瞬间,与首帧同场景同角色、"
+                "人物服装道具一致",
+                size, last, {**payload, "chain_first_uri": str(first)})
             return ProviderResult(
                 provider=self.name, cost=self.cost_per_call * 2,
                 data={"first": str(first), "last": str(last)},
@@ -268,7 +369,8 @@ class OpenAIImageProvider(Provider):
             self._gen_image(
                 f"短视频封面:《{payload.get('title', '')}》"
                 f"第{payload.get('episode', 0)}集,"
-                f"{payload.get('tagline', '')}。{prompt}", size, target)
+                f"{payload.get('tagline', '')}。{prompt}", size, target,
+                payload)
             return ProviderResult(provider=self.name,
                                   cost=self.cost_per_call,
                                   data={}, uri=str(target),

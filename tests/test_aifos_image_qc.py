@@ -220,3 +220,72 @@ def test_regen_frames_with_prompt_override(app):
     item = next(i for i in plan["items"] if i["id"] == "frames:2")
     assert item["custom_prompt"] is True
     assert "逆光剪影" in item["prompt"]
+
+
+def test_openai_api_uses_reference_images(tmp_path, monkeypatch):
+    """API 出图有参考图时走 images/edits 多图输入,与 CLI 用参考图一致。"""
+    from aifos.production import api_providers
+    from aifos.production.api_providers import OpenAIImageProvider
+
+    anchor = tmp_path / "anchor.png"
+    anchor.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 8)
+    portrait = tmp_path / "portrait.png"
+    portrait.write_bytes(b"\x89PNG\r\n\x1a\n" + b"1" * 8)
+
+    captured = {}
+
+    def fake_multipart(name, url, headers, fields, files, timeout):
+        captured["url"] = url
+        captured["files"] = [f[1].name for f in files]
+        captured["prompt"] = fields["prompt"]
+        return {"data": [{"b64_json": "aGk="}]}
+
+    def fake_json(*a, **k):
+        captured["fell_back_to_generations"] = True
+        return {"data": [{"b64_json": "aGk="}]}
+
+    monkeypatch.setattr(api_providers, "_multipart_post", fake_multipart)
+    monkeypatch.setattr(api_providers, "_request_json", fake_json)
+    provider = OpenAIImageProvider("image_api", {
+        "type": "image_api", "enabled": True,
+        "capabilities": ["image"], "api_key": "sk-x",
+        "model": "gpt-image-2"})
+    result = provider.generate("image", {
+        "character_sheet": "makeup", "art_name": "小鹿",
+        "prompt": "妆容设定", "aspect": "9:16",
+        "character_refs": [str(portrait)],
+        "style_ref": str(anchor)}, tmp_path)
+    assert "images/edits" in captured["url"]
+    # 风格基准图排在最前,人物设定图随后
+    assert captured["files"][0] == "anchor.png"
+    assert "portrait.png" in captured["files"]
+    assert "禁止漂移" in captured["prompt"]
+    assert "fell_back_to_generations" not in captured
+    assert result.provider == "image_api"
+
+
+def test_openai_api_no_reference_falls_back_to_generations(tmp_path,
+                                                           monkeypatch):
+    """没有可用参考图时回退纯文本 generations,不崩。"""
+    from aifos.production import api_providers
+    from aifos.production.api_providers import OpenAIImageProvider
+
+    used = {}
+
+    def fake_gen(*a, **k):
+        used["gen"] = True
+        return {"data": [{"b64_json": "aGk="}]}
+
+    def fake_edit(*a, **k):
+        used["edit"] = True
+        return {"data": [{"b64_json": "aGk="}]}
+
+    monkeypatch.setattr(api_providers, "_request_json", fake_gen)
+    monkeypatch.setattr(api_providers, "_multipart_post", fake_edit)
+    provider = OpenAIImageProvider("image_api", {
+        "type": "image_api", "enabled": True,
+        "capabilities": ["image"], "api_key": "sk-x"})
+    provider.generate("image", {
+        "portrait": True, "art_name": "小鹿", "prompt": "立绘",
+        "aspect": "9:16"}, tmp_path)
+    assert used.get("gen") and "edit" not in used

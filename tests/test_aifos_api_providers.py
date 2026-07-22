@@ -57,7 +57,12 @@ class _FakeApi(BaseHTTPRequestHandler):
 
     def _handle(self, method):
         length = int(self.headers.get("Content-Length", "0"))
-        body = json.loads(self.rfile.read(length)) if length else None
+        raw = self.rfile.read(length) if length else b""
+        try:
+            body = json.loads(raw) if raw else None
+        except ValueError:
+            body = {"_multipart": True}   # multipart(edits 多图)不解析
+
         _FakeApi.calls.append({
             "method": method, "path": self.path,
             "headers": {k.lower(): v for k, v in self.headers.items()},
@@ -194,6 +199,9 @@ def test_image_api_frames_url_mode(fake_api, tmp_path):
     endpoint, fake = fake_api
     fake.routes[("GET", "/img.png")] = lambda body: PNG_1PX
     fake.routes[("POST", "/v1/images/generations")] = lambda body: {
+        "data": [{"url": f"{endpoint}/img.png"}]}
+    # 尾帧以首帧为参考走 edits(保持连贯);url 模式同样支持
+    fake.routes[("POST", "/v1/images/edits")] = lambda body: {
         "data": [{"url": f"{endpoint}/img.png"}]}
     provider = OpenAIImageProvider("image_api", _image_conf(endpoint))
     result = provider.generate("frames", {
