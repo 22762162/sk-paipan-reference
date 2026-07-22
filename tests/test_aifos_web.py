@@ -88,6 +88,11 @@ def test_index_and_static(server):
     assert b"/api/video/references" in app_js
     assert "质检没有通过的原因".encode() in app_js
     assert "本次质检/重画实际附上的参考图".encode() in app_js
+    assert "待生产图片批量 API 加速".encode() in app_js
+    assert b"/api/image_acceleration/preflight" in app_js
+    assert b"/api/image_acceleration/queue" in app_js
+    assert "逐张预检所选图片".encode() in app_js
+    assert "中 · 默认生产档".encode() in app_js
     assert "人物定版".encode() in app_js
     status, ctype, style_css = _request(
         server["port"], "GET", "/static/style.css")
@@ -97,6 +102,8 @@ def test_index_and_static(server):
     assert b".blocking-map-scroll" in style_css
     assert b".video-ref-picker-grid" in style_css
     assert b".plan-ref-gallery" in style_css
+    assert b".acceleration-panel" in style_css
+    assert b".accel-gates" in style_css
     status, ctype, raw = _request(
         server["port"], "GET", "/manifest.webmanifest")
     assert status == 200 and "application/manifest+json" in ctype
@@ -560,6 +567,72 @@ def test_image_line_switch_and_parallel(server):
     status, _ = _json_request(port, "POST", "/api/settings", {
         "defaults": {"parallel_images": "abc"}})
     assert status == 400
+
+
+def test_image_acceleration_options_and_preflight_api(server):
+    """加速 API 只读预检会锁定提示词、参考图、provider 和 model。"""
+    port = server["port"]
+    status, _ = _json_request(port, "POST", "/api/settings", {
+        "provider": "image_api",
+        "fields": {"enabled": True, "api_key": "test-key",
+                   "model": "gpt-image-2"},
+    })
+    assert status == 200
+    app2 = App(server["workspace"])
+    try:
+        project, _ = app2.projects.get_or_create_project("网页加速测试")
+        episode, _ = app2.projects.get_or_create_episode(project["id"], 1)
+        out_root = (app2.workspace.artifacts_dir / f"p{project['id']:03d}"
+                    / "e001")
+        ref = out_root / "identity.png"
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_bytes(b"\x89PNG\r\n\x1a\n" + b"r" * 32)
+        ctx = {"project": dict(project), "episode": dict(episode),
+               "out_root": out_root}
+        app2.director._plan_write(ctx, {"items": [{
+            "id": "shot:1", "category": "shot_image",
+            "label": "镜头 01", "status": "pending",
+            "prompt": "林昭看向镜头",
+        }]})
+        task = {
+            "item_id": "shot:1", "capability": "image",
+            "sub_dir": "images", "tag": 1,
+            "payload": {
+                "shot_no": 1, "characters": ["林昭"],
+                "prompt": "林昭看向镜头", "aspect": "9:16",
+                "image_quality": "medium", "image_task_class": "batch",
+                "identity_references": [{
+                    "character": "林昭", "asset_id": 1, "uri": str(ref)}],
+                "character_refs": [str(ref)],
+                "require_reference_images": True,
+            },
+        }
+        app2.director._prepare_dispatch_contracts(ctx, [task])
+        episode_id = episode["id"]
+    finally:
+        app2.close()
+
+    status, options = _json_request(
+        port, "GET", f"/api/image_acceleration/options?episode_id={episode_id}")
+    assert status == 200
+    item = next(value for value in options["items"]
+                if value["item_id"] == "shot:1")
+    assert item["status"] == "ready"
+    assert item["references"]["items"][0]["url"].startswith("/artifacts/")
+    body = {
+        "episode_id": episode_id, "item_ids": ["shot:1"],
+        "contract_tokens": {"shot:1": item["contract_token"]},
+        "provider": "image_api", "model": "gpt-image-2",
+        "quality": "medium",
+    }
+    status, preflight = _json_request(
+        port, "POST", "/api/image_acceleration/preflight", body)
+    assert status == 200 and preflight["passed"] is True
+    assert preflight["items"][0]["references"]["count"] == 1
+    status, reply = _json_request(
+        port, "POST", "/api/image_acceleration/queue",
+        {**body, "fingerprint": "stale"})
+    assert status == 409 and "预检结果已过期" in reply["error"]
 
 
 def test_overview_and_episode_expose_build(server):

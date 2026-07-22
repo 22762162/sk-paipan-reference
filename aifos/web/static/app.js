@@ -2334,6 +2334,177 @@ function mockWarnHtml(data) {
   </div>`;
 }
 
+function accelerationProviderLabel(name) {
+  return PROVIDER_LABEL[name] || name;
+}
+
+function accelerationReferenceHtml(refs) {
+  const items = (refs || {}).items || [];
+  if (!items.length)
+    return `<span class="accel-gate bad">✗ 没有真实参考图</span>`;
+  return `<div class="accel-refs">${items.map((ref) => `
+    <span class="accel-ref" title="${esc(ref.uri || "")}">
+      ${ref.url ? `<img src="${esc(thumbUrl(ref.url, 96))}" alt="">` : "🖼"}
+      ${esc(ref.label || ref.name || ref.kind || "参考图")}
+    </span>`).join("")}</div>`;
+}
+
+function accelerationItemHtml(item) {
+  const ready = item.status === "ready";
+  const issues = item.issues || [];
+  return `<article class="accel-item ${ready ? "ready" : "blocked"}">
+    <label class="accel-pick"><input type="checkbox" data-accel-item="${esc(item.item_id)}"
+      data-contract="${esc(item.contract_token || "")}" ${ready ? "checked" : "disabled"}>
+      <b>${esc(item.label || item.item_id)}</b>
+      <span>${esc(PLAN_CAT_CN[item.category] || item.category || "图片")}</span>
+    </label>
+    <div class="accel-gates">
+      <span class="accel-gate ${item.prompt ? "ok" : "bad"}">${item.prompt ? "✓" : "✗"} 提示词</span>
+      <span class="accel-gate ${(item.references || {}).count ? "ok" : "bad"}">
+        ${(item.references || {}).count ? "✓" : "✗"} 参考图 ×${Number((item.references || {}).count || 0)}</span>
+      <span class="accel-gate ${Object.keys(item.identity_map || {}).length || !(item.characters || []).length ? "ok" : "bad"}">
+        人物映射 ${Object.keys(item.identity_map || {}).length}/${(item.characters || []).length}</span>
+    </div>
+    ${accelerationReferenceHtml(item.references)}
+    ${issues.length ? `<div class="accel-issues" role="alert"><b>暂不放行：</b>${esc(issues.join("；"))}</div>` : ""}
+    <details><summary>核对最终提交给 API 的提示词</summary>
+      <pre>${esc(item.prompt || "")}</pre></details>
+  </article>`;
+}
+
+async function showImageAcceleration(episodeId) {
+  let options;
+  try { options = await api(`/api/image_acceleration/options?episode_id=${episodeId}`); }
+  catch (e) { showToast(staleServerHint(e), "error"); return; }
+  const candidates = (options.items || []).filter(
+    (item) => ["ready", "blocked", "queued", "running"].includes(item.status));
+  const providers = (options.providers || []).filter((item) => item.ready);
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay acceleration-overlay";
+  overlay.setAttribute("role", "dialog");
+  overlay.setAttribute("aria-modal", "true");
+  overlay.innerHTML = `<div class="script-panel acceleration-panel">
+    <div class="script-head"><h3>⚡ 待生产图片批量 API 加速</h3>
+      <button class="close">关闭 Esc</button></div>
+    <p class="dim">只处理从未进入 worker 的排队图片。系统逐张锁定最终提示词、人物/场景参考图、API 和模型；
+      任一项不一致，整批不放行，也不会回退到其他模型。</p>
+    <div class="accel-controls">
+      <label>调用 API<select class="accel-provider">${providers.length
+        ? providers.map((provider) => `<option value="${esc(provider.provider)}"
+          ${provider.provider === options.default_provider ? "selected" : ""}>
+          ${esc(accelerationProviderLabel(provider.provider))}</option>`).join("")
+        : `<option value="">没有已接通的参考图 API</option>`}</select></label>
+      <label>模型<select class="accel-model"></select></label>
+      <label>质量<select class="accel-quality">
+        <option value="low">低 · 快速候选</option>
+        <option value="medium" selected>中 · 默认生产档</option>
+        <option value="high">高 · 核心资产/关键镜头</option>
+      </select></label>
+      <button class="accel-preflight primary" ${providers.length ? "" : "disabled"}>逐张预检所选图片</button>
+    </div>
+    <div class="accel-summary" role="status">已自动选中可放行的排队图片；先预检，再确认分流。</div>
+    <div class="accel-items">${candidates.length
+      ? candidates.map(accelerationItemHtml).join("")
+      : `<div class="loading">当前没有“从未开工”的排队图片。生成中、失败重试和已完成图片不会被抢占。</div>`}</div>
+    <div class="accel-actions">
+      <button class="accel-queue primary" disabled>确认并批量调用所选 API</button>
+    </div>
+  </div>`;
+  const close = () => {
+    overlay.remove(); document.removeEventListener("keydown", onKey);
+  };
+  const onKey = (ev) => { if (ev.key === "Escape") close(); };
+  overlay.querySelector(".close").onclick = close;
+  overlay.addEventListener("click", (ev) => {
+    if (ev.target === overlay) close();
+  });
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(overlay);
+
+  const providerSel = overlay.querySelector(".accel-provider");
+  const modelSel = overlay.querySelector(".accel-model");
+  const qualitySel = overlay.querySelector(".accel-quality");
+  const preflightBtn = overlay.querySelector(".accel-preflight");
+  const queueBtn = overlay.querySelector(".accel-queue");
+  const summary = overlay.querySelector(".accel-summary");
+  let preflight = null;
+  const selectedProvider = () => providers.find(
+    (provider) => provider.provider === providerSel.value);
+  const loadModels = () => {
+    const provider = selectedProvider();
+    modelSel.innerHTML = (provider?.models || []).map((model) =>
+      `<option value="${esc(model)}">${esc(model)}</option>`).join("");
+    if (provider?.default_model) modelSel.value = provider.default_model;
+  };
+  const picked = () => [...overlay.querySelectorAll("[data-accel-item]:checked")];
+  const invalidate = () => {
+    preflight = null; queueBtn.disabled = true;
+    summary.textContent = `已选 ${picked().length} 张；设置有变化，请重新逐张预检。`;
+  };
+  loadModels();
+  providerSel.onchange = () => { loadModels(); invalidate(); };
+  modelSel.onchange = invalidate;
+  qualitySel.onchange = invalidate;
+  overlay.querySelectorAll("[data-accel-item]").forEach(
+    (box) => { box.onchange = invalidate; });
+
+  const requestBody = () => {
+    const boxes = picked();
+    return {
+      episode_id: episodeId,
+      item_ids: boxes.map((box) => box.dataset.accelItem),
+      contract_tokens: Object.fromEntries(boxes.map(
+        (box) => [box.dataset.accelItem, box.dataset.contract])),
+      provider: providerSel.value,
+      model: modelSel.value,
+      quality: qualitySel.value || "medium",
+    };
+  };
+  preflightBtn.onclick = async () => {
+    const body = requestBody();
+    if (!body.item_ids.length) {
+      showToast("至少选择一张可放行的排队图片", "error"); return;
+    }
+    preflightBtn.disabled = true; preflightBtn.textContent = "正在核对…";
+    try {
+      preflight = await api("/api/image_acceleration/preflight", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const failed = (preflight.items || []).filter((item) => item.status !== "ready");
+      summary.innerHTML = preflight.passed
+        ? `<b class="ok">✓ ${preflight.summary.ready} 张全部通过：</b>
+          ${esc(accelerationProviderLabel(preflight.provider))} / ${esc(preflight.model)} /
+          质量${preflight.quality === "medium" ? "中" : preflight.quality === "high" ? "高" : "低"}。`
+        : `<b class="bad">✗ ${failed.length} 张未通过：</b>${esc(failed.map(
+          (item) => `${item.label}:${(item.issues || []).join("；")}`).join("；"))}`;
+      queueBtn.disabled = !preflight.passed;
+    } catch (e) {
+      preflight = null; queueBtn.disabled = true;
+      summary.textContent = staleServerHint(e);
+      showToast(staleServerHint(e), "error");
+    } finally {
+      preflightBtn.disabled = !providers.length;
+      preflightBtn.textContent = "逐张预检所选图片";
+    }
+  };
+  queueBtn.onclick = async () => {
+    if (!preflight?.passed) return;
+    queueBtn.disabled = true; queueBtn.textContent = "正在原子分流…";
+    try {
+      const reply = await api("/api/image_acceleration/queue", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...requestBody(), fingerprint: preflight.fingerprint }),
+      });
+      showToast(`已将 ${reply.queued} 张安全分流到 ${accelerationProviderLabel(reply.provider)} / ${reply.model}，下一空闲槽开始执行`, "ok");
+      close(); pollCanvas(episodeId);
+    } catch (e) {
+      queueBtn.disabled = false; queueBtn.textContent = "确认并批量调用所选 API";
+      showToast(staleServerHint(e), "error");
+    }
+  };
+}
+
 function renderPlanHtml(data, editable) {
   const items = ((data.render_plan || {}).items) || [];
   if (!items.length) return "";
@@ -2345,12 +2516,19 @@ function renderPlanHtml(data, editable) {
     (i) => planQcEnabled(i) && (i.qc || {}).passed === false
       && ["done", "reused"].includes(i.status)).length;
   const qcItems = items.filter(planQcEnabled);
+  const acceleration = (data.image_acceleration || {}).summary || {};
+  const accelerationCount = Number(acceleration.ready || 0)
+    + Number(acceleration.blocked || 0);
   return `<div class="plan-panel">
     <h2>🖼 图片生产清单 <span class="dim">共 ${items.length} 张 · 已就绪 ${ready}</span></h2>
     ${qualityPolicyHtml()}
     ${imageCostGuideHtml(true)}
     ${mockWarnHtml(data)}
     ${editable ? `<div class="plan-batchbar">
+      ${accelerationCount ? `<button class="batch-accelerate primary"
+        onclick="showImageAcceleration(${data.episode.id})"
+        title="只分流从未进入 worker 的 pending 图片；开工前逐张核对提示词和参考图">
+        ⚡ API 加速待生产图片${acceleration.ready ? ` (${acceleration.ready})` : ""}</button>` : ""}
       ${qcItems.length ? `<button class="batch-qc" onclick="qcAll(${data.episode.id}, this)"
         title="只核对后续分镜关键帧和首尾帧">🔍 批量质检镜头图</button>` : ""}
       <button class="batch-redo-failed" onclick="redoFailed(${data.episode.id}, this)"

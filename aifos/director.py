@@ -14,6 +14,7 @@ from pathlib import Path
 from .db import now
 from .errors import (AifosError, BudgetExceeded, ProduceCancelled,
                      ProviderError, ProviderUnavailable)
+from .image_acceleration import ImageAccelerationStore
 from .quality_policy import (
     default_quality_policy,
     formal_reference_allowed,
@@ -137,6 +138,7 @@ class Director:
         self.data = data_center
         self.artifacts_root = Path(artifacts_root)
         self.standards = standards
+        self.image_acceleration = ImageAccelerationStore(db)
 
     def _resolve_standard_snapshot(self, episode_id, force=False):
         """为一集绑定不可漂移的制作标准。
@@ -683,6 +685,177 @@ class Director:
                 "required": bool(payload.get("require_reference_images")),
                 "items": rows}
 
+    ACCELERATABLE_IMAGE_CATEGORIES = frozenset({
+        "character_candidate", "character_sheet", "scene_art",
+        "shot_image", "frames",
+    })
+    ACCELERATION_IDENTITY_CATEGORIES = frozenset({
+        "character_sheet", "shot_image", "frames",
+    })
+
+    @staticmethod
+    def _stable_hash(value):
+        raw = json.dumps(
+            value, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), default=str).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+
+    def _build_dispatch_contract(self, task, item):
+        """从即将交给 worker 的真实 payload 构造不可变预检契约。"""
+        payload = json.loads(json.dumps(
+            task.get("payload") or {}, ensure_ascii=False, default=str))
+        prompt = self._prompt_with_feedback(
+            payload.get("prompt", ""), payload.get("feedback", ""))
+        refs = self._reference_inputs(payload)
+        category = item.get("category", "")
+        characters = [str(value) for value in payload.get("characters") or []]
+        identity_rows = [
+            ref for ref in payload.get("identity_references") or []
+            if isinstance(ref, dict)
+        ]
+        identity_map = {
+            str(ref.get("character")): str(ref.get("uri"))
+            for ref in identity_rows
+            if ref.get("character") and ref.get("uri")
+        }
+        issues = []
+        if not prompt.strip():
+            issues.append("最终提示词为空")
+        subject = str(payload.get("art_name") or payload.get("location") or "")
+        expected_names = characters or ([subject] if subject else [])
+        for name in expected_names:
+            if name and name not in prompt:
+                issues.append(f"提示词没有明确写出对象「{name}」")
+        # 用户已明确要求：调用其他 API 时不能只交文字，所有加速项至少一图。
+        if not refs["items"]:
+            issues.append("API 加速必须携带真实参考图，不能只使用文字描述")
+        for ref in refs["items"]:
+            uri = str(ref.get("uri") or "")
+            if not uri:
+                issues.append(f"参考图「{ref.get('label', '未命名')}」没有文件地址")
+            elif not uri.startswith(("http://", "https://", "data:image/")) \
+                    and not Path(uri).is_file():
+                issues.append(f"参考图文件不存在: {uri}")
+        if category in self.ACCELERATION_IDENTITY_CATEGORIES:
+            missing = [name for name in characters if name not in identity_map]
+            extra = [name for name in identity_map if name not in characters]
+            if missing:
+                issues.append("缺少人物最终立绘映射: " + "、".join(missing))
+            if extra:
+                issues.append("参考图人物与提示词名单不一致: " + "、".join(extra))
+        if category == "frames" and not (
+                payload.get("image_uri") or payload.get("chain_first_uri")):
+            issues.append("首尾帧缺少本镜关键帧/上一镜尾帧连续性参考")
+        reference_facts = [{
+            "kind": ref.get("kind", ""),
+            "label": ref.get("label", ""),
+            "name": ref.get("name", ""),
+            "uri": ref.get("uri", ""),
+            "asset_id": ref.get("asset_id"),
+        } for ref in refs["items"]]
+        contract = {
+            "schema": "aifos.image-dispatch/v1",
+            "item_id": task["item_id"],
+            "label": item.get("label", task["item_id"]),
+            "category": category,
+            "capability": task["capability"],
+            "prompt": prompt,
+            "prompt_hash": self._stable_hash(prompt),
+            "references": {
+                "required": True,
+                "count": len(reference_facts),
+                "items": reference_facts,
+            },
+            "reference_hash": self._stable_hash(reference_facts),
+            "characters": characters,
+            "identity_map": identity_map,
+            "base_quality": payload.get("image_quality", "medium"),
+            "payload": payload,
+            "issues": list(dict.fromkeys(issues)),
+        }
+        contract["passed"] = not contract["issues"]
+        token_basis = {key: contract[key] for key in (
+            "item_id", "category", "capability", "prompt_hash",
+            "reference_hash", "characters", "identity_map")}
+        contract["token"] = self._stable_hash(token_basis)
+        return contract
+
+    def _prepare_dispatch_contracts(self, ctx, tasks):
+        plan = self._plan_read(ctx)
+        by_id = {item.get("id"): item for item in plan.get("items", [])}
+        records = []
+        for task in tasks:
+            item = by_id.get(task.get("item_id"))
+            if item is None or item.get("category") \
+                    not in self.ACCELERATABLE_IMAGE_CATEGORIES:
+                continue
+            contract = self._build_dispatch_contract(task, item)
+            task["_dispatch_contract"] = contract
+            task["_dispatch_contract_token"] = contract["token"]
+            records.append({
+                "item_id": task["item_id"],
+                "category": item["category"],
+                "capability": task["capability"],
+                "contract_token": contract["token"],
+                "contract": contract,
+                "never_started": (
+                    item.get("status", "pending") == "pending"
+                    and not item.get("started_at")
+                    and not item.get("finished_at")
+                    and not item.get("provider")),
+            })
+        if records:
+            self.image_acceleration.register(ctx["episode"]["id"], records)
+
+    def _claim_dispatch_task(self, ctx, task):
+        token = task.get("_dispatch_contract_token")
+        if not token:
+            return task
+        request = self.image_acceleration.claim(
+            ctx["episode"]["id"], task["item_id"], token)
+        if request is None:
+            return task
+        quality = normalize_quality(
+            request.get("quality") or "medium", field="image_quality")
+        payload = dict(task.get("payload") or {})
+        decision = dict(payload.get("quality_decision") or {})
+        decision.update({
+            "level": quality,
+            "source": "api_acceleration",
+            "reasons": ["用户将尚未开工图片批量分流到指定 API"],
+        })
+        payload.update({
+            "image_quality": quality,
+            "quality_decision": decision,
+            "image_task_class": image_task_class_for(quality),
+            "strict_provider": request["provider"],
+            "model_override": request["model"],
+            "require_reference_images": True,
+        })
+        # claim 后、进入 worker 前再用本任务持有的 Router 做一次硬校验；
+        # 服务运行期间配置变更时宁可失败，也不允许模型/参考图静默漂移。
+        self.router.validate_image_selection(
+            request["provider"], task["capability"], payload,
+            request["model"])
+        accelerated = dict(task)
+        accelerated["payload"] = payload
+        accelerated["_acceleration"] = {
+            "status": "running", "gate": "passed",
+            "provider": request["provider"], "model": request["model"],
+            "quality": quality, "contract_token": token,
+        }
+        return accelerated
+
+    def _finish_dispatch_task(self, ctx, task, result=None, error=""):
+        if not task.get("_dispatch_contract_token"):
+            return
+        self.image_acceleration.finish(
+            ctx["episode"]["id"], task["item_id"],
+            result={
+                "provider": getattr(result, "provider", "") if result else "",
+                "model": getattr(result, "model", "") if result else "",
+            }, error=error)
+
     def _plan_run(self, ctx, item_id, fn, prompt=None, payload=None,
                   revision_source="manual"):
         """包住一次出图调用:生成中 → 完成/失败;手动停止落回排队。
@@ -831,27 +1004,41 @@ class Director:
         """串行执行单个出图任务(含质检),记账并更新清单。"""
         if self._cancel_requested(ctx):
             raise ProduceCancelled("已手动停止生成")
+        try:
+            task = self._claim_dispatch_task(ctx, task)
+        except Exception as exc:
+            self._finish_dispatch_task(ctx, task, error=str(exc))
+            self._plan_mark(ctx, task["item_id"], "failed",
+                            error=str(exc)[:300])
+            raise
         payload = task.get("payload") or {}
-        self._plan_mark(ctx, task["item_id"], "generating", extra={
+        generating_extra = {
             "image_task_class": payload.get("image_task_class"),
             "image_quality": payload.get("image_quality"),
             "reference_inputs": self._reference_inputs(payload),
-        })
+        }
+        if task.get("_acceleration"):
+            generating_extra["acceleration"] = task["_acceleration"]
+        self._plan_mark(ctx, task["item_id"], "generating",
+                        extra=generating_extra)
         try:
             result = self._generate_image_with_qc(
                 task["capability"], task["payload"],
                 ctx["out_root"] / task["sub_dir"],
                 lambda: self._cancel_requested(ctx), task.get("qc_spec"))
         except ProduceCancelled:
+            self._finish_dispatch_task(ctx, task, error="已手动停止生成")
             self._plan_mark(ctx, task["item_id"], "pending")
             raise
         except Exception as exc:
+            self._finish_dispatch_task(ctx, task, error=str(exc))
             self._plan_mark(ctx, task["item_id"], "failed",
                             error=str(exc)[:300])
             raise
         self._task_cost += result.cost
         self._task_providers.add(result.provider)
         self.projects.add_episode_cost(ctx["episode"]["id"], result.cost)
+        self._finish_dispatch_task(ctx, task, result=result)
         self._plan_mark(ctx, task["item_id"], "done",
                         extra=self._plan_done_extra(result))
         return result
@@ -874,6 +1061,7 @@ class Director:
         返回 {tag: ProviderResult};暂停时未完成条目回到排队并保留已完成。"""
         if not tasks:
             return {}
+        self._prepare_dispatch_contracts(ctx, tasks)
         tasks = sorted(tasks, key=lambda task: (
             -int(task.get("priority", 0)), str(task.get("item_id", ""))))
         workers = self._parallel_workers()
@@ -906,12 +1094,24 @@ class Director:
                     task = next(iterator)
                 except StopIteration:
                     return False
+                try:
+                    task = self._claim_dispatch_task(ctx, task)
+                except Exception as exc:
+                    failures.append((task, exc))
+                    self._finish_dispatch_task(ctx, task, error=str(exc))
+                    self._plan_mark(ctx, task["item_id"], "failed",
+                                    error=str(exc)[:300])
+                    return False
                 payload = task.get("payload") or {}
-                self._plan_mark(ctx, task["item_id"], "generating", extra={
+                generating_extra = {
                     "image_task_class": payload.get("image_task_class"),
                     "image_quality": payload.get("image_quality"),
                     "reference_inputs": self._reference_inputs(payload),
-                })
+                }
+                if task.get("_acceleration"):
+                    generating_extra["acceleration"] = task["_acceleration"]
+                self._plan_mark(ctx, task["item_id"], "generating",
+                                extra=generating_extra)
                 future = pool.submit(
                     self._generate_image_with_qc, task["capability"],
                     task["payload"], ctx["out_root"] / task["sub_dir"],
@@ -930,10 +1130,13 @@ class Director:
                         result = future.result()
                     except ProduceCancelled:
                         cancelled = True
+                        self._finish_dispatch_task(
+                            ctx, task, error="已手动停止生成")
                         self._plan_mark(ctx, task["item_id"], "pending")
                         continue
                     except Exception as exc:
                         failures.append((task, exc))
+                        self._finish_dispatch_task(ctx, task, error=str(exc))
                         self._plan_mark(ctx, task["item_id"], "failed",
                                         error=str(exc)[:300])
                         continue
@@ -941,6 +1144,7 @@ class Director:
                     self._task_providers.add(result.provider)
                     self.projects.add_episode_cost(
                         ctx["episode"]["id"], result.cost)
+                    self._finish_dispatch_task(ctx, task, result=result)
                     self._plan_mark(ctx, task["item_id"], "done",
                                     extra=self._plan_done_extra(result))
                     results[task["tag"]] = result
@@ -958,6 +1162,193 @@ class Director:
         if failures:
             raise failures[0][1]
         return results
+
+    def image_acceleration_options(self, project_title, episode_number):
+        """当前 stage 尚未进入 worker 的图片与可选 API/模型。"""
+        project, episode = self._episode_ctx(project_title, episode_number)
+        ctx = {"project": dict(project), "episode": dict(episode),
+               "out_root": self._episode_dir(project, episode)}
+        plan = self._plan_read(ctx)
+        plan_by_id = {item.get("id"): item for item in plan.get("items", [])}
+        rows = self.image_acceleration.list(episode["id"])
+        items = []
+        for row in rows:
+            contract = row.get("contract") or {}
+            item = plan_by_id.get(row["item_id"]) or {}
+            issues = list(contract.get("issues") or [])
+            plan_pending = item.get("status") == "pending"
+            if row["acceleration_status"] in ("queued", "running"):
+                status = row["acceleration_status"]
+            elif row["acceleration_status"] in ("done", "failed"):
+                status = row["acceleration_status"]
+            elif row["production_state"] != "pending" or not plan_pending:
+                status = ("completed" if row["production_state"] == "generated"
+                          else "in_production")
+                issues = []
+            elif not row["never_started"]:
+                status = "retry_only"
+                issues.append("图片曾经进入过生产线，只能按重试流程处理")
+            else:
+                status = "blocked" if issues else "ready"
+            items.append({
+                "item_id": row["item_id"],
+                "label": contract.get("label", item.get("label", row["item_id"])),
+                "category": row["category"],
+                "capability": row["capability"],
+                "status": status,
+                "production_state": row["production_state"],
+                "contract_token": row["contract_token"],
+                "prompt": contract.get("prompt", ""),
+                "prompt_hash": contract.get("prompt_hash", ""),
+                "references": contract.get("references") or {
+                    "required": True, "count": 0, "items": []},
+                "characters": contract.get("characters") or [],
+                "identity_map": contract.get("identity_map") or {},
+                "base_quality": contract.get("base_quality", "medium"),
+                "issues": list(dict.fromkeys(issues)),
+                "requested_provider": row["requested_provider"],
+                "requested_model": row["requested_model"],
+                "requested_quality": row["requested_quality"],
+                "actual_provider": row["actual_provider"],
+                "actual_model": row["actual_model"],
+                "error": row["error"],
+            })
+        providers = self.router.image_api_options()
+        default = next((option for option in providers if option["ready"]), None)
+        ready = [item for item in items if item["status"] == "ready"]
+        return {
+            "project": project_title,
+            "episode": episode_number,
+            "providers": providers,
+            "default_provider": default["provider"] if default else "",
+            "default_model": default["default_model"] if default else "",
+            "default_quality": "medium",
+            "items": items,
+            "summary": {
+                "total": len(items), "ready": len(ready),
+                "queued": sum(item["status"] == "queued" for item in items),
+                "running": sum(item["status"] == "running" for item in items),
+                "blocked": sum(item["status"] == "blocked" for item in items),
+                "completed": sum(item["status"] == "completed" for item in items),
+            },
+        }
+
+    def preflight_image_acceleration(
+            self, project_title, episode_number, item_ids, provider, model,
+            quality="medium", contract_tokens=None):
+        """无副作用逐张核对最终提示词、参考图、API、模型和质量。"""
+        quality = normalize_quality(
+            quality or "medium", field="image_quality")
+        unique = list(dict.fromkeys(str(value) for value in (item_ids or [])
+                                    if str(value).strip()))
+        if not unique:
+            raise AifosError("至少选择一张尚未开工的图片")
+        if len(unique) > 200:
+            raise AifosError("单次最多加速 200 张图片")
+        _project, episode = self._episode_ctx(project_title, episode_number)
+        rows = {row["item_id"]: row
+                for row in self.image_acceleration.list(episode["id"])}
+        expected = contract_tokens or {}
+        checked = []
+        for item_id in unique:
+            row = rows.get(item_id)
+            issues = []
+            if row is None:
+                checked.append({"item_id": item_id, "label": item_id,
+                                "status": "blocked",
+                                "issues": ["图片尚未形成可派发契约"]})
+                continue
+            contract = row.get("contract") or {}
+            issues.extend(contract.get("issues") or [])
+            if expected.get(item_id) \
+                    and expected[item_id] != row["contract_token"]:
+                issues.append("页面中的提示词/参考图预览已经过期")
+            if row["production_state"] != "pending" \
+                    or not row["never_started"]:
+                issues.append("图片已进入生产线，不能再切换 API")
+            if row["acceleration_status"] in ("queued", "running", "done"):
+                issues.append("图片已经提交过 API 加速")
+            payload = dict(contract.get("payload") or {})
+            decision = dict(payload.get("quality_decision") or {})
+            decision.update({"level": quality,
+                             "source": "api_acceleration"})
+            payload.update({
+                "image_quality": quality,
+                "quality_decision": decision,
+                "image_task_class": image_task_class_for(quality),
+                "require_reference_images": True,
+                "strict_provider": provider,
+                "model_override": model,
+            })
+            if not issues:
+                try:
+                    self.router.validate_image_selection(
+                        provider, row["capability"], payload, model)
+                except (ProviderUnavailable, ProviderError) as exc:
+                    issues.append(str(exc))
+            checked.append({
+                "item_id": item_id,
+                "label": contract.get("label", item_id),
+                "category": row["category"],
+                "capability": row["capability"],
+                "status": "blocked" if issues else "ready",
+                "issues": list(dict.fromkeys(issues)),
+                "contract_token": row["contract_token"],
+                "prompt": contract.get("prompt", ""),
+                "prompt_hash": contract.get("prompt_hash", ""),
+                "references": contract.get("references") or {},
+                "characters": contract.get("characters") or [],
+                "provider": provider, "model": model,
+                "quality": quality,
+            })
+        passed = bool(checked) and all(
+            item["status"] == "ready" for item in checked)
+        fingerprint_basis = {
+            "episode_id": episode["id"], "provider": provider,
+            "model": model, "quality": quality,
+            "items": [{"item_id": item["item_id"],
+                       "contract_token": item.get("contract_token", "")}
+                      for item in checked],
+        }
+        return {
+            "passed": passed,
+            "fingerprint": self._stable_hash(fingerprint_basis),
+            "provider": provider, "model": model, "quality": quality,
+            "items": checked,
+            "summary": {
+                "total": len(checked),
+                "ready": sum(item["status"] == "ready" for item in checked),
+                "blocked": sum(item["status"] != "ready" for item in checked),
+            },
+        }
+
+    def queue_image_acceleration(
+            self, project_title, episode_number, item_ids, provider, model,
+            quality="medium", fingerprint="", contract_tokens=None):
+        report = self.preflight_image_acceleration(
+            project_title, episode_number, item_ids, provider, model,
+            quality=quality, contract_tokens=contract_tokens)
+        if fingerprint and fingerprint != report["fingerprint"]:
+            raise AifosError("预检结果已过期，请重新核对提示词和参考图")
+        if not report["passed"]:
+            first = next(item for item in report["items"]
+                         if item["status"] != "ready")
+            raise AifosError(
+                f"{first['label']} 未通过放行: "
+                + "；".join(first.get("issues") or ["未知原因"]))
+        _project, episode = self._episode_ctx(project_title, episode_number)
+        requests = [{
+            "item_id": item["item_id"],
+            "contract_token": item["contract_token"],
+            "provider": provider, "model": model, "quality": report["quality"],
+        } for item in report["items"]]
+        self.image_acceleration.queue(episode["id"], requests)
+        return {
+            "queued": len(requests), "provider": provider,
+            "model": model, "quality": report["quality"],
+            "item_ids": [request["item_id"] for request in requests],
+            "fingerprint": report["fingerprint"],
+        }
 
     @staticmethod
     def _shot_priority(shot, scene_first=False):

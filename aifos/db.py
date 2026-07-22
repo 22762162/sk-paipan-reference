@@ -3,6 +3,7 @@
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects(
@@ -141,6 +142,33 @@ CREATE TABLE IF NOT EXISTS tasks(
   updated_at REAL NOT NULL
 );
 
+-- 图片任务进入 worker 前的不可变派发契约。Web 端只能给仍为 pending 且
+-- never_started=1 的条目请求 API 加速；原 Director 在提交 worker 时原子
+-- claim，因此不会出现第二个任务抢跑、重复生成和重复计费。
+CREATE TABLE IF NOT EXISTS image_dispatch_contracts(
+  episode_id INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+  item_id TEXT NOT NULL,
+  category TEXT NOT NULL DEFAULT '',
+  capability TEXT NOT NULL DEFAULT 'image',
+  contract_token TEXT NOT NULL,
+  contract TEXT NOT NULL DEFAULT '{}',
+  production_state TEXT NOT NULL DEFAULT 'pending',
+  never_started INTEGER NOT NULL DEFAULT 1,
+  acceleration_status TEXT NOT NULL DEFAULT '',
+  requested_provider TEXT NOT NULL DEFAULT '',
+  requested_model TEXT NOT NULL DEFAULT '',
+  requested_quality TEXT NOT NULL DEFAULT 'medium',
+  actual_provider TEXT NOT NULL DEFAULT '',
+  actual_model TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  PRIMARY KEY(episode_id, item_id)
+);
+
+CREATE INDEX IF NOT EXISTS image_dispatch_episode_state_idx
+ON image_dispatch_contracts(episode_id, production_state, never_started);
+
 -- 订阅额度(即梦 CLI 优先使用订阅额度,耗尽回退 API)
 CREATE TABLE IF NOT EXISTS quota(
   provider TEXT PRIMARY KEY,
@@ -252,6 +280,19 @@ class Database:
             cur = self.conn.execute(sql, params)
             self.conn.commit()
             return cur
+
+    @contextmanager
+    def transaction(self, *, immediate=False):
+        """跨 App/线程安全的显式事务；供批量认领做全有或全无更新。"""
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            try:
+                yield self.conn
+            except Exception:
+                self.conn.rollback()
+                raise
+            else:
+                self.conn.commit()
 
     def query(self, sql, params=()):
         with self._lock:

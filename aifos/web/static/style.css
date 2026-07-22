@@ -1384,6 +1384,67 @@ textarea:focus-visible, select:focus-visible {
 .plan-note { font-size: 11px; margin-top: 4px; }
 .plan-overlay { max-width: 780px; }
 
+/* ---- 尚未开工图片 · 严格 API 加速 ---- */
+.acceleration-panel { width: min(980px, 96vw); max-width: 980px; }
+.accel-controls {
+  position: sticky; top: 0; z-index: 4; display: grid;
+  grid-template-columns: repeat(3, minmax(150px, 1fr)) auto;
+  gap: 9px; align-items: end; margin: 12px 0; padding: 11px;
+  border: 1px solid rgba(57, 135, 229, .42); border-radius: 12px;
+  background: rgba(20, 30, 48, .97);
+}
+.accel-controls label { display: grid; gap: 4px; font-size: 11px; color: var(--ink-3); }
+.accel-controls select {
+  min-width: 0; width: 100%; padding: 8px; color: var(--ink);
+  background: var(--page); border: 1px solid var(--hairline); border-radius: 8px;
+}
+.accel-summary {
+  padding: 9px 11px; border-radius: 9px; background: var(--surface-2);
+  color: var(--ink-2); font-size: 12px;
+}
+.accel-summary .ok, .accel-gate.ok { color: #67ce89; }
+.accel-summary .bad, .accel-gate.bad { color: #ef8f8f; }
+.accel-items { display: grid; gap: 10px; margin: 12px 0; }
+.accel-item {
+  padding: 11px; border: 1px solid var(--hairline); border-radius: 11px;
+  background: var(--surface-2);
+}
+.accel-item.ready { border-color: rgba(74, 190, 117, .42); }
+.accel-item.blocked { border-color: rgba(208, 59, 59, .45); }
+.accel-pick { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.accel-pick > span { margin-left: auto; color: var(--ink-3); font-size: 11px; }
+.accel-gates, .accel-refs { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.accel-gate {
+  padding: 3px 8px; border-radius: 999px; background: var(--surface-3);
+  color: var(--ink-2); font-size: 11px;
+}
+.accel-ref {
+  display: inline-flex; align-items: center; gap: 5px; max-width: 220px;
+  padding: 4px 7px; border: 1px solid var(--hairline); border-radius: 8px;
+  color: var(--ink-2); font-size: 10px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.accel-ref img { width: 30px; height: 30px; object-fit: cover; border-radius: 5px; }
+.accel-issues { margin-top: 8px; color: #ef8f8f; font-size: 12px; }
+.accel-item details { margin-top: 8px; color: var(--ink-3); font-size: 11px; }
+.accel-item pre {
+  max-height: 180px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+  padding: 8px; border-radius: 8px; background: var(--page); color: var(--ink-2);
+  font: 11px/1.6 var(--font);
+}
+.accel-actions { display: flex; justify-content: flex-end; }
+.plan-batchbar .batch-accelerate {
+  background: linear-gradient(135deg, #2a70db, #7757d8);
+  color: #fff; border-color: rgba(125, 180, 255, .65);
+}
+
+@media (max-width: 760px) {
+  .acceleration-panel { width: 100%; }
+  .accel-controls { position: static; grid-template-columns: 1fr; }
+  .accel-pick > span { width: 100%; margin-left: 26px; }
+  .accel-actions .primary { width: 100%; }
+}
+
 /* ---- 空间调度图 ---- */
 .blocking-overlay { width: min(980px, 100%); max-width: 980px; }
 .blocking-summary {

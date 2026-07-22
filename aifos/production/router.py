@@ -32,6 +32,7 @@ PROVIDER_TYPES = {
 class ProviderRouter:
     IMAGE_CAPABILITIES = {"image", "frames", "cover"}
     IMAGE_TASK_CLASSES = {"batch", "important", "final", "complex_text"}
+    API_IMAGE_TYPES = {"image_api", "seedream_image"}
 
     def __init__(self, config, db, logger):
         self.config = config
@@ -77,6 +78,9 @@ class ProviderRouter:
         routing.<capability> 原顺序。分层链只调整已知首选，其余
         自定义 Provider 仍按用户配置作为回退。
         """
+        strict_provider = str(payload.get("strict_provider") or "").strip()
+        if strict_provider:
+            return [strict_provider]
         base = list(self.config.get(
             "routing", capability, default=None) or ["mock"])
         if capability not in self.IMAGE_CAPABILITIES:
@@ -101,8 +105,95 @@ class ProviderRouter:
         # 去重但保持顺序：分层首选 → 旧/用户 routing 回退。
         return list(dict.fromkeys(preferred + base))
 
+    @staticmethod
+    def _provider_models(provider):
+        configured = provider.conf.get("models") or []
+        values = []
+        for item in configured:
+            value = item.get("id") if isinstance(item, dict) else item
+            if value and str(value) not in values:
+                values.append(str(value))
+        current = (provider.conf.get("model")
+                   or getattr(provider, "DEFAULT_MODEL", ""))
+        if current and str(current) not in values:
+            values.insert(0, str(current))
+        return values
+
+    def image_api_options(self):
+        """返回可供单批次严格选择的真实图片 API/模型。"""
+        options = []
+        for name, provider in self.providers.items():
+            if provider.conf.get("type") not in self.API_IMAGE_TYPES:
+                continue
+            models = self._provider_models(provider)
+            checks = []
+            for capability in ("image", "frames"):
+                ok, reason = provider.available(capability)
+                checks.append({"capability": capability, "ok": bool(ok),
+                               "reason": reason or "就绪"})
+            ready = bool(models) and provider.reference_images \
+                and any(item["ok"] for item in checks)
+            reason = ""
+            if not models:
+                reason = "未配置模型"
+            elif not provider.reference_images:
+                reason = "不支持真实参考图输入"
+            elif not ready:
+                reason = next((item["reason"] for item in checks
+                               if not item["ok"]), "API 未就绪")
+            options.append({
+                "provider": name,
+                "type": provider.conf.get("type", ""),
+                "models": models,
+                "default_model": models[0] if models else "",
+                "ready": ready,
+                "reason": reason,
+                "reference_images": bool(provider.reference_images),
+                "cost_per_call": provider.cost_per_call,
+                "checks": checks,
+            })
+        preferred = list(self.config.get(
+            "image_routing", "batch", default=None) or [])
+        rank = {name: index for index, name in enumerate(preferred)}
+        options.sort(key=lambda item: (
+            not item["ready"], rank.get(item["provider"], 999),
+            item["provider"]))
+        return options
+
+    def validate_image_selection(self, provider_name, capability, payload,
+                                 model):
+        """只读校验所选 API/模型与真实 payload 契约是否可执行。"""
+        provider = self.providers.get(provider_name)
+        if provider is None:
+            raise ProviderUnavailable(f"未知图片 API: {provider_name}")
+        if provider.conf.get("type") not in self.API_IMAGE_TYPES:
+            raise ProviderUnavailable(
+                f"{provider_name} 不是可批量加速的图片 API")
+        ok, reason = provider.available(capability)
+        if not ok:
+            raise ProviderUnavailable(f"{provider_name} 不可用: {reason}")
+        if not provider.reference_images:
+            raise ProviderUnavailable(
+                f"{provider_name} 不支持真实参考图，禁止纯文字加速出图")
+        models = self._provider_models(provider)
+        if not model or model not in models:
+            raise ProviderUnavailable(
+                f"模型 {model or '未选择'} 与 {provider_name} 配置不匹配")
+        validator = getattr(provider, "validate_request", None)
+        if validator is not None:
+            issues = validator(capability, payload, model=model) or []
+            if issues:
+                raise ProviderUnavailable("；".join(str(x) for x in issues))
+        return {"provider": provider_name, "model": model,
+                "capability": capability}
+
     # ---- 调用 ----
     def call(self, capability, payload, out_dir, cancel=None):
+        strict_provider = str(payload.get("strict_provider") or "").strip()
+        strict_model = str(payload.get("model_override") or "").strip()
+        if strict_provider:
+            self.validate_image_selection(
+                strict_provider, capability, payload, strict_model)
         chain = self._routing_chain(capability, payload)
         fallbacks = []
         requires_refs = bool(payload.get("require_reference_images")
@@ -155,6 +246,12 @@ class ProviderRouter:
                 fallbacks.append(
                     {"provider": name, "reason": f"执行失败: {exc}"})
                 continue
+            if strict_provider and (result.provider != strict_provider
+                                    or result.model != strict_model):
+                raise ProviderUnavailable(
+                    "严格 API 加速实际产线/模型与预检不一致: "
+                    f"请求 {strict_provider}/{strict_model}，"
+                    f"实际 {result.provider}/{result.model or '未知'}")
             if provider.quota_limit > 0:
                 self._consume_quota(name)
             result.fallbacks = fallbacks

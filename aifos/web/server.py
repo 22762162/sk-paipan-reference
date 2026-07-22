@@ -467,6 +467,8 @@ def _episode_payload(app, episode_id):
         for item in render_plan.get("items", []):
             for ref in (item.get("reference_inputs") or {}).get("items", []):
                 ref["url"] = _artifact_url(app, ref.get("uri", ""))
+    image_acceleration = app.director.image_acceleration_options(
+        project["title"], episode["number"])
     if blocking is not None:
         blocking = copy.deepcopy(blocking)
         for scene in blocking.get("scenes", []):
@@ -505,6 +507,12 @@ def _episode_payload(app, episode_id):
         "cast_selection": cast_selection,
         "qc_report": qc_report,
         "render_plan": render_plan,
+        "image_acceleration": {
+            "summary": image_acceleration["summary"],
+            "default_provider": image_acceleration["default_provider"],
+            "default_model": image_acceleration["default_model"],
+            "default_quality": image_acceleration["default_quality"],
+        },
         "artifacts": _collect_artifacts(
             app, project["id"], episode["number"]),
     }
@@ -651,6 +659,8 @@ def make_handler(workspace, jobs):
                     return self._json(payload)
                 if route == "/api/assets":
                     return self._assets(query)
+                if route == "/api/image_acceleration/options":
+                    return self._image_acceleration_options(query)
                 if route == "/api/logs":
                     limit = int(query.get("limit", ["50"])[0])
                     return self._json(self._with_app(
@@ -751,6 +761,10 @@ def make_handler(workspace, jobs):
                     return self._qc_all()
                 if parsed.path == "/api/redo_items":
                     return self._redo_items()
+                if parsed.path == "/api/image_acceleration/preflight":
+                    return self._image_acceleration_preflight()
+                if parsed.path == "/api/image_acceleration/queue":
+                    return self._image_acceleration_queue()
                 if parsed.path == "/api/restyle":
                     return self._restyle()
                 if parsed.path == "/api/reference/upload":
@@ -1551,6 +1565,87 @@ def make_handler(workspace, jobs):
                 lambda app, run_id: app.director.qc_all(title, number),
                 action="qc_all")
             return self._json({"job_id": job_id}, status=202)
+
+        def _image_acceleration_options(self, query):
+            value = query.get("episode_id", [""])[0]
+            try:
+                episode_id = int(value)
+            except (TypeError, ValueError):
+                return self._error(400, "缺少有效 episode_id")
+            found = self._episode_ref({"episode_id": episode_id})
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+
+            def load(app):
+                payload = app.director.image_acceleration_options(
+                    title, number)
+                for item in payload.get("items", []):
+                    for ref in (item.get("references") or {}).get(
+                            "items", []):
+                        ref["url"] = _artifact_url(
+                            app, ref.get("uri", ""))
+                return payload
+
+            return self._json(self._with_app(load))
+
+        def _image_acceleration_body(self):
+            body = self._read_body()
+            if body is None:
+                return None, None, (400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return None, None, (404, "剧集不存在")
+            if not isinstance(body.get("item_ids"), list):
+                return None, None, (400, "item_ids 必须是数组")
+            return body, found, None
+
+        def _image_acceleration_preflight(self):
+            body, found, error = self._image_acceleration_body()
+            if error is not None:
+                return self._error(*error)
+            title, number = found
+            try:
+                report = self._with_app(
+                    lambda app: app.director.preflight_image_acceleration(
+                        title, number, body.get("item_ids"),
+                        str(body.get("provider") or ""),
+                        str(body.get("model") or ""),
+                        quality=body.get("quality") or "medium",
+                        contract_tokens=body.get("contract_tokens") or {}))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(report)
+
+        def _image_acceleration_queue(self):
+            body, found, error = self._image_acceleration_body()
+            if error is not None:
+                return self._error(*error)
+            title, number = found
+            try:
+                report = self._with_app(
+                    lambda app: app.director.queue_image_acceleration(
+                        title, number, body.get("item_ids"),
+                        str(body.get("provider") or ""),
+                        str(body.get("model") or ""),
+                        quality=body.get("quality") or "medium",
+                        fingerprint=str(body.get("fingerprint") or ""),
+                        contract_tokens=body.get("contract_tokens") or {}))
+            except AifosError as exc:
+                return self._error(409, str(exc))
+            running = jobs.running_for(title, number)
+            if running:
+                job_id = running[0]["id"]
+                report["dispatch"] = "current_job"
+            else:
+                # 没有主任务时从断点恢复；真正的 API 调用仍由这一条原
+                # Director 流水线完成，不另开抢跑的图片 worker。
+                job_id = jobs.start(
+                    title, number, review=False,
+                    action="image_acceleration_resume")
+                report["dispatch"] = "resumed_job"
+            report["job_id"] = job_id
+            return self._json(report, status=202)
 
         def _redo_items(self):
             """批量重画:{item_ids:[...]} 或 {only_failed:true}。"""

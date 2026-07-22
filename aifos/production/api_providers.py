@@ -345,11 +345,50 @@ class OpenAIImageProvider(Provider):
             quality, costs.get("lite") if quality == "low"
             else self.cost_per_call))
 
+    def _request_model(self, payload=None):
+        payload = payload or {}
+        configured = self.conf.get("model") or self.DEFAULT_MODEL
+        requested = str(payload.get("model_override") or "").strip()
+        if requested and requested != configured:
+            raise ProviderError(
+                f"{self.name} 请求模型 {requested} 与配置 {configured} 不匹配")
+        return requested or configured
+
+    def validate_request(self, capability, payload, model=""):
+        """网络调用前验证模型、质量以及全部参考图都能真实上传。"""
+        issues = []
+        try:
+            selected = self._request_model(
+                {**(payload or {}), "model_override": model})
+            if not selected:
+                issues.append("未配置图片模型")
+            self._quality(payload or {})
+        except ProviderError as exc:
+            issues.append(str(exc))
+        prompt = str((payload or {}).get("prompt") or "").strip()
+        if not prompt:
+            issues.append("最终提示词为空")
+        entries = _reference_entries(payload or {})
+        if not entries:
+            issues.append("API 加速必须携带至少一张真实参考图")
+        for entry in entries:
+            uri = entry["uri"]
+            if uri.startswith(("http://", "https://", "data:image/")):
+                issues.append(
+                    f"{self.name} 多图编辑只接受可上传的本地参考图: {uri}")
+                continue
+            path = Path(uri)
+            if not path.exists() or not path.is_file():
+                issues.append(f"必需参考图不存在: {uri}")
+            elif path.suffix.lower() not in _IMG_MEDIA:
+                issues.append(f"不支持参考图格式: {path.suffix}")
+        return issues
+
     def _audit_data(self, data, payload, unit_cost):
         quality, _api_quality = self._quality(payload)
         return {
             **data,
-            "model": self.conf.get("model") or self.DEFAULT_MODEL,
+            "model": self._request_model(payload),
             "image_task_class": payload.get("image_task_class", "legacy"),
             "image_quality": quality,
             "unit_cost": unit_cost,
@@ -376,8 +415,8 @@ class OpenAIImageProvider(Provider):
         endpoint = (self.conf.get("endpoint")
                     or self.DEFAULT_ENDPOINT).rstrip("/")
         timeout = self.conf.get("timeout", 300)
-        model = self.conf.get("model") or self.DEFAULT_MODEL
         payload = payload or {}
+        model = self._request_model(payload)
         refs = _local_refs(payload)
         _quality, api_quality = self._quality(payload)
         if payload.get("require_reference_images") and not refs:
@@ -451,8 +490,7 @@ class OpenAIImageProvider(Provider):
                                   data=self._audit_data(
                                       data, payload, call_cost),
                                   uri=str(target),
-                                  model=(self.conf.get("model")
-                                         or self.DEFAULT_MODEL))
+                                  model=self._request_model(payload))
         if capability == "frames":
             shot_no = int(payload["shot_no"])
             first = out_dir / f"shot_{shot_no:03d}.first.png"
@@ -493,8 +531,7 @@ class OpenAIImageProvider(Provider):
                     "first_source": first_source,
                     "generation_calls": calls,
                 }, payload, call_cost),
-                uri=str(first), model=(self.conf.get("model")
-                                       or self.DEFAULT_MODEL))
+                uri=str(first), model=self._request_model(payload))
         if capability == "cover":
             target = out_dir / "cover.png"
             self._gen_image(
@@ -507,8 +544,7 @@ class OpenAIImageProvider(Provider):
                                   data=self._audit_data(
                                       {}, payload, call_cost),
                                   uri=str(target),
-                                  model=(self.conf.get("model")
-                                         or self.DEFAULT_MODEL))
+                                  model=self._request_model(payload))
         raise ProviderError(f"{self.name} 不支持能力: {capability}")
 
 
@@ -553,11 +589,41 @@ class SeedreamImageProvider(OpenAIImageProvider):
         quality = self.QUALITY_ALIASES.get(quality, quality)
         return {
             **data,
-            "model": self.conf.get("model") or self.DEFAULT_MODEL,
+            "model": self._request_model(payload),
             "image_task_class": payload.get("image_task_class", "legacy"),
             "image_quality": quality,
             "unit_cost": unit_cost,
         }
+
+    def validate_request(self, capability, payload, model=""):
+        issues = []
+        try:
+            self._request_model({**(payload or {}), "model_override": model})
+        except ProviderError as exc:
+            issues.append(str(exc))
+        if not str((payload or {}).get("prompt") or "").strip():
+            issues.append("最终提示词为空")
+        entries = _reference_entries(payload or {})
+        if not entries:
+            issues.append("API 加速必须携带至少一张真实参考图")
+        max_refs = int(self.conf.get("max_reference_images", 10))
+        if len(entries) > max_refs:
+            issues.append(
+                f"参考图 {len(entries)} 张超过模型上限 {max_refs} 张")
+        max_bytes = int(self.conf.get(
+            "max_reference_bytes", 10 * 1024 * 1024))
+        for entry in entries:
+            uri = entry["uri"]
+            if uri.startswith(("http://", "https://", "data:image/")):
+                continue
+            path = Path(uri)
+            if not path.exists() or not path.is_file():
+                issues.append(f"必需参考图不存在: {uri}")
+            elif path.suffix.lower() not in _IMG_MEDIA:
+                issues.append(f"不支持参考图格式: {path.suffix}")
+            elif path.stat().st_size > max_bytes:
+                issues.append(f"参考图超过 {max_bytes} 字节: {uri}")
+        return issues
 
     def _seedream_references(self, payload):
         entries = _reference_entries(payload)
@@ -609,7 +675,7 @@ class SeedreamImageProvider(OpenAIImageProvider):
         endpoint = (self.conf.get("endpoint")
                     or self.DEFAULT_ENDPOINT).rstrip("/")
         timeout = self.conf.get("timeout", 300)
-        model = self.conf.get("model") or self.DEFAULT_MODEL
+        model = self._request_model(payload)
         entries, images = self._seedream_references(payload)
         body = {
             "model": model,
