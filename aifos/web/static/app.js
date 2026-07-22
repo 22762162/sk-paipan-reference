@@ -1314,6 +1314,13 @@ function drawSettings(data) {
         el.innerHTML = checksHtml(r.results) + (r.extra
           ? `<div class="${r.ok ? "ok" : "miss"}">${esc(r.extra)}</div>` : "");
         const bad = (r.results || []).find((x) => !x.ok);
+        // 测通了但开关还没开 → 顺手替你打开,免得卡在"未启用"
+        if (r.ok && r.disabled) {
+          const fresh = await post({ provider: name, fields: { enabled: true } });
+          showToast("✓ 测试通过,已自动打开「启用」,该产线已就绪", "ok");
+          drawSettings(fresh);
+          return;
+        }
         showToast(r.ok ? "✓ 测试通过,该产线已就绪"
           : `✗ 测试未通过:${r.extra || (bad && bad.reason) || "未知原因"}`,
           r.ok ? "ok" : "error");
