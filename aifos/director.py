@@ -536,11 +536,16 @@ class Director:
     def _portrait_prompt(self, name, role, style, design=None):
         detail = self._design_line(
             design, keys=("species", "appearance", "hair", "eyes",
+                          "makeup", "accessories", "signature",
                           "temperament", "personality", "costume",
                           "palette"))
         return (f"角色立绘:{name}({role}),{style}"
                 + (f",{detail},表情站姿体现其性格" if detail else "")
-                + ",全身,正面")
+                + ",全身,正面;如有角色参考图,优先锁定该图的人脸骨相、五官比例、"
+                "眼鼻嘴、肤色与年龄感、发际线、发型轮廓、发色、眉眼妆、眼线、"
+                "睫毛、唇妆和身份配饰,必须是同一个人;服装、服装颜色/材质、动作、"
+                "场景和光影按本剧本及当集造型生成,允许与参考图服装不同,除非明确"
+                "要求保留参考图服装")
 
     def _scene_prompt(self, location, style):
         return f"场景概念图:{location},{style},空镜,氛围感"
@@ -1383,7 +1388,8 @@ class Director:
                     f"{base_prompt};人物候选{index}/{CHARACTER_CANDIDATES};"
                     "身份核心设定不变，只允许在脸部骨相细节、神态感染力和"
                     "自然真实感上做克制差异；干净均匀肤质，禁止塑料脸、"
-                    "脏污毛孔、改变发型服装或增加人物")
+                    "脏污毛孔；参考图锁定脸型、五官、发型、发色、妆容和年龄感；"
+                    "服装与配色按当前剧本和本集造型，可与参考图不同；禁止新增人物")
                 seed.append({
                     "id": item_id, "category": "character_candidate",
                     "label": f"{name} · 候选 {index}", "name": name,

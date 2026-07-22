@@ -48,6 +48,14 @@ def test_five_candidates_pause_before_downstream_images(app):
     assert app.assets.list(project["id"], "scene_art") == []
 
 
+def test_portrait_prompt_prioritizes_identity_over_reference_clothing(app):
+    prompt = app.director._portrait_prompt(
+        "林昭", "主角", "现代都市3D半写实",
+        design={"hair": "长直发", "makeup": "清透妆", "costume": "通勤装"})
+    assert "发型轮廓" in prompt and "眉眼妆" in prompt
+    assert "允许与参考图服装不同" in prompt
+
+
 def test_locked_candidate_becomes_only_identity_reference(app):
     title = "最终立绘锁定测试"
     project, episode, script = _to_cast_selection(app, title)

@@ -85,4 +85,5 @@ def test_cover_is_final_high_and_carries_locked_portraits(tmp_path):
     instruction, _targets, _data = build_instruction(
         "cover", payload, tmp_path)
     assert "人工锁定最终立绘" in instruction
+    assert "允许与人物参考图服装不同" in instruction
     assert str(identity) in instruction

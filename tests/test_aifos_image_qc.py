@@ -44,6 +44,7 @@ def test_qc_prompt_and_validation():
     assert "小鹿、石头" in prompt and "共 2 个" in prompt
     assert "名字不代表物种" in prompt
     assert "设定写明物种就按设定画" in prompt
+    assert "允许与身份参考图不同" in prompt
     assert "悬挂的衣物" in prompt
     assert "全景" in prompt
     ok = {"pass": True, "issues": []}
@@ -384,6 +385,7 @@ def test_codex_qc_instruction_and_parse(tmp_path, monkeypatch):
                      "designs": "小鹿(发型:银白短发)",
                      "location": "地铁站", "forbid": ["悬挂衣物"]}, tmp_path)
     assert "/tmp/f.png" in instruction and "小鹿" in instruction
+    assert "允许与身份参考图不同" in instruction
     assert '"pass"' in instruction
     assert targets == [] and data["qc"] is True
 
