@@ -235,6 +235,91 @@ class MockProvider(Provider):
                      "颈侧妖纹"],
     }
 
+    STORY_COSTUME_POOLS = {
+        "xianxia": {
+            "costume": ["交领束腰长衫,外罩纱质大氅,层次三层",
+                        "短打劲装配护腕,束腿裤,轻便利落",
+                        "宽袖道袍,腰悬玉牌,内衬素白"],
+            "detail": ["袖口云纹刺绣,玉扣与软底云靴",
+                       "护腕有旧战痕,腰封藏符,轻便布靴",
+                       "领口锁子纹,玉牌刻符,云头履"],
+            "palette": ["月白+黛青,点缀朱砂红", "玄黑+石青,点缀鎏金",
+                        "藕荷+鹅黄,点缀草绿"],
+            "variants": [
+                {"label": "行旅探查", "costume": "耐磨短打与轻便斗篷",
+                 "props": "铜制罗盘与符纸", "temperament": "警觉克制"},
+                {"label": "对战冲突", "costume": "收袖劲装与护腕护膝",
+                 "props": "佩剑与破损护符", "temperament": "锋利决绝"},
+                {"label": "封印仪式", "costume": "宽袖法袍与层叠披帛",
+                 "props": "发光玉牌与朱砂阵笔", "temperament": "肃穆坚定"},
+            ],
+        },
+        "urban": {
+            "costume": ["剪裁利落的深色西装与真丝衬衫",
+                        "简洁针织上衣配高腰直筒裤和短外套",
+                        "真实可辨认的外卖配送制服与反光条"],
+            "detail": ["金属袖扣,窄版皮带,通勤皮鞋",
+                       "织物纹理清晰,帆布包与低跟鞋",
+                       "品牌区域留空,保温箱、头盔和工牌"],
+            "palette": ["炭灰+冷白,点缀酒红", "奶油白+雾蓝,点缀焦糖",
+                        "制服蓝+荧光黄,点缀黑色"],
+            "variants": [
+                {"label": "工作身份", "costume": "符合职业的制服或工装",
+                 "props": "工牌、职业装备与随身包", "temperament": "专注可靠"},
+                {"label": "冲突加班", "costume": "卷袖衬衫、功能马甲与疲惫层次",
+                 "props": "文件夹、手机或工具箱", "temperament": "压迫中坚持"},
+                {"label": "关键会面", "costume": "为身份升级的正式造型",
+                 "props": "关键文件或象征性物件", "temperament": "克制有锋芒"},
+            ],
+        },
+        "campus": {
+            "costume": ["校服西装外套与百褶裙/长裤",
+                        "社团运动服配帆布鞋和校徽",
+                        "毕业典礼正装与校徽领带"],
+            "detail": ["校徽、课本和针织背心", "护腕、社团徽章和运动鞋",
+                       "学士帽、证书和整洁皮鞋"],
+            "palette": ["藏蓝+白,点缀红", "墨绿+米白,点缀橙",
+                        "黑色+象牙白,点缀金色"],
+            "variants": [
+                {"label": "日常上课", "costume": "合体校服与书包",
+                 "props": "课本、学生证", "temperament": "自然青涩"},
+                {"label": "社团行动", "costume": "社团运动服或排练服",
+                 "props": "社团徽章、球具或乐器", "temperament": "投入鲜活"},
+                {"label": "公开比赛", "costume": "比赛服或整洁正式校服",
+                 "props": "奖状、麦克风或比赛道具", "temperament": "紧张坚定"},
+            ],
+        },
+        "idol": {
+            "costume": ["主题舞台服与层叠亮片短外套",
+                        "练习室功能运动装与成员识别色",
+                        "打歌主舞台定制造型与耳麦"],
+            "detail": ["耳麦、成员色发饰和舞台靴", "护腕、毛巾和运动鞋",
+                       "水钻、流苏、耳返和舞台靴"],
+            "palette": ["黑银+成员色", "白灰+糖果色", "深紫+冷金"],
+            "variants": [
+                {"label": "练习室", "costume": "便于动作的功能练习服",
+                 "props": "耳机、毛巾和水瓶", "temperament": "专注真实"},
+                {"label": "后台准备", "costume": "半成品舞台服与外搭",
+                 "props": "耳返、麦克风和成员徽章", "temperament": "紧张兴奋"},
+                {"label": "主舞台", "costume": "与歌曲主题绑定的完整舞台服",
+                 "props": "麦克风与灯光反射饰件", "temperament": "耀眼自信"},
+            ],
+        },
+    }
+
+    @staticmethod
+    def _design_genre(payload, character):
+        text = " ".join(str(payload.get(key) or "") for key in (
+            "project_title", "premise", "style", "logline"))
+        text += " " + json.dumps(character, ensure_ascii=False)
+        if any(word in text for word in GENRE_KEYWORDS["idol"]):
+            return "idol"
+        if any(word in text for word in GENRE_KEYWORDS["campus"]):
+            return "campus"
+        if any(word in text for word in GENRE_KEYWORDS["urban"]):
+            return "urban"
+        return "xianxia"
+
     def _gen_character_design(self, payload, out_dir):
         seed = _digest(payload)
         designs = []
@@ -243,6 +328,40 @@ class MockProvider(Provider):
             for f_no, (field, pool) in enumerate(
                     sorted(self.DESIGN_POOLS.items())):
                 design[field] = _pick(pool, seed, idx * 13 + f_no)
+            genre = self._design_genre(payload, character)
+            story_pool = self.STORY_COSTUME_POOLS[genre]
+            design["costume"] = _pick(
+                story_pool["costume"], seed, idx * 17 + 2)
+            design["costume_detail"] = _pick(
+                story_pool["detail"], seed, idx * 17 + 3)
+            design["palette"] = _pick(
+                story_pool["palette"], seed, idx * 17 + 4)
+            role = character.get("role") or "角色"
+            setting = character.get("era_setting") or (
+                "仙侠世界与古代地域" if genre == "xianxia" else
+                "当代城市与真实生活场景" if genre == "urban" else
+                "当代校园" if genre == "campus" else "当代舞台与练习室")
+            design.update({
+                "background_prompt": character.get(
+                    "background_prompt") or
+                    f"{character.get('name', '角色')}是{setting}中的{role};"
+                    f"其外冷内热/目标明确的性格通过眼神、站姿和{story_pool['variants'][0]['props']}外化;"
+                    "服装必须随剧情场合变化并保留身份辨识度",
+                "era_setting": character.get("era_setting") or setting,
+                "occupation": character.get("occupation") or role,
+                "motivation": character.get("motivation") or
+                    "在本集冲突中完成目标并保护重要关系",
+                "backstory": character.get("backstory") or
+                    "曾经历一次改变其信念的事件,因此形成当前性格",
+                "relationships": character.get("relationships") or
+                    "与同伴互相扶持,与对手存在目标冲突",
+                "costume_direction": character.get("costume_direction") or
+                    f"服装按{setting}、{role}与剧情场合区分,材质和装备必须可辨认",
+                "signature_props": character.get("signature_props") or
+                    story_pool["variants"][0]["props"],
+                "visual_variants": character.get("visual_variants") or
+                    story_pool["variants"],
+            })
             # 参考图为最高标准:脸部特征/发型/风格字段锁定到参考图
             references = character.get("reference_images") or []
             if references:
@@ -258,6 +377,35 @@ class MockProvider(Provider):
         data = {"designs": designs}
         uri = _json_artifact(out_dir / "character_designs.json", data)
         return data, uri
+
+    def _enrich_script_characters(self, script, payload, genre=None):
+        """占位剧本也输出完整人物背景,让后续真实出图不靠默认都市模板。"""
+        for character in script.get("characters", []):
+            genre_name = genre or self._design_genre(payload, character)
+            story_pool = self.STORY_COSTUME_POOLS[genre_name]
+            role = character.get("role") or "角色"
+            setting = ("仙侠世界与古代地域" if genre_name == "xianxia" else
+                       "当代城市与真实生活场景" if genre_name == "urban" else
+                       "当代校园" if genre_name == "campus" else
+                       "当代舞台与练习室")
+            name = character.get("name", "角色")
+            character.setdefault(
+                "background_prompt",
+                f"{name}是{setting}中的{role},带着一段改变信念的过往;"
+                "当前目标与本集冲突相连,外冷内热/目标明确的性格通过眼神、站姿、"
+                f"标志道具{story_pool['variants'][0]['props']}和服装层次外化")
+            character.setdefault("era_setting", setting)
+            character.setdefault("occupation", role)
+            character.setdefault("motivation", "完成本集目标并守护重要关系")
+            character.setdefault("backstory", "曾经历一次改变其信念的事件")
+            character.setdefault("relationships", "与同伴互相扶持,与对手存在目标冲突")
+            character.setdefault(
+                "costume_direction",
+                f"按{setting}、{role}和剧情场合设计,不同场合使用不同材质、"
+                "层次、配色和职业装备,不得套用现代都市便服")
+            character.setdefault("signature_props", story_pool["variants"][0]["props"])
+            character.setdefault("visual_variants", story_pool["variants"])
+        return script
 
     def _gen_drama_script(self, payload, out_dir, genre):
         flavor = DRAMA_FLAVORS[genre]
@@ -304,6 +452,7 @@ class MockProvider(Provider):
             ],
             "scenes": scenes,
         }
+        self._enrich_script_characters(script, payload, genre)
         uri = _json_artifact(out_dir / "script.json", script)
         return script, uri
 
@@ -357,6 +506,7 @@ class MockProvider(Provider):
             "characters": [{"name": idol, "role": "主角"}],
             "scenes": scenes,
         }
+        self._enrich_script_characters(script, payload, "idol")
         uri = _json_artifact(out_dir / "script.json", script)
         return script, uri
 
@@ -408,6 +558,7 @@ class MockProvider(Provider):
             ],
             "scenes": scenes,
         }
+        self._enrich_script_characters(script, payload, "idol")
         uri = _json_artifact(out_dir / "script.json", script)
         return script, uri
 

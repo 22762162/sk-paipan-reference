@@ -1970,6 +1970,8 @@ function showScriptOverlay(data, episodeId) {
       <p class="logline">${esc(script.logline || "")}</p>
       <div class="cast">${(script.characters || []).map((c) =>
         `<span class="chip">${esc(c.name)} · ${esc(c.role || "")}</span>`).join("")}</div>
+      <div class="script-character-profiles">${(script.characters || [])
+        .map(characterProfileHtml).join("")}</div>
       ${script.scenes.map((s) => `
         <section class="scene">
           <div class="scene-head"><span class="scene-no">第 ${s.scene_no} 场</span>
@@ -3431,19 +3433,56 @@ const DESIGN_LABELS_JS = [
   ["personality", "性格"], ["temperament", "气质"], ["appearance", "外貌"],
   ["hair", "发型"], ["eyes", "眼睛"], ["makeup", "妆容"],
   ["costume", "服装"], ["costume_detail", "服装细节"],
-  ["accessories", "配饰"], ["palette", "配色"], ["signature", "标志特征"]];
+  ["accessories", "配饰"], ["palette", "配色"], ["signature", "标志特征"],
+  ["background_prompt", "人物背景提示词"], ["era_setting", "时代/世界观"],
+  ["occupation", "职业身份"], ["motivation", "核心动机"],
+  ["backstory", "人物经历"], ["relationships", "人物关系"],
+  ["costume_direction", "服装设计逻辑"], ["signature_props", "标志道具"],
+  ["visual_variants", "剧情造型方案"]];
+
+function designValueText(value) {
+  if (value == null) return "";
+  if (Array.isArray(value) && !value.length) return "";
+  if (typeof value === "object" && !Array.isArray(value)
+      && !Object.keys(value).length) return "";
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
 
 function designHtml(design) {
   if (!design) return "";
   const rows = DESIGN_LABELS_JS
-    .filter(([key]) => (design[key] || "").trim())
+    .map(([key, label]) => [key, label, designValueText(design[key])])
+    .filter(([, , value]) => value.trim())
     .map(([key, label]) =>
-      `<div class="design-row"><b>${label}</b><span>${esc(design[key])}</span></div>`);
+      `<div class="design-row"><b>${label}</b><span>${esc(designValueText(design[key]))}</span></div>`);
   if (!rows.length) return "";
-  const brief = [design.personality, design.temperament]
+  const brief = [designValueText(design.personality),
+    designValueText(design.temperament), designValueText(design.era_setting)]
     .filter(Boolean).join(" · ");
   return `<details class="design-box">
     <summary>🧬 人物设定${brief ? ` · ${esc(brief)}` : ""}(点开看全部,出图提示词按它生成)</summary>
+    <div class="design-grid">${rows.join("")}</div></details>`;
+}
+
+function characterProfileHtml(character) {
+  if (!character) return "";
+  const labels = [
+    ["background_prompt", "人物背景提示词"], ["era_setting", "时代/世界观"],
+    ["occupation", "职业身份"], ["motivation", "核心动机"],
+    ["backstory", "人物经历"], ["relationships", "人物关系"],
+    ["costume_direction", "服装设计逻辑"], ["signature_props", "标志道具"],
+    ["visual_variants", "剧情造型方案"]];
+  const rows = labels.map(([key, label]) =>
+    `<div class="design-row"><b>${label}</b><span>${esc(designValueText(character[key]))}</span></div>`)
+    .filter((row, index) => {
+      const key = labels[index][0];
+      return designValueText(character[key]).trim();
+    });
+  if (!rows.length) return "";
+  const summary = [character.name, character.role, character.era_setting,
+    character.occupation].map(designValueText).filter(Boolean).join(" · ");
+  return `<details class="design-box script-profile-box">
+    <summary>📚 ${esc(summary)} · 剧情人物背景与造型提示</summary>
     <div class="design-grid">${rows.join("")}</div></details>`;
 }
 
@@ -4448,6 +4487,8 @@ function scriptBodyHtml(script) {
       <p class="logline">${esc(script.logline || "")}</p>
       <div class="cast">${(script.characters || []).map((c) =>
         `<span class="chip">${esc(c.name)} · ${esc(c.role || "")}</span>`).join("")}</div>
+      <div class="script-character-profiles">${(script.characters || [])
+        .map(characterProfileHtml).join("")}</div>
       ${script.scenes.map((s) => `
         <section class="scene">
           <div class="scene-head"><span class="scene-no">第 ${s.scene_no} 场</span>

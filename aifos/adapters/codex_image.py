@@ -63,7 +63,8 @@ def _space_line(payload):
 
 def _style_line(payload):
     style = payload.get("style") or (
-        "现代都市精品漫剧，电影级半写实人物与场景，现代服装和现代建筑")
+        "剧情自适应精品漫剧；服装、发型、道具、建筑和光影服从剧本时代/世界观、"
+        "地域、职业、人物性格与剧情阶段")
     if payload.get("portrait_candidate"):
         return (f"画风要求:{style}；高细节；严格按该媒介和时代执行；"
                 "定角候选必须保持同一项目画风；无参考图时服装、妆容或面部修饰"

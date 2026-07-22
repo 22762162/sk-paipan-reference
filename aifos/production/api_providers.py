@@ -437,6 +437,14 @@ class OpenAIImageProvider(Provider):
         if (payload.get("portrait") or payload.get("portrait_candidate")
                 or payload.get("character_sheet")):
             parts.append(_CHARACTER_BACKGROUND_DIRECTIVE)
+        story = payload.get("character_background")
+        if story:
+            if isinstance(story, (dict, list)):
+                story = json.dumps(story, ensure_ascii=False, separators=(",", ":"))
+            parts.append(
+                "人物剧情设定硬约束(优先于通用造型模板):"
+                f"{story};服装、发型、材质、配色和道具必须符合其时代/世界观、"
+                "职业、性格、关系与当前剧情场合,不得默认现代都市便服。")
         if refs:
             if payload.get("portrait_candidate"):
                 parts.append(

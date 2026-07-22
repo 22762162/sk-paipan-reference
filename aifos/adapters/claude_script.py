@@ -24,12 +24,20 @@ SCRIPT_PROMPT = """你是漫剧编剧。为作品《{title}》第{episode}集创
 要求:
 - 3 到 5 场戏,每场 2-4 句台词,适合 1-2 分钟短剧;
 - 台词口语化,单句不超过 25 个字;
+- 每个角色都必须先写完整人物背景提示词,不能只写姓名和标签。背景要和本集剧情、时代/世界观、职业、人物性格、关系、目标与冲突绑定;
+- `costume_direction` 必须给出可画的服装逻辑(款式、材质、层次、颜色、职业制服/时代服饰和剧情场合),禁止所有角色默认现代都市便服;
+- `visual_variants` 至少给出 3 个剧情兼容的造型方向(例如日常、行动/冲突、仪式/舞台),后续人物候选图必须据此做明显不同的服装与气质变化;
 - 只输出一个 JSON 对象,不要任何其他文字、解释或 Markdown 代码块。
 
 JSON 格式(字段必须齐全):
 {{"project_title": "{title}", "episode_number": {episode},
  "episode_title": "本集小标题", "logline": "一句话梗概",
- "characters": [{{"name": "角色名", "role": "主角/重要配角/非重要配角/背景路人"}}],
+ "characters": [{{"name": "角色名", "role": "主角/重要配角/非重要配角/背景路人",
+   "background_prompt": "可直接用于出图的详细人物背景提示词:成长经历、当前处境、核心动机、心理矛盾和视觉象征",
+   "era_setting": "时代/世界观/地域", "occupation": "职业/社会身份",
+   "motivation": "核心目标与本集欲望", "backstory": "关键经历、秘密或创伤",
+   "relationships": "与其他角色的关系及冲突", "costume_direction": "服装如何体现身份、性格和剧情阶段",
+   "signature_props": "标志性道具或动作", "visual_variants": "日常/冲突/关键场合等不同造型方向"}}],
  "scenes": [{{"scene_no": 1, "location": "地点",
    "characters": ["出场角色名"], "action": "本场动作描述",
    "lines": [{{"character": "角色名", "dialogue": "台词"}}]}}]}}"""
@@ -42,13 +50,20 @@ IDOL_PROMPT = """你是 AI 虚拟偶像「{persona}」的内容策划。为第{e
 - 若主题涉及女团/男团/组合,设 2-4 名成员(队长/主唱/舞担等),
   characters 列出全部成员,台词在成员间分配;否则全部台词由
   「{persona}」一人口播;
+- 每个成员都要写与团内定位、歌曲主题、成长经历和本期冲突绑定的人物背景提示词、
+  职业/舞台身份、性格外化方式、服装逻辑和至少 3 套练习室/后台/舞台造型方向;
 - 台词口语化、有网感,单句不超过 22 个字;
 - 只输出一个 JSON 对象,不要任何其他文字、解释或 Markdown 代码块。
 
 JSON 格式(字段必须齐全,characters 只含「{persona}」一人):
 {{"project_title": "{persona}", "episode_number": {episode},
  "episode_title": "本期小标题", "logline": "一句话内容概要",
- "characters": [{{"name": "{persona}", "role": "主角"}}],
+ "characters": [{{"name": "{persona}", "role": "主角",
+   "background_prompt": "与主题和成员定位绑定的人物背景提示词",
+   "era_setting": "时代/舞台世界观", "occupation": "职业/团内身份",
+   "motivation": "本期目标", "backstory": "成长经历",
+   "relationships": "团内关系", "costume_direction": "练习室/后台/舞台服装逻辑",
+   "signature_props": "标志道具", "visual_variants": "至少三套剧情造型方向"}}],
  "scenes": [{{"scene_no": 1, "location": "场景",
    "characters": ["{persona}"], "action": "画面动作描述",
    "lines": [{{"character": "{persona}", "dialogue": "口播台词"}}]}}]}}"""
@@ -99,6 +114,18 @@ def validate_script(script, payload):
         return "缺少 scenes"
     if not script.get("characters"):
         return "缺少 characters"
+    character_fields = {
+        "background_prompt": "", "era_setting": "", "occupation": "",
+        "motivation": "", "backstory": "", "relationships": "",
+        "costume_direction": "", "signature_props": "",
+        "visual_variants": [],
+    }
+    for character in script["characters"]:
+        if not isinstance(character, dict) or not character.get("name"):
+            return f"角色字段不全: {character}"
+        for key, default in character_fields.items():
+            character.setdefault(key, default.copy() if isinstance(default, list)
+                                else default)
     for scene in script["scenes"]:
         if not scene.get("location") or "scene_no" not in scene:
             return f"场次字段不全: {scene}"
@@ -148,12 +175,22 @@ def validate_storyboard(storyboard):
 
 DESIGN_PROMPT = """你是漫剧人物设定师。为作品《{title}》的角色写生产级人物设定,
 供 AI 出图使用(立绘/四视图/特写/妆容/服装设定全部依据它)。
-画风:{style}。剧情梗概:{logline}。
+画风:{style}。剧情梗概:{logline}。本集前提:{premise}。
 
 角色名单(全部要写,名字必须逐字一致):{names}
+剧本人物背景(必须逐条吸收,不得改成模板化现代都市):{story_context}
+本集场景锚点(用于决定每套服装/道具的剧情场合):{scene_context}
 {references}
 要求:
 - 每个字段是一段具体、可画出来的描述(不要空话套话);
+- 必须先理解角色的时代/世界观、地域、职业、成长经历、核心目标、关系和本集冲突,
+  再决定服装和造型;人物背景与画风冲突时以剧情时代/世界观为准,不能把所有人都套成现代都市;
+- `background_prompt` 要写成一段可直接拼进文生图的完整人物背景提示词,至少包含身份来源、
+  当前处境、性格外化方式、动机、冲突、关系和视觉符号;
+- `era_setting`、`occupation`、`motivation`、`backstory`、`relationships`、
+  `costume_direction`、`signature_props` 必须具体;职业身份要能从服装和装备一眼识别;
+- `visual_variants` 必须给出 3-5 个与剧情兼容的不同造型方向,每项写清场合、服装、材质、
+  配色、配饰/道具和气质变化;不是同一套衣服只换动作;
 - 给每个角色标注重要度角色:主角、重要配角、非重要配角或背景路人;背景路人不单独生成角色立绘;
 - 性格要能从表情神态与站姿体现;外貌含脸型/肤色/身材比例;
 - 服装要具体到款式、材质、层次;配色给出主色与点缀色;
@@ -174,13 +211,25 @@ JSON 格式:
   "makeup": "妆容细节", "costume": "服装(款式/材质/层次)",
   "costume_detail": "服装细节(纹样/扣饰/鞋履)",
   "accessories": "配饰", "palette": "主配色与点缀色",
-  "signature": "标志性辨识特征"}}]}}"""
+  "signature": "标志性辨识特征",
+  "background_prompt": "完整人物背景提示词(身份/经历/处境/动机/冲突/视觉象征)",
+  "era_setting": "时代/世界观/地域", "occupation": "职业/社会身份",
+  "motivation": "核心目标", "backstory": "关键经历或秘密",
+  "relationships": "关系与冲突", "costume_direction": "服装设计逻辑",
+  "signature_props": "标志性道具", "visual_variants": [
+    {{"label": "日常/身份", "costume": "...", "palette": "...", "props": "...", "temperament": "..."}},
+    {{"label": "行动/冲突", "costume": "...", "palette": "...", "props": "...", "temperament": "..."}},
+    {{"label": "关键场合", "costume": "...", "palette": "...", "props": "...", "temperament": "..."}}
+  ]}}]}}"""
 
 # 人物设定必填字段;缺失时置空串,提示词侧自动跳过
 DESIGN_FIELDS = ("species", "personality", "temperament",
                  "appearance", "hair",
                  "eyes", "makeup", "costume", "costume_detail",
-                 "accessories", "palette", "signature")
+                 "accessories", "palette", "signature", "background_prompt",
+                 "era_setting", "occupation", "motivation", "backstory",
+                 "relationships", "costume_direction", "signature_props",
+                 "visual_variants")
 
 
 def validate_design(data, payload):
@@ -287,7 +336,14 @@ def build_prompt(capability, payload):
             title=payload.get("project_title", ""),
             style=payload.get("style", "") or "国风漫剧",
             logline=payload.get("logline", "") or "见角色名单",
-            names=names, references=references)
+            premise=payload.get("premise", "") or "见本集剧本",
+            names=names,
+            story_context=json.dumps(
+                payload.get("character_context") or payload.get("characters", []),
+                ensure_ascii=False),
+            scene_context=json.dumps(payload.get("scene_context") or [],
+                                     ensure_ascii=False),
+            references=references)
     if capability == "script":
         feedback = payload.get("feedback", "")
         if payload.get("template") == "idol":

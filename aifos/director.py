@@ -55,9 +55,11 @@ MODERN_OTOME_STYLE = (
     "2D平涂、动漫线稿和历史建筑"
 )
 DEFAULT_VISUAL_STYLE = (
-    "现代都市精品漫剧，电影级半写实人物与场景，现代服装和现代建筑，"
-    "自然皮肤质感，细腻灯光；禁止古装、汉服和历史场景"
+    "剧情自适应精品漫剧，电影级半写实人物与场景；服装、发型、道具、建筑和光影"
+    "必须服从剧本的时代/世界观、地域、职业、人物性格与剧情阶段；自然材质，"
+    "统一人物造型；禁止把未明确的故事默认套成现代都市便服"
 )
+LEGACY_DEFAULT_VISUAL_STYLE_PREFIX = "现代都市精品漫剧"
 
 
 def infer_visual_style(premise="", project_title=""):
@@ -72,6 +74,21 @@ def infer_visual_style(premise="", project_title=""):
     if any(word in text for word in ("古装", "仙侠", "武侠", "国风")):
         return ("国风漫剧，精致2D动画质感，服装与建筑严格符合剧情时代，"
                 "高细节，统一人物造型")
+    if any(word in text for word in ("民国", "年代", "旧上海", "旗袍")):
+        return ("民国年代漫剧，电影级半写实质感；服装、发型、街景与道具严格"
+                "符合民国时代和人物身份，统一角色造型")
+    if any(word in text for word in ("校园", "高中", "大学", "学生")):
+        return ("青春校园漫剧，清透电影光影；校服、社团服和生活造型严格按"
+                "校园剧情与人物性格区分，统一角色造型")
+    if any(word in text for word in ("赛博", "未来", "星际", "机甲", "末世")):
+        return ("未来幻想漫剧，电影级科幻材质与光影；服装、装备和环境严格"
+                "按世界观、阵营和人物功能设计，统一角色造型")
+    if any(word in text for word in ("女团", "男团", "偶像", "打歌", "舞台")):
+        return ("舞台偶像漫剧，精致半写实角色与舞台灯光；成员服装按定位、"
+                "歌曲主题和剧情场合区分，禁止千篇一律通勤装")
+    if any(word in text for word in ("西幻", "魔法", "骑士", "精灵", "吸血鬼")):
+        return ("西幻漫剧，精致半写实幻想质感；服装、护具、法器和建筑严格"
+                "按阵营、阶层与世界观设计，统一角色造型")
     title = (project_title or "").lower()
     if any(word in title for word in ("仙侠", "修仙", "妖", "灵", "剑", "宗门")):
         return ("国风漫剧，精致2D动画质感，服装与建筑严格符合剧情时代，"
@@ -304,10 +321,15 @@ class Director:
             force = True  # 剧本变了,旧镜头/配音不可复用
         existing_project = self.projects.get_project(project_title)
         requested_style = (style or "").strip()
+        stored_style = (existing_project["style"] if existing_project else "")
+        # 旧版本把未指定画风写成现代都市默认值;升级时按当前剧情重新推断,
+        # 但用户明确选过的现代风格仍原样保留。
+        if (not requested_style and stored_style.startswith(
+                LEGACY_DEFAULT_VISUAL_STYLE_PREFIX)):
+            stored_style = ""
         visual_style = (requested_style
-                        or (existing_project["style"]
-                            if existing_project and existing_project["style"]
-                            else infer_visual_style(premise, project_title)))
+                        or stored_style
+                        or infer_visual_style(premise, project_title))
         project, created = self.projects.get_or_create_project(
             project_title, style=visual_style,
             kind=kind if kind in ("drama", "idol") else "drama")
@@ -566,13 +588,17 @@ class Director:
     # 每类资产套件重点采用的人物设定字段(全用会超长,按图取材)
     SHEET_DESIGN_KEYS = {
         "turnaround": ("species", "appearance", "hair", "costume",
-                       "palette"),
+                       "palette", "era_setting", "occupation",
+                       "costume_direction"),
         "closeup": ("species", "appearance", "hair", "eyes",
-                    "temperament"),
-        "features": ("signature", "appearance", "hair", "palette"),
-        "makeup": ("makeup", "eyes", "palette"),
-        "costume": ("costume", "palette", "accessories"),
-        "costume_detail": ("costume_detail", "accessories"),
+                    "temperament", "background_prompt"),
+        "features": ("signature", "appearance", "hair", "palette",
+                      "signature_props"),
+        "makeup": ("makeup", "eyes", "palette", "personality"),
+        "costume": ("costume", "palette", "accessories",
+                     "occupation", "costume_direction"),
+        "costume_detail": ("costume_detail", "accessories",
+                            "signature_props", "visual_variants"),
     }
     DESIGN_LABELS = (
         ("species", "形态"),
@@ -580,7 +606,23 @@ class Director:
         ("temperament", "气质"), ("personality", "性格"),
         ("makeup", "妆容"), ("costume", "服装"),
         ("costume_detail", "服装细节"), ("accessories", "配饰"),
-        ("palette", "配色"), ("signature", "标志特征"))
+        ("palette", "配色"), ("signature", "标志特征"),
+        ("background_prompt", "人物背景提示词"),
+        ("era_setting", "时代/世界观"), ("occupation", "职业身份"),
+        ("motivation", "核心动机"), ("backstory", "人物经历"),
+        ("relationships", "人物关系"),
+        ("costume_direction", "服装设计逻辑"),
+        ("signature_props", "标志道具"),
+        ("visual_variants", "剧情造型方案"))
+
+    @staticmethod
+    def _design_value(value):
+        """把 Claude 返回的列表/对象稳定地拼进提示词,不丢失造型方案。"""
+        if isinstance(value, (list, dict)):
+            if not value:
+                return ""
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return str(value or "").strip()
 
     def _design_line(self, design, keys=None):
         """人物设定 → 提示词片段;keys 限定只取某几个字段。"""
@@ -590,7 +632,7 @@ class Director:
         for key, label in self.DESIGN_LABELS:
             if keys is not None and key not in keys:
                 continue
-            value = str(design.get(key) or "").strip()
+            value = self._design_value(design.get(key))
             if value:
                 parts.append(f"{label}:{value}")
         return ",".join(parts)
@@ -638,9 +680,13 @@ class Director:
             design, keys=("species", "appearance", "hair", "eyes",
                           "makeup", "accessories", "signature",
                           "temperament", "personality", "costume",
-                          "palette"))
+                          "palette", "background_prompt", "era_setting",
+                          "occupation", "motivation", "costume_direction",
+                          "signature_props"))
         return (f"角色立绘:{name}({role}),{style}"
                 + (f",{detail},表情站姿体现其性格" if detail else "")
+                + ";服装和造型必须从人物背景提示词、时代/世界观、职业、性格、"
+                "本集剧情与当前场合推导，不得把不同角色模板化成同一种现代都市穿搭"
                 + ",全身,正面;如有角色参考图,优先锁定该图的人脸骨相、五官比例、"
                 "眼鼻嘴、肤色与年龄感、发际线、发型轮廓、发色、眉眼妆、眼线、"
                 "睫毛、唇妆和身份配饰,必须是同一个人;服装、服装颜色/材质、动作、"
@@ -663,18 +709,61 @@ class Director:
                 "temperament": str(
                     design.get("temperament") or look["temperament"]),
             })
+        story_variants = self._story_variants(design)
+        story_variant = (story_variants[index - 1]
+                         if index <= len(story_variants) else None)
+        if story_variant:
+            label = story_variant.get("label") or story_variant.get("name")
+            if label:
+                story_label = str(label)
+            else:
+                story_label = ""
+            for key in ("hair", "makeup", "costume", "temperament"):
+                if story_variant.get(key):
+                    look[key] = self._design_value(story_variant[key])
+        else:
+            story_label = ""
         return {
             "variant_id": template["variant_id"],
-            "variant_label": template["variant_label"],
+            "variant_label": (f"{template['variant_label']} · "
+                              f"{story_label}"
+                              if story_label
+                              else template["variant_label"]),
             "look_variant": look,
             "variant_source": "generated",
+            "story_variant": story_variant or {},
         }
+
+    @staticmethod
+    def _story_variants(design):
+        """读取剧本/人物设定给出的剧情造型方案。"""
+        if not design:
+            return []
+        value = design.get("visual_variants") or design.get("outfit_variants")
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        if isinstance(value, dict):
+            return [value]
+        if not isinstance(value, str) or not value.strip():
+            return []
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return [item for item in parsed if isinstance(item, dict)]
+        except (TypeError, ValueError):
+            pass
+        return [{"label": part.strip(), "costume": part.strip()}
+                for part in value.replace("；", "|").split("|")
+                if part.strip()]
 
     def _candidate_portrait_prompt(self, name, role, style, design, variant,
                                    has_reference=False):
         """定角候选只锁角色边界，显式放开尚未定版的造型变量。"""
         identity = self._design_line(
-            design, keys=("species", "appearance", "eyes", "personality"))
+            design, keys=("species", "appearance", "eyes", "personality",
+                          "background_prompt", "era_setting", "occupation",
+                          "motivation", "costume_direction",
+                          "signature_props"))
         look = variant["look_variant"]
         if has_reference:
             hair = "严格保持参考图发型轮廓、发际线和发色,不得改发型"
@@ -695,8 +784,15 @@ class Director:
             f";本套造型方向:{variant['variant_label']}"
             f";发型:{hair};妆容或面部修饰:{makeup}"
             f";服装:{look['costume']};气质:{look['temperament']}"
-            ";服装轮廓、妆容强度和外显气质必须与其他候选明显不同,"
-            "但必须适配角色的性别表达、年龄、职业、物种、时代背景和项目画风"
+            + (f";剧情场合:{variant.get('story_variant', {}).get('occasion') or variant.get('story_variant', {}).get('scene')}"
+               if variant.get("story_variant", {}).get("occasion")
+               or variant.get("story_variant", {}).get("scene") else "")
+            + (f";配饰/道具:{variant.get('story_variant', {}).get('props') or variant.get('story_variant', {}).get('accessories')}"
+               if variant.get("story_variant", {}).get("props")
+               or variant.get("story_variant", {}).get("accessories") else "")
+            + ";服装轮廓、妆容强度和外显气质必须与其他候选明显不同,"
+            + "但必须适配角色的性别表达、年龄、职业、物种、时代背景、人物背景和项目画风;"
+            + "造型变化优先体现剧情场合与人物性格，不得套用现代都市默认模板"
             f";{variant_rule};{WORKWEAR_RULE}{CHARACTER_BACKGROUND_RULE}"
             ";全身正面自然站姿，动作只服务造型展示；干净均匀肤质，禁止塑料脸、"
             "脏污毛孔；单人，禁止新增人物")
@@ -711,6 +807,8 @@ class Director:
             design, keys=self.SHEET_DESIGN_KEYS.get(key))
         return (f"角色{label}:{name}({role}),{style},{desc}"
                 + (f";人物设定:{detail}" if detail else "")
+                + ";本套资产的造型必须服从人物背景、时代/世界观、职业、性格和剧情场合，"
+                "不得把服装统一成现代都市模板;"
                 + f";与立绘同一人物、同一发型服装配色,严格保持形象一致;"
                 f"{WORKWEAR_RULE}{CHARACTER_BACKGROUND_RULE}")
 
@@ -1081,7 +1179,8 @@ class Director:
             design = self._character_design(project_id, name)
             line = self._design_line(design, keys=(
                 "species", "hair", "costume",
-                "signature")) if design else ""
+                "signature", "era_setting", "occupation",
+                "costume_direction", "signature_props")) if design else ""
             designs.append(f"{name}({line})" if line else name)
         identity_refs = self._identity_references(
             project_id, characters,
@@ -1568,10 +1667,45 @@ class Director:
         self._plan_seed(ctx, "frames", frame_items)
 
     # ---- 各阶段实现 ----
+    @staticmethod
+    def _normalize_script_character_profiles(script, premise=""):
+        """为人工导入/旧版剧本补齐人物背景字段,不覆盖用户已有设定。"""
+        if not isinstance(script, dict):
+            return script
+        scenes = script.get("scenes") or []
+        locations = {}
+        for scene in scenes:
+            for name in scene.get("characters", []) or []:
+                locations.setdefault(name, []).append(
+                    scene.get("location") or "本集场景")
+        for character in script.get("characters", []) or []:
+            if not isinstance(character, dict) or not character.get("name"):
+                continue
+            name = character["name"]
+            role = character.get("role") or "角色"
+            place = "、".join(dict.fromkeys(locations.get(name, []))) or "本集剧情场景"
+            character.setdefault(
+                "background_prompt",
+                f"{name}作为{role}出现在{place},其经历与本集前提{premise or '当前冲突'}"
+                "相连;通过眼神、站姿、随身物件和服装层次外化性格,造型不得脱离故事")
+            character.setdefault("era_setting", "由本集剧情和场景决定的时代/世界观")
+            character.setdefault("occupation", role)
+            character.setdefault("motivation", "推动本集目标并回应当前冲突")
+            character.setdefault("backstory", "待编剧根据剧情补充的关键经历")
+            character.setdefault("relationships", "与本集同场角色存在剧情关系,按台词和行动体现")
+            character.setdefault(
+                "costume_direction",
+                "服装须符合时代/世界观、职业、性格和当前场合;至少区分日常、冲突、关键场合三套造型")
+            character.setdefault("signature_props", "由职业、经历或本集关键事件决定的标志道具")
+            character.setdefault("visual_variants", [])
+        return script
+
     def _stage_script(self, ctx):
         episode = ctx["episode"]
         provided = ctx.get("provided_script")
         if provided is not None:
+            self._normalize_script_character_profiles(
+                provided, ctx["episode"].get("premise", ""))
             provided.setdefault("project_title", ctx["project"]["title"])
             provided.setdefault("episode_number", episode["number"])
             version = self.projects.save_document(
@@ -1609,6 +1743,8 @@ class Director:
                 payload["previous_script"] = previous
         result = self._call(ctx, "script", payload, "script")
         script = result.data
+        self._normalize_script_character_profiles(
+            script, ctx["episode"].get("premise", ""))
         version = self.projects.save_document(episode["id"], "script", script)
         ctx["script"] = script
         ctx["script_version"] = version
@@ -1763,6 +1899,21 @@ class Director:
             "project_title": ctx["project"]["title"],
             "style": ctx["project"]["style"] or "",
             "logline": (ctx.get("script") or {}).get("logline", ""),
+            "premise": ctx["episode"].get("premise", ""),
+            "episode_title": (ctx.get("script") or {}).get(
+                "episode_title", ""),
+            "scene_context": [
+                {"scene_no": scene.get("scene_no"),
+                 "location": scene.get("location", ""),
+                 "action": scene.get("action", ""),
+                 "characters": scene.get("characters", [])}
+                for scene in (ctx.get("script") or {}).get("scenes", [])
+            ],
+            "character_context": [
+                {key: value for key, value in c.items()
+                 if key != "reference_images"}
+                for c in missing
+            ],
             # 有参考图的角色:设定必须以参考图人物的脸部特征与风格
             # 为最高标准撰写(编剧 AI 可直接读取图片文件)
             "characters": [{"name": c["name"],
@@ -1779,6 +1930,15 @@ class Director:
             design = by_name.get(name)
             if not design:
                 continue
+            # 即使编剧模型只回传了基础视觉字段,也不允许丢掉剧本中的
+            # 时代/职业/动机/服装逻辑;这些字段会继续进入所有出图提示词。
+            for key in (
+                    "background_prompt", "era_setting", "occupation",
+                    "motivation", "backstory", "relationships",
+                    "costume_direction", "signature_props",
+                    "visual_variants"):
+                if not design.get(key) and character.get(key):
+                    design[key] = character[key]
             self.assets.register(
                 project_id, "character", name,
                 meta={"role": character.get("role", ""),
@@ -1967,7 +2127,8 @@ class Director:
                         variant = {
                             key: existing_meta[key] for key in (
                                 "variant_id", "variant_label", "look_variant",
-                                "variant_source") if key in existing_meta
+                                "variant_source", "story_variant")
+                            if key in existing_meta
                         }
                         variant.setdefault("variant_source", "generated")
                     else:
@@ -2009,6 +2170,7 @@ class Director:
                         "role": role, "shot_no": 0,
                         "characters": [name], "location": "",
                         "prompt": prompt, "style": style,
+                        "character_background": designs.get(name) or {},
                         "reference_images": refs,
                         # 初次定妆尚不存在最终立绘；若用户上传过身份参考，
                         # API 也必须真实使用这些图，不能只读文字。
@@ -2307,6 +2469,7 @@ class Director:
                             name, role, style, label, desc,
                             key=key, design=designs.get(name)),
                         "style": style,
+                        "character_background": designs.get(name) or {},
                         "character_refs": (
                             [portrait_uri] if portrait_uri else []),
                         "identity_references": self._identity_references(
@@ -2490,7 +2653,9 @@ class Director:
             design = self._character_design(project_id, name)
             line = self._design_line(design, keys=(
                 "species", "appearance", "hair", "eyes", "costume",
-                "signature", "temperament")) if design else ""
+                "signature", "temperament", "background_prompt",
+                "era_setting", "occupation", "costume_direction",
+                "signature_props")) if design else ""
             who.append(f"{name}({line})" if line else name)
         if who:
             parts.append(
@@ -2545,9 +2710,23 @@ class Director:
             for item in (ctx.get("script") or {}).get("characters", [])
             if item.get("name")
         }
+        # 身份参考图固定按剧本角色表顺序排列,不因场景生成器/字典排序而
+        # 把第一位主角的参考图换成配角,同时保留镜头中的实际出场名单。
+        script_order = [item.get("name") for item in (
+            ctx.get("script") or {}).get("characters", [])
+                        if item.get("name")]
         identity_characters = [
+            name for name in script_order
+            if name in shot["characters"]
+            and not is_background_character(script_characters.get(name, {}))]
+        identity_characters.extend(
             name for name in shot["characters"]
-            if not is_background_character(script_characters.get(name, {}))]
+            if name not in identity_characters
+            and not is_background_character(script_characters.get(name, {})))
+        character_background = {
+            name: self._character_design(ctx["project"]["id"], name) or {}
+            for name in shot.get("characters", [])
+        }
         payload = {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
@@ -2555,6 +2734,7 @@ class Director:
             "seedance_prompt": shot.get("seedance_prompt", shot["prompt"]),
             "characters": shot["characters"],
             "identity_characters": identity_characters,
+            "character_background": character_background,
             "character_count": shot.get(
                 "character_count", len(shot["characters"])),
             "location": location,
