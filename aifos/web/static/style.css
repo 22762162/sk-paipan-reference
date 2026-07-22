@@ -1480,6 +1480,7 @@ textarea:focus-visible, select:focus-visible {
 .image-accel-livebar span { line-height: 1.45; }
 .image-accel-livebar small { color: var(--ink-3); line-height: 1.4; }
 .image-accel-livebar button { flex: 0 0 auto; }
+.canvas-view > .image-accel-livebar { margin: 12px 18px; }
 
 @media (max-width: 760px) {
   .acceleration-panel { width: 100%; }
@@ -1488,6 +1489,7 @@ textarea:focus-visible, select:focus-visible {
   .accel-actions .primary { width: 100%; }
   .image-accel-livebar { align-items: stretch; flex-direction: column; }
   .image-accel-livebar button { width: 100%; min-height: 44px; }
+  .canvas-view > .image-accel-livebar { margin: 10px 12px; }
 }
 
 /* ---- 空间调度图 ---- */
