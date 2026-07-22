@@ -553,6 +553,8 @@ td.num, th.num { text-align: right; }
 .confirm-banner span { color: var(--ink-2); font-size: 13px; }
 .confirm-banner > div { flex: 1; min-width: 260px; }
 .confirm-banner button { font-size: 15px; padding: 11px 22px; white-space: nowrap; }
+.cast-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.cast-actions button:not(.primary) { color: var(--ink-2); }
 
 /* 人物5选1定版：最终立绘是后续所有含人物图片的视觉身份锚点 */
 .cast-selection-list { padding: 18px; display: grid; gap: 18px; overflow: auto; }
@@ -577,6 +579,7 @@ td.num, th.num { text-align: right; }
   .cast-candidate-grid .cast-candidate:last-child:nth-child(odd) { grid-column: 1 / -1; max-width: calc(50% - 5px); }
   .cast-select-view .confirm-banner { align-items: stretch; }
   .cast-select-view .confirm-banner button { width: 100%; }
+  .cast-actions { width: 100%; }
 }
 .progress-card.confirm {
   border-color: rgba(250, 178, 25, .5);

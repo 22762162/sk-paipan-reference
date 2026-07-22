@@ -2939,6 +2939,73 @@ class Director:
             raise AifosError(f"剧集不存在: 第{episode_number}集")
         return project, episode
 
+    def _invalidate_cast_assets(self, project, script, reason):
+        """让新一轮人物候选遮蔽旧版本,但保留旧文件和历史记录。"""
+        for character in script.get("characters", []):
+            name = character["name"]
+            self.assets.register(
+                project["id"], "character_identity", name, uri="",
+                meta={"character": name, "locked": False,
+                      "reason": reason}, new_version=True)
+            for index in range(1, CHARACTER_CANDIDATES + 1):
+                self.assets.register(
+                    project["id"], "character_candidate",
+                    f"{name}:{index:02d}", uri="",
+                    meta={"character": name,
+                          "role": character.get("role", ""),
+                          "candidate_index": index,
+                          "invalidated": reason}, new_version=True)
+            for key, label, _desc in CHARACTER_SHEETS:
+                self.assets.register(
+                    project["id"], "character_sheet", f"{name}:{key}",
+                    uri="", meta={"character": name, "sheet": key,
+                                   "label": label,
+                                   "invalidated": reason},
+                    new_version=True)
+        for location in dict.fromkeys(
+                scene["location"] for scene in script.get("scenes", [])):
+            self.assets.register(
+                project["id"], "scene_art", location, uri="",
+                meta={"invalidated": reason}, new_version=True)
+
+    def regenerate_character_candidates(self, project_title, episode_number,
+                                        run_id=None):
+        """放弃当前人物选择并重新生成候选,不进入后续镜头生产。"""
+        project, episode = self._episode_ctx(project_title, episode_number)
+        if episode["status"] != "awaiting_cast":
+            raise AifosError("只能在人物选择阶段返回重新生成")
+        script, _ = self.projects.latest_document(episode["id"], "script")
+        if script is None:
+            raise AifosError("本集尚无剧本,先完成剧本确认")
+        self._invalidate_cast_assets(
+            project, script, reason="manual_regenerate_cast")
+        self.projects.set_episode_status(episode["id"], "cast")
+        aspect = (project["aspect"]
+                  or self.config.get("defaults", "aspect", default="9:16"))
+        ctx = {"project": dict(project), "episode": dict(episode),
+               "out_root": self._episode_dir(project, episode),
+               "script": script, "force": False, "aspect": aspect,
+               "dims": ASPECT_DIMS.get(aspect, ASPECT_DIMS["9:16"]),
+               "run_id": run_id,
+               "quality_policy": self._episode_quality_policy(
+                   episode["id"], persist=True)}
+        self._task_cost = 0.0
+        self._task_providers = set()
+        try:
+            report = self._stage_cast(ctx)
+        except ProduceCancelled:
+            self.projects.set_episode_status(episode["id"], "awaiting_cast")
+            return {"status": "paused", "done": 0,
+                    "note": "人物候选重新生成已暂停,已完成候选保留"}
+        self.projects.set_episode_status(episode["id"], "awaiting_cast")
+        self.log.info(
+            "director", "已放弃当前人物选择,新候选已生成,等待重新定版"
+            f"(episode_id={episode['id']})")
+        return {"status": "awaiting_cast",
+                "done": report.get("candidates", 0),
+                "candidate_target": report.get("candidate_target", 0),
+                "locked": 0}
+
     def import_image(self, project_title, episode_number, target,
                      file_bytes, ext):
         """上传替换图片:character_art / scene_art / shot(镜头画面)。
@@ -3055,32 +3122,7 @@ class Director:
             raise AifosError("本集尚无剧本,先完成剧本确认")
         # 新画风使旧身份锚点和下游人物资产失效，但保留历史版本/文件。
         # 用空的新版本遮蔽旧最新版，重新走5选1，不做破坏性删除。
-        for character in script.get("characters", []):
-            name = character["name"]
-            self.assets.register(
-                project["id"], "character_identity", name, uri="",
-                meta={"character": name, "locked": False,
-                      "reason": "restyle"}, new_version=True)
-            for index in range(1, CHARACTER_CANDIDATES + 1):
-                self.assets.register(
-                    project["id"], "character_candidate",
-                    f"{name}:{index:02d}", uri="",
-                    meta={"character": name,
-                          "role": character.get("role", ""),
-                          "candidate_index": index,
-                          "invalidated": "restyle"}, new_version=True)
-            for key, label, _desc in CHARACTER_SHEETS:
-                self.assets.register(
-                    project["id"], "character_sheet", f"{name}:{key}",
-                    uri="", meta={"character": name, "sheet": key,
-                                   "label": label,
-                                   "invalidated": "restyle"},
-                    new_version=True)
-        for location in dict.fromkeys(
-                scene["location"] for scene in script.get("scenes", [])):
-            self.assets.register(
-                project["id"], "scene_art", location, uri="",
-                meta={"invalidated": "restyle"}, new_version=True)
+        self._invalidate_cast_assets(project, script, reason="restyle")
 
         self.projects.set_episode_status(episode["id"], "cast")
         self.log.info(

@@ -727,6 +727,8 @@ def make_handler(workspace, jobs):
                     return self._confirm()
                 if parsed.path == "/api/character/select":
                     return self._character_select()
+                if parsed.path == "/api/character/regenerate":
+                    return self._character_regenerate()
                 if parsed.path == "/api/revise":
                     return self._revise()
                 if parsed.path == "/api/regen_image":
@@ -1242,6 +1244,23 @@ def make_handler(workspace, jobs):
             except (AifosError, TypeError, ValueError) as exc:
                 return self._error(400, str(exc))
             return self._json(result)
+
+        def _character_regenerate(self):
+            """放弃人物定版并重新生成候选,不绕过人物选择门禁。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id: app.director.regenerate_character_candidates(
+                    title, number, run_id=run_id),
+                action="regenerate_cast",
+                request={"reason": "manual_regenerate_cast"})
+            return self._json({"job_id": job_id}, status=202)
 
         def _episode_ref(self, body):
             episode_id = body.get("episode_id")

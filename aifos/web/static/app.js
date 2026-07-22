@@ -3500,9 +3500,12 @@ function renderCastSelection(data, episodeId) {
         <span>每名角色已有 ${selection.candidate_target || 5} 张候选。请各选1张作为最终立绘；
         后续四视图、关键帧、首尾帧和其他图片 API 都会真实携带这张参考图，
         视觉质检也会将成图与它逐人比对。</span></div>
-      <button class="primary" id="cast-continue" ${selection.passed ? "" : "disabled"}>
-        ${selection.passed ? "✅ 全部定版，继续预生产" : `已定版 ${selection.locked || 0}/${selection.total || characters.length}`}
-      </button>
+      <div class="cast-actions">
+        <button id="cast-regenerate" title="放弃当前已选人物并重新生成候选">↻ 不选，返回重新生成</button>
+        <button class="primary" id="cast-continue" ${selection.passed ? "" : "disabled"}>
+          ${selection.passed ? "✅ 全部定版，继续预生产" : `已定版 ${selection.locked || 0}/${selection.total || characters.length}`}
+        </button>
+      </div>
     </div>
     <div class="canvas-toolbar">
       <button id="cast-back">← 仪表盘</button>
@@ -3531,6 +3534,23 @@ function renderCastSelection(data, episodeId) {
   </div>`;
   document.getElementById("cast-back").onclick = () => { location.hash = "#/"; };
   document.getElementById("cast-script").onclick = () => showScriptOverlay(data, episodeId);
+  document.getElementById("cast-regenerate").onclick = (ev) => armConfirm(
+    ev.currentTarget, "放弃当前选择并重新生成", async () => {
+      ev.currentTarget.disabled = true;
+      ev.currentTarget.textContent = "重新生成中…";
+      try {
+        await api("/api/character/regenerate", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ episode_id: data.episode.id }),
+        });
+        showToast("已返回人物候选生成，旧候选保留在历史中", "ok");
+        pollCanvas(episodeId);
+      } catch (e) {
+        showToast(e.message, "error");
+        ev.currentTarget.disabled = false;
+        ev.currentTarget.textContent = "↻ 不选，返回重新生成";
+      }
+    });
   app.querySelectorAll(".cast-image").forEach((button) => {
     button.onclick = () => {
       if (button.dataset.full) showImageLightbox(button.dataset.full, "人物候选大图");

@@ -83,6 +83,7 @@ def test_index_and_static(server):
     assert "选择多集剧本文档".encode() in app_js
     assert "始终只激活一集".encode() in app_js
     assert b"/api/character/select" in app_js
+    assert b"/api/character/regenerate" in app_js
     assert b"/api/asset/delete" in app_js
     assert b"/api/video/references" in app_js
     assert "质检没有通过的原因".encode() in app_js
@@ -308,6 +309,19 @@ def test_produce_flow_and_episode_api(server):
     status, blocked = _json_request(port, "POST", "/api/confirm", {
         "episode_id": episode_id})
     assert status == 409 and "最终立绘" in blocked["error"]
+
+    # 人物定版页允许放弃当前选择并回到候选生成;旧版本仍保留在历史中。
+    status, reply = _json_request(port, "POST", "/api/character/regenerate", {
+        "episode_id": episode_id})
+    assert status == 202 and reply["job_id"]
+    job = _wait_job(port, reply["job_id"])
+    assert job["summary"]["status"] == "awaiting_cast"
+    status, pre = _json_request(port, "GET", f"/api/episode/{episode_id}")
+    assert status == 200
+    selection = pre["cast_selection"]
+    assert selection["locked"] == 0 and not selection["passed"]
+    assert all(len(c["candidates"]) == 5 for c in selection["characters"])
+
     for character in selection["characters"]:
         status, selected = _json_request(
             port, "POST", "/api/character/select", {
