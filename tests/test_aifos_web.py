@@ -10,6 +10,7 @@ import time
 import pytest
 
 from aifos.app import App
+from aifos.director import character_candidate_target
 from aifos.web.server import serve
 
 
@@ -60,8 +61,8 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260723-cast-variants" in html
-    assert "/static/app.js?v=20260723-cast-variants" in html
+    assert "/static/style.css?v=20260723-character-rules" in html
+    assert "/static/app.js?v=20260723-character-rules" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -420,7 +421,7 @@ def test_produce_flow_and_episode_api(server):
     assert pre["storyboard"] is None
     assert pre["artifacts"]["cast_art"] == []
 
-    # 第一道确认(剧本 OK)→ 只生成每名人物5张候选后停下。
+    # 第一道确认(剧本 OK)→ 按角色重要度生成候选后停下。
     status, reply = _json_request(port, "POST", "/api/confirm", {
         "episode_id": episode_id})
     assert status == 202 and reply["phase"] == "awaiting_script"
@@ -431,7 +432,8 @@ def test_produce_flow_and_episode_api(server):
     assert pre["storyboard"] is None
     selection = pre["cast_selection"]
     assert not selection["passed"]
-    assert all(len(c["candidates"]) == 5 for c in selection["characters"])
+    assert all(len(c["candidates"]) == character_candidate_target(c)
+               for c in selection["characters"])
     assert all(candidate["url"].startswith("/artifacts/")
                for c in selection["characters"]
                for candidate in c["candidates"])
@@ -458,7 +460,8 @@ def test_produce_flow_and_episode_api(server):
     assert status == 200
     selection = pre["cast_selection"]
     assert selection["locked"] == 0 and not selection["passed"]
-    assert all(len(c["candidates"]) == 5 for c in selection["characters"])
+    assert all(len(c["candidates"]) == character_candidate_target(c)
+               for c in selection["characters"])
 
     for character in selection["characters"]:
         status, selected = _json_request(

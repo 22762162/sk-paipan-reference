@@ -98,6 +98,7 @@ def build_continuity_bible(project, script, profile):
     """锁定项目级角色、场景、文字与生成配置。"""
     rules = profile.get("rules", {})
     continuity_rules = rules.get("continuity", {})
+    character_asset_rules = rules.get("character_assets", {})
     text_rules = rules.get("text_assets", {})
     delivery_rules = rules.get("delivery", {})
     characters = []
@@ -159,6 +160,7 @@ def build_continuity_bible(project, script, profile):
             "require_delivery_verifier": delivery_rules.get(
                 "delivery_verifier_required", True),
         },
+        "character_asset_policy": copy.deepcopy(character_asset_rules),
         "production_profile": copy.deepcopy(profile),
     }
 

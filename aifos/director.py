@@ -100,8 +100,47 @@ STAGES = [
 # 确认后才进入视频生产(真实产线从这里开始消耗即梦额度)
 CONFIRM_AFTER = "preflight"
 CHARACTER_CANDIDATES = 5
+IMPORTANT_CHARACTER_CANDIDATES = 3
+NONIMPORTANT_CHARACTER_CANDIDATES = 1
+BACKGROUND_CHARACTER_ROLE_TOKENS = (
+    "背景路人", "背景人物", "背景群众", "群众演员", "群演")
 
-# 人物定版不是“同一套造型换五个动作”。五张候选分别承担不同的选角方向，
+CHARACTER_BACKGROUND_RULE = (
+    "人物立绘必须是纯净、无文字的单人物资产背景;背景只允许纯色、柔和渐变"
+    "或干净无辨识度的棚拍底,禁止任何场景、建筑、室内、街道、自然环境、"
+    "道具、其他人物、品牌标识、Logo、水印、字幕和乱码文字。")
+
+WORKWEAR_RULE = (
+    "若角色身份或职业属于外卖小哥、快递员、配送员、医生、护士、警察、"
+    "消防员、保安、服务员、厨师、工人等职业,必须穿该职业真实可辨认的"
+    "工作服/制服并体现必要的职业装备,不得用普通便服替代。")
+
+
+def is_background_character(character):
+    """背景路人可出现在镜头剧情中，但不创建单独人物母资产。"""
+    role = str((character or {}).get("role") or "").strip().lower()
+    return any(token in role for token in BACKGROUND_CHARACTER_ROLE_TOKENS)
+
+
+def character_candidate_target(character):
+    """按人物重要度返回候选张数，防止非主要角色消耗五张额度。"""
+    role = str((character or {}).get("role") or "").strip().lower()
+    if is_background_character(character):
+        return 0
+    if any(token in role for token in ("主角", "主人公", "女主", "男主")):
+        return CHARACTER_CANDIDATES
+    if any(token in role for token in ("非重要", "非主要", "次要")):
+        return NONIMPORTANT_CHARACTER_CANDIDATES
+    if any(token in role for token in ("重要", "核心", "配角")):
+        return IMPORTANT_CHARACTER_CANDIDATES
+    return NONIMPORTANT_CHARACTER_CANDIDATES
+
+
+def character_candidate_policy_text():
+    return ("主角5张；重要配角3张；非重要配角1张（非主要角色不超过3张）；"
+            "背景路人不单独生成立绘")
+
+# 人物定版不是“同一套造型换几个动作”。候选分别承担不同的选角方向，
 # 但都受角色年龄、职业、物种、时代和项目画风约束。候选被人工锁定后，
 # 其完整脸、发型、妆容与服装才成为后续镜头不可漂移的身份锚点。
 CHARACTER_LOOK_VARIANTS = (
@@ -255,7 +294,7 @@ class Director:
         只补齐缺失部分——真实产线(即梦按镜头计费)断点续产的关键。
         script:用户自带剧本(标准 JSON);提供时跳过 AI 编剧,
         人物/场次/分镜等全部从该剧本自动推导。
-        pause_for_confirm=True:剧本确认后先生成每人5张定妆候选并暂停，
+        pause_for_confirm=True:剧本确认后按角色重要度生成定妆候选并暂停，
         所有人物人工锁定后才继续五维分镜、关键帧、首尾帧和门禁；确认后再次调用
         produce(不带该参数)即从断点继续自动完成 Seedance 声画、无字幕剪辑
         与三层质检。"""
@@ -329,7 +368,7 @@ class Director:
                     and ctx.get("script_is_new")):
                 paused = "script"
                 break
-            # 第二道确认:每名角色5张候选必须人工选定1张。没有最终立绘时，
+            # 第二道确认:候选数量按人物重要度分配,必须人工选定1张。没有最终立绘时，
             # 禁止继续生成资产套件、分镜画面和首尾帧。
             if (stage == "cast" and ctx.get("cast_selection_required")):
                 paused = "cast"
@@ -604,7 +643,8 @@ class Director:
                 "眼鼻嘴、肤色与年龄感、发际线、发型轮廓、发色、眉眼妆、眼线、"
                 "睫毛、唇妆和身份配饰,必须是同一个人;服装、服装颜色/材质、动作、"
                 "场景和光影按本剧本及当集造型生成,允许与参考图服装不同,除非明确"
-                "要求保留参考图服装")
+                "要求保留参考图服装;"
+                f"{WORKWEAR_RULE}{CHARACTER_BACKGROUND_RULE}")
 
     def _candidate_variant(self, index, design=None):
         """返回真实写入提示词和资产元数据的候选造型方向。"""
@@ -628,30 +668,40 @@ class Director:
             "variant_source": "generated",
         }
 
-    def _candidate_portrait_prompt(self, name, role, style, design, variant):
+    def _candidate_portrait_prompt(self, name, role, style, design, variant,
+                                   has_reference=False):
         """定角候选只锁角色边界，显式放开尚未定版的造型变量。"""
         identity = self._design_line(
             design, keys=("species", "appearance", "eyes", "personality"))
         look = variant["look_variant"]
+        if has_reference:
+            hair = "严格保持参考图发型轮廓、发际线和发色,不得改发型"
+            makeup = "严格保持参考图妆容与面部身份特征,不得改脸"
+            variant_rule = (
+                "有参考图时,人物脸和发型是最高标准;本套候选只允许在服装、"
+                "服装配色、姿态和表情上做剧情化变化,不得改变脸和发型")
+        else:
+            hair = look["hair"]
+            makeup = look["makeup"]
+            variant_rule = (
+                "无参考图时,可按本套造型方向变化脸部细节、发型和妆容,"
+                "但不得改变年龄、物种和核心人物气质")
         return (
             f"角色定角候选:{name}({role}),{style}"
             + (f";角色不可越界特征:{identity}" if identity else "")
-            + ";这是用于选择最终人物形象的五套互斥造型之一，不是同一套衣服只换动作"
+            + ";这是用于选择最终人物形象的互斥造型候选之一，不是同一套衣服只换动作"
             f";本套造型方向:{variant['variant_label']}"
-            f";发型:{look['hair']};妆容或面部修饰:{look['makeup']}"
+            f";发型:{hair};妆容或面部修饰:{makeup}"
             f";服装:{look['costume']};气质:{look['temperament']}"
-            ";服装轮廓、发型轮廓、妆容强度和外显气质必须与其他四套明显不同，"
+            ";服装轮廓、妆容强度和外显气质必须与其他候选明显不同,"
             "但必须适配角色的性别表达、年龄、职业、物种、时代背景和项目画风"
-            ";若有角色参考图，只锁脸型、五官比例、眼鼻嘴结构、肤色、年龄感、"
-            "发际线和稳定身份特征，必须是同一个人；不要复制参考图的发型、妆容、"
-            "服装和姿态，本套造型指令优先"
-            ";若没有身份参考图，允许在角色外貌类型范围内让脸部骨相、五官细节和"
-            "神态产生可辨别差异，供人工选角，但不得改变年龄、物种和核心人物气质"
+            f";{variant_rule};{WORKWEAR_RULE}{CHARACTER_BACKGROUND_RULE}"
             ";全身正面自然站姿，动作只服务造型展示；干净均匀肤质，禁止塑料脸、"
             "脏污毛孔；单人，禁止新增人物")
 
     def _scene_prompt(self, location, style):
-        return f"场景概念图:{location},{style},空镜,氛围感"
+        return (f"场景概念图:{location},{style},空镜,氛围感;"
+                "禁止任何可读文字、字幕、Logo、水印和无关人物")
 
     def _sheet_prompt(self, name, role, style, label, desc, key=None,
                       design=None):
@@ -659,7 +709,8 @@ class Director:
             design, keys=self.SHEET_DESIGN_KEYS.get(key))
         return (f"角色{label}:{name}({role}),{style},{desc}"
                 + (f";人物设定:{detail}" if detail else "")
-                + ";与立绘同一人物、同一发型服装配色,严格保持形象一致")
+                + f";与立绘同一人物、同一发型服装配色,严格保持形象一致;"
+                f"{WORKWEAR_RULE}{CHARACTER_BACKGROUND_RULE}")
 
     def _plan_path(self, ctx):
         return ctx["out_root"] / "render_plan.json"
@@ -838,8 +889,13 @@ class Director:
                     and not Path(uri).is_file():
                 issues.append(f"参考图文件不存在: {uri}")
         if category in self.ACCELERATION_IDENTITY_CATEGORIES:
-            missing = [name for name in characters if name not in identity_map]
-            extra = [name for name in identity_map if name not in characters]
+            required_identity_names = payload.get("identity_characters")
+            if required_identity_names is None:
+                required_identity_names = characters
+            missing = [name for name in required_identity_names
+                       if name not in identity_map]
+            extra = [name for name in identity_map
+                     if name not in required_identity_names]
             if missing:
                 issues.append("缺少人物最终立绘映射: " + "、".join(missing))
             if extra:
@@ -1798,13 +1854,15 @@ class Director:
         return row
 
     def character_selection_status(self, project_id, characters):
-        """项目级人物定版状态：每人5候选、最终只锁1张，跨集复用。"""
+        """项目级人物定版状态：按重要度生成候选，最终只锁1张。"""
         result = []
         candidate_rows = {}
         for row in self.assets.list(project_id, "character_candidate"):
             candidate_rows[row["name"]] = row
         for character in characters or []:
             name = character["name"] if isinstance(character, dict) else str(character)
+            target = character_candidate_target(
+                character if isinstance(character, dict) else {"name": name})
             locked = self._locked_identity(project_id, name)
             selected_meta = self._asset_meta(locked)
             candidates = []
@@ -1817,6 +1875,8 @@ class Director:
                                and not Path(uri).exists()):
                     continue
                 index = int(meta.get("candidate_index") or 0)
+                if index < 1 or index > target:
+                    continue
                 look_variant = meta.get("look_variant")
                 variant_source = meta.get("variant_source")
                 if not isinstance(look_variant, dict) or not meta.get(
@@ -1839,25 +1899,31 @@ class Director:
             result.append({
                 "character": name,
                 "role": character.get("role", "") if isinstance(character, dict) else "",
+                "candidate_target": target,
+                "selection_required": target > 0,
                 "locked": locked is not None,
                 "identity_uri": locked["uri"] if locked else "",
                 "identity_version": locked["version"] if locked else None,
                 "candidates": candidates,
                 "candidate_count": len(candidates),
             })
-        locked_count = sum(1 for item in result if item["locked"])
+        required_items = [item for item in result if item["candidate_target"] > 0]
+        locked_count = sum(1 for item in required_items if item["locked"])
         return {
             "schema": "aifos.character-selection/v1",
-            "candidate_target": CHARACTER_CANDIDATES,
+            "candidate_target": max(
+                (item["candidate_target"] for item in result), default=0),
+            "candidate_policy": character_candidate_policy_text(),
             "characters": result,
             "locked": locked_count,
-            "total": len(result),
-            "passed": bool(result) and locked_count == len(result),
-            "required": any(not item["locked"] for item in result),
+            "total": len(required_items),
+            "passed": (not required_items
+                       or locked_count == len(required_items)),
+            "required": any(not item["locked"] for item in required_items),
         }
 
     def _ensure_character_candidates(self, ctx, characters, designs, style):
-        """为尚未定版的角色补足5张候选；候选之间并行，后续等待人工选择。"""
+        """按角色重要度补足候选；候选之间并行，后续等待人工选择。"""
         project_id = ctx["project"]["id"]
         seed = []
         tasks = []
@@ -1866,9 +1932,10 @@ class Director:
         for character in characters:
             name = character["name"]
             role = character.get("role", "")
+            target = character_candidate_target(character)
             locked = self._locked_identity(project_id, name)
             existing = {}
-            for index in range(1, CHARACTER_CANDIDATES + 1):
+            for index in range(1, target + 1):
                 row = self.assets.latest(
                     project_id, "character_candidate", f"{name}:{index:02d}")
                 if row is None:
@@ -1887,7 +1954,7 @@ class Director:
                 recommend_asset_quality("character_candidate"),
                 ctx.get("quality_policy") or default_quality_policy(),
                 f"candidate:{name}")
-            for index in range(1, CHARACTER_CANDIDATES + 1):
+            for index in range(1, target + 1):
                 item_id = f"candidate:{name}:{index}"
                 quality_by_candidate[(name, index)] = quality
                 variant = self._candidate_variant(index, designs.get(name))
@@ -1910,10 +1977,11 @@ class Director:
                         }
                 variant_by_candidate[(name, index)] = variant
                 if variant["variant_source"] == "legacy":
-                    prompt = "历史候选未记录独立造型方向，请重新生成后比较五套造型"
+                    prompt = "历史候选未记录独立造型方向，请按当前角色重要度规则重新生成"
                 else:
                     prompt = self._candidate_portrait_prompt(
-                        name, role, style, designs.get(name), variant)
+                        name, role, style, designs.get(name), variant,
+                        has_reference=bool(refs))
                 seed.append({
                     "id": item_id, "category": "character_candidate",
                     "label": (f"{name} · 候选 {index} · "
@@ -1959,7 +2027,8 @@ class Director:
                    for c in status["characters"][0]["candidates"]):
                 self._plan_mark(ctx, item["id"], "reused", only_pending=True)
         for (name, index, role), result in self._run_parallel(
-                ctx, tasks, line="人物定妆候选(每人5张)").items():
+                ctx, tasks,
+                line=f"人物定妆候选({character_candidate_policy_text()})").items():
             quality = quality_by_candidate[(name, index)]
             variant = variant_by_candidate[(name, index)]
             self.assets.register(
@@ -1993,6 +2062,11 @@ class Director:
             raise AifosError(f"剧本中没有角色: {character_name}")
         if episode["status"] != "awaiting_cast":
             raise AifosError("只能在人物定版阶段选择候选；后续已生产时请先重开定版")
+        target = character_candidate_target(character)
+        if int(candidate_index) < 1 or int(candidate_index) > target:
+            raise AifosError(
+                f"{character_name}({character.get('role') or '角色'})最多允许"
+                f"{target}张候选，不能选择第{int(candidate_index)}张")
         candidate = self.assets.latest(
             project["id"], "character_candidate",
             f"{character_name}:{int(candidate_index):02d}")
@@ -2057,7 +2131,9 @@ class Director:
         """人物立绘与场景概念图:项目级资产,跨集复用保证形象一致。"""
         project_id = ctx["project"]["id"]
         style = ctx["project"]["style"] or DEFAULT_VISUAL_STYLE
-        characters = ctx["script"].get("characters", [])
+        all_characters = ctx["script"].get("characters", [])
+        characters = [c for c in all_characters
+                      if not is_background_character(c)]
         locations = []
         for scene in ctx["script"]["scenes"]:
             if scene["location"] not in locations:
@@ -2094,7 +2170,8 @@ class Director:
                 "characters": len(characters),
                 "candidates": sum(item["candidate_count"]
                                   for item in selection["characters"]),
-                "candidate_target": CHARACTER_CANDIDATES * len(characters),
+                "candidate_target": sum(
+                    character_candidate_target(c) for c in characters),
                 "locked": selection["locked"],
                 "awaiting_selection": True,
                 "created": 0, "reused": 0, "scenes": 0,
@@ -2461,12 +2538,21 @@ class Director:
             ctx.get("quality_policy") or default_quality_policy(),
             item_id or f"shot:{shot['shot_no']}",
             explicit_override=quality_override)
+        script_characters = {
+            item.get("name"): item
+            for item in (ctx.get("script") or {}).get("characters", [])
+            if item.get("name")
+        }
+        identity_characters = [
+            name for name in shot["characters"]
+            if not is_background_character(script_characters.get(name, {}))]
         payload = {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
             "prompt": self._rich_shot_prompt(ctx, shot, location),
             "seedance_prompt": shot.get("seedance_prompt", shot["prompt"]),
             "characters": shot["characters"],
+            "identity_characters": identity_characters,
             "character_count": shot.get(
                 "character_count", len(shot["characters"])),
             "location": location,
@@ -2491,7 +2577,7 @@ class Director:
             "forbid_subtitles": not profile["burn_subtitles"],
             "style": ctx["project"]["style"] or "",
             "aspect": ctx["aspect"], **ctx["dims"],
-            **self._art_refs(ctx, shot["characters"], location,
+            **self._art_refs(ctx, identity_characters, location,
                              shot_no=shot["shot_no"]),
         }
         actor_ids = {
@@ -2554,7 +2640,8 @@ class Director:
                 "sub_dir": "images", "tag": shot["shot_no"],
                 "priority": self._shot_priority(shot, scene_first),
                 "qc_spec": {**self._qc_spec(
-                    ctx["project"]["id"], payload.get("characters", []),
+                    ctx["project"]["id"],
+                    payload.get("identity_characters", payload.get("characters", [])),
                     location=payload.get("location", ""),
                     action=payload.get("action", ""),
                     forbid=["与设定形态不符的角色", "悬挂的衣物或衣架", "与设定不符的人"] + ["字幕条"]),
@@ -3091,7 +3178,7 @@ class Director:
         else:
             cover_characters = [c.get("name") for c in
                                 ctx["script"].get("characters", [])
-                                if c.get("name")]
+                                if c.get("name") and not is_background_character(c)]
             identity_refs = self._identity_references(
                 ctx["project"]["id"], cover_characters,
                 required=bool(cover_characters))
@@ -3258,7 +3345,7 @@ class Director:
 
         if kind == "character_art":
             raise AifosError(
-                "最终立绘不能从文字直接重画。请重新生成5张人物候选并人工定版，"
+                "最终立绘不能从文字直接重画。请按角色重要度重新生成候选并人工定版，"
                 "或上传经过确认的最终立绘")
         elif kind == "character_sheet":
             raw = target["name"]
@@ -3693,7 +3780,7 @@ class Director:
         raise AifosError(f"不支持的上传目标: {kind}")
 
     def restyle_project(self, project_title, episode_number, style=None):
-        """一键换画风后重新生成每人5张候选，禁止直接覆盖最终立绘。"""
+        """一键换画风后按角色重要度重新生成候选，禁止直接覆盖最终立绘。"""
         project, episode = self._episode_ctx(project_title, episode_number)
         if style and style.strip():
             self.projects.update_project(project_title, style=style.strip())
@@ -3702,13 +3789,14 @@ class Director:
         if script is None:
             raise AifosError("本集尚无剧本,先完成剧本确认")
         # 新画风使旧身份锚点和下游人物资产失效，但保留历史版本/文件。
-        # 用空的新版本遮蔽旧最新版，重新走5选1，不做破坏性删除。
+        # 用空的新版本遮蔽旧最新版，重新按重要度候选并人工定版，不做破坏性删除。
         self._invalidate_cast_assets(project, script, reason="restyle")
 
         self.projects.set_episode_status(episode["id"], "cast")
         self.log.info(
             "director",
-            f"新画风已生效，重新生成每人5张定妆候选: {project['style']}")
+            f"新画风已生效，按角色重要度重新生成定妆候选"
+            f"({character_candidate_policy_text()}): {project['style']}")
         aspect = (project["aspect"]
                   or self.config.get("defaults", "aspect", default="9:16"))
         ctx = {"project": dict(project), "episode": dict(episode),
@@ -3851,7 +3939,8 @@ class Director:
                     ctx["aspect"], ASPECT_DIMS["9:16"]))
                 payload = self._shot_payload(ctx, shot)
                 spec = self._qc_spec(
-                    project_id, payload.get("characters", []),
+                    project_id, payload.get(
+                        "identity_characters", payload.get("characters", [])),
                     location=payload.get("location", ""),
                     action=payload.get("action", ""),
                     forbid=self._FORBID + ["字幕条"])

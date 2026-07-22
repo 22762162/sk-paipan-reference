@@ -7,7 +7,7 @@ import pytest
 
 from aifos.adapters.codex_image import build_instruction
 from aifos.app import App
-from aifos.director import CHARACTER_SHEETS
+from aifos.director import CHARACTER_SHEETS, character_candidate_target
 from aifos.errors import AifosError
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 16
@@ -414,7 +414,9 @@ def test_style_anchor_unifies_all_art(app):
     anchor_uri = app.assets.latest(
         project["id"], "character_art", anchor)["uri"]
     portraits = [p for p in payloads if p.get("portrait")]
-    assert len(portraits) == len(script["characters"]) * 5
+    from aifos.director import character_candidate_target
+    expected = sum(character_candidate_target(c) for c in script["characters"])
+    assert len(portraits) == expected
     assert all(p.get("portrait_candidate") for p in portraits)
     for p in payloads:
         if p.get("character_sheet") or p.get("scene_art"):
@@ -425,8 +427,12 @@ def test_style_anchor_unifies_all_art(app):
 
 
 def test_restyle_project_regenerates_all_art(app):
-    """换画风:旧身份失效，重新生成5张候选并等待人工定版。"""
+    """换画风:旧身份失效，按角色重要度重生成候选并等待人工定版。"""
     project = _preproduce(app)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
     before = {(r["kind"], r["name"]): r["version"]
               for r in app.assets.list(project["id"])
               if r["kind"] in ("character_candidate", "character_sheet",
@@ -441,9 +447,16 @@ def test_restyle_project_regenerates_all_art(app):
              for r in app.assets.list(project["id"])
              if r["kind"] in ("character_candidate", "character_sheet",
                               "scene_art", "character_identity")}
-    assert after.keys() == before.keys()
-    for key, version in after.items():
-        assert version == before[key] + 1, f"{key} 未重做"
+    # 历史候选槽位继续保留为版本记录；有效候选数量由角色重要度控制。
+    assert set(before).issubset(after)
+    for key, version in before.items():
+        assert after[key] == version + 1, f"{key} 未重做"
+    selection = app.director.character_selection_status(
+        project["id"], script["characters"])
+    assert all(item["candidate_count"] == character_candidate_target(
+        next(c for c in script["characters"]
+             if c["name"] == item["character"]))
+               for item in selection["characters"])
     # 新画风必须重新人工定版，不能自动覆盖最终立绘
     episode = app.db.query_one(
         "SELECT * FROM episodes WHERE project_id=? AND number=1",
