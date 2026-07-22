@@ -1,4 +1,4 @@
-"""把已登记的正式图片增量镜像到 iCloud Drive，供手机快速查看。
+"""把已登记图片增量平铺镜像到 iCloud Drive/AIFOS，供手机快速查看。
 
 本地 artifacts 始终是唯一事实源；本模块只在图片完整落盘并登记为资产后
 复制一份，不让 iCloud 的占位文件、冲突副本或网络状态进入生产路径。
@@ -11,6 +11,7 @@ import queue
 import re
 import shutil
 import sqlite3
+import stat
 import threading
 import time
 import unicodedata
@@ -30,17 +31,6 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic", ".svg"}
 PROJECT_LEVEL_KINDS = {
     "character_candidate", "character_art", "character_sheet",
     "scene_art", "reference",
-}
-KIND_FOLDERS = {
-    "character_candidate": "01_人物候选",
-    "character_art": "02_定版人物",
-    "character_sheet": "03_人物设定",
-    "scene_art": "04_场景设定",
-    "reference": "05_参考图",
-    "image": "10_关键帧",
-    "first_frame": "20_首尾帧",
-    "last_frame": "20_首尾帧",
-    "cover": "30_封面",
 }
 KIND_LABELS = {
     "character_candidate": "候选", "character_art": "定版",
@@ -148,7 +138,7 @@ class ICloudImageSync:
 
     def _empty_manifest(self):
         return {
-            "schema": "aifos.icloud-image-sync/v1",
+            "schema": "aifos.icloud-image-sync/v2",
             "entries": {}, "failures": {}, "last_runs": {},
         }
 
@@ -228,6 +218,8 @@ class ICloudImageSync:
         if not self._dirty:
             return
         self._merge_disk_locked()
+        self._manifest["schema"] = "aifos.icloud-image-sync/v2"
+        self._manifest.pop("layout", None)  # 布局以每条 entry 为准。
         self._manifest["updated_at"] = time.time()
         temp = self.root / (f".{self.MANIFEST}.tmp.{os.getpid()}."
                             f"{uuid.uuid4().hex}")
@@ -315,26 +307,149 @@ class ICloudImageSync:
 
     def _target(self, row, source, relative):
         title = row.get("project_title") or "未知项目"
-        project_dir = (self.root
-                       / f"P{int(row['project_id']):03d}_{_safe_name(title)}"
-                         f"__W{self.workspace_id}")
         kind = row["kind"]
-        folder = KIND_FOLDERS.get(kind, "99_其他图片")
         if kind in PROJECT_LEVEL_KINDS:
-            parent = project_dir / "00_项目素材" / folder
+            scope = "E000"
         else:
             episode = self._episode_number(row, relative)
-            episode_dir = (f"第{episode:03d}集" if episode is not None
-                           else "待归档剧集")
-            parent = project_dir / episode_dir / folder
+            scope = (f"E{episode:03d}" if episode is not None
+                     else "E待归档")
         label = KIND_LABELS.get(kind, "图片")
-        name = _safe_name(row.get("name"), limit=180)
         version = int(row.get("version") or 1)
         asset_id = int(row["id"])
         suffix = source.suffix.lower()
-        filename = (f"{label}__{name}__A{asset_id:06d}"
-                    f"__v{version:03d}{suffix}")
-        return parent / filename
+        prefix = f"P{int(row['project_id']):03d}_W{self.workspace_id}_"
+        middle = (f"__{scope}__{label}__A{asset_id:06d}"
+                  f"__v{version:03d}__")
+        fixed_bytes = len((prefix + middle + suffix).encode("utf-8"))
+        variable_budget = 255 - fixed_bytes
+        if variable_budget < 2:
+            raise OSError("资产编号过长，无法生成安全的 iCloud 文件名")
+        project_budget = min(30, max(1, variable_budget // 3))
+        name_budget = max(1, variable_budget - project_budget)
+        project = _safe_name(title, limit=project_budget)
+        name = _safe_name(row.get("name"), limit=name_budget)
+        filename = f"{prefix}{project}{middle}{name}{suffix}"
+        if len(filename.encode("utf-8")) > 255:
+            raise OSError("iCloud 文件名超过系统限制")
+        return self.root / filename
+
+    @contextmanager
+    def _managed_parent_fd(self, path):
+        """在 AIFOS 根内逐层 O_NOFOLLOW 打开父目录，拒绝任何符号链接。"""
+        path = Path(os.path.abspath(os.path.normpath(str(path))))
+        relative = path.relative_to(self.root)
+        if not relative.parts:
+            raise OSError("不能把 AIFOS 根目录当作图片文件")
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptors = []
+        try:
+            current = os.open(str(self.root), directory_flags)
+            descriptors.append(current)
+            for part in relative.parts[:-1]:
+                current = os.open(part, directory_flags, dir_fd=current)
+                descriptors.append(current)
+            yield current, relative.parts[-1], relative
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    def _managed_digest(self, path):
+        with self._managed_parent_fd(path) as (parent_fd, name, _):
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(name, flags, dir_fd=parent_fd)
+            try:
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode):
+                    raise OSError("镜像路径不是普通文件")
+                digest = hashlib.sha256()
+                while True:
+                    chunk = os.read(descriptor, 1024 * 1024)
+                    if not chunk:
+                        return digest.hexdigest()
+                    digest.update(chunk)
+            finally:
+                os.close(descriptor)
+
+    def _unlink_managed_file(self, path, expected_digest):
+        with self._managed_parent_fd(path) as (parent_fd, name, relative):
+            actual = self._managed_digest(path)
+            if expected_digest and actual != expected_digest:
+                raise OSError("旧目录中的镜像已被修改，已保留以免丢失内容")
+            os.unlink(name, dir_fd=parent_fd)
+        self._prune_managed_parents(relative.parent.parts)
+
+    def _prune_managed_parents(self, parts):
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        for depth in range(len(parts), 0, -1):
+            descriptors = []
+            try:
+                current = os.open(str(self.root), directory_flags)
+                descriptors.append(current)
+                for part in parts[:depth - 1]:
+                    current = os.open(part, directory_flags, dir_fd=current)
+                    descriptors.append(current)
+                os.rmdir(parts[depth - 1], dir_fd=current)
+            except OSError:
+                break
+            finally:
+                for descriptor in reversed(descriptors):
+                    os.close(descriptor)
+
+    def _retire_previous_target_locked(
+            self, existing, replacement, key, replacement_digest):
+        """新单层副本校验完成后，移除本模块登记的旧目录版镜像。"""
+        old_rel = str(existing.get("target") or "")
+        if not old_rel:
+            return
+        # 只按词法路径定位；绝不跟随 manifest 路径中的符号链接。
+        old = Path(os.path.abspath(os.path.normpath(str(self.root / old_rel))))
+        replacement = Path(os.path.abspath(os.path.normpath(str(replacement))))
+        if old == replacement:
+            return
+        try:
+            if os.path.commonpath((str(old), str(self.root))) != str(self.root):
+                raise OSError("旧版镜像路径超出 AIFOS 目录，拒绝清理")
+        except ValueError as exc:
+            raise OSError("旧版镜像路径无效，拒绝清理") from exc
+        try:
+            if self._managed_digest(replacement) != replacement_digest:
+                raise OSError("新单层镜像缺失或校验失败，已保留旧目录镜像")
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            raise OSError("新单层镜像缺失，已保留旧目录镜像") from exc
+        if any(manifest_key != key and
+               Path(os.path.abspath(os.path.normpath(
+                   str(self.root / str(item.get("target") or ""))))) == old
+               for manifest_key, item in
+               self._manifest.get("entries", {}).items()):
+            raise OSError("旧版镜像仍被其他资产引用，暂不清理")
+        try:
+            self._unlink_managed_file(
+                old, str(existing.get("sha256") or ""))
+        except FileNotFoundError:
+            try:
+                relative = old.relative_to(self.root)
+                self._prune_managed_parents(relative.parent.parts)
+            except ValueError:
+                pass
+
+    def _finish_pending_retirement_locked(self, key, target):
+        entry = self._manifest["entries"].get(key) or {}
+        old_rel = entry.get("previous_target")
+        if not old_rel:
+            return
+        self._retire_previous_target_locked({
+            "target": old_rel,
+            "sha256": entry.get("previous_sha256"),
+        }, target, key, str(entry.get("sha256") or ""))
+        entry.pop("previous_target", None)
+        entry.pop("previous_sha256", None)
+        self._manifest["entries"][key] = entry
+        self._dirty_entries.add(key)
+        self._dirty = True
+        self._write_manifest_locked()
 
     def _asset_key(self, row):
         return (f"W{self.workspace_id}:{int(row['id'])}:"
@@ -343,8 +458,8 @@ class ICloudImageSync:
     def _copy_atomic(self, source, target, source_digest):
         target.parent.mkdir(parents=True, exist_ok=True)
         before = source.stat()
-        temp = target.parent / (
-            f".{target.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+        # 临时文件名不继承可读长文件名，避免 NAME_MAX 被额外后缀撑爆。
+        temp = target.parent / f".aifos-copy-{uuid.uuid4().hex}.tmp"
         try:
             shutil.copy2(str(source), str(temp))
             after = source.stat()
@@ -430,6 +545,8 @@ class ICloudImageSync:
                             and target.is_file()
                             and target.stat().st_size == stat.st_size
                             and _hash_file(target) == source_digest):
+                        self._finish_pending_retirement_locked(
+                            key, target)
                         if key in self._manifest["failures"]:
                             self._manifest["failures"].pop(key, None)
                             self._resolved_failures.add(key)
@@ -438,7 +555,7 @@ class ICloudImageSync:
                         return {"status": "skipped", "target": str(target)}
                     stat, digest = self._copy_atomic(
                         source, target, source_digest)
-                    self._manifest["entries"][key] = {
+                    entry = {
                         "workspace_id": self.workspace_id,
                         "asset_id": int(current["id"]),
                         "version": int(current.get("version") or 1),
@@ -446,12 +563,19 @@ class ICloudImageSync:
                         "source": relative.as_posix(), "target": target_rel,
                         "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
                         "sha256": digest, "synced_at": time.time(),
+                        "layout": "flat-v1",
                     }
+                    previous_target = str(existing.get("target") or "")
+                    if previous_target and previous_target != target_rel:
+                        entry["previous_target"] = previous_target
+                        entry["previous_sha256"] = existing.get("sha256")
+                    self._manifest["entries"][key] = entry
                     self._dirty_entries.add(key)
                     self._manifest["failures"].pop(key, None)
                     self._resolved_failures.add(key)
                     self._dirty = True
                     self._write_manifest_locked()
+                    self._finish_pending_retirement_locked(key, target)
                     return {"status": "synced", "target": str(target),
                             "bytes": stat.st_size}
                 except Exception as exc:
@@ -531,16 +655,92 @@ class ICloudImageSync:
         return [dict(row) for row in latest.values()
                 if row["uri"] and not self._meta(dict(row)).get("deleted")]
 
+    def _migrate_legacy_entry(self, key):
+        """把一个清单内的旧多层镜像迁为单层；历史版本同样保留。"""
+        current = None
+        try:
+            with self._root_guard():
+                self._merge_disk_locked()
+                existing = dict(
+                    (self._manifest.get("entries") or {}).get(key) or {})
+                if not existing or existing.get("workspace_id") != self.workspace_id:
+                    return {"status": "ignored"}
+                old_rel = str(existing.get("target") or "")
+                if existing.get("previous_target"):
+                    target = self.root / old_rel
+                    self._finish_pending_retirement_locked(key, target)
+                    return {"status": "migrated", "bytes": 0}
+                if not old_rel or "/" not in old_rel:
+                    return {"status": "skipped"}
+                current = self._current_asset(existing.get("asset_id"))
+                if current is None:
+                    raise OSError("旧目录镜像对应的资产记录不存在，已保留原文件")
+                found = self._source(current)
+                if found is None:
+                    raise OSError("旧目录镜像对应的本地原图不可用，已保留原文件")
+                source, relative = found
+                target = self._target(current, source, relative)
+                digest = _hash_file(source)
+                stat, copied_digest = self._copy_atomic(source, target, digest)
+                entry = dict(existing)
+                entry.update({
+                    "source": relative.as_posix(),
+                    "target": target.relative_to(self.root).as_posix(),
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "sha256": copied_digest,
+                    "synced_at": time.time(),
+                    "layout": "flat-v1",
+                    "previous_target": old_rel,
+                    "previous_sha256": existing.get("sha256"),
+                })
+                self._manifest["entries"][key] = entry
+                self._dirty_entries.add(key)
+                self._dirty = True
+                self._write_manifest_locked()
+                self._finish_pending_retirement_locked(key, target)
+                return {"status": "migrated", "bytes": stat.st_size}
+        except Exception as exc:
+            return self._record_failure(current or {
+                "id": (self._manifest.get("entries", {}).get(key) or {}).get(
+                    "asset_id"),
+                "version": (self._manifest.get("entries", {}).get(key) or {}).get(
+                    "version", 1),
+            }, str(exc))
+
+    def _migrate_legacy_entries(self):
+        prefix = f"W{self.workspace_id}:"
+        keys = [key for key, entry in
+                (self._manifest.get("entries") or {}).items()
+                if key.startswith(prefix)
+                and ("/" in str(entry.get("target") or "")
+                     or entry.get("previous_target"))]
+        report = {"migrated": 0, "failed": 0, "bytes": 0, "errors": []}
+        for key in keys:
+            result = self._migrate_legacy_entry(key)
+            if result.get("status") == "migrated":
+                report["migrated"] += 1
+                report["bytes"] += int(result.get("bytes") or 0)
+            elif result.get("status") == "failed":
+                report["failed"] += 1
+                if result.get("error") and len(report["errors"]) < 20:
+                    report["errors"].append(result["error"])
+        return report
+
     def backfill(self):
-        """幂等补齐当前有效图片；不删除 iCloud 中的任何历史镜像。"""
+        """幂等补齐当前有效图片，并迁移本模块登记的旧目录版镜像。"""
         if not self.enabled:
             return {"status": "disabled", "total": 0,
                     "synced": 0, "skipped": 0, "failed": 0,
                     "bytes": 0, "errors": ["iCloud 图片同步尚未启用"]}
+        migration = self._migrate_legacy_entries()
         rows = self._active_rows()
         report = {"status": "done", "total": len(rows), "synced": 0,
                   "skipped": 0, "failed": 0, "ignored": 0,
-                  "bytes": 0, "errors": []}
+                  "migrated": migration["migrated"],
+                  "bytes": migration["bytes"],
+                  "errors": list(migration["errors"])}
+        report["failed"] += migration["failed"]
         for row in rows:
             result = self.sync_asset(row)
             state = result["status"]

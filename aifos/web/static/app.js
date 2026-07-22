@@ -1504,7 +1504,7 @@ function icloudSyncHtml(sync = {}) {
   return `<section class="panel icloud-sync-card">
     <div class="icloud-sync-head">
       <div><h2>☁️ iCloud 图片同步</h2>
-        <p>生成完成后自动复制到 iCloud Drive/AIFOS，手机“文件”App 可直接查看。</p></div>
+        <p>手机“文件”App → iCloud Drive → AIFOS；所有图片直接放在同一个文件夹。</p></div>
       <span class="chip ${state[0]}">${esc(state[1])}</span>
     </div>
     <code>${esc(sync.display_path || "~/Library/Mobile Documents/com~apple~CloudDocs/AIFOS")}</code>
@@ -1517,7 +1517,7 @@ function icloudSyncHtml(sync = {}) {
       <button class="primary" id="btn-icloud-toggle">${sync.enabled ? "停用同步" : "启用同步"}</button>
       <button id="btn-icloud-backfill" ${sync.enabled && sync.available ? "" : "disabled"}>补同步现有图片</button>
     </div>
-    <small>只复制正式登记的原图，不复制缩略图、数据库、配置和日志；本地工作区仍是唯一生产源。</small>
+    <small>已登记图片以只读镜像复制；项目素材标 E000，剧集图片标 E001…；修改或删除 iCloud 副本不会回写本地生产工作区。</small>
   </section>`;
 }
 
