@@ -1727,3 +1727,28 @@ textarea:focus-visible, select:focus-visible {
 .plan-st.st-qc-ok { background: rgba(12, 163, 12, .14); color: #58c558; }
 
 .mock-warn .mw-redo { margin-left: 12px; font-size: 12.5px; }
+
+/* ---- 单张/批量质检按钮 ---- */
+.plan-qc-row { margin: 4px 0; }
+.plan-qc-one {
+  font-size: 12px; background: var(--surface-3); color: var(--ink-2);
+  border: 1px solid var(--hairline); border-radius: 8px;
+  padding: 4px 10px; cursor: pointer;
+}
+.plan-qc-one:hover { color: var(--ink); border-color: var(--accent); }
+.plan-batchbar {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  margin: 8px 0; padding: 8px 10px;
+  background: var(--surface-2); border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+}
+.plan-batchbar button {
+  font-size: 13px; padding: 6px 12px; border-radius: 8px; cursor: pointer;
+  background: var(--surface-3); color: var(--ink);
+  border: 1px solid var(--hairline);
+}
+.plan-batchbar .batch-redo-failed:not(:disabled) {
+  background: rgba(208, 59, 59, .18); color: #ef8f8f;
+  border-color: rgba(208, 59, 59, .5);
+}
+.plan-batchbar button:disabled { opacity: .5; cursor: default; }

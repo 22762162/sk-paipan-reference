@@ -752,14 +752,18 @@ class Director:
         return results
 
     def _plan_seed_shots(self, ctx):
-        """分镜确定后,把每个镜头的关键帧与首尾帧登记进清单。"""
+        """分镜确定后,把每个镜头的关键帧与首尾帧登记进清单。
+        清单里展示的是详细提示词(含人物设定与故事情境),所见即所得。"""
         shots = (ctx.get("storyboard") or {}).get("shots") or []
+        locations = self._scene_locations(ctx) if ctx.get("script") else {}
         self._plan_seed(ctx, "shot_image", [
             {"id": f"shot:{s['shot_no']}", "category": "shot_image",
              "label": f"镜头 {s['shot_no']:02d}"
                       + (f" · 第{s['scene_no']}场" if s.get("scene_no")
                          else ""),
-             "shot_no": s["shot_no"], "prompt": s["prompt"]}
+             "shot_no": s["shot_no"],
+             "prompt": self._rich_shot_prompt(
+                 ctx, s, locations.get(s.get("scene_no"), ""))}
             for s in shots])
         self._plan_seed(ctx, "frames", [
             {"id": f"frames:{s['shot_no']}", "category": "frames",
@@ -1177,6 +1181,47 @@ class Director:
             refs["style_ref"] = anchor
         return refs
 
+    def _rich_shot_prompt(self, ctx, shot, location):
+        """详细出图提示词:场景 + 出场人物完整设定 + 动作 + 台词情绪 + 镜头,
+        让每张分镜画面都说清楚人物是谁、在做什么、什么故事情境。"""
+        project_id = ctx["project"]["id"]
+        title = ctx["project"].get("title", "")
+        parts = [f"漫剧《{title}》分镜画面"]
+        if location:
+            parts.append(f"场景:{location}")
+        who = []
+        for name in shot.get("characters", []):
+            design = self._character_design(project_id, name)
+            line = self._design_line(design, keys=(
+                "species", "appearance", "hair", "eyes", "costume",
+                "signature", "temperament")) if design else ""
+            who.append(f"{name}({line})" if line else name)
+        if who:
+            parts.append(
+                f"出场人物(严格共{len(who)}人,形态与设定一致):"
+                + ";".join(who))
+        else:
+            parts.append("环境空镜,画面中无人物")
+        action = shot.get("description") or shot.get("prompt", "")
+        if action:
+            parts.append(f"本镜动作/画面:{action}")
+        dialogue = shot.get("dialogue")
+        if isinstance(dialogue, dict) and dialogue.get("dialogue"):
+            speaker = dialogue.get("character", "")
+            emo = (shot.get("speech_timing") or {}).get("emotion", "")
+            parts.append(
+                f"此刻{speaker}正说「{dialogue['dialogue']}」"
+                + (f",情绪{emo},神态需体现" if emo else ",神态需体现"))
+        elif shot.get("kind") == "reaction":
+            parts.append("表现听者听到上一句台词后的即时反应与微表情")
+        camera = shot.get("camera", "")
+        if camera:
+            parts.append(f"镜头语言:{camera}")
+        ref = (shot.get("script_reference") or "").strip()
+        if ref and ref not in action:
+            parts.append(f"剧情依据:{ref}")
+        return "。".join(p for p in parts if p)
+
     def _shot_payload(self, ctx, shot):
         locations = self._scene_locations(ctx)
         location = locations.get(shot["scene_no"], "")
@@ -1187,7 +1232,7 @@ class Director:
         return {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
-            "prompt": shot["prompt"],
+            "prompt": self._rich_shot_prompt(ctx, shot, location),
             "seedance_prompt": shot.get("seedance_prompt", shot["prompt"]),
             "characters": shot["characters"],
             "character_count": shot.get(
@@ -2108,11 +2153,201 @@ class Director:
                                  "shot_no": int(parts[0])},
     }
 
+    # ---- 单张/批量质检:核对已生成的图是否符合剧本要求 ----
+    _FORBID = ["与设定形态不符的角色", "悬挂的衣物或衣架", "与设定不符的人"]
+
+    def _plan_item_target(self, item_id):
+        head, _, rest = item_id.partition(":")
+        builder = self.PLAN_TARGETS.get(head)
+        return builder(rest.split(":")) if builder else None
+
+    def _plan_item_asset(self, project_id, ep_num, item):
+        """清单条目 → (最新资产 uri, 质检要求 spec);无法解析返回 (None,None)。"""
+        cat = item.get("category")
+        shot_no = item.get("shot_no")
+        name = item.get("name")
+        prefix = f"e{ep_num:03d}"
+        if cat == "character_art":
+            row = self.assets.latest(project_id, "character_art", name)
+            spec = self._qc_spec(project_id, [name], forbid=self._FORBID)
+        elif cat == "character_sheet":
+            asset_name = (name if ":" in str(name)
+                          else f"{name}:{item.get('sheet', '')}")
+            row = self.assets.latest(
+                project_id, "character_sheet", asset_name)
+            spec = self._qc_spec(project_id, [str(name).split(":")[0]],
+                                 forbid=self._FORBID)
+        elif cat == "scene_art":
+            row = self.assets.latest(project_id, "scene_art", name)
+            spec = self._qc_spec(project_id, [], location=name,
+                                 forbid=self._FORBID)
+        elif cat in ("shot_image", "frames"):
+            kind = "image" if cat == "shot_image" else "first_frame"
+            row = self.assets.latest(
+                project_id, kind, f"{prefix}_shot{shot_no:03d}")
+            spec = None   # 分镜/首尾帧的人物名单在下面按分镜补
+        else:
+            return None, None
+        uri = row["uri"] if row and row["uri"] else None
+        if uri and not (uri.startswith("http") or Path(uri).exists()):
+            uri = None
+        return uri, spec
+
+    def qc_item(self, project_title, episode_number, item_id):
+        """单张质检:对清单里某条目的最新图做视觉核对,写回 qc 结果。"""
+        project, episode = self._episode_ctx(project_title, episode_number)
+        ctx = {"project": dict(project), "episode": dict(episode),
+               "out_root": self._episode_dir(project, episode)}
+        plan = self._plan_read(ctx)
+        item = next((i for i in plan["items"] if i["id"] == item_id), None)
+        if item is None:
+            raise AifosError(f"清单里没有该条目: {item_id}")
+        return self._qc_one(project, episode, ctx, item)
+
+    def _qc_one(self, project, episode, ctx, item):
+        project_id = project["id"]
+        uri, spec = self._plan_item_asset(
+            project_id, episode["number"], item)
+        if not uri:
+            self._plan_mark(ctx, item["id"], item.get("status", "done"),
+                            extra={"qc": {"passed": False, "attempts": 0,
+                                          "issues": ["尚无可检的图片"]}})
+            return {"passed": False, "issues": ["尚无可检的图片"]}
+        if spec is None:
+            # 分镜/首尾帧:按分镜取人物名单/场景/动作
+            storyboard, _ = self.projects.latest_document(
+                episode["id"], "storyboard")
+            shot = next((s for s in (storyboard or {}).get("shots", [])
+                         if s["shot_no"] == item.get("shot_no")), None)
+            if shot is not None:
+                ctx["storyboard"] = storyboard
+                if "script" not in ctx:
+                    script, _ = self.projects.latest_document(
+                        episode["id"], "script")
+                    ctx["script"] = script or {"scenes": []}
+                ctx.setdefault("aspect", project["aspect"] or "9:16")
+                ctx.setdefault("dims", ASPECT_DIMS.get(
+                    ctx["aspect"], ASPECT_DIMS["9:16"]))
+                payload = self._shot_payload(ctx, shot)
+                spec = self._qc_spec(
+                    project_id, payload.get("characters", []),
+                    location=payload.get("location", ""),
+                    action=payload.get("action", ""),
+                    forbid=self._FORBID + ["字幕条"])
+                spec["camera"] = payload.get("camera", "")
+            else:
+                spec = self._qc_spec(project_id, [], forbid=self._FORBID)
+        try:
+            result = self.router.call(
+                "image_qc", {**spec, "image_uri": uri}, ctx["out_root"],
+                cancel=lambda: self._cancel_requested(ctx))
+        except (ProviderUnavailable, ProviderError) as exc:
+            raise AifosError(f"质检产线不可用: {exc}") from exc
+        verdict = result.data or {}
+        report = {"passed": bool(verdict.get("pass")),
+                  "issues": list(verdict.get("issues") or []),
+                  "attempts": (item.get("qc") or {}).get("attempts", 0)}
+        self.projects.add_episode_cost(episode["id"], result.cost)
+        self._plan_mark(ctx, item["id"], item.get("status", "done"),
+                        extra={"qc": report})
+        self.log.info(
+            "director",
+            f"质检 {item['id']}: "
+            + ("通过" if report["passed"]
+               else "未过 — " + "；".join(report["issues"])))
+        return report
+
+    def qc_all(self, project_title, episode_number):
+        """批量质检:对清单里所有已生成的图逐张核对,可暂停。"""
+        project, episode = self._episode_ctx(project_title, episode_number)
+        ctx = {"project": dict(project), "episode": dict(episode),
+               "out_root": self._episode_dir(project, episode)}
+        plan = self._plan_read(ctx)
+        items = [i for i in plan["items"]
+                 if i.get("status") in ("done", "reused")]
+        previous_status = episode["status"]
+        self.projects.set_episode_status(episode["id"], "cast")
+        checked = passed = failed = 0
+        try:
+            for item in items:
+                if self._cancel_requested(ctx):
+                    raise ProduceCancelled("已手动暂停质检")
+                try:
+                    report = self._qc_one(project, episode, ctx, item)
+                except AifosError as exc:
+                    self.log.warn("director",
+                                  f"质检 {item['id']} 跳过: {exc}")
+                    continue
+                checked += 1
+                passed += 1 if report["passed"] else 0
+                failed += 0 if report["passed"] else 1
+        except ProduceCancelled:
+            self.projects.set_episode_status(episode["id"], previous_status)
+            return {"status": "paused", "checked": checked,
+                    "passed": passed, "failed": failed}
+        finally:
+            row = self.projects.get_episode(episode["id"])
+            if row and row["status"] in ("cast", "cancelling"):
+                self.projects.set_episode_status(
+                    episode["id"], previous_status)
+        self.log.info(
+            "director",
+            f"批量质检完成:{checked} 张,通过 {passed},未过 {failed}")
+        return {"status": "done", "checked": checked,
+                "passed": passed, "failed": failed}
+
+    def redo_items(self, project_title, episode_number, item_ids=None,
+                   only_failed=False):
+        """批量重画:按 item_ids 重画;only_failed=True 时重画所有质检
+        未过的图。可暂停,重画后自动复检。"""
+        project, episode = self._episode_ctx(project_title, episode_number)
+        ctx = {"episode": dict(episode),
+               "out_root": self._episode_dir(project, episode)}
+        plan = self._plan_read(ctx)
+        by_id = {i["id"]: i for i in plan["items"]}
+        if only_failed:
+            targets = [i["id"] for i in plan["items"]
+                       if (i.get("qc") or {}).get("passed") is False
+                       and i.get("status") in ("done", "reused")]
+        else:
+            targets = [tid for tid in (item_ids or []) if tid in by_id]
+        if not targets:
+            return {"status": "done", "redone": 0,
+                    "note": "没有需要重画的图"}
+        previous_status = episode["status"]
+        self.projects.set_episode_status(episode["id"], "cast")
+        self.log.info("director", f"开始批量重画 {len(targets)} 张")
+        redone = 0
+        try:
+            for item_id in targets:
+                if self._cancel_requested(ctx):
+                    raise ProduceCancelled("已手动暂停重画")
+                target = self._plan_item_target(item_id)
+                if target is None:
+                    continue
+                try:
+                    self.regen_image(project_title, episode_number, target)
+                    redone += 1
+                except AifosError as exc:
+                    self.log.warn("director",
+                                  f"重画 {item_id} 跳过: {exc}")
+        except ProduceCancelled:
+            self.projects.set_episode_status(episode["id"], previous_status)
+            return {"status": "paused", "redone": redone}
+        finally:
+            row = self.projects.get_episode(episode["id"])
+            if row and row["status"] in ("cast", "cancelling"):
+                self.projects.set_episode_status(
+                    episode["id"], previous_status)
+        self.log.info("director", f"批量重画完成:{redone} 张")
+        return {"status": "done", "redone": redone}
+
     def redo_placeholders(self, project_title, episode_number):
         """一键补真:把清单里落到占位产线的图,逐张用真实产线重画。
         可随时暂停,已补好的保留;真实产线仍不可用时保持占位并红标。"""
         project, episode = self._episode_ctx(project_title, episode_number)
-        ctx = {"out_root": self._episode_dir(project, episode)}
+        ctx = {"episode": dict(episode),
+               "out_root": self._episode_dir(project, episode)}
         plan = self._plan_read(ctx)
         pending = [i for i in plan["items"]
                    if i.get("status") == "done" and i.get("real") is False]
