@@ -1904,6 +1904,22 @@ function planItemHtml(data, item, editable) {
     </div></div>`;
 }
 
+/* 一键补真:只重画占位图,不动其余 */
+async function redoMock(episodeId, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "已提交,补画中…"; }
+  try {
+    await api("/api/redo_mock", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ episode_id: episodeId }),
+    });
+    showToast("开始用真实产线补画占位图,进度看实况看板", "ok");
+    pollCanvas(episodeId);
+  } catch (e) {
+    showToast(staleServerHint(e), "error");
+    if (btn) { btn.disabled = false; btn.textContent = "🔁 重试补画"; }
+  }
+}
+
 /* 占位图警示条:真实出图产线没接通时,大字告知原因与接入方法 */
 function mockWarnHtml(data) {
   const items = ((data.render_plan || {}).items) || [];
@@ -1912,7 +1928,9 @@ function mockWarnHtml(data) {
   const reasons = [...new Set((mocks[0].fallbacks || []).map((f) =>
     `${PROVIDER_LABEL[f.provider] || f.provider}(${f.reason})`))];
   return `<div class="mock-warn">
-    <b>⚠️ ${mocks.length} 张图是内置占位示意图,不是真实 AI 生成的画面</b>
+    <b>⚠️ ${mocks.length} 张图是内置占位示意图,不是真实 AI 生成的画面
+      <button class="primary mw-redo" onclick="redoMock(${data.episode.id}, this)"
+        title="只重画这 ${mocks.length} 张占位图,其余不动;可随时暂停">🔁 用真实产线补画这 ${mocks.length} 张</button></b>
     <span>真实出图产线未接通:${esc(reasons.join(";") || "未检测到可用产线")}。
     接入方法:打开 <a href="#/settings">AI 设置</a> → 点「自动检测」接 Codex CLI,
     或在「图片生成 API」粘贴 Key 保存;接好后回到本集点「全部重做」,

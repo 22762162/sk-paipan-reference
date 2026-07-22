@@ -1725,3 +1725,5 @@ textarea:focus-visible, select:focus-visible {
 
 /* ---- 图片质检徽标 ---- */
 .plan-st.st-qc-ok { background: rgba(12, 163, 12, .14); color: #58c558; }
+
+.mock-warn .mw-redo { margin-left: 12px; font-size: 12.5px; }

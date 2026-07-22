@@ -195,6 +195,7 @@ class MockProvider(Provider):
 
     # ---- 人物设定:占位版也给出具体可画的丰富描述 ----
     DESIGN_POOLS = {
+        "species": ["人类", "人类", "人类", "人类"],
         "personality": ["外冷内热,神态克制,眼神却藏锋",
                        "活泼张扬,嘴角常带笑,站姿重心随性",
                        "沉稳可靠,表情不多但目光坚定",
@@ -501,7 +502,14 @@ class MockProvider(Provider):
         shot_no = payload["shot_no"]
         first = out_dir / f"shot_{shot_no:03d}.first.svg"
         last = out_dir / f"shot_{shot_no:03d}.last.svg"
-        first.write_text(self._shot_svg(payload, "first"), encoding="utf-8")
+        chain_first = payload.get("chain_first_uri", "")
+        if chain_first and Path(chain_first).exists():
+            # 帧链:首帧 = 上一镜尾帧(两段视频拼接处画面连贯)
+            first.write_text(Path(chain_first).read_text(encoding="utf-8"),
+                             encoding="utf-8")
+        else:
+            first.write_text(self._shot_svg(payload, "first"),
+                             encoding="utf-8")
         last.write_text(self._shot_svg(payload, "last"), encoding="utf-8")
         return {"first": str(first), "last": str(last)}, str(first)
 

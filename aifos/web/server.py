@@ -567,6 +567,8 @@ def make_handler(workspace, jobs):
                     return self._settings_detect()
                 if parsed.path == "/api/update":
                     return self._update_now()
+                if parsed.path == "/api/redo_mock":
+                    return self._redo_mock()
                 if parsed.path == "/api/restyle":
                     return self._restyle()
                 if parsed.path == "/api/reference/upload":
@@ -1091,6 +1093,22 @@ def make_handler(workspace, jobs):
                     restart_process()
                 threading.Thread(target=later, daemon=True).start()
             return self._json({"status": status, "detail": detail})
+
+        def _redo_mock(self):
+            """一键补真:{episode_id|project+episode} → 只重画占位图。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id: app.director.redo_placeholders(
+                    title, number),
+                action="redo_placeholders")
+            return self._json({"job_id": job_id}, status=202)
 
         def _restyle(self):
             """一键换画风:{episode_id|project+episode, style?}。

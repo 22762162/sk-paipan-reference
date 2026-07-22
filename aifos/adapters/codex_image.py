@@ -31,10 +31,11 @@ DEFAULT_EXEC_ARGS = ["--sandbox", "workspace-write", "--skip-git-repo-check"]
 # 强制真实出图:Codex 是编码代理,放任它就会用 Pillow 画示意图充数
 # 画面语义硬约束:角色名不是物种;不画剧情外的杂物
 SUBJECT_DIRECTIVE = (
-    "画面语义约束:所有角色一律画成人类,角色名只是称呼——"
-    "「小鹿」「石头」「小狐」等名字绝不能画成动物、植物或物体;"
-    "除剧情明确需要的道具外,不要出现无关杂物"
-    "(如悬挂的衣物、衣架、多余的人形)。")
+    "画面语义约束:角色形态严格以提示词中的人物设定为准——设定写明"
+    "物种(动物/精怪/机器人等)就按设定画,未写明的一律默认人类;"
+    "名字不代表物种,「小鹿」「石头」这类名字不能因为字面画成动物或"
+    "物体;同一角色在所有画面中形态必须一致。除剧情明确需要的道具外,"
+    "不要出现无关杂物(如悬挂的衣物、衣架、多余的人形)。")
 
 GEN_DIRECTIVE = (
     "你必须使用你环境里可用的图像生成能力(图像生成技能 / 工具 / MCP,"
@@ -139,6 +140,25 @@ def build_instruction(capability, payload, out_dir):
         if (image_uri and not image_uri.startswith(("http://", "https://"))
                 and not Path(image_uri).exists()):
             image_uri = Path(image_uri).name
+        chain_first = payload.get("chain_first_uri", "")
+        if chain_first and Path(chain_first).exists():
+            # 帧链:首帧固定为上一镜尾帧(平台已定),只生成尾帧,
+            # 保证两段视频拼接处画面连贯
+            shutil.copyfile(chain_first, first)
+            instruction = (
+                f"本镜首帧已固定为上一镜的尾帧(文件已就位:{first},"
+                "不要改动它)。请基于该首帧与关键图 "
+                f"{image_uri}(均可直接读取)只生成本镜尾帧,"
+                f"保存到 {last}(PNG,{size})。"
+                f"镜头内容:{payload.get('prompt', '')}。"
+                f"结尾状态:{payload.get('end_state', {})};"
+                "画面从首帧状态自然演进到结尾状态,"
+                "人物、服装、道具、场景与首帧完全一致,"
+                f"不新增字幕条。{_ref_line(payload)}{common}"
+                "只产出尾帧这一个文件。"
+            )
+            return instruction, [first, last], {
+                "first": str(first), "last": str(last)}
         instruction = (
             f"基于关键图 {image_uri}(文件可直接读取)"
             "为镜头生成首帧与尾帧,"

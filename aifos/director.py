@@ -396,14 +396,17 @@ class Director:
     # ---- 图片生产清单:每张图的分类/提示词/实时状态(Web 实时可见) ----
     # 每类资产套件重点采用的人物设定字段(全用会超长,按图取材)
     SHEET_DESIGN_KEYS = {
-        "turnaround": ("appearance", "hair", "costume", "palette"),
-        "closeup": ("appearance", "hair", "eyes", "temperament"),
+        "turnaround": ("species", "appearance", "hair", "costume",
+                       "palette"),
+        "closeup": ("species", "appearance", "hair", "eyes",
+                    "temperament"),
         "features": ("signature", "appearance", "hair", "palette"),
         "makeup": ("makeup", "eyes", "palette"),
         "costume": ("costume", "palette", "accessories"),
         "costume_detail": ("costume_detail", "accessories"),
     }
     DESIGN_LABELS = (
+        ("species", "形态"),
         ("appearance", "外貌"), ("hair", "发型"), ("eyes", "眼睛"),
         ("temperament", "气质"), ("personality", "性格"),
         ("makeup", "妆容"), ("costume", "服装"),
@@ -463,8 +466,9 @@ class Director:
 
     def _portrait_prompt(self, name, role, style, design=None):
         detail = self._design_line(
-            design, keys=("appearance", "hair", "eyes", "temperament",
-                          "personality", "costume", "palette"))
+            design, keys=("species", "appearance", "hair", "eyes",
+                          "temperament", "personality", "costume",
+                          "palette"))
         return (f"角色立绘:{name}({role}),{style}"
                 + (f",{detail},表情站姿体现其性格" if detail else "")
                 + ",全身,正面")
@@ -590,7 +594,8 @@ class Director:
         for name in characters:
             design = self._character_design(project_id, name)
             line = self._design_line(design, keys=(
-                "hair", "costume", "signature")) if design else ""
+                "species", "hair", "costume",
+                "signature")) if design else ""
             designs.append(f"{name}({line})" if line else name)
         return {
             "characters": list(characters),
@@ -1028,7 +1033,7 @@ class Director:
                     "sub_dir": "cast",
                     "qc_spec": self._qc_spec(
                         project_id, [name],
-                        forbid=["动物化角色", "悬挂的衣物或衣架", "与设定不符的人"])})
+                        forbid=["与设定形态不符的角色", "悬挂的衣物或衣架", "与设定不符的人"])})
                 self.assets.register(
                     project_id, "character_art", name, uri=result.uri,
                     meta={"role": character.get("role", "")})
@@ -1042,7 +1047,7 @@ class Director:
             "tag": ("char", c["name"], c.get("role", "")),
             "qc_spec": self._qc_spec(
                 project_id, [c["name"]],
-                forbid=["动物化角色", "悬挂的衣物或衣架", "与设定不符的人"]),
+                forbid=["与设定形态不符的角色", "悬挂的衣物或衣架", "与设定不符的人"]),
         } for c in pending_portraits]
         for scene in ctx["script"]["scenes"]:
             location = scene["location"]
@@ -1116,7 +1121,7 @@ class Director:
                     "tag": (name, key, label),
                     "qc_spec": self._qc_spec(
                         project_id, [name],
-                        forbid=["动物化角色", "悬挂的衣物或衣架", "与设定不符的人"])})
+                        forbid=["与设定形态不符的角色", "悬挂的衣物或衣架", "与设定不符的人"])})
         for (name, key, label), result in self._run_parallel(
                 ctx, tasks, line="人物资产套件").items():
             self.assets.register(
@@ -1230,7 +1235,7 @@ class Director:
                     ctx["project"]["id"], payload.get("characters", []),
                     location=payload.get("location", ""),
                     action=payload.get("action", ""),
-                    forbid=["动物化角色", "悬挂的衣物或衣架", "与设定不符的人"] + ["字幕条"]),
+                    forbid=["与设定形态不符的角色", "悬挂的衣物或衣架", "与设定不符的人"] + ["字幕条"]),
                     "camera": payload.get("camera", "")}})
         results = self._run_parallel(ctx, tasks, line="分镜画面")
         for shot_no in sorted(results):
@@ -1269,40 +1274,68 @@ class Director:
                 "passed": manifest["passed"]}
 
     def _stage_frames(self, ctx):
+        """首尾帧·帧链模式:同一场内「上一镜尾帧 = 下一镜首帧」,
+        两段视频拼接处画面连贯;不同场之间是剪辑硬切,各自独立,
+        因此按轮推进——每轮并行处理各场的第 N 镜,场内保持串行。"""
         self._plan_seed_shots(ctx)
         images = {i["shot_no"]: i["uri"] for i in ctx["images"]}
         ctx["frames"] = []
         reused = 0
-        tasks = []
+        chains = {}
         for shot in ctx["storyboard"]["shots"]:
-            name = self._shot_name(ctx, shot["shot_no"])
-            first = self._existing_asset_uri(ctx, "first_frame", name)
-            last = self._existing_asset_uri(ctx, "last_frame", name)
-            if first and last:
-                ctx["frames"].append({"shot_no": shot["shot_no"],
-                                      "first": first, "last": last})
-                reused += 1
-                self._plan_mark(ctx, f"frames:{shot['shot_no']}", "reused",
-                                only_pending=True)
+            chains.setdefault(shot.get("scene_no"), []).append(shot)
+        chain_list = list(chains.values())
+        last_by_scene = {}
+        max_len = max((len(c) for c in chain_list), default=0)
+        for round_no in range(max_len):
+            round_tasks = []
+            for chain in chain_list:
+                if round_no >= len(chain):
+                    continue
+                shot = chain[round_no]
+                scene_no = shot.get("scene_no")
+                name = self._shot_name(ctx, shot["shot_no"])
+                first = self._existing_asset_uri(ctx, "first_frame", name)
+                last = self._existing_asset_uri(ctx, "last_frame", name)
+                if first and last:
+                    ctx["frames"].append({"shot_no": shot["shot_no"],
+                                          "first": first, "last": last})
+                    reused += 1
+                    self._plan_mark(ctx, f"frames:{shot['shot_no']}",
+                                    "reused", only_pending=True)
+                    last_by_scene[scene_no] = last
+                    continue
+                payload = {**self._shot_payload(ctx, shot),
+                           "image_uri": images[shot["shot_no"]]}
+                chain_first = last_by_scene.get(scene_no)
+                if round_no > 0 and chain_first                         and Path(chain_first).exists():
+                    payload["chain_first_uri"] = chain_first
+                round_tasks.append({
+                    "item_id": f"frames:{shot['shot_no']}",
+                    "capability": "frames",
+                    "payload": payload,
+                    "sub_dir": "frames", "tag": shot["shot_no"],
+                    "scene": scene_no})
+            if not round_tasks:
                 continue
-            tasks.append({
-                "item_id": f"frames:{shot['shot_no']}",
-                "capability": "frames",
-                "payload": {**self._shot_payload(ctx, shot),
-                            "image_uri": images[shot["shot_no"]]},
-                "sub_dir": "frames", "tag": shot["shot_no"]})
-        results = self._run_parallel(ctx, tasks, line="首尾帧")
-        for shot_no in sorted(results):
-            result = results[shot_no]
-            self._register_shot_asset(
-                ctx, "first_frame", shot_no, result.data["first"])
-            self._register_shot_asset(
-                ctx, "last_frame", shot_no, result.data["last"])
-            ctx["frames"].append({
-                "shot_no": shot_no,
-                "first": result.data["first"],
-                "last": result.data["last"],
-            })
+            results = self._run_parallel(
+                ctx, round_tasks,
+                line=f"首尾帧帧链(第{round_no + 1}轮·各场并行)")
+            for task in round_tasks:
+                result = results.get(task["tag"])
+                if result is None:
+                    continue
+                shot_no = task["tag"]
+                self._register_shot_asset(
+                    ctx, "first_frame", shot_no, result.data["first"])
+                self._register_shot_asset(
+                    ctx, "last_frame", shot_no, result.data["last"])
+                ctx["frames"].append({
+                    "shot_no": shot_no,
+                    "first": result.data["first"],
+                    "last": result.data["last"],
+                })
+                last_by_scene[task["scene"]] = result.data["last"]
         ctx["frames"].sort(key=lambda f: f["shot_no"])
         return {"count": len(ctx["frames"]), "reused": reused}
 
@@ -1837,14 +1870,69 @@ class Director:
                 prompt=payload["prompt"])
             self.assets.register(project["id"], "image", asset_name,
                                  uri=result.uri, new_version=True)
+            frames_payload = {**payload, "image_uri": result.uri}
+            prev = None
+            for candidate in storyboard["shots"]:
+                if candidate["shot_no"] >= shot_no:
+                    break
+                if candidate.get("scene_no") == shot.get("scene_no"):
+                    prev = candidate
+            if prev is not None:
+                row = self.assets.latest(
+                    project["id"], "last_frame",
+                    self._shot_name(ctx, prev["shot_no"]))
+                if row and row["uri"] and Path(row["uri"]).exists():
+                    # 帧链衔接:重画也保持与上一镜尾帧连贯
+                    frames_payload["chain_first_uri"] = row["uri"]
             frames = self._plan_run(
-                ctx, f"frames:{shot_no}", lambda: self._call(ctx, "frames", {
-                    **payload, "image_uri": result.uri}, "frames"))
+                ctx, f"frames:{shot_no}", lambda: self._call(
+                    ctx, "frames", frames_payload, "frames"))
             self.assets.register(project["id"], "first_frame", asset_name,
                                  uri=frames.data["first"], new_version=True)
             self.assets.register(project["id"], "last_frame", asset_name,
                                  uri=frames.data["last"], new_version=True)
             # 画面变了 → 旧视频作废,「继续补齐」时重拍并重剪
+            self.assets.delete(project["id"], "video", asset_name)
+        elif kind == "frames":
+            shot_no = int(target["shot_no"])
+            storyboard, _ = self.projects.latest_document(
+                episode["id"], "storyboard")
+            shot = next((s for s in (storyboard or {}).get("shots", [])
+                         if s["shot_no"] == shot_no), None)
+            if shot is None:
+                raise AifosError(f"镜头不存在: {shot_no}")
+            ctx["storyboard"] = storyboard
+            asset_name = self._shot_name(ctx, shot_no)
+            image_row = self.assets.latest(project["id"], "image",
+                                           asset_name)
+            if not (image_row and image_row["uri"]
+                    and Path(image_row["uri"]).exists()):
+                raise AifosError(f"镜头{shot_no}尚无关键图,请先重画镜头")
+            frames_payload = {**self._shot_payload(ctx, shot),
+                              "image_uri": image_row["uri"],
+                              "feedback": feedback,
+                              "revision": next_revision("first_frame",
+                                                        asset_name)}
+            prev = None
+            for candidate in storyboard["shots"]:
+                if candidate["shot_no"] >= shot_no:
+                    break
+                if candidate.get("scene_no") == shot.get("scene_no"):
+                    prev = candidate
+            if prev is not None:
+                row = self.assets.latest(
+                    project["id"], "last_frame",
+                    self._shot_name(ctx, prev["shot_no"]))
+                if row and row["uri"] and Path(row["uri"]).exists():
+                    frames_payload["chain_first_uri"] = row["uri"]
+            result = self._plan_run(
+                ctx, f"frames:{shot_no}", lambda: self._call(
+                    ctx, "frames", frames_payload, "frames"))
+            self.assets.register(project["id"], "first_frame", asset_name,
+                                 uri=result.data["first"],
+                                 new_version=True)
+            self.assets.register(project["id"], "last_frame", asset_name,
+                                 uri=result.data["last"], new_version=True)
             self.assets.delete(project["id"], "video", asset_name)
         else:
             raise AifosError(f"不支持的重画目标: {kind}")
@@ -2005,6 +2093,57 @@ class Director:
             "director", f"全部形象已按新画风重做完成(共 {done} 张)。"
             "分镜画面如需同步新画风,点「全部重做」重制本集")
         return {"status": "done", "done": done, "style": project["style"]}
+
+    PLAN_TARGETS = {
+        "char": lambda parts: {"kind": "character_art", "name": parts[0]},
+        "sheet": lambda parts: {"kind": "character_sheet",
+                                "name": ":".join(parts)},
+        "scene": lambda parts: {"kind": "scene_art", "name": parts[0]},
+        "shot": lambda parts: {"kind": "shot", "shot_no": int(parts[0])},
+        "frames": lambda parts: {"kind": "frames",
+                                 "shot_no": int(parts[0])},
+    }
+
+    def redo_placeholders(self, project_title, episode_number):
+        """一键补真:把清单里落到占位产线的图,逐张用真实产线重画。
+        可随时暂停,已补好的保留;真实产线仍不可用时保持占位并红标。"""
+        project, episode = self._episode_ctx(project_title, episode_number)
+        ctx = {"out_root": self._episode_dir(project, episode)}
+        plan = self._plan_read(ctx)
+        pending = [i for i in plan["items"]
+                   if i.get("status") == "done" and i.get("real") is False]
+        if not pending:
+            return {"status": "done", "redone": 0,
+                    "note": "清单里没有占位图"}
+        previous_status = episode["status"]
+        self.projects.set_episode_status(episode["id"], "cast")
+        self.log.info(
+            "director", f"开始补画 {len(pending)} 张占位图(真实产线)")
+        redone = 0
+        try:
+            for item in pending:
+                head, _, rest = item["id"].partition(":")
+                builder = self.PLAN_TARGETS.get(head)
+                if builder is None:
+                    continue
+                try:
+                    self.regen_image(project_title, episode_number,
+                                     builder(rest.split(":")))
+                    redone += 1
+                except AifosError as exc:
+                    self.log.warn("director",
+                                  f"补画 {item['id']} 跳过: {exc}")
+        except ProduceCancelled:
+            self.projects.set_episode_status(
+                episode["id"], previous_status)
+            return {"status": "paused", "redone": redone}
+        finally:
+            row = self.projects.get_episode(episode["id"])
+            if row and row["status"] in ("cast", "cancelling"):
+                self.projects.set_episode_status(
+                    episode["id"], previous_status)
+        self.log.info("director", f"占位图补画完成:{redone} 张")
+        return {"status": "done", "redone": redone}
 
     # ---- 参考图管理:上传的参考图会自动进入出图提示(关联角色/场景) ----
     def add_reference(self, project_title, name, file_bytes, ext,

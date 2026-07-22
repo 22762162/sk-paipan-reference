@@ -64,7 +64,8 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
 - 关键台词后的听者反应与情绪高潮留白由平台补齐，不要用空镜凑时长；
 - shot_no 从 1 连续编号；duration 单位秒，优先 5-8 秒，最长 15 秒；
 - prompt 含场景、准确人物名单、主体动作、光影、机位与结尾状态；
-- prompt 中所有人物一律按人类角色描写(名字只是称呼,不能当作动物);
+- prompt 中人物形态按人物设定描写(名字只是称呼,「小鹿」若设定为
+  人类不能当动物写;设定为动物/精怪的按设定写,全片保持一致);
 - 不生成对白字幕。手机屏、弹幕、合同等可读文字只描述载体与准确文字，
   后续由 ChatGPT 关键帧锁定，不能交给视频模型从零生成；
 - 只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块。
@@ -159,7 +160,9 @@ DESIGN_PROMPT = """你是漫剧人物设定师。为作品《{title}》的角色
 
 JSON 格式:
 {{"designs": [{{
-  "name": "角色名", "personality": "性格(外化到神态)",
+  "name": "角色名",
+  "species": "物种/形态(默认人类;若是动物/精怪/机器人等明确写出)",
+  "personality": "性格(外化到神态)",
   "temperament": "气质", "appearance": "外貌(脸型/肤色/身材)",
   "hair": "发型发色", "eyes": "眼睛(形状/瞳色/眼神)",
   "makeup": "妆容细节", "costume": "服装(款式/材质/层次)",
@@ -168,7 +171,8 @@ JSON 格式:
   "signature": "标志性辨识特征"}}]}}"""
 
 # 人物设定必填字段;缺失时置空串,提示词侧自动跳过
-DESIGN_FIELDS = ("personality", "temperament", "appearance", "hair",
+DESIGN_FIELDS = ("species", "personality", "temperament",
+                 "appearance", "hair",
                  "eyes", "makeup", "costume", "costume_detail",
                  "accessories", "palette", "signature")
 
@@ -185,6 +189,8 @@ def validate_design(data, payload):
     for design in designs:
         for key in DESIGN_FIELDS:
             design.setdefault(key, "")
+        if not design["species"]:
+            design["species"] = "人类"
         if not (design.get("personality") and design.get("appearance")
                 and design.get("costume")):
             return f"角色「{design.get('name')}」设定过于空泛" \
@@ -196,12 +202,13 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 逐项核对是否符合生产要求。
 
 画面要求:
-- 出场角色:{characters}(严格共 {count} 人;所有角色必须是人类,
-  角色名只是称呼——「小鹿」「石头」等绝不能是动物/物体)
+- 出场角色:{characters}(严格共 {count} 个;角色形态必须与人物设定
+  一致——设定写明物种就按设定画,没写明的默认人类;名字不代表物种,
+  「小鹿」若设定是人类就必须是人类,不能因为名字画成动物)
 - 人物设定要点(发型/服装/标志特征必须一致,不能像换了一个人):{designs}
 - 场景:{location};动作:{action};镜头:{camera}
   (景别需大致相符:要求全景/远景不能给成特写,反之亦然)
-- 不允许出现:动物化的角色、与剧情无关的杂物(悬挂的衣物/衣架)、
+- 不允许出现:与设定形态不符的角色、与剧情无关的杂物(悬挂的衣物/衣架)、
   字幕条、乱码文字、多余或缺失的人物{extra}
 
 只输出一个 JSON 对象,不要任何其他文字:
