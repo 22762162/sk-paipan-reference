@@ -243,6 +243,17 @@ class MockProvider(Provider):
             for f_no, (field, pool) in enumerate(
                     sorted(self.DESIGN_POOLS.items())):
                 design[field] = _pick(pool, seed, idx * 13 + f_no)
+            # 参考图为最高标准:脸部特征/发型/风格字段锁定到参考图
+            references = character.get("reference_images") or []
+            if references:
+                design["appearance"] = (
+                    "以参考图人物脸部特征为最高标准(脸型/五官比例/"
+                    "年龄感与参考图一致)," + design["appearance"])
+                design["hair"] = "发型发色以参考图为准," + design["hair"]
+                design["signature"] = ("与参考图同一人辨识特征,"
+                                       + design["signature"])
+                design["reference_locked"] = True
+                design["reference_images"] = list(references)
             designs.append(design)
         data = {"designs": designs}
         uri = _json_artifact(out_dir / "character_designs.json", data)

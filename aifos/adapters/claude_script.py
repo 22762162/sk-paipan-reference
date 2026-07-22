@@ -151,7 +151,7 @@ DESIGN_PROMPT = """你是漫剧人物设定师。为作品《{title}》的角色
 画风:{style}。剧情梗概:{logline}。
 
 角色名单(全部要写,名字必须逐字一致):{names}
-
+{references}
 要求:
 - 每个字段是一段具体、可画出来的描述(不要空话套话);
 - 性格要能从表情神态与站姿体现;外貌含脸型/肤色/身材比例;
@@ -263,11 +263,25 @@ def build_prompt(capability, payload):
         names = "、".join(
             f"{c.get('name')}({c.get('role') or '角色'})"
             for c in payload.get("characters", []))
+        ref_lines = []
+        for c in payload.get("characters", []):
+            for uri in c.get("reference_images") or []:
+                ref_lines.append(f"- {c.get('name')}: {uri}")
+        references = ""
+        if ref_lines:
+            references = (
+                "\n角色参考图(文件路径,可直接查看):\n"
+                + "\n".join(ref_lines)
+                + "\n有参考图的角色必须先查看参考图,以图中人物的脸部特征"
+                "(脸型/五官比例/眼鼻嘴/年龄感)、发型发色、妆容、气质和"
+                "整体风格为最高标准逐项撰写 appearance/hair/eyes/makeup/"
+                "signature/temperament 等字段,与参考图冲突的描述一律"
+                "以参考图为准,不得凭空想象;服装可按剧情另行设计。\n")
         return DESIGN_PROMPT.format(
             title=payload.get("project_title", ""),
             style=payload.get("style", "") or "国风漫剧",
             logline=payload.get("logline", "") or "见角色名单",
-            names=names)
+            names=names, references=references)
     if capability == "script":
         feedback = payload.get("feedback", "")
         if payload.get("template") == "idol":

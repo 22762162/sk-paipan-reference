@@ -27,6 +27,7 @@ from .quality_policy import (
     resolve_video_quality,
     set_policy_choices,
 )
+from .relations import relation_lines, write_relations
 from .spatial_blocking import (build_spatial_plan, shot_blocking,
                                write_spatial_svgs)
 from .workflow import (
@@ -1704,8 +1705,13 @@ class Director:
             "project_title": ctx["project"]["title"],
             "style": ctx["project"]["style"] or "",
             "logline": (ctx.get("script") or {}).get("logline", ""),
+            # 有参考图的角色:设定必须以参考图人物的脸部特征与风格
+            # 为最高标准撰写(编剧 AI 可直接读取图片文件)
             "characters": [{"name": c["name"],
-                            "role": c.get("role", "")}
+                            "role": c.get("role", ""),
+                            "reference_images":
+                                self._character_reference_uris(
+                                    project_id, c["name"])}
                            for c in missing],
         }, "script")
         by_name = {d.get("name"): d
@@ -2255,6 +2261,17 @@ class Director:
         return {s["scene_no"]: s["location"]
                 for s in ctx["script"]["scenes"]}
 
+    def _character_reference_uris(self, project_id, name):
+        """只取明确关联到该角色的参考图(全局参考不用于定义单人长相)。"""
+        uris = []
+        for row in self.assets.active_list(project_id, kind="reference"):
+            meta = self._asset_meta(row)
+            if meta.get("attach_to") != name:
+                continue
+            if row["uri"] and Path(row["uri"]).exists():
+                uris.append(row["uri"])
+        return uris
+
     def _reference_uris(self, project_id, attach_names):
         """用户上传的参考图:关联到指定角色/场景的 + 全局的。"""
         uris = []
@@ -2364,6 +2381,23 @@ class Director:
             or refs.get("reference_images") or refs.get("style_ref"))
         return refs
 
+    def _relations(self, ctx):
+        """画布关系图:ctx 内缓存优先,单图重画等路径从落盘文件回读。"""
+        if ctx.get("relations"):
+            return ctx["relations"]
+        out_root = ctx.get("out_root")
+        if out_root is None:
+            return None
+        path = out_root / "relations.json"
+        if path.exists():
+            try:
+                ctx["relations"] = json.loads(
+                    path.read_text(encoding="utf-8"))
+                return ctx["relations"]
+            except ValueError:
+                pass
+        return None
+
     def _rich_shot_prompt(self, ctx, shot, location):
         """详细出图提示词:场景 + 出场人物完整设定 + 动作 + 台词情绪 + 镜头,
         让每张分镜画面都说清楚人物是谁、在做什么、什么故事情境。"""
@@ -2403,6 +2437,11 @@ class Director:
         ref = (shot.get("script_reference") or "").strip()
         if ref and ref not in action:
             parts.append(f"剧情依据:{ref}")
+        # 画布关系线:多人物镜头带上人物之间的关联,牵引跨镜一致
+        lines = relation_lines(self._relations(ctx),
+                               shot.get("characters", []))
+        if lines:
+            parts.append("人物关系线:" + ";".join(lines))
         return "。".join(p for p in parts if p)
 
     def _shot_payload(self, ctx, shot, *, continuity_anchor=False,
@@ -2477,6 +2516,10 @@ class Director:
 
     def _stage_images(self, ctx):
         self._plan_seed_shots(ctx)
+        # 生产画布:出图一开始就落盘人物/场景/镜头关系线,
+        # 前端画布与出图/质检提示词共用,牵引人物关联性不漂移
+        ctx["relations"] = write_relations(
+            ctx["out_root"], ctx.get("script"), ctx.get("storyboard"))
         ctx["images"] = []
         reused = 0
         tasks = []
@@ -4146,7 +4189,56 @@ class Director:
         self.log.info(
             "director", f"已上传参考图「{name}」"
             f"(关联: {attach_to or '全项目'});后续出图将自动参考")
-        return {"name": name, "uri": str(path)}
+        # 参考图为最高标准:关联到已有设定的角色时,立即按参考图的
+        # 脸部特征与风格重写该角色的人物设定提示词
+        design_refreshed = False
+        if attach_to:
+            design_refreshed = self._refresh_design_from_reference(
+                project, attach_to)
+        return {"name": name, "uri": str(path),
+                "design_refreshed": design_refreshed}
+
+    def _refresh_design_from_reference(self, project, name):
+        """按参考图重写角色设定:脸部特征与风格以参考图为最高标准。
+
+        找不到该角色/无编剧产线时静默跳过(不阻断参考图上传本身)。
+        """
+        row = self.assets.latest(project["id"], "character", name)
+        if row is None:
+            return False
+        meta = self._asset_meta(row)
+        references = self._character_reference_uris(project["id"], name)
+        if not references:
+            return False
+        try:
+            result = self.router.call("script", {
+                "character_design": True,
+                "project_title": project["title"],
+                "style": project["style"] or "",
+                "logline": "",
+                "characters": [{"name": name,
+                                "role": meta.get("role", ""),
+                                "reference_images": references}],
+            }, self.artifacts_root / f"p{project['id']:03d}" / "designs")
+        except Exception as exc:
+            self.log.warn(
+                "director",
+                f"按参考图重写「{name}」设定失败(参考图已保存,"
+                f"出图仍会带参考图): {exc}")
+            return False
+        design = next((d for d in result.data.get("designs", [])
+                       if d.get("name") == name), None)
+        if not design:
+            return False
+        self.assets.register(
+            project["id"], "character", name,
+            meta={**meta, "design": design,
+                  "design_from_reference": True}, new_version=True)
+        self.log.info(
+            "director",
+            f"已按参考图重写「{name}」人物设定(脸部特征与风格以参考图"
+            "为最高标准);已有形象可用「换风格重画/批量重画」按新设定重出")
+        return True
 
     def delete_reference(self, project_title, name):
         project = self.projects.get_project(project_title)

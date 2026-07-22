@@ -579,6 +579,14 @@ def _episode_payload(app, episode_id):
             render_plan = json.loads(plan_path.read_text(encoding="utf-8"))
         except ValueError:
             render_plan = None
+    relations = None
+    relations_path = out_dir / "relations.json"
+    if relations_path.exists():
+        try:
+            relations = json.loads(
+                relations_path.read_text(encoding="utf-8"))
+        except ValueError:
+            relations = None
     if render_plan is not None:
         render_plan = copy.deepcopy(render_plan)
         for item in render_plan.get("items", []):
@@ -624,6 +632,7 @@ def _episode_payload(app, episode_id):
         "cast_selection": cast_selection,
         "qc_report": qc_report,
         "render_plan": render_plan,
+        "relations": relations,
         "image_acceleration": {
             "summary": image_acceleration["summary"],
             "default_provider": image_acceleration["default_provider"],

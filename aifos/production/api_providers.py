@@ -235,13 +235,44 @@ class ClaudeApiProvider(Provider):
         content.append({"type": "text", "text": prompt})
         return content
 
+    def _design_content(self, prompt, payload):
+        """人物设定带参考图:参考图作为真实图像块上传,脸部特征与风格
+        以参考图为最高标准;单张图不可读时跳过该图(不阻断设定)。"""
+        import base64
+        from pathlib import Path as _P
+        blocks = []
+        for character in payload.get("characters", []):
+            name = character.get("name", "角色")
+            for uri in character.get("reference_images") or []:
+                path = _P(uri)
+                media = self.QC_MEDIA.get(path.suffix.lower())
+                if media is None or not path.exists():
+                    continue
+                data = path.read_bytes()
+                if len(data) > 20 * 1024 * 1024:
+                    continue
+                blocks.append({"type": "text",
+                               "text": f"下面是{name}的参考图,该角色脸部"
+                                       "特征与风格以此图为最高标准。"})
+                blocks.append({"type": "image", "source": {
+                    "type": "base64", "media_type": media,
+                    "data": base64.b64encode(data).decode()}})
+        if not blocks:
+            return prompt
+        blocks.append({"type": "text", "text": prompt})
+        return blocks
+
     def generate(self, capability, payload, out_dir, cancel=None):
         try:
             prompt = build_prompt(capability, payload)
         except ValueError as exc:
             raise ProviderError(str(exc)) from exc
-        content = (self._qc_content(prompt, payload)
-                   if capability == "image_qc" else prompt)
+        if capability == "image_qc":
+            content = self._qc_content(prompt, payload)
+        elif capability == "script" and payload.get("character_design"):
+            content = self._design_content(prompt, payload)
+        else:
+            content = prompt
         endpoint = (self.conf.get("endpoint")
                     or self.DEFAULT_ENDPOINT).rstrip("/")
         reply = _request_json(

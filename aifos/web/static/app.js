@@ -2620,6 +2620,7 @@ function renderPlanHtml(data, editable) {
     ${qualityPolicyHtml()}
     ${imageCostGuideHtml(true)}
     ${mockWarnHtml(data)}
+    ${relationCanvasHtml(data)}
     ${editable ? `<div class="plan-batchbar">
       ${accelerationCount ? `<button class="batch-accelerate primary"
         onclick="showImageAcceleration(${data.episode.id})"
@@ -3034,6 +3035,89 @@ function planCardHtml(data, item, avg) {
   </div>`;
 }
 
+/* 生产画布:人物/场景/镜头节点 + 关系线(与出图提示词同源,牵引人物关联) */
+function relationCanvasHtml(data) {
+  const rel = data.relations;
+  if (!rel || !(rel.nodes || []).length) return "";
+  const items = ((data.render_plan || {}).items) || [];
+  const shotStatus = {};
+  items.forEach((i) => {
+    const m = /^shot:(\d+)$/.exec(i.id || "");
+    if (m) shotStatus[Number(m[1])] = i.status;
+  });
+  const chars = rel.nodes.filter((n) => n.type === "character");
+  const scenes = rel.nodes.filter((n) => n.type === "scene");
+  const shots = rel.nodes.filter((n) => n.type === "shot");
+  const GAP = 46, TOP = 30;
+  const colY = (list, idx) => TOP + idx * GAP
+    + Math.max(0, (Math.max(chars.length, scenes.length, shots.length)
+      - list.length) / 2) * GAP;
+  const pos = {};
+  chars.forEach((n, i) => { pos[n.id] = { x: 120, y: colY(chars, i) }; });
+  scenes.forEach((n, i) => { pos[n.id] = { x: 360, y: colY(scenes, i) }; });
+  shots.forEach((n, i) => { pos[n.id] = { x: 600, y: colY(shots, i) }; });
+  const H = TOP + Math.max(chars.length, scenes.length, shots.length, 1) * GAP;
+  const edgeEls = (rel.edges || []).map((e) => {
+    const a = pos[e.from], b = pos[e.to];
+    if (!a || !b) return "";
+    const common = `class="rel-edge rel-${e.type}" data-from="${esc(e.from)}" data-to="${esc(e.to)}"`;
+    if (e.type === "co_scene") {
+      const bend = 70 + Math.abs(a.y - b.y) / 5;
+      return `<g ${common}><path d="M ${a.x - 46} ${a.y} C ${a.x - bend} ${a.y}, ${b.x - bend} ${b.y}, ${b.x - 46} ${b.y}" fill="none"/>
+        <text x="${a.x - bend + 6}" y="${(a.y + b.y) / 2 - 4}">${esc(e.label || "同场")}</text></g>`;
+    }
+    const x1 = a.x + 46, x2 = b.x - 46;
+    return `<g ${common}><path d="M ${x1} ${a.y} C ${x1 + 60} ${a.y}, ${x2 - 60} ${b.y}, ${x2} ${b.y}" fill="none"/></g>`;
+  }).join("");
+  const nodeEl = (n) => {
+    const p = pos[n.id];
+    let cls = `rel-node rel-node-${n.type}`;
+    let sub = "";
+    if (n.type === "character") sub = n.role || "";
+    if (n.type === "scene") sub = `第${n.scene_no}场`;
+    if (n.type === "shot") {
+      const st = shotStatus[n.shot_no] || "";
+      cls += st ? ` st-${st}` : "";
+      sub = { done: "✓完成", reused: "✓复用", generating: "生成中",
+        failed: "✗失败" }[st] || (st ? st : "待产");
+    }
+    return `<g class="${cls}" data-node="${esc(n.id)}" transform="translate(${p.x},${p.y})">
+      <rect x="-46" y="-16" width="92" height="32" rx="8"/>
+      <text class="rel-label" y="${sub ? -2 : 4}">${esc(n.label)}</text>
+      ${sub ? `<text class="rel-sub" y="12">${esc(sub)}</text>` : ""}</g>`;
+  };
+  return `<div class="relation-canvas">
+    <h3>🧭 生产画布 <span class="dim">人物—场景—镜头关系线(点节点高亮它的线;
+      出图与质检提示词自动携带同一份关系线,保持人物关联一致)</span></h3>
+    <div class="rel-scroll"><svg viewBox="0 0 740 ${H}" width="740" height="${H}"
+      class="rel-svg" role="img" aria-label="人物场景镜头关系画布">
+      <text class="rel-col" x="120" y="14">人物</text>
+      <text class="rel-col" x="360" y="14">场景</text>
+      <text class="rel-col" x="600" y="14">镜头</text>
+      ${edgeEls}
+      ${rel.nodes.map(nodeEl).join("")}
+    </svg></div></div>`;
+}
+
+/* 画布节点点击高亮(事件委托:看板轮询重绘也不丢绑定) */
+document.addEventListener("click", (event) => {
+  const node = event.target.closest(".rel-node");
+  const svg = event.target.closest(".rel-svg");
+  if (!svg) return;
+  const id = node ? node.dataset.node : null;
+  const active = node && svg.dataset.focus !== id;
+  svg.dataset.focus = active ? id : "";
+  svg.querySelectorAll(".rel-edge").forEach((edge) => {
+    const hit = active
+      && (edge.dataset.from === id || edge.dataset.to === id);
+    edge.classList.toggle("hl", !!hit);
+    edge.classList.toggle("dim-out", active && !hit);
+  });
+  svg.querySelectorAll(".rel-node").forEach((el) => {
+    el.classList.toggle("hl", active && el.dataset.node === id);
+  });
+});
+
 function renderPlanBoardHtml(data) {
   const items = ((data.render_plan || {}).items) || [];
   if (!items.length) return "";
@@ -3055,6 +3139,7 @@ function renderPlanBoardHtml(data) {
       <div class="pb-select-hint">点击任意图片卡片可选择并查看大图、状态和提示词</div>
     </div>
     ${mockWarnHtml(data)}
+    ${relationCanvasHtml(data)}
     ${cats.map((cat) => {
       const list = items.filter((i) => i.category === cat);
       const ok = list.filter(

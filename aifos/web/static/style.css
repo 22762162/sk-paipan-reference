@@ -2512,3 +2512,43 @@ textarea:focus-visible, select:focus-visible {
   .video-ref-row button { grid-column:1 / -1 }
   .video-ref-picker-grid { grid-template-columns:repeat(2,minmax(0,1fr)) }
 }
+
+/* 生产画布:人物/场景/镜头关系线 */
+.relation-canvas { margin: 10px 0 16px; }
+.relation-canvas h3 { margin: 0 0 8px; font-size: 13.5px; }
+.relation-canvas h3 .dim { font-weight: 400; font-size: 11px; }
+.rel-scroll { overflow-x: auto; border: 1px solid var(--hairline);
+  border-radius: 10px; background: rgba(255, 255, 255, .02); }
+.rel-svg { display: block; margin: 0 auto; }
+.rel-col { fill: var(--ink-3); font-size: 11px; text-anchor: middle;
+  letter-spacing: 2px; }
+.rel-node { cursor: pointer; }
+.rel-node rect { fill: rgba(255, 255, 255, .05);
+  stroke: rgba(255, 255, 255, .22); }
+.rel-node-character rect { stroke: rgba(57, 135, 229, .65);
+  fill: rgba(57, 135, 229, .12); }
+.rel-node-scene rect { stroke: rgba(178, 148, 250, .6);
+  fill: rgba(178, 148, 250, .1); }
+.rel-node-shot rect { stroke: rgba(255, 255, 255, .25); }
+.rel-node.st-done rect, .rel-node.st-reused rect {
+  stroke: rgba(63, 185, 80, .8); fill: rgba(63, 185, 80, .12); }
+.rel-node.st-generating rect { stroke: rgba(250, 178, 25, .85);
+  fill: rgba(250, 178, 25, .12); }
+.rel-node.st-failed rect { stroke: rgba(248, 81, 73, .85);
+  fill: rgba(248, 81, 73, .12); }
+.rel-node text { text-anchor: middle; pointer-events: none; }
+.rel-node .rel-label { fill: var(--ink); font-size: 11.5px; }
+.rel-node .rel-sub { fill: var(--ink-3); font-size: 9.5px; }
+.rel-node.hl rect { stroke-width: 2.4; filter: drop-shadow(0 0 5px rgba(57, 135, 229, .8)); }
+.rel-edge path { stroke: rgba(255, 255, 255, .18); stroke-width: 1.2; }
+.rel-edge.rel-co_scene path { stroke: rgba(57, 135, 229, .55);
+  stroke-width: 1.8; stroke-dasharray: none; }
+.rel-edge.rel-appears path { stroke: rgba(57, 135, 229, .3); }
+.rel-edge.rel-contains path { stroke: rgba(178, 148, 250, .3); }
+.rel-edge.rel-features path { display: none; }
+.rel-edge.rel-sequence path { stroke: rgba(255, 255, 255, .1); }
+.rel-edge text { fill: #9ec3f0; font-size: 9.5px; }
+.rel-edge.hl path { stroke: #5aa2f5; stroke-width: 2.6; }
+.rel-edge.hl.rel-features path { display: block; stroke: #5aa2f5; }
+.rel-edge.hl text { fill: #cfe4ff; }
+.rel-edge.dim-out { opacity: .12; }
