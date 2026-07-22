@@ -101,6 +101,7 @@ def test_index_and_static(server):
     assert b'id="btn-plan-live"' in app_js
     assert b'id="btn-image-acceleration"' in app_js
     assert app_js.count(b"imageAccelerationLivebarHtml(data)") >= 3
+    assert b'updateViaCache: "none"' in app_js
     assert b"/api/image_acceleration/preflight" in app_js
     assert b"/api/image_acceleration/queue" in app_js
     assert "逐张预检所选图片".encode() in app_js
@@ -127,7 +128,8 @@ def test_index_and_static(server):
         "192x192", "512x512"}
     status, ctype, raw = _request(server["port"], "GET", "/sw.js")
     assert status == 200 and "javascript" in ctype
-    assert b"aifos-mobile-shell" in raw
+    assert b"aifos-mobile-shell-v2" in raw
+    assert b'/static/app.js' in raw and b'fetch(request)' in raw
 
 
 def test_asset_delete_and_video_reference_api(server):

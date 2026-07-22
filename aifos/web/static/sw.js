@@ -1,6 +1,6 @@
 "use strict";
 
-const CACHE_NAME = "aifos-mobile-shell-v1";
+const CACHE_NAME = "aifos-mobile-shell-v2";
 const APP_SHELL = [
   "/",
   "/static/style.css",
@@ -40,6 +40,21 @@ self.addEventListener("fetch", (event) => {
         caches.open(CACHE_NAME).then((cache) => cache.put("/", copy));
         return response;
       }).catch(() => caches.match("/")),
+    );
+    return;
+  }
+
+  // 核心代码联网时必须优先取最新版，避免 PWA 先执行旧 JS、需要刷新两次。
+  if (["/static/app.js", "/static/style.css", "/manifest.webmanifest"]
+      .includes(url.pathname)) {
+    event.respondWith(
+      fetch(request).then((response) => {
+        if (response.ok) {
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
+        }
+        return response;
+      }).catch(() => caches.match(request)),
     );
     return;
   }
