@@ -263,12 +263,18 @@ def build_instruction(capability, payload, out_dir):
             "必须真实打开待检图和上述最终立绘逐人做视觉比对；脸型、五官比例、"
             "眼鼻嘴、发际线、发型轮廓、年龄感和体型以最终立绘为准。"
             "不得只根据文字判断；文字与最终立绘冲突时，身份以最终立绘为准。\n"
+            "必须单独核对每个人物的性别与性别表达。女性画成男性、男性画成女性"
+            "一律判失败，不能因服装、发色或气质相似而放行。\n"
             f"- 场景:{payload.get('location', '按提示词')};"
             f"动作:{payload.get('action', '按提示词')};"
             f"镜头景别:{payload.get('camera', '不限')}\n"
             f"- 不允许出现:{forbid}、字幕条、乱码文字、多余或缺失的人物\n"
+            "- 当前检查对象是静态关键帧：只检查图中可见的最终状态。不得因为"
+            "单张图无法证明运镜、眼神变化过程、呼吸等时间动作而判失败；景别"
+            "裁掉且非剧情要求必须出镜的裤子、腰间配饰等，不得仅因不可见判失败。\n"
             "只在标准输出打印一行 JSON,不要产出任何文件,不要多余文字:"
             '{"pass": true或false, "identity_checked": true或false, '
+            '"gender_checked": true或false, "gender_match": true或false, '
             '"issues": ["每条一句具体原因"]}'
         )
         return instruction, [], {"qc": True}

@@ -922,7 +922,7 @@ function tilesHtml(data) {
   return `
       <div class="tile"><div class="label">剧集总数</div><div class="value">${s.episodes}</div></div>
       <div class="tile"><div class="label">已完成</div><div class="value">${s.done}<small> / ${s.episodes}</small></div></div>
-      <div class="tile"><div class="label">总成本</div><div class="value">${fmt(s.total_cost)}<small> 单集预算 ${fmt(s.budget, 0)}</small></div></div>
+      <div class="tile"><div class="label">总成本</div><div class="value">${fmt(s.total_cost)}<small>${Number(s.budget || 0) > 0 ? ` 单集预算 ${fmt(s.budget, 0)}` : " 单集不限额"}</small></div></div>
       <div class="tile"><div class="label">平均质检分</div><div class="value">${s.avg_qc == null ? "-" : fmt(s.avg_qc, 1)}</div></div>
       <div class="tile"><div class="label">制作任务</div><div class="value">${running}<small> 进行中</small></div></div>`;
 }

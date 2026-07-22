@@ -34,7 +34,8 @@ DEFAULTS = {
         "text_lock_provider": "ChatGPT关键帧",
     },
     "budget": {
-        "per_episode": 200.0,          # 单集成本预算(成本单位)
+        # 0 表示不限额。成本仍完整记账和展示，但不再因单集累计金额熔断。
+        "per_episode": 0.0,
     },
     "retry": {
         "max_retries": 2,              # 质检不通过时的自动重跑轮数

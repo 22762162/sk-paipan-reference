@@ -260,6 +260,8 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 {identity_references}
 只要画面中有人物，就必须把待检图与对应最终立绘逐人做视觉比对：脸型、
 五官比例、眼鼻嘴结构、发际线、发型轮廓、年龄感、体型和标志特征。
+必须单独核对每个人物的性别与性别表达；女性被画成男性、男性被画成女性，
+一律是身份硬错误，不能因发色、服装或气质相似而通过。
 文字设定只补充剧情、动作、场景和当镜服装；与最终立绘冲突时以最终立绘为准。
 
 画面要求:
@@ -272,9 +274,13 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
   (景别需大致相符:要求全景/远景不能给成特写,反之亦然)
 - 不允许出现:与设定形态不符的角色、与剧情无关的杂物(悬挂的衣物/衣架)、
   字幕条、乱码文字、多余或缺失的人物{extra}
+- 这是静态关键帧质检：只检查画面中能看见的最终状态。不得因为单张图无法证明
+  运镜、眼神变化过程、呼吸或其他时间动作而判失败；景别裁掉且并非剧情要求必须
+  出镜的裤子、腰间配饰等，也不得仅因不可见而判失败。
 
 只输出一个 JSON 对象,不要任何其他文字:
 {{"pass": true或false, "identity_checked": true或false,
+"gender_checked": true或false, "gender_match": true或false,
 "issues": ["不通过的具体原因,每条一句,指出在画面哪里"]}}"""
 
 
@@ -307,6 +313,10 @@ def validate_image_qc(data):
     data["issues"] = [str(item) for item in issues][:8]
     if "identity_checked" in data:
         data["identity_checked"] = bool(data["identity_checked"])
+    if "gender_checked" in data:
+        data["gender_checked"] = bool(data["gender_checked"])
+    if "gender_match" in data:
+        data["gender_match"] = bool(data["gender_match"])
     if not data["pass"] and not data["issues"]:
         data["issues"] = ["未给出具体原因"]
     return None

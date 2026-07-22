@@ -794,8 +794,9 @@ class Director:
         "makeup": ("makeup", "eyes", "palette", "personality"),
         "costume": ("costume", "palette", "accessories",
                      "occupation", "costume_direction"),
-        "costume_detail": ("costume_detail", "accessories",
-                            "signature_props", "visual_variants"),
+        "costume_detail": ("costume", "costume_detail", "palette",
+                            "accessories", "signature_props",
+                            "visual_variants"),
     }
     DESIGN_LABELS = (
         ("species", "形态"),
@@ -871,6 +872,71 @@ class Director:
         if isinstance(meta, str):
             meta = json.loads(meta or "{}")
         return (meta or {}).get("design")
+
+    def _locked_look_variant(self, project_id, name):
+        """人工定版后取候选的服装/配饰锚点,供全部人物套件复用。"""
+        row = self._locked_identity(project_id, name)
+        if row is None:
+            return {}
+        meta = self._asset_meta(row)
+        look = meta.get("look_variant")
+        result = dict(look) if isinstance(look, dict) else {}
+        # 旧候选的 look_variant 只有四个基础字段;配饰/职业道具仍从剧本
+        # 人物设定补齐,否则不同套件会各自猜测“乔安到底有没有配饰”。
+        design = self._character_design(project_id, name) or {}
+        for key in ("costume", "costume_detail", "palette", "accessories",
+                    "signature_props", "props", "temperament"):
+            if not result.get(key) and design.get(key):
+                result[key] = design[key]
+        return result
+
+    def _locked_look_line(self, look):
+        if not look:
+            return ""
+        values = []
+        for key, label in (("costume", "服装"), ("palette", "配色"),
+                           ("accessories", "配饰"), ("props", "道具"),
+                           ("temperament", "气质")):
+            value = self._design_value(look.get(key))
+            if value:
+                values.append(f"{label}:{value}")
+        if not any(key in look and self._design_value(look.get(key))
+                   for key in ("accessories", "signature_props", "props")):
+            values.append("配饰/道具:以锁定最终立绘可见内容为准,不可见不得新增")
+        return ";".join(values)
+
+    def _character_sheet_reference_uris(self, project_id, name,
+                                        exclude_key=""):
+        """套件重画时复用已完成的其他套件,避免服装/配饰各自漂移。"""
+        uris = []
+        for key in ("turnaround", "costume", "costume_detail",
+                    "features", "makeup"):
+            if key == exclude_key:
+                continue
+            row = self.assets.latest(
+                project_id, "character_sheet", f"{name}:{key}")
+            if (row and formal_reference_allowed(self._asset_quality(row))
+                    and row["uri"] and Path(row["uri"]).exists()):
+                uris.append(row["uri"])
+        return uris
+
+    @staticmethod
+    def _reference_safe_design(design):
+        """最终立绘锁定后只保留剧情/服装语义，避免旧文字反向改脸改性别。
+
+        appearance/hair/eyes/makeup/signature 等身份字段已经由人工锁定的
+        最终立绘提供。候选生成前的旧文字可能与定版图冲突，不能再作为后续
+        镜头的硬约束传给任何图片 API。
+        """
+        if not isinstance(design, dict):
+            return {}
+        keys = (
+            "species", "personality", "temperament", "costume",
+            "costume_detail", "background_prompt", "era_setting",
+            "occupation", "motivation", "backstory", "relationships",
+            "costume_direction", "signature_props",
+        )
+        return {key: design.get(key) for key in keys if design.get(key)}
 
     def _portrait_prompt(self, name, role, style, design=None):
         detail = self._design_line(
@@ -1045,11 +1111,14 @@ class Director:
             "均无可读文字、字幕、Logo、水印、乱码和品牌标识"))
 
     def _sheet_prompt(self, name, role, style, label, desc, key=None,
-                      design=None):
+                      design=None, locked_look=None):
         detail = self._design_line(
             design, keys=self.SHEET_DESIGN_KEYS.get(key))
+        anchor = self._locked_look_line(locked_look)
         return (f"角色{label}:{name}({role}),{style},{desc}"
                 + (f";人物设定:{detail}" if detail else "")
+                + (f";已锁定服装锚点:{anchor};配饰有则必须保留,没有则不得新增"
+                   if anchor else "")
                 + ";本套资产的造型必须服从人物背景、时代/世界观、职业、性格和剧情场合，"
                 "不得把服装统一成现代都市模板;"
                 + f";与立绘同一人物、同一发型服装配色,严格保持形象一致;"
@@ -1417,17 +1486,18 @@ class Director:
     def _qc_spec(self, project_id, characters, location="", action="",
                  forbid=None, require_identity=True):
         """视觉质检规格：待检图必须与人工锁定的最终立绘逐人比对。"""
-        designs = []
-        for name in characters:
-            design = self._character_design(project_id, name)
-            line = self._design_line(design, keys=(
-                "species", "hair", "costume",
-                "signature", "era_setting", "occupation",
-                "costume_direction", "signature_props")) if design else ""
-            designs.append(f"{name}({line})" if line else name)
         identity_refs = self._identity_references(
             project_id, characters,
             required=bool(characters and require_identity))
+        designs = []
+        for name in characters:
+            design = self._reference_safe_design(
+                self._character_design(project_id, name))
+            line = self._design_line(design, keys=(
+                "species", "costume", "era_setting", "occupation",
+                "costume_direction", "signature_props")) if design else ""
+            designs.append(f"{name}({line})" if line else name)
+        identity_required = bool(characters and require_identity)
         return {
             "characters": list(characters),
             "count": len(characters),
@@ -1436,7 +1506,11 @@ class Director:
             "action": action or "",
             "forbid": list(forbid or []),
             "identity_references": identity_refs,
-            "identity_required": bool(characters and require_identity),
+            "identity_required": identity_required,
+            # 性别/性别表达是身份的一部分，但单独设硬门槛，避免模型只写
+            # identity_checked=true 却漏掉女角被画成男性。
+            "gender_required": identity_required,
+            "static_frame": True,
         }
 
     def _generate_image_with_qc(self, capability, payload, out_dir,
@@ -1458,19 +1532,50 @@ class Director:
                 qc_result = self.router.call(
                     "image_qc", {**qc_spec, "image_uri": uri}, out_dir,
                     cancel=cancel)
-            except (ProviderUnavailable, ProviderError):
-                return result      # 质检产线故障不阻塞生产
+            except (ProviderUnavailable, ProviderError) as exc:
+                # 人物镜头不能在质检故障时静默放行。保留已生成图片供人工
+                # 查看，但明确标成质检未过，后续不得当作正式参考图。
+                result.qc = {
+                    "passed": False,
+                    "issues": [f"质检产线不可用，图片未放行:{exc}"],
+                    "attempts": attempts + 1,
+                    "identity_checked": False,
+                    "gender_checked": False,
+                    "gender_match": False,
+                    "identity_references": len(
+                        qc_spec.get("identity_references") or []),
+                }
+                return result
             result.cost += qc_result.cost
             verdict = qc_result.data or {}
             identity_checked = (not qc_spec.get("identity_required")
                                 or bool(verdict.get("identity_checked")))
+            # 兼容尚未升级的视觉质检 provider:只要它没有声明新字段,
+            # 沿用旧的 identity_checked 合同;一旦声明性别字段,则严格执行
+            # 两个性别门槛。这样不会把旧 provider 的历史结果误判为性别失败,
+            # 但新 provider 不能漏报或绕过性别核对。
+            gender_declared = bool({"gender_checked", "gender_match"}
+                                   & set(verdict))
+            gender_checked = (not qc_spec.get("gender_required")
+                              or not gender_declared
+                              or bool(verdict.get("gender_checked")))
+            gender_match = (not qc_spec.get("gender_required")
+                            or not gender_declared
+                            or bool(verdict.get("gender_match")))
             issues = list(verdict.get("issues") or [])
             if not identity_checked:
                 issues.append("质检未确认已逐人比对最终立绘")
-            report = {"passed": bool(verdict.get("pass")) and identity_checked,
+            if not gender_checked:
+                issues.append("质检未单独核对人物性别/性别表达")
+            elif not gender_match:
+                issues.append("人物性别/性别表达与锁定最终立绘不一致")
+            report = {"passed": bool(verdict.get("pass"))
+                      and identity_checked and gender_checked and gender_match,
                       "issues": issues,
                       "attempts": attempts + 1,
                       "identity_checked": identity_checked,
+                      "gender_checked": gender_checked,
+                      "gender_match": gender_match,
                       "identity_references": len(
                           qc_spec.get("identity_references") or [])}
             result.qc = report
@@ -2617,6 +2722,10 @@ class Director:
         ctx["character_asset_policy"] = asset_policy
         sheet_definitions = (
             CHARACTER_SHEETS if asset_policy["generate_sheets"] else [])
+        locked_looks = {
+            c["name"]: self._locked_look_variant(project_id, c["name"])
+            for c in characters
+        }
         self._plan_seed(ctx, "character_art", [
             {"id": f"char:{c['name']}", "category": "character_art",
              "label": f"{c['name']}({c.get('role') or '角色'})",
@@ -2638,7 +2747,8 @@ class Director:
              "quality_reasons": ["人物母资产会被后续全部镜头引用"],
              "prompt": self._sheet_prompt(
                  c["name"], c.get("role", ""), style, label, desc,
-                 key=key, design=designs.get(c["name"]))}
+                 key=key, design=designs.get(c["name"]),
+                 locked_look=locked_looks.get(c["name"]))}
             for c in characters
             for key, label, desc in sheet_definitions])
         self._plan_seed(ctx, "scene_art", [
@@ -2747,7 +2857,8 @@ class Director:
                         "shot_no": 0, "characters": [name], "location": "",
                         "prompt": self._sheet_prompt(
                             name, role, style, label, desc,
-                            key=key, design=designs.get(name)),
+                            key=key, design=designs.get(name),
+                            locked_look=locked_looks.get(name)),
                         "style": style,
                         "character_background": designs.get(name) or {},
                         "character_refs": (
@@ -2839,8 +2950,23 @@ class Director:
         ranked.sort(key=lambda item: (-item[0], -item[1]))
         return [item[2] for item in ranked[:limit]]
 
-    def _art_refs(self, ctx, characters, location, shot_no=None):
-        """最终立绘/四视图/场景图/用户参考 → 真实多图参考输入。
+    @staticmethod
+    def _shot_reference_sheet_keys(shot):
+        """按镜头用途选择已生成的人物套件参考,避免所有镜头只喂四视图。"""
+        shot = shot or {}
+        text = " ".join(str(shot.get(key) or "") for key in (
+            "kind", "description", "prompt", "camera", "dialogue"))
+        if any(word in text for word in (
+                "服装", "配饰", "袖口", "鞋", "细节", "costume", "detail")):
+            return ("turnaround", "costume", "costume_detail")
+        if any(word in text for word in (
+                "特写", "近景", "脸", "妆", "眼神", "表情", "closeup")):
+            return ("turnaround", "features", "makeup")
+        return ("turnaround", "costume")
+
+    def _art_refs(self, ctx, characters, location, shot_no=None,
+                  sheet_keys=None):
+        """最终立绘/人物套件/场景图/用户参考 → 真实多图参考输入。
 
         含人物画面缺任何一个最终立绘都直接阻断；禁止静默退化为文字生图。
         """
@@ -2867,15 +2993,32 @@ class Director:
                 ctx["episode"]["id"], script=ctx.get("script"))
         include_sheets = asset_policy.get("generate_sheets", True)
         if include_sheets:
+            requested_keys = tuple(sheet_keys or ("turnaround", "costume"))
+            # 多人镜头优先保持参考图总量可控:每人喂本镜最相关的一张
+            # 套件图;单人镜头可以同时喂四视图和服装/细节图。
+            if len(characters or []) > 1:
+                requested_keys = requested_keys[-1:]
             for name in characters or []:
-                row = self.assets.latest(
-                    project_id, "character_sheet", f"{name}:turnaround")
-                if (row and formal_reference_allowed(self._asset_quality(row))
-                        and row["uri"] and Path(row["uri"]).exists()):
+                for key in requested_keys:
+                    row = self.assets.latest(
+                        project_id, "character_sheet", f"{name}:{key}")
+                    if (not row
+                            or not formal_reference_allowed(
+                                self._asset_quality(row))
+                            or not row["uri"]
+                            or not Path(row["uri"]).exists()):
+                        continue
                     refs["character_refs"].append(row["uri"])
+                    label = {
+                        "turnaround": "四视图",
+                        "features": "五官特征",
+                        "makeup": "妆容",
+                        "costume": "服装",
+                        "costume_detail": "服装细节",
+                    }.get(key, key)
                     refs["asset_matches"].append({
                         "asset_id": row["id"], "kind": row["kind"],
-                        "name": row["name"], "label": f"{name}四视图",
+                        "name": row["name"], "label": f"{name}{label}",
                         "uri": row["uri"],
                     })
         if location:
@@ -2941,13 +3084,17 @@ class Director:
             parts.append(f"场景:{location}")
         who = []
         for name in shot.get("characters", []):
-            design = self._character_design(project_id, name)
+            design = self._reference_safe_design(
+                self._character_design(project_id, name))
             line = self._design_line(design, keys=(
-                "species", "appearance", "hair", "eyes", "costume",
-                "signature", "temperament", "background_prompt",
+                "species", "costume", "temperament", "background_prompt",
                 "era_setting", "occupation", "costume_direction",
                 "signature_props")) if design else ""
-            who.append(f"{name}({line})" if line else name)
+            identity_rule = (
+                "身份外貌、性别、年龄、脸型、五官和发型只以所附人工锁定"
+                "最终立绘为准，禁止被旧文字设定覆盖")
+            who.append(f"{name}({identity_rule}"
+                       + (f";{line}" if line else "") + ")")
         if who:
             parts.append(
                 f"出场人物(严格共{len(who)}人,形态与设定一致):"
@@ -3015,7 +3162,8 @@ class Director:
             if name not in identity_characters
             and not is_background_character(script_characters.get(name, {})))
         character_background = {
-            name: self._character_design(ctx["project"]["id"], name) or {}
+            name: self._reference_safe_design(
+                self._character_design(ctx["project"]["id"], name))
             for name in shot.get("characters", [])
         }
         payload = {
@@ -3050,8 +3198,10 @@ class Director:
             "forbid_subtitles": not profile["burn_subtitles"],
             "style": ctx["project"]["style"] or "",
             "aspect": ctx["aspect"], **ctx["dims"],
-            **self._art_refs(ctx, identity_characters, location,
-                             shot_no=shot["shot_no"]),
+            **self._art_refs(
+                ctx, identity_characters, location,
+                shot_no=shot["shot_no"],
+                sheet_keys=self._shot_reference_sheet_keys(shot)),
         }
         actor_ids = {
             actor.get("name"): actor.get("actor_id")
@@ -3843,9 +3993,13 @@ class Director:
             portrait_uri = (portrait["uri"]
                             if portrait and portrait["uri"]
                             and Path(portrait["uri"]).exists() else None)
+            locked_look = self._locked_look_variant(project["id"], name)
+            existing_sheet_refs = self._character_sheet_reference_uris(
+                project["id"], name, exclude_key=sheet_key)
             prompt = prompt_override or self._sheet_prompt(
                 name, role, style, label, desc, key=sheet_key,
-                design=self._character_design(project["id"], name))
+                design=self._character_design(project["id"], name),
+                locked_look=locked_look)
             quality = resolve_image_quality(
                 recommend_asset_quality("character_sheet"), policy,
                 f"sheet:{raw}", explicit_override=quality_choice)
@@ -3861,7 +4015,8 @@ class Director:
                     "feedback": feedback,
                     "revision": next_revision("character_sheet", raw),
                     "character_refs": (
-                        [portrait_uri] if portrait_uri else []),
+                        ([portrait_uri] if portrait_uri else [])
+                        + existing_sheet_refs),
                     "identity_references": self._identity_references(
                         project["id"], [name]),
                     "require_reference_images": True,
@@ -4448,6 +4603,8 @@ class Director:
             return cached
         passed_all, issues, cost = True, [], 0.0
         identity_checked_all = True
+        gender_checked_all = True
+        gender_match_all = True
         try:
             for label, one in uris:
                 result = self.router.call(
@@ -4461,6 +4618,23 @@ class Director:
                     identity_checked_all = False
                     passed_all = False
                     issues.append(f"{label}:质检未确认已逐人比对最终立绘")
+                gender_declared = bool({"gender_checked", "gender_match"}
+                                       & set(verdict))
+                gender_checked = (not spec.get("gender_required")
+                                  or not gender_declared
+                                  or bool(verdict.get("gender_checked")))
+                gender_match = (not spec.get("gender_required")
+                                or not gender_declared
+                                or bool(verdict.get("gender_match")))
+                if not gender_checked:
+                    gender_checked_all = False
+                    passed_all = False
+                    issues.append(f"{label}:质检未单独核对人物性别/性别表达")
+                elif not gender_match:
+                    gender_match_all = False
+                    passed_all = False
+                    issues.append(
+                        f"{label}:人物性别/性别表达与锁定最终立绘不一致")
                 if not bool(verdict.get("pass")):
                     passed_all = False
                     issues.extend(f"{label}:{x}"
@@ -4470,6 +4644,8 @@ class Director:
         report = {"passed": passed_all, "issues": issues,
                   "attempts": previous.get("attempts", 0),
                   "identity_checked": identity_checked_all,
+                  "gender_checked": gender_checked_all,
+                  "gender_match": gender_match_all,
                   "identity_references": len(
                       spec.get("identity_references") or []),
                   "signature": signature, "cached": False}

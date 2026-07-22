@@ -60,10 +60,11 @@ def test_full_pipeline_produces_episode(app):
     storyboard, _ = app.projects.latest_document(episode["id"], "storyboard")
     assert len(storyboard["shots"]) > len(script["scenes"])
 
-    # 成本记账:总成本还包含上一轮生成的五选一候选，且在预算内。
+    # 成本记账:总成本还包含上一轮生成的五选一候选；配置了预算时才校验上限。
     stage_cost = round(sum(s["cost"] for s in summary["stages"]), 2)
     assert summary["cost"] >= stage_cost > 0
-    assert summary["cost"] <= summary["budget"]
+    if summary["budget"] > 0:
+        assert summary["cost"] <= summary["budget"]
 
     # 数据沉淀:prompt/image/video/voice/case 均有记录
     kinds = {row["kind"] for row in app.data.cases(episode_id=episode["id"])}
