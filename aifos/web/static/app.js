@@ -345,6 +345,7 @@ async function renderHistoryDetail(runId) {
       <div class="history-detail-actions">
         ${run.episode_id ? `<a class="button-link primary" href="#/episode/${run.episode_id}">打开本集</a>` : ""}
         <a class="button-link" href="#/history">查看全部记录</a>
+        <button class="danger" id="history-delete-work">删除这集作品</button>
       </div>
     </div>
     <section class="history-kpis detail-kpis">
@@ -376,6 +377,56 @@ async function renderHistoryDetail(runId) {
       </dl></aside>
     </section>
   </div>`;
+  document.getElementById("history-delete-work").onclick = () =>
+    showHistoryDeleteDialog(run);
+}
+
+function showHistoryDeleteDialog(run) {
+  const project = run.current_project || run.project_title;
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay history-delete-overlay";
+  overlay.innerHTML = `<div class="history-delete-dialog">
+    <p class="eyebrow">DELETE WORK</p>
+    <h2>删除《${esc(project)}》第 ${run.episode_number} 集？</h2>
+    <p class="history-delete-warning">这会删除本集、全部生产运行记录、任务和文档。
+      项目本身保留，已生成的物理文件不会被直接抹掉。</p>
+    <fieldset class="history-delete-options">
+      <label><input type="radio" name="history-asset-choice" value="keep" checked>
+        <span><b>保留资产中心图片（推荐）</b><small>删除作品后仍可在资产中心按原作品查看和复用。</small></span></label>
+      <label><input type="radio" name="history-asset-choice" value="delete">
+        <span><b>同时从资产中心移除关联图片</b><small>采用软删除，历史版本与原文件仍保留；多集共用母资产不会误删。</small></span></label>
+    </fieldset>
+    <div class="history-delete-actions">
+      <button class="cancel">取消</button>
+      <button class="danger confirm">确认删除本集作品</button>
+    </div>
+  </div>`;
+  const close = () => overlay.remove();
+  overlay.querySelector(".cancel").onclick = close;
+  overlay.onclick = (ev) => { if (ev.target === overlay) close(); };
+  overlay.querySelector(".confirm").onclick = async (ev) => {
+    const button = ev.currentTarget;
+    const deleteAssets = overlay.querySelector(
+      'input[name="history-asset-choice"]:checked').value === "delete";
+    button.disabled = true;
+    button.textContent = "正在删除…";
+    try {
+      const result = await api("/api/history/delete", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ run_id: run.id, delete_assets: deleteAssets }),
+      });
+      close();
+      showToast(deleteAssets
+        ? `作品已删除，${result.assets_soft_deleted || 0} 张关联图片已从资产中心移除`
+        : "作品已删除，资产中心图片已保留", "ok");
+      location.hash = "#/history";
+    } catch (e) {
+      showToast(e.message, "error");
+      button.disabled = false;
+      button.textContent = "确认删除本集作品";
+    }
+  };
+  document.body.appendChild(overlay);
 }
 
 /* ================= 制作标准中心 ================= */
@@ -3247,6 +3298,34 @@ function assetCardHtml(ep, target, url, label, mock, assetId = null) {
   </div>`;
 }
 
+function assetCatalogCardHtml(item) {
+  const source = `《${item.source_project || "未命名作品"}》`
+    + (item.source_episode ? ` · 第 ${item.source_episode} 集` : " · 项目公共资产");
+  return `<article class="asset-catalog-card" data-category="${esc(item.category)}">
+    <div class="asset-catalog-media"><img class="zoomable"
+      src="${esc(thumbUrl(item.url, 480))}" loading="lazy" alt="${esc(item.label)}"></div>
+    <div class="asset-catalog-head"><span class="asset-category-chip">${esc(item.category_label)}</span>
+      <b>${esc(item.label)}</b></div>
+    <dl class="asset-origin-meta">
+      <div><dt>来源作品</dt><dd>${esc(source)}</dd></div>
+      <div><dt>生成时间</dt><dd>${dateTime(item.generated_at)}</dd></div>
+      <div><dt>质量 / 版本</dt><dd>${esc(item.quality || "medium")} · v${item.version}</dd></div>
+    </dl>
+    <details class="asset-prompt"><summary>查看提示词</summary>
+      <p class="${item.prompt_status === "recorded" ? "" : "dim"}">${esc(item.prompt)}</p></details>
+    <button class="asset-del danger" data-asset-id="${item.asset_id}"
+      title="从资产中心隐藏当前版本；历史版本和原文件仍会保留">🗑 删除</button>
+  </article>`;
+}
+
+function assetCatalogHtml(items, category = "all") {
+  const visible = category === "all"
+    ? items : items.filter((item) => item.category === category);
+  return visible.length
+    ? visible.map(assetCatalogCardHtml).join("")
+    : `<div class="dim">当前分类还没有图片资产。</div>`;
+}
+
 async function renderAssetsCenter(selectedTitle) {
   topbarRight.innerHTML = "";
   let ov;
@@ -3277,6 +3356,10 @@ async function renderAssetsCenter(selectedTitle) {
       art = epData.artifacts || art;
     } catch (e) { /* 项目还没有产物 */ }
   }
+  try {
+    const catalog = await api(`/api/asset-images?project=${encodeURIComponent(title)}`);
+    art.image_assets = catalog.items || [];
+  } catch (e) { art.image_assets = art.image_assets || []; }
   // 占位图标注:该资产最后一次是占位产线画的 → 卡片红标提醒
   const mockIds = new Set(
     (((epData || {}).render_plan || {}).items || [])
@@ -3285,6 +3368,12 @@ async function renderAssetsCenter(selectedTitle) {
   const attachOptions = [
     ...(art.cast_art || []).map((c) => c.name),
     ...(art.scene_art || []).map((s) => s.name)];
+  const storedCategory = localStorage.getItem("aifos.assets.category") || "all";
+  const assetCategories = [...new Map((art.image_assets || []).map((item) =>
+    [item.category, item.category_label])).entries()];
+  const activeCategory = storedCategory === "all"
+    || assetCategories.some(([value]) => value === storedCategory)
+    ? storedCategory : "all";
   app.innerHTML = `
   <div class="assets-center">
     <div class="canvas-toolbar">
@@ -3293,6 +3382,17 @@ async function renderAssetsCenter(selectedTitle) {
         `<option ${p.title === title ? "selected" : ""}>${esc(p.title)}</option>`).join("")}</select>
       <span class="hint">人物资产套件与场景概念图跨集复用;参考图自动进入出图提示</span>
     </div>
+    <section class="panel asset-panel asset-catalog-panel">
+      <div class="asset-catalog-toolbar"><div><h2>🧭 资产索引</h2>
+        <p class="dim">先按作品定位，再按人物、场景、服装等分类筛选；每张图保留时间、来源和提示词。</p></div>
+        <label>资产分类 <select id="asset-category"><option value="all">全部图片</option>
+          ${assetCategories.map(([value, label]) => `<option value="${esc(value)}"
+            ${activeCategory === value ? "selected" : ""}>${esc(label)}</option>`).join("")}
+        </select></label></div>
+      <div class="asset-catalog-grid" id="asset-catalog-grid">
+        ${assetCatalogHtml(art.image_assets || [], activeCategory)}
+      </div>
+    </section>
     ${epData ? mockWarnHtml(epData) : ""}
     <section class="panel asset-panel">
       <h2>🎨 画风管理 <span class="dim">更换画风后一键重做全部形象:
@@ -3393,6 +3493,27 @@ async function renderAssetsCenter(selectedTitle) {
       } catch (e) { showToast(e.message, "error"); }
     });
   const reload = () => renderAssetsCenter(title);
+  const bindAssetDeleteButtons = () => {
+    app.querySelectorAll(".asset-del").forEach((btn) => {
+      btn.onclick = (ev) => armConfirm(ev.target, "删除", async () => {
+        try {
+          await api("/api/asset/delete", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ project: title,
+              asset_id: Number(btn.dataset.assetId) }),
+          });
+          showToast("图片已从资产中心删除，历史版本仍保留", "ok");
+          reload();
+        } catch (e) { showToast(e.message, "error"); }
+      });
+    });
+  };
+  document.getElementById("asset-category").onchange = (ev) => {
+    localStorage.setItem("aifos.assets.category", ev.target.value);
+    document.getElementById("asset-catalog-grid").innerHTML =
+      assetCatalogHtml(art.image_assets || [], ev.target.value);
+    bindAssetDeleteButtons();
+  };
   bindLightbox(app);
   if (ep) {
     bindRegen(app, ep.id, () => null, reload);
@@ -3440,19 +3561,7 @@ async function renderAssetsCenter(selectedTitle) {
       } catch (e) { showToast(e.message, "error"); }
     });
   });
-  app.querySelectorAll(".asset-del").forEach((btn) => {
-    btn.onclick = (ev) => armConfirm(ev.target, "删除", async () => {
-      try {
-        await api("/api/asset/delete", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ project: title,
-            asset_id: Number(btn.dataset.assetId) }),
-        });
-        showToast("图片已从资产中心删除，历史版本仍保留", "ok");
-        reload();
-      } catch (e) { showToast(e.message, "error"); }
-    });
-  });
+  bindAssetDeleteButtons();
 }
 
 /* 可内联播放的媒体标签(真实产线 mp4/wav;mock 的 json 描述文件回退为链接) */
