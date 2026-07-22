@@ -1458,12 +1458,28 @@ textarea:focus-visible, select:focus-visible {
   background: linear-gradient(135deg, #2a70db, #7757d8);
   color: #fff; border-color: rgba(125, 180, 255, .65);
 }
+.image-accel-livebar {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 14px 16px; border: 1px solid var(--hairline); border-radius: 14px;
+  background: var(--surface); box-shadow: 0 8px 24px rgba(0, 0, 0, .12);
+}
+.image-accel-livebar.ready {
+  border-color: rgba(86, 148, 255, .58);
+  background: linear-gradient(135deg, rgba(42, 112, 219, .18), rgba(119, 87, 216, .1));
+}
+.image-accel-livebar > div { display: grid; gap: 4px; }
+.image-accel-livebar b { font-size: 16px; }
+.image-accel-livebar span { line-height: 1.45; }
+.image-accel-livebar small { color: var(--ink-3); line-height: 1.4; }
+.image-accel-livebar button { flex: 0 0 auto; }
 
 @media (max-width: 760px) {
   .acceleration-panel { width: 100%; }
   .accel-controls { position: static; grid-template-columns: 1fr; }
   .accel-pick > span { width: 100%; margin-left: 26px; }
   .accel-actions .primary { width: 100%; }
+  .image-accel-livebar { align-items: stretch; flex-direction: column; }
+  .image-accel-livebar button { width: 100%; min-height: 44px; }
 }
 
 /* ---- 空间调度图 ---- */

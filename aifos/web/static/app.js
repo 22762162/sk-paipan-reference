@@ -4223,6 +4223,13 @@ function scriptBodyHtml(script) {
 /* ---- 生产直播页:每一步实时可见,剧本一出即可阅读,可随时停止 ---- */
 function renderProductionView(data, episodeId) {
   const ep = data.episode;
+  const acceleration = (data.image_acceleration || {}).summary || {};
+  const accelerationReady = Number(acceleration.ready || 0);
+  const accelerationBlocked = Number(acceleration.blocked || 0);
+  const accelerationQueued = Number(acceleration.queued || 0);
+  const accelerationRunning = Number(acceleration.running || 0);
+  const accelerationVisible = accelerationReady + accelerationBlocked
+    + accelerationQueued + accelerationRunning > 0;
   const done = new Set((data.tasks || [])
     .filter((t) => t.status === "done").map((t) => t.stage));
   const runningTask = (data.tasks || []).find((t) => t.status === "running");
@@ -4236,6 +4243,8 @@ function renderProductionView(data, episodeId) {
       <span class="title">《${esc(data.project.title)}》第${ep.number}集</span>
       ${chip(ep.status)}
       <span class="spacer"></span>
+      <button id="btn-plan-live"
+        title="查看每张图片的状态、提示词和参考图">🖼 图片清单</button>
       <button id="btn-stop" class="stop-btn big" ${stopping ? "disabled" : ""}
         title="暂停生成:已完成的图片全部保留,可从断点继续">${stopping ? "暂停中…" : "⏸ 暂停生成"}</button>
     </div>
@@ -4262,6 +4271,22 @@ function renderProductionView(data, episodeId) {
         <div class="log-list" id="live-log"><div class="dim">加载中…</div></div>
       </div>
       <div class="produce-main">
+        <div class="image-accel-livebar ${accelerationVisible ? "ready" : "empty"}">
+          <div>
+            <b>⚡ API 批量加速</b>
+            <span>${accelerationReady
+              ? `还有 ${accelerationReady} 张从未进入生产线；可自主选择 API 和模型，默认中等质量。`
+              : accelerationQueued || accelerationRunning
+                ? `已排队 ${accelerationQueued} 张 · 正在 API 加速 ${accelerationRunning} 张。`
+                : "当前没有尚未进入生产线、可安全分流的图片。"}</span>
+            <small>放行前逐张核对实际提示词、参考图和人物身份；任何一项不一致都不会调用。</small>
+          </div>
+          <button id="btn-image-acceleration" class="primary"
+            ${accelerationVisible ? "" : "disabled"}>
+            ${accelerationReady ? `选择 API/模型并加速 (${accelerationReady})`
+              : "查看 API 加速状态"}
+          </button>
+        </div>
         ${renderPlanBoardHtml(data)}
         ${data.script ? `<div class="script-review">
           <div class="dim" style="margin-bottom:6px">📖 剧本已就绪,可边生产边阅读:</div>
@@ -4271,6 +4296,10 @@ function renderProductionView(data, episodeId) {
     </div>
   </div>`;
   document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
+  document.getElementById("btn-plan-live").onclick = () => showPlanOverlay(episodeId);
+  const accelerationButton = document.getElementById("btn-image-acceleration");
+  if (accelerationButton && !accelerationButton.disabled)
+    accelerationButton.onclick = () => showImageAcceleration(episodeId);
   document.getElementById("btn-stop").onclick = (ev) => {
     ev.target.disabled = true;
     ev.target.textContent = "停止中…";

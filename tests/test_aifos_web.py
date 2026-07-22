@@ -93,6 +93,10 @@ def test_index_and_static(server):
     assert "质检没有通过的原因".encode() in app_js
     assert "本次质检/重画实际附上的参考图".encode() in app_js
     assert "待生产图片批量 API 加速".encode() in app_js
+    assert "API 批量加速".encode() in app_js
+    assert "选择 API/模型并加速".encode() in app_js
+    assert b'id="btn-plan-live"' in app_js
+    assert b'id="btn-image-acceleration"' in app_js
     assert b"/api/image_acceleration/preflight" in app_js
     assert b"/api/image_acceleration/queue" in app_js
     assert "逐张预检所选图片".encode() in app_js
@@ -107,6 +111,7 @@ def test_index_and_static(server):
     assert b".video-ref-picker-grid" in style_css
     assert b".plan-ref-gallery" in style_css
     assert b".acceleration-panel" in style_css
+    assert b".image-accel-livebar" in style_css
     assert b".accel-gates" in style_css
     status, ctype, raw = _request(
         server["port"], "GET", "/manifest.webmanifest")
