@@ -8,6 +8,7 @@
 
 import hashlib
 import json
+import re
 import time
 from pathlib import Path
 
@@ -131,6 +132,47 @@ WORKWEAR_RULE = (
     "若角色身份或职业属于外卖小哥、快递员、配送员、医生、护士、警察、"
     "消防员、保安、服务员、厨师、工人等职业,必须穿该职业真实可辨认的"
     "工作服/制服并体现必要的职业装备,不得用普通便服替代。")
+
+# 场景概念图是后续分镜共用的环境基准,不能把人物服装描述误当成场景内容。
+# 这些关键词只补充空间功能和可见锚点,最终仍以剧本地点/时代/动作为准。
+SCENE_ENVIRONMENT_PRESETS = (
+    (("直播间", "直播室", "录播间"),
+     "干净紧凑的直播工作区；主机位三脚架与镜头朝向主播位，桌面有麦克风、"
+     "补光灯、耳机和调音设备，背景是吸音墙/灯带/收纳架，线缆整齐，留出人物站位"),
+    (("练习室", "排练室"),
+     "大面积镜面墙、木地板、音响与可移动把杆；墙边有水瓶和毛巾收纳，"
+     "中心留出连续动作区域，镜面反射保持同一空间结构"),
+    (("舞台", "演出厅", "剧场"),
+     "明确的舞台台口、主灯位、侧灯位、地面走位区与观众方向；灯光设备只作环境"
+     "结构，不出现观众面孔或无关人物"),
+    (("后台", "化妆间", "休息室"),
+     "演出后台的化妆台、镜前灯、服装挂架和设备箱；通道与座位分区清晰，"
+     "道具按剧情需要摆放，不堆满无关杂物"),
+    (("办公室", "会议室", "写字楼", "公司"),
+     "功能明确、干净可用的办公空间；桌椅、显示器、文件收纳和玻璃/隔断形成"
+     "前后层次，设备年代与故事阶段一致，桌面不出现可读文件文字"),
+    (("教室", "学校", "图书馆"),
+     "符合校园尺度的课桌、黑板/书架、窗户和过道；光线方向明确，书本只作无字"
+     "道具，空间留出人物进出动线"),
+    (("咖啡", "餐厅", "便利店", "厨房"),
+     "服务空间的操作台、座位/货架、收银区域和出入口关系清楚；材质、器具和"
+     "灯光体现营业时段，招牌与包装不得出现可读文字"),
+    (("医院", "诊室", "病房"),
+     "医疗空间的病床/诊疗台、器械车、隔帘、洗手区和门口关系清晰；设备整洁，"
+     "屏幕与病历全部无字无标识"),
+    (("宿舍", "卧室", "房间", "客厅"),
+     "生活空间的床铺/沙发、收纳、桌面和门窗形成可连续拍摄的动线；物品有使用痕迹"
+     "但不凌乱，私人照片和纸张不出现可读内容"),
+    (("古镇", "客栈", "府邸", "宫殿", "宗门", "藏经阁"),
+     "严格按古代/仙侠世界建造的空间；院落、木石结构、灯火、帘幕和传统器物"
+     "符合阶层与地域，不混入现代电器、玻璃幕墙或现代服装陈设"),
+    (("街道", "巷子", "广场", "车站"),
+     "明确的道路走向、建筑界面、遮挡关系和远近层次；时代、地域和天气由剧本决定，"
+     "空镜不添加随机路人、车辆或品牌广告"),
+    (("山谷", "森林", "湖边", "海边", "荒野", "废墟"),
+     "自然环境的地形层次、可通行路径、视线遮挡和远景边界清楚；天气与时间服从"
+     "剧情，不用无关建筑或随机人物填充"),
+)
 
 
 def is_background_character(character):
@@ -797,9 +839,55 @@ class Director:
             ";全身正面自然站姿，动作只服务造型展示；干净均匀肤质，禁止塑料脸、"
             "脏污毛孔；单人，禁止新增人物")
 
-    def _scene_prompt(self, location, style):
-        return (f"场景概念图:{location},{style},空镜,氛围感;"
-                "禁止任何可读文字、字幕、Logo、水印和无关人物")
+    @staticmethod
+    def _scene_style_line(style):
+        """从项目画风中抽取适用于环境的媒介/材质/光影,去掉人物服装词。"""
+        raw = str(style or "").strip()
+        if not raw:
+            return "剧情自适应半写实漫剧材质与电影光影"
+        blocked = ("角色", "人物", "青年", "发型", "服装", "穿搭", "皮肤",
+                   "五官", "妆", "脸", "通勤")
+        chunks = [part.strip() for part in re.split(r"[,，;；。]", raw)
+                  if part.strip()]
+        kept = [part for part in chunks
+                if not any(word in part for word in blocked)]
+        # 兜底保留第一段媒介名,避免画风整句恰好只包含人物描述。
+        if not kept:
+            kept = chunks[:1]
+        return "；".join(kept)
+
+    @staticmethod
+    def _scene_environment_line(location):
+        place = str(location or "未命名地点")
+        for keywords, detail in SCENE_ENVIRONMENT_PRESETS:
+            if any(keyword in place for keyword in keywords):
+                return detail
+        return ("根据地点名称建立真实可用的空间功能、入口/出口、前中后景和人物动线；"
+                "材质、设备、建筑与陈设严格服从剧本时代/世界观、地域和社会阶层，"
+                "不凭空加入不属于故事的现代或古代元素")
+
+    def _scene_prompt(self, location, style, scene=None, premise=""):
+        """场景概念图提示词:只建立可复用环境,不把人物画风误当场景内容。"""
+        scene = scene or {}
+        place = str(location or scene.get("location") or "未命名地点")
+        time_state = (scene.get("time_of_day") or scene.get("time") or "")
+        if "·" in place and not time_state:
+            place, suffix = place.split("·", 1)
+            time_state = suffix.strip()
+        time_state = time_state or "按本场剧情确定的时间与天气"
+        action = (scene.get("action") or premise or
+                  "建立本场事件发生所需的环境关系")
+        return ";".join((
+            f"场景概念图/环境基准:{place.strip()}",
+            f"项目视觉媒介与材质:{self._scene_style_line(style)}",
+            f"空间功能与布局:{self._scene_environment_line(place)}",
+            f"时间与天气:{time_state}",
+            f"剧情用途:{action}",
+            "构图:适配项目画幅的环境建立镜头，前景/主体区/背景层次清楚，"
+            "留出角色进出与表演动线，机位高度和光线方向稳定，后续镜头可复用",
+            "空镜:画面中不出现人物、人体局部、剪影、倒影中的人或随机路人",
+            "场景只保留与剧情有关的设备、道具和陈设；所有屏幕、纸张、招牌和包装"
+            "均无可读文字、字幕、Logo、水印、乱码和品牌标识"))
 
     def _sheet_prompt(self, name, role, style, label, desc, key=None,
                       design=None):
@@ -2299,9 +2387,15 @@ class Director:
         characters = [c for c in all_characters
                       if not is_background_character(c)]
         locations = []
+        scene_context_by_location = {}
         for scene in ctx["script"]["scenes"]:
             if scene["location"] not in locations:
                 locations.append(scene["location"])
+                scene_context_by_location[scene["location"]] = dict(scene)
+            elif scene.get("action"):
+                previous = scene_context_by_location[scene["location"]]
+                previous["action"] = "；".join(filter(None, (
+                    previous.get("action", ""), scene.get("action", ""))))
         location_reuse = {
             location: sum(1 for scene in ctx["script"]["scenes"]
                           if scene.get("location") == location)
@@ -2368,7 +2462,9 @@ class Director:
         self._plan_seed(ctx, "scene_art", [
             {"id": f"scene:{loc}", "category": "scene_art",
              "label": loc, "name": loc,
-             "prompt": self._scene_prompt(loc, style),
+             "prompt": self._scene_prompt(
+                 loc, style, scene_context_by_location.get(loc),
+                 premise=ctx["episode"].get("premise", "")),
              **self._quality_meta(scene_quality[loc])}
             for loc in locations])
         reused, created = 0, 0
@@ -2418,7 +2514,9 @@ class Director:
                     "quality_decision": scene_quality[location],
                     "shot_no": 0, "characters": [], "location": location,
                     "action": scene.get("action", ""),
-                    "prompt": self._scene_prompt(location, style),
+                    "prompt": self._scene_prompt(
+                        location, style, scene,
+                        premise=ctx["episode"].get("premise", "")),
                     "style": style,
                     "reference_images": self._reference_uris(
                         project_id, [location]),
@@ -3587,7 +3685,9 @@ class Director:
             name = target["name"]
             scene = next((s for s in script["scenes"]
                           if s["location"] == name), {})
-            prompt = prompt_override or self._scene_prompt(name, style)
+            prompt = prompt_override or self._scene_prompt(
+                name, style, scene,
+                premise=episode["premise"] if episode else "")
             references = self._reference_uris(project["id"], [name])
             style_ref = self._style_anchor_uri(project["id"])
             reuse_count = sum(1 for value in script["scenes"]
