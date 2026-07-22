@@ -6474,6 +6474,10 @@ async function renderCanvasView(episodeId) {
     return;
   }
   if (!sb) {
+    if (script) {
+      renderRecoveryView(data, episodeId);
+      return;
+    }
     app.innerHTML = `<div class="loading">本集尚无分镜(制作进行中或未开始)。<a href="#/">返回仪表盘</a></div>`;
     if (!["done", "failed", "qc_failed"].includes(ep.status))
       pollCanvas(episodeId);
@@ -6926,6 +6930,57 @@ function renderScriptReview(data, episodeId) {
     } catch (e) {
       showToast(e.message, "error");
       btn.disabled = false; btn.textContent = "✅ 剧本OK,按此风格开始画图";
+    }
+  };
+}
+
+/* ---- 生产恢复页:阶段失败/中断后的一键续跑入口 ---- */
+function renderRecoveryView(data, episodeId) {
+  const ep = data.episode;
+  const failedTask = [...(data.tasks || [])].reverse()
+    .find((t) => t.status === "failed");
+  app.innerHTML = `
+  <div class="canvas-view">
+    <div class="confirm-banner">
+      <div>
+        <b>${failedTask ? `上次生产在「${esc(STAGE_CN[failedTask.stage] || failedTask.stage)}」失败 ⚠️` : "生产已中断"}</b>
+        <span>${failedTask ? esc((failedTask.error || "").slice(0, 200)) : "可从断点继续"};
+        剧本、人物设定和已画好的图全部保留,点继续只重跑未完成的部分,不重复消耗额度。</span>
+      </div>
+      <button class="primary" id="btn-resume">▶ 继续补齐(从断点重跑)</button>
+    </div>
+    <div class="canvas-toolbar">
+      <button id="btn-back">← 仪表盘</button>
+      <span class="title">《${esc(data.project.title)}》第${ep.number}集</span>
+      ${chip(ep.status)}
+      <span class="spacer"></span>
+      <button id="btn-script2">📖 看剧本</button>
+      <button id="btn-plan2">🖼 图片清单</button>
+    </div>
+    <div class="produce-main" style="padding:0 18px 40px">
+      ${renderPlanBoardHtml(data)}
+    </div>
+  </div>`;
+  document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
+  document.getElementById("btn-script2").onclick = () =>
+    showScriptOverlay(data, episodeId);
+  document.getElementById("btn-plan2").onclick = () =>
+    showPlanOverlay(episodeId);
+  bindLightbox(app);
+  document.getElementById("btn-resume").onclick = async (ev) => {
+    const btn = ev.target;
+    btn.disabled = true; btn.textContent = "已提交,续跑中…";
+    try {
+      await api("/api/produce", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: data.project.title,
+                               episode: ep.number, review: true }),
+      });
+      showToast("已从断点继续:复用已完成部分,只重跑剩余步骤", "ok");
+      pollCanvas(episodeId);
+    } catch (e) {
+      showToast(e.message, "error");
+      btn.disabled = false; btn.textContent = "▶ 继续补齐(从断点重跑)";
     }
   };
 }
