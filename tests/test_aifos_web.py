@@ -60,8 +60,8 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260722-image-accel" in html
-    assert "/static/app.js?v=20260722-image-accel" in html
+    assert "/static/style.css?v=20260722-image-accel-2" in html
+    assert "/static/app.js?v=20260722-image-accel-2" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -102,7 +102,7 @@ def test_index_and_static(server):
     assert "选择 API/模型并加速".encode() in app_js
     assert b'id="btn-plan-live"' in app_js
     assert b'id="btn-image-acceleration"' in app_js
-    assert app_js.count(b"imageAccelerationLivebarHtml(data)") >= 3
+    assert app_js.count(b"imageAccelerationLivebarHtml(data)") >= 4
     assert b'updateViaCache: "none"' in app_js
     assert b"/api/image_acceleration/preflight" in app_js
     assert b"/api/image_acceleration/queue" in app_js

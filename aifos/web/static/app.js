@@ -3865,6 +3865,7 @@ function renderCastSelection(data, episodeId) {
         </button>
       </div>
     </div>
+    ${imageAccelerationLivebarHtml(data)}
     <div class="canvas-toolbar">
       <button id="cast-back">← 仪表盘</button>
       <span class="title">《${esc(data.project.title)}》第${data.episode.number}集 · 人物定版</span>
@@ -3890,6 +3891,7 @@ function renderCastSelection(data, episodeId) {
           </article>`).join("")}</div>
       </section>`).join("")}</div>
   </div>`;
+  bindImageAccelerationLivebar(episodeId);
   document.getElementById("cast-back").onclick = () => { location.hash = "#/"; };
   document.getElementById("cast-script").onclick = () => showScriptOverlay(data, episodeId);
   document.getElementById("cast-regenerate").onclick = (ev) => armConfirm(
