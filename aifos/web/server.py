@@ -19,6 +19,8 @@ API:
   GET  /artifacts/<path>        workspace/artifacts 下的产物(防目录穿越)
 """
 
+import base64
+import binascii
 import copy
 import ipaddress
 import json
@@ -207,12 +209,27 @@ class JobRegistry:
     def _run(self, job_id, task):
         def run():
             app = App(self.workspace)
+            follow_up = None
             try:
                 summary = task(app)
                 self._jobs[job_id].update(
                     status="done", summary=summary, finished_at=time.time())
                 app.history.finish_run(
                     self._jobs[job_id]["run_id"], summary=summary)
+                if isinstance(summary, dict) and summary.get("status") == "done":
+                    project = app.projects.get_project(summary.get("project"))
+                    episode = (app.db.query_one(
+                        "SELECT id FROM episodes WHERE project_id=? AND number=?",
+                        (project["id"], int(summary["episode"])))
+                        if project is not None else None)
+                    if episode is not None:
+                        try:
+                            follow_up = app.series.maybe_auto_advance(
+                                episode["id"])
+                        except Exception as exc:
+                            # 串行队列是当前成功运行的后续动作；推进失败只提示，
+                            # 不能把已经交付成功的本集和历史记录反写成失败。
+                            self._jobs[job_id]["series_advance_error"] = str(exc)
             except Exception as exc:  # 后台任务兜底,错误进任务状态
                 self._jobs[job_id].update(
                     status="failed", error=str(exc), finished_at=time.time())
@@ -220,8 +237,28 @@ class JobRegistry:
                     self._jobs[job_id]["run_id"], error=str(exc))
             finally:
                 app.close()
+            if follow_up and not follow_up.get("done"):
+                try:
+                    next_job = self.start_series_step(follow_up)
+                    self._jobs[job_id]["series_next"] = {
+                        "episode_id": follow_up["episode_id"],
+                        "episode": follow_up["number"],
+                        "job_id": next_job,
+                    }
+                except Exception as exc:
+                    # 当前集已经成功，自动准备下一集失败不应篡改当前结果。
+                    self._jobs[job_id]["series_advance_error"] = str(exc)
 
         threading.Thread(target=run, daemon=True).start()
+
+    def start_series_step(self, step):
+        """激活结果为梗概时按集编剧；已有剧本只进入审阅，不启动任务。"""
+        if step.get("done") or step.get("mode") == "script":
+            return None
+        return self.start(
+            step["title"], int(step["number"]),
+            premise=step.get("premise", ""), review=True,
+            action="series_next")
 
     def get(self, job_id):
         return self._jobs.get(job_id)
@@ -368,6 +405,8 @@ def _episode_payload(app, episode_id):
         episode_id, "production_standard")
     quality_policy, quality_policy_v = app.projects.latest_document(
         episode_id, "quality_policy")
+    series_source, series_source_v = app.projects.latest_document(
+        episode_id, "series_source")
     cast_selection = app.director.character_selection_status(
         project["id"], (script or {}).get("characters", []))
     for character in cast_selection.get("characters", []):
@@ -422,6 +461,9 @@ def _episode_payload(app, episode_id):
         "production_standard_version": production_standard_v,
         "quality_policy": normalize_quality_policy(quality_policy),
         "quality_policy_version": quality_policy_v,
+        "series_source": series_source,
+        "series_source_version": series_source_v,
+        "series_batch": app.series.batch_for_episode(episode_id),
         "cast_selection": cast_selection,
         "qc_report": qc_report,
         "render_plan": render_plan,
@@ -464,6 +506,7 @@ def _overview_payload(app, jobs):
             for p in app.projects.list_projects()
         },
         "jobs": jobs.list(),
+        "series_batches": app.series.list_batches(),
     }
 
 
@@ -605,6 +648,13 @@ def make_handler(workspace, jobs):
                     if job is None:
                         return self._error(404, "任务不存在")
                     return self._json(job)
+                match = re.match(r"^/api/series/(\d+)$", route)
+                if match:
+                    payload = self._with_app(
+                        lambda app: app.series.get_batch(int(match.group(1))))
+                    if payload is None:
+                        return self._error(404, "多集导入批次不存在")
+                    return self._json(payload)
                 match = re.match(r"^/api/export/(\d+)$", route)
                 if match:
                     return self._export(int(match.group(1)))
@@ -627,6 +677,14 @@ def make_handler(workspace, jobs):
             try:
                 if parsed.path == "/api/produce":
                     return self._produce()
+                if parsed.path == "/api/series/preview":
+                    return self._series_preview()
+                if parsed.path == "/api/series/import":
+                    return self._series_import()
+                if parsed.path == "/api/series/next":
+                    return self._series_next()
+                if parsed.path == "/api/series/settings":
+                    return self._series_settings()
                 if parsed.path == "/api/confirm":
                     return self._confirm()
                 if parsed.path == "/api/character/select":
@@ -896,6 +954,130 @@ def make_handler(workspace, jobs):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+
+        def _series_request(self, body):
+            filename = str(body.get("filename") or "").strip()
+            encoded = body.get("data_base64")
+            if not filename or not isinstance(encoded, str) or not encoded:
+                raise AifosError("请选择要导入的剧本文档")
+            if len(encoded) > 28 * 1024 * 1024:
+                raise AifosError("文档超过 20MB；请按卷拆分后导入")
+            try:
+                raw = base64.b64decode(encoded, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise AifosError("文档数据不是有效的 Base64") from exc
+
+            def prepare(app):
+                start = body.get("start_episode")
+                try:
+                    start = int(start) if start not in (None, "") else None
+                except (TypeError, ValueError) as exc:
+                    raise AifosError("起始集数必须是正整数") from exc
+                title, number, note = resolve_produce_target(
+                    app, body.get("sentence", ""),
+                    title=(body.get("title") or None), number=start)
+                from ..series_import import (
+                    SeriesImportError, parse_series_document)
+                try:
+                    parsed = parse_series_document(
+                        filename, raw, title, start_number=number)
+                except SeriesImportError as exc:
+                    raise AifosError(str(exc)) from exc
+                project = app.projects.get_project(title)
+                conflicts = []
+                if project is not None:
+                    numbers = [item["episode_number"]
+                               for item in parsed["episodes"]]
+                    placeholders = ",".join("?" for _ in numbers)
+                    conflicts = [row["number"] for row in app.db.query(
+                        f"SELECT number FROM episodes WHERE project_id=? "
+                        f"AND number IN ({placeholders}) ORDER BY number",
+                        (project["id"], *numbers))]
+                return parsed, note, conflicts
+
+            return self._with_app(prepare)
+
+        def _series_preview(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                parsed, note, conflicts = self._series_request(body)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            from ..series_import import preview_payload
+            payload = preview_payload(parsed)
+            payload["note"] = note
+            payload["conflicts"] = conflicts
+            payload["can_import"] = not conflicts
+            return self._json(payload)
+
+        def _series_import(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                parsed, note, conflicts = self._series_request(body)
+                if conflicts:
+                    joined = "、".join(f"第{number}集" for number in conflicts)
+                    return self._error(
+                        409, f"以下剧集已经存在，未覆盖任何内容：{joined}；"
+                        "请调整起始集数后重试")
+                batch = self._with_app(
+                    lambda app: app.series.import_batch(
+                        parsed, style=body.get("style", ""),
+                        kind=(body.get("kind")
+                              if body.get("kind") in ("drama", "idol")
+                              else None),
+                        auto_advance=body.get("auto_advance", True)))
+                step = None
+                job_id = None
+                if body.get("start_first", True):
+                    step = self._with_app(
+                        lambda app: app.series.activate_next(batch["id"]))
+                    job_id = jobs.start_series_step(step)
+                    batch = self._with_app(
+                        lambda app: app.series.get_batch(batch["id"]))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json({
+                "batch": batch,
+                "first": step,
+                "job_id": job_id,
+                "note": note,
+            }, status=201)
+
+        def _series_next(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                batch_id = int(body.get("batch_id"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少有效 batch_id")
+            try:
+                step = self._with_app(
+                    lambda app: app.series.activate_next(batch_id))
+                job_id = jobs.start_series_step(step)
+            except AifosError as exc:
+                return self._error(409, str(exc))
+            return self._json({"step": step, "job_id": job_id}, status=202)
+
+        def _series_settings(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                batch_id = int(body.get("batch_id"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少有效 batch_id")
+            try:
+                batch = self._with_app(
+                    lambda app: app.series.set_auto_advance(
+                        batch_id, bool(body.get("auto_advance"))))
+            except AifosError as exc:
+                return self._error(404, str(exc))
+            return self._json(batch)
 
         def _produce(self):
             length = int(self.headers.get("Content-Length", "0"))

@@ -189,6 +189,7 @@ function armConfirm(btn, label, action) {
 
 const STATUS_CN = {
   done: "完成", failed: "失败", qc_failed: "质检未过", created: "已建",
+  queued_script: "已排队",
   awaiting_confirm: "待确认", awaiting_script: "剧本待确认",
   awaiting_cast: "人物待定版",
   cancelling: "正在暂停…",
@@ -205,6 +206,7 @@ const RUN_STATUS_CN = {
 };
 const ACTION_CN = {
   produce: "开始制作", script_import: "导入剧本制作",
+  series_import: "多集文档导入", series_next: "串行准备下一集",
   confirm_script: "确认剧本后续产", confirm_cast: "确认人物定版后续产",
   confirm_preflight: "确认开拍后续产",
   force_rebuild: "全部重做", revise_script: "修改剧本",
@@ -836,6 +838,8 @@ function dashSig(data) {
   return JSON.stringify([
     data.episodes.map((e) => [e.id, e.status, e.qc_score, e.cost]),
     data.jobs.map((j) => [j.id, j.status]),
+    (data.series_batches || []).map((b) => [b.id, b.status, b.completed,
+      b.auto_advance, (b.current || {}).episode_id, (b.next || {}).episode_id]),
     data.stats,
   ]);
 }
@@ -887,6 +891,11 @@ function updateDashboard(data) {
     sub.textContent = `V3.2 · ${data.build} · AI 漫剧工业生产系统`;
   updateTopbar(data);
   renderProgressBanner(data);
+  const series = document.getElementById("series-batches");
+  if (series) {
+    series.innerHTML = seriesBatchesHtml(data);
+    bindSeriesBatches();
+  }
   const tiles = document.getElementById("tiles");
   if (tiles) tiles.innerHTML = tilesHtml(data);
   const panel = document.getElementById("episodes-panel");
@@ -894,6 +903,83 @@ function updateDashboard(data) {
     panel.innerHTML = episodesPanelHtml(data);
     bindEpisodeRows();
   }
+}
+
+const SERIES_ITEM_CN = {
+  queued: "等待前一集", active: "当前制作", done: "已完成",
+  needs_attention: "需处理",
+};
+
+function seriesBatchesHtml(data) {
+  const batches = (data.series_batches || []).filter((batch) => batch.status !== "done");
+  if (!batches.length) return "";
+  return `<section class="series-queues" aria-label="多集串行生产队列">
+    ${batches.map((batch) => {
+      const pct = Math.round((Number(batch.completed) || 0)
+        / Math.max(1, Number(batch.total) || 1) * 100);
+      const canNext = !batch.current && batch.next
+        && !batch.items.some((item) => item.status === "needs_attention");
+      return `<article class="series-queue" data-series-batch="${batch.id}">
+        <div class="series-queue-head">
+          <div><span class="eyebrow">SERIES QUEUE · #${batch.id}</span>
+            <h2>《${esc(batch.project_title)}》· ${esc(batch.filename || "多集剧本")}</h2>
+            <p>已完成 ${batch.completed}/${batch.total} 集；整批已入库，但始终只激活一集。</p></div>
+          <label class="series-auto"><input type="checkbox" data-series-auto
+            ${batch.auto_advance ? "checked" : ""}> 当前集完整通过后自动准备下一集</label>
+        </div>
+        <div class="series-progress"><i style="width:${pct}%"></i></div>
+        <div class="series-episode-strip">${batch.items.map((item) => `
+          <a href="#/episode/${item.episode_id}" class="series-episode ${item.status}">
+            <b>第${item.episode_number}集</b><span>${esc(item.episode_title || "")}</span>
+            <small>${esc(SERIES_ITEM_CN[item.status] || item.status)} · ${item.mode === "script" ? "已有剧本" : "剧情梗概待编剧"}</small>
+          </a>`).join("")}</div>
+        <div class="series-actions">
+          ${batch.current ? `<a class="primary button-link" href="#/episode/${batch.current.episode_id}">继续当前第${batch.current.episode_number}集 →</a>` : ""}
+          ${canNext ? `<button class="primary" data-series-next>开始第${batch.next.episode_number}集</button>` : ""}
+          ${batch.items.some((item) => item.status === "needs_attention")
+            ? `<span class="series-blocked">有剧集失败或质检未通过，修复后才会继续。</span>` : ""}
+        </div>
+      </article>`;
+    }).join("")}
+  </section>`;
+}
+
+function bindSeriesBatches() {
+  document.querySelectorAll("[data-series-batch]").forEach((card) => {
+    const batchId = Number(card.dataset.seriesBatch);
+    card.querySelector("[data-series-next]")?.addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true; button.textContent = "正在准备…";
+      try {
+        const reply = await api("/api/series/next", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ batch_id: batchId }),
+        });
+        const step = reply.step;
+        showToast(step.mode === "script"
+          ? `第${step.number}集剧本已进入审阅`
+          : `第${step.number}集正在按剧情梗概编剧`, "ok");
+        location.hash = `#/episode/${step.episode_id}`;
+      } catch (error) {
+        showToast(error.message, "error");
+        button.disabled = false; button.textContent = "开始下一集";
+      }
+    });
+    card.querySelector("[data-series-auto]")?.addEventListener("change", async (event) => {
+      try {
+        await api("/api/series/settings", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ batch_id: batchId,
+            auto_advance: event.currentTarget.checked }),
+        });
+        showToast(event.currentTarget.checked
+          ? "当前集通过后会自动准备下一集" : "已改为手动开始下一集", "ok");
+      } catch (error) {
+        event.currentTarget.checked = !event.currentTarget.checked;
+        showToast(error.message, "error");
+      }
+    });
+  });
 }
 
 /* ================= 仪表盘 ================= */
@@ -944,6 +1030,19 @@ async function renderDashboard() {
 夜色渐深,妖气翻涌。
 林昭:这股妖气不对劲。
 小狐:小心,它就在附近!"></textarea>
+      <div class="series-import-tools" data-series-tools hidden>
+        <label class="series-file-picker">
+          <span>📚 选择多集剧本文档</span>
+          <input type="file" name="series_file"
+            accept=".txt,.md,.markdown,.json,.docx,.pdf,text/plain,application/json,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/pdf">
+        </label>
+        <label class="series-start-field"><span>起始集</span>
+          <input type="number" name="series_start" min="1" step="1"
+            placeholder="自动接下一集"></label>
+        <label class="series-auto-field"><input type="checkbox" name="series_auto" checked>
+          当前集完整通过后，自动准备下一集</label>
+        <small data-series-file-note>支持 TXT、Markdown、JSON、Word DOCX、PDF；先预览分集，不会直接开始烧图。</small>
+      </div>
       <div class="produce-hint">SK 工业流:连续性圣经 → 五维分镜 → 空间调度图 → 关键帧/文字锁定 → 生产门禁 → Seedance → 三层质检 → 交付脚本。</div>
     </form>
     <section class="workflow-map" aria-label="AIFOS 漫剧工业流">
@@ -954,6 +1053,7 @@ async function renderDashboard() {
       </div>
     </section>
     <div id="progress-banner"></div>
+    <div id="series-batches">${seriesBatchesHtml(data)}</div>
     <div id="pipeline-strip"></div>
 
     <div class="tiles" id="tiles">${tilesHtml(data)}</div>
@@ -1018,6 +1118,7 @@ async function renderDashboard() {
       form.querySelectorAll(".mode-tab").forEach((t) =>
         t.classList.toggle("active", t === tab));
       form.script.hidden = tab.dataset.mode !== "script";
+      form.querySelector("[data-series-tools]").hidden = tab.dataset.mode !== "script";
       if (tab.dataset.mode === "script") form.script.focus();
     }));
   form.querySelectorAll(".kind-tab").forEach((tab) =>
@@ -1026,7 +1127,17 @@ async function renderDashboard() {
         t.classList.toggle("active", t === tab));
       form.dataset.kind = tab.dataset.kind;
     }));
+  form.elements.series_file.addEventListener("change", () => {
+    const file = form.elements.series_file.files[0];
+    const note = form.querySelector("[data-series-file-note]");
+    note.textContent = file
+      ? `已选择 ${file.name} · ${Math.max(1, Math.round(file.size / 1024))}KB；点“预览并批量导入”检查分集。`
+      : "支持 TXT、Markdown、JSON、Word DOCX、PDF；先预览分集，不会直接开始烧图。";
+    const submit = form.querySelector('button[type="submit"]');
+    submit.textContent = file ? "预览并批量导入" : "开始制作";
+  });
   renderProgressBanner(data);
+  bindSeriesBatches();
   bindEpisodeRows();
   app.querySelectorAll(".proj-rename").forEach((btn) =>
     btn.addEventListener("click", () =>
@@ -1058,7 +1169,7 @@ async function renderDashboard() {
 
   const producing = data.episodes.some((e) =>
     !["done", "failed", "qc_failed", "created", "awaiting_script",
-      "awaiting_cast", "awaiting_confirm"].includes(e.status));
+      "awaiting_cast", "awaiting_confirm", "queued_script"].includes(e.status));
   if (runningJobs.length || producing)
     pollTimer = setInterval(refreshIfIdle, 2500);
 }
@@ -1080,12 +1191,102 @@ async function refreshIfIdle() {
   } catch (e) { /* 网络抖动下一轮再试 */ }
 }
 
+function fileBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || "").split(",")[1] || "");
+    reader.onerror = () => reject(new Error("读取文档失败"));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function previewSeriesImport(form, file) {
+  const dataBase64 = await fileBase64(file);
+  const request = {
+    sentence: form.sentence.value.trim(),
+    start_episode: form.elements.series_start.value || null,
+    filename: file.name,
+    data_base64: dataBase64,
+    style: form.style.value,
+    kind: form.dataset.kind || "",
+    auto_advance: form.elements.series_auto.checked,
+    start_first: true,
+  };
+  const preview = await api("/api/series/preview", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  const conflicts = preview.conflicts || [];
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay series-preview-overlay";
+  overlay.innerHTML = `<div class="script-panel series-preview-panel">
+    <div class="script-head"><div><span class="eyebrow">DOCUMENT IMPORT</span>
+      <h3>导入前确认分集 · 《${esc(preview.project_title)}》</h3></div>
+      <button class="close">关闭 Esc</button></div>
+    <div class="series-preview-summary">
+      <div><b>${preview.total}</b><span>识别剧集</span></div>
+      <div><b>第${preview.start_number}集</b><span>开始编号</span></div>
+      <div><b>${esc((preview.source_format || "text").toUpperCase())}</b><span>${esc(preview.filename)}</span></div>
+    </div>
+    <p class="series-preview-rule">整批只负责导入和排队：当前集过完剧本、人物、开拍和质检门禁后，才准备下一集。不会同时批量烧图。</p>
+    ${conflicts.length ? `<div class="series-import-error">第 ${conflicts.join("、")} 集已经存在。请关闭后修改“起始集”，现有内容不会被覆盖。</div>` : ""}
+    <div class="series-preview-list">${preview.episodes.map((episode) => `
+      <article class="series-preview-item ${episode.mode}">
+        <div><b>第${episode.episode_number}集 · ${esc(episode.title)}</b>
+          <span class="series-mode ${episode.mode}">${episode.mode === "script" ? "已识别完整剧本" : "剧情梗概 · 将由 AI 按集编剧"}</span></div>
+        <p>${esc(episode.excerpt || "")}</p>
+        <small>${episode.char_count} 字${episode.mode === "script"
+          ? ` · ${episode.scene_count} 场 · 角色 ${episode.characters.map(esc).join("、") || "待识别"}`
+          : " · 编剧完成后停在剧本审阅，不会直接出图"}</small>
+      </article>`).join("")}</div>
+    <div class="series-preview-actions">
+      <button class="close-secondary">返回修改</button>
+      <button class="primary import-confirm" ${conflicts.length ? "disabled" : ""}>确认导入 ${preview.total} 集并从第${preview.start_number}集开始</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  const close = () => {
+    overlay.remove();
+    document.removeEventListener("keydown", onKey);
+  };
+  const onKey = (event) => { if (event.key === "Escape") close(); };
+  document.addEventListener("keydown", onKey);
+  overlay.addEventListener("click", (event) => { if (event.target === overlay) close(); });
+  overlay.querySelector(".close").onclick = close;
+  overlay.querySelector(".close-secondary").onclick = close;
+  overlay.querySelector(".import-confirm")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true; button.textContent = "正在建立逐集队列…";
+    try {
+      const reply = await api("/api/series/import", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request),
+      });
+      close();
+      const first = reply.first;
+      showToast(`已导入 ${reply.batch.total} 集；仅激活第${first.number}集`, "ok");
+      location.hash = `#/episode/${first.episode_id}`;
+    } catch (error) {
+      showToast(error.message, "error");
+      button.disabled = false;
+      button.textContent = `确认导入 ${preview.total} 集并开始第一集`;
+    }
+  });
+}
+
 async function onProduce(ev) {
   ev.preventDefault();
   const form = ev.target;
   const btn = form.querySelector('button[type="submit"]');
   btn.disabled = true; btn.textContent = "提交中…";
   try {
+    const seriesFile = form.elements.series_file?.files?.[0];
+    if (!form.script.hidden && seriesFile) {
+      btn.textContent = "正在解析文档…";
+      await previewSeriesImport(form, seriesFile);
+      btn.disabled = false; btn.textContent = "预览并批量导入";
+      return;
+    }
     const reply = await api("/api/produce", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1103,7 +1304,9 @@ async function onProduce(ev) {
     renderDashboard();
   } catch (e) {
     showToast(e.message, "error");
-    btn.disabled = false; btn.textContent = "开始制作";
+    btn.disabled = false;
+    btn.textContent = form.elements.series_file?.files?.[0]
+      ? "预览并批量导入" : "开始制作";
   }
 }
 
@@ -3067,7 +3270,7 @@ function renderProgressBanner(data) {
     (e) => e.status === "awaiting_confirm");
   const producing = data.episodes.filter(
     (e) => !["done", "failed", "qc_failed", "created", "awaiting_script",
-             "awaiting_cast", "awaiting_confirm"].includes(e.status));
+             "awaiting_cast", "awaiting_confirm", "queued_script"].includes(e.status));
   if (!producing.length && !awaiting.length && !awaitingScript.length
       && !awaitingCast.length) {
     el.innerHTML = ""; return;
@@ -3310,6 +3513,46 @@ function renderCastSelection(data, episodeId) {
   };
 }
 
+function renderQueuedSeriesView(data) {
+  const batch = data.series_batch || {};
+  const source = data.series_source || {};
+  const current = batch.current;
+  const isNext = batch.next && batch.next.episode_id === data.episode.id;
+  app.innerHTML = `<div class="canvas-view queued-series-view">
+    <div class="canvas-toolbar"><button id="queued-back">← 仪表盘</button>
+      <span class="title">《${esc(data.project.title)}》第${data.episode.number}集</span>
+      ${chip(data.episode.status)}</div>
+    <section class="panel queued-series-card">
+      <span class="eyebrow">SERIES QUEUE · ${source.position || "-"}/${source.total || "-"}</span>
+      <h1>${esc(data.episode.title || `第${data.episode.number}集`)}</h1>
+      <p>本集已经从 <b>${esc(source.filename || "多集文档")}</b> 导入，正在等待前一集完整通过。系统不会并行生图。</p>
+      <div class="queued-source-mode">${source.mode === "script"
+        ? "✓ 已识别完整剧本；轮到本集时直接进入剧本审阅"
+        : "✦ 已识别剧情梗概；轮到本集时先由 AI 编写脚本，再进入审阅"}</div>
+      <blockquote>${esc(String(source.source_text || "").replace(/\s+/g, " ").slice(0, 500))}</blockquote>
+      <div class="series-actions">
+        ${current ? `<a class="primary button-link" href="#/episode/${current.episode_id}">先完成当前第${current.episode_number}集 →</a>` : ""}
+        ${!current && isNext ? `<button class="primary" id="queued-start">开始本集</button>` : ""}
+      </div>
+    </section>
+  </div>`;
+  document.getElementById("queued-back").onclick = () => { location.hash = "#/"; };
+  document.getElementById("queued-start")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true; button.textContent = "正在准备…";
+    try {
+      await api("/api/series/next", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ batch_id: batch.id }),
+      });
+      renderCanvasView(data.episode.id);
+    } catch (error) {
+      showToast(error.message, "error");
+      button.disabled = false; button.textContent = "开始本集";
+    }
+  });
+}
+
 async function renderCanvasView(episodeId) {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   let data;
@@ -3319,6 +3562,10 @@ async function renderCanvasView(episodeId) {
 
   const ep = data.episode, sb = data.storyboard, script = data.script;
   topbarRight.innerHTML = chip(ep.status);
+  if (ep.status === "queued_script") {
+    renderQueuedSeriesView(data);
+    return;
+  }
   if (ep.status === "awaiting_script" && script) {
     renderScriptReview(data, episodeId);
     return;
@@ -3329,7 +3576,7 @@ async function renderCanvasView(episodeId) {
   }
   // 制作进行中一律进生产直播页(实况看板+日志+停止),画布留给审阅/成片
   const stable = ["done", "failed", "qc_failed", "created",
-    "awaiting_script", "awaiting_cast", "awaiting_confirm"];
+    "awaiting_script", "awaiting_cast", "awaiting_confirm", "queued_script"];
   if (!stable.includes(ep.status)) {
     renderProductionView(data, episodeId);
     return;

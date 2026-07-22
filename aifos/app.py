@@ -12,6 +12,7 @@ from .ops_center import OpsCenter
 from .production.router import ProviderRouter
 from .project_center import ProjectCenter
 from .qc_center import QcCenter
+from .series_center import SeriesCenter
 from .standard_center import StandardCenter
 from .system_center import Logger, SystemCenter
 
@@ -47,6 +48,7 @@ class App:
         self.system = SystemCenter(self.db, self.logger)
         self.system.ensure_user("admin", "admin")
         self.projects = ProjectCenter(self.db)
+        self.series = SeriesCenter(self.db)
         self.assets = AssetCenter(self.db)
         self.data = DataCenter(self.db)
         self.router = ProviderRouter(self.config, self.db, self.logger)

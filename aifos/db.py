@@ -31,6 +31,42 @@ CREATE TABLE IF NOT EXISTS episodes(
   UNIQUE(project_id, number)
 );
 
+-- 长篇/多集剧本文档的串行生产批次。整批先导入，但任一时刻只激活一集；
+-- 后续集保留在 queued_script，避免并行烧图和跨集连续性失控。
+CREATE TABLE IF NOT EXISTS series_batches(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id),
+  filename TEXT NOT NULL DEFAULT '',
+  source_format TEXT NOT NULL DEFAULT 'text',
+  source_sha256 TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  total INTEGER NOT NULL DEFAULT 0,
+  auto_advance INTEGER NOT NULL DEFAULT 1,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS series_batch_items(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id INTEGER NOT NULL REFERENCES series_batches(id) ON DELETE CASCADE,
+  episode_id INTEGER NOT NULL REFERENCES episodes(id),
+  position INTEGER NOT NULL,
+  source_number INTEGER,
+  source_title TEXT NOT NULL DEFAULT '',
+  mode TEXT NOT NULL DEFAULT 'script',       -- script 已有剧本 / outline 剧情梗概待编剧
+  source_text TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'queued',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  UNIQUE(batch_id, position),
+  UNIQUE(batch_id, episode_id)
+);
+
+CREATE INDEX IF NOT EXISTS series_batch_project_idx
+ON series_batches(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS series_batch_item_episode_idx
+ON series_batch_items(episode_id);
+
 -- 每次生产/续产/重做/打磨的持久运行记录。Web Job 可以随服务重启消失，
 -- production_runs 作为用户可追溯的历史事实源永久保留。
 CREATE TABLE IF NOT EXISTS production_runs(
