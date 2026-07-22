@@ -550,6 +550,8 @@ def _episode_payload(app, episode_id):
         episode_id, "production_standard")
     quality_policy, quality_policy_v = app.projects.latest_document(
         episode_id, "quality_policy")
+    _character_asset_policy, character_asset_policy_v = \
+        app.projects.latest_document(episode_id, "character_asset_policy")
     video_references, video_references_v = app.projects.latest_document(
         episode_id, "video_references")
     series_source, series_source_v = app.projects.latest_document(
@@ -623,6 +625,9 @@ def _episode_payload(app, episode_id):
         "production_standard_version": production_standard_v,
         "quality_policy": normalize_quality_policy(quality_policy),
         "quality_policy_version": quality_policy_v,
+        "character_asset_policy": app.director.character_asset_policy(
+            episode_id, script=script),
+        "character_asset_policy_version": character_asset_policy_v,
         "video_references": video_references or {
             "schema": "aifos.video-references/v1", "shots": {}},
         "video_references_version": video_references_v,
@@ -866,6 +871,8 @@ def make_handler(workspace, jobs):
                     return self._confirm()
                 if parsed.path == "/api/character/select":
                     return self._character_select()
+                if parsed.path == "/api/character/assets-policy":
+                    return self._character_assets_policy()
                 if parsed.path == "/api/character/regenerate":
                     return self._character_regenerate()
                 if parsed.path == "/api/revise":
@@ -1408,6 +1415,38 @@ def make_handler(workspace, jobs):
             except (AifosError, TypeError, ValueError) as exc:
                 return self._error(400, str(exc))
             return self._json(result)
+
+        def _character_assets_policy(self):
+            """保存本集人物扩展资产的自动/简化/完整选择。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            mode = str(body.get("mode") or "").strip().lower()
+            if mode not in ("auto", "simple", "full"):
+                return self._error(
+                    400, "mode 需为 auto、simple 或 full")
+            expected_version = body.get("expected_version")
+            if (isinstance(expected_version, bool)
+                    or not isinstance(expected_version, int)
+                    or expected_version < 0):
+                return self._error(
+                    400, "expected_version 需为页面返回的非负整数，请刷新后重试")
+            title, number = found
+            if jobs.running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，不能中途切换人物资产模式；请先停止生成")
+            try:
+                policy = self._with_app(
+                    lambda app: app.director.update_character_asset_policy(
+                        int(body["episode_id"]), mode,
+                        expected_version=expected_version))
+            except AifosError as exc:
+                return self._error(409, str(exc))
+            return self._json({
+                "policy": policy, "version": policy["version"]})
 
         def _character_regenerate(self):
             """放弃人物定版并重新生成候选,不绕过人物选择门禁。"""

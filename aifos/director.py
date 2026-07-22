@@ -275,6 +275,78 @@ CHARACTER_SHEETS = [
      "服装细节拆解:纹样、扣饰、腰带、鞋履、佩饰逐项放大展示"),
 ]
 
+CHARACTER_ASSET_POLICY_SCHEMA = "aifos.character-assets/v1"
+CHARACTER_ASSET_MODES = ("auto", "simple", "full")
+CHARACTER_ASSET_COMPLEXITY_TOKENS = (
+    "近景", "特写", "微表情", "哭", "舞台", "舞蹈", "打斗", "追逐",
+    "转身", "换装", "制服", "礼服", "群像", "直播", "口型", "演唱",
+    "变身", "非人", "机器人", "妖", "兽",
+)
+
+
+def normalize_character_asset_mode(value):
+    mode = str(value or "auto").strip().lower()
+    if mode not in CHARACTER_ASSET_MODES:
+        raise AifosError(
+            "人物资产模式需为 auto(自动)、simple(仅人物形象图)或 full(完整套件)")
+    return mode
+
+
+def resolve_character_asset_policy(policy=None, script=None):
+    """把用户选择解析为本集实际要不要生成四视图与细节图。"""
+    mode = normalize_character_asset_mode((policy or {}).get("mode"))
+    characters = [
+        character for character in (script or {}).get("characters", [])
+        if not is_background_character(character)
+    ]
+    scenes = list((script or {}).get("scenes", []))
+    locations = {
+        str(scene.get("location") or "").strip()
+        for scene in scenes if str(scene.get("location") or "").strip()
+    }
+    reasons = []
+    if mode == "auto":
+        text = json.dumps(script or {}, ensure_ascii=False)
+        risk_tokens = [token for token in CHARACTER_ASSET_COMPLEXITY_TOKENS
+                       if token in text]
+        if not script:
+            resolved = "full"
+            reasons.append("剧本信息不足，按完整模式保护后续一致性")
+        elif len(characters) > 1:
+            resolved = "full"
+            reasons.append(f"有 {len(characters)} 名需锁定身份的人物")
+        elif len(locations) > 1:
+            resolved = "full"
+            reasons.append(f"人物会跨 {len(locations)} 个场景复用")
+        elif len(scenes) > 2:
+            resolved = "full"
+            reasons.append(f"剧情包含 {len(scenes)} 场，连续性要求较高")
+        elif risk_tokens:
+            resolved = "full"
+            reasons.append("包含高一致性内容：" + "、".join(risk_tokens[:5]))
+        else:
+            resolved = "simple"
+            reasons.append("单人、少场景且无高一致性内容，可只用最终人物形象图")
+    else:
+        resolved = mode
+        if (policy or {}).get("source") == "legacy_migration":
+            reasons.append("旧项目已有完整人物资产计划，保持原有生产行为")
+        else:
+            reasons.append(
+                "用户手动选择仅使用最终人物形象图"
+                if mode == "simple" else "用户手动选择完整人物资产套件")
+    generate_sheets = resolved == "full"
+    return {
+        "schema": CHARACTER_ASSET_POLICY_SCHEMA,
+        "mode": mode,
+        "source": (policy or {}).get("source", "episode"),
+        "resolved_mode": resolved,
+        "generate_sheets": generate_sheets,
+        "sheet_count_per_character": (
+            len(CHARACTER_SHEETS) if generate_sheets else 0),
+        "reasons": reasons,
+    }
+
 IMAGE_ASSET_KINDS = {
     "character_art", "character_sheet", "scene_art", "character_candidate",
     "image", "first_frame", "last_frame", "cover", "reference",
@@ -347,6 +419,87 @@ class Director:
         self.projects.save_document(episode["id"], "quality_policy", policy)
         return policy
 
+    def _episode_character_asset_policy(self, episode_id, *, persist=False):
+        policy, version = self.projects.latest_document(
+            episode_id, "character_asset_policy")
+        default_mode = "auto"
+        source = "episode" if policy is not None else "default"
+        if policy is None:
+            episode = self.projects.get_episode(int(episode_id))
+            project = (self.db.query_one(
+                "SELECT * FROM projects WHERE id=?",
+                (episode["project_id"],)) if episode is not None else None)
+            if episode is not None and project is not None:
+                ctx = {"project": dict(project), "episode": dict(episode),
+                       "out_root": self._episode_dir(project, episode)}
+                plan = self._plan_read(ctx)
+                if any(item.get("category") == "character_sheet"
+                       for item in plan.get("items", [])):
+                    default_mode = "full"
+                    source = "legacy_migration"
+        normalized = {
+            "schema": CHARACTER_ASSET_POLICY_SCHEMA,
+            "mode": normalize_character_asset_mode(
+                (policy or {}).get("mode", default_mode)),
+            "source": (policy or {}).get("source", source),
+        }
+        if persist and policy is None:
+            version = self.projects.save_document(
+                episode_id, "character_asset_policy", normalized)
+        return normalized, version
+
+    def character_asset_policy(self, episode_id, *, script=None,
+                               persist=False):
+        """返回本集人物资产选择及自动判断后的实际执行模式。"""
+        episode = self.projects.get_episode(int(episode_id))
+        if episode is None:
+            raise AifosError("剧集不存在")
+        policy, version = self._episode_character_asset_policy(
+            episode["id"], persist=persist)
+        if script is None:
+            script, _ = self.projects.latest_document(
+                episode["id"], "script")
+        resolved = resolve_character_asset_policy(policy, script)
+        resolved["version"] = version
+        return resolved
+
+    def update_character_asset_policy(self, episode_id, mode,
+                                      expected_version=None):
+        """在人物定版检查点保存自动/简化/完整模式。"""
+        episode = self.projects.get_episode(int(episode_id))
+        if episode is None:
+            raise AifosError("剧集不存在")
+        if episode["status"] != "awaiting_cast":
+            raise AifosError("只能在人物定版阶段调整四视图与细节图")
+        _current, version = self._episode_character_asset_policy(
+            episode["id"])
+        if expected_version is not None:
+            try:
+                expected = int(expected_version)
+            except (TypeError, ValueError):
+                raise AifosError("人物资产设置版本无效")
+            if expected != version:
+                raise AifosError("人物资产设置已在其他页面更新，请刷新后重试")
+        policy = {
+            "schema": CHARACTER_ASSET_POLICY_SCHEMA,
+            "mode": normalize_character_asset_mode(mode),
+            "source": "user",
+            "updated_at": now(),
+        }
+        version = self.projects.save_document_cas(
+            episode["id"], "character_asset_policy", policy, version,
+            allowed_status={"awaiting_cast"}, reject_running=True)
+        if policy["mode"] == "simple":
+            project = self.db.query_one(
+                "SELECT * FROM projects WHERE id=?",
+                (episode["project_id"],))
+            ctx = {"project": dict(project), "episode": dict(episode),
+                   "out_root": self._episode_dir(project, episode)}
+            self._plan_seed(ctx, "character_sheet", [])
+        resolved = self.character_asset_policy(episode["id"])
+        resolved["version"] = version
+        return resolved
+
     # ---- 入口:一句话开工 ----
     def produce(self, project_title, episode_number, premise="", style="",
                 force=False, script=None, pause_for_confirm=False,
@@ -410,6 +563,8 @@ class Director:
             "production_standard": standard_snapshot,
             "production_profile": profile,
             "quality_policy": self._episode_quality_policy(
+                episode["id"], persist=True),
+            "character_asset_policy": self.character_asset_policy(
                 episode["id"], persist=True),
             "run_id": run_id,
         }
@@ -1516,11 +1671,19 @@ class Director:
                "out_root": self._episode_dir(project, episode)}
         plan = self._plan_read(ctx)
         plan_by_id = {item.get("id"): item for item in plan.get("items", [])}
+        asset_policy = self.character_asset_policy(episode["id"])
         rows = self.image_acceleration.list(episode["id"])
         items = []
         for row in rows:
             contract = row.get("contract") or {}
-            item = plan_by_id.get(row["item_id"]) or {}
+            if (row["category"] == "character_sheet"
+                    and not asset_policy["generate_sheets"]):
+                continue
+            item = plan_by_id.get(row["item_id"])
+            # 切换简化模式或刷新计划后，旧人物套件契约仍保留审计历史，
+            # 但绝不能继续出现在可加速队列里。
+            if item is None:
+                continue
             issues = list(contract.get("issues") or [])
             plan_pending = item.get("status") == "pending"
             if row["acceleration_status"] in ("queued", "running"):
@@ -1591,7 +1754,13 @@ class Director:
             raise AifosError("至少选择一张尚未开工的图片")
         if len(unique) > 200:
             raise AifosError("单次最多加速 200 张图片")
-        _project, episode = self._episode_ctx(project_title, episode_number)
+        project, episode = self._episode_ctx(project_title, episode_number)
+        ctx = {"project": dict(project), "episode": dict(episode),
+               "out_root": self._episode_dir(project, episode)}
+        plan = self._plan_read(ctx)
+        plan_by_id = {item.get("id"): item
+                      for item in plan.get("items", [])}
+        asset_policy = self.character_asset_policy(episode["id"])
         rows = {row["item_id"]: row
                 for row in self.image_acceleration.list(episode["id"])}
         expected = contract_tokens or {}
@@ -1606,6 +1775,14 @@ class Director:
                 continue
             contract = row.get("contract") or {}
             issues.extend(contract.get("issues") or [])
+            if (row["category"] == "character_sheet"
+                    and not asset_policy["generate_sheets"]):
+                issues.append("本集使用简化人物资产模式，不生成四视图或细节图")
+            plan_item = plan_by_id.get(item_id)
+            if plan_item is None:
+                issues.append("图片已不在当前生产计划中")
+            elif plan_item.get("status") != "pending":
+                issues.append("图片已不处于当前待生产状态")
             if expected.get(item_id) \
                     and expected[item_id] != row["contract_token"]:
                 issues.append("页面中的提示词/参考图预览已经过期")
@@ -2435,6 +2612,11 @@ class Director:
                 "created": 0, "reused": 0, "scenes": 0,
             }
         ctx["cast_selection"] = selection
+        asset_policy = self.character_asset_policy(
+            ctx["episode"]["id"], script=ctx["script"], persist=True)
+        ctx["character_asset_policy"] = asset_policy
+        sheet_definitions = (
+            CHARACTER_SHEETS if asset_policy["generate_sheets"] else [])
         self._plan_seed(ctx, "character_art", [
             {"id": f"char:{c['name']}", "category": "character_art",
              "label": f"{c['name']}({c.get('role') or '角色'})",
@@ -2458,7 +2640,7 @@ class Director:
                  c["name"], c.get("role", ""), style, label, desc,
                  key=key, design=designs.get(c["name"]))}
             for c in characters
-            for key, label, desc in CHARACTER_SHEETS])
+            for key, label, desc in sheet_definitions])
         self._plan_seed(ctx, "scene_art", [
             {"id": f"scene:{loc}", "category": "scene_art",
              "label": loc, "name": loc,
@@ -2540,7 +2722,7 @@ class Director:
                             if portrait and portrait["uri"]
                             and Path(portrait["uri"]).exists() else None)
             reference = self._reference_uris(project_id, [name])
-            for key, label, desc in CHARACTER_SHEETS:
+            for key, label, desc in sheet_definitions:
                 asset_name = f"{name}:{key}"
                 existing_sheet = self._existing_asset_uri(
                     ctx, "character_sheet", asset_name)
@@ -2595,7 +2777,10 @@ class Director:
         ctx["cast"] = cast
         return {"reused": reused, "created": created,
                 "characters": len(cast),
-                "scenes": len(ctx["script"]["scenes"])}
+                "scenes": len(ctx["script"]["scenes"]),
+                "character_asset_mode": asset_policy["mode"],
+                "character_asset_resolved": asset_policy["resolved_mode"],
+                "character_sheets_per_character": len(sheet_definitions)}
 
     def _scene_locations(self, ctx):
         return {s["scene_no"]: s["location"]
@@ -2674,17 +2859,25 @@ class Director:
                 "label": f"{identity.get('character', '角色')}最终立绘",
                 "uri": identity["uri"],
             })
-        for name in characters or []:
-            row = self.assets.latest(
-                project_id, "character_sheet", f"{name}:turnaround")
-            if (row and formal_reference_allowed(self._asset_quality(row))
-                    and row["uri"] and Path(row["uri"]).exists()):
-                refs["character_refs"].append(row["uri"])
-                refs["asset_matches"].append({
-                    "asset_id": row["id"], "kind": row["kind"],
-                    "name": row["name"], "label": f"{name}四视图",
-                    "uri": row["uri"],
-                })
+        # 简化版即使项目历史里已有四视图，也只以人工锁定最终立绘为身份锚，
+        # 避免旧扩展资产继续偷偷进入提示词与外部 API 参考图。
+        asset_policy = ctx.get("character_asset_policy") or {}
+        if not asset_policy and (ctx.get("episode") or {}).get("id"):
+            asset_policy = self.character_asset_policy(
+                ctx["episode"]["id"], script=ctx.get("script"))
+        include_sheets = asset_policy.get("generate_sheets", True)
+        if include_sheets:
+            for name in characters or []:
+                row = self.assets.latest(
+                    project_id, "character_sheet", f"{name}:turnaround")
+                if (row and formal_reference_allowed(self._asset_quality(row))
+                        and row["uri"] and Path(row["uri"]).exists()):
+                    refs["character_refs"].append(row["uri"])
+                    refs["asset_matches"].append({
+                        "asset_id": row["id"], "kind": row["kind"],
+                        "name": row["name"], "label": f"{name}四视图",
+                        "uri": row["uri"],
+                    })
         if location:
             row = self.assets.latest(project_id, "scene_art", location)
             if (row and formal_reference_allowed(self._asset_quality(row))
@@ -3595,6 +3788,8 @@ class Director:
             "production_standard": standard,
             "production_profile": production_profile(self.config, standard),
             "blocking": blocking,
+            "character_asset_policy": self.character_asset_policy(
+                episode["id"], script=script),
         }
         self._task_cost = 0.0
         self._task_providers = set()
@@ -3628,6 +3823,10 @@ class Director:
                 "最终立绘不能从文字直接重画。请按角色重要度重新生成候选并人工定版，"
                 "或上传经过确认的最终立绘")
         elif kind == "character_sheet":
+            if not ctx["character_asset_policy"]["generate_sheets"]:
+                raise AifosError(
+                    "本集使用简化人物资产模式，不生成四视图或细节图；"
+                    "如确有需要，请在人物定版阶段切换为完整模式")
             raw = target["name"]
             if ":" not in raw:
                 raise AifosError(f"资产名需为 角色:套件键,收到 {raw}")
@@ -4027,6 +4226,8 @@ class Director:
                    "out_root": out_root, "aspect": aspect,
                    "dims": ASPECT_DIMS.get(aspect, ASPECT_DIMS["9:16"]),
                    "script": script, "storyboard": storyboard,
+                   "character_asset_policy": self.character_asset_policy(
+                       episode["id"], script=script),
                    "force": True}
             self.assets.register(project["id"], "image", asset_name,
                                  uri=str(path),

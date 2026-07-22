@@ -115,6 +115,44 @@ class ProjectCenter:
         )
         return version
 
+    def save_document_cas(self, episode_id, kind, content,
+                          expected_version, *, allowed_status=None,
+                          reject_running=False):
+        """原子比较版本并保存，供会与生产任务并发的设置使用。"""
+        with self.db.transaction(immediate=True) as conn:
+            episode = conn.execute(
+                "SELECT status FROM episodes WHERE id=?", (episode_id,)
+            ).fetchone()
+            if episode is None:
+                raise AifosError("剧集不存在")
+            if allowed_status and episode["status"] not in allowed_status:
+                raise AifosError("只能在人物定版阶段调整四视图与细节图")
+            if reject_running:
+                running = conn.execute(
+                    "SELECT 1 FROM production_runs "
+                    "WHERE episode_id=? AND status='running' LIMIT 1",
+                    (episode_id,),
+                ).fetchone()
+                if running is not None:
+                    raise AifosError(
+                        "本集正在生产，不能中途切换人物资产模式；请先停止生成")
+            row = conn.execute(
+                "SELECT COALESCE(MAX(version), 0) AS v FROM documents "
+                "WHERE episode_id=? AND kind=?", (episode_id, kind)
+            ).fetchone()
+            actual = int(row["v"] or 0)
+            if int(expected_version) != actual:
+                raise AifosError(
+                    "人物资产设置已在其他页面更新，请刷新后重试")
+            version = actual + 1
+            conn.execute(
+                "INSERT INTO documents(episode_id, kind, version, content, "
+                "created_at) VALUES(?,?,?,?,?)",
+                (episode_id, kind, version,
+                 json.dumps(content, ensure_ascii=False), now()),
+            )
+        return version
+
     def latest_document(self, episode_id, kind):
         row = self.db.query_one(
             "SELECT * FROM documents WHERE episode_id=? AND kind=? "
