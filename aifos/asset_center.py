@@ -21,8 +21,18 @@ IMAGE_KINDS = (
 
 
 class AssetCenter:
-    def __init__(self, db):
+    def __init__(self, db, on_registered=None):
         self.db = db
+        self.on_registered = on_registered
+
+    def _registered(self, row):
+        """通知非关键旁路；镜像失败绝不能让正式资产登记失败。"""
+        if row is not None and self.on_registered is not None:
+            try:
+                self.on_registered(row)
+            except Exception:
+                pass
+        return row
 
     def acquire(self, project_id, kind, name, uri="", meta=None):
         """复用优先:已有同名资产直接复用(reuse_count+1),否则登记 v1。
@@ -57,8 +67,8 @@ class AssetCenter:
                  json.dumps(meta, ensure_ascii=False) if meta is not None
                  else latest["meta"],
                  latest["id"]))
-            return self.db.query_one(
-                "SELECT * FROM assets WHERE id=?", (latest["id"],))
+            return self._registered(self.db.query_one(
+                "SELECT * FROM assets WHERE id=?", (latest["id"],)))
         version = (latest["version"] + 1) if latest is not None else 1
         self.db.execute(
             "INSERT INTO assets(project_id, kind, name, version, uri, meta, "
@@ -66,9 +76,9 @@ class AssetCenter:
             (project_id, kind, name, version, uri,
              json.dumps(meta or {}, ensure_ascii=False), now()),
         )
-        return self.db.query_one(
+        return self._registered(self.db.query_one(
             "SELECT * FROM assets WHERE project_id=? AND kind=? AND name=? "
-            "AND version=?", (project_id, kind, name, version))
+            "AND version=?", (project_id, kind, name, version)))
 
     def latest(self, project_id, kind, name, include_deleted=False):
         row = self.db.query_one(

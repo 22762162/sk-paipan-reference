@@ -887,6 +887,13 @@ audio.player { background: var(--surface-2); }
 .settings-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 .settings-head h1 { font-size: 20px; }
 .settings-head .hint { color: var(--ink-3); font-size: 13px; }
+.icloud-sync-card { display: grid; gap: 12px; }
+.icloud-sync-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.icloud-sync-head h2 { font-size: 17px; margin: 0 0 4px; }
+.icloud-sync-head p { margin: 0; color: var(--ink-3); font-size: 13px; }
+.icloud-sync-card code { overflow-wrap: anywhere; color: var(--ink-2); }
+.icloud-sync-stats { display: flex; flex-wrap: wrap; gap: 18px; color: var(--ink-2); }
+.icloud-sync-card small { color: var(--ink-3); line-height: 1.5; }
 .dim { color: var(--ink-3); }
 .route-table { width: 100%; }
 .route-table small { margin-left: 6px; }

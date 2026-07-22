@@ -8,6 +8,7 @@ from .data_center import DataCenter
 from .db import Database
 from .director import Director
 from .history_center import HistoryCenter
+from .icloud_sync import ICloudImageSync
 from .ops_center import OpsCenter
 from .production.router import ProviderRouter
 from .project_center import ProjectCenter
@@ -49,7 +50,11 @@ class App:
         self.system.ensure_user("admin", "admin")
         self.projects = ProjectCenter(self.db)
         self.series = SeriesCenter(self.db)
-        self.assets = AssetCenter(self.db)
+        self.icloud_sync = ICloudImageSync(
+            self.config, self.db, self.workspace.artifacts_dir,
+            logger=self.logger)
+        self.assets = AssetCenter(
+            self.db, on_registered=self.icloud_sync.enqueue_asset)
         self.data = DataCenter(self.db)
         self.router = ProviderRouter(self.config, self.db, self.logger)
         self.qc = QcCenter(self.config)
@@ -60,4 +65,5 @@ class App:
             self.workspace.artifacts_dir, standards=self.standards)
 
     def close(self):
+        self.icloud_sync.close()
         self.db.close()

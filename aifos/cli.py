@@ -220,6 +220,11 @@ def _build_parser():
     p_config.add_argument("--chain",
                           help="route 用:调用顺序,逗号分隔,"
                                "如 jimeng,ark,mock")
+
+    p_icloud = sub.add_parser(
+        "icloud", help="iCloud 图片镜像:手机在“文件”App 中直接查看")
+    p_icloud.add_argument(
+        "action", choices=["status", "enable", "disable", "backfill"])
     return parser
 
 
@@ -694,6 +699,35 @@ def _cmd_config(app, args):
     return 0 if report["ok"] else 1
 
 
+def _cmd_icloud(app, args):
+    from .settings import set_icloud_sync
+    if args.action in ("enable", "disable"):
+        enabled = args.action == "enable"
+        set_icloud_sync(app.workspace.config_path, enabled)
+        state = "启用" if enabled else "停用"
+        print(f"已{state} iCloud 图片镜像;下次启动/命令立即生效")
+        return 0
+    if args.action == "status":
+        status = app.icloud_sync.status()
+        state = {
+            "disabled": "未启用", "unavailable": "iCloud 不可用",
+            "partial": "部分失败", "ready": "正常",
+        }.get(status["state"], status["state"])
+        print(f"iCloud 图片镜像: {state}")
+        print(f"目录: {status['display_path']}")
+        print(f"已同步: {status['synced']}  失败: {status['failed']}")
+        if status["last_error"]:
+            print(f"最近错误: {status['last_error']}")
+        return 0 if status["state"] in ("ready", "disabled") else 1
+    report = app.icloud_sync.backfill()
+    print(f"补同步完成: 共{report['total']}张,新增{report['synced']}张,"
+          f"已存在{report['skipped']}张,失败{report['failed']}张,"
+          f"复制 {report['bytes'] / 1024 / 1024:.1f} MB")
+    for error in report.get("errors", [])[:5]:
+        print(f"  ✗ {error}", file=sys.stderr)
+    return 0 if report["status"] == "done" else 1
+
+
 def main(argv=None):
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -848,6 +882,8 @@ def main(argv=None):
             return _cmd_user(app, args)
         if args.command == "config":
             return _cmd_config(app, args)
+        if args.command == "icloud":
+            return _cmd_icloud(app, args)
         if args.command == "doctor":
             return _cmd_doctor(app, args)
         parser.print_help()

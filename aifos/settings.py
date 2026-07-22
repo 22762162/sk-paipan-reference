@@ -127,6 +127,7 @@ def settings_payload(app):
             "parallel_images": app.config.get(
                 "defaults", "parallel_images", default=3),
         },
+        "icloud_sync": app.icloud_sync.status(),
         "config_path": str(app.workspace.config_path),
     }
 
@@ -275,6 +276,16 @@ def set_defaults(config_path, mapping):
     data.setdefault("defaults", {}).update(updates)
     _save_file(config_path, data)
     return updates
+
+
+def set_icloud_sync(config_path, enabled):
+    """启停固定在 iCloud Drive/AIFOS 下的手机图片镜像。"""
+    if not isinstance(enabled, bool):
+        enabled = str(enabled).strip().lower() in ("1", "true", "on", "yes")
+    data = _load_file(config_path)
+    data.setdefault("icloud_sync", {})["enabled"] = enabled
+    _save_file(config_path, data)
+    return {"enabled": enabled}
 
 
 def test_provider(app, name):

@@ -895,6 +895,13 @@ audio.player { background: var(--surface-2); }
 .settings-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 .settings-head h1 { font-size: 20px; }
 .settings-head .hint { color: var(--ink-3); font-size: 13px; }
+.icloud-sync-card { display: grid; gap: 12px; }
+.icloud-sync-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.icloud-sync-head h2 { font-size: 17px; margin: 0 0 4px; }
+.icloud-sync-head p { margin: 0; color: var(--ink-3); font-size: 13px; }
+.icloud-sync-card code { overflow-wrap: anywhere; color: var(--ink-2); }
+.icloud-sync-stats { display: flex; flex-wrap: wrap; gap: 18px; color: var(--ink-2); }
+.icloud-sync-card small { color: var(--ink-3); line-height: 1.5; }
 .dim { color: var(--ink-3); }
 .route-table { width: 100%; }
 .route-table small { margin-left: 6px; }
@@ -6145,6 +6152,32 @@ function qualityPolicyHtml() {
   </section>`;
 }
 
+function icloudSyncHtml(sync = {}) {
+  const states = {
+    disabled: ["", "未启用"], unavailable: ["qc_failed", "iCloud 不可用"],
+    partial: ["qc_failed", "部分失败"], ready: ["done", "同步正常"],
+  };
+  const state = states[sync.state] || ["", sync.state || "未知"];
+  return `<section class="panel icloud-sync-card">
+    <div class="icloud-sync-head">
+      <div><h2>☁️ iCloud 图片同步</h2>
+        <p>生成完成后自动复制到 iCloud Drive/AIFOS，手机“文件”App 可直接查看。</p></div>
+      <span class="chip ${state[0]}">${esc(state[1])}</span>
+    </div>
+    <code>${esc(sync.display_path || "~/Library/Mobile Documents/com~apple~CloudDocs/AIFOS")}</code>
+    <div class="icloud-sync-stats">
+      <span>已复制到 iCloud Drive <b>${Number(sync.synced || 0)}</b> 张</span>
+      <span>失败 <b>${Number(sync.failed || 0)}</b> 张</span>
+    </div>
+    ${sync.last_error ? `<div class="miss">最近错误:${esc(sync.last_error)}</div>` : ""}
+    <div class="pc-actions">
+      <button class="primary" id="btn-icloud-toggle">${sync.enabled ? "停用同步" : "启用同步"}</button>
+      <button id="btn-icloud-backfill" ${sync.enabled && sync.available ? "" : "disabled"}>补同步现有图片</button>
+    </div>
+    <small>只复制正式登记的原图，不复制缩略图、数据库、配置和日志；本地工作区仍是唯一生产源。</small>
+  </section>`;
+}
+
 function providerCostHint(provider) {
   const id = `${provider.name || ""} ${provider.type || ""} ${provider.model || ""}`.toLowerCase();
   if (id.includes("seedream"))
@@ -6175,6 +6208,7 @@ function drawSettings(data) {
       <span class="hint">CLI 点「自动检测」,API 只要粘贴 Key(接口地址已内置官方默认),保存即启用;没配好的环节由内置产线兜底</span>
     </div>
     ${imageCostGuideHtml()}
+    ${icloudSyncHtml(data.icloud_sync)}
     <div class="settings-grid">
       ${data.providers.map(providerCard).join("")}
     </div>
@@ -6201,6 +6235,28 @@ function drawSettings(data) {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+  document.getElementById("btn-icloud-toggle").onclick = async () => {
+    const current = Boolean((data.icloud_sync || {}).enabled);
+    try {
+      const fresh = await post({ icloud_sync: { enabled: !current } });
+      showToast(!current ? "已启用 iCloud 图片同步" : "已停用 iCloud 图片同步", "ok");
+      drawSettings(fresh);
+    } catch (e) { showToast(e.message, "error"); }
+  };
+  document.getElementById("btn-icloud-backfill").onclick = async (ev) => {
+    const btn = ev.currentTarget;
+    btn.disabled = true; btn.textContent = "正在补同步…";
+    try {
+      const report = await api("/api/icloud-sync/backfill", { method: "POST" });
+      showToast(`补同步完成:新增 ${report.synced} 张，失败 ${report.failed} 张`,
+        report.failed ? "error" : "ok");
+      const fresh = await api("/api/settings");
+      drawSettings(fresh);
+    } catch (e) {
+      showToast(e.message, "error");
+      btn.disabled = false; btn.textContent = "补同步现有图片";
+    }
+  };
   document.getElementById("btn-detect").onclick = async (ev) => {
     const btn = ev.target;
     btn.disabled = true; btn.textContent = "检测中…";

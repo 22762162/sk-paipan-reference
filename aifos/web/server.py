@@ -677,6 +677,7 @@ def _overview_payload(app, jobs):
             p["title"]: [dict(r) for r in app.assets.stats(p["id"])]
             for p in app.projects.list_projects()
         },
+        "icloud_sync": app.icloud_sync.status(),
         "jobs": jobs.list(),
         "series_batches": app.series.list_batches(),
     }
@@ -879,6 +880,8 @@ def make_handler(workspace, jobs):
                     return self._settings_test()
                 if parsed.path == "/api/settings/detect":
                     return self._settings_detect()
+                if parsed.path == "/api/icloud-sync/backfill":
+                    return self._icloud_sync_backfill()
                 if parsed.path == "/api/update":
                     return self._update_now()
                 if parsed.path == "/api/redo_mock":
@@ -1501,8 +1504,8 @@ def make_handler(workspace, jobs):
 
         def _settings_update(self):
             """设置中心保存 Provider、能力路由或整套图片策略。"""
-            from ..settings import set_image_strategy, set_routing, \
-                settings_payload, update_provider
+            from ..settings import set_icloud_sync, set_image_strategy, \
+                set_routing, settings_payload, update_provider
             body = self._read_body()
             if body is None:
                 return self._error(400, "请求体不是合法 JSON")
@@ -1519,6 +1522,12 @@ def make_handler(workspace, jobs):
                     from ..settings import set_defaults
                     set_defaults(app.workspace.config_path,
                                  body["defaults"])
+                elif body.get("icloud_sync") is not None:
+                    values = body.get("icloud_sync") or {}
+                    if "enabled" not in values:
+                        raise AifosError("icloud_sync 缺少 enabled")
+                    set_icloud_sync(app.workspace.config_path,
+                                    values["enabled"])
                 elif body.get("capability"):
                     chain = body.get("chain") or []
                     if isinstance(chain, str):
@@ -1527,7 +1536,8 @@ def make_handler(workspace, jobs):
                     set_routing(app.workspace.config_path,
                                 body["capability"], chain)
                 else:
-                    raise AifosError("缺少 provider 或 capability")
+                    raise AifosError(
+                        "缺少 provider、capability 或 icloud_sync")
 
             try:
                 self._with_app(task)
@@ -1535,6 +1545,12 @@ def make_handler(workspace, jobs):
                 return self._error(400, str(exc))
             # 重新加载,回传保存后的完整视图
             return self._json(self._with_app(settings_payload))
+
+        def _icloud_sync_backfill(self):
+            report = self._with_app(lambda app: app.icloud_sync.backfill())
+            if report.get("status") == "disabled":
+                return self._error(409, "请先启用 iCloud 图片同步")
+            return self._json(report)
 
         def _settings_test(self):
             from ..settings import test_provider

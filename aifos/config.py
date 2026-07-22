@@ -16,6 +16,12 @@ DEFAULTS = {
     "defaults": {
         "aspect": "9:16",              # 全局默认画幅(抖音竖屏);项目可设 16:9
     },
+    # 本地 artifacts 是唯一事实源；图片完成并登记后异步复制到 iCloud，
+    # 只供手机/Finder 查看。默认关闭，避免测试或其他 workspace 意外写云盘。
+    "icloud_sync": {
+        "enabled": False,
+        "root": "~/Library/Mobile Documents/com~apple~CloudDocs/AIFOS",
+    },
     # SK 漫剧工业流的项目级硬门槛。每集另存 production_profile，避免
     # workspace 配置改变后无法还原当时使用的生成规格。
     "production": {
