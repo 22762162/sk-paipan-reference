@@ -60,8 +60,8 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260722-image-accel-2" in html
-    assert "/static/app.js?v=20260722-image-accel-2" in html
+    assert "/static/style.css?v=20260722-storyboard-table" in html
+    assert "/static/app.js?v=20260722-storyboard-table" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -109,6 +109,16 @@ def test_index_and_static(server):
     assert "逐张预检所选图片".encode() in app_js
     assert "中 · 默认生产档".encode() in app_js
     assert "人物定版".encode() in app_js
+    assert "分镜头生产表".encode() in app_js
+    for heading in ("序号", "时长", "参考分镜", "首尾帧", "运镜",
+                    "画面描述", "声音", "生产状态"):
+        assert f'<th scope="col">{heading}</th>'.encode() in app_js
+    assert b"shotProductionTableHtml(data" in app_js
+    assert b"bindShotProductionTable(app, data)" in app_js
+    assert b"missing-keyframe" in app_js
+    assert b"missing-frames" in app_js
+    assert b"missing-video" in app_js
+    assert b"storyboardLineNo(data, shot)" in app_js
     status, ctype, style_css = _request(
         server["port"], "GET", "/static/style.css")
     assert status == 200 and "css" in ctype
@@ -120,6 +130,10 @@ def test_index_and_static(server):
     assert b".acceleration-panel" in style_css
     assert b".image-accel-livebar" in style_css
     assert b".accel-gates" in style_css
+    assert b".shot-production-table" in style_css
+    assert b".storyboard-table-row" in style_css
+    assert b".storyboard-frame-pair" in style_css
+    assert b".storyboard-status-stack" in style_css
     status, ctype, raw = _request(
         server["port"], "GET", "/manifest.webmanifest")
     assert status == 200 and "application/manifest+json" in ctype

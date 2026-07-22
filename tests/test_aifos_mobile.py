@@ -41,6 +41,11 @@ def test_mobile_ui_contract_and_pwa_registration():
     assert "env(safe-area-inset-bottom)" in css
     assert "grid-template-columns: repeat(5" in css
     assert "min-height: 44px" in css
-    assert 'serviceWorker.register("/sw.js")' in js
+    assert ".shot-production-table thead" in css
+    assert ".storyboard-table-row > [data-label]::before" in css
+    assert ".storyboard-frame-pair" in css
+    assert "scroll-snap-type: x mandatory" in css
+    assert 'serviceWorker.register("/sw.js",' in js
+    assert 'updateViaCache: "none"' in js
     assert "/api/access" in js
     assert "beforeinstallprompt" in js

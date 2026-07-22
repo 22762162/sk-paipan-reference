@@ -3826,6 +3826,9 @@ function canvasSig(data) {
     (data.tasks || []).map((t) => [t.stage, t.status]),
     data.script_version, data.storyboard_version,
     Object.values((data.artifacts || {}).images || {}),
+    Object.values((data.artifacts || {}).first || {}),
+    Object.values((data.artifacts || {}).last || {}),
+    Object.entries((data.artifacts || {}).video_audio || {}),
     Object.values((data.artifacts || {}).videos || {}),
     ((data.artifacts || {}).cast_art || []).map((c) => c.url),
     ((data.artifacts || {}).scene_art || []).map((x) => x.url),
@@ -4159,7 +4162,7 @@ async function renderCanvasView(episodeId) {
       <span class="hint">质检 ${ep.qc_score == null ? "-" : fmt(ep.qc_score, 0)} 分 · 成本 ${fmt(ep.cost)}</span>
       <span class="spacer"></span>
       <div class="zoom-group view-toggle">
-        <button id="view-theater">🎬 剧场</button>
+        <button id="view-theater">📋 分镜表</button>
         <button id="view-canvas">🗺 画布</button>
       </div>
       <button id="btn-play" class="primary">▶ 播放本集</button>
@@ -4252,7 +4255,7 @@ async function renderCanvasView(episodeId) {
   canvas.mount();
   renderTheater(data, canvas);
 
-  // 剧场(影视站观感,默认)/ 自由画布 双视图
+  // 分镜生产表(默认)/ 自由画布双视图；播放器仍从表头和逐镜按钮进入。
   const theaterEl = document.getElementById("theater");
   const viewportEl = document.getElementById("viewport");
   const timelineEl = document.getElementById("timeline");
@@ -4338,7 +4341,12 @@ function renderProductionView(data, episodeId) {
       </div>
       <div class="produce-main">
         ${imageAccelerationLivebarHtml(data)}
-        ${renderPlanBoardHtml(data)}
+        ${data.storyboard ? `${shotProductionTableHtml(data, {
+          shotIssues: storyboardShotIssues(data), context: "live" })}
+          <details class="asset-production-details">
+            <summary>🖼 查看人物、场景及全部图片资产生产清单</summary>
+            ${renderPlanBoardHtml(data)}
+          </details>` : renderPlanBoardHtml(data)}
         ${data.script ? `<div class="script-review">
           <div class="dim" style="margin-bottom:6px">📖 剧本已就绪,可边生产边阅读:</div>
           ${scriptBodyHtml(data.script)}
@@ -4356,6 +4364,7 @@ function renderProductionView(data, episodeId) {
   };
   updateLiveStrip(data);
   bindPlanSelection(app, data, episodeId);
+  bindShotProductionTable(app, data);
   startLiveTicker(episodeId);
   pollCanvas(episodeId);
 }
@@ -4693,22 +4702,312 @@ function renderRecoveryView(data, episodeId) {
   };
 }
 
-/* ---- 剧场模式:Hero 横幅 + 人物条 + 每场一条横向镜头海报行 ---- */
+function storyboardShotIssues(data) {
+  const byShot = {};
+  (data.qc_report?.issues || []).forEach((issue) => {
+    if (issue.shot_no == null) return;
+    (byShot[issue.shot_no] = byShot[issue.shot_no] || []).push(issue);
+  });
+  return byShot;
+}
+
+function storyboardLineNo(data, shot) {
+  if (!shot.dialogue) return null;
+  let lineNo = 0;
+  for (const scene of (data.script?.scenes || [])) {
+    for (const line of (scene.lines || [])) {
+      lineNo += 1;
+      if (scene.scene_no === shot.scene_no
+          && line.character === shot.dialogue.character
+          && line.dialogue === (shot.dialogue_source || shot.dialogue.dialogue))
+        return lineNo;
+    }
+  }
+  return null;
+}
+
+function storyboardPlanState(data, category, shotNo, complete) {
+  if (complete) return { status: "done", label: "已生成" };
+  const item = (((data.render_plan || {}).items) || []).find((row) =>
+    row.category === category && Number(row.shot_no) === Number(shotNo));
+  const status = item?.status || "pending";
+  return { status, label: PLAN_STATUS_CN[status] || "待生成" };
+}
+
+function storyboardStateClass(status) {
+  return ["done", "reused", "generating", "pending", "failed"].includes(status)
+    ? status : "pending";
+}
+
+function storyboardMediaThumb(url, label, shotNo, state) {
+  const status = storyboardStateClass(state.status);
+  if (!url) return `<div class="storyboard-media-empty state-${status}">
+    <span>${esc(label)}</span><b>${esc(state.label)}</b></div>`;
+  return `<button type="button" class="storyboard-media-button"
+    data-image-url="${esc(url)}" data-image-title="镜头 ${shotNo} · ${esc(label)}"
+    aria-label="放大镜头 ${shotNo} 的${esc(label)}">
+    <img src="${esc(thumbUrl(url, 260))}" loading="lazy"
+      alt="镜头 ${shotNo} ${esc(label)}">
+    <span>${esc(label)}</span></button>`;
+}
+
+function storyboardCameraHtml(shot) {
+  const design = shot.five_dimensions?.camera_design || {};
+  const movement = design.movement || shot.shot_contract?.["运镜"] || "";
+  const specs = [design.shot_scale, design.angle, design.lens,
+    design.camera_position].filter(Boolean);
+  if (!movement && !specs.length)
+    return `<p>${esc(typeof shot.camera === "string" ? shot.camera : "未填写")}</p>`;
+  return `<div class="storyboard-camera">
+    <b>${esc(movement || "固定")}</b>
+    ${specs.length ? `<span>${esc(specs.join(" · "))}</span>` : ""}
+    ${design.movement_motivation
+      ? `<small>动机：${esc(design.movement_motivation)}</small>` : ""}
+    ${shot.camera && !specs.length ? `<small>${esc(String(shot.camera))}</small>` : ""}
+  </div>`;
+}
+
+function storyboardCharacterHtml(shot) {
+  const map = shot.character_number_map || {};
+  const ids = shot.character_number_ids || Object.keys(map);
+  const rows = ids.map((id) => map[id]).filter(Boolean);
+  const names = shot.characters || [];
+  const expected = Number(shot.character_count ?? names.length);
+  const mismatch = expected !== names.length;
+  const labels = rows.length
+    ? rows.map((row) => row.display_label || `${row.actor_id || ""} ${row.name || ""}`)
+    : names;
+  return `<div class="storyboard-cast ${mismatch ? "mismatch" : ""}">
+    ${labels.map((label) => `<span>${esc(label)}</span>`).join("")
+      || `<span>无出场人物</span>`}
+    <small>${expected} 人${mismatch ? ` · 名单实际 ${names.length} 人` : " · 人数已锁"}</small>
+  </div>`;
+}
+
+function storyboardSoundHtml(data, shot) {
+  const art = data.artifacts || {};
+  const sound = shot.sound_design || {};
+  const lineNo = storyboardLineNo(data, shot);
+  const hasVideo = !!(art.videos || {})[shot.shot_no];
+  const videoAudio = art.video_audio || {};
+  const hasAudioEvidence = Object.prototype.hasOwnProperty.call(
+    videoAudio, shot.shot_no);
+  const integratedVoice = hasAudioEvidence
+    ? !!videoAudio[shot.shot_no]
+    : data.production_profile?.voice === "jimeng_builtin";
+  const voiceReady = !shot.dialogue || (integratedVoice
+    ? hasVideo : (lineNo != null && !!(art.voices || {})[lineNo]));
+  return `<div class="storyboard-sound">
+    ${shot.dialogue ? `<div class="storyboard-dialogue"><b>${esc(shot.dialogue.character)}</b>
+      <span>「${esc(shot.dialogue.dialogue)}」</span></div>`
+      : `<span class="storyboard-no-dialogue">无对白</span>`}
+    <dl>
+      <div><dt>环境</dt><dd>${esc(sound.environment
+        || shot.shot_contract?.["音效"] || "未填写")}</dd></div>
+      ${sound.effects ? `<div><dt>拟音</dt><dd>${esc(sound.effects)}</dd></div>` : ""}
+      ${sound.music ? `<div><dt>音乐</dt><dd>${esc(sound.music)}</dd></div>` : ""}
+    </dl>
+    ${shot.dialogue ? `<span class="storyboard-status state-${voiceReady ? "done" : "pending"}">
+      ${voiceReady ? "✓ 配音/口型已就绪" : "○ 待随视频生成配音/口型"}</span>` : ""}
+  </div>`;
+}
+
+function storyboardStatusHtml(data, shot, issues, context) {
+  const art = data.artifacts || {};
+  const no = shot.shot_no;
+  const hasImage = !!(art.images || {})[no];
+  const hasFirst = !!(art.first || {})[no];
+  const hasLast = !!(art.last || {})[no];
+  const hasVideo = !!(art.videos || {})[no];
+  const imageState = storyboardPlanState(data, "shot_image", no, hasImage);
+  const frameState = storyboardPlanState(data, "frames", no, hasFirst && hasLast);
+  const readable = shot.readable_text || {};
+  return `<div class="storyboard-status-stack">
+    <span class="storyboard-status state-${storyboardStateClass(imageState.status)}">
+      参考分镜 · ${esc(imageState.label)}</span>
+    <span class="storyboard-status state-${storyboardStateClass(frameState.status)}">
+      首尾帧 · ${hasFirst && hasLast ? "已齐" : esc(frameState.label)}</span>
+    <span class="storyboard-status state-${hasVideo ? "done" : "pending"}">
+      视频 · ${hasVideo ? "已生成" : "待生成"}</span>
+    ${readable.required ? `<span class="storyboard-status state-${readable.keyframe_uri ? "done" : "pending"}">
+      文字 · ${readable.keyframe_uri ? "已锁定" : "待锁定"}</span>` : ""}
+    ${issues.length ? `<span class="storyboard-status state-failed">⚠ 质检问题 ${issues.length}</span>`
+      : `<span class="storyboard-status state-done">质检 · 暂无问题</span>`}
+    ${context === "review" ? `<button type="button" class="shot-table-detail"
+      data-shot-detail="${no}">查看完整合同</button>` : ""}
+    <button type="button" class="shot-table-play" data-shot-play="${no}">
+      ▶ ${hasVideo ? "播放本镜" : "预览本镜"}</button>
+  </div>`;
+}
+
+function shotProductionTableHtml(data, options = {}) {
+  const shots = data.storyboard?.shots || [];
+  if (!shots.length) return "";
+  const art = data.artifacts || {};
+  const issuesByShot = options.shotIssues || storyboardShotIssues(data);
+  const context = options.context || "review";
+  const aspectClass = data.project.aspect === "16:9" ? "landscape" : "portrait";
+  const sceneOf = (no) => (data.script?.scenes || []).find(
+    (scene) => scene.scene_no === no) || {};
+  const sceneNos = [...new Set(shots.map((shot) => shot.scene_no))];
+  const completeImages = shots.filter((shot) => !!(art.images || {})[shot.shot_no]).length;
+  const completeFrames = shots.filter((shot) => (art.first || {})[shot.shot_no]
+    && (art.last || {})[shot.shot_no]).length;
+  const completeVideos = shots.filter((shot) => !!(art.videos || {})[shot.shot_no]).length;
+  const bodies = sceneNos.map((sceneNo) => {
+    const scene = sceneOf(sceneNo);
+    const sceneShots = shots.filter((shot) => shot.scene_no === sceneNo);
+    const duration = sceneShots.reduce((sum, shot) => sum + Number(shot.duration || 0), 0);
+    return `<tbody data-storyboard-scene="${esc(sceneNo)}">
+      <tr class="storyboard-scene-row" data-scene-heading="${esc(sceneNo)}">
+        <th colspan="8" scope="rowgroup">场 ${esc(sceneNo)} · ${esc(scene.location || "")}
+          <span>${fmt(duration, 1)}s · ${sceneShots.length} 镜</span></th></tr>
+      ${sceneShots.map((shot) => {
+        const no = shot.shot_no;
+        const issues = issuesByShot[no] || [];
+        const imageState = storyboardPlanState(data, "shot_image", no,
+          !!(art.images || {})[no]);
+        const frameState = storyboardPlanState(data, "frames", no,
+          !!(art.first || {})[no] && !!(art.last || {})[no]);
+        const description = shot.description || shot.shot_contract?.["画面内容描述"]
+          || shot.five_dimensions?.subject_motion || shot.prompt || "未填写";
+        return `<tr class="storyboard-table-row" data-shot="${no}" data-scene="${esc(sceneNo)}"
+          data-missing-keyframe="${(art.images || {})[no] ? "0" : "1"}"
+          data-missing-frames="${(art.first || {})[no] && (art.last || {})[no] ? "0" : "1"}"
+          data-missing-video="${(art.videos || {})[no] ? "0" : "1"}"
+          data-has-issues="${issues.length ? "1" : "0"}">
+          <th scope="row" class="storyboard-sequence" data-label="序号">
+            <b>#${String(no).padStart(2, "0")}</b>
+            <span>${esc(shot.unit_id || `S${no}`)}</span>
+            <small>场 ${esc(sceneNo)} · ${esc(shot.shot_function || shot.kind || "镜头")}</small>
+          </th>
+          <td class="storyboard-duration" data-label="时长">
+            <b>${fmt(shot.duration, 1)}s</b><span>${esc(shot.timecode || "时间码未填")}</span></td>
+          <td class="storyboard-reference" data-label="参考分镜">
+            ${storyboardMediaThumb((art.images || {})[no], "参考分镜", no, imageState)}</td>
+          <td class="storyboard-frames" data-label="首尾帧"><div class="storyboard-frame-pair">
+            ${storyboardMediaThumb((art.first || {})[no], "首帧", no, frameState)}
+            ${storyboardMediaThumb((art.last || {})[no], "尾帧", no, frameState)}
+          </div></td>
+          <td class="storyboard-movement" data-label="运镜">${storyboardCameraHtml(shot)}</td>
+          <td class="storyboard-description" data-label="画面描述">
+            <p>${esc(description)}</p>${storyboardCharacterHtml(shot)}
+            <details><summary>连续性与剧本依据</summary>
+              <div><b>起：</b>${esc(stateInline(shot.start_state))}</div>
+              <div><b>止：</b>${esc(stateInline(shot.end_state))}</div>
+              <div><b>剧本：</b>${esc(shot.script_reference || "未填写")}</div>
+              <div><b>视觉钩子：</b>${esc(shot.visual_hook || "未填写")}</div>
+            </details></td>
+          <td class="storyboard-sound-cell" data-label="声音">${storyboardSoundHtml(data, shot)}</td>
+          <td class="storyboard-production-status" data-label="生产状态">
+            ${storyboardStatusHtml(data, shot, issues, context)}</td>
+        </tr>`;
+      }).join("")}
+    </tbody>`;
+  }).join("");
+  return `<section class="shot-production-section ${aspectClass}" data-shot-table-context="${esc(context)}">
+    <div class="shot-production-heading">
+      <div><h2>📋 分镜头生产表</h2>
+        <p>逐镜核对参考分镜、首尾帧、运镜、画面、声音和生产门禁。</p></div>
+      <div class="shot-production-progress">
+        <span>参考分镜 ${completeImages}/${shots.length}</span>
+        <span>首尾帧 ${completeFrames}/${shots.length}</span>
+        <span>视频 ${completeVideos}/${shots.length}</span>
+      </div>
+      <label class="shot-table-filter-label">筛选
+        <select class="shot-table-filter">
+          <option value="all">全部镜头</option>
+          <option value="missing-keyframe">缺参考分镜</option>
+          <option value="missing-frames">缺首尾帧</option>
+          <option value="missing-video">缺视频</option>
+          <option value="issues">有质检问题</option>
+        </select></label>
+    </div>
+    <div class="shot-table-filter-summary" aria-live="polite">显示全部 ${shots.length} 个镜头</div>
+    <div class="shot-production-table-wrap" role="region"
+      aria-label="分镜头生产表，可横向滚动" tabindex="0">
+      <table class="shot-production-table">
+        <caption>本集逐镜生产合同与产物状态</caption>
+        <colgroup><col class="col-sequence"><col class="col-duration">
+          <col class="col-reference"><col class="col-frames"><col class="col-movement">
+          <col class="col-description"><col class="col-sound"><col class="col-status"></colgroup>
+        <thead><tr><th scope="col">序号</th><th scope="col">时长</th>
+          <th scope="col">参考分镜</th><th scope="col">首尾帧</th><th scope="col">运镜</th>
+          <th scope="col">画面描述</th><th scope="col">声音</th><th scope="col">生产状态</th></tr></thead>
+        ${bodies}
+      </table>
+    </div>
+  </section>`;
+}
+
+function bindShotProductionTable(root, data, onSelect) {
+  root.querySelectorAll(".storyboard-media-button").forEach((button) => {
+    button.onclick = (event) => {
+      event.stopPropagation();
+      showImageLightbox(button.dataset.imageUrl, button.dataset.imageTitle);
+    };
+  });
+  root.querySelectorAll(".shot-table-detail").forEach((button) => {
+    button.onclick = (event) => {
+      event.stopPropagation();
+      if (onSelect) onSelect(Number(button.dataset.shotDetail));
+    };
+  });
+  root.querySelectorAll(".shot-table-play").forEach((button) => {
+    button.onclick = (event) => {
+      event.stopPropagation();
+      openPlayer(data, Number(button.dataset.shotPlay));
+    };
+  });
+  if (onSelect) root.querySelectorAll(".storyboard-table-row").forEach((row) => {
+    row.tabIndex = 0;
+    row.onclick = (event) => {
+      if (event.target.closest("button, a, details, summary")) return;
+      onSelect(Number(row.dataset.shot));
+    };
+    row.onkeydown = (event) => {
+      if (["Enter", " "].includes(event.key)) {
+        event.preventDefault(); onSelect(Number(row.dataset.shot));
+      }
+    };
+  });
+  root.querySelectorAll(".shot-production-section").forEach((section) => {
+    const filter = section.querySelector(".shot-table-filter");
+    const summary = section.querySelector(".shot-table-filter-summary");
+    const rows = [...section.querySelectorAll(".storyboard-table-row")];
+    if (!filter) return;
+    filter.onchange = () => {
+      const key = filter.value;
+      let visible = 0;
+      rows.forEach((row) => {
+        const show = key === "all"
+          || (key === "missing-keyframe" && row.dataset.missingKeyframe === "1")
+          || (key === "missing-frames" && row.dataset.missingFrames === "1")
+          || (key === "missing-video" && row.dataset.missingVideo === "1")
+          || (key === "issues" && row.dataset.hasIssues === "1");
+        row.hidden = !show;
+        if (show) visible += 1;
+      });
+      section.querySelectorAll("[data-storyboard-scene]").forEach((body) => {
+        const heading = body.querySelector(".storyboard-scene-row");
+        if (heading) heading.hidden = ![...body.querySelectorAll(".storyboard-table-row")]
+          .some((row) => !row.hidden);
+      });
+      summary.textContent = `显示 ${visible}/${rows.length} 个镜头`;
+    };
+  });
+}
+
+/* ---- 分镜生产表:Hero 横幅 + 人物条 + 逐镜生产合同 ---- */
 function renderTheater(data, canvas) {
   const el = document.getElementById("theater");
   const art = data.artifacts;
   const script = data.script;
   const shots = data.storyboard.shots;
-  const aspect = data.project.aspect || "9:16";
   const hero = art.cover || art.images[shots[0] && shots[0].shot_no] || "";
   const total = shots.reduce((a, s) => a + s.duration, 0);
   const kindCN = { drama: "剧情短剧", idol: "AI虚拟偶像" }[data.project.kind]
     || data.project.kind;
-  const sceneOf = (no) => script.scenes.find((s) => s.scene_no === no) || {};
-  const rows = [...new Set(shots.map((s) => s.scene_no))].map((no) => ({
-    scene: sceneOf(no),
-    shots: shots.filter((s) => s.scene_no === no),
-  }));
   el.innerHTML = `
     <div class="hero" style="background-image:url('${hero.replace(/'/g, "%27")}')">
       <div class="hero-content">
@@ -4738,25 +5037,8 @@ function renderTheater(data, canvas) {
           <figcaption>${esc(c.name)}</figcaption>
         </figure>`).join("")}
     </div>` : ""}
-    ${rows.map(({ scene, shots: ss }) => `
-    <section class="scene-row">
-      <h3>场 ${scene.scene_no} · ${esc(scene.location || "")}
-        <span>${fmt(ss.reduce((a, s) => a + s.duration, 0), 1)}s · ${ss.length} 镜</span></h3>
-      <div class="row-scroll">
-        ${ss.map((s) => `
-        <div class="t-card ${aspect === "16:9" ? "landscape" : ""}" data-shot="${s.shot_no}">
-          ${art.images[s.shot_no]
-            ? `<img src="${esc(art.images[s.shot_no])}" alt="镜头${s.shot_no}" loading="lazy">`
-            : `<div class="t-empty">画面生成中</div>`}
-          <button class="t-detail" data-shot="${s.shot_no}" title="镜头详情">ⓘ</button>
-          <div class="t-play">▶</div>
-          <div class="t-info">
-            <b>#${String(s.shot_no).padStart(2, "0")}</b> ${esc(s.camera || "")} · ${fmt(s.duration, 1)}s
-            ${s.dialogue ? `<div class="t-line">${esc(s.dialogue.character)}:${esc(s.dialogue.dialogue)}</div>` : ""}
-          </div>
-        </div>`).join("")}
-      </div>
-    </section>`).join("")}`;
+    ${shotProductionTableHtml(data, {
+      shotIssues: canvas.shotIssues, context: "review" })}`;
 
   el.querySelector("#hero-play").onclick = () => openPlayer(data);
   el.querySelector("#hero-script").onclick = () =>
@@ -4765,16 +5047,7 @@ function renderTheater(data, canvas) {
   el.querySelector("#hero-rename").onclick = () =>
     renameProject(data.project.title,
       () => renderCanvasView(data.episode.id));
-  el.querySelectorAll(".t-card").forEach((card) => {
-    card.addEventListener("click", () =>
-      openPlayer(data, Number(card.dataset.shot)));
-  });
-  el.querySelectorAll(".t-detail").forEach((btn) => {
-    btn.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      canvas.select(Number(btn.dataset.shot));
-    });
-  });
+  bindShotProductionTable(el, data, (shotNo) => canvas.select(shotNo));
 }
 
 class StoryboardCanvas {
@@ -5067,17 +5340,7 @@ class StoryboardCanvas {
   }
 
   lineNoOf(shot) {
-    if (!shot.dialogue) return null;
-    let n = 0;
-    for (const scene of this.data.script.scenes) {
-      for (const line of scene.lines) {
-        n += 1;
-        if (scene.scene_no === shot.scene_no &&
-            line.character === shot.dialogue.character &&
-            line.dialogue === (shot.dialogue_source || shot.dialogue.dialogue)) return n;
-      }
-    }
-    return null;
+    return storyboardLineNo(this.data, shot);
   }
 
   /* ---- 交互:平移 / 缩放 / 拖拽卡片 / 选中 ---- */
@@ -5189,6 +5452,8 @@ class StoryboardCanvas {
     this.selected = shotNo;
     this.world.querySelectorAll(".shot-card").forEach((c) =>
       c.classList.toggle("selected", Number(c.dataset.shot) === shotNo));
+    document.querySelectorAll(".storyboard-table-row").forEach((row) =>
+      row.classList.toggle("selected", Number(row.dataset.shot) === shotNo));
     this.renderSidePanel(shotNo);
   }
 }
