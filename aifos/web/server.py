@@ -40,7 +40,8 @@ from ..asset_center import IMAGE_KINDS
 from ..updater import (check_and_update, current_build, repo_root,
                        restart_process, start_auto_updater)
 from ..errors import AifosError
-from ..quality_policy import normalize_quality, normalize_quality_policy
+from ..quality_policy import (normalize_aspect, normalize_quality,
+                               normalize_quality_policy)
 from ..smart_input import resolve_produce_target
 from ..standard_center import StandardConflictError, StandardValidationError
 
@@ -152,7 +153,7 @@ class JobRegistry:
 
     def start(self, title, number, premise="", style="", force=False,
               script=None, review=False, kind=None, action="produce",
-              unique=False):
+              unique=False, aspect=""):
         """启动生产；unique=True 时同一集重复提交复用正在运行的任务。
 
         检查、创建历史和登记 job 必须处在同一把锁内，否则两个浏览器标签
@@ -171,6 +172,7 @@ class JobRegistry:
                 title, number, action, force=force,
                 request={"premise": premise, "style": style,
                          "review": bool(review), "kind": kind,
+                         "aspect": aspect or "",
                          "script_supplied": script is not None})
             self._seq += 1
             job_id = f"j{self._seq}"
@@ -184,7 +186,7 @@ class JobRegistry:
             return app.director.produce(
                 title, number, premise=premise, style=style, force=force,
                 script=script, pause_for_confirm=review, kind=kind,
-                run_id=run_id)
+                run_id=run_id, aspect=aspect)
 
         self._run(job_id, task)
         return job_id
@@ -1257,6 +1259,11 @@ def make_handler(workspace, jobs):
             self.wfile.write(data)
 
         def _series_request(self, body):
+            raw_aspect = body.get("aspect", "")
+            if str(raw_aspect or "").strip():
+                body["aspect"] = normalize_aspect(raw_aspect, field="aspect")
+            else:
+                body["aspect"] = ""
             filename = str(body.get("filename") or "").strip()
             encoded = body.get("data_base64")
             if not filename or not isinstance(encoded, str) or not encoded:
@@ -1330,7 +1337,8 @@ def make_handler(workspace, jobs):
                         kind=(body.get("kind")
                               if body.get("kind") in ("drama", "idol")
                               else None),
-                        auto_advance=body.get("auto_advance", True)))
+                        auto_advance=body.get("auto_advance", True),
+                        aspect=body.get("aspect", "")))
                 step = None
                 job_id = None
                 if body.get("start_first", True):
@@ -1407,6 +1415,14 @@ def make_handler(workspace, jobs):
                         body["script_text"], title, int(number))
                 except ScriptImportError as exc:
                     return self._error(400, str(exc))
+            aspect = body.get("aspect", "")
+            if str(aspect or "").strip():
+                try:
+                    aspect = normalize_aspect(aspect, field="aspect")
+                except AifosError as exc:
+                    return self._error(400, str(exc))
+            else:
+                aspect = ""
             # Web 端默认走「预生产 → 确认 → 自动生产」流程
             job_id = jobs.start(
                 title, int(number),
@@ -1420,7 +1436,7 @@ def make_handler(workspace, jobs):
                 action=("force_rebuild" if body.get("force") else
                         "script_import" if script is not None else
                         "produce"),
-                unique=True)
+                unique=True, aspect=aspect)
             return self._json(
                 {"job_id": job_id, "title": title,
                  "episode": int(number), "note": note}, status=202)
@@ -1444,12 +1460,13 @@ def make_handler(workspace, jobs):
                     "SELECT * FROM projects WHERE id=?",
                     (episode["project_id"],))
                 return (project["title"], episode["number"],
-                        episode["status"], project["id"], episode["id"])
+                        episode["status"], project["id"], episode["id"],
+                        project["aspect"])
 
             found = self._with_app(lookup)
             if found is None:
                 return self._error(404, "剧集不存在")
-            title, number, status, project_id, found_episode_id = found
+            title, number, status, project_id, found_episode_id, current_aspect = found
             running = jobs.running_for(title, number)
             if running:
                 return self._json({
@@ -1485,6 +1502,28 @@ def make_handler(workspace, jobs):
                             video_default=video_quality))
                 except AifosError as exc:
                     return self._error(400, str(exc))
+            requested_aspect = body.get("aspect")
+            if str(requested_aspect or "").strip():
+                try:
+                    requested_aspect = normalize_aspect(
+                        requested_aspect, field="aspect")
+                except AifosError as exc:
+                    return self._error(400, str(exc))
+            else:
+                requested_aspect = ""
+            rebuild_for_aspect = False
+            if requested_aspect:
+                effective_current_aspect = current_aspect or "9:16"
+                if requested_aspect != effective_current_aspect:
+                    rebuild_for_aspect = status == "awaiting_confirm"
+                    self._with_app(
+                        lambda app: app.projects.update_project(
+                            title, aspect=requested_aspect))
+                elif not current_aspect:
+                    # 旧项目空值等价于默认竖屏；规范化保存但不重建。
+                    self._with_app(
+                        lambda app: app.projects.update_project(
+                            title, aspect=effective_current_aspect))
             if status == "awaiting_cast":
                 selection = self._with_app(
                     lambda app: app.director.character_selection_status(
@@ -1499,13 +1538,19 @@ def make_handler(workspace, jobs):
             # 开拍确认 → 自动完成视频/配音/剪辑/质检
             job_id = jobs.start(
                 title, number,
+                force=rebuild_for_aspect,
                 review=(status in ("awaiting_script", "awaiting_cast")),
-                action=("confirm_script" if status == "awaiting_script"
+                aspect=requested_aspect,
+                action=("change_aspect_rebuild" if rebuild_for_aspect
+                        else "confirm_script" if status == "awaiting_script"
                         else "confirm_cast" if status == "awaiting_cast"
                         else "confirm_preflight"),
                 unique=True)
             return self._json(
-                {"job_id": job_id, "phase": status}, status=202)
+                {"job_id": job_id, "phase": status,
+                 "rebuild": rebuild_for_aspect,
+                 "aspect": requested_aspect or current_aspect or "9:16"},
+                status=202)
 
         def _character_select(self):
             body = self._read_body()

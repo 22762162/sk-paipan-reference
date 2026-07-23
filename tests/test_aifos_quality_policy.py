@@ -3,7 +3,10 @@
 import pytest
 
 from aifos.quality_policy import (
+    ASPECT_PRESETS,
+    aspect_dimensions,
     formal_reference_allowed,
+    normalize_aspect,
     normalize_quality_policy,
     recommend_asset_quality,
     recommend_shot_image_quality,
@@ -11,6 +14,29 @@ from aifos.quality_policy import (
     resolve_video_quality,
     set_policy_choices,
 )
+
+
+@pytest.mark.parametrize(("value", "expected", "dims"), [
+    ("", "9:16", (1080, 1920)),
+    ("portrait", "9:16", (1080, 1920)),
+    ("16:9", "16:9", (1920, 1080)),
+    ("1:1", "1:1", (1080, 1080)),
+    ("4:3", "4:3", (1440, 1080)),
+    ("3:4", "3:4", (1080, 1440)),
+    ("21:9", "21:9", (2520, 1080)),
+])
+def test_seedance_aspect_presets(value, expected, dims):
+    if value == "":
+        assert aspect_dimensions(value) == {"width": 1080, "height": 1920}
+    else:
+        assert normalize_aspect(value) == expected
+        assert tuple(aspect_dimensions(value).values()) == dims
+    assert expected in ASPECT_PRESETS
+
+
+def test_invalid_aspect_is_rejected():
+    with pytest.raises(Exception, match="aspect"):
+        normalize_aspect("2:7")
 
 
 def _shot(**updates):
@@ -70,4 +96,3 @@ def test_low_quality_is_never_a_formal_video_reference():
     assert formal_reference_allowed("low") is False
     assert formal_reference_allowed("medium") is True
     assert formal_reference_allowed("high") is True
-

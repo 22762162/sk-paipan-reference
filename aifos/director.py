@@ -24,6 +24,7 @@ from .quality_policy import (
     formal_reference_allowed,
     image_task_class_for,
     normalize_quality,
+    normalize_aspect,
     normalize_quality_policy,
     recommend_asset_quality,
     recommend_shot_image_quality,
@@ -56,6 +57,10 @@ from .workflow import (
 ASPECT_DIMS = {
     "9:16": {"width": 1080, "height": 1920},
     "16:9": {"width": 1920, "height": 1080},
+    "1:1": {"width": 1080, "height": 1080},
+    "4:3": {"width": 1440, "height": 1080},
+    "3:4": {"width": 1080, "height": 1440},
+    "21:9": {"width": 2520, "height": 1080},
 }
 
 MODERN_OTOME_STYLE = (
@@ -509,7 +514,7 @@ class Director:
     # ---- 入口:一句话开工 ----
     def produce(self, project_title, episode_number, premise="", style="",
                 force=False, script=None, pause_for_confirm=False,
-                kind=None, feedback="", run_id=None):
+                kind=None, feedback="", run_id=None, aspect=""):
         """force=False 时增量生产:已有且落盘完好的产物直接复用,
         只补齐缺失部分——真实产线(即梦按镜头计费)断点续产的关键。
         script:用户自带剧本(标准 JSON);提供时跳过 AI 编剧,
@@ -533,8 +538,11 @@ class Director:
                         or infer_visual_style(premise, project_title))
         project, created = self.projects.get_or_create_project(
             project_title, style=visual_style,
-            kind=kind if kind in ("drama", "idol") else "drama")
+            kind=kind if kind in ("drama", "idol") else "drama",
+            aspect=(normalize_aspect(aspect, field="aspect")
+                    if str(aspect or "").strip() else ""))
         updates = {}
+        aspect_changed = False
         if (not created and kind in ("drama", "idol")
                 and project["kind"] != kind):
             updates["kind"] = kind
@@ -542,9 +550,17 @@ class Director:
                 and (requested_style or not project["style"])
                 and project["style"] != visual_style):
             updates["style"] = visual_style
+        if str(aspect or "").strip():
+            selected_aspect = normalize_aspect(aspect, field="aspect")
+            if project["aspect"] != selected_aspect:
+                updates["aspect"] = selected_aspect
+                aspect_changed = True
         if updates:
             # 用户明确改了内容类型/画风，或旧项目尚未锁定画风。
             project = self.projects.update_project(project_title, **updates)
+        if aspect_changed:
+            # 首尾帧、视频和剪辑都带有画幅；切换规格不能复用旧比例资产。
+            force = True
         episode, _ = self.projects.get_or_create_episode(
             project["id"], episode_number, premise=premise)
         self.log.info(
@@ -3787,7 +3803,10 @@ class Director:
                     "audio_in_video": meta.get("audio_in_video"),
                     "video_quality": meta.get("video_quality", "medium"),
                     "video_resolution": meta.get(
-                        "video_resolution", "720p")})
+                        "video_resolution", "720p"),
+                    "aspect": meta.get("aspect", ctx["aspect"]),
+                    "width": meta.get("width", ctx["dims"]["width"]),
+                    "height": meta.get("height", ctx["dims"]["height"])})
                 reused += 1
                 continue
             pending.append(self._prepare_video_call(ctx, shot, frames))
@@ -4148,6 +4167,9 @@ class Director:
         quality = task["quality"]
         reference_assets = task["reference_assets"]
         reference_manifest = task["reference_manifest"]
+        aspect = ctx.get("aspect", "9:16")
+        dims = ctx.get("dims") or ASPECT_DIMS.get(
+            aspect, ASPECT_DIMS["9:16"])
         provider = self.router.providers.get(result.provider)
         audio_in_video = bool(
             provider and provider.conf.get("audio_in_video"))
@@ -4163,6 +4185,9 @@ class Director:
                                         "audio_in_video": audio_in_video,
                                         "video_quality": quality["level"],
                                         "video_resolution": quality["resolution"],
+                                        "aspect": aspect,
+                                        "width": dims["width"],
+                                        "height": dims["height"],
                                         "quality_source": quality["source"],
                                         "reference_assets": reference_assets,
                                         "reference_manifest":
@@ -4172,6 +4197,9 @@ class Director:
                 "audio_in_video": audio_in_video,
                 "video_quality": quality["level"],
                 "video_resolution": quality["resolution"],
+                "aspect": aspect,
+                "width": dims["width"],
+                "height": dims["height"],
                 "reference_assets": reference_assets,
                 "reference_manifest": reference_manifest}
 

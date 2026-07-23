@@ -88,6 +88,7 @@ class DreaminaProvider(Provider):
         video_quality = str(payload.get("video_quality") or "medium")
         video_resolution = str(payload.get(
             "video_resolution") or self.conf.get("video_resolution", "720p"))
+        aspect = str(payload.get("aspect") or "9:16")
         if video_resolution.lower() not in ("480p", "720p", "1080p"):
             raise ProviderError(
                 "Seedance video_resolution 只允许 480p/720p/1080p")
@@ -101,6 +102,8 @@ class DreaminaProvider(Provider):
                 "场景和画风连续性，不得把参考图拼贴进画面。")
             cmd = self._command() + ["multimodal2video"]
             cmd.extend(f"--image={uri}" for uri in [first, last, *references])
+            # multimodal2video 需要显式 ratio；frames2video 会从首帧尺寸推断。
+            cmd.append(f"--ratio={aspect}")
         else:
             cmd = self._command() + [
                 "frames2video", f"--first={first}", f"--last={last}"]
@@ -146,6 +149,9 @@ class DreaminaProvider(Provider):
                 "model_version": model_version,
                 "video_quality": video_quality,
                 "video_resolution": video_resolution,
+                "aspect": aspect,
+                "width": payload.get("width", 1080),
+                "height": payload.get("height", 1920),
                 "voice": payload.get("voice", "jimeng_builtin"),
                 "lip_sync": bool(payload.get("lip_sync", True)),
                 "forbid_subtitles": bool(payload.get("forbid_subtitles", True)),

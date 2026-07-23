@@ -59,6 +59,15 @@ def test_landscape_project_override(app):
     assert 'width="1920"' in content and 'height="1080"' in content
 
 
+def test_square_project_override(app):
+    summary = _finish(app, "方形剧", 1, aspect="1:1")
+    assert summary["aspect"] == "1:1"
+    project = app.projects.get_project("方形剧")
+    image = app.assets.latest(project["id"], "image", "e001_shot001")
+    content = Path(image["uri"]).read_text(encoding="utf-8")
+    assert 'width="1080"' in content and 'height="1080"' in content
+
+
 def test_idol_pipeline(app):
     app.projects.get_or_create_project(
         "小澜同学", kind="idol", account="xiaolan_ai")

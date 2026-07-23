@@ -662,6 +662,7 @@ class SeedreamImageProvider(OpenAIImageProvider):
             "3:2": "2496x1664",
             "2:3": "1664x2496",
             "1:1": "2048x2048",
+            "21:9": "2560x1080",
         }.get(payload.get("aspect", "9:16"), "2048x2048")
 
     def _audit_data(self, data, payload, unit_cost):
@@ -936,6 +937,7 @@ class ArkVideoProvider(Provider):
         video_quality = str(payload.get("video_quality") or "medium")
         video_resolution = str(payload.get(
             "video_resolution") or self.conf.get("video_resolution", "720p"))
+        aspect = str(payload.get("aspect") or "9:16")
         if video_resolution.lower() not in ("480p", "720p", "1080p"):
             raise ProviderError(
                 "Seedance video_resolution 只允许 480p/720p/1080p")
@@ -949,7 +951,7 @@ class ArkVideoProvider(Provider):
             "type": "text",
             "text": f"{prompt} "
                     f"--duration {duration} --resolution "
-                    f"{video_resolution}",
+                    f"{video_resolution} --aspect {aspect}",
         }]
         for key, role in (("first", "first_frame"), ("last", "last_frame")):
             if payload.get(key):
@@ -1002,6 +1004,9 @@ class ArkVideoProvider(Provider):
             data={"task_id": task_id, "duration": duration,
                   "video_quality": video_quality,
                   "video_resolution": video_resolution,
+                  "aspect": aspect,
+                  "width": payload.get("width", 1080),
+                  "height": payload.get("height", 1920),
                   "reference_images_used": list(
                       (payload.get("reference_images") or [])[:7]),
                   "reference_assets": list(

@@ -14,7 +14,7 @@ from pathlib import Path
 # 保证完整生产流程离线可跑;接入后把对应 enabled 置 true 即切换为真实产线。
 DEFAULTS = {
     "defaults": {
-        "aspect": "9:16",              # 全局默认画幅(抖音竖屏);项目可设 16:9
+        "aspect": "9:16",              # 全局默认画幅;可选 16:9/1:1/4:3/3:4/21:9
         # Seedance 逐镜视频默认 4 路并行；可在设置页按账号限流调低/调高。
         "parallel_videos": 4,
     },

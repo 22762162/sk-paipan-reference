@@ -48,6 +48,10 @@ def _build_parser():
     p_produce.add_argument("--episode", type=int, help="集数")
     p_produce.add_argument("--premise", default="", help="本集前提/梗概")
     p_produce.add_argument("--style", default="", help="画风/风格")
+    p_produce.add_argument(
+        "--aspect", default="",
+        choices=["9:16", "16:9", "1:1", "4:3", "3:4", "21:9"],
+        help="视频画幅(默认 9:16；支持 16:9/1:1/4:3/3:4/21:9)")
     p_produce.add_argument("--kind", choices=["drama", "idol"],
                            help="内容类型:drama 剧情短剧 / idol 虚拟偶像;"
                                 "不填按标题/前提关键词自动识别")
@@ -112,8 +116,8 @@ def _build_parser():
     p_project.add_argument("--account", default=None,
                            help="绑定的抖音等平台账号名")
     p_project.add_argument("--aspect", default=None,
-                           choices=["9:16", "16:9"],
-                           help="画幅(默认跟随全局 9:16)")
+                           choices=["9:16", "16:9", "1:1", "4:3", "3:4", "21:9"],
+                           help="画幅(默认跟随全局 9:16；支持 16:9/1:1/4:3/3:4/21:9)")
 
     p_publish = sub.add_parser("publish", help="查看某集发布包(成片/封面/标题/话题)")
     p_publish.add_argument("--project", required=True)
@@ -255,7 +259,7 @@ def _cmd_produce(app, args):
     summary = app.director.produce(
         title, number, premise=args.premise, style=args.style,
         force=args.force, script=script,
-        pause_for_confirm=args.review, kind=args.kind)
+        pause_for_confirm=args.review, kind=args.kind, aspect=args.aspect)
     print(f"\n=== 《{title}》第{number}集 制作{_status_cn(summary['status'])} ===")
     print(f"质检得分: {summary['qc_score']}   "
           f"成本: {summary['cost']}/{summary['budget']}")

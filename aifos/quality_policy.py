@@ -20,6 +20,75 @@ VIDEO_RESOLUTION_BY_QUALITY = {
 }
 QUALITY_POLICY_SCHEMA = "aifos.quality-policy/v1"
 
+# Seedance 2 常用交付画幅。项目默认仍是 9:16 竖屏；这些是平台层的
+# 可选预设，统一写入项目/任务/资产元数据，避免各环节自行猜比例。
+DEFAULT_ASPECT = "9:16"
+ASPECT_PRESETS = {
+    "9:16": {
+        "label": "竖屏短剧",
+        "width": 1080,
+        "height": 1920,
+        "hint": "手机短剧 / 抖音 / 快手",
+    },
+    "16:9": {
+        "label": "横屏",
+        "width": 1920,
+        "height": 1080,
+        "hint": "横屏视频 / B站 / YouTube",
+    },
+    "1:1": {
+        "label": "方形",
+        "width": 1080,
+        "height": 1080,
+        "hint": "方形预览 / 社交平台",
+    },
+    "4:3": {
+        "label": "经典横幅",
+        "width": 1440,
+        "height": 1080,
+        "hint": "传统横幅 / 旧屏幕构图",
+    },
+    "3:4": {
+        "label": "窄竖屏",
+        "width": 1080,
+        "height": 1440,
+        "hint": "窄幅竖版构图",
+    },
+    "21:9": {
+        "label": "超宽电影屏",
+        "width": 2520,
+        "height": 1080,
+        "hint": "电影感宽银幕",
+    },
+}
+
+
+def normalize_aspect(value, *, allow_auto=False, field="aspect"):
+    """校验项目画幅并统一中文/常见别名。"""
+    aliases = {
+        "竖屏": "9:16", "portrait": "9:16", "vertical": "9:16",
+        "横屏": "16:9", "landscape": "16:9",
+        "方形": "1:1", "square": "1:1",
+        "经典横幅": "4:3",
+        "": "auto", "auto": "auto", "自动": "auto",
+    }
+    raw = str(value or "").strip().lower()
+    aspect = aliases.get(raw, raw)
+    allowed = set(ASPECT_PRESETS) | ({"auto"} if allow_auto else set())
+    if aspect not in allowed:
+        names = "|".join(ASPECT_PRESETS)
+        if allow_auto:
+            names += "|auto"
+        raise AifosError(f"{field} 只允许 {names}")
+    return aspect
+
+
+def aspect_dimensions(value, *, default=DEFAULT_ASPECT):
+    """返回可安全传给图片/视频 Provider 的宽高。"""
+    aspect = normalize_aspect(value or default)
+    preset = ASPECT_PRESETS[aspect]
+    return {"width": preset["width"], "height": preset["height"]}
+
 _CLOSE_UP_WORDS = ("近景", "特写", "大特写", "面部", "脸部", "微距")
 _EMOTION_WORDS = (
     "哭", "泪", "崩溃", "爆发", "暴怒", "愤怒", "绝望", "惊恐",

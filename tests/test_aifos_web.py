@@ -122,6 +122,10 @@ def test_index_and_static(server):
     assert "非重要角色固定1张".encode() in app_js
     assert "跑龙套/背景路人不做独立设定".encode() in app_js
     assert "不建立独立人物设定，不生成候选图、立绘或四视图".encode() in app_js
+    assert "视频规格（本集锁定）".encode() in app_js
+    assert "21:9".encode() in app_js
+    assert "Seedance 画幅".encode() in app_js
+    assert b'id="seedance-aspect"' in app_js
     for heading in ("序号", "时长", "参考分镜", "首尾帧", "运镜",
                     "画面描述", "声音", "生产状态"):
         assert f'<th scope="col">{heading}</th>'.encode() in app_js
@@ -184,6 +188,25 @@ def test_index_and_static(server):
     assert status == 200 and "javascript" in ctype
     assert b"aifos-mobile-shell-v3" in raw
     assert b'/static/app.js' in raw and b'fetch(request)' in raw
+
+
+def test_produce_accepts_seedance_aspect_and_rejects_unknown(server):
+    status, invalid = _json_request(server["port"], "POST", "/api/produce", {
+        "sentence": "开始制作《画幅校验剧》第1集",
+        "aspect": "2:7",
+    })
+    assert status == 400 and "aspect" in invalid["error"]
+
+    status, reply = _json_request(server["port"], "POST", "/api/produce", {
+        "sentence": "开始制作《横屏校验剧》第1集",
+        "aspect": "21:9",
+    })
+    assert status == 202
+    job = _wait_job(server["port"], reply["job_id"])
+    assert job["summary"]["status"] == "awaiting_script"
+    project = _json_request(server["port"], "GET", "/api/overview")[1]["projects"]
+    row = next(item for item in project if item["title"] == "横屏校验剧")
+    assert row["aspect"] == "21:9"
 
 
 def test_job_registry_unique_reuses_running_episode(tmp_path):

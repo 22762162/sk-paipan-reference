@@ -4,6 +4,7 @@ import json
 
 from .db import now
 from .errors import AifosError
+from .quality_policy import normalize_aspect
 
 
 ACTIVE_EPISODE_STATUSES = {
@@ -19,7 +20,7 @@ class SeriesCenter:
         self.db = db
 
     def import_batch(self, parsed, *, style="", kind=None,
-                     auto_advance=True):
+                     auto_advance=True, aspect=""):
         """原子建立项目、批次、各集与脚本文档；所有集先进入队列。"""
         title = str(parsed.get("project_title") or "").strip()
         episodes = list(parsed.get("episodes") or [])
@@ -29,6 +30,8 @@ class SeriesCenter:
         if len(numbers) != len(set(numbers)):
             raise AifosError("导入批次存在重复集数")
         timestamp = now()
+        selected_aspect = (normalize_aspect(aspect, field="aspect")
+                           if str(aspect or "").strip() else "")
         with self.db._lock:
             conn = self.db.conn
             conn.execute("BEGIN IMMEDIATE")
@@ -37,10 +40,11 @@ class SeriesCenter:
                     "SELECT * FROM projects WHERE title=?", (title,)).fetchone()
                 if project is None:
                     cur = conn.execute(
-                        "INSERT INTO projects(title, style, kind, created_at) "
-                        "VALUES(?,?,?,?)",
+                        "INSERT INTO projects(title, style, kind, aspect, "
+                        "created_at) VALUES(?,?,?,?,?)",
                         (title, str(style or ""),
                          kind if kind in ("drama", "idol") else "drama",
+                         selected_aspect,
                          timestamp))
                     project_id = cur.lastrowid
                 else:
@@ -52,6 +56,9 @@ class SeriesCenter:
                     if kind in ("drama", "idol") and kind != project["kind"]:
                         updates.append("kind=?")
                         params.append(kind)
+                    if selected_aspect and selected_aspect != project["aspect"]:
+                        updates.append("aspect=?")
+                        params.append(selected_aspect)
                     if updates:
                         conn.execute(
                             f"UPDATE projects SET {', '.join(updates)} WHERE id=?",

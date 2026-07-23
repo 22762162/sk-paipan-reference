@@ -153,6 +153,7 @@ def test_asset_references_use_multimodal2video(tmp_path, fake_dreamina):
         assert call[0] == "multimodal2video"
         images = [arg for arg in call if arg.startswith("--image=")]
         assert len(images) == 4
+        assert "--ratio=9:16" in call
         assert images[0].endswith(str(Path("/tmp/first.png").resolve()))
         assert images[1].endswith(str(Path("/tmp/last.png").resolve()))
         assert result.data["reference_images_used"] == [

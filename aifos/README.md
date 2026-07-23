@@ -297,7 +297,7 @@ python3 -m aifos produce --title 小澜同学 --episode 1 --premise 新歌翻唱
 python3 -m aifos publish --project 小澜同学 --episode 1   # 发布包
 ```
 
-- **画幅**:全局默认 9:16(1080×1920 竖屏),项目可设 `--aspect 16:9`;
+- **画幅**:全局默认 9:16(1080×1920 竖屏),可选 `--aspect 16:9`、`1:1`、`4:3`、`3:4`、`21:9`;
   贯通分镜 Prompt、出图尺寸、首尾帧与剪辑;
 - **发布包**:每集自动产出 `publish/publish.json`——账号、成片、封面、
   3 个候选标题、话题标签(按类型:#漫剧/#AI虚拟偶像)、按场拆条与

@@ -712,6 +712,9 @@ class MockProvider(Provider):
             "forbid_subtitles": bool(payload.get("forbid_subtitles", True)),
             "video_quality": payload.get("video_quality", "medium"),
             "video_resolution": payload.get("video_resolution", "720p"),
+            "aspect": payload.get("aspect", "9:16"),
+            "width": payload.get("width", 1080),
+            "height": payload.get("height", 1920),
             "reference_images": list(payload.get("reference_images") or []),
             "reference_assets": list(payload.get("reference_assets") or []),
             "reference_manifest": list(
@@ -724,6 +727,9 @@ class MockProvider(Provider):
             "forbid_subtitles": bool(payload.get("forbid_subtitles", True)),
             "video_quality": payload.get("video_quality", "medium"),
             "video_resolution": payload.get("video_resolution", "720p"),
+            "aspect": payload.get("aspect", "9:16"),
+            "width": payload.get("width", 1080),
+            "height": payload.get("height", 1920),
             "reference_images_used": list(
                 payload.get("reference_images") or []),
             "reference_assets": list(payload.get("reference_assets") or []),

@@ -302,8 +302,10 @@ def test_ark_video_task_flow(fake_api, tmp_path):
     assert create["body"]["model"] == "seedance-2.0-fast"
     text = create["body"]["content"][0]["text"]
     assert "--duration 8" in text and "1080p" in text
+    assert "--aspect 9:16" in text
     assert result.data["video_quality"] == "high"
     assert result.data["video_resolution"] == "1080p"
+    assert result.data["aspect"] == "9:16"
     roles = [c.get("role") for c in create["body"]["content"][1:]]
     assert roles == ["first_frame", "last_frame", "reference_image"]
     assert create["body"]["content"][1]["image_url"]["url"].startswith(

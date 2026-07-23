@@ -10,6 +10,14 @@ let standardsMeta = null;
 let standardsDirty = false;
 let deferredInstallPrompt = null;
 const MODERN_OTOME_STYLE = "现代都市乙女游戏CG，精致3D半写实角色渲染，亚洲当代青年，现代发型与时尚通勤服装，清透自然皮肤，细腻五官，柔和电影灯光，高级时尚杂志质感；禁止古装、汉服、发簪、长袍、水墨、国风、2D平涂、动漫线稿和历史建筑";
+const ASPECT_PRESETS = [
+  ["9:16", "竖屏短剧 · 1080×1920", "手机短剧 / 抖音 / 快手"],
+  ["16:9", "横屏 · 1920×1080", "横屏视频 / B站 / YouTube"],
+  ["1:1", "方形 · 1080×1080", "方形预览 / 社交平台"],
+  ["4:3", "经典横幅 · 1440×1080", "传统横幅 / 旧屏幕构图"],
+  ["3:4", "窄竖屏 · 1080×1440", "窄幅竖版构图"],
+  ["21:9", "超宽电影屏 · 2520×1080", "电影感宽银幕"],
+];
 
 /* ---------- 工具 ---------- */
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
@@ -24,6 +32,9 @@ const durationText = (seconds) => {
   if (value < 3600) return `${Math.floor(value / 60)} 分 ${Math.round(value % 60)} 秒`;
   return `${Math.floor(value / 3600)} 小时 ${Math.round(value % 3600 / 60)} 分`;
 };
+const aspectOptionsHtml = (selected = "9:16") => ASPECT_PRESETS.map(
+  ([value, label, hint]) => `<option value="${value}"${value === selected ? " selected" : ""}>${label} · ${hint}</option>`
+).join("");
 
 /* 服务自动更新后 build 变化 → 页面自动刷新,用户零操作 */
 let appBuild = null;
@@ -1144,6 +1155,12 @@ async function renderDashboard() {
           <option value="国风漫剧，精致2D动画质感，服装与建筑严格符合剧情时代，高细节，统一人物造型">国风漫剧 · 2D</option>
         </select>
       </label>
+      <label class="style-field aspect-field">
+        <span>视频规格（本集锁定）</span>
+        <select name="aspect" aria-label="视频规格">
+          ${aspectOptionsHtml()}
+        </select>
+      </label>
       <button class="primary" type="submit">开始制作</button>
       <textarea name="script" rows="5" hidden placeholder="把你的剧本粘贴到这里,人物、场次、分镜会自动识别。写法示例:
 第1场 古镇长街
@@ -1328,6 +1345,7 @@ async function previewSeriesImport(form, file) {
     filename: file.name,
     data_base64: dataBase64,
     style: form.style.value,
+    aspect: form.elements.aspect.value,
     kind: form.dataset.kind || "",
     auto_advance: form.elements.series_auto.checked,
     start_first: true,
@@ -1414,6 +1432,7 @@ async function onProduce(ev) {
         sentence: form.sentence.value,
         premise: form.premise.value,
         style: form.style.value,
+        aspect: form.elements.aspect.value,
         script_text: form.script.hidden ? "" : form.script.value,
         kind: form.dataset.kind || "",
       }),
@@ -1903,8 +1922,10 @@ function openPlayer(data, startShotNo) {
   overlay.addEventListener("click", (ev) => { if (ev.target === overlay) close(); });
   const aspect = data.project.aspect || "9:16";
   overlay.querySelector(".player-stage").style.aspectRatio =
-    aspect === "16:9" ? "16 / 9" : "9 / 16";
-  if (aspect === "16:9")
+    ({"16:9": "16 / 9", "1:1": "1 / 1", "4:3": "4 / 3",
+      "3:4": "3 / 4", "21:9": "21 / 9"}[aspect]
+      || "9 / 16");
+  if (aspect !== "9:16")
     overlay.querySelector(".player-box").style.width = "min(960px, 96vw)";
   const startIndex = startShotNo
     ? Math.max(0, shots.findIndex((x) => x.shot.shot_no === startShotNo))
@@ -5177,6 +5198,7 @@ async function renderCanvasView(episodeId) {
   const preflightReady = !!data.preflight?.passed
     && revisionState.formal_ready !== false;
   const profile = data.production_profile || {};
+  const currentAspect = data.project.aspect || "9:16";
   const videoDefault = (data.quality_policy || {}).video_default || "auto";
   const gates = data.preflight?.gates || [];
   const lastFailed = ["failed", "qc_failed"].includes(ep.status)
@@ -5217,6 +5239,12 @@ async function renderCanvasView(episodeId) {
             <option value="high" ${videoDefault === "high" ? "selected" : ""}>高档 · 1080P</option>
           </select>
         </label>
+        <label class="video-aspect-choice">Seedance 画幅
+          <select id="seedance-aspect">
+            ${aspectOptionsHtml(currentAspect)}
+          </select>
+        </label>
+        <div class="video-aspect-locked"><small>本集已按当前规格生成关键帧；此处切换会先按新规格重建关键帧与门禁，再次确认后才生成视频。</small></div>
       </div>
       <button class="primary" id="btn-confirm" ${preflightReady ? "" : "disabled"}>${
         revisedShot != null ? "✅ 确认，只重拍受影响镜头" : "✅ 确认,开始 Seedance 生产"}</button>
@@ -5225,6 +5253,7 @@ async function renderCanvasView(episodeId) {
     <div class="profile-strip">
       <span><b>${esc(profile.standard_name || "SK 五维工业流")}</b> v${esc(profile.standard_version || 1)}</span>
       <span>Seedance 2.0 Fast VIP</span><span>${esc(profile.resolution || "720p")}</span>
+      <span>画幅 ${esc(currentAspect)}</span>
       <span>Seedance2 随视频配音</span><span>口型同步</span><span>无字幕母版</span>
       <strong>${gates.filter((g) => g.passed).length}/${gates.length || 0} 门禁通过</strong>
       <a href="#/standards/history">查看制作标准</a>
@@ -5317,9 +5346,12 @@ async function renderCanvasView(episodeId) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ episode_id: ep.id,
-          video_quality: document.getElementById("seedance-quality")?.value || "auto" }),
+          video_quality: document.getElementById("seedance-quality")?.value || "auto",
+          aspect: document.getElementById("seedance-aspect")?.value || currentAspect }),
       });
-      showToast("已确认!正在生成 Seedance 视频、随视频配音/口型与无字幕母版", "ok");
+      showToast(reply.rebuild
+        ? `已切换为 ${reply.aspect}，正在重建关键帧与生产门禁；完成后请再次确认`
+        : "已确认!正在生成 Seedance 视频、随视频配音/口型与无字幕母版", "ok");
       pollCanvas(episodeId);
     } catch (e) {
       showToast(e.message, "error");
@@ -5961,7 +5993,13 @@ function shotProductionTableHtml(data, options = {}) {
   const art = data.artifacts || {};
   const issuesByShot = options.shotIssues || storyboardShotIssues(data);
   const context = options.context || "review";
-  const aspectClass = data.project.aspect === "16:9" ? "landscape" : "portrait";
+  const aspectClass = ({
+    "16:9": "landscape",
+    "1:1": "square",
+    "4:3": "classic-landscape",
+    "3:4": "narrow-portrait",
+    "21:9": "cinema-wide",
+  })[data.project.aspect] || "portrait";
   const sceneOf = (no) => (data.script?.scenes || []).find(
     (scene) => scene.scene_no === no) || {};
   const sceneNos = [...new Set(shots.map((shot) => shot.scene_no))];

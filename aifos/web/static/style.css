@@ -584,6 +584,10 @@ td.num, th.num { text-align: right; }
   display: block; width: 100%; aspect-ratio: 9 / 16; object-fit: cover;
 }
 .shot-production-section.landscape .storyboard-media-button img { aspect-ratio: 16 / 9; }
+.shot-production-section.square .storyboard-media-button img { aspect-ratio: 1 / 1; }
+.shot-production-section.classic-landscape .storyboard-media-button img { aspect-ratio: 4 / 3; }
+.shot-production-section.narrow-portrait .storyboard-media-button img { aspect-ratio: 3 / 4; }
+.shot-production-section.cinema-wide .storyboard-media-button img { aspect-ratio: 21 / 9; }
 .storyboard-media-button span {
   position: absolute; left: 4px; bottom: 4px; padding: 2px 5px;
   border-radius: 4px; background: rgba(0, 0, 0, .72); color: #fff; font-size: 9px;
@@ -2766,6 +2770,17 @@ textarea:focus-visible, select:focus-visible {
 }
 .video-quality-choice { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
 .confirm-banner .video-quality-choice { color: var(--ink); }
+.video-aspect-choice { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+.video-aspect-choice select {
+  background: var(--page); color: var(--ink); border: 1px solid var(--hairline);
+  border-radius: 8px; padding: 6px 8px; font-size: 12px;
+}
+.video-aspect-locked {
+  display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap;
+  margin-top: 8px; color: var(--ink); font-size: 12px;
+}
+.video-aspect-locked b { color: var(--accent); }
+.video-aspect-locked small { color: var(--ink-3); }
 .plan-st.quality-low, .plan-st.quality-lite { color: var(--warning); }
 .plan-st.quality-medium { color: #79b6ff; }
 .plan-st.quality-high { color: #e69bff; }
