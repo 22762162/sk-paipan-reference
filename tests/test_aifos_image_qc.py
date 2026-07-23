@@ -86,6 +86,36 @@ def test_qc_fail_triggers_auto_redraw(app, tmp_path):
     assert result.cost == 3.0        # 两次出图(2.0)+两次质检(1.0)
 
 
+def test_gender_mismatch_is_a_hard_identity_gate(app, tmp_path):
+    """即使视觉模型声称 pass，性别与最终立绘不符也必须拦截。"""
+    image = tmp_path / "shot.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 8)
+
+    class StubRouter:
+        def call(self, capability, payload, out_dir, cancel=None):
+            if capability == "image":
+                return ProviderResult(provider="codex", cost=1.0,
+                                      uri=str(image))
+            return ProviderResult(
+                provider="codex", cost=0.1,
+                data={"pass": True, "identity_checked": True,
+                      "gender_checked": True, "gender_match": False,
+                      "issues": []})
+
+    app.director.router = StubRouter()
+    result = app.director._generate_image_with_qc(
+        "image", {"prompt": "x", "shot_no": 1}, tmp_path, None,
+        {"characters": ["程沐"], "count": 1,
+         "identity_required": True, "gender_required": True,
+         "identity_references": [{"character": "程沐",
+                                    "uri": "/tmp/chengmu.png"}],
+         "designs": "", "location": "", "action": "", "forbid": []})
+    assert result.qc["passed"] is False
+    assert result.qc["gender_checked"] is True
+    assert result.qc["gender_match"] is False
+    assert any("性别" in issue for issue in result.qc["issues"])
+
+
 def test_qc_report_lands_in_plan(app):
     """初始母资产不空耗视觉 QC；正式镜头图必须带通过结果。"""
     import json
