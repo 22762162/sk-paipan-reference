@@ -3244,8 +3244,16 @@ class Director:
                         "aspect": ctx["aspect"], **ctx["dims"],
                     }), "sub_dir": "cast",
                     "tag": (name, key, label),
-                    # 人物资产套件仍属于初始母资产阶段，不做视觉 QC；
-                    # 分镜/首尾帧等后续镜头才使用已锁定人物立绘质检。
+                    # 母资产同步质检:四视图等会被后续所有镜头当参考图,
+                    # 一张跑偏就污染全部下游——生成后立即与锁定立绘逐一
+                    # 比对身份,不合格自动重画。多视角图不按人数硬卡。
+                    "qc_spec": {**self._qc_spec(
+                        project_id, [name], forbid=self._FORBID,
+                        action=f"人物资产设定图({label}):同一角色"
+                               f"「{name}」的{label},每个视角/局部都必须"
+                               "与最终立绘同一人、同一发型",),
+                        "multi_view": True,
+                        "count_required": False},
                 })
         for (name, key, label), result in self._run_parallel(
                 ctx, tasks, line="人物资产套件").items():

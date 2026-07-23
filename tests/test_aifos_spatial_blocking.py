@@ -89,7 +89,19 @@ def test_group_scene_builds_routes_camera_and_continuity(tmp_path):
     assert 'data-camera-phase="fixed"' in svg
 
 
-def test_seedance_spatial_png_required_for_group_and_changed_camera(tmp_path):
+def test_seedance_spatial_png_required_for_group_and_changed_camera(
+        tmp_path, monkeypatch):
+    # 本容器/CI 无真实 SVG 转换器:打桩转换环节,专测"该带图的镜头
+    # 都被标记、生成并绑定 PNG"这条产线逻辑(真实转换 macOS sips 覆盖)
+    from aifos import spatial_blocking as sb
+    PNG = (b"\x89PNG\r\n\x1a\n" + b"0" * 100)
+
+    def fake_render(svg_path, png_path):
+        Path(png_path).write_bytes(PNG)
+        return ""
+
+    monkeypatch.setattr(sb, "spatial_png_supported", lambda: True)
+    monkeypatch.setattr(sb, "_render_svg_png", fake_render)
     shots = [
         _shot(1, ["甲"], "固定", "甲站在原位"),
         _shot(2, ["甲"], "固定", "甲站在原位"),

@@ -510,7 +510,7 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 文字设定只补充剧情、动作、场景和当镜服装；与最终立绘冲突时以最终立绘为准。
 
 画面要求:
-- 出场角色:{characters}(严格共 {count} 个;角色形态必须与人物设定
+- 出场角色:{characters}({count_rule};角色形态必须与人物设定
   一致——设定写明物种就按设定画,没写明的默认人类;名字不代表物种,
   「小鹿」若设定是人类就必须是人类,不能因为名字画成动物)
 - 人物设定要点(脸型/五官/发型/发色/妆容/年龄感/标志特征必须一致；
@@ -539,11 +539,17 @@ def build_qc_prompt(payload):
     ref_lines = "\n".join(
         f"- {ref.get('character', '角色')}: {ref.get('uri', '')}"
         for ref in identity_refs if isinstance(ref, dict))
+    count_rule = (
+        "本图为同一角色的多视角/局部设定图(四视图/特写/服装细节等):"
+        "画面中出现的每个人形、头像或局部都必须是该角色同一人,"
+        "人数不按出场人数核对"
+        if payload.get("multi_view")
+        else f"严格共 {payload.get('count', len(characters))} 个")
     return IMAGE_QC_PROMPT.format(
         image=payload.get("image_uri", ""),
         identity_references=(ref_lines or "无人空镜，无需人物身份比对"),
         characters="、".join(characters) or "无人(空镜)",
-        count=payload.get("count", len(characters)),
+        count_rule=count_rule,
         designs=payload.get("designs") or "见参考图",
         expected_genders=("；".join(
             f"{name}={gender}" for name, gender in

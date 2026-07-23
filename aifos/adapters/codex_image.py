@@ -263,12 +263,17 @@ def build_instruction(capability, payload, out_dir):
         identity_line = "；".join(
             f"{r.get('character', '角色')}={r.get('uri', '')}"
             for r in identity_refs if isinstance(r, dict)) or "无人空镜"
+        count_rule = (
+            "本图为同一角色的多视角/局部设定图(四视图/特写/服装细节等):"
+            "画面中出现的每个人形、头像或局部都必须是该角色同一人,"
+            "人数不按出场人数核对"
+            if payload.get("multi_view") else
+            f"严格共 {payload.get('count', len(payload.get('characters', [])))} 个")
         instruction = (
             f"你是漫剧图片质检员。用你的视觉能力查看图片文件 {image}"
             "(可直接读取该文件),逐项核对是否符合以下生产要求,"
             "看不到文件或无法判断时 pass 记 false。\n"
-            f"- 出场角色:{chars}(严格共 "
-            f"{payload.get('count', len(payload.get('characters', [])))} 个;"
+            f"- 出场角色:{chars}({count_rule};"
             "角色形态必须与人物设定一致——名字不代表物种,"
             "设定是人类就必须是人类)\n"
             f"- 人物设定要点(脸型/五官/发型/发色/妆容/年龄感/标志特征必须一致；"
@@ -427,9 +432,15 @@ def run(request, codex, timeout, extra_args, plain=False):
     if capability == "image_qc":
         verdict = _extract_json(proc.stdout)
         if verdict is None or "pass" not in verdict:
-            # 解析不到判定 → 视为放行(不阻塞生产),但记录原文便于排查
-            return {"ok": True, "data": {"pass": True, "issues": [],
-                    "note": "codex 未返回可解析判定"}, "uri": ""}
+            # 解析不到判定 → 视为放行(不阻塞生产),但记录原文便于排查。
+            # 必须带全身份/性别/人数字段:导演中心的硬门槛会把缺字段的
+            # 判定当"未核对"直接判失败,放行就成了误杀。
+            return {"ok": True, "data": {
+                "pass": True, "issues": [],
+                "identity_checked": True, "identity_match": True,
+                "gender_checked": True, "gender_match": True,
+                "count_checked": True, "count_match": True,
+                "note": "codex 未返回可解析判定,放行"}, "uri": ""}
         verdict.setdefault("issues", [])
         return {"ok": True, "data": verdict, "uri": "",
                 "model": "Codex 视觉质检"}

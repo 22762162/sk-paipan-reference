@@ -586,12 +586,21 @@ def mark_spatial_reference_requirements(plan):
             if camera_changed:
                 reasons.append("相邻镜头机位变化")
             required = bool(reasons)
+            # 本机没有 SVG→PNG 工具时豁免"必传":空间图是辅助参考,
+            # 不能因环境缺一个转换器把整条生产线卡死(macOS 自带 sips
+            # 不受影响;Linux 装 rsvg-convert/ImageMagick 即恢复强制)
+            waived = ""
+            if required and not spatial_png_supported():
+                required = False
+                waived = NO_SVG_CONVERTER
             shot["spatial_reference_required"] = required
             shot["spatial_reference_reason"] = "、".join(reasons)
+            shot["spatial_reference_waived"] = waived
             indexed = index.get(str(shot.get("shot_no")))
             if isinstance(indexed, dict):
                 indexed["spatial_reference_required"] = required
                 indexed["spatial_reference_reason"] = "、".join(reasons)
+                indexed["spatial_reference_waived"] = waived
             previous_camera = end or start
     return plan
 
@@ -777,16 +786,46 @@ def render_scene_svg(scene):
     return "".join(parts)
 
 
+NO_SVG_CONVERTER = ("本机没有 SVG 转 PNG 工具(sips/rsvg-convert/"
+                    "inkscape/ImageMagick 任一),空间图仅供人审,"
+                    "本机不强制随 Seedance 提交")
+
+
+def _svg_converter_command(svg_path, png_path):
+    """按平台可用性挑选 SVG→PNG 转换器(macOS sips 优先,Linux 常见
+    转换器兜底);全都没有返回 None。"""
+    sips = shutil.which("sips")
+    if sips:
+        return [sips, "-s", "format", "png", str(svg_path),
+                "--out", str(png_path)]
+    rsvg = shutil.which("rsvg-convert")
+    if rsvg:
+        return [rsvg, "-o", str(png_path), str(svg_path)]
+    inkscape = shutil.which("inkscape")
+    if inkscape:
+        return [inkscape, str(svg_path),
+                "--export-type=png",
+                f"--export-filename={png_path}"]
+    magick = shutil.which("magick") or shutil.which("convert")
+    if magick:
+        return [magick, str(svg_path), str(png_path)]
+    return None
+
+
+def spatial_png_supported():
+    """本机是否具备把空间 SVG 转成 PNG 的任一工具。"""
+    return any(shutil.which(tool) for tool in
+               ("sips", "rsvg-convert", "inkscape", "magick", "convert"))
+
+
 def _render_svg_png(svg_path, png_path):
-    """使用 macOS 自带 sips 把 SVG 变成 Seedance 可上传的 PNG。"""
-    converter = shutil.which("sips")
-    if converter is None:
-        return "系统缺少 sips，无法把空间 SVG 转成 Seedance 可用 PNG"
+    """把空间 SVG 变成 Seedance 可上传的 PNG(多转换器自动择一)。"""
+    command = _svg_converter_command(svg_path, png_path)
+    if command is None:
+        return NO_SVG_CONVERTER
     try:
         completed = subprocess.run(
-            [converter, "-s", "format", "png", str(svg_path),
-             "--out", str(png_path)],
-            capture_output=True, text=True, timeout=30)
+            command, capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"空间图转 PNG 失败:{exc}"
     if completed.returncode != 0:
