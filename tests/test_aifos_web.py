@@ -61,8 +61,8 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260723-light-extras" in html
-    assert "/static/app.js?v=20260723-light-extras" in html
+    assert "/static/style.css?v=20260723-asset-board" in html
+    assert "/static/app.js?v=20260723-asset-board" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -239,6 +239,10 @@ def test_asset_image_catalog_has_category_origin_time_and_prompt(server):
     assert item["generated_at"] > 0
     assert item["prompt"] == "林昭现代通勤服装设定，正面全身"
     assert item["prompt_status"] == "recorded"
+    assert item["board_group"] == "character_support"
+    assert item["board_group_label"] == "人物辅助设定"
+    assert item["usage_label"] == "辅助参考·按镜头调用"
+    assert item["selected"] is False
 
 
 def test_history_delete_api_can_keep_asset_center_images(server):

@@ -342,6 +342,11 @@ def _image_asset_catalog(app, project_id):
             project_prompts.setdefault(item_id, prompt)
 
     active_rows = app.assets.active_list(project_id)
+    selected_candidate_ids = {
+        str(app.assets.meta(row).get("candidate_asset_id"))
+        for row in active_rows if row["kind"] == "character_identity"
+        and app.assets.meta(row).get("candidate_asset_id")
+    }
     stored_prompts = {}
     for row in active_rows:
         if row["kind"] != "prompt":
@@ -364,6 +369,41 @@ def _image_asset_catalog(app, project_id):
         if kind in {"first_frame", "last_frame"}:
             return "frame"
         return kind
+
+    def board_group_for(kind):
+        """资产画布的一级泳道:先区分是否会直接进入后续生产。"""
+        if kind in {"character_art", "scene_art", "image", "first_frame",
+                    "last_frame", "cover"}:
+            return "production"
+        if kind == "character_sheet":
+            return "character_support"
+        if kind == "character_candidate":
+            return "candidate"
+        if kind == "reference":
+            return "reference"
+        return "other"
+
+    board_group_labels = {
+        "production": "主生产资产",
+        "character_support": "人物辅助设定",
+        "candidate": "候选与历史",
+        "reference": "上传参考图",
+        "other": "其他资产",
+    }
+
+    def usage_for(kind, row_id, selected=False):
+        if kind == "character_candidate":
+            return "已定版候选" if selected else "候选图·未定版不入镜头"
+        return {
+            "character_art": "身份锚点·自动使用",
+            "scene_art": "场景锚点·自动使用",
+            "character_sheet": "辅助参考·按镜头调用",
+            "image": "镜头关键图·可入视频",
+            "first_frame": "首帧·视频必需",
+            "last_frame": "尾帧·视频必需",
+            "cover": "封面资产",
+            "reference": "上传参考·按关联调用",
+        }.get(kind, "项目资产")
 
     def prompt_key(row, meta, episode_number):
         kind, name = row["kind"], row["name"]
@@ -425,6 +465,8 @@ def _image_asset_catalog(app, project_id):
                 prompt = "早期资产未留存完整提示词"
         category = category_for(row["kind"], meta)
         quality = meta.get("image_quality", "medium")
+        board_group = board_group_for(row["kind"])
+        selected = str(row["id"]) in selected_candidate_ids
         items.append({
             "asset_id": row["id"], "kind": row["kind"],
             "name": row["name"], "version": row["version"],
@@ -433,6 +475,10 @@ def _image_asset_catalog(app, project_id):
             "usable_for_video": quality != "low",
             "category": category,
             "category_label": category_labels.get(category, category),
+            "board_group": board_group,
+            "board_group_label": board_group_labels[board_group],
+            "selected": selected,
+            "usage_label": usage_for(row["kind"], row["id"], selected),
             "generated_at": row["created_at"],
             "source_project": project["title"],
             "source_episode": episode_number,

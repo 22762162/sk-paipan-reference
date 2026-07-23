@@ -3608,13 +3608,39 @@ function assetCardHtml(ep, target, url, label, mock, assetId = null) {
   </div>`;
 }
 
+const ASSET_BOARD_GROUPS = [
+  { key: "production", label: "主生产资产", hint: "会直接进入镜头、首尾帧或视频" },
+  { key: "character_support", label: "人物辅助设定", hint: "四视图、服装、妆容和细节参考" },
+  { key: "candidate", label: "候选与历史", hint: "未定版候选只用于挑选，不进入镜头" },
+  { key: "reference", label: "上传参考图", hint: "按角色或场景关联调用" },
+  { key: "other", label: "其他资产", hint: "暂未归入生产链的资产" },
+];
+
+function assetBoardGroupKey(item) {
+  if (item.board_group) return item.board_group;
+  if (["character_art", "scene_art", "image", "first_frame",
+    "last_frame", "cover"].includes(item.kind)) return "production";
+  if (item.kind === "character_sheet") return "character_support";
+  if (item.kind === "character_candidate") return "candidate";
+  if (item.kind === "reference") return "reference";
+  return "other";
+}
+
+function assetBoardGroupLabel(item) {
+  return item.board_group_label
+    || (ASSET_BOARD_GROUPS.find((g) => g.key === assetBoardGroupKey(item)) || {}).label
+    || "其他资产";
+}
+
 function assetCatalogCardHtml(item) {
   const source = `《${item.source_project || "未命名作品"}》`
     + (item.source_episode ? ` · 第 ${item.source_episode} 集` : " · 项目公共资产");
-  return `<article class="asset-catalog-card" data-category="${esc(item.category)}">
+  const group = assetBoardGroupKey(item);
+  return `<article class="asset-catalog-card" data-category="${esc(item.category)}" data-group="${esc(group)}">
     <div class="asset-catalog-media"><img class="zoomable"
       src="${esc(thumbUrl(item.url, 480))}" loading="lazy" alt="${esc(item.label)}"></div>
     <div class="asset-catalog-head"><span class="asset-category-chip">${esc(item.category_label)}</span>
+      <span class="asset-usage-chip ${item.selected ? "selected" : ""}">${esc(item.usage_label || assetBoardGroupLabel(item))}</span>
       <b>${esc(item.label)}</b></div>
     <dl class="asset-origin-meta">
       <div><dt>来源作品</dt><dd>${esc(source)}</dd></div>
@@ -3634,6 +3660,24 @@ function assetCatalogHtml(items, category = "all") {
   return visible.length
     ? visible.map(assetCatalogCardHtml).join("")
     : `<div class="dim">当前分类还没有图片资产。</div>`;
+}
+
+function assetBoardHtml(items, category = "all", group = "all") {
+  const visible = (items || []).filter((item) =>
+    (category === "all" || item.category === category)
+    && (group === "all" || assetBoardGroupKey(item) === group));
+  if (!visible.length) return `<div class="dim asset-board-empty">当前筛选没有图片资产。</div>`;
+  const groups = ASSET_BOARD_GROUPS.filter((g) =>
+    visible.some((item) => assetBoardGroupKey(item) === g.key));
+  return `<div class="asset-board-lanes">${groups.map((g) => {
+    const lane = visible.filter((item) => assetBoardGroupKey(item) === g.key);
+    return `<section class="asset-lane asset-lane-${g.key}" data-group="${g.key}">
+      <div class="asset-lane-head"><div><h3>${g.label}
+        <span>${lane.length}</span></h3><p>${g.hint}</p></div>
+        <span class="asset-lane-count">${lane.filter((item) => item.usable_for_video).length} 可用于视频</span></div>
+      <div class="asset-catalog-grid">${lane.map(assetCatalogCardHtml).join("")}</div>
+    </section>`;
+  }).join("")}</div>`;
 }
 
 async function renderAssetsCenter(selectedTitle) {
@@ -3684,6 +3728,14 @@ async function renderAssetsCenter(selectedTitle) {
   const activeCategory = storedCategory === "all"
     || assetCategories.some(([value]) => value === storedCategory)
     ? storedCategory : "all";
+  const storedBoardGroup = localStorage.getItem("aifos.assets.board") || "all";
+  const activeBoardGroup = storedBoardGroup === "all"
+    || ASSET_BOARD_GROUPS.some((group) => group.key === storedBoardGroup)
+    ? storedBoardGroup : "all";
+  const boardItems = art.image_assets || [];
+  const boardCounts = Object.fromEntries(ASSET_BOARD_GROUPS.map((group) => [
+    group.key, boardItems.filter((item) => assetBoardGroupKey(item) === group.key).length,
+  ]));
   const characterAssetPolicy = (epData || {}).character_asset_policy || {};
   const characterAssetHint = characterAssetPolicy.resolved_mode === "simple"
     ? "当前为简化版：只使用人工锁定的最终人物形象图；历史扩展资产保留但不会自动注入后续出图"
@@ -3697,14 +3749,20 @@ async function renderAssetsCenter(selectedTitle) {
       <span class="hint">人物资产范围可按集选择;最终人物形象图始终进入出图与质检</span>
     </div>
     <section class="panel asset-panel asset-catalog-panel">
-      <div class="asset-catalog-toolbar"><div><h2>🧭 资产索引</h2>
-        <p class="dim">先按作品定位，再按人物、场景、服装等分类筛选；每张图保留时间、来源和提示词。</p></div>
-        <label>资产分类 <select id="asset-category"><option value="all">全部图片</option>
+      <div class="asset-catalog-toolbar"><div><h2>🧭 资产画布</h2>
+        <p class="dim">先看会进入生产的资产，再展开人物设定、候选和上传参考；避免所有图片混在一列。</p></div>
+        <label>资产分类·细分 <select id="asset-category"><option value="all">全部图片</option>
           ${assetCategories.map(([value, label]) => `<option value="${esc(value)}"
             ${activeCategory === value ? "selected" : ""}>${esc(label)}</option>`).join("")}
         </select></label></div>
-      <div class="asset-catalog-grid" id="asset-catalog-grid">
-        ${assetCatalogHtml(art.image_assets || [], activeCategory)}
+      <div class="asset-board-summary">${ASSET_BOARD_GROUPS.filter((group) => boardCounts[group.key]).map((group) =>
+        `<button class="asset-board-filter ${activeBoardGroup === group.key ? "active" : ""}"
+          data-asset-board-group="${group.key}"><b>${group.label}</b><span>${boardCounts[group.key]}</span></button>`).join("")}
+        <button class="asset-board-filter ${activeBoardGroup === "all" ? "active" : ""}"
+          data-asset-board-group="all"><b>全部资产</b><span>${boardItems.length}</span></button>
+      </div>
+      <div class="asset-board" id="asset-catalog-board">
+        ${assetBoardHtml(boardItems, activeCategory, activeBoardGroup)}
       </div>
     </section>
     ${epData ? mockWarnHtml(epData) : ""}
@@ -3821,11 +3879,26 @@ async function renderAssetsCenter(selectedTitle) {
       });
     });
   };
+  const renderAssetBoard = () => {
+    const board = document.getElementById("asset-catalog-board");
+    if (!board) return;
+    board.innerHTML = assetBoardHtml(
+      art.image_assets || [], document.getElementById("asset-category").value,
+      localStorage.getItem("aifos.assets.board") || "all");
+    bindAssetDeleteButtons();
+    bindLightbox(board);
+  };
+  document.querySelectorAll("[data-asset-board-group]").forEach((button) => {
+    button.onclick = () => {
+      localStorage.setItem("aifos.assets.board", button.dataset.assetBoardGroup);
+      document.querySelectorAll("[data-asset-board-group]").forEach((item) =>
+        item.classList.toggle("active", item.dataset.assetBoardGroup === button.dataset.assetBoardGroup));
+      renderAssetBoard();
+    };
+  });
   document.getElementById("asset-category").onchange = (ev) => {
     localStorage.setItem("aifos.assets.category", ev.target.value);
-    document.getElementById("asset-catalog-grid").innerHTML =
-      assetCatalogHtml(art.image_assets || [], ev.target.value);
-    bindAssetDeleteButtons();
+    renderAssetBoard();
   };
   bindLightbox(app);
   if (ep) {
