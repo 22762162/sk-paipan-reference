@@ -61,8 +61,8 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260723-shot-inline-revision" in html
-    assert "/static/app.js?v=20260723-shot-inline-revision" in html
+    assert "/static/style.css?v=20260723-video-ref-table" in html
+    assert "/static/app.js?v=20260723-video-ref-table" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -126,6 +126,15 @@ def test_index_and_static(server):
     assert b"missing-keyframe" in app_js
     assert b"missing-frames" in app_js
     assert b"missing-video" in app_js
+    assert "Seedance 参考图输入表".encode() in app_js
+    assert "首帧（必传）".encode() in app_js
+    assert "尾帧（必传）".encode() in app_js
+    assert "资产参考图（最多 7 张）".encode() in app_js
+    assert "锁定人物身份、脸型和发型".encode() in app_js
+    assert "人物特征参考".encode() in app_js
+    assert b"friendlyVideoReferenceName" in app_js
+    assert b"videoReferenceFigureHtml" in app_js
+    assert b"video-ref-preview" in app_js
     assert "直接修改此图".encode() in app_js
     assert "暂停并修改".encode() in app_js
     assert "修改并同步后续".encode() in app_js
@@ -138,6 +147,9 @@ def test_index_and_static(server):
     assert b".blocking-actor-legend" in style_css
     assert b".blocking-map-scroll" in style_css
     assert b".video-ref-picker-grid" in style_css
+    assert b".video-ref-table" in style_css
+    assert b".video-ref-card" in style_css
+    assert b".video-ref-status" in style_css
     assert b".plan-ref-gallery" in style_css
     assert b".acceleration-panel" in style_css
     assert b".image-accel-livebar" in style_css

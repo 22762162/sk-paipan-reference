@@ -4476,31 +4476,130 @@ const VIDEO_REF_KIND_CN = {
   first_frame: "首帧", last_frame: "尾帧",
 };
 
+const VIDEO_REF_USAGE_CN = {
+  image: "锁定本镜构图、站位和机位",
+  character_identity: "锁定人物身份、脸型和发型",
+  scene_art: "锁定场景布局、光影和空间",
+  reference: "补充用户指定造型或细节",
+  character_sheet: "补充人物角度和局部细节",
+  character_art: "锁定人物身份和本集造型",
+  first_frame: "视频动作起点，必须传入",
+  last_frame: "视频动作终点及衔接，必须传入",
+};
+
+function friendlyVideoReferenceName(item, shotNo) {
+  if (item.kind === "image") return `镜头 ${shotNo} 参考分镜`;
+  let name = String(item.name || VIDEO_REF_KIND_CN[item.kind] || "参考图");
+  if (item.kind !== "reference") return name;
+  name = name.split("__").pop() || name;
+  const suffixes = {
+    features: "人物特征参考", identity: "人物身份参考",
+    makeup: "妆容参考", outfit: "服装参考", detail: "细节参考",
+    fullbody: "全身参考", portrait: "肖像参考",
+  };
+  const match = name.match(/^(.+?)_([a-zA-Z][a-zA-Z0-9_-]*)$/);
+  if (!match) return name;
+  const suffix = suffixes[match[2].toLowerCase()]
+    || `${match[2].replaceAll("_", " ")} 参考`;
+  return `${match[1]} · ${suffix}`;
+}
+
+function videoReferenceFigureHtml({
+  url, kind, name, order, missing = false,
+}) {
+  const type = VIDEO_REF_KIND_CN[kind] || kind || "参考图";
+  const usage = VIDEO_REF_USAGE_CN[kind] || "提供本镜视觉约束";
+  if (!url || missing) return `<figure class="video-ref-card missing">
+    <div class="video-ref-missing-image">待生成</div>
+    <figcaption><b>${esc(type)}</b><span>${esc(name)}</span>
+      <small>${esc(usage)}</small></figcaption>
+  </figure>`;
+  return `<figure class="video-ref-card ${kind === "first_frame"
+    || kind === "last_frame" ? "required" : "asset"}">
+    <button type="button" class="video-ref-preview"
+      data-image-url="${esc(url)}" data-image-title="${esc(type)} · ${esc(name)}"
+      aria-label="放大查看${esc(type)}：${esc(name)}">
+      <img src="${esc(thumbUrl(url, 180))}" loading="lazy"
+        alt="${esc(type)} ${esc(name)}">
+      <span class="video-ref-order">${order}</span>
+    </button>
+    <figcaption><b>${esc(type)}</b><span title="${esc(name)}">${esc(name)}</span>
+      <small>${esc(usage)}</small></figcaption>
+  </figure>`;
+}
+
 function videoReferencePanelHtml(data) {
   const shots = (data.storyboard || {}).shots || [];
   const effective = (data.video_references_effective || {}).shots || {};
+  const artifacts = data.artifacts || {};
+  const firstFrames = artifacts.first || {};
+  const lastFrames = artifacts.last || {};
   return `<section class="panel video-ref-panel">
-    <h2>🧷 Seedance 资产参考图
-      <span class="dim">已按剧本自动选入每镜必要的图——本镜分镜图、出场人物
-      最终立绘、场景图和用户参考图(与首尾帧一起交给 Seedance);
-      需要调整再点右侧按钮,人工选择优先于自动。</span></h2>
-    <div class="video-ref-list">${shots.map((shot) => {
+    <h2>🧷 Seedance 参考图输入表
+      <span class="dim">逐镜列出实际送入 Seedance 的首帧、尾帧和资产参考图。
+      编号就是输入顺序；首尾帧固定占 2 张，资产参考图最多 7 张。</span></h2>
+    <div class="video-ref-table-wrap" role="region"
+      aria-label="Seedance 逐镜参考图输入表，可滚动查看">
+      <table class="video-ref-table">
+        <caption>每个镜头实际送入 Seedance 的全部图片与用途</caption>
+        <thead><tr>
+          <th scope="col">镜头</th>
+          <th scope="col">首帧（必传）</th>
+          <th scope="col">尾帧（必传）</th>
+          <th scope="col">资产参考图（最多 7 张）</th>
+          <th scope="col">输入状态</th>
+          <th scope="col">操作</th>
+        </tr></thead>
+        <tbody>${shots.map((shot) => {
       const entry = effective[String(shot.shot_no)] || {};
       const rows = entry.items || [];
       const auto = entry.mode !== "manual";
-      return `<div class="video-ref-row">
-        <b>镜头 ${shot.shot_no}
+      const first = firstFrames[String(shot.shot_no)]
+        || firstFrames[shot.shot_no] || "";
+      const last = lastFrames[String(shot.shot_no)]
+        || lastFrames[shot.shot_no] || "";
+      const frameCount = Number(Boolean(first)) + Number(Boolean(last));
+      const total = frameCount + rows.length;
+      return `<tr>
+        <th scope="row" class="video-ref-shot">
+          <b>#${String(shot.shot_no).padStart(2, "0")}</b>
+          <span>${esc(shot.unit_id || `镜头 ${shot.shot_no}`)}</span>
+        </th>
+        <td data-label="首帧（必传）">${videoReferenceFigureHtml({
+          url: first, kind: "first_frame",
+          name: `镜头 ${shot.shot_no} 动作起点`, order: "①",
+          missing: !first,
+        })}</td>
+        <td data-label="尾帧（必传）">${videoReferenceFigureHtml({
+          url: last, kind: "last_frame",
+          name: `镜头 ${shot.shot_no} 动作终点`, order: "②",
+          missing: !last,
+        })}</td>
+        <td data-label="资产参考图" class="video-ref-assets">
+          <div class="video-ref-asset-list">${rows.map((item, index) =>
+            videoReferenceFigureHtml({
+              url: item.url, kind: item.kind,
+              name: friendlyVideoReferenceName(item, shot.shot_no),
+              order: String(index + 3),
+            })).join("")
+            || `<span class="video-ref-empty">无额外资产参考图</span>`}</div>
+        </td>
+        <td data-label="输入状态" class="video-ref-status">
           <span class="video-ref-mode ${auto ? "auto" : "manual"}">${auto
-            ? "自动选入" : "人工选定"}</span></b>
-        <div class="video-ref-thumbs">${rows.map((item) =>
-          `<img src="${esc(thumbUrl(item.url, 120))}"
-            alt="${esc(VIDEO_REF_KIND_CN[item.kind] || item.kind)} ${esc(item.name)}"
-            title="${esc(VIDEO_REF_KIND_CN[item.kind] || item.kind)} · ${esc(item.name)}">`).join("")
-          || `<span class="dim">暂无可用参考(仍使用首尾帧)</span>`}</div>
-        <button class="video-ref-edit" data-shot-no="${shot.shot_no}">
-          调整（${auto ? `自动 ${rows.length} 张` : `已选 ${rows.length} 张`}）</button>
-      </div>`;
-    }).join("")}</div>
+            ? "按剧本自动选入" : "人工选定"}</span>
+          <b>首尾帧 ${frameCount}/2 · 资产 ${rows.length}/7</b>
+          <small>${frameCount === 2
+            ? `实际输入 ${total} 张，可进入 Seedance`
+            : `缺 ${2 - frameCount} 张必传帧，暂不可开拍`}</small>
+        </td>
+        <td data-label="操作">
+          <button class="video-ref-edit" data-shot-no="${shot.shot_no}">
+            调整资产参考图</button>
+        </td>
+      </tr>`;
+    }).join("")}</tbody>
+      </table>
+    </div>
   </section>`;
 }
 
@@ -4575,6 +4674,10 @@ function showVideoReferencePicker(data, episodeId, shotNo) {
 }
 
 function bindVideoReferenceControls(data, episodeId) {
+  document.querySelectorAll(".video-ref-preview").forEach((button) => {
+    button.onclick = () => showImageLightbox(
+      button.dataset.imageUrl, button.dataset.imageTitle);
+  });
   document.querySelectorAll(".video-ref-edit").forEach((button) => {
     button.onclick = () => showVideoReferencePicker(
       data, episodeId, Number(button.dataset.shotNo));
