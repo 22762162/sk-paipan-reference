@@ -117,6 +117,11 @@ def test_index_and_static(server):
     assert "分镜头生产表".encode() in app_js
     assert "全流程生产表".encode() in app_js
     assert b"productionLedgerHtml" in app_js
+    assert b"productionLedgerRowIsUseful" in app_js
+    assert b'row.category === "character_candidate" && !row.selected' in app_js
+    assert b'["failed", "retrying", "awaiting_human"].includes(row.status)' in app_js
+    assert "未选候选、失败产物、质检废片与占位图已隐藏".encode() in app_js
+    assert "全部有效生产项".encode() in app_js
     assert "全生产链画布".encode() in app_js
     assert b"productionCanvasStages" in app_js
     assert b' id="canvas-stage-nav"' in app_js

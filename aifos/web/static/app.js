@@ -2937,22 +2937,19 @@ function productionLedgerVideoRows(data) {
   });
 }
 
+function productionLedgerRowIsUseful(row) {
+  /* 全流程表是交付视图，不是素材回收站。
+     候选/废片仍完整保留在人物定版、图片生产状况和历史记录中，方便回退与追溯。 */
+  if (row.category === "character_candidate" && !row.selected) return false;
+  if (row.mock) return false;
+  if (row.item?.error || row.item?.qc?.passed === false) return false;
+  if (["failed", "retrying", "awaiting_human"].includes(row.status)) return false;
+  return true;
+}
+
 function productionLedgerRows(data) {
-  const rows = [...productionLedgerPlanRows(data), ...productionLedgerVideoRows(data)];
-  const hasCandidates = rows.some((row) => row.category === "character_candidate");
-  if (!hasCandidates) {
-    ((data.cast_selection || {}).characters || []).filter((character) =>
-      Number(character.candidate_target || character.candidate_count || 0) > 0
-    ).forEach((character) => rows.unshift({
-      rowId: `character:${character.character}`, category: "character_candidate",
-      stageKey: "character_candidate", stageLabel: "人物候选",
-      objectLabel: character.character, subLabel: `${character.role || "角色"} · 待生成候选`,
-      status: "pending", selected: false, mock: false,
-      issue: "尚未登记人物候选生产项", issueCritical: false,
-      refs: { items: productionLedgerReferenceAssets(data, character.character), actual: false, required: false },
-      outputUrls: [],
-    }));
-  }
+  const rows = [...productionLedgerPlanRows(data), ...productionLedgerVideoRows(data)]
+    .filter(productionLedgerRowIsUseful);
   return rows.sort((a, b) => (PRODUCTION_LEDGER_STAGE_ORDER[a.stageKey] ?? 99)
     - (PRODUCTION_LEDGER_STAGE_ORDER[b.stageKey] ?? 99)
     || String(a.objectLabel).localeCompare(String(b.objectLabel), "zh"));
@@ -3014,7 +3011,7 @@ function productionLedgerHtml(data, options = {}) {
   return `<section class="production-ledger" data-ledger-context="${esc(context)}">
     <div class="production-ledger-heading">
       <div><h2>📊 全流程生产表</h2>
-        <p>逐项列出对象、实际/预期参考图、当前产物和干预入口；状态变化会随生产自动刷新。</p></div>
+        <p>精选视图：只显示已选定候选和有效生产资料；未选候选、失败产物、质检废片与占位图已隐藏，原始记录仍可追溯。</p></div>
       <span class="production-ledger-current">当前阶段：<b>${esc(currentLabel)}</b></span>
     </div>
     ${humanVideoShots.length ? `<div class="production-ledger-video-stop" role="alert">
@@ -3028,8 +3025,8 @@ function productionLedgerHtml(data, options = {}) {
     </div>
     <div class="production-ledger-controls">
       <label>筛选生产项<select class="production-ledger-filter">
-        <option value="all">全部生产项</option><option value="active">正在生产</option>
-        <option value="problem">失败/需要干预</option><option value="character">人物与场景</option>
+        <option value="all">全部有效生产项</option><option value="active">正在生产</option>
+        <option value="pending">待补齐资料</option><option value="character">人物与场景</option>
         <option value="shot">关键帧与首尾帧</option><option value="video">视频</option>
       </select></label>
       <span class="production-ledger-filter-summary">显示 ${rows.length}/${rows.length} 项</span>
@@ -3057,7 +3054,7 @@ function productionLedgerHtml(data, options = {}) {
               : `<span class="production-ledger-ok">暂无问题</span>`}${productionLedgerActionHtml(row)}</td>
           </tr>`;
         }).join("")}</tbody>
-      </table></div>` : `<div class="production-ledger-empty">当前还没有可追踪的图片或视频生产项。</div>`}
+      </table></div>` : `<div class="production-ledger-empty">当前还没有已选定或可用的生产资料。</div>`}
   </section>`;
 }
 
@@ -3126,7 +3123,7 @@ function bindProductionLedger(root, data, episodeId) {
         const kind = row.dataset.ledgerKind;
         const show = key === "all"
           || (key === "active" && ["generating", "pending"].includes(state))
-          || (key === "problem" && ["failed", "retrying", "awaiting_human"].includes(state))
+          || (key === "pending" && state === "pending")
           || (key === kind);
         row.hidden = !show;
         if (show) visible += 1;
