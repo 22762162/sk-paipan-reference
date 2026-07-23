@@ -2624,6 +2624,339 @@ function planItemHtml(data, item, editable) {
     </div></div>`;
 }
 
+/* ================= 全流程生产表 =================
+   用一张表把人物、场景、关键帧、首尾帧和视频串起来。
+   图片清单仍保留卡片用于深度编辑；这里负责让用户一眼看出“谁/哪一镜/到哪一步/哪里出错”。 */
+const PRODUCTION_LEDGER_STAGES = [
+  { key: "character_candidate", label: "人物候选" },
+  { key: "character_art", label: "人物立绘" },
+  { key: "character_sheet", label: "人物辅助设定" },
+  { key: "scene_art", label: "场景概念图" },
+  { key: "shot_image", label: "分镜关键帧" },
+  { key: "frames", label: "首尾帧" },
+  { key: "video", label: "Seedance 视频" },
+];
+const PRODUCTION_LEDGER_STAGE_ORDER = Object.fromEntries(
+  PRODUCTION_LEDGER_STAGES.map((stage, index) => [stage.key, index]));
+
+function productionLedgerStage(item) {
+  return PRODUCTION_LEDGER_STAGES.find((stage) => stage.key === item.category)
+    || { key: item.category || "other", label: PLAN_CAT_CN[item.category] || item.category || "其他" };
+}
+
+function productionLedgerCharacter(data, name) {
+  return ((data.cast_selection || {}).characters || [])
+    .find((character) => character.character === name) || {};
+}
+
+function productionLedgerSelectedCandidate(data, item) {
+  if (item.category !== "character_candidate") return false;
+  const character = productionLedgerCharacter(data, item.name);
+  return !!(character.candidates || []).find((candidate) =>
+    Number(candidate.index) === Number(item.candidate_index) && candidate.selected);
+}
+
+function productionLedgerReferenceAssets(data, name) {
+  const references = (data.artifacts || {}).references || [];
+  return references.filter((reference) => {
+    const target = String(reference.attach_to || "");
+    return target === String(name || "") || target.includes(String(name || ""));
+  }).map((reference) => ({
+    ...reference, label: reference.note || reference.name || "上传参考图",
+    actual: false,
+  }));
+}
+
+function productionLedgerFallbackRefs(data, item) {
+  const refs = [];
+  const add = (ref) => {
+    if (!ref || (!ref.url && !ref.name && !ref.label)) return;
+    const key = `${ref.kind || ""}:${ref.url || ref.name || ref.label}`;
+    if (refs.some((row) => row._key === key)) return;
+    refs.push({ ...ref, _key: key, actual: false });
+  };
+  const category = item.category;
+  if (["character_candidate", "character_art", "character_sheet"].includes(category)) {
+    productionLedgerReferenceAssets(data, item.name).forEach(add);
+    const character = productionLedgerCharacter(data, item.name);
+    if (character.identity_url && category !== "character_candidate") {
+      add({ kind: "identity", label: "最终人物立绘", name: item.name,
+        url: character.identity_url });
+    }
+  }
+  if (category === "scene_art") {
+    productionLedgerReferenceAssets(data, item.name).forEach(add);
+  }
+  if (["shot_image", "frames"].includes(category)) {
+    const shot = (data.storyboard?.shots || []).find((row) =>
+      Number(row.shot_no) === Number(item.shot_no));
+    (shot?.characters || []).forEach((name) => {
+      const character = productionLedgerCharacter(data, name);
+      if (character.identity_url) {
+        add({ kind: "identity", label: `${name}·最终立绘`, name,
+          url: character.identity_url });
+      }
+    });
+    const scene = (data.artifacts || {}).scene_art?.find((row) =>
+      row.name === (data.script?.scenes || []).find(
+        (sceneRow) => sceneRow.scene_no === shot?.scene_no)?.location);
+    if (scene?.url) add({ kind: "scene", label: "场景锚点", name: scene.name, url: scene.url });
+    if (category === "frames" && (data.artifacts || {}).images?.[item.shot_no]) {
+      add({ kind: "keyframe", label: "本镜关键帧", name: `镜头${item.shot_no}`,
+        url: data.artifacts.images[item.shot_no] });
+    }
+  }
+  return refs.map(({ _key, ...ref }) => ref);
+}
+
+function productionLedgerRefs(data, item) {
+  const recorded = ((item.reference_inputs || {}).items || [])
+    .filter((reference) => reference.url)
+    .map((reference) => ({ ...reference, actual: true }));
+  return {
+    items: recorded.length ? recorded : productionLedgerFallbackRefs(data, item),
+    actual: !!recorded.length,
+    required: !!(item.reference_inputs || {}).required,
+  };
+}
+
+function productionLedgerVideoRefs(data, shotNo) {
+  const entry = ((data.video_references_effective || {}).shots || {})[String(shotNo)] || {};
+  const artifacts = data.artifacts || {};
+  const refs = [];
+  const add = (kind, label, url, name = label) => {
+    if (!url || refs.some((row) => row.url === url)) return;
+    refs.push({ kind, label, name, url, actual: true });
+  };
+  add("first_frame", "首帧·必传", artifacts.first?.[shotNo], `镜头${shotNo}`);
+  add("last_frame", "尾帧·必传", artifacts.last?.[shotNo], `镜头${shotNo}`);
+  (entry.items || []).forEach((item) => add(
+    item.kind, friendlyVideoReferenceName(item, shotNo), item.url, item.name));
+  return { items: refs, actual: refs.length > 0, required: true };
+}
+
+function productionLedgerState(row) {
+  if (row.issue && row.issueCritical) return "failed";
+  if (row.selected) return "selected";
+  return row.status || "pending";
+}
+
+function productionLedgerStateLabel(row) {
+  if (row.issue && row.issueCritical) return "需要干预";
+  if (row.selected) return "已定版";
+  if (row.status === "done" && row.mock) return "占位图·需补画";
+  return PLAN_STATUS_CN[row.status] || row.status || "待生成";
+}
+
+function productionLedgerPlanRows(data) {
+  const items = ((data.render_plan || {}).items) || [];
+  return items.map((item) => {
+    const stage = productionLedgerStage(item);
+    const qcIssues = item.qc && item.qc.passed === false
+      ? (item.qc.issues || []) : [];
+    const issue = item.error || (qcIssues.length ? qcIssues.join("；") : "");
+    const refs = productionLedgerRefs(data, item);
+    return {
+      rowId: `plan:${item.id}`, planId: item.id, category: item.category,
+      stageKey: stage.key, stageLabel: stage.label, item,
+      objectLabel: item.category === "character_sheet"
+        ? `${item.name} · ${item.label || item.sheet || "辅助设定"}`
+        : item.category === "character_candidate"
+          ? `${item.name} · 候选${item.candidate_index || ""}`
+          : item.label || item.name || item.id,
+      subLabel: item.category === "character_candidate"
+        ? (item.variant_label || "造型候选")
+        : item.category === "character_sheet"
+          ? (item.sheet || "人物辅助设定") : (item.role || ""),
+      status: item.status || "pending", selected: productionLedgerSelectedCandidate(data, item),
+      mock: planIsMock(item), issue, issueCritical: !!issue,
+      refs, outputUrls: planItemThumbs(data, item),
+    };
+  });
+}
+
+function productionLedgerVideoRows(data) {
+  const shots = (data.storyboard || {}).shots || [];
+  const artifacts = data.artifacts || {};
+  const videoTask = (data.tasks || []).find((task) => task.stage === "videos"
+    && ["running", "failed"].includes(task.status));
+  return shots.map((shot) => {
+    const shotNo = shot.shot_no;
+    const videoUrl = artifacts.videos?.[shotNo] || "";
+    const missingFrames = !artifacts.first?.[shotNo] || !artifacts.last?.[shotNo];
+    const status = videoUrl ? "done" : videoTask?.status === "failed"
+      ? "failed" : videoTask?.status === "running" ? "generating" : "pending";
+    const issue = videoUrl ? "" : videoTask?.error || (missingFrames ? "缺少首帧或尾帧" : "等待视频生产");
+    return {
+      rowId: `video:${shotNo}`, shotNo, category: "video", stageKey: "video",
+      stageLabel: "Seedance 视频", objectLabel: `镜头 ${String(shotNo).padStart(2, "0")}`,
+      subLabel: shot.unit_id || `场${shot.scene_no} · ${shot.shot_function || "视频"}`,
+      status, selected: false, mock: false, issue,
+      issueCritical: status === "failed" || (missingFrames && status !== "done"),
+      refs: productionLedgerVideoRefs(data, shotNo),
+      outputUrls: videoUrl ? [videoUrl] : (artifacts.first?.[shotNo] ? [artifacts.first[shotNo]] : []),
+    };
+  });
+}
+
+function productionLedgerRows(data) {
+  const rows = [...productionLedgerPlanRows(data), ...productionLedgerVideoRows(data)];
+  const hasCandidates = rows.some((row) => row.category === "character_candidate");
+  if (!hasCandidates) {
+    ((data.cast_selection || {}).characters || []).filter((character) =>
+      Number(character.candidate_target || character.candidate_count || 0) > 0
+    ).forEach((character) => rows.unshift({
+      rowId: `character:${character.character}`, category: "character_candidate",
+      stageKey: "character_candidate", stageLabel: "人物候选",
+      objectLabel: character.character, subLabel: `${character.role || "角色"} · 待生成候选`,
+      status: "pending", selected: false, mock: false,
+      issue: "尚未登记人物候选生产项", issueCritical: false,
+      refs: { items: productionLedgerReferenceAssets(data, character.character), actual: false, required: false },
+      outputUrls: [],
+    }));
+  }
+  return rows.sort((a, b) => (PRODUCTION_LEDGER_STAGE_ORDER[a.stageKey] ?? 99)
+    - (PRODUCTION_LEDGER_STAGE_ORDER[b.stageKey] ?? 99)
+    || String(a.objectLabel).localeCompare(String(b.objectLabel), "zh"));
+}
+
+function productionLedgerReferenceHtml(refs) {
+  const rows = refs.items || [];
+  if (!rows.length) return refs.required
+    ? `<span class="production-ledger-missing">⚠ 待挂载必需参考图</span>`
+    : `<span class="production-ledger-no-ref">按规则自动调用</span>`;
+  return `<div class="production-ledger-ref-list">
+    ${rows.slice(0, 6).map((ref) => `<span class="production-ledger-ref${ref.actual ? " actual" : " expected"}"
+      title="${esc(ref.label || ref.name || "参考图")}">
+      ${ref.url ? `<img src="${esc(thumbUrl(ref.url, 88))}" loading="lazy" alt="">` : "🖼"}
+      <b>${esc(ref.label || ref.name || ref.kind || "参考图")}</b></span>`).join("")}
+    ${rows.length > 6 ? `<small>+${rows.length - 6} 张</small>` : ""}
+    ${!refs.actual ? `<small class="production-ledger-expected">预期自动挂载</small>` : ""}
+  </div>`;
+}
+
+function productionLedgerOutputHtml(row) {
+  if (!row.outputUrls.length) return `<span class="production-ledger-output-empty">${
+    row.status === "generating" ? "⏳ 正在生成" : "尚无产物"}</span>`;
+  if (row.category === "video") return `<button class="production-ledger-video-output"
+    data-ledger-play="${row.shotNo}" type="button">▶ ${row.status === "done" ? "视频已生成" : "查看当前帧"}</button>`;
+  return `<div class="production-ledger-output-list">${row.outputUrls.slice(0, 2).map((url, index) =>
+    `<button type="button" class="production-ledger-preview" data-ledger-preview="${esc(url)}"
+      aria-label="预览${esc(row.objectLabel)}第${index + 1}张"><img src="${esc(thumbUrl(url, 120))}" loading="lazy" alt=""></button>`
+  ).join("")}</div>`;
+}
+
+function productionLedgerActionHtml(row) {
+  if (row.planId) return `<button type="button" class="production-ledger-action"
+    data-ledger-plan="${esc(row.planId)}">${row.issue ? "立即处理" : "查看/干预"}</button>`;
+  if (row.category === "video") return `<button type="button" class="production-ledger-action"
+    data-ledger-shot="${row.shotNo}">${row.issueCritical ? "查看问题" : "查看镜头"}</button>`;
+  return `<span class="production-ledger-no-action">等待进入生产</span>`;
+}
+
+function productionLedgerHtml(data, options = {}) {
+  const rows = productionLedgerRows(data);
+  const tasks = data.tasks || [];
+  const runningTask = tasks.find((task) => task.status === "running");
+  const currentStage = runningTask?.stage || data.episode?.status || "created";
+  const currentLabel = STAGE_CN[currentStage] || STATUS_CN[currentStage] || currentStage;
+  const stageSummary = PRODUCTION_LEDGER_STAGES.map((stage) => {
+    const list = rows.filter((row) => row.stageKey === stage.key);
+    const done = list.filter((row) => ["done", "reused", "selected"].includes(row.status)
+      || row.selected).length;
+    const active = list.some((row) => row.status === "generating");
+    return { ...stage, total: list.length, done, active };
+  }).filter((stage) => stage.total || (stage.key === "video" && data.storyboard));
+  const context = options.context || "live";
+  return `<section class="production-ledger" data-ledger-context="${esc(context)}">
+    <div class="production-ledger-heading">
+      <div><h2>📊 全流程生产表</h2>
+        <p>逐项列出对象、实际/预期参考图、当前产物和干预入口；状态变化会随生产自动刷新。</p></div>
+      <span class="production-ledger-current">当前阶段：<b>${esc(currentLabel)}</b></span>
+    </div>
+    <div class="production-ledger-summary">
+      ${stageSummary.map((stage) => `<span class="production-ledger-stage ${stage.done === stage.total && stage.total ? "done" : stage.active ? "running" : "pending"}">
+        ${stage.label} <b>${stage.done}/${stage.total}</b></span>`).join("")}
+    </div>
+    <div class="production-ledger-controls">
+      <label>筛选生产项<select class="production-ledger-filter">
+        <option value="all">全部生产项</option><option value="active">正在生产</option>
+        <option value="problem">失败/需要干预</option><option value="character">人物与场景</option>
+        <option value="shot">关键帧与首尾帧</option><option value="video">视频</option>
+      </select></label>
+      <span class="production-ledger-filter-summary">显示 ${rows.length}/${rows.length} 项</span>
+    </div>
+    ${rows.length ? `<div class="production-ledger-table-wrap" role="region" aria-label="全流程生产表，可横向滚动">
+      <table class="production-ledger-table"><caption>人物、场景、关键帧、首尾帧和视频生产状态</caption>
+        <thead><tr><th>生产对象</th><th>生产环节</th><th>所需参考图</th><th>当前产物</th><th>状态标志</th><th>问题 / 干预</th></tr></thead>
+        <tbody>${rows.map((row) => {
+          const state = productionLedgerState(row);
+          const filterKind = row.category === "video" ? "video"
+            : ["character_candidate", "character_art", "character_sheet", "scene_art"].includes(row.category)
+              ? "character" : "shot";
+          return `<tr class="production-ledger-row state-${esc(state)}" data-ledger-row
+            data-ledger-state="${esc(state)}" data-ledger-kind="${filterKind}">
+            <th scope="row" class="production-ledger-object"><b>${esc(row.objectLabel)}</b>
+              <small>${esc(row.subLabel || "")}</small></th>
+            <td data-label="生产环节"><span class="production-ledger-stage-label">${esc(row.stageLabel)}</span>
+              ${row.item?.model ? `<small>${esc(row.item.model)}</small>` : ""}</td>
+            <td data-label="所需参考图">${productionLedgerReferenceHtml(row.refs)}</td>
+            <td data-label="当前产物">${productionLedgerOutputHtml(row)}</td>
+            <td data-label="状态标志"><span class="production-ledger-status status-${esc(state)}">${esc(productionLedgerStateLabel(row))}</span>
+              ${row.mock ? `<small class="production-ledger-warning">占位产物</small>` : ""}</td>
+            <td data-label="问题 / 干预" class="production-ledger-intervention">${row.issue
+              ? `<div class="production-ledger-issue">⚠ ${esc(row.issue)}</div>`
+              : `<span class="production-ledger-ok">暂无问题</span>`}${productionLedgerActionHtml(row)}</td>
+          </tr>`;
+        }).join("")}</tbody>
+      </table></div>` : `<div class="production-ledger-empty">当前还没有可追踪的图片或视频生产项。</div>`}
+  </section>`;
+}
+
+function bindProductionLedger(root, data, episodeId) {
+  if (!root) return;
+  root.querySelectorAll(".production-ledger-preview").forEach((button) => {
+    button.onclick = () => showImageLightbox(button.dataset.ledgerPreview, button.getAttribute("aria-label") || "产物预览");
+  });
+  root.querySelectorAll(".production-ledger-video-output").forEach((button) => {
+    button.onclick = () => openPlayer(data, Number(button.dataset.ledgerPlay));
+  });
+  root.querySelectorAll("[data-ledger-plan]").forEach((button) => {
+    button.onclick = () => showPlanOverlay(episodeId, button.dataset.ledgerPlan);
+  });
+  root.querySelectorAll("[data-ledger-shot]").forEach((button) => {
+    button.onclick = () => {
+      const row = root.querySelector(`.storyboard-table-row[data-shot="${button.dataset.ledgerShot}"]`)
+        || document.querySelector(`.storyboard-table-row[data-shot="${button.dataset.ledgerShot}"]`);
+      if (row) {
+        row.scrollIntoView({ behavior: "smooth", block: "center" });
+        row.classList.add("selected");
+        setTimeout(() => row.classList.remove("selected"), 1800);
+      } else showToast("本集分镜表尚未出现，稍后刷新即可查看该镜头", "info");
+    };
+  });
+  root.querySelectorAll(".production-ledger-filter").forEach((filter) => {
+    const section = filter.closest(".production-ledger");
+    const summary = section?.querySelector(".production-ledger-filter-summary");
+    const rows = [...(section?.querySelectorAll("[data-ledger-row]") || [])];
+    filter.onchange = () => {
+      const key = filter.value;
+      let visible = 0;
+      rows.forEach((row) => {
+        const state = row.dataset.ledgerState;
+        const kind = row.dataset.ledgerKind;
+        const show = key === "all"
+          || (key === "active" && ["generating", "pending"].includes(state))
+          || (key === "problem" && ["failed"].includes(state))
+          || (key === kind);
+        row.hidden = !show;
+        if (show) visible += 1;
+      });
+      if (summary) summary.textContent = `显示 ${visible}/${rows.length} 项`;
+    };
+  });
+}
+
 /* 一键补真:只重画占位图,不动其余 */
 async function redoMock(episodeId, btn) {
   if (btn) { btn.disabled = true; btn.textContent = "已提交,补画中…"; }
@@ -3407,7 +3740,7 @@ function bindImageAccelerationLivebar(episodeId) {
   if (button) button.onclick = () => showImageAcceleration(episodeId);
 }
 
-async function showPlanOverlay(episodeId) {
+async function showPlanOverlay(episodeId, focusId = "") {
   let data;
   try { data = await api(`/api/episode/${episodeId}`); }
   catch (e) { showToast(e.message, "error"); return; }
@@ -3438,6 +3771,14 @@ async function showPlanOverlay(episodeId) {
   document.body.appendChild(overlay);
   bindPlanSelection(overlay, data, episodeId);
   bindPlanRegen(overlay, episodeId, () => { close(); showPlanOverlay(episodeId); });
+  if (focusId) {
+    const target = [...overlay.querySelectorAll("[data-plan-select]")]
+      .find((card) => card.dataset.planSelect === focusId);
+    if (target) {
+      target.scrollIntoView({ behavior: "smooth", block: "center" });
+      target.classList.add("selected");
+    }
+  }
 }
 
 function blockingPoint(value) {
@@ -4387,6 +4728,7 @@ function renderCastSelection(data, episodeId) {
       ${chip(data.episode.status)}<span class="spacer"></span>
       <button id="cast-script">📖 看剧本</button>
     </div>
+    ${productionLedgerHtml(data, { context: "cast" })}
     <div class="cast-selection-list">${characters.map((character) => `
       <section class="cast-choice panel">
         <div class="cast-choice-head"><div><h2>${esc(character.character)}</h2>
@@ -4413,6 +4755,7 @@ function renderCastSelection(data, episodeId) {
       </section>`).join("")}</div>
   </div>`;
   bindImageAccelerationLivebar(episodeId);
+  bindProductionLedger(app, data, episodeId);
   document.getElementById("cast-back").onclick = () => { location.hash = "#/"; };
   document.getElementById("cast-script").onclick = () => showScriptOverlay(data, episodeId);
   document.getElementById("cast-regenerate").onclick = (ev) => armConfirm(
@@ -5086,6 +5429,7 @@ function renderProductionView(data, episodeId) {
         <div class="log-list" id="live-log"><div class="dim">加载中…</div></div>
       </div>
       <div class="produce-main">
+        ${productionLedgerHtml(data, { context: "live" })}
         ${imageAccelerationLivebarHtml(data)}
         ${data.storyboard ? `${shotProductionTableHtml(data, {
           shotIssues: storyboardShotIssues(data), context: "live" })}
@@ -5421,6 +5765,7 @@ function renderRecoveryView(data, episodeId) {
       <button id="btn-plan2">🖼 图片清单</button>
     </div>
     <div class="produce-main" style="padding:0 18px 40px">
+      ${productionLedgerHtml(data, { context: "recovery" })}
       ${imageAccelerationLivebarHtml(data)}
       ${renderPlanBoardHtml(data)}
     </div>
@@ -5431,6 +5776,7 @@ function renderRecoveryView(data, episodeId) {
   document.getElementById("btn-plan2").onclick = () =>
     showPlanOverlay(episodeId);
   bindImageAccelerationLivebar(episodeId);
+  bindProductionLedger(app, data, episodeId);
   bindLightbox(app);
   document.getElementById("btn-resume").onclick = async (ev) => {
     const btn = ev.target;
@@ -5797,6 +6143,7 @@ function renderTheater(data, canvas) {
           <figcaption>${esc(c.name)}</figcaption>
         </figure>`).join("")}
     </div>` : ""}
+    ${productionLedgerHtml(data, { context: "review" })}
     ${shotProductionTableHtml(data, {
       shotIssues: canvas.shotIssues, context: "review" })}`;
 
@@ -5807,6 +6154,7 @@ function renderTheater(data, canvas) {
   el.querySelector("#hero-rename").onclick = () =>
     renameProject(data.project.title,
       () => renderCanvasView(data.episode.id));
+  bindProductionLedger(el, data, data.episode.id);
   bindShotProductionTable(el, data, (shotNo) => {
     canvas.select(shotNo);
     if (window.matchMedia("(max-width: 780px)").matches) {

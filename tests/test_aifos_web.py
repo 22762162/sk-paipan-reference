@@ -61,8 +61,8 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260724-qc-spatial" in html
-    assert "/static/app.js?v=20260724-qc-spatial" in html
+    assert "/static/style.css?v=20260724-production-ledger" in html
+    assert "/static/app.js?v=20260724-production-ledger" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -111,6 +111,10 @@ def test_index_and_static(server):
     assert "中 · 默认生产档".encode() in app_js
     assert "人物定版".encode() in app_js
     assert "分镜头生产表".encode() in app_js
+    assert "全流程生产表".encode() in app_js
+    assert b"productionLedgerHtml" in app_js
+    assert "所需参考图".encode() in app_js
+    assert "问题 / 干预".encode() in app_js
     assert "故事世界与背景圣经".encode() in app_js
     assert "后续人物、分镜和镜头统一以此为准".encode() in app_js
     assert b"storyBibleHtml(script)" in app_js
