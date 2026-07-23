@@ -521,6 +521,16 @@ def apply_story_analysis(script, analysis):
     """把制作圣经注入剧本，供现有下游 Provider 无缝继承。"""
     if not isinstance(script, dict) or not isinstance(analysis, dict):
         return script
+    # 旧剧集可能保存过不完整的角色分析(例如只有 visual_direction)，
+    # 不能因为详情页/分镜列表读取这些历史数据而直接抛出 KeyError。
+    # 先按当前 schema 补齐缺失字段，再注入下游，保证历史项目可继续检查和干预。
+    analysis = build_story_analysis(
+        script,
+        style=((analysis.get("visual") or {}).get("user_style_constraint", "")
+               if isinstance(analysis.get("visual"), dict) else ""),
+        raw=analysis,
+        source=analysis.get("source", "legacy"),
+    )
     script["production_analysis"] = copy.deepcopy(analysis)
     world = analysis["world"]
     visual = analysis["visual"]
@@ -571,7 +581,9 @@ def apply_story_analysis(script, analysis):
         character["candidate_count"] = item["candidate_count"]
         if item.get("importance") != "背景路人":
             character["character_analysis"] = copy.deepcopy(
-                item["character_analysis"])
-            character["visual_dna"] = copy.deepcopy(item["visual_dna"])
-            character["cast_dedup"] = copy.deepcopy(item["cast_dedup"])
+                item.get("character_analysis") or {})
+            character["visual_dna"] = copy.deepcopy(
+                item.get("visual_dna") or {})
+            character["cast_dedup"] = copy.deepcopy(
+                item.get("cast_dedup") or {})
     return script

@@ -64,6 +64,19 @@ def test_analysis_is_injected_into_all_downstream_prompt_context(script):
         MODERN_OTOME_STYLE)
 
 
+def test_legacy_analysis_without_character_fields_is_upgraded(script):
+    analysis = build_story_analysis(script, MODERN_OTOME_STYLE)
+    # 旧版本曾把角色分析保存成不完整对象；详情页和分镜生产表仍必须可打开。
+    for character in analysis["characters"]:
+        character.pop("character_analysis", None)
+        character.pop("visual_dna", None)
+        character.pop("cast_dedup", None)
+    enriched = apply_story_analysis(script, analysis)
+    assert enriched["characters"][0]["character_analysis"]["core_desire"]
+    assert enriched["characters"][0]["visual_dna"]["hair_silhouette"]
+    assert enriched["characters"][0]["cast_dedup"]["compared_with"] == ["顾屿"]
+
+
 def test_saved_analysis_is_versioned_and_rejects_stale_edit(tmp_path):
     app = App(tmp_path / "ws")
     try:
