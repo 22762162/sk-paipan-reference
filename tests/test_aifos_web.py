@@ -61,8 +61,8 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260723-character-rules" in html
-    assert "/static/app.js?v=20260723-character-rules" in html
+    assert "/static/style.css?v=20260723-light-extras" in html
+    assert "/static/app.js?v=20260723-light-extras" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -115,6 +115,9 @@ def test_index_and_static(server):
     assert "后续人物、分镜和镜头统一以此为准".encode() in app_js
     assert b"storyBibleHtml(script)" in app_js
     assert "人物介绍".encode() in app_js
+    assert "非重要角色固定1张".encode() in app_js
+    assert "跑龙套/背景路人不做独立设定".encode() in app_js
+    assert "不建立独立人物设定，不生成候选图、立绘或四视图".encode() in app_js
     for heading in ("序号", "时长", "参考分镜", "首尾帧", "运镜",
                     "画面描述", "声音", "生产状态"):
         assert f'<th scope="col">{heading}</th>'.encode() in app_js
@@ -139,6 +142,7 @@ def test_index_and_static(server):
     assert b".storyboard-table-row" in style_css
     assert b".storyboard-frame-pair" in style_css
     assert b".storyboard-status-stack" in style_css
+    assert b".background-cast-note" in style_css
     status, ctype, raw = _request(
         server["port"], "GET", "/manifest.webmanifest")
     assert status == 200 and "application/manifest+json" in ctype
@@ -149,7 +153,7 @@ def test_index_and_static(server):
         "192x192", "512x512"}
     status, ctype, raw = _request(server["port"], "GET", "/sw.js")
     assert status == 200 and "javascript" in ctype
-    assert b"aifos-mobile-shell-v2" in raw
+    assert b"aifos-mobile-shell-v3" in raw
     assert b'/static/app.js' in raw and b'fetch(request)' in raw
 
 

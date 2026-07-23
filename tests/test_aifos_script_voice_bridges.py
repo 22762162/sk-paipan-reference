@@ -152,6 +152,30 @@ def test_script_bible_is_required_normalized_and_declared_cast_only():
     }
     assert "未在人物设定中介绍" in validate_script(invalid, payload)
 
+    with_extra = {
+        "characters": [
+            {"name": "甲", "role": "主角"},
+            {"name": "站台路人", "role": "背景路人",
+             "introduction": "不应保留的独立设定",
+             "gender": "男", "age_range": "中年",
+             "identity": "路人", "personality": "着急",
+             "background_prompt": "不应触发独立人物图"},
+        ],
+        "scenes": [{"scene_no": 1, "location": "旧车站",
+                    "characters": ["甲", "站台路人"],
+                    "lines": [
+                        {"character": "甲", "dialogue": "我回来了"},
+                        {"character": "站台路人", "dialogue": "借过"},
+                    ]}],
+    }
+    assert validate_script(with_extra, payload) is None
+    extra = with_extra["characters"][1]
+    assert extra["candidate_count"] == 0
+    assert extra["asset_policy"] == "scene_only_no_individual_asset"
+    assert extra["crowd_function"]
+    assert "introduction" not in extra
+    assert "background_prompt" not in extra
+
 
 def test_router_uses_claude_for_script(tmp_path, monkeypatch):
     monkeypatch.setenv("PYTHONPATH", REPO_ROOT)

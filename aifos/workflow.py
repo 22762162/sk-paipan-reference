@@ -12,7 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .adapters.claude_script import validate_script_bible
+from .adapters.claude_script import (is_background_role,
+                                     validate_script_bible)
 from .quality_policy import default_quality_policy, resolve_video_quality
 
 from .spatial_blocking import (build_character_number_map, build_spatial_plan,
@@ -105,6 +106,17 @@ def build_continuity_bible(project, script, profile):
     characters = []
     for index, character in enumerate(script.get("characters", []), 1):
         name = character["name"]
+        if is_background_role(character):
+            characters.append({
+                "name": name,
+                "role": character.get("role", "背景路人"),
+                "background_role": True,
+                "crowd_function": character.get("crowd_function", ""),
+                "identity_anchor": "仅锁定场次功能与人数；无独立人物设定或身份参考图",
+                "default_position": ["画面左1/3", "画面中", "画面右2/3"][
+                    (index - 1) % 3],
+            })
+            continue
         characters.append({
             "name": name,
             "role": character.get("role", ""),

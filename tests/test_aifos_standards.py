@@ -38,6 +38,14 @@ def test_default_standard_is_complete_and_active(tmp_path):
         assert len(rules["storyboard"]["five_dimensions"]) == 5
         assert len(rules["storyboard"]["required_columns"]) == 17
         assert len(rules["storyboard"]["scene_type_words"]) == 8
+        candidate_targets = rules["character_assets"]["candidate_targets"]
+        assert candidate_targets == {
+            "main": 5,
+            "important_supporting": 3,
+            "non_main": 1,
+            "non_main_max": 1,
+            "background": 0,
+        }
         assert [gate["id"] for gate in rules["quality_gates"]] == REQUIRED_GATE_IDS
         assert app.db.query_one("PRAGMA busy_timeout")[0] == 5000
     finally:

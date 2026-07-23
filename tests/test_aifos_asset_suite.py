@@ -71,6 +71,57 @@ def test_story_bible_flows_into_continuity_and_image_prompts(app):
     assert "本集故事背景" in shot["prompt"]
 
 
+def test_background_extras_skip_design_and_generic_support_gets_one_candidate(app):
+    script = {
+        "project_title": "轻量角色测试",
+        "episode_number": 1,
+        "episode_title": "车站",
+        "logline": "林昭在车站找到线索。",
+        "characters": [
+            {"name": "林昭", "role": "主角"},
+            {"name": "小陈", "role": "配角"},
+            {"name": "站台路人", "role": "背景路人"},
+        ],
+        "scenes": [{
+            "scene_no": 1, "location": "车站", "action": "人群短暂让路",
+            "characters": ["林昭", "小陈", "站台路人"],
+            "lines": [
+                {"character": "林昭", "dialogue": "线索就在这里。"},
+                {"character": "小陈", "dialogue": "我去确认。"},
+                {"character": "站台路人", "dialogue": "借过。"},
+            ],
+        }],
+    }
+    summary = app.director.produce(
+        "轻量角色测试", 1, script=script, pause_for_confirm=True)
+    assert summary["status"] == "awaiting_cast"
+    project = app.projects.get_project("轻量角色测试")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    saved, _ = app.projects.latest_document(episode["id"], "script")
+    extra = next(c for c in saved["characters"]
+                 if c["name"] == "站台路人")
+    assert extra["crowd_function"]
+    assert "introduction" not in extra
+    assert app.assets.latest(
+        project["id"], "character", "站台路人") is None
+    extra_candidates = [
+        row for row in app.assets.list(
+            project["id"], "character_candidate")
+        if app.assets.meta(row).get("character") == "站台路人"
+    ]
+    assert extra_candidates == []
+
+    selection = app.director.character_selection_status(
+        project["id"], saved["characters"])
+    by_name = {item["character"]: item
+               for item in selection["characters"]}
+    assert set(by_name) == {"林昭", "小陈"}
+    assert by_name["林昭"]["candidate_target"] == 5
+    assert by_name["小陈"]["candidate_target"] == 1
+
+
 def test_character_suite_generated(app):
     """每个角色除立绘外生成完整资产套件:四视图/特写/特征/妆容/服装。"""
     project = _preproduce(app, asset_mode="full")

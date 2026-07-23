@@ -2395,6 +2395,11 @@ textarea:focus-visible, select:focus-visible {
 .design-row { font-size: 12.5px; line-height: 1.7; display: flex; gap: 8px; }
 .design-row b { flex: 0 0 62px; color: var(--accent); font-weight: 650; }
 .design-row span { color: var(--ink-2); }
+.background-cast-note {
+  margin: 5px 0; padding: 7px 10px; border: 1px dashed var(--hairline);
+  border-radius: 8px; color: var(--ink-3); font-size: 12px; line-height: 1.6;
+  background: var(--surface-2);
+}
 .pc-media img.zoomable { cursor: zoom-in; }
 .img-lightbox { z-index: 300; }
 .lightbox-box {

@@ -61,6 +61,15 @@ def test_role_based_candidates_pause_before_downstream_images(app):
     assert app.assets.list(project["id"], "scene_art") == []
 
 
+def test_candidate_count_is_strictly_role_tiered():
+    assert character_candidate_target({"role": "主角"}) == 5
+    assert character_candidate_target({"role": "重要配角"}) == 3
+    assert character_candidate_target({"role": "配角"}) == 1
+    assert character_candidate_target({"role": "非重要配角"}) == 1
+    assert character_candidate_target({"role": "背景路人"}) == 0
+    assert character_candidate_target({"role": "跑龙套"}) == 0
+
+
 def test_portrait_prompt_prioritizes_identity_over_reference_clothing(app):
     prompt = app.director._portrait_prompt(
         "林昭", "主角", "现代都市3D半写实",

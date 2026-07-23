@@ -29,9 +29,15 @@ SCRIPT_PROMPT = """你是漫剧编剧。为作品《{title}》第{episode}集创
 - 世界设定必须具体写清时代地域、社会/组织规则、能力或技术边界与视觉基准,
   禁止使用“按剧情决定”“自由发挥”等空泛占位;
 - 故事前情必须说明本集开始前发生了什么、当前局势、核心冲突、本集目标及前后集衔接;
-- 每个角色都必须先写完整人物背景提示词,不能只写姓名和标签。背景要和本集剧情、时代/世界观、职业、人物性格、关系、目标与冲突绑定;
-- 每个角色必须有独立的 `introduction`,明确性别、年龄段、身份、性格、目标、
-  与其他角色的关系和不可改变的身份事实;场次中不得出现人物表未介绍的新角色;
+- 主角、重要配角和非重要配角都必须先写完整人物背景提示词,不能只写姓名和标签。
+  背景要和本集剧情、时代/世界观、职业、人物性格、关系、目标与冲突绑定;
+- 主角、重要配角和非重要配角必须有独立的 `introduction`,明确性别、年龄段、
+  身份、性格、目标、人物关系和不可改变的身份事实;
+- 跑龙套、群演、背景路人不得建立独立人物设定。只在 characters 中保留
+  `name`、`role: "背景路人"`、`crowd_function` 和出现场次功能,不写外貌、性别、
+  年龄、妆容、服装、经历或人物背景提示词,也不生成候选图/立绘/四视图;
+- 人物重要度必须明确标为主角、重要配角、非重要配角或背景路人。
+  非重要配角后续固定只生成 1 张候选图;场次中不得出现人物表未声明的新角色;
 - `costume_direction` 必须给出可画的服装逻辑(款式、材质、层次、颜色、职业制服/时代服饰和剧情场合),禁止所有角色默认现代都市便服;
 - `visual_variants` 至少给出 3 个剧情兼容的造型方向(例如日常、行动/冲突、仪式/舞台),后续人物候选图必须据此做明显不同的服装与气质变化;
 - 只输出一个 JSON 对象,不要任何其他文字、解释或 Markdown 代码块。
@@ -48,7 +54,7 @@ JSON 格式(字段必须齐全):
    "current_situation": "本集开场时局势", "core_conflict": "核心冲突",
    "episode_goal": "本集要完成或改变什么",
    "continuity_hooks": "承接前集并留给后集的连续性钩子"}},
- "characters": [{{"name": "角色名", "role": "主角/重要配角/非重要配角/背景路人",
+ "characters": [{{"name": "角色名", "role": "主角/重要配角/非重要配角",
    "introduction": "人物设定介绍:性别、年龄段、身份、性格、目标、关系和身份硬事实",
    "gender": "明确性别", "age_range": "明确年龄段", "identity": "身份与阵营",
    "personality": "性格及外化方式",
@@ -56,7 +62,9 @@ JSON 格式(字段必须齐全):
    "era_setting": "时代/世界观/地域", "occupation": "职业/社会身份",
    "motivation": "核心目标与本集欲望", "backstory": "关键经历、秘密或创伤",
    "relationships": "与其他角色的关系及冲突", "costume_direction": "服装如何体现身份、性格和剧情阶段",
-   "signature_props": "标志性道具或动作", "visual_variants": "日常/冲突/关键场合等不同造型方向"}}],
+   "signature_props": "标志性道具或动作", "visual_variants": "日常/冲突/关键场合等不同造型方向"}},
+  {{"name": "路人功能名", "role": "背景路人",
+   "crowd_function": "在哪一场以几人、什么剧情功能短暂出现;无独立人物资产"}}],
  "scenes": [{{"scene_no": 1, "location": "地点",
    "characters": ["出场角色名"], "action": "本场动作描述",
    "lines": [{{"character": "角色名", "dialogue": "台词"}}]}}]}}"""
@@ -71,10 +79,12 @@ IDOL_PROMPT = """你是 AI 虚拟偶像「{persona}」的内容策划。为第{e
 - 若主题涉及女团/男团/组合,设 2-4 名成员(队长/主唱/舞担等),
   characters 列出全部成员,台词在成员间分配;否则全部台词由
   「{persona}」一人口播;
-- 每个成员都要写与团内定位、歌曲主题、成长经历和本期冲突绑定的人物背景提示词、
+- 每个正式成员都要写与团内定位、歌曲主题、成长经历和本期冲突绑定的人物背景提示词、
   职业/舞台身份、性格外化方式、服装逻辑和至少 3 套练习室/后台/舞台造型方向;
 - 每个成员必须有 `introduction`,明确性别、年龄段、团内身份、性格、目标、
   成员关系与不可改变的身份事实;场次不得新增人物表之外的成员;
+- 临时观众、工作人员、群演等背景路人只写 `name`、`role: "背景路人"` 和
+  `crowd_function`,不建立独立人物设定或人物资产;非重要配角固定只生成 1 张候选图;
 - 台词口语化、有网感,单句不超过 22 个字;
 - 只输出一个 JSON 对象,不要任何其他文字、解释或 Markdown 代码块。
 
@@ -108,9 +118,9 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
 {script}
 
 要求:
-- `story_world`、`story_background` 与 `characters[].introduction` 是硬约束,
-  必须先读取再分镜;不得新增人物表之外的角色,不得擅自改时代、组织、能力、
-  技术、物种、性别、年龄段、身份与人物关系;
+- `story_world`、`story_background`、非背景角色的 `introduction` 与背景路人的
+  `crowd_function` 是硬约束,必须先读取再分镜;不得新增人物表之外的角色,
+  不得擅自改时代、组织、能力、技术、物种、性别、年龄段、身份与人物关系;
 - 每段只承载一个主要动作或一次情绪转折；台词逐字照抄，禁止改写；
 - 每场先给 1 个环境/肢体镜头，再为每句台词给 1 个对白镜头；
 - 关键台词后的听者反应与情绪高潮留白由平台补齐，不要用空镜凑时长；
@@ -154,6 +164,20 @@ BACKGROUND_FIELDS = (
 CHARACTER_INTRO_FIELDS = (
     "introduction", "gender", "age_range", "identity", "personality",
 )
+CHARACTER_PROFILE_FIELDS = (
+    "background_prompt", "era_setting", "occupation", "motivation",
+    "backstory", "relationships", "costume_direction", "signature_props",
+    "visual_variants",
+)
+BACKGROUND_ROLE_TOKENS = (
+    "背景路人", "背景人物", "背景群众", "群众演员", "群演", "跑龙套",
+    "龙套", "临时路人", "路人角色", "路人",
+)
+
+
+def is_background_role(character):
+    role = str((character or {}).get("role") or "").strip().lower()
+    return any(token in role for token in BACKGROUND_ROLE_TOKENS)
 
 
 def _missing(value):
@@ -252,6 +276,17 @@ def normalize_script_bible(script, payload=None):
         role = character.get("role") or "角色"
         places = "、".join(dict.fromkeys(
             appearances.get(name, []))) or locations
+        if is_background_role(character):
+            # 路人只承担场次中的人数/功能，不建立会触发候选图与套件的个人档案。
+            for field in CHARACTER_INTRO_FIELDS + CHARACTER_PROFILE_FIELDS:
+                character.pop(field, None)
+            _fill_missing(
+                character, "crowd_function",
+                f"仅作为{places}中的短暂场景功能角色，按分镜声明的人数出现；"
+                "无独立人物设定、候选图、立绘或四视图。")
+            character["asset_policy"] = "scene_only_no_individual_asset"
+            character["candidate_count"] = 0
+            continue
         _fill_missing(
             character, "introduction",
             f"{name}是本剧{role}，活动于{places}；身份、性格、目标及与"
@@ -294,6 +329,13 @@ def validate_script_bible(script):
         if not isinstance(character, dict) or not character.get("name"):
             continue
         declared.add(character["name"])
+        if is_background_role(character):
+            if _missing(character.get("crowd_function")):
+                return f"{character['name']}背景路人缺少场次功能: crowd_function"
+            if any(not _missing(character.get(field))
+                   for field in CHARACTER_INTRO_FIELDS):
+                return f"{character['name']}是背景路人，不应建立独立人物设定"
+            continue
         for field in CHARACTER_INTRO_FIELDS:
             if _missing(character.get(field)):
                 return f"{character['name']}人物设定字段不全: {field}"
@@ -318,18 +360,13 @@ def validate_script(script, payload):
         return "缺少 scenes"
     if not script.get("characters"):
         return "缺少 characters"
-    character_fields = {
-        "background_prompt": "", "era_setting": "", "occupation": "",
-        "motivation": "", "backstory": "", "relationships": "",
-        "costume_direction": "", "signature_props": "",
-        "visual_variants": [],
-    }
     for character in script["characters"]:
         if not isinstance(character, dict) or not character.get("name"):
             return f"角色字段不全: {character}"
-        for key, default in character_fields.items():
-            character.setdefault(key, default.copy() if isinstance(default, list)
-                                else default)
+        if not is_background_role(character):
+            for key in CHARACTER_PROFILE_FIELDS:
+                default = [] if key == "visual_variants" else ""
+                character.setdefault(key, default)
     for scene in script["scenes"]:
         if not scene.get("location") or "scene_no" not in scene:
             return f"场次字段不全: {scene}"
@@ -396,7 +433,8 @@ DESIGN_PROMPT = """你是漫剧人物设定师。为作品《{title}》的角色
   `costume_direction`、`signature_props` 必须具体;职业身份要能从服装和装备一眼识别;
 - `visual_variants` 必须给出 3-5 个与剧情兼容的不同造型方向,每项写清场合、服装、材质、
   配色、配饰/道具和气质变化;不是同一套衣服只换动作;
-- 给每个角色标注重要度角色:主角、重要配角、非重要配角或背景路人;背景路人不单独生成角色立绘;
+- 传入的正式角色必须标注重要度:主角、重要配角或非重要配角;不得补画或扩写
+  跑龙套/背景路人,这类角色只在剧本场次中保留人数与功能标签,不建立独立设定或人物资产;
 - 性格要能从表情神态与站姿体现;外貌含脸型/肤色/身材比例;
 - 服装要具体到款式、材质、层次;配色给出主色与点缀色;
 - 如果角色有职业或工作身份(如外卖小哥、快递员、医生、护士、警察、消防员、

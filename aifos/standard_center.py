@@ -52,7 +52,8 @@ DEFAULT_STANDARD = {
                 "main": 5,
                 "important_supporting": 3,
                 "non_main": 1,
-                "non_main_max": 3,
+                "non_main_max": 1,
+                "background": 0,
             },
             "initial_portrait_quality_gate": False,
         },
@@ -508,30 +509,33 @@ class StandardCenter:
                               and item.get("id") == "continuity"), 0)
             gates.insert(insert_at, gate)
             changed = True
-        if not changed:
-            asset_rules = rules.get("character_assets")
-            defaults = DEFAULT_STANDARD["rules"]["character_assets"]
-            if not isinstance(asset_rules, dict):
-                changed = True
-                rules["character_assets"] = copy.deepcopy(defaults)
-            else:
-                for key, value in defaults.items():
-                    if key not in asset_rules:
-                        asset_rules[key] = copy.deepcopy(value)
-                        changed = True
+        asset_rules = rules.get("character_assets")
+        defaults = DEFAULT_STANDARD["rules"]["character_assets"]
+        if not isinstance(asset_rules, dict):
+            changed = True
+            rules["character_assets"] = copy.deepcopy(defaults)
         else:
-            asset_rules = rules.get("character_assets")
-            defaults = DEFAULT_STANDARD["rules"]["character_assets"]
-            if not isinstance(asset_rules, dict):
-                rules["character_assets"] = copy.deepcopy(defaults)
+            for key, value in defaults.items():
+                if key not in asset_rules:
+                    asset_rules[key] = copy.deepcopy(value)
+                    changed = True
+            targets = asset_rules.get("candidate_targets")
+            default_targets = defaults["candidate_targets"]
+            if not isinstance(targets, dict):
+                asset_rules["candidate_targets"] = copy.deepcopy(
+                    default_targets)
+                changed = True
             else:
-                for key, value in defaults.items():
-                    asset_rules.setdefault(key, copy.deepcopy(value))
+                for key in ("non_main", "non_main_max", "background"):
+                    if targets.get(key) != default_targets[key]:
+                        targets[key] = default_targets[key]
+                        changed = True
         if not changed:
             return snapshot
         try:
             return self.save(
-                content, change_note="自动升级：加入空间调度图、多人走位与人物资产规则",
+                content, change_note=(
+                    "自动升级：加入剧情事实源、空间调度与角色分级资产规则"),
                 expected_active_id=snapshot.get("version_id"))
         except StandardConflictError:
             # 多个 App 同时启动时由先完成者负责升级。

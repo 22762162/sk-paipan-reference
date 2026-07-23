@@ -12,7 +12,8 @@ import re
 import time
 from pathlib import Path
 
-from .adapters.claude_script import (normalize_script_bible,
+from .adapters.claude_script import (is_background_role,
+                                     normalize_script_bible,
                                      validate_script_bible)
 from .db import now
 from .errors import (AifosError, BudgetExceeded, ProduceCancelled,
@@ -122,9 +123,6 @@ CONFIRM_AFTER = "preflight"
 CHARACTER_CANDIDATES = 5
 IMPORTANT_CHARACTER_CANDIDATES = 3
 NONIMPORTANT_CHARACTER_CANDIDATES = 1
-BACKGROUND_CHARACTER_ROLE_TOKENS = (
-    "背景路人", "背景人物", "背景群众", "群众演员", "群演")
-
 CHARACTER_BACKGROUND_RULE = (
     "人物立绘必须是纯净、无文字的单人物资产背景;背景只允许纯色、柔和渐变"
     "或干净无辨识度的棚拍底,禁止任何场景、建筑、室内、街道、自然环境、"
@@ -179,8 +177,7 @@ SCENE_ENVIRONMENT_PRESETS = (
 
 def is_background_character(character):
     """背景路人可出现在镜头剧情中，但不创建单独人物母资产。"""
-    role = str((character or {}).get("role") or "").strip().lower()
-    return any(token in role for token in BACKGROUND_CHARACTER_ROLE_TOKENS)
+    return is_background_role(character)
 
 
 def character_candidate_target(character):
@@ -193,15 +190,15 @@ def character_candidate_target(character):
     if any(token in role for token in ("非重要", "非主要", "次要")):
         return NONIMPORTANT_CHARACTER_CANDIDATES
     if any(token in role for token in (
-            "重要", "核心", "配角", "同伴", "反派", "对手",
+            "重要", "核心", "同伴", "反派", "对手",
             "队长", "主唱", "舞担", "成员", "男二", "女二")):
         return IMPORTANT_CHARACTER_CANDIDATES
     return NONIMPORTANT_CHARACTER_CANDIDATES
 
 
 def character_candidate_policy_text():
-    return ("主角5张；重要配角3张；非重要配角1张（非主要角色不超过3张）；"
-            "背景路人不单独生成立绘")
+    return ("主角5张；重要配角3张；非重要角色固定1张；"
+            "跑龙套/背景路人不做独立设定、不生成候选图或立绘")
 
 # 人物定版不是“同一套造型换几个动作”。候选分别承担不同的选角方向，
 # 但都受角色年龄、职业、物种、时代和项目画风约束。候选被人工锁定后，
@@ -2057,6 +2054,12 @@ class Director:
             name = character["name"]
             role = character.get("role") or "角色"
             place = "、".join(dict.fromkeys(locations.get(name, []))) or "本集剧情场景"
+            if is_background_character(character):
+                character.setdefault(
+                    "crowd_function",
+                    f"仅作为{place}中的短暂场景功能角色，按分镜声明的人数出现；"
+                    "无独立人物设定、候选图、立绘或四视图")
+                continue
             character.setdefault(
                 "background_prompt",
                 f"{name}作为{role}出现在{place},其经历与本集前提{premise or '当前冲突'}"
@@ -2429,6 +2432,10 @@ class Director:
             name = character["name"] if isinstance(character, dict) else str(character)
             target = character_candidate_target(
                 character if isinstance(character, dict) else {"name": name})
+            # 背景路人只留在剧本、连续性和镜头人数控制中，不进入人物定版清单，
+            # 避免在 UI 与生产计划里形成一条“零候选”的伪人物资产。
+            if target <= 0:
+                continue
             locked = self._locked_identity(project_id, name)
             selected_meta = self._asset_meta(locked)
             candidates = []

@@ -3491,6 +3491,14 @@ function designHtml(design) {
 
 function characterProfileHtml(character) {
   if (!character) return "";
+  const role = String(character.role || "");
+  if (["背景路人", "背景人物", "背景群众", "群众演员", "群演",
+       "跑龙套", "龙套", "临时路人", "路人角色", "路人"]
+      .some((token) => role.includes(token))) {
+    return `<div class="background-cast-note">🎭 ${esc(character.name)}
+      · ${esc(role || "背景路人")} · 仅按场次人数与功能受控，
+      不建立独立人物设定，不生成候选图、立绘或四视图</div>`;
+  }
   const labels = [
     ["introduction", "人物介绍"], ["gender", "性别"],
     ["age_range", "年龄段"], ["identity", "身份/阵营"],
@@ -3934,7 +3942,7 @@ function renderProgressBanner(data) {
     </div>`).join("") + awaitingCast.map((e) => `
     <div class="progress-card confirm">
       <div class="progress-text">《${esc(e.project)}》第${e.number}集 人物候选已就绪 👤
-        <span>候选数量按角色重要度分配（主角5张、重要配角3张、非重要配角1张，非主要角色不超过3张；背景路人不单独生成立绘）；全部定版后才生成后续图片</span></div>
+        <span>候选数量按角色重要度分配（主角5张、重要配角3张、非重要角色固定1张；跑龙套/背景路人不做独立设定，也不生成候选图或立绘）；全部定版后才生成后续图片</span></div>
       <button class="primary" onclick="location.hash='#/episode/${e.id}'">去选人物 →</button>
     </div>`).join("") + awaiting.map((e) => `
     <div class="progress-card confirm">
@@ -4121,7 +4129,7 @@ function renderCastSelection(data, episodeId) {
       ? "已选择简化版：不生成四视图和任何面部、特征、妆容、服装类细节图"
       : "已选择完整版：为每名非背景角色生成全部 6 类扩展资产");
   const policy = selection.candidate_policy
-    || "主角5张；重要配角3张；非重要配角1张（非主要角色不超过3张）；背景路人不单独生成立绘";
+    || "主角5张；重要配角3张；非重要角色固定1张；跑龙套/背景路人不做独立设定、不生成候选图或立绘";
   app.innerHTML = `<div class="canvas-view cast-select-view">
     <div class="confirm-banner">
       <div><b>先定人物，再生产后续图片 👤</b>
