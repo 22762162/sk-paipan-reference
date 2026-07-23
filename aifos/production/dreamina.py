@@ -19,11 +19,12 @@ import json
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 
 
-from ..errors import ProviderError
+from ..errors import ProduceCancelled, ProviderError
 from .base import Provider, ProviderResult
 from .external import run_interruptible
 
@@ -53,6 +54,7 @@ class DreaminaProvider(Provider):
     def generate(self, capability, payload, out_dir, cancel=None):
         if capability != "video":
             raise ProviderError(f"dreamina 适配器不支持能力: {capability}")
+        started_at = time.monotonic()
         out_dir = Path(out_dir).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
         first = payload.get("first", "")
@@ -124,6 +126,14 @@ class DreaminaProvider(Provider):
                 f"{stderr.strip()[:500]}")
         uri = self._extract_uri(stdout)
         if not uri:
+            reply = self._json_reply(stdout)
+            submit_id = str(reply.get("submit_id") or "").strip()
+            status = str(
+                reply.get("gen_status") or reply.get("status") or "").lower()
+            if submit_id and status not in ("failed", "error", "cancelled"):
+                uri = self._wait_for_video(
+                    submit_id, out_dir, log_path, started_at, cancel)
+        if not uri:
             raise ProviderError(
                 f"未能从 dreamina 输出解析出视频地址(详见 {log_path})")
         uri = self._ingest(uri, out_dir, shot_no)
@@ -145,6 +155,69 @@ class DreaminaProvider(Provider):
             },
             uri=uri,
         )
+
+    @staticmethod
+    def _json_reply(stdout):
+        """兼容 CLI 的单行或缩进 JSON 输出。"""
+        text = (stdout or "").strip()
+        try:
+            reply = json.loads(text)
+        except (TypeError, ValueError):
+            return {}
+        return reply if isinstance(reply, dict) else {}
+
+    def _wait_for_video(self, submit_id, out_dir, log_path, started_at,
+                        cancel=None):
+        """异步任务返回 querying 时持续查到成片，不把排队误判为失败。
+
+        dreamina 的 ``--poll`` 只会短暂等待，超时后正常返回 submit_id；
+        这里接管后续查询，并把每次状态写入同一个镜头日志。
+        """
+        timeout = float(self.conf.get("timeout", 1800) or 1800)
+        interval = max(
+            0.05, float(self.conf.get("query_interval", 5) or 5))
+        deadline = started_at + timeout
+        query_no = 0
+        while time.monotonic() < deadline:
+            if cancel is not None and cancel():
+                raise ProduceCancelled(
+                    "已手动停止(终止 dreamina 异步视频查询)")
+            remaining = max(1, int(deadline - time.monotonic()))
+            command = self._command() + [
+                "query_result",
+                f"--submit_id={submit_id}",
+                f"--download_dir={out_dir}",
+            ]
+            returncode, stdout, stderr = run_interruptible(
+                "dreamina", command, None, min(60, remaining),
+                cancel=cancel)
+            query_no += 1
+            with log_path.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    f"\n--- query_result #{query_no} ---\n{stdout}\n"
+                    f"--- query stderr ---\n{stderr}\n")
+            if returncode != 0:
+                raise ProviderError(
+                    f"dreamina query_result 退出码 {returncode}: "
+                    f"{stderr.strip()[:500]}")
+            uri = self._extract_uri(stdout)
+            if uri:
+                return uri
+            reply = self._json_reply(stdout)
+            status = str(
+                reply.get("gen_status") or reply.get("status") or "").lower()
+            if status in ("failed", "error", "cancelled"):
+                detail = reply.get("message") or reply.get("error") or status
+                raise ProviderError(
+                    f"dreamina 任务 {submit_id} 生成失败: {detail}")
+            sleep_until = min(deadline, time.monotonic() + interval)
+            while time.monotonic() < sleep_until:
+                if cancel is not None and cancel():
+                    raise ProduceCancelled(
+                        "已手动停止(终止 dreamina 异步视频查询)")
+                time.sleep(min(0.5, sleep_until - time.monotonic()))
+        raise ProviderError(
+            f"dreamina 异步视频等待超时({int(timeout)}s): {submit_id}")
 
     @staticmethod
     def _ingest(uri, out_dir, shot_no):

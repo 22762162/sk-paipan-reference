@@ -1773,6 +1773,15 @@ class Director:
             workers = 3
         return max(1, min(workers, 8))
 
+    def _video_parallel_workers(self):
+        """Seedance 同时生成的镜头数；默认 4 路，避免串行等待。"""
+        try:
+            workers = int(self.config.get(
+                "defaults", "parallel_videos", default=4))
+        except (TypeError, ValueError):
+            workers = 4
+        return max(1, min(workers, 8))
+
     def _run_parallel(self, ctx, tasks, line="出图产线"):
         """有界并行出图:只把 worker 数量的任务标为生成中。
 
@@ -3763,6 +3772,7 @@ class Director:
         frames = {f["shot_no"]: f for f in ctx["frames"]}
         ctx["videos"] = []
         reused = 0
+        pending = []
         for shot in ctx["storyboard"]["shots"]:
             name = self._shot_name(ctx, shot["shot_no"])
             existing = self._existing_asset_uri(ctx, "video", name)
@@ -3780,8 +3790,17 @@ class Director:
                         "video_resolution", "720p")})
                 reused += 1
                 continue
-            ctx["videos"].append(self._make_video(ctx, shot, frames))
-        return {"count": len(ctx["videos"]), "reused": reused}
+            pending.append(self._prepare_video_call(ctx, shot, frames))
+        generated = self._run_videos_parallel(ctx, pending)
+        ctx["videos"].extend(generated.values())
+        ctx["videos"].sort(key=lambda item: int(item["shot_no"]))
+        return {
+            "count": len(ctx["videos"]),
+            "reused": reused,
+            "generated": len(generated),
+            "parallel_workers": min(
+                self._video_parallel_workers(), max(1, len(pending))),
+        }
 
     def _ensure_spatial_reference_assets(self, ctx):
         """补齐并登记本集 Seedance 必传的逐镜空间 PNG（兼容旧项目）。"""
@@ -4050,7 +4069,8 @@ class Director:
                 rows.append(row)
         return rows[:7]
 
-    def _make_video(self, ctx, shot, frames):
+    def _prepare_video_call(self, ctx, shot, frames):
+        """在主线程锁定单镜首尾帧、人物/场景资产和空间图映射。"""
         frame = frames[shot["shot_no"]]
         if not formal_reference_allowed(
                 frame.get("image_quality", "medium")):
@@ -4094,7 +4114,7 @@ class Director:
                     f"图{item['index']}={item['kind']}/{item['name']}："
                     f"{item['binding']}" for item in reference_manifest)
                 + "。必须严格按图序使用，禁止张冠李戴。")
-        result = self._call(ctx, "video", {
+        payload = {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
             "prompt": video_prompt,
@@ -4113,7 +4133,21 @@ class Director:
             "standard_fingerprint": ctx["production_profile"].get(
                 "standard_fingerprint", ""),
             "aspect": ctx["aspect"], **ctx["dims"],
-        }, "videos")
+        }
+        return {
+            "shot": shot,
+            "payload": payload,
+            "quality": quality,
+            "reference_assets": reference_assets,
+            "reference_manifest": reference_manifest,
+        }
+
+    def _finish_video_call(self, ctx, task, result):
+        """在主线程登记单镜视频，避免并发 worker 争抢资产版本。"""
+        shot = task["shot"]
+        quality = task["quality"]
+        reference_assets = task["reference_assets"]
+        reference_manifest = task["reference_manifest"]
         provider = self.router.providers.get(result.provider)
         audio_in_video = bool(
             provider and provider.conf.get("audio_in_video"))
@@ -4140,6 +4174,102 @@ class Director:
                 "video_resolution": quality["resolution"],
                 "reference_assets": reference_assets,
                 "reference_manifest": reference_manifest}
+
+    def _run_videos_parallel(self, ctx, tasks):
+        """有界并行生成 Seedance 视频，完成一镜就立即记账并沉淀资产。
+
+        worker 只执行 Provider 调用；提示词、首尾帧、人物与空间参考图均在
+        提交前按镜头冻结。暂停/失败后不再派发新镜头，已完成视频继续保留。
+        """
+        if not tasks:
+            return {}
+        workers = min(self._video_parallel_workers(), len(tasks))
+        if workers == 1:
+            output = {}
+            for task in tasks:
+                result = self._call(
+                    ctx, "video", task["payload"], "videos")
+                video = self._finish_video_call(ctx, task, result)
+                output[int(video["shot_no"])] = video
+            return output
+        if self._cancel_requested(ctx):
+            raise ProduceCancelled("已手动停止生成")
+        episode = self.projects.get_episode(ctx["episode"]["id"])
+        budget = self.config.get("budget", "per_episode", default=0)
+        if budget and episode["cost"] >= budget:
+            raise BudgetExceeded(
+                f"单集成本 {episode['cost']:.2f} 已达预算 {budget},停止调度")
+
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+        self.log.info(
+            "director",
+            f"Seedance 视频并行开工:共 {len(tasks)} 个镜头,"
+            f"{workers} 路同时生成")
+        cancel = lambda: self._cancel_requested(ctx)   # noqa: E731
+        output, failures = {}, []
+        cancelled = False
+        started_at = time.monotonic()
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            iterator = iter(tasks)
+            futures = {}
+
+            def submit_next():
+                try:
+                    task = next(iterator)
+                except StopIteration:
+                    return False
+                future = pool.submit(
+                    self.router.call, "video", task["payload"],
+                    ctx["out_root"] / "videos", cancel)
+                futures[future] = task
+                return True
+
+            for _ in range(workers):
+                submit_next()
+            while futures:
+                done_now, _ = wait(
+                    set(futures), timeout=2,
+                    return_when=FIRST_COMPLETED)
+                for future in done_now:
+                    task = futures.pop(future)
+                    try:
+                        result = future.result()
+                    except ProduceCancelled:
+                        cancelled = True
+                        continue
+                    except Exception as exc:
+                        failures.append((task, exc))
+                        continue
+                    self._task_cost += result.cost
+                    self._task_providers.add(result.provider)
+                    self.projects.add_episode_cost(
+                        ctx["episode"]["id"], result.cost)
+                    video = self._finish_video_call(ctx, task, result)
+                    output[int(video["shot_no"])] = video
+                if (not cancelled and not failures
+                        and not self._cancel_requested(ctx)):
+                    while len(futures) < workers and submit_next():
+                        pass
+
+        elapsed = max(.001, time.monotonic() - started_at)
+        self.log.info(
+            "director",
+            f"Seedance 视频本批完成 {len(output)}/{len(tasks)}，"
+            f"墙钟 {elapsed:.1f}s，吞吐 "
+            f"{len(output) * 60 / elapsed:.2f} 镜头/分钟")
+        if cancelled or self._cancel_requested(ctx):
+            raise ProduceCancelled(
+                "已手动暂停(本批已完成的视频全部保留)")
+        if failures:
+            raise failures[0][1]
+        return output
+
+    def _make_video(self, ctx, shot, frames):
+        """兼容单镜调用；正式视频阶段由 4 路并行调度器执行。"""
+        task = self._prepare_video_call(ctx, shot, frames)
+        result = self._call(ctx, "video", task["payload"], "videos")
+        return self._finish_video_call(ctx, task, result)
 
     def _video_audio_states(self, ctx):
         """按实际视频资产/Provider 声明返回每镜是否内置配音。"""

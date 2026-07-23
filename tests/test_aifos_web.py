@@ -798,9 +798,16 @@ def test_image_line_switch_and_parallel(server):
     assert status == 200
     status, view = _json_request(port, "GET", "/api/settings")
     assert view["defaults"]["parallel_images"] == 6
+    assert view["defaults"]["parallel_videos"] == 4
+    # 视频生产独立配置，默认 4 路，也可按账号限流自主调整。
+    status, _ = _json_request(port, "POST", "/api/settings", {
+        "defaults": {"parallel_videos": 6}})
+    assert status == 200
+    status, view = _json_request(port, "GET", "/api/settings")
+    assert view["defaults"]["parallel_videos"] == 6
     # 非法值被拒
     status, _ = _json_request(port, "POST", "/api/settings", {
-        "defaults": {"parallel_images": "abc"}})
+        "defaults": {"parallel_videos": "abc"}})
     assert status == 400
 
 

@@ -28,12 +28,53 @@ if args and args[0] in ("frames2video", "multimodal2video"):
 sys.exit(2)
 '''
 
+FAKE_ASYNC_DREAMINA = '''#!/usr/bin/env python3
+import json, os, sys
+here = os.path.dirname(os.path.abspath(__file__))
+args = sys.argv[1:]
+with open(os.path.join(here, "calls.log"), "a") as f:
+    f.write(json.dumps(args, ensure_ascii=False) + "\\n")
+if args and args[0] in ("frames2video", "multimodal2video"):
+    print(json.dumps({
+        "submit_id": "async-video-1",
+        "gen_status": "querying",
+        "queue_info": {"queue_status": "Generating"},
+    }))
+    sys.exit(0)
+if args and args[0] == "query_result":
+    download = next(
+        (x.split("=", 1)[1] for x in args if x.startswith("--download_dir=")),
+        here)
+    os.makedirs(download, exist_ok=True)
+    out = os.path.join(download, "async-result.mp4")
+    open(out, "wb").write(b"\\x00\\x00\\x00 ftypisom-async")
+    print(json.dumps({
+        "submit_id": "async-video-1",
+        "gen_status": "success",
+        "video_path": out,
+    }))
+    sys.exit(0)
+if args and args[0] == "user_credit":
+    print("credit balance: 420")
+    sys.exit(0)
+sys.exit(2)
+'''
+
 
 @pytest.fixture()
 def fake_dreamina(tmp_path):
     binary = tmp_path / "bin" / "dreamina"
     binary.parent.mkdir(parents=True)
     binary.write_text(FAKE_DREAMINA, encoding="utf-8")
+    binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+    return binary
+
+
+@pytest.fixture()
+def fake_async_dreamina(tmp_path):
+    binary = tmp_path / "async-bin" / "dreamina"
+    binary.parent.mkdir(parents=True)
+    binary.write_text(FAKE_ASYNC_DREAMINA, encoding="utf-8")
     binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
     return binary
 
@@ -118,6 +159,35 @@ def test_asset_references_use_multimodal2video(tmp_path, fake_dreamina):
             str(Path("/tmp/hero.png").resolve()),
             str(Path("/tmp/room.png").resolve())]
         assert result.data["reference_assets"][0]["asset_id"] == 8
+    finally:
+        app.close()
+
+
+def test_async_querying_result_is_polled_until_video(
+        tmp_path, fake_async_dreamina):
+    """CLI 返回 querying 是正常排队，必须继续查结果，不能回退并重复扣费。"""
+    app = _make_app(
+        tmp_path, fake_async_dreamina,
+        {"poll": 0, "query_interval": 0.05, "timeout": 5})
+    try:
+        result = app.router.call("video", {
+            "shot_no": 3,
+            "prompt": "人物沿行动路线向镜头走来",
+            "first": "/tmp/first.png",
+            "last": "/tmp/last.png",
+        }, app.workspace.artifacts_dir)
+        assert result.provider == "jimeng"
+        assert result.uri.endswith("shot_003.mp4")
+        assert Path(result.uri).exists()
+        calls = _calls(fake_async_dreamina)
+        assert [call[0] for call in calls] == [
+            "frames2video", "query_result"]
+        assert "--submit_id=async-video-1" in calls[1]
+        assert any(
+            arg.startswith("--download_dir=") for arg in calls[1])
+        assert app.router.quota_remaining("jimeng") == 999
+        log_path = app.workspace.artifacts_dir / "shot_003.dreamina.log"
+        assert "query_result #1" in log_path.read_text(encoding="utf-8")
     finally:
         app.close()
 

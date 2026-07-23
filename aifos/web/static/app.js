@@ -5447,6 +5447,7 @@ function renderProductionView(data, episodeId) {
   document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
   document.getElementById("btn-plan-live").onclick = () => showPlanOverlay(episodeId);
   bindImageAccelerationLivebar(episodeId);
+  bindProductionLedger(app, data, episodeId);
   document.getElementById("btn-stop").onclick = (ev) => {
     ev.target.disabled = true;
     ev.target.textContent = "停止中…";
@@ -5464,8 +5465,10 @@ function imageLineControlsHtml() {
   return `<div class="style-row image-line-row">
     <label>出图策略</label>
     <select id="image-line" disabled><option>加载中…</option></select>
-    <label class="il-label">并行路数</label>
+    <label class="il-label">图片并行</label>
     <select id="parallel-images" disabled><option>…</option></select>
+    <label class="il-label">视频并行</label>
+    <select id="parallel-videos" disabled><option>…</option></select>
     <label class="il-label">质检产线</label>
     <select id="qc-line" disabled><option>…</option></select>
     <span class="dim" id="image-line-hint"></span>
@@ -5486,7 +5489,8 @@ function staleServerHint(e) {
 async function bindImageLineControls() {
   const lineSel = document.getElementById("image-line");
   const parSel = document.getElementById("parallel-images");
-  if (!lineSel || !parSel) return;
+  const videoParSel = document.getElementById("parallel-videos");
+  if (!lineSel || !parSel || !videoParSel) return;
   let st;
   try { st = await api("/api/settings"); } catch (e) { return; }
   const byName = {};
@@ -5555,6 +5559,23 @@ async function bindImageLineControls() {
           defaults: { parallel_images: Number(parSel.value) } }),
       });
       showToast(`并行出图已设为 ${parSel.value} 路,下一批生效`, "ok");
+    } catch (e) {
+      showToast(staleServerHint(e), "error");
+    }
+  };
+  videoParSel.innerHTML = [1, 2, 3, 4, 6, 8].map(
+    (n) => `<option value="${n}">${n} 路并行</option>`).join("");
+  videoParSel.value = String((st.defaults || {}).parallel_videos || 4);
+  videoParSel.disabled = false;
+  videoParSel.onchange = async () => {
+    try {
+      await api("/api/settings", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          defaults: { parallel_videos: Number(videoParSel.value) } }),
+      });
+      showToast(`视频生产已设为 ${videoParSel.value} 路并行，`
+        + "下一批 Seedance 生效", "ok");
     } catch (e) {
       showToast(staleServerHint(e), "error");
     }

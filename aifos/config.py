@@ -15,6 +15,8 @@ from pathlib import Path
 DEFAULTS = {
     "defaults": {
         "aspect": "9:16",              # 全局默认画幅(抖音竖屏);项目可设 16:9
+        # Seedance 逐镜视频默认 4 路并行；可在设置页按账号限流调低/调高。
+        "parallel_videos": 4,
     },
     # 本地 artifacts 是唯一事实源；图片完成并登记后异步复制到 iCloud，
     # 只供手机/Finder 查看。默认关闭，避免测试或其他 workspace 意外写云盘。

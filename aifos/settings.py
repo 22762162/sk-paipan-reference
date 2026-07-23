@@ -126,6 +126,8 @@ def settings_payload(app):
         "defaults": {
             "parallel_images": app.config.get(
                 "defaults", "parallel_images", default=3),
+            "parallel_videos": app.config.get(
+                "defaults", "parallel_videos", default=4),
         },
         "icloud_sync": app.icloud_sync.status(),
         "config_path": str(app.workspace.config_path),
@@ -260,8 +262,8 @@ def set_image_strategy(config_path, strategy):
 
 
 def set_defaults(config_path, mapping):
-    """写入 defaults 配置(如 parallel_images 并行出图路数)。"""
-    allowed = {"parallel_images"}
+    """写入 defaults 配置(图片/视频并行生产路数)。"""
+    allowed = {"parallel_images", "parallel_videos"}
     updates = {}
     for key, value in (mapping or {}).items():
         if key not in allowed:
