@@ -27,6 +27,13 @@ def test_default_standard_is_complete_and_active(tmp_path):
         assert content["source_skill"]["id"] == "sk-manju-storyboard-skill"
         rules = content["rules"]
         production = rules["production"]
+        story_analysis = rules["story_analysis"]
+        assert story_analysis["required_before_images"] is True
+        assert story_analysis["auto_analyze_uploaded_script"] is True
+        assert story_analysis["user_style_is_hard_constraint"] is True
+        assert story_analysis["downstream_consumers"] == [
+            "character", "scene", "storyboard", "keyframe", "seedance",
+        ]
         assert production["video_model"] == "seedance2.0fast_vip"
         assert production["resolution"] == "720p"
         assert production["voice"] == "jimeng_builtin"
@@ -48,6 +55,22 @@ def test_default_standard_is_complete_and_active(tmp_path):
         }
         assert [gate["id"] for gate in rules["quality_gates"]] == REQUIRED_GATE_IDS
         assert app.db.query_one("PRAGMA busy_timeout")[0] == 5000
+    finally:
+        app.close()
+
+
+def test_existing_standard_is_upgraded_with_story_analysis_rules(tmp_path):
+    app = App(tmp_path / "ws")
+    try:
+        active = app.standards.active()
+        legacy = copy.deepcopy(active)
+        legacy["content"]["rules"].pop("story_analysis")
+        upgraded = app.standards._upgrade_spatial_standard(legacy)
+        assert upgraded["version"] == active["version"] + 1
+        assert upgraded["content"]["rules"]["story_analysis"] == (
+            DEFAULT_STANDARD["rules"]["story_analysis"])
+        assert "剧本分析" in upgraded["change_note"]
+        assert len(app.standards.history("sk-manju-v5")) == 2
     finally:
         app.close()
 
