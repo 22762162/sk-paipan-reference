@@ -4330,11 +4330,29 @@ function showVideoReferencePicker(data, episodeId, shotNo) {
         <span>${esc(item.label)}</span>
         <small>${esc(item.quality || "medium")}${item.usable_for_video ? "" : " · 低质量禁用"}</small>
       </label>`).join("") || `<div class="dim">资产中心还没有可选图片。</div>`}</div>
-    <div class="script-actions"><button class="primary save">保存参考图</button></div>
+    <div class="script-actions">
+      <button class="reset-auto" title="撤销人工选择,回到按剧本自动选入分镜图/人物立绘/场景图">↺ 恢复自动选入</button>
+      <button class="primary save">保存参考图</button></div>
   </div>`;
   const close = () => overlay.remove();
   overlay.querySelector(".close").onclick = close;
   overlay.addEventListener("click", (ev) => { if (ev.target === overlay) close(); });
+  overlay.querySelector(".reset-auto").onclick = async (ev) => {
+    ev.target.disabled = true; ev.target.textContent = "恢复中…";
+    try {
+      await api("/api/video/references", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ episode_id: episodeId, shot_no: shotNo,
+          reset: true }),
+      });
+      close();
+      showToast(`镜头 ${shotNo} 已恢复自动选入必要参考图`, "ok");
+      renderCanvasView(episodeId);
+    } catch (e) {
+      showToast(e.message, "error");
+      ev.target.disabled = false; ev.target.textContent = "↺ 恢复自动选入";
+    }
+  };
   overlay.querySelector(".save").onclick = async (ev) => {
     const ids = [...overlay.querySelectorAll("input:checked")]
       .map((input) => Number(input.value));

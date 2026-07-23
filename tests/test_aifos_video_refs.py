@@ -110,3 +110,30 @@ def test_locked_character_missing_candidates_not_stuck_pending(app):
     ids = {i["id"] for i in candidates}
     assert f"candidate:{hero}:4" not in ids
     assert f"candidate:{hero}:5" not in ids
+
+
+def test_shot_example_image_always_submitted_even_low_quality(app):
+    """镜头示例图有则必交:即使被归为低质量试错图也自动选入。"""
+    project, episode, out = _preproduce(app, "万妖图录")
+    row = app.assets.latest(project["id"], "image", "e001_shot001")
+    assert row is not None
+    # 模拟该分镜图被质量策略归为低质量(试错级)
+    app.assets.register(
+        project["id"], "image", "e001_shot001", uri=row["uri"],
+        meta={"image_quality": "low"}, new_version=True)
+    effective = app.director.effective_video_references(episode["id"])
+    kinds = [item["kind"] for item in effective["shots"]["1"]["items"]]
+    assert "image" in kinds, "低质量分镜示例图被静默丢弃(应仍提交)"
+
+
+def test_reset_manual_selection_falls_back_to_auto(app):
+    """人工选择可一键撤销,回落自动选入。"""
+    project, episode, out = _preproduce(app, "万妖图录")
+    app.director.set_video_references(episode["id"], 1, [])   # 人工清空
+    assert app.director.effective_video_references(
+        episode["id"])["shots"]["1"]["mode"] == "manual"
+    app.director.set_video_references(episode["id"], 1, [], reset=True)
+    effective = app.director.effective_video_references(episode["id"])
+    assert effective["shots"]["1"]["mode"] == "auto"
+    assert any(item["kind"] == "image"
+               for item in effective["shots"]["1"]["items"])
