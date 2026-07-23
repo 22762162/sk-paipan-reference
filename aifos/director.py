@@ -3533,8 +3533,12 @@ class Director:
             ctx["videos"].append(self._make_video(ctx, shot, frames))
         return {"count": len(ctx["videos"]), "reused": reused}
 
-    def set_video_references(self, episode_id, shot_no, asset_ids):
-        """保存某镜头从资产中心人工选定的 Seedance 参考图。"""
+    def set_video_references(self, episode_id, shot_no, asset_ids,
+                             reset=False):
+        """保存某镜头从资产中心人工选定的 Seedance 参考图。
+
+        reset=True 撤销该镜头的人工选择,回落到自动选入必要参考图。
+        """
         episode = self.projects.get_episode(int(episode_id))
         if episode is None:
             raise AifosError("剧集不存在")
@@ -3544,6 +3548,16 @@ class Director:
         if not any(int(shot.get("shot_no", -1)) == int(shot_no)
                    for shot in shots):
             raise AifosError(f"镜头不存在: {shot_no}")
+        if reset:
+            document, _ = self.projects.latest_document(
+                episode["id"], "video_references")
+            document = document or {
+                "schema": "aifos.video-references/v1", "shots": {}}
+            document.setdefault("shots", {}).pop(str(int(shot_no)), None)
+            document["updated_at"] = now()
+            version = self.projects.save_document(
+                episode["id"], "video_references", document)
+            return {**document, "version": version}
         unique_ids = []
         for value in asset_ids or []:
             asset_id = int(value)
@@ -3654,9 +3668,18 @@ class Director:
                 seen.add(row["id"])
                 rows.append(row)
 
-        add(self.assets.latest(
+        # 本镜分镜示例图:有就必交(首尾帧本就源于它,画了不交等于白做);
+        # 它承载本镜构图/调度事实,不受"低质量禁入正式参考链"限制
+        shot_image = self.assets.latest(
             project_id, "image",
-            f"e{ctx['episode']['number']:03d}_shot{int(shot_no):03d}"))
+            f"e{ctx['episode']['number']:03d}_shot{int(shot_no):03d}")
+        if (shot_image is not None
+                and not self.assets.is_deleted(shot_image)
+                and shot_image["uri"]
+                and (shot_image["uri"].startswith(("http://", "https://"))
+                     or Path(shot_image["uri"]).exists())):
+            seen.add(shot_image["id"])
+            rows.append(shot_image)
         for name in shot.get("characters", []) or []:
             add(self._locked_identity(project_id, name))
         if location:

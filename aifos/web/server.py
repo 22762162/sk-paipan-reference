@@ -2046,7 +2046,8 @@ def make_handler(workspace, jobs):
                 result = self._with_app(
                     lambda app: app.director.set_video_references(
                         int(body["episode_id"]), int(body["shot_no"]),
-                        body.get("asset_ids") or []))
+                        body.get("asset_ids") or [],
+                        reset=bool(body.get("reset"))))
             except Exception as exc:
                 return self._error(400, str(exc))
             return self._json(result)
