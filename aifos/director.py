@@ -272,14 +272,27 @@ CHARACTER_LOOK_VARIANTS = (
     },
 )
 
-# 人物完整资产套件:立绘之外每个角色补齐的生产级设定资产
-# (项目级,跨集复用;全部以立绘和用户参考图为基准保证同一形象)
-CHARACTER_SHEETS = [
-    ("turnaround", "四视图",
-     "标准四视图设定:正面/侧面/背面/四分之三视角并排一张图,"
-     "全身等比例,发型服装配色完全一致"),
+# 人物完整资产套件：16:9 合成板只用于审核；面部、正面、严格侧面和
+# 完整背面必须分别生成高清单图，作为后续镜头真正使用的母资产。
+CANONICAL_CHARACTER_SHEETS = [
+    ("turnaround", "三视图审核板",
+     "16:9横版审核板:左侧约1/3为同一角色清晰面部近景；右侧约2/3"
+     "依次为同一角色完整全身正面、严格90度侧面、完整180度背面；"
+     "纯白或中性浅灰背景,统一相机高度、焦段、站姿和比例；审核板仅作"
+     "人工浏览与索引,不得替代独立高清母资产"),
     ("closeup", "面部特写",
-     "面部大特写:五官、发际线、瞳色细节清晰,中性表情"),
+     "独立高清面部近景母资产:中性表情,五官、发际线、瞳色、耳部、"
+     "下颌与颈部结构清晰；肤面干净均匀,只保留极轻微自然微纹理"),
+    ("front", "正面母资产",
+     "独立高清全身正面母资产:严格正对镜头,自然中性站姿,从头到脚完整可见"),
+    ("profile", "侧面母资产",
+     "独立高清全身侧面母资产:严格90度真侧面,鼻唇下颌、耳朵、后脑、"
+     "肩胯与服装侧缝结构真实,不得只做轻微转头或四分之三视角"),
+    ("back", "背面母资产",
+     "独立高清全身背面母资产:严格180度完整背面,后脑、发型背部、"
+     "肩胛、服装背片、接缝、扣件和配饰位置真实,不得复制正面"),
+]
+DETAIL_CHARACTER_SHEETS = [
     ("features", "特征设定",
      "辨识特征拆解:发型、瞳色、体态、标志性配饰逐项放大标注"),
     ("makeup", "妆容设定",
@@ -289,6 +302,8 @@ CHARACTER_SHEETS = [
     ("costume_detail", "服装细节",
      "服装细节拆解:纹样、扣饰、腰带、鞋履、佩饰逐项放大展示"),
 ]
+CHARACTER_SHEETS = CANONICAL_CHARACTER_SHEETS + DETAIL_CHARACTER_SHEETS
+CANONICAL_CHARACTER_SHEET_KEYS = ("closeup", "front", "profile", "back")
 
 CHARACTER_ASSET_POLICY_SCHEMA = "aifos.character-assets/v1"
 CHARACTER_ASSET_MODES = ("auto", "simple", "full")
@@ -819,9 +834,18 @@ class Director:
     SHEET_DESIGN_KEYS = {
         "turnaround": ("species", "appearance", "hair", "costume",
                        "palette", "era_setting", "occupation",
-                       "costume_direction"),
+                       "costume_direction", "visual_dna", "cast_dedup"),
         "closeup": ("species", "appearance", "hair", "eyes",
-                    "temperament", "background_prompt"),
+                    "temperament", "background_prompt", "visual_dna"),
+        "front": ("species", "appearance", "hair", "costume",
+                  "costume_detail", "accessories", "palette",
+                  "visual_dna"),
+        "profile": ("species", "appearance", "hair", "costume",
+                    "costume_detail", "accessories", "palette",
+                    "visual_dna"),
+        "back": ("species", "appearance", "hair", "costume",
+                 "costume_detail", "accessories", "palette",
+                 "visual_dna"),
         "features": ("signature", "appearance", "hair", "palette",
                       "signature_props"),
         "makeup": ("makeup", "eyes", "palette", "personality"),
@@ -849,7 +873,10 @@ class Director:
         ("visual_variants", "剧情造型方案"),
         ("visual_direction", "制作圣经视觉方向"),
         ("prompt_prefix", "人物提示词母版"),
-        ("continuity_anchors", "人物连续性锚点"))
+        ("continuity_anchors", "人物连续性锚点"),
+        ("character_analysis", "人物因果分析"),
+        ("visual_dna", "人物视觉DNA"),
+        ("cast_dedup", "全剧角色去重"))
 
     @staticmethod
     def _design_value(value):
@@ -1054,8 +1081,11 @@ class Director:
         """套件重画只复用最相关的 1–2 张资产，避免参考图互相争权。"""
         uris = []
         priority = {
-            "turnaround": ("costume", "features"),
-            "closeup": ("features", "makeup"),
+            "turnaround": ("front", "profile"),
+            "closeup": ("front", "features"),
+            "front": ("closeup", "turnaround"),
+            "profile": ("front", "closeup"),
+            "back": ("profile", "front"),
             "features": ("turnaround", "makeup"),
             "makeup": ("features", "turnaround"),
             "costume": ("turnaround", "costume_detail"),
@@ -1088,6 +1118,7 @@ class Director:
             "era_setting",
             "occupation", "motivation", "backstory", "relationships",
             "costume_direction", "signature_props",
+            "character_analysis", "visual_dna", "cast_dedup",
         )
         return {key: design.get(key) for key in keys if design.get(key)}
 
@@ -1183,7 +1214,9 @@ class Director:
                           "background_prompt", "era_setting", "occupation",
                           "motivation", "costume_direction",
                           "signature_props", "visual_direction",
-                          "prompt_prefix", "continuity_anchors"))
+                          "prompt_prefix", "continuity_anchors",
+                          "character_analysis", "visual_dna",
+                          "cast_dedup"))
         look = variant["look_variant"]
         if has_reference:
             hair = (
@@ -1222,6 +1255,13 @@ class Director:
             + "但必须适配角色的性别表达、年龄、职业、物种、时代背景、人物背景和项目画风;"
             + "造型变化优先体现剧情场合与人物性格，不得套用现代都市默认模板"
             f"。【STYLE】{style}；{WORKWEAR_RULE}{CHARACTER_BACKGROUND_RULE}"
+            "【NARRATIVE DNA】按“剧情证据→经历与处境→性格与行为→"
+            "可见外貌→视觉DNA”推导；所有可见特征必须能追溯到人物经历、当前处境、"
+            "性格或行为；禁止AI网红脸、模板帅哥美女、韩式偶像脸，以及"
+            "只靠帅、美、冷峻、高级等空洞词塑造角色。"
+            "【CAST DEDUP】与全剧其他角色比较发型轮廓、服装结构、身体/职业"
+            "痕迹、故事视觉符号、核心配饰和气质关键词；两个及以上主要维度"
+            "重叠时，本角色必须先更换结构方案再出图。"
             "【COMPOSITION】全身正面自然站姿，动作只服务造型展示。"
             "【SKIN / STRUCTURE】肤色干净均匀、仅保留极轻微真实微纹理，"
             "五官、手指、关节与身体比例自然。"
@@ -1291,6 +1331,32 @@ class Director:
             "均无可读文字、字幕、Logo、水印、乱码和品牌标识",
             (f"负面约束:{negative}" if negative else ""))))
 
+    @staticmethod
+    def _sheet_view_contract(key):
+        return {
+            "turnaround": (
+                "【REVIEW BOARD】16:9横版；左侧约1/3为清晰面部近景，"
+                "右侧约2/3依次为完整全身正面、严格90度侧面、完整180度"
+                "背面。纯白或中性浅灰背景，统一相机高度、焦段、水平线、"
+                "柔和中性光和自然站姿。该图仅用于审核与索引；不依赖模型"
+                "生成Front/Profile/Back文字，标签留给静态排版。"),
+            "closeup": (
+                "【CANONICAL FACE】独立高清面部近景，正面中性表情；"
+                "完整保留脸型、五官比例、眼鼻嘴、发际线、耳部、下颌与"
+                "颈部连接，作为后续镜头面部身份母资产。"),
+            "front": (
+                "【CANONICAL FRONT】独立高清全身正面；严格正对镜头，"
+                "身体无偏转，从头到脚完整可见，不裁切、不遮挡。"),
+            "profile": (
+                "【CANONICAL PROFILE】独立高清全身严格90度真侧面；"
+                "双眼不可同时完整可见，鼻唇下颌、耳朵、后脑、肩胯、"
+                "服装侧缝与配饰悬挂关系必须真实；禁止四分之三视角。"),
+            "back": (
+                "【CANONICAL BACK】独立高清全身严格180度完整背面；"
+                "不露正脸，真实展示后脑发型、肩胛、服装背片、接缝、"
+                "扣件、纹样与配饰背部位置；禁止复制正面。"),
+        }.get(key, "")
+
     def _sheet_prompt(self, name, role, style, label, desc, key=None,
                       design=None, locked_look=None):
         detail = self._design_line(
@@ -1298,6 +1364,7 @@ class Director:
         anchor = self._locked_look_line(locked_look)
         return (
             f"【任务】角色{label}:{name}({role})；{desc}。"
+            f"{self._sheet_view_contract(key)}"
             "【IDENTITY LOCK】只以人工锁定最终立绘锁定脸型、五官骨相、"
             "年龄、性别表达、发际线、发型轮廓和身份标志；必须是同一人。"
             + (f"【人物设定】{detail}。" if detail else "")
@@ -1306,10 +1373,13 @@ class Director:
             + "【WORLD / COSTUME】造型必须服从人物背景、时代/世界观、"
             "职业、性格和剧情场合，不得套用现代都市模板。"
             f"【STYLE】{style}。"
-            "【CONSISTENCY】除本资产明确展示的视角/细节外，发型、服装结构、"
-            "配色、材质和配饰必须与最终立绘及已锁定造型一致。"
+            "【CONSISTENCY】所有母资产必须是同一个人、同一年龄、同一套"
+            "服装与配饰；身高、头身比、肩胯宽度、四肢长度、五官位置、"
+            "发型轮廓、服装接缝、扣件、纹样、材质、颜色和配饰位置严格"
+            "对应。除本资产明确展示的视角/细节外，不得改变结构。"
             "【SKIN / STRUCTURE】肤色干净均匀，仅保留极轻微真实微纹理；"
-            "五官、手指、关节和身体比例自然。"
+            "依靠骨相、体积和统一光线建立真实感，不增加可见脏点、斑驳"
+            "泛红、灰褐颗粒或过强毛孔；五官、手指、关节和身体比例自然。"
             f"【NEGATIVE】禁止换脸、换性别、增减人物、乱码、Logo、水印；"
             f"{WORKWEAR_RULE}{CHARACTER_BACKGROUND_RULE}")
 
@@ -2403,6 +2473,9 @@ class Director:
                 "服装须符合时代/世界观、职业、性格和当前场合;至少区分日常、冲突、关键场合三套造型")
             character.setdefault("signature_props", "由职业、经历或本集关键事件决定的标志道具")
             character.setdefault("visual_variants", [])
+            character.setdefault("character_analysis", {})
+            character.setdefault("visual_dna", {})
+            character.setdefault("cast_dedup", {})
         normalize_script_bible(script, {
             "project_title": project_title or script.get("project_title", ""),
             "premise": premise,
@@ -2728,20 +2801,211 @@ class Director:
             "passed": blocking.get("validation", {}).get("passed", False),
         }
 
+    @staticmethod
+    def _upgrade_character_visual_dna(design, character):
+        """把旧人物设定无损升级到视觉 DNA 结构，保留已有具体描述。"""
+        upgraded = copy.deepcopy(design or {})
+        analysis = upgraded.get("character_analysis")
+        if not isinstance(analysis, dict) or not analysis:
+            analysis = copy.deepcopy(
+                character.get("character_analysis")
+                if isinstance(character.get("character_analysis"), dict)
+                else {})
+            analysis.update({
+                key: analysis.get(key) or value
+                for key, value in {
+                    "identity_and_class": (
+                        character.get("identity")
+                        or upgraded.get("occupation")
+                        or character.get("role") or "角色"),
+                    "age_and_presentation": (
+                        character.get("age_range") or "以剧本为准"),
+                    "upbringing": (
+                        character.get("backstory")
+                        or upgraded.get("backstory")
+                        or "由关键经历塑造当前性格"),
+                    "family_background": (
+                        character.get("family_background")
+                        or "剧本未明示，保守留白"),
+                    "education_background": (
+                        character.get("education_background")
+                        or "剧本未明示，保守留白"),
+                    "current_situation": (
+                        character.get("current_situation")
+                        or upgraded.get("background_prompt")
+                        or "处于本集核心冲突中"),
+                    "core_desire": (
+                        character.get("motivation")
+                        or upgraded.get("motivation")
+                        or "完成本集目标"),
+                    "greatest_fear": (
+                        character.get("greatest_fear")
+                        or "失去当前最重要的目标或关系"),
+                    "formative_experiences": [
+                        character.get("backstory")
+                        or upgraded.get("backstory")
+                        or "关键经历以剧本为准"],
+                    "strengths": [
+                        character.get("personality")
+                        or upgraded.get("personality") or "目标明确"],
+                    "flaws": ["由冲突和行为代价反推，禁止完美人设"],
+                    "behavior_habits": [
+                        character.get("signature_props")
+                        or upgraded.get("signature_props")
+                        or "通过眼神、站姿和随身物件外化性格"],
+                }.items()
+            })
+            upgraded["character_analysis"] = analysis
+        visual_dna = upgraded.get("visual_dna")
+        if not isinstance(visual_dna, dict) or not visual_dna:
+            visual_dna = copy.deepcopy(
+                character.get("visual_dna")
+                if isinstance(character.get("visual_dna"), dict)
+                else {})
+            visual_dna.update({
+                key: visual_dna.get(key) or value
+                for key, value in {
+                    "face_structure": (
+                        upgraded.get("appearance")
+                        or "脸型骨相由年龄和经历推导"),
+                    "hair_silhouette": (
+                        upgraded.get("hair")
+                        or "发型轮廓由职业与行为习惯推导"),
+                    "body_or_occupation_marks": (
+                        upgraded.get("occupation")
+                        or "体态与职业痕迹服从人物经历"),
+                    "clothing_structure": (
+                        upgraded.get("costume")
+                        or upgraded.get("costume_direction")
+                        or "服装结构服从身份与剧情场合"),
+                    "clothing_wear_state": (
+                        "新旧、磨损与整洁程度服从社会阶层和当前处境"),
+                    "story_visual_symbol": (
+                        upgraded.get("signature")
+                        or upgraded.get("signature_props")
+                        or "从关键经历提炼专属视觉符号"),
+                    "story_visual_symbol_origin": (
+                        upgraded.get("backstory")
+                        or "符号必须能追溯到经历、职业或关系"),
+                    "signature_accessory": (
+                        upgraded.get("signature_props")
+                        or upgraded.get("accessories")
+                        or "仅保留一个有剧情来源的核心配饰"),
+                    "temperament_keywords": [
+                        upgraded.get("temperament") or "克制",
+                        upgraded.get("personality") or "有行动目标",
+                        "非模板化"],
+                    "genre_system_mapping": {},
+                }.items()
+            })
+            upgraded["visual_dna"] = visual_dna
+        keywords = upgraded["visual_dna"].get("temperament_keywords")
+        if not isinstance(keywords, list):
+            keywords = [str(keywords)] if str(keywords or "").strip() else []
+        for fallback in ("有行动目标", "经历可见", "非模板化"):
+            if len(keywords) >= 3:
+                break
+            if fallback not in keywords:
+                keywords.append(fallback)
+        upgraded["visual_dna"]["temperament_keywords"] = keywords[:8]
+        return upgraded
+
+    @staticmethod
+    def _cast_visual_dna_audit(designs):
+        """对明确相同的主要视觉维度做确定性预审，结果写回候选提示词。
+
+        这里只拦截两项以上的明显文本重合；真实语义近似仍由人物设定 AI
+        和人工选角复核，避免把不同措辞误判成已经去重。
+        """
+        dimensions = {
+            "hair_silhouette": ("visual_dna", "hair_silhouette", "hair"),
+            "clothing_structure": (
+                "visual_dna", "clothing_structure", "costume"),
+            "body_or_occupation_marks": (
+                "visual_dna", "body_or_occupation_marks", "appearance"),
+            "story_visual_symbol": (
+                "visual_dna", "story_visual_symbol", "signature"),
+            "signature_accessory": (
+                "visual_dna", "signature_accessory", "signature_props"),
+            "temperament_keywords": (
+                "visual_dna", "temperament_keywords", "temperament"),
+        }
+
+        def value_for(design, spec):
+            nested = design.get(spec[0])
+            value = nested.get(spec[1]) if isinstance(nested, dict) else None
+            if not value:
+                value = design.get(spec[2])
+            if isinstance(value, list):
+                return tuple(sorted(
+                    re.sub(r"\W+", "", str(item)).lower()
+                    for item in value if str(item).strip()))
+            return re.sub(r"\W+", "", str(value or "")).lower()
+
+        names = list(designs)
+        conflicts = {name: [] for name in names}
+        for index, left in enumerate(names):
+            for right in names[index + 1:]:
+                overlap = []
+                for dimension, spec in dimensions.items():
+                    left_value = value_for(designs[left], spec)
+                    right_value = value_for(designs[right], spec)
+                    if (left_value and right_value
+                            and left_value == right_value):
+                        overlap.append(dimension)
+                if len(overlap) >= 2:
+                    item = {"with": right, "dimensions": overlap}
+                    conflicts[left].append(item)
+                    conflicts[right].append(
+                        {"with": left, "dimensions": overlap})
+        audit = {}
+        for name in names:
+            items = conflicts[name]
+            audit[name] = {
+                "compared_with": [
+                    other for other in names if other != name],
+                "dimensions": list(dimensions),
+                "overlap_threshold": 2,
+                "status": "redesign_required" if items else "passed",
+                "conflicts": items,
+                "redesign_if_overlap": True,
+                "instruction": (
+                    "与冲突角色更换至少两个主要视觉维度后再生成候选"
+                    if items else "已通过确定性文本预审；仍需人工视觉复核"),
+            }
+        return audit
+
     def _ensure_character_designs(self, ctx, characters):
         """人物设定:编剧 AI 为每个角色写性格/外貌/妆容/服装细节。
         项目级一次生成(存 character 资产 meta),跨集复用保证形象一致;
         缺谁补谁,占位产线也会给出具体可画的设定。"""
         project_id = ctx["project"]["id"]
-        designs, missing = {}, []
+        designs, missing, dirty = {}, [], set()
+        role_by_name = {
+            character["name"]: character.get("role", "")
+            for character in characters}
         for character in characters:
             name = character["name"]
             design = self._character_design(project_id, name)
             if design:
-                designs[name] = design
+                upgraded = self._upgrade_character_visual_dna(
+                    design, character)
+                designs[name] = upgraded
+                if upgraded != design:
+                    dirty.add(name)
             else:
                 missing.append(character)
         if not missing:
+            audit = self._cast_visual_dna_audit(designs)
+            for name, design in designs.items():
+                if design.get("cast_dedup") != audit[name]:
+                    dirty.add(name)
+                design["cast_dedup"] = audit[name]
+            for name in dirty:
+                self.assets.register(
+                    project_id, "character", name,
+                    meta={"role": role_by_name.get(name, ""),
+                          "design": designs[name]}, new_version=True)
             return designs
         result = self._call(ctx, "script", {
             "character_design": True,
@@ -2767,6 +3031,7 @@ class Director:
                  if key != "reference_images"}
                 for c in missing
             ],
+            "existing_cast_designs": designs,
             # 有参考图的角色:设定必须以参考图人物的脸部特征与风格
             # 为最高标准撰写(编剧 AI 可直接读取图片文件)
             "characters": [{"name": c["name"],
@@ -2792,14 +3057,23 @@ class Director:
                     "motivation", "backstory", "relationships",
                     "costume_direction", "signature_props",
                     "visual_variants", "visual_direction",
-                    "prompt_prefix", "continuity_anchors"):
+                    "prompt_prefix", "continuity_anchors",
+                    "character_analysis", "visual_dna", "cast_dedup"):
                 if not design.get(key) and character.get(key):
                     design[key] = character[key]
+            designs[name] = design
+            dirty.add(name)
+        audit = self._cast_visual_dna_audit(designs)
+        for name, design in designs.items():
+            if design.get("cast_dedup") != audit[name]:
+                dirty.add(name)
+            design["cast_dedup"] = audit[name]
+            if name not in dirty:
+                continue
             self.assets.register(
                 project_id, "character", name,
-                meta={"role": character.get("role", ""),
+                meta={"role": role_by_name.get(name, ""),
                       "design": design}, new_version=True)
-            designs[name] = design
         if designs:
             self.log.info(
                 "director",
@@ -2871,6 +3145,31 @@ class Director:
             return None
         return row
 
+    def _canonical_character_assets(self, project_id, name):
+        """返回定版后四张独立正式母资产；三视图拼板不计入就绪状态。"""
+        assets = {}
+        for key in CANONICAL_CHARACTER_SHEET_KEYS:
+            row = self.assets.latest(
+                project_id, "character_sheet", f"{name}:{key}")
+            if row is None or not formal_reference_allowed(
+                    self._asset_quality(row)):
+                continue
+            uri = str(row["uri"] or "")
+            if not uri or (
+                    not uri.startswith(("http://", "https://"))
+                    and not Path(uri).exists()):
+                continue
+            assets[key] = {
+                "uri": uri, "version": row["version"],
+                "label": self._asset_meta(row).get("label", key),
+            }
+        return {
+            "required": list(CANONICAL_CHARACTER_SHEET_KEYS),
+            "assets": assets,
+            "ready": all(
+                key in assets for key in CANONICAL_CHARACTER_SHEET_KEYS),
+        }
+
     def character_selection_status(self, project_id, characters):
         """项目级人物定版状态：按重要度生成候选，最终只锁1张。"""
         result = []
@@ -2887,6 +3186,8 @@ class Director:
                 continue
             locked = self._locked_identity(project_id, name)
             selected_meta = self._asset_meta(locked)
+            canonical = self._canonical_character_assets(project_id, name)
+            design = self._character_design(project_id, name) or {}
             candidates = []
             for row in candidate_rows.values():
                 meta = self._asset_meta(row)
@@ -2926,6 +3227,11 @@ class Director:
                 "locked": locked is not None,
                 "identity_uri": locked["uri"] if locked else "",
                 "identity_version": locked["version"] if locked else None,
+                "canonical_assets": canonical,
+                "character_analysis": design.get(
+                    "character_analysis") or {},
+                "visual_dna": design.get("visual_dna") or {},
+                "cast_dedup": design.get("cast_dedup") or {},
                 "candidates": candidates,
                 "candidate_count": len(candidates),
             })
@@ -2942,6 +3248,10 @@ class Director:
             "passed": (not required_items
                        or locked_count == len(required_items)),
             "required": any(not item["locked"] for item in required_items),
+            "canonical_assets_ready": bool(
+                required_items and all(
+                    item["canonical_assets"]["ready"]
+                    for item in required_items)),
         }
 
     def _ensure_character_candidates(self, ctx, characters, designs, style):
@@ -3338,6 +3648,13 @@ class Director:
                 allowed_roles={"identity", "wardrobe", "composition"})
             for key, label, desc in sheet_definitions:
                 asset_name = f"{name}:{key}"
+                sheet_aspect = (
+                    "16:9" if key == "turnaround"
+                    else "1:1" if key == "closeup"
+                    else "9:16" if key in ("front", "profile", "back")
+                    else ctx["aspect"])
+                sheet_dims = ASPECT_DIMS.get(
+                    sheet_aspect, ctx["dims"])
                 existing_sheet = self._existing_asset_uri(
                     ctx, "character_sheet", asset_name)
                 if existing_sheet:
@@ -3372,7 +3689,7 @@ class Director:
                         "require_reference_images": True,
                         **reference_payload,
                         "style_ref": self._style_anchor_uri(project_id),
-                        "aspect": ctx["aspect"], **ctx["dims"],
+                        "aspect": sheet_aspect, **sheet_dims,
                     }), "sub_dir": "cast",
                     "tag": (name, key, label),
                     # 母资产同步质检:四视图等会被后续所有镜头当参考图,
@@ -3392,11 +3709,25 @@ class Director:
                 project_id, "character_sheet", f"{name}:{key}",
                 uri=result.uri,
                 meta={"character": name, "sheet": key, "label": label,
+                      "canonical": key in CANONICAL_CHARACTER_SHEET_KEYS,
+                      "review_only": key == "turnaround",
+                      "aspect": (
+                          "16:9" if key == "turnaround"
+                          else "1:1" if key == "closeup"
+                          else "9:16" if key in ("front", "profile", "back")
+                          else ctx["aspect"]),
                       "image_quality": "high",
                       "recommended_quality": "high",
                       "quality_source": "auto",
                       "quality_rule": "mother_asset"})
             created += 1
+        # 保存包含独立母资产就绪状态的最新人物定版文档，供 UI/API 和
+        # 后续生产门禁读取；合成审核板不计入正式参考图。
+        ctx["cast_selection"] = self.character_selection_status(
+            project_id, characters)
+        self.projects.save_document(
+            ctx["episode"]["id"], "cast_selection",
+            ctx["cast_selection"])
         ctx["cast"] = cast
         return {"reused": reused, "created": created,
                 "characters": len(cast),
@@ -3459,17 +3790,23 @@ class Director:
 
     @staticmethod
     def _shot_reference_sheet_keys(shot):
-        """按镜头用途选择已生成的人物套件参考,避免所有镜头只喂四视图。"""
+        """按镜头用途选择一张独立母资产，合成审核板不进入正式参考链。"""
         shot = shot or {}
         text = " ".join(str(shot.get(key) or "") for key in (
             "kind", "description", "prompt", "camera", "dialogue"))
         if any(word in text for word in (
+                "背面", "背对", "离场", "转身离开", "back view")):
+            return ("back",)
+        if any(word in text for word in (
+                "侧面", "侧脸", "侧身", "转头", "走位", "profile")):
+            return ("profile",)
+        if any(word in text for word in (
                 "服装", "配饰", "袖口", "鞋", "细节", "costume", "detail")):
-            return ("turnaround", "costume", "costume_detail")
+            return ("costume_detail",)
         if any(word in text for word in (
                 "特写", "近景", "脸", "妆", "眼神", "表情", "closeup")):
-            return ("turnaround", "features", "makeup")
-        return ("turnaround", "costume")
+            return ("closeup",)
+        return ("front",)
 
     def _art_refs(self, ctx, characters, location, shot_no=None,
                   sheet_keys=None, spatial_ref=""):
@@ -3546,7 +3883,7 @@ class Director:
         # 3 人及以上群像只上传每人的最终立绘；人物套件图会挤占身份、
         # 场景和连续性槽位，也容易让模型把不同角色的服装/脸互相混合。
         if include_sheets and len(characters or []) <= 2:
-            requested_keys = tuple(sheet_keys or ("turnaround", "costume"))
+            requested_keys = tuple(sheet_keys or ("front",))
             # 每人只用本镜最相关的一张套件；最终立绘已经承担身份锁定。
             requested_keys = requested_keys[-1:]
             for name in characters or []:
@@ -3563,7 +3900,11 @@ class Director:
                         continue
                     refs["character_refs"].append(row["uri"])
                     label = {
-                        "turnaround": "四视图",
+                        "turnaround": "三视图审核板",
+                        "closeup": "面部母资产",
+                        "front": "正面母资产",
+                        "profile": "侧面母资产",
+                        "back": "背面母资产",
                         "features": "五官特征",
                         "makeup": "妆容",
                         "costume": "服装",
@@ -3954,7 +4295,9 @@ class Director:
                     f"只读取{who or '对应人物'}的服装结构、材质、配色、"
                     "鞋履和配饰；不得用此图覆盖脸、年龄、性别、姿势或背景")
                 role = "wardrobe"
-            elif sheet in ("features", "makeup", "closeup"):
+            elif sheet in (
+                    "features", "makeup", "closeup",
+                    "front", "profile", "back"):
                 binding = (
                     f"只补充{who or '对应人物'}的五官/妆容局部细节；"
                     "身份仍以最终立绘为准，不复制服装、姿势或背景")
@@ -3962,7 +4305,8 @@ class Director:
             elif sheet == "turnaround":
                 binding = (
                     f"只补充{who or '对应人物'}的体型比例、发型轮廓与"
-                    "各角度结构；不得覆盖最终立绘身份或强制复制图中姿势")
+                    "各角度结构；此合成板只作审核索引，不得取代独立"
+                    "正面/侧面/背面母资产或覆盖最终立绘身份")
                 role = "structure"
             else:
                 binding = (

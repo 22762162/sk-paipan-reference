@@ -40,6 +40,13 @@ def test_analysis_locks_user_style_and_builds_prompt_bible(script):
     assert analysis["scenes"][0]["environment"]
     assert analysis["characters"][0]["candidate_count"] == 5
     assert analysis["characters"][1]["candidate_count"] == 3
+    hero = analysis["characters"][0]
+    assert hero["character_analysis"]["core_desire"]
+    assert 3 <= len(hero["visual_dna"]["temperament_keywords"]) <= 8
+    assert hero["cast_dedup"]["compared_with"] == ["顾屿"]
+    assert analysis["production_rules"]["three_view_contract"][
+        "canonical_individual_assets"] == [
+            "face_closeup", "front", "profile", "back"]
     assert "15秒" in analysis["prompt_bible"]["seedance_prefix"]
     assert validate_story_analysis(analysis) is None
 
@@ -51,6 +58,8 @@ def test_analysis_is_injected_into_all_downstream_prompt_context(script):
         "global_image_prefix"]
     assert "现代城市" in enriched["scenes"][0]["prompt_prefix"]
     assert enriched["characters"][0]["prompt_prefix"]
+    assert enriched["characters"][0]["visual_dna"]["hair_silhouette"]
+    assert enriched["characters"][0]["cast_dedup"]["overlap_threshold"] == 2
     assert enriched["story_world"]["visual_baseline"].startswith(
         MODERN_OTOME_STYLE)
 

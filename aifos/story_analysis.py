@@ -70,6 +70,116 @@ def _candidate_count(importance):
     }[importance]
 
 
+VISUAL_DNA_DIMENSIONS = (
+    "hair_silhouette", "clothing_structure", "body_or_occupation_marks",
+    "story_visual_symbol", "signature_accessory", "temperament_keywords",
+)
+
+
+def _character_analysis(character, item, narrative):
+    raw = _dict(item.get("character_analysis"))
+    return {
+        "identity_and_class": _text(
+            raw.get("identity_and_class"),
+            character.get("identity") or character.get("occupation")
+            or character.get("role"),
+        ),
+        "age_and_presentation": _text(
+            raw.get("age_and_presentation"), character.get("age_range")),
+        "upbringing": _text(
+            raw.get("upbringing"),
+            character.get("upbringing") or character.get("backstory"),
+        ),
+        "family_background": _text(
+            raw.get("family_background"), character.get("family_background"),
+            ),
+        "education_background": _text(
+            raw.get("education_background"),
+            character.get("education_background")),
+        "current_situation": _text(
+            raw.get("current_situation"),
+            character.get("current_situation")
+            or narrative.get("core_conflict")),
+        "core_desire": _text(
+            raw.get("core_desire"),
+            character.get("motivation") or narrative.get("core_conflict")),
+        "greatest_fear": _text(
+            raw.get("greatest_fear"),
+            character.get("greatest_fear") or "失去当前最重要的目标或关系"),
+        "formative_experiences": _list(
+            raw.get("formative_experiences")
+            or character.get("formative_experiences")
+            or character.get("backstory"),
+            ["以剧本已声明的关键经历为准"]),
+        "strengths": _list(
+            raw.get("strengths") or character.get("strengths"),
+            [_text(character.get("personality"), "目标明确")]),
+        "flaws": _list(
+            raw.get("flaws") or character.get("flaws"),
+            ["由人物冲突与行为代价反推，不使用完美人设"]),
+        "behavior_habits": _list(
+            raw.get("behavior_habits") or character.get("behavior_habits"),
+            [_text(character.get("signature_props"), "通过眼神、站姿与动作外化")]),
+    }
+
+
+def _visual_dna(character, item, visual, analysis):
+    raw = _dict(item.get("visual_dna"))
+    symbol_fallback = (
+        character.get("signature")
+        or character.get("signature_props")
+        or "从关键经历或职业中提炼专属视觉符号")
+    keywords = _list(
+        raw.get("temperament_keywords")
+        or character.get("temperament_keywords")
+        or character.get("personality"),
+        ["克制", "有行动目标", "非模板化"])
+    for fallback in ("有行动目标", "经历可见", "非模板化"):
+        if len(keywords) >= 3:
+            break
+        if fallback not in keywords:
+            keywords.append(fallback)
+    return {
+        "face_structure": _text(
+            raw.get("face_structure"),
+            character.get("appearance")
+            or "脸型与骨相必须由年龄、经历和生活状态推导"),
+        "hair_silhouette": _text(
+            raw.get("hair_silhouette"),
+            character.get("hair")
+            or "发型轮廓由职业、行为习惯和剧情时代推导"),
+        "body_or_occupation_marks": _text(
+            raw.get("body_or_occupation_marks"),
+            character.get("body_or_occupation_marks")
+            or character.get("occupation")
+            or "体态和职业痕迹服从人物经历"),
+        "clothing_structure": _text(
+            raw.get("clothing_structure"),
+            character.get("costume_direction")
+            or visual.get("wardrobe_and_styling")),
+        "clothing_wear_state": _text(
+            raw.get("clothing_wear_state"),
+            character.get("clothing_wear_state")
+            or "新旧、磨损与整洁程度服从社会阶层和当前处境"),
+        "story_visual_symbol": _text(
+            raw.get("story_visual_symbol"), symbol_fallback),
+        "story_visual_symbol_origin": _text(
+            raw.get("story_visual_symbol_origin"),
+            "必须能追溯到人物经历、职业、关系或当前冲突"),
+        "signature_accessory": _text(
+            raw.get("signature_accessory"),
+            character.get("signature_props")
+            or "仅保留一个有剧情来源的核心配饰或道具"),
+        "temperament_keywords": keywords[:8],
+        "genre_system_mapping": _dict(
+            raw.get("genre_system_mapping")
+            or character.get("genre_system_mapping")),
+        "derivation": (
+            "剧情证据 → 经历与处境 → 性格与行为 → 可见外貌 → 视觉 DNA"),
+        "analysis_source": analysis,
+    }
+
+
 def _default_negative(style):
     baseline = [
         "字幕", "水印", "Logo", "乱码文字", "多余人物", "人物复制",
@@ -230,6 +340,13 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
         _text(item.get("name")): item
         for item in raw.get("characters", []) if isinstance(item, dict)
     }
+    formal_character_names = [
+        _text(character.get("name"))
+        for character in script.get("characters", [])
+        if isinstance(character, dict)
+        and character.get("name")
+        and _importance(character.get("role")) != "背景路人"
+    ]
     characters = []
     for character in script.get("characters", []):
         if not isinstance(character, dict) or not character.get("name"):
@@ -237,7 +354,7 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
         name = _text(character.get("name"))
         item = _dict(raw_character_map.get(name))
         importance = _importance(character.get("role"))
-        characters.append({
+        entry = {
             "name": name,
             "importance": importance,
             "candidate_count": _candidate_count(importance),
@@ -256,7 +373,28 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
             "prompt_prefix": _text(
                 item.get("prompt_prefix"),
                 f"{name}，同一人物身份；{visual['wardrobe_and_styling']}"),
-        })
+        }
+        if importance != "背景路人":
+            analysis = _character_analysis(character, item, narrative)
+            entry["character_analysis"] = analysis
+            entry["visual_dna"] = _visual_dna(
+                character, item, visual, analysis)
+            raw_dedup = _dict(item.get("cast_dedup"))
+            entry["cast_dedup"] = {
+                "compared_with": [
+                    other for other in formal_character_names
+                    if other and other != name
+                ],
+                "dimensions": list(VISUAL_DNA_DIMENSIONS),
+                "overlap_threshold": 2,
+                "status": _text(
+                    raw_dedup.get("status"), "pending_design_audit"),
+                "conflicts": (
+                    raw_dedup.get("conflicts")
+                    if isinstance(raw_dedup.get("conflicts"), list) else []),
+                "redesign_if_overlap": True,
+            }
+        characters.append(entry)
 
     global_prefix = _text(
         raw_prompts.get("global_image_prefix"),
@@ -320,6 +458,21 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
                 "main": 5, "important_supporting": 3,
                 "non_main": 1, "background": 0,
             },
+            "character_design_sequence": [
+                "story_evidence", "experience_and_situation",
+                "personality_and_behavior", "visible_traits",
+                "cast_dedup", "three_view_assets",
+            ],
+            "three_view_contract": {
+                "after_human_lock": True,
+                "review_board": "16:9 face close-up + Front/Profile/Back",
+                "canonical_individual_assets": [
+                    "face_closeup", "front", "profile", "back",
+                ],
+                "profile_degrees": 90,
+                "back_degrees": 180,
+                "seedance_may_redesign": False,
+            },
         },
     }
 
@@ -346,6 +499,21 @@ def validate_story_analysis(analysis):
             "scene_prefix", "keyframe_prefix", "seedance_prefix"):
         if not _text(analysis["prompt_bible"].get(field)):
             return f"制作圣经提示词母版缺少 {field}"
+    if not isinstance(analysis.get("characters"), list):
+        return "制作圣经缺少 characters"
+    for character in analysis["characters"]:
+        if not isinstance(character, dict):
+            return "制作圣经角色分析必须是对象"
+        if character.get("importance") == "背景路人":
+            continue
+        for field in ("character_analysis", "visual_dna", "cast_dedup"):
+            if not isinstance(character.get(field), dict):
+                return f"角色 {character.get('name')} 缺少 {field}"
+        keywords = character["visual_dna"].get("temperament_keywords")
+        if not isinstance(keywords, list) or not 3 <= len(keywords) <= 8:
+            return (
+                f"角色 {character.get('name')} 的视觉 DNA "
+                "必须包含 3-8 个气质关键词")
     return None
 
 
@@ -401,4 +569,9 @@ def apply_story_analysis(script, analysis):
             f"{prompt_bible['character_prefix']}；{item['prompt_prefix']}")
         character["continuity_anchors"] = item["continuity_anchors"]
         character["candidate_count"] = item["candidate_count"]
+        if item.get("importance") != "背景路人":
+            character["character_analysis"] = copy.deepcopy(
+                item["character_analysis"])
+            character["visual_dna"] = copy.deepcopy(item["visual_dna"])
+            character["cast_dedup"] = copy.deepcopy(item["cast_dedup"])
     return script

@@ -126,20 +126,28 @@ def test_background_extras_skip_design_and_generic_support_gets_one_candidate(ap
 
 
 def test_character_suite_generated(app):
-    """每个角色除立绘外生成完整资产套件:四视图/特写/特征/妆容/服装。"""
+    """定版后生成审核板、四张独立母资产及细节套件。"""
     project = _preproduce(app, asset_mode="full")
     episode = app.db.query_one(
         "SELECT * FROM episodes WHERE project_id=? AND number=1",
         (project["id"],))
     script, _ = app.projects.latest_document(episode["id"], "script")
-    assert len(CHARACTER_SHEETS) == 6
+    assert len(CHARACTER_SHEETS) == 9
+    assert [key for key, _label, _desc in CHARACTER_SHEETS[:5]] == [
+        "turnaround", "closeup", "front", "profile", "back"]
     for character in script["characters"]:
         name = character["name"]
         for key, label, _desc in CHARACTER_SHEETS:
             row = app.assets.latest(
                 project["id"], "character_sheet", f"{name}:{key}")
             assert row is not None, f"缺少 {name}:{key}"
-            assert json.loads(row["meta"])["label"] == label
+            meta = json.loads(row["meta"])
+            assert meta["label"] == label
+            if key == "turnaround":
+                assert meta["review_only"] is True
+                assert meta["aspect"] == "16:9"
+            if key in ("closeup", "front", "profile", "back"):
+                assert meta["canonical"] is True
     # 生产清单同步登记(看板/图片清单可见)
     out_root = (app.workspace.artifacts_dir
                 / f"p{project['id']:03d}" / "e001")
@@ -147,7 +155,7 @@ def test_character_suite_generated(app):
         encoding="utf-8"))
     sheet_items = [i for i in plan["items"]
                    if i["category"] == "character_sheet"]
-    assert len(sheet_items) == len(script["characters"]) * 6
+    assert len(sheet_items) == len(script["characters"]) * 9
     assert all(i["status"] in ("done", "reused") for i in sheet_items)
 
 
