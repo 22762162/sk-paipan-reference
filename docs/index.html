@@ -2554,11 +2554,20 @@ textarea:focus-visible, select:focus-visible {
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
 .video-ref-panel { margin:10px 14px }
 .video-ref-list { display:grid; gap:7px }
-.video-ref-row { display:grid; grid-template-columns:72px minmax(120px,1fr) auto;
+.video-ref-row { display:grid;
+  grid-template-columns:minmax(72px,max-content) minmax(120px,1fr) auto;
   align-items:center; gap:9px; padding:7px; border:1px solid var(--hairline);
   border-radius:8px }
 .video-ref-thumbs { display:flex; align-items:center; gap:5px; overflow-x:auto }
 .video-ref-thumbs img { width:52px; height:52px; object-fit:cover; border-radius:6px }
+.video-ref-mode {
+  display:inline-block; margin-left:6px; padding:1px 7px; border-radius:999px;
+  font-size:10px; font-weight:400;
+}
+.video-ref-mode.auto { color:#9fe2b8; background:rgba(44,164,92,.16);
+  border:1px solid rgba(44,164,92,.35) }
+.video-ref-mode.manual { color:#cfe4ff; background:rgba(57,135,229,.14);
+  border:1px solid rgba(57,135,229,.4) }
 .video-ref-box { width:min(980px,94vw); max-height:90vh; overflow:auto }
 .video-ref-picker-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr));
   gap:10px; margin:12px 0 }
@@ -8977,26 +8986,36 @@ function renderCastSelection(data, episodeId) {
   };
 }
 
+const VIDEO_REF_KIND_CN = {
+  image: "分镜图", character_identity: "人物最终立绘",
+  scene_art: "场景图", reference: "用户参考图",
+  character_sheet: "人物资产图", character_art: "人物立绘",
+  first_frame: "首帧", last_frame: "尾帧",
+};
+
 function videoReferencePanelHtml(data) {
   const shots = (data.storyboard || {}).shots || [];
-  const library = (data.artifacts || {}).image_assets || [];
-  const byId = new Map(library.map((item) => [Number(item.asset_id), item]));
-  const selected = (data.video_references || {}).shots || {};
+  const effective = (data.video_references_effective || {}).shots || {};
   return `<section class="panel video-ref-panel">
     <h2>🧷 Seedance 资产参考图
-      <span class="dim">按镜头从资产中心选择；首尾帧之外最多再附 7 张，
-      只允许中/高质量且当前未删除的图。</span></h2>
+      <span class="dim">已按剧本自动选入每镜必要的图——本镜分镜图、出场人物
+      最终立绘、场景图和用户参考图(与首尾帧一起交给 Seedance);
+      需要调整再点右侧按钮,人工选择优先于自动。</span></h2>
     <div class="video-ref-list">${shots.map((shot) => {
-      const rows = (selected[String(shot.shot_no)] || [])
-        .map((entry) => byId.get(Number(entry.asset_id))).filter(Boolean);
+      const entry = effective[String(shot.shot_no)] || {};
+      const rows = entry.items || [];
+      const auto = entry.mode !== "manual";
       return `<div class="video-ref-row">
-        <b>镜头 ${shot.shot_no}</b>
+        <b>镜头 ${shot.shot_no}
+          <span class="video-ref-mode ${auto ? "auto" : "manual"}">${auto
+            ? "自动选入" : "人工选定"}</span></b>
         <div class="video-ref-thumbs">${rows.map((item) =>
-          `<img src="${esc(thumbUrl(item.url, 120))}" alt="${esc(item.label)}"
-            title="${esc(item.label)}">`).join("")
-          || `<span class="dim">未额外选择（仍使用首尾帧）</span>`}</div>
+          `<img src="${esc(thumbUrl(item.url, 120))}"
+            alt="${esc(VIDEO_REF_KIND_CN[item.kind] || item.kind)} ${esc(item.name)}"
+            title="${esc(VIDEO_REF_KIND_CN[item.kind] || item.kind)} · ${esc(item.name)}">`).join("")
+          || `<span class="dim">暂无可用参考(仍使用首尾帧)</span>`}</div>
         <button class="video-ref-edit" data-shot-no="${shot.shot_no}">
-          从资产中心选择${rows.length ? `（已选 ${rows.length}）` : ""}</button>
+          调整（${auto ? `自动 ${rows.length} 张` : `已选 ${rows.length} 张`}）</button>
       </div>`;
     }).join("")}</div>
   </section>`;
@@ -9004,8 +9023,10 @@ function videoReferencePanelHtml(data) {
 
 function showVideoReferencePicker(data, episodeId, shotNo) {
   const library = (data.artifacts || {}).image_assets || [];
-  const selectedRows = ((data.video_references || {}).shots || {})[String(shotNo)] || [];
-  const selected = new Set(selectedRows.map((row) => Number(row.asset_id)));
+  // 从"实际生效"的参考图出发调整:自动模式下就是自动选入的那批
+  const effectiveRows = (((data.video_references_effective || {}).shots
+    || {})[String(shotNo)] || {}).items || [];
+  const selected = new Set(effectiveRows.map((row) => Number(row.asset_id)));
   const overlay = document.createElement("div");
   overlay.className = "script-overlay video-ref-overlay";
   overlay.innerHTML = `<div class="script-box video-ref-box">

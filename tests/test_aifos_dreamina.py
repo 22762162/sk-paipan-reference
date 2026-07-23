@@ -217,9 +217,15 @@ def test_full_pipeline_with_fake_dreamina(tmp_path, fake_dreamina):
         videos_stage = next(
             s for s in summary["stages"] if s["stage"] == "videos")
         assert videos_stage["providers"] == ["jimeng"]
-        calls = [c for c in _calls(fake_dreamina) if c[0] == "frames2video"]
+        # 必要参考图(分镜图/人物立绘/场景图)自动选入后,视频默认走
+        # multimodal2video(首尾帧+参考图一起提交);无参考图的镜头
+        # 仍走 frames2video。两种模式都必须锁定 fast_vip 模型。
+        calls = [c for c in _calls(fake_dreamina)
+                 if c[0] in ("frames2video", "multimodal2video")]
         assert calls and all(
             "--model_version=seedance2.0fast_vip" in c for c in calls)
+        assert any(c[0] == "multimodal2video" for c in calls), \
+            "自动参考图选入后应有镜头走 multimodal2video"
     finally:
         app.close()
 

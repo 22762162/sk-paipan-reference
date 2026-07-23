@@ -2546,11 +2546,20 @@ textarea:focus-visible, select:focus-visible {
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
 .video-ref-panel { margin:10px 14px }
 .video-ref-list { display:grid; gap:7px }
-.video-ref-row { display:grid; grid-template-columns:72px minmax(120px,1fr) auto;
+.video-ref-row { display:grid;
+  grid-template-columns:minmax(72px,max-content) minmax(120px,1fr) auto;
   align-items:center; gap:9px; padding:7px; border:1px solid var(--hairline);
   border-radius:8px }
 .video-ref-thumbs { display:flex; align-items:center; gap:5px; overflow-x:auto }
 .video-ref-thumbs img { width:52px; height:52px; object-fit:cover; border-radius:6px }
+.video-ref-mode {
+  display:inline-block; margin-left:6px; padding:1px 7px; border-radius:999px;
+  font-size:10px; font-weight:400;
+}
+.video-ref-mode.auto { color:#9fe2b8; background:rgba(44,164,92,.16);
+  border:1px solid rgba(44,164,92,.35) }
+.video-ref-mode.manual { color:#cfe4ff; background:rgba(57,135,229,.14);
+  border:1px solid rgba(57,135,229,.4) }
 .video-ref-box { width:min(980px,94vw); max-height:90vh; overflow:auto }
 .video-ref-picker-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr));
   gap:10px; margin:12px 0 }
