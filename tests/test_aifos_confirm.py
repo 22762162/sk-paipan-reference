@@ -86,7 +86,7 @@ def test_script_confirm_pauses_before_video(app):
         (project["id"],))
     preflight, _ = app.projects.latest_document(episode["id"], "preflight")
     assert preflight["passed"]
-    assert len(preflight["gates"]) == 13
+    assert len(preflight["gates"]) == 14
     assert preflight["gates"][0]["id"] == "script_bible"
     # 预生产阶段不消耗视频产线
     assert app.assets.latest(project["id"], "video", "e001_shot001") is None

@@ -505,6 +505,8 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 五官比例、眼鼻嘴结构、发际线、发型轮廓、年龄感、体型和标志特征。
 必须单独核对每个人物的性别与性别表达；女性被画成男性、男性被画成女性，
 一律是身份硬错误，不能因发色、服装或气质相似而通过。
+必须点数画面里实际可见的人物总数，并与要求人数逐一核对；多一个、少一个、
+同一角色被复制两次或把两人合成一人都必须失败。
 文字设定只补充剧情、动作、场景和当镜服装；与最终立绘冲突时以最终立绘为准。
 
 画面要求:
@@ -513,6 +515,7 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
   「小鹿」若设定是人类就必须是人类,不能因为名字画成动物)
 - 人物设定要点(脸型/五官/发型/发色/妆容/年龄感/标志特征必须一致；
   服装按本镜剧本和当集造型核对,允许与身份参考图不同):{designs}
+- 角色性别硬事实:{expected_genders}
 - 场景:{location};动作:{action};镜头:{camera}
   (景别需大致相符:要求全景/远景不能给成特写,反之亦然)
 - 不允许出现:与设定形态不符的角色、与剧情无关的杂物(悬挂的衣物/衣架)、
@@ -523,7 +526,10 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 
 只输出一个 JSON 对象,不要任何其他文字:
 {{"pass": true或false, "identity_checked": true或false,
+"identity_match": true或false,
 "gender_checked": true或false, "gender_match": true或false,
+"count_checked": true或false, "count_match": true或false,
+"detected_count": 画面实际人数整数,
 "issues": ["不通过的具体原因,每条一句,指出在画面哪里"]}}"""
 
 
@@ -539,6 +545,10 @@ def build_qc_prompt(payload):
         characters="、".join(characters) or "无人(空镜)",
         count=payload.get("count", len(characters)),
         designs=payload.get("designs") or "见参考图",
+        expected_genders=("；".join(
+            f"{name}={gender}" for name, gender in
+            (payload.get("expected_genders") or {}).items())
+            or "以最终立绘与人物设定为准"),
         location=payload.get("location") or "按提示词",
         action=payload.get("action") or "按提示词",
         camera=payload.get("camera") or "按提示词",
@@ -556,10 +566,21 @@ def validate_image_qc(data):
     data["issues"] = [str(item) for item in issues][:8]
     if "identity_checked" in data:
         data["identity_checked"] = bool(data["identity_checked"])
+    if "identity_match" in data:
+        data["identity_match"] = bool(data["identity_match"])
     if "gender_checked" in data:
         data["gender_checked"] = bool(data["gender_checked"])
     if "gender_match" in data:
         data["gender_match"] = bool(data["gender_match"])
+    if "count_checked" in data:
+        data["count_checked"] = bool(data["count_checked"])
+    if "count_match" in data:
+        data["count_match"] = bool(data["count_match"])
+    if "detected_count" in data:
+        try:
+            data["detected_count"] = int(data["detected_count"])
+        except (TypeError, ValueError):
+            data.pop("detected_count", None)
     if not data["pass"] and not data["issues"]:
         data["issues"] = ["未给出具体原因"]
     return None

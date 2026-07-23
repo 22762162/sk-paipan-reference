@@ -37,6 +37,7 @@ KIND_LABELS = {
     "character_sheet": "设定", "scene_art": "场景",
     "reference": "参考", "image": "关键帧",
     "first_frame": "首帧", "last_frame": "尾帧", "cover": "封面",
+    "spatial_blocking": "空间图",
 }
 
 _ROOT_LOCKS = {}

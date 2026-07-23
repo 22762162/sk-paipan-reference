@@ -327,6 +327,7 @@ def _image_asset_catalog(app, project_id):
         "scene_art": "场景概念图", "image": "镜头关键图",
         "first_frame": "首帧", "last_frame": "尾帧",
         "cover": "封面", "reference": "上传参考图",
+        "spatial_blocking": "空间调度图",
     }
     category_labels = {
         "character": "人物", "scene": "场景", "costume": "服装",
@@ -388,6 +389,8 @@ def _image_asset_catalog(app, project_id):
             return "scene"
         if kind == "image":
             return "shot"
+        if kind == "spatial_blocking":
+            return "shot"
         if kind in {"first_frame", "last_frame"}:
             return "frame"
         return kind
@@ -395,7 +398,7 @@ def _image_asset_catalog(app, project_id):
     def board_group_for(kind):
         """资产画布的一级泳道:先区分是否会直接进入后续生产。"""
         if kind in {"character_art", "scene_art", "image", "first_frame",
-                    "last_frame", "cover"}:
+                    "last_frame", "cover", "spatial_blocking"}:
             return "production"
         if kind == "character_sheet":
             return "character_support"
@@ -425,6 +428,7 @@ def _image_asset_catalog(app, project_id):
             "last_frame": "尾帧·视频必需",
             "cover": "封面资产",
             "reference": "上传参考·按关联调用",
+            "spatial_blocking": "多人/变机位镜头·Seedance 必传",
         }.get(kind, "项目资产")
 
     def prompt_key(row, meta, episode_number):

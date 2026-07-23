@@ -184,16 +184,24 @@ class MockProvider(Provider):
             return {"pass": False,
                     "identity_checked": bool(
                         payload.get("identity_references")),
+                    "identity_match": True,
                     "gender_checked": bool(
                         payload.get("identity_references")),
                     "gender_match": True,
+                    "count_checked": True,
+                    "count_match": True,
+                    "detected_count": payload.get("count", 0),
                     "issues": ["测试触发:画面与要求不符"]}, ""
         return {"pass": True,
                 "identity_checked": (not payload.get("identity_required")
                                      or bool(payload.get("identity_references"))),
+                "identity_match": True,
                 "gender_checked": (not payload.get("gender_required")
                                     or bool(payload.get("identity_references"))),
                 "gender_match": True,
+                "count_checked": True,
+                "count_match": True,
+                "detected_count": payload.get("count", 0),
                 "issues": []}, ""
 
     # ---- 剧本:按题材分流(偶像/都市/校园/仙侠) ----
@@ -706,6 +714,8 @@ class MockProvider(Provider):
             "video_resolution": payload.get("video_resolution", "720p"),
             "reference_images": list(payload.get("reference_images") or []),
             "reference_assets": list(payload.get("reference_assets") or []),
+            "reference_manifest": list(
+                payload.get("reference_manifest") or []),
         })
         return {
             "shot_no": shot_no, "duration": duration,
@@ -717,6 +727,8 @@ class MockProvider(Provider):
             "reference_images_used": list(
                 payload.get("reference_images") or []),
             "reference_assets": list(payload.get("reference_assets") or []),
+            "reference_manifest": list(
+                payload.get("reference_manifest") or []),
         }, uri
 
     # ---- 配音 ----

@@ -11,6 +11,8 @@ import html
 import json
 import math
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 
@@ -556,6 +558,57 @@ def shot_blocking(plan, shot_no):
     return (plan.get("shot_index") or {}).get(str(shot_no))
 
 
+def mark_spatial_reference_requirements(plan):
+    """标出必须随 Seedance 提交的空间图。
+
+    多人镜头、镜头内摄影机移动，以及同场相邻镜头发生机位变化时都必须
+    带空间图。这个标记同时写入 scene.shots 与 shot_index，兼容从 JSON
+    重新加载后两处对象不再共享引用的情况。
+    """
+    if not plan:
+        return plan
+    index = plan.setdefault("shot_index", {})
+    for scene in plan.get("scenes", []):
+        previous_camera = None
+        for shot in scene.get("shots", []):
+            camera = shot.get("camera") or {}
+            start = camera.get("start") or {}
+            end = camera.get("end") or start
+            moving = bool(camera.get("moving")) or start != end
+            camera_changed = (
+                previous_camera is not None and start != previous_camera)
+            people = int(shot.get("character_count") or 0)
+            reasons = []
+            if people > 1:
+                reasons.append(f"{people}人同框")
+            if moving:
+                reasons.append("镜头内机位移动")
+            if camera_changed:
+                reasons.append("相邻镜头机位变化")
+            required = bool(reasons)
+            shot["spatial_reference_required"] = required
+            shot["spatial_reference_reason"] = "、".join(reasons)
+            indexed = index.get(str(shot.get("shot_no")))
+            if isinstance(indexed, dict):
+                indexed["spatial_reference_required"] = required
+                indexed["spatial_reference_reason"] = "、".join(reasons)
+            previous_camera = end or start
+    return plan
+
+
+def requires_spatial_reference(block):
+    """单镜是否必须给 Seedance 空间图；旧文档没有新标记时安全兜底。"""
+    if not block:
+        return False
+    if "spatial_reference_required" in block:
+        return bool(block.get("spatial_reference_required"))
+    camera = block.get("camera") or {}
+    start = camera.get("start") or {}
+    end = camera.get("end") or start
+    return (int(block.get("character_count") or 0) > 1
+            or bool(camera.get("moving")) or start != end)
+
+
 def _line(x1, y1, x2, y2, **attrs):
     extra = " ".join(f'{key.replace("_", "-")}="{html.escape(str(value))}"'
                      for key, value in attrs.items())
@@ -724,9 +777,83 @@ def render_scene_svg(scene):
     return "".join(parts)
 
 
+def _render_svg_png(svg_path, png_path):
+    """使用 macOS 自带 sips 把 SVG 变成 Seedance 可上传的 PNG。"""
+    converter = shutil.which("sips")
+    if converter is None:
+        return "系统缺少 sips，无法把空间 SVG 转成 Seedance 可用 PNG"
+    try:
+        completed = subprocess.run(
+            [converter, "-s", "format", "png", str(svg_path),
+             "--out", str(png_path)],
+            capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"空间图转 PNG 失败:{exc}"
+    if completed.returncode != 0:
+        return ("空间图转 PNG 失败:"
+                + (completed.stderr or completed.stdout or "未知错误")[:240])
+    try:
+        valid = (png_path.exists() and png_path.stat().st_size > 64
+                 and png_path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n")
+    except OSError:
+        valid = False
+    return "" if valid else "空间图转 PNG 后文件无效"
+
+
+def write_spatial_reference_pngs(plan, out_dir):
+    """为需要空间约束的镜头生成独立 PNG，供 Seedance 真实上传。
+
+    场景总览 SVG 继续用于人审；每镜 PNG 只保留当前镜的稳定人物编号、
+    行动路线和摄影机起终点，避免把其他镜头的调度误喂给视频模型。
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    mark_spatial_reference_requirements(plan)
+    paths = {}
+    index = (plan or {}).get("shot_index") or {}
+    for scene in (plan or {}).get("scenes", []):
+        for shot in scene.get("shots", []):
+            no = int(shot.get("shot_no") or 0)
+            indexed = index.get(str(no))
+            required = requires_spatial_reference(shot)
+            shot["spatial_reference_required"] = required
+            if isinstance(indexed, dict):
+                indexed["spatial_reference_required"] = required
+            if not required:
+                shot.pop("spatial_reference_uri", None)
+                shot.pop("spatial_reference_error", None)
+                if isinstance(indexed, dict):
+                    indexed.pop("spatial_reference_uri", None)
+                    indexed.pop("spatial_reference_error", None)
+                continue
+            svg_path = out_dir / f"shot_{no:03d}_space.svg"
+            png_path = out_dir / f"shot_{no:03d}_space.png"
+            isolated = dict(scene)
+            isolated["shots"] = [shot]
+            svg_path.write_text(
+                render_scene_svg(isolated), encoding="utf-8")
+            error = _render_svg_png(svg_path, png_path)
+            if error:
+                shot["spatial_reference_error"] = error
+                shot.pop("spatial_reference_uri", None)
+                if isinstance(indexed, dict):
+                    indexed["spatial_reference_error"] = error
+                    indexed.pop("spatial_reference_uri", None)
+                continue
+            uri = str(png_path.resolve())
+            shot["spatial_reference_uri"] = uri
+            shot.pop("spatial_reference_error", None)
+            if isinstance(indexed, dict):
+                indexed["spatial_reference_uri"] = uri
+                indexed.pop("spatial_reference_error", None)
+            paths[no] = uri
+    return paths
+
+
 def write_spatial_svgs(plan, out_dir):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    mark_spatial_reference_requirements(plan)
     paths = []
     for scene in plan.get("scenes", []):
         path = out_dir / f"scene_{int(scene.get('scene_no', 0)):03d}.svg"

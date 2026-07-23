@@ -32,8 +32,14 @@ from .quality_policy import (
     set_policy_choices,
 )
 from .relations import relation_lines, write_relations
-from .spatial_blocking import (build_spatial_plan, shot_blocking,
-                               write_spatial_svgs)
+from .spatial_blocking import (
+    build_spatial_plan,
+    mark_spatial_reference_requirements,
+    requires_spatial_reference,
+    shot_blocking,
+    write_spatial_reference_pngs,
+    write_spatial_svgs,
+)
 from .workflow import (
     PIPELINE_VERSION,
     build_content_review,
@@ -349,6 +355,7 @@ def resolve_character_asset_policy(policy=None, script=None):
 IMAGE_ASSET_KINDS = {
     "character_art", "character_sheet", "scene_art", "character_candidate",
     "image", "first_frame", "last_frame", "cover", "reference",
+    "spatial_blocking",
 }
 
 
@@ -1484,33 +1491,134 @@ class Director:
         return refs
 
     def _qc_spec(self, project_id, characters, location="", action="",
-                 forbid=None, require_identity=True):
+                 forbid=None, require_identity=True, expected_characters=None,
+                 expected_count=None, character_background=None):
         """视觉质检规格：待检图必须与人工锁定的最终立绘逐人比对。"""
+        identity_characters = list(characters or [])
+        visible_characters = list(
+            identity_characters if expected_characters is None
+            else expected_characters)
         identity_refs = self._identity_references(
-            project_id, characters,
-            required=bool(characters and require_identity))
+            project_id, identity_characters,
+            required=bool(identity_characters and require_identity))
+        backgrounds = character_background or {}
         designs = []
-        for name in characters:
+        genders = {}
+        for name in visible_characters:
             design = self._reference_safe_design(
                 self._character_design(project_id, name))
-            line = self._design_line(design, keys=(
-                "species", "costume", "era_setting", "occupation",
-                "costume_direction", "signature_props")) if design else ""
+            merged = {**(backgrounds.get(name) or {}), **(design or {})}
+            line = self._design_line(merged, keys=(
+                "species", "gender", "age_range", "appearance", "costume",
+                "era_setting", "occupation", "costume_direction",
+                "signature_props", "identity"))
             designs.append(f"{name}({line})" if line else name)
-        identity_required = bool(characters and require_identity)
+            gender = str(merged.get("gender") or merged.get("sex") or "")
+            if gender:
+                genders[name] = gender
+        identity_required = bool(identity_characters and require_identity)
+        try:
+            count = (len(visible_characters) if expected_count is None
+                     else int(expected_count))
+        except (TypeError, ValueError):
+            count = len(visible_characters)
         return {
-            "characters": list(characters),
-            "count": len(characters),
+            "characters": visible_characters,
+            "identity_characters": identity_characters,
+            "count": count,
             "designs": ";".join(designs),
+            "expected_genders": genders,
             "location": location or "",
             "action": action or "",
             "forbid": list(forbid or []),
             "identity_references": identity_refs,
             "identity_required": identity_required,
+            "identity_match_required": identity_required,
             # 性别/性别表达是身份的一部分，但单独设硬门槛，避免模型只写
             # identity_checked=true 却漏掉女角被画成男性。
             "gender_required": identity_required,
+            # 即使是无人空镜也要明确核对 0 人，禁止模型擅自新增路人。
+            "count_required": True,
             "static_frame": True,
+        }
+
+    @staticmethod
+    def _qc_issue_text(issues):
+        return "；".join(str(item) for item in (issues or []))
+
+    def _assess_image_qc(self, qc_spec, verdict, attempts):
+        """把视觉模型结果收敛为身份/性别/人数三个不可绕过的门槛。"""
+        verdict = verdict or {}
+        identity_required = bool(qc_spec.get("identity_required"))
+        identity_checked = (
+            not identity_required or bool(verdict.get("identity_checked")))
+        identity_declared = "identity_match" in verdict
+        identity_match = (
+            not identity_required
+            or (bool(verdict.get("identity_match"))
+                if identity_declared else bool(verdict.get("pass"))))
+        gender_required = bool(qc_spec.get("gender_required"))
+        gender_declared = bool({"gender_checked", "gender_match"}
+                               & set(verdict))
+        gender_checked = (
+            not gender_required or not gender_declared
+            or bool(verdict.get("gender_checked")))
+        gender_match = (
+            not gender_required or not gender_declared
+            or bool(verdict.get("gender_match")))
+        count_required = bool(qc_spec.get("count_required"))
+        count_checked = (
+            not count_required or bool(verdict.get("count_checked")))
+        count_match = (
+            not count_required or bool(verdict.get("count_match")))
+        issues = [str(item) for item in (verdict.get("issues") or [])]
+        if not identity_checked:
+            issues.append("质检未确认已逐人比对最终立绘")
+        elif not identity_match:
+            issues.append("画面人物身份与锁定最终立绘不一致")
+        if not gender_checked:
+            issues.append("质检未单独核对人物性别/性别表达")
+        elif not gender_match:
+            issues.append("人物性别/性别表达与锁定最终立绘不一致")
+        if not count_checked:
+            issues.append("质检未核对画面实际人数")
+        elif not count_match:
+            detected = verdict.get("detected_count")
+            suffix = f"，检测到{detected}人" if detected is not None else ""
+            issues.append(
+                f"画面人数与要求的{qc_spec.get('count', 0)}人不一致{suffix}")
+        issues = list(dict.fromkeys(issues))
+        text = self._qc_issue_text(issues).lower()
+        mismatch_words = (
+            "人物不一致", "人物形象", "身份", "同一个人", "脸不一致",
+            "性别", "男性", "女性", "人数", "数量", "多余人物",
+            "缺失人物", "新增人物", "重复人物", "person count",
+            "identity", "gender", "sex mismatch",
+        )
+        hard_failure = (
+            not identity_checked or not identity_match
+            or not gender_checked or not gender_match
+            or not count_checked or not count_match
+            or any(word in text for word in mismatch_words))
+        passed = (
+            bool(verdict.get("pass"))
+            and identity_checked and identity_match
+            and gender_checked and gender_match
+            and count_checked and count_match)
+        return {
+            "passed": passed,
+            "issues": issues,
+            "attempts": attempts,
+            "identity_checked": identity_checked,
+            "identity_match": identity_match,
+            "gender_checked": gender_checked,
+            "gender_match": gender_match,
+            "count_checked": count_checked,
+            "count_match": count_match,
+            "detected_count": verdict.get("detected_count"),
+            "identity_references": len(
+                qc_spec.get("identity_references") or []),
+            "hard_failure": bool(hard_failure and not passed),
         }
 
     def _generate_image_with_qc(self, capability, payload, out_dir,
@@ -1542,42 +1650,16 @@ class Director:
                     "identity_checked": False,
                     "gender_checked": False,
                     "gender_match": False,
+                    "count_checked": False,
+                    "count_match": False,
+                    "hard_failure": True,
                     "identity_references": len(
                         qc_spec.get("identity_references") or []),
                 }
                 return result
             result.cost += qc_result.cost
-            verdict = qc_result.data or {}
-            identity_checked = (not qc_spec.get("identity_required")
-                                or bool(verdict.get("identity_checked")))
-            # 兼容尚未升级的视觉质检 provider:只要它没有声明新字段,
-            # 沿用旧的 identity_checked 合同;一旦声明性别字段,则严格执行
-            # 两个性别门槛。这样不会把旧 provider 的历史结果误判为性别失败,
-            # 但新 provider 不能漏报或绕过性别核对。
-            gender_declared = bool({"gender_checked", "gender_match"}
-                                   & set(verdict))
-            gender_checked = (not qc_spec.get("gender_required")
-                              or not gender_declared
-                              or bool(verdict.get("gender_checked")))
-            gender_match = (not qc_spec.get("gender_required")
-                            or not gender_declared
-                            or bool(verdict.get("gender_match")))
-            issues = list(verdict.get("issues") or [])
-            if not identity_checked:
-                issues.append("质检未确认已逐人比对最终立绘")
-            if not gender_checked:
-                issues.append("质检未单独核对人物性别/性别表达")
-            elif not gender_match:
-                issues.append("人物性别/性别表达与锁定最终立绘不一致")
-            report = {"passed": bool(verdict.get("pass"))
-                      and identity_checked and gender_checked and gender_match,
-                      "issues": issues,
-                      "attempts": attempts + 1,
-                      "identity_checked": identity_checked,
-                      "gender_checked": gender_checked,
-                      "gender_match": gender_match,
-                      "identity_references": len(
-                          qc_spec.get("identity_references") or [])}
+            report = self._assess_image_qc(
+                qc_spec, qc_result.data or {}, attempts + 1)
             result.qc = report
             if report["passed"] or attempts >= self._qc_retries():
                 return result
@@ -1585,9 +1667,26 @@ class Director:
             attempts += 1
             payload = dict(payload)
             payload["feedback"] = ((payload.get("feedback") or "")
-                                   + ";图片质检不通过,必须修正:"
+                                   + ";自动定向修图：上一版图片质检不通过，"
+                                   "必须只修正以下身份/性别/人数问题:"
                                    + "；".join(report["issues"]))[:800]
             payload["qc_attempt"] = attempts
+            payload["revision_mode"] = "targeted_qc_fix"
+            payload["source_qc_uri"] = uri
+            references = [uri]
+            references.extend(payload.get("reference_images") or [])
+            payload["reference_images"] = list(dict.fromkeys(references))
+            matches = [
+                match for match in (payload.get("asset_matches") or [])
+                if match.get("uri") != uri]
+            matches.append({
+                "asset_id": None, "kind": "qc_revision_base",
+                "name": f"qc_attempt_{attempts}",
+                "label": "质检未过的待修改基底", "uri": uri,
+            })
+            payload["asset_matches"] = matches
+            payload["require_reference_images"] = True
+            self._attach_reference_manifest(payload)
 
     def _plan_done_extra(self, result):
         extra = {"provider": result.provider,
@@ -1605,6 +1704,16 @@ class Director:
         if qc is not None:
             extra["qc"] = qc
         return extra
+
+    @staticmethod
+    def _critical_qc_error(result):
+        qc = getattr(result, "qc", None) or {}
+        if qc.get("passed") is False and qc.get("hard_failure"):
+            return (
+                "角色身份/性别/人数质检未通过；已自动定向修图 "
+                f"{qc.get('attempts', 1) - 1} 次后仍失败:"
+                + "；".join(qc.get("issues") or []))
+        return ""
 
     def _run_one_task(self, ctx, task):
         """串行执行单个出图任务(含质检),记账并更新清单。"""
@@ -1644,6 +1753,13 @@ class Director:
         self._task_cost += result.cost
         self._task_providers.add(result.provider)
         self.projects.add_episode_cost(ctx["episode"]["id"], result.cost)
+        critical_error = self._critical_qc_error(result)
+        if critical_error:
+            self._finish_dispatch_task(ctx, task, error=critical_error)
+            self._plan_mark(
+                ctx, task["item_id"], "failed", error=critical_error[:300],
+                extra=self._plan_done_extra(result))
+            raise AifosError(critical_error)
         self._finish_dispatch_task(ctx, task, result=result)
         self._plan_mark(ctx, task["item_id"], "done",
                         extra=self._plan_done_extra(result))
@@ -1750,6 +1866,17 @@ class Director:
                     self._task_providers.add(result.provider)
                     self.projects.add_episode_cost(
                         ctx["episode"]["id"], result.cost)
+                    critical_error = self._critical_qc_error(result)
+                    if critical_error:
+                        error = AifosError(critical_error)
+                        failures.append((task, error))
+                        self._finish_dispatch_task(
+                            ctx, task, error=critical_error)
+                        self._plan_mark(
+                            ctx, task["item_id"], "failed",
+                            error=critical_error[:300],
+                            extra=self._plan_done_extra(result))
+                        continue
                     self._finish_dispatch_task(ctx, task, result=result)
                     self._plan_mark(ctx, task["item_id"], "done",
                                     extra=self._plan_done_extra(result))
@@ -2266,9 +2393,25 @@ class Director:
         blocking = existing if reused else candidate
         paths = write_spatial_svgs(
             blocking, ctx["out_root"] / "blocking")
-        if not reused:
-            version = self.projects.save_document(
-                ctx["episode"]["id"], "blocking", blocking)
+        reference_paths = write_spatial_reference_pngs(
+            blocking, ctx["out_root"] / "blocking" / "seedance")
+        # PNG 路径属于生产合同的一部分；旧版 blocking 即使可复用，也要
+        # 补写新字段，保证稍后刷新页面或重启后仍能找到必传空间图。
+        version = self.projects.save_document(
+            ctx["episode"]["id"], "blocking", blocking)
+        for shot_no, uri in reference_paths.items():
+            block = shot_blocking(blocking, shot_no) or {}
+            self.assets.register(
+                ctx["project"]["id"], "spatial_blocking",
+                f"e{ctx['episode']['number']:03d}_shot{shot_no:03d}_space",
+                uri=uri,
+                meta={
+                    "shot_no": shot_no,
+                    "scene_no": block.get("scene_no"),
+                    "image_quality": "high",
+                    "mandatory_for_seedance": True,
+                    "reason": block.get("spatial_reference_reason", ""),
+                })
         ctx["blocking"] = blocking
         return {
             "version": version,
@@ -2278,6 +2421,7 @@ class Director:
                 "required_scenes", 0),
             "shots": blocking.get("summary", {}).get("shots", 0),
             "svgs": len(paths),
+            "seedance_reference_pngs": len(reference_paths),
             "passed": blocking.get("validation", {}).get("passed", False),
         }
 
@@ -3447,7 +3591,12 @@ class Director:
                     payload.get("identity_characters", payload.get("characters", [])),
                     location=payload.get("location", ""),
                     action=payload.get("action", ""),
-                    forbid=["与设定形态不符的角色", "悬挂的衣物或衣架", "与设定不符的人"] + ["字幕条"]),
+                    forbid=["与设定形态不符的角色", "悬挂的衣物或衣架",
+                            "与设定不符的人", "字幕条"],
+                    expected_characters=payload.get("characters", []),
+                    expected_count=payload.get("character_count"),
+                    character_background=payload.get(
+                        "character_background", {})),
                     "camera": payload.get("camera", "")}})
         results = self._run_parallel(ctx, tasks, line="分镜画面")
         for shot_no in sorted(results):
@@ -3634,6 +3783,62 @@ class Director:
             ctx["videos"].append(self._make_video(ctx, shot, frames))
         return {"count": len(ctx["videos"]), "reused": reused}
 
+    def _ensure_spatial_reference_assets(self, ctx):
+        """补齐并登记本集 Seedance 必传的逐镜空间 PNG（兼容旧项目）。"""
+        blocking = ctx.get("blocking")
+        if blocking is None:
+            blocking, _ = self.projects.latest_document(
+                ctx["episode"]["id"], "blocking")
+        if not blocking:
+            return {}
+        mark_spatial_reference_requirements(blocking)
+        required = [
+            block for block in (blocking.get("shot_index") or {}).values()
+            if requires_spatial_reference(block)]
+        missing = [
+            block for block in required
+            if not block.get("spatial_reference_uri")
+            or not Path(block["spatial_reference_uri"]).exists()]
+        if missing:
+            write_spatial_reference_pngs(
+                blocking, ctx["out_root"] / "blocking" / "seedance")
+            self.projects.save_document(
+                ctx["episode"]["id"], "blocking", blocking)
+        rows = {}
+        for block in required:
+            shot_no = int(block.get("shot_no") or 0)
+            uri = block.get("spatial_reference_uri") or ""
+            if not uri or not Path(uri).exists():
+                continue
+            name = (
+                f"e{ctx['episode']['number']:03d}_shot{shot_no:03d}_space")
+            row = self.assets.latest(
+                ctx["project"]["id"], "spatial_blocking", name)
+            if row is None or row["uri"] != uri:
+                row = self.assets.register(
+                    ctx["project"]["id"], "spatial_blocking", name,
+                    uri=uri, meta={
+                    "shot_no": shot_no,
+                    "scene_no": block.get("scene_no"),
+                    "image_quality": "high",
+                    "mandatory_for_seedance": True,
+                    "reason": block.get("spatial_reference_reason", ""),
+                    })
+            rows[shot_no] = row
+        ctx["blocking"] = blocking
+        return rows
+
+    def _spatial_reference_requirement(self, ctx, shot_no):
+        rows = self._ensure_spatial_reference_assets(ctx)
+        block = shot_blocking(ctx.get("blocking"), shot_no) or {}
+        return {
+            "required": requires_spatial_reference(block),
+            "ready": int(shot_no) in rows,
+            "reason": block.get("spatial_reference_reason", ""),
+            "row": rows.get(int(shot_no)),
+            "error": block.get("spatial_reference_error", ""),
+        }
+
     def set_video_references(self, episode_id, shot_no, asset_ids,
                              reset=False):
         """保存某镜头从资产中心人工选定的 Seedance 参考图。
@@ -3659,14 +3864,24 @@ class Director:
             version = self.projects.save_document(
                 episode["id"], "video_references", document)
             return {**document, "version": version}
+        project = self.db.query_one(
+            "SELECT * FROM projects WHERE id=?", (episode["project_id"],))
+        ctx = {"project": dict(project), "episode": dict(episode),
+               "out_root": self._episode_dir(project, episode)}
+        spatial = self._spatial_reference_requirement(ctx, shot_no)
         unique_ids = []
         for value in asset_ids or []:
             asset_id = int(value)
             if asset_id not in unique_ids:
                 unique_ids.append(asset_id)
-        # multimodal2video 最多 9 张；首尾帧占 2 张。
-        if len(unique_ids) > 7:
-            raise AifosError("每个镜头最多选择 7 张资产参考图")
+        # multimodal2video 最多 9 张；首尾帧占 2 张。需要空间图时再保留
+        # 一个不可取消的槽位，人工参考最多 6 张。
+        manual_limit = 6 if spatial["required"] else 7
+        if len(unique_ids) > manual_limit:
+            suffix = ("（本镜另保留 1 张空间调度图）"
+                      if spatial["required"] else "")
+            raise AifosError(
+                f"每个镜头最多选择 {manual_limit} 张资产参考图{suffix}")
         selected = []
         for asset_id in unique_ids:
             row = self.assets.get(asset_id)
@@ -3679,6 +3894,8 @@ class Director:
                 raise AifosError(f"资产已删除或不是最新版本: {asset_id}")
             if row["kind"] not in IMAGE_ASSET_KINDS:
                 raise AifosError(f"资产不是可用图片: {row['kind']}")
+            if row["kind"] == "spatial_blocking":
+                raise AifosError("空间调度图由系统按镜头强制加入，无需人工选择")
             if not formal_reference_allowed(self._asset_quality(row)):
                 raise AifosError(f"低质量候选图不能交给 Seedance: {row['name']}")
             uri = row["uri"]
@@ -3708,6 +3925,7 @@ class Director:
             "SELECT * FROM projects WHERE id=?", (episode["project_id"],))
         ctx = {"project": dict(project), "episode": dict(episode),
                "out_root": self._episode_dir(project, episode)}
+        self._ensure_spatial_reference_assets(ctx)
         storyboard, _ = self.projects.latest_document(
             episode["id"], "storyboard")
         document, _ = self.projects.latest_document(
@@ -3719,8 +3937,13 @@ class Director:
             if no is None:
                 continue
             key = str(int(no))
+            spatial = self._spatial_reference_requirement(ctx, no)
             shots[key] = {
                 "mode": "manual" if key in manual else "auto",
+                "spatial_reference_required": spatial["required"],
+                "spatial_reference_ready": spatial["ready"],
+                "spatial_reference_reason": spatial["reason"],
+                "spatial_reference_error": spatial["error"],
                 "items": [{
                     "asset_id": row["id"], "kind": row["kind"],
                     "name": row["name"], "uri": row["uri"],
@@ -3769,8 +3992,13 @@ class Director:
                 seen.add(row["id"])
                 rows.append(row)
 
-        # 本镜分镜示例图:有就必交(首尾帧本就源于它,画了不交等于白做);
-        # 它承载本镜构图/调度事实,不受"低质量禁入正式参考链"限制
+        # 空间图是多人/变机位镜头的硬参考，优先占位且不可被人工选择覆盖。
+        spatial = self._spatial_reference_requirement(ctx, shot_no)
+        add(spatial["row"])
+        for name in shot.get("characters", []) or []:
+            add(self._locked_identity(project_id, name))
+        # 本镜分镜示例图承载构图事实；它即使是低档候选也可在首尾帧之外
+        # 作为构图参考，但不能挤掉必传空间图与人物身份图。
         shot_image = self.assets.latest(
             project_id, "image",
             f"e{ctx['episode']['number']:03d}_shot{int(shot_no):03d}")
@@ -3778,11 +4006,10 @@ class Director:
                 and not self.assets.is_deleted(shot_image)
                 and shot_image["uri"]
                 and (shot_image["uri"].startswith(("http://", "https://"))
-                     or Path(shot_image["uri"]).exists())):
+                     or Path(shot_image["uri"]).exists())
+                and shot_image["id"] not in seen):
             seen.add(shot_image["id"])
             rows.append(shot_image)
-        for name in shot.get("characters", []) or []:
-            add(self._locked_identity(project_id, name))
         if location:
             add(self.assets.latest(project_id, "scene_art", location))
         wanted = set(shot.get("characters") or [])
@@ -3803,7 +4030,9 @@ class Director:
             # 人工没选过 = 自动选入必要参考图;人工选择(含清空)优先
             return self._auto_video_reference_rows(ctx, shot_no)
         selected = shots_doc.get(str(int(shot_no)), [])
-        rows = []
+        spatial = self._spatial_reference_requirement(ctx, shot_no)
+        rows = [spatial["row"]] if spatial["row"] is not None else []
+        seen = {row["id"] for row in rows}
         for item in selected:
             row = self.assets.get(item.get("asset_id"))
             if row is None or row["project_id"] != ctx["project"]["id"]:
@@ -3816,7 +4045,8 @@ class Director:
                 continue
             uri = row["uri"]
             if (uri.startswith(("http://", "https://"))
-                    or Path(uri).exists()):
+                    or Path(uri).exists()) and row["id"] not in seen:
+                seen.add(row["id"])
                 rows.append(row)
         return rows[:7]
 
@@ -3830,19 +4060,50 @@ class Director:
             ctx.get("quality_policy") or default_quality_policy(),
             shot_no=shot["shot_no"])
         reference_rows = self._video_reference_rows(ctx, shot["shot_no"])
+        spatial = self._spatial_reference_requirement(
+            ctx, shot["shot_no"])
+        if spatial["required"] and not (
+                spatial["ready"]
+                and any(row["kind"] == "spatial_blocking"
+                        for row in reference_rows)):
+            detail = spatial["error"] or "空间 PNG 未生成或未上传"
+            raise AifosError(
+                f"镜头{shot['shot_no']}为多人/变机位镜头，"
+                f"必须给 Seedance 2 上传空间调度示意图:{detail}")
         reference_assets = [{
             "asset_id": row["id"], "kind": row["kind"],
             "name": row["name"], "version": row["version"],
         } for row in reference_rows]
+        reference_manifest = [{
+            "index": index + 3,
+            **asset,
+            "uri": row["uri"],
+            "binding": (
+                "只读取人物编号、起终站位、行动箭头和摄影机起终点；"
+                "这是俯视示意图，不得把图形、文字或俯视画风画进成片"
+                if row["kind"] == "spatial_blocking"
+                else "按该资产类别锁定本镜人物身份、服装、场景或构图"),
+        } for index, (row, asset) in enumerate(
+            zip(reference_rows, reference_assets))]
+        video_prompt = shot.get("seedance_prompt", shot["prompt"])
+        if reference_manifest:
+            video_prompt += (
+                "。Seedance 图片输入对照表：图1=首帧（动作起点）；"
+                "图2=尾帧（动作终点）；"
+                + "；".join(
+                    f"图{item['index']}={item['kind']}/{item['name']}："
+                    f"{item['binding']}" for item in reference_manifest)
+                + "。必须严格按图序使用，禁止张冠李戴。")
         result = self._call(ctx, "video", {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
-            "prompt": shot.get("seedance_prompt", shot["prompt"]),
+            "prompt": video_prompt,
             "duration": shot["duration"],
             "first": frame["first"],
             "last": frame["last"],
             "reference_images": [row["uri"] for row in reference_rows],
             "reference_assets": reference_assets,
+            "reference_manifest": reference_manifest,
             "dialogue": shot.get("dialogue"),
             "voice": ctx["production_profile"]["voice"],
             "lip_sync": ctx["production_profile"]["lip_sync"],
@@ -3869,13 +4130,16 @@ class Director:
                                         "video_quality": quality["level"],
                                         "video_resolution": quality["resolution"],
                                         "quality_source": quality["source"],
-                                        "reference_assets": reference_assets})
+                                        "reference_assets": reference_assets,
+                                        "reference_manifest":
+                                            reference_manifest})
         return {"shot_no": shot["shot_no"], "uri": result.uri,
                 "duration": shot["duration"], "provider": result.provider,
                 "audio_in_video": audio_in_video,
                 "video_quality": quality["level"],
                 "video_resolution": quality["resolution"],
-                "reference_assets": reference_assets}
+                "reference_assets": reference_assets,
+                "reference_manifest": reference_manifest}
 
     def _video_audio_states(self, ctx):
         """按实际视频资产/Provider 声明返回每镜是否内置配音。"""
@@ -4702,14 +4966,34 @@ class Director:
             if prompt_override:
                 payload["prompt"] = prompt_override
                 payload["seedance_prompt"] = prompt_override
+                payload["_reference_prompt_base"] = prompt_override
             asset_name = self._shot_name(ctx, shot_no)
             old_image = self.assets.latest(
                 project["id"], "image", asset_name)
+            if (old_image and old_image["uri"]
+                    and (old_image["uri"].startswith(("http://", "https://"))
+                         or Path(old_image["uri"]).exists())):
+                payload["reference_images"] = list(dict.fromkeys([
+                    old_image["uri"],
+                    *(payload.get("reference_images") or []),
+                ]))
+                matches = [
+                    match for match in (payload.get("asset_matches") or [])
+                    if match.get("uri") != old_image["uri"]]
+                matches.append({
+                    "asset_id": old_image["id"], "kind": old_image["kind"],
+                    "name": old_image["name"],
+                    "label": "本镜当前关键帧（待修改基底）",
+                    "uri": old_image["uri"],
+                })
+                payload["asset_matches"] = matches
+                payload["require_reference_images"] = True
+                self._attach_reference_manifest(payload)
             result = self._plan_run(
                 ctx, f"shot:{shot_no}",
                 lambda: self._call(ctx, "image", payload, "images"),
                 prompt=self._prompt_with_feedback(
-                    payload["prompt"], feedback),
+                    prompt_override or payload["prompt"], feedback),
                 payload=payload, revision_source=revision_source)
             new_image = self.assets.register(
                 project["id"], "image", asset_name, uri=result.uri,
@@ -5314,7 +5598,10 @@ class Director:
                 "初始人物/场景母资产不做视觉质检；请在分镜关键帧或首尾帧生成后质检")
         if category not in self.SHOT_QC_CATEGORIES:
             raise AifosError("该清单条目不支持镜头视觉质检")
-        return self._qc_one(project, episode, ctx, item)
+        report = self._qc_one(project, episode, ctx, item)
+        report, _ = self._auto_repair_qc_item(
+            project, episode, ctx, item, report)
+        return report
 
     def _qc_one(self, project, episode, ctx, item):
         project_id = project["id"]
@@ -5346,7 +5633,11 @@ class Director:
                         "identity_characters", payload.get("characters", [])),
                     location=payload.get("location", ""),
                     action=payload.get("action", ""),
-                    forbid=self._FORBID + ["字幕条"])
+                    forbid=self._FORBID + ["字幕条"],
+                    expected_characters=payload.get("characters", []),
+                    expected_count=payload.get("character_count"),
+                    character_background=payload.get(
+                        "character_background", {}))
                 spec["camera"] = payload.get("camera", "")
             else:
                 spec = self._qc_spec(project_id, [], forbid=self._FORBID)
@@ -5368,49 +5659,48 @@ class Director:
             return cached
         passed_all, issues, cost = True, [], 0.0
         identity_checked_all = True
+        identity_match_all = True
         gender_checked_all = True
         gender_match_all = True
+        count_checked_all = True
+        count_match_all = True
+        hard_failure = False
         try:
             for label, one in uris:
                 result = self.router.call(
                     "image_qc", {**spec, "image_uri": one}, ctx["out_root"],
                     cancel=lambda: self._cancel_requested(ctx))
                 cost += result.cost
-                verdict = result.data or {}
-                identity_checked = (not spec.get("identity_required")
-                                    or bool(verdict.get("identity_checked")))
-                if not identity_checked:
-                    identity_checked_all = False
-                    passed_all = False
-                    issues.append(f"{label}:质检未确认已逐人比对最终立绘")
-                gender_declared = bool({"gender_checked", "gender_match"}
-                                       & set(verdict))
-                gender_checked = (not spec.get("gender_required")
-                                  or not gender_declared
-                                  or bool(verdict.get("gender_checked")))
-                gender_match = (not spec.get("gender_required")
-                                or not gender_declared
-                                or bool(verdict.get("gender_match")))
-                if not gender_checked:
-                    gender_checked_all = False
-                    passed_all = False
-                    issues.append(f"{label}:质检未单独核对人物性别/性别表达")
-                elif not gender_match:
-                    gender_match_all = False
-                    passed_all = False
-                    issues.append(
-                        f"{label}:人物性别/性别表达与锁定最终立绘不一致")
-                if not bool(verdict.get("pass")):
-                    passed_all = False
-                    issues.extend(f"{label}:{x}"
-                                  for x in (verdict.get("issues") or []))
+                one_report = self._assess_image_qc(
+                    spec, result.data or {}, 1)
+                passed_all = passed_all and one_report["passed"]
+                identity_checked_all = (
+                    identity_checked_all
+                    and one_report["identity_checked"])
+                identity_match_all = (
+                    identity_match_all and one_report["identity_match"])
+                gender_checked_all = (
+                    gender_checked_all and one_report["gender_checked"])
+                gender_match_all = (
+                    gender_match_all and one_report["gender_match"])
+                count_checked_all = (
+                    count_checked_all and one_report["count_checked"])
+                count_match_all = (
+                    count_match_all and one_report["count_match"])
+                hard_failure = hard_failure or one_report["hard_failure"]
+                issues.extend(
+                    f"{label}:{x}" for x in one_report["issues"])
         except (ProviderUnavailable, ProviderError) as exc:
             raise AifosError(f"质检产线不可用: {exc}") from exc
         report = {"passed": passed_all, "issues": issues,
                   "attempts": previous.get("attempts", 0),
                   "identity_checked": identity_checked_all,
+                  "identity_match": identity_match_all,
                   "gender_checked": gender_checked_all,
                   "gender_match": gender_match_all,
+                  "count_checked": count_checked_all,
+                  "count_match": count_match_all,
+                  "hard_failure": hard_failure,
                   "identity_references": len(
                       spec.get("identity_references") or []),
                   "signature": signature, "cached": False}
@@ -5424,6 +5714,55 @@ class Director:
                else "未过 — " + "；".join(report["issues"])))
         return report
 
+    def _auto_repair_qc_item(self, project, episode, ctx, item, report):
+        """身份/性别/人数硬错误：以失败图为基底自动修图并立即复检。"""
+        if report.get("passed") or not report.get("hard_failure"):
+            return report, 0
+        repaired = 0
+        current = report
+        for attempt in range(self._qc_retries()):
+            if self._cancel_requested(ctx):
+                raise ProduceCancelled("已手动暂停质检自动修图")
+            target = self._plan_item_target(item["id"])
+            if target is None:
+                break
+            # 帧组能定位到首/尾时只修那一张，避免无关帧也被重画。
+            if item.get("category") == "frames":
+                issue_text = "；".join(current.get("issues") or [])
+                has_first = "首帧:" in issue_text
+                has_last = "尾帧:" in issue_text
+                if has_first != has_last:
+                    target = {
+                        "kind": ("first_frame" if has_first
+                                 else "last_frame"),
+                        "shot_no": int(item.get("shot_no")),
+                    }
+            feedback = (
+                "质检自动定向修图：必须逐项修正角色身份、性别和人数硬错误；"
+                "严格使用锁定最终立绘逐人对应，不得新增、删减、复制或合并人物。"
+                "上一版问题：" + "；".join(current.get("issues") or []))[:800]
+            self.log.warn(
+                "director",
+                f"{item['id']} 触发自动修图第{attempt + 1}次:"
+                + "；".join(current.get("issues") or []))
+            self.regen_image(
+                project["title"], episode["number"], target,
+                feedback=feedback, revision_source="auto_qc_identity")
+            repaired += 1
+            refreshed = next((
+                candidate for candidate in self._plan_read(ctx)["items"]
+                if candidate["id"] == item["id"]), item)
+            current = self._qc_one(
+                project, episode, ctx, refreshed)
+            if current.get("passed") or not current.get("hard_failure"):
+                break
+        current = dict(current)
+        current["auto_repaired"] = repaired
+        current["auto_repair_exhausted"] = bool(
+            repaired and current.get("hard_failure")
+            and not current.get("passed"))
+        return current, repaired
+
     def qc_all(self, project_title, episode_number):
         """批量质检:对清单里所有已生成的图逐张核对,可暂停。"""
         project, episode = self._episode_ctx(project_title, episode_number)
@@ -5436,12 +5775,16 @@ class Director:
         previous_status = episode["status"]
         self.projects.set_episode_status(episode["id"], "cast")
         checked = passed = failed = 0
+        auto_repaired = 0
         try:
             for item in items:
                 if self._cancel_requested(ctx):
                     raise ProduceCancelled("已手动暂停质检")
                 try:
                     report = self._qc_one(project, episode, ctx, item)
+                    report, repaired = self._auto_repair_qc_item(
+                        project, episode, ctx, item, report)
+                    auto_repaired += repaired
                 except AifosError as exc:
                     self.log.warn("director",
                                   f"质检 {item['id']} 跳过: {exc}")
@@ -5452,7 +5795,8 @@ class Director:
         except ProduceCancelled:
             self.projects.set_episode_status(episode["id"], previous_status)
             return {"status": "paused", "checked": checked,
-                    "passed": passed, "failed": failed}
+                    "passed": passed, "failed": failed,
+                    "auto_repaired": auto_repaired}
         finally:
             row = self.projects.get_episode(episode["id"])
             if row and row["status"] in ("cast", "cancelling"):
@@ -5460,9 +5804,11 @@ class Director:
                     episode["id"], previous_status)
         self.log.info(
             "director",
-            f"批量质检完成:{checked} 张,通过 {passed},未过 {failed}")
+            f"批量质检完成:{checked} 张,通过 {passed},未过 {failed},"
+            f"自动修图 {auto_repaired} 次")
         return {"status": "done", "checked": checked,
-                "passed": passed, "failed": failed}
+                "passed": passed, "failed": failed,
+                "auto_repaired": auto_repaired}
 
     def redo_items(self, project_title, episode_number, item_ids=None,
                    only_failed=False, quality_override=None, progress=None):

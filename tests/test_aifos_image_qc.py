@@ -116,6 +116,56 @@ def test_gender_mismatch_is_a_hard_identity_gate(app, tmp_path):
     assert any("性别" in issue for issue in result.qc["issues"])
 
 
+def test_count_mismatch_auto_revises_bad_image_with_locked_references(
+        app, tmp_path):
+    """人数错误必须把失败图作为待修改基底重画，并与最终立绘一起复检。"""
+    image = tmp_path / "shot.png"
+    identity = tmp_path / "identity.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+    identity.write_bytes(b"\x89PNG\r\n\x1a\n" + b"1" * 16)
+    calls = {"image": [], "qc": []}
+
+    class StubRouter:
+        def call(self, capability, payload, out_dir, cancel=None):
+            if capability == "image":
+                calls["image"].append(dict(payload))
+                return ProviderResult(
+                    provider="seedream5_lite", cost=0.2, uri=str(image))
+            calls["qc"].append(dict(payload))
+            first = len(calls["qc"]) == 1
+            return ProviderResult(provider="vision", cost=0.1, data={
+                "pass": not first,
+                "identity_checked": True, "identity_match": True,
+                "gender_checked": True, "gender_match": True,
+                "count_checked": True, "count_match": not first,
+                "detected_count": 3 if first else 2,
+                "issues": ["多出一名人物"] if first else [],
+            })
+
+    app.director.router = StubRouter()
+    result = app.director._generate_image_with_qc(
+        "image", {
+            "prompt": "两人对话", "characters": ["甲", "乙"],
+            "identity_references": [
+                {"character": "甲", "uri": str(identity)}],
+        }, tmp_path, None, {
+            "characters": ["甲", "乙"], "count": 2,
+            "identity_required": True, "gender_required": True,
+            "count_required": True,
+            "identity_references": [
+                {"character": "甲", "uri": str(identity)}],
+        })
+    assert result.qc["passed"] is True
+    assert len(calls["image"]) == 2
+    revised = calls["image"][1]
+    assert revised["revision_mode"] == "targeted_qc_fix"
+    assert revised["reference_images"][0] == str(image)
+    assert any(
+        item["label"] == "质检未过的待修改基底"
+        for item in revised["reference_manifest"])
+    assert revised["reference_manifest"][0]["uri"] == str(identity)
+
+
 def test_qc_report_lands_in_plan(app):
     """初始母资产不空耗视觉 QC；正式镜头图必须带通过结果。"""
     import json
@@ -455,6 +505,12 @@ def test_frames_qc_checks_both_frames(app, monkeypatch):
             return ProviderResult(
                 provider="codex", cost=0.1,
                 data={"pass": calls["n"] != 2,
+                      "identity_checked": True,
+                      "identity_match": True,
+                      "gender_checked": True,
+                      "gender_match": True,
+                      "count_checked": True,
+                      "count_match": True,
                       "issues": [] if calls["n"] != 2 else ["尾帧人物不符"]})
         return real_call(capability, payload, out_dir, cancel=cancel)
 

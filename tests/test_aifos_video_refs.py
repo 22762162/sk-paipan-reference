@@ -51,6 +51,10 @@ def test_auto_video_references_include_necessary_images(app):
         if shot.get("characters"):
             assert "character_identity" in kinds, \
                 f"镜头{shot['shot_no']}缺人物最终立绘"
+        if entry["spatial_reference_required"]:
+            assert entry["spatial_reference_ready"]
+            assert "spatial_blocking" in kinds, \
+                f"镜头{shot['shot_no']}缺 Seedance 必传空间图"
         assert len(entry["items"]) <= 7
 
 
@@ -62,12 +66,20 @@ def test_manual_selection_overrides_auto(app):
     effective = app.director.effective_video_references(episode["id"])
     entry = effective["shots"]["1"]
     assert entry["mode"] == "manual"
-    assert [item["asset_id"] for item in entry["items"]] == [row["id"]]
+    manual_ids = [item["asset_id"] for item in entry["items"]
+                  if item["kind"] != "spatial_blocking"]
+    assert manual_ids == [row["id"]]
+    if entry["spatial_reference_required"]:
+        assert entry["items"][0]["kind"] == "spatial_blocking"
     # 清空 = 明确只用首尾帧,不回落自动
     app.director.set_video_references(episode["id"], 1, [])
     effective = app.director.effective_video_references(episode["id"])
     assert effective["shots"]["1"]["mode"] == "manual"
-    assert effective["shots"]["1"]["items"] == []
+    remaining = effective["shots"]["1"]["items"]
+    if effective["shots"]["1"]["spatial_reference_required"]:
+        assert [item["kind"] for item in remaining] == ["spatial_blocking"]
+    else:
+        assert remaining == []
     # 其他镜头仍是自动
     assert effective["shots"]["2"]["mode"] == "auto"
 

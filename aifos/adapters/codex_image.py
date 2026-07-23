@@ -271,12 +271,20 @@ def build_instruction(capability, payload, out_dir):
             f"- 人物设定要点(脸型/五官/发型/发色/妆容/年龄感/标志特征必须一致；"
             "服装按本镜剧本设定，允许与身份参考图不同):"
             f"{payload.get('designs', '见参考图')}\n"
+            "- 角色性别硬事实:"
+            + ("；".join(
+                f"{name}={gender}" for name, gender in
+                (payload.get("expected_genders") or {}).items())
+               or "以最终立绘与人物设定为准")
+            + "\n"
             f"- 人工锁定的最终立绘:{identity_line}\n"
             "必须真实打开待检图和上述最终立绘逐人做视觉比对；脸型、五官比例、"
             "眼鼻嘴、发际线、发型轮廓、年龄感和体型以最终立绘为准。"
             "不得只根据文字判断；文字与最终立绘冲突时，身份以最终立绘为准。\n"
             "必须单独核对每个人物的性别与性别表达。女性画成男性、男性画成女性"
             "一律判失败，不能因服装、发色或气质相似而放行。\n"
+            "必须点数画面实际可见人物；多一个、少一个、角色被复制或两人合成一人"
+            "都必须判失败。\n"
             f"- 场景:{payload.get('location', '按提示词')};"
             f"动作:{payload.get('action', '按提示词')};"
             f"镜头景别:{payload.get('camera', '不限')}\n"
@@ -286,7 +294,10 @@ def build_instruction(capability, payload, out_dir):
             "裁掉且非剧情要求必须出镜的裤子、腰间配饰等，不得仅因不可见判失败。\n"
             "只在标准输出打印一行 JSON,不要产出任何文件,不要多余文字:"
             '{"pass": true或false, "identity_checked": true或false, '
+            '"identity_match": true或false, '
             '"gender_checked": true或false, "gender_match": true或false, '
+            '"count_checked": true或false, "count_match": true或false, '
+            '"detected_count": 画面实际人数整数, '
             '"issues": ["每条一句具体原因"]}'
         )
         return instruction, [], {"qc": True}

@@ -376,7 +376,13 @@ def test_video_references_are_versioned_and_used(app):
     video = app.assets.latest(
         project["id"], "video", f"e001_shot{shot_no:03d}")
     meta = json.loads(video["meta"])
-    assert meta["reference_assets"][0]["asset_id"] == scene["id"]
+    assert any(
+        item["asset_id"] == scene["id"]
+        for item in meta["reference_assets"])
+    effective = app.director.effective_video_references(episode["id"])
+    if effective["shots"][str(shot_no)]["spatial_reference_required"]:
+        assert meta["reference_assets"][0]["kind"] == "spatial_blocking"
+        assert meta["reference_manifest"][0]["index"] == 3
 
 
 def test_shot_generation_prioritizes_matching_asset_center_images(app):

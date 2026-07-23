@@ -4511,6 +4511,7 @@ const VIDEO_REF_KIND_CN = {
   scene_art: "场景图", reference: "用户参考图",
   character_sheet: "人物资产图", character_art: "人物立绘",
   first_frame: "首帧", last_frame: "尾帧",
+  spatial_blocking: "空间调度图",
 };
 
 const VIDEO_REF_USAGE_CN = {
@@ -4522,6 +4523,7 @@ const VIDEO_REF_USAGE_CN = {
   character_art: "锁定人物身份和本集造型",
   first_frame: "视频动作起点，必须传入",
   last_frame: "视频动作终点及衔接，必须传入",
+  spatial_blocking: "锁定多人站位、行动路线和摄影机起终点，必须传入",
 };
 
 function friendlyVideoReferenceName(item, shotNo) {
@@ -4597,6 +4599,9 @@ function videoReferencePanelHtml(data) {
         || lastFrames[shot.shot_no] || "";
       const frameCount = Number(Boolean(first)) + Number(Boolean(last));
       const total = frameCount + rows.length;
+      const spatialRequired = Boolean(entry.spatial_reference_required);
+      const spatialReady = !spatialRequired
+        || Boolean(entry.spatial_reference_ready);
       return `<tr>
         <th scope="row" class="video-ref-shot">
           <b>#${String(shot.shot_no).padStart(2, "0")}</b>
@@ -4625,9 +4630,15 @@ function videoReferencePanelHtml(data) {
           <span class="video-ref-mode ${auto ? "auto" : "manual"}">${auto
             ? "按剧本自动选入" : "人工选定"}</span>
           <b>首尾帧 ${frameCount}/2 · 资产 ${rows.length}/7</b>
-          <small>${frameCount === 2
+          ${spatialRequired ? `<small class="${spatialReady ? "pass" : "danger"}">
+            空间图${spatialReady ? "已强制加入" : "缺失，禁止 Seedance"}
+            ${entry.spatial_reference_reason
+              ? ` · ${esc(entry.spatial_reference_reason)}` : ""}</small>` : ""}
+          <small>${frameCount === 2 && spatialReady
             ? `实际输入 ${total} 张，可进入 Seedance`
-            : `缺 ${2 - frameCount} 张必传帧，暂不可开拍`}</small>
+            : (frameCount < 2
+              ? `缺 ${2 - frameCount} 张必传帧，暂不可开拍`
+              : "缺必传空间图，暂不可开拍")}</small>
         </td>
         <td data-label="操作">
           <button class="video-ref-edit" data-shot-no="${shot.shot_no}">
@@ -4645,22 +4656,31 @@ function showVideoReferencePicker(data, episodeId, shotNo) {
   // 从"实际生效"的参考图出发调整:自动模式下就是自动选入的那批
   const effectiveRows = (((data.video_references_effective || {}).shots
     || {})[String(shotNo)] || {}).items || [];
-  const selected = new Set(effectiveRows.map((row) => Number(row.asset_id)));
+  const entry = (((data.video_references_effective || {}).shots
+    || {})[String(shotNo)] || {});
+  const manualLimit = entry.spatial_reference_required ? 6 : 7;
+  const selected = new Set(effectiveRows
+    .filter((row) => row.kind !== "spatial_blocking")
+    .map((row) => Number(row.asset_id)));
   const overlay = document.createElement("div");
   overlay.className = "script-overlay video-ref-overlay";
   overlay.innerHTML = `<div class="script-box video-ref-box">
     <div class="script-head"><h2>镜头 ${shotNo} · 选择资产参考图</h2>
       <button class="close">关闭</button></div>
     <p class="dim">图片会与本镜首尾帧一起交给 Seedance 2.0 Fast VIP。
-      低质量候选不能勾选；最多选 7 张。</p>
+      低质量候选不能勾选；最多选 ${manualLimit} 张。${entry.spatial_reference_required
+        ? "本镜的空间调度图由系统强制加入，不占人工选择。" : ""}</p>
     <div class="video-ref-picker-grid">${library.map((item) => `
-      <label class="video-ref-choice${item.usable_for_video ? "" : " disabled"}">
+      <label class="video-ref-choice${item.usable_for_video
+        && item.kind !== "spatial_blocking" ? "" : " disabled"}">
         <input type="checkbox" value="${item.asset_id}"
           ${selected.has(Number(item.asset_id)) ? "checked" : ""}
-          ${item.usable_for_video ? "" : "disabled"}>
+          ${item.usable_for_video && item.kind !== "spatial_blocking"
+            ? "" : "disabled"}>
         <img src="${esc(thumbUrl(item.url, 260))}" loading="lazy" alt="${esc(item.label)}">
         <span>${esc(item.label)}</span>
-        <small>${esc(item.quality || "medium")}${item.usable_for_video ? "" : " · 低质量禁用"}</small>
+        <small>${esc(item.quality || "medium")}${item.kind === "spatial_blocking"
+          ? " · 系统自动加入" : (item.usable_for_video ? "" : " · 低质量禁用")}</small>
       </label>`).join("") || `<div class="dim">资产中心还没有可选图片。</div>`}</div>
     <div class="script-actions">
       <button class="reset-auto" title="撤销人工选择,回到按剧本自动选入分镜图/人物立绘/场景图">↺ 恢复自动选入</button>
@@ -4688,8 +4708,8 @@ function showVideoReferencePicker(data, episodeId, shotNo) {
   overlay.querySelector(".save").onclick = async (ev) => {
     const ids = [...overlay.querySelectorAll("input:checked")]
       .map((input) => Number(input.value));
-    if (ids.length > 7) {
-      showToast("每个镜头最多选择 7 张资产参考图", "error");
+    if (ids.length > manualLimit) {
+      showToast(`每个镜头最多选择 ${manualLimit} 张资产参考图`, "error");
       return;
     }
     ev.target.disabled = true; ev.target.textContent = "保存中…";

@@ -4,8 +4,12 @@ from pathlib import Path
 from aifos.spatial_blocking import (MIN_ACTOR_SEPARATION,
                                     MIN_CAMERA_SEPARATION,
                                     build_character_number_map,
-                                    build_spatial_plan, render_scene_svg,
-                                    shot_blocking, validate_spatial_plan,
+                                    build_spatial_plan,
+                                    mark_spatial_reference_requirements,
+                                    render_scene_svg,
+                                    requires_spatial_reference, shot_blocking,
+                                    validate_spatial_plan,
+                                    write_spatial_reference_pngs,
                                     write_spatial_svgs)
 
 
@@ -83,6 +87,36 @@ def test_group_scene_builds_routes_camera_and_continuity(tmp_path):
     assert svg.count('data-layout="isolated-panel"') == 2
     assert 'data-camera-phase="start"' in svg
     assert 'data-camera-phase="fixed"' in svg
+
+
+def test_seedance_spatial_png_required_for_group_and_changed_camera(tmp_path):
+    shots = [
+        _shot(1, ["甲"], "固定", "甲站在原位"),
+        _shot(2, ["甲"], "固定", "甲站在原位"),
+        _shot(3, ["甲", "乙"], "固定", "两人对峙"),
+    ]
+    # 强制第2镜换机位，但镜内保持静止。
+    shots[1]["five_dimensions"]["camera_design"]["camera_position"] = "侧面"
+    shots[1]["five_dimensions"]["camera_design"]["axis_offset_degrees"] = 45
+    plan = build_spatial_plan(
+        {"scenes": [{"scene_no": 1, "location": "办公室"}]},
+        {"shots": shots},
+        {"characters": [{"name": "甲"}, {"name": "乙"}], "scenes": []})
+    mark_spatial_reference_requirements(plan)
+
+    assert not requires_spatial_reference(shot_blocking(plan, 1))
+    assert requires_spatial_reference(shot_blocking(plan, 2))
+    assert "相邻镜头机位变化" in (
+        shot_blocking(plan, 2)["spatial_reference_reason"])
+    assert requires_spatial_reference(shot_blocking(plan, 3))
+    assert "2人同框" in shot_blocking(plan, 3)["spatial_reference_reason"]
+
+    paths = write_spatial_reference_pngs(plan, tmp_path / "seedance")
+    assert set(paths) == {2, 3}
+    for shot_no, uri in paths.items():
+        path = Path(uri)
+        assert path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+        assert shot_blocking(plan, shot_no)["spatial_reference_uri"] == uri
 
 
 def test_svg_escapes_scene_and_actor_labels():

@@ -16,7 +16,7 @@ KINDS = (
 IMAGE_KINDS = (
     "character_candidate", "character_art", "character_sheet",
     "scene_art", "image", "first_frame", "last_frame", "cover",
-    "reference",
+    "reference", "spatial_blocking",
 )
 
 

@@ -16,8 +16,13 @@ from .adapters.claude_script import (is_background_role,
                                      validate_script_bible)
 from .quality_policy import default_quality_policy, resolve_video_quality
 
-from .spatial_blocking import (build_character_number_map, build_spatial_plan,
-                               validate_spatial_plan)
+from .spatial_blocking import (
+    build_character_number_map,
+    build_spatial_plan,
+    mark_spatial_reference_requirements,
+    requires_spatial_reference,
+    validate_spatial_plan,
+)
 
 
 PIPELINE_VERSION = "sk-manju-v5"
@@ -917,10 +922,20 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
         script, storyboard, continuity, group_threshold=threshold)
     if blocking is None:
         blocking = expected_blocking
+    mark_spatial_reference_requirements(blocking)
     spatial_validation = validate_spatial_plan(blocking, storyboard)
     spatial_ok = (spatial_validation["passed"]
                   and (blocking.get("source_fingerprint")
                        == expected_blocking.get("source_fingerprint")))
+    spatial_required = [
+        block for block in (blocking.get("shot_index") or {}).values()
+        if requires_spatial_reference(block)]
+    spatial_references_ok = all(
+        bool(block.get("spatial_reference_uri"))
+        and (str(block["spatial_reference_uri"]).startswith(
+                 ("http://", "https://"))
+             or Path(block["spatial_reference_uri"]).exists())
+        for block in spatial_required)
     available_gates = [
         _gate("script_bible", "世界观、前情与人物设定",
               validate_script_bible(script) is None,
@@ -934,6 +949,11 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
               f"{blocking.get('summary', {}).get('scenes', 0)} 场 / "
               f"{blocking.get('summary', {}).get('shots', 0)} 镜已锁定人物走位、"
               "机位、视锥与屏幕轴线"),
+        _gate(
+            "spatial_seedance", "Seedance 空间参考图",
+            spatial_references_ok,
+            f"{sum(1 for block in spatial_required if block.get('spatial_reference_uri'))}"
+            f"/{len(spatial_required)} 个多人或变机位镜头已生成并绑定必传空间 PNG"),
         _gate("five_dimensions", "五维分镜字段", bool(shots) and all(
             all(key in shot for key in required) for shot in shots)
             and contract_ok,
