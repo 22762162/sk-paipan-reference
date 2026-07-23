@@ -11,6 +11,7 @@ import pytest
 
 from aifos.app import App
 from aifos.director import character_candidate_target
+from aifos.story_analysis import build_story_analysis
 from aifos.web.server import JobRegistry, serve
 
 
@@ -273,6 +274,53 @@ def test_asset_delete_and_video_reference_api(server):
     assert len(assets) == 2
     assert assets[-1]["meta"]["deleted"] is True
     assert path.exists(), "删除资产中心卡片不应物理删除历史文件"
+
+
+def test_episode_payload_upgrades_legacy_story_analysis(server):
+    script = {
+        "project_title": "旧制作圣经兼容测试",
+        "episode_title": "第一集",
+        "logline": "都市女团成员在直播间解决一次意外。",
+        "characters": [{
+            "name": "乔安",
+            "role": "主角",
+            "identity": "女团成员",
+            "age_range": "22岁",
+            "personality": "果断",
+        }],
+        "scenes": [{
+            "scene_no": 1,
+            "location": "现代直播间",
+            "characters": ["乔安"],
+            "action": "乔安处理直播事故。",
+        }],
+    }
+    legacy = build_story_analysis(script, "现代都市乙女游戏CG")
+    for character in legacy["characters"]:
+        character.pop("character_analysis", None)
+        character.pop("visual_dna", None)
+        character.pop("cast_dedup", None)
+
+    app2 = App(server["workspace"])
+    try:
+        project, _ = app2.projects.get_or_create_project(
+            "旧制作圣经兼容测试", style="现代都市乙女游戏CG")
+        episode, _ = app2.projects.get_or_create_episode(project["id"], 1)
+        app2.projects.save_document(episode["id"], "script", script)
+        app2.projects.save_document(
+            episode["id"], "story_analysis", legacy)
+        episode_id = episode["id"]
+    finally:
+        app2.close()
+
+    status, detail = _json_request(
+        server["port"], "GET", f"/api/episode/{episode_id}")
+    assert status == 200
+    character = detail["story_analysis"]["characters"][0]
+    assert character["character_analysis"]["identity_and_class"]
+    assert character["visual_dna"]["temperament_keywords"]
+    assert isinstance(character["cast_dedup"], dict)
+    assert detail["script"]["production_analysis"]["characters"]
 
 
 def test_asset_image_catalog_has_category_origin_time_and_prompt(server):
