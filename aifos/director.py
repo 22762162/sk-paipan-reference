@@ -527,7 +527,7 @@ class Director:
     # ---- 入口:一句话开工 ----
     def produce(self, project_title, episode_number, premise="", style="",
                 force=False, script=None, pause_for_confirm=False,
-                kind=None, feedback="", run_id=None):
+                kind=None, feedback="", run_id=None, style_pack_id=""):
         """force=False 时增量生产:已有且落盘完好的产物直接复用,
         只补齐缺失部分——真实产线(即梦按镜头计费)断点续产的关键。
         script:用户自带剧本(标准 JSON);提供时跳过 AI 编剧,
@@ -551,7 +551,8 @@ class Director:
                         or infer_visual_style(premise, project_title))
         project, created = self.projects.get_or_create_project(
             project_title, style=visual_style,
-            kind=kind if kind in ("drama", "idol") else "drama")
+            kind=kind if kind in ("drama", "idol") else "drama",
+            style_pack_id=str(style_pack_id or "").strip())
         updates = {}
         if (not created and kind in ("drama", "idol")
                 and project["kind"] != kind):
@@ -560,6 +561,9 @@ class Director:
                 and (requested_style or not project["style"])
                 and project["style"] != visual_style):
             updates["style"] = visual_style
+        if (not created and style_pack_id
+                and project["style_pack_id"] != str(style_pack_id).strip()):
+            updates["style_pack_id"] = str(style_pack_id).strip()
         if updates:
             # 用户明确改了内容类型/画风，或旧项目尚未锁定画风。
             project = self.projects.update_project(project_title, **updates)

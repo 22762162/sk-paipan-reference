@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS projects(
   kind TEXT NOT NULL DEFAULT 'drama',     -- drama 漫剧 / idol AI虚拟偶像
   account TEXT NOT NULL DEFAULT '',       -- 绑定的抖音等平台账号
   aspect TEXT NOT NULL DEFAULT '',        -- 画幅:空=用全局默认(9:16)
+  style_pack_id TEXT NOT NULL DEFAULT '', -- 火火漫剧研究室人工确认的独立风格包
   created_at REAL NOT NULL
 );
 
@@ -223,6 +224,77 @@ CREATE TABLE IF NOT EXISTS production_standard_state(
   updated_at REAL NOT NULL
 );
 
+-- 火火漫剧研究室:学习素材、可追溯证据和人工确认的独立风格包。
+-- 该空间与 production_standard_versions 分离，学习结果只能被项目显式选择，
+-- 不会悄悄改写系统制作标准。
+CREATE TABLE IF NOT EXISTS firefire_sessions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL DEFAULT '',
+  source_url TEXT NOT NULL DEFAULT '',
+  source_type TEXT NOT NULL DEFAULT 'url',
+  status TEXT NOT NULL DEFAULT 'awaiting_rights',
+  rights_confirmed INTEGER NOT NULL DEFAULT 0,
+  notes TEXT NOT NULL DEFAULT '',
+  analysis TEXT NOT NULL DEFAULT '{}',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS firefire_session_updated_idx
+ON firefire_sessions(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS firefire_evidence(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id INTEGER NOT NULL REFERENCES firefire_sessions(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL DEFAULT 'frame',
+  label TEXT NOT NULL DEFAULT '',
+  uri TEXT NOT NULL DEFAULT '',
+  timecode TEXT NOT NULL DEFAULT '',
+  observation TEXT NOT NULL DEFAULT '',
+  meta TEXT NOT NULL DEFAULT '{}',
+  created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS firefire_evidence_session_idx
+ON firefire_evidence(session_id, created_at);
+
+CREATE TABLE IF NOT EXISTS firefire_styles(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'draft',
+  session_id INTEGER REFERENCES firefire_sessions(id),
+  summary TEXT NOT NULL DEFAULT '',
+  compiled_style TEXT NOT NULL DEFAULT '',
+  positive_prompt TEXT NOT NULL DEFAULT '',
+  negative_prompt TEXT NOT NULL DEFAULT '',
+  references_json TEXT NOT NULL DEFAULT '[]',
+  validation TEXT NOT NULL DEFAULT '{}',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  UNIQUE(name, version)
+);
+
+CREATE INDEX IF NOT EXISTS firefire_style_status_idx
+ON firefire_styles(status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS firefire_validation_tasks(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id INTEGER REFERENCES firefire_sessions(id),
+  style_id TEXT REFERENCES firefire_styles(id),
+  title TEXT NOT NULL DEFAULT '',
+  prompt TEXT NOT NULL DEFAULT '',
+  references_json TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'queued',
+  result_json TEXT NOT NULL DEFAULT '{}',
+  human_feedback TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS firefire_validation_status_idx
+ON firefire_validation_tasks(status, created_at DESC);
+
 -- 数据库级保护，避免绕过 StandardCenter 意外篡改历史版本。
 CREATE TRIGGER IF NOT EXISTS production_standard_versions_immutable_update
 BEFORE UPDATE ON production_standard_versions
@@ -247,6 +319,7 @@ MIGRATIONS = [
     ("projects", "kind", "TEXT NOT NULL DEFAULT 'drama'"),
     ("projects", "account", "TEXT NOT NULL DEFAULT ''"),
     ("projects", "aspect", "TEXT NOT NULL DEFAULT ''"),
+    ("projects", "style_pack_id", "TEXT NOT NULL DEFAULT ''"),
     ("tasks", "run_id", "INTEGER REFERENCES production_runs(id)"),
 ]
 

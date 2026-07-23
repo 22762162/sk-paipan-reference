@@ -7,6 +7,7 @@ from .config import Config
 from .data_center import DataCenter
 from .db import Database
 from .director import Director
+from .firefire_center import FireFireCenter
 from .history_center import HistoryCenter
 from .icloud_sync import ICloudImageSync
 from .ops_center import OpsCenter
@@ -56,6 +57,7 @@ class App:
         self.assets = AssetCenter(
             self.db, on_registered=self.icloud_sync.enqueue_asset)
         self.data = DataCenter(self.db)
+        self.firefire = FireFireCenter(self.db, self.workspace.artifacts_dir)
         self.router = ProviderRouter(self.config, self.db, self.logger)
         self.qc = QcCenter(self.config)
         self.ops = OpsCenter(self.router)

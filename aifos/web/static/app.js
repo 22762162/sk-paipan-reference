@@ -1129,6 +1129,9 @@ async function renderDashboard() {
   const s = data.stats;
   const runningJobs = data.jobs.filter((j) => j.status === "running");
   const activeStandard = data.production_standard || {};
+  const firefire = data.firefire || {};
+  const approvedFireStyles = (firefire.styles || []).filter((style) =>
+    style.status === "approved");
   updateTopbar(data);
 
   const maxStage = Math.max(1, ...data.cost_by_stage.map((r) => r.total || 0));
@@ -1160,6 +1163,15 @@ async function renderDashboard() {
           <option value="国风漫剧，精致2D动画质感，服装与建筑严格符合剧情时代，高细节，统一人物造型">国风漫剧 · 2D</option>
         </select>
       </label>
+      <label class="style-field independent-style-field">
+        <span>火火漫剧研究室 · 独立风格</span>
+        <select name="style_pack_id" aria-label="火火独立风格">
+          <option value="">不使用独立风格</option>
+          ${approvedFireStyles.map((style) =>
+            `<option value="${esc(style.id)}">${esc(style.name)} · v${esc(style.version)}</option>`).join("")}
+        </select>
+        <small>只作用于本剧，不改写现有画风和硬规则</small>
+      </label>
       <button class="primary" type="submit">生成剧本并 AI 分析</button>
       <textarea name="script" rows="5" hidden placeholder="把你的剧本粘贴到这里,人物、场次、分镜会自动识别。写法示例:
 第1场 古镇长街
@@ -1181,6 +1193,18 @@ async function renderDashboard() {
       </div>
       <div class="produce-hint">SK 工业流:上传/AI 编剧 → AI 世界观、环境与风格分析 → 锁定制作圣经 → 连续性圣经 → 五维分镜 → 空间调度图 → 关键帧/文字锁定 → Seedance → 三层质检。</div>
     </form>
+    <section class="panel firefire-summary-panel">
+      <div class="panel-heading-row"><div><span class="eyebrow">RESEARCH BRAIN</span><h2>火火漫剧研究室</h2></div>
+        <button type="button" class="mini-btn" data-firefire-open>打开研究室</button></div>
+      <p class="muted">把公开短剧/平台案例拆成可追溯证据，生成验证任务；只有人工确认后，独立风格才会出现在上面的首步选择器。</p>
+      <div class="firefire-stats">
+        <span><b>${firefire.counts?.sessions || 0}</b>学习会话</span>
+        <span><b>${firefire.counts?.evidence || 0}</b>证据</span>
+        <span><b>${firefire.counts?.draft_styles || 0}</b>待确认风格</span>
+        <span><b>${firefire.counts?.approved_styles || 0}</b>已发布风格</span>
+      </div>
+      ${approvedFireStyles.length ? `<div class="asset-chips firefire-style-chips">${approvedFireStyles.map((style) => `<span class="chip">${esc(style.name)} · v${esc(style.version)}</span>`).join("")}</div>` : `<div class="empty">还没有人工确认的独立风格</div>`}
+    </section>
     <section class="workflow-map" aria-label="AIFOS 漫剧工业流">
       <div class="workflow-lead"><b>不把长剧本直接塞给视频模型</b><span>先锁定画面、人物与段间状态，再让 Seedance 只执行动作、镜头和情绪。</span><a href="#/standards/production">${esc(activeStandard.name || "SK 五维漫剧标准")} · v${esc(activeStandard.version || 1)} 正在驱动新剧集 →</a></div>
       <div class="workflow-steps">
@@ -1249,6 +1273,8 @@ async function renderDashboard() {
   const form = document.getElementById("produce-form");
   bindMobileAccessButtons(app);
   form.addEventListener("submit", onProduce);
+  app.querySelector("[data-firefire-open]")?.addEventListener(
+    "click", () => openFireFireLab(firefire));
   form.querySelectorAll(".mode-tab").forEach((tab) =>
     tab.addEventListener("click", () => {
       form.querySelectorAll(".mode-tab").forEach((t) =>
@@ -1344,6 +1370,7 @@ async function previewSeriesImport(form, file) {
     filename: file.name,
     data_base64: dataBase64,
     style: form.style.value,
+    style_pack_id: form.style_pack_id.value,
     kind: form.dataset.kind || "",
     auto_advance: form.elements.series_auto.checked,
     start_first: true,
@@ -1410,6 +1437,84 @@ async function previewSeriesImport(form, file) {
   });
 }
 
+function openFireFireLab(initial) {
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay firefire-overlay";
+  overlay.innerHTML = `<div class="script-panel firefire-panel">
+    <div class="script-head"><div><span class="eyebrow">RESEARCH BRAIN</span><h3>火火漫剧研究室</h3></div><button class="close">关闭 Esc</button></div>
+    <p class="logline">学习资料只进入研究空间；证据、分析草稿和验证任务可追溯，独立风格必须人工确认后才能用于新剧。</p>
+    <div class="firefire-lab-body"></div>
+  </div>`;
+  document.body.appendChild(overlay);
+  const panel = overlay.querySelector(".firefire-lab-body");
+  const close = () => { overlay.remove(); document.removeEventListener("keydown", onKey); };
+  const onKey = (event) => { if (event.key === "Escape") close(); };
+  document.addEventListener("keydown", onKey);
+  overlay.querySelector(".close").onclick = close;
+  overlay.addEventListener("click", (event) => { if (event.target === overlay) close(); });
+
+  const render = (data) => {
+    const sessions = data.sessions || [];
+    const styles = data.styles || [];
+    panel.innerHTML = `
+      <div class="firefire-grid">
+        <form class="firefire-form" data-firefire-session-form>
+          <h4>建立学习会话</h4>
+          <input name="name" placeholder="案例名称，例如：红果爆款女团夜戏" required>
+          <input name="source_url" type="url" placeholder="来源链接（可选，需有使用权）">
+          <textarea name="notes" rows="3" placeholder="研究目标、平台、集数或补充说明"></textarea>
+          <label class="checkline"><input type="checkbox" name="rights_confirmed"> 我确认有权使用该链接/素材，并会保留来源</label>
+          <button class="primary" type="submit">保存学习会话</button>
+        </form>
+        <form class="firefire-form" data-firefire-evidence-form>
+          <h4>补充证据</h4>
+          <select name="session_id" required><option value="">选择学习会话</option>${sessions.map((s) => `<option value="${s.id}">${esc(s.name)} · #${s.id}</option>`).join("")}</select>
+          <input name="label" placeholder="证据标签，如：女主近景妆造">
+          <input name="uri" placeholder="截图/参考图路径或链接">
+          <input name="timecode" placeholder="时间码，如 00:01:12">
+          <textarea name="observation" rows="3" placeholder="观察到的画风、镜头、服装或节奏事实"></textarea>
+          <button type="submit">保存证据</button>
+        </form>
+        <form class="firefire-form" data-firefire-style-form>
+          <h4>建立独立风格草稿</h4>
+          <input name="name" placeholder="风格名称，例如：夜色玻璃糖" required>
+          <select name="session_id"><option value="">不关联会话</option>${sessions.map((s) => `<option value="${s.id}">${esc(s.name)} · #${s.id}</option>`).join("")}</select>
+          <textarea name="summary" rows="2" placeholder="风格摘要与适用剧情"></textarea>
+          <textarea name="compiled_style" rows="4" placeholder="可直接执行的完整风格提示词（含时代、人物、服装、灯光、镜头和禁用项）" required></textarea>
+          <textarea name="positive_prompt" rows="2" placeholder="正向提示词（可选）"></textarea>
+          <textarea name="negative_prompt" rows="2" placeholder="负向提示词（可选）"></textarea>
+          <button type="submit">保存草稿，等待人工确认</button>
+        </form>
+      </div>
+      <div class="firefire-records">
+        <h4>学习会话与分析状态</h4>
+        ${sessions.length ? sessions.map((s) => `<article class="firefire-record"><div><b>#${s.id} ${esc(s.name)}</b><span class="chip">${esc(s.status)}</span></div><small>${esc(s.source_url || s.notes || "未填写来源")}</small>${s.rights_confirmed && s.status !== "complete" ? `<button class="mini-btn firefire-analyse" data-id="${s.id}">建立分析工作单</button>` : `<small>${s.rights_confirmed ? "已完成" : "等待权利确认"}</small>`}</article>`).join("") : `<div class="empty">还没有学习会话</div>`}
+        <h4>独立风格包</h4>
+        ${styles.length ? styles.map((style) => `<article class="firefire-record"><div><b>${esc(style.name)} · v${esc(style.version)}</b><span class="chip">${esc(style.status)}</span></div><small>${esc(style.summary || style.compiled_style.slice(0, 120))}</small>${style.status === "draft" ? `<button class="mini-btn firefire-publish" data-id="${esc(style.id)}">人工确认并发布</button>` : ""}</article>`).join("") : `<div class="empty">还没有风格草稿</div>`}
+      </div>`;
+    panel.querySelector("[data-firefire-session-form]").onsubmit = async (event) => {
+      event.preventDefault(); const form = event.currentTarget;
+      try { await api("/api/firefire/session", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: form.name.value, source_url: form.source_url.value, notes: form.notes.value, rights_confirmed: form.rights_confirmed.checked }) }); showToast("学习会话已保存", "ok"); render(await api("/api/firefire")); } catch (error) { showToast(error.message, "error"); }
+    };
+    panel.querySelector("[data-firefire-evidence-form]").onsubmit = async (event) => {
+      event.preventDefault(); const form = event.currentTarget;
+      try { await api("/api/firefire/evidence", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: form.session_id.value, label: form.label.value, uri: form.uri.value, timecode: form.timecode.value, observation: form.observation.value }) }); showToast("证据已保存", "ok"); render(await api("/api/firefire")); } catch (error) { showToast(error.message, "error"); }
+    };
+    panel.querySelector("[data-firefire-style-form]").onsubmit = async (event) => {
+      event.preventDefault(); const form = event.currentTarget;
+      try { await api("/api/firefire/style", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: form.name.value, session_id: form.session_id.value || null, summary: form.summary.value, compiled_style: form.compiled_style.value, positive_prompt: form.positive_prompt.value, negative_prompt: form.negative_prompt.value }) }); showToast("风格草稿已保存", "ok"); render(await api("/api/firefire")); } catch (error) { showToast(error.message, "error"); }
+    };
+    panel.querySelectorAll(".firefire-analyse").forEach((button) => button.onclick = async () => {
+      try { await api("/api/firefire/analyse", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: button.dataset.id }) }); showToast("已建立分析工作单，请继续绑定证据", "ok"); render(await api("/api/firefire")); } catch (error) { showToast(error.message, "error"); }
+    });
+    panel.querySelectorAll(".firefire-publish").forEach((button) => button.onclick = async () => {
+      if (!window.confirm("确认已查看验证结果，并把这个风格发布到新剧首步选择器吗？")) return;
+      try { await api("/api/firefire/style/publish", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ style_id: button.dataset.id, approved_by: "human" }) }); showToast("独立风格已发布", "ok"); render(await api("/api/firefire")); } catch (error) { showToast(error.message, "error"); }
+    });
+  };
+  render(initial || { sessions: [], styles: [] });
+}
+
 async function onProduce(ev) {
   ev.preventDefault();
   const form = ev.target;
@@ -1430,6 +1535,7 @@ async function onProduce(ev) {
         sentence: form.sentence.value,
         premise: form.premise.value,
         style: form.style.value,
+        style_pack_id: form.style_pack_id.value,
         script_text: form.script.hidden ? "" : form.script.value,
         kind: form.dataset.kind || "",
       }),

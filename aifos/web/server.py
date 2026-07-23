@@ -152,7 +152,7 @@ class JobRegistry:
 
     def start(self, title, number, premise="", style="", force=False,
               script=None, review=False, kind=None, action="produce",
-              unique=False):
+              unique=False, style_pack_id=""):
         """启动生产；unique=True 时同一集重复提交复用正在运行的任务。
 
         检查、创建历史和登记 job 必须处在同一把锁内，否则两个浏览器标签
@@ -170,6 +170,7 @@ class JobRegistry:
             run_id = self._create_history(
                 title, number, action, force=force,
                 request={"premise": premise, "style": style,
+                         "style_pack_id": style_pack_id,
                          "review": bool(review), "kind": kind,
                          "script_supplied": script is not None})
             self._seq += 1
@@ -184,7 +185,7 @@ class JobRegistry:
             return app.director.produce(
                 title, number, premise=premise, style=style, force=force,
                 script=script, pause_for_confirm=review, kind=kind,
-                run_id=run_id)
+                run_id=run_id, style_pack_id=style_pack_id)
 
         self._run(job_id, task)
         return job_id
@@ -792,6 +793,7 @@ def _overview_payload(app, jobs):
             for p in app.projects.list_projects()
         },
         "icloud_sync": app.icloud_sync.status(),
+        "firefire": app.firefire.overview(),
         "jobs": jobs.list(),
         "series_batches": app.series.list_batches(),
     }
@@ -890,6 +892,23 @@ def make_handler(workspace, jobs):
                 if route == "/api/overview":
                     return self._json(self._with_app(
                         lambda app: _overview_payload(app, jobs)))
+                if route in ("/api/firefire", "/api/firefire/overview"):
+                    return self._json(self._with_app(
+                        lambda app: app.firefire.overview()))
+                match = re.match(r"^/api/firefire/session/(\d+)$", route)
+                if match:
+                    payload = self._with_app(lambda app: app.firefire.get_session(
+                        int(match.group(1)), include_evidence=True))
+                    if payload is None:
+                        return self._error(404, "火火学习会话不存在")
+                    return self._json(payload)
+                match = re.match(r"^/api/firefire/style/([\w-]+)$", route)
+                if match:
+                    payload = self._with_app(lambda app: app.firefire.get_style(
+                        match.group(1)))
+                    if payload is None:
+                        return self._error(404, "火火独立风格不存在")
+                    return self._json(payload)
                 match = re.match(r"^/api/episode/(\d+)$", route)
                 if match:
                     payload = self._with_app(
@@ -968,6 +987,20 @@ def make_handler(workspace, jobs):
             try:
                 if parsed.path == "/api/produce":
                     return self._produce()
+                if parsed.path == "/api/firefire/session":
+                    return self._firefire_session()
+                if parsed.path == "/api/firefire/evidence":
+                    return self._firefire_evidence()
+                if parsed.path == "/api/firefire/analyse":
+                    return self._firefire_analyse()
+                if parsed.path == "/api/firefire/style":
+                    return self._firefire_style()
+                if parsed.path == "/api/firefire/style/publish":
+                    return self._firefire_style_publish()
+                if parsed.path == "/api/firefire/style/archive":
+                    return self._firefire_style_archive()
+                if parsed.path == "/api/firefire/validation":
+                    return self._firefire_validation()
                 if parsed.path == "/api/series/preview":
                     return self._series_preview()
                 if parsed.path == "/api/series/import":
@@ -1351,9 +1384,18 @@ def make_handler(workspace, jobs):
                     return self._error(
                         409, f"以下剧集已经存在，未覆盖任何内容：{joined}；"
                         "请调整起始集数后重试")
+                style_pack_id = str(body.get("style_pack_id") or "").strip()
+                selected_style = body.get("style", "")
+                if style_pack_id:
+                    pack = self._with_app(lambda app: app.firefire.get_style(
+                        style_pack_id, approved_only=True))
+                    if pack is None:
+                        return self._error(409, "所选火火独立风格不存在或尚未人工确认")
+                    selected_style = pack["compiled_style"]
                 batch = self._with_app(
                     lambda app: app.series.import_batch(
-                        parsed, style=body.get("style", ""),
+                        parsed, style=selected_style,
+                        style_pack_id=style_pack_id,
                         kind=(body.get("kind")
                               if body.get("kind") in ("drama", "idol")
                               else None),
@@ -1407,6 +1449,123 @@ def make_handler(workspace, jobs):
                 return self._error(404, str(exc))
             return self._json(batch)
 
+        def _firefire_session(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                result = self._with_app(lambda app: app.firefire.create_session(
+                    name=body.get("name", ""),
+                    source_url=body.get("source_url", ""),
+                    source_type=body.get("source_type", "url"),
+                    rights_confirmed=bool(body.get("rights_confirmed")),
+                    notes=body.get("notes", "")))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(result, status=201)
+
+        def _firefire_evidence(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                session_id = int(body.get("session_id"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少有效 session_id")
+            try:
+                result = self._with_app(lambda app: app.firefire.add_evidence(
+                    session_id, kind=body.get("kind", "frame"),
+                    label=body.get("label", ""), uri=body.get("uri", ""),
+                    timecode=body.get("timecode", ""),
+                    observation=body.get("observation", ""),
+                    meta=body.get("meta") or {}))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(result, status=201)
+
+        def _firefire_analyse(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                session_id = int(body.get("session_id"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少有效 session_id")
+            try:
+                result = self._with_app(
+                    lambda app: app.firefire.start_analysis(session_id))
+            except AifosError as exc:
+                return self._error(409, str(exc))
+            return self._json(result)
+
+        def _firefire_style(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                session_id = body.get("session_id")
+                session_id = int(session_id) if session_id not in (None, "") else None
+                result = self._with_app(lambda app: app.firefire.create_style(
+                    name=body.get("name", ""), session_id=session_id,
+                    summary=body.get("summary", ""),
+                    compiled_style=body.get("compiled_style", ""),
+                    positive_prompt=body.get("positive_prompt", ""),
+                    negative_prompt=body.get("negative_prompt", ""),
+                    references=body.get("references") or [],
+                    validation=body.get("validation") or {}))
+            except (AifosError, ValueError) as exc:
+                return self._error(400, str(exc))
+            return self._json(result, status=201)
+
+        def _firefire_style_publish(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            style_id = str(body.get("style_id") or "").strip()
+            if not style_id:
+                return self._error(400, "缺少 style_id")
+            try:
+                result = self._with_app(lambda app: app.firefire.publish_style(
+                    style_id, approved_by=body.get("approved_by", "human"),
+                    feedback=body.get("feedback", "")))
+            except AifosError as exc:
+                return self._error(409, str(exc))
+            return self._json(result)
+
+        def _firefire_style_archive(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            style_id = str(body.get("style_id") or "").strip()
+            if not style_id:
+                return self._error(400, "缺少 style_id")
+            try:
+                result = self._with_app(
+                    lambda app: app.firefire.archive_style(style_id))
+            except AifosError as exc:
+                return self._error(409, str(exc))
+            return self._json(result)
+
+        def _firefire_validation(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                session_id = body.get("session_id")
+                style_id = body.get("style_id")
+                result = self._with_app(
+                    lambda app: app.firefire.create_validation_task(
+                        title=body.get("title", ""),
+                        prompt=body.get("prompt", ""),
+                        session_id=(int(session_id)
+                                    if session_id not in (None, "") else None),
+                        style_id=(str(style_id).strip()
+                                  if style_id else None),
+                        references=body.get("references") or []))
+            except (AifosError, ValueError) as exc:
+                return self._error(400, str(exc))
+            return self._json(result, status=201)
+
         def _produce(self):
             length = int(self.headers.get("Content-Length", "0"))
             try:
@@ -1434,11 +1593,20 @@ def make_handler(workspace, jobs):
                         body["script_text"], title, int(number))
                 except ScriptImportError as exc:
                     return self._error(400, str(exc))
+            style_pack_id = str(body.get("style_pack_id") or "").strip()
+            selected_style = body.get("style", "")
+            if style_pack_id:
+                pack = self._with_app(lambda app: app.firefire.get_style(
+                    style_pack_id, approved_only=True))
+                if pack is None:
+                    return self._error(409, "所选火火独立风格不存在或尚未人工确认")
+                selected_style = pack["compiled_style"]
             # Web 端默认走「预生产 → 确认 → 自动生产」流程
             job_id = jobs.start(
                 title, int(number),
                 premise=body.get("premise", ""),
-                style=body.get("style", ""),
+                style=selected_style,
+                style_pack_id=style_pack_id,
                 force=bool(body.get("force")),
                 script=script,
                 review=bool(body.get("review", True)),

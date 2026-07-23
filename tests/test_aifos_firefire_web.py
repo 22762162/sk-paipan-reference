@@ -1,0 +1,66 @@
+import http.client
+import json
+import threading
+
+from aifos.app import App
+from aifos.web.server import serve
+
+
+def _request(port, method, path, body=None):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+    payload = None
+    headers = {}
+    if body is not None:
+        payload = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    conn.request(method, path, body=payload, headers=headers)
+    response = conn.getresponse()
+    raw = response.read()
+    conn.close()
+    return response.status, json.loads(raw)
+
+
+def test_firefire_web_control_plane_and_style_gate(tmp_path):
+    workspace = tmp_path / "workspace"
+    App(workspace).close()
+    server = serve(workspace, host="127.0.0.1", port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    try:
+        status, overview = _request(port, "GET", "/api/firefire")
+        assert status == 200 and overview["name"] == "火火漫剧研究室"
+        status, session = _request(port, "POST", "/api/firefire/session", {
+            "name": "待确认案例", "source_url": "https://example.com/case",
+        })
+        assert status == 201 and session["status"] == "awaiting_rights"
+        status, _ = _request(port, "POST", "/api/firefire/analyse", {
+            "session_id": session["id"],
+        })
+        assert status == 409
+        status, ready = _request(port, "POST", "/api/firefire/session", {
+            "name": "可研究案例", "source_url": "https://example.com/ready",
+            "rights_confirmed": True,
+        })
+        assert status == 201
+        status, style = _request(port, "POST", "/api/firefire/style", {
+            "name": "验证草稿", "session_id": ready["id"],
+            "compiled_style": "剧情适配的可执行风格提示词，禁止字幕、logo、水印",
+        })
+        assert status == 201 and style["status"] == "draft"
+        status, reply = _request(port, "POST", "/api/produce", {
+            "title": "风格门禁测试", "episode": 1,
+            "style_pack_id": style["id"], "review": True,
+        })
+        assert status == 409 and "人工确认" in reply["error"]
+        status, published = _request(
+            port, "POST", "/api/firefire/style/publish",
+            {"style_id": style["id"], "approved_by": "tester"})
+        assert status == 200 and published["status"] == "approved"
+        status, overview = _request(port, "GET", "/api/overview")
+        assert status == 200
+        assert any(item["id"] == style["id"]
+                   for item in overview["firefire"]["styles"])
+    finally:
+        server.shutdown()
+        server.server_close()

@@ -3172,6 +3172,34 @@ textarea:focus-visible, select:focus-visible {
   border-color:rgba(97,145,255,.55);
   background:rgba(55,111,230,.18); color:#dceaff;
 }
+
+/* 火火漫剧研究室 */
+.panel-heading-row { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.panel-heading-row h2 { margin:2px 0 0; }
+.muted { color:var(--ink-3); line-height:1.55; }
+.independent-style-field small { color:var(--ink-3); font-size:10px; line-height:1.35; }
+.firefire-summary-panel { border-color:rgba(170,125,255,.35); background:linear-gradient(135deg,rgba(76,45,130,.16),rgba(24,31,60,.2)); }
+.firefire-stats { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; margin:12px 0; }
+.firefire-stats span { display:grid; gap:3px; padding:9px 10px; border:1px solid var(--hairline); border-radius:9px; color:var(--ink-3); font-size:10px; }
+.firefire-stats b { color:var(--ink); font-size:17px; }
+.firefire-style-chips { margin-top:8px; }
+.firefire-panel { max-width:980px; }
+.firefire-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; }
+.firefire-form { display:grid; gap:7px; padding:12px; border:1px solid var(--hairline); border-radius:10px; background:rgba(0,0,0,.12); }
+.firefire-form h4,.firefire-records h4 { margin:0 0 3px; color:var(--accent); }
+.firefire-form input,.firefire-form select,.firefire-form textarea { width:100%; box-sizing:border-box; padding:8px 9px; border:1px solid var(--hairline); border-radius:8px; background:rgba(0,0,0,.18); color:var(--ink); font:inherit; font-size:11px; }
+.firefire-form textarea { resize:vertical; line-height:1.45; }
+.checkline { display:flex; gap:6px; align-items:flex-start; color:var(--ink-3); font-size:10px; line-height:1.4; }
+.firefire-records { display:grid; gap:7px; margin-top:14px; }
+.firefire-record { display:grid; gap:5px; padding:10px 12px; border:1px solid var(--hairline); border-radius:9px; background:rgba(0,0,0,.1); }
+.firefire-record > div { display:flex; align-items:center; gap:8px; }
+.firefire-record small { color:var(--ink-3); overflow-wrap:anywhere; line-height:1.45; }
+.firefire-record .mini-btn { justify-self:start; }
+@media (max-width:760px) {
+  .firefire-stats { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .firefire-grid { grid-template-columns:1fr; }
+  .firefire-panel { margin:12px; padding:14px; }
+}
 @media (max-width:760px) {
   .prepro-steps {
     grid-template-columns:repeat(2,minmax(0,1fr)); margin:10px; gap:6px;

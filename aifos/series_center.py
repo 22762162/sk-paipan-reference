@@ -19,7 +19,7 @@ class SeriesCenter:
         self.db = db
 
     def import_batch(self, parsed, *, style="", kind=None,
-                     auto_advance=True):
+                     auto_advance=True, style_pack_id=""):
         """原子建立项目、批次、各集与脚本文档；所有集先进入队列。"""
         title = str(parsed.get("project_title") or "").strip()
         episodes = list(parsed.get("episodes") or [])
@@ -37,11 +37,11 @@ class SeriesCenter:
                     "SELECT * FROM projects WHERE title=?", (title,)).fetchone()
                 if project is None:
                     cur = conn.execute(
-                        "INSERT INTO projects(title, style, kind, created_at) "
-                        "VALUES(?,?,?,?)",
+                        "INSERT INTO projects(title, style, kind, "
+                        "style_pack_id, created_at) VALUES(?,?,?,?,?)",
                         (title, str(style or ""),
                          kind if kind in ("drama", "idol") else "drama",
-                         timestamp))
+                         str(style_pack_id or ""), timestamp))
                     project_id = cur.lastrowid
                 else:
                     project_id = project["id"]
@@ -52,6 +52,9 @@ class SeriesCenter:
                     if kind in ("drama", "idol") and kind != project["kind"]:
                         updates.append("kind=?")
                         params.append(kind)
+                    if style_pack_id and style_pack_id != project["style_pack_id"]:
+                        updates.append("style_pack_id=?")
+                        params.append(str(style_pack_id))
                     if updates:
                         conn.execute(
                             f"UPDATE projects SET {', '.join(updates)} WHERE id=?",
