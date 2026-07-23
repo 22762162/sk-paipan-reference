@@ -86,7 +86,8 @@ def test_script_confirm_pauses_before_video(app):
         (project["id"],))
     preflight, _ = app.projects.latest_document(episode["id"], "preflight")
     assert preflight["passed"]
-    assert len(preflight["gates"]) == 12
+    assert len(preflight["gates"]) == 13
+    assert preflight["gates"][0]["id"] == "script_bible"
     # 预生产阶段不消耗视频产线
     assert app.assets.latest(project["id"], "video", "e001_shot001") is None
     # 但人物立绘/场景概念图与首尾帧已就绪

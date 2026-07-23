@@ -117,6 +117,42 @@ def test_validators():
         {"shots": [{"scene_no": 1, "duration": 2.0, "prompt": "p"}]}) is None
 
 
+def test_script_bible_is_required_normalized_and_declared_cast_only():
+    from aifos.adapters.claude_script import build_prompt
+
+    script = {
+        "characters": [{"name": "甲", "role": "主角"}],
+        "scenes": [{"scene_no": 1, "location": "旧车站",
+                    "characters": ["甲"],
+                    "lines": [{"character": "甲", "dialogue": "我回来了"}]}],
+    }
+    payload = {"project_title": "归途", "episode_number": 1,
+               "premise": "甲回到十年前离开的故乡",
+               "style": "九十年代现实主义"}
+    assert validate_script(script, payload) is None
+    assert script["story_bible_version"] == 1
+    assert script["story_world"]["overview"]
+    assert script["story_background"]["prior_events"]
+    assert script["characters"][0]["introduction"]
+    assert script["characters"][0]["gender"].startswith("未指定")
+
+    prompt = build_prompt("script", payload)
+    assert "story_world" in prompt
+    assert "story_background" in prompt
+    assert "人物设定介绍" in prompt
+    storyboard_prompt = build_prompt("storyboard", {"script": script})
+    assert "世界观" in storyboard_prompt
+    assert "不得新增人物表之外的角色" in storyboard_prompt
+
+    invalid = {
+        "characters": [{"name": "甲"}],
+        "scenes": [{"scene_no": 1, "location": "旧车站",
+                    "characters": ["甲", "乙"],
+                    "lines": [{"character": "乙", "dialogue": "你终于回来了"}]}],
+    }
+    assert "未在人物设定中介绍" in validate_script(invalid, payload)
+
+
 def test_router_uses_claude_for_script(tmp_path, monkeypatch):
     monkeypatch.setenv("PYTHONPATH", REPO_ROOT)
     claude = _make_bin(tmp_path, "claude", FAKE_CLAUDE)

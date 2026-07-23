@@ -12,6 +12,7 @@ import re
 from html import escape
 from pathlib import Path
 
+from ..adapters.claude_script import normalize_script_bible
 from .base import Provider, ProviderResult
 from .cinematic import render_cover, render_portrait, render_shot
 
@@ -411,6 +412,7 @@ class MockProvider(Provider):
                 "层次、配色和职业装备,不得套用现代都市便服")
             character.setdefault("signature_props", story_pool["variants"][0]["props"])
             character.setdefault("visual_variants", story_pool["variants"])
+        normalize_script_bible(script, payload)
         return script
 
     def _gen_drama_script(self, payload, out_dir, genre):

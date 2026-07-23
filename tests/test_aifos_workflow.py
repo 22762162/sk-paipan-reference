@@ -47,9 +47,9 @@ def test_five_dimension_preflight_and_delivery(tmp_path):
         assert profile["burn_subtitles"] is False
         assert preflight["passed"]
         assert [gate["id"] for gate in preflight["gates"]] == [
-            "continuity", "spatial", "five_dimensions", "duration", "dialogue",
-            "performance", "camera", "people", "text", "frames",
-            "audio", "profile"]
+            "script_bible", "continuity", "spatial", "five_dimensions",
+            "duration", "dialogue", "performance", "camera", "people",
+            "text", "frames", "audio", "profile"]
 
         shots = storyboard["shots"]
         assert {"reaction", "beat"} <= {shot["kind"] for shot in shots}

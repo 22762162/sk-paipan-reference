@@ -12,6 +12,8 @@ import re
 import time
 from pathlib import Path
 
+from .adapters.claude_script import (normalize_script_bible,
+                                     validate_script_bible)
 from .db import now
 from .errors import (AifosError, BudgetExceeded, ProduceCancelled,
                      ProviderError, ProviderUnavailable)
@@ -2038,8 +2040,9 @@ class Director:
 
     # ---- 各阶段实现 ----
     @staticmethod
-    def _normalize_script_character_profiles(script, premise=""):
-        """为人工导入/旧版剧本补齐人物背景字段,不覆盖用户已有设定。"""
+    def _normalize_script_character_profiles(script, premise="", *,
+                                             project_title="", style=""):
+        """为人工导入/旧版剧本补齐人物背景与剧情圣经,不覆盖已有设定。"""
         if not isinstance(script, dict):
             return script
         scenes = script.get("scenes") or []
@@ -2068,6 +2071,14 @@ class Director:
                 "服装须符合时代/世界观、职业、性格和当前场合;至少区分日常、冲突、关键场合三套造型")
             character.setdefault("signature_props", "由职业、经历或本集关键事件决定的标志道具")
             character.setdefault("visual_variants", [])
+        normalize_script_bible(script, {
+            "project_title": project_title or script.get("project_title", ""),
+            "premise": premise,
+            "style": style,
+        })
+        error = validate_script_bible(script)
+        if error:
+            raise AifosError(f"剧本世界观/人物设定门禁失败: {error}")
         return script
 
     def _stage_script(self, ctx):
@@ -2075,7 +2086,9 @@ class Director:
         provided = ctx.get("provided_script")
         if provided is not None:
             self._normalize_script_character_profiles(
-                provided, ctx["episode"].get("premise", ""))
+                provided, ctx["episode"].get("premise", ""),
+                project_title=ctx["project"]["title"],
+                style=ctx["project"].get("style", ""))
             provided.setdefault("project_title", ctx["project"]["title"])
             provided.setdefault("episode_number", episode["number"])
             version = self.projects.save_document(
@@ -2091,6 +2104,19 @@ class Director:
             existing, version = self.projects.latest_document(
                 episode["id"], "script")
             if existing is not None:
+                before = json.dumps(
+                    existing, ensure_ascii=False, sort_keys=True)
+                self._normalize_script_character_profiles(
+                    existing, ctx["episode"].get("premise", ""),
+                    project_title=ctx["project"]["title"],
+                    style=ctx["project"].get("style", ""))
+                if json.dumps(
+                        existing, ensure_ascii=False, sort_keys=True) != before:
+                    version = self.projects.save_document(
+                        episode["id"], "script", existing)
+                    self.log.info(
+                        "director",
+                        f"已有剧本已补齐故事世界、前情与人物设定(v{version})")
                 ctx["script"] = existing
                 ctx["script_version"] = version
                 self.log.info("director", f"复用已有剧本 v{version}")
@@ -2114,7 +2140,9 @@ class Director:
         result = self._call(ctx, "script", payload, "script")
         script = result.data
         self._normalize_script_character_profiles(
-            script, ctx["episode"].get("premise", ""))
+            script, ctx["episode"].get("premise", ""),
+            project_title=ctx["project"]["title"],
+            style=ctx["project"].get("style", ""))
         version = self.projects.save_document(episode["id"], "script", script)
         ctx["script"] = script
         ctx["script_version"] = version
@@ -2272,6 +2300,10 @@ class Director:
             "premise": ctx["episode"].get("premise", ""),
             "episode_title": (ctx.get("script") or {}).get(
                 "episode_title", ""),
+            "story_world": (ctx.get("script") or {}).get(
+                "story_world", {}),
+            "story_background": (ctx.get("script") or {}).get(
+                "story_background", {}),
             "scene_context": [
                 {"scene_no": scene.get("scene_no"),
                  "location": scene.get("location", ""),
@@ -2303,6 +2335,8 @@ class Director:
             # 即使编剧模型只回传了基础视觉字段,也不允许丢掉剧本中的
             # 时代/职业/动机/服装逻辑;这些字段会继续进入所有出图提示词。
             for key in (
+                    "introduction", "gender", "age_range", "identity",
+                    "personality",
                     "background_prompt", "era_setting", "occupation",
                     "motivation", "backstory", "relationships",
                     "costume_direction", "signature_props",
@@ -3080,16 +3114,42 @@ class Director:
         project_id = ctx["project"]["id"]
         title = ctx["project"].get("title", "")
         parts = [f"漫剧《{title}》分镜画面"]
+        script = ctx.get("script") or {}
+        world = script.get("story_world") or {}
+        background = script.get("story_background") or {}
+        world_line = "；".join(
+            str(world.get(key, "")).strip()
+            for key in ("overview", "era_and_location", "hard_rules",
+                        "visual_baseline")
+            if str(world.get(key, "")).strip())
+        if world_line:
+            parts.append(f"故事世界硬约束:{world_line}")
+        situation = "；".join(
+            str(background.get(key, "")).strip()
+            for key in ("current_situation", "core_conflict", "episode_goal")
+            if str(background.get(key, "")).strip())
+        if situation:
+            parts.append(f"本集故事背景:{situation}")
         if location:
             parts.append(f"场景:{location}")
+        script_profiles = {
+            item.get("name"): item
+            for item in script.get("characters", [])
+            if isinstance(item, dict) and item.get("name")
+        }
         who = []
         for name in shot.get("characters", []):
             design = self._reference_safe_design(
                 self._character_design(project_id, name))
+            design = {
+                **script_profiles.get(name, {}),
+                **(design or {}),
+            }
             line = self._design_line(design, keys=(
-                "species", "costume", "temperament", "background_prompt",
-                "era_setting", "occupation", "costume_direction",
-                "signature_props")) if design else ""
+                "introduction", "gender", "age_range", "identity",
+                "personality", "species", "costume", "temperament",
+                "background_prompt", "era_setting", "occupation",
+                "costume_direction", "signature_props")) if design else ""
             identity_rule = (
                 "身份外貌、性别、年龄、脸型、五官和发型只以所附人工锁定"
                 "最终立绘为准，禁止被旧文字设定覆盖")
@@ -3162,8 +3222,12 @@ class Director:
             if name not in identity_characters
             and not is_background_character(script_characters.get(name, {})))
         character_background = {
-            name: self._reference_safe_design(
-                self._character_design(ctx["project"]["id"], name))
+            name: {
+                **script_characters.get(name, {}),
+                **(self._reference_safe_design(
+                    self._character_design(
+                        ctx["project"]["id"], name)) or {}),
+            }
             for name in shot.get("characters", [])
         }
         payload = {
@@ -3174,6 +3238,10 @@ class Director:
             "characters": shot["characters"],
             "identity_characters": identity_characters,
             "character_background": character_background,
+            "story_world": (ctx.get("script") or {}).get(
+                "story_world", {}),
+            "story_background": (ctx.get("script") or {}).get(
+                "story_background", {}),
             "character_count": shot.get(
                 "character_count", len(shot["characters"])),
             "location": location,

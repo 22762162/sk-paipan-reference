@@ -45,6 +45,32 @@ def _preproduce(app, title="万妖图录", number=1, asset_mode=None):
     return app.projects.get_project(title)
 
 
+def test_story_bible_flows_into_continuity_and_image_prompts(app):
+    project = _preproduce(app, title="归途")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    continuity, _ = app.projects.latest_document(
+        episode["id"], "continuity")
+    assert script["story_world"]["overview"]
+    assert script["story_background"]["core_conflict"]
+    assert all(character["introduction"]
+               for character in script["characters"])
+    assert continuity["story_world"] == script["story_world"]
+    assert continuity["story_background"] == script["story_background"]
+    assert continuity["characters"][0]["introduction"]
+
+    out_root = (app.workspace.artifacts_dir
+                / f"p{project['id']:03d}" / "e001")
+    plan = json.loads((out_root / "render_plan.json").read_text(
+        encoding="utf-8"))
+    shot = next(item for item in plan["items"]
+                if item["category"] == "shot_image")
+    assert "故事世界硬约束" in shot["prompt"]
+    assert "本集故事背景" in shot["prompt"]
+
+
 def test_character_suite_generated(app):
     """每个角色除立绘外生成完整资产套件:四视图/特写/特征/妆容/服装。"""
     project = _preproduce(app, asset_mode="full")

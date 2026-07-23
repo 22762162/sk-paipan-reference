@@ -12,6 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .adapters.claude_script import validate_script_bible
 from .quality_policy import default_quality_policy, resolve_video_quality
 
 from .spatial_blocking import (build_character_number_map, build_spatial_plan,
@@ -107,10 +108,17 @@ def build_continuity_bible(project, script, profile):
         characters.append({
             "name": name,
             "role": character.get("role", ""),
+            "introduction": character.get("introduction", ""),
+            "gender": character.get("gender", ""),
+            "age_range": character.get("age_range", ""),
+            "identity": character.get("identity", ""),
+            "personality": character.get("personality", ""),
+            "background_prompt": character.get("background_prompt", ""),
+            "relationships": character.get("relationships", ""),
             "identity_anchor": f"{name}角色参考图 + 同名禁令",
             "face_hair_anchor": "继承项目角色参考，不改脸型、发型、发色与年龄感",
             "costume_anchor": "继承本场服装参考，不跨镜换装",
-            "signature_prop": "无",
+            "signature_prop": character.get("signature_props") or "无",
             "default_position": ["画面左1/3", "画面中", "画面右2/3"][
                 (index - 1) % 3],
         })
@@ -132,6 +140,10 @@ def build_continuity_bible(project, script, profile):
         "standard_fingerprint": profile.get("standard_fingerprint", ""),
         "project": project.get("title", ""),
         "episode": script.get("episode_number", 0),
+        "story_bible_version": script.get("story_bible_version", 1),
+        "story_world": copy.deepcopy(script.get("story_world") or {}),
+        "story_background": copy.deepcopy(
+            script.get("story_background") or {}),
         "same_name_rule": ("同一实体全程使用完全相同的名字"
                            if continuity_rules.get(
                                "canonical_entity_names", True)
@@ -898,6 +910,10 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
                   and (blocking.get("source_fingerprint")
                        == expected_blocking.get("source_fingerprint")))
     available_gates = [
+        _gate("script_bible", "世界观、前情与人物设定",
+              validate_script_bible(script) is None,
+              (validate_script_bible(script)
+               or "故事世界、故事背景、人物介绍和场次人物名单已锁定")),
         _gate("continuity", "连续性圣经", bool(continuity.get("characters"))
               and bool(continuity.get("scenes"))
               and continuity.get("standard_fingerprint") == profile.get(

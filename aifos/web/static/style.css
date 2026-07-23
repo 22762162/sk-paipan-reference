@@ -1525,6 +1525,37 @@ textarea:focus-visible, select:focus-visible {
   .line-block .speaker { text-align: left; }
   .line-block .speech { border-left: none; padding-left: 0; }
 }
+.story-bible {
+  margin: 14px 0 16px; padding: 12px;
+  border: 1px solid rgba(57, 135, 229, .3); border-radius: var(--radius);
+  background: linear-gradient(135deg, rgba(57, 135, 229, .1), var(--surface-2));
+}
+.story-bible-title {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 12px; margin-bottom: 10px;
+}
+.story-bible-title b { color: #cfe4ff; }
+.story-bible-title span { color: var(--ink-3); font-size: 11.5px; }
+.story-bible-columns {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px;
+}
+.story-bible-columns > div {
+  padding: 9px 10px; border: 1px solid var(--hairline);
+  border-radius: 8px; background: rgba(0, 0, 0, .1);
+}
+.story-bible-columns h3 {
+  margin: 0 0 5px; color: var(--accent); font-size: 13px;
+}
+.story-bible-row {
+  display: grid; grid-template-columns: 72px minmax(0, 1fr);
+  gap: 8px; padding: 3px 0; font-size: 12px; line-height: 1.65;
+}
+.story-bible-row b { color: var(--ink-2); font-weight: 650; }
+.story-bible-row span { color: var(--ink-3); overflow-wrap: anywhere; }
+@media (max-width: 720px) {
+  .story-bible-title { align-items: flex-start; flex-direction: column; gap: 2px; }
+  .story-bible-columns { grid-template-columns: 1fr; }
+}
 
 /* ---- 图片生产清单:分类/状态/提示词/单张改词重画 ---- */
 .plan-panel { margin-top: 14px; }

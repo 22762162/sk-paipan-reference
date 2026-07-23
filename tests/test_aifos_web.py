@@ -111,6 +111,10 @@ def test_index_and_static(server):
     assert "中 · 默认生产档".encode() in app_js
     assert "人物定版".encode() in app_js
     assert "分镜头生产表".encode() in app_js
+    assert "故事世界与背景圣经".encode() in app_js
+    assert "后续人物、分镜和镜头统一以此为准".encode() in app_js
+    assert b"storyBibleHtml(script)" in app_js
+    assert "人物介绍".encode() in app_js
     for heading in ("序号", "时长", "参考分镜", "首尾帧", "运镜",
                     "画面描述", "声音", "生产状态"):
         assert f'<th scope="col">{heading}</th>'.encode() in app_js
@@ -311,7 +315,7 @@ def test_standard_center_api_lifecycle(server):
     status, initial = _json_request(port, "GET", "/api/standards")
     assert status == 200
     assert initial["active"]["version"] == 1
-    assert len(initial["active"]["content"]["rules"]["quality_gates"]) == 12
+    assert len(initial["active"]["content"]["rules"]["quality_gates"]) == 13
     assert initial["capabilities"] == {
         "versioned": True,
         "episode_snapshot": True,

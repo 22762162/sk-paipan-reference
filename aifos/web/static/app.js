@@ -1992,6 +1992,7 @@ function showScriptOverlay(data, episodeId) {
         <button class="primary" id="btn-edit-submit">用这版剧本重做</button>
       </div>
       <p class="logline">${esc(script.logline || "")}</p>
+      ${storyBibleHtml(script)}
       <div class="cast">${(script.characters || []).map((c) =>
         `<span class="chip">${esc(c.name)} · ${esc(c.role || "")}</span>`).join("")}</div>
       <div class="script-character-profiles">${(script.characters || [])
@@ -3491,6 +3492,9 @@ function designHtml(design) {
 function characterProfileHtml(character) {
   if (!character) return "";
   const labels = [
+    ["introduction", "人物介绍"], ["gender", "性别"],
+    ["age_range", "年龄段"], ["identity", "身份/阵营"],
+    ["personality", "性格"],
     ["background_prompt", "人物背景提示词"], ["era_setting", "时代/世界观"],
     ["occupation", "职业身份"], ["motivation", "核心动机"],
     ["backstory", "人物经历"], ["relationships", "人物关系"],
@@ -3508,6 +3512,36 @@ function characterProfileHtml(character) {
   return `<details class="design-box script-profile-box">
     <summary>📚 ${esc(summary)} · 剧情人物背景与造型提示</summary>
     <div class="design-grid">${rows.join("")}</div></details>`;
+}
+
+function storyBibleHtml(script) {
+  const world = script?.story_world || {};
+  const background = script?.story_background || {};
+  const worldLabels = [
+    ["name", "世界名称"], ["overview", "世界概述"],
+    ["era_and_location", "时代地域"], ["social_order", "社会/组织秩序"],
+    ["hard_rules", "世界硬规则"], ["visual_baseline", "视觉基准"],
+    ["forbidden_drift", "禁止漂移"]];
+  const backgroundLabels = [
+    ["prior_events", "前情"], ["current_situation", "当前局势"],
+    ["core_conflict", "核心冲突"], ["episode_goal", "本集目标"],
+    ["continuity_hooks", "前后集衔接"]];
+  const rows = (source, labels) => labels
+    .filter(([key]) => designValueText(source[key]).trim())
+    .map(([key, label]) =>
+      `<div class="story-bible-row"><b>${label}</b><span>${esc(designValueText(source[key]))}</span></div>`)
+    .join("");
+  const worldRows = rows(world, worldLabels);
+  const backgroundRows = rows(background, backgroundLabels);
+  if (!worldRows && !backgroundRows) return "";
+  return `<section class="story-bible" aria-label="故事世界与背景设定">
+    <div class="story-bible-title"><b>🌐 故事世界与背景圣经</b>
+      <span>后续人物、分镜和镜头统一以此为准</span></div>
+    <div class="story-bible-columns">
+      <div><h3>故事世界</h3>${worldRows}</div>
+      <div><h3>故事背景</h3>${backgroundRows}</div>
+    </div>
+  </section>`;
 }
 
 /* 图片点击放大(资产中心/参考图通用灯箱) */
@@ -4585,6 +4619,7 @@ function scriptBodyHtml(script) {
   return `
       <h1>${esc(script.episode_title || "本集剧本")}</h1>
       <p class="logline">${esc(script.logline || "")}</p>
+      ${storyBibleHtml(script)}
       <div class="cast">${(script.characters || []).map((c) =>
         `<span class="chip">${esc(c.name)} · ${esc(c.role || "")}</span>`).join("")}</div>
       <div class="script-character-profiles">${(script.characters || [])

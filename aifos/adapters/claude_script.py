@@ -24,7 +24,14 @@ SCRIPT_PROMPT = """你是漫剧编剧。为作品《{title}》第{episode}集创
 要求:
 - 3 到 5 场戏,每场 2-4 句台词,适合 1-2 分钟短剧;
 - 台词口语化,单句不超过 25 个字;
+- 写场次前必须先建立 `story_world` 世界设定、`story_background` 故事前情和
+  `characters` 人物设定介绍;三者是后续人物图、分镜、关键帧和视频的唯一剧情依据;
+- 世界设定必须具体写清时代地域、社会/组织规则、能力或技术边界与视觉基准,
+  禁止使用“按剧情决定”“自由发挥”等空泛占位;
+- 故事前情必须说明本集开始前发生了什么、当前局势、核心冲突、本集目标及前后集衔接;
 - 每个角色都必须先写完整人物背景提示词,不能只写姓名和标签。背景要和本集剧情、时代/世界观、职业、人物性格、关系、目标与冲突绑定;
+- 每个角色必须有独立的 `introduction`,明确性别、年龄段、身份、性格、目标、
+  与其他角色的关系和不可改变的身份事实;场次中不得出现人物表未介绍的新角色;
 - `costume_direction` 必须给出可画的服装逻辑(款式、材质、层次、颜色、职业制服/时代服饰和剧情场合),禁止所有角色默认现代都市便服;
 - `visual_variants` 至少给出 3 个剧情兼容的造型方向(例如日常、行动/冲突、仪式/舞台),后续人物候选图必须据此做明显不同的服装与气质变化;
 - 只输出一个 JSON 对象,不要任何其他文字、解释或 Markdown 代码块。
@@ -32,7 +39,19 @@ SCRIPT_PROMPT = """你是漫剧编剧。为作品《{title}》第{episode}集创
 JSON 格式(字段必须齐全):
 {{"project_title": "{title}", "episode_number": {episode},
  "episode_title": "本集小标题", "logline": "一句话梗概",
+ "story_world": {{"name": "故事世界名称", "overview": "世界概述",
+   "era_and_location": "时代与主要地域", "social_order": "社会、组织与阵营秩序",
+   "hard_rules": "能力、技术、身份与事件运行边界",
+   "visual_baseline": "建筑、服装、道具、色彩与光影基准",
+   "forbidden_drift": ["禁止乱入的时代/技术/物种/组织或身份"]}},
+ "story_background": {{"prior_events": "本集之前的关键事件",
+   "current_situation": "本集开场时局势", "core_conflict": "核心冲突",
+   "episode_goal": "本集要完成或改变什么",
+   "continuity_hooks": "承接前集并留给后集的连续性钩子"}},
  "characters": [{{"name": "角色名", "role": "主角/重要配角/非重要配角/背景路人",
+   "introduction": "人物设定介绍:性别、年龄段、身份、性格、目标、关系和身份硬事实",
+   "gender": "明确性别", "age_range": "明确年龄段", "identity": "身份与阵营",
+   "personality": "性格及外化方式",
    "background_prompt": "可直接用于出图的详细人物背景提示词:成长经历、当前处境、核心动机、心理矛盾和视觉象征",
    "era_setting": "时代/世界观/地域", "occupation": "职业/社会身份",
    "motivation": "核心目标与本集欲望", "backstory": "关键经历、秘密或创伤",
@@ -47,18 +66,33 @@ IDOL_PROMPT = """你是 AI 虚拟偶像「{persona}」的内容策划。为第{e
 
 要求:
 - 竖屏短视频节奏:开场 3 秒钩子 → 主体内容 → 结尾引导关注;
+- 写场次前先完整输出 `story_world`、`story_background` 和人物设定介绍,
+  作为后续人物图、舞台分镜和视频的唯一事实源;
 - 若主题涉及女团/男团/组合,设 2-4 名成员(队长/主唱/舞担等),
   characters 列出全部成员,台词在成员间分配;否则全部台词由
   「{persona}」一人口播;
 - 每个成员都要写与团内定位、歌曲主题、成长经历和本期冲突绑定的人物背景提示词、
   职业/舞台身份、性格外化方式、服装逻辑和至少 3 套练习室/后台/舞台造型方向;
+- 每个成员必须有 `introduction`,明确性别、年龄段、团内身份、性格、目标、
+  成员关系与不可改变的身份事实;场次不得新增人物表之外的成员;
 - 台词口语化、有网感,单句不超过 22 个字;
 - 只输出一个 JSON 对象,不要任何其他文字、解释或 Markdown 代码块。
 
 JSON 格式(字段必须齐全,characters 只含「{persona}」一人):
 {{"project_title": "{persona}", "episode_number": {episode},
  "episode_title": "本期小标题", "logline": "一句话内容概要",
+ "story_world": {{"name": "偶像内容世界名称", "overview": "世界概述",
+   "era_and_location": "当代及主要活动空间", "social_order": "团队/平台/粉丝规则",
+   "hard_rules": "成员身份、舞台能力和活动边界",
+   "visual_baseline": "练习室/后台/舞台的服装道具与光影基准",
+   "forbidden_drift": ["禁止成员身份、人数、时代与舞台规则漂移"]}},
+ "story_background": {{"prior_events": "本期之前的关键经历",
+   "current_situation": "本期开场局势", "core_conflict": "本期核心矛盾",
+   "episode_goal": "本期目标", "continuity_hooks": "与前后期的衔接"}},
  "characters": [{{"name": "{persona}", "role": "主角",
+   "introduction": "人物设定介绍", "gender": "明确性别",
+   "age_range": "明确年龄段", "identity": "职业/团内身份",
+   "personality": "性格及舞台外化方式",
    "background_prompt": "与主题和成员定位绑定的人物背景提示词",
    "era_setting": "时代/舞台世界观", "occupation": "职业/团内身份",
    "motivation": "本期目标", "backstory": "成长经历",
@@ -74,11 +108,15 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
 {script}
 
 要求:
+- `story_world`、`story_background` 与 `characters[].introduction` 是硬约束,
+  必须先读取再分镜;不得新增人物表之外的角色,不得擅自改时代、组织、能力、
+  技术、物种、性别、年龄段、身份与人物关系;
 - 每段只承载一个主要动作或一次情绪转折；台词逐字照抄，禁止改写；
 - 每场先给 1 个环境/肢体镜头，再为每句台词给 1 个对白镜头；
 - 关键台词后的听者反应与情绪高潮留白由平台补齐，不要用空镜凑时长；
 - shot_no 从 1 连续编号；duration 单位秒，优先 5-8 秒，最长 15 秒；
-- prompt 含场景、准确人物名单、主体动作、光影、机位与结尾状态；
+- prompt 含世界观约束、故事前情、场景、准确人物名单、主体动作、光影、
+  机位与结尾状态；
 - prompt 中人物形态按人物设定描写(名字只是称呼,「小鹿」若设定为
   人类不能当动物写;设定为动物/精怪的按设定写,全片保持一致);
 - 不生成对白字幕。手机屏、弹幕、合同等可读文字只描述载体与准确文字，
@@ -102,6 +140,172 @@ def extract_json(text):
             return obj
         except ValueError:
             idx = text.find("{", idx + 1)
+    return None
+
+
+WORLD_FIELDS = (
+    "name", "overview", "era_and_location", "social_order", "hard_rules",
+    "visual_baseline",
+)
+BACKGROUND_FIELDS = (
+    "prior_events", "current_situation", "core_conflict", "episode_goal",
+    "continuity_hooks",
+)
+CHARACTER_INTRO_FIELDS = (
+    "introduction", "gender", "age_range", "identity", "personality",
+)
+
+
+def _missing(value):
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _fill_missing(target, key, value):
+    if _missing(target.get(key)):
+        target[key] = value
+
+
+def _sentence(value):
+    value = str(value).strip()
+    return value if value.endswith(("。", "！", "？", ".", "!", "?")) else value + "。"
+
+
+def normalize_script_bible(script, payload=None):
+    """把新写、人工导入和旧版剧本统一成不会乱串的剧情事实源。
+
+    真实编剧输出应当提供完整内容；这里的确定性补全主要服务旧数据和用户导入，
+    且会显式写出“未指定时禁止猜测”，避免下游模型自行脑补身份。
+    """
+    if not isinstance(script, dict):
+        return script
+    payload = payload or {}
+    title = (script.get("project_title")
+             or payload.get("project_title") or "本剧")
+    premise = payload.get("premise") or script.get("logline") or "本集剧情"
+    style = payload.get("style") or "以项目已锁定画风为准"
+    scenes = script.get("scenes") or []
+    locations = "、".join(dict.fromkeys(
+        scene.get("location") for scene in scenes
+        if isinstance(scene, dict) and scene.get("location")
+    )) or "剧本已声明场景"
+
+    world = script.get("story_world")
+    if not isinstance(world, dict):
+        world = {}
+        script["story_world"] = world
+    _fill_missing(world, "name", f"《{title}》故事世界")
+    _fill_missing(
+        world, "overview",
+        f"故事围绕“{premise}”展开，所有人物、事件与场景均服从同一世界设定。")
+    _fill_missing(world, "era_and_location",
+                  f"时代以剧本明示为准，主要地域为{locations}。")
+    _fill_missing(
+        world, "social_order",
+        "社会身份、组织阵营、职业权限和人物关系以人物表与场次事实为准。")
+    _fill_missing(
+        world, "hard_rules",
+        "不得新增未声明的能力、技术、组织、物种或身份；同一事实跨镜头保持一致。")
+    _fill_missing(
+        world, "visual_baseline",
+        f"{style}；建筑、服装、发型、妆容、道具和光影必须符合时代地域与人物身份。")
+    forbidden = world.get("forbidden_drift")
+    if not isinstance(forbidden, list) or not any(
+            str(item).strip() for item in forbidden):
+        world["forbidden_drift"] = [
+            "禁止时代、地域、能力/技术规则和组织阵营漂移",
+            "禁止新增人物、改变人物性别年龄身份或混淆人物关系",
+            "禁止建筑、服装、发型、妆容和道具脱离世界视觉基准",
+        ]
+
+    background = script.get("story_background")
+    if not isinstance(background, dict):
+        background = {}
+        script["story_background"] = background
+    logline = script.get("logline") or premise
+    _fill_missing(background, "prior_events",
+                  "本集开始前的已知前情：" + _sentence(premise))
+    _fill_missing(background, "current_situation",
+                  "本集开场局势：" + _sentence(logline))
+    _fill_missing(background, "core_conflict", logline)
+    _fill_missing(background, "episode_goal",
+                  "让本集核心冲突发生明确推进，并在结尾留下可核验的状态变化。")
+    _fill_missing(
+        background, "continuity_hooks",
+        "人物身份、关系、持有道具、伤势、服装、情绪和空间状态承接前后镜头与前后集。")
+
+    appearances = {}
+    for scene in scenes:
+        if not isinstance(scene, dict):
+            continue
+        for name in scene.get("characters") or []:
+            appearances.setdefault(name, []).append(
+                scene.get("location") or "本集场景")
+    cast = script.get("characters") or []
+    cast_names = [
+        character.get("name") for character in cast
+        if isinstance(character, dict) and character.get("name")
+    ]
+    for character in cast:
+        if not isinstance(character, dict) or not character.get("name"):
+            continue
+        name = character["name"]
+        role = character.get("role") or "角色"
+        places = "、".join(dict.fromkeys(
+            appearances.get(name, []))) or locations
+        _fill_missing(
+            character, "introduction",
+            f"{name}是本剧{role}，活动于{places}；身份、性格、目标及与"
+            "其他角色的关系以本人物表和台词行动为准，后续镜头不得换人或改身份。")
+        _fill_missing(
+            character, "gender",
+            "未指定（人物定版前禁止下游模型自行猜测，定版后以参考图为准）")
+        _fill_missing(
+            character, "age_range",
+            "未指定（人物定版前禁止下游模型自行猜测，定版后保持一致）")
+        _fill_missing(character, "identity",
+                      character.get("occupation") or role)
+        _fill_missing(
+            character, "personality",
+            "由剧本台词、行动与人物背景外化，跨场景保持同一性格逻辑")
+    script["story_bible_version"] = 1
+    script["declared_character_names"] = cast_names
+    return script
+
+
+def validate_script_bible(script):
+    """返回世界观/前情/人物介绍硬门禁错误；通过时返回 ``None``。"""
+    world = script.get("story_world")
+    if not isinstance(world, dict):
+        return "缺少 story_world 故事世界设定"
+    for field in WORLD_FIELDS:
+        if _missing(world.get(field)):
+            return f"故事世界字段不全: story_world.{field}"
+    if not isinstance(world.get("forbidden_drift"), list) or not any(
+            str(item).strip() for item in world["forbidden_drift"]):
+        return "故事世界字段不全: story_world.forbidden_drift"
+    background = script.get("story_background")
+    if not isinstance(background, dict):
+        return "缺少 story_background 故事背景"
+    for field in BACKGROUND_FIELDS:
+        if _missing(background.get(field)):
+            return f"故事背景字段不全: story_background.{field}"
+    declared = set()
+    for character in script.get("characters") or []:
+        if not isinstance(character, dict) or not character.get("name"):
+            continue
+        declared.add(character["name"])
+        for field in CHARACTER_INTRO_FIELDS:
+            if _missing(character.get(field)):
+                return f"{character['name']}人物设定字段不全: {field}"
+    used = set()
+    for scene in script.get("scenes") or []:
+        used.update(scene.get("characters") or [])
+        used.update(
+            line.get("character") for line in scene.get("lines") or []
+            if isinstance(line, dict) and line.get("character"))
+    unknown = sorted(used - declared)
+    if unknown:
+        return "场次出现未在人物设定中介绍的角色: " + "、".join(unknown)
     return None
 
 
@@ -140,7 +344,8 @@ def validate_script(script, payload):
     script.setdefault("episode_number", payload.get("episode_number", 0))
     script.setdefault("episode_title", "")
     script.setdefault("logline", "")
-    return None
+    normalize_script_bible(script, payload)
+    return validate_script_bible(script)
 
 
 def validate_storyboard(storyboard):
@@ -349,7 +554,12 @@ def build_prompt(capability, payload):
             premise=payload.get("premise", "") or "见本集剧本",
             names=names,
             story_context=json.dumps(
-                payload.get("character_context") or payload.get("characters", []),
+                {
+                    "story_world": payload.get("story_world") or {},
+                    "story_background": payload.get("story_background") or {},
+                    "characters": (payload.get("character_context")
+                                   or payload.get("characters", [])),
+                },
                 ensure_ascii=False),
             scene_context=json.dumps(payload.get("scene_context") or [],
                                      ensure_ascii=False),

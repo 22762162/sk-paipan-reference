@@ -144,6 +144,7 @@ DEFAULT_STANDARD = {
             "speeds": ["正常", "升格", "降格", "延时", "定格"],
         },
         "quality_gates": [
+            {"id": "script_bible", "label": "剧情事实源", "enabled": True, "severity": "block", "description": "故事世界、前情、人物介绍及场次人物名单完整且不互相冲突。"},
             {"id": "continuity", "label": "连续性", "enabled": True, "severity": "block", "description": "人物、服装、道具、站位及段间状态无跳变。"},
             {"id": "spatial", "label": "空间调度", "enabled": True, "severity": "block", "description": "逐场锁定人物走位、机位、视锥和屏幕轴线，防止多人漂移或增殖。"},
             {"id": "five_dimensions", "label": "五维分镜", "enabled": True, "severity": "block", "description": "每镜包含主体、环境、摄影机、时间状态和审美信息。"},
@@ -182,8 +183,9 @@ LOCKED_PRODUCTION_RULES = {
 }
 
 REQUIRED_GATE_IDS = [
-    "continuity", "spatial", "five_dimensions", "duration", "dialogue", "performance",
-    "camera", "people", "text", "frames", "audio", "profile",
+    "script_bible", "continuity", "spatial", "five_dimensions", "duration",
+    "dialogue", "performance", "camera", "people", "text", "frames", "audio",
+    "profile",
 ]
 
 
@@ -488,10 +490,19 @@ class StandardCenter:
             changed = True
         gates = rules.get("quality_gates")
         if isinstance(gates, list) and not any(
+                isinstance(gate, dict) and gate.get("id") == "script_bible"
+                for gate in gates):
+            gate = next(copy.deepcopy(item)
+                        for item in DEFAULT_STANDARD["rules"]["quality_gates"]
+                        if item.get("id") == "script_bible")
+            gates.insert(0, gate)
+            changed = True
+        if isinstance(gates, list) and not any(
                 isinstance(gate, dict) and gate.get("id") == "spatial"
                 for gate in gates):
-            gate = copy.deepcopy(DEFAULT_STANDARD["rules"][
-                "quality_gates"][1])
+            gate = next(copy.deepcopy(item)
+                        for item in DEFAULT_STANDARD["rules"]["quality_gates"]
+                        if item.get("id") == "spatial")
             insert_at = next((index + 1 for index, item in enumerate(gates)
                               if isinstance(item, dict)
                               and item.get("id") == "continuity"), 0)
