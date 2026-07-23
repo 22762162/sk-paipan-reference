@@ -62,8 +62,8 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260724-full-pipeline-canvas" in html
-    assert "/static/app.js?v=20260724-full-pipeline-canvas" in html
+    assert "/static/style.css?v=20260724-novel-auto-style" in html
+    assert "/static/app.js?v=20260724-novel-auto-style" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -85,6 +85,10 @@ def test_index_and_static(server):
     assert b"/api/series/preview" in app_js
     assert b"/api/series/import" in app_js
     assert "选择多集剧本文档".encode() in app_js
+    assert "AI 根据剧本自动设计（推荐）".encode() in app_js
+    assert "智能解析小说 / 剧本并 AI 分析".encode() in app_js
+    assert "小说 / 剧本智能解析完成".encode() in app_js
+    assert "AI 根据剧本生成".encode() in app_js
     assert "始终只激活一集".encode() in app_js
     assert b"/api/character/select" in app_js
     assert b"/api/character/regenerate" in app_js
@@ -197,7 +201,7 @@ def test_index_and_static(server):
         "192x192", "512x512"}
     status, ctype, raw = _request(server["port"], "GET", "/sw.js")
     assert status == 200 and "javascript" in ctype
-    assert b"aifos-mobile-shell-v3" in raw
+    assert b"aifos-mobile-shell-v4" in raw
     assert b'/static/app.js' in raw and b'fetch(request)' in raw
 
 

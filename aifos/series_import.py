@@ -332,6 +332,8 @@ def parse_series_document(filename, data, project_title, start_number=1):
             character.get("name", "")
             for character in script.get("characters", [])
             if character.get("name")]
+        episode["import_analysis"] = dict(
+            script.get("import_analysis") or {})
         episode["excerpt"] = re.sub(
             r"\s+", " ", episode["source_text"]).strip()[:160]
     return {
@@ -353,6 +355,7 @@ def preview_payload(parsed):
         "episodes": [{
             key: episode[key] for key in (
                 "episode_number", "source_number", "title", "mode",
-                "char_count", "scene_count", "characters", "excerpt")
+                "char_count", "scene_count", "characters", "excerpt",
+                "import_analysis")
         } for episode in parsed["episodes"]]
     }

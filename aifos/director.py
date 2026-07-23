@@ -561,9 +561,9 @@ class Director:
         if (not requested_style and stored_style.startswith(
                 LEGACY_DEFAULT_VISUAL_STYLE_PREFIX)):
             stored_style = ""
-        visual_style = (requested_style
-                        or stored_style
-                        or infer_visual_style(premise, project_title))
+        # 未指定风格时保持为空:剧本完成后由制作圣经根据全文证据推导。
+        # 不能在看到正文前仅凭标题/一句梗概套入现代乙女或国风模板。
+        visual_style = requested_style or stored_style
         project, created = self.projects.get_or_create_project(
             project_title, style=visual_style,
             kind=kind if kind in ("drama", "idol") else "drama",
@@ -2494,20 +2494,47 @@ class Director:
         analysis_rules = (
             (ctx.get("production_profile") or {}).get(
                 "rules", {}).get("story_analysis", {}))
-        style = (ctx["project"].get("style", "")
-                 or analysis_rules.get("default_visual_fallback", ""))
+        # 空值代表“AI 根据完整剧本自动设计”,不要把制作标准中的通用兜底
+        # 冒充用户锁定画风。分析完成后会把本剧专属结果写回项目。
+        project_style = str(ctx["project"].get("style") or "").strip()
         current, version = self.projects.latest_document(
             episode_id, "story_analysis")
+        current_visual = (
+            current.get("visual") if isinstance(current, dict) else {}) or {}
+        current_auto_style = (
+            current_visual.get("style_source") == "ai_inferred"
+            and project_style
+            == str(current_visual.get("user_style_constraint") or "").strip())
+        # 已保存的自动风格不是用户约束；重新分析时仍允许 AI 根据新剧本重建。
+        style = "" if current_auto_style else project_style
+
+        def persist_auto_style(analysis):
+            nonlocal style
+            visual = analysis.get("visual") or {}
+            derived = str(
+                visual.get("user_style_constraint") or "").strip()
+            if not style and derived:
+                visual["style_source"] = "ai_inferred"
+                # 自动分析结果只在本集上下文和制作圣经中生效，不写成项目的
+                # “人工锁定画风”。这样新集/重写仍会读完整剧本重新分析，
+                # force 重制的编剧输入也保持确定性。
+                project = dict(ctx["project"])
+                project["style"] = derived
+                ctx["project"] = project
+                style = derived
+            analysis["project_style"] = project_style
+            return analysis
+
         if (not force and current is not None
                 and current.get("script_version") == ctx.get(
                     "script_version")
-                and current.get("project_style") == style
+                and current.get("project_style") == project_style
                 and validate_story_analysis(current) is None):
             analysis = build_story_analysis(
                 script, style, raw=current,
                 source=current.get("source", "saved"))
             analysis["script_version"] = ctx.get("script_version")
-            analysis["project_style"] = style
+            persist_auto_style(analysis)
             apply_story_analysis(script, analysis)
             ctx["story_analysis"] = analysis
             ctx["story_analysis_version"] = version
@@ -2525,7 +2552,7 @@ class Director:
             }, "story_analysis")
         analysis = build_story_analysis(
             script, style, raw=result.data, source=result.provider)
-        analysis["project_style"] = style
+        persist_auto_style(analysis)
         error = validate_story_analysis(analysis)
         if error:
             raise AifosError(f"剧本 AI 分析失败: {error}")
