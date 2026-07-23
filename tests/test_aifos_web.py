@@ -391,7 +391,7 @@ def test_standard_center_api_lifecycle(server):
     status, initial = _json_request(port, "GET", "/api/standards")
     assert status == 200
     assert initial["active"]["version"] == 1
-    assert len(initial["active"]["content"]["rules"]["quality_gates"]) == 13
+    assert len(initial["active"]["content"]["rules"]["quality_gates"]) == 14
     assert initial["capabilities"] == {
         "versioned": True,
         "episode_snapshot": True,

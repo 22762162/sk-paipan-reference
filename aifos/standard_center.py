@@ -25,9 +25,11 @@ DEFAULT_STANDARD = {
     "source_skill": {
         "id": "sk-manju-storyboard-skill",
         "name": "SK 漫剧五维分镜制作 Skill",
-        "version": "5.0",
+        "version": "5.1",
         "reference": "five-dimension-storyboard-template-v5.txt",
-        "principle": "先完成五维分镜和硬门校验，再进入关键帧与 Seedance 生产。",
+        "principle": (
+            "先从剧情推导人物视觉 DNA、完成全剧角色去重和人工定版，"
+            "再建立三视图母资产、五维分镜与 Seedance 生产。"),
     },
     "rules": {
         "production": {
@@ -64,6 +66,30 @@ DEFAULT_STANDARD = {
             "background": "pure_background_no_text_no_scene",
             "reference_identity_priority": ["face", "hair"],
             "workwear_required_for_occupational_roles": True,
+            "visual_dna_required": True,
+            "visual_dna_sequence": [
+                "story_evidence", "experience_and_situation",
+                "personality_and_behavior", "visible_traits",
+                "cast_dedup", "three_view_assets",
+            ],
+            "forbid_template_labels": True,
+            "cast_dedup_required": True,
+            "cast_dedup_dimensions": [
+                "hair_silhouette", "clothing_structure",
+                "body_or_occupation_marks", "story_visual_symbol",
+                "signature_accessory", "temperament_keywords",
+            ],
+            "cast_dedup_overlap_threshold": 2,
+            "three_view_required_after_lock": True,
+            "canonical_views": [
+                "face_closeup", "front", "profile", "back",
+            ],
+            "turnaround_review_board_aspect": "16:9",
+            "turnaround_review_board_only": True,
+            "canonical_views_are_separate_assets": True,
+            "identity_and_wardrobe_separated": True,
+            "clean_skin_default": True,
+            "seedance_may_redesign_character": False,
             "candidate_targets": {
                 "main": 5,
                 "important_supporting": 3,
@@ -162,6 +188,7 @@ DEFAULT_STANDARD = {
         },
         "quality_gates": [
             {"id": "script_bible", "label": "剧情事实源", "enabled": True, "severity": "block", "description": "故事世界、前情、人物介绍及场次人物名单完整且不互相冲突。"},
+            {"id": "character_assets", "label": "人物母资产", "enabled": True, "severity": "block", "description": "人物视觉 DNA 来自剧情、全剧角色已去重；人工定版后具备独立面部、正面、严格侧面和完整背面母资产。"},
             {"id": "continuity", "label": "连续性", "enabled": True, "severity": "block", "description": "人物、服装、道具、站位及段间状态无跳变。"},
             {"id": "spatial", "label": "空间调度", "enabled": True, "severity": "block", "description": "逐场锁定人物走位、机位、视锥和屏幕轴线，防止多人漂移或增殖。"},
             {"id": "five_dimensions", "label": "五维分镜", "enabled": True, "severity": "block", "description": "每镜包含主体、环境、摄影机、时间状态和审美信息。"},
@@ -200,9 +227,9 @@ LOCKED_PRODUCTION_RULES = {
 }
 
 REQUIRED_GATE_IDS = [
-    "script_bible", "continuity", "spatial", "five_dimensions", "duration",
-    "dialogue", "performance", "camera", "people", "text", "frames", "audio",
-    "profile",
+    "script_bible", "character_assets", "continuity", "spatial",
+    "five_dimensions", "duration", "dialogue", "performance", "camera",
+    "people", "text", "frames", "audio", "profile",
 ]
 
 
@@ -350,6 +377,68 @@ class StandardCenter:
         for key in ("visible_text_policy", "default_visual_fallback"):
             nonempty_string(
                 story_analysis, key, f"rules.story_analysis.{key}")
+
+        character_assets = required_dict(
+            rules, "character_assets", "rules.character_assets")
+        for key in (
+                "workwear_required_for_occupational_roles",
+                "visual_dna_required", "forbid_template_labels",
+                "cast_dedup_required", "three_view_required_after_lock",
+                "turnaround_review_board_only",
+                "canonical_views_are_separate_assets",
+                "identity_and_wardrobe_separated", "clean_skin_default"):
+            bool_field(
+                character_assets, key, f"rules.character_assets.{key}")
+        if character_assets.get("seedance_may_redesign_character") is not False:
+            issue(
+                "rules.character_assets.seedance_may_redesign_character",
+                "Seedance 只能动画化锁定资产，不能重新设计人物")
+        sequence = character_assets.get("visual_dna_sequence")
+        required_sequence = [
+            "story_evidence", "experience_and_situation",
+            "personality_and_behavior", "visible_traits",
+            "cast_dedup", "three_view_assets",
+        ]
+        if sequence != required_sequence:
+            issue(
+                "rules.character_assets.visual_dna_sequence",
+                "人物设计顺序必须为剧情证据→经历处境→性格行为→可见特征"
+                "→全剧去重→三视图资产")
+        dimensions = character_assets.get("cast_dedup_dimensions")
+        if (not isinstance(dimensions, list) or len(dimensions) < 6
+                or len(set(dimensions)) != len(dimensions)
+                or not all(isinstance(item, str) and item.strip()
+                           for item in dimensions)):
+            issue(
+                "rules.character_assets.cast_dedup_dimensions",
+                "必须定义至少 6 个不重复的角色视觉去重维度")
+        threshold = character_assets.get("cast_dedup_overlap_threshold")
+        if (not isinstance(threshold, int) or isinstance(threshold, bool)
+                or threshold != 2):
+            issue(
+                "rules.character_assets.cast_dedup_overlap_threshold",
+                "两个及以上主要视觉维度重叠时必须重设计")
+        if character_assets.get("canonical_views") != [
+                "face_closeup", "front", "profile", "back"]:
+            issue(
+                "rules.character_assets.canonical_views",
+                "正式人物母资产必须依次为面部近景、正面、严格侧面和完整背面")
+        if character_assets.get(
+                "turnaround_review_board_aspect") != "16:9":
+            issue(
+                "rules.character_assets.turnaround_review_board_aspect",
+                "三视图审核板必须为 16:9")
+        targets = required_dict(
+            character_assets, "candidate_targets",
+            "rules.character_assets.candidate_targets")
+        required_targets = {
+            "main": 5, "important_supporting": 3,
+            "non_main": 1, "non_main_max": 1, "background": 0,
+        }
+        if targets != required_targets:
+            issue(
+                "rules.character_assets.candidate_targets",
+                "候选额度必须为主角5、重要配角3、非重要配角1、背景路人0")
 
         dialogue = required_dict(rules, "dialogue", "rules.dialogue")
         bool_field(dialogue, "preserve_verbatim", "rules.dialogue.preserve_verbatim")
@@ -521,6 +610,14 @@ class StandardCenter:
         if not isinstance(rules, dict):
             return snapshot
         changed = False
+        source = content.get("source_skill")
+        source_defaults = DEFAULT_STANDARD["source_skill"]
+        if (isinstance(source, dict)
+                and source.get("id") == source_defaults["id"]):
+            for key in ("version", "principle"):
+                if source.get(key) != source_defaults[key]:
+                    source[key] = copy.deepcopy(source_defaults[key])
+                    changed = True
         storyboard = rules.get("storyboard")
         if isinstance(storyboard, dict) \
                 and "spatial_blocking_required_for_group" not in storyboard:
@@ -544,6 +641,17 @@ class StandardCenter:
             insert_at = next((index + 1 for index, item in enumerate(gates)
                               if isinstance(item, dict)
                               and item.get("id") == "continuity"), 0)
+            gates.insert(insert_at, gate)
+            changed = True
+        if isinstance(gates, list) and not any(
+                isinstance(gate, dict) and gate.get("id") == "character_assets"
+                for gate in gates):
+            gate = next(copy.deepcopy(item)
+                        for item in DEFAULT_STANDARD["rules"]["quality_gates"]
+                        if item.get("id") == "character_assets")
+            insert_at = next((index + 1 for index, item in enumerate(gates)
+                              if isinstance(item, dict)
+                              and item.get("id") == "script_bible"), 0)
             gates.insert(insert_at, gate)
             changed = True
         asset_rules = rules.get("character_assets")
@@ -582,7 +690,8 @@ class StandardCenter:
         try:
             return self.save(
                 content, change_note=(
-                    "自动升级：加入剧本分析、剧情事实源、空间调度与角色分级资产规则"),
+                    "自动升级：加入视觉 DNA、全剧角色去重、三视图母资产、"
+                    "剧本分析、剧情事实源与空间调度规则"),
                 expected_active_id=snapshot.get("version_id"))
         except StandardConflictError:
             # 多个 App 同时启动时由先完成者负责升级。

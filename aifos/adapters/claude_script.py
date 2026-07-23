@@ -42,6 +42,13 @@ SCRIPT_PROMPT = """你是漫剧编剧。为作品《{title}》第{episode}集创
   非重要配角后续固定只生成 1 张候选图;场次中不得出现人物表未声明的新角色;
 - `costume_direction` 必须给出可画的服装逻辑(款式、材质、层次、颜色、职业制服/时代服饰和剧情场合),禁止所有角色默认现代都市便服;
 - `visual_variants` 至少给出 3 个剧情兼容的造型方向(例如日常、行动/冲突、仪式/舞台),后续人物候选图必须据此做明显不同的服装与气质变化;
+- 每个正式角色必须先完成 `character_analysis`，再生成 `visual_dna`：
+  从身份阶层、成长环境、当前处境、欲望、恐惧、关键经历、性格优缺点和
+  行为习惯，推导脸部骨相、发型轮廓、身体/职业痕迹、服装结构与磨损、
+  核心配饰、带故事来源的视觉符号及 3-8 个气质关键词；
+- `cast_dedup` 必须把角色与全剧其他正式角色逐一比较；发型、服装结构、
+  身体特征、视觉符号、核心配饰、气质关键词中有两项以上重叠就先重设计；
+  禁止 AI 网红脸、模板帅哥美女、韩式偶像脸和只写“帅、美、冷峻、高级”;
 - 只输出一个 JSON 对象,不要任何其他文字、解释或 Markdown 代码块。
 
 JSON 格式(字段必须齐全):
@@ -64,7 +71,18 @@ JSON 格式(字段必须齐全):
    "era_setting": "时代/世界观/地域", "occupation": "职业/社会身份",
    "motivation": "核心目标与本集欲望", "backstory": "关键经历、秘密或创伤",
    "relationships": "与其他角色的关系及冲突", "costume_direction": "服装如何体现身份、性格和剧情阶段",
-   "signature_props": "标志性道具或动作", "visual_variants": "日常/冲突/关键场合等不同造型方向"}},
+   "signature_props": "标志性道具或动作", "visual_variants": "日常/冲突/关键场合等不同造型方向",
+   "character_analysis": {{"identity_and_class":"身份与阶层","age_and_presentation":"年龄感",
+     "upbringing":"成长环境","family_background":"家庭背景","education_background":"教育背景",
+     "current_situation":"当前处境","core_desire":"核心欲望","greatest_fear":"最大恐惧",
+     "formative_experiences":["关键经历"],"strengths":["性格优点"],
+     "flaws":["性格缺陷"],"behavior_habits":["行为习惯"]}},
+   "visual_dna": {{"face_structure":"脸型骨相","hair_silhouette":"发型轮廓",
+     "body_or_occupation_marks":"身体或职业痕迹","clothing_structure":"服装结构",
+     "clothing_wear_state":"服装状态","story_visual_symbol":"视觉符号",
+     "story_visual_symbol_origin":"符号的故事来源","signature_accessory":"核心配饰",
+     "temperament_keywords":["3-8个气质关键词"],"genre_system_mapping":{{}}}},
+   "cast_dedup": {{"compared_with":["其他角色"],"dimensions":["发型","服装结构","身体特征","视觉符号","核心配饰","气质关键词"],"status":"passed","conflicts":[]}}}},
   {{"name": "路人功能名", "role": "背景路人",
    "crowd_function": "在哪一场以几人、什么剧情功能短暂出现;无独立人物资产"}}],
  "scenes": [{{"scene_no": 1, "location": "地点",
@@ -83,6 +101,9 @@ IDOL_PROMPT = """你是 AI 虚拟偶像「{persona}」的内容策划。为第{e
   「{persona}」一人口播;
 - 每个正式成员都要写与团内定位、歌曲主题、成长经历和本期冲突绑定的人物背景提示词、
   职业/舞台身份、性格外化方式、服装逻辑和至少 3 套练习室/后台/舞台造型方向;
+- 每个正式成员先写人物分析和视觉 DNA，再与全团其他成员做视觉去重；
+  发型、服装结构、身体特征、视觉符号、核心配饰、气质关键词中两项以上
+  重叠必须重设计，不能只靠换衣服颜色区分成员;
 - 每个成员必须有 `introduction`,明确性别、年龄段、团内身份、性格、目标、
   成员关系与不可改变的身份事实;场次不得新增人物表之外的成员;
 - 临时观众、工作人员、群演等背景路人只写 `name`、`role: "背景路人"` 和
@@ -109,7 +130,15 @@ JSON 格式(字段必须齐全,characters 只含「{persona}」一人):
    "era_setting": "时代/舞台世界观", "occupation": "职业/团内身份",
    "motivation": "本期目标", "backstory": "成长经历",
    "relationships": "团内关系", "costume_direction": "练习室/后台/舞台服装逻辑",
-   "signature_props": "标志道具", "visual_variants": "至少三套剧情造型方向"}}],
+   "signature_props": "标志道具", "visual_variants": "至少三套剧情造型方向",
+   "character_analysis": {{"identity_and_class":"身份与团内位置","current_situation":"当前处境",
+     "core_desire":"核心欲望","greatest_fear":"最大恐惧","formative_experiences":["关键经历"],
+     "strengths":["优点"],"flaws":["缺点"],"behavior_habits":["行为习惯"]}},
+   "visual_dna": {{"face_structure":"脸部骨相","hair_silhouette":"发型轮廓",
+     "body_or_occupation_marks":"舞台/训练痕迹","clothing_structure":"服装结构",
+     "story_visual_symbol":"视觉符号","story_visual_symbol_origin":"故事来源",
+     "signature_accessory":"核心配饰","temperament_keywords":["3-8个气质关键词"]}},
+   "cast_dedup": {{"compared_with":["其他成员"],"status":"passed","conflicts":[]}}}}],
  "scenes": [{{"scene_no": 1, "location": "场景",
    "characters": ["{persona}"], "action": "画面动作描述",
    "lines": [{{"character": "{persona}", "dialogue": "口播台词"}}]}}]}}"""
@@ -163,6 +192,13 @@ Seedance 视频前必须锁定的“制作圣经”。
 - 逐场分析空间功能、入口出口、前中后景、材质道具、时段天气、主光方向、
   环境声和连续性锚点;
 - 候选图数量固定:主角5、重要配角3、非重要配角1、背景路人0;
+- 每名正式角色按“剧情证据→经历与处境→性格与行为→可见特征→视觉 DNA”
+  分析；视觉 DNA 包含脸部骨相、发型轮廓、身体/职业痕迹、服装结构与状态、
+  核心配饰、有故事来源的视觉符号及3-8个气质关键词;
+- 对全剧正式角色做视觉去重；发型、服装结构、身体特征、视觉符号、核心配饰、
+  气质关键词中两项以上重叠时，先重设计再标记 passed;
+- 人工定版后必须生成面部近景、正面、严格90度侧面、完整180度背面四张独立
+  高清母资产；16:9三视图拼图只用于审核，不能代替独立参考图;
 - 输出全局图片、人物、场景、关键帧、Seedance前缀及负面提示词;
 - 台词逐字保护;每段最长15秒;关键台词后有反应镜;高潮有2-4秒留白镜;
   重要肢体动作独立成镜;不要字幕;可读文字先在关键帧锁定;
@@ -186,7 +222,19 @@ JSON 结构:
 "lighting":"","sound":"","continuity_anchors":[],"prompt_prefix":""}}],
 "characters":[{{"name":"","importance":"主角/重要配角/非重要配角/背景路人",
 "candidate_count":5,"identity_facts":"","visual_direction":"",
-"continuity_anchors":[],"prompt_prefix":""}}],
+"continuity_anchors":[],"prompt_prefix":"",
+"character_analysis":{{"identity_and_class":"","age_and_presentation":"",
+"upbringing":"","family_background":"","education_background":"",
+"current_situation":"","core_desire":"","greatest_fear":"",
+"formative_experiences":[],"strengths":[],"flaws":[],"behavior_habits":[]}},
+"visual_dna":{{"face_structure":"","hair_silhouette":"",
+"body_or_occupation_marks":"","clothing_structure":"",
+"clothing_wear_state":"","story_visual_symbol":"",
+"story_visual_symbol_origin":"","signature_accessory":"",
+"temperament_keywords":[],"genre_system_mapping":{{}}}},
+"cast_dedup":{{"compared_with":[],"dimensions":[],
+"overlap_threshold":2,"status":"passed","conflicts":[],
+"redesign_if_overlap":true}}}}],
 "prompt_bible":{{"global_image_prefix":"","negative_prompt":"",
 "character_prefix":"","scene_prefix":"","keyframe_prefix":"",
 "seedance_prefix":"","readable_text_policy":"","continuity_rules":[]}}}}"""
@@ -219,7 +267,7 @@ CHARACTER_INTRO_FIELDS = (
 CHARACTER_PROFILE_FIELDS = (
     "background_prompt", "era_setting", "occupation", "motivation",
     "backstory", "relationships", "costume_direction", "signature_props",
-    "visual_variants",
+    "visual_variants", "character_analysis", "visual_dna", "cast_dedup",
 )
 BACKGROUND_ROLE_TOKENS = (
     "背景路人", "背景人物", "背景群众", "群众演员", "群演", "跑龙套",
@@ -417,7 +465,11 @@ def validate_script(script, payload):
             return f"角色字段不全: {character}"
         if not is_background_role(character):
             for key in CHARACTER_PROFILE_FIELDS:
-                default = [] if key == "visual_variants" else ""
+                default = (
+                    [] if key == "visual_variants"
+                    else {} if key in (
+                        "character_analysis", "visual_dna", "cast_dedup")
+                    else "")
                 character.setdefault(key, default)
     for scene in script["scenes"]:
         if not scene.get("location") or "scene_no" not in scene:
@@ -468,7 +520,7 @@ def validate_storyboard(storyboard):
 
 
 DESIGN_PROMPT = """你是漫剧人物设定师。为作品《{title}》的角色写生产级人物设定,
-供 AI 出图使用(立绘/四视图/特写/妆容/服装设定全部依据它)。
+供 AI 出图使用(候选立绘/三视图审核板/独立正侧背母资产/妆容服装设定全部依据它)。
 画风:{style}。剧情梗概:{logline}。本集前提:{premise}。
 
 角色名单(全部要写,名字必须逐字一致):{names}
@@ -481,6 +533,14 @@ DESIGN_PROMPT = """你是漫剧人物设定师。为作品《{title}》的角色
   再决定服装和造型;人物背景与画风冲突时以剧情时代/世界观为准,不能把所有人都套成现代都市;
 - `background_prompt` 要写成一段可直接拼进文生图的完整人物背景提示词,至少包含身份来源、
   当前处境、性格外化方式、动机、冲突、关系和视觉符号;
+- 必须先写 `character_analysis`：身份阶层、年龄感、成长与家庭/教育背景、当前处境、
+  核心欲望、最大恐惧、关键经历、性格优缺点和行为习惯；原文未说明的内容只能保守推导;
+- 再把人物分析转译为 `visual_dna`：脸部骨相、发型轮廓、身体/职业痕迹、服装结构与
+  磨损状态、核心配饰、带明确故事来源的视觉符号和 3-8 个气质关键词；不得只写帅、美、
+  冷峻、高级，也不得套 AI 网红脸、韩式偶像脸或模板男女主;
+- `cast_dedup` 必须与剧本人物背景中的全部正式角色及已有角色设定逐一比较；
+  发型、服装结构、身体特征、视觉符号、核心配饰、气质关键词中两项以上重叠必须主动
+  更换结构方案，只有完成重设计后才能输出 `status:"passed"`;
 - `era_setting`、`occupation`、`motivation`、`backstory`、`relationships`、
   `costume_direction`、`signature_props` 必须具体;职业身份要能从服装和装备一眼识别;
 - `visual_variants` 必须给出 3-5 个与剧情兼容的不同造型方向,每项写清场合、服装、材质、
@@ -515,7 +575,23 @@ JSON 格式:
     {{"label": "日常/身份", "costume": "...", "palette": "...", "props": "...", "temperament": "..."}},
     {{"label": "行动/冲突", "costume": "...", "palette": "...", "props": "...", "temperament": "..."}},
     {{"label": "关键场合", "costume": "...", "palette": "...", "props": "...", "temperament": "..."}}
-  ]}}]}}"""
+  ],
+  "character_analysis": {{"identity_and_class":"身份与社会阶层",
+    "age_and_presentation":"年龄感与性别呈现","upbringing":"成长环境",
+    "family_background":"家庭背景","education_background":"教育背景",
+    "current_situation":"当前处境","core_desire":"核心欲望",
+    "greatest_fear":"最大恐惧","formative_experiences":["关键人生经历"],
+    "strengths":["性格优点"],"flaws":["性格缺陷"],"behavior_habits":["行为习惯"]}},
+  "visual_dna": {{"face_structure":"脸型与骨相","hair_silhouette":"发型轮廓",
+    "body_or_occupation_marks":"身体或职业痕迹","clothing_structure":"服装结构",
+    "clothing_wear_state":"服装状态","story_visual_symbol":"视觉符号",
+    "story_visual_symbol_origin":"符号的故事来源","signature_accessory":"核心配饰",
+    "temperament_keywords":["3-8个气质关键词"],"genre_system_mapping":{{}}}},
+  "cast_dedup": {{"compared_with":["其他正式角色"],"dimensions":[
+    "hair_silhouette","clothing_structure","body_or_occupation_marks",
+    "story_visual_symbol","signature_accessory","temperament_keywords"],
+    "overlap_threshold":2,"status":"passed","conflicts":[],"redesign_if_overlap":true}}
+}}]}}"""
 
 # 人物设定必填字段;缺失时置空串,提示词侧自动跳过
 DESIGN_FIELDS = ("species", "personality", "temperament",
@@ -524,7 +600,8 @@ DESIGN_FIELDS = ("species", "personality", "temperament",
                  "accessories", "palette", "signature", "background_prompt",
                  "era_setting", "occupation", "motivation", "backstory",
                  "relationships", "costume_direction", "signature_props",
-                 "visual_variants")
+                 "visual_variants", "character_analysis", "visual_dna",
+                 "cast_dedup")
 
 
 def validate_design(data, payload):
@@ -538,13 +615,24 @@ def validate_design(data, payload):
         return f"缺少角色设定: {'、'.join(missing)}"
     for design in designs:
         for key in DESIGN_FIELDS:
-            design.setdefault(key, "")
+            design.setdefault(
+                key,
+                [] if key == "visual_variants"
+                else {} if key in (
+                    "character_analysis", "visual_dna", "cast_dedup")
+                else "")
         if not design["species"]:
             design["species"] = "人类"
         if not (design.get("personality") and design.get("appearance")
                 and design.get("costume")):
             return f"角色「{design.get('name')}」设定过于空泛" \
                    "(personality/appearance/costume 必填)"
+        if not isinstance(design.get("character_analysis"), dict):
+            return f"角色「{design.get('name')}」character_analysis 必须是对象"
+        if not isinstance(design.get("visual_dna"), dict):
+            return f"角色「{design.get('name')}」visual_dna 必须是对象"
+        if not isinstance(design.get("cast_dedup"), dict):
+            return f"角色「{design.get('name')}」cast_dedup 必须是对象"
     return None
 
 
@@ -687,6 +775,8 @@ def build_prompt(capability, payload):
                     "story_background": payload.get("story_background") or {},
                     "characters": (payload.get("character_context")
                                    or payload.get("characters", [])),
+                    "existing_cast_designs": (
+                        payload.get("existing_cast_designs") or {}),
                 },
                 ensure_ascii=False),
             scene_context=json.dumps(payload.get("scene_context") or [],

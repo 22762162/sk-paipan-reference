@@ -2529,7 +2529,7 @@ function bindShotInlineRevisions(root, data) {
 const PLAN_CAT_CN = {
   character_candidate: "人物定妆候选(按角色重要度)",
   character_art: "人物立绘",
-  character_sheet: "人物资产套件(四视图/特写/特征/妆容/服装)",
+  character_sheet: "人物资产套件(三视图审核板/独立正侧背母资产/特写/服装)",
   scene_art: "场景概念图",
   shot_image: "分镜画面(关键帧)", frames: "首尾帧",
 };
@@ -4410,8 +4410,8 @@ async function renderAssetsCenter(selectedTitle) {
   ]));
   const characterAssetPolicy = (epData || {}).character_asset_policy || {};
   const characterAssetHint = characterAssetPolicy.resolved_mode === "simple"
-    ? "当前为简化版：只使用人工锁定的最终人物形象图；历史扩展资产保留但不会自动注入后续出图"
-    : "当前为完整版：最终人物形象图 + 四视图/面部特写/特征/妆容/服装/服装细节";
+    ? "当前为简化版：只使用人工锁定的最终人物形象图；这是人工明确选择的三视图门禁豁免"
+    : "当前为完整版：视觉DNA + 三视图审核板 + 独立面部/正面/严格侧面/完整背面母资产 + 细节图";
   app.innerHTML = `
   <div class="assets-center">
     <div class="canvas-toolbar">
@@ -4875,6 +4875,28 @@ function castLookHtml(candidate) {
   </div>`;
 }
 
+function castVisualDnaHtml(character) {
+  const dna = character.visual_dna || {};
+  const rows = [
+    ["脸部骨相", dna.face_structure],
+    ["发型轮廓", dna.hair_silhouette],
+    ["职业/身体痕迹", dna.body_or_occupation_marks],
+    ["服装结构", dna.clothing_structure],
+    ["故事视觉符号", dna.story_visual_symbol],
+    ["核心配饰", dna.signature_accessory],
+    ["气质关键词", Array.isArray(dna.temperament_keywords)
+      ? dna.temperament_keywords.join("、") : dna.temperament_keywords],
+  ].filter(([, value]) => value);
+  if (!rows.length) return "";
+  const dedup = character.cast_dedup || {};
+  const dedupStatus = dedup.status === "redesign_required"
+    ? "⚠ 与其他角色存在重叠，候选提示词已要求重设计"
+    : "✓ 已完成全剧角色去重预审";
+  return `<details class="cast-look cast-visual-dna"><summary>查看剧情视觉 DNA</summary>
+    <dl>${rows.map(([label, value]) => `<div><dt>${label}</dt><dd>${esc(value)}</dd></div>`).join("")}</dl>
+    <p class="dim">${esc(dedupStatus)}</p></details>`;
+}
+
 function renderCastSelection(data, episodeId) {
   const selection = data.cast_selection || {};
   const characters = selection.characters || [];
@@ -4883,29 +4905,32 @@ function renderCastSelection(data, episodeId) {
   };
   const assetMode = assetPolicy.mode || "auto";
   const resolvedLabel = assetPolicy.resolved_mode === "simple"
-    ? "简化版（仅最终人物形象图）" : "完整版（每人增加 6 张扩展资产）";
+    ? "简化版（仅最终人物形象图）"
+    : `完整版（每人增加 ${assetPolicy.sheet_count_per_character || 9} 张生产资产）`;
   const assetPolicyStatus = assetMode === "auto"
     ? `自动判断结果：${resolvedLabel}${(assetPolicy.reasons || []).length
       ? ` · ${assetPolicy.reasons.join("；")}` : ""}`
     : (assetMode === "simple"
-      ? "已选择简化版：不生成四视图和任何面部、特征、妆容、服装类细节图"
-      : "已选择完整版：为每名非背景角色生成全部 6 类扩展资产");
+      ? "已选择简化版：人工豁免三视图门禁，不生成独立正侧背和细节图"
+      : "已选择完整版：生成视觉DNA、三视图审核板及独立高清正侧背母资产");
   const policy = selection.candidate_policy
     || "主角5张；重要配角3张；非重要角色固定1张；跑龙套/背景路人不做独立设定、不生成候选图或立绘";
   app.innerHTML = `<div class="canvas-view cast-select-view">
     <div class="confirm-banner">
       <div><b>先定人物，再生产后续图片 👤</b>
         <span>${esc(policy)}；有参考图时人物脸和发型是最高标准，职业角色必须穿工作服；人物候选统一使用纯背景，不得出现文字或场景。
-        每名角色按重要度生成独立造型候选，不再只是换动作；
+        每名角色先从剧情推导视觉DNA并与全剧角色去重，再按重要度生成独立造型候选；
         请比较服装、发型、妆容和气质后各选1张作为最终立绘。
+        定版后完整版会生成面部、正面、严格90°侧面和完整180°背面独立母资产；
+        16:9三视图拼板只用于审核，不作为正式镜头参考。
         后续关键帧、首尾帧和其他图片 API 都会真实携带这张参考图，
         视觉质检也会将成图与它逐人比对。</span></div>
         <div class="cast-asset-policy">
           <label for="cast-asset-mode"><b>人物扩展资产</b>
             <select id="cast-asset-mode">
               <option value="auto" ${assetMode === "auto" ? "selected" : ""}>自动判断（推荐）</option>
-              <option value="simple" ${assetMode === "simple" ? "selected" : ""}>简化版 · 只用人物形象图</option>
-              <option value="full" ${assetMode === "full" ? "selected" : ""}>完整版 · 四视图与细节图</option>
+              <option value="simple" ${assetMode === "simple" ? "selected" : ""}>简化版 · 人工豁免三视图</option>
+              <option value="full" ${assetMode === "full" ? "selected" : ""}>完整版 · 视觉DNA与独立三视图母资产</option>
             </select>
           </label>
           <span id="cast-asset-policy-status" class="dim" aria-live="polite">${esc(assetPolicyStatus)}</span>
@@ -4931,6 +4956,7 @@ function renderCastSelection(data, episodeId) {
           <span class="dim">${esc(character.role || "角色")} · ${character.candidate_count || 0}/${character.candidate_target || selection.candidate_target || 5} 张候选</span></div>
           <strong class="${character.candidate_target === 0 ? "cast-locked" : (character.locked ? "cast-locked" : "cast-unlocked")}">
             ${character.candidate_target === 0 ? "无需单独立绘" : (character.locked ? "✓ 已锁定最终立绘" : "请选择1张")}</strong></div>
+        ${castVisualDnaHtml(character)}
         <div class="cast-candidate-grid" role="list" aria-label="${esc(character.character)}的造型候选">${(character.candidates || []).map((candidate) => {
           const variant = candidate.variant_source === "legacy" || !candidate.variant_label
             ? "历史候选" : candidate.variant_label;
@@ -5035,8 +5061,8 @@ function renderCastSelection(data, episodeId) {
         body: JSON.stringify({ episode_id: data.episode.id }),
       });
       showToast(assetPolicy.generate_sheets
-        ? "人物已全部定版，开始生成完整人物资产套件和后续图片"
-        : "人物已全部定版，跳过四视图与细节图，开始生成后续图片", "ok");
+        ? "人物已全部定版，开始生成三视图审核板与独立高清母资产"
+        : "人物已全部定版；按人工选择豁免三视图，开始后续图片", "ok");
       pollCanvas(episodeId);
     } catch (e) {
       showToast(e.message, "error");
