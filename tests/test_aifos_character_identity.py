@@ -98,6 +98,69 @@ def test_candidate_prompts_create_real_look_variants_without_locking_style(app):
     assert "齐肩内扣短发" in prompts[0]
 
 
+def test_visual_dna_and_cast_dedup_enter_candidate_prompt(app):
+    design = {
+        "species": "人类", "appearance": "长期熬夜形成的清瘦骨相",
+        "personality": "谨慎、目标明确", "costume": "旧工装夹克",
+        "character_analysis": {
+            "current_situation": "在追查失踪同伴",
+            "core_desire": "找到同伴",
+            "greatest_fear": "再次失去重要的人",
+        },
+        "visual_dna": {
+            "face_structure": "清瘦长脸和轻微眼下疲态",
+            "hair_silhouette": "自行剪短的不齐耳短发",
+            "body_or_occupation_marks": "右手虎口工具磨痕",
+            "clothing_structure": "多口袋旧工装",
+            "story_visual_symbol": "修过三次的旧怀表",
+            "signature_accessory": "旧怀表",
+            "temperament_keywords": ["警觉", "克制", "疲惫但坚定"],
+        },
+        "cast_dedup": {
+            "status": "passed", "compared_with": ["周鹿"],
+            "overlap_threshold": 2, "conflicts": [],
+        },
+    }
+    prompt = app.director._candidate_portrait_prompt(
+        "林昭", "主角", "电影级半写实", design,
+        app.director._candidate_variant(1, design))
+    assert "人物视觉DNA" in prompt
+    assert "旧怀表" in prompt
+    assert "剧情证据" in prompt
+    assert "两个及以上主要维度" in prompt
+    assert "AI网红脸" in prompt
+
+
+def test_legacy_character_design_is_upgraded_without_losing_fields(app):
+    legacy = {
+        "appearance": "方脸、肩背挺直",
+        "hair": "利落短发",
+        "costume": "深蓝维修工装",
+        "occupation": "设备维修师",
+        "signature_props": "磨旧的扳手",
+        "personality": "沉稳但固执",
+    }
+    upgraded = app.director._upgrade_character_visual_dna(
+        legacy, {"name": "陈工", "role": "重要配角"})
+    assert upgraded["appearance"] == legacy["appearance"]
+    assert upgraded["visual_dna"]["face_structure"] == legacy["appearance"]
+    assert upgraded["visual_dna"]["hair_silhouette"] == legacy["hair"]
+    assert upgraded["visual_dna"]["signature_accessory"] == "磨旧的扳手"
+    assert 3 <= len(upgraded["visual_dna"]["temperament_keywords"]) <= 8
+    assert upgraded["character_analysis"]["identity_and_class"] == "设备维修师"
+
+
+def test_shot_uses_individual_canonical_view_not_review_board(app):
+    assert app.director._shot_reference_sheet_keys(
+        {"description": "她背对镜头离场"}) == ("back",)
+    assert app.director._shot_reference_sheet_keys(
+        {"description": "严格侧面转头观察"}) == ("profile",)
+    assert app.director._shot_reference_sheet_keys(
+        {"camera": "面部大特写"}) == ("closeup",)
+    assert app.director._shot_reference_sheet_keys(
+        {"description": "正面走入房间"}) == ("front",)
+
+
 def test_reference_portrait_locks_face_but_varies_hair_and_workwear(app):
     design = {"appearance": "鹅蛋脸", "hair": "齐肩短发", "costume": "外卖制服"}
     variant = app.director._candidate_variant(1, design)

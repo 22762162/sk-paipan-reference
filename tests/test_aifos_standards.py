@@ -53,6 +53,14 @@ def test_default_standard_is_complete_and_active(tmp_path):
             "non_main_max": 1,
             "background": 0,
         }
+        assert rules["character_assets"]["visual_dna_required"] is True
+        assert rules["character_assets"]["cast_dedup_overlap_threshold"] == 2
+        assert rules["character_assets"]["canonical_views"] == [
+            "face_closeup", "front", "profile", "back"]
+        assert rules["character_assets"][
+            "turnaround_review_board_only"] is True
+        assert rules["character_assets"][
+            "seedance_may_redesign_character"] is False
         assert [gate["id"] for gate in rules["quality_gates"]] == REQUIRED_GATE_IDS
         assert app.db.query_one("PRAGMA busy_timeout")[0] == 5000
     finally:

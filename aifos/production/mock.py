@@ -349,6 +349,11 @@ class MockProvider(Provider):
     def _gen_character_design(self, payload, out_dir):
         seed = _digest(payload)
         designs = []
+        formal_names = [
+            str(character.get("name") or "")
+            for character in payload.get("characters", [])
+            if character.get("name")
+        ]
         for idx, character in enumerate(payload.get("characters", [])):
             design = {"name": character.get("name", "")}
             for f_no, (field, pool) in enumerate(
@@ -388,6 +393,63 @@ class MockProvider(Provider):
                 "visual_variants": character.get("visual_variants") or
                     story_pool["variants"],
             })
+            design["character_analysis"] = (
+                character.get("character_analysis") or {
+                    "identity_and_class": (
+                        character.get("identity") or role),
+                    "age_and_presentation": character.get("age_range") or
+                        "以剧本人物表为准",
+                    "upbringing": character.get("backstory") or
+                        "关键经历塑造当前性格",
+                    "family_background": character.get(
+                        "family_background") or "剧本未明示，保守留白",
+                    "education_background": character.get(
+                        "education_background") or "剧本未明示，保守留白",
+                    "current_situation": (
+                        payload.get("premise") or "处于本集核心冲突中"),
+                    "core_desire": character.get("motivation") or
+                        "完成本集目标",
+                    "greatest_fear": character.get("greatest_fear") or
+                        "失去重要目标或关系",
+                    "formative_experiences": [
+                        character.get("backstory")
+                        or "一次改变信念的关键经历"],
+                    "strengths": ["目标明确", "能够行动"],
+                    "flaws": ["在压力下容易固执"],
+                    "behavior_habits": [
+                        character.get("signature_props")
+                        or "通过眼神、站姿和随身物件外化性格"],
+                })
+            design["visual_dna"] = character.get("visual_dna") or {
+                "face_structure": design["appearance"],
+                "hair_silhouette": design["hair"],
+                "body_or_occupation_marks": (
+                    f"{design['occupation']}形成的体态与使用痕迹"),
+                "clothing_structure": (
+                    f"{design['costume']}；{design['costume_detail']}"),
+                "clothing_wear_state": "整洁程度与当前处境和社会身份一致",
+                "story_visual_symbol": design["signature"],
+                "story_visual_symbol_origin": (
+                    f"来源于{design['backstory']}与{design['occupation']}"),
+                "signature_accessory": design["signature_props"],
+                "temperament_keywords": [
+                    design["temperament"], design["personality"], role],
+                "genre_system_mapping": {},
+            }
+            design["cast_dedup"] = character.get("cast_dedup") or {
+                "compared_with": [
+                    name for name in formal_names
+                    if name != character.get("name")],
+                "dimensions": [
+                    "hair_silhouette", "clothing_structure",
+                    "body_or_occupation_marks", "story_visual_symbol",
+                    "signature_accessory", "temperament_keywords",
+                ],
+                "overlap_threshold": 2,
+                "status": "passed",
+                "conflicts": [],
+                "redesign_if_overlap": True,
+            }
             # 参考图为最高标准:脸部特征/发型/风格字段锁定到参考图
             references = character.get("reference_images") or []
             if references:
