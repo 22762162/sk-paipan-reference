@@ -114,8 +114,8 @@ def test_confirm_continues_to_done(app):
         project["id"], "video", "e002_shot001")["uri"]).exists()
 
 
-def test_provided_script_skips_script_pause(app):
-    """用户自带剧本不用再过目，但仍必须停在人物五选一。"""
+def test_provided_script_pauses_for_story_analysis(app):
+    """用户自带剧本也先确认 AI 制作圣经，不能绕过审阅直接烧图。"""
     script = {
         "project_title": "万妖图录", "episode_number": 9,
         "episode_title": "自带剧本", "logline": "测试",
@@ -127,6 +127,18 @@ def test_provided_script_skips_script_pause(app):
     }
     summary = app.director.produce(
         "万妖图录", 9, script=script, pause_for_confirm=True)
+    assert summary["status"] == "awaiting_script"
+    project = app.projects.get_project("万妖图录")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=9",
+        (project["id"],))
+    analysis, version = app.projects.latest_document(
+        episode["id"], "story_analysis")
+    assert version == 1
+    assert analysis["world"]["era_and_location"]
+    assert analysis["prompt_bible"]["keyframe_prefix"]
+    summary = app.director.produce(
+        "万妖图录", 9, pause_for_confirm=True)
     assert summary["status"] == "awaiting_cast"
     _lock_all(app, "万妖图录", 9)
     summary = app.director.produce(

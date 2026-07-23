@@ -494,6 +494,22 @@ const STANDARD_SECTIONS = [
     ],
   },
   {
+    id: "story_analysis", label: "剧本 AI 分析", icon: "02A",
+    blurb: "在生成人物和场景前，先把故事世界、环境、视觉媒介与提示词母版锁成可调整的制作圣经。",
+    fields: [
+      { path: "rules.story_analysis.required_before_images", label: "出图前必须有制作圣经", type: "boolean" },
+      { path: "rules.story_analysis.auto_analyze_uploaded_script", label: "上传剧本也自动分析", type: "boolean" },
+      { path: "rules.story_analysis.user_style_is_hard_constraint", label: "用户画风为最高硬约束", type: "boolean" },
+      { path: "rules.story_analysis.distinguish_world_from_render_medium", label: "区分故事时代与渲染媒介", type: "boolean" },
+      { path: "rules.story_analysis.editable_before_lock", label: "开画前允许编辑和重分析", type: "boolean" },
+      { path: "rules.story_analysis.required_sections", label: "制作圣经必备模块", type: "list",
+        help: "故事、世界、视觉、场景、人物和提示词母版，缺一项不进入出图。" },
+      { path: "rules.story_analysis.downstream_consumers", label: "必须继承制作圣经的环节", type: "list" },
+      { path: "rules.story_analysis.visible_text_policy", label: "画面文字策略" },
+      { path: "rules.story_analysis.default_visual_fallback", label: "未指定画风时的兜底媒介" },
+    ],
+  },
+  {
     id: "dialogue", label: "台词与表演", icon: "03",
     blurb: "语速跟随情绪，台词后给听者反应，高点给演员留白。",
     fields: [
@@ -1144,7 +1160,7 @@ async function renderDashboard() {
           <option value="国风漫剧，精致2D动画质感，服装与建筑严格符合剧情时代，高细节，统一人物造型">国风漫剧 · 2D</option>
         </select>
       </label>
-      <button class="primary" type="submit">开始制作</button>
+      <button class="primary" type="submit">生成剧本并 AI 分析</button>
       <textarea name="script" rows="5" hidden placeholder="把你的剧本粘贴到这里,人物、场次、分镜会自动识别。写法示例:
 第1场 古镇长街
 夜色渐深,妖气翻涌。
@@ -1163,12 +1179,12 @@ async function renderDashboard() {
           当前集完整通过后，自动准备下一集</label>
         <small data-series-file-note>支持 TXT、Markdown、JSON、Word DOCX、PDF；先预览分集，不会直接开始烧图。</small>
       </div>
-      <div class="produce-hint">SK 工业流:连续性圣经 → 五维分镜 → 空间调度图 → 关键帧/文字锁定 → 生产门禁 → Seedance → 三层质检 → 交付脚本。</div>
+      <div class="produce-hint">SK 工业流:上传/AI 编剧 → AI 世界观、环境与风格分析 → 锁定制作圣经 → 连续性圣经 → 五维分镜 → 空间调度图 → 关键帧/文字锁定 → Seedance → 三层质检。</div>
     </form>
     <section class="workflow-map" aria-label="AIFOS 漫剧工业流">
       <div class="workflow-lead"><b>不把长剧本直接塞给视频模型</b><span>先锁定画面、人物与段间状态，再让 Seedance 只执行动作、镜头和情绪。</span><a href="#/standards/production">${esc(activeStandard.name || "SK 五维漫剧标准")} · v${esc(activeStandard.version || 1)} 正在驱动新剧集 →</a></div>
       <div class="workflow-steps">
-        ${["连续性", "五维分镜", "空间调度", "文字关键帧", "首尾帧", "生产门禁", "视频/口型", "抽帧+内容复核", "交付脚本"].map((name, i) =>
+        ${["剧本来源", "AI制作圣经", "连续性", "五维分镜", "空间调度", "文字关键帧", "首尾帧", "生产门禁", "视频/口型", "抽帧+复核", "交付"].map((name, i) =>
           `<div class="workflow-step"><em>${String(i + 1).padStart(2, "0")}</em><span>${name}</span></div>`).join("")}
       </div>
     </section>
@@ -1254,7 +1270,7 @@ async function renderDashboard() {
       ? `已选择 ${file.name} · ${Math.max(1, Math.round(file.size / 1024))}KB；点“预览并批量导入”检查分集。`
       : "支持 TXT、Markdown、JSON、Word DOCX、PDF；先预览分集，不会直接开始烧图。";
     const submit = form.querySelector('button[type="submit"]');
-    submit.textContent = file ? "预览并批量导入" : "开始制作";
+    submit.textContent = file ? "预览并批量导入" : "生成剧本并 AI 分析";
   });
   renderProgressBanner(data);
   bindSeriesBatches();
@@ -1426,7 +1442,7 @@ async function onProduce(ev) {
     showToast(e.message, "error");
     btn.disabled = false;
     btn.textContent = form.elements.series_file?.files?.[0]
-      ? "预览并批量导入" : "开始制作";
+      ? "预览并批量导入" : "生成剧本并 AI 分析";
   }
 }
 
@@ -4531,7 +4547,7 @@ function stateInline(states) {
 }
 
 const STAGE_CN = {
-  script: "剧本", continuity: "连续性圣经", cast: "人物/场景图",
+  script: "剧本 + AI制作圣经", continuity: "连续性圣经", cast: "人物/场景图",
   storyboard: "五维分镜", blocking: "空间调度图", images: "关键帧", text_assets: "文字资产锁定",
   frames: "首尾帧", preflight: "生产门禁", videos: "Seedance 视频",
   voices: "随视频配音/口型", edit: "剪映剪辑",
@@ -4543,7 +4559,8 @@ const STAGE_ORDER = ["script", "continuity", "cast", "storyboard", "blocking", "
   "package", "archive"];
 const STAGE_PLAIN = {
   cancelling: "正在暂停,已完成的图片全部保留,随时可从断点继续",
-  script: "正在写剧本", continuity: "正在锁定角色、场景和文字规则",
+  script: "正在写/读取剧本，并分析世界、环境和风格",
+  continuity: "正在锁定角色、场景和文字规则",
   cast: "正在画人物和场景", storyboard: "正在生成五维分镜",
   blocking: "正在锁定人物走位、机位与屏幕轴线",
   images: "正在生成关键帧", text_assets: "正在锁定可读文字",
@@ -5695,12 +5712,111 @@ async function bindImageLineControls() {
 
 /* ---- 剧本审阅页:剧本确认后才开始画图(第一道确认) ----
    开画前在这里确定画风、上传参考图,出图全程按它们执行 */
-const STYLE_PRESETS = ["国风漫剧", "现代都市漫剧", "校园清新日系",
+const STYLE_PRESETS = ["现代乙女 3D 半写实", "现代都市漫剧", "国风漫剧", "校园清新日系",
   "水墨国风", "赛博朋克霓虹", "日系少年漫", "欧美卡通",
   "3D 渲染动画", "复古港漫", "治愈系水彩"];
 
+function analysisText(value) {
+  return Array.isArray(value) ? value.join("、") : (value == null ? "" : String(value));
+}
+
+function storyAnalysisEditorHtml(analysis, version) {
+  if (!analysis) return `<section class="analysis-studio missing">
+    <div class="analysis-head"><div><span class="eyebrow">STEP 02</span>
+      <h2>AI 世界观与风格分析尚未完成</h2>
+      <p>未形成制作圣经前不会开始生成人物和场景。</p></div>
+      <button class="primary" id="analysis-retry">AI 重新分析</button></div></section>`;
+  const n = analysis.narrative || {}, w = analysis.world || {};
+  const v = analysis.visual || {}, p = analysis.prompt_bible || {};
+  const sceneCards = (analysis.scenes || []).map((scene) => `
+    <details class="analysis-scene">
+      <summary>场 ${esc(scene.scene_no || "—")} · ${esc(scene.location || "未命名")}</summary>
+      <div><b>空间：</b>${esc(scene.environment || "")}</div>
+      <div><b>布局：</b>${esc(scene.layout || "")}</div>
+      <div><b>材质道具：</b>${esc(scene.materials_and_props || "")}</div>
+      <div><b>时段/天气：</b>${esc(scene.time_weather || "")}</div>
+      <div><b>光线：</b>${esc(scene.lighting || "")}</div>
+    </details>`).join("");
+  return `<section class="analysis-studio" data-version="${Number(version || 0)}">
+    <div class="analysis-head"><div><span class="eyebrow">STEP 02 · AI PRODUCTION BIBLE</span>
+      <h2>世界观、环境与视觉制作圣经</h2>
+      <p>AI 已读完整剧本。锁定后，人物、场景、分镜、关键帧和 Seedance
+      都继承同一套提示词，不再各自猜风格。</p></div>
+      <div class="analysis-state">${analysis.locked ? "🔒 已锁定" : "待确认"} · v${Number(version || 1)}</div>
+    </div>
+    <div class="analysis-summary">
+      <div><span>类型</span><b>${esc(n.genre || "待分析")}</b></div>
+      <div><span>世界</span><b>${esc(w.name || "待分析")}</b></div>
+      <div><span>时代地域</span><b>${esc(w.era_and_location || "待分析")}</b></div>
+      <div><span>视觉媒介</span><b>${esc(v.medium || "待分析")}</b></div>
+    </div>
+    <div class="analysis-grid">
+      <label><span>一句话故事</span><textarea id="analysis-logline">${esc(n.logline || "")}</textarea></label>
+      <label><span>类型与受众</span><textarea id="analysis-genre">${esc(n.genre || "")}</textarea></label>
+      <label><span>时代、地域与世界</span><textarea id="analysis-era">${esc(w.era_and_location || "")}</textarea></label>
+      <label><span>世界硬规则</span><textarea id="analysis-rules">${esc(w.hard_rules || "")}</textarea></label>
+      <label><span>社会、组织与生活方式</span><textarea id="analysis-social">${esc([w.social_order, w.culture_and_lifestyle].filter(Boolean).join("；"))}</textarea></label>
+      <label><span>技术等级与关键道具</span><textarea id="analysis-tech">${esc(w.technology_and_props || "")}</textarea></label>
+      <label class="wide"><span>用户锁定画风（AI 不得擅自改变）</span>
+        <textarea id="analysis-style">${esc(v.user_style_constraint || "")}</textarea></label>
+      <label><span>色彩与渲染质感</span><textarea id="analysis-palette">${esc([analysisText(v.palette), v.texture_and_render].filter(Boolean).join("；"))}</textarea></label>
+      <label><span>光线设计</span><textarea id="analysis-light">${esc(v.lighting || "")}</textarea></label>
+      <label><span>镜头语言</span><textarea id="analysis-camera">${esc(v.camera_language || "")}</textarea></label>
+      <label><span>建筑与环境设计</span><textarea id="analysis-environment">${esc(v.architecture_and_environment || "")}</textarea></label>
+      <label><span>人物服装与造型边界</span><textarea id="analysis-wardrobe">${esc(v.wardrobe_and_styling || "")}</textarea></label>
+      <label><span>禁止出现</span><textarea id="analysis-forbid">${esc(analysisText(v.forbidden_visuals))}</textarea></label>
+    </div>
+    <details class="prompt-master"><summary>查看 / 调整后续生成提示词母版</summary>
+      <div class="analysis-grid">
+        <label class="wide"><span>全局图片提示词</span><textarea id="analysis-global">${esc(p.global_image_prefix || "")}</textarea></label>
+        <label class="wide"><span>负面提示词</span><textarea id="analysis-negative">${esc(p.negative_prompt || "")}</textarea></label>
+        <label><span>场景图前缀</span><textarea id="analysis-scene-prefix">${esc(p.scene_prefix || "")}</textarea></label>
+        <label><span>关键帧前缀</span><textarea id="analysis-keyframe-prefix">${esc(p.keyframe_prefix || "")}</textarea></label>
+        <label class="wide"><span>Seedance 视频前缀</span><textarea id="analysis-seedance-prefix">${esc(p.seedance_prefix || "")}</textarea></label>
+      </div></details>
+    <details class="analysis-scenes"><summary>逐场环境分析 · ${(analysis.scenes || []).length} 场</summary>
+      <div class="analysis-scene-grid">${sceneCards || "暂无场景分析"}</div></details>
+    <div class="analysis-actions">
+      <input id="analysis-direction" placeholder="补充要求，如：保持现代乙女3D，不要古装；雨夜冷调">
+      <button id="analysis-rerun">↻ AI 重新分析</button>
+      <button id="analysis-save">保存制作圣经</button>
+      <button id="analysis-copy">复制全局提示词</button>
+    </div>
+  </section>`;
+}
+
+function collectStoryAnalysis(analysis) {
+  const next = JSON.parse(JSON.stringify(analysis || {}));
+  next.narrative ||= {}; next.world ||= {}; next.visual ||= {};
+  next.prompt_bible ||= {};
+  const value = (id) => document.getElementById(id)?.value.trim() || "";
+  const list = (text) => text.split(/[、，,；;\n]+/).map((x) => x.trim()).filter(Boolean);
+  next.narrative.logline = value("analysis-logline");
+  next.narrative.genre = value("analysis-genre");
+  next.world.era_and_location = value("analysis-era");
+  next.world.hard_rules = value("analysis-rules");
+  next.world.social_order = value("analysis-social");
+  next.world.technology_and_props = value("analysis-tech");
+  next.visual.user_style_constraint = value("analysis-style");
+  next.visual.palette = list(value("analysis-palette"));
+  next.visual.lighting = value("analysis-light");
+  next.visual.camera_language = value("analysis-camera");
+  next.visual.architecture_and_environment = value("analysis-environment");
+  next.visual.wardrobe_and_styling = value("analysis-wardrobe");
+  next.visual.forbidden_visuals = list(value("analysis-forbid"));
+  next.prompt_bible.global_image_prefix = value("analysis-global");
+  next.prompt_bible.negative_prompt = value("analysis-negative");
+  next.prompt_bible.scene_prefix = value("analysis-scene-prefix");
+  next.prompt_bible.keyframe_prefix = value("analysis-keyframe-prefix");
+  next.prompt_bible.seedance_prefix = value("analysis-seedance-prefix");
+  return next;
+}
+
 function renderScriptReview(data, episodeId) {
   const script = data.script;
+  const storyAnalysis = data.story_analysis || script.production_analysis || null;
+  let analysisDraft = storyAnalysis;
+  let analysisVersion = Number(data.story_analysis_version || 0);
   const refs = (data.artifacts || {}).references || [];
   const planItems = ((data.render_plan || {}).items) || [];
   const planReady = planItems.filter(
@@ -5712,14 +5828,20 @@ function renderScriptReview(data, episodeId) {
     ...[...new Set((script.scenes || []).map((s) => s.location))]];
   app.innerHTML = `
   <div class="canvas-view">
+    <div class="prepro-steps" aria-label="预生产步骤">
+      <div class="done"><b>01</b><span>剧本来源<small>上传 / AI 编剧</small></span></div>
+      <div class="active"><b>02</b><span>AI 制作圣经<small>世界 · 环境 · 风格</small></span></div>
+      <div><b>03</b><span>人工锁定<small>可改、可重分析</small></span></div>
+      <div><b>04</b><span>开始生产<small>人物 · 场景 · 分镜</small></span></div>
+    </div>
     <div class="confirm-banner">
       <div>
-        <b>剧本写好了,先过目 📖</b>
-        <span>看剧本 → 定画风 → 传参考图(可选)→ 点确认才开始画
-        (此刻还没花出图额度);剧本不满意可意见重写或直接编辑。</span>
+        <b>剧本与 AI 制作圣经已就绪，先确认再出图 📖</b>
+        <span>检查故事、世界、环境和画风 → 可改或重新分析 → 锁定后才开始画。
+        此刻还没有消耗生图额度。</span>
       </div>
       <button class="primary" id="btn-script-ok">${resuming
-        ? "▶ 从断点继续画图" : "✅ 剧本OK,按此风格开始画图"}</button>
+        ? "▶ 锁定并从断点继续" : "🔒 锁定制作圣经并开始人物图"}</button>
     </div>
     ${resuming ? `<div class="resume-banner">⏸ 上次生成已暂停:
       图片 <b>${planReady}/${planItems.length}</b> 已完成并全部保留。
@@ -5737,8 +5859,8 @@ function renderScriptReview(data, episodeId) {
       <div class="style-row">
         <label>本剧画风</label>
         <input id="style-input" list="style-presets"
-          value="${esc(data.project.style || "国风漫剧")}"
-          placeholder="选一个预设,或自己写,如:水墨国风,淡彩,留白构图">
+          value="${esc(data.project.style || "剧情自适应精品漫剧")}"
+          placeholder="如：现代乙女3D半写实；柔光；禁止古装和2D">
         <datalist id="style-presets">${STYLE_PRESETS.map((s) =>
           `<option>${esc(s)}</option>`).join("")}</datalist>
         <button id="style-save">保存画风</button>
@@ -5763,6 +5885,7 @@ function renderScriptReview(data, episodeId) {
       : `<div class="dim" style="margin-top:6px">还没有参考图。有官方设定图/画风样例就传上来,
          人物形象和画风会稳定得多;之后在「资产中心」也能管理。</div>`}
     </div>
+    ${storyAnalysisEditorHtml(storyAnalysis, data.story_analysis_version)}
     <div class="script-review">${scriptBodyHtml(script)}</div>
   </div>`;
   document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
@@ -5774,6 +5897,64 @@ function renderScriptReview(data, episodeId) {
   const post = (path, body) => api(path, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body) });
+  const rerunAnalysis = async (button) => {
+    button.disabled = true;
+    const oldText = button.textContent;
+    button.textContent = "AI 分析中…";
+    try {
+      const reply = await post("/api/story-analysis", {
+        episode_id: data.episode.id, action: "reanalyze",
+        creative_direction:
+          document.getElementById("analysis-direction")?.value.trim() || "",
+      });
+      showToast("AI 正在重读剧本并重建制作圣经", "ok");
+      if (reply.job_id) pollCanvas(episodeId);
+    } catch (e) {
+      showToast(e.message, "error");
+      button.disabled = false; button.textContent = oldText;
+    }
+  };
+  const saveAnalysis = async (locked = false) => {
+    if (!analysisDraft) throw new Error("制作圣经尚未生成，请先点 AI 重新分析");
+    const style = document.getElementById("style-input").value.trim();
+    const styleField = document.getElementById("analysis-style");
+    if (style && styleField) styleField.value = style;
+    const reply = await post("/api/story-analysis", {
+      episode_id: data.episode.id, action: "save",
+      analysis: collectStoryAnalysis(analysisDraft),
+      expected_version: analysisVersion, locked,
+    });
+    analysisDraft = reply.analysis;
+    analysisVersion = Number(reply.version || analysisVersion);
+    return reply;
+  };
+  document.getElementById("analysis-rerun")?.addEventListener(
+    "click", (event) => rerunAnalysis(event.currentTarget));
+  document.getElementById("analysis-retry")?.addEventListener(
+    "click", (event) => rerunAnalysis(event.currentTarget));
+  document.getElementById("analysis-save")?.addEventListener(
+    "click", async (event) => {
+      const button = event.currentTarget; button.disabled = true;
+      try {
+        await saveAnalysis(false);
+        showToast(`制作圣经 v${analysisVersion} 已保存`, "ok");
+        button.textContent = "✓ 已保存";
+      } catch (e) { showToast(e.message, "error"); }
+      setTimeout(() => {
+        button.disabled = false; button.textContent = "保存制作圣经";
+      }, 1200);
+    });
+  document.getElementById("analysis-copy")?.addEventListener(
+    "click", async (event) => {
+      try {
+        await navigator.clipboard.writeText(
+          document.getElementById("analysis-global")?.value || "");
+        event.currentTarget.textContent = "✓ 已复制";
+        setTimeout(() => {
+          event.currentTarget.textContent = "复制全局提示词";
+        }, 1200);
+      } catch (e) { showToast("复制失败，请手动选择文本", "error"); }
+    });
   const saveStyle = async () => {
     const style = document.getElementById("style-input").value.trim();
     if (!style || style === data.project.style) return style;
@@ -5830,12 +6011,13 @@ function renderScriptReview(data, episodeId) {
     btn.disabled = true; btn.textContent = "已确认,画图中…";
     try {
       await saveStyle();   // 确认时顺手保存画风,忘点保存也不丢
+      await saveAnalysis(true);
       await post("/api/confirm", { episode_id: data.episode.id });
-      showToast("已确认!按选定画风画人物/场景/分镜,完成后再来确认开拍", "ok");
+      showToast("制作圣经已锁定！人物、场景和分镜将继承同一套世界与画风", "ok");
       pollCanvas(episodeId);
     } catch (e) {
       showToast(e.message, "error");
-      btn.disabled = false; btn.textContent = "✅ 剧本OK,按此风格开始画图";
+      btn.disabled = false; btn.textContent = "🔒 锁定制作圣经并开始人物图";
     }
   };
 }

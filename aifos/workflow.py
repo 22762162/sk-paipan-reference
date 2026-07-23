@@ -547,6 +547,17 @@ def _normalize_ai_shot(raw):
 def enrich_storyboard(script, storyboard, continuity, profile, style=""):
     """把 Provider 的轻量分镜升级为五维生产分镜。"""
     rules = profile.get("rules", {})
+    production_analysis = (
+        script.get("production_analysis")
+        if isinstance(script.get("production_analysis"), dict) else {})
+    prompt_bible = (
+        production_analysis.get("prompt_bible")
+        if isinstance(production_analysis.get("prompt_bible"), dict) else {})
+    visual_bible = (
+        production_analysis.get("visual")
+        if isinstance(production_analysis.get("visual"), dict) else {})
+    seedance_master = str(
+        prompt_bible.get("seedance_prefix") or "").strip()
     scenes = _scene_map(script)
     normalized = []
     fallback_scene = next(
@@ -647,6 +658,7 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
         micro_expression = "眉眼变化·下颌张力·呼吸节奏"
         performance_goal = raw.get("description") or "完成本镜叙事任务"
         seedance_prompt = (
+            (f"【制作圣经】{seedance_master}。" if seedance_master else "") +
             "【输入】首帧是唯一动作起点，尾帧是唯一动作终点。"
             "【人物编号映射（仅用于提示词引用，不生成画面文字）】"
             f"{numbered_people}；成片严格共{len(characters)}人"
@@ -733,8 +745,12 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
                     "end": end_summary,
                 },
                 "aesthetics": {
-                    "style": style or "项目既定美术风格",
-                    "render": "高反差、暗部保留层次、轻微胶片颗粒",
+                    "style": (visual_bible.get("user_style_constraint")
+                              or style or "项目既定美术风格"),
+                    "render": (visual_bible.get("texture_and_render")
+                               or "高反差、暗部保留层次、轻微胶片颗粒"),
+                    "palette": visual_bible.get("palette") or [],
+                    "lighting": visual_bible.get("lighting") or "",
                     "purpose": "服务事件可读性与角色情绪",
                 },
             },

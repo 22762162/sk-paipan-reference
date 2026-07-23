@@ -13,6 +13,7 @@ from html import escape
 from pathlib import Path
 
 from ..adapters.claude_script import normalize_script_bible
+from ..story_analysis import build_story_analysis
 from .base import Provider, ProviderResult
 from .cinematic import render_cover, render_portrait, render_shot
 
@@ -206,6 +207,16 @@ class MockProvider(Provider):
 
     # ---- 剧本:按题材分流(偶像/都市/校园/仙侠) ----
     def _gen_script(self, payload, out_dir):
+        if payload.get("story_analysis"):
+            analysis = build_story_analysis(
+                payload.get("script") or {}, payload.get("style", ""),
+                source="mock")
+            if payload.get("creative_direction"):
+                analysis["creative_direction"] = payload[
+                    "creative_direction"]
+            uri = _json_artifact(
+                out_dir / "story_analysis.json", analysis)
+            return analysis, uri
         if payload.get("character_design"):
             return self._gen_character_design(payload, out_dir)
         genre = _detect_genre(payload)

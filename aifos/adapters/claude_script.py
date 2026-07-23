@@ -18,6 +18,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from ..story_analysis import STORY_ANALYSIS_SCHEMA, validate_story_analysis
+
 SCRIPT_PROMPT = """你是漫剧编剧。为作品《{title}》第{episode}集创作一集完整剧本。
 风格:{style};本集前提:{premise}。
 
@@ -121,6 +123,8 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
 - `story_world`、`story_background`、非背景角色的 `introduction` 与背景路人的
   `crowd_function` 是硬约束,必须先读取再分镜;不得新增人物表之外的角色,
   不得擅自改时代、组织、能力、技术、物种、性别、年龄段、身份与人物关系;
+- 必须读取 `production_analysis` 制作圣经；逐场继承其中的环境、布局、材质、
+  时段天气、主光方向和提示词前缀；继承全局画风、负面提示词与连续性规则;
 - 每段只承载一个主要动作或一次情绪转折；台词逐字照抄，禁止改写；
 - 每场先给 1 个环境/肢体镜头，再为每句台词给 1 个对白镜头；
 - 关键台词后的听者反应与情绪高潮留白由平台补齐，不要用空镜凑时长；
@@ -138,6 +142,54 @@ JSON 格式:
   "kind": "environment", "description": "...", "camera": "镜头语言",
   "duration": 2.5, "characters": ["角色名"], "dialogue": null,
   "prompt": "文生图提示词"}}]}}"""
+
+STORY_ANALYSIS_PROMPT = """你是 AI 漫剧的编剧、美术指导、摄影指导和连续性导演。
+请完整分析下面的剧本，建立一份在出人物图、场景图、五维分镜、关键帧和
+Seedance 视频前必须锁定的“制作圣经”。
+
+用户明确画风（最高优先级，不得擅自改变）:
+{style}
+用户补充方向:
+{direction}
+当前制作标准（必须遵守）:
+{analysis_rules}
+剧本 JSON:
+{script}
+
+分析规则:
+- 区分“故事时代/世界”与“成片渲染媒介/画风”；现代乙女风禁止古装、汉服、
+  历史建筑和2D平涂；即便故事发生在古代，也不得擅自改变用户指定的渲染媒介;
+- 不得新增人物或改变姓名、性别、年龄、身份、阵营、物种与人物关系;
+- 逐场分析空间功能、入口出口、前中后景、材质道具、时段天气、主光方向、
+  环境声和连续性锚点;
+- 候选图数量固定:主角5、重要配角3、非重要配角1、背景路人0;
+- 输出全局图片、人物、场景、关键帧、Seedance前缀及负面提示词;
+- 台词逐字保护;每段最长15秒;关键台词后有反应镜;高潮有2-4秒留白镜;
+  重要肢体动作独立成镜;不要字幕;可读文字先在关键帧锁定;
+- 只输出一个 JSON 对象，不要解释或 Markdown。
+
+JSON 结构:
+{{"schema":"{schema}","source":"ai","locked":false,
+"narrative":{{"logline":"","genre":"","themes":[],"tone":"",
+"target_audience":"","emotional_arc":"","core_conflict":"",
+"continuity_hooks":""}},
+"world":{{"name":"","overview":"","era_and_location":"",
+"geography_and_climate":"","social_order":"","culture_and_lifestyle":"",
+"technology_and_props":"","hard_rules":"","recurring_motifs":[],
+"forbidden_drift":[]}},
+"visual":{{"user_style_constraint":"逐字保留用户明确画风","medium":"",
+"realism":"","palette":[],"lighting":"","camera_language":"",
+"texture_and_render":"","architecture_and_environment":"",
+"wardrobe_and_styling":"","props_and_graphics":"","forbidden_visuals":[]}},
+"scenes":[{{"scene_no":1,"location":"","story_function":"",
+"environment":"","layout":"","materials_and_props":"","time_weather":"",
+"lighting":"","sound":"","continuity_anchors":[],"prompt_prefix":""}}],
+"characters":[{{"name":"","importance":"主角/重要配角/非重要配角/背景路人",
+"candidate_count":5,"identity_facts":"","visual_direction":"",
+"continuity_anchors":[],"prompt_prefix":""}}],
+"prompt_bible":{{"global_image_prefix":"","negative_prompt":"",
+"character_prefix":"","scene_prefix":"","keyframe_prefix":"",
+"seedance_prefix":"","readable_text_policy":"","continuity_rules":[]}}}}"""
 
 
 def extract_json(text):
@@ -594,6 +646,17 @@ def validate_image_qc(data):
 
 def build_prompt(capability, payload):
     """构造编剧/分镜/人物设定提示词(CLI 桥与 Claude API Provider 共用)。"""
+    if capability == "script" and payload.get("story_analysis"):
+        return STORY_ANALYSIS_PROMPT.format(
+            style=(payload.get("style")
+                   or "未指定；依据剧本分析，不得套用无关默认画风"),
+            direction=(payload.get("creative_direction")
+                       or "无额外补充，以剧本事实为准"),
+            analysis_rules=json.dumps(
+                payload.get("analysis_rules") or {}, ensure_ascii=False),
+            script=json.dumps(payload.get("script", {}),
+                              ensure_ascii=False),
+            schema=STORY_ANALYSIS_SCHEMA)
     if capability == "script" and payload.get("character_design"):
         names = "、".join(
             f"{c.get('name')}({c.get('role') or '角色'})"
@@ -684,6 +747,8 @@ def run(request, claude, timeout):
         return {"ok": False, "error": "claude 输出中未找到 JSON 对象"}
     if capability == "image_qc":
         error = validate_image_qc(data)
+    elif capability == "script" and payload.get("story_analysis"):
+        error = validate_story_analysis(data)
     elif capability == "script":
         error = validate_script(data, payload)
     else:

@@ -609,6 +609,11 @@ def _episode_payload(app, episode_id):
     project = app.db.query_one(
         "SELECT * FROM projects WHERE id=?", (episode["project_id"],))
     script, script_v = app.projects.latest_document(episode_id, "script")
+    story_analysis, story_analysis_v = app.projects.latest_document(
+        episode_id, "story_analysis")
+    if script is not None and story_analysis is not None:
+        from ..story_analysis import apply_story_analysis
+        script = apply_story_analysis(copy.deepcopy(script), story_analysis)
     storyboard, sb_v = app.projects.latest_document(episode_id, "storyboard")
     continuity, continuity_v = app.projects.latest_document(
         episode_id, "continuity")
@@ -705,6 +710,8 @@ def _episode_payload(app, episode_id):
         "tasks": tasks,
         "script": script,
         "script_version": script_v,
+        "story_analysis": story_analysis,
+        "story_analysis_version": story_analysis_v,
         "storyboard": storyboard,
         "storyboard_version": sb_v,
         "continuity": continuity,
@@ -1021,6 +1028,8 @@ def make_handler(workspace, jobs):
                     return self._video_references()
                 if parsed.path == "/api/project/style":
                     return self._project_style()
+                if parsed.path == "/api/story-analysis":
+                    return self._story_analysis()
                 if parsed.path == "/api/project/rename":
                     return self._project_rename()
                 if parsed.path == "/api/stop":
@@ -1481,6 +1490,13 @@ def make_handler(workspace, jobs):
                 return self._error(
                     409, f"本集当前处于「{status}」，不能重复确认；"
                     "请刷新查看当前生产进度")
+            if status == "awaiting_script":
+                try:
+                    self._with_app(
+                        lambda app: app.director.lock_story_analysis(
+                            found_episode_id))
+                except AifosError as exc:
+                    return self._error(409, str(exc))
             revision_state = self._with_app(
                 lambda app: app.projects.latest_document(
                     found_episode_id, "shot_revision_state")[0])
@@ -1808,6 +1824,51 @@ def make_handler(workspace, jobs):
             return self._json({"status": "cancelling",
                                "previous": episode["status"],
                                "run_ids": [j.get("run_id") for j in active]})
+
+        def _story_analysis(self):
+            """保存、锁定或重新运行剧本 AI 制作圣经。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            episode_id = int(body["episode_id"])
+            action = str(body.get("action") or "save").strip()
+            if action == "reanalyze":
+                if jobs.running_for(title, number):
+                    return self._error(409, "本集已有任务正在运行")
+                direction = str(
+                    body.get("creative_direction") or "").strip()
+                job_id = jobs.start_task(
+                    title, number,
+                    lambda app, run_id: app.director.reanalyze_story(
+                        title, number, direction, run_id=run_id),
+                    action="reanalyze_story",
+                    request={"creative_direction": direction},
+                    unique=True)
+                return self._json({"job_id": job_id}, status=202)
+            try:
+                if action == "lock":
+                    result = self._with_app(
+                        lambda app: app.director.lock_story_analysis(
+                            episode_id))
+                elif action == "save":
+                    analysis = body.get("analysis")
+                    if not isinstance(analysis, dict):
+                        return self._error(400, "缺少 analysis 制作圣经")
+                    result = self._with_app(
+                        lambda app: app.director.save_story_analysis(
+                            episode_id, analysis,
+                            expected_version=body.get("expected_version"),
+                            locked=bool(body.get("locked", False))))
+                else:
+                    return self._error(
+                        400, "action 仅支持 save / lock / reanalyze")
+            except AifosError as exc:
+                return self._error(409, str(exc))
+            return self._json(result)
 
         def _project_style(self):
             """画风确认:{project, style}。剧本确认页在开画前设定,

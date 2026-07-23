@@ -87,6 +87,9 @@ def test_index_and_static(server):
     assert "始终只激活一集".encode() in app_js
     assert b"/api/character/select" in app_js
     assert b"/api/character/regenerate" in app_js
+    assert b"/api/story-analysis" in app_js
+    assert "世界观、环境与视觉制作圣经".encode() in app_js
+    assert "锁定制作圣经并开始人物图".encode() in app_js
     assert b"/api/asset/delete" in app_js
     assert b"/api/history/delete" in app_js
     assert b"history-delete-row" in app_js
@@ -495,6 +498,9 @@ def test_produce_flow_and_episode_api(server):
     status, pre = _json_request(port, "GET", f"/api/episode/{episode_id}")
     assert status == 200
     assert pre["script"]["scenes"]
+    assert pre["story_analysis"]["schema"] == "aifos.story-analysis/v1"
+    assert pre["story_analysis"]["prompt_bible"]["global_image_prefix"]
+    assert pre["script"]["production_analysis"]["scenes"]
     assert pre["storyboard"] is None
     assert pre["artifacts"]["cast_art"] == []
 
