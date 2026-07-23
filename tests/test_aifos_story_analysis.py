@@ -9,6 +9,7 @@ from aifos.story_analysis import (
     STORY_ANALYSIS_SCHEMA,
     apply_story_analysis,
     build_story_analysis,
+    infer_story_visual_context,
     validate_story_analysis,
 )
 
@@ -49,6 +50,66 @@ def test_analysis_locks_user_style_and_builds_prompt_bible(script):
             "face_closeup", "front", "profile", "back"]
     assert "15秒" in analysis["prompt_bible"]["seedance_prefix"]
     assert validate_story_analysis(analysis) is None
+
+
+def test_history_story_builds_its_own_style_without_modern_or_2d_default():
+    historical = {
+        "project_title": "大明",
+        "episode_number": 1,
+        "episode_title": "乾清宫急报",
+        "logline": "崇祯命太子守住京城",
+        "characters": [
+            {"name": "朱慈烺", "role": "主角"},
+            {"name": "崇祯", "role": "重要配角"},
+        ],
+        "scenes": [{
+            "scene_no": 1, "location": "乾清宫",
+            "characters": ["朱慈烺", "崇祯"],
+            "action": "王承恩捧着奏折奔入殿内",
+            "lines": [
+                {"character": "朱慈烺", "dialogue": "父皇，儿臣请战！"},
+                {"character": "崇祯", "dialogue": "守住城门。"},
+            ],
+        }],
+    }
+    context = infer_story_visual_context(historical)
+    analysis = build_story_analysis(historical)
+    assert context["key"] == "ming_history"
+    assert "明代" in analysis["world"]["era_and_location"]
+    assert "明代历史题材" in analysis["visual"]["user_style_constraint"]
+    assert analysis["visual"]["style_source"] == "ai_inferred"
+    assert "2D" not in analysis["visual"]["user_style_constraint"]
+    assert "现代乙女" not in analysis["visual"]["user_style_constraint"]
+    assert "清代服饰" in analysis["visual"]["forbidden_visuals"]
+    assert validate_story_analysis(analysis) is None
+
+
+def test_blank_project_style_is_inferred_from_full_imported_script(tmp_path):
+    from aifos.script_import import parse_text_script
+
+    imported = parse_text_script(
+        "朱慈烺说道：“父皇，儿臣请战！”\n"
+        "“守住大明城门。”崇祯沉声道。",
+        "大明", 1)
+    app = App(tmp_path / "ws-auto-style")
+    try:
+        summary = app.director.produce(
+            "大明", 1, script=imported, pause_for_confirm=True)
+        assert summary["status"] == "awaiting_script"
+        project = app.projects.get_project("大明")
+        # 自动结果不伪装成人工项目锁定风格；本集制作圣经才是事实源。
+        assert project["style"] == ""
+        episode = app.db.query_one(
+            "SELECT * FROM episodes WHERE project_id=? AND number=1",
+            (project["id"],))
+        analysis, _ = app.projects.latest_document(
+            episode["id"], "story_analysis")
+        assert analysis["visual"]["style_source"] == "ai_inferred"
+        assert "明代历史题材" in analysis["visual"][
+            "user_style_constraint"]
+        assert analysis["project_style"] == ""
+    finally:
+        app.close()
 
 
 def test_analysis_is_injected_into_all_downstream_prompt_context(script):

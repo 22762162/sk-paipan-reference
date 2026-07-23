@@ -7,6 +7,9 @@ from datetime import datetime, timezone
 
 
 STORY_ANALYSIS_SCHEMA = "aifos.story-analysis/v1"
+_GENERIC_ERA_MARKERS = (
+    "以剧本明示为准", "未明示", "由本集剧情", "由剧情决定", "待分析",
+)
 
 
 def _text(value, fallback=""):
@@ -41,6 +44,9 @@ def _genre(script):
                  if isinstance(scene, dict)),
     ))
     for tokens, label in (
+        (("大明", "明朝", "大唐", "唐朝", "大宋", "宋朝", "大清",
+          "清朝", "皇帝", "太子", "陛下", "朝堂"), "历史 / 权谋"),
+        (("民国", "旧上海", "军阀", "租界"), "民国 / 年代"),
         (("仙侠", "修仙", "宗门", "妖", "灵力"), "东方幻想 / 仙侠"),
         (("乙女", "恋爱", "暧昧", "心动"), "现代乙女 / 情感"),
         (("校园", "高中", "大学", "社团"), "青春校园"),
@@ -51,6 +57,153 @@ def _genre(script):
         if any(token in blob for token in tokens):
             return label
     return "剧情向精品漫剧"
+
+
+def _story_blob(script):
+    parts = [
+        _text(script.get("project_title")),
+        _text(script.get("episode_title")),
+        _text(script.get("logline")),
+    ]
+    story_world = _dict(script.get("story_world"))
+    story_background = _dict(script.get("story_background"))
+    parts.extend(_text(value) for value in story_world.values())
+    parts.extend(_text(value) for value in story_background.values())
+    for character in script.get("characters", []):
+        if isinstance(character, dict):
+            parts.extend(_text(character.get(key)) for key in (
+                "name", "role", "identity", "occupation", "backstory"))
+    for scene in script.get("scenes", []):
+        if not isinstance(scene, dict):
+            continue
+        parts.extend((_text(scene.get("location")), _text(scene.get("action"))))
+        for line in scene.get("lines", []):
+            if isinstance(line, dict):
+                parts.extend((
+                    _text(line.get("character")),
+                    _text(line.get("dialogue")),
+                ))
+    return " ".join(parts)
+
+
+def _has_any(text, tokens):
+    return any(token in text for token in tokens)
+
+
+def infer_story_visual_context(script):
+    """从正文证据推导世界和制作风格,不把媒介或古今写死。
+
+    这是 AI Provider 不可用时的确定性底座。在线 AI 可以给出更细分析,
+    但同样必须服从剧本中的朝代、地域、人物阶层和物质文化证据。
+    """
+    text = _story_blob(_dict(script))
+    contexts = (
+        {
+            "key": "ming_history",
+            "tokens": ("大明", "明朝", "洪武", "永乐", "嘉靖", "万历",
+                       "崇祯", "乾清宫", "锦衣卫", "东厂"),
+            "era": "中国明代；具体年份、地域与政局以剧本证据为准",
+            "style": (
+                "明代历史题材自适应制作风格；以史料和剧本身份关系为依据，"
+                "人物骨相、冠帽发式、服装制度、礼仪、兵器、建筑与器物符合"
+                "明代及人物阶层；色彩、光线、镜头和写实程度随剧情气质设计"),
+            "medium": "考据型电影感漫剧；写实程度由剧情与目标观众共同决定",
+            "palette": ["明代物质文化色彩", "身份阶层配色", "剧情情绪重点色"],
+            "forbidden": ["清代服饰", "唐宋服饰混搭", "现代物件",
+                          "仙侠法术乱入", "无史料依据的宫殿与礼制"],
+        },
+        {
+            "key": "republican",
+            "tokens": ("民国", "旧上海", "军阀", "租界", "黄包车", "月份牌"),
+            "era": "中国民国时期；城市、年份与阵营按剧本证据细化",
+            "style": (
+                "民国年代题材自适应制作风格；服装、发型、街景、交通、"
+                "室内陈设和社会阶层符合具体年代与地域，影像气质服从剧情"),
+            "medium": "年代电影感漫剧；材质和写实度根据故事情绪确定",
+            "palette": ["年代环境本色", "人物阵营配色", "克制的情绪重点色"],
+            "forbidden": ["现代电子设备", "跨年代服装", "古代宫廷混入"],
+        },
+        {
+            "key": "historical",
+            "tokens": ("皇帝", "陛下", "太子", "王爷", "朝堂", "奏折",
+                       "宫门", "大殿", "县衙", "将军", "城门", "诏书"),
+            "era": "中国历史时期；朝代、地域和制度必须从剧本继续核定",
+            "style": (
+                "历史题材自适应制作风格；先核定朝代与地域，再设计人物骨相、"
+                "服制、发式、礼仪、建筑、器物和军政制度；不得用通用古装模板"),
+            "medium": "考据型电影感漫剧；不预设2D、3D或真人化比例",
+            "palette": ["时代材料本色", "阶层身份配色", "冲突情绪重点色"],
+            "forbidden": ["通用影楼古装", "朝代混搭", "现代物件",
+                          "无剧情依据的仙侠元素"],
+        },
+        {
+            "key": "xianxia",
+            "tokens": ("仙侠", "修仙", "灵力", "灵根", "宗门", "渡劫",
+                       "飞剑", "妖丹", "魔尊"),
+            "era": "东方幻想架空世界；宗门、地域、能力和物质规则以剧本为准",
+            "style": (
+                "东方幻想题材自适应制作风格；先建立宗门、种族、能力、"
+                "服装结构和建筑材料规则，再按剧情气质决定写实度与渲染媒介"),
+            "medium": "东方幻想精品漫剧；媒介由世界观和情绪目标推导",
+            "palette": ["阵营识别色", "灵力规则色", "自然材质本色"],
+            "forbidden": ["无规则法术", "宗门造型同质化", "现代都市物件"],
+        },
+        {
+            "key": "science_fiction",
+            "tokens": ("赛博", "星际", "未来", "机甲", "太空站", "仿生人",
+                       "量子", "末世"),
+            "era": "未来或架空科技世界；技术等级、地域与阵营按剧本锁定",
+            "style": (
+                "科幻题材自适应制作风格；技术、装备、交通、建筑和界面遵守"
+                "统一工程逻辑，人物造型由职业、阵营和生存环境推导"),
+            "medium": "电影级科幻漫剧；写实度和材质表现服从世界观",
+            "palette": ["技术体系主色", "阵营识别色", "环境风险色"],
+            "forbidden": ["技术等级漂移", "无功能装饰", "古装元素乱入"],
+        },
+        {
+            "key": "modern",
+            "tokens": ("现代", "都市", "手机", "微信", "直播", "写字楼",
+                       "外卖", "大学", "高中", "咖啡店", "地铁"),
+            "era": "当代社会；城市、季节、职业和生活方式按剧本证据细化",
+            "style": (
+                "当代题材自适应制作风格；人物造型由年龄、职业、阶层、"
+                "生活状态和关系阶段推导，空间与品牌信息符合现实语境"),
+            "medium": "当代电影感精品漫剧；美型程度与剧情气质相匹配",
+            "palette": ["现实环境本色", "人物关系色", "情绪转折重点色"],
+            "forbidden": ["古装", "跨年代物件", "职业服装错误", "模板网红脸"],
+        },
+    )
+    priority = {
+        "ming_history": 0, "republican": 1, "xianxia": 2,
+        "science_fiction": 3, "historical": 4, "modern": 5,
+    }
+    matches = [
+        item for item in contexts if _has_any(text, item["tokens"])]
+    selected = min(
+        matches, key=lambda item: priority[item["key"]]) if matches else None
+    if selected is None:
+        selected = {
+            "key": "story_adaptive",
+            "era": "时代与地域尚待从剧本证据确认，不预设现代或古代",
+            "style": (
+                "剧本自适应制作风格；先分析时代、地域、题材、人物身份与"
+                "阶层、环境材料、情绪和目标观众，再决定写实度、媒介、"
+                "色彩、光线、服化道与镜头语言；不套用固定风格模板"),
+            "medium": "媒介与写实度由剧本分析决定，不预设2D、3D或真人化",
+            "palette": ["故事环境本色", "人物关系色", "剧情情绪重点色"],
+            "forbidden": ["无文本依据的时代设定", "题材模板套用", "风格漂移"],
+        }
+    result = dict(selected)
+    result["basis"] = [
+        token for token in selected.get("tokens", ()) if token in text
+    ][:12]
+    return result
+
+
+def _specific_era(value):
+    value = _text(value)
+    return bool(value) and not any(
+        marker in value for marker in _GENERIC_ERA_MARKERS)
 
 
 def _importance(role):
@@ -202,20 +355,30 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
     raw_prompts = _dict(raw.get("prompt_bible"))
     story_world = _dict(script.get("story_world"))
     story_background = _dict(script.get("story_background"))
-    locked_style = _text(
-        style or raw_visual.get("user_style_constraint"),
-        "剧情自适应、电影级半写实精品漫剧")
+    inferred = infer_story_visual_context(script)
+    requested_style = _text(style)
+    raw_style = _text(raw_visual.get("user_style_constraint"))
+    if raw_style.startswith(("未指定", "自动分析", "AI自动")):
+        raw_style = ""
+    locked_style = requested_style or raw_style or inferred["style"]
+    raw_style_source = _text(raw_visual.get("style_source"))
+    style_source = (
+        "user_override"
+        if requested_style and requested_style != raw_style
+        else raw_style_source or (
+            "user_override" if requested_style else "ai_inferred"))
+    script_era = _text(story_world.get("era_and_location"))
     era = _text(
         raw_world.get("era_and_location")
-        or story_world.get("era_and_location"),
-        "时代与地域以剧本明示为准，未明示部分禁止擅自猜测")
+        or (script_era if _specific_era(script_era) else "")
+        or inferred["era"])
     hard_rules = _text(
         raw_world.get("hard_rules") or story_world.get("hard_rules"),
         "能力、技术、组织、物种、身份与人物关系只以剧本声明为准")
-    forbidden = _list(
+    forbidden = list(dict.fromkeys(_list(
         raw_visual.get("forbidden_visuals")
         or raw_world.get("forbidden_drift"),
-        _default_negative(locked_style))
+        _default_negative(locked_style) + inferred["forbidden"])))
     narrative = {
         "logline": _text(
             raw_narrative.get("logline") or script.get("logline"),
@@ -268,12 +431,15 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
     }
     visual = {
         "user_style_constraint": locked_style,
+        "style_source": style_source,
+        "analysis_basis": _list(
+            raw_visual.get("analysis_basis"), inferred["basis"]),
         "medium": _text(
-            raw_visual.get("medium"), "电影级半写实漫剧画面"),
+            raw_visual.get("medium"), inferred["medium"]),
         "realism": _text(
             raw_visual.get("realism"), "人物结构自然，材质真实，适度美型"),
         "palette": _list(
-            raw_visual.get("palette"), ["主色随剧情空间", "肤色自然", "重点色克制跳出"]),
+            raw_visual.get("palette"), inferred["palette"]),
         "lighting": _text(
             raw_visual.get("lighting"),
             "主光方向固定，人物面部可读，光影参与情绪叙事"),

@@ -1154,17 +1154,19 @@ async function renderDashboard() {
         <button type="button" class="kind-tab" data-kind="idol">💫 虚拟偶像/女团</button>
       </div>
       <input name="sentence" placeholder='写作品名就行,例如:苏念的一天(集数可不写,自动接着做下一集)' required>
-      <input name="premise" placeholder="内容方向,例如:偶像女团 / 都市职场 / 仙侠(可不填)">
+      <input name="premise" placeholder="内容方向或补充要求（可不填，AI 会从剧本自动分析）">
       <label class="style-field">
-        <span>视觉风格</span>
+        <span>视觉制作风格（可选）</span>
         <select name="style" aria-label="视觉风格">
-          <option value="${esc(MODERN_OTOME_STYLE)}" selected>现代乙女 · 3D半写实</option>
+          <option value="" selected>AI 根据剧本自动设计（推荐）</option>
+          <option value="${esc(MODERN_OTOME_STYLE)}">现代乙女 · 3D半写实</option>
           <option value="现代都市电影感，写实人物，现代时装，自然皮肤，电影级灯光；禁止古装、汉服、水墨和2D线稿">现代都市 · 电影写实</option>
           <option value="国风漫剧，精致2D动画质感，服装与建筑严格符合剧情时代，高细节，统一人物造型">国风漫剧 · 2D</option>
         </select>
+        <small>留空时先分析时代、地域、题材、人物阶层、环境和情绪，再生成本剧专属风格。</small>
       </label>
       <label class="style-field independent-style-field">
-        <span>火火漫剧研究室 · 独立风格</span>
+        <span>火火漫剧研究室 · 风格包（可选覆盖）</span>
         <select name="style_pack_id" aria-label="火火独立风格">
           <option value="">不使用独立风格</option>
           ${approvedFireStyles.map((style) =>
@@ -1172,12 +1174,20 @@ async function renderDashboard() {
         </select>
         <small>只作用于本剧，不改写现有画风和硬规则</small>
       </label>
-      <button class="primary" type="submit">生成剧本并 AI 分析</button>
-      <textarea name="script" rows="5" hidden placeholder="把你的剧本粘贴到这里,人物、场次、分镜会自动识别。写法示例:
+      <button class="primary" type="submit" data-produce-submit>生成剧本并 AI 分析</button>
+      <textarea name="script" rows="7" hidden placeholder="可直接粘贴小说正文或标准剧本。支持人物在对白前/后，也支持独立引号对白。例如：
+乾清宫内烛影摇曳。
+朱慈烺咬牙道：“父皇，儿臣请战！”
+“你可知此去凶险？”崇祯沉声问道。
+
+标准剧本也可：
 第1场 古镇长街
 夜色渐深,妖气翻涌。
 林昭:这股妖气不对劲。
 小狐:小心,它就在附近!"></textarea>
+      <div class="produce-hint" data-script-intelligence hidden>
+        小说智能解析：识别引号对白、说话人、人物和动作；对白逐字保留。无法确定的说话人会在剧本审阅页明确标出，不会静默丢弃。
+      </div>
       <div class="series-import-tools" data-series-tools hidden>
         <label class="series-file-picker">
           <span>📚 选择多集剧本文档</span>
@@ -1275,12 +1285,22 @@ async function renderDashboard() {
   form.addEventListener("submit", onProduce);
   app.querySelector("[data-firefire-open]")?.addEventListener(
     "click", () => openFireFireLab(firefire));
+  const syncProduceMode = () => {
+    const scriptMode = !form.script.hidden;
+    const file = form.elements.series_file.files[0];
+    form.querySelector("[data-script-intelligence]").hidden = !scriptMode;
+    form.querySelector("[data-produce-submit]").textContent = file
+      ? "预览并批量导入"
+      : scriptMode ? "智能解析小说 / 剧本并 AI 分析"
+        : "生成剧本并 AI 分析";
+  };
   form.querySelectorAll(".mode-tab").forEach((tab) =>
     tab.addEventListener("click", () => {
       form.querySelectorAll(".mode-tab").forEach((t) =>
         t.classList.toggle("active", t === tab));
       form.script.hidden = tab.dataset.mode !== "script";
       form.querySelector("[data-series-tools]").hidden = tab.dataset.mode !== "script";
+      syncProduceMode();
       if (tab.dataset.mode === "script") form.script.focus();
     }));
   form.querySelectorAll(".kind-tab").forEach((tab) =>
@@ -1295,8 +1315,7 @@ async function renderDashboard() {
     note.textContent = file
       ? `已选择 ${file.name} · ${Math.max(1, Math.round(file.size / 1024))}KB；点“预览并批量导入”检查分集。`
       : "支持 TXT、Markdown、JSON、Word DOCX、PDF；先预览分集，不会直接开始烧图。";
-    const submit = form.querySelector('button[type="submit"]');
-    submit.textContent = file ? "预览并批量导入" : "生成剧本并 AI 分析";
+    syncProduceMode();
   });
   renderProgressBanner(data);
   bindSeriesBatches();
@@ -1399,7 +1418,7 @@ async function previewSeriesImport(form, file) {
           <span class="series-mode ${episode.mode}">${episode.mode === "script" ? "已识别完整剧本" : "剧情梗概 · 将由 AI 按集编剧"}</span></div>
         <p>${esc(episode.excerpt || "")}</p>
         <small>${episode.char_count} 字${episode.mode === "script"
-          ? ` · ${episode.scene_count} 场 · 角色 ${episode.characters.map(esc).join("、") || "待识别"}`
+          ? ` · ${episode.import_analysis?.dialogue_count || 0} 句对白 · ${episode.scene_count} 场 · 角色 ${episode.characters.map(esc).join("、") || "待识别"}`
           : " · 编剧完成后停在剧本审阅，不会直接出图"}</small>
       </article>`).join("")}</div>
     <div class="series-preview-actions">
@@ -1548,7 +1567,9 @@ async function onProduce(ev) {
     showToast(e.message, "error");
     btn.disabled = false;
     btn.textContent = form.elements.series_file?.files?.[0]
-      ? "预览并批量导入" : "生成剧本并 AI 分析";
+      ? "预览并批量导入" : !form.script.hidden
+        ? "智能解析小说 / 剧本并 AI 分析"
+        : "生成剧本并 AI 分析";
   }
 }
 
@@ -5590,9 +5611,22 @@ async function renderCanvasView(episodeId) {
 
 /* ---- 剧本正文(审阅页与生产直播页共用) ---- */
 function scriptBodyHtml(script) {
+  const imported = script.import_analysis || {};
+  const importSummary = imported.dialogue_count ? `
+      <div class="resume-banner">
+        <b>✓ 小说 / 剧本智能解析完成</b>：
+        识别 ${Number(imported.dialogue_count || 0)} 句对白、
+        ${Number(imported.character_count || 0)} 名人物、
+        ${Number(imported.scene_count || 0)} 个场景。
+        ${imported.unresolved_dialogue_count
+          ? `<span class="warn">${Number(imported.unresolved_dialogue_count)} 句说话人待人工核对（已标为“待确认说话人”）。</span>`
+          : "说话人均已识别。"}
+        <span class="dim">对白原文未改写。</span>
+      </div>` : "";
   return `
       <h1>${esc(script.episode_title || "本集剧本")}</h1>
       <p class="logline">${esc(script.logline || "")}</p>
+      ${importSummary}
       ${storyBibleHtml(script)}
       <div class="cast">${(script.characters || []).map((c) =>
         `<span class="chip">${esc(c.name)} · ${esc(c.role || "")}</span>`).join("")}</div>
@@ -5857,6 +5891,8 @@ function storyAnalysisEditorHtml(analysis, version) {
       <button class="primary" id="analysis-retry">AI 重新分析</button></div></section>`;
   const n = analysis.narrative || {}, w = analysis.world || {};
   const v = analysis.visual || {}, p = analysis.prompt_bible || {};
+  const styleSource = v.style_source === "user_override"
+    ? "人工指定" : "AI 根据剧本生成";
   const sceneCards = (analysis.scenes || []).map((scene) => `
     <details class="analysis-scene">
       <summary>场 ${esc(scene.scene_no || "—")} · ${esc(scene.location || "未命名")}</summary>
@@ -5886,7 +5922,7 @@ function storyAnalysisEditorHtml(analysis, version) {
       <label><span>世界硬规则</span><textarea id="analysis-rules">${esc(w.hard_rules || "")}</textarea></label>
       <label><span>社会、组织与生活方式</span><textarea id="analysis-social">${esc([w.social_order, w.culture_and_lifestyle].filter(Boolean).join("；"))}</textarea></label>
       <label><span>技术等级与关键道具</span><textarea id="analysis-tech">${esc(w.technology_and_props || "")}</textarea></label>
-      <label class="wide"><span>用户锁定画风（AI 不得擅自改变）</span>
+      <label class="wide"><span>本剧制作风格 · ${esc(styleSource)}（可调整）</span>
         <textarea id="analysis-style">${esc(v.user_style_constraint || "")}</textarea></label>
       <label><span>色彩与渲染质感</span><textarea id="analysis-palette">${esc([analysisText(v.palette), v.texture_and_render].filter(Boolean).join("；"))}</textarea></label>
       <label><span>光线设计</span><textarea id="analysis-light">${esc(v.lighting || "")}</textarea></label>
@@ -5906,7 +5942,7 @@ function storyAnalysisEditorHtml(analysis, version) {
     <details class="analysis-scenes"><summary>逐场环境分析 · ${(analysis.scenes || []).length} 场</summary>
       <div class="analysis-scene-grid">${sceneCards || "暂无场景分析"}</div></details>
     <div class="analysis-actions">
-      <input id="analysis-direction" placeholder="补充要求，如：保持现代乙女3D，不要古装；雨夜冷调">
+      <input id="analysis-direction" placeholder="可选补充，如：更考据、更克制、雨夜冷调；留空则完全按剧本重建">
       <button id="analysis-rerun">↻ AI 重新分析</button>
       <button id="analysis-save">保存制作圣经</button>
       <button id="analysis-copy">复制全局提示词</button>
@@ -5926,7 +5962,10 @@ function collectStoryAnalysis(analysis) {
   next.world.hard_rules = value("analysis-rules");
   next.world.social_order = value("analysis-social");
   next.world.technology_and_props = value("analysis-tech");
+  const previousStyle = analysis?.visual?.user_style_constraint || "";
   next.visual.user_style_constraint = value("analysis-style");
+  if (next.visual.user_style_constraint !== previousStyle)
+    next.visual.style_source = "user_override";
   next.visual.palette = list(value("analysis-palette"));
   next.visual.lighting = value("analysis-light");
   next.visual.camera_language = value("analysis-camera");
@@ -5944,6 +5983,8 @@ function collectStoryAnalysis(analysis) {
 function renderScriptReview(data, episodeId) {
   const script = data.script;
   const storyAnalysis = data.story_analysis || script.production_analysis || null;
+  const resolvedStyle = storyAnalysis?.visual?.user_style_constraint
+    || data.project.style || "";
   let analysisDraft = storyAnalysis;
   let analysisVersion = Number(data.story_analysis_version || 0);
   const refs = (data.artifacts || {}).references || [];
@@ -5984,12 +6025,12 @@ function renderScriptReview(data, episodeId) {
       <button id="btn-polish">✏️ 打磨剧本(意见重写/直接编辑/上传下载)</button>
     </div>
     <div class="style-panel">
-      <h2>🎨 画风与参考 <span class="dim">开始画图前确认;人物/场景/分镜全部按这里执行</span></h2>
+      <h2>🎨 制作风格与参考 <span class="dim">AI 已按剧本分析；开始画图前可调整</span></h2>
       <div class="style-row">
-        <label>本剧画风</label>
+        <label>本剧制作风格</label>
         <input id="style-input" list="style-presets"
-          value="${esc(data.project.style || "剧情自适应精品漫剧")}"
-          placeholder="如：现代乙女3D半写实；柔光；禁止古装和2D">
+          value="${esc(resolvedStyle)}"
+          placeholder="默认由 AI 根据剧本生成；也可在此人工覆盖">
         <datalist id="style-presets">${STYLE_PRESETS.map((s) =>
           `<option>${esc(s)}</option>`).join("")}</datalist>
         <button id="style-save">保存画风</button>
@@ -6047,7 +6088,11 @@ function renderScriptReview(data, episodeId) {
     if (!analysisDraft) throw new Error("制作圣经尚未生成，请先点 AI 重新分析");
     const style = document.getElementById("style-input").value.trim();
     const styleField = document.getElementById("analysis-style");
-    if (style && styleField) styleField.value = style;
+    if (style && styleField && style !== styleField.value.trim()) {
+      styleField.value = style;
+      analysisDraft.visual ||= {};
+      analysisDraft.visual.style_source = "user_override";
+    }
     const reply = await post("/api/story-analysis", {
       episode_id: data.episode.id, action: "save",
       analysis: collectStoryAnalysis(analysisDraft),

@@ -41,6 +41,45 @@ def test_parse_without_scene_header():
     assert script["scenes"][0]["location"] == "主场景"
 
 
+def test_parse_chinese_novel_dialogue_and_preserve_original_words():
+    source = """大明第一集
+乾清宫内烛影摇曳。
+朱慈烺咬牙道：“父皇，儿臣请战！”
+“你可知此去凶险？”崇祯沉声问道。
+王承恩忙道：“陛下，城门急报。”
+"""
+    script = parse_text_script(source, "大明", 1)
+    lines = script["scenes"][0]["lines"]
+    assert lines == [
+        {"character": "朱慈烺", "dialogue": "父皇，儿臣请战！"},
+        {"character": "崇祯", "dialogue": "你可知此去凶险？"},
+        {"character": "王承恩", "dialogue": "陛下，城门急报。"},
+    ]
+    assert script["import_analysis"] == {
+        "source_format": "novel",
+        "dialogue_count": 3,
+        "explicit_dialogue_count": 3,
+        "inferred_dialogue_count": 0,
+        "unresolved_dialogue_count": 0,
+        "character_count": 3,
+        "scene_count": 1,
+        "dialogue_preserved_verbatim": True,
+    }
+
+
+def test_parse_standalone_novel_dialogue_uses_context_instead_of_dropping_it():
+    source = """苏念说道：“你终于来了。”
+“路上堵车。”顾屿答道。
+“我等了你三年。”
+"""
+    script = parse_text_script(source, "重逢", 1)
+    lines = script["scenes"][0]["lines"]
+    assert [line["dialogue"] for line in lines] == [
+        "你终于来了。", "路上堵车。", "我等了你三年。"]
+    assert lines[2]["character"] in {"苏念", "顾屿"}
+    assert script["import_analysis"]["unresolved_dialogue_count"] == 0
+
+
 def test_parse_rejects_no_dialogue():
     with pytest.raises(ScriptImportError):
         parse_text_script("只有描写没有台词", "T", 1)

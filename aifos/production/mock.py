@@ -509,6 +509,10 @@ class MockProvider(Provider):
         villain = _pick(flavor["villains"], seed, 3)
         locations = [_pick(flavor["locations"], seed, 4 + i)
                      for i in range(3)]
+        # 占位故事也要至少有一个可复用场景，确保场景母图达到正式参考质量，
+        # 后续关键帧能实际携带空间基准图而不是只在文字里声称“保持一致”。
+        if len(set(locations)) == len(locations):
+            locations[-1] = locations[0]
         fmt = dict(hero=hero, partner=partner, villain=villain,
                    title=title, number=number)
         logline = (flavor["logline"].format(loc=locations[0], **fmt)

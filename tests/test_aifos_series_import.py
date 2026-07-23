@@ -49,6 +49,21 @@ def test_split_and_classify_script_vs_outline():
     assert parsed["episodes"][1]["script"] is None
 
 
+def test_novel_dialogue_is_classified_as_script_not_outline():
+    novel = """第1集 宫门急报
+乾清宫内，王承恩快步入殿。
+朱慈烺咬牙道：“父皇，儿臣请战！”
+“你可知此去凶险？”崇祯沉声问道。
+"""
+    parsed = parse_series_document(
+        "大明小说.txt", novel.encode(), "大明", start_number=1)
+    episode = parsed["episodes"][0]
+    assert episode["mode"] == "script"
+    assert episode["import_analysis"]["source_format"] == "novel"
+    assert episode["import_analysis"]["dialogue_count"] == 2
+    assert episode["characters"] == ["朱慈烺", "崇祯"]
+
+
 def test_docx_and_json_series_are_supported():
     raw = _docx_bytes(SERIES_TEXT.splitlines())
     text, kind, digest = extract_document("series.docx", raw)

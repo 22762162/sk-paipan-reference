@@ -21,9 +21,12 @@ from pathlib import Path
 from ..story_analysis import STORY_ANALYSIS_SCHEMA, validate_story_analysis
 
 SCRIPT_PROMPT = """你是漫剧编剧。为作品《{title}》第{episode}集创作一集完整剧本。
-风格:{style};本集前提:{premise}。
+制作风格输入:{style};本集前提:{premise}。
 
 要求:
+- 若制作风格输入为“未指定”,必须先从题材、时代、地域、人物阶层、物质文化、
+  情绪和目标观众推导本剧专属视觉基准；不得默认套用现代乙女、国风、古装、
+  2D、3D或半写实模板;
 - 3 到 5 场戏,每场 2-4 句台词,适合 1-2 分钟短剧;
 - 台词口语化,单句不超过 25 个字;
 - 写场次前必须先建立 `story_world` 世界设定、`story_background` 故事前情和
@@ -176,7 +179,7 @@ STORY_ANALYSIS_PROMPT = """你是 AI 漫剧的编剧、美术指导、摄影指�
 请完整分析下面的剧本，建立一份在出人物图、场景图、五维分镜、关键帧和
 Seedance 视频前必须锁定的“制作圣经”。
 
-用户明确画风（最高优先级，不得擅自改变）:
+制作风格输入（明确填写时为覆盖项；未指定时必须依据剧本自动设计）:
 {style}
 用户补充方向:
 {direction}
@@ -186,8 +189,12 @@ Seedance 视频前必须锁定的“制作圣经”。
 {script}
 
 分析规则:
-- 区分“故事时代/世界”与“成片渲染媒介/画风”；现代乙女风禁止古装、汉服、
-  历史建筑和2D平涂；即便故事发生在古代，也不得擅自改变用户指定的渲染媒介;
+- 先从全文提取时代、地域、社会秩序、人物身份与阶层、环境材料、服化道、
+  题材、情绪弧和目标观众，再建立适合本剧的制作风格;
+- 区分“故事时代/世界”与“成片渲染媒介/画风”。用户明确填写风格时保留其
+  媒介诉求，但服装、建筑、器物和社会规则仍须符合故事世界;
+- 用户未指定时，不得默认套用现代乙女、国风、古装、2D、3D、半写实或
+  任何固定模板；历史题材要先核定朝代与地域，不得使用通用影楼古装或朝代混搭;
 - 不得新增人物或改变姓名、性别、年龄、身份、阵营、物种与人物关系;
 - 逐场分析空间功能、入口出口、前中后景、材质道具、时段天气、主光方向、
   环境声和连续性锚点;
@@ -213,7 +220,8 @@ JSON 结构:
 "geography_and_climate":"","social_order":"","culture_and_lifestyle":"",
 "technology_and_props":"","hard_rules":"","recurring_motifs":[],
 "forbidden_drift":[]}},
-"visual":{{"user_style_constraint":"逐字保留用户明确画风","medium":"",
+"visual":{{"user_style_constraint":"明确风格则保留；未指定则写入根据剧本生成的本剧制作风格",
+"style_source":"user_override或ai_inferred","analysis_basis":["时代/地域/题材等文本证据"],"medium":"",
 "realism":"","palette":[],"lighting":"","camera_language":"",
 "texture_and_render":"","architecture_and_environment":"",
 "wardrobe_and_styling":"","props_and_graphics":"","forbidden_visuals":[]}},
@@ -306,7 +314,9 @@ def normalize_script_bible(script, payload=None):
     title = (script.get("project_title")
              or payload.get("project_title") or "本剧")
     premise = payload.get("premise") or script.get("logline") or "本集剧情"
-    style = payload.get("style") or "以项目已锁定画风为准"
+    style = (
+        payload.get("style")
+        or "待 AI 根据剧本全文生成的本剧专属制作风格")
     scenes = script.get("scenes") or []
     locations = "、".join(dict.fromkeys(
         scene.get("location") for scene in scenes
@@ -765,7 +775,8 @@ def build_prompt(capability, payload):
                 "以参考图为准,不得凭空想象;脸和发型不得漂移;服装可按剧情另行设计。\n")
         return DESIGN_PROMPT.format(
             title=payload.get("project_title", ""),
-            style=payload.get("style", "") or "国风漫剧",
+            style=(payload.get("style", "")
+                   or "未指定；以本集制作圣经和剧本世界自动分析结果为准"),
             logline=payload.get("logline", "") or "见角色名单",
             premise=payload.get("premise", "") or "见本集剧本",
             names=names,
@@ -789,13 +800,15 @@ def build_prompt(capability, payload):
                 persona=payload.get("persona")
                 or payload.get("project_title", ""),
                 episode=payload.get("episode_number", 0),
-                style=payload.get("style", "") or "元气少女",
+                style=(payload.get("style", "")
+                       or "未指定；按人设、主题和舞台语境自动设计"),
                 premise=payload.get("premise", "") or "自选一个日常主题")
         else:
             prompt = SCRIPT_PROMPT.format(
                 title=payload.get("project_title", ""),
                 episode=payload.get("episode_number", 0),
-                style=payload.get("style", "") or "国风漫剧",
+                style=(payload.get("style", "")
+                       or "未指定；根据剧本自动分析，不套用固定画风"),
                 premise=payload.get("premise", "") or "自由发挥")
         if feedback:
             previous = json.dumps(
