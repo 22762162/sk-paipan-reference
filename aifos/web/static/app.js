@@ -2250,6 +2250,121 @@ function bindRegen(container, episodeId, getData, onDone) {
   });
 }
 
+/* 分镜生产表内直接修图：不再返回图片清单或画布侧栏找镜头。 */
+function shotInlineRevisionHtml(shotNo, hasImage, productionActive = false) {
+  if (!hasImage) return `<small class="shot-inline-revision-note">关键帧生成后可在此直接修改</small>`;
+  const target = { kind: "shot", shot_no: Number(shotNo) };
+  return `<details class="shot-inline-revision"
+    data-target="${esc(JSON.stringify(target))}"
+    data-production-active="${productionActive ? "1" : "0"}">
+    <summary class="shot-revision-toggle">✏️ 直接修改此图</summary>
+    <div class="shot-revision-form">
+      <textarea rows="3" class="shot-revision-feedback"
+        placeholder="必填：指出错误和正确画面，例如“程沐应为女性，脸和发型严格参考已锁定立绘；保持当前机位”"></textarea>
+      ${qualitySelectHtml("shot-revision-quality")}
+      <div class="shot-revision-actions">
+        <button type="button" class="shot-revision-ref">📎 添加参考图</button>
+        <button type="button" class="shot-revision-upload">⬆ 上传修好图片</button>
+        <button type="button" class="primary shot-revision-go">${
+          productionActive ? "暂停并修改" : "修改并同步后续"}</button>
+      </div>
+      <small>新图会自动同步本镜及同场后续首尾帧、Seedance 手选参考；
+        旧镜头视频、旧成片和旧质检自动失效，历史版本仍保留。</small>
+    </div>
+  </details>`;
+}
+
+async function waitForShotRevisionCheckpoint(
+  episodeId, projectTitle, episodeNumber, timeoutMs = 120000) {
+  const deadline = Date.now() + timeoutMs;
+  const stable = new Set(["awaiting_script", "awaiting_cast", "awaiting_confirm",
+    "done", "failed", "qc_failed", "created"]);
+  while (Date.now() < deadline) {
+    const [current, jobs] = await Promise.all([
+      api(`/api/episode/${episodeId}`), api("/api/jobs"),
+    ]);
+    const busy = jobs.some((job) => job.status === "running"
+      && job.title === projectTitle
+      && Number(job.episode) === Number(episodeNumber));
+    if (stable.has(current.episode.status) && !busy) return current;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  throw new Error("暂停尚未完成，请稍后在本镜继续修改");
+}
+
+function bindShotInlineRevisions(root, data) {
+  root.querySelectorAll(".shot-inline-revision").forEach((box) => {
+    const target = JSON.parse(box.dataset.target);
+    const form = box.querySelector(".shot-revision-form");
+    const refBtn = box.querySelector(".shot-revision-ref");
+    refBtn.onclick = (event) => {
+      event.stopPropagation();
+      uploadRegenReference(data.episode.id, target, refBtn);
+    };
+    box.querySelector(".shot-revision-upload").onclick = (event) => {
+      event.stopPropagation();
+      if (box.dataset.productionActive === "1") {
+        showToast("正在生产时请使用“暂停并修改”，或先暂停后上传修好图片", "error");
+        return;
+      }
+      uploadFile(data.episode.id, target, "image/*",
+        () => renderCanvasView(data.episode.id));
+    };
+    const go = box.querySelector(".shot-revision-go");
+    go.onclick = async (event) => {
+      event.stopPropagation();
+      const feedback = form.querySelector(".shot-revision-feedback").value.trim();
+      if (!feedback) {
+        showToast("请先写清楚这张分镜哪里错、要改成什么", "error");
+        form.querySelector("textarea").focus();
+        return;
+      }
+      const original = go.textContent;
+      go.disabled = true;
+      try {
+        if (box.dataset.productionActive === "1") {
+          go.textContent = "正在安全暂停…";
+          try {
+            await api("/api/stop", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ episode_id: data.episode.id }),
+            });
+          } catch (error) {
+            // 任务可能恰好在点击时结束；以随后读取到的稳定状态为准。
+          }
+          await waitForShotRevisionCheckpoint(
+            data.episode.id, data.project.title, data.episode.number);
+        }
+        go.textContent = "正在重画并同步…";
+        const reply = await api("/api/regen_image", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            episode_id: data.episode.id, target, feedback,
+            quality: form.querySelector(".shot-revision-quality").value,
+          }),
+        });
+        pollJob(reply.job_id, (job) => {
+          if (job.status === "done") {
+            const sync = (job.summary || {}).sync || {};
+            const frameCount = (sync.frame_shots || []).length;
+            const videoCount = (sync.invalidated_video_shots || []).length;
+            showToast(
+              `镜头${target.shot_no}已修改；同步${frameCount}个镜头帧链，`
+              + `标记${videoCount}个视频待重拍`, "ok");
+            renderCanvasView(data.episode.id);
+          } else {
+            showToast("修改失败：" + (job.error || "未知错误"), "error");
+            go.disabled = false; go.textContent = original;
+          }
+        });
+      } catch (error) {
+        showToast(error.message, "error");
+        go.disabled = false; go.textContent = original;
+      }
+    };
+  });
+}
+
 /* ================= 图片生产清单 =================
    每张要生成的图:分类/名称/提示词/实时状态;可单张改提示词重画 */
 const PLAN_CAT_CN = {
@@ -4554,6 +4669,10 @@ async function renderCanvasView(episodeId) {
   });
 
   const awaiting = ep.status === "awaiting_confirm";
+  const revisionState = data.shot_revision_state || {};
+  const revisedShot = revisionState.active ? revisionState.shot_no : null;
+  const preflightReady = !!data.preflight?.passed
+    && revisionState.formal_ready !== false;
   const profile = data.production_profile || {};
   const videoDefault = (data.quality_policy || {}).video_default || "auto";
   const gates = data.preflight?.gates || [];
@@ -4575,9 +4694,18 @@ async function renderCanvasView(episodeId) {
     ${awaiting ? `
     <div class="confirm-banner">
       <div>
-        <b>${data.preflight?.passed ? `${gates.length} 项生产门禁通过，请做最终视觉确认` : "生产门禁未通过"}</b>
-        <span>角色/场景连续性、五维分镜、文字关键帧、首尾帧和即梦配置均已机检。
-        确认后才会消耗 Seedance 额度；成片仍须通过检查板、内容复核与交付脚本。</span>
+        <b>${revisedShot != null
+          ? revisionState.formal_ready === false
+            ? `镜头 ${revisedShot} 当前是低质量试错版，不能交给 Seedance`
+            : `镜头 ${revisedShot} 已更新，相关旧视频和旧成片已自动作废`
+          : preflightReady
+            ? `${gates.length} 项生产门禁通过，请做最终视觉确认`
+            : "生产门禁未通过"}</b>
+        <span>${revisedShot != null
+          ? revisionState.formal_ready === false
+            ? "请直接在下方分镜表把本镜改用中/高质量重画；低质量图只用于试错，确认按钮不会放行。"
+            : "新关键帧、同场首尾帧链和 Seedance 手选参考已经同步；现在只需确认一次，系统只重拍受影响镜头，再重剪与复检。"
+          : "角色/场景连续性、五维分镜、文字关键帧、首尾帧和即梦配置均已机检。确认后才会消耗 Seedance 额度；成片仍须通过检查板、内容复核与交付脚本。"}</span>
         <label class="video-quality-choice">Seedance 质量
           <select id="seedance-quality">
             <option value="auto" ${videoDefault === "auto" ? "selected" : ""}>自动 · 中档 720P（默认）</option>
@@ -4587,7 +4715,8 @@ async function renderCanvasView(episodeId) {
           </select>
         </label>
       </div>
-      <button class="primary" id="btn-confirm" ${data.preflight?.passed ? "" : "disabled"}>✅ 确认,开始 Seedance 生产</button>
+      <button class="primary" id="btn-confirm" ${preflightReady ? "" : "disabled"}>${
+        revisedShot != null ? "✅ 确认，只重拍受影响镜头" : "✅ 确认,开始 Seedance 生产"}</button>
     </div>
     ${videoReferencePanelHtml(data)}` : ""}
     <div class="profile-strip">
@@ -4692,7 +4821,9 @@ async function renderCanvasView(episodeId) {
     } catch (e) {
       showToast(e.message, "error");
       btnConfirm.disabled = false;
-      btnConfirm.textContent = "✅ 确认,开始生产";
+      btnConfirm.textContent = revisedShot != null
+        ? "✅ 确认，只重拍受影响镜头"
+        : "✅ 确认,开始 Seedance 生产";
     }
   };
   // 制作进行中自动刷新画布(待确认是稳定状态,不轮询)
@@ -4710,6 +4841,7 @@ async function renderCanvasView(episodeId) {
   const timelineEl = document.getElementById("timeline");
   const btnTheater = document.getElementById("view-theater");
   const btnCanvas = document.getElementById("view-canvas");
+  const sidepanelEl = document.getElementById("sidepanel");
   const setView = (mode) => {
     localStorage.setItem("aifos.view", mode);
     const theaterMode = mode !== "canvas";
@@ -4718,6 +4850,8 @@ async function renderCanvasView(episodeId) {
     timelineEl.hidden = theaterMode;
     btnTheater.classList.toggle("active", theaterMode);
     btnCanvas.classList.toggle("active", !theaterMode);
+    if (window.matchMedia("(max-width: 780px)").matches)
+      sidepanelEl.hidden = theaterMode;
     if (!theaterMode) canvas.fit();
   };
   btnTheater.onclick = () => setView("theater");
@@ -5338,7 +5472,9 @@ function shotProductionTableHtml(data, options = {}) {
           <td class="storyboard-duration" data-label="时长">
             <b>${fmt(shot.duration, 1)}s</b><span>${esc(shot.timecode || "时间码未填")}</span></td>
           <td class="storyboard-reference" data-label="参考分镜">
-            ${storyboardMediaThumb((art.images || {})[no], "参考分镜", no, imageState)}</td>
+            ${storyboardMediaThumb((art.images || {})[no], "参考分镜", no, imageState)}
+            ${shotInlineRevisionHtml(
+              no, !!(art.images || {})[no], context === "live")}</td>
           <td class="storyboard-frames" data-label="首尾帧"><div class="storyboard-frame-pair">
             ${storyboardMediaThumb((art.first || {})[no], "首帧", no, frameState)}
             ${storyboardMediaThumb((art.last || {})[no], "尾帧", no, frameState)}
@@ -5362,7 +5498,7 @@ function shotProductionTableHtml(data, options = {}) {
   return `<section class="shot-production-section ${aspectClass}" data-shot-table-context="${esc(context)}">
     <div class="shot-production-heading">
       <div><h2>📋 分镜头生产表</h2>
-        <p>逐镜核对参考分镜、首尾帧、运镜、画面、声音和生产门禁。</p></div>
+        <p>逐镜核对；发现错误可在参考分镜下直接修改并同步后续，不用退回图片清单。</p></div>
       <div class="shot-production-progress">
         <span>参考分镜 ${completeImages}/${shots.length}</span>
         <span>首尾帧 ${completeFrames}/${shots.length}</span>
@@ -5395,6 +5531,7 @@ function shotProductionTableHtml(data, options = {}) {
 }
 
 function bindShotProductionTable(root, data, onSelect) {
+  bindShotInlineRevisions(root, data);
   root.querySelectorAll(".storyboard-media-button").forEach((button) => {
     button.onclick = (event) => {
       event.stopPropagation();
@@ -5416,7 +5553,8 @@ function bindShotProductionTable(root, data, onSelect) {
   if (onSelect) root.querySelectorAll(".storyboard-table-row").forEach((row) => {
     row.tabIndex = 0;
     row.onclick = (event) => {
-      if (event.target.closest("button, a, details, summary")) return;
+      if (event.target.closest(
+        "button, a, details, summary, input, textarea, select, label")) return;
       onSelect(Number(row.dataset.shot));
     };
     row.onkeydown = (event) => {
@@ -5501,7 +5639,19 @@ function renderTheater(data, canvas) {
   el.querySelector("#hero-rename").onclick = () =>
     renameProject(data.project.title,
       () => renderCanvasView(data.episode.id));
-  bindShotProductionTable(el, data, (shotNo) => canvas.select(shotNo));
+  bindShotProductionTable(el, data, (shotNo) => {
+    canvas.select(shotNo);
+    if (window.matchMedia("(max-width: 780px)").matches) {
+      const panel = document.getElementById("sidepanel");
+      panel.hidden = false;
+      const close = document.createElement("button");
+      close.type = "button";
+      close.className = "sidepanel-mobile-close";
+      close.textContent = "× 关闭镜头详情";
+      close.onclick = () => { panel.hidden = true; };
+      panel.prepend(close);
+    }
+  });
 }
 
 class StoryboardCanvas {

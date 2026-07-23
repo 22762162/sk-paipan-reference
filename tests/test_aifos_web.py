@@ -11,7 +11,7 @@ import pytest
 
 from aifos.app import App
 from aifos.director import character_candidate_target
-from aifos.web.server import serve
+from aifos.web.server import JobRegistry, serve
 
 
 @pytest.fixture()
@@ -61,8 +61,8 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260723-asset-board" in html
-    assert "/static/app.js?v=20260723-asset-board" in html
+    assert "/static/style.css?v=20260723-shot-inline-revision" in html
+    assert "/static/app.js?v=20260723-shot-inline-revision" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -126,6 +126,10 @@ def test_index_and_static(server):
     assert b"missing-keyframe" in app_js
     assert b"missing-frames" in app_js
     assert b"missing-video" in app_js
+    assert "直接修改此图".encode() in app_js
+    assert "暂停并修改".encode() in app_js
+    assert "修改并同步后续".encode() in app_js
+    assert b"bindShotInlineRevisions(root, data)" in app_js
     assert b"storyboardLineNo(data, shot)" in app_js
     status, ctype, style_css = _request(
         server["port"], "GET", "/static/style.css")
@@ -142,6 +146,8 @@ def test_index_and_static(server):
     assert b".storyboard-table-row" in style_css
     assert b".storyboard-frame-pair" in style_css
     assert b".storyboard-status-stack" in style_css
+    assert b".shot-inline-revision" in style_css
+    assert b".shot-revision-form" in style_css
     assert b".background-cast-note" in style_css
     status, ctype, raw = _request(
         server["port"], "GET", "/manifest.webmanifest")
@@ -155,6 +161,36 @@ def test_index_and_static(server):
     assert status == 200 and "javascript" in ctype
     assert b"aifos-mobile-shell-v3" in raw
     assert b'/static/app.js' in raw and b'fetch(request)' in raw
+
+
+def test_job_registry_unique_reuses_running_episode(tmp_path):
+    """多标签重复确认必须复用同一任务，不新增历史或重复烧额度。"""
+    workspace = tmp_path / "ws"
+    App(workspace).close()
+    jobs = JobRegistry(workspace)
+    release = threading.Event()
+
+    def slow_task(app, run_id):
+        assert release.wait(5)
+        return {"status": "done"}
+
+    first = jobs.start_task(
+        "重复确认", 1, slow_task, action="confirm_preflight", unique=True)
+    second = jobs.start_task(
+        "重复确认", 1, slow_task, action="confirm_preflight", unique=True)
+    assert second == first
+    assert len(jobs.running_for("重复确认", 1)) == 1
+    check = App(workspace)
+    try:
+        assert check.db.query_one(
+            "SELECT COUNT(*) AS n FROM production_runs")["n"] == 1
+    finally:
+        check.close()
+    release.set()
+    deadline = time.time() + 5
+    while time.time() < deadline and jobs.get(first)["status"] == "running":
+        time.sleep(0.02)
+    assert jobs.get(first)["status"] == "done"
 
 
 def test_asset_delete_and_video_reference_api(server):

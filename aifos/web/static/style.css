@@ -280,7 +280,12 @@ td.num, th.num { text-align: right; }
 .zoom-group button { padding: 5px 10px; font-size: 12px; }
 .zoom-pct { min-width: 48px; text-align: center; color: var(--ink-2); font-size: 12px; align-self: center; }
 
-.canvas-body { flex: 1; min-height: 0; display: flex; }
+.canvas-body {
+  flex: 0 0 clamp(480px, calc(100dvh - 180px), 700px);
+  height: clamp(480px, calc(100dvh - 180px), 700px);
+  min-height: 0;
+  display: flex;
+}
 #viewport {
   flex: 1; position: relative; overflow: hidden; cursor: grab;
   background-color: var(--page);
@@ -524,7 +529,7 @@ td.num, th.num { text-align: right; }
   -webkit-overflow-scrolling: touch;
 }
 .shot-production-table {
-  width: 100%; min-width: 1320px; border-collapse: separate; border-spacing: 0;
+  width: 100%; min-width: 1390px; border-collapse: separate; border-spacing: 0;
   table-layout: fixed; font-size: 12px;
 }
 .shot-production-table caption {
@@ -533,7 +538,7 @@ td.num, th.num { text-align: right; }
 }
 .shot-production-table .col-sequence { width: 76px; }
 .shot-production-table .col-duration { width: 92px; }
-.shot-production-table .col-reference { width: 122px; }
+.shot-production-table .col-reference { width: 190px; }
 .shot-production-table .col-frames { width: 192px; }
 .shot-production-table .col-movement { width: 165px; }
 .shot-production-table .col-description { width: 340px; }
@@ -592,6 +597,29 @@ td.num, th.num { text-align: right; }
 .storyboard-media-empty b { font-size: 10.5px; color: var(--ink-2); }
 .storyboard-media-empty.state-generating { border-color: rgba(250, 178, 25, .55); }
 .storyboard-media-empty.state-failed { border-color: rgba(208, 59, 59, .65); }
+.shot-inline-revision { display: grid; gap: 6px; margin-top: 7px; }
+.shot-revision-toggle {
+  width: 100%; padding: 6px 8px; border: 1px solid rgba(57, 135, 229, .5);
+  border-radius: 7px; background: var(--surface-2); color: #cfe4ff;
+  font-size: 10.5px; text-align: center; cursor: pointer; list-style: none;
+}
+.shot-revision-toggle::-webkit-details-marker { display: none; }
+.shot-inline-revision[open] .shot-revision-toggle {
+  background: var(--accent-soft); border-color: var(--accent);
+}
+.shot-inline-revision:not([open]) .shot-revision-form { display: none; }
+.shot-revision-form { display: grid; gap: 6px; }
+.shot-revision-form textarea {
+  width: 100%; min-width: 0; resize: vertical; box-sizing: border-box;
+  padding: 7px; border: 1px solid var(--hairline); border-radius: 7px;
+  background: var(--surface-2); color: var(--ink); font: inherit; line-height: 1.45;
+}
+.shot-revision-form select { width: 100%; min-width: 0; }
+.shot-revision-actions { display: grid; grid-template-columns: 1fr; gap: 5px; }
+.shot-revision-actions button { width: 100%; padding: 6px; font-size: 10.5px; }
+.shot-revision-form > small, .shot-inline-revision-note {
+  display: block; color: var(--ink-3); font-size: 9px; line-height: 1.45;
+}
 .storyboard-frame-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
 .storyboard-frame-pair .storyboard-media-empty { min-height: 110px; }
 .storyboard-camera { display: grid; gap: 5px; }
@@ -2275,6 +2303,10 @@ textarea:focus-visible, select:focus-visible {
   .canvas-view { min-height: calc(100dvh - 126px); }
   .canvas-body { min-height: 480px; position: relative; }
   #sidepanel { width: min(330px, 88vw); padding: 14px; }
+  .sidepanel-mobile-close {
+    position: sticky; top: 0; z-index: 2; width: 100%; min-height: 44px;
+    margin-bottom: 10px; background: var(--surface-3);
+  }
   .timeline { padding: 7px 10px; overflow-x: auto; }
   .tl-seg { min-width: 52px; }
 
@@ -2319,7 +2351,11 @@ textarea:focus-visible, select:focus-visible {
   .storyboard-duration::before { grid-column: 1 / -1; }
   .storyboard-duration span { margin: 0; }
   .storyboard-reference .storyboard-media-button,
-  .storyboard-reference .storyboard-media-empty { width: 96px; }
+  .storyboard-reference .storyboard-media-empty { width: 128px; }
+  .shot-inline-revision { width: 100%; }
+  .shot-revision-toggle, .shot-revision-actions button { min-height: 44px; }
+  .shot-revision-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .shot-revision-actions .shot-revision-go { grid-column: 1 / -1; }
   .storyboard-media-empty { min-height: 136px; }
   .storyboard-frame-pair {
     display: flex; gap: 8px; overflow-x: auto; scroll-snap-type: x mandatory;

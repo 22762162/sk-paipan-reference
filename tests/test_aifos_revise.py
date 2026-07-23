@@ -69,18 +69,52 @@ def test_regen_character_art(app):
 def test_regen_shot_invalidates_video(app):
     _to_preflight(app, "万妖图录", 2, finish=True)
     project = app.projects.get_project("万妖图录")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=?",
+        (project["id"], 2))
+    old_image = app.assets.latest(
+        project["id"], "image", "e002_shot001")
     assert app.assets.latest(project["id"], "video", "e002_shot001")
-    app.director.regen_image(
+    assert app.assets.latest(project["id"], "edit", "e002_final")
+    assert app.assets.latest(project["id"], "review_board", "e002")
+    app.director.set_video_references(
+        episode["id"], 1, [old_image["id"]])
+
+    revised = app.director.regen_image(
         "万妖图录", 2, {"kind": "shot", "shot_no": 1}, feedback="改成夜晚")
-    # 旧视频作废,首尾帧已重生成
+    sync = revised["sync"]
+    # 旧视频/成片/检查板作废，同场已有首尾帧链已经同步重生成。
     assert app.assets.latest(project["id"], "video", "e002_shot001") is None
-    assert app.assets.latest(
-        project["id"], "image", "e002_shot001")["version"] >= 2
-    # 增量补齐:只重拍该镜头视频
+    new_image = app.assets.latest(
+        project["id"], "image", "e002_shot001")
+    assert new_image["version"] >= 2
+    assert sync["frame_shots"][0] == 1
+    assert sync["invalidated_video_shots"] == sync["frame_shots"]
+    assert app.assets.latest(project["id"], "edit", "e002_final") is None
+    assert app.assets.latest(project["id"], "review_board", "e002") is None
+    assert app.projects.get_episode(episode["id"])["qc_score"] is None
+    assert app.projects.get_episode(episode["id"])["status"] == \
+        "awaiting_confirm"
+    revision, _ = app.projects.latest_document(
+        episode["id"], "shot_revision_state")
+    assert revision["active"] is True
+
+    # 手选 Seedance 参考不能因 asset_id 变旧而静默丢失。
+    refs, _ = app.projects.latest_document(
+        episode["id"], "video_references")
+    assert refs["shots"]["1"][0]["asset_id"] == new_image["id"]
+    assert refs["shots"]["1"][0]["asset_id"] != old_image["id"]
+
+    # 增量补齐：只重拍同场受帧链影响的镜头，其余镜头视频复用。
     summary = app.director.produce("万妖图录", 2)
     assert summary["status"] == "done"
     videos = next(s for s in summary["stages"] if s["stage"] == "videos")
-    assert videos["detail"]["reused"] == videos["detail"]["count"] - 1
+    assert videos["detail"]["reused"] == (
+        videos["detail"]["count"]
+        - len(sync["invalidated_video_shots"]))
+    revision, _ = app.projects.latest_document(
+        episode["id"], "shot_revision_state")
+    assert revision["active"] is False
 
 
 def test_regen_scene_art_and_errors(app):

@@ -151,13 +151,27 @@ class JobRegistry:
             app.close()
 
     def start(self, title, number, premise="", style="", force=False,
-              script=None, review=False, kind=None, action="produce"):
-        run_id = self._create_history(
-            title, number, action, force=force,
-            request={"premise": premise, "style": style,
-                     "review": bool(review), "kind": kind,
-                     "script_supplied": script is not None})
+              script=None, review=False, kind=None, action="produce",
+              unique=False):
+        """启动生产；unique=True 时同一集重复提交复用正在运行的任务。
+
+        检查、创建历史和登记 job 必须处在同一把锁内，否则两个浏览器标签
+        同时点「确认」仍可能各自通过检查，重复消耗 Seedance/生图额度。
+        """
         with self._lock:
+            if unique:
+                existing = next((
+                    job for job in self._jobs.values()
+                    if job["status"] == "running"
+                    and job["title"] == title
+                    and int(job["episode"]) == int(number)), None)
+                if existing is not None:
+                    return existing["id"]
+            run_id = self._create_history(
+                title, number, action, force=force,
+                request={"premise": premise, "style": style,
+                         "review": bool(review), "kind": kind,
+                         "script_supplied": script is not None})
             self._seq += 1
             job_id = f"j{self._seq}"
             self._jobs[job_id] = {
@@ -176,15 +190,23 @@ class JobRegistry:
         return job_id
 
     def start_task(self, title, number, task, action="adjustment",
-                   request=None, tracked=False):
+                   request=None, tracked=False, unique=False):
         """通用后台任务(打磨重写/重画)。
 
         普通任务签名为 ``task(app, run_id)``；tracked=True 时额外传入
         ``report(**fields)``，让长批次把逐项进度写进 job，前端无需猜测。
         """
-        run_id = self._create_history(
-            title, number, action, request=request)
         with self._lock:
+            if unique:
+                existing = next((
+                    job for job in self._jobs.values()
+                    if job["status"] == "running"
+                    and job["title"] == title
+                    and int(job["episode"]) == int(number)), None)
+                if existing is not None:
+                    return existing["id"]
+            run_id = self._create_history(
+                title, number, action, request=request)
             self._seq += 1
             job_id = f"j{self._seq}"
             self._jobs[job_id] = {
@@ -600,6 +622,8 @@ def _episode_payload(app, episode_id):
         app.projects.latest_document(episode_id, "character_asset_policy")
     video_references, video_references_v = app.projects.latest_document(
         episode_id, "video_references")
+    shot_revision_state, shot_revision_state_v = \
+        app.projects.latest_document(episode_id, "shot_revision_state")
     series_source, series_source_v = app.projects.latest_document(
         episode_id, "series_source")
     cast_selection = app.director.character_selection_status(
@@ -620,6 +644,10 @@ def _episode_payload(app, episode_id):
     qc_path = out_dir / "qc_report.json"
     if qc_path.exists():
         qc_report = json.loads(qc_path.read_text(encoding="utf-8"))
+    if (shot_revision_state or {}).get("active"):
+        # 镜头已出新版本而旧成片尚未补拍时，不能继续展示旧质检“通过”。
+        qc_report = None
+        content_review = None
     render_plan = None
     plan_path = out_dir / "render_plan.json"
     if plan_path.exists():
@@ -683,6 +711,8 @@ def _episode_payload(app, episode_id):
             "schema": "aifos.video-references/v1", "shots": {}},
         "video_references_version": video_references_v,
         "video_references_effective": video_references_effective,
+        "shot_revision_state": shot_revision_state,
+        "shot_revision_state_version": shot_revision_state_v,
         "series_source": series_source,
         "series_source_version": series_source_v,
         "series_batch": app.series.batch_for_episode(episode_id),
@@ -1385,7 +1415,8 @@ def make_handler(workspace, jobs):
                 if body.get("kind") in ("drama", "idol") else None,
                 action=("force_rebuild" if body.get("force") else
                         "script_import" if script is not None else
-                        "produce"))
+                        "produce"),
+                unique=True)
             return self._json(
                 {"job_id": job_id, "title": title,
                  "episode": int(number), "note": note}, status=202)
@@ -1415,6 +1446,29 @@ def make_handler(workspace, jobs):
             if found is None:
                 return self._error(404, "剧集不存在")
             title, number, status, project_id, found_episode_id = found
+            running = jobs.running_for(title, number)
+            if running:
+                return self._json({
+                    "job_id": running[0]["id"], "phase": status,
+                    "reused": True,
+                    "note": "本集已经在生产，无需重复确认",
+                }, status=202)
+            allowed = {"awaiting_script", "awaiting_cast",
+                       "awaiting_confirm"}
+            if status not in allowed:
+                return self._error(
+                    409, f"本集当前处于「{status}」，不能重复确认；"
+                    "请刷新查看当前生产进度")
+            revision_state = self._with_app(
+                lambda app: app.projects.latest_document(
+                    found_episode_id, "shot_revision_state")[0])
+            if (status == "awaiting_confirm"
+                    and (revision_state or {}).get("active")
+                    and not (revision_state or {}).get(
+                        "formal_ready", True)):
+                return self._error(
+                    409, "当前修订镜头是低质量试错图；请先在分镜表用中/高质量"
+                    "重画，低质量图不能交给 Seedance")
             video_quality = body.get("video_quality")
             if video_quality is not None:
                 try:
@@ -1444,7 +1498,8 @@ def make_handler(workspace, jobs):
                 review=(status in ("awaiting_script", "awaiting_cast")),
                 action=("confirm_script" if status == "awaiting_script"
                         else "confirm_cast" if status == "awaiting_cast"
-                        else "confirm_preflight"))
+                        else "confirm_preflight"),
+                unique=True)
             return self._json(
                 {"job_id": job_id, "phase": status}, status=202)
 
@@ -1509,6 +1564,9 @@ def make_handler(workspace, jobs):
             if found is None:
                 return self._error(404, "剧集不存在")
             title, number = found
+            if jobs.running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，请先暂停，待状态稳定后再重做人物候选")
             job_id = jobs.start_task(
                 title, number,
                 lambda app, run_id: app.director.regenerate_character_candidates(
@@ -1574,6 +1632,9 @@ def make_handler(workspace, jobs):
             if found is None:
                 return self._error(404, "剧集不存在")
             title, number = found
+            if jobs.running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，请先暂停，待状态稳定后再修改镜头")
             feedback = (body.get("feedback") or "").strip()
             prompt = (body.get("prompt") or "").strip()
             quality = body.get("quality")
@@ -1590,7 +1651,8 @@ def make_handler(workspace, jobs):
                     prompt_override=prompt, quality_override=quality),
                 action="regen_image",
                 request={"target": target, "feedback": feedback,
-                         "prompt": prompt, "quality": quality})
+                         "prompt": prompt, "quality": quality},
+                unique=True)
             return self._json({"job_id": job_id}, status=202)
 
         def _settings_update(self):
@@ -2110,6 +2172,9 @@ def make_handler(workspace, jobs):
             if found is None:
                 return self._error(404, "剧集不存在")
             title, number = found
+            if jobs.running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，请先暂停，待状态稳定后再替换镜头")
             try:
                 data = base64.b64decode(body.get("data_base64", ""))
             except Exception:
