@@ -67,7 +67,20 @@ _IMG_MEDIA = {".png": "image/png", ".jpg": "image/jpeg",
 
 
 def _local_refs(payload):
-    """本地参考图路径：最终立绘优先，其后才是衔接/场景/风格/用户图。"""
+    """本地参考图路径：最终立绘优先，其后才是衔接/场景/风格/用户图。
+    有 reference_manifest 时严格按对照表顺序(与提示词"图N"编号一致)。"""
+    manifest = payload.get("reference_manifest") or []
+    if manifest:
+        refs, seen = [], set()
+        for item in manifest:
+            uri = str((item or {}).get("uri") or "").strip()
+            if not uri or uri in seen:
+                continue
+            seen.add(uri)
+            path = Path(uri)
+            if path.exists() and path.suffix.lower() in _IMG_MEDIA:
+                refs.append(path)
+        return refs
     order = []
     order.extend(
         ref.get("uri") for ref in (payload.get("identity_references") or [])
@@ -95,7 +108,22 @@ def _reference_entries(payload):
     """按人物身份优先级收集参考图，并保留 Seedream 需要的
     图序语义。identity_references 的顺序就是 P01/P02/... 的顺序；
     character_refs 中重复的最终立绘不再二次上传。
+
+    payload 带 reference_manifest(导演中心前置生成的参考图对照表)时
+    直接按对照表顺序与标签提交——保证提示词里的"图N"与实际第 N 张
+    图片完全一致。
     """
+    manifest = payload.get("reference_manifest") or []
+    if manifest:
+        entries, seen = [], set()
+        for item in manifest:
+            uri = str((item or {}).get("uri") or "").strip()
+            if not uri or uri in seen:
+                continue
+            seen.add(uri)
+            entries.append({"uri": uri,
+                            "label": str(item.get("label") or "参考图")})
+        return entries
     entries, seen = [], set()
 
     def add(uri, label):

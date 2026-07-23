@@ -75,6 +75,18 @@ def _style_line(payload):
 
 
 def _ref_line(payload):
+    # 导演中心前置生成的参考图对照表:编号绑定"谁参考哪张图",
+    # CLI 侧原样照读,禁止自行重排或忽略
+    manifest = payload.get("reference_manifest") or []
+    if manifest:
+        numbered = ";".join(
+            f"图{item.get('index')}={item.get('label', '参考图')}"
+            f" {item.get('uri', '')}({item.get('binding', '')})"
+            for item in manifest if item.get("uri"))
+        return ("参考图对照表(必须逐张真实打开读取,严格按编号对应使用:"
+                "每个人物只参考自己名下的图,禁止把一个人的脸画成另一张"
+                "参考图中的人;服装、动作、场景按本镜剧本,除非绑定说明"
+                f"要求保留):{numbered}。")
     identity_refs = payload.get("identity_references") or []
     refs = [
         f"{r.get('character', '角色')}人工锁定最终立绘 {r.get('uri', '')}"

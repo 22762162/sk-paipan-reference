@@ -172,10 +172,13 @@ def test_produce_passes_reference_art(tmp_path, fake_codex, monkeypatch):
                     log.read_text(encoding="utf-8").splitlines()]
     keyframe_calls = [i for i in instructions if "keyframe" in i]
     assert keyframe_calls
-    # 对白镜头的指令引用人工锁定立绘(portrait_*.png 真实路径)
-    assert any("人工锁定最终立绘" in i and "portrait_" in i
+    # 对白镜头的指令按参考图对照表引用人工锁定立绘(portrait_*.png 真实路径)
+    assert any("最终立绘" in i and "portrait_" in i
                for i in keyframe_calls)
-    assert any("场景概念图" in i and "scene_" in i for i in keyframe_calls)
+    # 场景图同样进对照表(编号绑定,标签为「场景…基准图」)
+    assert any("基准图" in i and "scene_" in i for i in keyframe_calls)
+    # 对照表编号与用途绑定进入指令
+    assert any("参考图对照表" in i and "图1=" in i for i in keyframe_calls)
 
 
 def test_router_integration(tmp_path, fake_codex, monkeypatch):

@@ -931,7 +931,8 @@ class Director:
             return {}
         keys = (
             "species", "personality", "temperament", "costume",
-            "costume_detail", "background_prompt", "era_setting",
+            "costume_detail", "palette", "background_prompt",
+            "era_setting",
             "occupation", "motivation", "backstory", "relationships",
             "costume_direction", "signature_props",
         )
@@ -2894,7 +2895,7 @@ class Director:
                 tasks.append({
                     "item_id": f"sheet:{name}:{key}",
                     "capability": "image",
-                    "payload": {
+                    "payload": self._with_reference_manifest({
                         "character_sheet": key, "sheet_label": label,
                         "image_task_class": "important",
                         "image_quality": "high",
@@ -2914,7 +2915,7 @@ class Director:
                         "reference_images": reference,
                         "style_ref": self._style_anchor_uri(project_id),
                         "aspect": ctx["aspect"], **ctx["dims"],
-                    }, "sub_dir": "cast",
+                    }), "sub_dir": "cast",
                     "tag": (name, key, label),
                     # 人物资产套件仍属于初始母资产阶段，不做视觉 QC；
                     # 分镜/首尾帧等后续镜头才使用已锁定人物立绘质检。
@@ -3142,7 +3143,12 @@ class Director:
         if situation:
             parts.append(f"本集故事背景:{situation}")
         if location:
-            parts.append(f"场景:{location}")
+            scene = next((s for s in script.get("scenes", [])
+                          if s.get("scene_no") == shot.get("scene_no")), {})
+            scene_detail = str(scene.get("action") or "").strip()
+            parts.append(f"场景:{location}"
+                         + (f"(本场情境与环境细节:{scene_detail})"
+                            if scene_detail else ""))
         script_profiles = {
             item.get("name"): item
             for item in script.get("characters", [])
@@ -3158,7 +3164,9 @@ class Director:
             }
             line = self._design_line(design, keys=(
                 "introduction", "gender", "age_range", "identity",
-                "personality", "species", "costume", "temperament",
+                "personality", "species", "costume", "costume_detail",
+                "makeup", "accessories", "palette", "signature",
+                "temperament",
                 "background_prompt", "era_setting", "occupation",
                 "costume_direction", "signature_props")) if design else ""
             identity_rule = (
@@ -3300,7 +3308,84 @@ class Director:
             "uri": next((ref.get("uri") for ref in mapped_refs
                          if ref.get("character") == name), ""),
         } for name in shot.get("characters", [])]
+        # 前置绑定:参考图对照表进提示词——每张图是谁的、参考什么,
+        # 出图前就写死,而不是靠事后质检纠错
+        self._attach_reference_manifest(payload)
         return payload
+
+    def _reference_manifest(self, payload):
+        """按提交顺序给每张参考图编号并绑定用途(与产线上传顺序一致)。
+
+        顺序必须与 API/CLI 产线的图片提交顺序完全相同:
+        最终立绘 → 人物设定图 → 上一镜尾帧 → 场景图 → 风格基准 → 用户参考图。
+        """
+        labels = {match.get("uri"): match.get("label", "")
+                  for match in payload.get("asset_matches", [])
+                  if isinstance(match, dict)}
+        entries, seen = [], set()
+
+        def add(uri, label, binding, character=""):
+            value = str(uri or "").strip()
+            if not value or value in seen:
+                return
+            seen.add(value)
+            entries.append({
+                "index": len(entries) + 1, "uri": value,
+                "label": label, "binding": binding,
+                "character": character,
+            })
+
+        for pos, ref in enumerate(
+                payload.get("identity_references") or [], 1):
+            if not isinstance(ref, dict) or not ref.get("uri"):
+                continue
+            who = str(ref.get("character") or "角色")
+            actor = str(ref.get("actor_id") or f"P{pos:02d}")
+            add(ref["uri"], f"{actor}·{who}最终立绘",
+                f"{who}的脸型、五官、发型、体型、年龄感必须与此图同一人,"
+                "禁止参考他人图片", character=who)
+        for uri in payload.get("character_refs") or []:
+            label = labels.get(uri) or "人物设定图"
+            who = label.split("最终立绘")[0].split("四视图")[0] \
+                if ("最终立绘" in label or "四视图" in label) else ""
+            add(uri, label,
+                (f"{who}的服装结构、材质与配色细节参考此图"
+                 if who else "对应人物的服装结构与配色细节参考此图"),
+                character=who)
+        add(payload.get("chain_first_uri"), "上一镜结尾画面",
+            "构图、光线、人物站位与状态需自然承接此图")
+        location = payload.get("location", "")
+        add(payload.get("scene_ref"),
+            f"场景「{location}」基准图" if location else "场景基准图",
+            "空间结构、陈设、材质与光线以此图为准")
+        add(payload.get("style_ref"), "全片风格基准图",
+            "绘画风格、线条、上色与光影必须与此图一致")
+        for uri in payload.get("reference_images") or []:
+            label = labels.get(uri) or "用户上传参考图"
+            binding = ("同人物/同场景连续性参考,人物造型与环境延续此前画面"
+                       if "已生产" in label
+                       else "用户指定参考,涉及的人物/场景以此为优先标准")
+            add(uri, label, binding)
+        return entries
+
+    def _with_reference_manifest(self, payload):
+        """便捷包装:附上参考图对照表后原样返回 payload。"""
+        self._attach_reference_manifest(payload)
+        return payload
+
+    def _attach_reference_manifest(self, payload):
+        """把参考图对照表写进 payload 与提示词(编号=实际提交顺序)。"""
+        manifest = self._reference_manifest(payload)
+        payload["reference_manifest"] = manifest
+        if not manifest:
+            return
+        lines = [f"图{entry['index']}={entry['label']}:{entry['binding']}"
+                 for entry in manifest]
+        payload["prompt"] = (
+            (payload.get("prompt") or "").rstrip("。")
+            + f"。参考图对照表(共{len(manifest)}张,按此顺序提交,"
+            "必须严格按编号对应使用,禁止张冠李戴、禁止把一个人的脸画成"
+            "另一张参考图中的人):" + ";".join(lines))
 
     def _stage_images(self, ctx):
         self._plan_seed_shots(ctx)
