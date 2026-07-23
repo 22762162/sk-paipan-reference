@@ -94,6 +94,9 @@ def test_background_extras_skip_design_and_generic_support_gets_one_candidate(ap
     }
     summary = app.director.produce(
         "轻量角色测试", 1, script=script, pause_for_confirm=True)
+    assert summary["status"] == "awaiting_script"
+    summary = app.director.produce(
+        "轻量角色测试", 1, pause_for_confirm=True)
     assert summary["status"] == "awaiting_cast"
     project = app.projects.get_project("轻量角色测试")
     episode = app.db.query_one(

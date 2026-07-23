@@ -44,6 +44,22 @@ DEFAULT_STANDARD = {
             "prompt_strategy": "five_dimensions_per_segment",
             "fast_vip_real_face_conflict": "pause_for_confirmation",
         },
+        "story_analysis": {
+            "required_before_images": True,
+            "auto_analyze_uploaded_script": True,
+            "user_style_is_hard_constraint": True,
+            "distinguish_world_from_render_medium": True,
+            "editable_before_lock": True,
+            "required_sections": [
+                "narrative", "world", "visual", "scenes", "characters",
+                "prompt_bible",
+            ],
+            "downstream_consumers": [
+                "character", "scene", "storyboard", "keyframe", "seedance",
+            ],
+            "visible_text_policy": "关键帧先锁字，视频模型只保持不重写",
+            "default_visual_fallback": "剧情自适应、电影级半写实精品漫剧",
+        },
         "character_assets": {
             "background": "pure_background_no_text_no_scene",
             "reference_identity_priority": ["face", "hair"],

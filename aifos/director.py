@@ -6,6 +6,7 @@
        → 抽帧检查板 + 内容复核 + 交付脚本 → 包装 → 数据沉淀
 """
 
+import copy
 import hashlib
 import json
 import re
@@ -39,6 +40,11 @@ from .spatial_blocking import (
     shot_blocking,
     write_spatial_reference_pngs,
     write_spatial_svgs,
+)
+from .story_analysis import (
+    apply_story_analysis,
+    build_story_analysis,
+    validate_story_analysis,
 )
 from .workflow import (
     PIPELINE_VERSION,
@@ -106,7 +112,7 @@ def infer_visual_style(premise="", project_title=""):
     return DEFAULT_VISUAL_STYLE
 
 STAGES = [
-    ("script", "剧本"),
+    ("script", "剧本 + AI制作圣经"),
     ("continuity", "连续性圣经"),
     ("cast", "人物/场景图"),
     ("storyboard", "五维分镜"),
@@ -836,7 +842,10 @@ class Director:
         ("relationships", "人物关系"),
         ("costume_direction", "服装设计逻辑"),
         ("signature_props", "标志道具"),
-        ("visual_variants", "剧情造型方案"))
+        ("visual_variants", "剧情造型方案"),
+        ("visual_direction", "制作圣经视觉方向"),
+        ("prompt_prefix", "人物提示词母版"),
+        ("continuity_anchors", "人物连续性锚点"))
 
     @staticmethod
     def _design_value(value):
@@ -1086,7 +1095,8 @@ class Director:
                           "temperament", "personality", "costume",
                           "palette", "background_prompt", "era_setting",
                           "occupation", "motivation", "costume_direction",
-                          "signature_props"))
+                          "signature_props", "visual_direction",
+                          "prompt_prefix", "continuity_anchors"))
         return (f"角色立绘:{name}({role}),{style}"
                 + (f",{detail},表情站姿体现其性格" if detail else "")
                 + ";服装和造型必须从人物背景提示词、时代/世界观、职业、性格、"
@@ -1168,7 +1178,8 @@ class Director:
                           "appearance", "eyes", "personality",
                           "background_prompt", "era_setting", "occupation",
                           "motivation", "costume_direction",
-                          "signature_props"))
+                          "signature_props", "visual_direction",
+                          "prompt_prefix", "continuity_anchors"))
         look = variant["look_variant"]
         if has_reference:
             hair = (
@@ -1251,9 +1262,21 @@ class Director:
         time_state = time_state or "按本场剧情确定的时间与天气"
         action = (scene.get("action") or premise or
                   "建立本场事件发生所需的环境关系")
-        return ";".join((
+        production_design = (
+            scene.get("production_design")
+            if isinstance(scene.get("production_design"), dict) else {})
+        analysis_line = "；".join(filter(None, (
+            str(scene.get("prompt_prefix") or "").strip(),
+            str(production_design.get("environment") or "").strip(),
+            str(production_design.get("layout") or "").strip(),
+            str(production_design.get("materials_and_props") or "").strip(),
+            str(production_design.get("lighting") or "").strip(),
+        )))
+        negative = str(scene.get("negative_prompt") or "").strip()
+        return ";".join(filter(None, (
             f"场景概念图/环境基准:{place.strip()}",
             f"项目视觉媒介与材质:{self._scene_style_line(style)}",
+            (f"AI制作圣经:{analysis_line}" if analysis_line else ""),
             f"空间功能与布局:{self._scene_environment_line(place)}",
             f"时间与天气:{time_state}",
             f"剧情用途:{action}",
@@ -1261,7 +1284,8 @@ class Director:
             "留出角色进出与表演动线，机位高度和光线方向稳定，后续镜头可复用",
             "空镜:画面中不出现人物、人体局部、剪影、倒影中的人或随机路人",
             "场景只保留与剧情有关的设备、道具和陈设；所有屏幕、纸张、招牌和包装"
-            "均无可读文字、字幕、Logo、水印、乱码和品牌标识"))
+            "均无可读文字、字幕、Logo、水印、乱码和品牌标识",
+            (f"负面约束:{negative}" if negative else ""))))
 
     def _sheet_prompt(self, name, role, style, label, desc, key=None,
                       design=None, locked_look=None):
@@ -2385,6 +2409,78 @@ class Director:
             raise AifosError(f"剧本世界观/人物设定门禁失败: {error}")
         return script
 
+    def _ensure_story_analysis(self, ctx, *, force=False,
+                               creative_direction=""):
+        """剧本 → AI 制作圣经；保存后注入剧本供所有下游提示词继承。"""
+        episode_id = ctx["episode"]["id"]
+        script = ctx["script"]
+        analysis_rules = (
+            (ctx.get("production_profile") or {}).get(
+                "rules", {}).get("story_analysis", {}))
+        style = (ctx["project"].get("style", "")
+                 or analysis_rules.get("default_visual_fallback", ""))
+        current, version = self.projects.latest_document(
+            episode_id, "story_analysis")
+        if (not force and current is not None
+                and current.get("script_version") == ctx.get(
+                    "script_version")
+                and current.get("project_style") == style
+                and validate_story_analysis(current) is None):
+            analysis = build_story_analysis(
+                script, style, raw=current,
+                source=current.get("source", "saved"))
+            analysis["script_version"] = ctx.get("script_version")
+            analysis["project_style"] = style
+            apply_story_analysis(script, analysis)
+            ctx["story_analysis"] = analysis
+            ctx["story_analysis_version"] = version
+            return analysis, version, True
+        result = self._call(
+            ctx, "script", {
+                "story_analysis": True,
+                "project_title": ctx["project"]["title"],
+                "episode_number": ctx["episode"]["number"],
+                "script": script,
+                "style": style,
+                "creative_direction": creative_direction,
+                "analysis_rules": analysis_rules,
+                "production_profile": ctx.get("production_profile") or {},
+            }, "story_analysis")
+        analysis = build_story_analysis(
+            script, style, raw=result.data, source=result.provider)
+        analysis["project_style"] = style
+        error = validate_story_analysis(analysis)
+        if error:
+            raise AifosError(f"剧本 AI 分析失败: {error}")
+        apply_story_analysis(script, analysis)
+        # 新写/上传/重写的剧本要等 AI 分析完成后一次性落成同一个版本，
+        # 避免“原始剧本 v1 + 自动增强 v2”造成无意义的版本膨胀。
+        if ctx.pop("script_pending_save", False):
+            stored_script = copy.deepcopy(script)
+            stored_script.pop("production_analysis", None)
+            script_version = self.projects.save_document(
+                episode_id, "script", stored_script)
+        else:
+            script_version = ctx.get("script_version") or 0
+        ctx["script_version"] = script_version
+        analysis["script_version"] = script_version
+        # 内存中的下游上下文保留完整制作圣经，并带上最终剧本版本号。
+        apply_story_analysis(script, analysis)
+        version = self.projects.save_document(
+            episode_id, "story_analysis", analysis)
+        ctx["story_analysis"] = analysis
+        ctx["story_analysis_version"] = version
+        self.data.record(
+            "prompt", "success",
+            prompt=f"story-analysis:{ctx['project']['title']}"
+            f":e{ctx['episode']['number']}",
+            uri=result.uri,
+            meta={"version": version,
+                  "script_version": ctx.get("script_version"),
+                  "style": style},
+            episode_id=episode_id)
+        return analysis, version, False
+
     def _stage_script(self, ctx):
         episode = ctx["episode"]
         provided = ctx.get("provided_script")
@@ -2395,15 +2491,21 @@ class Director:
                 style=ctx["project"].get("style", ""))
             provided.setdefault("project_title", ctx["project"]["title"])
             provided.setdefault("episode_number", episode["number"])
-            version = self.projects.save_document(
-                episode["id"], "script", provided)
             ctx["script"] = provided
-            ctx["script_version"] = version
-            # 用户自己写的剧本不需要再过目 → 不触发剧本确认暂停
-            self.log.info("director", f"使用用户自带剧本(v{version}),"
-                          "人物/分镜将自动推导")
+            _, ctx["script_version"] = self.projects.latest_document(
+                episode["id"], "script")
+            ctx["script_pending_save"] = True
+            analysis, analysis_version, _ = self._ensure_story_analysis(
+                ctx, force=True)
+            ctx["script_is_new"] = True
+            version = ctx["script_version"]
+            self.log.info(
+                "director", f"使用用户自带剧本(v{version})，"
+                f"AI 制作圣经(v{analysis_version})已完成，等待确认")
             return {"version": version, "provided": True,
-                    "scenes": len(provided["scenes"])}
+                    "scenes": len(provided["scenes"]),
+                    "story_analysis_version": analysis_version,
+                    "world": analysis["world"]["name"]}
         if not ctx.get("force"):
             existing, version = self.projects.latest_document(
                 episode["id"], "script")
@@ -2414,18 +2516,28 @@ class Director:
                     existing, ctx["episode"].get("premise", ""),
                     project_title=ctx["project"]["title"],
                     style=ctx["project"].get("style", ""))
-                if json.dumps(
-                        existing, ensure_ascii=False, sort_keys=True) != before:
-                    version = self.projects.save_document(
-                        episode["id"], "script", existing)
+                normalized_changed = json.dumps(
+                    existing, ensure_ascii=False, sort_keys=True) != before
+                ctx["script"] = existing
+                ctx["script_version"] = version
+                if normalized_changed:
+                    ctx["script_pending_save"] = True
+                analysis, analysis_version, reused = \
+                    self._ensure_story_analysis(
+                        ctx, force=normalized_changed)
+                version = ctx["script_version"]
+                if normalized_changed:
                     self.log.info(
                         "director",
                         f"已有剧本已补齐故事世界、前情与人物设定(v{version})")
-                ctx["script"] = existing
-                ctx["script_version"] = version
-                self.log.info("director", f"复用已有剧本 v{version}")
-                return {"version": version, "reused": True,
-                        "scenes": len(existing["scenes"])}
+                else:
+                    self.log.info("director", f"复用已有剧本 v{version}")
+                return {"version": version,
+                        "reused": not normalized_changed,
+                        "scenes": len(existing["scenes"]),
+                        "story_analysis_version": analysis_version,
+                        "story_analysis_reused": reused,
+                        "world": analysis["world"]["name"]}
         payload = {
             "project_title": ctx["project"]["title"],
             "episode_number": episode["number"],
@@ -2447,15 +2559,21 @@ class Director:
             script, ctx["episode"].get("premise", ""),
             project_title=ctx["project"]["title"],
             style=ctx["project"].get("style", ""))
-        version = self.projects.save_document(episode["id"], "script", script)
         ctx["script"] = script
-        ctx["script_version"] = version
+        _, ctx["script_version"] = self.projects.latest_document(
+            episode["id"], "script")
+        ctx["script_pending_save"] = True
+        analysis, analysis_version, _ = self._ensure_story_analysis(
+            ctx, force=True)
+        version = ctx["script_version"]
         ctx["script_is_new"] = True     # 新写的剧本 → 触发剧本确认暂停
         self.data.record(
             "prompt", "success", prompt=f"script:{ctx['project']['title']}"
             f":e{episode['number']}", uri=result.uri,
             meta={"version": version}, episode_id=episode["id"])
-        return {"version": version, "scenes": len(script["scenes"])}
+        return {"version": version, "scenes": len(script["scenes"]),
+                "story_analysis_version": analysis_version,
+                "world": analysis["world"]["name"]}
 
     def _stage_continuity(self, ctx):
         """项目角色/场景/文字规则与生产配置的单集快照。"""
@@ -2466,6 +2584,8 @@ class Director:
                     and existing.get("pipeline_version") == PIPELINE_VERSION
                     and existing.get("script_version") == ctx.get(
                         "script_version")
+                    and existing.get("story_analysis_version") == ctx.get(
+                        "story_analysis_version")
                     and (existing.get("production_profile")
                          if isinstance(existing.get("production_profile"),
                                        dict) else {}).get(
@@ -2479,6 +2599,8 @@ class Director:
         continuity = build_continuity_bible(
             ctx["project"], ctx["script"], ctx["production_profile"])
         continuity["script_version"] = ctx.get("script_version")
+        continuity["story_analysis_version"] = ctx.get(
+            "story_analysis_version")
         version = self.projects.save_document(
             ctx["episode"]["id"], "continuity", continuity)
         ctx["continuity"] = continuity
@@ -2494,6 +2616,8 @@ class Director:
                     and existing.get("pipeline_version") == PIPELINE_VERSION
                     and existing.get("script_version") == ctx.get(
                         "script_version")
+                    and existing.get("story_analysis_version") == ctx.get(
+                        "story_analysis_version")
                     and (existing.get("profile")
                          if isinstance(existing.get("profile"), dict)
                          else {}).get(
@@ -2532,6 +2656,8 @@ class Director:
                 f"分镜产出结构异常({exc});原始分镜已保存在 "
                 f"{raw_path},把该文件发给开发助手即可定位") from exc
         storyboard["script_version"] = ctx.get("script_version")
+        storyboard["story_analysis_version"] = ctx.get(
+            "story_analysis_version")
         version = self.projects.save_document(
             ctx["episode"]["id"], "storyboard", storyboard)
         ctx["storyboard"] = storyboard
@@ -2661,7 +2787,8 @@ class Director:
                     "background_prompt", "era_setting", "occupation",
                     "motivation", "backstory", "relationships",
                     "costume_direction", "signature_props",
-                    "visual_variants"):
+                    "visual_variants", "visual_direction",
+                    "prompt_prefix", "continuity_anchors"):
                 if not design.get(key) and character.get(key):
                     design[key] = character[key]
             self.assets.register(
@@ -3526,7 +3653,19 @@ class Director:
         script = ctx.get("script") or {}
         world = script.get("story_world") or {}
         background = script.get("story_background") or {}
+        analysis = (script.get("production_analysis")
+                    if isinstance(script.get("production_analysis"), dict)
+                    else {})
+        prompt_bible = (analysis.get("prompt_bible")
+                        if isinstance(analysis.get("prompt_bible"), dict)
+                        else {})
         parts = [f"【TASK】漫剧《{title}》镜头 {shot.get('shot_no', '')} 静态关键帧"]
+        master = "；".join(filter(None, (
+            str(prompt_bible.get("global_image_prefix") or "").strip(),
+            str(prompt_bible.get("keyframe_prefix") or "").strip(),
+        )))
+        if master:
+            parts.append(f"【PROMPT MASTER·制作圣经】{master}")
         world_line = "；".join(filter(None, (
             str(world.get("era_and_location") or "").strip(),
             str(world.get("hard_rules") or "").strip(),
@@ -3546,7 +3685,9 @@ class Director:
             parts.append(
                 f"【SCENE】{location}；空间、陈设、光线与场景基准图一致"
                 + (f"；本场情境:{str(scene.get('action')).strip()}"
-                   if str(scene.get("action") or "").strip() else ""))
+                   if str(scene.get("action") or "").strip() else "")
+                + (f"；{str(scene.get('prompt_prefix')).strip()}"
+                   if str(scene.get("prompt_prefix") or "").strip() else ""))
         script_profiles = {
             item.get("name"): item
             for item in script.get("characters", [])
@@ -3639,6 +3780,9 @@ class Director:
         parts.append(
             "【NEGATIVE】禁止身份漂移、性别错误、人数错误、脸部融合、"
             "重复人物、错误服装、无关杂物、脏污皮肤、塑料脸、字幕和标签")
+        if prompt_bible.get("negative_prompt"):
+            parts.append(
+                f"【PROJECT NEGATIVE】{prompt_bible['negative_prompt']}")
         return "\n".join(p for p in parts if p)
 
     def _shot_payload(self, ctx, shot, *, continuity_anchor=False,
@@ -5383,6 +5527,100 @@ class Director:
             ctx["project"]["id"], kind,
             f"e{ctx['episode']['number']:03d}_shot{shot_no:03d}", uri=uri,
             meta=meta)
+
+    # ---- 剧本 AI 分析 / 制作圣经 ----
+    def save_story_analysis(self, episode_id, analysis, *,
+                            expected_version=None, locked=False):
+        episode = self.projects.get_episode(int(episode_id))
+        if episode is None:
+            raise AifosError("剧集不存在")
+        running = self.db.query_one(
+            "SELECT id FROM production_runs WHERE episode_id=? "
+            "AND status IN ('running', 'cancelling') LIMIT 1",
+            (episode["id"],))
+        if running is not None:
+            raise AifosError("本集正在生产，请先停止并等待任务稳定后再修改制作圣经")
+        script, script_version = self.projects.latest_document(
+            episode["id"], "script")
+        if script is None:
+            raise AifosError("本集尚无剧本，先上传剧本或让 AI 写剧本")
+        current, current_version = self.projects.latest_document(
+            episode["id"], "story_analysis")
+        if (expected_version is not None
+                and int(expected_version) != int(current_version)):
+            raise AifosError("制作圣经已在其他页面更新，请刷新后再保存")
+        project = self.db.query_one(
+            "SELECT * FROM projects WHERE id=?", (episode["project_id"],))
+        normalized = build_story_analysis(
+            script, project["style"], raw=analysis,
+            source=("manual_adjusted" if current else "manual"))
+        normalized["script_version"] = script_version
+        normalized["project_style"] = project["style"]
+        normalized["locked"] = bool(locked)
+        normalized["updated_at"] = now()
+        error = validate_story_analysis(normalized)
+        if error:
+            raise AifosError(f"制作圣经保存失败: {error}")
+        version = self.projects.save_document(
+            episode["id"], "story_analysis", normalized)
+        self.projects.set_episode_status(episode["id"], "awaiting_script")
+        self.log.info(
+            "director", f"制作圣经已保存 v{version}"
+            f"（{'已锁定' if locked else '待确认'}）")
+        return {"analysis": normalized, "version": version}
+
+    def lock_story_analysis(self, episode_id):
+        analysis, version = self.projects.latest_document(
+            int(episode_id), "story_analysis")
+        if analysis is None:
+            raise AifosError("AI 制作圣经尚未生成，请先完成剧本分析")
+        if analysis.get("locked"):
+            return {"analysis": analysis, "version": version}
+        analysis = copy.deepcopy(analysis)
+        analysis["locked"] = True
+        analysis["locked_at"] = now()
+        new_version = self.projects.save_document(
+            int(episode_id), "story_analysis", analysis)
+        return {"analysis": analysis, "version": new_version}
+
+    def reanalyze_story(self, project_title, episode_number,
+                        creative_direction="", run_id=None):
+        project = self.projects.get_project(project_title)
+        if project is None:
+            raise AifosError(f"项目不存在: {project_title}")
+        episode = self.db.query_one(
+            "SELECT * FROM episodes WHERE project_id=? AND number=?",
+            (project["id"], episode_number))
+        if episode is None:
+            raise AifosError(f"剧集不存在: 第{episode_number}集")
+        script, script_version = self.projects.latest_document(
+            episode["id"], "script")
+        if script is None:
+            raise AifosError("本集尚无剧本，无法分析")
+        standard = self._resolve_standard_snapshot(
+            episode["id"], force=False)
+        ctx = {
+            "project": dict(project), "episode": dict(episode),
+            "script": script, "script_version": script_version,
+            "out_root": self._episode_dir(project, episode),
+            "production_standard": standard,
+            "production_profile": production_profile(self.config, standard),
+            "run_id": run_id,
+        }
+        self._task_cost = 0.0
+        self._task_providers = set()
+        analysis, version, _ = self._ensure_story_analysis(
+            ctx, force=True, creative_direction=creative_direction)
+        self.projects.set_episode_status(episode["id"], "awaiting_script")
+        self.log.info(
+            "director", f"剧本已重新分析，制作圣经 v{version} 等待确认")
+        return {
+            "project": project_title, "episode": episode_number,
+            "episode_id": episode["id"], "status": "awaiting_script",
+            "story_analysis_version": version,
+            "world": analysis["world"]["name"],
+            "cost": round(self._task_cost, 2),
+        }
 
     # ---- 打磨:剧本意见重写 / 单张图片附意见重画 ----
     def revise_script(self, project_title, episode_number, feedback,
