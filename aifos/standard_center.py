@@ -330,6 +330,27 @@ class StandardCenter:
                     "rules.production.time_precision_seconds",
                     "单段最大时长必须能被时间精度整除")
 
+        story_analysis = required_dict(
+            rules, "story_analysis", "rules.story_analysis")
+        for key in (
+                "required_before_images", "auto_analyze_uploaded_script",
+                "user_style_is_hard_constraint",
+                "distinguish_world_from_render_medium",
+                "editable_before_lock"):
+            bool_field(
+                story_analysis, key, f"rules.story_analysis.{key}")
+        for key in ("required_sections", "downstream_consumers"):
+            values = story_analysis.get(key)
+            if (not isinstance(values, list) or not values
+                    or not all(isinstance(item, str) and item.strip()
+                               for item in values)):
+                issue(
+                    f"rules.story_analysis.{key}",
+                    "必须是非空字符串列表")
+        for key in ("visible_text_policy", "default_visual_fallback"):
+            nonempty_string(
+                story_analysis, key, f"rules.story_analysis.{key}")
+
         dialogue = required_dict(rules, "dialogue", "rules.dialogue")
         bool_field(dialogue, "preserve_verbatim", "rules.dialogue.preserve_verbatim")
         bool_field(dialogue, "split_at_natural_pause", "rules.dialogue.split_at_natural_pause")
@@ -492,7 +513,7 @@ class StandardCenter:
         return self._upgrade_spatial_standard(self.active())
 
     def _upgrade_spatial_standard(self, snapshot):
-        """把既有 V5 标准无损补齐空间与人物资产规则，保留旧版本可追溯。"""
+        """无损补齐新增规则并创建新版本，历史标准仍可追溯。"""
         if not snapshot:
             return snapshot
         content = copy.deepcopy(snapshot.get("content") or {})
@@ -546,12 +567,22 @@ class StandardCenter:
                     if targets.get(key) != default_targets[key]:
                         targets[key] = default_targets[key]
                         changed = True
+        story_defaults = DEFAULT_STANDARD["rules"]["story_analysis"]
+        story_rules = rules.get("story_analysis")
+        if not isinstance(story_rules, dict):
+            rules["story_analysis"] = copy.deepcopy(story_defaults)
+            changed = True
+        else:
+            for key, value in story_defaults.items():
+                if key not in story_rules:
+                    story_rules[key] = copy.deepcopy(value)
+                    changed = True
         if not changed:
             return snapshot
         try:
             return self.save(
                 content, change_note=(
-                    "自动升级：加入剧情事实源、空间调度与角色分级资产规则"),
+                    "自动升级：加入剧本分析、剧情事实源、空间调度与角色分级资产规则"),
                 expected_active_id=snapshot.get("version_id"))
         except StandardConflictError:
             # 多个 App 同时启动时由先完成者负责升级。
