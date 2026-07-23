@@ -2488,6 +2488,10 @@ class Director:
                 f"candidate:{name}")
             for index in range(1, target + 1):
                 item_id = f"candidate:{name}:{index}"
+                if locked and index not in existing:
+                    # 已人工定版:缺失的候选不会再生成,也绝不挂在清单里
+                    # 占着"待生成"(否则永远显示还有几张没画完)
+                    continue
                 quality_by_candidate[(name, index)] = quality
                 variant = self._candidate_variant(index, designs.get(name))
                 if index in existing:
@@ -3505,10 +3509,101 @@ class Director:
             episode["id"], "video_references", document)
         return {**document, "version": version}
 
+    def effective_video_references(self, episode_id):
+        """每个镜头实际交给 Seedance 的参考图与来源(auto=自动选入)。"""
+        episode = self.projects.get_episode(int(episode_id))
+        if episode is None:
+            raise AifosError("剧集不存在")
+        project = self.db.query_one(
+            "SELECT * FROM projects WHERE id=?", (episode["project_id"],))
+        ctx = {"project": dict(project), "episode": dict(episode),
+               "out_root": self._episode_dir(project, episode)}
+        storyboard, _ = self.projects.latest_document(
+            episode["id"], "storyboard")
+        document, _ = self.projects.latest_document(
+            episode["id"], "video_references")
+        manual = set(((document or {}).get("shots") or {}).keys())
+        shots = {}
+        for shot in (storyboard or {}).get("shots", []):
+            no = shot.get("shot_no")
+            if no is None:
+                continue
+            key = str(int(no))
+            shots[key] = {
+                "mode": "manual" if key in manual else "auto",
+                "items": [{
+                    "asset_id": row["id"], "kind": row["kind"],
+                    "name": row["name"], "uri": row["uri"],
+                } for row in self._video_reference_rows(ctx, no)],
+            }
+        return {"schema": "aifos.video-references-effective/v1",
+                "shots": shots}
+
+    def _auto_video_reference_rows(self, ctx, shot_no):
+        """人工未选择时,按剧本/分镜自动集合本镜必要参考图。
+
+        顺序:本镜分镜图 → 出场人物最终立绘 → 场景概念图 → 用户参考图;
+        全部限中/高质量且文件在盘,最多 7 张(multimodal2video 上限内)。
+        """
+        project_id = ctx["project"]["id"]
+        storyboard = ctx.get("storyboard")
+        if storyboard is None:
+            storyboard, _ = self.projects.latest_document(
+                ctx["episode"]["id"], "storyboard")
+        shot = next((s for s in (storyboard or {}).get("shots", [])
+                     if int(s.get("shot_no", -1)) == int(shot_no)), None)
+        if shot is None:
+            return []
+        script = ctx.get("script")
+        if script is None:
+            script, _ = self.projects.latest_document(
+                ctx["episode"]["id"], "script")
+        location = next(
+            (scene.get("location", "")
+             for scene in (script or {}).get("scenes", [])
+             if scene.get("scene_no") == shot.get("scene_no")), "")
+        rows, seen = [], set()
+
+        def usable(row):
+            if (row is None or self.assets.is_deleted(row)
+                    or not row["uri"]):
+                return False
+            if not formal_reference_allowed(self._asset_quality(row)):
+                return False
+            uri = row["uri"]
+            return (uri.startswith(("http://", "https://"))
+                    or Path(uri).exists())
+
+        def add(row):
+            if row is not None and row["id"] not in seen and usable(row):
+                seen.add(row["id"])
+                rows.append(row)
+
+        add(self.assets.latest(
+            project_id, "image",
+            f"e{ctx['episode']['number']:03d}_shot{int(shot_no):03d}"))
+        for name in shot.get("characters", []) or []:
+            add(self._locked_identity(project_id, name))
+        if location:
+            add(self.assets.latest(project_id, "scene_art", location))
+        wanted = set(shot.get("characters") or [])
+        if location:
+            wanted.add(location)
+        for row in self.assets.active_list(project_id, kind="reference"):
+            attach = self._asset_meta(row).get("attach_to", "")
+            if attach and attach not in wanted:
+                continue
+            add(row)
+        return rows[:7]
+
     def _video_reference_rows(self, ctx, shot_no):
         document, _ = self.projects.latest_document(
             ctx["episode"]["id"], "video_references")
-        selected = (document or {}).get("shots", {}).get(str(int(shot_no)), [])
+        shots_doc = (document or {}).get("shots", {})
+        if str(int(shot_no)) not in shots_doc:
+            # 人工没选过 = 自动选入必要参考图;人工选择(含清空)优先
+            return self._auto_video_reference_rows(ctx, shot_no)
+        selected = shots_doc.get(str(int(shot_no)), [])
         rows = []
         for item in selected:
             row = self.assets.get(item.get("asset_id"))

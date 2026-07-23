@@ -594,6 +594,11 @@ def _episode_payload(app, episode_id):
         for item in render_plan.get("items", []):
             for ref in (item.get("reference_inputs") or {}).get("items", []):
                 ref["url"] = _artifact_url(app, ref.get("uri", ""))
+    video_references_effective = app.director.effective_video_references(
+        episode_id)
+    for shot in video_references_effective.get("shots", {}).values():
+        for item in shot.get("items", []):
+            item["url"] = _artifact_url(app, item.get("uri", ""))
     image_acceleration = app.director.image_acceleration_options(
         project["title"], episode["number"])
     if blocking is not None:
@@ -631,6 +636,7 @@ def _episode_payload(app, episode_id):
         "video_references": video_references or {
             "schema": "aifos.video-references/v1", "shots": {}},
         "video_references_version": video_references_v,
+        "video_references_effective": video_references_effective,
         "series_source": series_source,
         "series_source_version": series_source_v,
         "series_batch": app.series.batch_for_episode(episode_id),
