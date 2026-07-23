@@ -701,6 +701,12 @@ td.num, th.num { text-align: right; }
 }
 .confirm-banner b { display: block; margin-bottom: 2px; }
 .confirm-banner span { color: var(--ink-2); font-size: 13px; }
+/* 失败横幅:红色示警,一键从断点继续 */
+.confirm-banner.fail-banner {
+  background: rgba(248, 81, 73, .1);
+  border-bottom: 1px solid rgba(248, 81, 73, .45);
+}
+.episode-resume { white-space: nowrap; }
 .confirm-banner > div { flex: 1; min-width: 260px; }
 .confirm-banner button { font-size: 15px; padding: 11px 22px; white-space: nowrap; }
 .cast-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
