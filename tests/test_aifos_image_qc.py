@@ -521,6 +521,34 @@ def test_codex_qc_instruction_and_parse(tmp_path, monkeypatch):
     assert reply["data"]["issues"] == ["尾帧换了个人"]
 
 
+def test_codex_qc_unparseable_output_fails_closed(tmp_path, monkeypatch):
+    """质检没有可靠 JSON 时不得伪造 checked=true 后放行。"""
+    from aifos.adapters import codex_image
+
+    class FakePopen:
+        returncode = 0
+
+        def __init__(self, *args, **kwargs):
+            self.args = args[0] if args else []
+
+        def communicate(self, timeout=None):
+            return "我看过了，应该没问题。", ""
+
+    monkeypatch.setattr(codex_image.shutil, "which",
+                        lambda _command: "/usr/bin/codex")
+    monkeypatch.setattr(codex_image.subprocess, "Popen", FakePopen)
+    reply = codex_image.run({
+        "capability": "image_qc",
+        "payload": {"image_uri": "/tmp/f.png", "characters": ["程沐"]},
+        "out_dir": str(tmp_path)}, "codex", 30, [])
+    assert reply["ok"] is True
+    assert reply["data"]["pass"] is False
+    assert reply["data"]["identity_checked"] is False
+    assert reply["data"]["gender_checked"] is False
+    assert reply["data"]["count_checked"] is False
+    assert "未返回可解析" in reply["data"]["issues"][0]
+
+
 def test_frames_qc_checks_both_frames(app, monkeypatch):
     """首尾帧质检:首帧或尾帧任一不符即整组不合格。"""
     project = _preproduce(app, title="首尾帧质检")
