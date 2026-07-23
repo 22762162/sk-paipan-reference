@@ -61,8 +61,8 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260724-production-ledger" in html
-    assert "/static/app.js?v=20260724-production-ledger" in html
+    assert "/static/style.css?v=20260724-full-pipeline-canvas" in html
+    assert "/static/app.js?v=20260724-full-pipeline-canvas" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -96,6 +96,7 @@ def test_index_and_static(server):
     assert "资产分类".encode() in app_js
     assert "查看提示词".encode() in app_js
     assert b"/api/video/references" in app_js
+    assert b"/api/redo_video" in app_js
     assert "质检没有通过的原因".encode() in app_js
     assert "本次质检/重画实际附上的参考图".encode() in app_js
     assert "待生产图片批量 API 加速".encode() in app_js
@@ -113,6 +114,11 @@ def test_index_and_static(server):
     assert "分镜头生产表".encode() in app_js
     assert "全流程生产表".encode() in app_js
     assert b"productionLedgerHtml" in app_js
+    assert "全生产链画布".encode() in app_js
+    assert b"productionCanvasStages" in app_js
+    assert b' id="canvas-stage-nav"' in app_js
+    assert b"data-canvas-stage" in app_js
+    assert b"focusStage(stageKey)" in app_js
     assert "所需参考图".encode() in app_js
     assert "问题 / 干预".encode() in app_js
     assert "故事世界与背景圣经".encode() in app_js
@@ -596,6 +602,8 @@ def test_produce_flow_and_episode_api(server):
     status, detail = _json_request(port, "GET", f"/api/episode/{episode_id}")
     assert status == 200
     assert detail["qc_report"]["passed"]
+    assert detail["video_qc_report"]["passed"]
+    assert detail["video_qc_report"]["auto_retry_limit"] == 1
     assert detail["quality_policy"]["video_default"] == "high"
     assert len(detail["tasks"]) >= 11
 

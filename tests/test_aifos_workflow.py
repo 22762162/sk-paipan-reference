@@ -147,3 +147,42 @@ def test_enrich_tolerates_loose_ai_storyboard(tmp_path):
     assert all(isinstance(s.get("camera_plan", s.get("camera")), (dict, str))
                for s in shots)
     assert all(s["seedance_prompt"] for s in shots)
+
+
+def test_environment_shot_remains_strictly_empty(tmp_path):
+    """空镜不再从场次人物表擅自补入第一名角色。"""
+    from aifos.workflow import (build_continuity_bible, enrich_storyboard,
+                                production_profile)
+
+    script = {
+        "project_title": "空镜测试",
+        "episode_number": 1,
+        "episode_title": "T",
+        "logline": "L",
+        "characters": [{"name": "程沐", "role": "主角", "gender": "女"}],
+        "scenes": [{
+            "scene_no": 1,
+            "location": "清晨办公室",
+            "characters": ["程沐"],
+            "action": "窗帘被风吹动",
+            "lines": [],
+        }],
+    }
+    app = App(tmp_path / "ws")
+    try:
+        profile = production_profile(app.config, app.standards.active())
+    finally:
+        app.close()
+    continuity = build_continuity_bible(
+        {"title": "空镜测试", "style": ""}, script, profile)
+    storyboard = enrich_storyboard(script, {"shots": [{
+        "scene_no": 1,
+        "kind": "environment",
+        "characters": [],
+        "description": "窗帘被风吹动，桌面文件轻响",
+    }]}, continuity, profile)
+    shot = storyboard["shots"][0]
+    assert shot["characters"] == []
+    assert shot["character_count"] == 0
+    assert "严格共0人" in shot["seedance_prompt"]
+    assert "无人空镜" in shot["seedance_prompt"]

@@ -110,7 +110,7 @@ def test_canvas_written_and_prompts_carry_relation_lines(app):
     assert any(e["type"] == "co_scene" for e in rel["edges"])
     plan = json.loads((out / "render_plan.json").read_text(encoding="utf-8"))
     multi = [i for i in plan["items"] if i["category"] == "shot_image"
-             and i.get("prompt", "").count("(") >= 2
+             and "画面严格共2人" in i.get("prompt", "")
              and "人物关系线" in i.get("prompt", "")]
     # 至少有一个多人物镜头带了关系线(占位剧本必有双人同场镜头)
     assert multi, "没有任何镜头提示词携带人物关系线"
@@ -158,6 +158,26 @@ def test_reference_upload_rewrites_existing_design(app):
     result2 = app.director.add_reference(title, "场景参考", PNG, ".png",
                                          attach_to="不存在的角色")
     assert result2["design_refreshed"] is False
+
+
+def test_wardrobe_reference_never_rewrites_character_face_design(app):
+    """服装图只管服装，不能触发人物身份设定重写。"""
+    title = "服装参考分工"
+    app.director.produce(title, 1, pause_for_confirm=True)
+    app.director.produce(title, 1, pause_for_confirm=True)
+    project = app.projects.get_project(title)
+    episode = app.db.query_one(
+        "SELECT id FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    hero = script["characters"][0]["name"]
+    before = app.director._character_design(project["id"], hero)
+    result = app.director.add_reference(
+        title, "服装版型", PNG, ".png", attach_to=hero,
+        reference_role="wardrobe")
+    after = app.director._character_design(project["id"], hero)
+    assert result["design_refreshed"] is False
+    assert after == before
 
 
 def test_relations_exposed_in_episode_payload(app):

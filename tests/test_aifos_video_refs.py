@@ -59,27 +59,32 @@ def test_auto_video_references_include_necessary_images(app):
 
 
 def test_manual_selection_overrides_auto(app):
-    """人工选定(含清空)优先于自动集合。"""
+    """人工只调整额外参考，空间图与出场人物最终立绘不可取消。"""
     project, episode, out = _preproduce(app, "万妖图录")
     row = app.assets.latest(project["id"], "image", "e001_shot002")
     app.director.set_video_references(episode["id"], 1, [row["id"]])
     effective = app.director.effective_video_references(episode["id"])
     entry = effective["shots"]["1"]
     assert entry["mode"] == "manual"
+    storyboard, _ = app.projects.latest_document(episode["id"], "storyboard")
+    shot = storyboard["shots"][0]
+    identity_ids = {
+        app.director._locked_identity(project["id"], name)["id"]
+        for name in shot["characters"]}
     manual_ids = [item["asset_id"] for item in entry["items"]
                   if item["kind"] != "spatial_blocking"]
-    assert manual_ids == [row["id"]]
+    assert set(manual_ids) == identity_ids | {row["id"]}
     if entry["spatial_reference_required"]:
         assert entry["items"][0]["kind"] == "spatial_blocking"
-    # 清空 = 明确只用首尾帧,不回落自动
+    # 清空 = 不再使用额外参考，但硬身份图与空间图仍保留。
     app.director.set_video_references(episode["id"], 1, [])
     effective = app.director.effective_video_references(episode["id"])
     assert effective["shots"]["1"]["mode"] == "manual"
     remaining = effective["shots"]["1"]["items"]
     if effective["shots"]["1"]["spatial_reference_required"]:
-        assert [item["kind"] for item in remaining] == ["spatial_blocking"]
-    else:
-        assert remaining == []
+        assert remaining[0]["kind"] == "spatial_blocking"
+        remaining = remaining[1:]
+    assert {item["asset_id"] for item in remaining} == identity_ids
     # 其他镜头仍是自动
     assert effective["shots"]["2"]["mode"] == "auto"
 
@@ -149,3 +154,28 @@ def test_reset_manual_selection_falls_back_to_auto(app):
     assert effective["shots"]["1"]["mode"] == "auto"
     assert any(item["kind"] == "image"
                for item in effective["shots"]["1"]["items"])
+
+
+def test_historical_wrong_character_manual_reference_is_filtered(app):
+    """升级前保存的错角色参考图也不能继续偷偷送入 Seedance。"""
+    project, episode, out = _preproduce(app, "万妖图录")
+    wrong = out / "wrong-character.png"
+    wrong.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+    row = app.assets.register(
+        project["id"], "character_art", "未出场角色",
+        uri=str(wrong), meta={
+            "character": "未出场角色",
+            "image_quality": "high",
+        })
+    app.projects.save_document(episode["id"], "video_references", {
+        "schema": "aifos.video-references/v1",
+        "shots": {"1": [{
+            "asset_id": row["id"], "kind": row["kind"],
+            "name": row["name"], "version": row["version"],
+        }]},
+    })
+    effective = app.director.effective_video_references(episode["id"])
+    ids = {item["asset_id"] for item in effective["shots"]["1"]["items"]}
+    assert row["id"] not in ids
+    assert all(item["binding"] for item in
+               effective["shots"]["1"]["items"])

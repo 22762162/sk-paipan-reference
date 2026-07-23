@@ -68,7 +68,8 @@ def _style_line(payload):
     if payload.get("portrait_candidate"):
         return (f"画风要求:{style}；高细节；严格按该媒介和时代执行；"
                 "定角候选必须保持同一项目画风；无参考图时服装、妆容或面部修饰"
-                "和外显气质按各自造型方向明显不同，有参考图时脸和发型不得改变；"
+                "和外显气质按各自造型方向明显不同；有参考图时锁脸、年龄、"
+                "性别表达和身份标志，但允许按候选方向改变发型梳法、妆容和服装；"
                 "不得用同一造型只换动作。")
     return (f"画风要求:{style}；高细节；严格按该媒介、时代和服装要求执行；"
             "整部作品所有画面保持同一画风、同一人物造型。")
@@ -95,6 +96,8 @@ def _ref_line(payload):
                    if isinstance(r, dict)}
     refs.extend(f"人物设定图 {r}" for r in payload.get("character_refs", [])
                 if r not in locked_uris)
+    if payload.get("spatial_ref"):
+        refs.append(f"本镜空间调度图 {payload['spatial_ref']}")
     if payload.get("scene_ref"):
         refs.append(f"场景概念图 {payload['scene_ref']}")
     refs.extend(f"用户参考图 {r}"
@@ -109,9 +112,9 @@ def _ref_line(payload):
         if payload.get("portrait_candidate"):
             lines.append(
                 "定角候选参考图(必须真实打开读取，不得只使用文字描述；参考图人物的"
-                "脸和发型是最高标准，脸型、五官比例、眼鼻嘴结构、肤色、年龄感、"
-                "发际线、发型轮廓、发色和稳定身份特征必须保持同一个人；妆容、"
-                "服装、配色、姿态可按本候选造型方向设计，但不得改脸或改发型):"
+                "脸是最高标准，脸型、五官比例、眼鼻嘴结构、肤色、年龄感、"
+                "性别表达、发际线和稳定身份特征必须保持同一个人；发型梳法、"
+                "妆容、服装、配色、姿态按本候选造型方向明显变化，但不得改脸):"
                 + ";".join(refs) + "。")
         else:
             lines.append("参考图(必须真实打开读取，不得只使用文字描述；人物身份以"

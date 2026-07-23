@@ -86,7 +86,7 @@ def _local_refs(payload):
         ref.get("uri") for ref in (payload.get("identity_references") or [])
         if isinstance(ref, dict) and ref.get("uri"))
     order.extend(payload.get("character_refs") or [])
-    for key in ("chain_first_uri", "scene_ref", "style_ref"):
+    for key in ("spatial_ref", "chain_first_uri", "scene_ref", "style_ref"):
         val = payload.get(key)
         if val:
             order.append(val)
@@ -143,6 +143,7 @@ def _reference_entries(payload):
     for uri in payload.get("character_refs") or []:
         add(uri, "人物设定图")
     for key, label in (
+            ("spatial_ref", "本镜空间调度图"),
             ("chain_first_uri", "上一镜尾帧"),
             ("scene_ref", "场景基准图"),
             ("style_ref", "风格基准图")):
@@ -476,10 +477,17 @@ class OpenAIImageProvider(Provider):
         if refs:
             if payload.get("portrait_candidate"):
                 parts.append(
-                    "已随请求真实上传定角参考图。参考图人物的脸和发型是最高标准；"
-                    "脸型、五官比例、眼鼻嘴结构、肤色、年龄感、发际线、发型轮廓、"
-                    "发色和稳定身份特征必须保持同一个人，不得改脸或改发型；妆容、"
-                    "服装、配色和姿态可服从本候选的独立造型方向。")
+                    "已随请求真实上传定角参考图。参考图人物身份与脸是最高标准；"
+                    "脸型、五官比例、眼鼻嘴结构、肤色、年龄感、性别表达、"
+                    "发际线和稳定身份特征必须保持同一个人，不得改脸；"
+                    "候选阶段允许按提示词改变发型梳法、妆容、服装、配色和姿态，"
+                    "以便人工比较不同造型，禁止五张只换动作。")
+            elif payload.get("reference_manifest"):
+                parts.append(
+                    "本请求已提供逐图参考对照表。每张参考图只能执行表中声明的"
+                    "单一职责；身份图不得强制服装/姿势/背景，服装图不得覆盖脸，"
+                    "场景图不得带入人物，构图图不得覆盖身份，风格图只控制媒介与"
+                    "色光。禁止跨用途传播或把一个人的任何属性复制给另一个人。")
             else:
                 parts.append(
                     "已随请求真实上传参考图(人物镜头第一组为人工锁定最终立绘,"

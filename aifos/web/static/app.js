@@ -2484,7 +2484,9 @@ function planTraceHtml(item) {
       · ${refItems.length ? `已附 ${refItems.length} 张参考图` : (refs.required ? "缺少必需参考图" : "无需参考图")}</summary>
     ${revision.feedback ? `<div><b>自动修正：</b>${esc(revision.feedback)}</div>` : ""}
     ${refItems.length ? `<div><b>参考图：</b>${refItems.map((ref) =>
-      `${esc(ref.label || ref.kind)}「${esc(ref.name || "未命名") }」`).join("；")}</div>` : ""}
+      `${esc(ref.label || ref.kind)}「${esc(ref.name || "未命名") }」`
+      + `${ref.reference_role ? `〔${esc(ref.reference_role)}${ref.attach_to ? `→${esc(ref.attach_to)}` : ""}〕` : ""}`
+    ).join("；")}</div>` : ""}
   </details>`;
 }
 
@@ -2742,6 +2744,8 @@ function productionLedgerState(row) {
 }
 
 function productionLedgerStateLabel(row) {
+  if (row.status === "awaiting_human") return "二次失败·待人工"
+  if (row.status === "retrying") return `自动返工 ${row.autoRetriesUsed || 0}/1`;
   if (row.issue && row.issueCritical) return "需要干预";
   if (row.selected) return "已定版";
   if (row.status === "done" && row.mock) return "占位图·需补画";
@@ -2778,21 +2782,33 @@ function productionLedgerPlanRows(data) {
 function productionLedgerVideoRows(data) {
   const shots = (data.storyboard || {}).shots || [];
   const artifacts = data.artifacts || {};
+  const videoQc = ((data.video_qc_report || {}).shots || []).reduce((map, item) => {
+    map[Number(item.shot_no)] = item;
+    return map;
+  }, {});
   const videoTask = (data.tasks || []).find((task) => task.stage === "videos"
     && ["running", "failed"].includes(task.status));
   return shots.map((shot) => {
     const shotNo = shot.shot_no;
     const videoUrl = artifacts.videos?.[shotNo] || "";
+    const qc = videoQc[Number(shotNo)];
     const missingFrames = !artifacts.first?.[shotNo] || !artifacts.last?.[shotNo];
-    const status = videoUrl ? "done" : videoTask?.status === "failed"
+    const status = qc?.awaiting_human ? "awaiting_human"
+      : qc && !qc.passed ? "retrying"
+      : qc?.passed ? "done"
+      : videoUrl ? "done" : videoTask?.status === "failed"
       ? "failed" : videoTask?.status === "running" ? "generating" : "pending";
-    const issue = videoUrl ? "" : videoTask?.error || (missingFrames ? "缺少首帧或尾帧" : "等待视频生产");
+    const issue = qc?.issues?.length ? qc.issues.join("；")
+      : videoTask?.error || (missingFrames ? "缺少首帧或尾帧" : "等待视频生产");
     return {
       rowId: `video:${shotNo}`, shotNo, category: "video", stageKey: "video",
       stageLabel: "Seedance 视频", objectLabel: `镜头 ${String(shotNo).padStart(2, "0")}`,
       subLabel: shot.unit_id || `场${shot.scene_no} · ${shot.shot_function || "视频"}`,
       status, selected: false, mock: false, issue,
-      issueCritical: status === "failed" || (missingFrames && status !== "done"),
+      autoRetriesUsed: Number(qc?.auto_retries_used || 0),
+      videoQc: qc || null,
+      issueCritical: status === "failed" || status === "awaiting_human"
+        || (missingFrames && status !== "done"),
       refs: productionLedgerVideoRefs(data, shotNo),
       outputUrls: videoUrl ? [videoUrl] : (artifacts.first?.[shotNo] ? [artifacts.first[shotNo]] : []),
     };
@@ -2849,6 +2865,9 @@ function productionLedgerOutputHtml(row) {
 function productionLedgerActionHtml(row) {
   if (row.planId) return `<button type="button" class="production-ledger-action"
     data-ledger-plan="${esc(row.planId)}">${row.issue ? "立即处理" : "查看/干预"}</button>`;
+  if (row.category === "video" && row.status === "awaiting_human")
+    return `<button type="button" class="production-ledger-action"
+      data-ledger-video-redo="${row.shotNo}">填写修改意见并重生成</button>`;
   if (row.category === "video") return `<button type="button" class="production-ledger-action"
     data-ledger-shot="${row.shotNo}">${row.issueCritical ? "查看问题" : "查看镜头"}</button>`;
   return `<span class="production-ledger-no-action">等待进入生产</span>`;
@@ -2860,6 +2879,8 @@ function productionLedgerHtml(data, options = {}) {
   const runningTask = tasks.find((task) => task.status === "running");
   const currentStage = runningTask?.stage || data.episode?.status || "created";
   const currentLabel = STAGE_CN[currentStage] || STATUS_CN[currentStage] || currentStage;
+  const humanVideoShots = (data.video_qc_report?.shots || [])
+    .filter((item) => item.awaiting_human);
   const stageSummary = PRODUCTION_LEDGER_STAGES.map((stage) => {
     const list = rows.filter((row) => row.stageKey === stage.key);
     const done = list.filter((row) => ["done", "reused", "selected"].includes(row.status)
@@ -2874,6 +2895,11 @@ function productionLedgerHtml(data, options = {}) {
         <p>逐项列出对象、实际/预期参考图、当前产物和干预入口；状态变化会随生产自动刷新。</p></div>
       <span class="production-ledger-current">当前阶段：<b>${esc(currentLabel)}</b></span>
     </div>
+    ${humanVideoShots.length ? `<div class="production-ledger-video-stop" role="alert">
+      <b>⏸ 视频质检已暂停自动返工</b>
+      <span>${humanVideoShots.map((item) => `镜头${item.shot_no}：${esc((item.issues || []).join("；") || "视频质检未通过")}`).join("；")}</span>
+      <small>系统只自动返工 1 次；请先填写人工修改意见，再对指定镜头重生成。</small>
+    </div>` : ""}
     <div class="production-ledger-summary">
       ${stageSummary.map((stage) => `<span class="production-ledger-stage ${stage.done === stage.total && stage.total ? "done" : stage.active ? "running" : "pending"}">
         ${stage.label} <b>${stage.done}/${stage.total}</b></span>`).join("")}
@@ -2935,6 +2961,37 @@ function bindProductionLedger(root, data, episodeId) {
       } else showToast("本集分镜表尚未出现，稍后刷新即可查看该镜头", "info");
     };
   });
+  root.querySelectorAll("[data-ledger-video-redo]").forEach((button) => {
+    button.onclick = async () => {
+      const shotNo = Number(button.dataset.ledgerVideoRedo);
+      const qc = (data.video_qc_report?.shots || []).find((item) =>
+        Number(item.shot_no) === shotNo);
+      const initial = (qc?.issues || []).join("；");
+      const feedback = window.prompt(
+        `镜头${shotNo}质检未通过。请填写确认后的修改要求：`, initial);
+      if (!feedback || !feedback.trim()) return;
+      button.disabled = true; button.textContent = "已提交，重生成中…";
+      try {
+        const reply = await api("/api/redo_video", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ episode_id: episodeId, shot_no: shotNo,
+            feedback: feedback.trim() }),
+        });
+        pollJob(reply.job_id, (job) => {
+          if (job.status === "done") {
+            showToast(`镜头${shotNo}已按人工意见重生成并复检`, "ok");
+            renderCanvasView(episodeId);
+          } else if (["failed", "stopped"].includes(job.status)) {
+            showToast(`镜头${shotNo}重生成失败：${job.error || "请查看日志"}`, "error");
+            button.disabled = false; button.textContent = "填写修改意见并重生成";
+          }
+        });
+      } catch (error) {
+        showToast(error.message, "error");
+        button.disabled = false; button.textContent = "填写修改意见并重生成";
+      }
+    };
+  });
   root.querySelectorAll(".production-ledger-filter").forEach((filter) => {
     const section = filter.closest(".production-ledger");
     const summary = section?.querySelector(".production-ledger-filter-summary");
@@ -2947,7 +3004,7 @@ function bindProductionLedger(root, data, episodeId) {
         const kind = row.dataset.ledgerKind;
         const show = key === "all"
           || (key === "active" && ["generating", "pending"].includes(state))
-          || (key === "problem" && ["failed"].includes(state))
+          || (key === "problem" && ["failed", "retrying", "awaiting_human"].includes(state))
           || (key === kind);
         row.hidden = !show;
         if (show) visible += 1;
@@ -4280,8 +4337,15 @@ async function renderAssetsCenter(selectedTitle) {
         (可全项目通用,或只关联某个角色/场景)</span></h2>
       <div class="ref-form">
         <input id="ref-name" placeholder="参考图名称,如:女主官方设定">
+        <select id="ref-role" aria-label="参考图用途">
+          <option value="identity">人物身份（只锁脸/年龄/性别）</option>
+          <option value="wardrobe">服装/道具（不覆盖脸）</option>
+          <option value="scene">场景空间（忽略人物）</option>
+          <option value="composition">构图/动作（不覆盖身份）</option>
+          <option value="style">画风（可全项目使用）</option>
+        </select>
         <input id="ref-attach" list="ref-attach-list"
-          placeholder="关联对象(留空=全项目通用):角色名或场景名">
+          placeholder="关联角色/场景；仅画风可留空全局使用">
         <datalist id="ref-attach-list">${attachOptions.map((n) =>
           `<option>${esc(n)}</option>`).join("")}</datalist>
         <button class="primary" id="ref-upload">⬆ 上传参考图</button>
@@ -4290,7 +4354,12 @@ async function renderAssetsCenter(selectedTitle) {
         <div class="plan-card ref-card">
           <div class="pc-media">${r.url ? `<img src="${esc(thumbUrl(r.url, 480))}" loading="lazy" alt="">` : `<div class="pc-empty">🖼</div>`}</div>
           <div class="pc-label" title="${esc(r.name)}">${esc(r.name)}</div>
-          <div class="dim">${r.attach_to ? "关联:" + esc(r.attach_to) : "全项目通用"}</div>
+          <div class="dim">用途:${esc({
+            identity: "人物身份", wardrobe: "服装/道具", scene: "场景空间",
+            composition: "构图/动作", style: "画风", manual: "仅手动"
+          }[r.reference_role] || r.reference_role || "旧图待指定")}
+            · ${r.attach_to ? "关联:" + esc(r.attach_to)
+              : (r.reference_role === "style" ? "全项目画风" : "仅手动选择")}</div>
           <button class="ref-del" data-name="${esc(r.name)}">删除</button>
         </div>`).join("")
         || `<div class="dim">还没有参考图。上传后所有出图自动参考,人物形象更稳定。</div>`}
@@ -4416,11 +4485,12 @@ async function renderAssetsCenter(selectedTitle) {
               name: document.getElementById("ref-name").value.trim()
                     || file.name.replace(/\.[^.]+$/, ""),
               attach_to: document.getElementById("ref-attach").value.trim(),
+              reference_role: document.getElementById("ref-role").value,
               filename: file.name,
               data_base64: String(reader.result).split(",")[1] || "",
             }),
           });
-          showToast("参考图已上传,之后出图会自动参考", "ok");
+          showToast("参考图已上传，只会按所选用途和关联对象使用", "ok");
           reload();
         } catch (e) { showToast(e.message, "error"); }
       };
@@ -4662,6 +4732,9 @@ function pollCanvas(episodeId) {
 }
 
 const CARD_W = 220, CARD_H = 218, GAP_X = 26, GAP_Y = 56, LANE_X = 150;
+const CANVAS_STAGE_W = 324, CANVAS_STAGE_GAP = 30;
+const CANVAS_STAGE_LEFT = 28, CANVAS_STAGE_TOP = 28;
+const CANVAS_SHOTS_TOP = 2240;
 
 function castLookHtml(candidate) {
   const look = candidate.look_variant;
@@ -4859,11 +4932,11 @@ const VIDEO_REF_KIND_CN = {
 
 const VIDEO_REF_USAGE_CN = {
   image: "锁定本镜构图、站位和机位",
-  character_identity: "锁定人物身份、脸型和发型",
-  scene_art: "锁定场景布局、光影和空间",
-  reference: "补充用户指定造型或细节",
-  character_sheet: "补充人物角度和局部细节",
-  character_art: "锁定人物身份和本集造型",
+  character_identity: "只锁定人物身份、脸型和发型轮廓，不复制姿势与背景",
+  scene_art: "只锁场景布局、材质和主光方向",
+  reference: "按上传时声明的单一用途使用",
+  character_sheet: "只补充标签对应的人物局部属性",
+  character_art: "只锁脸、年龄、性别表达与身份标志",
   first_frame: "视频动作起点，必须传入",
   last_frame: "视频动作终点及衔接，必须传入",
   spatial_blocking: "锁定多人站位、行动路线和摄影机起终点，必须传入",
@@ -4887,10 +4960,10 @@ function friendlyVideoReferenceName(item, shotNo) {
 }
 
 function videoReferenceFigureHtml({
-  url, kind, name, order, missing = false,
+  url, kind, name, order, missing = false, binding = "",
 }) {
   const type = VIDEO_REF_KIND_CN[kind] || kind || "参考图";
-  const usage = VIDEO_REF_USAGE_CN[kind] || "提供本镜视觉约束";
+  const usage = binding || VIDEO_REF_USAGE_CN[kind] || "提供本镜视觉约束";
   if (!url || missing) return `<figure class="video-ref-card missing">
     <div class="video-ref-missing-image">待生成</div>
     <figcaption><b>${esc(type)}</b><span>${esc(name)}</span>
@@ -4966,6 +5039,7 @@ function videoReferencePanelHtml(data) {
               url: item.url, kind: item.kind,
               name: friendlyVideoReferenceName(item, shot.shot_no),
               order: String(index + 3),
+              binding: item.binding,
             })).join("")
             || `<span class="video-ref-empty">无额外资产参考图</span>`}</div>
         </td>
@@ -5256,6 +5330,8 @@ async function renderCanvasView(episodeId) {
         <button id="layout-reset">重排</button>
       </div>
     </div>
+    <div class="canvas-stage-nav" id="canvas-stage-nav" hidden
+      aria-label="全生产链画布导航"></div>
     <div id="live-strip" class="live-strip" hidden></div>
     <div class="canvas-body">
       <div id="theater"></div>
@@ -5345,16 +5421,20 @@ async function renderCanvasView(episodeId) {
   const btnTheater = document.getElementById("view-theater");
   const btnCanvas = document.getElementById("view-canvas");
   const sidepanelEl = document.getElementById("sidepanel");
+  const stageNavEl = document.getElementById("canvas-stage-nav");
+  const externalReviewPanels = [...document.querySelectorAll(".video-ref-panel")];
   const setView = (mode) => {
     localStorage.setItem("aifos.view", mode);
     const theaterMode = mode !== "canvas";
     theaterEl.hidden = !theaterMode;
     viewportEl.hidden = theaterMode;
     timelineEl.hidden = theaterMode;
+    if (stageNavEl) stageNavEl.hidden = theaterMode;
+    externalReviewPanels.forEach((panel) => { panel.hidden = !theaterMode; });
     btnTheater.classList.toggle("active", theaterMode);
     btnCanvas.classList.toggle("active", !theaterMode);
     if (window.matchMedia("(max-width: 780px)").matches)
-      sidepanelEl.hidden = theaterMode;
+      sidepanelEl.hidden = true;
     if (!theaterMode) canvas.fit();
   };
   btnTheater.onclick = () => setView("theater");
@@ -5850,7 +5930,7 @@ function storyboardPlanState(data, category, shotNo, complete) {
 }
 
 function storyboardStateClass(status) {
-  return ["done", "reused", "generating", "pending", "failed"].includes(status)
+  return ["done", "reused", "generating", "retrying", "awaiting_human", "pending", "failed"].includes(status)
     ? status : "pending";
 }
 
@@ -5937,13 +6017,25 @@ function storyboardStatusHtml(data, shot, issues, context) {
   const imageState = storyboardPlanState(data, "shot_image", no, hasImage);
   const frameState = storyboardPlanState(data, "frames", no, hasFirst && hasLast);
   const readable = shot.readable_text || {};
+  const videoQc = ((data.video_qc_report || {}).shots || []).find((item) =>
+    Number(item.shot_no) === Number(no));
+  const videoStatus = videoQc?.awaiting_human ? "awaiting_human"
+    : videoQc && !videoQc.passed ? "retrying"
+    : videoQc?.passed ? "done" : (hasVideo ? "done" : "pending");
+  const videoLabel = videoQc?.awaiting_human
+    ? "二次不合格·待人工修改"
+    : videoQc && !videoQc.passed
+      ? `质检失败·自动返工 ${videoQc.auto_retries_used || 0}/1`
+      : videoQc?.passed ? "质检通过" : (hasVideo ? "已生成·待质检" : "待生成");
   return `<div class="storyboard-status-stack">
     <span class="storyboard-status state-${storyboardStateClass(imageState.status)}">
       参考分镜 · ${esc(imageState.label)}</span>
     <span class="storyboard-status state-${storyboardStateClass(frameState.status)}">
       首尾帧 · ${hasFirst && hasLast ? "已齐" : esc(frameState.label)}</span>
-    <span class="storyboard-status state-${hasVideo ? "done" : "pending"}">
-      视频 · ${hasVideo ? "已生成" : "待生成"}</span>
+    <span class="storyboard-status state-${storyboardStateClass(videoStatus)}">
+      视频 · ${videoLabel}</span>
+    ${videoQc?.issues?.length ? `<span class="storyboard-status state-${videoQc.awaiting_human ? "awaiting_human" : "retrying"}">
+      原因 · ${esc(videoQc.issues.join("；"))}</span>` : ""}
     ${readable.required ? `<span class="storyboard-status state-${readable.keyframe_uri ? "done" : "pending"}">
       文字 · ${readable.keyframe_uri ? "已锁定" : "待锁定"}</span>` : ""}
     ${issues.length ? `<span class="storyboard-status state-failed">⚠ 质检问题 ${issues.length}</span>`
@@ -6191,6 +6283,243 @@ function renderTheater(data, canvas) {
   });
 }
 
+const CANVAS_STAGE_STATUS_CN = {
+  done: "已完成", reused: "已复用", selected: "已定版",
+  generating: "生产中", running: "生产中", failed: "失败",
+  stopped: "已停止", pending: "待生产",
+};
+
+function canvasLatestTask(data, stage) {
+  return (data.tasks || []).filter((task) => task.stage === stage)
+    .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))[0] || null;
+}
+
+function canvasTaskRollup(data, stage) {
+  const tasks = (data.tasks || []).filter((task) => task.stage === stage);
+  const providers = [...new Set(tasks.flatMap((task) =>
+    String(task.provider || "").split(",").map((name) => name.trim()).filter(Boolean)))];
+  return {
+    latest: canvasLatestTask(data, stage),
+    cost: tasks.reduce((sum, task) => sum + Number(task.cost || 0), 0),
+    providers,
+  };
+}
+
+function canvasStageItemStatus(status) {
+  if (["done", "reused", "selected", "completed"].includes(status)) return "done";
+  if (["generating", "running"].includes(status)) return "generating";
+  if (status === "failed") return "failed";
+  if (status === "stopped") return "stopped";
+  return "pending";
+}
+
+function canvasStageStatus(items, latestTask) {
+  const taskStatus = canvasStageItemStatus(latestTask?.status);
+  if (latestTask && ["generating", "failed", "stopped"].includes(taskStatus))
+    return taskStatus;
+  if (latestTask?.status === "done") return "done";
+  const states = items.map((item) => canvasStageItemStatus(item.status));
+  if (states.includes("generating")) return "generating";
+  if (states.includes("failed")) return "failed";
+  if (states.includes("stopped")) return "stopped";
+  if (states.length && states.every((status) => status === "done")) return "done";
+  return "pending";
+}
+
+function canvasLedgerItem(row) {
+  const state = productionLedgerState(row);
+  return {
+    label: row.objectLabel,
+    meta: [row.subLabel, row.issue].filter(Boolean).join(" · "),
+    status: state,
+    thumb: row.outputUrls?.[0] || "",
+    planId: row.planId || "",
+    shotNo: row.shotNo || null,
+    refs: row.refs?.items?.length || 0,
+  };
+}
+
+function productionCanvasStages(data) {
+  const script = data.script || {};
+  const continuity = data.continuity || {};
+  const storyboard = data.storyboard || {};
+  const blocking = data.blocking || {};
+  const artifacts = data.artifacts || {};
+  const ledgerRows = productionLedgerRows(data);
+  const shots = storyboard.shots || [];
+  const planGroups = {
+    cast: ledgerRows.filter((row) => [
+      "character_candidate", "character_art", "character_sheet", "scene_art",
+    ].includes(row.category)),
+    images: ledgerRows.filter((row) => row.category === "shot_image"),
+    frames: ledgerRows.filter((row) => row.category === "frames"),
+    videos: ledgerRows.filter((row) => row.category === "video"),
+  };
+  const qc = data.qc_report || {};
+  const contentReview = data.content_review || qc.content_review || {};
+  const delivery = qc.delivery_check || {};
+  const latestVideoTask = canvasLatestTask(data, "videos");
+  const stageItems = {
+    script: (script.scenes || []).map((scene) => ({
+      label: `第 ${scene.scene_no} 场 · ${scene.location || "未命名场景"}`,
+      meta: `${(scene.lines || []).length} 句台词${scene.action ? " · 含场景动作" : ""}`,
+      status: "done", action: "script",
+    })),
+    continuity: [
+      ...(continuity.characters || []).map((character) => ({
+        label: `人物 · ${character.name}`,
+        meta: character.role || character.identity || "连续性身份锚点",
+        status: "done", action: "overview",
+      })),
+      ...(continuity.scenes || []).map((scene) => ({
+        label: `场景 · ${scene.location || scene.name || `第${scene.scene_no}场`}`,
+        meta: "场景、道具与状态锚点", status: "done", action: "overview",
+      })),
+    ],
+    cast: planGroups.cast.map(canvasLedgerItem),
+    storyboard: shots.map((shot) => ({
+      label: `${shot.unit_id || `镜头 ${String(shot.shot_no).padStart(2, "0")}`} · ${shot.shot_function || "分镜"}`,
+      meta: `第 ${shot.scene_no} 场 · ${fmt(shot.duration, 1)}s · ${(shot.characters || []).length} 人`,
+      status: "done", shotNo: shot.shot_no,
+      thumb: artifacts.images?.[shot.shot_no] || "",
+    })),
+    blocking: (blocking.scenes || []).map((scene) => ({
+      label: `第 ${scene.scene_no} 场 · ${scene.location || "未命名场景"}`,
+      meta: `${(scene.shots || []).length} 镜 · ${scene.required ? "重点调度" : "连续性参考"}`,
+      status: blocking.validation?.passed ? "done" : "pending",
+      thumb: scene.svg_url || scene.map_url || scene.svg || "",
+      action: "blocking",
+    })),
+    images: planGroups.images.map(canvasLedgerItem),
+    text_assets: ((data.text_assets || {}).assets || []).map((asset) => ({
+      label: `${asset.unit_id || `镜头 ${asset.shot_no}`} · ${asset.carrier || "画面文字"}`,
+      meta: `白名单：${(asset.whitelist || []).join("、") || "无额外文字"}`,
+      status: (data.text_assets || {}).passed ? "done" : "pending",
+      shotNo: asset.shot_no,
+      thumb: artifacts.images?.[asset.shot_no] || "",
+    })),
+    frames: planGroups.frames.map(canvasLedgerItem),
+    preflight: ((data.preflight || {}).gates || []).map((gate) => ({
+      label: gate.label || gate.id || "生产门禁",
+      meta: gate.detail || gate.description || "",
+      status: gate.passed ? "done" : "failed",
+      action: "overview",
+    })),
+    videos: planGroups.videos.map((row) => ({
+      ...canvasLedgerItem(row),
+      meta: `${row.subLabel || ""}${row.refs?.items?.length
+        ? ` · 实际输入 ${row.refs.items.length} 张参考图` : ""}`,
+      videoReference: true,
+    })),
+    voices: shots.map((shot) => {
+      const hasVideo = !!artifacts.videos?.[shot.shot_no];
+      const hasIntegratedAudio = !!artifacts.video_audio?.[shot.shot_no];
+      const dialogue = shot.dialogue?.dialogue || "";
+      return {
+        label: `${shot.unit_id || `镜头 ${shot.shot_no}`} · ${dialogue ? shot.dialogue.character : "无对白"}`,
+        meta: dialogue || "保留环境声与动作拟音",
+        status: hasVideo && (!dialogue || hasIntegratedAudio
+          || data.production_profile?.voice === "jimeng_builtin") ? "done" : "pending",
+        shotNo: shot.shot_no,
+      };
+    }),
+    edit: artifacts.final ? [{
+      label: "无字幕母版", meta: "最终剪辑成片", status: "done",
+      thumb: artifacts.cover || "", action: "play",
+    }] : [{
+      label: "最终剪辑成片", meta: "等待所有镜头视频与声音完成",
+      status: latestVideoTask?.status === "failed" ? "failed" : "pending",
+    }],
+    qc: [
+      { label: "① 自动文件检查", meta: "分辨率、时长、音视频流与文件完整性",
+        status: qc.technical_passed ? "done" : "pending", action: "overview" },
+      { label: "② 抽帧图文检查板", meta: "人物、文字、服装与段间连续性",
+        status: artifacts.review_board ? "done" : "pending", action: "overview" },
+      { label: "③ 逐段内容复核", meta: "逐镜对照剧本核心事件",
+        status: contentReview.passed ? "done" : "pending", action: "overview" },
+      { label: "④ 交付脚本实跑", meta: "交付包自动检查",
+        status: delivery.passed ? "done" : "pending", action: "overview" },
+    ],
+    package: [
+      { label: "封面", meta: artifacts.cover ? "封面已生成" : "等待成片后生成",
+        status: artifacts.cover ? "done" : "pending", thumb: artifacts.cover || "" },
+      ...((artifacts.titles || []).map((title, index) => ({
+        label: `标题 ${index + 1}`, meta: title, status: "done",
+      }))),
+      ...((artifacts.clips || []).map((clip) => ({
+        label: `拆条 · 第 ${clip.scene_no || "-"} 场`,
+        meta: "短视频拆条", status: clip.url ? "done" : "pending",
+      }))),
+    ],
+    archive: [
+      { label: "制作标准快照",
+        meta: `${data.production_standard?.name || "SK 五维漫剧标准"} · v${data.production_standard?.version || 1}`,
+        status: data.production_standard ? "done" : "pending" },
+      { label: "连续性关系与资产来源",
+        meta: data.relations ? "已记录人物、场景与镜头关系" : "等待归档",
+        status: data.relations ? "done" : "pending" },
+      { label: "最终交付包",
+        meta: artifacts.final ? "成片与元数据已沉淀" : "等待成片完成",
+        status: artifacts.final ? "done" : "pending" },
+    ],
+  };
+  return STAGE_ORDER.map((key, index) => {
+    const rollup = canvasTaskRollup(data, key);
+    const items = stageItems[key]?.length ? stageItems[key] : [{
+      label: STAGE_CN[key] || key,
+      meta: "尚未进入此生产环节",
+      status: "pending",
+    }];
+    return {
+      key, index, label: STAGE_CN[key] || key, items,
+      latestTask: rollup.latest, cost: rollup.cost, providers: rollup.providers,
+      status: canvasStageStatus(items, rollup.latest),
+      x: CANVAS_STAGE_LEFT + index * (CANVAS_STAGE_W + CANVAS_STAGE_GAP),
+      y: CANVAS_STAGE_TOP,
+    };
+  });
+}
+
+function productionCanvasStageItemHtml(item) {
+  const status = canvasStageItemStatus(item.status);
+  const attrs = [
+    item.planId ? `data-canvas-plan="${esc(item.planId)}"` : "",
+    item.shotNo != null ? `data-canvas-shot="${item.shotNo}"` : "",
+    item.action ? `data-canvas-action="${esc(item.action)}"` : "",
+    item.videoReference ? `data-canvas-video-reference="${item.shotNo}"` : "",
+  ].filter(Boolean).join(" ");
+  const actionable = !!attrs;
+  const tag = actionable ? "button" : "div";
+  return `<${tag} ${actionable ? 'type="button"' : ""} class="canvas-stage-item" ${attrs}>
+    ${item.thumb ? `<img src="${esc(thumbUrl(item.thumb, 96))}" loading="lazy" alt="">`
+      : `<span class="canvas-stage-item-icon">${status === "done" ? "✓"
+        : status === "generating" ? "⏳" : status === "failed" ? "!" : "○"}</span>`}
+    <span class="canvas-stage-item-copy"><b>${esc(item.label)}</b>
+      <small>${esc(item.meta || "")}</small></span>
+    <span class="canvas-stage-item-status status-${status}">${
+      esc(CANVAS_STAGE_STATUS_CN[status] || status)}</span>
+  </${tag}>`;
+}
+
+function productionCanvasStageHtml(stage) {
+  const provider = stage.providers.length
+    ? stage.providers.join(" / ") : "等待产线";
+  return `<section class="canvas-stage-board state-${stage.status}"
+    data-canvas-node data-canvas-stage="${esc(stage.key)}"
+    style="left:${stage.x}px;top:${stage.y}px">
+    <header class="canvas-stage-board-head">
+      <span class="canvas-stage-index">${String(stage.index + 1).padStart(2, "0")}</span>
+      <div><h3>${esc(stage.label)}</h3>
+        <p>${stage.items.length} 项 · ${esc(provider)}${
+          stage.cost ? ` · 成本 ${fmt(stage.cost)}` : ""}</p></div>
+      <span class="canvas-stage-state">${esc(
+        CANVAS_STAGE_STATUS_CN[stage.status] || stage.status)}</span>
+    </header>
+    <div class="canvas-stage-list">${stage.items.map(
+      productionCanvasStageItemHtml).join("")}</div>
+  </section>`;
+}
+
 class StoryboardCanvas {
   constructor(data, shotIssues, lineIssues) {
     this.data = data;
@@ -6198,7 +6527,12 @@ class StoryboardCanvas {
     this.lineIssues = lineIssues;
     this.scale = 1; this.tx = 30; this.ty = 24;
     this.selected = null;
-    this.layoutKey = `aifos.layout.${data.episode.id}`;
+    this.layoutKey = `aifos.layout.pipeline.${data.episode.id}`;
+    this.stages = productionCanvasStages(data);
+    const tallestStage = Math.max(...this.stages.map((stage) =>
+      70 + stage.items.length * 44), 0);
+    this.shotZoneTop = Math.max(CANVAS_SHOTS_TOP,
+      CANVAS_STAGE_TOP + tallestStage + 170);
     this.positions = this.loadLayout();
     this.viewport = document.getElementById("viewport");
     this.world = document.getElementById("world");
@@ -6215,7 +6549,10 @@ class StoryboardCanvas {
     let lane = 0;
     for (const [, shots] of [...scenes.entries()].sort((a, b) => a[0] - b[0])) {
       shots.forEach((s, i) => {
-        pos[s.shot_no] = { x: LANE_X + i * (CARD_W + GAP_X), y: lane * (CARD_H + GAP_Y) };
+        pos[s.shot_no] = {
+          x: LANE_X + i * (CARD_W + GAP_X),
+          y: this.shotZoneTop + lane * (CARD_H + GAP_Y),
+        };
       });
       lane += 1;
     }
@@ -6231,6 +6568,7 @@ class StoryboardCanvas {
 
   mount() {
     this.renderWorld();
+    this.renderStageNav();
     this.renderTimeline();
     this.renderSidePanel(null);
     this.bind();
@@ -6247,10 +6585,17 @@ class StoryboardCanvas {
       const p = this.positions[s.shot_no];
       if (!lanes.has(s.scene_no) || p.y < lanes.get(s.scene_no)) lanes.set(s.scene_no, p.y);
     });
-    let html = "";
+    let html = `<div class="canvas-flow-line" data-canvas-node
+      style="left:${CANVAS_STAGE_LEFT + CANVAS_STAGE_W}px;top:${CANVAS_STAGE_TOP + 42}px;
+      width:${(this.stages.length - 1) * (CANVAS_STAGE_W + CANVAS_STAGE_GAP)
+        - CANVAS_STAGE_W}px"></div>`;
+    html += this.stages.map(productionCanvasStageHtml).join("");
+    html += `<div class="canvas-shot-zone-label" data-canvas-node
+      style="left:0;top:${this.shotZoneTop - 92}px">
+      <b>逐镜生产区</b><span>按场次排列 · 可拖动镜头卡重新布局</span></div>`;
     for (const [sceneNo, y] of lanes) {
       const scene = this.sceneOf(sceneNo);
-      html += `<div class="lane-label" style="left:0;top:${y}px">
+      html += `<div class="lane-label" data-canvas-node style="left:0;top:${y}px">
         场 ${sceneNo}<span class="loc">${esc(scene?.location || "")}</span></div>`;
     }
     for (const shot of storyboard.shots) {
@@ -6268,7 +6613,7 @@ class StoryboardCanvas {
       const voiceOk = integratedVoice ? hasVideo : lineNo != null && !!art.voices[lineNo];
       html += `
       <div class="shot-card${this.selected === shot.shot_no ? " selected" : ""}"
-           data-shot="${shot.shot_no}" style="left:${p.x}px;top:${p.y}px">
+           data-canvas-node data-shot="${shot.shot_no}" style="left:${p.x}px;top:${p.y}px">
         ${img ? `<img src="${esc(img)}" alt="镜头${shot.shot_no}关键图" draggable="false">`
               : `<div class="no-img">暂无关键图</div>`}
         <div class="body">
@@ -6285,6 +6630,19 @@ class StoryboardCanvas {
     }
     this.world.innerHTML = html;
     this.applyTransform();
+  }
+
+  renderStageNav() {
+    const nav = document.getElementById("canvas-stage-nav");
+    if (!nav) return;
+    nav.innerHTML = `<span class="canvas-stage-nav-label">定位环节</span>${
+      this.stages.map((stage) => `<button type="button"
+        class="canvas-stage-jump state-${stage.status}"
+        data-stage-jump="${esc(stage.key)}"><b>${String(stage.index + 1).padStart(2, "0")}</b>
+        ${esc(stage.label)} <span>${stage.items.length}</span></button>`).join("")}`;
+    nav.querySelectorAll("[data-stage-jump]").forEach((button) => {
+      button.onclick = () => this.focusStage(button.dataset.stageJump);
+    });
   }
 
   renderTimeline() {
@@ -6308,6 +6666,59 @@ class StoryboardCanvas {
     this.tx = 40 - (first.x - LANE_X) * this.scale;
     this.ty = 40 - first.y * this.scale;
     this.applyTransform();
+  }
+
+  focusElement(element, maxScale = 1.05) {
+    if (!element) return;
+    const rect = this.viewport.getBoundingClientRect();
+    const x = Number.parseFloat(element.style.left || "0");
+    const y = Number.parseFloat(element.style.top || "0");
+    const width = element.offsetWidth || CANVAS_STAGE_W;
+    const height = element.offsetHeight || 500;
+    const next = Math.min(maxScale, Math.max(0.28, Math.min(
+      (rect.width - 72) / width, (rect.height - 72) / height)));
+    this.scale = next;
+    this.tx = (rect.width - width * next) / 2 - x * next;
+    this.ty = (rect.height - height * next) / 2 - y * next;
+    this.applyTransform();
+  }
+
+  focusStage(stageKey) {
+    const board = this.world.querySelector(
+      `.canvas-stage-board[data-canvas-stage="${CSS.escape(stageKey)}"]`);
+    if (!board) return;
+    this.world.querySelectorAll(".canvas-stage-board").forEach((node) =>
+      node.classList.toggle("focused", node === board));
+    const viewport = this.viewport.getBoundingClientRect();
+    const x = Number.parseFloat(board.style.left || "0");
+    const y = Number.parseFloat(board.style.top || "0");
+    const width = board.offsetWidth || CANVAS_STAGE_W;
+    const next = Math.min(1.05, Math.max(0.65,
+      (viewport.width - 56) / width));
+    this.scale = next;
+    this.tx = (viewport.width - width * next) / 2 - x * next;
+    this.ty = 28 - y * next;
+    this.applyTransform();
+  }
+
+  focusShot(shotNo) {
+    this.select(shotNo);
+    const card = this.world.querySelector(`.shot-card[data-shot="${shotNo}"]`);
+    this.focusElement(card, 1.35);
+  }
+
+  showMobileSidePanel() {
+    if (!window.matchMedia("(max-width: 780px)").matches
+        || this.viewport.hidden) return;
+    const panel = document.getElementById("sidepanel");
+    panel.hidden = false;
+    if (panel.querySelector(".sidepanel-mobile-close")) return;
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "sidepanel-mobile-close";
+    close.textContent = "× 关闭详情";
+    close.onclick = () => { panel.hidden = true; };
+    panel.prepend(close);
   }
 
   /* ---- 侧栏 ---- */
@@ -6511,12 +6922,21 @@ class StoryboardCanvas {
   }
 
   bounds() {
-    const xs = Object.values(this.positions);
-    if (!xs.length) return { x: 0, y: 0, w: 800, h: 600 };
-    const minX = Math.min(...xs.map((p) => p.x)) - LANE_X;
-    const minY = Math.min(...xs.map((p) => p.y));
-    const maxX = Math.max(...xs.map((p) => p.x)) + CARD_W;
-    const maxY = Math.max(...xs.map((p) => p.y)) + CARD_H;
+    const nodes = [...this.world.querySelectorAll("[data-canvas-node]")]
+      .map((element) => {
+        const x = Number.parseFloat(element.style.left || "0");
+        const y = Number.parseFloat(element.style.top || "0");
+        return {
+          x, y,
+          width: element.offsetWidth || 1,
+          height: element.offsetHeight || 1,
+        };
+      });
+    if (!nodes.length) return { x: 0, y: 0, w: 800, h: 600 };
+    const minX = Math.min(...nodes.map((node) => node.x));
+    const minY = Math.min(...nodes.map((node) => node.y));
+    const maxX = Math.max(...nodes.map((node) => node.x + node.width));
+    const maxY = Math.max(...nodes.map((node) => node.y + node.height));
     return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
   }
 
@@ -6586,6 +7006,8 @@ class StoryboardCanvas {
     vp.addEventListener("pointerup", (ev) => {
       if (!drag) return;
       vp.classList.remove("panning");
+      this.justDragged = drag.moved;
+      if (drag.moved) setTimeout(() => { this.justDragged = false; }, 0);
       if (drag.kind === "card") {
         if (drag.moved) this.saveLayout();
         else this.select(drag.no);
@@ -6593,6 +7015,45 @@ class StoryboardCanvas {
         this.select(null);
       }
       drag = null;
+    });
+    this.world.addEventListener("click", (ev) => {
+      if (this.justDragged) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        return;
+      }
+      const plan = ev.target.closest("[data-canvas-plan]");
+      if (plan) {
+        ev.stopPropagation();
+        showPlanOverlay(this.data.episode.id, plan.dataset.canvasPlan);
+        return;
+      }
+      const videoReference = ev.target.closest("[data-canvas-video-reference]");
+      if (videoReference) {
+        ev.stopPropagation();
+        showVideoReferencePicker(this.data, this.data.episode.id,
+          Number(videoReference.dataset.canvasVideoReference));
+        return;
+      }
+      const shot = ev.target.closest("[data-canvas-shot]");
+      if (shot && !shot.classList.contains("shot-card")) {
+        ev.stopPropagation();
+        this.focusShot(Number(shot.dataset.canvasShot));
+        return;
+      }
+      const action = ev.target.closest("[data-canvas-action]");
+      if (!action) return;
+      ev.stopPropagation();
+      if (action.dataset.canvasAction === "script")
+        showScriptOverlay(this.data, this.data.episode.id);
+      else if (action.dataset.canvasAction === "blocking")
+        showBlockingOverlay(this.data.episode.id);
+      else if (action.dataset.canvasAction === "play")
+        openPlayer(this.data);
+      else if (action.dataset.canvasAction === "overview") {
+        this.select(null);
+        this.showMobileSidePanel();
+      }
     });
   }
 
@@ -6603,6 +7064,7 @@ class StoryboardCanvas {
     document.querySelectorAll(".storyboard-table-row").forEach((row) =>
       row.classList.toggle("selected", Number(row.dataset.shot) === shotNo));
     this.renderSidePanel(shotNo);
+    if (shotNo != null) this.showMobileSidePanel();
   }
 }
 

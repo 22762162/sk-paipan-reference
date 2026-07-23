@@ -96,9 +96,10 @@ class DreaminaProvider(Provider):
         duration = max(1, min(15, int(requested_duration + 0.5)))
         if references:
             prompt += (
-                "。多图用途必须严格遵守：图1是首帧，图2是尾帧；"
-                "图3及之后是资产中心参考图，仅用于锁定人物身份、服装、"
-                "场景和画风连续性，不得把参考图拼贴进画面。")
+                "。多图边界：图1仅为动作起点，图2仅为动作终点；"
+                "图3及之后必须逐张服从提示词内的“资产图单一职责”，"
+                "禁止把一张图同时当人物、服装、场景和画风依据，"
+                "禁止跨人物复制属性或把参考图拼贴进画面。")
             cmd = self._command() + ["multimodal2video"]
             cmd.extend(f"--image={uri}" for uri in [first, last, *references])
         else:

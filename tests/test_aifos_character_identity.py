@@ -98,14 +98,15 @@ def test_candidate_prompts_create_real_look_variants_without_locking_style(app):
     assert "齐肩内扣短发" in prompts[0]
 
 
-def test_reference_portrait_locks_face_and_hair_and_workwear(app):
+def test_reference_portrait_locks_face_but_varies_hair_and_workwear(app):
     design = {"appearance": "鹅蛋脸", "hair": "齐肩短发", "costume": "外卖制服"}
     variant = app.director._candidate_variant(1, design)
     prompt = app.director._candidate_portrait_prompt(
         "外卖小哥", "非重要配角", "现代半写实", design, variant,
         has_reference=True)
-    assert "人物脸和发型是最高标准" in prompt
-    assert "严格保持参考图发型轮廓" in prompt
+    assert "只锁人物脸型、五官骨相" in prompt
+    assert "必须改变梳法/轮廓以便人工选择" in prompt
+    assert "禁止换脸" in prompt
     assert "外卖小哥" in prompt and "工作服/制服" in prompt
     assert "纯净、无文字的单人物资产背景" in prompt
 
@@ -117,9 +118,9 @@ def test_candidate_reference_semantics_lock_face_but_release_look():
         "reference_images": ["/tmp/identity.png"],
     }
     ref_line = _ref_line(payload)
-    assert "脸和发型是最高标准" in ref_line
-    assert "不得改脸或改发型" in ref_line
-    assert "妆容、服装、配色、姿态可按本候选造型方向设计" in ref_line
+    assert "脸是最高标准" in ref_line
+    assert "发型梳法" in ref_line
+    assert "妆容、服装、配色、姿态按本候选造型方向明显变化" in ref_line
     style_line = _style_line(payload)
     assert "不得用同一造型只换动作" in style_line
     normal = _ref_line({"reference_images": ["/tmp/identity.png"]})
@@ -171,6 +172,14 @@ def test_locked_candidate_becomes_only_identity_reference(app):
         == len(storyboard["shots"][0]["characters"])
     locked_uris = {ref["uri"] for ref in payload["identity_references"]}
     assert locked_uris.issubset(set(payload["character_refs"]))
+    # 后续关键帧不只“看这张脸”，还要继承人工选中候选的默认造型；
+    # 否则 5 选 1 之后又会退回选角前的通用服装/发型文字。
+    for name in storyboard["shots"][0]["characters"]:
+        look = app.director._locked_look_variant(project["id"], name)
+        for key in ("hair", "makeup", "costume"):
+            if look.get(key):
+                assert str(look[key]) in payload["prompt"]
+                assert payload["character_background"][name][key] == look[key]
 
 
 def test_missing_identity_blocks_character_generation_and_qc(app):

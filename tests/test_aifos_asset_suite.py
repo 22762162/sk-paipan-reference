@@ -307,7 +307,7 @@ def test_character_suite_reused_across_episodes(app):
 
 
 def test_reference_upload_and_injection(app):
-    """参考图上传后自动注入出图参考:全局与按角色关联都生效。"""
+    """参考图按单一用途注入；全局画风不混入人物/服装参考列表。"""
     project = _preproduce(app)
     episode = app.db.query_one(
         "SELECT * FROM episodes WHERE project_id=? AND number=1",
@@ -316,19 +316,21 @@ def test_reference_upload_and_injection(app):
     hero = script["characters"][0]["name"]
     other = "不存在的角色"
     app.director.add_reference(project["title"], "官方设定", PNG, ".png",
-                               attach_to=hero)
-    app.director.add_reference(project["title"], "画风参考", PNG, ".png")
+                               attach_to=hero, reference_role="identity")
+    app.director.add_reference(
+        project["title"], "画风参考", PNG, ".png",
+        reference_role="style")
     app.director.add_reference(project["title"], "别人的图", PNG, ".png",
                                attach_to=other)
     uris = app.director._reference_uris(project["id"], [hero])
     names = [u.split("/")[-1] for u in uris]
-    assert any("官方设定" in n or n.startswith("____") for n in names) \
-        or len(uris) == 2   # 关联本角色 + 全局,共 2 张
-    assert len(uris) == 2
-    # 场景镜头的参考也带上用户参考图
+    assert any("官方设定" in n or n.startswith("____") for n in names)
+    assert len(uris) == 1
+    # 画风作为独立 style_ref，不得伪装成人物/服装参考。
     ctx = {"project": dict(project)}
     refs = app.director._art_refs(ctx, [hero], "")
-    assert len(refs.get("reference_images", [])) == 2
+    assert len(refs.get("reference_images", [])) == 1
+    assert refs.get("style_ref")
     # 删除后不再注入
     app.director.delete_reference(project["title"], "画风参考")
     assert len(app.director._reference_uris(project["id"], [hero])) == 1
@@ -366,8 +368,11 @@ def test_video_references_are_versioned_and_used(app):
         "SELECT * FROM episodes WHERE project_id=? AND number=1",
         (project["id"],))
     storyboard, _ = app.projects.latest_document(episode["id"], "storyboard")
-    shot_no = storyboard["shots"][0]["shot_no"]
-    scene = app.assets.active_list(project["id"], "character_art")[0]
+    shot = storyboard["shots"][0]
+    shot_no = shot["shot_no"]
+    scene = app.assets.latest(
+        project["id"], "character_sheet",
+        f"{shot['characters'][0]}:turnaround")
     document = app.director.set_video_references(
         episode["id"], shot_no, [scene["id"]])
     assert document["shots"][str(shot_no)][0]["asset_id"] == scene["id"]
@@ -629,8 +634,8 @@ def test_asset_center_has_design_and_lightbox():
     assert "cursor: zoom-in" in css
 
 
-def test_style_anchor_unifies_all_art(app):
-    """风格统一:候选定版后，套件/场景/镜头全部引用最终锚点。"""
+def test_character_portrait_is_not_reused_as_cross_character_style_ref(app):
+    """主角立绘只决定生成顺序，不得把主角脸污染其他人物和场景。"""
     payloads = []
     original = app.director.router.call
 
@@ -647,8 +652,6 @@ def test_style_anchor_unifies_all_art(app):
     script, _ = app.projects.latest_document(episode["id"], "script")
     anchor = app.director._anchor_character(project["id"])
     assert anchor  # 主角优先
-    anchor_uri = app.assets.latest(
-        project["id"], "character_art", anchor)["uri"]
     portraits = [p for p in payloads if p.get("portrait")]
     from aifos.director import character_candidate_target
     expected = sum(character_candidate_target(c) for c in script["characters"])
@@ -656,10 +659,11 @@ def test_style_anchor_unifies_all_art(app):
     assert all(p.get("portrait_candidate") for p in portraits)
     for p in payloads:
         if p.get("character_sheet") or p.get("scene_art"):
-            assert p.get("style_ref") == anchor_uri
-    # 分镜画面同样携带风格基准
+            assert not p.get("style_ref")
+    # 分镜画面由项目文字画风、人物最终立绘与场景基准共同约束，
+    # 不再额外上传另一个角色的脸作为“画风图”。
     shots = [p for p in payloads if p.get("shot_no")]
-    assert shots and all(p.get("style_ref") == anchor_uri for p in shots)
+    assert shots and all(not p.get("style_ref") for p in shots)
 
 
 def test_restyle_project_regenerates_all_art(app):

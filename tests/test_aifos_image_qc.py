@@ -116,6 +116,29 @@ def test_gender_mismatch_is_a_hard_identity_gate(app, tmp_path):
     assert any("性别" in issue for issue in result.qc["issues"])
 
 
+def test_qc_cannot_pass_when_gender_check_fields_are_omitted(app):
+    """视觉模型漏答性别字段时不得按“未发现问题”放行。"""
+    spec = {
+        "identity_required": True,
+        "gender_required": True,
+        "count_required": True,
+        "count": 1,
+    }
+    report = app.director._assess_image_qc(spec, {
+        "pass": True,
+        "identity_checked": True,
+        "identity_match": True,
+        "count_checked": True,
+        "count_match": True,
+        "issues": [],
+    }, attempts=1)
+    assert report["passed"] is False
+    assert report["gender_checked"] is False
+    assert report["gender_match"] is False
+    assert any("未单独核对人物性别" in issue
+               for issue in report["issues"])
+
+
 def test_count_mismatch_auto_revises_bad_image_with_locked_references(
         app, tmp_path):
     """人数错误必须把失败图作为待修改基底重画，并与最终立绘一起复检。"""

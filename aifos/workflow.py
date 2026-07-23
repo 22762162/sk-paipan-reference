@@ -579,7 +579,15 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
         kind = raw.get("kind") or ("dialogue" if raw.get("dialogue") else "environment")
         characters = list(dict.fromkeys(raw.get("characters", [])))
         if not characters:
-            characters = list(scene.get("characters", []))[:1]
+            # 环境/空镜必须允许 0 人。旧逻辑会从场次人物表里擅自塞进第一名
+            # 角色，导致提示词、人数质检和最终画面一起多出人。只有对白或
+            # 明确的人物表演镜缺名单时才做确定性补全。
+            speaker = str((raw.get("dialogue") or {}).get(
+                "character") or "").strip()
+            if speaker:
+                characters = [speaker]
+            elif kind in ("reaction", "beat", "dialogue", "physical"):
+                characters = list(scene.get("characters", []))[:1]
         start_state = {
             name: copy.deepcopy(previous.get(name) or _state(name, continuity))
             for name in characters
@@ -633,20 +641,27 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             f"{name}{state['pose']}" for name, state in end_state.items())
         text_rule = ("保持首帧中文字完全一致，不新增文字" if text_asset["required"]
                      else "不生成字幕条或任何画面文字")
-        seedance_prompt = (
-            f"使用首帧参考。人物编号映射（仅用于提示词引用，不生成画面文字）："
-            f"{numbered_people}。画面内人物：{people}，共{len(characters)}人，"
-            f"禁止新增或复制人物。{text_rule}。"
-            f"动作：{raw.get('description', '')}。"
-            f"镜头：{camera['shot_scale']}·{camera['angle']}·{camera['movement']}。"
-            f"结尾：{end_summary}。最终画面不得出现P01等人物编号、姓名标签、"
-            "坐标、箭头或空间调度图符号。"
-        )
         station = "；".join(
             f"{name}{state['position']}" for name, state in start_state.items())
         gaze = "主体 → 凝视/瞥向 → 对手或核心物件"
         micro_expression = "眉眼变化·下颌张力·呼吸节奏"
         performance_goal = raw.get("description") or "完成本镜叙事任务"
+        seedance_prompt = (
+            "【输入】首帧是唯一动作起点，尾帧是唯一动作终点。"
+            "【人物编号映射（仅用于提示词引用，不生成画面文字）】"
+            f"{numbered_people}；成片严格共{len(characters)}人"
+            f"（{people}），不得新增、复制、合并或换人。"
+            f"【起点】{station or '无人空镜，保持场景初始状态'}。"
+            f"【单一主动作】{raw.get('description', '') or '环境保持自然变化'}。"
+            f"【表演】{gaze}；{micro_expression}，动作连贯自然。"
+            f"【运镜】只执行一次{camera['movement']}，"
+            f"{camera['shot_scale']}·{camera['angle']}，"
+            f"动机是{camera['movement_motivation']}。"
+            f"【终点】{end_summary or '保持空镜构图稳定'}。"
+            f"【文字】{text_rule}。"
+            "【禁止】最终画面不得出现P01等人物编号、姓名标签、坐标、箭头、"
+            "空间调度图符号、字幕、Logo或水印。"
+        )
         environment_sound = (
             f"{scene.get('location', '场景')}环境底噪·空间空气声·动作触发声")
         visual_hook = "主体视线或动作方向承接下一镜"

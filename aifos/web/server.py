@@ -594,6 +594,8 @@ def _collect_artifacts(app, project_id, ep_num):
         {"asset_id": row["id"], "kind": row["kind"], "name": row["name"],
          "attach_to": json.loads(row["meta"] or "{}").get("attach_to", ""),
          "note": json.loads(row["meta"] or "{}").get("note", ""),
+         "reference_role": json.loads(row["meta"] or "{}").get(
+             "reference_role", ""),
          "url": _versioned(_artifact_url(app, row["uri"]), row)}
         for row in latest_rows("reference")]
     out["image_assets"] = _image_asset_catalog(app, project_id)
@@ -628,6 +630,8 @@ def _episode_payload(app, episode_id):
         episode_id, "video_references")
     shot_revision_state, shot_revision_state_v = \
         app.projects.latest_document(episode_id, "shot_revision_state")
+    video_qc_report, video_qc_report_v = \
+        app.projects.latest_document(episode_id, "video_qc_report")
     series_source, series_source_v = app.projects.latest_document(
         episode_id, "series_source")
     cast_selection = app.director.character_selection_status(
@@ -648,9 +652,19 @@ def _episode_payload(app, episode_id):
     qc_path = out_dir / "qc_report.json"
     if qc_path.exists():
         qc_report = json.loads(qc_path.read_text(encoding="utf-8"))
+    # 视频质检单独落盘，供生产表逐镜显示“已通过 / 自动返工 1/1 /
+    # 二次失败待人工”，即使总质检报告尚未生成也能看到视频状态。
+    video_qc_path = out_dir / "video_qc_report.json"
+    if video_qc_path.exists():
+        try:
+            video_qc_report = json.loads(
+                video_qc_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
     if (shot_revision_state or {}).get("active"):
         # 镜头已出新版本而旧成片尚未补拍时，不能继续展示旧质检“通过”。
         qc_report = None
+        video_qc_report = None
         content_review = None
     render_plan = None
     plan_path = out_dir / "render_plan.json"
@@ -722,6 +736,8 @@ def _episode_payload(app, episode_id):
         "series_batch": app.series.batch_for_episode(episode_id),
         "cast_selection": cast_selection,
         "qc_report": qc_report,
+        "video_qc_report": video_qc_report,
+        "video_qc_report_version": video_qc_report_v,
         "render_plan": render_plan,
         "relations": relations,
         "image_acceleration": {
@@ -985,6 +1001,8 @@ def make_handler(workspace, jobs):
                     return self._qc_all()
                 if parsed.path == "/api/redo_items":
                     return self._redo_items()
+                if parsed.path == "/api/redo_video":
+                    return self._redo_video()
                 if parsed.path == "/api/image_acceleration/preflight":
                     return self._image_acceleration_preflight()
                 if parsed.path == "/api/image_acceleration/queue":
@@ -1997,6 +2015,33 @@ def make_handler(workspace, jobs):
                          "only_failed": only_failed, "quality": quality})
             return self._json({"job_id": job_id}, status=202)
 
+        def _redo_video(self):
+            """人工修订后重生成单镜视频:{episode_id,shot_no,feedback}。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            feedback = (body.get("feedback") or "").strip()
+            if not feedback:
+                return self._error(400, "请填写视频质检问题与修改要求")
+            try:
+                shot_no = int(body.get("shot_no"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少有效 shot_no")
+            title, number = found
+            if jobs.running_for(title, number):
+                return self._error(409, "本集正在生产，请先等待当前任务结束")
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id: app.director.redo_video(
+                    title, number, shot_no, feedback),
+                action="redo_video", request={"shot_no": shot_no,
+                                               "feedback": feedback},
+                unique=True)
+            return self._json({"job_id": job_id}, status=202)
+
         def _redo_mock(self):
             """一键补真:{episode_id|project+episode} → 只重画占位图。"""
             body = self._read_body()
@@ -2033,6 +2078,7 @@ def make_handler(workspace, jobs):
 
         def _reference_upload(self):
             """参考图上传:{project|episode_id, name, attach_to, note,
+            reference_role,
             filename, data_base64};出图时自动注入提示。"""
             import base64
             body = self._read_body()
@@ -2058,7 +2104,9 @@ def make_handler(workspace, jobs):
                     lambda app: app.director.add_reference(
                         title, body.get("name", ""), data, ext,
                         attach_to=(body.get("attach_to") or "").strip(),
-                        note=(body.get("note") or "").strip()))
+                        note=(body.get("note") or "").strip(),
+                        reference_role=(
+                            body.get("reference_role") or "").strip()))
             except Exception as exc:
                 return self._error(400, str(exc))
             return self._json(result)

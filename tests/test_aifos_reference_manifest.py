@@ -125,3 +125,78 @@ def test_user_reference_appears_in_manifest(app):
         pytest.skip("首个多人镜头未包含主角,跳过")
     labels = [m["label"] for m in payload["reference_manifest"]]
     assert any("定妆照" in label or "用户" in label for label in labels)
+
+
+def test_frame_edit_base_is_always_in_reference_manifest(app, tmp_path):
+    """首尾帧修改不能只写 image_uri，必须真的作为参考图按序上传。"""
+    frame = tmp_path / "current-frame.png"
+    frame.write_bytes(PNG)
+    payload = {
+        "prompt": "只修正手部，其他保持不变",
+        "image_uri": str(frame),
+    }
+    app.director._attach_reference_manifest(payload)
+    assert payload["reference_manifest"]
+    assert payload["reference_manifest"][0]["uri"] == str(frame)
+    assert payload["reference_manifest"][0]["role"] == "keyframe"
+    assert "图1=本镜已通过的关键图" in payload["prompt"]
+
+
+def test_legacy_unscoped_reference_does_not_pollute_every_shot(app, tmp_path):
+    """历史无用途、无关联参考图不得自动进入所有镜头。"""
+    project, episode, _ = _preproduce(app)
+    old_ref = tmp_path / "legacy-global.png"
+    old_ref.write_bytes(PNG)
+    row = app.assets.register(
+        project["id"], "reference", "历史全局人物图",
+        uri=str(old_ref), meta={"attach_to": "", "note": ""})
+    payload, _ = _multi_char_shot_payload(app, project, episode)
+    assert row["uri"] not in [
+        item["uri"] for item in payload["reference_manifest"]]
+
+
+def test_continuity_reference_requires_exact_character_set(app, tmp_path):
+    """双人旧图不能凭“有一个角色重叠”混进单人镜头。"""
+    project, _ = app.projects.get_or_create_project("连续性参考测试")
+    single = tmp_path / "single.png"
+    group = tmp_path / "group.png"
+    single.write_bytes(PNG)
+    group.write_bytes(PNG)
+    single_row = app.assets.register(
+        project["id"], "image", "single",
+        uri=str(single), meta={
+            "characters": ["乔安"],
+            "location": "直播间",
+            "image_quality": "medium",
+        })
+    group_row = app.assets.register(
+        project["id"], "image", "group",
+        uri=str(group), meta={
+            "characters": ["乔安", "白芷"],
+            "location": "直播间",
+            "image_quality": "medium",
+        })
+    matched = app.director._matching_produced_image_rows(
+        project["id"], ["乔安"], "直播间")
+    ids = {row["id"] for row in matched}
+    assert single_row["id"] in ids
+    assert group_row["id"] not in ids
+
+
+def test_spatial_diagram_is_uploaded_for_keyframe_with_single_role(
+        app, tmp_path):
+    """多人/变机位空间图从关键帧阶段就要真上传，但不得污染画面样式。"""
+    project, episode, script = _preproduce(app)
+    spatial = tmp_path / "shot-space.png"
+    spatial.write_bytes(PNG)
+    character = script["characters"][0]["name"]
+    refs = app.director._art_refs(
+        {"project": dict(project), "episode": dict(episode), "script": script},
+        [character], "", shot_no=1, spatial_ref=str(spatial))
+    payload = {"prompt": "单人按空间图站位", **refs}
+    app.director._attach_reference_manifest(payload)
+    entry = next(item for item in payload["reference_manifest"]
+                 if item["role"] == "spatial")
+    assert entry["uri"] == str(spatial)
+    assert "不得把俯视视角" in entry["binding"]
+    assert payload["reference_manifest"][0]["role"] == "identity"

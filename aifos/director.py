@@ -126,6 +126,10 @@ STAGES = [
 # 预生产检查点:此阶段完成后可暂停等待用户确认,
 # 确认后才进入视频生产(真实产线从这里开始消耗即梦额度)
 CONFIRM_AFTER = "preflight"
+# 视频是按镜头计费的成品资产。生成后必须经过视频质检；质检失败只允许
+# 自动返工一次，第二次仍失败时必须停在人工检查点，不能继续烧额度。
+VIDEO_QC_AUTO_RETRIES = 1
+VIDEO_QC_SCHEMA = "aifos.video-qc/v1"
 CHARACTER_CANDIDATES = 5
 IMPORTANT_CHARACTER_CANDIDATES = 3
 NONIMPORTANT_CHARACTER_CANDIDATES = 1
@@ -358,6 +362,14 @@ IMAGE_ASSET_KINDS = {
     "spatial_blocking",
 }
 
+REFERENCE_ROLES = {
+    "identity", "wardrobe", "scene", "composition", "style", "manual",
+}
+# Seedream 5 Lite 当前最多接收 10 张参考图。导演层按最小公共上限组织
+# 参考图，避免同一任务切换模型时图序、人物或构图语义发生漂移。
+IMAGE_REFERENCE_LIMIT = 10
+SHOT_BASE_REFERENCE_LIMIT = 8
+
 
 class Director:
     def __init__(self, db, config, logger, projects, assets, router, qc, ops,
@@ -568,6 +580,8 @@ class Director:
             "feedback": feedback,
             "production_standard": standard_snapshot,
             "production_profile": profile,
+            "voice_mode": profile.get("voice", "jimeng_builtin"),
+            "lip_sync": bool(profile.get("lip_sync", True)),
             "quality_policy": self._episode_quality_policy(
                 episode["id"], persist=True),
             "character_asset_policy": self.character_asset_policy(
@@ -666,6 +680,7 @@ class Director:
             "budget": self.config.get("budget", "per_episode", default=0),
             "artifacts_dir": str(ctx["out_root"]),
             "stages": stage_reports,
+            "video_qc": ctx.get("video_qc_report", {}),
             "outputs": {
                 "final": ctx.get("final_uri", ""),
                 "cover": ctx.get("cover_uri", ""),
@@ -756,6 +771,8 @@ class Director:
         """经由路由器调用 Provider,并做预算与成本记账。"""
         if self._cancel_requested(ctx):
             raise ProduceCancelled("已手动停止生成")
+        if capability in ("image", "frames", "cover"):
+            self._attach_reference_manifest(payload)
         episode = self.projects.get_episode(ctx["episode"]["id"])
         budget = self.config.get("budget", "per_episode", default=0)
         if budget and episode["cost"] >= budget:
@@ -806,6 +823,8 @@ class Director:
     }
     DESIGN_LABELS = (
         ("species", "形态"),
+        ("gender", "性别"), ("sex", "性别"),
+        ("age_range", "年龄段"), ("identity", "身份"),
         ("appearance", "外貌"), ("hair", "发型"), ("eyes", "眼睛"),
         ("temperament", "气质"), ("personality", "性格"),
         ("makeup", "妆容"), ("costume", "服装"),
@@ -860,15 +879,121 @@ class Director:
         return anchor
 
     def _style_anchor_uri(self, project_id, exclude_name=None):
-        """风格基准图:锚角色的最新立绘;全项目所有形象向它对齐。
-        exclude_name=锚角色自己画立绘时不引用自己。"""
-        anchor = self._anchor_character(project_id)
-        if not anchor or anchor == exclude_name:
-            return None
-        row = self._locked_identity(project_id, anchor)
-        if row and row["uri"] and Path(row["uri"]).exists():
-            return row["uri"]
+        """只返回用户明确标成 ``style`` 的无人物身份风格参考图。
+
+        旧实现把主角立绘当成所有角色/场景的风格图，会把主角的脸、服装
+        和姿态一并污染其他人物。项目画风默认由文字和场景基准维持；只有
+        用户明确声明“仅参考画风”的图片才允许跨角色全局使用。
+        """
+        del exclude_name  # 保留旧调用签名，风格图不再由某个角色担任。
+        for row in reversed(
+                self.assets.active_list(project_id, kind="reference")):
+            meta = self._asset_meta(row)
+            if str(meta.get("attach_to") or "").strip():
+                continue
+            if self._reference_role(row) != "style":
+                continue
+            uri = str(row["uri"] or "")
+            if uri and (uri.startswith(("http://", "https://"))
+                        or Path(uri).exists()):
+                return uri
         return None
+
+    def _reference_role(self, row):
+        """返回用户参考图的单一用途；旧数据采用保守推断。
+
+        无关联、无用途的旧“全项目通用”图不再自动进入任何任务，避免一张
+        人物图污染整部剧。用户仍可在 Seedance 资产选择器中手动选它。
+        """
+        meta = self._asset_meta(row)
+        role = str(meta.get("reference_role")
+                   or meta.get("role") or "").strip().lower()
+        aliases = {
+            "人物": "identity", "身份": "identity",
+            "服装": "wardrobe", "道具": "wardrobe",
+            "场景": "scene", "空间": "scene",
+            "构图": "composition", "动作": "composition",
+            "画风": "style", "风格": "style",
+        }
+        role = aliases.get(role, role)
+        if role in REFERENCE_ROLES:
+            return role
+        text = " ".join((
+            str(row["name"] or ""), str(meta.get("note") or ""))).lower()
+        if any(token in text for token in (
+                "画风", "风格", "style", "色板", "palette", "材质参考")):
+            return "style"
+        if any(token in text for token in (
+                "场景", "空间", "环境", "location", "scene")):
+            return "scene"
+        if any(token in text for token in (
+                "服装", "衣服", "造型", "道具", "costume", "wardrobe")):
+            return "wardrobe"
+        if any(token in text for token in (
+                "构图", "机位", "动作", "姿势", "composition", "pose")):
+            return "composition"
+        # 有明确关联对象的历史图仍按“身份/对象参考”兼容；没有关联对象的
+        # 旧图必须人工指定用途后才自动进入生产。
+        return "identity" if str(meta.get("attach_to") or "").strip() \
+            else "manual"
+
+    def _reference_rows(self, project_id, attach_names, *,
+                        allowed_roles=None, include_global_style=False):
+        """筛出与当前角色/场景精确关联的用户参考图。
+
+        全局旧图不再凭空进入所有镜头；只有明确 ``style`` 角色的全局图可按
+        需加入。这个过滤同时供人物候选、套件、场景、关键帧和视频使用。
+        """
+        wanted = {str(name) for name in (attach_names or []) if name}
+        allowed = set(allowed_roles or REFERENCE_ROLES)
+        rows = []
+        for row in self.assets.active_list(project_id, kind="reference"):
+            meta = self._asset_meta(row)
+            attach = str(meta.get("attach_to") or "").strip()
+            role = self._reference_role(row)
+            if role not in allowed:
+                continue
+            if attach:
+                if attach not in wanted:
+                    continue
+            elif not (include_global_style and role == "style"):
+                continue
+            uri = str(row["uri"] or "")
+            if uri and (uri.startswith(("http://", "https://"))
+                        or Path(uri).exists()):
+                rows.append(row)
+        return rows
+
+    def _reference_asset_match(self, row):
+        meta = self._asset_meta(row)
+        role = self._reference_role(row)
+        labels = {
+            "identity": "人物身份参考",
+            "wardrobe": "服装/道具参考",
+            "scene": "场景空间参考",
+            "composition": "构图/动作参考",
+            "style": "画风参考",
+            "manual": "手动参考图",
+        }
+        return {
+            "asset_id": row["id"], "kind": "reference",
+            "name": row["name"],
+            "label": f"{row['name']}·{labels[role]}",
+            "uri": row["uri"], "reference_role": role,
+            "attach_to": meta.get("attach_to", ""),
+        }
+
+    def _user_reference_payload(self, project_id, attach_names, *,
+                                allowed_roles=None,
+                                include_global_style=False):
+        rows = self._reference_rows(
+            project_id, attach_names, allowed_roles=allowed_roles,
+            include_global_style=include_global_style)
+        return {
+            "reference_images": [row["uri"] for row in rows],
+            "asset_matches": [
+                self._reference_asset_match(row) for row in rows],
+        }
 
     def _character_design(self, project_id, name):
         row = self.assets.latest(project_id, "character", name)
@@ -913,10 +1038,17 @@ class Director:
 
     def _character_sheet_reference_uris(self, project_id, name,
                                         exclude_key=""):
-        """套件重画时复用已完成的其他套件,避免服装/配饰各自漂移。"""
+        """套件重画只复用最相关的 1–2 张资产，避免参考图互相争权。"""
         uris = []
-        for key in ("turnaround", "costume", "costume_detail",
-                    "features", "makeup"):
+        priority = {
+            "turnaround": ("costume", "features"),
+            "closeup": ("features", "makeup"),
+            "features": ("turnaround", "makeup"),
+            "makeup": ("features", "turnaround"),
+            "costume": ("turnaround", "costume_detail"),
+            "costume_detail": ("costume", "turnaround"),
+        }.get(exclude_key, ("turnaround", "costume"))
+        for key in priority:
             if key == exclude_key:
                 continue
             row = self.assets.latest(
@@ -937,7 +1069,8 @@ class Director:
         if not isinstance(design, dict):
             return {}
         keys = (
-            "species", "personality", "temperament", "costume",
+            "species", "gender", "sex", "age_range", "identity",
+            "personality", "temperament", "costume",
             "costume_detail", "palette", "background_prompt",
             "era_setting",
             "occupation", "motivation", "backstory", "relationships",
@@ -947,7 +1080,8 @@ class Director:
 
     def _portrait_prompt(self, name, role, style, design=None):
         detail = self._design_line(
-            design, keys=("species", "appearance", "hair", "eyes",
+            design, keys=("species", "gender", "age_range", "identity",
+                          "appearance", "hair", "eyes",
                           "makeup", "accessories", "signature",
                           "temperament", "personality", "costume",
                           "palette", "background_prompt", "era_setting",
@@ -1030,17 +1164,23 @@ class Director:
                                    has_reference=False):
         """定角候选只锁角色边界，显式放开尚未定版的造型变量。"""
         identity = self._design_line(
-            design, keys=("species", "appearance", "eyes", "personality",
+            design, keys=("species", "gender", "age_range", "identity",
+                          "appearance", "eyes", "personality",
                           "background_prompt", "era_setting", "occupation",
                           "motivation", "costume_direction",
                           "signature_props"))
         look = variant["look_variant"]
         if has_reference:
-            hair = "严格保持参考图发型轮廓、发际线和发色,不得改发型"
-            makeup = "严格保持参考图妆容与面部身份特征,不得改脸"
+            hair = (
+                f"{look['hair']}；保持参考图发际线、发量和发色家族，"
+                "但必须改变梳法/轮廓以便人工选择")
+            makeup = (
+                f"{look['makeup']}；只改变妆容强度与配色，"
+                "不得改变五官结构、年龄感或性别表达")
             variant_rule = (
-                "有参考图时,人物脸和发型是最高标准;本套候选只允许在服装、"
-                "服装配色、姿态和表情上做剧情化变化,不得改变脸和发型")
+                "有参考图时只锁人物脸型、五官骨相、年龄、性别表达、发际线"
+                "和身份标志；候选阶段允许发型梳法、妆容、服装、配色与气质"
+                "按本套方向变化，禁止换脸")
         else:
             hair = look["hair"]
             makeup = look["makeup"]
@@ -1048,24 +1188,30 @@ class Director:
                 "无参考图时,可按本套造型方向变化脸部细节、发型和妆容,"
                 "但不得改变年龄、物种和核心人物气质")
         return (
-            f"角色定角候选:{name}({role}),{style}"
-            + (f";角色不可越界特征:{identity}" if identity else "")
-            + ";这是用于选择最终人物形象的互斥造型候选之一，不是同一套衣服只换动作"
-            f";本套造型方向:{variant['variant_label']}"
-            f";发型:{hair};妆容或面部修饰:{makeup}"
-            f";服装:{look['costume']};气质:{look['temperament']}"
+            f"【任务】角色定角候选:{name}({role})；"
+            f"本套方向:{variant['variant_label']}；"
+            "这是互斥造型候选，不是同一套衣服只换动作。"
+            f"【IDENTITY BOUNDARY】{identity or '年龄、物种、性别表达与核心身份不变'}；"
+            f"{variant_rule}。"
+            f"【HAIR / MAKEUP】发型:{hair}；妆容或面部修饰:{makeup}。"
+            f"【WARDROBE】{look['costume']}。"
+            f"【EXPRESSION】{look['temperament']}。"
             + (f";剧情场合:{variant.get('story_variant', {}).get('occasion') or variant.get('story_variant', {}).get('scene')}"
                if variant.get("story_variant", {}).get("occasion")
                or variant.get("story_variant", {}).get("scene") else "")
             + (f";配饰/道具:{variant.get('story_variant', {}).get('props') or variant.get('story_variant', {}).get('accessories')}"
                if variant.get("story_variant", {}).get("props")
                or variant.get("story_variant", {}).get("accessories") else "")
-            + ";服装轮廓、妆容强度和外显气质必须与其他候选明显不同,"
+            + "【VARIATION】服装轮廓、发型梳法、妆容强度和外显气质"
+            "必须与其他候选明显不同,"
             + "但必须适配角色的性别表达、年龄、职业、物种、时代背景、人物背景和项目画风;"
             + "造型变化优先体现剧情场合与人物性格，不得套用现代都市默认模板"
-            f";{variant_rule};{WORKWEAR_RULE}{CHARACTER_BACKGROUND_RULE}"
-            ";全身正面自然站姿，动作只服务造型展示；干净均匀肤质，禁止塑料脸、"
-            "脏污毛孔；单人，禁止新增人物")
+            f"。【STYLE】{style}；{WORKWEAR_RULE}{CHARACTER_BACKGROUND_RULE}"
+            "【COMPOSITION】全身正面自然站姿，动作只服务造型展示。"
+            "【SKIN / STRUCTURE】肤色干净均匀、仅保留极轻微真实微纹理，"
+            "五官、手指、关节与身体比例自然。"
+            "【NEGATIVE】单人；禁止新增人物、塑料脸、脏污毛孔、文字、"
+            "Logo、水印或背景场景")
 
     @staticmethod
     def _scene_style_line(style):
@@ -1122,14 +1268,22 @@ class Director:
         detail = self._design_line(
             design, keys=self.SHEET_DESIGN_KEYS.get(key))
         anchor = self._locked_look_line(locked_look)
-        return (f"角色{label}:{name}({role}),{style},{desc}"
-                + (f";人物设定:{detail}" if detail else "")
-                + (f";已锁定服装锚点:{anchor};配饰有则必须保留,没有则不得新增"
-                   if anchor else "")
-                + ";本套资产的造型必须服从人物背景、时代/世界观、职业、性格和剧情场合，"
-                "不得把服装统一成现代都市模板;"
-                + f";与立绘同一人物、同一发型服装配色,严格保持形象一致;"
-                f"{WORKWEAR_RULE}{CHARACTER_BACKGROUND_RULE}")
+        return (
+            f"【任务】角色{label}:{name}({role})；{desc}。"
+            "【IDENTITY LOCK】只以人工锁定最终立绘锁定脸型、五官骨相、"
+            "年龄、性别表达、发际线、发型轮廓和身份标志；必须是同一人。"
+            + (f"【人物设定】{detail}。" if detail else "")
+            + (f"【WARDROBE LOCK】{anchor}；配饰有则必须保留，"
+               "不可见或未声明则不得新增。" if anchor else "")
+            + "【WORLD / COSTUME】造型必须服从人物背景、时代/世界观、"
+            "职业、性格和剧情场合，不得套用现代都市模板。"
+            f"【STYLE】{style}。"
+            "【CONSISTENCY】除本资产明确展示的视角/细节外，发型、服装结构、"
+            "配色、材质和配饰必须与最终立绘及已锁定造型一致。"
+            "【SKIN / STRUCTURE】肤色干净均匀，仅保留极轻微真实微纹理；"
+            "五官、手指、关节和身体比例自然。"
+            f"【NEGATIVE】禁止换脸、换性别、增减人物、乱码、Logo、水印；"
+            f"{WORKWEAR_RULE}{CHARACTER_BACKGROUND_RULE}")
 
     def _plan_path(self, ctx):
         return ctx["out_root"] / "render_plan.json"
@@ -1237,6 +1391,8 @@ class Director:
                 "uri": value,
                 "asset_id": match.get("asset_id"),
                 "source": "asset_center" if match else "upload",
+                "reference_role": match.get("reference_role", ""),
+                "attach_to": match.get("attach_to", ""),
             })
 
         for ref in payload.get("identity_references") or []:
@@ -1245,6 +1401,7 @@ class Director:
                     f"{ref.get('character', '角色')}最终立绘")
         for uri in payload.get("character_refs") or []:
             add("character", uri, "人物设定/资产图")
+        add("spatial", payload.get("spatial_ref"), "本镜空间调度图")
         add("keyframe", payload.get("image_uri"), "本镜关键图")
         add("continuity", payload.get("chain_first_uri"), "上一镜尾帧")
         add("scene", payload.get("scene_ref"), "场景概念图")
@@ -1328,6 +1485,8 @@ class Director:
             "name": ref.get("name", ""),
             "uri": ref.get("uri", ""),
             "asset_id": ref.get("asset_id"),
+            "reference_role": ref.get("reference_role", ""),
+            "attach_to": ref.get("attach_to", ""),
         } for ref in refs["items"]]
         contract = {
             "schema": "aifos.image-dispatch/v1",
@@ -1505,13 +1664,21 @@ class Director:
         designs = []
         genders = {}
         for name in visible_characters:
-            design = self._reference_safe_design(
-                self._character_design(project_id, name))
-            merged = {**(backgrounds.get(name) or {}), **(design or {})}
+            # 性别、年龄、物种和身份是质检硬事实，不能经过用于“防止旧
+            # 外貌文字反向改脸”的 safe_design 过滤。脸仍以最终立绘为准。
+            design = self._character_design(project_id, name) or {}
+            merged = {
+                **(design or {}),
+                **(backgrounds.get(name) or {}),
+                # 人工选中的候选造型才是后续服装/发型/妆容默认值；
+                # 不能又回退到候选前的文字设定。
+                **self._locked_look_variant(project_id, name),
+            }
             line = self._design_line(merged, keys=(
-                "species", "gender", "age_range", "appearance", "costume",
+                "species", "gender", "age_range", "identity", "costume",
+                "hair", "makeup", "palette", "accessories",
                 "era_setting", "occupation", "costume_direction",
-                "signature_props", "identity"))
+                "signature_props", "temperament"))
             designs.append(f"{name}({line})" if line else name)
             gender = str(merged.get("gender") or merged.get("sex") or "")
             if gender:
@@ -1552,20 +1719,14 @@ class Director:
         identity_required = bool(qc_spec.get("identity_required"))
         identity_checked = (
             not identity_required or bool(verdict.get("identity_checked")))
-        identity_declared = "identity_match" in verdict
         identity_match = (
             not identity_required
-            or (bool(verdict.get("identity_match"))
-                if identity_declared else bool(verdict.get("pass"))))
+            or bool(verdict.get("identity_match")))
         gender_required = bool(qc_spec.get("gender_required"))
-        gender_declared = bool({"gender_checked", "gender_match"}
-                               & set(verdict))
         gender_checked = (
-            not gender_required or not gender_declared
-            or bool(verdict.get("gender_checked")))
+            not gender_required or bool(verdict.get("gender_checked")))
         gender_match = (
-            not gender_required or not gender_declared
-            or bool(verdict.get("gender_match")))
+            not gender_required or bool(verdict.get("gender_match")))
         count_required = bool(qc_spec.get("count_required"))
         count_checked = (
             not count_required or bool(verdict.get("count_checked")))
@@ -1624,7 +1785,8 @@ class Director:
     def _generate_image_with_qc(self, capability, payload, out_dir,
                                 cancel, qc_spec):
         """出图 + 视觉质检 + 不合格自动重画(worker 线程安全:只调产线)。
-        质检产线不可用/出错时放行不阻塞;结果附在 result.qc。"""
+        质检产线不可用/出错时失败关闭并保留图片待人工处理；结果附在
+        result.qc，未通过的图片不得进入后续正式参考链。"""
         attempts = 0
         spent = 0.0
         while True:
@@ -1719,6 +1881,8 @@ class Director:
         """串行执行单个出图任务(含质检),记账并更新清单。"""
         if self._cancel_requested(ctx):
             raise ProduceCancelled("已手动停止生成")
+        if task.get("capability") in ("image", "frames", "cover"):
+            self._attach_reference_manifest(task["payload"])
         try:
             task = self._claim_dispatch_task(ctx, task)
         except Exception as exc:
@@ -2676,7 +2840,10 @@ class Director:
             if locked and not existing:
                 # 人工上传的最终立绘没有候选集，仍视为明确人工定版。
                 continue
-            refs = self._reference_uris(project_id, [name])
+            reference_payload = self._user_reference_payload(
+                project_id, [name],
+                allowed_roles={"identity", "wardrobe", "composition"})
+            refs = reference_payload["reference_images"]
             quality = resolve_image_quality(
                 recommend_asset_quality("character_candidate"),
                 ctx.get("quality_policy") or default_quality_policy(),
@@ -2740,7 +2907,7 @@ class Director:
                         "characters": [name], "location": "",
                         "prompt": prompt, "style": style,
                         "character_background": designs.get(name) or {},
-                        "reference_images": refs,
+                        **reference_payload,
                         # 初次定妆尚不存在最终立绘；若用户上传过身份参考，
                         # API 也必须真实使用这些图，不能只读文字。
                         "require_reference_images": bool(refs),
@@ -2995,6 +3162,9 @@ class Director:
                     continue
             if any(t["tag"] == ("scene", location, "") for t in tasks):
                 continue
+            scene_references = self._user_reference_payload(
+                project_id, [location],
+                allowed_roles={"scene", "composition"})
             tasks.append({
                 "item_id": f"scene:{location}", "capability": "image",
                 "payload": {
@@ -3009,9 +3179,11 @@ class Director:
                         location, style, scene,
                         premise=ctx["episode"].get("premise", "")),
                     "style": style,
-                    "reference_images": self._reference_uris(
-                        project_id, [location]),
+                    **scene_references,
                     "style_ref": self._style_anchor_uri(project_id),
+                    "require_reference_images": bool(
+                        scene_references["reference_images"]
+                        or self._style_anchor_uri(project_id)),
                     "aspect": ctx["aspect"], **ctx["dims"],
                 }, "sub_dir": "cast", "tag": ("scene", location, "")})
         for tag, result in self._run_parallel(
@@ -3030,7 +3202,9 @@ class Director:
             portrait_uri = (portrait["uri"]
                             if portrait and portrait["uri"]
                             and Path(portrait["uri"]).exists() else None)
-            reference = self._reference_uris(project_id, [name])
+            reference_payload = self._user_reference_payload(
+                project_id, [name],
+                allowed_roles={"identity", "wardrobe", "composition"})
             for key, label, desc in sheet_definitions:
                 asset_name = f"{name}:{key}"
                 existing_sheet = self._existing_asset_uri(
@@ -3065,7 +3239,7 @@ class Director:
                         "identity_references": self._identity_references(
                             project_id, [name]),
                         "require_reference_images": True,
-                        "reference_images": reference,
+                        **reference_payload,
                         "style_ref": self._style_anchor_uri(project_id),
                         "aspect": ctx["aspect"], **ctx["dims"],
                     }), "sub_dir": "cast",
@@ -3097,28 +3271,23 @@ class Director:
                 for s in ctx["script"]["scenes"]}
 
     def _character_reference_uris(self, project_id, name):
-        """只取明确关联到该角色的参考图(全局参考不用于定义单人长相)。"""
-        uris = []
-        for row in self.assets.active_list(project_id, kind="reference"):
-            meta = self._asset_meta(row)
-            if meta.get("attach_to") != name:
-                continue
-            if row["uri"] and Path(row["uri"]).exists():
-                uris.append(row["uri"])
-        return uris
+        """只取明确关联到该角色的人物/服装参考图。"""
+        return [
+            row["uri"] for row in self._reference_rows(
+                project_id, [name],
+                allowed_roles={"identity", "wardrobe", "composition"})]
 
     def _reference_uris(self, project_id, attach_names):
-        """用户上传的参考图:关联到指定角色/场景的 + 全局的。"""
-        uris = []
-        for row in self.assets.active_list(project_id, kind="reference"):
-            meta = json.loads(row["meta"] or "{}") if isinstance(
-                row["meta"], str) else (row["meta"] or {})
-            attach = meta.get("attach_to", "")
-            if attach and attach not in (attach_names or []):
-                continue
-            if row["uri"] and Path(row["uri"]).exists():
-                uris.append(row["uri"])
-        return uris
+        """兼容旧调用：只返回与当前对象精确关联的参考图。
+
+        全局画风图通过 ``style_ref`` 单独传递并使用专用绑定，不能再混成
+        “用户参考图”去覆盖所有人物、服装和场景。
+        """
+        return [
+            row["uri"] for row in self._reference_rows(
+                project_id, attach_names,
+                allowed_roles={
+                    "identity", "wardrobe", "scene", "composition"})]
 
     def _matching_produced_image_rows(self, project_id, characters,
                                       location, shot_no=None, limit=3):
@@ -3139,12 +3308,12 @@ class Director:
                 continue
             row_chars = set(meta.get("characters") or [])
             same_location = bool(location and meta.get("location") == location)
-            overlap = len(wanted & row_chars)
-            if not same_location and not overlap:
+            # 连续性图必须人物集合完全一致。旧逻辑只要求“有重叠”，会把
+            # 乔安+白芷的双人图塞进乔安单人镜，直接污染人数和身份。
+            exact_people = row_chars == wanted
+            if not same_location or not exact_people:
                 continue
-            score = (6 if same_location else 0) + overlap * 4
-            if wanted and row_chars == wanted:
-                score += 3
+            score = 6 + len(wanted) * 4 + 3
             ranked.append((score, row["id"], row))
         ranked.sort(key=lambda item: (-item[0], -item[1]))
         return [item[2] for item in ranked[:limit]]
@@ -3164,17 +3333,36 @@ class Director:
         return ("turnaround", "costume")
 
     def _art_refs(self, ctx, characters, location, shot_no=None,
-                  sheet_keys=None):
+                  sheet_keys=None, spatial_ref=""):
         """最终立绘/人物套件/场景图/用户参考 → 真实多图参考输入。
 
         含人物画面缺任何一个最终立绘都直接阻断；禁止静默退化为文字生图。
+        基础参考最多 8 张，为首/尾帧阶段的本镜关键图与上一镜尾帧预留
+        2 个槽位；任何人物最终立绘都不会被低优先级参考挤掉。
         """
         project_id = ctx["project"]["id"]
         refs = {"character_refs": [], "identity_references": [],
                 "asset_matches": []}
+        used_uris = set()
+
+        def room():
+            return len(used_uris) < SHOT_BASE_REFERENCE_LIMIT
+
+        def remember(uri):
+            value = str(uri or "")
+            if not value or value in used_uris or not room():
+                return False
+            used_uris.add(value)
+            return True
+
         identities = self._identity_references(
             project_id, characters, required=bool(characters))
+        if len(identities) > SHOT_BASE_REFERENCE_LIMIT:
+            raise AifosError(
+                f"本镜有 {len(identities)} 位需锁定身份的人物，超过参考图"
+                f"硬上限 {SHOT_BASE_REFERENCE_LIMIT}；请拆分群像镜头")
         for identity in identities:
+            remember(identity["uri"])
             refs["character_refs"].append(identity["uri"])
             refs["identity_references"].append(identity)
             refs["asset_matches"].append({
@@ -3184,6 +3372,31 @@ class Director:
                 "label": f"{identity.get('character', '角色')}最终立绘",
                 "uri": identity["uri"],
             })
+        # 多人走位/变机位镜头的俯视空间图不仅要给 Seedance，也要在
+        # 关键帧阶段先把人数、站位和屏幕方向锁准。它只承担空间职责，
+        # 绝不能把编号、箭头或示意图样式画进成片。
+        spatial_uri = str(spatial_ref or "").strip()
+        if (spatial_uri
+                and (spatial_uri.startswith(("http://", "https://"))
+                     or Path(spatial_uri).exists())
+                and remember(spatial_uri)):
+            refs["spatial_ref"] = spatial_uri
+            spatial_row = next((
+                row for row in self.assets.active_list(
+                    project_id, kind="spatial_blocking")
+                if row["uri"] == spatial_uri), None)
+            refs["asset_matches"].append({
+                "asset_id": (
+                    spatial_row["id"] if spatial_row is not None else None),
+                "kind": "spatial_blocking",
+                "name": (
+                    spatial_row["name"] if spatial_row is not None
+                    else f"shot_{shot_no or 0}_space"),
+                "label": "本镜空间调度图",
+                "uri": spatial_uri,
+                "reference_role": "spatial",
+                "attach_to": f"shot:{shot_no}" if shot_no is not None else "",
+            })
         # 简化版即使项目历史里已有四视图，也只以人工锁定最终立绘为身份锚，
         # 避免旧扩展资产继续偷偷进入提示词与外部 API 参考图。
         asset_policy = ctx.get("character_asset_policy") or {}
@@ -3191,12 +3404,12 @@ class Director:
             asset_policy = self.character_asset_policy(
                 ctx["episode"]["id"], script=ctx.get("script"))
         include_sheets = asset_policy.get("generate_sheets", True)
-        if include_sheets:
+        # 3 人及以上群像只上传每人的最终立绘；人物套件图会挤占身份、
+        # 场景和连续性槽位，也容易让模型把不同角色的服装/脸互相混合。
+        if include_sheets and len(characters or []) <= 2:
             requested_keys = tuple(sheet_keys or ("turnaround", "costume"))
-            # 多人镜头优先保持参考图总量可控:每人喂本镜最相关的一张
-            # 套件图;单人镜头可以同时喂四视图和服装/细节图。
-            if len(characters or []) > 1:
-                requested_keys = requested_keys[-1:]
+            # 每人只用本镜最相关的一张套件；最终立绘已经承担身份锁定。
+            requested_keys = requested_keys[-1:]
             for name in characters or []:
                 for key in requested_keys:
                     row = self.assets.latest(
@@ -3206,6 +3419,8 @@ class Director:
                                 self._asset_quality(row))
                             or not row["uri"]
                             or not Path(row["uri"]).exists()):
+                        continue
+                    if not remember(row["uri"]):
                         continue
                     refs["character_refs"].append(row["uri"])
                     label = {
@@ -3223,7 +3438,8 @@ class Director:
         if location:
             row = self.assets.latest(project_id, "scene_art", location)
             if (row and formal_reference_allowed(self._asset_quality(row))
-                    and row["uri"] and Path(row["uri"]).exists()):
+                    and row["uri"] and Path(row["uri"]).exists()
+                    and remember(row["uri"])):
                 refs["scene_ref"] = row["uri"]
                 refs["asset_matches"].append({
                     "asset_id": row["id"], "kind": row["kind"],
@@ -3231,24 +3447,42 @@ class Director:
                     "uri": row["uri"],
                 })
         matched_rows = (self._matching_produced_image_rows(
-            project_id, characters, location, shot_no=shot_no)
+            project_id, characters, location, shot_no=shot_no, limit=1)
             if shot_no is not None else [])
         matched = []
         for row in matched_rows:
+            if not remember(row["uri"]):
+                continue
             matched.append(row["uri"])
             refs["asset_matches"].append({
                 "asset_id": row["id"], "kind": row["kind"],
                 "name": row["name"], "label": "同人物/同场景已生产图",
                 "uri": row["uri"],
             })
-        reference = matched + self._reference_uris(
-            project_id, list(characters or []) + ([location] if location
-                                                  else []))
+        attach_names = list(characters or []) + ([location] if location else [])
+        user_rows = self._reference_rows(
+            project_id, attach_names,
+            allowed_roles={
+                "identity", "wardrobe", "scene", "composition"})
+        reference = list(matched)
+        for row in user_rows:
+            if not remember(row["uri"]):
+                continue
+            reference.append(row["uri"])
+            refs["asset_matches"].append(
+                self._reference_asset_match(row))
         if reference:
             refs["reference_images"] = reference
         anchor = self._style_anchor_uri(project_id)
-        if anchor:
+        if anchor and remember(anchor):
             refs["style_ref"] = anchor
+            style_row = next((
+                row for row in self.assets.active_list(
+                    project_id, kind="reference")
+                if row["uri"] == anchor), None)
+            if style_row is not None:
+                refs["asset_matches"].append(
+                    self._reference_asset_match(style_row))
         # 只要本次已经有任何锚点，就必须路由到能真实接收图片的产线；
         # 空镜同样不能把场景/风格/用户参考静默丢掉。
         refs["require_reference_images"] = bool(
@@ -3274,89 +3508,130 @@ class Director:
         return None
 
     def _rich_shot_prompt(self, ctx, shot, location):
-        """详细出图提示词:场景 + 出场人物完整设定 + 动作 + 台词情绪 + 镜头,
-        让每张分镜画面都说清楚人物是谁、在做什么、什么故事情境。"""
+        """构造短而分层的生产级静帧提示词。
+
+        身份由最终立绘承担；文字只补充性别/年龄/身份、当镜服装、构图、
+        动作和可读文字，避免长篇人物经历与参考图争权。
+        """
         project_id = ctx["project"]["id"]
         title = ctx["project"].get("title", "")
-        parts = [f"漫剧《{title}》分镜画面"]
         script = ctx.get("script") or {}
         world = script.get("story_world") or {}
         background = script.get("story_background") or {}
-        world_line = "；".join(
-            str(world.get(key, "")).strip()
-            for key in ("overview", "era_and_location", "hard_rules",
-                        "visual_baseline")
-            if str(world.get(key, "")).strip())
+        parts = [f"【TASK】漫剧《{title}》镜头 {shot.get('shot_no', '')} 静态关键帧"]
+        world_line = "；".join(filter(None, (
+            str(world.get("era_and_location") or "").strip(),
+            str(world.get("hard_rules") or "").strip(),
+            str(world.get("visual_baseline") or "").strip(),
+        )))
         if world_line:
-            parts.append(f"故事世界硬约束:{world_line}")
-        situation = "；".join(
-            str(background.get(key, "")).strip()
-            for key in ("current_situation", "core_conflict", "episode_goal")
-            if str(background.get(key, "")).strip())
+            parts.append(f"【WORLD / STYLE·故事世界硬约束】{world_line}")
+        situation = "；".join(filter(None, (
+            str(background.get("current_situation") or "").strip(),
+            str(background.get("core_conflict") or "").strip(),
+        )))
         if situation:
-            parts.append(f"本集故事背景:{situation}")
+            parts.append(f"【STORY CONTEXT·本集故事背景】{situation}")
+        scene = next((s for s in script.get("scenes", [])
+                      if s.get("scene_no") == shot.get("scene_no")), {})
         if location:
-            scene = next((s for s in script.get("scenes", [])
-                          if s.get("scene_no") == shot.get("scene_no")), {})
-            scene_detail = str(scene.get("action") or "").strip()
-            parts.append(f"场景:{location}"
-                         + (f"(本场情境与环境细节:{scene_detail})"
-                            if scene_detail else ""))
+            parts.append(
+                f"【SCENE】{location}；空间、陈设、光线与场景基准图一致"
+                + (f"；本场情境:{str(scene.get('action')).strip()}"
+                   if str(scene.get("action") or "").strip() else ""))
         script_profiles = {
             item.get("name"): item
             for item in script.get("characters", [])
             if isinstance(item, dict) and item.get("name")
         }
         who = []
-        for name in shot.get("characters", []):
-            design = self._reference_safe_design(
-                self._character_design(project_id, name))
+        number_map = shot.get("character_number_map") or {}
+        actor_by_name = {
+            item.get("name"): actor_id
+            for actor_id, item in number_map.items()
+            if isinstance(item, dict) and item.get("name")
+        }
+        for pos, name in enumerate(shot.get("characters", []), 1):
             design = {
+                **(self._character_design(project_id, name) or {}),
                 **script_profiles.get(name, {}),
-                **(design or {}),
+                **self._locked_look_variant(project_id, name),
             }
             line = self._design_line(design, keys=(
-                "introduction", "gender", "age_range", "identity",
-                "personality", "species", "costume", "costume_detail",
-                "makeup", "accessories", "palette", "signature",
-                "temperament",
-                "background_prompt", "era_setting", "occupation",
+                "gender", "age_range", "species", "identity", "occupation",
+                "hair", "makeup", "costume", "costume_detail",
+                "palette", "accessories", "temperament",
                 "costume_direction", "signature_props")) if design else ""
-            identity_rule = (
-                "身份外貌、性别、年龄、脸型、五官和发型只以所附人工锁定"
-                "最终立绘为准，禁止被旧文字设定覆盖")
-            who.append(f"{name}({identity_rule}"
-                       + (f";{line}" if line else "") + ")")
+            actor_id = actor_by_name.get(name) or f"P{pos:02d}"
+            who.append(
+                f"{actor_id}={name}（{line or '人物身份以最终立绘为准'}；"
+                "脸型、五官骨相、年龄、性别表达、发际线与发型轮廓只以"
+                "该角色最终立绘锁定；不得复制参考图的姿势、背景或未声明服装）")
         if who:
             parts.append(
-                f"出场人物(严格共{len(who)}人,形态与设定一致):"
-                + ";".join(who))
+                f"【IDENTITY LOCK】画面严格共{len(who)}人；"
+                + "；".join(who)
+                + "；每人只读取自己编号对应的最终立绘，禁止串脸、换性别、"
+                "新增、缺失、合并或复制人物")
         else:
-            parts.append("环境空镜,画面中无人物")
+            parts.append(
+                "【IDENTITY LOCK】严格 0 人空镜；禁止人物、人体局部、"
+                "剪影、倒影中的人或随机路人")
+        start_state = shot.get("start_state") or {}
+        if start_state:
+            parts.append("【START STATE】" + "；".join(
+                f"{name}:{state.get('position', '')},"
+                f"{state.get('pose', '')},朝向{state.get('direction', '')}"
+                for name, state in start_state.items()))
         action = shot.get("description") or shot.get("prompt", "")
-        if action:
-            parts.append(f"本镜动作/画面:{action}")
+        parts.append(f"【ACTION】{action or '环境状态保持稳定'}")
         dialogue = shot.get("dialogue")
         if isinstance(dialogue, dict) and dialogue.get("dialogue"):
             speaker = dialogue.get("character", "")
             emo = (shot.get("speech_timing") or {}).get("emotion", "")
             parts.append(
-                f"此刻{speaker}正说「{dialogue['dialogue']}」"
-                + (f",情绪{emo},神态需体现" if emo else ",神态需体现"))
+                f"【EYES / EXPRESSION】{speaker}正在说话；"
+                f"{'情绪' + emo + '；' if emo else ''}"
+                "用视线、眉眼、下颌张力和呼吸体现，不把台词画成字幕")
         elif shot.get("kind") == "reaction":
-            parts.append("表现听者听到上一句台词后的即时反应与微表情")
+            parts.append(
+                "【EYES / EXPRESSION】表现听者即时反应；眼神先变，随后"
+                "眉眼和呼吸产生微小变化，避免夸张表情包")
+        else:
+            performance = shot.get("performance") or {}
+            parts.append(
+                f"【EYES / EXPRESSION】{performance.get('gaze') or '视线服务主体动作'}；"
+                f"{performance.get('micro_expression') or '自然微表情和呼吸'}")
         camera = shot.get("camera", "")
-        if camera:
-            parts.append(f"镜头语言:{camera}")
-        ref = (shot.get("script_reference") or "").strip()
-        if ref and ref not in action:
-            parts.append(f"剧情依据:{ref}")
-        # 画布关系线:多人物镜头带上人物之间的关联,牵引跨镜一致
+        contract = shot.get("shot_contract") or {}
+        parts.append(
+            "【COMPOSITION / CAMERA】"
+            f"{contract.get('景别') or camera or '按分镜'}；"
+            f"{contract.get('角度') or ''}；{contract.get('焦段') or ''}；"
+            f"{contract.get('机位') or ''}；构图{contract.get('构图') or '主体清楚'}")
         lines = relation_lines(self._relations(ctx),
                                shot.get("characters", []))
         if lines:
-            parts.append("人物关系线:" + ";".join(lines))
-        return "。".join(p for p in parts if p)
+            parts.append(
+                "【SPATIAL RELATION·人物关系线】" + "；".join(lines))
+        readable = shot.get("readable_text") or {}
+        if readable.get("required"):
+            whitelist = "、".join(readable.get("whitelist") or [])
+            parts.append(
+                f"【TEXT LOCK】文字载体={readable.get('carrier') or '指定载体'}；"
+                f"只允许逐字出现:{whitelist or '白名单为空'}；禁止新增文字")
+        else:
+            parts.append("【TEXT LOCK】无画面文字；禁止字幕、乱码、Logo和水印")
+        parts.append(
+            "【SKIN / MATERIAL】肤色干净、均匀、通透，仅保留极轻微真实"
+            "微纹理；衣料、金属、玻璃和环境材质可辨")
+        parts.append(
+            "【STRUCTURE】五官透视、手指、关节、肢体比例、遮挡关系与"
+            "接触点自然，无粘连、断肢、穿模或漂浮道具")
+        parts.append(
+            "【NEGATIVE】禁止身份漂移、性别错误、人数错误、脸部融合、"
+            "重复人物、错误服装、无关杂物、脏污皮肤、塑料脸、字幕和标签")
+        return "\n".join(p for p in parts if p)
 
     def _shot_payload(self, ctx, shot, *, continuity_anchor=False,
                       quality_override=None, item_id=None):
@@ -3399,6 +3674,8 @@ class Director:
                 **(self._reference_safe_design(
                     self._character_design(
                         ctx["project"]["id"], name)) or {}),
+                **self._locked_look_variant(
+                    ctx["project"]["id"], name),
             }
             for name in shot.get("characters", [])
         }
@@ -3441,7 +3718,10 @@ class Director:
             **self._art_refs(
                 ctx, identity_characters, location,
                 shot_no=shot["shot_no"],
-                sheet_keys=self._shot_reference_sheet_keys(shot)),
+                sheet_keys=self._shot_reference_sheet_keys(shot),
+                spatial_ref=(
+                    (spatial or {}).get("spatial_reference_uri", "")
+                    if requires_spatial_reference(spatial or {}) else "")),
         }
         actor_ids = {
             actor.get("name"): actor.get("actor_id")
@@ -3470,14 +3750,17 @@ class Director:
         """按提交顺序给每张参考图编号并绑定用途(与产线上传顺序一致)。
 
         顺序必须与 API/CLI 产线的图片提交顺序完全相同:
-        最终立绘 → 人物设定图 → 上一镜尾帧 → 场景图 → 风格基准 → 用户参考图。
+        最终立绘 → 空间调度图 → 人物设定图 → 本镜关键图 →
+        上一镜尾帧 → 场景图 → 风格基准 → 用户参考图。
         """
-        labels = {match.get("uri"): match.get("label", "")
-                  for match in payload.get("asset_matches", [])
-                  if isinstance(match, dict)}
+        matches = {
+            match.get("uri"): match
+            for match in payload.get("asset_matches", [])
+            if isinstance(match, dict) and match.get("uri")
+        }
         entries, seen = [], set()
 
-        def add(uri, label, binding, character=""):
+        def add(uri, label, binding, character="", role=""):
             value = str(uri or "").strip()
             if not value or value in seen:
                 return
@@ -3485,7 +3768,7 @@ class Director:
             entries.append({
                 "index": len(entries) + 1, "uri": value,
                 "label": label, "binding": binding,
-                "character": character,
+                "character": character, "role": role,
             })
 
         for pos, ref in enumerate(
@@ -3495,41 +3778,119 @@ class Director:
             who = str(ref.get("character") or "角色")
             actor = str(ref.get("actor_id") or f"P{pos:02d}")
             add(ref["uri"], f"{actor}·{who}最终立绘",
-                f"{who}的脸型、五官、发型、体型、年龄感必须与此图同一人,"
-                "禁止参考他人图片", character=who)
+                f"只锁定{who}的脸型、五官骨相、年龄、性别表达、发际线、"
+                "发型轮廓、体型与身份标志；不得复制此图的服装、姿势、"
+                "构图、背景或光线，除非本镜另有明确要求；禁止参考他人图片",
+                character=who, role="identity")
+        add(payload.get("spatial_ref"), "本镜空间调度图",
+            "只读取人物编号与对应站位、相对距离、前后遮挡、屏幕方向、"
+            "行动箭头和摄影机起终点；不得把俯视视角、编号、姓名、坐标、"
+            "箭头、色块、网格或任何示意图元素画进最终画面",
+            role="spatial")
         for uri in payload.get("character_refs") or []:
-            label = labels.get(uri) or "人物设定图"
-            who = label.split("最终立绘")[0].split("四视图")[0] \
-                if ("最终立绘" in label or "四视图" in label) else ""
+            match = matches.get(uri) or {}
+            label = match.get("label") or "人物设定图"
+            name = str(match.get("name") or "")
+            who = name.split(":", 1)[0] if ":" in name else ""
+            sheet = name.split(":", 1)[1] if ":" in name else ""
+            if sheet in ("costume", "costume_detail"):
+                binding = (
+                    f"只读取{who or '对应人物'}的服装结构、材质、配色、"
+                    "鞋履和配饰；不得用此图覆盖脸、年龄、性别、姿势或背景")
+                role = "wardrobe"
+            elif sheet in ("features", "makeup", "closeup"):
+                binding = (
+                    f"只补充{who or '对应人物'}的五官/妆容局部细节；"
+                    "身份仍以最终立绘为准，不复制服装、姿势或背景")
+                role = "identity_detail"
+            elif sheet == "turnaround":
+                binding = (
+                    f"只补充{who or '对应人物'}的体型比例、发型轮廓与"
+                    "各角度结构；不得覆盖最终立绘身份或强制复制图中姿势")
+                role = "structure"
+            else:
+                binding = (
+                    "只读取标签所指的单一人物属性；不得覆盖最终立绘身份，"
+                    "不得把图片中的其他人物、姿势或背景带入本镜")
+                role = "character_detail"
             add(uri, label,
-                (f"{who}的服装结构、材质与配色细节参考此图"
-                 if who else "对应人物的服装结构与配色细节参考此图"),
-                character=who)
+                binding, character=who, role=role)
+        add(payload.get("image_uri"), "本镜已通过的关键图",
+            "只锁定本镜构图、人物站位、场景、道具、服装和已锁定文字；"
+            "人物脸和性别仍以各自最终立绘为准，不得复制关键图中的错误",
+            role="keyframe")
         add(payload.get("chain_first_uri"), "上一镜结尾画面",
-            "构图、光线、人物站位与状态需自然承接此图")
+            "只承接屏幕方向、构图、光线、人物站位、服装、道具和状态；"
+            "不得用它覆盖各角色最终立绘身份", role="continuity")
         location = payload.get("location", "")
         add(payload.get("scene_ref"),
             f"场景「{location}」基准图" if location else "场景基准图",
-            "空间结构、陈设、材质与光线以此图为准")
+            "只锁定空间结构、陈设、材质与主光方向；忽略图中任何人物、"
+            "服装、姿势或可读文字", role="scene")
         add(payload.get("style_ref"), "全片风格基准图",
-            "绘画风格、线条、上色与光影必须与此图一致")
+            "只读取媒介、线条/渲染、上色、材质与光影风格；忽略图中"
+            "人物身份、服装、姿势、场景布局和文字", role="style")
         for uri in payload.get("reference_images") or []:
-            label = labels.get(uri) or "用户上传参考图"
+            match = matches.get(uri) or {}
+            label = match.get("label") or "用户上传参考图"
+            ref_role = str(match.get("reference_role") or "")
+            attach = str(match.get("attach_to") or "")
             if "待修改基底" in label:
                 binding = (
                     "这是当前待修改的原图；只修正修改意见指出的问题，"
                     "未提及的人物、构图、服装、道具、文字和光影保持不变")
+                ref_role = "revision_base"
             elif "连续性约束" in label:
                 binding = (
                     "这是同镜头另一端画面；人物身份、服装、场景、道具和"
                     "屏幕方向必须连续")
+                ref_role = "continuity"
             elif "参考分镜" in label:
-                binding = "镜头构图、人物身份与场景关系以此图为基准"
+                binding = (
+                    "只参考镜头构图、人物站位和场景关系；人物身份与性别"
+                    "仍以最终立绘为准，忽略额外人物")
+                ref_role = "composition"
             elif "已生产" in label:
-                binding = "同人物/同场景连续性参考,人物造型与环境延续此前画面"
+                binding = (
+                    "只承接同一人物集合、同一场景的服装/道具/光线状态；"
+                    "人物身份仍以最终立绘为准")
+                ref_role = "continuity"
+            elif ref_role == "identity":
+                binding = (
+                    f"只锁定{attach or '所关联人物'}的脸、年龄、性别表达、"
+                    + ("发际线/发量/发色家族和身份标志；候选阶段允许按"
+                       "造型方向改变发型梳法与轮廓；"
+                       if payload.get("portrait_candidate") else
+                       "发际线、发型轮廓和身份标志；")
+                    + "不复制服装、姿势、背景或其他人物")
+            elif ref_role == "wardrobe":
+                binding = (
+                    f"只参考{attach or '所关联对象'}的服装/道具结构、材质"
+                    "与配色；不得覆盖人物脸、性别、姿势或背景")
+            elif ref_role == "scene":
+                binding = (
+                    f"只参考{attach or '所关联场景'}的空间、陈设、材质和"
+                    "光线；忽略图中人物与文字")
+            elif ref_role == "composition":
+                binding = (
+                    "只参考构图、机位、动作路径或姿势关系；人物身份、"
+                    "服装和场景分别服从对应锁定资产")
+            elif ref_role == "style":
+                binding = (
+                    "只参考画风、渲染、材质、色彩与光影；忽略人物、服装、"
+                    "姿势、场景布局和文字")
             else:
-                binding = "用户指定参考,涉及的人物/场景以此为优先标准"
-            add(uri, label, binding)
+                binding = (
+                    "用户手动参考图未声明用途；只作弱构图参考，不得覆盖"
+                    "人物身份、性别、人数、服装、场景或已锁定文字")
+                ref_role = "manual"
+            add(uri, label, binding, character=attach, role=ref_role)
+        if len(entries) > IMAGE_REFERENCE_LIMIT:
+            labels = "、".join(entry["label"] for entry in entries)
+            raise AifosError(
+                f"本次需要 {len(entries)} 张参考图，超过图片模型公共上限 "
+                f"{IMAGE_REFERENCE_LIMIT} 张；请拆分任务或删除低优先级参考:"
+                f"{labels}")
         return entries
 
     def _with_reference_manifest(self, payload):
@@ -3553,8 +3914,9 @@ class Director:
         payload["prompt"] = (
             base_prompt.rstrip("。")
             + f"。参考图对照表(共{len(manifest)}张,按此顺序提交,"
-            "必须严格按编号对应使用,禁止张冠李戴、禁止把一个人的脸画成"
-            "另一张参考图中的人):" + ";".join(lines))
+            "每张图只允许执行其绑定用途；禁止跨用途传播、张冠李戴、"
+            "把一个人的脸/服装/姿势/背景复制给另一个人):"
+            + ";".join(lines))
 
     def _stage_images(self, ctx):
         self._plan_seed_shots(ctx)
@@ -3870,8 +4232,10 @@ class Director:
         storyboard, _ = self.projects.latest_document(
             episode["id"], "storyboard")
         shots = (storyboard or {}).get("shots", [])
-        if not any(int(shot.get("shot_no", -1)) == int(shot_no)
-                   for shot in shots):
+        target_shot = next((
+            shot for shot in shots
+            if int(shot.get("shot_no", -1)) == int(shot_no)), None)
+        if target_shot is None:
             raise AifosError(f"镜头不存在: {shot_no}")
         if reset:
             document, _ = self.projects.latest_document(
@@ -3885,23 +4249,47 @@ class Director:
             return {**document, "version": version}
         project = self.db.query_one(
             "SELECT * FROM projects WHERE id=?", (episode["project_id"],))
+        script, _ = self.projects.latest_document(
+            episode["id"], "script")
         ctx = {"project": dict(project), "episode": dict(episode),
-               "out_root": self._episode_dir(project, episode)}
+               "out_root": self._episode_dir(project, episode),
+               "script": script or {}}
         spatial = self._spatial_reference_requirement(ctx, shot_no)
         unique_ids = []
         for value in asset_ids or []:
             asset_id = int(value)
             if asset_id not in unique_ids:
                 unique_ids.append(asset_id)
-        # multimodal2video 最多 9 张；首尾帧占 2 张。需要空间图时再保留
-        # 一个不可取消的槽位，人工参考最多 6 张。
-        manual_limit = 6 if spatial["required"] else 7
-        if len(unique_ids) > manual_limit:
-            suffix = ("（本镜另保留 1 张空间调度图）"
-                      if spatial["required"] else "")
+        # multimodal2video 最多 9 张；首尾帧占 2 张。空间图和每位出场
+        # 人物最终立绘都是不可取消的硬参考，人工只能使用剩余槽位。
+        mandatory_ids = set()
+        if spatial["row"] is not None:
+            mandatory_ids.add(spatial["row"]["id"])
+        missing_identities = []
+        for name in self._video_identity_names(ctx, target_shot):
+            row = self._locked_identity(episode["project_id"], name)
+            if row is None:
+                missing_identities.append(name)
+            else:
+                mandatory_ids.add(row["id"])
+        if missing_identities:
             raise AifosError(
-                f"每个镜头最多选择 {manual_limit} 张资产参考图{suffix}")
+                "以下出场角色缺少最终立绘，禁止选择 Seedance 参考图:"
+                + "、".join(missing_identities))
+        if len(mandatory_ids) > 7:
+            raise AifosError(
+                f"本镜空间图与人物最终立绘已占 {len(mandatory_ids)} 张，"
+                "超过 Seedance 2 资产参考上限7张；请拆分群像镜头")
+        manual_limit = max(0, 7 - len(mandatory_ids))
+        unique_ids = [
+            asset_id for asset_id in unique_ids
+            if asset_id not in mandatory_ids]
+        if len(unique_ids) > manual_limit:
+            raise AifosError(
+                f"本镜空间图与人物最终立绘已占 {len(mandatory_ids)} 张，"
+                f"最多再选择 {manual_limit} 张额外参考图")
         selected = []
+        location = self._shot_location(script, target_shot)
         for asset_id in unique_ids:
             row = self.assets.get(asset_id)
             if row is None or row["project_id"] != episode["project_id"]:
@@ -3915,6 +4303,10 @@ class Director:
                 raise AifosError(f"资产不是可用图片: {row['kind']}")
             if row["kind"] == "spatial_blocking":
                 raise AifosError("空间调度图由系统按镜头强制加入，无需人工选择")
+            mismatch = self._video_reference_mismatch(
+                row, target_shot, location)
+            if mismatch:
+                raise AifosError(mismatch)
             if not formal_reference_allowed(self._asset_quality(row)):
                 raise AifosError(f"低质量候选图不能交给 Seedance: {row['name']}")
             uri = row["uri"]
@@ -3966,6 +4358,7 @@ class Director:
                 "items": [{
                     "asset_id": row["id"], "kind": row["kind"],
                     "name": row["name"], "uri": row["uri"],
+                    "binding": self._video_reference_binding(row),
                 } for row in self._video_reference_rows(ctx, no)],
             }
         return {"schema": "aifos.video-references-effective/v1",
@@ -3974,7 +4367,8 @@ class Director:
     def _auto_video_reference_rows(self, ctx, shot_no):
         """人工未选择时,按剧本/分镜自动集合本镜必要参考图。
 
-        顺序:本镜分镜图 → 出场人物最终立绘 → 场景概念图 → 用户参考图;
+        顺序:空间图 → 出场人物最终立绘 → 本镜分镜图 → 场景概念图
+        → 与本镜对象精确关联的用户参考图;
         全部限中/高质量且文件在盘,最多 7 张(multimodal2video 上限内)。
         """
         project_id = ctx["project"]["id"]
@@ -4014,14 +4408,27 @@ class Director:
         # 空间图是多人/变机位镜头的硬参考，优先占位且不可被人工选择覆盖。
         spatial = self._spatial_reference_requirement(ctx, shot_no)
         add(spatial["row"])
-        for name in shot.get("characters", []) or []:
-            add(self._locked_identity(project_id, name))
+        missing = []
+        for name in self._video_identity_names(ctx, shot):
+            identity = self._locked_identity(project_id, name)
+            if identity is None:
+                missing.append(name)
+            else:
+                add(identity)
+        if missing:
+            raise AifosError(
+                "以下出场角色缺少最终立绘，禁止交给 Seedance:"
+                + "、".join(missing))
+        if len(rows) > 7:
+            raise AifosError(
+                f"镜头{shot_no}的空间图与人物最终立绘已占{len(rows)}张，"
+                "超过 Seedance 2 资产参考上限7张；请拆分群像镜头")
         # 本镜分镜示例图承载构图事实；它即使是低档候选也可在首尾帧之外
         # 作为构图参考，但不能挤掉必传空间图与人物身份图。
         shot_image = self.assets.latest(
             project_id, "image",
             f"e{ctx['episode']['number']:03d}_shot{int(shot_no):03d}")
-        if (shot_image is not None
+        if (len(rows) < 7 and shot_image is not None
                 and not self.assets.is_deleted(shot_image)
                 and shot_image["uri"]
                 and (shot_image["uri"].startswith(("http://", "https://"))
@@ -4029,17 +4436,79 @@ class Director:
                 and shot_image["id"] not in seen):
             seen.add(shot_image["id"])
             rows.append(shot_image)
-        if location:
+        if location and len(rows) < 7:
             add(self.assets.latest(project_id, "scene_art", location))
-        wanted = set(shot.get("characters") or [])
+        wanted = list(shot.get("characters") or [])
         if location:
-            wanted.add(location)
-        for row in self.assets.active_list(project_id, kind="reference"):
-            attach = self._asset_meta(row).get("attach_to", "")
-            if attach and attach not in wanted:
-                continue
+            wanted.append(location)
+        for row in self._reference_rows(
+                project_id, wanted,
+                allowed_roles={
+                    "identity", "wardrobe", "scene", "composition", "style"},
+                include_global_style=True):
+            if len(rows) >= 7:
+                break
             add(row)
-        return rows[:7]
+        return rows
+
+    @staticmethod
+    def _shot_location(script, shot):
+        """按场号解析镜头场景名，兼容字符串/整数场号。"""
+        scene_no = shot.get("scene_no")
+        return next((
+            str(scene.get("location") or "")
+            for scene in (script or {}).get("scenes", [])
+            if str(scene.get("scene_no")) == str(scene_no)), "")
+
+    def _video_identity_names(self, ctx, shot):
+        """Seedance 必传最终立绘名单；背景路人不建立独立母资产。"""
+        script = ctx.get("script")
+        if script is None:
+            script, _ = self.projects.latest_document(
+                ctx["episode"]["id"], "script")
+            ctx["script"] = script or {}
+        profiles = {
+            item.get("name"): item
+            for item in (script or {}).get("characters", [])
+            if isinstance(item, dict) and item.get("name")
+        }
+        return [
+            name for name in (shot.get("characters") or [])
+            if not is_background_character(profiles.get(name, {}))]
+
+    def _video_reference_mismatch(self, row, shot, location=""):
+        """返回 Seedance 资产与当前镜头不兼容的原因；空串表示可用。
+
+        这个检查既用于新选择，也用于读取历史选择，避免旧版本保存的
+        错角色/错场景参考图在升级后继续悄悄污染视频。
+        """
+        characters = set(shot.get("characters") or [])
+        kind = row["kind"]
+        if kind in (
+                "character_identity", "character_art",
+                "character_candidate", "character_sheet"):
+            character = (
+                self._asset_meta(row).get("character")
+                or str(row["name"]).split(":", 1)[0])
+            if character not in characters:
+                return (
+                    f"资产「{row['name']}」属于未出场角色{character}，"
+                    "禁止作为本镜人物参考")
+        if kind == "reference":
+            meta = self._asset_meta(row)
+            attach = str(meta.get("attach_to") or "").strip()
+            valid_targets = set(characters)
+            if location:
+                valid_targets.add(location)
+            if attach and attach not in valid_targets:
+                return (
+                    f"参考图「{row['name']}」关联到{attach}，"
+                    "与本镜人物/场景不匹配")
+            role = self._reference_role(row)
+            if role == "manual" and not attach:
+                # 旧数据可保留手动选择能力，但只按弱构图使用。
+                return ""
+        return ""
 
     def _video_reference_rows(self, ctx, shot_no):
         document, _ = self.projects.latest_document(
@@ -4052,6 +4521,31 @@ class Director:
         spatial = self._spatial_reference_requirement(ctx, shot_no)
         rows = [spatial["row"]] if spatial["row"] is not None else []
         seen = {row["id"] for row in rows}
+        storyboard = ctx.get("storyboard")
+        if storyboard is None:
+            storyboard, _ = self.projects.latest_document(
+                ctx["episode"]["id"], "storyboard")
+        shot = next((
+            item for item in (storyboard or {}).get("shots", [])
+            if int(item.get("shot_no", -1)) == int(shot_no)), {})
+        script = ctx.get("script")
+        if script is None:
+            script, _ = self.projects.latest_document(
+                ctx["episode"]["id"], "script")
+        location = self._shot_location(script, shot)
+        # 人工选择只能调整“额外参考”，不能取消每位出场人物的最终立绘。
+        missing = []
+        for name in self._video_identity_names(ctx, shot):
+            row = self._locked_identity(ctx["project"]["id"], name)
+            if row is None:
+                missing.append(name)
+            elif row["id"] not in seen:
+                seen.add(row["id"])
+                rows.append(row)
+        if missing:
+            raise AifosError(
+                "以下出场角色缺少最终立绘，禁止交给 Seedance:"
+                + "、".join(missing))
         for item in selected:
             row = self.assets.get(item.get("asset_id"))
             if row is None or row["project_id"] != ctx["project"]["id"]:
@@ -4062,12 +4556,157 @@ class Director:
                     or self.assets.is_deleted(row) or not row["uri"]
                     or not formal_reference_allowed(self._asset_quality(row))):
                 continue
+            if self._video_reference_mismatch(row, shot, location):
+                continue
             uri = row["uri"]
             if (uri.startswith(("http://", "https://"))
                     or Path(uri).exists()) and row["id"] not in seen:
                 seen.add(row["id"])
                 rows.append(row)
-        return rows[:7]
+        if len(rows) > 7:
+            raise AifosError(
+                f"镜头{shot_no}的空间图、人物最终立绘与人工参考共"
+                f"{len(rows)}张，超过 Seedance 2 资产参考上限7张；"
+                "请减少人工额外参考或拆分群像镜头")
+        return rows
+
+    def _video_reference_binding(self, row):
+        """Seedance 每张资产的单一职责，禁止“身份/服装/场景全都锁”。"""
+        kind = row["kind"]
+        meta = self._asset_meta(row)
+        name = str(row["name"] or "")
+        if kind == "spatial_blocking":
+            return (
+                "只读取人物编号、起终站位、行动箭头、屏幕方向和摄影机"
+                "起终点；不得把俯视图、文字、坐标、箭头或图形画进成片")
+        if kind in (
+                "character_identity", "character_art",
+                "character_candidate"):
+            character = str(meta.get("character") or name.split(":", 1)[0])
+            return (
+                f"只锁定{character}的脸型、五官骨相、年龄、性别表达、"
+                "发际线、发型轮廓、体型与身份标志；服装、姿势、背景和"
+                "光线服从首尾帧，不得复制给其他人")
+        if kind == "character_sheet":
+            character = str(meta.get("character") or name.split(":", 1)[0])
+            sheet = str(meta.get("sheet") or (
+                name.split(":", 1)[1] if ":" in name else ""))
+            if sheet in ("costume", "costume_detail"):
+                return (
+                    f"只参考{character}的服装/道具结构、材质和配色；"
+                    "不得覆盖脸、性别、动作、场景或其他人物")
+            return (
+                f"只补充{character}的体型/五官/发型或妆容细节；"
+                "身份仍以最终立绘为准，不复制服装、姿势或背景")
+        if kind == "scene_art":
+            return (
+                "只锁定场景空间、陈设、材质与主光方向；忽略图中人物、"
+                "动作、服装和文字")
+        if kind in ("image", "first_frame", "last_frame"):
+            return (
+                "只参考构图、人物站位、服装/道具状态、屏幕方向和光线"
+                "连续性；人物身份和性别仍以最终立绘为准，忽略额外人物")
+        if kind == "reference":
+            role = self._reference_role(row)
+            attach = str(meta.get("attach_to") or "所关联对象")
+            return {
+                "identity": (
+                    f"只锁定{attach}的脸、年龄、性别表达、发型轮廓和"
+                    "身份标志；不复制服装、姿势、背景或其他人物"),
+                "wardrobe": (
+                    f"只参考{attach}的服装/道具结构、材质与配色；"
+                    "不得覆盖人物身份、动作或场景"),
+                "scene": (
+                    f"只参考{attach}的空间、陈设、材质和光线；"
+                    "忽略人物、服装与文字"),
+                "composition": (
+                    "只参考构图、机位、动作路径和姿势关系；"
+                    "人物身份、服装和场景服从各自锁定资产"),
+                "style": (
+                    "只参考画风、渲染、材质、色彩与光影；"
+                    "忽略人物、服装、姿势、场景布局和文字"),
+                "manual": (
+                    "未声明用途，只作弱构图参考；不得覆盖人物身份、"
+                    "性别、人数、服装、场景或已锁定文字"),
+            }[role]
+        return (
+            "只按资产类别提供弱连续性参考；不得覆盖首尾帧、人物最终"
+            "立绘、准确人数、性别或已锁定文字")
+
+    def _seedance_video_prompt(self, ctx, shot, reference_manifest):
+        """把旧/新分镜统一成短、硬、单动作的 Seedance 提示词。"""
+        characters = list(shot.get("characters") or [])
+        number_map = shot.get("character_number_map") or {}
+        actor_by_name = {
+            item.get("name"): actor_id
+            for actor_id, item in number_map.items()
+            if isinstance(item, dict) and item.get("name")
+        }
+        mapped = "、".join(
+            f"{actor_by_name.get(name) or f'P{index:02d}'}={name}"
+            for index, name in enumerate(characters, 1)) or "无人"
+
+        def state_line(states):
+            values = []
+            for name, state in (states or {}).items():
+                values.append(
+                    f"{name}:{state.get('position', '')},"
+                    f"{state.get('pose', '')},情绪{state.get('emotion', '')},"
+                    f"朝向{state.get('direction', '')}")
+            return "；".join(values)
+
+        camera = ((shot.get("five_dimensions") or {}).get(
+            "camera_design") or {})
+        movement = str(camera.get("movement")
+                       or (shot.get("shot_contract") or {}).get("运镜")
+                       or "固定")
+        performance = shot.get("performance") or {}
+        spatial = shot_blocking(ctx.get("blocking"), shot["shot_no"]) or {}
+        spatial_rule = str(spatial.get("constraint") or "").strip()
+        readable = shot.get("readable_text") or {}
+        if readable.get("required"):
+            text_rule = (
+                "首帧已有文字只做像素级保持，不新增、不改写、不重排；"
+                "视频模型不得从零生成文字")
+        else:
+            text_rule = "画面无字幕、无新增文字、无Logo、无水印"
+        dialogue = shot.get("dialogue") or {}
+        dialogue_rule = (
+            f"；{dialogue.get('character')}按自然口型说出台词，"
+            "说话时保留眼神、呼吸和细小停顿"
+            if dialogue.get("dialogue") else "")
+        lines = [
+            "【输入边界】图1首帧是唯一动作起点；图2尾帧是唯一动作终点。",
+            f"【人物硬锁】{mapped}；成片从头到尾严格共{len(characters)}人，"
+            "不得新增、缺失、复制、合并、换脸或换性别；"
+            "脸和性别按各自最终立绘，服装/道具按首尾帧。",
+            f"【起点】{state_line(shot.get('start_state')) or '保持首帧可见状态'}。",
+            f"【单一主动作】{shot.get('description') or shot.get('prompt') or '环境自然变化'}。",
+            f"【表演】{performance.get('gaze') or '视线服务主体动作'}；"
+            f"{performance.get('micro_expression') or '自然微表情、呼吸和重心变化'}"
+            f"{dialogue_rule}。",
+            f"【运镜】只执行一次{movement}；"
+            f"{camera.get('shot_scale') or (shot.get('shot_contract') or {}).get('景别') or '保持既定景别'}，"
+            f"{camera.get('angle') or (shot.get('shot_contract') or {}).get('角度') or '保持轴线'}；"
+            f"动机={camera.get('movement_motivation') or '服务主体动作'}。",
+        ]
+        if spatial_rule:
+            lines.append(f"【空间路径】{spatial_rule}")
+        lines.extend([
+            f"【终点】{state_line(shot.get('end_state')) or '准确到达尾帧状态'}。",
+            f"【文字】{text_rule}。",
+        ])
+        if reference_manifest:
+            lines.append(
+                "【资产图单一职责】"
+                + "；".join(
+                    f"图{item['index']}={item['kind']}/{item['name']}："
+                    f"{item['binding']}" for item in reference_manifest))
+        lines.append(
+            "【禁止】不得把空间示意图、编号、姓名标签、坐标、箭头、"
+            "参考图边框、字幕或乱码画进成片；不得执行第二个主动作或"
+            "第二种运镜；不得在首尾帧之间改变人物、服装、道具或场景。")
+        return "\n".join(lines)
 
     def _prepare_video_call(self, ctx, shot, frames):
         """在主线程锁定单镜首尾帧、人物/场景资产和空间图映射。"""
@@ -4098,22 +4737,18 @@ class Director:
             "index": index + 3,
             **asset,
             "uri": row["uri"],
-            "binding": (
-                "只读取人物编号、起终站位、行动箭头和摄影机起终点；"
-                "这是俯视示意图，不得把图形、文字或俯视画风画进成片"
-                if row["kind"] == "spatial_blocking"
-                else "按该资产类别锁定本镜人物身份、服装、场景或构图"),
+            "binding": self._video_reference_binding(row),
         } for index, (row, asset) in enumerate(
             zip(reference_rows, reference_assets))]
-        video_prompt = shot.get("seedance_prompt", shot["prompt"])
-        if reference_manifest:
+        video_prompt = self._seedance_video_prompt(
+            ctx, shot, reference_manifest)
+        manual_feedback = (ctx.get("video_feedback") or {}).get(
+            int(shot["shot_no"]), "")
+        if manual_feedback:
             video_prompt += (
-                "。Seedance 图片输入对照表：图1=首帧（动作起点）；"
-                "图2=尾帧（动作终点）；"
-                + "；".join(
-                    f"图{item['index']}={item['kind']}/{item['name']}："
-                    f"{item['binding']}" for item in reference_manifest)
-                + "。必须严格按图序使用，禁止张冠李戴。")
+                "\n【人工修订意见】这是人工检查后确认的本镜修订要求，"
+                "只修正以下问题并保持其余首尾帧、人物、服装、场景和口型不变："
+                + str(manual_feedback)[:1200])
         payload = {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
@@ -4390,6 +5025,116 @@ class Director:
             meta=result.data)
         return result.data
 
+    def _video_qc_path(self, ctx):
+        return ctx["out_root"] / "video_qc_report.json"
+
+    def _load_video_qc_report(self, ctx):
+        """读取跨次运行保留的视频质检状态。
+
+        质检阶段可能因人工暂停或服务重启而重新进入；返工次数必须落盘，
+        不能只放在本次 produce() 的内存上下文里，否则恢复生产会再次自动
+        消耗一次视频额度。
+        """
+        # force=True 代表新剧本/新一轮全量生产；上一版视频的返工计数不应
+        # 阻塞这次全新版本，但同一版本的断点续产(force=False)必须保留。
+        if ctx.get("force"):
+            return {}
+        path = self._video_qc_path(ctx)
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+            except (OSError, ValueError):
+                pass
+        document, _ = self.projects.latest_document(
+            ctx["episode"]["id"], "video_qc_report")
+        return document if isinstance(document, dict) else {}
+
+    def _save_video_qc_report(self, ctx, report):
+        report = dict(report or {})
+        report.setdefault("schema", VIDEO_QC_SCHEMA)
+        report["updated_at"] = now()
+        ctx["video_qc_report"] = report
+        path = self._video_qc_path(ctx)
+        path.write_text(json.dumps(report, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+        self.projects.save_document(
+            ctx["episode"]["id"], "video_qc_report", report)
+        return report
+
+    def _build_video_qc_report(self, ctx, qc_report, previous=None):
+        """把总质检中与视频直接相关的问题收敛为逐镜状态。
+
+        这层是视频生成后的明确质检门：既包含视频文件/媒体健全性，也包含
+        即梦有声视频与口型证据。内容复核、分镜合同等全局问题仍由总质检
+        报告负责，不会被错误地当作视频返工理由。
+        """
+        previous = previous or {}
+        previous_shots = {
+            str(item.get("shot_no")): item
+            for item in previous.get("shots", [])
+            if isinstance(item, dict) and item.get("shot_no") is not None
+        }
+        direct_checks = {"video", "media_sanity", "integrated_audio"}
+        all_issues = qc_report.get("issues") or {}
+        review_units = {
+            str(item.get("unit_id")): item
+            for item in (ctx.get("content_review") or {}).get("units", [])
+            if item.get("unit_id")
+        }
+        shots = []
+        for shot in ctx.get("storyboard", {}).get("shots", []):
+            shot_no = int(shot.get("shot_no"))
+            related = [issue for issue in all_issues
+                       if issue.get("check") in direct_checks
+                       and (issue.get("shot_no") in (None, shot_no))]
+            # 集成配音/口型属于每个视频的硬门禁，不能只显示成一个无主的
+            # 全局错误，否则用户无法知道该改哪一个镜头。
+            messages = list(dict.fromkeys(
+                str(issue.get("message") or issue.get("check"))
+                for issue in related))
+            review = review_units.get(str(shot.get("unit_id")))
+            if review and review.get("verdict") == "FAIL":
+                messages.append(str(review.get("drift_issue")
+                                   or "逐段内容复核未通过"))
+            messages = list(dict.fromkeys(messages))
+            old = previous_shots.get(str(shot_no), {})
+            auto_retries_used = int(old.get("auto_retries_used") or 0)
+            generation_attempts = int(old.get("generation_attempts") or 1)
+            shots.append({
+                "shot_no": shot_no,
+                "passed": not messages,
+                "status": "passed" if not messages else (
+                    "awaiting_human" if auto_retries_used >= VIDEO_QC_AUTO_RETRIES
+                    else "failed"),
+                "issues": messages,
+                "generation_attempts": generation_attempts,
+                "auto_retries_used": auto_retries_used,
+                "auto_retry_limit": VIDEO_QC_AUTO_RETRIES,
+                "awaiting_human": bool(messages)
+                and auto_retries_used >= VIDEO_QC_AUTO_RETRIES,
+            })
+        failed = [item for item in shots if not item["passed"]]
+        waiting = [item for item in failed if item["awaiting_human"]]
+        return {
+            "schema": VIDEO_QC_SCHEMA,
+            "passed": not failed,
+            "shots": shots,
+            "failed_shots": [item["shot_no"] for item in failed],
+            "awaiting_human": bool(waiting),
+            "awaiting_human_shots": [item["shot_no"] for item in waiting],
+            "auto_retry_limit": VIDEO_QC_AUTO_RETRIES,
+            "last_total_qc_passed": bool(qc_report.get("passed")),
+        }
+
+    @staticmethod
+    def _video_retry_candidates(video_qc_report):
+        return [item["shot_no"] for item in video_qc_report.get("shots", [])
+                if not item.get("passed")
+                and int(item.get("auto_retries_used") or 0)
+                < VIDEO_QC_AUTO_RETRIES]
+
     def _stage_qc(self, ctx):
         """自动检查 + 图文检查板 + 逐段内容复核 + 交付脚本。"""
         content_review = build_content_review(
@@ -4408,17 +5153,49 @@ class Director:
             ctx["project"]["id"], "review_board", ep_name,
             uri=review_board, meta={"passed": content_review["passed"]})
         max_retries = self.config.get("retry", "max_retries", default=2)
+        try:
+            max_retries = max(0, int(max_retries))
+        except (TypeError, ValueError):
+            max_retries = 2
+        # 普通配音/缺失产物仍沿用通用重试配置；视频返工单独固定为一次。
+        max_rounds = max(max_retries, VIDEO_QC_AUTO_RETRIES) + 1
+        previous_video_qc = self._load_video_qc_report(ctx)
         report = None
-        for attempt in range(max_retries + 1):
+        video_qc = previous_video_qc
+        for attempt in range(max_rounds):
             report = self.qc.run(ctx["script"], ctx["storyboard"], ctx)
+            video_qc = self._build_video_qc_report(
+                ctx, report, previous=video_qc)
+            self._save_video_qc_report(ctx, video_qc)
             self.log.info(
                 "qc", f"质检第{attempt + 1}轮:得分 {report['score']}"
                 f"(线 {report['pass_score']}),问题 {len(report['issues'])}")
-            # 只要存在可自动重跑的缺失产物(即使总分达标)就先修复再定论
-            fixable = report["rerun_shots"] or report["rerun_lines"]
-            if not fixable or attempt == max_retries:
+            # 只要存在可自动重跑的缺失产物(即使总分达标)就先修复再定论。
+            # 视频只能进入一次自动返工；第二次失败会在报告中标记待人工，
+            # 绝不因为通用 retry.max_retries=2 而偷偷再拍第三版。
+            video_shots = self._video_retry_candidates(video_qc)
+            line_retry = list(report.get("rerun_lines") or [])
+            if not video_shots and not line_retry:
                 break
-            self._rerun(ctx, report)
+            if attempt >= max_rounds - 1:
+                break
+            self._rerun(ctx, report, video_shots=video_shots)
+            if video_shots:
+                by_shot = {
+                    int(item["shot_no"]): item
+                    for item in video_qc.get("shots", [])}
+                for shot_no in video_shots:
+                    item = by_shot.get(int(shot_no))
+                    if item is not None:
+                        item["auto_retries_used"] = min(
+                            VIDEO_QC_AUTO_RETRIES,
+                            int(item.get("auto_retries_used") or 0) + 1)
+                        item["generation_attempts"] = int(
+                            item.get("generation_attempts") or 1) + 1
+                video_qc["auto_retry_count"] = sum(
+                    int(item.get("auto_retries_used") or 0)
+                    for item in video_qc.get("shots", []))
+                self._save_video_qc_report(ctx, video_qc)
         delivery = write_delivery_verifier(
             ctx, review_board, content_review)
         if not delivery.get("passed"):
@@ -4437,6 +5214,13 @@ class Director:
             for i in report["issues"])
         report["content_passed"] = content_review["passed"]
         ctx["qc_report"] = report
+        # 交付复核完成后再写一次，让前端拿到最终的总质检状态与“待人工”
+        # 镜头，而不是停留在返工前的中间快照。
+        video_qc["last_total_qc_passed"] = bool(report["passed"])
+        video_qc["passed"] = not bool(video_qc.get("failed_shots"))
+        video_qc["awaiting_human"] = bool(
+            video_qc.get("awaiting_human_shots"))
+        self._save_video_qc_report(ctx, video_qc)
         self.projects.set_qc_score(ctx["episode"]["id"], report["score"])
         report_path = ctx["out_root"] / "qc_report.json"
         report_path.write_text(
@@ -4457,12 +5241,21 @@ class Director:
         return {"score": report["score"], "passed": report["passed"],
                 "issues": len(report["issues"]),
                 "content_passed": content_review["passed"],
-                "delivery_passed": delivery.get("passed", False)}
+                "delivery_passed": delivery.get("passed", False),
+                "video_qc_passed": bool(video_qc.get("passed")),
+                "video_qc_awaiting_human": bool(
+                    video_qc.get("awaiting_human")),
+                "video_qc_auto_retry_limit": VIDEO_QC_AUTO_RETRIES}
 
-    def _rerun(self, ctx, report):
+    def _rerun(self, ctx, report, video_shots=None):
         shots = {s["shot_no"]: s for s in ctx["storyboard"]["shots"]}
         frames = {f["shot_no"]: f for f in ctx["frames"]}
-        for shot_no in report["rerun_shots"]:
+        # 调用方显式传入视频镜头集合时，只重拍该集合；这使“视频一次
+        # 自动返工”的限制不会被其它重试来源绕过。
+        shot_numbers = (list(video_shots)
+                        if video_shots is not None
+                        else list(report["rerun_shots"]))
+        for shot_no in shot_numbers:
             self.log.info("director", f"自动重跑镜头 {shot_no} 的视频")
             new_video = self._make_video(ctx, shots[shot_no], frames)
             ctx["videos"] = [
@@ -4999,6 +5792,9 @@ class Director:
             locked_look = self._locked_look_variant(project["id"], name)
             existing_sheet_refs = self._character_sheet_reference_uris(
                 project["id"], name, exclude_key=sheet_key)
+            user_references = self._user_reference_payload(
+                project["id"], [name],
+                allowed_roles={"identity", "wardrobe", "composition"})
             prompt = prompt_override or self._sheet_prompt(
                 name, role, style, label, desc, key=sheet_key,
                 design=self._character_design(project["id"], name),
@@ -5023,8 +5819,7 @@ class Director:
                     "identity_references": self._identity_references(
                         project["id"], [name]),
                     "require_reference_images": True,
-                    "reference_images": self._reference_uris(
-                        project["id"], [name]),
+                    **user_references,
                     "style_ref": self._style_anchor_uri(project["id"]),
                     "aspect": aspect, **ctx["dims"],
             }
@@ -5045,7 +5840,10 @@ class Director:
             prompt = prompt_override or self._scene_prompt(
                 name, style, scene,
                 premise=episode["premise"] if episode else "")
-            references = self._reference_uris(project["id"], [name])
+            reference_payload = self._user_reference_payload(
+                project["id"], [name],
+                allowed_roles={"scene", "composition"})
+            references = reference_payload["reference_images"]
             style_ref = self._style_anchor_uri(project["id"])
             reuse_count = sum(1 for value in script["scenes"]
                               if value.get("location") == name)
@@ -5063,7 +5861,7 @@ class Director:
                     "prompt": prompt,
                     "style": style, "feedback": feedback,
                     "revision": next_revision("scene_art", name),
-                    "reference_images": references,
+                    **reference_payload,
                     "style_ref": style_ref,
                     "require_reference_images": bool(
                         references or style_ref),
@@ -5987,6 +6785,7 @@ class Director:
                              completed=0, redone=0, failed=0,
                              note=result["note"])
                 return result
+
         previous_status = episode["status"]
         self.projects.set_episode_status(episode["id"], "cast")
         self.log.info("director", f"开始批量重画 {len(targets)} 张")
@@ -6107,6 +6906,112 @@ class Director:
                 "failed": failed, "checked": checked,
                 "qc_passed": qc_passed, "qc_failed": qc_failed}
 
+    def redo_video(self, project_title, episode_number, shot_no, feedback):
+        """人工确认问题后重生成指定视频镜头并重新质检。
+
+        这是视频自动返工两次(初版 + 一次自动返工)后的唯一恢复入口。
+        人工意见会进入本镜 Seedance 提示词；本方法只重拍指定镜头，不会
+        把整集再次当成“自动返工”或重置自动返工计数。
+        """
+        feedback = str(feedback or "").strip()
+        if not feedback:
+            raise AifosError("请先填写视频质检问题与修改要求")
+        project, episode = self._episode_ctx(project_title, episode_number)
+        script, _ = self.projects.latest_document(episode["id"], "script")
+        storyboard, _ = self.projects.latest_document(
+            episode["id"], "storyboard")
+        if not script or not storyboard:
+            raise AifosError("本集尚未完成剧本和分镜，不能重生成视频")
+        try:
+            shot_no = int(shot_no)
+        except (TypeError, ValueError):
+            raise AifosError("shot_no 必须是有效镜头编号")
+        shot = next((item for item in storyboard.get("shots", [])
+                     if int(item.get("shot_no", -1)) == shot_no), None)
+        if shot is None:
+            raise AifosError(f"镜头不存在: {shot_no}")
+        standard, _ = self.projects.latest_document(
+            episode["id"], "production_standard")
+        continuity, _ = self.projects.latest_document(
+            episode["id"], "continuity")
+        blocking, _ = self.projects.latest_document(
+            episode["id"], "blocking")
+        preflight, _ = self.projects.latest_document(
+            episode["id"], "preflight")
+        content_review, _ = self.projects.latest_document(
+            episode["id"], "content_review")
+        profile = production_profile(self.config, standard)
+        aspect = project["aspect"] or self.config.get(
+            "defaults", "aspect", default="9:16")
+        ctx = {
+            "project": dict(project), "episode": dict(episode),
+            "out_root": self._episode_dir(project, episode),
+            "aspect": aspect, "dims": ASPECT_DIMS.get(
+                aspect, ASPECT_DIMS["9:16"]), "script": script,
+            "storyboard": storyboard, "continuity": continuity or {},
+            "blocking": blocking or {}, "preflight": preflight or {},
+            "content_review": content_review or {},
+            "production_profile": profile,
+            "voice_mode": profile.get("voice", "jimeng_builtin"),
+            "lip_sync": bool(profile.get("lip_sync", True)),
+            "quality_policy": self._episode_quality_policy(episode["id"]),
+            "character_asset_policy": self.character_asset_policy(
+                episode["id"], script=script),
+            "images": [], "frames": [], "videos": [], "voices": [],
+            "subtitles": [],
+            "video_feedback": {shot_no: feedback}, "force": False,
+        }
+        for item in storyboard.get("shots", []):
+            value = int(item["shot_no"])
+            first = self.assets.latest(
+                project["id"], "first_frame", self._shot_name(ctx, value))
+            last = self.assets.latest(
+                project["id"], "last_frame", self._shot_name(ctx, value))
+            if first is None or last is None:
+                raise AifosError(f"镜头{value}缺少首尾帧，不能重生成视频")
+            ctx["frames"].append({"shot_no": value, "first": first["uri"],
+                                  "last": last["uri"],
+                                  "image_quality": "high"})
+            image = self.assets.latest(
+                project["id"], "image", self._shot_name(ctx, value))
+            if image is not None and image["uri"]:
+                ctx["images"].append({"shot_no": value, "uri": image["uri"]})
+            row = self.assets.latest(
+                project["id"], "video", self._shot_name(ctx, value))
+            if row is not None and row["uri"]:
+                meta = json.loads(row["meta"] or "{}")
+                ctx["videos"].append({
+                    "shot_no": value, "uri": row["uri"],
+                    "duration": item.get("duration"),
+                    "provider": meta.get("provider", ""),
+                    "audio_in_video": meta.get("audio_in_video"),
+                    "video_quality": meta.get("video_quality", "medium"),
+                    "video_resolution": meta.get("video_resolution", "720p"),
+                })
+        self._task_cost = 0.0
+        self._task_providers = set()
+        frame_map = {item["shot_no"]: item for item in ctx["frames"]}
+        generated = self._make_video(ctx, shot, frame_map)
+        replaced = False
+        updated_videos = []
+        for item in ctx["videos"]:
+            if item["shot_no"] == shot_no:
+                updated_videos.append(generated)
+                replaced = True
+            else:
+                updated_videos.append(item)
+        if not replaced:
+            updated_videos.append(generated)
+        ctx["videos"] = sorted(
+            updated_videos, key=lambda item: int(item["shot_no"]))
+        self._stage_edit(ctx)
+        ctx["voice_carried"] = self._videos_carry_audio(ctx)
+        qc = self._stage_qc(ctx)
+        self.projects.set_episode_status(
+            episode["id"], "done" if qc.get("passed") else "qc_failed")
+        return {"status": "done", "shot_no": shot_no,
+                "qc": qc, "video_qc": ctx.get("video_qc_report")}
+
     def redo_placeholders(self, project_title, episode_number):
         """一键补真:把清单里落到占位产线的图,逐张用真实产线重画。
         可随时暂停,已补好的保留;真实产线仍不可用时保持占位并红标。"""
@@ -6151,8 +7056,12 @@ class Director:
 
     # ---- 参考图管理:上传的参考图会自动进入出图提示(关联角色/场景) ----
     def add_reference(self, project_title, name, file_bytes, ext,
-                      attach_to="", note=""):
-        """上传参考图:attach_to 为空=全项目通用,否则只用于该角色/场景。"""
+                      attach_to="", note="", reference_role=""):
+        """上传带单一用途的参考图。
+
+        attach_to 为空时只有 ``style`` 会自动全局使用；其他无关联图片
+        作为手动参考保留，避免污染所有角色与镜头。
+        """
         ext = ext.lower()
         magic = self.IMAGE_MAGIC.get(ext)
         if magic is None:
@@ -6164,6 +7073,26 @@ class Director:
         if project is None:
             raise AifosError(f"项目不存在: {project_title}")
         name = (name or "").strip() or f"参考图{ext}"
+        role = str(reference_role or "").strip().lower()
+        aliases = {
+            "人物": "identity", "身份": "identity",
+            "服装": "wardrobe", "道具": "wardrobe",
+            "场景": "scene", "空间": "scene",
+            "构图": "composition", "动作": "composition",
+            "画风": "style", "风格": "style",
+        }
+        role = aliases.get(role, role)
+        if not role:
+            probe = {"name": name, "meta": json.dumps({
+                "attach_to": attach_to or "", "note": note or ""})}
+            role = self._reference_role(probe)
+        if role not in REFERENCE_ROLES:
+            raise AifosError(
+                "参考图用途必须是 identity/wardrobe/scene/"
+                "composition/style/manual")
+        if role != "style" and not str(attach_to or "").strip():
+            # 无关联人物/场景时无法建立硬映射，只能由用户在具体镜头手选。
+            role = "manual"
         safe = "".join(c if c.isalnum() else "_" for c in name)[:40]
         existing = self.assets.latest(project["id"], "reference", name)
         version = (existing["version"] + 1) if existing else 1
@@ -6173,18 +7102,21 @@ class Director:
         path.write_bytes(file_bytes)
         self.assets.register(
             project["id"], "reference", name, uri=str(path),
-            meta={"attach_to": attach_to or "", "note": note or ""},
+            meta={"attach_to": attach_to or "", "note": note or "",
+                  "reference_role": role},
             new_version=existing is not None)
         self.log.info(
             "director", f"已上传参考图「{name}」"
-            f"(关联: {attach_to or '全项目'});后续出图将自动参考")
+            f"(用途:{role};关联:{attach_to or '手动选择'});"
+            "后续只按该用途参考")
         # 参考图为最高标准:关联到已有设定的角色时,立即按参考图的
-        # 脸部特征与风格重写该角色的人物设定提示词
+        # 脸部特征与风格重写该角色的人物设定提示词。服装、构图等
+        # 参考绝不能触发改脸，否则上传一张衣服图就会污染角色身份。
         design_refreshed = False
-        if attach_to:
+        if attach_to and role == "identity":
             design_refreshed = self._refresh_design_from_reference(
                 project, attach_to)
-        return {"name": name, "uri": str(path),
+        return {"name": name, "uri": str(path), "reference_role": role,
                 "design_refreshed": design_refreshed}
 
     def _refresh_design_from_reference(self, project, name):
@@ -6196,7 +7128,9 @@ class Director:
         if row is None:
             return False
         meta = self._asset_meta(row)
-        references = self._character_reference_uris(project["id"], name)
+        references = [
+            row["uri"] for row in self._reference_rows(
+                project["id"], [name], allowed_roles={"identity"})]
         if not references:
             return False
         try:
