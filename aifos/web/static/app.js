@@ -2274,6 +2274,37 @@ function shotInlineRevisionHtml(shotNo, hasImage, productionActive = false) {
   </details>`;
 }
 
+function frameInlineRevisionHtml(
+  shotNo, kind, hasImage, productionActive = false) {
+  const isFirst = kind === "first_frame";
+  const label = isFirst ? "首帧" : "尾帧";
+  if (!hasImage) {
+    return `<small class="shot-inline-revision-note">${label}生成后可在此直接修改</small>`;
+  }
+  const target = { kind, shot_no: Number(shotNo) };
+  const boundary = isFirst
+    ? "同场上一镜的尾帧"
+    : "同场下一镜的首帧";
+  return `<details class="shot-inline-revision frame-inline-revision"
+    data-target="${esc(JSON.stringify(target))}"
+    data-production-active="${productionActive ? "1" : "0"}">
+    <summary class="shot-revision-toggle">✏️ 修改${label}</summary>
+    <div class="shot-revision-form">
+      <textarea rows="3" class="shot-revision-feedback"
+        placeholder="必填：只写这张${label}哪里错、要改成什么；未提及部分会保持不变"></textarea>
+      ${qualitySelectHtml("shot-revision-quality")}
+      <div class="shot-revision-actions">
+        <button type="button" class="shot-revision-ref">📎 添加参考图</button>
+        <button type="button" class="shot-revision-upload">⬆ 上传修好图片</button>
+        <button type="button" class="primary shot-revision-go">${
+          productionActive ? "暂停并修改" : `修改${label}并同步`}</button>
+      </div>
+      <small>修改后自动同步${boundary}、Seedance 手选引用及所有使用旧图的位置；
+        受影响视频、旧成片和旧质检自动失效。</small>
+    </div>
+  </details>`;
+}
+
 async function waitForShotRevisionCheckpoint(
   episodeId, projectTitle, episodeNumber, timeoutMs = 120000) {
   const deadline = Date.now() + timeoutMs;
@@ -2295,6 +2326,8 @@ async function waitForShotRevisionCheckpoint(
 function bindShotInlineRevisions(root, data) {
   root.querySelectorAll(".shot-inline-revision").forEach((box) => {
     const target = JSON.parse(box.dataset.target);
+    const targetLabel = target.kind === "first_frame" ? "首帧"
+      : target.kind === "last_frame" ? "尾帧" : "参考分镜";
     const form = box.querySelector(".shot-revision-form");
     const refBtn = box.querySelector(".shot-revision-ref");
     refBtn.onclick = (event) => {
@@ -2315,7 +2348,7 @@ function bindShotInlineRevisions(root, data) {
       event.stopPropagation();
       const feedback = form.querySelector(".shot-revision-feedback").value.trim();
       if (!feedback) {
-        showToast("请先写清楚这张分镜哪里错、要改成什么", "error");
+        showToast(`请先写清楚这张${targetLabel}哪里错、要改成什么`, "error");
         form.querySelector("textarea").focus();
         return;
       }
@@ -2348,8 +2381,12 @@ function bindShotInlineRevisions(root, data) {
             const sync = (job.summary || {}).sync || {};
             const frameCount = (sync.frame_shots || []).length;
             const videoCount = (sync.invalidated_video_shots || []).length;
-            showToast(
-              `镜头${target.shot_no}已修改；同步${frameCount}个镜头帧链，`
+            const boundary = (sync.boundary_sync || [])
+              .map((item) => item.label).filter(Boolean);
+            const boundaryText = boundary.length
+              ? `；已同步${boundary.join("、")}` : "";
+            showToast(`镜头${target.shot_no}${targetLabel}已修改`
+              + `${boundaryText}；共更新${frameCount}镜，`
               + `标记${videoCount}个视频待重拍`, "ok");
             renderCanvasView(data.episode.id);
           } else {
@@ -5579,8 +5616,16 @@ function shotProductionTableHtml(data, options = {}) {
             ${shotInlineRevisionHtml(
               no, !!(art.images || {})[no], context === "live")}</td>
           <td class="storyboard-frames" data-label="首尾帧"><div class="storyboard-frame-pair">
-            ${storyboardMediaThumb((art.first || {})[no], "首帧", no, frameState)}
-            ${storyboardMediaThumb((art.last || {})[no], "尾帧", no, frameState)}
+            <div class="storyboard-frame-item">
+              ${storyboardMediaThumb((art.first || {})[no], "首帧", no, frameState)}
+              ${frameInlineRevisionHtml(
+                no, "first_frame", !!(art.first || {})[no], context === "live")}
+            </div>
+            <div class="storyboard-frame-item">
+              ${storyboardMediaThumb((art.last || {})[no], "尾帧", no, frameState)}
+              ${frameInlineRevisionHtml(
+                no, "last_frame", !!(art.last || {})[no], context === "live")}
+            </div>
           </div></td>
           <td class="storyboard-movement" data-label="运镜">${storyboardCameraHtml(shot)}</td>
           <td class="storyboard-description" data-label="画面描述">
@@ -5975,9 +6020,15 @@ class StoryboardCanvas {
       <h3>${esc(shot.unit_id || `镜头 #${String(shotNo).padStart(2, "0")}`)} · 场${shot.scene_no}</h3>
       ${art.images[shotNo] ? `<img class="preview" src="${esc(art.images[shotNo])}" alt="关键图">` : ""}
       <h4>首尾帧</h4>
-      <div class="thumbs">
-        <figure>${art.first[shotNo] ? `<img src="${esc(art.first[shotNo])}">` : ""}<figcaption>首帧</figcaption></figure>
-        <figure>${art.last[shotNo] ? `<img src="${esc(art.last[shotNo])}">` : ""}<figcaption>尾帧</figcaption></figure>
+      <div class="thumbs editable-frame-thumbs">
+        <figure>${art.first[shotNo] ? `<img src="${esc(art.first[shotNo])}">` : ""}
+          <figcaption>首帧</figcaption>
+          ${frameInlineRevisionHtml(
+            shotNo, "first_frame", !!art.first[shotNo])}</figure>
+        <figure>${art.last[shotNo] ? `<img src="${esc(art.last[shotNo])}">` : ""}
+          <figcaption>尾帧</figcaption>
+          ${frameInlineRevisionHtml(
+            shotNo, "last_frame", !!art.last[shotNo])}</figure>
       </div>
       ${mediaTag(art.videos[shotNo]) ? `<h4>镜头视频</h4>${mediaTag(art.videos[shotNo])}` : ""}
       ${shot.dialogue ? `<h4>台词</h4><div class="dialogue"><b>${esc(shot.dialogue.character)}</b>:${esc(shot.dialogue.dialogue)}</div>` : ""}
@@ -6038,6 +6089,7 @@ class StoryboardCanvas {
       ${issues.length ? `<h4>质检问题</h4>${issues.map((i) => `
         <div class="issue ${esc(i.severity)}">[${esc(i.check)}] ${esc(i.message)}</div>`).join("")}` : ""}`;
     const epId = this.data.episode.id;
+    bindShotInlineRevisions(panel, this.data);
     bindRegen(panel, epId, () => this.data);
     bindIo(panel, epId, () => renderCanvasView(epId));
   }

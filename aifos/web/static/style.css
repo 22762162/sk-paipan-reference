@@ -621,7 +621,15 @@ td.num, th.num { text-align: right; }
   display: block; color: var(--ink-3); font-size: 9px; line-height: 1.45;
 }
 .storyboard-frame-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+.storyboard-frame-item { min-width: 0; }
+.storyboard-frame-item .frame-inline-revision { margin-top: 5px; }
 .storyboard-frame-pair .storyboard-media-empty { min-height: 110px; }
+#sidepanel .editable-frame-thumbs { align-items: start; }
+#sidepanel .editable-frame-thumbs figure { min-width: 0; }
+#sidepanel .editable-frame-thumbs .shot-revision-form {
+  padding: 7px; border: 1px solid var(--hairline); border-radius: 7px;
+  background: var(--surface-1);
+}
 .storyboard-camera { display: grid; gap: 5px; }
 .storyboard-camera b { color: #cfe4ff; font-size: 13px; }
 .storyboard-camera span { color: var(--ink-2); }
@@ -2360,8 +2368,10 @@ textarea:focus-visible, select:focus-visible {
   .storyboard-frame-pair {
     display: flex; gap: 8px; overflow-x: auto; scroll-snap-type: x mandatory;
   }
-  .storyboard-frame-pair > * { flex: 0 0 96px; scroll-snap-align: start; }
+  .storyboard-frame-pair > * { flex: 0 0 180px; scroll-snap-align: start; }
   .storyboard-frame-pair .storyboard-media-empty { min-height: 136px; }
+  #sidepanel .editable-frame-thumbs { display: grid; grid-template-columns: 1fr; }
+  #sidepanel .editable-frame-thumbs .shot-revision-toggle { min-height: 44px; }
   .storyboard-status-stack { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .storyboard-status-stack button { min-height: 44px; }
   .storyboard-status { width: auto; align-items: center; }

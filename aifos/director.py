@@ -3362,9 +3362,20 @@ class Director:
             "绘画风格、线条、上色与光影必须与此图一致")
         for uri in payload.get("reference_images") or []:
             label = labels.get(uri) or "用户上传参考图"
-            binding = ("同人物/同场景连续性参考,人物造型与环境延续此前画面"
-                       if "已生产" in label
-                       else "用户指定参考,涉及的人物/场景以此为优先标准")
+            if "待修改基底" in label:
+                binding = (
+                    "这是当前待修改的原图；只修正修改意见指出的问题，"
+                    "未提及的人物、构图、服装、道具、文字和光影保持不变")
+            elif "连续性约束" in label:
+                binding = (
+                    "这是同镜头另一端画面；人物身份、服装、场景、道具和"
+                    "屏幕方向必须连续")
+            elif "参考分镜" in label:
+                binding = "镜头构图、人物身份与场景关系以此图为基准"
+            elif "已生产" in label:
+                binding = "同人物/同场景连续性参考,人物造型与环境延续此前画面"
+            else:
+                binding = "用户指定参考,涉及的人物/场景以此为优先标准"
             add(uri, label, binding)
         return entries
 
@@ -3375,14 +3386,19 @@ class Director:
 
     def _attach_reference_manifest(self, payload):
         """把参考图对照表写进 payload 与提示词(编号=实际提交顺序)。"""
+        # 同一 payload 可能在补入首/尾帧修图基底后再次绑定参考图。
+        # 始终从未附表的原始提示词重建，避免“参考图对照表”重复叠加。
+        base_prompt = payload.setdefault(
+            "_reference_prompt_base", payload.get("prompt") or "")
         manifest = self._reference_manifest(payload)
         payload["reference_manifest"] = manifest
+        payload["prompt"] = base_prompt
         if not manifest:
             return
         lines = [f"图{entry['index']}={entry['label']}:{entry['binding']}"
                  for entry in manifest]
         payload["prompt"] = (
-            (payload.get("prompt") or "").rstrip("。")
+            base_prompt.rstrip("。")
             + f"。参考图对照表(共{len(manifest)}张,按此顺序提交,"
             "必须严格按编号对应使用,禁止张冠李戴、禁止把一个人的脸画成"
             "另一张参考图中的人):" + ";".join(lines))
@@ -4333,7 +4349,118 @@ class Director:
             "invalidated_video_shots": invalidated_videos,
         }
 
-    def _invalidate_revised_delivery(self, ctx, shot, formal_ready=True):
+    def _apply_revised_frame_assets(
+            self, ctx, storyboard, shot, frame_uris, meta,
+            formal_ready=True, sync_boundaries=None):
+        """登记修改后的首/尾帧，并同步同场共享边界与所有旧引用。
+
+        一段视频的尾帧就是同场下一段视频的首帧。人工只改其中一侧时，
+        必须让相邻资产指向同一张新图；手选 Seedance 参考仍保存 asset_id，
+        因而也要原子迁移并作废所有用旧图生成过的视频。
+        """
+        project_id = ctx["project"]["id"]
+        episode_id = ctx["episode"]["id"]
+        shot_no = int(shot["shot_no"])
+        scene_no = shot.get("scene_no")
+        scene_shots = [
+            candidate for candidate in storyboard.get("shots", [])
+            if candidate.get("scene_no") == scene_no]
+        try:
+            index = next(
+                pos for pos, candidate in enumerate(scene_shots)
+                if int(candidate["shot_no"]) == shot_no)
+        except StopIteration:
+            raise AifosError(f"镜头不存在: {shot_no}")
+
+        allowed = {"first_frame", "last_frame"}
+        updates = {
+            kind: uri for kind, uri in (frame_uris or {}).items()
+            if kind in allowed and uri}
+        if not updates:
+            raise AifosError("没有可登记的首帧或尾帧")
+        sync_boundaries = (
+            set(updates) if sync_boundaries is None
+            else set(sync_boundaries))
+
+        revised_rows = {}
+        frame_shots = {shot_no}
+        reference_shots = set()
+        boundary_sync = []
+
+        def register(kind, candidate, uri, extra=None):
+            name = self._shot_name(ctx, candidate["shot_no"])
+            old = self.assets.latest(project_id, kind, name)
+            row = self.assets.register(
+                project_id, kind, name, uri=uri,
+                meta={**(meta or {}), **(extra or {})},
+                new_version=True)
+            reference_shots.update(self._sync_revised_video_references(
+                episode_id, project_id, old["id"] if old else None,
+                row, usable=formal_ready))
+            return row
+
+        for kind, uri in updates.items():
+            revised_rows[kind] = register(
+                kind, shot, uri,
+                {"revised_frame": True, "source_shot": shot_no})
+
+        if "first_frame" in updates and "first_frame" in sync_boundaries \
+                and index > 0:
+            previous = scene_shots[index - 1]
+            previous_name = self._shot_name(ctx, previous["shot_no"])
+            if self.assets.latest(project_id, "last_frame", previous_name):
+                row = register(
+                    "last_frame", previous, updates["first_frame"],
+                    {"boundary_synced_from": shot_no,
+                     "boundary_source_kind": "first_frame"})
+                frame_shots.add(int(previous["shot_no"]))
+                boundary_sync.append({
+                    "source_shot": shot_no, "source_kind": "first_frame",
+                    "synced_shot": int(previous["shot_no"]),
+                    "synced_kind": "last_frame", "asset_id": row["id"],
+                    "label": f"镜头{int(previous['shot_no'])}尾帧",
+                })
+
+        if "last_frame" in updates and "last_frame" in sync_boundaries \
+                and index + 1 < len(scene_shots):
+            following = scene_shots[index + 1]
+            following_name = self._shot_name(ctx, following["shot_no"])
+            if self.assets.latest(project_id, "first_frame", following_name):
+                row = register(
+                    "first_frame", following, updates["last_frame"],
+                    {"boundary_synced_from": shot_no,
+                     "boundary_source_kind": "last_frame"})
+                frame_shots.add(int(following["shot_no"]))
+                boundary_sync.append({
+                    "source_shot": shot_no, "source_kind": "last_frame",
+                    "synced_shot": int(following["shot_no"]),
+                    "synced_kind": "first_frame", "asset_id": row["id"],
+                    "label": f"镜头{int(following['shot_no'])}首帧",
+                })
+
+        invalidated_videos = []
+        for affected_no in sorted(frame_shots | reference_shots):
+            name = self._shot_name(ctx, affected_no)
+            if self.assets.latest(project_id, "video", name) is None:
+                continue
+            self.assets.soft_delete(
+                project_id, "video", name,
+                meta={"invalidated_by_frame_revision": shot_no})
+            invalidated_videos.append(affected_no)
+
+        return {
+            "frame_shots": sorted(frame_shots),
+            "affected_shots": sorted(frame_shots | reference_shots),
+            "invalidated_video_shots": invalidated_videos,
+            "video_reference_shots": sorted(reference_shots),
+            "boundary_sync": boundary_sync,
+            "frame_asset_ids": {
+                kind: row["id"] for kind, row in revised_rows.items()},
+        }
+
+    def _invalidate_revised_delivery(
+            self, ctx, shot, formal_ready=True, affected_shots=None,
+            source_kind="shot"):
         """镜头版本变化后隐藏旧成片/检查板，并登记待重拍状态。"""
         project_id = ctx["project"]["id"]
         episode_id = ctx["episode"]["id"]
@@ -4351,13 +4478,28 @@ class Director:
 
         invalidate("edit", f"{ep_name}_final")
         invalidate("review_board", ep_name)
-        invalidate("clip", f"{ep_name}_scene{int(shot['scene_no']):02d}")
+        affected = sorted({
+            int(value) for value in (affected_shots or [shot["shot_no"]])})
+        storyboard = ctx.get("storyboard") or {}
+        scene_by_shot = {
+            int(candidate["shot_no"]): int(candidate["scene_no"])
+            for candidate in storyboard.get("shots", [])
+            if candidate.get("shot_no") is not None
+            and candidate.get("scene_no") is not None}
+        scene_nos = sorted({
+            scene_by_shot.get(value, int(shot["scene_no"]))
+            for value in affected})
+        for scene_no in scene_nos:
+            invalidate("clip", f"{ep_name}_scene{scene_no:02d}")
         self.projects.set_qc_score(episode_id, None)
         revision = {
             "schema": "aifos.shot-revision-state/v1",
             "active": True,
             "shot_no": int(shot["shot_no"]),
             "scene_no": int(shot["scene_no"]),
+            "source_kind": source_kind,
+            "affected_shots": affected,
+            "affected_scenes": scene_nos,
             "formal_ready": bool(formal_ready),
             "invalidated": invalidated,
             "updated_at": now(),
@@ -4371,8 +4513,8 @@ class Director:
     def regen_image(self, project_title, episode_number, target,
                     feedback="", prompt_override="", quality_override=None,
                     revision_source="manual"):
-        """重画单张图:target = {"kind": character_art|scene_art|shot,
-        "name"|"shot_no"};附意见时新画面按意见调整;
+        """重画单张图:target = {"kind": character_art|scene_art|shot|
+        first_frame|last_frame, "name"|"shot_no"};附意见时按意见调整;
         prompt_override 非空则整句替换默认提示词(所见即所得)。
         镜头画面重画会连带重生成首尾帧并作废旧视频(补齐时重拍)。"""
         project = self.projects.get_project(project_title)
@@ -4417,6 +4559,10 @@ class Director:
             "scene_art": lambda: f"scene:{target.get('name', '')}",
             "shot": lambda: f"shot:{int(target.get('shot_no', 0))}",
             "frames": lambda: f"frames:{int(target.get('shot_no', 0))}",
+            "first_frame": lambda: (
+                f"frames:{int(target.get('shot_no', 0))}"),
+            "last_frame": lambda: (
+                f"frames:{int(target.get('shot_no', 0))}"),
         }.get(kind, lambda: "")()
         policy = self._episode_quality_policy(episode["id"])
         if quality_override is not None and item_id:
@@ -4586,6 +4732,108 @@ class Director:
                 ctx, shot, formal_ready=formal_ready))
             sync["video_reference_shots"] = reference_shots
             sync["image_asset_id"] = new_image["id"]
+        elif kind in ("first_frame", "last_frame"):
+            shot_no = int(target["shot_no"])
+            storyboard, _ = self.projects.latest_document(
+                episode["id"], "storyboard")
+            shot = next((s for s in (storyboard or {}).get("shots", [])
+                         if int(s["shot_no"]) == shot_no), None)
+            if shot is None:
+                raise AifosError(f"镜头不存在: {shot_no}")
+            ctx["storyboard"] = storyboard
+            asset_name = self._shot_name(ctx, shot_no)
+            current = self.assets.latest(project["id"], kind, asset_name)
+            if not (current and current["uri"]
+                    and (current["uri"].startswith(("http://", "https://"))
+                         or Path(current["uri"]).exists())):
+                label = "首帧" if kind == "first_frame" else "尾帧"
+                raise AifosError(f"镜头{shot_no}尚无{label},请先生成首尾帧")
+            counterpart_kind = (
+                "last_frame" if kind == "first_frame" else "first_frame")
+            counterpart = self.assets.latest(
+                project["id"], counterpart_kind, asset_name)
+            image_row = self.assets.latest(
+                project["id"], "image", asset_name)
+            scene_shots = [
+                candidate for candidate in storyboard.get("shots", [])
+                if candidate.get("scene_no") == shot.get("scene_no")]
+            payload = self._shot_payload(
+                ctx, shot, continuity_anchor=len(scene_shots) > 1,
+                quality_override=quality_choice,
+                item_id=f"frames:{shot_no}")
+            label = "首帧" if kind == "first_frame" else "尾帧"
+            state_label = "起始状态" if kind == "first_frame" else "结束状态"
+            state = (shot.get("start_state", {}) if kind == "first_frame"
+                     else shot.get("end_state", {}))
+            base_prompt = prompt_override or payload.get(
+                "_reference_prompt_base", payload["prompt"])
+            payload["_reference_prompt_base"] = (
+                f"只修改镜头{shot_no}的{label}这一张静帧，不生成另一张帧，"
+                f"也不改关键分镜。{base_prompt}。{state_label}:{state}。"
+                "严格以当前待修改原图为基底落实修改意见；未被意见指出的"
+                "人物身份、人数、构图、机位、服装、发型、妆容、道具、"
+                "场景、文字和光影保持不变")
+            payload["prompt"] = payload["_reference_prompt_base"]
+            payload["seedance_prompt"] = payload["prompt"]
+            payload["frame_kind"] = kind
+            payload["feedback"] = feedback
+            payload["revision"] = next_revision(kind, asset_name)
+
+            rows = [
+                (current, f"本镜当前{label}（待修改基底）"),
+                (image_row, "本镜参考分镜"),
+                (counterpart,
+                 f"本镜{'尾帧' if kind == 'first_frame' else '首帧'}"
+                 "（连续性约束）"),
+            ]
+            references = []
+            for row, _label in rows:
+                if row and row["uri"] and row["uri"] not in references:
+                    references.append(row["uri"])
+            for uri in payload.get("reference_images") or []:
+                if uri not in references:
+                    references.append(uri)
+            payload["reference_images"] = references
+            matches = list(payload.get("asset_matches") or [])
+            for row, ref_label in rows:
+                if not row or not row["uri"]:
+                    continue
+                matches = [
+                    match for match in matches
+                    if match.get("uri") != row["uri"]]
+                matches.append({
+                    "asset_id": row["id"], "kind": row["kind"],
+                    "name": row["name"], "label": ref_label,
+                    "uri": row["uri"],
+                })
+            payload["asset_matches"] = matches
+            payload["require_reference_images"] = True
+            self._attach_reference_manifest(payload)
+
+            revision_dir = (
+                f"frames/revisions/shot_{shot_no:03d}/"
+                f"{kind}_v{payload['revision']}")
+            result = self._plan_run(
+                ctx, f"frames:{shot_no}",
+                lambda: self._call(
+                    ctx, "image", payload, revision_dir),
+                prompt=self._prompt_with_feedback(
+                    payload["prompt"], feedback),
+                payload=payload, revision_source=revision_source)
+            meta = {
+                **self._quality_meta(payload["quality_decision"]),
+                "frame_kind": kind, "revision": payload["revision"],
+                "revision_source": revision_source,
+            }
+            formal_ready = formal_reference_allowed(
+                payload["image_quality"])
+            sync = self._apply_revised_frame_assets(
+                ctx, storyboard, shot, {kind: result.uri}, meta,
+                formal_ready=formal_ready)
+            sync.update(self._invalidate_revised_delivery(
+                ctx, shot, formal_ready=formal_ready,
+                affected_shots=sync["affected_shots"],
+                source_kind=kind))
         elif kind == "frames":
             shot_no = int(target["shot_no"])
             storyboard, _ = self.projects.latest_document(
@@ -4637,17 +4885,23 @@ class Director:
                 prompt=self._prompt_with_feedback(
                     frames_payload["prompt"], feedback),
                 payload=frames_payload, revision_source=revision_source)
-            self.assets.register(project["id"], "first_frame", asset_name,
-                                 uri=result.data["first"],
-                                 meta=self._quality_meta(
-                                     frames_payload["quality_decision"]),
-                                 new_version=True)
-            self.assets.register(project["id"], "last_frame", asset_name,
-                                 uri=result.data["last"],
-                                 meta=self._quality_meta(
-                                     frames_payload["quality_decision"]),
-                                 new_version=True)
-            self.assets.delete(project["id"], "video", asset_name)
+            formal_ready = formal_reference_allowed(
+                frames_payload["image_quality"])
+            sync_boundaries = {"last_frame"}
+            if (not frames_payload.get("chain_first_uri")
+                    and result.data.get("first_source") != "previous_tail"):
+                sync_boundaries.add("first_frame")
+            sync = self._apply_revised_frame_assets(
+                ctx, storyboard, shot,
+                {"first_frame": result.data["first"],
+                 "last_frame": result.data["last"]},
+                self._quality_meta(frames_payload["quality_decision"]),
+                formal_ready=formal_ready,
+                sync_boundaries=sync_boundaries)
+            sync.update(self._invalidate_revised_delivery(
+                ctx, shot, formal_ready=formal_ready,
+                affected_shots=sync["affected_shots"],
+                source_kind="frames"))
         else:
             raise AifosError(f"不支持的重画目标: {kind}")
         if feedback:
@@ -4662,7 +4916,7 @@ class Director:
                 "quality": (result.data or {}).get(
                     "image_quality", quality_choice),
                 "cost": round(self._task_cost, 2)}
-        if kind == "shot":
+        if kind in ("shot", "frames", "first_frame", "last_frame"):
             response["sync"] = sync
         return response
 
@@ -4751,8 +5005,11 @@ class Director:
 
     def import_image(self, project_title, episode_number, target,
                      file_bytes, ext):
-        """上传替换图片:character_art / scene_art / shot(镜头画面)。
-        镜头画面替换后自动按新图重做首尾帧并作废旧视频。"""
+        """上传替换图片:人物/场景/关键分镜/单独首帧或尾帧。
+
+        关键分镜替换后重做同场帧链；单独首尾帧替换会同步相邻共享边界，
+        两种操作都会迁移 Seedance 手选引用并作废受影响的旧视频/成片。
+        """
         ext = ext.lower()
         magic = self.IMAGE_MAGIC.get(ext)
         if magic is None:
@@ -4861,6 +5118,67 @@ class Director:
             sync["image_asset_id"] = new_image["id"]
             self.log.info(
                 "director", f"已上传替换镜头{shot_no}画面并同步下游版本")
+            return {"uri": str(path), "sync": sync}
+        if kind in ("first_frame", "last_frame"):
+            shot_no = int(target["shot_no"])
+            storyboard, _ = self.projects.latest_document(
+                episode["id"], "storyboard")
+            script, _ = self.projects.latest_document(
+                episode["id"], "script")
+            shot = next((candidate for candidate in
+                         (storyboard or {}).get("shots", [])
+                         if int(candidate["shot_no"]) == shot_no), None)
+            if shot is None:
+                raise AifosError(f"镜头不存在: {shot_no}")
+            asset_name = f"e{episode['number']:03d}_shot{shot_no:03d}"
+            old_frame = self.assets.latest(
+                project["id"], kind, asset_name)
+            label = "首帧" if kind == "first_frame" else "尾帧"
+            if old_frame is None:
+                raise AifosError(f"镜头{shot_no}尚无{label},请先生成首尾帧")
+            version = int(old_frame["version"]) + 1
+            suffix = "first" if kind == "first_frame" else "last"
+            path = (out_root / "frames" / "revisions"
+                    / f"shot_{shot_no:03d}.{suffix}.upload_v{version}{ext}")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(file_bytes)
+            aspect = (project["aspect"] or self.config.get(
+                "defaults", "aspect", default="9:16"))
+            standard, _ = self.projects.latest_document(
+                episode["id"], "production_standard")
+            blocking, _ = self.projects.latest_document(
+                episode["id"], "blocking")
+            ctx = {
+                "project": dict(project), "episode": dict(episode),
+                "out_root": out_root, "aspect": aspect,
+                "dims": ASPECT_DIMS.get(aspect, ASPECT_DIMS["9:16"]),
+                "script": script, "storyboard": storyboard,
+                "production_standard": standard,
+                "production_profile": production_profile(
+                    self.config, standard),
+                "blocking": blocking,
+                "quality_policy": self._episode_quality_policy(
+                    episode["id"], persist=True),
+                "character_asset_policy": self.character_asset_policy(
+                    episode["id"], script=script),
+                "force": True,
+            }
+            meta = {
+                "uploaded": True, "frame_kind": kind,
+                "image_quality": "high",
+                "recommended_quality": "high",
+                "quality_source": "manual_upload",
+            }
+            sync = self._apply_revised_frame_assets(
+                ctx, storyboard, shot, {kind: str(path)}, meta,
+                formal_ready=True)
+            sync.update(self._invalidate_revised_delivery(
+                ctx, shot, formal_ready=True,
+                affected_shots=sync["affected_shots"],
+                source_kind=kind))
+            self.log.info(
+                "director",
+                f"已上传替换镜头{shot_no}{label}并同步所有共享边界与引用")
             return {"uri": str(path), "sync": sync}
         raise AifosError(f"不支持的上传目标: {kind}")
 

@@ -61,8 +61,8 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260723-video-ref-table" in html
-    assert "/static/app.js?v=20260723-video-ref-table" in html
+    assert "/static/style.css?v=20260724-frame-inline" in html
+    assert "/static/app.js?v=20260724-frame-inline" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -136,6 +136,11 @@ def test_index_and_static(server):
     assert b"videoReferenceFigureHtml" in app_js
     assert b"video-ref-preview" in app_js
     assert "直接修改此图".encode() in app_js
+    assert b"frameInlineRevisionHtml" in app_js
+    assert "同场上一镜的尾帧".encode() in app_js
+    assert "同场下一镜的首帧".encode() in app_js
+    assert b"first_frame" in app_js
+    assert b"last_frame" in app_js
     assert "暂停并修改".encode() in app_js
     assert "修改并同步后续".encode() in app_js
     assert b"bindShotInlineRevisions(root, data)" in app_js
@@ -159,6 +164,8 @@ def test_index_and_static(server):
     assert b".storyboard-frame-pair" in style_css
     assert b".storyboard-status-stack" in style_css
     assert b".shot-inline-revision" in style_css
+    assert b".frame-inline-revision" in style_css
+    assert b".storyboard-frame-item" in style_css
     assert b".shot-revision-form" in style_css
     assert b".background-cast-note" in style_css
     status, ctype, raw = _request(

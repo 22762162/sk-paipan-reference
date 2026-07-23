@@ -1624,10 +1624,11 @@ def make_handler(workspace, jobs):
             target = body.get("target") or {}
             if target.get("kind") not in ("character_art", "scene_art",
                                           "shot", "character_sheet",
-                                          "frames"):
+                                          "frames", "first_frame",
+                                          "last_frame"):
                 return self._error(400, "target.kind 需为 character_art/"
                                         "scene_art/shot/character_sheet/"
-                                        "frames")
+                                        "frames/first_frame/last_frame")
             found = self._episode_ref(body)
             if found is None:
                 return self._error(404, "剧集不存在")
@@ -2162,7 +2163,8 @@ def make_handler(workspace, jobs):
 
         def _upload(self):
             """人工修改素材上传:{episode_id, target, filename, data_base64}。
-            target.kind: character_art / scene_art / shot / shot_video。"""
+            target.kind: character_art / scene_art / shot / first_frame /
+            last_frame / shot_video。"""
             import base64
             body = self._read_body()
             if body is None:

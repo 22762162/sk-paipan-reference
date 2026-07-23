@@ -332,13 +332,29 @@ def run(request, codex, timeout, extra_args, plain=False):
     out_dir = Path(request["out_dir"]).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     if payload.get("require_reference_images"):
-        declared = payload.get("character_refs") or []
-        missing = [str(uri) for uri in declared if not Path(uri).exists()]
+        character_refs = list(payload.get("character_refs") or [])
+        declared = list(character_refs)
+        declared.extend(
+            ref.get("uri") for ref in
+            (payload.get("identity_references") or [])
+            if isinstance(ref, dict) and ref.get("uri"))
+        declared.extend(payload.get("reference_images") or [])
+        declared.extend(
+            payload.get(key) for key in (
+                "image_uri", "chain_first_uri", "scene_ref", "style_ref")
+            if payload.get(key))
+        declared = list(dict.fromkeys(str(uri) for uri in declared if uri))
+        missing = [
+            uri for uri in declared
+            if not uri.startswith(("http://", "https://"))
+            and not Path(uri).exists()]
+        if payload.get("characters") and not character_refs:
+            return {"ok": False, "error": "人物出图要求最终立绘，但请求未携带人物参考图"}
         if not declared:
-            return {"ok": False, "error": "人物出图要求最终立绘，但请求未携带参考图"}
+            return {"ok": False, "error": "本次出图要求参考图，但请求未携带可用参考图"}
         if missing:
             return {"ok": False,
-                    "error": "人物参考图不存在: " + "、".join(missing)}
+                    "error": "参考图不存在: " + "、".join(missing)}
     if payload.get("identity_required"):
         identity_refs = payload.get("identity_references") or []
         missing = [str(ref.get("uri", "")) for ref in identity_refs

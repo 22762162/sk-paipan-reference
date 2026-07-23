@@ -117,6 +117,82 @@ def test_regen_shot_invalidates_video(app):
     assert revision["active"] is False
 
 
+def test_revise_last_and_first_frame_syncs_shared_boundary_and_references(app):
+    _to_preflight(app, "万妖图录", 3, finish=True)
+    project = app.projects.get_project("万妖图录")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=?",
+        (project["id"], 3))
+    storyboard, _ = app.projects.latest_document(
+        episode["id"], "storyboard")
+    previous, following = next(
+        (left, right) for left, right in zip(
+            storyboard["shots"], storyboard["shots"][1:])
+        if left["scene_no"] == right["scene_no"])
+    previous_no = int(previous["shot_no"])
+    following_no = int(following["shot_no"])
+    previous_name = f"e003_shot{previous_no:03d}"
+    following_name = f"e003_shot{following_no:03d}"
+    old_tail = app.assets.latest(
+        project["id"], "last_frame", previous_name)
+    old_head = app.assets.latest(
+        project["id"], "first_frame", following_name)
+    assert old_tail and old_head
+    assert app.assets.latest(project["id"], "video", previous_name)
+    assert app.assets.latest(project["id"], "video", following_name)
+    app.director.set_video_references(
+        episode["id"], following_no, [old_tail["id"], old_head["id"]])
+
+    revised = app.director.regen_image(
+        "万妖图录", 3,
+        {"kind": "last_frame", "shot_no": previous_no},
+        feedback="人物表情改为惊讶，其他内容保持不变")
+    sync = revised["sync"]
+    new_tail = app.assets.latest(
+        project["id"], "last_frame", previous_name)
+    new_head = app.assets.latest(
+        project["id"], "first_frame", following_name)
+    assert new_tail["version"] == old_tail["version"] + 1
+    assert new_head["version"] == old_head["version"] + 1
+    assert new_tail["uri"] == new_head["uri"]
+    assert sync["frame_shots"] == [previous_no, following_no]
+    assert sync["boundary_sync"][0]["synced_kind"] == "first_frame"
+    assert set(sync["invalidated_video_shots"]) == {
+        previous_no, following_no}
+    assert app.assets.latest(project["id"], "video", previous_name) is None
+    assert app.assets.latest(project["id"], "video", following_name) is None
+    assert app.assets.latest(project["id"], "edit", "e003_final") is None
+    assert app.assets.latest(project["id"], "review_board", "e003") is None
+
+    refs, _ = app.projects.latest_document(
+        episode["id"], "video_references")
+    selected = refs["shots"][str(following_no)]
+    assert {item["asset_id"] for item in selected} == {
+        new_tail["id"], new_head["id"]}
+    revision, _ = app.projects.latest_document(
+        episode["id"], "shot_revision_state")
+    assert revision["source_kind"] == "last_frame"
+    assert revision["affected_shots"] == [previous_no, following_no]
+
+    # 上传修好的下一镜首帧，也要反向同步回上一镜尾帧。
+    uploaded = app.director.import_image(
+        "万妖图录", 3,
+        {"kind": "first_frame", "shot_no": following_no},
+        Path(new_head["uri"]).read_bytes(), Path(new_head["uri"]).suffix)
+    uploaded_head = app.assets.latest(
+        project["id"], "first_frame", following_name)
+    uploaded_tail = app.assets.latest(
+        project["id"], "last_frame", previous_name)
+    assert uploaded_head["uri"] == uploaded_tail["uri"] == uploaded["uri"]
+    assert uploaded["sync"]["boundary_sync"][0]["synced_kind"] == \
+        "last_frame"
+    refs, _ = app.projects.latest_document(
+        episode["id"], "video_references")
+    selected_ids = {item["asset_id"] for item in
+                    refs["shots"][str(following_no)]}
+    assert selected_ids == {uploaded_head["id"], uploaded_tail["id"]}
+
+
 def test_regen_scene_art_and_errors(app):
     _to_preflight(app)
     project = app.projects.get_project("万妖图录")
