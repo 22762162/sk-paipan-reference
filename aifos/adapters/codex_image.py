@@ -432,15 +432,15 @@ def run(request, codex, timeout, extra_args, plain=False):
     if capability == "image_qc":
         verdict = _extract_json(proc.stdout)
         if verdict is None or "pass" not in verdict:
-            # 解析不到判定 → 视为放行(不阻塞生产),但记录原文便于排查。
-            # 必须带全身份/性别/人数字段:导演中心的硬门槛会把缺字段的
-            # 判定当"未核对"直接判失败,放行就成了误杀。
+            # 看不到可靠的结构化结论就失败关闭。伪造 checked/match=true
+            # 会让换性别、人数错误或串脸图片绕过导演层硬门槛。
             return {"ok": True, "data": {
-                "pass": True, "issues": [],
-                "identity_checked": True, "identity_match": True,
-                "gender_checked": True, "gender_match": True,
-                "count_checked": True, "count_match": True,
-                "note": "codex 未返回可解析判定,放行"}, "uri": ""}
+                "pass": False,
+                "issues": ["Codex 未返回可解析的视觉质检 JSON，图片未放行"],
+                "identity_checked": False, "identity_match": False,
+                "gender_checked": False, "gender_match": False,
+                "count_checked": False, "count_match": False,
+                "note": "codex 未返回可解析判定,失败关闭"}, "uri": ""}
         verdict.setdefault("issues", [])
         return {"ok": True, "data": verdict, "uri": "",
                 "model": "Codex 视觉质检"}

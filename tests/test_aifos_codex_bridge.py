@@ -19,6 +19,15 @@ log = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                    "codex_argv.jsonl")
 with open(log, "a", encoding="utf-8") as f:
     f.write(json.dumps(sys.argv[1:], ensure_ascii=False) + "\\n")
+if "你是漫剧图片质检员" in instruction:
+    print(json.dumps({
+        "pass": True,
+        "identity_checked": True, "identity_match": True,
+        "gender_checked": True, "gender_match": True,
+        "count_checked": True, "count_match": True,
+        "detected_count": 1, "issues": [],
+    }, ensure_ascii=False))
+    sys.exit(0)
 paths = re.findall(r"(/\\S+?\\.png)", instruction)
 for p in paths:
     open(p, "wb").write(b"fake-png")
