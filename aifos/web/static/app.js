@@ -2592,8 +2592,10 @@ function planQcBadge(item) {
 function planQcIssuesHtml(item) {
   const qc = item.qc;
   if (!qc || qc.passed || !(qc.issues || []).length) return "";
+  const revision = qc.revision_feedback
+    ? `<div class="qc-revision"><b>自动优化修订：</b>${esc(qc.revision_feedback)}</div>` : "";
   return `<div class="plan-err qc-fail-reason"><b>质检没有通过的原因：</b>${esc(qc.issues.join("；"))}
-    <span class="dim">(已自动重画 ${qc.attempts} 次仍未过,可改提示词手动重画)</span></div>`;
+    <span class="dim">(已自动重画 ${qc.attempts} 次仍未过,可改提示词手动重画)</span>${revision}</div>`;
 }
 
 function planQcReferenceGalleryHtml(item) {
@@ -3044,7 +3046,7 @@ function productionLedgerHtml(data, options = {}) {
     </div>
     ${humanVideoShots.length ? `<div class="production-ledger-video-stop" role="alert">
       <b>⏸ 视频质检已暂停自动返工</b>
-      <span>${humanVideoShots.map((item) => `镜头${item.shot_no}：${esc((item.issues || []).join("；") || "视频质检未通过")}`).join("；")}</span>
+      <span>${humanVideoShots.map((item) => `镜头${item.shot_no}：${esc((item.issues || []).join("；") || "视频质检未通过")}${item.revision_feedback ? `<small>自动优化修订：${esc(item.revision_feedback)}</small>` : ""}`).join("；")}</span>
       <small>系统只自动返工 1 次；请先填写人工修改意见，再对指定镜头重生成。</small>
     </div>` : ""}
     <div class="production-ledger-summary">
@@ -3113,7 +3115,7 @@ function bindProductionLedger(root, data, episodeId) {
       const shotNo = Number(button.dataset.ledgerVideoRedo);
       const qc = (data.video_qc_report?.shots || []).find((item) =>
         Number(item.shot_no) === shotNo);
-      const initial = (qc?.issues || []).join("；");
+      const initial = qc?.revision_feedback || (qc?.issues || []).join("；");
       const feedback = window.prompt(
         `镜头${shotNo}质检未通过。请填写确认后的修改要求：`, initial);
       if (!feedback || !feedback.trim()) return;
@@ -6441,6 +6443,8 @@ function storyboardStatusHtml(data, shot, issues, context) {
       视频 · ${videoLabel}</span>
     ${videoQc?.issues?.length ? `<span class="storyboard-status state-${videoQc.awaiting_human ? "awaiting_human" : "retrying"}">
       原因 · ${esc(videoQc.issues.join("；"))}</span>` : ""}
+    ${videoQc?.revision_feedback ? `<span class="storyboard-status state-${videoQc.awaiting_human ? "awaiting_human" : "retrying"}">
+      自动优化修订 · ${esc(videoQc.revision_feedback)}</span>` : ""}
     ${readable.required ? `<span class="storyboard-status state-${readable.keyframe_uri ? "done" : "pending"}">
       文字 · ${readable.keyframe_uri ? "已锁定" : "待锁定"}</span>` : ""}
     ${issues.length ? `<span class="storyboard-status state-failed">⚠ 质检问题 ${issues.length}</span>`
