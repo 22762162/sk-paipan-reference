@@ -1905,9 +1905,15 @@ function codexExecutionSettingsHtml(data) {
   const parallelValue = data?.codex_parallel;
   const enabledCount = Number(parallelValue?.enabled_count) ||
     profiles.filter((profile) => profile.enabled).length;
-  const parallel = enabledCount >= 2;
+  const readyCount = profiles.filter((profile) => profile.enabled &&
+    ["ready", "healthy", "ok", "idle"].includes(
+      String(profile.status || "").toLowerCase())).length;
+  const parallel = readyCount >= 2 ||
+    (readyCount === 0 && enabledCount >= 2 &&
+      profiles.every((profile) => !profile.status));
   const modeLabel = parallel ? "双通道并行已启用"
-    : enabledCount === 1 ? "单通道兼容模式" : "等待配置两个通道";
+    : enabledCount >= 2 ? "已配置，先修复通道"
+      : enabledCount === 1 ? "单通道兼容模式" : "等待配置两个通道";
   return `<section class="panel codex-execution-panel">
     <div class="codex-execution-head">
       <div><span class="eyebrow">PARALLEL CODEX EXECUTION</span>
