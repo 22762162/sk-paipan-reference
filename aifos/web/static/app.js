@@ -1728,6 +1728,237 @@ function providerCostHint(provider) {
   return "";
 }
 
+function codexProfileList(data) {
+  const raw = Array.isArray(data?.codex_profiles) ? data.codex_profiles : [];
+  const channels = [
+    { channel: "A", defaultName: "Codex 通道 A" },
+    { channel: "B", defaultName: "Codex 通道 B" },
+  ];
+  return channels.map(({ channel, defaultName }, index) => {
+    const exact = raw.find((item) =>
+      String(item?.id || "").trim().toUpperCase() === channel ||
+      String(item?.id || "").trim().toUpperCase().endsWith(`_${channel}`) ||
+      String(item?.id || "").trim().toUpperCase().endsWith(`-${channel}`));
+    const profile = exact || raw[index] || {};
+    return {
+      id: String(profile.id || channel),
+      channel,
+      name: profile.name || defaultName,
+      enabled: Boolean(profile.enabled),
+      codex_home: profile.codex_home || "",
+      command: profile.command || "",
+      status: String(profile.status || (profile.enabled ? "unknown" : "disabled")),
+      reason: profile.reason || "",
+      assigned: profile.assigned ?? 0,
+      active_jobs: profile.active_jobs ?? [],
+    };
+  });
+}
+
+function codexCount(value) {
+  if (Array.isArray(value)) return value.length;
+  if (value && typeof value === "object")
+    return Number(value.count ?? value.total ?? Object.keys(value).length) || 0;
+  return Math.max(0, Number(value) || 0);
+}
+
+function codexHealth(profile) {
+  const status = String(profile.status || "").toLowerCase();
+  if (!profile.enabled) return { tone: "", label: "未启用" };
+  if (["ready", "healthy", "ok", "idle", "done"].includes(status))
+    return { tone: "done", label: "健康" };
+  if (["running", "busy", "processing", "active"].includes(status))
+    return { tone: "done", label: "运行中" };
+  if (["error", "failed", "unhealthy", "offline", "missing"].includes(status))
+    return { tone: "qc_failed", label: "异常" };
+  return { tone: "", label: "待检测" };
+}
+
+function codexProfileCard(profile) {
+  const health = codexHealth(profile);
+  return `<article class="codex-channel-card" data-codex-profile="${esc(profile.id)}">
+    <div class="codex-channel-head">
+      <div><span class="codex-channel-badge">通道 ${esc(profile.channel)}</span>
+        <strong>${esc(profile.name)}</strong></div>
+      <span class="chip ${health.tone}">${health.label}</span>
+    </div>
+    <label class="set-row codex-set-row"><span>名称</span>
+      <input data-codex-field="name" value="${esc(profile.name)}"
+        placeholder="例如：Codex 图片通道 ${esc(profile.channel)}"></label>
+    <label class="set-row codex-set-row"><span>CODEX_HOME / 配置路径</span>
+      <input data-codex-field="codex_home" value="${esc(profile.codex_home)}"
+        placeholder="例如：/Users/name/.codex-${esc(profile.channel.toLowerCase())}"></label>
+    <label class="set-row codex-set-row"><span>Codex 命令</span>
+      <input data-codex-field="command" value="${esc(profile.command)}"
+        placeholder="留空使用系统 codex"></label>
+    <label class="set-row toggle codex-toggle"><span>启用</span>
+      <input type="checkbox" data-codex-field="enabled" ${profile.enabled ? "checked" : ""}>
+      <em>${profile.enabled ? "参与图片任务并行分片" : "暂不分配图片任务"}</em></label>
+    <div class="codex-channel-runtime">
+      <span>已分配 <b>${codexCount(profile.assigned)}</b></span>
+      <span>运行中 <b>${codexCount(profile.active_jobs)}</b></span>
+      <span>状态 <b>${health.label}</b></span>
+    </div>
+    ${profile.reason ? `<p class="${health.tone === "qc_failed" ? "codex-channel-error" : "dim"}">
+      ${esc(profile.reason)}</p>` : ""}
+  </article>`;
+}
+
+function codexJobList(value) {
+  if (Array.isArray(value)) return value;
+  if (value && Array.isArray(value.items)) return value.items;
+  if (value && Array.isArray(value.jobs)) return value.jobs;
+  return [];
+}
+
+function codexShardRows(data, shardPayload = null) {
+  const profiles = codexProfileList(data);
+  const raw = Array.isArray(shardPayload) ? shardPayload
+    : shardPayload?.shards || shardPayload?.channels ||
+      shardPayload?.items || shardPayload?.codex_profiles || [];
+  const shards = Array.isArray(raw) ? raw : [];
+  return profiles.map((profile, index) => {
+    const extra = shards.find((item) =>
+      [profile.id, profile.channel].includes(
+        String(item?.id || item?.channel || item?.profile_id || "").trim())
+      || String(item?.id || item?.channel || item?.profile_id || "")
+        .trim().toUpperCase() === profile.channel) || shards[index] || {};
+    const activeValue = extra.active_jobs ?? extra.running ?? profile.active_jobs;
+    const jobs = codexJobList(activeValue);
+    const assigned = codexCount(extra.assigned ?? extra.total ?? profile.assigned);
+    const running = extra.running_count != null
+      ? codexCount(extra.running_count)
+      : jobs.length
+        ? jobs.filter((job) =>
+          ["running", "processing", "active", "retrying"].includes(
+            String(job?.status || "").toLowerCase())).length
+        : codexCount(activeValue);
+    const completed = extra.completed != null
+      ? codexCount(extra.completed)
+      : jobs.filter((job) =>
+        ["done", "completed", "success"].includes(
+          String(job?.status || "").toLowerCase())).length;
+    const failed = extra.failed != null
+      ? codexCount(extra.failed)
+      : jobs.filter((job) =>
+        ["failed", "error"].includes(String(job?.status || "").toLowerCase())).length;
+    let progress = Number(extra.progress);
+    if (Number.isFinite(progress) && progress >= 0 && progress <= 1) progress *= 100;
+    if (!Number.isFinite(progress))
+      progress = assigned > 0 && (completed || failed)
+        ? ((completed + failed) / assigned) * 100 : 0;
+    const failedJob = jobs.find((job) => job?.error || job?.reason);
+    const status = String(profile.status || "").toLowerCase();
+    const error = extra.error || extra.last_error || failedJob?.error ||
+      failedJob?.reason ||
+      (["error", "failed", "unhealthy"].includes(status) ? profile.reason : "");
+    return {
+      id: profile.id, channel: profile.channel,
+      name: profile.name, enabled: profile.enabled,
+      assigned, running, completed, failed,
+      progress: Math.max(0, Math.min(100, progress)),
+      error,
+    };
+  });
+}
+
+function codexShardBoardHtml(data, shardPayload = null, optionalApiMissing = false) {
+  const rows = codexShardRows(data, shardPayload);
+  return `<div class="codex-shard-head">
+      <div><h3>图片并行生产 · 任务分片</h3>
+        <p>图片任务会按通道健康状态分配；单个通道报错时可由另一通道继续。</p></div>
+      <button type="button" id="btn-codex-shards-refresh">刷新任务</button>
+    </div>
+    <div class="codex-shard-grid">
+      ${rows.map((row) => `<article class="codex-shard-card">
+        <div class="codex-shard-title">
+          <span class="codex-channel-badge">通道 ${esc(row.channel)}</span>
+          <strong>${esc(row.name)}</strong>
+          <span class="chip ${row.failed || row.error ? "qc_failed" : row.enabled ? "done" : ""}">
+            ${row.failed || row.error ? "有错误" : row.enabled ? "可分配" : "未启用"}</span>
+        </div>
+        <div class="codex-shard-stats">
+          <span><b>${row.assigned}</b> 分配数</span>
+          <span><b>${row.completed}</b> 已完成</span>
+          <span><b>${row.running}</b> 进行中</span>
+          <span><b>${row.failed}</b> 错误</span>
+        </div>
+        <div class="codex-progress" role="progressbar" aria-label="通道 ${esc(row.channel)} 图片任务进度"
+          aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(row.progress)}">
+          <i style="width:${row.progress.toFixed(1)}%"></i></div>
+        <small>${row.assigned
+          ? `进度 ${Math.round(row.progress)}%`
+          : "暂无已分配任务"}</small>
+        ${row.error ? `<p class="codex-channel-error">${esc(row.error)}</p>` : ""}
+      </article>`).join("")}
+    </div>
+    <p class="codex-shard-note ${optionalApiMissing ? "compat" : ""}">
+      ${optionalApiMissing
+        ? "实时分片接口待接入，当前按 /api/settings 的任务快照展示。"
+        : "状态来自实时分片接口；刷新不会中断正在运行的任务。"}
+    </p>`;
+}
+
+function codexExecutionSettingsHtml(data) {
+  const profiles = codexProfileList(data);
+  const supported = Array.isArray(data?.codex_profiles);
+  const parallelValue = data?.codex_parallel;
+  const parallel = parallelValue && typeof parallelValue === "object"
+    ? Boolean(parallelValue.enabled ?? parallelValue.active)
+    : Boolean(parallelValue);
+  return `<section class="panel codex-execution-panel">
+    <div class="codex-execution-head">
+      <div><span class="eyebrow">PARALLEL CODEX EXECUTION</span>
+        <h2>Codex 双通道</h2>
+        <p>为通道 A/B 使用独立 CODEX_HOME，隔离订阅会话并并行生产图片。</p></div>
+      <span class="chip ${parallel ? "done" : ""}">
+        ${parallel ? "双通道并行已启用" : "单通道兼容模式"}</span>
+    </div>
+    <div class="codex-channel-grid">${profiles.map(codexProfileCard).join("")}</div>
+    <div class="codex-profile-actions">
+      <button type="button" class="primary" id="btn-codex-profiles-save">保存双通道配置</button>
+      <span id="codex-profile-save-status" class="dim">${supported
+        ? "保存后新图片任务生效，运行中的任务不迁移。"
+        : "接口待接入：当前服务未返回 codex_profiles；原 AI 设置仍可正常使用。"}</span>
+    </div>
+    <div class="codex-shard-board" id="codex-shard-board">
+      ${codexShardBoardHtml(data, null, true)}
+    </div>
+  </section>`;
+}
+
+function bindCodexShardRefresh(data) {
+  const button = document.getElementById("btn-codex-shards-refresh");
+  if (!button) return;
+  button.onclick = async () => {
+    button.disabled = true;
+    button.textContent = "刷新中…";
+    const host = document.getElementById("codex-shard-board");
+    try {
+      const payload = await api("/api/image-production/shards");
+      if (!host?.isConnected) return;
+      host.innerHTML = codexShardBoardHtml(data, payload, false);
+    } catch (_) {
+      if (!host?.isConnected) return;
+      host.innerHTML = codexShardBoardHtml(data, null, true);
+    }
+    bindCodexShardRefresh(data);
+  };
+}
+
+async function hydrateCodexShardBoard(data) {
+  const host = document.getElementById("codex-shard-board");
+  if (!host) return;
+  try {
+    const payload = await api("/api/image-production/shards");
+    if (!host.isConnected) return;
+    host.innerHTML = codexShardBoardHtml(data, payload, false);
+  } catch (_) {
+    // 可选接口在旧服务上可能不存在；保留 /api/settings 快照，不弹错误打断设置。
+  }
+  bindCodexShardRefresh(data);
+}
+
 async function renderSettings() {
   topbarRight.innerHTML = "";
   let data;
@@ -1748,6 +1979,7 @@ function drawSettings(data) {
     </div>
     ${imageCostGuideHtml()}
     ${icloudSyncHtml(data.icloud_sync)}
+    ${codexExecutionSettingsHtml(data)}
     <div class="settings-grid">
       ${data.providers.map(providerCard).join("")}
     </div>
@@ -1774,6 +2006,38 @@ function drawSettings(data) {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+  document.getElementById("btn-codex-profiles-save").onclick = async (ev) => {
+    const button = ev.currentTarget;
+    const status = document.getElementById("codex-profile-save-status");
+    const profiles = [...app.querySelectorAll("[data-codex-profile]")].map((card) => {
+      const field = (name) => card.querySelector(`[data-codex-field="${name}"]`);
+      return {
+        id: card.dataset.codexProfile,
+        name: field("name").value.trim(),
+        enabled: field("enabled").checked,
+        codex_home: field("codex_home").value.trim(),
+        command: field("command").value.trim(),
+      };
+    });
+    button.disabled = true;
+    button.textContent = "保存中…";
+    if (status) status.textContent = "正在写入通道配置…";
+    try {
+      const fresh = await post({ codex_profiles: profiles });
+      showToast("Codex 双通道配置已保存", "ok");
+      drawSettings(fresh);
+    } catch (e) {
+      if (status) {
+        status.className = "codex-channel-error";
+        status.textContent = `暂未保存：${e.message}（原 AI 设置不受影响）`;
+      }
+      showToast(`双通道配置暂不可用：${e.message}`, "error");
+      button.disabled = false;
+      button.textContent = "保存双通道配置";
+    }
+  };
+  bindCodexShardRefresh(data);
+  void hydrateCodexShardBoard(data);
   document.getElementById("btn-icloud-toggle").onclick = async () => {
     const current = Boolean((data.icloud_sync || {}).enabled);
     try {

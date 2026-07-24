@@ -1274,6 +1274,95 @@ audio.player { background: var(--surface-2); }
 .pc-status .ok { color: var(--good); }
 .pc-status .miss { color: var(--serious); }
 
+/* Codex 双通道配置与图片任务分片 */
+.codex-execution-panel {
+  display: grid; gap: 15px; padding: 18px;
+  border-color: rgba(57, 135, 229, .36);
+  background:
+    radial-gradient(circle at 92% -30%, rgba(57, 135, 229, .18), transparent 42%),
+    var(--surface);
+}
+.codex-execution-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 16px;
+}
+.codex-execution-head h2 { margin: 0; font-size: 18px; }
+.codex-execution-head p {
+  margin: 5px 0 0; color: var(--ink-3); font-size: 12.5px; line-height: 1.5;
+}
+.codex-channel-grid, .codex-shard-grid {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px;
+}
+.codex-channel-card, .codex-shard-card {
+  min-width: 0; padding: 14px; border: 1px solid var(--hairline);
+  border-radius: 11px; background: rgba(13, 13, 13, .48);
+}
+.codex-channel-head, .codex-shard-title {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+}
+.codex-channel-head > div, .codex-shard-title {
+  min-width: 0; flex-wrap: wrap;
+}
+.codex-channel-head strong, .codex-shard-title strong {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px;
+}
+.codex-channel-badge {
+  display: inline-flex; align-items: center; min-height: 24px; padding: 3px 8px;
+  margin-right: 7px; border: 1px solid rgba(57, 135, 229, .38);
+  border-radius: 7px; background: var(--accent-soft); color: #bcdcff;
+  font-size: 10.5px; font-weight: 800; letter-spacing: .04em;
+}
+.codex-set-row { align-items: flex-start; }
+.codex-set-row > span { width: 150px; line-height: 1.35; padding-top: 7px; }
+.codex-set-row input:not([type="checkbox"]) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.codex-toggle > span { width: 150px; }
+.codex-channel-runtime, .codex-shard-stats {
+  display: grid; gap: 7px; margin-top: 12px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.codex-channel-runtime span, .codex-shard-stats span {
+  min-width: 0; padding: 7px 8px; border-radius: 7px;
+  background: var(--surface-2); color: var(--ink-3); font-size: 10.5px;
+}
+.codex-channel-runtime b, .codex-shard-stats b {
+  color: var(--ink); font-size: 12px; font-variant-numeric: tabular-nums;
+}
+.codex-channel-error {
+  margin: 8px 0 0; color: var(--serious); font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+.codex-profile-actions {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+}
+.codex-profile-actions span { font-size: 11.5px; }
+.codex-shard-board {
+  display: grid; gap: 11px; padding-top: 15px; border-top: 1px solid var(--hairline);
+}
+.codex-shard-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+}
+.codex-shard-head h3 { margin: 0; font-size: 14px; }
+.codex-shard-head p { margin: 4px 0 0; color: var(--ink-3); font-size: 11.5px; }
+.codex-shard-title { justify-content: flex-start; }
+.codex-shard-title .chip { margin-left: auto; }
+.codex-shard-stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.codex-shard-stats span { display: grid; gap: 2px; }
+.codex-progress {
+  height: 7px; margin-top: 11px; overflow: hidden; border-radius: 999px;
+  background: var(--surface-2);
+}
+.codex-progress i {
+  display: block; height: 100%; border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), #7cc7ff);
+  transition: width .25s ease;
+}
+.codex-shard-card > small {
+  display: block; margin-top: 5px; color: var(--ink-3); font-size: 10.5px;
+}
+.codex-shard-note { margin: 0; color: var(--ink-3); font-size: 10.5px; }
+.codex-shard-note.compat { color: #d7ab74; }
+
 /* ---------- 产线状态条 / 实际产线标注 ---------- */
 .pipeline-row {
   display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
@@ -1354,6 +1443,13 @@ audio.player { background: var(--surface-2); }
   .settings { padding: 12px; }
   .settings-grid { grid-template-columns: minmax(0, 1fr); }
   .settings-head { align-items: flex-start; }
+  .codex-execution-head, .codex-shard-head { align-items: flex-start; flex-direction: column; }
+  .codex-channel-grid, .codex-shard-grid { grid-template-columns: minmax(0, 1fr); }
+  .codex-set-row { display: grid; grid-template-columns: minmax(0, 1fr); gap: 5px; }
+  .codex-set-row > span, .codex-toggle > span { width: auto; padding-top: 0; }
+  .codex-toggle { grid-template-columns: auto minmax(0, 1fr); align-items: center; }
+  .codex-toggle > span { grid-column: 1 / -1; }
+  .codex-shard-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .route-table { display: block; overflow-x: auto; }
   .workflow-steps { grid-template-columns: repeat(2, 1fr); }
   .profile-strip strong { margin-left: 0; }

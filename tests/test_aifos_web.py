@@ -82,6 +82,15 @@ def test_index_and_static(server):
     assert "全部 Seedream 5.0 Lite 优先".encode() in app_js
     assert "全部 OpenAI 图片 API 优先".encode() in app_js
     assert b"image_strategy" in app_js
+    assert "Codex 双通道".encode() in app_js
+    assert "通道 A".encode() in app_js
+    assert "通道 B".encode() in app_js
+    assert "CODEX_HOME / 配置路径".encode() in app_js
+    assert "图片并行生产 · 任务分片".encode() in app_js
+    assert b"codex_profiles" in app_js
+    assert b"codex_parallel" in app_js
+    assert b"/api/image-production/shards" in app_js
+    assert "接口待接入".encode() in app_js
     assert b"/api/series/preview" in app_js
     assert b"/api/series/import" in app_js
     assert "选择多集剧本文档".encode() in app_js
@@ -187,6 +196,10 @@ def test_index_and_static(server):
         server["port"], "GET", "/static/style.css")
     assert status == 200 and "css" in ctype
     assert b".image-cost-guide" in style_css
+    assert b".codex-execution-panel" in style_css
+    assert b".codex-channel-grid" in style_css
+    assert b".codex-shard-board" in style_css
+    assert b".codex-progress" in style_css
     assert b".blocking-actor-legend" in style_css
     assert b".blocking-map-scroll" in style_css
     assert b".video-ref-picker-grid" in style_css
