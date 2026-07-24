@@ -63,11 +63,26 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260725-spatial-3d-1" in html
-    assert "/static/app.js?v=20260725-spatial-3d-1" in html
+    assert "/static/style.css?v=20260725-plan-filter-1" in html
+    assert "/static/app.js?v=20260725-plan-filter-1" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
+    assert b"pausedProductionState" in app_js
+    assert b"pausedProductionAccessHtml" in app_js
+    assert b'&& !pausedProduction.active' in app_js
+    assert b'data-paused-access="script"' in app_js
+    assert b'data-paused-access="assets"' in app_js
+    assert b'data-paused-access="storyboard"' in app_js
+    assert b'data-paused-access="blocking"' in app_js
+    assert b'data-paused-access="images"' in app_js
+    assert b'data-paused-access="canvas"' in app_js
+    assert "制作已暂停，已有内容仍可查看".encode() in app_js
+    assert b"planNeedsRevision" in app_js
+    assert "仅显示需修改".encode() in app_js
+    assert "显示全部图片".encode() in app_js
+    assert b"refreshOpenPlanOverlay(episodeId, force" in app_js
+    assert b"planOverlaySignatures" in app_js
     assert "空间调度".encode() in app_js
     assert "人物编号图例".encode() in app_js
     assert "人物路线".encode() in app_js
