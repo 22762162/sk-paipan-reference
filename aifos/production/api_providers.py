@@ -460,14 +460,16 @@ class OpenAIImageProvider(Provider):
     def _semantic_prompt(self, prompt, payload, refs):
         """API 提示词补齐与 CLI 一致的语义约束;有参考图时点明"以所附
         图片为准",保证同一角色跨图一致。"""
-        parts = [prompt, _api_style_line(payload),
-                 _api_space_line(payload),
-                 _SUBJECT_DIRECTIVE]
+        complete = bool(payload.get("prompt_contract_complete"))
+        parts = [prompt]
+        if not complete:
+            parts.extend((_api_style_line(payload), _api_space_line(payload)))
+        parts.append(_SUBJECT_DIRECTIVE)
         if (payload.get("portrait") or payload.get("portrait_candidate")
-                or payload.get("character_sheet")):
+                or payload.get("character_sheet")) and not complete:
             parts.append(_CHARACTER_BACKGROUND_DIRECTIVE)
         story = payload.get("character_background")
-        if story:
+        if story and not complete:
             if isinstance(story, (dict, list)):
                 story = json.dumps(story, ensure_ascii=False, separators=(",", ":"))
             parts.append(

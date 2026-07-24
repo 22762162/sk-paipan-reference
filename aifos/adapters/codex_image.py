@@ -140,8 +140,13 @@ def build_instruction(capability, payload, out_dir):
     prompt_text = payload.get("prompt_compact") or payload.get("prompt", "")
     if feedback:
         prompt_text = f"{prompt_text}。修改意见(必须落实):{feedback}"
-    common = (f"{_style_line(payload)}{_space_line(payload)}"
-              f"{SUBJECT_DIRECTIVE}{GEN_DIRECTIVE}")
+    # A complete visual contract already carries style/composition/background.
+    # Keep only universal safety and execution rules instead of repeating the
+    # same character card around the actual image prompt.
+    semantic_context = (
+        "" if payload.get("prompt_contract_complete")
+        else f"{_style_line(payload)}{_space_line(payload)}")
+    common = f"{semantic_context}{SUBJECT_DIRECTIVE}{GEN_DIRECTIVE}"
     if capability == "image":
         safe = "".join(c if c.isalnum() else "_"
                        for c in str(payload.get("art_name", "")))[:40]
@@ -153,7 +158,9 @@ def build_instruction(capability, payload, out_dir):
             instruction = (
                 f"为角色生成立绘并保存到 {target}(PNG,{size})。"
                 f"{prompt_text}。{purpose}。"
-                f"{CHARACTER_BACKGROUND_DIRECTIVE}{_ref_line(payload)}{common}"
+                + ("" if payload.get("prompt_contract_complete")
+                   else CHARACTER_BACKGROUND_DIRECTIVE)
+                + f"{_ref_line(payload)}{common}"
                 "只产出该文件。")
             return instruction, [target], {"name": payload.get("art_name")}
         if payload.get("character_sheet"):
@@ -163,8 +170,10 @@ def build_instruction(capability, payload, out_dir):
                 f"为角色生成{payload.get('sheet_label', key)}设定资产并保存到"
                 f" {target}(PNG,{size})。{payload.get('prompt', '')}。"
                 "这是人物资产库的生产级设定图,必须与立绘/参考图为同一人物,"
-                f"发型服装配色完全一致。{CHARACTER_BACKGROUND_DIRECTIVE}"
-                f"{_ref_line(payload)}{common}"
+                "发型服装配色完全一致。"
+                + ("" if payload.get("prompt_contract_complete")
+                   else CHARACTER_BACKGROUND_DIRECTIVE)
+                + f"{_ref_line(payload)}{common}"
                 "只产出该文件。")
             return instruction, [target], {
                 "name": payload.get("art_name"), "sheet": key}

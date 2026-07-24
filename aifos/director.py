@@ -1170,19 +1170,24 @@ class Director:
         final_card = self._design_value(
             (design or {}).get("image_prompt"))
         if final_card:
-            compact = self._design_line(
-                design, keys=("species", "personality", "temperament"))
-            detail = "；".join(filter(None, (compact, final_card)))
+            species = self._design_value(
+                (design or {}).get("species") or "人类")
+            acting = self._design_value(
+                (design or {}).get("personality")
+                or (design or {}).get("temperament"))
+            detail = final_card
+            if f"形态:{species}" not in final_card:
+                detail = f"形态:{species}；{detail}"
+            if acting and acting not in final_card:
+                detail = f"{detail}；表情与站姿外化:{acting[:120]}"
         else:
             detail = self._design_line(
                 design, keys=("species", "gender", "age_range", "identity",
                           "appearance", "hair", "eyes",
                           "makeup", "accessories", "signature",
-                          "temperament", "personality", "costume",
-                          "palette", "background_prompt", "era_setting",
-                          "occupation", "motivation", "costume_direction",
-                          "signature_props", "visual_direction",
-                          "prompt_prefix", "continuity_anchors"))
+                          "temperament", "costume", "costume_detail",
+                          "palette", "era_setting", "occupation",
+                          "signature_props"))
         return (f"角色立绘:{name}({role}),{style}"
                 + (f",{detail},表情站姿体现其性格" if detail else "")
                 + ";服装和造型必须从人物背景提示词、时代/世界观、职业、性格、"
@@ -1273,11 +1278,8 @@ class Director:
         else:
             identity = self._design_line(
                 design, keys=("species", "gender", "age_range", "identity",
-                              "appearance", "eyes", "personality",
-                              "background_prompt", "era_setting", "occupation",
-                              "motivation", "costume_direction",
-                              "signature_props", "visual_direction",
-                              "prompt_prefix", "continuity_anchors"))
+                              "appearance", "eyes", "era_setting", "occupation",
+                              "signature_props"))
             dna = (design or {}).get("visual_dna")
             if isinstance(dna, dict):
                 compact_dna = "；".join(
@@ -3551,6 +3553,10 @@ class Director:
                         "role": role, "shot_no": 0,
                         "characters": [name], "location": "",
                         "prompt": prompt, "style": style,
+                        # 候选提示词已编译为可直接出图的视觉合同。人物
+                        # 剧情设定仍保留在 payload 供审计/QC 使用，但不再
+                        # 由 API Provider 二次拼入模型提示词。
+                        "prompt_contract_complete": True,
                         "character_background": designs.get(name) or {},
                         **reference_payload,
                         # 初次定妆尚不存在最终立绘；若用户上传过身份参考，
@@ -3889,6 +3895,7 @@ class Director:
                             key=key, design=designs.get(name),
                             locked_look=locked_looks.get(name)),
                         "style": style,
+                        "prompt_contract_complete": True,
                         "character_background": designs.get(name) or {},
                         "character_refs": (
                             [portrait_uri] if portrait_uri else []),

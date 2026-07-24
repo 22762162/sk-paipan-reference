@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime, timezone
+import re
 
 
 STORY_ANALYSIS_SCHEMA = "aifos.story-analysis/v1"
@@ -650,33 +651,88 @@ def reconcile_character_entities(script, raw):
     return True
 
 
+def _source_character_image_prompt(value):
+    """Recover the authored visual prompt without re-appending generated blocks.
+
+    ``build_story_analysis`` is intentionally idempotent because saved analyses
+    are normalized again whenever they are loaded.  Older versions appended the
+    whole generated character card on every normalization pass, which made a
+    short visual prompt grow into repeated biography and audit text.
+    """
+    prompt = _text(value)
+    if not prompt:
+        return ""
+    marker = "单人角色定妆母图："
+    positions = [match.start() for match in re.finditer(marker, prompt)]
+    if positions:
+        # An authored visual lead followed by our generated card: retain only
+        # the authored lead.  A generated card starting at zero is already a
+        # complete prompt; trim only if a second copy was appended.
+        cut = positions[0] if positions[0] > 0 else (
+            positions[1] if len(positions) > 1 else None)
+        if cut is not None:
+            prompt = prompt[:cut]
+    return prompt.strip(" \n\t；;。")
+
+
+def _short_visible_identity(value, fallback):
+    """Keep the drawable role/class label, not a character biography."""
+    text = _text(value, fallback)
+    return re.split(r"[，,；;。\n]", text, maxsplit=1)[0].strip() or fallback
+
+
+def _visible_age(value):
+    """Remove inner-soul/backstory qualifiers from the visible body age."""
+    text = _text(value)
+    return re.split(r"[／/]|\b附\b|附成年|灵魂", text, maxsplit=1)[0].strip()
+
+
 def _character_image_prompt(name, entry, visual, era):
     analysis = _dict(entry.get("character_analysis"))
     dna = _dict(entry.get("visual_dna"))
-    raw = _text(entry.get("image_prompt"))
+    raw = _source_character_image_prompt(entry.get("image_prompt"))
+    # A model-authored prompt is useful only while it remains a compact,
+    # directly drawable card.  Oversized legacy cards are rebuilt from the
+    # structured visual DNA below.
+    if raw and len(raw) <= 700:
+        required = [raw]
+        if name not in raw:
+            required.insert(0, f"单人角色定妆母图：{name}")
+        if not any(token in raw for token in ("全身", "半身", "近景", "特写")):
+            required.append("全身正面自然站姿，人物从头到脚完整可见")
+        if "背景" not in raw:
+            required.append("纯净中性棚拍背景")
+        if not any(token in raw for token in ("无文字", "禁止文字")):
+            required.append("无字幕、无文字、无Logo、无水印")
+        return "；".join(dict.fromkeys(
+            part.strip("；;。") for part in required if part.strip()))
+
+    identity = _short_visible_identity(
+        entry.get("identity_facts"),
+        analysis.get("identity_and_class") or "角色")
+    age = _visible_age(entry.get("age_range"))
+    medium = "；".join(filter(None, (
+        _text(visual.get("medium")),
+        _text(visual.get("realism")),
+    )))
     parts = [
         f"单人角色定妆母图：{name}",
-        f"身份：{entry.get('identity_facts')}",
-        f"性别与年龄呈现：{entry.get('gender')}；{entry.get('age_range')}",
-        f"人物处境与性格：{analysis.get('current_situation')}；"
-        f"{'、'.join(_list(analysis.get('strengths')) + _list(analysis.get('flaws')))}",
+        f"可见身份：{identity}",
+        f"性别与可见年龄：{_text(entry.get('gender'))}；{age}",
         f"脸部骨相：{dna.get('face_structure')}",
         f"发型轮廓：{dna.get('hair_silhouette')}",
         f"体态与职业痕迹：{dna.get('body_or_occupation_marks')}",
         f"服装结构与状态：{dna.get('clothing_structure')}；"
         f"{dna.get('clothing_wear_state')}",
-        f"核心配饰与视觉符号：{dna.get('signature_accessory')}；"
-        f"{dna.get('story_visual_symbol')}（来源："
-        f"{dna.get('story_visual_symbol_origin')}）",
+        f"身份配饰：{dna.get('signature_accessory')}",
         f"气质关键词：{'、'.join(_list(dna.get('temperament_keywords')))}",
-        f"时代世界：{era}",
-        f"画面媒介：{visual.get('medium')}；{visual.get('realism')}；"
-        f"{visual.get('texture_and_render')}",
+        f"时代约束：{_text(era)[:160]}",
+        f"画面媒介：{medium[:220]}",
         "全身正面自然站姿，人物从头到脚完整可见，纯净中性棚拍背景，"
         "自然人体比例与手部结构，无字幕、无文字、无Logo、无水印",
     ]
     generated = "；".join(_text(part) for part in parts if _text(part))
-    return f"{raw}；{generated}" if raw else generated
+    return generated
 
 
 def _default_negative(style):

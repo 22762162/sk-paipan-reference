@@ -11,7 +11,7 @@ import pytest
 
 from aifos.app import App
 from aifos.director import character_candidate_target
-from aifos.story_analysis import build_story_analysis
+from aifos.story_analysis import build_story_analysis, validate_story_analysis
 from aifos.web.server import JobRegistry, serve
 
 
@@ -330,6 +330,52 @@ def test_episode_payload_upgrades_legacy_story_analysis(server):
     assert character["visual_dna"]["temperament_keywords"]
     assert isinstance(character["cast_dedup"], dict)
     assert detail["script"]["production_analysis"]["characters"]
+
+
+def test_episode_payload_compacts_valid_repeated_character_prompt(server):
+    script = {
+        "project_title": "人物提示词兼容测试",
+        "episode_title": "第一集",
+        "logline": "明代皇太子伤后醒来。",
+        "characters": [{
+            "name": "朱慈烺", "role": "主角",
+            "gender": "男", "age_range": "约十五岁",
+        }],
+        "scenes": [{
+            "scene_no": 1, "location": "东宫寝殿",
+            "characters": ["朱慈烺"], "action": "太子起身。",
+        }],
+    }
+    analysis = build_story_analysis(script, "电影级半写实精品漫剧")
+    compact = (
+        "电影级半写实精品漫剧，明代皇太子朱慈烺，约十五岁少年，"
+        "乌黑长发束发无辫；全身正面，纯净棚拍背景，无文字")
+    repeated = (
+        "单人角色定妆母图：朱慈烺；父崇祯帝、母周皇后；"
+        "距亡国不足108天，谋划说服父皇")
+    analysis["characters"][0]["image_prompt"] = (
+        f"{compact}；{repeated}；{repeated}")
+    assert validate_story_analysis(analysis) is None
+
+    app2 = App(server["workspace"])
+    try:
+        project, _ = app2.projects.get_or_create_project(
+            "人物提示词兼容测试", style="电影级半写实精品漫剧")
+        episode, _ = app2.projects.get_or_create_episode(project["id"], 1)
+        app2.projects.save_document(episode["id"], "script", script)
+        app2.projects.save_document(
+            episode["id"], "story_analysis", analysis)
+        episode_id = episode["id"]
+    finally:
+        app2.close()
+
+    status, detail = _json_request(
+        server["port"], "GET", f"/api/episode/{episode_id}")
+    assert status == 200
+    prompt = detail["story_analysis"]["characters"][0]["image_prompt"]
+    assert prompt == compact
+    assert "108天" not in prompt
+    assert "说服父皇" not in prompt
 
 
 def test_asset_image_catalog_has_category_origin_time_and_prompt(server):

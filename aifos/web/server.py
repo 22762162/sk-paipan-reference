@@ -616,17 +616,16 @@ def _episode_payload(app, episode_id):
         from ..story_analysis import (
             apply_story_analysis,
             build_story_analysis,
-            validate_story_analysis,
         )
-        # 旧剧集的制作圣经可能早于人物因果分析/视觉 DNA 字段。
-        # 详情接口只做内存升级，不覆盖用户保存的文档版本。
-        if validate_story_analysis(story_analysis) is not None:
-            story_analysis = build_story_analysis(
-                script,
-                project["style"] or "",
-                raw=story_analysis,
-                source=story_analysis.get("source") or "legacy_upgrade",
-            )
+        # 详情接口始终做一次幂等内存规范化，不覆盖用户保存的文档版本。
+        # 除补齐旧字段外，这也会折叠历史版本中反复拼接的人物出图卡，
+        # 让当前项目立即看到简洁视觉提示词。
+        story_analysis = build_story_analysis(
+            script,
+            project["style"] or "",
+            raw=story_analysis,
+            source=story_analysis.get("source") or "legacy_upgrade",
+        )
         script = apply_story_analysis(copy.deepcopy(script), story_analysis)
     storyboard, sb_v = app.projects.latest_document(episode_id, "storyboard")
     continuity, continuity_v = app.projects.latest_document(
