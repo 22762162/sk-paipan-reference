@@ -651,32 +651,64 @@ def reconcile_character_entities(script, raw):
 
 
 def _character_image_prompt(name, entry, visual, era):
-    analysis = _dict(entry.get("character_analysis"))
     dna = _dict(entry.get("visual_dna"))
     raw = _text(entry.get("image_prompt"))
+
+    # 保存过的制作圣经会再次经过 build_story_analysis。旧逻辑每次都把
+    # “结构化人物母版”追加到上一版 image_prompt 后面，重分析几次就会
+    # 指数式变长，甚至把旧造型与新造型一起交给生图模型。先剥掉历史追加
+    # 段；若编剧模型已经给出一条可直接出图的完整提示词，就把它作为唯一
+    # 权威提示词，丰富的人物经历/因果分析仍保留在独立结构化字段中。
+    generated_marker = f"单人角色定妆母图：{name}"
+    for marker in (f"；{generated_marker}", f";{generated_marker}"):
+        if marker in raw and not raw.startswith(generated_marker):
+            raw = raw.split(marker, 1)[0].strip("；; ")
+
+    def compact(text, limit=720):
+        clauses, seen = [], set()
+        for clause in str(text or "").replace("\n", "；").split("；"):
+            clause = " ".join(clause.split()).strip("；;，,。 ")
+            key = "".join(clause.split()).lower()
+            if not clause or key in seen:
+                continue
+            seen.add(key)
+            candidate = "；".join(clauses + [clause])
+            if len(candidate) > limit:
+                if not clauses:
+                    clauses.append(clause[:limit].rstrip("；;，,。 "))
+                break
+            clauses.append(clause)
+        return "；".join(clauses)
+
+    raw_is_complete = (
+        len(raw) >= 50
+        and name in raw
+        and any(token in raw for token in (
+            "男", "女", "少年", "青年", "中年", "老年", "岁"))
+        and any(token in raw for token in (
+            "脸", "面容", "骨相", "发型", "黑发", "身着", "服装")))
+    if raw.startswith(generated_marker) or raw_is_complete:
+        return compact(raw)
+
     parts = [
         f"单人角色定妆母图：{name}",
         f"身份：{entry.get('identity_facts')}",
         f"性别与年龄呈现：{entry.get('gender')}；{entry.get('age_range')}",
-        f"人物处境与性格：{analysis.get('current_situation')}；"
-        f"{'、'.join(_list(analysis.get('strengths')) + _list(analysis.get('flaws')))}",
         f"脸部骨相：{dna.get('face_structure')}",
         f"发型轮廓：{dna.get('hair_silhouette')}",
         f"体态与职业痕迹：{dna.get('body_or_occupation_marks')}",
         f"服装结构与状态：{dna.get('clothing_structure')}；"
         f"{dna.get('clothing_wear_state')}",
         f"核心配饰与视觉符号：{dna.get('signature_accessory')}；"
-        f"{dna.get('story_visual_symbol')}（来源："
-        f"{dna.get('story_visual_symbol_origin')}）",
+        f"{dna.get('story_visual_symbol')}",
         f"气质关键词：{'、'.join(_list(dna.get('temperament_keywords')))}",
         f"时代世界：{era}",
-        f"画面媒介：{visual.get('medium')}；{visual.get('realism')}；"
-        f"{visual.get('texture_and_render')}",
+        f"画面媒介：{visual.get('medium')}；{visual.get('realism')}",
         "全身正面自然站姿，人物从头到脚完整可见，纯净中性棚拍背景，"
         "自然人体比例与手部结构，无字幕、无文字、无Logo、无水印",
     ]
     generated = "；".join(_text(part) for part in parts if _text(part))
-    return f"{raw}；{generated}" if raw else generated
+    return compact(f"{raw}；{generated}" if raw else generated)
 
 
 def _default_negative(style):

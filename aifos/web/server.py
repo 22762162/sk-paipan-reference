@@ -618,15 +618,18 @@ def _episode_payload(app, episode_id):
             build_story_analysis,
             validate_story_analysis,
         )
-        # 旧剧集的制作圣经可能早于人物因果分析/视觉 DNA 字段。
-        # 详情接口只做内存升级，不覆盖用户保存的文档版本。
-        if validate_story_analysis(story_analysis) is not None:
-            story_analysis = build_story_analysis(
-                script,
-                project["style"] or "",
-                raw=story_analysis,
-                source=story_analysis.get("source") or "legacy_upgrade",
-            )
+        # 旧剧集的制作圣经可能早于人物因果分析/视觉 DNA 字段，或者被
+        # 历史版本重复追加过人物提示词。详情接口统一做一次幂等内存归一化，
+        # 不覆盖用户保存的文档版本；页面和下游始终拿到精简、无重复的版本。
+        story_analysis = build_story_analysis(
+            script,
+            project["style"] or "",
+            raw=story_analysis,
+            source=story_analysis.get("source") or (
+                "legacy_upgrade"
+                if validate_story_analysis(story_analysis) is not None
+                else "saved"),
+        )
         script = apply_story_analysis(copy.deepcopy(script), story_analysis)
     storyboard, sb_v = app.projects.latest_document(episode_id, "storyboard")
     continuity, continuity_v = app.projects.latest_document(

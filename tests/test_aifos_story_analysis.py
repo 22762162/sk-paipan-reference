@@ -131,6 +131,61 @@ def test_analysis_is_injected_into_all_downstream_prompt_context(script):
         MODERN_OTOME_STYLE)
 
 
+def test_character_image_prompt_is_compact_and_idempotent(script):
+    raw = {
+        "characters": [{
+            "name": "苏念",
+            "gender": "女",
+            "age_range": "二十六岁",
+            "identity_facts": "现代城市设计师",
+            "image_prompt": (
+                "电影级现代乙女半写实漫剧，苏念，女，二十六岁，"
+                "清晰自然骨相，黑色锁骨发，身着利落设计师通勤装；"
+                "全身正面自然站姿，纯净棚拍背景，无文字无水印"
+            ),
+        }],
+    }
+    first = build_story_analysis(script, MODERN_OTOME_STYLE, raw=raw)
+    first_prompt = first["characters"][0]["image_prompt"]
+    assert first_prompt.startswith("电影级现代乙女半写实漫剧")
+    assert len(first_prompt) <= 720
+
+    second = build_story_analysis(
+        script, MODERN_OTOME_STYLE, raw=first, source="saved")
+    second_prompt = second["characters"][0]["image_prompt"]
+    assert second_prompt == first_prompt
+    assert second_prompt.count("单人角色定妆母图：苏念") <= 1
+
+    enriched = apply_story_analysis(script, second)
+    assert enriched["characters"][0]["image_prompt"] == first_prompt
+
+
+def test_legacy_appended_character_prompt_keeps_only_authoritative_card(script):
+    concise = (
+        "电影级现代乙女半写实漫剧，苏念，女，二十六岁，"
+        "清晰自然骨相，黑色锁骨发，身着利落设计师通勤装；"
+        "全身正面自然站姿，纯净棚拍背景，无文字无水印"
+    )
+    legacy = {
+        "characters": [{
+            "name": "苏念",
+            "gender": "女",
+            "age_range": "二十六岁",
+            "image_prompt": (
+                concise
+                + "；单人角色定妆母图：苏念；身份：旧版重复母版；"
+                + "脸部骨相：旧版冲突模板"
+            ),
+        }],
+    }
+    analysis = build_story_analysis(
+        script, MODERN_OTOME_STYLE, raw=legacy, source="saved")
+    prompt = analysis["characters"][0]["image_prompt"]
+    assert prompt == concise
+    assert "旧版重复母版" not in prompt
+    assert "旧版冲突模板" not in prompt
+
+
 def test_legacy_analysis_without_character_fields_is_upgraded(script):
     analysis = build_story_analysis(script, MODERN_OTOME_STYLE)
     # 旧版本曾把角色分析保存成不完整对象；详情页和分镜生产表仍必须可打开。
