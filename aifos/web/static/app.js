@@ -3345,10 +3345,16 @@ function productionLedgerReferenceHtml(refs) {
     ? `<span class="production-ledger-missing">⚠ 待挂载必需参考图</span>`
     : `<span class="production-ledger-no-ref">按规则自动调用</span>`;
   return `<div class="production-ledger-ref-list">
-    ${rows.slice(0, 6).map((ref) => `<span class="production-ledger-ref${ref.actual ? " actual" : " expected"}"
-      title="${esc(ref.label || ref.name || "参考图")}">
-      ${ref.url ? `<img src="${esc(thumbUrl(ref.url, 88))}" loading="lazy" alt="">` : "🖼"}
-      <b>${esc(ref.label || ref.name || ref.kind || "参考图")}</b></span>`).join("")}
+    ${rows.slice(0, 6).map((ref) => {
+      const label = ref.label || ref.name || ref.kind || "参考图";
+      if (!ref.url) return `<span class="production-ledger-ref${ref.actual ? " actual" : " expected"}"
+        title="${esc(label)}">🖼 <b>${esc(label)}</b></span>`;
+      return `<button type="button" class="production-ledger-ref production-ledger-ref-preview${ref.actual ? " actual" : " expected"}"
+        data-ledger-ref-preview="${esc(ref.url)}" data-ledger-ref-label="${esc(label)}"
+        title="点击放大：${esc(label)}" aria-label="点击放大查看${esc(label)}">
+        <img src="${esc(thumbUrl(ref.url, 88))}" loading="lazy" alt="${esc(label)}">
+        <b>${esc(label)}</b></button>`;
+    }).join("")}
     ${rows.length > 6 ? `<small>+${rows.length - 6} 张</small>` : ""}
     ${!refs.actual ? `<small class="production-ledger-expected">预期自动挂载</small>` : ""}
   </div>`;
@@ -4215,6 +4221,11 @@ function bindProductionLedger(root, data, episodeId) {
   });
   root.querySelectorAll(".production-ledger-preview").forEach((button) => {
     button.onclick = () => showImageLightbox(button.dataset.ledgerPreview, button.getAttribute("aria-label") || "产物预览");
+  });
+  root.querySelectorAll(".production-ledger-ref-preview").forEach((button) => {
+    button.onclick = () => showImageLightbox(
+      button.dataset.ledgerRefPreview,
+      button.dataset.ledgerRefLabel || "参考图预览");
   });
   root.querySelectorAll(".production-ledger-video-output").forEach((button) => {
     button.onclick = () => openPlayer(data, Number(button.dataset.ledgerPlay));

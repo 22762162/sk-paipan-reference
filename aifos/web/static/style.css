@@ -1270,7 +1270,13 @@ button.canvas-stage-item:hover, button.canvas-stage-item:focus-visible {
 .production-ledger-ref {
   display: inline-flex; align-items: center; gap: 4px; max-width: 125px;
   padding: 3px 5px; border: 1px solid var(--hairline); border-radius: 6px;
-  background: var(--surface-2); color: var(--ink-2); font-size: 9.5px;
+  background: var(--surface-2); color: var(--ink-2); font: inherit; font-size: 9.5px;
+  text-align: left;
+}
+.production-ledger-ref-preview { cursor: zoom-in; }
+.production-ledger-ref-preview:hover, .production-ledger-ref-preview:focus-visible {
+  border-color: var(--accent); background: rgba(57, 135, 229, .12);
+  outline: none;
 }
 .production-ledger-ref.expected { border-style: dashed; color: var(--ink-3); }
 .production-ledger-ref img { width: 28px; height: 28px; object-fit: cover; border-radius: 4px; flex: none; }
