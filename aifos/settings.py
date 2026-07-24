@@ -256,10 +256,14 @@ def set_codex_profiles(config_path, profiles):
 
     # 旧 router 仍把 codex 视为单 Provider；镜像首个 profile 保证保存
     # 双配置后，未升级的调用路径继续使用第一路而不丢 enabled/command。
-    primary = normalized[0]
+    # Router 仍只有一个 codex Provider；只要任一路开启就必须让 Provider
+    # 可用，实际任务再由导演按 profile 分片。优先把首个已启用通道镜像
+    # 到旧字段，兼容尚未支持双 profile 的调用路径。
+    primary = next((profile for profile in normalized
+                    if profile["enabled"]), normalized[0])
     legacy = data.setdefault("providers", {}).setdefault("codex", {})
     legacy.update({
-        "enabled": primary["enabled"],
+        "enabled": any(profile["enabled"] for profile in normalized),
         "command": list(primary["command"]),
         "codex_home": primary["codex_home"],
     })

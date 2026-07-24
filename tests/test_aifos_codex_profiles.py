@@ -107,6 +107,16 @@ def test_empty_command_uses_safe_default_and_ids_remain_stable(tmp_path):
         "--codex", "codex"]
 
 
+def test_secondary_only_profile_keeps_legacy_provider_enabled(tmp_path):
+    config_path = tmp_path / "config.json"
+    profiles = _profiles()
+    profiles[0]["enabled"] = False
+    set_codex_profiles(config_path, profiles)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    assert raw["providers"]["codex"]["enabled"] is True
+    assert raw["providers"]["codex"]["codex_home"] == "~/.codex-alt"
+
+
 def test_settings_payload_exposes_paths_but_never_reads_codex_auth(tmp_path):
     home = tmp_path / "codex-home"
     home.mkdir()
