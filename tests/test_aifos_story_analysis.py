@@ -10,6 +10,8 @@ from aifos.story_analysis import (
     apply_story_analysis,
     build_story_analysis,
     infer_story_visual_context,
+    reconcile_character_entities,
+    unresolved_character_labels,
     validate_story_analysis,
 )
 
@@ -43,6 +45,9 @@ def test_analysis_locks_user_style_and_builds_prompt_bible(script):
     assert analysis["characters"][1]["candidate_count"] == 3
     hero = analysis["characters"][0]
     assert hero["character_analysis"]["core_desire"]
+    assert "苏念" in hero["image_prompt"]
+    assert "脸部骨相" in hero["image_prompt"]
+    assert hero["negative_prompt"]
     assert 3 <= len(hero["visual_dna"]["temperament_keywords"]) <= 8
     assert hero["cast_dedup"]["compared_with"] == ["顾屿"]
     assert analysis["production_rules"]["three_view_contract"][
@@ -136,6 +141,64 @@ def test_legacy_analysis_without_character_fields_is_upgraded(script):
     assert enriched["characters"][0]["character_analysis"]["core_desire"]
     assert enriched["characters"][0]["visual_dna"]["hair_silhouette"]
     assert enriched["characters"][0]["cast_dedup"]["compared_with"] == ["顾屿"]
+
+
+def test_ai_resolution_merges_misparsed_states_into_real_people():
+    imported = {
+        "project_title": "大明", "episode_number": 1,
+        "logline": "太子试探内侍",
+        "characters": [
+            {"name": "哑着嗓子", "role": "主角"},
+            {"name": "小心翼翼地", "role": "配角"},
+            {"name": "朱慈烺试探着", "role": "配角"},
+        ],
+        "scenes": [{
+            "scene_no": 1, "location": "东宫",
+            "characters": ["哑着嗓子", "小心翼翼地", "朱慈烺试探着"],
+            "action": "",
+            "lines": [
+                {"character": "哑着嗓子", "dialogue": "锦盒里是什么？"},
+                {"character": "小心翼翼地", "dialogue": "是西洋奇物。"},
+                {"character": "朱慈烺试探着", "dialogue": "拿来。"},
+            ],
+        }],
+        "import_analysis": {"dialogue_count": 3, "character_count": 3},
+    }
+    raw = {
+        "speaker_resolution": [
+            {"raw_label": "哑着嗓子", "canonical_name": "朱慈烺",
+             "classification": "performance_cue",
+             "performance": "哑着嗓子", "confidence": 0.99},
+            {"raw_label": "朱慈烺试探着", "canonical_name": "朱慈烺",
+             "classification": "misparsed_label",
+             "performance": "试探着", "confidence": 0.99},
+            {"raw_label": "小心翼翼地", "canonical_name": "李继周",
+             "classification": "performance_cue",
+             "performance": "小心翼翼地", "confidence": 0.97},
+        ],
+        "characters": [
+            {"name": "朱慈烺", "gender": "男", "age_range": "约十五岁",
+             "identity_facts": "明末皇太子",
+             "visual_direction": "明代太子常服，黑发无辫"},
+            {"name": "李继周", "gender": "男", "age_range": "三十余岁",
+             "identity_facts": "东宫内侍",
+             "visual_direction": "明代内官帽服"},
+        ],
+    }
+    assert reconcile_character_entities(imported, raw) is True
+    assert [item["name"] for item in imported["characters"]] == [
+        "朱慈烺", "李继周"]
+    assert [line["character"] for line in imported["scenes"][0]["lines"]] == [
+        "朱慈烺", "李继周", "朱慈烺"]
+    assert imported["scenes"][0]["lines"][0]["performance"] == "哑着嗓子"
+    assert unresolved_character_labels(imported) == []
+    analysis = build_story_analysis(imported, raw=raw)
+    prince = next(
+        item for item in analysis["characters"] if item["name"] == "朱慈烺")
+    assert prince["gender"] == "男"
+    assert prince["age_range"] == "约十五岁"
+    assert "明末皇太子" in prince["image_prompt"]
+    assert "最终人物出图卡" not in prince["image_prompt"]
 
 
 def test_saved_analysis_is_versioned_and_rejects_stale_edit(tmp_path):

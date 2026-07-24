@@ -52,6 +52,10 @@ DEFAULT_STANDARD = {
             "user_style_is_hard_constraint": True,
             "distinguish_world_from_render_medium": True,
             "editable_before_lock": True,
+            "resolve_character_entities_before_images": True,
+            "performance_cues_are_not_characters": True,
+            "final_character_image_prompt_required": True,
+            "compact_prompt_compilation": True,
             "required_sections": [
                 "narrative", "world", "visual", "scenes", "characters",
                 "prompt_bible",
@@ -363,7 +367,11 @@ class StandardCenter:
                 "required_before_images", "auto_analyze_uploaded_script",
                 "user_style_is_hard_constraint",
                 "distinguish_world_from_render_medium",
-                "editable_before_lock"):
+                "editable_before_lock",
+                "resolve_character_entities_before_images",
+                "performance_cues_are_not_characters",
+                "final_character_image_prompt_required",
+                "compact_prompt_compilation"):
             bool_field(
                 story_analysis, key, f"rules.story_analysis.{key}")
         for key in ("required_sections", "downstream_consumers"):

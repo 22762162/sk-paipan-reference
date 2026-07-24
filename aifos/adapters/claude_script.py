@@ -195,13 +195,23 @@ Seedance 视频前必须锁定的“制作圣经”。
   媒介诉求，但服装、建筑、器物和社会规则仍须符合故事世界;
 - 用户未指定时，不得默认套用现代乙女、国风、古装、2D、3D、半写实或
   任何固定模板；历史题材要先核定朝代与地域，不得使用通用影楼古装或朝代混搭;
-- 不得新增人物或改变姓名、性别、年龄、身份、阵营、物种与人物关系;
+- 先重新核对人物实体。剧本人物表可能由小说规则解析而来，凡“冷声、温声、
+  哑着嗓子、试探着、小心翼翼地、躬身回话”等语气、动作、状态短语，绝不是
+  人物名；必须结合全文称谓、上下句、代词、关系和行动归并到真实人物，并在
+  speaker_resolution 中逐项说明。无法可靠归并时保留待确认，禁止编造新人;
+- 除纠正上述错误标签外，不得新增人物或擅自改变真实人物的姓名、性别、年龄、
+  身份、阵营、物种与人物关系;
 - 逐场分析空间功能、入口出口、前中后景、材质道具、时段天气、主光方向、
   环境声和连续性锚点;
 - 候选图数量固定:主角5、重要配角3、非重要配角1、背景路人0;
 - 每名正式角色按“剧情证据→经历与处境→性格与行为→可见特征→视觉 DNA”
   分析；视觉 DNA 包含脸部骨相、发型轮廓、身体/职业痕迹、服装结构与状态、
   核心配饰、有故事来源的视觉符号及3-8个气质关键词;
+- 每名正式角色必须根据全文明确或保守推断 gender、age_range，并生成一段
+  `image_prompt`。它是交给图片模型的最终人物出图卡，必须自洽且可直接出图：
+  包含身份/阶层、性别年龄呈现、脸部骨相、肤色、体态、发型、服装结构/材质/
+  层次、配饰道具、性格外化、时代世界、画面媒介与纯净背景要求。不得把内部
+  JSON、审计过程或互相冲突的备选设定塞进去;
 - 对全剧正式角色做视觉去重；发型、服装结构、身体特征、视觉符号、核心配饰、
   气质关键词中两项以上重叠时，先重设计再标记 passed;
 - 人工定版后必须生成面部近景、正面、严格90度侧面、完整180度背面四张独立
@@ -213,6 +223,10 @@ Seedance 视频前必须锁定的“制作圣经”。
 
 JSON 结构:
 {{"schema":"{schema}","source":"ai","locked":false,
+"speaker_resolution":[{{"raw_label":"误识别标签",
+"canonical_name":"真实人物名","classification":"performance_cue/action_cue/alias/misparsed_label",
+"performance":"应保留的语气或动作","confidence":0.98,
+"evidence":"用于判断的原文称谓、上下句或人物关系"}}],
 "narrative":{{"logline":"","genre":"","themes":[],"tone":"",
 "target_audience":"","emotional_arc":"","core_conflict":"",
 "continuity_hooks":""}},
@@ -229,7 +243,9 @@ JSON 结构:
 "environment":"","layout":"","materials_and_props":"","time_weather":"",
 "lighting":"","sound":"","continuity_anchors":[],"prompt_prefix":""}}],
 "characters":[{{"name":"","importance":"主角/重要配角/非重要配角/背景路人",
-"candidate_count":5,"identity_facts":"","visual_direction":"",
+"candidate_count":5,"gender":"","age_range":"","identity_facts":"",
+"visual_direction":"","image_prompt":"无矛盾、可直接交给图片模型的人物出图提示词",
+"negative_prompt":"本角色专属负面提示词",
 "continuity_anchors":[],"prompt_prefix":"",
 "character_analysis":{{"identity_and_class":"","age_and_presentation":"",
 "upbringing":"","family_background":"","education_background":"",
@@ -543,6 +559,10 @@ DESIGN_PROMPT = """你是漫剧人物设定师。为作品《{title}》的角色
   再决定服装和造型;人物背景与画风冲突时以剧情时代/世界观为准,不能把所有人都套成现代都市;
 - `background_prompt` 要写成一段可直接拼进文生图的完整人物背景提示词,至少包含身份来源、
   当前处境、性格外化方式、动机、冲突、关系和视觉符号;
+- `image_prompt` 是最终交给图片模型的单人物出图卡，必须先消解所有冲突，只保留一套
+  明确的姓名、性别、年龄、身份、骨相、肤色、体态、发型、服装结构/材质/层次、
+  配饰道具、气质、时代世界和渲染媒介；不得写“未知/自行猜测”，不得粘贴内部审计
+  JSON、候选比较过程或其他人物的设定；`negative_prompt` 写本角色专属禁止项;
 - 必须先写 `character_analysis`：身份阶层、年龄感、成长与家庭/教育背景、当前处境、
   核心欲望、最大恐惧、关键经历、性格优缺点和行为习惯；原文未说明的内容只能保守推导;
 - 再把人物分析转译为 `visual_dna`：脸部骨相、发型轮廓、身体/职业痕迹、服装结构与
@@ -578,6 +598,8 @@ JSON 格式:
   "accessories": "配饰", "palette": "主配色与点缀色",
   "signature": "标志性辨识特征",
   "background_prompt": "完整人物背景提示词(身份/经历/处境/动机/冲突/视觉象征)",
+  "image_prompt": "最终无矛盾、可直接出图的单人物提示词",
+  "negative_prompt": "本角色专属负面提示词",
   "era_setting": "时代/世界观/地域", "occupation": "职业/社会身份",
   "motivation": "核心目标", "backstory": "关键经历或秘密",
   "relationships": "关系与冲突", "costume_direction": "服装设计逻辑",
@@ -608,6 +630,7 @@ DESIGN_FIELDS = ("species", "personality", "temperament",
                  "appearance", "hair",
                  "eyes", "makeup", "costume", "costume_detail",
                  "accessories", "palette", "signature", "background_prompt",
+                 "image_prompt", "negative_prompt",
                  "era_setting", "occupation", "motivation", "backstory",
                  "relationships", "costume_direction", "signature_props",
                  "visual_variants", "character_analysis", "visual_dna",

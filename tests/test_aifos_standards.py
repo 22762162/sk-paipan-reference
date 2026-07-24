@@ -31,6 +31,12 @@ def test_default_standard_is_complete_and_active(tmp_path):
         assert story_analysis["required_before_images"] is True
         assert story_analysis["auto_analyze_uploaded_script"] is True
         assert story_analysis["user_style_is_hard_constraint"] is True
+        assert story_analysis[
+            "resolve_character_entities_before_images"] is True
+        assert story_analysis["performance_cues_are_not_characters"] is True
+        assert story_analysis[
+            "final_character_image_prompt_required"] is True
+        assert story_analysis["compact_prompt_compilation"] is True
         assert story_analysis["downstream_consumers"] == [
             "character", "scene", "storyboard", "keyframe", "seedance",
         ]

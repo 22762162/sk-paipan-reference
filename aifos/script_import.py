@@ -37,7 +37,6 @@ _SCENE_RE = re.compile(
     r"[：:.\s]*(.*)$")
 _LINE_RE = re.compile(r"^\s*([^\s：:]{1,12})\s*[：:]\s*(.+)$")
 _NAME = r"[A-Za-z\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff·]{0,11}"
-_NAME_LAZY = r"[A-Za-z\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff·]{0,11}?"
 _MANNER = (
     r"(?:一字一顿地|不耐烦地|压低声音|平静地|严肃地|认真地|疑惑地|"
     r"咬牙|冷笑|沉声|冷声|厉声|轻声|低声|柔声|温声|颤声|怒声|"
@@ -46,12 +45,6 @@ _MANNER = (
 _SPEECH_VERB = (
     r"(?:开口说道|开口问道|开口道|说道|问道|答道|喊道|叫道|喝道|斥道|"
     r"怒喝|反问|追问|低语|嘀咕|开口|说|问|答|喊|叫|道)")
-_PREFIX_SPEAKER_RE = re.compile(
-    rf"(?:^|[，。！？；、\s])(?P<speaker>{_NAME_LAZY})"
-    rf"(?={_MANNER}{_SPEECH_VERB}\s*[，,:：]?\s*$)")
-_SUFFIX_SPEAKER_RE = re.compile(
-    rf"^\s*[，。！？；、\s]*(?P<speaker>{_NAME_LAZY})"
-    rf"(?={_MANNER}{_SPEECH_VERB})")
 _PREFIX_COLON_RE = re.compile(
     rf"(?:^|[，。！？；、\s])(?P<speaker>{_NAME})\s*[：:]\s*$")
 _QUOTE_PATTERNS = tuple(
@@ -62,8 +55,21 @@ _QUOTE_PATTERNS = tuple(
 _INVALID_SPEAKERS = {
     "他", "她", "它", "他们", "她们", "众人", "有人", "对方", "来人",
     "一个人", "那人", "男人", "女人", "少年", "少女", "老人", "声音",
+    "那个人", "这个人", "其中一人", "屋里人", "门外人", "问话的人",
 }
 _PLACEHOLDER_SPEAKER = "待确认说话人"
+_PERFORMANCE_PHRASES = tuple(sorted({
+    "一字一顿地", "不耐烦地", "压低声音", "小心翼翼地",
+    "连忙躬身回话", "躬身垂手", "哑着嗓子", "试探着",
+    "有些好奇", "咬牙", "冷笑", "沉声", "冷声", "厉声", "轻声",
+    "低声", "柔声", "温声", "颤声", "怒声", "高声", "朗声",
+    "大声", "小声", "哭着", "笑着", "皱眉", "叹息", "喃喃",
+    "幽幽", "淡淡", "缓缓", "慢慢", "忽然", "急忙", "连忙", "忙",
+}, key=len, reverse=True))
+_PERFORMANCE_ENDINGS = (
+    "地", "着", "嗓子", "回话", "垂手", "好奇", "说道", "问道",
+    "答道", "喊道", "叫道", "喝道", "斥道", "低语", "嘀咕",
+)
 
 _CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7,
            "八": 8, "九": 9, "十": 10}
@@ -73,10 +79,27 @@ class ScriptImportError(ValueError):
     pass
 
 
-def _speaker(value):
+def is_likely_performance_label(value):
+    """说话方式/动作不是人物实体，绝不能触发独立人物资产。"""
+    value = str(value or "").strip(" \t，。！？；、:：")
+    if not value:
+        return False
+    if value in _PERFORMANCE_PHRASES:
+        return True
+    if any(value.endswith(ending) for ending in _PERFORMANCE_ENDINGS):
+        return True
+    return any(
+        token in value for token in (
+            "躬身", "垂手", "回话", "嗓子", "试探着", "小心翼翼",
+            "有些好奇", "冷声", "温声", "沉声", "厉声", "低声",
+        ))
+
+
+def _speaker(value, *, direct=False):
     value = str(value or "").strip(" \t，。！？；、:：")
     if (not value or len(value) > 12 or value in _INVALID_SPEAKERS
-            or re.search(r"[，。！？；、:：\"“”‘’「」『』]", value)):
+            or re.search(r"[，。！？；、:：\"“”‘’「」『』]", value)
+            or (not direct and is_likely_performance_label(value))):
         return ""
     return value
 
@@ -102,24 +125,79 @@ def _quote_segments(line):
     return result
 
 
-def _attributed_speaker(prefix, suffix):
-    matches = list(_PREFIX_SPEAKER_RE.finditer(prefix))
-    if matches:
-        return _speaker(matches[-1].group("speaker"))
+def _split_speaker_performance(value, known=()):
+    value = str(value or "").strip(" \t，。！？；、:：")
+    if not value:
+        return "", ""
+    for name in sorted(set(known or ()), key=len, reverse=True):
+        if value == name:
+            return name, ""
+        if value.startswith(name):
+            performance = value[len(name):].strip()
+            if performance and is_likely_performance_label(performance):
+                return name, performance
+    original = value
+    removed = []
+    changed = True
+    while changed and value:
+        changed = False
+        for phrase in _PERFORMANCE_PHRASES:
+            if value.endswith(phrase):
+                removed.insert(0, phrase)
+                value = value[:-len(phrase)].strip()
+                changed = True
+                break
+    if value and _speaker(value):
+        return _speaker(value), "".join(removed)
+    if value in _INVALID_SPEAKERS and removed:
+        return "", "".join(removed)
+    if is_likely_performance_label(original):
+        return "", original
+    return _speaker(original), ""
+
+
+def _attribution_part(text, *, prefix):
+    """从引号外叙述拆出「人物 + 表演提示 + 说话动词」。"""
+    value = str(text or "")
+    if prefix:
+        value = value.rstrip(" \t，。！？；、:：")
+        match = re.search(rf"{_SPEECH_VERB}\s*$", value)
+        if not match:
+            return "", ""
+        body = value[:match.start()]
+        body = re.split(r"[，。！？；、\s]", body)[-1]
+        return body, match.group(0).strip()
+    value = value.lstrip(" \t，。！？；、:：")
+    match = re.match(
+        rf"(?P<body>[A-Za-z0-9\u4e00-\u9fff·]{{0,24}}?)"
+        rf"(?P<verb>{_SPEECH_VERB})(?=$|[，。！？；、:：\s])",
+        value)
+    if not match:
+        return "", ""
+    return match.group("body"), match.group("verb")
+
+
+def _attribution(prefix, suffix, known=()):
+    for value, is_prefix in ((prefix, True), (suffix, False)):
+        body, _ = _attribution_part(value, prefix=is_prefix)
+        if body:
+            speaker, performance = _split_speaker_performance(body, known)
+            return speaker, performance
     match = _PREFIX_COLON_RE.search(prefix)
     if match:
-        return _speaker(match.group("speaker"))
-    match = _SUFFIX_SPEAKER_RE.match(suffix)
-    if match:
-        return _speaker(match.group("speaker"))
-    return ""
+        return _speaker(match.group("speaker"), direct=True), ""
+    return "", ""
+
+
+def _attributed_speaker(prefix, suffix, known=()):
+    return _attribution(prefix, suffix, known)[0]
 
 
 def _has_speech_attribution(prefix, suffix):
     return bool(
-        _PREFIX_SPEAKER_RE.search(prefix)
-        or _PREFIX_COLON_RE.search(prefix)
-        or _SUFFIX_SPEAKER_RE.match(suffix))
+        _PREFIX_COLON_RE.search(prefix)
+        or _attribution_part(prefix, prefix=True)[1]
+        or _attribution_part(suffix, prefix=False)[1])
 
 
 def _unwrap_dialogue(value):
@@ -135,7 +213,7 @@ def _known_speakers(text):
     names = []
 
     def add(name):
-        name = _speaker(name)
+        name = _speaker(name, direct=True)
         if name and name not in names:
             names.append(name)
 
@@ -210,7 +288,7 @@ def parse_text_script(text, project_title, episode_number):
         # 错当成人名；无引号的标准「角色:台词」仍走直接解析。
         line_match = None if quoted else _LINE_RE.match(line)
         if line_match:
-            speaker = _speaker(line_match.group(1))
+            speaker = _speaker(line_match.group(1), direct=True)
             if not speaker:
                 _append_action(current, line)
                 continue
@@ -225,7 +303,7 @@ def parse_text_script(text, project_title, episode_number):
         for segment in quoted:
             prefix = line[:segment["start"]]
             suffix = line[segment["end"]:]
-            speaker = _attributed_speaker(prefix, suffix)
+            speaker, performance = _attribution(prefix, suffix, known)
             is_standalone = not prefix.strip()
             # 没有说话归属、又嵌在叙述中的引号通常是书名/术语,不误判成台词。
             if (not speaker and not is_standalone
@@ -239,11 +317,14 @@ def parse_text_script(text, project_title, episode_number):
                 inferred_dialogue_count += 1
                 if speaker == _PLACEHOLDER_SPEAKER:
                     unresolved_dialogue_count += 1
-            current["lines"].append({
+            dialogue_line = {
                 "character": speaker,
                 # 台词必须逐字保留,不做标点/空白重写。
                 "dialogue": segment["dialogue"],
-            })
+            }
+            if performance:
+                dialogue_line["performance"] = performance
+            current["lines"].append(dialogue_line)
             quote_dialogue_count += 1
             accepted.append((segment["start"], segment["end"]))
 
@@ -274,9 +355,17 @@ def parse_text_script(text, project_title, episode_number):
             speakers.append(line["character"])
         scene["characters"] = sorted(set(speakers))
     ordered = sorted(counts, key=lambda n: -counts[n])
-    characters = [{"name": name,
-                   "role": "主角" if i == 0 else "配角"}
-                  for i, name in enumerate(ordered)]
+    characters = [{
+        "name": name,
+        "role": (
+            "待确认说话人" if name == _PLACEHOLDER_SPEAKER
+            else "主角" if i == 0 else "配角"),
+        **({"asset_policy": "unresolved_no_generation"}
+           if name == _PLACEHOLDER_SPEAKER else {}),
+    } for i, name in enumerate(ordered)]
+    performance_count = sum(
+        1 for scene in scenes for line in scene["lines"]
+        if line.get("performance"))
 
     first_action = next((s["action"] for s in scenes if s["action"]), "")
     script = {
@@ -294,6 +383,7 @@ def parse_text_script(text, project_title, episode_number):
             "explicit_dialogue_count": explicit_dialogue_count,
             "inferred_dialogue_count": inferred_dialogue_count,
             "unresolved_dialogue_count": unresolved_dialogue_count,
+            "performance_cue_count": performance_count,
             "character_count": len(characters),
             "scene_count": len(scenes),
             "dialogue_preserved_verbatim": True,

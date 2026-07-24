@@ -44,6 +44,8 @@ from .spatial_blocking import (
 from .story_analysis import (
     apply_story_analysis,
     build_story_analysis,
+    reconcile_character_entities,
+    unresolved_character_labels,
     validate_story_analysis,
 )
 from .workflow import (
@@ -196,10 +198,19 @@ def is_background_character(character):
     return is_background_role(character)
 
 
+def is_unresolved_character(character):
+    name = str((character or {}).get("name") or "").strip()
+    role = str((character or {}).get("role") or "").strip()
+    if name == "待确认说话人" or "待确认" in role:
+        return True
+    from .script_import import is_likely_performance_label
+    return is_likely_performance_label(name)
+
+
 def character_candidate_target(character):
     """按人物重要度返回候选张数，防止非主要角色消耗五张额度。"""
     role = str((character or {}).get("role") or "").strip().lower()
-    if is_background_character(character):
+    if is_background_character(character) or is_unresolved_character(character):
         return 0
     if any(token in role for token in ("主角", "主人公", "女主", "男主")):
         return CHARACTER_CANDIDATES
@@ -215,6 +226,33 @@ def character_candidate_target(character):
 def character_candidate_policy_text():
     return ("主角5张；重要配角3张；非重要角色固定1张；"
             "跑龙套/背景路人不做独立设定、不生成候选图或立绘")
+
+
+def character_production_readiness_error(script, analysis=None):
+    labels = unresolved_character_labels(script)
+    if labels:
+        return (
+            "人物实体尚未确认：" + "、".join(labels)
+            + "。这些更像语气、动作或状态，不会生成图片；"
+            "请先点「AI 重新分析」把它们归并到真实人物，再锁定生产。")
+    analysis_map = {
+        item.get("name"): item
+        for item in (analysis or {}).get("characters", [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    for character in (script or {}).get("characters", []):
+        if (not isinstance(character, dict)
+                or is_background_character(character)
+                or is_unresolved_character(character)):
+            continue
+        item = analysis_map.get(character.get("name")) or {}
+        if not str(
+                item.get("image_prompt")
+                or character.get("image_prompt") or "").strip():
+            return (
+                f"人物「{character.get('name')}」还没有无矛盾的最终出图提示词，"
+                "请先重新运行 AI 人物分析。")
+    return None
 
 # 人物定版不是“同一套造型换几个动作”。候选分别承担不同的选角方向，
 # 但都受角色年龄、职业、物种、时代和项目画风约束。候选被人工锁定后，
@@ -865,6 +903,8 @@ class Director:
         ("costume_detail", "服装细节"), ("accessories", "配饰"),
         ("palette", "配色"), ("signature", "标志特征"),
         ("background_prompt", "人物背景提示词"),
+        ("image_prompt", "最终人物出图卡"),
+        ("negative_prompt", "人物负面提示词"),
         ("era_setting", "时代/世界观"), ("occupation", "职业身份"),
         ("motivation", "核心动机"), ("backstory", "人物经历"),
         ("relationships", "人物关系"),
@@ -1115,6 +1155,7 @@ class Director:
             "species", "gender", "sex", "age_range", "identity",
             "personality", "temperament", "costume",
             "costume_detail", "palette", "background_prompt",
+            "image_prompt", "negative_prompt",
             "era_setting",
             "occupation", "motivation", "backstory", "relationships",
             "costume_direction", "signature_props",
@@ -1123,8 +1164,15 @@ class Director:
         return {key: design.get(key) for key in keys if design.get(key)}
 
     def _portrait_prompt(self, name, role, style, design=None):
-        detail = self._design_line(
-            design, keys=("species", "gender", "age_range", "identity",
+        final_card = self._design_value(
+            (design or {}).get("image_prompt"))
+        if final_card:
+            compact = self._design_line(
+                design, keys=("species", "personality", "temperament"))
+            detail = "；".join(filter(None, (compact, final_card)))
+        else:
+            detail = self._design_line(
+                design, keys=("species", "gender", "age_range", "identity",
                           "appearance", "hair", "eyes",
                           "makeup", "accessories", "signature",
                           "temperament", "personality", "costume",
@@ -1207,16 +1255,34 @@ class Director:
 
     def _candidate_portrait_prompt(self, name, role, style, design, variant,
                                    has_reference=False):
-        """定角候选只锁角色边界，显式放开尚未定版的造型变量。"""
-        identity = self._design_line(
-            design, keys=("species", "gender", "age_range", "identity",
-                          "appearance", "eyes", "personality",
-                          "background_prompt", "era_setting", "occupation",
-                          "motivation", "costume_direction",
-                          "signature_props", "visual_direction",
-                          "prompt_prefix", "continuity_anchors",
-                          "character_analysis", "visual_dna",
-                          "cast_dedup"))
+        """把内部人物分析编译成单张图可执行的简洁提示词。"""
+        final_card = self._design_value(
+            (design or {}).get("image_prompt"))
+        if final_card:
+            identity = final_card
+        else:
+            identity = self._design_line(
+                design, keys=("species", "gender", "age_range", "identity",
+                              "appearance", "eyes", "personality",
+                              "background_prompt", "era_setting", "occupation",
+                              "motivation", "costume_direction",
+                              "signature_props", "visual_direction",
+                              "prompt_prefix", "continuity_anchors"))
+            dna = (design or {}).get("visual_dna")
+            if isinstance(dna, dict):
+                compact_dna = "；".join(
+                    f"{label}:{value}" for key, label in (
+                        ("face_structure", "脸部骨相"),
+                        ("hair_silhouette", "发型轮廓"),
+                        ("body_or_occupation_marks", "体态/职业痕迹"),
+                        ("clothing_structure", "服装结构"),
+                        ("story_visual_symbol", "视觉符号"),
+                        ("signature_accessory", "核心配饰"),
+                        ("temperament_keywords", "气质"),
+                    )
+                    if (value := self._design_value(dna.get(key))))
+                if compact_dna:
+                    identity = f"{identity}；人物视觉DNA:{compact_dna}"
         look = variant["look_variant"]
         if has_reference:
             hair = (
@@ -1236,37 +1302,25 @@ class Director:
                 "无参考图时,可按本套造型方向变化脸部细节、发型和妆容,"
                 "但不得改变年龄、物种和核心人物气质")
         return (
-            f"【任务】角色定角候选:{name}({role})；"
-            f"本套方向:{variant['variant_label']}；"
-            "这是互斥造型候选，不是同一套衣服只换动作。"
-            f"【IDENTITY BOUNDARY】{identity or '年龄、物种、性别表达与核心身份不变'}；"
-            f"{variant_rule}。"
-            f"【HAIR / MAKEUP】发型:{hair}；妆容或面部修饰:{makeup}。"
-            f"【WARDROBE】{look['costume']}。"
-            f"【EXPRESSION】{look['temperament']}。"
+            f"【任务】{name}（{role}）单人定角候选 · {variant['variant_label']}。"
+            "不同候选是互斥造型，不是同一套衣服只换动作。"
+            f"【最终人物出图卡】{identity or '年龄、物种、性别表达与核心身份不变'}。"
+            f"【本张造型覆盖项】仅以下字段覆盖出图卡中的对应字段："
+            f"发型:{hair}；妆容:{makeup}；服装:{look['costume']}；"
+            f"表情气质:{look['temperament']}。{variant_rule}。"
             + (f";剧情场合:{variant.get('story_variant', {}).get('occasion') or variant.get('story_variant', {}).get('scene')}"
                if variant.get("story_variant", {}).get("occasion")
                or variant.get("story_variant", {}).get("scene") else "")
             + (f";配饰/道具:{variant.get('story_variant', {}).get('props') or variant.get('story_variant', {}).get('accessories')}"
                if variant.get("story_variant", {}).get("props")
                or variant.get("story_variant", {}).get("accessories") else "")
-            + "【VARIATION】服装轮廓、发型梳法、妆容强度和外显气质"
-            "必须与其他候选明显不同,"
-            + "但必须适配角色的性别表达、年龄、职业、物种、时代背景、人物背景和项目画风;"
-            + "造型变化优先体现剧情场合与人物性格，不得套用现代都市默认模板"
-            f"。【STYLE】{style}；{WORKWEAR_RULE}{CHARACTER_BACKGROUND_RULE}"
-            "【NARRATIVE DNA】按“剧情证据→经历与处境→性格与行为→"
-            "可见外貌→视觉DNA”推导；所有可见特征必须能追溯到人物经历、当前处境、"
-            "性格或行为；禁止AI网红脸、模板帅哥美女、韩式偶像脸，以及"
-            "只靠帅、美、冷峻、高级等空洞词塑造角色。"
-            "【CAST DEDUP】与全剧其他角色比较发型轮廓、服装结构、身体/职业"
-            "痕迹、故事视觉符号、核心配饰和气质关键词；两个及以上主要维度"
-            "重叠时，本角色必须先更换结构方案再出图。"
-            "【COMPOSITION】全身正面自然站姿，动作只服务造型展示。"
-            "【SKIN / STRUCTURE】肤色干净均匀、仅保留极轻微真实微纹理，"
+            + f"【画风】{style}。"
+            "职业人物必须穿真实可辨认的工作服/制服并保留必要装备。"
+            "人物立绘必须是纯净、无文字的单人物资产背景。"
+            "【构图】单人、全身正面自然站姿、从头到脚完整、纯净中性棚拍背景；"
             "五官、手指、关节与身体比例自然。"
-            "【NEGATIVE】单人；禁止新增人物、塑料脸、脏污毛孔、文字、"
-            "Logo、水印或背景场景")
+            "【禁止】其他人物、身份/性别/年龄漂移、时代错置、模板网红脸、"
+            "塑料皮肤、文字、字幕、Logo、水印、可辨认背景场景。")
 
     @staticmethod
     def _scene_style_line(style):
@@ -2550,6 +2604,15 @@ class Director:
                 "analysis_rules": analysis_rules,
                 "production_profile": ctx.get("production_profile") or {},
             }, "story_analysis")
+        script_changed = reconcile_character_entities(script, result.data)
+        if script_changed:
+            # AI 已确认“温声/试探着”等只是表演提示：把它们合并回真实人物，
+            # 再补齐真实人物的基础档案。台词原文不做任何改写。
+            normalize_script_bible(script, {
+                "project_title": ctx["project"]["title"],
+                "episode_number": ctx["episode"]["number"],
+                "style": style,
+            })
         analysis = build_story_analysis(
             script, style, raw=result.data, source=result.provider)
         persist_auto_style(analysis)
@@ -2559,7 +2622,7 @@ class Director:
         apply_story_analysis(script, analysis)
         # 新写/上传/重写的剧本要等 AI 分析完成后一次性落成同一个版本，
         # 避免“原始剧本 v1 + 自动增强 v2”造成无意义的版本膨胀。
-        if ctx.pop("script_pending_save", False):
+        if ctx.pop("script_pending_save", False) or script_changed:
             stored_script = copy.deepcopy(script)
             stored_script.pop("production_analysis", None)
             script_version = self.projects.save_document(
@@ -3017,6 +3080,27 @@ class Director:
             if design:
                 upgraded = self._upgrade_character_visual_dna(
                     design, character)
+                for key in (
+                        "gender", "age_range", "identity", "image_prompt",
+                        "negative_prompt", "visual_direction",
+                        "character_analysis", "visual_dna",
+                        "continuity_anchors"):
+                    if character.get(key):
+                        upgraded[key] = copy.deepcopy(character[key])
+                dna = character.get("visual_dna")
+                if character.get("image_prompt") and isinstance(dna, dict):
+                    upgraded["appearance"] = (
+                        dna.get("face_structure")
+                        or upgraded.get("appearance"))
+                    upgraded["hair"] = (
+                        dna.get("hair_silhouette")
+                        or upgraded.get("hair"))
+                    upgraded["costume"] = (
+                        dna.get("clothing_structure")
+                        or upgraded.get("costume"))
+                    upgraded["accessories"] = (
+                        dna.get("signature_accessory")
+                        or upgraded.get("accessories"))
                 designs[name] = upgraded
                 if upgraded != design:
                     dirty.add(name)
@@ -3075,6 +3159,38 @@ class Director:
             design = by_name.get(name)
             if not design:
                 continue
+            has_reference = bool(
+                self._character_reference_uris(project_id, name))
+            # 制作圣经先于人物设定，最终人物出图卡是身份事实源。Provider
+            # 不得用另一套随机模板覆盖它；尤其 mock 仅用于跑通流程，绝不能
+            # 把仙侠发色/道袍混进历史或现代人物。
+            for key in (
+                    "gender", "age_range", "identity", "image_prompt",
+                    "negative_prompt", "visual_direction",
+                    "character_analysis", "visual_dna",
+                    "continuity_anchors"):
+                if (character.get(key)
+                        and not (has_reference
+                                 and key in ("image_prompt", "visual_dna"))):
+                    design[key] = copy.deepcopy(character[key])
+            if (result.provider == "mock" and not has_reference
+                    and isinstance(
+                        character.get("visual_dna"), dict)):
+                dna = character["visual_dna"]
+                design["appearance"] = (
+                    dna.get("face_structure") or design.get("appearance"))
+                design["hair"] = (
+                    dna.get("hair_silhouette") or design.get("hair"))
+                design["costume"] = (
+                    dna.get("clothing_structure") or design.get("costume"))
+                design["accessories"] = (
+                    dna.get("signature_accessory")
+                    or design.get("accessories"))
+                design["visual_variants"] = copy.deepcopy(
+                    character.get("visual_variants") or [])
+                keywords = dna.get("temperament_keywords")
+                if isinstance(keywords, list) and keywords:
+                    design["temperament"] = "、".join(map(str, keywords))
             # 即使编剧模型只回传了基础视觉字段,也不允许丢掉剧本中的
             # 时代/职业/动机/服装逻辑;这些字段会继续进入所有出图提示词。
             for key in (
@@ -3085,9 +3201,29 @@ class Director:
                     "costume_direction", "signature_props",
                     "visual_variants", "visual_direction",
                     "prompt_prefix", "continuity_anchors",
+                    "image_prompt", "negative_prompt",
                     "character_analysis", "visual_dna", "cast_dedup"):
-                if not design.get(key) and character.get(key):
+                if (not design.get(key) and character.get(key)
+                        and not (has_reference and key == "image_prompt")):
                     design[key] = character[key]
+            if has_reference:
+                design["image_prompt"] = "；".join(filter(None, (
+                    f"单人角色定妆母图：{name}",
+                    f"形态：{design.get('species') or '人类'}",
+                    f"性别年龄：{design.get('gender') or character.get('gender') or '以参考图与剧本为准'}；"
+                    f"{design.get('age_range') or character.get('age_range') or '以参考图与剧本为准'}",
+                    f"身份：{design.get('identity') or character.get('identity') or character.get('role')}",
+                    f"参考图身份锁：{design.get('appearance')}；{design.get('hair')}；"
+                    f"{design.get('eyes')}；{design.get('makeup')}；{design.get('signature')}",
+                    f"服装：{design.get('costume')}；{design.get('costume_detail')}",
+                    f"配饰：{design.get('accessories')}",
+                    "参考图中的脸部骨相、五官比例、年龄感、发际线和发型为最高标准，"
+                    "全身正面自然站姿，纯净无文字背景",
+                )))
+                dna = design.get("visual_dna")
+                if isinstance(dna, dict):
+                    dna["face_structure"] = design.get("appearance")
+                    dna["hair_silhouette"] = design.get("hair")
             designs[name] = design
             dirty.add(name)
         audit = self._cast_visual_dna_audit(designs)
@@ -3497,11 +3633,15 @@ class Director:
 
     def _stage_cast(self, ctx):
         """人物立绘与场景概念图:项目级资产,跨集复用保证形象一致。"""
+        readiness_error = character_production_readiness_error(
+            ctx["script"], ctx.get("story_analysis"))
+        if readiness_error:
+            raise AifosError(readiness_error)
         project_id = ctx["project"]["id"]
         style = ctx["project"]["style"] or DEFAULT_VISUAL_STYLE
         all_characters = ctx["script"].get("characters", [])
-        characters = [c for c in all_characters
-                      if not is_background_character(c)]
+        characters = [
+            c for c in all_characters if character_candidate_target(c) > 0]
         locations = []
         scene_context_by_location = {}
         for scene in ctx["script"]["scenes"]:
@@ -5936,6 +6076,10 @@ class Director:
         error = validate_story_analysis(normalized)
         if error:
             raise AifosError(f"制作圣经保存失败: {error}")
+        if locked:
+            error = character_production_readiness_error(script, normalized)
+            if error:
+                raise AifosError(error)
         version = self.projects.save_document(
             episode["id"], "story_analysis", normalized)
         self.projects.set_episode_status(episode["id"], "awaiting_script")
@@ -5949,6 +6093,10 @@ class Director:
             int(episode_id), "story_analysis")
         if analysis is None:
             raise AifosError("AI 制作圣经尚未生成，请先完成剧本分析")
+        script, _ = self.projects.latest_document(int(episode_id), "script")
+        error = character_production_readiness_error(script or {}, analysis)
+        if error:
+            raise AifosError(error)
         if analysis.get("locked"):
             return {"analysis": analysis, "version": version}
         analysis = copy.deepcopy(analysis)

@@ -208,6 +208,8 @@ def _specific_era(value):
 
 def _importance(role):
     role = _text(role)
+    if "待确认" in role:
+        return "待确认"
     if "主角" in role:
         return "主角"
     if "重要" in role:
@@ -219,7 +221,8 @@ def _importance(role):
 
 def _candidate_count(importance):
     return {
-        "主角": 5, "重要配角": 3, "非重要配角": 1, "背景路人": 0,
+        "主角": 5, "重要配角": 3, "非重要配角": 1,
+        "背景路人": 0, "待确认": 0,
     }[importance]
 
 
@@ -331,6 +334,200 @@ def _visual_dna(character, item, visual, analysis):
             "剧情证据 → 经历与处境 → 性格与行为 → 可见外貌 → 视觉 DNA"),
         "analysis_source": analysis,
     }
+
+
+def unresolved_character_labels(script):
+    """返回尚未归一为真实人物实体的标签。"""
+    from .script_import import is_likely_performance_label
+
+    result = []
+    for character in _dict(script).get("characters", []):
+        if not isinstance(character, dict):
+            continue
+        name = _text(character.get("name"))
+        role = _text(character.get("role"))
+        if (name == "待确认说话人" or "待确认" in role
+                or is_likely_performance_label(name)):
+            if name and name not in result:
+                result.append(name)
+    return result
+
+
+def _role_rank(role):
+    role = _text(role)
+    if "主角" in role:
+        return 3
+    if "重要" in role:
+        return 2
+    if any(token in role for token in ("背景", "路人", "群演")):
+        return 0
+    return 1
+
+
+def reconcile_character_entities(script, raw):
+    """按 AI 的全剧语境判断，把误识别的状态词合并回真实人物。
+
+    这里只接受结构化映射，不猜测映射目标；原始台词保持不变，语气/动作
+    另存为 ``performance``，方便分镜和配音使用。
+    """
+    if not isinstance(script, dict) or not isinstance(raw, dict):
+        return False
+    cast = [
+        item for item in script.get("characters", [])
+        if isinstance(item, dict) and item.get("name")
+    ]
+    existing = {str(item["name"]).strip(): item for item in cast}
+    raw_characters = {
+        _text(item.get("name")): item
+        for item in raw.get("characters", []) if isinstance(item, dict)
+    }
+    mapping = {}
+    resolution_meta = {}
+    resolutions = raw.get("speaker_resolution")
+    if not isinstance(resolutions, list):
+        resolutions = []
+    for item in resolutions:
+        if not isinstance(item, dict):
+            continue
+        source = _text(item.get("raw_label"))
+        target = _text(item.get("canonical_name"))
+        classification = _text(item.get("classification")).lower()
+        confidence = item.get("confidence", 1)
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError):
+            confidence = 1 if str(confidence).lower() == "high" else 0
+        if (source not in existing or not target or source == target
+                or target == "待确认说话人" or confidence < 0.75
+                or classification not in {
+                    "performance_cue", "action_cue", "alias",
+                    "misparsed_label", "performance", "action", "state",
+                    "状态词", "动作词", "别名",
+                }):
+            continue
+        mapping[source] = target
+        resolution_meta[source] = item
+    if not mapping:
+        return False
+
+    canonical = {}
+    source_order = []
+    for character in cast:
+        source = _text(character.get("name"))
+        target = mapping.get(source, source)
+        if target not in canonical:
+            canonical[target] = copy.deepcopy(
+                existing.get(target) or {"name": target, "role": "配角"})
+            canonical[target]["name"] = target
+            source_order.append(target)
+        merged = canonical[target]
+        if _role_rank(character.get("role")) > _role_rank(merged.get("role")):
+            merged["role"] = character.get("role")
+        if source != target:
+            aliases = merged.setdefault("source_aliases", [])
+            if source not in aliases:
+                aliases.append(source)
+            performance = _text(
+                resolution_meta[source].get("performance") or source)
+            cues = merged.setdefault("performance_cues", [])
+            if performance and performance not in cues:
+                cues.append(performance)
+
+    for target, character in canonical.items():
+        item = _dict(raw_characters.get(target))
+        analysis = _dict(item.get("character_analysis"))
+        for key, value in (
+            ("introduction", item.get("identity_facts")),
+            ("gender", item.get("gender")),
+            ("age_range", item.get("age_range")
+             or analysis.get("age_and_presentation")),
+            ("identity", item.get("identity")
+             or analysis.get("identity_and_class")),
+            ("visual_direction", item.get("visual_direction")),
+            ("costume_direction", item.get("visual_direction")),
+            ("prompt_prefix", item.get("prompt_prefix")),
+            ("image_prompt", item.get("image_prompt")),
+            ("negative_prompt", item.get("negative_prompt")),
+            ("continuity_anchors", item.get("continuity_anchors")),
+            ("character_analysis", item.get("character_analysis")),
+            ("visual_dna", item.get("visual_dna")),
+            ("cast_dedup", item.get("cast_dedup")),
+        ):
+            if value not in (None, "", [], {}):
+                character[key] = copy.deepcopy(value)
+
+    for scene in script.get("scenes", []):
+        if not isinstance(scene, dict):
+            continue
+        for line in scene.get("lines", []):
+            if not isinstance(line, dict):
+                continue
+            source = _text(line.get("character"))
+            if source not in mapping:
+                continue
+            line["character"] = mapping[source]
+            performance = _text(
+                resolution_meta[source].get("performance") or source)
+            if performance and not line.get("performance"):
+                line["performance"] = performance
+        scene["characters"] = list(dict.fromkeys(
+            mapping.get(_text(name), _text(name))
+            for name in scene.get("characters", [])
+            if _text(name)
+        ))
+    script["characters"] = [canonical[name] for name in source_order]
+    script["declared_character_names"] = source_order
+    imported = script.setdefault("import_analysis", {})
+    imported["character_count"] = len(canonical)
+    imported["entity_corrections"] = [
+        {
+            "raw_label": source,
+            "canonical_name": target,
+            "performance": _text(
+                resolution_meta[source].get("performance") or source),
+        }
+        for source, target in mapping.items()
+    ]
+    imported["misclassified_labels_removed"] = len(mapping)
+    unresolved = set(unresolved_character_labels(script))
+    imported["unresolved_dialogue_count"] = sum(
+        1 for scene in script.get("scenes", [])
+        for line in scene.get("lines", [])
+        if isinstance(line, dict) and line.get("character") in unresolved)
+    imported["performance_cue_count"] = sum(
+        1 for scene in script.get("scenes", [])
+        for line in scene.get("lines", [])
+        if isinstance(line, dict) and line.get("performance"))
+    return True
+
+
+def _character_image_prompt(name, entry, visual, era):
+    analysis = _dict(entry.get("character_analysis"))
+    dna = _dict(entry.get("visual_dna"))
+    raw = _text(entry.get("image_prompt"))
+    parts = [
+        f"单人角色定妆母图：{name}",
+        f"身份：{entry.get('identity_facts')}",
+        f"性别与年龄呈现：{entry.get('gender')}；{entry.get('age_range')}",
+        f"人物处境与性格：{analysis.get('current_situation')}；"
+        f"{'、'.join(_list(analysis.get('strengths')) + _list(analysis.get('flaws')))}",
+        f"脸部骨相：{dna.get('face_structure')}",
+        f"发型轮廓：{dna.get('hair_silhouette')}",
+        f"体态与职业痕迹：{dna.get('body_or_occupation_marks')}",
+        f"服装结构与状态：{dna.get('clothing_structure')}；"
+        f"{dna.get('clothing_wear_state')}",
+        f"核心配饰与视觉符号：{dna.get('signature_accessory')}；"
+        f"{dna.get('story_visual_symbol')}（来源："
+        f"{dna.get('story_visual_symbol_origin')}）",
+        f"气质关键词：{'、'.join(_list(dna.get('temperament_keywords')))}",
+        f"时代世界：{era}",
+        f"画面媒介：{visual.get('medium')}；{visual.get('realism')}；"
+        f"{visual.get('texture_and_render')}",
+        "全身正面自然站姿，人物从头到脚完整可见，纯净中性棚拍背景，"
+        "自然人体比例与手部结构，无字幕、无文字、无Logo、无水印",
+    ]
+    generated = "；".join(_text(part) for part in parts if _text(part))
+    return f"{raw}；{generated}" if raw else generated
 
 
 def _default_negative(style):
@@ -511,7 +708,7 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
         for character in script.get("characters", [])
         if isinstance(character, dict)
         and character.get("name")
-        and _importance(character.get("role")) != "背景路人"
+        and _importance(character.get("role")) not in ("背景路人", "待确认")
     ]
     characters = []
     for character in script.get("characters", []):
@@ -524,6 +721,12 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
             "name": name,
             "importance": importance,
             "candidate_count": _candidate_count(importance),
+            "gender": _text(
+                item.get("gender") or character.get("gender"),
+                "剧本未明示，AI 必须结合全文人物称谓、关系与行动保守判断"),
+            "age_range": _text(
+                item.get("age_range") or character.get("age_range"),
+                "剧本未明示，AI 必须结合全文身份、称谓与经历保守判断"),
             "identity_facts": _text(
                 item.get("identity_facts")
                 or character.get("introduction")
@@ -540,11 +743,20 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
                 item.get("prompt_prefix"),
                 f"{name}，同一人物身份；{visual['wardrobe_and_styling']}"),
         }
-        if importance != "背景路人":
+        if importance not in ("背景路人", "待确认"):
             analysis = _character_analysis(character, item, narrative)
             entry["character_analysis"] = analysis
             entry["visual_dna"] = _visual_dna(
                 character, item, visual, analysis)
+            entry["image_prompt"] = _character_image_prompt(
+                name, {**entry,
+                       "image_prompt": item.get("image_prompt")},
+                visual, era)
+            entry["negative_prompt"] = _text(
+                item.get("negative_prompt"),
+                "多人、身份错误、性别漂移、年龄漂移、换脸、发型漂移、"
+                "服装跨时代、模板网红脸、塑料皮肤、畸形手指、背景场景、"
+                "文字、字幕、Logo、水印")
             raw_dedup = _dict(item.get("cast_dedup"))
             entry["cast_dedup"] = {
                 "compared_with": [
@@ -670,11 +882,17 @@ def validate_story_analysis(analysis):
     for character in analysis["characters"]:
         if not isinstance(character, dict):
             return "制作圣经角色分析必须是对象"
-        if character.get("importance") == "背景路人":
+        if character.get("importance") in ("背景路人", "待确认"):
             continue
         for field in ("character_analysis", "visual_dna", "cast_dedup"):
             if not isinstance(character.get(field), dict):
                 return f"角色 {character.get('name')} 缺少 {field}"
+        if not _text(character.get("image_prompt")):
+            return f"角色 {character.get('name')} 缺少可直接出图的人物提示词"
+        if not _text(character.get("gender")):
+            return f"角色 {character.get('name')} 缺少性别呈现"
+        if not _text(character.get("age_range")):
+            return f"角色 {character.get('name')} 缺少年龄段"
         keywords = character["visual_dna"].get("temperament_keywords")
         if not isinstance(keywords, list) or not 3 <= len(keywords) <= 8:
             return (
@@ -745,7 +963,12 @@ def apply_story_analysis(script, analysis):
             f"{prompt_bible['character_prefix']}；{item['prompt_prefix']}")
         character["continuity_anchors"] = item["continuity_anchors"]
         character["candidate_count"] = item["candidate_count"]
-        if item.get("importance") != "背景路人":
+        if item.get("importance") not in ("背景路人", "待确认"):
+            character["gender"] = item.get("gender") or character.get("gender")
+            character["age_range"] = (
+                item.get("age_range") or character.get("age_range"))
+            character["image_prompt"] = item.get("image_prompt", "")
+            character["negative_prompt"] = item.get("negative_prompt", "")
             character["character_analysis"] = copy.deepcopy(
                 item.get("character_analysis") or {})
             character["visual_dna"] = copy.deepcopy(

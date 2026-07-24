@@ -6,7 +6,10 @@ import pytest
 
 from aifos.app import App
 from aifos.adapters.codex_image import _ref_line, _style_line
-from aifos.director import character_candidate_target
+from aifos.director import (
+    character_candidate_target,
+    character_production_readiness_error,
+)
 from aifos.errors import AifosError, ProviderUnavailable
 from aifos.production.base import ProviderResult
 
@@ -68,6 +71,22 @@ def test_candidate_count_is_strictly_role_tiered():
     assert character_candidate_target({"role": "非重要配角"}) == 1
     assert character_candidate_target({"role": "背景路人"}) == 0
     assert character_candidate_target({"role": "跑龙套"}) == 0
+    assert character_candidate_target({
+        "name": "哑着嗓子", "role": "主角"}) == 0
+    assert character_candidate_target({
+        "name": "待确认说话人", "role": "待确认说话人"}) == 0
+
+
+def test_unresolved_action_label_blocks_character_generation():
+    script = {
+        "characters": [{"name": "温声", "role": "配角"}],
+        "scenes": [{"scene_no": 1, "location": "东宫",
+                    "characters": ["温声"],
+                    "lines": [{"character": "温声", "dialogue": "拿来。"}]}],
+    }
+    error = character_production_readiness_error(script, {})
+    assert "人物实体尚未确认" in error
+    assert "AI 重新分析" in error
 
 
 def test_portrait_prompt_prioritizes_identity_over_reference_clothing(app):
@@ -98,7 +117,7 @@ def test_candidate_prompts_create_real_look_variants_without_locking_style(app):
     assert "齐肩内扣短发" in prompts[0]
 
 
-def test_visual_dna_and_cast_dedup_enter_candidate_prompt(app):
+def test_visual_dna_is_compiled_without_dumping_internal_audit_json(app):
     design = {
         "species": "人类", "appearance": "长期熬夜形成的清瘦骨相",
         "personality": "谨慎、目标明确", "costume": "旧工装夹克",
@@ -126,9 +145,10 @@ def test_visual_dna_and_cast_dedup_enter_candidate_prompt(app):
         app.director._candidate_variant(1, design))
     assert "人物视觉DNA" in prompt
     assert "旧怀表" in prompt
-    assert "剧情证据" in prompt
-    assert "两个及以上主要维度" in prompt
-    assert "AI网红脸" in prompt
+    assert "本张造型覆盖项" in prompt
+    assert "全剧角色去重" not in prompt
+    assert '"overlap_threshold"' not in prompt
+    assert "模板网红脸" in prompt
 
 
 def test_legacy_character_design_is_upgraded_without_losing_fields(app):

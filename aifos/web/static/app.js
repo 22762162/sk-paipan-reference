@@ -502,6 +502,10 @@ const STANDARD_SECTIONS = [
       { path: "rules.story_analysis.user_style_is_hard_constraint", label: "用户画风为最高硬约束", type: "boolean" },
       { path: "rules.story_analysis.distinguish_world_from_render_medium", label: "区分故事时代与渲染媒介", type: "boolean" },
       { path: "rules.story_analysis.editable_before_lock", label: "开画前允许编辑和重分析", type: "boolean" },
+      { path: "rules.story_analysis.resolve_character_entities_before_images", label: "出图前归一真实人物实体", type: "boolean" },
+      { path: "rules.story_analysis.performance_cues_are_not_characters", label: "语气与动作不得当作人物", type: "boolean" },
+      { path: "rules.story_analysis.final_character_image_prompt_required", label: "人物最终出图卡必填", type: "boolean" },
+      { path: "rules.story_analysis.compact_prompt_compilation", label: "出图提示词编译为简洁终稿", type: "boolean" },
       { path: "rules.story_analysis.required_sections", label: "制作圣经必备模块", type: "list",
         help: "故事、世界、视觉、场景、人物和提示词母版，缺一项不进入出图。" },
       { path: "rules.story_analysis.downstream_consumers", label: "必须继承制作圣经的环节", type: "list" },
@@ -2148,7 +2152,9 @@ function showScriptOverlay(data, episodeId) {
           ${(s.lines || []).map((l) => `
             <div class="line-block">
               <div class="speaker">${esc(l.character)}</div>
-              <div class="speech">${esc(l.dialogue)}</div>
+              <div class="speech">${esc(l.dialogue)}
+                ${l.performance ? `<small class="performance-cue">表演：${esc(l.performance)}</small>` : ""}
+              </div>
             </div>`).join("")}
         </section>`).join("")}
     </div>`;
@@ -4150,6 +4156,8 @@ const DESIGN_LABELS_JS = [
   ["costume", "服装"], ["costume_detail", "服装细节"],
   ["accessories", "配饰"], ["palette", "配色"], ["signature", "标志特征"],
   ["background_prompt", "人物背景提示词"], ["era_setting", "时代/世界观"],
+  ["image_prompt", "最终人物出图提示词"],
+  ["negative_prompt", "人物负面提示词"],
   ["occupation", "职业身份"], ["motivation", "核心动机"],
   ["backstory", "人物经历"], ["relationships", "人物关系"],
   ["costume_direction", "服装设计逻辑"], ["signature_props", "标志道具"],
@@ -4182,6 +4190,15 @@ function designHtml(design) {
 function characterProfileHtml(character) {
   if (!character) return "";
   const role = String(character.role || "");
+  const cueLikeName = /(地|着|嗓子|回话|垂手|好奇|冷声|温声|沉声|低声)$/
+    .test(String(character.name || ""));
+  if (role.includes("待确认") || character.name === "待确认说话人"
+      || character.asset_policy === "unresolved_no_generation"
+      || cueLikeName) {
+    return `<div class="background-cast-note unresolved-cast-note">
+      ⚠️ ${esc(character.name)} · 尚未确认真实人物。
+      系统不会为它生成图片；请先用「AI 重新分析」或直接编辑剧本确认说话人。</div>`;
+  }
   if (["背景路人", "背景人物", "背景群众", "群众演员", "群演",
        "跑龙套", "龙套", "临时路人", "路人角色", "路人"]
       .some((token) => role.includes(token))) {
@@ -4194,6 +4211,8 @@ function characterProfileHtml(character) {
     ["age_range", "年龄段"], ["identity", "身份/阵营"],
     ["personality", "性格"],
     ["background_prompt", "人物背景提示词"], ["era_setting", "时代/世界观"],
+    ["image_prompt", "最终人物出图提示词"],
+    ["negative_prompt", "人物负面提示词"],
     ["occupation", "职业身份"], ["motivation", "核心动机"],
     ["backstory", "人物经历"], ["relationships", "人物关系"],
     ["costume_direction", "服装设计逻辑"], ["signature_props", "标志道具"],
@@ -5612,6 +5631,7 @@ async function renderCanvasView(episodeId) {
 /* ---- 剧本正文(审阅页与生产直播页共用) ---- */
 function scriptBodyHtml(script) {
   const imported = script.import_analysis || {};
+  const corrections = imported.entity_corrections || [];
   const importSummary = imported.dialogue_count ? `
       <div class="resume-banner">
         <b>✓ 小说 / 剧本智能解析完成</b>：
@@ -5621,6 +5641,13 @@ function scriptBodyHtml(script) {
         ${imported.unresolved_dialogue_count
           ? `<span class="warn">${Number(imported.unresolved_dialogue_count)} 句说话人待人工核对（已标为“待确认说话人”）。</span>`
           : "说话人均已识别。"}
+        ${corrections.length
+          ? `<span class="ok">已纠正 ${corrections.length} 个误识别标签：
+            ${corrections.map((item) => `${esc(item.raw_label)} → ${esc(item.canonical_name)}`).join("、")}。</span>`
+          : ""}
+        ${imported.performance_cue_count
+          ? `<span class="dim">另保留 ${Number(imported.performance_cue_count)} 条语气/动作供配音与表演使用。</span>`
+          : ""}
         <span class="dim">对白原文未改写。</span>
       </div>` : "";
   return `
@@ -5640,7 +5667,9 @@ function scriptBodyHtml(script) {
           ${(s.lines || []).map((l) => `
             <div class="line-block">
               <div class="speaker">${esc(l.character)}</div>
-              <div class="speech">${esc(l.dialogue)}</div>
+              <div class="speech">${esc(l.dialogue)}
+                ${l.performance ? `<small class="performance-cue">表演：${esc(l.performance)}</small>` : ""}
+              </div>
             </div>`).join("")}
         </section>`).join("")}`;
 }
@@ -5902,6 +5931,19 @@ function storyAnalysisEditorHtml(analysis, version) {
       <div><b>时段/天气：</b>${esc(scene.time_weather || "")}</div>
       <div><b>光线：</b>${esc(scene.lighting || "")}</div>
     </details>`).join("");
+  const characterCards = (analysis.characters || []).map((character) => `
+    <details class="analysis-scene">
+      <summary>${character.importance === "待确认" ? "⚠️" : "🧬"}
+        ${esc(character.name || "未命名")} · ${esc(character.importance || "角色")}</summary>
+      <div><b>性别 / 年龄：</b>${esc(character.gender || "待确认")} ·
+        ${esc(character.age_range || "待确认")}</div>
+      <div><b>身份：</b>${esc(character.identity_facts || "")}</div>
+      <div><b>视觉方向：</b>${esc(character.visual_direction || "")}</div>
+      <div><b>最终人物出图提示词：</b>${esc(character.image_prompt
+        || "尚未形成；不会进入人物出图")}</div>
+      ${character.negative_prompt
+        ? `<div><b>负面提示词：</b>${esc(character.negative_prompt)}</div>` : ""}
+    </details>`).join("");
   return `<section class="analysis-studio" data-version="${Number(version || 0)}">
     <div class="analysis-head"><div><span class="eyebrow">STEP 02 · AI PRODUCTION BIBLE</span>
       <h2>世界观、环境与视觉制作圣经</h2>
@@ -5941,6 +5983,9 @@ function storyAnalysisEditorHtml(analysis, version) {
       </div></details>
     <details class="analysis-scenes"><summary>逐场环境分析 · ${(analysis.scenes || []).length} 场</summary>
       <div class="analysis-scene-grid">${sceneCards || "暂无场景分析"}</div></details>
+    <details class="analysis-scenes" open><summary>真实人物与最终出图卡 ·
+      ${(analysis.characters || []).filter((item) => item.importance !== "背景路人").length} 人</summary>
+      <div class="analysis-scene-grid">${characterCards || "暂无人物分析"}</div></details>
     <div class="analysis-actions">
       <input id="analysis-direction" placeholder="可选补充，如：更考据、更克制、雨夜冷调；留空则完全按剧本重建">
       <button id="analysis-rerun">↻ AI 重新分析</button>

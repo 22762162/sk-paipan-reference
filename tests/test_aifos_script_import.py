@@ -51,9 +51,12 @@ def test_parse_chinese_novel_dialogue_and_preserve_original_words():
     script = parse_text_script(source, "大明", 1)
     lines = script["scenes"][0]["lines"]
     assert lines == [
-        {"character": "朱慈烺", "dialogue": "父皇，儿臣请战！"},
-        {"character": "崇祯", "dialogue": "你可知此去凶险？"},
-        {"character": "王承恩", "dialogue": "陛下，城门急报。"},
+        {"character": "朱慈烺", "dialogue": "父皇，儿臣请战！",
+         "performance": "咬牙"},
+        {"character": "崇祯", "dialogue": "你可知此去凶险？",
+         "performance": "沉声"},
+        {"character": "王承恩", "dialogue": "陛下，城门急报。",
+         "performance": "忙"},
     ]
     assert script["import_analysis"] == {
         "source_format": "novel",
@@ -61,6 +64,7 @@ def test_parse_chinese_novel_dialogue_and_preserve_original_words():
         "explicit_dialogue_count": 3,
         "inferred_dialogue_count": 0,
         "unresolved_dialogue_count": 0,
+        "performance_cue_count": 3,
         "character_count": 3,
         "scene_count": 1,
         "dialogue_preserved_verbatim": True,
@@ -78,6 +82,23 @@ def test_parse_standalone_novel_dialogue_uses_context_instead_of_dropping_it():
         "你终于来了。", "路上堵车。", "我等了你三年。"]
     assert lines[2]["character"] in {"苏念", "顾屿"}
     assert script["import_analysis"]["unresolved_dialogue_count"] == 0
+
+
+def test_narration_states_are_performance_not_fake_characters():
+    source = """朱慈烺试探着问道：“锦盒里是什么？”
+“是西洋奇物。”李继周小心翼翼地答道。
+“拿来。”朱慈烺冷声道。
+“奴婢遵命。”李继周连忙躬身回话道。
+"""
+    script = parse_text_script(source, "大明", 1)
+    assert [line["character"] for line in script["scenes"][0]["lines"]] == [
+        "朱慈烺", "李继周", "朱慈烺", "李继周"]
+    assert [line.get("performance") for line
+            in script["scenes"][0]["lines"]] == [
+        "试探着", "小心翼翼地", "冷声", "连忙躬身回话"]
+    assert {item["name"] for item in script["characters"]} == {
+        "朱慈烺", "李继周"}
+    assert script["import_analysis"]["performance_cue_count"] == 4
 
 
 def test_parse_rejects_no_dialogue():

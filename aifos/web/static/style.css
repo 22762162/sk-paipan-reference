@@ -1805,6 +1805,13 @@ textarea:focus-visible, select:focus-visible {
   font-size: 15px; color: var(--ink);
   border-left: 2px solid var(--grid); padding-left: 12px;
 }
+.performance-cue {
+  display: block; width: fit-content; margin-top: 4px;
+  padding: 2px 7px; border-radius: 999px;
+  color: #c7d7ea; background: rgba(57, 135, 229, .12);
+  border: 1px solid rgba(57, 135, 229, .24);
+  font-size: 10.5px; line-height: 1.45;
+}
 .line-block:hover .speech { border-left-color: var(--accent); }
 @media (max-width: 640px) {
   .line-block { grid-template-columns: 1fr; gap: 2px; }
@@ -2778,6 +2785,10 @@ textarea:focus-visible, select:focus-visible {
   margin: 5px 0; padding: 7px 10px; border: 1px dashed var(--hairline);
   border-radius: 8px; color: var(--ink-3); font-size: 12px; line-height: 1.6;
   background: var(--surface-2);
+}
+.unresolved-cast-note {
+  color: #ffd39b; border-color: rgba(226, 154, 61, .5);
+  background: rgba(226, 154, 61, .08);
 }
 .pc-media img.zoomable { cursor: zoom-in; }
 .img-lightbox { z-index: 300; }
