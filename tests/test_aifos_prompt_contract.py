@@ -156,3 +156,35 @@ def test_negative_subtitle_instruction_is_not_a_readable_text_asset():
     )
     assert review["passed"] is True
     assert review["units"][0]["text_accuracy"] is None
+
+
+def test_laptop_page_is_a_hard_readable_asset_not_a_blank_light():
+    shot = _shot()
+    shot.update({
+        "characters": ["林晚"],
+        "readable_text": {
+            "required": True, "carrier": "电脑",
+            "whitelist": ["明季北略", "崇祯"],
+        },
+        "description": "林晚盯着银色笔记本电脑屏幕上的《明季北略》崇祯页面",
+    })
+    _, prompt = compile_shot_prompt(shot, location="现代书房")
+    assert "电脑屏幕必须打开并清晰显示白名单原文:明季北略、崇祯" in prompt
+    assert "屏幕不是冷白光效/空白占位面" in prompt
+
+    instruction, _, _ = build_instruction(
+        "image",
+        {
+            "shot_no": 1,
+            "prompt_compact": prompt,
+            "characters": ["林晚"],
+            "character_count": 1,
+            "readable_text": {
+                "required": True, "carrier": "电脑",
+                "whitelist": ["明季北略", "崇祯"],
+            },
+        },
+        "/tmp",
+    )
+    assert "禁止空白" in instruction
+    assert "明季北略、崇祯" in instruction

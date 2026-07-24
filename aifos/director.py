@@ -1883,7 +1883,7 @@ class Director:
     def _qc_spec(self, project_id, characters, location="", action="",
                  forbid=None, require_identity=True, expected_characters=None,
                  expected_count=None, character_background=None, camera="",
-                 composition_contract=None):
+                 composition_contract=None, readable_text=None):
         """视觉质检规格：按角色在本镜可见角度选择核验依据。"""
         identity_characters = list(characters or [])
         visible_characters = list(
@@ -1936,6 +1936,8 @@ class Director:
             "action": action or "",
             "camera": camera or "",
             "composition_contract": composition_contract,
+            "readable_text": (readable_text if isinstance(readable_text, dict)
+                               else {}),
             "identity_view_policy": "adaptive_visible_angle_v2",
             "forbid": list(forbid or []),
             "identity_references": identity_refs,
@@ -2069,7 +2071,8 @@ class Director:
                 # 人物镜头不能在质检故障时静默放行。保留已生成图片供人工
                 # 查看，但明确标成质检未过，后续不得当作正式参考图。
                 revision = optimize_qc_feedback(
-                    [f"质检产线不可用，图片未放行:{exc}"], mode="image")
+                    [f"质检产线不可用，图片未放行:{exc}"], mode="image",
+                    readable_text=qc_spec.get("readable_text"))
                 result.qc = {
                     "passed": False,
                     "issues": [f"质检产线不可用，图片未放行:{exc}"],
@@ -2089,7 +2092,9 @@ class Director:
             result.cost += qc_result.cost
             report = self._assess_image_qc(
                 qc_spec, qc_result.data or {}, attempts + 1)
-            revision = optimize_qc_feedback(report["issues"], mode="image")
+            revision = optimize_qc_feedback(
+                report["issues"], mode="image",
+                readable_text=qc_spec.get("readable_text"))
             report["revision_feedback"] = revision["text"]
             report["revision_categories"] = revision["categories"]
             result.qc = report
@@ -5084,7 +5089,8 @@ class Director:
                         "character_background", {}),
                     camera=payload.get("camera", ""),
                     composition_contract=payload.get(
-                        "composition_contract"))}})
+                        "composition_contract"),
+                    readable_text=payload.get("readable_text"))}})
         results, qc_failures = self._run_parallel(
             ctx, tasks, line="分镜画面",
             continue_on_qc_failure=True)
@@ -7035,6 +7041,13 @@ class Director:
                  if entry.get("id") == item_id), None)
             auto_revision = ((plan_item or {}).get("qc") or {}).get(
                 "revision_feedback") or ""
+            # 兼容旧版计划:旧版本把“电脑屏幕空白”落成 generic。每次手动
+            # 重画都依据当前质检原因重新编译，不能继续沿用旧的泛化提示。
+            old_qc = (plan_item or {}).get("qc") or {}
+            if old_qc.get("issues"):
+                refreshed_revision = optimize_qc_feedback(
+                    old_qc.get("issues") or [], mode="image")
+                auto_revision = refreshed_revision["text"]
             prompt_is_unchanged = (not prompt_override or prompt_override ==
                                    (plan_item or {}).get("prompt", ""))
             if (auto_revision and prompt_is_unchanged
@@ -7880,7 +7893,8 @@ class Director:
                         "character_background", {}),
                     camera=payload.get("camera", ""),
                     composition_contract=payload.get(
-                        "composition_contract"))
+                        "composition_contract"),
+                    readable_text=payload.get("readable_text"))
             else:
                 spec = self._qc_spec(project_id, [], forbid=self._FORBID)
         # 首尾帧:首帧 + 尾帧两张都要检,任一不符即整组不合格
@@ -7897,12 +7911,14 @@ class Director:
         if previous.get("signature") == signature \
                 and "passed" in previous:
             cached = dict(previous)
-            if not cached.get("revision_feedback"):
-                revision = optimize_qc_feedback(
-                    cached.get("issues") or [], mode="image")
-                cached["revision_feedback"] = revision["text"]
-                cached["revision_categories"] = revision["categories"]
+            revision = optimize_qc_feedback(
+                cached.get("issues") or [], mode="image",
+                readable_text=spec.get("readable_text"))
+            cached["revision_feedback"] = revision["text"]
+            cached["revision_categories"] = revision["categories"]
             cached["cached"] = True
+            self._plan_mark(ctx, item["id"], item.get("status", "done"),
+                            extra={"qc": cached})
             return cached
         passed_all, issues, cost = True, [], 0.0
         identity_checked_all = True
@@ -7951,7 +7967,8 @@ class Director:
                   "identity_references": len(
                       spec.get("identity_references") or []),
                   "signature": signature, "cached": False}
-        revision = optimize_qc_feedback(issues, mode="image")
+        revision = optimize_qc_feedback(
+            issues, mode="image", readable_text=spec.get("readable_text"))
         report["revision_feedback"] = revision["text"]
         report["revision_categories"] = revision["categories"]
         self.projects.add_episode_cost(episode["id"], cost)

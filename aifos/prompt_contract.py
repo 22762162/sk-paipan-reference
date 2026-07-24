@@ -203,11 +203,21 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
     characters = list(shot.get("characters") or [])
     dialogue = shot.get("dialogue") or {}
     readable = shot.get("readable_text") or {}
-    text_rule = (
-        f"首帧文字只保持原样:{'、'.join(readable.get('whitelist') or []) or '白名单'}"
-        if readable_text_required(readable)
-        else "无画面文字、无字幕、无Logo、无水印"
-    )
+    if readable_text_required(readable):
+        whitelist = "、".join(dict.fromkeys(
+            str(item).strip() for item in (readable.get("whitelist") or [])
+            if str(item).strip())) or "白名单"
+        carrier = _text(readable.get("carrier"), "指定载体")
+        if any(token in carrier for token in ("电脑", "笔记本", "屏幕", "显示器")):
+            text_rule = (
+                f"电脑屏幕必须打开并清晰显示白名单原文:{whitelist}；"
+                "屏幕不是冷白光效/空白占位面，禁止随机乱码、模糊色块和黑白占位；"
+                "屏幕外无字幕、Logo、水印和无关文字"
+            )
+        else:
+            text_rule = f"{carrier}内文字只保持原样:{whitelist}；禁止新增文字"
+    else:
+        text_rule = "无画面文字、无字幕、无Logo、无水印"
     refs = []
     for item in references or []:
         if not isinstance(item, dict) or not item.get("index"):

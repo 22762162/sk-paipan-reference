@@ -35,3 +35,16 @@ def test_back_view_identity_feedback_does_not_force_a_front_face():
     assert result["categories"] == ["nonface_visibility"]
     assert "禁止强迫背影人物转成正脸" in result["text"]
     assert "肩背体型" in result["text"]
+
+
+def test_blank_laptop_screen_gets_explicit_readable_page_repair():
+    result = optimize_qc_feedback(
+        ["银色笔记本电脑屏幕呈空白冷白画面，未显示人物设定要求的《明季北略》崇祯页面。"],
+        mode="image",
+        readable_text={"required": True, "whitelist": ["明季北略", "崇祯"]},
+    )
+
+    assert result["categories"] == ["screen_text"]
+    assert "TEXT ASSET HARD GATE" in result["text"]
+    assert "明季北略、崇祯" in result["text"]
+    assert "禁止空白冷白屏" in result["text"]

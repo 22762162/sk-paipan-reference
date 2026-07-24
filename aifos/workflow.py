@@ -320,6 +320,13 @@ def _text_asset(shot, rules=None):
         r"[《「『【]([^》」』】]{1,40})[》」』】]",
         searchable,
     ) if carrier else []
+    # 同一条要求通常同时出现在 description 和 prompt；白名单必须是稳定、
+    # 去重后的原文。电脑页面若明确写到“崇祯页面”，把页面主题一并锁住，
+    # 否则模型只看到书名，容易生成泛化的白色网页占位面。
+    texts = list(dict.fromkeys(texts))
+    if carrier in ("电脑", "手机屏", "平板", "屏幕") \
+            and "崇祯" in searchable and "崇祯" not in texts:
+        texts.append("崇祯")
     required = bool(carrier)
     return {
         "required": required,

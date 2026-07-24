@@ -47,6 +47,51 @@ _RULES = (
      "只恢复项目风格基准的媒介、材质、色彩和光影；不改变人物身份、动作或场景布局。"),
 )
 
+# 屏幕/书页/文件页是“画面内文字载体”，不应落入 generic。尤其是
+# “空白冷白、未显示页面”这类原因，旧版会只附加“保持其余内容不变”，
+# 导致模型继续沿用失败图里的空白屏幕。
+_SCREEN_TEXT_TOKENS = (
+    "电脑", "笔记本", "屏幕", "显示器", "手机屏", "平板", "页面",
+    "书页", "史书", "网页", "文档", "合同", "奏折", "纸张", "崇祯",
+    "明季北略", "冷白", "空白屏", "空白画面",
+)
+_TEXT_MISSING_TOKENS = (
+    "未显示", "未呈现", "未出现", "没有显示", "缺少", "缺失", "未包含",
+    "空白", "冷白", "不见", "未看到", "未出现",
+)
+_TEXT_UNWANTED_TOKENS = (
+    "乱码", "错字", "多余文字", "错误文字", "新增文字", "字幕条", "水印",
+    "logo", "标志", "标签",
+)
+
+
+def _screen_text_instruction(reason, whitelist=None):
+    """把屏幕/书页文字问题变成可执行的局部修订指令。"""
+    reason = str(reason or "")
+    wanted = [str(item).strip() for item in (whitelist or []) if str(item).strip()]
+    # 没有结构化白名单时，从质检证据中保留书名号内容；这是比“请显示页面”
+    # 更明确的补救，且不会凭空编造未被质检指出的文字。
+    if not wanted:
+        wanted = list(dict.fromkeys(re.findall(
+            r"[《「『【]([^》」』】]{1,40})[》」』】]", reason)))
+    wanted_text = "、".join(dict.fromkeys(wanted)) or "质检原因中明确指出的页面原文"
+    missing = any(token in reason.lower() for token in _TEXT_MISSING_TOKENS)
+    unwanted = any(token in reason.lower() for token in _TEXT_UNWANTED_TOKENS)
+    if missing and not unwanted:
+        return (
+            "【TEXT ASSET HARD GATE】只修正屏幕/页面这一块局部；银色笔记本必须"
+            "保持打开并让屏幕正对镜头、占画面中清晰可见区域，屏幕内实际显示"
+            f"{wanted_text}；逐字沿用该原文，不得改写、缩写或用随机乱码替代。"
+            "禁止空白冷白屏、纯白发光占位面、黑屏占位面和模糊不可读页面；"
+            "屏幕外的人物、服装、配饰、场景、构图、光线和金属机身全部保持失败"
+            "图不变；背景仍不得出现额外字幕、Logo、水印或无关文字。"
+        )
+    return (
+        "【TEXT ASSET HARD GATE】只修正质检指出的屏幕/页面文字；删除乱码、"
+        "错字、字幕条、Logo、水印和未授权文字，保留已锁定的合法原文；"
+        "屏幕外人物、服装、场景、构图和光线保持不变。"
+    )
+
 
 def _issue_text(issue):
     if isinstance(issue, dict):
@@ -55,7 +100,7 @@ def _issue_text(issue):
     return str(issue or "").strip()
 
 
-def optimize_qc_feedback(issues, *, mode="image"):
+def optimize_qc_feedback(issues, *, mode="image", readable_text=None):
     """返回原始原因、分类指令及可直接附加到提示词的修订文本。"""
     reasons = []
     instructions = []
@@ -70,6 +115,17 @@ def optimize_qc_feedback(issues, *, mode="image"):
         reasons.append(reason)
         lowered = reason.lower()
         matched = False
+        # 屏幕/页面问题必须先于 generic 和普通 text 规则处理；“电脑屏幕
+        # 空白”本质是缺失文字资产，不能套用“删除字幕/乱码”。
+        if any(token.lower() in lowered for token in _SCREEN_TEXT_TOKENS):
+            category = "screen_text"
+            if category not in seen_categories:
+                seen_categories.add(category)
+                categories.append(category)
+                instructions.append(_screen_text_instruction(
+                    reason, (readable_text or {}).get("whitelist")
+                    if isinstance(readable_text, dict) else None))
+            continue
         for category, tokens, instruction in _RULES:
             if any(token.lower() in lowered for token in tokens):
                 matched = True

@@ -19,6 +19,7 @@
 import argparse
 import json
 import os
+import re
 import signal
 import shutil
 import subprocess
@@ -130,6 +131,32 @@ def _ref_line(payload):
     return "".join(lines)
 
 
+def _screen_prop_rule(prompt_text, text_asset=None):
+    """识别道具提示里的屏幕/页面，并追加局部可读文字硬约束。"""
+    source = str(prompt_text or "")
+    asset = text_asset if isinstance(text_asset, dict) else {}
+    if not any(token in source for token in (
+            "电脑", "笔记本", "屏幕", "显示器", "页面", "史书", "网页")) \
+            and not readable_text_required(asset):
+        return ""
+    titles = list(dict.fromkeys(re.findall(
+        r"[《「『【]([^》」』】]{1,40})[》」』】]", source)))
+    whitelist = [str(item).strip() for item in asset.get("whitelist", [])
+                 if str(item).strip()]
+    exact = list(dict.fromkeys(whitelist + titles))
+    if "崇祯" in source and "崇祯" not in exact:
+        exact.append("崇祯")
+    wanted = "、".join(exact) or "镜头合同明确要求的页面原文"
+    return (
+        "【屏幕/页面文字硬锁】电脑必须保持打开，屏幕正对镜头并在画面中清晰"
+        "可见；禁止空白冷白屏、纯白发光占位面和空白占位内容，屏幕必须实际"
+        "显示并尽量逐字"
+        f"呈现{wanted}，不得用随机乱码、模糊色块或纯白发光替代。只修改"
+        "屏幕内页面，电脑金属外壳、人物、服装、场景、构图和光线保持不变；"
+        "屏幕外仍禁止字幕、Logo、水印和无关文字。"
+    )
+
+
 def build_instruction(capability, payload, out_dir):
     """返回 (给 codex 的指令, 期望产出的文件列表, 应答的 data 字段)。"""
     out_dir = Path(out_dir)
@@ -175,6 +202,7 @@ def build_instruction(capability, payload, out_dir):
                 "发型服装配色完全一致。"
                 + ("" if payload.get("prompt_contract_complete")
                    else CHARACTER_BACKGROUND_DIRECTIVE)
+                + _screen_prop_rule(prompt_text)
                 + f"{_ref_line(payload)}{common}"
                 "只产出该文件。")
             return instruction, [target], {
@@ -195,6 +223,7 @@ def build_instruction(capability, payload, out_dir):
             "不得新增乱码或字幕条。"
             if readable_text_required(text_asset) else
             "画面中不要生成字幕条、对白字幕或无关可读文字。")
+        text_rule += _screen_prop_rule(prompt_text, text_asset)
         instruction = (
             f"为漫剧分镜生成一张关键图并保存到 {target}"
             f"(PNG,{size})。画面内容:{prompt_text}。"
