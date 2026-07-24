@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -435,6 +436,11 @@ REFERENCE_ROLES = {
 # 参考图，避免同一任务切换模型时图序、人物或构图语义发生漂移。
 IMAGE_REFERENCE_LIMIT = 10
 SHOT_BASE_REFERENCE_LIMIT = 8
+
+# render_plan.json is shared by the parallel image workers.  Keep the
+# read/write pair atomic inside one Python process; the actual image calls stay
+# outside this lock so Codex A/B can run concurrently.
+_PLAN_IO_LOCK = threading.RLock()
 
 
 class Director:
@@ -1471,22 +1477,24 @@ class Director:
         return ctx["out_root"] / "render_plan.json"
 
     def _plan_read(self, ctx):
-        path = self._plan_path(ctx)
-        if path.exists():
-            try:
-                return json.loads(path.read_text(encoding="utf-8"))
-            except ValueError:
-                pass
-        return {"items": []}
+        with _PLAN_IO_LOCK:
+            path = self._plan_path(ctx)
+            if path.exists():
+                try:
+                    return json.loads(path.read_text(encoding="utf-8"))
+                except ValueError:
+                    pass
+            return {"items": []}
 
     def _plan_write(self, ctx, plan):
-        plan["updated_at"] = now()
-        path = self._plan_path(ctx)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(plan, ensure_ascii=False, indent=1),
-                       encoding="utf-8")
-        tmp.replace(path)
+        with _PLAN_IO_LOCK:
+            plan["updated_at"] = now()
+            path = self._plan_path(ctx)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(plan, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            tmp.replace(path)
 
     def _plan_seed(self, ctx, category, items):
         """登记(或刷新)某分类要生成的全部图片;同 id 条目保留状态。"""
@@ -1516,31 +1524,35 @@ class Director:
 
     def _plan_mark(self, ctx, item_id, status, error="", prompt=None,
                    only_pending=False, extra=None):
-        plan = self._plan_read(ctx)
-        for item in plan["items"]:
-            if item["id"] != item_id:
-                continue
-            if only_pending and item.get("status") not in ("pending",
-                                                           "failed"):
+        # _plan_mark is a read-modify-write operation.  Lock the whole
+        # transaction, not just each individual file operation, otherwise two
+        # workers can overwrite each other's status/prompt updates.
+        with _PLAN_IO_LOCK:
+            plan = self._plan_read(ctx)
+            for item in plan["items"]:
+                if item["id"] != item_id:
+                    continue
+                if only_pending and item.get("status") not in ("pending",
+                                                               "failed"):
+                    return
+                item["status"] = status
+                item["error"] = error
+                # 计时:生成中记起点,完成/失败记单张耗时(供前端估算剩余时间)
+                if status == "generating":
+                    item["started_at"] = round(time.time(), 1)
+                    item.pop("finished_at", None)
+                elif status in ("done", "failed", "awaiting_human") \
+                        and item.get("started_at"):
+                    item["finished_at"] = round(time.time(), 1)
+                    item["duration"] = round(
+                        item["finished_at"] - item["started_at"], 1)
+                if prompt is not None and prompt != item.get("prompt"):
+                    item["prompt"] = prompt
+                    item["custom_prompt"] = True
+                if extra:
+                    item.update(extra)
+                self._plan_write(ctx, plan)
                 return
-            item["status"] = status
-            item["error"] = error
-            # 计时:生成中记起点,完成/失败记单张耗时(供前端估算剩余时间)
-            if status == "generating":
-                item["started_at"] = round(time.time(), 1)
-                item.pop("finished_at", None)
-            elif status in ("done", "failed", "awaiting_human") \
-                    and item.get("started_at"):
-                item["finished_at"] = round(time.time(), 1)
-                item["duration"] = round(
-                    item["finished_at"] - item["started_at"], 1)
-            if prompt is not None and prompt != item.get("prompt"):
-                item["prompt"] = prompt
-                item["custom_prompt"] = True
-            if extra:
-                item.update(extra)
-            self._plan_write(ctx, plan)
-            return
 
     @staticmethod
     def _prompt_with_feedback(prompt, feedback):
@@ -6721,7 +6733,7 @@ class Director:
     def _regenerate_revised_frame_chain(
             self, ctx, storyboard, start_shot, feedback="",
             prompt_override="", quality_override="auto",
-            revision_source="manual"):
+            revision_source="manual", codex_profile=""):
         """重做当前镜及同场已有的后续帧链，并作废对应旧视频。
 
         同场下一镜的首帧依赖上一镜尾帧。只重做当前镜会留下看似完整、
@@ -6787,6 +6799,8 @@ class Director:
                 frames_payload["seedance_prompt"] = prompt_override
             if previous_last:
                 frames_payload["chain_first_uri"] = previous_last
+            if codex_profile:
+                frames_payload["_codex_profile"] = str(codex_profile)
             frame_result = self._plan_run(
                 ctx, f"frames:{shot['shot_no']}",
                 lambda payload=frames_payload: self._call(
@@ -6982,7 +6996,7 @@ class Director:
 
     def regen_image(self, project_title, episode_number, target,
                     feedback="", prompt_override="", quality_override=None,
-                    revision_source="manual"):
+                    revision_source="manual", codex_profile=""):
         """重画单张图:target = {"kind": character_art|scene_art|shot|
         first_frame|last_frame, "name"|"shot_no"};附意见时按意见调整;
         prompt_override 非空则整句替换默认提示词(所见即所得)。
@@ -7238,6 +7252,8 @@ class Director:
                 payload["asset_matches"] = matches
                 payload["require_reference_images"] = True
                 self._attach_reference_manifest(payload)
+            if codex_profile:
+                payload["_codex_profile"] = str(codex_profile)
             result = self._plan_run(
                 ctx, f"shot:{shot_no}",
                 lambda: self._call(ctx, "image", payload, "images"),
@@ -7260,7 +7276,8 @@ class Director:
                 ctx, storyboard, shot, feedback=feedback,
                 prompt_override=prompt_override,
                 quality_override=quality_choice,
-                revision_source=revision_source)
+                revision_source=revision_source,
+                codex_profile=codex_profile)
             sync.update(self._invalidate_revised_delivery(
                 ctx, shot, formal_ready=formal_ready))
             sync["video_reference_shots"] = reference_shots
@@ -7344,6 +7361,8 @@ class Director:
             payload["asset_matches"] = matches
             payload["require_reference_images"] = True
             self._attach_reference_manifest(payload)
+            if codex_profile:
+                payload["_codex_profile"] = str(codex_profile)
 
             revision_dir = (
                 f"frames/revisions/shot_{shot_no:03d}/"
@@ -7416,6 +7435,8 @@ class Director:
                 if (row and formal_reference_allowed(self._asset_quality(row))
                         and row["uri"] and Path(row["uri"]).exists()):
                     frames_payload["chain_first_uri"] = row["uri"]
+            if codex_profile:
+                frames_payload["_codex_profile"] = str(codex_profile)
             result = self._plan_run(
                 ctx, f"frames:{shot_no}", lambda: self._call(
                     ctx, "frames", frames_payload, "frames"),
@@ -8143,26 +8164,35 @@ class Director:
                      prompt_policy="auto_revision",
                      reference_policy="auto_attach")
         try:
-            for index, item_id in enumerate(targets, 1):
-                if self._cancel_requested(ctx):
-                    raise ProduceCancelled("已手动暂停重画")
+            # Each worker owns an App/Director so mutable per-task accounting
+            # (cost, provider set, context and router state) cannot leak across
+            # images.  Profiles are assigned round-robin; with Codex A+B this
+            # gives two genuinely independent CLI processes.
+            profiles = self._codex_parallel_profiles()
+            parallel_workers = self._parallel_workers()
+            if profiles:
+                parallel_workers = min(parallel_workers, len(profiles))
+            parallel_workers = max(1, min(parallel_workers, total))
+            storyboard, _ = self.projects.latest_document(
+                episode["id"], "storyboard")
+            scene_by_shot = {
+                int(shot.get("shot_no")): shot.get("scene_no")
+                for shot in (storyboard or {}).get("shots", [])
+                if shot.get("shot_no") is not None
+            }
+            scene_locks = {}
+
+            def run_one(index, item_id):
                 target = self._plan_item_target(item_id)
                 item = by_id[item_id]
                 label = item.get("label") or item_id
                 if target is None:
-                    failed += 1
-                    processed += 1
-                    if progress:
-                        progress(phase="redrawing", total=total,
-                                 completed=processed, current_index=index,
-                                 current_item=item_id, current_label=label,
-                                 redone=redone, failed=failed)
-                    continue
+                    return {"index": index, "item_id": item_id,
+                            "label": label, "failed": True,
+                            "error": "无法解析批量重画目标"}
                 issues = list((item.get("qc") or {}).get("issues") or [])
                 if issues:
                     revision = optimize_qc_feedback(issues, mode="image")
-                    # 手动/批量提交也沿用与自动返工相同的修订编译器，
-                    # 让模型拿到可执行的改法，而不是只重复失败现象。
                     feedback = revision["text"][:1600]
                     revision_source = "batch_qc"
                 else:
@@ -8173,63 +8203,130 @@ class Director:
                     revision_source = "batch_redraw"
                 prompt_override = (item.get("prompt", "")
                                    if item.get("custom_prompt") else "")
-                if progress:
-                    progress(phase="redrawing", total=total,
-                             completed=processed, current_index=index,
-                             current_item=item_id, current_label=label,
-                             redone=redone, failed=failed,
-                             prompt_modified=True,
-                             revision_note=feedback)
+                profile_id = ""
+                if profiles:
+                    profile_id = profiles[(index - 1) % len(profiles)]["id"]
+                shot_no = target.get("shot_no")
+                scene_no = scene_by_shot.get(int(shot_no)) \
+                    if shot_no is not None else None
+                lock_key = ("scene", scene_no) if scene_no is not None \
+                    else ("item", item_id)
+                scene_lock = scene_locks.setdefault(
+                    lock_key, threading.Lock())
+                worker_app = None
                 try:
-                    self.regen_image(
-                        project_title, episode_number, target,
-                        feedback=feedback, prompt_override=prompt_override,
-                        quality_override=quality_override,
-                        revision_source=revision_source)
-                    redone += 1
+                    if self._cancel_requested(ctx):
+                        return {"index": index, "item_id": item_id,
+                                "label": label, "cancelled": True}
+                    # Local import avoids the Director ↔ App module cycle at
+                    # import time.  All workers use the same workspace/config.
+                    from .app import App
+                    worker_app = App(self.artifacts_root.parent)
+                    worker_director = worker_app.director
+                    with scene_lock:
+                        worker_director.regen_image(
+                            project_title, episode_number, target,
+                            feedback=feedback,
+                            prompt_override=prompt_override,
+                            quality_override=quality_override,
+                            revision_source=revision_source,
+                            codex_profile=profile_id)
+                        worker_project, worker_episode = \
+                            worker_director._episode_ctx(
+                                project_title, episode_number)
+                        worker_ctx = {
+                            "project": dict(worker_project),
+                            "episode": dict(worker_episode),
+                            "out_root": worker_director._episode_dir(
+                                worker_project, worker_episode),
+                        }
+                        refreshed = next(
+                            (entry for entry in worker_director._plan_read(
+                                worker_ctx)["items"]
+                             if entry["id"] == item_id), item)
+                        refs = refreshed.get("reference_inputs") or {}
+                        report = worker_director._qc_one(
+                            worker_project, worker_episode, worker_ctx,
+                            refreshed)
+                    return {
+                        "index": index, "item_id": item_id, "label": label,
+                        "redone": True, "report": report,
+                        "references_attached": bool(refs.get("attached")),
+                        "reference_count": int(refs.get("count") or 0),
+                        "codex_profile": profile_id,
+                        "feedback": feedback,
+                    }
+                except ProduceCancelled:
+                    return {"index": index, "item_id": item_id,
+                            "label": label, "cancelled": True,
+                            "codex_profile": profile_id}
                 except AifosError as exc:
-                    failed += 1
-                    self.log.warn("director",
-                                  f"重画 {item_id} 跳过: {exc}")
+                    return {"index": index, "item_id": item_id,
+                            "label": label, "failed": True,
+                            "error": str(exc),
+                            "codex_profile": profile_id}
+                except Exception as exc:  # defensive: one image must not stop the batch
+                    self.log.warn("director", f"重画 {item_id} 失败: {exc}")
+                    return {"index": index, "item_id": item_id,
+                            "label": label, "failed": True,
+                            "error": str(exc),
+                            "codex_profile": profile_id}
+                finally:
+                    if worker_app is not None:
+                        worker_app.close()
+
+            if progress:
+                progress(phase="redrawing", total=total, completed=0,
+                         redone=0, failed=0, checked=0, qc_passed=0,
+                         qc_failed=0, parallel_workers=parallel_workers,
+                         codex_profiles=[p["id"] for p in profiles],
+                         parallel_mode=("codex_profiles" if profiles
+                                        else "configured_workers"))
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            futures = {}
+            with ThreadPoolExecutor(max_workers=parallel_workers) as pool:
+                for index, item_id in enumerate(targets, 1):
+                    if self._cancel_requested(ctx):
+                        raise ProduceCancelled("已手动暂停重画")
+                    future = pool.submit(run_one, index, item_id)
+                    futures[future] = (index, item_id)
+                for future in as_completed(futures):
+                    result = future.result()
+                    index = result["index"]
+                    item_id = result["item_id"]
+                    label = result["label"]
+                    if result.get("cancelled"):
+                        raise ProduceCancelled("已手动暂停重画")
+                    if result.get("failed"):
+                        failed += 1
+                        self.log.warn(
+                            "director",
+                            f"重画 {item_id} 跳过: {result.get('error', '')}")
+                    else:
+                        redone += 1
+                        report = result.get("report") or {}
+                        checked += 1
+                        if report.get("passed"):
+                            qc_passed += 1
+                        else:
+                            qc_failed += 1
                     processed += 1
                     if progress:
-                        progress(phase="redrawing", total=total,
-                                 completed=processed, current_index=index,
-                                 current_item=item_id, current_label=label,
-                                 redone=redone, failed=failed,
-                                 error=str(exc))
-                    continue
-
-                refreshed = next((entry for entry in self._plan_read(ctx)[
-                    "items"] if entry["id"] == item_id), item)
-                refs = refreshed.get("reference_inputs") or {}
-                if progress:
-                    progress(phase="checking", total=total,
-                             completed=processed, current_index=index,
-                             current_item=item_id, current_label=label,
-                             redone=redone, failed=failed,
-                             references_attached=bool(refs.get("attached")),
-                             reference_count=int(refs.get("count") or 0))
-                try:
-                    report = self._qc_one(
-                        project, episode, ctx, refreshed)
-                    checked += 1
-                    if report.get("passed"):
-                        qc_passed += 1
-                    else:
-                        qc_failed += 1
-                except AifosError as exc:
-                    self.log.warn(
-                        "director", f"重画后复检 {item_id} 跳过: {exc}")
-                processed += 1
-                if progress:
-                    progress(phase="running", total=total,
-                             completed=processed, current_index=index,
-                             current_item=item_id, current_label=label,
-                             redone=redone, failed=failed, checked=checked,
-                             qc_passed=qc_passed, qc_failed=qc_failed,
-                             references_attached=bool(refs.get("attached")),
-                             reference_count=int(refs.get("count") or 0))
+                        progress(
+                            phase=("checking" if not result.get("failed")
+                                   else "redrawing"),
+                            total=total, completed=processed,
+                            current_index=index, current_item=item_id,
+                            current_label=label, redone=redone,
+                            failed=failed, checked=checked,
+                            qc_passed=qc_passed, qc_failed=qc_failed,
+                            references_attached=result.get(
+                                "references_attached", False),
+                            reference_count=result.get("reference_count", 0),
+                            codex_profile=result.get("codex_profile", ""),
+                            prompt_modified=True,
+                            revision_note=result.get("feedback", ""),
+                            parallel_workers=parallel_workers)
         except ProduceCancelled:
             self.projects.set_episode_status(episode["id"], previous_status)
             if progress:

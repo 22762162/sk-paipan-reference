@@ -1,6 +1,7 @@
 """图片视觉质检:核对剧本要求,不合格自动重画;镜头景别多样性。"""
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -770,6 +771,69 @@ def test_single_and_batch_qc_and_redo(app):
     assert all("测试标记未过" in i["prompt"] for i in redrawn)
     assert all(i["reference_inputs"]["attached"] for i in redrawn)
     assert all(i["reference_inputs"]["count"] >= 1 for i in redrawn)
+
+
+def test_batch_redo_dispatches_different_scenes_in_parallel(app, monkeypatch):
+    """批量关键帧返工按 Codex 槽位并行,同场仍由场景锁保护。"""
+    project = _preproduce(app, title="并行返工调度")
+    plan_path = (app.workspace.artifacts_dir
+                 / f"p{project['id']:03d}" / "e001" / "render_plan.json")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    shots = [item for item in plan["items"]
+             if item["category"] == "shot_image"]
+    assert len(shots) >= 2
+    # 选不同场景,否则连续性锁会按设计串行。
+    storyboard, _ = app.projects.latest_document(
+        app.db.query_one("SELECT id FROM episodes WHERE project_id=?",
+                         (project["id"],))["id"], "storyboard")
+    scene_by_shot = {int(shot["shot_no"]): shot.get("scene_no")
+                     for shot in storyboard["shots"]}
+    chosen = []
+    scenes = set()
+    for item in shots:
+        scene = scene_by_shot.get(int(item["shot_no"]))
+        if scene not in scenes:
+            chosen.append(item)
+            scenes.add(scene)
+        if len(chosen) == 2:
+            break
+    assert len(chosen) == 2
+    ids = {item["id"] for item in chosen}
+    for item in plan["items"]:
+        if item["id"] in ids:
+            item["status"] = "done"
+            item["qc"] = {"passed": False, "issues": ["测试标记未过"]}
+    plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+
+    barrier = threading.Barrier(2)
+    active = 0
+    max_active = 0
+    state_lock = threading.Lock()
+
+    def fake_regen(self, *args, **kwargs):
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            barrier.wait(timeout=2)
+        finally:
+            with state_lock:
+                active -= 1
+
+    monkeypatch.setattr("aifos.director.Director.regen_image", fake_regen)
+    monkeypatch.setattr(
+        "aifos.director.Director._qc_one",
+        lambda self, project, episode, ctx, item: {"passed": True,
+                                                    "issues": []})
+    monkeypatch.setattr(app.director, "_codex_parallel_profiles", lambda: [
+        {"id": "codex_a"}, {"id": "codex_b"}])
+
+    result = app.director.redo_items(
+        project["title"], 1, item_ids=list(ids))
+    assert result["status"] == "done"
+    assert result["redone"] == 2 and result["checked"] == 2
+    assert max_active == 2
 
 
 def test_manual_qc_pass_promotes_failed_draft_and_keeps_audit_reason(app,
