@@ -3,6 +3,8 @@
 
 from pathlib import Path
 
+from .prompt_contract import readable_text_required
+
 SEVERITY_PENALTY = {"error": 15, "warn": 5}
 
 
@@ -168,7 +170,7 @@ class QcCenter:
                     "message": f"{shot.get('unit_id')}人物名单与数量不一致",
                 })
             text_asset = shot.get("readable_text") or {}
-            if enabled("text") and text_asset.get("required") and not (
+            if enabled("text") and readable_text_required(text_asset) and not (
                     text_asset.get("locked_by") and text_asset.get("keyframe_uri")):
                 issues.append({
                     "check": "text_asset", "severity": "error",

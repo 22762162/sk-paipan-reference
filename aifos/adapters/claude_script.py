@@ -690,12 +690,20 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 
 最终立绘视觉基准(这些图片是身份事实来源，优先级高于早期文字描述):
 {identity_references}
-只要画面中有人物，就必须把待检图与对应最终立绘逐人做视觉比对：脸型、
-五官比例、眼鼻嘴结构、发际线、发型轮廓、年龄感、体型和标志特征。
+必须先逐人判断实际可见视角，再按视角核验，不得强迫所有人物露正脸:
+- 正面/四分之三:核对脸型、五官比例、眼鼻嘴、发际线、年龄感和性别表达。
+- 严格侧面:核对额头—鼻梁—唇—下颌侧廓、耳朵、发际线、发型轮廓、
+  体型、服装、道具和站位；不得因只见一只眼或看不全正脸失败。
+- 背面/半背影/过肩前景:核对后脑/帽冠和发型轮廓、肩背体型、服装背片/
+  接缝/材质配色、身份配饰、道具、朝向和站位；正脸不可见本身不是错误。
+  若这些可见身份点相符，identity_match 必须为 true。
+当前镜头逐角色构图合同:{composition_rules}
 必须单独核对每个人物的性别与性别表达；女性被画成男性、男性被画成女性，
 一律是身份硬错误，不能因发色、服装或气质相似而通过。
 必须点数画面里实际可见的人物总数，并与要求人数逐一核对；多一个、少一个、
 同一角色被复制两次或把两人合成一人都必须失败。
+过肩构图中“1个正面主体 + 1个前景半背影对话者”是两个已登记角色槽位；
+前景肩膀/半身只计作该对话者1人，不得另算成第三人、陌生人或人物复制。
 文字设定只补充剧情、动作、场景和当镜服装；与最终立绘冲突时以最终立绘为准。
 
 画面要求:
@@ -716,6 +724,9 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 只输出一个 JSON 对象,不要任何其他文字:
 {{"pass": true或false, "identity_checked": true或false,
 "identity_match": true或false,
+"identity_checks": [{{"character":"角色名",
+"view":"front_or_three_quarter/profile/back/back_or_over_shoulder",
+"basis":["实际核验项"],"checked":true或false,"match":true或false}}],
 "gender_checked": true或false, "gender_match": true或false,
 "count_checked": true或false, "count_match": true或false,
 "detected_count": 画面实际人数整数,
@@ -726,17 +737,34 @@ def build_qc_prompt(payload):
     characters = payload.get("characters") or []
     identity_refs = payload.get("identity_references") or []
     ref_lines = "\n".join(
-        f"- {ref.get('character', '角色')}: {ref.get('uri', '')}"
+        f"- {ref.get('character', '角色')}"
+        f"({ref.get('reference_view') or 'final_portrait'}): "
+        f"{ref.get('uri', '')}"
         for ref in identity_refs if isinstance(ref, dict))
+    composition = payload.get("composition_contract") or {}
+    actor_rules = "；".join(
+        f"{item.get('character')}={item.get('role')}/"
+        f"{item.get('expected_view')}/按{item.get('identity_basis')}核验"
+        for item in composition.get("actors") or []
+        if isinstance(item, dict))
+    composition_rules = (
+        f"类型={composition.get('composition_type')};"
+        f"正面主体={composition.get('expected_primary_count')};"
+        f"实际可见人形={composition.get('expected_visible_figure_count')};"
+        f"{actor_rules};{composition.get('count_rule', '')}"
+        if composition else "标准构图；按待检图实际可见视角逐人选择核验项")
     count_rule = (
         "本图为同一角色的多视角/局部设定图(四视图/特写/服装细节等):"
         "画面中出现的每个人形、头像或局部都必须是该角色同一人,"
         "人数不按出场人数核对"
         if payload.get("multi_view")
-        else f"严格共 {payload.get('count', len(characters))} 个")
+        else (
+            f"严格共 {payload.get('count', len(characters))} 个已登记角色；"
+            + (composition.get("count_rule") or "每个人物只计一次")))
     return IMAGE_QC_PROMPT.format(
         image=payload.get("image_uri", ""),
         identity_references=(ref_lines or "无人空镜，无需人物身份比对"),
+        composition_rules=composition_rules,
         characters="、".join(characters) or "无人(空镜)",
         count_rule=count_rule,
         designs=payload.get("designs") or "见参考图",
@@ -776,6 +804,25 @@ def validate_image_qc(data):
             data["detected_count"] = int(data["detected_count"])
         except (TypeError, ValueError):
             data.pop("detected_count", None)
+    checks = data.get("identity_checks")
+    if isinstance(checks, list):
+        normalized = []
+        for item in checks[:16]:
+            if not isinstance(item, dict) or not item.get("character"):
+                continue
+            row = dict(item)
+            row["character"] = str(row["character"])
+            row["view"] = str(row.get("view") or "")
+            row["checked"] = bool(row.get("checked"))
+            row["match"] = bool(row.get("match"))
+            basis = row.get("basis")
+            row["basis"] = (
+                [str(value) for value in basis[:12]]
+                if isinstance(basis, list) else [])
+            normalized.append(row)
+        data["identity_checks"] = normalized
+    elif checks is not None:
+        data["identity_checks"] = []
     if not data["pass"] and not data["issues"]:
         data["issues"] = ["未给出具体原因"]
     return None

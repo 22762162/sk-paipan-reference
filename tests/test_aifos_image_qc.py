@@ -47,12 +47,97 @@ def test_qc_prompt_and_validation():
     assert "允许与身份参考图不同" in prompt
     assert "悬挂的衣物" in prompt
     assert "全景" in prompt
+    assert "正脸不可见本身不是错误" in prompt
+    assert "不得另算成第三人" in prompt
     ok = {"pass": True, "issues": []}
     assert validate_image_qc(ok) is None
     bad = {"pass": False, "issues": "镜头9画成了动物"}
     assert validate_image_qc(bad) is None
     assert bad["issues"] == ["镜头9画成了动物"]
     assert validate_image_qc({"issues": []}) == "缺少 pass 字段"
+
+
+def test_over_shoulder_qc_uses_face_for_front_and_silhouette_for_back(app):
+    from aifos.adapters.claude_script import build_prompt
+
+    composition = {
+        "composition_type": "over_shoulder_dialogue",
+        "expected_primary_count": 1,
+        "expected_visible_figure_count": 2,
+        "count_rule": (
+            "前景半身背影是李继周本人，只计作该角色1人，不得另算"),
+        "actors": [
+            {
+                "character": "朱慈烺", "role": "primary_subject",
+                "expected_view": "front_or_three_quarter",
+                "identity_basis": "face",
+            },
+            {
+                "character": "李继周", "role": "foreground_counterpart",
+                "expected_view": "back_or_over_shoulder",
+                "identity_basis": "back_silhouette",
+            },
+        ],
+    }
+    prompt = build_prompt("image_qc", {
+        "image_uri": "/tmp/shot.png",
+        "characters": ["朱慈烺", "李继周"],
+        "count": 2,
+        "identity_references": [
+            {
+                "character": "朱慈烺", "reference_view": "closeup",
+                "uri": "/tmp/zhu-front.png",
+            },
+            {
+                "character": "李继周", "reference_view": "back",
+                "uri": "/tmp/li-back.png",
+            },
+        ],
+        "composition_contract": composition,
+    })
+    assert "朱慈烺=primary_subject/front_or_three_quarter/按face核验" in prompt
+    assert "李继周=foreground_counterpart/back_or_over_shoulder/按back_silhouette核验" in prompt
+    assert "李继周(back): /tmp/li-back.png" in prompt
+    assert "实际可见人形=2" in prompt
+
+    spec = {
+        "identity_required": True,
+        "identity_characters": ["朱慈烺", "李继周"],
+        "gender_required": True,
+        "count_required": True,
+        "count": 2,
+        "composition_contract": composition,
+        "identity_references": [{}, {}],
+    }
+    report = app.director._assess_image_qc(spec, {
+        "pass": True,
+        # 兼容旧总字段故意返回 false：逐角色结构化结果应作为新事实源。
+        "identity_checked": False,
+        "identity_match": False,
+        "identity_checks": [
+            {
+                "character": "朱慈烺",
+                "view": "front_or_three_quarter",
+                "basis": ["脸型", "五官", "年龄感"],
+                "checked": True, "match": True,
+            },
+            {
+                "character": "李继周",
+                "view": "back_or_over_shoulder",
+                "basis": ["发型轮廓", "服装", "体型", "道具", "站位"],
+                "checked": True, "match": True,
+            },
+        ],
+        "gender_checked": True,
+        "gender_match": True,
+        "count_checked": True,
+        "count_match": True,
+        "detected_count": 2,
+        "issues": [],
+    }, attempts=1)
+    assert report["passed"] is True
+    assert report["identity_match"] is True
+    assert report["count_match"] is True
 
 
 def test_qc_fail_triggers_auto_redraw(app, tmp_path):

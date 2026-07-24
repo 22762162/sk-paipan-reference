@@ -135,8 +135,20 @@ class ApiProvider(Provider):
         return True, ""
 
     def generate(self, capability, payload, out_dir, cancel=None):
+        outbound = dict(payload or {})
+        if capability in {"image", "frames", "cover"}:
+            prompt_used = (
+                outbound.get("prompt_compact") or outbound.get("prompt") or "")
+            outbound["prompt"] = prompt_used
+            outbound["prompt_compact"] = prompt_used
+            # Unknown external endpoints must not get planning biographies and
+            # episode context then accidentally choose those over the shot.
+            for key in (
+                    "prompt_full", "prompt_audit", "_reference_prompt_base",
+                    "story_world", "story_background", "character_background"):
+                outbound.pop(key, None)
         body = json.dumps(
-            {"capability": capability, "payload": payload,
+            {"capability": capability, "payload": outbound,
              "out_dir": str(out_dir)},
             ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(

@@ -25,6 +25,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from aifos.prompt_contract import readable_text_required
+
 
 # 非交互出图必需:可写沙箱 + 跳过 git 仓库检查(产物目录不是 git 仓库)。
 # 旧版 codex 不认识这些参数时,run() 会自动去掉重试。
@@ -168,7 +170,7 @@ def build_instruction(capability, payload, out_dir):
             target = out_dir / f"sheet_{safe}_{key}.png"
             instruction = (
                 f"为角色生成{payload.get('sheet_label', key)}设定资产并保存到"
-                f" {target}(PNG,{size})。{payload.get('prompt', '')}。"
+                f" {target}(PNG,{size})。{prompt_text}。"
                 "这是人物资产库的生产级设定图,必须与立绘/参考图为同一人物,"
                 "发型服装配色完全一致。"
                 + ("" if payload.get("prompt_contract_complete")
@@ -191,7 +193,7 @@ def build_instruction(capability, payload, out_dir):
             f"画面文字载体:{text_asset.get('carrier', '')};只允许逐字出现:"
             f"{'、'.join(text_asset.get('whitelist', [])) or '白名单为空'};"
             "不得新增乱码或字幕条。"
-            if text_asset.get("required") else
+            if readable_text_required(text_asset) else
             "画面中不要生成字幕条、对白字幕或无关可读文字。")
         instruction = (
             f"为漫剧分镜生成一张关键图并保存到 {target}"
@@ -273,14 +275,30 @@ def build_instruction(capability, payload, out_dir):
         forbid = "、".join(payload.get("forbid", [])) or "无"
         identity_refs = payload.get("identity_references") or []
         identity_line = "；".join(
-            f"{r.get('character', '角色')}={r.get('uri', '')}"
+            f"{r.get('character', '角色')}"
+            f"({r.get('reference_view') or 'final_portrait'})="
+            f"{r.get('uri', '')}"
             for r in identity_refs if isinstance(r, dict)) or "无人空镜"
+        composition = payload.get("composition_contract") or {}
+        actor_rules = "；".join(
+            f"{item.get('character')}={item.get('role')}/"
+            f"{item.get('expected_view')}/按{item.get('identity_basis')}核验"
+            for item in composition.get("actors") or []
+            if isinstance(item, dict))
+        composition_line = (
+            f"类型={composition.get('composition_type')};"
+            f"正面主体={composition.get('expected_primary_count')};"
+            f"实际可见人形={composition.get('expected_visible_figure_count')};"
+            f"{actor_rules};{composition.get('count_rule', '')}"
+            if composition else "标准构图；按待检图实际可见视角逐人核验")
         count_rule = (
             "本图为同一角色的多视角/局部设定图(四视图/特写/服装细节等):"
             "画面中出现的每个人形、头像或局部都必须是该角色同一人,"
             "人数不按出场人数核对"
             if payload.get("multi_view") else
-            f"严格共 {payload.get('count', len(payload.get('characters', [])))} 个")
+            f"严格共 {payload.get('count', len(payload.get('characters', [])))} "
+            "个已登记角色；"
+            + (composition.get("count_rule") or "每个人物只计一次"))
         instruction = (
             f"你是漫剧图片质检员。用你的视觉能力查看图片文件 {image}"
             "(可直接读取该文件),逐项核对是否符合以下生产要求,"
@@ -298,13 +316,20 @@ def build_instruction(capability, payload, out_dir):
                or "以最终立绘与人物设定为准")
             + "\n"
             f"- 人工锁定的最终立绘:{identity_line}\n"
-            "必须真实打开待检图和上述最终立绘逐人做视觉比对；脸型、五官比例、"
-            "眼鼻嘴、发际线、发型轮廓、年龄感和体型以最终立绘为准。"
-            "不得只根据文字判断；文字与最终立绘冲突时，身份以最终立绘为准。\n"
+            f"- 当前镜头逐角色构图合同:{composition_line}\n"
+            "必须真实打开待检图和对应参考图，先逐人判断实际可见视角，再核验："
+            "正面/四分之三核对脸型、五官比例、眼鼻嘴、发际线、年龄感；"
+            "严格侧面核对额头—鼻梁—唇—下颌侧廓、耳朵、发际线、发型轮廓、"
+            "体型、服装、道具和站位，不要求完整正脸；背面/半背影/过肩前景"
+            "核对后脑/帽冠和发型轮廓、肩背体型、服装背片/接缝/材质配色、"
+            "身份配饰、道具、朝向和站位，正脸不可见本身不得判失败。"
+            "可见身份点相符时 identity_match 必须为 true。文字与最终立绘"
+            "冲突时，身份以参考图为准。\n"
             "必须单独核对每个人物的性别与性别表达。女性画成男性、男性画成女性"
             "一律判失败，不能因服装、发色或气质相似而放行。\n"
             "必须点数画面实际可见人物；多一个、少一个、角色被复制或两人合成一人"
-            "都必须判失败。\n"
+            "都必须判失败。过肩镜中前景半身背影/肩膀是已登记的对话者本人，"
+            "只计该角色1人，不得另算成第三人、陌生人或人物复制。\n"
             f"- 场景:{payload.get('location', '按提示词')};"
             f"动作:{payload.get('action', '按提示词')};"
             f"镜头景别:{payload.get('camera', '不限')}\n"
@@ -315,6 +340,9 @@ def build_instruction(capability, payload, out_dir):
             "只在标准输出打印一行 JSON,不要产出任何文件,不要多余文字:"
             '{"pass": true或false, "identity_checked": true或false, '
             '"identity_match": true或false, '
+            '"identity_checks": [{"character":"角色名",'
+            '"view":"front_or_three_quarter/profile/back/back_or_over_shoulder",'
+            '"basis":["实际核验项"],"checked":true或false,"match":true或false}], '
             '"gender_checked": true或false, "gender_match": true或false, '
             '"count_checked": true或false, "count_match": true或false, '
             '"detected_count": 画面实际人数整数, '

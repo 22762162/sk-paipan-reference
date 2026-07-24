@@ -225,11 +225,20 @@ def test_image_api_portrait_and_shot(fake_api, tmp_path):
     assert call["body"]["size"] == "1024x1536"   # 9:16 → 竖版
 
     result = provider.generate("image", {
-        "shot_no": 7, "characters": ["林昭"], "prompt": "古镇夜景",
+        "shot_no": 7, "characters": ["林昭"],
+        "prompt": "FULL_EPISODE_PLOT_SENTINEL_整集剧情",
+        "prompt_compact": "CURRENT_SHOT_SENTINEL_林昭抬眼看向门外",
+        "prompt_contract_complete": True,
+        "character_background": {
+            "林昭": {"backstory": "FULL_BIO_SENTINEL_人物身世"}},
         "aspect": "16:9",
     }, tmp_path)
     assert result.uri.endswith("shot_007.keyframe.png")
     assert fake.calls[-1]["body"]["size"] == "1536x1024"
+    sent_prompt = fake.calls[-1]["body"]["prompt"]
+    assert "CURRENT_SHOT_SENTINEL" in sent_prompt
+    assert "FULL_EPISODE_PLOT_SENTINEL" not in sent_prompt
+    assert "FULL_BIO_SENTINEL" not in sent_prompt
 
 
 def test_image_api_frames_url_mode(fake_api, tmp_path):

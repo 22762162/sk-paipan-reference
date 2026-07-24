@@ -181,7 +181,12 @@ def test_seedream_uploads_ordered_identity_refs_and_forces_one_image(
     })
     result = provider.generate("image", {
         "shot_no": 8, "characters": ["林昭", "叶晚"],
-        "prompt": "两人在办公室交谈", "aspect": "9:16",
+        "prompt": "FULL_EPISODE_PLOT_SENTINEL_整集剧情",
+        "prompt_compact": "CURRENT_SHOT_SENTINEL_两人在办公室交谈",
+        "prompt_contract_complete": True,
+        "character_background": {
+            "林昭": {"backstory": "FULL_BIO_SENTINEL_人物身世"}},
+        "aspect": "9:16",
         "image_task_class": "batch", "image_quality": "medium",
         "identity_references": [
             {"actor_id": "P01", "character": "林昭", "uri": lin},
@@ -206,6 +211,9 @@ def test_seedream_uploads_ordered_identity_refs_and_forces_one_image(
     assert "图1=P01/林昭最终立绘" in body["prompt"]
     assert "图2=P02/叶晚最终立绘" in body["prompt"]
     assert "最终成片不得画出" in body["prompt"]
+    assert "CURRENT_SHOT_SENTINEL" in body["prompt"]
+    assert "FULL_EPISODE_PLOT_SENTINEL" not in body["prompt"]
+    assert "FULL_BIO_SENTINEL" not in body["prompt"]
     assert result.cost == 0.22
     assert result.model == "doubao-seedream-5-0-lite-260128"
     assert result.data["model"] == "doubao-seedream-5-0-lite-260128"

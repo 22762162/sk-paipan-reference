@@ -12,6 +12,7 @@ import re
 
 
 PROMPT_CONTRACT_SCHEMA = "aifos.shot-prompt/v1"
+NON_PICTURE_TEXT_CARRIERS = ("字幕", "对白字幕", "旁白字幕", "台词字幕")
 
 
 def _text(value, fallback=""):
@@ -32,6 +33,23 @@ def _state_line(states):
     return "；".join(values)
 
 
+def readable_text_required(value):
+    """Only treat an explicit on-screen whitelist as an image text asset.
+
+    Dialogue/subtitle metadata occasionally arrives as ``required=true`` with an
+    empty whitelist. Sending that to an image model as "字幕 / 白名单为空"
+    invites invented text even though the production profile forbids subtitles.
+    """
+    value = value if isinstance(value, dict) else {}
+    if not value.get("required"):
+        return False
+    carrier = _text(value.get("carrier"))
+    if any(label in carrier for label in NON_PICTURE_TEXT_CARRIERS):
+        return False
+    return bool([item for item in (value.get("whitelist") or [])
+                 if _text(item)])
+
+
 def _camera(shot):
     dimensions = shot.get("five_dimensions") or {}
     design = dimensions.get("camera_design") or {}
@@ -50,15 +68,130 @@ def _camera(shot):
 def _character_lines(shot):
     characters = list(shot.get("characters") or [])
     number_map = shot.get("character_number_map") or {}
+    visuals = shot.get("character_visuals") or {}
     actor_by_name = {
         item.get("name"): actor_id
         for actor_id, item in number_map.items()
         if isinstance(item, dict) and item.get("name")
     }
     return [
-        f"{actor_by_name.get(name) or f'P{index:02d}'}={name}"
+        (
+            f"{actor_by_name.get(name) or f'P{index:02d}'}={name}"
+            + (f"（{_text(visuals.get(name))}）"
+               if _text(visuals.get(name)) else "")
+        )
         for index, name in enumerate(characters, 1)
     ]
+
+
+def build_composition_contract(shot):
+    """Derive per-actor visibility duties from the current shot only.
+
+    An over-shoulder dialogue has one primary face and one registered foreground
+    counterpart. The foreground shoulder/back remains one expected character;
+    it is not a duplicate or an extra body.
+    """
+    shot = shot or {}
+    characters = list(shot.get("characters") or [])
+    dialogue = shot.get("dialogue") or {}
+    contract = shot.get("shot_contract") or {}
+    dimensions = shot.get("five_dimensions") or {}
+    camera_design = dimensions.get("camera_design") or {}
+    camera_text = " ".join(_text(value) for value in (
+        shot.get("camera"), contract.get("角度"), contract.get("机位"),
+        contract.get("构图"), camera_design.get("angle"),
+        camera_design.get("camera_position"),
+        camera_design.get("composition"),
+    ) if _text(value))
+    framing_text = " ".join(
+        value for value in (camera_text, _text(shot.get("description")))
+        if value)
+
+    view_cues = {
+        "back": ("背面", "背影", "背对", "肩后", "过肩前景", "后脑"),
+        "front": ("正面", "正脸", "面向镜头", "面对镜头", "三分之四正面"),
+        "profile": ("侧面", "侧脸", "严格侧身", "profile"),
+    }
+    actor_views = {}
+    for name in characters:
+        name_positions = [
+            match.start() for match in re.finditer(
+                re.escape(str(name)), framing_text, flags=re.IGNORECASE)]
+        nearest = None
+        for view, cues in view_cues.items():
+            for cue in cues:
+                for match in re.finditer(
+                        re.escape(cue), framing_text, flags=re.IGNORECASE):
+                    for position in name_positions:
+                        distance = abs(match.start() - position)
+                        candidate = (distance, view)
+                        if distance <= 18 and (
+                                nearest is None or candidate < nearest):
+                            nearest = candidate
+        if nearest:
+            actor_views[name] = nearest[1]
+    back_names = {
+        name for name, view in actor_views.items() if view == "back"}
+    front_names = {
+        name for name, view in actor_views.items() if view == "front"}
+    profile_names = {
+        name for name, view in actor_views.items() if view == "profile"}
+    over_shoulder = "过肩" in framing_text or (
+        ("背面" in framing_text or "背影" in framing_text)
+        and len(characters) >= 2
+        and bool(dialogue.get("dialogue")))
+    profile = any(
+        word in camera_text for word in ("侧面", "侧脸", "profile"))
+    back = any(
+        word in camera_text for word in ("背面", "背对", "back view"))
+    speaker = _text(dialogue.get("character"))
+    primary = next(
+        (name for name in characters if name in front_names),
+        next(
+            (name for name in characters if name not in back_names),
+            speaker if speaker in characters else (
+                characters[0] if characters else "")))
+    actors = []
+    for name in characters:
+        if over_shoulder:
+            is_primary = name == primary and name not in back_names
+            expected_view = (
+                "front_or_three_quarter" if is_primary
+                else "back_or_over_shoulder")
+            role = "primary_subject" if is_primary else "foreground_counterpart"
+            basis = "face" if is_primary else "back_silhouette"
+            coverage = "face_visible" if is_primary else "partial"
+        elif name in back_names or (back and not front_names):
+            expected_view, role = "back", "subject"
+            basis, coverage = "back_silhouette", "body_visible"
+        elif name in profile_names or (profile and not front_names):
+            expected_view, role = "profile", "subject"
+            basis, coverage = "profile_silhouette", "profile_visible"
+        else:
+            expected_view, role = "front_or_three_quarter", "subject"
+            basis, coverage = "face", "face_visible"
+        actors.append({
+            "character": name,
+            "role": role,
+            "expected_view": expected_view,
+            "coverage": coverage,
+            "identity_basis": basis,
+        })
+    return {
+        "composition_type": (
+            "over_shoulder_dialogue" if over_shoulder
+            else "back_view" if back
+            else "profile_view" if profile
+            else "standard"),
+        "expected_primary_count": (
+            1 if over_shoulder and characters else len(characters)),
+        "expected_visible_figure_count": len(characters),
+        "actors": actors,
+        "count_rule": (
+            "前景半身背影/肩膀是已登记的对话者本人，只计作该角色1人，"
+            "不得另算成新增人物或人物复制"
+            if over_shoulder else "每个可见人物只计一次"),
+    }
 
 
 def build_shot_prompt_contract(shot, *, location="", style="", references=None):
@@ -72,7 +205,8 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
     readable = shot.get("readable_text") or {}
     text_rule = (
         f"首帧文字只保持原样:{'、'.join(readable.get('whitelist') or []) or '白名单'}"
-        if readable.get("required") else "无画面文字、无字幕、无Logo、无水印"
+        if readable_text_required(readable)
+        else "无画面文字、无字幕、无Logo、无水印"
     )
     refs = []
     for item in references or []:
@@ -92,10 +226,15 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
     contract = {
         "schema": PROMPT_CONTRACT_SCHEMA,
         "mode": "shot",
+        "frame_kind": _text(shot.get("frame_kind")),
         "subject": {
             "count": len(characters),
             "actors": _character_lines(shot),
         },
+        "composition": (
+            shot.get("composition_contract")
+            if isinstance(shot.get("composition_contract"), dict)
+            else build_composition_contract(shot)),
         "scene": scene,
         "style": _text(style),
         "start": _state_line(shot.get("start_state")) or "保持首帧状态",
@@ -161,6 +300,18 @@ def render_shot_prompt(contract, *, mode="image"):
         f"【镜头】{camera_line}。",
         f"【终点】{contract['end']}。",
     ]
+    composition = contract.get("composition") or {}
+    if composition.get("composition_type") == "over_shoulder_dialogue":
+        duties = "；".join(
+            f"{item.get('character')}={item.get('role')}/"
+            f"{item.get('expected_view')}"
+            for item in composition.get("actors") or [])
+        lines.insert(
+            3,
+            "【过肩构图】"
+            f"主体{composition.get('expected_primary_count', 1)}人，"
+            f"实际可见人形{composition.get('expected_visible_figure_count', count)}人；"
+            f"{duties}；{composition.get('count_rule', '')}。")
     if contract.get("style"):
         lines.append(f"【画风】{contract['style']}（只沿用项目基准，不改媒介）。")
     if contract.get("dialogue"):
@@ -169,6 +320,13 @@ def render_shot_prompt(contract, *, mode="image"):
     lines.append(f"【文字】{contract['text']}。")
     if mode == "video":
         lines.insert(1, "【输入】图1是唯一动作起点，图2是唯一动作终点；只让已锁定画面动起来。")
+    if contract.get("frame_kind") in {"first_frame", "last_frame"}:
+        label = "首帧" if contract["frame_kind"] == "first_frame" else "尾帧"
+        state = contract["start"] if label == "首帧" else contract["end"]
+        lines.insert(
+            1,
+            f"【单帧修改】只生成{label}这一张；目标状态={state}；"
+            "保持待修改基底中未被反馈点名的内容不变。")
     if contract.get("references"):
         refs = "；".join(
             f"图{item['index']}={item['label']}({_reference_role(item)})"

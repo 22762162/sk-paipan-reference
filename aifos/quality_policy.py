@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 
 from .errors import AifosError
+from .prompt_contract import NON_PICTURE_TEXT_CARRIERS
 
 
 QUALITY_LEVELS = ("low", "medium", "high")
@@ -81,7 +82,10 @@ def recommend_shot_image_quality(shot, *, continuity_anchor=False):
     """正式关键帧默认中；五类下游污染风险自动升高。"""
     reasons = []
     readable = shot.get("readable_text") or {}
-    if readable.get("required"):
+    carrier = str(readable.get("carrier") or "")
+    if (readable.get("required")
+            and not any(label in carrier
+                        for label in NON_PICTURE_TEXT_CARRIERS)):
         reasons.append("可读文字必须在静帧中锁定")
     try:
         people = int(shot.get("character_count", len(

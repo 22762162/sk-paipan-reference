@@ -183,6 +183,20 @@ def test_shot_uses_individual_canonical_view_not_review_board(app):
         {"description": "正面走入房间"}) == ("front",)
 
 
+def test_over_shoulder_uses_front_sheet_for_subject_and_back_for_counterpart(
+        app):
+    shot = {
+        "characters": ["朱慈烺", "李继周"],
+        "description": "李继周半个背影作过肩前景，朱慈烺正面对他说话",
+        "camera": "中近景过肩机位",
+        "dialogue": {"character": "朱慈烺", "dialogue": "照此办理。"},
+    }
+    keys = app.director._shot_reference_sheet_keys_by_character(shot)
+    assert keys["朱慈烺"] in (("front", "closeup"),
+                              ("closeup", "front"))
+    assert keys["李继周"] == ("back",)
+
+
 def test_reference_portrait_locks_face_hair_makeup_and_workwear(app):
     design = {"appearance": "鹅蛋脸", "hair": "齐肩短发", "costume": "外卖制服"}
     variant = app.director._candidate_variant(1, design)

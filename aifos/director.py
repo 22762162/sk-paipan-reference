@@ -32,7 +32,11 @@ from .quality_policy import (
     resolve_video_quality,
     set_policy_choices,
 )
-from .prompt_contract import compile_shot_prompt
+from .prompt_contract import (
+    build_composition_contract,
+    compile_shot_prompt,
+    readable_text_required,
+)
 from .qc_feedback import optimize_qc_feedback
 from .relations import relation_lines, write_relations
 from .spatial_blocking import (
@@ -875,9 +879,9 @@ class Director:
     SHEET_DESIGN_KEYS = {
         "turnaround": ("species", "appearance", "hair", "costume",
                        "palette", "era_setting", "occupation",
-                       "costume_direction", "visual_dna", "cast_dedup"),
+                       "costume_direction", "visual_dna"),
         "closeup": ("species", "appearance", "hair", "eyes",
-                    "temperament", "background_prompt", "visual_dna"),
+                    "temperament", "visual_dna"),
         "front": ("species", "appearance", "hair", "costume",
                   "costume_detail", "accessories", "palette",
                   "visual_dna"),
@@ -894,8 +898,13 @@ class Director:
                      "occupation", "costume_direction"),
         "costume_detail": ("costume", "costume_detail", "palette",
                             "accessories", "signature_props",
-                            "visual_variants"),
+                            ),
     }
+    VISIBLE_DNA_KEYS = (
+        "face_structure", "hair_silhouette", "body_or_occupation_marks",
+        "clothing_structure", "clothing_wear_state", "story_visual_symbol",
+        "signature_accessory", "temperament_keywords",
+    )
     DESIGN_LABELS = (
         ("species", "形态"),
         ("gender", "性别"), ("sex", "性别"),
@@ -938,7 +947,13 @@ class Director:
         for key, label in self.DESIGN_LABELS:
             if keys is not None and key not in keys:
                 continue
-            value = self._design_value(design.get(key))
+            raw = design.get(key)
+            if key == "visual_dna" and isinstance(raw, dict):
+                # analysis_source / derivation are valuable planning evidence,
+                # but they are biography rather than visible image controls.
+                raw = {item: raw.get(item) for item in self.VISIBLE_DNA_KEYS
+                       if raw.get(item)}
+            value = self._design_value(raw)
             if value:
                 parts.append(f"{label}:{value}")
         return ",".join(parts)
@@ -1371,11 +1386,13 @@ class Director:
             place, suffix = place.split("·", 1)
             time_state = suffix.strip()
         time_state = time_state or "按本场剧情确定的时间与天气"
-        action = (scene.get("action") or premise or
-                  "建立本场事件发生所需的环境关系")
         production_design = (
             scene.get("production_design")
             if isinstance(scene.get("production_design"), dict) else {})
+        purpose = (
+            production_design.get("story_function")
+            or scene.get("scene_purpose")
+            or "建立本地点可复用的空间、出入口、表演区与摄影动线")
         analysis_line = "；".join(filter(None, (
             str(scene.get("prompt_prefix") or "").strip(),
             str(production_design.get("environment") or "").strip(),
@@ -1390,7 +1407,7 @@ class Director:
             (f"AI制作圣经:{analysis_line}" if analysis_line else ""),
             f"空间功能与布局:{self._scene_environment_line(place)}",
             f"时间与天气:{time_state}",
-            f"剧情用途:{action}",
+            f"当前场景图用途:{purpose}",
             "构图:适配项目画幅的环境建立镜头，前景/主体区/背景层次清楚，"
             "留出角色进出与表演动线，机位高度和光线方向稳定，后续镜头可复用",
             "空镜:画面中不出现人物、人体局部、剪影、倒影中的人或随机路人",
@@ -1598,11 +1615,10 @@ class Director:
         """从即将交给 worker 的真实 payload 构造不可变预检契约。"""
         payload = json.loads(json.dumps(
             task.get("payload") or {}, ensure_ascii=False, default=str))
-        prompt = self._prompt_with_feedback(
-            payload.get("prompt", ""), payload.get("feedback", ""))
         prompt_used = self._prompt_with_feedback(
             payload.get("prompt_compact") or payload.get("prompt", ""),
             payload.get("feedback", ""))
+        prompt = prompt_used
         refs = self._reference_inputs(payload)
         category = item.get("category", "")
         characters = [str(value) for value in payload.get("characters") or []]
@@ -1616,12 +1632,12 @@ class Director:
             if ref.get("character") and ref.get("uri")
         }
         issues = []
-        if not prompt.strip():
+        if not prompt_used.strip():
             issues.append("最终提示词为空")
         subject = str(payload.get("art_name") or payload.get("location") or "")
         expected_names = characters or ([subject] if subject else [])
         for name in expected_names:
-            if name and name not in prompt:
+            if name and name not in prompt_used:
                 issues.append(f"提示词没有明确写出对象「{name}」")
         # 用户已明确要求：调用其他 API 时不能只交文字，所有加速项至少一图。
         if not refs["items"]:
@@ -1823,16 +1839,62 @@ class Director:
                 "以下角色尚未锁定最终立绘，禁止出图/质检: " + "、".join(missing))
         return refs
 
+    def _qc_identity_references(
+            self, project_id, characters, composition_contract=None,
+            required=True):
+        """Attach the final portrait plus the matching canonical view for QC."""
+        refs = self._identity_references(
+            project_id, characters, required=required)
+        by_name = {
+            item.get("character"): item
+            for item in (composition_contract or {}).get("actors") or []
+            if isinstance(item, dict) and item.get("character")
+        }
+        seen = {item.get("uri") for item in refs}
+        for name in characters or []:
+            view = (by_name.get(name) or {}).get(
+                "expected_view", "front_or_three_quarter")
+            keys = {
+                "front_or_three_quarter": ("closeup", "front"),
+                "profile": ("profile",),
+                "back": ("back",),
+                "back_or_over_shoulder": ("back",),
+            }.get(view, ())
+            for key in keys:
+                row = self.assets.latest(
+                    project_id, "character_sheet", f"{name}:{key}")
+                if (not row or not row["uri"] or row["uri"] in seen
+                        or not formal_reference_allowed(
+                            self._asset_quality(row))
+                        or not Path(row["uri"]).exists()):
+                    continue
+                refs.append({
+                    "character": name,
+                    "asset_id": row["id"],
+                    "uri": row["uri"],
+                    "version": row["version"],
+                    "reference_view": key,
+                })
+                seen.add(row["uri"])
+                break
+        return refs
+
     def _qc_spec(self, project_id, characters, location="", action="",
                  forbid=None, require_identity=True, expected_characters=None,
-                 expected_count=None, character_background=None):
-        """视觉质检规格：待检图必须与人工锁定的最终立绘逐人比对。"""
+                 expected_count=None, character_background=None, camera="",
+                 composition_contract=None):
+        """视觉质检规格：按角色在本镜可见角度选择核验依据。"""
         identity_characters = list(characters or [])
         visible_characters = list(
             identity_characters if expected_characters is None
             else expected_characters)
-        identity_refs = self._identity_references(
+        composition_contract = (
+            composition_contract
+            if isinstance(composition_contract, dict)
+            else {"composition_type": "standard", "actors": []})
+        identity_refs = self._qc_identity_references(
             project_id, identity_characters,
+            composition_contract=composition_contract,
             required=bool(identity_characters and require_identity))
         backgrounds = character_background or {}
         designs = []
@@ -1871,6 +1933,9 @@ class Director:
             "expected_genders": genders,
             "location": location or "",
             "action": action or "",
+            "camera": camera or "",
+            "composition_contract": composition_contract,
+            "identity_view_policy": "adaptive_visible_angle_v2",
             "forbid": list(forbid or []),
             "identity_references": identity_refs,
             "identity_required": identity_required,
@@ -1891,11 +1956,30 @@ class Director:
         """把视觉模型结果收敛为身份/性别/人数三个不可绕过的门槛。"""
         verdict = verdict or {}
         identity_required = bool(qc_spec.get("identity_required"))
-        identity_checked = (
-            not identity_required or bool(verdict.get("identity_checked")))
-        identity_match = (
-            not identity_required
-            or bool(verdict.get("identity_match")))
+        raw_identity_checks = verdict.get("identity_checks")
+        identity_checks = [
+            dict(item) for item in (raw_identity_checks or [])
+            if isinstance(item, dict) and item.get("character")
+        ] if isinstance(raw_identity_checks, list) else []
+        if identity_required and identity_checks:
+            by_name = {str(item["character"]): item
+                       for item in identity_checks}
+            expected_names = [
+                str(name) for name in (
+                    qc_spec.get("identity_characters") or [])]
+            identity_checked = all(
+                name in by_name and bool(by_name[name].get("checked"))
+                for name in expected_names)
+            identity_match = all(
+                name in by_name and bool(by_name[name].get("match"))
+                for name in expected_names)
+        else:
+            identity_checked = (
+                not identity_required
+                or bool(verdict.get("identity_checked")))
+            identity_match = (
+                not identity_required
+                or bool(verdict.get("identity_match")))
         gender_required = bool(qc_spec.get("gender_required"))
         gender_checked = (
             not gender_required or bool(verdict.get("gender_checked")))
@@ -1934,7 +2018,8 @@ class Director:
             not identity_checked or not identity_match
             or not gender_checked or not gender_match
             or not count_checked or not count_match
-            or any(word in text for word in mismatch_words))
+            or (not identity_checks
+                and any(word in text for word in mismatch_words)))
         passed = (
             bool(verdict.get("pass"))
             and identity_checked and identity_match
@@ -1953,6 +2038,9 @@ class Director:
             "detected_count": verdict.get("detected_count"),
             "identity_references": len(
                 qc_spec.get("identity_references") or []),
+            "identity_checks": identity_checks,
+            "composition_contract": qc_spec.get(
+                "composition_contract") or {},
             "hard_failure": bool(hard_failure and not passed),
         }
 
@@ -2471,7 +2559,7 @@ class Director:
         camera = str(shot.get("camera") or "")
         action = str(shot.get("description") or shot.get("prompt") or "")
         return (people * 30
-                + (45 if text.get("required") else 0)
+                + (45 if readable_text_required(text) else 0)
                 + (25 if scene_first else 0)
                 + (15 if any(word in camera for word in
                              ("跟", "移", "摇", "环绕")) else 0)
@@ -2480,9 +2568,8 @@ class Director:
 
     def _plan_seed_shots(self, ctx):
         """分镜确定后,把每个镜头的关键帧与首尾帧登记进清单。
-        清单里展示的是详细提示词(含人物设定与故事情境),所见即所得。"""
+        清单展示实际发送的当前镜头短合同，所见即所得。"""
         shots = (ctx.get("storyboard") or {}).get("shots") or []
-        locations = self._scene_locations(ctx) if ctx.get("script") else {}
         scene_counts = {}
         for shot in shots:
             scene_counts[shot.get("scene_no")] = (
@@ -2490,6 +2577,9 @@ class Director:
         image_items, frame_items = [], []
         for shot in shots:
             shot_no = shot["shot_no"]
+            shot_payload = self._shot_payload(
+                ctx, shot, continuity_anchor=(
+                    scene_counts.get(shot.get("scene_no"), 0) > 1))
             image_quality = resolve_image_quality(
                 recommend_shot_image_quality(shot),
                 ctx.get("quality_policy") or default_quality_policy(),
@@ -2506,15 +2596,15 @@ class Director:
                          + (f" · 第{shot['scene_no']}场"
                             if shot.get("scene_no") else ""),
                 "shot_no": shot_no,
-                "prompt": self._rich_shot_prompt(
-                    ctx, shot, locations.get(shot.get("scene_no"), "")),
+                # 清单展示与模型实际收到的是同一份当前镜头短合同。
+                "prompt": shot_payload["prompt_compact"],
                 **self._quality_meta(image_quality),
             })
             frame_items.append({
                 "id": f"frames:{shot_no}", "category": "frames",
                 "label": f"镜头 {shot_no:02d} 首尾帧",
                 "shot_no": shot_no,
-                "prompt": shot.get("seedance_prompt", shot["prompt"]),
+                "prompt": shot_payload["prompt_compact"],
                 **self._quality_meta(frame_quality),
             })
         self._plan_seed(ctx, "shot_image", image_items)
@@ -3234,8 +3324,8 @@ class Director:
                 keywords = dna.get("temperament_keywords")
                 if isinstance(keywords, list) and keywords:
                     design["temperament"] = "、".join(map(str, keywords))
-            # 即使编剧模型只回传了基础视觉字段,也不允许丢掉剧本中的
-            # 时代/职业/动机/服装逻辑;这些字段会继续进入所有出图提示词。
+            # 即使编剧模型只回传基础视觉字段，也保留内部人物分析；
+            # 真正出图时只编译其中对当前资产可见、可执行的字段。
             for key in (
                     "introduction", "gender", "age_range", "identity",
                     "personality",
@@ -3695,10 +3785,6 @@ class Director:
             if scene["location"] not in locations:
                 locations.append(scene["location"])
                 scene_context_by_location[scene["location"]] = dict(scene)
-            elif scene.get("action"):
-                previous = scene_context_by_location[scene["location"]]
-                previous["action"] = "；".join(filter(None, (
-                    previous.get("action", ""), scene.get("action", ""))))
         location_reuse = {
             location: sum(1 for scene in ctx["script"]["scenes"]
                           if scene.get("location") == location)
@@ -3834,6 +3920,7 @@ class Director:
                         location, style, scene,
                         premise=ctx["episode"].get("premise", "")),
                     "style": style,
+                    "prompt_contract_complete": True,
                     **scene_references,
                     "style_ref": self._style_anchor_uri(project_id),
                     "require_reference_images": bool(
@@ -4009,6 +4096,13 @@ class Director:
         shot = shot or {}
         text = " ".join(str(shot.get(key) or "") for key in (
             "kind", "description", "prompt", "camera", "dialogue"))
+        contract = shot.get("shot_contract") or {}
+        design = (shot.get("five_dimensions") or {}).get(
+            "camera_design") or {}
+        text += " " + " ".join(str(value or "") for value in (
+            contract.get("角度"), contract.get("机位"), contract.get("构图"),
+            design.get("angle"), design.get("camera_position"),
+            design.get("composition")))
         if any(word in text for word in (
                 "背面", "背对", "离场", "转身离开", "back view")):
             return ("back",)
@@ -4023,8 +4117,37 @@ class Director:
             return ("closeup",)
         return ("front",)
 
+    @classmethod
+    def _shot_reference_sheet_keys_by_character(
+            cls, shot, composition_contract=None):
+        """Mixed views need per-actor references, not one sheet for the shot."""
+        composition = (
+            composition_contract
+            if isinstance(composition_contract, dict)
+            else build_composition_contract(shot))
+        fallback = cls._shot_reference_sheet_keys(shot)
+        close = any(word in str(shot.get("camera") or "")
+                    for word in ("近景", "特写", "closeup"))
+        result = {}
+        for actor in composition.get("actors") or []:
+            name = actor.get("character")
+            view = actor.get("expected_view")
+            if not name:
+                continue
+            if view in ("back", "back_or_over_shoulder"):
+                result[name] = ("back",)
+            elif view == "profile":
+                result[name] = ("profile",)
+            elif view == "front_or_three_quarter":
+                result[name] = (("closeup", "front")
+                                if close else ("front", "closeup"))
+            else:
+                result[name] = fallback
+        return result
+
     def _art_refs(self, ctx, characters, location, shot_no=None,
-                  sheet_keys=None, spatial_ref=""):
+                  sheet_keys=None, sheet_keys_by_character=None,
+                  spatial_ref=""):
         """最终立绘/人物套件/场景图/用户参考 → 真实多图参考输入。
 
         含人物画面缺任何一个最终立绘都直接阻断；禁止静默退化为文字生图。
@@ -4099,10 +4222,12 @@ class Director:
         # 场景和连续性槽位，也容易让模型把不同角色的服装/脸互相混合。
         if include_sheets and len(characters or []) <= 2:
             requested_keys = tuple(sheet_keys or ("front",))
-            # 每人只用本镜最相关的一张套件；最终立绘已经承担身份锁定。
-            requested_keys = requested_keys[-1:]
             for name in characters or []:
-                for key in requested_keys:
+                per_actor_keys = tuple(
+                    (sheet_keys_by_character or {}).get(name)
+                    or requested_keys)
+                # 每人只使用第一张实际存在且质量合格的视角母资产。
+                for key in per_actor_keys:
                     row = self.assets.latest(
                         project_id, "character_sheet", f"{name}:{key}")
                     if (not row
@@ -4130,6 +4255,7 @@ class Director:
                         "name": row["name"], "label": f"{name}{label}",
                         "uri": row["uri"],
                     })
+                    break
         if location:
             row = self.assets.latest(project_id, "scene_art", location)
             if (row and formal_reference_allowed(self._asset_quality(row))
@@ -4202,30 +4328,58 @@ class Director:
                 pass
         return None
 
-    def _rich_shot_prompt(self, ctx, shot, location):
-        """构造短而分层的生产级静帧提示词。
+    SHOT_CHARACTER_FACT_KEYS = (
+        "species", "gender", "sex", "age_range", "identity", "occupation",
+        "hair", "makeup", "costume", "costume_detail", "palette",
+        "accessories", "signature_props", "temperament",
+    )
 
-        身份由最终立绘承担；文字只补充性别/年龄/身份、当镜服装、构图、
-        动作和可读文字，避免长篇人物经历与参考图争权。
+    def _shot_character_facts(self, ctx, shot):
+        """Compile only visible, current-shot actor facts.
+
+        Backstory, motivation, relationships, analysis source and full episode
+        context remain in planning documents; image providers never receive
+        them as part of a shot prompt.
         """
         project_id = ctx["project"]["id"]
+        script_profiles = {
+            item.get("name"): item
+            for item in (ctx.get("script") or {}).get("characters", [])
+            if isinstance(item, dict) and item.get("name")
+        }
+        result = {}
+        for name in shot.get("characters", []) or []:
+            merged = {
+                **(self._character_design(project_id, name) or {}),
+                **script_profiles.get(name, {}),
+                **self._locked_look_variant(project_id, name),
+            }
+            result[name] = {
+                key: copy.deepcopy(merged.get(key))
+                for key in self.SHOT_CHARACTER_FACT_KEYS
+                if merged.get(key)
+            }
+        return result
+
+    def _shot_character_visuals(self, ctx, shot, facts=None):
+        facts = facts if isinstance(facts, dict) \
+            else self._shot_character_facts(ctx, shot)
+        return {
+            name: self._design_line(
+                design, keys=self.SHOT_CHARACTER_FACT_KEYS)
+            for name, design in facts.items()
+        }
+
+    def _rich_shot_prompt(self, ctx, shot, location):
+        """构造只含当前镜头事实的可审计静帧提示词。
+
+        身份由最终立绘承担；不注入整集剧情、故事前情、人物经历、其他
+        镜头对白或整场 action，避免审计提示词与实际短合同不一致。
+        """
         title = ctx["project"].get("title", "")
         script = ctx.get("script") or {}
         world = script.get("story_world") or {}
-        background = script.get("story_background") or {}
-        analysis = (script.get("production_analysis")
-                    if isinstance(script.get("production_analysis"), dict)
-                    else {})
-        prompt_bible = (analysis.get("prompt_bible")
-                        if isinstance(analysis.get("prompt_bible"), dict)
-                        else {})
         parts = [f"【TASK】漫剧《{title}》镜头 {shot.get('shot_no', '')} 静态关键帧"]
-        master = "；".join(filter(None, (
-            str(prompt_bible.get("global_image_prefix") or "").strip(),
-            str(prompt_bible.get("keyframe_prefix") or "").strip(),
-        )))
-        if master:
-            parts.append(f"【PROMPT MASTER·制作圣经】{master}")
         world_line = "；".join(filter(None, (
             str(world.get("era_and_location") or "").strip(),
             str(world.get("hard_rules") or "").strip(),
@@ -4233,26 +4387,12 @@ class Director:
         )))
         if world_line:
             parts.append(f"【WORLD / STYLE·故事世界硬约束】{world_line}")
-        situation = "；".join(filter(None, (
-            str(background.get("current_situation") or "").strip(),
-            str(background.get("core_conflict") or "").strip(),
-        )))
-        if situation:
-            parts.append(f"【STORY CONTEXT·本集故事背景】{situation}")
-        scene = next((s for s in script.get("scenes", [])
-                      if s.get("scene_no") == shot.get("scene_no")), {})
         if location:
             parts.append(
-                f"【SCENE】{location}；空间、陈设、光线与场景基准图一致"
-                + (f"；本场情境:{str(scene.get('action')).strip()}"
-                   if str(scene.get("action") or "").strip() else "")
-                + (f"；{str(scene.get('prompt_prefix')).strip()}"
-                   if str(scene.get("prompt_prefix") or "").strip() else ""))
-        script_profiles = {
-            item.get("name"): item
-            for item in script.get("characters", [])
-            if isinstance(item, dict) and item.get("name")
-        }
+                f"【SCENE】{location}；空间、陈设、光线与场景基准图一致")
+        character_facts = self._shot_character_facts(ctx, shot)
+        character_visuals = self._shot_character_visuals(
+            ctx, shot, character_facts)
         who = []
         number_map = shot.get("character_number_map") or {}
         actor_by_name = {
@@ -4261,16 +4401,7 @@ class Director:
             if isinstance(item, dict) and item.get("name")
         }
         for pos, name in enumerate(shot.get("characters", []), 1):
-            design = {
-                **(self._character_design(project_id, name) or {}),
-                **script_profiles.get(name, {}),
-                **self._locked_look_variant(project_id, name),
-            }
-            line = self._design_line(design, keys=(
-                "gender", "age_range", "species", "identity", "occupation",
-                "hair", "makeup", "costume", "costume_detail",
-                "palette", "accessories", "temperament",
-                "costume_direction", "signature_props")) if design else ""
+            line = character_visuals.get(name, "")
             actor_id = actor_by_name.get(name) or f"P{pos:02d}"
             who.append(
                 f"{actor_id}={name}（{line or '人物身份以最终立绘为准'}；"
@@ -4286,6 +4417,20 @@ class Director:
             parts.append(
                 "【IDENTITY LOCK】严格 0 人空镜；禁止人物、人体局部、"
                 "剪影、倒影中的人或随机路人")
+        composition = (
+            shot.get("composition_contract")
+            if isinstance(shot.get("composition_contract"), dict)
+            else build_composition_contract(shot))
+        if composition.get("composition_type") == "over_shoulder_dialogue":
+            duties = "；".join(
+                f"{item.get('character')}={item.get('role')}/"
+                f"{item.get('expected_view')}"
+                for item in composition.get("actors") or [])
+            parts.append(
+                "【OVER-SHOULDER COMPOSITION】"
+                f"正面主体{composition.get('expected_primary_count', 1)}人，"
+                f"实际可见人形{composition.get('expected_visible_figure_count', len(who))}人；"
+                f"{duties}；{composition.get('count_rule', '')}")
         start_state = shot.get("start_state") or {}
         if start_state:
             parts.append("【START STATE】" + "；".join(
@@ -4324,7 +4469,7 @@ class Director:
             parts.append(
                 "【SPATIAL RELATION·人物关系线】" + "；".join(lines))
         readable = shot.get("readable_text") or {}
-        if readable.get("required"):
+        if readable_text_required(readable):
             whitelist = "、".join(readable.get("whitelist") or [])
             parts.append(
                 f"【TEXT LOCK】文字载体={readable.get('carrier') or '指定载体'}；"
@@ -4340,9 +4485,6 @@ class Director:
         parts.append(
             "【NEGATIVE】禁止身份漂移、性别错误、人数错误、脸部融合、"
             "重复人物、错误服装、无关杂物、脏污皮肤、塑料脸、字幕和标签")
-        if prompt_bible.get("negative_prompt"):
-            parts.append(
-                f"【PROJECT NEGATIVE】{prompt_bible['negative_prompt']}")
         return "\n".join(p for p in parts if p)
 
     def _shot_payload(self, ctx, shot, *, continuity_anchor=False,
@@ -4355,7 +4497,7 @@ class Director:
                        self.config, ctx.get("production_standard")))
         spatial = shot_blocking(ctx.get("blocking"), shot["shot_no"])
         readable_text = shot.get("readable_text", {}) or {}
-        text_required = bool(readable_text.get("required"))
+        text_required = readable_text_required(readable_text)
         quality = resolve_image_quality(
             recommend_shot_image_quality(
                 shot, continuity_anchor=continuity_anchor),
@@ -4380,29 +4522,20 @@ class Director:
             name for name in shot["characters"]
             if name not in identity_characters
             and not is_background_character(script_characters.get(name, {})))
-        character_background = {
-            name: {
-                **script_characters.get(name, {}),
-                **(self._reference_safe_design(
-                    self._character_design(
-                        ctx["project"]["id"], name)) or {}),
-                **self._locked_look_variant(
-                    ctx["project"]["id"], name),
-            }
-            for name in shot.get("characters", [])
-        }
+        character_background = self._shot_character_facts(ctx, shot)
+        character_visuals = self._shot_character_visuals(
+            ctx, shot, character_background)
+        composition_contract = build_composition_contract(shot)
         payload = {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
             "prompt": self._rich_shot_prompt(ctx, shot, location),
             "seedance_prompt": shot.get("seedance_prompt", shot["prompt"]),
             "characters": shot["characters"],
+            "character_number_map": shot.get("character_number_map", {}),
             "identity_characters": identity_characters,
             "character_background": character_background,
-            "story_world": (ctx.get("script") or {}).get(
-                "story_world", {}),
-            "story_background": (ctx.get("script") or {}).get(
-                "story_background", {}),
+            "character_visuals": character_visuals,
             "character_count": shot.get(
                 "character_count", len(shot["characters"])),
             "location": location,
@@ -4420,17 +4553,24 @@ class Director:
             "quality_decision": quality,
             "performance": shot.get("performance", {}),
             "shot_contract": shot.get("shot_contract", {}),
+            "composition_contract": composition_contract,
             "sound_design": shot.get("sound_design", {}),
             "spatial_blocking": spatial or {},
             "spatial_constraint": (spatial or {}).get("constraint", ""),
             "standard_fingerprint": profile.get("standard_fingerprint", ""),
             "forbid_subtitles": not profile["burn_subtitles"],
             "style": ctx["project"]["style"] or "",
+            # The shot contract below is the complete provider instruction.
+            # Providers must not append biography or episode-level context.
+            "prompt_contract_complete": True,
             "aspect": ctx["aspect"], **ctx["dims"],
             **self._art_refs(
                 ctx, identity_characters, location,
                 shot_no=shot["shot_no"],
                 sheet_keys=self._shot_reference_sheet_keys(shot),
+                sheet_keys_by_character=(
+                    self._shot_reference_sheet_keys_by_character(
+                        shot, composition_contract)),
                 spatial_ref=(
                     (spatial or {}).get("spatial_reference_uri", "")
                     if requires_spatial_reference(spatial or {}) else "")),
@@ -4460,7 +4600,10 @@ class Director:
         # payload['prompt'] 供人工审计，避免故事背景、全局风格与参考图
         # 在模型输入里重复争权。
         contract, compact = compile_shot_prompt(
-            shot, location=location, style=payload.get("style", ""),
+            {**shot,
+             "character_visuals": character_visuals,
+             "composition_contract": composition_contract},
+            location=location, style=payload.get("style", ""),
             references=payload.get("reference_manifest"), mode="image")
         payload["prompt_contract"] = contract
         payload["prompt_compact"] = compact
@@ -4521,9 +4664,22 @@ class Director:
             elif sheet in (
                     "features", "makeup", "closeup",
                     "front", "profile", "back"):
-                binding = (
-                    f"只补充{who or '对应人物'}的五官/妆容局部细节；"
-                    "身份仍以最终立绘为准，不复制服装、姿势或背景")
+                if sheet == "back":
+                    binding = (
+                        f"只补充{who or '对应人物'}的后脑与发型背部轮廓、"
+                        "肩背体型、服装背片/接缝、配饰和道具位置；背面不可见"
+                        "五官时不得要求核脸；身份仍以最终立绘为准，不复制"
+                        "姿势或背景")
+                elif sheet == "profile":
+                    binding = (
+                        f"只补充{who or '对应人物'}的侧脸外轮廓、发型侧面"
+                        "轮廓、服装、体型、配饰和道具位置；看不见的正面五官"
+                        "不得作为失败理由；身份仍以最终立绘为准")
+                else:
+                    binding = (
+                        f"只补充{who or '对应人物'}的正脸五官、脸型、年龄感、"
+                        "发型和妆容细节；身份仍以最终立绘为准，不复制服装、"
+                        "姿势或背景")
                 role = "identity_detail"
             elif sheet == "turnaround":
                 binding = (
@@ -4630,18 +4786,15 @@ class Director:
         manifest = self._reference_manifest(payload)
         payload["reference_manifest"] = manifest
         payload["prompt"] = base_prompt
-        if not manifest:
-            payload.pop("prompt_contract", None)
-            payload.pop("prompt_compact", None)
-            return
-        lines = [f"图{entry['index']}={entry['label']}:{entry['binding']}"
-                 for entry in manifest]
-        payload["prompt"] = (
-            base_prompt.rstrip("。")
-            + f"。参考图对照表(共{len(manifest)}张,按此顺序提交,"
-            "每张图只允许执行其绑定用途；禁止跨用途传播、张冠李戴、"
-            "把一个人的脸/服装/姿势/背景复制给另一个人):"
-            + ";".join(lines))
+        if manifest:
+            lines = [f"图{entry['index']}={entry['label']}:{entry['binding']}"
+                     for entry in manifest]
+            payload["prompt"] = (
+                base_prompt.rstrip("。")
+                + f"。参考图对照表(共{len(manifest)}张,按此顺序提交,"
+                "每张图只允许执行其绑定用途；禁止跨用途传播、张冠李戴、"
+                "把一个人的脸/服装/姿势/背景复制给另一个人):"
+                + ";".join(lines))
         # QC 定向重画、人工换参考图会再次进入这里；同步刷新实际发送的
         # 短合同，避免新加入的“待修改基底”仍被旧提示词遮蔽。
         if ("shot_no" in payload and not payload.get("portrait")
@@ -4653,6 +4806,13 @@ class Director:
                 mode="image")
             payload["prompt_contract"] = contract
             payload["prompt_compact"] = compact
+        else:
+            # 人物/场景资产也只把未附表的视觉合同交给 Provider。
+            # 参考图及绑定职责由 manifest/真实上传通道单独传递；若继续把
+            # 同一对照表塞进 prompt，Codex/Seedream 桥还会再展开一次，
+            # 造成重复、超长并削弱真正的资产要求。
+            payload.pop("prompt_contract", None)
+            payload["prompt_compact"] = base_prompt
 
     def _stage_images(self, ctx):
         self._plan_seed_shots(ctx)
@@ -4703,8 +4863,10 @@ class Director:
                     expected_characters=payload.get("characters", []),
                     expected_count=payload.get("character_count"),
                     character_background=payload.get(
-                        "character_background", {})),
-                    "camera": payload.get("camera", "")}})
+                        "character_background", {}),
+                    camera=payload.get("camera", ""),
+                    composition_contract=payload.get(
+                        "composition_contract"))}})
         results = self._run_parallel(ctx, tasks, line="分镜画面")
         for shot_no in sorted(results):
             result = results[shot_no]
@@ -5400,7 +5562,7 @@ class Director:
         spatial = shot_blocking(ctx.get("blocking"), shot["shot_no"]) or {}
         spatial_rule = str(spatial.get("constraint") or "").strip()
         readable = shot.get("readable_text") or {}
-        if readable.get("required"):
+        if readable_text_required(readable):
             text_rule = (
                 "首帧已有文字只做像素级保持，不新增、不改写、不重排；"
                 "视频模型不得从零生成文字")
@@ -6699,6 +6861,7 @@ class Director:
                     "art_name": name, "role": role,
                     "shot_no": 0, "characters": [name], "location": "",
                     "prompt": prompt, "style": style,
+                    "prompt_contract_complete": True,
                     "feedback": feedback,
                     "revision": next_revision("character_sheet", raw),
                     "character_refs": (
@@ -6748,6 +6911,7 @@ class Director:
                     "action": scene.get("action", ""),
                     "prompt": prompt,
                     "style": style, "feedback": feedback,
+                    "prompt_contract_complete": True,
                     "revision": next_revision("scene_art", name),
                     **reference_payload,
                     "style_ref": style_ref,
@@ -7459,8 +7623,10 @@ class Director:
                     expected_characters=payload.get("characters", []),
                     expected_count=payload.get("character_count"),
                     character_background=payload.get(
-                        "character_background", {}))
-                spec["camera"] = payload.get("camera", "")
+                        "character_background", {}),
+                    camera=payload.get("camera", ""),
+                    composition_contract=payload.get(
+                        "composition_contract"))
             else:
                 spec = self._qc_spec(project_id, [], forbid=self._FORBID)
         # 首尾帧:首帧 + 尾帧两张都要检,任一不符即整组不合格
