@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -96,7 +97,26 @@ class CliProvider(Provider):
         return True, ""
 
     def generate(self, capability, payload, out_dir, cancel=None):
-        command = self.conf["command"]
+        command = list(self.conf["command"])
+        profile_id = ""
+        profile = None
+        if self.name == "codex":
+            profile_id = str(payload.get("_codex_profile") or "").strip()
+            profiles = self.conf.get("codex_profiles") or []
+            profile = next((item for index, item in enumerate(profiles)
+                            if isinstance(item, dict)
+                            and str(item.get("id") or (
+                                "codex_a" if index == 0
+                                else f"codex_{index + 1}")) == profile_id),
+                           None) if profile_id else None
+            if profile is not None and profile.get("command"):
+                command = list(profile["command"])
+            # 设置页允许只填写 `codex` 或一个绝对路径；这仍需经过
+            # AIFOS 桥接协议，不能把 JSON 请求直接喂给 Codex 交互 CLI。
+            if len(command) == 1:
+                command = [sys.executable, "-m",
+                           "aifos.adapters.codex_image", "--codex",
+                           command[0]]
         request = json.dumps(
             {"capability": capability, "payload": payload,
              "out_dir": str(out_dir)},
@@ -106,15 +126,8 @@ class CliProvider(Provider):
         # 独立登录态。只允许导演层传入已配置 profile id，避免任意任务
         # 通过 payload 注入外部环境变量或凭据路径。
         if self.name == "codex":
-            profile_id = str(payload.get("_codex_profile") or "").strip()
             if profile_id:
                 profiles = self.conf.get("codex_profiles") or []
-                profile = next((item for index, item in enumerate(profiles)
-                                if isinstance(item, dict)
-                                and str(item.get("id") or (
-                                    "codex_a" if index == 0
-                                    else f"codex_{index + 1}")) == profile_id),
-                               None)
                 if profile is None:
                     raise ProviderError(
                         f"Codex profile 不存在或未配置: {profile_id}")
