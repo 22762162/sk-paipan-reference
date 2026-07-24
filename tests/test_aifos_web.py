@@ -63,8 +63,8 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260724-novel-auto-style" in html
-    assert "/static/app.js?v=20260724-novel-auto-style" in html
+    assert "/static/style.css?v=20260724-production-progress-2" in html
+    assert "/static/app.js?v=20260724-production-progress-2" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -230,7 +230,7 @@ def test_index_and_static(server):
         "192x192", "512x512"}
     status, ctype, raw = _request(server["port"], "GET", "/sw.js")
     assert status == 200 and "javascript" in ctype
-    assert b"aifos-mobile-shell-v4" in raw
+    assert b"aifos-mobile-shell-v5" in raw
     assert b'/static/app.js' in raw and b'fetch(request)' in raw
 
 
@@ -423,6 +423,8 @@ def test_episode_production_progress_uses_verified_formal_assets(server):
     assert shots["awaiting_human"] == 1
     assert shots["percent"] == 25.0
     assert progress["overall"]["running"] is True
+    assert progress["overall"]["current_stage"] == "images"
+    assert progress["overall"]["current_stage_label"] == "批量关键帧"
     assert progress["overall"]["parallelism"]["image"] == {
         "active": 1, "limit": 3}
     assert progress["overall"]["parallelism"]["video"] == {

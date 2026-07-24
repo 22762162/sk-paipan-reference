@@ -3364,9 +3364,19 @@ function productionProgressModel(data) {
   const active = explicitRunning != null
     ? ![false, 0, "0", "false", "idle", "stopped"].includes(explicitRunning)
     : progressStatus === "running" || !!runningTask || !stableEpisode;
-  const stage = overall.current_stage || overall.stage || payload.current_stage
+  const reportedStage = overall.current_stage || overall.stage || payload.current_stage
     || payload.stage || runningTask?.stage
     || (active ? episodeStatus : "");
+  const activeStage = activeItems[0]?.category || "";
+  const stage = active && activeStage
+    && ["failed", "qc_failed", "awaiting_confirm", "production"].includes(reportedStage)
+    ? activeStage : reportedStage;
+  const reportedStageLabel = overall.current_stage_label || overall.stage_label
+    || payload.current_stage_label || payload.stage_label || "";
+  const stageLabel = active && activeStage
+    && ["failed", "qc_failed", "awaiting_confirm", "production"].includes(reportedStage)
+    ? `${PLAN_CAT_CN[activeStage] || STAGE_CN[activeStage] || activeStage}生产`
+    : reportedStageLabel || STAGE_CN[stage] || STATUS_CN[stage] || stage || "准备中";
   const categoryRows = Array.isArray(payload.categories)
     ? payload.categories : Object.entries(payload.categories || {}).map(
       ([key, value]) => ({ key, ...(value || {}) }));
@@ -3439,11 +3449,7 @@ function productionProgressModel(data) {
     active: active && !["completed", "done", "idle", "stopped"].includes(progressStatus),
     stopping: episodeStatus === "cancelling" || progressStatus === "cancelling",
     stage,
-    stageLabel: active
-      ? overall.current_stage_label || overall.stage_label
-        || payload.current_stage_label || payload.stage_label
-        || STAGE_CN[stage] || STATUS_CN[stage] || stage || "准备中"
-      : "无生产阶段",
+    stageLabel: active ? stageLabel : "无生产阶段",
     parallelism, activeCount, activeItems, categories, total, completed,
     pending: productionProgressNumber(overall.pending, payload.pending,
       Math.max(0, total - completed)),

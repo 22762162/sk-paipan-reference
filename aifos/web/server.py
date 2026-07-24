@@ -619,7 +619,7 @@ def _production_progress(app, episode, render_plan):
         "WHERE episode_id=? AND status='running' "
         "ORDER BY id DESC LIMIT 1", (episode_id,))
     running_run = app.db.query_one(
-        "SELECT id FROM production_runs WHERE episode_id=? "
+        "SELECT id, action FROM production_runs WHERE episode_id=? "
         "AND status IN ('running', 'cancelling') "
         "ORDER BY id DESC LIMIT 1", (episode_id,))
     live_run = running_task is not None or running_run is not None
@@ -798,12 +798,24 @@ def _production_progress(app, episode, render_plan):
     overall["percent"] = round(
         overall["usable"] * 100 / overall["total"], 1
     ) if overall["total"] else 0
-    current_stage = (
-        str(running_task["stage"]) if running_task is not None
-        else str(episode["status"] or ""))
-    current_stage_label = (
-        str(running_task["name"]) if running_task is not None
-        else current_stage)
+    if running_task is not None:
+        current_stage = str(running_task["stage"])
+        current_stage_label = str(running_task["name"])
+    elif active_items:
+        current_stage = str(active_items[0]["category"])
+        current_stage_label = (
+            f"{active_items[0]['category_label']}生产")
+    elif running_run is not None:
+        current_stage = str(running_run["action"] or "production")
+        current_stage_label = {
+            "regen_image": "图片定向修改",
+            "redo_items": "批量补画",
+            "video_regen": "视频定向修改",
+            "produce": "继续制作",
+        }.get(current_stage, "生产任务")
+    else:
+        current_stage = str(episode["status"] or "")
+        current_stage_label = current_stage
     def parallel_limit(key, default):
         try:
             value = int(app.config.get("defaults", key, default=default))
