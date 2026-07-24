@@ -15,7 +15,11 @@ from pathlib import Path
 from .adapters.claude_script import (is_background_role,
                                      validate_script_bible)
 from .quality_policy import default_quality_policy, resolve_video_quality
-from .prompt_contract import compile_shot_prompt, readable_text_required
+from .prompt_contract import (
+    build_physical_contract,
+    compile_shot_prompt,
+    readable_text_required,
+)
 
 from .spatial_blocking import (
     build_character_number_map,
@@ -90,7 +94,7 @@ def production_profile(config, standard=None):
                 "text_lock_provider", "ChatGPT关键帧")),
         "prompt_contract": copy.deepcopy(
             production.get("prompt_contract") or {
-                "schema": "aifos.shot-prompt/v1",
+                "schema": "aifos.shot-prompt/v2",
                 "compact_prompt_sent_to_model": True,
                 "full_prompt_kept_for_audit": True,
             }),
@@ -729,6 +733,13 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             "视觉钩子": visual_hook,
             "镜头功能": SHOT_FUNCTIONS.get(kind, "信息交代"),
         }
+        physical_contract = build_physical_contract({
+            **raw,
+            "description": raw.get("description", ""),
+            "action": raw.get("description", ""),
+            "shot_contract": shot_contract,
+            "readable_text": text_asset,
+        })
         shot = {
             **raw,
             "shot_no": index,
@@ -762,6 +773,7 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             } if dialogue else None),
             "sound_design": sound_design,
             "shot_contract": shot_contract,
+            "physical_contract": physical_contract,
             "five_dimensions": {
                 "subject_motion": raw.get("description") or "主体保持明确动势",
                 "environment_light": f"{scene.get('location', '')}参与叙事，主光方向稳定",

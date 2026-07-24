@@ -320,6 +320,14 @@ def build_instruction(capability, payload, out_dir):
             f"实际可见人形={composition.get('expected_visible_figure_count')};"
             f"{actor_rules};{composition.get('count_rule', '')}"
             if composition else "标准构图；按待检图实际可见视角逐人核验")
+        physical = payload.get("physical_contract") or {}
+        physical_rules = "；".join(physical.get("rules") or [])
+        physical_objects = "；".join(physical.get("objects") or [])
+        physical_line = (
+            ("必须执行硬检查；" if payload.get("physical_logic_required")
+             else "仅作辅助检查；")
+            + (physical_rules or "人物、镜头、道具关系按当前镜头实际构图核对")
+            + (f"；对象关系：{physical_objects}" if physical_objects else ""))
         count_rule = (
             "本图为同一角色的多视角/局部设定图(四视图/特写/服装细节等):"
             "画面中出现的每个人形、头像或局部都必须是该角色同一人,"
@@ -362,6 +370,10 @@ def build_instruction(capability, payload, out_dir):
             f"- 场景:{payload.get('location', '按提示词')};"
             f"动作:{payload.get('action', '按提示词')};"
             f"镜头景别:{payload.get('camera', '不限')}\n"
+            f"- 物理/空间逻辑硬检查:{physical_line}\n"
+            "必须核对人物、镜头、道具的前后左右关系、朝向、视线、接触点、重力支撑和动作可达性；"
+            "电脑/手机/屏幕等设备必须按真实使用方向成立，屏幕正面、键盘/手部和使用者关系不能反向。"
+            "发现任何物理或空间关系不成立，pass 必须为 false，并在 issues 指出具体对象和位置。\n"
             f"- 不允许出现:{forbid}、字幕条、乱码文字、多余或缺失的人物\n"
             "- 当前检查对象是静态关键帧：只检查图中可见的最终状态。不得因为"
             "单张图无法证明运镜、眼神变化过程、呼吸等时间动作而判失败；景别"
@@ -374,6 +386,8 @@ def build_instruction(capability, payload, out_dir):
             '"basis":["实际核验项"],"checked":true或false,"match":true或false}], '
             '"gender_checked": true或false, "gender_match": true或false, '
             '"count_checked": true或false, "count_match": true或false, '
+            '"physical_logic_checked": true或false, "physical_logic_match": true或false, '
+            '"spatial_logic_checked": true或false, "spatial_logic_match": true或false, '
             '"detected_count": 画面实际人数整数, '
             '"issues": ["每条一句具体原因"]}'
         )

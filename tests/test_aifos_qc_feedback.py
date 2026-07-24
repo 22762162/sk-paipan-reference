@@ -48,3 +48,13 @@ def test_blank_laptop_screen_gets_explicit_readable_page_repair():
     assert "TEXT ASSET HARD GATE" in result["text"]
     assert "明季北略、崇祯" in result["text"]
     assert "禁止空白冷白屏" in result["text"]
+
+
+def test_physical_logic_feedback_preserves_shot_boundary():
+    result = optimize_qc_feedback(
+        ["人物坐在笔记本屏幕后方却看到屏幕正面，电脑使用方向反了"],
+        mode="image",
+    )
+    assert result["categories"] == ["physics"]
+    assert "电脑/手机屏幕" in result["text"]
+    assert "同一空间坐标" in result["text"]
