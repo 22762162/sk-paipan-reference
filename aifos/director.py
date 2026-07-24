@@ -5019,8 +5019,29 @@ class Director:
                     "uri": row["uri"],
                 })
         matched_rows = (self._matching_produced_image_rows(
-            project_id, characters, location, shot_no=shot_no, limit=1)
+            project_id, characters, location, shot_no=shot_no, limit=3)
             if shot_no is not None else [])
+        # 只允许当前分镜合同下已经通过视觉质检的镜头图充当连续性参考。
+        # 分镜重排后旧图片仍保存在资产历史中；如果仅按“同人物/同场景”
+        # 选图，旧合同里画错的人物会重新污染本轮返工。
+        plan = self._plan_read(ctx) if ctx.get("out_root") else {"items": []}
+        current_shot_items = [
+            item for item in plan.get("items", [])
+            if item.get("category") == "shot_image"]
+        if current_shot_items:
+            passed_shots = {
+                int(item["shot_no"])
+                for item in current_shot_items
+                if item.get("shot_no") is not None
+                and item.get("status") in ("done", "reused")
+                and (item.get("qc") or {}).get("passed") is True
+                and not (item.get("qc") or {}).get("stale")
+            }
+            matched_rows = [
+                row for row in matched_rows
+                if int((self._asset_meta(row).get("shot_no") or -1))
+                in passed_shots]
+        matched_rows = matched_rows[:1]
         matched = []
         for row in matched_rows:
             if not remember(row["uri"]):
@@ -9517,7 +9538,7 @@ class Director:
             project, episode, ctx, item, report)
         return report
 
-    def _qc_one(self, project, episode, ctx, item):
+    def _qc_one(self, project, episode, ctx, item, codex_profile=""):
         project_id = project["id"]
         payload = {}
         uri, spec = self._plan_item_asset(
@@ -9613,6 +9634,7 @@ class Director:
                         "generation_prompt": generation_input["prompt"],
                         "reference_manifest": generation_input[
                             "reference_manifest"],
+                        "_codex_profile": str(codex_profile or ""),
                     }, ctx["out_root"],
                     cancel=lambda: self._cancel_requested(ctx))
                 cost += result.cost
@@ -9764,17 +9786,199 @@ class Director:
             and not current.get("passed"))
         return current, repaired
 
-    def qc_all(self, project_title, episode_number):
-        """批量质检:对清单里所有已生成的图逐张核对,可暂停。"""
+    def _qc_all_current_contract_parallel(
+            self, project, episode, ctx, items, previous_status,
+            progress=None):
+        """用独立 Codex 登录态并行复检旧图，但不在检查阶段直接重画。"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        profiles = self._codex_parallel_profiles()
+        workers = min(
+            max(1, self._parallel_workers()),
+            len(profiles) if profiles else 1,
+            max(1, len(items)))
+        prepared = []
+        for item in items:
+            uri, _ = self._plan_item_asset(
+                project["id"], episode["number"], item)
+            if not uri:
+                continue
+            old_qc = item.get("qc") or {}
+            stale_qc = {
+                "passed": False,
+                "stale": True,
+                "stale_reason": "current_storyboard_contract_recheck",
+                "issues": ["分镜合同已更新，旧图正在按当前人物、人数和空间图重新质检"],
+                "previous_passed": old_qc.get("passed"),
+                "previous_signature": old_qc.get("signature", ""),
+            }
+            self._plan_mark(
+                ctx, item["id"], "retrying",
+                extra={"qc": stale_qc, "output_uri": uri,
+                       "contract_recheck": True})
+            prepared.append(item["id"])
+        if progress:
+            progress(
+                phase="checking", total=len(prepared), completed=0,
+                checked=0, passed=0, failed=0,
+                parallelism=workers,
+                note=f"按当前分镜合同复检；Codex {workers} 路并行")
+
+        def run_one(index, item_id):
+            from .app import App
+            worker_app = App(self.artifacts_root.parent)
+            director = worker_app.director
+            worker_project, worker_episode = director._episode_ctx(
+                project["title"], episode["number"])
+            worker_ctx = {
+                "project": dict(worker_project),
+                "episode": dict(worker_episode),
+                "out_root": director._episode_dir(
+                    worker_project, worker_episode),
+            }
+            current = next((
+                value for value in director._plan_read(worker_ctx)["items"]
+                if value["id"] == item_id), None)
+            if current is None:
+                worker_app.close()
+                return {"item_id": item_id, "error": "清单条目已不存在"}
+            profile_id = (
+                profiles[index % len(profiles)]["id"] if profiles else "")
+            try:
+                report = director._qc_one(
+                    worker_project, worker_episode, worker_ctx, current,
+                    codex_profile=profile_id)
+                report = dict(report)
+                report["stale"] = False
+                report["contract_recheck"] = True
+                report["codex_profile"] = profile_id
+                director._plan_mark(
+                    worker_ctx, item_id,
+                    "done" if report.get("passed") else "awaiting_human",
+                    extra={"qc": report, "contract_recheck": True})
+                result = {
+                    "item_id": item_id,
+                    "passed": bool(report.get("passed")),
+                    "report": report,
+                    "codex_profile": profile_id,
+                }
+            except AifosError as exc:
+                report = {
+                    "passed": False, "stale": False,
+                    "contract_recheck": True,
+                    "codex_profile": profile_id,
+                    "issues": [f"复检失败:{exc}"],
+                }
+                director._plan_mark(
+                    worker_ctx, item_id, "awaiting_human",
+                    error=str(exc)[:300], extra={"qc": report})
+                result = {
+                    "item_id": item_id, "passed": False,
+                    "report": report, "error": str(exc),
+                    "codex_profile": profile_id,
+                }
+            except Exception as exc:  # 单张异常不得中止其余镜头复检
+                report = {
+                    "passed": False, "stale": False,
+                    "contract_recheck": True,
+                    "codex_profile": profile_id,
+                    "issues": [f"复检异常:{exc}"],
+                }
+                director._plan_mark(
+                    worker_ctx, item_id, "awaiting_human",
+                    error=str(exc)[:300], extra={"qc": report})
+                result = {
+                    "item_id": item_id, "passed": False,
+                    "report": report, "error": str(exc),
+                    "codex_profile": profile_id,
+                }
+            finally:
+                worker_app.close()
+            return result
+
+        checked = passed = failed = 0
+        failed_item_ids = []
+        if workers == 1:
+            results = [
+                run_one(index, item_id)
+                for index, item_id in enumerate(prepared)]
+            iterator = results
+        else:
+            pool = ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="aifos-qc")
+            futures = {
+                pool.submit(run_one, index, item_id): item_id
+                for index, item_id in enumerate(prepared)}
+            iterator = (future.result()
+                        for future in as_completed(futures))
+        try:
+            for result in iterator:
+                checked += 1
+                if result.get("passed"):
+                    passed += 1
+                else:
+                    failed += 1
+                    failed_item_ids.append(result["item_id"])
+                if progress:
+                    progress(
+                        phase="checking", total=len(prepared),
+                        completed=checked, checked=checked, passed=passed,
+                        failed=failed, parallelism=workers,
+                        current_item=result.get("item_id", ""),
+                        codex_profile=result.get("codex_profile", ""))
+        finally:
+            if workers > 1:
+                pool.shutdown(wait=True)
+            row = self.projects.get_episode(episode["id"])
+            if row and row["status"] in ("cast", "cancelling"):
+                self.projects.set_episode_status(
+                    episode["id"], previous_status)
+        self.log.info(
+            "director",
+            f"当前分镜合同复检完成:{checked} 张,通过 {passed},"
+            f"未过 {failed};Codex {workers} 路")
+        return {
+            "status": "done", "checked": checked, "passed": passed,
+            "failed": failed, "failed_item_ids": sorted(
+                failed_item_ids,
+                key=lambda value: int(value.split(":")[-1])),
+            "auto_repaired": 0, "parallelism": workers,
+            "contract_recheck": True,
+        }
+
+    def qc_all(self, project_title, episode_number, *,
+               include_existing=False, auto_repair=True, parallel=False,
+               progress=None, categories=None):
+        """批量质检。
+
+        include_existing=True 时，当前清单虽为 pending、但磁盘已有旧图的
+        镜头也必须重新检查；auto_repair=False 可先得到完整失败清单，再
+        交给双 Codex 通道只重画失败项。
+        """
         project, episode = self._episode_ctx(project_title, episode_number)
         ctx = {"project": dict(project), "episode": dict(episode),
                "out_root": self._episode_dir(project, episode)}
         plan = self._plan_read(ctx)
-        items = [i for i in plan["items"]
-                 if i.get("status") in ("done", "reused")
-                 and i.get("category") in self.SHOT_QC_CATEGORIES]
+        allowed_categories = set(categories or self.SHOT_QC_CATEGORIES)
+        allowed_categories &= self.SHOT_QC_CATEGORIES
+        items = []
+        for item in plan["items"]:
+            if item.get("category") not in allowed_categories:
+                continue
+            if item.get("status") in ("done", "reused"):
+                items.append(item)
+                continue
+            if include_existing:
+                uri, _ = self._plan_item_asset(
+                    project["id"], episode["number"], item)
+                if uri:
+                    items.append(item)
         previous_status = episode["status"]
         self.projects.set_episode_status(episode["id"], "cast")
+        if include_existing and parallel and not auto_repair:
+            return self._qc_all_current_contract_parallel(
+                project, episode, ctx, items, previous_status,
+                progress=progress)
         checked = passed = failed = 0
         auto_repaired = 0
         try:
@@ -9783,9 +9987,15 @@ class Director:
                     raise ProduceCancelled("已手动暂停质检")
                 try:
                     report = self._qc_one(project, episode, ctx, item)
-                    report, repaired = self._auto_repair_qc_item(
-                        project, episode, ctx, item, report)
-                    auto_repaired += repaired
+                    if auto_repair:
+                        report, repaired = self._auto_repair_qc_item(
+                            project, episode, ctx, item, report)
+                        auto_repaired += repaired
+                    self._plan_mark(
+                        ctx, item["id"],
+                        "done" if report.get("passed") else "awaiting_human",
+                        extra={"qc": report,
+                               "contract_recheck": bool(include_existing)})
                 except AifosError as exc:
                     self.log.warn("director",
                                   f"质检 {item['id']} 跳过: {exc}")
@@ -9923,8 +10133,14 @@ class Director:
                 shot_no = target.get("shot_no")
                 scene_no = scene_by_shot.get(int(shot_no)) \
                     if shot_no is not None else None
-                lock_key = ("scene", scene_no) if scene_no is not None \
-                    else ("item", item_id)
+                # 关键帧彼此是独立静态资产，均使用已锁定人物、当前空间图
+                # 和已通过参考图，可以让 A/B 在同一场景真正并行。只有
+                # 首尾帧存在“上一镜尾帧→下一镜首帧”的硬依赖，仍按场锁串行。
+                lock_key = (
+                    ("scene", scene_no)
+                    if item.get("category") == "frames"
+                    and scene_no is not None
+                    else ("item", item_id))
                 scene_lock = scene_locks.setdefault(
                     lock_key, threading.Lock())
                 worker_app = None

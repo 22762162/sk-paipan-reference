@@ -1074,17 +1074,55 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
 
     keyframes = stage_from_category("shot_image", "关键帧")
     frames = stage_from_category("frames", "首尾帧")
+    usable_keyframe_shots = set()
+    usable_frame_shots = set()
     if shot_numbers:
-        expected_names = {
-            f"e{episode_number:03d}_shot{shot_no:03d}"
-            for shot_no in shot_numbers
+        plan_by_stage_and_shot = {
+            (str(item.get("category")), int(item["shot_no"])): item
+            for item in plan_items
+            if item.get("category") in ("shot_image", "frames")
+            and item.get("shot_no") is not None
         }
-        keyframes["usable"] = len(
-            expected_names & asset_names.get("image", set()))
-        frames["usable"] = len(
-            expected_names
-            & asset_names.get("first_frame", set())
-            & asset_names.get("last_frame", set()))
+
+        def current_contract_passed(category, shot_no):
+            item = plan_by_stage_and_shot.get((category, int(shot_no)))
+            if not item or item.get("status") not in ("done", "reused"):
+                return False
+            qc = item.get("qc") or {}
+            if not qc:
+                # 兼容明确关闭图片 QC 的历史项目；一旦条目标记过期或进入
+                # 当前合同重检，就绝不能再靠旧资产文件存在直接放行。
+                return not (
+                    item.get("invalidated_previous_output")
+                    or item.get("contract_recheck"))
+            if qc.get("passed") is not True or qc.get("stale"):
+                return False
+            # 新版人物/物理/空间门禁缺一项都不算当前合同正式通过。
+            required = (
+                "identity_checked", "identity_match",
+                "gender_checked", "gender_match",
+                "count_checked", "count_match",
+                "physical_logic_checked", "physical_logic_match",
+                "spatial_logic_checked", "spatial_logic_match",
+            )
+            return all(qc.get(field) is True for field in required)
+
+        usable_keyframe_shots = {
+            shot_no for shot_no in shot_numbers
+            if current_contract_passed("shot_image", shot_no)
+            and f"e{episode_number:03d}_shot{shot_no:03d}"
+            in asset_names.get("image", set())
+        }
+        usable_frame_shots = {
+            shot_no for shot_no in shot_numbers
+            if current_contract_passed("frames", shot_no)
+            and f"e{episode_number:03d}_shot{shot_no:03d}"
+            in asset_names.get("first_frame", set())
+            and f"e{episode_number:03d}_shot{shot_no:03d}"
+            in asset_names.get("last_frame", set())
+        }
+        keyframes["usable"] = len(usable_keyframe_shots)
+        frames["usable"] = len(usable_frame_shots)
         for stage in (keyframes, frames):
             stage["remaining"] = max(0, stage["total"] - stage["usable"])
             stage["percent"] = round(
@@ -1157,15 +1195,15 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
         except (KeyError, TypeError, ValueError):
             continue
         planned_shots.add(shot_no)
-        asset_name = f"e{episode_number:03d}_shot{shot_no:03d}"
-        if asset_name in keyframe_assets:
+        if shot_no in usable_keyframe_shots:
             continue
         status = str(item.get("status") or "pending")
-        if status in ("awaiting_human", "failed"):
+        qc = item.get("qc") or {}
+        if status in ("awaiting_human", "failed") \
+                or qc.get("passed") is False:
             issue_shots.append(shot_no)
             item_id = str(item.get("id") or f"shot:{shot_no}")
             issue_item_ids.append(item_id)
-            qc = item.get("qc") or {}
             hard_failure = qc.get("hard_failure") is not False
             issue_details.append({
                 "item_id": item_id,
@@ -1184,8 +1222,7 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
             pending_item_ids.append(str(
                 item.get("id") or f"shot:{shot_no}"))
     for shot_no in sorted(shot_numbers - planned_shots):
-        asset_name = f"e{episode_number:03d}_shot{shot_no:03d}"
-        if asset_name not in keyframe_assets:
+        if shot_no not in usable_keyframe_shots:
             pending_shots.append(shot_no)
             pending_item_ids.append(f"shot:{shot_no}")
     pending_shots = sorted(set(pending_shots))
@@ -3132,10 +3169,30 @@ def make_handler(workspace, jobs):
             if found is None:
                 return self._error(404, "剧集不存在")
             title, number = found
+            include_existing = bool(body.get("include_existing"))
+            auto_repair = bool(body.get("auto_repair", True))
+            parallel = bool(body.get("parallel"))
+            categories = body.get("categories")
+            if categories is not None and not isinstance(categories, list):
+                return self._error(400, "categories 必须是数组")
             job_id = jobs.start_task(
                 title, number,
-                lambda app, run_id: app.director.qc_all(title, number),
-                action="qc_all")
+                lambda app, run_id, report: app.director.qc_all(
+                    title, number,
+                    include_existing=include_existing,
+                    auto_repair=auto_repair,
+                    parallel=parallel,
+                    progress=report,
+                    categories=categories),
+                action=("recheck_current_storyboard"
+                        if include_existing else "qc_all"),
+                tracked=True,
+                request={
+                    "include_existing": include_existing,
+                    "auto_repair": auto_repair,
+                    "parallel": parallel,
+                    "categories": categories,
+                })
             return self._json({"job_id": job_id}, status=202)
 
         def _image_acceleration_options(self, query):

@@ -4536,6 +4536,10 @@ function renderPlanHtml(data, editable) {
         ⚡ API 加速待生产图片${acceleration.ready ? ` (${acceleration.ready})` : ""}</button>` : ""}
       ${qcItems.length ? `<button class="batch-qc" onclick="qcAll(${data.episode.id}, this)"
         title="只核对后续分镜关键帧和首尾帧">🔍 批量质检镜头图</button>` : ""}
+      ${qcItems.length ? `<button class="batch-recheck-current primary"
+        onclick="recheckCurrentAndRedoFailed(${data.episode.id}, this)"
+        title="把磁盘已有旧图按当前分镜、人物母图和空间图重新质检；仅将失败关键帧交给 Codex A/B 并行重画">
+        🔄 当前分镜重检，只重做失败图</button>` : ""}
       <button class="batch-redo-failed" onclick="redoFailed(${data.episode.id}, this)"
         ${qcFailed ? "" : "disabled"}
         title="只显示质检未过的图片，并按每张图的原因自动优化提示词后批量重画">🛠 批量优化修改${qcFailed ? ` (${qcFailed})` : ""}</button>
@@ -4601,6 +4605,68 @@ async function qcAll(episodeId, btn) {
   } catch (e) {
     showToast(staleServerHint(e), "error");
     if (btn) { btn.disabled = false; btn.textContent = "🔍 批量质检全部"; }
+  }
+}
+
+async function recheckCurrentAndRedoFailed(episodeId, btn) {
+  const original = btn?.textContent || "🔄 当前分镜重检，只重做失败图";
+  if (btn) { btn.disabled = true; btn.textContent = "正在安全暂停…"; }
+  try {
+    await ensureBatchRevisionCheckpoint(episodeId);
+    if (btn) btn.textContent = "A/B 双通道重新质检中…";
+    const reply = await api("/api/qc_all", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        episode_id: episodeId,
+        include_existing: true,
+        auto_repair: false,
+        parallel: true,
+        categories: ["shot_image"],
+      }),
+    });
+    showToast("已开始按当前分镜重新质检；旧图不会直接进入首尾帧或视频", "ok");
+    pollJob(reply.job_id, async (job) => {
+      if (job.status !== "done") {
+        showToast(job.error || "当前分镜重检未完成", "error");
+        if (btn) { btn.disabled = false; btn.textContent = original; }
+        renderCanvasView(episodeId);
+        return;
+      }
+      const summary = job.summary || {};
+      const current = await api(`/api/episode/${episodeId}`);
+      const failedIds = ((current.render_plan || {}).items || [])
+        .filter((item) => item.category === "shot_image"
+          && (item.qc || {}).passed === false
+          && (item.qc || {}).contract_recheck)
+        .map((item) => item.id);
+      if (!failedIds.length) {
+        showToast(`重检完成：${summary.passed || 0} 张全部通过，不需要重画`, "ok");
+        if (btn) { btn.disabled = false; btn.textContent = original; }
+        renderCanvasView(episodeId);
+        return;
+      }
+      if (btn) btn.textContent = `A/B 并行重画 ${failedIds.length} 张…`;
+      const redraw = await api("/api/redo_items", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          episode_id: episodeId, item_ids: failedIds, quality: "auto",
+        }),
+      });
+      watchBatchRedraw(episodeId, redraw.job_id, failedIds.length, (redrawJob) => {
+        const result = redrawJob.summary || {};
+        if (redrawJob.status === "done")
+          showToast(`选择性返工完成：仅重画 ${result.redone || 0} 张失败图`, "ok");
+        else showToast(redrawJob.error || "选择性返工未完成", "error");
+        if (btn) { btn.disabled = false; btn.textContent = original; }
+        renderCanvasView(episodeId);
+      });
+      showToast(`重检发现 ${failedIds.length} 张失败图，已交给 Codex A/B 并行重画`, "ok");
+      pollCanvas(episodeId);
+    });
+    pollCanvas(episodeId);
+  } catch (e) {
+    showToast(staleServerHint(e), "error");
+    if (btn) { btn.disabled = false; btn.textContent = original; }
   }
 }
 

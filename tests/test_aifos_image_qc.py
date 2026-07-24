@@ -1096,8 +1096,37 @@ def test_single_and_batch_qc_and_redo(app):
     assert all(i["reference_inputs"]["count"] >= 1 for i in redrawn)
 
 
-def test_batch_redo_dispatches_different_scenes_in_parallel(app, monkeypatch):
-    """批量关键帧返工按 Codex 槽位并行,同场仍由场景锁保护。"""
+def test_current_contract_recheck_includes_pending_existing_keyframes(app):
+    """分镜换版后计划虽 pending，磁盘旧图仍必须按当前合同重新质检。"""
+    import json as _json
+    project = _preproduce(app, title="当前合同重检")
+    plan_path = (app.workspace.artifacts_dir
+                 / f"p{project['id']:03d}" / "e001" / "render_plan.json")
+    plan = _json.loads(plan_path.read_text(encoding="utf-8"))
+    target = next(
+        item for item in plan["items"]
+        if item["category"] == "shot_image")
+    target["status"] = "pending"
+    target["qc"] = None
+    target["invalidated_previous_output"] = True
+    plan_path.write_text(
+        _json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+
+    summary = app.director.qc_all(
+        "当前合同重检", 1, include_existing=True,
+        auto_repair=False, parallel=False, categories=["shot_image"])
+    assert summary["checked"] > 0
+    refreshed = next(
+        item for item in _json.loads(
+            plan_path.read_text(encoding="utf-8"))["items"]
+        if item["id"] == target["id"])
+    assert refreshed["status"] == "done"
+    assert refreshed["qc"]["passed"] is True
+    assert refreshed["contract_recheck"] is True
+
+
+def test_batch_redo_dispatches_same_scene_keyframes_in_parallel(app, monkeypatch):
+    """同场关键帧彼此独立，批量返工也会真正占用两个 Codex 槽位。"""
     project = _preproduce(app, title="并行返工调度")
     plan_path = (app.workspace.artifacts_dir
                  / f"p{project['id']:03d}" / "e001" / "render_plan.json")
@@ -1105,21 +1134,18 @@ def test_batch_redo_dispatches_different_scenes_in_parallel(app, monkeypatch):
     shots = [item for item in plan["items"]
              if item["category"] == "shot_image"]
     assert len(shots) >= 2
-    # 选不同场景,否则连续性锁会按设计串行。
+    # 选同一场的两个关键帧；只有首尾帧链需要按场串行。
     storyboard, _ = app.projects.latest_document(
         app.db.query_one("SELECT id FROM episodes WHERE project_id=?",
                          (project["id"],))["id"], "storyboard")
     scene_by_shot = {int(shot["shot_no"]): shot.get("scene_no")
                      for shot in storyboard["shots"]}
-    chosen = []
-    scenes = set()
+    by_scene = {}
     for item in shots:
         scene = scene_by_shot.get(int(item["shot_no"]))
-        if scene not in scenes:
-            chosen.append(item)
-            scenes.add(scene)
-        if len(chosen) == 2:
-            break
+        by_scene.setdefault(scene, []).append(item)
+    chosen = next(
+        values[:2] for values in by_scene.values() if len(values) >= 2)
     assert len(chosen) == 2
     ids = {item["id"] for item in chosen}
     for item in plan["items"]:
