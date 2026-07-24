@@ -41,6 +41,7 @@ from .prompt_contract import (
     shot_local_scene,
 )
 from .qc_feedback import optimize_qc_feedback
+from .lessons import lessons_block, project_lessons, record_lessons
 from .relations import relation_lines, write_relations
 from .spatial_blocking import (
     build_spatial_plan,
@@ -1554,6 +1555,24 @@ class Director:
                 if extra:
                     item.update(extra)
                 self._plan_write(ctx, plan)
+                # 出错经验库:质检发现过的问题(含重画后已通过的首轮问题)
+                # 自动归档,之后所有出图/视频提示词带"严禁再犯"清单
+                qc = (extra or {}).get("qc") or {}
+                issues = qc.get("lesson_issues") or (
+                    qc.get("issues") if qc.get("passed") is False else [])
+                if issues:
+                    try:
+                        count = record_lessons(
+                            self.assets, ctx["project"]["id"], issues,
+                            category=item.get("category", ""))
+                        if count:
+                            self.log.info(
+                                "director",
+                                f"经验库已归档 {count} 条出错原因"
+                                f"({item.get('label', item_id)});"
+                                "后续出图/视频将自动规避")
+                    except Exception:
+                        pass   # 经验归档失败绝不能影响生产主流程
                 return
 
     @staticmethod
@@ -2110,6 +2129,7 @@ class Director:
         result.qc，未通过的图片不得进入后续正式参考链。"""
         attempts = 0
         spent = 0.0
+        lesson_issues = []
         while True:
             result = self.router.call(capability, payload, out_dir,
                                       cancel=cancel)
@@ -2157,6 +2177,10 @@ class Director:
                 readable_text=qc_spec.get("readable_text"))
             report["revision_feedback"] = revision["text"]
             report["revision_categories"] = revision["categories"]
+            # 经验库素材:重画后最终通过的图,第一次犯的错也要记住
+            if not report["passed"]:
+                lesson_issues.extend(report["issues"])
+            report["lesson_issues"] = list(dict.fromkeys(lesson_issues))
             result.qc = report
             if report["passed"] or attempts >= self._qc_retries():
                 return result
@@ -4663,9 +4687,24 @@ class Director:
         parts.append(
             "【STRUCTURE】五官透视、手指、关节、肢体比例、遮挡关系与"
             "接触点自然，无粘连、断肢、穿模或漂浮道具")
+        # 时代与物理硬约束:场景年代错乱与物体拉伸变形是高频真实错误
+        drift = [str(item).strip() for item in
+                 (world.get("forbidden_drift") or []) if str(item).strip()]
+        parts.append(
+            "【ERA LOCK】画面中每一件物品、服装、道具、建筑必须符合本"
+            "故事时代与世界观"
+            + (f";严禁出现:{'、'.join(drift)}" if drift else
+               ";历史/古代场景严禁出现笔记本电脑、手机、屏幕、现代家具"
+               "等现代物品")
+            + ";道具形态按真实规格(笔记本电脑=合页翻盖薄板,不得拉长"
+            "变形或塞进不合理容器)")
         parts.append(
             "【NEGATIVE】禁止身份漂移、性别错误、人数错误、脸部融合、"
             "重复人物、错误服装、无关杂物、脏污皮肤、塑料脸、字幕和标签")
+        # 出错经验库:本项目此前真实犯过的错,逐条声明严禁再犯
+        lessons = lessons_block(self.assets, ctx["project"]["id"])
+        if lessons:
+            parts.append("【LESSONS·严禁再犯】" + lessons)
         return "\n".join(p for p in parts if p)
 
     def _shot_payload(self, ctx, shot, *, continuity_anchor=False,
@@ -5934,6 +5973,18 @@ class Director:
             "【禁止】不得把空间示意图、编号、姓名标签、坐标、箭头、"
             "参考图边框、字幕或乱码画进成片；不得执行第二个主动作或"
             "第二种运镜；不得在首尾帧之间改变人物、服装、道具或场景。")
+        # 与出图同一套时代/物理硬约束 + 出错经验库,视频端同步防错
+        world = (ctx.get("script") or {}).get("story_world") or {}
+        drift = [str(item).strip() for item in
+                 (world.get("forbidden_drift") or []) if str(item).strip()]
+        lines.append(
+            "【时代与物理】全程物品、服装、建筑必须符合故事时代与世界观"
+            + (f"，严禁出现:{'、'.join(drift)}" if drift else
+               "，历史/古代场景严禁出现笔记本电脑、手机等现代物品")
+            + "；物体在运动中保持真实结构与比例,严禁拉长、扭曲、穿模。")
+        lessons = lessons_block(self.assets, ctx["project"]["id"])
+        if lessons:
+            lines.append("【严禁再犯】" + lessons)
         return "\n".join(lines)
 
     def _prepare_video_call(self, ctx, shot, frames):
@@ -7873,7 +7924,11 @@ class Director:
     SHOT_QC_CATEGORIES = frozenset({"shot_image", "frames"})
 
     # ---- 单张/批量质检:核对已生成的图是否符合剧本要求 ----
-    _FORBID = ["与设定形态不符的角色", "悬挂的衣物或衣架", "与设定不符的人"]
+    _FORBID = ["与设定形态不符的角色", "悬挂的衣物或衣架", "与设定不符的人",
+               "与故事时代/世界观不符的物品或建筑(时代错乱,如历史场景"
+               "出现笔记本电脑/手机/现代家具)",
+               "结构扭曲、比例失常或被拉长变形的物体(如被拉长的笔记本/"
+               "盒子,不合物理的道具)"]
 
     def _plan_item_target(self, item_id):
         head, _, rest = item_id.partition(":")

@@ -4314,6 +4314,7 @@ function renderPlanHtml(data, editable) {
     ${qualityPolicyHtml()}
     ${imageCostGuideHtml(true)}
     ${mockWarnHtml(data)}
+    ${lessonsPanelHtml(data)}
     ${relationCanvasHtml(data)}
     ${editable ? `<div class="plan-batchbar">
       ${failedOnly ? `<button class="batch-show-all"
@@ -4855,6 +4856,18 @@ function planCardHtml(data, item, avg) {
 }
 
 /* 生产画布:人物/场景/镜头节点 + 关系线(与出图提示词同源,牵引人物关联) */
+/* 出错经验库:质检发现过的问题自动总结,已注入所有出图/视频提示词 */
+function lessonsPanelHtml(data) {
+  const lessons = data.lessons || [];
+  if (!lessons.length) return "";
+  return `<div class="lessons-panel">
+    <h3>📚 出错经验库 <span class="dim">系统自动总结每次质检发现的问题,
+      并已注入后续所有出图与视频提示词,同样的错误不再重犯</span></h3>
+    <ul>${lessons.slice(0, 8).map((item) =>
+      `<li><b>×${item.count}</b> ${esc(item.issue)}</li>`).join("")}</ul>
+  </div>`;
+}
+
 function relationCanvasHtml(data) {
   const rel = data.relations;
   if (!rel || !(rel.nodes || []).length) return "";
@@ -4958,6 +4971,7 @@ function renderPlanBoardHtml(data) {
       <div class="pb-select-hint">点击任意图片卡片可选择并查看大图、状态和提示词</div>
     </div>
     ${mockWarnHtml(data)}
+    ${lessonsPanelHtml(data)}
     ${relationCanvasHtml(data)}
     ${cats.map((cat) => {
       const list = items.filter((i) => i.category === cat);
