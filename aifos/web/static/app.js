@@ -967,6 +967,10 @@ function episodesPanelHtml(data) {
             ? `<button class="primary episode-resume" data-episode-id="${e.id}"
                 data-title="${esc(e.project)}" data-number="${e.number}"
                 title="从上次失败的断点接着做,已完成部分全部保留">▶ 继续</button> ` : ""}
+          ${["failed", "qc_failed"].includes(e.status) && !running
+            ? `<button class="danger episode-rebuild-all" data-episode-id="${e.id}"
+                data-title="${esc(e.project)}" data-number="${e.number}"
+                title="推翻原有设定,清理本轮复用并从头重新生成图片、首尾帧和视频">⚠ 全部重新生成</button> ` : ""}
           <button class="danger episode-delete-work" data-episode-id="${e.id}"
             ${running ? "disabled" : ""} title="${running
               ? "本集正在生成，请先安全停止" : "删除本集作品，可选择是否保留资产中心图片"}">删除</button></td>
@@ -1002,6 +1006,27 @@ function bindEpisodeRows(data) {
         button.disabled = false;
         button.textContent = "▶ 继续";
       }
+    }));
+  app.querySelectorAll("#episodes-panel .episode-rebuild-all").forEach((button) =>
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      armConfirm(button, "全部重新生成", async () => {
+        button.disabled = true;
+        button.textContent = "已确认,全部重新生成中…";
+        try {
+          await api("/api/produce", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ title: button.dataset.title,
+              episode: Number(button.dataset.number), force: true, review: true }),
+          });
+          showToast("已提交全部重新生成:图片、首尾帧、视频将按新设定从头生产", "ok");
+          location.hash = `#/episode/${button.dataset.episodeId}`;
+        } catch (e) {
+          showToast(e.message, "error");
+          button.disabled = false;
+          button.textContent = "⚠ 全部重新生成";
+        }
+      });
     }));
   app.querySelectorAll("#episodes-panel .episode-delete-work").forEach((button) =>
     button.addEventListener("click", (event) => {
@@ -5513,7 +5538,8 @@ async function renderCanvasView(episodeId) {
       <button id="btn-stop-live" class="stop-btn" hidden
         title="暂停生成:已完成的图片全部保留,可从断点继续">⏸ 暂停生成</button>
       <button id="btn-reproduce" title="复用已完成的部分,只补做缺失内容">继续补齐</button>
-      <button id="btn-reproduce-force" title="从头全部重新制作(真实产线会消耗额度)">全部重做</button>
+      <button id="btn-reproduce-force" class="danger"
+        title="推翻原有设定,清理本轮复用并从头重新生成图片、首尾帧和视频">⚠ 全部重新生成</button>
       <div class="zoom-group">
         <button id="zoom-out">−</button>
         <span class="zoom-pct" id="zoom-pct">100%</span>
@@ -5557,14 +5583,14 @@ async function renderCanvasView(episodeId) {
           title: data.project.title, episode: ep.number, force,
         }),
       });
-      showToast(force ? "已提交强制重制,画布将自动刷新" : "已提交增量重制,画布将自动刷新", "ok");
+      showToast(force ? "已提交全部重新生成,画布将自动刷新" : "已提交断点补齐,画布将自动刷新", "ok");
       pollCanvas(episodeId);
     } catch (e) { showToast(e.message, "error"); }
   };
   document.getElementById("btn-reproduce").onclick = (ev) =>
     armConfirm(ev.target, "补齐", () => reproduce(false));
   document.getElementById("btn-reproduce-force").onclick = (ev) =>
-    armConfirm(ev.target, "重做", () => reproduce(true));
+    armConfirm(ev.target, "全部重新生成", () => reproduce(true));
   const btnResumeCanvas = document.getElementById("btn-resume-canvas");
   if (btnResumeCanvas) btnResumeCanvas.onclick = () => {
     btnResumeCanvas.disabled = true;
@@ -6271,6 +6297,8 @@ function renderRecoveryView(data, episodeId) {
       <span class="spacer"></span>
       ${hasScript ? `<button id="btn-script2">📖 看剧本</button>` : ""}
       <button id="btn-plan2">🖼 图片清单</button>
+      <button id="btn-rebuild-all-recovery" class="danger"
+        title="推翻原有设定,清理本轮复用并从头重新生成图片、首尾帧和视频">⚠ 全部重新生成</button>
     </div>
     <div class="produce-main" style="padding:0 18px 40px">
       ${productionLedgerHtml(data, { context: "recovery" })}
@@ -6283,6 +6311,24 @@ function renderRecoveryView(data, episodeId) {
     showScriptOverlay(data, episodeId));
   document.getElementById("btn-plan2").onclick = () =>
     showPlanOverlay(episodeId);
+  document.getElementById("btn-rebuild-all-recovery").onclick = (ev) =>
+    armConfirm(ev.target, "全部重新生成", async () => {
+      ev.target.disabled = true;
+      ev.target.textContent = "已确认,全部重新生成中…";
+      try {
+        await api("/api/produce", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: data.project.title,
+            episode: ep.number, force: true, review: true }),
+        });
+        showToast("已提交全部重新生成:图片、首尾帧、视频将按新设定从头生产", "ok");
+        pollCanvas(episodeId);
+      } catch (e) {
+        showToast(e.message, "error");
+        ev.target.disabled = false;
+        ev.target.textContent = "⚠ 全部重新生成";
+      }
+    });
   bindImageAccelerationLivebar(episodeId);
   bindProductionLedger(app, data, episodeId);
   bindLightbox(app);
