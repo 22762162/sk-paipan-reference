@@ -838,6 +838,121 @@ button.canvas-stage-item:hover, button.canvas-stage-item:focus-visible {
   color: #ffd77a; font-size: 11px; white-space: nowrap;
 }
 .production-ledger-current b { color: #fff0b7; }
+.production-progress-panel {
+  margin: 10px 16px 4px; border: 1px solid var(--hairline);
+  border-radius: 10px; overflow: hidden; background: rgba(9, 12, 16, .48);
+}
+.production-progress-panel.is-active {
+  border-color: rgba(250, 178, 25, .48);
+  box-shadow: inset 3px 0 0 rgba(250, 178, 25, .72);
+}
+.production-progress-panel.is-idle {
+  border-color: rgba(102, 121, 143, .38);
+  box-shadow: inset 3px 0 0 rgba(102, 121, 143, .55);
+}
+.production-progress-head {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(210px, 30%);
+  gap: 16px; align-items: center; padding: 12px;
+  border-bottom: 1px solid var(--grid);
+}
+.production-progress-state {
+  display: flex; align-items: center; gap: 10px; min-width: 0;
+}
+.production-progress-state > div { display: grid; gap: 3px; min-width: 0; }
+.production-progress-state b { color: #fff; font-size: 14px; }
+.production-progress-state small {
+  color: var(--ink-3); font-size: 10.5px; line-height: 1.45;
+}
+.production-progress-dot {
+  width: 10px; height: 10px; flex: none; border-radius: 50%;
+  background: #66798f;
+}
+.production-progress-dot.active {
+  background: var(--warning); animation: pulse 1.2s infinite;
+  box-shadow: 0 0 0 4px rgba(250, 178, 25, .1);
+}
+.production-progress-overall { display: grid; gap: 6px; }
+.production-progress-overall > span {
+  display: flex; justify-content: space-between; gap: 8px;
+  color: var(--ink-3); font-size: 10.5px;
+}
+.production-progress-overall b {
+  color: var(--ink); font-variant-numeric: tabular-nums;
+}
+.production-progress-track {
+  height: 7px; border-radius: 999px; overflow: hidden;
+  background: rgba(255, 255, 255, .07);
+}
+.production-progress-track i {
+  display: block; height: 100%; min-width: 0; border-radius: inherit;
+  background: linear-gradient(90deg, #3987e5, #5ec7ff);
+}
+.production-progress-kpis {
+  display: grid; grid-template-columns: 1.25fr repeat(4, minmax(100px, 1fr));
+  border-bottom: 1px solid var(--grid);
+}
+.production-progress-kpis > span {
+  display: grid; gap: 4px; min-width: 0; padding: 10px 12px;
+  border-right: 1px solid var(--grid);
+}
+.production-progress-kpis > span:last-child { border-right: 0; }
+.production-progress-kpis small { color: var(--ink-3); font-size: 9.5px; }
+.production-progress-kpis b {
+  color: #dcecff; font-size: 12px; font-variant-numeric: tabular-nums;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.production-progress-kpis .has-failure b { color: #ff9d9d; }
+.production-progress-active {
+  display: grid; gap: 8px; padding: 10px 12px;
+}
+.production-progress-active > b { color: #cfe4ff; font-size: 10.5px; }
+.production-progress-active-list {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 7px;
+}
+.production-progress-active-item {
+  display: grid; grid-template-columns: auto minmax(0, 1fr);
+  gap: 3px 7px; align-items: center; min-width: 0; padding: 8px 9px;
+  text-align: left; border: 1px solid rgba(250, 178, 25, .35);
+  border-radius: 8px; background: rgba(250, 178, 25, .06); cursor: pointer;
+}
+.production-progress-active-item:hover {
+  border-color: var(--warning); background: rgba(250, 178, 25, .11);
+}
+.production-progress-active-item.retrying {
+  border-color: rgba(57, 135, 229, .5); background: rgba(57, 135, 229, .08);
+}
+.production-progress-active-item > span {
+  grid-row: 1 / 3; align-self: stretch; display: grid; place-items: center;
+  padding-right: 7px; border-right: 1px solid var(--grid);
+  color: #ffd77a; font-size: 9.5px; white-space: nowrap;
+}
+.production-progress-active-item.retrying > span { color: #9fcaff; }
+.production-progress-active-item b {
+  min-width: 0; color: #fff; font-size: 11px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.production-progress-active-item small {
+  min-width: 0; color: var(--ink-3); font-size: 9.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.production-progress-idle-copy { color: var(--ink-3); font-size: 10.5px; }
+.production-progress-categories {
+  padding: 0 12px 10px; color: var(--ink-3); font-size: 10.5px;
+}
+.production-progress-categories summary { cursor: pointer; color: #9fcaff; }
+.production-progress-categories > div {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 6px; margin-top: 8px;
+}
+.production-progress-categories span {
+  display: grid; gap: 3px; padding: 7px 8px;
+  border: 1px solid var(--grid); border-radius: 6px; background: var(--surface-2);
+}
+.production-progress-categories b { color: var(--ink-2); font-size: 10.5px; }
+.production-progress-categories small {
+  color: var(--ink-3); font-size: 9.5px; font-variant-numeric: tabular-nums;
+}
 .production-ledger-summary {
   display: flex; gap: 6px; flex-wrap: wrap; padding: 10px 16px 4px;
 }
@@ -2731,6 +2846,22 @@ textarea:focus-visible, select:focus-visible {
   #theater .production-ledger, .produce-main > .production-ledger { margin: 0 0 12px; border-radius: 10px; }
   .production-ledger-heading { display: grid; grid-template-columns: minmax(0, 1fr); padding: 12px; }
   .production-ledger-current { width: fit-content; }
+  .production-progress-panel { margin: 10px 12px 4px; }
+  .production-progress-head { grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 10px; }
+  .production-progress-kpis {
+    display: flex; overflow-x: auto; scroll-snap-type: x proximity;
+    scrollbar-width: none;
+  }
+  .production-progress-kpis::-webkit-scrollbar { display: none; }
+  .production-progress-kpis > span {
+    flex: 0 0 132px; scroll-snap-align: start; border-right: 1px solid var(--grid);
+  }
+  .production-progress-kpis > span:first-child { flex-basis: 160px; }
+  .production-progress-active { padding: 10px; }
+  .production-progress-active-list { grid-template-columns: minmax(0, 1fr); }
+  .production-progress-active-item { min-height: 54px; }
+  .production-progress-categories { padding: 0 10px 10px; }
+  .production-progress-categories > div { grid-template-columns: minmax(0, 1fr); }
   .image-failure-panel { margin: 10px 12px 0; padding: 10px; }
   .image-failure-heading { display: grid; gap: 6px; }
   .image-failure-heading > small { max-width: none; text-align: left; }

@@ -3320,6 +3320,208 @@ function productionLedgerActionHtml(row) {
   return `<span class="production-ledger-no-action">等待进入生产</span>`;
 }
 
+function productionProgressNumber(...values) {
+  for (const value of values) {
+    if (value == null || value === "") continue;
+    const number = Number(value);
+    if (Number.isFinite(number)) return number;
+  }
+  return 0;
+}
+
+function productionProgressModel(data) {
+  const payload = data.production_progress || {};
+  const overall = payload.overall || {};
+  const plan = ((data.render_plan || {}).items) || [];
+  const artifacts = data.artifacts || {};
+  const shots = (data.storyboard || {}).shots || [];
+  const tasks = data.tasks || [];
+  const runningTask = tasks.find((task) => task.status === "running");
+  const activeItemsRaw = payload.active_items || overall.active_items
+    || plan.filter((item) => ["generating", "retrying"].includes(item.status));
+  const activeItems = activeItemsRaw.map((item, index) => {
+    const category = item.category || item.stage || overall.stage || runningTask?.stage || "";
+    const shotNo = item.shot_no == null ? null : Number(item.shot_no);
+    const status = item.status || (item.auto_repair || item.repairing
+      ? "retrying" : "generating");
+    return {
+      id: item.item_id || item.id || `active-${index}`,
+      planId: item.plan_id || item.item_id || item.id || "",
+      category, shotNo, status,
+      label: item.label || item.name || (shotNo == null
+        ? (PLAN_CAT_CN[category] || STAGE_CN[category] || "生产任务")
+        : `镜头 ${String(shotNo).padStart(2, "0")}`),
+      detail: item.detail || item.message || item.phase_label || "",
+      startedAt: item.started_at || item.startedAt || "",
+      elapsed: productionProgressNumber(item.elapsed, item.elapsed_seconds),
+    };
+  });
+  const episodeStatus = data.episode?.status || "created";
+  const stableEpisode = ["done", "failed", "qc_failed", "created", "queued_script",
+    "awaiting_script", "awaiting_cast", "awaiting_confirm"].includes(episodeStatus);
+  const progressStatus = overall.status || payload.status || "";
+  const explicitRunning = overall.running ?? payload.running ?? payload.active;
+  const active = explicitRunning != null
+    ? ![false, 0, "0", "false", "idle", "stopped"].includes(explicitRunning)
+    : progressStatus === "running" || !!runningTask || !stableEpisode;
+  const stage = overall.current_stage || overall.stage || payload.current_stage
+    || payload.stage || runningTask?.stage
+    || (active ? episodeStatus : "");
+  const categoryRows = Array.isArray(payload.categories)
+    ? payload.categories : Object.entries(payload.categories || {}).map(
+      ([key, value]) => ({ key, ...(value || {}) }));
+  const categories = categoryRows.map((category) => {
+    const key = category.key || category.category || category.stage || "";
+    return {
+      key,
+      label: category.label || PLAN_CAT_CN[key] || STAGE_CN[key] || key,
+      total: productionProgressNumber(category.total, category.count),
+      completed: productionProgressNumber(
+        category.usable, category.completed,
+        productionProgressNumber(category.done) + productionProgressNumber(category.reused),
+        category.formal_assets),
+      pending: productionProgressNumber(category.pending, category.queued),
+      active: productionProgressNumber(category.active, category.running,
+        productionProgressNumber(category.generating)
+          + productionProgressNumber(category.retrying)),
+      awaitingHuman: productionProgressNumber(category.awaiting_human),
+      hardFailed: productionProgressNumber(category.failed),
+      unverified: productionProgressNumber(category.unverified_done),
+      failed: productionProgressNumber(
+        productionProgressNumber(category.awaiting_human)
+          + productionProgressNumber(category.failed)
+          + productionProgressNumber(category.unverified_done),
+        category.second_failures),
+    };
+  });
+  const keyframeCategory = categories.find((row) => row.key === "shot_image")
+    || categories.find((row) => row.key === "images");
+  const keyframeTotal = productionProgressNumber(
+    keyframeCategory?.total, overall.keyframe_total, payload.keyframe_total, shots.length);
+  const keyframeDone = productionProgressNumber(
+    keyframeCategory?.completed,
+    overall.formal_assets, overall.keyframe_completed,
+    payload.formal_assets, payload.keyframe_completed,
+    Object.keys(artifacts.images || {}).length);
+  const reportedImageFailures = (data.image_failures || []).length;
+  const keyframeFailed = Math.max(
+    productionProgressNumber(keyframeCategory?.awaitingHuman),
+    productionProgressNumber(overall.second_failures, payload.second_failures),
+    reportedImageFailures);
+  const keyframePending = Math.max(0, productionProgressNumber(
+    keyframeCategory
+      ? keyframeCategory.pending + keyframeCategory.hardFailed
+        + keyframeCategory.unverified
+        - Math.min(keyframeCategory.hardFailed, reportedImageFailures)
+      : null,
+    overall.keyframe_pending, payload.keyframe_pending,
+    keyframeTotal - keyframeDone - keyframeFailed));
+  const categoryTotal = categories.reduce((sum, row) => sum + row.total, 0);
+  const categoryDone = categories.reduce((sum, row) => sum + row.completed, 0);
+  const total = productionProgressNumber(overall.total, payload.total, categoryTotal);
+  const completed = productionProgressNumber(
+    overall.usable, overall.completed,
+    productionProgressNumber(overall.done) + productionProgressNumber(overall.reused),
+    payload.usable, payload.completed, payload.done, categoryDone);
+  const percentValue = productionProgressNumber(overall.percent, payload.percent,
+    total ? completed / total * 100 : 0);
+  const parallelSpec = overall.parallelism || payload.parallelism || {};
+  const parallelLane = (stage === "videos" ? parallelSpec.video : parallelSpec.image)
+    || parallelSpec;
+  const parallelism = Math.max(0, productionProgressNumber(
+    parallelLane.limit, parallelLane.parallelism, parallelLane.parallel,
+    overall.parallel, overall.concurrency,
+    payload.parallel, payload.concurrency,
+    activeItems.length));
+  const activeCount = Math.max(activeItems.length, productionProgressNumber(
+    parallelLane.active, overall.active_count, payload.active_count));
+  return {
+    active: active && !["completed", "done", "idle", "stopped"].includes(progressStatus),
+    stopping: episodeStatus === "cancelling" || progressStatus === "cancelling",
+    stage,
+    stageLabel: active
+      ? overall.current_stage_label || overall.stage_label
+        || payload.current_stage_label || payload.stage_label
+        || STAGE_CN[stage] || STATUS_CN[stage] || stage || "准备中"
+      : "无生产阶段",
+    parallelism, activeCount, activeItems, categories, total, completed,
+    pending: productionProgressNumber(overall.pending, payload.pending,
+      Math.max(0, total - completed)),
+    failed: productionProgressNumber(overall.failed, payload.failed),
+    percent: Math.max(0, Math.min(100, percentValue)),
+    keyframeTotal, keyframeDone, keyframePending, keyframeFailed,
+  };
+}
+
+function productionProgressPanelHtml(data) {
+  const progress = productionProgressModel(data);
+  const stateLabel = progress.stopping ? "正在暂停生产"
+    : progress.active ? "正在生产" : "当前没有生产任务";
+  const stateHelp = progress.stopping
+    ? "正在等待已提交的调用安全结束，已经完成的正式资产会保留。"
+    : progress.active
+      ? `当前阶段：${progress.stageLabel}。下方列出实际占用生产通道的对象。`
+      : "不是卡住：目前没有图片或视频请求在执行。可查看待生产数量，按流程继续或处理问题图。";
+  const overallText = progress.total
+    ? `${progress.completed}/${progress.total}`
+    : (progress.active ? "统计中" : "0/0");
+  return `<section class="production-progress-panel ${progress.active ? "is-active" : "is-idle"}"
+    aria-label="准确生产进度" data-production-progress>
+    <div class="production-progress-head">
+      <div class="production-progress-state">
+        <span class="production-progress-dot${progress.active ? " active" : ""}"></span>
+        <div><b>${stateLabel}</b><small>${esc(stateHelp)}</small></div>
+      </div>
+      <div class="production-progress-overall">
+        <span>全流程 <b>${overallText}</b></span>
+        ${progress.total ? `<div class="production-progress-track" role="progressbar"
+          aria-valuemin="0" aria-valuemax="100" aria-valuenow="${fmt(progress.percent, 0)}">
+          <i style="width:${progress.percent}%"></i></div>` : ""}
+      </div>
+    </div>
+    <div class="production-progress-kpis">
+      <span><small>当前阶段</small><b>${esc(progress.stageLabel)}</b></span>
+      <span><small>生产通道</small><b>${progress.active
+        ? `${progress.activeCount}/${progress.parallelism || progress.activeCount || 1} 正在占用`
+        : "0 正在占用"}</b></span>
+      <span><small>关键帧正式资产</small><b>${progress.keyframeDone}/${progress.keyframeTotal}</b></span>
+      <span><small>待生产 / 待补齐</small><b>${progress.keyframePending}</b></span>
+      <span class="${progress.keyframeFailed ? "has-failure" : ""}">
+        <small>二次质检失败</small><b>${progress.keyframeFailed}</b></span>
+    </div>
+    <div class="production-progress-active">
+      <b>${progress.active ? `正在处理 ${progress.activeCount} 项`
+        : "正在处理 0 项"}</b>
+      ${progress.activeItems.length ? `<div class="production-progress-active-list">
+        ${progress.activeItems.map((item) => {
+          const retrying = item.status === "retrying";
+          const actionAttrs = item.shotNo != null
+            ? `data-progress-shot="${item.shotNo}"`
+            : item.planId ? `data-progress-plan="${esc(item.planId)}"` : "";
+          return `<button type="button" class="production-progress-active-item ${retrying ? "retrying" : ""}"
+            ${actionAttrs}>
+            <span>${retrying ? "↻ 自动修图" : "⏳ 生产中"}</span>
+            <b>${esc(item.label)}</b>
+            <small>${esc(item.detail || (item.shotNo != null
+              ? `${PLAN_CAT_CN[item.category] || STAGE_CN[item.category] || "关键帧"} · 镜头 ${String(item.shotNo).padStart(2, "0")}`
+              : PLAN_CAT_CN[item.category] || STAGE_CN[item.category] || item.category))}${
+                item.elapsed ? ` · 已进行 ${fmtDur(item.elapsed)}` : ""}</small>
+          </button>`;
+        }).join("")}</div>`
+        : `<span class="production-progress-idle-copy">${progress.active
+          ? `当前处于“${esc(progress.stageLabel)}”，暂未拆分到具体图片或视频任务。`
+          : "当前没有图片、关键帧或视频正在调用 API。"}</span>`}
+    </div>
+    ${progress.categories.length ? `<details class="production-progress-categories">
+      <summary>查看各生产环节准确数量</summary>
+      <div>${progress.categories.map((row) => `<span>
+        <b>${esc(row.label)}</b><small>完成 ${row.completed}/${row.total}
+        · 生产中 ${row.active} · 待生产 ${row.pending}
+        · 未形成正式资产 ${row.unverified} · 问题 ${row.failed}</small>
+      </span>`).join("")}</div></details>` : ""}
+  </section>`;
+}
+
 function imageFailurePanelHtml(data) {
   const failures = data.image_failures || [];
   if (!failures.length) return "";
@@ -3351,10 +3553,14 @@ function imageFailurePanelHtml(data) {
 
 function productionLedgerHtml(data, options = {}) {
   const rows = productionLedgerRows(data);
+  const progress = productionProgressModel(data);
   const tasks = data.tasks || [];
   const runningTask = tasks.find((task) => task.status === "running");
-  const currentStage = runningTask?.stage || data.episode?.status || "created";
-  const currentLabel = STAGE_CN[currentStage] || STATUS_CN[currentStage] || currentStage;
+  const currentStage = progress.active
+    ? progress.stage || runningTask?.stage || data.episode?.status || "created" : "";
+  const currentLabel = progress.active
+    ? progress.stageLabel || STAGE_CN[currentStage] || STATUS_CN[currentStage] || currentStage
+    : "当前没有生产任务";
   const humanVideoShots = (data.video_qc_report?.shots || [])
     .filter((item) => item.awaiting_human);
   const stageSummary = PRODUCTION_LEDGER_STAGES.map((stage) => {
@@ -3369,8 +3575,9 @@ function productionLedgerHtml(data, options = {}) {
     <div class="production-ledger-heading">
       <div><h2>📊 全流程生产表</h2>
         <p>精选视图：只显示已选定候选和有效生产资料；未选候选、失败产物、质检废片与占位图已隐藏，原始记录仍可追溯。</p></div>
-      <span class="production-ledger-current">当前阶段：<b>${esc(currentLabel)}</b></span>
+      <span class="production-ledger-current">${progress.active ? "当前阶段" : "生产状态"}：<b>${esc(currentLabel)}</b></span>
     </div>
+    ${productionProgressPanelHtml(data)}
     ${humanVideoShots.length ? `<div class="production-ledger-video-stop" role="alert">
       <b>⏸ 视频质检已暂停自动返工</b>
       <span>${humanVideoShots.map((item) => `镜头${item.shot_no}：${esc((item.issues || []).join("；") || "视频质检未通过")}${item.revision_feedback ? `<small>自动优化修订：${esc(item.revision_feedback)}</small>` : ""}`).join("；")}</span>
@@ -3456,6 +3663,24 @@ function focusImageFailureShot(root, data, shotNo) {
 
 function bindProductionLedger(root, data, episodeId) {
   if (!root) return;
+  root.querySelectorAll("[data-progress-shot]").forEach((button) => {
+    button.onclick = () => {
+      const shotNo = Number(button.dataset.progressShot);
+      const row = root.querySelector(`.storyboard-table-row[data-shot="${shotNo}"]`)
+        || document.querySelector(`.storyboard-table-row[data-shot="${shotNo}"]`);
+      if (!row) {
+        showPlanOverlay(episodeId, `shot:${shotNo}`);
+        return;
+      }
+      row.hidden = false;
+      row.scrollIntoView({ behavior: "smooth", block: "center" });
+      row.classList.add("selected");
+      setTimeout(() => row.classList.remove("selected"), 1800);
+    };
+  });
+  root.querySelectorAll("[data-progress-plan]").forEach((button) => {
+    button.onclick = () => showPlanOverlay(episodeId, button.dataset.progressPlan);
+  });
   root.querySelectorAll("[data-image-failure-preview]").forEach((button) => {
     button.onclick = () => showImageLightbox(
       button.dataset.imageFailurePreview, "二次质检未通过的关键帧");
@@ -5154,16 +5379,20 @@ function liveCounts(data) {
   const art = data.artifacts || {};
   const total = data.storyboard ? data.storyboard.shots.length : 0;
   const parts = [];
+  const progress = productionProgressModel(data);
+  if (progress.active) {
+    parts.push(`并行 ${progress.activeCount}/${progress.parallelism || progress.activeCount || 1}`);
+    const activeLabels = progress.activeItems.slice(0, 4).map((item) =>
+      `${item.status === "retrying" ? "自动修图" : "生产"}:${item.label}`);
+    if (activeLabels.length) parts.push(activeLabels.join("、")
+      + (progress.activeItems.length > 4 ? ` 等${progress.activeItems.length}项` : ""));
+  }
   const plan = ((data.render_plan || {}).items) || [];
   if (plan.length) {
-    const ok = plan.filter(
-      (i) => ["done", "reused"].includes(i.status)).length;
-    const gen = plan.find((i) => i.status === "generating");
-    parts.push(`图片 ${ok}/${plan.length}`);
-    if (gen)
-      parts.push(`正在画:${PLAN_CAT_CN[gen.category] || ""}「${gen.label}」`);
+    parts.push(`图片正式资产 ${progress.completed}/${progress.total}`);
   }
   if (total) {
+    parts.push(`关键帧 ${progress.keyframeDone}/${progress.keyframeTotal}`);
     parts.push(`视频 ${Object.keys(art.videos || {}).length}/${total}`);
   }
   if (!plan.length) {
@@ -5177,9 +5406,10 @@ function updateLiveStrip(data) {
   const el = document.getElementById("live-strip");
   if (!el) return;
   const ep = data.episode;
+  const progress = productionProgressModel(data);
   const runningTask = (data.tasks || []).find((t) => t.status === "running");
   const stage = ep.status === "cancelling" ? "cancelling"
-    : (runningTask && runningTask.stage) || ep.status;
+    : progress.stage || (runningTask && runningTask.stage) || ep.status;
   if (stage !== liveState.stage) liveState = { stage, since: Date.now() };
   const secs = Math.floor((Date.now() - liveState.since) / 1000);
   const mm = Math.floor(secs / 60), ss = String(secs % 60).padStart(2, "0");
@@ -5188,7 +5418,9 @@ function updateLiveStrip(data) {
     ? " · 外部产线(出图/视频)可能需要几分钟,只要本条时间在走就没卡住" : "";
   el.innerHTML = `
     <span class="live-dot${stage === "cancelling" ? " stopping" : ""}"></span>
-    <b>${esc(STAGE_PLAIN[stage] || STAGE_CN[stage] || stage)}</b>
+    <b>${esc(progress.active
+      ? STAGE_PLAIN[stage] || STAGE_CN[stage] || stage
+      : "当前没有生产任务")}</b>
     <span class="dim">本步已进行 ${mm}:${ss}${counts ? " · " + counts : ""}${slow}</span>
     <span class="live-last dim" id="live-last"></span>`;
 }

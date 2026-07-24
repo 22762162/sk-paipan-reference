@@ -603,6 +603,254 @@ def _collect_artifacts(app, project_id, ep_num):
     return out
 
 
+def _production_progress(app, episode, render_plan):
+    """把图片清单换算成可核验的实时进度。
+
+    render_plan 的 ``done`` 在资产登记前会短暂先落盘，历史异常中也可能
+    永久残留；因此完成数只认资产中心里仍有效且文件真实存在的正式资产，
+    不能仅凭清单状态把一张不存在的图展示为已完成。
+    """
+    project_id = int(episode["project_id"])
+    episode_id = int(episode["id"])
+    episode_number = int(episode["number"])
+    plan_items = list((render_plan or {}).get("items") or [])
+    running_task = app.db.query_one(
+        "SELECT stage, name, status, updated_at FROM tasks "
+        "WHERE episode_id=? AND status='running' "
+        "ORDER BY id DESC LIMIT 1", (episode_id,))
+    running_run = app.db.query_one(
+        "SELECT id FROM production_runs WHERE episode_id=? "
+        "AND status IN ('running', 'cancelling') "
+        "ORDER BY id DESC LIMIT 1", (episode_id,))
+    live_run = running_task is not None or running_run is not None
+    status_keys = (
+        "done", "reused", "pending", "generating", "retrying",
+        "awaiting_human", "failed",
+    )
+    category_labels = {
+        "character_candidate": "人物候选",
+        "character_art": "人物立绘",
+        "character_sheet": "人物设定图",
+        "scene_art": "场景图",
+        "shot_image": "关键帧",
+        "frames": "首尾帧",
+    }
+    assets = {
+        (row["kind"], row["name"]): row
+        for row in app.assets.active_list(project_id)
+    }
+
+    def valid_uri(uri):
+        uri = str(uri or "").strip()
+        return bool(uri) and (
+            uri.startswith(("http://", "https://")) or Path(uri).is_file())
+
+    def has_asset(kind, name):
+        row = assets.get((kind, name))
+        return row is not None and valid_uri(row["uri"])
+
+    def item_has_formal_asset(item):
+        """按 render_plan 项定位其唯一正式资产；失败稿 output_uri 不算。"""
+        category = str(item.get("category") or "")
+        shot_no = item.get("shot_no")
+        try:
+            shot_no = int(shot_no) if shot_no is not None else None
+        except (TypeError, ValueError):
+            shot_no = None
+        shot_name = (
+            f"e{int(episode_number):03d}_shot{shot_no:03d}"
+            if shot_no is not None else "")
+        if category == "shot_image":
+            return bool(shot_name) and has_asset("image", shot_name)
+        if category == "frames":
+            return bool(shot_name) and (
+                has_asset("first_frame", shot_name)
+                and has_asset("last_frame", shot_name))
+        if category == "character_art":
+            name = str(item.get("name") or item.get("id", "").split(
+                ":", 1)[-1])
+            return has_asset("character_art", name)
+        if category == "scene_art":
+            name = str(item.get("name") or item.get("id", "").split(
+                ":", 1)[-1])
+            return has_asset("scene_art", name)
+        if category == "character_sheet":
+            name = str(item.get("name") or "")
+            sheet = str(item.get("sheet") or "")
+            if not (name and sheet):
+                parts = str(item.get("id") or "").split(":")
+                if len(parts) >= 3:
+                    name, sheet = ":".join(parts[1:-1]), parts[-1]
+            return bool(name and sheet) and has_asset(
+                "character_sheet", f"{name}:{sheet}")
+        if category == "character_candidate":
+            name = str(item.get("name") or "")
+            index = item.get("candidate_index")
+            if not (name and index):
+                parts = str(item.get("id") or "").split(":")
+                if len(parts) >= 3:
+                    name, index = ":".join(parts[1:-1]), parts[-1]
+            try:
+                asset_name = f"{name}:{int(index):02d}"
+            except (TypeError, ValueError):
+                return False
+            return bool(name) and has_asset("character_candidate", asset_name)
+        # 新分类可显式声明正式资产映射，避免默认相信 output_uri。
+        return bool(
+            item.get("asset_kind") and item.get("asset_name")
+            and has_asset(str(item["asset_kind"]), str(item["asset_name"])))
+
+    categories = {}
+    active_items = []
+    issues = []
+    timestamp = time.time()
+    for item in plan_items:
+        category = str(item.get("category") or "other")
+        stats = categories.setdefault(category, {
+            "category": category,
+            "label": category_labels.get(category, category),
+            "total": 0,
+            **{key: 0 for key in status_keys},
+            "usable": 0,
+            "unverified_done": 0,
+            "percent": 0,
+        })
+        stats["total"] += 1
+        raw_status = str(item.get("status") or "pending")
+        status = {
+            "running": "generating",
+            "retry": "retrying",
+        }.get(raw_status, raw_status)
+        if status not in status_keys:
+            status = "pending"
+        if status in ("generating", "retrying") and not live_run:
+            issues.append({
+                "item_id": item.get("id", ""),
+                "category": category,
+                "shot_no": item.get("shot_no"),
+                "label": item.get("label", ""),
+                "status": "stale_active",
+                "issues": ["任务已经结束，此项不再生产中，已按待续产统计"],
+            })
+            status = "pending"
+        formal_asset = item_has_formal_asset(item)
+        if status in ("done", "reused"):
+            if formal_asset:
+                stats[status] += 1
+                stats["usable"] += 1
+            else:
+                stats["unverified_done"] += 1
+                issues.append({
+                    "item_id": item.get("id", ""),
+                    "category": category,
+                    "shot_no": item.get("shot_no"),
+                    "label": item.get("label", ""),
+                    "status": "unverified_done",
+                    "issues": ["清单标记完成，但未找到可用的正式资产"],
+                })
+        else:
+            stats[status] += 1
+
+        if status in ("generating", "retrying"):
+            try:
+                started_at = float(item.get("started_at") or timestamp)
+            except (TypeError, ValueError):
+                started_at = timestamp
+            active_items.append({
+                "item_id": item.get("id", ""),
+                "category": category,
+                "category_label": stats["label"],
+                "shot_no": item.get("shot_no"),
+                "label": item.get("label", ""),
+                "status": status,
+                "started_at": started_at,
+                "elapsed": round(max(0.0, timestamp - started_at), 1),
+            })
+        if status in ("awaiting_human", "failed"):
+            qc = item.get("qc") or {}
+            item_issues = list(qc.get("issues") or [])
+            if not item_issues and item.get("error"):
+                item_issues = [item["error"]]
+            issues.append({
+                "item_id": item.get("id", ""),
+                "category": category,
+                "shot_no": item.get("shot_no"),
+                "label": item.get("label", ""),
+                "status": status,
+                "issues": item_issues,
+            })
+
+    overall = {
+        "total": 0,
+        **{key: 0 for key in status_keys},
+        "usable": 0,
+        "unverified_done": 0,
+        "percent": 0,
+    }
+    ordered_categories = []
+    for category in categories.values():
+        category["percent"] = round(
+            category["usable"] * 100 / category["total"], 1
+        ) if category["total"] else 0
+        ordered_categories.append(category)
+        for key in ("total", *status_keys, "usable", "unverified_done"):
+            overall[key] += int(category[key])
+    overall["percent"] = round(
+        overall["usable"] * 100 / overall["total"], 1
+    ) if overall["total"] else 0
+    current_stage = (
+        str(running_task["stage"]) if running_task is not None
+        else str(episode["status"] or ""))
+    current_stage_label = (
+        str(running_task["name"]) if running_task is not None
+        else current_stage)
+    def parallel_limit(key, default):
+        try:
+            value = int(app.config.get("defaults", key, default=default))
+        except (TypeError, ValueError):
+            value = default
+        return max(1, min(value, 8))
+
+    image_limit = parallel_limit("parallel_images", 3)
+    video_limit = parallel_limit("parallel_videos", 4)
+    image_active = sum(
+        1 for item in active_items
+        if item["category"] in {
+            "character_candidate", "character_art", "character_sheet",
+            "scene_art", "shot_image", "frames",
+        })
+    video_active = 0
+    if running_task is not None and current_stage == "videos":
+        shot_numbers = {
+            int(item["shot_no"]) for item in plan_items
+            if item.get("category") == "shot_image"
+            and item.get("shot_no") is not None
+        }
+        missing_videos = sum(
+            1 for shot_no in shot_numbers
+            if not has_asset(
+                "video",
+                f"e{episode_number:03d}_shot{shot_no:03d}"))
+        video_active = min(video_limit, missing_videos)
+    overall.update({
+        "running": live_run,
+        "current_stage": current_stage,
+        "current_stage_label": current_stage_label,
+        "parallelism": {
+            "image": {"active": image_active, "limit": image_limit},
+            "video": {"active": video_active, "limit": video_limit},
+        },
+    })
+    return {
+        "updated_at": (render_plan or {}).get("updated_at"),
+        "calculated_at": timestamp,
+        "overall": overall,
+        "categories": ordered_categories,
+        "active_items": active_items,
+        "issues": issues,
+    }
+
+
 def _episode_payload(app, episode_id):
     episode = app.projects.get_episode(episode_id)
     if episode is None:
@@ -747,6 +995,8 @@ def _episode_payload(app, episode_id):
         for scene in blocking.get("scenes", []):
             scene["svg_url"] = _artifact_url(
                 app, scene.get("svg_uri", ""))
+    production_progress = _production_progress(
+        app, episode, render_plan)
     return {
         "build": BUILD,
         "episode": dict(episode),
@@ -790,6 +1040,7 @@ def _episode_payload(app, episode_id):
         "video_qc_report": video_qc_report,
         "video_qc_report_version": video_qc_report_v,
         "render_plan": render_plan,
+        "production_progress": production_progress,
         "image_failures": image_failures,
         "relations": relations,
         "image_acceleration": {

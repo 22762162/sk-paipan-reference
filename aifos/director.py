@@ -1505,7 +1505,7 @@ class Director:
                             "image_task_class", "image_quality", "unit_cost",
                             "qc", "started_at", "finished_at", "duration",
                             "reference_inputs", "revision", "prompt_used",
-                            "prompt_used_hash"):
+                            "prompt_used_hash", "output_uri"):
                     if key in prev:
                         item[key] = prev[key]
                 if prev.get("custom_prompt"):
@@ -4916,8 +4916,124 @@ class Director:
             payload.pop("prompt_contract", None)
             payload["prompt_compact"] = base_prompt
 
+    def reconcile_completed_shot_images(self, ctx):
+        """补登记旧批次已通过 QC、但因批次中途失败而遗留的关键帧。
+
+        旧并行调度会先把每张图及 QC 状态写入 render_plan，随后才批量
+        登记正式资产；若其中一张失败，已经通过的图片文件会留在磁盘，
+        却没有进入资产中心。断点续跑前先按三重条件恢复：
+        render_plan=done/reused、QC 明确通过、约定文件真实存在。失败稿
+        只补 output_uri 并升级为 awaiting_human，绝不登记成正式资产。
+        """
+        plan = self._plan_read(ctx)
+        by_id = {item.get("id"): item for item in plan.get("items", [])}
+        recovered = 0
+        exposed_failures = 0
+        changed = False
+        for shot in (ctx.get("storyboard") or {}).get("shots", []):
+            shot_no = int(shot["shot_no"])
+            item = by_id.get(f"shot:{shot_no}")
+            if item is None:
+                continue
+            uri = str(item.get("output_uri") or "")
+            if not uri:
+                candidate = (
+                    Path(ctx["out_root"]) / "images"
+                    / f"shot_{shot_no:03d}.keyframe.png")
+                if candidate.exists():
+                    uri = str(candidate)
+                    item["output_uri"] = uri
+                    changed = True
+            if not uri or (
+                    not uri.startswith(("http://", "https://"))
+                    and not Path(uri).exists()):
+                continue
+            qc = item.get("qc") or {}
+            if qc.get("passed") is False:
+                if item.get("status") != "awaiting_human":
+                    item["status"] = "awaiting_human"
+                    changed = True
+                attempts = int(qc.get("attempts") or 1)
+                qc.update({
+                    "awaiting_human": True,
+                    "auto_repairs": max(0, attempts - 1),
+                    "auto_repair_exhausted": True,
+                })
+                item["qc"] = qc
+                exposed_failures += 1
+                changed = True
+                continue
+            if (item.get("status") not in ("done", "reused")
+                    or qc.get("passed") is not True):
+                continue
+            asset_name = self._shot_name(ctx, shot_no)
+            if self._existing_asset_uri(ctx, "image", asset_name):
+                continue
+            decision = {
+                "level": item.get("image_quality") or "medium",
+                "recommended": item.get("recommended_quality")
+                or item.get("image_quality") or "medium",
+                "source": item.get("quality_source") or "recovered",
+                "rule": item.get("quality_rule") or "",
+                "reasons": list(item.get("quality_reasons") or []),
+            }
+            recovered_meta = {
+                "recovered_from_render_plan": True,
+                "render_plan_item": item.get("id"),
+            }
+            for key in (
+                    "provider", "model", "real", "fallbacks",
+                    "image_task_class", "unit_cost", "qc",
+                    "reference_inputs", "prompt_used", "prompt_used_hash",
+                    "started_at", "finished_at", "duration"):
+                if key in item:
+                    recovered_meta[key] = item[key]
+            self._register_shot_asset(
+                ctx, "image", shot_no, uri,
+                meta=self._shot_image_meta(
+                    ctx, shot, decision, recovered_meta))
+            recovered += 1
+        if changed:
+            plan["updated_at"] = now()
+            self._plan_write(ctx, plan)
+        if recovered or exposed_failures:
+            self.log.info(
+                "director",
+                f"关键帧断点对账:补登记 {recovered} 张已通过图片，"
+                f"保留 {exposed_failures} 张待人工失败稿")
+        return {
+            "recovered": recovered,
+            "awaiting_human": exposed_failures,
+        }
+
+    def _preflight_plan_incomplete(self, ctx):
+        """关键帧/首尾帧仍缺失或待人工时，不得显示为可确认 Seedance。"""
+        for item in self._plan_read(ctx).get("items", []):
+            category = item.get("category")
+            if category not in ("shot_image", "frames"):
+                continue
+            if (item.get("status") not in ("done", "reused")
+                    or (item.get("qc") or {}).get("passed") is False):
+                return True
+            shot_no = item.get("shot_no")
+            if shot_no is None:
+                continue
+            asset_name = self._shot_name(ctx, int(shot_no))
+            if category == "shot_image":
+                if not self._existing_asset_uri(
+                        ctx, "image", asset_name):
+                    return True
+            elif not (
+                    self._existing_asset_uri(
+                        ctx, "first_frame", asset_name)
+                    and self._existing_asset_uri(
+                        ctx, "last_frame", asset_name)):
+                return True
+        return False
+
     def _stage_images(self, ctx):
         self._plan_seed_shots(ctx)
+        reconciliation = self.reconcile_completed_shot_images(ctx)
         # 生产画布:出图一开始就落盘人物/场景/镜头关系线,
         # 前端画布与出图/质检提示词共用,牵引人物关联性不漂移
         ctx["relations"] = write_relations(
@@ -4999,7 +5115,10 @@ class Director:
                 "请点击问题项定位并手动修改后，从断点继续。"
                 "问题镜头: "
                 + "、".join(str(value) for value in failed_shots))
-        return {"count": len(ctx["images"]), "reused": reused}
+        return {
+            "count": len(ctx["images"]), "reused": reused,
+            "recovered": reconciliation["recovered"],
+        }
 
     def _stage_text_assets(self, ctx):
         """所有可读文字先由关键帧锁定；无文字单元自动通过。"""
@@ -7932,6 +8051,13 @@ class Director:
             if row and row["status"] in ("cast", "cancelling"):
                 self.projects.set_episode_status(
                     episode["id"], previous_status)
+            elif (row and previous_status == "failed"
+                  and row["status"] == "awaiting_confirm"
+                  and self._preflight_plan_incomplete(ctx)):
+                # 自动/批量重画会暂时进入 awaiting_confirm；若本集仍有缺图、
+                # 待生产或二次 QC 失败项，必须保持失败/待处理状态，不能
+                # 让页面误报“预生产已完成，可以开始 Seedance”。
+                self.projects.set_episode_status(episode["id"], "failed")
         self.log.info(
             "director",
             f"批量质检完成:{checked} 张,通过 {passed},未过 {failed},"
@@ -8099,6 +8225,10 @@ class Director:
             if row and row["status"] in ("cast", "cancelling"):
                 self.projects.set_episode_status(
                     episode["id"], previous_status)
+            elif (row and previous_status == "failed"
+                  and row["status"] == "awaiting_confirm"
+                  and self._preflight_plan_incomplete(ctx)):
+                self.projects.set_episode_status(episode["id"], "failed")
         self.log.info("director", f"批量重画完成:{redone} 张")
         if progress:
             progress(phase="done", total=total, completed=processed,

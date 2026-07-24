@@ -385,6 +385,95 @@ def test_stage_images_collects_qc_failure_and_finishes_later_shots(
                for n in (1, 3, 4))
 
 
+def test_reconcile_completed_shot_images_recovers_only_qc_passed_files(app):
+    """旧批次中断后，只补登记已通过 QC 的落盘图；失败稿继续隔离。"""
+    project, _ = app.projects.get_or_create_project("旧批次关键帧对账")
+    episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+    out_root = (app.workspace.artifacts_dir / f"p{project['id']:03d}"
+                / "e001")
+    images_dir = out_root / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    passed_uri = images_dir / "shot_001.keyframe.png"
+    failed_uri = images_dir / "shot_002.keyframe.png"
+    legacy_failed_uri = images_dir / "shot_004.keyframe.png"
+    unchecked_uri = images_dir / "shot_005.keyframe.png"
+    passed_uri.write_bytes(b"\x89PNG\r\n\x1a\n" + b"p" * 24)
+    failed_uri.write_bytes(b"\x89PNG\r\n\x1a\n" + b"f" * 24)
+    legacy_failed_uri.write_bytes(b"\x89PNG\r\n\x1a\n" + b"l" * 24)
+    unchecked_uri.write_bytes(b"\x89PNG\r\n\x1a\n" + b"u" * 24)
+    ctx = {
+        "project": dict(project),
+        "episode": dict(episode),
+        "out_root": out_root,
+        "script": {
+            "scenes": [{"scene_no": 1, "location": "东宫"}],
+        },
+        "storyboard": {"shots": [
+            {"shot_no": 1, "scene_no": 1, "characters": ["朱慈烺"]},
+            {"shot_no": 2, "scene_no": 1, "characters": ["朱慈烺"]},
+            {"shot_no": 3, "scene_no": 1, "characters": []},
+            {"shot_no": 4, "scene_no": 1, "characters": ["朱慈烺"]},
+            {"shot_no": 5, "scene_no": 1, "characters": ["朱慈烺"]},
+        ]},
+    }
+    app.director._plan_write(ctx, {"items": [
+        {
+            "id": "shot:1", "category": "shot_image",
+            "shot_no": 1, "status": "done",
+            "image_quality": "high",
+            "qc": {"passed": True, "attempts": 2, "issues": []},
+        },
+        {
+            "id": "shot:2", "category": "shot_image",
+            "shot_no": 2, "status": "failed",
+            "image_quality": "high",
+            "qc": {
+                "passed": False, "attempts": 2,
+                "issues": ["人物年龄感漂移"],
+            },
+        },
+        {
+            "id": "shot:3", "category": "shot_image",
+            "shot_no": 3, "status": "done",
+            "image_quality": "medium",
+            "qc": {"passed": True, "attempts": 1, "issues": []},
+        },
+        {
+            "id": "shot:4", "category": "shot_image",
+            "shot_no": 4, "status": "done",
+            "image_quality": "high",
+            "qc": {
+                "passed": False, "attempts": 1,
+                "issues": ["旧逻辑误标完成"],
+            },
+        },
+        {
+            "id": "shot:5", "category": "shot_image",
+            "shot_no": 5, "status": "done",
+            "image_quality": "medium",
+        },
+    ]})
+
+    result = app.director.reconcile_completed_shot_images(ctx)
+
+    assert result == {"recovered": 1, "awaiting_human": 2}
+    formal = app.assets.active_list(project["id"], kind="image")
+    assert [(row["name"], row["uri"]) for row in formal] == [
+        ("e001_shot001", str(passed_uri))]
+    plan = app.director._plan_read(ctx)
+    by_id = {item["id"]: item for item in plan["items"]}
+    assert by_id["shot:1"]["output_uri"] == str(passed_uri)
+    assert by_id["shot:2"]["status"] == "awaiting_human"
+    assert by_id["shot:2"]["output_uri"] == str(failed_uri)
+    assert by_id["shot:2"]["qc"]["auto_repair_exhausted"] is True
+    assert "output_uri" not in by_id["shot:3"]
+    assert by_id["shot:4"]["status"] == "awaiting_human"
+    assert by_id["shot:4"]["output_uri"] == str(legacy_failed_uri)
+    assert by_id["shot:5"]["output_uri"] == str(unchecked_uri)
+    assert app.assets.latest(
+        project["id"], "image", "e001_shot005") is None
+
+
 def test_qc_report_lands_in_plan(app):
     """初始母资产不空耗视觉 QC；正式镜头图必须带通过结果。"""
     project = _preproduce(app)

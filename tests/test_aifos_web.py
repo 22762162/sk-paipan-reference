@@ -10,6 +10,7 @@ import time
 import pytest
 
 from aifos.app import App
+from aifos.db import now
 from aifos.director import character_candidate_target
 from aifos.story_analysis import build_story_analysis, validate_story_analysis
 from aifos.web.server import JobRegistry, serve
@@ -353,6 +354,113 @@ def test_episode_exposes_image_failures_with_artifact_urls(server):
     assert failed_url.startswith("/artifacts/")
     status, ctype, raw = _request(server["port"], "GET", failed_url)
     assert status == 200 and ctype.startswith("image/png") and raw
+
+
+def test_episode_production_progress_uses_verified_formal_assets(server):
+    """完成进度只认正式资产，并准确列出正在生产和待处理问题。"""
+    app2 = App(server["workspace"])
+    try:
+        project, _ = app2.projects.get_or_create_project("真实生产进度")
+        episode, _ = app2.projects.get_or_create_episode(project["id"], 1)
+        out_root = (app2.workspace.artifacts_dir / f"p{project['id']:03d}"
+                    / "e001")
+        completed = out_root / "images" / "shot-1.png"
+        completed.parent.mkdir(parents=True, exist_ok=True)
+        completed.write_bytes(b"\x89PNG\r\n\x1a\n" + b"d" * 32)
+        app2.assets.register(
+            project["id"], "image", "e001_shot001",
+            uri=str(completed))
+        started_at = time.time() - 12
+        app2.director._plan_write({
+            "out_root": out_root,
+        }, {"items": [
+            {
+                "id": "shot:1", "category": "shot_image",
+                "label": "镜头 01", "shot_no": 1, "status": "done",
+            },
+            {
+                "id": "shot:2", "category": "shot_image",
+                "label": "镜头 02", "shot_no": 2, "status": "done",
+            },
+            {
+                "id": "shot:3", "category": "shot_image",
+                "label": "镜头 03", "shot_no": 3,
+                "status": "generating", "started_at": started_at,
+            },
+            {
+                "id": "shot:4", "category": "shot_image",
+                "label": "镜头 04", "shot_no": 4,
+                "status": "awaiting_human",
+                "qc": {"issues": ["人物身份不一致"]},
+            },
+            {
+                "id": "frames:1", "category": "frames",
+                "label": "镜头 01 首尾帧", "shot_no": 1,
+                "status": "reused",
+            },
+        ]})
+        stamp = now()
+        app2.db.execute(
+            "INSERT INTO tasks(episode_id, stage, name, status, created_at, "
+            "updated_at) VALUES(?,?,?,?,?,?)",
+            (episode["id"], "images", "批量关键帧", "running",
+             stamp, stamp))
+        episode_id = episode["id"]
+    finally:
+        app2.close()
+
+    status, detail = _json_request(
+        server["port"], "GET", f"/api/episode/{episode_id}")
+    assert status == 200
+    progress = detail["production_progress"]
+    shots = next(item for item in progress["categories"]
+                 if item["category"] == "shot_image")
+    assert shots["total"] == 4
+    assert shots["done"] == 1
+    assert shots["usable"] == 1
+    assert shots["unverified_done"] == 1
+    assert shots["generating"] == 1
+    assert shots["awaiting_human"] == 1
+    assert shots["percent"] == 25.0
+    assert progress["overall"]["running"] is True
+    assert progress["overall"]["parallelism"]["image"] == {
+        "active": 1, "limit": 3}
+    assert progress["overall"]["parallelism"]["video"] == {
+        "active": 0, "limit": 4}
+    frames = next(item for item in progress["categories"]
+                  if item["category"] == "frames")
+    assert frames["reused"] == 0
+    assert frames["unverified_done"] == 1
+    active = progress["active_items"]
+    assert len(active) == 1
+    assert active[0]["item_id"] == "shot:3"
+    assert active[0]["shot_no"] == 3
+    assert active[0]["elapsed"] >= 11
+    issues = {item["item_id"]: item for item in progress["issues"]}
+    assert issues["shot:2"]["status"] == "unverified_done"
+    assert issues["shot:4"]["issues"] == ["人物身份不一致"]
+    assert issues["frames:1"]["status"] == "unverified_done"
+
+    app3 = App(server["workspace"])
+    try:
+        app3.db.execute(
+            "UPDATE tasks SET status='done', updated_at=? "
+            "WHERE episode_id=? AND status='running'",
+            (now(), episode_id))
+    finally:
+        app3.close()
+    status, detail = _json_request(
+        server["port"], "GET", f"/api/episode/{episode_id}")
+    assert status == 200
+    progress = detail["production_progress"]
+    assert progress["overall"]["running"] is False
+    assert progress["active_items"] == []
+    shots = next(item for item in progress["categories"]
+                 if item["category"] == "shot_image")
+    assert shots["generating"] == 0
+    assert shots["pending"] == 1
+    issues = {item["item_id"]: item for item in progress["issues"]}
+    assert issues["shot:3"]["status"] == "stale_active"
 
 
 def test_episode_payload_upgrades_legacy_story_analysis(server):
