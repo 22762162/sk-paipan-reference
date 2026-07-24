@@ -225,8 +225,8 @@ def character_candidate_target(character):
 
 def character_candidate_policy_text():
     return ("主角5张；重要配角3张；非重要角色固定1张；"
-            "跑龙套/背景路人不做独立设定、不生成候选图或立绘")
-
+            "跑龙套/背景路人不做独立设定、不生成候选图或立绘；"
+            "所有候选继承本剧唯一画风，只比较人物身份与剧情造型细节")
 
 def character_production_readiness_error(script, analysis=None):
     labels = unresolved_character_labels(script)
@@ -254,13 +254,13 @@ def character_production_readiness_error(script, analysis=None):
                 "请先重新运行 AI 人物分析。")
     return None
 
-# 人物定版不是“同一套造型换几个动作”。候选分别承担不同的选角方向，
-# 但都受角色年龄、职业、物种、时代和项目画风约束。候选被人工锁定后，
-# 其完整脸、发型、妆容与服装才成为后续镜头不可漂移的身份锚点。
+# 人物定版候选不承担“选画风”的职责。本剧画风由项目/制作圣经唯一锁定；
+# 多张候选只用于比较同一画风下的人物身份、表情和剧情造型细节。候选被人工
+# 锁定后，其完整脸、发型、妆容与服装才成为后续镜头不可漂移的身份锚点。
 CHARACTER_LOOK_VARIANTS = (
     {
         "variant_id": "story_baseline",
-        "variant_label": "角色本色",
+        "variant_label": "候选 A · 基准身份",
         "look_variant": {
             "hair": "采用剧本人物设定中的基准发型",
             "makeup": "采用剧本人物设定中的基准妆容或面部修饰",
@@ -270,42 +270,42 @@ CHARACTER_LOOK_VARIANTS = (
     },
     {
         "variant_id": "clean_minimal",
-        "variant_label": "清爽极简",
+        "variant_label": "候选 B · 发型细节",
         "look_variant": {
-            "hair": "相对基准明显改变梳法和轮廓，整洁、轻盈、露出更多面部",
-            "makeup": "低饱和清透妆或自然克制修饰，保留真实肤质",
-            "costume": "简洁轻量、符合角色时代的层次与明亮中性色，轮廓不得复刻基准服装",
-            "temperament": "清爽、亲近、可信赖，表演自然不刻意",
+            "hair": "同一发型体系内做轻微梳理和发丝整理差异，不改变身份轮廓",
+            "makeup": "保持基准妆造和本剧统一媒介，只做不可改变身份的轻微强弱差异",
+            "costume": "保持基准服装体系，只调整剧情允许的层次或细节",
+            "temperament": "同一核心性格，表情略偏清爽自然，不能改变人物气质",
         },
     },
     {
         "variant_id": "sharp_professional",
-        "variant_label": "干练正式",
+        "variant_label": "候选 C · 表情细节",
         "look_variant": {
-            "hair": "相对基准改为利落收束、侧分或更有结构的正式轮廓",
-            "makeup": "眉眼与面部轮廓更清晰的正式妆或精致理容，克制不过浓",
-            "costume": "挺括、有结构感的正式造型与更深配色，符合角色身份和时代",
-            "temperament": "冷静、专业、有掌控力，站姿更坚定",
+            "hair": "保持基准发型轮廓、发际线和发色家族，不更换发型体系",
+            "makeup": "保持基准妆造，只让眉眼表情和面部明暗更清晰",
+            "costume": "保持基准服装体系，不能以更换画风或时代服装制造差异",
+            "temperament": "同一核心性格，表情略偏专注坚定，不能变成另一种人设",
         },
     },
     {
         "variant_id": "soft_relaxed",
-        "variant_label": "松弛亲和",
+        "variant_label": "候选 D · 职业细节",
         "look_variant": {
-            "hair": "相对基准改为自然松散、柔软纹理或轻微碎发的生活化轮廓",
-            "makeup": "暖调轻透妆或柔和自然修饰，降低攻击性",
-            "costume": "柔软面料、舒展层次和温暖配色的日常造型，不复刻其他候选",
-            "temperament": "温暖、松弛、有生活气和亲近感",
+            "hair": "保持基准发型轮廓，只允许不改变身份的自然发丝差异",
+            "makeup": "保持基准妆造体系，不能改成另一种媒介或人物年龄感",
+            "costume": "保持职业、时代和剧情服装体系，突出一个可追溯的职业细节",
+            "temperament": "同一核心性格，补充与职业/经历一致的自然状态",
         },
     },
     {
         "variant_id": "signature_statement",
-        "variant_label": "高辨识造型",
+        "variant_label": "候选 E · 标志特征",
         "look_variant": {
-            "hair": "在剧情允许范围内采用最有记忆点的轮廓、编束或非对称梳法",
-            "makeup": "强化一个清晰重点的镜头妆或面部修饰，精致但不舞台化过度",
-            "costume": "用标志性剪裁、材质或强调色建立角色记忆点，仍符合身份与时代",
-            "temperament": "更强的镜头存在感和角色辨识度，不改变核心性格",
+            "hair": "保持基准发型轮廓和身份标志，只强化一个可辨识的小细节",
+            "makeup": "保持基准妆造和本剧统一画风，只强化人物已有的眉眼重点",
+            "costume": "保持基准服装、时代和职业逻辑，只强化一个故事来源明确的细节",
+            "temperament": "同一核心性格，呈现最清晰的角色标志性神态",
         },
     },
 )
@@ -1192,20 +1192,27 @@ class Director:
                 f"{WORKWEAR_RULE}{CHARACTER_BACKGROUND_RULE}")
 
     def _candidate_variant(self, index, design=None):
-        """返回真实写入提示词和资产元数据的候选造型方向。"""
+        """返回同一项目画风下的候选差异轴和资产元数据。"""
         template = CHARACTER_LOOK_VARIANTS[index - 1]
         look = dict(template["look_variant"])
-        if index == 1 and design:
-            look.update({
-                "hair": str(design.get("hair") or look["hair"]),
-                "makeup": str(design.get("makeup") or look["makeup"]),
-                "costume": ";".join(filter(None, (
-                    str(design.get("costume") or "").strip(),
-                    str(design.get("costume_detail") or "").strip(),
-                ))) or look["costume"],
-                "temperament": str(
-                    design.get("temperament") or look["temperament"]),
-            })
+        if design:
+            base_costume = ";".join(filter(None, (
+                str(design.get("costume") or "").strip(),
+                str(design.get("costume_detail") or "").strip(),
+            )))
+            base = {
+                "hair": str(design.get("hair") or "").strip(),
+                "makeup": str(design.get("makeup") or "").strip(),
+                "costume": base_costume,
+                "temperament": str(design.get("temperament") or "").strip(),
+            }
+            for key, value in base.items():
+                if not value:
+                    continue
+                if index == 1:
+                    look[key] = value
+                else:
+                    look[key] = f"基准设定:{value}；本候选{look[key]}"
         story_variants = self._story_variants(design)
         story_variant = (story_variants[index - 1]
                          if index <= len(story_variants) else None)
@@ -1255,7 +1262,7 @@ class Director:
 
     def _candidate_portrait_prompt(self, name, role, style, design, variant,
                                    has_reference=False):
-        """把内部人物分析编译成单张图可执行的简洁提示词。"""
+        """把内部分析编译成同一项目画风下、单张图可执行的提示词。"""
         final_card = self._design_value(
             (design or {}).get("image_prompt"))
         if final_card:
@@ -1286,21 +1293,21 @@ class Director:
         look = variant["look_variant"]
         if has_reference:
             hair = (
-                f"{look['hair']}；保持参考图发际线、发量和发色家族，"
-                "但必须改变梳法/轮廓以便人工选择")
+                "严格保持参考图发型轮廓、发际线、发量和发色家族；"
+                "候选不改变发型身份，只允许自然发丝状态差异")
             makeup = (
-                f"{look['makeup']}；只改变妆容强度与配色，"
-                "不得改变五官结构、年龄感或性别表达")
+                "严格保持参考图妆造、眉眼、眼线、睫毛和唇妆身份；"
+                "候选不改变妆造体系")
             variant_rule = (
                 "有参考图时只锁人物脸型、五官骨相、年龄、性别表达、发际线"
-                "和身份标志；候选阶段允许发型梳法、妆容、服装、配色与气质"
-                "按本套方向变化，禁止换脸")
+                "、发型、妆造和身份标志；候选只允许剧情服装细节、表情和轻微"
+                "姿态差异，禁止换脸、换发型或换画风")
         else:
             hair = look["hair"]
             makeup = look["makeup"]
             variant_rule = (
-                "无参考图时,可按本套造型方向变化脸部细节、发型和妆容,"
-                "但不得改变年龄、物种和核心人物气质")
+                "无参考图时,可在同一项目画风、时代、职业和核心人物气质内"
+                "做有限的发型/妆容/表情细节差异,不得制作不同画风候选")
         return (
             f"【任务】{name}（{role}）单人定角候选 · {variant['variant_label']}。"
             "不同候选是互斥造型，不是同一套衣服只换动作。"
@@ -1314,7 +1321,8 @@ class Director:
             + (f";配饰/道具:{variant.get('story_variant', {}).get('props') or variant.get('story_variant', {}).get('accessories')}"
                if variant.get("story_variant", {}).get("props")
                or variant.get("story_variant", {}).get("accessories") else "")
-            + f"【画风】{style}。"
+            + f"【PROJECT STYLE LOCK】本项目唯一画风:{style}；"
+            "所有候选必须完全一致，不得制作不同画风候选。"
             "职业人物必须穿真实可辨认的工作服/制服并保留必要装备。"
             "人物立绘必须是纯净、无文字的单人物资产背景。"
             "【构图】单人、全身正面自然站姿、从头到脚完整、纯净中性棚拍背景；"
@@ -3480,7 +3488,7 @@ class Director:
                         }
                 variant_by_candidate[(name, index)] = variant
                 if variant["variant_source"] == "legacy":
-                    prompt = "历史候选未记录独立造型方向，请按当前角色重要度规则重新生成"
+                    prompt = "历史候选未记录候选差异轴，请按当前项目唯一画风和角色重要度规则重新生成"
                 else:
                     prompt = self._candidate_portrait_prompt(
                         name, role, style, designs.get(name), variant,
@@ -4525,8 +4533,8 @@ class Director:
             elif ref_role == "identity":
                 binding = (
                     f"只锁定{attach or '所关联人物'}的脸、年龄、性别表达、"
-                    + ("发际线/发量/发色家族和身份标志；候选阶段允许按"
-                       "造型方向改变发型梳法与轮廓；"
+                    + ("发际线/发量/发色家族和身份标志；候选阶段不改变发型和妆造，"
+                       "只比较剧情服装细节、表情与轻微姿态；"
                        if payload.get("portrait_candidate") else
                        "发际线、发型轮廓和身份标志；")
                     + "不复制服装、姿势、背景或其他人物")

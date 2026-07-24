@@ -114,6 +114,8 @@ def test_candidate_prompts_create_real_look_variants_without_locking_style(app):
     assert all("人物立绘必须是纯净、无文字的单人物资产背景" in prompt
                for prompt in prompts)
     assert all("无参考图时" in prompt for prompt in prompts)
+    assert all("PROJECT STYLE LOCK" in prompt for prompt in prompts)
+    assert all("不得制作不同画风候选" in prompt for prompt in prompts)
     assert "齐肩内扣短发" in prompts[0]
 
 
@@ -181,20 +183,22 @@ def test_shot_uses_individual_canonical_view_not_review_board(app):
         {"description": "正面走入房间"}) == ("front",)
 
 
-def test_reference_portrait_locks_face_but_varies_hair_and_workwear(app):
+def test_reference_portrait_locks_face_hair_makeup_and_workwear(app):
     design = {"appearance": "鹅蛋脸", "hair": "齐肩短发", "costume": "外卖制服"}
     variant = app.director._candidate_variant(1, design)
     prompt = app.director._candidate_portrait_prompt(
         "外卖小哥", "非重要配角", "现代半写实", design, variant,
         has_reference=True)
     assert "只锁人物脸型、五官骨相" in prompt
-    assert "必须改变梳法/轮廓以便人工选择" in prompt
+    assert "严格保持参考图发型轮廓" in prompt
+    assert "候选不改变发型身份" in prompt
+    assert "候选不改变妆造体系" in prompt
     assert "禁止换脸" in prompt
     assert "外卖小哥" in prompt and "工作服/制服" in prompt
     assert "纯净、无文字的单人物资产背景" in prompt
 
 
-def test_candidate_reference_semantics_lock_face_but_release_look():
+def test_candidate_reference_semantics_lock_project_style_and_identity():
     payload = {
         "portrait_candidate": True,
         "style": "现代都市半写实",
@@ -202,9 +206,11 @@ def test_candidate_reference_semantics_lock_face_but_release_look():
     }
     ref_line = _ref_line(payload)
     assert "脸是最高标准" in ref_line
-    assert "发型梳法" in ref_line
-    assert "妆容、服装、配色、姿态按本候选造型方向明显变化" in ref_line
+    assert "发型轮廓、发量、发色家族、妆造" in ref_line
+    assert "不得改脸、换发型、换妆造或换画风" in ref_line
     style_line = _style_line(payload)
+    assert "不存在候选画风选项" in style_line
+    assert "不得通过更换媒介、渲染、色彩系统或时代制造差异" in style_line
     assert "不得用同一造型只换动作" in style_line
     normal = _ref_line({"reference_images": ["/tmp/identity.png"]})
     assert "禁止换脸或换发型" in normal
