@@ -8245,12 +8245,25 @@ class Director:
                                 worker_ctx)["items"]
                              if entry["id"] == item_id), item)
                         refs = refreshed.get("reference_inputs") or {}
-                        report = worker_director._qc_one(
-                            worker_project, worker_episode, worker_ctx,
-                            refreshed)
+                        try:
+                            report = worker_director._qc_one(
+                                worker_project, worker_episode, worker_ctx,
+                                refreshed)
+                            qc_error = ""
+                        except AifosError as exc:
+                            # Match the serial path: a successful redraw still
+                            # counts as redone when the follow-up QC provider is
+                            # unavailable; the item remains visible for manual
+                            # checking instead of being miscounted as a redraw
+                            # failure.
+                            worker_director.log.warn(
+                                "director", f"重画后复检 {item_id} 跳过: {exc}")
+                            report = None
+                            qc_error = str(exc)
                     return {
                         "index": index, "item_id": item_id, "label": label,
                         "redone": True, "report": report,
+                        "qc_error": qc_error,
                         "references_attached": bool(refs.get("attached")),
                         "reference_count": int(refs.get("count") or 0),
                         "codex_profile": profile_id,
@@ -8304,12 +8317,13 @@ class Director:
                             f"重画 {item_id} 跳过: {result.get('error', '')}")
                     else:
                         redone += 1
-                        report = result.get("report") or {}
-                        checked += 1
-                        if report.get("passed"):
-                            qc_passed += 1
-                        else:
-                            qc_failed += 1
+                        report = result.get("report")
+                        if report is not None:
+                            checked += 1
+                            if report.get("passed"):
+                                qc_passed += 1
+                            else:
+                                qc_failed += 1
                     processed += 1
                     if progress:
                         progress(
@@ -8324,6 +8338,7 @@ class Director:
                                 "references_attached", False),
                             reference_count=result.get("reference_count", 0),
                             codex_profile=result.get("codex_profile", ""),
+                            qc_error=result.get("qc_error", ""),
                             prompt_modified=True,
                             revision_note=result.get("feedback", ""),
                             parallel_workers=parallel_workers)
