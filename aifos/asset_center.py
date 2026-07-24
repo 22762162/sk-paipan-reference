@@ -148,6 +148,38 @@ class AssetCenter:
             project_id, kind, name, uri="", meta=tombstone,
             new_version=True)
 
+    def mark_superseded(self, asset_id, replacement_asset_id,
+                        reason="revision"):
+        """标记已被修正版替代的旧版本，但保留历史和原文件。
+
+        修正版已经通过 ``register(..., new_version=True)`` 成为同名资产的
+        最新版本，旧版本不应再被当前资产面板或参考图选择器误用。这里不
+        写删除墓碑（否则会把修正版一起遮蔽），而是在旧行上写入替代关系，
+        既能隐藏旧图的使用意图，又保留审计、回溯和重新导出能力。
+        """
+        old = self.get(asset_id)
+        if old is None:
+            return None
+        try:
+            old_id = int(old["id"])
+            replacement_id = int(replacement_asset_id)
+        except (TypeError, ValueError):
+            return old
+        if old_id == replacement_id:
+            return old
+        metadata = self.meta(old)
+        metadata.update({
+            "superseded": True,
+            "superseded_at": now(),
+            "superseded_by_asset_id": replacement_id,
+            "superseded_reason": str(reason or "revision"),
+        })
+        self.db.execute(
+            "UPDATE assets SET meta=? WHERE id=?",
+            (json.dumps(metadata, ensure_ascii=False), old_id),
+        )
+        return self.get(old_id)
+
     def delete(self, project_id, kind, name):
         """兼容旧调用：作废资产但不物理删除文件或历史。"""
         return self.soft_delete(project_id, kind, name)

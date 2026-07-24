@@ -8104,14 +8104,22 @@ class Director:
                     frames_payload["feedback"]),
                 payload=frames_payload, revision_source=revision_source)
             meta = self._quality_meta(frames_payload["quality_decision"])
-            self.assets.register(
+            new_first = self.assets.register(
                 ctx["project"]["id"], "first_frame", asset_name,
                 uri=frame_result.data["first"], meta=meta,
                 new_version=True)
-            self.assets.register(
+            new_last = self.assets.register(
                 ctx["project"]["id"], "last_frame", asset_name,
                 uri=frame_result.data["last"], meta=meta,
                 new_version=True)
+            if old_first is not None:
+                self.assets.mark_superseded(
+                    old_first["id"], new_first["id"],
+                    reason="frame_chain_revision")
+            if old_last is not None:
+                self.assets.mark_superseded(
+                    old_last["id"], new_last["id"],
+                    reason="frame_chain_revision")
             previous_last = frame_result.data["last"]
             affected.append(int(shot["shot_no"]))
             video = self.assets.latest(
@@ -8175,6 +8183,9 @@ class Director:
             reference_shots.update(self._sync_revised_video_references(
                 episode_id, project_id, old["id"] if old else None,
                 row, usable=formal_ready))
+            if old is not None:
+                self.assets.mark_superseded(
+                    old["id"], row["id"], reason="frame_revision")
             return row
 
         for kind, uri in updates.items():
@@ -8447,11 +8458,17 @@ class Director:
                 lambda: self._call(ctx, "image", payload, "cast"),
                 prompt=self._prompt_with_feedback(prompt, feedback),
                 payload=payload, revision_source=revision_source)
-            self.assets.register(
+            old_sheet = self.assets.latest(
+                project["id"], "character_sheet", raw)
+            new_sheet = self.assets.register(
                 project["id"], "character_sheet", raw, uri=result.uri,
                 meta={"character": name, "sheet": sheet_key,
                       "label": label, **self._quality_meta(quality)},
                 new_version=True)
+            if old_sheet is not None:
+                self.assets.mark_superseded(
+                    old_sheet["id"], new_sheet["id"],
+                    reason="character_sheet_revision")
         elif kind == "scene_art":
             name = target["name"]
             scene = next((s for s in script["scenes"]
@@ -8492,10 +8509,15 @@ class Director:
                 lambda: self._call(ctx, "image", payload, "cast"),
                 prompt=self._prompt_with_feedback(prompt, feedback),
                 payload=payload, revision_source=revision_source)
-            self.assets.register(project["id"], "scene_art", name,
-                                 uri=result.uri,
-                                 meta=self._quality_meta(quality),
-                                 new_version=True)
+            old_scene = self.assets.latest(
+                project["id"], "scene_art", name)
+            new_scene = self.assets.register(
+                project["id"], "scene_art", name, uri=result.uri,
+                meta=self._quality_meta(quality), new_version=True)
+            if old_scene is not None:
+                self.assets.mark_superseded(
+                    old_scene["id"], new_scene["id"],
+                    reason="scene_revision")
         elif kind == "shot":
             shot_no = int(target["shot_no"])
             storyboard, _ = self.projects.latest_document(
@@ -8584,6 +8606,10 @@ class Director:
                 episode["id"], project["id"],
                 old_image["id"] if old_image else None,
                 new_image, usable=formal_ready)
+            if old_image is not None:
+                self.assets.mark_superseded(
+                    old_image["id"], new_image["id"],
+                    reason="image_revision")
             sync = self._regenerate_revised_frame_chain(
                 ctx, storyboard, shot, feedback=feedback,
                 prompt_override=prompt_override,
@@ -8934,12 +8960,18 @@ class Director:
             uploaded_meta = {"uploaded": True, "image_quality": "high",
                              "recommended_quality": "high",
                              "quality_source": "manual_upload"}
-            self.assets.register(project["id"], kind, name,
-                                 uri=str(path), meta=uploaded_meta,
-                                 new_version=True)
+            new_asset = self.assets.register(
+                project["id"], kind, name, uri=str(path),
+                meta=uploaded_meta, new_version=True)
+            if latest is not None:
+                self.assets.mark_superseded(
+                    latest["id"], new_asset["id"],
+                    reason="manual_upload_revision")
             if kind == "character_art":
                 # 人工上传等同于明确确认最终立绘，同时建立真正的身份锚点。
-                self.assets.register(
+                old_identity = self.assets.latest(
+                    project["id"], "character_identity", name)
+                new_identity = self.assets.register(
                     project["id"], "character_identity", name,
                     uri=str(path),
                     meta={"character": name, "locked": True,
@@ -8948,6 +8980,10 @@ class Director:
                           "recommended_quality": "high",
                           "quality_source": "manual_upload"},
                     new_version=True)
+                if old_identity is not None:
+                    self.assets.mark_superseded(
+                        old_identity["id"], new_identity["id"],
+                        reason="manual_upload_revision")
             self.log.info("director", f"已上传替换 {kind}/{name}")
             return {"uri": str(path)}
         if kind == "shot":
@@ -9002,6 +9038,10 @@ class Director:
             reference_shots = self._sync_revised_video_references(
                 episode["id"], project["id"],
                 old_image["id"] if old_image else None, new_image)
+            if old_image is not None:
+                self.assets.mark_superseded(
+                    old_image["id"], new_image["id"],
+                    reason="manual_upload_revision")
             sync = self._regenerate_revised_frame_chain(
                 ctx, storyboard, shot, feedback="人工上传替换关键帧",
                 quality_override="high", revision_source="manual_upload")
@@ -9911,15 +9951,23 @@ class Director:
                             "reasons": list(item.get("quality_reasons")
                                             or []),
                         }
-                        self.assets.register(
+                        asset_name = self._shot_name(
+                            ctx, int(item["shot_no"]))
+                        old_image = self.assets.latest(
+                            project["id"], "image", asset_name)
+                        new_image = self.assets.register(
                             project["id"], "image",
-                            self._shot_name(ctx, int(item["shot_no"])),
+                            asset_name,
                             uri=uri,
                             meta=self._shot_image_meta(
                                 ctx, shot, decision,
                                 {"manual_qc_override": True,
                                  "manual_qc_note": message}),
                             new_version=True)
+                        if old_image is not None:
+                            self.assets.mark_superseded(
+                                old_image["id"], new_image["id"],
+                                reason="manual_qc_revision")
             if not uri:
                 skipped += 1
                 skipped_items.append({"item_id": item_id,

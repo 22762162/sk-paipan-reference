@@ -374,6 +374,25 @@ def test_produced_image_soft_delete_preserves_history(app):
         app.director.delete_image_asset(project["title"], row["id"])
 
 
+def test_corrected_asset_supersedes_old_version_without_deleting_history(app):
+    """修正版进入当前资产，错误旧图只隐藏并保留可回溯关系。"""
+    project = _preproduce(app, title="修正版替代")
+    old = app.assets.active_list(project["id"], "scene_art")[0]
+    replacement = app.assets.register(
+        project["id"], "scene_art", old["name"], uri=old["uri"],
+        meta={"revision": 2}, new_version=True)
+    superseded = app.assets.mark_superseded(
+        old["id"], replacement["id"], reason="scene_revision")
+
+    assert app.assets.active_list(project["id"], "scene_art") == [replacement]
+    metadata = app.assets.meta(superseded)
+    assert metadata["superseded"] is True
+    assert metadata["superseded_by_asset_id"] == replacement["id"]
+    assert Path(old["uri"]).exists()
+    assert len(app.assets.history(
+        project["id"], "scene_art", old["name"])) == 2
+
+
 def test_video_references_are_versioned_and_used(app):
     """按镜头选择资产图后，视频资产记录实际引用的 asset_id。"""
     project = _preproduce(app)
