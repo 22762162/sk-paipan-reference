@@ -33,6 +33,7 @@ from .quality_policy import (
     set_policy_choices,
 )
 from .prompt_contract import compile_shot_prompt
+from .qc_feedback import optimize_qc_feedback
 from .relations import relation_lines, write_relations
 from .spatial_blocking import (
     build_spatial_plan,
@@ -1975,9 +1976,13 @@ class Director:
             except (ProviderUnavailable, ProviderError) as exc:
                 # 人物镜头不能在质检故障时静默放行。保留已生成图片供人工
                 # 查看，但明确标成质检未过，后续不得当作正式参考图。
+                revision = optimize_qc_feedback(
+                    [f"质检产线不可用，图片未放行:{exc}"], mode="image")
                 result.qc = {
                     "passed": False,
                     "issues": [f"质检产线不可用，图片未放行:{exc}"],
+                    "revision_feedback": revision["text"],
+                    "revision_categories": revision["categories"],
                     "attempts": attempts + 1,
                     "identity_checked": False,
                     "gender_checked": False,
@@ -1992,6 +1997,9 @@ class Director:
             result.cost += qc_result.cost
             report = self._assess_image_qc(
                 qc_spec, qc_result.data or {}, attempts + 1)
+            revision = optimize_qc_feedback(report["issues"], mode="image")
+            report["revision_feedback"] = revision["text"]
+            report["revision_categories"] = revision["categories"]
             result.qc = report
             if report["passed"] or attempts >= self._qc_retries():
                 return result
@@ -1999,9 +2007,8 @@ class Director:
             attempts += 1
             payload = dict(payload)
             payload["feedback"] = ((payload.get("feedback") or "")
-                                   + ";自动定向修图：上一版图片质检不通过，"
-                                   "必须只修正以下身份/性别/人数问题:"
-                                   + "；".join(report["issues"]))[:800]
+                                   + ";" + revision["text"])[:1600]
+            payload["qc_revision"] = revision
             payload["qc_attempt"] = attempts
             payload["revision_mode"] = "targeted_qc_fix"
             payload["source_qc_uri"] = uri
@@ -5468,6 +5475,9 @@ class Director:
                 "\n【人工修订意见】这是人工检查后确认的本镜修订要求，"
                 "只修正以下问题并保持其余首尾帧、人物、服装、场景和口型不变："
                 + str(manual_feedback)[:1200])
+            compact += (
+                "\n【质检修订】只落实以下修订要求，其他首尾帧、人物、服装、"
+                "场景、构图和口型保持不变：" + str(manual_feedback)[:1600])
         payload = {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
@@ -5821,6 +5831,11 @@ class Director:
                 messages.append(str(review.get("drift_issue")
                                    or "逐段内容复核未通过"))
             messages = list(dict.fromkeys(messages))
+            revision = optimize_qc_feedback(
+                messages, mode="video") if messages else {
+                    "text": "", "categories": [], "issues": [],
+                    "instructions": [], "mode": "video",
+                }
             old = previous_shots.get(str(shot_no), {})
             auto_retries_used = int(old.get("auto_retries_used") or 0)
             generation_attempts = int(old.get("generation_attempts") or 1)
@@ -5834,6 +5849,8 @@ class Director:
                 "generation_attempts": generation_attempts,
                 "auto_retries_used": auto_retries_used,
                 "auto_retry_limit": VIDEO_QC_AUTO_RETRIES,
+                "revision_feedback": revision["text"],
+                "revision_categories": revision["categories"],
                 "awaiting_human": bool(messages)
                 and auto_retries_used >= VIDEO_QC_AUTO_RETRIES,
             })
@@ -5901,6 +5918,15 @@ class Director:
                 break
             if attempt >= max_rounds - 1:
                 break
+            if video_shots:
+                by_shot = {
+                    int(item["shot_no"]): item
+                    for item in video_qc.get("shots", [])}
+                ctx["video_feedback"] = {
+                    int(shot_no): (by_shot.get(int(shot_no), {})
+                                   .get("revision_feedback") or "")
+                    for shot_no in video_shots
+                }
             self._rerun(ctx, report, video_shots=video_shots)
             if video_shots:
                 by_shot = {
@@ -5985,7 +6011,11 @@ class Director:
                 for v in ctx["videos"]]
             self.data.record(
                 "case", "failure", prompt=shots[shot_no]["prompt"],
-                meta={"reason": "qc_rerun", "shot_no": shot_no},
+                meta={
+                    "reason": "qc_rerun", "shot_no": shot_no,
+                    "revision_feedback": (ctx.get("video_feedback") or {})
+                    .get(int(shot_no), ""),
+                },
                 episode_id=ctx["episode"]["id"])
         lines = {}
         line_no = 0
@@ -6577,6 +6607,19 @@ class Director:
             "last_frame": lambda: (
                 f"frames:{int(target.get('shot_no', 0))}"),
         }.get(kind, lambda: "")()
+        plan_item = None
+        if item_id:
+            plan_item = next(
+                (entry for entry in self._plan_read(ctx)["items"]
+                 if entry.get("id") == item_id), None)
+            auto_revision = ((plan_item or {}).get("qc") or {}).get(
+                "revision_feedback") or ""
+            prompt_is_unchanged = (not prompt_override or prompt_override ==
+                                   (plan_item or {}).get("prompt", ""))
+            if (auto_revision and prompt_is_unchanged
+                    and "【自动优化修订】" not in feedback):
+                feedback = ((auto_revision + "\n【人工补充】" + feedback)
+                            if feedback else auto_revision)[:2400]
         policy = self._episode_quality_policy(episode["id"])
         if quality_override is not None and item_id:
             policy = set_policy_choices(
@@ -7415,6 +7458,11 @@ class Director:
         if previous.get("signature") == signature \
                 and "passed" in previous:
             cached = dict(previous)
+            if not cached.get("revision_feedback"):
+                revision = optimize_qc_feedback(
+                    cached.get("issues") or [], mode="image")
+                cached["revision_feedback"] = revision["text"]
+                cached["revision_categories"] = revision["categories"]
             cached["cached"] = True
             return cached
         passed_all, issues, cost = True, [], 0.0
@@ -7464,6 +7512,9 @@ class Director:
                   "identity_references": len(
                       spec.get("identity_references") or []),
                   "signature": signature, "cached": False}
+        revision = optimize_qc_feedback(issues, mode="image")
+        report["revision_feedback"] = revision["text"]
+        report["revision_categories"] = revision["categories"]
         self.projects.add_episode_cost(episode["id"], cost)
         self._plan_mark(ctx, item["id"], item.get("status", "done"),
                         extra={"qc": report})
@@ -7497,10 +7548,9 @@ class Director:
                                  else "last_frame"),
                         "shot_no": int(item.get("shot_no")),
                     }
-            feedback = (
-                "质检自动定向修图：必须逐项修正角色身份、性别和人数硬错误；"
-                "严格使用锁定最终立绘逐人对应，不得新增、删减、复制或合并人物。"
-                "上一版问题：" + "；".join(current.get("issues") or []))[:800]
+            revision = optimize_qc_feedback(
+                current.get("issues") or [], mode="image")
+            feedback = revision["text"][:1600]
             self.log.warn(
                 "director",
                 f"{item['id']} 触发自动修图第{attempt + 1}次:"
@@ -7646,9 +7696,10 @@ class Director:
                     continue
                 issues = list((item.get("qc") or {}).get("issues") or [])
                 if issues:
-                    feedback = (
-                        "批量重画自动修正：必须逐项解决上一版质检问题："
-                        + "；".join(issues))[:800]
+                    revision = optimize_qc_feedback(issues, mode="image")
+                    # 手动/批量提交也沿用与自动返工相同的修订编译器，
+                    # 让模型拿到可执行的改法，而不是只重复失败现象。
+                    feedback = revision["text"][:1600]
                     revision_source = "batch_qc"
                 else:
                     feedback = (
@@ -7749,15 +7800,26 @@ class Director:
         if not feedback:
             raise AifosError("请先填写视频质检问题与修改要求")
         project, episode = self._episode_ctx(project_title, episode_number)
+        try:
+            requested_shot_no = int(shot_no)
+        except (TypeError, ValueError):
+            raise AifosError("shot_no 必须是有效镜头编号")
+        # API 调用方可能只提交原始质检现象；在进入生成链路前自动补上
+        # 最近一次编译好的修订提示词，避免人工提交绕过自动修订规则。
+        video_qc_doc, _ = self.projects.latest_document(
+            episode["id"], "video_qc_report")
+        previous_shot_qc = next(
+            (item for item in (video_qc_doc or {}).get("shots", [])
+             if int(item.get("shot_no", -1)) == requested_shot_no), None)
+        auto_revision = (previous_shot_qc or {}).get("revision_feedback") or ""
+        if auto_revision and "【自动优化修订】" not in feedback:
+            feedback = (auto_revision + "\n【人工补充】" + feedback)[:2400]
         script, _ = self.projects.latest_document(episode["id"], "script")
         storyboard, _ = self.projects.latest_document(
             episode["id"], "storyboard")
         if not script or not storyboard:
             raise AifosError("本集尚未完成剧本和分镜，不能重生成视频")
-        try:
-            shot_no = int(shot_no)
-        except (TypeError, ValueError):
-            raise AifosError("shot_no 必须是有效镜头编号")
+        shot_no = requested_shot_no
         shot = next((item for item in storyboard.get("shots", [])
                      if int(item.get("shot_no", -1)) == shot_no), None)
         if shot is None:

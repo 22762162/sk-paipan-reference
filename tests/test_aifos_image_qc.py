@@ -81,6 +81,8 @@ def test_qc_fail_triggers_auto_redraw(app, tmp_path):
          "location": "", "action": "", "forbid": []})
     assert len(calls["image"]) == 2          # 首画 + 质检重画
     assert "小鹿被画成了动物" in calls["image"][1]["feedback"]
+    assert "【自动优化修订】" in calls["image"][1]["feedback"]
+    assert "物种" in calls["image"][1]["feedback"]
     assert result.qc["passed"] is True
     assert result.qc["attempts"] == 2
     assert result.cost == 3.0        # 两次出图(2.0)+两次质检(1.0)

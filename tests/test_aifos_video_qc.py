@@ -70,6 +70,9 @@ def test_video_qc_only_retries_once_then_waits_for_human(tmp_path):
         assert report["awaiting_human_shots"] == [1]
         assert report["shots"][0]["auto_retries_used"] == 1
         assert report["shots"][0]["generation_attempts"] == 2
+        assert "【自动优化修订】" in report["shots"][0]["revision_feedback"]
+        assert "首帧" in report["shots"][0]["revision_feedback"]
+        assert "尾帧" in report["shots"][0]["revision_feedback"]
         # 断点恢复/再次进入质检也不能把第三次自动返工偷偷触发。
         app.director._stage_qc(ctx)
         assert calls == [[1]]
