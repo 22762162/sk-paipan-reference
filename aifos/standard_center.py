@@ -44,6 +44,22 @@ DEFAULT_STANDARD = {
             "max_segment_seconds": 15,
             "time_precision_seconds": 0.5,
             "prompt_strategy": "five_dimensions_per_segment",
+            "prompt_contract": {
+                "schema": "aifos.shot-prompt/v1",
+                "order": [
+                    "subject", "scene", "start", "single_action",
+                    "performance", "camera", "end", "dialogue", "text",
+                    "references", "hard_constraints",
+                ],
+                "single_primary_action": True,
+                "single_camera_move": True,
+                "compact_prompt_sent_to_model": True,
+                "full_prompt_kept_for_audit": True,
+                "reference_roles": [
+                    "identity", "wardrobe", "scene", "composition",
+                    "spatial_blocking", "continuity", "style",
+                ],
+            },
             "fast_vip_real_face_conflict": "pause_for_confirmation",
         },
         "story_analysis": {
@@ -340,6 +356,29 @@ class StandardCenter:
         for key in ("pipeline_version", "text_lock_provider", "prompt_strategy",
                     "fast_vip_real_face_conflict"):
             nonempty_string(production, key, f"rules.production.{key}")
+        prompt_contract = required_dict(
+            production, "prompt_contract", "rules.production.prompt_contract")
+        nonempty_string(
+            prompt_contract, "schema", "rules.production.prompt_contract.schema")
+        for key in (
+                "single_primary_action", "single_camera_move",
+                "compact_prompt_sent_to_model", "full_prompt_kept_for_audit"):
+            bool_field(
+                prompt_contract, key,
+                f"rules.production.prompt_contract.{key}")
+        order = prompt_contract.get("order")
+        if (not isinstance(order, list) or len(order) < 5
+                or len(set(order)) != len(order)
+                or not all(isinstance(item, str) and item for item in order)):
+            issue(
+                "rules.production.prompt_contract.order",
+                "必须是无重复的镜头提示词字段顺序列表")
+        roles = prompt_contract.get("reference_roles")
+        if (not isinstance(roles, list) or not roles
+                or not all(isinstance(item, str) and item for item in roles)):
+            issue(
+                "rules.production.prompt_contract.reference_roles",
+                "必须是非空参考图职责列表")
         preferred = numeric_pair(
             production, "preferred_segment_seconds",
             "rules.production.preferred_segment_seconds", minimum=0.5,
@@ -618,6 +657,16 @@ class StandardCenter:
         if not isinstance(rules, dict):
             return snapshot
         changed = False
+        production_rules = rules.get("production")
+        production_defaults = DEFAULT_STANDARD["rules"]["production"]
+        if not isinstance(production_rules, dict):
+            rules["production"] = copy.deepcopy(production_defaults)
+            changed = True
+        else:
+            for key, value in production_defaults.items():
+                if key not in production_rules:
+                    production_rules[key] = copy.deepcopy(value)
+                    changed = True
         source = content.get("source_skill")
         source_defaults = DEFAULT_STANDARD["source_skill"]
         if (isinstance(source, dict)

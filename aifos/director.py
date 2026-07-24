@@ -32,6 +32,7 @@ from .quality_policy import (
     resolve_video_quality,
     set_policy_choices,
 )
+from .prompt_contract import compile_shot_prompt
 from .relations import relation_lines, write_relations
 from .spatial_blocking import (
     build_spatial_plan,
@@ -1483,7 +1484,8 @@ class Director:
                 for key in ("provider", "model", "real", "fallbacks",
                             "image_task_class", "image_quality", "unit_cost",
                             "qc", "started_at", "finished_at", "duration",
-                            "reference_inputs", "revision"):
+                            "reference_inputs", "revision", "prompt_used",
+                            "prompt_used_hash"):
                     if key in prev:
                         item[key] = prev[key]
                 if prev.get("custom_prompt"):
@@ -1595,6 +1597,9 @@ class Director:
             task.get("payload") or {}, ensure_ascii=False, default=str))
         prompt = self._prompt_with_feedback(
             payload.get("prompt", ""), payload.get("feedback", ""))
+        prompt_used = self._prompt_with_feedback(
+            payload.get("prompt_compact") or payload.get("prompt", ""),
+            payload.get("feedback", ""))
         refs = self._reference_inputs(payload)
         category = item.get("category", "")
         characters = [str(value) for value in payload.get("characters") or []]
@@ -1657,6 +1662,8 @@ class Director:
             "capability": task["capability"],
             "prompt": prompt,
             "prompt_hash": self._stable_hash(prompt),
+            "prompt_used": prompt_used,
+            "prompt_used_hash": self._stable_hash(prompt_used),
             "references": {
                 "required": True,
                 "count": len(reference_facts),
@@ -1672,6 +1679,7 @@ class Director:
         contract["passed"] = not contract["issues"]
         token_basis = {key: contract[key] for key in (
             "item_id", "category", "capability", "prompt_hash",
+            "prompt_used_hash",
             "reference_hash", "characters", "identity_map")}
         contract["token"] = self._stable_hash(token_basis)
         return contract
@@ -1760,6 +1768,8 @@ class Director:
         self._plan_mark(ctx, item_id, "generating", prompt=prompt,
                         extra={
                             "qc": None,
+                            "prompt_used": (payload or {}).get(
+                                "prompt_compact") or prompt or "",
                             "reference_inputs": self._reference_inputs(
                                 payload),
                             "revision": {
@@ -2275,6 +2285,8 @@ class Director:
                 "contract_token": row["contract_token"],
                 "prompt": contract.get("prompt", ""),
                 "prompt_hash": contract.get("prompt_hash", ""),
+                "prompt_used": contract.get("prompt_used", contract.get("prompt", "")),
+                "prompt_used_hash": contract.get("prompt_used_hash", ""),
                 "references": contract.get("references") or {
                     "required": True, "count": 0, "items": []},
                 "characters": contract.get("characters") or [],
@@ -2385,6 +2397,8 @@ class Director:
                 "contract_token": row["contract_token"],
                 "prompt": contract.get("prompt", ""),
                 "prompt_hash": contract.get("prompt_hash", ""),
+                "prompt_used": contract.get("prompt_used", contract.get("prompt", "")),
+                "prompt_used_hash": contract.get("prompt_used_hash", ""),
                 "references": contract.get("references") or {},
                 "characters": contract.get("characters") or [],
                 "provider": provider, "model": model,
@@ -4428,6 +4442,14 @@ class Director:
         # 前置绑定:参考图对照表进提示词——每张图是谁的、参考什么,
         # 出图前就写死,而不是靠事后质检纠错
         self._attach_reference_manifest(payload)
+        # 发送给图片模型的版本只保留本镜事实；完整 prompt 仍保留在
+        # payload['prompt'] 供人工审计，避免故事背景、全局风格与参考图
+        # 在模型输入里重复争权。
+        contract, compact = compile_shot_prompt(
+            shot, location=location, style=payload.get("style", ""),
+            references=payload.get("reference_manifest"), mode="image")
+        payload["prompt_contract"] = contract
+        payload["prompt_compact"] = compact
         return payload
 
     def _reference_manifest(self, payload):
@@ -4595,6 +4617,8 @@ class Director:
         payload["reference_manifest"] = manifest
         payload["prompt"] = base_prompt
         if not manifest:
+            payload.pop("prompt_contract", None)
+            payload.pop("prompt_compact", None)
             return
         lines = [f"图{entry['index']}={entry['label']}:{entry['binding']}"
                  for entry in manifest]
@@ -4604,6 +4628,17 @@ class Director:
             "每张图只允许执行其绑定用途；禁止跨用途传播、张冠李戴、"
             "把一个人的脸/服装/姿势/背景复制给另一个人):"
             + ";".join(lines))
+        # QC 定向重画、人工换参考图会再次进入这里；同步刷新实际发送的
+        # 短合同，避免新加入的“待修改基底”仍被旧提示词遮蔽。
+        if ("shot_no" in payload and not payload.get("portrait")
+                and not payload.get("character_sheet")
+                and not payload.get("scene_art")):
+            contract, compact = compile_shot_prompt(
+                payload, location=payload.get("location", ""),
+                style=payload.get("style", ""), references=manifest,
+                mode="image")
+            payload["prompt_contract"] = contract
+            payload["prompt_compact"] = compact
 
     def _stage_images(self, ctx):
         self._plan_seed_shots(ctx)
@@ -5429,6 +5464,15 @@ class Director:
             zip(reference_rows, reference_assets))]
         video_prompt = self._seedance_video_prompt(
             ctx, shot, reference_manifest)
+        video_refs = [
+            {"index": 1, "label": "首帧", "kind": "first_frame"},
+            {"index": 2, "label": "尾帧", "kind": "last_frame"},
+            *reference_manifest,
+        ]
+        contract, compact = compile_shot_prompt(
+            shot, location=self._shot_location(ctx.get("script"), shot),
+            style=ctx["project"].get("style", ""), references=video_refs,
+            mode="video")
         manual_feedback = (ctx.get("video_feedback") or {}).get(
             int(shot["shot_no"]), "")
         if manual_feedback:
@@ -5440,6 +5484,9 @@ class Director:
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
             "prompt": video_prompt,
+            "prompt_compact": compact,
+            "prompt_contract": contract,
+            "prompt_full": video_prompt,
             "duration": shot["duration"],
             "first": frame["first"],
             "last": frame["last"],
@@ -6290,6 +6337,8 @@ class Director:
                 (prior["version"] + 1) if prior else 1)
             if offset == 0 and prompt_override:
                 frames_payload["prompt"] = prompt_override
+                frames_payload["prompt_compact"] = prompt_override
+                frames_payload["action"] = prompt_override
                 frames_payload["seedance_prompt"] = prompt_override
             if previous_last:
                 frames_payload["chain_first_uri"] = previous_last
@@ -6682,6 +6731,8 @@ class Director:
                 "image", self._shot_name(ctx, shot_no))
             if prompt_override:
                 payload["prompt"] = prompt_override
+                payload["prompt_compact"] = prompt_override
+                payload["action"] = prompt_override
                 payload["seedance_prompt"] = prompt_override
                 payload["_reference_prompt_base"] = prompt_override
             asset_name = self._shot_name(ctx, shot_no)
@@ -6775,6 +6826,8 @@ class Director:
                 "人物身份、人数、构图、机位、服装、发型、妆容、道具、"
                 "场景、文字和光影保持不变")
             payload["prompt"] = payload["_reference_prompt_base"]
+            if prompt_override:
+                payload["action"] = prompt_override
             payload["seedance_prompt"] = payload["prompt"]
             payload["frame_kind"] = kind
             payload["feedback"] = feedback
@@ -6866,6 +6919,8 @@ class Director:
                 frames_payload["draft_image_rejected"] = image_row["uri"]
             if prompt_override:
                 frames_payload["prompt"] = prompt_override
+                frames_payload["prompt_compact"] = prompt_override
+                frames_payload["action"] = prompt_override
                 frames_payload["seedance_prompt"] = prompt_override
             prev = None
             for candidate in storyboard["shots"]:

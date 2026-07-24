@@ -552,7 +552,8 @@ class OpenAIImageProvider(Provider):
         out_dir.mkdir(parents=True, exist_ok=True)
         size = self._size(payload)
         call_cost = self._call_cost(payload)
-        prompt = payload.get("prompt", "")
+        # 有镜头合同时只把短版交给模型；payload['prompt'] 仍作为审计原文保存。
+        prompt = payload.get("prompt_compact") or payload.get("prompt", "")
         if payload.get("feedback"):
             prompt = f"{prompt}。修改意见(必须落实):{payload['feedback']}"
         if capability == "image":
@@ -948,7 +949,7 @@ class ArkVideoProvider(Provider):
         if video_resolution.lower() not in ("480p", "720p", "1080p"):
             raise ProviderError(
                 "Seedance video_resolution 只允许 480p/720p/1080p")
-        prompt = payload.get("prompt", "")
+        prompt = payload.get("prompt_compact") or payload.get("prompt", "")
         dialogue = payload.get("dialogue") or {}
         if self.conf.get("audio_in_video", True) and dialogue.get("dialogue"):
             # Seedance2 有声视频:台词随视频自动配音

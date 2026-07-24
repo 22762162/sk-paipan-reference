@@ -2755,15 +2755,16 @@ function planItemHtml(data, item, editable) {
       ${canEdit && planQcEnabled(item) && ["done", "reused"].includes(st) ? `<div class="plan-qc-row">
         <button class="plan-qc-one" data-plan-id="${esc(item.id)}"
           title="用 AI 视觉核对这张是否符合已锁定人物/场景设定">🔍 质检这张</button></div>` : ""}
-      <details class="plan-prompt"><summary>提示词</summary>
-        <pre>${esc(item.prompt || "")}</pre></details>
+      <details class="plan-prompt"><summary>实际发送提示词（镜头合同短版）</summary>
+        <pre>${esc(item.prompt_used || item.prompt || "")}</pre></details>
+      ${item.prompt_used && item.prompt_used !== item.prompt ? `<details class="plan-prompt"><summary>审计原文（完整提示词）</summary><pre>${esc(item.prompt || "")}</pre></details>` : ""}
       ${planQcIssuesHtml(item)}
       ${planQcReferenceGalleryHtml(item)}
       ${planTraceHtml(item)}
       ${canEdit ? `<div class="plan-edit" data-target="${esc(JSON.stringify(planTargetOf(item)))}">
         <button class="plan-edit-toggle">🔄 修改提示词/重画这张</button>
         <div class="plan-edit-form" hidden>
-          <textarea class="plan-edit-prompt" rows="3">${esc(item.prompt || "")}</textarea>
+          <textarea class="plan-edit-prompt" rows="3">${esc(item.prompt_used || item.prompt || "")}</textarea>
           <input class="plan-edit-feedback" placeholder="补充意见(可留空),如:换成夜晚/表情更凶">
           ${qualitySelectHtml("plan-edit-quality")}
           <div class="plan-edit-actions">
@@ -3227,8 +3228,9 @@ function accelerationItemHtml(item) {
     </div>
     ${accelerationReferenceHtml(item.references)}
     ${issues.length ? `<div class="accel-issues" role="alert"><b>暂不放行：</b>${esc(issues.join("；"))}</div>` : ""}
-    <details><summary>核对最终提交给 API 的提示词</summary>
-      <pre>${esc(item.prompt || "")}</pre></details>
+    <details><summary>核对最终提交给 API 的提示词（镜头合同短版）</summary>
+      <pre>${esc(item.prompt_used || item.prompt || "")}</pre></details>
+    ${item.prompt_used && item.prompt_used !== item.prompt ? `<details><summary>审计原文（完整提示词）</summary><pre>${esc(item.prompt || "")}</pre></details>` : ""}
   </article>`;
 }
 
@@ -3681,8 +3683,9 @@ function showPlanItemPreview(data, item, episodeId) {
       ${thumbs.length ? `<button type="button" class="preview-download">⬇ 下载当前图片</button>` : ""}
     </div>
     ${item.error ? `<div class="plan-err">${esc(item.error)}</div>` : ""}
-    <details class="plan-prompt" open><summary>提示词</summary>
-      <pre>${esc(item.prompt || "")}</pre></details>
+    <details class="plan-prompt" open><summary>实际发送提示词（镜头合同短版）</summary>
+      <pre>${esc(item.prompt_used || item.prompt || "")}</pre></details>
+    ${item.prompt_used && item.prompt_used !== item.prompt ? `<details class="plan-prompt"><summary>审计原文（完整提示词）</summary><pre>${esc(item.prompt || "")}</pre></details>` : ""}
   </div>`;
   const close = () => {
     overlay.remove();
@@ -7270,7 +7273,7 @@ class StoryboardCanvas {
           : "无可读文字 · 禁止字幕条与乱码"}
       </div>
       <h4>Seedance 执行提示词</h4>
-      <div class="prompt">${esc(shot.seedance_prompt || shot.prompt)}</div>
+      <div class="prompt">${esc(shot.seedance_prompt_compact || shot.seedance_prompt || shot.prompt)}</div>
       <h4>产物</h4>
       <ul class="links">
         ${this.link("关键图", art.images[shotNo])}
