@@ -135,10 +135,11 @@ def build_instruction(capability, payload, out_dir):
     height = int(payload.get("height", 1920))
     size = f"{width}x{height},画幅 {payload.get('aspect', '9:16')}"
     feedback = payload.get("feedback", "")
+    # 镜头类请求优先使用导演编译的短合同；完整 prompt 仍随 payload
+    # 保存，供审计和人工复核，不让它重复占用模型的注意力。
+    prompt_text = payload.get("prompt_compact") or payload.get("prompt", "")
     if feedback:
-        payload = dict(payload)
-        payload["prompt"] = (f"{payload.get('prompt', '')}。"
-                             f"修改意见(必须落实):{feedback}")
+        prompt_text = f"{prompt_text}。修改意见(必须落实):{feedback}"
     common = (f"{_style_line(payload)}{_space_line(payload)}"
               f"{SUBJECT_DIRECTIVE}{GEN_DIRECTIVE}")
     if capability == "image":
@@ -151,7 +152,7 @@ def build_instruction(capability, payload, out_dir):
                        "这张立绘是全剧的人物设定基准，之后所有镜头都会参考它")
             instruction = (
                 f"为角色生成立绘并保存到 {target}(PNG,{size})。"
-                f"{payload.get('prompt', '')}。{purpose}。"
+                f"{prompt_text}。{purpose}。"
                 f"{CHARACTER_BACKGROUND_DIRECTIVE}{_ref_line(payload)}{common}"
                 "只产出该文件。")
             return instruction, [target], {"name": payload.get("art_name")}
@@ -171,7 +172,7 @@ def build_instruction(capability, payload, out_dir):
             target = out_dir / f"scene_{safe}.png"
             instruction = (
                 f"为场景生成概念图并保存到 {target}(PNG,{size})。"
-                f"{payload.get('prompt', '')}。这张概念图是该场景的美术基准。"
+                f"{prompt_text}。这张概念图是该场景的美术基准。"
                 f"{_ref_line(payload)}{common}只产出该文件。")
             return instruction, [target], {"name": payload.get("art_name")}
         shot_no = int(payload["shot_no"])
@@ -185,7 +186,7 @@ def build_instruction(capability, payload, out_dir):
             "画面中不要生成字幕条、对白字幕或无关可读文字。")
         instruction = (
             f"为漫剧分镜生成一张关键图并保存到 {target}"
-            f"(PNG,{size})。画面内容:{payload.get('prompt', '')}。"
+            f"(PNG,{size})。画面内容:{prompt_text}。"
             f"出场角色:{'、'.join(payload.get('characters', []))}，"
             f"严格共{payload.get('character_count', len(payload.get('characters', [])))}人，"
             f"禁止新增或复制人物。{text_rule}"
@@ -214,7 +215,7 @@ def build_instruction(capability, payload, out_dir):
                 "不要改动它)。请基于该首帧与关键图 "
                 f"{image_uri}(均可直接读取)只生成本镜尾帧,"
                 f"保存到 {last}(PNG,{size})。"
-                f"镜头内容:{payload.get('prompt', '')}。"
+                f"镜头内容:{prompt_text}。"
                 f"结尾状态:{payload.get('end_state', {})};"
                 "画面从首帧状态自然演进到结尾状态,"
                 "人物、服装、道具、场景与首帧完全一致,"
@@ -234,7 +235,7 @@ def build_instruction(capability, payload, out_dir):
                 f"本镜首帧已直接复用通过质检的关键图(文件已就位:{first},"
                 "不要改动它)。请基于该首帧只生成本镜尾帧,"
                 f"保存到 {last}(PNG,{size})。"
-                f"镜头内容:{payload.get('prompt', '')}。"
+                f"镜头内容:{prompt_text}。"
                 f"结尾状态:{payload.get('end_state', {})};"
                 "画面从首帧自然演进到结尾状态，人物、服装、道具、场景与"
                 f"首帧完全一致，不新增字幕条。{_ref_line(payload)}{common}"
@@ -246,7 +247,7 @@ def build_instruction(capability, payload, out_dir):
             f"基于关键图 {image_uri}(文件可直接读取)"
             "为镜头生成首帧与尾帧,"
             f"分别保存到 {first} 和 {last}(PNG,{size})。"
-            f"镜头内容:{payload.get('prompt', '')}。"
+            f"镜头内容:{prompt_text}。"
             f"起始状态:{payload.get('start_state', {})};"
             f"结尾状态:{payload.get('end_state', {})};"
             "首帧为动作起始、尾帧为动作结束，构图与关键图连贯，"

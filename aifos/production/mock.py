@@ -784,6 +784,8 @@ class MockProvider(Provider):
             "first_frame": payload.get("first", ""),
             "last_frame": payload.get("last", ""),
             "prompt": payload.get("prompt", ""),
+            "prompt_compact": payload.get("prompt_compact", ""),
+            "prompt_full": payload.get("prompt_full", payload.get("prompt", "")),
             "voice": payload.get("voice", "jimeng_builtin"),
             "lip_sync": bool(payload.get("lip_sync", True)),
             "forbid_subtitles": bool(payload.get("forbid_subtitles", True)),

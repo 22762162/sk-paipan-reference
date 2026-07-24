@@ -15,6 +15,7 @@ from pathlib import Path
 from .adapters.claude_script import (is_background_role,
                                      validate_script_bible)
 from .quality_policy import default_quality_policy, resolve_video_quality
+from .prompt_contract import compile_shot_prompt
 
 from .spatial_blocking import (
     build_character_number_map,
@@ -87,6 +88,12 @@ def production_profile(config, standard=None):
         "text_lock_provider": production.get(
             "text_lock_provider", configured.get(
                 "text_lock_provider", "ChatGPT关键帧")),
+        "prompt_contract": copy.deepcopy(
+            production.get("prompt_contract") or {
+                "schema": "aifos.shot-prompt/v1",
+                "compact_prompt_sent_to_model": True,
+                "full_prompt_kept_for_audit": True,
+            }),
         "max_dialogue_chars": dialogue.get("max_chars_per_shot", 25),
         "reaction_min_ratio": performance.get(
             "listener_duration_ratio", 2 / 3),
@@ -757,6 +764,12 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             "seedance_prompt": seedance_prompt,
             "transition": "硬切",
         }
+        contract, compact_prompt = compile_shot_prompt(
+            shot, location=scene.get("location", ""),
+            style=(visual_bible.get("user_style_constraint")
+                   or style or "项目既定美术风格"), mode="video")
+        shot["prompt_contract"] = contract
+        shot["seedance_prompt_compact"] = compact_prompt
         shots.append(shot)
     return {
         "episode_title": storyboard.get("episode_title", script.get("episode_title", "")),

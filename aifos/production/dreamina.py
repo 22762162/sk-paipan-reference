@@ -77,7 +77,9 @@ class DreaminaProvider(Provider):
         shot_no = int(payload.get("shot_no", 0))
         model_version = self.conf.get(
             "model_version", REQUIRED_MODEL_VERSION)
-        prompt = payload.get("prompt", "")
+        # 导演同时保存完整审计提示词与镜头合同；真实请求使用合同短版，
+        # 避免全局故事背景和重复禁词稀释首尾帧/单一动作。
+        prompt = payload.get("prompt_compact") or payload.get("prompt", "")
         dialogue = payload.get("dialogue") or {}
         if self.conf.get("audio_in_video", True) and dialogue.get("dialogue"):
             # Seedance2 有声视频:台词随视频自动配音,免单独 TTS

@@ -37,6 +37,14 @@ def test_default_standard_is_complete_and_active(tmp_path):
         assert story_analysis[
             "final_character_image_prompt_required"] is True
         assert story_analysis["compact_prompt_compilation"] is True
+        contract = production["prompt_contract"]
+        assert contract["schema"] == "aifos.shot-prompt/v1"
+        assert contract["single_primary_action"] is True
+        assert contract["single_camera_move"] is True
+        assert contract["compact_prompt_sent_to_model"] is True
+        assert contract["full_prompt_kept_for_audit"] is True
+        assert contract["order"][:4] == [
+            "subject", "scene", "start", "single_action"]
         assert story_analysis["downstream_consumers"] == [
             "character", "scene", "storyboard", "keyframe", "seedance",
         ]
