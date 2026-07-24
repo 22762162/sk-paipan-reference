@@ -1909,13 +1909,17 @@ def make_handler(workspace, jobs):
         def _settings_update(self):
             """设置中心保存 Provider、能力路由或整套图片策略。"""
             from ..settings import set_icloud_sync, set_image_strategy, \
-                set_routing, settings_payload, update_provider
+                set_codex_profiles, set_routing, settings_payload, \
+                update_provider
             body = self._read_body()
             if body is None:
                 return self._error(400, "请求体不是合法 JSON")
 
             def task(app):
-                if body.get("provider"):
+                if body.get("codex_profiles") is not None:
+                    set_codex_profiles(app.workspace.config_path,
+                                       body.get("codex_profiles"))
+                elif body.get("provider"):
                     update_provider(app.workspace.config_path,
                                     body["provider"],
                                     body.get("fields") or {})

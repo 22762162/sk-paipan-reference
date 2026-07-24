@@ -2130,7 +2130,8 @@ class Director:
             extra["output_uri"] = uri
         data = getattr(result, "data", {}) or {}
         for key in ("first_source", "generation_calls", "model",
-                    "image_task_class", "image_quality", "unit_cost"):
+                    "image_task_class", "image_quality", "unit_cost",
+                    "codex_profile"):
             if key in data:
                 extra[key] = data[key]
         model = getattr(result, "model", "")
@@ -2178,6 +2179,8 @@ class Director:
             "image_quality": payload.get("image_quality"),
             "reference_inputs": self._reference_inputs(payload),
         }
+        if task.get("_codex_profile"):
+            generating_extra["codex_profile"] = task["_codex_profile"]
         if task.get("_acceleration"):
             generating_extra["acceleration"] = task["_acceleration"]
         self._plan_mark(ctx, task["item_id"], "generating",
@@ -2196,6 +2199,8 @@ class Director:
             self._plan_mark(ctx, task["item_id"], "failed",
                             error=str(exc)[:300])
             raise
+        if task.get("_codex_profile"):
+            result.data.setdefault("codex_profile", task["_codex_profile"])
         self._task_cost += result.cost
         self._task_providers.add(result.provider)
         self.projects.add_episode_cost(ctx["episode"]["id"], result.cost)
@@ -2223,6 +2228,57 @@ class Director:
             workers = 3
         return max(1, min(workers, 8))
 
+    def _codex_parallel_profiles(self):
+        """返回可安全用于本批图片的 Codex 登录态配置。"""
+        profile_reader = getattr(self.config, "codex_profiles", None)
+        if callable(profile_reader):
+            profiles = profile_reader() or []
+        else:
+            profiles = (self.config.get("codex_profiles", default=None)
+                        or self.config.get(
+                            "codex_parallel", "profiles", default=[])
+                        or [])
+        ready = []
+        for index, profile in enumerate(profiles):
+            if not isinstance(profile, dict):
+                continue
+            if not bool(profile.get("enabled", False)):
+                continue
+            home_value = str(profile.get("codex_home") or "").strip()
+            if not home_value or not Path(home_value).expanduser().is_dir():
+                continue
+            profile_id = str(profile.get("id") or (
+                "codex_a" if index == 0 else f"codex_{index + 1}"))
+            ready.append({
+                "id": profile_id,
+                "name": str(profile.get("name") or profile_id),
+            })
+        return ready
+
+    def _assign_codex_profiles(self, tasks):
+        """按轮询把独立图片任务分配到可用 Codex 登录态。"""
+        profiles = self._codex_parallel_profiles()
+        if not profiles:
+            return tasks
+        next_index = 0
+        for task in tasks:
+            if task.get("capability") not in ("image", "frames", "cover"):
+                continue
+            payload = task.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            strict = str(payload.get("strict_provider") or "").strip()
+            if strict and strict != "codex":
+                continue
+            if payload.get("_codex_profile"):
+                continue
+            profile = profiles[next_index % len(profiles)]
+            next_index += 1
+            payload["_codex_profile"] = profile["id"]
+            task["_codex_profile"] = profile["id"]
+            task["worker"] = f"codex:{profile['id']}"
+        return tasks
+
     def _video_parallel_workers(self):
         """Seedance 同时生成的镜头数；默认 4 路，避免串行等待。"""
         try:
@@ -2246,6 +2302,7 @@ class Director:
         (results, qc_failures)，真正的 Provider/预算错误仍会中止整批。"""
         if not tasks:
             return ({}, []) if continue_on_qc_failure else {}
+        self._assign_codex_profiles(tasks)
         self._prepare_dispatch_contracts(ctx, tasks)
         tasks = sorted(tasks, key=lambda task: (
             -int(task.get("priority", 0)), str(task.get("item_id", ""))))
@@ -2303,6 +2360,9 @@ class Director:
                         "image_quality": payload.get("image_quality"),
                         "reference_inputs": self._reference_inputs(payload),
                     }
+                    if task.get("_codex_profile"):
+                        generating_extra["codex_profile"] = task[
+                            "_codex_profile"]
                     if task.get("_acceleration"):
                         generating_extra["acceleration"] = task[
                             "_acceleration"]
@@ -2336,6 +2396,9 @@ class Director:
                         self._plan_mark(ctx, task["item_id"], "failed",
                                         error=str(exc)[:300])
                         continue
+                    if task.get("_codex_profile"):
+                        result.data.setdefault(
+                            "codex_profile", task["_codex_profile"])
                     self._task_cost += result.cost
                     self._task_providers.add(result.provider)
                     self.projects.add_episode_cost(

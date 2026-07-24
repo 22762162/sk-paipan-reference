@@ -8,6 +8,7 @@ CLI 协议:向命令 stdin 写入一行 JSON
 """
 
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -19,7 +20,7 @@ from .base import Provider, ProviderResult
 
 
 def run_interruptible(name, command, input_text, timeout, cancel=None,
-                      cwd=None):
+                      cwd=None, env=None):
     """可中断的子进程执行:每 2 秒检查一次停止信号,收到即 kill。
 
     返回 (returncode, stdout, stderr);用户停止 → ProduceCancelled。
@@ -28,7 +29,7 @@ def run_interruptible(name, command, input_text, timeout, cancel=None,
         proc = subprocess.Popen(
             command, stdin=subprocess.PIPE if input_text is not None else None,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, cwd=cwd)
+            text=True, cwd=cwd, env=env)
     except OSError as exc:
         raise ProviderError(f"{name} 调用失败: {exc}") from exc
     try:
@@ -100,9 +101,34 @@ class CliProvider(Provider):
             {"capability": capability, "payload": payload,
              "out_dir": str(out_dir)},
             ensure_ascii=False)
+        env = None
+        # 两个 Codex 账号共用同一个桥接命令，但由 CODEX_HOME 选择
+        # 独立登录态。只允许导演层传入已配置 profile id，避免任意任务
+        # 通过 payload 注入外部环境变量或凭据路径。
+        if self.name == "codex":
+            profile_id = str(payload.get("_codex_profile") or "").strip()
+            if profile_id:
+                profiles = self.conf.get("codex_profiles") or []
+                profile = next((item for index, item in enumerate(profiles)
+                                if isinstance(item, dict)
+                                and str(item.get("id") or (
+                                    "codex_a" if index == 0
+                                    else f"codex_{index + 1}")) == profile_id),
+                               None)
+                if profile is None:
+                    raise ProviderError(
+                        f"Codex profile 不存在或未配置: {profile_id}")
+                home_value = str(profile.get("codex_home") or "").strip()
+                home = Path(home_value).expanduser()
+                if not home.is_dir():
+                    raise ProviderError(
+                        f"Codex profile {profile_id} 的 CODEX_HOME 不存在: {home}")
+                env = os.environ.copy()
+                env["CODEX_HOME"] = str(home.resolve())
+                env["AIFOS_CODEX_PROFILE"] = profile_id
         returncode, stdout, stderr = run_interruptible(
             self.name, command, request,
-            self.conf.get("timeout", 600), cancel=cancel)
+            self.conf.get("timeout", 600), cancel=cancel, env=env)
         if returncode != 0:
             raise ProviderError(
                 f"{self.name} 退出码 {returncode}: "

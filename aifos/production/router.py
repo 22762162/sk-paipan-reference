@@ -5,6 +5,8 @@
 - 全部不可用 → ProviderUnavailable。
 """
 
+import threading
+
 from ..errors import ProviderError, ProviderUnavailable
 from .api_providers import (ArkVideoProvider, ClaudeApiProvider,
                             DoubaoTtsProvider, OpenAIImageProvider,
@@ -39,13 +41,27 @@ class ProviderRouter:
         self.db = db
         self.log = logger
         self.providers = {}
+        self._codex_profile_locks = {}
         for name, conf in (config.get("providers") or {}).items():
             cls = PROVIDER_TYPES.get(conf.get("type"))
             if cls is None:
                 logger.warn("router", f"未知 provider 类型: {name}")
                 continue
+            # profile 配置位于顶层，桥接 Provider 仍只接收自己的配置，
+            # 这样旧工作区的 providers.codex 结构完全兼容。
+            if name == "codex":
+                conf = dict(conf)
+                conf["codex_profiles"] = (
+                    config.get("codex_profiles", default=None)
+                    or config.get("codex_parallel", "profiles", default=[])
+                    or conf.get("codex_profiles") or [])
             provider = cls(name, conf)
             self.providers[name] = provider
+            if name == "codex":
+                for profile in conf.get("codex_profiles") or []:
+                    if isinstance(profile, dict) and profile.get("id"):
+                        self._codex_profile_locks.setdefault(
+                            str(profile["id"]), threading.Lock())
             if provider.quota_limit > 0:
                 self._ensure_quota_row(name, provider.quota_limit)
 
@@ -238,8 +254,18 @@ class ProviderRouter:
                 fallbacks.append({"provider": name, "reason": reason})
                 continue
             try:
-                result = provider.generate(capability, payload, out_dir,
-                                           cancel=cancel)
+                profile_id = (str(payload.get("_codex_profile") or "").strip()
+                              if name == "codex" else "")
+                lock = self._codex_profile_locks.get(profile_id)
+                if lock is None:
+                    result = provider.generate(capability, payload, out_dir,
+                                               cancel=cancel)
+                else:
+                    # 每个 Codex 登录态最多一个活动调用；两个 profile
+                    # 可同时出图，避免同一账号的 CLI 会话互相覆盖。
+                    with lock:
+                        result = provider.generate(
+                            capability, payload, out_dir, cancel=cancel)
             except ProviderError as exc:
                 self.log.warn(
                     "router", f"{name} 执行失败({exc}),回退({capability})")
