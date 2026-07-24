@@ -200,6 +200,11 @@ Seedance 视频前必须锁定的“制作圣经”。
   哑着嗓子、试探着、小心翼翼地、躬身回话”等语气、动作、状态短语，绝不是
   人物名；必须结合全文称谓、上下句、代词、关系和行动归并到真实人物，并在
   speaker_resolution 中逐项说明。无法可靠归并时保留待确认，禁止编造新人;
+- 必须再逐场逐句判断说话人，在 `line_speakers` 中为每句对白输出一条记录；
+  `line_index` 是该场 lines 数组从 1 开始的序号，`dialogue` 必须逐字复制原文。
+  不得因为多句对白共享同一个旧标签就把它们归给同一人；要根据称谓（殿下/
+  奴婢/本宫）、问答关系、上下句和动作分别判断。无法可靠判断时
+  canonical_name 写“待确认说话人”，不得猜;
 - 除纠正上述错误标签外，不得新增人物或擅自改变真实人物的姓名、性别、年龄、
   身份、阵营、物种与人物关系;
 - 逐场分析空间功能、入口出口、前中后景、材质道具、时段天气、主光方向、
@@ -228,6 +233,10 @@ JSON 结构:
 "canonical_name":"真实人物名","classification":"performance_cue/action_cue/alias/misparsed_label",
 "performance":"应保留的语气或动作","confidence":0.98,
 "evidence":"用于判断的原文称谓、上下句或人物关系"}}],
+"line_speakers":[{{"scene_no":1,"line_index":1,
+"dialogue":"逐字复制该句对白","raw_label":"该句当前人物标签",
+"canonical_name":"该句真实说话人","performance":"该句语气或动作",
+"confidence":0.98,"evidence":"称谓、问答关系、上下句或动作证据"}}],
 "narrative":{{"logline":"","genre":"","themes":[],"tone":"",
 "target_audience":"","emotional_arc":"","core_conflict":"",
 "continuity_hooks":""}},

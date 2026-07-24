@@ -46,6 +46,7 @@ from .story_analysis import (
     build_story_analysis,
     reconcile_character_entities,
     unresolved_character_labels,
+    validate_line_speaker_resolution,
     validate_story_analysis,
 )
 from .workflow import (
@@ -2612,6 +2613,17 @@ class Director:
                 "analysis_rules": analysis_rules,
                 "production_profile": ctx.get("production_profile") or {},
             }, "story_analysis")
+        imported = script.get("import_analysis")
+        needs_line_resolution = (
+            bool(unresolved_character_labels(script))
+            or (isinstance(imported, dict)
+                and bool(imported.get("misclassified_labels_removed")
+                         or imported.get("entity_corrections"))))
+        if needs_line_resolution:
+            resolution_error = validate_line_speaker_resolution(
+                script, result.data)
+            if resolution_error:
+                raise AifosError(f"剧本人物逐句校正失败: {resolution_error}")
         script_changed = reconcile_character_entities(script, result.data)
         if script_changed:
             # AI 已确认“温声/试探着”等只是表演提示：把它们合并回真实人物，

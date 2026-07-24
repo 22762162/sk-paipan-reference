@@ -12,6 +12,7 @@ from aifos.story_analysis import (
     infer_story_visual_context,
     reconcile_character_entities,
     unresolved_character_labels,
+    validate_line_speaker_resolution,
     validate_story_analysis,
 )
 
@@ -199,6 +200,68 @@ def test_ai_resolution_merges_misparsed_states_into_real_people():
     assert prince["age_range"] == "约十五岁"
     assert "明末皇太子" in prince["image_prompt"]
     assert "最终人物出图卡" not in prince["image_prompt"]
+
+
+def test_line_level_resolution_overrides_reused_wrong_label_per_dialogue():
+    imported = {
+        "project_title": "大明", "episode_number": 1,
+        "characters": [{"name": "哑着嗓子", "role": "主角"}],
+        "scenes": [{
+            "scene_no": 1, "location": "东宫",
+            "characters": ["哑着嗓子"], "action": "",
+            "lines": [
+                {"character": "哑着嗓子", "dialogue": "殿下醒了？"},
+                {"character": "哑着嗓子", "dialogue": "今夕是何年何月？"},
+                {"character": "哑着嗓子", "dialogue": "回殿下，是崇祯十六年。"},
+            ],
+        }],
+        "import_analysis": {"dialogue_count": 3, "character_count": 1},
+    }
+    raw = {
+        "line_speakers": [
+            {"scene_no": 1, "line_index": 1, "dialogue": "殿下醒了？",
+             "raw_label": "哑着嗓子", "canonical_name": "李继周",
+             "performance": "小心问候", "confidence": 0.99},
+            {"scene_no": 1, "line_index": 2, "dialogue": "今夕是何年何月？",
+             "raw_label": "哑着嗓子", "canonical_name": "朱慈烺",
+             "performance": "哑声试探", "confidence": 0.99},
+            {"scene_no": 1, "line_index": 3,
+             "dialogue": "回殿下，是崇祯十六年。",
+             "raw_label": "哑着嗓子", "canonical_name": "李继周",
+             "performance": "躬身回话", "confidence": 0.99},
+        ],
+        "characters": [
+            {"name": "朱慈烺", "importance": "主角",
+             "gender": "男", "age_range": "十五岁"},
+            {"name": "李继周", "importance": "非重要配角",
+             "gender": "男（宦官）", "age_range": "三十余岁"},
+        ],
+    }
+    assert validate_line_speaker_resolution(imported, raw) is None
+    assert reconcile_character_entities(imported, raw) is True
+    assert [line["character"] for line
+            in imported["scenes"][0]["lines"]] == [
+                "李继周", "朱慈烺", "李继周"]
+    assert {item["name"] for item in imported["characters"]} == {
+        "朱慈烺", "李继周"}
+    assert imported["import_analysis"]["line_speaker_corrections"][0][
+        "dialogue"] == "殿下醒了？"
+
+
+def test_line_level_resolution_requires_every_dialogue():
+    script = {
+        "scenes": [{"scene_no": 1, "lines": [
+            {"character": "旧标签", "dialogue": "第一句"},
+            {"character": "旧标签", "dialogue": "第二句"},
+        ]}],
+    }
+    error = validate_line_speaker_resolution(script, {
+        "line_speakers": [{
+            "scene_no": 1, "line_index": 1, "dialogue": "第一句",
+            "canonical_name": "甲",
+        }],
+    })
+    assert "场1第2句" in error
 
 
 def test_saved_analysis_is_versioned_and_rejects_stale_edit(tmp_path):

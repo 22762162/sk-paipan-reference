@@ -353,6 +353,50 @@ def unresolved_character_labels(script):
     return result
 
 
+def is_likely_non_person_name(name):
+    from .script_import import is_likely_performance_label
+    return (
+        _text(name) == "待确认说话人"
+        or is_likely_performance_label(name)
+    )
+
+
+def validate_line_speaker_resolution(script, raw):
+    """旧人物标签不可信时，AI 必须逐句给出可核验的说话人。"""
+    expected = {}
+    for scene in _dict(script).get("scenes", []):
+        if not isinstance(scene, dict):
+            continue
+        try:
+            scene_no = int(scene.get("scene_no"))
+        except (TypeError, ValueError):
+            continue
+        for index, line in enumerate(scene.get("lines", []), 1):
+            if isinstance(line, dict) and line.get("dialogue"):
+                expected[(scene_no, index)] = _text(line.get("dialogue"))
+    items = raw.get("line_speakers") if isinstance(raw, dict) else None
+    if not isinstance(items, list):
+        return "人物标签存在历史误识别，AI 必须逐句返回 line_speakers"
+    got = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            key = (int(item.get("scene_no")), int(item.get("line_index")))
+        except (TypeError, ValueError):
+            continue
+        if (key in expected and _text(item.get("dialogue")) == expected[key]
+                and _text(item.get("canonical_name"))):
+            got[key] = item
+    missing = [key for key in expected if key not in got]
+    if missing:
+        labels = "、".join(
+            f"场{scene_no}第{line_index}句"
+            for scene_no, line_index in missing[:8])
+        return f"逐句说话人分析不完整：{labels}"
+    return None
+
+
 def _role_rank(role):
     role = _text(role)
     if "主角" in role:
@@ -381,6 +425,60 @@ def reconcile_character_entities(script, raw):
         _text(item.get("name")): item
         for item in raw.get("characters", []) if isinstance(item, dict)
     }
+
+    def confidence(item):
+        value = item.get("confidence", 1)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 1 if str(value).lower() == "high" else 0
+
+    # 第一优先级：逐场逐句校正。同一旧标签可能曾被错误复用于不同人物，
+    # 所以不能先做全局替换。
+    line_meta = {}
+    source_targets = {}
+    line_resolutions = raw.get("line_speakers")
+    if not isinstance(line_resolutions, list):
+        line_resolutions = []
+    scene_map = {
+        int(scene.get("scene_no")): scene
+        for scene in script.get("scenes", [])
+        if isinstance(scene, dict) and str(scene.get("scene_no", "")).isdigit()
+    }
+    for item in line_resolutions:
+        if not isinstance(item, dict) or confidence(item) < 0.75:
+            continue
+        try:
+            scene_no = int(item.get("scene_no"))
+            line_index = int(item.get("line_index")) - 1
+        except (TypeError, ValueError):
+            continue
+        scene = scene_map.get(scene_no)
+        lines = scene.get("lines", []) if scene else []
+        if not 0 <= line_index < len(lines):
+            continue
+        line = lines[line_index]
+        if not isinstance(line, dict):
+            continue
+        dialogue = _text(item.get("dialogue"))
+        if dialogue and dialogue != _text(line.get("dialogue")):
+            continue
+        target = _text(item.get("canonical_name"))
+        if not target:
+            continue
+        source = _text(
+            item.get("raw_label")
+            or line.get("source_character_label")
+            or line.get("character"))
+        line["source_character_label"] = source
+        line["character"] = target
+        performance = _text(item.get("performance"))
+        if performance:
+            line["performance"] = performance
+        line_meta[(scene_no, line_index)] = item
+        source_targets.setdefault(source, set()).add(target)
+
+    # 第二优先级：仅对没有逐句结果的旧标签应用高置信全局归并。
     mapping = {}
     resolution_meta = {}
     resolutions = raw.get("speaker_resolution")
@@ -392,13 +490,8 @@ def reconcile_character_entities(script, raw):
         source = _text(item.get("raw_label"))
         target = _text(item.get("canonical_name"))
         classification = _text(item.get("classification")).lower()
-        confidence = item.get("confidence", 1)
-        try:
-            confidence = float(confidence)
-        except (TypeError, ValueError):
-            confidence = 1 if str(confidence).lower() == "high" else 0
         if (source not in existing or not target or source == target
-                or target == "待确认说话人" or confidence < 0.75
+                or target == "待确认说话人" or confidence(item) < 0.75
                 or classification not in {
                     "performance_cue", "action_cue", "alias",
                     "misparsed_label", "performance", "action", "state",
@@ -407,30 +500,91 @@ def reconcile_character_entities(script, raw):
             continue
         mapping[source] = target
         resolution_meta[source] = item
-    if not mapping:
-        return False
 
-    canonical = {}
-    source_order = []
-    for character in cast:
-        source = _text(character.get("name"))
-        target = mapping.get(source, source)
-        if target not in canonical:
-            canonical[target] = copy.deepcopy(
-                existing.get(target) or {"name": target, "role": "配角"})
-            canonical[target]["name"] = target
-            source_order.append(target)
-        merged = canonical[target]
-        if _role_rank(character.get("role")) > _role_rank(merged.get("role")):
-            merged["role"] = character.get("role")
-        if source != target:
-            aliases = merged.setdefault("source_aliases", [])
-            if source not in aliases:
-                aliases.append(source)
+    for scene in script.get("scenes", []):
+        if not isinstance(scene, dict):
+            continue
+        scene_no = int(scene.get("scene_no") or 0)
+        for index, line in enumerate(scene.get("lines", [])):
+            if not isinstance(line, dict) or (scene_no, index) in line_meta:
+                continue
+            source = _text(line.get("character"))
+            if source not in mapping:
+                continue
+            line["source_character_label"] = source
+            line["character"] = mapping[source]
+            source_targets.setdefault(source, set()).add(mapping[source])
             performance = _text(
                 resolution_meta[source].get("performance") or source)
-            cues = merged.setdefault("performance_cues", [])
-            if performance and performance not in cues:
+            if performance and not line.get("performance"):
+                line["performance"] = performance
+
+    if not line_meta and not mapping:
+        return False
+
+    # 按校正后的逐句人物重建正式角色表；不再让旧错误标签决定人物数量。
+    source_order = []
+    line_counts = {}
+    for scene in script.get("scenes", []):
+        if not isinstance(scene, dict):
+            continue
+        names = []
+        for line in scene.get("lines", []):
+            if not isinstance(line, dict):
+                continue
+            name = _text(line.get("character"))
+            if not name:
+                continue
+            names.append(name)
+            line_counts[name] = line_counts.get(name, 0) + 1
+            if name not in source_order:
+                source_order.append(name)
+        scene["characters"] = list(dict.fromkeys(names))
+    for name, character in existing.items():
+        if name not in source_order and not is_likely_non_person_name(name):
+            source_order.append(name)
+
+    importance_roles = {
+        "主角": "主角", "重要配角": "重要配角",
+        "非重要配角": "配角", "背景路人": "背景路人",
+    }
+    canonical = {}
+    for target in source_order:
+        raw_item = _dict(raw_characters.get(target))
+        base = copy.deepcopy(existing.get(target) or {"name": target})
+        base["name"] = target
+        if not base.get("role"):
+            base["role"] = importance_roles.get(
+                _text(raw_item.get("importance")), "配角")
+        canonical[target] = base
+    if canonical and not any(
+            _role_rank(item.get("role")) == 3 for item in canonical.values()):
+        hero = max(canonical, key=lambda name: line_counts.get(name, 0))
+        canonical[hero]["role"] = "主角"
+
+    for source, targets in source_targets.items():
+        for target in targets:
+            character = canonical.get(target)
+            if not character or source == target:
+                continue
+            aliases = character.setdefault("source_aliases", [])
+            if source not in aliases:
+                aliases.append(source)
+    for (scene_no, line_index), item in line_meta.items():
+        line = scene_map[scene_no]["lines"][line_index]
+        character = canonical.get(line.get("character"))
+        performance = _text(item.get("performance"))
+        if character and performance:
+            cues = character.setdefault("performance_cues", [])
+            if performance not in cues:
+                cues.append(performance)
+    for source, target in mapping.items():
+        character = canonical.get(target)
+        performance = _text(
+            resolution_meta[source].get("performance") or source)
+        if character and performance:
+            cues = character.setdefault("performance_cues", [])
+            if performance not in cues:
                 cues.append(performance)
 
     for target, character in canonical.items():
@@ -456,25 +610,6 @@ def reconcile_character_entities(script, raw):
             if value not in (None, "", [], {}):
                 character[key] = copy.deepcopy(value)
 
-    for scene in script.get("scenes", []):
-        if not isinstance(scene, dict):
-            continue
-        for line in scene.get("lines", []):
-            if not isinstance(line, dict):
-                continue
-            source = _text(line.get("character"))
-            if source not in mapping:
-                continue
-            line["character"] = mapping[source]
-            performance = _text(
-                resolution_meta[source].get("performance") or source)
-            if performance and not line.get("performance"):
-                line["performance"] = performance
-        scene["characters"] = list(dict.fromkeys(
-            mapping.get(_text(name), _text(name))
-            for name in scene.get("characters", [])
-            if _text(name)
-        ))
     script["characters"] = [canonical[name] for name in source_order]
     script["declared_character_names"] = source_order
     imported = script.setdefault("import_analysis", {})
@@ -488,7 +623,21 @@ def reconcile_character_entities(script, raw):
         }
         for source, target in mapping.items()
     ]
-    imported["misclassified_labels_removed"] = len(mapping)
+    imported["line_speaker_corrections"] = [
+        {
+            "scene_no": scene_no, "line_index": line_index + 1,
+            "dialogue": scene_map[scene_no]["lines"][line_index].get(
+                "dialogue", ""),
+            "canonical_name": scene_map[scene_no]["lines"][line_index].get(
+                "character", ""),
+        }
+        for scene_no, line_index in sorted(line_meta)
+    ]
+    imported["misclassified_labels_removed"] = len(
+        set(mapping) | {
+            source for source, targets in source_targets.items()
+            if any(target != source for target in targets)
+        })
     unresolved = set(unresolved_character_labels(script))
     imported["unresolved_dialogue_count"] = sum(
         1 for scene in script.get("scenes", [])
@@ -814,6 +963,12 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
     return {
         "schema": STORY_ANALYSIS_SCHEMA,
         "source": _text(raw.get("source"), source),
+        "speaker_resolution": copy.deepcopy(
+            raw.get("speaker_resolution")
+            if isinstance(raw.get("speaker_resolution"), list) else []),
+        "line_speakers": copy.deepcopy(
+            raw.get("line_speakers")
+            if isinstance(raw.get("line_speakers"), list) else []),
         "analyzed_at": _text(
             raw.get("analyzed_at"),
             datetime.now(timezone.utc).isoformat(timespec="seconds")),
