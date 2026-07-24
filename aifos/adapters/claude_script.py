@@ -44,7 +44,7 @@ SCRIPT_PROMPT = """你是漫剧编剧。为作品《{title}》第{episode}集创
 - 人物重要度必须明确标为主角、重要配角、非重要配角或背景路人。
   非重要配角后续固定只生成 1 张候选图;场次中不得出现人物表未声明的新角色;
 - `costume_direction` 必须给出可画的服装逻辑(款式、材质、层次、颜色、职业制服/时代服饰和剧情场合),禁止所有角色默认现代都市便服;
-- `visual_variants` 至少给出 3 个剧情兼容的造型方向(例如日常、行动/冲突、仪式/舞台),后续人物候选图必须据此做明显不同的服装与气质变化;
+- `visual_variants` 至少给出 3 个剧情兼容的造型方案(例如日常、行动/冲突、仪式/舞台);它们是服装、道具和表演细节，不是画风选项；全剧候选图必须继承同一个项目画风;
 - 每个正式角色必须先完成 `character_analysis`，再生成 `visual_dna`：
   从身份阶层、成长环境、当前处境、欲望、恐惧、关键经历、性格优缺点和
   行为习惯，推导脸部骨相、发型轮廓、身体/职业痕迹、服装结构与磨损、
@@ -74,7 +74,7 @@ JSON 格式(字段必须齐全):
    "era_setting": "时代/世界观/地域", "occupation": "职业/社会身份",
    "motivation": "核心目标与本集欲望", "backstory": "关键经历、秘密或创伤",
    "relationships": "与其他角色的关系及冲突", "costume_direction": "服装如何体现身份、性格和剧情阶段",
-   "signature_props": "标志性道具或动作", "visual_variants": "日常/冲突/关键场合等不同造型方向",
+   "signature_props": "标志性道具或动作", "visual_variants": "日常/冲突/关键场合等剧情造型方案（不改变全剧画风）",
    "character_analysis": {{"identity_and_class":"身份与阶层","age_and_presentation":"年龄感",
      "upbringing":"成长环境","family_background":"家庭背景","education_background":"教育背景",
      "current_situation":"当前处境","core_desire":"核心欲望","greatest_fear":"最大恐惧",
@@ -103,7 +103,8 @@ IDOL_PROMPT = """你是 AI 虚拟偶像「{persona}」的内容策划。为第{e
   characters 列出全部成员,台词在成员间分配;否则全部台词由
   「{persona}」一人口播;
 - 每个正式成员都要写与团内定位、歌曲主题、成长经历和本期冲突绑定的人物背景提示词、
-  职业/舞台身份、性格外化方式、服装逻辑和至少 3 套练习室/后台/舞台造型方向;
+  职业/舞台身份、性格外化方式、服装逻辑和至少 3 套练习室/后台/舞台剧情造型方案；
+  这些方案不改变全剧唯一画风，候选图只比较人物身份与剧情细节;
 - 每个正式成员先写人物分析和视觉 DNA，再与全团其他成员做视觉去重；
   发型、服装结构、身体特征、视觉符号、核心配饰、气质关键词中两项以上
   重叠必须重设计，不能只靠换衣服颜色区分成员;
@@ -133,7 +134,7 @@ JSON 格式(字段必须齐全,characters 只含「{persona}」一人):
    "era_setting": "时代/舞台世界观", "occupation": "职业/团内身份",
    "motivation": "本期目标", "backstory": "成长经历",
    "relationships": "团内关系", "costume_direction": "练习室/后台/舞台服装逻辑",
-   "signature_props": "标志道具", "visual_variants": "至少三套剧情造型方向",
+  "signature_props": "标志道具", "visual_variants": "至少三套剧情造型方案（不改变全剧画风）",
    "character_analysis": {{"identity_and_class":"身份与团内位置","current_situation":"当前处境",
      "core_desire":"核心欲望","greatest_fear":"最大恐惧","formative_experiences":["关键经历"],
      "strengths":["优点"],"flaws":["缺点"],"behavior_habits":["行为习惯"]}},
@@ -553,8 +554,9 @@ DESIGN_PROMPT = """你是漫剧人物设定师。为作品《{title}》的角色
   更换结构方案，只有完成重设计后才能输出 `status:"passed"`;
 - `era_setting`、`occupation`、`motivation`、`backstory`、`relationships`、
   `costume_direction`、`signature_props` 必须具体;职业身份要能从服装和装备一眼识别;
-- `visual_variants` 必须给出 3-5 个与剧情兼容的不同造型方向,每项写清场合、服装、材质、
-  配色、配饰/道具和气质变化;不是同一套衣服只换动作;
+- `visual_variants` 必须给出 3-5 个与剧情兼容的造型方案,每项写清场合、服装、材质、
+  配色、配饰/道具和气质变化；它们不改变本剧唯一画风，候选图不得把画风作为变量，
+  也不是同一套衣服只换动作;
 - 传入的正式角色必须标注重要度:主角、重要配角或非重要配角;不得补画或扩写
   跑龙套/背景路人,这类角色只在剧本场次中保留人数与功能标签,不建立独立设定或人物资产;
 - 性格要能从表情神态与站姿体现;外貌含脸型/肤色/身材比例;

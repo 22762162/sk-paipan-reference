@@ -4882,7 +4882,7 @@ function castLookHtml(candidate) {
   const valid = candidate.variant_source !== "legacy"
     && candidate.variant_label && look && typeof look === "object";
   if (!valid) return `<div class="cast-look legacy">
-    <b>历史候选</b><span>未记录独立造型方向；建议按新规则重新生成后再比较。</span>
+    <b>历史候选</b><span>未记录候选差异轴；建议按本剧唯一画风规则重新生成后再比较。</span>
   </div>`;
   const rows = [
     ["服装", look.costume], ["发型", look.hair],
@@ -4937,8 +4937,9 @@ function renderCastSelection(data, episodeId) {
     <div class="confirm-banner">
       <div><b>先定人物，再生产后续图片 👤</b>
         <span>${esc(policy)}；有参考图时人物脸和发型是最高标准，职业角色必须穿工作服；人物候选统一使用纯背景，不得出现文字或场景。
-        每名角色先从剧情推导视觉DNA并与全剧角色去重，再按重要度生成独立造型候选；
-        请比较服装、发型、妆容和气质后各选1张作为最终立绘。
+        每名角色先从剧情推导视觉DNA并与全剧角色去重，再按重要度生成同一画风下的候选图；
+        所有候选继承本剧唯一画风，不提供多个画风选项，只比较人物身份、表情、轻微姿态和剧情造型细节，
+        请各选1张作为最终立绘。
         定版后完整版会生成面部、正面、严格90°侧面和完整180°背面独立母资产；
         16:9三视图拼板只用于审核，不作为正式镜头参考。
         后续关键帧、首尾帧和其他图片 API 都会真实携带这张参考图，

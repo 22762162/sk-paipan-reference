@@ -24,13 +24,14 @@ PNG_1PX = base64.b64decode(
 MP4_FAKE = b"\x00\x00\x00 ftypisom" + b"\x00" * 64
 
 
-def test_candidate_api_prompt_locks_face_but_releases_look():
+def test_candidate_api_prompt_locks_project_style_and_identity():
     provider = OpenAIImageProvider("image_api", {"enabled": True})
     payload = {"portrait_candidate": True, "style": "现代都市半写实"}
     prompt = provider._semantic_prompt("五套造型候选", payload, [object()])
     assert "人物身份与脸是最高标准" in prompt
     assert "不得改脸" in prompt
-    assert "允许按提示词改变发型梳法" in prompt
+    assert "不得改脸、换发型或换妆造" in prompt
+    assert "同一项目画风" in prompt
     assert "纯净无场景背景" in prompt
     assert "不得用同一造型只换动作" in prompt
 
