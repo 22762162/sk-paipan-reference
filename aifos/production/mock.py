@@ -191,6 +191,10 @@ class MockProvider(Provider):
                     "gender_match": True,
                     "count_checked": True,
                     "count_match": True,
+                    "physical_logic_checked": True,
+                    "physical_logic_match": True,
+                    "spatial_logic_checked": True,
+                    "spatial_logic_match": True,
                     "detected_count": payload.get("count", 0),
                     "issues": ["测试触发:画面与要求不符"],
                     "image_error": {
@@ -223,6 +227,10 @@ class MockProvider(Provider):
                 "gender_match": True,
                 "count_checked": True,
                 "count_match": True,
+                "physical_logic_checked": True,
+                "physical_logic_match": True,
+                "spatial_logic_checked": True,
+                "spatial_logic_match": True,
                 "detected_count": payload.get("count", 0),
                 "issues": [],
                 "image_error": {

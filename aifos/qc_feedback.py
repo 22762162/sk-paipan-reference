@@ -36,6 +36,12 @@ _RULES = (
      "按本镜剧本和对应服装参考图修正服装、配饰和妆造；身份参考图只锁脸和发型，不把错误服装带入。"),
     ("scene", ("场景", "空间", "环境", "建筑", "陈设", "地点", "scene", "location"),
      "按本镜场景基准图修正空间结构、陈设、材质和主光方向；禁止把参考图人物或文字带入。"),
+    ("physics", ("物理", "物理逻辑", "空间逻辑", "空间关系", "方向反",
+                  "朝向不成立", "接触点", "支撑", "漂浮", "屏幕背面",
+                  "键盘朝向", "使用关系", "physics", "spatial logic"),
+     "只修正质检指出的物理/空间关系：保持人物、镜头和道具在同一空间坐标中，"
+     "核对前后左右、朝向、视线、手部接触、重力支撑和动作可达性；电脑/手机屏幕"
+     "按真实使用方向摆放，未指出的身份、服装、场景和文字保持不变。"),
     ("text", ("文字", "字幕", "乱码", "logo", "水印", "可读", "subtitle", "watermark"),
      "画面文字只允许沿用已锁定关键帧；删除字幕、乱码、Logo和水印，不让视频模型重新写字。"),
     ("continuity", ("连续", "首帧", "尾帧", "起点", "终点", "状态", "站位", "道具",
@@ -86,7 +92,8 @@ def _screen_text_instruction(reason, whitelist=None):
     if missing and not unwanted:
         return (
             "【TEXT ASSET HARD GATE】只修正屏幕/页面这一块局部；银色笔记本必须"
-            "保持打开并让屏幕正对镜头、占画面中清晰可见区域，屏幕内实际显示"
+            "保持打开并让屏幕正面朝向本镜需要看到屏幕的一侧；使用者与屏幕正面同侧，"
+            "若人物需要读屏则采用越肩或侧面机位；屏幕内实际显示"
             f"{wanted_text}；逐字沿用该原文，不得改写、缩写或用随机乱码替代。"
             "禁止空白冷白屏、纯白发光占位面、黑屏占位面和模糊不可读页面；"
             "屏幕外的人物、服装、配饰、场景、构图、光线和金属机身全部保持失败"
@@ -122,6 +129,22 @@ def optimize_qc_feedback(
         reasons.append(reason)
         lowered = reason.lower()
         matched = False
+        # 先识别物理/空间关系；“屏幕方向反了”不能被误归为文字资产问题。
+        physics_tokens = (
+            "物理", "物理逻辑", "空间逻辑", "空间关系", "方向反",
+            "朝向不成立", "接触点", "支撑", "漂浮", "屏幕背面",
+            "键盘朝向", "使用关系", "physics", "spatial logic",
+        )
+        if any(token.lower() in lowered for token in physics_tokens):
+            category = "physics"
+            if category not in seen_categories:
+                seen_categories.add(category)
+                categories.append(category)
+                instructions.append(
+                    "只修正质检指出的物理/空间关系：保持人物、镜头和道具在同一空间坐标中，"
+                    "核对前后左右、朝向、视线、手部接触、重力支撑和动作可达性；电脑/手机屏幕"
+                    "按真实使用方向摆放，未指出的身份、服装、场景和文字保持不变。")
+            continue
         # 屏幕/页面问题必须先于 generic 和普通 text 规则处理；“电脑屏幕
         # 空白”本质是缺失文字资产，不能套用“删除字幕/乱码”。
         if any(token.lower() in lowered for token in _SCREEN_TEXT_TOKENS):

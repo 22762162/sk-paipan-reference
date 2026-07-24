@@ -338,11 +338,15 @@ def test_visual_qc_requires_identity_ack_and_reuses_signature(app, tmp_path):
             calls.append(payload)
             return ProviderResult(
                 provider="vision", cost=0.2,
-                data={"pass": True, "identity_checked": True,
-                      "identity_match": True,
-                      "gender_checked": True, "gender_match": True,
-                      "count_checked": True, "count_match": True,
-                      "issues": []})
+                    data={"pass": True, "identity_checked": True,
+                          "identity_match": True,
+                          "gender_checked": True, "gender_match": True,
+                          "count_checked": True, "count_match": True,
+                          "physical_logic_checked": True,
+                          "physical_logic_match": True,
+                          "spatial_logic_checked": True,
+                          "spatial_logic_match": True,
+                          "issues": []})
 
     app.director.router = Router()
     app.assets.register(

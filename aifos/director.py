@@ -43,11 +43,14 @@ from .quality_policy import (
     set_policy_choices,
 )
 from .prompt_contract import (
+    build_physical_contract,
     build_composition_contract,
     compile_shot_prompt,
     readable_text_required,
+    shot_local_scene,
 )
 from .qc_feedback import optimize_qc_feedback
+from .lessons import lessons_block, project_lessons, record_lessons
 from .relations import relation_lines, write_relations
 from .spatial_blocking import (
     build_spatial_plan,
@@ -1561,6 +1564,24 @@ class Director:
                 if extra:
                     item.update(extra)
                 self._plan_write(ctx, plan)
+                # 出错经验库:质检发现过的问题(含重画后已通过的首轮问题)
+                # 自动归档,之后所有出图/视频提示词带"严禁再犯"清单
+                qc = (extra or {}).get("qc") or {}
+                issues = qc.get("lesson_issues") or (
+                    qc.get("issues") if qc.get("passed") is False else [])
+                if issues:
+                    try:
+                        count = record_lessons(
+                            self.assets, ctx["project"]["id"], issues,
+                            category=item.get("category", ""))
+                        if count:
+                            self.log.info(
+                                "director",
+                                f"经验库已归档 {count} 条出错原因"
+                                f"({item.get('label', item_id)});"
+                                "后续出图/视频将自动规避")
+                    except Exception:
+                        pass   # 经验归档失败绝不能影响生产主流程
                 return
 
     @staticmethod
@@ -1904,7 +1925,8 @@ class Director:
     def _qc_spec(self, project_id, characters, location="", action="",
                  forbid=None, require_identity=True, expected_characters=None,
                  expected_count=None, character_background=None, camera="",
-                 composition_contract=None, readable_text=None):
+                 composition_contract=None, readable_text=None,
+                 physical_contract=None, physical_logic_required=False):
         """视觉质检规格：按角色在本镜可见角度选择核验依据。"""
         identity_characters = list(characters or [])
         visible_characters = list(
@@ -1961,6 +1983,16 @@ class Director:
             "action": action or "",
             "camera": camera or "",
             "composition_contract": composition_contract,
+            "physical_contract": (physical_contract
+                                   if isinstance(physical_contract, dict)
+                                   else build_physical_contract({
+                                       "description": action,
+                                       "action": action,
+                                       "camera": camera,
+                                       "composition_contract": composition_contract,
+                                       "location": location,
+                                       "readable_text": readable_text or {},
+                                   })),
             "readable_text": (readable_text if isinstance(readable_text, dict)
                                else {}),
             "identity_view_policy": "adaptive_visible_angle_v2",
@@ -1973,6 +2005,7 @@ class Director:
             "gender_required": identity_required,
             # 即使是无人空镜也要明确核对 0 人，禁止模型擅自新增路人。
             "count_required": True,
+            "physical_logic_required": bool(physical_logic_required),
             "static_frame": True,
         }
 
@@ -2246,7 +2279,7 @@ class Director:
             for action in reference_actions(diagnostics))
 
     def _assess_image_qc(self, qc_spec, verdict, attempts):
-        """把视觉模型结果收敛为身份/性别/人数三个不可绕过的门槛。"""
+        """把视觉模型结果收敛为身份/性别/人数/物理空间四个门槛。"""
         verdict = verdict or {}
         input_diagnosis = normalize_generation_diagnostics(
             verdict, issues=verdict.get("issues"))
@@ -2285,6 +2318,19 @@ class Director:
             not count_required or bool(verdict.get("count_checked")))
         count_match = (
             not count_required or bool(verdict.get("count_match")))
+        physical_required = bool(qc_spec.get("physical_logic_required"))
+        physical_checked = (
+            not physical_required
+            or bool(verdict.get("physical_logic_checked")))
+        physical_match = (
+            not physical_required
+            or bool(verdict.get("physical_logic_match")))
+        spatial_checked = (
+            not physical_required
+            or bool(verdict.get("spatial_logic_checked")))
+        spatial_match = (
+            not physical_required
+            or bool(verdict.get("spatial_logic_match")))
         issues = [str(item) for item in (verdict.get("issues") or [])]
         if not identity_checked:
             issues.append("质检未确认已逐人比对最终立绘")
@@ -2301,6 +2347,14 @@ class Director:
             suffix = f"，检测到{detected}人" if detected is not None else ""
             issues.append(
                 f"画面人数与要求的{qc_spec.get('count', 0)}人不一致{suffix}")
+        if not physical_checked:
+            issues.append("质检未核对道具、人物与镜头的物理关系")
+        elif not physical_match:
+            issues.append("画面存在物理逻辑错误或道具使用关系不成立")
+        if not spatial_checked:
+            issues.append("质检未核对人物、道具、镜头的空间关系")
+        elif not spatial_match:
+            issues.append("人物、道具与镜头的相对位置/朝向不成立")
         issues = list(dict.fromkeys(issues))
         text = self._qc_issue_text(issues).lower()
         mismatch_words = (
@@ -2313,13 +2367,17 @@ class Director:
             not identity_checked or not identity_match
             or not gender_checked or not gender_match
             or not count_checked or not count_match
+            or not physical_checked or not physical_match
+            or not spatial_checked or not spatial_match
             or (not identity_checks
                 and any(word in text for word in mismatch_words)))
         passed = (
             bool(verdict.get("pass"))
             and identity_checked and identity_match
             and gender_checked and gender_match
-            and count_checked and count_match)
+            and count_checked and count_match
+            and physical_checked and physical_match
+            and spatial_checked and spatial_match)
         report = {
             "passed": passed,
             "issues": issues,
@@ -2330,12 +2388,17 @@ class Director:
             "gender_match": gender_match,
             "count_checked": count_checked,
             "count_match": count_match,
+            "physical_logic_checked": physical_checked,
+            "physical_logic_match": physical_match,
+            "spatial_logic_checked": spatial_checked,
+            "spatial_logic_match": spatial_match,
             "detected_count": verdict.get("detected_count"),
             "identity_references": len(
                 qc_spec.get("identity_references") or []),
             "identity_checks": identity_checks,
             "composition_contract": qc_spec.get(
                 "composition_contract") or {},
+            "physical_contract": qc_spec.get("physical_contract") or {},
             "hard_failure": bool(hard_failure and not passed),
         }
         report.update({
@@ -2364,6 +2427,7 @@ class Director:
         payload = copy.deepcopy(payload or {})
         if not isinstance(payload.get("reference_manifest"), list):
             self._attach_reference_manifest(payload)
+        lesson_issues = []
         while True:
             generation_input = self._image_generation_input(
                 payload, qc_spec=qc_spec)
@@ -2435,6 +2499,10 @@ class Director:
                     "gender_match": False,
                     "count_checked": False,
                     "count_match": False,
+                    "physical_logic_checked": False,
+                    "physical_logic_match": False,
+                    "spatial_logic_checked": False,
+                    "spatial_logic_match": False,
                     "hard_failure": True,
                     "identity_references": len(
                         qc_spec.get("identity_references") or []),
@@ -2470,6 +2538,10 @@ class Director:
             })
             attempt_history.append(history_row)
             report["attempt_history"] = copy.deepcopy(attempt_history)
+            # 经验库素材:重画后最终通过的图,第一次犯的错也要记住
+            if not report["passed"]:
+                lesson_issues.extend(report["issues"])
+            report["lesson_issues"] = list(dict.fromkeys(lesson_issues))
             result.qc = report
             if report["passed"] or attempts >= self._qc_retries():
                 return result
@@ -4938,16 +5010,15 @@ class Director:
         镜头对白或整场 action，避免审计提示词与实际短合同不一致。
         """
         title = ctx["project"].get("title", "")
-        script = ctx.get("script") or {}
-        world = script.get("story_world") or {}
+        world = (ctx.get("script") or {}).get("story_world") or {}
         parts = [f"【TASK】漫剧《{title}》镜头 {shot.get('shot_no', '')} 静态关键帧"]
-        world_line = "；".join(filter(None, (
-            str(world.get("era_and_location") or "").strip(),
-            str(world.get("hard_rules") or "").strip(),
-            str(world.get("visual_baseline") or "").strip(),
+        shot_world = "；".join(filter(None, (
+            str(shot.get("world_state") or "").strip(),
+            str(shot.get("era") or "").strip(),
+            str(shot.get("time") or "").strip(),
         )))
-        if world_line:
-            parts.append(f"【WORLD / STYLE·故事世界硬约束】{world_line}")
+        if shot_world:
+            parts.append(f"【本镜世界状态】{shot_world}")
         if location:
             parts.append(
                 f"【SCENE】{location}；空间、陈设、光线与场景基准图一致")
@@ -4998,7 +5069,9 @@ class Director:
                 f"{name}:{state.get('position', '')},"
                 f"{state.get('pose', '')},朝向{state.get('direction', '')}"
                 for name, state in start_state.items()))
-        action = shot.get("description") or shot.get("prompt", "")
+        # The audit prompt may be verbose, but its action line must remain
+        # shot-local too; never inject the raw episode/story prompt as action.
+        action = shot.get("description") or shot.get("action") or ""
         parts.append(f"【ACTION】{action or '环境状态保持稳定'}")
         dialogue = shot.get("dialogue")
         if isinstance(dialogue, dict) and dialogue.get("dialogue"):
@@ -5024,6 +5097,13 @@ class Director:
             f"{contract.get('景别') or camera or '按分镜'}；"
             f"{contract.get('角度') or ''}；{contract.get('焦段') or ''}；"
             f"{contract.get('机位') or ''}；构图{contract.get('构图') or '主体清楚'}")
+        physical = build_physical_contract({
+            **shot, "spatial_blocking": shot_blocking(
+                ctx.get("blocking"), shot.get("shot_no")) or {},
+        })
+        if physical.get("rules"):
+            parts.append("【PHYSICAL / SPATIAL LOGIC】" + "；".join(
+                physical["rules"]))
         lines = relation_lines(self._relations(ctx),
                                shot.get("characters", []))
         if lines:
@@ -5043,15 +5123,31 @@ class Director:
         parts.append(
             "【STRUCTURE】五官透视、手指、关节、肢体比例、遮挡关系与"
             "接触点自然，无粘连、断肢、穿模或漂浮道具")
+        # 时代与物理硬约束:场景年代错乱与物体拉伸变形是高频真实错误
+        drift = [str(item).strip() for item in
+                 (world.get("forbidden_drift") or []) if str(item).strip()]
+        parts.append(
+            "【ERA LOCK】画面中每一件物品、服装、道具、建筑必须符合本"
+            "故事时代与世界观"
+            + (f";严禁出现:{'、'.join(drift)}" if drift else
+               ";历史/古代场景严禁出现笔记本电脑、手机、屏幕、现代家具"
+               "等现代物品")
+            + ";道具形态按真实规格(笔记本电脑=合页翻盖薄板,不得拉长"
+            "变形或塞进不合理容器)")
         parts.append(
             "【NEGATIVE】禁止身份漂移、性别错误、人数错误、脸部融合、"
             "重复人物、错误服装、无关杂物、脏污皮肤、塑料脸、字幕和标签")
+        # 出错经验库:本项目此前真实犯过的错,逐条声明严禁再犯
+        lessons = lessons_block(self.assets, ctx["project"]["id"])
+        if lessons:
+            parts.append("【LESSONS·严禁再犯】" + lessons)
         return "\n".join(p for p in parts if p)
 
     def _shot_payload(self, ctx, shot, *, continuity_anchor=False,
                       quality_override=None, item_id=None):
         locations = self._scene_locations(ctx)
-        location = locations.get(shot["scene_no"], "")
+        location = shot_local_scene(
+            shot, locations.get(shot["scene_no"], ""))
         profile = (ctx.get("production_profile")
                    or (ctx.get("storyboard") or {}).get("profile")
                    or production_profile(
@@ -5087,6 +5183,10 @@ class Director:
         character_visuals = self._shot_character_visuals(
             ctx, shot, character_background)
         composition_contract = build_composition_contract(shot)
+        physical_contract = build_physical_contract({
+            **shot, "spatial_blocking": spatial or {},
+            "readable_text": readable_text,
+        })
         payload = {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
@@ -5115,6 +5215,7 @@ class Director:
             "performance": shot.get("performance", {}),
             "shot_contract": shot.get("shot_contract", {}),
             "composition_contract": composition_contract,
+            "physical_contract": physical_contract,
             "sound_design": shot.get("sound_design", {}),
             "spatial_blocking": spatial or {},
             "spatial_constraint": (spatial or {}).get("constraint", ""),
@@ -5163,7 +5264,10 @@ class Director:
         contract, compact = compile_shot_prompt(
             {**shot,
              "character_visuals": character_visuals,
-             "composition_contract": composition_contract},
+             "composition_contract": composition_contract,
+             "physical_contract": physical_contract,
+             "spatial_blocking": spatial or {},
+             "readable_text": readable_text},
             location=location, style=payload.get("style", ""),
             references=payload.get("reference_manifest"), mode="image")
         payload["prompt_contract"] = contract
@@ -5552,7 +5656,9 @@ class Director:
                     camera=payload.get("camera", ""),
                     composition_contract=payload.get(
                         "composition_contract"),
-                    readable_text=payload.get("readable_text"))}})
+                    readable_text=payload.get("readable_text"),
+                    physical_contract=payload.get("physical_contract"),
+                    physical_logic_required=True)}})
         results, qc_failures = self._run_parallel(
             ctx, tasks, line="分镜画面",
             continue_on_qc_failure=True)
@@ -6059,10 +6165,11 @@ class Director:
     def _shot_location(script, shot):
         """按场号解析镜头场景名，兼容字符串/整数场号。"""
         scene_no = shot.get("scene_no")
-        return next((
+        fallback = next((
             str(scene.get("location") or "")
             for scene in (script or {}).get("scenes", [])
             if str(scene.get("scene_no")) == str(scene_no)), "")
+        return shot_local_scene(shot, fallback)
 
     def _video_identity_names(self, ctx, shot):
         """Seedance 必传最终立绘名单；背景路人不建立独立母资产。"""
@@ -6310,6 +6417,18 @@ class Director:
             "【禁止】不得把空间示意图、编号、姓名标签、坐标、箭头、"
             "参考图边框、字幕或乱码画进成片；不得执行第二个主动作或"
             "第二种运镜；不得在首尾帧之间改变人物、服装、道具或场景。")
+        # 与出图同一套时代/物理硬约束 + 出错经验库,视频端同步防错
+        world = (ctx.get("script") or {}).get("story_world") or {}
+        drift = [str(item).strip() for item in
+                 (world.get("forbidden_drift") or []) if str(item).strip()]
+        lines.append(
+            "【时代与物理】全程物品、服装、建筑必须符合故事时代与世界观"
+            + (f"，严禁出现:{'、'.join(drift)}" if drift else
+               "，历史/古代场景严禁出现笔记本电脑、手机等现代物品")
+            + "；物体在运动中保持真实结构与比例,严禁拉长、扭曲、穿模。")
+        lessons = lessons_block(self.assets, ctx["project"]["id"])
+        if lessons:
+            lines.append("【严禁再犯】" + lessons)
         return "\n".join(lines)
 
     @staticmethod
@@ -8976,7 +9095,11 @@ class Director:
     SHOT_QC_CATEGORIES = frozenset({"shot_image", "frames"})
 
     # ---- 单张/批量质检:核对已生成的图是否符合剧本要求 ----
-    _FORBID = ["与设定形态不符的角色", "悬挂的衣物或衣架", "与设定不符的人"]
+    _FORBID = ["与设定形态不符的角色", "悬挂的衣物或衣架", "与设定不符的人",
+               "与故事时代/世界观不符的物品或建筑(时代错乱,如历史场景"
+               "出现笔记本电脑/手机/现代家具)",
+               "结构扭曲、比例失常或被拉长变形的物体(如被拉长的笔记本/"
+               "盒子,不合物理的道具)"]
 
     def _plan_item_target(self, item_id):
         head, _, rest = item_id.partition(":")
@@ -9135,7 +9258,9 @@ class Director:
                     camera=payload.get("camera", ""),
                     composition_contract=payload.get(
                         "composition_contract"),
-                    readable_text=payload.get("readable_text"))
+                    readable_text=payload.get("readable_text"),
+                    physical_contract=payload.get("physical_contract"),
+                    physical_logic_required=True)
             else:
                 spec = self._qc_spec(project_id, [], forbid=self._FORBID)
         # 首尾帧:首帧 + 尾帧两张都要检,任一不符即整组不合格
@@ -9172,6 +9297,10 @@ class Director:
         gender_match_all = True
         count_checked_all = True
         count_match_all = True
+        physical_checked_all = True
+        physical_match_all = True
+        spatial_checked_all = True
+        spatial_match_all = True
         hard_failure = False
         input_diagnoses = []
         try:
@@ -9208,6 +9337,18 @@ class Director:
                     count_checked_all and one_report["count_checked"])
                 count_match_all = (
                     count_match_all and one_report["count_match"])
+                physical_checked_all = (
+                    physical_checked_all
+                    and one_report["physical_logic_checked"])
+                physical_match_all = (
+                    physical_match_all
+                    and one_report["physical_logic_match"])
+                spatial_checked_all = (
+                    spatial_checked_all
+                    and one_report["spatial_logic_checked"])
+                spatial_match_all = (
+                    spatial_match_all
+                    and one_report["spatial_logic_match"])
                 hard_failure = hard_failure or one_report["hard_failure"]
                 issues.extend(
                     f"{label}:{x}" for x in one_report["issues"])
@@ -9221,6 +9362,10 @@ class Director:
                   "gender_match": gender_match_all,
                   "count_checked": count_checked_all,
                   "count_match": count_match_all,
+                  "physical_logic_checked": physical_checked_all,
+                  "physical_logic_match": physical_match_all,
+                  "spatial_logic_checked": spatial_checked_all,
+                  "spatial_logic_match": spatial_match_all,
                   "hard_failure": hard_failure,
                   "identity_references": len(
                       spec.get("identity_references") or []),

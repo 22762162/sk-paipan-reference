@@ -1,8 +1,10 @@
 from aifos.prompt_contract import (
     PROMPT_CONTRACT_SCHEMA,
     build_composition_contract,
+    build_physical_contract,
     compile_shot_prompt,
     readable_text_required,
+    shot_local_scene,
 )
 from aifos.adapters.codex_image import build_instruction
 from aifos.workflow import _text_asset, build_content_review
@@ -188,3 +190,27 @@ def test_laptop_page_is_a_hard_readable_asset_not_a_blank_light():
     )
     assert "禁止空白" in instruction
     assert "明季北略、崇祯" in instruction
+
+
+def test_laptop_contract_states_user_screen_and_camera_side():
+    shot = _shot()
+    shot.update({
+        "characters": ["林晚"],
+        "description": "林晚阅读银色笔记本电脑屏幕上的《明季北略》崇祯页面",
+        "readable_text": {
+            "required": True, "carrier": "电脑",
+            "whitelist": ["明季北略", "崇祯"],
+        },
+    })
+    physical = build_physical_contract(shot)
+    assert physical["schema"] == "aifos.physical-space/v1"
+    assert any("屏幕正面" in rule and "使用者" in rule
+               for rule in physical["rules"])
+    _, prompt = compile_shot_prompt(shot, location="现代书房")
+    assert "【物理/空间逻辑】" in prompt
+    assert "禁止人物坐在屏幕背面却看到屏幕正面" in prompt
+
+
+def test_legacy_shot_uses_local_modern_scene_before_episode_fallback():
+    shot = {"description": "现代书房闪回，青年查看银色笔记本电脑"}
+    assert shot_local_scene(shot, "明代东宫寝殿") == "现代书房（闪回）"

@@ -81,3 +81,13 @@ def test_structured_diagnosis_uses_short_patch_without_dumping_analysis():
     assert "只修改当前镜头" in result["text"]
     assert "很长的整集背景分析" not in result["text"]
     assert result["reference_adjustments"] == []
+
+
+def test_physical_logic_feedback_preserves_shot_boundary():
+    result = optimize_qc_feedback(
+        ["人物坐在笔记本屏幕后方却看到屏幕正面，电脑使用方向反了"],
+        mode="image",
+    )
+    assert result["categories"] == ["physics"]
+    assert "电脑/手机屏幕" in result["text"]
+    assert "同一空间坐标" in result["text"]

@@ -11,7 +11,8 @@ from __future__ import annotations
 import re
 
 
-PROMPT_CONTRACT_SCHEMA = "aifos.shot-prompt/v1"
+PROMPT_CONTRACT_SCHEMA = "aifos.shot-prompt/v2"
+PHYSICAL_CONTRACT_SCHEMA = "aifos.physical-space/v1"
 NON_PICTURE_TEXT_CARRIERS = ("字幕", "对白字幕", "旁白字幕", "台词字幕")
 
 
@@ -62,6 +63,122 @@ def _camera(shot):
         "运镜": _text(design.get("movement") or contract.get("运镜"), "固定"),
         "动机": _text(design.get("movement_motivation"), "服务主体动作"),
         "构图": _text(design.get("composition") or contract.get("构图"), "主体清楚"),
+    }
+
+
+def shot_local_scene(shot, fallback=""):
+    """Resolve only the current shot's visible place/era.
+
+    Legacy storyboards often omitted a per-shot location and left only a raw
+    prompt such as “现代书房闪回”. Do not silently use the episode's later
+    historical scene in that case; use an explicit shot value or a narrow
+    keyword hint, then fall back to the scene baseline.
+    """
+    shot = shot or {}
+    explicit = _text(
+        shot.get("location") or shot.get("scene_location")
+        or shot.get("scene_context") or shot.get("world_state"))
+    if explicit:
+        return explicit
+    text = " ".join(_text(value) for value in (
+        shot.get("description"), shot.get("action"), shot.get("prompt"),
+    ) if _text(value))
+    hints = (
+        ("现代书房", ("现代书房", "现代书桌")),
+        ("现代办公室", ("现代办公室", "现代办公")),
+        ("现代都市", ("现代都市", "都市街道", "现代街道")),
+        ("明代东宫寝殿", ("东宫", "寝殿", "太子殿")),
+        ("明代宫殿内景", ("明代宫殿", "宫殿", "紫禁城")),
+    )
+    for label, tokens in hints:
+        if any(token in text for token in tokens):
+            return label + ("（闪回）" if "闪回" in text and "现代" in label
+                            else "")
+    return _text(fallback, "按场景基准图")
+
+
+def build_physical_contract(shot):
+    """Build a short, shot-local physical/spatial contract.
+
+    The image model must receive object-user-camera relationships explicitly;
+    a generic "natural proportions" negative prompt is not enough to catch
+    impossible setups such as a laptop facing the camera while its user sits
+    behind the display.  Only inspect current-shot fields here, never the full
+    episode/story bible.
+    """
+    shot = shot or {}
+    explicit = (shot.get("physical_contract")
+                or shot.get("physical_logic")
+                or shot.get("spatial_logic"))
+    if isinstance(explicit, dict):
+        raw_rules = explicit.get("rules") or explicit.get("constraints") or []
+        if isinstance(raw_rules, str):
+            raw_rules = [raw_rules]
+        rules = [_text(value) for value in raw_rules if _text(value)]
+        objects = explicit.get("objects") or explicit.get("object_relations") or []
+        if isinstance(objects, str):
+            objects = [objects]
+    else:
+        rules = [_text(explicit)] if explicit else []
+        objects = []
+    shot_contract = shot.get("shot_contract")
+    shot_contract = shot_contract if isinstance(shot_contract, dict) else {}
+    description = " ".join(_text(value) for value in (
+        shot.get("description"), shot.get("action"),
+        shot_contract.get("画面内容描述"),
+        shot_contract.get("构图"),
+    ) if _text(value))
+    carrier = _text((shot.get("readable_text") or {}).get("carrier"))
+    object_text = f"{description} {carrier}".lower()
+    generic = (
+        "人物、镜头与道具的前后左右关系必须真实成立；道具服从重力并与桌面/地面/手部"
+        "保持自然接触；人物朝向、视线和手部动作必须指向实际使用对象；禁止漂浮、穿模、"
+        "镜像反向、无支撑或无法完成动作的姿势。"
+    )
+    if generic not in rules:
+        rules.insert(0, generic)
+    if any(token in object_text for token in (
+            "笔记本", "电脑", " laptop", "屏幕", "显示器")):
+        rules.append(
+            "电脑使用关系：屏幕正面、键盘和使用者必须位于同一使用侧；键盘朝向使用者，"
+            "屏幕与底座由铰链连接并由桌面支撑；人物视线落在屏幕可见区域。若需要看清屏幕文字，"
+            "镜头必须采用使用者同侧的越肩或侧面机位，禁止人物坐在屏幕背面却看到屏幕正面。"
+        )
+        objects.append("笔记本电脑：使用者↔键盘/屏幕正面↔桌面支撑")
+    elif any(token in object_text for token in ("手机", "平板", "tablet")):
+        rules.append(
+            "手持屏幕关系：屏幕正面必须朝向正在查看或展示的人；手指与机身接触自然，"
+            "手腕、手臂和视线方向一致，禁止屏幕朝后却被人物读取。"
+        )
+        objects.append("手持屏幕：使用者/观看者↔屏幕正面")
+    blocking = shot.get("spatial_blocking") or {}
+    if isinstance(blocking, dict):
+        camera = blocking.get("camera") or {}
+        if isinstance(camera, dict):
+            camera_position = _text(camera.get("position")
+                                     or camera.get("camera_position"))
+            if camera_position:
+                rules.append(f"空间调度机位：{camera_position}；保持与人物和道具关系一致。")
+        actors = blocking.get("actors") or []
+        if actors:
+            positions = []
+            for actor in actors:
+                if not isinstance(actor, dict):
+                    continue
+                name = _text(actor.get("name") or actor.get("character"))
+                pos = _text(actor.get("start") or actor.get("position"))
+                direction = _text(actor.get("direction"))
+                if name and (pos or direction):
+                    positions.append(f"{name}:{pos or '原位'}{('，朝向' + direction) if direction else ''}")
+            if positions:
+                rules.append("人物站位与朝向：" + "；".join(positions) + "。")
+    rules = list(dict.fromkeys(rule for rule in rules if rule))
+    objects = list(dict.fromkeys(_text(value) for value in objects if _text(value)))
+    return {
+        "schema": PHYSICAL_CONTRACT_SCHEMA,
+        "required": True,
+        "rules": rules,
+        "objects": objects,
     }
 
 
@@ -228,9 +345,13 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
             "role": _text(item.get("role") or item.get("kind"), "reference"),
             "character": _text(item.get("character")),
         })
-    scene = _text(location or shot.get("location"), "按场景基准图")
+    scene = shot_local_scene(shot, location)
+    physical = build_physical_contract(shot)
+    # Never fall back to the raw storyboard prompt here. It may contain the
+    # whole episode bible and unrelated scenes, which makes the provider blend
+    # facts from other shots into this image.
     action = _text(
-        shot.get("description") or shot.get("action") or shot.get("prompt"),
+        shot.get("description") or shot.get("action"),
         "环境保持稳定，只执行自然微动",
     )
     contract = {
@@ -254,6 +375,7 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
             "自然微表情、呼吸和重心变化",
         ),
         "camera": _camera(shot),
+        "physical": physical,
         "end": _state_line(shot.get("end_state")) or "到达尾帧状态",
         "dialogue": _text(dialogue.get("dialogue")),
         "speaker": _text(dialogue.get("character")),
@@ -301,7 +423,7 @@ def render_shot_prompt(contract, *, mode="image"):
         ) if value
     )
     lines = [
-        "【镜头合同v1】只执行下列事实，不自行补剧情。",
+        "【镜头合同v2】只执行下列事实，不自行补剧情。",
         f"【主体】严格共{count}人：{subject}。",
         f"【场景】{contract['scene']}。",
         f"【起点】{contract['start']}。",
@@ -310,6 +432,14 @@ def render_shot_prompt(contract, *, mode="image"):
         f"【镜头】{camera_line}。",
         f"【终点】{contract['end']}。",
     ]
+    physical = contract.get("physical") or {}
+    physical_rules = "；".join(physical.get("rules") or [])
+    if physical_rules:
+        lines.insert(
+            6,
+            f"【物理/空间逻辑】{physical_rules}"
+            + (f"；对象关系：{'；'.join(physical.get('objects') or [])}。"
+               if physical.get("objects") else "。"))
     composition = contract.get("composition") or {}
     if composition.get("composition_type") == "over_shoulder_dialogue":
         duties = "；".join(

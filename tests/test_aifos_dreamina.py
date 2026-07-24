@@ -21,7 +21,9 @@ if args and args[0] == "user_credit":
     print("credit balance: 420")
     sys.exit(0)
 if args and args[0] in ("frames2video", "multimodal2video"):
-    out = os.path.join(here, "result.mp4")
+    # 视频默认并行生产；每个假 CLI 进程必须有独立输出，避免多个进程
+    # 同时截断同一个 result.mp4，制造与真实 Provider 无关的空文件竞态。
+    out = os.path.join(here, "result-%s.mp4" % os.getpid())
     open(out, "wb").write(b"\\x00\\x00\\x00 ftypisom-fake")
     print(json.dumps({"status": "done", "video_path": out}))
     sys.exit(0)

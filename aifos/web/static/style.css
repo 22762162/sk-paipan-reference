@@ -3929,3 +3929,15 @@ textarea:focus-visible, select:focus-visible {
   .analysis-actions input { grid-column:1/-1; min-height:40px }
   .analysis-actions button { min-height:44px; white-space:normal }
 }
+
+/* 出错经验库面板 */
+.lessons-panel {
+  margin: 10px 0 14px; padding: 12px 14px; border-radius: 10px;
+  border: 1px solid rgba(250, 178, 25, .35);
+  background: rgba(250, 178, 25, .06);
+}
+.lessons-panel h3 { margin: 0 0 8px; font-size: 13px; }
+.lessons-panel h3 .dim { font-weight: 400; font-size: 11px; }
+.lessons-panel ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.lessons-panel li { color: var(--ink-2); font-size: 12px; }
+.lessons-panel li b { color: #ffd77a; margin-right: 6px; font-variant-numeric: tabular-nums; }

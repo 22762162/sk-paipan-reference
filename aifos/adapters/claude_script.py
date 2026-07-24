@@ -154,7 +154,8 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
 {script}
 
 要求:
-- `story_world`、`story_background`、非背景角色的 `introduction` 与背景路人的
+- `story_world` 故事世界观、`story_background`、非背景角色的
+  `introduction` 与背景路人的
   `crowd_function` 是硬约束,必须先读取再分镜;不得新增人物表之外的角色,
   不得擅自改时代、组织、能力、技术、物种、性别、年龄段、身份与人物关系;
 - 必须读取 `production_analysis` 制作圣经；逐场继承其中的环境、布局、材质、
@@ -163,8 +164,12 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
 - 每场先给 1 个环境/肢体镜头，再为每句台词给 1 个对白镜头；
 - 关键台词后的听者反应与情绪高潮留白由平台补齐，不要用空镜凑时长；
 - shot_no 从 1 连续编号；duration 单位秒，优先 5-8 秒，最长 15 秒；
-- prompt 含世界观约束、故事前情、场景、准确人物名单、主体动作、光影、
-  机位与结尾状态；
+- prompt 只含本镜头真正可见且会影响生成的世界状态、场景、准确人物名单、主体动作、
+  光影、机位与结尾状态；不得复制整集前情、其他镜头、人物传记或无关道具；
+- 每个镜头必须额外输出 `physical_logic`，只写本镜可见的物理/空间事实：人物、
+  道具、桌面/地面、镜头的相对位置，使用方向、接触点、视线和动作可达性；
+  涉及电脑/手机/屏幕时必须明确屏幕正面、键盘/手部、使用者和摄影机同侧关系，
+  禁止人物坐在屏幕后方却看到屏幕正面等反向构图；
 - prompt 中人物形态按人物设定描写(名字只是称呼,「小鹿」若设定为
   人类不能当动物写;设定为动物/精怪的按设定写,全片保持一致);
 - 不生成对白字幕。手机屏、弹幕、合同等可读文字只描述载体与准确文字，
@@ -175,6 +180,7 @@ JSON 格式:
 {{"episode_title": "...", "shots": [{{"shot_no": 1, "scene_no": 1,
   "kind": "environment", "description": "...", "camera": "镜头语言",
   "duration": 2.5, "characters": ["角色名"], "dialogue": null,
+  "physical_logic": "本镜物理/空间关系",
   "prompt": "文生图提示词"}}]}}"""
 
 STORY_ANALYSIS_PROMPT = """你是 AI 漫剧的编剧、美术指导、摄影指导和连续性导演。
@@ -551,6 +557,7 @@ def validate_storyboard(storyboard):
         shot.setdefault("description", "")
         shot.setdefault("camera", "")
         shot.setdefault("dialogue", None)
+        shot.setdefault("physical_logic", "")
     # 编号强制连续,避免下游连续性质检失败
     for index, shot in enumerate(storyboard["shots"], start=1):
         shot["shot_no"] = index
@@ -724,6 +731,10 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 - 角色性别硬事实:{expected_genders}
 - 场景:{location};动作:{action};镜头:{camera}
   (景别需大致相符:要求全景/远景不能给成特写,反之亦然)
+- 物理/空间逻辑硬检查:{physical_contract}
+  必须核对人物、镜头、道具的前后左右关系、朝向、视线、接触点、重力支撑和动作可达性；
+  电脑/手机/屏幕等设备必须按真实使用方向成立，屏幕正面、键盘/手部和使用者关系不能反向。
+  发现任何物理或空间关系不成立，pass 必须为 false，并在 issues 指出具体对象和位置。
 - 不允许出现:与设定形态不符的角色、与剧情无关的杂物(悬挂的衣物/衣架)、
   字幕条、乱码文字、多余或缺失的人物{extra}
 - 这是静态关键帧质检：只检查画面中能看见的最终状态。不得因为单张图无法证明
@@ -738,6 +749,8 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 "basis":["实际核验项"],"checked":true或false,"match":true或false}}],
 "gender_checked": true或false, "gender_match": true或false,
 "count_checked": true或false, "count_match": true或false,
+"physical_logic_checked": true或false, "physical_logic_match": true或false,
+"spatial_logic_checked": true或false, "spatial_logic_match": true或false,
 "detected_count": 画面实际人数整数,
 "issues": ["不通过的具体原因,每条一句,指出在画面哪里"],
 "image_error": {{"summary":"画面错误摘要","categories":["identity/count/camera等"],
@@ -800,6 +813,13 @@ def build_qc_prompt(payload):
         else (
             f"严格共 {payload.get('count', len(characters))} 个已登记角色；"
             + (composition.get("count_rule") or "每个人物只计一次")))
+    physical = payload.get("physical_contract") or {}
+    physical_rules = "；".join(physical.get("rules") or [])
+    physical_objects = "；".join(physical.get("objects") or [])
+    physical_text = (
+        ("必须执行硬检查；" if payload.get("physical_logic_required") else "仅作辅助检查；")
+        + (physical_rules or "人物、镜头、道具关系按当前镜头实际构图核对")
+        + (f"；对象关系：{physical_objects}" if physical_objects else ""))
     return IMAGE_QC_PROMPT.format(
         image=payload.get("image_uri", ""),
         generation_scope=json.dumps(
@@ -820,6 +840,7 @@ def build_qc_prompt(payload):
         location=payload.get("location") or "按提示词",
         action=payload.get("action") or "按提示词",
         camera=payload.get("camera") or "按提示词",
+        physical_contract=physical_text,
         extra=("、" + "、".join(payload.get("forbid", []))
                if payload.get("forbid") else ""))
 
@@ -844,6 +865,11 @@ def validate_image_qc(data):
         data["count_checked"] = bool(data["count_checked"])
     if "count_match" in data:
         data["count_match"] = bool(data["count_match"])
+    for key in (
+            "physical_logic_checked", "physical_logic_match",
+            "spatial_logic_checked", "spatial_logic_match"):
+        if key in data:
+            data[key] = bool(data[key])
     if "detected_count" in data:
         try:
             data["detected_count"] = int(data["detected_count"])

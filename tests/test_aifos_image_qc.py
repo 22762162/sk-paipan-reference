@@ -51,6 +51,8 @@ def test_qc_prompt_and_validation():
     assert "全景" in prompt
     assert "正脸不可见本身不是错误" in prompt
     assert "不得另算成第三人" in prompt
+    assert "物理/空间逻辑硬检查" in prompt
+    assert "physical_logic_checked" in prompt
     ok = {"pass": True, "issues": []}
     assert validate_image_qc(ok) is None
     bad = {"pass": False, "issues": "镜头9画成了动物"}
@@ -463,6 +465,46 @@ def test_qc_cannot_pass_when_gender_check_fields_are_omitted(app):
     assert report["gender_checked"] is False
     assert report["gender_match"] is False
     assert any("未单独核对人物性别" in issue
+               for issue in report["issues"])
+
+
+def test_physical_and_spatial_logic_are_hard_gates(app):
+    spec = {
+        "identity_required": False,
+        "gender_required": False,
+        "count_required": True,
+        "count": 1,
+        "physical_logic_required": True,
+        "physical_contract": {
+            "schema": "aifos.physical-space/v1",
+            "rules": ["使用者与电脑屏幕正面必须在同一侧"],
+        },
+    }
+    report = app.director._assess_image_qc(spec, {
+        "pass": True,
+        "count_checked": True,
+        "count_match": True,
+        # 模型漏答或无法证明物理关系时，不能按“没发现问题”放行。
+        "issues": [],
+    }, attempts=1)
+    assert report["passed"] is False
+    assert report["physical_logic_checked"] is False
+    assert report["spatial_logic_checked"] is False
+    assert any("物理" in issue for issue in report["issues"])
+
+    report = app.director._assess_image_qc(spec, {
+        "pass": True,
+        "count_checked": True,
+        "count_match": True,
+        "physical_logic_checked": True,
+        "physical_logic_match": False,
+        "spatial_logic_checked": True,
+        "spatial_logic_match": False,
+        "issues": ["人物坐在笔记本屏幕后方却看到屏幕正面"],
+    }, attempts=1)
+    assert report["passed"] is False
+    assert report["hard_failure"] is True
+    assert any("空间" in issue or "物理" in issue
                for issue in report["issues"])
 
 
