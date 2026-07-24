@@ -2980,6 +2980,23 @@ function planQualityBadge(item) {
     title="${esc(`${source}判级${reasons ? `：${reasons}` : ""}`)}">质量 ${labels[quality] || quality}${item.recommended_quality && item.image_quality !== item.recommended_quality ? ` · 建议${labels[item.recommended_quality] || item.recommended_quality}` : ""}</span>`;
 }
 
+function planStoryContextHtml(item, compact = false) {
+  const story = item.story_context;
+  if (!story || item.shot_no == null) return "";
+  const eraClass = story.era === "现代" ? "modern"
+    : story.era === "明代" ? "historical" : "unknown";
+  const excerpt = story.script_excerpt || story.story || "剧本对应原句待补";
+  return `<section class="plan-story-context ${eraClass}" aria-label="镜头剧本对应">
+    <div class="plan-story-head"><b>本镜剧本对应</b>
+      <span class="plan-story-era">${esc(story.era_label || story.era || "时代待确认")}</span></div>
+    <div class="plan-story-meta"><span><b>场景：</b>${esc(story.location || "剧本未明确")}</span>
+      <span><b>时间：</b>${esc(story.time || "剧本未明确")}</span></div>
+    ${story.story && story.story !== excerpt ? `<p><b>镜头故事：</b>${esc(story.story)}</p>` : ""}
+    <p><b>剧本原句：</b>${esc(excerpt)}</p>
+    ${!compact && story.scene_story ? `<small><b>场次功能：</b>${esc(story.scene_story)}</small>` : ""}
+  </section>`;
+}
+
 /* 列表用缩略图(服务端按需缩放缓存);灯箱/预览仍加载原图 */
 function thumbUrl(url, w = 480) {
   if (!url || !url.startsWith("/artifacts/")) return url;
@@ -3071,6 +3088,7 @@ function planItemHtml(data, item, editable) {
         <button class="plan-qc-accept" data-plan-id="${esc(item.id)}"
           title="保留原质检问题，人工确认该问题不影响本集观感">✅ 人工通过</button>
       </div>` : ""}
+      ${planStoryContextHtml(item)}
       <details class="plan-prompt"><summary>实际发送提示词（镜头合同短版）</summary>
         <pre>${esc(item.prompt_used || item.prompt || "")}</pre></details>
       ${item.prompt_used && item.prompt_used !== item.prompt ? `<details class="plan-prompt"><summary>审计原文（完整提示词）</summary><pre>${esc(item.prompt || "")}</pre></details>` : ""}
@@ -3311,6 +3329,15 @@ function productionLedgerReferenceHtml(refs) {
       <b>${esc(ref.label || ref.name || ref.kind || "参考图")}</b></span>`).join("")}
     ${rows.length > 6 ? `<small>+${rows.length - 6} 张</small>` : ""}
     ${!refs.actual ? `<small class="production-ledger-expected">预期自动挂载</small>` : ""}
+  </div>`;
+}
+
+function productionLedgerStoryHtml(row) {
+  const story = row.item?.story_context;
+  if (!story || row.item?.shot_no == null) return "";
+  return `<div class="production-ledger-story">
+    <b>${esc(story.era_label || story.era || "时代待确认")} · ${esc(story.location || "场景待确认")}</b>
+    <small>剧本：${esc(story.script_excerpt || story.story || "待补")}</small>
   </div>`;
 }
 
@@ -3833,7 +3860,7 @@ function productionLedgerHtml(data, options = {}) {
           return `<tr class="production-ledger-row state-${esc(state)}" data-ledger-row
             data-ledger-state="${esc(state)}" data-ledger-kind="${filterKind}">
             <th scope="row" class="production-ledger-object"><b>${esc(row.objectLabel)}</b>
-              <small>${esc(row.subLabel || "")}</small></th>
+              <small>${esc(row.subLabel || "")}</small>${productionLedgerStoryHtml(row)}</th>
             <td data-label="生产环节"><span class="production-ledger-stage-label">${esc(row.stageLabel)}</span>
               ${row.item?.model ? `<small>${esc(row.item.model)}</small>` : ""}</td>
             <td data-label="所需参考图">${productionLedgerReferenceHtml(row.refs)}</td>
@@ -4636,6 +4663,7 @@ function showPlanItemPreview(data, item, episodeId) {
       ${thumbs.length ? `<button type="button" class="preview-download">⬇ 下载当前图片</button>` : ""}
     </div>
     ${item.error ? `<div class="plan-err">${esc(item.error)}</div>` : ""}
+    ${planStoryContextHtml(item)}
     <details class="plan-prompt" open><summary>实际发送提示词（镜头合同短版）</summary>
       <pre>${esc(item.prompt_used || item.prompt || "")}</pre></details>
     ${item.prompt_used && item.prompt_used !== item.prompt ? `<details class="plan-prompt"><summary>审计原文（完整提示词）</summary><pre>${esc(item.prompt || "")}</pre></details>` : ""}
@@ -4966,6 +4994,14 @@ function blockingPointText(point) {
 }
 
 function blockingRouteText(entity, labels = ["起点", "终点"]) {
+  const route3d = Array.isArray(entity && entity.route_3d)
+    ? entity.route_3d.filter((point) => point && point.x != null
+      && point.y != null && point.z != null) : [];
+  if (route3d.length) {
+    const format = (point) => `(${Number(point.x).toFixed(1)},${Number(point.y).toFixed(1)},${Number(point.z).toFixed(1)})m`;
+    if (route3d.length === 1) return `原地 ${format(route3d[0])}`;
+    return `${labels[0]} ${format(route3d[0])} → ${labels[1]} ${format(route3d[route3d.length - 1])}`;
+  }
   const points = blockingRoutePoints(entity || {});
   if (!points.length) return "路线待生成";
   if (points.length === 1) return `原地 ${blockingPointText(points[0])}`;
@@ -5031,6 +5067,337 @@ function blockingLegendHtml(scene, blocking) {
   </div>`;
 }
 
+function blocking3dSceneHtml(scene, sceneIndex) {
+  const shots = scene.shots || [];
+  return `<div class="blocking-3d-stage" data-blocking-scene="${sceneIndex}">
+    <div class="blocking-3d-toolbar">
+      <div class="blocking-3d-shot-tabs" role="tablist" aria-label="选择镜头">
+        ${shots.map((shot, index) => `<button type="button" role="tab"
+          class="${index === 0 ? "active" : ""}" data-shot-index="${index}"
+          aria-selected="${index === 0}">S${esc(shot.shot_no)}</button>`).join("")}
+      </div>
+      <div class="blocking-3d-views" aria-label="切换3D视角">
+        <button type="button" class="active" data-view="orbit">透视</button>
+        <button type="button" data-view="top">俯视</button>
+        <button type="button" data-view="camera">机位方向</button>
+        <button type="button" data-view="reset" aria-label="重置3D视角">重置</button>
+      </div>
+    </div>
+    <canvas class="blocking-3d-canvas" tabindex="0" role="img"
+      aria-label="第${esc(scene.scene_no)}场三维空间调度；可拖拽旋转、滚轮缩放"></canvas>
+    <div class="blocking-3d-hint">
+      拖拽旋转 · Shift/右键拖拽平移 · 滚轮缩放 · 彩色立柱=人物 · 蓝色棱锥=机位视锥
+    </div>
+  </div>`;
+}
+
+function blockingWorldPoint(point3d, point2d, height = 0) {
+  if (point3d && ["x", "y", "z"].every((axis) => Number.isFinite(Number(point3d[axis])))) {
+    return { x: Number(point3d.x), y: Number(point3d.y), z: Number(point3d.z) };
+  }
+  const point = point2d || { x: 500, y: 350 };
+  const x = Number(point.x);
+  const y = Number(point.y);
+  return {
+    x: ((Number.isFinite(x) ? x : 500) - 500) / 820 * 10,
+    y: height,
+    z: ((Number.isFinite(y) ? y : 350) - 350) / 470 * 7,
+  };
+}
+
+function mountBlocking3d(stage, scene) {
+  const canvas = stage.querySelector(".blocking-3d-canvas");
+  const shots = scene.shots || [];
+  if (!canvas || !shots.length) return () => {};
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return () => {};
+  const state = {
+    shotIndex: 0, yaw: -.72, pitch: .58, zoom: 1,
+    panX: 0, panY: 12, dragging: false, panning: false,
+    pointerX: 0, pointerY: 0,
+  };
+  let logicalWidth = 0;
+  let logicalHeight = 0;
+  let frame = 0;
+
+  const project = (point) => {
+    const cosY = Math.cos(state.yaw);
+    const sinY = Math.sin(state.yaw);
+    const cosP = Math.cos(state.pitch);
+    const sinP = Math.sin(state.pitch);
+    const rx = point.x * cosY - point.z * sinY;
+    const rz = point.x * sinY + point.z * cosY;
+    const scale = Math.min(logicalWidth / 13, logicalHeight / 8.5) * state.zoom;
+    return {
+      x: logicalWidth / 2 + state.panX + rx * scale,
+      y: logicalHeight * .57 + state.panY
+        - (point.y * cosP - rz * sinP) * scale,
+      depth: point.y * sinP + rz * cosP,
+    };
+  };
+  const line = (from, to, color, width = 1, dash = []) => {
+    const a = project(from);
+    const b = project(to);
+    ctx.beginPath();
+    ctx.setLineDash(dash);
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.stroke();
+    ctx.setLineDash([]);
+    return { a, b };
+  };
+  const arrow = (from, to, color, width = 3, dash = []) => {
+    const projected = line(from, to, color, width, dash);
+    const angle = Math.atan2(
+      projected.b.y - projected.a.y, projected.b.x - projected.a.x);
+    ctx.beginPath();
+    ctx.moveTo(projected.b.x, projected.b.y);
+    ctx.lineTo(
+      projected.b.x - 10 * Math.cos(angle - .45),
+      projected.b.y - 10 * Math.sin(angle - .45));
+    ctx.lineTo(
+      projected.b.x - 10 * Math.cos(angle + .45),
+      projected.b.y - 10 * Math.sin(angle + .45));
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+  };
+  const dot = (point, radius, fill, stroke = "", width = 1) => {
+    const p = project(point);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+    ctx.fillStyle = fill;
+    ctx.fill();
+    if (stroke) {
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = width;
+      ctx.stroke();
+    }
+    return p;
+  };
+  const label = (text, point, color = "#e2e8f0", offsetY = -10) => {
+    const p = project(point);
+    ctx.font = "600 12px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "bottom";
+    const width = Math.min(190, ctx.measureText(text).width + 12);
+    ctx.fillStyle = "rgba(10,16,28,.82)";
+    ctx.fillRect(p.x - width / 2, p.y + offsetY - 17, width, 19);
+    ctx.fillStyle = color;
+    ctx.fillText(text, p.x, p.y + offsetY - 2, width - 8);
+  };
+  const polygon = (points, fill, stroke) => {
+    const projected = points.map(project);
+    if (!projected.length) return;
+    ctx.beginPath();
+    ctx.moveTo(projected[0].x, projected[0].y);
+    projected.slice(1).forEach((point) => ctx.lineTo(point.x, point.y));
+    ctx.closePath();
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+  };
+  const render = () => {
+    frame = 0;
+    ctx.clearRect(0, 0, logicalWidth, logicalHeight);
+    const background = ctx.createLinearGradient(0, 0, 0, logicalHeight);
+    background.addColorStop(0, "#101b2c");
+    background.addColorStop(1, "#080d16");
+    ctx.fillStyle = background;
+    ctx.fillRect(0, 0, logicalWidth, logicalHeight);
+
+    const floor = [
+      { x: -5, y: 0, z: -3.5 }, { x: 5, y: 0, z: -3.5 },
+      { x: 5, y: 0, z: 3.5 }, { x: -5, y: 0, z: 3.5 },
+    ];
+    polygon(floor, "rgba(21,39,61,.86)", "#52627a");
+    for (let x = -5; x <= 5; x += 1)
+      line({ x, y: 0, z: -3.5 }, { x, y: 0, z: 3.5 }, "#2c405a", .7);
+    for (let z = -3.5; z <= 3.5; z += .5)
+      line({ x: -5, y: 0, z }, { x: 5, y: 0, z }, "#263b54", .7);
+    line({ x: 0, y: 0, z: 0 }, { x: 1.3, y: 0, z: 0 }, "#f87171", 2);
+    line({ x: 0, y: 0, z: 0 }, { x: 0, y: 1.3, z: 0 }, "#4ade80", 2);
+    line({ x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 1.3 }, "#60a5fa", 2);
+
+    const shot = shots[state.shotIndex] || shots[0];
+    const camera = shot.camera || {};
+    const cameraStart = blockingWorldPoint(
+      camera.start_3d, camera.start, 1.55);
+    const cameraEnd = blockingWorldPoint(
+      camera.end_3d, camera.end, 1.55);
+    const cameraTarget = blockingWorldPoint(
+      camera.target_3d, camera.target, 1.25);
+    polygon([
+      cameraEnd,
+      { x: cameraTarget.x - 1.15, y: 0, z: cameraTarget.z },
+      { x: cameraTarget.x + 1.15, y: 0, z: cameraTarget.z },
+      { x: cameraTarget.x + 1.15, y: 2.45, z: cameraTarget.z },
+      { x: cameraTarget.x - 1.15, y: 2.45, z: cameraTarget.z },
+    ], "rgba(56,189,248,.1)", "rgba(56,189,248,.72)");
+    line(cameraEnd, cameraTarget, "#7dd3fc", 1.5, [6, 5]);
+    if (camera.moving || cameraStart.x !== cameraEnd.x
+        || cameraStart.y !== cameraEnd.y || cameraStart.z !== cameraEnd.z) {
+      arrow(cameraStart, cameraEnd, "#38bdf8", 3);
+      dot(cameraStart, 7, "#0f172a", "#38bdf8", 2);
+    }
+    const cameraDot = dot(cameraEnd, 9, "#38bdf8", "#e0f2fe", 2);
+    ctx.save();
+    ctx.translate(cameraDot.x, cameraDot.y);
+    ctx.rotate(Math.PI / 4);
+    ctx.strokeStyle = "#e0f2fe";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(-7, -7, 14, 14);
+    ctx.restore();
+    label(`C${shot.shot_no} · ${camera.lens_mm || "-"}mm`, cameraEnd, "#bae6fd", -13);
+
+    const actors = (shot.actors || []).map((actor) => {
+      const start = blockingWorldPoint(actor.start_3d, actor.start);
+      const end = blockingWorldPoint(actor.end_3d, actor.end);
+      return { actor, start, end, depth: project(end).depth };
+    }).sort((left, right) => left.depth - right.depth);
+    actors.forEach(({ actor, start, end }) => {
+      const color = blockingSafeColor(actor.color);
+      const height = Number(actor.height_m) || 1.68;
+      if (actor.moving) {
+        arrow(start, end, color, 4);
+        line(start, { ...start, y: height }, color, 3, [4, 4]);
+        dot({ ...start, y: height }, 6, "#0b1220", color, 2);
+      }
+      line(end, { ...end, y: height }, color, 7);
+      dot(end, 6, color, "#f8fafc", 1.5);
+      dot({ ...end, y: height }, 8, color, "#f8fafc", 1.5);
+      label(blockingActorLabel(actor), { ...end, y: height }, color, -12);
+    });
+
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.font = "600 12px system-ui, sans-serif";
+    ctx.fillStyle = "#cbd5e1";
+    ctx.fillText(
+      `S${shot.shot_no} · ${shot.character_count == null ? actors.length : shot.character_count}人 · ${camera.movement || "固定"} · XYZ 米制`,
+      14, 12);
+  };
+  const requestRender = () => {
+    if (frame) cancelAnimationFrame(frame);
+    frame = requestAnimationFrame(render);
+  };
+  const resize = () => {
+    const rect = canvas.getBoundingClientRect();
+    logicalWidth = Math.max(320, Math.round(rect.width));
+    logicalHeight = Math.max(300, Math.round(rect.height));
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = Math.round(logicalWidth * dpr);
+    canvas.height = Math.round(logicalHeight * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    requestRender();
+  };
+  const applyView = (view) => {
+    if (view === "top") {
+      state.yaw = 0;
+      state.pitch = 1.5;
+      state.panX = 0;
+      state.panY = 5;
+    } else if (view === "camera") {
+      const shot = shots[state.shotIndex] || shots[0];
+      const camera = shot.camera || {};
+      const from = blockingWorldPoint(camera.end_3d, camera.end, 1.55);
+      const target = blockingWorldPoint(camera.target_3d, camera.target, 1.25);
+      state.yaw = -Math.atan2(target.x - from.x, target.z - from.z);
+      state.pitch = .32;
+      state.panX = 0;
+      state.panY = 12;
+    } else {
+      state.yaw = -.72;
+      state.pitch = .58;
+      state.panX = 0;
+      state.panY = 12;
+      state.zoom = 1;
+    }
+    stage.querySelectorAll("[data-view]").forEach((button) =>
+      button.classList.toggle("active", button.dataset.view === view));
+    requestRender();
+  };
+  stage.querySelectorAll("[data-shot-index]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.shotIndex = Number(button.dataset.shotIndex) || 0;
+      stage.querySelectorAll("[data-shot-index]").forEach((candidate) => {
+        const active = candidate === button;
+        candidate.classList.toggle("active", active);
+        candidate.setAttribute("aria-selected", String(active));
+      });
+      requestRender();
+    });
+  });
+  stage.querySelectorAll("[data-view]").forEach((button) => {
+    button.addEventListener("click", () =>
+      applyView(button.dataset.view === "reset" ? "orbit" : button.dataset.view));
+  });
+  const onPointerDown = (event) => {
+    state.dragging = true;
+    state.panning = event.shiftKey || event.button === 2;
+    state.pointerX = event.clientX;
+    state.pointerY = event.clientY;
+    canvas.setPointerCapture(event.pointerId);
+  };
+  const onPointerMove = (event) => {
+    if (!state.dragging) return;
+    const dx = event.clientX - state.pointerX;
+    const dy = event.clientY - state.pointerY;
+    state.pointerX = event.clientX;
+    state.pointerY = event.clientY;
+    if (state.panning) {
+      state.panX += dx;
+      state.panY += dy;
+    } else {
+      state.yaw += dx * .009;
+      state.pitch = Math.max(.12, Math.min(1.52, state.pitch + dy * .007));
+      stage.querySelectorAll("[data-view]").forEach((button) =>
+        button.classList.toggle("active", button.dataset.view === "orbit"));
+    }
+    requestRender();
+  };
+  const onPointerUp = (event) => {
+    state.dragging = false;
+    if (canvas.hasPointerCapture(event.pointerId))
+      canvas.releasePointerCapture(event.pointerId);
+  };
+  const onWheel = (event) => {
+    event.preventDefault();
+    state.zoom = Math.max(.45, Math.min(2.8, state.zoom * Math.exp(-event.deltaY * .001)));
+    requestRender();
+  };
+  const onKey = (event) => {
+    if (event.key === "ArrowLeft") state.yaw -= .12;
+    else if (event.key === "ArrowRight") state.yaw += .12;
+    else if (event.key === "ArrowUp") state.pitch = Math.max(.12, state.pitch - .1);
+    else if (event.key === "ArrowDown") state.pitch = Math.min(1.52, state.pitch + .1);
+    else if (event.key === "+" || event.key === "=") state.zoom = Math.min(2.8, state.zoom * 1.12);
+    else if (event.key === "-") state.zoom = Math.max(.45, state.zoom / 1.12);
+    else if (event.key === "0") applyView("orbit");
+    else return;
+    event.preventDefault();
+    requestRender();
+  };
+  canvas.addEventListener("pointerdown", onPointerDown);
+  canvas.addEventListener("pointermove", onPointerMove);
+  canvas.addEventListener("pointerup", onPointerUp);
+  canvas.addEventListener("pointercancel", onPointerUp);
+  canvas.addEventListener("wheel", onWheel, { passive: false });
+  canvas.addEventListener("keydown", onKey);
+  canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+  canvas.addEventListener("dblclick", () => applyView("orbit"));
+  window.addEventListener("resize", resize);
+  resize();
+  return () => {
+    if (frame) cancelAnimationFrame(frame);
+    window.removeEventListener("resize", resize);
+  };
+}
+
 function blockingShotHtml(shot) {
   const actors = shot.actors || [];
   const actorRoutes = actors.length ? actors.map((actor) => `
@@ -5061,7 +5428,7 @@ async function showBlockingOverlay(episodeId) {
   const scenes = blocking.scenes || [];
   const overlay = document.createElement("div");
   overlay.className = "script-overlay";
-  const sceneHtml = scenes.map((scene) => {
+  const sceneHtml = scenes.map((scene, sceneIndex) => {
     const svgUrl = scene.svg_url || scene.map_url || scene.svg || "";
     return `
     <section class="blocking-scene">
@@ -5071,10 +5438,12 @@ async function showBlockingOverlay(episodeId) {
         <span class="${scene.required ? "warn" : "pass"}">${scene.required ? "重点调度" : "连续性参考"}</span>
       </div>
       ${blockingLegendHtml(scene, blocking)}
+      ${blocking3dSceneHtml(scene, sceneIndex)}
       ${svgUrl
-        ? `<div class="blocking-map-scroll"><button class="blocking-map-btn" data-map="${esc(svgUrl)}" data-label="第${scene.scene_no}场空间调度图"><img src="${esc(svgUrl)}" loading="lazy" alt="第${scene.scene_no}场空间调度图，点击放大"></button></div>
-          <div class="blocking-map-mobile-hint">↔ 左右滑动查看全图 · 点图放大</div>`
-        : `<div class="blocking-empty">SVG 尚未生成</div>`}
+        ? `<details class="blocking-fixed-reference"><summary>查看给关键帧 / Seedance 使用的固定 3D 参考图</summary>
+          <div class="blocking-map-scroll"><button class="blocking-map-btn" data-map="${esc(svgUrl)}" data-label="第${scene.scene_no}场固定3D空间参考图"><img src="${esc(svgUrl)}" loading="lazy" alt="第${scene.scene_no}场固定3D空间参考图，点击放大"></button></div>
+          <div class="blocking-map-mobile-hint">↔ 左右滑动查看全图 · 点图放大</div></details>`
+        : `<div class="blocking-empty">固定 3D 参考图尚未生成</div>`}
       <div class="blocking-shot-list">${(scene.shots || []).map(blockingShotHtml).join("")}</div>
     </section>`;
   }).join("");
@@ -5090,10 +5459,15 @@ async function showBlockingOverlay(episodeId) {
         <b>${blocking.summary?.required_scenes || 0}</b> 个重点调度场景
         <span class="${blocking.validation?.passed ? "pass" : "warn"}">${blocking.validation?.passed ? "空间门禁 PASS" : "空间门禁待生成"}</span>
       </div>
-      <p class="dim">人物编号在每场保持一致；人物与镜头的起点、终点分开标记。坐标只约束构图，不会画进最终画面。</p>
+      <p class="dim">交互 3D 与模型参考图共用同一套米制坐标；人物站位、路线、机位高度、瞄准点和视锥只约束构图，不会画进最终画面。</p>
       ${sceneHtml || `<div class="blocking-empty">本集还没有空间调度图；确认剧本并完成五维分镜后会自动生成。</div>`}
     </div>`;
-  const close = () => { overlay.remove(); document.removeEventListener("keydown", onKey); };
+  const cleanups = [];
+  const close = () => {
+    cleanups.forEach((cleanup) => cleanup());
+    overlay.remove();
+    document.removeEventListener("keydown", onKey);
+  };
   const onKey = (ev) => { if (ev.key === "Escape") close(); };
   overlay.addEventListener("click", (ev) => { if (ev.target === overlay) close(); });
   overlay.querySelector(".close").onclick = close;
@@ -5103,6 +5477,10 @@ async function showBlockingOverlay(episodeId) {
   });
   document.addEventListener("keydown", onKey);
   document.body.appendChild(overlay);
+  overlay.querySelectorAll("[data-blocking-scene]").forEach((stage) => {
+    const scene = scenes[Number(stage.dataset.blockingScene)];
+    if (scene) cleanups.push(mountBlocking3d(stage, scene));
+  });
 }
 
 /* ================= 资产中心 =================

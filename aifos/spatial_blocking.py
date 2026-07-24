@@ -1,7 +1,8 @@
-"""确定性空间调度图（blocking map）。
+"""确定性 3D 空间调度（blocking）。
 
-把五维分镜中的人物站位与摄影机设计转换成可校验的俯视坐标和 SVG。
-该产物只服务预生产规划，不调用图片模型，也不会作为最终关键帧交付。
+把五维分镜中的人物站位与摄影机设计转换成可校验的三维世界坐标、交互
+查看数据和固定透视参考图。参考图只服务预生产与模型约束，不会作为最终
+关键帧交付；旧版二维坐标继续保留，供历史调用方平滑升级。
 """
 
 from __future__ import annotations
@@ -16,8 +17,11 @@ import subprocess
 from pathlib import Path
 
 
-SCHEMA = "aifos.spatial-blocking/v2"
+SCHEMA = "aifos.spatial-blocking/v3"
 WIDTH, HEIGHT = 1000, 700
+WORLD_WIDTH_M, WORLD_DEPTH_M = 10.0, 7.0
+DEFAULT_ACTOR_HEIGHT_M = 1.68
+DEFAULT_CAMERA_HEIGHT_M = 1.55
 MIN_ACTOR_SEPARATION = 72
 MIN_CAMERA_SEPARATION = 90
 ACTOR_COLORS = (
@@ -83,6 +87,28 @@ def _position_x(value, fallback):
 def _point(x, y):
     return {"x": int(max(90, min(WIDTH - 90, x))),
             "y": int(max(115, min(HEIGHT - 115, y)))}
+
+
+def _world_point(point, height=0.0):
+    """把兼容二维画布坐标转换为右手系 Y-up 米制世界坐标。"""
+    return {
+        "x": round(
+            (float(point.get("x", WIDTH / 2)) - WIDTH / 2)
+            / (WIDTH - 180) * WORLD_WIDTH_M, 2),
+        "y": round(float(height), 2),
+        "z": round(
+            (float(point.get("y", HEIGHT / 2)) - HEIGHT / 2)
+            / (HEIGHT - 230) * WORLD_DEPTH_M, 2),
+    }
+
+
+def _point_3d_valid(point):
+    return (
+        isinstance(point, dict)
+        and all(isinstance(point.get(axis), (int, float))
+                and math.isfinite(float(point[axis]))
+                for axis in ("x", "y", "z"))
+    )
 
 
 def _distance(a, b):
@@ -183,6 +209,67 @@ def _lens_and_fov(shot):
     # 以全画幅水平视角做规划近似；只用于构图示意。
     fov = math.degrees(2 * math.atan(36 / (2 * lens)))
     return int(round(lens)), round(fov, 1)
+
+
+def _camera_height(position, movement, phase="start"):
+    text = f"{position} {movement}"
+    if any(word in text for word in ("顶视", "顶拍", "航拍", "鸟瞰")):
+        height = 4.8
+    elif any(word in text for word in ("俯拍", "高机位", "高角度")):
+        height = 2.8
+    elif any(word in text for word in ("低机位", "低角度", "仰拍")):
+        height = .7
+    else:
+        height = DEFAULT_CAMERA_HEIGHT_M
+    if phase == "end" and "升" in movement:
+        height += 1.2
+    elif phase == "end" and "降" in movement:
+        height = max(.35, height - .9)
+    return round(height, 2)
+
+
+def _camera_orientation(camera_point, target_point):
+    dx = target_point["x"] - camera_point["x"]
+    dy = target_point["y"] - camera_point["y"]
+    dz = target_point["z"] - camera_point["z"]
+    horizontal = max(.001, math.hypot(dx, dz))
+    return {
+        "heading_degrees": round(math.degrees(math.atan2(dx, dz)), 1),
+        "pitch_degrees": round(math.degrees(math.atan2(dy, horizontal)), 1),
+        "roll_degrees": 0.0,
+    }
+
+
+def _attach_camera_3d(camera, start_target, end_target):
+    position = str(camera.get("position") or "")
+    movement = str(camera.get("movement") or "")
+    start = _world_point(
+        camera["start"], _camera_height(position, movement, "start"))
+    end = _world_point(
+        camera["end"], _camera_height(position, movement, "end"))
+    target_start = _world_point(start_target, 1.25)
+    target_end = _world_point(end_target, 1.25)
+    horizontal_fov = float(camera.get("fov_degrees") or 39.6)
+    vertical_fov = math.degrees(
+        2 * math.atan(math.tan(math.radians(horizontal_fov) / 2) * 16 / 9))
+    camera.update({
+        "start_3d": start,
+        "end_3d": end,
+        "target_start_3d": target_start,
+        "target_end_3d": target_end,
+        "target_3d": target_end,
+        "route_3d": (
+            [dict(start, phase="start"), dict(end, phase="end")]
+            if camera.get("moving") or start != end
+            else [dict(start, phase="fixed")]
+        ),
+        "orientation_start": _camera_orientation(start, target_start),
+        "orientation_end": _camera_orientation(end, target_end),
+        "horizontal_fov_degrees": round(horizontal_fov, 1),
+        "vertical_fov_degrees": round(vertical_fov, 1),
+        "frustum": {"near_m": .1, "far_m": 18.0, "aspect_ratio": "9:16"},
+    })
+    return camera
 
 
 def _camera_block(shot, target):
@@ -373,6 +460,8 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
                 previous_end[name] = end
                 character = character_by_name[name]
                 route_direction = _direction(start, end)
+                start_3d = _world_point(start)
+                end_3d = _world_point(end)
                 positions.append({
                     "actor_id": character["actor_id"], "name": name,
                     "role": character["role"],
@@ -383,6 +472,14 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
                               dict(end, phase="end")]
                              if start != end
                              else [dict(start, phase="fixed")],
+                    "start_3d": start_3d, "end_3d": end_3d,
+                    "route_3d": (
+                        [dict(start_3d, phase="start"),
+                         dict(end_3d, phase="end")]
+                        if start != end
+                        else [dict(start_3d, phase="fixed")]
+                    ),
+                    "height_m": DEFAULT_ACTOR_HEIGHT_M,
                     "moving": start != end,
                     "route_direction": route_direction,
                     "route_label": (f"起点→终点，{route_direction}"
@@ -393,24 +490,41 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
             target = _point(
                 sum(p["end"]["x"] for p in positions) / max(1, len(positions)),
                 sum(p["end"]["y"] for p in positions) / max(1, len(positions)))
+            start_target = _point(
+                sum(p["start"]["x"] for p in positions)
+                / max(1, len(positions)),
+                sum(p["start"]["y"] for p in positions)
+                / max(1, len(positions)))
             actor_markers = [point for position in positions
                              for point in (position["start"], position["end"])]
-            camera = _clear_camera_icons(
-                _camera_block(shot, target), actor_markers)
+            camera = _attach_camera_3d(
+                _clear_camera_icons(
+                    _camera_block(shot, target), actor_markers),
+                start_target, target)
             compact = ";".join(
-                f"{p['display_label']}({p['start']['x']},{p['start']['y']})"
-                f"→({p['end']['x']},{p['end']['y']})/{p['route_direction']}"
+                f"{p['display_label']}"
+                f"({p['start_3d']['x']},{p['start_3d']['y']},"
+                f"{p['start_3d']['z']})m"
+                f"→({p['end_3d']['x']},{p['end_3d']['y']},"
+                f"{p['end_3d']['z']})m/{p['route_direction']}"
                 for p in positions)
             constraint = (
                 f"空间调度锁：本镜严格 {len(people)} 人；{compact}；"
-                f"机位({camera['start']['x']},{camera['start']['y']})"
-                f"→({camera['end']['x']},{camera['end']['y']})，"
-                f"{camera['lens_mm']}mm/{camera['movement']}，保持屏幕轴线。"
+                f"机位({camera['start_3d']['x']},{camera['start_3d']['y']},"
+                f"{camera['start_3d']['z']})m"
+                f"→({camera['end_3d']['x']},{camera['end_3d']['y']},"
+                f"{camera['end_3d']['z']})m，"
+                f"瞄准({camera['target_3d']['x']},"
+                f"{camera['target_3d']['y']},"
+                f"{camera['target_3d']['z']})m，"
+                f"{camera['lens_mm']}mm/{camera['movement']}，"
+                f"水平视角{camera['horizontal_fov_degrees']}°，保持屏幕轴线。"
                 "编号、坐标和路线仅供生产约束引用，最终画面不得出现人物编号、"
                 "姓名标签、坐标、箭头或调度图符号。"
             )
             block = {
                 "shot_no": int(shot.get("shot_no", 0)),
+                "scene_no": scene_no,
                 "unit_id": shot.get("unit_id"),
                 "character_count": len(people),
                 "character_number_map": {
@@ -423,6 +537,8 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
                 "camera": camera,
                 "axis": {"a": _point(120, target["y"]),
                          "b": _point(880, target["y"]),
+                         "a_3d": _world_point(_point(120, target["y"])),
+                         "b_3d": _world_point(_point(880, target["y"])),
                          "rule": "机位保持在同一轴线侧，越轴须另建镜头"},
                 "constraint": constraint,
             }
@@ -434,7 +550,17 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
             "required": required,
             "reasons": reasons,
             "canvas": {"width": WIDTH, "height": HEIGHT,
-                       "orientation": "俯视"},
+                       "orientation": "交互3D",
+                       "projection": "orbit"},
+            "world": {
+                "coordinate_system": "right-handed-y-up",
+                "unit": "meter",
+                "floor_width_m": WORLD_WIDTH_M,
+                "floor_depth_m": WORLD_DEPTH_M,
+                "floor_y_m": 0.0,
+                "default_actor_height_m": DEFAULT_ACTOR_HEIGHT_M,
+                "default_camera_height_m": DEFAULT_CAMERA_HEIGHT_M,
+            },
             "actors": [dict(character_by_name[name])
                        for name in cast_names
                        if any(name in s.get("characters", []) for s in shots)],
@@ -469,6 +595,14 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
 
 def validate_spatial_plan(plan, storyboard):
     issues = []
+    if plan.get("schema") != SCHEMA:
+        issues.append(f"空间调度版本不是 {SCHEMA}")
+    for scene in plan.get("scenes", []):
+        world = scene.get("world") or {}
+        if (world.get("coordinate_system") != "right-handed-y-up"
+                or world.get("unit") != "meter"):
+            issues.append(
+                f"第 {scene.get('scene_no')} 场缺少米制 Y-up 三维世界")
     index = plan.get("shot_index") or {
         str(shot.get("shot_no")): shot
         for scene in plan.get("scenes", []) for shot in scene.get("shots", [])
@@ -496,6 +630,17 @@ def validate_spatial_plan(plan, storyboard):
                 issues.append(
                     f"镜头 {shot_no} 的 {left.get('name')} 缺少稳定人物编号映射")
             route = left.get("route") or []
+            route_3d = left.get("route_3d") or []
+            if (not _point_3d_valid(left.get("start_3d"))
+                    or not _point_3d_valid(left.get("end_3d"))
+                    or not route_3d
+                    or not all(_point_3d_valid(point)
+                               for point in route_3d)
+                    or float(left.get("height_m") or 0) <= 0):
+                issues.append(
+                    f"镜头 {shot_no} 的 "
+                    f"{left.get('display_label') or left.get('name')}"
+                    " 缺少合法三维站位/路线")
             if left.get("moving") and (
                     len(route) < 2 or route[0].get("phase") != "start"
                     or route[-1].get("phase") != "end"
@@ -534,6 +679,18 @@ def validate_spatial_plan(plan, storyboard):
                 or not camera.get("target") or not camera.get("route")
                 or not camera.get("direction_label")):
             issues.append(f"镜头 {shot_no} 缺少机位或视线目标")
+        elif (
+                not _point_3d_valid(camera.get("start_3d"))
+                or not _point_3d_valid(camera.get("end_3d"))
+                or not _point_3d_valid(camera.get("target_3d"))
+                or not camera.get("route_3d")
+                or not all(_point_3d_valid(point)
+                           for point in camera.get("route_3d", []))
+                or not camera.get("orientation_start")
+                or not camera.get("orientation_end")
+                or float(camera.get("horizontal_fov_degrees") or 0) <= 0
+                or float(camera.get("vertical_fov_degrees") or 0) <= 0):
+            issues.append(f"镜头 {shot_no} 缺少合法三维机位/视锥")
         elif camera.get("moving") and len(camera.get("route", [])) < 2:
             issues.append(f"镜头 {shot_no} 缺少摄影机移动起终点")
         elif (not camera.get("moving")
@@ -624,28 +781,86 @@ def _line(x1, y1, x2, y2, **attrs):
     return f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" {extra}/>'
 
 
-def _panel_point(point, plot_x, plot_y, plot_width, plot_height):
-    x = plot_x + (point.get("x", 500) - 90) / (WIDTH - 180) * plot_width
-    y = plot_y + (point.get("y", 350) - 115) / (HEIGHT - 230) * plot_height
-    return round(x, 1), round(y, 1)
+def _project_3d(point, plot_x, plot_y, plot_width, plot_height):
+    """固定等距投影；交互查看器会使用同一坐标但允许用户旋转。"""
+    x = float(point.get("x", 0))
+    y = float(point.get("y", 0))
+    z = float(point.get("z", 0))
+    scale = min(plot_width / 13.0, plot_height / 8.5)
+    screen_x = plot_x + plot_width / 2 + (x - z) * .68 * scale
+    screen_y = (
+        plot_y + plot_height * .64
+        + (x + z) * .29 * scale
+        - y * .95 * scale
+    )
+    return round(screen_x, 1), round(screen_y, 1)
+
+
+def _svg_points(points):
+    return " ".join(f"{x},{y}" for x, y in points)
+
+
+def _render_floor_grid(parts, plot_x, plot_y, plot_width, plot_height):
+    floor = [
+        _project_3d({"x": x, "y": 0, "z": z},
+                    plot_x, plot_y, plot_width, plot_height)
+        for x, z in (
+            (-WORLD_WIDTH_M / 2, -WORLD_DEPTH_M / 2),
+            (WORLD_WIDTH_M / 2, -WORLD_DEPTH_M / 2),
+            (WORLD_WIDTH_M / 2, WORLD_DEPTH_M / 2),
+            (-WORLD_WIDTH_M / 2, WORLD_DEPTH_M / 2),
+        )
+    ]
+    parts.append(
+        f'<polygon points="{_svg_points(floor)}" fill="#0d1728" '
+        'stroke="#475569" stroke-width="1.5" data-world-floor="true"/>')
+    for x in range(-5, 6):
+        a = _project_3d({"x": x, "y": 0, "z": -3.5},
+                        plot_x, plot_y, plot_width, plot_height)
+        b = _project_3d({"x": x, "y": 0, "z": 3.5},
+                        plot_x, plot_y, plot_width, plot_height)
+        parts.append(_line(*a, *b, stroke="#25354d", stroke_width=".7"))
+    for index in range(-7, 8):
+        z = index / 2
+        a = _project_3d({"x": -5, "y": 0, "z": z},
+                        plot_x, plot_y, plot_width, plot_height)
+        b = _project_3d({"x": 5, "y": 0, "z": z},
+                        plot_x, plot_y, plot_width, plot_height)
+        parts.append(_line(*a, *b, stroke="#25354d", stroke_width=".7"))
+    origin = _project_3d({"x": 0, "y": 0, "z": 0},
+                         plot_x, plot_y, plot_width, plot_height)
+    axes = (
+        ("X", {"x": 1.4, "y": 0, "z": 0}, "#f87171"),
+        ("Y", {"x": 0, "y": 1.4, "z": 0}, "#4ade80"),
+        ("Z", {"x": 0, "y": 0, "z": 1.4}, "#60a5fa"),
+    )
+    for label, point, color in axes:
+        end = _project_3d(
+            point, plot_x, plot_y, plot_width, plot_height)
+        parts.extend([
+            _line(*origin, *end, stroke=color, stroke_width="2"),
+            f'<text x="{end[0] + 3}" y="{end[1] - 2}" fill="{color}" '
+            f'font-size="8" font-family="sans-serif">{label}</text>',
+        ])
 
 
 def render_scene_svg(scene):
-    """渲染单场俯视空间图；逐镜分面，避免跨镜标记互相覆盖。"""
+    """渲染逐镜固定 3D 透视图，供人审与图片/视频模型共同参考。"""
     title = html.escape(str(scene.get("location") or "空间调度图"))
     scene_actors = scene.get("actors", [])
     shots = scene.get("shots", [])
-    columns = 2
-    panel_width, panel_height, panel_gap = 580, 420, 20
-    canvas_width = 1220
+    columns = 2 if len(shots) > 1 else 1
+    panel_width, panel_height, panel_gap = 580, 440, 20
+    canvas_width = 1220 if columns == 2 else 620
     legend_rows = max(1, math.ceil(len(scene_actors) / 2))
-    header_height = 100 + legend_rows * 26
+    header_height = 104 + legend_rows * 26
     shot_rows = max(1, math.ceil(len(shots) / columns))
     canvas_height = header_height + shot_rows * (panel_height + panel_gap) + 20
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" '
         f'viewBox="0 0 {canvas_width} {canvas_height}" '
-        f'data-layout="per-shot-panels" data-overlap-policy="separate-label-lanes">',
+        f'data-layout="per-shot-panels" data-projection="isometric-3d" '
+        f'data-overlap-policy="separate-label-lanes">',
         "<defs><marker id=\"arrow\" markerWidth=\"10\" markerHeight=\"10\" "
         "refX=\"8\" refY=\"3\" orient=\"auto\"><path d=\"M0,0 L0,6 L9,3 z\" "
         "fill=\"#f8fafc\"/></marker>"
@@ -657,11 +872,11 @@ def render_scene_svg(scene):
         f'<text x="55" y="48" fill="#f8fafc" font-size="26" '
         f'font-family="sans-serif" font-weight="700">第{scene.get("scene_no")}场 · {title}</text>',
         '<text x="55" y="76" fill="#94a3b8" font-size="15" '
-        'font-family="sans-serif">每镜独立俯视图 · 空心=起点 · 实心=终点 · 箭头=方向 · 三角形=摄影机</text>',
+        'font-family="sans-serif">逐镜 3D 透视 · 人物高度/路线/机位高度/瞄准线/视锥 · 单位：米</text>',
     ]
     for index, actor in enumerate(scene_actors):
         col, row = index % 2, index // 2
-        x, y = 55 + col * 575, 108 + row * 26
+        x, y = 55 + col * 575, 110 + row * 26
         label = html.escape(str(actor.get("display_label") or
                                 f"{actor.get('actor_id')} {actor.get('name')}"))
         parts.extend([
@@ -676,11 +891,12 @@ def render_scene_svg(scene):
         panel_x = 20 + panel_col * (panel_width + panel_gap)
         panel_y = header_height + panel_row * (panel_height + panel_gap)
         plot_x, plot_y = panel_x + 18, panel_y + 52
-        plot_width, plot_height = 350, 262
+        plot_width, plot_height = 350, 282
         roster_x = panel_x + 386
-        camera_y = panel_y + 332
+        camera_y = panel_y + 350
         parts.extend([
-            f'<g data-shot="{html.escape(str(no))}" data-layout="isolated-panel">',
+            f'<g data-shot="{html.escape(str(no))}" '
+            'data-layout="isolated-panel" data-world-axis="y-up">',
             f'<rect x="{panel_x}" y="{panel_y}" width="{panel_width}" '
             f'height="{panel_height}" rx="18" fill="#172033" '
             'stroke="#44506a" stroke-width="2"/>',
@@ -691,95 +907,126 @@ def render_scene_svg(scene):
             f'height="{plot_height}" rx="12" fill="#111827" '
             'stroke="#334155"/>',
             f'<text x="{roster_x}" y="{plot_y + 15}" fill="#94a3b8" '
-            'font-size="12" font-family="sans-serif">镜头前人物（稳定编号）</text>',
+            'font-size="12" font-family="sans-serif">人物 3D 站位（稳定编号）</text>',
         ])
+        _render_floor_grid(parts, plot_x, plot_y, plot_width, plot_height)
         axis = shot.get("axis") or {}
-        a, b = axis.get("a") or {}, axis.get("b") or {}
-        ax, ay = _panel_point(a, plot_x, plot_y, plot_width, plot_height)
-        bx, by = _panel_point(b, plot_x, plot_y, plot_width, plot_height)
-        parts.append(_line(ax, ay, bx, by, stroke="#64748b",
+        a = axis.get("a_3d") or _world_point(axis.get("a") or {})
+        b = axis.get("b_3d") or _world_point(axis.get("b") or {})
+        ax, ay = _project_3d(a, plot_x, plot_y, plot_width, plot_height)
+        bx, by = _project_3d(b, plot_x, plot_y, plot_width, plot_height)
+        parts.append(_line(ax, ay, bx, by, stroke="#94a3b8",
                            stroke_width="1.5", stroke_dasharray="8 7"))
         for actor_index, actor in enumerate(shot.get("actors", [])):
-            start, end = actor["start"], actor["end"]
+            start = actor.get("start_3d") or _world_point(actor["start"])
+            end = actor.get("end_3d") or _world_point(actor["end"])
+            height = float(actor.get("height_m") or DEFAULT_ACTOR_HEIGHT_M)
             color = actor.get("color", "#fff")
-            sx, sy = _panel_point(start, plot_x, plot_y,
-                                  plot_width, plot_height)
-            ex, ey = _panel_point(end, plot_x, plot_y,
-                                  plot_width, plot_height)
+            sx, sy = _project_3d(
+                start, plot_x, plot_y, plot_width, plot_height)
+            ex, ey = _project_3d(
+                end, plot_x, plot_y, plot_width, plot_height)
+            start_head = dict(start, y=height)
+            end_head = dict(end, y=height)
+            shx, shy = _project_3d(
+                start_head, plot_x, plot_y, plot_width, plot_height)
+            ehx, ehy = _project_3d(
+                end_head, plot_x, plot_y, plot_width, plot_height)
             if actor.get("moving"):
-                parts.append(_line(sx, sy, ex, ey,
-                                   stroke=color, stroke_width="5",
-                                   marker_end="url(#arrow)", opacity="0.86"))
                 parts.extend([
-                    f'<circle cx="{sx}" cy="{sy}" r="14" fill="#111827" '
-                    f'stroke="{color}" stroke-width="4" data-phase="start"/>',
-                    f'<circle cx="{ex}" cy="{ey}" r="15" fill="{color}" '
-                    'data-phase="end"/>',
-                    f'<text x="{sx}" y="{sy + 4}" text-anchor="middle" '
-                    f'fill="#f8fafc" font-size="8" font-family="sans-serif">起</text>',
-                    f'<text x="{ex}" y="{ey + 4}" text-anchor="middle" '
-                    f'fill="#111827" font-size="8" font-family="sans-serif">终</text>',
+                    _line(sx, sy, ex, ey, stroke=color, stroke_width="4",
+                          marker_end="url(#arrow)", opacity=".9"),
+                    _line(sx, sy, shx, shy, stroke=color, stroke_width="4",
+                          stroke_dasharray="4 4", opacity=".55"),
+                    f'<circle cx="{shx}" cy="{shy}" r="6" fill="#111827" '
+                    f'stroke="{color}" stroke-width="2" data-phase="start"/>',
+                    _line(ex, ey, ehx, ehy, stroke=color, stroke_width="6"),
+                    f'<circle cx="{ehx}" cy="{ehy}" r="7" fill="{color}" '
+                    'stroke="#f8fafc" stroke-width="1.5" data-phase="end"/>',
                 ])
             else:
-                parts.append(
-                    f'<circle cx="{sx}" cy="{sy}" r="15" fill="{color}" '
-                    f'stroke="#f8fafc" stroke-width="2" data-phase="fixed"/>')
+                parts.extend([
+                    _line(ex, ey, ehx, ehy, stroke=color, stroke_width="6"),
+                    f'<circle cx="{ehx}" cy="{ehy}" r="7" fill="{color}" '
+                    'stroke="#f8fafc" stroke-width="1.5" '
+                    'data-phase="fixed"/>',
+                ])
             actor_label = html.escape(str(actor.get("display_label") or
                                           f"{actor.get('actor_id')} {actor.get('name')}"))
             route_label = html.escape(str(actor.get("route_label") or "原地静止"))
-            roster_y = plot_y + 42 + actor_index * 28
+            roster_y = plot_y + 42 + actor_index * 30
             parts.extend([
                 f'<circle cx="{roster_x + 7}" cy="{roster_y - 5}" r="6" '
                 f'fill="{color}"/>',
                 f'<text x="{roster_x + 18}" y="{roster_y}" fill="#f8fafc" '
                 f'font-size="12" font-family="sans-serif">{actor_label}</text>',
                 f'<text x="{roster_x + 18}" y="{roster_y + 14}" fill="#94a3b8" '
-                f'font-size="9" font-family="sans-serif">{route_label}</text>',
+                f'font-size="9" font-family="sans-serif">{route_label} · '
+                f'({end.get("x")},{end.get("z")})m</text>',
             ])
         camera = shot.get("camera") or {}
-        cs, ce, target = camera.get("start") or {}, camera.get("end") or {}, camera.get("target") or {}
+        cs = camera.get("start_3d") or _world_point(
+            camera.get("start") or {}, DEFAULT_CAMERA_HEIGHT_M)
+        ce = camera.get("end_3d") or _world_point(
+            camera.get("end") or {}, DEFAULT_CAMERA_HEIGHT_M)
+        target = camera.get("target_3d") or _world_point(
+            camera.get("target") or {}, 1.25)
         if cs and target:
-            csx, csy = _panel_point(cs, plot_x, plot_y,
-                                    plot_width, plot_height)
-            cex, cey = _panel_point(ce, plot_x, plot_y,
-                                    plot_width, plot_height)
-            tx, ty = _panel_point(target, plot_x, plot_y,
-                                  plot_width, plot_height)
-            parts.append(
-                f'<path d="M {cex} {cey} L {tx - 28} {ty + 15} '
-                f'L {tx + 28} {ty + 15} Z" fill="#38bdf8" opacity="0.08" '
-                f'stroke="#38bdf8" stroke-width="1"/>')
+            csx, csy = _project_3d(
+                cs, plot_x, plot_y, plot_width, plot_height)
+            cex, cey = _project_3d(
+                ce, plot_x, plot_y, plot_width, plot_height)
+            tx, ty = _project_3d(
+                target, plot_x, plot_y, plot_width, plot_height)
+            target_left = _project_3d(
+                dict(target, x=target["x"] - 1.0, y=0),
+                plot_x, plot_y, plot_width, plot_height)
+            target_right = _project_3d(
+                dict(target, x=target["x"] + 1.0, y=2.4),
+                plot_x, plot_y, plot_width, plot_height)
+            parts.extend([
+                f'<polygon points="{_svg_points([(cex, cey), target_left, target_right])}" '
+                'fill="#38bdf8" opacity=".11" stroke="#38bdf8" '
+                'stroke-width="1" data-camera-frustum="true"/>',
+                _line(cex, cey, tx, ty, stroke="#7dd3fc",
+                      stroke_width="1.5", stroke_dasharray="5 4"),
+            ])
             if camera.get("moving"):
                 parts.extend([
                     _line(csx, csy, cex, cey, stroke="#38bdf8",
                           stroke_width="4", marker_end="url(#camera-arrow)"),
-                    f'<path d="M {csx} {csy - 13} L {csx - 13} {csy + 11} '
-                    f'L {csx + 13} {csy + 11} Z" fill="#111827" '
-                    'stroke="#38bdf8" stroke-width="3" data-camera-phase="start"/>',
-                    f'<path d="M {cex} {cey - 13} L {cex - 13} {cey + 11} '
-                    f'L {cex + 13} {cey + 11} Z" fill="#38bdf8" '
+                    f'<circle cx="{csx}" cy="{csy}" r="8" fill="#111827" '
+                    'stroke="#38bdf8" stroke-width="3" '
+                    'data-camera-phase="start"/>',
+                    f'<path d="M {cex} {cey - 12} L {cex - 12} {cey + 10} '
+                    f'L {cex + 12} {cey + 10} Z" fill="#38bdf8" '
                     'data-camera-phase="end"/>',
                 ])
             else:
                 parts.append(
-                    f'<path d="M {csx} {csy - 14} L {csx - 14} {csy + 12} '
-                    f'L {csx + 14} {csy + 12} Z" fill="#38bdf8" '
-                    'stroke="#e0f2fe" stroke-width="2" data-camera-phase="fixed"/>')
+                    f'<path d="M {csx} {csy - 13} L {csx - 13} {csy + 11} '
+                    f'L {csx + 13} {csy + 11} Z" fill="#38bdf8" '
+                    'stroke="#e0f2fe" stroke-width="2" '
+                    'data-camera-phase="fixed"/>')
         camera_label = html.escape(str(camera.get("direction_label") or
                                        "静止机位：起点=终点"))
+        orientation = camera.get("orientation_end") or {}
         parts.extend([
             f'<rect x="{panel_x + 18}" y="{camera_y}" width="{panel_width - 36}" '
-            'height="68" rx="10" fill="#0f2940"/>',
+            'height="72" rx="10" fill="#0f2940"/>',
             f'<text x="{panel_x + 32}" y="{camera_y + 22}" fill="#bae6fd" '
             f'font-size="13" font-family="sans-serif" font-weight="700">C{no} '
             f'{camera.get("lens_mm")}mm · '
-            f'{html.escape(str(camera.get("movement") or "固定"))}</text>',
+            f'{html.escape(str(camera.get("movement") or "固定"))} · '
+            f'FOV {camera.get("horizontal_fov_degrees", camera.get("fov_degrees"))}°</text>',
             f'<text x="{panel_x + 32}" y="{camera_y + 43}" fill="#e0f2fe" '
             f'font-size="11" font-family="sans-serif">{camera_label}</text>',
-            f'<text x="{panel_x + 32}" y="{camera_y + 59}" fill="#7dd3fc" '
-            f'font-size="9" font-family="sans-serif">起点({cs.get("x")},{cs.get("y")}) '
-            f'→ 终点({ce.get("x")},{ce.get("y")}) · 视线目标('
-            f'{target.get("x")},{target.get("y")})</text>',
+            f'<text x="{panel_x + 32}" y="{camera_y + 61}" fill="#7dd3fc" '
+            f'font-size="9" font-family="sans-serif">'
+            f'机位({ce.get("x")},{ce.get("y")},{ce.get("z")})m · '
+            f'目标({target.get("x")},{target.get("y")},{target.get("z")})m · '
+            f'朝向{orientation.get("heading_degrees", "-")}° / '
+            f'俯仰{orientation.get("pitch_degrees", "-")}°</text>',
             '</g>',
         ])
     parts.append("</svg>")
@@ -869,6 +1116,17 @@ def write_spatial_reference_pngs(plan, out_dir):
             png_path = out_dir / f"shot_{no:03d}_space.png"
             isolated = dict(scene)
             isolated["shots"] = [shot]
+            # 逐镜参考图只列出本镜人物，不能把同场其他角色的编号带给
+            # 图片/视频模型，避免把场景总演员表误读成当前镜头人数。
+            isolated["actors"] = [
+                {
+                    key: actor.get(key)
+                    for key in (
+                        "actor_id", "name", "role", "display_label",
+                        "is_protagonist", "color")
+                }
+                for actor in shot.get("actors", [])
+            ]
             svg_path.write_text(
                 render_scene_svg(isolated), encoding="utf-8")
             error = _render_svg_png(svg_path, png_path)

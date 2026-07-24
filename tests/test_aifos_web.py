@@ -63,8 +63,8 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260724-production-guidance-3" in html
-    assert "/static/app.js?v=20260724-production-guidance-3" in html
+    assert "/static/style.css?v=20260725-spatial-3d-1" in html
+    assert "/static/app.js?v=20260725-spatial-3d-1" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -72,6 +72,11 @@ def test_index_and_static(server):
     assert "人物编号图例".encode() in app_js
     assert "人物路线".encode() in app_js
     assert "镜头路线".encode() in app_js
+    assert b"mountBlocking3d" in app_js
+    assert b"blocking-3d-canvas" in app_js
+    assert "机位方向".encode() in app_js
+    assert "拖拽旋转".encode() in app_js
+    assert "固定 3D 参考图".encode() in app_js
     assert "Codex 订阅".encode() in app_js
     assert "Seedream 5.0 Lite".encode() in app_js
     assert "¥0.22/张".encode() in app_js
@@ -210,6 +215,9 @@ def test_index_and_static(server):
     assert b".codex-progress" in style_css
     assert b".blocking-actor-legend" in style_css
     assert b".blocking-map-scroll" in style_css
+    assert b".blocking-3d-stage" in style_css
+    assert b".blocking-3d-canvas" in style_css
+    assert b".blocking-3d-toolbar" in style_css
     assert b".video-ref-picker-grid" in style_css
     assert b".video-ref-table" in style_css
     assert b".video-ref-card" in style_css

@@ -47,12 +47,22 @@ def test_group_scene_builds_routes_camera_and_continuity(tmp_path):
     ]}
     plan = build_spatial_plan(script, storyboard, continuity)
 
-    assert plan["schema"] == "aifos.spatial-blocking/v2"
+    assert plan["schema"] == "aifos.spatial-blocking/v3"
     assert plan["summary"] == {
         "scenes": 1, "required_scenes": 1, "shots": 2, "actors": 3}
     assert plan["validation"]["passed"]
     scene = plan["scenes"][0]
     assert scene["required"] and "多人场景" in scene["reasons"][0]
+    assert scene["canvas"]["orientation"] == "交互3D"
+    assert scene["world"] == {
+        "coordinate_system": "right-handed-y-up",
+        "unit": "meter",
+        "floor_width_m": 10.0,
+        "floor_depth_m": 7.0,
+        "floor_y_m": 0.0,
+        "default_actor_height_m": 1.68,
+        "default_camera_height_m": 1.55,
+    }
     assert [actor["actor_id"] for actor in scene["actors"]] == [
         "P01", "P02", "P03"]
     assert plan["character_number_map"]["P01"]["display_label"] == \
@@ -63,12 +73,26 @@ def test_group_scene_builds_routes_camera_and_continuity(tmp_path):
     assert first["camera"]["lens_mm"] == 35
     assert first["camera"]["movement"] == "跟"
     assert first["camera"]["moving"]
+    assert first["camera"]["start_3d"]["y"] == 1.55
+    assert first["camera"]["target_3d"]["y"] == 1.25
+    assert first["camera"]["horizontal_fov_degrees"] > 0
+    assert first["camera"]["vertical_fov_degrees"] > \
+        first["camera"]["horizontal_fov_degrees"]
+    assert first["camera"]["orientation_start"]["roll_degrees"] == 0
+    assert first["camera"]["frustum"]["aspect_ratio"] == "9:16"
     assert [point["phase"] for point in first["camera"]["route"]] == [
         "start", "end"]
     assert "起点→终点" in first["camera"]["direction_label"]
     assert len(first["actors"]) == first["character_count"] == 3
     assert all(actor["display_label"].startswith(actor["actor_id"])
                for actor in first["actors"])
+    assert all(actor["height_m"] == 1.68
+               and set(actor["start_3d"]) == {"x", "y", "z"}
+               and set(actor["end_3d"]) == {"x", "y", "z"}
+               and actor["start_3d"]["y"] == actor["end_3d"]["y"] == 0
+               for actor in first["actors"])
+    assert all([point["phase"] for point in actor["route_3d"]] == [
+        "start", "end"] for actor in first["actors"])
     assert all([point["phase"] for point in actor["route"]] == [
         "start", "end"] for actor in first["actors"])
     assert second["actors"][0]["start"] == first["actors"][0]["end"]
@@ -84,6 +108,9 @@ def test_group_scene_builds_routes_camera_and_continuity(tmp_path):
     svg = Path(paths[0]).read_text(encoding="utf-8")
     assert "35mm" in svg and "P01 主角·林昭" in svg
     assert 'data-layout="per-shot-panels"' in svg
+    assert 'data-projection="isometric-3d"' in svg
+    assert 'data-world-axis="y-up"' in svg
+    assert 'data-camera-frustum="true"' in svg
     assert svg.count('data-layout="isolated-panel"') == 2
     assert 'data-camera-phase="start"' in svg
     assert 'data-camera-phase="fixed"' in svg
@@ -125,6 +152,12 @@ def test_seedance_spatial_png_required_for_group_and_changed_camera(
 
     paths = write_spatial_reference_pngs(plan, tmp_path / "seedance")
     assert set(paths) == {2, 3}
+    single_shot_svg = (
+        tmp_path / "seedance" / "shot_002_space.svg").read_text(
+            encoding="utf-8")
+    assert 'viewBox="0 0 620 ' in single_shot_svg
+    assert "P01 角色·甲" in single_shot_svg
+    assert "P02 角色·乙" not in single_shot_svg
     for shot_no, uri in paths.items():
         path = Path(uri)
         assert path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
@@ -150,6 +183,24 @@ def test_validation_rejects_character_drift():
     report = validate_spatial_plan(plan, storyboard)
     assert not report["passed"]
     assert "人物名单/数量" in report["issues"][0]
+
+
+def test_validation_rejects_malformed_3d_actor_and_camera_contract():
+    storyboard = {"shots": [_shot(1, ["甲"], "升", "甲向前走")]}
+    plan = build_spatial_plan(
+        {"scenes": [{"scene_no": 1, "location": "房间"}]}, storyboard,
+        {"characters": [{"name": "甲"}], "scenes": []})
+    block = plan["shot_index"]["1"]
+    block["actors"][0]["start_3d"].pop("z")
+    block["camera"]["vertical_fov_degrees"] = 0
+
+    report = validate_spatial_plan(plan, storyboard)
+
+    assert not report["passed"]
+    assert any("缺少合法三维站位/路线" in issue
+               for issue in report["issues"])
+    assert any("缺少合法三维机位/视锥" in issue
+               for issue in report["issues"])
 
 
 def test_crowded_center_positions_are_spread_and_routes_remain_parseable(

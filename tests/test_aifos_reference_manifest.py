@@ -270,5 +270,5 @@ def test_spatial_diagram_is_uploaded_for_keyframe_with_single_role(
     entry = next(item for item in payload["reference_manifest"]
                  if item["role"] == "spatial")
     assert entry["uri"] == str(spatial)
-    assert "不得把俯视视角" in entry["binding"]
+    assert "不得把3D示意视角" in entry["binding"]
     assert payload["reference_manifest"][0]["role"] == "identity"
