@@ -14,12 +14,29 @@ import re
 PROMPT_CONTRACT_SCHEMA = "aifos.shot-prompt/v2"
 PHYSICAL_CONTRACT_SCHEMA = "aifos.physical-space/v1"
 NON_PICTURE_TEXT_CARRIERS = ("字幕", "对白字幕", "旁白字幕", "台词字幕")
+FORBIDDEN_ON_SCREEN_METADATA = (
+    "镜头合同", "主体", "场景", "起点", "终点", "单一主动作", "TASK",
+    "WORLD / STYLE", "质检原因", "自动优化修订", "参考图职责", "硬约束",
+)
 
 
 def _text(value, fallback=""):
     value = "" if value is None else str(value)
     value = re.sub(r"\s+", " ", value).strip()
     return value or fallback
+
+
+def sanitize_text_whitelist(values):
+    """Keep only explicit user/story text, never prompt or QC metadata."""
+    cleaned = []
+    for value in values or []:
+        text = _text(value)
+        if not text or any(text == field or text.startswith(field)
+                           for field in FORBIDDEN_ON_SCREEN_METADATA):
+            continue
+        if text not in cleaned:
+            cleaned.append(text)
+    return cleaned
 
 
 def _state_line(states):
@@ -47,8 +64,7 @@ def readable_text_required(value):
     carrier = _text(value.get("carrier"))
     if any(label in carrier for label in NON_PICTURE_TEXT_CARRIERS):
         return False
-    return bool([item for item in (value.get("whitelist") or [])
-                 if _text(item)])
+    return bool(sanitize_text_whitelist(value.get("whitelist") or []))
 
 
 def _camera(shot):
@@ -321,18 +337,28 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
     dialogue = shot.get("dialogue") or {}
     readable = shot.get("readable_text") or {}
     if readable_text_required(readable):
-        whitelist = "、".join(dict.fromkeys(
-            str(item).strip() for item in (readable.get("whitelist") or [])
-            if str(item).strip())) or "白名单"
+        whitelist = "、".join(sanitize_text_whitelist(
+            readable.get("whitelist") or [])) or "白名单"
         carrier = _text(readable.get("carrier"), "指定载体")
+        layout = _text(readable.get("layout"))
+        style = _text(readable.get("style"))
+        perspective = _text(readable.get("perspective"))
+        presentation = "；".join(filter(None, (
+            f"版式/位置:{layout}" if layout else "",
+            f"字体/颜色/层级:{style}" if style else "",
+            f"透视/反光:{perspective}" if perspective else "",
+        )))
         if any(token in carrier for token in ("电脑", "笔记本", "屏幕", "显示器")):
             text_rule = (
                 f"电脑屏幕必须打开并清晰显示白名单原文:{whitelist}；"
-                "屏幕不是冷白光效/空白占位面，禁止随机乱码、模糊色块和黑白占位；"
-                "屏幕外无字幕、Logo、水印和无关文字"
+                + (presentation + "；" if presentation else "")
+                + "屏幕不是冷白光效/空白占位面，禁止随机乱码、模糊色块和黑白占位；"
+                + "屏幕外无字幕、Logo、水印和无关文字"
             )
         else:
-            text_rule = f"{carrier}内文字只保持原样:{whitelist}；禁止新增文字"
+            text_rule = (f"{carrier}内文字只保持原样:{whitelist}；"
+                         + (presentation + "；" if presentation else "")
+                         + "禁止新增文字")
     else:
         text_rule = "无画面文字、无字幕、无Logo、无水印"
     refs = []

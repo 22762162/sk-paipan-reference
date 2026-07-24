@@ -45,7 +45,7 @@ DEFAULT_STANDARD = {
             "time_precision_seconds": 0.5,
             "prompt_strategy": "five_dimensions_per_segment",
             "prompt_contract": {
-                "schema": "aifos.shot-prompt/v1",
+                "schema": "aifos.shot-prompt/v2",
                 "order": [
                     "subject", "scene", "start", "single_action",
                     "performance", "camera", "end", "dialogue", "text",
@@ -81,6 +81,29 @@ DEFAULT_STANDARD = {
             ],
             "visible_text_policy": "关键帧先锁字，视频模型只保持不重写",
             "default_visual_fallback": "剧情自适应、电影级半写实精品漫剧",
+        },
+        "text_assets": {
+            "explicit_whitelist_only": True,
+            "required_fields": [
+                "carrier", "whitelist", "layout", "style",
+                "perspective", "priority",
+            ],
+            "style_description_required": True,
+            "keyframe_provider": "ChatGPT关键帧",
+            "video_policy": "Seedance只保持首帧文字，不从零生成或改写",
+            "dense_text_policy": "密集页面单独生成文字/UI资产后合成，不依赖视频模型重写",
+            "forbid_prompt_metadata_as_text": True,
+            "forbidden_system_fields": [
+                "镜头合同", "主体", "场景", "起点", "终点", "单一主动作",
+                "TASK", "WORLD / STYLE", "质检原因", "自动优化修订",
+                "参考图职责", "硬约束",
+            ],
+            "no_readable_text_without_whitelist": True,
+            "qc_requirements": [
+                "逐字核对白名单",
+                "核对载体、版式、字体风格、颜色和透视",
+                "禁止乱码、字幕、Logo、水印和未授权系统字段",
+            ],
         },
         "character_assets": {
             "background": "pure_background_no_text_no_scene",
@@ -379,6 +402,10 @@ class StandardCenter:
             issue(
                 "rules.production.prompt_contract.reference_roles",
                 "必须是非空参考图职责列表")
+        if prompt_contract.get("schema") == "aifos.shot-prompt/v1":
+            issue(
+                "rules.production.prompt_contract.schema",
+                "镜头提示词合同已升级为 aifos.shot-prompt/v2")
         preferred = numeric_pair(
             production, "preferred_segment_seconds",
             "rules.production.preferred_segment_seconds", minimum=0.5,
@@ -424,6 +451,23 @@ class StandardCenter:
         for key in ("visible_text_policy", "default_visual_fallback"):
             nonempty_string(
                 story_analysis, key, f"rules.story_analysis.{key}")
+
+        text_assets = required_dict(
+            rules, "text_assets", "rules.text_assets")
+        for key in (
+                "explicit_whitelist_only", "style_description_required",
+                "forbid_prompt_metadata_as_text",
+                "no_readable_text_without_whitelist"):
+            bool_field(text_assets, key, f"rules.text_assets.{key}")
+        for key in (
+                "keyframe_provider", "video_policy", "dense_text_policy"):
+            nonempty_string(text_assets, key, f"rules.text_assets.{key}")
+        for key in ("required_fields", "forbidden_system_fields", "qc_requirements"):
+            values = text_assets.get(key)
+            if (not isinstance(values, list) or not values
+                    or not all(isinstance(item, str) and item.strip()
+                               for item in values)):
+                issue(f"rules.text_assets.{key}", "必须是非空字符串列表")
 
         character_assets = required_dict(
             rules, "character_assets", "rules.character_assets")
@@ -667,6 +711,12 @@ class StandardCenter:
                 if key not in production_rules:
                     production_rules[key] = copy.deepcopy(value)
                     changed = True
+            prompt_contract = production_rules.get("prompt_contract")
+            if (isinstance(prompt_contract, dict)
+                    and prompt_contract.get("schema")
+                    == "aifos.shot-prompt/v1"):
+                prompt_contract["schema"] = "aifos.shot-prompt/v2"
+                changed = True
         source = content.get("source_skill")
         source_defaults = DEFAULT_STANDARD["source_skill"]
         if (isinstance(source, dict)
@@ -674,6 +724,16 @@ class StandardCenter:
             for key in ("version", "principle"):
                 if source.get(key) != source_defaults[key]:
                     source[key] = copy.deepcopy(source_defaults[key])
+                    changed = True
+        text_rules = rules.get("text_assets")
+        text_defaults = DEFAULT_STANDARD["rules"]["text_assets"]
+        if not isinstance(text_rules, dict):
+            rules["text_assets"] = copy.deepcopy(text_defaults)
+            changed = True
+        else:
+            for key, value in text_defaults.items():
+                if key not in text_rules:
+                    text_rules[key] = copy.deepcopy(value)
                     changed = True
         storyboard = rules.get("storyboard")
         if isinstance(storyboard, dict) \

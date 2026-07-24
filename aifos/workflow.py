@@ -19,6 +19,7 @@ from .prompt_contract import (
     build_physical_contract,
     compile_shot_prompt,
     readable_text_required,
+    sanitize_text_whitelist,
 )
 
 from .spatial_blocking import (
@@ -305,6 +306,27 @@ def _state(name, continuity, emotion="专注", pose="站立，重心稳定"):
 
 
 def _text_asset(shot, rules=None):
+    # 新版分镜可直接提供结构化文字资产卡；它是唯一的可读文字来源，
+    # 不再从整段系统提示词或 QC 字段猜测屏幕内容。
+    declared = shot.get("readable_text")
+    if isinstance(declared, dict) and (
+            declared.get("carrier") or declared.get("whitelist")):
+        whitelist = sanitize_text_whitelist(declared.get("whitelist") or [])
+        carrier = str(declared.get("carrier") or "").strip()
+        return {
+            "required": bool(carrier and whitelist),
+            "carrier": carrier,
+            "whitelist": whitelist,
+            "layout": str(declared.get("layout") or "").strip(),
+            "style": str(declared.get("style") or "").strip(),
+            "perspective": str(declared.get("perspective") or "").strip(),
+            "priority": str(declared.get("priority") or "must_read").strip(),
+            "source": str(declared.get("source") or "storyboard").strip(),
+            "locked_by": declared.get("locked_by", ""),
+            "keyframe_uri": declared.get("keyframe_uri", ""),
+            "rule": ("文字必须由ChatGPT关键帧锁定，Seedance只保持原字"
+                     if carrier and whitelist else "无显式文字白名单"),
+        }
     blob = " ".join((shot.get("description", ""), shot.get("prompt", "")))
     # “无字幕/禁止文字”等负向约束不代表画面里真的有文字载体。
     # 旧逻辑只要看到“字幕”二字就把它标成 required，随后既拿不到白名单，
@@ -327,7 +349,7 @@ def _text_asset(shot, rules=None):
     # 同一条要求通常同时出现在 description 和 prompt；白名单必须是稳定、
     # 去重后的原文。电脑页面若明确写到“崇祯页面”，把页面主题一并锁住，
     # 否则模型只看到书名，容易生成泛化的白色网页占位面。
-    texts = list(dict.fromkeys(texts))
+    texts = sanitize_text_whitelist(texts)
     if carrier in ("电脑", "手机屏", "平板", "屏幕") \
             and "崇祯" in searchable and "崇祯" not in texts:
         texts.append("崇祯")
@@ -336,6 +358,11 @@ def _text_asset(shot, rules=None):
         "required": required,
         "carrier": carrier,
         "whitelist": texts,
+        "layout": "",
+        "style": "",
+        "perspective": "",
+        "priority": "must_read" if required else "none",
+        "source": "legacy_inferred" if required else "none",
         "locked_by": "",
         "keyframe_uri": "",
         "rule": "文字必须由ChatGPT关键帧锁定，Seedance只保持原字" if required else "无可读文字",
@@ -835,6 +862,10 @@ def lock_text_assets(storyboard, image_uris, provider_name):
             "shot_no": shot["shot_no"],
             "carrier": asset.get("carrier", ""),
             "whitelist": asset.get("whitelist", []),
+            "layout": asset.get("layout", ""),
+            "style": asset.get("style", ""),
+            "perspective": asset.get("perspective", ""),
+            "priority": asset.get("priority", "must_read"),
             "locked_by": asset.get("locked_by", ""),
             "keyframe_uri": asset.get("keyframe_uri", ""),
         })

@@ -61,6 +61,25 @@ def test_qc_prompt_and_validation():
     assert validate_image_qc({"issues": []}) == "缺少 pass 字段"
 
 
+def test_screen_text_rule_uses_only_explicit_whitelist_and_style():
+    from aifos.adapters.codex_image import _screen_prop_rule
+    prompt = "【镜头合同v2】【主体】电脑屏幕显示页面"
+    blocked = _screen_prop_rule(prompt, {
+        "carrier": "电脑屏幕", "whitelist": [],
+    })
+    assert "不得从" in blocked
+    assert "镜头合同" in blocked
+    assert "镜头合同v2" not in blocked
+    locked = _screen_prop_rule(prompt, {
+        "carrier": "电脑屏幕", "whitelist": ["东宫书房"],
+        "layout": "左上标题栏", "style": "宋体黑字", "perspective": "贴合屏幕",
+    })
+    assert "东宫书房" in locked
+    assert "左上标题栏" in locked
+    assert "宋体黑字" in locked
+    assert "镜头合同v2" not in locked
+
+
 def test_qc_prompt_audits_exact_current_prompt_and_reference_manifest():
     from aifos.adapters.claude_script import build_prompt
 

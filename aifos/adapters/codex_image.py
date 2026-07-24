@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 from aifos.generation_diagnostics import normalize_generation_diagnostics
-from aifos.prompt_contract import readable_text_required
+from aifos.prompt_contract import readable_text_required, sanitize_text_whitelist
 
 
 # 非交互出图必需:可写沙箱 + 跳过 git 仓库检查(产物目录不是 git 仓库)。
@@ -139,8 +139,7 @@ def _screen_prop_rule(prompt_text, text_asset=None):
             "电脑", "笔记本", "屏幕", "显示器", "页面", "史书", "网页")) \
             and not readable_text_required(asset):
         return ""
-    whitelist = [str(item).strip() for item in asset.get("whitelist", [])
-                 if str(item).strip()]
+    whitelist = sanitize_text_whitelist(asset.get("whitelist", []))
     # Only the explicit structured whitelist may authorize readable text.
     # Extracting bracketed phrases from prompt_text turns structural headings
     # such as 【镜头合同v1】【主体】 into accidental on-screen copy.
@@ -153,11 +152,21 @@ def _screen_prop_rule(prompt_text, text_asset=None):
             "画面仍禁止字幕、Logo、水印和乱码。"
         )
     wanted = "、".join(exact)
+    presentation = "；".join(filter(None, (
+        f"版式/位置:{str(asset.get('layout') or '').strip()}"
+        if str(asset.get("layout") or "").strip() else "",
+        f"字体/颜色/层级:{str(asset.get('style') or '').strip()}"
+        if str(asset.get("style") or "").strip() else "",
+        f"透视/反光:{str(asset.get('perspective') or '').strip()}"
+        if str(asset.get("perspective") or "").strip() else "",
+    )))
     return (
         "【屏幕/页面文字硬锁】电脑必须保持打开，屏幕正对镜头并在画面中清晰"
         "可见；禁止空白冷白屏、纯白发光占位面和空白占位内容，屏幕必须实际"
         "显示并尽量逐字"
-        f"呈现{wanted}，不得用随机乱码、模糊色块或纯白发光替代。只修改"
+        f"呈现{wanted}"
+        + (f"；{presentation}" if presentation else "")
+        + "，不得用随机乱码、模糊色块或纯白发光替代。只修改"
         "屏幕内页面，电脑金属外壳、人物、服装、场景、构图和光线保持不变；"
         "屏幕外仍禁止字幕、Logo、水印和无关文字。"
     )
@@ -225,7 +234,7 @@ def build_instruction(capability, payload, out_dir):
         text_asset = payload.get("readable_text") or {}
         text_rule = (
             f"画面文字载体:{text_asset.get('carrier', '')};只允许逐字出现:"
-            f"{'、'.join(text_asset.get('whitelist', [])) or '白名单为空'};"
+            f"{'、'.join(sanitize_text_whitelist(text_asset.get('whitelist', []))) or '白名单为空'};"
             "不得新增乱码或字幕条。"
             if readable_text_required(text_asset) else
             "画面中不要生成字幕条、对白字幕或无关可读文字。")

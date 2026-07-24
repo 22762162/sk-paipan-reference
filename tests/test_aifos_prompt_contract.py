@@ -4,6 +4,7 @@ from aifos.prompt_contract import (
     build_physical_contract,
     compile_shot_prompt,
     readable_text_required,
+    sanitize_text_whitelist,
     shot_local_scene,
 )
 from aifos.adapters.codex_image import build_instruction
@@ -209,6 +210,34 @@ def test_laptop_contract_states_user_screen_and_camera_side():
     _, prompt = compile_shot_prompt(shot, location="现代书房")
     assert "【物理/空间逻辑】" in prompt
     assert "禁止人物坐在屏幕背面却看到屏幕正面" in prompt
+
+
+def test_text_asset_card_compiles_layout_style_and_perspective():
+    shot = _shot()
+    shot.update({
+        "characters": [],
+        "description": "空镜，门牌需要清晰可读",
+        "readable_text": {
+            "required": True,
+            "carrier": "门牌",
+            "whitelist": ["东宫书房"],
+            "layout": "门框右上，单行居中",
+            "style": "明代匾额书法，墨黑字，暗金底",
+            "perspective": "随门框透视，边缘轻微反光",
+            "priority": "must_read",
+        },
+    })
+    _, prompt = compile_shot_prompt(shot, location="明代东宫")
+    assert "东宫书房" in prompt
+    assert "版式/位置:门框右上，单行居中" in prompt
+    assert "字体/颜色/层级:明代匾额书法，墨黑字，暗金底" in prompt
+    assert "透视/反光:随门框透视，边缘轻微反光" in prompt
+
+
+def test_system_prompt_fields_never_become_screen_whitelist():
+    assert sanitize_text_whitelist([
+        "东宫书房", "镜头合同v2", "质检原因:屏幕乱码", "主体",
+    ]) == ["东宫书房"]
 
 
 def test_legacy_shot_uses_local_modern_scene_before_episode_fallback():

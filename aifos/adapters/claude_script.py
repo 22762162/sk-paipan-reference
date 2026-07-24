@@ -173,7 +173,10 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
 - prompt 中人物形态按人物设定描写(名字只是称呼,「小鹿」若设定为
   人类不能当动物写;设定为动物/精怪的按设定写,全片保持一致);
 - 不生成对白字幕。手机屏、弹幕、合同等可读文字只描述载体与准确文字，
-  后续由 ChatGPT 关键帧锁定，不能交给视频模型从零生成；
+  后续由 ChatGPT 关键帧锁定，不能交给视频模型从零生成；如需可读文字，必须
+  额外输出 `readable_text` 文字资产卡，只填写画面确实要出现的文字，不得把
+  镜头合同、提示词标题、质检原因或系统字段当作屏幕内容；同时给出载体、版式、
+  字体/颜色样式、屏幕透视和可读优先级；没有可读文字时输出 null；
 - 只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块。
 
 JSON 格式:
@@ -181,6 +184,9 @@ JSON 格式:
   "kind": "environment", "description": "...", "camera": "镜头语言",
   "duration": 2.5, "characters": ["角色名"], "dialogue": null,
   "physical_logic": "本镜物理/空间关系",
+  "readable_text": {{"carrier":"电脑屏幕", "whitelist":["逐字原文"],
+    "layout":"版式/位置", "style":"字体/颜色/层级", "perspective":"透视/反光",
+    "priority":"must_read"}},
   "prompt": "文生图提示词"}}]}}"""
 
 STORY_ANALYSIS_PROMPT = """你是 AI 漫剧的编剧、美术指导、摄影指导和连续性导演。
@@ -558,6 +564,7 @@ def validate_storyboard(storyboard):
         shot.setdefault("camera", "")
         shot.setdefault("dialogue", None)
         shot.setdefault("physical_logic", "")
+        shot.setdefault("readable_text", None)
     # 编号强制连续,避免下游连续性质检失败
     for index, shot in enumerate(storyboard["shots"], start=1):
         shot["shot_no"] = index

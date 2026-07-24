@@ -38,7 +38,7 @@ def test_default_standard_is_complete_and_active(tmp_path):
             "final_character_image_prompt_required"] is True
         assert story_analysis["compact_prompt_compilation"] is True
         contract = production["prompt_contract"]
-        assert contract["schema"] == "aifos.shot-prompt/v1"
+        assert contract["schema"] == "aifos.shot-prompt/v2"
         assert contract["single_primary_action"] is True
         assert contract["single_camera_move"] is True
         assert contract["compact_prompt_sent_to_model"] is True
@@ -53,6 +53,11 @@ def test_default_standard_is_complete_and_active(tmp_path):
         assert production["voice"] == "jimeng_builtin"
         assert production["lip_sync"] is True
         assert production["burn_subtitles"] is False
+        text_assets = rules["text_assets"]
+        assert text_assets["explicit_whitelist_only"] is True
+        assert text_assets["style_description_required"] is True
+        assert text_assets["forbid_prompt_metadata_as_text"] is True
+        assert "质检原因" in text_assets["forbidden_system_fields"]
         assert production["preferred_segment_seconds"] == [5, 8]
         assert production["max_segment_seconds"] == 15
         assert production["time_precision_seconds"] == 0.5
