@@ -1903,16 +1903,17 @@ function codexExecutionSettingsHtml(data) {
   const profiles = codexProfileList(data);
   const supported = Array.isArray(data?.codex_profiles);
   const parallelValue = data?.codex_parallel;
-  const parallel = parallelValue && typeof parallelValue === "object"
-    ? Boolean(parallelValue.enabled ?? parallelValue.active)
-    : Boolean(parallelValue);
+  const enabledCount = Number(parallelValue?.enabled_count) ||
+    profiles.filter((profile) => profile.enabled).length;
+  const parallel = enabledCount >= 2;
+  const modeLabel = parallel ? "双通道并行已启用"
+    : enabledCount === 1 ? "单通道兼容模式" : "等待配置两个通道";
   return `<section class="panel codex-execution-panel">
     <div class="codex-execution-head">
       <div><span class="eyebrow">PARALLEL CODEX EXECUTION</span>
         <h2>Codex 双通道</h2>
         <p>为通道 A/B 使用独立 CODEX_HOME，隔离订阅会话并并行生产图片。</p></div>
-      <span class="chip ${parallel ? "done" : ""}">
-        ${parallel ? "双通道并行已启用" : "单通道兼容模式"}</span>
+      <span class="chip ${parallel ? "done" : ""}">${modeLabel}</span>
     </div>
     <div class="codex-channel-grid">${profiles.map(codexProfileCard).join("")}</div>
     <div class="codex-profile-actions">
