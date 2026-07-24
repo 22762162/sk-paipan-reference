@@ -2307,6 +2307,11 @@ textarea:focus-visible, select:focus-visible {
 }
 .plan-note { font-size: 11px; margin-top: 4px; }
 .plan-overlay { max-width: 780px; }
+.plan-filter-empty {
+  margin: 14px 0; padding: 18px 12px; text-align: center;
+  border: 1px dashed var(--hairline); border-radius: 10px;
+  color: var(--ink-3); background: var(--surface-2);
+}
 
 /* ---- 尚未开工图片 · 严格 API 加速 ---- */
 .acceleration-panel { width: min(980px, 96vw); max-width: 980px; }
@@ -3307,6 +3312,43 @@ textarea:focus-visible, select:focus-visible {
 .plan-edit-actions .plan-edit-go { flex: 1; }
 .regen-form .regen-ref { font-size: 12px; }
 
+/* 暂停不等于锁页：已有生产环节保持可进入、可核对。 */
+.paused-production-access {
+  display: grid; gap: 10px; padding: 13px 18px;
+  border-bottom: 1px solid rgba(250, 178, 25, .42);
+  background:
+    radial-gradient(circle at 95% 0, rgba(57, 135, 229, .14), transparent 34%),
+    rgba(250, 178, 25, .08);
+}
+.paused-production-summary {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 14px; color: var(--ink-2);
+}
+.paused-production-summary b { display: block; color: var(--ink); }
+.paused-production-summary span { display: block; margin-top: 3px; font-size: 12px; }
+.paused-production-summary strong {
+  flex: 0 0 auto; color: var(--warning); font-size: 12px; white-space: nowrap;
+}
+.paused-stage-links {
+  display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 7px;
+}
+.paused-stage-links button {
+  display: flex; align-items: center; gap: 6px; min-width: 0;
+  padding: 8px 9px; border-color: rgba(97, 145, 255, .34);
+  background: rgba(11, 20, 34, .72); color: #cfe4ff; font-size: 11px;
+  white-space: normal; text-align: left;
+}
+.paused-stage-links button:hover {
+  border-color: var(--accent); background: rgba(57, 135, 229, .18);
+}
+.paused-stage-links button b {
+  color: #83b8ff; font-size: 9px; letter-spacing: .05em;
+}
+.paused-stage-links button span {
+  margin-left: auto; padding: 1px 5px; border-radius: 999px;
+  background: var(--surface-3); color: var(--ink-3); font-size: 9px;
+}
+
 /* ---- 出图产线切换 ---- */
 .image-line-row select {
   background: var(--page); color: var(--ink);
@@ -3390,6 +3432,14 @@ textarea:focus-visible, select:focus-visible {
 }
 .plan-batchbar .batch-select-qc:not(:disabled) {
   color: #ffd77a; border-color: rgba(250, 178, 25, .45);
+}
+.plan-batchbar .batch-filter-failed,
+.plan-batchbar .batch-show-all {
+  color: #ffd77a; border-color: rgba(250, 178, 25, .45);
+}
+.plan-batchbar .batch-filter-failed:hover,
+.plan-batchbar .batch-show-all:hover {
+  background: rgba(250, 178, 25, .14);
 }
 .plan-batchbar .batch-manual-pass:not(:disabled) {
   background: rgba(250, 178, 25, .16); color: #ffd77a;
@@ -3719,6 +3769,17 @@ textarea:focus-visible, select:focus-visible {
   .firefire-panel { margin:12px; padding:14px; }
 }
 @media (max-width:760px) {
+  .paused-production-access { padding: 10px; }
+  .paused-production-summary { align-items: flex-start; flex-direction: column; gap: 5px; }
+  .paused-production-summary strong { white-space: normal; }
+  .paused-stage-links {
+    display: flex; overflow-x: auto; margin-inline: -10px; padding: 0 10px 4px;
+    scroll-snap-type: x proximity; scrollbar-width: none;
+  }
+  .paused-stage-links::-webkit-scrollbar { display: none; }
+  .paused-stage-links button {
+    flex: 0 0 min(58vw, 220px); min-height: 44px; scroll-snap-align: start;
+  }
   .prepro-steps {
     grid-template-columns:repeat(2,minmax(0,1fr)); margin:10px; gap:6px;
   }

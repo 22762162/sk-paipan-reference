@@ -2865,6 +2865,29 @@ const PLAN_STATUS_CN = {
 };
 const PLAN_QC_CATS = new Set(["shot_image", "frames"]);
 function planQcEnabled(item) { return PLAN_QC_CATS.has(item.category); }
+const PLAN_REWORK_STATUSES = new Set([
+  "done", "reused", "awaiting_human", "failed", "generating",
+]);
+function planNeedsRevision(item) {
+  return planQcEnabled(item)
+    && (item.qc || {}).passed === false
+    && PLAN_REWORK_STATUSES.has(item.status || "pending");
+}
+
+/* 图片清单的筛选状态按集保存；批量修改只看当前需要返工的图片。 */
+const planFailedOnlyByEpisode = new Map();
+const planOverlaySignatures = new Map();
+function planFailedOnly(episodeId) {
+  return planFailedOnlyByEpisode.get(String(episodeId)) === true;
+}
+function planShowFailedOnly(episodeId) {
+  planFailedOnlyByEpisode.set(String(episodeId), true);
+  refreshOpenPlanOverlay(episodeId, true);
+}
+function planShowAll(episodeId) {
+  planFailedOnlyByEpisode.delete(String(episodeId));
+  refreshOpenPlanOverlay(episodeId, true);
+}
 const PROVIDER_LABEL = {
   codex: "Codex 订阅", image_api: "GPT Image 2 API", api: "通用API",
   seedream5_lite: "Seedream 5.0 Lite", seedream_lite: "Seedream 5.0 Lite",
@@ -3052,8 +3075,7 @@ function planItemHtml(data, item, editable) {
   const st = item.status || "pending";
   const canEdit = editable && item.category !== "character_candidate";
   const selectable = canEdit && ["done", "reused", "awaiting_human", "failed"].includes(st);
-  const qcFailed = planQcEnabled(item) && (item.qc || {}).passed === false
-    && ["done", "reused", "awaiting_human", "failed"].includes(st);
+  const qcFailed = planNeedsRevision(item);
   return `<div class="plan-item plan-selectable st-${st}" data-plan-select="${esc(item.id)}"
     role="button" tabindex="0" aria-pressed="false"
     aria-label="选择查看 ${esc(item.label)}">
@@ -4272,26 +4294,31 @@ async function showImageAcceleration(episodeId) {
 }
 
 function renderPlanHtml(data, editable) {
-  const items = ((data.render_plan || {}).items) || [];
-  if (!items.length) return "";
+  const allItems = ((data.render_plan || {}).items) || [];
+  if (!allItems.length) return "";
+  const failedOnly = planFailedOnly(data.episode.id);
+  const items = failedOnly ? allItems.filter(planNeedsRevision) : allItems;
   const cats = PLAN_CATS
     .filter((c) => items.some((i) => i.category === c));
   const ready = items.filter(
     (i) => ["done", "reused"].includes(i.status)).length;
-  const qcFailed = items.filter(
-    (i) => planQcEnabled(i) && (i.qc || {}).passed === false
-      && ["done", "reused", "awaiting_human", "failed"].includes(i.status)).length;
-  const qcItems = items.filter(planQcEnabled);
+  const qcFailed = allItems.filter(planNeedsRevision).length;
+  const qcItems = allItems.filter(planQcEnabled);
   const acceleration = (data.image_acceleration || {}).summary || {};
   const accelerationCount = Number(acceleration.ready || 0)
     + Number(acceleration.blocked || 0);
   return `<div class="plan-panel">
-    <h2>🖼 图片生产清单 <span class="dim">共 ${items.length} 张 · 已就绪 ${ready}</span></h2>
+    <h2>🖼 图片生产清单 <span class="dim">${failedOnly
+      ? `仅显示需修改 ${items.length}/${allItems.length} 张`
+      : `共 ${items.length} 张 · 已就绪 ${ready}`}</span></h2>
     ${qualityPolicyHtml()}
     ${imageCostGuideHtml(true)}
     ${mockWarnHtml(data)}
     ${relationCanvasHtml(data)}
     ${editable ? `<div class="plan-batchbar">
+      ${failedOnly ? `<button class="batch-show-all"
+        onclick="planShowAll(${data.episode.id})"
+        title="恢复显示本集全部图片">显示全部图片 (${allItems.length})</button>` : ""}
       ${accelerationCount ? `<button class="batch-accelerate primary"
         onclick="showImageAcceleration(${data.episode.id})"
         title="只分流从未进入 worker 的 pending 图片；开工前逐张核对提示词和参考图">
@@ -4300,7 +4327,10 @@ function renderPlanHtml(data, editable) {
         title="只核对后续分镜关键帧和首尾帧">🔍 批量质检镜头图</button>` : ""}
       <button class="batch-redo-failed" onclick="redoFailed(${data.episode.id}, this)"
         ${qcFailed ? "" : "disabled"}
-        title="按每张图的质检原因自动优化提示词，再批量重画">🛠 批量优化修改${qcFailed ? ` (${qcFailed})` : ""}</button>
+        title="只显示质检未过的图片，并按每张图的原因自动优化提示词后批量重画">🛠 批量优化修改${qcFailed ? ` (${qcFailed})` : ""}</button>
+      ${!failedOnly && qcFailed ? `<button class="batch-filter-failed"
+        onclick="planShowFailedOnly(${data.episode.id})"
+        title="先筛选出需要修改的图片，不显示已通过图片">只看需修改 (${qcFailed})</button>` : ""}
       <button class="batch-select-qc" onclick="planSelectQcFailed()"
         ${qcFailed ? "" : "disabled"} title="只勾选二次质检未通过的镜头图">选中未过图</button>
       <span class="batch-sep">|</span>
@@ -4315,13 +4345,13 @@ function renderPlanHtml(data, editable) {
         disabled title="保留质检问题记录，人工确认选中的轻微问题图可继续使用">✅ 人工通过选中的 <span class="sel-qc-count">0</span> 张</button>
     </div>` : ""}
     ${editable ? "" : `<div class="dim plan-hint">列表实时更新;要修改某张的提示词重画,等生成停下后点工具栏「🖼 图片清单」。</div>`}
-    ${cats.map((cat) => {
+    ${items.length ? cats.map((cat) => {
       const list = items.filter((i) => i.category === cat);
       const ok = list.filter(
         (i) => ["done", "reused"].includes(i.status)).length;
       return `<div class="plan-cat"><h3>${PLAN_CAT_CN[cat]} <span class="dim">${ok}/${list.length}</span></h3>
         <div class="plan-list">${list.map((i) => planItemHtml(data, i, editable)).join("")}</div></div>`;
-    }).join("")}</div>`;
+    }).join("") : `<div class="plan-filter-empty">当前没有待修改图片；质检通过后会自动从此筛选中移除。</div>`}</div>`;
 }
 
 /* 单张质检 / 批量质检 / 批量重画未过 */
@@ -4459,17 +4489,50 @@ function updateBatchRedrawProgress(episodeId, job, fallbackTotal = 0) {
     </div>`;
 }
 
-async function refreshOpenPlanOverlay(episodeId) {
-  const panel = document.querySelector(
-    `.plan-overlay[data-episode="${episodeId}"] .plan-overlay-content`);
-  if (!panel) return;
+async function refreshOpenPlanOverlay(episodeId, force = false) {
+  const overlay = document.querySelector(
+    `.plan-overlay[data-episode="${episodeId}"]`);
+  const panel = overlay?.querySelector(".plan-overlay-content");
+  if (!panel) return false;
+  const active = document.activeElement;
+  if (!force && (panel.querySelector(".plan-edit-form:not([hidden])")
+      || active?.closest(".plan-edit-form"))) {
+    // 用户正在改词时不替换 DOM；否则 textarea 会失焦、滚动位置也会跳走。
+    return false;
+  }
+  const scrollState = [overlay, panel].map((el) => [el, el.scrollTop]);
+  const checked = new Set([...panel.querySelectorAll(
+    ".plan-pick-box:checked")].map((box) => box.dataset.pick));
+  const openDetails = [...panel.querySelectorAll("details[open]")].map((details) => {
+    const card = details.closest("[data-plan-select]");
+    if (!card) return null;
+    return [card.dataset.planSelect,
+      [...card.querySelectorAll("details")].indexOf(details)];
+  }).filter(Boolean);
   try {
     const data = await api(`/api/episode/${episodeId}`);
+    planOverlaySignatures.set(String(episodeId), canvasSig(data));
     panel.innerHTML = renderPlanHtml(data, true)
       || `<div class="dim">本集还没有图片生产计划。</div>`;
     bindPlanSelection(panel, data, episodeId);
     bindPlanRegen(panel, episodeId, () => refreshOpenPlanOverlay(episodeId));
+    panel.querySelectorAll(".plan-pick-box").forEach((box) => {
+      box.checked = checked.has(box.dataset.pick);
+    });
+    openDetails.forEach(([id, index]) => {
+      const card = [...panel.querySelectorAll("[data-plan-select]")]
+        .find((candidate) => candidate.dataset.planSelect === id);
+      const details = card?.querySelectorAll("details");
+      if (details?.[index]) details[index].open = true;
+    });
+    planUpdateSelCount();
+    // innerHTML 替换后在下一帧恢复两个可能的滚动容器，避免生成进度导致页面跳动。
+    requestAnimationFrame(() => scrollState.forEach(([el, top]) => {
+      if (el) el.scrollTop = top;
+    }));
+    return true;
   } catch (e) { /* 下一次任务进度更新再试 */ }
+  return false;
 }
 
 function watchBatchRedraw(episodeId, jobId, total, onDone) {
@@ -4506,7 +4569,9 @@ async function redoSelected(episodeId, btn) {
     watchBatchRedraw(episodeId, reply.job_id, ids.length, (job) => {
       if (job.status === "done")
         showToast(`已重画选中的 ${(job.summary || {}).redone || 0} 张`, "ok");
-      renderCanvasView(episodeId);
+      if (document.querySelector(`.plan-overlay[data-episode="${episodeId}"]`))
+        refreshOpenPlanOverlay(episodeId, true);
+      else renderCanvasView(episodeId);
     });
     showToast(`开始重画选中的 ${ids.length} 张,进度看实况看板`, "ok");
     pollCanvas(episodeId);
@@ -4518,6 +4583,10 @@ async function redoSelected(episodeId, btn) {
 }
 
 async function redoFailed(episodeId, btn) {
+  // 先切换到“只看需修改”，避免批量操作把用户带回全部图片列表。
+  planFailedOnlyByEpisode.set(String(episodeId), true);
+  if (document.querySelector(`.plan-overlay[data-episode="${episodeId}"]`))
+    refreshOpenPlanOverlay(episodeId, true);
   const quality = btn?.closest(".plan-panel")?.querySelector(".batch-quality")?.value || "auto";
   if (btn) { btn.disabled = true; btn.textContent = "正在安全暂停…"; }
   try {
@@ -4533,7 +4602,9 @@ async function redoFailed(episodeId, btn) {
         showToast(summary.note || "检测到系统性人物漂移，已停止批量重画", "error");
       else if (job.status === "done")
         showToast(`已重画 ${summary.redone || 0} 张质检未过的图`, "ok");
-      renderCanvasView(episodeId);
+      if (document.querySelector(`.plan-overlay[data-episode="${episodeId}"]`))
+        refreshOpenPlanOverlay(episodeId, true);
+      else renderCanvasView(episodeId);
     });
     showToast("开始重画质检未过的图,进度看实况看板", "ok");
     pollCanvas(episodeId);
@@ -4931,6 +5002,7 @@ async function showPlanOverlay(episodeId, focusId = "") {
   let data;
   try { data = await api(`/api/episode/${episodeId}`); }
   catch (e) { showToast(e.message, "error"); return; }
+  planOverlaySignatures.set(String(episodeId), canvasSig(data));
   const overlay = document.createElement("div");
   overlay.className = "script-overlay";
   overlay.innerHTML = `
@@ -4948,6 +5020,7 @@ async function showPlanOverlay(episodeId, focusId = "") {
         || `<div class="dim">本集还没有图片生产计划(确认剧本、开始画图后就会出现)。</div>`}</div>
     </div>`;
   const close = () => {
+    planOverlaySignatures.delete(String(episodeId));
     overlay.remove(); document.removeEventListener("keydown", onKey);
   };
   const onKey = (ev) => { if (ev.key === "Escape") close(); };
@@ -6235,7 +6308,23 @@ function pollCanvas(episodeId) {
       const data = await api(`/api/episode/${episodeId}`);
       watchBuild(data);
       updateLiveStrip(data);          // 状态条每轮都刷新(不重画整页)
-      if (canvasSig(data) !== canvasSignature) renderCanvasView(episodeId);
+      if (canvasSig(data) !== canvasSignature) {
+        const planOverlay = document.querySelector(
+          `.plan-overlay[data-episode="${episodeId}"]`);
+        if (planOverlay) {
+          // 图片清单打开时只更新清单；不重建底层画布，避免遮罩层和滚动位置跳动。
+          const signature = canvasSig(data);
+          const key = String(episodeId);
+          if (planOverlaySignatures.get(key) !== signature)
+            refreshOpenPlanOverlay(episodeId);
+        } else {
+          const scrollHost = document.scrollingElement;
+          const scrollTop = scrollHost ? scrollHost.scrollTop : 0;
+          renderCanvasView(episodeId).finally(() => requestAnimationFrame(() => {
+            if (scrollHost) scrollHost.scrollTop = scrollTop;
+          }));
+        }
+      }
     } catch (e) { /* 下一轮再试 */ }
   }, 3000);
 }
@@ -6734,6 +6823,55 @@ function renderQueuedSeriesView(data) {
   });
 }
 
+function pausedProductionState(data) {
+  const episode = data.episode || {};
+  const items = ((data.render_plan || {}).items) || [];
+  const ready = items.filter(
+    (item) => ["done", "reused"].includes(item.status)).length;
+  const tasks = data.tasks || [];
+  const downstreamStages = new Set([
+    "cast", "storyboard", "blocking", "images", "frames", "preflight",
+    "videos", "voice", "edit", "qc",
+  ]);
+  const hasDownstreamTask = tasks.some((task) =>
+    downstreamStages.has(task.stage)
+    && ["done", "failed", "stopped", "cancelling"].includes(task.status));
+  const active = episode.status === "awaiting_script" && !!data.script
+    && (!!data.storyboard || ready > 0 || hasDownstreamTask);
+  return {
+    active,
+    ready,
+    total: items.length,
+    shots: (data.storyboard?.shots || []).length,
+    blockingScenes: (data.blocking?.scenes || []).length,
+    images: Object.keys((data.artifacts || {}).images || {}).length,
+  };
+}
+
+function pausedProductionAccessHtml(state) {
+  if (!state.active) return "";
+  return `<section class="paused-production-access" aria-label="暂停后的制作环节入口">
+    <div class="paused-production-summary">
+      <div><b>⏸ 制作已暂停，已有内容仍可查看</b>
+        <span>暂停只停止继续生成，不会锁住剧本、人物、场景、分镜或图片。
+        「继续补齐」只负责恢复剩余生产。</span></div>
+      <strong>${state.ready}/${state.total || 0} 项已完成 ·
+        ${state.images}/${state.shots || 0} 张分镜图</strong>
+    </div>
+    <nav class="paused-stage-links" aria-label="查看已完成的生产环节">
+      <button type="button" data-paused-access="script"><b>01</b> 剧本与制作圣经</button>
+      <button type="button" data-paused-access="assets"><b>02</b> 人物 / 场景</button>
+      <button type="button" data-paused-access="storyboard"><b>03</b> 分镜列表
+        <span>${state.shots}</span></button>
+      <button type="button" data-paused-access="blocking"><b>04</b> 3D 空间调度
+        <span>${state.blockingScenes}</span></button>
+      <button type="button" data-paused-access="images"><b>05</b> 图片清单
+        <span>${state.ready}/${state.total || 0}</span></button>
+      <button type="button" data-paused-access="canvas"><b>06</b> 全流程画布</button>
+    </nav>
+  </section>`;
+}
+
 async function renderCanvasView(episodeId) {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   let data;
@@ -6742,12 +6880,13 @@ async function renderCanvasView(episodeId) {
   canvasSignature = canvasSig(data);
 
   const ep = data.episode, sb = data.storyboard, script = data.script;
+  const pausedProduction = pausedProductionState(data);
   topbarRight.innerHTML = chip(ep.status);
   if (ep.status === "queued_script") {
     renderQueuedSeriesView(data);
     return;
   }
-  if (ep.status === "awaiting_script" && script) {
+  if (ep.status === "awaiting_script" && script && !pausedProduction.active) {
     renderScriptReview(data, episodeId);
     return;
   }
@@ -6806,6 +6945,7 @@ async function renderCanvasView(episodeId) {
   const firstImageFailure = (data.image_failures || [])[0] || null;
   app.innerHTML = `
   <div class="canvas-view">
+    ${pausedProductionAccessHtml(pausedProduction)}
     ${["failed", "qc_failed"].includes(ep.status) ? `
     <div class="confirm-banner fail-banner">
       <div>
@@ -7016,6 +7156,30 @@ async function renderCanvasView(episodeId) {
   btnTheater.onclick = () => setView("theater");
   btnCanvas.onclick = () => setView("canvas");
   setView(localStorage.getItem("aifos.view") || "theater");
+  app.querySelectorAll("[data-paused-access]").forEach((button) => {
+    button.onclick = () => {
+      const target = button.dataset.pausedAccess;
+      if (target === "script") {
+        showScriptOverlay(data, episodeId);
+      } else if (target === "blocking") {
+        showBlockingOverlay(episodeId);
+      } else if (target === "images") {
+        showPlanOverlay(episodeId);
+      } else if (target === "canvas") {
+        setView("canvas");
+        document.getElementById("canvas-stage-nav")?.scrollIntoView({
+          behavior: "smooth", block: "nearest",
+        });
+      } else {
+        setView("theater");
+        const selector = target === "storyboard"
+          ? ".shot-production-section" : ".production-ledger";
+        requestAnimationFrame(() => document.querySelector(selector)?.scrollIntoView({
+          behavior: "smooth", block: "start",
+        }));
+      }
+    };
+  });
 }
 
 /* ---- 剧本正文(审阅页与生产直播页共用) ---- */
