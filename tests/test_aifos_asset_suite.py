@@ -45,7 +45,7 @@ def _preproduce(app, title="万妖图录", number=1, asset_mode=None):
     return app.projects.get_project(title)
 
 
-def test_story_bible_flows_into_continuity_and_image_prompts(app):
+def test_story_bible_stays_in_continuity_but_not_shot_provider_prompt(app):
     project = _preproduce(app, title="归途")
     episode = app.db.query_one(
         "SELECT * FROM episodes WHERE project_id=? AND number=1",
@@ -67,8 +67,10 @@ def test_story_bible_flows_into_continuity_and_image_prompts(app):
         encoding="utf-8"))
     shot = next(item for item in plan["items"]
                 if item["category"] == "shot_image")
-    assert "故事世界硬约束" in shot["prompt"]
-    assert "本集故事背景" in shot["prompt"]
+    assert "【镜头合同v1】" in shot["prompt"]
+    assert "【单一主动作】" in shot["prompt"]
+    assert "故事世界硬约束" not in shot["prompt"]
+    assert "本集故事背景" not in shot["prompt"]
 
 
 def test_background_extras_skip_design_and_generic_support_gets_one_candidate(app):

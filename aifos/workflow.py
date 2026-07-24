@@ -15,7 +15,7 @@ from pathlib import Path
 from .adapters.claude_script import (is_background_role,
                                      validate_script_bible)
 from .quality_policy import default_quality_policy, resolve_video_quality
-from .prompt_contract import compile_shot_prompt
+from .prompt_contract import compile_shot_prompt, readable_text_required
 
 from .spatial_blocking import (
     build_character_number_map,
@@ -302,11 +302,24 @@ def _state(name, continuity, emotion="专注", pose="站立，重心稳定"):
 
 def _text_asset(shot, rules=None):
     blob = " ".join((shot.get("description", ""), shot.get("prompt", "")))
+    # “无字幕/禁止文字”等负向约束不代表画面里真的有文字载体。
+    # 旧逻辑只要看到“字幕”二字就把它标成 required，随后既拿不到白名单，
+    # 又会诱导图片模型凭空生成文字。
+    searchable = re.sub(
+        r"(?:无|没有|不含|不要|禁止|不得|避免)(?:任何)?"
+        r"(?:画面)?(?:字幕|对白字幕|旁白字幕|台词字幕|文字|Logo|水印)",
+        "",
+        blob,
+        flags=re.IGNORECASE,
+    )
     carriers = (rules or {}).get("text_assets", {}).get(
         "carriers", list(TEXT_CARRIERS))
-    carrier = next((word for word in carriers if word in blob), "")
+    carrier = next((word for word in carriers if word in searchable), "")
     # 仅在存在文字载体时提取书名号/引号内容，避免把口头台词当画面文字。
-    texts = re.findall(r"[《「『【]([^》」』】]{1,40})[》」』】]", blob) if carrier else []
+    texts = re.findall(
+        r"[《「『【]([^》」』】]{1,40})[》」』】]",
+        searchable,
+    ) if carrier else []
     required = bool(carrier)
     return {
         "required": required,
@@ -1066,7 +1079,8 @@ def build_content_review(script, storyboard, continuity):
     for shot in storyboard.get("shots", []):
         characters_ok = set(shot.get("characters", [])) <= cast
         text_asset = shot.get("readable_text") or {}
-        text_ok = not text_asset.get("required") or bool(text_asset.get("locked_by"))
+        text_required = readable_text_required(text_asset)
+        text_ok = not text_required or bool(text_asset.get("locked_by"))
         event_ok = bool(shot.get("script_reference"))
         passed = characters_ok and text_ok and event_ok
         units.append({
@@ -1076,7 +1090,7 @@ def build_content_review(script, storyboard, continuity):
             "character_consistency": characters_ok,
             "costume_consistency": bool(continuity.get("characters")),
             "prop_scene_consistency": bool(continuity.get("scenes")),
-            "text_accuracy": text_ok if text_asset.get("required") else None,
+            "text_accuracy": text_ok if text_required else None,
             "drift_issue": "" if passed else "结构化映射或文字锁定缺失",
             "verdict": "PASS" if passed else "FAIL",
         })

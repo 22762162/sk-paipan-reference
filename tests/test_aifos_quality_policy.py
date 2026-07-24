@@ -41,6 +41,16 @@ def test_formal_shot_defaults_medium_and_critical_risks_upgrade_high():
         _shot(), continuity_anchor=True)["level"] == "high"
 
 
+def test_empty_subtitle_metadata_does_not_waste_high_quality_generation():
+    decision = recommend_shot_image_quality(_shot(
+        readable_text={
+            "required": True,
+            "carrier": "字幕",
+            "whitelist": [],
+        }))
+    assert decision["level"] == "medium"
+
+
 def test_mother_assets_high_drafts_low_and_manual_override_wins():
     policy = normalize_quality_policy()
     assert recommend_asset_quality("character_candidate")["level"] == "high"
@@ -70,4 +80,3 @@ def test_low_quality_is_never_a_formal_video_reference():
     assert formal_reference_allowed("low") is False
     assert formal_reference_allowed("medium") is True
     assert formal_reference_allowed("high") is True
-

@@ -99,8 +99,8 @@ def _preproduce(app, title):
     return project, out
 
 
-def test_canvas_written_and_prompts_carry_relation_lines(app):
-    """出图阶段落盘 relations.json;多人物镜头提示词带人物关系线。"""
+def test_canvas_keeps_relation_graph_outside_compact_image_prompts(app):
+    """关系图继续落盘，但不再把整集关系背景塞进每张图片提示词。"""
     project, out = _preproduce(app, "万妖图录")
     rel_path = out / "relations.json"
     assert rel_path.exists()
@@ -109,11 +109,11 @@ def test_canvas_written_and_prompts_carry_relation_lines(app):
     assert any(n["type"] == "character" for n in rel["nodes"])
     assert any(e["type"] == "co_scene" for e in rel["edges"])
     plan = json.loads((out / "render_plan.json").read_text(encoding="utf-8"))
-    multi = [i for i in plan["items"] if i["category"] == "shot_image"
-             and "画面严格共2人" in i.get("prompt", "")
-             and "人物关系线" in i.get("prompt", "")]
-    # 至少有一个多人物镜头带了关系线(占位剧本必有双人同场镜头)
-    assert multi, "没有任何镜头提示词携带人物关系线"
+    shot_prompts = [
+        item.get("prompt", "") for item in plan["items"]
+        if item["category"] == "shot_image"]
+    assert any("严格共2人" in prompt for prompt in shot_prompts)
+    assert all("人物关系线" not in prompt for prompt in shot_prompts)
 
 
 def test_designs_follow_reference_as_top_standard(app):

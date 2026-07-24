@@ -1,8 +1,11 @@
 from aifos.prompt_contract import (
     PROMPT_CONTRACT_SCHEMA,
+    build_composition_contract,
     compile_shot_prompt,
+    readable_text_required,
 )
 from aifos.adapters.codex_image import build_instruction
+from aifos.workflow import _text_asset, build_content_review
 
 
 def _shot():
@@ -75,3 +78,81 @@ def test_codex_image_bridge_sends_compiled_prompt_not_audit_long_form(tmp_path):
     )
     assert "【镜头合同v1】动作：林晚抬头" in instruction
     assert "审计原文：包含大量制作圣经与背景" not in instruction
+
+
+def test_over_shoulder_tracks_front_and_back_actor_without_double_counting():
+    shot = {
+        "shot_no": 4,
+        "characters": ["朱慈烺", "李继周"],
+        "character_number_map": {
+            "P01": {"actor_id": "P01", "name": "朱慈烺"},
+            "P02": {"actor_id": "P02", "name": "李继周"},
+        },
+        "description": "李继周以半个背影作过肩前景，朱慈烺正面对他说话",
+        "camera": "中近景过肩机位",
+        "dialogue": {"character": "朱慈烺", "dialogue": "照此办理。"},
+        "character_visuals": {
+            "朱慈烺": "白皙清瘦少年、明代交领中衣",
+            "李继周": "束发、深色圆领袍、肩背略宽、手持拂尘",
+        },
+    }
+    composition = build_composition_contract(shot)
+    by_name = {
+        actor["character"]: actor for actor in composition["actors"]}
+
+    assert composition["composition_type"] == "over_shoulder_dialogue"
+    assert composition["expected_primary_count"] == 1
+    assert composition["expected_visible_figure_count"] == 2
+    assert by_name["朱慈烺"]["identity_basis"] == "face"
+    assert by_name["李继周"]["identity_basis"] == "back_silhouette"
+    assert by_name["李继周"]["coverage"] == "partial"
+
+    _, prompt = compile_shot_prompt(shot, location="东宫寝殿")
+    assert "实际可见人形2人" in prompt
+    assert "不得另算成新增人物或人物复制" in prompt
+    assert "束发、深色圆领袍、肩背略宽、手持拂尘" in prompt
+
+
+def test_negative_subtitle_instruction_is_not_a_readable_text_asset():
+    detected = _text_asset({
+        "description": "朱慈烺转身，无字幕、无Logo、无水印",
+        "prompt": "禁止对白字幕",
+    })
+    assert detected["required"] is False
+    assert readable_text_required({
+        "required": True, "carrier": "字幕", "whitelist": [],
+    }) is False
+
+    instruction, _, _ = build_instruction(
+        "image",
+        {
+            "shot_no": 1,
+            "prompt_compact": "朱慈烺转身",
+            "characters": ["朱慈烺"],
+            "character_count": 1,
+            "readable_text": {
+                "required": True, "carrier": "字幕", "whitelist": [],
+            },
+        },
+        "/tmp",
+    )
+    assert "白名单为空" not in instruction
+    assert "画面中不要生成字幕条" in instruction
+
+    review = build_content_review(
+        {},
+        {"shots": [{
+            "unit_id": "U01",
+            "script_reference": "scene:1",
+            "characters": ["朱慈烺"],
+            "readable_text": {
+                "required": True, "carrier": "字幕", "whitelist": [],
+            },
+        }]},
+        {
+            "characters": [{"name": "朱慈烺"}],
+            "scenes": [{"location": "东宫"}],
+        },
+    )
+    assert review["passed"] is True
+    assert review["units"][0]["text_accuracy"] is None

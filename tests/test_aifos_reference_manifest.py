@@ -2,6 +2,7 @@
 
 import pytest
 
+from aifos.adapters.codex_image import build_instruction
 from aifos.app import App
 from aifos.production.api_providers import _local_refs, _reference_entries
 
@@ -93,8 +94,8 @@ def test_manifest_order_matches_provider_submission_order(app, tmp_path):
         pngs[2], pngs[0], pngs[1]]
 
 
-def test_prompt_details_costume_scene(app):
-    """服装细节/妆容/配饰/配色与场景情境细节都必须写进提示词。"""
+def test_prompt_details_keep_visible_costume_but_not_full_scene_plot(app):
+    """保留本镜可见造型，但不把整场剧情动作重复塞给图片模型。"""
     project, episode, script = _preproduce(app)
     payload, shot = _multi_char_shot_payload(app, project, episode)
     prompt = payload["prompt"]
@@ -107,11 +108,58 @@ def test_prompt_details_costume_scene(app):
                        ("palette", "配色")):
         if str(design.get(key) or "").strip():
             assert label in prompt, f"提示词缺少{label}"
-    # 场景情境细节(本场剧情动作)
+    # 整场剧情动作可能覆盖多个镜头，不能重复塞进当前关键帧提示词。
     scene = next(s for s in script["scenes"]
                  if s["scene_no"] == shot["scene_no"])
     if str(scene.get("action") or "").strip():
-        assert "本场情境" in prompt
+        assert "本场情境" not in prompt
+
+
+def test_shot_provider_prompt_contains_current_frame_only(app):
+    project, episode, script = _preproduce(app, title="当前镜头提示词")
+    storyboard, _ = app.projects.latest_document(
+        episode["id"], "storyboard")
+    shot = next(
+        item for item in storyboard["shots"]
+        if item.get("characters"))
+    current = "CURRENT_FRAME_SENTINEL_只画当前举手动作"
+    shot["description"] = current
+    shot["prompt"] = "OLD_STORYBOARD_PROMPT_SENTINEL_不得下发"
+    script["story_background"] = {
+        "prior_events": "FULL_EPISODE_PLOT_SENTINEL_整集前情",
+        "core_conflict": "FULL_EPISODE_CONFLICT_SENTINEL_整集冲突",
+    }
+    scene = next(
+        item for item in script["scenes"]
+        if item["scene_no"] == shot["scene_no"])
+    scene["action"] = "FULL_SCENE_ACTION_SENTINEL_整场剧情"
+    for character in script["characters"]:
+        character["backstory"] = "FULL_BIO_SENTINEL_人物完整身世"
+        character["motivation"] = "FULL_MOTIVATION_SENTINEL_人物长期计划"
+    ctx = {
+        "project": dict(project), "episode": dict(episode),
+        "out_root": app.workspace.artifacts_dir
+        / f"p{project['id']:03d}" / "e001",
+        "script": script, "storyboard": storyboard,
+        "aspect": "9:16", "dims": {"width": 1080, "height": 1920},
+    }
+
+    payload = app.director._shot_payload(ctx, shot)
+    provider_prompt = payload["prompt_compact"]
+    assert current in provider_prompt
+    assert payload["prompt_contract_complete"] is True
+    for forbidden in (
+            "OLD_STORYBOARD_PROMPT_SENTINEL",
+            "FULL_EPISODE_PLOT_SENTINEL",
+            "FULL_EPISODE_CONFLICT_SENTINEL",
+            "FULL_SCENE_ACTION_SENTINEL",
+            "FULL_BIO_SENTINEL",
+            "FULL_MOTIVATION_SENTINEL"):
+        assert forbidden not in provider_prompt
+        assert forbidden not in payload["prompt"]
+    assert all(
+        "backstory" not in facts and "motivation" not in facts
+        for facts in payload["character_background"].values())
 
 
 def test_user_reference_appears_in_manifest(app):
@@ -140,6 +188,30 @@ def test_frame_edit_base_is_always_in_reference_manifest(app, tmp_path):
     assert payload["reference_manifest"][0]["uri"] == str(frame)
     assert payload["reference_manifest"][0]["role"] == "keyframe"
     assert "图1=本镜已通过的关键图" in payload["prompt"]
+
+
+def test_character_asset_reference_table_is_not_duplicated_in_provider_prompt(
+        app, tmp_path):
+    portrait = tmp_path / "portrait.png"
+    portrait.write_bytes(PNG)
+    payload = {
+        "character_sheet": "profile",
+        "sheet_label": "侧面母资产",
+        "art_name": "李继周",
+        "characters": ["李继周"],
+        "prompt": "CURRENT_ASSET_SENTINEL_严格90度侧面",
+        "prompt_contract_complete": True,
+        "identity_references": [{
+            "character": "李继周", "uri": str(portrait),
+        }],
+        "character_refs": [str(portrait)],
+    }
+    app.director._attach_reference_manifest(payload)
+    instruction, _, _ = build_instruction("image", payload, tmp_path)
+
+    assert payload["prompt_compact"] == "CURRENT_ASSET_SENTINEL_严格90度侧面"
+    assert "参考图对照表" not in payload["prompt_compact"]
+    assert instruction.count("参考图对照表(") == 1
 
 
 def test_legacy_unscoped_reference_does_not_pollute_every_shot(app, tmp_path):

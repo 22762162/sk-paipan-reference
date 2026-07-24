@@ -24,3 +24,14 @@ def test_video_feedback_locks_first_and_last_frame_boundary():
     assert result["categories"] == ["continuity"]
     assert "首帧/尾帧" in result["text"]
     assert "只让修订后的画面动起来" in result["text"]
+
+
+def test_back_view_identity_feedback_does_not_force_a_front_face():
+    result = optimize_qc_feedback(
+        ["李继周仅以背面过肩角度入镜，正脸五官不可见，无法核实身份"],
+        mode="image",
+    )
+
+    assert result["categories"] == ["nonface_visibility"]
+    assert "禁止强迫背影人物转成正脸" in result["text"]
+    assert "肩背体型" in result["text"]

@@ -428,7 +428,9 @@ class OpenAIImageProvider(Provider):
             self._quality(payload or {})
         except ProviderError as exc:
             issues.append(str(exc))
-        prompt = str((payload or {}).get("prompt") or "").strip()
+        prompt = str(
+            (payload or {}).get("prompt_compact")
+            or (payload or {}).get("prompt") or "").strip()
         if not prompt:
             issues.append("最终提示词为空")
         entries = _reference_entries(payload or {})
@@ -693,7 +695,9 @@ class SeedreamImageProvider(OpenAIImageProvider):
             self._request_model({**(payload or {}), "model_override": model})
         except ProviderError as exc:
             issues.append(str(exc))
-        if not str((payload or {}).get("prompt") or "").strip():
+        if not str(
+                (payload or {}).get("prompt_compact")
+                or (payload or {}).get("prompt") or "").strip():
             issues.append("最终提示词为空")
         entries = _reference_entries(payload or {})
         if not entries:
