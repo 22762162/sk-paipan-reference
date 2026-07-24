@@ -90,6 +90,68 @@ def test_history_story_builds_its_own_style_without_modern_or_2d_default():
     assert validate_story_analysis(analysis) is None
 
 
+def test_character_image_prompt_is_compact_visual_only_and_idempotent():
+    historical = {
+        "project_title": "大明",
+        "episode_number": 1,
+        "logline": "皇太子穿越首夜准备翻盘",
+        "characters": [{"name": "朱慈烺", "role": "主角"}],
+        "scenes": [{
+            "scene_no": 1, "location": "东宫寝殿",
+            "characters": ["朱慈烺"], "action": "太子伤后醒来",
+            "lines": [],
+        }],
+    }
+    compact = (
+        "电影级半写实精品漫剧，明代皇太子朱慈烺，男，约十五岁清瘦"
+        "少年，白皙清秀、骨相分明，乌黑长发束发，绝无辫发；明代交领"
+        "寝居中衣外覆貂皮大氅；全身正面自然站姿，纯净中性棚拍背景，"
+        "无字幕、无文字、无Logo、无水印")
+    generated = (
+        "单人角色定妆母图：朱慈烺；身份：大明皇太子，父崇祯帝、"
+        "母周皇后；人物处境：距亡国不足108天，谋划说服父皇；"
+        "掌握历史先知与防疫常识、过度依赖残电电脑；"
+        "全身正面自然站姿，纯净中性棚拍背景")
+    raw = {
+        "characters": [{
+            "name": "朱慈烺", "gender": "男",
+            "age_range": "约15岁少年（身体）／附成年现代意识",
+            "identity_facts": "大明皇太子（储君），父崇祯帝，母周皇后",
+            "image_prompt": f"{compact}；{generated}；{generated}",
+            "character_analysis": {
+                "identity_and_class": "大明皇太子（储君）",
+                "current_situation": "距亡国不足108天，谋划说服父皇",
+                "strengths": ["历史先知", "冷静算计"],
+                "flaws": ["依赖残电电脑"],
+            },
+            "visual_dna": {
+                "face_structure": "少年清秀脸型，白皙肤色，骨相分明",
+                "hair_silhouette": "乌黑长发束发，绝无清代辫发",
+                "body_or_occupation_marks": "清瘦少年体格，手指纤细",
+                "clothing_structure": "明代交领寝居中衣外覆貂皮大氅",
+                "clothing_wear_state": "整洁但略显伤后松散",
+                "story_visual_symbol": "笔记本电脑与防疫奏疏",
+                "story_visual_symbol_origin": "穿越与救国计划",
+                "signature_accessory": "貂皮大氅",
+                "temperament_keywords": ["沉郁", "孤勇", "决绝"],
+            },
+        }],
+    }
+    first = build_story_analysis(historical, raw=raw)
+    prompt = first["characters"][0]["image_prompt"]
+    assert prompt == compact
+    assert prompt.count("全身正面自然站姿") == 1
+    assert "父崇祯帝" not in prompt
+    assert "108天" not in prompt
+    assert "说服父皇" not in prompt
+    assert "历史先知" not in prompt
+    assert "残电电脑" not in prompt
+    assert len(prompt) < 700
+
+    second = build_story_analysis(historical, raw=first)
+    assert second["characters"][0]["image_prompt"] == prompt
+
+
 def test_blank_project_style_is_inferred_from_full_imported_script(tmp_path):
     from aifos.script_import import parse_text_script
 

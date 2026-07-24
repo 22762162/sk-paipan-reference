@@ -35,6 +35,31 @@ def test_candidate_api_prompt_locks_project_style_and_identity():
     assert "纯净无场景背景" in prompt
     assert "不得用同一造型只换动作" in prompt
 
+
+def test_complete_character_prompt_is_not_reexpanded_with_story_biography():
+    provider = OpenAIImageProvider("image_api", {"enabled": True})
+    visual = (
+        "单人角色定妆母图：朱慈烺；男，约十五岁；明代束发无辫；"
+        "明代交领中衣；全身正面；纯净中性背景；无文字")
+    payload = {
+        "portrait": True,
+        "portrait_candidate": True,
+        "prompt_contract_complete": True,
+        "style": "电影级半写实精品漫剧",
+        "character_background": {
+            "identity_facts": "父崇祯帝、母周皇后",
+            "motivation": "距亡国不足108天，谋划说服父皇",
+            "image_prompt": visual,
+        },
+    }
+    prompt = provider._semantic_prompt(visual, payload, [])
+    assert prompt.count(visual) == 1
+    assert "人物剧情设定硬约束" not in prompt
+    assert "父崇祯帝" not in prompt
+    assert "108天" not in prompt
+    assert "说服父皇" not in prompt
+
+
 SCRIPT_JSON = {
     "project_title": "万妖图录", "episode_number": 15,
     "episode_title": "夜探古镇", "logline": "少年初遇妖影",
