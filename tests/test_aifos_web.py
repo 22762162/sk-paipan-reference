@@ -63,8 +63,8 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260724-production-progress-2" in html
-    assert "/static/app.js?v=20260724-production-progress-2" in html
+    assert "/static/style.css?v=20260724-production-guidance-3" in html
+    assert "/static/app.js?v=20260724-production-guidance-3" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -240,7 +240,7 @@ def test_index_and_static(server):
         "192x192", "512x512"}
     status, ctype, raw = _request(server["port"], "GET", "/sw.js")
     assert status == 200 and "javascript" in ctype
-    assert b"aifos-mobile-shell-v5" in raw
+    assert b"aifos-mobile-shell-v6" in raw
     assert b'/static/app.js' in raw and b'fetch(request)' in raw
 
 
@@ -517,6 +517,171 @@ def test_episode_production_progress_uses_verified_formal_assets(server):
     assert shots["pending"] == 1
     issues = {item["item_id"]: item for item in progress["issues"]}
     assert issues["shot:3"]["status"] == "stale_active"
+
+
+def test_episode_guidance_pauses_at_incomplete_keyframe_gate(server):
+    """错误的 awaiting_confirm 不能越过正式关键帧和首尾帧门禁。"""
+    app2 = App(server["workspace"])
+    try:
+        project, _ = app2.projects.get_or_create_project("智能生产引导")
+        episode, _ = app2.projects.get_or_create_episode(project["id"], 1)
+        app2.projects.set_episode_status(episode["id"], "awaiting_confirm")
+        app2.projects.save_document(
+            episode["id"], "storyboard", {
+                "shots": [
+                    {
+                        "shot_no": number,
+                        "scene_no": 1,
+                        "description": f"镜头 {number}",
+                    }
+                    for number in range(1, 67)
+                ],
+            })
+        out_root = (
+            app2.workspace.artifacts_dir / f"p{project['id']:03d}" / "e001")
+        artifact = out_root / "images" / "verified.png"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_bytes(b"\x89PNG\r\n\x1a\n" + b"v" * 32)
+        plan_items = []
+        for number in range(1, 67):
+            keyframe_status = (
+                "done" if number <= 54
+                else "pending" if number <= 63
+                else "awaiting_human")
+            item = {
+                "id": f"shot:{number}",
+                "category": "shot_image",
+                "shot_no": number,
+                "label": f"镜头 {number:02d}",
+                "status": keyframe_status,
+            }
+            if keyframe_status == "awaiting_human":
+                item["qc"] = {
+                    "passed": False,
+                    "issues": ["人物身份不一致"],
+                    "hard_failure": number == 64,
+                    "identity_match": number != 64,
+                    "gender_match": True,
+                    "count_match": True,
+                }
+            plan_items.append(item)
+            if number <= 54:
+                app2.assets.register(
+                    project["id"], "image", f"e001_shot{number:03d}",
+                    uri=str(artifact))
+
+            frame_status = "done" if number <= 3 else "pending"
+            plan_items.append({
+                "id": f"frames:{number}",
+                "category": "frames",
+                "shot_no": number,
+                "label": f"镜头 {number:02d} 首尾帧",
+                "status": frame_status,
+            })
+            if number <= 3:
+                for kind in ("first_frame", "last_frame"):
+                    app2.assets.register(
+                        project["id"], kind, f"e001_shot{number:03d}",
+                        uri=str(artifact))
+        app2.director._plan_write(
+            {"out_root": out_root}, {"items": plan_items})
+        episode_id = episode["id"]
+    finally:
+        app2.close()
+
+    status, detail = _json_request(
+        server["port"], "GET", f"/api/episode/{episode_id}")
+    assert status == 200
+    assert detail["episode"]["status"] == "awaiting_confirm"
+    guidance = detail["production_guidance"]
+    assert guidance["state"] == "paused"
+    assert guidance["phase"] == "keyframes"
+    assert guidance["current_step"] == "keyframes"
+    assert guidance["current_step_label"] == "关键帧生产"
+    assert guidance["next_action"] == {
+        "action": "resume_keyframes",
+        "label": "继续生产 9 个非问题关键帧",
+        "count": 9,
+    }
+    assert guidance["actions"]["pending_images"] == {
+        "action": "resume_pending_images",
+        "count": 9,
+        "shot_nos": list(range(55, 64)),
+        "item_ids": [f"shot:{number}" for number in range(55, 64)],
+        "enabled": True,
+        "label": "继续生产 9 个非问题关键帧",
+    }
+    assert guidance["actions"]["resolve_image_issues"] == {
+        "action": "resolve_image_issues",
+        "count": 3,
+        "shot_nos": [64, 65, 66],
+        "item_ids": ["shot:64", "shot:65", "shot:66"],
+        "hard_failure": True,
+        "severity": "mixed",
+        "must_fix_count": 1,
+        "review_or_accept_count": 2,
+        "items": [
+            {
+                "item_id": "shot:64",
+                "shot_no": 64,
+                "hard_failure": True,
+                "severity": "must_fix",
+                "issues": ["人物身份不一致"],
+                "identity_match": False,
+                "gender_match": True,
+                "count_match": True,
+            },
+            *[
+                {
+                    "item_id": f"shot:{number}",
+                    "shot_no": number,
+                    "hard_failure": False,
+                    "severity": "review_or_accept",
+                    "issues": ["人物身份不一致"],
+                    "identity_match": True,
+                    "gender_match": True,
+                    "count_match": True,
+                }
+                for number in (65, 66)
+            ],
+        ],
+        "enabled": True,
+        "label": "修正 1 个必须修复、复核 2 个可放行关键帧",
+    }
+    assert guidance["next_actions"]["resume_pending_images"] == \
+        guidance["actions"]["pending_images"]
+    assert guidance["next_actions"]["resolve_image_issues"] == \
+        guidance["actions"]["resolve_image_issues"]
+    assert guidance["can_start_frames"] is False
+    assert guidance["can_start_videos"] is False
+    assert guidance["can_confirm_seedance"] is False
+
+    keyframes = guidance["stages"]["keyframes"]
+    assert (keyframes["status"], keyframes["usable"], keyframes["total"]) == (
+        "paused", 54, 66)
+    assert keyframes["pending"] == 9
+    assert keyframes["awaiting_human"] == 3
+    frames = guidance["stages"]["frames"]
+    assert (frames["status"], frames["usable"], frames["total"]) == (
+        "blocked", 3, 66)
+    assert frames["blocked_by"] == [
+        "keyframes_pending", "keyframes_awaiting_human"]
+    assert frames["continuity_chains"] == 1
+    assert frames["parallel_capacity"] == 1
+    assert frames["note"] == "当前仅1条连续链，首尾帧将按链串行"
+    videos = guidance["stages"]["videos"]
+    assert (videos["status"], videos["usable"], videos["total"]) == (
+        "blocked", 0, 66)
+    assert videos["blocked_by"] == ["frames_incomplete"]
+    assert [item["code"] for item in guidance["blockers"]] == [
+        "keyframes_pending", "keyframes_awaiting_human"]
+    issue_blocker = guidance["blockers"][1]
+    assert issue_blocker["hard_failure"] is True
+    assert issue_blocker["severity"] == "mixed"
+    assert issue_blocker["must_fix_count"] == 1
+    assert issue_blocker["review_or_accept_count"] == 2
+    assert [item["severity"] for item in guidance["issues"]] == [
+        "must_fix", "review_or_accept", "review_or_accept"]
 
 
 def test_episode_payload_upgrades_legacy_story_analysis(server):

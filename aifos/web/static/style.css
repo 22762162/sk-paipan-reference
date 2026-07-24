@@ -850,6 +850,102 @@ button.canvas-stage-item:hover, button.canvas-stage-item:focus-visible {
   border-color: rgba(102, 121, 143, .38);
   box-shadow: inset 3px 0 0 rgba(102, 121, 143, .55);
 }
+.production-guidance-hero {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; padding: 14px 16px 12px;
+  border-bottom: 1px solid var(--grid);
+  background: linear-gradient(110deg, rgba(57, 135, 229, .1), transparent 58%);
+}
+.production-guidance-hero .production-progress-state b {
+  font-size: 18px; line-height: 1.25;
+}
+.production-guidance-hero .production-progress-state small {
+  color: #9fcaff; font-weight: 650; letter-spacing: .02em;
+}
+.production-guidance-channel {
+  flex: none; display: grid; gap: 3px; min-width: 104px; padding: 8px 11px;
+  border: 1px solid var(--hairline); border-radius: 8px;
+  background: rgba(0, 0, 0, .18); text-align: right;
+}
+.production-guidance-channel small { color: var(--ink-3); font-size: 9.5px; }
+.production-guidance-channel b {
+  color: #dcecff; font-size: 12px; font-variant-numeric: tabular-nums;
+}
+.production-guidance-reason {
+  display: grid; grid-template-columns: 118px minmax(0, 1fr);
+  gap: 12px; align-items: start; padding: 11px 16px;
+  border-bottom: 1px solid var(--grid); background: rgba(250, 178, 25, .045);
+}
+.production-guidance-reason b { color: #ffd77a; font-size: 11px; }
+.production-guidance-reason p {
+  margin: 0; color: var(--ink-2); font-size: 11px; line-height: 1.55;
+}
+.production-stage-chain {
+  display: grid; grid-template-columns: repeat(5, minmax(90px, 1fr));
+  margin: 0; padding: 13px 16px; list-style: none;
+  border-bottom: 1px solid var(--grid);
+}
+.production-stage-chain li {
+  position: relative; display: grid; grid-template-columns: 25px minmax(0, 1fr);
+  gap: 7px; align-items: center; min-width: 0; padding-right: 24px;
+}
+.production-stage-chain li:last-child { padding-right: 0; }
+.production-stage-icon {
+  display: grid; place-items: center; width: 24px; height: 24px;
+  border: 1px solid var(--hairline); border-radius: 50%;
+  background: var(--surface-2); color: var(--ink-3); font-size: 10px; font-weight: 800;
+}
+.production-stage-chain li > div { display: grid; min-width: 0; gap: 2px; }
+.production-stage-chain b {
+  overflow: hidden; color: var(--ink-2); font-size: 10.5px;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.production-stage-chain small {
+  color: var(--ink-3); font-size: 9px; font-variant-numeric: tabular-nums;
+}
+.production-stage-arrow {
+  position: absolute; right: 7px; color: #556579; font-style: normal; font-size: 13px;
+}
+.production-stage-chain .stage-complete .production-stage-icon {
+  border-color: rgba(48, 184, 112, .45); background: rgba(48, 184, 112, .12);
+  color: #8de1ae;
+}
+.production-stage-chain .stage-active .production-stage-icon {
+  border-color: rgba(250, 178, 25, .58); background: rgba(250, 178, 25, .12);
+  color: #ffd77a; box-shadow: 0 0 0 3px rgba(250, 178, 25, .07);
+}
+.production-stage-chain .stage-attention .production-stage-icon {
+  border-color: rgba(208, 59, 59, .62); background: rgba(208, 59, 59, .15);
+  color: #ff9d9d;
+}
+.production-stage-chain .stage-blocked { opacity: .62; }
+.production-stage-note {
+  display: flex; gap: 9px; align-items: baseline; padding: 8px 16px;
+  border-bottom: 1px solid var(--grid); background: rgba(102, 121, 143, .055);
+  color: var(--ink-3); font-size: 9.5px; line-height: 1.45;
+}
+.production-stage-note b { flex: none; color: #b5c6da; }
+.production-guidance-next {
+  display: grid; grid-template-columns: minmax(150px, .65fr) minmax(260px, 1.35fr);
+  gap: 10px 16px; align-items: center; padding: 13px 16px;
+  border-bottom: 1px solid var(--grid); background: rgba(57, 135, 229, .055);
+}
+.production-guidance-next > div:first-child { display: grid; gap: 3px; }
+.production-guidance-next > div:first-child small {
+  color: #9fcaff; font-size: 9.5px; font-weight: 650;
+}
+.production-guidance-next > div:first-child b { color: #fff; font-size: 12px; }
+.production-guidance-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.production-guidance-actions button {
+  min-height: 38px; padding: 8px 12px; font-size: 11px; white-space: normal;
+}
+.production-guidance-actions .guidance-issue-action {
+  border-color: rgba(208, 59, 59, .55); background: rgba(90, 22, 22, .25);
+  color: #ffb4b4;
+}
+.production-guidance-safety {
+  grid-column: 1 / -1; color: var(--ink-3); font-size: 9.5px; text-align: right;
+}
 .production-progress-head {
   display: grid; grid-template-columns: minmax(0, 1fr) minmax(210px, 30%);
   gap: 16px; align-items: center; padding: 12px;
@@ -2858,6 +2954,29 @@ textarea:focus-visible, select:focus-visible {
   .production-ledger-heading { display: grid; grid-template-columns: minmax(0, 1fr); padding: 12px; }
   .production-ledger-current { width: fit-content; }
   .production-progress-panel { margin: 10px 12px 4px; }
+  .production-guidance-hero {
+    align-items: flex-start; padding: 12px; gap: 8px;
+  }
+  .production-guidance-hero .production-progress-state b { font-size: 16px; }
+  .production-guidance-channel { min-width: 86px; padding: 7px 8px; }
+  .production-guidance-reason {
+    grid-template-columns: minmax(0, 1fr); gap: 5px; padding: 10px 12px;
+  }
+  .production-stage-chain {
+    grid-template-columns: repeat(5, 104px); overflow-x: auto;
+    padding: 12px; scroll-snap-type: x proximity; scrollbar-width: none;
+  }
+  .production-stage-chain::-webkit-scrollbar { display: none; }
+  .production-stage-chain li { scroll-snap-align: start; padding-right: 22px; }
+  .production-stage-note { display: grid; gap: 3px; padding: 8px 12px; }
+  .production-guidance-next {
+    grid-template-columns: minmax(0, 1fr); padding: 12px; gap: 10px;
+  }
+  .production-guidance-actions {
+    display: grid; grid-template-columns: minmax(0, 1fr); justify-content: stretch;
+  }
+  .production-guidance-actions button { width: 100%; min-height: 44px; }
+  .production-guidance-safety { text-align: left; }
   .production-progress-head { grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 10px; }
   .production-progress-kpis {
     display: flex; overflow-x: auto; scroll-snap-type: x proximity;

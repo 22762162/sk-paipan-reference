@@ -863,6 +863,430 @@ def _production_progress(app, episode, render_plan):
     }
 
 
+def _production_guidance(app, episode, storyboard, render_plan, progress):
+    """根据正式资产门禁给出下一步，而不是照抄可能过期的 episode.status。
+
+    关键帧、首尾帧、视频是严格串行的三道门。某一阶段即使已有部分产物，
+    只要上游没有全部形成可读取的正式资产，就只能展示为 blocked，不能
+    因为数据库曾被写成 awaiting_confirm 而误导用户进入 Seedance。
+    """
+    categories = {
+        item["category"]: item
+        for item in (progress or {}).get("categories", [])
+    }
+    plan_items = list((render_plan or {}).get("items") or [])
+    overall = (progress or {}).get("overall") or {}
+    live_run = bool(overall.get("running"))
+    current_stage = str(overall.get("current_stage") or "")
+    episode_number = int(episode["number"])
+    project_id = int(episode["project_id"])
+
+    storyboard_shots = list((storyboard or {}).get("shots") or [])
+    storyboard_numbers = {
+        int(shot["shot_no"])
+        for shot in storyboard_shots
+        if shot.get("shot_no") is not None
+    }
+    plan_numbers = {
+        int(item["shot_no"])
+        for item in plan_items
+        if item.get("category") == "shot_image"
+        and item.get("shot_no") is not None
+    }
+    shot_numbers = storyboard_numbers or plan_numbers
+    total_shots = len(shot_numbers)
+    if not total_shots:
+        total_shots = max(
+            int(categories.get("shot_image", {}).get("total") or 0),
+            int(categories.get("frames", {}).get("total") or 0),
+        )
+
+    def valid_uri(uri):
+        uri = str(uri or "").strip()
+        return bool(uri) and (
+            uri.startswith(("http://", "https://")) or Path(uri).is_file())
+
+    active_assets = [
+        row for row in app.assets.active_list(project_id)
+        if valid_uri(row["uri"])
+    ]
+    asset_names = {}
+    for row in active_assets:
+        asset_names.setdefault(str(row["kind"]), set()).add(str(row["name"]))
+
+    def stage_from_category(key, label):
+        source = categories.get(key) or {}
+        total = max(int(source.get("total") or 0), total_shots)
+        usable = int(source.get("usable") or 0)
+        return {
+            "key": key,
+            "label": label,
+            "status": "paused",
+            "total": total,
+            "usable": usable,
+            "pending": int(source.get("pending") or 0),
+            "generating": int(source.get("generating") or 0),
+            "retrying": int(source.get("retrying") or 0),
+            "awaiting_human": int(source.get("awaiting_human") or 0),
+            "failed": int(source.get("failed") or 0),
+            "remaining": max(0, total - usable),
+            "percent": round(usable * 100 / total, 1) if total else 0,
+            "blocked_by": [],
+            "reason": "",
+        }
+
+    keyframes = stage_from_category("shot_image", "关键帧")
+    frames = stage_from_category("frames", "首尾帧")
+    if shot_numbers:
+        expected_names = {
+            f"e{episode_number:03d}_shot{shot_no:03d}"
+            for shot_no in shot_numbers
+        }
+        keyframes["usable"] = len(
+            expected_names & asset_names.get("image", set()))
+        frames["usable"] = len(
+            expected_names
+            & asset_names.get("first_frame", set())
+            & asset_names.get("last_frame", set()))
+        for stage in (keyframes, frames):
+            stage["remaining"] = max(0, stage["total"] - stage["usable"])
+            stage["percent"] = round(
+                stage["usable"] * 100 / stage["total"], 1
+            ) if stage["total"] else 0
+            accounted = (
+                stage["generating"] + stage["retrying"]
+                + stage["awaiting_human"] + stage["failed"])
+            stage["pending"] = max(
+                stage["pending"], stage["remaining"] - accounted)
+    continuity_keys = {
+        str(shot.get("scene_no") or f"shot:{shot.get('shot_no')}")
+        for shot in storyboard_shots
+    }
+    continuity_chains = len(continuity_keys)
+    image_limit = int(
+        ((overall.get("parallelism") or {}).get("image") or {}).get(
+            "limit") or 1)
+    frames["continuity_chains"] = continuity_chains
+    frames["parallel_capacity"] = min(
+        image_limit, continuity_chains) if continuity_chains else 0
+    frames["note"] = (
+        "当前仅1条连续链，首尾帧将按链串行"
+        if continuity_chains == 1
+        else (
+            f"当前有{continuity_chains}条连续链，最多并行"
+            f"{frames['parallel_capacity']}路"
+            if continuity_chains else "尚未识别到可生产的连续链"
+        )
+    )
+
+    video_prefix = f"e{episode_number:03d}_shot"
+    usable_videos = sum(
+        1 for name in asset_names.get("video", set())
+        if name.startswith(video_prefix))
+    videos = {
+        "key": "videos",
+        "label": "Seedance 视频",
+        "status": "paused",
+        "total": total_shots,
+        "usable": min(usable_videos, total_shots),
+        "pending": max(0, total_shots - usable_videos),
+        "generating": int(
+            ((overall.get("parallelism") or {}).get("video") or {}).get(
+                "active") or 0),
+        "retrying": 0,
+        "awaiting_human": 0,
+        "failed": 0,
+        "remaining": max(0, total_shots - usable_videos),
+        "percent": round(usable_videos * 100 / total_shots, 1)
+        if total_shots else 0,
+        "blocked_by": [],
+        "reason": "",
+    }
+
+    keyframe_assets = {
+        name for name in asset_names.get("image", set())
+    }
+    pending_shots = []
+    issue_shots = []
+    pending_item_ids = []
+    issue_item_ids = []
+    issue_details = []
+    planned_shots = set()
+    for item in plan_items:
+        if item.get("category") != "shot_image":
+            continue
+        try:
+            shot_no = int(item["shot_no"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        planned_shots.add(shot_no)
+        asset_name = f"e{episode_number:03d}_shot{shot_no:03d}"
+        if asset_name in keyframe_assets:
+            continue
+        status = str(item.get("status") or "pending")
+        if status in ("awaiting_human", "failed"):
+            issue_shots.append(shot_no)
+            item_id = str(item.get("id") or f"shot:{shot_no}")
+            issue_item_ids.append(item_id)
+            qc = item.get("qc") or {}
+            hard_failure = qc.get("hard_failure") is not False
+            issue_details.append({
+                "item_id": item_id,
+                "shot_no": shot_no,
+                "hard_failure": hard_failure,
+                "severity": (
+                    "must_fix" if hard_failure else "review_or_accept"),
+                "issues": list(qc.get("issues") or (
+                    [item["error"]] if item.get("error") else [])),
+                "identity_match": qc.get("identity_match"),
+                "gender_match": qc.get("gender_match"),
+                "count_match": qc.get("count_match"),
+            })
+        else:
+            pending_shots.append(shot_no)
+            pending_item_ids.append(str(
+                item.get("id") or f"shot:{shot_no}"))
+    for shot_no in sorted(shot_numbers - planned_shots):
+        asset_name = f"e{episode_number:03d}_shot{shot_no:03d}"
+        if asset_name not in keyframe_assets:
+            pending_shots.append(shot_no)
+            pending_item_ids.append(f"shot:{shot_no}")
+    pending_shots = sorted(set(pending_shots))
+    issue_shots = sorted(set(issue_shots))
+    pending_item_ids = list(dict.fromkeys(pending_item_ids))
+    issue_item_ids = list(dict.fromkeys(issue_item_ids))
+    issue_details.sort(key=lambda item: item["shot_no"])
+    must_fix_issues = [
+        item for item in issue_details if item["severity"] == "must_fix"]
+    review_issues = [
+        item for item in issue_details
+        if item["severity"] == "review_or_accept"]
+
+    keyframes_ready = bool(
+        keyframes["total"]
+        and keyframes["usable"] >= keyframes["total"])
+    frames_ready = bool(
+        frames["total"] and frames["usable"] >= frames["total"])
+    videos_ready = bool(
+        videos["total"] and videos["usable"] >= videos["total"])
+
+    image_stage_active = (
+        live_run and (
+            keyframes["generating"] > 0
+            or keyframes["retrying"] > 0
+            or current_stage in {
+                "images", "shot_image", "redo_items", "regen_image",
+                "produce",
+            }
+        )
+    )
+    if keyframes_ready:
+        keyframes["status"] = "ready"
+        keyframes["reason"] = "全部关键帧均已登记为可读取的正式资产。"
+    elif image_stage_active:
+        keyframes["status"] = "active"
+        keyframes["reason"] = "关键帧生产任务正在运行。"
+    elif keyframes["pending"] > 0 or pending_shots:
+        keyframes["status"] = "paused"
+        keyframes["reason"] = (
+            f"当前没有运行任务；还有 {len(pending_shots) or keyframes['pending']} "
+            "个镜头可继续生产。")
+    elif keyframes["awaiting_human"] or keyframes["failed"]:
+        keyframes["status"] = "blocked"
+        keyframes["reason"] = "剩余关键帧均需人工处理，暂时无法自动进入下一阶段。"
+    else:
+        keyframes["status"] = "blocked"
+        keyframes["reason"] = "未找到完整的关键帧正式资产或可继续的生产项。"
+
+    keyframe_blockers = []
+    if pending_shots or keyframes["pending"]:
+        keyframe_blockers.append("keyframes_pending")
+    if issue_shots or keyframes["awaiting_human"] or keyframes["failed"]:
+        keyframe_blockers.append("keyframes_awaiting_human")
+
+    if not keyframes_ready:
+        frames["status"] = "blocked"
+        frames["blocked_by"] = keyframe_blockers or ["keyframes_incomplete"]
+        frames["reason"] = "关键帧未全部通过并登记，首尾帧生产门禁未开放。"
+    elif frames_ready:
+        frames["status"] = "ready"
+        frames["reason"] = "全部镜头的首帧和尾帧正式资产均已齐全。"
+    elif (live_run and (
+            frames["generating"] > 0 or frames["retrying"] > 0
+            or current_stage in {"frames", "first_frame", "last_frame"})):
+        frames["status"] = "active"
+        frames["reason"] = "首尾帧生产任务正在运行。"
+    elif frames["pending"] > 0:
+        frames["status"] = "paused"
+        frames["reason"] = "关键帧门禁已通过，可继续生产剩余首尾帧。"
+    else:
+        frames["status"] = "blocked"
+        frames["reason"] = "首尾帧仍有失败或待人工处理项。"
+
+    if not frames_ready:
+        videos["status"] = "blocked"
+        videos["blocked_by"] = ["frames_incomplete"]
+        videos["reason"] = "首尾帧未全部齐全，Seedance 视频生产门禁未开放。"
+    elif videos_ready:
+        videos["status"] = "ready"
+        videos["reason"] = "全部镜头视频正式资产已齐全。"
+    elif (live_run and current_stage in {
+            "videos", "video", "video_regen", "seedance"}):
+        videos["status"] = "active"
+        videos["reason"] = "Seedance 视频任务正在运行。"
+    else:
+        videos["status"] = "paused"
+        videos["reason"] = "首尾帧门禁已通过，可开始 Seedance 视频生产。"
+
+    blockers = []
+    pending_count = len(pending_shots) or keyframes["pending"]
+    issue_count = len(issue_shots) or (
+        keyframes["awaiting_human"] + keyframes["failed"])
+    if pending_count:
+        blockers.append({
+            "code": "keyframes_pending",
+            "stage": "keyframes",
+            "count": pending_count,
+            "shot_nos": pending_shots,
+            "message": f"还有 {pending_count} 个关键帧尚未生产。",
+        })
+    if issue_count:
+        severity = (
+            "mixed" if must_fix_issues and review_issues
+            else "must_fix" if must_fix_issues else "review_or_accept")
+        blockers.append({
+            "code": "keyframes_awaiting_human",
+            "stage": "keyframes",
+            "count": issue_count,
+            "shot_nos": issue_shots,
+            "hard_failure": bool(must_fix_issues),
+            "severity": severity,
+            "must_fix_count": len(must_fix_issues),
+            "review_or_accept_count": len(review_issues),
+            "message": f"还有 {issue_count} 个关键帧二次质检未通过，需人工处理。",
+        })
+    if not keyframes_ready:
+        current = keyframes
+        phase = "keyframes"
+    elif not frames_ready:
+        current = frames
+        phase = "frames"
+    elif not videos_ready:
+        current = videos
+        phase = "videos"
+    else:
+        current = None
+        phase = "review"
+
+    if current is None:
+        state = "ready"
+        current_step_label = "成片复核"
+        headline = "视频资产已齐全，可以进入成片复核"
+        reason = "关键帧、首尾帧和视频三道正式资产门禁均已通过。"
+        next_action = {
+            "action": "review_videos",
+            "label": "进入成片复核",
+            "count": videos["usable"],
+        }
+    else:
+        state = current["status"]
+        current_step_label = {
+            "keyframes": "关键帧生产",
+            "frames": "首尾帧生产",
+            "videos": "Seedance 视频生产",
+        }[phase]
+        headline = {
+            "active": f"{current_step_label}正在进行",
+            "paused": f"{current_step_label}已暂停",
+            "blocked": f"{current_step_label}被门禁拦截",
+            "ready": f"{current_step_label}已完成",
+        }[state]
+        reason = current["reason"]
+        if phase == "keyframes" and pending_count:
+            next_action = {
+                "action": "resume_keyframes",
+                "label": f"继续生产 {pending_count} 个非问题关键帧",
+                "count": pending_count,
+            }
+        elif phase == "keyframes" and issue_count:
+            next_action = {
+                "action": "resolve_image_issues",
+                "label": f"处理 {issue_count} 个问题关键帧",
+                "count": issue_count,
+            }
+        elif phase == "frames":
+            next_action = {
+                "action": "resume_frames",
+                "label": f"继续生产 {frames['remaining']} 组首尾帧",
+                "count": frames["remaining"],
+            }
+        else:
+            next_action = {
+                "action": "start_videos",
+                "label": f"开始生产 {videos['remaining']} 个视频",
+                "count": videos["remaining"],
+            }
+
+    resume_pending_images = {
+        "action": "resume_pending_images",
+        "count": pending_count,
+        "shot_nos": pending_shots,
+        "item_ids": pending_item_ids,
+        "enabled": bool(pending_count and not live_run),
+        "label": f"继续生产 {pending_count} 个非问题关键帧",
+    }
+    resolve_image_issues = {
+        "action": "resolve_image_issues",
+        "count": issue_count,
+        "shot_nos": issue_shots,
+        "item_ids": issue_item_ids,
+        "hard_failure": bool(must_fix_issues),
+        "severity": (
+            "mixed" if must_fix_issues and review_issues
+            else "must_fix" if must_fix_issues
+            else "review_or_accept" if review_issues else "none"),
+        "must_fix_count": len(must_fix_issues),
+        "review_or_accept_count": len(review_issues),
+        "items": issue_details,
+        "enabled": bool(issue_count),
+        "label": (
+            f"修正 {len(must_fix_issues)} 个必须修复、"
+            f"复核 {len(review_issues)} 个可放行关键帧"
+            if issue_count else "没有待处理的问题关键帧"),
+    }
+    return {
+        "state": state,
+        "phase": phase,
+        "current_step": phase,
+        "current_step_label": current_step_label,
+        "headline": headline,
+        "reason": reason,
+        "next_action": next_action,
+        "next_actions": {
+            "resume_pending_images": resume_pending_images,
+            "resolve_image_issues": resolve_image_issues,
+        },
+        "blockers": blockers,
+        "issues": issue_details,
+        "actions": {
+            "pending_images": {
+                **resume_pending_images,
+            },
+            "resolve_image_issues": {
+                **resolve_image_issues,
+            },
+        },
+        "can_start_frames": keyframes_ready,
+        "can_start_videos": keyframes_ready and frames_ready,
+        "can_confirm_seedance": keyframes_ready and frames_ready,
+        "stages": {
+            "keyframes": keyframes,
+            "frames": frames,
+            "videos": videos,
+        },
+    }
+
+
 def _episode_payload(app, episode_id):
     episode = app.projects.get_episode(episode_id)
     if episode is None:
@@ -1009,6 +1433,8 @@ def _episode_payload(app, episode_id):
                 app, scene.get("svg_uri", ""))
     production_progress = _production_progress(
         app, episode, render_plan)
+    production_guidance = _production_guidance(
+        app, episode, storyboard, render_plan, production_progress)
     return {
         "build": BUILD,
         "episode": dict(episode),
@@ -1053,6 +1479,7 @@ def _episode_payload(app, episode_id):
         "video_qc_report_version": video_qc_report_v,
         "render_plan": render_plan,
         "production_progress": production_progress,
+        "production_guidance": production_guidance,
         "image_failures": image_failures,
         "relations": relations,
         "image_acceleration": {
