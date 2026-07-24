@@ -37,6 +37,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from .. import __version__
 from ..app import App
 from ..asset_center import IMAGE_KINDS
+from ..lessons import project_lessons
 from ..updater import (check_and_update, current_build, repo_root,
                        restart_process, start_auto_updater)
 from ..errors import AifosError
@@ -1503,6 +1504,7 @@ def _episode_payload(app, episode_id):
         "production_guidance": production_guidance,
         "image_failures": image_failures,
         "relations": relations,
+        "lessons": project_lessons(app.assets, project["id"], limit=20),
         "image_acceleration": {
             "summary": image_acceleration["summary"],
             "default_provider": image_acceleration["default_provider"],
