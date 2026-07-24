@@ -105,6 +105,11 @@ def test_index_and_static(server):
     assert "查看提示词".encode() in app_js
     assert b"/api/video/references" in app_js
     assert b"/api/redo_video" in app_js
+    assert "全部重新生成".encode() in app_js
+    assert b"episode-rebuild-all" in app_js
+    assert b"btn-rebuild-all-recovery" in app_js
+    assert b"force: true" in app_js
+    assert "armConfirm(button, \"全部重新生成\"".encode() in app_js
     assert "质检没有通过的原因".encode() in app_js
     assert "本次质检/重画实际附上的参考图".encode() in app_js
     assert "待生产图片批量 API 加速".encode() in app_js
