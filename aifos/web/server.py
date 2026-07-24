@@ -1346,6 +1346,8 @@ def make_handler(workspace, jobs):
                     return self._redo_mock()
                 if parsed.path == "/api/qc_item":
                     return self._qc_item()
+                if parsed.path == "/api/qc_override":
+                    return self._qc_override()
                 if parsed.path == "/api/qc_all":
                     return self._qc_all()
                 if parsed.path == "/api/redo_items":
@@ -2512,6 +2514,31 @@ def make_handler(workspace, jobs):
                 return self._error(400, str(exc))
             return self._json(report)
 
+        def _qc_override(self):
+            """人工通过轻微问题图:{episode_id,item_ids,note,only_failed}."""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            if jobs.running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，请先安全暂停后再人工通过问题图")
+            item_ids = body.get("item_ids")
+            if item_ids is not None and not isinstance(item_ids, list):
+                return self._error(400, "item_ids 必须是数组")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.manual_qc_pass(
+                        title, number, item_ids=item_ids,
+                        only_failed=bool(body.get("only_failed")),
+                        note=str(body.get("note") or "").strip()))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
         def _qc_all(self):
             """批量质检:后台逐张核对(可暂停)。"""
             body = self._read_body()
@@ -2617,6 +2644,9 @@ def make_handler(workspace, jobs):
             if found is None:
                 return self._error(404, "剧集不存在")
             title, number = found
+            if jobs.running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，请先安全暂停后再批量优化修改")
             item_ids = body.get("item_ids") or []
             only_failed = bool(body.get("only_failed"))
             quality = body.get("quality")

@@ -8079,7 +8079,8 @@ class Director:
             targets = [i["id"] for i in plan["items"]
                        if (i.get("qc") or {}).get("passed") is False
                        and i.get("category") in self.SHOT_QC_CATEGORIES
-                       and i.get("status") in ("done", "reused")]
+                       and i.get("status") in (
+                           "done", "reused", "awaiting_human", "failed")]
         else:
             targets = [tid for tid in (item_ids or []) if tid in by_id]
         if not targets:
@@ -8238,6 +8239,143 @@ class Director:
         return {"status": "done", "total": total, "redone": redone,
                 "failed": failed, "checked": checked,
                 "qc_passed": qc_passed, "qc_failed": qc_failed}
+
+    def manual_qc_pass(self, project_title, episode_number, item_ids=None,
+                       only_failed=False, note=""):
+        """人工放行轻微问题图,保留原始质检问题和覆盖审计记录。
+
+        人工通过不是删除质检结果: ``qc.issues`` 原样保留,同时写入
+        ``manual_override``。二次质检失败稿若只有 ``output_uri``,这里会
+        将该稿登记为正式镜头资产,这样放行后可以继续断点生产。
+        """
+        project, episode = self._episode_ctx(project_title, episode_number)
+        ctx = {"project": dict(project), "episode": dict(episode),
+               "out_root": self._episode_dir(project, episode)}
+        plan = self._plan_read(ctx)
+        by_id = {item.get("id"): item for item in plan.get("items", [])}
+        if only_failed:
+            targets = [item.get("id") for item in plan.get("items", [])
+                       if item.get("category") in self.SHOT_QC_CATEGORIES
+                       and (item.get("qc") or {}).get("passed") is False
+                       and item.get("status") in (
+                           "done", "reused", "awaiting_human", "failed")]
+        else:
+            targets = list(dict.fromkeys(
+                str(value) for value in (item_ids or [])
+                if str(value).strip()))
+        targets = [item_id for item_id in targets if item_id in by_id]
+        if len(targets) > 200:
+            raise AifosError("单次最多人工放行 200 张图片")
+        if not targets:
+            return {"status": "done", "passed": 0, "skipped": 0,
+                    "note": "没有需要人工放行的质检失败图"}
+
+        storyboard, _ = self.projects.latest_document(
+            episode["id"], "storyboard")
+        ctx["storyboard"] = storyboard or {"shots": []}
+        script, _ = self.projects.latest_document(episode["id"], "script")
+        ctx["script"] = script or {"scenes": [], "characters": []}
+        message = str(note or "人工复核通过：问题不影响本集观感，继续后续生产")
+        passed, skipped = 0, 0
+        skipped_items = []
+
+        def valid_uri(value):
+            value = str(value or "").strip()
+            return bool(value) and (
+                value.startswith(("http://", "https://"))
+                or Path(value).is_file())
+
+        for item_id in targets:
+            item = by_id[item_id]
+            category = item.get("category")
+            if category not in self.SHOT_QC_CATEGORIES:
+                skipped += 1
+                skipped_items.append({"item_id": item_id,
+                                      "reason": "该条目不是镜头图或首尾帧"})
+                continue
+            qc = dict(item.get("qc") or {})
+            if qc.get("passed") is True:
+                skipped += 1
+                skipped_items.append({"item_id": item_id,
+                                      "reason": "该图已经通过质检"})
+                continue
+            uri, _ = self._plan_item_asset(
+                project["id"], episode["number"], item)
+            # 二次失败稿没有正式资产时,允许用户明确放行 output_uri;
+            # 没有真实文件则拒绝把“通过”写成空壳状态。
+            candidate = item.get("output_uri")
+            promote_candidate = (
+                category == "shot_image"
+                and item.get("status") in ("awaiting_human", "failed")
+                and valid_uri(candidate))
+            if promote_candidate or (not uri and valid_uri(candidate)):
+                uri = str(candidate) if category == "shot_image" else uri
+                if category == "shot_image":
+                    shot = next((value for value in ctx["storyboard"].get(
+                        "shots", []) if int(value.get("shot_no", -1))
+                        == int(item.get("shot_no"))), None)
+                    if shot is None:
+                        uri = None
+                    else:
+                        decision = {
+                            "level": item.get("image_quality") or "medium",
+                            "recommended": item.get(
+                                "recommended_quality")
+                            or item.get("image_quality") or "medium",
+                            "source": "manual_override",
+                            "rule": item.get("quality_rule") or "",
+                            "reasons": list(item.get("quality_reasons")
+                                            or []),
+                        }
+                        self.assets.register(
+                            project["id"], "image",
+                            self._shot_name(ctx, int(item["shot_no"])),
+                            uri=uri,
+                            meta=self._shot_image_meta(
+                                ctx, shot, decision,
+                                {"manual_qc_override": True,
+                                 "manual_qc_note": message}),
+                            new_version=True)
+            if not uri:
+                skipped += 1
+                skipped_items.append({"item_id": item_id,
+                                      "reason": "没有可用图片，不能人工放行"})
+                continue
+            if category == "frames":
+                frame_name = self._shot_name(
+                    ctx, int(item.get("shot_no")))
+                last = self.assets.latest(
+                    project["id"], "last_frame", frame_name)
+                if last is None or not valid_uri(last["uri"]):
+                    skipped += 1
+                    skipped_items.append({
+                        "item_id": item_id,
+                        "reason": "首尾帧不完整，不能人工放行"})
+                    continue
+            issues = list(qc.get("issues") or [])
+            qc.update({
+                "passed": True,
+                "manual_override": True,
+                "manual_decision": "accepted",
+                "manual_note": message[:1200],
+                "manual_at": now(),
+                "manual_original_issues": issues,
+                "awaiting_human": False,
+                "auto_repair_exhausted": False,
+            })
+            item["qc"] = qc
+            item["status"] = "done"
+            item["error"] = ""
+            passed += 1
+
+        plan["updated_at"] = now()
+        self._plan_write(ctx, plan)
+        self.log.info(
+            "director",
+            f"人工放行质检问题图:{passed} 张,跳过 {skipped} 张")
+        return {"status": "done", "passed": passed, "skipped": skipped,
+                "skipped_items": skipped_items,
+                "note": message[:1200]}
 
     def redo_video(self, project_title, episode_number, shot_no, feedback):
         """人工确认问题后重生成指定视频镜头并重新质检。

@@ -121,6 +121,13 @@ def test_index_and_static(server):
     assert b"force: true" in app_js
     assert "armConfirm(button, \"全部重新生成\"".encode() in app_js
     assert "质检没有通过的原因".encode() in app_js
+    assert "批量优化修改".encode() in app_js
+    assert "人工通过".encode() in app_js
+    assert "打开清单批量优化".encode() in app_js
+    assert b"data-image-failure-pass" in app_js
+    assert b"planSelectQcFailed" in app_js
+    assert b"ensureBatchRevisionCheckpoint" in app_js
+    assert b"/api/qc_override" in app_js
     assert "本次质检/重画实际附上的参考图".encode() in app_js
     assert "待人工问题清单".encode() in app_js
     assert b"imageFailurePanelHtml" in app_js
@@ -208,6 +215,9 @@ def test_index_and_static(server):
     assert b".video-ref-card" in style_css
     assert b".video-ref-status" in style_css
     assert b".plan-ref-gallery" in style_css
+    assert b".qc-manual-pass" in style_css
+    assert b".plan-qc-accept" in style_css
+    assert b".image-failure-pass" in style_css
     assert b".acceleration-panel" in style_css
     assert b".image-accel-livebar" in style_css
     assert b".accel-gates" in style_css
@@ -354,6 +364,50 @@ def test_episode_exposes_image_failures_with_artifact_urls(server):
     assert failed_url.startswith("/artifacts/")
     status, ctype, raw = _request(server["port"], "GET", failed_url)
     assert status == 200 and ctype.startswith("image/png") and raw
+
+
+def test_manual_qc_override_api_promotes_problem_image(server):
+    """人工通过接口一次处理问题图，并保留质检审计字段。"""
+    app2 = App(server["workspace"])
+    try:
+        project, _ = app2.projects.get_or_create_project("人工通过接口")
+        episode, _ = app2.projects.get_or_create_episode(project["id"], 1)
+        app2.projects.save_document(
+            episode["id"], "script",
+            {"scenes": [{"scene_no": 1, "location": "室内"}],
+             "characters": []})
+        app2.projects.save_document(
+            episode["id"], "storyboard",
+            {"shots": [{"shot_no": 1, "scene_no": 1,
+                         "characters": [], "description": "停顿"}]})
+        out_root = (app2.workspace.artifacts_dir / f"p{project['id']:03d}"
+                    / "e001")
+        failed = out_root / "images" / "shot_001.failed.png"
+        failed.parent.mkdir(parents=True, exist_ok=True)
+        failed.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 32)
+        app2.director._plan_write({"out_root": out_root}, {"items": [{
+            "id": "shot:1", "category": "shot_image", "shot_no": 1,
+            "label": "镜头 01", "status": "awaiting_human",
+            "output_uri": str(failed),
+            "qc": {"passed": False, "issues": ["轻微构图偏差"]},
+        }]})
+        episode_id = episode["id"]
+    finally:
+        app2.close()
+    status, result = _json_request(server["port"], "POST", "/api/qc_override", {
+        "episode_id": episode_id, "item_ids": ["shot:1"],
+        "note": "人工确认可接受",
+    })
+    assert status == 200 and result["passed"] == 1
+    app3 = App(server["workspace"])
+    try:
+        plan = json.loads((out_root / "render_plan.json").read_text(
+            encoding="utf-8"))
+    finally:
+        app3.close()
+    item = plan["items"][0]
+    assert item["status"] == "done"
+    assert item["qc"]["manual_override"] is True
 
 
 def test_episode_production_progress_uses_verified_formal_assets(server):

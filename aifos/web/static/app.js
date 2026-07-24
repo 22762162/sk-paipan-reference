@@ -2881,6 +2881,8 @@ function planIsMock(item) {
 function planQcBadge(item) {
   const qc = item.qc;
   if (!qc) return "";
+  if (qc.passed && qc.manual_override)
+    return `<span class="plan-st st-manual" title="人工确认通过，原质检问题仍保留在审计记录">人工通过✓</span>`;
   if (qc.passed)
     return `<span class="plan-st st-qc-ok" title="视觉质检通过${qc.attempts > 1 ? `(重画 ${qc.attempts - 1} 次后通过)` : ""}">质检✓</span>`;
   return `<span class="plan-st st-mock" title="${esc((qc.issues || []).join(";"))}">⚠ 质检未过</span>`;
@@ -2888,7 +2890,13 @@ function planQcBadge(item) {
 
 function planQcIssuesHtml(item) {
   const qc = item.qc;
-  if (!qc || qc.passed || !(qc.issues || []).length) return "";
+  if (!qc) return "";
+  if (qc.passed && qc.manual_override) {
+    const issues = qc.manual_original_issues || qc.issues || [];
+    return `<div class="qc-manual-pass"><b>人工通过：</b>${esc(qc.manual_note || "问题不影响本集观感，继续后续生产")}
+      ${issues.length ? `<span>原质检提示（已接受）：${esc(issues.join("；"))}</span>` : ""}</div>`;
+  }
+  if (qc.passed || !(qc.issues || []).length) return "";
   const revision = qc.revision_feedback
     ? `<div class="qc-revision"><b>自动优化修订：</b>${esc(qc.revision_feedback)}</div>` : "";
   return `<div class="plan-err qc-fail-reason"><b>质检没有通过的原因：</b>${esc(qc.issues.join("；"))}
@@ -3026,6 +3034,9 @@ function planItemHtml(data, item, editable) {
   const thumbs = planItemThumbs(data, item);
   const st = item.status || "pending";
   const canEdit = editable && item.category !== "character_candidate";
+  const selectable = canEdit && ["done", "reused", "awaiting_human", "failed"].includes(st);
+  const qcFailed = planQcEnabled(item) && (item.qc || {}).passed === false
+    && ["done", "reused", "awaiting_human", "failed"].includes(st);
   return `<div class="plan-item plan-selectable st-${st}" data-plan-select="${esc(item.id)}"
     role="button" tabindex="0" aria-pressed="false"
     aria-label="选择查看 ${esc(item.label)}">
@@ -3034,9 +3045,10 @@ function planItemHtml(data, item, editable) {
       : `<span class="plan-thumb-empty">${st === "generating" ? "⏳" : "🖼"}</span>`}</div>
     <div class="plan-main">
       <div class="plan-row">
-        ${canEdit && ["done", "reused"].includes(st) ? `<label class="plan-pick"
+        ${selectable ? `<label class="plan-pick"
           onclick="event.stopPropagation()"><input type="checkbox"
-          class="plan-pick-box" data-pick="${esc(item.id)}"> 选</label>` : ""}
+          class="plan-pick-box" data-pick="${esc(item.id)}"
+          data-qc-failed="${qcFailed ? "1" : "0"}"> 选</label>` : ""}
         <b>${esc(item.label)}</b>
         <span class="plan-badges">
         ${planIsMock(item) ? `<span class="plan-st st-mock">⚠ 占位图</span>`
@@ -3055,6 +3067,10 @@ function planItemHtml(data, item, editable) {
       ${canEdit && planQcEnabled(item) && ["done", "reused"].includes(st) ? `<div class="plan-qc-row">
         <button class="plan-qc-one" data-plan-id="${esc(item.id)}"
           title="用 AI 视觉核对这张是否符合已锁定人物/场景设定">🔍 质检这张</button></div>` : ""}
+      ${canEdit && qcFailed ? `<div class="plan-qc-row">
+        <button class="plan-qc-accept" data-plan-id="${esc(item.id)}"
+          title="保留原质检问题，人工确认该问题不影响本集观感">✅ 人工通过</button>
+      </div>` : ""}
       <details class="plan-prompt"><summary>实际发送提示词（镜头合同短版）</summary>
         <pre>${esc(item.prompt_used || item.prompt || "")}</pre></details>
       ${item.prompt_used && item.prompt_used !== item.prompt ? `<details class="plan-prompt"><summary>审计原文（完整提示词）</summary><pre>${esc(item.prompt || "")}</pre></details>` : ""}
@@ -3536,7 +3552,11 @@ function imageFailurePanelHtml(data) {
     <div class="image-failure-heading">
       <div><b>⚠ 待人工问题清单 · ${failures.length} 张关键帧</b>
         <span>系统已自动定向修图 1 次；这些图仍未通过，但其他关键帧会继续生产。</span></div>
-      <small>失败稿不会进入正式资产或 Seedance 参考链。</small>
+      <div class="image-failure-actions">
+        <button type="button" class="image-failure-batch"
+          data-image-failure-batch>🛠 打开清单批量优化</button>
+        <small>失败稿不会进入正式资产或 Seedance 参考链。</small>
+      </div>
     </div>
     <div class="image-failure-list">${failures.map((failure) => `
       <article class="image-failure-item" data-image-failure-item="${esc(failure.item_id || "")}">
@@ -3553,6 +3573,9 @@ function imageFailurePanelHtml(data) {
         <button type="button" class="primary image-failure-jump"
           data-image-failure-shot="${failure.shot_no}">
           跳到镜头并展开修改</button>
+        <button type="button" class="image-failure-pass"
+          data-image-failure-pass="${esc(failure.item_id || "")}">
+          ✅ 人工通过</button>
       </article>`).join("")}</div>
   </section>`;
 }
@@ -3694,6 +3717,14 @@ function bindProductionLedger(root, data, episodeId) {
   root.querySelectorAll("[data-image-failure-shot]").forEach((button) => {
     button.onclick = () => focusImageFailureShot(
       root, data, Number(button.dataset.imageFailureShot));
+  });
+  root.querySelectorAll("[data-image-failure-batch]").forEach((button) => {
+    button.onclick = () => showPlanOverlay(episodeId);
+  });
+  root.querySelectorAll("[data-image-failure-pass]").forEach((button) => {
+    button.onclick = () => manualPassItems(
+      episodeId, [button.dataset.imageFailurePass], button,
+      () => renderCanvasView(episodeId));
   });
   root.querySelectorAll(".production-ledger-preview").forEach((button) => {
     button.onclick = () => showImageLightbox(button.dataset.ledgerPreview, button.getAttribute("aria-label") || "产物预览");
@@ -3983,7 +4014,7 @@ function renderPlanHtml(data, editable) {
     (i) => ["done", "reused"].includes(i.status)).length;
   const qcFailed = items.filter(
     (i) => planQcEnabled(i) && (i.qc || {}).passed === false
-      && ["done", "reused"].includes(i.status)).length;
+      && ["done", "reused", "awaiting_human", "failed"].includes(i.status)).length;
   const qcItems = items.filter(planQcEnabled);
   const acceleration = (data.image_acceleration || {}).summary || {};
   const accelerationCount = Number(acceleration.ready || 0)
@@ -4003,7 +4034,9 @@ function renderPlanHtml(data, editable) {
         title="只核对后续分镜关键帧和首尾帧">🔍 批量质检镜头图</button>` : ""}
       <button class="batch-redo-failed" onclick="redoFailed(${data.episode.id}, this)"
         ${qcFailed ? "" : "disabled"}
-        title="重画所有质检未过的图">🔁 重画质检未过的${qcFailed ? ` (${qcFailed})` : ""}</button>
+        title="按每张图的质检原因自动优化提示词，再批量重画">🛠 批量优化修改${qcFailed ? ` (${qcFailed})` : ""}</button>
+      <button class="batch-select-qc" onclick="planSelectQcFailed()"
+        ${qcFailed ? "" : "disabled"} title="只勾选二次质检未通过的镜头图">选中未过图</button>
       <span class="batch-sep">|</span>
       <button class="batch-selall" onclick="planSelectAll(true)">全选</button>
       <button class="batch-selnone" onclick="planSelectAll(false)">清空</button>
@@ -4012,6 +4045,8 @@ function renderPlanHtml(data, editable) {
       ${qualitySelectHtml("batch-quality")}
       <button class="primary batch-redo-sel" onclick="redoSelected(${data.episode.id}, this)"
         disabled>🔁 重画选中的 <span class="sel-count">0</span> 张</button>
+      <button class="batch-manual-pass" onclick="manualPassSelected(${data.episode.id}, this)"
+        disabled title="保留质检问题记录，人工确认选中的轻微问题图可继续使用">✅ 人工通过选中的 <span class="sel-qc-count">0</span> 张</button>
     </div>` : ""}
     ${editable ? "" : `<div class="dim plan-hint">列表实时更新;要修改某张的提示词重画,等生成停下后点工具栏「🖼 图片清单」。</div>`}
     ${cats.map((cat) => {
@@ -4067,13 +4102,25 @@ function planPickedIds() {
   return [...document.querySelectorAll(".plan-pick-box:checked")]
     .map((b) => b.dataset.pick);
 }
+function planPickedQcIds() {
+  return [...document.querySelectorAll(
+    '.plan-pick-box[data-qc-failed="1"]:checked')]
+    .map((b) => b.dataset.pick);
+}
 function planUpdateSelCount() {
   const n = planPickedIds().length;
+  const qcCount = planPickedQcIds().length;
   document.querySelectorAll(".sel-count").forEach((s) => {
     s.textContent = n;
   });
+  document.querySelectorAll(".sel-qc-count").forEach((s) => {
+    s.textContent = qcCount;
+  });
   document.querySelectorAll(".batch-redo-sel").forEach((b) => {
     b.disabled = n === 0;
+  });
+  document.querySelectorAll(".batch-manual-pass").forEach((b) => {
+    b.disabled = qcCount === 0;
   });
 }
 function planSelectAll(on) {
@@ -4087,6 +4134,27 @@ function planSelectCat(cat) {
     b.checked = b.dataset.pick.startsWith(cat + ":");
   });
   planUpdateSelCount();
+}
+function planSelectQcFailed() {
+  document.querySelectorAll(".plan-pick-box").forEach((b) => {
+    b.checked = b.dataset.qcFailed === "1";
+  });
+  planUpdateSelCount();
+}
+
+async function ensureBatchRevisionCheckpoint(episodeId) {
+  const current = await api(`/api/episode/${episodeId}`);
+  if (!current.production_progress?.overall?.running) return current;
+  try {
+    await api("/api/stop", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ episode_id: episodeId }),
+    });
+  } catch (error) {
+    // 任务可能恰好结束；下面以稳定状态复核为准。
+  }
+  return waitForShotRevisionCheckpoint(
+    episodeId, current.project.title, current.episode.number);
 }
 
 const batchRedrawSignatures = new Map();
@@ -4161,8 +4229,10 @@ async function redoSelected(episodeId, btn) {
   const ids = planPickedIds();
   if (!ids.length) return;
   const quality = btn?.closest(".plan-panel")?.querySelector(".batch-quality")?.value || "auto";
-  if (btn) { btn.disabled = true; btn.textContent = "已提交,重画中…"; }
+  if (btn) { btn.disabled = true; btn.textContent = "正在安全暂停…"; }
   try {
+    await ensureBatchRevisionCheckpoint(episodeId);
+    if (btn) btn.textContent = "已提交,重画中…";
     const reply = await api("/api/redo_items", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ episode_id: episodeId, item_ids: ids, quality }),
@@ -4183,8 +4253,10 @@ async function redoSelected(episodeId, btn) {
 
 async function redoFailed(episodeId, btn) {
   const quality = btn?.closest(".plan-panel")?.querySelector(".batch-quality")?.value || "auto";
-  if (btn) { btn.disabled = true; btn.textContent = "已提交,重画中…"; }
+  if (btn) { btn.disabled = true; btn.textContent = "正在安全暂停…"; }
   try {
+    await ensureBatchRevisionCheckpoint(episodeId);
+    if (btn) btn.textContent = "已提交,重画中…";
     const reply = await api("/api/redo_items", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ episode_id: episodeId, only_failed: true, quality }),
@@ -4205,6 +4277,33 @@ async function redoFailed(episodeId, btn) {
   }
 }
 
+async function manualPassItems(episodeId, ids, btn, onDone) {
+  if (!ids.length) return;
+  const original = btn?.textContent || "✅ 人工通过";
+  if (btn) { btn.disabled = true; btn.textContent = "正在安全暂停…"; }
+  try {
+    await ensureBatchRevisionCheckpoint(episodeId);
+    if (btn) btn.textContent = "正在登记人工通过…";
+    const reply = await api("/api/qc_override", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ episode_id: episodeId, item_ids: ids }),
+    });
+    showToast(`已人工通过 ${reply.passed || 0} 张，保留原质检问题记录`, "ok");
+    if (reply.skipped) {
+      showToast(`另有 ${reply.skipped} 张未能放行，请检查图片是否存在`, "info");
+    }
+    if (onDone) onDone(); else renderCanvasView(episodeId);
+  } catch (e) {
+    showToast(staleServerHint(e), "error");
+    if (btn) { btn.disabled = false; btn.textContent = original; }
+  }
+}
+
+function manualPassSelected(episodeId, btn) {
+  const ids = planPickedQcIds();
+  manualPassItems(episodeId, ids, btn, () => refreshOpenPlanOverlay(episodeId));
+}
+
 function bindPlanRegen(container, episodeId, onDone) {
   container.querySelectorAll(".plan-pick-box").forEach((box) => {
     box.onchange = planUpdateSelCount;
@@ -4213,6 +4312,12 @@ function bindPlanRegen(container, episodeId, onDone) {
     btn.onclick = (ev) => {
       ev.stopPropagation();
       qcOne(episodeId, btn.dataset.planId, btn, onDone);
+    };
+  });
+  container.querySelectorAll(".plan-qc-accept").forEach((btn) => {
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      manualPassItems(episodeId, [btn.dataset.planId], btn, onDone);
     };
   });
   container.querySelectorAll(".plan-edit").forEach((box) => {
@@ -4230,8 +4335,10 @@ function bindPlanRegen(container, episodeId, onDone) {
       const feedback = form.querySelector(".plan-edit-feedback").value.trim();
       const quality = form.querySelector(".plan-edit-quality").value;
       const btn = box.querySelector(".plan-edit-go");
-      btn.disabled = true; btn.textContent = "已提交,重画中…";
+      btn.disabled = true; btn.textContent = "正在安全暂停…";
       try {
+        await ensureBatchRevisionCheckpoint(episodeId);
+        btn.textContent = "已提交,重画中…";
         const reply = await api("/api/regen_image", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ episode_id: episodeId, target,
@@ -4566,7 +4673,8 @@ async function showPlanOverlay(episodeId, focusId = "") {
         <button class="close">关闭 Esc</button>
       </div>
       <div class="dim" style="margin:4px 0 10px">每张图的分类、状态与提示词都在这里;
-        可以直接改提示词或附意见,单独重画某一张(不影响其他图)。
+        可勾选多张执行「批量优化修改」，系统会把每张质检原因自动编译进提示词；
+        轻微问题也可单张或批量「人工通过」，原问题会保留在审计记录。
         镜头画面重画后会自动重做首尾帧并作废旧视频。</div>
       <div class="batch-job-progress" hidden></div>
       <div class="plan-overlay-content">${renderPlanHtml(data, true)

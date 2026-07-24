@@ -749,6 +749,8 @@ def test_single_and_batch_qc_and_redo(app):
         if i["id"] in fail_ids:
             i["qc"] = {"passed": False, "issues": ["测试标记未过"],
                        "attempts": 1}
+            if i["id"] == fail_ids[0]:
+                i["status"] = "awaiting_human"
             t = app.director._plan_item_target(i["id"])
             vers[i["id"]] = t
     plan_path.write_text(_json.dumps(plan, ensure_ascii=False),
@@ -768,6 +770,42 @@ def test_single_and_batch_qc_and_redo(app):
     assert all("测试标记未过" in i["prompt"] for i in redrawn)
     assert all(i["reference_inputs"]["attached"] for i in redrawn)
     assert all(i["reference_inputs"]["count"] >= 1 for i in redrawn)
+
+
+def test_manual_qc_pass_promotes_failed_draft_and_keeps_audit_reason(app,
+                                                                      tmp_path):
+    """轻微问题可人工放行;失败稿进入正式资产但原问题不丢。"""
+    project = _preproduce(app, title="人工放行质检")
+    plan_path = (app.workspace.artifacts_dir
+                 / f"p{project['id']:03d}" / "e001" / "render_plan.json")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    item = next(i for i in plan["items"] if i["category"] == "shot_image")
+    asset_name = f"e001_shot{int(item['shot_no']):03d}"
+    failed = tmp_path / "manual-pass-failed.png"
+    failed.write_bytes(b"\x89PNG\r\n\x1a\n" + b"failed" * 8)
+    app.assets.soft_delete(project["id"], "image", asset_name)
+    item.update({
+        "status": "awaiting_human",
+        "output_uri": str(failed),
+        "qc": {"passed": False, "attempts": 2,
+               "issues": ["人物表情轻微偏差"]},
+    })
+    plan_path.write_text(json.dumps(plan, ensure_ascii=False),
+                         encoding="utf-8")
+
+    result = app.director.manual_qc_pass(
+        "人工放行质检", 1, item_ids=[item["id"]],
+        note="人工确认：表情偏差不影响剧情理解")
+    assert result["passed"] == 1 and result["skipped"] == 0
+    final_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    final = next(i for i in final_plan["items"] if i["id"] == item["id"])
+    assert final["status"] == "done"
+    assert final["qc"]["passed"] is True
+    assert final["qc"]["manual_override"] is True
+    assert final["qc"]["manual_original_issues"] == ["人物表情轻微偏差"]
+    latest = app.assets.latest(project["id"], "image", asset_name)
+    assert latest["uri"] == str(failed)
+    assert json.loads(latest["meta"])["manual_qc_override"] is True
 
 
 def test_codex_qc_instruction_and_parse(tmp_path, monkeypatch):
