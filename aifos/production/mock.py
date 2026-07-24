@@ -191,6 +191,10 @@ class MockProvider(Provider):
                     "gender_match": True,
                     "count_checked": True,
                     "count_match": True,
+                    "overlay_count_checked": True,
+                    "overlay_count_match": True,
+                    "detected_overlay_count": payload.get(
+                        "expected_overlay_count", 0),
                     "physical_logic_checked": True,
                     "physical_logic_match": True,
                     "spatial_logic_checked": True,
@@ -227,6 +231,10 @@ class MockProvider(Provider):
                 "gender_match": True,
                 "count_checked": True,
                 "count_match": True,
+                "overlay_count_checked": True,
+                "overlay_count_match": True,
+                "detected_overlay_count": payload.get(
+                    "expected_overlay_count", 0),
                 "physical_logic_checked": True,
                 "physical_logic_match": True,
                 "spatial_logic_checked": True,

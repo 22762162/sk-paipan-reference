@@ -438,11 +438,12 @@ def resolve_character_asset_policy(policy=None, script=None):
 IMAGE_ASSET_KINDS = {
     "character_art", "character_sheet", "scene_art", "character_candidate",
     "image", "first_frame", "last_frame", "cover", "reference",
-    "spatial_blocking",
+    "spatial_blocking", "inner_persona",
 }
 
 REFERENCE_ROLES = {
     "identity", "wardrobe", "scene", "composition", "style", "manual",
+    "inner_persona",
 }
 # Seedream 5 Lite 当前最多接收 10 张参考图。导演层按最小公共上限组织
 # 参考图，避免同一任务切换模型时图序、人物或构图语义发生漂移。
@@ -1518,7 +1519,15 @@ class Director:
             prev = old.get(item["id"])
             item.setdefault("status", "pending")
             item.setdefault("error", "")
-            if prev is not None:
+            same_content = (
+                prev is not None
+                and (
+                    not item.get("content_hash")
+                    or (
+                        bool(prev.get("content_hash"))
+                        and prev.get("content_hash")
+                        == item.get("content_hash"))))
+            if same_content:
                 item["status"] = prev.get("status", "pending")
                 item["error"] = prev.get("error", "")
                 for key in ("provider", "model", "real", "fallbacks",
@@ -1531,6 +1540,11 @@ class Director:
                 if prev.get("custom_prompt"):
                     item["prompt"] = prev.get("prompt", item["prompt"])
                     item["custom_prompt"] = True
+            elif prev is not None and item.get("content_hash"):
+                item["invalidated_previous_output"] = True
+                item["invalidation_reason"] = (
+                    "镜头剧情/人物/Q版叠层/提示词或参考图合同已变化，"
+                    "旧图片不得按镜头编号继续复用")
         plan["items"] = rest + items
         self._plan_write(ctx, plan)
 
@@ -1625,6 +1639,9 @@ class Director:
             if isinstance(ref, dict):
                 add("identity", ref.get("uri"),
                     f"{ref.get('character', '角色')}最终立绘")
+        add(
+            "inner_persona", payload.get("inner_persona_ref"),
+            "内心Q版母资产")
         for uri in payload.get("character_refs") or []:
             add("character", uri, "人物设定/资产图")
         add("spatial", payload.get("spatial_ref"), "本镜空间调度图")
@@ -1653,6 +1670,27 @@ class Director:
             value, ensure_ascii=False, sort_keys=True,
             separators=(",", ":"), default=str).encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
+
+    def _shot_content_hash(self, shot, payload=None):
+        """Hash the semantic shot contract; old art may reuse only on match."""
+        payload = payload or {}
+        return self._stable_hash({
+            "shot_no": shot.get("shot_no"),
+            "scene_no": shot.get("scene_no"),
+            "characters": shot.get("characters") or [],
+            "narrative_overlays": shot.get("narrative_overlays") or [],
+            "description": shot.get("description") or "",
+            "dialogue": shot.get("dialogue"),
+            "start_state": shot.get("start_state") or {},
+            "end_state": shot.get("end_state") or {},
+            "prompt_contract": (
+                payload.get("prompt_contract")
+                or shot.get("prompt_contract") or {}),
+            "prompt_compact": (
+                payload.get("prompt_compact")
+                or shot.get("seedance_prompt_compact") or ""),
+            "reference_manifest": payload.get("reference_manifest") or [],
+        })
 
     def _build_dispatch_contract(self, task, item):
         """从即将交给 worker 的真实 payload 构造不可变预检契约。"""
@@ -1944,7 +1982,7 @@ class Director:
                  expected_count=None, character_background=None, camera="",
                  composition_contract=None, readable_text=None,
                  physical_contract=None, physical_logic_required=False,
-                 era_exceptions=None):
+                 era_exceptions=None, narrative_overlays=None):
         """视觉质检规格：按角色在本镜可见角度选择核验依据。"""
         identity_characters = list(characters or [])
         visible_characters = list(
@@ -1987,6 +2025,11 @@ class Director:
                      else int(expected_count))
         except (TypeError, ValueError):
             count = len(visible_characters)
+        overlays = [
+            copy.deepcopy(item)
+            for item in (narrative_overlays or [])
+            if isinstance(item, dict)
+        ][:1]
         return {
             # Internal retry guard: replacement selectors may only resolve
             # assets from this project.  The QC prompt does not render this
@@ -1995,6 +2038,9 @@ class Director:
             "characters": visible_characters,
             "identity_characters": identity_characters,
             "count": count,
+            "narrative_overlays": overlays,
+            "expected_overlay_count": len(overlays),
+            "overlay_count_required": bool(overlays),
             "designs": ";".join(designs),
             "expected_genders": genders,
             "location": location or "",
@@ -2340,6 +2386,13 @@ class Director:
             not count_required or bool(verdict.get("count_checked")))
         count_match = (
             not count_required or bool(verdict.get("count_match")))
+        overlay_required = bool(qc_spec.get("overlay_count_required"))
+        overlay_checked = (
+            not overlay_required
+            or bool(verdict.get("overlay_count_checked")))
+        overlay_match = (
+            not overlay_required
+            or bool(verdict.get("overlay_count_match")))
         physical_required = bool(qc_spec.get("physical_logic_required"))
         physical_checked = (
             not physical_required
@@ -2369,6 +2422,14 @@ class Director:
             suffix = f"，检测到{detected}人" if detected is not None else ""
             issues.append(
                 f"画面人数与要求的{qc_spec.get('count', 0)}人不一致{suffix}")
+        if not overlay_checked:
+            issues.append("质检未单独核对非现实内心Q版叠层数量")
+        elif not overlay_match:
+            detected = verdict.get("detected_overlay_count")
+            suffix = f"，检测到{detected}个" if detected is not None else ""
+            issues.append(
+                "内心Q版叠层与要求的"
+                f"{qc_spec.get('expected_overlay_count', 0)}个不一致{suffix}")
         if not physical_checked:
             issues.append("质检未核对道具、人物与镜头的物理关系")
         elif not physical_match:
@@ -2389,6 +2450,7 @@ class Director:
             not identity_checked or not identity_match
             or not gender_checked or not gender_match
             or not count_checked or not count_match
+            or not overlay_checked or not overlay_match
             or not physical_checked or not physical_match
             or not spatial_checked or not spatial_match
             or (not identity_checks
@@ -2398,6 +2460,7 @@ class Director:
             and identity_checked and identity_match
             and gender_checked and gender_match
             and count_checked and count_match
+            and overlay_checked and overlay_match
             and physical_checked and physical_match
             and spatial_checked and spatial_match)
         report = {
@@ -2410,11 +2473,19 @@ class Director:
             "gender_match": gender_match,
             "count_checked": count_checked,
             "count_match": count_match,
+            "overlay_count_checked": overlay_checked,
+            "overlay_count_match": overlay_match,
             "physical_logic_checked": physical_checked,
             "physical_logic_match": physical_match,
             "spatial_logic_checked": spatial_checked,
             "spatial_logic_match": spatial_match,
             "detected_count": verdict.get("detected_count"),
+            "detected_overlay_count": verdict.get(
+                "detected_overlay_count"),
+            "expected_overlay_count": qc_spec.get(
+                "expected_overlay_count", 0),
+            "narrative_overlays": qc_spec.get(
+                "narrative_overlays") or [],
             "identity_references": len(
                 qc_spec.get("identity_references") or []),
             "identity_checks": identity_checks,
@@ -3253,6 +3324,7 @@ class Director:
                 "shot_no": shot_no,
                 # 清单展示与模型实际收到的是同一份当前镜头短合同。
                 "prompt": shot_payload["prompt_compact"],
+                "content_hash": self._shot_content_hash(shot),
                 **self._quality_meta(image_quality),
             })
             frame_items.append({
@@ -3260,6 +3332,7 @@ class Director:
                 "label": f"镜头 {shot_no:02d} 首尾帧",
                 "shot_no": shot_no,
                 "prompt": shot_payload["prompt_compact"],
+                "content_hash": self._shot_content_hash(shot),
                 **self._quality_meta(frame_quality),
             })
         self._plan_seed(ctx, "shot_image", image_items)
@@ -4067,6 +4140,7 @@ class Director:
         location = self._scene_locations(ctx).get(shot.get("scene_no"), "")
         value = {
             **self._quality_meta(decision),
+            "shot_content_hash": self._shot_content_hash(shot),
             "episode_number": ctx["episode"]["number"],
             "shot_no": shot.get("shot_no"),
             "scene_no": shot.get("scene_no"),
@@ -4802,7 +4876,7 @@ class Director:
 
     def _art_refs(self, ctx, characters, location, shot_no=None,
                   sheet_keys=None, sheet_keys_by_character=None,
-                  spatial_ref=""):
+                  spatial_ref="", inner_persona_ref=""):
         """最终立绘/人物套件/场景图/用户参考 → 真实多图参考输入。
 
         含人物画面缺任何一个最终立绘都直接阻断；禁止静默退化为文字生图。
@@ -4840,6 +4914,28 @@ class Director:
                 "name": identity.get("character", ""),
                 "label": f"{identity.get('character', '角色')}最终立绘",
                 "uri": identity["uri"],
+            })
+        inner_uri = str(inner_persona_ref or "").strip()
+        if (inner_uri
+                and (inner_uri.startswith(("http://", "https://"))
+                     or Path(inner_uri).exists())
+                and remember(inner_uri)):
+            refs["inner_persona_ref"] = inner_uri
+            inner_row = next((
+                row for row in self.assets.active_list(
+                    project_id, kind="inner_persona")
+                if row["uri"] == inner_uri), None)
+            refs["asset_matches"].append({
+                "asset_id": (
+                    inner_row["id"] if inner_row is not None else None),
+                "kind": "inner_persona",
+                "name": (
+                    inner_row["name"] if inner_row is not None
+                    else "内心Q版"),
+                "label": "内心Q版母资产",
+                "uri": inner_uri,
+                "reference_role": "inner_persona",
+                "attach_to": f"shot:{shot_no}" if shot_no is not None else "",
             })
         # 多人走位/变机位镜头的 3D 空间图不仅要给 Seedance，也要在
         # 关键帧阶段先把人数、站位和屏幕方向锁准。它只承担空间职责，
@@ -4963,7 +5059,8 @@ class Director:
         # 空镜同样不能把场景/风格/用户参考静默丢掉。
         refs["require_reference_images"] = bool(
             characters or refs.get("scene_ref")
-            or refs.get("reference_images") or refs.get("style_ref"))
+            or refs.get("reference_images") or refs.get("style_ref")
+            or refs.get("inner_persona_ref"))
         return refs
 
     def _relations(self, ctx):
@@ -5071,6 +5168,24 @@ class Director:
             parts.append(
                 "【IDENTITY LOCK】严格 0 人空镜；禁止人物、人体局部、"
                 "剪影、倒影中的人或随机路人")
+        overlays = [
+            item for item in (shot.get("narrative_overlays") or [])
+            if isinstance(item, dict)
+        ][:1]
+        if overlays:
+            overlay = overlays[0]
+            inner_line = (
+                f"；内心台词「{overlay.get('dialogue')}」"
+                if overlay.get("dialogue") else "")
+            parts.append(
+                "【NON-DIEGETIC INNER CHIBI】"
+                f"{overlay.get('name') or '内心Q版'}只代表"
+                f"{overlay.get('host_character') or '宿主'}的内心人格；"
+                f"{overlay.get('expression') or '夸张Q版表情和动作'}；"
+                f"{overlay.get('action') or '在宿主肩旁完成内心反应'}"
+                f"{inner_line}。不计真实人数，不进入物理/空间站位，不被"
+                "其他人物看见、回应、触碰或对视；服装继承已锁定当前造型，"
+                "不继承默认道具；内心声音出现时真人宿主闭口，不画旁白字幕")
         composition = (
             shot.get("composition_contract")
             if isinstance(shot.get("composition_contract"), dict)
@@ -5096,7 +5211,13 @@ class Director:
         action = shot.get("description") or shot.get("action") or ""
         parts.append(f"【ACTION】{action or '环境状态保持稳定'}")
         dialogue = shot.get("dialogue")
-        if isinstance(dialogue, dict) and dialogue.get("dialogue"):
+        if (isinstance(dialogue, dict) and dialogue.get("dialogue")
+                and dialogue.get("inner_voice")):
+            parts.append(
+                "【EYES / EXPRESSION】本镜台词是内心声音；由内心Q版表现"
+                "夸张嘴形、表情和动作，真人宿主保持闭口，只用眼神和呼吸"
+                "承接情绪；其他人物不得听见或回应")
+        elif isinstance(dialogue, dict) and dialogue.get("dialogue"):
             speaker = dialogue.get("character", "")
             emo = (shot.get("speech_timing") or {}).get("emotion", "")
             parts.append(
@@ -5218,6 +5339,22 @@ class Director:
             **shot, "spatial_blocking": spatial or {},
             "readable_text": readable_text,
         })
+        narrative_overlays = [
+            copy.deepcopy(item)
+            for item in (shot.get("narrative_overlays") or [])
+            if isinstance(item, dict)
+        ][:1]
+        inner_persona_ref = ""
+        if narrative_overlays:
+            overlay = narrative_overlays[0]
+            inner_persona_ref = str(overlay.get("asset_uri") or "").strip()
+            if not inner_persona_ref and overlay.get("asset_name"):
+                row = self.assets.latest(
+                    ctx["project"]["id"], "inner_persona",
+                    str(overlay["asset_name"]))
+                if row is not None:
+                    inner_persona_ref = str(row["uri"] or "").strip()
+                    overlay["asset_uri"] = inner_persona_ref
         payload = {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
@@ -5230,6 +5367,9 @@ class Director:
             "character_visuals": character_visuals,
             "character_count": shot.get(
                 "character_count", len(shot["characters"])),
+            "visible_figure_count": (
+                len(shot["characters"]) + len(narrative_overlays)),
+            "narrative_overlays": narrative_overlays,
             "location": location,
             "dialogue": shot.get("dialogue"),
             "camera": shot.get("camera", ""),
@@ -5266,7 +5406,8 @@ class Director:
                         shot, composition_contract)),
                 spatial_ref=(
                     (spatial or {}).get("spatial_reference_uri", "")
-                    if requires_spatial_reference(spatial or {}) else "")),
+                    if requires_spatial_reference(spatial or {}) else ""),
+                inner_persona_ref=inner_persona_ref),
         }
         actor_ids = {
             actor.get("name"): actor.get("actor_id")
@@ -5349,6 +5490,13 @@ class Director:
                 character=who, role="identity",
                 asset_id=ref.get("asset_id"),
                 kind="character_identity")
+        add(
+            payload.get("inner_persona_ref"), "内心Q版母资产",
+            "只锁定非现实内心Q版的脸、发型、当前衣着、Q版比例和材质；"
+            "允许本镜按剧情夸张表情与动作。它不是真实人物，不得覆盖真人"
+            "身份、增加真实人数、进入空间站位、被其他人物看见或继承任何"
+            "默认道具；透明背景不得画进成片",
+            role="inner_persona", kind="inner_persona")
         add(payload.get("spatial_ref"), "本镜空间调度图",
             "只读取人物编号与对应站位、相对距离、前后遮挡、屏幕方向、"
             "行动箭头、摄影机起终点/高度、瞄准点和视锥；不得把3D示意视角、"
@@ -5657,7 +5805,12 @@ class Director:
                     ctx["project"]["id"], "image",
                     self._shot_name(ctx, shot["shot_no"]))
                 actual_quality = self._asset_quality(row)
-                if self._quality_meets(actual_quality, required_quality):
+                same_content = (
+                    self._asset_meta(row).get("shot_content_hash")
+                    == self._shot_content_hash(shot))
+                if (same_content
+                        and self._quality_meets(
+                            actual_quality, required_quality)):
                     ctx["images"].append(
                         {"shot_no": shot["shot_no"], "uri": existing,
                          "image_quality": actual_quality})
@@ -5689,7 +5842,9 @@ class Director:
                     readable_text=payload.get("readable_text"),
                     physical_contract=payload.get("physical_contract"),
                     physical_logic_required=True,
-                    era_exceptions=self._era_exceptions(ctx))}})
+                    era_exceptions=self._era_exceptions(ctx),
+                    narrative_overlays=payload.get(
+                        "narrative_overlays"))}})
         results, qc_failures = self._run_parallel(
             ctx, tasks, line="分镜画面",
             continue_on_qc_failure=True)
@@ -6156,6 +6311,11 @@ class Director:
                 missing.append(name)
             else:
                 add(identity)
+        inner_row = self._inner_persona_row_for_shot(ctx, shot)
+        if (shot.get("narrative_overlays") and inner_row is None):
+            raise AifosError(
+                f"镜头{shot_no}声明了内心Q版，但对应母资产缺失或质量不足")
+        add(inner_row)
         if missing:
             raise AifosError(
                 "以下出场角色缺少最终立绘，禁止交给 Seedance:"
@@ -6218,6 +6378,27 @@ class Director:
             name for name in (shot.get("characters") or [])
             if not is_background_character(profiles.get(name, {}))]
 
+    def _inner_persona_row_for_shot(self, ctx, shot):
+        overlays = [
+            item for item in (shot.get("narrative_overlays") or [])
+            if isinstance(item, dict)
+        ][:1]
+        if not overlays:
+            return None
+        name = str(overlays[0].get("asset_name") or "").strip()
+        if not name:
+            return None
+        row = self.assets.latest(
+            ctx["project"]["id"], "inner_persona", name)
+        if (row is None or self.assets.is_deleted(row) or not row["uri"]
+                or not formal_reference_allowed(self._asset_quality(row))):
+            return None
+        uri = str(row["uri"])
+        if not (uri.startswith(("http://", "https://"))
+                or Path(uri).exists()):
+            return None
+        return row
+
     def _video_reference_mismatch(self, row, shot, location=""):
         """返回 Seedance 资产与当前镜头不兼容的原因；空串表示可用。
 
@@ -6226,6 +6407,17 @@ class Director:
         """
         characters = set(shot.get("characters") or [])
         kind = row["kind"]
+        if kind == "inner_persona":
+            asset_name = str(row["name"] or "")
+            expected = {
+                str(item.get("asset_name") or "")
+                for item in (shot.get("narrative_overlays") or [])
+                if isinstance(item, dict)
+            }
+            if asset_name not in expected:
+                return (
+                    f"内心Q版资产「{asset_name}」未在本镜声明，"
+                    "禁止作为额外人物参考")
         if kind in (
                 "character_identity", "character_art",
                 "character_candidate", "character_sheet"):
@@ -6284,6 +6476,13 @@ class Director:
             elif row["id"] not in seen:
                 seen.add(row["id"])
                 rows.append(row)
+        inner_row = self._inner_persona_row_for_shot(ctx, shot)
+        if shot.get("narrative_overlays") and inner_row is None:
+            raise AifosError(
+                f"镜头{shot_no}声明了内心Q版，但对应母资产缺失或质量不足")
+        if inner_row is not None and inner_row["id"] not in seen:
+            seen.add(inner_row["id"])
+            rows.append(inner_row)
         if missing:
             raise AifosError(
                 "以下出场角色缺少最终立绘，禁止交给 Seedance:"
@@ -6321,6 +6520,11 @@ class Director:
             return (
                 "只读取人物编号、起终站位、行动箭头、屏幕方向和摄影机"
                 "起终点；不得把俯视图、文字、坐标、箭头或图形画进成片")
+        if kind == "inner_persona":
+            return (
+                "只锁定非现实内心Q版的脸、发型、当前衣着、Q版比例和材质；"
+                "允许按本镜做夸张表情动作。不得转化为真人、增加真实人数、"
+                "进入物理站位、被其他人物感知或携带默认道具")
         if kind in (
                 "character_identity", "character_art",
                 "character_candidate"):
@@ -6413,10 +6617,15 @@ class Director:
         else:
             text_rule = "画面无字幕、无新增文字、无Logo、无水印"
         dialogue = shot.get("dialogue") or {}
-        dialogue_rule = (
-            f"；{dialogue.get('character')}按自然口型说出台词，"
-            "说话时保留眼神、呼吸和细小停顿"
-            if dialogue.get("dialogue") else "")
+        if dialogue.get("dialogue") and dialogue.get("inner_voice"):
+            dialogue_rule = (
+                "；台词由非现实内心Q版发声并做夸张Q版口型，真人宿主"
+                "全程闭口，只用眼神、呼吸和细小停顿承接")
+        else:
+            dialogue_rule = (
+                f"；{dialogue.get('character')}按自然口型说出台词，"
+                "说话时保留眼神、呼吸和细小停顿"
+                if dialogue.get("dialogue") else "")
         lines = [
             "【输入边界】图1首帧是唯一动作起点；图2尾帧是唯一动作终点。",
             f"【人物硬锁】{mapped}；成片从头到尾严格共{len(characters)}人，"
@@ -6655,6 +6864,12 @@ class Director:
             compact += (
                 "\n【质检修订】只落实以下修订要求，其他首尾帧、人物、服装、"
                 "场景、构图和口型保持不变：" + str(manual_feedback)[:1600])
+        video_dialogue = copy.deepcopy(shot.get("dialogue"))
+        if (isinstance(video_dialogue, dict)
+                and video_dialogue.get("inner_voice")):
+            video_dialogue["character"] = (
+                video_dialogue.get("performed_by")
+                or video_dialogue.get("character"))
         payload = {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
@@ -6671,7 +6886,7 @@ class Director:
             "reference_images": [row["uri"] for row in reference_rows],
             "reference_assets": reference_assets,
             "reference_manifest": reference_manifest,
-            "dialogue": shot.get("dialogue"),
+            "dialogue": video_dialogue,
             "voice": ctx["production_profile"]["voice"],
             "lip_sync": ctx["production_profile"]["lip_sync"],
             "forbid_subtitles": not ctx["production_profile"]["burn_subtitles"],
@@ -7175,7 +7390,9 @@ class Director:
                     expected_count=shot.get(
                         "character_count", expected_count),
                     composition_contract=composition,
-                    readable_text=shot.get("readable_text") or {})
+                    readable_text=shot.get("readable_text") or {},
+                    narrative_overlays=shot.get(
+                        "narrative_overlays"))
                 samples = [
                     ("首帧", first, "first_valid"),
                     ("尾帧", last, "last_valid"),
@@ -9341,7 +9558,9 @@ class Director:
                         "composition_contract"),
                     readable_text=payload.get("readable_text"),
                     physical_contract=payload.get("physical_contract"),
-                    physical_logic_required=True)
+                    physical_logic_required=True,
+                    narrative_overlays=payload.get(
+                        "narrative_overlays"))
             else:
                 spec = self._qc_spec(project_id, [], forbid=self._FORBID)
         # 首尾帧:首帧 + 尾帧两张都要检,任一不符即整组不合格

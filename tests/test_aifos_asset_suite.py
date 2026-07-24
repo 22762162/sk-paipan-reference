@@ -377,14 +377,18 @@ def test_produced_image_soft_delete_preserves_history(app):
 def test_corrected_asset_supersedes_old_version_without_deleting_history(app):
     """修正版进入当前资产，错误旧图只隐藏并保留可回溯关系。"""
     project = _preproduce(app, title="修正版替代")
-    old = app.assets.active_list(project["id"], "scene_art")[0]
+    active_before = app.assets.active_list(project["id"], "scene_art")
+    old = active_before[0]
     replacement = app.assets.register(
         project["id"], "scene_art", old["name"], uri=old["uri"],
         meta={"revision": 2}, new_version=True)
     superseded = app.assets.mark_superseded(
         old["id"], replacement["id"], reason="scene_revision")
 
-    assert app.assets.active_list(project["id"], "scene_art") == [replacement]
+    active_after = app.assets.active_list(project["id"], "scene_art")
+    assert len(active_after) == len(active_before)
+    assert replacement in active_after
+    assert old not in active_after
     metadata = app.assets.meta(superseded)
     assert metadata["superseded"] is True
     assert metadata["superseded_by_asset_id"] == replacement["id"]

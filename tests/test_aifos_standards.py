@@ -102,6 +102,20 @@ def test_existing_standard_is_upgraded_with_story_analysis_rules(tmp_path):
         app.close()
 
 
+def test_standard_upgrade_never_downgrades_newer_skill_version(tmp_path):
+    app = App(tmp_path / "ws")
+    try:
+        active = app.standards.active()
+        newer = copy.deepcopy(active)
+        newer["content"]["source_skill"]["version"] = "5.9"
+        unchanged = app.standards._upgrade_spatial_standard(newer)
+        assert unchanged["version_id"] == active["version_id"]
+        assert unchanged["content"]["source_skill"]["version"] == "5.9"
+        assert len(app.standards.history("sk-manju-v5")) == 1
+    finally:
+        app.close()
+
+
 def test_save_creates_immutable_version_and_persists(tmp_path):
     root = tmp_path / "ws"
     app = App(root)

@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 from ..generation_diagnostics import normalize_generation_diagnostics
+from ..inner_persona import normalize_inner_persona_policy
 from ..story_analysis import STORY_ANALYSIS_SCHEMA, validate_story_analysis
 
 SCRIPT_PROMPT = """你是漫剧编剧。为作品《{title}》第{episode}集创作一集完整剧本。
@@ -164,6 +165,11 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
 - 每段只承载一个主要动作或一次情绪转折；台词逐字照抄，禁止改写；
 - 每场先给 1 个环境/肢体镜头，再为每句台词给 1 个对白镜头；
 - 关键台词后的听者反应与情绪高潮留白由平台补齐，不要用空镜凑时长；
+- 若剧本 `inner_persona_policy.enabled=true`：穿越前该人物可作为真实人物；
+  穿越后其真人形态必须从 `characters` 删除。只有必要的内心独白、内心吐槽、
+  喜剧反应或决策冲突，才可输出一个 `narrative_overlays` Q版叠层；不得每句
+  台词后自动插入。Q版不计真实人数、不参与站位、不被他人感知，继承当前锁定
+  衣服但无默认道具，表情动作可以夸张；内心发声时真人宿主闭口且不生成字幕；
 - shot_no 从 1 连续编号；duration 单位秒，优先 5-8 秒，最长 15 秒；
 - prompt 只含本镜头真正可见且会影响生成的世界状态、场景、准确人物名单、主体动作、
   光影、机位与结尾状态；不得复制整集前情、其他镜头、人物传记或无关道具；
@@ -184,6 +190,11 @@ JSON 格式:
 {{"episode_title": "...", "shots": [{{"shot_no": 1, "scene_no": 1,
   "kind": "environment", "description": "...", "camera": "镜头语言",
   "duration": 2.5, "characters": ["角色名"], "dialogue": null,
+  "narrative_overlays": [{{"kind":"inner_persona_chibi",
+    "function":"inner_monologue/inner_commentary/comic_reaction/decision_conflict",
+    "name":"内心人格角色名","host_character":"宿主角色名",
+    "expression":"夸张Q版表情","action":"夸张Q版动作",
+    "dialogue":"必要时的内心台词；否则空字符串"}}],
   "physical_logic": "本镜物理/空间关系",
   "readable_text": {{"carrier":"电脑屏幕", "whitelist":["逐字原文"],
     "layout":"版式/位置", "style":"字体/颜色/层级", "perspective":"透视/反光",
@@ -464,6 +475,7 @@ def normalize_script_bible(script, payload=None):
             "由剧本台词、行动与人物背景外化，跨场景保持同一性格逻辑")
     script["story_bible_version"] = 1
     script["declared_character_names"] = cast_names
+    script["inner_persona_policy"] = normalize_inner_persona_policy(script)
     return script
 
 
@@ -736,6 +748,7 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 同一角色被复制两次或把两人合成一人都必须失败。
 过肩构图中“1个正面主体 + 1个前景半背影对话者”是两个已登记角色槽位；
 前景肩膀/半身只计作该对话者1人，不得另算成第三人、陌生人或人物复制。
+{overlay_rules}
 文字设定只补充剧情、动作、场景和当镜服装；与最终立绘冲突时以最终立绘为准。
 
 画面要求:
@@ -765,6 +778,8 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 "basis":["实际核验项"],"checked":true或false,"match":true或false}}],
 "gender_checked": true或false, "gender_match": true或false,
 "count_checked": true或false, "count_match": true或false,
+"overlay_count_checked": true或false, "overlay_count_match": true或false,
+"detected_overlay_count": 画面实际内心Q版叠层数整数,
 "physical_logic_checked": true或false, "physical_logic_match": true或false,
 "spatial_logic_checked": true或false, "spatial_logic_match": true或false,
 "detected_count": 画面实际人数整数,
@@ -836,6 +851,24 @@ def build_qc_prompt(payload):
         ("必须执行硬检查；" if payload.get("physical_logic_required") else "仅作辅助检查；")
         + (physical_rules or "人物、镜头、道具关系按当前镜头实际构图核对")
         + (f"；对象关系：{physical_objects}" if physical_objects else ""))
+    overlays = [
+        item for item in (payload.get("narrative_overlays") or [])
+        if isinstance(item, dict)
+    ][:1]
+    if overlays:
+        overlay = overlays[0]
+        overlay_rules = (
+            "本镜另有 1 个非现实内心Q版叠层："
+            f"{overlay.get('name') or '内心Q版'}，宿主="
+            f"{overlay.get('host_character') or '宿主'}。人数核验时 detected_count "
+            "只统计真实人物，不把Q版计入；另用 detected_overlay_count 单独统计Q版，"
+            "必须恰好1个。Q版不得被画成真人实体、不得进入真实站位或遮挡、不得被"
+            "其他人物看见/回应/触碰；应继承当前锁定衣着、无默认道具，并以夸张"
+            "Q版表情动作表现。若有内心声音，真人宿主必须闭口且不得出现旁白字幕。")
+    else:
+        overlay_rules = (
+            "本镜不允许非现实内心Q版叠层；detected_overlay_count 必须为0，"
+            "不得擅自新增Q版、分身、幽灵或意识小人。")
     return IMAGE_QC_PROMPT.format(
         image=payload.get("image_uri", ""),
         generation_scope=json.dumps(
@@ -846,6 +879,7 @@ def build_qc_prompt(payload):
             separators=(",", ":"))[:16000],
         identity_references=(ref_lines or "无人空镜，无需人物身份比对"),
         composition_rules=composition_rules,
+        overlay_rules=overlay_rules,
         characters="、".join(characters) or "无人(空镜)",
         count_rule=count_rule,
         designs=payload.get("designs") or "见参考图",
@@ -887,7 +921,8 @@ def validate_image_qc(data):
         data["count_match"] = bool(data["count_match"])
     for key in (
             "physical_logic_checked", "physical_logic_match",
-            "spatial_logic_checked", "spatial_logic_match"):
+            "spatial_logic_checked", "spatial_logic_match",
+            "overlay_count_checked", "overlay_count_match"):
         if key in data:
             data[key] = bool(data[key])
     if "detected_count" in data:
@@ -895,6 +930,12 @@ def validate_image_qc(data):
             data["detected_count"] = int(data["detected_count"])
         except (TypeError, ValueError):
             data.pop("detected_count", None)
+    if "detected_overlay_count" in data:
+        try:
+            data["detected_overlay_count"] = int(
+                data["detected_overlay_count"])
+        except (TypeError, ValueError):
+            data.pop("detected_overlay_count", None)
     checks = data.get("identity_checks")
     if isinstance(checks, list):
         normalized = []

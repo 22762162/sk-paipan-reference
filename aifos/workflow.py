@@ -15,6 +15,12 @@ from pathlib import Path
 from .adapters.claude_script import (is_background_role,
                                      validate_script_bible)
 from .quality_policy import default_quality_policy, resolve_video_quality
+from .inner_persona import (
+    apply_inner_persona_to_shots,
+    normalize_inner_persona_policy,
+    physical_scene_characters,
+    shot_timeline_state,
+)
 from .prompt_contract import (
     build_physical_contract,
     compile_shot_prompt,
@@ -38,7 +44,7 @@ TEXT_CARRIERS = (
 )
 SHOT_FUNCTIONS = {
     "environment": "铺垫", "dialogue": "信息交代", "reaction": "反应",
-    "beat": "留白", "physical": "蓄势",
+    "beat": "留白", "physical": "蓄势", "inner_monologue": "内心戏",
 }
 
 
@@ -120,6 +126,8 @@ def build_continuity_bible(project, script, profile):
     character_asset_rules = rules.get("character_assets", {})
     text_rules = rules.get("text_assets", {})
     delivery_rules = rules.get("delivery", {})
+    inner_policy = normalize_inner_persona_policy(
+        script, rules.get("inner_persona"))
     characters = []
     for index, character in enumerate(script.get("characters", []), 1):
         name = character["name"]
@@ -202,6 +210,7 @@ def build_continuity_bible(project, script, profile):
                 "delivery_verifier_required", True),
         },
         "character_asset_policy": copy.deepcopy(character_asset_rules),
+        "inner_persona_policy": copy.deepcopy(inner_policy),
         "production_profile": copy.deepcopy(profile),
     }
 
@@ -507,6 +516,8 @@ def _append_performance_beats(raw_shots, script, rules=None):
         "beat_seconds", performance_rules.get("beat_duration_seconds", [2, 4]))
     add_beat = performance_rules.get("beat_at_emotional_peak", True)
     scenes = _scene_map(script)
+    inner_policy = normalize_inner_persona_policy(
+        script, rules.get("inner_persona"))
     out = []
     grouped = {}
     for raw in raw_shots:
@@ -514,15 +525,21 @@ def _append_performance_beats(raw_shots, script, rules=None):
     for scene_no in sorted(grouped):
         scene = scenes.get(scene_no, {})
         scene_people = list(scene.get("characters", []))
+        timeline = "unknown"
         for raw in grouped[scene_no]:
+            timeline = shot_timeline_state(raw, timeline)
+            physical_people = physical_scene_characters(
+                scene_people, timeline, inner_policy)
             out.append(raw)
             dialogue = raw.get("dialogue")
             part = raw.get("dialogue_part") or {"index": 1, "total": 1}
-            if (not dialogue or not add_reaction
+            if (not dialogue or dialogue.get("inner_voice")
+                    or not add_reaction
                     or part.get("index") != part.get("total")):
                 continue
             speaker = dialogue.get("character")
-            listeners = [name for name in scene_people if name != speaker]
+            listeners = [
+                name for name in physical_people if name != speaker]
             if listeners:
                 out.append({
                     "scene_no": scene_no,
@@ -539,7 +556,8 @@ def _append_performance_beats(raw_shots, script, rules=None):
                     "prompt": f"{listeners[0]}听完{speaker}的话后的近景反应",
                     "source_dialogue": dialogue.get("dialogue", ""),
                 })
-        lead = scene_people[:1]
+        lead = physical_scene_characters(
+            scene_people, timeline, inner_policy)[:1]
         if lead and add_beat:
             out.append({
                 "scene_no": scene_no,
@@ -581,6 +599,11 @@ def _normalize_ai_shot(raw):
     if isinstance(characters, str):
         characters = [characters]
     shot["characters"] = [str(c) for c in (characters or []) if c]
+    overlays = shot.get("narrative_overlays")
+    if isinstance(overlays, dict):
+        overlays = [overlays]
+    shot["narrative_overlays"] = [
+        dict(item) for item in (overlays or []) if isinstance(item, dict)]
     if shot["dialogue"] and not shot["dialogue"]["character"]:
         shot["dialogue"]["character"] = (shot["characters"][0]
                                          if shot["characters"] else "")
@@ -631,7 +654,11 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
                                 else fallback_scene)
         last_scene = shot["scene_no"]
         normalized.append(shot)
+    normalized, inner_policy = apply_inner_persona_to_shots(
+        script, normalized, rules.get("inner_persona"))
     raw_shots = _append_performance_beats(normalized, script, rules)
+    raw_shots, inner_policy = apply_inner_persona_to_shots(
+        script, raw_shots, rules.get("inner_persona"))
     character_number_map = build_character_number_map(
         continuity, {"shots": raw_shots})
     character_by_name = {
@@ -647,6 +674,11 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
         scene = scenes.get(raw.get("scene_no"), {})
         kind = raw.get("kind") or ("dialogue" if raw.get("dialogue") else "environment")
         characters = list(dict.fromkeys(raw.get("characters", [])))
+        narrative_overlays = [
+            copy.deepcopy(item)
+            for item in (raw.get("narrative_overlays") or [])
+            if isinstance(item, dict)
+        ][:1]
         if not characters:
             # 环境/空镜必须允许 0 人。旧逻辑会从场次人物表里擅自塞进第一名
             # 角色，导致提示词、人数质检和最终画面一起多出人。只有对白或
@@ -656,7 +688,10 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             if speaker:
                 characters = [speaker]
             elif kind in ("reaction", "beat", "dialogue", "physical"):
-                characters = list(scene.get("characters", []))[:1]
+                characters = physical_scene_characters(
+                    scene.get("characters", []),
+                    raw.get("timeline_state", "unknown"),
+                    inner_policy)[:1]
         start_state = {
             name: copy.deepcopy(previous.get(name) or _state(name, continuity))
             for name in characters
@@ -714,6 +749,10 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             f"{name}{state['position']}" for name, state in start_state.items())
         gaze = "主体 → 凝视/瞥向 → 对手或核心物件"
         micro_expression = "眉眼变化·下颌张力·呼吸节奏"
+        if narrative_overlays:
+            micro_expression += (
+                "；内心Q版以夸张眉眼、嘴形、手势和身体弹性强化吐槽/冲突，"
+                "真人宿主保持闭口，不替内心声音做口型")
         performance_goal = raw.get("description") or "完成本镜叙事任务"
         seedance_prompt = (
             (f"【制作圣经】{seedance_master}。" if seedance_master else "") +
@@ -732,6 +771,17 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             "【禁止】最终画面不得出现P01等人物编号、姓名标签、坐标、箭头、"
             "空间调度图符号、字幕、Logo或水印。"
         )
+        if narrative_overlays:
+            overlay = narrative_overlays[0]
+            seedance_prompt += (
+                "【非现实内心Q版叠层】"
+                f"{overlay.get('name')}是{overlay.get('host_character')}的"
+                "内心人格，不是真实人物，不计入上述真实人数，不参与物理站位、"
+                "遮挡或空间调度；只有宿主内心感知，其他人物不得看见、回应、"
+                "触碰或与其对视。继承锁定的当前服装，不继承任何默认道具；"
+                f"以夸张Q版表情和动作表现：{overlay.get('expression')}；"
+                f"{overlay.get('action')}。内心声音出现时宿主闭口，禁止旁白字幕。"
+            )
         environment_sound = (
             f"{scene.get('location', '场景')}环境底噪·空间空气声·动作触发声")
         visual_hook = "主体视线或动作方向承接下一镜"
@@ -777,6 +827,9 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             "timecode": timecode,
             "characters": characters,
             "character_count": len(characters),
+            "narrative_overlays": narrative_overlays,
+            "inner_persona_policy": copy.deepcopy(inner_policy),
+            "visible_figure_count": len(characters) + len(narrative_overlays),
             "character_number_map": shot_character_map,
             "character_number_ids": list(shot_character_map),
             "type_word": _type_word(scene, raw),
@@ -841,6 +894,7 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             character["name"]: actor_id
             for actor_id, character in character_number_map.items()
         },
+        "inner_persona_policy": copy.deepcopy(inner_policy),
         "shots": shots,
     }
 
@@ -933,19 +987,25 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
             len(dialogue.get("dialogue", "")) <= max_chars)
 
     reaction_ok = True
+    inner_policy = normalize_inner_persona_policy(
+        script, rules.get("inner_persona"))
     reaction_ratio = float(performance_rules.get(
         "listener_duration_ratio", performance_rules.get(
             "reaction_min_ratio", 2 / 3)))
     if performance_rules.get("reaction_after_key_dialogue", True):
         scene_people = {
-            scene.get("scene_no"): set(scene.get("characters", []))
+            scene.get("scene_no"): list(scene.get("characters", []))
             for scene in script.get("scenes", [])
         }
         for index, shot in enumerate(shots):
             dialogue = shot.get("dialogue")
             part = shot.get("dialogue_part") or {"index": 1, "total": 1}
-            if (not dialogue or part.get("index") != part.get("total")
-                    or len(scene_people.get(shot.get("scene_no"), set())) < 2):
+            physical_people = physical_scene_characters(
+                scene_people.get(shot.get("scene_no"), []),
+                shot.get("timeline_state", "unknown"), inner_policy)
+            if (not dialogue or dialogue.get("inner_voice")
+                    or part.get("index") != part.get("total")
+                    or len(physical_people) < 2):
                 continue
             following = shots[index + 1] if index + 1 < len(shots) else {}
             reaction_ok = reaction_ok and (
@@ -1022,6 +1082,14 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
     people_ok = all(
         shot.get("character_count") == len(shot.get("characters", []))
         and set(shot.get("characters", [])) <= cast
+        and all(
+            overlay.get("physical_presence") is False
+            and overlay.get("counts_as_real_character") is False
+            and overlay.get("included_in_spatial_blocking") is False
+            and overlay.get("visible_to") == "host_only"
+            and overlay.get("historical_characters_may_react") is False
+            and overlay.get("host_character") in shot.get("characters", [])
+            for overlay in (shot.get("narrative_overlays") or []))
         for shot in shots)
     threshold = storyboard_rules.get(
         "spatial_blocking_required_for_group", 3)

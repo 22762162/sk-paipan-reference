@@ -779,6 +779,16 @@ button.canvas-stage-item:hover, button.canvas-stage-item:focus-visible {
 }
 .storyboard-cast small { width: 100%; color: var(--ink-3); font-size: 9.5px; }
 .storyboard-cast.mismatch small { color: var(--critical); }
+.storyboard-inner-persona {
+  display: flex; align-items: center; gap: 5px; flex-wrap: wrap; margin-top: 6px;
+}
+.storyboard-inner-persona > span {
+  padding: 2px 7px; border: 1px solid #8e6bc6; border-radius: 999px;
+  background: rgba(100, 68, 150, .16); color: #d9c4ff; font-size: 10px;
+}
+.storyboard-inner-persona small {
+  width: 100%; color: #b79bdc; font-size: 9.5px;
+}
 .storyboard-description details { margin-top: 8px; color: var(--ink-3); font-size: 10.5px; }
 .storyboard-description summary { color: var(--accent); cursor: pointer; }
 .storyboard-description details div { margin-top: 5px; line-height: 1.45; }

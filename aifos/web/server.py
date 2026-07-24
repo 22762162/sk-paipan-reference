@@ -448,11 +448,12 @@ def _image_asset_catalog(app, project_id):
         "first_frame": "首帧", "last_frame": "尾帧",
         "cover": "封面", "reference": "上传参考图",
         "spatial_blocking": "空间调度图",
+        "inner_persona": "内心Q版母资产",
     }
     category_labels = {
         "character": "人物", "scene": "场景", "costume": "服装",
         "shot": "镜头", "frame": "首尾帧", "cover": "封面",
-        "reference": "参考图",
+        "reference": "参考图", "inner_persona": "内心Q版",
     }
     project = app.db.query_one(
         "SELECT id, title FROM projects WHERE id=?", (project_id,))
@@ -500,7 +501,8 @@ def _image_asset_catalog(app, project_id):
             stored_prompts[row["name"]] = prompt
 
     def category_for(kind, meta):
-        if kind in {"character_candidate", "character_art"}:
+        if kind in {
+                "character_candidate", "character_art", "inner_persona"}:
             return "character"
         if kind == "character_sheet":
             return ("costume" if meta.get("sheet") in {
@@ -518,7 +520,8 @@ def _image_asset_catalog(app, project_id):
     def board_group_for(kind):
         """资产画布的一级泳道:先区分是否会直接进入后续生产。"""
         if kind in {"character_art", "scene_art", "image", "first_frame",
-                    "last_frame", "cover", "spatial_blocking"}:
+                    "last_frame", "cover", "spatial_blocking",
+                    "inner_persona"}:
             return "production"
         if kind == "character_sheet":
             return "character_support"
@@ -549,6 +552,7 @@ def _image_asset_catalog(app, project_id):
             "cover": "封面资产",
             "reference": "上传参考·按关联调用",
             "spatial_blocking": "多人/变机位镜头·Seedance 必传",
+            "inner_persona": "必要内心戏自动使用·不计现场真人",
         }.get(kind, "项目资产")
 
     def prompt_key(row, meta, episode_number):
@@ -718,6 +722,11 @@ def _collect_artifacts(app, project_id, ep_num):
              "reference_role", ""),
          "url": _versioned(_artifact_url(app, row["uri"]), row)}
         for row in latest_rows("reference")]
+    out["inner_personas"] = [
+        {"asset_id": row["id"], "kind": row["kind"], "name": row["name"],
+         "url": _versioned(_artifact_url(app, row["uri"]), row),
+         "meta": json.loads(row["meta"] or "{}")}
+        for row in latest_rows("inner_persona")]
     out["image_assets"] = _image_asset_catalog(app, project_id)
     return out
 

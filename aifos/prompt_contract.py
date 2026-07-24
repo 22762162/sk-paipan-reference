@@ -373,6 +373,28 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
         })
     scene = shot_local_scene(shot, location)
     physical = build_physical_contract(shot)
+    overlays = []
+    for item in shot.get("narrative_overlays") or []:
+        if not isinstance(item, dict):
+            continue
+        overlays.append({
+            "kind": _text(item.get("kind"), "inner_persona_chibi"),
+            "name": _text(item.get("name"), "内心Q版"),
+            "host_character": _text(item.get("host_character"), "宿主"),
+            "function": _text(item.get("function"), "inner_commentary"),
+            "expression": _text(
+                item.get("expression"),
+                "夸张但清晰可读的Q版眉眼、嘴形、手势和身体弹性"),
+            "action": _text(
+                item.get("action"), "在宿主肩旁完成内心反应"),
+            "dialogue": _text(item.get("dialogue")),
+            "physical_presence": False,
+            "counts_as_real_character": False,
+            "included_in_spatial_blocking": False,
+            "visible_to": "host_only",
+            "inherit_signature_props": False,
+            "host_mouth_closed": True,
+        })
     # Never fall back to the raw storyboard prompt here. It may contain the
     # whole episode bible and unrelated scenes, which makes the provider blend
     # facts from other shots into this image.
@@ -403,13 +425,20 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
         "camera": _camera(shot),
         "physical": physical,
         "end": _state_line(shot.get("end_state")) or "到达尾帧状态",
-        "dialogue": _text(dialogue.get("dialogue")),
-        "speaker": _text(dialogue.get("character")),
+        "dialogue": (
+            "" if dialogue.get("inner_voice")
+            else _text(dialogue.get("dialogue"))),
+        "speaker": (
+            "" if dialogue.get("inner_voice")
+            else _text(dialogue.get("character"))),
+        "inner_voice": bool(dialogue.get("inner_voice")),
         "text": text_rule,
+        "narrative_overlays": overlays[:1],
         "references": refs,
         "hard": (
             "只执行一个主动作和一个运镜；人物身份、服装、场景、构图分别服从"
-            "对应参考图；不得重新设计人物，不得新增/复制人物或把参考图内容贴进成片"
+            "对应参考图；不得重新设计人物，不得新增/复制真实人物或把参考图内容"
+            "贴进成片；非现实Q版叠层不得转化成真人、实体角色或空间站位"
         ),
     }
     return contract
@@ -433,6 +462,10 @@ def _reference_role(item):
         return "画风：只锁媒介、材质、色彩、光影"
     if role == "composition":
         return "构图：只锁机位、构图、动作路径"
+    if role in {"inner_persona", "narrative_overlay"}:
+        return (
+            "内心Q版：只锁Q版脸、发型、当前衣着和Q版比例；"
+            "不增加真实人物、站位或默认道具")
     return "弱参考：不得覆盖已锁定身份和场景"
 
 
@@ -450,7 +483,7 @@ def render_shot_prompt(contract, *, mode="image"):
     )
     lines = [
         "【镜头合同v2】只执行下列事实，不自行补剧情。",
-        f"【主体】严格共{count}人：{subject}。",
+        f"【主体】严格共{count}人：{subject}（均为真实人物）。",
         f"【场景】{contract['scene']}。",
         f"【起点】{contract['start']}。",
         f"【单一主动作】{contract['action']}。",
@@ -458,6 +491,22 @@ def render_shot_prompt(contract, *, mode="image"):
         f"【镜头】{camera_line}。",
         f"【终点】{contract['end']}。",
     ]
+    overlays = contract.get("narrative_overlays") or []
+    if overlays:
+        overlay = overlays[0]
+        inner_dialogue = (
+            f"；内心说「{overlay['dialogue']}」"
+            if overlay.get("dialogue") else "")
+        lines.insert(
+            2,
+            "【非现实内心Q版叠层】"
+            f"{overlay['name']}是{overlay['host_character']}的内心人格，"
+            f"用途={overlay['function']}；{overlay['expression']}；"
+            f"{overlay['action']}{inner_dialogue}。它不是真实人物，不计入"
+            f"上述{count}名真实主体，不参与物理站位、遮挡、空间调度或真实"
+            "连续性；只有宿主内心感知，其他人物不得看见、回应、触碰、对视；"
+            "继承锁定的当前衣着，不继承默认道具；内心发声时宿主闭口，"
+            "不画旁白/吐槽字幕。")
     physical = contract.get("physical") or {}
     physical_rules = "；".join(physical.get("rules") or [])
     if physical_rules:

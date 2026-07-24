@@ -351,6 +351,24 @@ def build_instruction(capability, payload, out_dir):
             f"严格共 {payload.get('count', len(payload.get('characters', [])))} "
             "个已登记角色；"
             + (composition.get("count_rule") or "每个人物只计一次"))
+        overlays = [
+            item for item in (payload.get("narrative_overlays") or [])
+            if isinstance(item, dict)
+        ][:1]
+        if overlays:
+            overlay = overlays[0]
+            overlay_line = (
+                "- 本镜另有1个非现实内心Q版叠层:"
+                f"{overlay.get('name') or '内心Q版'}，宿主="
+                f"{overlay.get('host_character') or '宿主'}。detected_count"
+                "只统计真实人物，不把Q版计入；detected_overlay_count单独统计"
+                "Q版且必须为1。Q版不得成为真人实体、不得进入真实站位或遮挡、"
+                "不得被其他人物看见/回应/触碰；继承当前衣着、无默认道具，"
+                "表情动作应夸张。内心发声时真人宿主闭口，不得出现旁白字幕。\n")
+        else:
+            overlay_line = (
+                "- 本镜不允许内心Q版叠层；detected_overlay_count必须为0，"
+                "不得新增Q版、分身、幽灵或意识小人。\n")
         generation = payload.get("generation_input")
         generation = generation if isinstance(generation, dict) else {}
         generation_prompt = (
@@ -408,7 +426,8 @@ def build_instruction(capability, payload, out_dir):
             "必须点数画面实际可见人物；多一个、少一个、角色被复制或两人合成一人"
             "都必须判失败。过肩镜中前景半身背影/肩膀是已登记的对话者本人，"
             "只计该角色1人，不得另算成第三人、陌生人或人物复制。\n"
-            f"- 场景:{payload.get('location', '按提示词')};"
+            + overlay_line
+            + f"- 场景:{payload.get('location', '按提示词')};"
             f"动作:{payload.get('action', '按提示词')};"
             f"镜头景别:{payload.get('camera', '不限')}\n"
             f"- 物理/空间逻辑硬检查:{physical_line}\n"
@@ -431,6 +450,9 @@ def build_instruction(capability, payload, out_dir):
             '"basis":["实际核验项"],"checked":true或false,"match":true或false}], '
             '"gender_checked": true或false, "gender_match": true或false, '
             '"count_checked": true或false, "count_match": true或false, '
+            '"overlay_count_checked": true或false, '
+            '"overlay_count_match": true或false, '
+            '"detected_overlay_count": 画面实际内心Q版叠层数整数, '
             '"physical_logic_checked": true或false, "physical_logic_match": true或false, '
             '"spatial_logic_checked": true或false, "spatial_logic_match": true或false, '
             '"detected_count": 画面实际人数整数, '

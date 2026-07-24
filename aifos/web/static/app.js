@@ -6775,6 +6775,7 @@ const VIDEO_REF_KIND_CN = {
   image: "分镜图", character_identity: "人物最终立绘",
   scene_art: "场景图", reference: "用户参考图",
   character_sheet: "人物资产图", character_art: "人物立绘",
+  inner_persona: "内心Q版母资产",
   first_frame: "首帧", last_frame: "尾帧",
   spatial_blocking: "空间调度图",
 };
@@ -6786,6 +6787,7 @@ const VIDEO_REF_USAGE_CN = {
   reference: "按上传时声明的单一用途使用",
   character_sheet: "只补充标签对应的人物局部属性",
   character_art: "只锁脸、年龄、性别表达与身份标志",
+  inner_persona: "只锁Q版身份、当前服装和比例，动作表情可按内心戏夸张发挥",
   first_frame: "视频动作起点，必须传入",
   last_frame: "视频动作终点及衔接，必须传入",
   spatial_blocking: "锁定多人站位、行动路线和摄影机起终点，必须传入",
@@ -8209,11 +8211,17 @@ function storyboardCharacterHtml(shot) {
   const labels = rows.length
     ? rows.map((row) => row.display_label || `${row.actor_id || ""} ${row.name || ""}`)
     : names;
+  const overlays = (shot.narrative_overlays || []).filter(
+    (item) => item && item.kind === "inner_persona");
   return `<div class="storyboard-cast ${mismatch ? "mismatch" : ""}">
     ${labels.map((label) => `<span>${esc(label)}</span>`).join("")
       || `<span>无出场人物</span>`}
     <small>${expected} 人${mismatch ? ` · 名单实际 ${names.length} 人` : " · 人数已锁"}</small>
-  </div>`;
+  </div>${overlays.length ? `<div class="storyboard-inner-persona">
+    ${overlays.map((item) => `<span>🧠 ${esc(item.display_name
+      || item.name || item.asset_name || "Q版内心")}</span>`).join("")}
+    <small>非现实内心投影 · 夸张表演 · 不计入现场真人</small>
+  </div>` : ""}`;
 }
 
 function storyboardSoundHtml(data, shot) {
@@ -9095,6 +9103,10 @@ class StoryboardCanvas {
       <ul class="links">
         <li><span>镜头功能</span><span>${esc(shot.shot_function || "-")}</span></li>
         <li><span>人物</span><span>${esc((shot.characters || []).join("、"))} · ${shot.character_count ?? 0}人</span></li>
+        ${(shot.narrative_overlays || []).length ? `<li><span>内心Q版</span><span>${
+          esc((shot.narrative_overlays || []).map((item) => item.display_name
+            || item.name || item.asset_name || "Q版内心").join("、"))
+        } · 非现实叠层，不计真人</span></li>` : ""}
         <li><span>时间码</span><span>${esc(shot.timecode || "-")} · ${fmt(shot.duration, 1)}s</span></li>
         <li><span>类型词</span><span>${esc(shot.type_word || shot.kind || "-")}</span></li>
         <li><span>剧本对应</span><span>${esc(shot.script_reference || "-")}</span></li>

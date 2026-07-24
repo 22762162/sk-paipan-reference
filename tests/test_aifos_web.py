@@ -1010,6 +1010,52 @@ def test_asset_image_catalog_has_category_origin_time_and_prompt(server):
     assert item["selected"] is False
 
 
+def test_episode_catalog_accepts_inner_persona_asset(server):
+    app2 = App(server["workspace"])
+    try:
+        project, _ = app2.projects.get_or_create_project("内心Q版资产测试")
+        episode, _ = app2.projects.get_or_create_episode(
+            project["id"], 1, title="内心戏")
+        path = (app2.workspace.artifacts_dir
+                / f"p{project['id']:03d}" / "inner_persona.png")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+        row = app2.assets.register(
+            project["id"], "inner_persona", "主角:chibi-a",
+            uri=str(path), meta={
+                "image_quality": "high",
+                "prompt": "当前服装的夸张Q版内心人格，透明背景",
+            })
+        app2.assets.register(
+            project["id"], "character_identity", "主角",
+            uri=str(path), meta={"image_quality": "high", "locked": True})
+        app2.projects.save_document(episode["id"], "storyboard", {
+            "shots": [{
+                "shot_no": 1, "scene_no": 1, "characters": ["主角"],
+                "character_count": 1,
+                "narrative_overlays": [{
+                    "kind": "inner_persona_chibi",
+                    "host_character": "主角",
+                    "asset_name": row["name"],
+                }],
+            }],
+        })
+        episode_id = episode["id"]
+    finally:
+        app2.close()
+
+    status, detail = _json_request(
+        server["port"], "GET", f"/api/episode/{episode_id}")
+    assert status == 200
+    assert detail["artifacts"]["inner_personas"][0]["asset_id"] == row["id"]
+    catalog_item = next(
+        item for item in detail["artifacts"]["image_assets"]
+        if item["asset_id"] == row["id"])
+    assert catalog_item["label"].startswith("内心Q版母资产")
+    assert catalog_item["category"] == "character"
+    assert catalog_item["usage_label"] == "必要内心戏自动使用·不计现场真人"
+
+
 def test_history_delete_api_can_keep_asset_center_images(server):
     app2 = App(server["workspace"])
     try:

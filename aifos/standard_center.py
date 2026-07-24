@@ -25,7 +25,7 @@ DEFAULT_STANDARD = {
     "source_skill": {
         "id": "sk-manju-storyboard-skill",
         "name": "SK 漫剧五维分镜制作 Skill",
-        "version": "5.1",
+        "version": "5.2",
         "reference": "five-dimension-storyboard-template-v5.txt",
         "principle": (
             "先从剧情推导人物视觉 DNA、完成全剧角色去重和人工定版，"
@@ -58,6 +58,7 @@ DEFAULT_STANDARD = {
                 "reference_roles": [
                     "identity", "wardrobe", "scene", "composition",
                     "spatial_blocking", "continuity", "style",
+                    "inner_persona",
                 ],
             },
             "fast_vip_real_face_conflict": "pause_for_confirmation",
@@ -141,6 +142,27 @@ DEFAULT_STANDARD = {
                 "background": 0,
             },
             "initial_portrait_quality_gate": False,
+        },
+        "inner_persona": {
+            "schema": "aifos.inner-persona/v1",
+            "mode": "chibi_overlay",
+            "physical_presence": False,
+            "counts_as_real_character": False,
+            "included_in_spatial_blocking": False,
+            "visible_to": "host_only",
+            "historical_characters_may_react": False,
+            "real_form_forbidden_after_transition": True,
+            "wardrobe_source": "locked_current_look",
+            "inherit_signature_props": False,
+            "allowed_functions": [
+                "inner_monologue", "inner_commentary",
+                "comic_reaction", "decision_conflict",
+            ],
+            "auto_after_every_dialogue": False,
+            "expression_style": "exaggerated",
+            "max_overlays_per_shot": 1,
+            "host_mouth_closed_for_inner_voice": True,
+            "forbid_burned_subtitles": True,
         },
         "dialogue": {
             "preserve_verbatim": True,
@@ -531,6 +553,61 @@ class StandardCenter:
                 "rules.character_assets.candidate_targets",
                 "候选额度必须为主角5、重要配角3、非重要配角1、背景路人0")
 
+        inner_persona = required_dict(
+            rules, "inner_persona", "rules.inner_persona")
+        if inner_persona.get("schema") != "aifos.inner-persona/v1":
+            issue(
+                "rules.inner_persona.schema",
+                "内心人格规则必须使用 aifos.inner-persona/v1")
+        if inner_persona.get("mode") != "chibi_overlay":
+            issue(
+                "rules.inner_persona.mode",
+                "内心人格必须采用非现实 Q 版叠层")
+        for key in (
+                "physical_presence", "counts_as_real_character",
+                "included_in_spatial_blocking",
+                "historical_characters_may_react",
+                "inherit_signature_props", "auto_after_every_dialogue"):
+            if inner_persona.get(key) is not False:
+                issue(
+                    f"rules.inner_persona.{key}",
+                    "内心 Q 版不得成为实体、真实人数、空间角色、历史人物"
+                    "反应对象、默认道具来源或逐句自动插入项")
+        for key in (
+                "real_form_forbidden_after_transition",
+                "host_mouth_closed_for_inner_voice",
+                "forbid_burned_subtitles"):
+            if inner_persona.get(key) is not True:
+                issue(
+                    f"rules.inner_persona.{key}",
+                    "该内心人格硬规则必须开启")
+        if inner_persona.get("visible_to") != "host_only":
+            issue(
+                "rules.inner_persona.visible_to",
+                "Q 版内心人格只能被宿主内心感知")
+        if inner_persona.get("wardrobe_source") != "locked_current_look":
+            issue(
+                "rules.inner_persona.wardrobe_source",
+                "Q 版衣着必须继承已锁定的当前造型")
+        if inner_persona.get("expression_style") != "exaggerated":
+            issue(
+                "rules.inner_persona.expression_style",
+                "Q 版内心表演必须允许夸张表达")
+        if inner_persona.get("max_overlays_per_shot") != 1:
+            issue(
+                "rules.inner_persona.max_overlays_per_shot",
+                "每镜最多一个内心 Q 版叠层")
+        functions = inner_persona.get("allowed_functions")
+        required_functions = {
+            "inner_monologue", "inner_commentary",
+            "comic_reaction", "decision_conflict",
+        }
+        if (not isinstance(functions, list)
+                or not required_functions.issubset(set(functions))):
+            issue(
+                "rules.inner_persona.allowed_functions",
+                "必须覆盖内心独白、内心吐槽、喜剧反应与决策冲突")
+
         dialogue = required_dict(rules, "dialogue", "rules.dialogue")
         bool_field(dialogue, "preserve_verbatim", "rules.dialogue.preserve_verbatim")
         bool_field(dialogue, "split_at_natural_pause", "rules.dialogue.split_at_natural_pause")
@@ -721,10 +798,19 @@ class StandardCenter:
         source_defaults = DEFAULT_STANDARD["source_skill"]
         if (isinstance(source, dict)
                 and source.get("id") == source_defaults["id"]):
-            for key in ("version", "principle"):
-                if source.get(key) != source_defaults[key]:
-                    source[key] = copy.deepcopy(source_defaults[key])
-                    changed = True
+            def version_tuple(value):
+                return tuple(
+                    int(part) for part in str(value or "0").split(".")
+                    if part.isdigit())
+
+            if version_tuple(source.get("version")) < version_tuple(
+                    source_defaults["version"]):
+                source["version"] = source_defaults["version"]
+                changed = True
+            if not str(source.get("principle") or "").strip():
+                source["principle"] = copy.deepcopy(
+                    source_defaults["principle"])
+                changed = True
         text_rules = rules.get("text_assets")
         text_defaults = DEFAULT_STANDARD["rules"]["text_assets"]
         if not isinstance(text_rules, dict):
@@ -802,13 +888,23 @@ class StandardCenter:
                 if key not in story_rules:
                     story_rules[key] = copy.deepcopy(value)
                     changed = True
+        inner_defaults = DEFAULT_STANDARD["rules"]["inner_persona"]
+        inner_rules = rules.get("inner_persona")
+        if not isinstance(inner_rules, dict):
+            rules["inner_persona"] = copy.deepcopy(inner_defaults)
+            changed = True
+        else:
+            for key, value in inner_defaults.items():
+                if key not in inner_rules:
+                    inner_rules[key] = copy.deepcopy(value)
+                    changed = True
         if not changed:
             return snapshot
         try:
             return self.save(
                 content, change_note=(
                     "自动升级：加入视觉 DNA、全剧角色去重、三视图母资产、"
-                    "剧本分析、剧情事实源与空间调度规则"),
+                    "剧本分析、剧情事实源、空间调度与非现实Q版内心人格规则"),
                 expected_active_id=snapshot.get("version_id"))
         except StandardConflictError:
             # 多个 App 同时启动时由先完成者负责升级。
