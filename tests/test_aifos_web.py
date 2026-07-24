@@ -1003,6 +1003,33 @@ def test_image_line_switch_and_parallel(server):
     assert status == 400
 
 
+def test_codex_parallel_settings_and_shards_api(server):
+    """双 Codex 配置可保存，分片快照始终返回可观测状态。"""
+    port = server["port"]
+    status, view = _json_request(port, "GET", "/api/settings")
+    assert status == 200
+    assert len(view["codex_profiles"]) == 2
+    assert {item["id"] for item in view["codex_profiles"]} == {
+        "codex_a", "codex_b"}
+    assert view["codex_parallel"]["max_parallel"] == 2
+    status, saved = _json_request(port, "POST", "/api/settings", {
+        "codex_profiles": [
+            {"id": "codex_a", "name": "A", "enabled": True,
+             "codex_home": "/tmp/not-a-real-codex-home", "command": "codex"},
+            {"id": "codex_b", "name": "B", "enabled": False,
+             "codex_home": "~/.codex-account-b", "command": "codex"},
+        ],
+    })
+    assert status == 200
+    assert saved["codex_profiles"][0]["name"] == "A"
+    status, shards = _json_request(
+        port, "GET", "/api/image-production/shards")
+    assert status == 200
+    assert len(shards["shards"]) == 2
+    assert {item["id"] for item in shards["shards"]} == {
+        "codex_a", "codex_b"}
+
+
 def test_image_acceleration_options_and_preflight_api(server):
     """加速 API 只读预检会锁定提示词、参考图、provider 和 model。"""
     port = server["port"]

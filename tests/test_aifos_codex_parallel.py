@@ -25,7 +25,7 @@ def _profiles(tmp_path):
 def test_director_assigns_ready_profiles_round_robin(tmp_path):
     profiles, _home_a, _home_b = _profiles(tmp_path)
     app = App(tmp_path / "ws", config_overrides={
-        "codex_profiles": profiles,
+        "codex_parallel": {"profiles": profiles},
     })
     try:
         tasks = [
@@ -48,7 +48,7 @@ def test_director_skips_unavailable_profile_and_respects_strict_provider(
     profiles, _home_a, _home_b = _profiles(tmp_path)
     profiles[0]["enabled"] = False
     app = App(tmp_path / "ws", config_overrides={
-        "codex_profiles": profiles,
+        "codex_parallel": {"profiles": profiles},
     })
     try:
         tasks = [

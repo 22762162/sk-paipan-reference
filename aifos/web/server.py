@@ -990,6 +990,8 @@ def make_handler(workspace, jobs):
                     return self._json(payload)
                 if route == "/api/jobs":
                     return self._json(jobs.list())
+                if route == "/api/image-production/shards":
+                    return self._image_production_shards()
                 if route == "/api/standards":
                     return self._standards()
                 if route == "/api/standards/export":
@@ -1953,6 +1955,86 @@ def make_handler(workspace, jobs):
                 return self._error(400, str(exc))
             # 重新加载,回传保存后的完整视图
             return self._json(self._with_app(settings_payload))
+
+        def _image_production_shards(self):
+            """返回图片任务按 Codex profile 的只读分片快照。
+
+            生产线程把 profile id 写入 render_plan 条目；这里仅汇总已有
+            清单，不启动任何 Provider，也不读取 CODEX_HOME 下的认证文件。
+            没有新任务时返回两个可用但空闲的通道，前端仍能明确看到配置
+            已生效，而不是把 404 误判成设置未保存。
+            """
+            def collect(app):
+                profiles = app.config.codex_profiles()
+                rows = {profile["id"]: {
+                    "id": profile["id"],
+                    "name": profile["name"],
+                    "assigned": 0,
+                    "running": 0,
+                    "completed": 0,
+                    "failed": 0,
+                    "active_jobs": [],
+                } for profile in profiles}
+                jobs_seen = set()
+                for job in jobs.list():
+                    if job.get("status") not in ("running", "done", "failed"):
+                        continue
+                    try:
+                        row = app.db.query_one(
+                            "SELECT p.id AS project_id, e.id AS episode_id "
+                            "FROM projects p JOIN episodes e "
+                            "ON e.project_id=p.id "
+                            "WHERE p.title=? AND e.number=?",
+                            (job.get("title"), int(job.get("episode"))),
+                        )
+                    except (TypeError, ValueError):
+                        row = None
+                    if row is None:
+                        continue
+                    plan_path = (app.workspace.artifacts_dir
+                                 / f"p{int(row['project_id']):03d}"
+                                 / f"e{int(job['episode']):03d}"
+                                 / "render_plan.json")
+                    try:
+                        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        continue
+                    for item in plan.get("items", []):
+                        profile_id = str(item.get("codex_profile") or "")
+                        target = rows.get(profile_id)
+                        if target is None or item.get("category") not in (
+                                "character_art", "character_sheet",
+                                "scene_art", "shot_image", "first_frame",
+                                "last_frame", "cover"):
+                            continue
+                        item_key = f"{job.get('id')}:{item.get('id')}"
+                        if item_key in jobs_seen:
+                            continue
+                        jobs_seen.add(item_key)
+                        target["assigned"] += 1
+                        status = item.get("status") or "pending"
+                        if status == "generating":
+                            target["running"] += 1
+                        elif status in ("done", "reused"):
+                            target["completed"] += 1
+                        elif status in ("failed", "awaiting_human"):
+                            target["failed"] += 1
+                        if status == "generating":
+                            target["active_jobs"].append({
+                                "id": item.get("id", ""),
+                                "status": status,
+                                "error": item.get("error", ""),
+                            })
+                for target in rows.values():
+                    finished = target["completed"] + target["failed"]
+                    target["progress"] = (
+                        finished / target["assigned"]
+                        if target["assigned"] else 0)
+                return {
+                    "shards": list(rows.values()),
+                    "codex_parallel": app.config.codex_parallel_status(),
+                }
+            return self._json(self._with_app(collect))
 
         def _icloud_sync_backfill(self):
             report = self._with_app(lambda app: app.icloud_sync.backfill())
