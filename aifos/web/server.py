@@ -699,11 +699,42 @@ def _episode_payload(app, episode_id):
                 relations_path.read_text(encoding="utf-8"))
         except ValueError:
             relations = None
+    image_failures = []
     if render_plan is not None:
         render_plan = copy.deepcopy(render_plan)
         for item in render_plan.get("items", []):
             for ref in (item.get("reference_inputs") or {}).get("items", []):
                 ref["url"] = _artifact_url(app, ref.get("uri", ""))
+            output_url = _artifact_url(app, item.get("output_uri", ""))
+            if output_url:
+                try:
+                    stamp = int(Path(item["output_uri"]).stat().st_mtime_ns)
+                except (OSError, TypeError, ValueError):
+                    stamp = int(render_plan.get("updated_at") or 0)
+                separator = "&" if "?" in output_url else "?"
+                item["output_url"] = (
+                    f"{output_url}{separator}failed={stamp}"
+                    if item.get("status") in ("awaiting_human", "failed")
+                    else output_url)
+            if (item.get("category") == "shot_image"
+                    and item.get("status") in ("awaiting_human", "failed")):
+                qc = item.get("qc") or {}
+                issues = list(qc.get("issues") or [])
+                if not issues and item.get("error"):
+                    issues = [item["error"]]
+                image_failures.append({
+                    "item_id": item.get("id", ""),
+                    "shot_no": item.get("shot_no"),
+                    "label": item.get("label", ""),
+                    "status": item.get("status"),
+                    "attempts": int(qc.get("attempts") or 0),
+                    "auto_repairs": int(qc.get("auto_repairs") or max(
+                        0, int(qc.get("attempts") or 1) - 1)),
+                    "issues": issues,
+                    "revision_feedback": qc.get(
+                        "revision_feedback", ""),
+                    "failed_output_url": item.get("output_url"),
+                })
     video_references_effective = app.director.effective_video_references(
         episode_id)
     for shot in video_references_effective.get("shots", {}).values():
@@ -759,6 +790,7 @@ def _episode_payload(app, episode_id):
         "video_qc_report": video_qc_report,
         "video_qc_report_version": video_qc_report_v,
         "render_plan": render_plan,
+        "image_failures": image_failures,
         "relations": relations,
         "image_acceleration": {
             "summary": image_acceleration["summary"],

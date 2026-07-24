@@ -1,5 +1,6 @@
 """图片视觉质检:核对剧本要求,不合格自动重画;镜头景别多样性。"""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -276,9 +277,116 @@ def test_count_mismatch_auto_revises_bad_image_with_locked_references(
     assert revised["reference_manifest"][0]["uri"] == str(identity)
 
 
+@pytest.mark.parametrize("worker_count", [1, 2])
+def test_stage_images_collects_qc_failure_and_finishes_later_shots(
+        app, monkeypatch, worker_count):
+    """单镜二次 QC 失败不能阻断后续镜头，也不能污染正式图片资产。"""
+    project, _ = app.projects.get_or_create_project(
+        f"关键帧失败不中断-{worker_count}")
+    episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+    out_root = (app.workspace.artifacts_dir / f"p{project['id']:03d}"
+                / "e001")
+    out_root.mkdir(parents=True, exist_ok=True)
+    shots = [
+        {"shot_no": shot_no, "scene_no": 1, "characters": []}
+        for shot_no in range(1, 5)
+    ]
+    ctx = {
+        "project": dict(project),
+        "episode": dict(episode),
+        "out_root": out_root,
+        "script": {
+            "scenes": [{"scene_no": 1, "location": "会议室"}],
+        },
+        "storyboard": {"shots": shots},
+    }
+    app.director._plan_write(ctx, {"items": [{
+        "id": f"shot:{shot['shot_no']}",
+        "category": "shot_image",
+        "label": f"镜头 {shot['shot_no']:02d}",
+        "status": "pending",
+        "error": "",
+    } for shot in shots]})
+
+    generated = []
+    output_by_shot = {}
+
+    def fake_generate(_capability, payload, out_dir, _cancel, _qc_spec):
+        shot_no = int(payload["shot_no"])
+        generated.append(shot_no)
+        output = out_dir / f"shot-{shot_no}.png"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"\x89PNG\r\n\x1a\n" + bytes([shot_no]) * 16)
+        output_by_shot[shot_no] = output
+        result = ProviderResult(
+            provider="stub-image", cost=0.1, uri=str(output))
+        failed = shot_no == 2
+        result.qc = {
+            "passed": not failed,
+            "attempts": 2 if failed else 1,
+            "issues": ["镜头2人物多出一人"] if failed else [],
+            "hard_failure": failed,
+        }
+        return result
+
+    monkeypatch.setattr(app.director, "_plan_seed_shots",
+                        lambda _ctx: None)
+    monkeypatch.setattr("aifos.director.write_relations",
+                        lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(app.director, "_shot_payload", lambda _ctx, shot: {
+        "shot_no": shot["shot_no"],
+        "prompt": f"镜头 {shot['shot_no']}",
+        "characters": [],
+        "character_count": 0,
+        "quality_decision": {
+            "level": "medium", "recommended": "medium",
+            "source": "test", "rule": "", "reasons": [],
+        },
+    })
+    monkeypatch.setattr(app.director, "_qc_spec",
+                        lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        app.director, "_parallel_workers", lambda: worker_count)
+    monkeypatch.setattr(app.director, "_prepare_dispatch_contracts",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(app.director, "_claim_dispatch_task",
+                        lambda _ctx, task: task)
+    monkeypatch.setattr(app.director, "_finish_dispatch_task",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(app.director, "_attach_reference_manifest",
+                        lambda _payload: None)
+    monkeypatch.setattr(app.director, "_generate_image_with_qc",
+                        fake_generate)
+    app.director._task_cost = 0.0
+    app.director._task_providers = set()
+
+    with pytest.raises(AifosError) as caught:
+        app.director._stage_images(ctx)
+
+    assert sorted(generated) == [1, 2, 3, 4], \
+        "二次 QC 失败后仍应派发并完成本集剩余关键帧"
+    assert "问题镜头: 2" in str(caught.value)
+    assert [item["shot_no"] for item in ctx["images"]] == [1, 3, 4]
+
+    formal = app.assets.active_list(project["id"], kind="image")
+    assert {row["name"] for row in formal} == {
+        "e001_shot001", "e001_shot003", "e001_shot004"}
+    assert not any(row["uri"] == str(output_by_shot[2]) for row in formal)
+    assert output_by_shot[2].exists(), "失败图必须留给人工查看和定向修改"
+
+    plan = app.director._plan_read(ctx)
+    by_id = {item["id"]: item for item in plan["items"]}
+    assert by_id["shot:2"]["status"] == "awaiting_human"
+    assert by_id["shot:2"]["output_uri"] == str(output_by_shot[2])
+    assert by_id["shot:2"]["qc"]["passed"] is False
+    assert by_id["shot:2"]["qc"]["attempts"] == 2
+    assert by_id["shot:2"]["qc"]["issues"] == ["镜头2人物多出一人"]
+    assert all(by_id[f"shot:{n}"]["status"] == "done"
+               for n in (1, 3, 4))
+
+
 def test_qc_report_lands_in_plan(app):
     """初始母资产不空耗视觉 QC；正式镜头图必须带通过结果。"""
-    import json
     project = _preproduce(app)
     plan = json.loads(
         (app.workspace.artifacts_dir / f"p{project['id']:03d}" / "e001"

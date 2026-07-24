@@ -112,6 +112,16 @@ def test_index_and_static(server):
     assert "armConfirm(button, \"全部重新生成\"".encode() in app_js
     assert "质检没有通过的原因".encode() in app_js
     assert "本次质检/重画实际附上的参考图".encode() in app_js
+    assert "待人工问题清单".encode() in app_js
+    assert b"imageFailurePanelHtml" in app_js
+    assert b"focusImageFailureShot" in app_js
+    assert b"image_failures" in app_js
+    assert b"data-image-failure-shot" in app_js
+    assert "跳到镜头".encode() in app_js
+    assert "展开修改".encode() in app_js
+    assert b"scrollIntoView" in app_js
+    assert "先处理问题图".encode() in app_js
+    assert "失败稿不会进入正式资产".encode() in app_js
     assert "待生产图片批量 API 加速".encode() in app_js
     assert "API 批量加速".encode() in app_js
     assert "选择 API/模型并加速".encode() in app_js
@@ -283,6 +293,53 @@ def test_asset_delete_and_video_reference_api(server):
     assert len(assets) == 2
     assert assets[-1]["meta"]["deleted"] is True
     assert path.exists(), "删除资产中心卡片不应物理删除历史文件"
+
+
+def test_episode_exposes_image_failures_with_artifact_urls(server):
+    """二次 QC 失败必须成为可预览、可定位到镜头的待人工问题。"""
+    app2 = App(server["workspace"])
+    try:
+        project, _ = app2.projects.get_or_create_project("图片待人工接口")
+        episode, _ = app2.projects.get_or_create_episode(project["id"], 1)
+        out_root = (app2.workspace.artifacts_dir / f"p{project['id']:03d}"
+                    / "e001")
+        failed = out_root / "images" / "shot-7-qc-failed.png"
+        failed.parent.mkdir(parents=True, exist_ok=True)
+        failed.write_bytes(b"\x89PNG\r\n\x1a\n" + b"f" * 32)
+        app2.director._plan_write({
+            "out_root": out_root,
+        }, {"items": [{
+            "id": "shot:7",
+            "category": "shot_image",
+            "label": "镜头 07",
+            "shot_no": 7,
+            "status": "awaiting_human",
+            "error": "图片质检未通过",
+            "output_uri": str(failed),
+            "qc": {
+                "passed": False,
+                "awaiting_human": True,
+                "attempts": 2,
+                "issues": ["人物多出一人", "服装颜色与定版不一致"],
+            },
+        }]})
+        episode_id = episode["id"]
+    finally:
+        app2.close()
+
+    status, detail = _json_request(
+        server["port"], "GET", f"/api/episode/{episode_id}")
+    assert status == 200
+    assert detail["render_plan"]["items"][0]["status"] == "awaiting_human"
+    assert len(detail["image_failures"]) == 1
+    failure = detail["image_failures"][0]
+    assert failure["item_id"] == "shot:7"
+    assert failure["shot_no"] == 7
+    assert failure["issues"] == ["人物多出一人", "服装颜色与定版不一致"]
+    failed_url = failure["failed_output_url"]
+    assert failed_url.startswith("/artifacts/")
+    status, ctype, raw = _request(server["port"], "GET", failed_url)
+    assert status == 200 and ctype.startswith("image/png") and raw
 
 
 def test_episode_payload_upgrades_legacy_story_analysis(server):

@@ -2590,6 +2590,7 @@ const PLAN_CATS = ["character_candidate", "character_art", "character_sheet", "s
 const PLAN_STATUS_CN = {
   pending: "排队中", generating: "生成中", done: "已完成",
   failed: "失败", reused: "复用已有", selected: "已选定",
+  awaiting_human: "二次质检未过 · 待人工修改",
 };
 const PLAN_QC_CATS = new Set(["shot_image", "frames"]);
 function planQcEnabled(item) { return PLAN_QC_CATS.has(item.category); }
@@ -2729,6 +2730,7 @@ function planItemThumbs(data, item) {
     if (row && row.url) urls = [row.url];
   } else if (item.category === "shot_image") {
     if ((art.images || {})[item.shot_no]) urls = [art.images[item.shot_no]];
+    else if (item.output_url) urls = [item.output_url];
   } else if (item.category === "frames") {
     if ((art.first || {})[item.shot_no]) urls.push(art.first[item.shot_no]);
     if ((art.last || {})[item.shot_no]) urls.push(art.last[item.shot_no]);
@@ -3047,6 +3049,35 @@ function productionLedgerActionHtml(row) {
   return `<span class="production-ledger-no-action">等待进入生产</span>`;
 }
 
+function imageFailurePanelHtml(data) {
+  const failures = data.image_failures || [];
+  if (!failures.length) return "";
+  return `<section class="image-failure-panel" role="alert"
+    aria-label="待人工问题清单">
+    <div class="image-failure-heading">
+      <div><b>⚠ 待人工问题清单 · ${failures.length} 张关键帧</b>
+        <span>系统已自动定向修图 1 次；这些图仍未通过，但其他关键帧会继续生产。</span></div>
+      <small>失败稿不会进入正式资产或 Seedance 参考链。</small>
+    </div>
+    <div class="image-failure-list">${failures.map((failure) => `
+      <article class="image-failure-item" data-image-failure-item="${esc(failure.item_id || "")}">
+        ${failure.failed_output_url ? `<button type="button"
+          class="image-failure-preview" data-image-failure-preview="${esc(failure.failed_output_url)}"
+          aria-label="查看镜头 ${failure.shot_no} 的失败关键帧">
+          <img src="${esc(thumbUrl(failure.failed_output_url, 180))}" loading="lazy" alt=""></button>`
+          : `<span class="image-failure-no-preview">暂无预览</span>`}
+        <div class="image-failure-copy">
+          <b>镜头 ${String(failure.shot_no).padStart(2, "0")}</b>
+          <span>${esc((failure.issues || []).join("；") || "图片质检未通过")}</span>
+          <small>已自动修图 ${Number(failure.auto_repairs || 1)} 次后仍未过</small>
+        </div>
+        <button type="button" class="primary image-failure-jump"
+          data-image-failure-shot="${failure.shot_no}">
+          跳到镜头并展开修改</button>
+      </article>`).join("")}</div>
+  </section>`;
+}
+
 function productionLedgerHtml(data, options = {}) {
   const rows = productionLedgerRows(data);
   const tasks = data.tasks || [];
@@ -3074,6 +3105,7 @@ function productionLedgerHtml(data, options = {}) {
       <span>${humanVideoShots.map((item) => `镜头${item.shot_no}：${esc((item.issues || []).join("；") || "视频质检未通过")}${item.revision_feedback ? `<small>自动优化修订：${esc(item.revision_feedback)}</small>` : ""}`).join("；")}</span>
       <small>系统只自动返工 1 次；请先填写人工修改意见，再对指定镜头重生成。</small>
     </div>` : ""}
+    ${imageFailurePanelHtml(data)}
     <div class="production-ledger-summary">
       ${stageSummary.map((stage) => `<span class="production-ledger-stage ${stage.done === stage.total && stage.total ? "done" : stage.active ? "running" : "pending"}">
         ${stage.label} <b>${stage.done}/${stage.total}</b></span>`).join("")}
@@ -3113,8 +3145,54 @@ function productionLedgerHtml(data, options = {}) {
   </section>`;
 }
 
+function focusImageFailureShot(root, data, shotNo) {
+  document.getElementById("view-theater")?.click();
+  const row = document.querySelector(
+    `.storyboard-table-row[data-shot="${Number(shotNo)}"]`);
+  if (!row) {
+    showPlanOverlay(data.episode.id, `shot:${Number(shotNo)}`);
+    return;
+  }
+  const section = row.closest(".shot-production-section");
+  const filter = section?.querySelector(".shot-table-filter");
+  if (filter) {
+    filter.value = "all";
+    filter.dispatchEvent(new Event("change"));
+  }
+  row.hidden = false;
+  row.scrollIntoView({ behavior: "smooth", block: "center" });
+  row.classList.add("selected", "qc-needs-human");
+  setTimeout(() => row.classList.remove("selected"), 2200);
+  const editor = row.querySelector(
+    ".storyboard-reference .shot-inline-revision");
+  if (!editor) {
+    showPlanOverlay(data.episode.id, `shot:${Number(shotNo)}`);
+    return;
+  }
+  editor.open = true;
+  const failure = (data.image_failures || []).find(
+    (item) => Number(item.shot_no) === Number(shotNo));
+  const textarea = editor.querySelector(".shot-revision-feedback");
+  if (textarea && !textarea.value.trim()) {
+    textarea.value = failure?.revision_feedback
+      || (failure?.issues || []).join("；");
+  }
+  textarea?.focus({ preventScroll: true });
+  if (editor.dataset.productionActive === "1") {
+    showToast("已定位问题图；其他关键帧仍在生产，批次完成后可直接提交修改", "info");
+  }
+}
+
 function bindProductionLedger(root, data, episodeId) {
   if (!root) return;
+  root.querySelectorAll("[data-image-failure-preview]").forEach((button) => {
+    button.onclick = () => showImageLightbox(
+      button.dataset.imageFailurePreview, "二次质检未通过的关键帧");
+  });
+  root.querySelectorAll("[data-image-failure-shot]").forEach((button) => {
+    button.onclick = () => focusImageFailureShot(
+      root, data, Number(button.dataset.imageFailureShot));
+  });
   root.querySelectorAll(".production-ledger-preview").forEach((button) => {
     button.onclick = () => showImageLightbox(button.dataset.ledgerPreview, button.getAttribute("aria-label") || "产物预览");
   });
@@ -4905,7 +4983,12 @@ function canvasSig(data) {
     ((data.artifacts || {}).scene_art || []).map((x) => x.url),
     (data.artifacts || {}).final, (data.artifacts || {}).cover,
     (((data.render_plan || {}).items) || []).map(
-      (i) => [i.id, i.status, i.custom_prompt ? i.prompt : ""]),
+      (i) => [i.id, i.status, i.output_url || "",
+        i.custom_prompt ? i.prompt : ""]),
+    (data.image_failures || []).map((item) => [
+      item.item_id, item.shot_no, item.failed_output_url,
+      item.revision_feedback, item.issues,
+    ]),
   ]);
 }
 
@@ -5456,9 +5539,8 @@ async function renderCanvasView(episodeId) {
   }
 
   // 质检问题按镜头/台词索引
-  const shotIssues = {}, lineIssues = {};
+  const shotIssues = storyboardShotIssues(data), lineIssues = {};
   (data.qc_report?.issues || []).forEach((i) => {
-    if (i.shot_no != null) (shotIssues[i.shot_no] = shotIssues[i.shot_no] || []).push(i);
     if (i.line_no != null) (lineIssues[i.line_no] = lineIssues[i.line_no] || []).push(i);
   });
 
@@ -5473,6 +5555,7 @@ async function renderCanvasView(episodeId) {
   const lastFailed = ["failed", "qc_failed"].includes(ep.status)
     ? [...(data.tasks || [])].reverse().find((t) => t.status === "failed")
     : null;
+  const firstImageFailure = (data.image_failures || [])[0] || null;
   app.innerHTML = `
   <div class="canvas-view">
     ${["failed", "qc_failed"].includes(ep.status) ? `
@@ -5480,10 +5563,15 @@ async function renderCanvasView(episodeId) {
       <div>
         <b>${lastFailed ? `上次制作在「${esc(STAGE_CN[lastFailed.stage] || lastFailed.stage)}」失败 ⚠️`
           : (ep.status === "qc_failed" ? "成片质检未通过 ⚠️" : "上次制作失败 ⚠️")}</b>
-        <span>${lastFailed ? esc((lastFailed.error || "").slice(0, 200)) + ";" : ""}
-        已完成的剧本/人物/图片/视频全部保留,点右侧按钮从断点接着做,只补缺失部分,不重复消耗额度。</span>
+        <span>${firstImageFailure
+          ? `${data.image_failures.length} 张关键帧二次质检未过，已隔离等待人工修改；其他关键帧已经继续完成，失败稿不会进入正式资产。`
+          : `${lastFailed ? esc((lastFailed.error || "").slice(0, 200)) + ";" : ""}
+        已完成的剧本/人物/图片/视频全部保留,点右侧按钮从断点接着做,只补缺失部分,不重复消耗额度。`}</span>
       </div>
-      <button class="primary" id="btn-resume-canvas">▶ 从断点继续制作</button>
+      <button class="primary" id="btn-resume-canvas">${
+        firstImageFailure
+          ? `定位并处理 ${data.image_failures.length} 张问题图`
+          : "▶ 从断点继续制作"}</button>
     </div>` : ""}
     ${awaiting ? `
     <div class="confirm-banner">
@@ -5587,16 +5675,29 @@ async function renderCanvasView(episodeId) {
       pollCanvas(episodeId);
     } catch (e) { showToast(e.message, "error"); }
   };
-  document.getElementById("btn-reproduce").onclick = (ev) =>
-    armConfirm(ev.target, "补齐", () => reproduce(false));
+  const reproduceButton = document.getElementById("btn-reproduce");
+  if (firstImageFailure) {
+    reproduceButton.textContent = "先处理问题图";
+    reproduceButton.title = "二次质检未过的关键帧人工修好后，再从断点补齐";
+    reproduceButton.onclick = () => focusImageFailureShot(
+      document, data, Number(firstImageFailure.shot_no));
+  } else {
+    reproduceButton.onclick = (ev) =>
+      armConfirm(ev.target, "补齐", () => reproduce(false));
+  }
   document.getElementById("btn-reproduce-force").onclick = (ev) =>
     armConfirm(ev.target, "全部重新生成", () => reproduce(true));
   const btnResumeCanvas = document.getElementById("btn-resume-canvas");
-  if (btnResumeCanvas) btnResumeCanvas.onclick = () => {
-    btnResumeCanvas.disabled = true;
-    btnResumeCanvas.textContent = "已提交,续跑中…";
-    reproduce(false);
-  };
+  if (btnResumeCanvas) {
+    btnResumeCanvas.onclick = firstImageFailure
+      ? () => focusImageFailureShot(
+        document, data, Number(firstImageFailure.shot_no))
+      : () => {
+        btnResumeCanvas.disabled = true;
+        btnResumeCanvas.textContent = "已提交,续跑中…";
+        reproduce(false);
+      };
+  }
   document.getElementById("btn-script").onclick = () => showScriptOverlay(data, episodeId);
   document.getElementById("btn-blocking").onclick = () => showBlockingOverlay(episodeId);
   document.getElementById("btn-plan").onclick = () => showPlanOverlay(episodeId);
@@ -6356,7 +6457,39 @@ function storyboardShotIssues(data) {
     if (issue.shot_no == null) return;
     (byShot[issue.shot_no] = byShot[issue.shot_no] || []).push(issue);
   });
+  (data.image_failures || []).forEach((failure) => {
+    if (failure.shot_no == null) return;
+    const messages = failure.issues || [];
+    (byShot[failure.shot_no] = byShot[failure.shot_no] || []).push({
+      severity: "error",
+      check: "关键帧二次质检",
+      message: messages.join("；") || "自动定向修图后仍未通过，待人工修改",
+      shot_no: failure.shot_no,
+      plan_id: failure.item_id,
+      revision_feedback: failure.revision_feedback || "",
+      awaiting_human: true,
+    });
+  });
   return byShot;
+}
+
+function storyboardKeyframePlanItem(data, shotNo) {
+  return (((data.render_plan || {}).items) || []).find((row) =>
+    row.category === "shot_image" && Number(row.shot_no) === Number(shotNo));
+}
+
+function storyboardKeyframeFailure(data, shotNo) {
+  return (data.image_failures || []).find((row) =>
+    Number(row.shot_no) === Number(shotNo));
+}
+
+function storyboardKeyframeUrl(data, shotNo) {
+  const failure = storyboardKeyframeFailure(data, shotNo);
+  const item = storyboardKeyframePlanItem(data, shotNo);
+  if (failure?.failed_output_url) return failure.failed_output_url;
+  if (["awaiting_human", "failed"].includes(item?.status) && item?.output_url)
+    return item.output_url;
+  return (data.artifacts?.images || {})[shotNo] || "";
 }
 
 function storyboardLineNo(data, shot) {
@@ -6375,9 +6508,15 @@ function storyboardLineNo(data, shot) {
 }
 
 function storyboardPlanState(data, category, shotNo, complete) {
-  if (complete) return { status: "done", label: "已生成" };
   const item = (((data.render_plan || {}).items) || []).find((row) =>
     row.category === category && Number(row.shot_no) === Number(shotNo));
+  if (item?.status === "awaiting_human") {
+    return {
+      status: "awaiting_human",
+      label: PLAN_STATUS_CN.awaiting_human,
+    };
+  }
+  if (complete) return { status: "done", label: "已生成" };
   const status = item?.status || "pending";
   return { status, label: PLAN_STATUS_CN[status] || "待生成" };
 }
@@ -6468,6 +6607,7 @@ function storyboardStatusHtml(data, shot, issues, context) {
   const hasLast = !!(art.last || {})[no];
   const hasVideo = !!(art.videos || {})[no];
   const imageState = storyboardPlanState(data, "shot_image", no, hasImage);
+  const imageFailure = storyboardKeyframeFailure(data, no);
   const frameState = storyboardPlanState(data, "frames", no, hasFirst && hasLast);
   const readable = shot.readable_text || {};
   const videoQc = ((data.video_qc_report || {}).shots || []).find((item) =>
@@ -6483,6 +6623,8 @@ function storyboardStatusHtml(data, shot, issues, context) {
   return `<div class="storyboard-status-stack">
     <span class="storyboard-status state-${storyboardStateClass(imageState.status)}">
       参考分镜 · ${esc(imageState.label)}</span>
+    ${imageFailure?.issues?.length ? `<span class="storyboard-status state-awaiting_human">
+      原因 · ${esc(imageFailure.issues.join("；"))}</span>` : ""}
     <span class="storyboard-status state-${storyboardStateClass(frameState.status)}">
       首尾帧 · ${hasFirst && hasLast ? "已齐" : esc(frameState.label)}</span>
     <span class="storyboard-status state-${storyboardStateClass(videoStatus)}">
@@ -6527,13 +6669,16 @@ function shotProductionTableHtml(data, options = {}) {
       ${sceneShots.map((shot) => {
         const no = shot.shot_no;
         const issues = issuesByShot[no] || [];
+        const failedKeyframe = storyboardKeyframeFailure(data, no);
+        const keyframeUrl = storyboardKeyframeUrl(data, no);
         const imageState = storyboardPlanState(data, "shot_image", no,
           !!(art.images || {})[no]);
         const frameState = storyboardPlanState(data, "frames", no,
           !!(art.first || {})[no] && !!(art.last || {})[no]);
         const description = shot.description || shot.shot_contract?.["画面内容描述"]
           || shot.five_dimensions?.subject_motion || shot.prompt || "未填写";
-        return `<tr class="storyboard-table-row" data-shot="${no}" data-scene="${esc(sceneNo)}"
+        return `<tr class="storyboard-table-row${failedKeyframe ? " qc-needs-human" : ""}"
+          data-shot="${no}" data-scene="${esc(sceneNo)}"
           data-missing-keyframe="${(art.images || {})[no] ? "0" : "1"}"
           data-missing-frames="${(art.first || {})[no] && (art.last || {})[no] ? "0" : "1"}"
           data-missing-video="${(art.videos || {})[no] ? "0" : "1"}"
@@ -6546,9 +6691,10 @@ function shotProductionTableHtml(data, options = {}) {
           <td class="storyboard-duration" data-label="时长">
             <b>${fmt(shot.duration, 1)}s</b><span>${esc(shot.timecode || "时间码未填")}</span></td>
           <td class="storyboard-reference" data-label="参考分镜">
-            ${storyboardMediaThumb((art.images || {})[no], "参考分镜", no, imageState)}
+            ${storyboardMediaThumb(keyframeUrl,
+              failedKeyframe ? "二次质检失败稿" : "参考分镜", no, imageState)}
             ${shotInlineRevisionHtml(
-              no, !!(art.images || {})[no], context === "live")}</td>
+              no, !!keyframeUrl, context === "live")}</td>
           <td class="storyboard-frames" data-label="首尾帧"><div class="storyboard-frame-pair">
             <div class="storyboard-frame-item">
               ${storyboardMediaThumb((art.first || {})[no], "首帧", no, frameState)}
@@ -7055,7 +7201,9 @@ class StoryboardCanvas {
     }
     for (const shot of storyboard.shots) {
       const p = this.positions[shot.shot_no];
-      const img = art.images[shot.shot_no];
+      const failedKeyframe = storyboardKeyframeFailure(
+        this.data, shot.shot_no);
+      const img = storyboardKeyframeUrl(this.data, shot.shot_no);
       const issues = this.shotIssues[shot.shot_no] || [];
       const hasVideo = !!art.videos[shot.shot_no];
       const lineNo = this.lineNoOf(shot);
@@ -7067,15 +7215,18 @@ class StoryboardCanvas {
         : this.data.production_profile?.voice === "jimeng_builtin";
       const voiceOk = integratedVoice ? hasVideo : lineNo != null && !!art.voices[lineNo];
       html += `
-      <div class="shot-card${this.selected === shot.shot_no ? " selected" : ""}"
+      <div class="shot-card${this.selected === shot.shot_no ? " selected" : ""}${
+        failedKeyframe ? " qc-needs-human" : ""}"
            data-canvas-node data-shot="${shot.shot_no}" style="left:${p.x}px;top:${p.y}px">
-        ${img ? `<img src="${esc(img)}" alt="镜头${shot.shot_no}关键图" draggable="false">`
+        ${img ? `<img src="${esc(img)}" alt="镜头${shot.shot_no}${
+          failedKeyframe ? "二次质检失败稿" : "关键图"}" draggable="false">`
               : `<div class="no-img">暂无关键图</div>`}
         <div class="body">
           <div class="head"><span class="sn">#${String(shot.shot_no).padStart(2, "0")}</span>
             <span class="dur">${esc(shot.camera || "")} · ${fmt(shot.duration, 1)}s</span></div>
           <div class="desc">${esc(shot.dialogue ? `${shot.dialogue.character}:「${shot.dialogue.dialogue}」` : shot.description)}</div>
           <div class="badges">
+            ${failedKeyframe ? `<span class="badge qc">⚠ 待人工修改</span>` : ""}
             <span class="badge ${hasVideo ? "ok" : "miss"}">${hasVideo ? "✓ 视频" : "✗ 视频"}</span>
             ${shot.dialogue ? `<span class="badge ${voiceOk ? "ok" : "miss"}">${voiceOk ? "✓ 配音/口型" : "✗ 配音/口型"}</span>` : ""}
             ${issues.length ? `<span class="badge qc">⚠ 质检${issues.length}</span>` : ""}
@@ -7267,13 +7418,19 @@ class StoryboardCanvas {
     }
     const shot = this.data.storyboard.shots.find((s) => s.shot_no === shotNo);
     const issues = this.shotIssues[shotNo] || [];
+    const failedKeyframe = storyboardKeyframeFailure(this.data, shotNo);
+    const keyframeUrl = storyboardKeyframeUrl(this.data, shotNo);
     const lineNo = this.lineNoOf(shot);
     const dims = shot.five_dimensions || {};
     const cam = dims.camera_design || {};
     const textAsset = shot.readable_text || {};
     panel.innerHTML = `
       <h3>${esc(shot.unit_id || `镜头 #${String(shotNo).padStart(2, "0")}`)} · 场${shot.scene_no}</h3>
-      ${art.images[shotNo] ? `<img class="preview" src="${esc(art.images[shotNo])}" alt="关键图">` : ""}
+      ${keyframeUrl ? `<img class="preview" src="${esc(keyframeUrl)}" alt="${
+        failedKeyframe ? "二次质检失败稿" : "关键图"}">` : ""}
+      ${failedKeyframe ? `<div class="issue error">[关键帧二次质检]
+        ${esc((failedKeyframe.issues || []).join("；") || "待人工修改")}</div>` : ""}
+      ${shotInlineRevisionHtml(shotNo, !!keyframeUrl)}
       <h4>首尾帧</h4>
       <div class="thumbs editable-frame-thumbs">
         <figure>${art.first[shotNo] ? `<img src="${esc(art.first[shotNo])}">` : ""}
@@ -7326,7 +7483,7 @@ class StoryboardCanvas {
       <div class="prompt">${esc(shot.seedance_prompt_compact || shot.seedance_prompt || shot.prompt)}</div>
       <h4>产物</h4>
       <ul class="links">
-        ${this.link("关键图", art.images[shotNo])}
+        ${this.link(failedKeyframe ? "二次质检失败稿" : "关键图", keyframeUrl)}
         ${this.link("首帧", art.first[shotNo])}
         ${this.link("尾帧", art.last[shotNo])}
         ${this.link("视频", art.videos[shotNo])}
@@ -7337,7 +7494,7 @@ class StoryboardCanvas {
       <h4>下载修改后上传</h4>
       <div class="io-row"><span>画面</span>
         ${ioControls({ kind: "shot", shot_no: shotNo },
-          art.images[shotNo], `shot_${shotNo}.png`)}</div>
+          keyframeUrl, `shot_${shotNo}.png`)}</div>
       <div class="io-row"><span>视频</span>
         ${ioControls({ kind: "shot_video", shot_no: shotNo },
           art.videos[shotNo], `shot_${shotNo}.mp4`)}</div>

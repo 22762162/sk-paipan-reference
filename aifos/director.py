@@ -1529,7 +1529,8 @@ class Director:
             if status == "generating":
                 item["started_at"] = round(time.time(), 1)
                 item.pop("finished_at", None)
-            elif status in ("done", "failed") and item.get("started_at"):
+            elif status in ("done", "failed", "awaiting_human") \
+                    and item.get("started_at"):
                 item["finished_at"] = round(time.time(), 1)
                 item["duration"] = round(
                     item["finished_at"] - item["started_at"], 1)
@@ -2122,6 +2123,11 @@ class Director:
         extra = {"provider": result.provider,
                  "real": result.provider != "mock",
                  "fallbacks": getattr(result, "fallbacks", [])}
+        uri = getattr(result, "uri", "")
+        if uri:
+            # 二次质检仍未通过的图片不会登记为正式资产，但必须保留
+            # 最终失败稿，供问题清单预览和人工定向修改。
+            extra["output_uri"] = uri
         data = getattr(result, "data", {}) or {}
         for key in ("first_source", "generation_calls", "model",
                     "image_task_class", "image_quality", "unit_cost"):
@@ -2132,20 +2138,28 @@ class Director:
             extra["model"] = model
         qc = getattr(result, "qc", None)
         if qc is not None:
+            qc = dict(qc)
+            if qc.get("passed") is False:
+                attempts = int(qc.get("attempts") or 1)
+                qc.update({
+                    "awaiting_human": True,
+                    "auto_repairs": max(0, attempts - 1),
+                    "auto_repair_exhausted": True,
+                })
             extra["qc"] = qc
         return extra
 
     @staticmethod
     def _critical_qc_error(result):
         qc = getattr(result, "qc", None) or {}
-        if qc.get("passed") is False and qc.get("hard_failure"):
+        if qc.get("passed") is False:
             return (
-                "角色身份/性别/人数质检未通过；已自动定向修图 "
+                "图片质检未通过；已自动定向修图 "
                 f"{qc.get('attempts', 1) - 1} 次后仍失败:"
                 + "；".join(qc.get("issues") or []))
         return ""
 
-    def _run_one_task(self, ctx, task):
+    def _run_one_task(self, ctx, task, *, continue_on_qc_failure=False):
         """串行执行单个出图任务(含质检),记账并更新清单。"""
         if self._cancel_requested(ctx):
             raise ProduceCancelled("已手动停止生成")
@@ -2189,8 +2203,12 @@ class Director:
         if critical_error:
             self._finish_dispatch_task(ctx, task, error=critical_error)
             self._plan_mark(
-                ctx, task["item_id"], "failed", error=critical_error[:300],
+                ctx, task["item_id"],
+                ("awaiting_human" if continue_on_qc_failure else "failed"),
+                error=critical_error[:300],
                 extra=self._plan_done_extra(result))
+            if continue_on_qc_failure:
+                return None
             raise AifosError(critical_error)
         self._finish_dispatch_task(ctx, task, result=result)
         self._plan_mark(ctx, task["item_id"], "done",
@@ -2214,25 +2232,38 @@ class Director:
             workers = 4
         return max(1, min(workers, 8))
 
-    def _run_parallel(self, ctx, tasks, line="出图产线"):
+    def _run_parallel(self, ctx, tasks, line="出图产线",
+                      *, continue_on_qc_failure=False):
         """有界并行出图:只把 worker 数量的任务标为生成中。
 
         多人/文字/场首等高风险镜头可通过 priority 提前；尚未真正开工的
         条目保持 pending，因此计时与暂停后的恢复都反映真实状态。
         worker 线程只做产线调用;记账/资产登记/清单状态全在主线程。
         tasks: [{"item_id","capability","payload","sub_dir","tag","priority"}]
-        返回 {tag: ProviderResult};暂停时未完成条目回到排队并保留已完成。"""
+        默认返回 {tag: ProviderResult};暂停时未完成条目回到排队并保留
+        已完成。continue_on_qc_failure=True 时，二次视觉质检失败的单项
+        标为 awaiting_human 并继续补投剩余任务，返回
+        (results, qc_failures)，真正的 Provider/预算错误仍会中止整批。"""
         if not tasks:
-            return {}
+            return ({}, []) if continue_on_qc_failure else {}
         self._prepare_dispatch_contracts(ctx, tasks)
         tasks = sorted(tasks, key=lambda task: (
             -int(task.get("priority", 0)), str(task.get("item_id", ""))))
         workers = self._parallel_workers()
         if workers == 1 or len(tasks) == 1:
-            out = {}
+            out, qc_failures = {}, []
             for task in tasks:
-                out[task["tag"]] = self._run_one_task(ctx, task)
-            return out
+                result = self._run_one_task(
+                    ctx, task,
+                    continue_on_qc_failure=continue_on_qc_failure)
+                if result is None:
+                    qc_failures.append((
+                        task, AifosError(
+                            "图片二次质检仍未通过，等待人工修改")))
+                    continue
+                out[task["tag"]] = result
+            return ((out, qc_failures)
+                    if continue_on_qc_failure else out)
         if self._cancel_requested(ctx):
             raise ProduceCancelled("已手动停止生成")
         episode = self.projects.get_episode(ctx["episode"]["id"])
@@ -2245,7 +2276,7 @@ class Director:
             "director",
             f"{line}并行开工:共 {len(tasks)} 张,{workers} 路同时生成")
         cancel = lambda: self._cancel_requested(ctx)   # noqa: E731
-        results, failures = {}, []
+        results, failures, qc_failures = {}, [], []
         cancelled = False
         started_at = time.monotonic()
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -2253,34 +2284,36 @@ class Director:
             futures = {}
 
             def submit_next():
-                try:
-                    task = next(iterator)
-                except StopIteration:
-                    return False
-                try:
-                    task = self._claim_dispatch_task(ctx, task)
-                except Exception as exc:
-                    failures.append((task, exc))
-                    self._finish_dispatch_task(ctx, task, error=str(exc))
-                    self._plan_mark(ctx, task["item_id"], "failed",
-                                    error=str(exc)[:300])
-                    return False
-                payload = task.get("payload") or {}
-                generating_extra = {
-                    "image_task_class": payload.get("image_task_class"),
-                    "image_quality": payload.get("image_quality"),
-                    "reference_inputs": self._reference_inputs(payload),
-                }
-                if task.get("_acceleration"):
-                    generating_extra["acceleration"] = task["_acceleration"]
-                self._plan_mark(ctx, task["item_id"], "generating",
-                                extra=generating_extra)
-                future = pool.submit(
-                    self._generate_image_with_qc, task["capability"],
-                    task["payload"], ctx["out_root"] / task["sub_dir"],
-                    cancel, task.get("qc_spec"))
-                futures[future] = task
-                return True
+                while True:
+                    try:
+                        task = next(iterator)
+                    except StopIteration:
+                        return False
+                    try:
+                        task = self._claim_dispatch_task(ctx, task)
+                    except Exception as exc:
+                        failures.append((task, exc))
+                        self._finish_dispatch_task(ctx, task, error=str(exc))
+                        self._plan_mark(ctx, task["item_id"], "failed",
+                                        error=str(exc)[:300])
+                        return False
+                    payload = task.get("payload") or {}
+                    generating_extra = {
+                        "image_task_class": payload.get("image_task_class"),
+                        "image_quality": payload.get("image_quality"),
+                        "reference_inputs": self._reference_inputs(payload),
+                    }
+                    if task.get("_acceleration"):
+                        generating_extra["acceleration"] = task[
+                            "_acceleration"]
+                    self._plan_mark(ctx, task["item_id"], "generating",
+                                    extra=generating_extra)
+                    future = pool.submit(
+                        self._generate_image_with_qc, task["capability"],
+                        task["payload"], ctx["out_root"] / task["sub_dir"],
+                        cancel, task.get("qc_spec"))
+                    futures[future] = task
+                    return True
 
             for _ in range(min(workers, len(tasks))):
                 submit_next()
@@ -2310,11 +2343,15 @@ class Director:
                     critical_error = self._critical_qc_error(result)
                     if critical_error:
                         error = AifosError(critical_error)
-                        failures.append((task, error))
+                        target = (qc_failures if continue_on_qc_failure
+                                  else failures)
+                        target.append((task, error))
                         self._finish_dispatch_task(
                             ctx, task, error=critical_error)
                         self._plan_mark(
-                            ctx, task["item_id"], "failed",
+                            ctx, task["item_id"],
+                            ("awaiting_human"
+                             if continue_on_qc_failure else "failed"),
                             error=critical_error[:300],
                             extra=self._plan_done_extra(result))
                         continue
@@ -2335,6 +2372,8 @@ class Director:
                 "已手动暂停(本批已完成的图片全部保留)")
         if failures:
             raise failures[0][1]
+        if continue_on_qc_failure:
+            return results, qc_failures
         return results
 
     def image_acceleration_options(self, project_title, episode_number):
@@ -4867,7 +4906,9 @@ class Director:
                     camera=payload.get("camera", ""),
                     composition_contract=payload.get(
                         "composition_contract"))}})
-        results = self._run_parallel(ctx, tasks, line="分镜画面")
+        results, qc_failures = self._run_parallel(
+            ctx, tasks, line="分镜画面",
+            continue_on_qc_failure=True)
         for shot_no in sorted(results):
             result = results[shot_no]
             quality = quality_by_shot[shot_no]
@@ -4880,6 +4921,21 @@ class Director:
                 "shot_no": shot_no, "uri": result.uri,
                 "image_quality": quality["level"]})
         ctx["images"].sort(key=lambda i: i["shot_no"])
+        if qc_failures:
+            failed_shots = sorted(
+                int(task["tag"]) for task, _error in qc_failures)
+            self.log.warn(
+                "director",
+                f"关键帧本批已完成其余 {len(results)} 张；"
+                f"{len(failed_shots)} 张二次质检仍未通过，"
+                "已隔离到待人工问题清单: "
+                + "、".join(f"镜头{value}" for value in failed_shots))
+            raise AifosError(
+                f"{len(failed_shots)} 张关键帧自动修图 1 次后仍未通过；"
+                "问题图已保留并列入待人工问题清单，其他关键帧已继续完成。"
+                "请点击问题项定位并手动修改后，从断点继续。"
+                "问题镜头: "
+                + "、".join(str(value) for value in failed_shots))
         return {"count": len(ctx["images"]), "reused": reused}
 
     def _stage_text_assets(self, ctx):
@@ -6510,8 +6566,10 @@ class Director:
                 ctx["project"]["id"], "first_frame", asset_name)
             old_last = self.assets.latest(
                 ctx["project"]["id"], "last_frame", asset_name)
-            # 后续镜尚未进入生产线时不提前生成；确认/续产时自然补齐。
-            if offset and not (old_first or old_last):
+            # 当前镜或后续镜尚未进入首尾帧生产线时都不抢跑；人工修好
+            # 关键帧后由断点续产自然补齐，避免一次手动修图意外开始整条
+            # 帧链并额外消耗额度。
+            if not (old_first or old_last):
                 break
             image_row = self.assets.latest(
                 ctx["project"]["id"], "image", asset_name)
@@ -6952,21 +7010,35 @@ class Director:
             asset_name = self._shot_name(ctx, shot_no)
             old_image = self.assets.latest(
                 project["id"], "image", asset_name)
-            if (old_image and old_image["uri"]
-                    and (old_image["uri"].startswith(("http://", "https://"))
-                         or Path(old_image["uri"]).exists())):
+            revision_base = old_image["uri"] if old_image else ""
+            if not revision_base and plan_item \
+                    and plan_item.get("status") in (
+                        "awaiting_human", "failed"):
+                candidate = str(plan_item.get("output_uri") or "")
+                if candidate and (
+                        candidate.startswith(("http://", "https://"))
+                        or Path(candidate).exists()):
+                    revision_base = candidate
+            if (revision_base
+                    and (revision_base.startswith(("http://", "https://"))
+                         or Path(revision_base).exists())):
                 payload["reference_images"] = list(dict.fromkeys([
-                    old_image["uri"],
+                    revision_base,
                     *(payload.get("reference_images") or []),
                 ]))
                 matches = [
                     match for match in (payload.get("asset_matches") or [])
-                    if match.get("uri") != old_image["uri"]]
+                    if match.get("uri") != revision_base]
                 matches.append({
-                    "asset_id": old_image["id"], "kind": old_image["kind"],
-                    "name": old_image["name"],
-                    "label": "本镜当前关键帧（待修改基底）",
-                    "uri": old_image["uri"],
+                    "asset_id": old_image["id"] if old_image else None,
+                    "kind": (old_image["kind"] if old_image
+                             else "qc_revision_base"),
+                    "name": (old_image["name"] if old_image
+                             else f"shot_{shot_no:03d}_failed"),
+                    "label": ("本镜当前关键帧（待修改基底）"
+                              if old_image else
+                              "本镜二次质检失败稿（待人工修改基底）"),
+                    "uri": revision_base,
                 })
                 payload["asset_matches"] = matches
                 payload["require_reference_images"] = True
