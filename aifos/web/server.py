@@ -43,6 +43,7 @@ from ..errors import AifosError
 from ..quality_policy import normalize_quality, normalize_quality_policy
 from ..smart_input import resolve_produce_target
 from ..standard_center import StandardConflictError, StandardValidationError
+from ..story_context import attach_shot_story_context
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -1321,6 +1322,10 @@ def _episode_payload(app, episode_id):
         )
         script = apply_story_analysis(copy.deepcopy(script), story_analysis)
     storyboard, sb_v = app.projects.latest_document(episode_id, "storyboard")
+    # 给每个镜头附上可人工核对的“剧本对应/时代/地点”上下文。这里是
+    # API 视图层的只读增强，不改写历史分镜文档，也不会影响已锁定提示词。
+    storyboard, shot_story_contexts = attach_shot_story_context(
+        script, storyboard)
     continuity, continuity_v = app.projects.latest_document(
         episode_id, "continuity")
     blocking, blocking_v = app.projects.latest_document(
@@ -1396,6 +1401,13 @@ def _episode_payload(app, episode_id):
     if render_plan is not None:
         render_plan = copy.deepcopy(render_plan)
         for item in render_plan.get("items", []):
+            try:
+                shot_no = int(item.get("shot_no"))
+            except (TypeError, ValueError):
+                shot_no = None
+            if shot_no in shot_story_contexts:
+                item["story_context"] = copy.deepcopy(
+                    shot_story_contexts[shot_no])
             for ref in (item.get("reference_inputs") or {}).get("items", []):
                 ref["url"] = _artifact_url(app, ref.get("uri", ""))
             output_url = _artifact_url(app, item.get("output_uri", ""))
