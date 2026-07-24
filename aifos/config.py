@@ -2,6 +2,7 @@
 
 import copy
 import json
+import shlex
 from pathlib import Path
 
 # 模型协同(总体设计方案·四):
@@ -17,6 +18,34 @@ DEFAULTS = {
         "aspect": "9:16",              # 全局默认画幅(抖音竖屏);项目可设 16:9
         # Seedance 逐镜视频默认 4 路并行；可在设置页按账号限流调低/调高。
         "parallel_videos": 4,
+    },
+    # Codex 双实例不注册成两个 Provider，避免破坏现有 routing。旧工作区
+    # 没有 profiles 时会自动把 providers.codex 映射成一个兼容 profile；
+    # 设置中心保存后可配置两个各自独立的 CODEX_HOME。
+    "codex_parallel": {
+        "max_parallel": 2,
+        "profiles": [
+            {
+                "id": "codex_a",
+                "name": "Codex A",
+                "codex_home": "~/.codex",
+                "command": [
+                    "python3", "-m", "aifos.adapters.codex_image",
+                    "--codex", "codex",
+                ],
+                "enabled": False,
+            },
+            {
+                "id": "codex_b",
+                "name": "Codex B",
+                "codex_home": "~/.codex-account-b",
+                "command": [
+                    "python3", "-m", "aifos.adapters.codex_image",
+                    "--codex", "codex",
+                ],
+                "enabled": False,
+            },
+        ],
     },
     # 本地 artifacts 是唯一事实源；图片完成并登记后异步复制到 iCloud，
     # 只供手机/Finder 查看。默认关闭，避免测试或其他 workspace 意外写云盘。
@@ -198,6 +227,292 @@ def _deep_merge(base, override):
     return out
 
 
+CODEX_PROFILE_LIMIT = 2
+CODEX_PROFILE_FIELDS = ("id", "name", "codex_home", "command", "enabled")
+_CODEX_SECRET_FIELDS = {
+    "api_key", "apikey", "auth", "auth_json", "credentials", "password",
+    "secret", "token",
+}
+_CODEX_SECRET_FLAGS = {
+    "--api-key", "--api_key", "--auth", "--auth-token", "--password",
+    "--secret", "--token",
+}
+_CODEX_SECRET_ASSIGNMENTS = (
+    "API_KEY=", "AUTH_TOKEN=", "PASSWORD=", "SECRET=", "TOKEN=",
+)
+
+
+def _profile_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "on", "yes")
+
+
+def _safe_codex_home(value, strict=False):
+    """仅保留 CODEX_HOME 目录路径；绝不读取或接受 auth 文件内容。"""
+    home = str(value or "").strip()
+    lowered_name = Path(home).name.lower() if home else ""
+    unsafe = (
+        any(char in home for char in ("\x00", "\r", "\n"))
+        or lowered_name in {
+            "auth.json", "credentials.json", "token.json", "secrets.json",
+        }
+    )
+    if unsafe:
+        if strict:
+            raise ValueError("codex_home 必须是目录路径，不能指向认证文件")
+        return ""
+    return home
+
+
+def _safe_codex_command(value, strict=False):
+    """规范命令并剔除可能内嵌的认证参数。
+
+    Codex 认证只能经 CODEX_HOME 隔离，不能把 token/auth 参数写进
+    workspace/config.json 或回传到设置页。
+    """
+    if isinstance(value, str):
+        try:
+            parts = shlex.split(value)
+        except ValueError:
+            if strict:
+                raise ValueError("Codex command 不是有效的 shell 命令")
+            parts = []
+    elif isinstance(value, (list, tuple)):
+        parts = [str(part) for part in value]
+    elif value in (None, ""):
+        parts = []
+    else:
+        if strict:
+            raise ValueError("Codex command 必须是字符串或字符串列表")
+        parts = []
+
+    safe = []
+    index = 0
+    while index < len(parts):
+        part = parts[index]
+        lowered = part.lower()
+        secret_flag = lowered in _CODEX_SECRET_FLAGS
+        secret_inline = any(
+            lowered.startswith(flag + "=") for flag in _CODEX_SECRET_FLAGS)
+        secret_assignment = any(
+            assignment.lower() in lowered
+            for assignment in _CODEX_SECRET_ASSIGNMENTS)
+        auth_file = "auth.json" in lowered
+        if secret_flag or secret_inline or secret_assignment or auth_file:
+            if strict:
+                raise ValueError(
+                    "Codex command 不得包含 token/auth；请使用 codex_home")
+            index += 2 if secret_flag and index + 1 < len(parts) else 1
+            continue
+        safe.append(part)
+        index += 1
+    return safe
+
+
+def normalize_codex_profile(profile, index=0, strict=False):
+    """把一个 Codex profile 规范为可安全对外返回/调度的稳定字段。"""
+    if not isinstance(profile, dict):
+        if strict:
+            raise ValueError("Codex profile 必须是对象")
+        profile = {}
+    if strict:
+        unknown = set(profile) - set(CODEX_PROFILE_FIELDS)
+        secret = {
+            key for key in unknown
+            if str(key).strip().lower() in _CODEX_SECRET_FIELDS
+            or any(word in str(key).strip().lower()
+                   for word in ("auth", "token", "secret", "password"))
+        }
+        if secret:
+            raise ValueError("Codex profile 不保存认证字段")
+        if unknown:
+            raise ValueError(
+                "Codex profile 不支持字段: "
+                + ", ".join(sorted(str(key) for key in unknown)))
+
+    default_id = "codex_a" if index == 0 else "codex_b"
+    profile_id = str(profile.get("id") or default_id).strip()
+    if (not profile_id or len(profile_id) > 64
+            or any(char in profile_id for char in ("\x00", "\r", "\n"))):
+        if strict:
+            raise ValueError("Codex profile id 必须是 1-64 个可见字符")
+        profile_id = default_id
+    name = str(profile.get("name") or (
+        "Codex A" if index == 0 else "Codex B")).strip()
+    if (not name or len(name) > 64
+            or any(char in name for char in ("\x00", "\r", "\n"))):
+        if strict:
+            raise ValueError("Codex profile name 必须是 1-64 个可见字符")
+        name = "codex" if index == 0 else f"codex-{index + 1}"
+    command = _safe_codex_command(profile.get("command"), strict=strict)
+    if not command:
+        command = copy.deepcopy(DEFAULTS["providers"]["codex"]["command"])
+    return {
+        "id": profile_id,
+        "name": name,
+        "codex_home": _safe_codex_home(
+            profile.get("codex_home", ""), strict=strict),
+        "command": command,
+        "enabled": _profile_bool(profile.get("enabled", False)),
+    }
+
+
+def get_codex_profiles(config):
+    """纯函数：读取安全 Codex profiles；旧单 Provider 自动兼容为一个。"""
+    data = getattr(config, "data", config)
+    data = data if isinstance(data, dict) else {}
+    parallel = data.get("codex_parallel")
+    raw_profiles = (
+        parallel.get("profiles")
+        if isinstance(parallel, dict) else None
+    )
+    if not isinstance(raw_profiles, list) or not raw_profiles:
+        provider = (data.get("providers") or {}).get("codex") or {}
+        raw_profiles = copy.deepcopy(
+            DEFAULTS["codex_parallel"]["profiles"])
+        raw_profiles[0].update({
+            "codex_home": provider.get(
+                "codex_home", raw_profiles[0]["codex_home"]),
+            "command": provider.get("command", raw_profiles[0]["command"]),
+            "enabled": provider.get("enabled", False),
+        })
+
+    profiles = []
+    seen_ids = set()
+    seen_names = set()
+    for index, raw in enumerate(raw_profiles[:CODEX_PROFILE_LIMIT]):
+        profile = normalize_codex_profile(raw, index=index)
+        if (profile["id"] in seen_ids or profile["name"] in seen_names):
+            continue
+        seen_ids.add(profile["id"])
+        seen_names.add(profile["name"])
+        profiles.append(profile)
+    return profiles
+
+
+def _assignment_profile(value):
+    if isinstance(value, dict):
+        value = (
+            value.get("profile_id") or value.get("id")
+            or value.get("profile") or value.get("profile_name")
+        )
+    return str(value or "").strip()
+
+
+def codex_parallel_status(profiles, assignments=None, max_parallel=2):
+    """纯函数：汇总两个 Codex 槽位的 busy/idle/disabled 状态。"""
+    normalized = [
+        normalize_codex_profile(profile, index=index)
+        for index, profile in enumerate(list(profiles or [])
+                                      [:CODEX_PROFILE_LIMIT])
+    ]
+    try:
+        parallel_limit = max(1, min(int(max_parallel), CODEX_PROFILE_LIMIT))
+    except (TypeError, ValueError):
+        parallel_limit = CODEX_PROFILE_LIMIT
+    eligible = [
+        profile["id"] for profile in normalized if profile["enabled"]
+    ][:parallel_limit]
+    active = {profile_id: [] for profile_id in eligible}
+    id_by_alias = {
+        alias: profile["id"]
+        for profile in normalized
+        for alias in (profile["id"], profile["name"])
+    }
+    clean_assignments = {}
+    for task_id, value in (assignments or {}).items():
+        profile_id = id_by_alias.get(_assignment_profile(value))
+        if profile_id not in active:
+            continue
+        task_key = str(task_id)
+        active[profile_id].append(task_key)
+        clean_assignments[task_key] = profile_id
+
+    profile_status = []
+    for profile in normalized:
+        item = copy.deepcopy(profile)
+        tasks = active.get(profile["id"], [])
+        if not profile["enabled"]:
+            state = "disabled"
+        elif profile["id"] not in eligible:
+            state = "standby"
+        else:
+            state = "busy" if tasks else "idle"
+        item.update({
+            "state": state,
+            "task_ids": tasks,
+            "active_count": len(tasks),
+        })
+        profile_status.append(item)
+    busy_count = sum(1 for tasks in active.values() if tasks)
+    return {
+        "max_parallel": parallel_limit,
+        "configured_count": len(normalized),
+        "enabled_count": len(eligible),
+        "active_count": sum(len(tasks) for tasks in active.values()),
+        "busy_profile_count": busy_count,
+        "available_count": max(0, len(eligible) - busy_count),
+        "profiles": profile_status,
+        "assignments": clean_assignments,
+    }
+
+
+def assign_codex_task(profiles, assignments, task_id, max_parallel=2):
+    """纯函数：幂等地把任务分给首个空闲 profile，不修改传入字典。"""
+    task_key = str(task_id or "").strip()
+    if not task_key:
+        raise ValueError("task_id 不能为空")
+    current = {
+        str(key): _assignment_profile(value)
+        for key, value in (assignments or {}).items()
+    }
+    status = codex_parallel_status(
+        profiles, assignments=current, max_parallel=max_parallel)
+    existing = status["assignments"].get(task_key)
+    if existing:
+        selected = next(
+            profile for profile in status["profiles"]
+            if profile["id"] == existing)
+        return {
+            "assigned": True,
+            "reason": "already_assigned",
+            "task_id": task_key,
+            "profile_id": existing,
+            "profile_name": selected["name"],
+            "profile": selected,
+            "assignments": current,
+        }
+    selected = next(
+        (profile for profile in status["profiles"]
+         if profile["state"] == "idle"),
+        None,
+    )
+    if selected is None:
+        return {
+            "assigned": False,
+            "reason": (
+                "no_enabled_profile"
+                if status["enabled_count"] == 0 else "all_busy"),
+            "task_id": task_key,
+            "profile_id": None,
+            "profile_name": None,
+            "profile": None,
+            "assignments": current,
+        }
+    updated = dict(current)
+    updated[task_key] = selected["id"]
+    return {
+        "assigned": True,
+        "reason": "assigned",
+        "task_id": task_key,
+        "profile_id": selected["id"],
+        "profile_name": selected["name"],
+        "profile": selected,
+        "assignments": updated,
+    }
+
+
 def _normalize_legacy(data):
     """兼容旧工作区：移除平台曾内置的低质量 macOS say 过渡产线。
 
@@ -260,10 +575,36 @@ class Config:
     def load(cls, config_path, overrides=None):
         data = copy.deepcopy(DEFAULTS)
         path = Path(config_path)
+        saved = {}
         if path.exists():
-            data = _deep_merge(data, json.loads(path.read_text(encoding="utf-8")))
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            data = _deep_merge(data, saved)
         if overrides:
             data = _deep_merge(data, overrides)
+        # 旧工作区只有 providers.codex：第一路继承原命令/开关，
+        # 第二路保持安全关闭并使用约定的备用 CODEX_HOME。
+        explicit_profiles = (
+            (saved.get("codex_parallel") or {}).get("profiles")
+            if isinstance(saved.get("codex_parallel"), dict) else None
+        )
+        override_profiles = (
+            (overrides.get("codex_parallel") or {}).get("profiles")
+            if isinstance(overrides, dict)
+            and isinstance(overrides.get("codex_parallel"), dict)
+            else None
+        )
+        if not explicit_profiles and not override_profiles:
+            provider = (data.get("providers") or {}).get("codex") or {}
+            profiles = copy.deepcopy(
+                DEFAULTS["codex_parallel"]["profiles"])
+            profiles[0].update({
+                "codex_home": provider.get(
+                    "codex_home", profiles[0]["codex_home"]),
+                "command": provider.get(
+                    "command", profiles[0]["command"]),
+                "enabled": provider.get("enabled", False),
+            })
+            data.setdefault("codex_parallel", {})["profiles"] = profiles
         return cls(_normalize_legacy(data))
 
     @staticmethod
@@ -283,3 +624,28 @@ class Config:
                 return default
             node = node[key]
         return node
+
+    def codex_profiles(self):
+        """返回安全的 Codex 调度配置（最多两个）。"""
+        return get_codex_profiles(self.data)
+
+    def codex_parallel_status(self, assignments=None):
+        """按当前配置汇总 Codex 并行槽状态。"""
+        return codex_parallel_status(
+            self.codex_profiles(),
+            assignments=assignments,
+            max_parallel=self.get(
+                "codex_parallel", "max_parallel",
+                default=CODEX_PROFILE_LIMIT),
+        )
+
+    def assign_codex_task(self, task_id, assignments=None):
+        """按当前配置为任务选择 Codex profile。"""
+        return assign_codex_task(
+            self.codex_profiles(),
+            assignments=assignments,
+            task_id=task_id,
+            max_parallel=self.get(
+                "codex_parallel", "max_parallel",
+                default=CODEX_PROFILE_LIMIT),
+        )

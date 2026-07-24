@@ -6,9 +6,10 @@ Web 每个请求)即生效;api_key 对外只回传掩码,掩码回传不覆盖�
 
 import json
 import shlex
+import shutil
 from pathlib import Path
 
-from .config import Config
+from .config import (CODEX_PROFILE_LIMIT, Config, normalize_codex_profile)
 from .errors import AifosError
 
 CAPABILITY_CN = {
@@ -67,7 +68,7 @@ EDITABLE_FIELDS = {
     "enabled", "command", "endpoint", "api_key", "model", "model_version",
     "max_tokens", "video_resolution", "duration", "poll", "timeout",
     "cost_per_call", "quota", "appid", "cluster", "voice_type",
-    "speed_ratio", "audio_in_video", "draft_dir",
+    "speed_ratio", "audio_in_video", "draft_dir", "codex_home",
 }
 _INT_FIELDS = {"max_tokens", "duration", "quota", "timeout"}
 _FLOAT_FIELDS = {"cost_per_call", "poll"}
@@ -83,6 +84,69 @@ def mask_key(value):
 
 def is_masked(value):
     return isinstance(value, str) and value.startswith("****")
+
+
+def _command_readiness(command):
+    """只检查可执行文件是否可发现，不运行命令、不触碰认证数据。"""
+    candidates = [command[0]] if command else []
+    if "--codex" in command:
+        index = command.index("--codex")
+        if index + 1 < len(command):
+            candidates.append(command[index + 1])
+    for candidate in candidates:
+        path = Path(candidate).expanduser()
+        found = path.is_file() if "/" in candidate else bool(
+            shutil.which(candidate))
+        if not found:
+            return False, f"命令不可用: {candidate}"
+    return bool(candidates), "" if candidates else "未配置 command"
+
+
+def _profile_settings_view(profile, runtime=None):
+    """设置页只返回目录和命令，不读取 CODEX_HOME 下任何认证文件。"""
+    runtime = runtime or {}
+    home = profile["codex_home"]
+    home_ready = bool(home) and Path(home).expanduser().is_dir()
+    command_ready, command_reason = _command_readiness(profile["command"])
+    if not profile["enabled"]:
+        status = "disabled"
+        reason = "未启用"
+    elif not home_ready:
+        status = "missing"
+        reason = "CODEX_HOME 路径不存在" if home else "未配置 CODEX_HOME"
+    elif not command_ready:
+        status = "missing"
+        reason = command_reason
+    else:
+        status = "ready"
+        reason = "就绪"
+    active_jobs = list(runtime.get("task_ids") or [])
+    return {
+        "id": profile["id"],
+        "name": profile["name"],
+        "codex_home": profile["codex_home"],
+        "command": " ".join(profile["command"]),
+        "enabled": profile["enabled"],
+        "status": status,
+        "reason": reason,
+        "assigned": bool(active_jobs),
+        "active_jobs": active_jobs,
+        "runtime_state": runtime.get("state", "idle"),
+    }
+
+
+def codex_profiles_payload(config, status=None):
+    """返回设置页可编辑的安全双 Codex 配置。"""
+    status = status or config.codex_parallel_status()
+    runtime_by_id = {
+        profile["id"]: profile
+        for profile in status.get("profiles", [])
+    }
+    return [
+        _profile_settings_view(
+            profile, runtime=runtime_by_id.get(profile["id"]))
+        for profile in config.codex_profiles()
+    ]
 
 
 def settings_payload(app):
@@ -109,6 +173,8 @@ def settings_payload(app):
             "appid": conf.get("appid", ""),
             "voice_type": conf.get("voice_type", ""),
             "draft_dir": conf.get("draft_dir", ""),
+            "codex_home": (
+                conf.get("codex_home", "") if name == "codex" else ""),
             "api_key_masked": mask_key(conf.get("api_key", "")),
             "api_key_set": bool(conf.get("api_key")),
             "timeout": conf.get("timeout"),
@@ -117,8 +183,15 @@ def settings_payload(app):
             "ready": bool(checks) and all(c["ok"] for c in checks),
         })
     image_routing = app.config.get("image_routing") or {}
+    codex_status = app.config.codex_parallel_status()
+    codex_profiles = codex_profiles_payload(
+        app.config, status=codex_status)
+    codex_status = dict(codex_status)
+    codex_status["profiles"] = list(codex_profiles)
     return {
         "providers": providers,
+        "codex_profiles": codex_profiles,
+        "codex_parallel": codex_status,
         "routing": app.config.get("routing") or {},
         "image_routing": image_routing,
         "image_strategy": image_strategy_name(image_routing),
@@ -145,6 +218,53 @@ def _save_file(config_path, data):
     Path(config_path).write_text(
         json.dumps(data, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8")
+
+
+def set_codex_profiles(config_path, profiles):
+    """安全保存 1-2 个 Codex profile，并同步首个到旧 providers.codex。
+
+    profile 只接受 name/codex_home/command/enabled；认证继续由每个
+    CODEX_HOME 自己的 auth.json 管理，本函数既不读取也不落盘其内容。
+    """
+    if not isinstance(profiles, list) or not profiles:
+        raise AifosError("codex_profiles 必须包含至少一个配置")
+    if len(profiles) > CODEX_PROFILE_LIMIT:
+        raise AifosError(
+            f"Codex profile 最多 {CODEX_PROFILE_LIMIT} 个")
+    normalized = []
+    ids = set()
+    names = set()
+    for index, profile in enumerate(profiles):
+        try:
+            clean = normalize_codex_profile(
+                profile, index=index, strict=True)
+        except ValueError as exc:
+            raise AifosError(str(exc))
+        if clean["id"] in ids:
+            raise AifosError(f"Codex profile id 重复: {clean['id']}")
+        if clean["name"] in names:
+            raise AifosError(f"Codex profile name 重复: {clean['name']}")
+        ids.add(clean["id"])
+        names.add(clean["name"])
+        normalized.append(clean)
+
+    data = _load_file(config_path)
+    parallel = data.setdefault("codex_parallel", {})
+    parallel["max_parallel"] = min(
+        CODEX_PROFILE_LIMIT, len(normalized))
+    parallel["profiles"] = normalized
+
+    # 旧 router 仍把 codex 视为单 Provider；镜像首个 profile 保证保存
+    # 双配置后，未升级的调用路径继续使用第一路而不丢 enabled/command。
+    primary = normalized[0]
+    legacy = data.setdefault("providers", {}).setdefault("codex", {})
+    legacy.update({
+        "enabled": primary["enabled"],
+        "command": list(primary["command"]),
+        "codex_home": primary["codex_home"],
+    })
+    _save_file(config_path, data)
+    return [_profile_settings_view(profile) for profile in normalized]
 
 
 def update_provider(config_path, name, fields):
@@ -174,6 +294,25 @@ def update_provider(config_path, name, fields):
             clean[key] = float(value)
         else:
             clean[key] = str(value).strip()
+    if "codex_home" in clean and name != "codex":
+        raise AifosError("codex_home 只能用于 Codex Provider")
+    if name == "codex" and clean:
+        current = (merged.get("providers") or {}).get("codex") or {}
+        profile_source = {
+            "name": "codex",
+            "codex_home": clean.get(
+                "codex_home", current.get("codex_home", "")),
+            "command": clean.get("command", current.get("command")),
+            "enabled": clean.get("enabled", current.get("enabled", False)),
+        }
+        try:
+            safe_profile = normalize_codex_profile(
+                profile_source, strict=True)
+        except ValueError as exc:
+            raise AifosError(str(exc))
+        for key in ("codex_home", "command", "enabled"):
+            if key in clean:
+                clean[key] = safe_profile[key]
     if not clean:
         return {}
     # 填了 Key 就是要用:未显式给 enabled 时自动启用,省一步开关
@@ -183,6 +322,15 @@ def update_provider(config_path, name, fields):
             clean["enabled"] = True
     data = _load_file(config_path)
     data.setdefault("providers", {}).setdefault(name, {}).update(clean)
+    if name == "codex":
+        saved_profiles = (
+            (data.get("codex_parallel") or {}).get("profiles") or [])
+        if saved_profiles:
+            saved_profiles[0].update({
+                key: clean[key]
+                for key in ("codex_home", "command", "enabled")
+                if key in clean
+            })
     _save_file(config_path, data)
     return clean
 
