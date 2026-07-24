@@ -2324,6 +2324,13 @@ class Director:
         tasks = sorted(tasks, key=lambda task: (
             -int(task.get("priority", 0)), str(task.get("item_id", ""))))
         workers = self._parallel_workers()
+        # When two independent Codex logins are ready, they are the effective
+        # image-production ceiling.  Do not create eight queued subprocess
+        # workers just because the generic image slot setting is eight; that
+        # would make the UI and the actual provider concurrency disagree.
+        codex_profiles = self._codex_parallel_profiles()
+        if codex_profiles:
+            workers = min(workers, len(codex_profiles))
         if workers == 1 or len(tasks) == 1:
             out, qc_failures = {}, []
             for task in tasks:
@@ -3094,7 +3101,7 @@ class Director:
                 "pipeline_version": storyboard["pipeline_version"]}
 
     def _stage_blocking(self, ctx):
-        """五维分镜 → 确定性俯视空间图，不消耗任何出图额度。"""
+        """五维分镜 → 确定性 3D 空间调度，不消耗任何出图额度。"""
         rules = ctx["production_profile"].get("rules", {}).get(
             "storyboard", {})
         threshold = int(rules.get(
@@ -4305,7 +4312,7 @@ class Director:
                 "label": f"{identity.get('character', '角色')}最终立绘",
                 "uri": identity["uri"],
             })
-        # 多人走位/变机位镜头的俯视空间图不仅要给 Seedance，也要在
+        # 多人走位/变机位镜头的 3D 空间图不仅要给 Seedance，也要在
         # 关键帧阶段先把人数、站位和屏幕方向锁准。它只承担空间职责，
         # 绝不能把编号、箭头或示意图样式画进成片。
         spatial_uri = str(spatial_ref or "").strip()
@@ -4766,7 +4773,7 @@ class Director:
                 character=who, role="identity")
         add(payload.get("spatial_ref"), "本镜空间调度图",
             "只读取人物编号与对应站位、相对距离、前后遮挡、屏幕方向、"
-            "行动箭头和摄影机起终点；不得把俯视视角、编号、姓名、坐标、"
+            "行动箭头、摄影机起终点/高度、瞄准点和视锥；不得把3D示意视角、"
             "箭头、色块、网格或任何示意图元素画进最终画面",
             role="spatial")
         for uri in payload.get("character_refs") or []:

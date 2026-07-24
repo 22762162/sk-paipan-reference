@@ -519,6 +519,54 @@ def test_episode_production_progress_uses_verified_formal_assets(server):
     assert issues["shot:3"]["status"] == "stale_active"
 
 
+def test_episode_progress_uses_ready_codex_channels_as_image_limit(server):
+    """双 Codex 就绪时,生产面板显示/使用 2 路而非泛化图片槽位数。"""
+    port = server["port"]
+    status, _ = _json_request(port, "POST", "/api/settings", {
+        "defaults": {"parallel_images": 8},
+        "codex_profiles": [
+            {"id": "codex_a", "name": "A", "enabled": True,
+             "codex_home": str(server["workspace"]), "command": "codex"},
+            {"id": "codex_b", "name": "B", "enabled": True,
+             "codex_home": str(server["workspace"]), "command": "codex"},
+        ],
+    })
+    assert status == 200
+    app2 = App(server["workspace"])
+    try:
+        project, _ = app2.projects.get_or_create_project("双通道生产面板")
+        episode, _ = app2.projects.get_or_create_episode(project["id"], 1)
+        out_root = (app2.workspace.artifacts_dir / f"p{project['id']:03d}"
+                    / "e001")
+        app2.director._plan_write({"out_root": out_root}, {"items": [
+            {"id": "shot:1", "category": "shot_image", "shot_no": 1,
+             "status": "generating", "codex_profile": "codex_a"},
+        ]})
+        stamp = now()
+        app2.db.execute(
+            "INSERT INTO tasks(episode_id, stage, name, status, created_at, "
+            "updated_at) VALUES(?,?,?,?,?,?)",
+            (episode["id"], "images", "关键帧", "running", stamp, stamp))
+        episode_id = episode["id"]
+    finally:
+        app2.close()
+
+    status, detail = _json_request(
+        port, "GET", f"/api/episode/{episode_id}")
+    assert status == 200
+    assert detail["production_progress"]["overall"]["parallelism"]["image"] == {
+        "active": 1, "limit": 2}
+
+    app3 = App(server["workspace"])
+    try:
+        app3.db.execute(
+            "UPDATE tasks SET status='done', updated_at=? "
+            "WHERE episode_id=? AND status='running'",
+            (now(), episode_id))
+    finally:
+        app3.close()
+
+
 def test_episode_guidance_pauses_at_incomplete_keyframe_gate(server):
     """错误的 awaiting_confirm 不能越过正式关键帧和首尾帧门禁。"""
     app2 = App(server["workspace"])

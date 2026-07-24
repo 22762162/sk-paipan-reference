@@ -824,6 +824,15 @@ def _production_progress(app, episode, render_plan):
         return max(1, min(value, 8))
 
     image_limit = parallel_limit("parallel_images", 3)
+    # The generic image setting may be larger than the number of usable Codex
+    # logins.  When Codex A/B are ready, the effective production channel
+    # count is the ready profile count; otherwise keep the API/mock slot limit.
+    try:
+        codex_ready_count = len(app.director._codex_parallel_profiles())
+    except (AttributeError, TypeError, ValueError):
+        codex_ready_count = 0
+    if codex_ready_count:
+        image_limit = min(image_limit, codex_ready_count)
     video_limit = parallel_limit("parallel_videos", 4)
     image_active = sum(
         1 for item in active_items
