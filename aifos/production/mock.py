@@ -192,7 +192,28 @@ class MockProvider(Provider):
                     "count_checked": True,
                     "count_match": True,
                     "detected_count": payload.get("count", 0),
-                    "issues": ["测试触发:画面与要求不符"]}, ""
+                    "issues": ["测试触发:画面与要求不符"],
+                    "image_error": {
+                        "summary": "画面与当前镜头要求不符",
+                        "categories": ["composition"],
+                        "evidence": ["mock 质检标记触发"],
+                    },
+                    "prompt_diagnosis": {
+                        "status": "needs_patch",
+                        "issues": ["当前镜头约束需要进一步明确"],
+                        "irrelevant_or_conflicting_sections": [],
+                    },
+                    "reference_diagnosis": {
+                        "status": "correct",
+                        "issues": [],
+                        "missing_roles": [],
+                    },
+                    "targeted_prompt_patch": {
+                        "instructions": ["只修正当前镜头构图与动作"],
+                        "preserve": ["人物身份", "场景", "画风"],
+                        "max_scope": "current_shot_only",
+                    },
+                    "reference_adjustments": []}, ""
         return {"pass": True,
                 "identity_checked": (not payload.get("identity_required")
                                      or bool(payload.get("identity_references"))),
@@ -203,7 +224,18 @@ class MockProvider(Provider):
                 "count_checked": True,
                 "count_match": True,
                 "detected_count": payload.get("count", 0),
-                "issues": []}, ""
+                "issues": [],
+                "image_error": {
+                    "summary": "", "categories": [], "evidence": []},
+                "prompt_diagnosis": {
+                    "status": "correct", "issues": [],
+                    "irrelevant_or_conflicting_sections": []},
+                "reference_diagnosis": {
+                    "status": "correct", "issues": [], "missing_roles": []},
+                "targeted_prompt_patch": {
+                    "instructions": [], "preserve": [],
+                    "max_scope": "current_shot_only"},
+                "reference_adjustments": []}, ""
 
     # ---- 剧本:按题材分流(偶像/都市/校园/仙侠) ----
     def _gen_script(self, payload, out_dir):

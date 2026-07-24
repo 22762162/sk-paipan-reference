@@ -238,7 +238,12 @@ class ClaudeApiProvider(Provider):
                 ".jpeg": "image/jpeg", ".webp": "image/webp"}
 
     def _qc_content(self, prompt, payload):
-        """图片质检：待检图和每个最终立绘都作为真实图像块上传。"""
+        """图片质检：上传待检图及本次生成实际使用的全部参考图。
+
+        只给质检模型最终立绘，它就无法判断场景图、空间图或连续性图是否
+        选错。优先按 reference_manifest 的真实提交顺序上传；旧请求没有
+        manifest 时仍兼容 identity_references。
+        """
         import base64
         from pathlib import Path as _P
         def image_block(uri, label):
@@ -257,13 +262,39 @@ class ClaudeApiProvider(Provider):
 
         content = [{"type": "text", "text": "下面第一张是待检图。"},
                    image_block(payload.get("image_uri", ""), "待检图")]
-        for ref in payload.get("identity_references") or []:
+        manifest = [
+            ref for ref in (payload.get("reference_manifest") or [])
+            if isinstance(ref, dict) and ref.get("uri")
+        ]
+        references = manifest or [
+            {
+                **ref,
+                "label": f"{ref.get('character', '角色')}最终立绘",
+                "role": "identity",
+                "binding": "锁定人物身份",
+            }
+            for ref in (payload.get("identity_references") or [])
+            if isinstance(ref, dict) and ref.get("uri")
+        ]
+        seen = set()
+        for ref in references:
             if not isinstance(ref, dict) or not ref.get("uri"):
                 continue
-            name = ref.get("character", "角色")
-            content.append({"type": "text",
-                            "text": f"下面是{name}人工锁定的最终立绘。"})
-            content.append(image_block(ref["uri"], f"{name}最终立绘"))
+            uri = str(ref["uri"])
+            if uri in seen:
+                continue
+            seen.add(uri)
+            label = str(ref.get("label")
+                        or f"{ref.get('character', '角色')}参考图")
+            role = str(ref.get("role") or "reference")
+            binding = str(ref.get("binding") or "按标签职责使用")
+            index = ref.get("index")
+            prefix = f"图{index}" if index is not None else "参考图"
+            content.append({
+                "type": "text",
+                "text": f"下面是{prefix}「{label}」，职责={role}：{binding}",
+            })
+            content.append(image_block(uri, label))
         content.append({"type": "text", "text": prompt})
         return content
 

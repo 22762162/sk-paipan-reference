@@ -3768,6 +3768,207 @@ function productionProgressPanelHtml(data) {
   </section>`;
 }
 
+const GENERATION_DIAG_STATUS_CN = {
+  correct: "输入正确", passed: "通过", needs_patch: "需修正",
+  needs_adjustment: "需调整", conflicting: "存在冲突",
+  insufficient: "信息不足", missing: "缺失", uncertain: "待确认",
+  unknown: "未判定", blocked: "已阻止重试", retry: "按调整重试",
+  retry_with_changes: "按调整重试", awaiting_human: "等待人工",
+  manual_review: "等待人工", stop: "停止重试", accept: "接受当前结果",
+  direct_video_retry: "输入已调整，可重试", repair_frames_first: "先修复源帧",
+  none: "无需重试", keep: "保持", remove: "移除", rebind: "重新绑定",
+  replace: "替换", add: "补充", drop_revision_base: "移除失败稿基底",
+};
+const GENERATION_DIAG_FIELD_CN = {
+  status: "判断", summary: "摘要", categories: "问题分类", evidence: "画面证据",
+  issues: "发现的问题", irrelevant_or_conflicting_sections: "冲突或无关片段",
+  missing_roles: "缺失的参考图职责", instructions: "调整指令",
+  preserve: "保持不变", max_scope: "调整范围", role: "参考用途",
+  character: "对应人物", reason: "原因", action: "动作",
+  target_index: "参考图序号", replacement_selector: "替换目标",
+  reference_adjustments: "参考图调整", targeted_prompt_patch: "提示词定向修订",
+  revision_feedback: "自动优化修订", attempt: "尝试", attempt_no: "尝试",
+  generation_attempts: "生成次数", auto_retries_used: "自动重试次数",
+  result: "结果", passed: "是否通过", retry_blocked: "是否阻止重试",
+  retry_blocked_reason: "阻止原因", attempt_history: "尝试记录",
+  decision: "重试决策", prompt_changed: "提示词已变化",
+  references_changed: "参考图已变化", changes_input: "生成输入已变化",
+  same_as_previous_attempt: "与上次失败输入相同",
+  valid: "是否有效", problems: "发现的问题", items: "参考图明细",
+  safe_to_auto_retry: "可否安全自动重试", input_changed: "生成输入已变化",
+  prompt_patch: "提示词修订", reference_ops: "参考图调整",
+  reference_ops_applied: "参考图调整已应用", frame_audit: "源帧诊断",
+  first_valid: "首帧有效", last_valid: "尾帧有效",
+  source_frames_valid: "源帧有效", continuity_valid: "连续性有效",
+  visual_checked: "已做视觉检查", provider: "生成通道", model: "模型",
+  generated_at: "生成时间",
+};
+const GENERATION_DIAG_HIDDEN_FIELDS = new Set([
+  "schema", "diagnosis_complete", "prompt_hash", "reference_hash",
+  "input_hash", "revised_prompt_hash", "prompt", "prompt_full",
+  "prompt_sent", "original_prompt", "revised_prompt", "uri", "path",
+  "local_path", "absolute_path", "file_path",
+]);
+
+function generationDiagnosisHasValue(value) {
+  if (value == null || value === "") return false;
+  if (Array.isArray(value)) return value.some(generationDiagnosisHasValue);
+  if (typeof value === "object")
+    return Object.values(value).some(generationDiagnosisHasValue);
+  return true;
+}
+
+function generationDiagnosisModel(record = {}) {
+  const input = record.input_diagnosis && typeof record.input_diagnosis === "object"
+    ? record.input_diagnosis : {};
+  const first = (...values) => values.find(generationDiagnosisHasValue);
+  const visual = first(input.image_error, input.visual_error, input.frame_audit,
+    record.image_error, record.visual_error,
+    (record.issues || []).length ? {
+      summary: (record.issues || [])[0],
+      evidence: record.issues || [],
+    } : null);
+  const prompt = first(input.prompt_diagnosis, input.prompt_audit,
+    record.prompt_diagnosis, record.prompt_audit);
+  const references = first(input.reference_diagnosis, input.reference_audit,
+    record.reference_diagnosis, record.reference_audit);
+  let applied = first(record.applied_changes, input.applied_changes);
+  if (!generationDiagnosisHasValue(applied) && record.revision_feedback) {
+    applied = { revision_feedback: record.revision_feedback };
+  }
+  const attempts = first(record.attempt_history, input.attempt_history);
+  const decision = first(record.retry_decision, input.retry_decision,
+    record.decision, input.decision);
+  const decisionObject = decision && typeof decision === "object" ? decision : {};
+  const nestedDecision = decisionObject.decision
+    && typeof decisionObject.decision === "object" ? decisionObject.decision : {};
+  const action = first(
+    typeof decision === "string" ? decision : null,
+    decisionObject.action, nestedDecision.action);
+  const blockedReason = first(record.retry_blocked_reason,
+    input.retry_blocked_reason, decisionObject.retry_blocked_reason,
+    decisionObject.blocked_reason, nestedDecision.retry_blocked_reason,
+    nestedDecision.blocked_reason);
+  const retry = {};
+  if (generationDiagnosisHasValue(attempts)) retry.attempt_history = attempts;
+  if (generationDiagnosisHasValue(decision)) retry.decision = decision;
+  if (action && !(decisionObject.action || nestedDecision.action))
+    retry.action = action;
+  if (blockedReason) retry.retry_blocked_reason = blockedReason;
+  return { visual, prompt, references, applied, retry, action, blockedReason };
+}
+
+function generationDiagnosisFieldLabel(key) {
+  return GENERATION_DIAG_FIELD_CN[key]
+    || String(key || "").replaceAll("_", " ");
+}
+
+function generationDiagnosisScalarHtml(value, key = "") {
+  if (typeof value === "boolean")
+    return `<span class="generation-diagnosis-boolean ${value ? "yes" : "no"}">${value ? "是" : "否"}</span>`;
+  const text = String(value ?? "");
+  if (key === "status" || key === "action") {
+    const label = GENERATION_DIAG_STATUS_CN[text] || text;
+    return `<span class="generation-diagnosis-status state-${esc(text || "unknown")}">${esc(label)}</span>`;
+  }
+  return `<span>${esc(text)}</span>`;
+}
+
+function generationDiagnosisFieldIsHidden(field) {
+  const key = String(field || "").toLowerCase();
+  const safePromptField = [
+    "diagnosis", "audit", "hash", "changed", "patch",
+    "adjustment", "instruction", "delta", "status",
+  ].some((token) => key.includes(token));
+  return GENERATION_DIAG_HIDDEN_FIELDS.has(key)
+    || key.endsWith("_hash") || key.endsWith("_signature")
+    || key.endsWith("_uri") || key.endsWith("_path")
+    || (key.includes("prompt") && !safePromptField);
+}
+
+function generationDiagnosisValueHtml(value, key = "", depth = 0) {
+  if (!generationDiagnosisHasValue(value))
+    return `<span class="generation-diagnosis-empty">未记录</span>`;
+  if (depth > 5) return "";
+  if (Array.isArray(value)) {
+    return `<ul>${value.map((item) => `<li>${
+      generationDiagnosisValueHtml(item, key, depth + 1)}</li>`).join("")}</ul>`;
+  }
+  if (typeof value !== "object")
+    return generationDiagnosisScalarHtml(value, key);
+  const entries = Object.entries(value)
+    .filter(([field, item]) => !generationDiagnosisFieldIsHidden(field)
+      && generationDiagnosisHasValue(item));
+  if (!entries.length)
+    return `<span class="generation-diagnosis-empty">未记录</span>`;
+  return `<dl>${entries.map(([field, item]) => `<div>
+    <dt>${esc(generationDiagnosisFieldLabel(field))}</dt>
+    <dd>${generationDiagnosisValueHtml(item, field, depth + 1)}</dd>
+  </div>`).join("")}</dl>`;
+}
+
+function generationDiagnosisSectionHtml(title, value, emptyText, className) {
+  return `<section class="generation-diagnosis-section ${className}">
+    <h4>${esc(title)}</h4>
+    ${generationDiagnosisHasValue(value)
+      ? generationDiagnosisValueHtml(value)
+      : `<p class="generation-diagnosis-empty">${esc(emptyText)}</p>`}
+  </section>`;
+}
+
+function generationDiagnosisHtml(record, kind = "image") {
+  const diagnosis = generationDiagnosisModel(record);
+  const issue = (record.issues || [])[0]
+    || diagnosis.visual?.summary || "已保留问题记录";
+  const action = diagnosis.action
+    ? (GENERATION_DIAG_STATUS_CN[diagnosis.action] || diagnosis.action) : "";
+  const summary = `${issue}${action ? ` · ${action}` : ""}`;
+  return `<details class="generation-diagnosis generation-diagnosis-${esc(kind)}"
+    data-generation-diagnosis>
+    <summary><span>生成输入诊断</span>
+      <small>${esc(summary.length > 90 ? `${summary.slice(0, 90)}…` : summary)}</small>
+    </summary>
+    <div class="generation-diagnosis-grid">
+      ${generationDiagnosisSectionHtml("画面错在哪里", diagnosis.visual,
+        "只有旧版质检原因，暂无结构化画面证据。", "visual")}
+      ${generationDiagnosisSectionHtml("提示词诊断", diagnosis.prompt,
+        "本次没有记录提示词输入诊断。", "prompt")}
+      ${generationDiagnosisSectionHtml("参考图诊断", diagnosis.references,
+        "本次没有记录参考图输入诊断。", "references")}
+      ${generationDiagnosisSectionHtml("本次实际调整", diagnosis.applied,
+        "未记录实际应用到本次生成输入的调整。", "changes")}
+      ${generationDiagnosisSectionHtml("重试结果", diagnosis.retry,
+        "未记录重试决策或尝试历史。", "retry")}
+    </div>
+  </details>`;
+}
+
+function videoFailurePanelHtml(failures) {
+  if (!failures.length) return "";
+  return `<section class="production-ledger-video-stop generation-failure-panel"
+    role="alert" aria-label="视频待人工问题清单">
+    <div class="generation-failure-heading">
+      <div><b>⏸ 视频质检已暂停自动返工 · ${failures.length} 个镜头</b>
+        <span>系统只自动返工 1 次；请核对本次生成输入，再填写人工修改意见。</span></div>
+      <small>问题视频不会被当作已通过成片。</small>
+    </div>
+    <div class="generation-issue-list">${failures.map((failure) => `
+      <article class="generation-issue-card video-failure-item">
+        <div class="generation-issue-card-main">
+          <span class="generation-issue-kind" aria-hidden="true">🎬</span>
+          <div class="generation-issue-copy">
+            <b>镜头 ${String(failure.shot_no).padStart(2, "0")}</b>
+            <span>${esc((failure.issues || []).join("；") || "视频质检未通过")}</span>
+            <small>已自动返工 ${Number(failure.auto_retries_used || 0)} / ${Number(failure.auto_retry_limit || 1)} 次</small>
+          </div>
+          <button type="button" class="primary generation-issue-action"
+            data-ledger-video-redo="${failure.shot_no}">填写修改意见并重生成</button>
+        </div>
+        ${generationDiagnosisHtml(failure, "video")}
+      </article>`).join("")}</div>
+  </section>`;
+}
+
 function imageFailurePanelHtml(data) {
   const failures = data.image_failures || [];
   if (!failures.length) return "";
@@ -3783,7 +3984,8 @@ function imageFailurePanelHtml(data) {
       </div>
     </div>
     <div class="image-failure-list">${failures.map((failure) => `
-      <article class="image-failure-item" data-image-failure-item="${esc(failure.item_id || "")}">
+      <article class="image-failure-item generation-issue-card"
+        data-image-failure-item="${esc(failure.item_id || "")}">
         ${failure.failed_output_url ? `<button type="button"
           class="image-failure-preview" data-image-failure-preview="${esc(failure.failed_output_url)}"
           aria-label="查看镜头 ${failure.shot_no} 的失败关键帧">
@@ -3800,6 +4002,7 @@ function imageFailurePanelHtml(data) {
         <button type="button" class="image-failure-pass"
           data-image-failure-pass="${esc(failure.item_id || "")}">
           ✅ 人工通过</button>
+        ${generationDiagnosisHtml(failure, "image")}
       </article>`).join("")}</div>
   </section>`;
 }
@@ -3831,11 +4034,7 @@ function productionLedgerHtml(data, options = {}) {
       <span class="production-ledger-current">${progress.active ? "当前阶段" : "生产状态"}：<b>${esc(currentLabel)}</b></span>
     </div>
     ${productionProgressPanelHtml(data)}
-    ${humanVideoShots.length ? `<div class="production-ledger-video-stop" role="alert">
-      <b>⏸ 视频质检已暂停自动返工</b>
-      <span>${humanVideoShots.map((item) => `镜头${item.shot_no}：${esc((item.issues || []).join("；") || "视频质检未通过")}${item.revision_feedback ? `<small>自动优化修订：${esc(item.revision_feedback)}</small>` : ""}`).join("；")}</span>
-      <small>系统只自动返工 1 次；请先填写人工修改意见，再对指定镜头重生成。</small>
-    </div>` : ""}
+    ${videoFailurePanelHtml(humanVideoShots)}
     ${imageFailurePanelHtml(data)}
     <div class="production-ledger-summary">
       ${stageSummary.map((stage) => `<span class="production-ledger-stage ${stage.done === stage.total && stage.total ? "done" : stage.active ? "running" : "pending"}">

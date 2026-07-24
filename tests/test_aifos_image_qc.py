@@ -59,6 +59,104 @@ def test_qc_prompt_and_validation():
     assert validate_image_qc({"issues": []}) == "缺少 pass 字段"
 
 
+def test_qc_prompt_audits_exact_current_prompt_and_reference_manifest():
+    from aifos.adapters.claude_script import build_prompt
+
+    payload = {
+        "image_uri": "/tmp/shot-12.png",
+        "shot_no": 12,
+        "characters": ["李继周"],
+        "count": 1,
+        "generation_input": {
+            "scope": {
+                "item_id": "shot:12", "shot_no": 12,
+                "frame_kind": "keyframe",
+            },
+            "prompt": "CURRENT_SHOT_ONLY_SENTINEL 李继周转身",
+            "reference_manifest": [{
+                "index": 1, "uri": "/tmp/li.png",
+                "label": "李继周最终立绘", "role": "identity",
+                "character": "李继周", "binding": "只锁脸",
+            }],
+        },
+    }
+    prompt = build_prompt("image_qc", payload)
+
+    assert "CURRENT_SHOT_ONLY_SENTINEL" in prompt
+    assert '"item_id":"shot:12"' in prompt
+    assert '"role":"identity"' in prompt
+    assert "prompt_diagnosis" in prompt
+    assert "reference_diagnosis" in prompt
+    assert "targeted_prompt_patch" in prompt
+    assert "reference_adjustments" in prompt
+    assert "禁止补写整集剧情或其他镜头" in prompt
+
+
+def test_codex_qc_prompt_uses_same_structured_input_diagnosis_contract(
+        tmp_path):
+    from aifos.adapters.codex_image import build_instruction
+
+    instruction, targets, _ = build_instruction("image_qc", {
+        "image_uri": "/tmp/shot-7.png",
+        "shot_no": 7,
+        "characters": ["程沐"],
+        "count": 1,
+        "generation_input": {
+            "scope": {"item_id": "shot:7", "shot_no": 7},
+            "prompt": "CODEX_CURRENT_SHOT_SENTINEL",
+            "reference_manifest": [{
+                "index": 1, "uri": "/tmp/cheng.png",
+                "role": "identity", "character": "程沐",
+            }],
+        },
+    }, tmp_path)
+
+    assert targets == []
+    assert "CODEX_CURRENT_SHOT_SENTINEL" in instruction
+    assert "prompt_diagnosis" in instruction
+    assert "reference_diagnosis" in instruction
+    assert "targeted_prompt_patch" in instruction
+    assert "reference_adjustments" in instruction
+
+
+def test_legacy_qc_validation_remains_compatible_but_disables_blind_retry():
+    from aifos.adapters.claude_script import validate_image_qc
+
+    verdict = {
+        "pass": False,
+        "identity_checked": True,
+        "identity_match": False,
+        "issues": ["人物脸与最终立绘不一致"],
+    }
+    assert validate_image_qc(verdict) is None
+    assert verdict["diagnosis_complete"] is False
+    assert verdict["image_error"]["summary"] == "人物脸与最终立绘不一致"
+    assert verdict["prompt_diagnosis"]["status"] == "unknown"
+    assert verdict["reference_diagnosis"]["status"] == "unknown"
+
+
+def test_screen_prop_rule_never_turns_contract_headings_into_screen_text():
+    from aifos.adapters.codex_image import _screen_prop_rule
+
+    prompt = (
+        "【镜头合同v1】只执行下列事实。【主体】朱慈烺。"
+        "【场景】东宫。【单一主动作】打开电脑。")
+    explicit = _screen_prop_rule(prompt, {
+        "required": True,
+        "carrier": "电脑屏幕",
+        "whitelist": ["明季北略", "崇祯"],
+    })
+    assert "明季北略、崇祯" in explicit
+    assert "镜头合同v1" not in explicit
+    assert "主体" not in explicit
+    assert "单一主动作" not in explicit
+
+    no_whitelist = _screen_prop_rule(prompt, {})
+    assert "没有显式可读文字白名单" in no_whitelist
+    assert "不得从【镜头合同】【主体】" in no_whitelist
+    assert "明季北略" not in no_whitelist
+
+
 def test_over_shoulder_qc_uses_face_for_front_and_silhouette_for_back(app):
     from aifos.adapters.claude_script import build_prompt
 
@@ -159,7 +257,30 @@ def test_qc_fail_triggers_auto_redraw(app, tmp_path):
             return ProviderResult(
                 provider="claude", cost=0.5,
                 data={"pass": not first,
-                      "issues": (["小鹿被画成了动物"] if first else [])})
+                      "issues": (["小鹿被画成了动物"] if first else []),
+                      **({
+                          "image_error": {
+                              "summary": "小鹿被画成了动物",
+                              "categories": ["species"],
+                              "evidence": ["画面主体不是人类"],
+                          },
+                          "prompt_diagnosis": {
+                              "status": "insufficient",
+                              "issues": ["主体物种约束不够明确"],
+                              "irrelevant_or_conflicting_sections": [],
+                          },
+                          "reference_diagnosis": {
+                              "status": "correct", "issues": [],
+                              "missing_roles": [],
+                          },
+                          "targeted_prompt_patch": {
+                              "instructions": [
+                                  "小鹿是人类女性，不得生成动物或兽形"],
+                              "preserve": ["当前构图", "场景"],
+                              "max_scope": "current_shot_only",
+                          },
+                          "reference_adjustments": [],
+                      } if first else {})})
 
     app.director.router = StubRouter()
     result = app.director._generate_image_with_qc(
@@ -167,12 +288,129 @@ def test_qc_fail_triggers_auto_redraw(app, tmp_path):
         {"characters": ["小鹿"], "count": 1, "designs": "",
          "location": "", "action": "", "forbid": []})
     assert len(calls["image"]) == 2          # 首画 + 质检重画
-    assert "小鹿被画成了动物" in calls["image"][1]["feedback"]
-    assert "【自动优化修订】" in calls["image"][1]["feedback"]
-    assert "物种" in calls["image"][1]["feedback"]
+    assert "小鹿是人类女性" in calls["image"][1]["feedback"]
+    assert "【本镜定向修正】" in calls["image"][1]["feedback"]
+    assert "只修改当前镜头" in calls["image"][1]["feedback"]
+    assert "【质检原因】" not in calls["image"][1]["feedback"]
     assert result.qc["passed"] is True
     assert result.qc["attempts"] == 2
     assert result.cost == 3.0        # 两次出图(2.0)+两次质检(1.0)
+    assert calls["qc"][0]["generation_input"]["scope"]["shot_no"] == 1
+    assert calls["qc"][0]["generation_input"]["input_hash"]
+    assert len(result.qc["attempt_history"]) == 2
+    assert result.qc["attempt_history"][0][
+        "input_hash"] != result.qc["attempt_history"][1]["input_hash"]
+
+
+def test_incomplete_legacy_diagnosis_blocks_blind_second_generation(
+        app, tmp_path):
+    image = tmp_path / "legacy-failure.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+    image_calls = []
+
+    class StubRouter:
+        def call(self, capability, payload, out_dir, cancel=None):
+            if capability == "image":
+                image_calls.append(dict(payload))
+                return ProviderResult(
+                    provider="seedream", cost=0.2, uri=str(image))
+            return ProviderResult(provider="legacy-qc", cost=0.1, data={
+                "pass": False, "issues": ["人物身份不一致"],
+                "identity_checked": True, "identity_match": False,
+                "gender_checked": True, "gender_match": True,
+                "count_checked": True, "count_match": True,
+            })
+
+    app.director.router = StubRouter()
+    result = app.director._generate_image_with_qc(
+        "image", {"prompt": "本镜人物转身", "shot_no": 4},
+        tmp_path, None, {
+            "characters": ["甲"], "count": 1,
+            "identity_required": True, "gender_required": True,
+            "count_required": True, "identity_references": [{}],
+        })
+
+    assert len(image_calls) == 1
+    assert result.qc["passed"] is False
+    assert result.qc["diagnosis_complete"] is False
+    assert result.qc["retry_blocked"] is True
+    assert "禁止盲目原样重试" in result.qc["retry_blocked_reason"]
+
+
+def test_reference_diagnosis_removes_wrong_manual_ref_before_retry(
+        app, tmp_path):
+    output = tmp_path / "shot.png"
+    wrong = tmp_path / "wrong-reference.png"
+    output.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+    wrong.write_bytes(b"\x89PNG\r\n\x1a\n" + b"1" * 16)
+    calls = {"image": [], "qc": []}
+
+    class StubRouter:
+        def call(self, capability, payload, out_dir, cancel=None):
+            if capability == "image":
+                calls["image"].append(copy := dict(payload))
+                # Keep nested values stable for assertions after director
+                # mutates the next attempt.
+                copy["reference_manifest"] = [
+                    dict(item) for item in (
+                        payload.get("reference_manifest") or [])]
+                return ProviderResult(
+                    provider="seedream", cost=0.2, uri=str(output))
+            calls["qc"].append(dict(payload))
+            first = len(calls["qc"]) == 1
+            return ProviderResult(provider="vision", cost=0.1, data={
+                "pass": not first,
+                "issues": ["错误参考图造成现代服装"] if first else [],
+                "identity_checked": True, "identity_match": True,
+                "gender_checked": True, "gender_match": True,
+                "count_checked": True, "count_match": True,
+                **({
+                    "image_error": {
+                        "summary": "服装年代错误",
+                        "categories": ["wardrobe"],
+                        "evidence": ["画面是现代西装"],
+                    },
+                    "prompt_diagnosis": {
+                        "status": "correct", "issues": [],
+                        "irrelevant_or_conflicting_sections": [],
+                    },
+                    "reference_diagnosis": {
+                        "status": "conflicting",
+                        "issues": ["图1属于其他项目且服装错误"],
+                        "missing_roles": [],
+                    },
+                    "targeted_prompt_patch": {
+                        "instructions": [], "preserve": [],
+                        "max_scope": "current_shot_only",
+                    },
+                    "reference_adjustments": [{
+                        "action": "remove", "target_index": 1,
+                        "role": "manual", "character": "",
+                        "reason": "移除错误服装参考",
+                    }],
+                } if first else {}),
+            })
+
+    app.director.router = StubRouter()
+    result = app.director._generate_image_with_qc(
+        "image", {
+            "prompt": "空镜中的衣架", "shot_no": 8,
+            "reference_images": [str(wrong)],
+            "asset_matches": [{
+                "uri": str(wrong), "label": "用户错误参考图",
+                "reference_role": "manual",
+            }],
+        }, tmp_path, None, {
+            "characters": [], "count": 0, "count_required": True,
+        })
+
+    assert result.qc["passed"] is True
+    assert len(calls["image"]) == 2
+    assert str(wrong) not in calls["image"][1].get("reference_images", [])
+    assert calls["image"][1].get("reference_manifest") == []
+    assert result.qc["attempt_history"][0][
+        "reference_hash"] != result.qc["attempt_history"][1][
+            "reference_hash"]
 
 
 def test_gender_mismatch_is_a_hard_identity_gate(app, tmp_path):
@@ -252,6 +490,28 @@ def test_count_mismatch_auto_revises_bad_image_with_locked_references(
                 "count_checked": True, "count_match": not first,
                 "detected_count": 3 if first else 2,
                 "issues": ["多出一名人物"] if first else [],
+                **({
+                    "image_error": {
+                        "summary": "画面多出一名人物",
+                        "categories": ["count"],
+                        "evidence": ["检测到3人，要求2人"],
+                    },
+                    "prompt_diagnosis": {
+                        "status": "needs_patch",
+                        "issues": ["人数边界需要强化"],
+                        "irrelevant_or_conflicting_sections": [],
+                    },
+                    "reference_diagnosis": {
+                        "status": "correct", "issues": [],
+                        "missing_roles": [],
+                    },
+                    "targeted_prompt_patch": {
+                        "instructions": ["画面严格只保留甲、乙两人"],
+                        "preserve": ["甲乙身份", "原机位"],
+                        "max_scope": "current_shot_only",
+                    },
+                    "reference_adjustments": [],
+                } if first else {}),
             })
 
     app.director.router = StubRouter()
@@ -271,8 +531,10 @@ def test_count_mismatch_auto_revises_bad_image_with_locked_references(
     assert len(calls["image"]) == 2
     revised = calls["image"][1]
     assert revised["revision_mode"] == "targeted_qc_fix"
-    assert revised["reference_images"][0] == str(image)
-    assert any(
+    # 人数/身份错误稿不能反过来成为第二次生成的参考图，否则多余人物
+    # 容易被继续复制；只保留锁定人物参考并用短提示词定向重生。
+    assert str(image) not in revised.get("reference_images", [])
+    assert not any(
         item["label"] == "质检未过的待修改基底"
         for item in revised["reference_manifest"])
     assert revised["reference_manifest"][0]["uri"] == str(identity)

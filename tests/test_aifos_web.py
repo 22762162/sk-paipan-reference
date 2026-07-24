@@ -141,6 +141,12 @@ def test_index_and_static(server):
     assert b"data-image-failure-shot" in app_js
     assert "跳到镜头".encode() in app_js
     assert "展开修改".encode() in app_js
+    assert b"generationDiagnosisHtml" in app_js
+    assert b"videoFailurePanelHtml" in app_js
+    assert b"data-generation-diagnosis" in app_js
+    for heading in ("画面错在哪里", "提示词诊断", "参考图诊断",
+                    "本次实际调整", "重试结果"):
+        assert heading.encode() in app_js
     assert b"scrollIntoView" in app_js
     assert "先处理问题图".encode() in app_js
     assert "失败稿不会进入正式资产".encode() in app_js
@@ -226,6 +232,9 @@ def test_index_and_static(server):
     assert b".qc-manual-pass" in style_css
     assert b".plan-qc-accept" in style_css
     assert b".image-failure-pass" in style_css
+    assert b".generation-diagnosis-grid" in style_css
+    assert b".generation-diagnosis-section" in style_css
+    assert b".generation-issue-card-main" in style_css
     assert b".acceleration-panel" in style_css
     assert b".image-accel-livebar" in style_css
     assert b".accel-gates" in style_css
@@ -353,6 +362,36 @@ def test_episode_exposes_image_failures_with_artifact_urls(server):
                 "awaiting_human": True,
                 "attempts": 2,
                 "issues": ["人物多出一人", "服装颜色与定版不一致"],
+                "revision_feedback": f"按失败稿 {failed} 定向修正人数",
+                "input_diagnosis": {
+                    "image_error": {
+                        "summary": "右侧出现多余人物",
+                        "evidence": ["右侧边缘可见第三人"],
+                    },
+                    "prompt_audit": {
+                        "status": "conflicting",
+                        "issues": ["人数描述互相冲突"],
+                    },
+                    "reference_audit": {
+                        "status": "needs_adjustment",
+                        "issues": ["第二张参考图绑定到错误人物"],
+                    },
+                    "prompt": "这是绝不能通过问题清单接口泄漏的完整提示词",
+                    "local_path": str(failed),
+                },
+                "applied_changes": [{
+                    "prompt_patch": "只保留两名角色",
+                    "output_uri": str(failed),
+                }],
+                "attempt_history": [{
+                    "attempt": 1,
+                    "generation_prompt": "完整提示词副本",
+                    "artifact_path": str(failed),
+                    "result": "failed",
+                }],
+                "decision": {"action": "manual_review"},
+                "retry_blocked_reason": (
+                    f"输入未发生有效变化，失败稿位于 {failed}"),
             },
         }]})
         episode_id = episode["id"]
@@ -368,10 +407,90 @@ def test_episode_exposes_image_failures_with_artifact_urls(server):
     assert failure["item_id"] == "shot:7"
     assert failure["shot_no"] == 7
     assert failure["issues"] == ["人物多出一人", "服装颜色与定版不一致"]
+    assert failure["input_diagnosis"]["prompt_audit"]["status"] == \
+        "conflicting"
+    assert failure["input_diagnosis"]["reference_audit"]["status"] == \
+        "needs_adjustment"
+    assert failure["applied_changes"][0]["prompt_patch"] == \
+        "只保留两名角色"
+    assert failure["attempt_history"][0]["attempt"] == 1
+    assert failure["retry_decision"]["action"] == "manual_review"
+    assert "[本地路径已隐藏]" in failure["retry_blocked_reason"]
+    assert "[本地路径已隐藏]" in failure["revision_feedback"]
+    safe_failure = json.dumps(failure, ensure_ascii=False)
+    assert str(failed) not in safe_failure
+    assert "绝不能通过问题清单接口泄漏" not in safe_failure
+    assert "完整提示词副本" not in safe_failure
     failed_url = failure["failed_output_url"]
     assert failed_url.startswith("/artifacts/")
     status, ctype, raw = _request(server["port"], "GET", failed_url)
     assert status == 200 and ctype.startswith("image/png") and raw
+
+
+def test_episode_exposes_safe_video_input_diagnosis(server):
+    """视频问题卡取得同一诊断契约，但不取得提示词全文或源帧绝对路径。"""
+    app2 = App(server["workspace"])
+    try:
+        project, _ = app2.projects.get_or_create_project("视频输入诊断接口")
+        episode, _ = app2.projects.get_or_create_episode(project["id"], 1)
+        local_frame = (
+            app2.workspace.artifacts_dir / f"p{project['id']:03d}"
+            / "e001" / "frames" / "shot-2-first.png")
+        app2.projects.save_document(episode["id"], "video_qc_report", {
+            "schema": "aifos.video-qc/v2",
+            "awaiting_human": True,
+            "shots": [{
+                "shot_no": 2,
+                "passed": False,
+                "awaiting_human": True,
+                "issues": ["人物动作漂移"],
+                "input_diagnosis": {
+                    "prompt_diagnosis": {
+                        "valid": False,
+                        "problems": ["包含第二个主动作"],
+                    },
+                    "reference_audit": {
+                        "valid": False,
+                        "problems": ["尾帧不属于当前镜头"],
+                    },
+                    "frame_audit": {
+                        "first_valid": True,
+                        "last_valid": False,
+                    },
+                    "prompt_sent": "完整 Seedance 提示词不得由问题卡接口返回",
+                },
+                "decision": {
+                    "action": "repair_frames_first",
+                    "safe_to_auto_retry": False,
+                    "reason": "先修复尾帧",
+                },
+                "attempt_history": [{
+                    "attempt": 1,
+                    "first_frame": str(local_frame),
+                    "prompt_sent_hash": "hash-only",
+                }],
+            }],
+        })
+        episode_id = episode["id"]
+    finally:
+        app2.close()
+
+    status, detail = _json_request(
+        server["port"], "GET", f"/api/episode/{episode_id}")
+    assert status == 200
+    shot = detail["video_qc_report"]["shots"][0]
+    assert shot["input_diagnosis"]["prompt_diagnosis"]["valid"] is False
+    assert shot["input_diagnosis"]["reference_audit"]["valid"] is False
+    assert shot["input_diagnosis"]["frame_audit"]["last_valid"] is False
+    assert shot["retry_decision"]["action"] == "repair_frames_first"
+    assert shot["attempt_history"][0]["first_frame"] == "[本地路径已隐藏]"
+    safe_diagnosis = json.dumps({
+        "input_diagnosis": shot["input_diagnosis"],
+        "attempt_history": shot["attempt_history"],
+        "retry_decision": shot["retry_decision"],
+    }, ensure_ascii=False)
+    assert str(local_frame) not in safe_diagnosis
+    assert "完整 Seedance 提示词" not in safe_diagnosis
 
 
 def test_manual_qc_override_api_promotes_problem_image(server):

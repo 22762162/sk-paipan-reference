@@ -320,6 +320,123 @@ def _artifact_url(app, uri):
     return "/artifacts/" + rel.as_posix()
 
 
+_DIAGNOSTIC_FIELDS = (
+    "image_error", "prompt_diagnosis", "prompt_audit",
+    "reference_diagnosis", "reference_audit",
+    "frame_audit",
+    "targeted_prompt_patch", "reference_adjustments",
+    "diagnosis_complete",
+)
+_DIAGNOSTIC_FULL_PROMPT_KEYS = {
+    "prompt", "prompt_full", "full_prompt", "original_prompt",
+    "generation_prompt", "prompt_used", "revised_prompt", "final_prompt",
+    "prompt_before", "prompt_after",
+}
+
+
+def _safe_diagnostic_text(value, limit=800):
+    """诊断展示文本脱敏：不把服务器绝对路径或超长生成输入发给浏览器。"""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return ""
+    try:
+        if Path(text).is_absolute():
+            return "[本地路径已隐藏]"
+    except (OSError, ValueError):
+        pass
+    # 兼容错误文本中夹带的 macOS/Linux 绝对路径；远程 URL 不是诊断卡
+    # 需要展示的内容，也一并收敛为不可点击的安全占位。
+    text = re.sub(
+        r"(?<![\w/])/(?:[^/\s,;，；]+/)+[^/\s,;，；]+",
+        "[本地路径已隐藏]", text)
+    text = re.sub(
+        r"\b[A-Za-z]:\\(?:[^\\\s,;，；]+\\)*[^\\\s,;，；]+",
+        "[本地路径已隐藏]", text)
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "…"
+    return text
+
+
+def _safe_diagnostic_value(value, *, depth=0):
+    """仅保留可解释的结构化诊断，不透传 prompt、URI 或任意文件路径。"""
+    if depth > 5:
+        return None
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _safe_diagnostic_text(value)
+    if isinstance(value, (list, tuple)):
+        return [
+            safe for item in list(value)[:24]
+            if (safe := _safe_diagnostic_value(
+                item, depth=depth + 1)) not in (None, "", [], {})
+        ]
+    if not isinstance(value, dict):
+        return _safe_diagnostic_text(value)
+    output = {}
+    for raw_key, raw_value in list(value.items())[:48]:
+        key = str(raw_key)
+        lowered = key.lower()
+        prompt_key_is_safe = any(token in lowered for token in (
+            "diagnosis", "audit", "hash", "changed", "patch",
+            "adjustment", "instruction", "delta", "status",
+        ))
+        if (lowered in _DIAGNOSTIC_FULL_PROMPT_KEYS
+                or ("prompt" in lowered and not prompt_key_is_safe)
+                or any(token in lowered for token in (
+                    "absolute_path", "local_path", "file_path",
+                    "output_uri", "source_uri", "image_uri",
+                    "video_uri", "reference_uri"))):
+            continue
+        safe = _safe_diagnostic_value(raw_value, depth=depth + 1)
+        if safe not in (None, "", [], {}):
+            output[key] = safe
+    return output
+
+
+def _generation_diagnostic_payload(item, qc=None):
+    """统一图片/视频问题项的安全诊断契约，兼容新旧字段命名。"""
+    item = item if isinstance(item, dict) else {}
+    qc = qc if isinstance(qc, dict) else {}
+    raw_input = (
+        qc.get("input_diagnosis")
+        or item.get("input_diagnosis")
+        or {})
+    raw_input = raw_input if isinstance(raw_input, dict) else {}
+    input_diagnosis = {}
+    for key in _DIAGNOSTIC_FIELDS:
+        for source in (raw_input, qc, item):
+            if key in source:
+                input_diagnosis[key] = source[key]
+                break
+
+    def first_value(*keys, default=None):
+        for source in (qc, item, raw_input):
+            for key in keys:
+                if key in source and source[key] is not None:
+                    return source[key]
+        return default
+
+    decision = first_value("retry_decision", default=None)
+    if not decision:
+        decision = first_value("decision", default={})
+    blocked_reason = first_value("retry_blocked_reason", default="")
+    if not blocked_reason and isinstance(decision, dict):
+        blocked_reason = (
+            decision.get("retry_blocked_reason")
+            or decision.get("blocked_reason")
+            or "")
+    return {
+        "input_diagnosis": _safe_diagnostic_value(input_diagnosis) or {},
+        "applied_changes": _safe_diagnostic_value(
+            first_value("applied_changes", default=[])) or [],
+        "attempt_history": _safe_diagnostic_value(
+            first_value("attempt_history", default=[])) or [],
+        "retry_decision": _safe_diagnostic_value(decision) or {},
+        "retry_blocked_reason": _safe_diagnostic_text(blocked_reason),
+    }
+
+
 def _image_asset_catalog(app, project_id):
     """资产中心当前可见图片，补齐分类、作品、时间与提示词溯源。"""
     labels = {
@@ -1416,18 +1533,26 @@ def _episode_payload(app, episode_id):
                 if not issues and item.get("error"):
                     issues = [item["error"]]
                 image_failures.append({
-                    "item_id": item.get("id", ""),
+                    "item_id": _safe_diagnostic_text(
+                        item.get("id", ""), limit=160),
                     "shot_no": item.get("shot_no"),
-                    "label": item.get("label", ""),
+                    "label": _safe_diagnostic_text(
+                        item.get("label", ""), limit=240),
                     "status": item.get("status"),
                     "attempts": int(qc.get("attempts") or 0),
                     "auto_repairs": int(qc.get("auto_repairs") or max(
                         0, int(qc.get("attempts") or 1) - 1)),
-                    "issues": issues,
-                    "revision_feedback": qc.get(
-                        "revision_feedback", ""),
+                    "issues": _safe_diagnostic_value(issues) or [],
+                    "revision_feedback": _safe_diagnostic_text(
+                        qc.get("revision_feedback", "")),
                     "failed_output_url": item.get("output_url"),
+                    **_generation_diagnostic_payload(item, qc),
                 })
+    if isinstance(video_qc_report, dict):
+        video_qc_report = copy.deepcopy(video_qc_report)
+        for shot_qc in video_qc_report.get("shots", []):
+            if isinstance(shot_qc, dict):
+                shot_qc.update(_generation_diagnostic_payload(shot_qc))
     video_references_effective = app.director.effective_video_references(
         episode_id)
     for shot in video_references_effective.get("shots", {}).values():

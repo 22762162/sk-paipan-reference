@@ -18,6 +18,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from ..generation_diagnostics import normalize_generation_diagnostics
 from ..story_analysis import STORY_ANALYSIS_SCHEMA, validate_story_analysis
 
 SCRIPT_PROMPT = """你是漫剧编剧。为作品《{title}》第{episode}集创作一集完整剧本。
@@ -688,6 +689,14 @@ def validate_design(data, payload):
 IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(可直接读取),
 逐项核对是否符合生产要求。
 
+当前镜头本次真实生成输入(只能分析这一镜，禁止补写整集剧情或其他镜头):
+- 范围:{generation_scope}
+- 实际提交提示词:{generation_prompt}
+- 实际提交参考图对照表:{generation_references}
+除判断画面错误外，必须分别判断：提示词是否准确、简洁、无冲突、无无关剧情；
+参考图是否属于本镜、人物/角色/用途是否绑定正确、是否有缺失或冲突。诊断只能
+引用上述实际输入，不得虚构未提交的提示词或参考图。
+
 最终立绘视觉基准(这些图片是身份事实来源，优先级高于早期文字描述):
 {identity_references}
 必须先逐人判断实际可见视角，再按视角核验，不得强迫所有人物露正脸:
@@ -730,12 +739,42 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 "gender_checked": true或false, "gender_match": true或false,
 "count_checked": true或false, "count_match": true或false,
 "detected_count": 画面实际人数整数,
-"issues": ["不通过的具体原因,每条一句,指出在画面哪里"]}}"""
+"issues": ["不通过的具体原因,每条一句,指出在画面哪里"],
+"image_error": {{"summary":"画面错误摘要","categories":["identity/count/camera等"],
+"evidence":["画面中可见证据"]}},
+"prompt_diagnosis": {{"status":"correct/needs_patch/conflicting/insufficient",
+"issues":["提示词问题"],"irrelevant_or_conflicting_sections":["应删除或冲突片段"]}},
+"reference_diagnosis": {{"status":"correct/needs_adjustment/conflicting/missing/uncertain",
+"issues":["参考图问题"],"missing_roles":[{{"role":"identity/spatial/scene等",
+"character":"角色名或空","reason":"缺失原因"}}]}},
+"targeted_prompt_patch": {{"instructions":["只针对当前镜头的短修正指令"],
+"preserve":["必须保持不变的内容"],"max_scope":"current_shot_only"}},
+"reference_adjustments": [{{"action":"keep/remove/rebind/replace/add/drop_revision_base",
+"target_index":参考图编号整数,"role":"用途","character":"角色名或空",
+"replacement_selector":{{"asset_id":已有资产ID或null,"role":"用途","character":"角色名或空"}},
+"reason":"调整原因"}}]}}"""
 
 
 def build_qc_prompt(payload):
     characters = payload.get("characters") or []
     identity_refs = payload.get("identity_references") or []
+    generation = payload.get("generation_input")
+    generation = generation if isinstance(generation, dict) else {}
+    generation_prompt = (
+        generation.get("prompt")
+        or payload.get("generation_prompt")
+        or payload.get("prompt_used")
+        or payload.get("prompt_compact")
+        or "")
+    generation_references = (
+        generation.get("reference_manifest")
+        or payload.get("reference_manifest")
+        or [])
+    generation_scope = generation.get("scope") or payload.get("scope") or {
+        "item_id": payload.get("item_id", ""),
+        "shot_no": payload.get("shot_no"),
+        "frame_kind": payload.get("frame_kind", "keyframe"),
+    }
     ref_lines = "\n".join(
         f"- {ref.get('character', '角色')}"
         f"({ref.get('reference_view') or 'final_portrait'}): "
@@ -763,6 +802,12 @@ def build_qc_prompt(payload):
             + (composition.get("count_rule") or "每个人物只计一次")))
     return IMAGE_QC_PROMPT.format(
         image=payload.get("image_uri", ""),
+        generation_scope=json.dumps(
+            generation_scope, ensure_ascii=False, separators=(",", ":")),
+        generation_prompt=str(generation_prompt or "")[:12000],
+        generation_references=json.dumps(
+            generation_references, ensure_ascii=False,
+            separators=(",", ":"))[:16000],
         identity_references=(ref_lines or "无人空镜，无需人物身份比对"),
         composition_rules=composition_rules,
         characters="、".join(characters) or "无人(空镜)",
@@ -825,6 +870,8 @@ def validate_image_qc(data):
         data["identity_checks"] = []
     if not data["pass"] and not data["issues"]:
         data["issues"] = ["未给出具体原因"]
+    data.update(normalize_generation_diagnostics(
+        data, issues=data.get("issues")))
     return None
 
 

@@ -19,13 +19,13 @@
 import argparse
 import json
 import os
-import re
 import signal
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+from aifos.generation_diagnostics import normalize_generation_diagnostics
 from aifos.prompt_contract import readable_text_required
 
 
@@ -139,14 +139,20 @@ def _screen_prop_rule(prompt_text, text_asset=None):
             "电脑", "笔记本", "屏幕", "显示器", "页面", "史书", "网页")) \
             and not readable_text_required(asset):
         return ""
-    titles = list(dict.fromkeys(re.findall(
-        r"[《「『【]([^》」』】]{1,40})[》」』】]", source)))
     whitelist = [str(item).strip() for item in asset.get("whitelist", [])
                  if str(item).strip()]
-    exact = list(dict.fromkeys(whitelist + titles))
-    if "崇祯" in source and "崇祯" not in exact:
-        exact.append("崇祯")
-    wanted = "、".join(exact) or "镜头合同明确要求的页面原文"
+    # Only the explicit structured whitelist may authorize readable text.
+    # Extracting bracketed phrases from prompt_text turns structural headings
+    # such as 【镜头合同v1】【主体】 into accidental on-screen copy.
+    exact = list(dict.fromkeys(whitelist))
+    if not exact:
+        return (
+            "【屏幕文字边界】本镜没有显式可读文字白名单；不得从"
+            "【镜头合同】【主体】【场景】【动作】等提示词结构标题或剧情描述"
+            "中抽取、猜测或新增任何可读文字。屏幕仅呈现不可读的自然界面细节，"
+            "画面仍禁止字幕、Logo、水印和乱码。"
+        )
+    wanted = "、".join(exact)
     return (
         "【屏幕/页面文字硬锁】电脑必须保持打开，屏幕正对镜头并在画面中清晰"
         "可见；禁止空白冷白屏、纯白发光占位面和空白占位内容，屏幕必须实际"
@@ -328,10 +334,36 @@ def build_instruction(capability, payload, out_dir):
             f"严格共 {payload.get('count', len(payload.get('characters', [])))} "
             "个已登记角色；"
             + (composition.get("count_rule") or "每个人物只计一次"))
+        generation = payload.get("generation_input")
+        generation = generation if isinstance(generation, dict) else {}
+        generation_prompt = (
+            generation.get("prompt")
+            or payload.get("generation_prompt")
+            or payload.get("prompt_used")
+            or payload.get("prompt_compact")
+            or "")
+        generation_references = (
+            generation.get("reference_manifest")
+            or payload.get("reference_manifest")
+            or [])
+        generation_scope = generation.get("scope") or payload.get("scope") or {
+            "item_id": payload.get("item_id", ""),
+            "shot_no": payload.get("shot_no"),
+            "frame_kind": payload.get("frame_kind", "keyframe"),
+        }
         instruction = (
             f"你是漫剧图片质检员。用你的视觉能力查看图片文件 {image}"
             "(可直接读取该文件),逐项核对是否符合以下生产要求,"
             "看不到文件或无法判断时 pass 记 false。\n"
+            "- 当前镜头本次真实生成输入（只能分析这一镜，禁止补写整集剧情"
+            "或其他镜头）：\n"
+            f"  范围={json.dumps(generation_scope, ensure_ascii=False)}\n"
+            f"  实际提交提示词={str(generation_prompt)[:12000]}\n"
+            "  实际提交参考图对照表="
+            f"{json.dumps(generation_references, ensure_ascii=False)[:16000]}\n"
+            "除判断画面错误外，必须分别判断提示词是否准确、简洁、无冲突、"
+            "无无关剧情，以及参考图是否属于本镜、人物与用途绑定是否正确、"
+            "是否缺失或冲突。不得虚构未提交的输入。\n"
             f"- 出场角色:{chars}({count_rule};"
             "角色形态必须与人物设定一致——名字不代表物种,"
             "设定是人类就必须是人类)\n"
@@ -375,7 +407,28 @@ def build_instruction(capability, payload, out_dir):
             '"gender_checked": true或false, "gender_match": true或false, '
             '"count_checked": true或false, "count_match": true或false, '
             '"detected_count": 画面实际人数整数, '
-            '"issues": ["每条一句具体原因"]}'
+            '"issues": ["每条一句具体原因"], '
+            '"image_error": {"summary":"画面错误摘要",'
+            '"categories":["identity/count/camera等"],'
+            '"evidence":["画面中可见证据"]}, '
+            '"prompt_diagnosis": {"status":'
+            '"correct/needs_patch/conflicting/insufficient",'
+            '"issues":["提示词问题"],'
+            '"irrelevant_or_conflicting_sections":["冲突或无关片段"]}, '
+            '"reference_diagnosis": {"status":'
+            '"correct/needs_adjustment/conflicting/missing/uncertain",'
+            '"issues":["参考图问题"],"missing_roles":'
+            '[{"role":"用途","character":"角色名或空","reason":"原因"}]}, '
+            '"targeted_prompt_patch": {"instructions":'
+            '["只针对当前镜头的短修正指令"],'
+            '"preserve":["必须保持不变的内容"],'
+            '"max_scope":"current_shot_only"}, '
+            '"reference_adjustments": [{"action":'
+            '"keep/remove/rebind/replace/add/drop_revision_base",'
+            '"target_index":参考图编号整数,"role":"用途",'
+            '"character":"角色名或空","replacement_selector":'
+            '{"asset_id":已有资产ID或null,"role":"用途",'
+            '"character":"角色名或空"},"reason":"调整原因"}]}'
         )
         return instruction, [], {"qc": True}
     if capability == "cover":
@@ -503,14 +556,19 @@ def run(request, codex, timeout, extra_args, plain=False):
         if verdict is None or "pass" not in verdict:
             # 看不到可靠的结构化结论就失败关闭。伪造 checked/match=true
             # 会让换性别、人数错误或串脸图片绕过导演层硬门槛。
-            return {"ok": True, "data": {
+            fallback = {
                 "pass": False,
                 "issues": ["Codex 未返回可解析的视觉质检 JSON，图片未放行"],
                 "identity_checked": False, "identity_match": False,
                 "gender_checked": False, "gender_match": False,
                 "count_checked": False, "count_match": False,
-                "note": "codex 未返回可解析判定,失败关闭"}, "uri": ""}
+                "note": "codex 未返回可解析判定,失败关闭"}
+            fallback.update(normalize_generation_diagnostics(
+                fallback, issues=fallback["issues"]))
+            return {"ok": True, "data": fallback, "uri": ""}
         verdict.setdefault("issues", [])
+        verdict.update(normalize_generation_diagnostics(
+            verdict, issues=verdict.get("issues")))
         return {"ok": True, "data": verdict, "uri": "",
                 "model": "Codex 视觉质检"}
     missing = [str(t) for t in targets if not t.exists()]

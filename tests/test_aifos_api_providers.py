@@ -199,6 +199,62 @@ def test_claude_api_requires_key(tmp_path):
     assert not ok and "api_key" in reason
 
 
+def test_claude_image_qc_uploads_actual_reference_manifest_in_order(tmp_path):
+    provider = ClaudeApiProvider(
+        "claude_api", _claude_conf("http://127.0.0.1:1"))
+    generated = tmp_path / "generated.png"
+    identity = tmp_path / "identity.png"
+    spatial = tmp_path / "spatial.png"
+    scene = tmp_path / "scene.png"
+    for path in (generated, identity, spatial, scene):
+        path.write_bytes(PNG_1PX)
+
+    content = provider._qc_content("检查本镜输入是否正确", {
+        "image_uri": str(generated),
+        "reference_manifest": [
+            {
+                "index": 1,
+                "uri": str(identity),
+                "label": "林昭最终立绘",
+                "role": "identity",
+                "binding": "锁定林昭身份",
+            },
+            {
+                "index": 2,
+                "uri": str(spatial),
+                "label": "镜头空间调度图",
+                "role": "spatial",
+                "binding": "锁定站位与镜头路线",
+            },
+            {
+                "index": 3,
+                "uri": str(scene),
+                "label": "古镇场景母图",
+                "role": "scene",
+                "binding": "锁定场景结构",
+            },
+        ],
+        # manifest 存在时不得退回只检查人物身份图。
+        "identity_references": [{
+            "uri": str(identity), "character": "错误的兼容回退",
+        }],
+    })
+
+    image_blocks = [
+        item for item in content if item.get("type") == "image"]
+    labels = [
+        item["text"] for item in content if item.get("type") == "text"]
+    assert len(image_blocks) == 4
+    assert labels[0] == "下面第一张是待检图。"
+    assert labels[1:4] == [
+        "下面是图1「林昭最终立绘」，职责=identity：锁定林昭身份",
+        "下面是图2「镜头空间调度图」，职责=spatial：锁定站位与镜头路线",
+        "下面是图3「古镇场景母图」，职责=scene：锁定场景结构",
+    ]
+    assert "错误的兼容回退" not in "\n".join(labels)
+    assert labels[-1] == "检查本镜输入是否正确"
+
+
 # ---------------- OpenAI 兼容出图 API ----------------
 
 def _image_conf(endpoint):

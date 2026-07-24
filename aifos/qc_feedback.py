@@ -8,6 +8,12 @@ from __future__ import annotations
 
 import re
 
+from .generation_diagnostics import (
+    normalize_generation_diagnostics,
+    reference_actions,
+    targeted_prompt_patch as render_targeted_prompt_patch,
+)
+
 
 _RULES = (
     ("species", ("动物", "物种", "人类", "小鹿", "animal", "species"),
@@ -100,7 +106,8 @@ def _issue_text(issue):
     return str(issue or "").strip()
 
 
-def optimize_qc_feedback(issues, *, mode="image", readable_text=None):
+def optimize_qc_feedback(
+        issues, *, mode="image", readable_text=None, diagnostics=None):
     """返回原始原因、分类指令及可直接附加到提示词的修订文本。"""
     reasons = []
     instructions = []
@@ -148,6 +155,19 @@ def optimize_qc_feedback(issues, *, mode="image", readable_text=None):
         instructions = [
             "先重新核对质检清单，再只修正可确认的问题；其余画面保持不变。"
         ]
+    normalized_diagnostics = (
+        normalize_generation_diagnostics(
+            diagnostics, issues=reasons)
+        if diagnostics is not None else None)
+    diagnostic_patch = (
+        render_targeted_prompt_patch(normalized_diagnostics)
+        if normalized_diagnostics is not None else "")
+    if diagnostic_patch:
+        # The structured QC patch has inspected the exact prompt/reference
+        # inputs.  It is more specific than keyword rules; do not concatenate
+        # both and recreate the prompt clutter this compiler is meant to avoid.
+        instructions = list(
+            normalized_diagnostics["targeted_prompt_patch"]["instructions"])
     if mode == "video":
         scope = (
             "以首帧/尾帧和已锁定参考图为硬边界；只让修订后的画面动起来，"
@@ -158,14 +178,26 @@ def optimize_qc_feedback(issues, *, mode="image", readable_text=None):
             "以当前失败图为待修改基底；只修正上述问题，未提及内容保持不变。"
         )
     text = (
-        "【质检原因】" + "；".join(reasons)
-        + "。\n【自动优化修订】" + "；".join(instructions)
-        + "\n【修订边界】" + scope
+        diagnostic_patch
+        if diagnostic_patch else (
+            "【质检原因】" + "；".join(reasons)
+            + "。\n【自动优化修订】" + "；".join(instructions)
+            + "\n【修订边界】" + scope)
     )
-    return {
+    result = {
         "mode": mode,
         "issues": reasons,
         "categories": categories,
         "instructions": instructions,
         "text": text,
     }
+    if normalized_diagnostics is not None:
+        result.update({
+            "diagnostics": normalized_diagnostics,
+            "targeted_prompt_patch": diagnostic_patch,
+            "reference_adjustments": reference_actions(
+                normalized_diagnostics),
+            "diagnosis_complete": normalized_diagnostics[
+                "diagnosis_complete"],
+        })
+    return result

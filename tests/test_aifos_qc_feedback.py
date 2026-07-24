@@ -48,3 +48,36 @@ def test_blank_laptop_screen_gets_explicit_readable_page_repair():
     assert "TEXT ASSET HARD GATE" in result["text"]
     assert "明季北略、崇祯" in result["text"]
     assert "禁止空白冷白屏" in result["text"]
+
+
+def test_structured_diagnosis_uses_short_patch_without_dumping_analysis():
+    diagnostics = {
+        "pass": False,
+        "image_error": {
+            "summary": "主角服装错误",
+            "categories": ["wardrobe"],
+            "evidence": ["画面中的长袍颜色错误"],
+        },
+        "prompt_diagnosis": {
+            "status": "needs_patch",
+            "issues": ["服装颜色没有明确"],
+            "irrelevant_or_conflicting_sections": [
+                "这是一段很长的整集背景分析，不应交给图片模型"],
+        },
+        "reference_diagnosis": {
+            "status": "correct", "issues": [], "missing_roles": []},
+        "targeted_prompt_patch": {
+            "instructions": ["只把主角长袍改为深青色"],
+            "preserve": ["人物脸", "构图", "场景"],
+        },
+        "reference_adjustments": [],
+    }
+    result = optimize_qc_feedback(
+        ["主角服装颜色错误"], mode="image", diagnostics=diagnostics)
+
+    assert result["diagnosis_complete"] is True
+    assert result["text"] == result["targeted_prompt_patch"]
+    assert "只把主角长袍改为深青色" in result["text"]
+    assert "只修改当前镜头" in result["text"]
+    assert "很长的整集背景分析" not in result["text"]
+    assert result["reference_adjustments"] == []

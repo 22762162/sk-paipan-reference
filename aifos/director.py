@@ -20,6 +20,15 @@ from .adapters.claude_script import (is_background_role,
 from .db import now
 from .errors import (AifosError, BudgetExceeded, ProduceCancelled,
                      ProviderError, ProviderUnavailable)
+from .generation_diagnostics import (
+    generation_input_hash,
+    normalize_generation_diagnostics,
+    prompt_hash,
+    reference_actions,
+    reference_hash,
+    retry_input_decision,
+    targeted_prompt_patch,
+)
 from .image_acceleration import ImageAccelerationStore
 from .quality_policy import (
     default_quality_policy,
@@ -1939,6 +1948,10 @@ class Director:
         except (TypeError, ValueError):
             count = len(visible_characters)
         return {
+            # Internal retry guard: replacement selectors may only resolve
+            # assets from this project.  The QC prompt does not render this
+            # private field.
+            "_project_id": int(project_id),
             "characters": visible_characters,
             "identity_characters": identity_characters,
             "count": count,
@@ -1967,9 +1980,276 @@ class Director:
     def _qc_issue_text(issues):
         return "；".join(str(item) for item in (issues or []))
 
+    def _image_generation_input(self, payload, qc_spec=None):
+        """Freeze the actual director-side prompt/reference input for QC.
+
+        The provider may add transport-only wording, but every image route
+        receives this compact prompt plus ``feedback`` and the manifest in this
+        order.  Store hashes instead of the full prompt in attempt history; the
+        full current-shot prompt is sent only to the QC request that needs it.
+        """
+        payload = payload or {}
+        if not isinstance(payload.get("reference_manifest"), list):
+            self._attach_reference_manifest(payload)
+        prompt_sent = self._prompt_with_feedback(
+            payload.get("prompt_compact") or payload.get("prompt") or "",
+            payload.get("feedback") or "")
+        frame_kind = str(
+            payload.get("frame_kind")
+            or ("frames" if payload.get("image_uri") else "keyframe"))
+        scope = {
+            "item_id": str(payload.get("item_id") or ""),
+            "shot_no": payload.get("shot_no"),
+            "frame_kind": frame_kind,
+            "art_name": str(payload.get("art_name") or ""),
+        }
+        manifest = copy.deepcopy(payload.get("reference_manifest") or [])
+        return {
+            "schema": "aifos.image-generation-input/v1",
+            "scope": scope,
+            "prompt": prompt_sent,
+            "prompt_hash": prompt_hash(prompt_sent),
+            "reference_manifest": manifest,
+            "reference_hash": reference_hash(manifest),
+            "input_hash": generation_input_hash(prompt_sent, manifest),
+            "prompt_contract": copy.deepcopy(
+                payload.get("prompt_contract") or {}),
+            "quality": str(payload.get("image_quality") or ""),
+            "model": str(payload.get("model_override") or ""),
+            "project_id": (qc_spec or {}).get("_project_id"),
+        }
+
+    @staticmethod
+    def _replace_reference_uri(payload, old_uri, new_uri):
+        """Replace one submitted reference without widening its scope."""
+        old_uri, new_uri = str(old_uri or ""), str(new_uri or "")
+        if not old_uri or not new_uri or old_uri == new_uri:
+            return False
+        changed = False
+        for key in (
+                "spatial_ref", "image_uri", "chain_first_uri", "scene_ref",
+                "style_ref"):
+            if str(payload.get(key) or "") == old_uri:
+                payload[key] = new_uri
+                changed = True
+        for key in ("character_refs", "reference_images"):
+            values = list(payload.get(key) or [])
+            revised = [new_uri if str(uri) == old_uri else uri
+                       for uri in values]
+            if revised != values:
+                payload[key] = list(dict.fromkeys(revised))
+                changed = True
+        for ref in payload.get("identity_references") or []:
+            if (isinstance(ref, dict)
+                    and str(ref.get("uri") or "") == old_uri):
+                ref["uri"] = new_uri
+                changed = True
+        return changed
+
+    def _resolve_reference_replacement(self, qc_spec, selector):
+        """Resolve only an existing same-project asset selected by id."""
+        selector = selector if isinstance(selector, dict) else {}
+        asset_id = selector.get("asset_id")
+        if asset_id in (None, ""):
+            return None
+        try:
+            row = self.assets.get(int(asset_id))
+        except (TypeError, ValueError):
+            return None
+        if row is None or not row["uri"] or not Path(row["uri"]).exists():
+            return None
+        project_id = (qc_spec or {}).get("_project_id")
+        if project_id is not None and int(row["project_id"]) != int(project_id):
+            return None
+        if self.assets.is_deleted(row):
+            return None
+        return row
+
+    def _apply_image_reference_adjustments(
+            self, payload, qc_spec, diagnostics):
+        """Apply model proposals through a narrow asset-safe allowlist.
+
+        A visual model may identify a bad reference, but it may never invent a
+        URI, silently replace a locked identity, or reach into another project.
+        Unsupported proposals are recorded for the problem card and force the
+        retry decision to use only changes that were actually applied.
+        """
+        actions = reference_actions(diagnostics)
+        manifest = {
+            int(item.get("index")): item
+            for item in (payload.get("reference_manifest") or [])
+            if isinstance(item, dict) and item.get("index") is not None
+        }
+        protected_roles = {
+            "identity", "identity_detail", "structure", "wardrobe",
+        }
+        removable_roles = {
+            "manual", "composition", "continuity", "revision_base",
+            "qc_revision_base", "style",
+        }
+        applied, skipped = [], []
+
+        def skip(action, reason):
+            skipped.append({
+                "action": action.get("action", ""),
+                "target_index": action.get("target_index"),
+                "reason": reason,
+            })
+
+        for action in actions:
+            kind = str(action.get("action") or "")
+            if kind == "keep":
+                continue
+            target = manifest.get(action.get("target_index"))
+            target_role = str((target or {}).get("role") or "")
+            target_uri = str((target or {}).get("uri") or "")
+            if kind == "drop_revision_base":
+                candidates = [
+                    item for item in manifest.values()
+                    if str(item.get("role") or "") in (
+                        "revision_base", "qc_revision_base")]
+                if target is not None:
+                    candidates = [target]
+                removed = []
+                for item in candidates:
+                    uri = str(item.get("uri") or "")
+                    if not uri:
+                        continue
+                    payload["reference_images"] = [
+                        value for value in (
+                            payload.get("reference_images") or [])
+                        if str(value) != uri]
+                    payload["asset_matches"] = [
+                        value for value in (payload.get("asset_matches") or [])
+                        if str(value.get("uri") or "") != uri]
+                    removed.append(uri)
+                if removed:
+                    applied.append({
+                        "action": kind,
+                        "target_indices": [
+                            item.get("index") for item in candidates],
+                        "reason": action.get("reason") or "",
+                    })
+                else:
+                    skip(action, "当前输入没有可移除的失败稿基底")
+                continue
+            if kind in ("remove", "rebind", "replace") and target is None:
+                skip(action, "目标参考图编号不存在")
+                continue
+            if target_role in protected_roles:
+                skip(action, "锁定人物身份/人物母资产禁止自动移除、换绑或替换")
+                continue
+            if kind == "remove":
+                if target_role not in removable_roles:
+                    skip(action, f"{target_role or '未标注'}参考图不是可自动移除的弱引用")
+                    continue
+                payload["reference_images"] = [
+                    value for value in (payload.get("reference_images") or [])
+                    if str(value) != target_uri]
+                payload["asset_matches"] = [
+                    value for value in (payload.get("asset_matches") or [])
+                    if str(value.get("uri") or "") != target_uri]
+                for field in (
+                        "image_uri", "chain_first_uri", "style_ref"):
+                    if str(payload.get(field) or "") == target_uri:
+                        payload[field] = ""
+                applied.append({
+                    "action": kind, "target_index": target.get("index"),
+                    "role": target_role, "reason": action.get("reason") or "",
+                })
+                continue
+            if kind == "rebind":
+                matches = list(payload.get("asset_matches") or [])
+                match = next((
+                    item for item in matches
+                    if str(item.get("uri") or "") == target_uri), None)
+                if match is None:
+                    match = {"asset_id": target.get("asset_id"),
+                             "kind": target.get("kind"),
+                             "name": target.get("label"),
+                             "label": target.get("label"),
+                             "uri": target_uri}
+                    matches.append(match)
+                match["reference_role"] = (
+                    action.get("role") or target_role or "manual")
+                match["attach_to"] = action.get("character") or ""
+                payload["asset_matches"] = matches
+                applied.append({
+                    "action": kind, "target_index": target.get("index"),
+                    "role": match["reference_role"],
+                    "character": match["attach_to"],
+                    "reason": action.get("reason") or "",
+                })
+                continue
+            if kind in ("replace", "add"):
+                row = self._resolve_reference_replacement(
+                    qc_spec, action.get("replacement_selector"))
+                if row is None:
+                    skip(action, "替换资产未提供有效的本项目已有 asset_id")
+                    continue
+                new_uri = str(row["uri"])
+                role = str(action.get("role") or target_role or "manual")
+                character = str(action.get("character") or "")
+                if kind == "replace":
+                    if not self._replace_reference_uri(
+                            payload, target_uri, new_uri):
+                        skip(action, "目标参考图未在实际提交字段中找到")
+                        continue
+                    payload["asset_matches"] = [
+                        item for item in (payload.get("asset_matches") or [])
+                        if str(item.get("uri") or "") != target_uri]
+                else:
+                    refs = list(payload.get("reference_images") or [])
+                    if new_uri not in [str(value) for value in refs]:
+                        refs.append(new_uri)
+                        payload["reference_images"] = refs
+                matches = list(payload.get("asset_matches") or [])
+                matches.append({
+                    "asset_id": row["id"], "kind": row["kind"],
+                    "name": row["name"], "label": row["name"],
+                    "uri": new_uri, "reference_role": role,
+                    "attach_to": character,
+                })
+                payload["asset_matches"] = matches
+                applied.append({
+                    "action": kind,
+                    "target_index": (target or {}).get("index"),
+                    "asset_id": row["id"], "role": role,
+                    "character": character,
+                    "reason": action.get("reason") or "",
+                })
+                continue
+            skip(action, "不支持的参考图调整动作")
+        return {"applied": applied, "skipped": skipped}
+
+    @staticmethod
+    def _use_failed_image_as_revision_base(diagnostics):
+        """Do not let a bad identity/count output poison the next attempt."""
+        reference_status = str(
+            (diagnostics.get("reference_diagnosis") or {}).get(
+                "status") or "").lower()
+        if reference_status in {
+                "conflicting", "needs_adjustment", "missing"}:
+            return False
+        categories = {
+            str(value).strip().lower()
+            for value in (
+                (diagnostics.get("image_error") or {}).get("categories")
+                or [])
+        }
+        if categories & {
+                "identity", "gender", "count", "species", "identity_drift",
+                "person_count"}:
+            return False
+        return not any(
+            action.get("action") == "drop_revision_base"
+            for action in reference_actions(diagnostics))
+
     def _assess_image_qc(self, qc_spec, verdict, attempts):
         """把视觉模型结果收敛为身份/性别/人数三个不可绕过的门槛。"""
         verdict = verdict or {}
+        input_diagnosis = normalize_generation_diagnostics(
+            verdict, issues=verdict.get("issues"))
         identity_required = bool(qc_spec.get("identity_required"))
         raw_identity_checks = verdict.get("identity_checks")
         identity_checks = [
@@ -2040,7 +2320,7 @@ class Director:
             and identity_checked and identity_match
             and gender_checked and gender_match
             and count_checked and count_match)
-        return {
+        report = {
             "passed": passed,
             "issues": issues,
             "attempts": attempts,
@@ -2058,6 +2338,20 @@ class Director:
                 "composition_contract") or {},
             "hard_failure": bool(hard_failure and not passed),
         }
+        report.update({
+            "input_diagnosis": input_diagnosis,
+            "image_error": input_diagnosis["image_error"],
+            "prompt_diagnosis": input_diagnosis["prompt_diagnosis"],
+            "reference_diagnosis": input_diagnosis[
+                "reference_diagnosis"],
+            "targeted_prompt_patch": input_diagnosis[
+                "targeted_prompt_patch"],
+            "reference_adjustments": input_diagnosis[
+                "reference_adjustments"],
+            "diagnosis_complete": input_diagnosis[
+                "diagnosis_complete"],
+        })
+        return report
 
     def _generate_image_with_qc(self, capability, payload, out_dir,
                                 cancel, qc_spec):
@@ -2066,25 +2360,70 @@ class Director:
         result.qc，未通过的图片不得进入后续正式参考链。"""
         attempts = 0
         spent = 0.0
+        attempt_history = []
+        payload = copy.deepcopy(payload or {})
+        if not isinstance(payload.get("reference_manifest"), list):
+            self._attach_reference_manifest(payload)
         while True:
+            generation_input = self._image_generation_input(
+                payload, qc_spec=qc_spec)
             result = self.router.call(capability, payload, out_dir,
                                       cancel=cancel)
+            generation_cost = float(result.cost or 0.0)
             result.cost += spent
             if not qc_spec or not self._image_qc_enabled():
                 return result
             uri = result.uri
             if not uri or not Path(uri).exists():
                 return result
+            history_row = {
+                "attempt": attempts + 1,
+                "generated_at": now(),
+                "provider": result.provider,
+                "model": getattr(result, "model", "") or (
+                    (getattr(result, "data", {}) or {}).get("model") or ""),
+                "output_uri": uri,
+                "prompt_hash": generation_input["prompt_hash"],
+                "reference_hash": generation_input["reference_hash"],
+                "input_hash": generation_input["input_hash"],
+                "generation_cost": generation_cost,
+                "applied_changes": copy.deepcopy(
+                    payload.get("_applied_qc_changes") or []),
+            }
             try:
+                qc_payload = {
+                    **qc_spec,
+                    "image_uri": uri,
+                    "generation_input": generation_input,
+                    "generation_prompt": generation_input["prompt"],
+                    # The multimodal QC provider uploads this exact full set,
+                    # not only the final character portraits.
+                    "reference_manifest": generation_input[
+                        "reference_manifest"],
+                }
                 qc_result = self.router.call(
-                    "image_qc", {**qc_spec, "image_uri": uri}, out_dir,
+                    "image_qc", qc_payload, out_dir,
                     cancel=cancel)
             except (ProviderUnavailable, ProviderError) as exc:
                 # 人物镜头不能在质检故障时静默放行。保留已生成图片供人工
                 # 查看，但明确标成质检未过，后续不得当作正式参考图。
+                diagnostics = normalize_generation_diagnostics({
+                    "pass": False,
+                    "issues": [f"质检产线不可用，图片未放行:{exc}"],
+                })
                 revision = optimize_qc_feedback(
                     [f"质检产线不可用，图片未放行:{exc}"], mode="image",
-                    readable_text=qc_spec.get("readable_text"))
+                    readable_text=qc_spec.get("readable_text"),
+                    diagnostics=diagnostics)
+                history_row.update({
+                    "qc_passed": False,
+                    "qc_cost": 0.0,
+                    "image_error": diagnostics["image_error"],
+                    "prompt_diagnosis": diagnostics["prompt_diagnosis"],
+                    "reference_diagnosis": diagnostics[
+                        "reference_diagnosis"],
+                })
+                attempt_history.append(history_row)
                 result.qc = {
                     "passed": False,
                     "issues": [f"质检产线不可用，图片未放行:{exc}"],
@@ -2099,6 +2438,16 @@ class Director:
                     "hard_failure": True,
                     "identity_references": len(
                         qc_spec.get("identity_references") or []),
+                    "input_diagnosis": diagnostics,
+                    "image_error": diagnostics["image_error"],
+                    "prompt_diagnosis": diagnostics["prompt_diagnosis"],
+                    "reference_diagnosis": diagnostics[
+                        "reference_diagnosis"],
+                    "diagnosis_complete": False,
+                    "retry_blocked": True,
+                    "retry_blocked_reason": (
+                        "质检产线未返回提示词与参考图诊断，禁止盲目重试"),
+                    "attempt_history": attempt_history,
                 }
                 return result
             result.cost += qc_result.cost
@@ -2106,35 +2455,121 @@ class Director:
                 qc_spec, qc_result.data or {}, attempts + 1)
             revision = optimize_qc_feedback(
                 report["issues"], mode="image",
-                readable_text=qc_spec.get("readable_text"))
+                readable_text=qc_spec.get("readable_text"),
+                diagnostics=report["input_diagnosis"])
             report["revision_feedback"] = revision["text"]
             report["revision_categories"] = revision["categories"]
+            history_row.update({
+                "qc_passed": bool(report["passed"]),
+                "qc_cost": float(qc_result.cost or 0.0),
+                "image_error": copy.deepcopy(report["image_error"]),
+                "prompt_diagnosis": copy.deepcopy(
+                    report["prompt_diagnosis"]),
+                "reference_diagnosis": copy.deepcopy(
+                    report["reference_diagnosis"]),
+            })
+            attempt_history.append(history_row)
+            report["attempt_history"] = copy.deepcopy(attempt_history)
             result.qc = report
             if report["passed"] or attempts >= self._qc_retries():
                 return result
+            diagnostics = report["input_diagnosis"]
+            proposed = retry_input_decision(
+                generation_input["prompt"],
+                generation_input["reference_manifest"],
+                diagnostics,
+                previous_input_hash=(
+                    attempt_history[-2]["input_hash"]
+                    if len(attempt_history) > 1 else ""))
+            next_payload = copy.deepcopy(payload)
+            reference_changes = self._apply_image_reference_adjustments(
+                next_payload, qc_spec, diagnostics)
+            patch = targeted_prompt_patch(diagnostics)
+            if patch:
+                old_feedback = str(next_payload.get("feedback") or "").strip()
+                next_payload["feedback"] = (
+                    f"{old_feedback}\n{patch}" if old_feedback else patch
+                )[:2400]
+            if ((patch or reference_changes["applied"])
+                    and self._use_failed_image_as_revision_base(diagnostics)):
+                references = [uri]
+                references.extend(next_payload.get("reference_images") or [])
+                next_payload["reference_images"] = list(
+                    dict.fromkeys(references))
+                matches = [
+                    match for match in (
+                        next_payload.get("asset_matches") or [])
+                    if match.get("uri") != uri]
+                matches.append({
+                    "asset_id": None, "kind": "qc_revision_base",
+                    "name": f"qc_attempt_{attempts + 1}",
+                    "label": "质检未过的待修改基底", "uri": uri,
+                    "reference_role": "revision_base",
+                })
+                next_payload["asset_matches"] = matches
+            next_payload["qc_revision"] = revision
+            next_payload["qc_attempt"] = attempts + 1
+            next_payload["revision_mode"] = "targeted_qc_fix"
+            next_payload["source_qc_uri"] = uri
+            self._attach_reference_manifest(next_payload)
+            next_payload["require_reference_images"] = bool(
+                next_payload.get("reference_manifest"))
+            next_input = self._image_generation_input(
+                next_payload, qc_spec=qc_spec)
+            actual_prompt_changed = (
+                next_input["prompt_hash"] != generation_input["prompt_hash"])
+            actual_references_changed = (
+                next_input["reference_hash"]
+                != generation_input["reference_hash"])
+            actual_changes = {
+                "prompt_changed": actual_prompt_changed,
+                "references_changed": actual_references_changed,
+                "prompt_patch": patch,
+                "reference_changes": reference_changes["applied"],
+                "skipped_reference_changes": reference_changes["skipped"],
+                "previous_input_hash": generation_input["input_hash"],
+                "next_input_hash": next_input["input_hash"],
+            }
+            blocked_reason = ""
+            if not report.get("diagnosis_complete"):
+                blocked_reason = (
+                    "质检未完整分析实际提示词和参考图，禁止盲目原样重试")
+            elif not (actual_prompt_changed or actual_references_changed):
+                blocked_reason = (
+                    "定向修订后实际提示词与参考图均未变化，禁止原样重试")
+            elif next_input["input_hash"] == generation_input["input_hash"]:
+                blocked_reason = "修订后的生成输入与失败输入完全相同"
+            proposed.update({
+                "prompt_changed": actual_prompt_changed,
+                "references_changed": actual_references_changed,
+                "changes_input": bool(
+                    actual_prompt_changed or actual_references_changed),
+                "next_input_hash": next_input["input_hash"],
+                "retry_blocked": bool(blocked_reason),
+                "retry_blocked_reason": blocked_reason,
+            })
+            report["retry_decision"] = proposed
+            report["applied_changes"] = actual_changes
+            report["retry_blocked"] = bool(blocked_reason)
+            report["retry_blocked_reason"] = blocked_reason
+            history_row["applied_changes_for_next_attempt"] = copy.deepcopy(
+                actual_changes)
+            report["attempt_history"] = copy.deepcopy(attempt_history)
+            result.qc = report
+            if blocked_reason:
+                return result
             spent = result.cost
             attempts += 1
-            payload = dict(payload)
-            payload["feedback"] = ((payload.get("feedback") or "")
-                                   + ";" + revision["text"])[:1600]
-            payload["qc_revision"] = revision
-            payload["qc_attempt"] = attempts
-            payload["revision_mode"] = "targeted_qc_fix"
-            payload["source_qc_uri"] = uri
-            references = [uri]
-            references.extend(payload.get("reference_images") or [])
-            payload["reference_images"] = list(dict.fromkeys(references))
-            matches = [
-                match for match in (payload.get("asset_matches") or [])
-                if match.get("uri") != uri]
-            matches.append({
-                "asset_id": None, "kind": "qc_revision_base",
-                "name": f"qc_attempt_{attempts}",
-                "label": "质检未过的待修改基底", "uri": uri,
-            })
-            payload["asset_matches"] = matches
-            payload["require_reference_images"] = True
-            self._attach_reference_manifest(payload)
+            next_payload["_applied_qc_changes"] = [
+                {
+                    "source_attempt": attempts,
+                    "prompt_changed": actual_prompt_changed,
+                    "references_changed": actual_references_changed,
+                    "prompt_patch": patch,
+                    "reference_changes": reference_changes["applied"],
+                }
+            ]
+            payload = next_payload
 
     def _plan_done_extra(self, result):
         extra = {"provider": result.provider,
@@ -4749,15 +5184,21 @@ class Director:
         }
         entries, seen = [], set()
 
-        def add(uri, label, binding, character="", role=""):
+        def add(uri, label, binding, character="", role="", asset_id=None,
+                kind=""):
             value = str(uri or "").strip()
             if not value or value in seen:
                 return
             seen.add(value)
+            match = matches.get(value) or {}
             entries.append({
                 "index": len(entries) + 1, "uri": value,
                 "label": label, "binding": binding,
                 "character": character, "role": role,
+                "asset_id": (
+                    asset_id if asset_id is not None
+                    else match.get("asset_id")),
+                "kind": kind or match.get("kind") or role,
             })
 
         for pos, ref in enumerate(
@@ -4770,7 +5211,9 @@ class Director:
                 f"只锁定{who}的脸型、五官骨相、年龄、性别表达、发际线、"
                 "发型轮廓、体型与身份标志；不得复制此图的服装、姿势、"
                 "构图、背景或光线，除非本镜另有明确要求；禁止参考他人图片",
-                character=who, role="identity")
+                character=who, role="identity",
+                asset_id=ref.get("asset_id"),
+                kind="character_identity")
         add(payload.get("spatial_ref"), "本镜空间调度图",
             "只读取人物编号与对应站位、相对距离、前后遮挡、屏幕方向、"
             "行动箭头、摄影机起终点/高度、瞄准点和视锥；不得把3D示意视角、"
@@ -5869,8 +6312,140 @@ class Director:
             "第二种运镜；不得在首尾帧之间改变人物、服装、道具或场景。")
         return "\n".join(lines)
 
+    @staticmethod
+    def _video_input_snapshot(payload, result=None):
+        """Freeze the exact director-side Seedance inputs for audit/retry.
+
+        Providers may add transport-only suffixes (duration/audio flags), so a
+        future adapter can return ``prompt_used``.  Until then the compact
+        prompt is the exact prompt body handed to every video provider.
+        """
+        result_data = getattr(result, "data", {}) or {}
+        prompt_sent = str(
+            result_data.get("prompt_used")
+            or payload.get("prompt_compact")
+            or payload.get("prompt")
+            or "")
+        manifest = []
+        for item in payload.get("reference_manifest") or []:
+            if not isinstance(item, dict):
+                continue
+            manifest.append({
+                key: item.get(key) for key in (
+                    "index", "asset_id", "kind", "name", "version", "uri",
+                    "binding")
+            })
+        snapshot = {
+            "schema": "aifos.video-input-snapshot/v1",
+            "shot_no": payload.get("shot_no"),
+            "prompt_sent": prompt_sent,
+            "prompt_sent_hash": hashlib.sha256(
+                prompt_sent.encode("utf-8")).hexdigest(),
+            "prompt_contract": copy.deepcopy(
+                payload.get("prompt_contract") or {}),
+            "keyframe": str(payload.get("keyframe") or ""),
+            "first_frame": str(payload.get("first") or ""),
+            "last_frame": str(payload.get("last") or ""),
+            "reference_manifest": manifest,
+            "reference_images": [
+                str(uri) for uri in (payload.get("reference_images") or [])],
+            "reference_images_used": [
+                str(uri) for uri in (
+                    result_data.get("reference_images_used")
+                    or payload.get("reference_images") or [])],
+            "duration": payload.get("duration"),
+            "video_quality": payload.get("video_quality"),
+            "video_resolution": payload.get("video_resolution"),
+            "standard_fingerprint": payload.get("standard_fingerprint", ""),
+        }
+        signature_source = {
+            key: snapshot[key] for key in (
+                "prompt_sent", "keyframe", "first_frame", "last_frame",
+                "reference_manifest", "reference_images", "duration",
+                "video_quality", "video_resolution", "standard_fingerprint")
+        }
+        snapshot["input_signature"] = hashlib.sha256(json.dumps(
+            signature_source, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode("utf-8")).hexdigest()
+        return snapshot
+
+    @staticmethod
+    def _video_diagnosis_from_ctx(ctx, shot_no):
+        """Read visual/input diagnosis without coupling Director to its engine."""
+        candidates = (
+            ctx.get("video_input_diagnoses"),
+            ctx.get("video_visual_qc"),
+        )
+        for source in candidates:
+            if isinstance(source, dict):
+                raw = source.get(shot_no)
+                if raw is None:
+                    raw = source.get(str(shot_no))
+                if raw is None and int(source.get("shot_no") or -1) == shot_no:
+                    raw = source
+                if isinstance(raw, dict):
+                    return copy.deepcopy(
+                        raw.get("input_diagnosis")
+                        if isinstance(raw.get("input_diagnosis"), dict)
+                        else raw)
+            elif isinstance(source, list):
+                raw = next((
+                    item for item in source if isinstance(item, dict)
+                    and int(item.get("shot_no") or -1) == shot_no), None)
+                if raw:
+                    return copy.deepcopy(
+                        raw.get("input_diagnosis")
+                        if isinstance(raw.get("input_diagnosis"), dict)
+                        else raw)
+        return {}
+
+    @staticmethod
+    def _video_frame_diagnosis_failed(diagnosis):
+        frame = diagnosis.get("frame_audit") or {}
+        if not isinstance(frame, dict):
+            return False
+        explicit = (
+            frame.get("source_frames_valid"),
+            frame.get("first_valid"),
+            frame.get("last_valid"),
+            frame.get("keyframe_valid"),
+            frame.get("continuity_valid"),
+        )
+        return any(value is False for value in explicit)
+
+    @staticmethod
+    def _video_repair_feedback(item):
+        """Render only the targeted repair, not the whole QC transcript."""
+        decision = item.get("decision") or {}
+        value = (
+            decision.get("revised_prompt")
+            or decision.get("prompt_patch")
+            or item.get("prompt_patch"))
+        if isinstance(value, dict):
+            value = json.dumps(
+                value, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"))
+        value = str(value or "").strip()
+        if value:
+            return "【结构化输入修订】" + value[:1200]
+        return str(item.get("revision_feedback") or "")[:1200]
+
+    def _latest_video_input_meta(self, ctx, shot_no):
+        row = self.assets.latest(
+            ctx["project"]["id"], "video",
+            self._shot_name(ctx, int(shot_no)))
+        return self._asset_meta(row) if row is not None else {}
+
     def _prepare_video_call(self, ctx, shot, frames):
         """在主线程锁定单镜首尾帧、人物/场景资产和空间图映射。"""
+        shot_no = int(shot["shot_no"])
+        diagnosis = self._video_diagnosis_from_ctx(ctx, shot_no)
+        decision = diagnosis.get("decision") or {}
+        if (decision.get("action") == "repair_frames_first"
+                or self._video_frame_diagnosis_failed(diagnosis)):
+            raise AifosError(
+                f"镜头{shot_no}的源关键帧/首尾帧诊断未通过，"
+                "必须先修复上游帧，禁止消耗 Seedance 额度")
         frame = frames[shot["shot_no"]]
         if not formal_reference_allowed(
                 frame.get("image_quality", "medium")):
@@ -5930,6 +6505,9 @@ class Director:
             "prompt_contract": contract,
             "prompt_full": video_prompt,
             "duration": shot["duration"],
+            "keyframe": next((
+                item.get("uri", "") for item in (ctx.get("images") or [])
+                if int(item.get("shot_no") or -1) == shot_no), ""),
             "first": frame["first"],
             "last": frame["last"],
             "reference_images": [row["uri"] for row in reference_rows],
@@ -5945,6 +6523,20 @@ class Director:
                 "standard_fingerprint", ""),
             "aspect": ctx["aspect"], **ctx["dims"],
         }
+        snapshot = self._video_input_snapshot(payload)
+        payload["input_snapshot"] = snapshot
+        payload["input_signature"] = snapshot["input_signature"]
+        if diagnosis:
+            payload["input_diagnosis"] = copy.deepcopy(diagnosis)
+        previous_signature = str(
+            self._latest_video_input_meta(ctx, shot_no).get(
+                "input_signature") or "")
+        if (decision.get("action") == "direct_video_retry"
+                and previous_signature
+                and previous_signature == snapshot["input_signature"]):
+            raise AifosError(
+                f"镜头{shot_no}的提示词、首尾帧与参考图均未改变，"
+                "禁止原样重复调用 Seedance")
         return {
             "shot": shot,
             "payload": payload,
@@ -5969,22 +6561,46 @@ class Director:
                 and result.data.get("voice") == "jimeng_builtin"
                 and result.data.get("lip_sync")):
             audio_in_video = True
+        input_snapshot = self._video_input_snapshot(task["payload"], result)
+        previous_meta = self._latest_video_input_meta(
+            ctx, int(shot["shot_no"]))
+        attempt_history = list(previous_meta.get("attempt_history") or [])
+        attempt_history.append({
+            "attempt": len(attempt_history) + 1,
+            "generated_at": now(),
+            "provider": result.provider,
+            "model": getattr(result, "model", "") or "",
+            "input_signature": input_snapshot["input_signature"],
+            "prompt_sent_hash": input_snapshot["prompt_sent_hash"],
+            "reference_assets": copy.deepcopy(reference_assets),
+            "first_frame": input_snapshot["first_frame"],
+            "last_frame": input_snapshot["last_frame"],
+        })
+        attempt_history = attempt_history[-20:]
         self._register_shot_asset(ctx, "video", shot["shot_no"], result.uri,
                                   meta={"provider": result.provider,
+                                        "model": getattr(result, "model", ""),
                                         "audio_in_video": audio_in_video,
                                         "video_quality": quality["level"],
                                         "video_resolution": quality["resolution"],
                                         "quality_source": quality["source"],
                                         "reference_assets": reference_assets,
                                         "reference_manifest":
-                                            reference_manifest})
+                                            reference_manifest,
+                                        "input_snapshot": input_snapshot,
+                                        "input_signature":
+                                            input_snapshot["input_signature"],
+                                        "attempt_history": attempt_history})
         return {"shot_no": shot["shot_no"], "uri": result.uri,
                 "duration": shot["duration"], "provider": result.provider,
                 "audio_in_video": audio_in_video,
                 "video_quality": quality["level"],
                 "video_resolution": quality["resolution"],
                 "reference_assets": reference_assets,
-                "reference_manifest": reference_manifest}
+                "reference_manifest": reference_manifest,
+                "input_snapshot": input_snapshot,
+                "input_signature": input_snapshot["input_signature"],
+                "attempt_history": attempt_history}
 
     def _run_videos_parallel(self, ctx, tasks):
         """有界并行生成 Seedance 视频，完成一镜就立即记账并沉淀资产。
@@ -6239,6 +6855,437 @@ class Director:
             ctx["episode"]["id"], "video_qc_report", report)
         return report
 
+    def _video_input_for_qc(self, ctx, shot_no):
+        video = next((
+            item for item in (ctx.get("videos") or [])
+            if int(item.get("shot_no") or -1) == int(shot_no)), {})
+        snapshot = copy.deepcopy(video.get("input_snapshot") or {})
+        history = copy.deepcopy(video.get("attempt_history") or [])
+        signature = str(video.get("input_signature") or "")
+        if not snapshot or not history or not signature:
+            meta = self._latest_video_input_meta(ctx, shot_no)
+            snapshot = snapshot or copy.deepcopy(
+                meta.get("input_snapshot") or {})
+            history = history or copy.deepcopy(
+                meta.get("attempt_history") or [])
+            signature = signature or str(meta.get("input_signature") or "")
+        if not snapshot:
+            shot = next((
+                item for item in (ctx.get("storyboard") or {}).get(
+                    "shots", [])
+                if int(item.get("shot_no") or -1) == int(shot_no)), {})
+            frame = next((
+                item for item in (ctx.get("frames") or [])
+                if int(item.get("shot_no") or -1) == int(shot_no)), {})
+            keyframe = next((
+                item for item in (ctx.get("images") or [])
+                if int(item.get("shot_no") or -1) == int(shot_no)), {})
+            legacy_payload = {
+                "shot_no": shot_no,
+                "prompt_compact": (
+                    shot.get("seedance_prompt_compact")
+                    or shot.get("seedance_prompt")
+                    or shot.get("prompt")
+                    or ""),
+                "prompt_contract": shot.get("prompt_contract") or {},
+                "keyframe": keyframe.get("uri", ""),
+                "first": frame.get("first", ""),
+                "last": frame.get("last", ""),
+                "reference_images": [
+                    item.get("uri") for item in (
+                        video.get("reference_manifest") or [])
+                    if isinstance(item, dict) and item.get("uri")],
+                "reference_manifest": copy.deepcopy(
+                    video.get("reference_manifest") or []),
+                "duration": shot.get("duration"),
+                "video_quality": video.get("video_quality", "medium"),
+                "video_resolution": video.get(
+                    "video_resolution", "720p"),
+                "standard_fingerprint": (
+                    (ctx.get("production_profile") or {}).get(
+                        "standard_fingerprint", "")),
+            }
+            snapshot = self._video_input_snapshot(legacy_payload)
+            signature = snapshot["input_signature"]
+        return snapshot, signature, history
+
+    def _run_video_input_diagnosis(self, ctx, shot, snapshot, messages):
+        """Inspect actual prompt, frames and reference manifest after failure.
+
+        Video-capable visual QC is not yet a guaranteed provider capability.
+        We therefore inspect both source frames with the existing multimodal
+        image-QC route and fail closed when that route is unavailable.  A
+        visual-video diagnosis supplied by a capable provider can override
+        this through ``ctx.video_input_diagnoses``.
+        """
+        prompt = str(snapshot.get("prompt_sent") or "")
+        contract = snapshot.get("prompt_contract") or {}
+        technical_output_missing = bool(messages) and all(
+            any(token in str(message) for token in (
+                "视频缺失", "视频文件缺失", "产物缺失"))
+            for message in messages)
+        prompt_problems = []
+        if not prompt:
+            prompt_problems.append("缺少实际发送给 Seedance 的提示词")
+        if len(prompt) > 2200:
+            prompt_problems.append(
+                f"实际视频提示词过长({len(prompt)}字)，主体动作可能被稀释")
+        expected_count = len(shot.get("characters") or [])
+        subject = contract.get("subject") or {}
+        if (subject and subject.get("count") is not None
+                and int(subject.get("count") or 0) != expected_count):
+            prompt_problems.append("提示词合同人数与本镜人物名单不一致")
+
+        manifest = [
+            item for item in (snapshot.get("reference_manifest") or [])
+            if isinstance(item, dict)]
+        reference_problems = []
+        indices = [item.get("index") for item in manifest]
+        if len(indices) != len(set(indices)):
+            reference_problems.append("参考图序号重复，图文对应关系不唯一")
+        if len(manifest) > 7:
+            reference_problems.append("首尾帧之外参考图超过 Seedance 上限7张")
+        for item in manifest:
+            uri = str(item.get("uri") or "")
+            if not uri:
+                reference_problems.append(
+                    f"参考图{item.get('index')}缺少实际文件")
+            elif (not uri.startswith(("http://", "https://"))
+                  and not Path(uri).exists()):
+                reference_problems.append(
+                    f"参考图{item.get('index')}文件不存在:{item.get('name')}")
+            if not str(item.get("binding") or "").strip():
+                reference_problems.append(
+                    f"参考图{item.get('index')}未声明单一职责")
+        expected_reference_uris = [
+            str(uri) for uri in (snapshot.get("reference_images") or [])]
+        actual_reference_uris = [
+            str(uri) for uri in (
+                snapshot.get("reference_images_used") or [])]
+        if actual_reference_uris != expected_reference_uris:
+            reference_problems.append(
+                "Provider实际使用的参考图顺序/数量与提交清单不一致")
+        identity_names = self._video_identity_names(ctx, shot)
+        identity_labels = {
+            str(item.get("name") or "").split(":", 1)[0]
+            for item in manifest
+            if item.get("kind") in (
+                "character_identity", "character_art",
+                "character_candidate")}
+        for name in identity_names:
+            if name not in identity_labels:
+                reference_problems.append(f"缺少{name}的最终立绘参考")
+
+        frame_audit = {
+            "source_frames_valid": True,
+            "first_valid": True,
+            "last_valid": True,
+            "keyframe_valid": None,
+            "continuity_valid": True,
+            "visual_checked": False,
+            "issues": [],
+        }
+        first = str(snapshot.get("first_frame") or "")
+        last = str(snapshot.get("last_frame") or "")
+        keyframe = str(snapshot.get("keyframe") or "")
+        for label, uri, key in (
+                ("首帧", first, "first_valid"),
+                ("尾帧", last, "last_valid")):
+            if not uri or (
+                    not uri.startswith(("http://", "https://"))
+                    and not Path(uri).exists()):
+                frame_audit[key] = False
+                frame_audit["issues"].append(f"{label}文件缺失")
+        if keyframe:
+            frame_audit["keyframe_valid"] = not (
+                not keyframe.startswith(("http://", "https://"))
+                and not Path(keyframe).exists())
+            if not frame_audit["keyframe_valid"]:
+                frame_audit["issues"].append("关键帧文件缺失")
+        if frame_audit["first_valid"] and frame_audit["last_valid"]:
+            try:
+                composition = (
+                    shot.get("composition_contract")
+                    or build_composition_contract(shot))
+                spec = self._qc_spec(
+                    ctx["project"]["id"],
+                    self._video_identity_names(ctx, shot),
+                    location=self._shot_location(ctx.get("script"), shot),
+                    action=shot.get("description") or shot.get("prompt") or "",
+                    forbid=self._FORBID + ["字幕条"],
+                    expected_characters=shot.get("characters") or [],
+                    expected_count=shot.get(
+                        "character_count", expected_count),
+                    composition_contract=composition,
+                    readable_text=shot.get("readable_text") or {})
+                samples = [
+                    ("首帧", first, "first_valid"),
+                    ("尾帧", last, "last_valid"),
+                ]
+                if keyframe and frame_audit["keyframe_valid"]:
+                    samples.append(("关键帧", keyframe, "keyframe_valid"))
+                qc_reference_manifest = [
+                    {
+                        "index": 1, "uri": first,
+                        "label": "Seedance实际首帧",
+                        "role": "first_frame",
+                        "binding": "锁定视频动作起点、人物状态与构图",
+                    },
+                    {
+                        "index": 2, "uri": last,
+                        "label": "Seedance实际尾帧",
+                        "role": "last_frame",
+                        "binding": "锁定视频动作终点、人物状态与构图",
+                    },
+                    *[
+                        {**copy.deepcopy(item), "index": index + 3}
+                        for index, item in enumerate(manifest)
+                    ],
+                ]
+                generation_input = {
+                    "schema": "aifos.video-generation-input/v1",
+                    "scope": {
+                        "shot_no": shot.get("shot_no"),
+                        "frame_kind": "video_source_frame",
+                    },
+                    "prompt": prompt,
+                    "prompt_contract": copy.deepcopy(contract),
+                    "reference_manifest": qc_reference_manifest,
+                    "input_signature": snapshot.get(
+                        "input_signature", ""),
+                }
+                for label, uri, key in samples:
+                    result = self.router.call(
+                        "image_qc", {
+                            **spec,
+                            "image_uri": uri,
+                            "generation_input": generation_input,
+                            "generation_prompt": prompt,
+                            "reference_manifest": qc_reference_manifest,
+                        },
+                        ctx["out_root"],
+                        cancel=lambda: self._cancel_requested(ctx))
+                    if result.cost:
+                        self._task_cost = (
+                            getattr(self, "_task_cost", 0.0) + result.cost)
+                        if not hasattr(self, "_task_providers"):
+                            self._task_providers = set()
+                        self._task_providers.add(result.provider)
+                        self.projects.add_episode_cost(
+                            ctx["episode"]["id"], result.cost)
+                    verdict = self._assess_image_qc(
+                        spec, result.data or {}, 1)
+                    frame_audit["visual_checked"] = True
+                    if not verdict["passed"]:
+                        frame_audit[key] = False
+                        frame_audit["issues"].extend(
+                            f"{label}:{value}"
+                            for value in verdict.get("issues") or [])
+            except (AifosError, ProviderUnavailable, ProviderError) as exc:
+                frame_audit["diagnostic_error"] = str(exc)
+                frame_audit["visual_checked"] = False
+        frame_audit["source_frames_valid"] = bool(
+            frame_audit["first_valid"] and frame_audit["last_valid"]
+            and frame_audit["keyframe_valid"] is not False)
+        if not frame_audit["source_frames_valid"]:
+            decision = {
+                "action": "repair_frames_first",
+                "safe_to_auto_retry": False,
+                "input_changed": False,
+                "reason": "源关键帧/首尾帧未通过视觉诊断",
+            }
+        elif reference_problems:
+            decision = {
+                "action": "awaiting_human",
+                "safe_to_auto_retry": False,
+                "input_changed": False,
+                "reason": "参考图输入有误，需先更换或补齐参考图",
+            }
+        elif prompt_problems:
+            decision = {
+                "action": "direct_video_retry",
+                "safe_to_auto_retry": True,
+                "input_changed": True,
+                "prompt_patch": {
+                    "replace": "只保留本镜人物、单一动作、一次运镜和终点状态",
+                    "remove": prompt_problems,
+                },
+                "reason": "提示词合同可定向收敛后重拍",
+            }
+        elif technical_output_missing:
+            decision = {
+                "action": "direct_video_retry",
+                "safe_to_auto_retry": True,
+                "input_changed": True,
+                "prompt_patch": (
+                    "技术恢复：严格沿用已核验的本镜首尾帧、人物与参考图，"
+                    "重新生成并完整落盘视频文件"),
+                "reason": "视频产物缺失，源输入已核验，可安全恢复生成",
+            }
+        else:
+            # Source inputs passed, but no provider actually inspected the
+            # produced video's temporal content.  Do not pretend that a text
+            # diagnosis proved the cause and do not spend another video call.
+            decision = {
+                "action": "awaiting_human",
+                "safe_to_auto_retry": False,
+                "input_changed": False,
+                "reason": (
+                    "提示词、参考图与源帧未发现确定错误；"
+                    "当前无视频时序视觉诊断证据，禁止盲目重拍"),
+            }
+        return {
+            "schema": "aifos.generation-input-diagnosis/v1",
+            "mode": "video",
+            "issues": list(dict.fromkeys(
+                [*messages, *prompt_problems, *reference_problems,
+                 *frame_audit["issues"]])),
+            "prompt_diagnosis": {
+                "valid": not prompt_problems,
+                "problems": prompt_problems,
+                "prompt_sent_hash": snapshot.get("prompt_sent_hash", ""),
+            },
+            "reference_diagnosis": {
+                "valid": not reference_problems,
+                "problems": reference_problems,
+                "items": copy.deepcopy(manifest),
+            },
+            "frame_audit": frame_audit,
+            "decision": decision,
+        }
+
+    @staticmethod
+    def _normalize_video_input_diagnosis(raw, related, revision):
+        """Fail-safe retry routing from structured visual/input diagnosis."""
+        raw = copy.deepcopy(raw) if isinstance(raw, dict) else {}
+        prompt_audit = raw.get("prompt_diagnosis") or raw.get(
+            "prompt_audit") or {}
+        reference_audit = raw.get("reference_diagnosis") or raw.get(
+            "reference_audit") or {}
+        frame_audit = raw.get("frame_audit") or {}
+        decision = copy.deepcopy(raw.get("decision") or {})
+        generic_patch = raw.get("targeted_prompt_patch")
+        if isinstance(generic_patch, dict):
+            generic_patch = generic_patch.get("instructions") or generic_patch
+        generic_reference_ops = raw.get("reference_adjustments") or []
+        diagnosis_issues = [
+            str(value) for value in (raw.get("issues") or [])
+            if str(value).strip()]
+        image_error = raw.get("image_error") or {}
+        if isinstance(image_error, dict):
+            diagnosis_issues.extend(
+                str(value) for value in (
+                    image_error.get("evidence") or [])
+                if str(value).strip())
+            if image_error.get("summary"):
+                diagnosis_issues.append(str(image_error["summary"]))
+        if not diagnosis_issues:
+            for audit in (prompt_audit, reference_audit, frame_audit):
+                if isinstance(audit, dict):
+                    diagnosis_issues.extend(
+                        str(value) for value in (audit.get("problems")
+                                                 or audit.get("issues")
+                                                 or [])
+                        if str(value).strip())
+        frame_failed = False
+        if isinstance(frame_audit, dict):
+            frame_failed = any(value is False for value in (
+                frame_audit.get("source_frames_valid"),
+                frame_audit.get("first_valid"),
+                frame_audit.get("last_valid"),
+                frame_audit.get("keyframe_valid"),
+                frame_audit.get("continuity_valid"),
+            ))
+        if frame_failed:
+            decision.update({
+                "action": "repair_frames_first",
+                "safe_to_auto_retry": False,
+                "input_changed": False,
+                "reason": (decision.get("reason")
+                           or "源关键帧/首尾帧诊断未通过"),
+            })
+        if not decision:
+            if generic_patch and raw.get("diagnosis_complete"):
+                decision = {
+                    "action": "direct_video_retry",
+                    "safe_to_auto_retry": True,
+                    "input_changed": True,
+                    "prompt_patch": generic_patch,
+                    "reason": "视觉诊断已生成本镜定向提示词修订",
+                }
+            elif generic_reference_ops:
+                decision = {
+                    "action": "awaiting_human",
+                    "safe_to_auto_retry": False,
+                    "input_changed": False,
+                    "reference_ops": copy.deepcopy(generic_reference_ops),
+                    "reason": "参考图修订建议尚未解析并实际应用",
+                }
+            # Backward compatibility: old QC only knew a shot-local
+            # rerunnable video/media failure.  Compile a targeted prompt patch
+            # so the retry input changes; global/config issues never enter here.
+            rerunnable = any(bool(item.get("rerunnable"))
+                             for item in related)
+            if (not decision and related and rerunnable
+                    and revision.get("instructions")):
+                decision = {
+                    "action": "direct_video_retry",
+                    "safe_to_auto_retry": True,
+                    "input_changed": True,
+                    "prompt_patch": list(revision["instructions"]),
+                    "reason": "镜头级视频输出未通过，使用定向修订重拍",
+                }
+            elif not decision and (related or diagnosis_issues):
+                decision = {
+                    "action": "awaiting_human",
+                    "safe_to_auto_retry": False,
+                    "input_changed": False,
+                    "reason": "缺少可验证的提示词或参考图修订方案",
+                }
+            elif not decision:
+                decision = {
+                    "action": "none",
+                    "safe_to_auto_retry": False,
+                    "input_changed": False,
+                }
+        action = str(decision.get("action") or "awaiting_human")
+        if action not in (
+                "none", "direct_video_retry", "repair_frames_first",
+                "awaiting_human"):
+            action = "awaiting_human"
+            decision["reason"] = (
+                decision.get("reason") or "未知修复动作，已失败安全暂停")
+        decision["action"] = action
+        patch = decision.get("prompt_patch")
+        ref_ops = decision.get("reference_ops") or []
+        declared_change = bool(
+            patch or decision.get("revised_prompt")
+            or (ref_ops and decision.get("reference_ops_applied")))
+        if action == "direct_video_retry" and not declared_change:
+            decision.update({
+                "action": "awaiting_human",
+                "safe_to_auto_retry": False,
+                "input_changed": False,
+                "reason": (
+                    "提示词未修订，或参考图修订尚未实际应用，"
+                    "禁止原样重试"),
+            })
+        elif action == "direct_video_retry":
+            decision["input_changed"] = True
+            decision["safe_to_auto_retry"] = bool(
+                decision.get("safe_to_auto_retry", True))
+        else:
+            decision["safe_to_auto_retry"] = False
+        return {
+            "schema": "aifos.generation-input-diagnosis/v1",
+            "mode": "video",
+            "issues": list(dict.fromkeys(diagnosis_issues)),
+            "prompt_diagnosis": copy.deepcopy(prompt_audit),
+            "reference_diagnosis": copy.deepcopy(reference_audit),
+            "frame_audit": copy.deepcopy(frame_audit),
+            "decision": decision,
+        }
+
     def _build_video_qc_report(self, ctx, qc_report, previous=None):
         """把总质检中与视频直接相关的问题收敛为逐镜状态。
 
@@ -6253,7 +7300,13 @@ class Director:
             if isinstance(item, dict) and item.get("shot_no") is not None
         }
         direct_checks = {"video", "media_sanity", "integrated_audio"}
-        all_issues = qc_report.get("issues") or {}
+        all_issues = qc_report.get("issues") or []
+        global_issues = [
+            str(issue.get("message") or issue.get("check"))
+            for issue in all_issues
+            if issue.get("check") in direct_checks
+            and issue.get("shot_no") is None
+        ]
         review_units = {
             str(item.get("unit_id")): item
             for item in (ctx.get("content_review") or {}).get("units", [])
@@ -6264,9 +7317,7 @@ class Director:
             shot_no = int(shot.get("shot_no"))
             related = [issue for issue in all_issues
                        if issue.get("check") in direct_checks
-                       and (issue.get("shot_no") in (None, shot_no))]
-            # 集成配音/口型属于每个视频的硬门禁，不能只显示成一个无主的
-            # 全局错误，否则用户无法知道该改哪一个镜头。
+                       and issue.get("shot_no") == shot_no]
             messages = list(dict.fromkeys(
                 str(issue.get("message") or issue.get("check"))
                 for issue in related))
@@ -6274,39 +7325,103 @@ class Director:
             if review and review.get("verdict") == "FAIL":
                 messages.append(str(review.get("drift_issue")
                                    or "逐段内容复核未通过"))
+            old = previous_shots.get(str(shot_no), {})
+            input_snapshot, input_signature, attempt_history = (
+                self._video_input_for_qc(ctx, shot_no))
+            raw_diagnosis = self._video_diagnosis_from_ctx(ctx, shot_no)
+            if (raw_diagnosis.get("input_signature")
+                    and raw_diagnosis.get("input_signature")
+                    != input_signature):
+                raw_diagnosis = {}
+            for issue in related:
+                embedded = issue.get("input_diagnosis")
+                if isinstance(embedded, dict):
+                    raw_diagnosis = {
+                        **raw_diagnosis, **copy.deepcopy(embedded)}
+            if (not raw_diagnosis and messages
+                    and old.get("input_signature") == input_signature
+                    and not old.get("passed")
+                    and list(old.get("issues") or []) == messages
+                    and isinstance(old.get("input_diagnosis"), dict)):
+                raw_diagnosis = copy.deepcopy(old["input_diagnosis"])
+            if not raw_diagnosis and messages:
+                raw_diagnosis = self._run_video_input_diagnosis(
+                    ctx, shot, input_snapshot, messages)
+            messages.extend(
+                str(value) for value in (raw_diagnosis.get("issues") or [])
+                if str(value).strip())
             messages = list(dict.fromkeys(messages))
             revision = optimize_qc_feedback(
                 messages, mode="video") if messages else {
                     "text": "", "categories": [], "issues": [],
                     "instructions": [], "mode": "video",
                 }
-            old = previous_shots.get(str(shot_no), {})
+            input_diagnosis = self._normalize_video_input_diagnosis(
+                raw_diagnosis,
+                related or ([{"rerunnable": False}] if messages else []),
+                revision)
+            if input_diagnosis.get("issues"):
+                messages = list(dict.fromkeys(
+                    messages + input_diagnosis["issues"]))
+                revision = optimize_qc_feedback(messages, mode="video")
+                input_diagnosis = self._normalize_video_input_diagnosis(
+                    raw_diagnosis,
+                    related or [{"rerunnable": False}],
+                    revision)
+            input_diagnosis["input_signature"] = input_signature
+            decision = input_diagnosis["decision"]
             auto_retries_used = int(old.get("auto_retries_used") or 0)
             generation_attempts = int(old.get("generation_attempts") or 1)
+            passed = not messages
+            retry_available = (
+                not passed
+                and decision.get("action") == "direct_video_retry"
+                and decision.get("safe_to_auto_retry")
+                and decision.get("input_changed")
+                and auto_retries_used < VIDEO_QC_AUTO_RETRIES)
+            if passed:
+                status = "passed"
+            elif decision.get("action") == "repair_frames_first":
+                status = "repair_frames_first"
+            elif retry_available:
+                status = "failed"
+            else:
+                status = "awaiting_human"
             shots.append({
                 "shot_no": shot_no,
-                "passed": not messages,
-                "status": "passed" if not messages else (
-                    "awaiting_human" if auto_retries_used >= VIDEO_QC_AUTO_RETRIES
-                    else "failed"),
+                "passed": passed,
+                "status": status,
                 "issues": messages,
                 "generation_attempts": generation_attempts,
                 "auto_retries_used": auto_retries_used,
                 "auto_retry_limit": VIDEO_QC_AUTO_RETRIES,
                 "revision_feedback": revision["text"],
                 "revision_categories": revision["categories"],
+                "input_diagnosis": input_diagnosis,
+                "decision": decision,
+                "input_snapshot": input_snapshot,
+                "input_signature": input_signature,
+                "attempt_history": attempt_history,
                 "awaiting_human": bool(messages)
-                and auto_retries_used >= VIDEO_QC_AUTO_RETRIES,
+                and status in ("awaiting_human", "repair_frames_first"),
             })
         failed = [item for item in shots if not item["passed"]]
         waiting = [item for item in failed if item["awaiting_human"]]
+        frame_blocked = [
+            item for item in failed
+            if item["status"] == "repair_frames_first"]
         return {
             "schema": VIDEO_QC_SCHEMA,
-            "passed": not failed,
+            "passed": not failed and not global_issues,
             "shots": shots,
             "failed_shots": [item["shot_no"] for item in failed],
-            "awaiting_human": bool(waiting),
+            "awaiting_human": bool(waiting or global_issues),
             "awaiting_human_shots": [item["shot_no"] for item in waiting],
+            "repair_frames_first_shots": [
+                item["shot_no"] for item in frame_blocked],
+            "global_issues": list(dict.fromkeys(global_issues)),
+            "global_status": (
+                "awaiting_human" if global_issues else "passed"),
             "auto_retry_limit": VIDEO_QC_AUTO_RETRIES,
             "last_total_qc_passed": bool(qc_report.get("passed")),
         }
@@ -6315,6 +7430,11 @@ class Director:
     def _video_retry_candidates(video_qc_report):
         return [item["shot_no"] for item in video_qc_report.get("shots", [])
                 if not item.get("passed")
+                and (item.get("decision") or {}).get(
+                    "action") == "direct_video_retry"
+                and bool((item.get("decision") or {}).get(
+                    "safe_to_auto_retry"))
+                and bool((item.get("decision") or {}).get("input_changed"))
                 and int(item.get("auto_retries_used") or 0)
                 < VIDEO_QC_AUTO_RETRIES]
 
@@ -6367,8 +7487,14 @@ class Director:
                     int(item["shot_no"]): item
                     for item in video_qc.get("shots", [])}
                 ctx["video_feedback"] = {
-                    int(shot_no): (by_shot.get(int(shot_no), {})
-                                   .get("revision_feedback") or "")
+                    int(shot_no): self._video_repair_feedback(
+                        by_shot.get(int(shot_no), {}))
+                    for shot_no in video_shots
+                }
+                ctx["video_input_diagnoses"] = {
+                    int(shot_no): copy.deepcopy(
+                        (by_shot.get(int(shot_no), {})
+                         .get("input_diagnosis") or {}))
                     for shot_no in video_shots
                 }
             self._rerun(ctx, report, video_shots=video_shots)
@@ -6409,9 +7535,12 @@ class Director:
         # 交付复核完成后再写一次，让前端拿到最终的总质检状态与“待人工”
         # 镜头，而不是停留在返工前的中间快照。
         video_qc["last_total_qc_passed"] = bool(report["passed"])
-        video_qc["passed"] = not bool(video_qc.get("failed_shots"))
+        video_qc["passed"] = (
+            not bool(video_qc.get("failed_shots"))
+            and not bool(video_qc.get("global_issues")))
         video_qc["awaiting_human"] = bool(
-            video_qc.get("awaiting_human_shots"))
+            video_qc.get("awaiting_human_shots")
+            or video_qc.get("global_issues"))
         self._save_video_qc_report(ctx, video_qc)
         self.projects.set_qc_score(ctx["episode"]["id"], report["score"])
         report_path = ctx["out_root"] / "qc_report.json"
@@ -7056,18 +8185,25 @@ class Director:
                 f"frames:{int(target.get('shot_no', 0))}"),
         }.get(kind, lambda: "")()
         plan_item = None
+        plan_diagnostics = {}
         if item_id:
             plan_item = next(
                 (entry for entry in self._plan_read(ctx)["items"]
                  if entry.get("id") == item_id), None)
-            auto_revision = ((plan_item or {}).get("qc") or {}).get(
-                "revision_feedback") or ""
+            old_qc = (plan_item or {}).get("qc") or {}
+            plan_diagnostics = normalize_generation_diagnostics(
+                old_qc.get("input_diagnosis") or {},
+                issues=old_qc.get("issues"))
+            auto_revision = old_qc.get("revision_feedback") or ""
             # 兼容旧版计划:旧版本把“电脑屏幕空白”落成 generic。每次手动
             # 重画都依据当前质检原因重新编译，不能继续沿用旧的泛化提示。
-            old_qc = (plan_item or {}).get("qc") or {}
             if old_qc.get("issues"):
                 refreshed_revision = optimize_qc_feedback(
-                    old_qc.get("issues") or [], mode="image")
+                    old_qc.get("issues") or [], mode="image",
+                    diagnostics=(
+                        plan_diagnostics
+                        if plan_diagnostics.get("diagnosis_complete")
+                        else None))
                 auto_revision = refreshed_revision["text"]
             prompt_is_unchanged = (not prompt_override or prompt_override ==
                                    (plan_item or {}).get("prompt", ""))
@@ -7223,6 +8359,13 @@ class Director:
                 payload["action"] = prompt_override
                 payload["seedance_prompt"] = prompt_override
                 payload["_reference_prompt_base"] = prompt_override
+            if plan_diagnostics.get("diagnosis_complete"):
+                reference_changes = self._apply_image_reference_adjustments(
+                    payload, {"_project_id": project["id"]},
+                    plan_diagnostics)
+                if reference_changes["applied"]:
+                    payload["qc_reference_changes"] = reference_changes
+                    self._attach_reference_manifest(payload)
             asset_name = self._shot_name(ctx, shot_no)
             old_image = self.assets.latest(
                 project["id"], "image", asset_name)
@@ -7235,7 +8378,11 @@ class Director:
                         candidate.startswith(("http://", "https://"))
                         or Path(candidate).exists()):
                     revision_base = candidate
-            if (revision_base
+            allow_revision_base = (
+                not plan_diagnostics.get("diagnosis_complete")
+                or self._use_failed_image_as_revision_base(
+                    plan_diagnostics))
+            if (revision_base and allow_revision_base
                     and (revision_base.startswith(("http://", "https://"))
                          or Path(revision_base).exists())):
                 payload["reference_images"] = list(dict.fromkeys([
@@ -7318,16 +8465,29 @@ class Director:
                 ctx, shot, continuity_anchor=len(scene_shots) > 1,
                 quality_override=quality_choice,
                 item_id=f"frames:{shot_no}")
+            if plan_diagnostics.get("diagnosis_complete"):
+                reference_changes = self._apply_image_reference_adjustments(
+                    payload, {"_project_id": project["id"]},
+                    plan_diagnostics)
+                if reference_changes["applied"]:
+                    payload["qc_reference_changes"] = reference_changes
             label = "首帧" if kind == "first_frame" else "尾帧"
             state_label = "起始状态" if kind == "first_frame" else "结束状态"
             state = (shot.get("start_state", {}) if kind == "first_frame"
                      else shot.get("end_state", {}))
+            use_current_revision_base = (
+                not plan_diagnostics.get("diagnosis_complete")
+                or self._use_failed_image_as_revision_base(
+                    plan_diagnostics))
             base_prompt = prompt_override or payload.get(
                 "_reference_prompt_base", payload["prompt"])
             payload["_reference_prompt_base"] = (
                 f"只修改镜头{shot_no}的{label}这一张静帧，不生成另一张帧，"
                 f"也不改关键分镜。{base_prompt}。{state_label}:{state}。"
-                "严格以当前待修改原图为基底落实修改意见；未被意见指出的"
+                + ("严格以当前待修改原图为基底落实修改意见；"
+                   if use_current_revision_base else
+                   "失败稿不作为参考，按已锁定人物、关键分镜和另一端帧重新生成；")
+                + "未被意见指出的"
                 "人物身份、人数、构图、机位、服装、发型、妆容、道具、"
                 "场景、文字和光影保持不变")
             payload["prompt"] = payload["_reference_prompt_base"]
@@ -7345,6 +8505,8 @@ class Director:
                  f"本镜{'尾帧' if kind == 'first_frame' else '首帧'}"
                  "（连续性约束）"),
             ]
+            if not use_current_revision_base:
+                rows = rows[1:]
             references = []
             for row, _label in rows:
                 if row and row["uri"] and row["uri"] not in references:
@@ -7420,6 +8582,14 @@ class Director:
                 "feedback": feedback,
                 "revision": next_revision("first_frame", asset_name),
             }
+            if plan_diagnostics.get("diagnosis_complete"):
+                reference_changes = self._apply_image_reference_adjustments(
+                    frames_payload, {"_project_id": project["id"]},
+                    plan_diagnostics)
+                if reference_changes["applied"]:
+                    frames_payload["qc_reference_changes"] = (
+                        reference_changes)
+                    self._attach_reference_manifest(frames_payload)
             if formal_reference_allowed(self._asset_quality(image_row)):
                 frames_payload["image_uri"] = image_row["uri"]
             else:
@@ -7849,11 +9019,53 @@ class Director:
             uri = None
         return uri, spec
 
-    def _qc_signature(self, uris, spec):
-        """图片内容、最终立绘版本和质检规格都没变时复用质检结果。"""
+    def _plan_generation_input(self, item, payload, qc_spec):
+        """Recover the exact saved prompt/reference pair for later re-QC."""
+        payload = copy.deepcopy(payload or {})
+        self._attach_reference_manifest(payload)
+        snapshot = self._image_generation_input(payload, qc_spec=qc_spec)
+        saved_prompt = str(item.get("prompt_used") or "")
+        if saved_prompt:
+            snapshot["prompt"] = saved_prompt
+            snapshot["prompt_hash"] = prompt_hash(saved_prompt)
+        saved_refs = (
+            (item.get("reference_inputs") or {}).get("items") or [])
+        if saved_refs:
+            snapshot["reference_manifest"] = [
+                {
+                    "index": index,
+                    "asset_id": ref.get("asset_id"),
+                    "uri": str(ref.get("uri") or ""),
+                    "label": str(ref.get("label") or ref.get("name")
+                                 or f"参考图{index}"),
+                    "role": str(ref.get("reference_role")
+                                or ref.get("kind") or "reference"),
+                    "character": str(ref.get("attach_to") or ""),
+                    "binding": (
+                        f"按生产清单中记录的{ref.get('label') or ref.get('kind') or '参考'}"
+                        "单一职责核验"),
+                }
+                for index, ref in enumerate(saved_refs, 1)
+                if isinstance(ref, dict) and ref.get("uri")
+            ]
+            snapshot["reference_hash"] = reference_hash(
+                snapshot["reference_manifest"])
+        snapshot["input_hash"] = generation_input_hash(
+            snapshot["prompt"], snapshot["reference_manifest"])
+        snapshot["scope"]["item_id"] = str(item.get("id") or "")
+        snapshot["scope"]["shot_no"] = item.get("shot_no")
+        snapshot["scope"]["frame_kind"] = str(
+            item.get("category") or snapshot["scope"].get("frame_kind") or "")
+        return snapshot
+
+    def _qc_signature(self, uris, spec, generation_input=None):
+        """图片、质检规格及实际生成输入都没变时才复用质检结果。"""
         digest = hashlib.sha256()
         digest.update(json.dumps(spec, ensure_ascii=False, sort_keys=True,
                                  separators=(",", ":")).encode("utf-8"))
+        if generation_input:
+            digest.update(str(
+                generation_input.get("input_hash") or "").encode("utf-8"))
         for label, uri in uris:
             digest.update(label.encode("utf-8"))
             digest.update(str(uri).encode("utf-8"))
@@ -7886,6 +9098,7 @@ class Director:
 
     def _qc_one(self, project, episode, ctx, item):
         project_id = project["id"]
+        payload = {}
         uri, spec = self._plan_item_asset(
             project_id, episode["number"], item)
         if not uri:
@@ -7934,14 +9147,18 @@ class Director:
             if last and last["uri"] and (last["uri"].startswith("http")
                                          or Path(last["uri"]).exists()):
                 uris.append(("尾帧", last["uri"]))
-        signature = self._qc_signature(uris, spec)
+        generation_input = self._plan_generation_input(
+            item, payload, spec)
+        signature = self._qc_signature(
+            uris, spec, generation_input=generation_input)
         previous = item.get("qc") or {}
         if previous.get("signature") == signature \
                 and "passed" in previous:
             cached = dict(previous)
             revision = optimize_qc_feedback(
                 cached.get("issues") or [], mode="image",
-                readable_text=spec.get("readable_text"))
+                readable_text=spec.get("readable_text"),
+                diagnostics=cached.get("input_diagnosis"))
             cached["revision_feedback"] = revision["text"]
             cached["revision_categories"] = revision["categories"]
             cached["cached"] = True
@@ -7956,14 +9173,27 @@ class Director:
         count_checked_all = True
         count_match_all = True
         hard_failure = False
+        input_diagnoses = []
         try:
             for label, one in uris:
                 result = self.router.call(
-                    "image_qc", {**spec, "image_uri": one}, ctx["out_root"],
+                    "image_qc", {
+                        **spec,
+                        "image_uri": one,
+                        "generation_input": generation_input,
+                        "generation_prompt": generation_input["prompt"],
+                        "reference_manifest": generation_input[
+                            "reference_manifest"],
+                    }, ctx["out_root"],
                     cancel=lambda: self._cancel_requested(ctx))
                 cost += result.cost
                 one_report = self._assess_image_qc(
                     spec, result.data or {}, 1)
+                input_diagnoses.append({
+                    "frame": label,
+                    "passed": bool(one_report["passed"]),
+                    **copy.deepcopy(one_report["input_diagnosis"]),
+                })
                 passed_all = passed_all and one_report["passed"]
                 identity_checked_all = (
                     identity_checked_all
@@ -7994,9 +9224,17 @@ class Director:
                   "hard_failure": hard_failure,
                   "identity_references": len(
                       spec.get("identity_references") or []),
+                  "generation_input_hash": generation_input["input_hash"],
+                  "input_diagnoses": input_diagnoses,
+                  "input_diagnosis": (
+                      next((
+                          value for value in input_diagnoses
+                          if not value.get("passed")), None)
+                      or (input_diagnoses[0] if input_diagnoses else {})),
                   "signature": signature, "cached": False}
         revision = optimize_qc_feedback(
-            issues, mode="image", readable_text=spec.get("readable_text"))
+            issues, mode="image", readable_text=spec.get("readable_text"),
+            diagnostics=report.get("input_diagnosis"))
         report["revision_feedback"] = revision["text"]
         report["revision_categories"] = revision["categories"]
         self.projects.add_episode_cost(episode["id"], cost)
@@ -8016,6 +9254,29 @@ class Director:
         repaired = 0
         current = report
         for attempt in range(self._qc_retries()):
+            diagnostics = normalize_generation_diagnostics(
+                current.get("input_diagnosis") or {},
+                issues=current.get("issues"))
+            patch = targeted_prompt_patch(diagnostics)
+            if not diagnostics.get("diagnosis_complete"):
+                current = dict(current)
+                current["retry_blocked"] = True
+                current["retry_blocked_reason"] = (
+                    "质检未完整分析实际提示词和参考图，禁止盲目自动修图")
+                self._plan_mark(
+                    ctx, item["id"], "awaiting_human",
+                    extra={"qc": current})
+                break
+            if not patch:
+                current = dict(current)
+                current["retry_blocked"] = True
+                current["retry_blocked_reason"] = (
+                    "质检没有给出可实际应用的本镜提示词修订；"
+                    "参考图调整需人工确认后再生成")
+                self._plan_mark(
+                    ctx, item["id"], "awaiting_human",
+                    extra={"qc": current})
+                break
             if self._cancel_requested(ctx):
                 raise ProduceCancelled("已手动暂停质检自动修图")
             target = self._plan_item_target(item["id"])
@@ -8033,7 +9294,8 @@ class Director:
                         "shot_no": int(item.get("shot_no")),
                     }
             revision = optimize_qc_feedback(
-                current.get("issues") or [], mode="image")
+                current.get("issues") or [], mode="image",
+                diagnostics=diagnostics)
             feedback = revision["text"][:1600]
             self.log.warn(
                 "director",
