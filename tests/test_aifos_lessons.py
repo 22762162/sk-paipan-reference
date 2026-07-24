@@ -135,3 +135,51 @@ def test_era_and_deformation_in_global_forbid(app):
     forbid = "、".join(app.director._FORBID)
     assert "时代错乱" in forbid
     assert "拉长" in forbid or "变形" in forbid
+
+
+def test_time_travel_props_are_sanctioned_not_blocked(app):
+    """穿越剧:剧本声明的跨时代物品必须画出,不被 ERA LOCK/质检卡掉。"""
+    app.director.produce("穿越回明朝", 1, pause_for_confirm=True)
+    project = app.projects.get_project("穿越回明朝")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    script.setdefault("story_world", {})["sanctioned_anachronisms"] = [
+        "主角随身的智能手机"]
+    app.projects.save_document(episode["id"], "script", script)
+    ctx = {"project": dict(project), "episode": dict(episode),
+           "out_root": app.workspace.artifacts_dir
+           / f"p{project['id']:03d}" / "e001",
+           "script": script}
+    shot = {"shot_no": 1, "scene_no": 1, "characters": [],
+            "description": "主角掏出手机查资料", "duration": 3}
+    prompt = app.director._rich_shot_prompt(ctx, shot, "明代大殿")
+    assert "剧情明确允许跨时代出现" in prompt
+    assert "智能手机" in prompt
+    assert "以本剧剧本为唯一标准" in prompt
+    video_prompt = app.director._seedance_video_prompt(ctx, shot, [])
+    assert "智能手机" in video_prompt and "不算错" in video_prompt
+    # 质检端同样拿到白名单
+    assert app.director._era_exceptions(ctx) == ["主角随身的智能手机"]
+    spec = app.director._qc_spec(
+        project["id"], [], era_exceptions=app.director._era_exceptions(ctx))
+    assert spec["era_exceptions"] == ["主角随身的智能手机"]
+    from aifos.adapters.claude_script import build_prompt
+    qc_prompt = build_prompt("image_qc", {
+        "image_uri": "/tmp/x.png", "characters": [], "count": 0,
+        "era_exceptions": spec["era_exceptions"]})
+    assert "禁止当成时代错乱判失败" in qc_prompt
+    assert "智能手机" in qc_prompt
+
+
+def test_normalize_bible_defaults_sanctioned_list():
+    from aifos.adapters.claude_script import normalize_script_bible
+    script = {"scenes": [], "characters": []}
+    normalize_script_bible(script)
+    assert script["story_world"]["sanctioned_anachronisms"] == []
+    script2 = {"scenes": [], "characters": [],
+               "story_world": {"sanctioned_anachronisms":
+                               [" 主角的手机 ", ""]}}
+    normalize_script_bible(script2)
+    assert script2["story_world"]["sanctioned_anachronisms"] == ["主角的手机"]

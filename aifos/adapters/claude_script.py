@@ -62,7 +62,8 @@ JSON 格式(字段必须齐全):
    "era_and_location": "时代与主要地域", "social_order": "社会、组织与阵营秩序",
    "hard_rules": "能力、技术、身份与事件运行边界",
    "visual_baseline": "建筑、服装、道具、色彩与光影基准",
-   "forbidden_drift": ["禁止乱入的时代/技术/物种/组织或身份"]}},
+   "forbidden_drift": ["禁止乱入的时代/技术/物种/组织或身份"],
+   "sanctioned_anachronisms": ["剧情明确允许跨时代出现的物品(如穿越者随身的手机);非穿越/无此类设定则给空数组"]}},
  "story_background": {{"prior_events": "本集之前的关键事件",
    "current_situation": "本集开场时局势", "core_conflict": "核心冲突",
    "episode_goal": "本集要完成或改变什么",
@@ -391,6 +392,14 @@ def normalize_script_bible(script, payload=None):
             "禁止新增人物、改变人物性别年龄身份或混淆人物关系",
             "禁止建筑、服装、发型、妆容和道具脱离世界视觉基准",
         ]
+    # 穿越/带入物白名单:剧情明确允许跨时代出现的物品(如穿越者的手机)。
+    # 时代校验一律以剧本为准——名单内物品必须按剧情出现,不算时代错乱。
+    sanctioned = world.get("sanctioned_anachronisms")
+    if not isinstance(sanctioned, list):
+        world["sanctioned_anachronisms"] = []
+    else:
+        world["sanctioned_anachronisms"] = [
+            str(item).strip() for item in sanctioned if str(item).strip()]
 
     background = script.get("story_background")
     if not isinstance(background, dict):
@@ -849,7 +858,11 @@ def build_qc_prompt(payload):
         camera=payload.get("camera") or "按提示词",
         physical_contract=physical_text,
         extra=("、" + "、".join(payload.get("forbid", []))
-               if payload.get("forbid") else ""))
+               if payload.get("forbid") else "")
+        + (("。剧情允许跨时代出现(穿越/带入物,时代判断以剧本为准,"
+            "这些物品出现是正确的,禁止当成时代错乱判失败):"
+            + "、".join(payload["era_exceptions"]))
+           if payload.get("era_exceptions") else ""))
 
 
 def validate_image_qc(data):

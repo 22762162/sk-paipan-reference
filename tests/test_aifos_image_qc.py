@@ -1278,6 +1278,10 @@ def test_frames_qc_checks_both_frames(app, monkeypatch):
                       "gender_match": True,
                       "count_checked": True,
                       "count_match": True,
+                      "physical_logic_checked": True,
+                      "physical_logic_match": True,
+                      "spatial_logic_checked": True,
+                      "spatial_logic_match": True,
                       "issues": [] if calls["n"] != 2 else ["尾帧人物不符"]})
         return real_call(capability, payload, out_dir, cancel=cancel)
 

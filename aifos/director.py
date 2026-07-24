@@ -1922,11 +1922,29 @@ class Director:
                 break
         return refs
 
+    def _era_exceptions(self, ctx_or_episode_id):
+        """剧本声明的穿越/带入物白名单(时代判断以剧本为准)。"""
+        if isinstance(ctx_or_episode_id, dict):
+            script = ctx_or_episode_id.get("script")
+            if script is None:
+                episode = ctx_or_episode_id.get("episode") or {}
+                script, _ = self.projects.latest_document(
+                    episode.get("id"), "script") if episode.get("id") \
+                    else (None, None)
+        else:
+            script, _ = self.projects.latest_document(
+                int(ctx_or_episode_id), "script")
+        world = (script or {}).get("story_world") or {}
+        return [str(item).strip()
+                for item in (world.get("sanctioned_anachronisms") or [])
+                if str(item).strip()]
+
     def _qc_spec(self, project_id, characters, location="", action="",
                  forbid=None, require_identity=True, expected_characters=None,
                  expected_count=None, character_background=None, camera="",
                  composition_contract=None, readable_text=None,
-                 physical_contract=None, physical_logic_required=False):
+                 physical_contract=None, physical_logic_required=False,
+                 era_exceptions=None):
         """视觉质检规格：按角色在本镜可见角度选择核验依据。"""
         identity_characters = list(characters or [])
         visible_characters = list(
@@ -1982,6 +2000,10 @@ class Director:
             "location": location or "",
             "action": action or "",
             "camera": camera or "",
+            # 穿越/带入物白名单:时代判断以剧本为准,名单内物品不算错
+            "era_exceptions": [str(item).strip()
+                               for item in (era_exceptions or [])
+                               if str(item).strip()],
             "composition_contract": composition_contract,
             "physical_contract": (physical_contract
                                    if isinstance(physical_contract, dict)
@@ -5123,15 +5145,24 @@ class Director:
         parts.append(
             "【STRUCTURE】五官透视、手指、关节、肢体比例、遮挡关系与"
             "接触点自然，无粘连、断肢、穿模或漂浮道具")
-        # 时代与物理硬约束:场景年代错乱与物体拉伸变形是高频真实错误
+        # 时代与物理硬约束:场景年代错乱与物体拉伸变形是高频真实错误。
+        # 时代判断一律以剧本为准:穿越剧里剧本明写的跨时代物品是剧情
+        # 事实,必须画出,绝不能被当成"时代错乱"卡掉。
+        story_world = (ctx.get("script") or {}).get("story_world") or {}
         drift = [str(item).strip() for item in
-                 (world.get("forbidden_drift") or []) if str(item).strip()]
+                 (story_world.get("forbidden_drift") or [])
+                 if str(item).strip()]
+        sanctioned = [str(item).strip() for item in
+                      (story_world.get("sanctioned_anachronisms") or [])
+                      if str(item).strip()]
         parts.append(
-            "【ERA LOCK】画面中每一件物品、服装、道具、建筑必须符合本"
-            "故事时代与世界观"
+            "【ERA LOCK】时代判断以本剧剧本为唯一标准:画面中每一件"
+            "物品、服装、道具、建筑必须符合剧本声明的时代与世界观"
+            + (f";剧情明确允许跨时代出现(必须按剧情画出,不算时代"
+               f"错乱):{'、'.join(sanctioned)}" if sanctioned else "")
             + (f";严禁出现:{'、'.join(drift)}" if drift else
-               ";历史/古代场景严禁出现笔记本电脑、手机、屏幕、现代家具"
-               "等现代物品")
+               ";除剧本明确写出的穿越/带入物品外,历史/古代场景不出现"
+               "笔记本电脑、手机、屏幕、现代家具等现代物品")
             + ";道具形态按真实规格(笔记本电脑=合页翻盖薄板,不得拉长"
             "变形或塞进不合理容器)")
         parts.append(
@@ -5647,8 +5678,7 @@ class Director:
                     payload.get("identity_characters", payload.get("characters", [])),
                     location=payload.get("location", ""),
                     action=payload.get("action", ""),
-                    forbid=["与设定形态不符的角色", "悬挂的衣物或衣架",
-                            "与设定不符的人", "字幕条"],
+                    forbid=self._FORBID + ["字幕条"],
                     expected_characters=payload.get("characters", []),
                     expected_count=payload.get("character_count"),
                     character_background=payload.get(
@@ -5658,7 +5688,8 @@ class Director:
                         "composition_contract"),
                     readable_text=payload.get("readable_text"),
                     physical_contract=payload.get("physical_contract"),
-                    physical_logic_required=True)}})
+                    physical_logic_required=True,
+                    era_exceptions=self._era_exceptions(ctx))}})
         results, qc_failures = self._run_parallel(
             ctx, tasks, line="分镜画面",
             continue_on_qc_failure=True)
@@ -6417,14 +6448,22 @@ class Director:
             "【禁止】不得把空间示意图、编号、姓名标签、坐标、箭头、"
             "参考图边框、字幕或乱码画进成片；不得执行第二个主动作或"
             "第二种运镜；不得在首尾帧之间改变人物、服装、道具或场景。")
-        # 与出图同一套时代/物理硬约束 + 出错经验库,视频端同步防错
+        # 与出图同一套时代/物理硬约束 + 出错经验库,视频端同步防错。
+        # 时代判断以剧本为准:剧本明写的穿越/带入物品必须保留,不算错。
         world = (ctx.get("script") or {}).get("story_world") or {}
         drift = [str(item).strip() for item in
                  (world.get("forbidden_drift") or []) if str(item).strip()]
+        sanctioned = [str(item).strip() for item in
+                      (world.get("sanctioned_anachronisms") or [])
+                      if str(item).strip()]
         lines.append(
-            "【时代与物理】全程物品、服装、建筑必须符合故事时代与世界观"
+            "【时代与物理】时代判断以本剧剧本为唯一标准；全程物品、服装、"
+            "建筑必须符合剧本声明的时代与世界观"
+            + (f"；剧情明确允许跨时代出现(必须保留,不算错):"
+               f"{'、'.join(sanctioned)}" if sanctioned else "")
             + (f"，严禁出现:{'、'.join(drift)}" if drift else
-               "，历史/古代场景严禁出现笔记本电脑、手机等现代物品")
+               "，除剧本明确写出的穿越/带入物品外,历史/古代场景不出现"
+               "笔记本电脑、手机等现代物品")
             + "；物体在运动中保持真实结构与比例,严禁拉长、扭曲、穿模。")
         lessons = lessons_block(self.assets, ctx["project"]["id"])
         if lessons:
@@ -9096,8 +9135,10 @@ class Director:
 
     # ---- 单张/批量质检:核对已生成的图是否符合剧本要求 ----
     _FORBID = ["与设定形态不符的角色", "悬挂的衣物或衣架", "与设定不符的人",
-               "与故事时代/世界观不符的物品或建筑(时代错乱,如历史场景"
-               "出现笔记本电脑/手机/现代家具)",
+               "剧本未提及却自行出现的时代错乱物品或建筑(时代判断以剧本"
+               "为准:剧本明确写出的穿越/带入物品是剧情事实,必须出现,"
+               "不算错误;只有剧本没写、画面凭空冒出的时代外物品才算错,"
+               "如古代场景凭空出现笔记本电脑/现代家具)",
                "结构扭曲、比例失常或被拉长变形的物体(如被拉长的笔记本/"
                "盒子,不合物理的道具)"]
 
