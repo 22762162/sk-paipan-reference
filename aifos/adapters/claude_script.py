@@ -46,6 +46,7 @@ SCRIPT_PROMPT = """你是漫剧编剧。为作品《{title}》第{episode}集创
 - 人物重要度必须明确标为主角、重要配角、非重要配角或背景路人。
   非重要配角后续固定只生成 1 张候选图;场次中不得出现人物表未声明的新角色;
 - `costume_direction` 必须给出可画的服装逻辑(款式、材质、层次、颜色、职业制服/时代服饰和剧情场合),禁止所有角色默认现代都市便服;
+- 必须在人物与场景之后建立全剧 `props` 重要道具表。凡是剧情关键、承载可读文字、会被角色操作、需要特写或在至少两镜重复出现的道具标为 A，必须独立生成纯背景母资产和细节/状态图；签名或反复出现但不满足 A 的标为 B，建议独立母资产；通用家具和背景小物标为 C，不单独生图。每件 A/B 道具写清用途、材质、颜色、初始状态、交互方式和资产输出，不得把提示词元数据当画面文字;
 - `visual_variants` 至少给出 3 个剧情兼容的造型方案(例如日常、行动/冲突、仪式/舞台);它们是服装、道具和表演细节，不是画风选项；全剧候选图必须继承同一个项目画风;
 - 每个正式角色必须先完成 `character_analysis`，再生成 `visual_dna`：
   从身份阶层、成长环境、当前处境、欲望、恐惧、关键经历、性格优缺点和
@@ -88,9 +89,13 @@ JSON 格式(字段必须齐全):
      "clothing_wear_state":"服装状态","story_visual_symbol":"视觉符号",
      "story_visual_symbol_origin":"符号的故事来源","signature_accessory":"核心配饰",
      "temperament_keywords":["3-8个气质关键词"],"genre_system_mapping":{{}}}},
-   "cast_dedup": {{"compared_with":["其他角色"],"dimensions":["发型","服装结构","身体特征","视觉符号","核心配饰","气质关键词"],"status":"passed","conflicts":[]}}}},
+ "cast_dedup": {{"compared_with":["其他角色"],"dimensions":["发型","服装结构","身体特征","视觉符号","核心配饰","气质关键词"],"status":"passed","conflicts":[]}}}},
   {{"name": "路人功能名", "role": "背景路人",
    "crowd_function": "在哪一场以几人、什么剧情功能短暂出现;无独立人物资产"}}],
+ "props": [{{"name":"道具名","tier":"A/B/C","importance":"剧情关键/签名/通用",
+   "plot_critical":false,"text_required":false,"repeated_shots":0,"closeup":false,
+   "interaction":false,"description":"用途、材质、颜色与时代/世界观依据",
+   "state":"初始状态与可变状态","asset_outputs":["master","detail_or_state"]}}],
  "scenes": [{{"scene_no": 1, "location": "地点",
    "characters": ["出场角色名"], "action": "本场动作描述",
    "lines": [{{"character": "角色名", "dialogue": "台词"}}]}}]}}"""
@@ -113,6 +118,9 @@ IDOL_PROMPT = """你是 AI 虚拟偶像「{persona}」的内容策划。为第{e
   重叠必须重设计，不能只靠换衣服颜色区分成员;
 - 每个成员必须有 `introduction`,明确性别、年龄段、团内身份、性格、目标、
   成员关系与不可改变的身份事实;场次不得新增人物表之外的成员;
+- 必须输出 `props` 道具表：舞台设备、手机/屏幕、信物等剧情关键或会被操作的
+  道具标为 A 并先建母资产，反复出现的签名道具标为 B，通用背景小物标为 C；
+  写清状态、材质、颜色、文字白名单和资产输出，不把系统提示词当成画面文字;
 - 临时观众、工作人员、群演等背景路人只写 `name`、`role: "背景路人"` 和
   `crowd_function`,不建立独立人物设定或人物资产;非重要配角固定只生成 1 张候选图;
 - 台词口语化、有网感,单句不超过 22 个字;
@@ -146,6 +154,10 @@ JSON 格式(字段必须齐全,characters 只含「{persona}」一人):
      "story_visual_symbol":"视觉符号","story_visual_symbol_origin":"故事来源",
      "signature_accessory":"核心配饰","temperament_keywords":["3-8个气质关键词"]}},
    "cast_dedup": {{"compared_with":["其他成员"],"status":"passed","conflicts":[]}}}}],
+ "props": [{{"name":"道具名","tier":"A/B/C","plot_critical":false,
+   "text_required":false,"repeated_shots":0,"interaction":false,
+   "description":"用途、材质、颜色","state":"初始状态",
+   "asset_outputs":["master","detail_or_state"]}}],
  "scenes": [{{"scene_no": 1, "location": "场景",
    "characters": ["{persona}"], "action": "画面动作描述",
    "lines": [{{"character": "{persona}", "dialogue": "口播台词"}}]}}]}}"""
@@ -177,6 +189,10 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
   道具、桌面/地面、镜头的相对位置，使用方向、接触点、视线和动作可达性；
   涉及电脑/手机/屏幕时必须明确屏幕正面、键盘/手部、使用者和摄影机同侧关系，
   禁止人物坐在屏幕后方却看到屏幕正面等反向构图；
+- 每个镜头只列本镜真正出现的 `props`，并额外输出 `prop_contract`：逐件写明
+  道具名称、起止状态、持有者、空间位置、单一动作、接触/遮挡关系和母资产参考；
+  不得把全剧道具表或其他镜头道具复制进来。A/B 级道具没有母资产参考时必须
+  阻断进入生图；被操作道具没有状态/位置/动作时必须先补齐，不得让模型猜测;
 - prompt 中人物形态按人物设定描写(名字只是称呼,「小鹿」若设定为
   人类不能当动物写;设定为动物/精怪的按设定写,全片保持一致);
 - 不生成对白字幕。手机屏、弹幕、合同等可读文字只描述载体与准确文字，
@@ -196,6 +212,10 @@ JSON 格式:
     "expression":"夸张Q版表情","action":"夸张Q版动作",
     "dialogue":"必要时的内心台词；否则空字符串"}}],
   "physical_logic": "本镜物理/空间关系",
+  "props": [{{"name":"本镜道具","tier":"A/B/C"}}],
+  "prop_contract": {{"items":[{{"name":"道具名","state":"起止状态",
+    "owner":"持有者","position":"相对人物/桌面位置","action":"本镜单一动作",
+    "contact":"接触点/遮挡关系","reference":"母资产编号"}}]}},
   "readable_text": {{"carrier":"电脑屏幕", "whitelist":["逐字原文"],
     "layout":"版式/位置", "style":"字体/颜色/层级", "perspective":"透视/反光",
     "priority":"must_read"}},
@@ -234,6 +254,10 @@ Seedance 视频前必须锁定的“制作圣经”。
   身份、阵营、物种与人物关系;
 - 逐场分析空间功能、入口出口、前中后景、材质道具、时段天气、主光方向、
   环境声和连续性锚点;
+- 对全剧道具建立分级清单：A=剧情关键/可读文字/被操作/特写/重复出现，必须
+  有纯背景母资产与细节或状态图；B=签名或反复出现，建议独立母资产；C=通用
+  家具或背景小物，不单独生图。每件道具输出用途、材质、颜色、状态、文字白名单、
+  交互关系和使用镜头，先解决时代、空间、持有者和首尾状态矛盾;
 - 候选图数量固定:主角5、重要配角3、非重要配角1、背景路人0;
 - 每名正式角色按“剧情证据→经历与处境→性格与行为→可见特征→视觉 DNA”
   分析；视觉 DNA 包含脸部骨相、发型轮廓、身体/职业痕迹、服装结构与状态、
@@ -271,6 +295,10 @@ JSON 结构:
 "geography_and_climate":"","social_order":"","culture_and_lifestyle":"",
 "technology_and_props":"","hard_rules":"","recurring_motifs":[],
 "forbidden_drift":[]}},
+"props":[{{"name":"","tier":"A/B/C","plot_critical":false,
+"text_required":false,"repeated_shots":0,"closeup":false,"interaction":false,
+"description":"用途、材质、颜色和时代依据","state":"初始/可变状态",
+"asset_outputs":[],"shot_refs":[]}}],
 "visual":{{"user_style_constraint":"明确风格则保留；未指定则写入根据剧本生成的本剧制作风格",
 "style_source":"user_override或ai_inferred","analysis_basis":["时代/地域/题材等文本证据"],"medium":"",
 "realism":"","palette":[],"lighting":"","camera_language":"",

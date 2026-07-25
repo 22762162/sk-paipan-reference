@@ -48,7 +48,7 @@ DEFAULT_STANDARD = {
                 "schema": "aifos.shot-prompt/v2",
                 "order": [
                     "subject", "scene", "start", "single_action",
-                    "performance", "camera", "end", "dialogue", "text",
+                    "performance", "camera", "end", "props", "dialogue", "text",
                     "references", "hard_constraints",
                 ],
                 "single_primary_action": True,
@@ -104,6 +104,33 @@ DEFAULT_STANDARD = {
                 "逐字核对白名单",
                 "核对载体、版式、字体风格、颜色和透视",
                 "禁止乱码、字幕、Logo、水印和未授权系统字段",
+            ],
+        },
+        "props": {
+            "schema": "aifos.prop-policy/v1",
+            "tier_a": {
+                "label": "必须独立母资产",
+                "reasons": [
+                    "可读文字", "剧情关键", "重复出现至少2镜", "特写/近景",
+                    "角色物理操作", "复杂开合/状态变化",
+                ],
+                "repeated_min": 2,
+            },
+            "tier_b": {
+                "label": "建议独立母资产",
+                "reasons": ["签名道具", "反复出现", "需要稳定材质/颜色/轮廓"],
+            },
+            "tier_c": {
+                "label": "不单独生图",
+                "reasons": ["通用家具", "背景小物", "不承载剧情且不被操作"],
+            },
+            "master_asset_outputs": ["master", "detail_or_state"],
+            "text_asset_outputs": ["flat_text_layout", "context_keyframe"],
+            "pure_background": "no_text_no_scene_no_characters",
+            "no_asset_for_generic": True,
+            "qc": [
+                "轮廓/材质/颜色", "文字逐字白名单", "开合与状态",
+                "手部接触/遮挡", "透视与空间位置", "首尾帧及相邻镜头状态连续",
             ],
         },
         "character_assets": {
@@ -254,7 +281,7 @@ DEFAULT_STANDARD = {
         "quality_gates": [
             {"id": "script_bible", "label": "剧情事实源", "enabled": True, "severity": "block", "description": "故事世界、前情、人物介绍及场次人物名单完整且不互相冲突。"},
             {"id": "character_assets", "label": "人物母资产", "enabled": True, "severity": "block", "description": "人物视觉 DNA 来自剧情、全剧角色已去重；人工定版后具备独立面部、正面、严格侧面和完整背面母资产。"},
-            {"id": "continuity", "label": "连续性", "enabled": True, "severity": "block", "description": "人物、服装、道具、站位及段间状态无跳变。"},
+            {"id": "continuity", "label": "连续性", "enabled": True, "severity": "block", "description": "人物、服装、道具、站位及段间状态无跳变；重要道具已分级、建母资产并绑定到使用镜头。"},
             {"id": "spatial", "label": "空间调度", "enabled": True, "severity": "block", "description": "逐场锁定人物走位、机位、视锥和屏幕轴线，防止多人漂移或增殖。"},
             {"id": "five_dimensions", "label": "五维分镜", "enabled": True, "severity": "block", "description": "每镜包含主体、环境、摄影机、时间状态和审美信息。"},
             {"id": "duration", "label": "时长与时间码", "enabled": True, "severity": "block", "description": "分段时长及 0.5 秒精度符合生产规格。"},
@@ -490,6 +517,39 @@ class StandardCenter:
                     or not all(isinstance(item, str) and item.strip()
                                for item in values)):
                 issue(f"rules.text_assets.{key}", "必须是非空字符串列表")
+
+        # 重要道具规则对旧版自定义标准保持向后兼容；存在时才严格校验，
+        # 默认标准和自动升级都会补齐它。
+        props = rules.get("props")
+        if props is not None:
+            props = required_dict(rules, "props", "rules.props")
+            if props.get("schema") != "aifos.prop-policy/v1":
+                issue("rules.props.schema", "必须使用 aifos.prop-policy/v1")
+            for tier in ("tier_a", "tier_b", "tier_c"):
+                tier_rules = props.get(tier)
+                if not isinstance(tier_rules, dict):
+                    issue(f"rules.props.{tier}", "必须是对象")
+                    continue
+                nonempty_string(tier_rules, "label", f"rules.props.{tier}.label")
+                reasons = tier_rules.get("reasons")
+                if (not isinstance(reasons, list) or not reasons
+                        or not all(isinstance(item, str) and item.strip()
+                                   for item in reasons)):
+                    issue(f"rules.props.{tier}.reasons", "必须是非空字符串列表")
+            repeated_min = (props.get("tier_a") or {}).get("repeated_min")
+            if (not isinstance(repeated_min, int) or isinstance(repeated_min, bool)
+                    or repeated_min < 2):
+                issue("rules.props.tier_a.repeated_min", "必须是至少 2 的整数")
+            for key in ("master_asset_outputs", "text_asset_outputs", "qc"):
+                values = props.get(key)
+                if (not isinstance(values, list) or not values
+                        or not all(isinstance(item, str) and item.strip()
+                                   for item in values)):
+                    issue(f"rules.props.{key}", "必须是非空字符串列表")
+            if props.get("pure_background") != "no_text_no_scene_no_characters":
+                issue("rules.props.pure_background", "道具母资产背景必须是纯背景")
+            if not isinstance(props.get("no_asset_for_generic"), bool):
+                issue("rules.props.no_asset_for_generic", "必须是布尔值")
 
         character_assets = required_dict(
             rules, "character_assets", "rules.character_assets")
@@ -821,6 +881,33 @@ class StandardCenter:
                 if key not in text_rules:
                     text_rules[key] = copy.deepcopy(value)
                     changed = True
+        prop_defaults = DEFAULT_STANDARD["rules"]["props"]
+        prop_rules = rules.get("props")
+        if not isinstance(prop_rules, dict):
+            rules["props"] = copy.deepcopy(prop_defaults)
+            changed = True
+        else:
+            for key, value in prop_defaults.items():
+                if key not in prop_rules:
+                    prop_rules[key] = copy.deepcopy(value)
+                    changed = True
+            for tier in ("tier_a", "tier_b", "tier_c"):
+                if not isinstance(prop_rules.get(tier), dict):
+                    prop_rules[tier] = copy.deepcopy(prop_defaults[tier])
+                    changed = True
+                else:
+                    for key, value in prop_defaults[tier].items():
+                        if key not in prop_rules[tier]:
+                            prop_rules[tier][key] = copy.deepcopy(value)
+                            changed = True
+        prompt_rules = rules.get("production", {}).get("prompt_contract")
+        if isinstance(prompt_rules, dict):
+            order = prompt_rules.get("order")
+            if isinstance(order, list) and "props" not in order:
+                insert_at = (order.index("dialogue")
+                             if "dialogue" in order else len(order))
+                order.insert(insert_at, "props")
+                changed = True
         storyboard = rules.get("storyboard")
         if isinstance(storyboard, dict) \
                 and "spatial_blocking_required_for_group" not in storyboard:

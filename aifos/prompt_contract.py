@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import re
 
+from .prop_policy import build_prop_contract
+
 
 PROMPT_CONTRACT_SCHEMA = "aifos.shot-prompt/v2"
 PHYSICAL_CONTRACT_SCHEMA = "aifos.physical-space/v1"
@@ -373,6 +375,7 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
         })
     scene = shot_local_scene(shot, location)
     physical = build_physical_contract(shot)
+    props = build_prop_contract(shot)
     overlays = []
     for item in shot.get("narrative_overlays") or []:
         if not isinstance(item, dict):
@@ -424,6 +427,7 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
         ),
         "camera": _camera(shot),
         "physical": physical,
+        "props": props,
         "end": _state_line(shot.get("end_state")) or "到达尾帧状态",
         "dialogue": (
             "" if dialogue.get("inner_voice")
@@ -515,6 +519,19 @@ def render_shot_prompt(contract, *, mode="image"):
             f"【物理/空间逻辑】{physical_rules}"
             + (f"；对象关系：{'；'.join(physical.get('objects') or [])}。"
                if physical.get("objects") else "。"))
+    props = contract.get("props") or {}
+    prop_items = props.get("items") or []
+    if prop_items:
+        prop_lines = []
+        for item in prop_items:
+            text = f"；逐字文字:{item['text']}" if item.get("text_required") else ""
+            prop_lines.append(
+                f"{item['name']}（状态:{item['state']}；持有者:{item['owner']}；"
+                f"位置:{item['position']}；动作:{item['action']}{text}）")
+        lines.insert(
+            6,
+            "【道具合同】只出现本镜列出的道具：" + "；".join(prop_lines) + "。"
+            "不新增、不复制、不把参考图道具带入其他镜头。")
     composition = contract.get("composition") or {}
     if composition.get("composition_type") == "over_shoulder_dialogue":
         duties = "；".join(

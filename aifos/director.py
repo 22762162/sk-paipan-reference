@@ -49,6 +49,7 @@ from .prompt_contract import (
     readable_text_required,
     shot_local_scene,
 )
+from .prop_policy import build_prop_asset_plan
 from .qc_feedback import optimize_qc_feedback
 from .lessons import lessons_block, project_lessons, record_lessons
 from .relations import relation_lines, write_relations
@@ -3683,6 +3684,45 @@ class Director:
             raise AifosError(
                 f"分镜产出结构异常({exc});原始分镜已保存在 "
                 f"{raw_path},把该文件发给开发助手即可定位") from exc
+        # 分镜落盘前绑定已经生成的 A/B 级道具母资产，后续关键帧和视频
+        # 只从本镜合同取图，不靠模型根据道具名称猜外观。
+        prop_plan = (ctx.get("continuity") or {}).get("prop_asset_plan") or {}
+        prop_rows = {
+            item.get("name"): item for item in
+            (prop_plan.get("required_assets") or [])
+        }
+        for shot in storyboard.get("shots", []):
+            contract = shot.get("prop_contract")
+            contract_items = (contract or {}).get("items", []) \
+                if isinstance(contract, dict) else []
+            names = []
+            for value in (shot.get("props") or shot.get("key_props")
+                          or contract_items):
+                name = value.get("name") if isinstance(value, dict) else value
+                if str(name or "").strip() and str(name) not in names:
+                    names.append(str(name).strip())
+            references = []
+            for name in names:
+                item = prop_rows.get(name)
+                if not item:
+                    continue
+                for output in (item.get("asset_outputs") or ["master"]):
+                    row = self.assets.latest(
+                        ctx["project"]["id"], "prop_art",
+                        f"{name}:{output}")
+                    if (row and row["uri"] and formal_reference_allowed(
+                            self._asset_quality(row))
+                            and (row["uri"].startswith(("http://", "https://"))
+                                 or Path(row["uri"]).exists())):
+                        references.append(row["uri"])
+            if references:
+                shot["prop_references"] = list(dict.fromkeys(references))
+                if isinstance(contract, dict):
+                    for item in contract_items:
+                        name = item.get("name")
+                        if name in prop_rows:
+                            item["references"] = list(
+                                dict.fromkeys(references))
         storyboard["script_version"] = ctx.get("script_version")
         storyboard["story_analysis_version"] = ctx.get(
             "story_analysis_version")
@@ -4664,6 +4704,79 @@ class Director:
                 project_id, "scene_art", name, uri=result.uri,
                 meta=self._quality_meta(scene_quality[name]))
             created += 1
+        # 重要道具先于分镜关键帧建立独立母资产；C 级通用小物留给镜头内联，
+        # 避免无意义抽卡，同时让 A/B 级道具在后续镜头有可追踪的参考图。
+        prop_plan = (ctx.get("continuity") or {}).get("prop_asset_plan")
+        if not isinstance(prop_plan, dict):
+            prop_plan = build_prop_asset_plan(
+                ctx.get("script"), rules=ctx["production_profile"].get(
+                    "rules", {}).get("props"))
+        prop_items = prop_plan.get("required_assets") or []
+        self._plan_seed(ctx, "prop_asset", [
+            {"id": f"prop:{item['name']}:{output}",
+             "category": "prop_asset", "label": f"{item['name']} · {output}",
+             "name": item["name"], "prop_output": output,
+             "image_quality": "high", "recommended_quality": "high",
+             "quality_source": "auto", "quality_rule": "prop_mother_asset",
+             "quality_reasons": ["重要道具会被多个镜头引用"],
+             "prompt": (
+                 f"重要道具母资产：{item['name']}；输出={output}；"
+                 f"用途={item.get('description') or '服从剧本用途'}；"
+                 f"初始状态={item.get('state') or '保持结构完整'}；"
+                 "纯净无文字背景、无人物、无场景；只保留道具本体，"
+                 "材质、颜色、比例、时代依据和可操作结构清晰；"
+                 + ("文字只允许逐字白名单并以文字资产卡为准；" if item.get(
+                     "text_required") else "禁止随机文字、Logo和水印；")
+             )}
+            for item in prop_items
+            for output in (item.get("asset_outputs") or ["master"])
+        ])
+        prop_tasks = []
+        for item in prop_items:
+            for output in (item.get("asset_outputs") or ["master"]):
+                asset_name = f"{item['name']}:{output}"
+                existing_prop = self._existing_asset_uri(
+                    ctx, "prop_art", asset_name)
+                if existing_prop:
+                    reused += 1
+                    self._plan_mark(ctx, f"prop:{item['name']}:{output}",
+                                    "reused", only_pending=True)
+                    continue
+                prop_tasks.append({
+                    "item_id": f"prop:{item['name']}:{output}",
+                    "capability": "image",
+                    "payload": {
+                        "prop_art": True,
+                        "prop_output": output,
+                        "art_name": item["name"],
+                        "image_task_class": "important",
+                        "image_quality": "high",
+                        "shot_no": 0, "characters": [], "location": "",
+                        "prompt": (
+                            f"重要道具母资产：{item['name']}；输出={output}；"
+                            f"{item.get('description') or '严格服从剧本用途'}；"
+                            f"状态：{item.get('state') or '结构完整、可被真实操作'}；"
+                            "纯净无文字背景、无人物、无场景；禁止随机文字、Logo和水印；"
+                            + ("文字仅按白名单资产卡逐字呈现；" if item.get(
+                                "text_required") else "不生成任何可读文字；")
+                        ),
+                        "style": style,
+                        "prompt_contract_complete": True,
+                        "aspect": ctx["aspect"], **ctx["dims"],
+                    },
+                    "sub_dir": "cast",
+                    "tag": ("prop", item["name"], output),
+                })
+        for (_kind, name, output), result in self._run_parallel(
+                ctx, prop_tasks, line="重要道具母资产").items():
+            self.assets.register(
+                project_id, "prop_art", f"{name}:{output}", uri=result.uri,
+                meta={"prop": name, "prop_output": output,
+                      "tier": next((item.get("tier") for item in prop_items
+                                     if item.get("name") == name), "A"),
+                      "image_quality": "high", "recommended_quality": "high",
+                      "quality_rule": "prop_mother_asset"})
+            created += 1
         # 阶段3:人物资产套件产线 并行批量(引用各自立绘+风格基准图)
         tasks = []
         for character in characters:
@@ -4876,7 +4989,7 @@ class Director:
 
     def _art_refs(self, ctx, characters, location, shot_no=None,
                   sheet_keys=None, sheet_keys_by_character=None,
-                  spatial_ref="", inner_persona_ref=""):
+                  spatial_ref="", inner_persona_ref="", props=None):
         """最终立绘/人物套件/场景图/用户参考 → 真实多图参考输入。
 
         含人物画面缺任何一个最终立绘都直接阻断；禁止静默退化为文字生图。
@@ -5017,6 +5130,40 @@ class Director:
                     "asset_id": row["id"], "kind": row["kind"],
                     "name": row["name"], "label": f"场景:{location}",
                     "uri": row["uri"],
+                })
+        # A/B 级道具母资产只在实际使用该道具的镜头绑定，避免全局道具
+        # 污染画面；优先细节/文字资产，再退回 master。
+        prop_names = []
+        for value in props or []:
+            if isinstance(value, dict):
+                name = value.get("name") or value.get("label")
+            else:
+                name = value
+            if str(name or "").strip() and str(name) not in prop_names:
+                prop_names.append(str(name).strip())
+        if isinstance(props, dict):
+            prop_names = [str(props.get("name") or props.get("label")).strip()]
+        for name in prop_names:
+            rows = [row for row in self.assets.active_list(
+                project_id, kind="prop_art")
+                    if str(self._asset_meta(row).get("prop")
+                           or row["name"]).startswith(name)]
+            rows.sort(key=lambda row: (
+                0 if str(self._asset_meta(row).get("prop_output", ""))
+                in ("detail_or_state", "flat_text_layout", "context_keyframe")
+                else 1, -int(row["version"] or 0)))
+            row = next((candidate for candidate in rows
+                        if candidate.get("uri") and formal_reference_allowed(
+                            self._asset_quality(candidate))
+                        and (candidate["uri"].startswith(("http://", "https://"))
+                             or Path(candidate["uri"]).exists())
+                        and remember(candidate["uri"])), None)
+            if row is not None:
+                refs["prop_refs"] = refs.get("prop_refs", []) + [row["uri"]]
+                refs["asset_matches"].append({
+                    "asset_id": row["id"], "kind": "prop_art",
+                    "name": row["name"], "label": f"重要道具:{name}",
+                    "uri": row["uri"], "reference_role": "prop",
                 })
         matched_rows = (self._matching_produced_image_rows(
             project_id, characters, location, shot_no=shot_no, limit=3)
@@ -5376,10 +5523,23 @@ class Director:
                 if row is not None:
                     inner_persona_ref = str(row["uri"] or "").strip()
                     overlay["asset_uri"] = inner_persona_ref
+        shot_props = shot.get("props") or shot.get("key_props")
+        if not shot_props and isinstance(shot.get("prop_contract"), dict):
+            shot_props = shot.get("prop_contract", {}).get("items")
+        if not shot_props:
+            inferred_props = []
+            for state_key in ("start_state", "end_state"):
+                for state in (shot.get(state_key) or {}).values():
+                    if not isinstance(state, dict) or not state.get("prop"):
+                        continue
+                    if state["prop"] not in inferred_props:
+                        inferred_props.append(state["prop"])
+            shot_props = inferred_props
         payload = {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
-            "prompt": self._rich_shot_prompt(ctx, shot, location),
+            "prompt": self._rich_shot_prompt(
+                ctx, {**shot, "props": shot_props or []}, location),
             "seedance_prompt": shot.get("seedance_prompt", shot["prompt"]),
             "characters": shot["characters"],
             "character_number_map": shot.get("character_number_map", {}),
@@ -5397,6 +5557,8 @@ class Director:
             "action": shot.get("description", ""),
             "start_state": shot.get("start_state", {}),
             "end_state": shot.get("end_state", {}),
+            "props": shot_props or [],
+            "prop_contract": shot.get("prop_contract") or {},
             "five_dimensions": shot.get("five_dimensions", {}),
             "readable_text": readable_text,
             # 正式关键帧默认中档；文字/群像/人脸情绪/连续性自动升高。
@@ -5428,7 +5590,8 @@ class Director:
                 spatial_ref=(
                     (spatial or {}).get("spatial_reference_uri", "")
                     if requires_spatial_reference(spatial or {}) else ""),
-                inner_persona_ref=inner_persona_ref),
+                inner_persona_ref=inner_persona_ref,
+                props=shot_props or []),
         }
         actor_ids = {
             actor.get("name"): actor.get("actor_id")

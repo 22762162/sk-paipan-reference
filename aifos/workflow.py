@@ -23,10 +23,12 @@ from .inner_persona import (
 )
 from .prompt_contract import (
     build_physical_contract,
+    build_prop_contract,
     compile_shot_prompt,
     readable_text_required,
     sanitize_text_whitelist,
 )
+from .prop_policy import build_prop_asset_plan, validate_prop_contract
 
 from .spatial_blocking import (
     build_character_number_map,
@@ -70,6 +72,7 @@ def production_profile(config, standard=None):
     performance = rules.get("performance", {})
     storyboard = rules.get("storyboard", {})
     delivery = rules.get("delivery", {})
+    prop_rules = rules.get("props", {})
     return {
         "pipeline_version": PIPELINE_VERSION,
         "standard_profile_key": (standard or {}).get(
@@ -115,6 +118,7 @@ def production_profile(config, standard=None):
         "shot_contract_columns": len(storyboard.get("required_columns", [])),
         "review_layers": delivery.get(
             "review_layers", ["自动文件检查", "抽帧检查板", "逐段内容复核"]),
+        "prop_policy": copy.deepcopy(prop_rules),
         "rules": copy.deepcopy(rules),
     }
 
@@ -128,6 +132,7 @@ def build_continuity_bible(project, script, profile):
     delivery_rules = rules.get("delivery", {})
     inner_policy = normalize_inner_persona_policy(
         script, rules.get("inner_persona"))
+    prop_plan = build_prop_asset_plan(script, rules=rules.get("props"))
     characters = []
     for index, character in enumerate(script.get("characters", []), 1):
         name = character["name"]
@@ -211,6 +216,8 @@ def build_continuity_bible(project, script, profile):
         },
         "character_asset_policy": copy.deepcopy(character_asset_rules),
         "inner_persona_policy": copy.deepcopy(inner_policy),
+        "prop_policy": copy.deepcopy(rules.get("props", {})),
+        "prop_asset_plan": prop_plan,
         "production_profile": copy.deepcopy(profile),
     }
 
@@ -817,6 +824,17 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             "shot_contract": shot_contract,
             "readable_text": text_asset,
         })
+        shot_props = raw.get("props") or raw.get("key_props")
+        if not shot_props and isinstance(raw.get("prop_contract"), dict):
+            shot_props = raw.get("prop_contract", {}).get("items")
+        if not shot_props:
+            inferred_props = []
+            for state in list(start_state.values()) + list(end_state.values()):
+                if not isinstance(state, dict) or not state.get("prop"):
+                    continue
+                if state["prop"] not in inferred_props:
+                    inferred_props.append(state["prop"])
+            shot_props = inferred_props
         shot = {
             **raw,
             "shot_no": index,
@@ -836,6 +854,9 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             "shot_function": SHOT_FUNCTIONS.get(kind, "信息交代"),
             "start_state": start_state,
             "end_state": end_state,
+            "props": shot_props or [],
+            "prop_contract": build_prop_contract({
+                **raw, "props": shot_props or [], "readable_text": text_asset}),
             "script_reference": script_reference,
             "readable_text": text_asset,
             "visual_hook": visual_hook,
@@ -939,6 +960,22 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
                     profile, blocking=None, quality_policy=None):
     shots = storyboard.get("shots", [])
     rules = profile.get("rules", {})
+    prop_plan = build_prop_asset_plan(
+        script, storyboard, rules=rules.get("props"))
+    prop_issues = []
+    for shot in shots:
+        prop_issues.extend(validate_prop_contract(shot, prop_plan))
+    prop_preflight = {
+        "passed": not prop_issues,
+        "issues": prop_issues,
+        "required_assets": [
+            {"name": item.get("name"), "tier": item.get("tier"),
+             "asset_outputs": item.get("asset_outputs", []),
+             "shot_refs": item.get("shot_refs", [])}
+            for item in prop_plan.get("required_assets", [])
+        ],
+        "deferred_items": [item.get("name") for item in prop_plan.get("deferred_items", [])],
+    }
     production_rules = rules.get("production", {})
     dialogue_rules = rules.get("dialogue", {})
     performance_rules = rules.get("performance", {})
@@ -1119,7 +1156,10 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
         _gate("continuity", "连续性圣经", bool(continuity.get("characters"))
               and bool(continuity.get("scenes"))
               and continuity.get("standard_fingerprint") == profile.get(
-                  "standard_fingerprint"), "角色、场景、文字规则与本集标准已锁定"),
+                  "standard_fingerprint") and prop_preflight["passed"],
+              ("角色、场景、文字规则与本集标准已锁定；"
+               f"重要道具前置检查{'通过' if prop_preflight['passed'] else '未通过'}"
+               + (f"（{len(prop_issues)}项）" if prop_issues else ""))),
         _gate("spatial", "空间调度图", spatial_ok,
               f"{blocking.get('summary', {}).get('scenes', 0)} 场 / "
               f"{blocking.get('summary', {}).get('shots', 0)} 镜已锁定人物走位、"
@@ -1186,13 +1226,16 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
         "quality_policy": copy.deepcopy(
             quality_policy or default_quality_policy()),
         "selected_video_quality": video_quality,
+        "prop_asset_plan": prop_plan,
+        "prop_preflight": prop_preflight,
         "script_lines": sum(len(s.get("lines", [])) for s in script.get("scenes", [])),
         "units": len(shots),
     }
 
 
-def build_content_review(script, storyboard, continuity):
+def build_content_review(script, storyboard, continuity, prop_plan=None):
     cast = {c["name"] for c in continuity.get("characters", [])}
+    prop_plan = prop_plan or build_prop_asset_plan(script, storyboard)
     units = []
     for shot in storyboard.get("shots", []):
         characters_ok = set(shot.get("characters", [])) <= cast
@@ -1200,16 +1243,22 @@ def build_content_review(script, storyboard, continuity):
         text_required = readable_text_required(text_asset)
         text_ok = not text_required or bool(text_asset.get("locked_by"))
         event_ok = bool(shot.get("script_reference"))
-        passed = characters_ok and text_ok and event_ok
+        prop_issues = validate_prop_contract(shot, prop_plan)
+        prop_ok = not prop_issues
+        passed = characters_ok and text_ok and event_ok and prop_ok
         units.append({
             "unit_id": shot.get("unit_id"),
             "script_reference": shot.get("script_reference", ""),
             "event_visible": event_ok,
             "character_consistency": characters_ok,
             "costume_consistency": bool(continuity.get("characters")),
-            "prop_scene_consistency": bool(continuity.get("scenes")),
+            "prop_scene_consistency": prop_ok,
+            "prop_contract": build_prop_contract(shot),
+            "prop_issues": prop_issues,
             "text_accuracy": text_ok if text_required else None,
-            "drift_issue": "" if passed else "结构化映射或文字锁定缺失",
+            "drift_issue": "" if passed else (
+                "；".join(issue["message"] for issue in prop_issues)
+                or "结构化映射或文字锁定缺失"),
             "verdict": "PASS" if passed else "FAIL",
         })
     return {
