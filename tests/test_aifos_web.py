@@ -113,6 +113,8 @@ def test_index_and_static(server):
     assert "镜头路线".encode() in app_js
     assert b"mountBlocking3d" in app_js
     assert b"blocking-3d-canvas" in app_js
+    assert b"blockingStickFigureGeometry" in app_js
+    assert "彩色火柴人=人物".encode() in app_js
     assert "机位方向".encode() in app_js
     assert "拖拽旋转".encode() in app_js
     assert "固定 3D 参考图".encode() in app_js
@@ -302,6 +304,31 @@ def test_index_and_static(server):
     assert status == 200 and "javascript" in ctype
     assert b"aifos-mobile-shell-v6" in raw
     assert b'/static/app.js' in raw and b'fetch(request)' in raw
+
+
+def test_blocking_svg_url_uses_document_version_to_bust_cache(server):
+    app2 = App(server["workspace"])
+    try:
+        project, _ = app2.projects.get_or_create_project("空间图版本")
+        episode, _ = app2.projects.get_or_create_episode(project["id"], 1)
+        svg = (app2.workspace.artifacts_dir / f"p{project['id']:03d}"
+               / "e001" / "blocking" / "scene_001.svg")
+        svg.parent.mkdir(parents=True, exist_ok=True)
+        svg.write_text("<svg/>", encoding="utf-8")
+        blocking = {
+            "scenes": [{"scene_no": 1, "svg_uri": str(svg), "shots": []}],
+            "summary": {}, "validation": {"passed": True},
+        }
+        app2.projects.save_document(episode["id"], "blocking", blocking)
+        episode_id = episode["id"]
+    finally:
+        app2.close()
+
+    status, payload = _json_request(
+        server["port"], "GET", f"/api/episode/{episode_id}")
+
+    assert status == 200
+    assert payload["blocking"]["scenes"][0]["svg_url"].endswith("?v=1")
 
 
 def test_job_registry_unique_reuses_running_episode(tmp_path):

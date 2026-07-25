@@ -111,6 +111,9 @@ def test_group_scene_builds_routes_camera_and_continuity(tmp_path):
     assert 'data-projection="isometric-3d"' in svg
     assert 'data-world-axis="y-up"' in svg
     assert 'data-camera-frustum="true"' in svg
+    assert 'data-actor-model="stick-figure"' in svg
+    assert 'data-pose="standing"' in svg
+    assert "姿态火柴人" in svg
     assert svg.count('data-layout="isolated-panel"') == 2
     assert 'data-camera-phase="start"' in svg
     assert 'data-camera-phase="fixed"' in svg
@@ -318,3 +321,7 @@ def test_lying_actor_uses_support_pose_and_low_camera_target():
     assert actor["height_m"] == .55
     assert block["camera"]["target_3d"]["y"] == .42
     assert plan["validation"]["passed"], plan["validation"]["issues"]
+    svg = render_scene_svg(plan["scenes"][0])
+    assert 'data-actor-model="stick-figure"' in svg
+    assert 'data-pose="lying"' in svg
+    assert svg.count('data-stick-head="true"') == 1

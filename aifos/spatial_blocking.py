@@ -881,6 +881,152 @@ def _project_3d(point, plot_x, plot_y, plot_width, plot_height):
     return round(screen_x, 1), round(screen_y, 1)
 
 
+def _stick_figure_geometry(anchor, height, pose):
+    """Return a small 3D stick skeleton for the actor's resolved body pose.
+
+    ``anchor`` remains the authoritative blocking position.  The skeleton is
+    only a clearer visualization of that point; it must never change routing
+    coordinates or be interpreted as character appearance.
+    """
+    anchor = anchor or {}
+    base_x = float(anchor.get("x", 0))
+    base_y = float(anchor.get("y", 0))
+    base_z = float(anchor.get("z", 0))
+    height = max(.55, float(height or DEFAULT_ACTOR_HEIGHT_M))
+    pose = str(pose or "standing")
+
+    def point(x=0, y=0, z=0):
+        return {
+            "x": round(base_x + x, 3),
+            "y": round(base_y + y, 3),
+            "z": round(base_z + z, 3),
+        }
+
+    if pose == "lying":
+        body_length = max(1.4, height * 2.8)
+        joints = {
+            "head": point(body_length * .45, height * .72),
+            "neck": point(body_length * .32, height * .61),
+            "shoulder_l": point(body_length * .24, height * .58, -.18),
+            "shoulder_r": point(body_length * .24, height * .58, .18),
+            "hip": point(-body_length * .12, height * .50),
+            "elbow_l": point(body_length * .05, height * .45, -.28),
+            "elbow_r": point(body_length * .05, height * .45, .28),
+            "hand_l": point(-body_length * .10, height * .36, -.34),
+            "hand_r": point(-body_length * .10, height * .36, .34),
+            "knee_l": point(-body_length * .31, height * .38, -.10),
+            "knee_r": point(-body_length * .31, height * .38, .10),
+            "foot_l": point(-body_length * .48, height * .26, -.16),
+            "foot_r": point(-body_length * .48, height * .26, .16),
+        }
+    else:
+        profiles = {
+            "standing": {
+                "head_x": 0, "neck_x": 0, "shoulder_x": 0,
+                "hip_x": 0, "hip_y": .43,
+                "knee_x": .11, "knee_y": .22, "foot_x": .18,
+            },
+            "sitting": {
+                "head_x": .05, "neck_x": .03, "shoulder_x": .02,
+                "hip_x": 0, "hip_y": .48,
+                "knee_x": .25, "knee_y": .30, "foot_x": .25,
+            },
+            "leaning_seated": {
+                "head_x": .18, "neck_x": .13, "shoulder_x": .09,
+                "hip_x": 0, "hip_y": .46,
+                "knee_x": .25, "knee_y": .29, "foot_x": .26,
+            },
+            "kneeling": {
+                "head_x": .03, "neck_x": .02, "shoulder_x": 0,
+                "hip_x": 0, "hip_y": .45,
+                "knee_x": .21, "knee_y": .09, "foot_x": .31,
+            },
+            "crouching": {
+                "head_x": .10, "neck_x": .07, "shoulder_x": .03,
+                "hip_x": -.04, "hip_y": .39,
+                "knee_x": .28, "knee_y": .16, "foot_x": .35,
+            },
+        }
+        profile = profiles.get(pose, profiles["standing"])
+        shoulder_center = profile["shoulder_x"]
+        arm_drop = .42 if pose == "standing" else .38
+        joints = {
+            "head": point(profile["head_x"], height * .91),
+            "neck": point(profile["neck_x"], height * .80),
+            "shoulder_l": point(shoulder_center - .20, height * .75),
+            "shoulder_r": point(shoulder_center + .20, height * .75),
+            "hip": point(profile["hip_x"], height * profile["hip_y"]),
+            "elbow_l": point(shoulder_center - .29, height * .58),
+            "elbow_r": point(shoulder_center + .29, height * .58),
+            "hand_l": point(shoulder_center - .33, height * arm_drop),
+            "hand_r": point(shoulder_center + .33, height * arm_drop),
+            "knee_l": point(
+                profile["hip_x"] - profile["knee_x"],
+                height * profile["knee_y"]),
+            "knee_r": point(
+                profile["hip_x"] + profile["knee_x"],
+                height * profile["knee_y"]),
+            "foot_l": point(-profile["foot_x"], 0),
+            "foot_r": point(profile["foot_x"], 0),
+        }
+    segments = (
+        ("neck", "shoulder_l"), ("neck", "shoulder_r"),
+        ("neck", "hip"),
+        ("shoulder_l", "elbow_l"), ("elbow_l", "hand_l"),
+        ("shoulder_r", "elbow_r"), ("elbow_r", "hand_r"),
+        ("hip", "knee_l"), ("knee_l", "foot_l"),
+        ("hip", "knee_r"), ("knee_r", "foot_r"),
+    )
+    return {
+        "anchor": point(),
+        "head": joints["head"],
+        "joints": joints,
+        "segments": segments,
+    }
+
+
+def _render_stick_figure_svg(
+        parts, anchor, height, pose, color, phase,
+        plot_x, plot_y, plot_width, plot_height, actor_id=""):
+    """Append one projected, pose-aware stick figure to an SVG panel."""
+    figure = _stick_figure_geometry(anchor, height, pose)
+    ghost = phase == "start"
+    attrs = (
+        f'data-actor-model="stick-figure" '
+        f'data-actor-id="{html.escape(str(actor_id or ""))}" '
+        f'data-pose="{html.escape(str(pose or "standing"))}" '
+        f'data-phase="{html.escape(str(phase))}"')
+    parts.append(
+        f'<g {attrs} opacity="{".52" if ghost else ".96"}">')
+    for start_name, end_name in figure["segments"]:
+        start = _project_3d(
+            figure["joints"][start_name],
+            plot_x, plot_y, plot_width, plot_height)
+        end = _project_3d(
+            figure["joints"][end_name],
+            plot_x, plot_y, plot_width, plot_height)
+        parts.append(_line(
+            *start, *end, stroke=color,
+            stroke_width="2.2" if ghost else "3.6",
+            stroke_dasharray="4 4" if ghost else "",
+            stroke_linecap="round"))
+    head = _project_3d(
+        figure["head"], plot_x, plot_y, plot_width, plot_height)
+    anchor_point = _project_3d(
+        figure["anchor"], plot_x, plot_y, plot_width, plot_height)
+    parts.extend([
+        f'<circle cx="{head[0]}" cy="{head[1]}" r="7" '
+        f'fill="{"#111827" if ghost else color}" stroke="'
+        f'{color if ghost else "#f8fafc"}" stroke-width="2" '
+        'data-stick-head="true"/>',
+        f'<circle cx="{anchor_point[0]}" cy="{anchor_point[1]}" r="3" '
+        f'fill="{color}" stroke="#f8fafc" stroke-width="1" '
+        'data-stick-anchor="true"/>',
+        '</g>',
+    ])
+    return figure
+
+
 def _svg_points(points):
     return " ".join(f"{x},{y}" for x, y in points)
 
@@ -957,7 +1103,7 @@ def render_scene_svg(scene):
         f'<text x="55" y="48" fill="#f8fafc" font-size="26" '
         f'font-family="sans-serif" font-weight="700">第{scene.get("scene_no")}场 · {title}</text>',
         '<text x="55" y="76" fill="#94a3b8" font-size="15" '
-        'font-family="sans-serif">逐镜 3D 透视 · 人物高度/路线/机位高度/瞄准线/视锥 · 单位：米</text>',
+        'font-family="sans-serif">逐镜 3D 透视 · 姿态火柴人/路线/机位高度/瞄准线/视锥 · 单位：米</text>',
     ]
     for index, actor in enumerate(scene_actors):
         col, row = index % 2, index // 2
@@ -992,7 +1138,7 @@ def render_scene_svg(scene):
             f'height="{plot_height}" rx="12" fill="#111827" '
             'stroke="#334155"/>',
             f'<text x="{roster_x}" y="{plot_y + 15}" fill="#94a3b8" '
-            'font-size="12" font-family="sans-serif">人物 3D 站位（稳定编号）</text>',
+            'font-size="12" font-family="sans-serif">人物火柴人 3D 站位（稳定编号）</text>',
         ])
         _render_floor_grid(parts, plot_x, plot_y, plot_width, plot_height)
         axis = shot.get("axis") or {}
@@ -1016,31 +1162,22 @@ def render_scene_svg(scene):
                 start, plot_x, plot_y, plot_width, plot_height)
             ex, ey = _project_3d(
                 end, plot_x, plot_y, plot_width, plot_height)
-            start_head = dict(start, y=start_height)
-            end_head = dict(end, y=end_height)
-            shx, shy = _project_3d(
-                start_head, plot_x, plot_y, plot_width, plot_height)
-            ehx, ehy = _project_3d(
-                end_head, plot_x, plot_y, plot_width, plot_height)
             if actor.get("moving"):
-                parts.extend([
-                    _line(sx, sy, ex, ey, stroke=color, stroke_width="4",
-                          marker_end="url(#arrow)", opacity=".9"),
-                    _line(sx, sy, shx, shy, stroke=color, stroke_width="4",
-                          stroke_dasharray="4 4", opacity=".55"),
-                    f'<circle cx="{shx}" cy="{shy}" r="6" fill="#111827" '
-                    f'stroke="{color}" stroke-width="2" data-phase="start"/>',
-                    _line(ex, ey, ehx, ehy, stroke=color, stroke_width="6"),
-                    f'<circle cx="{ehx}" cy="{ehy}" r="7" fill="{color}" '
-                    'stroke="#f8fafc" stroke-width="1.5" data-phase="end"/>',
-                ])
-            else:
-                parts.extend([
-                    _line(ex, ey, ehx, ehy, stroke=color, stroke_width="6"),
-                    f'<circle cx="{ehx}" cy="{ehy}" r="7" fill="{color}" '
-                    'stroke="#f8fafc" stroke-width="1.5" '
-                    'data-phase="fixed"/>',
-                ])
+                parts.append(_line(
+                    sx, sy, ex, ey, stroke=color, stroke_width="4",
+                    marker_end="url(#arrow)", opacity=".9"))
+                _render_stick_figure_svg(
+                    parts, start, start_height,
+                    actor.get("pose_start") or "standing",
+                    color, "start", plot_x, plot_y, plot_width, plot_height,
+                    actor.get("actor_id"))
+            _render_stick_figure_svg(
+                parts, end, end_height,
+                actor.get("pose_end") or actor.get("pose_start")
+                or "standing",
+                color, "end" if actor.get("moving") else "fixed",
+                plot_x, plot_y, plot_width, plot_height,
+                actor.get("actor_id"))
             actor_label = html.escape(str(actor.get("display_label") or
                                           f"{actor.get('actor_id')} {actor.get('name')}"))
             route_label = html.escape(

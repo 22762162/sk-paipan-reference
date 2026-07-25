@@ -1702,8 +1702,10 @@ def _episode_payload(app, episode_id):
     if blocking is not None:
         blocking = copy.deepcopy(blocking)
         for scene in blocking.get("scenes", []):
-            scene["svg_url"] = _artifact_url(
+            scene_url = _artifact_url(
                 app, scene.get("svg_uri", ""))
+            scene["svg_url"] = _versioned(
+                scene_url, {"version": blocking_v or 1})
     production_progress = _production_progress(
         app, episode, render_plan)
     production_guidance = _production_guidance(

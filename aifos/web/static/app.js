@@ -5532,7 +5532,7 @@ function blocking3dSceneHtml(scene, sceneIndex) {
     <canvas class="blocking-3d-canvas" tabindex="0" role="img"
       aria-label="第${esc(scene.scene_no)}场三维空间调度；可拖拽旋转、滚轮缩放"></canvas>
     <div class="blocking-3d-hint">
-      拖拽旋转 · Shift/右键拖拽平移 · 滚轮缩放 · 彩色立柱=人物 · 蓝色棱锥=机位视锥
+      拖拽旋转 · Shift/右键拖拽平移 · 滚轮缩放 · 彩色火柴人=人物 · 虚线火柴人=移动起点 · 蓝色棱锥=机位视锥
     </div>
   </div>`;
 }
@@ -5548,6 +5548,78 @@ function blockingWorldPoint(point3d, point2d, height = 0) {
     x: ((Number.isFinite(x) ? x : 500) - 500) / 820 * 10,
     y: height,
     z: ((Number.isFinite(y) ? y : 350) - 350) / 470 * 7,
+  };
+}
+
+function blockingStickFigureGeometry(anchor, height, pose) {
+  const base = anchor || { x: 0, y: 0, z: 0 };
+  const actorHeight = Math.max(.55, Number(height) || 1.68);
+  const actorPose = String(pose || "standing");
+  const point = (x = 0, y = 0, z = 0) => ({
+    x: Number(base.x || 0) + x,
+    y: Number(base.y || 0) + y,
+    z: Number(base.z || 0) + z,
+  });
+  let joints;
+  if (actorPose === "lying") {
+    const bodyLength = Math.max(1.4, actorHeight * 2.8);
+    joints = {
+      head: point(bodyLength * .45, actorHeight * .72),
+      neck: point(bodyLength * .32, actorHeight * .61),
+      shoulderL: point(bodyLength * .24, actorHeight * .58, -.18),
+      shoulderR: point(bodyLength * .24, actorHeight * .58, .18),
+      hip: point(-bodyLength * .12, actorHeight * .50),
+      elbowL: point(bodyLength * .05, actorHeight * .45, -.28),
+      elbowR: point(bodyLength * .05, actorHeight * .45, .28),
+      handL: point(-bodyLength * .10, actorHeight * .36, -.34),
+      handR: point(-bodyLength * .10, actorHeight * .36, .34),
+      kneeL: point(-bodyLength * .31, actorHeight * .38, -.10),
+      kneeR: point(-bodyLength * .31, actorHeight * .38, .10),
+      footL: point(-bodyLength * .48, actorHeight * .26, -.16),
+      footR: point(-bodyLength * .48, actorHeight * .26, .16),
+    };
+  } else {
+    const profiles = {
+      standing: { headX: 0, neckX: 0, shoulderX: 0, hipX: 0,
+        hipY: .43, kneeX: .11, kneeY: .22, footX: .18 },
+      sitting: { headX: .05, neckX: .03, shoulderX: .02, hipX: 0,
+        hipY: .48, kneeX: .25, kneeY: .30, footX: .25 },
+      leaning_seated: { headX: .18, neckX: .13, shoulderX: .09, hipX: 0,
+        hipY: .46, kneeX: .25, kneeY: .29, footX: .26 },
+      kneeling: { headX: .03, neckX: .02, shoulderX: 0, hipX: 0,
+        hipY: .45, kneeX: .21, kneeY: .09, footX: .31 },
+      crouching: { headX: .10, neckX: .07, shoulderX: .03, hipX: -.04,
+        hipY: .39, kneeX: .28, kneeY: .16, footX: .35 },
+    };
+    const profile = profiles[actorPose] || profiles.standing;
+    const armDrop = actorPose === "standing" ? .42 : .38;
+    joints = {
+      head: point(profile.headX, actorHeight * .91),
+      neck: point(profile.neckX, actorHeight * .80),
+      shoulderL: point(profile.shoulderX - .20, actorHeight * .75),
+      shoulderR: point(profile.shoulderX + .20, actorHeight * .75),
+      hip: point(profile.hipX, actorHeight * profile.hipY),
+      elbowL: point(profile.shoulderX - .29, actorHeight * .58),
+      elbowR: point(profile.shoulderX + .29, actorHeight * .58),
+      handL: point(profile.shoulderX - .33, actorHeight * armDrop),
+      handR: point(profile.shoulderX + .33, actorHeight * armDrop),
+      kneeL: point(profile.hipX - profile.kneeX, actorHeight * profile.kneeY),
+      kneeR: point(profile.hipX + profile.kneeX, actorHeight * profile.kneeY),
+      footL: point(-profile.footX, 0),
+      footR: point(profile.footX, 0),
+    };
+  }
+  return {
+    anchor: point(),
+    head: joints.head,
+    joints,
+    segments: [
+      ["neck", "shoulderL"], ["neck", "shoulderR"], ["neck", "hip"],
+      ["shoulderL", "elbowL"], ["elbowL", "handL"],
+      ["shoulderR", "elbowR"], ["elbowR", "handR"],
+      ["hip", "kneeL"], ["kneeL", "footL"],
+      ["hip", "kneeR"], ["kneeR", "footR"],
+    ],
   };
 }
 
@@ -5647,6 +5719,23 @@ function mountBlocking3d(stage, scene) {
     ctx.lineWidth = 1.2;
     ctx.stroke();
   };
+  const stickFigure = (anchor, height, pose, color, phase) => {
+    const figure = blockingStickFigureGeometry(anchor, height, pose);
+    const ghost = phase === "start";
+    ctx.save();
+    ctx.globalAlpha = ghost ? .52 : .96;
+    figure.segments.forEach(([from, to]) => {
+      line(
+        figure.joints[from], figure.joints[to], color,
+        ghost ? 2.4 : 4, ghost ? [4, 4] : []);
+    });
+    dot(
+      figure.head, 7, ghost ? "#0b1220" : color,
+      ghost ? color : "#f8fafc", 2);
+    dot(figure.anchor, 3, color, "#f8fafc", 1);
+    ctx.restore();
+    return figure;
+  };
   const render = () => {
     frame = 0;
     ctx.clearRect(0, 0, logicalWidth, logicalHeight);
@@ -5707,16 +5796,18 @@ function mountBlocking3d(stage, scene) {
     }).sort((left, right) => left.depth - right.depth);
     actors.forEach(({ actor, start, end }) => {
       const color = blockingSafeColor(actor.color);
-      const height = Number(actor.height_m) || 1.68;
+      const startHeight = Number(actor.start_height_m || actor.height_m) || 1.68;
+      const endHeight = Number(actor.end_height_m || actor.height_m) || 1.68;
       if (actor.moving) {
         arrow(start, end, color, 4);
-        line(start, { ...start, y: height }, color, 3, [4, 4]);
-        dot({ ...start, y: height }, 6, "#0b1220", color, 2);
+        stickFigure(
+          start, startHeight, actor.pose_start || "standing",
+          color, "start");
       }
-      line(end, { ...end, y: height }, color, 7);
-      dot(end, 6, color, "#f8fafc", 1.5);
-      dot({ ...end, y: height }, 8, color, "#f8fafc", 1.5);
-      label(blockingActorLabel(actor), { ...end, y: height }, color, -12);
+      const finalFigure = stickFigure(
+        end, endHeight, actor.pose_end || actor.pose_start || "standing",
+        color, actor.moving ? "end" : "fixed");
+      label(blockingActorLabel(actor), finalFigure.head, color, -12);
     });
 
     ctx.textAlign = "left";
