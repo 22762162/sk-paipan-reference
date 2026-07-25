@@ -5,6 +5,8 @@ import threading
 import time
 from contextlib import contextmanager
 
+_DATABASE_IO_LOCK = threading.RLock()
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -328,17 +330,22 @@ class Database:
     def __init__(self, path):
         self.path = str(path)
         # 并行出图产线的 worker 线程会经由 router/logger 读写库:
-        # 连接允许跨线程 + 进程内互斥锁串行化,保证线程安全
-        self.conn = sqlite3.connect(self.path, check_same_thread=False)
+        # 连接允许跨线程；所有 App 实例共享同一把进程级锁，只串行化极短
+        # 的 SQLite 读写，图片/API 调用本身仍保持并行。
+        self.conn = sqlite3.connect(
+            self.path, timeout=60, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self._lock = threading.RLock()
-        # 标准保存会使用 BEGIN IMMEDIATE；给并发 UI/API 写入留出等待窗口，
-        # 避免短暂锁竞争直接抛出 "database is locked"。
-        self.conn.execute("PRAGMA busy_timeout = 5000")
-        self.conn.execute("PRAGMA foreign_keys = ON")
-        self.conn.executescript(SCHEMA)
-        self._migrate()
-        self.conn.commit()
+        self._lock = _DATABASE_IO_LOCK
+        # WAL 允许页面读取与图片 worker 写入并行；60 秒等待覆盖多通道
+        # 同时注册产物/质检结果的写入高峰，不因几秒锁竞争丢掉整批结果。
+        with self._lock:
+            self.conn.execute("PRAGMA busy_timeout = 60000")
+            self.conn.execute("PRAGMA journal_mode = WAL")
+            self.conn.execute("PRAGMA synchronous = NORMAL")
+            self.conn.execute("PRAGMA foreign_keys = ON")
+            self.conn.executescript(SCHEMA)
+            self._migrate()
+            self.conn.commit()
 
     def _migrate(self):
         for table, column, decl in MIGRATIONS:

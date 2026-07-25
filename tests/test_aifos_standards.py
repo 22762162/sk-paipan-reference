@@ -118,7 +118,7 @@ def test_default_standard_is_complete_and_active(tmp_path):
         assert by_gate["performance"]["severity"] == "warning"
         assert by_gate["performance"]["mandatory"] is False
         assert by_gate["camera"]["severity"] == "warning"
-        assert app.db.query_one("PRAGMA busy_timeout")[0] == 5000
+        assert app.db.query_one("PRAGMA busy_timeout")[0] == 60000
     finally:
         app.close()
 
