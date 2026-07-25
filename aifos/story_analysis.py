@@ -362,6 +362,15 @@ def is_likely_non_person_name(name):
     )
 
 
+def _is_background_voice_name(name):
+    """画外群声/旁白不是需要定妆的人物，允许按逐句证据归入背景声。"""
+    value = _text(name)
+    return any(token in value for token in (
+        "画外", "群体声", "众人", "群众声", "合声", "旁白",
+        "广播声", "电话声",
+    ))
+
+
 def validate_line_speaker_resolution(script, raw):
     """旧人物标签不可信时，AI 必须逐句给出可核验的说话人。"""
     expected = {}
@@ -447,7 +456,7 @@ def reconcile_character_entities(script, raw):
         if isinstance(scene, dict) and str(scene.get("scene_no", "")).isdigit()
     }
     for item in line_resolutions:
-        if not isinstance(item, dict) or confidence(item) < 0.75:
+        if not isinstance(item, dict):
             continue
         try:
             scene_no = int(item.get("scene_no"))
@@ -471,6 +480,19 @@ def reconcile_character_entities(script, raw):
             item.get("raw_label")
             or line.get("source_character_label")
             or line.get("character"))
+        score = confidence(item)
+        # 具名人物仍要求高置信；但“官差（画外群体声）”一类明确的
+        # 非独立人物只影响台词归属和人数合同，不会触发人物出图。AI 已逐句
+        # 给出证据时可用较低门槛接纳，避免把它永久留成“待确认说话人”。
+        if not (
+            score >= 0.75
+            or (
+                score >= 0.5
+                and is_likely_non_person_name(source)
+                and _is_background_voice_name(target)
+            )
+        ):
+            continue
         line["source_character_label"] = source
         line["character"] = target
         performance = _text(item.get("performance"))
@@ -554,7 +576,10 @@ def reconcile_character_entities(script, raw):
         raw_item = _dict(raw_characters.get(target))
         base = copy.deepcopy(existing.get(target) or {"name": target})
         base["name"] = target
-        if not base.get("role"):
+        if _is_background_voice_name(target):
+            base["role"] = "背景人物"
+            base["asset_policy"] = "scene_only_no_individual_asset"
+        elif not base.get("role"):
             base["role"] = importance_roles.get(
                 _text(raw_item.get("importance")), "配角")
         canonical[target] = base

@@ -64,7 +64,7 @@ def test_index_and_static(server):
     assert "AIFOS" in html
     assert "历史记录" in html
     assert "/static/style.css?v=20260725-plan-filter-1" in html
-    assert "/static/app.js?v=20260725-plan-filter-1" in html
+    assert "/static/app.js?v=20260726-speaker-resolution-1" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -124,6 +124,8 @@ def test_index_and_static(server):
     assert b"/api/character/regenerate" in app_js
     assert b"/api/story-analysis" in app_js
     assert "世界观、环境与视觉制作圣经".encode() in app_js
+    assert "去编辑剧本确认说话人".encode() in app_js
+    assert b'character.importance !== "' + "背景路人".encode() + b'"' in app_js
     assert "锁定制作圣经并开始人物图".encode() in app_js
     assert "剧本第一道总闸门".encode() in app_js
     assert "导入小说自动完成影视化改编".encode() in app_js

@@ -7856,7 +7856,9 @@ function storyAnalysisEditorHtml(analysis, version) {
       <div><b>时段/天气：</b>${esc(scene.time_weather || "")}</div>
       <div><b>光线：</b>${esc(scene.lighting || "")}</div>
     </details>`).join("");
-  const characterCards = (analysis.characters || []).map((character) => `
+  const productionCharacters = (analysis.characters || [])
+    .filter((character) => character.importance !== "背景路人");
+  const characterCards = productionCharacters.map((character) => `
     <details class="analysis-scene">
       <summary>${character.importance === "待确认" ? "⚠️" : "🧬"}
         ${esc(character.name || "未命名")} · ${esc(character.importance || "角色")}</summary>
@@ -7868,6 +7870,10 @@ function storyAnalysisEditorHtml(analysis, version) {
         || "尚未形成；不会进入人物出图")}</div>
       ${character.negative_prompt
         ? `<div><b>负面提示词：</b>${esc(character.negative_prompt)}</div>` : ""}
+      ${character.importance === "待确认"
+        ? `<div class="warn">系统无法从原文可靠判断这句由谁说。
+          <button type="button" class="analysis-confirm-speaker">
+            去编辑剧本确认说话人</button></div>` : ""}
     </details>`).join("");
   return `<section class="analysis-studio" data-version="${Number(version || 0)}">
     <div class="analysis-head"><div><span class="eyebrow">STEP 02 · AI PRODUCTION BIBLE</span>
@@ -7909,7 +7915,7 @@ function storyAnalysisEditorHtml(analysis, version) {
     <details class="analysis-scenes"><summary>逐场环境分析 · ${(analysis.scenes || []).length} 场</summary>
       <div class="analysis-scene-grid">${sceneCards || "暂无场景分析"}</div></details>
     <details class="analysis-scenes" open><summary>真实人物与最终出图卡 ·
-      ${(analysis.characters || []).filter((item) => item.importance !== "背景路人").length} 人</summary>
+      ${productionCharacters.length} 人</summary>
       <div class="analysis-scene-grid">${characterCards || "暂无人物分析"}</div></details>
     <div class="analysis-actions">
       <input id="analysis-direction" placeholder="可选补充，如：更考据、更克制、雨夜冷调；留空则完全按剧本重建">
@@ -8032,6 +8038,9 @@ function renderScriptReview(data, episodeId) {
   document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
   document.getElementById("btn-polish").onclick = () =>
     showScriptOverlay(data, episodeId);
+  app.querySelectorAll(".analysis-confirm-speaker").forEach((button) => {
+    button.onclick = () => showScriptOverlay(data, episodeId);
+  });
   bindImageAccelerationLivebar(episodeId);
   bindLightbox(app);
   bindImageLineControls();

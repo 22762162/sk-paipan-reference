@@ -406,6 +406,73 @@ def test_line_level_resolution_overrides_reused_wrong_label_per_dialogue():
         "dialogue"] == "殿下醒了？"
 
 
+def test_low_confidence_background_voice_does_not_remain_unresolved_cast():
+    imported = {
+        "project_title": "冒名入仕", "episode_number": 1,
+        "characters": [{
+            "name": "待确认说话人", "role": "待确认说话人",
+            "asset_policy": "unresolved_no_generation",
+        }],
+        "scenes": [{
+            "scene_no": 1, "location": "胭谷山",
+            "characters": ["待确认说话人"],
+            "action": "现代青年林川二十四岁，官差骑马赶到现场。",
+            "lines": [
+                {"character": "待确认说话人",
+                 "dialogue": "我只是路过，被打晕后莫名换了衣服。"},
+                {"character": "待确认说话人",
+                 "dialogue": "快！前面有马车！"},
+                {"character": "待确认说话人", "dialogue": "在那里！"},
+            ],
+        }],
+        "import_analysis": {"dialogue_count": 3, "character_count": 1},
+    }
+    raw = {
+        "line_speakers": [
+            {"scene_no": 1, "line_index": 1,
+             "dialogue": "我只是路过，被打晕后莫名换了衣服。",
+             "raw_label": "待确认说话人", "canonical_name": "林川",
+             "confidence": 0.78},
+            {"scene_no": 1, "line_index": 2,
+             "dialogue": "快！前面有马车！",
+             "raw_label": "待确认说话人",
+             "canonical_name": "官差（画外群体声）",
+             "confidence": 0.55},
+            {"scene_no": 1, "line_index": 3, "dialogue": "在那里！",
+             "raw_label": "待确认说话人",
+             "canonical_name": "官差（画外群体声）",
+             "confidence": 0.55},
+        ],
+        "characters": [{
+            "name": "林川", "importance": "主角",
+            "gender": "男", "age_range": "24岁",
+            "identity_facts": "现代清华高材生、国考选调生，穿越成明初穷秀才",
+        }],
+    }
+
+    assert reconcile_character_entities(imported, raw) is True
+    assert unresolved_character_labels(imported) == []
+    assert [line["character"] for line
+            in imported["scenes"][0]["lines"]] == [
+                "林川", "官差（画外群体声）", "官差（画外群体声）"]
+    hero = next(item for item in imported["characters"]
+                if item["name"] == "林川")
+    background = next(item for item in imported["characters"]
+                      if item["name"] == "官差（画外群体声）")
+    assert hero["role"] == "主角"
+    assert hero["gender"] == "男" and hero["age_range"] == "24岁"
+    assert background["role"] == "背景人物"
+    assert background["asset_policy"] == "scene_only_no_individual_asset"
+
+    analysis = build_story_analysis(imported, raw=raw)
+    background_card = next(
+        item for item in analysis["characters"]
+        if item["name"] == "官差（画外群体声）")
+    assert background_card["importance"] == "背景路人"
+    assert background_card["candidate_count"] == 0
+    assert "image_prompt" not in background_card
+
+
 def test_line_level_resolution_requires_every_dialogue():
     script = {
         "scenes": [{"scene_no": 1, "lines": [
