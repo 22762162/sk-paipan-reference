@@ -436,6 +436,10 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
             "expression": _text(
                 item.get("expression"),
                 "夸张但清晰可读的Q版眉眼、嘴形、手势和身体弹性"),
+            "proportion_style": "oversized_head_tiny_body",
+            "total_height_in_heads": 1.8,
+            "head_height_ratio": 0.58,
+            "body_smaller_than_head": True,
             "action": _text(
                 item.get("action"), "在宿主肩旁完成内心反应"),
             "dialogue": _text(item.get("dialogue")),
@@ -516,6 +520,7 @@ def _reference_role(item):
     if role in {"inner_persona", "narrative_overlay"}:
         return (
             "内心Q版：只锁Q版脸、发型、当前衣着和Q版比例；"
+            "保持约1.8头身，头占总高约58%，身体明显小于头；"
             "不增加真实人物、站位或默认道具")
     return "弱参考：不得覆盖已锁定身份和场景"
 
@@ -560,6 +565,8 @@ def render_shot_prompt(contract, *, mode="image"):
             f"{overlay['action']}{inner_dialogue}。它不是真实人物，不计入"
             f"上述{count}名真实主体，不参与物理站位、遮挡、空间调度或真实"
             "连续性；只有宿主内心感知，其他人物不得看见、回应、触碰、对视；"
+            "严格保持大头小身：约1.8头身，头占总高约58%，身体、肩宽、"
+            "躯干、四肢、手脚都明显小于头部；"
             "继承锁定的当前衣着，不继承默认道具；内心发声时宿主闭口，"
             "不画旁白/吐槽字幕。")
     physical = contract.get("physical") or {}

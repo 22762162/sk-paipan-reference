@@ -123,6 +123,10 @@ def test_inner_persona_is_non_physical_and_exaggerated(tmp_path):
     assert overlay["inherit_signature_props"] is False
     assert overlay["host_mouth_closed"] is True
     assert overlay["expression_style"] == "exaggerated"
+    assert overlay["proportion_style"] == "oversized_head_tiny_body"
+    assert overlay["total_height_in_heads"] == 1.8
+    assert overlay["head_height_ratio"] == 0.58
+    assert overlay["body_smaller_than_head"] is True
     assert overlay["asset_uri"] == "/tmp/chibi-a.png"
     assert SOURCE not in inner["start_state"]
     assert SOURCE not in {
@@ -131,6 +135,8 @@ def test_inner_persona_is_non_physical_and_exaggerated(tmp_path):
     assert "非现实内心Q版叠层" in inner["seedance_prompt_compact"]
     assert "不计入上述1名真实主体" in inner["seedance_prompt_compact"]
     assert "表情和动作" in inner["seedance_prompt"]
+    assert "约1.8头身" in inner["seedance_prompt"]
+    assert "头占总高约58%" in inner["seedance_prompt"]
     assert "不继承任何默认道具" in inner["seedance_prompt"]
     assert "宿主闭口" in inner["seedance_prompt"]
 
@@ -160,12 +166,15 @@ def test_inner_persona_prompt_and_reference_role_are_explicit():
     assert policy["mode"] == "chibi_overlay"
     assert policy["auto_after_every_dialogue"] is False
     assert policy["expression_style"] == "exaggerated"
+    assert policy["proportion_style"] == "oversized_head_tiny_body"
+    assert policy["body_smaller_than_head"] is True
     assert contract["subject"]["count"] == 1
     assert len(contract["narrative_overlays"]) == 1
     assert "严格共1人" in prompt
     assert "非现实内心Q版叠层" in prompt
     assert "其他人物不得看见、回应、触碰、对视" in prompt
     assert "不继承默认道具" in prompt
+    assert "约1.8头身" in prompt
     assert "图2=内心Q版母资产(内心Q版：" in prompt
 
 
@@ -179,6 +188,10 @@ def test_default_standard_locks_inner_persona_as_overlay(tmp_path):
         assert rules["historical_characters_may_react"] is False
         assert rules["auto_after_every_dialogue"] is False
         assert rules["expression_style"] == "exaggerated"
+        assert rules["proportion_style"] == "oversized_head_tiny_body"
+        assert rules["total_height_in_heads"] == 1.8
+        assert rules["head_height_ratio"] == 0.58
+        assert rules["body_smaller_than_head"] is True
         assert rules["host_mouth_closed_for_inner_voice"] is True
     finally:
         app.close()

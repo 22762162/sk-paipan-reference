@@ -25,7 +25,7 @@ DEFAULT_STANDARD = {
     "source_skill": {
         "id": "sk-manju-storyboard-skill",
         "name": "SK 漫剧五维分镜制作 Skill",
-        "version": "5.2",
+        "version": "5.3",
         "reference": "five-dimension-storyboard-template-v5.txt",
         "principle": (
             "先从剧情推导人物视觉 DNA、完成全剧角色去重和人工定版，"
@@ -160,6 +160,10 @@ DEFAULT_STANDARD = {
             ],
             "auto_after_every_dialogue": False,
             "expression_style": "exaggerated",
+            "proportion_style": "oversized_head_tiny_body",
+            "total_height_in_heads": 1.8,
+            "head_height_ratio": 0.58,
+            "body_smaller_than_head": True,
             "max_overlays_per_shot": 1,
             "host_mouth_closed_for_inner_voice": True,
             "forbid_burned_subtitles": True,
@@ -593,6 +597,29 @@ class StandardCenter:
             issue(
                 "rules.inner_persona.expression_style",
                 "Q 版内心表演必须允许夸张表达")
+        if inner_persona.get(
+                "proportion_style") != "oversized_head_tiny_body":
+            issue(
+                "rules.inner_persona.proportion_style",
+                "Q版必须采用头部明显大于身体的大头小身比例")
+        total_heads = inner_persona.get("total_height_in_heads")
+        if (not isinstance(total_heads, (int, float))
+                or isinstance(total_heads, bool)
+                or not 1.7 <= float(total_heads) <= 1.9):
+            issue(
+                "rules.inner_persona.total_height_in_heads",
+                "Q版总高必须控制在1.7至1.9个头高")
+        head_ratio = inner_persona.get("head_height_ratio")
+        if (not isinstance(head_ratio, (int, float))
+                or isinstance(head_ratio, bool)
+                or not 0.55 <= float(head_ratio) <= 0.60):
+            issue(
+                "rules.inner_persona.head_height_ratio",
+                "Q版头部必须占总高55%至60%")
+        if inner_persona.get("body_smaller_than_head") is not True:
+            issue(
+                "rules.inner_persona.body_smaller_than_head",
+                "Q版身体必须在视觉上小于头部")
         if inner_persona.get("max_overlays_per_shot") != 1:
             issue(
                 "rules.inner_persona.max_overlays_per_shot",

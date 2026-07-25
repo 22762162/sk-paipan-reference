@@ -6853,7 +6853,7 @@ const VIDEO_REF_USAGE_CN = {
   reference: "按上传时声明的单一用途使用",
   character_sheet: "只补充标签对应的人物局部属性",
   character_art: "只锁脸、年龄、性别表达与身份标志",
-  inner_persona: "只锁Q版身份、当前服装和比例，动作表情可按内心戏夸张发挥",
+  inner_persona: "只锁Q版身份和当前服装；约1.8头身、头大身小，动作表情可夸张发挥",
   first_frame: "视频动作起点，必须传入",
   last_frame: "视频动作终点及衔接，必须传入",
   spatial_blocking: "锁定多人站位、行动路线和摄影机起终点，必须传入",

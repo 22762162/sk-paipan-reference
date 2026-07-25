@@ -31,6 +31,10 @@ DEFAULT_INNER_PERSONA_RULES = {
     ],
     "auto_after_every_dialogue": False,
     "expression_style": "exaggerated",
+    "proportion_style": "oversized_head_tiny_body",
+    "total_height_in_heads": 1.8,
+    "head_height_ratio": 0.58,
+    "body_smaller_than_head": True,
     "max_overlays_per_shot": 1,
     "host_mouth_closed_for_inner_voice": True,
     "forbid_burned_subtitles": True,
@@ -127,6 +131,10 @@ def normalize_inner_persona_policy(script, rules=None):
     policy["inherit_signature_props"] = False
     policy["auto_after_every_dialogue"] = False
     policy["expression_style"] = "exaggerated"
+    policy["proportion_style"] = "oversized_head_tiny_body"
+    policy["total_height_in_heads"] = 1.8
+    policy["head_height_ratio"] = 0.58
+    policy["body_smaller_than_head"] = True
     policy["max_overlays_per_shot"] = 1
     policy["host_mouth_closed_for_inner_voice"] = True
     policy["forbid_burned_subtitles"] = True
@@ -201,6 +209,10 @@ def normalize_narrative_overlay(value, policy, *, fallback_text=""):
         "historical_characters_may_react": False,
         "inherit_signature_props": False,
         "expression_style": "exaggerated",
+        "proportion_style": "oversized_head_tiny_body",
+        "total_height_in_heads": 1.8,
+        "head_height_ratio": 0.58,
+        "body_smaller_than_head": True,
         "expression": expression,
         "action": action,
         "dialogue": _text(

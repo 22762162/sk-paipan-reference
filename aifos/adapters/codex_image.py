@@ -364,7 +364,8 @@ def build_instruction(capability, payload, out_dir):
                 "只统计真实人物，不把Q版计入；detected_overlay_count单独统计"
                 "Q版且必须为1。Q版不得成为真人实体、不得进入真实站位或遮挡、"
                 "不得被其他人物看见/回应/触碰；继承当前衣着、无默认道具，"
-                "表情动作应夸张。内心发声时真人宿主闭口，不得出现旁白字幕。\n")
+                "表情动作应夸张；比例约1.8头身，头占总高约58%，身体与四肢"
+                "明显小于头。内心发声时真人宿主闭口，不得出现旁白字幕。\n")
         else:
             overlay_line = (
                 "- 本镜不允许内心Q版叠层；detected_overlay_count必须为0，"
