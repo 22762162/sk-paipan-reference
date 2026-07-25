@@ -451,6 +451,14 @@ def build_instruction(capability, payload, out_dir):
             "冲突时，身份以参考图为准。\n"
             "必须单独核对每个人物的性别与性别表达。女性画成男性、男性画成女性"
             "一律判失败，不能因服装、发色或气质相似而放行。\n"
+            "- 当前镜头逐角色服装/头饰/妆发状态:"
+            + ("；".join(
+                f"{name}={wardrobe}" for name, wardrobe in
+                (payload.get("expected_wardrobe") or {}).items())
+               or "本镜未声明服装状态")
+            + "\n只要声明了服装状态，就必须逐人核对；无换装动作却从官服变"
+            "常服、漏掉帽冠或擅自改妆发，一律判失败。侧面/背面按可见服装"
+            "轮廓、背片、材质、配色、头饰和发型核对，不要求正脸。\n"
             "必须点数画面实际可见人物；多一个、少一个、角色被复制或两人合成一人"
             "都必须判失败。过肩镜中前景半身背影/肩膀是已登记的对话者本人，"
             "只计该角色1人，不得另算成第三人、陌生人或人物复制。\n"
@@ -482,6 +490,7 @@ def build_instruction(capability, payload, out_dir):
             '"view":"front_or_three_quarter/profile/back/back_or_over_shoulder",'
             '"basis":["实际核验项"],"checked":true或false,"match":true或false}], '
             '"gender_checked": true或false, "gender_match": true或false, '
+            '"wardrobe_checked": true或false, "wardrobe_match": true或false, '
             '"count_checked": true或false, "count_match": true或false, '
             '"overlay_count_checked": true或false, '
             '"overlay_count_match": true或false, '

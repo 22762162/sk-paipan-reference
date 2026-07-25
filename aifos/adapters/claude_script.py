@@ -250,8 +250,11 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
   涉及电脑/手机/屏幕时必须明确屏幕正面、键盘/手部、使用者和摄影机同侧关系，
   禁止人物坐在屏幕后方却看到屏幕正面等反向构图；
 - 每个有角色的镜头必须输出 `start_state` 和 `end_state`，按角色名分别写
-  pose、position、direction、prop、injury、emotion；姿态必须说明站/坐/跪/
-  躺/伏案及真实支撑面，终态必须能被下一镜继承。空镜输出空对象；
+  pose、position、direction、prop、injury、emotion、wardrobe、headwear、
+  hair_makeup；服装、头饰、妆发必须写当前镜头唯一可见状态，不能把多套剧情
+  造型同时塞入同一镜。姿态必须说明站/坐/跪/躺/伏案及真实支撑面，终态必须
+  被下一镜逐项继承；没有明确换装/摘戴/改妆动作时，下一镜不得改动 wardrobe、
+  headwear 或 hair_makeup。空镜输出空对象；
 - prompt 中人物形态按人物设定描写(名字只是称呼,「小鹿」若设定为
   人类不能当动物写;设定为动物/精怪的按设定写,全片保持一致);
 - 不生成对白字幕。手机屏、弹幕、合同等可读文字只描述载体与准确文字，
@@ -273,10 +276,14 @@ JSON 格式:
   "physical_logic": "本镜物理/空间关系",
   "start_state": {{"角色名":{{"pose":"动作起点姿态及支撑面",
     "position":"相对场景和其他人物的位置","direction":"身体朝向和视线对象",
-    "prop":"手中/身上道具","injury":"伤势","emotion":"可见情绪"}}}},
+    "prop":"手中/身上道具","injury":"伤势","emotion":"可见情绪",
+    "wardrobe":"当前唯一服装","headwear":"当前头饰/冠帽或无",
+    "hair_makeup":"当前发型与妆容"}}}},
   "end_state": {{"角色名":{{"pose":"动作完成后的姿态及支撑面",
     "position":"终点位置","direction":"终点朝向和视线对象",
-    "prop":"终点持物","injury":"终点伤势","emotion":"终点情绪"}}}},
+    "prop":"终点持物","injury":"终点伤势","emotion":"终点情绪",
+    "wardrobe":"结尾唯一服装","headwear":"结尾头饰/冠帽或无",
+    "hair_makeup":"结尾发型与妆容"}}}},
   "readable_text": {{"carrier":"电脑屏幕", "whitelist":["逐字原文"],
     "layout":"版式/位置", "style":"字体/颜色/层级", "perspective":"透视/反光",
     "priority":"must_read"}},
@@ -874,6 +881,10 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 当前镜头逐角色构图合同:{composition_rules}
 必须单独核对每个人物的性别与性别表达；女性被画成男性、男性被画成女性，
 一律是身份硬错误，不能因发色、服装或气质相似而通过。
+当前镜头逐角色服装/头饰/妆发状态:{expected_wardrobe}
+只要本镜声明了服装状态，就必须逐人核对实际画面；上一镜已经锁定官服而本镜
+无换装动作却变成常服、漏掉帽冠、擅自改发型或妆容，一律是连续性硬错误。
+背面/侧面镜头按可见服装轮廓、背片、材质、颜色、头饰与发型核对，不要求正脸。
 必须点数画面里实际可见的人物总数，并与要求人数逐一核对；多一个、少一个、
 同一角色被复制两次或把两人合成一人都必须失败。
 过肩构图中“1个正面主体 + 1个前景半背影对话者”是两个已登记角色槽位；
@@ -911,6 +922,7 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 "view":"front_or_three_quarter/profile/back/back_or_over_shoulder",
 "basis":["实际核验项"],"checked":true或false,"match":true或false}}],
 "gender_checked": true或false, "gender_match": true或false,
+"wardrobe_checked": true或false, "wardrobe_match": true或false,
 "count_checked": true或false, "count_match": true或false,
 "overlay_count_checked": true或false, "overlay_count_match": true或false,
 "detected_overlay_count": 画面实际内心Q版叠层数整数,
@@ -1027,6 +1039,10 @@ def build_qc_prompt(payload):
             f"{name}={gender}" for name, gender in
             (payload.get("expected_genders") or {}).items())
             or "以最终立绘与人物设定为准"),
+        expected_wardrobe=("；".join(
+            f"{name}={wardrobe}" for name, wardrobe in
+            (payload.get("expected_wardrobe") or {}).items())
+            or "本镜未声明服装状态，仅按可见剧情事实检查"),
         location=payload.get("location") or "按提示词",
         action=payload.get("action") or "按提示词",
         camera=payload.get("camera") or "按提示词",
@@ -1054,6 +1070,7 @@ def validate_image_qc(data):
         "pass", "visual_pass", "input_contract_pass",
         "identity_checked", "identity_match",
         "gender_checked", "gender_match",
+        "wardrobe_checked", "wardrobe_match",
         "count_checked", "count_match",
         "physical_logic_checked", "physical_logic_match",
         "spatial_logic_checked", "spatial_logic_match",

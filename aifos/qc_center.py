@@ -199,15 +199,19 @@ class QcCenter:
         # 同名角色跨单元出现时，下一单元起始状态必须继承上一结尾状态。
         if enabled("continuity"):
             previous = {}
+            previous_scene = None
             for shot in shots:
                 for name, start in (shot.get("start_state") or {}).items():
-                    if name in previous and start != previous[name]:
+                    if (shot.get("scene_no") == previous_scene
+                            and name in previous
+                            and start != previous[name]):
                         issues.append({
                             "check": "state_continuity", "severity": "error",
                             "shot_no": shot.get("shot_no"), "rerunnable": False,
                             "message": f"{shot.get('unit_id')}的{name}未继承上一单元结尾状态",
                         })
                 previous.update(shot.get("end_state") or {})
+                previous_scene = shot.get("scene_no")
 
         script_lines = [
             line.get("dialogue", "")

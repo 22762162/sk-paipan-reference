@@ -43,12 +43,31 @@ def _state_line(states):
     values = []
     for name, state in (states or {}).items():
         state = state if isinstance(state, dict) else {}
-        values.append(
-            f"{_text(name)}:{_text(state.get('position')) or '原位'},"
-            f"{_text(state.get('pose')) or '自然状态'},"
-            f"朝向{_text(state.get('direction')) or '按画面'}"
-        )
+        details = [
+            _text(state.get("position")) or "原位",
+            _text(state.get("pose")) or "自然状态",
+            f"朝向{_text(state.get('direction')) or '按画面'}",
+        ]
+        for key, label in (
+                ("wardrobe", "服装"), ("headwear", "头饰"),
+                ("hair_makeup", "妆发"), ("prop", "道具"),
+                ("injury", "伤势"), ("emotion", "情绪")):
+            if _text(state.get(key)):
+                details.append(f"{label}{_text(state[key])}")
+        values.append(f"{_text(name)}:" + ",".join(details))
     return "；".join(values)
+
+
+def _appearance_map(states):
+    return {
+        _text(name): {
+            key: _text(state.get(key))
+            for key in ("wardrobe", "headwear", "hair_makeup")
+            if _text(state.get(key))
+        }
+        for name, state in (states or {}).items()
+        if isinstance(state, dict)
+    }
 
 
 def readable_text_required(value):
@@ -472,6 +491,7 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
         "scene": scene,
         "style": _text(style),
         "start": _state_line(shot.get("start_state")) or "保持首帧状态",
+        "start_appearance": _appearance_map(shot.get("start_state")),
         "action": action,
         "performance": _text(
             (shot.get("performance") or {}).get("micro_expression"),
@@ -480,6 +500,14 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
         "camera": _camera(shot),
         "physical": physical,
         "end": _state_line(shot.get("end_state")) or "到达尾帧状态",
+        "end_appearance": _appearance_map(shot.get("end_state")),
+        "appearance_state_required": bool(
+            shot.get("appearance_state_required")),
+        "appearance_issues": [
+            _text(value) for value in (
+                shot.get("appearance_continuity_issues") or [])
+            if _text(value)
+        ],
         "dialogue": (
             "" if dialogue.get("inner_voice")
             else _text(dialogue.get("dialogue"))),
@@ -493,7 +521,9 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
         "hard": (
             "只执行一个主动作和一个运镜；人物身份、服装、场景、构图分别服从"
             "对应参考图；不得重新设计人物，不得新增/复制真实人物或把参考图内容"
-            "贴进成片；非现实Q版叠层不得转化成真人、实体角色或空间站位"
+            "贴进成片；服装、头饰、妆发必须逐人服从本镜起止状态，未写换装/"
+            "摘戴/改妆动作时不得自行改变；非现实Q版叠层不得转化成真人、"
+            "实体角色或空间站位"
         ),
     }
     return contract
@@ -652,6 +682,25 @@ def validate_shot_prompt_contract(contract):
         issues.append("参考图编号不是与提交顺序一致的连续编号")
 
     action = _text(contract.get("action"))
+    start_appearance = contract.get("start_appearance") or {}
+    end_appearance = contract.get("end_appearance") or {}
+    actor_names = []
+    for actor in subject.get("actors") or []:
+        value = _text(actor)
+        if "=" in value:
+            value = value.split("=", 1)[1].split("（", 1)[0].strip()
+        if value:
+            actor_names.append(value)
+    if contract.get("appearance_state_required"):
+        for name in actor_names:
+            start_look = start_appearance.get(name) or {}
+            end_look = end_appearance.get(name) or {}
+            if not _text(
+                    start_look.get("wardrobe") or end_look.get("wardrobe")):
+                issues.append(f"{name}缺少当前镜头唯一服装状态")
+    issues.extend(
+        _text(value) for value in contract.get("appearance_issues") or []
+        if _text(value))
     start = _text(contract.get("start"))
     end = _text(contract.get("end"))
     state_text = f"{start} {end}"

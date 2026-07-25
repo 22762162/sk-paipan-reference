@@ -186,3 +186,55 @@ def test_environment_shot_remains_strictly_empty(tmp_path):
     assert shot["character_count"] == 0
     assert "严格共0人" in shot["seedance_prompt"]
     assert "无人空镜" in shot["seedance_prompt"]
+
+
+def test_saved_storyboard_repairs_official_uniform_continuity_without_rewrite():
+    from aifos.workflow import repair_storyboard_appearance_continuity
+
+    continuity = {
+        "characters": [{
+            "name": "沈砚", "default_position": "画面中",
+            "default_wardrobe": "旧灰长衫", "signature_prop": "袖中鱼符",
+        }],
+    }
+    storyboard = {"shots": [
+        {
+            "shot_no": 7, "scene_no": 2, "characters": ["沈砚"],
+            "description": "沈砚青官袍乌纱下轿立定",
+            "prompt": "沈砚青官袍乌纱略不合身",
+            "start_state": {"沈砚": {"pose": "立定"}},
+            "end_state": {"沈砚": {"pose": "立定"}},
+        },
+        {
+            "shot_no": 8, "scene_no": 2, "characters": ["沈砚"],
+            "description": "沈砚侧背微颔首",
+            "prompt": "沈砚青官袍侧背前景",
+            "start_state": {"沈砚": {"pose": "立定"}},
+            "end_state": {"沈砚": {"pose": "立定微颔首"}},
+        },
+        {
+            "shot_no": 9, "scene_no": 2, "characters": ["沈砚"],
+            "description": "沈砚略顿",
+            "prompt": "沈砚略顿，冷天光压抑",
+            "start_state": {"沈砚": {"pose": "立定"}},
+            "end_state": {"沈砚": {"pose": "手将探袖"}},
+        },
+        {
+            "shot_no": 10, "scene_no": 2, "characters": ["沈砚"],
+            "description": "沈砚身穿旧月白直裰继续答话",
+            "prompt": "沈砚旧月白直裰正面",
+            "start_state": {"沈砚": {"pose": "立定"}},
+            "end_state": {"沈砚": {"pose": "立定"}},
+        },
+    ]}
+
+    repaired = repair_storyboard_appearance_continuity(
+        storyboard, continuity)
+    shots = repaired["shots"]
+    expected = shots[0]["end_state"]["沈砚"]["wardrobe"]
+    assert "青官袍" in expected
+    assert shots[1]["start_state"]["沈砚"]["wardrobe"] == expected
+    assert shots[2]["end_state"]["沈砚"]["wardrobe"] == expected
+    assert shots[3]["end_state"]["沈砚"]["wardrobe"] == expected
+    assert shots[3]["appearance_continuity_issues"]
+    assert "服装" + expected in shots[2]["seedance_prompt_compact"]

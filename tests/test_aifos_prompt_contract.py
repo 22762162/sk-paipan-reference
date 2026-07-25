@@ -59,6 +59,45 @@ def test_compact_contract_is_ordered_and_single_purpose():
     assert "你看这里。" in prompt
 
 
+def test_compact_contract_locks_per_actor_wardrobe_and_blocks_missing_state():
+    shot = {
+        "shot_no": 8,
+        "characters": ["沈砚"],
+        "character_number_map": {
+            "P01": {"actor_id": "P01", "name": "沈砚"},
+        },
+        "description": "沈砚微微颔首",
+        "appearance_state_required": True,
+        "start_state": {
+            "沈砚": {
+                "position": "县衙门前", "pose": "立定",
+                "direction": "面向县丞", "wardrobe": "青官袍、乌角革带",
+                "headwear": "乌纱帽", "hair_makeup": "束发、素颜",
+            },
+        },
+        "end_state": {
+            "沈砚": {
+                "position": "县衙门前", "pose": "微颔首",
+                "direction": "面向县丞", "wardrobe": "青官袍、乌角革带",
+                "headwear": "乌纱帽", "hair_makeup": "束发、素颜",
+            },
+        },
+    }
+    contract, prompt = compile_shot_prompt(shot, location="清河县衙门前")
+    assert validate_shot_prompt_contract(contract)["passed"]
+    assert "服装青官袍、乌角革带" in prompt
+    assert "头饰乌纱帽" in prompt
+    assert "未写换装/摘戴/改妆动作时不得自行改变" in prompt
+
+    missing = dict(shot)
+    missing["start_state"] = {"沈砚": {"pose": "立定"}}
+    missing["end_state"] = {"沈砚": {"pose": "立定"}}
+    broken, _ = compile_shot_prompt(missing)
+    verdict = validate_shot_prompt_contract(broken)
+    assert verdict["passed"] is False
+    assert "沈砚缺少当前镜头唯一服装状态" in verdict["issues"]
+
+
 def test_empty_scene_is_explicitly_an_empty_shot():
     shot = _shot()
     shot.update({"characters": [], "character_number_map": {}, "description": "雨水落在窗沿"})

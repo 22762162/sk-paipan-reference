@@ -190,6 +190,8 @@ class MockProvider(Provider):
                     "gender_checked": bool(
                         payload.get("identity_references")),
                     "gender_match": True,
+                    "wardrobe_checked": True,
+                    "wardrobe_match": True,
                     "count_checked": True,
                     "count_match": True,
                     "overlay_count_checked": True,
@@ -230,6 +232,8 @@ class MockProvider(Provider):
                 "gender_checked": (not payload.get("gender_required")
                                     or bool(payload.get("identity_references"))),
                 "gender_match": True,
+                "wardrobe_checked": True,
+                "wardrobe_match": True,
                 "count_checked": True,
                 "count_match": True,
                 "overlay_count_checked": True,

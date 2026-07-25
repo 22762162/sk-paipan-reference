@@ -77,6 +77,7 @@ from .workflow import (
     enrich_storyboard,
     lock_text_assets,
     production_profile,
+    repair_storyboard_appearance_continuity,
     write_delivery_verifier,
     write_review_board,
 )
@@ -2619,13 +2620,20 @@ class Director:
             # 性别、年龄、物种和身份是质检硬事实，不能经过用于“防止旧
             # 外貌文字反向改脸”的 safe_design 过滤。脸仍以最终立绘为准。
             design = self._character_design(project_id, name) or {}
-            merged = {
-                **(design or {}),
-                **(backgrounds.get(name) or {}),
-                # 人工选中的候选造型才是后续服装/发型/妆容默认值；
-                # 不能又回退到候选前的文字设定。
-                **self._locked_look_variant(project_id, name),
-            }
+            if character_sheet_key:
+                merged = {
+                    **(design or {}),
+                    **self._locked_look_variant(project_id, name),
+                    **(backgrounds.get(name) or {}),
+                }
+            else:
+                # Shot QC must evaluate the inherited current-shot look.
+                # A selected identity candidate may intentionally depict a
+                # later outfit and must never overwrite this state.
+                merged = {
+                    **(design or {}),
+                    **(backgrounds.get(name) or {}),
+                }
             if character_sheet_key:
                 line = self._sheet_design_line(
                     merged, character_sheet_key,
@@ -2651,6 +2659,18 @@ class Director:
             for item in (narrative_overlays or [])
             if isinstance(item, dict)
         ][:1]
+        expected_wardrobe = {
+            name: "；".join(filter(None, (
+                ("服装:" + str((backgrounds.get(name) or {}).get("costume")))
+                if (backgrounds.get(name) or {}).get("costume") else "",
+                ("头饰:" + str((backgrounds.get(name) or {}).get("accessories")))
+                if (backgrounds.get(name) or {}).get("accessories") else "",
+                ("妆发:" + str((backgrounds.get(name) or {}).get("hair")))
+                if (backgrounds.get(name) or {}).get("hair") else "",
+            )))
+            for name in visible_characters
+            if str((backgrounds.get(name) or {}).get("costume") or "").strip()
+        }
         return {
             # Internal retry guard: replacement selectors may only resolve
             # assets from this project.  The QC prompt does not render this
@@ -2664,6 +2684,9 @@ class Director:
             "overlay_count_required": bool(overlays),
             "designs": ";".join(designs),
             "expected_genders": genders,
+            "expected_wardrobe": expected_wardrobe,
+            "wardrobe_required": bool(
+                expected_wardrobe and not character_sheet_key),
             "location": location or "",
             "action": action or "",
             "camera": camera or "",
@@ -3013,6 +3036,13 @@ class Director:
         gender_match = (
             not gender_required
             or checked_true(verdict.get("gender_match")))
+        wardrobe_required = bool(qc_spec.get("wardrobe_required"))
+        wardrobe_checked = (
+            not wardrobe_required
+            or checked_true(verdict.get("wardrobe_checked")))
+        wardrobe_match = (
+            not wardrobe_required
+            or checked_true(verdict.get("wardrobe_match")))
         count_required = bool(qc_spec.get("count_required"))
         count_checked = (
             not count_required
@@ -3066,6 +3096,10 @@ class Director:
             issues.append("质检未单独核对人物性别/性别表达")
         elif not gender_match:
             issues.append("人物性别/性别表达与锁定最终立绘不一致")
+        if not wardrobe_checked:
+            issues.append("质检未逐人核对当前镜头服装、头饰与妆发状态")
+        elif not wardrobe_match:
+            issues.append("画面服装、头饰或妆发与本镜继承状态不一致")
         if not count_checked:
             issues.append("质检未核对画面实际人数")
         elif not count_match:
@@ -3095,6 +3129,7 @@ class Director:
         visual_hard_failure = (
             not identity_checked or not identity_match
             or not gender_checked or not gender_match
+            or not wardrobe_checked or not wardrobe_match
             or not count_checked or not count_match
             or not overlay_checked or not overlay_match
             or not physical_checked or not physical_match
@@ -3115,6 +3150,7 @@ class Director:
         visual_checks_passed = (
             identity_checked and identity_match
             and gender_checked and gender_match
+            and wardrobe_checked and wardrobe_match
             and count_checked and count_match
             and overlay_checked and overlay_match
             and physical_checked and physical_match
@@ -3139,6 +3175,10 @@ class Director:
             "identity_match": identity_match,
             "gender_checked": gender_checked,
             "gender_match": gender_match,
+            "wardrobe_checked": wardrobe_checked,
+            "wardrobe_match": wardrobe_match,
+            "expected_wardrobe": copy.deepcopy(
+                qc_spec.get("expected_wardrobe") or {}),
             "count_checked": count_checked,
             "count_match": count_match,
             "overlay_count_checked": overlay_checked,
@@ -4452,9 +4492,19 @@ class Director:
                     and (existing.get("profile")
                          if isinstance(existing.get("profile"), dict)
                          else {}).get(
-                        "standard_fingerprint") == ctx[
-                            "production_profile"].get(
+                            "standard_fingerprint") == ctx[
+                                "production_profile"].get(
                                 "standard_fingerprint")):
+                repaired = repair_storyboard_appearance_continuity(
+                    existing, ctx["continuity"], ctx.get("script"))
+                if repaired != existing:
+                    existing = repaired
+                    version = self.projects.save_document(
+                        ctx["episode"]["id"], "storyboard", existing)
+                    self.log.info(
+                        "director",
+                        "已为复用分镜补齐服装/头饰/妆发连续性状态；"
+                        "未重写镜头、台词或时长")
                 ctx["storyboard"] = existing
                 self._plan_seed_shots(ctx)
                 self.log.info("director", f"复用已有五维分镜 v{version}")
@@ -4941,6 +4991,16 @@ class Director:
     def _shot_image_meta(self, ctx, shot, decision, extra=None):
         """镜头图写入可检索上下文，供跨集资产匹配和复用。"""
         location = self._scene_locations(ctx).get(shot.get("scene_no"), "")
+        appearance_state = {}
+        for name in shot.get("characters") or []:
+            state = (
+                (shot.get("end_state") or {}).get(name)
+                or (shot.get("start_state") or {}).get(name)
+                or {})
+            appearance_state[name] = {
+                key: str(state.get(key) or "")
+                for key in ("wardrobe", "headwear", "hair_makeup")
+            }
         value = {
             **self._quality_meta(decision),
             "shot_content_hash": self._shot_content_hash(shot),
@@ -4949,6 +5009,7 @@ class Director:
             "scene_no": shot.get("scene_no"),
             "characters": list(shot.get("characters") or []),
             "location": location,
+            "appearance_state": appearance_state,
         }
         if extra:
             value.update(extra)
@@ -5927,9 +5988,15 @@ class Director:
                     "identity", "wardrobe", "scene", "composition"})]
 
     def _matching_produced_image_rows(self, project_id, characters,
-                                      location, shot_no=None, limit=3):
+                                      location, shot_no=None, limit=3,
+                                      wardrobe_states=None):
         """从资产中心找同人物/同场景的正式成图，优先作为连续性参考。"""
         wanted = set(characters or [])
+        expected_appearance = {
+            str(name): str(wardrobe or "")
+            for name, wardrobe in (wardrobe_states or {}).items()
+            if str(wardrobe or "").strip()
+        }
         ranked = []
         for row in self.assets.active_list(project_id):
             if row["kind"] not in ("image", "first_frame", "last_frame"):
@@ -5950,6 +6017,24 @@ class Director:
             exact_people = row_chars == wanted
             if not same_location or not exact_people:
                 continue
+            # 历史图若没有记录当时的镜头服装状态，不能在服装连续段中
+            # 作为参考图重新进入产线；这正是旧白衣错误反向污染官服镜头
+            # 的来源。新图按服装家族和头饰状态精确复用。
+            if expected_appearance:
+                row_appearance = meta.get("appearance_state")
+                if not isinstance(row_appearance, dict):
+                    continue
+                compatible = True
+                for name, expected in expected_appearance.items():
+                    actual = str(
+                        (row_appearance.get(name) or {}).get("wardrobe")
+                        or "")
+                    if not self._wardrobe_states_compatible(
+                            expected, actual):
+                        compatible = False
+                        break
+                if not compatible:
+                    continue
             score = 6 + len(wanted) * 4 + 3
             ranked.append((score, row["id"], row))
         ranked.sort(key=lambda item: (-item[0], -item[1]))
@@ -6010,9 +6095,125 @@ class Director:
                 result[name] = fallback
         return result
 
+    @staticmethod
+    def _wardrobe_terms(value):
+        text = str(value or "")
+        terms = (
+            "青官袍", "深青官袍", "官袍", "直裰", "乌纱帽", "乌纱",
+            "网巾", "革带", "长衫", "长袍", "圆领袍", "交领袍",
+            "盘领袍", "常服", "公服", "朝服", "制服", "工装", "西装",
+            "衬衫", "外套", "夹克", "风衣", "大氅", "斗篷", "披风",
+            "礼服", "睡衣", "中衣", "襦裙", "道袍", "袈裟", "铠甲",
+            "盔甲", "校服",
+        )
+        return {
+            term for term in terms
+            if term in text
+            and not any(term != other and term in other and other in text
+                        for other in terms)
+        }
+
+    @staticmethod
+    def _wardrobe_states_compatible(expected, actual):
+        """Compare current visible outfits, not biography-style costume prose."""
+        expected = str(expected or "").strip()
+        actual = str(actual or "").strip()
+        if not expected or not actual:
+            return False
+        if expected == actual or expected in actual or actual in expected:
+            return True
+        families = (
+            ("官袍", "公服", "朝服"),
+            ("直裰", "长衫"),
+            ("铠甲", "盔甲"),
+            ("西装",),
+            ("工装", "制服"),
+            ("睡衣", "中衣"),
+            ("大氅", "斗篷", "披风"),
+        )
+        return any(
+            any(token in expected for token in family)
+            and any(token in actual for token in family)
+            for family in families
+        )
+
+    @classmethod
+    def _wardrobe_candidate_score(cls, wardrobe, costume):
+        """Score a mother asset's *outer current look* for wardrobe binding."""
+        target = str(wardrobe or "")
+        candidate = str(costume or "")
+        if not target or not candidate:
+            return 0
+        if ("官袍" in target
+                and re.search(r"脱(?:去|下).{0,8}官袍", candidate)):
+            return 0
+        if ("乌纱" in target
+                and re.search(r"(?:去|摘|未戴).{0,5}乌纱", candidate)):
+            return 0
+        if ("直裰" in target and "官袍" not in target
+                and "官袍" in candidate
+                and not re.search(r"脱(?:去|下).{0,8}官袍", candidate)):
+            # “官袍内衬直裰”是官服造型，不能冒充已脱官袍后的直裰。
+            return 0
+        target_terms = cls._wardrobe_terms(target)
+        candidate_terms = cls._wardrobe_terms(candidate)
+        score = len(target_terms & candidate_terms)
+        if cls._wardrobe_states_compatible(target, candidate):
+            score += 4
+        return score
+
+    def _wardrobe_reference_row(self, project_id, name, wardrobe,
+                                used_uris=None):
+        """Reuse the closest locked mother asset strictly as a wardrobe ref."""
+        target = self._wardrobe_terms(wardrobe)
+        if not target:
+            return None
+        used = {str(value) for value in (used_uris or []) if value}
+        ranked = []
+        for row in self.assets.active_list(
+                project_id, kind="character_candidate"):
+            meta = self._asset_meta(row)
+            if str(meta.get("character") or "") != str(name):
+                continue
+            uri = str(row["uri"] or "")
+            if not uri or uri in used or (
+                    not uri.startswith(("http://", "https://"))
+                    and not Path(uri).exists()):
+                continue
+            quality = self._asset_quality(row)
+            if not formal_reference_allowed(quality):
+                continue
+            look = meta.get("look_variant")
+            look = look if isinstance(look, dict) else {}
+            score = self._wardrobe_candidate_score(
+                wardrobe, look.get("costume"))
+            if score:
+                ranked.append((score, int(row["id"]), row))
+        if ranked:
+            ranked.sort(key=lambda item: (-item[0], -item[1]))
+            return ranked[0][2]
+
+        # If the selected identity look itself matches the current outfit, use
+        # its separately generated costume sheet. This avoids dual-binding one
+        # image as both face identity and wardrobe.
+        locked = self._locked_look_variant(project_id, name)
+        if self._wardrobe_candidate_score(
+                wardrobe, locked.get("costume")):
+            for key in ("costume", "costume_detail"):
+                row = self.assets.latest(
+                    project_id, "character_sheet", f"{name}:{key}")
+                if (row and str(row["uri"] or "") not in used
+                        and formal_reference_allowed(self._asset_quality(row))
+                        and (str(row["uri"]).startswith(
+                            ("http://", "https://"))
+                             or Path(row["uri"]).exists())):
+                    return row
+        return None
+
     def _art_refs(self, ctx, characters, location, shot_no=None,
                   sheet_keys=None, sheet_keys_by_character=None,
-                  spatial_ref="", inner_persona_ref="", prop_names=None):
+                  spatial_ref="", inner_persona_ref="", prop_names=None,
+                  wardrobe_states=None):
         """最终立绘/人物套件/场景图/用户参考 → 真实多图参考输入。
 
         含人物画面缺任何一个最终立绘都直接阻断；禁止静默退化为文字生图。
@@ -6036,11 +6237,24 @@ class Director:
 
         identities = self._identity_references(
             project_id, characters, required=bool(characters))
+        wardrobe_bound_names = set()
         if len(identities) > SHOT_BASE_REFERENCE_LIMIT:
             raise AifosError(
                 f"本镜有 {len(identities)} 位需锁定身份的人物，超过参考图"
                 f"硬上限 {SHOT_BASE_REFERENCE_LIMIT}；请拆分群像镜头")
         for identity in identities:
+            current_wardrobe = str(
+                (wardrobe_states or {}).get(
+                    identity.get("character")) or "").strip()
+            locked_look = self._locked_look_variant(
+                project_id, identity.get("character"))
+            if (current_wardrobe
+                    and self._wardrobe_candidate_score(
+                        current_wardrobe, locked_look.get("costume"))):
+                # One image can safely carry both responsibilities when the
+                # manually selected portrait visibly wears this exact look.
+                identity["wardrobe_lock"] = current_wardrobe
+                wardrobe_bound_names.add(identity.get("character"))
             remember(identity["uri"])
             refs["character_refs"].append(identity["uri"])
             refs["identity_references"].append(identity)
@@ -6117,6 +6331,31 @@ class Director:
                 "reference_role": "prop",
                 "attach_to": name,
             })
+        # Current wardrobe is a separate responsibility from face identity.
+        # Prefer a high-quality existing candidate/sheet that matches the
+        # inherited per-shot wardrobe; bind it as clothes-only so a later
+        # selected portrait outfit cannot overwrite this shot.
+        for name in characters or []:
+            if name in wardrobe_bound_names:
+                continue
+            wardrobe = str(
+                (wardrobe_states or {}).get(name) or "").strip()
+            row = self._wardrobe_reference_row(
+                project_id, name, wardrobe, used_uris)
+            if row is None or not remember(row["uri"]):
+                continue
+            refs["character_refs"].append(row["uri"])
+            refs["asset_matches"].append({
+                "asset_id": row["id"],
+                "kind": "wardrobe_reference",
+                "name": f"{name}:wardrobe",
+                "label": f"{name}当前服装参考",
+                "uri": row["uri"],
+                "reference_role": "wardrobe",
+                "attach_to": name,
+                "wardrobe": wardrobe,
+            })
+            wardrobe_bound_names.add(name)
         # 简化版即使项目历史里已有四视图，也只以人工锁定最终立绘为身份锚，
         # 避免旧扩展资产继续偷偷进入提示词与外部 API 参考图。
         asset_policy = ctx.get("character_asset_policy") or {}
@@ -6129,6 +6368,11 @@ class Director:
         if include_sheets and len(characters or []) <= 2:
             requested_keys = tuple(sheet_keys or ("front",))
             for name in characters or []:
+                if name in wardrobe_bound_names:
+                    # Identity + a current-look wardrobe mother asset already
+                    # cover this actor. A third generic sheet would compete for
+                    # the same role and crowd out user/scene/spatial evidence.
+                    continue
                 per_actor_keys = tuple(
                     (sheet_keys_by_character or {}).get(name)
                     or requested_keys)
@@ -6174,7 +6418,8 @@ class Director:
                     "uri": row["uri"],
                 })
         matched_rows = (self._matching_produced_image_rows(
-            project_id, characters, location, shot_no=shot_no, limit=3)
+            project_id, characters, location, shot_no=shot_no, limit=3,
+            wardrobe_states=wardrobe_states)
             if shot_no is not None else [])
         # 只允许当前分镜合同下已经通过视觉质检的镜头图充当连续性参考。
         # 分镜重排后旧图片仍保存在资产历史中；如果仅按“同人物/同场景”
@@ -6277,8 +6522,8 @@ class Director:
 
     SHOT_CHARACTER_FACT_KEYS = (
         "species", "gender", "sex", "age_range", "identity", "occupation",
-        "hair", "makeup", "costume", "costume_detail", "palette",
-        "accessories", "signature_props", "temperament",
+        "hair", "makeup", "costume", "accessories", "signature_props",
+        "temperament",
     )
 
     def _shot_character_facts(self, ctx, shot):
@@ -6301,11 +6546,32 @@ class Director:
                 **script_profiles.get(name, {}),
                 **self._locked_look_variant(project_id, name),
             }
-            result[name] = {
+            # Identity is locked by the final portrait. The selected candidate
+            # may depict a later story outfit; never flatten that candidate's
+            # costume/makeup/headwear into every shot.
+            current_state = (
+                (shot.get("end_state") or {}).get(name)
+                or (shot.get("start_state") or {}).get(name)
+                or {})
+            facts = {
                 key: copy.deepcopy(merged.get(key))
-                for key in self.SHOT_CHARACTER_FACT_KEYS
+                for key in (
+                    "species", "gender", "sex", "age_range", "identity",
+                    "occupation")
                 if merged.get(key)
             }
+            if current_state.get("wardrobe"):
+                facts["costume"] = str(current_state["wardrobe"])
+            if current_state.get("headwear"):
+                facts["accessories"] = str(current_state["headwear"])
+            if current_state.get("hair_makeup"):
+                facts["hair"] = str(current_state["hair_makeup"])
+            if (current_state.get("prop")
+                    and str(current_state["prop"]) not in ("无", "无道具")):
+                facts["signature_props"] = str(current_state["prop"])
+            if current_state.get("emotion"):
+                facts["temperament"] = str(current_state["emotion"])
+            result[name] = facts
         return result
 
     def _shot_character_visuals(self, ctx, shot, facts=None):
@@ -6397,15 +6663,31 @@ class Director:
                 f"实际可见人形{composition.get('expected_visible_figure_count', len(who))}人；"
                 f"{duties}；{composition.get('count_rule', '')}")
         start_state = shot.get("start_state") or {}
+        def state_line(name, state):
+            details = [
+                str(state.get("position") or ""),
+                str(state.get("pose") or ""),
+                f"朝向{state.get('direction') or ''}",
+            ]
+            for key, label in (
+                    ("wardrobe", "服装"), ("headwear", "头饰"),
+                    ("hair_makeup", "妆发"), ("prop", "道具")):
+                if state.get(key):
+                    details.append(f"{label}{state[key]}")
+            return f"{name}:" + ",".join(value for value in details if value)
         if start_state:
             parts.append("【START STATE】" + "；".join(
-                f"{name}:{state.get('position', '')},"
-                f"{state.get('pose', '')},朝向{state.get('direction', '')}"
+                state_line(name, state)
                 for name, state in start_state.items()))
         # The audit prompt may be verbose, but its action line must remain
         # shot-local too; never inject the raw episode/story prompt as action.
         action = shot.get("description") or shot.get("action") or ""
         parts.append(f"【ACTION】{action or '环境状态保持稳定'}")
+        end_state = shot.get("end_state") or {}
+        if end_state:
+            parts.append("【END STATE】" + "；".join(
+                state_line(name, state)
+                for name, state in end_state.items()))
         dialogue = shot.get("dialogue")
         if (isinstance(dialogue, dict) and dialogue.get("dialogue")
                 and dialogue.get("inner_voice")):
@@ -6603,7 +6885,16 @@ class Director:
                     (spatial or {}).get("spatial_reference_uri", "")
                     if requires_spatial_reference(spatial or {}) else ""),
                 inner_persona_ref=inner_persona_ref,
-                prop_names=self._shot_core_prop_names(ctx, shot)),
+                prop_names=self._shot_core_prop_names(ctx, shot),
+                wardrobe_states={
+                    name: str(
+                        ((shot.get("end_state") or {}).get(name) or {}).get(
+                            "wardrobe")
+                        or ((shot.get("start_state") or {}).get(name) or {}).get(
+                            "wardrobe")
+                        or "")
+                    for name in identity_characters
+                }),
         }
         actor_ids = {
             actor.get("name"): actor.get("actor_id")
@@ -6681,10 +6972,18 @@ class Director:
                 continue
             who = str(ref.get("character") or "角色")
             actor = str(ref.get("actor_id") or f"P{pos:02d}")
-            add(ref["uri"], f"{actor}·{who}最终立绘",
+            wardrobe_lock = str(ref.get("wardrobe_lock") or "").strip()
+            wardrobe_binding = (
+                f"；本图同时是{who}本镜当前服装「{wardrobe_lock}」的"
+                "服装参考，锁定其外层服装结构、材质、配色、鞋履和配饰"
+                if wardrobe_lock else
+                "；不得复制此图的服装")
+            add(ref["uri"], (
+                    f"{actor}·{who}最终立绘兼当前服装参考"
+                    if wardrobe_lock else f"{actor}·{who}最终立绘"),
                 f"只锁定{who}的脸型、五官骨相、年龄、性别表达、发际线、"
-                "发型轮廓、体型与身份标志；不得复制此图的服装、姿势、"
-                "构图、背景或光线，除非本镜另有明确要求；禁止参考他人图片",
+                f"发型轮廓、体型与身份标志{wardrobe_binding}；不得复制姿势、"
+                "构图、背景或光线；禁止参考他人图片",
                 character=who, role="identity",
                 asset_id=ref.get("asset_id"),
                 kind="character_identity")
@@ -6716,7 +7015,10 @@ class Director:
             name = str(match.get("name") or "")
             who = name.split(":", 1)[0] if ":" in name else ""
             sheet = name.split(":", 1)[1] if ":" in name else ""
-            if sheet in ("costume", "costume_detail"):
+            declared_role = str(
+                match.get("reference_role") or "").strip()
+            if (declared_role == "wardrobe"
+                    or sheet in ("wardrobe", "costume", "costume_detail")):
                 binding = (
                     f"只读取{who or '对应人物'}的服装结构、材质、配色、"
                     "鞋履和配饰；不得用此图覆盖脸、年龄、性别、姿势或背景")
@@ -11847,6 +12149,7 @@ class Director:
             hard_fields = (
                 "identity_checked", "identity_match",
                 "gender_checked", "gender_match",
+                "wardrobe_checked", "wardrobe_match",
                 "count_checked", "count_match",
                 "overlay_count_checked", "overlay_count_match",
                 "physical_logic_checked", "physical_logic_match",
@@ -11890,6 +12193,7 @@ class Director:
                     "item_id": item_id,
                     "reason": (
                         "身份/性别/人数/物理空间/参考图绑定属于硬错误，"
+                        "服装/头饰/妆发连续性同样不能人工强行放行；"
                         "不能人工强行放行；请修改本镜后重新质检"),
                     "hard_fields": failed_hard_fields,
                 })

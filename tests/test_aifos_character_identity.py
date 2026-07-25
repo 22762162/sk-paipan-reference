@@ -275,14 +275,21 @@ def test_locked_candidate_becomes_only_identity_reference(app):
         == len(storyboard["shots"][0]["characters"])
     locked_uris = {ref["uri"] for ref in payload["identity_references"]}
     assert locked_uris.issubset(set(payload["character_refs"]))
-    # 后续关键帧不只“看这张脸”，还要继承人工选中候选的默认造型；
-    # 否则 5 选 1 之后又会退回选角前的通用服装/发型文字。
+    # 最终候选只锁身份。服装/头饰/妆发必须服从当前镜头状态，避免把
+    # 候选图中属于其他场次的造型错误扩散到每个镜头。
     for name in storyboard["shots"][0]["characters"]:
         look = app.director._locked_look_variant(project["id"], name)
-        for key in ("hair", "makeup", "costume"):
-            if look.get(key):
-                assert str(look[key]) in payload["prompt"]
-                assert payload["character_background"][name][key] == look[key]
+        state = (
+            storyboard["shots"][0]["end_state"].get(name)
+            or storyboard["shots"][0]["start_state"].get(name)
+            or {})
+        if state.get("wardrobe"):
+            assert str(state["wardrobe"]) in payload["prompt"]
+            assert payload["character_background"][name]["costume"] \
+                == str(state["wardrobe"])
+            if (look.get("costume")
+                    and str(look["costume"]) != str(state["wardrobe"])):
+                assert str(look["costume"]) not in payload["prompt"]
 
 
 def test_missing_identity_blocks_character_generation_and_qc(app):
@@ -338,10 +345,12 @@ def test_visual_qc_requires_identity_ack_and_reuses_signature(app, tmp_path):
             calls.append(payload)
             return ProviderResult(
                 provider="vision", cost=0.2,
-                    data={"pass": True, "identity_checked": True,
-                          "identity_match": True,
-                          "gender_checked": True, "gender_match": True,
-                          "count_checked": True, "count_match": True,
+                        data={"pass": True, "identity_checked": True,
+                              "identity_match": True,
+                              "gender_checked": True, "gender_match": True,
+                              "wardrobe_checked": True,
+                              "wardrobe_match": True,
+                              "count_checked": True, "count_match": True,
                           "physical_logic_checked": True,
                           "physical_logic_match": True,
                           "spatial_logic_checked": True,

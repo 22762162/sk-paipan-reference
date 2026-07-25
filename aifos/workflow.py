@@ -46,6 +46,33 @@ SHOT_FUNCTIONS = {
     "environment": "铺垫", "dialogue": "信息交代", "reaction": "反应",
     "beat": "留白", "physical": "蓄势", "inner_monologue": "内心戏",
 }
+APPEARANCE_STATE_FIELDS = ("wardrobe", "headwear", "hair_makeup")
+APPEARANCE_STATE_VERSION = 1
+APPEARANCE_STATE_ALIASES = {
+    "wardrobe": ("wardrobe", "costume", "clothing", "服装", "衣着"),
+    "headwear": ("headwear", "hat", "头饰", "帽冠", "冠帽"),
+    "hair_makeup": (
+        "hair_makeup", "hair_and_makeup", "styling", "妆发", "发型妆容"),
+}
+WARDROBE_TOKENS = (
+    "官袍", "直裰", "长衫", "长袍", "圆领袍", "交领袍", "盘领袍",
+    "朝服", "常服", "公服", "制服", "工装", "西装", "衬衫", "外套",
+    "夹克", "风衣", "大氅", "斗篷", "披风", "裙", "裤", "铠甲",
+    "盔甲", "校服", "礼服", "睡衣", "中衣", "襦裙", "道袍", "袈裟",
+)
+HEADWEAR_TOKENS = (
+    "乌纱帽", "乌纱", "网巾", "发冠", "头冠", "冠", "帽", "头巾",
+    "头盔", "斗笠", "簪", "钗",
+)
+HAIR_MAKEUP_TOKENS = (
+    "束发", "散发", "披发", "发髻", "短发", "长发", "马尾", "妆容",
+    "素颜", "眼妆", "唇妆", "底妆",
+)
+APPEARANCE_CHANGE_TOKENS = (
+    "换装", "更衣", "换上", "换成", "改穿", "穿上", "套上", "披上",
+    "披着", "已脱", "脱去", "脱下", "褪下", "摘下", "取下",
+    "戴上", "系上", "换",
+)
 
 
 def _rules_from_standard(standard):
@@ -155,6 +182,14 @@ def build_continuity_bible(project, script, profile):
             "identity_anchor": f"{name}角色参考图 + 同名禁令",
             "face_hair_anchor": "继承项目角色参考，不改脸型、发型、发色与年龄感",
             "costume_anchor": "继承本场服装参考，不跨镜换装",
+            "default_wardrobe": str(
+                next((
+                    item.get("costume") for item in (
+                        character.get("visual_variants") or [])
+                    if isinstance(item, dict) and item.get("costume")
+                ), None)
+                or character.get("costume_direction")
+                or ""),
             "signature_prop": character.get("signature_props") or "无",
             "default_position": ["画面左1/3", "画面中", "画面右2/3"][
                 (index - 1) % 3],
@@ -185,8 +220,12 @@ def build_continuity_bible(project, script, profile):
                            if continuity_rules.get(
                                "canonical_entity_names", True)
                            else "按项目自定义命名"),
-        "state_fields": continuity_rules.get(
-            "state_labels", ["姿态", "伤势", "持有道具", "情绪", "朝向关系"]),
+        "state_fields": list(dict.fromkeys([
+            *continuity_rules.get(
+                "state_labels",
+                ["姿态", "伤势", "持有道具", "情绪", "朝向关系"]),
+            "服装", "头饰", "妆发",
+        ])),
         "characters": characters,
         "scenes": scenes,
         "text_policy": {
@@ -329,7 +368,7 @@ def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
 def _state(name, continuity, emotion="专注", pose="站立，重心稳定"):
     anchor = next(
         (c for c in continuity.get("characters", []) if c["name"] == name), {})
-    return {
+    state = {
         "pose": pose,
         "injury": "无伤",
         "prop": anchor.get("signature_prop", "无"),
@@ -337,6 +376,175 @@ def _state(name, continuity, emotion="专注", pose="站立，重心稳定"):
         "direction": "面向本镜主体，视线不越轴",
         "position": anchor.get("default_position", "画面中"),
     }
+    wardrobe = str(anchor.get("default_wardrobe") or "").strip()
+    if wardrobe:
+        state["wardrobe"] = wardrobe
+        headwear = [
+            token for token in HEADWEAR_TOKENS if token in wardrobe
+            and not any(token != other and token in other
+                        for other in HEADWEAR_TOKENS if other in wardrobe)
+        ]
+        state["headwear"] = "、".join(dict.fromkeys(headwear)) or "无"
+    return state
+
+
+def _normalized_explicit_state(value):
+    """Normalize model/user state aliases without discarding unknown fields."""
+    state = copy.deepcopy(value) if isinstance(value, dict) else {}
+    for canonical, aliases in APPEARANCE_STATE_ALIASES.items():
+        if state.get(canonical):
+            continue
+        for alias in aliases:
+            if state.get(alias):
+                state[canonical] = str(state[alias]).strip()
+                break
+    return state
+
+
+def _character_visual_clause(name, text):
+    """Return the current-shot clause that visibly describes ``name``.
+
+    This is a legacy fallback only. New storyboards carry structured
+    wardrobe/headwear/hair_makeup fields. Keeping the fallback narrow lets old
+    saved boards gain continuity without re-running the writer model.
+    """
+    source = str(text or "")
+    if not source or not name:
+        return ""
+    matches = list(re.finditer(re.escape(str(name)), source))
+    if not matches:
+        return ""
+    appearance_tokens = (
+        *WARDROBE_TOKENS, *HEADWEAR_TOKENS, *HAIR_MAKEUP_TOKENS,
+    )
+    for match in matches:
+        tail = source[match.start():match.start() + 96]
+        # A comma normally starts another actor or a new visual fact. Keep the
+        # first actor-local phrase only so another character's outfit can never
+        # be recorded as this actor's wardrobe.
+        clause = re.split(r"[，,。；\n]", tail, maxsplit=1)[0]
+        if any(token in clause for token in appearance_tokens):
+            return clause.strip(" ，,；。")
+    return ""
+
+
+def _visible_appearance(name, text, explicit=None):
+    explicit = _normalized_explicit_state(explicit)
+    result = {
+        field: str(explicit.get(field) or "").strip()
+        for field in APPEARANCE_STATE_FIELDS
+        if str(explicit.get(field) or "").strip()
+    }
+    clause = _character_visual_clause(name, text)
+    if not clause:
+        return result
+    if not result.get("wardrobe") and any(
+            token in clause for token in WARDROBE_TOKENS):
+        wardrobe = clause
+        if wardrobe.startswith(str(name)):
+            wardrobe = wardrobe[len(str(name)):]
+        # For a legacy unstructured change such as
+        # “已脱官袍披旧月白直裰”, retain the new visible look after the final
+        # donning verb, not both the removed and newly worn outfits.
+        markers = (
+            "换上", "换成", "改穿", "穿上", "套上", "披上", "披着",
+            "戴上", "换", "身穿", "穿", "披",
+        )
+        marker_hits = [
+            (wardrobe.rfind(marker), marker)
+            for marker in markers if marker in wardrobe
+        ]
+        if marker_hits:
+            index, marker = max(marker_hits, key=lambda item: item[0])
+            wardrobe = wardrobe[index + len(marker):]
+        ends = [
+            wardrobe.find(token) + len(token)
+            for token in (*WARDROBE_TOKENS, *HEADWEAR_TOKENS)
+            if token in wardrobe
+        ]
+        if ends:
+            wardrobe = wardrobe[:max(ends)]
+        result["wardrobe"] = wardrobe.strip(" ，,；。、")
+    if not result.get("headwear"):
+        headwear = list(dict.fromkeys(
+            token for token in HEADWEAR_TOKENS if token in clause))
+        if headwear:
+            # Prefer precise tokens over their substrings (乌纱帽 > 乌纱 > 帽).
+            headwear = [
+                token for token in headwear
+                if not any(token != other and token in other
+                           for other in headwear)
+            ]
+            result["headwear"] = "、".join(headwear)
+        elif (_appearance_transition(name, clause)
+              and any(token in clause for token in HAIR_MAKEUP_TOKENS)):
+            result["headwear"] = "无外戴帽冠（按本镜束发/妆发状态）"
+    if not result.get("hair_makeup") and any(
+            token in clause for token in HAIR_MAKEUP_TOKENS):
+        result["hair_makeup"] = clause
+    return result
+
+
+def _appearance_transition(name, text):
+    clause = _character_visual_clause(name, text)
+    return bool(clause and any(
+        token in clause for token in APPEARANCE_CHANGE_TOKENS))
+
+
+def _appearance_signature(value):
+    text = str(value or "")
+    return {
+        token for token in (*WARDROBE_TOKENS, *HEADWEAR_TOKENS)
+        if token in text
+    }
+
+
+def _appearance_conflicts(previous, current):
+    """Only call two explicit looks different when their garment anchors clash."""
+    previous_terms = _appearance_signature(previous)
+    current_terms = _appearance_signature(current)
+    return bool(
+        previous_terms and current_terms
+        and previous_terms.isdisjoint(current_terms))
+
+
+def _merge_shot_state(name, continuity, explicit, text, *, previous=None,
+                      emotion="专注", ending=False, scene_changed=False):
+    """Merge pose/prop state with an inherited, transition-aware appearance."""
+    declared = _normalized_explicit_state(explicit)
+    inherited = copy.deepcopy(previous or {})
+    if declared:
+        state = _shot_state(
+            name, continuity, text, previous=inherited,
+            emotion=emotion, ending=ending)
+        state.update(declared)
+    else:
+        state = _shot_state(
+            name, continuity, text, previous=inherited,
+            emotion=emotion, ending=ending)
+
+    current = _visible_appearance(name, text, declared)
+    transition = _appearance_transition(name, text)
+    for field in APPEARANCE_STATE_FIELDS:
+        prior_value = str(inherited.get(field) or "").strip()
+        current_value = str(current.get(field) or "").strip()
+        declared_value = str(declared.get(field) or "").strip()
+        if transition and not ending and prior_value and not scene_changed:
+            # A visible change starts in the inherited look and finishes in the
+            # declared/current look.
+            state[field] = prior_value
+        elif declared_value:
+            state[field] = declared_value
+        elif current_value and (
+                not prior_value or scene_changed or transition):
+            state[field] = current_value
+        elif prior_value:
+            # Within one continuous scene, clothes may change only through a
+            # declared visible transition. The inherited state is authoritative.
+            state[field] = prior_value
+        elif current_value:
+            state[field] = current_value
+    return state
 
 
 def _visible_pose(text, fallback="保持当前可见姿态"):
@@ -753,6 +961,9 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
     prev_scene_no = None
     for index, raw in enumerate(raw_shots, 1):
         scene = scenes.get(raw.get("scene_no"), {})
+        scene_changed = (
+            prev_scene_no is None or raw.get("scene_no") != prev_scene_no)
+        previous_before_shot = copy.deepcopy(previous)
         kind = raw.get("kind") or ("dialogue" if raw.get("dialogue") else "environment")
         characters = list(dict.fromkeys(raw.get("characters", [])))
         narrative_overlays = [
@@ -773,7 +984,7 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
                     scene.get("characters", []),
                     raw.get("timeline_state", "unknown"),
                     inner_policy)[:1]
-        action_text = " ".join(str(value or "") for value in (
+        action_text = "；".join(str(value or "") for value in (
             raw.get("description"), raw.get("physical_logic"),
             raw.get("prompt")))
         declared_start = raw.get("start_state")
@@ -782,12 +993,10 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
         start_state = {}
         for name in characters:
             explicit_state = declared_start.get(name)
-            if isinstance(explicit_state, dict) and explicit_state:
-                start_state[name] = copy.deepcopy(explicit_state)
-            else:
-                start_state[name] = _shot_state(
-                    name, continuity, action_text,
-                    previous=previous.get(name), emotion="专注")
+            start_state[name] = _merge_shot_state(
+                name, continuity, explicit_state, action_text,
+                previous=previous.get(name), emotion="专注",
+                scene_changed=scene_changed)
         emotion = "消化信息" if kind == "reaction" else (
             "情绪余波" if kind == "beat" else "推进事件")
         declared_end = raw.get("end_state")
@@ -796,17 +1005,29 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
         end_state = {}
         for name in characters:
             explicit_state = declared_end.get(name)
-            if isinstance(explicit_state, dict) and explicit_state:
-                end_state[name] = copy.deepcopy(explicit_state)
-            elif kind in ("reaction", "beat"):
-                end_state[name] = _state(
+            if not explicit_state and kind in ("reaction", "beat"):
+                explicit_state = _state(
                     name, continuity, emotion=emotion,
                     pose="保持原位，完成眼神与呼吸变化")
-            else:
-                end_state[name] = _shot_state(
-                    name, continuity, action_text,
-                    previous=start_state.get(name), emotion=emotion,
-                    ending=True)
+            end_state[name] = _merge_shot_state(
+                name, continuity, explicit_state, action_text,
+                previous=start_state.get(name), emotion=emotion,
+                ending=True, scene_changed=scene_changed)
+        appearance_continuity_issues = []
+        if not scene_changed:
+            for name in characters:
+                inherited = previous_before_shot.get(name) or {}
+                current = _visible_appearance(
+                    name, action_text,
+                    (declared_start.get(name)
+                     if isinstance(declared_start.get(name), dict) else None))
+                if (_appearance_conflicts(
+                        inherited.get("wardrobe"),
+                        current.get("wardrobe"))
+                        and not _appearance_transition(name, action_text)):
+                    appearance_continuity_issues.append(
+                        f"{name}本镜声明服装与上一镜不一致，且没有换装动作；"
+                        "已继续继承上一镜服装")
         previous.update(copy.deepcopy(end_state))
         camera = _camera_plan(
             raw.get("camera", ""), kind, index, rules,
@@ -940,6 +1161,8 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             "shot_function": SHOT_FUNCTIONS.get(kind, "信息交代"),
             "start_state": start_state,
             "end_state": end_state,
+            "appearance_state_required": True,
+            "appearance_continuity_issues": appearance_continuity_issues,
             "script_reference": script_reference,
             "readable_text": text_asset,
             "visual_hook": visual_hook,
@@ -990,6 +1213,7 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
     return {
         "episode_title": storyboard.get("episode_title", script.get("episode_title", "")),
         "pipeline_version": PIPELINE_VERSION,
+        "appearance_state_version": APPEARANCE_STATE_VERSION,
         "profile": copy.deepcopy(profile),
         "standard_fingerprint": profile.get("standard_fingerprint", ""),
         "total_duration": elapsed,
@@ -1001,6 +1225,99 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
         "inner_persona_policy": copy.deepcopy(inner_policy),
         "shots": shots,
     }
+
+
+def repair_storyboard_appearance_continuity(storyboard, continuity,
+                                             script=None):
+    """Upgrade a saved storyboard without re-running or expanding its shots.
+
+    Only structured appearance state and the derived compact prompt are
+    changed. Existing shot numbers, dialogue, timing, camera and assets remain
+    untouched, so a reused episode can be repaired without regenerating the
+    whole storyboard.
+    """
+    repaired = copy.deepcopy(storyboard or {})
+    if repaired.get("appearance_state_version") == APPEARANCE_STATE_VERSION:
+        return repaired
+    continuity = copy.deepcopy(continuity or {})
+    script_characters = {
+        item.get("name"): item
+        for item in (script or {}).get("characters", [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    for character in continuity.get("characters", []):
+        if character.get("default_wardrobe"):
+            continue
+        source = script_characters.get(character.get("name")) or {}
+        character["default_wardrobe"] = str(
+            next((
+                item.get("costume") for item in (
+                    source.get("visual_variants") or [])
+                if isinstance(item, dict) and item.get("costume")
+            ), None)
+            or source.get("costume_direction")
+            or "")
+    previous = {}
+    previous_scene = None
+    for shot in repaired.get("shots", []):
+        characters = list(dict.fromkeys(shot.get("characters") or []))
+        scene_no = shot.get("scene_no")
+        scene_changed = previous_scene is None or scene_no != previous_scene
+        before = copy.deepcopy(previous)
+        action_text = "；".join(str(value or "") for value in (
+            shot.get("description"), shot.get("action"), shot.get("prompt")))
+        declared_start = (
+            shot.get("start_state")
+            if isinstance(shot.get("start_state"), dict) else {})
+        declared_end = (
+            shot.get("end_state")
+            if isinstance(shot.get("end_state"), dict) else {})
+        start_state, end_state = {}, {}
+        for name in characters:
+            start_state[name] = _merge_shot_state(
+                name, continuity, declared_start.get(name), action_text,
+                previous=before.get(name), emotion="专注",
+                scene_changed=scene_changed)
+            end_state[name] = _merge_shot_state(
+                name, continuity, declared_end.get(name), action_text,
+                previous=start_state[name], emotion=(
+                    (declared_end.get(name) or {}).get("emotion")
+                    if isinstance(declared_end.get(name), dict)
+                    else "推进事件"),
+                ending=True, scene_changed=scene_changed)
+        issues = []
+        if not scene_changed:
+            for name in characters:
+                current = _visible_appearance(
+                    name, action_text, declared_start.get(name))
+                if (_appearance_conflicts(
+                        (before.get(name) or {}).get("wardrobe"),
+                        current.get("wardrobe"))
+                        and not _appearance_transition(name, action_text)):
+                    issues.append(
+                        f"{name}本镜声明服装与上一镜不一致，且没有换装动作；"
+                        "已继续继承上一镜服装")
+        shot["start_state"] = start_state
+        shot["end_state"] = end_state
+        shot["appearance_state_required"] = True
+        shot["appearance_continuity_issues"] = issues
+        previous.update(copy.deepcopy(end_state))
+        previous_scene = scene_no
+        style = str(
+            ((shot.get("prompt_contract") or {}).get("style")
+             if isinstance(shot.get("prompt_contract"), dict) else "")
+            or "")
+        contract, compact = compile_shot_prompt(
+            shot, location=str(
+                shot.get("location")
+                or ((shot.get("prompt_contract") or {}).get("scene")
+                    if isinstance(shot.get("prompt_contract"), dict) else "")
+                or ""),
+            style=style, mode="video")
+        shot["prompt_contract"] = contract
+        shot["seedance_prompt_compact"] = compact
+    repaired["appearance_state_version"] = APPEARANCE_STATE_VERSION
+    return repaired
 
 
 def lock_text_assets(storyboard, image_uris, provider_name):
@@ -1236,6 +1553,20 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
         else "所有正式角色最终立绘、核心道具及完整四视图/细节母资产已锁定"
         if character_assets_ok
         else "人物最终立绘、核心道具或当前人物资产模式要求的母资产尚未齐全")
+    appearance_issues = [
+        str(issue)
+        for shot in shots
+        for issue in (shot.get("appearance_continuity_issues") or [])
+        if str(issue).strip()
+    ]
+    appearance_complete = all(
+        all(
+            str(((shot.get(state_key) or {}).get(name) or {}).get(
+                "wardrobe") or "").strip()
+            for state_key in ("start_state", "end_state"))
+        for shot in shots
+        for name in (shot.get("characters") or []))
+    appearance_ok = appearance_complete and not appearance_issues
     available_gates = [
         _gate("script_bible", "剧本第一道总闸门与制作圣经",
               script_gate_error is None,
@@ -1248,8 +1579,14 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
             character_assets_ok, character_assets_detail),
         _gate("continuity", "连续性圣经", bool(continuity.get("characters"))
               and bool(continuity.get("scenes"))
+              and appearance_ok
               and continuity.get("standard_fingerprint") == profile.get(
-                  "standard_fingerprint"), "角色、场景、文字规则与本集标准已锁定"),
+                  "standard_fingerprint"),
+              ("角色、场景、文字、服装、头饰与妆发连续性已锁定"
+               if appearance_ok else
+               "存在无过渡换装或镜头缺少服装状态:"
+               + ("；".join(appearance_issues[:3])
+                  if appearance_issues else "请补齐逐角色首尾服装状态"))),
         _gate("spatial", "空间调度图", spatial_ok,
               f"{blocking.get('summary', {}).get('scenes', 0)} 场 / "
               f"{blocking.get('summary', {}).get('shots', 0)} 镜已锁定人物走位、"

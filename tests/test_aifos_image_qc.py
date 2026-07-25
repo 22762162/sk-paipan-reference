@@ -100,6 +100,33 @@ def test_qc_keeps_broken_input_contract_advisory_when_image_is_correct(app):
     assert validate_image_qc({"issues": []}) == "缺少 pass 字段"
 
 
+def test_qc_treats_visible_wardrobe_drift_as_hard_failure(app):
+    report = app.director._assess_image_qc({
+        "identity_required": False,
+        "gender_required": False,
+        "wardrobe_required": True,
+        "expected_wardrobe": {"沈砚": "青官袍、乌纱帽"},
+        "count_required": True,
+        "count": 1,
+        "physical_logic_required": False,
+    }, {
+        "pass": True,
+        "visual_pass": True,
+        "input_contract_pass": True,
+        "wardrobe_checked": True,
+        "wardrobe_match": False,
+        "count_checked": True,
+        "count_match": True,
+        "issues": ["沈砚从青官袍变成旧月白直裰"],
+    }, attempts=1)
+
+    assert report["passed"] is False
+    assert report["hard_failure"] is True
+    assert report["wardrobe_checked"] is True
+    assert report["wardrobe_match"] is False
+    assert report["redraw_required"] is True
+
+
 def test_plan_read_drops_legacy_qc_only_from_initial_assets(app, tmp_path):
     ctx = {"out_root": tmp_path / "episode"}
     app.director._plan_write(ctx, {"items": [

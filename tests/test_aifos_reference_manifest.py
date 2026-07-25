@@ -1,5 +1,7 @@
 """参考图对照表:出图前就写死"谁参考哪张图",编号与提交顺序一致。"""
 
+import json
+
 import pytest
 
 from aifos.adapters.codex_image import build_instruction
@@ -68,6 +70,17 @@ def test_prompt_carries_numbered_reference_binding(app):
         assert entry is not None, f"{name} 没有对应的参考图绑定"
         assert name in entry["binding"]
         assert f"图{entry['index']}={entry['label']}" in prompt
+    wardrobe_entries = [
+        item for item in manifest if item.get("role") == "wardrobe"]
+    combined_entries = [
+        item for item in manifest
+        if "兼当前服装参考" in item.get("label", "")]
+    assert wardrobe_entries or combined_entries, \
+        "当前服装状态没有绑定服装参考职责"
+    assert all("不得用此图覆盖脸" in item["binding"]
+               for item in wardrobe_entries)
+    assert all("本镜当前服装" in item["binding"]
+               for item in combined_entries)
 
 
 def test_later_qc_prefers_immutable_generation_snapshot(app):
@@ -170,18 +183,57 @@ def test_prompt_details_keep_visible_costume_but_not_full_scene_plot(app):
     prompt = payload["prompt"]
     hero = shot["characters"][0]
     design = app.director._character_design(project["id"], hero) or {}
-    # 妆容/配饰/发型等身份细节由锁定立绘图提供;文字侧必须写清
-    # 服装、服装细节与配色(锁定后允许保留的服装语义字段)
-    for key, label in (("costume", "服装"),
-                       ("costume_detail", "服装细节"),
-                       ("palette", "配色")):
-        if str(design.get(key) or "").strip():
-            assert label in prompt, f"提示词缺少{label}"
+    current = payload["character_background"][hero].get("costume")
+    assert current and current in prompt
+    assert "服装:" in prompt
+    # 人物总设定可能包含后续场次的服装细节/配色；当前镜头只允许当前
+    # wardrobe_state，不能把多套造型重新拍扁进提示词。
+    for key in ("costume_detail", "palette"):
+        value = str(design.get(key) or "").strip()
+        if value and value != current:
+            assert value not in prompt
     # 整场剧情动作可能覆盖多个镜头，不能重复塞进当前关键帧提示词。
     scene = next(s for s in script["scenes"]
                  if s["scene_no"] == shot["scene_no"])
     if str(scene.get("action") or "").strip():
         assert "本场情境" not in prompt
+
+
+def test_selected_later_outfit_cannot_pollute_current_shot(app, monkeypatch):
+    monkeypatch.setattr(
+        app.director, "_character_design",
+        lambda _project_id, _name: {
+            "species": "人类", "gender": "男",
+            "costume": "青官袍乌纱", "temperament": "谨慎",
+        })
+    monkeypatch.setattr(
+        app.director, "_locked_look_variant",
+        lambda _project_id, _name: {
+            "costume": "脱官袍披旧月白直裰，去乌纱仅留网巾",
+            "temperament": "夜探书房相",
+        })
+    shot = {
+        "characters": ["沈砚"],
+        "start_state": {"沈砚": {
+            "wardrobe": "青官袍乌纱", "headwear": "乌纱帽",
+            "emotion": "镇定内紧", "prop": "鱼符藏左袖",
+        }},
+        "end_state": {"沈砚": {
+            "wardrobe": "青官袍乌纱", "headwear": "乌纱帽",
+            "emotion": "镇定内紧", "prop": "鱼符藏左袖",
+        }},
+    }
+    ctx = {
+        "project": {"id": 1},
+        "script": {"characters": [{"name": "沈砚", "occupation": "知县"}]},
+    }
+
+    facts = app.director._shot_character_facts(ctx, shot)["沈砚"]
+    assert facts["costume"] == "青官袍乌纱"
+    assert facts["accessories"] == "乌纱帽"
+    assert facts["temperament"] == "镇定内紧"
+    assert "旧月白直裰" not in json.dumps(facts, ensure_ascii=False)
+    assert "夜探书房相" not in json.dumps(facts, ensure_ascii=False)
 
 
 def test_shot_provider_prompt_contains_current_frame_only(app):
@@ -322,6 +374,37 @@ def test_continuity_reference_requires_exact_character_set(app, tmp_path):
     ids = {row["id"] for row in matched}
     assert single_row["id"] in ids
     assert group_row["id"] not in ids
+
+
+def test_legacy_continuity_image_cannot_pollute_current_wardrobe(
+        app, tmp_path):
+    project, _ = app.projects.get_or_create_project("服装连续性参考测试")
+    legacy = tmp_path / "legacy-white.png"
+    official = tmp_path / "official.png"
+    legacy.write_bytes(PNG)
+    official.write_bytes(PNG)
+    legacy_row = app.assets.register(
+        project["id"], "image", "legacy",
+        uri=str(legacy), meta={
+            "characters": ["沈砚"], "location": "县衙公堂",
+            "image_quality": "medium",
+        })
+    official_row = app.assets.register(
+        project["id"], "image", "official",
+        uri=str(official), meta={
+            "characters": ["沈砚"], "location": "县衙公堂",
+            "image_quality": "medium",
+            "appearance_state": {
+                "沈砚": {"wardrobe": "青官袍乌纱", "headwear": "乌纱"},
+            },
+        })
+
+    matched = app.director._matching_produced_image_rows(
+        project["id"], ["沈砚"], "县衙公堂",
+        wardrobe_states={"沈砚": "官袍"})
+    ids = {row["id"] for row in matched}
+    assert official_row["id"] in ids
+    assert legacy_row["id"] not in ids
 
 
 def test_spatial_diagram_is_uploaded_for_keyframe_with_single_role(
