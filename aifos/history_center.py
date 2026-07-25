@@ -2,10 +2,18 @@
 
 import json
 import re
+from pathlib import Path
 
 from .asset_center import AssetCenter, IMAGE_KINDS
 from .db import now
 
+
+DERIVED_VISUAL_STATE_KINDS = {
+    "character",
+    "scene",
+    "character_identity",
+    "style_anchor",
+}
 
 STABLE_EPISODE_STATUSES = {
     "done", "failed", "qc_failed", "created",
@@ -27,8 +35,43 @@ class HistoryCenter:
     shown to operators after reloads and server restarts.
     """
 
-    def __init__(self, db):
+    def __init__(self, db, artifacts_root=None):
         self.db = db
+        self.artifacts_root = (
+            Path(artifacts_root).resolve() if artifacts_root else None)
+
+    def _archive_episode_runtime_state(self, project_id, episode_id,
+                                       episode_number):
+        """移走会污染同编号新作品的活动清单，生成文件本身仍原地保留。"""
+        if self.artifacts_root is None:
+            return {"count": 0, "archive_dir": ""}
+        episode_dir = (
+            self.artifacts_root / f"p{int(project_id):03d}"
+            / f"e{int(episode_number):03d}")
+        if not episode_dir.is_dir():
+            return {"count": 0, "archive_dir": ""}
+        names = (
+            "render_plan.json",
+            "summary.json",
+            "qc_report.json",
+            "video_qc_report.json",
+            "relations.json",
+            "delivery_verify.json",
+        )
+        existing = [episode_dir / name for name in names
+                    if (episode_dir / name).is_file()]
+        if not existing:
+            return {"count": 0, "archive_dir": ""}
+        archive_dir = (
+            episode_dir / ".history"
+            / f"deleted-episode-{int(episode_id)}-{int(now() * 1000)}")
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for path in existing:
+            path.replace(archive_dir / path.name)
+        return {
+            "count": len(existing),
+            "archive_dir": str(archive_dir),
+        }
 
     def create_run(self, project_title, episode_number, action="produce",
                    force=False, request=None, source="web"):
@@ -385,8 +428,9 @@ class HistoryCenter:
         assets_deleted = 0
         if delete_assets:
             center = AssetCenter(self.db)
+            deletable_kinds = set(IMAGE_KINDS) | DERIVED_VISUAL_STATE_KINDS
             for asset in center.active_list(project_id):
-                if asset["kind"] not in IMAGE_KINDS:
+                if asset["kind"] not in deletable_kinds:
                     continue
                 meta = center.meta(asset)
                 source_id = meta.get("source_episode_id")
@@ -406,6 +450,9 @@ class HistoryCenter:
                             "deleted_episode_number": episode_number,
                         })
                     assets_deleted += int(deleted is not None)
+
+        archived_state = self._archive_episode_runtime_state(
+            project_id, episode_id, episode_number)
 
         batch_ids = [row["batch_id"] for row in self.db.query(
             "SELECT DISTINCT batch_id FROM series_batch_items WHERE episode_id=?",
@@ -443,5 +490,7 @@ class HistoryCenter:
             "assets_requested": bool(delete_assets),
             "assets_soft_deleted": assets_deleted,
             "asset_files_preserved": True,
+            "runtime_state_archived": archived_state["count"],
+            "runtime_state_archive_dir": archived_state["archive_dir"],
             "project_retained": True,
         }

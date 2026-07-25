@@ -110,16 +110,92 @@ def test_delete_single_episode_can_soft_delete_all_visible_project_images(tmp_pa
         run_id = app.history.create_run("单集全删图片", 1)
         portrait, portrait_path = _image(
             app, project["id"], "character_art", "林昭", "portrait.png")
+        identity, _ = _image(
+            app, project["id"], "character_identity", "林昭",
+            "identity.png", {"locked": True, "image_quality": "high"})
+        character = app.assets.register(
+            project["id"], "character", "林昭",
+            meta={"design": {"appearance": "旧人物设定"}})
+        style_anchor, _ = _image(
+            app, project["id"], "style_anchor", "project",
+            "style-anchor.png")
         reference, reference_path = _image(
             app, project["id"], "reference", "造型参考", "reference.png")
+        episode_dir = (
+            app.workspace.artifacts_dir
+            / f"p{project['id']:03d}" / "e001")
+        episode_dir.mkdir(parents=True, exist_ok=True)
+        plan_path = episode_dir / "render_plan.json"
+        plan_path.write_text(
+            '{"items":[{"id":"char:林昭","status":"reused"}]}',
+            encoding="utf-8")
 
         result = app.history.delete_work(run_id, delete_assets=True)
 
-        assert result["assets_soft_deleted"] == 2
+        assert result["assets_soft_deleted"] == 5
         assert app.assets.latest(
             project["id"], portrait["kind"], portrait["name"]) is None
         assert app.assets.latest(
+            project["id"], identity["kind"], identity["name"]) is None
+        assert app.assets.latest(
+            project["id"], character["kind"], character["name"]) is None
+        assert app.assets.latest(
+            project["id"], style_anchor["kind"], style_anchor["name"]) is None
+        assert app.assets.latest(
             project["id"], reference["kind"], reference["name"]) is None
         assert portrait_path.exists() and reference_path.exists()
+        assert result["runtime_state_archived"] == 1
+        assert not plan_path.exists()
+        assert list(
+            (episode_dir / ".history").glob(
+                "deleted-episode-*/render_plan.json"))
+    finally:
+        app.close()
+
+
+def test_force_rebuild_archives_old_runtime_state_before_new_plan(tmp_path):
+    app = App(tmp_path / "ws")
+    try:
+        project, _ = app.projects.get_or_create_project("强制重生清单")
+        episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+        ctx = {
+            "project": dict(project),
+            "episode": dict(episode),
+            "out_root": (
+                app.workspace.artifacts_dir
+                / f"p{project['id']:03d}" / "e001"),
+            "force": True,
+        }
+        ctx["out_root"].mkdir(parents=True, exist_ok=True)
+        plan_path = ctx["out_root"] / "render_plan.json"
+        plan_path.write_text(
+            '{"items":[{"id":"char:林昭","category":"character_art",'
+            '"status":"reused","output_uri":"/tmp/old.png"}]}',
+            encoding="utf-8")
+        summary_path = ctx["out_root"] / "summary.json"
+        summary_path.write_text(
+            '{"status":"awaiting_script"}', encoding="utf-8")
+
+        archived = app.director._archive_force_rebuild_state(ctx)
+        app.director._plan_seed(ctx, "character_art", [{
+            "id": "char:林昭",
+            "category": "character_art",
+            "label": "林昭",
+            "prompt": "新人物提示词",
+        }])
+
+        plan = app.director._plan_read(ctx)
+        rebuilt = next(row for row in plan["items"]
+                       if row["id"] == "char:林昭")
+        assert rebuilt["status"] == "pending"
+        assert "output_uri" not in rebuilt
+        assert archived["count"] == 2
+        assert not summary_path.exists()
+        assert list(
+            (ctx["out_root"] / ".history").glob(
+                "force-rebuild-*/render_plan.json"))
+        assert list(
+            (ctx["out_root"] / ".history").glob(
+                "force-rebuild-*/summary.json"))
     finally:
         app.close()

@@ -678,6 +678,8 @@ class Director:
                 episode["id"], persist=True),
             "run_id": run_id,
         }
+        if force:
+            self._archive_force_rebuild_state(ctx)
         stage_reports = []
         failed = False
         paused = ""
@@ -1489,6 +1491,36 @@ class Director:
 
     def _plan_path(self, ctx):
         return ctx["out_root"] / "render_plan.json"
+
+    def _archive_force_rebuild_state(self, ctx):
+        """全量重生先隔离旧运行清单，不能让旧状态冒充本轮复用结果。"""
+        out_root = ctx["out_root"]
+        names = (
+            "render_plan.json",
+            "summary.json",
+            "qc_report.json",
+            "video_qc_report.json",
+            "relations.json",
+            "delivery_verify.json",
+        )
+        existing = [out_root / name for name in names
+                    if (out_root / name).is_file()]
+        if not existing:
+            return {"count": 0, "archive_dir": ""}
+        archive_dir = (
+            out_root / ".history"
+            / f"force-rebuild-{int(now() * 1000)}")
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for path in existing:
+            path.replace(archive_dir / path.name)
+        self.log.info(
+            "director",
+            f"全部重新生成已隔离 {len(existing)} 个旧运行状态文件；"
+            "旧图片只作历史保留，不会冒充本轮完成项")
+        return {
+            "count": len(existing),
+            "archive_dir": str(archive_dir),
+        }
 
     def _plan_read(self, ctx):
         with _PLAN_IO_LOCK:

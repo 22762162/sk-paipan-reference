@@ -44,7 +44,8 @@ class App:
         self.config = Config.load(
             self.workspace.config_path, overrides=config_overrides)
         self.db = Database(self.workspace.db_path)
-        self.history = HistoryCenter(self.db)
+        self.history = HistoryCenter(
+            self.db, artifacts_root=self.workspace.artifacts_dir)
         self.standards = StandardCenter(self.db, self.config)
         self.logger = Logger(self.db, self.workspace.logs_dir, echo=echo_logs)
         self.system = SystemCenter(self.db, self.logger)
