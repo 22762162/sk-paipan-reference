@@ -105,16 +105,21 @@ class ProjectCenter:
 
     # ---- 剧本 / 分镜文档(版本化) ----
     def save_document(self, episode_id, kind, content):
-        row = self.db.query_one(
-            "SELECT MAX(version) AS v FROM documents "
-            "WHERE episode_id=? AND kind=?", (episode_id, kind))
-        version = (row["v"] or 0) + 1
-        self.db.execute(
-            "INSERT INTO documents(episode_id, kind, version, content, "
-            "created_at) VALUES(?,?,?,?,?)",
-            (episode_id, kind, version,
-             json.dumps(content, ensure_ascii=False), now()),
-        )
+        # Parallel image workers can persist the same quality/continuity
+        # document at once. Allocate and insert the next version inside one
+        # transaction so two workers cannot choose the same version number.
+        with self.db.transaction(immediate=True) as conn:
+            row = conn.execute(
+                "SELECT MAX(version) AS v FROM documents "
+                "WHERE episode_id=? AND kind=?", (episode_id, kind)
+            ).fetchone()
+            version = (row["v"] or 0) + 1
+            conn.execute(
+                "INSERT INTO documents(episode_id, kind, version, content, "
+                "created_at) VALUES(?,?,?,?,?)",
+                (episode_id, kind, version,
+                 json.dumps(content, ensure_ascii=False), now()),
+            )
         return version
 
     def save_document_cas(self, episode_id, kind, content,
