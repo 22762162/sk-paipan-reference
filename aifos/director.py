@@ -2639,6 +2639,9 @@ class Director:
                     "reference_manifest": generation_input[
                         "reference_manifest"],
                 }
+                if payload.get("_codex_profile"):
+                    qc_payload["_codex_profile"] = payload[
+                        "_codex_profile"]
                 qc_result = self.router.call(
                     "image_qc", qc_payload, out_dir,
                     cancel=cancel)
@@ -2935,12 +2938,19 @@ class Director:
         return result
 
     def _parallel_workers(self):
+        """每个图片生产通道允许的并行任务数。"""
         try:
             workers = int(self.config.get(
                 "defaults", "parallel_images", default=3))
         except (TypeError, ValueError):
             workers = 3
         return max(1, min(workers, 8))
+
+    def _total_image_workers(self):
+        """图片总并行数：每通道路数 × 可用生产通道数。"""
+        per_channel = self._parallel_workers()
+        profiles = self._codex_parallel_profiles()
+        return per_channel * len(profiles) if profiles else per_channel
 
     def _codex_parallel_profiles(self):
         """返回可安全用于本批图片的 Codex 登录态配置。"""
@@ -3020,14 +3030,9 @@ class Director:
         self._prepare_dispatch_contracts(ctx, tasks)
         tasks = sorted(tasks, key=lambda task: (
             -int(task.get("priority", 0)), str(task.get("item_id", ""))))
-        workers = self._parallel_workers()
-        # When two independent Codex logins are ready, they are the effective
-        # image-production ceiling.  Do not create eight queued subprocess
-        # workers just because the generic image slot setting is eight; that
-        # would make the UI and the actual provider concurrency disagree.
-        codex_profiles = self._codex_parallel_profiles()
-        if codex_profiles:
-            workers = min(workers, len(codex_profiles))
+        # parallel_images 表示每条通道的容量，不是所有通道合计容量：
+        # 单 Codex 通道 8 路，Codex A+B 两条通道合计 16 路。
+        workers = self._total_image_workers()
         if workers == 1 or len(tasks) == 1:
             out, qc_failures = {}, []
             for task in tasks:
@@ -10048,8 +10053,7 @@ class Director:
 
         profiles = self._codex_parallel_profiles()
         workers = min(
-            max(1, self._parallel_workers()),
-            len(profiles) if profiles else 1,
+            max(1, self._total_image_workers()),
             max(1, len(items)))
         prepared = []
         for item in items:
@@ -10375,12 +10379,10 @@ class Director:
         try:
             # Each worker owns an App/Director so mutable per-task accounting
             # (cost, provider set, context and router state) cannot leak across
-            # images.  Profiles are assigned round-robin; with Codex A+B this
-            # gives two genuinely independent CLI processes.
+            # images. Profiles are assigned round-robin；每个 Codex 通道可按
+            # parallel_images 并行，A+B 的总容量为每通道容量的两倍。
             profiles = self._codex_parallel_profiles()
-            parallel_workers = self._parallel_workers()
-            if profiles:
-                parallel_workers = min(parallel_workers, len(profiles))
+            parallel_workers = self._total_image_workers()
             parallel_workers = max(1, min(parallel_workers, total))
             storyboard, _ = self.projects.latest_document(
                 episode["id"], "storyboard")

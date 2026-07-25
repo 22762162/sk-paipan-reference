@@ -43,6 +43,25 @@ def test_director_assigns_ready_profiles_round_robin(tmp_path):
         app.close()
 
 
+def test_dual_codex_channels_each_contribute_eight_workers(tmp_path):
+    profiles, _home_a, _home_b = _profiles(tmp_path)
+    app = App(tmp_path / "ws", config_overrides={
+        "defaults": {"parallel_images": 8},
+        "codex_parallel": {"profiles": profiles},
+    })
+    try:
+        assert app.director._parallel_workers() == 8
+        assert app.director._total_image_workers() == 16
+        status = app.config.codex_parallel_status()
+        assert status["parallel_per_channel"] == 8
+        assert status["total_parallel"] == 16
+        assert app.router._codex_parallel_per_channel == 8
+        assert set(app.router._codex_profile_slots) == {
+            "codex_a", "codex_b"}
+    finally:
+        app.close()
+
+
 def test_director_skips_unavailable_profile_and_respects_strict_provider(
         tmp_path):
     profiles, _home_a, _home_b = _profiles(tmp_path)

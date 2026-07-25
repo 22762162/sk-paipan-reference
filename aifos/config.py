@@ -400,8 +400,10 @@ def _assignment_profile(value):
     return str(value or "").strip()
 
 
-def codex_parallel_status(profiles, assignments=None, max_parallel=2):
-    """纯函数：汇总两个 Codex 槽位的 busy/idle/disabled 状态。"""
+def codex_parallel_status(
+        profiles, assignments=None, max_parallel=2,
+        parallel_per_channel=8):
+    """汇总 Codex 通道及槽位状态；每条通道可容纳多项并行任务。"""
     normalized = [
         normalize_codex_profile(profile, index=index)
         for index, profile in enumerate(list(profiles or [])
@@ -411,6 +413,10 @@ def codex_parallel_status(profiles, assignments=None, max_parallel=2):
         parallel_limit = max(1, min(int(max_parallel), CODEX_PROFILE_LIMIT))
     except (TypeError, ValueError):
         parallel_limit = CODEX_PROFILE_LIMIT
+    try:
+        per_channel_limit = max(1, min(int(parallel_per_channel), 8))
+    except (TypeError, ValueError):
+        per_channel_limit = 8
     eligible = [
         profile["id"] for profile in normalized if profile["enabled"]
     ][:parallel_limit]
@@ -443,23 +449,37 @@ def codex_parallel_status(profiles, assignments=None, max_parallel=2):
             "state": state,
             "task_ids": tasks,
             "active_count": len(tasks),
+            "parallel_limit": (
+                per_channel_limit if profile["id"] in eligible else 0),
+            "available_slots": (
+                max(0, per_channel_limit - len(tasks))
+                if profile["id"] in eligible else 0),
         })
         profile_status.append(item)
     busy_count = sum(1 for tasks in active.values() if tasks)
+    total_parallel = per_channel_limit * len(eligible)
+    active_count = sum(len(tasks) for tasks in active.values())
     return {
         "max_parallel": parallel_limit,
+        "parallel_per_channel": per_channel_limit,
+        "total_parallel": total_parallel,
         "configured_count": len(normalized),
         "enabled_count": len(eligible),
-        "active_count": sum(len(tasks) for tasks in active.values()),
+        "active_count": active_count,
         "busy_profile_count": busy_count,
-        "available_count": max(0, len(eligible) - busy_count),
+        "available_count": sum(
+            1 for tasks in active.values()
+            if len(tasks) < per_channel_limit),
+        "available_slots": max(0, total_parallel - active_count),
         "profiles": profile_status,
         "assignments": clean_assignments,
     }
 
 
-def assign_codex_task(profiles, assignments, task_id, max_parallel=2):
-    """纯函数：幂等地把任务分给首个空闲 profile，不修改传入字典。"""
+def assign_codex_task(
+        profiles, assignments, task_id, max_parallel=2,
+        parallel_per_channel=8):
+    """幂等地把任务分给负载最低且仍有槽位的 profile。"""
     task_key = str(task_id or "").strip()
     if not task_key:
         raise ValueError("task_id 不能为空")
@@ -468,7 +488,8 @@ def assign_codex_task(profiles, assignments, task_id, max_parallel=2):
         for key, value in (assignments or {}).items()
     }
     status = codex_parallel_status(
-        profiles, assignments=current, max_parallel=max_parallel)
+        profiles, assignments=current, max_parallel=max_parallel,
+        parallel_per_channel=parallel_per_channel)
     existing = status["assignments"].get(task_key)
     if existing:
         selected = next(
@@ -483,11 +504,17 @@ def assign_codex_task(profiles, assignments, task_id, max_parallel=2):
             "profile": selected,
             "assignments": current,
         }
-    selected = next(
-        (profile for profile in status["profiles"]
-         if profile["state"] == "idle"),
-        None,
-    )
+    candidates = [
+        profile for profile in status["profiles"]
+        if profile["state"] in {"idle", "busy"}
+        and profile.get("available_slots", 0) > 0
+    ]
+    selected = min(
+        candidates,
+        key=lambda profile: (
+            int(profile.get("active_count") or 0),
+            str(profile.get("id") or "")),
+        default=None)
     if selected is None:
         return {
             "assigned": False,
@@ -637,6 +664,8 @@ class Config:
             max_parallel=self.get(
                 "codex_parallel", "max_parallel",
                 default=CODEX_PROFILE_LIMIT),
+            parallel_per_channel=self.get(
+                "defaults", "parallel_images", default=3),
         )
 
     def assign_codex_task(self, task_id, assignments=None):
@@ -648,4 +677,6 @@ class Config:
             max_parallel=self.get(
                 "codex_parallel", "max_parallel",
                 default=CODEX_PROFILE_LIMIT),
+            parallel_per_channel=self.get(
+                "defaults", "parallel_images", default=3),
         )

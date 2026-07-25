@@ -288,10 +288,12 @@ macOS 实机 `workspace/config.json` 示例:
 
 设置页还支持两个独立 Codex 登录态并行出图。只保存通道名称、命令和
 `CODEX_HOME` 目录，不读取或复制目录内的 `auth.json`/token；图片任务会在
-两个已启用且路径可用的通道间轮询分片，每个登录态同一时间只运行一个 CLI：
+两个已启用且路径可用的通道间轮询分片。`defaults.parallel_images` 表示
+每条通道的并行容量（最高 8）；设为 8 时，单通道 8 路、双通道合计 16 路：
 
 ```json
 {
+  "defaults": {"parallel_images": 8},
   "codex_parallel": {
     "max_parallel": 2,
     "profiles": [

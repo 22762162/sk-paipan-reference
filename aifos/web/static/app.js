@@ -1816,7 +1816,8 @@ function codexProfileCard(profile) {
       <em>${profile.enabled ? "参与图片任务并行分片" : "暂不分配图片任务"}</em></label>
     <div class="codex-channel-runtime">
       <span>已分配 <b>${codexCount(profile.assigned)}</b></span>
-      <span>运行中 <b>${codexCount(profile.active_jobs)}</b></span>
+      <span>运行中 <b>${codexCount(profile.active_jobs)}/${
+        Number(profile.parallel_limit) || 8}</b></span>
       <span>状态 <b>${health.label}</b></span>
     </div>
     ${profile.reason ? `<p class="${health.tone === "qc_failed" ? "codex-channel-error" : "dim"}">
@@ -1938,7 +1939,8 @@ function codexExecutionSettingsHtml(data) {
     <div class="codex-execution-head">
       <div><span class="eyebrow">PARALLEL CODEX EXECUTION</span>
         <h2>Codex 双通道</h2>
-        <p>为通道 A/B 使用独立 CODEX_HOME，隔离订阅会话并并行生产图片。</p></div>
+        <p>通道 A/B 使用独立 CODEX_HOME；每通道最多 8 路，
+          双通道合计最多 16 路并行生产图片。</p></div>
       <span class="chip ${parallel ? "done" : ""}">${modeLabel}</span>
     </div>
     <div class="codex-channel-grid">${profiles.map(codexProfileCard).join("")}</div>
@@ -7636,7 +7638,7 @@ function imageLineControlsHtml() {
   return `<div class="style-row image-line-row">
     <label>出图策略</label>
     <select id="image-line" disabled><option>加载中…</option></select>
-    <label class="il-label">图片并行</label>
+    <label class="il-label">每通道图片并行</label>
     <select id="parallel-images" disabled><option>…</option></select>
     <label class="il-label">视频并行</label>
     <select id="parallel-videos" disabled><option>…</option></select>
@@ -7719,7 +7721,7 @@ async function bindImageLineControls() {
     } finally { lineSel.disabled = false; }
   };
   parSel.innerHTML = [1, 2, 3, 4, 6, 8].map(
-    (n) => `<option value="${n}">${n} 路并行</option>`).join("");
+    (n) => `<option value="${n}">${n} 路/通道</option>`).join("");
   parSel.value = String((st.defaults || {}).parallel_images || 3);
   parSel.disabled = false;
   parSel.onchange = async () => {
@@ -7729,7 +7731,10 @@ async function bindImageLineControls() {
         body: JSON.stringify({
           defaults: { parallel_images: Number(parSel.value) } }),
       });
-      showToast(`并行出图已设为 ${parSel.value} 路,下一批生效`, "ok");
+      const channels = Math.max(1,
+        Number(st?.codex_parallel?.enabled_count) || 1);
+      showToast(`每通道已设为 ${parSel.value} 路，当前 ${channels} 条通道`
+        + `合计 ${Number(parSel.value) * channels} 路，下一批生效`, "ok");
     } catch (e) {
       showToast(staleServerHint(e), "error");
     }

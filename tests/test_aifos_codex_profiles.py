@@ -147,33 +147,41 @@ def test_settings_payload_exposes_paths_but_never_reads_codex_auth(tmp_path):
     assert "auth.json" not in serialized
 
 
-def test_assignment_is_idempotent_and_uses_each_profile_once():
+def test_assignment_is_idempotent_and_fills_eight_slots_per_profile():
     assignments = {}
     first = assign_codex_task(_profiles(), assignments, "task-1")
     assert first["profile_id"] == "codex_a"
     assert first["profile_name"] == "codex-main"
     assert assignments == {}
 
-    second = assign_codex_task(
-        _profiles(), first["assignments"], "task-2")
-    assert second["profile_id"] == "codex_b"
-    assert second["profile_name"] == "codex-alt"
-    third = assign_codex_task(
-        _profiles(), second["assignments"], "task-3")
-    assert third["assigned"] is False
-    assert third["reason"] == "all_busy"
+    result = first
+    assigned_profiles = [first["profile_id"]]
+    for index in range(2, 17):
+        result = assign_codex_task(
+            _profiles(), result["assignments"], f"task-{index}")
+        assert result["assigned"] is True
+        assigned_profiles.append(result["profile_id"])
+    assert assigned_profiles == ["codex_a", "codex_b"] * 8
+
+    full = assign_codex_task(
+        _profiles(), result["assignments"], "task-17")
+    assert full["assigned"] is False
+    assert full["reason"] == "all_busy"
 
     repeated = assign_codex_task(
-        _profiles(), second["assignments"], "task-1")
+        _profiles(), result["assignments"], "task-1")
     assert repeated["assigned"] is True
     assert repeated["reason"] == "already_assigned"
     assert repeated["profile_id"] == "codex_a"
     assert repeated["profile_name"] == "codex-main"
 
     status = codex_parallel_status(
-        _profiles(), second["assignments"])
-    assert status["active_count"] == 2
+        _profiles(), result["assignments"])
+    assert status["parallel_per_channel"] == 8
+    assert status["total_parallel"] == 16
+    assert status["active_count"] == 16
     assert status["available_count"] == 0
+    assert status["available_slots"] == 0
     assert [profile["state"] for profile in status["profiles"]] == [
         "busy", "busy"]
 

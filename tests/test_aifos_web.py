@@ -663,11 +663,14 @@ def test_episode_production_progress_uses_verified_formal_assets(server):
     assert issues["shot:3"]["status"] == "stale_active"
 
 
-def test_episode_progress_uses_ready_codex_channels_as_image_limit(server):
-    """双 Codex 就绪时,生产面板显示/使用 2 路而非泛化图片槽位数。"""
+def test_episode_progress_multiplies_per_channel_codex_capacity(server):
+    """每通道 8 路；双 Codex 就绪时生产面板显示总容量 16 路。"""
     port = server["port"]
     status, _ = _json_request(port, "POST", "/api/settings", {
         "defaults": {"parallel_images": 8},
+    })
+    assert status == 200
+    status, _ = _json_request(port, "POST", "/api/settings", {
         "codex_profiles": [
             {"id": "codex_a", "name": "A", "enabled": True,
              "codex_home": str(server["workspace"]), "command": "codex"},
@@ -699,7 +702,7 @@ def test_episode_progress_uses_ready_codex_channels_as_image_limit(server):
         port, "GET", f"/api/episode/{episode_id}")
     assert status == 200
     assert detail["production_progress"]["overall"]["parallelism"]["image"] == {
-        "active": 1, "limit": 2}
+        "active": 1, "limit": 16}
 
     app3 = App(server["workspace"])
     try:

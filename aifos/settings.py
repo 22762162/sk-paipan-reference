@@ -132,6 +132,8 @@ def _profile_settings_view(profile, runtime=None):
         "assigned": bool(active_jobs),
         "active_jobs": active_jobs,
         "runtime_state": runtime.get("state", "idle"),
+        "parallel_limit": int(runtime.get("parallel_limit") or 0),
+        "available_slots": int(runtime.get("available_slots") or 0),
     }
 
 

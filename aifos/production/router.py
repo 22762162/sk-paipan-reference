@@ -41,7 +41,13 @@ class ProviderRouter:
         self.db = db
         self.log = logger
         self.providers = {}
-        self._codex_profile_locks = {}
+        try:
+            self._codex_parallel_per_channel = max(
+                1, min(int(config.get(
+                    "defaults", "parallel_images", default=3)), 8))
+        except (TypeError, ValueError):
+            self._codex_parallel_per_channel = 3
+        self._codex_profile_slots = {}
         for name, conf in (config.get("providers") or {}).items():
             cls = PROVIDER_TYPES.get(conf.get("type"))
             if cls is None:
@@ -60,8 +66,10 @@ class ProviderRouter:
             if name == "codex":
                 for profile in conf.get("codex_profiles") or []:
                     if isinstance(profile, dict) and profile.get("id"):
-                        self._codex_profile_locks.setdefault(
-                            str(profile["id"]), threading.Lock())
+                        self._codex_profile_slots.setdefault(
+                            str(profile["id"]),
+                            threading.BoundedSemaphore(
+                                self._codex_parallel_per_channel))
             if provider.quota_limit > 0:
                 self._ensure_quota_row(name, provider.quota_limit)
 
@@ -256,14 +264,15 @@ class ProviderRouter:
             try:
                 profile_id = (str(payload.get("_codex_profile") or "").strip()
                               if name == "codex" else "")
-                lock = self._codex_profile_locks.get(profile_id)
-                if lock is None:
+                slots = self._codex_profile_slots.get(profile_id)
+                if slots is None:
                     result = provider.generate(capability, payload, out_dir,
                                                cancel=cancel)
                 else:
-                    # 每个 Codex 登录态最多一个活动调用；两个 profile
-                    # 可同时出图，避免同一账号的 CLI 会话互相覆盖。
-                    with lock:
+                    # parallel_images 是每条 Codex 通道的容量。独立
+                    # CODEX_HOME 继续隔离登录态；单通道最多 8 路，
+                    # Codex A+B 可合计 16 路。
+                    with slots:
                         result = provider.generate(
                             capability, payload, out_dir, cancel=cancel)
             except ProviderError as exc:
