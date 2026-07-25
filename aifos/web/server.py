@@ -767,7 +767,7 @@ def _collect_artifacts(app, project_id, ep_num):
 
 
 def _current_render_plan_items(render_plan):
-    """隐藏旧版第5张人物候选；文件与资产历史仍保留可追溯。"""
+    """返回当前有效清单，并屏蔽已废止的母资产历史 QC。"""
     current = []
     for item in (render_plan or {}).get("items") or []:
         if item.get("category") == "character_candidate":
@@ -780,7 +780,14 @@ def _current_render_plan_items(render_plan):
                     continue
             except (TypeError, ValueError):
                 pass
-        current.append(item)
+        visible = dict(item)
+        if visible.get("category") in {
+                "character_candidate", "character_art",
+                "character_sheet", "scene_art"}:
+            # 初始母资产不做视觉质检。旧计划里的失败 QC 只属于历史
+            # 运行记录，不得继续污染当前生产清单和失败徽标。
+            visible.pop("qc", None)
+        current.append(visible)
     return current
 
 

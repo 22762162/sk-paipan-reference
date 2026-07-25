@@ -1961,7 +1961,15 @@ class Director:
             path = self._plan_path(ctx)
             if path.exists():
                 try:
-                    return json.loads(path.read_text(encoding="utf-8"))
+                    plan = json.loads(path.read_text(encoding="utf-8"))
+                    # 旧版本曾给人物/场景母资产附加视觉 QC。新规则关闭
+                    # 母资产自动质检后，历史 qc 不能继续在页面显示失败，
+                    # 也不能在下一轮 _plan_seed 时被原样继承。
+                    for item in plan.get("items") or []:
+                        if item.get("category") in \
+                                self.INITIAL_ASSET_CATEGORIES:
+                            item.pop("qc", None)
+                    return plan
                 except ValueError:
                     pass
             return {"items": []}

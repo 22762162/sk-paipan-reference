@@ -62,12 +62,18 @@ def test_legacy_fifth_character_candidate_is_hidden_from_current_plan():
         {"id": "candidate:林川:4", "category": "character_candidate",
          "candidate_index": 4},
         {"id": "candidate:林川:5", "category": "character_candidate"},
-        {"id": "scene:主场景", "category": "scene_art"},
+        {"id": "scene:主场景", "category": "scene_art",
+         "qc": {"passed": False, "issues": ["旧版母资产质检失败"]}},
+        {"id": "shot:1", "category": "shot_image",
+         "qc": {"passed": False, "issues": ["镜头质检失败"]}},
     ]}
     current = _current_render_plan_items(plan)
     assert [item["id"] for item in current] == [
-        "candidate:林川:4", "scene:主场景"]
-    assert len(plan["items"]) == 3, "过滤不能改写磁盘历史计划"
+        "candidate:林川:4", "scene:主场景", "shot:1"]
+    assert "qc" not in current[1], "母资产不得显示旧版视觉质检失败"
+    assert current[2]["qc"]["passed"] is False, "镜头质检仍需保留"
+    assert len(plan["items"]) == 4, "过滤不能改写磁盘历史计划"
+    assert "qc" in plan["items"][2], "API 过滤不能改写磁盘历史计划"
 
 
 def test_index_and_static(server):
@@ -83,6 +89,8 @@ def test_index_and_static(server):
     assert b"showBlockingOverlay" in app_js
     assert b"stableProductionProgress(data.production_progress)" in app_js
     assert b"logEl.dataset.signature === signature" in app_js
+    assert b"function planVisibleQc(item)" in app_js
+    assert b"const visibleQc = planVisibleQc(item)" in app_js
     assert b'class="live-elapsed dim"' in app_js
     assert b"pausedProductionState" in app_js
     assert b"pausedProductionAccessHtml" in app_js

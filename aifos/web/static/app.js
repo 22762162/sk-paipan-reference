@@ -2942,6 +2942,11 @@ const PLAN_STATUS_CN = {
 };
 const PLAN_QC_CATS = new Set(["shot_image", "frames"]);
 function planQcEnabled(item) { return PLAN_QC_CATS.has(item.category); }
+/* 旧清单可能仍携带人物/场景母资产的历史 QC。当前规则只展示镜头
+   关键帧与首尾帧 QC；刷新页面即可生效，不必打断正在运行的生产任务。 */
+function planVisibleQc(item) {
+  return planQcEnabled(item) ? item.qc : null;
+}
 const PLAN_REWORK_STATUSES = new Set([
   "done", "reused", "awaiting_human", "failed", "generating",
 ]);
@@ -2979,7 +2984,7 @@ function planIsMock(item) {
 }
 
 function planQcBadge(item) {
-  const qc = item.qc;
+  const qc = planVisibleQc(item);
   if (!qc) return "";
   if (qc.passed && qc.manual_override)
     return `<span class="plan-st st-manual" title="人工确认通过，原质检问题仍保留在审计记录">人工通过✓</span>`;
@@ -2989,7 +2994,7 @@ function planQcBadge(item) {
 }
 
 function planQcIssuesHtml(item) {
-  const qc = item.qc;
+  const qc = planVisibleQc(item);
   if (!qc) return "";
   if (qc.passed && qc.manual_override) {
     const issues = qc.manual_original_issues || qc.issues || [];
@@ -3004,7 +3009,7 @@ function planQcIssuesHtml(item) {
 }
 
 function planQcReferenceGalleryHtml(item) {
-  const qc = item.qc;
+  const qc = planVisibleQc(item);
   if (!qc || qc.passed) return "";
   const refs = ((item.reference_inputs || {}).items || [])
     .filter((ref) => ref.url);
@@ -3339,8 +3344,9 @@ function productionLedgerPlanRows(data) {
   const items = ((data.render_plan || {}).items) || [];
   return items.map((item) => {
     const stage = productionLedgerStage(item);
-    const qcIssues = item.qc && item.qc.passed === false
-      ? (item.qc.issues || []) : [];
+    const visibleQc = planVisibleQc(item);
+    const qcIssues = visibleQc && visibleQc.passed === false
+      ? (visibleQc.issues || []) : [];
     const issue = item.error || (qcIssues.length ? qcIssues.join("；") : "");
     const refs = productionLedgerRefs(data, item);
     return {
@@ -5182,7 +5188,7 @@ function planCardHtml(data, item, avg) {
     state = `<span class="pc-state pc-timer" data-started="${item.started_at || ""}"
       data-eta="${avg ? Math.round(avg) : ""}">正在画 0:00${avg ? ` · 预计 ~${fmtDur(avg)}` : ""}</span>`;
   } else if (["done", "reused"].includes(st)) {
-    const qc = item.qc;
+    const qc = planVisibleQc(item);
     const sourceNote = item.first_source === "keyframe" ? " · 首帧复用✓"
       : item.first_source === "previous_tail" ? " · 帧链复用✓" : "";
     const qcNote = !qc ? "" : (qc.passed ? " · 质检✓"

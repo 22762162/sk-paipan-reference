@@ -100,6 +100,31 @@ def test_qc_keeps_broken_input_contract_advisory_when_image_is_correct(app):
     assert validate_image_qc({"issues": []}) == "缺少 pass 字段"
 
 
+def test_plan_read_drops_legacy_qc_only_from_initial_assets(app, tmp_path):
+    ctx = {"out_root": tmp_path / "episode"}
+    app.director._plan_write(ctx, {"items": [
+        {
+            "id": "sheet:孙九:profile",
+            "category": "character_sheet",
+            "status": "done",
+            "qc": {"passed": False, "issues": ["旧版提示词重复"]},
+        },
+        {
+            "id": "shot:1",
+            "category": "shot_image",
+            "status": "awaiting_human",
+            "qc": {"passed": False, "issues": ["人物数量错误"]},
+        },
+    ]})
+
+    by_id = {
+        item["id"]: item
+        for item in app.director._plan_read(ctx)["items"]
+    }
+    assert "qc" not in by_id["sheet:孙九:profile"]
+    assert by_id["shot:1"]["qc"]["passed"] is False
+
+
 def test_screen_text_rule_uses_only_explicit_whitelist_and_style():
     from aifos.adapters.codex_image import _screen_prop_rule
     prompt = "【镜头合同v2】【主体】电脑屏幕显示页面"
