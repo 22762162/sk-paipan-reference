@@ -6210,6 +6210,23 @@ class Director:
                     return row
         return None
 
+    def _face_only_identity_row(self, project_id, name, used_uris=None):
+        """Return a formal face anchor that cannot leak an obsolete outfit."""
+        used = {str(value) for value in (used_uris or []) if value}
+        for key in ("closeup", "features", "makeup"):
+            row = self.assets.latest(
+                project_id, "character_sheet", f"{name}:{key}")
+            if row is None:
+                continue
+            uri = str(row["uri"] or "")
+            if (not uri or uri in used
+                    or not formal_reference_allowed(self._asset_quality(row))
+                    or (not uri.startswith(("http://", "https://"))
+                        and not Path(uri).exists())):
+                continue
+            return row
+        return None
+
     def _art_refs(self, ctx, characters, location, shot_no=None,
                   sheet_keys=None, sheet_keys_by_character=None,
                   spatial_ref="", inner_persona_ref="", prop_names=None,
@@ -6243,27 +6260,59 @@ class Director:
                 f"本镜有 {len(identities)} 位需锁定身份的人物，超过参考图"
                 f"硬上限 {SHOT_BASE_REFERENCE_LIMIT}；请拆分群像镜头")
         for identity in identities:
+            identity = dict(identity)
+            character = identity.get("character")
             current_wardrobe = str(
                 (wardrobe_states or {}).get(
-                    identity.get("character")) or "").strip()
+                    character) or "").strip()
             locked_look = self._locked_look_variant(
-                project_id, identity.get("character"))
+                project_id, character)
             if (current_wardrobe
                     and self._wardrobe_candidate_score(
                         current_wardrobe, locked_look.get("costume"))):
                 # One image can safely carry both responsibilities when the
                 # manually selected portrait visibly wears this exact look.
                 identity["wardrobe_lock"] = current_wardrobe
-                wardrobe_bound_names.add(identity.get("character"))
+                wardrobe_bound_names.add(character)
+            elif current_wardrobe and str(
+                    locked_look.get("costume") or "").strip():
+                # A full-body final portrait wearing another scene's outfit
+                # visually overpowers a clothes-only reference even when the
+                # prompt says "identity only". Replace the submitted image
+                # with a high-quality face crop derived from that locked
+                # identity, while preserving the immutable source for audit.
+                face_row = self._face_only_identity_row(
+                    project_id, character, used_uris)
+                if face_row is not None:
+                    identity.update({
+                        "source_identity_asset_id": identity.get("asset_id"),
+                        "source_identity_uri": identity.get("uri"),
+                        "source_identity_version": identity.get("version"),
+                        "asset_id": face_row["id"],
+                        "uri": face_row["uri"],
+                        "version": face_row["version"],
+                        "identity_anchor_type": "face_only_derived",
+                    })
             remember(identity["uri"])
             refs["character_refs"].append(identity["uri"])
             refs["identity_references"].append(identity)
             refs["asset_matches"].append({
                 "asset_id": identity.get("asset_id"),
-                "kind": "character_identity",
-                "name": identity.get("character", ""),
-                "label": f"{identity.get('character', '角色')}最终立绘",
+                "kind": (
+                    "character_identity_face_anchor"
+                    if identity.get("identity_anchor_type")
+                    == "face_only_derived"
+                    else "character_identity"),
+                "name": character or "",
+                "label": (
+                    f"{character or '角色'}最终立绘面部锚"
+                    if identity.get("identity_anchor_type")
+                    == "face_only_derived"
+                    else f"{character or '角色'}最终立绘"),
                 "uri": identity["uri"],
+                "source_identity_asset_id": identity.get(
+                    "source_identity_asset_id"),
+                "source_identity_uri": identity.get("source_identity_uri"),
             })
         inner_uri = str(inner_persona_ref or "").strip()
         if (inner_uri
@@ -6973,6 +7022,8 @@ class Director:
             who = str(ref.get("character") or "角色")
             actor = str(ref.get("actor_id") or f"P{pos:02d}")
             wardrobe_lock = str(ref.get("wardrobe_lock") or "").strip()
+            face_only = (
+                ref.get("identity_anchor_type") == "face_only_derived")
             wardrobe_binding = (
                 f"；本图同时是{who}本镜当前服装「{wardrobe_lock}」的"
                 "服装参考，锁定其外层服装结构、材质、配色、鞋履和配饰"
@@ -6980,13 +7031,23 @@ class Director:
                 "；不得复制此图的服装")
             add(ref["uri"], (
                     f"{actor}·{who}最终立绘兼当前服装参考"
-                    if wardrobe_lock else f"{actor}·{who}最终立绘"),
-                f"只锁定{who}的脸型、五官骨相、年龄、性别表达、发际线、"
-                f"发型轮廓、体型与身份标志{wardrobe_binding}；不得复制姿势、"
-                "构图、背景或光线；禁止参考他人图片",
+                    if wardrobe_lock else (
+                        f"{actor}·{who}最终立绘面部锚"
+                        if face_only else f"{actor}·{who}最终立绘")),
+                (
+                    f"本图是从人工锁定的{who}最终立绘派生的面部锚；只锁定"
+                    f"{who}的脸型、五官骨相、年龄、性别表达、发际线与发型"
+                    "轮廓；不得推断或继承图外服装、体型、姿势、构图、背景"
+                    "或光线；服装只服从本镜服装参考；禁止参考他人图片"
+                    if face_only else
+                    f"只锁定{who}的脸型、五官骨相、年龄、性别表达、发际线、"
+                    f"发型轮廓、体型与身份标志{wardrobe_binding}；不得复制"
+                    "姿势、构图、背景或光线；禁止参考他人图片"),
                 character=who, role="identity",
                 asset_id=ref.get("asset_id"),
-                kind="character_identity")
+                kind=(
+                    "character_identity_face_anchor"
+                    if face_only else "character_identity"))
         add(
             payload.get("inner_persona_ref"), "内心Q版母资产",
             "只锁定非现实内心Q版的脸、发型、当前衣着、Q版比例和材质；"
@@ -10218,7 +10279,9 @@ class Director:
                 auto_revision = refreshed_revision["text"]
             prompt_is_unchanged = (not prompt_override or prompt_override ==
                                    (plan_item or {}).get("prompt", ""))
-            if (auto_revision and prompt_is_unchanged
+            if (auto_revision
+                    and revision_source != "batch_current_contract"
+                    and prompt_is_unchanged
                     and "【自动优化修订】" not in feedback):
                 feedback = ((auto_revision + "\n【人工补充】" + feedback)
                             if feedback else auto_revision)[:2400]
@@ -10409,9 +10472,10 @@ class Director:
                         or Path(candidate).exists()):
                     revision_base = candidate
             allow_revision_base = (
-                not plan_diagnostics.get("diagnosis_complete")
-                or self._use_failed_image_as_revision_base(
-                    plan_diagnostics))
+                revision_source != "batch_current_contract"
+                and (not plan_diagnostics.get("diagnosis_complete")
+                     or self._use_failed_image_as_revision_base(
+                         plan_diagnostics)))
             if (revision_base and allow_revision_base
                     and (revision_base.startswith(("http://", "https://"))
                          or Path(revision_base).exists())):
@@ -11873,6 +11937,11 @@ class Director:
             parallel_workers = max(1, min(parallel_workers, total))
             storyboard, _ = self.projects.latest_document(
                 episode["id"], "storyboard")
+            shot_by_no = {
+                int(shot.get("shot_no")): shot
+                for shot in (storyboard or {}).get("shots", [])
+                if shot.get("shot_no") is not None
+            }
             scene_by_shot = {
                 int(shot.get("shot_no")): shot.get("scene_no")
                 for shot in (storyboard or {}).get("shots", [])
@@ -11889,7 +11958,32 @@ class Director:
                             "label": label, "failed": True,
                             "error": "无法解析批量重画目标"}
                 issues = list((item.get("qc") or {}).get("issues") or [])
-                if issues:
+                if not only_failed:
+                    shot = shot_by_no.get(
+                        int(target.get("shot_no") or 0))
+                    appearance = []
+                    for name in (shot or {}).get("characters", []):
+                        state = (
+                            ((shot or {}).get("end_state") or {}).get(name)
+                            or ((shot or {}).get("start_state") or {}).get(name)
+                            or {})
+                        look = "、".join(
+                            value for value in (
+                                str(state.get("wardrobe") or "").strip(),
+                                (f"头饰{state.get('headwear')}"
+                                 if state.get("headwear") else ""),
+                            ) if value)
+                        if look:
+                            appearance.append(f"{name}={look}")
+                    feedback = (
+                        "按最新镜头合同重新生成当前镜头；"
+                        + (f"当前造型：{'；'.join(appearance)}；"
+                           if appearance else "")
+                        + "身份参考只锁脸、年龄、性别和发型轮廓，严禁继承"
+                        "身份图中的旧服装；服装只服从本镜当前服装参考；"
+                        "其余人数、站位、机位、动作、道具和场景服从当前合同")
+                    revision_source = "batch_current_contract"
+                elif issues:
                     revision = optimize_qc_feedback(issues, mode="image")
                     feedback = revision["text"][:1600]
                     revision_source = "batch_qc"

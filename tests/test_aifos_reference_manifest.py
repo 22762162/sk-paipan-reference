@@ -236,6 +236,38 @@ def test_selected_later_outfit_cannot_pollute_current_shot(app, monkeypatch):
     assert "夜探书房相" not in json.dumps(facts, ensure_ascii=False)
 
 
+def test_conflicting_full_body_identity_uses_face_only_anchor(
+        app, monkeypatch):
+    project, episode, script = _preproduce(
+        app, title="身份服装职责隔离")
+    name = script["characters"][0]["name"]
+    locked = app.director._locked_identity(project["id"], name)
+    closeup = app.assets.latest(
+        project["id"], "character_sheet", f"{name}:closeup")
+    assert locked is not None and closeup is not None
+    monkeypatch.setattr(
+        app.director, "_locked_look_variant",
+        lambda _project_id, _name: {
+            "costume": "脱去青官袍、穿旧月白直裰，摘乌纱仅留网巾",
+        })
+
+    refs = app.director._art_refs(
+        {"project": dict(project), "episode": dict(episode)},
+        [name], "", wardrobe_states={name: "青官袍乌纱"})
+
+    identity = refs["identity_references"][0]
+    assert identity["identity_anchor_type"] == "face_only_derived"
+    assert identity["uri"] == closeup["uri"]
+    assert identity["source_identity_uri"] == locked["uri"]
+    assert locked["uri"] not in refs["character_refs"]
+    manifest = app.director._reference_manifest(refs)
+    identity_entry = next(
+        item for item in manifest if item["role"] == "identity")
+    assert "最终立绘面部锚" in identity_entry["label"]
+    assert "不得推断或继承图外服装" in identity_entry["binding"]
+    assert "服装只服从本镜服装参考" in identity_entry["binding"]
+
+
 def test_shot_provider_prompt_contains_current_frame_only(app):
     project, episode, script = _preproduce(app, title="当前镜头提示词")
     storyboard, _ = app.projects.latest_document(
