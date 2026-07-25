@@ -45,6 +45,47 @@ def _preproduce(app, title="万妖图录", number=1, asset_mode=None):
     return app.projects.get_project(title)
 
 
+def test_character_sheet_prompt_compiler_is_scope_specific(app):
+    """每类人物设定图只接收当前可执行字段,不复用整套剧情状态。"""
+    design = {
+        "species": "人类", "gender": "男", "age_range": "20-24岁",
+        "appearance": "清正骨相，面白略带旅途风尘，眼神清明兼具疲惫与警觉",
+        "hair": "明式束发，戴儒巾或幞头", "eyes": "黑褐瞳色",
+        "temperament": "落魄清醒、隐忍机敏",
+        "costume": "本体：交领右衽粗布青灰长衫；错穿：青色举人官服",
+        "costume_detail": "粗布长衫无纹样；官服领缘与门襟为深青织带",
+        "accessories": "黄花梨木文匣及内含官印",
+        "era_setting": "中国明朝洪武二十四年（约1391年），胭谷山山道",
+        "visual_dna": {
+            "face_structure": "清正骨相，面白略带旅途风尘",
+            "hair_silhouette": "明式束发",
+            "body_or_occupation_marks": "清瘦书生体态；醒来后左臂刀伤包扎",
+            "clothing_structure": "本体：粗布长衫；错穿：青色官服",
+            "signature_accessory": "黄花梨木文匣及官印",
+        },
+    }
+    for key in ("turnaround", "closeup", "front", "profile", "back",
+                "features", "makeup", "costume", "costume_detail"):
+        prompt = app.director._sheet_prompt(
+            "林川", "主角", "电影级半写实", "人物设定图", "legacy desc",
+            key=key, design=design,
+            locked_look={"costume": design["costume"],
+                         "accessories": design["accessories"]})
+        assert "实际可见人形=1" in prompt
+        assert "None" not in prompt
+        assert "错穿" not in prompt
+        assert "文匣" not in prompt
+        assert "刀伤" not in prompt
+
+
+def test_character_sheet_contract_is_single_subject(app):
+    contract = app.director._character_sheet_composition_contract(
+        "林川", "closeup")
+    assert contract["expected_primary_count"] == 1
+    assert contract["expected_visible_figure_count"] == 1
+    assert contract["actors"][0]["character"] == "林川"
+
+
 def test_story_bible_stays_in_continuity_but_not_shot_provider_prompt(app):
     project = _preproduce(app, title="归途")
     episode = app.db.query_one(
