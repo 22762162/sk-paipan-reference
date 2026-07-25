@@ -274,6 +274,29 @@ def test_text_asset_card_compiles_layout_style_and_perspective():
     assert "透视/反光:随门框透视，边缘轻微反光" in prompt
 
 
+def test_text_asset_style_never_overwrites_project_visual_style():
+    shot = _shot()
+    shot.update({
+        "characters": [],
+        "description": "铜鱼符特写，符面文字清晰可读",
+        "readable_text": {
+            "required": True,
+            "carrier": "铜鱼符",
+            "whitelist": ["清河"],
+            "style": "青铜錾刻阴文，边缘带包浆",
+        },
+    })
+    contract, prompt = compile_shot_prompt(
+        shot,
+        location="明代驿站",
+        style="电影级半写实精品漫剧，明末历史正剧质感",
+    )
+    assert contract["style"] == "电影级半写实精品漫剧，明末历史正剧质感"
+    assert "【画风】电影级半写实精品漫剧，明末历史正剧质感" in prompt
+    assert "字体/颜色/层级:青铜錾刻阴文，边缘带包浆" in prompt
+    assert "【画风】青铜錾刻阴文，边缘带包浆" not in prompt
+
+
 def test_system_prompt_fields_never_become_screen_whitelist():
     assert sanitize_text_whitelist([
         "东宫书房", "镜头合同v2", "质检原因:屏幕乱码", "主体",

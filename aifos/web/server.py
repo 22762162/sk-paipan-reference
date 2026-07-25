@@ -5,6 +5,7 @@
 API:
   GET  /api/overview            全局看板(项目/剧集/成本/额度/任务)
   GET  /api/episode/<id>        单集详情(阶段/剧本/分镜/质检/产物索引)
+  GET  /api/episode/<id>/status 单集轻量变更摘要(用于手机端轮询)
   GET  /api/assets?project=T    项目资产列表
   GET  /api/logs?limit=N        最近日志
   GET  /api/jobs  /api/jobs/<id>后台制作任务
@@ -22,6 +23,7 @@ API:
 import base64
 import binascii
 import copy
+import hashlib
 import ipaddress
 import json
 import shutil
@@ -227,9 +229,84 @@ class JobRegistry:
                 progress["updated_at"] = time.time()
                 job["progress"] = progress
 
-        runner = ((lambda app: task(app, run_id, report))
-                  if tracked else (lambda app: task(app, run_id)))
-        self._run(job_id, runner)
+        callback = ((lambda app: task(app, run_id, report))
+                    if tracked else (lambda app: task(app, run_id)))
+
+        def accounted_runner(app):
+            project = app.projects.get_project(title)
+            episode = (app.db.query_one(
+                "SELECT * FROM episodes WHERE project_id=? AND number=?",
+                (project["id"], int(number)))
+                if project is not None else None)
+            before_episode_cost = float(
+                episode["cost"] or 0) if episode is not None else 0.0
+            before_task_cost = float((app.db.query_one(
+                "SELECT COALESCE(SUM(cost), 0) AS total FROM tasks "
+                "WHERE episode_id=?", (episode["id"],))
+                if episode is not None else {"total": 0})["total"] or 0)
+            summary = None
+            error = ""
+            try:
+                summary = callback(app)
+                return summary
+            except Exception as exc:
+                error = str(exc)
+                raise
+            finally:
+                if episode is not None:
+                    current = app.projects.get_episode(episode["id"])
+                    after_episode_cost = float(
+                        current["cost"] or 0) if current is not None else 0.0
+                    after_task_cost = float(app.db.query_one(
+                        "SELECT COALESCE(SUM(cost), 0) AS total FROM tasks "
+                        "WHERE episode_id=?", (episode["id"],))["total"] or 0)
+                    unassigned = round(max(
+                        0.0,
+                        (after_episode_cost - before_episode_cost)
+                        - (after_task_cost - before_task_cost),
+                    ), 4)
+                    if unassigned > 0:
+                        stage, name = {
+                            "regenerate_cast": ("cast", "人物/道具候选重做"),
+                            "revise_script": ("script", "剧本打磨重写"),
+                            "regen_image": ("images", "图片定向修改"),
+                            "reanalyze_story": ("script", "制作圣经重新分析"),
+                            "qc_all": ("qc", "图片批量复检"),
+                            "recheck_current_storyboard": (
+                                "qc", "当前分镜合同批量复检"),
+                            "redo_items": ("images", "图片批量重画"),
+                            "redo_video": ("videos", "视频定向修改"),
+                            "redo_placeholders": ("images", "占位图片补真"),
+                            "restyle": ("cast", "全剧视觉风格重做"),
+                        }.get(action, ("adjustment", "制作调整"))
+                        providers = ",".join(sorted(
+                            str(value) for value in
+                            getattr(app.director, "_task_providers", set())
+                            if str(value))) or "调整任务（Provider 未回传）"
+                        summary_dict = (
+                            summary if isinstance(summary, dict) else {})
+                        result_status = str(
+                            summary_dict.get("status") or "")
+                        task_status = (
+                            "failed" if error else
+                            "stopped" if result_status == "paused" else
+                            "done")
+                        ts = time.time()
+                        app.db.execute(
+                            "INSERT INTO tasks("
+                            "episode_id, run_id, stage, name, status, "
+                            "provider, cost, result, error, created_at, "
+                            "updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                episode["id"], run_id, stage, name,
+                                task_status, providers, unassigned,
+                                json.dumps(
+                                    summary_dict, ensure_ascii=False,
+                                    default=str)[:4000],
+                                error[:1000], ts, ts,
+                            ))
+
+        self._run(job_id, accounted_runner)
         return job_id
 
     def _run(self, job_id, task):
@@ -1627,7 +1704,79 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
     }
 
 
-def _episode_payload(app, episode_id):
+def _episode_status_payload(app, episode_id, jobs):
+    """返回适合高频轮询的轻量变更摘要，不加载整集剧本和全部图片合同。"""
+    episode = app.projects.get_episode(episode_id)
+    if episode is None:
+        return None
+    project = app.db.query_one(
+        "SELECT * FROM projects WHERE id=?", (episode["project_id"],))
+    tasks = [dict(row) for row in app.db.query(
+        "SELECT id, stage, status, provider, cost, error, updated_at "
+        "FROM tasks WHERE episode_id=? ORDER BY id",
+        (episode_id,))]
+    document_versions = {
+        row["kind"]: int(row["version"])
+        for row in app.db.query(
+            "SELECT kind, MAX(version) AS version FROM documents "
+            "WHERE episode_id=? GROUP BY kind ORDER BY kind",
+            (episode_id,))
+    }
+    asset_marker = dict(app.db.query_one(
+        "SELECT COUNT(*) AS total, COALESCE(MAX(id), 0) AS max_id, "
+        "COALESCE(SUM(version), 0) AS versions, "
+        "COALESCE(SUM(reuse_count), 0) AS reuse_count, "
+        "COALESCE(SUM(LENGTH(uri) + LENGTH(meta)), 0) AS content_size "
+        "FROM assets WHERE project_id=?",
+        (project["id"],)))
+    out_dir = (app.workspace.artifacts_dir / f"p{project['id']:03d}"
+               / f"e{episode['number']:03d}")
+    plan_path = out_dir / "render_plan.json"
+    try:
+        plan_stat = plan_path.stat()
+        render_plan_marker = {
+            "exists": True,
+            "size": plan_stat.st_size,
+            "mtime_ns": plan_stat.st_mtime_ns,
+        }
+    except OSError:
+        render_plan_marker = {"exists": False, "size": 0, "mtime_ns": 0}
+    relevant_jobs = []
+    for job in jobs.list():
+        if (job.get("title") != project["title"]
+                or int(job.get("episode") or 0) != int(episode["number"])):
+            continue
+        relevant_jobs.append({
+            key: copy.deepcopy(job[key])
+            for key in (
+                "id", "status", "title", "episode", "started_at",
+                "finished_at", "error", "progress",
+                "series_advance_error")
+            if key in job
+        })
+    payload = {
+        "build": BUILD,
+        "episode": dict(episode),
+        "project": {
+            key: project[key] for key in (
+                "id", "title", "status", "kind", "style", "aspect",
+                "style_pack_id")
+        },
+        "tasks": tasks,
+        "jobs": relevant_jobs,
+        "document_versions": document_versions,
+        "asset_marker": asset_marker,
+        "render_plan_marker": render_plan_marker,
+    }
+    signature_source = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    payload["signature"] = hashlib.sha256(signature_source).hexdigest()
+    return payload
+
+
+def _episode_payload(app, episode_id, jobs=None):
     episode = app.projects.get_episode(episode_id)
     if episode is None:
         return None
@@ -1804,7 +1953,7 @@ def _episode_payload(app, episode_id):
         app, episode, render_plan)
     production_guidance = _production_guidance(
         app, episode, storyboard, render_plan, production_progress)
-    return {
+    payload = {
         "build": BUILD,
         "episode": dict(episode),
         "project": dict(project),
@@ -1861,6 +2010,10 @@ def _episode_payload(app, episode_id):
         "artifacts": _collect_artifacts(
             app, project["id"], episode["number"]),
     }
+    if jobs is not None:
+        status = _episode_status_payload(app, episode_id, jobs)
+        payload["poll_signature"] = status["signature"]
+    return payload
 
 
 def _overview_payload(app, jobs):
@@ -2013,11 +2166,19 @@ def make_handler(workspace, jobs):
                     if payload is None:
                         return self._error(404, "火火独立风格不存在")
                     return self._json(payload)
+                match = re.match(r"^/api/episode/(\d+)/status$", route)
+                if match:
+                    payload = self._with_app(
+                        lambda app: _episode_status_payload(
+                            app, int(match.group(1)), jobs))
+                    if payload is None:
+                        return self._error(404, "剧集不存在")
+                    return self._json(payload)
                 match = re.match(r"^/api/episode/(\d+)$", route)
                 if match:
                     payload = self._with_app(
                         lambda app: _episode_payload(
-                            app, int(match.group(1))))
+                            app, int(match.group(1)), jobs=jobs))
                     if payload is None:
                         return self._error(404, "剧集不存在")
                     payload["live_jobs"] = copy.deepcopy(jobs.running_for(

@@ -138,9 +138,13 @@ def _screen_prop_rule(prompt_text, text_asset=None):
     """识别道具提示里的屏幕/页面，并追加局部可读文字硬约束。"""
     source = str(prompt_text or "")
     asset = text_asset if isinstance(text_asset, dict) else {}
-    if not any(token in source for token in (
-            "电脑", "笔记本", "屏幕", "显示器", "页面", "史书", "网页")) \
-            and not readable_text_required(asset):
+    carrier = str(asset.get("carrier") or "")
+    screen_tokens = (
+        "电脑", "笔记本电脑", "屏幕", "显示器", "网页",
+        "手机屏", "手机界面", "平板屏", "平板界面",
+    )
+    if not any(token in source for token in screen_tokens) \
+            and not any(token in carrier for token in screen_tokens):
         return ""
     whitelist = sanitize_text_whitelist(asset.get("whitelist", []))
     # Only the explicit structured whitelist may authorize readable text.

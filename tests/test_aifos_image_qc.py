@@ -171,6 +171,24 @@ def test_screen_text_rule_uses_only_explicit_whitelist_and_style():
     assert "镜头合同v2" not in locked
 
 
+def test_readable_non_screen_prop_never_gets_computer_instructions():
+    from aifos.adapters.codex_image import _screen_prop_rule
+
+    rule = _screen_prop_rule(
+        "铜鱼符特写，青铜錾刻阴文，边缘带包浆",
+        {
+            "required": True,
+            "carrier": "铜鱼符",
+            "whitelist": ["清河"],
+            "style": "青铜錾刻阴文，边缘带包浆",
+        },
+    )
+
+    assert rule == ""
+    assert "电脑必须" not in rule
+    assert "屏幕正对镜头" not in rule
+
+
 def test_qc_prompt_audits_exact_current_prompt_and_reference_manifest():
     from aifos.adapters.claude_script import build_prompt
 

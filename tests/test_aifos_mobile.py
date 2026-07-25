@@ -52,4 +52,5 @@ def test_mobile_ui_contract_and_pwa_registration():
     assert 'serviceWorker.register("/sw.js",' in js
     assert 'updateViaCache: "none"' in js
     assert "/api/access" in js
+    assert "/api/episode/${episodeId}/status" in js
     assert "beforeinstallprompt" in js

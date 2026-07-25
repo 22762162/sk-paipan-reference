@@ -411,11 +411,11 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
             readable.get("whitelist") or [])) or "白名单"
         carrier = _text(readable.get("carrier"), "指定载体")
         layout = _text(readable.get("layout"))
-        style = _text(readable.get("style"))
+        text_style = _text(readable.get("style"))
         perspective = _text(readable.get("perspective"))
         presentation = "；".join(filter(None, (
             f"版式/位置:{layout}" if layout else "",
-            f"字体/颜色/层级:{style}" if style else "",
+            f"字体/颜色/层级:{text_style}" if text_style else "",
             f"透视/反光:{perspective}" if perspective else "",
         )))
         if any(token in carrier for token in ("电脑", "笔记本", "屏幕", "显示器")):

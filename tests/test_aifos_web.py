@@ -82,8 +82,8 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260726-stable-live-log-1" in html
-    assert "/static/app.js?v=20260726-stable-live-log-1" in html
+    assert "/static/style.css?v=20260726-contract-poll-1" in html
+    assert "/static/app.js?v=20260726-contract-poll-1" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -109,6 +109,7 @@ def test_index_and_static(server):
     assert "显示全部图片".encode() in app_js
     assert b"refreshOpenPlanOverlay(episodeId, force" in app_js
     assert b"planOverlaySignatures" in app_js
+    assert b"planOverlayPollSignatures" in app_js
     assert "空间调度".encode() in app_js
     assert "人物编号图例".encode() in app_js
     assert "人物路线".encode() in app_js
@@ -304,7 +305,7 @@ def test_index_and_static(server):
         "192x192", "512x512"}
     status, ctype, raw = _request(server["port"], "GET", "/sw.js")
     assert status == 200 and "javascript" in ctype
-    assert b"aifos-mobile-shell-v6" in raw
+    assert b"aifos-mobile-shell-v7" in raw
     assert b'/static/app.js' in raw and b'fetch(request)' in raw
 
 
@@ -331,6 +332,46 @@ def test_blocking_svg_url_uses_document_version_to_bust_cache(server):
 
     assert status == 200
     assert payload["blocking"]["scenes"][0]["svg_url"].endswith("?v=1")
+
+
+def test_episode_status_is_lightweight_and_changes_with_documents(server):
+    app2 = App(server["workspace"])
+    try:
+        project, _ = app2.projects.get_or_create_project("轻量轮询测试")
+        episode, _ = app2.projects.get_or_create_episode(project["id"], 1)
+        episode_id = episode["id"]
+    finally:
+        app2.close()
+
+    status, first = _json_request(
+        server["port"], "GET", f"/api/episode/{episode_id}/status")
+    assert status == 200
+    assert len(first["signature"]) == 64
+    assert first["episode"]["id"] == episode_id
+    assert first["document_versions"] == {}
+    assert first["jobs"] == []
+    for heavy_key in (
+            "script", "story_analysis", "storyboard", "render_plan",
+            "production_progress", "artifacts", "image_failures"):
+        assert heavy_key not in first
+
+    app2 = App(server["workspace"])
+    try:
+        app2.projects.save_document(
+            episode_id, "script", {"title": "第一版", "scenes": []})
+    finally:
+        app2.close()
+
+    status, second = _json_request(
+        server["port"], "GET", f"/api/episode/{episode_id}/status")
+    assert status == 200
+    assert second["document_versions"]["script"] == 1
+    assert second["signature"] != first["signature"]
+
+    status, detail = _json_request(
+        server["port"], "GET", f"/api/episode/{episode_id}")
+    assert status == 200
+    assert detail["poll_signature"] == second["signature"]
 
 
 def test_job_registry_unique_reuses_running_episode(tmp_path):
@@ -361,6 +402,49 @@ def test_job_registry_unique_reuses_running_episode(tmp_path):
     while time.time() < deadline and jobs.get(first)["status"] == "running":
         time.sleep(0.02)
     assert jobs.get(first)["status"] == "done"
+
+
+def test_job_registry_accounts_unstaged_adjustment_cost(tmp_path):
+    workspace = tmp_path / "ws"
+    app = App(workspace)
+    try:
+        project, _ = app.projects.get_or_create_project("调整成本测试")
+        episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+        episode_id = episode["id"]
+    finally:
+        app.close()
+    jobs = JobRegistry(workspace)
+
+    def billed_adjustment(app, run_id):
+        app.director._task_providers = {"codex"}
+        app.projects.add_episode_cost(episode_id, 2.5)
+        return {"status": "done", "redone": 1}
+
+    job_id = jobs.start_task(
+        "调整成本测试", 1, billed_adjustment, action="redo_items")
+    deadline = time.time() + 5
+    while time.time() < deadline and jobs.get(job_id)["status"] == "running":
+        time.sleep(0.02)
+    assert jobs.get(job_id)["status"] == "done"
+
+    check = App(workspace)
+    try:
+        task = check.db.query_one(
+            "SELECT * FROM tasks WHERE run_id=?",
+            (jobs.get(job_id)["run_id"],))
+        assert task["stage"] == "images"
+        assert task["provider"] == "codex"
+        assert task["cost"] == pytest.approx(2.5)
+        history = check.history.get(jobs.get(job_id)["run_id"])
+        assert history["cost"] == pytest.approx(2.5)
+        assert history["last_stage"] == "images"
+        assert history["stage_count"] == 1
+        assert sum(row["total"] for row in
+                   check.system.cost_by_stage()) == pytest.approx(2.5)
+        assert sum(row["total"] for row in
+                   check.system.cost_by_provider()) == pytest.approx(2.5)
+    finally:
+        check.close()
 
 
 def test_asset_delete_and_video_reference_api(server):

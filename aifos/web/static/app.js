@@ -2834,10 +2834,8 @@ async function waitForShotRevisionCheckpoint(
   const stable = new Set(["awaiting_script", "awaiting_cast", "awaiting_confirm",
     "paused", "done", "failed", "qc_failed", "created"]);
   while (Date.now() < deadline) {
-    const [current, jobs] = await Promise.all([
-      api(`/api/episode/${episodeId}`), api("/api/jobs"),
-    ]);
-    const busy = jobs.some((job) => job.status === "running"
+    const current = await api(`/api/episode/${episodeId}/status`);
+    const busy = (current.jobs || []).some((job) => job.status === "running"
       && job.title === projectTitle
       && Number(job.episode) === Number(episodeNumber));
     if (stable.has(current.episode.status) && !busy) return current;
@@ -2960,6 +2958,7 @@ function planNeedsRevision(item) {
 /* 图片清单的筛选状态按集保存；批量修改只看当前需要返工的图片。 */
 const planFailedOnlyByEpisode = new Map();
 const planOverlaySignatures = new Map();
+const planOverlayPollSignatures = new Map();
 function planFailedOnly(episodeId) {
   return planFailedOnlyByEpisode.get(String(episodeId)) === true;
 }
@@ -5046,6 +5045,8 @@ async function refreshOpenPlanOverlay(episodeId, force = false) {
   try {
     const data = await api(`/api/episode/${episodeId}`);
     planOverlaySignatures.set(String(episodeId), canvasSig(data));
+    planOverlayPollSignatures.set(
+      String(episodeId), data.poll_signature || "");
     panel.innerHTML = renderPlanHtml(data, true)
       || `<div class="dim">本集还没有图片生产计划。</div>`;
     bindPlanSelection(panel, data, episodeId);
@@ -5550,6 +5551,8 @@ async function showPlanOverlay(episodeId, focusId = "", focusCategory = "") {
   try { data = await api(`/api/episode/${episodeId}`); }
   catch (e) { showToast(e.message, "error"); return; }
   planOverlaySignatures.set(String(episodeId), canvasSig(data));
+  planOverlayPollSignatures.set(
+    String(episodeId), data.poll_signature || "");
   const overlay = document.createElement("div");
   overlay.className = "script-overlay";
   overlay.innerHTML = `
@@ -5568,6 +5571,7 @@ async function showPlanOverlay(episodeId, focusId = "", focusCategory = "") {
     </div>`;
   const close = () => {
     planOverlaySignatures.delete(String(episodeId));
+    planOverlayPollSignatures.delete(String(episodeId));
     overlay.remove(); document.removeEventListener("keydown", onKey);
   };
   const onKey = (ev) => { if (ev.key === "Escape") close(); };
@@ -6745,7 +6749,8 @@ const STAGE_CN = {
   frames: "首尾帧", preflight: "生产门禁", videos: "Seedance 视频",
   voices: "随视频配音/口型", edit: "剪映剪辑",
   qc: "三层质检", package: "封面/标题", archive: "数据沉淀",
-  assets: "资产调用",
+  assets: "资产调用", adjustment: "制作调整",
+  historical_adjustment: "历史调整调用（待归档）",
 };
 const STAGE_ORDER = ["script", "continuity", "cast", "storyboard", "blocking", "images",
   "text_assets", "frames", "preflight", "videos", "voices", "edit", "qc",
@@ -6949,6 +6954,7 @@ function startLiveTicker(episodeId) {
 
 /* 画布轮询防闪烁:内容签名没变就不重画 */
 let canvasSignature = "";
+let canvasPollSignature = "";
 
 function stableProductionProgress(progress) {
   if (!progress || typeof progress !== "object") return progress;
@@ -6990,24 +6996,26 @@ function pollCanvas(episodeId) {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(async () => {
     try {
-      const data = await api(`/api/episode/${episodeId}`);
-      watchBuild(data);
-      updateLiveStrip(data);          // 状态条每轮都刷新(不重画整页)
-      if (canvasSig(data) !== canvasSignature) {
+      const status = await api(`/api/episode/${episodeId}/status`);
+      watchBuild(status);
+      if (status.signature !== canvasPollSignature) {
         const planOverlay = document.querySelector(
           `.plan-overlay[data-episode="${episodeId}"]`);
         if (planOverlay) {
           // 图片清单打开时只更新清单；不重建底层画布，避免遮罩层和滚动位置跳动。
-          const signature = canvasSig(data);
           const key = String(episodeId);
-          if (planOverlaySignatures.get(key) !== signature)
-            refreshOpenPlanOverlay(episodeId);
+          if (planOverlayPollSignatures.get(key) !== status.signature) {
+            const refreshed = await refreshOpenPlanOverlay(episodeId);
+            if (refreshed)
+              planOverlayPollSignatures.set(key, status.signature);
+          }
         } else {
           const scrollHost = document.scrollingElement;
           const scrollTop = scrollHost ? scrollHost.scrollTop : 0;
-          renderCanvasView(episodeId).finally(() => requestAnimationFrame(() => {
+          await renderCanvasView(episodeId);
+          requestAnimationFrame(() => {
             if (scrollHost) scrollHost.scrollTop = scrollTop;
-          }));
+          });
         }
       }
     } catch (e) { /* 下一轮再试 */ }
@@ -7714,6 +7722,7 @@ async function renderCanvasView(episodeId) {
   try { data = await api(`/api/episode/${episodeId}`); }
   catch (e) { app.innerHTML = `<div class="loading">加载失败:${esc(e.message)}</div>`; return; }
   canvasSignature = canvasSig(data);
+  canvasPollSignature = data.poll_signature || "";
 
   const ep = data.episode, sb = data.storyboard, script = data.script;
   const pausedProduction = pausedProductionState(data);

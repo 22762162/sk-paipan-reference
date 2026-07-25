@@ -135,9 +135,11 @@ class HistoryCenter:
         providers = set()
         for stage in stages:
             providers.update(stage.get("providers") or [])
+        task_rows = []
         if run["episode_id"] is not None:
             task_rows = self.db.query(
-                "SELECT provider FROM tasks WHERE run_id=?", (run_id,))
+                "SELECT stage, provider, cost FROM tasks "
+                "WHERE run_id=? ORDER BY id", (run_id,))
             for task in task_rows:
                 providers.update(p.strip() for p in
                                  (task["provider"] or "").split(",")
@@ -146,15 +148,19 @@ class HistoryCenter:
             cost = sum(float(stage.get("cost") or 0) for stage in stages)
             last_stage = str(stages[-1].get("stage") or "")
         else:
-            cost = float(summary.get("cost") or 0)
-            last_stage = str(summary.get("stage") or "")
+            task_cost = sum(float(task["cost"] or 0) for task in task_rows)
+            cost = max(float(summary.get("cost") or 0), task_cost)
+            last_stage = str(
+                summary.get("stage")
+                or (task_rows[-1]["stage"] if task_rows else ""))
+        stage_count = len(stages) or len(task_rows)
         ts = now()
         self.db.execute(
             "UPDATE production_runs SET status=?, result_status=?, cost=?, "
             "providers=?, stage_count=?, last_stage=?, error=?, summary=?, "
             "finished_at=?, updated_at=? WHERE id=?",
             (status, result_status, round(cost, 4),
-             ",".join(sorted(providers)), len(stages), last_stage,
+             ",".join(sorted(providers)), stage_count, last_stage,
              str(error or summary.get("error") or "")[:2000],
              json.dumps(summary, ensure_ascii=False)[:200000], ts, ts,
              run_id))

@@ -75,15 +75,44 @@ class SystemCenter:
         return self.db.query("SELECT * FROM users ORDER BY id")
 
     # ---- 成本统计 ----
+    def _unassigned_cost(self, *, provider_only=False):
+        assigned_where = " WHERE provider != ''" if provider_only else ""
+        row = self.db.query_one(
+            "SELECT "
+            "COALESCE((SELECT SUM(cost) FROM episodes), 0) AS charged, "
+            "COALESCE((SELECT SUM(cost) FROM tasks"
+            + assigned_where + "), 0) AS assigned")
+        return round(max(
+            0.0, float(row["charged"] or 0) - float(row["assigned"] or 0)), 4)
+
     def cost_by_provider(self):
-        return self.db.query(
+        rows = [dict(row) for row in self.db.query(
             "SELECT provider, COUNT(*) AS calls, SUM(cost) AS total "
-            "FROM tasks WHERE provider != '' GROUP BY provider ORDER BY total DESC")
+            "FROM tasks WHERE provider != '' GROUP BY provider "
+            "ORDER BY total DESC")]
+        unassigned = self._unassigned_cost(provider_only=True)
+        if unassigned:
+            rows.append({
+                "provider": "历史调整调用（待归档）",
+                "calls": 0,
+                "total": unassigned,
+            })
+        return sorted(
+            rows, key=lambda row: float(row["total"] or 0), reverse=True)
 
     def cost_by_stage(self):
-        return self.db.query(
+        rows = [dict(row) for row in self.db.query(
             "SELECT stage, COUNT(*) AS tasks, SUM(cost) AS total "
-            "FROM tasks GROUP BY stage ORDER BY total DESC")
+            "FROM tasks GROUP BY stage ORDER BY total DESC")]
+        unassigned = self._unassigned_cost()
+        if unassigned:
+            rows.append({
+                "stage": "historical_adjustment",
+                "tasks": 0,
+                "total": unassigned,
+            })
+        return sorted(
+            rows, key=lambda row: float(row["total"] or 0), reverse=True)
 
     def cost_by_episode(self):
         return self.db.query(
