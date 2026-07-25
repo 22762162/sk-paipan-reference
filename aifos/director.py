@@ -11993,8 +11993,13 @@ class Director:
                         "严格保持已锁定的人物身份、服装、场景、文字白名单"
                         "和前后镜头连续性")
                     revision_source = "batch_redraw"
-                prompt_override = (item.get("prompt", "")
-                                   if item.get("custom_prompt") else "")
+                # Contract-repair batches must compile from the latest
+                # storyboard. A legacy custom_prompt can contain a complete
+                # older provider prompt and, if reused as "action", duplicate
+                # plot/QC text inside the new shot contract.
+                prompt_override = (
+                    item.get("prompt", "")
+                    if only_failed and item.get("custom_prompt") else "")
                 profile_id = ""
                 if profiles:
                     profile_id = profiles[(index - 1) % len(profiles)]["id"]

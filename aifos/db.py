@@ -1,11 +1,13 @@
 """数据层:SQLite 统一存储全部结构化数据(项目/资产/任务/额度/日志/沉淀)。"""
 
+import os
 import sqlite3
 import threading
 import time
 from contextlib import contextmanager
 
 _DATABASE_IO_LOCK = threading.RLock()
+_DATABASE_INITIALIZED_FILES = {}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects(
@@ -332,20 +334,34 @@ class Database:
         # 并行出图产线的 worker 线程会经由 router/logger 读写库:
         # 连接允许跨线程；所有 App 实例共享同一把进程级锁，只串行化极短
         # 的 SQLite 读写，图片/API 调用本身仍保持并行。
+        # Autocommit prevents an overlooked direct statement from retaining a
+        # write transaction while another image worker waits. Explicit
+        # all-or-nothing operations still use transaction() below.
         self.conn = sqlite3.connect(
-            self.path, timeout=60, check_same_thread=False)
+            self.path, timeout=60, check_same_thread=False,
+            isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         self._lock = _DATABASE_IO_LOCK
         # WAL 允许页面读取与图片 worker 写入并行；60 秒等待覆盖多通道
         # 同时注册产物/质检结果的写入高峰，不因几秒锁竞争丢掉整批结果。
         with self._lock:
             self.conn.execute("PRAGMA busy_timeout = 60000")
-            self.conn.execute("PRAGMA journal_mode = WAL")
+            journal = self.conn.execute(
+                "PRAGMA journal_mode").fetchone()[0]
+            if str(journal).lower() != "wal":
+                self.conn.execute("PRAGMA journal_mode = WAL").fetchone()
             self.conn.execute("PRAGMA synchronous = NORMAL")
             self.conn.execute("PRAGMA foreign_keys = ON")
-            self.conn.executescript(SCHEMA)
-            self._migrate()
-            self.conn.commit()
+            # AIFOS creates one lightweight App per parallel worker. Running
+            # the full DDL script for every connection turns startup into a
+            # schema-lock storm before any image API call begins. Initialize
+            # once per actual database file in this process.
+            stat = os.stat(self.path)
+            file_key = (stat.st_dev, stat.st_ino)
+            if _DATABASE_INITIALIZED_FILES.get(self.path) != file_key:
+                self.conn.executescript(SCHEMA)
+                self._migrate()
+                _DATABASE_INITIALIZED_FILES[self.path] = file_key
 
     def _migrate(self):
         for table, column, decl in MIGRATIONS:
@@ -358,7 +374,6 @@ class Database:
     def execute(self, sql, params=()):
         with self._lock:
             cur = self.conn.execute(sql, params)
-            self.conn.commit()
             return cur
 
     @contextmanager

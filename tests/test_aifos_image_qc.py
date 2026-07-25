@@ -1235,12 +1235,15 @@ def test_batch_redo_dispatches_same_scene_keyframes_in_parallel(app, monkeypatch
     for item in plan["items"]:
         if item["id"] in ids:
             item["status"] = "done"
+            item["custom_prompt"] = True
+            item["prompt"] = "旧版整段提示词不得再次进入当前镜头"
             item["qc"] = {"passed": False, "issues": ["测试标记未过"]}
     plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
 
     barrier = threading.Barrier(2)
     active = 0
     max_active = 0
+    regen_kwargs = []
     state_lock = threading.Lock()
 
     def fake_regen(self, *args, **kwargs):
@@ -1248,6 +1251,7 @@ def test_batch_redo_dispatches_same_scene_keyframes_in_parallel(app, monkeypatch
         with state_lock:
             active += 1
             max_active = max(max_active, active)
+            regen_kwargs.append(dict(kwargs))
         try:
             barrier.wait(timeout=2)
         finally:
@@ -1267,6 +1271,9 @@ def test_batch_redo_dispatches_same_scene_keyframes_in_parallel(app, monkeypatch
     assert result["status"] == "done"
     assert result["redone"] == 2 and result["checked"] == 2
     assert max_active == 2
+    assert all(call["prompt_override"] == "" for call in regen_kwargs)
+    assert all(call["revision_source"] == "batch_current_contract"
+               for call in regen_kwargs)
 
 
 def test_manual_qc_pass_promotes_failed_draft_and_keeps_audit_reason(app,
