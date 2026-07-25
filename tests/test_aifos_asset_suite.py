@@ -78,6 +78,14 @@ def test_character_sheet_prompt_compiler_is_scope_specific(app):
         assert "刀伤" not in prompt
 
 
+def test_scene_prompt_preserves_full_location_name_with_separator(app):
+    location = "赴任途中·驿馆内室（闪回，数日前夜）"
+    prompt = app.director._scene_prompt(
+        location, "电影级半写实", scene={})
+    assert f"场景概念图/环境基准:{location}" in prompt
+    assert "时间与天气:驿馆内室（闪回，数日前夜）" in prompt
+
+
 def test_character_sheet_contract_is_single_subject(app):
     contract = app.director._character_sheet_composition_contract(
         "林川", "closeup")

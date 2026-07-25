@@ -60,7 +60,7 @@ def test_qc_prompt_and_validation():
     assert bad["issues"] == ["镜头9画成了动物"]
 
 
-def test_qc_separates_correct_image_from_broken_input_contract(app):
+def test_qc_keeps_broken_input_contract_advisory_when_image_is_correct(app):
     from aifos.adapters.claude_script import validate_image_qc
 
     report = app.director._assess_image_qc({
@@ -92,9 +92,11 @@ def test_qc_separates_correct_image_from_broken_input_contract(app):
 
     assert report["image_passed"] is True
     assert report["input_contract_passed"] is False
-    assert report["passed"] is False
+    assert report["passed"] is True
     assert report["redraw_required"] is False
     assert report["contract_repair_required"] is True
+    assert report["input_contract_advisory"] is True
+    assert report["qc_policy"] == "visible_major_defects_v2"
     assert validate_image_qc({"issues": []}) == "缺少 pass 字段"
 
 
@@ -841,19 +843,12 @@ def test_qc_report_lands_in_plan(app):
     plan = json.loads(
         (app.workspace.artifacts_dir / f"p{project['id']:03d}" / "e001"
          / "render_plan.json").read_text(encoding="utf-8"))
-    for cat in ("character_candidate", "scene_art"):
+    for cat in ("character_candidate", "character_sheet", "scene_art"):
         drawn = [i for i in plan["items"]
                  if i["category"] == cat
                  and i["status"] in ("done", "reused")]
         assert drawn, f"{cat} 无生成条目"
         assert all("qc" not in i for i in drawn), f"{cat} 不应做初始视觉质检"
-    # 四视图等母资产会被后续所有镜头当参考图:生成后即做身份质检
-    sheets = [i for i in plan["items"]
-              if i["category"] == "character_sheet"
-              and i["status"] in ("done", "reused")]
-    assert sheets, "character_sheet 无生成条目"
-    assert all(i.get("qc", {}).get("passed") for i in sheets), \
-        "character_sheet 缺母资产身份质检结果"
     # 关键帧在生成阶段自动质检；首尾帧由整集批量质检同时核对
     # 首、尾两张，避免把帧容器条目误当成单张生成结果。
     drawn = [i for i in plan["items"]

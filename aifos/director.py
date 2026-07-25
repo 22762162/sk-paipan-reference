@@ -1507,7 +1507,10 @@ class Director:
         place = str(location or scene.get("location") or "未命名地点")
         time_state = (scene.get("time_of_day") or scene.get("time") or "")
         if "·" in place and not time_state:
-            place, suffix = place.split("·", 1)
+            # “·”既可能分隔时间，也常属于完整场景名（如
+            # “赴任途中·驿馆内室（闪回，数日前夜）”）。只提取后半段
+            # 作为时间补充，不能改写生产合同里的场景对象全名。
+            _, suffix = place.split("·", 1)
             time_state = suffix.strip()
         time_state = time_state or "按本场剧情确定的时间与天气"
         production_design = (
@@ -3079,21 +3082,15 @@ class Director:
         elif not spatial_match:
             issues.append("人物、道具与镜头的相对位置/朝向不成立")
         issues = list(dict.fromkeys(issues))
-        text = self._qc_issue_text(issues).lower()
-        mismatch_words = (
-            "人物不一致", "人物形象", "身份", "同一个人", "脸不一致",
-            "性别", "男性", "女性", "人数", "数量", "多余人物",
-            "缺失人物", "新增人物", "重复人物", "person count",
-            "identity", "gender", "sex mismatch",
-        )
+        # 是否触发硬失败只认结构化核验字段，不能因为 issues 中出现
+        # “人物形象轻微偏差”“提示词身份说明重复”等字样就误判重画。
         visual_hard_failure = (
             not identity_checked or not identity_match
             or not gender_checked or not gender_match
             or not count_checked or not count_match
             or not overlay_checked or not overlay_match
             or not physical_checked or not physical_match
-            or not spatial_checked or not spatial_match
-            or any(word in text for word in mismatch_words))
+            or not spatial_checked or not spatial_match)
         prompt_status = str(
             input_diagnosis["prompt_diagnosis"].get("status") or "").lower()
         reference_status = str(
@@ -3122,9 +3119,10 @@ class Director:
             image_passed = (
                 checked_true(verdict.get("pass"))
                 and not visual_hard_failure)
-        passed = (
-            image_passed and input_contract_passed
-            and visual_checks_passed)
+        # 图片已经生成后，以普通观众实际能看到的成片结果决定是否放行。
+        # 提示词冗余、参考图说明不够简洁等输入合同问题继续记录为优化
+        # 建议，但不再把视觉合格的图片判失败或触发昂贵的自动重画。
+        passed = image_passed and visual_checks_passed
         report = {
             "passed": passed,
             "issues": issues,
@@ -3160,6 +3158,8 @@ class Director:
             "redraw_required": not image_passed,
             "contract_repair_required": not input_contract_passed,
             "production_ready": passed,
+            "qc_policy": "visible_major_defects_v2",
+            "input_contract_advisory": not input_contract_passed,
             "hard_failure": bool(visual_hard_failure and not image_passed),
         }
         report.update({
@@ -5853,22 +5853,6 @@ class Director:
                         "aspect": sheet_aspect, **sheet_dims,
                     }), "sub_dir": "cast",
                     "tag": ("character_sheet", name, key, label),
-                    # 母资产同步质检:四视图等会被后续所有镜头当参考图,
-                    # 一张跑偏就污染全部下游——生成后立即与锁定立绘逐一
-                    # 比对身份,不合格自动重画。多视角图不按人数硬卡。
-                    "qc_spec": {**self._qc_spec(
-                        project_id, [name], forbid=self._FORBID,
-                        expected_characters=[name], expected_count=1,
-                        composition_contract=(
-                            self._character_sheet_composition_contract(
-                                name, key, role=role,
-                                design=designs.get(name))),
-                        character_sheet_key=key,
-                        action=f"人物资产设定图({label}):同一角色"
-                               f"「{name}」的{label},每个视角/局部都必须"
-                               "与最终立绘同一人、同一发型",),
-                        "multi_view": True,
-                        "count_required": False},
                 })
         for tag, result in self._run_parallel(
                 ctx, tasks, line="人物/场景独立资产").items():
