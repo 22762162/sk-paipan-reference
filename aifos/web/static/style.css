@@ -1624,7 +1624,7 @@ audio.player { background: var(--surface-2); }
 .pc-status .ok { color: var(--good); }
 .pc-status .miss { color: var(--serious); }
 
-/* Codex 双通道配置与图片任务分片 */
+/* Codex 多通道配置与图片任务分片 */
 .codex-execution-panel {
   display: grid; gap: 15px; padding: 18px;
   border-color: rgba(57, 135, 229, .36);

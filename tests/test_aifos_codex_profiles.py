@@ -57,6 +57,13 @@ def test_legacy_single_codex_provider_populates_primary_profile(tmp_path):
         "command": ["python3", "-m", "aifos.adapters.codex_image",
                     "--codex", "codex"],
         "enabled": False,
+    }, {
+        "id": "codex_c",
+        "name": "Codex C",
+        "codex_home": "~/.codex-account-c",
+        "command": ["python3", "-m", "aifos.adapters.codex_image",
+                    "--codex", "codex"],
+        "enabled": False,
     }]
 
 
@@ -73,6 +80,32 @@ def test_set_two_profiles_persists_safe_fields_and_mirrors_primary(tmp_path):
     assert raw["providers"]["codex"]["codex_home"] == "~/.codex-main"
     assert raw["providers"]["codex"]["command"] == _profiles()[0]["command"]
     assert Config.load(config_path).codex_profiles() == _profiles()
+
+
+def test_set_three_profiles_enables_twenty_four_slots(tmp_path):
+    config_path = tmp_path / "config.json"
+    profiles = _profiles() + [{
+        "id": "codex_c",
+        "name": "codex-third",
+        "codex_home": "~/.codex-third",
+        "command": _profiles()[0]["command"],
+        "enabled": True,
+    }]
+
+    written = set_codex_profiles(config_path, profiles)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw.setdefault("defaults", {})["parallel_images"] = 8
+    config_path.write_text(
+        json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    config = Config.load(config_path)
+    status = config.codex_parallel_status()
+
+    assert [profile["id"] for profile in written] == [
+        "codex_a", "codex_b", "codex_c"]
+    assert config.get("codex_parallel", "max_parallel") == 3
+    assert status["enabled_count"] == 3
+    assert status["parallel_per_channel"] == 8
+    assert status["total_parallel"] == 24
 
 
 def test_profile_writer_rejects_auth_and_secret_command_args(tmp_path):

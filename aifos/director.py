@@ -3141,7 +3141,7 @@ class Director:
         tasks = sorted(tasks, key=lambda task: (
             -int(task.get("priority", 0)), str(task.get("item_id", ""))))
         # parallel_images 表示每条通道的容量，不是所有通道合计容量：
-        # 单 Codex 通道 8 路，Codex A+B 两条通道合计 16 路。
+        # 单通道最多 8 路；A/B/C 三通道就合计最多 24 路。
         workers = self._total_image_workers()
         if workers == 1 or len(tasks) == 1:
             out, qc_failures = {}, []
@@ -10392,7 +10392,7 @@ class Director:
 
         include_existing=True 时，当前清单虽为 pending、但磁盘已有旧图的
         镜头也必须重新检查；auto_repair=False 可先得到完整失败清单，再
-        交给双 Codex 通道只重画失败项。
+        交给 Codex 多通道只重画失败项。
         """
         project, episode = self._episode_ctx(project_title, episode_number)
         ctx = {"project": dict(project), "episode": dict(episode),
@@ -10561,7 +10561,7 @@ class Director:
             # Each worker owns an App/Director so mutable per-task accounting
             # (cost, provider set, context and router state) cannot leak across
             # images. Profiles are assigned round-robin；每个 Codex 通道可按
-            # parallel_images 并行，A+B 的总容量为每通道容量的两倍。
+            # parallel_images 并行，总容量为每通道容量乘以可用通道数。
             profiles = self._codex_parallel_profiles()
             parallel_workers = self._total_image_workers()
             parallel_workers = max(1, min(parallel_workers, total))

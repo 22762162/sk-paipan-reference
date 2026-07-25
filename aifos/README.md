@@ -288,27 +288,29 @@ macOS 实机 `workspace/config.json` 示例:
 }
 ```
 
-设置页还支持两个独立 Codex 登录态并行出图。只保存通道名称、命令和
+设置页支持最多三个独立 Codex 登录态并行出图。只保存通道名称、命令和
 `CODEX_HOME` 目录，不读取或复制目录内的 `auth.json`/token；图片任务会在
-两个已启用且路径可用的通道间轮询分片。`defaults.parallel_images` 表示
-每条通道的并行容量（最高 8）；设为 8 时，单通道 8 路、双通道合计 16 路：
+所有已启用且路径可用的通道间轮询分片。`defaults.parallel_images` 表示
+每条通道的并行容量（最高 8）；设为 8 时，单通道 8 路、三通道合计 24 路：
 
 ```json
 {
   "defaults": {"parallel_images": 8},
   "codex_parallel": {
-    "max_parallel": 2,
+    "max_parallel": 3,
     "profiles": [
       {"id": "codex_a", "name": "Codex A", "codex_home": "~/.codex",
        "enabled": true},
       {"id": "codex_b", "name": "Codex B", "codex_home": "~/.codex-account-b",
+       "enabled": true},
+      {"id": "codex_c", "name": "Codex C", "codex_home": "~/.codex-account-c",
        "enabled": true}
     ]
   }
 }
 ```
 
-也可以直接在「AI 设置 → Codex 双通道」填写并保存；运行中的任务不会迁移，
+也可以直接在「AI 设置 → Codex 多通道」填写并保存；运行中的任务不会迁移，
 下一批图片生效。设置页的「图片并行生产 · 任务分片」显示通道分配、完成、
 进行中、失败和进度。
 

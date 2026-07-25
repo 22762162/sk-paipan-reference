@@ -1780,6 +1780,7 @@ function codexProfileList(data) {
   const channels = [
     { channel: "A", defaultName: "Codex 通道 A" },
     { channel: "B", defaultName: "Codex 通道 B" },
+    { channel: "C", defaultName: "Codex 通道 C" },
   ];
   return channels.map(({ channel, defaultName }, index) => {
     const exact = raw.find((item) =>
@@ -1956,23 +1957,32 @@ function codexExecutionSettingsHtml(data) {
   const readyCount = profiles.filter((profile) => profile.enabled &&
     ["ready", "healthy", "ok", "idle"].includes(
       String(profile.status || "").toLowerCase())).length;
-  const parallel = readyCount >= 2 ||
-    (readyCount === 0 && enabledCount >= 2 &&
-      profiles.every((profile) => !profile.status));
-  const modeLabel = parallel ? "双通道并行已启用"
-    : enabledCount >= 2 ? "已配置，先修复通道"
-      : enabledCount === 1 ? "单通道兼容模式" : "等待配置两个通道";
+  const enabledProfiles = profiles.filter((profile) => profile.enabled);
+  const statusUnknown = enabledProfiles.length > 0 && enabledProfiles.every(
+    (profile) => !profile.status || profile.status === "unknown");
+  const activeChannelCount = readyCount ||
+    (statusUnknown ? enabledCount : 0);
+  const parallel = activeChannelCount >= 2;
+  const modeLabel = parallel && activeChannelCount === enabledCount
+    ? `${activeChannelCount} 通道并行已启用`
+    : activeChannelCount > 0
+      ? `${activeChannelCount}/${enabledCount} 通道就绪`
+    : enabledCount >= 2 ? `${enabledCount} 通道已配置，先修复异常通道`
+      : enabledCount === 1 ? "单通道兼容模式" : "等待配置 Codex 通道";
+  const perChannelCapacity = Math.max(
+    1, Number(data?.defaults?.parallel_images) || 8);
+  const totalCapacity = Math.max(0, activeChannelCount) * perChannelCapacity;
   return `<section class="panel codex-execution-panel">
     <div class="codex-execution-head">
       <div><span class="eyebrow">PARALLEL CODEX EXECUTION</span>
-        <h2>Codex 双通道</h2>
-        <p>通道 A/B 使用独立 CODEX_HOME；每通道最多 8 路，
-          双通道合计最多 16 路并行生产图片。</p></div>
+        <h2>Codex 多通道</h2>
+        <p>通道 A/B/C 使用独立 CODEX_HOME；每通道当前 ${perChannelCapacity} 路，
+          已就绪 ${activeChannelCount}/${enabledCount} 条，当前总容量 ${totalCapacity} 路。</p></div>
       <span class="chip ${parallel ? "done" : ""}">${modeLabel}</span>
     </div>
     <div class="codex-channel-grid">${profiles.map(codexProfileCard).join("")}</div>
     <div class="codex-profile-actions">
-      <button type="button" class="primary" id="btn-codex-profiles-save">保存双通道配置</button>
+      <button type="button" class="primary" id="btn-codex-profiles-save">保存通道配置</button>
       <span id="codex-profile-save-status" class="dim">${supported
         ? "保存后新图片任务生效，运行中的任务不迁移。"
         : "接口待接入：当前服务未返回 codex_profiles；原 AI 设置仍可正常使用。"}</span>
@@ -2080,16 +2090,16 @@ function drawSettings(data) {
     if (status) status.textContent = "正在写入通道配置…";
     try {
       const fresh = await post({ codex_profiles: profiles });
-      showToast("Codex 双通道配置已保存", "ok");
+      showToast(`Codex ${profiles.filter((profile) => profile.enabled).length} 通道配置已保存`, "ok");
       drawSettings(fresh);
     } catch (e) {
       if (status) {
         status.className = "codex-channel-error";
         status.textContent = `暂未保存：${e.message}（原 AI 设置不受影响）`;
       }
-      showToast(`双通道配置暂不可用：${e.message}`, "error");
+      showToast(`Codex 通道配置暂不可用：${e.message}`, "error");
       button.disabled = false;
-      button.textContent = "保存双通道配置";
+      button.textContent = "保存通道配置";
     }
   };
   bindCodexShardRefresh(data);
@@ -4662,7 +4672,7 @@ async function recheckCurrentAndRedoFailed(episodeId, btn) {
   if (btn) { btn.disabled = true; btn.textContent = "正在安全暂停…"; }
   try {
     await ensureBatchRevisionCheckpoint(episodeId);
-    if (btn) btn.textContent = "A/B 双通道重新质检中…";
+    if (btn) btn.textContent = "Codex 多通道重新质检中…";
     const reply = await api("/api/qc_all", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
