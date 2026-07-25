@@ -194,6 +194,30 @@ def test_router_uses_claude_for_script(tmp_path, monkeypatch):
         app.close()
 
 
+def test_claimed_director_review_rejects_abstract_unshootable_scene():
+    payload = {"project_title": "导演逻辑门禁", "episode_number": 1}
+    script = {
+        "characters": [{"name": "甲", "role": "主角"}],
+        "adaptation_review": {
+            "source_to_screen_strategy": "把心理改成动作",
+            "causal_chain": "触发到结果",
+            "character_motivation": "目标驱动",
+            "physical_reality": "检查重力接触",
+            "spatial_continuity": "检查进出站位",
+            "shootability": "镜头可见",
+            "self_reviewed": True,
+        },
+        "scenes": [{
+            "scene_no": 1, "location": "房间", "characters": ["甲"],
+            "action": "甲意识到局势紧张",
+            "lines": [{"character": "甲", "dialogue": "不好。"}],
+        }],
+    }
+    error = validate_script(script, payload)
+    assert "物理/空间/可拍摄性门禁失败" in error
+    assert "导演改编字段仍由平台兜底" in error
+
+
 # ---- say 配音桥 ----
 def test_say_voice_generation(tmp_path):
     say = _make_bin(tmp_path, "say", FAKE_SAY)

@@ -20,12 +20,23 @@ from pathlib import Path
 
 from ..generation_diagnostics import normalize_generation_diagnostics
 from ..inner_persona import normalize_inner_persona_policy
+from ..story_logic import normalize_script_logic
 from ..story_analysis import STORY_ANALYSIS_SCHEMA, validate_story_analysis
 
-SCRIPT_PROMPT = """你是漫剧编剧。为作品《{title}》第{episode}集创作一集完整剧本。
+SCRIPT_PROMPT = """你是兼具顶级类型片编剧、影视导演、场面调度和连续性经验的漫剧主创。
+为作品《{title}》第{episode}集创作一集完整、能实际拍摄和生成的剧本。
 制作风格输入:{style};本集前提:{premise}。
 
 要求:
+- 如果输入来自小说、故事梗概或泛化叙述，先做影视化改编：保留核心因果、人物
+  动机和关键台词，把“他很震惊、局势紧张、两人交锋”等抽象概括改写成摄影机
+  能直接拍到的动作、反应、道具变化和空间结果；不得照抄小说旁白充当画面;
+- 写完后必须以编剧、导演、场面调度和连续性四个身份进行一次内部自审并修正：
+  核对触发事件→选择→行动→结果的因果链，人物是否知道足够信息、动作是否可达、
+  道具从哪里来又到哪里去、人物如何进出场、站位视线是否成立、伤势/服装/持物
+  是否连续、设备使用方向和重力支撑是否真实；先修正再输出最终 JSON;
+- 每场必须建立 `director_logic`：戏剧功能、入场状态、可见物理动作链、道具连续性、
+  空间逻辑、离场状态和导演意图。禁止“推进剧情、发生冲突、自然表演”等占位语;
 - 若制作风格输入为“未指定”,必须先从题材、时代、地域、人物阶层、物质文化、
   情绪和目标观众推导本剧专属视觉基准；不得默认套用现代乙女、国风、古装、
   2D、3D或半写实模板;
@@ -91,8 +102,24 @@ JSON 格式(字段必须齐全):
    "cast_dedup": {{"compared_with":["其他角色"],"dimensions":["发型","服装结构","身体特征","视觉符号","核心配饰","气质关键词"],"status":"passed","conflicts":[]}}}},
   {{"name": "路人功能名", "role": "背景路人",
    "crowd_function": "在哪一场以几人、什么剧情功能短暂出现;无独立人物资产"}}],
+ "adaptation_review": {{
+   "source_to_screen_strategy": "如何把小说/梗概改成可见戏剧行动",
+   "causal_chain": "逐场触发→选择→行动→结果→钩子检查",
+   "character_motivation": "关键行动与人物目标、信息和风险的对应",
+   "physical_reality": "动作可达、重力支撑、接触点、设备方向与道具来源去向检查",
+   "spatial_continuity": "入口出口、站位、视线、路线和场景布局检查",
+   "shootability": "核心事件如何由镜头直接拍出",
+   "self_reviewed": true}},
  "scenes": [{{"scene_no": 1, "location": "地点",
    "characters": ["出场角色名"], "action": "本场动作描述",
+   "director_logic": {{
+     "dramatic_function": "本场给观众带来的新信息/冲突/转折",
+     "entry_state": "每名重要人物入场位置、姿态、情绪、伤势和持物",
+     "physical_actions": "按先后顺序写可见且可达的单一动作链",
+     "prop_continuity": "关键道具来源、持有人、接触方式和离场去向；无则写无",
+     "spatial_logic": "入口、相对站位、视线对象、动作路径、支撑面与出口",
+     "exit_state": "每名重要人物离场位置、姿态、情绪、伤势和持物",
+     "director_intent": "不用旁白，如何用表演、调度和画面结果拍出本场"}},
    "lines": [{{"character": "角色名", "dialogue": "台词"}}]}}]}}"""
 
 IDOL_PROMPT = """你是 AI 虚拟偶像「{persona}」的内容策划。为第{episode}期短视频写口播脚本。
@@ -177,6 +204,9 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
   道具、桌面/地面、镜头的相对位置，使用方向、接触点、视线和动作可达性；
   涉及电脑/手机/屏幕时必须明确屏幕正面、键盘/手部、使用者和摄影机同侧关系，
   禁止人物坐在屏幕后方却看到屏幕正面等反向构图；
+- 每个有角色的镜头必须输出 `start_state` 和 `end_state`，按角色名分别写
+  pose、position、direction、prop、injury、emotion；姿态必须说明站/坐/跪/
+  躺/伏案及真实支撑面，终态必须能被下一镜继承。空镜输出空对象；
 - prompt 中人物形态按人物设定描写(名字只是称呼,「小鹿」若设定为
   人类不能当动物写;设定为动物/精怪的按设定写,全片保持一致);
 - 不生成对白字幕。手机屏、弹幕、合同等可读文字只描述载体与准确文字，
@@ -196,6 +226,12 @@ JSON 格式:
     "expression":"夸张Q版表情","action":"夸张Q版动作",
     "dialogue":"必要时的内心台词；否则空字符串"}}],
   "physical_logic": "本镜物理/空间关系",
+  "start_state": {{"角色名":{{"pose":"动作起点姿态及支撑面",
+    "position":"相对场景和其他人物的位置","direction":"身体朝向和视线对象",
+    "prop":"手中/身上道具","injury":"伤势","emotion":"可见情绪"}}}},
+  "end_state": {{"角色名":{{"pose":"动作完成后的姿态及支撑面",
+    "position":"终点位置","direction":"终点朝向和视线对象",
+    "prop":"终点持物","injury":"终点伤势","emotion":"终点情绪"}}}},
   "readable_text": {{"carrier":"电脑屏幕", "whitelist":["逐字原文"],
     "layout":"版式/位置", "style":"字体/颜色/层级", "perspective":"透视/反光",
     "priority":"must_read"}},
@@ -476,6 +512,7 @@ def normalize_script_bible(script, payload=None):
     script["story_bible_version"] = 1
     script["declared_character_names"] = cast_names
     script["inner_persona_policy"] = normalize_inner_persona_policy(script)
+    normalize_script_logic(script)
     return script
 
 
@@ -520,6 +557,10 @@ def validate_script_bible(script):
     unknown = sorted(used - declared)
     if unknown:
         return "场次出现未在人物设定中介绍的角色: " + "、".join(unknown)
+    logic = script.get("script_logic_audit") or {}
+    if not logic.get("passed"):
+        issues = logic.get("issues") or ["剧本缺少编剧/导演级逻辑审查"]
+        return "剧本物理/空间/可拍摄性门禁失败: " + "；".join(issues[:6])
     return None
 
 
@@ -585,6 +626,8 @@ def validate_storyboard(storyboard):
         shot.setdefault("camera", "")
         shot.setdefault("dialogue", None)
         shot.setdefault("physical_logic", "")
+        shot.setdefault("start_state", {})
+        shot.setdefault("end_state", {})
         shot.setdefault("readable_text", None)
     # 编号强制连续,避免下游连续性质检失败
     for index, shot in enumerate(storyboard["shots"], start=1):
@@ -770,8 +813,11 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
   运镜、眼神变化过程、呼吸或其他时间动作而判失败；景别裁掉且并非剧情要求必须
   出镜的裤子、腰间配饰等，也不得仅因不可见而判失败。
 
-只输出一个 JSON 对象,不要任何其他文字:
-{{"pass": true或false, "identity_checked": true或false,
+只输出一个 JSON 对象,不要任何其他文字。必须把“画面本身是否正确”和
+“生成输入合同是否正确”分开判断；参考图编号/用途冲突不能伪装成画面人物错误:
+{{"pass": true或false, "visual_pass": true或false,
+"input_contract_pass": true或false,
+"identity_checked": true或false,
 "identity_match": true或false,
 "identity_checks": [{{"character":"角色名",
 "view":"front_or_three_quarter/profile/back/back_or_over_shoulder",
@@ -903,6 +949,9 @@ def validate_image_qc(data):
     if not isinstance(data, dict) or "pass" not in data:
         return "缺少 pass 字段"
     data["pass"] = bool(data["pass"])
+    for key in ("visual_pass", "input_contract_pass"):
+        if key in data:
+            data[key] = bool(data[key])
     issues = data.get("issues")
     if not isinstance(issues, list):
         issues = [str(issues)] if issues else []

@@ -6,6 +6,7 @@ from aifos.prompt_contract import (
     readable_text_required,
     sanitize_text_whitelist,
     shot_local_scene,
+    validate_shot_prompt_contract,
 )
 from aifos.adapters.codex_image import build_instruction
 from aifos.workflow import _text_asset, build_content_review
@@ -243,3 +244,40 @@ def test_system_prompt_fields_never_become_screen_whitelist():
 def test_legacy_shot_uses_local_modern_scene_before_episode_fallback():
     shot = {"description": "现代书房闪回，青年查看银色笔记本电脑"}
     assert shot_local_scene(shot, "明代东宫寝殿") == "现代书房（闪回）"
+
+
+def test_explicit_camera_and_single_subject_over_shoulder_are_authoritative():
+    shot = {
+        "characters": ["朱慈烺"],
+        "description": "朱慈烺背对镜头，肩后望向案上奏疏",
+        "camera": "低机位近景单人过肩固定镜头",
+        "five_dimensions": {"camera_design": {
+            "shot_scale": "全景", "angle": "平视",
+            "camera_position": "正面", "movement": "环绕",
+        }},
+    }
+    contract, image_prompt = compile_shot_prompt(shot, location="东宫")
+    composition = contract["composition"]
+
+    assert contract["camera"]["景别"] == "近景"
+    assert contract["camera"]["角度"] == "仰拍"
+    assert contract["camera"]["机位"] == "过肩"
+    assert contract["camera"]["运镜"] == "固定"
+    assert composition["composition_type"] == "single_subject_over_shoulder"
+    assert composition["expected_visible_figure_count"] == 1
+    assert "严格只有1名人物、1具连续身体" in image_prompt
+    assert "环绕" not in image_prompt
+    assert validate_shot_prompt_contract(contract)["passed"]
+
+
+def test_prompt_contract_blocks_standing_state_for_lying_action():
+    shot = {
+        "characters": ["朱慈烺"],
+        "description": "朱慈烺仰卧于床榻",
+        "start_state": {"朱慈烺": {"pose": "站立"}},
+        "end_state": {"朱慈烺": {"pose": "站立"}},
+    }
+    contract, _ = compile_shot_prompt(shot, location="寝殿")
+    report = validate_shot_prompt_contract(contract)
+    assert not report["passed"]
+    assert any("仰卧" in issue for issue in report["issues"])

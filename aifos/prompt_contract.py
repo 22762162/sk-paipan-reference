@@ -71,14 +71,50 @@ def _camera(shot):
     dimensions = shot.get("five_dimensions") or {}
     design = dimensions.get("camera_design") or {}
     contract = shot.get("shot_contract") or {}
+    raw = _text(shot.get("camera"))
+
+    def explicit(tokens):
+        return next((value for token, value in tokens if token in raw), "")
+
+    # The author/director's explicit current-shot camera text is authoritative.
+    # Five-dimension defaults may fill omissions, but must never contradict it.
+    raw_scale = explicit((
+        ("大特写", "大特写"), ("特写", "特写"), ("近景", "近景"),
+        ("中景", "中景"), ("全景", "全景"), ("远景", "远景"),
+    ))
+    raw_angle = explicit((
+        ("顶拍", "顶拍"), ("顶视", "顶拍"), ("鸟瞰", "顶拍"),
+        ("俯拍", "俯拍"), ("高机位", "俯拍"), ("高角度", "俯拍"),
+        ("仰拍", "仰拍"), ("低机位", "仰拍"), ("低角度", "仰拍"),
+        ("平视", "平视"),
+    ))
+    raw_position = explicit((
+        ("过肩", "过肩"), ("背面", "背面"), ("背后", "背面"),
+        ("侧面", "侧面"), ("侧脸", "侧面"), ("正面", "正面"),
+    ))
+    raw_movement = explicit((
+        ("急推", "急推"), ("缓推", "缓推"), ("推近", "推"),
+        ("上摇", "上摇"), ("下摇", "下摇"), ("环绕", "环绕"),
+        ("跟拍", "跟拍"), ("拉远", "拉"), ("横移", "移"),
+        ("固定", "固定"),
+    ))
     return {
-        "景别": _text(design.get("shot_scale") or contract.get("景别"), "按分镜"),
-        "角度": _text(design.get("angle") or contract.get("角度"), "保持轴线"),
+        "景别": _text(
+            raw_scale or contract.get("景别") or design.get("shot_scale"),
+            "按分镜"),
+        "角度": _text(
+            raw_angle or contract.get("角度") or design.get("angle"),
+            "保持轴线"),
         "焦段": _text(design.get("lens") or contract.get("焦段")),
-        "机位": _text(design.get("camera_position") or contract.get("机位")),
-        "运镜": _text(design.get("movement") or contract.get("运镜"), "固定"),
+        "机位": _text(
+            raw_position or contract.get("机位")
+            or design.get("camera_position")),
+        "运镜": _text(
+            raw_movement or contract.get("运镜") or design.get("movement"),
+            "固定"),
         "动机": _text(design.get("movement_motivation"), "服务主体动作"),
-        "构图": _text(design.get("composition") or contract.get("构图"), "主体清楚"),
+        "构图": _text(
+            contract.get("构图") or design.get("composition"), "主体清楚"),
     }
 
 
@@ -269,7 +305,8 @@ def build_composition_contract(shot):
         name for name, view in actor_views.items() if view == "front"}
     profile_names = {
         name for name, view in actor_views.items() if view == "profile"}
-    over_shoulder = "过肩" in framing_text or (
+    single_over_shoulder = "过肩" in framing_text and len(characters) == 1
+    over_shoulder = ("过肩" in framing_text and len(characters) >= 2) or (
         ("背面" in framing_text or "背影" in framing_text)
         and len(characters) >= 2
         and bool(dialogue.get("dialogue")))
@@ -286,7 +323,17 @@ def build_composition_contract(shot):
                 characters[0] if characters else "")))
     actors = []
     for name in characters:
-        if over_shoulder:
+        if single_over_shoulder:
+            expected_view = (
+                "profile" if any(
+                    cue in framing_text for cue in ("侧面", "侧脸"))
+                else "back_or_over_shoulder")
+            role = "single_subject"
+            basis = (
+                "profile_silhouette" if expected_view == "profile"
+                else "back_silhouette")
+            coverage = "partial"
+        elif over_shoulder:
             is_primary = name == primary and name not in back_names
             expected_view = (
                 "front_or_three_quarter" if is_primary
@@ -313,6 +360,7 @@ def build_composition_contract(shot):
     return {
         "composition_type": (
             "over_shoulder_dialogue" if over_shoulder
+            else "single_subject_over_shoulder" if single_over_shoulder
             else "back_view" if back
             else "profile_view" if profile
             else "standard"),
@@ -323,7 +371,10 @@ def build_composition_contract(shot):
         "count_rule": (
             "前景半身背影/肩膀是已登记的对话者本人，只计作该角色1人，"
             "不得另算成新增人物或人物复制"
-            if over_shoulder else "每个可见人物只计一次"),
+            if over_shoulder else
+            "近机位肩背、头部和可见侧脸必须属于同一具连续身体，"
+            "同一人物只出现一次，不得生成第二具身体"
+            if single_over_shoulder else "每个可见人物只计一次"),
     }
 
 
@@ -474,13 +525,17 @@ def render_shot_prompt(contract, *, mode="image"):
     subject = "、".join(contract["subject"]["actors"]) or "无人"
     count = contract["subject"]["count"]
     camera = contract["camera"]
-    camera_line = "；".join(
-        value for value in (
-            camera.get("景别"), camera.get("角度"), camera.get("焦段"),
-            camera.get("机位"), f"{camera.get('运镜')}({camera.get('动机')})",
-            f"构图{camera.get('构图')}",
-        ) if value
-    )
+    camera_values = [
+        camera.get("景别"), camera.get("角度"), camera.get("焦段"),
+        camera.get("机位"),
+    ]
+    if mode == "video":
+        camera_values.append(
+            f"{camera.get('运镜')}({camera.get('动机')})")
+    else:
+        camera_values.append("静态关键帧只定格最终可见机位与构图")
+    camera_values.append(f"构图{camera.get('构图')}")
+    camera_line = "；".join(value for value in camera_values if value)
     lines = [
         "【镜头合同v2】只执行下列事实，不自行补剧情。",
         f"【主体】严格共{count}人：{subject}（均为真实人物）。",
@@ -527,6 +582,17 @@ def render_shot_prompt(contract, *, mode="image"):
             f"主体{composition.get('expected_primary_count', 1)}人，"
             f"实际可见人形{composition.get('expected_visible_figure_count', count)}人；"
             f"{duties}；{composition.get('count_rule', '')}。")
+    elif composition.get(
+            "composition_type") == "single_subject_over_shoulder":
+        duties = "；".join(
+            f"{item.get('character')}={item.get('role')}/"
+            f"{item.get('expected_view')}"
+            for item in composition.get("actors") or [])
+        lines.insert(
+            3,
+            "【单人过肩构图】"
+            f"严格只有1名人物、1具连续身体；{duties}；"
+            f"{composition.get('count_rule', '')}。")
     if contract.get("style"):
         lines.append(f"【画风】{contract['style']}（只沿用项目基准，不改媒介）。")
     if contract.get("dialogue"):
@@ -556,3 +622,50 @@ def compile_shot_prompt(shot, *, location="", style="", references=None, mode="i
     contract = build_shot_prompt_contract(
         shot, location=location, style=style, references=references)
     return contract, render_shot_prompt(contract, mode=mode)
+
+
+def validate_shot_prompt_contract(contract):
+    """Fail before generation when a shot contract cannot be executed."""
+    contract = contract if isinstance(contract, dict) else {}
+    issues = []
+    subject = contract.get("subject") or {}
+    count = int(subject.get("count") or 0)
+    composition = contract.get("composition") or {}
+    if composition.get("expected_visible_figure_count", count) != count:
+        issues.append("构图可见人数与镜头人物名单不一致")
+    if (composition.get("composition_type") == "over_shoulder_dialogue"
+            and count < 2):
+        issues.append("单人镜头不得使用双人过肩对话合同")
+
+    refs = contract.get("references") or []
+    indexes = [item.get("index") for item in refs if isinstance(item, dict)]
+    if indexes and indexes != list(range(1, len(indexes) + 1)):
+        issues.append("参考图编号不是与提交顺序一致的连续编号")
+
+    action = _text(contract.get("action"))
+    start = _text(contract.get("start"))
+    end = _text(contract.get("end"))
+    state_text = f"{start} {end}"
+    lie = any(token in action for token in (
+        "仰卧", "卧榻", "卧床", "躺下", "躺在", "睡在"))
+    sit = any(token in action for token in (
+        "坐在", "坐于", "伏案", "趴向", "趴在"))
+    if "站立" in state_text and lie:
+        issues.append("人物状态要求站立，但当前动作要求仰卧")
+    if "站立" in state_text and sit:
+        issues.append("人物状态要求站立，但当前动作要求坐姿/伏案")
+
+    camera = contract.get("camera") or {}
+    angle = _text(camera.get("角度"))
+    physical = " ".join(contract.get("physical", {}).get("rules") or [])
+    if angle in {"顶拍", "俯拍"} and any(
+            token in physical for token in ("低机位", "仰拍")):
+        issues.append("镜头要求俯拍/顶拍，但空间合同要求低机位/仰拍")
+    if angle == "仰拍" and any(
+            token in physical for token in ("顶拍", "摄影机在人物上方")):
+        issues.append("镜头要求仰拍，但空间合同要求人物上方俯拍")
+
+    return {
+        "passed": not issues,
+        "issues": list(dict.fromkeys(issues)),
+    }

@@ -48,6 +48,7 @@ from .prompt_contract import (
     compile_shot_prompt,
     readable_text_required,
     shot_local_scene,
+    validate_shot_prompt_contract,
 )
 from .qc_feedback import optimize_qc_feedback
 from .lessons import lessons_block, project_lessons, record_lessons
@@ -1534,7 +1535,8 @@ class Director:
                             "image_task_class", "image_quality", "unit_cost",
                             "qc", "started_at", "finished_at", "duration",
                             "reference_inputs", "revision", "prompt_used",
-                            "prompt_used_hash", "output_uri"):
+                            "prompt_used_hash", "generation_input",
+                            "prompt_contract_validation", "output_uri"):
                     if key in prev:
                         item[key] = prev[key]
                 if prev.get("custom_prompt"):
@@ -1609,6 +1611,35 @@ class Director:
     def _reference_inputs(payload):
         """把本次真实传入产线的参考图做成人可读清单，供手机端核验。"""
         payload = payload or {}
+        manifest = payload.get("reference_manifest")
+        if isinstance(manifest, list):
+            rows = []
+            for position, entry in enumerate(manifest, 1):
+                if not isinstance(entry, dict) or not entry.get("uri"):
+                    continue
+                rows.append({
+                    "index": int(entry.get("index") or position),
+                    "kind": str(entry.get("kind") or entry.get("role")
+                                or "reference"),
+                    "label": str(entry.get("label") or f"参考图{position}"),
+                    "name": str(entry.get("label")
+                                or Path(str(entry["uri"])).name),
+                    "uri": str(entry["uri"]),
+                    "asset_id": entry.get("asset_id"),
+                    "source": (
+                        "asset_center" if entry.get("asset_id") is not None
+                        else "upload"),
+                    "reference_role": str(entry.get("role") or ""),
+                    "attach_to": str(entry.get("character") or ""),
+                    "binding": str(entry.get("binding") or ""),
+                })
+            return {
+                "attached": bool(rows),
+                "count": len(rows),
+                "required": bool(payload.get("require_reference_images")),
+                "schema": "aifos.reference-inputs/v2",
+                "items": rows,
+            }
         rows = []
 
         asset_by_uri = {
@@ -1715,6 +1746,13 @@ class Director:
         issues = []
         if not prompt_used.strip():
             issues.append("最终提示词为空")
+        if payload.get("shot_no") is not None:
+            validation = validate_shot_prompt_contract(
+                payload.get("prompt_contract") or {})
+            if not validation["passed"]:
+                issues.extend(
+                    f"镜头生成合同冲突：{issue}"
+                    for issue in validation["issues"])
         subject = str(payload.get("art_name") or payload.get("location") or "")
         expected_names = characters or ([subject] if subject else [])
         for name in expected_names:
@@ -1864,12 +1902,28 @@ class Director:
                   revision_source="manual"):
         """包住一次出图调用:生成中 → 完成/失败;手动停止落回排队。
         完成时记录实际使用的产线(真实/占位)与回退原因,界面透明可见。"""
-        feedback = (payload or {}).get("feedback", "")
+        payload = payload or {}
+        feedback = payload.get("feedback", "")
+        if payload.get("shot_no") is not None:
+            if not isinstance(payload.get("reference_manifest"), list):
+                self._attach_reference_manifest(payload)
+            validation = validate_shot_prompt_contract(
+                payload.get("prompt_contract") or {})
+            payload["prompt_contract_validation"] = validation
+            if not validation["passed"]:
+                raise AifosError(
+                    "镜头生成合同前置校验失败，未调用生图 API："
+                    + "；".join(validation["issues"]))
+        generation_input = self._image_generation_input(payload)
         self._plan_mark(ctx, item_id, "generating", prompt=prompt,
                         extra={
                             "qc": None,
-                            "prompt_used": (payload or {}).get(
-                                "prompt_compact") or prompt or "",
+                            "prompt_used": generation_input["prompt"],
+                            "prompt_used_hash": generation_input[
+                                "prompt_hash"],
+                            "generation_input": generation_input,
+                            "prompt_contract_validation": payload.get(
+                                "prompt_contract_validation") or {},
                             "reference_inputs": self._reference_inputs(
                                 payload),
                             "revision": {
@@ -2347,7 +2401,7 @@ class Director:
             for action in reference_actions(diagnostics))
 
     def _assess_image_qc(self, qc_spec, verdict, attempts):
-        """把视觉模型结果收敛为身份/性别/人数/物理空间四个门槛。"""
+        """Separate rendered-image truth from prompt/reference contract truth."""
         verdict = verdict or {}
         input_diagnosis = normalize_generation_diagnostics(
             verdict, issues=verdict.get("issues"))
@@ -2446,7 +2500,7 @@ class Director:
             "缺失人物", "新增人物", "重复人物", "person count",
             "identity", "gender", "sex mismatch",
         )
-        hard_failure = (
+        visual_hard_failure = (
             not identity_checked or not identity_match
             or not gender_checked or not gender_match
             or not count_checked or not count_match
@@ -2455,14 +2509,34 @@ class Director:
             or not spatial_checked or not spatial_match
             or (not identity_checks
                 and any(word in text for word in mismatch_words)))
-        passed = (
-            bool(verdict.get("pass"))
-            and identity_checked and identity_match
+        prompt_status = str(
+            input_diagnosis["prompt_diagnosis"].get("status") or "").lower()
+        reference_status = str(
+            input_diagnosis["reference_diagnosis"].get("status")
+            or "").lower()
+        if "input_contract_pass" in verdict:
+            input_contract_passed = bool(verdict["input_contract_pass"])
+        elif prompt_status != "unknown" or reference_status != "unknown":
+            input_contract_passed = (
+                prompt_status == "correct" and reference_status == "correct")
+        else:
+            input_contract_passed = bool(verdict.get("pass"))
+        visual_checks_passed = (
+            identity_checked and identity_match
             and gender_checked and gender_match
             and count_checked and count_match
             and overlay_checked and overlay_match
             and physical_checked and physical_match
             and spatial_checked and spatial_match)
+        if "visual_pass" in verdict:
+            image_passed = (
+                bool(verdict["visual_pass"]) and not visual_hard_failure)
+        else:
+            image_passed = (
+                bool(verdict.get("pass")) and not visual_hard_failure)
+        passed = (
+            image_passed and input_contract_passed
+            and visual_checks_passed)
         report = {
             "passed": passed,
             "issues": issues,
@@ -2492,7 +2566,14 @@ class Director:
             "composition_contract": qc_spec.get(
                 "composition_contract") or {},
             "physical_contract": qc_spec.get("physical_contract") or {},
-            "hard_failure": bool(hard_failure and not passed),
+            "image_passed": image_passed,
+            "visual_pass": image_passed,
+            "input_contract_passed": input_contract_passed,
+            "input_contract_pass": input_contract_passed,
+            "redraw_required": not image_passed,
+            "contract_repair_required": not input_contract_passed,
+            "production_ready": passed,
+            "hard_failure": bool(visual_hard_failure and not image_passed),
         }
         report.update({
             "input_diagnosis": input_diagnosis,
@@ -2597,6 +2678,13 @@ class Director:
                     "spatial_logic_checked": False,
                     "spatial_logic_match": False,
                     "hard_failure": True,
+                    "image_passed": False,
+                    "visual_pass": False,
+                    "input_contract_passed": False,
+                    "input_contract_pass": False,
+                    "redraw_required": False,
+                    "contract_repair_required": True,
+                    "production_ready": False,
                     "identity_references": len(
                         qc_spec.get("identity_references") or []),
                     "input_diagnosis": diagnostics,
@@ -2609,6 +2697,7 @@ class Director:
                     "retry_blocked_reason": (
                         "质检产线未返回提示词与参考图诊断，禁止盲目重试"),
                     "attempt_history": attempt_history,
+                    "generation_input": copy.deepcopy(generation_input),
                 }
                 return result
             result.cost += qc_result.cost
@@ -2631,12 +2720,14 @@ class Director:
             })
             attempt_history.append(history_row)
             report["attempt_history"] = copy.deepcopy(attempt_history)
+            report["generation_input"] = copy.deepcopy(generation_input)
             # 经验库素材:重画后最终通过的图,第一次犯的错也要记住
             if not report["passed"]:
                 lesson_issues.extend(report["issues"])
             report["lesson_issues"] = list(dict.fromkeys(lesson_issues))
             result.qc = report
-            if report["passed"] or attempts >= self._qc_retries():
+            if (report["passed"] or not report["redraw_required"]
+                    or attempts >= self._qc_retries()):
                 return result
             diagnostics = report["input_diagnosis"]
             proposed = retry_input_decision(
@@ -2771,6 +2862,12 @@ class Director:
     def _critical_qc_error(result):
         qc = getattr(result, "qc", None) or {}
         if qc.get("passed") is False:
+            if (qc.get("contract_repair_required")
+                    and not qc.get("redraw_required")):
+                return (
+                    "图片画面未判错，但生成输入合同未通过；"
+                    "已停止自动重画，请先修正提示词/参考图绑定后复检:"
+                    + "；".join(qc.get("issues") or []))
             return (
                 "图片质检未通过；已自动定向修图 "
                 f"{qc.get('attempts', 1) - 1} 次后仍失败:"
@@ -5465,6 +5562,8 @@ class Director:
             references=payload.get("reference_manifest"), mode="image")
         payload["prompt_contract"] = contract
         payload["prompt_compact"] = compact
+        payload["prompt_contract_validation"] = (
+            validate_shot_prompt_contract(contract))
         return payload
 
     def _reference_manifest(self, payload):
@@ -5679,6 +5778,8 @@ class Director:
                 mode="image")
             payload["prompt_contract"] = contract
             payload["prompt_compact"] = compact
+            payload["prompt_contract_validation"] = (
+                validate_shot_prompt_contract(contract))
         else:
             # 人物/场景资产也只把未附表的视觉合同交给 Provider。
             # 参考图及绑定职责由 manifest/真实上传通道单独传递；若继续把
@@ -9463,6 +9564,27 @@ class Director:
 
     def _plan_generation_input(self, item, payload, qc_spec):
         """Recover the exact saved prompt/reference pair for later re-QC."""
+        previous_qc = item.get("qc") or {}
+        saved = previous_qc.get("generation_input")
+        if isinstance(saved, dict) and saved.get("input_hash"):
+            snapshot = copy.deepcopy(saved)
+            snapshot.setdefault("scope", {})
+            snapshot["scope"]["item_id"] = str(item.get("id") or "")
+            snapshot["scope"]["shot_no"] = item.get("shot_no")
+            snapshot["scope"]["frame_kind"] = str(
+                item.get("category")
+                or snapshot["scope"].get("frame_kind") or "")
+            return snapshot
+        saved = item.get("generation_input")
+        if isinstance(saved, dict) and saved.get("input_hash"):
+            snapshot = copy.deepcopy(saved)
+            snapshot.setdefault("scope", {})
+            snapshot["scope"]["item_id"] = str(item.get("id") or "")
+            snapshot["scope"]["shot_no"] = item.get("shot_no")
+            snapshot["scope"]["frame_kind"] = str(
+                item.get("category")
+                or snapshot["scope"].get("frame_kind") or "")
+            return snapshot
         payload = copy.deepcopy(payload or {})
         self._attach_reference_manifest(payload)
         snapshot = self._image_generation_input(payload, qc_spec=qc_spec)
@@ -9473,22 +9595,69 @@ class Director:
         saved_refs = (
             (item.get("reference_inputs") or {}).get("items") or [])
         if saved_refs:
+            # Legacy plans saved the mobile display order
+            # identity→character→spatial, while providers actually submitted
+            # identity→spatial→character.  Recover the provider order and
+            # reuse the current same-URI binding; otherwise old images would
+            # reproduce the very numbering mismatch this migration fixes.
+            role_priority = {
+                "identity": 10, "character_identity": 10,
+                "inner_persona": 20,
+                "spatial": 30, "spatial_blocking": 30,
+                "character": 40, "identity_detail": 40,
+                "wardrobe": 40, "structure": 40,
+                "keyframe": 50,
+                "continuity": 60,
+                "scene": 70,
+                "style": 80,
+                "asset": 90, "user": 90, "manual": 90,
+            }
+            indexed_refs = [
+                (position, ref)
+                for position, ref in enumerate(saved_refs)
+                if isinstance(ref, dict) and ref.get("uri")
+            ]
+            indexed_refs.sort(key=lambda row: (
+                role_priority.get(str(
+                    row[1].get("reference_role")
+                    or row[1].get("kind") or "manual"), 90),
+                row[0]))
+            current_by_uri = {
+                str(ref.get("uri") or ""): ref
+                for ref in snapshot.get("reference_manifest") or []
+                if isinstance(ref, dict) and ref.get("uri")
+            }
             snapshot["reference_manifest"] = [
                 {
+                    **copy.deepcopy(current_by_uri.get(
+                        str(ref.get("uri") or ""), {})),
                     "index": index,
-                    "asset_id": ref.get("asset_id"),
+                    "asset_id": (
+                        ref.get("asset_id")
+                        if ref.get("asset_id") is not None
+                        else current_by_uri.get(
+                            str(ref.get("uri") or ""), {}).get("asset_id")),
                     "uri": str(ref.get("uri") or ""),
                     "label": str(ref.get("label") or ref.get("name")
                                  or f"参考图{index}"),
-                    "role": str(ref.get("reference_role")
-                                or ref.get("kind") or "reference"),
-                    "character": str(ref.get("attach_to") or ""),
-                    "binding": (
-                        f"按生产清单中记录的{ref.get('label') or ref.get('kind') or '参考'}"
-                        "单一职责核验"),
+                    "role": str(
+                        current_by_uri.get(
+                            str(ref.get("uri") or ""), {}).get("role")
+                        or ref.get("reference_role")
+                        or ref.get("kind") or "reference"),
+                    "character": str(
+                        current_by_uri.get(
+                            str(ref.get("uri") or ""), {}).get("character")
+                        or ref.get("attach_to") or ""),
+                    "binding": str(
+                        current_by_uri.get(
+                            str(ref.get("uri") or ""), {}).get("binding")
+                        or (
+                            "按生产清单中记录的"
+                            f"{ref.get('label') or ref.get('kind') or '参考'}"
+                            "单一职责核验")),
                 }
-                for index, ref in enumerate(saved_refs, 1)
-                if isinstance(ref, dict) and ref.get("uri")
+                for index, (_position, ref) in enumerate(indexed_refs, 1)
             ]
             snapshot["reference_hash"] = reference_hash(
                 snapshot["reference_manifest"])
@@ -9623,6 +9792,8 @@ class Director:
         spatial_checked_all = True
         spatial_match_all = True
         hard_failure = False
+        image_passed_all = True
+        input_contract_passed_all = True
         input_diagnoses = []
         try:
             for label, one in uris:
@@ -9643,9 +9814,17 @@ class Director:
                 input_diagnoses.append({
                     "frame": label,
                     "passed": bool(one_report["passed"]),
+                    "image_passed": bool(one_report["image_passed"]),
+                    "input_contract_passed": bool(
+                        one_report["input_contract_passed"]),
                     **copy.deepcopy(one_report["input_diagnosis"]),
                 })
                 passed_all = passed_all and one_report["passed"]
+                image_passed_all = (
+                    image_passed_all and one_report["image_passed"])
+                input_contract_passed_all = (
+                    input_contract_passed_all
+                    and one_report["input_contract_passed"])
                 identity_checked_all = (
                     identity_checked_all
                     and one_report["identity_checked"])
@@ -9688,10 +9867,19 @@ class Director:
                   "physical_logic_match": physical_match_all,
                   "spatial_logic_checked": spatial_checked_all,
                   "spatial_logic_match": spatial_match_all,
+                  "image_passed": image_passed_all,
+                  "visual_pass": image_passed_all,
+                  "input_contract_passed": input_contract_passed_all,
+                  "input_contract_pass": input_contract_passed_all,
+                  "redraw_required": not image_passed_all,
+                  "contract_repair_required":
+                      not input_contract_passed_all,
+                  "production_ready": passed_all,
                   "hard_failure": hard_failure,
                   "identity_references": len(
                       spec.get("identity_references") or []),
                   "generation_input_hash": generation_input["input_hash"],
+                  "generation_input": copy.deepcopy(generation_input),
                   "input_diagnoses": input_diagnoses,
                   "input_diagnosis": (
                       next((
@@ -10037,9 +10225,40 @@ class Director:
                "out_root": self._episode_dir(project, episode)}
         plan = self._plan_read(ctx)
         by_id = {i["id"]: i for i in plan["items"]}
+        requested = [
+            item for item in plan["items"]
+            if item.get("category") in self.SHOT_QC_CATEGORIES
+            and (
+                (only_failed and (item.get("qc") or {}).get("passed") is False)
+                or (not only_failed and item.get("id") in (item_ids or [])))
+        ]
+        contract_failures = [
+            item for item in requested
+            if (item.get("qc") or {}).get("contract_repair_required")
+            or (item.get("qc") or {}).get(
+                "input_contract_passed") is False
+        ]
+        if len(contract_failures) >= 3:
+            note = (
+                f"检测到 {len(contract_failures)} 张共享提示词/参考图合同异常；"
+                "已在调用生图 API 前熔断。请先修复合同并重新质检，"
+                "禁止把系统性输入错误当成逐张画面错误重画。")
+            self.log.warn("director", "批量重画熔断:" + note)
+            result = {
+                "status": "blocked", "redone": 0,
+                "reason": "systemic_input_contract_failure",
+                "affected": len(contract_failures), "note": note,
+            }
+            if progress:
+                progress(
+                    phase="blocked", total=len(requested), completed=0,
+                    redone=0, failed=0, note=note)
+            return result
         if only_failed:
             targets = [i["id"] for i in plan["items"]
                        if (i.get("qc") or {}).get("passed") is False
+                       and (i.get("qc") or {}).get(
+                           "redraw_required", True)
                        and i.get("category") in self.SHOT_QC_CATEGORIES
                        and i.get("status") in (
                            "done", "reused", "awaiting_human", "failed")]
@@ -10175,10 +10394,12 @@ class Director:
                                 worker_ctx)["items"]
                              if entry["id"] == item_id), item)
                         refs = refreshed.get("reference_inputs") or {}
+                        report = refreshed.get("qc")
                         try:
-                            report = worker_director._qc_one(
-                                worker_project, worker_episode, worker_ctx,
-                                refreshed)
+                            if not isinstance(report, dict):
+                                report = worker_director._qc_one(
+                                    worker_project, worker_episode, worker_ctx,
+                                    refreshed)
                             qc_error = ""
                         except AifosError as exc:
                             # Match the serial path: a successful redraw still

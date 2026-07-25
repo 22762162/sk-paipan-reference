@@ -58,6 +58,43 @@ def test_qc_prompt_and_validation():
     bad = {"pass": False, "issues": "镜头9画成了动物"}
     assert validate_image_qc(bad) is None
     assert bad["issues"] == ["镜头9画成了动物"]
+
+
+def test_qc_separates_correct_image_from_broken_input_contract(app):
+    from aifos.adapters.claude_script import validate_image_qc
+
+    report = app.director._assess_image_qc({
+        "identity_required": False,
+        "gender_required": False,
+        "count_required": True,
+        "count": 1,
+        "physical_logic_required": False,
+    }, {
+        "pass": False,
+        "visual_pass": True,
+        "input_contract_pass": False,
+        "count_checked": True,
+        "count_match": True,
+        "issues": ["参考图编号与提交顺序冲突"],
+        "prompt_diagnosis": {
+            "status": "correct", "issues": [],
+            "irrelevant_or_conflicting_sections": []},
+        "reference_diagnosis": {
+            "status": "conflicting", "issues": ["图2用途错位"],
+            "missing_roles": []},
+        "image_error": {
+            "summary": "", "categories": [], "evidence": []},
+        "targeted_prompt_patch": {
+            "instructions": [], "preserve": [],
+            "max_scope": "current_shot_only"},
+        "reference_adjustments": [],
+    }, attempts=1)
+
+    assert report["image_passed"] is True
+    assert report["input_contract_passed"] is False
+    assert report["passed"] is False
+    assert report["redraw_required"] is False
+    assert report["contract_repair_required"] is True
     assert validate_image_qc({"issues": []}) == "缺少 pass 字段"
 
 

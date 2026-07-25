@@ -70,6 +70,75 @@ def test_prompt_carries_numbered_reference_binding(app):
         assert f"图{entry['index']}={entry['label']}" in prompt
 
 
+def test_later_qc_prefers_immutable_generation_snapshot(app):
+    snapshot = {
+        "schema": "aifos.image-generation-input/v1",
+        "scope": {"item_id": "shot:4", "shot_no": 4,
+                  "frame_kind": "keyframe"},
+        "prompt": "镜头4冻结提示词",
+        "prompt_hash": "prompt-hash",
+        "reference_manifest": [
+            {"index": 1, "uri": "/frozen-a.png", "label": "人物A",
+             "role": "identity", "character": "A", "binding": "只锁A"},
+            {"index": 2, "uri": "/frozen-space.png", "label": "空间图",
+             "role": "spatial", "character": "", "binding": "只锁站位"},
+        ],
+        "reference_hash": "reference-hash",
+        "input_hash": "immutable-input-hash",
+    }
+    item = {
+        "id": "shot:4", "shot_no": 4, "category": "shot_image",
+        "generation_input": snapshot,
+        "prompt_used": "会造成漂移的旧提示词",
+        "reference_inputs": {"items": [
+            {"uri": "/wrong-order.png", "label": "错误重建"}]},
+    }
+    recovered = app.director._plan_generation_input(
+        item, {"prompt": "当前重建提示词"}, {})
+
+    assert recovered["input_hash"] == "immutable-input-hash"
+    assert recovered["prompt"] == "镜头4冻结提示词"
+    assert [row["uri"] for row in recovered["reference_manifest"]] == [
+        "/frozen-a.png", "/frozen-space.png"]
+
+
+def test_legacy_qc_recovers_provider_reference_order(app):
+    payload = {
+        "shot_no": 8,
+        "prompt": "镜头8",
+        "identity_references": [{
+            "character": "甲", "uri": "/identity.png", "asset_id": 1,
+        }],
+        "spatial_ref": "/space.png",
+        "character_refs": ["/wardrobe.png"],
+        "asset_matches": [{
+            "uri": "/wardrobe.png", "name": "甲:costume",
+            "label": "甲服装", "reference_role": "wardrobe",
+            "attach_to": "甲",
+        }],
+    }
+    # v1 mobile display order was identity→character→spatial.
+    legacy_item = {
+        "id": "shot:8", "shot_no": 8, "category": "shot_image",
+        "prompt_used": "镜头8冻结提示词",
+        "reference_inputs": {"items": [
+            {"kind": "identity", "uri": "/identity.png",
+             "label": "甲最终立绘", "attach_to": "甲"},
+            {"kind": "character", "uri": "/wardrobe.png",
+             "label": "甲服装", "attach_to": "甲"},
+            {"kind": "spatial", "uri": "/space.png",
+             "label": "空间调度图"},
+        ]},
+    }
+    recovered = app.director._plan_generation_input(
+        legacy_item, payload, {})
+
+    assert [row["uri"] for row in recovered["reference_manifest"]] == [
+        "/identity.png", "/space.png", "/wardrobe.png"]
+    assert recovered["reference_manifest"][1]["role"] == "spatial"
+    assert "只读取人物编号" in recovered["reference_manifest"][1]["binding"]
+
+
 def test_manifest_order_matches_provider_submission_order(app, tmp_path):
     """提示词编号 = API 产线实际提交顺序(图N就是第N张,不许错位)。"""
     project, episode, script = _preproduce(app)

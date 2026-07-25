@@ -745,6 +745,12 @@ class MockProvider(Provider):
                 })
         storyboard = {"episode_title": script.get("episode_title", ""),
                       "shots": shots}
+        for shot in storyboard["shots"]:
+            names = shot.get("characters") or []
+            action = shot.get("description") or "保持当前动作"
+            shot["physical_logic"] = (
+                f"{'、'.join(names) or '空镜'}位于当前场景有效支撑面内；"
+                f"动作“{action}”的朝向、接触点、视线与道具使用方向可达")
         uri = _json_artifact(out_dir / "storyboard.json", storyboard)
         return storyboard, uri
 

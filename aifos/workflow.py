@@ -270,28 +270,41 @@ def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
         # 标准要求相邻景别变化:与上一镜相同时顺位换一档
         scale = next((s for s in ("中景", "全景", "近景", "特写")
                       if s in scales and s != prev_scale), scale)
-    if "俯" in camera:
+    if any(token in camera for token in ("顶拍", "顶视", "鸟瞰")):
+        angle = "顶拍"
+    elif any(token in camera for token in ("俯拍", "高机位", "高角度")):
         angle = "俯拍"
-    elif "仰" in camera:
+    elif any(token in camera for token in ("仰拍", "低机位", "低角度")):
         angle = "仰拍"
     else:
         angle = angles[(index - 1) % len(angles)]
     movement = "固定" if "固定" in movements else movements[0]
+    movement_explicit = False
     for candidate in sorted(movements, key=len, reverse=True):
         if candidate in camera:
             movement = candidate
+            movement_explicit = True
             break
-    if kind in ("reaction", "beat"):
+    if kind in ("reaction", "beat") and not movement_explicit:
         movement = ("推" if kind == "reaction" and "推" in movements
                     else "固定" if "固定" in movements else movements[0])
+    explicit_position = next((
+        value for token, value in (
+            ("过肩", "过肩"), ("背面", "背面"), ("背后", "背面"),
+            ("侧面", "侧面"), ("侧脸", "侧面"), ("正面", "正面"),
+        ) if token in camera), None)
+    explicit_composition = next((
+        value for value in compositions if value in camera), None)
     return {
         "shot_scale": scale,
         "angle": angle,
         "lens": "85mm" if scale in ("近景", "特写") else "35mm",
-        "camera_position": ("过肩" if "过肩" in camera and "过肩" in positions
-                            else positions[(index - 1) % len(positions)]),
+        "camera_position": (
+            explicit_position or positions[(index - 1) % len(positions)]),
         "movement": movement,
-        "composition": compositions[(index - 1) % len(compositions)],
+        "composition": (
+            explicit_composition
+            or compositions[(index - 1) % len(compositions)]),
         "speed": "正常",
         "axis_offset_degrees": (
             ((index - 1) % 3 - 1) * float(storyboard_rules.get(
@@ -312,6 +325,66 @@ def _state(name, continuity, emotion="专注", pose="站立，重心稳定"):
         "direction": "面向本镜主体，视线不越轴",
         "position": anchor.get("default_position", "画面中"),
     }
+
+
+def _visible_pose(text, fallback="保持当前可见姿态"):
+    """Infer only a camera-visible pose; never invent story action."""
+    text = str(text or "")
+    rules = (
+        (("仰卧", "卧榻", "卧床", "躺下", "躺在", "睡在"),
+         "仰卧于明确承托面，身体由床榻/座具稳定支撑"),
+        (("伏案", "趴向", "趴在"),
+         "坐于桌前并俯身伏案，上身由座椅和桌面自然承托"),
+        (("坐起", "坐在", "坐于", "落座"),
+         "坐姿，臀部由座具或床榻稳定支撑"),
+        (("跪下", "跪地", "跪在"),
+         "跪姿，膝部与地面接触并保持重心稳定"),
+        (("蹲下", "蹲在", "半蹲"),
+         "蹲姿，双脚着地且重心位于支撑面内"),
+        (("俯身", "弯腰", "躬身"),
+         "俯身站姿，双脚着地并保持重心可达"),
+        (("奔跑", "跑向", "冲向", "逃跑"),
+         "跑动姿态，落地脚与运动方向一致"),
+        (("走向", "走入", "走出", "行走", "迈步", "进入", "离开"),
+         "行走姿态，落地脚支撑且朝向运动路径"),
+        (("站起", "起身", "站立"),
+         "站立，双脚着地且重心稳定"),
+    )
+    for tokens, pose in rules:
+        if any(token in text for token in tokens):
+            return pose
+    return fallback
+
+
+def _shot_state(name, continuity, text, *, previous=None,
+                emotion="专注", ending=False):
+    """Build a concrete state from the current visible action.
+
+    Previous state is inherited only when it already describes a concrete
+    pose. Generic legacy placeholders must never override a visible sit/lie/
+    kneel action in the current shot.
+    """
+    visible_pose = _visible_pose(text)
+    previous = copy.deepcopy(previous or {})
+    generic = {
+        "", "站立，重心稳定", "完成本镜主要动作，重心可供下一镜继承",
+        "保持当前可见姿态",
+    }
+    if previous and not ending:
+        # A shot starts from the exact prior visible state.  The current
+        # shot's action changes only the end state; changing emotion/pose at
+        # frame zero would create a discontinuity before the action begins.
+        return previous
+    if previous and str(previous.get("pose") or "") not in generic \
+            and visible_pose == "保持当前可见姿态":
+        state = previous
+        if ending:
+            state["emotion"] = emotion or state.get("emotion")
+        return state
+    pose = visible_pose
+    if ending and pose == "保持当前可见姿态":
+        pose = "保持本镜最终可见姿态，重心与接触点可供下一镜继承"
+    return _state(name, continuity, emotion=emotion, pose=pose)
 
 
 def _text_asset(shot, rules=None):
@@ -692,19 +765,40 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
                     scene.get("characters", []),
                     raw.get("timeline_state", "unknown"),
                     inner_policy)[:1]
-        start_state = {
-            name: copy.deepcopy(previous.get(name) or _state(name, continuity))
-            for name in characters
-        }
+        action_text = " ".join(str(value or "") for value in (
+            raw.get("description"), raw.get("physical_logic"),
+            raw.get("prompt")))
+        declared_start = raw.get("start_state")
+        declared_start = (
+            declared_start if isinstance(declared_start, dict) else {})
+        start_state = {}
+        for name in characters:
+            explicit_state = declared_start.get(name)
+            if isinstance(explicit_state, dict) and explicit_state:
+                start_state[name] = copy.deepcopy(explicit_state)
+            else:
+                start_state[name] = _shot_state(
+                    name, continuity, action_text,
+                    previous=previous.get(name), emotion="专注")
         emotion = "消化信息" if kind == "reaction" else (
             "情绪余波" if kind == "beat" else "推进事件")
-        end_state = {
-            name: _state(
-                name, continuity, emotion=emotion,
-                pose="保持原位，完成眼神与呼吸变化" if kind in ("reaction", "beat")
-                else "完成本镜主要动作，重心可供下一镜继承")
-            for name in characters
-        }
+        declared_end = raw.get("end_state")
+        declared_end = (
+            declared_end if isinstance(declared_end, dict) else {})
+        end_state = {}
+        for name in characters:
+            explicit_state = declared_end.get(name)
+            if isinstance(explicit_state, dict) and explicit_state:
+                end_state[name] = copy.deepcopy(explicit_state)
+            elif kind in ("reaction", "beat"):
+                end_state[name] = _state(
+                    name, continuity, emotion=emotion,
+                    pose="保持原位，完成眼神与呼吸变化")
+            else:
+                end_state[name] = _shot_state(
+                    name, continuity, action_text,
+                    previous=start_state.get(name), emotion=emotion,
+                    ending=True)
         previous.update(copy.deepcopy(end_state))
         camera = _camera_plan(
             raw.get("camera", ""), kind, index, rules,
@@ -1111,11 +1205,14 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
                  ("http://", "https://"))
              or Path(block["spatial_reference_uri"]).exists())
         for block in spatial_required)
+    script_gate_error = validate_script_bible(script)
+    script_logic = script.get("script_logic_audit") or {}
     available_gates = [
-        _gate("script_bible", "世界观、前情与人物设定",
-              validate_script_bible(script) is None,
-              (validate_script_bible(script)
-               or "故事世界、故事背景、人物介绍和场次人物名单已锁定")),
+        _gate("script_bible", "剧本导演逻辑与制作圣经",
+              script_gate_error is None,
+              (script_gate_error
+               or (script_logic.get("summary")
+                   or "世界观、前情、人物、因果、物理、空间和可拍摄性已锁定"))),
         _gate("continuity", "连续性圣经", bool(continuity.get("characters"))
               and bool(continuity.get("scenes"))
               and continuity.get("standard_fingerprint") == profile.get(

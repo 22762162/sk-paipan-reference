@@ -442,8 +442,12 @@ def build_instruction(capability, payload, out_dir):
             + "- 当前检查对象是静态关键帧：只检查图中可见的最终状态。不得因为"
             "单张图无法证明运镜、眼神变化过程、呼吸等时间动作而判失败；景别"
             "裁掉且非剧情要求必须出镜的裤子、腰间配饰等，不得仅因不可见判失败。\n"
+            "必须把画面本身是否正确与生成输入合同是否正确分开判断；参考图"
+            "编号/用途冲突不能伪装成画面人物错误。\n"
             "只在标准输出打印一行 JSON,不要产出任何文件,不要多余文字:"
-            '{"pass": true或false, "identity_checked": true或false, '
+            '{"pass": true或false, "visual_pass": true或false, '
+            '"input_contract_pass": true或false, '
+            '"identity_checked": true或false, '
             '"identity_match": true或false, '
             '"identity_checks": [{"character":"角色名",'
             '"view":"front_or_three_quarter/profile/back/back_or_over_shoulder",'
@@ -531,7 +535,8 @@ def run(request, codex, timeout, extra_args, plain=False):
         declared.extend(payload.get("reference_images") or [])
         declared.extend(
             payload.get(key) for key in (
-                "image_uri", "chain_first_uri", "scene_ref", "style_ref")
+                "spatial_ref", "image_uri", "chain_first_uri",
+                "scene_ref", "style_ref")
             if payload.get(key))
         declared = list(dict.fromkeys(str(uri) for uri in declared if uri))
         missing = [

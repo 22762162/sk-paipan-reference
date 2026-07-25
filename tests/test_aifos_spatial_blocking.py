@@ -301,3 +301,20 @@ def test_storyboard_exports_same_number_map_for_prompt_references():
         for actor in shot_blocking(plan, 1)["actors"]
     }
     assert moving_by_name == {"林昭": True, "沈砚": False}
+
+
+def test_lying_actor_uses_support_pose_and_low_camera_target():
+    shot = _shot(1, ["朱慈烺"], "固定", "朱慈烺仰卧于床榻")
+    plan = build_spatial_plan(
+        {"scenes": [{"scene_no": 1, "location": "寝殿"}]},
+        {"shots": [shot]},
+        {"characters": [{"name": "朱慈烺", "role": "主角"}],
+         "scenes": [{"name": "寝殿"}]})
+    block = shot_blocking(plan, 1)
+    actor = block["actors"][0]
+
+    assert actor["pose_start"] == actor["pose_end"] == "lying"
+    assert actor["support_end"] == "床榻"
+    assert actor["height_m"] == .55
+    assert block["camera"]["target_3d"]["y"] == .42
+    assert plan["validation"]["passed"], plan["validation"]["issues"]

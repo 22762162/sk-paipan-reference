@@ -57,6 +57,7 @@ def _source_fingerprint(script, storyboard, continuity):
     } for shot in storyboard.get("shots", [])]
     payload = {
         "blocking_schema": SCHEMA,
+        "pose_contract_version": 2,
         "script_version": script.get("script_version"),
         "scenes": script.get("scenes", []),
         "storyboard": blocking_shots,
@@ -240,15 +241,67 @@ def _camera_orientation(camera_point, target_point):
     }
 
 
-def _attach_camera_3d(camera, start_target, end_target):
+def _pose_profile(state, action="", phase="start"):
+    """Resolve support and eye/torso target height from visible body state."""
+    state = state if isinstance(state, dict) else {}
+    explicit = " ".join(str(state.get(key) or "") for key in (
+        "pose", "position", "support", "action"))
+    pose_tokens = (
+        "仰卧", "俯卧", "侧卧", "卧床", "卧榻", "躺", "平卧",
+        "伏案", "趴桌", "趴在", "趴向", "坐", "落座", "跪", "蹲",
+        "蜷缩", "站立", "站姿",
+    )
+    text = (
+        explicit if any(token in explicit for token in pose_tokens)
+        else f"{explicit} {action}")
+    if any(word in text for word in (
+            "仰卧", "俯卧", "侧卧", "卧床", "卧榻", "躺", "平卧")):
+        support = "床榻" if any(
+            word in text for word in ("床", "榻", "卧榻")) else "地面/已声明支撑面"
+        return {
+            "pose": "lying", "pose_label": "卧姿",
+            "support": support, "height_m": .55, "target_height_m": .42,
+        }
+    if any(word in text for word in ("伏案", "趴桌", "趴在", "趴向")):
+        return {
+            "pose": "leaning_seated", "pose_label": "伏案/前倾坐姿",
+            "support": "座椅与桌面", "height_m": 1.05,
+            "target_height_m": .82,
+        }
+    if any(word in text for word in ("坐", "落座")):
+        return {
+            "pose": "sitting", "pose_label": "坐姿",
+            "support": "座椅/已声明坐面", "height_m": 1.22,
+            "target_height_m": 1.0,
+        }
+    if any(word in text for word in ("跪", "半跪")):
+        return {
+            "pose": "kneeling", "pose_label": "跪姿",
+            "support": "地面", "height_m": 1.12, "target_height_m": .9,
+        }
+    if any(word in text for word in ("蹲", "蜷缩")):
+        return {
+            "pose": "crouching", "pose_label": "蹲姿",
+            "support": "双脚/地面", "height_m": .98, "target_height_m": .78,
+        }
+    return {
+        "pose": "standing", "pose_label": "站姿",
+        "support": "双脚/地面", "height_m": DEFAULT_ACTOR_HEIGHT_M,
+        "target_height_m": 1.25,
+    }
+
+
+def _attach_camera_3d(
+        camera, start_target, end_target,
+        start_target_height=1.25, end_target_height=1.25):
     position = str(camera.get("position") or "")
     movement = str(camera.get("movement") or "")
     start = _world_point(
         camera["start"], _camera_height(position, movement, "start"))
     end = _world_point(
         camera["end"], _camera_height(position, movement, "end"))
-    target_start = _world_point(start_target, 1.25)
-    target_end = _world_point(end_target, 1.25)
+    target_start = _world_point(start_target, start_target_height)
+    target_end = _world_point(end_target, end_target_height)
     horizontal_fov = float(camera.get("fov_degrees") or 39.6)
     vertical_fov = math.degrees(
         2 * math.atan(math.tan(math.radians(horizontal_fov) / 2) * 16 / 9))
@@ -459,6 +512,12 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
                 occupied_ends.append(end)
                 previous_end[name] = end
                 character = character_by_name[name]
+                action_text = " ".join((
+                    str(shot.get("description") or ""),
+                    str(shot.get("prompt") or "")))
+                start_pose = _pose_profile(
+                    state_start, action_text, "start")
+                end_pose = _pose_profile(state_end, action_text, "end")
                 route_direction = _direction(start, end)
                 start_3d = _world_point(start)
                 end_3d = _world_point(end)
@@ -479,7 +538,18 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
                         if start != end
                         else [dict(start_3d, phase="fixed")]
                     ),
-                    "height_m": DEFAULT_ACTOR_HEIGHT_M,
+                    "height_m": end_pose["height_m"],
+                    "start_height_m": start_pose["height_m"],
+                    "end_height_m": end_pose["height_m"],
+                    "target_start_height_m":
+                        start_pose["target_height_m"],
+                    "target_end_height_m": end_pose["target_height_m"],
+                    "pose_start": start_pose["pose"],
+                    "pose_end": end_pose["pose"],
+                    "pose_label_start": start_pose["pose_label"],
+                    "pose_label_end": end_pose["pose_label"],
+                    "support_start": start_pose["support"],
+                    "support_end": end_pose["support"],
                     "moving": start != end,
                     "route_direction": route_direction,
                     "route_label": (f"起点→终点，{route_direction}"
@@ -500,13 +570,19 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
             camera = _attach_camera_3d(
                 _clear_camera_icons(
                     _camera_block(shot, target), actor_markers),
-                start_target, target)
+                start_target, target,
+                sum(p["target_start_height_m"] for p in positions)
+                / max(1, len(positions)),
+                sum(p["target_end_height_m"] for p in positions)
+                / max(1, len(positions)))
             compact = ";".join(
                 f"{p['display_label']}"
                 f"({p['start_3d']['x']},{p['start_3d']['y']},"
                 f"{p['start_3d']['z']})m"
                 f"→({p['end_3d']['x']},{p['end_3d']['y']},"
-                f"{p['end_3d']['z']})m/{p['route_direction']}"
+                f"{p['end_3d']['z']})m/{p['route_direction']}/"
+                f"{p['pose_label_start']}→{p['pose_label_end']}/"
+                f"支撑:{p['support_end']}"
                 for p in positions)
             constraint = (
                 f"空间调度锁：本镜严格 {len(people)} 人；{compact}；"
@@ -636,11 +712,20 @@ def validate_spatial_plan(plan, storyboard):
                     or not route_3d
                     or not all(_point_3d_valid(point)
                                for point in route_3d)
-                    or float(left.get("height_m") or 0) <= 0):
+                    or float(left.get("height_m") or 0) <= 0
+                    or not left.get("pose_start")
+                    or not left.get("pose_end")
+                    or not left.get("support_start")
+                    or not left.get("support_end")):
                 issues.append(
                     f"镜头 {shot_no} 的 "
                     f"{left.get('display_label') or left.get('name')}"
                     " 缺少合法三维站位/路线")
+            if (left.get("pose_end") == "lying"
+                    and float(left.get("target_end_height_m") or 99) > .8):
+                issues.append(
+                    f"镜头 {shot_no} 的 {left.get('name')} 为卧姿，"
+                    "但镜头瞄准高度仍按站姿计算")
             if left.get("moving") and (
                     len(route) < 2 or route[0].get("phase") != "start"
                     or route[-1].get("phase") != "end"
@@ -920,14 +1005,19 @@ def render_scene_svg(scene):
         for actor_index, actor in enumerate(shot.get("actors", [])):
             start = actor.get("start_3d") or _world_point(actor["start"])
             end = actor.get("end_3d") or _world_point(actor["end"])
-            height = float(actor.get("height_m") or DEFAULT_ACTOR_HEIGHT_M)
+            start_height = float(
+                actor.get("start_height_m")
+                or actor.get("height_m") or DEFAULT_ACTOR_HEIGHT_M)
+            end_height = float(
+                actor.get("end_height_m")
+                or actor.get("height_m") or DEFAULT_ACTOR_HEIGHT_M)
             color = actor.get("color", "#fff")
             sx, sy = _project_3d(
                 start, plot_x, plot_y, plot_width, plot_height)
             ex, ey = _project_3d(
                 end, plot_x, plot_y, plot_width, plot_height)
-            start_head = dict(start, y=height)
-            end_head = dict(end, y=height)
+            start_head = dict(start, y=start_height)
+            end_head = dict(end, y=end_height)
             shx, shy = _project_3d(
                 start_head, plot_x, plot_y, plot_width, plot_height)
             ehx, ehy = _project_3d(
@@ -953,7 +1043,10 @@ def render_scene_svg(scene):
                 ])
             actor_label = html.escape(str(actor.get("display_label") or
                                           f"{actor.get('actor_id')} {actor.get('name')}"))
-            route_label = html.escape(str(actor.get("route_label") or "原地静止"))
+            route_label = html.escape(
+                f"{actor.get('pose_label_start', '姿态未标注')}→"
+                f"{actor.get('pose_label_end', '姿态未标注')}；"
+                f"{actor.get('route_label') or '原地静止'}")
             roster_y = plot_y + 42 + actor_index * 30
             parts.extend([
                 f'<circle cx="{roster_x + 7}" cy="{roster_y - 5}" r="6" '
