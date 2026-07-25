@@ -161,6 +161,29 @@ def test_character_suite_generated(app):
     assert all(i["status"] in ("done", "reused") for i in sheet_items)
 
 
+def test_scene_and_character_sheets_share_one_parallel_batch(
+        app, monkeypatch):
+    """无依赖的场景图和人物母资产必须同批开工，不能先 1 路再 N 路。"""
+    batches = []
+    original = app.director._run_parallel
+
+    def record_batch(ctx, tasks, line="出图产线", **kwargs):
+        categories = {
+            str(task.get("item_id") or "").split(":", 1)[0]
+            for task in tasks
+        }
+        if categories & {"scene", "sheet"}:
+            batches.append({"categories": categories, "line": line})
+        return original(ctx, tasks, line=line, **kwargs)
+
+    monkeypatch.setattr(app.director, "_run_parallel", record_batch)
+    _preproduce(app, title="同批并发测试", asset_mode="full")
+
+    assert len(batches) == 1
+    assert batches[0]["categories"] >= {"scene", "sheet"}
+    assert batches[0]["line"] == "人物/场景独立资产"
+
+
 def test_auto_character_asset_policy_is_conservative():
     simple = resolve_character_asset_policy({"mode": "auto"}, {
         "characters": [{"name": "林昭", "role": "主角"}],

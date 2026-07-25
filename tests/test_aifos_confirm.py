@@ -371,3 +371,54 @@ def test_stop_interrupts_long_provider_call(tmp_path):
         provider.generate("image", {"shot_no": 1}, tmp_path,
                           cancel=lambda: True)
     assert _time.monotonic() - start < 10   # 不等 60 秒,秒级返回
+
+
+def test_stop_reaps_codex_imagegen_descendants(tmp_path):
+    """暂停 Codex 适配器时，其 imagegen 后代不能继续在后台占并发。"""
+    import os
+    import stat
+    import time as _time
+
+    from aifos.errors import ProduceCancelled
+    from aifos.production.external import CliProvider
+
+    if not hasattr(os, "killpg"):
+        pytest.skip("当前平台不支持进程组终止")
+    child_pid_file = tmp_path / "imagegen-child.pid"
+    fake_codex = tmp_path / "fake_codex.py"
+    fake_codex.write_text(
+        "#!/usr/bin/env python3\n"
+        "import subprocess\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        "child = subprocess.Popen(['python3', '-c', "
+        "'import time; time.sleep(60)'])\n"
+        f"Path({str(child_pid_file)!r}).write_text(str(child.pid))\n"
+        "time.sleep(60)\n",
+        encoding="utf-8")
+    fake_codex.chmod(fake_codex.stat().st_mode | stat.S_IEXEC)
+    provider = CliProvider("codex", {
+        "type": "cli", "enabled": True, "capabilities": ["image"],
+        "command": [
+            "python3", "-m", "aifos.adapters.codex_image",
+            "--codex", str(fake_codex),
+        ],
+        "timeout": 120,
+    })
+
+    with pytest.raises(ProduceCancelled):
+        provider.generate(
+            "image", {"shot_no": 1, "prompt": "进程清理测试"},
+            tmp_path, cancel=child_pid_file.exists)
+
+    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+    deadline = _time.monotonic() + 5
+    alive = True
+    while _time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            alive = False
+            break
+        _time.sleep(.05)
+    assert not alive, "暂停后 Codex 的 imagegen 子进程仍在后台运行"

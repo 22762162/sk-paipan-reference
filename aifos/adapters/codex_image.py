@@ -23,6 +23,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from aifos.generation_diagnostics import normalize_generation_diagnostics
@@ -533,6 +534,24 @@ def _flags_unsupported(stderr):
         "invalid option", "unknown argument"))
 
 
+def _terminate_process_group(proc, grace=5):
+    """终止 Codex 及其 imagegen 后代，避免暂停后留下幽灵任务。"""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.communicate(timeout=grace)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
+
+
 def run(request, codex, timeout, extra_args, plain=False):
     capability = request["capability"]
     payload = request.get("payload", {})
@@ -584,24 +603,26 @@ def run(request, codex, timeout, extra_args, plain=False):
             [codex, "exec", *args, *extra_args, instruction],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             cwd=str(out_dir), start_new_session=True)
+        previous_handlers = {}
+
+        def forward_termination(signum, _frame):
+            _terminate_process_group(proc)
+            raise SystemExit(128 + signum)
+
+        if threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                previous_handlers[signum] = signal.signal(
+                    signum, forward_termination)
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             # subprocess.run 只会终止直接子进程；Codex 内置 imagegen 可能继续
             # 留在后台占用并发。整组 TERM→KILL，保证超时后没有孤儿进程。
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                proc.communicate()
+            _terminate_process_group(proc)
             raise
+        finally:
+            for signum, previous in previous_handlers.items():
+                signal.signal(signum, previous)
         return subprocess.CompletedProcess(
             proc.args, proc.returncode, stdout, stderr)
 

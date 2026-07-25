@@ -22,7 +22,7 @@ from .base import Provider, ProviderResult
 
 def run_interruptible(name, command, input_text, timeout, cancel=None,
                       cwd=None, env=None):
-    """可中断的子进程执行:每 2 秒检查一次停止信号,收到即 kill。
+    """可中断的子进程执行:每 2 秒检查一次停止信号,先 TERM 再 KILL。
 
     返回 (returncode, stdout, stderr);用户停止 → ProduceCancelled。
     """
@@ -47,13 +47,11 @@ def run_interruptible(name, command, input_text, timeout, cancel=None,
                 break
             except subprocess.TimeoutExpired:
                 if cancel is not None and cancel():
-                    proc.kill()
-                    proc.wait()
+                    _terminate_process(proc)
                     raise ProduceCancelled(
                         f"已手动停止(终止 {name} 外部调用)")
                 if time.monotonic() >= deadline:
-                    proc.kill()
-                    proc.wait()
+                    _terminate_process(proc)
                     raise ProviderError(f"{name} 调用超时({timeout}s)")
         stdout = proc.stdout.read() if proc.stdout else ""
         stderr = proc.stderr.read() if proc.stderr else ""
@@ -65,6 +63,21 @@ def run_interruptible(name, command, input_text, timeout, cancel=None,
                     stream.close()
             except OSError:
                 pass
+
+
+def _terminate_process(proc, grace=5):
+    """给适配器清理子进程组的机会，超时后再强制终止。"""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
 
 
 class CliProvider(Provider):

@@ -5241,7 +5241,9 @@ class Director:
                                        "identity_version": locked["version"]})
                 continue
             raise AifosError(f"角色{name}尚未锁定最终立绘")
-        # 场景可与人物资产套件继续并行；人物出图全部引用最终身份锚点。
+        # 场景与人物资产套件没有先后依赖：统一进入同一批并行队列。
+        # 人物资产只依赖已锁定最终立绘；场景只依赖场景/风格参考图。
+        # 不要先等唯一一张场景图完成，再启动全部人物资产。
         tasks = []
         for scene in ctx["script"]["scenes"]:
             location = scene["location"]
@@ -5257,7 +5259,7 @@ class Director:
                     self._plan_mark(ctx, f"scene:{location}", "reused",
                                     only_pending=True)
                     continue
-            if any(t["tag"] == ("scene", location, "") for t in tasks):
+            if any(t["tag"] == ("scene_art", location) for t in tasks):
                 continue
             scene_references = self._user_reference_payload(
                 project_id, [location],
@@ -5283,16 +5285,8 @@ class Director:
                         scene_references["reference_images"]
                         or self._style_anchor_uri(project_id)),
                     "aspect": ctx["aspect"], **ctx["dims"],
-                }, "sub_dir": "cast", "tag": ("scene", location, "")})
-        for tag, result in self._run_parallel(
-                ctx, tasks, line="场景概念图").items():
-            kind, name, role = tag
-            self.assets.register(
-                project_id, "scene_art", name, uri=result.uri,
-                meta=self._quality_meta(scene_quality[name]))
-            created += 1
-        # 阶段3:人物资产套件产线 并行批量(引用各自立绘+风格基准图)
-        tasks = []
+                }, "sub_dir": "cast", "tag": ("scene_art", location)})
+        # 人物资产套件与场景图共用同一批次，引用各自立绘+风格基准图。
         for character in characters:
             name = character["name"]
             role = character.get("role", "")
@@ -5349,7 +5343,7 @@ class Director:
                         "style_ref": self._style_anchor_uri(project_id),
                         "aspect": sheet_aspect, **sheet_dims,
                     }), "sub_dir": "cast",
-                    "tag": (name, key, label),
+                    "tag": ("character_sheet", name, key, label),
                     # 母资产同步质检:四视图等会被后续所有镜头当参考图,
                     # 一张跑偏就污染全部下游——生成后立即与锁定立绘逐一
                     # 比对身份,不合格自动重画。多视角图不按人数硬卡。
@@ -5361,8 +5355,16 @@ class Director:
                         "multi_view": True,
                         "count_required": False},
                 })
-        for (name, key, label), result in self._run_parallel(
-                ctx, tasks, line="人物资产套件").items():
+        for tag, result in self._run_parallel(
+                ctx, tasks, line="人物/场景独立资产").items():
+            if tag[0] == "scene_art":
+                _kind, name = tag
+                self.assets.register(
+                    project_id, "scene_art", name, uri=result.uri,
+                    meta=self._quality_meta(scene_quality[name]))
+                created += 1
+                continue
+            _kind, name, key, label = tag
             self.assets.register(
                 project_id, "character_sheet", f"{name}:{key}",
                 uri=result.uri,
