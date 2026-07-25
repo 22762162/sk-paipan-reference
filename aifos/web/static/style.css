@@ -253,6 +253,16 @@ td.num, th.num { text-align: right; }
 .log-list div { padding: 3px 0; border-bottom: 1px solid var(--grid); }
 .log-list .lv-WARN { color: var(--warning); }
 .log-list .lv-ERROR { color: var(--critical); }
+.produce-live #live-log {
+  height: clamp(132px, 20dvh, 220px);
+  min-height: 132px;
+  max-height: 220px;
+  overflow-y: auto;
+  overflow-anchor: none;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  contain: layout paint;
+}
 
 .empty { color: var(--ink-3); padding: 12px 0; }
 
