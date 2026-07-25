@@ -11792,7 +11792,10 @@ class Director:
             or (item.get("qc") or {}).get(
                 "input_contract_passed") is False
         ]
-        if len(contract_failures) >= 3:
+        # “重画全部失败项”是自动批操作，遇到系统性合同问题必须熔断；
+        # 用户明确点选 item_ids 则表示合同已先由人工/系统修复，regen_image
+        # 会用最新分镜重新编译提示词和参考图，不能再被旧 QC 快照拦住。
+        if only_failed and len(contract_failures) >= 3:
             note = (
                 f"检测到 {len(contract_failures)} 张共享提示词/参考图合同异常；"
                 "已在调用生图 API 前熔断。请先修复合同并重新质检，"
