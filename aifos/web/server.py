@@ -766,6 +766,24 @@ def _collect_artifacts(app, project_id, ep_num):
     return out
 
 
+def _current_render_plan_items(render_plan):
+    """隐藏旧版第5张人物候选；文件与资产历史仍保留可追溯。"""
+    current = []
+    for item in (render_plan or {}).get("items") or []:
+        if item.get("category") == "character_candidate":
+            index = item.get("candidate_index")
+            if not index:
+                parts = str(item.get("id") or "").rsplit(":", 1)
+                index = parts[-1] if len(parts) == 2 else 0
+            try:
+                if int(index or 0) > 4:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        current.append(item)
+    return current
+
+
 def _production_progress(app, episode, render_plan):
     """把图片清单换算成可核验的实时进度。
 
@@ -776,15 +794,7 @@ def _production_progress(app, episode, render_plan):
     project_id = int(episode["project_id"])
     episode_id = int(episode["id"])
     episode_number = int(episode["number"])
-    plan_items = []
-    for item in (render_plan or {}).get("items") or []:
-        if item.get("category") == "character_candidate":
-            try:
-                if int(item.get("candidate_index") or 0) > 4:
-                    continue
-            except (TypeError, ValueError):
-                pass
-        plan_items.append(item)
+    plan_items = _current_render_plan_items(render_plan)
     running_task = app.db.query_one(
         "SELECT stage, name, status, updated_at FROM tasks "
         "WHERE episode_id=? AND status='running' "
@@ -1626,6 +1636,7 @@ def _episode_payload(app, episode_id):
     image_failures = []
     if render_plan is not None:
         render_plan = copy.deepcopy(render_plan)
+        render_plan["items"] = _current_render_plan_items(render_plan)
         for item in render_plan.get("items", []):
             try:
                 shot_no = int(item.get("shot_no"))

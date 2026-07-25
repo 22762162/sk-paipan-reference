@@ -13,7 +13,7 @@ from aifos.app import App
 from aifos.db import now
 from aifos.director import character_candidate_target
 from aifos.story_analysis import build_story_analysis, validate_story_analysis
-from aifos.web.server import JobRegistry, serve
+from aifos.web.server import JobRegistry, _current_render_plan_items, serve
 
 
 @pytest.fixture()
@@ -55,6 +55,19 @@ def _wait_job(port, job_id, timeout=60):
             return job
         time.sleep(0.2)
     raise TimeoutError("制作任务超时")
+
+
+def test_legacy_fifth_character_candidate_is_hidden_from_current_plan():
+    plan = {"items": [
+        {"id": "candidate:林川:4", "category": "character_candidate",
+         "candidate_index": 4},
+        {"id": "candidate:林川:5", "category": "character_candidate"},
+        {"id": "scene:主场景", "category": "scene_art"},
+    ]}
+    current = _current_render_plan_items(plan)
+    assert [item["id"] for item in current] == [
+        "candidate:林川:4", "scene:主场景"]
+    assert len(plan["items"]) == 3, "过滤不能改写磁盘历史计划"
 
 
 def test_index_and_static(server):
