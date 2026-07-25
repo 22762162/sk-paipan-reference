@@ -76,11 +76,14 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260725-plan-filter-1" in html
-    assert "/static/app.js?v=20260726-speaker-resolution-1" in html
+    assert "/static/style.css?v=20260726-stable-live-log-1" in html
+    assert "/static/app.js?v=20260726-stable-live-log-1" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
+    assert b"stableProductionProgress(data.production_progress)" in app_js
+    assert b"logEl.dataset.signature === signature" in app_js
+    assert b'class="live-elapsed dim"' in app_js
     assert b"pausedProductionState" in app_js
     assert b"pausedProductionAccessHtml" in app_js
     assert b'&& !pausedProduction.active' in app_js

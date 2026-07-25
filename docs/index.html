@@ -261,6 +261,16 @@ td.num, th.num { text-align: right; }
 .log-list div { padding: 3px 0; border-bottom: 1px solid var(--grid); }
 .log-list .lv-WARN { color: var(--warning); }
 .log-list .lv-ERROR { color: var(--critical); }
+.produce-live #live-log {
+  height: clamp(132px, 20dvh, 220px);
+  min-height: 132px;
+  max-height: 220px;
+  overflow-y: auto;
+  overflow-anchor: none;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  contain: layout paint;
+}
 
 .empty { color: var(--ink-3); padding: 12px 0; }
 
@@ -12643,13 +12653,28 @@ function updateLiveStrip(data) {
   const counts = liveCounts(data);
   const slow = secs > 120 && stage !== "cancelling"
     ? " · 外部产线(出图/视频)可能需要几分钟,只要本条时间在走就没卡住" : "";
-  el.innerHTML = `
-    <span class="live-dot${stage === "cancelling" ? " stopping" : ""}"></span>
-    <b>${esc(progress.active
-      ? STAGE_PLAIN[stage] || STAGE_CN[stage] || stage
-      : "当前没有生产任务")}</b>
-    <span class="dim">本步已进行 ${mm}:${ss}${counts ? " · " + counts : ""}${slow}</span>
-    <span class="live-last dim" id="live-last"></span>`;
+  const stageText = progress.active
+    ? STAGE_PLAIN[stage] || STAGE_CN[stage] || stage
+    : "当前没有生产任务";
+  const elapsedText = `本步已进行 ${mm}:${ss}${counts ? " · " + counts : ""}${slow}`;
+  let dot = el.querySelector(".live-dot");
+  let stageEl = el.querySelector(".live-stage");
+  let elapsedEl = el.querySelector(".live-elapsed");
+  if (!dot || !stageEl || !elapsedEl || !el.querySelector("#live-last")) {
+    // 只在首次挂载时建立 DOM；轮询不得反复清空“最新日志”并改变状态条高度。
+    el.innerHTML = `
+      <span class="live-dot${stage === "cancelling" ? " stopping" : ""}"></span>
+      <b class="live-stage">${esc(stageText)}</b>
+      <span class="live-elapsed dim">${esc(elapsedText)}</span>
+      <span class="live-last dim" id="live-last"></span>`;
+    dot = el.querySelector(".live-dot");
+    stageEl = el.querySelector(".live-stage");
+    elapsedEl = el.querySelector(".live-elapsed");
+  } else {
+    dot.classList.toggle("stopping", stage === "cancelling");
+    stageEl.textContent = stageText;
+    elapsedEl.textContent = elapsedText;
+  }
 }
 
 function startLiveTicker(episodeId) {
@@ -12667,18 +12692,29 @@ function startLiveTicker(episodeId) {
       }).catch(() => {});
       const logEl = document.getElementById("live-log");
       if (logEl) api("/api/logs?limit=14").then((rows) => {
-        logEl.innerHTML = rows.reverse().map((r) =>
-          `<div class="lv-${esc(r.level)}">[${esc(r.level)}] ${esc(r.source)}: ${esc(r.message)}</div>`).join("");
-        logEl.scrollTop = logEl.scrollHeight;
+        const ordered = [...rows].reverse();
+        const signature = JSON.stringify(ordered.map((r) => [
+          r.id, r.created_at, r.level, r.source, r.message,
+        ]));
+        if (logEl.dataset.signature === signature) return;
+        const stickToBottom = !logEl.dataset.signature
+          || logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 24;
+        const previousScrollTop = logEl.scrollTop;
+        logEl.innerHTML = ordered.length ? ordered.map((r) =>
+          `<div class="lv-${esc(r.level)}">[${esc(r.level)}] ${esc(r.source)}: ${esc(r.message)}</div>`).join("")
+          : `<div class="dim">暂无产线日志</div>`;
+        logEl.dataset.signature = signature;
+        logEl.scrollTop = stickToBottom
+          ? logEl.scrollHeight
+          : Math.max(0, Math.min(
+            previousScrollTop, logEl.scrollHeight - logEl.clientHeight));
       }).catch(() => {});
     }
-    const bold = strip.querySelector("b");
-    if (bold) {
-      const dim = strip.querySelector(".dim");
-      if (dim) {
-        const mm = Math.floor(secs / 60), ss = String(secs % 60).padStart(2, "0");
-        dim.textContent = dim.textContent.replace(/本步已进行 \d+:\d+/, `本步已进行 ${mm}:${ss}`);
-      }
+    const elapsed = strip.querySelector(".live-elapsed");
+    if (elapsed) {
+      const mm = Math.floor(secs / 60), ss = String(secs % 60).padStart(2, "0");
+      elapsed.textContent = elapsed.textContent.replace(
+        /本步已进行 \d+:\d+/, `本步已进行 ${mm}:${ss}`);
     }
     // 看板上"正在画"的卡片:秒表每秒走字
     document.querySelectorAll(".pc-timer[data-started]").forEach((el) => {
@@ -12695,6 +12731,14 @@ function startLiveTicker(episodeId) {
 
 /* 画布轮询防闪烁:内容签名没变就不重画 */
 let canvasSignature = "";
+
+function stableProductionProgress(progress) {
+  if (!progress || typeof progress !== "object") return progress;
+  // calculated_at 每次 API 请求都会变化，但不代表生产状态变化。
+  // 把它纳入签名会导致整页每 3 秒重建一次，日志区和手机滚动位置随之跳动。
+  const { calculated_at, ...stable } = progress;
+  return stable;
+}
 
 function canvasSig(data) {
   return JSON.stringify([
@@ -12719,7 +12763,7 @@ function canvasSig(data) {
       item.item_id, item.shot_no, item.failed_output_url,
       item.revision_feedback, item.issues,
     ]),
-    data.production_progress,
+    stableProductionProgress(data.production_progress),
     data.production_guidance,
   ]);
 }
