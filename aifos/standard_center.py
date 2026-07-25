@@ -13,6 +13,13 @@ import json
 import sqlite3
 import time
 
+from .rule_governance import (
+    ADVISORY_GATE_IDS,
+    MANDATORY_GATE_IDS,
+    audit_rule_configuration,
+    default_rule_governance,
+    gate_defaults,
+)
 
 DEFAULT_PROFILE_KEY = "sk-manju-v5"
 STANDARD_BUNDLE_SCHEMA = "aifos.production-standard/v1"
@@ -33,6 +40,7 @@ DEFAULT_STANDARD = {
             "和人工定版，最后建立母资产、五维分镜与 Seedance 生产。"),
     },
     "rules": {
+        "rule_governance": default_rule_governance(),
         "production": {
             "pipeline_version": "sk-manju-v5",
             "video_model": "seedance2.0fast_vip",
@@ -159,7 +167,8 @@ DEFAULT_STANDARD = {
                 "signature_accessory", "temperament_keywords",
             ],
             "cast_dedup_overlap_threshold": 2,
-            "three_view_required_after_lock": True,
+            "character_asset_depth_source": "episode_character_asset_policy",
+            "character_asset_default_mode": "auto",
             "canonical_views": [
                 "face_closeup", "front", "profile", "back",
             ],
@@ -291,20 +300,21 @@ DEFAULT_STANDARD = {
             "speeds": ["正常", "升格", "降格", "延时", "定格"],
         },
         "quality_gates": [
-            {"id": "script_bible", "label": "剧本第一道总闸门", "enabled": True, "severity": "block", "description": "小说/梗概已完成影视化改编；世界、人物、因果、信息、物理、时间、空间、道具生命周期、可拍性及局部返编边界完整且不冲突。"},
-            {"id": "character_assets", "label": "人物母资产", "enabled": True, "severity": "block", "description": "人物视觉 DNA 来自剧情、全剧角色已去重；人工定版后具备独立面部、正面、严格侧面和完整背面母资产。"},
-            {"id": "continuity", "label": "连续性", "enabled": True, "severity": "block", "description": "人物、服装、道具、站位及段间状态无跳变。"},
-            {"id": "spatial", "label": "空间调度", "enabled": True, "severity": "block", "description": "逐场锁定人物走位、机位、视锥和屏幕轴线，防止多人漂移或增殖。"},
-            {"id": "five_dimensions", "label": "五维分镜", "enabled": True, "severity": "block", "description": "每镜包含主体、环境、摄影机、时间状态和审美信息。"},
-            {"id": "duration", "label": "时长与时间码", "enabled": True, "severity": "block", "description": "分段时长及 0.5 秒精度符合生产规格。"},
-            {"id": "dialogue", "label": "台词与语速", "enabled": True, "severity": "block", "description": "台词逐字一致、自然拆分，并按情绪计算语速。"},
-            {"id": "performance", "label": "表演空间", "enabled": True, "severity": "block", "description": "关键台词有反应镜，高潮有留白镜，动作独立成镜。"},
-            {"id": "camera", "label": "镜头语言", "enabled": True, "severity": "block", "description": "角度、景别、机位和视觉钩子满足影视化规则。"},
-            {"id": "people", "label": "人物数量", "enabled": True, "severity": "block", "description": "镜头人物与在场角色清单及数量锁一致。"},
-            {"id": "text", "label": "画面文字", "enabled": True, "severity": "block", "description": "可读文字先由关键帧锁字，视频模型不得重写。"},
-            {"id": "frames", "label": "首尾帧", "enabled": True, "severity": "block", "description": "首尾帧与前后镜头状态可无缝衔接。"},
-            {"id": "audio", "label": "声音设计", "enabled": True, "severity": "block", "description": "环境声不为空，Seedance2 随视频人声与口型同步符合规格。"},
-            {"id": "profile", "label": "生产规格", "enabled": True, "severity": "block", "description": "模型、分辨率、配音、口型与无字幕硬规则未漂移。"},
+            {"id": "script_bible", "label": "剧本第一道总闸门", "enabled": True, "severity": "block", "mandatory": True, "owner": "script_development", "description": "小说/梗概已完成影视化改编；世界、人物、因果、信息、物理、时间、空间、道具生命周期、可拍性及局部返编边界完整且不冲突。"},
+            {"id": "character_assets", "label": "人物母资产", "enabled": True, "severity": "block", "mandatory": True, "owner": "character_asset_policy", "description": "所有正式角色已人工锁定最终形象；简化模式只要求最终立绘，完整模式才要求四视图与细节资产。"},
+            {"id": "continuity", "label": "连续性", "enabled": True, "severity": "block", "mandatory": True, "owner": "continuity", "description": "人物、服装、道具、站位及段间状态无跳变。"},
+            {"id": "spatial", "label": "空间调度", "enabled": True, "severity": "block", "mandatory": True, "owner": "blocking", "description": "逐场锁定人物走位、机位、视锥和屏幕轴线，防止多人漂移或增殖。"},
+            {"id": "spatial_seedance", "label": "Seedance 空间参考图", "enabled": True, "severity": "block", "mandatory": True, "owner": "blocking", "description": "多人走位或变机位镜头必须生成并绑定空间示意图。"},
+            {"id": "five_dimensions", "label": "五维分镜", "enabled": True, "severity": "block", "mandatory": True, "owner": "storyboard", "description": "每镜包含主体、环境、摄影机、时间状态和审美信息。"},
+            {"id": "duration", "label": "时长与时间码", "enabled": True, "severity": "block", "mandatory": True, "owner": "storyboard", "description": "分段时长及 0.5 秒精度符合生产规格。"},
+            {"id": "dialogue", "label": "台词与语速", "enabled": True, "severity": "block", "mandatory": True, "owner": "storyboard", "description": "台词逐字一致、自然拆分，并按情绪计算语速。"},
+            {"id": "performance", "label": "表演空间", "enabled": True, "severity": "warning", "mandatory": False, "owner": "storyboard", "description": "关键台词后的反应镜和高潮留白属于导演建议；有意长镜头可记录覆盖理由。"},
+            {"id": "camera", "label": "镜头语言", "enabled": True, "severity": "warning", "mandatory": False, "owner": "storyboard", "description": "景别跳级和机位变化属于导演建议，不得为了机械达标破坏有意的长镜头或正反打。"},
+            {"id": "people", "label": "人物数量", "enabled": True, "severity": "block", "mandatory": True, "owner": "continuity", "description": "镜头人物与在场角色清单及数量锁一致。"},
+            {"id": "text", "label": "画面文字", "enabled": True, "severity": "block", "mandatory": True, "owner": "text_assets", "description": "可读文字先由关键帧锁字，视频模型不得重写。"},
+            {"id": "frames", "label": "首尾帧", "enabled": True, "severity": "block", "mandatory": True, "owner": "frames", "description": "首尾帧已通过视觉质检，并与前后镜头状态无缝衔接。"},
+            {"id": "audio", "label": "声音设计", "enabled": True, "severity": "block", "mandatory": True, "owner": "delivery", "description": "环境声不为空，Seedance2 随视频人声与口型同步符合规格。"},
+            {"id": "profile", "label": "生产规格", "enabled": True, "severity": "block", "mandatory": True, "owner": "production_standard", "description": "实际 Provider、模型、质量、配音、口型与无字幕硬规则未漂移。"},
         ],
         "delivery": {
             "no_bgm": True,
@@ -332,8 +342,8 @@ LOCKED_PRODUCTION_RULES = {
 
 REQUIRED_GATE_IDS = [
     "script_bible", "character_assets", "continuity", "spatial",
-    "five_dimensions", "duration", "dialogue", "performance", "camera",
-    "people", "text", "frames", "audio", "profile",
+    "spatial_seedance", "five_dimensions", "duration", "dialogue",
+    "performance", "camera", "people", "text", "frames", "audio", "profile",
 ]
 
 
@@ -429,6 +439,64 @@ class StandardCenter:
         for key in ("id", "name", "version", "reference", "principle"):
             nonempty_string(source, key, f"source_skill.{key}")
         rules = required_dict(content, "rules", "rules")
+        governance = required_dict(
+            rules, "rule_governance", "rules.rule_governance")
+        nonempty_string(
+            governance, "schema", "rules.rule_governance.schema")
+        for key in (
+                "single_integrated_qc", "collect_all_issues_before_repair",
+                "unchanged_retry_forbidden", "current_shot_only_repair",
+                "provider_may_silently_override",
+                "qc_observation_auto_promotes_to_rule"):
+            bool_field(
+                governance, key, f"rules.rule_governance.{key}")
+        attempts = governance.get("max_auto_repair_attempts")
+        if (not isinstance(attempts, int) or isinstance(attempts, bool)
+                or attempts != 1):
+            issue(
+                "rules.rule_governance.max_auto_repair_attempts",
+                "默认只允许一次有针对性的自动修复")
+        precedence = governance.get("precedence")
+        if (not isinstance(precedence, list) or not precedence
+                or any(not isinstance(item, dict) or not item.get("id")
+                       for item in precedence)):
+            issue(
+                "rules.rule_governance.precedence",
+                "必须定义非空且可追溯的规则优先级")
+        scopes = governance.get("scopes")
+        if (not isinstance(scopes, list) or not scopes
+                or any(not isinstance(item, dict) or not item.get("id")
+                       or not item.get("expires") for item in scopes)):
+            issue(
+                "rules.rule_governance.scopes",
+                "永久、项目、镜头和临时修正规则必须分层并定义有效期")
+        owners = governance.get("owners")
+        if not isinstance(owners, dict) or not owners:
+            issue(
+                "rules.rule_governance.owners",
+                "每类规则必须登记唯一 owner 与运行时 consumer")
+        else:
+            for owner_key, owner in owners.items():
+                if (not isinstance(owner, dict) or not owner.get("owner")
+                        or not owner.get("consumer")
+                        or not owner.get("stage")):
+                    issue(
+                        f"rules.rule_governance.owners.{owner_key}",
+                        "必须包含 owner、consumer 与 stage")
+        pilot = governance.get("pilot")
+        if not isinstance(pilot, dict):
+            issue("rules.rule_governance.pilot", "必须定义小样片策略")
+        else:
+            for key in (
+                    "enabled_by_default", "simple_project_may_waive",
+                    "human_approval_required"):
+                bool_field(
+                    pilot, key, f"rules.rule_governance.pilot.{key}")
+            duration = pilot.get("duration_seconds")
+            if (not _is_number(duration) or not 5 <= duration <= 15):
+                issue(
+                    "rules.rule_governance.pilot.duration_seconds",
+                    "小样片时长必须为 5 到 15 秒")
 
         production = required_dict(rules, "production", "rules.production")
         for key, locked in LOCKED_PRODUCTION_RULES.items():
@@ -562,12 +630,24 @@ class StandardCenter:
         for key in (
                 "workwear_required_for_occupational_roles",
                 "visual_dna_required", "forbid_template_labels",
-                "cast_dedup_required", "three_view_required_after_lock",
+                "cast_dedup_required",
                 "turnaround_review_board_only",
                 "canonical_views_are_separate_assets",
                 "identity_and_wardrobe_separated", "clean_skin_default"):
             bool_field(
                 character_assets, key, f"rules.character_assets.{key}")
+        if character_assets.get(
+                "character_asset_depth_source") != \
+                "episode_character_asset_policy":
+            issue(
+                "rules.character_assets.character_asset_depth_source",
+                "四视图与细节图必须只由本集人物资产策略决定")
+        if character_assets.get(
+                "character_asset_default_mode") not in (
+                    "auto", "simple", "full"):
+            issue(
+                "rules.character_assets.character_asset_default_mode",
+                "人物资产默认模式只能是 auto、simple 或 full")
         if character_assets.get("seedance_may_redesign_character") is not False:
             issue(
                 "rules.character_assets.seedance_may_redesign_character",
@@ -817,6 +897,23 @@ class StandardCenter:
                 if gate.get("severity") not in ("block", "warning"):
                     issue(f"{path}.severity", "必须是 block 或 warning")
                 nonempty_string(gate, "description", f"{path}.description")
+                bool_field(gate, "mandatory", f"{path}.mandatory")
+                nonempty_string(gate, "owner", f"{path}.owner")
+                defaults = gate_defaults(gate.get("id"))
+                if gate.get("mandatory") != defaults["mandatory"]:
+                    issue(
+                        f"{path}.mandatory",
+                        "门禁 mandatory 属性与统一门禁注册表不一致")
+                if gate.get("id") in MANDATORY_GATE_IDS:
+                    if gate.get("enabled") is not True:
+                        issue(f"{path}.enabled", "合规硬门不能关闭")
+                    if gate.get("severity") != "block":
+                        issue(f"{path}.severity", "合规硬门不能降为警告")
+                elif gate.get("id") in ADVISORY_GATE_IDS \
+                        and gate.get("severity") != "warning":
+                    issue(
+                        f"{path}.severity",
+                        "创作启发式默认只能警告，避免机械规则阻断生产")
 
         delivery = required_dict(rules, "delivery", "rules.delivery")
         for key in (
@@ -830,6 +927,15 @@ class StandardCenter:
         if delivery.get("subtitle_track_must_be_empty") is not True:
             issue("rules.delivery.subtitle_track_must_be_empty", "字幕轨必须为空")
 
+        existing = {(item["path"], item["message"]) for item in issues}
+        for conflict in audit_rule_configuration(content):
+            key = (conflict["path"], conflict["message"])
+            if key not in existing:
+                issues.append({
+                    "path": conflict["path"],
+                    "message": conflict["message"],
+                })
+                existing.add(key)
         return issues
 
     def ensure_default(self):
@@ -867,6 +973,17 @@ class StandardCenter:
         if not isinstance(rules, dict):
             return snapshot
         changed = False
+        governance_defaults = DEFAULT_STANDARD["rules"]["rule_governance"]
+        governance = rules.get("rule_governance")
+        if not isinstance(governance, dict):
+            rules["rule_governance"] = copy.deepcopy(
+                governance_defaults)
+            changed = True
+        else:
+            for key, value in governance_defaults.items():
+                if key not in governance:
+                    governance[key] = copy.deepcopy(value)
+                    changed = True
         production_rules = rules.get("production")
         production_defaults = DEFAULT_STANDARD["rules"]["production"]
         if not isinstance(production_rules, dict):
@@ -946,6 +1063,39 @@ class StandardCenter:
                               and item.get("id") == "script_bible"), 0)
             gates.insert(insert_at, gate)
             changed = True
+        if isinstance(gates, list) and not any(
+                isinstance(gate, dict)
+                and gate.get("id") == "spatial_seedance"
+                for gate in gates):
+            gate = next(copy.deepcopy(item)
+                        for item in DEFAULT_STANDARD["rules"]["quality_gates"]
+                        if item.get("id") == "spatial_seedance")
+            insert_at = next((index + 1 for index, item in enumerate(gates)
+                              if isinstance(item, dict)
+                              and item.get("id") == "spatial"), 0)
+            gates.insert(insert_at, gate)
+            changed = True
+        if isinstance(gates, list):
+            default_gates = {
+                item["id"]: item
+                for item in DEFAULT_STANDARD["rules"]["quality_gates"]
+            }
+            for gate in gates:
+                if (not isinstance(gate, dict)
+                        or gate.get("id") not in default_gates):
+                    continue
+                default_gate = default_gates[gate["id"]]
+                for key in ("mandatory", "owner"):
+                    if gate.get(key) != default_gate[key]:
+                        gate[key] = copy.deepcopy(default_gate[key])
+                        changed = True
+                if gate.get("severity") != default_gate["severity"]:
+                    gate["severity"] = default_gate["severity"]
+                    changed = True
+                if default_gate["mandatory"] \
+                        and gate.get("enabled") is not True:
+                    gate["enabled"] = True
+                    changed = True
         asset_rules = rules.get("character_assets")
         defaults = DEFAULT_STANDARD["rules"]["character_assets"]
         if not isinstance(asset_rules, dict):
@@ -956,6 +1106,9 @@ class StandardCenter:
                 if key not in asset_rules:
                     asset_rules[key] = copy.deepcopy(value)
                     changed = True
+            if "three_view_required_after_lock" in asset_rules:
+                asset_rules.pop("three_view_required_after_lock", None)
+                changed = True
             targets = asset_rules.get("candidate_targets")
             default_targets = defaults["candidate_targets"]
             if not isinstance(targets, dict):

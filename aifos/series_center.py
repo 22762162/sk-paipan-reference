@@ -20,7 +20,13 @@ class SeriesCenter:
 
     def import_batch(self, parsed, *, style="", kind=None,
                      auto_advance=True, style_pack_id=""):
-        """原子建立项目、批次、各集与脚本文档；所有集先进入队列。"""
+        """原子建立项目、批次与各集素材；所有集先进入编剧改编队列。
+
+        文档解析得到的 ``script`` 只是源素材结构化结果，不是已经通过
+        编剧总闸门的正式剧本。它保存在 ``series_source``，激活该集时
+        交给 Director 完成一次综合改编与逻辑审查；禁止直接写入正式
+        ``script`` 文档后绕过第一步。
+        """
         title = str(parsed.get("project_title") or "").strip()
         episodes = list(parsed.get("episodes") or [])
         if not title or not episodes:
@@ -91,12 +97,6 @@ class SeriesCenter:
                          timestamp, timestamp))
                     episode_id = cur.lastrowid
                     episode_ids.append(episode_id)
-                    if script is not None:
-                        conn.execute(
-                            "INSERT INTO documents(episode_id, kind, version, "
-                            "content, created_at) VALUES(?,?,?,?,?)",
-                            (episode_id, "script", 1,
-                             json.dumps(script, ensure_ascii=False), timestamp))
                     source_doc = {
                         "batch_id": batch_id,
                         "position": position,
@@ -107,6 +107,8 @@ class SeriesCenter:
                         "source_title": item.get("title", ""),
                         "mode": item.get("mode", "script"),
                         "source_text": item.get("source_text", ""),
+                        "parsed_script": script,
+                        "requires_writer_adaptation": True,
                     }
                     conn.execute(
                         "INSERT INTO documents(episode_id, kind, version, "
@@ -223,7 +225,28 @@ class SeriesCenter:
         item = batch["next"]
         if item is None:
             return {"done": True, "batch": batch}
-        status = "awaiting_script" if item["mode"] == "script" else "created"
+        # New imports always enter the writer stage. A parsed screenplay or
+        # novel excerpt is source material, not an approved production script.
+        source_row = self.db.query_one(
+            "SELECT content FROM documents WHERE episode_id=? "
+            "AND kind='series_source' ORDER BY version DESC LIMIT 1",
+            (item["episode_id"],))
+        source = {}
+        if source_row is not None:
+            try:
+                source = json.loads(source_row["content"] or "{}")
+            except (TypeError, ValueError):
+                source = {}
+        source_script = source.get("parsed_script")
+        # Compatibility for batches created before this migration: if a real
+        # script document already exists, leave it at the human review gate.
+        existing_script = self.db.query_one(
+            "SELECT id FROM documents WHERE episode_id=? AND kind='script' "
+            "ORDER BY version DESC LIMIT 1", (item["episode_id"],))
+        status = (
+            "awaiting_script"
+            if existing_script is not None and source_script is None
+            else "created")
         timestamp = now()
         self.db.execute(
             "UPDATE episodes SET status=?, updated_at=? WHERE id=?",
@@ -240,6 +263,9 @@ class SeriesCenter:
             "episode_title": item["episode_title"],
             "premise": item["premise"],
             "mode": item["mode"],
+            "source_script": source_script,
+            "requires_writer_adaptation": bool(
+                source.get("requires_writer_adaptation", source_script)),
             "batch": self.get_batch(batch_id),
         }
 

@@ -26,6 +26,20 @@ def test_default_standard_is_complete_and_active(tmp_path):
         content = active["content"]
         assert content["source_skill"]["id"] == "sk-manju-storyboard-skill"
         rules = content["rules"]
+        governance = rules["rule_governance"]
+        assert governance["schema"] == "aifos.rule-governance/v1"
+        assert [item["id"] for item in governance["precedence"][:3]] == [
+            "user_locked_fact", "episode_fact_bible",
+            "shot_local_contract"]
+        retry_scope = next(
+            item for item in governance["scopes"]
+            if item["id"] == "retry_patch")
+        assert retry_scope["expires"] == "after_one_retry_or_pass"
+        assert governance["max_auto_repair_attempts"] == 1
+        assert governance["qc_observation_auto_promotes_to_rule"] is False
+        assert governance["single_integrated_qc"] is True
+        assert governance["collect_all_issues_before_repair"] is True
+        assert governance["pilot"]["duration_seconds"] == 15
         production = rules["production"]
         script_development = rules["script_development"]
         story_analysis = rules["story_analysis"]
@@ -98,6 +112,11 @@ def test_default_standard_is_complete_and_active(tmp_path):
         assert rules["character_assets"][
             "seedance_may_redesign_character"] is False
         assert [gate["id"] for gate in rules["quality_gates"]] == REQUIRED_GATE_IDS
+        by_gate = {gate["id"]: gate for gate in rules["quality_gates"]}
+        assert by_gate["people"]["mandatory"] is True
+        assert by_gate["performance"]["severity"] == "warning"
+        assert by_gate["performance"]["mandatory"] is False
+        assert by_gate["camera"]["severity"] == "warning"
         assert app.db.query_one("PRAGMA busy_timeout")[0] == 5000
     finally:
         app.close()

@@ -1580,8 +1580,8 @@ class Director:
                 if extra:
                     item.update(extra)
                 self._plan_write(ctx, plan)
-                # 出错经验库:质检发现过的问题(含重画后已通过的首轮问题)
-                # 自动归档,之后所有出图/视频提示词带"严禁再犯"清单
+                # 质检问题只记录为待审核观察；临时修订不得自动升级成
+                # 项目永久规则，更不能污染其他镜头的提示词。
                 qc = (extra or {}).get("qc") or {}
                 issues = qc.get("lesson_issues") or (
                     qc.get("issues") if qc.get("passed") is False else [])
@@ -1593,9 +1593,9 @@ class Director:
                         if count:
                             self.log.info(
                                 "director",
-                                f"经验库已归档 {count} 条出错原因"
+                                f"观察库已记录 {count} 条出错原因"
                                 f"({item.get('label', item_id)});"
-                                "后续出图/视频将自动规避")
+                                "未人工批准前不会注入后续提示词")
                     except Exception:
                         pass   # 经验归档失败绝不能影响生产主流程
                 return
@@ -1758,9 +1758,12 @@ class Director:
         for name in expected_names:
             if name and name not in prompt_used:
                 issues.append(f"提示词没有明确写出对象「{name}」")
-        # 用户已明确要求：调用其他 API 时不能只交文字，所有加速项至少一图。
-        if not refs["items"]:
-            issues.append("API 加速必须携带真实参考图，不能只使用文字描述")
+        # A reference is mandatory whenever the task contract says so.
+        # Genesis character candidates are the sole deliberate exception:
+        # when no identity exists yet they may use Codex subscription output,
+        # while the router refuses text-only Seedream/OpenAI API calls.
+        if payload.get("require_reference_images") and not refs["items"]:
+            issues.append("本次生图必须携带真实参考图，不能只使用文字描述")
         for ref in refs["items"]:
             uri = str(ref.get("uri") or "")
             if not uri:
@@ -1853,6 +1856,11 @@ class Director:
         token = task.get("_dispatch_contract_token")
         if not token:
             return task
+        contract = task.get("_dispatch_contract") or {}
+        if contract.get("passed") is not True:
+            raise AifosError(
+                "提示词/参考图输入合同未通过，未调用生图模型："
+                + "；".join(contract.get("issues") or ["未知输入错误"]))
         request = self.image_acceleration.claim(
             ctx["episode"]["id"], task["item_id"], token)
         if request is None:
@@ -1951,8 +1959,12 @@ class Director:
 
     def _qc_retries(self):
         try:
+            # Integrated QC gets one targeted repair. A second failed result
+            # becomes an isolated awaiting_human item while unrelated shots
+            # continue. Persistent retries only accumulate contradictory
+            # patches and waste generation time.
             return max(0, min(int(self.config.get(
-                "defaults", "image_qc_retries", default=1)), 3))
+                "defaults", "image_qc_retries", default=1)), 1))
         except (TypeError, ValueError):
             return 1
 
@@ -2403,6 +2415,12 @@ class Director:
     def _assess_image_qc(self, qc_spec, verdict, attempts):
         """Separate rendered-image truth from prompt/reference contract truth."""
         verdict = verdict or {}
+
+        def checked_true(value):
+            # 视觉模型偶尔返回字符串 "false"；Python 的 bool("false")
+            # 反而为 True。硬门只接受真正的 JSON true。
+            return value is True
+
         input_diagnosis = normalize_generation_diagnostics(
             verdict, issues=verdict.get("issues"))
         identity_required = bool(qc_spec.get("identity_required"))
@@ -2418,48 +2436,71 @@ class Director:
                 str(name) for name in (
                     qc_spec.get("identity_characters") or [])]
             identity_checked = all(
-                name in by_name and bool(by_name[name].get("checked"))
+                name in by_name
+                and checked_true(by_name[name].get("checked"))
                 for name in expected_names)
             identity_match = all(
-                name in by_name and bool(by_name[name].get("match"))
+                name in by_name
+                and checked_true(by_name[name].get("match"))
                 for name in expected_names)
         else:
             identity_checked = (
                 not identity_required
-                or bool(verdict.get("identity_checked")))
+                or checked_true(verdict.get("identity_checked")))
             identity_match = (
                 not identity_required
-                or bool(verdict.get("identity_match")))
+                or checked_true(verdict.get("identity_match")))
         gender_required = bool(qc_spec.get("gender_required"))
         gender_checked = (
-            not gender_required or bool(verdict.get("gender_checked")))
+            not gender_required
+            or checked_true(verdict.get("gender_checked")))
         gender_match = (
-            not gender_required or bool(verdict.get("gender_match")))
+            not gender_required
+            or checked_true(verdict.get("gender_match")))
         count_required = bool(qc_spec.get("count_required"))
         count_checked = (
-            not count_required or bool(verdict.get("count_checked")))
+            not count_required
+            or checked_true(verdict.get("count_checked")))
         count_match = (
-            not count_required or bool(verdict.get("count_match")))
+            not count_required
+            or checked_true(verdict.get("count_match")))
+        detected_count = verdict.get("detected_count")
+        try:
+            detected_count = int(detected_count)
+        except (TypeError, ValueError):
+            detected_count = None
+        if (count_required and detected_count is not None
+                and detected_count != int(qc_spec.get("count", 0))):
+            count_match = False
         overlay_required = bool(qc_spec.get("overlay_count_required"))
         overlay_checked = (
             not overlay_required
-            or bool(verdict.get("overlay_count_checked")))
+            or checked_true(verdict.get("overlay_count_checked")))
         overlay_match = (
             not overlay_required
-            or bool(verdict.get("overlay_count_match")))
+            or checked_true(verdict.get("overlay_count_match")))
+        detected_overlay_count = verdict.get("detected_overlay_count")
+        try:
+            detected_overlay_count = int(detected_overlay_count)
+        except (TypeError, ValueError):
+            detected_overlay_count = None
+        if (detected_overlay_count is not None
+                and detected_overlay_count != int(
+                    qc_spec.get("expected_overlay_count", 0))):
+            overlay_match = False
         physical_required = bool(qc_spec.get("physical_logic_required"))
         physical_checked = (
             not physical_required
-            or bool(verdict.get("physical_logic_checked")))
+            or checked_true(verdict.get("physical_logic_checked")))
         physical_match = (
             not physical_required
-            or bool(verdict.get("physical_logic_match")))
+            or checked_true(verdict.get("physical_logic_match")))
         spatial_checked = (
             not physical_required
-            or bool(verdict.get("spatial_logic_checked")))
+            or checked_true(verdict.get("spatial_logic_checked")))
         spatial_match = (
             not physical_required
-            or bool(verdict.get("spatial_logic_match")))
+            or checked_true(verdict.get("spatial_logic_match")))
         issues = [str(item) for item in (verdict.get("issues") or [])]
         if not identity_checked:
             issues.append("质检未确认已逐人比对最终立绘")
@@ -2472,14 +2513,14 @@ class Director:
         if not count_checked:
             issues.append("质检未核对画面实际人数")
         elif not count_match:
-            detected = verdict.get("detected_count")
+            detected = detected_count
             suffix = f"，检测到{detected}人" if detected is not None else ""
             issues.append(
                 f"画面人数与要求的{qc_spec.get('count', 0)}人不一致{suffix}")
         if not overlay_checked:
             issues.append("质检未单独核对非现实内心Q版叠层数量")
         elif not overlay_match:
-            detected = verdict.get("detected_overlay_count")
+            detected = detected_overlay_count
             suffix = f"，检测到{detected}个" if detected is not None else ""
             issues.append(
                 "内心Q版叠层与要求的"
@@ -2507,15 +2548,15 @@ class Director:
             or not overlay_checked or not overlay_match
             or not physical_checked or not physical_match
             or not spatial_checked or not spatial_match
-            or (not identity_checks
-                and any(word in text for word in mismatch_words)))
+            or any(word in text for word in mismatch_words))
         prompt_status = str(
             input_diagnosis["prompt_diagnosis"].get("status") or "").lower()
         reference_status = str(
             input_diagnosis["reference_diagnosis"].get("status")
             or "").lower()
         if "input_contract_pass" in verdict:
-            input_contract_passed = bool(verdict["input_contract_pass"])
+            input_contract_passed = checked_true(
+                verdict["input_contract_pass"])
         elif prompt_status != "unknown" or reference_status != "unknown":
             input_contract_passed = (
                 prompt_status == "correct" and reference_status == "correct")
@@ -2530,10 +2571,12 @@ class Director:
             and spatial_checked and spatial_match)
         if "visual_pass" in verdict:
             image_passed = (
-                bool(verdict["visual_pass"]) and not visual_hard_failure)
+                checked_true(verdict["visual_pass"])
+                and not visual_hard_failure)
         else:
             image_passed = (
-                bool(verdict.get("pass")) and not visual_hard_failure)
+                checked_true(verdict.get("pass"))
+                and not visual_hard_failure)
         passed = (
             image_passed and input_contract_passed
             and visual_checks_passed)
@@ -2553,9 +2596,8 @@ class Director:
             "physical_logic_match": physical_match,
             "spatial_logic_checked": spatial_checked,
             "spatial_logic_match": spatial_match,
-            "detected_count": verdict.get("detected_count"),
-            "detected_overlay_count": verdict.get(
-                "detected_overlay_count"),
+            "detected_count": detected_count,
+            "detected_overlay_count": detected_overlay_count,
             "expected_overlay_count": qc_spec.get(
                 "expected_overlay_count", 0),
             "narrative_overlays": qc_spec.get(
@@ -2612,6 +2654,17 @@ class Director:
             if not qc_spec or not self._image_qc_enabled():
                 return result
             uri = result.uri
+            # Frame generation returns the reused/locked first frame as
+            # ``result.uri``. The newly generated, risky output is the tail;
+            # inspect that tail and compare it with the first frame instead of
+            # repeatedly approving the already-known keyframe.
+            frame_pair = {}
+            if capability == "frames":
+                frame_pair = {
+                    "first": str((result.data or {}).get("first") or ""),
+                    "last": str((result.data or {}).get("last") or ""),
+                }
+                uri = frame_pair["last"] or uri
             if not uri or not Path(uri).exists():
                 return result
             history_row = {
@@ -2639,6 +2692,29 @@ class Director:
                     "reference_manifest": generation_input[
                         "reference_manifest"],
                 }
+                if frame_pair:
+                    qc_payload["frame_pair"] = copy.deepcopy(frame_pair)
+                    first_uri = frame_pair.get("first")
+                    if first_uri and first_uri != uri:
+                        qc_payload["reference_manifest"] = [
+                            {
+                                "index": 1,
+                                "uri": first_uri,
+                                "label": "同镜头首帧",
+                                "binding": (
+                                    "只用于核对尾帧的人物身份、服装、场景、"
+                                    "道具、文字、屏幕方向和动作连续性"),
+                                "role": "continuity",
+                                "kind": "first_frame",
+                            },
+                            *[
+                                {**entry, "index": index + 2}
+                                for index, entry in enumerate(
+                                    generation_input[
+                                        "reference_manifest"])
+                                if str(entry.get("uri") or "") != first_uri
+                            ],
+                        ]
                 if payload.get("_codex_profile"):
                     qc_payload["_codex_profile"] = payload[
                         "_codex_profile"]
@@ -2724,6 +2800,8 @@ class Director:
             attempt_history.append(history_row)
             report["attempt_history"] = copy.deepcopy(attempt_history)
             report["generation_input"] = copy.deepcopy(generation_input)
+            if frame_pair:
+                report["frame_pair"] = copy.deepcopy(frame_pair)
             # 经验库素材:重画后最终通过的图,第一次犯的错也要记住
             if not report["passed"]:
                 lesson_issues.extend(report["issues"])
@@ -3186,6 +3264,9 @@ class Director:
             if item is None:
                 continue
             issues = list(contract.get("issues") or [])
+            if not ((contract.get("references") or {}).get("items") or []):
+                issues.append(
+                    "API 加速必须携带真实参考图，不能只使用文字描述")
             plan_pending = item.get("status") == "pending"
             if row["acceleration_status"] in ("queued", "running"):
                 status = row["acceleration_status"]
@@ -3278,6 +3359,9 @@ class Director:
                 continue
             contract = row.get("contract") or {}
             issues.extend(contract.get("issues") or [])
+            if not ((contract.get("references") or {}).get("items") or []):
+                issues.append(
+                    "API 加速必须携带真实参考图，不能只使用文字描述")
             if (row["category"] == "character_sheet"
                     and not asset_policy["generate_sheets"]):
                 issues.append("本集使用简化人物资产模式，不生成四视图或细节图")
@@ -5459,15 +5543,14 @@ class Director:
                       (story_world.get("sanctioned_anachronisms") or [])
                       if str(item).strip()]
         parts.append(
-            "【ERA LOCK】时代判断以本剧剧本为唯一标准:画面中每一件"
-            "物品、服装、道具、建筑必须符合剧本声明的时代与世界观"
-            + (f";剧情明确允许跨时代出现(必须按剧情画出,不算时代"
-               f"错乱):{'、'.join(sanctioned)}" if sanctioned else "")
-            + (f";严禁出现:{'、'.join(drift)}" if drift else
-               ";除剧本明确写出的穿越/带入物品外,历史/古代场景不出现"
-               "笔记本电脑、手机、屏幕、现代家具等现代物品")
-            + ";道具形态按真实规格(笔记本电脑=合页翻盖薄板,不得拉长"
-            "变形或塞进不合理容器)")
+            "【ERA LOCK】时代判断以本剧剧本为唯一标准:"
+            + (f"剧情白名单优先于通用时代禁令，以下跨时代物品必须按"
+               f"当前镜头剧情画出且绝不判错:{'、'.join(sanctioned)}；"
+               f"除这些白名单物品外，其余" if sanctioned else "画面中每一件")
+            + "物品、服装、道具、建筑必须符合剧本声明的时代与世界观"
+            + (f";严禁出现:{'、'.join(drift)}" if drift else "")
+            + ";所有道具按当前镜头物理合同中的真实结构、比例、朝向和"
+            "使用关系生成，不得拉长、变形或塞进不合理容器")
         parts.append(
             "【NEGATIVE】禁止身份漂移、性别错误、人数错误、脸部融合、"
             "重复人物、错误服装、无关杂物、脏污皮肤、塑料脸、字幕和标签")
@@ -6103,6 +6186,10 @@ class Director:
         images = {i["shot_no"]: i for i in ctx["images"]}
         ctx["frames"] = []
         reused = 0
+        frame_plan = {
+            item.get("id"): item for item in self._plan_read(
+                ctx).get("items", [])
+            if item.get("category") == "frames"}
         chains = {}
         for shot in ctx["storyboard"]["shots"]:
             chains.setdefault(shot.get("scene_no"), []).append(shot)
@@ -6116,6 +6203,12 @@ class Director:
                     continue
                 shot = chain[round_no]
                 scene_no = shot.get("scene_no")
+                if round_no > 0 and scene_no not in last_by_scene:
+                    self._plan_mark(
+                        ctx, f"frames:{shot['shot_no']}", "pending",
+                        error=(
+                            "等待同场上一镜尾帧通过质检；本镜未调用生图模型"))
+                    continue
                 name = self._shot_name(ctx, shot["shot_no"])
                 payload = self._shot_payload(
                     ctx, shot, continuity_anchor=len(chain) > 1,
@@ -6132,11 +6225,17 @@ class Director:
                               self._asset_quality(last_row))
                     frame_quality = min(
                         levels, key=("low", "medium", "high").index)
-                    if self._quality_meets(
-                            frame_quality, required_quality):
+                    saved_qc = (
+                        frame_plan.get(
+                            f"frames:{shot['shot_no']}", {}).get("qc")
+                        or {})
+                    if (self._quality_meets(
+                            frame_quality, required_quality)
+                            and saved_qc.get("passed") is True):
                         ctx["frames"].append({
                             "shot_no": shot["shot_no"], "first": first,
-                            "last": last, "image_quality": frame_quality})
+                            "last": last, "image_quality": frame_quality,
+                            "qc_passed": True})
                         reused += 1
                         self._plan_mark(ctx, f"frames:{shot['shot_no']}",
                                         "reused", only_pending=True)
@@ -6162,12 +6261,37 @@ class Director:
                     "sub_dir": "frames", "tag": shot["shot_no"],
                     "priority": self._shot_priority(
                         shot, scene_first=round_no == 0),
-                    "scene": scene_no})
+                    "scene": scene_no,
+                    "qc_spec": {**self._qc_spec(
+                        ctx["project"]["id"],
+                        payload.get(
+                            "identity_characters",
+                            payload.get("characters", [])),
+                        location=payload.get("location", ""),
+                        action=(
+                            f"{payload.get('action', '')}；核对尾帧与首帧"
+                            "在人物、服装、道具、场景、文字、屏幕方向和"
+                            "动作状态上连续"),
+                        forbid=self._FORBID + ["字幕条"],
+                        expected_characters=payload.get("characters", []),
+                        expected_count=payload.get("character_count"),
+                        character_background=payload.get(
+                            "character_background", {}),
+                        camera=payload.get("camera", ""),
+                        composition_contract=payload.get(
+                            "composition_contract"),
+                        readable_text=payload.get("readable_text"),
+                        physical_contract=payload.get("physical_contract"),
+                        physical_logic_required=True,
+                        era_exceptions=self._era_exceptions(ctx),
+                        narrative_overlays=payload.get(
+                            "narrative_overlays"))}})
             if not round_tasks:
                 continue
-            results = self._run_parallel(
+            results, qc_failures = self._run_parallel(
                 ctx, round_tasks,
-                line=f"首尾帧帧链(第{round_no + 1}轮·各场并行)")
+                line=f"首尾帧帧链(第{round_no + 1}轮·各场并行)",
+                continue_on_qc_failure=True)
             for task in round_tasks:
                 result = results.get(task["tag"])
                 if result is None:
@@ -6175,6 +6299,8 @@ class Director:
                 shot_no = task["tag"]
                 decision = task["payload"]["quality_decision"]
                 meta = self._quality_meta(decision)
+                meta["qc_passed"] = bool(
+                    (getattr(result, "qc", None) or {}).get("passed"))
                 self._register_shot_asset(
                     ctx, "first_frame", shot_no, result.data["first"],
                     meta=meta)
@@ -6186,12 +6312,33 @@ class Director:
                     "first": result.data["first"],
                     "last": result.data["last"],
                     "image_quality": decision["level"],
+                    "qc_passed": meta["qc_passed"],
                 })
                 last_by_scene[task["scene"]] = {
                     "uri": result.data["last"],
                     "image_quality": decision["level"],
                 }
+            if qc_failures:
+                failed_shots = sorted(
+                    int(task["tag"]) for task, _error in qc_failures)
+                self.log.warn(
+                    "director",
+                    "首尾帧问题已隔离，其余场继续生产；等待人工处理镜头: "
+                    + "、".join(map(str, failed_shots)))
         ctx["frames"].sort(key=lambda f: f["shot_no"])
+        frame_plan = self._plan_read(ctx)
+        waiting = [
+            int(item.get("shot_no"))
+            for item in frame_plan.get("items", [])
+            if item.get("category") == "frames"
+            and item.get("status") in ("awaiting_human", "failed", "pending")
+            and item.get("error")
+        ]
+        if waiting:
+            raise AifosError(
+                "首尾帧生产已完成所有不受影响的镜头；"
+                "以下镜头等待人工修改或上游尾帧通过后再从断点继续: "
+                + "、".join(map(str, sorted(set(waiting)))))
         return {"count": len(ctx["frames"]), "reused": reused}
 
     def _stage_preflight(self, ctx):
@@ -6199,7 +6346,10 @@ class Director:
         report = build_preflight(
             ctx["script"], ctx["storyboard"], ctx["continuity"],
             ctx["text_assets"], ctx["frames"], ctx["production_profile"],
-            ctx.get("blocking"), ctx.get("quality_policy"))
+            ctx.get("blocking"), ctx.get("quality_policy"), {
+                "policy": ctx.get("character_asset_policy") or {},
+                "selection": ctx.get("cast_selection") or {},
+            })
         version = self.projects.save_document(
             ctx["episode"]["id"], "preflight", report)
         (ctx["out_root"] / "preflight_report.json").write_text(
@@ -6854,13 +7004,12 @@ class Director:
                       (world.get("sanctioned_anachronisms") or [])
                       if str(item).strip()]
         lines.append(
-            "【时代与物理】时代判断以本剧剧本为唯一标准；全程物品、服装、"
-            "建筑必须符合剧本声明的时代与世界观"
-            + (f"；剧情明确允许跨时代出现(必须保留,不算错):"
-               f"{'、'.join(sanctioned)}" if sanctioned else "")
-            + (f"，严禁出现:{'、'.join(drift)}" if drift else
-               "，除剧本明确写出的穿越/带入物品外,历史/古代场景不出现"
-               "笔记本电脑、手机等现代物品")
+            "【时代与物理】时代判断以本剧剧本为唯一标准；"
+            + (f"剧情白名单优先于通用时代禁令，以下跨时代物品必须保留"
+               f"且绝不判错:{'、'.join(sanctioned)}；除这些白名单物品外，"
+               if sanctioned else "全程")
+            + "物品、服装、建筑必须符合剧本声明的时代与世界观"
+            + (f"，严禁出现:{'、'.join(drift)}" if drift else "")
             + "；物体在运动中保持真实结构与比例,严禁拉长、扭曲、穿模。")
         lessons = lessons_block(self.assets, ctx["project"]["id"])
         if lessons:
@@ -10646,6 +10795,34 @@ class Director:
                 skipped += 1
                 skipped_items.append({"item_id": item_id,
                                       "reason": "该图已经通过质检"})
+                continue
+            hard_fields = (
+                "identity_checked", "identity_match",
+                "gender_checked", "gender_match",
+                "count_checked", "count_match",
+                "overlay_count_checked", "overlay_count_match",
+                "physical_logic_checked", "physical_logic_match",
+                "spatial_logic_checked", "spatial_logic_match",
+                "input_contract_passed",
+            )
+            failed_hard_fields = [
+                field for field in hard_fields if qc.get(field) is False]
+            issue_text = "；".join(
+                str(value) for value in (qc.get("issues") or []))
+            hard_issue_words = (
+                "身份", "性别", "人数", "数量", "新增人物", "缺失人物",
+                "物理逻辑", "空间关系", "参考图绑定", "提示词冲突",
+            )
+            if (qc.get("hard_failure") is True or failed_hard_fields
+                    or any(word in issue_text for word in hard_issue_words)):
+                skipped += 1
+                skipped_items.append({
+                    "item_id": item_id,
+                    "reason": (
+                        "身份/性别/人数/物理空间/提示词参考图属于硬错误，"
+                        "不能人工强行放行；请修改本镜后重新质检"),
+                    "hard_fields": failed_hard_fields,
+                })
                 continue
             uri, _ = self._plan_item_asset(
                 project["id"], episode["number"], item)

@@ -47,7 +47,7 @@ def test_five_dimension_preflight_and_delivery(tmp_path):
         assert profile["burn_subtitles"] is False
         assert preflight["passed"]
         assert [gate["id"] for gate in preflight["gates"]] == [
-            "script_bible", "continuity", "spatial",
+            "script_bible", "character_assets", "continuity", "spatial",
             "spatial_seedance", "five_dimensions", "duration",
             "dialogue", "performance", "camera", "people", "text",
             "frames", "audio", "profile"]

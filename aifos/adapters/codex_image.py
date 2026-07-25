@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 
 from aifos.generation_diagnostics import normalize_generation_diagnostics
+from aifos.adapters.claude_script import validate_image_qc
 from aifos.prompt_contract import readable_text_required, sanitize_text_whitelist
 
 
@@ -621,6 +622,22 @@ def run(request, codex, timeout, extra_args, plain=False):
             fallback.update(normalize_generation_diagnostics(
                 fallback, issues=fallback["issues"]))
             return {"ok": True, "data": fallback, "uri": ""}
+        validation_error = validate_image_qc(verdict)
+        if validation_error:
+            fallback = {
+                "pass": False,
+                "issues": [
+                    "Codex 视觉质检返回结构无效，图片未放行："
+                    + validation_error],
+                "identity_checked": False, "identity_match": False,
+                "gender_checked": False, "gender_match": False,
+                "count_checked": False, "count_match": False,
+                "note": validation_error,
+            }
+            fallback.update(normalize_generation_diagnostics(
+                fallback, issues=fallback["issues"]))
+            return {"ok": True, "data": fallback, "uri": "",
+                    "model": "Codex 视觉质检"}
         verdict.setdefault("issues", [])
         verdict.update(normalize_generation_diagnostics(
             verdict, issues=verdict.get("issues")))

@@ -278,6 +278,11 @@ def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
         angle = "仰拍"
     else:
         angle = angles[(index - 1) % len(angles)]
+    angle = {
+        "低机位": "仰拍",
+        "高机位": "俯拍",
+        "过肩": "平视",
+    }.get(angle, angle)
     movement = "固定" if "固定" in movements else movements[0]
     movement_explicit = False
     for candidate in sorted(movements, key=len, reverse=True):
@@ -295,12 +300,19 @@ def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
         ) if token in camera), None)
     explicit_composition = next((
         value for value in compositions if value in camera), None)
+    # 高/低机位属于垂直角度，不应再被当作正侧背方位独立轮换；
+    # 否则会产生“俯拍 + 低机位”这种无法执行的双重合同。
+    lateral_positions = [
+        value for value in positions if value not in ("低机位", "高机位")]
+    if not lateral_positions:
+        lateral_positions = ["正面", "斜侧", "过肩", "侧面"]
     return {
         "shot_scale": scale,
         "angle": angle,
         "lens": "85mm" if scale in ("近景", "特写") else "35mm",
         "camera_position": (
-            explicit_position or positions[(index - 1) % len(positions)]),
+            explicit_position
+            or lateral_positions[(index - 1) % len(lateral_positions)]),
         "movement": movement,
         "composition": (
             explicit_composition
@@ -428,13 +440,9 @@ def _text_asset(shot, rules=None):
         r"[《「『【]([^》」』】]{1,40})[》」』】]",
         searchable,
     ) if carrier else []
-    # 同一条要求通常同时出现在 description 和 prompt；白名单必须是稳定、
-    # 去重后的原文。电脑页面若明确写到“崇祯页面”，把页面主题一并锁住，
-    # 否则模型只看到书名，容易生成泛化的白色网页占位面。
+    # 同一条要求通常同时出现在 description 和 prompt；白名单必须只来自
+    # 当前镜头明确声明的原文，不能从某个历史项目推断并永久追加专有词。
     texts = sanitize_text_whitelist(texts)
-    if carrier in ("电脑", "手机屏", "平板", "屏幕") \
-            and "崇祯" in searchable and "崇祯" not in texts:
-        texts.append("崇祯")
     required = bool(carrier)
     return {
         "required": required,
@@ -1032,7 +1040,8 @@ def _gate(gate_id, label, passed, detail):
 
 
 def build_preflight(script, storyboard, continuity, text_manifest, frames,
-                    profile, blocking=None, quality_policy=None):
+                    profile, blocking=None, quality_policy=None,
+                    character_assets=None):
     shots = storyboard.get("shots", [])
     rules = profile.get("rules", {})
     production_rules = rules.get("production", {})
@@ -1047,6 +1056,8 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
     formal_frame_quality_ok = all(
         str(frame.get("image_quality", "medium")).lower()
         in ("medium", "high") for frame in frames)
+    frame_visual_qc_ok = all(
+        frame.get("qc_passed") is True for frame in frames)
     required = (
         "unit_id", "character_count", "start_state", "end_state",
         "shot_function", "script_reference", "readable_text", "visual_hook",
@@ -1209,6 +1220,22 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
         for block in spatial_required)
     script_gate_error = validate_script_bible(script)
     script_logic = script.get("script_logic_audit") or {}
+    character_assets = (
+        character_assets if isinstance(character_assets, dict) else {})
+    asset_policy = character_assets.get("policy") or {}
+    cast_selection = character_assets.get("selection") or {}
+    identities_ready = bool(cast_selection.get("passed"))
+    extended_required = bool(asset_policy.get("generate_sheets"))
+    extended_ready = bool(cast_selection.get("canonical_assets_ready"))
+    character_assets_ok = (
+        identities_ready and (not extended_required or extended_ready))
+    character_assets_detail = (
+        "所有正式角色已锁定最终立绘；本集采用简化人物资产模式，"
+        "不要求四视图/细节图"
+        if identities_ready and not extended_required
+        else "所有正式角色最终立绘及完整四视图/细节母资产已锁定"
+        if character_assets_ok
+        else "人物最终立绘或当前人物资产模式要求的母资产尚未齐全")
     available_gates = [
         _gate("script_bible", "剧本第一道总闸门与制作圣经",
               script_gate_error is None,
@@ -1216,6 +1243,9 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
                or (script_logic.get("summary")
                    or "世界观、人物、因果、信息、物理、时间、空间、"
                       "道具生命周期、可拍摄性与局部返编边界已锁定"))),
+        _gate(
+            "character_assets", "人物母资产",
+            character_assets_ok, character_assets_detail),
         _gate("continuity", "连续性圣经", bool(continuity.get("characters"))
               and bool(continuity.get("scenes"))
               and continuity.get("standard_fingerprint") == profile.get(
@@ -1256,9 +1286,11 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
               text_manifest.get("note", "")),
         _gate("frames", "首尾帧与段间状态", len(frame_map) == len(shots)
               and all(f.get("first") and f.get("last") for f in frames)
-              and formal_frame_quality_ok,
+              and formal_frame_quality_ok and frame_visual_qc_ok,
               f"{len(frame_map)}/{len(shots)} 个单元首尾帧就绪；"
-              "正式参考仅允许中/高质量"),
+              + ("均为中/高质量且已通过视觉质检"
+                 if formal_frame_quality_ok and frame_visual_qc_ok
+                 else "含低质量试错帧或缺少视觉质检")),
         _gate("audio", "环境声与声音策略", sound_ok,
               "每镜均含环境声设计，声音与空间共同参与叙事"),
         _gate("profile", "即梦生产配置", config_ok,
@@ -1269,11 +1301,16 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
     gates = []
     for gate in available_gates:
         setting = gate_config.get(gate["id"], {})
-        if setting.get("enabled", True) is False:
+        mandatory = bool(setting.get("mandatory"))
+        if setting.get("enabled", True) is False and not mandatory:
             continue
         if setting.get("label"):
             gate["label"] = setting["label"]
-        gate["severity"] = setting.get("severity", "hard")
+        gate["severity"] = (
+            "block" if mandatory
+            else setting.get("severity", "block"))
+        gate["mandatory"] = mandatory
+        gate["owner"] = setting.get("owner", "")
         gates.append(gate)
     return {
         "pipeline_version": PIPELINE_VERSION,

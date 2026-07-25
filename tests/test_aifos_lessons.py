@@ -31,8 +31,11 @@ def test_record_and_aggregate(app):
     assert top["count"] == 2                      # 同类问题聚合(镜头号归一)
     assert top["categories"] == {"shot_image": 1, "frames": 1}
     lines = lesson_lines(app.assets, project["id"])
-    assert any("已出错2次" in line for line in lines)
-    assert "严禁重犯" in lessons_block(app.assets, project["id"])
+    assert lines == []  # 质检观察未人工批准前不得污染后续提示词
+    assert top["scope"] == "qc_observation"
+    assert top["status"] == "pending_review"
+    assert top["approved_for_prompt"] is False
+    assert lessons_block(app.assets, project["id"]) == ""
 
 
 def test_environment_noise_is_not_a_lesson():
@@ -41,8 +44,8 @@ def test_environment_noise_is_not_a_lesson():
     assert lesson_worthy("古代场景出现现代手机")
 
 
-def test_lessons_injected_into_shot_and_video_prompts(app):
-    """记过的错必须出现在后续出图提示词与视频提示词里。"""
+def test_unapproved_qc_observations_do_not_enter_other_shot_prompts(app):
+    """本镜失败观察不能自动升级为跨镜头永久规则。"""
     app.director.produce("万妖图录", 1, pause_for_confirm=True)
     project = app.projects.get_project("万妖图录")
     record_lessons(app.assets, project["id"],
@@ -58,11 +61,13 @@ def test_lessons_injected_into_shot_and_video_prompts(app):
     shot = {"shot_no": 1, "scene_no": 1,
             "characters": [], "description": "空镜", "duration": 3}
     prompt = app.director._rich_shot_prompt(ctx, shot, "山门")
-    assert "严禁再犯" in prompt and "笔记本电脑" in prompt
+    assert "严禁再犯" not in prompt
+    assert "古代场景出现笔记本电脑" not in prompt
     assert "【ERA LOCK】" in prompt          # 时代硬约束逐镜写死
     video_prompt = app.director._seedance_video_prompt(ctx, shot, [])
     assert "【时代与物理】" in video_prompt
-    assert "严禁再犯" in video_prompt and "笔记本电脑" in video_prompt
+    assert "严禁再犯" not in video_prompt
+    assert "古代场景出现笔记本电脑" not in video_prompt
 
 
 def test_qc_failure_auto_records_lesson(app, tmp_path):
@@ -155,11 +160,11 @@ def test_time_travel_props_are_sanctioned_not_blocked(app):
     shot = {"shot_no": 1, "scene_no": 1, "characters": [],
             "description": "主角掏出手机查资料", "duration": 3}
     prompt = app.director._rich_shot_prompt(ctx, shot, "明代大殿")
-    assert "剧情明确允许跨时代出现" in prompt
+    assert "剧情白名单优先于通用时代禁令" in prompt
     assert "智能手机" in prompt
     assert "以本剧剧本为唯一标准" in prompt
     video_prompt = app.director._seedance_video_prompt(ctx, shot, [])
-    assert "智能手机" in video_prompt and "不算错" in video_prompt
+    assert "智能手机" in video_prompt and "绝不判错" in video_prompt
     # 质检端同样拿到白名单
     assert app.director._era_exceptions(ctx) == ["主角随身的智能手机"]
     spec = app.director._qc_spec(
