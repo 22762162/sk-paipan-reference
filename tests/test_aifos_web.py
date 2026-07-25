@@ -200,7 +200,7 @@ def test_index_and_static(server):
     assert "后续人物、分镜和镜头统一以此为准".encode() in app_js
     assert b"storyBibleHtml(script)" in app_js
     assert "人物介绍".encode() in app_js
-    assert "非重要角色固定1张".encode() in app_js
+    assert "所有正式角色统一4张候选".encode() in app_js
     assert "跑龙套/背景路人不做独立设定".encode() in app_js
     assert "不建立独立人物设定，不生成候选图、立绘或四视图".encode() in app_js
     for heading in ("序号", "时长", "参考分镜", "首尾帧", "运镜",
@@ -1218,7 +1218,7 @@ def test_standard_center_api_lifecycle(server):
 
 def test_produce_flow_and_episode_api(server):
     port = server["port"]
-    # Web 默认流程:剧本 → 每人五选一 → 预生产 → 开拍确认
+    # Web 默认流程:剧本 → 正式人物/核心道具四选一 → 预生产 → 开拍确认
     status, reply = _json_request(port, "POST", "/api/produce", {
         "sentence": "开始制作《万妖图录》第15集"})
     assert status == 202
@@ -1305,7 +1305,7 @@ def test_produce_flow_and_episode_api(server):
             "expected_version": policy_version,
         })
     assert status == 409 and "刷新" in stale["error"]
-    # 未完成五选一，后端也必须拒绝绕过门禁。
+    # 未完成四选一，后端也必须拒绝绕过门禁。
     status, blocked = _json_request(port, "POST", "/api/confirm", {
         "episode_id": episode_id})
     assert status == 409 and "最终立绘" in blocked["error"]

@@ -128,10 +128,12 @@ def recommend_asset_quality(kind, *, reuse_count=0, core_prop=False):
                 "character_sheet", "cover", "poster"):
         return {"level": "high", "reasons": ["人物母资产/独立展示资产"],
                 "rule": "mother_asset"}
-    if kind == "scene_art":
+    if kind in ("scene_art", "prop_asset"):
         if reuse_count >= 2 or core_prop:
-            reason = (f"高频复用场景（服务{reuse_count}个镜头）"
-                      if reuse_count >= 2 else "核心道具会跨镜复用")
+            reason = (
+                "核心道具会跨镜复用"
+                if kind == "prop_asset" or core_prop
+                else f"高频复用场景（服务{reuse_count}个镜头）")
             return {"level": "high", "reasons": [reason],
                     "rule": "reused_asset"}
         return {"level": "low", "reasons": ["场景/道具方向试错"],

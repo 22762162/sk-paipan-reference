@@ -42,8 +42,8 @@ def test_analysis_locks_user_style_and_builds_prompt_bible(script):
     assert analysis["visual"]["user_style_constraint"] == MODERN_OTOME_STYLE
     assert "古装" in analysis["visual"]["forbidden_visuals"]
     assert analysis["scenes"][0]["environment"]
-    assert analysis["characters"][0]["candidate_count"] == 5
-    assert analysis["characters"][1]["candidate_count"] == 3
+    assert analysis["characters"][0]["candidate_count"] == 4
+    assert analysis["characters"][1]["candidate_count"] == 4
     hero = analysis["characters"][0]
     assert hero["character_analysis"]["core_desire"]
     assert "苏念" in hero["image_prompt"]

@@ -789,6 +789,17 @@ class MockProvider(Provider):
     def _gen_image(self, payload, out_dir):
         seed = int.from_bytes(_digest(payload)[:4], "big")
         width, height = _dims(payload)
+        if payload.get("prop_candidate"):
+            name = payload.get("art_name", "")
+            path = out_dir / f"prop_{_safe_name(name)}.svg"
+            path.write_text(
+                render_portrait(
+                    width, height, seed, name, "核心道具候选"),
+                encoding="utf-8")
+            return {
+                "name": name,
+                "prop": payload.get("prop_name", ""),
+            }, str(path)
         if payload.get("portrait"):
             name = payload.get("art_name", "")
             path = out_dir / f"portrait_{_safe_name(name)}.svg"

@@ -60,7 +60,7 @@ def test_full_pipeline_produces_episode(app):
     storyboard, _ = app.projects.latest_document(episode["id"], "storyboard")
     assert len(storyboard["shots"]) > len(script["scenes"])
 
-    # 成本记账:总成本还包含上一轮生成的五选一候选；配置了预算时才校验上限。
+    # 成本记账:总成本还包含上一轮生成的四选一候选；配置了预算时才校验上限。
     stage_cost = round(sum(s["cost"] for s in summary["stages"]), 2)
     assert summary["cost"] >= stage_cost > 0
     if summary["budget"] > 0:

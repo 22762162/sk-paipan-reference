@@ -86,6 +86,7 @@ def _local_refs(payload):
         ref.get("uri") for ref in (payload.get("identity_references") or [])
         if isinstance(ref, dict) and ref.get("uri"))
     order.extend(payload.get("character_refs") or [])
+    order.extend(payload.get("prop_refs") or [])
     for key in ("spatial_ref", "chain_first_uri", "scene_ref", "style_ref"):
         val = payload.get(key)
         if val:
@@ -142,6 +143,8 @@ def _reference_entries(payload):
         add(ref["uri"], f"{actor_id}/{character}最终立绘")
     for uri in payload.get("character_refs") or []:
         add(uri, "人物设定图")
+    for uri in payload.get("prop_refs") or []:
+        add(uri, "核心道具母资产")
     for key, label in (
             ("spatial_ref", "本镜空间调度图"),
             ("chain_first_uri", "上一镜尾帧"),
@@ -593,7 +596,13 @@ class OpenAIImageProvider(Provider):
             prompt = f"{prompt}。修改意见(必须落实):{payload['feedback']}"
         if capability == "image":
             safe = _safe_name(payload.get("art_name", ""))
-            if payload.get("portrait"):
+            if payload.get("prop_candidate"):
+                target = out_dir / f"prop_{safe}.png"
+                data = {
+                    "name": payload.get("art_name"),
+                    "prop": payload.get("prop_name", ""),
+                }
+            elif payload.get("portrait"):
                 target = out_dir / f"portrait_{safe}.png"
                 data = {"name": payload.get("art_name")}
             elif payload.get("character_sheet"):

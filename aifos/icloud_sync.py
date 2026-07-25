@@ -30,11 +30,13 @@ from .asset_center import IMAGE_KINDS
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic", ".svg"}
 PROJECT_LEVEL_KINDS = {
     "character_candidate", "character_art", "character_sheet",
+    "prop_candidate", "prop_identity",
     "scene_art", "reference", "inner_persona",
 }
 KIND_LABELS = {
     "character_candidate": "候选", "character_art": "定版",
     "character_sheet": "设定", "scene_art": "场景",
+    "prop_candidate": "道具候选", "prop_identity": "道具定版",
     "reference": "参考", "image": "关键帧",
     "first_frame": "首帧", "last_frame": "尾帧", "cover": "封面",
     "spatial_blocking": "空间图", "inner_persona": "内心Q版",

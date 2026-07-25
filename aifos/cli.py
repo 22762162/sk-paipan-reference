@@ -282,8 +282,8 @@ def _cmd_produce(app, args):
         print(f"  python3 -m aifos confirm --project {title} --episode {number}")
         return 0
     if summary["status"] == "awaiting_cast":
-        print(f"\n按角色重要度生成候选立绘：{character_candidate_policy_text()}。"
-              "请在 AIFOS 网页中逐个选定最终形象。")
+        print(f"\n正式角色统一4张候选：{character_candidate_policy_text()}。"
+              "核心道具也统一四选一；请在 AIFOS 网页逐个定版。")
         print("全部锁定后再运行 confirm；未锁定前不会生成任何后续图片。")
         return 0
     if summary["status"] == "awaiting_confirm":
@@ -298,7 +298,7 @@ def _status_cn(status):
     return {"done": "完成", "failed": "失败", "qc_failed": "完成(质检未过)",
             "awaiting_confirm": "待确认",
             "awaiting_script": "剧本待确认",
-            "awaiting_cast": "人物待选"}.get(status, status)
+            "awaiting_cast": "人物/道具待选"}.get(status, status)
 
 
 def _cmd_tunnel(args):
@@ -356,24 +356,23 @@ def _cmd_confirm(app, args):
         "SELECT * FROM episodes WHERE project_id=? AND number=?",
         (project["id"], args.episode))
     if episode is not None and episode["status"] == "awaiting_script":
-        # 第一道确认:剧本 OK → 按角色重要度生成候选，再停下来人工定角。
+        # 第一道确认:剧本 OK → 人物/核心道具各生成4张候选，再停下来人工定版。
         print(f"剧本已确认,开始画《{args.project}》第{args.episode}集"
-              "的人物候选立绘 …")
+              "的人物与核心道具候选 …")
         summary = app.director.produce(
             args.project, args.episode, pause_for_confirm=True)
-        print(f"{_status_cn(summary['status'])};请先在网页中为每名人物选定1张，"
+        print(f"{_status_cn(summary['status'])};请先在网页中为每名正式角色和核心道具各选1张，"
               "再运行 confirm")
         return 0
     if episode is not None and episode["status"] == "awaiting_cast":
         script_doc, _ = app.projects.latest_document(episode["id"], "script")
-        selection = app.director.character_selection_status(
-            project["id"], (script_doc or {}).get("characters", []))
+        selection = app.director.production_asset_selection_status(
+            project["id"], script_doc or {})
         if not selection["passed"]:
-            pending = "、".join(selection.get("pending", [])) or "未锁定人物"
-            print(f"人物尚未全部选定: {pending}。请先在 AIFOS 网页按候选数量逐一选定。",
+            print("人物或核心道具尚未全部选定。请先在 AIFOS 网页逐一选定。",
                   file=sys.stderr)
             return 1
-        print(f"人物已锁定,开始画《{args.project}》第{args.episode}集"
+        print(f"人物与核心道具已锁定,开始画《{args.project}》第{args.episode}集"
               "的场景/分镜/首尾帧 …")
         summary = app.director.produce(
             args.project, args.episode, pause_for_confirm=True)

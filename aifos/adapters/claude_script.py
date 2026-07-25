@@ -42,6 +42,10 @@ SCRIPT_PROMPT = """你是兼具顶级类型片编剧、影视导演、场面调�
 - 对每件关键道具建立完整生命周期：出现来源→初始状态→当前持有人→拿取/使用/
   交接动作→状态变化→本场结束去向。服装、伤势、设备、门窗、座椅和其他支撑面
   也要写清使用方式，不能留给生图或视频模型自行猜测;
+- 另建 `core_props`，只收录会跨镜复用、影响身份识别、承载关键剧情或出错会污染
+  后续镜头的核心道具；每件写清剧情功能、外形结构、时代材质、持有人与状态变化，
+  并固定 `candidate_count:4` 供人工四选一。一次性普通小物只写进场次道具台账，
+  不得为了凑资产而列入 `core_props`;
 - 每场必须明确人物信息状态：本场开始时各自知道什么、不知道什么、通过何种
   可见证据新获知什么；禁止角色突然知道未听见、未看见、未被告知的内容;
 - 每场必须明确时间关系和动作耗时。上一场出口、本场入口、本场出口和下一场入口
@@ -70,7 +74,7 @@ SCRIPT_PROMPT = """你是兼具顶级类型片编剧、影视导演、场面调�
   `name`、`role: "背景路人"`、`crowd_function` 和出现场次功能,不写外貌、性别、
   年龄、妆容、服装、经历或人物背景提示词,也不生成候选图/立绘/四视图;
 - 人物重要度必须明确标为主角、重要配角、非重要配角或背景路人。
-  非重要配角后续固定只生成 1 张候选图;场次中不得出现人物表未声明的新角色;
+  所有正式角色后续统一生成 4 张候选图;场次中不得出现人物表未声明的新角色;
 - `costume_direction` 必须给出可画的服装逻辑(款式、材质、层次、颜色、职业制服/时代服饰和剧情场合),禁止所有角色默认现代都市便服;
 - `visual_variants` 至少给出 3 个剧情兼容的造型方案(例如日常、行动/冲突、仪式/舞台);它们是服装、道具和表演细节，不是画风选项；全剧候选图必须继承同一个项目画风;
 - 每个正式角色必须先完成 `character_analysis`，再生成 `visual_dna`：
@@ -117,6 +121,13 @@ JSON 格式(字段必须齐全):
    "cast_dedup": {{"compared_with":["其他角色"],"dimensions":["发型","服装结构","身体特征","视觉符号","核心配饰","气质关键词"],"status":"passed","conflicts":[]}}}},
   {{"name": "路人功能名", "role": "背景路人",
    "crowd_function": "在哪一场以几人、什么剧情功能短暂出现;无独立人物资产"}}],
+ "core_props": [{{"name":"核心道具唯一名称",
+   "story_function":"为什么会影响多镜头或核心剧情",
+   "visual_design":"可直接画出的外形、结构、尺寸级别与识别点",
+   "era_material":"符合世界观的材质、工艺和磨损",
+   "owner":"初始与主要持有人",
+   "continuity_states":"出现、使用/交接、状态变化和最终去向",
+   "candidate_count":4}}],
  "adaptation_review": {{
    "source_to_screen_strategy": "如何把小说/梗概改成可见戏剧行动",
    "source_material_policy": "原素材哪些必须保留、哪些允许为影视逻辑改写；正式锁定点是什么",
@@ -174,7 +185,7 @@ IDOL_PROMPT = """你是 AI 虚拟偶像「{persona}」的内容策划。为第{e
 - 每个成员必须有 `introduction`,明确性别、年龄段、团内身份、性格、目标、
   成员关系与不可改变的身份事实;场次不得新增人物表之外的成员;
 - 临时观众、工作人员、群演等背景路人只写 `name`、`role: "背景路人"` 和
-  `crowd_function`,不建立独立人物设定或人物资产;非重要配角固定只生成 1 张候选图;
+  `crowd_function`,不建立独立人物设定或人物资产;所有正式角色统一生成 4 张候选图;
 - 台词口语化、有网感,单句不超过 22 个字;
 - 只输出一个 JSON 对象,不要任何其他文字、解释或 Markdown 代码块。
 
@@ -304,7 +315,7 @@ Seedance 视频前必须锁定的“制作圣经”。
   身份、阵营、物种与人物关系;
 - 逐场分析空间功能、入口出口、前中后景、材质道具、时段天气、主光方向、
   环境声和连续性锚点;
-- 候选图数量固定:主角5、重要配角3、非重要配角1、背景路人0;
+- 候选图数量固定:所有正式角色4张、背景路人0张;
 - 每名正式角色按“剧情证据→经历与处境→性格与行为→可见特征→视觉 DNA”
   分析；视觉 DNA 包含脸部骨相、发型轮廓、身体/职业痕迹、服装结构与状态、
   核心配饰、有故事来源的视觉符号及3-8个气质关键词;
@@ -350,7 +361,7 @@ JSON 结构:
 "environment":"","layout":"","materials_and_props":"","time_weather":"",
 "lighting":"","sound":"","continuity_anchors":[],"prompt_prefix":""}}],
 "characters":[{{"name":"","importance":"主角/重要配角/非重要配角/背景路人",
-"candidate_count":5,"gender":"","age_range":"","identity_facts":"",
+"candidate_count":4,"gender":"","age_range":"","identity_facts":"",
 "visual_direction":"","image_prompt":"无矛盾、可直接交给图片模型的人物出图提示词",
 "negative_prompt":"本角色专属负面提示词",
 "continuity_anchors":[],"prompt_prefix":"",
@@ -543,6 +554,28 @@ def normalize_script_bible(script, payload=None):
         _fill_missing(
             character, "personality",
             "由剧本台词、行动与人物背景外化，跨场景保持同一性格逻辑")
+        character["candidate_count"] = 4
+    props = script.get("core_props")
+    if not isinstance(props, list):
+        script["core_props"] = []
+    else:
+        normalized_props = []
+        seen_props = set()
+        for item in props:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name or name in seen_props:
+                continue
+            seen_props.add(name)
+            item["name"] = name
+            item["candidate_count"] = 4
+            for field in (
+                    "story_function", "visual_design", "era_material",
+                    "owner", "continuity_states"):
+                item.setdefault(field, "")
+            normalized_props.append(item)
+        script["core_props"] = normalized_props
     script["story_bible_version"] = 1
     script["declared_character_names"] = cast_names
     script["inner_persona_policy"] = normalize_inner_persona_policy(script)
@@ -582,6 +615,16 @@ def validate_script_bible(script):
         for field in CHARACTER_INTRO_FIELDS:
             if _missing(character.get(field)):
                 return f"{character['name']}人物设定字段不全: {field}"
+    for prop in script.get("core_props") or []:
+        if not isinstance(prop, dict) or _missing(prop.get("name")):
+            return "核心道具字段不全: name"
+        for field in (
+                "story_function", "visual_design", "era_material",
+                "owner", "continuity_states"):
+            if _missing(prop.get(field)):
+                return f"{prop['name']}核心道具字段不全: {field}"
+        if prop.get("candidate_count") != 4:
+            return f"{prop['name']}核心道具候选数量必须为4"
     used = set()
     for scene in script.get("scenes") or []:
         used.update(scene.get("characters") or [])

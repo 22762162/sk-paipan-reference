@@ -222,7 +222,7 @@ def _importance(role):
 
 def _candidate_count(importance):
     return {
-        "主角": 5, "重要配角": 3, "非重要配角": 1,
+        "主角": 4, "重要配角": 4, "非重要配角": 4,
         "背景路人": 0, "待确认": 0,
     }[importance]
 
@@ -1091,8 +1091,8 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
             "reaction_after_key_dialogue": True,
             "beat_at_emotional_peak": True,
             "character_candidate_targets": {
-                "main": 5, "important_supporting": 3,
-                "non_main": 1, "background": 0,
+                "main": 4, "important_supporting": 4,
+                "non_main": 4, "background": 0,
             },
             "character_design_sequence": [
                 "story_evidence", "experience_and_situation",

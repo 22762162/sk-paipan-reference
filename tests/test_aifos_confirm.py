@@ -63,7 +63,7 @@ def test_xianxia_title_is_not_overridden_by_modern_default():
 
 
 def test_script_confirm_pauses_before_video(app):
-    """人物五选一后才画场景/分镜/首尾帧,再停等开拍。"""
+    """人物四选一后才画场景/分镜/首尾帧,再停等开拍。"""
     app.director.produce("万妖图录", 1, pause_for_confirm=True)
     summary = app.director.produce("万妖图录", 1, pause_for_confirm=True)
     assert summary["status"] == "awaiting_cast"
@@ -210,7 +210,7 @@ def test_cli_review_and_confirm(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 0
     assert "剧本已确认" in out
-    assert "人物待选" in out
+    assert "人物/道具待选" in out
     # 人工定角门禁:未选不能继续。
     assert main(["--workspace", ws, "confirm", "--project", "万妖图录",
                  "--episode", "1"]) == 1
@@ -301,7 +301,7 @@ def test_render_plan_lists_every_image_with_prompt(app):
 
 
 def test_regen_image_prompt_override(app):
-    """最终立绘禁止绕过五选一直接重画；镜头图仍可改词重画。"""
+    """最终立绘禁止绕过四选一直接重画；镜头图仍可改词重画。"""
     _to_preflight(app)
     plan = _plan_of(app, "万妖图录", 1)
     name = next(i["name"] for i in plan["items"]
