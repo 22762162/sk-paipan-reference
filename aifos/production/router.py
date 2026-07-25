@@ -253,6 +253,19 @@ class ProviderRouter:
                     "router", f"{name} {reason},回退({capability})")
                 fallbacks.append({"provider": name, "reason": reason})
                 continue
+            # Paid image APIs may only execute an already-bound
+            # prompt/reference contract. Initial identity exploration may
+            # still use the Codex subscription without a reference, but
+            # Seedream/OpenAI image APIs must never silently become text-only
+            # generation.
+            if (capability in self.IMAGE_CAPABILITIES
+                    and provider.conf.get("type") in self.API_IMAGE_TYPES
+                    and not supplied_refs):
+                reason = "未携带参考图，禁止图片 API 纯文字生成"
+                self.log.info(
+                    "router", f"{name} {reason},回退({capability})")
+                fallbacks.append({"provider": name, "reason": reason})
+                continue
             try:
                 profile_id = (str(payload.get("_codex_profile") or "").strip()
                               if name == "codex" else "")

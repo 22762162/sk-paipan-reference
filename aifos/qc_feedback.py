@@ -64,8 +64,8 @@ _RULES = (
 # 导致模型继续沿用失败图里的空白屏幕。
 _SCREEN_TEXT_TOKENS = (
     "电脑", "笔记本", "屏幕", "显示器", "手机屏", "平板", "页面",
-    "书页", "史书", "网页", "文档", "合同", "奏折", "纸张", "崇祯",
-    "明季北略", "冷白", "空白屏", "空白画面",
+    "书页", "史书", "网页", "文档", "合同", "奏折", "纸张",
+    "冷白", "空白屏", "空白画面",
 )
 _TEXT_MISSING_TOKENS = (
     "未显示", "未呈现", "未出现", "没有显示", "缺少", "缺失", "未包含",
@@ -77,7 +77,7 @@ _TEXT_UNWANTED_TOKENS = (
 )
 
 
-def _screen_text_instruction(reason, whitelist=None):
+def _screen_text_instruction(reason, whitelist=None, carrier=""):
     """把屏幕/书页文字问题变成可执行的局部修订指令。"""
     reason = str(reason or "")
     wanted = [str(item).strip() for item in (whitelist or []) if str(item).strip()]
@@ -90,10 +90,11 @@ def _screen_text_instruction(reason, whitelist=None):
     missing = any(token in reason.lower() for token in _TEXT_MISSING_TOKENS)
     unwanted = any(token in reason.lower() for token in _TEXT_UNWANTED_TOKENS)
     if missing and not unwanted:
+        carrier = str(carrier or "本镜声明的屏幕/页面载体").strip()
         return (
-            "【TEXT ASSET HARD GATE】只修正屏幕/页面这一块局部；银色笔记本必须"
-            "保持打开并让屏幕正面朝向本镜需要看到屏幕的一侧；使用者与屏幕正面同侧，"
-            "若人物需要读屏则采用越肩或侧面机位；屏幕内实际显示"
+            f"【TEXT ASSET HARD GATE】只修正{carrier}这一块局部；"
+            "载体的开启状态、朝向、使用者关系和机位必须服从当前镜头物理合同；"
+            "不得凭空指定笔记本、手机或其他未声明设备；载体内实际显示"
             f"{wanted_text}；逐字沿用该原文，不得改写、缩写或用随机乱码替代。"
             "禁止空白冷白屏、纯白发光占位面、黑屏占位面和模糊不可读页面；"
             "屏幕外的人物、服装、配饰、场景、构图、光线和金属机身全部保持失败"
@@ -154,7 +155,9 @@ def optimize_qc_feedback(
                 categories.append(category)
                 instructions.append(_screen_text_instruction(
                     reason, (readable_text or {}).get("whitelist")
-                    if isinstance(readable_text, dict) else None))
+                    if isinstance(readable_text, dict) else None,
+                    (readable_text or {}).get("carrier")
+                    if isinstance(readable_text, dict) else ""))
             continue
         for category, tokens, instruction in _RULES:
             if any(token.lower() in lowered for token in tokens):

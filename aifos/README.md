@@ -1,6 +1,8 @@
 # AIFOS V3.2 —— AI 精品漫剧工业化生产平台
 
 > 定位:Production Platform。先跑通完整生产流程,再逐步升级到企业级 V4。
+> 规则分层、冲突优先级、一次综合质检和无污染重制流程见
+> [`docs/RULE_GOVERNANCE.md`](../docs/RULE_GOVERNANCE.md)。
 
 输入一句 **「开始制作《万妖图录》第15集」**,平台按 SK 漫剧 V5 工业流完成
 连续性档案、五维分镜、文字关键帧、首尾帧、Seedance 视频内同步人声与

@@ -96,9 +96,45 @@ def test_batch_fallback_is_seedream_then_gpt_then_codex_emergency(tmp_path):
             "shot_no": 1,
             "image_task_class": "batch",
             "image_quality": "high",
+            "reference_images": [str(tmp_path / "identity.png")],
         }, app.workspace.artifacts_dir)
         assert calls == ["seedream5_lite", "image_api", "codex"]
         assert result.provider == "codex"
+    finally:
+        app.close()
+
+
+def test_text_only_batch_skips_paid_image_apis_and_uses_codex(tmp_path):
+    app = App(tmp_path / "ws", config_overrides={
+        "providers": {
+            "seedream5_lite": {"enabled": True, "api_key": "ark-test"},
+            "image_api": {"enabled": True, "api_key": "openai-test"},
+            "codex": {"enabled": True},
+        },
+    })
+    calls = []
+    try:
+        for name in ("seedream5_lite", "image_api", "codex"):
+            app.router.providers[name].available = lambda capability: (True, "")
+        app.router.providers["seedream5_lite"].generate = \
+            lambda *a, **k: calls.append("seedream5_lite")
+        app.router.providers["image_api"].generate = \
+            lambda *a, **k: calls.append("image_api")
+
+        def codex(*args, **kwargs):
+            calls.append("codex")
+            return ProviderResult(provider="codex", cost=0, data={})
+
+        app.router.providers["codex"].generate = codex
+        result = app.router.call("image", {
+            "shot_no": 1,
+            "image_task_class": "batch",
+            "image_quality": "medium",
+        }, app.workspace.artifacts_dir)
+        assert result.provider == "codex"
+        assert calls == ["codex"]
+        assert [item["provider"] for item in result.fallbacks[:2]] == [
+            "seedream5_lite", "image_api"]
     finally:
         app.close()
 

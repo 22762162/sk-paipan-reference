@@ -278,12 +278,19 @@ class JobRegistry:
         threading.Thread(target=run, daemon=True).start()
 
     def start_series_step(self, step):
-        """激活结果为梗概时按集编剧；已有剧本只进入审阅，不启动任务。"""
-        if step.get("done") or step.get("mode") == "script":
+        """逐集运行编剧总闸门；解析稿不得直接跳到人物/出图。"""
+        if step.get("done"):
+            return None
+        source_script = step.get("source_script")
+        if (step.get("mode") == "script" and source_script is None
+                and not step.get("requires_writer_adaptation")):
+            # Compatibility for a legacy batch that already stored a formal
+            # script and intentionally waits at the review checkpoint.
             return None
         return self.start(
             step["title"], int(step["number"]),
             premise=step.get("premise", ""), review=True,
+            script=source_script,
             action="series_next")
 
     def get(self, job_id):
@@ -2338,6 +2345,10 @@ def make_handler(workspace, jobs):
                     step = self._with_app(
                         lambda app: app.series.activate_next(batch["id"]))
                     job_id = jobs.start_series_step(step)
+                    if isinstance(step, dict):
+                        step = {
+                            key: value for key, value in step.items()
+                            if key != "source_script"}
                     batch = self._with_app(
                         lambda app: app.series.get_batch(batch["id"]))
             except AifosError as exc:
@@ -2361,6 +2372,10 @@ def make_handler(workspace, jobs):
                 step = self._with_app(
                     lambda app: app.series.activate_next(batch_id))
                 job_id = jobs.start_series_step(step)
+                if isinstance(step, dict):
+                    step = {
+                        key: value for key, value in step.items()
+                        if key != "source_script"}
             except AifosError as exc:
                 return self._error(409, str(exc))
             return self._json({"step": step, "job_id": job_id}, status=202)

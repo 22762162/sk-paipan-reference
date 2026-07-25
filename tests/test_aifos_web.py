@@ -1136,7 +1136,7 @@ def test_standard_center_api_lifecycle(server):
     status, initial = _json_request(port, "GET", "/api/standards")
     assert status == 200
     assert initial["active"]["version"] == 1
-    assert len(initial["active"]["content"]["rules"]["quality_gates"]) == 14
+    assert len(initial["active"]["content"]["rules"]["quality_gates"]) == 15
     assert initial["capabilities"] == {
         "versioned": True,
         "episode_snapshot": True,
@@ -1423,7 +1423,10 @@ def test_multi_episode_document_preview_import_and_serial_queue(server):
 
     status, imported = _json_request(
         port, "POST", "/api/series/import", request)
-    assert status == 201 and imported["job_id"] is None
+    assert status == 201 and imported["job_id"]
+    first_job = _wait_job(port, imported["job_id"])
+    assert first_job["status"] == "done"
+    assert first_job["summary"]["status"] == "awaiting_script"
     batch = imported["batch"]
     assert batch["total"] == 2 and batch["auto_advance"] is True
     assert batch["current"]["episode_number"] == 5
@@ -1447,7 +1450,10 @@ def test_multi_episode_document_preview_import_and_serial_queue(server):
         app_state.close()
     status, advanced = _json_request(
         port, "POST", "/api/series/next", {"batch_id": batch["id"]})
-    assert status == 202 and advanced["job_id"] is None
+    assert status == 202 and advanced["job_id"]
+    second_job = _wait_job(port, advanced["job_id"])
+    assert second_job["status"] == "done"
+    assert second_job["summary"]["status"] == "awaiting_script"
     assert advanced["step"]["number"] == 6
     _, detail = _json_request(
         port, "GET", f"/api/episode/{advanced['step']['episode_id']}")

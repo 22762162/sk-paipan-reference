@@ -102,7 +102,12 @@ def test_series_center_imports_all_but_activates_one(tmp_path):
         first = app.series.activate_next(batch["id"])
         assert first["mode"] == "script" and first["number"] == 1
         assert app.projects.get_episode(first["episode_id"])["status"] == \
-            "awaiting_script"
+            "created"
+        assert first["requires_writer_adaptation"] is True
+        assert first["source_script"]["episode_title"] == "初见"
+        formal, version = app.projects.latest_document(
+            first["episode_id"], "script")
+        assert formal is None and version == 0
         with pytest.raises(AifosError, match="尚未完成"):
             app.series.activate_next(batch["id"])
 

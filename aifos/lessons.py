@@ -1,9 +1,9 @@
-"""出错经验库:把每次质检失败的原因沉淀成"禁止再犯"的生产规则。
+"""出错观察库：保留质检证据，但不自动升级为永久提示词规则。
 
 闭环:质检发现问题(如"古代场景出现笔记本电脑""物体被拉长变形")
-→ 自动归档为项目级教训(同类问题聚合计数)
-→ 之后每张图、每段视频的提示词自动带上"历史教训(严禁再犯)"
-→ 同样的错误越犯越少,系统越用越准。
+→ 自动归档为项目级观察(同类问题聚合计数)
+→ 只有人工确认适用范围后才允许注入提示词
+→ 当前镜头的临时修订通过或重试一次后立即失效。
 
 教训存放在资产中心(kind="lesson"),按归一化指纹聚合;不需要
 额外表结构,跨集共享,断点续产/重启后依然生效。
@@ -48,7 +48,7 @@ def _fingerprint(normalized):
 
 
 def record_lessons(assets, project_id, issues, category=""):
-    """把一次质检失败的原因写入经验库;同类问题只累计次数。"""
+    """记录质检观察；默认 pending_review，绝不自动污染后续提示词。"""
     recorded = 0
     for issue in issues or []:
         if not lesson_worthy(issue):
@@ -79,6 +79,10 @@ def record_lessons(assets, project_id, issues, category=""):
                 "count": int(meta.get("count", 0)) + 1,
                 "categories": categories,
                 "last_at": time.time(),
+                "scope": meta.get("scope") or "qc_observation",
+                "status": meta.get("status") or "pending_review",
+                "approved_for_prompt": bool(
+                    meta.get("approved_for_prompt", False)),
             }, new_version=row is not None)
         recorded += 1
     return recorded
@@ -103,15 +107,21 @@ def project_lessons(assets, project_id, limit=50):
             "count": int(meta.get("count", 1)),
             "categories": meta.get("categories") or {},
             "last_at": meta.get("last_at"),
+            "scope": meta.get("scope") or "qc_observation",
+            "status": meta.get("status") or "pending_review",
+            "approved_for_prompt": bool(
+                meta.get("approved_for_prompt", False)),
         })
     rows.sort(key=lambda item: (-item["count"], -(item["last_at"] or 0)))
     return rows[:limit]
 
 
 def lesson_lines(assets, project_id, limit=MAX_INJECTED):
-    """给出图/视频提示词注入的"历史教训"清单(最高频前 N 条)。"""
+    """只返回人工批准的项目规则；旧记录也默认不注入。"""
     return [f"{item['issue']}(此前已出错{item['count']}次)"
-            for item in project_lessons(assets, project_id, limit=limit)]
+            for item in project_lessons(assets, project_id, limit=50)
+            if item.get("approved_for_prompt")
+            and item.get("status") == "approved"][:limit]
 
 
 def lessons_block(assets, project_id, limit=MAX_INJECTED):

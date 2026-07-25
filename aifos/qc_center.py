@@ -5,7 +5,9 @@ from pathlib import Path
 
 from .prompt_contract import readable_text_required
 
-SEVERITY_PENALTY = {"error": 15, "warn": 5}
+# Warnings are director suggestions, not disguised blockers. They remain in
+# the review report but cannot make a technically valid episode fail.
+SEVERITY_PENALTY = {"error": 15, "warn": 0}
 
 
 def _artifact_exists(uri):

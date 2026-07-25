@@ -1258,6 +1258,38 @@ def test_manual_qc_pass_promotes_failed_draft_and_keeps_audit_reason(app,
     assert json.loads(latest["meta"])["manual_qc_override"] is True
 
 
+def test_manual_qc_pass_cannot_override_identity_or_count_failure(app,
+                                                                  tmp_path):
+    project = _preproduce(app, title="硬错误禁止放行")
+    plan_path = (app.workspace.artifacts_dir
+                 / f"p{project['id']:03d}" / "e001" / "render_plan.json")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    item = next(i for i in plan["items"] if i["category"] == "shot_image")
+    failed = tmp_path / "identity-count-failed.png"
+    failed.write_bytes(b"\x89PNG\r\n\x1a\n" + b"failed" * 8)
+    item.update({
+        "status": "awaiting_human",
+        "output_uri": str(failed),
+        "qc": {
+            "passed": False,
+            "hard_failure": True,
+            "identity_checked": True,
+            "identity_match": False,
+            "count_checked": True,
+            "count_match": False,
+            "issues": ["人物身份不一致", "画面人数多一人"],
+        },
+    })
+    plan_path.write_text(
+        json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+
+    result = app.director.manual_qc_pass(
+        "硬错误禁止放行", 1, item_ids=[item["id"]])
+    assert result["passed"] == 0
+    assert result["skipped"] == 1
+    assert "不能人工强行放行" in result["skipped_items"][0]["reason"]
+
+
 def test_codex_qc_instruction_and_parse(tmp_path, monkeypatch):
     """Codex 图像质检:构造读图指令,从 stdout 解析判定 JSON。"""
     from aifos.adapters import codex_image

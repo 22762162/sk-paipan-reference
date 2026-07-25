@@ -90,6 +90,47 @@ def test_history_story_builds_its_own_style_without_modern_or_2d_default():
     assert validate_story_analysis(analysis) is None
 
 
+def test_episode_anachronism_whitelist_overrides_derived_era_bans():
+    historical = {
+        "project_title": "大明",
+        "episode_number": 1,
+        "logline": "皇太子带着穿越前的笔记本电脑醒来",
+        "story_world": {
+            "sanctioned_anachronisms": ["锦盒里的银色笔记本电脑"],
+        },
+        "characters": [{"name": "朱慈烺", "role": "主角"}],
+        "scenes": [{
+            "scene_no": 1,
+            "location": "东宫寝殿",
+            "characters": ["朱慈烺"],
+            "action": "朱慈烺打开锦盒里的银色笔记本电脑",
+            "lines": [],
+        }],
+    }
+    raw = {
+        "world": {
+            "forbidden_drift": [
+                "禁止现代物品进入明代寝殿",
+                "禁止出现锦盒里的银色笔记本电脑",
+                "禁止清代服饰",
+            ],
+        },
+    }
+
+    enriched = apply_story_analysis(
+        historical, build_story_analysis(historical, raw=raw))
+    forbidden = enriched["story_world"]["forbidden_drift"]
+
+    assert "禁止出现锦盒里的银色笔记本电脑" not in forbidden
+    assert "除剧情白名单（锦盒里的银色笔记本电脑）外，禁止现代物品进入明代寝殿" in forbidden
+    assert "禁止清代服饰" in forbidden
+    resolved = enriched["production_analysis"]["rule_conflicts_resolved"]
+    assert {item["resolution"] for item in resolved} == {
+        "discarded_lower_priority_forbidden_rule",
+        "qualified_by_episode_whitelist",
+    }
+
+
 def test_character_image_prompt_is_compact_visual_only_and_idempotent():
     historical = {
         "project_title": "大明",

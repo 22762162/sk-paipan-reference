@@ -983,32 +983,34 @@ def build_qc_prompt(payload):
 def validate_image_qc(data):
     if not isinstance(data, dict) or "pass" not in data:
         return "缺少 pass 字段"
-    data["pass"] = bool(data["pass"])
+
+    def strict_bool(key, *, required=False):
+        if key not in data:
+            return f"缺少 {key} 字段" if required else None
+        if type(data[key]) is not bool:
+            return f"{key} 必须是真正的 JSON 布尔值，不能是字符串或数字"
+        return None
+
+    boolean_fields = (
+        "pass", "visual_pass", "input_contract_pass",
+        "identity_checked", "identity_match",
+        "gender_checked", "gender_match",
+        "count_checked", "count_match",
+        "physical_logic_checked", "physical_logic_match",
+        "spatial_logic_checked", "spatial_logic_match",
+        "overlay_count_checked", "overlay_count_match",
+    )
+    for key in boolean_fields:
+        error = strict_bool(key, required=(key == "pass"))
+        if error:
+            return error
     for key in ("visual_pass", "input_contract_pass"):
-        if key in data:
-            data[key] = bool(data[key])
+        if key in data and type(data[key]) is not bool:
+            return f"{key} 必须是真正的 JSON 布尔值"
     issues = data.get("issues")
     if not isinstance(issues, list):
         issues = [str(issues)] if issues else []
     data["issues"] = [str(item) for item in issues][:8]
-    if "identity_checked" in data:
-        data["identity_checked"] = bool(data["identity_checked"])
-    if "identity_match" in data:
-        data["identity_match"] = bool(data["identity_match"])
-    if "gender_checked" in data:
-        data["gender_checked"] = bool(data["gender_checked"])
-    if "gender_match" in data:
-        data["gender_match"] = bool(data["gender_match"])
-    if "count_checked" in data:
-        data["count_checked"] = bool(data["count_checked"])
-    if "count_match" in data:
-        data["count_match"] = bool(data["count_match"])
-    for key in (
-            "physical_logic_checked", "physical_logic_match",
-            "spatial_logic_checked", "spatial_logic_match",
-            "overlay_count_checked", "overlay_count_match"):
-        if key in data:
-            data[key] = bool(data[key])
     if "detected_count" in data:
         try:
             data["detected_count"] = int(data["detected_count"])
@@ -1029,8 +1031,11 @@ def validate_image_qc(data):
             row = dict(item)
             row["character"] = str(row["character"])
             row["view"] = str(row.get("view") or "")
-            row["checked"] = bool(row.get("checked"))
-            row["match"] = bool(row.get("match"))
+            if (type(row.get("checked")) is not bool
+                    or type(row.get("match")) is not bool):
+                return (
+                    "identity_checks 的 checked/match 必须是真正的 JSON "
+                    "布尔值")
             basis = row.get("basis")
             row["basis"] = (
                 [str(value) for value in basis[:12]]

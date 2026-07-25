@@ -1134,6 +1134,51 @@ def validate_story_analysis(analysis):
     return None
 
 
+def _reconcile_forbidden_drift(forbidden, sanctioned):
+    """Let explicit story facts win over derived negative rules.
+
+    A generic era lock is still useful, but it must be qualified when the
+    screenplay deliberately contains a cross-era prop.  A negative rule that
+    explicitly names a sanctioned prop is discarded because retaining both
+    instructions makes image generation and QC non-deterministic.
+    """
+    sanctioned = list(dict.fromkeys(
+        _text(item) for item in sanctioned or [] if _text(item)))
+    whitelist = "、".join(sanctioned)
+    kept = []
+    resolved = []
+    broad_era_tokens = (
+        "现代物品", "现代道具", "现代科技", "跨时代", "时代错乱",
+        "时代漂移", "超出时代", "不符合时代",
+    )
+    for item in forbidden or []:
+        rule = _text(item)
+        if not rule:
+            continue
+        if sanctioned and any(
+                prop in rule or rule in prop for prop in sanctioned):
+            resolved.append({
+                "rule": rule,
+                "resolution": "discarded_lower_priority_forbidden_rule",
+                "winning_scope": "episode_fact_bible",
+                "sanctioned_items": sanctioned,
+            })
+            continue
+        if sanctioned and any(token in rule for token in broad_era_tokens):
+            qualified = f"除剧情白名单（{whitelist}）外，{rule}"
+            kept.append(qualified)
+            resolved.append({
+                "rule": rule,
+                "replacement": qualified,
+                "resolution": "qualified_by_episode_whitelist",
+                "winning_scope": "episode_fact_bible",
+                "sanctioned_items": sanctioned,
+            })
+            continue
+        kept.append(rule)
+    return list(dict.fromkeys(kept)), resolved
+
+
 def apply_story_analysis(script, analysis):
     """把制作圣经注入剧本，供现有下游 Provider 无缝继承。"""
     if not isinstance(script, dict) or not isinstance(analysis, dict):
@@ -1148,10 +1193,21 @@ def apply_story_analysis(script, analysis):
         raw=analysis,
         source=analysis.get("source", "legacy"),
     )
-    script["production_analysis"] = copy.deepcopy(analysis)
     world = analysis["world"]
     visual = analysis["visual"]
     story_world = script.setdefault("story_world", {})
+    sanctioned = [
+        _text(item) for item in
+        (story_world.get("sanctioned_anachronisms") or [])
+        if _text(item)
+    ]
+    forbidden, resolved = _reconcile_forbidden_drift(
+        world["forbidden_drift"] + visual["forbidden_visuals"],
+        sanctioned,
+    )
+    if resolved:
+        analysis["rule_conflicts_resolved"] = resolved
+    script["production_analysis"] = copy.deepcopy(analysis)
     story_world.update({
         "name": world["name"],
         "overview": world["overview"],
@@ -1162,8 +1218,7 @@ def apply_story_analysis(script, analysis):
             f"{visual['user_style_constraint']}；{visual['medium']}；"
             f"{visual['palette']}；{visual['lighting']}；"
             f"{visual['texture_and_render']}"),
-        "forbidden_drift": list(dict.fromkeys(
-            world["forbidden_drift"] + visual["forbidden_visuals"])),
+        "forbidden_drift": forbidden,
     })
     prompt_bible = analysis["prompt_bible"]
     scene_map = {

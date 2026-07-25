@@ -461,8 +461,8 @@ const STANDARD_SECTIONS = [
       { path: "profile_key", label: "标准标识", locked: true, help: "版本链的稳定标识，保存后不可更换。" },
       { path: "rules.production.video_model", label: "视频模型", locked: true,
         help: "锁定 Seedance 2.0 Fast VIP；遇到真人脸限制时暂停，不静默切普通 VIP。" },
-      { path: "rules.production.resolution", label: "输出分辨率", locked: true,
-        help: "当前标准锁定 720P，避免不同阶段分辨率漂移。" },
+      { path: "rules.production.resolution", label: "默认输出分辨率", locked: true,
+        help: "自动/中档默认 720P；用户把单镜 Seedance 质量改为低或高时，分别明确使用 480P 或 1080P，并记录在该镜头合同中。" },
       { path: "rules.production.voice", label: "对白声音", locked: true,
         help: "Seedance2 在视频单元内同步生成角色人声与口型；豆包 TTS 仅作为无声视频兼容模式的备选。" },
       { path: "rules.production.lip_sync", label: "即梦对口型", type: "boolean", locked: true,
@@ -604,7 +604,7 @@ const STANDARD_SECTIONS = [
       { path: "rules.delivery.archive_standard_snapshot", label: "成品包归档标准快照", type: "boolean" },
     ],
   },
-  { id: "gates", label: "门禁质检", icon: "07", blurb: "生产前逐项拦截；关闭门禁会降低交付可靠性。", fields: [] },
+  { id: "gates", label: "门禁质检", icon: "07", blurb: "系统永久硬门不可关闭；镜头语言和表演启发只提示、不阻断。", fields: [] },
   { id: "camera", label: "镜头词库", icon: "08", blurb: "统一摄影词汇，避免模型收到互相冲突或不存在的运镜指令。", fields: [
     { path: "rules.camera_library.shot_scales", label: "景别词库", type: "list" },
     { path: "rules.camera_library.angles", label: "角度词库", type: "list" },
@@ -703,9 +703,35 @@ function renderGatesEditor() {
   const gates = standardsDraft?.rules?.quality_gates || [];
   return `<div class="gate-editor">${gates.map((gate, index) => `
     <div class="gate-rule">
-      <div><span class="gate-index">${String(index + 1).padStart(2, "0")}</span><b>${esc(gate.label || gate.id)}</b><p>${esc(gate.description || "生产前自动检查，未通过则停止消耗视频额度。")}</p></div>
-      <div class="gate-controls"><label><span>失败级别</span><select data-gate-severity="${index}" aria-label="${esc(gate.label || gate.id)}失败级别"><option value="block" ${gate.severity !== "warning" ? "selected" : ""}>阻断开拍</option><option value="warning" ${gate.severity === "warning" ? "selected" : ""}>只警告</option></select></label><label class="switch"><input type="checkbox" data-gate-index="${index}" ${gate.enabled !== false ? "checked" : ""}><span aria-hidden="true"></span><em>${gate.enabled !== false ? "启用" : "停用"}</em></label></div>
+      <div><span class="gate-index">${String(index + 1).padStart(2, "0")}</span><b>${esc(gate.label || gate.id)}</b>
+        <span class="rule-badge ${gate.mandatory ? "hard" : "adjustable"}">${gate.mandatory ? "系统永久硬门" : "导演建议"}</span>
+        <p>${esc(gate.description || "生产前自动检查，未通过则停止消耗视频额度。")}</p></div>
+      <div class="gate-controls"><label><span>失败级别</span><select data-gate-severity="${index}" aria-label="${esc(gate.label || gate.id)}失败级别" ${gate.mandatory ? "disabled" : ""}><option value="block" ${gate.severity !== "warning" ? "selected" : ""}>阻断开拍</option><option value="warning" ${gate.severity === "warning" ? "selected" : ""}>只警告</option></select></label><label class="switch"><input type="checkbox" data-gate-index="${index}" ${gate.enabled !== false ? "checked" : ""} ${gate.mandatory ? "disabled" : ""}><span aria-hidden="true"></span><em>${gate.mandatory ? "永久启用" : gate.enabled !== false ? "启用" : "停用"}</em></label></div>
     </div>`).join("") || `<div class="empty">当前标准没有门禁定义</div>`}</div>`;
+}
+
+function ruleGovernanceHtml() {
+  const governance = standardsDraft?.rules?.rule_governance || {};
+  const scopes = governance.scopes || [];
+  const precedence = governance.precedence || [];
+  if (!scopes.length) return "";
+  const scopeLabel = {
+    system_permanent: "系统永久规则",
+    project_or_episode: "项目 / 本集事实",
+    shot_contract: "当前镜头规则",
+    retry_patch: "一次性修复规则",
+  };
+  const scopeNote = {
+    system_permanent: "只保留身份、性别、人数、物理、文字、参考图绑定和文件完整性等不可妥协门禁。",
+    project_or_episode: "时代、画风、服装、道具、允许的跨时代物件；只作用于本项目或本集。",
+    shot_contract: "机位、构图、动作、站位和首尾状态；只作用于当前镜头。",
+    retry_patch: "针对本次质检问题修一次；通过或第二次失败后立即失效，不写入永久提示词。",
+  };
+  return `<article class="skill-manifest">
+    <div><span>RULE GOVERNANCE</span><b>规则已分层，禁止临时修复污染永久规则</b></div>
+    <dl>${scopes.map((scope) => `<div><dt>${scopeLabel[scope.id] || scope.id}</dt><dd>${esc(scopeNote[scope.id] || scope.expires || "")}</dd></div>`).join("")}</dl>
+    <p>冲突优先级：${precedence.map((item) => esc(item.label || item.id)).join(" → ")}。质检观察默认“待审核”，不会自动注入其他镜头。</p>
+  </article>`;
 }
 
 function renderVersionHistory() {
@@ -767,6 +793,7 @@ async function renderStandards(sectionId) {
   topbarRight.innerHTML = `<span class="standard-live">标准 v${esc(active.version)} 生效中</span>`;
   const source = standardsDraft.source_skill || {};
   const skillManifest = section.id === "production" ? `
+    ${ruleGovernanceHtml()}
     <article class="skill-manifest">
       <div><span>SKILL SOURCE</span><b>${esc(source.name || "SK 漫剧五维分镜制作 Skill")}</b></div>
       <dl><div><dt>技能 ID</dt><dd>${esc(source.id || "sk-manju-storyboard-skill")}</dd></div><div><dt>模板</dt><dd>${esc(source.reference || "five-dimension-storyboard-template-v5.txt")}</dd></div></dl>
@@ -5152,15 +5179,16 @@ function planCardHtml(data, item, avg) {
 }
 
 /* 生产画布:人物/场景/镜头节点 + 关系线(与出图提示词同源,牵引人物关联) */
-/* 出错经验库:质检发现过的问题自动总结,已注入所有出图/视频提示词 */
+/* 质检观察库:默认只保留证据，未经人工批准不进入其他镜头提示词。 */
 function lessonsPanelHtml(data) {
   const lessons = data.lessons || [];
   if (!lessons.length) return "";
   return `<div class="lessons-panel">
-    <h3>📚 出错经验库 <span class="dim">系统自动总结每次质检发现的问题,
-      并已注入后续所有出图与视频提示词,同样的错误不再重犯</span></h3>
+    <h3>📋 质检观察库 <span class="dim">仅保留问题证据；默认不注入其他镜头，
+      避免一次性修复累积成冲突的永久规则</span></h3>
     <ul>${lessons.slice(0, 8).map((item) =>
-      `<li><b>×${item.count}</b> ${esc(item.issue)}</li>`).join("")}</ul>
+      `<li><b>×${item.count}</b> ${esc(item.issue)}
+        <span class="rule-badge ${item.approved_for_prompt ? "live" : "adjustable"}">${item.approved_for_prompt ? "已人工批准为项目规则" : "待审核·不注入"}</span></li>`).join("")}</ul>
   </div>`;
 }
 
