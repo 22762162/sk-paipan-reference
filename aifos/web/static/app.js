@@ -494,6 +494,26 @@ const STANDARD_SECTIONS = [
     ],
   },
   {
+    id: "script_development", label: "剧本第一道总闸门", icon: "02A",
+    blurb: "小说和梗概先由编剧完成影视化改编；因果、人物信息、物理、时间、空间和道具生命周期不完整时，禁止开始任何视觉资产。",
+    fields: [
+      { path: "rules.script_development.required_before_any_visual_asset", label: "任何出图前必须通过剧本门禁", type: "boolean" },
+      { path: "rules.script_development.source_material_is_adaptable", label: "小说/梗概属于可改编素材", type: "boolean" },
+      { path: "rules.script_development.auto_adapt_imported_source", label: "导入小说自动完成影视化改编", type: "boolean" },
+      { path: "rules.script_development.writer_completes_missing_details", label: "编剧主动补齐拍摄细节", type: "boolean" },
+      { path: "rules.script_development.single_integrated_review", label: "一次综合审查，不多角色反复质检", type: "boolean" },
+      { path: "rules.script_development.scene_boundary_contract_required", label: "逐场锁定前后连续性边界", type: "boolean" },
+      { path: "rules.script_development.local_rewrite_enabled", label: "发现剧本根因时允许局部返编", type: "boolean" },
+      { path: "rules.script_development.impact_analysis_before_rewrite", label: "返编前先做影响分析", type: "boolean" },
+      { path: "rules.script_development.preserve_unaffected_assets", label: "保留未受影响的分镜和资产", type: "boolean" },
+      { path: "rules.script_development.human_approval_if_scope_expands", label: "返编越界时必须人工确认", type: "boolean" },
+      { path: "rules.script_development.local_rewrite_default_scope", label: "默认返编范围" },
+      { path: "rules.script_development.required_review_dimensions", label: "综合审查维度", type: "list",
+        help: "一次覆盖因果、动机、信息、物理、空间、时间、道具、世界规则、可拍性和事件密度。" },
+      { path: "rules.script_development.scene_boundary_fields", label: "局部返编边界字段", type: "list" },
+    ],
+  },
+  {
     id: "story_analysis", label: "剧本 AI 分析", icon: "02A",
     blurb: "在生成人物和场景前，先把故事世界、环境、视觉媒介与提示词母版锁成可调整的制作圣经。",
     fields: [
@@ -7477,10 +7497,23 @@ async function renderCanvasView(episodeId) {
 /* ---- 剧本正文(审阅页与生产直播页共用) ---- */
 function scriptBodyHtml(script) {
   const imported = script.import_analysis || {};
+  const logic = script.script_logic_audit || {};
   const corrections = imported.entity_corrections || [];
+  const logicIssues = Array.isArray(logic.issues) ? logic.issues : [];
+  const logicSummary = logic.schema ? `
+      <div class="${logic.passed ? "done" : "resume-banner"}">
+        <b>${logic.passed ? "✓ 剧本第一道总闸门已通过" : "⚠ 剧本总闸门未通过"}</b>：
+        ${esc(logic.summary || "等待编剧完成综合审查")}。
+        <span class="dim">已一次检查因果、人物动机与信息、物理、时间、空间、
+        道具生命周期、可拍性和局部返编边界。</span>
+        ${logicIssues.length ? `<details><summary>查看 ${logicIssues.length} 项待修问题</summary>
+          <ul>${logicIssues.slice(0, 12).map((item) => `<li>${esc(item)}</li>`).join("")}</ul>
+          </details>` : ""}
+      </div>` : "";
   const importSummary = imported.dialogue_count ? `
       <div class="resume-banner">
-        <b>✓ 小说 / 剧本智能解析完成</b>：
+        <b>✓ 小说 / 剧本智能解析完成${imported.writer_adapted
+          ? " · 已完成影视化改编" : ""}</b>：
         识别 ${Number(imported.dialogue_count || 0)} 句对白、
         ${Number(imported.character_count || 0)} 名人物、
         ${Number(imported.scene_count || 0)} 个场景。
@@ -7494,12 +7527,15 @@ function scriptBodyHtml(script) {
         ${imported.performance_cue_count
           ? `<span class="dim">另保留 ${Number(imported.performance_cue_count)} 条语气/动作供配音与表演使用。</span>`
           : ""}
-        <span class="dim">对白原文未改写。</span>
+        <span class="dim">${imported.writer_adapted
+          ? "原素材已保留为导入依据；正式剧本允许为因果、物理、连续性和道具逻辑改写。"
+          : "当前仍是解析稿；锁定前需通过剧本总闸门。"}</span>
       </div>` : "";
   return `
       <h1>${esc(script.episode_title || "本集剧本")}</h1>
       <p class="logline">${esc(script.logline || "")}</p>
       ${importSummary}
+      ${logicSummary}
       ${storyBibleHtml(script)}
       <div class="cast">${(script.characters || []).map((c) =>
         `<span class="chip">${esc(c.name)} · ${esc(c.role || "")}</span>`).join("")}</div>
@@ -7890,15 +7926,16 @@ function renderScriptReview(data, episodeId) {
   app.innerHTML = `
   <div class="canvas-view">
     <div class="prepro-steps" aria-label="预生产步骤">
-      <div class="done"><b>01</b><span>剧本来源<small>上传 / AI 编剧</small></span></div>
+      <div class="done"><b>01</b><span>剧本总闸门<small>改编 · 因果 · 道具 · 连续性</small></span></div>
       <div class="active"><b>02</b><span>AI 制作圣经<small>世界 · 环境 · 风格</small></span></div>
       <div><b>03</b><span>人工锁定<small>可改、可重分析</small></span></div>
       <div><b>04</b><span>开始生产<small>人物 · 场景 · 分镜</small></span></div>
     </div>
     <div class="confirm-banner">
       <div>
-        <b>剧本与 AI 制作圣经已就绪，先确认再出图 📖</b>
-        <span>检查故事、世界、环境和画风 → 可改或重新分析 → 锁定后才开始画。
+        <b>剧本总闸门与 AI 制作圣经已就绪，先确认再出图 📖</b>
+        <span>检查因果、人物信息、时间空间、道具生命周期、故事、世界、环境和画风
+        → 可改或重新分析 → 锁定后才开始画。
         此刻还没有消耗生图额度。</span>
       </div>
       <button class="primary" id="btn-script-ok">${resuming

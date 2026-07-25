@@ -146,6 +146,39 @@ def test_provided_script_pauses_for_story_analysis(app):
     assert summary["status"] == "awaiting_confirm"
 
 
+def test_imported_novel_is_writer_adapted_before_any_image(app):
+    script = {
+        "project_title": "小说总闸门", "episode_number": 1,
+        "episode_title": "导入素材", "logline": "主角发现密门",
+        "characters": [{"name": "阿云", "role": "主角"}],
+        "scenes": [{
+            "scene_no": 1, "location": "书房",
+            "characters": ["阿云"], "action": "阿云意识到这里有密门",
+            "lines": [{"character": "阿云", "dialogue": "原来在这里。"}],
+        }],
+        "import_analysis": {
+            "source_format": "novel",
+            "dialogue_count": 1,
+            "character_count": 1,
+            "scene_count": 1,
+            "dialogue_preserved_verbatim": True,
+        },
+    }
+    summary = app.director.produce(
+        "小说总闸门", 1, script=script, pause_for_confirm=True)
+    assert summary["status"] == "awaiting_script"
+    project = app.projects.get_project("小说总闸门")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    saved, _ = app.projects.latest_document(episode["id"], "script")
+    assert saved["import_analysis"]["writer_adapted"] is True
+    assert saved["import_analysis"]["dialogue_preserved_verbatim"] is False
+    assert saved["script_logic_audit"]["schema"] == "aifos.script-logic/v2"
+    assert saved["script_logic_audit"]["passed"] is True
+    assert app.assets.list(project["id"], "character_art") == []
+
+
 def test_cast_art_reused_across_episodes(app):
     first = app.director.produce("万妖图录", 1)
     assert first["status"] == "awaiting_cast"

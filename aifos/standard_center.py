@@ -28,8 +28,9 @@ DEFAULT_STANDARD = {
         "version": "5.3",
         "reference": "five-dimension-storyboard-template-v5.txt",
         "principle": (
-            "先从剧情推导人物视觉 DNA、完成全剧角色去重和人工定版，"
-            "再建立三视图母资产、五维分镜与 Seedance 生产。"),
+            "先把小说或梗概改编成因果、物理、时间、空间、人物信息与道具"
+            "生命周期完整的可拍剧本，再推导人物视觉 DNA、完成全剧角色去重"
+            "和人工定版，最后建立母资产、五维分镜与 Seedance 生产。"),
     },
     "rules": {
         "production": {
@@ -62,6 +63,40 @@ DEFAULT_STANDARD = {
                 ],
             },
             "fast_vip_real_face_conflict": "pause_for_confirmation",
+        },
+        "script_development": {
+            "required_before_any_visual_asset": True,
+            "source_material_is_adaptable": True,
+            "auto_adapt_imported_source": True,
+            "writer_completes_missing_details": True,
+            "single_integrated_review": True,
+            "scene_boundary_contract_required": True,
+            "local_rewrite_enabled": True,
+            "impact_analysis_before_rewrite": True,
+            "preserve_unaffected_assets": True,
+            "human_approval_if_scope_expands": True,
+            "local_rewrite_default_scope": "current_scene",
+            "required_review_dimensions": [
+                "causal_chain",
+                "character_motivation",
+                "information_state",
+                "physical_reality",
+                "spatial_continuity",
+                "temporal_continuity",
+                "prop_lifecycle",
+                "world_rules",
+                "shootability",
+                "story_density",
+            ],
+            "scene_boundary_fields": [
+                "entry_boundary",
+                "exit_boundary",
+                "immutable_facts",
+                "prop_ledger",
+                "knowledge_state",
+                "time_state",
+                "local_rewrite_scope",
+            ],
         },
         "story_analysis": {
             "required_before_images": True,
@@ -256,7 +291,7 @@ DEFAULT_STANDARD = {
             "speeds": ["正常", "升格", "降格", "延时", "定格"],
         },
         "quality_gates": [
-            {"id": "script_bible", "label": "剧情事实源", "enabled": True, "severity": "block", "description": "故事世界、前情、人物介绍及场次人物名单完整且不互相冲突。"},
+            {"id": "script_bible", "label": "剧本第一道总闸门", "enabled": True, "severity": "block", "description": "小说/梗概已完成影视化改编；世界、人物、因果、信息、物理、时间、空间、道具生命周期、可拍性及局部返编边界完整且不冲突。"},
             {"id": "character_assets", "label": "人物母资产", "enabled": True, "severity": "block", "description": "人物视觉 DNA 来自剧情、全剧角色已去重；人工定版后具备独立面部、正面、严格侧面和完整背面母资产。"},
             {"id": "continuity", "label": "连续性", "enabled": True, "severity": "block", "description": "人物、服装、道具、站位及段间状态无跳变。"},
             {"id": "spatial", "label": "空间调度", "enabled": True, "severity": "block", "description": "逐场锁定人物走位、机位、视锥和屏幕轴线，防止多人漂移或增殖。"},
@@ -455,6 +490,33 @@ class StandardCenter:
 
         story_analysis = required_dict(
             rules, "story_analysis", "rules.story_analysis")
+        script_development = required_dict(
+            rules, "script_development", "rules.script_development")
+        for key in (
+                "required_before_any_visual_asset",
+                "source_material_is_adaptable",
+                "auto_adapt_imported_source",
+                "writer_completes_missing_details",
+                "single_integrated_review",
+                "scene_boundary_contract_required",
+                "local_rewrite_enabled",
+                "impact_analysis_before_rewrite",
+                "preserve_unaffected_assets",
+                "human_approval_if_scope_expands"):
+            bool_field(
+                script_development, key,
+                f"rules.script_development.{key}")
+        for key in ("required_review_dimensions", "scene_boundary_fields"):
+            values = script_development.get(key)
+            if (not isinstance(values, list) or not values
+                    or not all(isinstance(item, str) and item.strip()
+                               for item in values)):
+                issue(
+                    f"rules.script_development.{key}",
+                    "必须是非空字符串列表")
+        nonempty_string(
+            script_development, "local_rewrite_default_scope",
+            "rules.script_development.local_rewrite_default_scope")
         for key in (
                 "required_before_images", "auto_analyze_uploaded_script",
                 "user_style_is_hard_constraint",
@@ -906,6 +968,16 @@ class StandardCenter:
                         targets[key] = default_targets[key]
                         changed = True
         story_defaults = DEFAULT_STANDARD["rules"]["story_analysis"]
+        script_defaults = DEFAULT_STANDARD["rules"]["script_development"]
+        script_rules = rules.get("script_development")
+        if not isinstance(script_rules, dict):
+            rules["script_development"] = copy.deepcopy(script_defaults)
+            changed = True
+        else:
+            for key, value in script_defaults.items():
+                if key not in script_rules:
+                    script_rules[key] = copy.deepcopy(value)
+                    changed = True
         story_rules = rules.get("story_analysis")
         if not isinstance(story_rules, dict):
             rules["story_analysis"] = copy.deepcopy(story_defaults)
@@ -931,6 +1003,7 @@ class StandardCenter:
             return self.save(
                 content, change_note=(
                     "自动升级：加入视觉 DNA、全剧角色去重、三视图母资产、"
+                    "剧本第一道总闸门、道具生命周期、局部返编边界、"
                     "剧本分析、剧情事实源、空间调度与非现实Q版内心人格规则"),
                 expected_active_id=snapshot.get("version_id"))
         except StandardConflictError:

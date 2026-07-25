@@ -125,6 +125,8 @@ def test_index_and_static(server):
     assert b"/api/story-analysis" in app_js
     assert "世界观、环境与视觉制作圣经".encode() in app_js
     assert "锁定制作圣经并开始人物图".encode() in app_js
+    assert "剧本第一道总闸门".encode() in app_js
+    assert "导入小说自动完成影视化改编".encode() in app_js
     assert b"/api/asset/delete" in app_js
     assert b"/api/history/delete" in app_js
     assert b"history-delete-row" in app_js

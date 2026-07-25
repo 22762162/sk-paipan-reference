@@ -27,7 +27,24 @@ def test_default_standard_is_complete_and_active(tmp_path):
         assert content["source_skill"]["id"] == "sk-manju-storyboard-skill"
         rules = content["rules"]
         production = rules["production"]
+        script_development = rules["script_development"]
         story_analysis = rules["story_analysis"]
+        assert script_development[
+            "required_before_any_visual_asset"] is True
+        assert script_development["source_material_is_adaptable"] is True
+        assert script_development["auto_adapt_imported_source"] is True
+        assert script_development["writer_completes_missing_details"] is True
+        assert script_development["single_integrated_review"] is True
+        assert script_development["scene_boundary_contract_required"] is True
+        assert script_development["local_rewrite_enabled"] is True
+        assert script_development["impact_analysis_before_rewrite"] is True
+        assert script_development["preserve_unaffected_assets"] is True
+        assert script_development[
+            "human_approval_if_scope_expands"] is True
+        assert "prop_lifecycle" in script_development[
+            "required_review_dimensions"]
+        assert "entry_boundary" in script_development[
+            "scene_boundary_fields"]
         assert story_analysis["required_before_images"] is True
         assert story_analysis["auto_analyze_uploaded_script"] is True
         assert story_analysis["user_style_is_hard_constraint"] is True
@@ -91,11 +108,14 @@ def test_existing_standard_is_upgraded_with_story_analysis_rules(tmp_path):
     try:
         active = app.standards.active()
         legacy = copy.deepcopy(active)
+        legacy["content"]["rules"].pop("script_development")
         legacy["content"]["rules"].pop("story_analysis")
         upgraded = app.standards._upgrade_spatial_standard(legacy)
         assert upgraded["version"] == active["version"] + 1
         assert upgraded["content"]["rules"]["story_analysis"] == (
             DEFAULT_STANDARD["rules"]["story_analysis"])
+        assert upgraded["content"]["rules"]["script_development"] == (
+            DEFAULT_STANDARD["rules"]["script_development"])
         assert "剧本分析" in upgraded["change_note"]
         assert len(app.standards.history("sk-manju-v5")) == 2
     finally:

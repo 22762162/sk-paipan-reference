@@ -1210,11 +1210,12 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
     script_gate_error = validate_script_bible(script)
     script_logic = script.get("script_logic_audit") or {}
     available_gates = [
-        _gate("script_bible", "剧本导演逻辑与制作圣经",
+        _gate("script_bible", "剧本第一道总闸门与制作圣经",
               script_gate_error is None,
               (script_gate_error
                or (script_logic.get("summary")
-                   or "世界观、前情、人物、因果、物理、空间和可拍摄性已锁定"))),
+                   or "世界观、人物、因果、信息、物理、时间、空间、"
+                      "道具生命周期、可拍摄性与局部返编边界已锁定"))),
         _gate("continuity", "连续性圣经", bool(continuity.get("characters"))
               and bool(continuity.get("scenes"))
               and continuity.get("standard_fingerprint") == profile.get(
