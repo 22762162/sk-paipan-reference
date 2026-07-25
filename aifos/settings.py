@@ -138,7 +138,7 @@ def _profile_settings_view(profile, runtime=None):
 
 
 def codex_profiles_payload(config, status=None):
-    """返回设置页可编辑的安全双 Codex 配置。"""
+    """返回设置页可编辑的安全多 Codex 配置。"""
     status = status or config.codex_parallel_status()
     runtime_by_id = {
         profile["id"]: profile
@@ -223,7 +223,7 @@ def _save_file(config_path, data):
 
 
 def set_codex_profiles(config_path, profiles):
-    """安全保存 1-2 个 Codex profile，并同步首个到旧 providers.codex。
+    """安全保存 1-3 个 Codex profile，并同步首个到旧 providers.codex。
 
     profile 只接受 name/codex_home/command/enabled；认证继续由每个
     CODEX_HOME 自己的 auth.json 管理，本函数既不读取也不落盘其内容。
@@ -257,10 +257,10 @@ def set_codex_profiles(config_path, profiles):
     parallel["profiles"] = normalized
 
     # 旧 router 仍把 codex 视为单 Provider；镜像首个 profile 保证保存
-    # 双配置后，未升级的调用路径继续使用第一路而不丢 enabled/command。
+    # 多配置后，未升级的调用路径继续使用第一路而不丢 enabled/command。
     # Router 仍只有一个 codex Provider；只要任一路开启就必须让 Provider
     # 可用，实际任务再由导演按 profile 分片。优先把首个已启用通道镜像
-    # 到旧字段，兼容尚未支持双 profile 的调用路径。
+    # 到旧字段，兼容尚未支持多 profile 的调用路径。
     primary = next((profile for profile in normalized
                     if profile["enabled"]), normalized[0])
     legacy = data.setdefault("providers", {}).setdefault("codex", {})

@@ -19,11 +19,11 @@ DEFAULTS = {
         # Seedance 逐镜视频默认 4 路并行；可在设置页按账号限流调低/调高。
         "parallel_videos": 4,
     },
-    # Codex 双实例不注册成两个 Provider，避免破坏现有 routing。旧工作区
+    # Codex 多实例不注册成多个 Provider，避免破坏现有 routing。旧工作区
     # 没有 profiles 时会自动把 providers.codex 映射成一个兼容 profile；
-    # 设置中心保存后可配置两个各自独立的 CODEX_HOME。
+    # 设置中心保存后可配置三个各自独立的 CODEX_HOME。
     "codex_parallel": {
-        "max_parallel": 2,
+        "max_parallel": 3,
         "profiles": [
             {
                 "id": "codex_a",
@@ -39,6 +39,16 @@ DEFAULTS = {
                 "id": "codex_b",
                 "name": "Codex B",
                 "codex_home": "~/.codex-account-b",
+                "command": [
+                    "python3", "-m", "aifos.adapters.codex_image",
+                    "--codex", "codex",
+                ],
+                "enabled": False,
+            },
+            {
+                "id": "codex_c",
+                "name": "Codex C",
+                "codex_home": "~/.codex-account-c",
                 "command": [
                     "python3", "-m", "aifos.adapters.codex_image",
                     "--codex", "codex",
@@ -227,7 +237,7 @@ def _deep_merge(base, override):
     return out
 
 
-CODEX_PROFILE_LIMIT = 2
+CODEX_PROFILE_LIMIT = 3
 CODEX_PROFILE_FIELDS = ("id", "name", "codex_home", "command", "enabled")
 _CODEX_SECRET_FIELDS = {
     "api_key", "apikey", "auth", "auth_json", "credentials", "password",
@@ -331,15 +341,15 @@ def normalize_codex_profile(profile, index=0, strict=False):
                 "Codex profile 不支持字段: "
                 + ", ".join(sorted(str(key) for key in unknown)))
 
-    default_id = "codex_a" if index == 0 else "codex_b"
+    channel = chr(ord("a") + min(max(int(index), 0), 25))
+    default_id = f"codex_{channel}"
     profile_id = str(profile.get("id") or default_id).strip()
     if (not profile_id or len(profile_id) > 64
             or any(char in profile_id for char in ("\x00", "\r", "\n"))):
         if strict:
             raise ValueError("Codex profile id 必须是 1-64 个可见字符")
         profile_id = default_id
-    name = str(profile.get("name") or (
-        "Codex A" if index == 0 else "Codex B")).strip()
+    name = str(profile.get("name") or f"Codex {channel.upper()}").strip()
     if (not name or len(name) > 64
             or any(char in name for char in ("\x00", "\r", "\n"))):
         if strict:
@@ -401,7 +411,7 @@ def _assignment_profile(value):
 
 
 def codex_parallel_status(
-        profiles, assignments=None, max_parallel=2,
+        profiles, assignments=None, max_parallel=CODEX_PROFILE_LIMIT,
         parallel_per_channel=8):
     """汇总 Codex 通道及槽位状态；每条通道可容纳多项并行任务。"""
     normalized = [
@@ -477,7 +487,7 @@ def codex_parallel_status(
 
 
 def assign_codex_task(
-        profiles, assignments, task_id, max_parallel=2,
+        profiles, assignments, task_id, max_parallel=CODEX_PROFILE_LIMIT,
         parallel_per_channel=8):
     """幂等地把任务分给负载最低且仍有槽位的 profile。"""
     task_key = str(task_id or "").strip()
@@ -653,7 +663,7 @@ class Config:
         return node
 
     def codex_profiles(self):
-        """返回安全的 Codex 调度配置（最多两个）。"""
+        """返回安全的 Codex 调度配置（最多三个）。"""
         return get_codex_profiles(self.data)
 
     def codex_parallel_status(self, assignments=None):

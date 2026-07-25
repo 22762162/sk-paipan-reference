@@ -284,7 +284,7 @@ class ProviderRouter:
                 else:
                     # parallel_images 是每条 Codex 通道的容量。独立
                     # CODEX_HOME 继续隔离登录态；单通道最多 8 路，
-                    # Codex A+B 可合计 16 路。
+                    # A/B/C 三通道可合计 24 路。
                     with slots:
                         result = provider.generate(
                             capability, payload, out_dir, cancel=cancel)

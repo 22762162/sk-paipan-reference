@@ -1,4 +1,4 @@
-"""双 Codex 登录态分片：环境隔离、轮询分配与旧配置兼容。"""
+"""Codex 多登录态分片：环境隔离、轮询分配与旧配置兼容。"""
 
 import json
 
@@ -20,6 +20,17 @@ def _profiles(tmp_path):
         {"id": "codex_b", "name": "Codex 账号 B", "enabled": True,
          "codex_home": str(home_b)},
     ], home_a, home_b
+
+
+def _three_profiles(tmp_path):
+    profiles, home_a, home_b = _profiles(tmp_path)
+    home_c = tmp_path / "codex-c"
+    home_c.mkdir()
+    profiles.append({
+        "id": "codex_c", "name": "Codex 账号 C", "enabled": True,
+        "codex_home": str(home_c),
+    })
+    return profiles, home_a, home_b, home_c
 
 
 def test_director_assigns_ready_profiles_round_robin(tmp_path):
@@ -58,6 +69,24 @@ def test_dual_codex_channels_each_contribute_eight_workers(tmp_path):
         assert app.router._codex_parallel_per_channel == 8
         assert set(app.router._codex_profile_slots) == {
             "codex_a", "codex_b"}
+    finally:
+        app.close()
+
+
+def test_three_codex_channels_contribute_twenty_four_workers(tmp_path):
+    profiles, _home_a, _home_b, _home_c = _three_profiles(tmp_path)
+    app = App(tmp_path / "ws", config_overrides={
+        "defaults": {"parallel_images": 8},
+        "codex_parallel": {"max_parallel": 3, "profiles": profiles},
+    })
+    try:
+        assert app.director._parallel_workers() == 8
+        assert app.director._total_image_workers() == 24
+        status = app.config.codex_parallel_status()
+        assert status["enabled_count"] == 3
+        assert status["total_parallel"] == 24
+        assert set(app.router._codex_profile_slots) == {
+            "codex_a", "codex_b", "codex_c"}
     finally:
         app.close()
 
