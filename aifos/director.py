@@ -11772,6 +11772,14 @@ class Director:
 
     def manual_qc_pass(self, project_title, episode_number, item_ids=None,
                        only_failed=False, note=""):
+        """串行登记人工质检决定，允许同集其他镜头继续生产。"""
+        with _PLAN_IO_LOCK:
+            return self._manual_qc_pass_locked(
+                project_title, episode_number, item_ids=item_ids,
+                only_failed=only_failed, note=note)
+
+    def _manual_qc_pass_locked(self, project_title, episode_number,
+                               item_ids=None, only_failed=False, note=""):
         """人工放行轻微问题图,保留原始质检问题和覆盖审计记录。
 
         人工通过不是删除质检结果: ``qc.issues`` 原样保留,同时写入
@@ -11823,6 +11831,13 @@ class Director:
                 skipped_items.append({"item_id": item_id,
                                       "reason": "该条目不是镜头图或首尾帧"})
                 continue
+            if item.get("status") in ("pending", "generating", "retrying"):
+                skipped += 1
+                skipped_items.append({
+                    "item_id": item_id,
+                    "reason": "当前图片尚未生成稳定，请待本图完成后再人工通过",
+                })
+                continue
             qc = dict(item.get("qc") or {})
             if qc.get("passed") is True:
                 skipped += 1
@@ -11836,23 +11851,45 @@ class Director:
                 "overlay_count_checked", "overlay_count_match",
                 "physical_logic_checked", "physical_logic_match",
                 "spatial_logic_checked", "spatial_logic_match",
-                "input_contract_passed",
             )
             failed_hard_fields = [
                 field for field in hard_fields if qc.get(field) is False]
             issue_text = "；".join(
                 str(value) for value in (qc.get("issues") or []))
-            hard_issue_words = (
-                "身份", "性别", "人数", "数量", "新增人物", "缺失人物",
-                "物理逻辑", "空间关系", "参考图绑定", "提示词冲突",
+            # 旧质检只有自然语言 issues 时仍需关键词兜底；新版已有结构化
+            # 硬门结果时必须以结构化结果为准，不能因“人数、身份和空间关系
+            # 均成立”这类肯定句里出现关键词而误判成硬错误。
+            hard_issue_domains = (
+                ("identity_checked", "identity_match",
+                 ("身份", "人物不一致")),
+                ("gender_checked", "gender_match", ("性别",)),
+                ("count_checked", "count_match",
+                 ("人数", "数量", "新增人物", "缺失人物")),
+                ("overlay_count_checked", "overlay_count_match",
+                 ("叠层人数", "叠层数量")),
+                ("physical_logic_checked", "physical_logic_match",
+                 ("物理逻辑",)),
+                ("spatial_logic_checked", "spatial_logic_match",
+                 ("空间关系",)),
             )
+            unresolved_hard_words = [
+                word
+                for checked_field, match_field, words in hard_issue_domains
+                if not (
+                    qc.get(checked_field) is True
+                    and qc.get(match_field) is True)
+                for word in words
+            ]
+            hard_issue_detected = (
+                any(word in issue_text for word in unresolved_hard_words)
+                or "参考图绑定" in issue_text)
             if (qc.get("hard_failure") is True or failed_hard_fields
-                    or any(word in issue_text for word in hard_issue_words)):
+                    or hard_issue_detected):
                 skipped += 1
                 skipped_items.append({
                     "item_id": item_id,
                     "reason": (
-                        "身份/性别/人数/物理空间/提示词参考图属于硬错误，"
+                        "身份/性别/人数/物理空间/参考图绑定属于硬错误，"
                         "不能人工强行放行；请修改本镜后重新质检"),
                     "hard_fields": failed_hard_fields,
                 })

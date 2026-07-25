@@ -4977,10 +4977,9 @@ async function redoFailed(episodeId, btn) {
 async function manualPassItems(episodeId, ids, btn, onDone) {
   if (!ids.length) return;
   const original = btn?.textContent || "✅ 人工通过";
-  if (btn) { btn.disabled = true; btn.textContent = "正在安全暂停…"; }
+  if (btn) { btn.disabled = true; btn.textContent = "正在登记人工通过…"; }
+  showToast(`正在人工复核并放行 ${ids.length} 张问题图…`, "info");
   try {
-    await ensureBatchRevisionCheckpoint(episodeId);
-    if (btn) btn.textContent = "正在登记人工通过…";
     const reply = await api("/api/qc_override", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ episode_id: episodeId, item_ids: ids }),

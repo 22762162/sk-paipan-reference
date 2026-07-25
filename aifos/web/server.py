@@ -3264,9 +3264,6 @@ def make_handler(workspace, jobs):
             if found is None:
                 return self._error(404, "剧集不存在")
             title, number = found
-            if jobs.running_for(title, number):
-                return self._error(
-                    409, "本集正在生产，请先安全暂停后再人工通过问题图")
             item_ids = body.get("item_ids")
             if item_ids is not None and not isinstance(item_ids, list):
                 return self._error(400, "item_ids 必须是数组")

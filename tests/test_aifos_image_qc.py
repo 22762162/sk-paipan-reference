@@ -1310,6 +1310,53 @@ def test_manual_qc_pass_cannot_override_identity_or_count_failure(app,
     assert "不能人工强行放行" in result["skipped_items"][0]["reason"]
 
 
+def test_manual_qc_pass_can_override_prompt_contract_and_minor_camera_issue(
+        app, tmp_path):
+    """画面硬门均通过时，提示词冗余和轻微机位偏差可由人工放行。"""
+    project = _preproduce(app, title="人工放行输入合同")
+    plan_path = (app.workspace.artifacts_dir
+                 / f"p{project['id']:03d}" / "e001" / "render_plan.json")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    item = next(i for i in plan["items"] if i["category"] == "shot_image")
+    failed = tmp_path / "minor-camera-failed.png"
+    failed.write_bytes(b"\x89PNG\r\n\x1a\n" + b"failed" * 8)
+    item.update({
+        "status": "awaiting_human",
+        "output_uri": str(failed),
+        "qc": {
+            "passed": False,
+            "hard_failure": False,
+            "identity_checked": True,
+            "identity_match": True,
+            "gender_checked": True,
+            "gender_match": True,
+            "count_checked": True,
+            "count_match": True,
+            "physical_logic_checked": True,
+            "physical_logic_match": True,
+            "spatial_logic_checked": True,
+            "spatial_logic_match": True,
+            "input_contract_passed": False,
+            "issues": [
+                "荷兰角不够明显",
+                "其余人数、身份、服装、动作和空间关系成立",
+                "生成提示词存在服装描述冲突",
+            ],
+        },
+    })
+    plan_path.write_text(
+        json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+
+    result = app.director.manual_qc_pass(
+        "人工放行输入合同", 1, item_ids=[item["id"]])
+
+    assert result["passed"] == 1
+    final_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    final = next(i for i in final_plan["items"] if i["id"] == item["id"])
+    assert final["status"] == "done"
+    assert final["qc"]["manual_override"] is True
+
+
 def test_codex_qc_instruction_and_parse(tmp_path, monkeypatch):
     """Codex 图像质检:构造读图指令,从 stdout 解析判定 JSON。"""
     from aifos.adapters import codex_image

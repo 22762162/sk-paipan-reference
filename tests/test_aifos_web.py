@@ -536,7 +536,7 @@ def test_episode_exposes_safe_video_input_diagnosis(server):
     assert "完整 Seedance 提示词" not in safe_diagnosis
 
 
-def test_manual_qc_override_api_promotes_problem_image(server):
+def test_manual_qc_override_api_promotes_problem_image(server, monkeypatch):
     """人工通过接口一次处理问题图，并保留质检审计字段。"""
     app2 = App(server["workspace"])
     try:
@@ -564,6 +564,9 @@ def test_manual_qc_override_api_promotes_problem_image(server):
         episode_id = episode["id"]
     finally:
         app2.close()
+    monkeypatch.setattr(
+        JobRegistry, "running_for",
+        lambda self, title, number: [{"status": "running"}])
     status, result = _json_request(server["port"], "POST", "/api/qc_override", {
         "episode_id": episode_id, "item_ids": ["shot:1"],
         "note": "人工确认可接受",
