@@ -101,6 +101,7 @@ def _ref_line(payload):
                    if isinstance(r, dict)}
     refs.extend(f"人物设定图 {r}" for r in payload.get("character_refs", [])
                 if r not in locked_uris)
+    refs.extend(f"核心道具母资产 {r}" for r in payload.get("prop_refs", []))
     if payload.get("spatial_ref"):
         refs.append(f"本镜空间调度图 {payload['spatial_ref']}")
     if payload.get("scene_ref"):
@@ -195,6 +196,16 @@ def build_instruction(capability, payload, out_dir):
     if capability == "image":
         safe = "".join(c if c.isalnum() else "_"
                        for c in str(payload.get("art_name", "")))[:40]
+        if payload.get("prop_candidate"):
+            target = out_dir / f"prop_{safe}.png"
+            instruction = (
+                f"为核心道具生成单件候选图并保存到 {target}(PNG,{size})。"
+                f"{prompt_text}。这是供人工四选一的道具母资产候选，"
+                "不得画成人物立绘或场景图。"
+                f"{_ref_line(payload)}{common}只产出该文件。")
+            return instruction, [target], {
+                "name": payload.get("art_name"),
+                "prop": payload.get("prop_name", "")}
         if payload.get("portrait"):
             target = out_dir / f"portrait_{safe}.png"
             purpose = ("这只是供人工挑选的定妆候选，尚不是最终身份锚点"
@@ -530,6 +541,7 @@ def run(request, codex, timeout, extra_args, plain=False):
     if payload.get("require_reference_images"):
         character_refs = list(payload.get("character_refs") or [])
         declared = list(character_refs)
+        declared.extend(payload.get("prop_refs") or [])
         declared.extend(
             ref.get("uri") for ref in
             (payload.get("identity_references") or [])

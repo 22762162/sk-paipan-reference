@@ -1,4 +1,4 @@
-"""人物5选1定版、参考图硬门禁与视觉身份质检。"""
+"""正式人物统一4选1定版、参考图硬门禁与视觉身份质检。"""
 
 from pathlib import Path
 
@@ -45,7 +45,7 @@ def test_role_based_candidates_pause_before_downstream_images(app):
     project, episode, script = _to_cast_selection(app)
     status = app.director.character_selection_status(
         project["id"], script["characters"])
-    assert status["candidate_target"] == 5
+    assert status["candidate_target"] == 4
     assert status["locked"] == 0
     assert all(item["candidate_count"] == character_candidate_target(
         next(c for c in script["characters"] if c["name"] == item["character"]))
@@ -64,11 +64,11 @@ def test_role_based_candidates_pause_before_downstream_images(app):
     assert app.assets.list(project["id"], "scene_art") == []
 
 
-def test_candidate_count_is_strictly_role_tiered():
-    assert character_candidate_target({"role": "主角"}) == 5
-    assert character_candidate_target({"role": "重要配角"}) == 3
-    assert character_candidate_target({"role": "配角"}) == 1
-    assert character_candidate_target({"role": "非重要配角"}) == 1
+def test_candidate_count_is_four_for_every_formal_role():
+    assert character_candidate_target({"role": "主角"}) == 4
+    assert character_candidate_target({"role": "重要配角"}) == 4
+    assert character_candidate_target({"role": "配角"}) == 4
+    assert character_candidate_target({"role": "非重要配角"}) == 4
     assert character_candidate_target({"role": "背景路人"}) == 0
     assert character_candidate_target({"role": "跑龙套"}) == 0
     assert character_candidate_target({
@@ -104,12 +104,12 @@ def test_candidate_prompts_create_real_look_variants_without_locking_style(app):
         "hair": "齐肩内扣短发", "makeup": "清透妆",
         "costume": "浅灰通勤套装", "temperament": "温柔克制",
     }
-    variants = [app.director._candidate_variant(i, design) for i in range(1, 6)]
+    variants = [app.director._candidate_variant(i, design) for i in range(1, 5)]
     prompts = [app.director._candidate_portrait_prompt(
         "林昭", "主角", "现代都市半写实", design, variant)
         for variant in variants]
-    assert len({item["variant_id"] for item in variants}) == 5
-    assert len({tuple(item["look_variant"].values()) for item in variants}) == 5
+    assert len({item["variant_id"] for item in variants}) == 4
+    assert len({tuple(item["look_variant"].values()) for item in variants}) == 4
     assert all("不是同一套衣服只换动作" in prompt for prompt in prompts)
     assert all("人物立绘必须是纯净、无文字的单人物资产背景" in prompt
                for prompt in prompts)

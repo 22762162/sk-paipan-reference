@@ -451,6 +451,7 @@ def _image_asset_catalog(app, project_id):
     labels = {
         "character_candidate": "人物候选",
         "character_art": "人物立绘", "character_sheet": "人物设定",
+        "prop_candidate": "道具候选", "prop_identity": "核心道具母资产",
         "scene_art": "场景概念图", "image": "镜头关键图",
         "first_frame": "首帧", "last_frame": "尾帧",
         "cover": "封面", "reference": "上传参考图",
@@ -461,6 +462,7 @@ def _image_asset_catalog(app, project_id):
         "character": "人物", "scene": "场景", "costume": "服装",
         "shot": "镜头", "frame": "首尾帧", "cover": "封面",
         "reference": "参考图", "inner_persona": "内心Q版",
+        "prop": "道具",
     }
     project = app.db.query_one(
         "SELECT id, title FROM projects WHERE id=?", (project_id,))
@@ -495,7 +497,8 @@ def _image_asset_catalog(app, project_id):
     active_rows = app.assets.active_list(project_id)
     selected_candidate_ids = {
         str(app.assets.meta(row).get("candidate_asset_id"))
-        for row in active_rows if row["kind"] == "character_identity"
+        for row in active_rows if row["kind"] in {
+            "character_identity", "prop_identity"}
         and app.assets.meta(row).get("candidate_asset_id")
     }
     stored_prompts = {}
@@ -511,6 +514,8 @@ def _image_asset_catalog(app, project_id):
         if kind in {
                 "character_candidate", "character_art", "inner_persona"}:
             return "character"
+        if kind in {"prop_candidate", "prop_identity"}:
+            return "prop"
         if kind == "character_sheet":
             return ("costume" if meta.get("sheet") in {
                 "costume", "costume_detail"} else "character")
@@ -528,11 +533,11 @@ def _image_asset_catalog(app, project_id):
         """资产画布的一级泳道:先区分是否会直接进入后续生产。"""
         if kind in {"character_art", "scene_art", "image", "first_frame",
                     "last_frame", "cover", "spatial_blocking",
-                    "inner_persona"}:
+                    "inner_persona", "prop_identity"}:
             return "production"
         if kind == "character_sheet":
             return "character_support"
-        if kind == "character_candidate":
+        if kind in {"character_candidate", "prop_candidate"}:
             return "candidate"
         if kind == "reference":
             return "reference"
@@ -549,6 +554,8 @@ def _image_asset_catalog(app, project_id):
     def usage_for(kind, row_id, selected=False):
         if kind == "character_candidate":
             return "已定版候选" if selected else "候选图·未定版不入镜头"
+        if kind == "prop_candidate":
+            return "已定版道具候选" if selected else "道具候选·未定版不入镜头"
         return {
             "character_art": "身份锚点·自动使用",
             "scene_art": "场景锚点·自动使用",
@@ -560,6 +567,7 @@ def _image_asset_catalog(app, project_id):
             "reference": "上传参考·按关联调用",
             "spatial_blocking": "多人/变机位镜头·Seedance 必传",
             "inner_persona": "必要内心戏自动使用·不计现场真人",
+            "prop_identity": "核心道具锚点·相关镜头自动使用",
         }.get(kind, "项目资产")
 
     def prompt_key(row, meta, episode_number):
@@ -568,6 +576,11 @@ def _image_asset_catalog(app, project_id):
             character = meta.get("character") or name.rsplit(":", 1)[0]
             index = int(meta.get("candidate_index") or name.rsplit(":", 1)[-1])
             return f"candidate:{character}:{index}"
+        if kind == "prop_candidate":
+            prop = meta.get("prop") or name.rsplit(":", 1)[0]
+            index = int(
+                meta.get("candidate_index") or name.rsplit(":", 1)[-1])
+            return f"prop_candidate:{prop}:{index}"
         if kind == "character_art":
             index = meta.get("candidate_index")
             return (f"candidate:{name}:{int(index)}" if index
@@ -588,10 +601,20 @@ def _image_asset_catalog(app, project_id):
     for row in active_rows:
         if row["kind"] not in IMAGE_KINDS:
             continue
+        row_meta = app.assets.meta(row)
+        if row["kind"] == "character_candidate":
+            try:
+                legacy_index = int(
+                    row_meta.get("candidate_index") or 0)
+            except (TypeError, ValueError):
+                legacy_index = 0
+            if legacy_index > 4:
+                # 旧版第5张仍留在版本历史和文件中，但不再属于当前四选一。
+                continue
         url = _versioned(_artifact_url(app, row["uri"]), row)
         if not url:
             continue
-        meta = app.assets.meta(row)
+        meta = row_meta
         episode_number = meta.get(
             "source_episode_number", meta.get("episode_number"))
         match = re.match(r"^e(\d{3})(?:_|$)", row["name"])
@@ -711,6 +734,11 @@ def _collect_artifacts(app, project_id, ep_num):
         {"asset_id": row["id"], "kind": row["kind"], "name": row["name"],
          "url": _versioned(_artifact_url(app, row["uri"]), row)}
         for row in latest_rows("scene_art")]
+    out["prop_art"] = [
+        {"asset_id": row["id"], "kind": row["kind"], "name": row["name"],
+         "url": _versioned(_artifact_url(app, row["uri"]), row),
+         "meta": json.loads(row["meta"] or "{}")}
+        for row in latest_rows("prop_identity")]
     # 人物资产套件(四视图/特写/特征/妆容/服装/服装细节)按角色分组
     sheets = {}
     for row in latest_rows("character_sheet"):
@@ -748,7 +776,15 @@ def _production_progress(app, episode, render_plan):
     project_id = int(episode["project_id"])
     episode_id = int(episode["id"])
     episode_number = int(episode["number"])
-    plan_items = list((render_plan or {}).get("items") or [])
+    plan_items = []
+    for item in (render_plan or {}).get("items") or []:
+        if item.get("category") == "character_candidate":
+            try:
+                if int(item.get("candidate_index") or 0) > 4:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        plan_items.append(item)
     running_task = app.db.query_one(
         "SELECT stage, name, status, updated_at FROM tasks "
         "WHERE episode_id=? AND status='running' "
@@ -764,6 +800,7 @@ def _production_progress(app, episode, render_plan):
     )
     category_labels = {
         "character_candidate": "人物候选",
+        "prop_candidate": "道具候选",
         "character_art": "人物立绘",
         "character_sheet": "人物设定图",
         "scene_art": "场景图",
@@ -830,6 +867,18 @@ def _production_progress(app, episode, render_plan):
             except (TypeError, ValueError):
                 return False
             return bool(name) and has_asset("character_candidate", asset_name)
+        if category == "prop_candidate":
+            name = str(item.get("name") or "")
+            index = item.get("candidate_index")
+            if not (name and index):
+                parts = str(item.get("id") or "").split(":")
+                if len(parts) >= 3:
+                    name, index = ":".join(parts[1:-1]), parts[-1]
+            try:
+                asset_name = f"{name}:{int(index):02d}"
+            except (TypeError, ValueError):
+                return False
+            return bool(name) and has_asset("prop_candidate", asset_name)
         # 新分类可显式声明正式资产映射，避免默认相信 output_uri。
         return bool(
             item.get("asset_kind") and item.get("asset_name")
@@ -1520,14 +1569,21 @@ def _episode_payload(app, episode_id):
         app.projects.latest_document(episode_id, "video_qc_report")
     series_source, series_source_v = app.projects.latest_document(
         episode_id, "series_source")
-    cast_selection = app.director.character_selection_status(
-        project["id"], (script or {}).get("characters", []))
+    cast_selection = app.director.production_asset_selection_status(
+        project["id"], script or {})
     for character in cast_selection.get("characters", []):
         if character.get("identity_uri"):
             character["identity_url"] = _artifact_url(
                 app, character["identity_uri"])
         for candidate in character.get("candidates", []):
             candidate["url"] = _artifact_url(app, candidate.get("uri", ""))
+    for prop in cast_selection.get("props", []):
+        if prop.get("identity_uri"):
+            prop["identity_url"] = _artifact_url(
+                app, prop["identity_uri"])
+        for candidate in prop.get("candidates", []):
+            candidate["url"] = _artifact_url(
+                app, candidate.get("uri", ""))
     tasks = [dict(t) for t in app.db.query(
         "SELECT id, stage, name, status, provider, cost, error, created_at, "
         "updated_at FROM tasks WHERE episode_id=? ORDER BY id",
@@ -1949,6 +2005,8 @@ def make_handler(workspace, jobs):
                     return self._confirm()
                 if parsed.path == "/api/character/select":
                     return self._character_select()
+                if parsed.path == "/api/prop/select":
+                    return self._prop_select()
                 if parsed.path == "/api/character/assets-policy":
                     return self._character_assets_policy()
                 if parsed.path == "/api/character/regenerate":
@@ -2635,14 +2693,14 @@ def make_handler(workspace, jobs):
                     return self._error(400, str(exc))
             if status == "awaiting_cast":
                 selection = self._with_app(
-                    lambda app: app.director.character_selection_status(
+                    lambda app: app.director.production_asset_selection_status(
                         project_id,
-                        (app.projects.latest_document(
-                            found_episode_id, "script")[0] or {}).get(
-                                "characters", [])))
+                        app.projects.latest_document(
+                            found_episode_id, "script")[0] or {}))
                 if not selection.get("passed"):
                     return self._error(
-                        409, "请先为每名角色选定1张最终立绘，再继续生产")
+                        409, "请先为每名正式角色选定最终立绘，并为每件核心道具"
+                        "选定最终图，再继续生产")
             # 剧本确认 → 继续预生产(画完人物/分镜再停一次);
             # 开拍确认 → 自动完成视频/配音/剪辑/质检
             job_id = jobs.start(
@@ -2670,6 +2728,26 @@ def make_handler(workspace, jobs):
             try:
                 result = self._with_app(
                     lambda app: app.director.select_character_candidate(
+                        title, number, name, int(index)))
+            except (AifosError, TypeError, ValueError) as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _prop_select(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            name = str(body.get("prop") or "").strip()
+            index = body.get("candidate_index")
+            if not name or index is None:
+                return self._error(400, "缺少 prop/candidate_index")
+            title, number = found
+            try:
+                result = self._with_app(
+                    lambda app: app.director.select_prop_candidate(
                         title, number, name, int(index)))
             except (AifosError, TypeError, ValueError) as exc:
                 return self._error(400, str(exc))
@@ -2716,15 +2794,25 @@ def make_handler(workspace, jobs):
             if found is None:
                 return self._error(404, "剧集不存在")
             title, number = found
+            character_name = str(body.get("character") or "").strip()
+            prop_name = str(body.get("prop") or "").strip()
+            if character_name and prop_name:
+                return self._error(400, "character 与 prop 只能指定一个")
             if jobs.running_for(title, number):
                 return self._error(
                     409, "本集正在生产，请先暂停，待状态稳定后再重做人物候选")
             job_id = jobs.start_task(
                 title, number,
                 lambda app, run_id: app.director.regenerate_character_candidates(
-                    title, number, run_id=run_id),
+                    title, number, run_id=run_id,
+                    character_name=character_name,
+                    prop_name=prop_name),
                 action="regenerate_cast",
-                request={"reason": "manual_regenerate_cast"})
+                request={
+                    "reason": "manual_regenerate_cast",
+                    "character": character_name,
+                    "prop": prop_name,
+                })
             return self._json({"job_id": job_id}, status=202)
 
         def _episode_ref(self, body):

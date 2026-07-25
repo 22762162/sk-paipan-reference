@@ -54,6 +54,8 @@ def test_empty_subtitle_metadata_does_not_waste_high_quality_generation():
 def test_mother_assets_high_drafts_low_and_manual_override_wins():
     policy = normalize_quality_policy()
     assert recommend_asset_quality("character_candidate")["level"] == "high"
+    assert recommend_asset_quality(
+        "prop_asset", core_prop=True)["level"] == "high"
     draft = recommend_asset_quality("shot_candidate")
     assert draft["level"] == "low"
     decision = resolve_image_quality(

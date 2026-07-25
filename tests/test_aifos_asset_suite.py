@@ -123,8 +123,8 @@ def test_background_extras_skip_design_and_generic_support_gets_one_candidate(ap
     by_name = {item["character"]: item
                for item in selection["characters"]}
     assert set(by_name) == {"林昭", "小陈"}
-    assert by_name["林昭"]["candidate_target"] == 5
-    assert by_name["小陈"]["candidate_target"] == 1
+    assert by_name["林昭"]["candidate_target"] == 4
+    assert by_name["小陈"]["candidate_target"] == 4
 
 
 def test_character_suite_generated(app):

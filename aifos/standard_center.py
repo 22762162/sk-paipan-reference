@@ -179,12 +179,14 @@ DEFAULT_STANDARD = {
             "clean_skin_default": True,
             "seedance_may_redesign_character": False,
             "candidate_targets": {
-                "main": 5,
-                "important_supporting": 3,
-                "non_main": 1,
-                "non_main_max": 1,
+                "main": 4,
+                "important_supporting": 4,
+                "non_main": 4,
+                "non_main_max": 4,
                 "background": 0,
             },
+            "core_prop_candidate_target": 4,
+            "incidental_props_use_continuity_ledger_only": True,
             "initial_portrait_quality_gate": False,
         },
         "inner_persona": {
@@ -301,7 +303,7 @@ DEFAULT_STANDARD = {
         },
         "quality_gates": [
             {"id": "script_bible", "label": "剧本第一道总闸门", "enabled": True, "severity": "block", "mandatory": True, "owner": "script_development", "description": "小说/梗概已完成影视化改编；世界、人物、因果、信息、物理、时间、空间、道具生命周期、可拍性及局部返编边界完整且不冲突。"},
-            {"id": "character_assets", "label": "人物母资产", "enabled": True, "severity": "block", "mandatory": True, "owner": "character_asset_policy", "description": "所有正式角色已人工锁定最终形象；简化模式只要求最终立绘，完整模式才要求四视图与细节资产。"},
+            {"id": "character_assets", "label": "人物与核心道具母资产", "enabled": True, "severity": "block", "mandatory": True, "owner": "character_asset_policy", "description": "所有正式角色与核心道具都已从4张候选中人工锁定；简化模式只豁免人物四视图与细节资产。"},
             {"id": "continuity", "label": "连续性", "enabled": True, "severity": "block", "mandatory": True, "owner": "continuity", "description": "人物、服装、道具、站位及段间状态无跳变。"},
             {"id": "spatial", "label": "空间调度", "enabled": True, "severity": "block", "mandatory": True, "owner": "blocking", "description": "逐场锁定人物走位、机位、视锥和屏幕轴线，防止多人漂移或增殖。"},
             {"id": "spatial_seedance", "label": "Seedance 空间参考图", "enabled": True, "severity": "block", "mandatory": True, "owner": "blocking", "description": "多人走位或变机位镜头必须生成并绑定空间示意图。"},
@@ -691,13 +693,22 @@ class StandardCenter:
             character_assets, "candidate_targets",
             "rules.character_assets.candidate_targets")
         required_targets = {
-            "main": 5, "important_supporting": 3,
-            "non_main": 1, "non_main_max": 1, "background": 0,
+            "main": 4, "important_supporting": 4,
+            "non_main": 4, "non_main_max": 4, "background": 0,
         }
         if targets != required_targets:
             issue(
                 "rules.character_assets.candidate_targets",
-                "候选额度必须为主角5、重要配角3、非重要配角1、背景路人0")
+                "候选额度必须为所有正式角色4张、背景路人0张")
+        if character_assets.get("core_prop_candidate_target") != 4:
+            issue(
+                "rules.character_assets.core_prop_candidate_target",
+                "核心道具必须统一四选一")
+        if character_assets.get(
+                "incidental_props_use_continuity_ledger_only") is not True:
+            issue(
+                "rules.character_assets.incidental_props_use_continuity_ledger_only",
+                "一次性普通小物只能进入连续性台账，不能批量建立候选资产")
 
         inner_persona = required_dict(
             rules, "inner_persona", "rules.inner_persona")
@@ -1116,7 +1127,9 @@ class StandardCenter:
                     default_targets)
                 changed = True
             else:
-                for key in ("non_main", "non_main_max", "background"):
+                for key in (
+                        "main", "important_supporting",
+                        "non_main", "non_main_max", "background"):
                     if targets.get(key) != default_targets[key]:
                         targets[key] = default_targets[key]
                         changed = True

@@ -108,7 +108,7 @@ def test_locked_character_missing_candidates_not_stuck_pending(app):
     script, _ = app.projects.latest_document(episode["id"], "script")
     hero = script["characters"][0]["name"]
     removed = 0
-    for index in (4, 5):
+    for index in (3, 4):
         row = app.assets.latest(project["id"], "character_candidate",
                                 f"{hero}:{index:02d}")
         if row and row["uri"] and Path(row["uri"]).exists():
@@ -125,8 +125,8 @@ def test_locked_character_missing_candidates_not_stuck_pending(app):
     assert not stuck, f"仍有候选图卡在待生成: {[i['id'] for i in stuck]}"
     # 已锁定角色缺失的槽位直接不在清单里(不算进总进度)
     ids = {i["id"] for i in candidates}
+    assert f"candidate:{hero}:3" not in ids
     assert f"candidate:{hero}:4" not in ids
-    assert f"candidate:{hero}:5" not in ids
 
 
 def test_shot_example_image_always_submitted_even_low_quality(app):

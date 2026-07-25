@@ -97,12 +97,13 @@ def test_default_standard_is_complete_and_active(tmp_path):
         assert len(rules["storyboard"]["scene_type_words"]) == 8
         candidate_targets = rules["character_assets"]["candidate_targets"]
         assert candidate_targets == {
-            "main": 5,
-            "important_supporting": 3,
-            "non_main": 1,
-            "non_main_max": 1,
+            "main": 4,
+            "important_supporting": 4,
+            "non_main": 4,
+            "non_main_max": 4,
             "background": 0,
         }
+        assert rules["character_assets"]["core_prop_candidate_target"] == 4
         assert rules["character_assets"]["visual_dna_required"] is True
         assert rules["character_assets"]["cast_dedup_overlap_threshold"] == 2
         assert rules["character_assets"]["canonical_views"] == [

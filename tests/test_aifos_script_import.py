@@ -159,7 +159,7 @@ def test_cli_script_file(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 0
     assert "已导入剧本:2 场,3 个角色" in out
-    assert "制作人物待选" in out
+    assert "制作人物/道具待选" in out
     app = App(ws)
     try:
         project = app.projects.get_project("万妖图录")

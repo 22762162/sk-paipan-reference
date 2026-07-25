@@ -137,7 +137,7 @@ def infer_visual_style(premise="", project_title=""):
 STAGES = [
     ("script", "剧本总闸门 + AI制作圣经"),
     ("continuity", "连续性圣经"),
-    ("cast", "人物/场景图"),
+    ("cast", "人物/道具/场景图"),
     ("storyboard", "五维分镜"),
     ("blocking", "空间调度图"),
     ("images", "关键帧"),
@@ -159,9 +159,9 @@ CONFIRM_AFTER = "preflight"
 # 自动返工一次，第二次仍失败时必须停在人工检查点，不能继续烧额度。
 VIDEO_QC_AUTO_RETRIES = 1
 VIDEO_QC_SCHEMA = "aifos.video-qc/v1"
-CHARACTER_CANDIDATES = 5
-IMPORTANT_CHARACTER_CANDIDATES = 3
-NONIMPORTANT_CHARACTER_CANDIDATES = 1
+CHARACTER_CANDIDATES = 4
+PROP_CANDIDATES = 4
+LEGACY_CHARACTER_CANDIDATE_MAX = 5
 CHARACTER_BACKGROUND_RULE = (
     "人物立绘必须是纯净、无文字的单人物资产背景;背景只允许纯色、柔和渐变"
     "或干净无辨识度的棚拍底,禁止任何场景、建筑、室内、街道、自然环境、"
@@ -229,25 +229,42 @@ def is_unresolved_character(character):
 
 
 def character_candidate_target(character):
-    """按人物重要度返回候选张数，防止非主要角色消耗五张额度。"""
-    role = str((character or {}).get("role") or "").strip().lower()
+    """所有正式角色统一四选一；背景路人仍不创建独立人物资产。"""
     if is_background_character(character) or is_unresolved_character(character):
         return 0
-    if any(token in role for token in ("主角", "主人公", "女主", "男主")):
-        return CHARACTER_CANDIDATES
-    if any(token in role for token in ("非重要", "非主要", "次要")):
-        return NONIMPORTANT_CHARACTER_CANDIDATES
-    if any(token in role for token in (
-            "重要", "核心", "同伴", "反派", "对手",
-            "队长", "主唱", "舞担", "成员", "男二", "女二")):
-        return IMPORTANT_CHARACTER_CANDIDATES
-    return NONIMPORTANT_CHARACTER_CANDIDATES
+    return CHARACTER_CANDIDATES
 
 
 def character_candidate_policy_text():
-    return ("主角5张；重要配角3张；非重要角色固定1张；"
+    return ("主角、重要配角和普通配角统一4张候选；"
             "跑龙套/背景路人不做独立设定、不生成候选图或立绘；"
             "所有候选继承本剧唯一画风，只比较人物身份与剧情造型细节")
+
+
+def core_prop_definitions(script):
+    """返回编剧明确列出的核心/高复用道具；一次性小物不建立母资产。"""
+    result = []
+    seen = set()
+    for raw in (script or {}).get("core_props", []) or []:
+        item = {"name": raw} if isinstance(raw, str) else raw
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        result.append({
+            **item,
+            "name": name,
+            "candidate_count": PROP_CANDIDATES,
+        })
+    return result
+
+
+def prop_candidate_policy_text():
+    return (
+        "核心、高复用或身份识别型道具统一4张候选并人工定版；"
+        "一次性普通小物只进入连续性台账，不单独生成候选")
 
 def character_production_readiness_error(script, analysis=None):
     labels = unresolved_character_labels(script)
@@ -317,16 +334,6 @@ CHARACTER_LOOK_VARIANTS = (
             "makeup": "保持基准妆造体系，不能改成另一种媒介或人物年龄感",
             "costume": "保持职业、时代和剧情服装体系，突出一个可追溯的职业细节",
             "temperament": "同一核心性格，补充与职业/经历一致的自然状态",
-        },
-    },
-    {
-        "variant_id": "signature_statement",
-        "variant_label": "候选 E · 标志特征",
-        "look_variant": {
-            "hair": "保持基准发型轮廓和身份标志，只强化一个可辨识的小细节",
-            "makeup": "保持基准妆造和本剧统一画风，只强化人物已有的眉眼重点",
-            "costume": "保持基准服装、时代和职业逻辑，只强化一个故事来源明确的细节",
-            "temperament": "同一核心性格，呈现最清晰的角色标志性神态",
         },
     },
 )
@@ -438,6 +445,7 @@ def resolve_character_asset_policy(policy=None, script=None):
 
 IMAGE_ASSET_KINDS = {
     "character_art", "character_sheet", "scene_art", "character_candidate",
+    "prop_candidate", "prop_identity",
     "image", "first_frame", "last_frame", "cover", "reference",
     "spatial_blocking", "inner_persona",
 }
@@ -721,12 +729,14 @@ class Director:
                 (episode["id"], CONFIRM_AFTER))
             script_doc, _ = self.projects.latest_document(
                 episode["id"], "script")
-            selection = self.character_selection_status(
-                ctx["project"]["id"],
-                (script_doc or {}).get("characters", []))
+            selection = self.production_asset_selection_status(
+                ctx["project"]["id"], script_doc or {})
             candidates_started = any(
                 item.get("candidate_count", 0)
                 for item in selection.get("characters", []))
+            candidates_started = candidates_started or any(
+                item.get("candidate_count", 0)
+                for item in selection.get("props", []))
             landing = ("awaiting_confirm" if gate_done and gate_done["n"]
                        else "awaiting_cast" if (
                            selection.get("required") and candidates_started)
@@ -1705,6 +1715,8 @@ class Director:
         add(
             "inner_persona", payload.get("inner_persona_ref"),
             "内心Q版母资产")
+        for uri in payload.get("prop_refs") or []:
+            add("prop", uri, "核心道具母资产")
         for uri in payload.get("character_refs") or []:
             add("character", uri, "人物设定/资产图")
         add("spatial", payload.get("spatial_ref"), "本镜空间调度图")
@@ -1720,7 +1732,8 @@ class Director:
                 "items": rows}
 
     ACCELERATABLE_IMAGE_CATEGORIES = frozenset({
-        "character_candidate", "character_sheet", "scene_art",
+        "character_candidate", "prop_candidate",
+        "character_sheet", "scene_art",
         "shot_image", "frames",
     })
     ACCELERATION_IDENTITY_CATEGORIES = frozenset({
@@ -1785,7 +1798,10 @@ class Director:
                 issues.extend(
                     f"镜头生成合同冲突：{issue}"
                     for issue in validation["issues"])
-        subject = str(payload.get("art_name") or payload.get("location") or "")
+        subject = str(
+            payload.get("prop_name")
+            or payload.get("art_name")
+            or payload.get("location") or "")
         expected_names = characters or ([subject] if subject else [])
         for name in expected_names:
             if name and name not in prompt_used:
@@ -4446,6 +4462,20 @@ class Director:
             return None
         return row
 
+    def _locked_prop(self, project_id, name):
+        """返回人工选定的核心道具母资产。"""
+        row = self.assets.latest(project_id, "prop_identity", name)
+        if row is None or not self._asset_meta(row).get("locked"):
+            return None
+        if not formal_reference_allowed(self._asset_quality(row)):
+            return None
+        uri = str(row["uri"] or "")
+        if not uri or (
+                not uri.startswith(("http://", "https://"))
+                and not Path(uri).exists()):
+            return None
+        return row
+
     def _canonical_character_assets(self, project_id, name):
         """返回定版后四张独立正式母资产；三视图拼板不计入就绪状态。"""
         assets = {}
@@ -4554,6 +4584,130 @@ class Director:
                     item["canonical_assets"]["ready"]
                     for item in required_items)),
         }
+
+    def prop_selection_status(self, project_id, script):
+        """核心道具定版状态：每件四选一；普通一次性小物不进入此门禁。"""
+        result = []
+        candidate_rows = {}
+        for row in self.assets.list(project_id, "prop_candidate"):
+            candidate_rows[row["name"]] = row
+        for prop in core_prop_definitions(script):
+            name = prop["name"]
+            locked = self._locked_prop(project_id, name)
+            selected_meta = self._asset_meta(locked)
+            candidates = []
+            for row in candidate_rows.values():
+                meta = self._asset_meta(row)
+                if meta.get("prop") != name:
+                    continue
+                uri = str(row["uri"] or "")
+                if not uri or (
+                        not uri.startswith(("http://", "https://"))
+                        and not Path(uri).exists()):
+                    continue
+                index = int(meta.get("candidate_index") or 0)
+                if index < 1 or index > PROP_CANDIDATES:
+                    continue
+                candidates.append({
+                    "id": f"prop_candidate:{name}:{index}",
+                    "index": index,
+                    "uri": uri,
+                    "version": row["version"],
+                    "variant_id": meta.get("variant_id", ""),
+                    "variant_label": meta.get("variant_label", ""),
+                    "selected": bool(
+                        locked and selected_meta.get(
+                            "candidate_asset_id") == row["id"]),
+                })
+            candidates.sort(key=lambda item: item["index"])
+            result.append({
+                "prop": name,
+                "story_function": prop.get("story_function", ""),
+                "visual_design": prop.get("visual_design", ""),
+                "owner": prop.get("owner", ""),
+                "candidate_target": PROP_CANDIDATES,
+                "candidate_count": len(candidates),
+                "locked": locked is not None,
+                "identity_uri": locked["uri"] if locked else "",
+                "identity_version": locked["version"] if locked else None,
+                "candidates": candidates,
+            })
+        locked_count = sum(1 for item in result if item["locked"])
+        return {
+            "schema": "aifos.prop-selection/v1",
+            "candidate_target": PROP_CANDIDATES if result else 0,
+            "candidate_policy": prop_candidate_policy_text(),
+            "props": result,
+            "locked": locked_count,
+            "total": len(result),
+            "passed": locked_count == len(result),
+            "required": any(not item["locked"] for item in result),
+        }
+
+    @staticmethod
+    def _combine_asset_selection(character_selection, prop_selection):
+        """兼容旧人物字段，同时增加人物+核心道具的总门禁进度。"""
+        result = copy.deepcopy(character_selection)
+        result["schema"] = "aifos.production-asset-selection/v2"
+        result["props"] = copy.deepcopy(prop_selection.get("props") or [])
+        result["prop_locked"] = int(prop_selection.get("locked") or 0)
+        result["prop_total"] = int(prop_selection.get("total") or 0)
+        result["prop_candidate_policy"] = prop_selection.get(
+            "candidate_policy", prop_candidate_policy_text())
+        result["asset_locked"] = (
+            int(character_selection.get("locked") or 0)
+            + result["prop_locked"])
+        result["asset_total"] = (
+            int(character_selection.get("total") or 0)
+            + result["prop_total"])
+        result["passed"] = bool(
+            character_selection.get("passed")
+            and prop_selection.get("passed"))
+        result["required"] = not result["passed"]
+        return result
+
+    def production_asset_selection_status(self, project_id, script):
+        return self._combine_asset_selection(
+            self.character_selection_status(
+                project_id, (script or {}).get("characters", [])),
+            self.prop_selection_status(project_id, script))
+
+    @staticmethod
+    def _prop_candidate_variant(index):
+        variants = (
+            ("baseline", "基准造型", "最清晰地落实剧本功能、时代与基本轮廓"),
+            ("silhouette", "轮廓结构", "优化外形比例、握持结构与远景辨识度"),
+            ("material", "材质工艺", "优化材质、工艺、磨损和年代使用痕迹"),
+            ("story_detail", "剧情细节", "强化有明确来源的功能细节与故事识别点"),
+        )
+        variant_id, label, focus = variants[index - 1]
+        return {
+            "variant_id": variant_id,
+            "variant_label": label,
+            "variant_focus": focus,
+        }
+
+    def _prop_candidate_prompt(self, prop, style, variant):
+        facts = "；".join(
+            f"{label}:{self._design_value(prop.get(key))}"
+            for key, label in (
+                ("story_function", "剧情功能"),
+                ("visual_design", "视觉结构"),
+                ("era_material", "时代与材质"),
+                ("owner", "归属/持有人"),
+                ("continuity_states", "连续性状态"),
+            ) if self._design_value(prop.get(key)))
+        return (
+            f"【任务】核心道具「{prop['name']}」四选一候选 · "
+            f"{variant['variant_label']}。"
+            f"【道具事实】{facts or '外形、功能、材质与时代必须服从正式剧本'}。"
+            f"【本候选优化轴】{variant['variant_focus']}；"
+            "只改变不影响剧情功能的轮廓、材质、工艺和细节方案，不得改变"
+            "用途、尺寸级别、持有人、时代、文字内容或连续性状态。"
+            f"【PROJECT STYLE LOCK】本项目唯一画风:{style}。"
+            "单件道具完整居中，三分之四视角，结构和可握持/可使用部位清晰，"
+            "纯净中性棚拍背景，无人物、无手、无场景、无包装、无新增文字、"
+            "无字幕、无Logo、无水印；自然比例与材质真实可制造。")
 
     def _ensure_character_candidates(self, ctx, characters, designs, style):
         """按角色重要度补足候选；候选之间并行，后续等待人工选择。"""
@@ -4696,6 +4850,121 @@ class Director:
                       **self._quality_meta(quality)})
         return self.character_selection_status(project_id, characters)
 
+    def _ensure_prop_candidates(self, ctx, props, style):
+        """为剧本明确的核心道具补足四张高质量候选。"""
+        project_id = ctx["project"]["id"]
+        seed, tasks = [], []
+        quality_by_candidate = {}
+        for prop in props:
+            name = prop["name"]
+            locked = self._locked_prop(project_id, name)
+            existing = {}
+            for index in range(1, PROP_CANDIDATES + 1):
+                row = self.assets.latest(
+                    project_id, "prop_candidate", f"{name}:{index:02d}")
+                if row is None:
+                    continue
+                meta = self._asset_meta(row)
+                uri = str(row["uri"] or "")
+                if (int(meta.get("candidate_index") or 0) == index
+                        and uri and (
+                            uri.startswith(("http://", "https://"))
+                            or Path(uri).exists())):
+                    existing[index] = row
+            if locked and not existing:
+                continue
+            reference_payload = self._user_reference_payload(
+                project_id, [name],
+                allowed_roles={"wardrobe", "composition"})
+            refs = reference_payload["reference_images"]
+            quality = resolve_image_quality(
+                recommend_asset_quality(
+                    "prop_asset", reuse_count=2, core_prop=True),
+                ctx.get("quality_policy") or default_quality_policy(),
+                f"prop_candidate:{name}")
+            for index in range(1, PROP_CANDIDATES + 1):
+                if locked and index not in existing:
+                    continue
+                variant = self._prop_candidate_variant(index)
+                prompt = self._prop_candidate_prompt(prop, style, variant)
+                item_id = f"prop_candidate:{name}:{index}"
+                quality_by_candidate[(name, index)] = quality
+                seed.append({
+                    "id": item_id,
+                    "category": "prop_candidate",
+                    "label": (
+                        f"{name} · 候选 {index} · "
+                        f"{variant['variant_label']}"),
+                    "name": name,
+                    "candidate_index": index,
+                    "prompt": prompt,
+                    **variant,
+                    **self._quality_meta(quality),
+                })
+                if index in existing or locked:
+                    continue
+                tasks.append({
+                    "item_id": item_id,
+                    "capability": "image",
+                    "payload": {
+                        "prop_candidate": True,
+                        "image_task_class": image_task_class_for(
+                            quality["level"]),
+                        "image_quality": quality["level"],
+                        "quality_decision": quality,
+                        "art_name": f"{name}_candidate_{index:02d}",
+                        "prop_name": name,
+                        "prompt": prompt,
+                        "style": style,
+                        "prompt_contract_complete": True,
+                        **reference_payload,
+                        "require_reference_images": bool(refs),
+                        "aspect": "1:1", "width": 1024, "height": 1024,
+                    },
+                    "sub_dir": "cast/props/candidates",
+                    "tag": (name, index),
+                })
+        self._plan_seed(ctx, "prop_candidate", seed)
+        current = self.prop_selection_status(
+            project_id, {"core_props": props})
+        for item in seed:
+            if any(
+                    candidate["index"] == item["candidate_index"]
+                    for prop in current["props"]
+                    if prop["prop"] == item["name"]
+                    for candidate in prop["candidates"]):
+                self._plan_mark(
+                    ctx, item["id"], "reused", only_pending=True)
+        for (name, index), result in self._run_parallel(
+                ctx, tasks, line=f"核心道具候选({prop_candidate_policy_text()})"
+        ).items():
+            variant = self._prop_candidate_variant(index)
+            quality = quality_by_candidate[(name, index)]
+            prop = next(item for item in props if item["name"] == name)
+            self.assets.register(
+                project_id, "prop_candidate", f"{name}:{index:02d}",
+                uri=result.uri,
+                meta={
+                    "prop": name,
+                    "candidate_index": index,
+                    **variant,
+                    "story_function": prop.get("story_function", ""),
+                    "visual_design": prop.get("visual_design", ""),
+                    "prompt": self._prop_candidate_prompt(
+                        prop, style, variant),
+                    "reference_images": list(
+                        next(
+                            task["payload"].get("reference_images", [])
+                            for task in tasks
+                            if task["item_id"]
+                            == f"prop_candidate:{name}:{index}")),
+                    "provider": result.provider,
+                    "model": getattr(result, "model", ""),
+                    **self._quality_meta(quality),
+                })
+        return self.prop_selection_status(
+            project_id, {"core_props": props})
+
     def select_character_candidate(self, project_title, episode_number,
                                    character_name, candidate_index):
         """人工选择并锁定最终立绘；下游只能引用该不可变身份锚点。"""
@@ -4765,12 +5034,84 @@ class Director:
         self._plan_mark(
             ctx, f"char:{character_name}", "reused",
             extra={"selected": True, "identity_version": identity["version"]})
-        status = self.character_selection_status(project["id"], characters)
+        status = self.production_asset_selection_status(
+            project["id"], script)
         self.projects.save_document(episode["id"], "cast_selection", status)
         self.log.info(
             "director",
             f"人物定版: {character_name} 选中候选{int(candidate_index)}，"
             f"进度 {status['locked']}/{status['total']}")
+        return status
+
+    def select_prop_candidate(self, project_title, episode_number,
+                              prop_name, candidate_index):
+        """人工选择核心道具候选；关键帧和 Seedance 必须真实携带该图。"""
+        project, episode = self._episode_ctx(project_title, episode_number)
+        script, _ = self.projects.latest_document(episode["id"], "script")
+        prop = next((
+            item for item in core_prop_definitions(script)
+            if item["name"] == prop_name), None)
+        if prop is None:
+            raise AifosError(f"剧本中没有核心道具: {prop_name}")
+        if episode["status"] != "awaiting_cast":
+            raise AifosError("只能在人物/道具定版阶段选择候选")
+        index = int(candidate_index)
+        if index < 1 or index > PROP_CANDIDATES:
+            raise AifosError(
+                f"{prop_name}固定为{PROP_CANDIDATES}张候选，"
+                f"不能选择第{index}张")
+        candidate = self.assets.latest(
+            project["id"], "prop_candidate",
+            f"{prop_name}:{index:02d}")
+        if candidate is None or not candidate["uri"]:
+            raise AifosError(f"道具候选不存在: {prop_name}/{index}")
+        uri = str(candidate["uri"])
+        if not uri.startswith(("http://", "https://")) and not Path(uri).exists():
+            raise AifosError("候选图片文件已丢失，请重新生成候选")
+        quality = self._asset_quality(candidate, default="high")
+        if not formal_reference_allowed(quality):
+            raise AifosError("低质量试错图不能锁为正式道具参考")
+        candidate_meta = self._asset_meta(candidate)
+        identity = self.assets.register(
+            project["id"], "prop_identity", prop_name,
+            uri=uri,
+            meta={
+                "prop": prop_name,
+                "locked": True,
+                "candidate_index": index,
+                "candidate_asset_id": candidate["id"],
+                "candidate_version": candidate["version"],
+                "locked_at": now(),
+                "story_function": prop.get("story_function", ""),
+                "visual_design": prop.get("visual_design", ""),
+                "image_quality": quality,
+                "recommended_quality": "high",
+                "quality_source": "selected_mother_asset",
+                "variant_id": candidate_meta.get("variant_id", ""),
+                "variant_label": candidate_meta.get("variant_label", ""),
+            },
+            new_version=True)
+        ctx = {"episode": dict(episode),
+               "out_root": self._episode_dir(project, episode)}
+        for item in self._plan_read(ctx).get("items", []):
+            if (item.get("category") == "prop_candidate"
+                    and item.get("name") == prop_name):
+                self._plan_mark(
+                    ctx, item["id"], item.get("status", "done"),
+                    extra={
+                        "selected": int(
+                            item.get("candidate_index", 0)) == index})
+        self._plan_mark(
+            ctx, f"prop:{prop_name}", "reused",
+            extra={"selected": True, "identity_version": identity["version"]})
+        status = self.production_asset_selection_status(
+            project["id"], script)
+        self.projects.save_document(
+            episode["id"], "cast_selection", status)
+        self.log.info(
+            "director",
+            f"核心道具定版: {prop_name} 选中候选{index}，"
+            f"总进度 {status['asset_locked']}/{status['asset_total']}")
         return status
 
     def _stage_cast(self, ctx):
@@ -4810,8 +5151,12 @@ class Director:
         anchor_name = self._anchor_character(project_id, characters)
         characters = sorted(
             characters, key=lambda c: c["name"] != anchor_name)
-        selection = self._ensure_character_candidates(
+        character_selection = self._ensure_character_candidates(
             ctx, characters, designs, style)
+        prop_selection = self._ensure_prop_candidates(
+            ctx, core_prop_definitions(ctx["script"]), style)
+        selection = self._combine_asset_selection(
+            character_selection, prop_selection)
         self.projects.save_document(
             ctx["episode"]["id"], "cast_selection", selection)
         if selection["required"]:
@@ -4824,7 +5169,13 @@ class Director:
                                   for item in selection["characters"]),
                 "candidate_target": sum(
                     character_candidate_target(c) for c in characters),
-                "locked": selection["locked"],
+                "props": prop_selection["total"],
+                "prop_candidates": sum(
+                    item["candidate_count"]
+                    for item in prop_selection["props"]),
+                "prop_candidate_target": (
+                    prop_selection["total"] * PROP_CANDIDATES),
+                "locked": selection["asset_locked"],
                 "awaiting_selection": True,
                 "created": 0, "reused": 0, "scenes": 0,
             }
@@ -5030,8 +5381,8 @@ class Director:
             created += 1
         # 保存包含独立母资产就绪状态的最新人物定版文档，供 UI/API 和
         # 后续生产门禁读取；合成审核板不计入正式参考图。
-        ctx["cast_selection"] = self.character_selection_status(
-            project_id, characters)
+        ctx["cast_selection"] = self.production_asset_selection_status(
+            project_id, ctx["script"])
         self.projects.save_document(
             ctx["episode"]["id"], "cast_selection",
             ctx["cast_selection"])
@@ -5152,7 +5503,7 @@ class Director:
 
     def _art_refs(self, ctx, characters, location, shot_no=None,
                   sheet_keys=None, sheet_keys_by_character=None,
-                  spatial_ref="", inner_persona_ref=""):
+                  spatial_ref="", inner_persona_ref="", prop_names=None):
         """最终立绘/人物套件/场景图/用户参考 → 真实多图参考输入。
 
         含人物画面缺任何一个最终立绘都直接阻断；禁止静默退化为文字生图。
@@ -5161,7 +5512,7 @@ class Director:
         """
         project_id = ctx["project"]["id"]
         refs = {"character_refs": [], "identity_references": [],
-                "asset_matches": []}
+                "prop_refs": [], "asset_matches": []}
         used_uris = set()
 
         def room():
@@ -5237,6 +5588,25 @@ class Director:
                 "uri": spatial_uri,
                 "reference_role": "spatial",
                 "attach_to": f"shot:{shot_no}" if shot_no is not None else "",
+            })
+        for name in prop_names or []:
+            row = self._locked_prop(project_id, name)
+            if row is None:
+                raise AifosError(
+                    f"本镜使用核心道具「{name}」，但尚未人工锁定道具母资产")
+            if not remember(row["uri"]):
+                raise AifosError(
+                    f"本镜人物、空间与核心道具参考图超过"
+                    f"{SHOT_BASE_REFERENCE_LIMIT}张，请拆分镜头")
+            refs["prop_refs"].append(row["uri"])
+            refs["asset_matches"].append({
+                "asset_id": row["id"],
+                "kind": "prop_identity",
+                "name": name,
+                "label": f"核心道具:{name}",
+                "uri": row["uri"],
+                "reference_role": "prop",
+                "attach_to": name,
             })
         # 简化版即使项目历史里已有四视图，也只以人工锁定最终立绘为身份锚，
         # 避免旧扩展资产继续偷偷进入提示词与外部 API 参考图。
@@ -5357,8 +5727,27 @@ class Director:
         refs["require_reference_images"] = bool(
             characters or refs.get("scene_ref")
             or refs.get("reference_images") or refs.get("style_ref")
-            or refs.get("inner_persona_ref"))
+            or refs.get("inner_persona_ref") or refs.get("prop_refs"))
         return refs
+
+    def _shot_core_prop_names(self, ctx, shot):
+        """按镜头局部合同精确匹配需要携带母资产的核心道具。"""
+        explicit = {
+            str(value).strip()
+            for value in (shot.get("props") or [])
+            if str(value).strip()
+        }
+        text = json.dumps({
+            key: shot.get(key)
+            for key in (
+                "description", "prompt", "seedance_prompt", "dialogue",
+                "start_state", "end_state", "physical_logic",
+                "physical_contract", "shot_contract", "five_dimensions")
+        }, ensure_ascii=False, default=str)
+        return [
+            prop["name"] for prop in core_prop_definitions(ctx.get("script"))
+            if prop["name"] in explicit or prop["name"] in text
+        ]
 
     def _relations(self, ctx):
         """画布关系图:ctx 内缓存优先,单图重画等路径从落盘文件回读。"""
@@ -5704,7 +6093,8 @@ class Director:
                 spatial_ref=(
                     (spatial or {}).get("spatial_reference_uri", "")
                     if requires_spatial_reference(spatial or {}) else ""),
-                inner_persona_ref=inner_persona_ref),
+                inner_persona_ref=inner_persona_ref,
+                prop_names=self._shot_core_prop_names(ctx, shot)),
         }
         actor_ids = {
             actor.get("name"): actor.get("actor_id")
@@ -5802,6 +6192,15 @@ class Director:
             "行动箭头、摄影机起终点/高度、瞄准点和视锥；不得把3D示意视角、"
             "箭头、色块、网格或任何示意图元素画进最终画面",
             role="spatial")
+        for uri in payload.get("prop_refs") or []:
+            match = matches.get(uri) or {}
+            name = str(match.get("name") or "核心道具")
+            add(
+                uri, match.get("label") or f"核心道具:{name}",
+                f"只锁定核心道具「{name}」的轮廓、结构、材质、工艺、"
+                "磨损和识别细节；本镜中的尺寸、持有人、动作与状态服从"
+                "当前镜头合同，不得把纯背景、棚拍构图或额外道具带入画面",
+                role="prop", kind="prop_identity")
         for uri in payload.get("character_refs") or []:
             match = matches.get(uri) or {}
             label = match.get("label") or "人物设定图"
@@ -6685,10 +7084,21 @@ class Director:
             raise AifosError(
                 f"镜头{shot_no}声明了内心Q版，但对应母资产缺失或质量不足")
         add(inner_row)
+        missing_props = []
+        for name in self._shot_core_prop_names(ctx, shot):
+            prop_row = self._locked_prop(project_id, name)
+            if prop_row is None:
+                missing_props.append(name)
+            else:
+                add(prop_row)
         if missing:
             raise AifosError(
                 "以下出场角色缺少最终立绘，禁止交给 Seedance:"
                 + "、".join(missing))
+        if missing_props:
+            raise AifosError(
+                "以下核心道具缺少人工锁定母资产，禁止交给 Seedance:"
+                + "、".join(missing_props))
         if len(rows) > 7:
             raise AifosError(
                 f"镜头{shot_no}的空间图与人物最终立绘已占{len(rows)}张，"
@@ -6797,6 +7207,18 @@ class Director:
                 return (
                     f"资产「{row['name']}」属于未出场角色{character}，"
                     "禁止作为本镜人物参考")
+        if kind == "prop_candidate":
+            return "未定版的道具候选禁止作为 Seedance 正式参考"
+        if kind == "prop_identity":
+            prop = str(
+                self._asset_meta(row).get("prop")
+                or str(row["name"]).split(":", 1)[0])
+            shot_text = json.dumps(
+                shot, ensure_ascii=False, default=str)
+            if prop not in shot_text:
+                return (
+                    f"道具资产「{prop}」未在本镜合同中出现，"
+                    "禁止作为本镜参考")
         if kind == "reference":
             meta = self._asset_meta(row)
             attach = str(meta.get("attach_to") or "").strip()
@@ -6852,10 +7274,22 @@ class Director:
         if inner_row is not None and inner_row["id"] not in seen:
             seen.add(inner_row["id"])
             rows.append(inner_row)
+        missing_props = []
+        for name in self._shot_core_prop_names(ctx, shot):
+            row = self._locked_prop(ctx["project"]["id"], name)
+            if row is None:
+                missing_props.append(name)
+            elif row["id"] not in seen:
+                seen.add(row["id"])
+                rows.append(row)
         if missing:
             raise AifosError(
                 "以下出场角色缺少最终立绘，禁止交给 Seedance:"
                 + "、".join(missing))
+        if missing_props:
+            raise AifosError(
+                "以下核心道具缺少人工锁定母资产，禁止交给 Seedance:"
+                + "、".join(missing_props))
         for item in selected:
             row = self.assets.get(item.get("asset_id"))
             if row is None or row["project_id"] != ctx["project"]["id"]:
@@ -6914,6 +7348,12 @@ class Director:
             return (
                 f"只补充{character}的体型/五官/发型或妆容细节；"
                 "身份仍以最终立绘为准，不复制服装、姿势或背景")
+        if kind in ("prop_identity", "prop_candidate"):
+            prop = str(meta.get("prop") or name.split(":", 1)[0])
+            return (
+                f"只锁定核心道具「{prop}」的轮廓、结构、材质、工艺、"
+                "磨损和识别细节；尺寸、持有人、动作及状态服从首尾帧，"
+                "不得带入棚拍背景或额外物件")
         if kind == "scene_art":
             return (
                 "只锁定场景空间、陈设、材质与主光方向；忽略图中人物、"
@@ -9446,15 +9886,25 @@ class Director:
             raise AifosError(f"剧集不存在: 第{episode_number}集")
         return project, episode
 
-    def _invalidate_cast_assets(self, project, script, reason):
-        """让新一轮人物候选遮蔽旧版本,但保留旧文件和历史记录。"""
-        for character in script.get("characters", []):
+    def _invalidate_cast_assets(self, project, script, reason,
+                                character_name="", prop_name="",
+                                invalidate_scenes=False):
+        """让指定人物/道具进入新一轮四选一，同时保留全部历史版本。"""
+        characters = [] if prop_name else [
+            item for item in script.get("characters", [])
+            if not character_name or item.get("name") == character_name]
+        if character_name and not characters:
+            raise AifosError(f"剧本中没有角色: {character_name}")
+        for character in characters:
             name = character["name"]
             self.assets.register(
                 project["id"], "character_identity", name, uri="",
                 meta={"character": name, "locked": False,
                       "reason": reason}, new_version=True)
-            for index in range(1, CHARACTER_CANDIDATES + 1):
+            # 第5张是旧版5/3/1规则的历史候选；也写入新墓碑，
+            # 防止资产中心继续把它误显示为当前可选图。
+            for index in range(
+                    1, LEGACY_CHARACTER_CANDIDATE_MAX + 1):
                 self.assets.register(
                     project["id"], "character_candidate",
                     f"{name}:{index:02d}", uri="",
@@ -9469,15 +9919,39 @@ class Director:
                                    "label": label,
                                    "invalidated": reason},
                     new_version=True)
-        for location in dict.fromkeys(
-                scene["location"] for scene in script.get("scenes", [])):
+        props = [] if character_name else [
+            item for item in core_prop_definitions(script)
+            if not prop_name or item["name"] == prop_name]
+        if prop_name and not props:
+            raise AifosError(f"剧本中没有核心道具: {prop_name}")
+        for prop in props:
+            name = prop["name"]
             self.assets.register(
-                project["id"], "scene_art", location, uri="",
-                meta={"invalidated": reason}, new_version=True)
+                project["id"], "prop_identity", name, uri="",
+                meta={"prop": name, "locked": False, "reason": reason},
+                new_version=True)
+            for index in range(1, PROP_CANDIDATES + 1):
+                self.assets.register(
+                    project["id"], "prop_candidate",
+                    f"{name}:{index:02d}", uri="",
+                    meta={
+                        "prop": name,
+                        "candidate_index": index,
+                        "invalidated": reason,
+                    },
+                    new_version=True)
+        if invalidate_scenes:
+            for location in dict.fromkeys(
+                    scene["location"]
+                    for scene in script.get("scenes", [])):
+                self.assets.register(
+                    project["id"], "scene_art", location, uri="",
+                    meta={"invalidated": reason}, new_version=True)
 
     def regenerate_character_candidates(self, project_title, episode_number,
-                                        run_id=None):
-        """放弃当前人物选择并重新生成候选,不进入后续镜头生产。"""
+                                        run_id=None, character_name="",
+                                        prop_name=""):
+        """按指定对象重生四张候选；未指定时重生全部人物和核心道具。"""
         project, episode = self._episode_ctx(project_title, episode_number)
         if episode["status"] != "awaiting_cast":
             raise AifosError("只能在人物选择阶段返回重新生成")
@@ -9485,7 +9959,9 @@ class Director:
         if script is None:
             raise AifosError("本集尚无剧本,先完成剧本确认")
         self._invalidate_cast_assets(
-            project, script, reason="manual_regenerate_cast")
+            project, script, reason="manual_regenerate_cast",
+            character_name=str(character_name or "").strip(),
+            prop_name=str(prop_name or "").strip())
         self.projects.set_episode_status(episode["id"], "cast")
         aspect = (project["aspect"]
                   or self.config.get("defaults", "aspect", default="9:16"))
@@ -9506,12 +9982,18 @@ class Director:
                     "note": "人物候选重新生成已暂停,已完成候选保留"}
         self.projects.set_episode_status(episode["id"], "awaiting_cast")
         self.log.info(
-            "director", "已放弃当前人物选择,新候选已生成,等待重新定版"
+            "director", "已保留旧版本并生成新一轮四张候选,等待重新定版"
             f"(episode_id={episode['id']})")
         return {"status": "awaiting_cast",
-                "done": report.get("candidates", 0),
-                "candidate_target": report.get("candidate_target", 0),
-                "locked": 0}
+                "done": (
+                    report.get("candidates", 0)
+                    + report.get("prop_candidates", 0)),
+                "candidate_target": (
+                    report.get("candidate_target", 0)
+                    + report.get("prop_candidate_target", 0)),
+                "locked": int(
+                    (ctx.get("cast_selection") or {}).get(
+                        "asset_locked", 0))}
 
     def import_image(self, project_title, episode_number, target,
                      file_bytes, ext):
@@ -9717,7 +10199,9 @@ class Director:
             raise AifosError("本集尚无剧本,先完成剧本确认")
         # 新画风使旧身份锚点和下游人物资产失效，但保留历史版本/文件。
         # 用空的新版本遮蔽旧最新版，重新按重要度候选并人工定版，不做破坏性删除。
-        self._invalidate_cast_assets(project, script, reason="restyle")
+        self._invalidate_cast_assets(
+            project, script, reason="restyle",
+            invalidate_scenes=True)
 
         self.projects.set_episode_status(episode["id"], "cast")
         self.log.info(

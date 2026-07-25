@@ -226,7 +226,7 @@ class ProviderRouter:
         for key in ("style_ref", "scene_ref", "chain_first_uri"):
             if payload.get(key):
                 supplied_refs.append(payload[key])
-        for key in ("character_refs", "reference_images"):
+        for key in ("character_refs", "prop_refs", "reference_images"):
             supplied_refs.extend(payload.get(key) or [])
         supplied_refs.extend(
             ref.get("uri") for ref in (payload.get("identity_references") or [])

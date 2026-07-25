@@ -1230,12 +1230,12 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
     character_assets_ok = (
         identities_ready and (not extended_required or extended_ready))
     character_assets_detail = (
-        "所有正式角色已锁定最终立绘；本集采用简化人物资产模式，"
+        "所有正式角色和核心道具已人工锁定；本集采用简化人物资产模式，"
         "不要求四视图/细节图"
         if identities_ready and not extended_required
-        else "所有正式角色最终立绘及完整四视图/细节母资产已锁定"
+        else "所有正式角色最终立绘、核心道具及完整四视图/细节母资产已锁定"
         if character_assets_ok
-        else "人物最终立绘或当前人物资产模式要求的母资产尚未齐全")
+        else "人物最终立绘、核心道具或当前人物资产模式要求的母资产尚未齐全")
     available_gates = [
         _gate("script_bible", "剧本第一道总闸门与制作圣经",
               script_gate_error is None,
@@ -1244,7 +1244,7 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
                    or "世界观、人物、因果、信息、物理、时间、空间、"
                       "道具生命周期、可拍摄性与局部返编边界已锁定"))),
         _gate(
-            "character_assets", "人物母资产",
+            "character_assets", "人物与核心道具母资产",
             character_assets_ok, character_assets_detail),
         _gate("continuity", "连续性圣经", bool(continuity.get("characters"))
               and bool(continuity.get("scenes"))

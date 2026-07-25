@@ -2444,6 +2444,23 @@ function scriptToText(script) {
   }).join("\n\n");
 }
 
+function corePropsHtml(script) {
+  const props = script.core_props || [];
+  if (!props.length) return "";
+  return `<section class="story-bible-section core-props">
+    <h3>🧰 核心道具母资产 · 每件4选1</h3>
+    <div class="script-character-profiles">${props.map((prop) => `
+      <article class="character-profile">
+        <h4>${esc(prop.name)} <span class="chip">4张候选</span></h4>
+        ${prop.story_function ? `<p><b>剧情功能：</b>${esc(prop.story_function)}</p>` : ""}
+        ${prop.visual_design ? `<p><b>视觉结构：</b>${esc(prop.visual_design)}</p>` : ""}
+        ${prop.era_material ? `<p><b>时代材质：</b>${esc(prop.era_material)}</p>` : ""}
+        ${prop.owner ? `<p><b>持有人：</b>${esc(prop.owner)}</p>` : ""}
+        ${prop.continuity_states ? `<p><b>连续性：</b>${esc(prop.continuity_states)}</p>` : ""}
+      </article>`).join("")}</div>
+  </section>`;
+}
+
 async function pollJob(jobId, onDone, onProgress) {
   let timer = null;
   let finished = false;
@@ -2499,6 +2516,7 @@ function showScriptOverlay(data, episodeId) {
         `<span class="chip">${esc(c.name)} · ${esc(c.role || "")}</span>`).join("")}</div>
       <div class="script-character-profiles">${(script.characters || [])
         .map(characterProfileHtml).join("")}</div>
+      ${corePropsHtml(script)}
       ${script.scenes.map((s) => `
         <section class="scene">
           <div class="scene-head"><span class="scene-no">第 ${s.scene_no} 场</span>
@@ -6495,9 +6513,9 @@ function renderProgressBanner(data) {
       <button class="primary" onclick="location.hash='#/episode/${e.id}'">去看剧本 →</button>
     </div>`).join("") + awaitingCast.map((e) => `
     <div class="progress-card confirm">
-      <div class="progress-text">《${esc(e.project)}》第${e.number}集 人物候选已就绪 👤
-        <span>候选数量按角色重要度分配（主角5张、重要配角3张、非重要角色固定1张；跑龙套/背景路人不做独立设定，也不生成候选图或立绘）；全部定版后才生成后续图片</span></div>
-      <button class="primary" onclick="location.hash='#/episode/${e.id}'">去选人物 →</button>
+      <div class="progress-text">《${esc(e.project)}》第${e.number}集 人物/核心道具候选已就绪 👤
+        <span>所有正式角色统一4张候选（主角、重要配角和普通配角都认真挑选；跑龙套/背景路人不做独立设定，也不生成候选图或立绘）；全部定版后才生成后续图片</span></div>
+      <button class="primary" onclick="location.hash='#/episode/${e.id}'">去选人物/道具 →</button>
     </div>`).join("") + awaiting.map((e) => `
     <div class="progress-card confirm">
       <div class="progress-text">《${esc(e.project)}》第${e.number}集 预生产完成,等你过目
@@ -6725,6 +6743,7 @@ function castVisualDnaHtml(character) {
 function renderCastSelection(data, episodeId) {
   const selection = data.cast_selection || {};
   const characters = selection.characters || [];
+  const props = selection.props || [];
   const assetPolicy = data.character_asset_policy || {
     mode: "auto", resolved_mode: "full", generate_sheets: true, reasons: [],
   };
@@ -6739,12 +6758,12 @@ function renderCastSelection(data, episodeId) {
       ? "已选择简化版：人工豁免三视图门禁，不生成独立正侧背和细节图"
       : "已选择完整版：生成视觉DNA、三视图审核板及独立高清正侧背母资产");
   const policy = selection.candidate_policy
-    || "主角5张；重要配角3张；非重要角色固定1张；跑龙套/背景路人不做独立设定、不生成候选图或立绘";
+    || "主角、重要配角和普通配角统一4张候选；跑龙套/背景路人不做独立设定、不生成候选图或立绘";
   app.innerHTML = `<div class="canvas-view cast-select-view">
     <div class="confirm-banner">
-      <div><b>先定人物，再生产后续图片 👤</b>
-        <span>${esc(policy)}；有参考图时人物脸和发型是最高标准，职业角色必须穿工作服；人物候选统一使用纯背景，不得出现文字或场景。
-        每名角色先从剧情推导视觉DNA并与全剧角色去重，再按重要度生成同一画风下的候选图；
+      <div><b>先定人物和核心道具，再生产后续图片 👤</b>
+        <span>${esc(policy)}；${esc(selection.prop_candidate_policy || "核心道具统一4张候选并人工定版")}。有参考图时人物脸和发型是最高标准，职业角色必须穿工作服；人物候选统一使用纯背景，不得出现文字或场景。
+        每名正式角色先从剧情推导视觉DNA并与全剧角色去重，再统一生成4张同一画风下的候选图；
         所有候选继承本剧唯一画风，不提供多个画风选项，只比较人物身份、表情、轻微姿态和剧情造型细节，
         请各选1张作为最终立绘。
         定版后完整版会生成面部、正面、严格90°侧面和完整180°背面独立母资产；
@@ -6762,9 +6781,9 @@ function renderCastSelection(data, episodeId) {
           <span id="cast-asset-policy-status" class="dim" aria-live="polite">${esc(assetPolicyStatus)}</span>
         </div>
       <div class="cast-actions">
-        <button id="cast-regenerate" title="保留旧图并按角色重要度重新生成">↻ 按角色重要度重生成</button>
+        <button id="cast-regenerate" title="保留旧版本，为全部人物和核心道具各重生成4张">↻ 全部重生成4张</button>
         <button class="primary" id="cast-continue" ${selection.passed ? "" : "disabled"}>
-          ${selection.passed ? "✅ 全部定版，继续预生产" : `已定版 ${selection.locked || 0}/${selection.total || characters.length}`}
+          ${selection.passed ? "✅ 全部定版，继续预生产" : `已定版 ${selection.asset_locked || 0}/${selection.asset_total || characters.length + props.length}`}
         </button>
       </div>
     </div>
@@ -6779,7 +6798,8 @@ function renderCastSelection(data, episodeId) {
     <div class="cast-selection-list">${characters.map((character) => `
       <section class="cast-choice panel">
         <div class="cast-choice-head"><div><h2>${esc(character.character)}</h2>
-          <span class="dim">${esc(character.role || "角色")} · ${character.candidate_count || 0}/${character.candidate_target || selection.candidate_target || 5} 张候选</span></div>
+          <span class="dim">${esc(character.role || "角色")} · ${character.candidate_count || 0}/${character.candidate_target || selection.candidate_target || 4} 张候选</span></div>
+          <button type="button" class="cast-regenerate-one" data-character="${esc(character.character)}">↻ 不满意，换4张</button>
           <strong class="${character.candidate_target === 0 ? "cast-locked" : (character.locked ? "cast-locked" : "cast-unlocked")}">
             ${character.candidate_target === 0 ? "无需单独立绘" : (character.locked ? "✓ 已锁定最终立绘" : "请选择1张")}</strong></div>
         ${castVisualDnaHtml(character)}
@@ -6801,6 +6821,34 @@ function renderCastSelection(data, episodeId) {
           </article>`;
         }).join("")}</div>
       </section>`).join("")}</div>
+    ${props.length ? `<h2 class="cast-section-title">核心道具四选一</h2>
+    <div class="cast-selection-list">${props.map((prop) => `
+      <section class="cast-choice panel">
+        <div class="cast-choice-head"><div><h2>${esc(prop.prop)}</h2>
+          <span class="dim">核心道具 · ${prop.candidate_count || 0}/${prop.candidate_target || 4} 张候选</span></div>
+          <button type="button" class="prop-regenerate-one" data-prop="${esc(prop.prop)}">↻ 不满意，换4张</button>
+          <strong class="${prop.locked ? "cast-locked" : "cast-unlocked"}">
+            ${prop.locked ? "✓ 已锁定道具母资产" : "请选择1张"}</strong></div>
+        ${(prop.story_function || prop.visual_design) ? `<details class="cast-look"><summary>查看道具设计依据</summary>
+          ${prop.story_function ? `<p><b>剧情功能：</b>${esc(prop.story_function)}</p>` : ""}
+          ${prop.visual_design ? `<p><b>视觉结构：</b>${esc(prop.visual_design)}</p>` : ""}
+        </details>` : ""}
+        <div class="cast-candidate-grid" role="list" aria-label="${esc(prop.prop)}的道具候选">${(prop.candidates || []).map((candidate) => {
+          const variant = candidate.variant_label || `方案${candidate.index}`;
+          const title = `${prop.prop} · 候选${candidate.index} · ${variant}`;
+          return `<article class="cast-candidate${candidate.selected ? " selected" : ""}" role="listitem">
+            <button type="button" class="cast-image" data-full="${esc(candidate.url || "")}" data-title="${esc(title)}" aria-label="查看${esc(title)}大图">
+              ${candidate.url ? `<img src="${esc(thumbUrl(candidate.url, 520))}" loading="lazy" alt="${esc(title)}">`
+                : `<span class="plan-thumb-empty">图片缺失</span>`}
+            </button>
+            <div class="cast-candidate-foot"><div class="cast-candidate-title"><span>候选 ${candidate.index}</span><b>${esc(variant)}</b></div>
+              <button type="button" class="${candidate.selected ? "selected" : "primary"} prop-pick"
+                data-prop="${esc(prop.prop)}" data-index="${candidate.index}"
+                aria-pressed="${candidate.selected ? "true" : "false"}" ${candidate.selected ? "disabled" : ""}>
+                ${candidate.selected ? "✓ 当前道具母资产" : "选定这套道具"}</button></div>
+          </article>`;
+        }).join("")}</div>
+      </section>`).join("")}</div>` : ""}
   </div>`;
   bindImageAccelerationLivebar(episodeId);
   bindProductionLedger(app, data, episodeId);
@@ -6820,7 +6868,7 @@ function renderCastSelection(data, episodeId) {
       } catch (e) {
         showToast(e.message, "error");
         ev.currentTarget.disabled = false;
-        ev.currentTarget.textContent = "↻ 按角色重要度重生成";
+        ev.currentTarget.textContent = "↻ 全部重生成4张";
       }
     });
   app.querySelectorAll(".cast-image").forEach((button) => {
@@ -6851,6 +6899,54 @@ function renderCastSelection(data, episodeId) {
         button.textContent = "选定这套造型";
       }
     };
+  });
+  app.querySelectorAll(".prop-pick").forEach((button) => {
+    button.onclick = async () => {
+      const group = [...app.querySelectorAll(".prop-pick")]
+        .filter((item) => item.dataset.prop === button.dataset.prop);
+      group.forEach((item) => { item.disabled = true; });
+      button.textContent = "锁定中…";
+      try {
+        await api("/api/prop/select", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ episode_id: data.episode.id,
+            prop: button.dataset.prop,
+            candidate_index: Number(button.dataset.index) }),
+        });
+        showToast(`${button.dataset.prop} 已锁定候选 ${button.dataset.index}`, "ok");
+        renderCanvasView(episodeId);
+      } catch (e) {
+        showToast(e.message, "error");
+        group.forEach((item) => { item.disabled = false; });
+        button.textContent = "选定这套道具";
+      }
+    };
+  });
+  const regenerateOne = async (button, payload) => {
+    button.disabled = true;
+    button.textContent = "重新生成中…";
+    try {
+      await api("/api/character/regenerate", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ episode_id: data.episode.id, ...payload }),
+      });
+      showToast("旧版本已保留，正在生成新一轮4张候选", "ok");
+      pollCanvas(episodeId);
+    } catch (e) {
+      showToast(e.message, "error");
+      button.disabled = false;
+      button.textContent = "↻ 不满意，换4张";
+    }
+  };
+  app.querySelectorAll(".cast-regenerate-one").forEach((button) => {
+    button.onclick = (event) => armConfirm(
+      event.currentTarget, "保留旧版并生成新4张", () => regenerateOne(
+        button, { character: button.dataset.character }));
+  });
+  app.querySelectorAll(".prop-regenerate-one").forEach((button) => {
+    button.onclick = (event) => armConfirm(
+      event.currentTarget, "保留旧版并生成新4张", () => regenerateOne(
+        button, { prop: button.dataset.prop }));
   });
   const next = document.getElementById("cast-continue");
   const assetModeSelect = document.getElementById("cast-asset-mode");
@@ -7581,6 +7677,7 @@ function scriptBodyHtml(script) {
         `<span class="chip">${esc(c.name)} · ${esc(c.role || "")}</span>`).join("")}</div>
       <div class="script-character-profiles">${(script.characters || [])
         .map(characterProfileHtml).join("")}</div>
+      ${corePropsHtml(script)}
       ${script.scenes.map((s) => `
         <section class="scene">
           <div class="scene-head"><span class="scene-no">第 ${s.scene_no} 场</span>

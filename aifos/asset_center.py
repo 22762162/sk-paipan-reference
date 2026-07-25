@@ -15,6 +15,7 @@ KINDS = (
 # character_art 指向同一文件，不单独展示，避免用户看到重复卡片。
 IMAGE_KINDS = (
     "character_candidate", "character_art", "character_sheet",
+    "prop_candidate", "prop_identity",
     "scene_art", "image", "first_frame", "last_frame", "cover",
     "reference", "spatial_blocking", "inner_persona",
 )

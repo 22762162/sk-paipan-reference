@@ -507,6 +507,8 @@ def _reference_role(item):
         return "人物细节：只补充结构/妆发"
     if role in {"wardrobe", "costume", "costume_detail"}:
         return "服装：只锁服装、配饰、道具结构"
+    if role in {"prop", "prop_identity", "prop_candidate"}:
+        return "核心道具：只锁轮廓、结构、材质、工艺与识别细节"
     if role in {"scene", "scene_art"}:
         return "场景：只锁空间、陈设、主光方向"
     if role in {"spatial", "spatial_blocking"}:
