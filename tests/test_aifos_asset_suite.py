@@ -86,6 +86,43 @@ def test_character_sheet_contract_is_single_subject(app):
     assert contract["actors"][0]["character"] == "林川"
 
 
+def test_character_sheet_prompt_and_qc_share_minimal_contract(app):
+    design = {
+        "species": "人类", "gender": "男", "age_range": "24岁",
+        "appearance": "清正骨相，面白略带旅途风尘",
+        "hair": "明式束发，戴儒巾或幞头",
+        "makeup": "素颜；额角与鬓边、脸颊沾少许灰尘",
+        "occupation": "外卖小哥",
+        "costume": "本体：青灰粗布长衫；错穿：青色官服",
+        "visual_dna": {"face_structure": "清正骨相，面白略带旅途风尘"},
+    }
+    prompt = app.director._sheet_prompt(
+        "林川", "外卖小哥", "电影级半写实", "人物设定图", "legacy",
+        key="closeup", design=design,
+        locked_look={"hair": "明式束发，素色儒巾"})
+    contract = app.director._character_sheet_composition_contract(
+        "林川", "closeup", role="外卖小哥", design=design)
+    quality = contract["quality_requirements"]
+    assert "画面下缘到颈根" in prompt
+    assert "双肩" in prompt and "上胸" in prompt
+    assert "职业服装:" not in prompt  # closeup 不把全身职业装塞进面部图
+    assert "脸颊沾少许" not in prompt
+    assert "面白略带旅途风尘" not in prompt
+    assert all(part in prompt for part in quality["required"])
+    assert quality["required"] == app.director._sheet_quality_contract(
+        "closeup")["required"]
+    assert app.director._sheet_feedback_for_key(
+        "【质检原因】上胸露出；旧剧情要求官服和文匣；【自动优化修订】保留全身",
+        "closeup").startswith("只修正本资产")
+
+
+def test_workwear_only_applies_to_explicit_occupation(app):
+    assert app.director._sheet_workwear_line(
+        "主角", {"occupation": "学生"}) == ""
+    assert "外卖配送员工作服" in app.director._sheet_workwear_line(
+        "外卖小哥", {"occupation": "外卖小哥"})
+
+
 def test_story_bible_stays_in_continuity_but_not_shot_provider_prompt(app):
     project = _preproduce(app, title="归途")
     episode = app.db.query_one(

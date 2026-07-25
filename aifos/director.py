@@ -172,6 +172,95 @@ WORKWEAR_RULE = (
     "消防员、保安、服务员、厨师、工人等职业,必须穿该职业真实可辨认的"
     "工作服/制服并体现必要的职业装备,不得用普通便服替代。")
 
+# 人物设定图只允许把“当前这张图要核对的内容”送入生图和质检。
+# 这份合同是两边共用的单一事实源，避免提示词写了一套、质检又按另一套
+# 标准判错。职业装也不再用一条覆盖所有职业的泛化规则，而是按角色明确
+# 职业逐项加入。
+SHEET_QUALITY_REQUIREMENTS = {
+    "turnaround": {
+        "required": (
+            "同一角色的面部近景、正面、严格90度侧面、严格180度背面",
+            "四个视角脸型、发型、服装和比例一致",
+        ),
+        "forbidden": ("第二个人物", "可读文字", "场景背景", "剧情临时伤污"),
+    },
+    "closeup": {
+        "required": (
+            "正面头肩近景",
+            "画面下缘到颈根",
+            "脸型、五官、发际线、发型和妆容清晰",
+        ),
+        "forbidden": (
+            "双肩",
+            "锁骨",
+            "上胸",
+            "全身",
+            "手持或散置道具",
+            "第二套服装",
+            "剧情临时伤污",
+        ),
+    },
+    "front": {
+        "required": (
+            "严格正面全身",
+            "从头到脚完整可见",
+            "只使用一套当前主造型",
+        ),
+        "forbidden": ("侧身", "四分之三视角", "第二套服装", "剧情临时伤污"),
+    },
+    "profile": {
+        "required": (
+            "严格90度真侧面全身",
+            "只使用一套当前主造型",
+            "鼻梁、唇线、下颌、耳朵和后脑轮廓可核对",
+        ),
+        "forbidden": ("正面双眼同时完整可见", "四分之三视角", "剧情临时伤污"),
+    },
+    "back": {
+        "required": (
+            "严格180度完整背面",
+            "后脑发型、肩背、服装背片和贴身配饰可核对",
+        ),
+        "forbidden": ("正脸", "第二个人物", "剧情临时伤污"),
+    },
+    "features": {
+        "required": ("同一角色的发型、眼睛、体态和贴身标志特征",),
+        "forbidden": ("全身剧情场景", "手持或散置道具", "第二个人物", "剧情临时伤污"),
+    },
+    "makeup": {
+        "required": ("正面半身", "底妆、眉眼、唇妆和稳定肤质清晰"),
+        "forbidden": ("剧情伤痕", "泥点血污汗湿", "第二套妆造", "第二个人物"),
+    },
+    "costume": {
+        "required": ("严格正面全身", "一套当前主造型", "服装层次、材质和贴身配饰清晰"),
+        "forbidden": ("第二套服装", "手持或散置道具", "剧情临时伤污"),
+    },
+    "costume_detail": {
+        "required": ("当前主造型的材质、接缝、扣件和贴身配饰",),
+        "forbidden": ("第二套服装", "手持或散置道具", "完整剧情场景", "剧情临时伤污"),
+    },
+}
+
+OCCUPATION_WORKWEAR = (
+    ("外卖小哥", "外卖配送员工作服/制服；只保留服装本身，不新增品牌文字"),
+    ("外卖员", "外卖配送员工作服/制服；只保留服装本身，不新增品牌文字"),
+    ("快递员", "快递员工作服；只保留服装本身，不新增品牌文字"),
+    ("配送员", "配送员工作服；只保留服装本身，不新增品牌文字"),
+    ("医生", "医生白大褂或剧本明确的医疗工作服；不新增胸牌文字"),
+    ("护士", "护士制服；不新增胸牌文字"),
+    ("警察", "警察制服；不新增徽章文字"),
+    ("消防员", "消防员制服；不新增文字标识"),
+    ("保安", "保安制服；不新增文字标识"),
+    ("服务员", "服务员制服；不新增品牌文字"),
+    ("厨师", "厨师工作服；不新增品牌文字"),
+    ("工人", "工人工作服；不新增品牌文字"),
+)
+
+SHEET_BACKGROUND_RULE = (
+    "背景只允许纯色、柔和渐变或干净无辨识度棚拍底；禁止场景、建筑、"
+    "室内、街道、自然环境、可读文字、字幕、Logo、水印、乱码和其他人物；"
+    "不新增手持或散置道具，已锁定服装附件可保留。")
+
 # 场景概念图是后续分镜共用的环境基准,不能把人物服装描述误当成场景内容。
 # 这些关键词只补充空间功能和可见锚点,最终仍以剧本地点/时代/动作为准。
 SCENE_ENVIRONMENT_PRESETS = (
@@ -1235,6 +1324,7 @@ class Director:
                           "temperament", "costume", "costume_detail",
                           "palette", "era_setting", "occupation",
                           "signature_props"))
+        workwear = self._sheet_workwear_line(f"{name};{role}", design)
         return (f"角色立绘:{name}({role}),{style}"
                 + (f",{detail},表情站姿体现其性格" if detail else "")
                 + ";服装和造型必须从人物背景提示词、时代/世界观、职业、性格、"
@@ -1244,7 +1334,8 @@ class Director:
                 "睫毛、唇妆和身份配饰,必须是同一个人;服装、服装颜色/材质、动作、"
                 "场景和光影按本剧本及当集造型生成,允许与参考图服装不同,除非明确"
                 "要求保留参考图服装;"
-                f"{WORKWEAR_RULE}{CHARACTER_BACKGROUND_RULE}")
+                + (f"职业服装:{workwear};" if workwear else "")
+                + CHARACTER_BACKGROUND_RULE)
 
     def _candidate_variant(self, index, design=None):
         """返回同一项目画风下的候选差异轴和资产元数据。"""
@@ -1360,6 +1451,7 @@ class Director:
             variant_rule = (
                 "无参考图时,可在同一项目画风、时代、职业和核心人物气质内"
                 "做有限的发型/妆容/表情细节差异,不得制作不同画风候选")
+        workwear = self._sheet_workwear_line(f"{name};{role}", design)
         return (
             f"【任务】{name}（{role}）单人定角候选 · {variant['variant_label']}。"
             "不同候选是互斥造型，不是同一套衣服只换动作。"
@@ -1375,8 +1467,8 @@ class Director:
                or variant.get("story_variant", {}).get("accessories") else "")
             + f"【PROJECT STYLE LOCK】本项目唯一画风:{style}；"
             "所有候选必须完全一致，不得制作不同画风候选。"
-            "职业人物必须穿真实可辨认的工作服/制服并保留必要装备。"
-            "人物立绘必须是纯净、无文字的单人物资产背景。"
+            + (f"职业服装:{workwear}。" if workwear else "")
+            + "人物立绘必须是纯净、无文字的单人物资产背景。"
             "【构图】单人、全身正面自然站姿、从头到脚完整、纯净中性棚拍背景；"
             "五官、手指、关节与身体比例自然。"
             "【禁止】其他人物、身份/性别/年龄漂移、时代错置、模板网红脸、"
@@ -1507,11 +1599,17 @@ class Director:
         text = re.sub(
             r"[（(][^（）()]*?(?:泥|血|污|汗|伤|包扎|文匣|官印|卷轴|行囊)"
             r"[^（）()]*[）)]", "", text)
+        # 旧人物分析常把本体/错穿身份、临时状态塞进括号；这些不是
+        # 人物母资产的可见稳定属性，必须在编译阶段剔除。
+        text = re.sub(
+            r"[（(][^（）()]*?(?:本体|错穿|备用|第二套|身份|载)[^（）()]*[）)]",
+            "", text)
         for phrase in (
                 "旅途风尘", "汗湿痕", "汗湿", "泥水痕", "泥点", "泥污",
                 "污渍", "血痕", "血污", "血迹", "渗痕", "刀伤", "伤口",
                 "包扎", "受伤", "赶路", "文匣", "札付", "告身", "官印",
-                "卷轴", "行囊", "私人信件"):
+                "卷轴", "行囊", "私人信件", "脸颊沾少许", "额角与鬓边",
+                "面白略带", "临时污损"):
             text = text.replace(phrase, "")
         text = "；".join(
             clause.strip() for clause in re.split(r"[；;]", text)
@@ -1581,6 +1679,32 @@ class Director:
         return re.split(r"[，,；;。]", text, maxsplit=1)[0].strip()
 
     @classmethod
+    def _sheet_append_field(cls, parts, label, value):
+        """Append a field only when it adds visible information.
+
+        Legacy character cards often repeat the same face/hair/clothing text in
+        both the ordinary fields and ``visual_dna``.  Repeating it increases
+        prompt weight without adding a constraint, so exact or contained
+        clauses already present in the compiled line are discarded.
+        """
+        value = cls._sheet_stable_text(value)
+        if not value:
+            return
+        existing = "；".join(parts)
+        kept = []
+        for clause in re.split(r"[；;]", value):
+            clause = clause.strip(" ，,。;")
+            if not clause:
+                continue
+            comparable = clause.split(":", 1)[-1].strip()
+            if (clause in existing or comparable in existing
+                    or (comparable and existing.find(comparable) >= 0)):
+                continue
+            kept.append(clause)
+        if kept:
+            parts.append(f"{label}:{'；'.join(kept)}")
+
+    @classmethod
     def _sheet_design_line(cls, design, key, locked_look=None):
         """Compile only fields that are executable for this sheet type."""
         design = design if isinstance(design, dict) else {}
@@ -1613,7 +1737,9 @@ class Director:
         parts = []
         for field in fields:
             value = design.get(field)
-            if field == "costume":
+            if field == "hair" and locked_look.get("hair"):
+                value = locked_look.get("hair")
+            elif field == "costume":
                 value = (locked_look.get("costume")
                          or design.get("costume"))
                 value = cls._sheet_primary_wardrobe(value)
@@ -1627,8 +1753,7 @@ class Director:
                 value = cls._sheet_era_line(value)
             else:
                 value = cls._sheet_stable_text(value)
-            if value:
-                parts.append(f"{labels.get(field, field)}:{value}")
+            cls._sheet_append_field(parts, labels.get(field, field), value)
 
         dna = design.get("visual_dna")
         if isinstance(dna, dict):
@@ -1667,11 +1792,23 @@ class Director:
                 if value:
                     dna_parts.append(f"{dna_labels[field]}:{value}")
             if dna_parts:
-                parts.append("稳定视觉DNA:" + "；".join(dna_parts))
+                cls._sheet_append_field(
+                    parts, "稳定视觉DNA", "；".join(dna_parts))
         return "；".join(parts)
 
     @staticmethod
-    def _character_sheet_composition_contract(name, key):
+    def _sheet_quality_contract(key):
+        rule = SHEET_QUALITY_REQUIREMENTS.get(key)
+        if not rule:
+            return {"required": [], "forbidden": []}
+        return {
+            "required": list(rule.get("required") or ()),
+            "forbidden": list(rule.get("forbidden") or ()),
+        }
+
+    @classmethod
+    def _character_sheet_composition_contract(cls, name, key, *,
+                                              role="", design=None):
         view = {
             "turnaround": "审核板多视角",
             "closeup": "头肩面部近景",
@@ -1683,6 +1820,12 @@ class Director:
             "costume": "全身正面",
             "costume_detail": "服装局部",
         }.get(key, "人物设定图")
+        quality = cls._sheet_quality_contract(key)
+        workwear = cls._sheet_workwear_line(role, design)
+        if workwear and key in (
+                "turnaround", "front", "profile", "back", "costume",
+                "costume_detail"):
+            quality["required"].append(f"职业服装:{workwear}")
         return {
             "composition_type": "character_sheet_single_subject",
             "expected_primary_count": 1,
@@ -1696,17 +1839,16 @@ class Director:
             "count_rule": (
                 "逻辑上严格只有1名已登记角色；审核板中的多视角/局部均是同一人，"
                 "禁止新增人物、分身、陌生人、道具拟人或场景人物"),
+            "quality_requirements": quality,
         }
 
     @staticmethod
     def _sheet_scope_line(key):
-        return {
+        scope = {
             "turnaround": (
                 "逻辑主体只有1人；同一角色的面部近景、正面、严格90度侧面和"
                 "严格180度背面审核板，四个视角保持同一脸、发型、服装和比例"),
-            "closeup": (
-                "只有1人、头肩面部近景、裁切到颈部；只展示脸型、五官、发型、"
-                "妆容和稳定表情，禁止全身、手持物、剧情伤口或第二套造型"),
+            "closeup": "只有1人、正面头肩面部近景；画面下缘到颈根，双肩、锁骨和上胸全部不入画；只展示脸型、五官、发型和妆容",
             "front": "只有1人、严格正面全身、从头到脚完整可见、自然中性站姿",
             "profile": "只有1人、严格90度真侧面全身；禁止四分之三视角和双人构图",
             "back": "只有1人、严格180度完整背面；不露正脸，不新增前景人物",
@@ -1719,16 +1861,18 @@ class Director:
                 "只有1人；只展示当前主造型的服装材质、接缝、扣件和贴身配饰，"
                 "不得并列第二套服装或手持道具"),
         }.get(key, "只有1名角色作为设定主体")
+        return scope
 
     @classmethod
     def _sheet_workwear_line(cls, role, design):
-        text = " ".join(str((design or {}).get(field) or "")
-                        for field in ("occupation", "identity", "costume"))
-        if not any(token in text for token in (
-                "外卖", "快递", "配送", "医生", "护士", "警察", "消防",
-                "保安", "服务员", "厨师", "工人")):
-            return ""
-        return WORKWEAR_RULE
+        values = [str(role or "")]
+        values.extend(str((design or {}).get(field) or "")
+                      for field in ("occupation", "identity"))
+        text = "；".join(values)
+        for keyword, requirement in OCCUPATION_WORKWEAR:
+            if keyword in text:
+                return requirement
+        return ""
 
     def _sheet_prompt(self, name, role, style, label, desc, key=None,
                       design=None, locked_look=None):
@@ -1738,6 +1882,15 @@ class Director:
         scope = self._sheet_scope_line(key)
         era = self._sheet_era_line((design or {}).get("era_setting"))
         workwear = self._sheet_workwear_line(role, design)
+        quality = self._sheet_quality_contract(key)
+        if workwear and key in (
+                "turnaround", "front", "profile", "back", "costume",
+                "costume_detail"):
+            quality["required"].append(f"职业服装:{workwear}")
+        quality_line = (
+            f"必须满足:{'；'.join(quality['required'])}；"
+            f"禁止:{'；'.join(quality['forbidden'])}"
+        )
         # `desc` is retained in the method signature for compatibility with
         # saved plans, but is intentionally not copied verbatim: legacy desc
         # strings often describe multiple views or plot props.
@@ -1746,6 +1899,7 @@ class Director:
             f"【任务】角色{label}:{name}({role})。",
             f"【主体合同】严格1名逻辑角色：{name}；实际可见人形=1；{scope}。",
             f"【视角合同】{self._sheet_view_contract(key)}",
+            f"【质检同源合同】{quality_line}。",
             "【IDENTITY LOCK】必须以人工锁定最终立绘/身份参考图为最高标准，"
             "脸型、五官比例、眼鼻嘴、年龄感、性别表达、发际线、发型轮廓、发色"
             "和妆造保持同一个人；不把剧情临时状态当成身份特征。",
@@ -1760,8 +1914,7 @@ class Director:
             f"【STYLE】{style}；本剧所有人物设定图保持同一媒介与渲染方式。",
             "【单一状态】本批母资产统一使用干净、均匀、自然微纹理的皮肤；"
             "不画泥点、血污、汗湿污痕、伤口、包扎或其他临时剧情损伤。",
-            "【背景】纯色、柔和渐变或无辨识度的干净棚拍底；不画场景、建筑、"
-            "室内、街道、自然环境、文字、字幕、Logo、水印、乱码、道具或其他人物。",
+            f"【背景】{SHEET_BACKGROUND_RULE}",
             "【硬禁止】不要补写剧情、不要把人物传记/动作/道具/第二套服装"
             "带入本张图；不要新增或复制角色，不要把四视图的同一人误画成多人。",
         ])
@@ -1916,6 +2069,50 @@ class Director:
         feedback = (feedback or "").strip()
         return (f"{prompt}。修改意见(必须落实):{feedback}"
                 if feedback else prompt)
+
+    @classmethod
+    def _sheet_feedback_for_key(cls, feedback, key):
+        """Keep retry feedback inside the current sheet's quality contract.
+
+        Old plans may contain a full-shot auto-revision paragraph.  Appending
+        that paragraph to a face crop or a costume detail reintroduces exactly
+        the contradictions QC just reported.  Human-only notes remain intact;
+        generated QC notes are reduced to clauses relevant to this asset type.
+        """
+        text = str(feedback or "").strip()
+        if not text or not key:
+            return text
+        auto_markers = ("【质检原因】", "【自动优化修订】", "自动优化修订",
+                        "修改意见(必须落实)")
+        if not any(marker in text for marker in auto_markers):
+            return text[:1200]
+        common = {
+            "脸", "面部", "五官", "发型", "发际线", "妆", "皮肤", "污",
+            "痕", "划", "伤", "人物", "人形", "参考图", "背景", "文字",
+        }
+        per_key = {
+            "turnaround": {"视角", "正面", "侧面", "背面", "比例", "服装"},
+            "closeup": {"颈", "肩", "锁骨", "上胸", "裁切", "近景", "胸"},
+            "front": {"正面", "全身", "头", "脚", "服装", "材质", "配饰", "工作服"},
+            "profile": {"侧面", "90", "四分之三", "鼻", "唇", "下颌", "耳", "服装"},
+            "back": {"180", "背面", "后脑", "肩背", "背片", "接缝", "配饰"},
+            "features": {"眼睛", "体态", "标志", "局部", "特征"},
+            "makeup": {"半身", "底妆", "眉眼", "唇妆", "污", "泥", "血", "汗"},
+            "costume": {"全身", "正面", "服装", "材质", "配饰", "工作服"},
+            "costume_detail": {"材质", "接缝", "扣件", "配饰", "附件", "服装"},
+        }
+        allowed = common | per_key.get(key, set())
+        clauses = []
+        for clause in re.split(r"[\n。；;]", text):
+            clause = clause.strip(" ，,。；;:")
+            if not clause or clause.startswith("【自动优化修订】"):
+                continue
+            if any(token in clause for token in allowed):
+                clauses.append(clause)
+        if not clauses:
+            return ""
+        return "只修正本资产质检明确指出的问题；未指出内容保持不变；" \
+            + "；".join(dict.fromkeys(clauses))[:1100]
 
     @staticmethod
     def _reference_inputs(payload):
@@ -2082,6 +2279,11 @@ class Director:
             composition = payload.get("composition_contract") or {}
             if composition.get("expected_visible_figure_count") != 1:
                 issues.append("人物设定图构图合同缺少实际可见人形=1")
+            quality_contract = composition.get("quality_requirements")
+            if not isinstance(quality_contract, dict):
+                issues.append("人物设定图缺少与质检共用的最小质量合同")
+            elif "【质检同源合同】" not in prompt_used:
+                issues.append("人物设定图提示词未携带质检同源合同")
             if "None" in prompt_used or "none" in prompt_used.lower():
                 issues.append("人物设定图提示词不能出现未解析的人物数量None")
             if not payload.get("sheet_prompt_schema"):
@@ -2984,6 +3186,9 @@ class Director:
         spent = 0.0
         attempt_history = []
         payload = copy.deepcopy(payload or {})
+        if payload.get("character_sheet"):
+            payload["feedback"] = self._sheet_feedback_for_key(
+                payload.get("feedback"), payload.get("character_sheet"))
         if not isinstance(payload.get("reference_manifest"), list):
             self._attach_reference_manifest(payload)
         lesson_issues = []
@@ -3165,6 +3370,9 @@ class Director:
             reference_changes = self._apply_image_reference_adjustments(
                 next_payload, qc_spec, diagnostics)
             patch = targeted_prompt_patch(diagnostics)
+            if qc_spec.get("character_sheet_key"):
+                patch = self._sheet_feedback_for_key(
+                    patch, qc_spec.get("character_sheet_key"))
             if patch:
                 old_feedback = str(next_payload.get("feedback") or "").strip()
                 next_payload["feedback"] = (
@@ -5625,7 +5833,9 @@ class Director:
                         "shot_no": 0, "characters": [name],
                         "character_count": 1, "location": "",
                         "composition_contract": (
-                            self._character_sheet_composition_contract(name, key)),
+                            self._character_sheet_composition_contract(
+                                name, key, role=role,
+                                design=designs.get(name))),
                         "prompt": self._sheet_prompt(
                             name, role, style, label, desc,
                             key=key, design=designs.get(name),
@@ -5651,7 +5861,8 @@ class Director:
                         expected_characters=[name], expected_count=1,
                         composition_contract=(
                             self._character_sheet_composition_contract(
-                                name, key)),
+                                name, key, role=role,
+                                design=designs.get(name))),
                         character_sheet_key=key,
                         action=f"人物资产设定图({label}):同一角色"
                                f"「{name}」的{label},每个视角/局部都必须"
@@ -9748,8 +9959,10 @@ class Director:
             if entry is None:
                 raise AifosError(f"未知人物资产套件: {sheet_key}")
             _, label, desc = entry
+            feedback = self._sheet_feedback_for_key(feedback, sheet_key)
             role = next((c.get("role", "") for c in script["characters"]
                          if c["name"] == name), "")
+            sheet_design = self._character_design(project["id"], name) or {}
             portrait = self.assets.latest(
                 project["id"], "character_art", name)
             portrait_uri = (portrait["uri"]
@@ -9763,7 +9976,7 @@ class Director:
                 allowed_roles={"identity", "wardrobe", "composition"})
             prompt = prompt_override or self._sheet_prompt(
                 name, role, style, label, desc, key=sheet_key,
-                design=self._character_design(project["id"], name),
+                design=sheet_design,
                 locked_look=locked_look)
             quality = resolve_image_quality(
                 recommend_asset_quality("character_sheet"), policy,
@@ -9780,7 +9993,8 @@ class Director:
                     "character_count": 1, "location": "",
                     "composition_contract": (
                         self._character_sheet_composition_contract(
-                            name, sheet_key)),
+                            name, sheet_key, role=role,
+                            design=sheet_design)),
                     "prompt": prompt, "style": style,
                     "prompt_contract_complete": True,
                     "feedback": feedback,

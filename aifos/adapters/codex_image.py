@@ -342,11 +342,16 @@ def build_instruction(capability, payload, out_dir):
             f"{item.get('expected_view')}/按{item.get('identity_basis')}核验"
             for item in composition.get("actors") or []
             if isinstance(item, dict))
+        quality = composition.get("quality_requirements") or {}
+        quality_line = (
+            f"质检必须满足={ '；'.join(quality.get('required') or []) };"
+            f"质检禁止={ '；'.join(quality.get('forbidden') or []) }"
+            if isinstance(quality, dict) else "")
         composition_line = (
             f"类型={composition.get('composition_type')};"
             f"正面主体={composition.get('expected_primary_count')};"
             f"实际可见人形={composition.get('expected_visible_figure_count')};"
-            f"{actor_rules};{composition.get('count_rule', '')}"
+            f"{actor_rules};{composition.get('count_rule', '')};{quality_line}"
             if composition else "标准构图；按待检图实际可见视角逐人核验")
         physical = payload.get("physical_contract") or {}
         physical_rules = "；".join(physical.get("rules") or [])
