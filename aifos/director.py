@@ -5153,7 +5153,7 @@ class Director:
                 in ("detail_or_state", "flat_text_layout", "context_keyframe")
                 else 1, -int(row["version"] or 0)))
             row = next((candidate for candidate in rows
-                        if candidate.get("uri") and formal_reference_allowed(
+                        if candidate["uri"] and formal_reference_allowed(
                             self._asset_quality(candidate))
                         and (candidate["uri"].startswith(("http://", "https://"))
                              or Path(candidate["uri"]).exists())
