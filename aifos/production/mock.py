@@ -6,6 +6,7 @@
 占位描述文件落盘,由真实 Provider 接入后替换为真实媒体。
 """
 
+import copy
 import hashlib
 import json
 import re
@@ -267,6 +268,14 @@ class MockProvider(Provider):
             return analysis, uri
         if payload.get("character_design"):
             return self._gen_character_design(payload, out_dir)
+        if (payload.get("source_material_adaptation")
+                and isinstance(payload.get("previous_script"), dict)):
+            # 测试/离线占位也要遵守真实编剧的“保留核心人物、地点与事件”
+            # 约束，不能用随机模板把用户导入素材整体替换掉。
+            script = copy.deepcopy(payload["previous_script"])
+            normalize_script_bible(script, payload)
+            uri = _json_artifact(out_dir / "adapted_script.json", script)
+            return script, uri
         genre = _detect_genre(payload)
         if genre == "idol":
             return self._gen_idol_script(payload, out_dir)

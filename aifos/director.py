@@ -135,7 +135,7 @@ def infer_visual_style(premise="", project_title=""):
     return DEFAULT_VISUAL_STYLE
 
 STAGES = [
-    ("script", "剧本 + AI制作圣经"),
+    ("script", "剧本总闸门 + AI制作圣经"),
     ("continuity", "连续性圣经"),
     ("cast", "人物/场景图"),
     ("storyboard", "五维分镜"),
@@ -3606,10 +3606,68 @@ class Director:
             episode_id=episode_id)
         return analysis, version, False
 
+    def _adapt_imported_source(self, ctx, source):
+        """把小说/文本解析稿交给编剧完成正式影视化，不把解析稿直接拿去出图。"""
+        imported = (
+            source.get("import_analysis")
+            if isinstance(source, dict) else None)
+        rules = (
+            (ctx.get("production_profile") or {}).get(
+                "rules", {}).get("script_development", {}))
+        if (not isinstance(imported, dict)
+                or imported.get("source_format") not in {
+                    "novel", "script_text"}
+                or rules.get("auto_adapt_imported_source") is not True):
+            return source
+        payload = {
+            "project_title": ctx["project"]["title"],
+            "episode_number": ctx["episode"]["number"],
+            "premise": (
+                ctx["episode"].get("premise")
+                or source.get("logline") or "按导入素材改编"),
+            "style": ctx["project"].get("style", ""),
+            "template": ctx["project"].get("kind", "drama"),
+            "persona": ctx["project"]["title"],
+            "previous_script": source,
+            "source_material_adaptation": True,
+            "feedback": (
+                "完成第一道剧本总闸门：把导入素材改编成可实际拍摄的正式剧本。"
+                "修正因果、人物动机和信息来源；补齐时间与空间过渡、人物入口出口、"
+                "服装伤势状态、动作支撑与接触；逐件补齐关键道具的来源、持有人、"
+                "拿取使用交接、状态变化和去向；建立每场局部返编边界。"
+                "原素材未写但拍摄必需的细节由编剧主动完善，不能留给图片或视频模型"
+                "自行猜测；保留核心人物、核心事件和关键结果。"),
+        }
+        result = self._call(ctx, "script", payload, "script_adaptation")
+        adapted = result.data
+        import_analysis = copy.deepcopy(imported)
+        import_analysis.update({
+            "writer_adapted": True,
+            "source_dialogue_preserved_in_parse": bool(
+                imported.get("dialogue_preserved_verbatim")),
+            "dialogue_preserved_verbatim": False,
+            "adaptation_policy": (
+                "原素材对白只作为改编依据；正式剧本已按因果、物理、时间、空间、"
+                "人物信息和道具生命周期完善"),
+        })
+        adapted["import_analysis"] = import_analysis
+        self.data.record(
+            "prompt", "success",
+            prompt=f"script-adaptation:{ctx['project']['title']}"
+            f":e{ctx['episode']['number']}",
+            uri=result.uri,
+            meta={
+                "source_format": imported.get("source_format"),
+                "script_gate": "first_stage_integrated_review",
+            },
+            episode_id=ctx["episode"]["id"])
+        return adapted
+
     def _stage_script(self, ctx):
         episode = ctx["episode"]
         provided = ctx.get("provided_script")
         if provided is not None:
+            provided = self._adapt_imported_source(ctx, provided)
             self._normalize_script_character_profiles(
                 provided, ctx["episode"].get("premise", ""),
                 project_title=ctx["project"]["title"],
@@ -8249,6 +8307,11 @@ class Director:
         if analysis is None:
             raise AifosError("AI 制作圣经尚未生成，请先完成剧本分析")
         script, _ = self.projects.latest_document(int(episode_id), "script")
+        script_error = validate_script_bible(script or {})
+        if script_error:
+            raise AifosError(
+                "剧本第一道总闸门未通过，不能开始人物图："
+                f"{script_error}。请先打磨剧本或重新运行 AI 编剧。")
         error = character_production_readiness_error(script or {}, analysis)
         if error:
             raise AifosError(error)
