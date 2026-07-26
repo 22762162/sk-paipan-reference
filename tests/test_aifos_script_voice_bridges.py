@@ -30,13 +30,48 @@ if "分镜师" in prompt:
          "prompt": "p2"}]}
 else:
     data = {"episode_title": "妖王之章", "logline": "一句话",
-            "characters": [{"name": "甲", "role": "主角"}],
+            "characters": [{"name": "甲", "role": "主角", "gender": "男",
+                            "age_range": "25-30"}],
             "scenes": [{"scene_no": 1, "location": "古镇",
                         "characters": ["甲"], "action": "走",
                         "lines": [{"character": "甲", "dialogue": "你好"}]}]}
 print("好的,以下是结果:")
 print(json.dumps(data, ensure_ascii=False))
 print("(完)")
+'''
+
+# 假 codex:校验编剧引擎参数(exec/只读沙箱/最终答复文件),
+# stdout 只有进度杂讯,JSON 落在 --output-last-message 文件里
+FAKE_CODEX = '''#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+assert args[0] == "exec", args
+assert args[args.index("--sandbox") + 1] == "read-only", args
+assert "--skip-git-repo-check" in args, args
+out = args[args.index("--output-last-message") + 1]
+prompt = args[-1]
+if "分镜师" in prompt:
+    data = {"episode_title": "T", "shots": [
+        {"shot_no": 1, "scene_no": 1, "kind": "environment",
+         "description": "d", "camera": "远景", "duration": 2.5,
+         "characters": ["甲"], "dialogue": None, "prompt": "p1"}]}
+else:
+    data = {"episode_title": "妖王之章", "logline": "一句话",
+            "characters": [{"name": "甲", "role": "主角", "gender": "男",
+                            "age_range": "25-30"}],
+            "scenes": [{"scene_no": 1, "location": "古镇",
+                        "characters": ["甲"], "action": "走",
+                        "lines": [{"character": "甲", "dialogue": "你好"}]}]}
+print("[progress] thinking {not-json}")
+with open(out, "w", encoding="utf-8") as f:
+    f.write(json.dumps(data, ensure_ascii=False))
+'''
+
+# 假 codex(故障):模拟账号限流/断流,错误只写 stdout
+FAKE_CODEX_DOWN = '''#!/usr/bin/env python3
+import sys
+print("stream error: exhausted retries")
+sys.exit(1)
 '''
 
 # 假 say:解析 -o 输出路径,写合法 WAV(1 秒静音)
@@ -96,6 +131,31 @@ def test_claude_missing_binary(tmp_path):
         "capability": "script", "payload": {},
         "out_dir": str(tmp_path)}, ["--claude", "/missing/claude"])
     assert not reply["ok"]
+
+
+# ---- Codex 编剧引擎(同一桥,--engine codex) ----
+def test_codex_writer_script_generation(tmp_path):
+    codex = _make_bin(tmp_path, "codex", FAKE_CODEX)
+    reply = _bridge("aifos.adapters.claude_script", {
+        "capability": "script",
+        "payload": {"project_title": "万妖图录", "episode_number": 15,
+                    "premise": "", "style": ""},
+        "out_dir": str(tmp_path / "out")},
+        ["--engine", "codex", "--codex", str(codex)])
+    assert reply["ok"], reply
+    assert reply["data"]["scenes"]
+    assert reply["data"]["project_title"] == "万妖图录"
+
+
+def test_codex_writer_failure_reports_stdout(tmp_path):
+    codex = _make_bin(tmp_path, "codex", FAKE_CODEX_DOWN)
+    reply = _bridge("aifos.adapters.claude_script", {
+        "capability": "script", "payload": {},
+        "out_dir": str(tmp_path)},
+        ["--engine", "codex", "--codex", str(codex)])
+    assert not reply["ok"]
+    assert "codex 编剧退出码 1" in reply["error"]
+    assert "exhausted retries" in reply["error"]
 
 
 def test_extract_json_tolerates_noise():
