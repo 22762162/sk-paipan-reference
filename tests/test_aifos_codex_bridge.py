@@ -20,12 +20,15 @@ log = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 with open(log, "a", encoding="utf-8") as f:
     f.write(json.dumps(sys.argv[1:], ensure_ascii=False) + "\\n")
 if "你是漫剧图片质检员" in instruction:
+    # 回读合同期望人数:空镜场景合同是 0 人,写死 1 会误伤空镜质检。
+    count_match = re.search(r"严格共\\s*(\\d+)\\s*个", instruction)
+    detected = int(count_match.group(1)) if count_match else 1
     print(json.dumps({
         "pass": True,
         "identity_checked": True, "identity_match": True,
         "gender_checked": True, "gender_match": True,
         "count_checked": True, "count_match": True,
-        "detected_count": 1, "issues": [],
+        "detected_count": detected, "issues": [],
     }, ensure_ascii=False))
     sys.exit(0)
 paths = re.findall(r"(/\\S+?\\.png)", instruction)
@@ -188,6 +191,10 @@ def test_produce_passes_reference_art(tmp_path, fake_codex, monkeypatch):
     assert any("基准图" in i and "scene_" in i for i in keyframe_calls)
     # 对照表编号与用途绑定进入指令
     assert any("参考图对照表" in i and "图1=" in i for i in keyframe_calls)
+    # 场景概念图走 0 人空镜质检合同(回归:此前场景图不过机器质检,
+    # 带人物的空镜图会直达人工候选)
+    assert any("你是漫剧图片质检员" in i and "严格共 0 个" in i
+               for i in instructions)
 
 
 def test_router_integration(tmp_path, fake_codex, monkeypatch):

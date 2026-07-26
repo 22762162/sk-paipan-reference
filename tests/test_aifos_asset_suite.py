@@ -86,6 +86,40 @@ def test_scene_prompt_preserves_full_location_name_with_separator(app):
     assert "时间与天气:驿馆内室（闪回，数日前夜）" in prompt
 
 
+def test_scene_prompt_strips_characters_and_case_evidence(app):
+    """空镜母资产提示词必须无人物无事件:编剧场景字段按子句清洗。
+
+    回归背景:production_design 按"这场戏"写作,曾把"倒伏书童、黑衣人
+    围立、林川探看、血迹"原样拼进空镜提示词,与末尾空镜硬约束自相矛盾;
+    LLM 中介产线(Codex)会替平台裁决,直连扩散模型(即梦/Seedream)则画出
+    尸体和插地的刀,且血迹会烧进跨集复用的场景母资产。"""
+    scene = {
+        "production_design": {
+            "environment": "路旁幽暗树林，光线昏暗、林木密集，"
+                           "中景林地倒伏一名书童，数名黑衣人持刀围立。",
+            "layout": "前景树干与树根（包袱放置处），林川藏于树干后探看；"
+                      "树干形成偷窥遮挡角。",
+            "materials_and_props": "树干树根、粗布包袱（放树根旁）、"
+                                   "黑衣人腰刀（冷光）、倒伏书童（暗红血迹）"
+                                   "、林地落叶。",
+            "lighting": "树林低照度、阴冷侧光，斑驳透光，刀刃冷光反射，"
+                        "血迹暗红反光。",
+            "story_function": "让林川撞破凶案并进入危险。",
+        },
+    }
+    prompt = app.director._scene_prompt(
+        "官道路旁树林", "电影级半写实", scene,
+        cast_names=("林川", "书童"))
+    for banned in ("书童", "林川", "黑衣人", "血", "凶案", "倒伏",
+                   "刀刃", "一名", "数名"):
+        assert banned not in prompt, banned
+    # 纯环境子句必须保留
+    assert "粗布包袱" in prompt
+    assert "偷窥遮挡角" in prompt
+    # 人名/事件被清空后,用途回退到通用空间表述
+    assert "当前场景图用途:建立本地点可复用的空间" in prompt
+
+
 def test_character_sheet_contract_is_single_subject(app):
     contract = app.director._character_sheet_composition_contract(
         "林川", "closeup")
