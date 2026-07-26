@@ -2983,6 +2983,19 @@ function planIsMock(item) {
   return item.status === "done" && item.real === false;
 }
 
+const CODEX_QC_ACTION_CN = {
+  targeted_redraw: "定向重画",
+  repair_contract: "先修镜头合同",
+  split_shot: "拆分镜头动作",
+  accept_current: "建议保留当前图",
+  manual_review: "人工确认",
+};
+
+function planCodexEscalation(item) {
+  const value = (planVisibleQc(item) || {}).codex_escalation;
+  return value && typeof value === "object" ? value : {};
+}
+
 function planQcBadge(item) {
   const qc = planVisibleQc(item);
   if (!qc) return "";
@@ -2990,6 +3003,11 @@ function planQcBadge(item) {
     return `<span class="plan-st st-manual" title="人工确认通过，原质检问题仍保留在审计记录">人工通过✓</span>`;
   if (qc.passed)
     return `<span class="plan-st st-qc-ok" title="视觉质检通过${qc.attempts > 1 ? `(重画 ${qc.attempts - 1} 次后通过)` : ""}">质检✓</span>`;
+  const codex = planCodexEscalation(item);
+  if (codex.status === "completed")
+    return `<span class="plan-st st-auto" title="${esc(codex.reason || "连续两次失败后已由 Codex 分析")}">🤖 Codex 已分析 · ${esc(CODEX_QC_ACTION_CN[codex.aifos_action] || codex.aifos_action || "待处理")}</span>`;
+  if (codex.status === "unavailable")
+    return `<span class="plan-st st-mock" title="${esc(codex.reason || "Codex 暂不可用")}">⚠ Codex 待接管</span>`;
   return `<span class="plan-st st-mock" title="${esc((qc.issues || []).join(";"))}">⚠ 质检未过</span>`;
 }
 
@@ -3002,10 +3020,21 @@ function planQcIssuesHtml(item) {
       ${issues.length ? `<span>原质检提示（已接受）：${esc(issues.join("；"))}</span>` : ""}</div>`;
   }
   if (qc.passed || !(qc.issues || []).length) return "";
-  const revision = qc.revision_feedback
+  const codex = planCodexEscalation(item);
+  const failureCount = Number(qc.consecutive_failures || 0);
+  const revision = qc.revision_feedback && codex.status !== "completed"
     ? `<div class="qc-revision"><b>自动优化修订：</b>${esc(qc.revision_feedback)}</div>` : "";
+  const codexNotice = codex.status === "completed"
+    ? `<div class="qc-revision qc-codex-notice"><b>Codex → AIFOS：</b>
+      ${esc(codex.instruction_to_aifos || "已完成分析，等待应用修改指令")}
+      <span class="dim">处理方式：${esc(CODEX_QC_ACTION_CN[codex.aifos_action] || codex.aifos_action || "待确认")}</span></div>`
+    : (codex.status === "unavailable"
+      ? `<div class="qc-revision qc-codex-notice"><b>Codex 暂未接管：</b>${esc(codex.reason || "分析通道暂不可用；已停止原样重画")}</div>`
+      : "");
   return `<div class="plan-err qc-fail-reason"><b>质检没有通过的原因：</b>${esc(qc.issues.join("；"))}
-    <span class="dim">(已自动重画 ${qc.attempts} 次仍未过,可改提示词手动重画)</span>${revision}</div>`;
+    <span class="dim">(${failureCount
+      ? `已连续失败 ${failureCount} 次`
+      : `已自动重画 ${Number(qc.attempts || 0)} 次仍未过`})</span>${codexNotice}${revision}</div>`;
 }
 
 function planQcReferenceGalleryHtml(item) {
@@ -4182,18 +4211,26 @@ function videoFailurePanelHtml(failures) {
 function imageFailurePanelHtml(data) {
   const failures = data.image_failures || [];
   if (!failures.length) return "";
+  const codexReviewed = failures.filter(
+    (failure) => failure.codex_escalation?.status === "completed").length;
   return `<section class="image-failure-panel" role="alert"
     aria-label="待人工问题清单">
     <div class="image-failure-heading">
-      <div><b>⚠ 待人工问题清单 · ${failures.length} 张关键帧</b>
-        <span>系统已自动定向修图 1 次；这些图仍未通过，但其他关键帧会继续生产。</span></div>
+      <div><b>⚠ 连续失败问题清单 · ${failures.length} 张关键帧</b>
+        <span>连续两次未通过会自动交给 Codex 联合分析原图、提示词和参考图；
+          Codex 已完成 ${codexReviewed} 张，并把定向修改指令回传给 AIFOS。</span></div>
       <div class="image-failure-actions">
         <button type="button" class="image-failure-batch"
           data-image-failure-batch>🛠 打开清单批量优化</button>
         <small>失败稿不会进入正式资产或 Seedance 参考链。</small>
       </div>
     </div>
-    <div class="image-failure-list">${failures.map((failure) => `
+    <div class="image-failure-list">${failures.map((failure) => {
+      const codex = failure.codex_escalation || {};
+      const action = CODEX_QC_ACTION_CN[codex.aifos_action]
+        || codex.aifos_action || "等待第二次结果";
+      const count = Number(failure.consecutive_failures || 0);
+      return `
       <article class="image-failure-item generation-issue-card"
         data-image-failure-item="${esc(failure.item_id || "")}">
         ${failure.failed_output_url ? `<button type="button"
@@ -4204,16 +4241,22 @@ function imageFailurePanelHtml(data) {
         <div class="image-failure-copy">
           <b>镜头 ${String(failure.shot_no).padStart(2, "0")}</b>
           <span>${esc((failure.issues || []).join("；") || "图片质检未通过")}</span>
-          <small>已自动修图 ${Number(failure.auto_repairs || 1)} 次后仍未过</small>
+          <small>${count ? `连续失败 ${count} 次` : `已自动修图 ${Number(failure.auto_repairs || 0)} 次`}
+            · ${codex.status === "completed" ? `Codex 已分析：${esc(action)}`
+              : (codex.status === "unavailable" ? "Codex 暂不可用，已停止盲目重画"
+                : "未达到两次时保留原质检流程")}</small>
+          ${codex.status === "completed" ? `<span class="qc-codex-inline">
+            <b>Codex → AIFOS：</b>${esc(codex.instruction_to_aifos || "")}</span>` : ""}
         </div>
         <button type="button" class="primary image-failure-jump"
           data-image-failure-shot="${failure.shot_no}">
-          跳到镜头并展开修改</button>
+          ${codex.status === "completed" ? `按 Codex 指令处理 · ${esc(action)}` : "跳到镜头并展开修改"}</button>
         <button type="button" class="image-failure-pass"
           data-image-failure-pass="${esc(failure.item_id || "")}">
           ✅ 人工通过</button>
         ${generationDiagnosisHtml(failure, "image")}
-      </article>`).join("")}</div>
+      </article>`;
+    }).join("")}</div>
   </section>`;
 }
 

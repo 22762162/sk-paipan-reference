@@ -409,6 +409,30 @@ def build_instruction(capability, payload, out_dir):
             "shot_no": payload.get("shot_no"),
             "frame_kind": payload.get("frame_kind", "keyframe"),
         }
+        escalation = payload.get("codex_escalation_context")
+        escalation = escalation if isinstance(escalation, dict) else {}
+        escalation_line = ""
+        escalation_schema = ""
+        if escalation:
+            escalation_line = (
+                "- 这是连续质检失败后的 Codex 升级分析，不是普通复检。"
+                f"连续失败次数={int(escalation.get('consecutive_failures') or 2)}；"
+                "必须先判断失败来自画面、提示词/参考图合同冲突，还是一个静态"
+                "关键帧无法同时承载多个先后动作。藏入袖内、被手掌或身体合理"
+                "遮挡的道具属于不可见状态，不能强迫画面把它展示出来；双手已"
+                "执行抱拳、拱手等占用动作时，也不能同时要求同一只手清楚展示"
+                "被遮挡道具。若合同要求在一张图里同时表现接取、检查、归还等"
+                "先后动作，应选择单一冻结瞬间或建议拆镜，不能继续盲目重画。"
+                "请用 codex_escalation.aifos_action 明确通知 AIFOS 下一步。\n")
+            escalation_schema = (
+                ', "codex_escalation": {"aifos_action":'
+                '"targeted_redraw/repair_contract/split_shot/'
+                'accept_current/manual_review",'
+                '"reason":"为什么这样处理","aifos_instructions":'
+                '["AIFOS下一步只需执行的具体修改"],'
+                '"freeze_moment":"静态关键帧唯一冻结瞬间",'
+                '"visible_props":["本帧必须可见的道具"],'
+                '"hidden_props":["本帧应隐藏或允许被遮挡的道具"]}')
         instruction = (
             f"你是漫剧图片质检员。用你的视觉能力查看图片文件 {image}"
             "(可直接读取该文件),逐项核对是否符合以下生产要求,"
@@ -424,7 +448,8 @@ def build_instruction(capability, payload, out_dir):
             "是否缺失或冲突。不得虚构未提交的输入。输入诊断仅作后续优化建议："
             "提示词重复、略长或参考图说明不够简洁，不得单独令 visual_pass 或"
             " pass 为 false。\n"
-            "- 质检阈值：按手机竖屏正常播放观看，禁止放大像素挑刺。只有普通观众"
+            + escalation_line
+            + "- 质检阈值：按手机竖屏正常播放观看，禁止放大像素挑刺。只有普通观众"
             "一眼可见、会影响身份识别、剧情理解或画面可信度的明显问题才失败："
             "明显错人/错性别/错人数、严重跑脸、关键服装/道具/场景/时代错误、"
             "剧情必需文字错误，以及明显肢体畸形、穿模、悬浮、设备反向或空间"
@@ -523,7 +548,9 @@ def build_instruction(capability, payload, out_dir):
             '"target_index":参考图编号整数,"role":"用途",'
             '"character":"角色名或空","replacement_selector":'
             '{"asset_id":已有资产ID或null,"role":"用途",'
-            '"character":"角色名或空"},"reason":"调整原因"}]}'
+            '"character":"角色名或空"},"reason":"调整原因"}]'
+            + escalation_schema
+            + '}'
         )
         return instruction, [], {"qc": True}
     if capability == "cover":

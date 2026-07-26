@@ -3235,6 +3235,237 @@ class Director:
         })
         return report
 
+    @staticmethod
+    def _previous_qc_failure_count(qc):
+        """Read the durable consecutive-failure count, including legacy rows."""
+        qc = qc if isinstance(qc, dict) else {}
+        if qc.get("passed") is True:
+            return 0
+        for key in (
+                "consecutive_failures", "previous_consecutive_failures"):
+            try:
+                value = int(qc.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
+        history = qc.get("attempt_history")
+        if isinstance(history, list):
+            trailing = 0
+            for row in reversed(history):
+                if not isinstance(row, dict) or row.get("qc_passed") is True:
+                    break
+                trailing += 1
+            if trailing:
+                return trailing
+        # Older integrated generation reports only stored ``attempts``.
+        try:
+            return max(0, int(qc.get("attempts") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _codex_escalation_action(raw, codex_report):
+        raw = raw if isinstance(raw, dict) else {}
+        aliases = {
+            "redraw": "targeted_redraw",
+            "redraw_current": "targeted_redraw",
+            "fix_prompt": "repair_contract",
+            "contract_repair": "repair_contract",
+            "split": "split_shot",
+            "accept": "accept_current",
+            "pass": "accept_current",
+        }
+        action = str(raw.get("aifos_action") or "").strip().lower()
+        action = aliases.get(action, action)
+        allowed = {
+            "targeted_redraw", "repair_contract", "split_shot",
+            "accept_current", "manual_review",
+        }
+        if action in allowed:
+            return action
+        if codex_report.get("passed"):
+            return "accept_current"
+        if targeted_prompt_patch(
+                codex_report.get("input_diagnosis") or {}):
+            return "targeted_redraw"
+        if codex_report.get("contract_repair_required"):
+            return "repair_contract"
+        return "manual_review"
+
+    def _escalate_failed_image_to_codex(
+            self, report, qc_spec, image_uri, generation_input, out_dir,
+            cancel=None, codex_profile="", existing_result=None,
+            existing_verdict=None):
+        """After two failures, let Codex diagnose and notify AIFOS.
+
+        This is analysis only.  It never launches a third image generation.
+        A targeted redraw may happen later, using ``instruction_to_aifos``.
+        """
+        report = copy.deepcopy(report or {})
+        failures = self._previous_qc_failure_count(report)
+        if report.get("passed") or failures < 2:
+            return report, 0.0
+        existing_provider = str(
+            getattr(existing_result, "provider", "") or "").strip()
+        existing_model = str(
+            getattr(existing_result, "model", "") or "").strip()
+        verdict = (
+            copy.deepcopy(existing_verdict)
+            if isinstance(existing_verdict, dict) else {})
+        codex_report = None
+        cost = 0.0
+        try:
+            if (existing_provider == "codex"
+                    and isinstance(verdict.get("codex_escalation"), dict)):
+                codex_report = self._assess_image_qc(
+                    qc_spec, verdict, int(report.get("attempts") or 1))
+            else:
+                payload = {
+                    **qc_spec,
+                    "image_uri": image_uri,
+                    "generation_input": copy.deepcopy(generation_input),
+                    "generation_prompt": generation_input.get("prompt", ""),
+                    "reference_manifest": copy.deepcopy(
+                        generation_input.get("reference_manifest") or []),
+                    "required_provider": "codex",
+                    "_codex_profile": str(codex_profile or ""),
+                    "codex_escalation_context": {
+                        "consecutive_failures": failures,
+                        "previous_issues": list(report.get("issues") or []),
+                    },
+                }
+                codex_result = self.router.call(
+                    "image_qc", payload, out_dir, cancel=cancel)
+                cost = float(codex_result.cost or 0.0)
+                existing_provider = codex_result.provider
+                existing_model = (
+                    getattr(codex_result, "model", "") or "")
+                verdict = copy.deepcopy(codex_result.data or {})
+                codex_report = self._assess_image_qc(
+                    qc_spec, verdict, int(report.get("attempts") or 1))
+        except (ProviderUnavailable, ProviderError) as exc:
+            reason = str(exc)[:600]
+            report.update({
+                "redraw_required": False,
+                "production_ready": False,
+                "retry_blocked": True,
+                "retry_blocked_reason": (
+                    "连续两次质检未过，但 Codex 分析暂不可用；"
+                    "已禁止原样继续重画"),
+                "codex_escalation": {
+                    "schema": "aifos.codex-qc-escalation/v1",
+                    "triggered": True,
+                    "status": "unavailable",
+                    "trigger": "consecutive_qc_failures",
+                    "consecutive_failures": failures,
+                    "provider": "codex",
+                    "reason": reason,
+                    "aifos_action": "manual_review",
+                    "instruction_to_aifos": "",
+                    "analyzed_at": now(),
+                },
+            })
+            return report, cost
+
+        raw_escalation = verdict.get("codex_escalation")
+        raw_escalation = (
+            raw_escalation if isinstance(raw_escalation, dict) else {})
+        action = self._codex_escalation_action(
+            raw_escalation, codex_report)
+        raw_instructions = raw_escalation.get("aifos_instructions")
+        if isinstance(raw_instructions, str):
+            raw_instructions = [raw_instructions]
+        instructions = [
+            re.sub(r"\s+", " ", str(value or "")).strip()[:800]
+            for value in (
+                raw_instructions if isinstance(raw_instructions, list)
+                else [])
+            if str(value or "").strip()
+        ][:8]
+        patch = targeted_prompt_patch(
+            codex_report.get("input_diagnosis") or {})
+        if instructions:
+            instruction = (
+                "【Codex 通知 AIFOS】" + "；".join(instructions)
+                + "\n【范围】只修改当前镜头")
+        elif patch:
+            instruction = patch
+        elif action == "accept_current":
+            instruction = (
+                "【Codex 通知 AIFOS】当前失败来自质检合同冲突，"
+                "不要继续原样重画；保留当前图等待确认。")
+        else:
+            instruction = (
+                "【Codex 通知 AIFOS】先修复当前镜头合同或拆分动作，"
+                "确认唯一静态冻结瞬间后再重画。")
+        reason = re.sub(
+            r"\s+", " ", str(raw_escalation.get("reason") or (
+                (codex_report.get("image_error") or {}).get("summary")
+                or "连续失败后已完成画面、提示词和参考图联合诊断"
+            ))).strip()[:1200]
+
+        def escalation_list(key):
+            values = raw_escalation.get(key) or []
+            if isinstance(values, str):
+                values = [values]
+            if not isinstance(values, list):
+                return []
+            return [
+                re.sub(r"\s+", " ", str(value or "")).strip()[:160]
+                for value in values if str(value or "").strip()
+            ][:12]
+
+        # The Codex diagnosis becomes the authoritative next-input contract,
+        # while the earlier visual verdict remains in the audit trail.
+        report["pre_codex_input_diagnosis"] = copy.deepcopy(
+            report.get("input_diagnosis") or {})
+        for key in (
+                "input_diagnosis", "image_error", "prompt_diagnosis",
+                "reference_diagnosis", "targeted_prompt_patch",
+                "reference_adjustments", "diagnosis_complete"):
+            if key in codex_report:
+                report[key] = copy.deepcopy(codex_report[key])
+        report.update({
+            "production_ready": False,
+            "redraw_required": action == "targeted_redraw",
+            "contract_repair_required": action in {
+                "repair_contract", "split_shot"},
+            "retry_blocked": True,
+            "retry_blocked_reason": (
+                f"连续 {failures} 次质检未过，已由 Codex 分析；"
+                "禁止没有应用 Codex 指令的原样重画"),
+            "revision_feedback": instruction[:2400],
+            "auto_repair_exhausted": True,
+            "codex_escalation": {
+                "schema": "aifos.codex-qc-escalation/v1",
+                "triggered": True,
+                "status": "completed",
+                "trigger": "consecutive_qc_failures",
+                "consecutive_failures": failures,
+                "provider": existing_provider or "codex",
+                "model": existing_model or "Codex 视觉质检",
+                "aifos_action": action,
+                "reason": reason,
+                "aifos_instructions": instructions,
+                "instruction_to_aifos": instruction[:2400],
+                "freeze_moment": str(
+                    raw_escalation.get("freeze_moment") or "")[:600],
+                "visible_props": escalation_list("visible_props"),
+                "hidden_props": escalation_list("hidden_props"),
+                "issues": list(codex_report.get("issues") or [])[:16],
+                "analyzed_at": now(),
+            },
+            "retry_decision": {
+                "action": action,
+                "source": "codex_escalation",
+                "retry_blocked": True,
+                "retry_blocked_reason": (
+                    "必须先应用 Codex 回传的 AIFOS 修改指令"),
+            },
+        })
+        return report, cost
+
     def _generate_image_with_qc(self, capability, payload, out_dir,
                                 cancel, qc_spec):
         """出图 + 视觉质检 + 不合格自动重画(worker 线程安全:只调产线)。
@@ -3244,6 +3475,11 @@ class Director:
         spent = 0.0
         attempt_history = []
         payload = copy.deepcopy(payload or {})
+        try:
+            failure_count_base = max(
+                0, int(payload.get("qc_consecutive_failures_base") or 0))
+        except (TypeError, ValueError):
+            failure_count_base = 0
         if payload.get("character_sheet"):
             payload["feedback"] = self._sheet_feedback_for_key(
                 payload.get("feedback"), payload.get("character_sheet"))
@@ -3412,7 +3648,30 @@ class Director:
             if not report["passed"]:
                 lesson_issues.extend(report["issues"])
             report["lesson_issues"] = list(dict.fromkeys(lesson_issues))
+            trailing_failures = 0
+            for row in reversed(attempt_history):
+                if row.get("qc_passed") is True:
+                    break
+                trailing_failures += 1
+            report["consecutive_failures"] = (
+                0 if report["passed"]
+                else failure_count_base + trailing_failures)
+            report["qc_provider"] = qc_result.provider
+            report["qc_model"] = (
+                getattr(qc_result, "model", "") or "")
             result.qc = report
+            if (not report["passed"]
+                    and report["consecutive_failures"] >= 2):
+                report, escalation_cost = \
+                    self._escalate_failed_image_to_codex(
+                        report, qc_spec, uri, generation_input, out_dir,
+                        cancel=cancel,
+                        codex_profile=payload.get("_codex_profile", ""),
+                        existing_result=qc_result,
+                        existing_verdict=qc_result.data or {})
+                result.cost += escalation_cost
+                result.qc = report
+                return result
             if (report["passed"] or not report["redraw_required"]
                     or attempts >= self._qc_retries()):
                 return result
@@ -3552,6 +3811,18 @@ class Director:
     def _critical_qc_error(result):
         qc = getattr(result, "qc", None) or {}
         if qc.get("passed") is False:
+            codex = qc.get("codex_escalation") or {}
+            if codex.get("status") == "completed":
+                return (
+                    "图片连续两次质检未通过，Codex 已完成升级分析并通知 "
+                    f"AIFOS 执行 {codex.get('aifos_action', 'manual_review')}:"
+                    + str(codex.get("instruction_to_aifos") or "")
+                    + "；".join(qc.get("issues") or []))
+            if codex.get("status") == "unavailable":
+                return (
+                    "图片连续两次质检未通过，Codex 分析暂不可用；"
+                    "已禁止原样继续重画:"
+                    + str(codex.get("reason") or ""))
             if (qc.get("contract_repair_required")
                     and not qc.get("redraw_required")):
                 return (
@@ -10385,18 +10656,25 @@ class Director:
         }.get(kind, lambda: "")()
         plan_item = None
         plan_diagnostics = {}
+        qc_failure_base = 0
         if item_id:
             plan_item = next(
                 (entry for entry in self._plan_read(ctx)["items"]
                  if entry.get("id") == item_id), None)
             old_qc = (plan_item or {}).get("qc") or {}
+            qc_failure_base = self._previous_qc_failure_count(old_qc)
             plan_diagnostics = normalize_generation_diagnostics(
                 old_qc.get("input_diagnosis") or {},
                 issues=old_qc.get("issues"))
-            auto_revision = old_qc.get("revision_feedback") or ""
+            codex_escalation = old_qc.get("codex_escalation") or {}
+            codex_instruction = (
+                codex_escalation.get("instruction_to_aifos")
+                if isinstance(codex_escalation, dict) else "")
+            auto_revision = (
+                codex_instruction or old_qc.get("revision_feedback") or "")
             # 兼容旧版计划:旧版本把“电脑屏幕空白”落成 generic。每次手动
             # 重画都依据当前质检原因重新编译，不能继续沿用旧的泛化提示。
-            if old_qc.get("issues"):
+            if old_qc.get("issues") and not codex_instruction:
                 refreshed_revision = optimize_qc_feedback(
                     old_qc.get("issues") or [], mode="image",
                     diagnostics=(
@@ -10571,6 +10849,7 @@ class Director:
                 ctx, shot, quality_override=quality_choice,
                 item_id=f"shot:{shot_no}")
             payload["feedback"] = feedback
+            payload["qc_consecutive_failures_base"] = qc_failure_base
             payload["revision"] = next_revision(
                 "image", self._shot_name(ctx, shot_no))
             if prompt_override:
@@ -10721,6 +11000,7 @@ class Director:
             payload["seedance_prompt"] = payload["prompt"]
             payload["frame_kind"] = kind
             payload["feedback"] = feedback
+            payload["qc_consecutive_failures_base"] = qc_failure_base
             payload["revision"] = next_revision(kind, asset_name)
 
             rows = [
@@ -11513,6 +11793,7 @@ class Director:
         signature = self._qc_signature(
             uris, spec, generation_input=generation_input)
         previous = item.get("qc") or {}
+        previous_failures = self._previous_qc_failure_count(previous)
         if previous.get("signature") == signature \
                 and "passed" in previous:
             cached = dict(previous)
@@ -11541,6 +11822,10 @@ class Director:
         image_passed_all = True
         input_contract_passed_all = True
         input_diagnoses = []
+        qc_providers = []
+        failed_qc_result = None
+        failed_qc_verdict = {}
+        failed_qc_uri = uri
         try:
             for label, one in uris:
                 result = self.router.call(
@@ -11557,14 +11842,25 @@ class Director:
                 cost += result.cost
                 one_report = self._assess_image_qc(
                     spec, result.data or {}, 1)
+                qc_providers.append({
+                    "frame": label,
+                    "provider": result.provider,
+                    "model": getattr(result, "model", "") or "",
+                })
                 input_diagnoses.append({
                     "frame": label,
+                    "provider": result.provider,
+                    "model": getattr(result, "model", "") or "",
                     "passed": bool(one_report["passed"]),
                     "image_passed": bool(one_report["image_passed"]),
                     "input_contract_passed": bool(
                         one_report["input_contract_passed"]),
                     **copy.deepcopy(one_report["input_diagnosis"]),
                 })
+                if not one_report["passed"] and failed_qc_result is None:
+                    failed_qc_result = result
+                    failed_qc_verdict = copy.deepcopy(result.data or {})
+                    failed_qc_uri = one
                 passed_all = passed_all and one_report["passed"]
                 image_passed_all = (
                     image_passed_all and one_report["image_passed"])
@@ -11602,7 +11898,14 @@ class Director:
         except (ProviderUnavailable, ProviderError) as exc:
             raise AifosError(f"质检产线不可用: {exc}") from exc
         report = {"passed": passed_all, "issues": issues,
-                  "attempts": previous.get("attempts", 0),
+                  "attempts": max(
+                      1, int(previous.get("attempts") or 0)),
+                  "consecutive_failures": (
+                      0 if passed_all else previous_failures + 1),
+                  "qc_providers": qc_providers,
+                  "qc_provider": (
+                      qc_providers[0]["provider"]
+                      if len(qc_providers) == 1 else "mixed"),
                   "identity_checked": identity_checked_all,
                   "identity_match": identity_match_all,
                   "gender_checked": gender_checked_all,
@@ -11638,6 +11941,15 @@ class Director:
             diagnostics=report.get("input_diagnosis"))
         report["revision_feedback"] = revision["text"]
         report["revision_categories"] = revision["categories"]
+        if not report["passed"] and report["consecutive_failures"] >= 2:
+            report, escalation_cost = self._escalate_failed_image_to_codex(
+                report, spec, failed_qc_uri, generation_input,
+                ctx["out_root"],
+                cancel=lambda: self._cancel_requested(ctx),
+                codex_profile=codex_profile,
+                existing_result=failed_qc_result,
+                existing_verdict=failed_qc_verdict)
+            cost += escalation_cost
         self.projects.add_episode_cost(episode["id"], cost)
         self._plan_mark(ctx, item["id"], item.get("status", "done"),
                         extra={"qc": report})
@@ -11651,6 +11963,12 @@ class Director:
     def _auto_repair_qc_item(self, project, episode, ctx, item, report):
         """身份/性别/人数硬错误：以失败图为基底自动修图并立即复检。"""
         if report.get("passed") or not report.get("hard_failure"):
+            return report, 0
+        if (self._previous_qc_failure_count(report) >= 2
+                or (report.get("codex_escalation") or {}).get("triggered")):
+            # The second failure has already been handed to Codex.  Do not
+            # spend a third image call until AIFOS applies its returned
+            # instruction (or the contract is repaired/split).
             return report, 0
         repaired = 0
         current = report
@@ -11711,7 +12029,9 @@ class Director:
                 if candidate["id"] == item["id"]), item)
             current = self._qc_one(
                 project, episode, ctx, refreshed)
-            if current.get("passed") or not current.get("hard_failure"):
+            if (current.get("passed") or not current.get("hard_failure")
+                    or (current.get("codex_escalation") or {}).get(
+                        "triggered")):
                 break
         current = dict(current)
         current["auto_repaired"] = repaired
@@ -11744,6 +12064,8 @@ class Director:
                 "issues": ["分镜合同已更新，旧图正在按当前人物、人数和空间图重新质检"],
                 "previous_passed": old_qc.get("passed"),
                 "previous_signature": old_qc.get("signature", ""),
+                "previous_consecutive_failures":
+                    self._previous_qc_failure_count(old_qc),
             }
             self._plan_mark(
                 ctx, item["id"], "retrying",
@@ -12084,7 +12406,12 @@ class Director:
                     return {"index": index, "item_id": item_id,
                             "label": label, "failed": True,
                             "error": "无法解析批量重画目标"}
-                issues = list((item.get("qc") or {}).get("issues") or [])
+                item_qc = item.get("qc") or {}
+                issues = list(item_qc.get("issues") or [])
+                codex_escalation = item_qc.get("codex_escalation") or {}
+                codex_instruction = (
+                    codex_escalation.get("instruction_to_aifos")
+                    if isinstance(codex_escalation, dict) else "")
                 if not only_failed:
                     shot = shot_by_no.get(
                         int(target.get("shot_no") or 0))
@@ -12110,6 +12437,9 @@ class Director:
                         "身份图中的旧服装；服装只服从本镜当前服装参考；"
                         "其余人数、站位、机位、动作、道具和场景服从当前合同")
                     revision_source = "batch_current_contract"
+                elif codex_instruction:
+                    feedback = str(codex_instruction)[:2400]
+                    revision_source = "codex_escalation"
                 elif issues:
                     revision = optimize_qc_feedback(issues, mode="image")
                     feedback = revision["text"][:1600]

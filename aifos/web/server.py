@@ -520,6 +520,8 @@ def _generation_diagnostic_payload(item, qc=None):
             first_value("attempt_history", default=[])) or [],
         "retry_decision": _safe_diagnostic_value(decision) or {},
         "retry_blocked_reason": _safe_diagnostic_text(blocked_reason),
+        "codex_escalation": _safe_diagnostic_value(
+            first_value("codex_escalation", default={})) or {},
     }
 
 
@@ -1922,6 +1924,12 @@ def _episode_payload(app, episode_id, jobs=None):
                         item.get("label", ""), limit=240),
                     "status": item.get("status"),
                     "attempts": int(qc.get("attempts") or 0),
+                    "consecutive_failures": int(
+                        qc.get("consecutive_failures")
+                        or qc.get("previous_consecutive_failures")
+                        or 0),
+                    "qc_provider": _safe_diagnostic_text(
+                        qc.get("qc_provider", ""), limit=80),
                     "auto_repairs": int(qc.get("auto_repairs") or max(
                         0, int(qc.get("attempts") or 1) - 1)),
                     "issues": _safe_diagnostic_value(issues) or [],

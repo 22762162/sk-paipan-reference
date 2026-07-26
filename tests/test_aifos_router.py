@@ -79,3 +79,18 @@ def test_no_provider_available_raises(make_app):
     with pytest.raises(ProviderUnavailable):
         app.router.call("video", {"shot_no": 1},
                         app.workspace.artifacts_dir)
+
+
+def test_required_provider_forces_codex_analysis_without_fallback(make_app):
+    app = make_app({
+        "providers": {"codex": {
+            "enabled": True, "command": OK_CLI, "quota": 10}},
+        "routing": {"image_qc": ["mock", "codex"]},
+    })
+
+    result = app.router.call(
+        "image_qc",
+        {"image_uri": "/tmp/failed.png", "required_provider": "codex"},
+        app.workspace.artifacts_dir)
+
+    assert result.provider == "codex"

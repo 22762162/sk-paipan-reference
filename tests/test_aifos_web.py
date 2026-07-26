@@ -517,8 +517,16 @@ def test_episode_exposes_image_failures_with_artifact_urls(server):
                 "passed": False,
                 "awaiting_human": True,
                 "attempts": 2,
+                "consecutive_failures": 2,
                 "issues": ["人物多出一人", "服装颜色与定版不一致"],
                 "revision_feedback": f"按失败稿 {failed} 定向修正人数",
+                "codex_escalation": {
+                    "status": "completed",
+                    "provider": "codex",
+                    "aifos_action": "targeted_redraw",
+                    "reason": "人数合同明确，画面多出第三人",
+                    "instruction_to_aifos": "只保留两名已登记角色",
+                },
                 "input_diagnosis": {
                     "image_error": {
                         "summary": "右侧出现多余人物",
@@ -562,6 +570,12 @@ def test_episode_exposes_image_failures_with_artifact_urls(server):
     failure = detail["image_failures"][0]
     assert failure["item_id"] == "shot:7"
     assert failure["shot_no"] == 7
+    assert failure["consecutive_failures"] == 2
+    assert failure["codex_escalation"]["status"] == "completed"
+    assert failure["codex_escalation"]["aifos_action"] == \
+        "targeted_redraw"
+    assert failure["codex_escalation"]["instruction_to_aifos"] == \
+        "只保留两名已登记角色"
     assert failure["issues"] == ["人物多出一人", "服装颜色与定版不一致"]
     assert failure["input_diagnosis"]["prompt_audit"]["status"] == \
         "conflicting"

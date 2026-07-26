@@ -1220,6 +1220,15 @@ button.canvas-stage-item:hover, button.canvas-stage-item:focus-visible {
 .image-failure-copy b { color: #fff; font-size: 12px; }
 .image-failure-copy span { color: #ffd1d1; font-size: 11px; line-height: 1.5; }
 .image-failure-copy small { color: #ffabab; font-size: 10px; }
+.image-failure-copy .qc-codex-inline,
+.qc-codex-notice {
+  display: grid; gap: 3px; margin-top: 4px; padding: 7px 9px;
+  border: 1px solid rgba(57, 135, 229, .42); border-radius: 7px;
+  background: rgba(57, 135, 229, .1); color: #cfe4ff;
+  overflow-wrap: anywhere;
+}
+.image-failure-copy .qc-codex-inline b,
+.qc-codex-notice b { color: #8fc5ff; }
 .image-failure-jump { min-height: 36px; white-space: nowrap; }
 .image-failure-pass {
   min-height: 36px; padding: 6px 9px; white-space: nowrap; cursor: pointer;
