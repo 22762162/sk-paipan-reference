@@ -54,18 +54,28 @@ DEFAULT_STANDARD = {
             "time_precision_seconds": 0.5,
             "prompt_strategy": "five_dimensions_per_segment",
             "prompt_contract": {
-                "schema": "aifos.shot-prompt/v2",
+                "schema": "aifos.shot-prompt/v2.2",
                 "order": [
-                    "subject", "scene", "start", "single_action",
-                    "performance", "camera", "end", "dialogue", "text",
-                    "references", "hard_constraints",
+                    "subject", "scene", "frame_target", "start",
+                    "character_conditions", "prop_registry", "frame_props",
+                    "single_action", "performance", "camera",
+                    "prop_transitions", "end",
+                    "dialogue", "text", "references", "hard_constraints",
                 ],
                 "single_primary_action": True,
                 "single_camera_move": True,
+                "static_frame_target_required": True,
+                "validation_statuses": ["PASS", "WARN", "BLOCK"],
+                "headwear_fields": [
+                    "presence", "kind", "name", "hair_visibility"],
+                "character_condition_dimensions": [
+                    "life_state", "consciousness_state",
+                    "embodiment", "mobility"],
+                "prop_contract_schema": "aifos.prop-contract/v2.2",
                 "compact_prompt_sent_to_model": True,
                 "full_prompt_kept_for_audit": True,
                 "reference_roles": [
-                    "identity", "wardrobe", "scene", "composition",
+                    "identity", "wardrobe", "prop", "scene", "composition",
                     "spatial_blocking", "continuity", "style",
                     "inner_persona",
                 ],
@@ -514,8 +524,13 @@ class StandardCenter:
             production, "prompt_contract", "rules.production.prompt_contract")
         nonempty_string(
             prompt_contract, "schema", "rules.production.prompt_contract.schema")
+        if prompt_contract.get("schema") != "aifos.shot-prompt/v2.2":
+            issue(
+                "rules.production.prompt_contract.schema",
+                "镜头提示词合同必须是 aifos.shot-prompt/v2.2")
         for key in (
                 "single_primary_action", "single_camera_move",
+                "static_frame_target_required",
                 "compact_prompt_sent_to_model", "full_prompt_kept_for_audit"):
             bool_field(
                 prompt_contract, key,
@@ -533,10 +548,27 @@ class StandardCenter:
             issue(
                 "rules.production.prompt_contract.reference_roles",
                 "必须是非空参考图职责列表")
-        if prompt_contract.get("schema") == "aifos.shot-prompt/v1":
+        if prompt_contract.get("validation_statuses") != [
+                "PASS", "WARN", "BLOCK"]:
             issue(
-                "rules.production.prompt_contract.schema",
-                "镜头提示词合同已升级为 aifos.shot-prompt/v2")
+                "rules.production.prompt_contract.validation_statuses",
+                "必须严格为 PASS/WARN/BLOCK")
+        for field, required in (
+                ("headwear_fields", {
+                    "presence", "kind", "name", "hair_visibility"}),
+                ("character_condition_dimensions", {
+                    "life_state", "consciousness_state",
+                    "embodiment", "mobility"})):
+            values = prompt_contract.get(field)
+            if not isinstance(values, list) or set(values) != required:
+                issue(
+                    f"rules.production.prompt_contract.{field}",
+                    "字段集合与 v2.2 规范不一致")
+        if (prompt_contract.get("prop_contract_schema")
+                != "aifos.prop-contract/v2.2"):
+            issue(
+                "rules.production.prompt_contract.prop_contract_schema",
+                "必须是 aifos.prop-contract/v2.2")
         preferred = numeric_pair(
             production, "preferred_segment_seconds",
             "rules.production.preferred_segment_seconds", minimum=0.5,
@@ -1006,11 +1038,20 @@ class StandardCenter:
                     production_rules[key] = copy.deepcopy(value)
                     changed = True
             prompt_contract = production_rules.get("prompt_contract")
-            if (isinstance(prompt_contract, dict)
-                    and prompt_contract.get("schema")
-                    == "aifos.shot-prompt/v1"):
-                prompt_contract["schema"] = "aifos.shot-prompt/v2"
+            prompt_defaults = production_defaults["prompt_contract"]
+            if not isinstance(prompt_contract, dict):
+                production_rules["prompt_contract"] = copy.deepcopy(
+                    prompt_defaults)
                 changed = True
+            else:
+                if prompt_contract.get("schema") != (
+                        "aifos.shot-prompt/v2.2"):
+                    prompt_contract["schema"] = "aifos.shot-prompt/v2.2"
+                    changed = True
+                for key, value in prompt_defaults.items():
+                    if key not in prompt_contract:
+                        prompt_contract[key] = copy.deepcopy(value)
+                        changed = True
         source = content.get("source_skill")
         source_defaults = DEFAULT_STANDARD["source_skill"]
         if (isinstance(source, dict)

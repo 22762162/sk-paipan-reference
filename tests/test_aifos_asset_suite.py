@@ -153,7 +153,7 @@ def test_story_bible_stays_in_continuity_but_not_shot_provider_prompt(app):
         encoding="utf-8"))
     shot = next(item for item in plan["items"]
                 if item["category"] == "shot_image")
-    assert "【镜头合同v2.1】" in shot["prompt"]
+    assert "【镜头合同v2.2】" in shot["prompt"]
     assert shot["prompt"].count("【定格状态】") == 1
     assert all(
         label not in shot["prompt"]

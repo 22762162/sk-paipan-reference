@@ -75,7 +75,7 @@ def _functional_figures(payload):
 
 
 def _population_counts(payload):
-    """Resolve v2.1 population first, then legacy payload fields."""
+    """Resolve the current structured population first, then legacy fields."""
     contract = payload.get("prompt_contract")
     contract = contract if isinstance(contract, dict) else {}
     population = contract.get("population")
@@ -124,7 +124,7 @@ def _population_line(payload):
         + (f"({item.get('state') or item.get('function')})"
            if item.get("state") or item.get("function") else "")
         for item in figures
-    ) or ("按v2.1人口合同" if functional else "无")
+    ) or ("按v2.2人口合同" if functional else "无")
     return (
         f"登记角色{registered}人（{names}）；功能人物{functional}人"
         f"（{figure_text}）；画面可见真人严格共{visible}人。"

@@ -21,7 +21,13 @@ from pathlib import Path
 from ..generation_diagnostics import normalize_generation_diagnostics
 from ..speaker_labels import is_non_person_label
 from ..inner_persona import normalize_inner_persona_policy
-from ..story_logic import normalize_script_logic
+from ..story_logic import (
+    PROP_CONTRACT_SCHEMA,
+    audit_prop_contract,
+    audit_storyboard_prop_contract,
+    normalize_prop_contract,
+    normalize_script_logic,
+)
 from ..story_analysis import STORY_ANALYSIS_SCHEMA, validate_story_analysis
 from ..script_import import sanitize_script_entities
 
@@ -48,6 +54,13 @@ SCRIPT_PROMPT = """你是兼具顶级类型片编剧、影视导演、场面调�
   后续镜头的核心道具；每件写清剧情功能、外形结构、时代材质、持有人与状态变化，
   并固定 `candidate_count:4` 供人工四选一。一次性普通小物只写进场次道具台账，
   不得为了凑资产而列入 `core_props`;
+- 同时建立 `aifos.prop-contract/v2.2` 的 `prop_registry`。只登记核心、剧情敏感或
+  必须跨镜追踪的物理实例，不登记普通布景陈设；每件必须有稳定且全片唯一的
+  `prop_id`，同名同款的两件实物也必须使用两个不同 ID。必须写 `kind`、
+  `instance_count:1`、可与分镜 `event_id` 对齐的 `introduced_at` /
+  `availability_start_event`、可选 `retired_at` / `availability_end_event`，
+  以及明确 `disclosure_policy`。事件引用必须使用稳定 event_id，禁止只写会因
+  重排而变化的 shot_no;
 - 每场必须明确人物信息状态：本场开始时各自知道什么、不知道什么、通过何种
   可见证据新获知什么；禁止角色突然知道未听见、未看见、未被告知的内容;
 - 每场必须明确时间关系和动作耗时。上一场出口、本场入口、本场出口和下一场入口
@@ -127,7 +140,14 @@ JSON 格式(字段必须齐全):
    "cast_dedup": {{"compared_with":["其他角色"],"dimensions":["发型","服装结构","身体特征","视觉符号","核心配饰","气质关键词"],"status":"passed","conflicts":[]}}}},
   {{"name": "路人功能名", "role": "背景路人",
    "crowd_function": "在哪一场以几人、什么剧情功能短暂出现;无独立人物资产"}}],
- "core_props": [{{"name":"核心道具唯一名称",
+ "prop_contract_schema":"aifos.prop-contract/v2.2",
+ "prop_registry":[{{"prop_id":"稳定且唯一的道具实例ID","name":"全剧唯一实例显示名称",
+   "kind":"core/plot_sensitive/identity_prop","instance_count":1,
+   "introduced_at":{{"event_id":"稳定剧情事件ID","phase":"start"}},
+   "availability_start_event":{{"event_id":"同一稳定剧情事件ID","phase":"start"}},
+   "retired_at":null,"availability_end_event":null,
+   "disclosure_policy":"explicit_frame_only/conceal_until_introduced/available_after_introduction/never_visualize"}}],
+ "core_props": [{{"prop_id":"与prop_registry一致的稳定ID","name":"核心道具唯一名称",
    "story_function":"为什么会影响多镜头或核心剧情",
    "visual_design":"可直接画出的外形、结构、尺寸级别与识别点",
    "era_material":"符合世界观的材质、工艺和磨损",
@@ -149,7 +169,7 @@ JSON 格式(字段必须齐全):
    "shootability": "核心事件如何由镜头直接拍出",
    "local_rewrite_policy": "逻辑返编时如何锁定前后边界、分析影响并只使受影响资产失效",
    "self_reviewed": true}},
- "scenes": [{{"scene_no": 1, "location": "地点",
+ "scenes": [{{"scene_no": 1, "event_id":"稳定场次事件ID","location": "地点",
    "characters": ["出场角色名"], "action": "本场动作描述",
    "director_logic": {{
      "dramatic_function": "本场给观众带来的新信息/冲突/转折",
@@ -257,18 +277,43 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
   衣服但无默认道具，表情动作可以夸张；比例固定为大头小身，约1.8头身，
   头占总高约58%，身体与四肢明显小于头；内心发声时真人宿主闭口且不生成字幕；
 - shot_no 从 1 连续编号；duration 单位秒，优先 5-8 秒，最长 15 秒；
+- 每镜必须输出 `frame_targets`，分别锁定 keyframe、first_frame、last_frame
+  三种静态用途；每项只含一个 phase(start/end/freeze) 和一个可见、可拍、
+  无时间过程的 state，并明确 fallback:false。人物镜可引用已经写清的起止状态，
+  空镜也必须写场景、光线、陈设和环境变化完成后的唯一静态结果；禁止把“走过去、
+  拿起来、从躺到坐”等动作过程直接当静态定格；
 - prompt 只含本镜头真正可见且会影响生成的世界状态、场景、准确人物名单、主体动作、
   光影、机位与结尾状态；不得复制整集前情、其他镜头、人物传记或无关道具；
+- 保留剧本 `prop_registry` 的 prop_id、名称、实例身份和场次生命周期边界；
+  可把 availability_start/end 从源场次边界细化到同一场内的准确镜头 event_id，
+  不得跨场移动、改名、删项或复制。每镜输出稳定且唯一的 `event_id`。仅对本镜
+  实际相关的已登记剧情道具输出结构化 `frame_props`，不得
+  通过全文搜索道具名猜测状态，也不得把未登记的普通布景陈设强行纳入该合同；
+  每项必须写 prop_id、phase(start/end/freeze)、physical_state、holder、location、
+  support、visibility(visible/occluded/hidden/absent) 和
+  representation(physical/reflection/screen/painting/overlay)。反射、屏幕、画中画
+  和叠层都算剧情披露，但不算第二件物理实例；hidden/absent 不得偷画成背景露角;
+- 同一道具在 start/end 的持有人、位置、支撑、可见性、呈现方式或物理状态发生
+  变化时，必须输出 `prop_transitions`，写明 prop_id、from_phase、to_phase 和
+  唯一可见 action。静态 freeze 不写跨时间动作；同一 phase 的 physical 实体数
+  不得重复；多件同款物品必须分别登记不同 prop_id;
 - 每个镜头必须额外输出 `physical_logic`，只写本镜可见的物理/空间事实：人物、
   道具、桌面/地面、镜头的相对位置，使用方向、接触点、视线和动作可达性；
   涉及电脑/手机/屏幕时必须明确屏幕正面、键盘/手部、使用者和摄影机同侧关系，
   禁止人物坐在屏幕后方却看到屏幕正面等反向构图；
 - 每个有角色的镜头必须输出 `start_state` 和 `end_state`，按角色名分别写
-  pose、position、direction、prop、injury、emotion、wardrobe、headwear、
-  hair_makeup；服装、头饰、妆发必须写当前镜头唯一可见状态，不能把多套剧情
+  pose、position、direction、prop、injury、emotion、wardrobe、结构化
+  headwear(presence:none/worn、kind、name)、hair_visibility 和 hair_makeup；
+  同时写 condition 的 life_state(alive/dead/nonliving)、
+  consciousness_state(awake/asleep/unconscious/not_applicable)、
+  embodiment(physical/statue/portrait/imagined/overlay)、
+  mobility(active/limited/immobile/not_applicable)。服装、头饰、妆发和人物状态
+  必须写当前镜头唯一可见状态，不能把多套剧情
   造型同时塞入同一镜。姿态必须说明站/坐/跪/躺/伏案及真实支撑面，终态必须
   被下一镜逐项继承；没有明确换装/摘戴/改妆动作时，下一镜不得改动 wardrobe、
-  headwear 或 hair_makeup。空镜输出空对象；
+  headwear、hair_visibility 或 hair_makeup；没有醒来、入睡、昏迷、死亡等
+  明确过程时不得改变 condition。睡眠/昏迷/死亡/非生命形态不得出现与状态
+  冲突的注视、眨眼、说话、主动动作或微表情。空镜输出空对象；
 - prompt 中人物形态按人物设定描写(名字只是称呼,「小鹿」若设定为
   人类不能当动物写;设定为动物/精怪的按设定写,全片保持一致);
 - 不生成对白字幕。手机屏、弹幕、合同等可读文字只描述载体与准确文字，
@@ -279,7 +324,16 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
 - 只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块。
 
 JSON 格式:
-{{"episode_title": "...", "shots": [{{"shot_no": 1, "scene_no": 1,
+{{"episode_title": "...","prop_contract_schema":"aifos.prop-contract/v2.2",
+ "prop_registry":[{{"prop_id":"稳定道具实例ID","name":"全剧唯一实例显示名称",
+   "kind":"core/plot_sensitive/identity_prop","instance_count":1,
+   "introduced_at":{{"event_id":"同一源场次内首次可披露的准确镜头event_id","phase":"start"}},
+   "availability_start_event":{{"event_id":"同一准确镜头event_id","phase":"start"}},
+   "retired_at":null,"availability_end_event":null,
+   "disclosure_policy":"explicit_frame_only"}}],
+ "shots": [{{"shot_no": 1, "scene_no": 1,
+  "scene_event_id":"源剧本对应场次的稳定event_id",
+  "event_id":"稳定且唯一的镜头事件ID",
   "kind": "environment", "description": "...", "camera": "镜头语言",
   "duration": 2.5, "characters": ["角色名"], "dialogue": null,
   "functional_figures": [{{"name":"无独立身份资产的功能人物",
@@ -290,15 +344,36 @@ JSON 格式:
     "expression":"夸张Q版表情","action":"夸张Q版动作",
     "dialogue":"必要时的内心台词；否则空字符串"}}],
   "physical_logic": "本镜物理/空间关系",
+  "frame_props":[
+    {{"prop_id":"稳定道具实例ID","phase":"start",
+      "physical_state":"起点物理状态","holder":"持有人或none",
+      "location":"起点唯一主位置或none","support":"支撑/接触面或none",
+      "visibility":"visible/occluded/hidden/absent","representation":"physical"}},
+    {{"prop_id":"同一道具实例ID","phase":"end",
+      "physical_state":"终点物理状态","holder":"持有人或none",
+      "location":"终点唯一主位置或none","support":"支撑/接触面或none",
+      "visibility":"visible/occluded/hidden/absent","representation":"physical"}}],
+  "prop_transitions":[{{"prop_id":"稳定道具实例ID","from_phase":"start",
+    "to_phase":"end","action":"单一可见拿取/交接/移动/状态变化"}}],
+  "frame_targets":{{
+    "keyframe":{{"phase":"end","state":"本镜代表性唯一静态结果","fallback":false}},
+    "first_frame":{{"phase":"start","state":"动作发生前唯一可见状态","fallback":false}},
+    "last_frame":{{"phase":"end","state":"动作完成后唯一可见状态","fallback":false}}}},
   "start_state": {{"角色名":{{"pose":"动作起点姿态及支撑面",
     "position":"相对场景和其他人物的位置","direction":"身体朝向和视线对象",
     "prop":"手中/身上道具","injury":"伤势","emotion":"可见情绪",
-    "wardrobe":"当前唯一服装","headwear":"当前头饰/冠帽或无",
+    "wardrobe":"当前唯一服装",
+    "headwear":{{"presence":"none/worn","kind":"official_hat/crown/helmet/soft_hat/veil/hair_ornament/other/none","name":"具体名称或none"}},
+    "hair_visibility":"fully_visible/partially_visible/covered",
+    "condition":{{"life_state":"alive/dead/nonliving","consciousness_state":"awake/asleep/unconscious/not_applicable","embodiment":"physical/statue/portrait/imagined/overlay","mobility":"active/limited/immobile/not_applicable"}},
     "hair_makeup":"当前发型与妆容"}}}},
   "end_state": {{"角色名":{{"pose":"动作完成后的姿态及支撑面",
     "position":"终点位置","direction":"终点朝向和视线对象",
     "prop":"终点持物","injury":"终点伤势","emotion":"终点情绪",
-    "wardrobe":"结尾唯一服装","headwear":"结尾头饰/冠帽或无",
+    "wardrobe":"结尾唯一服装",
+    "headwear":{{"presence":"none/worn","kind":"official_hat/crown/helmet/soft_hat/veil/hair_ornament/other/none","name":"具体名称或none"}},
+    "hair_visibility":"fully_visible/partially_visible/covered",
+    "condition":{{"life_state":"alive/dead/nonliving","consciousness_state":"awake/asleep/unconscious/not_applicable","embodiment":"physical/statue/portrait/imagined/overlay","mobility":"active/limited/immobile/not_applicable"}},
     "hair_makeup":"结尾发型与妆容"}}}},
   "readable_text": {{"carrier":"电脑屏幕", "whitelist":["逐字原文"],
     "layout":"版式/位置", "style":"字体/颜色/层级", "perspective":"透视/反光",
@@ -475,6 +550,12 @@ def normalize_script_bible(script, payload=None):
         payload.get("style")
         or "待 AI 根据剧本全文生成的本剧专属制作风格")
     scenes = script.get("scenes") or []
+    for position, scene in enumerate(scenes, 1):
+        if not isinstance(scene, dict):
+            continue
+        scene.setdefault(
+            "event_id",
+            f"scene:{scene.get('scene_no', position)}")
     locations = "、".join(dict.fromkeys(
         scene.get("location") for scene in scenes
         if isinstance(scene, dict) and scene.get("location")
@@ -609,6 +690,39 @@ def normalize_script_bible(script, payload=None):
 def validate_script_bible(script):
     """返回世界观/前情/人物介绍硬门禁错误；通过时返回 ``None``。"""
     strip_non_person_speakers(script)
+    normalize_prop_contract(script)
+    prop_report = audit_prop_contract(script)
+    if not prop_report["passed"]:
+        return "结构化道具合同无效: " + "；".join(prop_report["issues"])
+    scene_event_ids = []
+    for position, scene in enumerate(script.get("scenes") or [], 1):
+        if not isinstance(scene, dict):
+            continue
+        scene.setdefault(
+            "event_id",
+            f"scene:{scene.get('scene_no', position)}")
+        event_id = str(scene.get("event_id") or "").strip()
+        if not event_id:
+            return f"第{position}场缺少稳定 event_id"
+        if event_id in scene_event_ids:
+            return f"场次 event_id 重复: {event_id}"
+        scene_event_ids.append(event_id)
+    known_events = set(scene_event_ids) | {"episode-start", "episode-end"}
+    for item in script.get("prop_registry") or []:
+        if not isinstance(item, dict):
+            continue
+        for field in (
+                "availability_start_event", "availability_end_event"):
+            ref = item.get(field)
+            if not ref:
+                continue
+            event_id = str(
+                ref.get("event_id") if isinstance(ref, dict) else ref
+            ).strip()
+            if event_id not in known_events:
+                return (
+                    f"{item.get('prop_id') or item.get('name')} 的 {field} "
+                    f"未对应稳定场次 event_id: {event_id}")
     world = script.get("story_world")
     if not isinstance(world, dict):
         return "缺少 story_world 故事世界设定"
@@ -766,9 +880,20 @@ def validate_storyboard(storyboard):
         return "缺少 shots"
     if not isinstance(storyboard["shots"], list):
         return "shots 需为数组"
-    for shot in storyboard["shots"]:
+    normalize_prop_contract(storyboard)
+    prop_registry_report = audit_prop_contract(storyboard)
+    if not prop_registry_report["passed"]:
+        return "分镜 prop_registry 无效: " + "；".join(
+            prop_registry_report["issues"])
+    for shot_position, shot in enumerate(storyboard["shots"], 1):
         if not isinstance(shot, dict):
             return f"镜头需为对象,收到: {str(shot)[:80]}"
+        shot.setdefault(
+            "event_id",
+            str(shot.get("unit_id") or f"shot:{shot_position}"))
+        shot.setdefault(
+            "scene_event_id",
+            f"scene:{shot.get('scene_no')}")
         for field in ("scene_no", "duration", "prompt"):
             if field not in shot:
                 return f"镜头缺少字段 {field}: {shot}"
@@ -819,10 +944,60 @@ def validate_storyboard(storyboard):
         shot.setdefault("start_state", {})
         shot.setdefault("end_state", {})
         shot.setdefault("readable_text", None)
+        frame_targets = shot.get("frame_targets")
+        if not isinstance(frame_targets, dict):
+            return f"镜头缺少显式 frame_targets: {shot}"
+        for target_name, expected_phase in (
+                ("keyframe", {"start", "end", "freeze"}),
+                ("first_frame", {"start", "freeze"}),
+                ("last_frame", {"end", "freeze"})):
+            target = frame_targets.get(target_name)
+            if not isinstance(target, dict):
+                return f"镜头 frame_targets.{target_name} 必须是对象: {shot}"
+            phase = str(target.get("phase") or "").strip().lower()
+            if phase not in expected_phase:
+                return (
+                    f"镜头 frame_targets.{target_name}.phase 非法: "
+                    f"{phase or '空'}")
+            target_state = target.get("state")
+            if (_missing(target_state)
+                    or (isinstance(target_state, (dict, list))
+                        and not target_state)):
+                return f"镜头 frame_targets.{target_name}.state 不能为空"
+            if target.get("fallback") is not False:
+                return (
+                    f"镜头 frame_targets.{target_name}.fallback 必须明确为 false")
+        frame_props = shot.setdefault("frame_props", [])
+        if not isinstance(frame_props, list):
+            return f"镜头 frame_props 需为数组: {shot}"
+        for frame_prop in frame_props:
+            if not isinstance(frame_prop, dict):
+                continue
+            frame_prop["prop_id"] = str(
+                frame_prop.get("prop_id") or "").strip()
+            for field in ("phase", "visibility", "representation"):
+                frame_prop[field] = str(
+                    frame_prop.get(field) or "").strip().lower()
+        transitions = shot.setdefault("prop_transitions", [])
+        if not isinstance(transitions, list):
+            return f"镜头 prop_transitions 需为数组: {shot}"
+        for transition in transitions:
+            if not isinstance(transition, dict):
+                continue
+            transition["prop_id"] = str(
+                transition.get("prop_id") or "").strip()
+            for field in ("from_phase", "to_phase"):
+                transition[field] = str(
+                    transition.get(field) or "").strip().lower()
     # 编号强制连续,避免下游连续性质检失败
     for index, shot in enumerate(storyboard["shots"], start=1):
         shot["shot_no"] = index
+    prop_report = audit_storyboard_prop_contract(storyboard)
+    if not prop_report["passed"]:
+        return "结构化镜头道具合同无效: " + "；".join(
+            prop_report["issues"])
     storyboard.setdefault("episode_title", "")
+    storyboard["prop_contract_schema"] = PROP_CONTRACT_SCHEMA
     return None
 
 
@@ -1377,6 +1552,66 @@ def run(request, claude, timeout):
     if (capability == "script" and isinstance(data, dict)
             and isinstance(data.get("scenes"), list)):
         sanitize_script_entities(data)
+    if capability == "storyboard" and isinstance(data, dict):
+        # The script registry is authoritative. The storyboard model may assign
+        # frame-local states and refine a scene boundary to one exact shot in
+        # that same scene, but it may not rename, delete, duplicate or move a
+        # tracked prop lifecycle into another scene.
+        source_script = json.loads(json.dumps(
+            payload.get("script") or {}, ensure_ascii=False))
+        normalize_prop_contract(source_script)
+        scene_events = {
+            str(scene.get("scene_no")): str(
+                scene.get("event_id") or f"scene:{scene.get('scene_no')}")
+            for scene in source_script.get("scenes") or []
+            if isinstance(scene, dict) and scene.get("scene_no") is not None
+        }
+        for shot in data.get("shots") or []:
+            if not isinstance(shot, dict):
+                continue
+            scene_no = str(shot.get("scene_no"))
+            shot["scene_event_id"] = scene_events.get(
+                scene_no, f"scene:{scene_no}")
+        shot_event_scenes = {
+            str(shot.get("event_id")): str(shot.get("scene_event_id"))
+            for shot in data.get("shots") or []
+            if isinstance(shot, dict) and shot.get("event_id")
+            and shot.get("scene_event_id")
+        }
+        proposed_registry = {
+            str(item.get("prop_id")): item
+            for item in data.get("prop_registry") or []
+            if isinstance(item, dict) and item.get("prop_id")
+        }
+        refined_registry = []
+        for source_prop in source_script["prop_registry"]:
+            item = json.loads(json.dumps(
+                source_prop, ensure_ascii=False))
+            proposed = proposed_registry.get(str(item.get("prop_id"))) or {}
+            for field, alias in (
+                    ("availability_start_event", "introduced_at"),
+                    ("availability_end_event", "retired_at")):
+                source_ref = item.get(field) or item.get(alias)
+                proposed_ref = proposed.get(field) or proposed.get(alias)
+                if not (isinstance(source_ref, dict)
+                        and isinstance(proposed_ref, dict)):
+                    continue
+                source_event = str(
+                    source_ref.get("event_id") or "").strip()
+                proposed_event = str(
+                    proposed_ref.get("event_id") or "").strip()
+                # An exact shot refinement is valid only inside the source
+                # scene boundary. episode-start/end remain immutable.
+                if (source_event not in {"episode-start", "episode-end"}
+                        and shot_event_scenes.get(proposed_event)
+                        == source_event):
+                    item[field] = json.loads(json.dumps(
+                        proposed_ref, ensure_ascii=False))
+                    item[alias] = json.loads(json.dumps(
+                        proposed_ref, ensure_ascii=False))
+            refined_registry.append(item)
+        data["prop_contract_schema"] = PROP_CONTRACT_SCHEMA
+        data["prop_registry"] = refined_registry
     if capability == "image_qc":
         error = validate_image_qc(data)
     elif capability == "script" and payload.get("story_analysis"):

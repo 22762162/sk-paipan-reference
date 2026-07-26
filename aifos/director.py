@@ -70,6 +70,11 @@ from .story_analysis import (
     validate_line_speaker_resolution,
     validate_story_analysis,
 )
+from .story_logic import (
+    PROP_CONTRACT_SCHEMA,
+    audit_prop_contract,
+    audit_storyboard_prop_contract,
+)
 from .script_import import sanitize_script_entities
 from .workflow import (
     PIPELINE_VERSION,
@@ -6347,12 +6352,12 @@ class Director:
             str(name): {
                 "wardrobe": str(
                     (wardrobe_states or {}).get(name) or "").strip(),
-                "headwear": str(
-                    (headwear_states or {}).get(name) or "").strip(),
+                "headwear": copy.deepcopy(
+                    (headwear_states or {}).get(name) or {}),
             }
             for name in set(wardrobe_states or {}) | set(headwear_states or {})
-            if (str((wardrobe_states or {}).get(name) or "").strip()
-                or str((headwear_states or {}).get(name) or "").strip())
+            if ((wardrobe_states or {}).get(name)
+                or (headwear_states or {}).get(name))
         }
         ranked = []
         for row in self.assets.active_list(project_id):
@@ -6386,8 +6391,8 @@ class Director:
                     actual_state = row_appearance.get(name) or {}
                     actual_wardrobe = str(
                         actual_state.get("wardrobe") or "")
-                    actual_headwear = str(
-                        actual_state.get("headwear") or "")
+                    actual_headwear = copy.deepcopy(
+                        actual_state.get("headwear") or {})
                     if (expected["wardrobe"]
                             and not self._wardrobe_states_compatible(
                                 expected["wardrobe"], actual_wardrobe)):
@@ -6396,7 +6401,7 @@ class Director:
                     if (expected["headwear"]
                             and not self._headwear_states_compatible(
                                 expected["headwear"],
-                                f"{actual_wardrobe} {actual_headwear}")):
+                                actual_headwear or actual_wardrobe)):
                         compatible = False
                         break
                 if not compatible:
@@ -6506,7 +6511,9 @@ class Director:
     @staticmethod
     def _visible_headwear_terms(value):
         """Extract headwear that is visibly worn, ignoring removal prose."""
-        text = str(value or "")
+        text = (
+            json.dumps(value, ensure_ascii=False, sort_keys=True)
+            if isinstance(value, dict) else str(value or ""))
         terms = (
             "乌纱帽", "乌纱", "网巾", "头巾", "发冠", "凤冠",
             "冠", "帽", "盔", "簪", "钗",
@@ -6525,6 +6532,14 @@ class Director:
 
     @staticmethod
     def _headwear_state_is_none(value):
+        if isinstance(value, dict):
+            presence = str(value.get("presence") or "").strip().lower()
+            kind = str(value.get("kind") or "").strip().lower()
+            name = str(value.get("name") or "").strip().lower()
+            return (
+                presence == "none"
+                or kind in {"none", "hair_only"}
+                or name in {"none", "无", "无头饰"})
         text = str(value or "").strip()
         return text in {
             "无", "无头饰", "不戴头饰", "未戴头饰", "去除头饰",
@@ -6534,13 +6549,22 @@ class Director:
     @classmethod
     def _headwear_states_compatible(cls, expected, actual):
         """Reject a visually conflicting hat even when the robe matches."""
-        expected = str(expected or "").strip()
         if not expected:
             return True
         actual_terms = cls._visible_headwear_terms(actual)
         if cls._headwear_state_is_none(expected):
             return not actual_terms
         expected_terms = cls._visible_headwear_terms(expected)
+        if isinstance(expected, dict) and not expected_terms:
+            kind_terms = {
+                "official_hat": {"乌纱帽", "乌纱", "官帽"},
+                "crown": {"发冠", "凤冠", "冠"},
+                "helmet": {"头盔", "盔"},
+                "soft_hat": {"网巾", "头巾", "帽", "斗笠"},
+                "hair_ornament": {"簪", "钗"},
+            }
+            expected_terms = kind_terms.get(
+                str(expected.get("kind") or "").strip().lower(), set())
         if not expected_terms:
             return False
         return bool(expected_terms & actual_terms)
@@ -6548,10 +6572,15 @@ class Director:
     @staticmethod
     def _look_headwear_text(look):
         look = look if isinstance(look, dict) else {}
+        def display(value):
+            if isinstance(value, (dict, list)):
+                return json.dumps(
+                    value, ensure_ascii=False, sort_keys=True)
+            return str(value or "").strip()
         return "；".join(
-            str(look.get(key) or "").strip()
+            display(look.get(key))
             for key in ("costume", "hair", "headwear", "accessories")
-            if str(look.get(key) or "").strip())
+            if display(look.get(key)))
 
     @classmethod
     def _wardrobe_candidate_score(cls, wardrobe, costume):
@@ -6663,6 +6692,7 @@ class Director:
     def _art_refs(self, ctx, characters, location, shot_no=None,
                   sheet_keys=None, sheet_keys_by_character=None,
                   spatial_ref="", inner_persona_ref="", prop_names=None,
+                  prop_reference_modes=None,
                   wardrobe_states=None, headwear_states=None):
         """最终立绘/人物套件/场景图/用户参考 → 真实多图参考输入。
 
@@ -6699,9 +6729,8 @@ class Director:
             current_wardrobe = str(
                 (wardrobe_states or {}).get(
                     character) or "").strip()
-            current_headwear = str(
-                (headwear_states or {}).get(
-                    character) or "").strip()
+            current_headwear = copy.deepcopy(
+                (headwear_states or {}).get(character) or {})
             locked_look = self._locked_look_variant(
                 project_id, character)
             wardrobe_matches = (
@@ -6807,6 +6836,8 @@ class Director:
                     f"本镜人物、空间与核心道具参考图超过"
                     f"{SHOT_BASE_REFERENCE_LIMIT}张，请拆分镜头")
             refs["prop_refs"].append(row["uri"])
+            prop_mode = dict(
+                (prop_reference_modes or {}).get(name) or {})
             refs["asset_matches"].append({
                 "asset_id": row["id"],
                 "kind": "prop_identity",
@@ -6815,6 +6846,12 @@ class Director:
                 "uri": row["uri"],
                 "reference_role": "prop",
                 "attach_to": name,
+                "prop_id": prop_mode.get("prop_id", ""),
+                "prop_representation": prop_mode.get(
+                    "representation", "physical"),
+                "prop_phase": prop_mode.get("phase", ""),
+                "prop_states": copy.deepcopy(
+                    prop_mode.get("states") or []),
             })
         # Current wardrobe is a separate responsibility from face identity.
         # Prefer a high-quality existing candidate/sheet that matches the
@@ -6825,8 +6862,8 @@ class Director:
                 continue
             wardrobe = str(
                 (wardrobe_states or {}).get(name) or "").strip()
-            headwear = str(
-                (headwear_states or {}).get(name) or "").strip()
+            headwear = copy.deepcopy(
+                (headwear_states or {}).get(name) or {})
             row = self._wardrobe_reference_row(
                 project_id, name, wardrobe, used_uris,
                 headwear=headwear)
@@ -6985,24 +7022,230 @@ class Director:
             or refs.get("inner_persona_ref") or refs.get("prop_refs"))
         return refs
 
-    def _shot_core_prop_names(self, ctx, shot):
-        """按镜头局部合同精确匹配需要携带母资产的核心道具。"""
-        explicit = {
-            str(value).strip()
-            for value in (shot.get("props") or [])
-            if str(value).strip()
+    def _shot_core_prop_references(self, ctx, shot, phases=None):
+        """返回本次静态相位/视频时间线真正可见的核心道具参考。
+
+        不再从提示词全文猜测道具：否定句、未来剧情说明或对白里提到名字，
+        都不能成为上传核心道具参考图的理由。旧分镜仅兼容显式 ``props``
+        名单；新分镜以 ``frame_props`` 为唯一事实源。
+        """
+        script = ctx.get("script") or {}
+        registry = self._prop_registry(script)
+        by_id = {
+            str(item.get("prop_id") or "").strip(): item
+            for item in registry if str(item.get("prop_id") or "").strip()
         }
-        text = json.dumps({
-            key: shot.get(key)
-            for key in (
-                "description", "prompt", "seedance_prompt", "dialogue",
-                "start_state", "end_state", "physical_logic",
-                "physical_contract", "shot_contract", "five_dimensions")
-        }, ensure_ascii=False, default=str)
+        by_name = {
+            str(item.get("name") or "").strip(): item
+            for item in registry if str(item.get("name") or "").strip()
+        }
+        references = []
+        seen = set()
+        references_by_id = {}
+        allowed_phases = {
+            str(value).strip().lower() for value in (phases or [])
+            if str(value).strip()}
+        frame_props = shot.get("frame_props") or []
+        has_structured_frame_props = any(
+            isinstance(item, dict) for item in frame_props)
+        for frame_prop in frame_props:
+            if not isinstance(frame_prop, dict):
+                continue
+            visibility = str(
+                frame_prop.get("visibility") or "visible").strip().lower()
+            representation = str(
+                frame_prop.get("representation") or "physical").strip().lower()
+            phase = str(
+                frame_prop.get("phase") or "").strip().lower()
+            if (allowed_phases and phase not in allowed_phases) or (
+                    visibility not in {"visible", "occluded"}):
+                continue
+            prop_id = str(frame_prop.get("prop_id") or "").strip()
+            name = str(frame_prop.get("name") or "").strip()
+            registered = by_id.get(prop_id) or by_name.get(name) or {}
+            name = str(registered.get("name") or name).strip()
+            if prop_id and name:
+                reference = references_by_id.get(prop_id)
+                if reference is None:
+                    reference = {
+                        "prop_id": prop_id,
+                        "name": name,
+                        "phase": phase,
+                        "representation": representation,
+                        "visibility": visibility,
+                        "states": [],
+                    }
+                    references_by_id[prop_id] = reference
+                    references.append(reference)
+                    seen.add(prop_id)
+                state = {
+                    "phase": phase,
+                    "representation": representation,
+                    "visibility": visibility,
+                }
+                if state not in reference["states"]:
+                    reference["states"].append(state)
+        for reference in references:
+            phases = list(dict.fromkeys(
+                state["phase"] for state in reference["states"]))
+            representations = list(dict.fromkeys(
+                state["representation"] for state in reference["states"]))
+            reference["phase"] = ",".join(phases)
+            reference["representation"] = (
+                representations[0] if len(representations) == 1 else "mixed")
+        if has_structured_frame_props:
+            return references
+
+        # 旧数据只接受结构化的显式名单，不扫描 description/dialogue。
+        for value in shot.get("props") or []:
+            name = str(value).strip()
+            registered = by_id.get(name) or by_name.get(name) or {}
+            name = str(registered.get("name") or name).strip()
+            prop_id = str(registered.get("prop_id") or name).strip()
+            if name and name in by_name and prop_id not in seen:
+                seen.add(prop_id)
+                references.append({
+                    "prop_id": prop_id,
+                    "name": name,
+                    "phase": "",
+                    "representation": "physical",
+                    "visibility": "visible",
+                })
+        return references
+
+    def _shot_core_prop_names(self, ctx, shot, phases=None):
         return [
-            prop["name"] for prop in core_prop_definitions(ctx.get("script"))
-            if prop["name"] in explicit or prop["name"] in text
-        ]
+            item["name"] for item in self._shot_core_prop_references(
+                ctx, shot, phases=phases)]
+
+    @staticmethod
+    def _prop_registry(script):
+        """返回稳定 ID 的核心道具登记表，同时兼容旧 ``core_props``。"""
+        rows = (script or {}).get("prop_registry")
+        if not isinstance(rows, list) or (
+                not rows and (script or {}).get("core_props")):
+            rows = (script or {}).get("core_props") or []
+        result = []
+        seen = set()
+        for index, raw in enumerate(rows, 1):
+            item = {"name": raw} if isinstance(raw, str) else raw
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            prop_id = str(item.get("prop_id") or "").strip()
+            if not prop_id:
+                prop_id = f"legacy_prop_{index:03d}"
+            if not name or prop_id in seen:
+                continue
+            seen.add(prop_id)
+            result.append({**copy.deepcopy(item), "prop_id": prop_id,
+                           "name": name})
+        return result
+
+    def _shot_prop_contract(self, ctx, shot):
+        """把集级登记表与镜头级实例状态送入生成前合同。"""
+        return {
+            "prop_registry": self._prop_registry(ctx.get("script") or {}),
+            "frame_props": copy.deepcopy(shot.get("frame_props") or []),
+            "prop_transitions": copy.deepcopy(
+                shot.get("prop_transitions") or []),
+        }
+
+    def _require_valid_storyboard_prop_contract(self, ctx):
+        """Recheck the authoritative prop timeline immediately before spend."""
+        storyboard = copy.deepcopy(ctx.get("storyboard") or {})
+        if not isinstance(storyboard, dict) or not storyboard.get("shots"):
+            return
+        script = copy.deepcopy(ctx.get("script") or {})
+        registry_report = audit_prop_contract(script)
+        issues = list(registry_report.get("issues") or [])
+
+        # A storyboard scene event must resolve to the authoritative script
+        # scene with the same scene_no.  This closes the gap where a saved or
+        # imported board could claim a later scene event on an earlier shot.
+        expected_scene_events = {}
+        event_scene_numbers = {}
+        for position, scene in enumerate(script.get("scenes") or [], 1):
+            if not isinstance(scene, dict):
+                continue
+            scene_no = str(
+                scene.get("scene_no")
+                if scene.get("scene_no") is not None else position).strip()
+            event_id = str(
+                scene.get("event_id") or f"scene:{scene_no}").strip()
+            previous_scene = event_scene_numbers.setdefault(event_id, scene_no)
+            if previous_scene != scene_no:
+                issues.append(
+                    f"剧本 scene_event_id={event_id} 被多个 scene_no 复用："
+                    f"{previous_scene}、{scene_no}")
+            previous_event = expected_scene_events.setdefault(
+                scene_no, event_id)
+            if previous_event != event_id:
+                issues.append(
+                    f"剧本 scene_no={scene_no} 绑定了多个 scene_event_id："
+                    f"{previous_event}、{event_id}")
+        for position, shot in enumerate(storyboard.get("shots") or [], 1):
+            if not isinstance(shot, dict):
+                continue
+            scene_no = str(
+                shot.get("scene_no")
+                if shot.get("scene_no") is not None else "").strip()
+            expected = expected_scene_events.get(scene_no)
+            actual = str(
+                shot.get("scene_event_id")
+                or (f"scene:{scene_no}" if scene_no else "")).strip()
+            if not expected:
+                issues.append(
+                    f"镜头{position}.scene_no={scene_no or '空'} "
+                    "未对应剧本场次")
+            elif actual != expected:
+                issues.append(
+                    f"镜头{position}.scene_event_id 与剧本 scene_no="
+                    f"{scene_no} 的稳定事件不一致：{actual} != {expected}")
+
+        storyboard["prop_contract_schema"] = PROP_CONTRACT_SCHEMA
+        storyboard["prop_registry"] = copy.deepcopy(
+            script.get("prop_registry") or [])
+        report = audit_storyboard_prop_contract(storyboard)
+        issues.extend(report.get("issues") or [])
+        issues = list(dict.fromkeys(issues))
+        if issues:
+            raise AifosError(
+                "结构化道具合同前置校验失败，未调用生成 API："
+                + "；".join(issues))
+
+    @staticmethod
+    def _select_explicit_frame_target(payload):
+        """Select an upstream-authored static target without deriving one."""
+        targets = payload.get("frame_targets")
+        if not isinstance(targets, dict):
+            return
+        frame_kind = str(payload.get("frame_kind") or "keyframe").strip()
+        target_key = (
+            frame_kind if frame_kind in {"first_frame", "last_frame"}
+            else "keyframe")
+        target = targets.get(target_key)
+        if isinstance(target, dict) and target.get("state"):
+            payload["frame_target"] = copy.deepcopy(target)
+
+    @staticmethod
+    def _shot_reference_phases(shot, frame_kind="keyframe"):
+        """Return exact prop phases relevant to one image request."""
+        kind = str(frame_kind or "keyframe").strip().lower()
+        if kind in {"timeline", "video"}:
+            return {"start", "freeze", "end"}
+        if kind == "frames":
+            return {"start", "end"}
+        targets = shot.get("frame_targets")
+        targets = targets if isinstance(targets, dict) else {}
+        key = kind if kind in {"first_frame", "last_frame"} else "keyframe"
+        target = targets.get(key)
+        if not isinstance(target, dict):
+            target = shot.get("frame_target")
+        phase = str(
+            (target or {}).get("phase")
+            if isinstance(target, dict) else "").strip().lower()
+        return {phase} if phase in {"start", "end", "freeze"} else set()
 
     def _relations(self, ctx):
         """画布关系图:ctx 内缓存优先,单图重画等路径从落盘文件回读。"""
@@ -7064,7 +7307,8 @@ class Director:
             if current_state.get("wardrobe"):
                 facts["costume"] = str(current_state["wardrobe"])
             if current_state.get("headwear"):
-                facts["accessories"] = str(current_state["headwear"])
+                facts["accessories"] = copy.deepcopy(
+                    current_state["headwear"])
             if current_state.get("hair_makeup"):
                 facts["hair"] = str(current_state["hair_makeup"])
             if (current_state.get("prop")
@@ -7177,6 +7421,10 @@ class Director:
                 f"{duties}；{composition.get('count_rule', '')}")
         start_state = shot.get("start_state") or {}
         def state_line(name, state):
+            def display(value):
+                return (
+                    json.dumps(value, ensure_ascii=False, sort_keys=True)
+                    if isinstance(value, dict) else str(value))
             details = [
                 str(state.get("position") or ""),
                 str(state.get("pose") or ""),
@@ -7186,7 +7434,12 @@ class Director:
                     ("wardrobe", "服装"), ("headwear", "头饰"),
                     ("hair_makeup", "妆发"), ("prop", "道具")):
                 if state.get(key):
-                    details.append(f"{label}{state[key]}")
+                    details.append(f"{label}{display(state[key])}")
+            if state.get("hair_visibility"):
+                details.append(f"头发可见度{state['hair_visibility']}")
+            condition = state.get("condition")
+            if condition:
+                details.append(f"人物状态{display(condition)}")
             return f"{name}:" + ",".join(value for value in details if value)
         if start_state:
             parts.append("【START STATE】" + "；".join(
@@ -7216,14 +7469,17 @@ class Director:
                 f"{'情绪' + emo + '；' if emo else ''}"
                 "用视线、眉眼、下颌张力和呼吸体现，不把台词画成字幕")
         elif shot.get("kind") == "reaction":
+            performance = shot.get("performance") or {}
             parts.append(
-                "【EYES / EXPRESSION】表现听者即时反应；眼神先变，随后"
-                "眉眼和呼吸产生微小变化，避免夸张表情包")
+                "【EYES / EXPRESSION】"
+                f"{performance.get('gaze') or '逐角色视线严格服从condition'}；"
+                f"{performance.get('micro_expression') or '逐角色表演严格服从condition'}")
         else:
             performance = shot.get("performance") or {}
             parts.append(
-                f"【EYES / EXPRESSION】{performance.get('gaze') or '视线服务主体动作'}；"
-                f"{performance.get('micro_expression') or '自然微表情和呼吸'}")
+                "【EYES / EXPRESSION】"
+                f"{performance.get('gaze') or '逐角色视线严格服从condition'}；"
+                f"{performance.get('micro_expression') or '逐角色表演严格服从condition'}")
         camera = shot.get("camera", "")
         contract = shot.get("shot_contract") or {}
         parts.append(
@@ -7286,11 +7542,19 @@ class Director:
         return "\n".join(p for p in parts if p)
 
     def _shot_payload(self, ctx, shot, *, continuity_anchor=False,
-                      quality_override=None, item_id=None):
+                      quality_override=None, item_id=None,
+                      frame_kind="keyframe"):
         # Defensive repair for saved legacy boards: the current-shot action is
         # narrower than a global character design and must win before identity
         # facts, references, prompt text or QC expectations are compiled.
         shot = reconcile_shot_semantics(shot)
+        self._require_valid_storyboard_prop_contract(ctx)
+        prop_contract = self._shot_prop_contract(ctx, shot)
+        prop_reference_rows = self._shot_core_prop_references(
+            ctx, shot, phases=self._shot_reference_phases(
+                shot, frame_kind))
+        prop_reference_modes = {
+            item["name"]: item for item in prop_reference_rows}
         locations = self._scene_locations(ctx)
         location = shot_local_scene(
             shot, locations.get(shot["scene_no"], ""))
@@ -7383,6 +7647,7 @@ class Director:
         payload = {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
+            "frame_kind": frame_kind,
             "prompt": self._rich_shot_prompt(ctx, shot, location),
             "seedance_prompt": shot.get("seedance_prompt", shot["prompt"]),
             "characters": shot["characters"],
@@ -7400,6 +7665,10 @@ class Director:
             "action": shot.get("description", ""),
             "start_state": shot.get("start_state", {}),
             "end_state": shot.get("end_state", {}),
+            "frame_targets": copy.deepcopy(
+                shot.get("frame_targets") or {}),
+            "frame_target": copy.deepcopy(
+                shot.get("frame_target") or {}),
             "semantic_corrections": copy.deepcopy(
                 shot.get("semantic_corrections") or []),
             "five_dimensions": shot.get("five_dimensions", {}),
@@ -7413,6 +7682,7 @@ class Director:
             "shot_contract": shot.get("shot_contract", {}),
             "composition_contract": composition_contract,
             "physical_contract": physical_contract,
+            **prop_contract,
             "sound_design": shot.get("sound_design", {}),
             "spatial_blocking": spatial or {},
             "spatial_constraint": (spatial or {}).get("constraint", ""),
@@ -7436,7 +7706,9 @@ class Director:
                     (spatial or {}).get("spatial_reference_uri", "")
                     if requires_spatial_reference(spatial or {}) else ""),
                 inner_persona_ref=inner_persona_ref,
-                prop_names=self._shot_core_prop_names(ctx, shot),
+                prop_names=[
+                    item["name"] for item in prop_reference_rows],
+                prop_reference_modes=prop_reference_modes,
                 wardrobe_states={
                     name: str(
                         ((shot.get("end_state") or {}).get(name) or {}).get(
@@ -7447,12 +7719,12 @@ class Director:
                     for name in identity_characters
                 },
                 headwear_states={
-                    name: str(
+                    name: copy.deepcopy(
                         ((shot.get("end_state") or {}).get(name) or {}).get(
                             "headwear")
                         or ((shot.get("start_state") or {}).get(name) or {}).get(
                             "headwear")
-                        or "")
+                        or {})
                     for name in identity_characters
                 }),
         }
@@ -7480,21 +7752,13 @@ class Director:
         # 发送给图片模型的版本只保留本镜事实；完整 prompt 仍保留在
         # payload['prompt'] 供人工审计，避免故事背景、全局风格与参考图
         # 在模型输入里重复争权。
-        contract, compact = compile_shot_prompt(
-            {**shot,
-             "character_visuals": character_visuals,
-             "composition_contract": composition_contract,
-             "physical_contract": physical_contract,
-             "spatial_blocking": spatial or {},
-             "readable_text": readable_text,
-             "era_context": era_context,
-             "sanctioned_anachronisms": sanctioned_anachronisms},
-            location=location, style=payload.get("style", ""),
-            references=payload.get("reference_manifest"), mode="image")
-        payload["prompt_contract"] = contract
-        payload["prompt_compact"] = compact
+        # _attach_reference_manifest 已经按 frame_kind 从上游
+        # frame_targets 中选定 keyframe/first_frame/last_frame 并编译合同。
+        # 此处禁止再用 shot.frame_target（默认 keyframe）二次覆盖，否则首尾
+        # 帧会被错误编译成同一个代表帧。
         payload["prompt_contract_validation"] = (
-            validate_shot_prompt_contract(contract))
+            validate_shot_prompt_contract(
+                payload.get("prompt_contract") or {}))
         return payload
 
     def _reference_manifest(self, payload):
@@ -7623,11 +7887,37 @@ class Director:
         for uri in payload.get("prop_refs") or []:
             match = matches.get(uri) or {}
             name = str(match.get("name") or "核心道具")
+            representation = str(
+                match.get("prop_representation") or "physical").strip()
+            phase = str(match.get("prop_phase") or "").strip()
+            phase_rule = f"（phase={phase}）" if phase else ""
+            states = [
+                item for item in (match.get("prop_states") or [])
+                if isinstance(item, dict)
+            ]
+            carrier_states = [
+                f"{str(item.get('phase') or '').strip()}="
+                f"{str(item.get('representation') or '').strip()}"
+                for item in states
+                if str(item.get("representation") or "").strip()
+                not in {"", "physical"}
+            ]
+            if not carrier_states and representation not in {
+                    "", "physical", "mixed"}:
+                carrier_states = [f"{phase or '当前'}={representation}"]
+            carrier_rule = (
+                "仅在合同声明的"
+                + "、".join(dict.fromkeys(carrier_states))
+                + "载体披露状态中使用母资产，不得据此在载体外新增第二个"
+                "物理实体；"
+                if carrier_states else "")
             add(
                 uri, match.get("label") or f"核心道具:{name}",
                 f"只锁定核心道具「{name}」的轮廓、结构、材质、工艺、"
                 "磨损和识别细节；本镜中的尺寸、持有人、动作与状态服从"
-                "当前镜头合同，不得把纯背景、棚拍构图或额外道具带入画面",
+                f"当前镜头合同{phase_rule}；"
+                f"{carrier_rule}"
+                "不得把纯背景、棚拍构图或额外道具带入画面",
                 role="prop", kind="prop_identity")
         for uri in payload.get("character_refs") or []:
             match = matches.get(uri) or {}
@@ -7782,14 +8072,54 @@ class Director:
         if ("shot_no" in payload and not payload.get("portrait")
                 and not payload.get("character_sheet")
                 and not payload.get("scene_art")):
-            contract, compact = compile_shot_prompt(
-                payload, location=payload.get("location", ""),
-                style=payload.get("style", ""), references=manifest,
-                mode="image")
-            payload["prompt_contract"] = contract
-            payload["prompt_compact"] = compact
-            payload["prompt_contract_validation"] = (
-                validate_shot_prompt_contract(contract))
+            if str(payload.get("frame_kind") or "") == "frames":
+                frame_contracts = {}
+                frame_compacts = {}
+                frame_validations = {}
+                for kind in ("first_frame", "last_frame"):
+                    variant = copy.deepcopy(payload)
+                    variant["frame_kind"] = kind
+                    self._select_explicit_frame_target(variant)
+                    contract, compact = compile_shot_prompt(
+                        variant, location=payload.get("location", ""),
+                        style=payload.get("style", ""),
+                        references=manifest, mode="image")
+                    frame_contracts[kind] = contract
+                    frame_compacts[kind] = compact
+                    frame_validations[kind] = (
+                        validate_shot_prompt_contract(contract))
+                invalid = [
+                    f"{kind}:{'；'.join(report.get('issues') or [])}"
+                    for kind, report in frame_validations.items()
+                    if not report.get("passed")
+                ]
+                if invalid:
+                    raise AifosError(
+                        "首尾帧独立静态合同校验失败，未调用生成 API："
+                        + "；".join(invalid))
+                payload["frame_prompt_contracts"] = frame_contracts
+                payload["frame_prompt_contract_validations"] = (
+                    frame_validations)
+                payload["prompt_contract"] = frame_contracts["first_frame"]
+                payload["prompt_contract_validation"] = (
+                    frame_validations["first_frame"])
+                payload["prompt_compact"] = (
+                    "【首帧独立静态合同】\n"
+                    + frame_compacts["first_frame"]
+                    + "\n【尾帧独立静态合同】\n"
+                    + frame_compacts["last_frame"]
+                    + "\n【联合生成约束】分别执行两份静态合同；"
+                    "首帧不得混入尾帧状态，尾帧不得保留已完成动作的起点状态。")
+            else:
+                self._select_explicit_frame_target(payload)
+                contract, compact = compile_shot_prompt(
+                    payload, location=payload.get("location", ""),
+                    style=payload.get("style", ""), references=manifest,
+                    mode="image")
+                payload["prompt_contract"] = contract
+                payload["prompt_compact"] = compact
+                payload["prompt_contract_validation"] = (
+                    validate_shot_prompt_contract(contract))
         else:
             # 人物/场景资产也只把未附表的视觉合同交给 Provider。
             # 参考图及绑定职责由 manifest/真实上传通道单独传递；若继续把
@@ -8076,7 +8406,8 @@ class Director:
                 name = self._shot_name(ctx, shot["shot_no"])
                 payload = self._shot_payload(
                     ctx, shot, continuity_anchor=len(chain) > 1,
-                    item_id=f"frames:{shot['shot_no']}")
+                    item_id=f"frames:{shot['shot_no']}",
+                    frame_kind="frames")
                 required_quality = payload["quality_decision"]["level"]
                 first = self._existing_asset_uri(ctx, "first_frame", name)
                 last = self._existing_asset_uri(ctx, "last_frame", name)
@@ -8371,10 +8702,28 @@ class Director:
                 missing_identities.append(name)
             else:
                 mandatory_ids.add(row["id"])
+        inner_row = self._inner_persona_row_for_shot(ctx, target_shot)
+        if target_shot.get("narrative_overlays") and inner_row is None:
+            raise AifosError(
+                f"镜头{shot_no}声明了内心Q版，但对应母资产缺失或质量不足")
+        if inner_row is not None:
+            mandatory_ids.add(inner_row["id"])
+        missing_props = []
+        for name in self._shot_core_prop_names(
+                ctx, target_shot, phases={"start", "freeze", "end"}):
+            row = self._locked_prop(episode["project_id"], name)
+            if row is None:
+                missing_props.append(name)
+            else:
+                mandatory_ids.add(row["id"])
         if missing_identities:
             raise AifosError(
                 "以下出场角色缺少最终立绘，禁止选择 Seedance 参考图:"
                 + "、".join(missing_identities))
+        if missing_props:
+            raise AifosError(
+                "以下核心道具缺少人工锁定母资产，禁止选择 Seedance 参考图:"
+                + "、".join(missing_props))
         if len(mandatory_ids) > 7:
             raise AifosError(
                 f"本镜空间图与人物最终立绘已占 {len(mandatory_ids)} 张，"
@@ -8403,7 +8752,7 @@ class Director:
             if row["kind"] == "spatial_blocking":
                 raise AifosError("空间调度图由系统按镜头强制加入，无需人工选择")
             mismatch = self._video_reference_mismatch(
-                row, target_shot, location)
+                row, target_shot, location, script=script)
             if mismatch:
                 raise AifosError(mismatch)
             if not formal_reference_allowed(self._asset_quality(row)):
@@ -8448,6 +8797,7 @@ class Director:
                 continue
             key = str(int(no))
             spatial = self._spatial_reference_requirement(ctx, no)
+            reference_rows = self._video_reference_rows(ctx, no)
             shots[key] = {
                 "mode": "manual" if key in manual else "auto",
                 "spatial_reference_required": spatial["required"],
@@ -8457,8 +8807,9 @@ class Director:
                 "items": [{
                     "asset_id": row["id"], "kind": row["kind"],
                     "name": row["name"], "uri": row["uri"],
-                    "binding": self._video_reference_binding(row),
-                } for row in self._video_reference_rows(ctx, no)],
+                    "binding": self._video_reference_binding(
+                        row, shot=shot, script=ctx.get("script") or {}),
+                } for row in reference_rows],
             }
         return {"schema": "aifos.video-references-effective/v1",
                 "shots": shots}
@@ -8520,7 +8871,8 @@ class Director:
                 f"镜头{shot_no}声明了内心Q版，但对应母资产缺失或质量不足")
         add(inner_row)
         missing_props = []
-        for name in self._shot_core_prop_names(ctx, shot):
+        for name in self._shot_core_prop_names(
+                ctx, shot, phases={"start", "freeze", "end"}):
             prop_row = self._locked_prop(project_id, name)
             if prop_row is None:
                 missing_props.append(name)
@@ -8613,7 +8965,7 @@ class Director:
             return None
         return row
 
-    def _video_reference_mismatch(self, row, shot, location=""):
+    def _video_reference_mismatch(self, row, shot, location="", script=None):
         """返回 Seedance 资产与当前镜头不兼容的原因；空串表示可用。
 
         这个检查既用于新选择，也用于读取历史选择，避免旧版本保存的
@@ -8648,11 +9000,51 @@ class Director:
             prop = str(
                 self._asset_meta(row).get("prop")
                 or str(row["name"]).split(":", 1)[0])
-            shot_text = json.dumps(
-                shot, ensure_ascii=False, default=str)
-            if prop not in shot_text:
+            registry = self._prop_registry(script or {})
+            by_id = {
+                str(item.get("prop_id") or "").strip(): item
+                for item in registry
+                if str(item.get("prop_id") or "").strip()
+            }
+            by_name = {
+                str(item.get("name") or "").strip(): item
+                for item in registry
+                if str(item.get("name") or "").strip()
+            }
+            frame_props = shot.get("frame_props") or []
+            structured = any(
+                isinstance(item, dict) for item in frame_props)
+            visible_names = set()
+            if structured:
+                for item in frame_props:
+                    if not isinstance(item, dict):
+                        continue
+                    if str(item.get("phase") or "").strip().lower() not in {
+                            "start", "freeze", "end"}:
+                        continue
+                    if str(
+                            item.get("visibility") or ""
+                    ).strip().lower() not in {"visible", "occluded"}:
+                        continue
+                    prop_id = str(item.get("prop_id") or "").strip()
+                    name = str(item.get("name") or "").strip()
+                    registered = by_id.get(prop_id) or by_name.get(name) or {}
+                    visible_name = str(
+                        registered.get("name") or name).strip()
+                    if visible_name:
+                        visible_names.add(visible_name)
+            else:
+                for value in shot.get("props") or []:
+                    name = str(value or "").strip()
+                    registered = by_id.get(name) or by_name.get(name) or {}
+                    visible_name = str(
+                        registered.get("name") or name).strip()
+                    if visible_name in by_name:
+                        visible_names.add(visible_name)
+            if prop not in visible_names:
                 return (
-                    f"道具资产「{prop}」未在本镜合同中出现，"
+                    f"道具资产「{prop}」未在本镜结构化 frame_props 的"
+                    "可见/遮挡相位中出现，"
                     "禁止作为本镜参考")
         if kind == "reference":
             meta = self._asset_meta(row)
@@ -8710,7 +9102,8 @@ class Director:
             seen.add(inner_row["id"])
             rows.append(inner_row)
         missing_props = []
-        for name in self._shot_core_prop_names(ctx, shot):
+        for name in self._shot_core_prop_names(
+                ctx, shot, phases={"start", "freeze", "end"}):
             row = self._locked_prop(ctx["project"]["id"], name)
             if row is None:
                 missing_props.append(name)
@@ -8735,7 +9128,8 @@ class Director:
                     or self.assets.is_deleted(row) or not row["uri"]
                     or not formal_reference_allowed(self._asset_quality(row))):
                 continue
-            if self._video_reference_mismatch(row, shot, location):
+            if self._video_reference_mismatch(
+                    row, shot, location, script=script):
                 continue
             uri = row["uri"]
             if (uri.startswith(("http://", "https://"))
@@ -8749,7 +9143,7 @@ class Director:
                 "请减少人工额外参考或拆分群像镜头")
         return rows
 
-    def _video_reference_binding(self, row):
+    def _video_reference_binding(self, row, shot=None, script=None):
         """Seedance 每张资产的单一职责，禁止“身份/服装/场景全都锁”。"""
         kind = row["kind"]
         meta = self._asset_meta(row)
@@ -8785,10 +9179,41 @@ class Director:
                 "身份仍以最终立绘为准，不复制服装、姿势或背景")
         if kind in ("prop_identity", "prop_candidate"):
             prop = str(meta.get("prop") or name.split(":", 1)[0])
+            carrier_rule = ""
+            if isinstance(shot, dict):
+                registry = self._prop_registry(script or {})
+                ids = {
+                    str(item.get("prop_id") or "").strip()
+                    for item in registry
+                    if str(item.get("name") or "").strip() == prop
+                }
+                carrier_states = []
+                for item in shot.get("frame_props") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    item_prop_id = str(
+                        item.get("prop_id") or "").strip()
+                    item_name = str(item.get("name") or "").strip()
+                    visibility = str(
+                        item.get("visibility") or "").strip().lower()
+                    representation = str(
+                        item.get("representation") or "").strip().lower()
+                    phase = str(item.get("phase") or "").strip().lower()
+                    if (item_prop_id not in ids and item_name != prop) or (
+                            visibility not in {"visible", "occluded"}
+                            or representation in {"", "physical"}):
+                        continue
+                    carrier_states.append(f"{phase}={representation}")
+                if carrier_states:
+                    carrier_rule = (
+                        "；仅在合同声明的"
+                        + "、".join(dict.fromkeys(carrier_states))
+                        + "载体披露状态中使用母资产，不得因此在载体外新增"
+                        "第二个物理实体")
             return (
                 f"只锁定核心道具「{prop}」的轮廓、结构、材质、工艺、"
                 "磨损和识别细节；尺寸、持有人、动作及状态服从首尾帧，"
-                "不得带入棚拍背景或额外物件")
+                f"不得带入棚拍背景或额外物件{carrier_rule}")
         if kind == "scene_art":
             return (
                 "只锁定场景空间、陈设、材质与主光方向；忽略图中人物、"
@@ -8840,10 +9265,17 @@ class Director:
         def state_line(states):
             values = []
             for name, state in (states or {}).items():
+                condition = state.get("condition")
+                condition_text = (
+                    json.dumps(
+                        condition, ensure_ascii=False, sort_keys=True)
+                    if isinstance(condition, dict) else str(condition or ""))
                 values.append(
                     f"{name}:{state.get('position', '')},"
                     f"{state.get('pose', '')},情绪{state.get('emotion', '')},"
-                    f"朝向{state.get('direction', '')}")
+                    f"朝向{state.get('direction', '')}"
+                    + (f",condition={condition_text}"
+                       if condition_text else ""))
             return "；".join(values)
 
         camera = ((shot.get("five_dimensions") or {}).get(
@@ -8878,8 +9310,8 @@ class Director:
             "脸和性别按各自最终立绘，服装/道具按首尾帧。",
             f"【起点】{state_line(shot.get('start_state')) or '保持首帧可见状态'}。",
             f"【单一主动作】{shot.get('description') or shot.get('prompt') or '环境自然变化'}。",
-            f"【表演】{performance.get('gaze') or '视线服务主体动作'}；"
-            f"{performance.get('micro_expression') or '自然微表情、呼吸和重心变化'}"
+            f"【表演】{performance.get('gaze') or '逐角色视线严格服从condition'}；"
+            f"{performance.get('micro_expression') or '逐角色表演严格服从condition'}"
             f"{dialogue_rule}。",
             f"【运镜】只执行一次{movement}；"
             f"{camera.get('shot_scale') or (shot.get('shot_contract') or {}).get('景别') or '保持既定景别'}，"
@@ -9050,6 +9482,8 @@ class Director:
     def _prepare_video_call(self, ctx, shot, frames):
         """在主线程锁定单镜首尾帧、人物/场景资产和空间图映射。"""
         shot_no = int(shot["shot_no"])
+        self._require_valid_storyboard_prop_contract(ctx)
+        prop_contract = self._shot_prop_contract(ctx, shot)
         diagnosis = self._video_diagnosis_from_ctx(ctx, shot_no)
         decision = diagnosis.get("decision") or {}
         if (decision.get("action") == "repair_frames_first"
@@ -9084,7 +9518,8 @@ class Director:
             "index": index + 3,
             **asset,
             "uri": row["uri"],
-            "binding": self._video_reference_binding(row),
+            "binding": self._video_reference_binding(
+                row, shot=shot, script=ctx.get("script") or {}),
         } for index, (row, asset) in enumerate(
             zip(reference_rows, reference_assets))]
         video_prompt = self._seedance_video_prompt(
@@ -9095,7 +9530,8 @@ class Director:
             *reference_manifest,
         ]
         contract, compact = compile_shot_prompt(
-            shot, location=self._shot_location(ctx.get("script"), shot),
+            {**shot, **prop_contract},
+            location=self._shot_location(ctx.get("script"), shot),
             style=ctx["project"].get("style", ""), references=video_refs,
             mode="video")
         manual_feedback = (ctx.get("video_feedback") or {}).get(
@@ -9130,6 +9566,7 @@ class Director:
             "reference_images": [row["uri"] for row in reference_rows],
             "reference_assets": reference_assets,
             "reference_manifest": reference_manifest,
+            **prop_contract,
             "dialogue": video_dialogue,
             "voice": ctx["production_profile"]["voice"],
             "lip_sync": ctx["production_profile"]["lip_sync"],
@@ -10543,7 +10980,8 @@ class Director:
             frames_payload = self._shot_payload(
                 ctx, shot, continuity_anchor=len(scene_shots) > 1,
                 quality_override=choice,
-                item_id=f"frames:{shot['shot_no']}")
+                item_id=f"frames:{shot['shot_no']}",
+                frame_kind="frames")
             if formal_reference_allowed(self._asset_quality(image_row)):
                 frames_payload["image_uri"] = image_row["uri"]
             else:
@@ -11135,7 +11573,7 @@ class Director:
             payload = self._shot_payload(
                 ctx, shot, continuity_anchor=len(scene_shots) > 1,
                 quality_override=quality_choice,
-                item_id=f"frames:{shot_no}")
+                item_id=f"frames:{shot_no}", frame_kind=kind)
             if plan_diagnostics.get("diagnosis_complete"):
                 reference_changes = self._apply_image_reference_adjustments(
                     payload, {"_project_id": project["id"]},
@@ -11250,7 +11688,7 @@ class Director:
                 **self._shot_payload(
                     ctx, shot, continuity_anchor=len(scene_shots) > 1,
                     quality_override=quality_choice,
-                    item_id=f"frames:{shot_no}"),
+                    item_id=f"frames:{shot_no}", frame_kind="frames"),
                 "feedback": feedback,
                 "revision": next_revision("first_frame", asset_name),
             }

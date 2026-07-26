@@ -40,13 +40,19 @@
 
 ## 镜头合同版本治理
 
-当前写入版本为 `aifos.shot-prompt/v2.1`。系统对旧 v2 合同采用“宽读
-严写”策略：可以读取并确定性补齐旧字段，但重新编译、修复、重试、保存或
-发起正式生成时只允许输出 v2.1。兼容回退不能覆盖明确的新字段，也不能
-降低 v2.1 硬门禁。
+`aifos.shot-prompt/v2.1` 已正式实现，作为人数、静态/视频分流、空间关系、
+媒介与参考图单一职责的稳定基线。当前治理目标为
+`aifos.shot-prompt/v2.2` hardening：不推翻 v2.1，而是在正式生成前进一步
+锁定构图语义、静态定格来源、头饰与头发可见性、道具实例和人物生命状态。
+
+系统对 v2.1 及更旧合同采用“宽读严写”策略：历史记录可以读取，但重新
+编译、修复、重试、保存或发起正式生成时必须输出 v2.2。旧静态镜头若只能
+从起止状态或描述回退，必须显式携带带名称的 `frame_target_policy`，并设置
+`allow_legacy_fallback:true`；否则生成前默认阻断。兼容不能覆盖已有的明确
+目标，也不能降低 v2.1 已落地的人数、媒介、空间与参考图硬门禁。
 
 旧 v2 没有 `functional_figures` 时，功能人物数为 0，总可见人数默认等于
-登记人物数；`subject.count` 继续保留为登记人物数的兼容别名。v2.1 的
+登记人物数；`subject.count` 继续保留为登记人物数的兼容别名。v2.1 已实现的
 规范人数来源是 `population.counts`，`subject.registered_count` /
 `functional_count` / `visible_count` 是迁移期直观别名。这个默认只适用于
 字段确实不存在的旧镜头。一旦镜头显式提供功能人物或总可见人数，三项人数
@@ -87,18 +93,98 @@
 | 静态图片 | 单个 `【定格状态】`、总可见人数、空间关系、静态机位与构图；首/尾相位只写结构化合同 | `【首帧定格】` / `【终点定格】`标签、同时出现 `【起点】`、`【单一主动作】`、`【终点】`的时间线及动作过程 |
 | 视频 | `【起点】→【单一主动作】→【终点】`、一次运镜、人数与空间路径 | 多个主动作、无边界的过程扩写 |
 
-静态定格状态优先采用 `freeze_state`、其次 `image_state`；没有这两个
-显式覆盖时，首帧采用 `start_state`，其余图片及尾帧采用 `end_state`，只有
-目标状态缺失才允许旧数据静态回退。合同必须记录结构化 `output`（媒体、
-帧相位、时间策略）、`frame_target`、`frame_target_state` 与
-`frame_target_source`；静态提示词仍统一使用 `【定格状态】`。显式字段
-具有权威性，低优先级内容只能补缺。诸如“循声走到、放下包袱、躲到门板后”
-的动作链不能进入图片提示词；图片只能写动作完成后可被一张画面同时观察到
-的姿态、道具位置、视线和空间关系。
+v2.2 中所有新静态图片任务必须显式携带结构化 `frame_target`、
+`frame_target_state` 与 `frame_target_source`。缺少明确目标时默认
+`BLOCK`，不得再从动作描述、提示词长文或“看起来像尾帧”自动猜测。静态
+提示词仍只渲染统一的 `【定格状态】`。
+
+历史镜头不能依靠隐式兼容直接付费生成。已有结构化 `frame_target`、
+`freeze_state` 或 `image_state` 时，编译器将该显式状态归一化为合同中的
+唯一 `frame_target`。只有需要从 `start_state`、`end_state`、description
+或 action 回退时，才允许使用如下兼容声明：
+
+```json
+{"frame_target_policy":{"name":"legacy_explicit","allow_legacy_fallback":true}}
+```
+
+兼容声明会使合同进入 `WARN`，而不是伪装成纯 `PASS`；没有声明时默认
+`BLOCK`。诸如“循声走到、放下包袱、躲到门板后”的动作链不能进入图片
+提示词；图片只能写动作完成后可被一张画面同时观察到的姿态、道具位置、
+视线和空间关系。
 
 视频仍需严格保留首帧起点、单一主动作和尾帧终点，不能因为图片模板已简化
 就丢失时序。Provider 不得擅自把图片合同转为视频动作，也不得把视频过程
 压成含糊的静态描述。
+
+## v2.2 构图与人物状态 hardening
+
+### 项目专用单人过肩
+
+`single_subject_over_shoulder` 是 AIFOS 项目专用构图，不采用影视术语中
+“过肩必然存在第二名对话者”的泛化解释。该构图严格只有一个登记主体和一具
+连续身体：近机位肩背、后脑、侧脸及可见躯干都属于同一人，不得补出第二名
+人物、对话者肩膀、分身或镜中额外人体。它仍必须满足
+`real_people_total=1`；若剧情确有第二人，应改用多人过肩合同并把第二人
+明确登记或列为精确功能人物。
+
+### 头饰与头发可见性
+
+每名登记角色的镜头状态必须分别记录结构化 `headwear` 与
+`hair_visibility`。`headwear.presence` 使用 `none` / `worn` / `unknown`；
+`headwear.kind` 使用 `none` / `hair_only` / `soft_hat` /
+`official_hat` / `crown` / `helmet` / `veil` / `hair_ornament` /
+`other` / `unknown`，并可用 `name` 写具体名称。`hair_visibility` 使用
+`fully_visible` / `partially_visible` / `covered` / `unknown`。身份参考
+锁定发际线和发型身份，不代表每个镜头都必须露出完整头发。
+
+以下矛盾默认 `BLOCK`：声明无头饰却画出帽冠；声明头发完全覆盖却同时要求
+完整发髻可见；没有摘戴动作却在相邻帧改变头饰；侧背镜强迫核验不可见的正面
+发际线。非关键发丝数量等纯视觉偏差不由结构化镜头合同 validator 判定。
+
+### 人物生命、意识、具身与移动状态
+
+人物状态必须把四个维度分开记录：
+
+- `life_state`：`alive` / `dead` / `nonliving` / `unknown`；
+- `consciousness_state`：`awake` / `asleep` / `unconscious` /
+  `not_applicable` / `unknown`；
+- `embodiment`：`physical` / `statue` / `portrait` / `imagined` /
+  `overlay` / `unknown`；
+- `mobility`：`active` / `limited` / `immobile` / `not_applicable` /
+  `unknown`。
+
+四维状态决定允许的表演与物理关系。尸体可以是
+`dead + not_applicable + physical + immobile`，仍计入真实可见人形，但
+禁止呼吸、眨眼、主动视线和自行移动；昏迷者是活人但无主动意识；灵魂或
+内心 Q 版不能因“可见”就获得真实身体、重力接触或真人移动路径。状态之间
+存在冲突，或转变没有可见事件与 `prop_transitions`/人物状态过渡支撑时，
+正式生成前必须 `BLOCK`。
+
+## v2.2 道具实例治理
+
+道具使用三个层级，禁止把剧情披露直接当成画面物理实例：
+
+- `prop_registry`：项目/本集级实例注册表。每项使用唯一 `prop_id`，并记录
+  `name`、`kind`、`instance_count:1`、可用事件边界和
+  `disclosure_policy`；同款多件实物必须拆成不同 `prop_id`；
+- `frame_props`：记录某个 `prop_id` 在 `start` / `end` / `freeze` 相位的
+  `physical_state`、`holder`、`location`、`support`、`visibility` 和
+  `representation`；
+- `prop_transitions`：使用 `prop_id`、`from_phase`、`to_phase` 与
+  `action` 记录同一实例在相位之间的拿取、交接、放置、损坏、隐藏或离场。
+
+`visibility` 只允许 `visible` / `occluded` / `hidden` / `absent`；
+`representation` 只允许 `physical` / `reflection` / `screen` /
+`painting` / `overlay`。反射、屏幕、画中画和叠层是披露形态，不建立第二个
+物理实例；`visibility=absent` 也不计物理实例。
+
+剧本提到、人物知道、镜头外存在或为了审计而披露的道具，只属于叙事披露；
+除非进入 `frame_props`，不得自动画进当前帧，也不增加物理实例数。同一个
+`prop_id` 在同一相位只能有一个物理主位置；同款多件必须先在
+`prop_registry` 中登记成不同 `prop_id`。`frame_props` 与定格状态、空间
+关系、手部接触和 `prop_transitions` 不一致时默认 `BLOCK`；遮挡应在
+`visibility` 中明确记录为 `occluded`，不能把“未看见”自动改写成
+`visibility=absent`。
 
 ## 参考图继承范围
 
@@ -122,7 +208,7 @@
 
 ## 空间关系与媒介一致性
 
-`spatial_relations` 是当前镜头事实，必须保留到 v2.1 合同并渲染为明确的
+`spatial_relations` 是当前镜头事实，必须从 v2.1 基线保留到 v2.2 合同并渲染为明确的
 “主体→关系→客体”。每条关系至少具有非空 subject、relation、object；
 缺少主体或客体时必须阻止生成，不能让模型猜测。空间关系只在当前镜头
 生效，不从身份图、全局故事或不匹配的连续性图传播。
@@ -144,6 +230,22 @@ Provider 不得静默选择其一。“半写实 3D”应明确归类为 3D 漫�
 - 可读文字和时代事实
 - 当前镜头提示词是否准确、简洁、无冲突
 - 本次实际上传的参考图是否正确、完整、用途绑定一致
+- `frame_target` 是否显式且能唯一决定静态定格
+- 头饰与头发可见性是否一致
+- 人物生命、意识、具身与移动状态是否允许当前表演
+- `frame_props` 的物理实例是否与注册表、空间关系和转移台账一致
+
+当前镜头合同 validator 输出聚合 `status`，并以三档表达处理结果：
+
+- `PASS`：合同没有阻断问题或兼容告警，可以进入下一阶段；
+- `WARN`：合同通过，但使用了显式允许的 legacy `frame_target` 回退；
+- `BLOCK`：缺失或冲突的硬事实，禁止付费生成、自动放行或进入下游。
+
+兼容字段 `passed` 仅在 `BLOCK` 时为 false；`severity` 使用对应的小写
+`pass` / `warn` / `block`。具体阻断原因进入字符串数组 `issues`，兼容回退
+提示进入 `warnings`。总体结果取最高严重度：任一阻断问题即整体 `BLOCK`；
+只有兼容告警时为 `WARN`。这里不承诺每个字符串问题都具有独立
+`rule_id`、字段路径或证据对象；视觉质检继续使用自身已有的报告结构。
 
 第一次失败后，只允许依据诊断修改当前镜头的提示词或参考图并自动重做
 一次。第二次仍失败时，该项进入“等待人工”，系统继续生产不依赖它的
