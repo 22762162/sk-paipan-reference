@@ -262,7 +262,10 @@ def test_background_extra_dialogue_does_not_block_the_episode(app):
             {"name": "站台路人", "role": "背景路人"},
         ],
         "scenes": [{
-            "scene_no": 1, "location": "车站", "action": "人群短暂让路",
+            # v2.1 人口合同禁止"人群/几名"这类模糊人数:要么按
+            # functional_figures 写精确数量,要么像这里只写具体的一个路人。
+            "scene_no": 1, "location": "车站",
+            "action": "路人侧身让开通道",
             "characters": ["林昭", "站台路人"],
             "lines": [
                 {"character": "林昭", "dialogue": "线索就在这里。"},
