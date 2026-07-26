@@ -144,3 +144,91 @@ def test_performance_cue_and_non_person_stay_separate_concepts():
     assert is_non_person_label("沉声") is False
     assert is_non_person_label("旁白") is True
     assert is_likely_performance_label("旁白") is False
+
+
+def test_script_parse_error_is_recorded_into_the_lessons_library(tmp_path):
+    """自愈闭环:系统自动纠正过旁白误识别,就要记进经验库(剧本域)。
+
+    这类错误在图片质检里永远看不到——它发生在剧本阶段,等到出图时已经
+    变成一张多余立绘。所以必须在剧本阶段留痕。
+    """
+    from aifos.app import App
+    from aifos.lessons import DOMAIN_SCRIPT, project_lessons
+
+    app = App(tmp_path / "ws")
+    try:
+        project, _ = app.projects.get_or_create_project("经验库剧本域")
+        ctx = {"project": dict(project)}
+        recorded = app.director._record_script_lessons(ctx, {
+            "non_person_labels_removed": ["旁白", "音效"],
+        })
+        assert recorded == 2
+
+        lessons = project_lessons(app.assets, project["id"])
+        assert len(lessons) == 2
+        assert all(item["domain"] == DOMAIN_SCRIPT for item in lessons)
+        assert any("旁白" in item["issue"] for item in lessons)
+        # 沿用既有闭环:默认待审核,未经人工批准不得注入提示词
+        assert all(item["status"] == "pending_review" for item in lessons)
+        assert all(not item["approved_for_prompt"] for item in lessons)
+    finally:
+        app.close()
+
+
+def test_script_lessons_never_leak_into_image_prompts(tmp_path):
+    """分域隔离:剧本教训不进出图提示词,出图教训不进编剧提示词。"""
+    from aifos.app import App
+    from aifos.lessons import (DOMAIN_IMAGE, DOMAIN_SCRIPT, lessons_block,
+                               project_lessons, record_lessons,
+                               script_lessons_block)
+
+    app = App(tmp_path / "ws")
+    try:
+        project, _ = app.projects.get_or_create_project("分域隔离")
+        pid = project["id"]
+        record_lessons(app.assets, pid, ["把旁白当成了人物写进人物表"],
+                       category="non_person_speaker", domain=DOMAIN_SCRIPT)
+        record_lessons(app.assets, pid, ["古代场景出现了现代笔记本电脑"],
+                       category="shot_image", domain=DOMAIN_IMAGE)
+
+        # 人工批准两条,才能验证注入时是否串味
+        import json
+        for row in app.assets.active_list(pid, kind="lesson"):
+            raw = row["meta"]
+            meta = json.loads(raw or "{}") if isinstance(raw, str) else (
+                dict(raw or {}))
+            meta["status"] = "approved"
+            meta["approved_for_prompt"] = True
+            app.assets.register(pid, "lesson", row["name"], meta=meta,
+                                new_version=True)
+
+        image_block = lessons_block(app.assets, pid)
+        script_block = script_lessons_block(app.assets, pid)
+        assert "笔记本电脑" in image_block and "旁白" not in image_block
+        assert "旁白" in script_block and "笔记本电脑" not in script_block
+        # 看板不分域,两条都要看得到
+        assert len(project_lessons(app.assets, pid)) == 2
+        assert len(project_lessons(app.assets, pid,
+                                   domain=DOMAIN_SCRIPT)) == 1
+    finally:
+        app.close()
+
+
+def test_legacy_lessons_without_domain_stay_in_the_image_domain(tmp_path):
+    """历史记录没有 domain 字段,必须仍按出图域处理,不能凭空跑进剧本域。"""
+    from aifos.app import App
+    from aifos.lessons import DOMAIN_IMAGE, DOMAIN_SCRIPT, project_lessons
+
+    app = App(tmp_path / "ws")
+    try:
+        project, _ = app.projects.get_or_create_project("历史兼容")
+        pid = project["id"]
+        app.assets.register(pid, "lesson", "legacyfingerprint", meta={
+            "issue": "古代场景出现了现代笔记本电脑",
+            "count": 3, "categories": {"shot_image": 3},
+        })
+        assert len(project_lessons(app.assets, pid,
+                                   domain=DOMAIN_IMAGE)) == 1
+        assert project_lessons(app.assets, pid, domain=DOMAIN_SCRIPT) == []
+    finally:
+        app.close()

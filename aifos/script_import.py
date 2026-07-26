@@ -269,6 +269,7 @@ def parse_text_script(text, project_title, episode_number):
     inferred_dialogue_count = 0
     unresolved_dialogue_count = 0
     quote_dialogue_count = 0
+    non_person_labels = []
 
     def open_scene(location):
         nonlocal current
@@ -294,6 +295,11 @@ def parse_text_script(text, project_title, episode_number):
         if line_match:
             speaker = _speaker(line_match.group(1), direct=True)
             if not speaker:
+                # 旁白/音效写成「角色:台词」格式的,留痕给经验库
+                if is_non_person_label(line_match.group(1)):
+                    label = line_match.group(1).strip()
+                    if label not in non_person_labels:
+                        non_person_labels.append(label)
                 _append_action(current, line)
                 continue
             current["lines"].append({
@@ -396,6 +402,8 @@ def parse_text_script(text, project_title, episode_number):
             "dialogue_preserved_verbatim": True,
         },
     }
+    if non_person_labels:
+        script["non_person_labels_removed"] = non_person_labels
     return script
 
 

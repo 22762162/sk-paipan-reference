@@ -5397,7 +5397,10 @@ function lessonsPanelHtml(data) {
     <h3>📋 质检观察库 <span class="dim">仅保留问题证据；默认不注入其他镜头，
       避免一次性修复累积成冲突的永久规则</span></h3>
     <ul>${lessons.slice(0, 8).map((item) =>
-      `<li><b>×${item.count}</b> ${esc(item.issue)}
+      `<li><b>×${item.count}</b>
+        <span class="lesson-domain ${item.domain === "script" ? "script" : "image"}"
+          >${item.domain === "script" ? "剧本解析" : "出图质检"}</span>
+        ${esc(item.issue)}
         <span class="rule-badge ${item.approved_for_prompt ? "live" : "adjustable"}">${item.approved_for_prompt ? "已人工批准为项目规则" : "待审核·不注入"}</span></li>`).join("")}</ul>
   </div>`;
 }

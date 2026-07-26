@@ -665,13 +665,24 @@ def strip_non_person_speakers(script):
     问题被修好又反复出现的原因之一。
     """
     if not isinstance(script, dict):
-        return
+        return []
+    removed = []
+
+    def note(label):
+        label = str(label or "").strip()
+        if label and label not in removed:
+            removed.append(label)
+
     characters = script.get("characters")
     if isinstance(characters, list):
-        script["characters"] = [
-            item for item in characters
-            if not (isinstance(item, dict)
-                    and is_non_person_label(item.get("name")))]
+        kept = []
+        for item in characters:
+            if isinstance(item, dict) and is_non_person_label(
+                    item.get("name")):
+                note(item.get("name"))
+                continue
+            kept.append(item)
+        script["characters"] = kept
     for scene in script.get("scenes") or []:
         if not isinstance(scene, dict):
             continue
@@ -681,8 +692,22 @@ def strip_non_person_speakers(script):
                 line["non_person_voice"] = True
         names = scene.get("characters")
         if isinstance(names, list):
-            scene["characters"] = [
-                name for name in names if not is_non_person_label(name)]
+            kept_names = []
+            for name in names:
+                if is_non_person_label(name):
+                    note(name)
+                    continue
+                kept_names.append(name)
+            scene["characters"] = kept_names
+    # 留痕给导演层记入经验库(能穿过子进程 JSON 回到主进程)
+    if removed:
+        existing = script.get("non_person_labels_removed")
+        merged = list(existing) if isinstance(existing, list) else []
+        for label in removed:
+            if label not in merged:
+                merged.append(label)
+        script["non_person_labels_removed"] = merged
+    return removed
 
 
 def validate_script(script, payload):
@@ -1247,6 +1272,9 @@ def build_prompt(capability, payload):
                 f"这是上一版剧本:\n{previous}\n\n"
                 f"用户的修改意见(必须逐条落实):{feedback}\n\n"
                 f"{source_policy}\n请在保留可取之处的前提下按意见重写。{prompt}")
+        lessons = str(payload.get("lessons") or "").strip()
+        if lessons:
+            prompt = f"{prompt}\n\n【经验库·严禁再犯】{lessons}"
         return prompt
     if capability == "storyboard":
         return STORYBOARD_PROMPT.format(

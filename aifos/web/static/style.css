@@ -4101,3 +4101,10 @@ textarea:focus-visible, select:focus-visible {
 .lessons-panel ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
 .lessons-panel li { color: var(--ink-2); font-size: 12px; }
 .lessons-panel li b { color: #ffd77a; margin-right: 6px; font-variant-numeric: tabular-nums; }
+/* 教训分域:剧本解析错误进编剧提示词,出图质检错误进出图/视频提示词 */
+.lesson-domain {
+  display: inline-block; margin-right: 6px; padding: 1px 6px;
+  border-radius: 999px; font-size: 10px; white-space: nowrap;
+}
+.lesson-domain.script { color: #cfe4ff; background: rgba(57, 135, 229, .18); }
+.lesson-domain.image { color: #ffd0b8; background: rgba(236, 131, 90, .16); }
