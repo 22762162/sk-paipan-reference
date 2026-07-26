@@ -1555,9 +1555,18 @@ CODEX_WRITER_ARGS = ("exec", "--sandbox", "read-only",
                      "--color", "never")
 
 
-def _invoke_engine(engine, binary, prompt, timeout):
-    """调用编剧引擎,返回 (ok, 文本或错误信息)。"""
+def _invoke_engine(engine, binary, prompt, timeout, codex_home=""):
+    """调用编剧引擎,返回 (ok, 文本或错误信息)。
+
+    codex_home 指定 codex 登录态目录(CODEX_HOME),让编剧走独立
+    账号通道(如 B 通道),不占默认账号的额度。"""
     if engine == "codex":
+        env = None
+        if codex_home:
+            home = Path(codex_home).expanduser()
+            if not home.is_dir():
+                return False, f"codex 编剧 CODEX_HOME 不存在: {home}"
+            env = dict(os.environ, CODEX_HOME=str(home.resolve()))
         fd, last = tempfile.mkstemp(prefix="aifos-codex-writer-",
                                     suffix=".txt")
         os.close(fd)
@@ -1565,7 +1574,7 @@ def _invoke_engine(engine, binary, prompt, timeout):
             proc = subprocess.run(
                 [binary, *CODEX_WRITER_ARGS,
                  "--output-last-message", last, prompt],
-                capture_output=True, text=True, timeout=timeout)
+                capture_output=True, text=True, timeout=timeout, env=env)
             if proc.returncode != 0:
                 detail = (proc.stderr.strip()
                           or proc.stdout.strip())[-300:]
@@ -1593,7 +1602,8 @@ def _invoke_engine(engine, binary, prompt, timeout):
     return True, proc.stdout
 
 
-def run(request, claude, timeout, engine="claude", codex="codex"):
+def run(request, claude, timeout, engine="claude", codex="codex",
+        codex_home=""):
     capability = request["capability"]
     payload = request.get("payload", {})
     binary = codex if engine == "codex" else claude
@@ -1604,7 +1614,8 @@ def run(request, claude, timeout, engine="claude", codex="codex"):
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     try:
-        ok, text = _invoke_engine(engine, binary, prompt, timeout)
+        ok, text = _invoke_engine(engine, binary, prompt, timeout,
+                                  codex_home=codex_home)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ok": False, "error": f"{engine} 调用失败: {exc}"}
     if not ok:
@@ -1698,12 +1709,16 @@ def main(argv=None):
                         help="编剧引擎;codex 供 Claude CLI 不可用时兜底")
     parser.add_argument("--codex", default="codex",
                         help="codex 可执行文件路径(--engine codex 时用)")
+    parser.add_argument("--codex-home", default="",
+                        help="codex 登录态目录(CODEX_HOME),"
+                             "编剧走独立账号通道时指定")
     parser.add_argument("--timeout", type=int, default=600)
     args = parser.parse_args(argv)
     try:
         request = json.loads(sys.stdin.read())
         reply = run(request, args.claude, args.timeout,
-                    engine=args.engine, codex=args.codex)
+                    engine=args.engine, codex=args.codex,
+                    codex_home=args.codex_home)
     except Exception as exc:
         reply = {"ok": False, "error": str(exc)}
     print(json.dumps(reply, ensure_ascii=False))

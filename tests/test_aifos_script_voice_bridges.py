@@ -50,6 +50,9 @@ assert args[args.index("--sandbox") + 1] == "read-only", args
 assert "--skip-git-repo-check" in args, args
 out = args[args.index("--output-last-message") + 1]
 prompt = args[-1]
+import os, pathlib
+probe = pathlib.Path(sys.argv[0]).parent / "codex_home_probe.txt"
+probe.write_text(os.environ.get("CODEX_HOME", ""), encoding="utf-8")
 if "分镜师" in prompt:
     data = {"episode_title": "T", "shots": [
         {"shot_no": 1, "scene_no": 1, "kind": "environment",
@@ -156,6 +159,33 @@ def test_codex_writer_failure_reports_stdout(tmp_path):
     assert not reply["ok"]
     assert "codex 编剧退出码 1" in reply["error"]
     assert "exhausted retries" in reply["error"]
+
+
+def test_codex_writer_uses_dedicated_codex_home(tmp_path):
+    codex = _make_bin(tmp_path, "codex", FAKE_CODEX)
+    home_b = tmp_path / "codex-home-b"
+    home_b.mkdir()
+    reply = _bridge("aifos.adapters.claude_script", {
+        "capability": "script",
+        "payload": {"project_title": "万妖图录", "episode_number": 15,
+                    "premise": "", "style": ""},
+        "out_dir": str(tmp_path / "out")},
+        ["--engine", "codex", "--codex", str(codex),
+         "--codex-home", str(home_b)])
+    assert reply["ok"], reply
+    probe = (codex.parent / "codex_home_probe.txt").read_text("utf-8")
+    assert probe == str(home_b.resolve())
+
+
+def test_codex_writer_missing_codex_home_fails_clearly(tmp_path):
+    codex = _make_bin(tmp_path, "codex", FAKE_CODEX)
+    reply = _bridge("aifos.adapters.claude_script", {
+        "capability": "script", "payload": {},
+        "out_dir": str(tmp_path)},
+        ["--engine", "codex", "--codex", str(codex),
+         "--codex-home", str(tmp_path / "no-such-home")])
+    assert not reply["ok"]
+    assert "CODEX_HOME 不存在" in reply["error"]
 
 
 def test_extract_json_tolerates_noise():

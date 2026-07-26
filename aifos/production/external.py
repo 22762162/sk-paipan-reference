@@ -16,6 +16,7 @@ import time
 import urllib.request
 from pathlib import Path
 
+from ..channel_stats import record as record_channel_stat
 from ..errors import ProduceCancelled, ProviderError, ProviderUnavailable
 from .base import Provider, ProviderResult
 
@@ -152,20 +153,38 @@ class CliProvider(Provider):
                 env = os.environ.copy()
                 env["CODEX_HOME"] = str(home.resolve())
                 env["AIFOS_CODEX_PROFILE"] = profile_id
-        returncode, stdout, stderr = run_interruptible(
-            self.name, command, request,
-            self.conf.get("timeout", 600), cancel=cancel, env=env)
+        started = time.monotonic()
+
+        def _stat(ok, error=""):
+            # 只统计 Codex 通道;用户手动停止(ProduceCancelled)不计入。
+            if self.name != "codex":
+                return
+            record_channel_stat(
+                out_dir, self.name, profile_id, capability,
+                time.monotonic() - started, ok, error=error)
+
+        try:
+            returncode, stdout, stderr = run_interruptible(
+                self.name, command, request,
+                self.conf.get("timeout", 600), cancel=cancel, env=env)
+        except ProviderError as exc:
+            _stat(False, error=str(exc))   # 超时/启动失败也计入通道账
+            raise
         if returncode != 0:
+            _stat(False, error=f"退出码 {returncode}")
             raise ProviderError(
                 f"{self.name} 退出码 {returncode}: "
                 f"{stderr.strip()[:500]}")
         try:
             reply = json.loads(stdout.strip().splitlines()[-1])
         except (ValueError, IndexError) as exc:
+            _stat(False, error="输出不是合法 JSON")
             raise ProviderError(f"{self.name} 输出不是合法 JSON") from exc
         if not reply.get("ok"):
+            _stat(False, error=str(reply.get("error", "未知错误")))
             raise ProviderError(
                 f"{self.name} 返回失败: {reply.get('error', '未知错误')}")
+        _stat(True)
         return ProviderResult(
             provider=self.name,
             cost=float(reply.get("cost", self.cost_per_call)),
