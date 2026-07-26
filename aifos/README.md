@@ -119,8 +119,9 @@ python3 -m aifos tunnel --record https://xxxx.trycloudflare.com/
 ## 生产流程
 
 ```
-需求/剧本 → 人物分析/视觉DNA/角色去重 → 候选与人工定版
-         → 独立三视图母资产 → 连续性圣经 → 五维分镜 → 角色/场景资产 → 关键帧
+需求/剧本 → 人物分析/视觉DNA/角色去重 → 每组画面4张候选
+         → CODEX 评选自动确认1张(人工可改选) → 独立三视图母资产
+         → 连续性圣经 → 五维分镜 → 角色/场景资产 → 关键帧
          → 文字锁定 → 首尾帧 → 14项开拍门禁 → Seedance视频
          → Seedance2 随视频配音/口型 → 无字幕母版剪辑 → 三层质检
          → 封面/标题/拆条 → 数据沉淀
@@ -183,14 +184,47 @@ AI 导演中心按 14 个阶段顺序调度;每个阶段落任务表(`tasks`),
 - **导出/导入**:JSON 标准包不含密钥,带 schema 与 SHA-256 内容指纹;导入
   会验证指纹,损坏或被篡改的包不会入库。
 
+## 图片资产:一组四张 → CODEX 评选 → 自动确认
+
+**第一个剧本确认后立即开始生产图片资产**。每一组画面(每个正式角色、每件
+核心道具、每个场景)统一生成 **4 张候选**,再由 **CODEX 主导的视觉评选**
+按本剧本要求逐张打分,**自动确认其中一张**为该组的定版母资产;人工随时
+可以改选并重新确认。
+
+```
+剧本确认 → 人物×4 / 核心道具×4 / 场景×4(同一批并行)
+        → image_select:CODEX 逐张打开候选并按剧本要求打分
+        → 自动确认最符合的一张 → 继续五维分镜/关键帧/首尾帧/开拍门禁
+```
+
+- **评选依据**:该组从剧本与制作圣经压缩出的要求清单(人物的性别、年龄段、
+  身份职业、时代、服装与标志特征;道具的剧情功能、结构、时代材质、持有人;
+  场景的地点、时间天气、空间布局与"空镜不得出现人物"硬规则),外加本剧
+  唯一画风。评选只在同组四张之间横向比较,剧本没写的细节不算扣分项。
+- **失败关闭**:评选产线不可用、应答结构非法、判定四张都有硬伤
+  (`needs_human`)或置信度低于阈值时,**不做任何锁定**,该组退回人工
+  四选一(剧集停在 `awaiting_cast`),其余能定的组照常自动确认。
+  绝不凭猜测定版。
+- **路由**:`image_select` 能力按 `codex → claude → claude_api → mock`
+  回退;`defaults.auto_select_candidates=false` 可整体关掉自动确认,
+  回到全人工四选一;`defaults.auto_select_min_confidence`(默认 0.6)
+  调整自动确认阈值。
+- **人工改选**:`POST /api/character/select`、`/api/prop/select`、
+  `/api/scene/select` 在生产批次没有在跑时随时可用。改掉已确认的母资产会
+  作废由它派生的人物资产套件,并退回定版检查点;分镜画面按参考图对照表
+  参与内容哈希,断点续产会自动重画受影响的镜头。
+- **落库**:定版资产的 `selection_source` 记 `auto_codex` 或 `human`,
+  `auto_selection` 保存评选理由、把握度与逐张分数;整组结论存为
+  `cast_auto_selection` 文档,网页定版页与 CLI 都会展示未能自动确认的组。
+
 ### 每集快照、暂停确认与 `force`
 
 新剧集第一次生产时会把当前生效标准完整保存为 `production_standard` 单集
 快照,分镜、门禁、质检和交付均记录同一指纹。之后切换全局标准不会追改已经
 开工的剧集:
 
-- `pause_for_confirm=True` 在剧本、连续性、角色/场景、五维分镜、关键帧、
-  文字资产、首尾帧和门禁完成后暂停;
+- `pause_for_confirm=True` 在剧本确认处暂停一次,图片资产自动确认后一路做到
+  开拍门禁再暂停第二次;只有 CODEX 评选未能自动确认时才在候选定版处多停一次;
 - 用户确认时再次调用普通 `produce`,继续使用暂停时的旧快照;
 - 普通断点续产也恢复该快照并复用已落盘产物,不会因标准中心刚刚切版而混用
   旧分镜和新声画参数;
@@ -228,13 +262,14 @@ HTTP 409 及实际生效版本 id。
 
 ## 模型协同与 Provider 路由
 
-能力(script/storyboard/image/frames/video/voice/edit/cover)按
-`routing` 配置的优先级链路由,前者不可用自动回退后者:
+能力(script/storyboard/image/frames/video/voice/edit/cover/image_qc/
+image_select)按 `routing` 配置的优先级链路由,前者不可用自动回退后者:
 
 ```
 video: 即梦CLI(订阅额度内) → API 备用 → mock
 voice: 随 Seedance2 视频完成；无声兼容模式才走豆包 TTS → API → mock
 image: Codex → API 备用 → mock
+image_select: Codex → Claude CLI → Claude API → mock(一组四张的评选与自动确认)
 ```
 
 - **即梦 CLI 优先使用订阅额度**:`quota` 表本地计数 + `dreamina
@@ -315,8 +350,9 @@ macOS 实机 `workspace/config.json` 示例:
 进行中、失败和进度。
 
 注:`codex` 经内置适配桥 `aifos.adapters.codex_image` 转为
-`codex exec` 出图指令(image/frames/cover 三能力,产出后校验文件
-落盘),按上例把 `--codex` 指向绝对路径即可;`dreamina` 无需包装,
+`codex exec` 指令(image/frames/cover 出图并校验文件落盘,image_qc 视觉
+质检,image_select 一组四张的评选与自动确认——后两者只读图、只回一行
+JSON,不产出文件),按上例把 `--codex` 指向绝对路径即可;`dreamina` 无需包装,
 开箱即用。每次外部调用的完整命令与原始输出都会落盘
 (`shot_XXX.dreamina.log` / `codex_*.log`)便于排查。
 

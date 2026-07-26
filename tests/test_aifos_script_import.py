@@ -123,7 +123,7 @@ def test_produce_with_provided_script(tmp_path):
     try:
         script = parse_text_script(SAMPLE, "万妖图录", 20)
         summary = app.director.produce("万妖图录", 20, script=script)
-        assert summary["status"] == "awaiting_cast"
+        assert summary["status"] == "done"
         project = app.projects.get_project("万妖图录")
         episode = app.db.query_one(
             "SELECT * FROM episodes WHERE project_id=? AND number=20",
@@ -159,7 +159,8 @@ def test_cli_script_file(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 0
     assert "已导入剧本:2 场,3 个角色" in out
-    assert "制作人物/道具待选" in out
+    # 剧本导入后图片资产自动定版，整集直接跑完
+    assert "制作完成" in out
     app = App(ws)
     try:
         project = app.projects.get_project("万妖图录")

@@ -240,6 +240,34 @@ class ClaudeApiProvider(Provider):
     QC_MEDIA = {".png": "image/png", ".jpg": "image/jpeg",
                 ".jpeg": "image/jpeg", ".webp": "image/webp"}
 
+    def _select_content(self, prompt, payload):
+        """候选评选：按候选编号顺序上传同一组四张图，编号必须与提示词对齐。"""
+        import base64
+        from pathlib import Path as _P
+        content = []
+        for item in payload.get("candidates") or []:
+            if not isinstance(item, dict) or not item.get("uri"):
+                continue
+            path = _P(str(item["uri"]))
+            media = self.QC_MEDIA.get(path.suffix.lower())
+            if media is None or not path.exists():
+                raise ProviderError(f"候选图不可读取: {item.get('uri')}")
+            data = path.read_bytes()
+            if len(data) > 20 * 1024 * 1024:
+                raise ProviderError(f"候选图超过 20MB: {item.get('uri')}")
+            content.append({
+                "type": "text",
+                "text": f"下面是候选{item.get('index')}"
+                        f"(差异轴={item.get('variant_label') or '未标注'})。",
+            })
+            content.append({"type": "image", "source": {
+                "type": "base64", "media_type": media,
+                "data": base64.b64encode(data).decode()}})
+        if not content:
+            raise ProviderError("候选评选未收到任何可读取的候选图")
+        content.append({"type": "text", "text": prompt})
+        return content
+
     def _qc_content(self, prompt, payload):
         """图片质检：上传待检图及本次生成实际使用的全部参考图。
 
@@ -335,6 +363,8 @@ class ClaudeApiProvider(Provider):
             raise ProviderError(str(exc)) from exc
         if capability == "image_qc":
             content = self._qc_content(prompt, payload)
+        elif capability == "image_select":
+            content = self._select_content(prompt, payload)
         elif capability == "script" and payload.get("character_design"):
             content = self._design_content(prompt, payload)
         else:
@@ -363,6 +393,9 @@ class ClaudeApiProvider(Provider):
             if capability == "image_qc":
                 from ..adapters.claude_script import validate_image_qc
                 error = validate_image_qc(data)
+            elif capability == "image_select":
+                from ..auto_select import validate_image_select
+                error = validate_image_select(data)
             elif capability == "script":
                 error = validate_script(data, payload)
             else:

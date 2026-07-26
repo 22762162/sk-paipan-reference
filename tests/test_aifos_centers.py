@@ -82,7 +82,7 @@ def test_workspace_paths_absolute(tmp_path, monkeypatch):
         assert relative.workspace.root.is_absolute()
         assert relative.workspace.artifacts_dir.is_absolute()
         summary = relative.director.produce("路径剧", 1)
-        assert summary["status"] == "awaiting_cast"
+        assert summary["status"] == "done"
         project = relative.projects.get_project("路径剧")
         episode = relative.db.query_one(
             "SELECT * FROM episodes WHERE project_id=? AND number=1",

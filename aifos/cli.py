@@ -12,8 +12,25 @@ import sys
 
 from . import __version__
 from .app import App
-from .director import character_candidate_policy_text
+from .director import (auto_selection_policy_text,
+                       character_candidate_policy_text)
 from .errors import AifosError
+
+
+def _pending_auto_selection(app, title, number):
+    """返回 CODEX 未能自动确认、仍待人工定版的组。"""
+    project = app.projects.get_project(title)
+    if project is None:
+        return []
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=?",
+        (project["id"], number))
+    if episode is None:
+        return []
+    report, _ = app.projects.latest_document(
+        episode["id"], "cast_auto_selection")
+    return [item for item in (report or {}).get("items", [])
+            if not item.get("auto_confirm")]
 
 PRODUCE_PATTERN = re.compile(r"《(?P<title>.+?)》\s*第\s*(?P<number>\d+)\s*集")
 
@@ -277,14 +294,20 @@ def _cmd_produce(app, args):
     print(f"产物目录: {summary['artifacts_dir']}")
     if summary["status"] == "awaiting_script":
         print("\n剧本已生成,先过目(还没开始画图,不花出图/视频额度)。")
-        print("满意 → 运行 confirm 开始画人物/场景/分镜;")
+        print("满意 → 运行 confirm 开始生产图片资产"
+              "(每组画面4张 → CODEX 评选自动确认1张);")
         print("不满意 → 运行 revise --feedback \"你的意见\" 重写:")
         print(f"  python3 -m aifos confirm --project {title} --episode {number}")
         return 0
     if summary["status"] == "awaiting_cast":
-        print(f"\n正式角色统一4张候选：{character_candidate_policy_text()}。"
-              "核心道具也统一四选一；请在 AIFOS 网页逐个定版。")
-        print("全部锁定后再运行 confirm；未锁定前不会生成任何后续图片。")
+        print(f"\n每组画面统一4张候选：{character_candidate_policy_text()}。"
+              "核心道具与场景同样四选一。")
+        print(f"{auto_selection_policy_text()}。")
+        print("以下组 CODEX 未能自动确认，请在 AIFOS 网页人工定版后再运行 "
+              "confirm：")
+        for item in _pending_auto_selection(app, title, number):
+            print(f"  - {item['subject']}「{item['name']}」:"
+                  f"{item.get('reason') or '待人工选择'}")
         return 0
     if summary["status"] == "awaiting_confirm":
         print("\n预生产完成(剧本/人物图/场景图/分镜/首尾帧)。检查满意后运行:")
@@ -298,7 +321,7 @@ def _status_cn(status):
     return {"done": "完成", "failed": "失败", "qc_failed": "完成(质检未过)",
             "awaiting_confirm": "待确认",
             "awaiting_script": "剧本待确认",
-            "awaiting_cast": "人物/道具待选"}.get(status, status)
+            "awaiting_cast": "人物/道具/场景待人工定版"}.get(status, status)
 
 
 def _cmd_tunnel(args):
@@ -356,24 +379,33 @@ def _cmd_confirm(app, args):
         "SELECT * FROM episodes WHERE project_id=? AND number=?",
         (project["id"], args.episode))
     if episode is not None and episode["status"] == "awaiting_script":
-        # 第一道确认:剧本 OK → 人物/核心道具各生成4张候选，再停下来人工定版。
-        print(f"剧本已确认,开始画《{args.project}》第{args.episode}集"
-              "的人物与核心道具候选 …")
+        # 第一道确认:剧本 OK → 每组画面各画4张候选，CODEX 评选自动确认1张。
+        print(f"剧本已确认,开始生产《{args.project}》第{args.episode}集"
+              "的图片资产:人物/核心道具/场景各4张候选，"
+              "由 CODEX 评选自动确认 …")
         summary = app.director.produce(
             args.project, args.episode, pause_for_confirm=True)
-        print(f"{_status_cn(summary['status'])};请先在网页中为每名正式角色和核心道具各选1张，"
-              "再运行 confirm")
+        if summary["status"] == "awaiting_cast":
+            print(f"{_status_cn(summary['status'])};"
+                  "以下组未能自动确认，请在网页人工定版后再运行 confirm:")
+            for item in _pending_auto_selection(
+                    app, args.project, args.episode):
+                print(f"  - {item['subject']}「{item['name']}」:"
+                      f"{item.get('reason') or '待人工选择'}")
+        else:
+            print(f"{_status_cn(summary['status'])};"
+                  "图片资产已自动确认,可继续运行 confirm 开始视频生产")
         return 0
     if episode is not None and episode["status"] == "awaiting_cast":
         script_doc, _ = app.projects.latest_document(episode["id"], "script")
         selection = app.director.production_asset_selection_status(
             project["id"], script_doc or {})
         if not selection["passed"]:
-            print("人物或核心道具尚未全部选定。请先在 AIFOS 网页逐一选定。",
+            print("人物、核心道具或场景尚未全部定版。请先在 AIFOS 网页逐一选定。",
                   file=sys.stderr)
             return 1
-        print(f"人物与核心道具已锁定,开始画《{args.project}》第{args.episode}集"
-              "的场景/分镜/首尾帧 …")
+        print(f"图片资产已定版,开始画《{args.project}》第{args.episode}集"
+              "的分镜/首尾帧 …")
         summary = app.director.produce(
             args.project, args.episode, pause_for_confirm=True)
         print(f"{_status_cn(summary['status'])};满意后再运行一次 "

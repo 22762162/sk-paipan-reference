@@ -617,6 +617,7 @@ def _image_asset_catalog(app, project_id):
         "character_candidate": "人物候选",
         "character_art": "人物立绘", "character_sheet": "人物设定",
         "prop_candidate": "道具候选", "prop_identity": "核心道具母资产",
+        "scene_candidate": "场景候选",
         "scene_art": "场景概念图", "image": "镜头关键图",
         "first_frame": "首帧", "last_frame": "尾帧",
         "cover": "封面", "reference": "上传参考图",
@@ -663,7 +664,7 @@ def _image_asset_catalog(app, project_id):
     selected_candidate_ids = {
         str(app.assets.meta(row).get("candidate_asset_id"))
         for row in active_rows if row["kind"] in {
-            "character_identity", "prop_identity"}
+            "character_identity", "prop_identity", "scene_art"}
         and app.assets.meta(row).get("candidate_asset_id")
     }
     stored_prompts = {}
@@ -702,7 +703,8 @@ def _image_asset_catalog(app, project_id):
             return "production"
         if kind == "character_sheet":
             return "character_support"
-        if kind in {"character_candidate", "prop_candidate"}:
+        if kind in {"character_candidate", "prop_candidate",
+                    "scene_candidate"}:
             return "candidate"
         if kind == "reference":
             return "reference"
@@ -721,6 +723,8 @@ def _image_asset_catalog(app, project_id):
             return "已定版候选" if selected else "候选图·未定版不入镜头"
         if kind == "prop_candidate":
             return "已定版道具候选" if selected else "道具候选·未定版不入镜头"
+        if kind == "scene_candidate":
+            return "已定版场景候选" if selected else "场景候选·未定版不入镜头"
         return {
             "character_art": "身份锚点·自动使用",
             "scene_art": "场景锚点·自动使用",
@@ -754,6 +758,11 @@ def _image_asset_catalog(app, project_id):
             character = meta.get("character") or name.split(":", 1)[0]
             sheet = meta.get("sheet") or name.split(":", 1)[-1]
             return f"sheet:{character}:{sheet}"
+        if kind == "scene_candidate":
+            location = meta.get("location") or name.rsplit(":", 1)[0]
+            index = int(
+                meta.get("candidate_index") or name.rsplit(":", 1)[-1])
+            return f"scene_candidate:{location}:{index}"
         if kind == "scene_art":
             return f"scene:{name}"
         if kind == "image":
@@ -989,6 +998,7 @@ def _production_progress(app, episode, render_plan):
     category_labels = {
         "character_candidate": "人物候选",
         "prop_candidate": "道具候选",
+        "scene_candidate": "场景候选",
         "character_art": "人物立绘",
         "character_sheet": "人物设定图",
         "scene_art": "场景图",
@@ -1939,6 +1949,15 @@ def _episode_payload(app, episode_id, jobs=None):
         for candidate in prop.get("candidates", []):
             candidate["url"] = _artifact_url(
                 app, candidate.get("uri", ""))
+    for scene in cast_selection.get("scenes", []):
+        if scene.get("identity_uri"):
+            scene["identity_url"] = _artifact_url(
+                app, scene["identity_uri"])
+        for candidate in scene.get("candidates", []):
+            candidate["url"] = _artifact_url(
+                app, candidate.get("uri", ""))
+    cast_auto_selection, _cast_auto_v = app.projects.latest_document(
+        episode_id, "cast_auto_selection")
     tasks = [dict(t) for t in app.db.query(
         "SELECT id, stage, name, status, provider, cost, error, created_at, "
         "updated_at FROM tasks WHERE episode_id=? ORDER BY id",
@@ -2087,6 +2106,8 @@ def _episode_payload(app, episode_id, jobs=None):
         "series_source_version": series_source_v,
         "series_batch": app.series.batch_for_episode(episode_id),
         "cast_selection": cast_selection,
+        # 一组四张 → CODEX 评选 → 自动确认;含每组理由与待人工清单
+        "cast_auto_selection": cast_auto_selection or {},
         "qc_report": qc_report,
         "video_qc_report": video_qc_report,
         "video_qc_report_version": video_qc_report_v,
@@ -2380,6 +2401,8 @@ def make_handler(workspace, jobs):
                     return self._character_select()
                 if parsed.path == "/api/prop/select":
                     return self._prop_select()
+                if parsed.path == "/api/scene/select":
+                    return self._scene_select()
                 if parsed.path == "/api/character/assets-policy":
                     return self._character_assets_policy()
                 if parsed.path == "/api/character/regenerate":
@@ -3074,8 +3097,9 @@ def make_handler(workspace, jobs):
                             found_episode_id, "script")[0] or {}))
                 if not selection.get("passed"):
                     return self._error(
-                        409, "请先为每名正式角色选定最终立绘，并为每件核心道具"
-                        "选定最终图，再继续生产")
+                        409, "CODEX 评选未能自动确认全部图片资产：请先为每名"
+                        "正式角色选定最终立绘，并为每件核心道具和每个场景各选"
+                        "定一张，再继续生产")
             # 剧本确认 → 继续预生产(画完人物/分镜再停一次);
             # 开拍确认 → 自动完成视频/配音/剪辑/质检
             job_id = jobs.start(
@@ -3128,6 +3152,30 @@ def make_handler(workspace, jobs):
                 return self._error(400, str(exc))
             return self._json(result)
 
+        def _scene_select(self):
+            """人工改选场景概念图定版(自动确认后随时可改)。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            name = str(body.get("scene") or "").strip()
+            index = body.get("candidate_index")
+            if not name or index is None:
+                return self._error(400, "缺少 scene/candidate_index")
+            title, number = found
+            if jobs.running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，请先停止生成，待状态稳定后再改选场景")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.select_scene_candidate(
+                        title, number, name, int(index)))
+            except (AifosError, TypeError, ValueError) as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
         def _character_assets_policy(self):
             """保存本集人物扩展资产的自动/简化/完整选择。"""
             body = self._read_body()
@@ -3171,8 +3219,11 @@ def make_handler(workspace, jobs):
             title, number = found
             character_name = str(body.get("character") or "").strip()
             prop_name = str(body.get("prop") or "").strip()
-            if character_name and prop_name:
-                return self._error(400, "character 与 prop 只能指定一个")
+            scene_name = str(body.get("scene") or "").strip()
+            if len([v for v in (character_name, prop_name, scene_name)
+                    if v]) > 1:
+                return self._error(
+                    400, "character、prop 与 scene 只能指定一个")
             if jobs.running_for(title, number):
                 return self._error(
                     409, "本集正在生产，请先暂停，待状态稳定后再重做人物候选")
@@ -3181,12 +3232,14 @@ def make_handler(workspace, jobs):
                 lambda app, run_id: app.director.regenerate_character_candidates(
                     title, number, run_id=run_id,
                     character_name=character_name,
-                    prop_name=prop_name),
+                    prop_name=prop_name,
+                    location=scene_name),
                 action="regenerate_cast",
                 request={
                     "reason": "manual_regenerate_cast",
                     "character": character_name,
                     "prop": prop_name,
+                    "scene": scene_name,
                 })
             return self._json({"job_id": job_id}, status=202)
 

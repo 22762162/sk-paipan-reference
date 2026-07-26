@@ -27,20 +27,20 @@ def app(tmp_path):
 
 def _preproduce(app, title="万妖图录", number=1, asset_mode=None):
     app.director.produce(title, number, pause_for_confirm=True)   # 剧本停
-    summary = app.director.produce(
-        title, number, pause_for_confirm=True)   # 人物候选停
+    project = app.projects.get_project(title)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=?",
+        (project["id"], number))
+    if asset_mode:
+        # 人物资产模式在开画前选定，随后的候选/套件都按该模式生产
+        app.director.update_character_asset_policy(episode["id"], asset_mode)
+    # 剧本确认 → 每组四张候选 → CODEX 评选自动确认 → 直到开拍门禁
+    summary = app.director.produce(title, number, pause_for_confirm=True)
     if summary["status"] == "awaiting_cast":
-        project = app.projects.get_project(title)
-        episode = app.db.query_one(
-            "SELECT * FROM episodes WHERE project_id=? AND number=?",
-            (project["id"], number))
         script, _ = app.projects.latest_document(episode["id"], "script")
         for character in script["characters"]:
             app.director.select_character_candidate(
                 title, number, character["name"], 1)
-        if asset_mode:
-            app.director.update_character_asset_policy(
-                episode["id"], asset_mode)
         app.director.produce(title, number, pause_for_confirm=True)
     return app.projects.get_project(title)
 
@@ -180,6 +180,8 @@ def test_background_extras_skip_design_and_generic_support_gets_one_candidate(ap
             ],
         }],
     }
+    # 本例只校验背景路人不建立人物资产,停在候选检查点即可
+    app.config.data["defaults"]["auto_select_candidates"] = False
     summary = app.director.produce(
         "轻量角色测试", 1, script=script, pause_for_confirm=True)
     assert summary["status"] == "awaiting_script"
@@ -247,9 +249,8 @@ def test_character_suite_generated(app):
     assert all(i["status"] in ("done", "reused") for i in sheet_items)
 
 
-def test_scene_and_character_sheets_share_one_parallel_batch(
-        app, monkeypatch):
-    """无依赖的场景图和人物母资产必须同批开工，不能先 1 路再 N 路。"""
+def test_candidate_groups_share_one_parallel_batch(app, monkeypatch):
+    """人物/道具/场景候选无依赖，必须同批开工，不能一组一组排队。"""
     batches = []
     original = app.director._run_parallel
 
@@ -258,16 +259,19 @@ def test_scene_and_character_sheets_share_one_parallel_batch(
             str(task.get("item_id") or "").split(":", 1)[0]
             for task in tasks
         }
-        if categories & {"scene", "sheet"}:
+        if categories & {"candidate", "prop_candidate", "scene_candidate",
+                         "sheet"}:
             batches.append({"categories": categories, "line": line})
         return original(ctx, tasks, line=line, **kwargs)
 
     monkeypatch.setattr(app.director, "_run_parallel", record_batch)
     _preproduce(app, title="同批并发测试", asset_mode="full")
 
-    assert len(batches) == 1
-    assert batches[0]["categories"] >= {"scene", "sheet"}
-    assert batches[0]["line"] == "人物/场景独立资产"
+    # 一批候选(人物+场景，本例无核心道具) + 一批人物资产套件
+    assert len(batches) == 2
+    assert batches[0]["categories"] >= {"candidate", "scene_candidate"}
+    assert "图片资产候选" in batches[0]["line"]
+    assert batches[1]["categories"] == {"sheet"}
 
 
 def test_auto_character_asset_policy_is_conservative():
@@ -387,6 +391,8 @@ def test_legacy_sheet_plan_migrates_to_full_without_silent_downgrade(app):
 
 def test_switching_to_simple_keeps_history_but_excludes_old_turnaround(app):
     """切到简化版不删旧资产，但旧四视图不再污染后续参考链。"""
+    # 本例校验人工定版检查点上的模式切换，关掉自动确认
+    app.config.data["defaults"]["auto_select_candidates"] = False
     app.director.produce("保留历史", 1, pause_for_confirm=True)
     app.director.produce("保留历史", 1, pause_for_confirm=True)
     project = app.projects.get_project("保留历史")
@@ -835,14 +841,18 @@ def test_restyle_project_regenerates_all_art(app):
     # 历史候选槽位继续保留为版本记录；有效候选数量由角色重要度控制。
     assert set(before).issubset(after)
     for key, version in before.items():
-        assert after[key] == version + 1, f"{key} 未重做"
+        # 候选与套件各写一版失效墓碑；身份与场景定版图在墓碑之后又被
+        # CODEX 评选重新自动确认，因此多一版。
+        expected = version + (
+            2 if key[0] in ("character_identity", "scene_art") else 1)
+        assert after[key] == expected, f"{key} 未重做"
     selection = app.director.character_selection_status(
         project["id"], script["characters"])
     assert all(item["candidate_count"] == character_candidate_target(
         next(c for c in script["characters"]
              if c["name"] == item["character"]))
                for item in selection["characters"])
-    # 新画风必须重新人工定版，不能自动覆盖最终立绘
+    # 新画风回到定版检查点:CODEX 已按新画风自动确认，人工可再改选
     episode = app.db.query_one(
         "SELECT * FROM episodes WHERE project_id=? AND number=1",
         (project["id"],))

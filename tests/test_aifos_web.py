@@ -1399,30 +1399,7 @@ def test_produce_flow_and_episode_api(server):
     assert pre["storyboard"] is None
     assert pre["artifacts"]["cast_art"] == []
 
-    # 第一道确认(剧本 OK)→ 按角色重要度生成候选后停下。
-    status, reply = _json_request(port, "POST", "/api/confirm", {
-        "episode_id": episode_id})
-    assert status == 202 and reply["phase"] == "awaiting_script"
-    job = _wait_job(port, reply["job_id"])
-    assert job["summary"]["status"] == "awaiting_cast"
-
-    status, pre = _json_request(port, "GET", f"/api/episode/{episode_id}")
-    assert pre["storyboard"] is None
-    selection = pre["cast_selection"]
-    assert not selection["passed"]
-    assert all(len(c["candidates"]) == character_candidate_target(c)
-               for c in selection["characters"])
-    assert all(candidate["url"].startswith("/artifacts/")
-               for c in selection["characters"]
-               for candidate in c["candidates"])
-    assert all(candidate["variant_source"] == "generated"
-               for c in selection["characters"]
-               for candidate in c["candidates"])
-    assert all(candidate["variant_label"] and candidate["look_variant"]
-               for c in selection["characters"]
-               for candidate in c["candidates"])
-    assert pre["artifacts"]["cast_art"] == []
-    assert pre["artifacts"]["scene_art"] == []
+    # 人物资产模式在开画前就能选定
     assert pre["character_asset_policy"]["mode"] == "auto"
     policy_version = pre["character_asset_policy_version"]
     status, missing_version = _json_request(
@@ -1450,35 +1427,65 @@ def test_produce_flow_and_episode_api(server):
             "expected_version": policy_version,
         })
     assert status == 409 and "刷新" in stale["error"]
-    # 未完成四选一，后端也必须拒绝绕过门禁。
-    status, blocked = _json_request(port, "POST", "/api/confirm", {
-        "episode_id": episode_id})
-    assert status == 409 and "最终立绘" in blocked["error"]
 
-    # 人物定版页允许放弃当前选择并回到候选生成;旧版本仍保留在历史中。
-    status, reply = _json_request(port, "POST", "/api/character/regenerate", {
+    # 第一道确认(剧本 OK)→ 每组画面四张候选 → CODEX 评选自动确认 →
+    # 一路画到开拍门禁。
+    status, reply = _json_request(port, "POST", "/api/confirm", {
         "episode_id": episode_id})
-    assert status == 202 and reply["job_id"]
+    assert status == 202 and reply["phase"] == "awaiting_script"
     job = _wait_job(port, reply["job_id"])
-    assert job["summary"]["status"] == "awaiting_cast"
+    assert job["summary"]["status"] == "awaiting_confirm"
+
     status, pre = _json_request(port, "GET", f"/api/episode/{episode_id}")
-    assert status == 200
     selection = pre["cast_selection"]
-    assert selection["locked"] == 0 and not selection["passed"]
+    assert selection["passed"]
     assert all(len(c["candidates"]) == character_candidate_target(c)
                for c in selection["characters"])
+    assert all(candidate["url"].startswith("/artifacts/")
+               for c in selection["characters"]
+               for candidate in c["candidates"])
+    assert all(candidate["variant_source"] == "generated"
+               for c in selection["characters"]
+               for candidate in c["candidates"])
+    assert all(candidate["variant_label"] and candidate["look_variant"]
+               for c in selection["characters"]
+               for candidate in c["candidates"])
+    # 场景概念图同样是一组四张后自动确认
+    assert selection["scenes"] and all(
+        len(scene["candidates"]) == 4 and scene["locked"]
+        for scene in selection["scenes"])
+    auto = pre["cast_auto_selection"]
+    assert auto["auto_confirmed"] >= 1 and auto["pending"] == 0
+    assert all(item["reason"] for item in auto["items"])
+    assert all(item["selection_source"] == "auto_codex"
+               for item in selection["characters"])
 
-    for character in selection["characters"]:
-        status, selected = _json_request(
-            port, "POST", "/api/character/select", {
-                "episode_id": episode_id,
-                "character": character["character"],
-                "candidate_index": 1,
-            })
-        assert status == 200
-    assert selected["passed"] is True
+    # 自动确认之后人工随时可以改选并重新确认
+    hero = selection["characters"][0]
+    status, reselected = _json_request(
+        port, "POST", "/api/character/select", {
+            "episode_id": episode_id,
+            "character": hero["character"],
+            "candidate_index": 2,
+        })
+    assert status == 200
+    changed = next(item for item in reselected["characters"]
+                   if item["character"] == hero["character"])
+    assert changed["locked"] and changed["selection_source"] == "human"
+    assert next(c for c in changed["candidates"] if c["selected"])[
+        "index"] == 2
+    scene_name = selection["scenes"][0]["scene"]
+    status, scene_reselected = _json_request(
+        port, "POST", "/api/scene/select", {
+            "episode_id": episode_id, "scene": scene_name,
+            "candidate_index": 3,
+        })
+    assert status == 200
+    changed_scene = next(item for item in scene_reselected["scenes"]
+                         if item["scene"] == scene_name)
+    assert changed_scene["selection_source"] == "human"
 
-    # 人物已锁定 → 才生成场景/分镜/首尾帧，再停等开拍。
+    # 改选后退回定版检查点，确认即从断点补齐受影响的下游画面
     status, reply = _json_request(port, "POST", "/api/confirm", {
         "episode_id": episode_id})
     assert status == 202 and reply["phase"] == "awaiting_cast"

@@ -23,7 +23,7 @@ def test_episode_snapshot_survives_confirm_and_force_rebinds(tmp_path):
         assert paused["status"] == "awaiting_script"
         paused = app.director.produce(
             "标准快照测试", 1, pause_for_confirm=True)  # 剧本确认
-        assert paused["status"] == "awaiting_cast"
+        assert paused["status"] == "awaiting_confirm"
         project = app.projects.get_project("标准快照测试")
         episode = _episode(app, "标准快照测试", 1)
         script, _ = app.projects.latest_document(episode["id"], "script")

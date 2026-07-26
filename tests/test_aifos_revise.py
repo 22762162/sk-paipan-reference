@@ -31,14 +31,15 @@ def _script_of(app, title, number):
 
 
 def _to_preflight(app, title="万妖图录", number=1, finish=False):
-    summary = app.director.produce(title, number)
-    assert summary["status"] == "awaiting_cast"
-    script, _ = _script_of(app, title, number)
-    for character in script["characters"]:
-        app.director.select_character_candidate(
-            title, number, character["name"], 1)
-    return app.director.produce(
-        title, number, pause_for_confirm=not finish)
+    """剧本确认后图片资产自动定版；finish=True 时直接跑完整集。"""
+    if finish:
+        summary = app.director.produce(title, number)
+        assert summary["status"] == "done"
+        return summary
+    app.director.produce(title, number, pause_for_confirm=True)
+    summary = app.director.produce(title, number, pause_for_confirm=True)
+    assert summary["status"] == "awaiting_confirm"
+    return summary
 
 
 def test_revise_script_regenerates(app):

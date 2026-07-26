@@ -17,6 +17,10 @@ from pathlib import Path
 from .adapters.claude_script import (is_background_role,
                                      normalize_script_bible,
                                      validate_script_bible)
+from .auto_select import (CANDIDATE_GROUP_SIZE, DEFAULT_MIN_CONFIDENCE,
+                          build_requirements, build_selection_payload,
+                          normalize_selection, selection_decision,
+                          subject_label)
 from .db import now
 from .errors import (AifosError, BudgetExceeded, ProduceCancelled,
                      ProviderError, ProviderUnavailable)
@@ -161,9 +165,22 @@ CONFIRM_AFTER = "preflight"
 # 自动返工一次，第二次仍失败时必须停在人工检查点，不能继续烧额度。
 VIDEO_QC_AUTO_RETRIES = 1
 VIDEO_QC_SCHEMA = "aifos.video-qc/v1"
-CHARACTER_CANDIDATES = 4
-PROP_CANDIDATES = 4
+# 剧本第一次确认后即开始生产图片资产:每一组画面统一 4 张候选,
+# 由 CODEX 主导的评选自动确认其中一张,人工随时可改选重新确认。
+CHARACTER_CANDIDATES = CANDIDATE_GROUP_SIZE
+PROP_CANDIDATES = CANDIDATE_GROUP_SIZE
+SCENE_CANDIDATES = CANDIDATE_GROUP_SIZE
 LEGACY_CHARACTER_CANDIDATE_MAX = 5
+# 自动确认后仍可人工改选的剧集状态:生产中(cast/running)与已开拍不在内,
+# 避免正在跑的批次中途换掉母资产。
+RESELECTABLE_STATUSES = frozenset({
+    "awaiting_cast", "awaiting_confirm", "paused", "qc_failed", "done",
+    "failed", "cancelled",
+})
+# 人物资产模式(四视图/细节图)最好在开画前就选定，因此比改选多两个更早
+# 的检查点;正在跑批次的剧集仍然一律拒绝。
+ASSET_POLICY_STATUSES = frozenset(
+    RESELECTABLE_STATUSES | {"created", "awaiting_script"})
 CHARACTER_BACKGROUND_RULE = (
     "人物立绘必须是纯净、无文字的单人物资产背景;背景只允许纯色、柔和渐变"
     "或干净无辨识度的棚拍底,禁止任何场景、建筑、室内、街道、自然环境、"
@@ -357,8 +374,21 @@ def core_prop_definitions(script):
 
 def prop_candidate_policy_text():
     return (
-        "核心、高复用或身份识别型道具统一4张候选并人工定版；"
+        "核心、高复用或身份识别型道具统一4张候选并定版；"
         "一次性普通小物只进入连续性台账，不单独生成候选")
+
+
+def scene_candidate_policy_text():
+    return (
+        "每个场景统一4张空镜候选并定版；候选只比较空间结构、时代地域与"
+        "光线氛围，一律不得出现人物；定版图即后续镜头的场景基准")
+
+
+def auto_selection_policy_text():
+    return (
+        "每一组画面生产4张候选后，由 CODEX 主导的视觉评选按剧本要求打分，"
+        "自动确认最符合的一张；评选失败或把握不足时退回人工四选一，"
+        "人工也可随时改选并重新确认")
 
 def character_production_readiness_error(script, analysis=None):
     labels = unresolved_character_labels(script)
@@ -671,12 +701,18 @@ class Director:
 
     def update_character_asset_policy(self, episode_id, mode,
                                       expected_version=None):
-        """在人物定版检查点保存自动/简化/完整模式。"""
+        """保存人物资产的自动/简化/完整模式。
+
+        自动确认之后不再停在 awaiting_cast，因此这里与人工改选一样，
+        只挡住正在跑批次的剧集；改完再次生产即按新模式补齐或跳过套件。
+        """
         episode = self.projects.get_episode(int(episode_id))
         if episode is None:
             raise AifosError("剧集不存在")
-        if episode["status"] != "awaiting_cast":
-            raise AifosError("只能在人物定版阶段调整四视图与细节图")
+        if episode["status"] not in ASSET_POLICY_STATUSES:
+            raise AifosError(
+                f"本集当前处于「{episode['status']}」，"
+                "正在生产中不能调整四视图与细节图；请先停止生成")
         _current, version = self._episode_character_asset_policy(
             episode["id"])
         if expected_version is not None:
@@ -694,7 +730,7 @@ class Director:
         }
         version = self.projects.save_document_cas(
             episode["id"], "character_asset_policy", policy, version,
-            allowed_status={"awaiting_cast"}, reject_running=True)
+            allowed_status=set(ASSET_POLICY_STATUSES), reject_running=True)
         if policy["mode"] == "simple":
             project = self.db.query_one(
                 "SELECT * FROM projects WHERE id=?",
@@ -834,10 +870,8 @@ class Director:
                 ctx["project"]["id"], script_doc or {})
             candidates_started = any(
                 item.get("candidate_count", 0)
-                for item in selection.get("characters", []))
-            candidates_started = candidates_started or any(
-                item.get("candidate_count", 0)
-                for item in selection.get("props", []))
+                for key in ("characters", "props", "scenes")
+                for item in selection.get(key, []))
             landing = ("awaiting_confirm" if gate_done and gate_done["n"]
                        else "awaiting_cast" if (
                            selection.get("required") and candidates_started)
@@ -1558,6 +1592,32 @@ class Director:
             (f"负面约束:{negative}" if negative else ""))))
 
     @staticmethod
+    def _scene_candidate_variant(index):
+        """场景四张候选的差异轴:只改空间取角与光线,不改剧本事实。"""
+        variants = (
+            ("baseline", "基准建立镜", "最完整交代空间全貌、出入口与表演区"),
+            ("layout", "空间层次", "强化前景/主体区/背景的纵深与遮挡关系"),
+            ("light", "光线氛围", "按本场时间与天气强化光位、色温与氛围"),
+            ("detail", "环境细节", "强化与剧情相关的陈设、材质与年代使用痕迹"),
+        )
+        variant_id, label, focus = variants[
+            (int(index) - 1) % len(variants)]
+        return {
+            "variant_id": variant_id,
+            "variant_label": label,
+            "variant_focus": focus,
+        }
+
+    def _scene_candidate_prompt(self, location, style, scene, variant,
+                                premise=""):
+        base = self._scene_prompt(location, style, scene, premise=premise)
+        return (
+            f"{base};本张候选差异轴:{variant['variant_label']}——"
+            f"{variant['variant_focus']};"
+            "同组四张必须是同一地点、同一时代与同一画风的不同表达，"
+            "不得改变剧本写明的地点性质、时间、天气与空间事实")
+
+    @staticmethod
     def _sheet_view_contract(key):
         return {
             "turnaround": (
@@ -2223,7 +2283,7 @@ class Director:
                 "items": rows}
 
     ACCELERATABLE_IMAGE_CATEGORIES = frozenset({
-        "character_candidate", "prop_candidate",
+        "character_candidate", "prop_candidate", "scene_candidate",
         "character_sheet", "scene_art",
         "shot_image", "frames",
     })
@@ -2314,8 +2374,11 @@ class Director:
                 issues.append("人物设定图提示词不能出现未解析的人物数量None")
             if not payload.get("sheet_prompt_schema"):
                 issues.append("人物设定图缺少按资产类型编译的提示词版本")
+        # 候选图的 art_name 带候选序号(用于产出文件名唯一),它不是提示词
+        # 里的对象名。道具用 prop_name、场景用 scene_name 声明真实对象。
         subject = str(
             payload.get("prop_name")
+            or payload.get("scene_name")
             or payload.get("art_name")
             or payload.get("location") or "")
         expected_names = characters or ([subject] if subject else [])
@@ -5093,6 +5156,86 @@ class Director:
             return None
         return row
 
+    def _locked_scene(self, project_id, location):
+        """返回已定版的场景概念图。
+
+        旧项目的 scene_art 是当年直出的单张图，没有候选与 locked 标记；
+        只要文件仍在就按已定版对待，升级后不重画、不倒退回四选一。
+        """
+        row = self.assets.latest(project_id, "scene_art", location)
+        if row is None:
+            return None
+        uri = str(row["uri"] or "")
+        if not uri or (
+                not uri.startswith(("http://", "https://"))
+                and not Path(uri).exists()):
+            return None
+        return row
+
+    @staticmethod
+    def _script_locations(script):
+        return list(dict.fromkeys(
+            str(scene.get("location") or "").strip()
+            for scene in (script or {}).get("scenes", [])
+            if str(scene.get("location") or "").strip()))
+
+    def scene_selection_status(self, project_id, script):
+        """场景概念图定版状态：每个地点四选一，定版图即镜头场景基准。"""
+        result = []
+        candidate_rows = {
+            row["name"]: row
+            for row in self.assets.list(project_id, "scene_candidate")}
+        for location in self._script_locations(script):
+            locked = self._locked_scene(project_id, location)
+            locked_meta = self._asset_meta(locked)
+            candidates = []
+            for row in candidate_rows.values():
+                meta = self._asset_meta(row)
+                if meta.get("location") != location:
+                    continue
+                uri = str(row["uri"] or "")
+                if not uri or (
+                        not uri.startswith(("http://", "https://"))
+                        and not Path(uri).exists()):
+                    continue
+                index = int(meta.get("candidate_index") or 0)
+                if index < 1 or index > SCENE_CANDIDATES:
+                    continue
+                candidates.append({
+                    "id": f"scene_candidate:{location}:{index}",
+                    "index": index,
+                    "uri": uri,
+                    "version": row["version"],
+                    "variant_id": meta.get("variant_id", ""),
+                    "variant_label": meta.get("variant_label", ""),
+                    "selected": bool(
+                        locked and locked_meta.get(
+                            "candidate_asset_id") == row["id"]),
+                })
+            candidates.sort(key=lambda item: item["index"])
+            result.append({
+                "scene": location,
+                "candidate_target": SCENE_CANDIDATES,
+                "candidate_count": len(candidates),
+                "locked": locked is not None,
+                "identity_uri": str(locked["uri"]) if locked else "",
+                "identity_version": locked["version"] if locked else None,
+                "selection_source": locked_meta.get("selection_source", ""),
+                "auto_selection": locked_meta.get("auto_selection") or {},
+                "candidates": candidates,
+            })
+        locked_count = sum(1 for item in result if item["locked"])
+        return {
+            "schema": "aifos.scene-selection/v1",
+            "candidate_target": SCENE_CANDIDATES if result else 0,
+            "candidate_policy": scene_candidate_policy_text(),
+            "scenes": result,
+            "locked": locked_count,
+            "total": len(result),
+            "passed": locked_count == len(result),
+            "required": any(not item["locked"] for item in result),
+        }
+
     def _canonical_character_assets(self, project_id, name):
         """返回定版后四张独立正式母资产；三视图拼板不计入就绪状态。"""
         assets = {}
@@ -5175,6 +5318,8 @@ class Director:
                 "locked": locked is not None,
                 "identity_uri": locked["uri"] if locked else "",
                 "identity_version": locked["version"] if locked else None,
+                "selection_source": selected_meta.get("selection_source", ""),
+                "auto_selection": selected_meta.get("auto_selection") or {},
                 "canonical_assets": canonical,
                 "character_analysis": design.get(
                     "character_analysis") or {},
@@ -5247,6 +5392,8 @@ class Director:
                 "locked": locked is not None,
                 "identity_uri": locked["uri"] if locked else "",
                 "identity_version": locked["version"] if locked else None,
+                "selection_source": selected_meta.get("selection_source", ""),
+                "auto_selection": selected_meta.get("auto_selection") or {},
                 "candidates": candidates,
             })
         locked_count = sum(1 for item in result if item["locked"])
@@ -5262,24 +5409,36 @@ class Director:
         }
 
     @staticmethod
-    def _combine_asset_selection(character_selection, prop_selection):
-        """兼容旧人物字段，同时增加人物+核心道具的总门禁进度。"""
+    def _combine_asset_selection(character_selection, prop_selection,
+                                 scene_selection=None):
+        """兼容旧人物字段，同时增加人物+核心道具+场景的总门禁进度。"""
+        scene_selection = scene_selection or {
+            "scenes": [], "locked": 0, "total": 0, "passed": True,
+            "candidate_policy": scene_candidate_policy_text(),
+        }
         result = copy.deepcopy(character_selection)
-        result["schema"] = "aifos.production-asset-selection/v2"
+        result["schema"] = "aifos.production-asset-selection/v3"
         result["props"] = copy.deepcopy(prop_selection.get("props") or [])
         result["prop_locked"] = int(prop_selection.get("locked") or 0)
         result["prop_total"] = int(prop_selection.get("total") or 0)
         result["prop_candidate_policy"] = prop_selection.get(
             "candidate_policy", prop_candidate_policy_text())
+        result["scenes"] = copy.deepcopy(scene_selection.get("scenes") or [])
+        result["scene_locked"] = int(scene_selection.get("locked") or 0)
+        result["scene_total"] = int(scene_selection.get("total") or 0)
+        result["scene_candidate_policy"] = scene_selection.get(
+            "candidate_policy", scene_candidate_policy_text())
+        result["auto_selection_policy"] = auto_selection_policy_text()
         result["asset_locked"] = (
             int(character_selection.get("locked") or 0)
-            + result["prop_locked"])
+            + result["prop_locked"] + result["scene_locked"])
         result["asset_total"] = (
             int(character_selection.get("total") or 0)
-            + result["prop_total"])
+            + result["prop_total"] + result["scene_total"])
         result["passed"] = bool(
             character_selection.get("passed")
-            and prop_selection.get("passed"))
+            and prop_selection.get("passed")
+            and scene_selection.get("passed"))
         result["required"] = not result["passed"]
         return result
 
@@ -5287,7 +5446,8 @@ class Director:
         return self._combine_asset_selection(
             self.character_selection_status(
                 project_id, (script or {}).get("characters", [])),
-            self.prop_selection_status(project_id, script))
+            self.prop_selection_status(project_id, script),
+            self.scene_selection_status(project_id, script))
 
     @staticmethod
     def _prop_candidate_variant(index):
@@ -5326,8 +5486,9 @@ class Director:
             "纯净中性棚拍背景，无人物、无手、无场景、无包装、无新增文字、"
             "无字幕、无Logo、无水印；自然比例与材质真实可制造。")
 
-    def _ensure_character_candidates(self, ctx, characters, designs, style):
-        """按角色重要度补足候选；候选之间并行，后续等待人工选择。"""
+    def _ensure_character_candidates(self, ctx, characters, designs, style,
+                                     batch=None):
+        """补足人物候选。batch 非空时只登记任务，由调用方统一并行执行。"""
         project_id = ctx["project"]["id"]
         seed = []
         tasks = []
@@ -5443,32 +5604,42 @@ class Director:
             if any(c["index"] == index
                    for c in status["characters"][0]["candidates"]):
                 self._plan_mark(ctx, item["id"], "reused", only_pending=True)
-        for (name, index, role), result in self._run_parallel(
-                ctx, tasks,
-                line=f"人物定妆候选({character_candidate_policy_text()})").items():
-            quality = quality_by_candidate[(name, index)]
-            variant = variant_by_candidate[(name, index)]
-            self.assets.register(
-                project_id, "character_candidate", f"{name}:{index:02d}",
-                uri=result.uri,
-                meta={"character": name, "role": role,
-                      "candidate_index": index,
-                      **variant,
-                      "prompt": next(
-                          item["prompt"] for item in seed
-                          if item["id"] == f"candidate:{name}:{index}"),
-                      "reference_images": list(
-                          next(task["payload"].get("reference_images", [])
-                               for task in tasks
-                               if task["item_id"] ==
-                               f"candidate:{name}:{index}")),
-                      "provider": result.provider,
-                      "model": getattr(result, "model", ""),
-                      **self._quality_meta(quality)})
-        return self.character_selection_status(project_id, characters)
 
-    def _ensure_prop_candidates(self, ctx, props, style):
-        """为剧本明确的核心道具补足四张高质量候选。"""
+        def register(results):
+            for (name, index, role), result in results.items():
+                quality = quality_by_candidate[(name, index)]
+                variant = variant_by_candidate[(name, index)]
+                self.assets.register(
+                    project_id, "character_candidate", f"{name}:{index:02d}",
+                    uri=result.uri,
+                    meta={"character": name, "role": role,
+                          "candidate_index": index,
+                          **variant,
+                          "prompt": next(
+                              item["prompt"] for item in seed
+                              if item["id"] == f"candidate:{name}:{index}"),
+                          "reference_images": list(
+                              next(task["payload"].get(
+                                  "reference_images", [])
+                                  for task in tasks
+                                  if task["item_id"] ==
+                                  f"candidate:{name}:{index}")),
+                          "provider": result.provider,
+                          "model": getattr(result, "model", ""),
+                          **self._quality_meta(quality)})
+            return self.character_selection_status(project_id, characters)
+
+        if batch is not None:
+            for task in tasks:
+                task["tag"] = ("character_candidate", *task["tag"])
+                batch.append(task)
+            return register
+        return register(self._run_parallel(
+            ctx, tasks,
+            line=f"人物定妆候选({character_candidate_policy_text()})"))
+
+    def _ensure_prop_candidates(self, ctx, props, style, batch=None):
+        """补足核心道具四张候选。batch 非空时只登记任务，由调用方统一并行。"""
         project_id = ctx["project"]["id"]
         seed, tasks = [], []
         quality_by_candidate = {}
@@ -5552,39 +5723,205 @@ class Director:
                     for candidate in prop["candidates"]):
                 self._plan_mark(
                     ctx, item["id"], "reused", only_pending=True)
-        for (name, index), result in self._run_parallel(
-                ctx, tasks, line=f"核心道具候选({prop_candidate_policy_text()})"
-        ).items():
-            variant = self._prop_candidate_variant(index)
-            quality = quality_by_candidate[(name, index)]
-            prop = next(item for item in props if item["name"] == name)
-            self.assets.register(
-                project_id, "prop_candidate", f"{name}:{index:02d}",
-                uri=result.uri,
-                meta={
-                    "prop": name,
+
+        def register(results):
+            for (name, index), result in results.items():
+                variant = self._prop_candidate_variant(index)
+                quality = quality_by_candidate[(name, index)]
+                prop = next(item for item in props if item["name"] == name)
+                self.assets.register(
+                    project_id, "prop_candidate", f"{name}:{index:02d}",
+                    uri=result.uri,
+                    meta={
+                        "prop": name,
+                        "candidate_index": index,
+                        **variant,
+                        "story_function": prop.get("story_function", ""),
+                        "visual_design": prop.get("visual_design", ""),
+                        "prompt": self._prop_candidate_prompt(
+                            prop, style, variant),
+                        "reference_images": list(
+                            next(
+                                task["payload"].get("reference_images", [])
+                                for task in tasks
+                                if task["item_id"]
+                                == f"prop_candidate:{name}:{index}")),
+                        "provider": result.provider,
+                        "model": getattr(result, "model", ""),
+                        **self._quality_meta(quality),
+                    })
+            return self.prop_selection_status(
+                project_id, {"core_props": props})
+
+        if batch is not None:
+            for task in tasks:
+                task["tag"] = ("prop_candidate", *task["tag"])
+                batch.append(task)
+            return register
+        return register(self._run_parallel(
+            ctx, tasks,
+            line=f"核心道具候选({prop_candidate_policy_text()})"))
+
+    def _ensure_scene_candidates(self, ctx, locations, scene_context, style,
+                                 scene_quality, batch=None):
+        """补足每个地点四张空镜候选；已定版且质量达标的场景不重画。"""
+        project_id = ctx["project"]["id"]
+        seed, tasks = [], []
+        premise = ctx["episode"].get("premise", "")
+        for location in locations:
+            locked = self._locked_scene(project_id, location)
+            if locked is not None and not ctx.get("force") and (
+                    self._quality_meets(
+                        self._asset_quality(locked),
+                        scene_quality[location]["level"])):
+                # 旧项目直出的场景图与本轮已定版的场景图都直接复用。
+                self._plan_mark(ctx, f"scene:{location}", "reused",
+                                only_pending=True)
+                continue
+            existing = {}
+            for index in range(1, SCENE_CANDIDATES + 1):
+                row = self.assets.latest(
+                    project_id, "scene_candidate",
+                    f"{location}:{index:02d}")
+                if row is None:
+                    continue
+                meta = self._asset_meta(row)
+                uri = str(row["uri"] or "")
+                if (int(meta.get("candidate_index") or 0) == index
+                        and uri and (
+                            uri.startswith(("http://", "https://"))
+                            or Path(uri).exists())):
+                    existing[index] = row
+            scene = scene_context.get(location) or {}
+            scene_references = self._user_reference_payload(
+                project_id, [location],
+                allowed_roles={"scene", "composition"})
+            style_ref = self._style_anchor_uri(project_id)
+            quality = scene_quality[location]
+            for index in range(1, SCENE_CANDIDATES + 1):
+                variant = self._scene_candidate_variant(index)
+                prompt = self._scene_candidate_prompt(
+                    location, style, scene, variant, premise=premise)
+                item_id = f"scene_candidate:{location}:{index}"
+                seed.append({
+                    "id": item_id,
+                    "category": "scene_candidate",
+                    "label": (f"{location} · 候选 {index} · "
+                              f"{variant['variant_label']}"),
+                    "name": location,
                     "candidate_index": index,
+                    "prompt": prompt,
                     **variant,
-                    "story_function": prop.get("story_function", ""),
-                    "visual_design": prop.get("visual_design", ""),
-                    "prompt": self._prop_candidate_prompt(
-                        prop, style, variant),
-                    "reference_images": list(
-                        next(
-                            task["payload"].get("reference_images", [])
-                            for task in tasks
-                            if task["item_id"]
-                            == f"prop_candidate:{name}:{index}")),
-                    "provider": result.provider,
-                    "model": getattr(result, "model", ""),
                     **self._quality_meta(quality),
                 })
-        return self.prop_selection_status(
-            project_id, {"core_props": props})
+                if index in existing:
+                    continue
+                tasks.append({
+                    "item_id": item_id,
+                    "capability": "image",
+                    "payload": {
+                        "scene_art": True,
+                        "scene_candidate": True,
+                        "scene_name": location,
+                        "art_name": f"{location}_candidate_{index:02d}",
+                        "image_task_class": image_task_class_for(
+                            quality["level"]),
+                        "image_quality": quality["level"],
+                        "quality_decision": quality,
+                        "shot_no": 0, "characters": [],
+                        "location": location,
+                        "action": scene.get("action", ""),
+                        "prompt": prompt,
+                        "style": style,
+                        "prompt_contract_complete": True,
+                        **scene_references,
+                        "style_ref": style_ref,
+                        "require_reference_images": bool(
+                            scene_references["reference_images"]
+                            or style_ref),
+                        "aspect": ctx["aspect"], **ctx["dims"],
+                    },
+                    "sub_dir": "cast/scenes/candidates",
+                    "tag": (location, index),
+                    # 场景候选是空镜:0 人硬门在定版后的镜头质检继续把关，
+                    # 候选阶段只做画面生成，避免整组因单张失败而中断。
+                })
+        self._plan_seed(ctx, "scene_candidate", seed)
+        for item in seed:
+            row = self.assets.latest(
+                project_id, "scene_candidate",
+                f"{item['name']}:{item['candidate_index']:02d}")
+            if row is not None and str(row["uri"] or ""):
+                self._plan_mark(ctx, item["id"], "reused", only_pending=True)
+        def register(results):
+            for (location, index), result in results.items():
+                variant = self._scene_candidate_variant(index)
+                self.assets.register(
+                    project_id, "scene_candidate",
+                    f"{location}:{index:02d}",
+                    uri=result.uri,
+                    meta={
+                        "location": location,
+                        "candidate_index": index,
+                        **variant,
+                        "prompt": next(
+                            item["prompt"] for item in seed
+                            if item["id"]
+                            == f"scene_candidate:{location}:{index}"),
+                        "provider": result.provider,
+                        "model": getattr(result, "model", ""),
+                        **self._quality_meta(scene_quality[location]),
+                    })
+            return self.scene_selection_status(project_id, ctx["script"])
+
+        if batch is not None:
+            for task in tasks:
+                task["tag"] = ("scene_candidate", *task["tag"])
+                batch.append(task)
+            return register
+        return register(self._run_parallel(
+            ctx, tasks,
+            line=f"场景空镜候选({scene_candidate_policy_text()})"))
+
+    def _assert_reselectable(self, episode, what):
+        """自动确认后仍允许人工改选：只挡住正在跑批次的剧集。"""
+        status = episode["status"]
+        if status == "awaiting_cast":
+            return
+        if status not in RESELECTABLE_STATUSES:
+            raise AifosError(
+                f"本集当前处于「{status}」，正在生产中不能改{what}；"
+                "请先停止生成，待状态稳定后再重新确认")
+
+    def _reopen_after_manual_change(self, project, episode, kind, name):
+        """人工改掉已确认的母资产：作废由它派生的下游图，退回定版检查点。
+
+        分镜画面按 reference_manifest 参与内容哈希，母资产换图后哈希自然
+        改变，断点续产会重画；人物资产套件按名字复用，必须显式作废。
+        """
+        if kind == "character":
+            for key, label, _desc in CHARACTER_SHEETS:
+                self.assets.register(
+                    project["id"], "character_sheet", f"{name}:{key}",
+                    uri="", meta={"character": name, "sheet": key,
+                                  "label": label,
+                                  "invalidated": "manual_reselect"},
+                    new_version=True)
+        if episode["status"] not in ("awaiting_cast", "cast"):
+            self.projects.set_episode_status(episode["id"], "awaiting_cast")
+            self.log.info(
+                "director",
+                f"人工改选{subject_label(kind)}「{name}」后已退回定版检查点；"
+                "确认后从断点继续，只补受影响的下游画面")
 
     def select_character_candidate(self, project_title, episode_number,
-                                   character_name, candidate_index):
-        """人工选择并锁定最终立绘；下游只能引用该不可变身份锚点。"""
+                                   character_name, candidate_index,
+                                   source="human", decision=None):
+        """选定并锁定最终立绘；下游只能引用该不可变身份锚点。
+
+        source="human" 为人工确认(含自动确认后的改选),"auto_codex" 为
+        CODEX 评选自动确认。人工改选已确认过的资产时自动作废下游派生图。
+        """
         project, episode = self._episode_ctx(project_title, episode_number)
         script, _ = self.projects.latest_document(episode["id"], "script")
         characters = (script or {}).get("characters", [])
@@ -5592,8 +5929,11 @@ class Director:
                           if c.get("name") == character_name), None)
         if character is None:
             raise AifosError(f"剧本中没有角色: {character_name}")
-        if episode["status"] != "awaiting_cast":
-            raise AifosError("只能在人物定版阶段选择候选；后续已生产时请先重开定版")
+        if source == "human":
+            self._assert_reselectable(episode, "人物定版")
+        previous = self._locked_identity(project["id"], character_name)
+        previous_index = int(
+            self._asset_meta(previous).get("candidate_index") or 0)
         target = character_candidate_target(character)
         if int(candidate_index) < 1 or int(candidate_index) > target:
             raise AifosError(
@@ -5628,6 +5968,8 @@ class Director:
             "image_quality": candidate_quality,
             "recommended_quality": "high",
             "quality_source": "selected_mother_asset",
+            "selection_source": source,
+            "auto_selection": dict(decision or {}),
             **variant_meta,
         }
         identity = self.assets.register(
@@ -5651,18 +5993,25 @@ class Director:
         self._plan_mark(
             ctx, f"char:{character_name}", "reused",
             extra={"selected": True, "identity_version": identity["version"]})
+        if (source == "human" and previous is not None
+                and previous_index != int(candidate_index)):
+            self._reopen_after_manual_change(
+                project, episode, "character", character_name)
+            episode = self.projects.get_episode(episode["id"])
         status = self.production_asset_selection_status(
             project["id"], script)
         self.projects.save_document(episode["id"], "cast_selection", status)
         self.log.info(
             "director",
-            f"人物定版: {character_name} 选中候选{int(candidate_index)}，"
+            f"人物定版({'CODEX自动确认' if source != 'human' else '人工确认'}): "
+            f"{character_name} 选中候选{int(candidate_index)}，"
             f"进度 {status['locked']}/{status['total']}")
         return status
 
     def select_prop_candidate(self, project_title, episode_number,
-                              prop_name, candidate_index):
-        """人工选择核心道具候选；关键帧和 Seedance 必须真实携带该图。"""
+                              prop_name, candidate_index,
+                              source="human", decision=None):
+        """选定核心道具候选；关键帧和 Seedance 必须真实携带该图。"""
         project, episode = self._episode_ctx(project_title, episode_number)
         script, _ = self.projects.latest_document(episode["id"], "script")
         prop = next((
@@ -5670,8 +6019,11 @@ class Director:
             if item["name"] == prop_name), None)
         if prop is None:
             raise AifosError(f"剧本中没有核心道具: {prop_name}")
-        if episode["status"] != "awaiting_cast":
-            raise AifosError("只能在人物/道具定版阶段选择候选")
+        if source == "human":
+            self._assert_reselectable(episode, "道具定版")
+        previous = self._locked_prop(project["id"], prop_name)
+        previous_index = int(
+            self._asset_meta(previous).get("candidate_index") or 0)
         index = int(candidate_index)
         if index < 1 or index > PROP_CANDIDATES:
             raise AifosError(
@@ -5704,6 +6056,8 @@ class Director:
                 "image_quality": quality,
                 "recommended_quality": "high",
                 "quality_source": "selected_mother_asset",
+                "selection_source": source,
+                "auto_selection": dict(decision or {}),
                 "variant_id": candidate_meta.get("variant_id", ""),
                 "variant_label": candidate_meta.get("variant_label", ""),
             },
@@ -5721,15 +6075,375 @@ class Director:
         self._plan_mark(
             ctx, f"prop:{prop_name}", "reused",
             extra={"selected": True, "identity_version": identity["version"]})
+        if (source == "human" and previous is not None
+                and previous_index != index):
+            self._reopen_after_manual_change(
+                project, episode, "prop", prop_name)
+            episode = self.projects.get_episode(episode["id"])
         status = self.production_asset_selection_status(
             project["id"], script)
         self.projects.save_document(
             episode["id"], "cast_selection", status)
         self.log.info(
             "director",
-            f"核心道具定版: {prop_name} 选中候选{index}，"
+            f"核心道具定版({'CODEX自动确认' if source != 'human' else '人工确认'}): "
+            f"{prop_name} 选中候选{index}，"
             f"总进度 {status['asset_locked']}/{status['asset_total']}")
         return status
+
+    def select_scene_candidate(self, project_title, episode_number,
+                               location, candidate_index,
+                               source="human", decision=None):
+        """选定场景概念图候选；定版图即后续全部镜头的场景基准。"""
+        project, episode = self._episode_ctx(project_title, episode_number)
+        script, _ = self.projects.latest_document(episode["id"], "script")
+        if location not in self._script_locations(script):
+            raise AifosError(f"剧本中没有场景: {location}")
+        if source == "human":
+            self._assert_reselectable(episode, "场景定版")
+        previous = self._locked_scene(project["id"], location)
+        previous_asset_id = self._asset_meta(previous).get(
+            "candidate_asset_id")
+        index = int(candidate_index)
+        if index < 1 or index > SCENE_CANDIDATES:
+            raise AifosError(
+                f"{location}固定为{SCENE_CANDIDATES}张候选，"
+                f"不能选择第{index}张")
+        candidate = self.assets.latest(
+            project["id"], "scene_candidate", f"{location}:{index:02d}")
+        if candidate is None or not candidate["uri"]:
+            raise AifosError(f"场景候选不存在: {location}/{index}")
+        uri = str(candidate["uri"])
+        if (not uri.startswith(("http://", "https://"))
+                and not Path(uri).exists()):
+            raise AifosError("候选图片文件已丢失，请重新生成候选")
+        candidate_meta = self._asset_meta(candidate)
+        quality = self._asset_quality(candidate, default="medium")
+        self.assets.register(
+            project["id"], "scene_art", location, uri=uri,
+            meta={
+                "location": location,
+                "locked": True,
+                "candidate_index": index,
+                "candidate_asset_id": candidate["id"],
+                "candidate_version": candidate["version"],
+                "locked_at": now(),
+                "image_quality": quality,
+                "recommended_quality": candidate_meta.get(
+                    "recommended_quality", quality),
+                "quality_source": "selected_mother_asset",
+                "selection_source": source,
+                "auto_selection": dict(decision or {}),
+                "variant_id": candidate_meta.get("variant_id", ""),
+                "variant_label": candidate_meta.get("variant_label", ""),
+            },
+            new_version=True)
+        ctx = {"episode": dict(episode),
+               "out_root": self._episode_dir(project, episode)}
+        chosen_item = None
+        for item in self._plan_read(ctx).get("items", []):
+            if (item.get("category") == "scene_candidate"
+                    and item.get("name") == location):
+                selected = int(item.get("candidate_index", 0)) == index
+                if selected:
+                    chosen_item = item
+                self._plan_mark(
+                    ctx, item["id"], item.get("status", "done"),
+                    extra={"selected": selected})
+        # 定版即该场景的最终产物:把选中候选的真实产线信息(产线、回退链、
+        # 耗时)带到定版条目上，清单展示与「一键补真」才能识别占位图。
+        extra = {
+            "selected": True,
+            "candidate_index": index,
+            "output_uri": uri,
+            "provider": candidate_meta.get("provider", ""),
+            "model": candidate_meta.get("model", ""),
+            "real": candidate_meta.get("provider", "") != "mock",
+            "image_quality": quality,
+        }
+        for key in ("provider", "model", "real", "fallbacks", "duration",
+                    "started_at", "finished_at", "unit_cost",
+                    "image_task_class", "image_quality", "codex_profile",
+                    "prompt_used", "prompt_used_hash", "generation_input",
+                    "reference_inputs"):
+            if chosen_item and key in chosen_item:
+                extra[key] = chosen_item[key]
+        self._plan_mark(ctx, f"scene:{location}", "done", extra=extra)
+        if (source == "human" and previous is not None
+                and previous_asset_id != candidate["id"]):
+            self._reopen_after_manual_change(
+                project, episode, "scene", location)
+            episode = self.projects.get_episode(episode["id"])
+        status = self.production_asset_selection_status(
+            project["id"], script)
+        self.projects.save_document(
+            episode["id"], "cast_selection", status)
+        self.log.info(
+            "director",
+            f"场景定版({'CODEX自动确认' if source != 'human' else '人工确认'}): "
+            f"{location} 选中候选{index}，"
+            f"总进度 {status['asset_locked']}/{status['asset_total']}")
+        return status
+
+    # ---- 一组四张 → CODEX 评选 → 自动确认其中一张 ----
+    def _auto_select_enabled(self):
+        return bool(self.config.get(
+            "defaults", "auto_select_candidates", default=True))
+
+    def _auto_select_min_confidence(self):
+        try:
+            value = float(self.config.get(
+                "defaults", "auto_select_min_confidence",
+                default=DEFAULT_MIN_CONFIDENCE))
+        except (TypeError, ValueError):
+            return DEFAULT_MIN_CONFIDENCE
+        return max(0.0, min(1.0, value))
+
+    def _character_requirements(self, ctx, character):
+        design = self._character_design(
+            ctx["project"]["id"], character["name"]) or {}
+        return build_requirements("character", character["name"], (
+            ("角色与戏份", f"{character['name']}"
+                        f"({character.get('role') or '角色'})"),
+            ("剧本人物介绍", character.get("introduction")
+             or character.get("identity")),
+            ("性别", self._design_value(
+                design.get("gender") or design.get("sex")
+                or character.get("gender"))),
+            ("年龄段", self._design_value(
+                design.get("age_range") or character.get("age_range"))),
+            ("身份职业", self._design_value(
+                design.get("identity") or design.get("occupation"))),
+            ("时代与世界观", self._design_value(design.get("era_setting"))),
+            ("外貌", self._design_value(design.get("appearance"))),
+            ("发型", self._design_value(design.get("hair"))),
+            ("服装", self._design_value(design.get("costume"))),
+            ("服装细节", self._design_value(design.get("costume_detail"))),
+            ("配饰", self._design_value(design.get("accessories"))),
+            ("标志特征", self._design_value(design.get("signature"))),
+            ("气质", self._design_value(design.get("temperament"))),
+            ("制作圣经视觉方向",
+             self._design_value(design.get("visual_direction"))),
+            ("人物负面约束",
+             self._design_value(design.get("negative_prompt"))),
+            ("立绘背景硬规则", CHARACTER_BACKGROUND_RULE),
+        ))
+
+    def _prop_requirements(self, prop):
+        return build_requirements("prop", prop["name"], (
+            ("剧情功能", self._design_value(prop.get("story_function"))),
+            ("视觉结构", self._design_value(prop.get("visual_design"))),
+            ("时代与材质", self._design_value(prop.get("era_material"))),
+            ("归属持有人", self._design_value(prop.get("owner"))),
+            ("连续性状态", self._design_value(prop.get("continuity_states"))),
+        ))
+
+    def _scene_requirements(self, location, scene):
+        scene = scene or {}
+        design = (scene.get("production_design")
+                  if isinstance(scene.get("production_design"), dict) else {})
+        return build_requirements("scene", location, (
+            ("地点", location),
+            ("时间与天气", self._design_value(
+                scene.get("time_of_day") or scene.get("time"))),
+            ("本场剧情功能", self._design_value(
+                design.get("story_function") or scene.get("scene_purpose"))),
+            ("环境", self._design_value(design.get("environment"))),
+            ("空间布局", self._design_value(design.get("layout"))),
+            ("陈设与材质",
+             self._design_value(design.get("materials_and_props"))),
+            ("光线", self._design_value(design.get("lighting"))),
+            ("负面约束", self._design_value(scene.get("negative_prompt"))),
+            ("空镜硬规则", "画面中不得出现人物、人体局部、剪影或倒影中的人"),
+        ))
+
+    def _auto_select_groups(self, ctx, selection):
+        """收集需要评选的组:未定版且候选齐备的人物/道具/场景。"""
+        groups = []
+        characters = {
+            item["name"]: item
+            for item in ctx["script"].get("characters", [])
+            if isinstance(item, dict) and item.get("name")}
+        props = {item["name"]: item
+                 for item in core_prop_definitions(ctx["script"])}
+        scene_context = {}
+        for scene in ctx["script"].get("scenes", []):
+            scene_context.setdefault(scene.get("location"), dict(scene))
+        for item in selection.get("characters", []):
+            character = characters.get(item["character"])
+            if item.get("locked") or character is None:
+                continue
+            groups.append({
+                "kind": "character", "name": item["character"],
+                "candidates": item.get("candidates") or [],
+                "requirements": self._character_requirements(ctx, character),
+            })
+        for item in selection.get("props", []):
+            prop = props.get(item["prop"])
+            if item.get("locked") or prop is None:
+                continue
+            groups.append({
+                "kind": "prop", "name": item["prop"],
+                "candidates": item.get("candidates") or [],
+                "requirements": self._prop_requirements(prop),
+            })
+        for item in selection.get("scenes", []):
+            if item.get("locked"):
+                continue
+            groups.append({
+                "kind": "scene", "name": item["scene"],
+                "candidates": item.get("candidates") or [],
+                "requirements": self._scene_requirements(
+                    item["scene"], scene_context.get(item["scene"])),
+            })
+        return groups
+
+    def _judge_candidate_group(self, ctx, group):
+        """调用 CODEX 评选一组候选;失败一律转人工,不猜测定版。"""
+        payload = build_selection_payload(
+            group["kind"], group["name"],
+            requirements=group["requirements"],
+            candidates=group["candidates"],
+            style=ctx["project"]["style"] or DEFAULT_VISUAL_STYLE,
+            project_title=ctx["project"]["title"],
+            episode_number=ctx["episode"]["number"],
+            premise=ctx["episode"].get("premise", ""))
+        result = self._call(
+            ctx, "image_select", payload,
+            f"cast/auto_select/{group['kind']}")
+        verdict = normalize_selection(
+            result.data, payload["candidate_count"])
+        verdict["provider"] = result.provider
+        verdict["model"] = getattr(result, "model", "")
+        return verdict
+
+    def _auto_select_asset_candidates(self, ctx, selection):
+        """剧本确认后:每组四张 → CODEX 评选 → 自动确认其中一张。
+
+        评选不可用、结构无效或把握不足时不做任何锁定,该组退回人工四选一;
+        自动确认后人工仍可随时改选并重新确认。
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        groups = self._auto_select_groups(ctx, selection)
+        report = {
+            "schema": "aifos.cast-auto-selection/v1",
+            "enabled": self._auto_select_enabled(),
+            "policy": auto_selection_policy_text(),
+            "min_confidence": self._auto_select_min_confidence(),
+            "updated_at": now(),
+            "items": [],
+            "auto_confirmed": 0,
+            "pending": 0,
+        }
+        if not report["enabled"]:
+            report["items"] = [
+                {"kind": group["kind"], "name": group["name"],
+                 "auto_confirm": False, "blocked_by": "disabled",
+                 "reason": "已在设置中关闭自动确认，按人工四选一处理"}
+                for group in groups]
+            report["pending"] = len(groups)
+            return report
+        pending = [group for group in groups
+                   if len(group["candidates"]) >= 2]
+        for group in groups:
+            if len(group["candidates"]) < 2:
+                report["items"].append({
+                    "kind": group["kind"], "name": group["name"],
+                    "auto_confirm": False, "blocked_by": "no_candidates",
+                    "reason": "候选不足两张，无法评选，请先补齐候选"})
+                report["pending"] += 1
+        if not pending:
+            return report
+        self.log.info(
+            "director",
+            f"CODEX 候选评选开始:{len(pending)} 组画面，"
+            f"每组 {CANDIDATE_GROUP_SIZE} 张四选一")
+        verdicts = {}
+        workers = min(self._parallel_workers(), len(pending))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(self._judge_candidate_group, ctx, group):
+                    (group["kind"], group["name"])
+                for group in pending}
+            for future, key in futures.items():
+                try:
+                    verdicts[key] = future.result()
+                except ProduceCancelled:
+                    verdicts[key] = ProduceCancelled("已手动停止生成")
+                except (ProviderError, ProviderUnavailable,
+                        AifosError, ValueError, OSError) as exc:
+                    verdicts[key] = exc
+        for group in pending:
+            key = (group["kind"], group["name"])
+            verdict = verdicts.get(key)
+            if isinstance(verdict, ProduceCancelled):
+                raise verdict
+            entry = {"kind": group["kind"], "name": group["name"],
+                     "subject": subject_label(group["kind"]),
+                     "candidate_count": len(group["candidates"])}
+            if isinstance(verdict, Exception):
+                entry.update({
+                    "auto_confirm": False, "blocked_by": "selector_error",
+                    "reason": f"评选未能给出结论:{verdict}"})
+                report["items"].append(entry)
+                report["pending"] += 1
+                self.log.warn(
+                    "director",
+                    f"{entry['subject']}「{group['name']}」自动评选失败，"
+                    f"退回人工四选一:{verdict}")
+                continue
+            decision = selection_decision(
+                verdict, len(group["candidates"]),
+                min_confidence=self._auto_select_min_confidence())
+            entry.update({
+                "auto_confirm": bool(decision["auto_confirm"]),
+                "candidate_index": decision["index"],
+                "confidence": decision["confidence"],
+                "reason": decision["reason"],
+                "blocked_by": decision["blocked_by"],
+                "runner_up_index": verdict.get("runner_up_index", 0),
+                "scores": verdict.get("scores", []),
+                "provider": verdict.get("provider", ""),
+                "model": verdict.get("model", ""),
+            })
+            if not decision["auto_confirm"]:
+                report["items"].append(entry)
+                report["pending"] += 1
+                continue
+            selector = {
+                "character": self.select_character_candidate,
+                "prop": self.select_prop_candidate,
+                "scene": self.select_scene_candidate,
+            }[group["kind"]]
+            try:
+                selector(
+                    ctx["project"]["title"], ctx["episode"]["number"],
+                    group["name"], decision["index"],
+                    source="auto_codex",
+                    decision={
+                        "index": decision["index"],
+                        "confidence": decision["confidence"],
+                        "reason": decision["reason"],
+                        "scores": verdict.get("scores", []),
+                        "provider": verdict.get("provider", ""),
+                        "model": verdict.get("model", ""),
+                        "decided_at": now(),
+                    })
+            except AifosError as exc:
+                entry.update({"auto_confirm": False,
+                              "blocked_by": "lock_failed",
+                              "reason": f"自动确认未能锁定:{exc}"})
+                report["items"].append(entry)
+                report["pending"] += 1
+                continue
+            report["items"].append(entry)
+            report["auto_confirmed"] += 1
+        self.log.info(
+            "director",
+            f"CODEX 评选完成:自动确认 {report['auto_confirmed']} 组，"
+            f"待人工 {report['pending']} 组")
+        return report
 
     def _stage_cast(self, ctx):
         """人物立绘与场景概念图:项目级资产,跨集复用保证形象一致。"""
@@ -5768,12 +6482,47 @@ class Director:
         anchor_name = self._anchor_character(project_id, characters)
         characters = sorted(
             characters, key=lambda c: c["name"] != anchor_name)
-        character_selection = self._ensure_character_candidates(
-            ctx, characters, designs, style)
-        prop_selection = self._ensure_prop_candidates(
-            ctx, core_prop_definitions(ctx["script"]), style)
+        # 场景定版项先落清单:候选生成与自动确认都要按同一条目回写状态。
+        self._plan_seed(ctx, "scene_art", [
+            {"id": f"scene:{loc}", "category": "scene_art",
+             "label": loc, "name": loc,
+             "prompt": self._scene_prompt(
+                 loc, style, scene_context_by_location.get(loc),
+                 premise=ctx["episode"].get("premise", "")),
+             **self._quality_meta(scene_quality[loc])}
+            for loc in locations])
+        # 人物/核心道具/场景候选之间没有先后依赖:统一进入同一批并行队列，
+        # 不要先等人物四张画完再开始画道具和场景。
+        candidate_batch = []
+        register_characters = self._ensure_character_candidates(
+            ctx, characters, designs, style, batch=candidate_batch)
+        register_props = self._ensure_prop_candidates(
+            ctx, core_prop_definitions(ctx["script"]), style,
+            batch=candidate_batch)
+        register_scenes = self._ensure_scene_candidates(
+            ctx, locations, scene_context_by_location, style, scene_quality,
+            batch=candidate_batch)
+        grouped = {"character_candidate": {}, "prop_candidate": {},
+                   "scene_candidate": {}}
+        for tag, result in self._run_parallel(
+                ctx, candidate_batch,
+                line=(f"图片资产候选(每组{CANDIDATE_GROUP_SIZE}张 → "
+                      "CODEX 评选自动确认)")).items():
+            grouped[tag[0]][tag[1:]] = result
+        character_selection = register_characters(
+            grouped["character_candidate"])
+        prop_selection = register_props(grouped["prop_candidate"])
+        scene_selection = register_scenes(grouped["scene_candidate"])
         selection = self._combine_asset_selection(
-            character_selection, prop_selection)
+            character_selection, prop_selection, scene_selection)
+        # 一组四张已就位:CODEX 评选出最符合本剧本要求的一张并自动确认;
+        # 评选不可用或把握不足的组仍停在人工四选一。
+        auto_report = self._auto_select_asset_candidates(ctx, selection)
+        ctx["cast_auto_selection"] = auto_report
+        self.projects.save_document(
+            ctx["episode"]["id"], "cast_auto_selection", auto_report)
+        selection = self.production_asset_selection_status(
+            project_id, ctx["script"])
         self.projects.save_document(
             ctx["episode"]["id"], "cast_selection", selection)
         if selection["required"]:
@@ -5792,9 +6541,17 @@ class Director:
                     for item in prop_selection["props"]),
                 "prop_candidate_target": (
                     prop_selection["total"] * PROP_CANDIDATES),
+                "scenes": scene_selection["total"],
+                "scene_candidates": sum(
+                    item["candidate_count"]
+                    for item in scene_selection["scenes"]),
+                "scene_candidate_target": (
+                    scene_selection["total"] * SCENE_CANDIDATES),
+                "auto_confirmed": auto_report["auto_confirmed"],
+                "awaiting_human": auto_report["pending"],
                 "locked": selection["asset_locked"],
                 "awaiting_selection": True,
-                "created": 0, "reused": 0, "scenes": 0,
+                "created": 0, "reused": 0,
             }
         ctx["cast_selection"] = selection
         asset_policy = self.character_asset_policy(
@@ -5831,14 +6588,6 @@ class Director:
                  locked_look=locked_looks.get(c["name"]))}
             for c in characters
             for key, label, desc in sheet_definitions])
-        self._plan_seed(ctx, "scene_art", [
-            {"id": f"scene:{loc}", "category": "scene_art",
-             "label": loc, "name": loc,
-             "prompt": self._scene_prompt(
-                 loc, style, scene_context_by_location.get(loc),
-                 premise=ctx["episode"].get("premise", "")),
-             **self._quality_meta(scene_quality[loc])}
-            for loc in locations])
         reused, created = 0, 0
         cast = []
 
@@ -5858,52 +6607,12 @@ class Director:
                                        "identity_version": locked["version"]})
                 continue
             raise AifosError(f"角色{name}尚未锁定最终立绘")
-        # 场景与人物资产套件没有先后依赖：统一进入同一批并行队列。
-        # 人物资产只依赖已锁定最终立绘；场景只依赖场景/风格参考图。
-        # 不要先等唯一一张场景图完成，再启动全部人物资产。
+        # 场景概念图在候选评选阶段就已定版，这里只登记场景实体并计入复用；
+        # 本批次只跑人物资产套件，引用各自立绘 + 风格基准图。
         tasks = []
-        for scene in ctx["script"]["scenes"]:
-            location = scene["location"]
+        for location in locations:
             self.assets.acquire(project_id, "scene", location)
-            existing_scene = self._existing_asset_uri(
-                ctx, "scene_art", location)
-            if existing_scene:
-                row = self.assets.latest(project_id, "scene_art", location)
-                if self._quality_meets(
-                        self._asset_quality(row),
-                        scene_quality[location]["level"]):
-                    reused += 1
-                    self._plan_mark(ctx, f"scene:{location}", "reused",
-                                    only_pending=True)
-                    continue
-            if any(t["tag"] == ("scene_art", location) for t in tasks):
-                continue
-            scene_references = self._user_reference_payload(
-                project_id, [location],
-                allowed_roles={"scene", "composition"})
-            tasks.append({
-                "item_id": f"scene:{location}", "capability": "image",
-                "payload": {
-                    "scene_art": True, "art_name": location,
-                    "image_task_class": image_task_class_for(
-                        scene_quality[location]["level"]),
-                    "image_quality": scene_quality[location]["level"],
-                    "quality_decision": scene_quality[location],
-                    "shot_no": 0, "characters": [], "location": location,
-                    "action": scene.get("action", ""),
-                    "prompt": self._scene_prompt(
-                        location, style, scene,
-                        premise=ctx["episode"].get("premise", "")),
-                    "style": style,
-                    "prompt_contract_complete": True,
-                    **scene_references,
-                    "style_ref": self._style_anchor_uri(project_id),
-                    "require_reference_images": bool(
-                        scene_references["reference_images"]
-                        or self._style_anchor_uri(project_id)),
-                    "aspect": ctx["aspect"], **ctx["dims"],
-                }, "sub_dir": "cast", "tag": ("scene_art", location)})
-        # 人物资产套件与场景图共用同一批次，引用各自立绘+风格基准图。
+            reused += 1
         for character in characters:
             name = character["name"]
             role = character.get("role", "")
@@ -5969,14 +6678,7 @@ class Director:
                     "tag": ("character_sheet", name, key, label),
                 })
         for tag, result in self._run_parallel(
-                ctx, tasks, line="人物/场景独立资产").items():
-            if tag[0] == "scene_art":
-                _kind, name = tag
-                self.assets.register(
-                    project_id, "scene_art", name, uri=result.uri,
-                    meta=self._quality_meta(scene_quality[name]))
-                created += 1
-                continue
+                ctx, tasks, line="人物独立资产套件").items():
             _kind, name, key, label = tag
             self.assets.register(
                 project_id, "character_sheet", f"{name}:{key}",
@@ -10933,9 +11635,10 @@ class Director:
 
     def _invalidate_cast_assets(self, project, script, reason,
                                 character_name="", prop_name="",
-                                invalidate_scenes=False):
-        """让指定人物/道具进入新一轮四选一，同时保留全部历史版本。"""
-        characters = [] if prop_name else [
+                                location="", invalidate_scenes=False):
+        """让指定人物/道具/场景进入新一轮四选一，同时保留全部历史版本。"""
+        targeted = bool(character_name or prop_name or location)
+        characters = [] if (prop_name or location) else [
             item for item in script.get("characters", [])
             if not character_name or item.get("name") == character_name]
         if character_name and not characters:
@@ -10964,7 +11667,7 @@ class Director:
                                    "label": label,
                                    "invalidated": reason},
                     new_version=True)
-        props = [] if character_name else [
+        props = [] if (character_name or location) else [
             item for item in core_prop_definitions(script)
             if not prop_name or item["name"] == prop_name]
         if prop_name and not props:
@@ -10985,28 +11688,49 @@ class Director:
                         "invalidated": reason,
                     },
                     new_version=True)
-        if invalidate_scenes:
-            for location in dict.fromkeys(
-                    scene["location"]
-                    for scene in script.get("scenes", [])):
+        locations = []
+        if invalidate_scenes or location:
+            locations = [
+                item for item in self._script_locations(script)
+                if not location or item == location]
+            if location and not locations:
+                raise AifosError(f"剧本中没有场景: {location}")
+        elif not targeted:
+            # 未指定对象的整体重做:场景与人物、道具一起回到四选一。
+            locations = self._script_locations(script)
+        for item in locations:
+            self.assets.register(
+                project["id"], "scene_art", item, uri="",
+                meta={"location": item, "locked": False,
+                      "invalidated": reason}, new_version=True)
+            for index in range(1, SCENE_CANDIDATES + 1):
                 self.assets.register(
-                    project["id"], "scene_art", location, uri="",
-                    meta={"invalidated": reason}, new_version=True)
+                    project["id"], "scene_candidate",
+                    f"{item}:{index:02d}", uri="",
+                    meta={"location": item, "candidate_index": index,
+                          "invalidated": reason}, new_version=True)
 
     def regenerate_character_candidates(self, project_title, episode_number,
                                         run_id=None, character_name="",
-                                        prop_name=""):
-        """按指定对象重生四张候选；未指定时重生全部人物和核心道具。"""
+                                        prop_name="", location=""):
+        """按指定对象重生四张候选；未指定时重生全部人物、核心道具与场景。
+
+        自动确认之后同样可用:重生的四张会再次交给 CODEX 评选，
+        评选不下判断时停回人工四选一。
+        """
         project, episode = self._episode_ctx(project_title, episode_number)
-        if episode["status"] != "awaiting_cast":
-            raise AifosError("只能在人物选择阶段返回重新生成")
+        if episode["status"] not in RESELECTABLE_STATUSES:
+            raise AifosError(
+                f"本集当前处于「{episode['status']}」，正在生产中不能重做候选；"
+                "请先停止生成")
         script, _ = self.projects.latest_document(episode["id"], "script")
         if script is None:
             raise AifosError("本集尚无剧本,先完成剧本确认")
         self._invalidate_cast_assets(
             project, script, reason="manual_regenerate_cast",
             character_name=str(character_name or "").strip(),
-            prop_name=str(prop_name or "").strip())
+            prop_name=str(prop_name or "").strip(),
+            location=str(location or "").strip())
         self.projects.set_episode_status(episode["id"], "cast")
         aspect = (project["aspect"]
                   or self.config.get("defaults", "aspect", default="9:16"))
@@ -11026,16 +11750,24 @@ class Director:
             return {"status": "paused", "done": 0,
                     "note": "人物候选重新生成已暂停,已完成候选保留"}
         self.projects.set_episode_status(episode["id"], "awaiting_cast")
+        auto = ctx.get("cast_auto_selection") or {}
         self.log.info(
-            "director", "已保留旧版本并生成新一轮四张候选,等待重新定版"
+            "director",
+            "已保留旧版本并生成新一轮四张候选，"
+            f"CODEX 自动确认 {auto.get('auto_confirmed', 0)} 组、"
+            f"待人工 {auto.get('pending', 0)} 组"
             f"(episode_id={episode['id']})")
         return {"status": "awaiting_cast",
                 "done": (
                     report.get("candidates", 0)
-                    + report.get("prop_candidates", 0)),
+                    + report.get("prop_candidates", 0)
+                    + report.get("scene_candidates", 0)),
                 "candidate_target": (
                     report.get("candidate_target", 0)
-                    + report.get("prop_candidate_target", 0)),
+                    + report.get("prop_candidate_target", 0)
+                    + report.get("scene_candidate_target", 0)),
+                "auto_confirmed": auto.get("auto_confirmed", 0),
+                "awaiting_human": auto.get("pending", 0),
                 "locked": int(
                     (ctx.get("cast_selection") or {}).get(
                         "asset_locked", 0))}

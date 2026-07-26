@@ -1,4 +1,8 @@
-"""核心道具四选一、人工锁定与下游真实参考图绑定。"""
+"""核心道具四选一、定版与下游真实参考图绑定。
+
+本文件校验人工四选一门禁本身，因此关闭 CODEX 自动确认；
+自动确认路径见 tests/test_aifos_auto_select.py。
+"""
 
 from pathlib import Path
 
@@ -16,6 +20,7 @@ def app(tmp_path):
 
 
 def _to_asset_selection(app, title="道具四选一"):
+    app.config.data["defaults"]["auto_select_candidates"] = False
     first = app.director.produce(title, 1, pause_for_confirm=True)
     assert first["status"] == "awaiting_script"
     project = app.projects.get_project(title)
@@ -39,6 +44,7 @@ def _to_asset_selection(app, title="道具四选一"):
 
 
 def test_core_prop_gets_four_candidates_and_blocks_until_selected(app):
+    """关掉自动确认时,核心道具仍必须人工四选一才放行。"""
     project, _episode, script = _to_asset_selection(app)
     selection = app.director.production_asset_selection_status(
         project["id"], script)
@@ -54,12 +60,17 @@ def test_core_prop_gets_four_candidates_and_blocks_until_selected(app):
     selection = app.director.production_asset_selection_status(
         project["id"], script)
     assert selection["passed"] is False
-    assert selection["asset_locked"] + 1 == selection["asset_total"]
+    # 还差:核心道具 1 件 + 尚未定版的场景
+    assert (selection["asset_total"] - selection["asset_locked"]
+            == 1 + selection["scene_total"] - selection["scene_locked"])
 
     selected = app.director.select_prop_candidate(
         project["title"], 1, "铜制机关钥匙", 2)
-    assert selected["passed"] is True
     assert selected["props"][0]["locked"] is True
+    for scene in selected["scenes"]:
+        selected = app.director.select_scene_candidate(
+            project["title"], 1, scene["scene"], 1)
+    assert selected["passed"] is True
 
     character_versions = {
         item["character"]: item["identity_version"]

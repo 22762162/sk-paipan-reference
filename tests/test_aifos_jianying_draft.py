@@ -168,7 +168,7 @@ def test_produce_routes_edit_to_jianying(fake_jd, tmp_path):
                                        "draft_dir": str(draft_dir)}}})
     try:
         summary = app.director.produce("草稿联测", 1)
-        assert summary["status"] == "awaiting_cast"
+        assert summary["status"] == "done"
         project = app.projects.get_project("草稿联测")
         episode = app.db.query_one(
             "SELECT * FROM episodes WHERE project_id=? AND number=1",

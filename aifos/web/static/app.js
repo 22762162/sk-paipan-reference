@@ -233,6 +233,7 @@ function route() {
   const standards = location.hash.match(/^#\/standards(?:\/([a-z_]+))?$/);
   const history = location.hash.match(/^#\/history(?:\/(\d+))?$/);
   const m = location.hash.match(/^#\/episode\/(\d+)$/);
+  const cast = location.hash.match(/^#\/cast\/(\d+)$/);
   const settings = location.hash === "#/settings";
   const assets = location.hash === "#/assets";
   const area = standards ? "standards" : history ? "history"
@@ -246,6 +247,7 @@ function route() {
   if (standards) renderStandards(standards[1] || "production");
   else if (history) renderHistory(history[1] ? Number(history[1]) : null);
   else if (m) renderCanvasView(Number(m[1]));
+  else if (cast) renderCanvasView(Number(cast[1]), { view: "cast" });
   else if (settings) renderSettings();
   else if (assets) renderAssetsCenter();
   else renderDashboard();
@@ -2952,12 +2954,15 @@ function bindShotInlineRevisions(root, data) {
    每张要生成的图:分类/名称/提示词/实时状态;可单张改提示词重画 */
 const PLAN_CAT_CN = {
   character_candidate: "人物定妆候选(正式角色统一4张)",
+  prop_candidate: "核心道具候选(每件4张)",
+  scene_candidate: "场景空镜候选(每个场景4张)",
   character_art: "人物立绘",
   character_sheet: "人物资产套件(三视图审核板/独立正侧背母资产/特写/服装)",
-  scene_art: "场景概念图",
+  scene_art: "场景概念图(候选定版)",
   shot_image: "分镜画面(关键帧)", frames: "首尾帧",
 };
-const PLAN_CATS = ["character_candidate", "character_art", "character_sheet", "scene_art",
+const PLAN_CATS = ["character_candidate", "prop_candidate", "scene_candidate",
+  "character_art", "character_sheet", "scene_art",
   "shot_image", "frames"];
 const PLAN_STATUS_CN = {
   pending: "排队中", generating: "生成中", done: "已完成",
@@ -7132,10 +7137,37 @@ function castVisualDnaHtml(character) {
     <p class="dim">${esc(dedupStatus)}</p></details>`;
 }
 
+function autoSelectBadge(group) {
+  const auto = group.auto_selection || {};
+  if (!group.locked) return "";
+  if (group.selection_source === "auto_codex") {
+    const percent = Math.round(Number(auto.confidence || 0) * 100);
+    return `<div class="cast-auto-note"><b>🤖 CODEX 已自动确认候选 ${
+      auto.index || group.candidates.findIndex((c) => c.selected) + 1}</b>
+      <span>把握 ${percent}% · ${esc(auto.reason || "评选判定该张最符合本剧本要求")}</span>
+      <span class="dim">不满意可直接改选下面任意一张，改完自动重新确认。</span></div>`;
+  }
+  if (group.selection_source === "human") {
+    return `<div class="cast-auto-note human"><b>✍️ 人工确认</b>
+      <span class="dim">该组已由人工定版，CODEX 评选结果被覆盖。</span></div>`;
+  }
+  return "";
+}
+
+function autoSelectPendingHtml(report) {
+  const pending = (report.items || []).filter((item) => !item.auto_confirm);
+  if (!pending.length) return "";
+  return `<div class="cast-auto-pending"><b>CODEX 未能自动确认 ${pending.length} 组，请人工定版：</b>
+    <ul>${pending.map((item) => `<li>${esc(item.subject || "图片资产")}「${esc(item.name)}」：${
+      esc(item.reason || "待人工选择")}</li>`).join("")}</ul></div>`;
+}
+
 function renderCastSelection(data, episodeId) {
   const selection = data.cast_selection || {};
   const characters = selection.characters || [];
   const props = selection.props || [];
+  const scenes = selection.scenes || [];
+  const autoReport = data.cast_auto_selection || {};
   const assetPolicy = data.character_asset_policy || {
     mode: "auto", resolved_mode: "full", generate_sheets: true, reasons: [],
   };
@@ -7153,11 +7185,12 @@ function renderCastSelection(data, episodeId) {
     || "主角、重要配角和普通配角统一4张候选；跑龙套/背景路人不做独立设定、不生成候选图或立绘";
   app.innerHTML = `<div class="canvas-view cast-select-view">
     <div class="confirm-banner">
-      <div><b>先定人物和核心道具，再生产后续图片 👤</b>
-        <span>${esc(policy)}；${esc(selection.prop_candidate_policy || "核心道具统一4张候选并人工定版")}。有参考图时人物脸和发型是最高标准，职业角色必须穿工作服；人物候选统一使用纯背景，不得出现文字或场景。
+      <div><b>每组画面4张候选，CODEX 评选自动确认1张 🤖</b>
+        <span>${esc(selection.auto_selection_policy || "剧本确认后即开始生产图片资产：每一组画面生产4张，由 CODEX 主导的评选按剧本要求打分并自动确认最符合的一张；评选失败或把握不足时退回人工四选一，人工也可随时改选并重新确认")}。
+        ${esc(policy)}；${esc(selection.prop_candidate_policy || "核心道具统一4张候选并定版")}；${esc(selection.scene_candidate_policy || "每个场景统一4张空镜候选并定版")}。
+        有参考图时人物脸和发型是最高标准，职业角色必须穿工作服；人物候选统一使用纯背景，不得出现文字或场景。
         每名正式角色先从剧情推导视觉DNA并与全剧角色去重，再统一生成4张同一画风下的候选图；
-        所有候选继承本剧唯一画风，不提供多个画风选项，只比较人物身份、表情、轻微姿态和剧情造型细节，
-        请各选1张作为最终立绘。
+        所有候选继承本剧唯一画风，不提供多个画风选项，只比较人物身份、表情、轻微姿态和剧情造型细节。
         定版后完整版会生成面部、正面、严格90°侧面和完整180°背面独立母资产；
         16:9三视图拼板只用于审核，不作为正式镜头参考。
         后续关键帧、首尾帧和其他图片 API 都会真实携带这张参考图，
@@ -7179,10 +7212,11 @@ function renderCastSelection(data, episodeId) {
         </button>
       </div>
     </div>
+    ${autoSelectPendingHtml(autoReport)}
     ${imageAccelerationLivebarHtml(data)}
     <div class="canvas-toolbar">
       <button id="cast-back">← 仪表盘</button>
-      <span class="title">《${esc(data.project.title)}》第${data.episode.number}集 · 人物定版</span>
+      <span class="title">《${esc(data.project.title)}》第${data.episode.number}集 · 图片资产定版</span>
       ${chip(data.episode.status)}<span class="spacer"></span>
       <button id="cast-script">📖 看剧本</button>
     </div>
@@ -7194,6 +7228,7 @@ function renderCastSelection(data, episodeId) {
           <button type="button" class="cast-regenerate-one" data-character="${esc(character.character)}">↻ 不满意，换4张</button>
           <strong class="${character.candidate_target === 0 ? "cast-locked" : (character.locked ? "cast-locked" : "cast-unlocked")}">
             ${character.candidate_target === 0 ? "无需单独立绘" : (character.locked ? "✓ 已锁定最终立绘" : "请选择1张")}</strong></div>
+        ${autoSelectBadge(character)}
         ${castVisualDnaHtml(character)}
         <div class="cast-candidate-grid" role="list" aria-label="${esc(character.character)}的造型候选">${(character.candidates || []).map((candidate) => {
           const variant = candidate.variant_source === "legacy" || !candidate.variant_label
@@ -7221,6 +7256,7 @@ function renderCastSelection(data, episodeId) {
           <button type="button" class="prop-regenerate-one" data-prop="${esc(prop.prop)}">↻ 不满意，换4张</button>
           <strong class="${prop.locked ? "cast-locked" : "cast-unlocked"}">
             ${prop.locked ? "✓ 已锁定道具母资产" : "请选择1张"}</strong></div>
+        ${autoSelectBadge(prop)}
         ${(prop.story_function || prop.visual_design) ? `<details class="cast-look"><summary>查看道具设计依据</summary>
           ${prop.story_function ? `<p><b>剧情功能：</b>${esc(prop.story_function)}</p>` : ""}
           ${prop.visual_design ? `<p><b>视觉结构：</b>${esc(prop.visual_design)}</p>` : ""}
@@ -7238,6 +7274,31 @@ function renderCastSelection(data, episodeId) {
                 data-prop="${esc(prop.prop)}" data-index="${candidate.index}"
                 aria-pressed="${candidate.selected ? "true" : "false"}" ${candidate.selected ? "disabled" : ""}>
                 ${candidate.selected ? "✓ 当前道具母资产" : "选定这套道具"}</button></div>
+          </article>`;
+        }).join("")}</div>
+      </section>`).join("")}</div>` : ""}
+    ${scenes.length ? `<h2 class="cast-section-title">场景概念图四选一</h2>
+    <div class="cast-selection-list">${scenes.map((scene) => `
+      <section class="cast-choice panel">
+        <div class="cast-choice-head"><div><h2>${esc(scene.scene)}</h2>
+          <span class="dim">场景空镜 · ${scene.candidate_count || 0}/${scene.candidate_target || 4} 张候选</span></div>
+          <button type="button" class="scene-regenerate-one" data-scene="${esc(scene.scene)}">↻ 不满意，换4张</button>
+          <strong class="${scene.locked ? "cast-locked" : "cast-unlocked"}">
+            ${scene.locked ? "✓ 已锁定场景基准图" : "请选择1张"}</strong></div>
+        ${autoSelectBadge(scene)}
+        <div class="cast-candidate-grid" role="list" aria-label="${esc(scene.scene)}的场景候选">${(scene.candidates || []).map((candidate) => {
+          const variant = candidate.variant_label || `方案${candidate.index}`;
+          const title = `${scene.scene} · 候选${candidate.index} · ${variant}`;
+          return `<article class="cast-candidate${candidate.selected ? " selected" : ""}" role="listitem">
+            <button type="button" class="cast-image" data-full="${esc(candidate.url || "")}" data-title="${esc(title)}" aria-label="查看${esc(title)}大图">
+              ${candidate.url ? `<img src="${esc(thumbUrl(candidate.url, 520))}" loading="lazy" alt="${esc(title)}">`
+                : `<span class="plan-thumb-empty">图片缺失</span>`}
+            </button>
+            <div class="cast-candidate-foot"><div class="cast-candidate-title"><span>候选 ${candidate.index}</span><b>${esc(variant)}</b></div>
+              <button type="button" class="${candidate.selected ? "selected" : "primary"} scene-pick"
+                data-scene="${esc(scene.scene)}" data-index="${candidate.index}"
+                aria-pressed="${candidate.selected ? "true" : "false"}" ${candidate.selected ? "disabled" : ""}>
+                ${candidate.selected ? "✓ 当前场景基准图" : "选定这张场景"}</button></div>
           </article>`;
         }).join("")}</div>
       </section>`).join("")}</div>` : ""}
@@ -7314,6 +7375,28 @@ function renderCastSelection(data, episodeId) {
       }
     };
   });
+  app.querySelectorAll(".scene-pick").forEach((button) => {
+    button.onclick = async () => {
+      const group = [...app.querySelectorAll(".scene-pick")]
+        .filter((item) => item.dataset.scene === button.dataset.scene);
+      group.forEach((item) => { item.disabled = true; });
+      button.textContent = "锁定中…";
+      try {
+        await api("/api/scene/select", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ episode_id: data.episode.id,
+            scene: button.dataset.scene,
+            candidate_index: Number(button.dataset.index) }),
+        });
+        showToast(`${button.dataset.scene} 已锁定候选 ${button.dataset.index}`, "ok");
+        renderCanvasView(episodeId, { view: "cast" });
+      } catch (e) {
+        showToast(e.message, "error");
+        group.forEach((item) => { item.disabled = false; });
+        button.textContent = "选定这张场景";
+      }
+    };
+  });
   const regenerateOne = async (button, payload) => {
     button.disabled = true;
     button.textContent = "重新生成中…";
@@ -7339,6 +7422,11 @@ function renderCastSelection(data, episodeId) {
     button.onclick = (event) => armConfirm(
       event.currentTarget, "保留旧版并生成新4张", () => regenerateOne(
         button, { prop: button.dataset.prop }));
+  });
+  app.querySelectorAll(".scene-regenerate-one").forEach((button) => {
+    button.onclick = (event) => armConfirm(
+      event.currentTarget, "保留旧版并生成新4张", () => regenerateOne(
+        button, { scene: button.dataset.scene }));
   });
   const next = document.getElementById("cast-continue");
   const assetModeSelect = document.getElementById("cast-asset-mode");
@@ -7783,7 +7871,7 @@ function bindEpisodeWorkspaceNav(root, data, episodeId, setView) {
   });
 }
 
-async function renderCanvasView(episodeId) {
+async function renderCanvasView(episodeId, options = {}) {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   let data;
   try { data = await api(`/api/episode/${episodeId}`); }
@@ -7802,7 +7890,8 @@ async function renderCanvasView(episodeId) {
     renderScriptReview(data, episodeId);
     return;
   }
-  if (ep.status === "awaiting_cast" && script) {
+  if (script && (ep.status === "awaiting_cast" || options.view === "cast")) {
+    // 自动确认之后也能从这里改选:定版页不再只属于 awaiting_cast。
     renderCastSelection(data, episodeId);
     return;
   }
@@ -7906,8 +7995,11 @@ async function renderCanvasView(episodeId) {
           </select>
         </label>
       </div>
-      <button class="primary" id="btn-confirm" ${preflightReady ? "" : "disabled"}>${
-        revisedShot != null ? "✅ 确认，只重拍受影响镜头" : "✅ 确认,开始 Seedance 生产"}</button>
+      <div class="confirm-actions">
+        <button id="btn-recast">🤖 图片资产定版 · 改选</button>
+        <button class="primary" id="btn-confirm" ${preflightReady ? "" : "disabled"}>${
+          revisedShot != null ? "✅ 确认，只重拍受影响镜头" : "✅ 确认,开始 Seedance 生产"}</button>
+      </div>
     </div>
     ${videoReferencePanelHtml(data)}` : ""}
     <div class="profile-strip">
@@ -8035,6 +8127,8 @@ async function renderCanvasView(episodeId) {
       behavior: "smooth", block: "center",
     }));
   if (awaiting) bindVideoReferenceControls(data, episodeId);
+  const btnRecast = document.getElementById("btn-recast");
+  if (btnRecast) btnRecast.onclick = () => { location.hash = `#/cast/${ep.id}`; };
   const btnConfirm = document.getElementById("btn-confirm");
   if (btnConfirm) btnConfirm.onclick = async () => {
     btnConfirm.disabled = true;

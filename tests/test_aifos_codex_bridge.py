@@ -164,7 +164,9 @@ def test_produce_passes_reference_art(tmp_path, fake_codex, monkeypatch):
     }}})
     try:
         summary = app.director.produce("参考图验证", 1)
-        assert summary["status"] == "awaiting_cast"
+        # 假 codex 的质检桩会挂掉关键帧，这里只关心出图指令内容本身
+        assert [s["stage"] for s in summary["stages"]][:3] == [
+            "script", "continuity", "cast"]
         project = app.projects.get_project("参考图验证")
         episode = app.db.query_one(
             "SELECT * FROM episodes WHERE project_id=? AND number=1",
