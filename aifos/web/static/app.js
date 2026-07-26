@@ -211,7 +211,8 @@ const ACTION_CN = {
   confirm_script: "确认剧本后续产", confirm_cast: "确认人物定版后续产",
   confirm_preflight: "确认开拍后续产",
   force_rebuild: "全部重做", revise_script: "修改剧本",
-  regen_image: "重画图片", adjustment: "制作调整",
+  regen_image: "重画图片", shot_candidates: "镜头按需备选",
+  adjustment: "制作调整",
   legacy_import: "历史记录回填",
 };
 function runChip(status) {
@@ -2685,6 +2686,106 @@ function qualitySelectHtml(cls = "quality-select", selected = "auto") {
   ];
   return `<select class="${cls}" title="可覆盖系统推荐质量">${values.map(([v, label]) =>
     `<option value="${v}" ${selected === v ? "selected" : ""}>${label}</option>`).join("")}</select>`;
+}
+
+/* 分镜画面按需多版:默认每镜只画1张;不满意时人工点这里再要 1-4 张。
+   备选由 CODEX 按本镜合同打分推荐，但换不换图始终由人工决定。 */
+function shotCandidateControls(data, shotNo) {
+  const status = (data.shot_candidates || {})[String(shotNo)] || {};
+  const candidates = status.candidates || [];
+  const recommended = Number(status.recommended_index || 0);
+  const cards = candidates.map((item) => {
+    const title = `镜头${shotNo} · 备选${item.index} · ${
+      item.variant_label || "备选"}`;
+    return `<article class="shot-candidate${item.selected ? " selected" : ""}${
+      item.index === recommended ? " recommended" : ""}">
+      <button type="button" class="cast-image shot-candidate-image"
+        data-full="${esc(item.url || "")}" data-title="${esc(title)}"
+        aria-label="查看${esc(title)}大图">
+        ${item.url ? `<img src="${esc(thumbUrl(item.url, 420))}" loading="lazy" alt="${esc(title)}">`
+          : `<span class="plan-thumb-empty">图片缺失</span>`}
+      </button>
+      <div class="shot-candidate-foot">
+        <div class="cast-candidate-title"><span>备选 ${item.index}</span>
+          <b>${esc(item.variant_label || "备选")}</b></div>
+        ${item.index === recommended
+          ? `<span class="shot-candidate-tip">🤖 CODEX 推荐${
+            item.score != null ? ` · ${Math.round(item.score)}分` : ""}${
+            item.reason ? `：${esc(item.reason)}` : ""}</span>`
+          : (item.reason ? `<span class="shot-candidate-tip dim">${esc(item.reason)}</span>` : "")}
+        <button type="button" class="${item.selected ? "selected" : "primary"} shot-candidate-pick"
+          data-shot="${shotNo}" data-index="${item.index}"
+          ${item.selected ? "disabled" : ""}>
+          ${item.selected ? "✓ 当前关键帧" : "用这张换掉当前图"}</button>
+      </div>
+    </article>`;
+  }).join("");
+  return `<div class="shot-candidate-box" data-shot="${shotNo}">
+    <div class="shot-candidate-ask">
+      <span class="dim">默认每镜只画 1 张；不满意时按需多要几张比对：</span>
+      <label>再生成
+        <select class="shot-candidate-count">
+          ${[1, 2, 3, 4].map((n) => `<option value="${n}"${n === 2 ? " selected" : ""}>${n} 张</option>`).join("")}
+        </select>
+      </label>
+      <input class="shot-candidate-feedback" placeholder="不满意在哪(可留空)，如:眼神要更狠">
+      <button class="shot-candidate-go">🎛 生成备选</button>
+    </div>
+    ${candidates.length ? `<div class="shot-candidate-grid">${cards}</div>` : ""}
+  </div>`;
+}
+
+function bindShotCandidates(root, data, episodeId) {
+  root.querySelectorAll(".shot-candidate-box").forEach((box) => {
+    const shotNo = Number(box.dataset.shot);
+    const go = box.querySelector(".shot-candidate-go");
+    if (go) go.onclick = async () => {
+      const count = Number(box.querySelector(".shot-candidate-count").value);
+      const feedback = box.querySelector(".shot-candidate-feedback").value.trim();
+      go.disabled = true;
+      go.textContent = "生成中…";
+      try {
+        await api("/api/shot/candidates", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ episode_id: episodeId, shot_no: shotNo,
+            count, feedback }),
+        });
+        showToast(`镜头${shotNo} 正在按需生成 ${count} 张备选`, "ok");
+        pollCanvas(episodeId);
+      } catch (e) {
+        showToast(e.message, "error");
+        go.disabled = false;
+        go.textContent = "🎛 生成备选";
+      }
+    };
+    box.querySelectorAll(".shot-candidate-image").forEach((button) => {
+      button.onclick = () => {
+        if (button.dataset.full)
+          showImageLightbox(button.dataset.full, button.dataset.title || "镜头备选");
+      };
+    });
+    box.querySelectorAll(".shot-candidate-pick").forEach((button) => {
+      button.onclick = async () => {
+        const group = [...box.querySelectorAll(".shot-candidate-pick")];
+        group.forEach((item) => { item.disabled = true; });
+        button.textContent = "换图中…";
+        try {
+          await api("/api/shot/select", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ episode_id: episodeId, shot_no: shotNo,
+              candidate_index: Number(button.dataset.index) }),
+          });
+          showToast(`镜头${shotNo} 已换成备选 ${button.dataset.index}，`
+            + "同场首尾帧与旧视频已同步作废", "ok");
+          renderCanvasView(episodeId);
+        } catch (e) {
+          showToast(e.message, "error");
+          group.forEach((item) => { item.disabled = false; });
+          button.textContent = "用这张换掉当前图";
+        }
+      };
+    });
+  });
 }
 
 function regenControls(target, label) {
@@ -9958,6 +10059,8 @@ class StoryboardCanvas {
       </ul>
       <h4>画面不满意?</h4>
       ${regenControls({ kind: "shot", shot_no: shotNo }, "附意见重画本镜头")}
+      <h4>要更多选择?</h4>
+      ${shotCandidateControls(this.data, shotNo)}
       <h4>下载修改后上传</h4>
       <div class="io-row"><span>画面</span>
         ${ioControls({ kind: "shot", shot_no: shotNo },
@@ -9969,6 +10072,7 @@ class StoryboardCanvas {
         <div class="issue ${esc(i.severity)}">[${esc(i.check)}] ${esc(i.message)}</div>`).join("")}` : ""}`;
     const epId = this.data.episode.id;
     bindShotInlineRevisions(panel, this.data);
+    bindShotCandidates(panel, this.data, epId);
     bindRegen(panel, epId, () => this.data);
     bindIo(panel, epId, () => renderCanvasView(epId));
   }

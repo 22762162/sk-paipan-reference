@@ -17,7 +17,7 @@ IMAGE_KINDS = (
     "character_candidate", "character_art", "character_sheet",
     "prop_candidate", "prop_identity",
     "scene_candidate", "scene_art",
-    "image", "first_frame", "last_frame", "cover",
+    "shot_candidate", "image", "first_frame", "last_frame", "cover",
     "reference", "spatial_blocking", "inner_persona",
 )
 

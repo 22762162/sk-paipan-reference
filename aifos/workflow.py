@@ -165,6 +165,15 @@ def build_continuity_bible(project, script, profile):
                 "background_role": True,
                 "crowd_function": character.get("crowd_function", ""),
                 "identity_anchor": "仅锁定场次功能与人数；无独立人物设定或身份参考图",
+                # 背景路人不建人物母资产，但仍必须有唯一的可见服装状态：
+                # 缺这一条，逐镜生产合同会因为"缺少当前镜头唯一服装状态"
+                # 直接判死，整集卡在关键帧。路人只锁时代/身份档次，不锁款式。
+                "default_wardrobe": str(
+                    character.get("costume_direction")
+                    or "与本场时代、地域和身份相称的普通常服，"
+                       "不得出现跨时代或现代服饰"),
+                "costume_anchor": "只需符合本场时代与身份档次；不锁具体款式，"
+                                  "不跨镜比对同一路人的衣服细节",
                 "default_position": ["画面左1/3", "画面中", "画面右2/3"][
                     (index - 1) % 3],
             })

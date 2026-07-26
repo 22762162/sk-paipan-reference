@@ -162,6 +162,17 @@ def _build_parser():
     group.add_argument("--scene", help="场景名")
     p_regen.add_argument("--feedback", default="", help="修改意见(可选)")
 
+    p_alt = sub.add_parser(
+        "alt", help="对不满意的镜头按需再生成 1-4 张备选并挑一张定版")
+    p_alt.add_argument("--project", required=True)
+    p_alt.add_argument("--episode", type=int, required=True)
+    p_alt.add_argument("--shot", type=int, required=True, help="镜头号")
+    p_alt.add_argument("--count", type=int, default=2,
+                       help="本轮再生成几张(1-4,默认2)")
+    p_alt.add_argument("--feedback", default="", help="哪里不满意(可选)")
+    p_alt.add_argument("--pick", type=int, default=0,
+                       help="直接定版第几张备选(1-4);省略则只生成并列出")
+
     p_import = sub.add_parser(
         "import", help="上传人工修改后的素材(图片/mp4,按扩展名识别)")
     p_import.add_argument("--project", required=True)
@@ -868,6 +879,37 @@ def main(argv=None):
             print(f"已重画: {result['uri']}(成本 {result['cost']})")
             if target["kind"] == "shot":
                 print("该镜头旧视频已作废;运行 produce(增量)重拍并重剪")
+            return 0
+        if args.command == "alt":
+            app.system.require(args.user, "produce")
+            if args.pick:
+                result = app.director.select_shot_candidate(
+                    args.project, args.episode, args.shot, args.pick)
+                print(f"镜头{args.shot} 已定版备选 {args.pick}:"
+                      f"{result['uri']}")
+                print("同场首尾帧已按新图重做,旧视频作废;"
+                      "运行 produce(增量)重拍并重剪")
+                return 0
+            result = app.director.generate_shot_candidates(
+                args.project, args.episode, args.shot,
+                count=args.count, feedback=args.feedback)
+            print(f"镜头{args.shot} 已按需生成 {result['created']} 张备选"
+                  "(当前关键帧未改动):")
+            for item in result["candidates"]:
+                mark = " ← CODEX 推荐" if item["recommended"] else ""
+                print(f"  备选{item['index']} · "
+                      f"{item['variant_label'] or '备选'}{mark}\n"
+                      f"    {item['uri']}")
+            recommendation = result.get("recommendation") or {}
+            if recommendation.get("available"):
+                print(f"CODEX 推荐第 {recommendation['index']} 张"
+                      f"(把握 {recommendation['confidence']:.2f}):"
+                      f"{recommendation['reason']}")
+            else:
+                print("CODEX 未给出推荐，请人工直接比对挑选")
+            print(f"满意哪张就定版: python3 -m aifos alt --project "
+                  f"{args.project} --episode {args.episode} "
+                  f"--shot {args.shot} --pick N")
             return 0
         if args.command == "import":
             app.system.require(args.user, "produce")

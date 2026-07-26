@@ -10615,6 +10615,45 @@ class Director:
             episode_id=episode_id)
         return {"label": label}
 
+    def _apply_shot_image(self, ctx, storyboard, shot, uri, *, quality,
+                          meta_extra=None, feedback="",
+                          revision_source="manual_upload",
+                          supersede_reason="image_revision",
+                          quality_override="high"):
+        """把一张已存在的图片定为本镜关键帧,并同步全部下游产物。
+
+        人工上传替换和候选定版共用这一条路径:同场帧链按新图重做、
+        Seedance 手选参考迁移、旧视频与旧成片作废。
+        """
+        project_id = ctx["project"]["id"]
+        asset_name = self._shot_name(ctx, shot["shot_no"])
+        old_image = self.assets.latest(project_id, "image", asset_name)
+        new_image = self.assets.register(
+            project_id, "image", asset_name, uri=str(uri),
+            meta=self._shot_image_meta(
+                ctx, shot, quality, dict(meta_extra or {})),
+            new_version=True)
+        self._task_cost = 0.0
+        self._task_providers = set()
+        formal_ready = formal_reference_allowed(
+            quality.get("level", "high"))
+        reference_shots = self._sync_revised_video_references(
+            ctx["episode"]["id"], project_id,
+            old_image["id"] if old_image else None, new_image,
+            usable=formal_ready)
+        if old_image is not None:
+            self.assets.mark_superseded(
+                old_image["id"], new_image["id"], reason=supersede_reason)
+        sync = self._regenerate_revised_frame_chain(
+            ctx, storyboard, shot, feedback=feedback,
+            quality_override=quality_override,
+            revision_source=revision_source)
+        sync.update(self._invalidate_revised_delivery(
+            ctx, shot, formal_ready=formal_ready))
+        sync["video_reference_shots"] = reference_shots
+        sync["image_asset_id"] = new_image["id"]
+        return sync
+
     def _register_shot_asset(self, ctx, kind, shot_no, uri, meta=None):
         self.assets.register(
             ctx["project"]["id"], kind,
@@ -11869,36 +11908,16 @@ class Director:
                    "character_asset_policy": self.character_asset_policy(
                        episode["id"], script=script),
                    "force": True}
-            old_image = self.assets.latest(
-                project["id"], "image", asset_name)
-            new_image = self.assets.register(
-                project["id"], "image", asset_name, uri=str(path),
-                meta=self._shot_image_meta(
-                    ctx, shot,
-                    {"level": "high",
-                     "recommended": "high",
-                     "source": "manual_upload",
-                     "rule": "manual_upload",
-                     "reasons": ["人工上传正式图"]},
-                    {"uploaded": True}),
-                new_version=True)
-            # 按新图同步同场既有帧链、手选 Seedance 参考和下游成片状态。
-            self._task_cost = 0.0
-            self._task_providers = set()
-            reference_shots = self._sync_revised_video_references(
-                episode["id"], project["id"],
-                old_image["id"] if old_image else None, new_image)
-            if old_image is not None:
-                self.assets.mark_superseded(
-                    old_image["id"], new_image["id"],
-                    reason="manual_upload_revision")
-            sync = self._regenerate_revised_frame_chain(
-                ctx, storyboard, shot, feedback="人工上传替换关键帧",
-                quality_override="high", revision_source="manual_upload")
-            sync.update(self._invalidate_revised_delivery(
-                ctx, shot, formal_ready=True))
-            sync["video_reference_shots"] = reference_shots
-            sync["image_asset_id"] = new_image["id"]
+            sync = self._apply_shot_image(
+                ctx, storyboard, shot, str(path),
+                quality={"level": "high", "recommended": "high",
+                         "source": "manual_upload",
+                         "rule": "manual_upload",
+                         "reasons": ["人工上传正式图"]},
+                meta_extra={"uploaded": True},
+                feedback="人工上传替换关键帧",
+                revision_source="manual_upload",
+                supersede_reason="manual_upload_revision")
             self.log.info(
                 "director", f"已上传替换镜头{shot_no}画面并同步下游版本")
             return {"uri": str(path), "sync": sync}
@@ -13279,6 +13298,360 @@ class Director:
         return {"status": "done", "passed": passed, "skipped": skipped,
                 "skipped_items": skipped_items,
                 "note": message[:1200]}
+
+    # ---- 分镜画面按需多版:默认每镜1张,人工不满意时再生成 1-4 张备选 ----
+    @staticmethod
+    def _shot_candidate_variant(index):
+        """备选差异轴只动合同没锁死的维度。
+
+        人物、人数、景别、机位、站位、动作和可读文字由五维分镜合同锁定,
+        备选之间只能在表演细节、光影、层次和色彩重点上拉开差别。
+        """
+        variants = (
+            ("baseline", "基准执行", "最忠实地落实本镜合同，不额外发挥"),
+            ("performance", "表演细节", "强化微表情、眼神、手部与重心细节"),
+            ("light", "光影氛围", "在同一光位逻辑下强化明暗层次与氛围"),
+            ("depth", "层次纵深", "强化前景遮挡与景深纵深，人物站位不变"),
+        )
+        variant_id, label, focus = variants[
+            (int(index) - 1) % len(variants)]
+        return {"variant_id": variant_id, "variant_label": label,
+                "variant_focus": focus}
+
+    def _shot_candidate_prompt(self, base_prompt, variant):
+        return (
+            f"{base_prompt}\n【本张备选差异轴】{variant['variant_label']}——"
+            f"{variant['variant_focus']};"
+            "本镜的人物、人数、景别、机位、站位、动作、服装状态和可读文字"
+            "全部由分镜合同锁定，差异轴不得改动其中任何一项。")
+
+    def shot_candidate_status(self, project_id, episode_number, shot_no):
+        """本镜当前可选的备选图与 CODEX 推荐。"""
+        prefix = f"e{int(episode_number):03d}_shot{int(shot_no):03d}"
+        candidates = []
+        for index in range(1, CANDIDATE_GROUP_SIZE + 1):
+            row = self.assets.latest(
+                project_id, "shot_candidate", f"{prefix}:{index:02d}")
+            if row is None:
+                continue
+            uri = str(row["uri"] or "")
+            if not uri or (
+                    not uri.startswith(("http://", "https://"))
+                    and not Path(uri).exists()):
+                continue
+            meta = self._asset_meta(row)
+            candidates.append({
+                "id": f"shot_candidate:{shot_no}:{index}",
+                "index": index,
+                "uri": uri,
+                "version": row["version"],
+                "variant_id": meta.get("variant_id", ""),
+                "variant_label": meta.get("variant_label", ""),
+                "feedback": meta.get("feedback", ""),
+                "recommended": bool(meta.get("recommended")),
+                "score": meta.get("score"),
+                "reason": meta.get("recommend_reason", ""),
+                "selected": bool(meta.get("selected")),
+            })
+        candidates.sort(key=lambda item: item["index"])
+        recommended = next(
+            (item["index"] for item in candidates if item["recommended"]), 0)
+        return {
+            "schema": "aifos.shot-candidates/v1",
+            "shot_no": int(shot_no),
+            "candidate_target": CANDIDATE_GROUP_SIZE,
+            "candidates": candidates,
+            "count": len(candidates),
+            "recommended_index": recommended,
+            "policy": (
+                "分镜画面默认每镜只画1张;对不满意的镜头可按需再生成 1-4 张"
+                "备选，由 CODEX 按本镜合同打分推荐，最终由人工定版"),
+        }
+
+    def generate_shot_candidates(self, project_title, episode_number,
+                                 shot_no, count=2, feedback="",
+                                 run_id=None, codex_profile=""):
+        """对不满意的镜头按需再画 1-4 张备选,并让 CODEX 给出推荐。
+
+        不动本镜当前关键帧:备选只进 shot_candidate,人工定版后才替换。
+        """
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            raise AifosError("备选张数需为 1-4 的整数")
+        if count < 1 or count > CANDIDATE_GROUP_SIZE:
+            raise AifosError(
+                f"备选张数需为 1-{CANDIDATE_GROUP_SIZE} 张;"
+                "默认每镜只画1张，不满意时才按需增加")
+        project, episode = self._episode_ctx(project_title, episode_number)
+        shot_no = int(shot_no)
+        storyboard, _ = self.projects.latest_document(
+            episode["id"], "storyboard")
+        shot = next((item for item in (storyboard or {}).get("shots", [])
+                     if item["shot_no"] == shot_no), None)
+        if shot is None:
+            raise AifosError(f"镜头不存在: {shot_no}")
+        script, _ = self.projects.latest_document(episode["id"], "script")
+        aspect = (project["aspect"]
+                  or self.config.get("defaults", "aspect", default="9:16"))
+        standard, _ = self.projects.latest_document(
+            episode["id"], "production_standard")
+        blocking, _ = self.projects.latest_document(
+            episode["id"], "blocking")
+        ctx = {
+            "project": dict(project), "episode": dict(episode),
+            "out_root": self._episode_dir(project, episode),
+            "aspect": aspect,
+            "dims": ASPECT_DIMS.get(aspect, ASPECT_DIMS["9:16"]),
+            "script": script, "storyboard": storyboard,
+            "blocking": blocking, "force": True,
+            "production_standard": standard,
+            "production_profile": production_profile(self.config, standard),
+            "quality_policy": self._episode_quality_policy(
+                episode["id"], persist=True),
+            "character_asset_policy": self.character_asset_policy(
+                episode["id"], script=script),
+            "run_id": run_id,
+        }
+        self._task_cost = 0.0
+        self._task_providers = set()
+        feedback = str(feedback or "").strip()
+        base_index = max(
+            (item["index"] for item in self.shot_candidate_status(
+                project["id"], episode["number"], shot_no)["candidates"]),
+            default=0)
+        tasks = []
+        for offset in range(count):
+            index = (base_index + offset) % CANDIDATE_GROUP_SIZE + 1
+            variant = self._shot_candidate_variant(index)
+            payload = self._shot_payload(
+                ctx, shot, item_id=f"shot:{shot_no}")
+            payload["feedback"] = feedback
+            payload["revision"] = index
+            payload["shot_candidate"] = True
+            payload["candidate_index"] = index
+            payload.update(variant)
+            for key in ("prompt", "prompt_compact"):
+                if payload.get(key):
+                    payload[key] = self._shot_candidate_prompt(
+                        payload[key], variant)
+            payload["art_name"] = (
+                f"{self._shot_name(ctx, shot_no)}_candidate_{index:02d}")
+            if codex_profile:
+                payload["_codex_profile"] = str(codex_profile)
+            tasks.append({
+                "item_id": f"shot_candidate:{shot_no}:{index}",
+                "capability": "image",
+                "payload": payload,
+                "sub_dir": "images/candidates",
+                "tag": index,
+            })
+        self.log.info(
+            "director",
+            f"镜头{shot_no}按需再生成 {count} 张备选"
+            + (f"(修改意见:{feedback[:40]})" if feedback else ""))
+        # 备选与人物/道具/场景候选同一口径:候选阶段不做视觉质检,
+        # 由 CODEX 评选推荐 + 人工定版后再进入正式质检。
+        results = self._run_parallel(
+            ctx, tasks, line=f"镜头{shot_no}按需备选(每张一个差异轴)")
+        prefix = self._shot_name(ctx, shot_no)
+        for index, result in results.items():
+            variant = self._shot_candidate_variant(index)
+            self.assets.register(
+                project["id"], "shot_candidate", f"{prefix}:{index:02d}",
+                uri=result.uri,
+                meta={
+                    "shot_no": shot_no,
+                    "candidate_index": index,
+                    **variant,
+                    "feedback": feedback,
+                    "prompt": next(
+                        task["payload"].get("prompt", "")
+                        for task in tasks
+                        if task["tag"] == index),
+                    "provider": result.provider,
+                    "model": getattr(result, "model", ""),
+                },
+                new_version=True)
+        status = self.shot_candidate_status(
+            project["id"], episode["number"], shot_no)
+        recommendation = self._recommend_shot_candidate(
+            ctx, shot, status["candidates"])
+        status = self.shot_candidate_status(
+            project["id"], episode["number"], shot_no)
+        status["recommendation"] = recommendation
+        self.projects.save_document(
+            episode["id"], f"shot_candidates_{shot_no}", status)
+        return {
+            "status": "done",
+            "shot_no": shot_no,
+            "created": len(results),
+            "candidates": status["candidates"],
+            "recommended_index": status["recommended_index"],
+            "recommendation": recommendation,
+        }
+
+    def _shot_requirements(self, ctx, shot):
+        payload_scene = self._scene_locations(ctx).get(shot.get("scene_no"))
+        return build_requirements("shot", f"镜头{shot['shot_no']}", (
+            ("本镜内容", shot.get("description")),
+            ("出场人物", "、".join(shot.get("characters") or []) or "无人空镜"),
+            ("实际可见人数", shot.get("visible_figure_count")),
+            ("景别与机位", json.dumps(
+                shot.get("camera") or {}, ensure_ascii=False)),
+            ("场景", shot_local_scene(shot, payload_scene or "")),
+            ("台词", (shot.get("dialogue") or {}).get("text")
+             if isinstance(shot.get("dialogue"), dict)
+             else shot.get("dialogue")),
+            ("起始状态", json.dumps(
+                shot.get("start_state") or {}, ensure_ascii=False)),
+            ("结束状态", json.dumps(
+                shot.get("end_state") or {}, ensure_ascii=False)),
+            ("可读文字", json.dumps(
+                shot.get("readable_text") or {}, ensure_ascii=False)),
+        ))
+
+    def _recommend_shot_candidate(self, ctx, shot, candidates):
+        """CODEX 只给推荐,不自动替换本镜关键帧——定版权在人工。"""
+        blank = {"available": False, "index": 0, "reason": "",
+                 "confidence": 0.0, "scores": []}
+        if len(candidates) < 2 or not self._auto_select_enabled():
+            return blank
+        payload = build_selection_payload(
+            "shot", f"镜头{shot['shot_no']}",
+            requirements=self._shot_requirements(ctx, shot),
+            candidates=candidates,
+            style=ctx["project"]["style"] or DEFAULT_VISUAL_STYLE,
+            project_title=ctx["project"]["title"],
+            episode_number=ctx["episode"]["number"],
+            premise=ctx["episode"].get("premise", ""))
+        try:
+            result = self._call(
+                ctx, "image_select", payload, "images/candidates")
+        except (ProviderError, ProviderUnavailable, AifosError) as exc:
+            self.log.warn(
+                "director",
+                f"镜头{shot['shot_no']}备选评选失败，改由人工直接挑选:{exc}")
+            return {**blank, "reason": f"评选未能给出结论:{exc}"}
+        verdict = normalize_selection(
+            result.data, payload["candidate_count"])
+        prefix = self._shot_name(ctx, shot["shot_no"])
+        score_by_index = {
+            int(item["index"]): item for item in verdict.get("scores") or []}
+        for item in candidates:
+            row = self.assets.latest(
+                ctx["project"]["id"], "shot_candidate",
+                f"{prefix}:{item['index']:02d}")
+            if row is None:
+                continue
+            score = score_by_index.get(item["index"]) or {}
+            self.assets.register(
+                ctx["project"]["id"], "shot_candidate",
+                f"{prefix}:{item['index']:02d}", uri=row["uri"],
+                meta={
+                    **self._asset_meta(row),
+                    "recommended": item["index"] == verdict["best_index"],
+                    "score": score.get("score"),
+                    "recommend_reason": (
+                        verdict.get("reason", "")
+                        if item["index"] == verdict["best_index"]
+                        else "；".join(score.get("violations") or [])),
+                })
+        return {
+            "available": verdict["best_index"] >= 1,
+            "index": verdict["best_index"],
+            "reason": verdict.get("reason", ""),
+            "confidence": verdict.get("confidence", 0.0),
+            "scores": verdict.get("scores", []),
+            "provider": result.provider,
+            "model": getattr(result, "model", ""),
+        }
+
+    def select_shot_candidate(self, project_title, episode_number, shot_no,
+                              candidate_index):
+        """人工把某张备选定为本镜关键帧,并同步重做下游首尾帧与视频。"""
+        project, episode = self._episode_ctx(project_title, episode_number)
+        shot_no, index = int(shot_no), int(candidate_index)
+        if index < 1 or index > CANDIDATE_GROUP_SIZE:
+            raise AifosError(
+                f"备选编号需为 1-{CANDIDATE_GROUP_SIZE}，收到 {index}")
+        if episode["status"] not in RESELECTABLE_STATUSES:
+            raise AifosError(
+                f"本集当前处于「{episode['status']}」，正在生产中不能换图；"
+                "请先停止生成")
+        storyboard, _ = self.projects.latest_document(
+            episode["id"], "storyboard")
+        shot = next((item for item in (storyboard or {}).get("shots", [])
+                     if item["shot_no"] == shot_no), None)
+        if shot is None:
+            raise AifosError(f"镜头不存在: {shot_no}")
+        prefix = f"e{episode['number']:03d}_shot{shot_no:03d}"
+        candidate = self.assets.latest(
+            project["id"], "shot_candidate", f"{prefix}:{index:02d}")
+        if candidate is None or not candidate["uri"]:
+            raise AifosError(f"镜头{shot_no}没有第{index}张备选")
+        uri = str(candidate["uri"])
+        if (not uri.startswith(("http://", "https://"))
+                and not Path(uri).exists()):
+            raise AifosError("备选图片文件已丢失，请重新生成备选")
+        candidate_meta = self._asset_meta(candidate)
+        script, _ = self.projects.latest_document(episode["id"], "script")
+        aspect = (project["aspect"]
+                  or self.config.get("defaults", "aspect", default="9:16"))
+        standard, _ = self.projects.latest_document(
+            episode["id"], "production_standard")
+        blocking, _ = self.projects.latest_document(
+            episode["id"], "blocking")
+        ctx = {
+            "project": dict(project), "episode": dict(episode),
+            "out_root": self._episode_dir(project, episode),
+            "aspect": aspect,
+            "dims": ASPECT_DIMS.get(aspect, ASPECT_DIMS["9:16"]),
+            "script": script, "storyboard": storyboard,
+            "blocking": blocking, "force": True,
+            "production_standard": standard,
+            "production_profile": production_profile(self.config, standard),
+            "quality_policy": self._episode_quality_policy(
+                episode["id"], persist=True),
+            "character_asset_policy": self.character_asset_policy(
+                episode["id"], script=script),
+        }
+        quality = self._asset_quality(candidate, default="medium")
+        sync = self._apply_shot_image(
+            ctx, storyboard, shot, uri,
+            quality={"level": quality, "recommended": quality,
+                     "source": "shot_candidate",
+                     "rule": "human_selected_candidate",
+                     "reasons": [f"人工从按需备选中定版第{index}张"]},
+            meta_extra={
+                "from_shot_candidate": index,
+                "candidate_asset_id": candidate["id"],
+                "variant_label": candidate_meta.get("variant_label", ""),
+                "selection_source": "human",
+            },
+            feedback=f"人工定版镜头{shot_no}第{index}张按需备选",
+            revision_source="shot_candidate",
+            supersede_reason="shot_candidate_selected",
+            quality_override=quality)
+        for item in range(1, CANDIDATE_GROUP_SIZE + 1):
+            row = self.assets.latest(
+                project["id"], "shot_candidate", f"{prefix}:{item:02d}")
+            if row is None or not row["uri"]:
+                continue
+            self.assets.register(
+                project["id"], "shot_candidate", f"{prefix}:{item:02d}",
+                uri=row["uri"],
+                meta={**self._asset_meta(row), "selected": item == index})
+        status = self.shot_candidate_status(
+            project["id"], episode["number"], shot_no)
+        self.projects.save_document(
+            episode["id"], f"shot_candidates_{shot_no}", status)
+        self.log.info(
+            "director",
+            f"镜头{shot_no}已定版第{index}张按需备选，下游首尾帧与视频已同步作废")
+        return {"shot_no": shot_no, "candidate_index": index,
+                "uri": uri, "sync": sync,
+                "candidates": status["candidates"]}
 
     def redo_video(self, project_title, episode_number, shot_no, feedback):
         """人工确认问题后重生成指定视频镜头并重新质检。

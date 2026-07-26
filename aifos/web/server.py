@@ -39,6 +39,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from .. import __version__
 from ..app import App
 from ..asset_center import IMAGE_KINDS
+from ..auto_select import CANDIDATE_GROUP_SIZE
 from ..lessons import project_lessons, set_lesson_approval
 from ..updater import (check_and_update, current_build, repo_root,
                        restart_process, start_auto_updater)
@@ -285,6 +286,8 @@ class JobRegistry:
                             "regenerate_cast": ("cast", "人物/道具候选重做"),
                             "revise_script": ("script", "剧本打磨重写"),
                             "regen_image": ("images", "图片定向修改"),
+                            "shot_candidates": (
+                                "images", "镜头按需备选生成"),
                             "reanalyze_story": ("script", "制作圣经重新分析"),
                             "qc_all": ("qc", "图片批量复检"),
                             "recheck_current_storyboard": (
@@ -618,7 +621,8 @@ def _image_asset_catalog(app, project_id):
         "character_art": "人物立绘", "character_sheet": "人物设定",
         "prop_candidate": "道具候选", "prop_identity": "核心道具母资产",
         "scene_candidate": "场景候选",
-        "scene_art": "场景概念图", "image": "镜头关键图",
+        "scene_art": "场景概念图",
+        "shot_candidate": "镜头备选", "image": "镜头关键图",
         "first_frame": "首帧", "last_frame": "尾帧",
         "cover": "封面", "reference": "上传参考图",
         "spatial_blocking": "空间调度图",
@@ -704,7 +708,7 @@ def _image_asset_catalog(app, project_id):
         if kind == "character_sheet":
             return "character_support"
         if kind in {"character_candidate", "prop_candidate",
-                    "scene_candidate"}:
+                    "scene_candidate", "shot_candidate"}:
             return "candidate"
         if kind == "reference":
             return "reference"
@@ -725,6 +729,8 @@ def _image_asset_catalog(app, project_id):
             return "已定版道具候选" if selected else "道具候选·未定版不入镜头"
         if kind == "scene_candidate":
             return "已定版场景候选" if selected else "场景候选·未定版不入镜头"
+        if kind == "shot_candidate":
+            return "已定版镜头备选" if selected else "镜头备选·按需生成待人工挑选"
         return {
             "character_art": "身份锚点·自动使用",
             "scene_art": "场景锚点·自动使用",
@@ -1253,6 +1259,7 @@ def _production_progress(app, episode, render_plan):
         current_stage = str(running_run["action"] or "production")
         current_stage_label = {
             "regen_image": "图片定向修改",
+            "shot_candidates": "镜头按需备选",
             "redo_items": "批量补画",
             "video_regen": "视频定向修改",
             "produce": "继续制作",
@@ -1958,6 +1965,23 @@ def _episode_payload(app, episode_id, jobs=None):
                 app, candidate.get("uri", ""))
     cast_auto_selection, _cast_auto_v = app.projects.latest_document(
         episode_id, "cast_auto_selection")
+    # 分镜画面默认每镜1张;只有人工按需生成过备选的镜头才会有条目。
+    shot_candidates = {}
+    for row in app.assets.list(project["id"], "shot_candidate"):
+        meta = app.assets.meta(row)
+        shot_no = meta.get("shot_no")
+        if not shot_no or not str(row["uri"] or ""):
+            continue
+        if not str(row["name"] or "").startswith(
+                f"e{episode['number']:03d}_shot"):
+            continue
+        shot_candidates.setdefault(int(shot_no), None)
+    for shot_no in list(shot_candidates):
+        status = app.director.shot_candidate_status(
+            project["id"], episode["number"], shot_no)
+        for candidate in status["candidates"]:
+            candidate["url"] = _artifact_url(app, candidate.get("uri", ""))
+        shot_candidates[shot_no] = status
     tasks = [dict(t) for t in app.db.query(
         "SELECT id, stage, name, status, provider, cost, error, created_at, "
         "updated_at FROM tasks WHERE episode_id=? ORDER BY id",
@@ -2108,6 +2132,8 @@ def _episode_payload(app, episode_id, jobs=None):
         "cast_selection": cast_selection,
         # 一组四张 → CODEX 评选 → 自动确认;含每组理由与待人工清单
         "cast_auto_selection": cast_auto_selection or {},
+        # 分镜画面按需备选:{镜号: 备选清单与 CODEX 推荐}
+        "shot_candidates": {str(k): v for k, v in shot_candidates.items()},
         "qc_report": qc_report,
         "video_qc_report": video_qc_report,
         "video_qc_report_version": video_qc_report_v,
@@ -2403,6 +2429,10 @@ def make_handler(workspace, jobs):
                     return self._prop_select()
                 if parsed.path == "/api/scene/select":
                     return self._scene_select()
+                if parsed.path == "/api/shot/candidates":
+                    return self._shot_candidates()
+                if parsed.path == "/api/shot/select":
+                    return self._shot_select()
                 if parsed.path == "/api/character/assets-policy":
                     return self._character_assets_policy()
                 if parsed.path == "/api/character/regenerate":
@@ -3173,6 +3203,64 @@ def make_handler(workspace, jobs):
                     lambda app: app.director.select_scene_candidate(
                         title, number, name, int(index)))
             except (AifosError, TypeError, ValueError) as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _shot_candidates(self):
+            """对不满意的镜头按需再生成 1-4 张备选(默认每镜仍只画1张)。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            try:
+                shot_no = int(body.get("shot_no"))
+                count = int(body.get("count", 2))
+            except (TypeError, ValueError):
+                return self._error(400, "shot_no/count 需为整数")
+            if count < 1 or count > CANDIDATE_GROUP_SIZE:
+                return self._error(
+                    400, f"备选张数需为 1-{CANDIDATE_GROUP_SIZE} 张")
+            if jobs.production_running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，请先暂停，待状态稳定后再生成备选")
+            feedback = str(body.get("feedback") or "").strip()
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id: app.director.generate_shot_candidates(
+                    title, number, shot_no, count=count,
+                    feedback=feedback, run_id=run_id),
+                action="shot_candidates",
+                request={"shot_no": shot_no, "count": count,
+                         "feedback": feedback},
+                queue=True)
+            return self._json({"job_id": job_id, "shot_no": shot_no,
+                               "count": count}, status=202)
+
+        def _shot_select(self):
+            """人工把某张按需备选定为本镜关键帧。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            try:
+                shot_no = int(body.get("shot_no"))
+                index = int(body.get("candidate_index"))
+            except (TypeError, ValueError):
+                return self._error(400, "shot_no/candidate_index 需为整数")
+            if jobs.running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，请先停止生成，待状态稳定后再换图")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.select_shot_candidate(
+                        title, number, shot_no, index))
+            except AifosError as exc:
                 return self._error(400, str(exc))
             return self._json(result)
 

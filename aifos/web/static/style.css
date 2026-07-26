@@ -1573,6 +1573,19 @@ button.canvas-stage-item:hover, button.canvas-stage-item:focus-visible {
 .cast-auto-pending b { color: var(--warning); font-size: 12px; }
 .cast-auto-pending ul { margin: 6px 0 0; padding-left: 18px; color: var(--ink-2); font-size: 11px; line-height: 1.6; }
 .confirm-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+/* 分镜画面按需多版:默认每镜1张,不满意时才现要 1-4 张备选 */
+.shot-candidate-box { display: grid; gap: 10px; }
+.shot-candidate-ask { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.shot-candidate-ask .dim { flex: 1 0 100%; font-size: 11px; }
+.shot-candidate-ask input { flex: 1 1 150px; min-width: 0; }
+.shot-candidate-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.shot-candidate { border: 2px solid var(--hairline); border-radius: 10px; overflow: hidden; background: var(--surface-2); display: flex; flex-direction: column; }
+.shot-candidate.recommended { border-color: var(--accent); }
+.shot-candidate.selected { border-color: var(--good); box-shadow: 0 0 0 3px rgba(12, 163, 12, .18); }
+.shot-candidate-foot { padding: 8px; display: grid; gap: 6px; }
+.shot-candidate-tip { color: var(--accent); font-size: 10px; line-height: 1.45; }
+.shot-candidate-tip.dim { color: var(--ink-3); }
+.shot-candidate-pick { min-height: 36px; }
 
 @media (max-width: 760px) {
   .cast-selection-list { padding: 10px; }

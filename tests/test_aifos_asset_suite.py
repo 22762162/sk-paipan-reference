@@ -249,6 +249,35 @@ def test_character_suite_generated(app):
     assert all(i["status"] in ("done", "reused") for i in sheet_items)
 
 
+def test_background_extra_dialogue_does_not_block_the_episode(app):
+    """路人有台词也能一路画到开拍门禁:路人只锁时代档次，不锁款式。"""
+    script = {
+        "project_title": "路人台词", "episode_number": 1,
+        "episode_title": "车站", "logline": "线索在车站",
+        "characters": [
+            {"name": "林昭", "role": "主角"},
+            {"name": "站台路人", "role": "背景路人"},
+        ],
+        "scenes": [{
+            "scene_no": 1, "location": "车站", "action": "人群短暂让路",
+            "characters": ["林昭", "站台路人"],
+            "lines": [
+                {"character": "林昭", "dialogue": "线索就在这里。"},
+                {"character": "站台路人", "dialogue": "借过。"},
+            ],
+        }],
+    }
+    summary = app.director.produce(
+        "路人台词", 1, script=script, pause_for_confirm=True)
+    assert summary["status"] == "awaiting_script"
+    summary = app.director.produce("路人台词", 1, pause_for_confirm=True)
+    assert summary["status"] == "awaiting_confirm", summary["stages"]
+    project = app.projects.get_project("路人台词")
+    # 路人不建人物母资产，但镜头照常出图
+    assert app.assets.latest(project["id"], "character", "站台路人") is None
+    assert app.assets.latest(project["id"], "image", "e001_shot001")
+
+
 def test_candidate_groups_share_one_parallel_batch(app, monkeypatch):
     """人物/道具/场景候选无依赖，必须同批开工，不能一组一组排队。"""
     batches = []

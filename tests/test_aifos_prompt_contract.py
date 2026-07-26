@@ -9,7 +9,7 @@ from aifos.prompt_contract import (
     validate_shot_prompt_contract,
 )
 from aifos.adapters.codex_image import build_instruction
-from aifos.workflow import _text_asset, build_content_review
+from aifos.workflow import _state, _text_asset, build_content_review
 
 
 def _shot():
@@ -96,6 +96,47 @@ def test_compact_contract_locks_per_actor_wardrobe_and_blocks_missing_state():
     verdict = validate_shot_prompt_contract(broken)
     assert verdict["passed"] is False
     assert "沈砚缺少当前镜头唯一服装状态" in verdict["issues"]
+
+
+def test_background_extra_carries_a_generic_wardrobe_state():
+    """背景路人不建母资产，但必须带唯一服装状态，否则整集卡在关键帧。"""
+    from aifos.workflow import build_continuity_bible
+
+    script = {
+        "episode_number": 1,
+        "characters": [
+            {"name": "林昭", "role": "主角"},
+            {"name": "站台路人", "role": "背景路人",
+             "crowd_function": "人群短暂让路"},
+        ],
+        "scenes": [{"scene_no": 1, "location": "车站"}],
+    }
+    continuity = build_continuity_bible(
+        {"title": "车站"}, script,
+        {"rules": {}, "burn_subtitles": False, "voice": "jimeng_builtin",
+         "lip_sync": True, "preferred_segment_seconds": [5, 8],
+         "max_segment_seconds": 15})
+    extra = next(item for item in continuity["characters"]
+                 if item["name"] == "站台路人")
+    assert extra["background_role"] is True
+    # 只锁时代/身份档次,不锁款式:路人不做跨镜服装比对
+    assert "时代" in extra["default_wardrobe"]
+    assert "不锁具体款式" in extra["costume_anchor"]
+
+    state = _state("站台路人", continuity)
+    shot = {
+        "shot_no": 2,
+        "characters": ["站台路人"],
+        "character_number_map": {
+            "P01": {"actor_id": "P01", "name": "站台路人"},
+        },
+        "description": "站台路人侧身让开通道",
+        "appearance_state_required": True,
+        "start_state": {"站台路人": state},
+        "end_state": {"站台路人": state},
+    }
+    contract, _prompt = compile_shot_prompt(shot, location="车站")
+    assert validate_shot_prompt_contract(contract)["passed"]
 
 
 def test_empty_scene_is_explicitly_an_empty_shot():
