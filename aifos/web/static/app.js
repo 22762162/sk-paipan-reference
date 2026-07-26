@@ -8887,6 +8887,15 @@ function analysisText(value) {
   return Array.isArray(value) ? value.join("、") : (value == null ? "" : String(value));
 }
 
+function analysisIdentityMissing(value, field) {
+  const text = String(value || "").trim();
+  if (!text || /(未指定|未知|不详|未明示|待定|待确认|待补充|待人工|需人工|参考图再定|由参考图决定|以参考图为准|以剧本为准|按参考图|按剧本|自行判断|自行推断|模型判断|自由发挥)/.test(text))
+    return true;
+  if (field === "gender")
+    return !/(男性|女性|男|女|非二元|无性别|不适用)/.test(text);
+  return !/(岁|婴儿|幼儿|儿童|孩童|少年|少女|青少年|未成年|青年|成年|中年|老年|老人)/.test(text);
+}
+
 function storyAnalysisEditorHtml(analysis, version) {
   if (!analysis) return `<section class="analysis-studio missing">
     <div class="analysis-head"><div><span class="eyebrow">STEP 02</span>
@@ -8908,23 +8917,44 @@ function storyAnalysisEditorHtml(analysis, version) {
     </details>`).join("");
   const productionCharacters = (analysis.characters || [])
     .filter((character) => character.importance !== "背景路人");
-  const characterCards = productionCharacters.map((character) => `
-    <details class="analysis-scene">
+  const identityPending = productionCharacters.filter((character) =>
+    analysisIdentityMissing(character.gender, "gender")
+    || analysisIdentityMissing(character.age_range, "age_range"));
+  const characterCards = productionCharacters.map((character, index) => {
+    const genderMissing = analysisIdentityMissing(character.gender, "gender");
+    const ageMissing = analysisIdentityMissing(character.age_range, "age_range");
+    return `
+    <details class="analysis-scene" ${genderMissing || ageMissing ? "open" : ""}>
       <summary>${character.importance === "待确认" ? "⚠️" : "🧬"}
         ${esc(character.name || "未命名")} · ${esc(character.importance || "角色")}</summary>
-      <div><b>性别 / 年龄：</b>${esc(character.gender || "待确认")} ·
-        ${esc(character.age_range || "待确认")}</div>
+      <div class="analysis-identity-grid">
+        <label class="${genderMissing ? "identity-missing" : ""}">
+          <span>性别（必填）</span>
+          <input data-analysis-character="${index}" data-identity-field="gender"
+            value="${esc(character.gender || "")}"
+            placeholder="例如：男 / 女 / 非二元"></label>
+        <label class="${ageMissing ? "identity-missing" : ""}">
+          <span>可见年龄段（必填）</span>
+          <input data-analysis-character="${index}" data-identity-field="age_range"
+            value="${esc(character.age_range || "")}"
+            placeholder="例如：约15岁少年 / 25—30岁青年"></label>
+      </div>
+      ${genderMissing || ageMissing
+        ? `<div class="warn identity-gate-warning">⚠️ 性别和年龄是人物身份硬事实。
+          请人工填写；未填写时不会生成候选图，参考图不能代替这两项。</div>`
+        : ""}
       <div><b>身份：</b>${esc(character.identity_facts || "")}</div>
       <div><b>视觉方向：</b>${esc(character.visual_direction || "")}</div>
       <div><b>最终人物出图提示词：</b>${esc(character.image_prompt
-        || "尚未形成；不会进入人物出图")}</div>
+        || "等待性别与年龄确认；确认后系统自动重建，不会进入人物出图")}</div>
       ${character.negative_prompt
         ? `<div><b>负面提示词：</b>${esc(character.negative_prompt)}</div>` : ""}
       ${character.importance === "待确认"
         ? `<div class="warn">系统无法从原文可靠判断这句由谁说。
           <button type="button" class="analysis-confirm-speaker">
             去编辑剧本确认说话人</button></div>` : ""}
-    </details>`).join("");
+    </details>`;
+  }).join("");
   return `<section class="analysis-studio" data-version="${Number(version || 0)}">
     <div class="analysis-head"><div><span class="eyebrow">STEP 02 · AI PRODUCTION BIBLE</span>
       <h2>世界观、环境与视觉制作圣经</h2>
@@ -8966,6 +8996,9 @@ function storyAnalysisEditorHtml(analysis, version) {
       <div class="analysis-scene-grid">${sceneCards || "暂无场景分析"}</div></details>
     <details class="analysis-scenes" open><summary>真实人物与最终出图卡 ·
       ${productionCharacters.length} 人</summary>
+      ${identityPending.length ? `<div class="warn analysis-identity-summary">
+        ⛔ ${identityPending.length} 名正式角色的性别或年龄尚未明确。
+        这是人物图生产硬门禁，请先在下方人物卡填写并保存。</div>` : ""}
       <div class="analysis-scene-grid">${characterCards || "暂无人物分析"}</div></details>
     <div class="analysis-actions">
       <input id="analysis-direction" placeholder="可选补充，如：更考据、更克制、雨夜冷调；留空则完全按剧本重建">
@@ -9003,6 +9036,14 @@ function collectStoryAnalysis(analysis) {
   next.prompt_bible.scene_prefix = value("analysis-scene-prefix");
   next.prompt_bible.keyframe_prefix = value("analysis-keyframe-prefix");
   next.prompt_bible.seedance_prefix = value("analysis-seedance-prefix");
+  next.characters ||= [];
+  document.querySelectorAll("[data-analysis-character][data-identity-field]")
+    .forEach((input) => {
+      const index = Number(input.dataset.analysisCharacter);
+      const field = input.dataset.identityField;
+      if (next.characters[index] && ["gender", "age_range"].includes(field))
+        next.characters[index][field] = input.value.trim();
+    });
   return next;
 }
 

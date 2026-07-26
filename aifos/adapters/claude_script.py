@@ -28,6 +28,7 @@ import tempfile
 from pathlib import Path
 
 from ..generation_diagnostics import normalize_generation_diagnostics
+from ..identity_facts import unresolved_identity_fields
 from ..speaker_labels import is_non_person_label
 from ..inner_persona import normalize_inner_persona_policy
 from ..story_logic import (
@@ -533,17 +534,6 @@ def _missing(value):
     return value is None or (isinstance(value, str) and not value.strip())
 
 
-def _ambiguous_identity_value(value):
-    value = str(value or "").strip()
-    if not value:
-        return True
-    return any(token in value for token in (
-        "未指定", "未知", "不详", "待定", "待确认", "待补充",
-        "以参考图为准", "以剧本为准", "按参考图", "按剧本",
-        "自行判断", "自行推断", "模型判断", "自由发挥",
-    ))
-
-
 def _fill_missing(target, key, value):
     if _missing(target.get(key)):
         target[key] = value
@@ -707,7 +697,7 @@ def normalize_script_bible(script, payload=None):
     return script
 
 
-def validate_script_bible(script):
+def validate_script_bible(script, *, require_resolved_identity=True):
     """返回世界观/前情/人物介绍硬门禁错误；通过时返回 ``None``。"""
     strip_non_person_speakers(script)
     normalize_prop_contract(script)
@@ -773,14 +763,12 @@ def validate_script_bible(script):
         for field in CHARACTER_INTRO_FIELDS:
             if _missing(character.get(field)):
                 return f"{character['name']}人物设定字段不全: {field}"
-        if _ambiguous_identity_value(character.get("gender")):
-            return (
-                f"{character['name']}人物性别必须明确，"
-                "不能使用未指定/以参考图为准等占位表达")
-        if _ambiguous_identity_value(character.get("age_range")):
-            return (
-                f"{character['name']}人物年龄段必须明确，"
-                "不能使用未指定/以参考图为准等占位表达")
+        if require_resolved_identity:
+            unresolved = unresolved_identity_fields(character)
+            if unresolved:
+                return (
+                    f"{character['name']}人物{'、'.join(unresolved)}必须明确，"
+                    "不能使用未指定、待确认或以参考图为准等占位表达")
     for prop in script.get("core_props") or []:
         if not isinstance(prop, dict) or _missing(prop.get("name")):
             return "核心道具字段不全: name"
@@ -900,7 +888,11 @@ def validate_script(script, payload):
     script.setdefault("episode_title", "")
     script.setdefault("logline", "")
     normalize_script_bible(script, payload)
-    return validate_script_bible(script)
+    # AI 初稿即使漏写性别/年龄也必须进入制作圣经供人工补录，不能在
+    # Provider 层静默回退成另一份 mock 剧本。真正锁定人物、生成候选图
+    # 时仍由 validate_script_bible 的默认严格模式阻断。
+    return validate_script_bible(
+        script, require_resolved_identity=False)
 
 
 def validate_storyboard(storyboard):
@@ -1697,7 +1689,8 @@ def run(request, claude, timeout, engine="claude", codex="codex",
     if capability == "image_qc":
         error = validate_image_qc(data)
     elif capability == "script" and payload.get("story_analysis"):
-        error = validate_story_analysis(data)
+        error = validate_story_analysis(
+            data, require_resolved_identity=False)
     elif capability == "script":
         error = validate_script(data, payload)
     else:

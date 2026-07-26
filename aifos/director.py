@@ -30,6 +30,7 @@ from .generation_diagnostics import (
     targeted_prompt_patch,
 )
 from .image_acceleration import ImageAccelerationStore
+from .identity_facts import unresolved_identity_fields
 from .quality_policy import (
     default_quality_policy,
     formal_reference_allowed,
@@ -388,6 +389,18 @@ def character_production_readiness_error(script, analysis=None):
                 or is_unresolved_character(character)):
             continue
         item = analysis_map.get(character.get("name")) or {}
+        effective_identity = {
+            "gender": item.get("gender") or character.get("gender"),
+            "age_range": (
+                item.get("age_range") or character.get("age_range")),
+        }
+        unresolved = unresolved_identity_fields(effective_identity)
+        if unresolved:
+            return (
+                f"人物「{character.get('name')}」的"
+                f"{'、'.join(unresolved)}尚未明确。"
+                "请在制作圣经的人物卡中人工填写；"
+                "未确认前不会生成候选图，参考图不能代替人物身份事实。")
         if not str(
                 item.get("image_prompt")
                 or character.get("image_prompt") or "").strip():
@@ -2380,7 +2393,10 @@ class Director:
                 prompt_review.get("approved") is True
                 or review_status == "not_applicable_mock_only"):
             issues.append("最终提示词尚未通过Codex审核优化")
-        if payload.get("shot_no") is not None:
+        # 只有真正的分镜关键帧/首尾帧需要 v2.2 镜头合同。人物候选图
+        # 为便于排序也带有 shot_no=0，但它不是分镜，不能被误拦成
+        # “缺少镜头合同”。
+        if category in {"shot_image", "frames"}:
             validation = validate_shot_prompt_contract(
                 payload.get("prompt_contract") or {})
             if not validation["passed"]:
@@ -2577,7 +2593,7 @@ class Director:
         完成时记录实际使用的产线(真实/占位)与回退原因,界面透明可见。"""
         payload = payload or {}
         feedback = payload.get("feedback", "")
-        if payload.get("shot_no") is not None:
+        if str(item_id).startswith(("shot:", "frames:")):
             if not isinstance(payload.get("reference_manifest"), list):
                 self._attach_reference_manifest(payload)
             validation = validate_shot_prompt_contract(
@@ -4638,7 +4654,11 @@ class Director:
             "premise": premise,
             "style": style,
         })
-        error = validate_script_bible(script)
+        # Drafts with unresolved identity must remain reviewable so the user
+        # can fill the two fields.  The lock/cast gates call the strict
+        # validator and cannot advance to image generation.
+        error = validate_script_bible(
+            script, require_resolved_identity=False)
         if error:
             raise AifosError(f"剧本世界观/人物设定门禁失败: {error}")
         return script
@@ -4686,7 +4706,8 @@ class Director:
                 and current.get("script_version") == ctx.get(
                     "script_version")
                 and current.get("project_style") == project_style
-                and validate_story_analysis(current) is None):
+                and validate_story_analysis(
+                    current, require_resolved_identity=False) is None):
             analysis = build_story_analysis(
                 script, style, raw=current,
                 source=current.get("source", "saved"))
@@ -4730,7 +4751,8 @@ class Director:
         analysis = build_story_analysis(
             script, style, raw=result.data, source=result.provider)
         persist_auto_style(analysis)
-        error = validate_story_analysis(analysis)
+        error = validate_story_analysis(
+            analysis, require_resolved_identity=False)
         if error:
             raise AifosError(f"剧本 AI 分析失败: {error}")
         apply_story_analysis(script, analysis)
@@ -10935,9 +10957,40 @@ class Director:
         normalized["project_style"] = project["style"]
         normalized["locked"] = bool(locked)
         normalized["updated_at"] = now()
-        error = validate_story_analysis(normalized)
+        error = validate_story_analysis(
+            normalized, require_resolved_identity=bool(locked))
         if error:
             raise AifosError(f"制作圣经保存失败: {error}")
+        # Manual identity confirmation becomes the canonical script fact, not
+        # a UI-only override.  Save only when explicit values changed.
+        character_map = {
+            item.get("name"): item
+            for item in normalized.get("characters", [])
+            if isinstance(item, dict) and item.get("name")
+        }
+        script_changed = False
+        for character in script.get("characters", []):
+            if (not isinstance(character, dict)
+                    or is_background_character(character)):
+                continue
+            item = character_map.get(character.get("name")) or {}
+            if unresolved_identity_fields(item):
+                continue
+            for field in ("gender", "age_range"):
+                value = str(item.get(field) or "").strip()
+                if value and character.get(field) != value:
+                    character[field] = value
+                    script_changed = True
+            prompt = str(item.get("image_prompt") or "").strip()
+            if prompt and character.get("image_prompt") != prompt:
+                character["image_prompt"] = prompt
+                script_changed = True
+        if script_changed:
+            stored_script = copy.deepcopy(script)
+            stored_script.pop("production_analysis", None)
+            script_version = self.projects.save_document(
+                episode["id"], "script", stored_script)
+            normalized["script_version"] = script_version
         if locked:
             error = character_production_readiness_error(script, normalized)
             if error:

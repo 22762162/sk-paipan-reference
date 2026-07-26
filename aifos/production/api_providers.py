@@ -372,7 +372,8 @@ class ClaudeApiProvider(Provider):
                 # 与 CLI 桥(claude_script.run)保持同一分支:制作圣经/剧本
                 # 自动分析的输出没有 scenes,必须用 story_analysis 校验器,
                 # 否则永远"缺少 scenes"并静默回退 mock 污染事实源。
-                error = validate_story_analysis(data)
+                error = validate_story_analysis(
+                    data, require_resolved_identity=False)
             elif capability == "script":
                 error = validate_script(data, payload)
             else:
