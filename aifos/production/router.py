@@ -9,8 +9,9 @@ import hashlib
 import json
 import re
 import threading
+import time
 
-from ..errors import ProviderError, ProviderUnavailable
+from ..errors import ProduceCancelled, ProviderError, ProviderUnavailable
 from .api_providers import (ArkVideoProvider, ClaudeApiProvider,
                             DoubaoTtsProvider, OpenAIImageProvider,
                             SeedreamImageProvider)
@@ -52,6 +53,9 @@ class ProviderRouter:
         except (TypeError, ValueError):
             self._codex_parallel_per_channel = 3
         self._codex_profile_slots = {}
+        # 通道取用优先级 = 配置列表顺序(只含启用通道):前面的通道并发
+        # 占满后才溢出到后面的通道(如 B、C 先行,A 兜底)。
+        self._codex_profile_order = []
         for name, conf in (config.get("providers") or {}).items():
             cls = PROVIDER_TYPES.get(conf.get("type"))
             if cls is None:
@@ -69,15 +73,57 @@ class ProviderRouter:
             self.providers[name] = provider
             if name == "codex":
                 for profile in conf.get("codex_profiles") or []:
-                    if isinstance(profile, dict) and profile.get("id"):
-                        self._codex_profile_slots.setdefault(
-                            str(profile["id"]),
-                            threading.BoundedSemaphore(
-                                self._codex_parallel_per_channel))
+                    if not (isinstance(profile, dict)
+                            and profile.get("id")):
+                        continue
+                    profile_id = str(profile["id"])
+                    self._codex_profile_slots.setdefault(
+                        profile_id,
+                        threading.BoundedSemaphore(
+                            self._codex_parallel_per_channel))
+                    if (bool(profile.get("enabled", False))
+                            and profile_id
+                            not in self._codex_profile_order):
+                        self._codex_profile_order.append(profile_id)
             if provider.quota_limit > 0:
                 self._ensure_quota_row(name, provider.quota_limit)
 
     # ---- 订阅额度 ----
+    # ---- Codex 通道溢出调度 ----
+    def _acquire_codex_slot(self, cancel=None):
+        """按通道优先级抢一个并发槽:B、C 先行,占满才溢出到 A。
+
+        非阻塞扫描全部启用通道;全占满则每 0.5s 重扫一轮(响应用户
+        停止)。返回 (profile_id, slot);未配置启用通道时返回
+        ("", None),调用方走无槽路径(保持旧配置兼容)。
+        """
+        order = self._codex_profile_order
+        if not order:
+            return "", None
+        while True:
+            for profile_id in order:
+                slot = self._codex_profile_slots.get(profile_id)
+                if slot is not None and slot.acquire(blocking=False):
+                    return profile_id, slot
+            if cancel is not None and cancel():
+                raise ProduceCancelled("已手动停止(等待 Codex 通道空槽)")
+            time.sleep(0.5)
+
+    def _generate_via_codex_slot(self, provider, capability, payload,
+                                 out_dir, cancel=None):
+        """给 codex 调用套通道槽,并把实际使用的通道写回 payload——
+        CliProvider 据此选择 CODEX_HOME,通道统计记到真实账号。"""
+        profile_id, slot = self._acquire_codex_slot(cancel)
+        if slot is None:
+            return provider.generate(capability, payload, out_dir,
+                                     cancel=cancel)
+        payload["_codex_profile"] = profile_id
+        try:
+            return provider.generate(capability, payload, out_dir,
+                                     cancel=cancel)
+        finally:
+            slot.release()
+
     def _ensure_quota_row(self, name, limit):
         row = self.db.query_one(
             "SELECT * FROM quota WHERE provider=?", (name,))
@@ -389,14 +435,10 @@ class ProviderRouter:
             or payload.get("_codex_profile") or "").strip()
         if profile_id:
             review_payload["_codex_profile"] = profile_id
-        slots = self._codex_profile_slots.get(profile_id)
-        if slots is None:
-            result = provider.generate(
-                "prompt_review", review_payload, out_dir, cancel=cancel)
-        else:
-            with slots:
-                result = provider.generate(
-                    "prompt_review", review_payload, out_dir, cancel=cancel)
+        # 审核与出图共用同一套通道槽:B、C 先行,占满溢出到 A。
+        result = self._generate_via_codex_slot(
+            provider, "prompt_review", review_payload, out_dir,
+            cancel=cancel)
         data = result.data or {}
         if data.get("schema") != self.PROMPT_REVIEW_SCHEMA:
             raise ProviderError(
@@ -523,19 +565,17 @@ class ProviderRouter:
                 fallbacks.append({"provider": name, "reason": reason})
                 continue
             try:
-                profile_id = (str(payload.get("_codex_profile") or "").strip()
-                              if name == "codex" else "")
-                slots = self._codex_profile_slots.get(profile_id)
-                if slots is None:
+                if name == "codex":
+                    # parallel_images 是每条 Codex 通道的容量,独立
+                    # CODEX_HOME 隔离登录态。通道按配置列表序取用:
+                    # 前面的通道(B、C)并发占满后才溢出到后面的(A),
+                    # 实际用哪个通道由执行时空槽决定,不再静态轮询。
+                    result = self._generate_via_codex_slot(
+                        provider, capability, payload, out_dir,
+                        cancel=cancel)
+                else:
                     result = provider.generate(capability, payload, out_dir,
                                                cancel=cancel)
-                else:
-                    # parallel_images 是每条 Codex 通道的容量。独立
-                    # CODEX_HOME 继续隔离登录态；单通道最多 8 路，
-                    # A/B/C 三通道可合计 24 路。
-                    with slots:
-                        result = provider.generate(
-                            capability, payload, out_dir, cancel=cancel)
             except ProviderError as exc:
                 self.log.warn(
                     "router", f"{name} 执行失败({exc}),回退({capability})")
