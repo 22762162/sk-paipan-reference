@@ -3004,10 +3004,23 @@ def make_handler(workspace, jobs):
                     return self._error(400, str(exc))
             script = None
             if body.get("script_text"):
-                from ..script_import import ScriptImportError, parse_any
+                from ..script_import import (
+                    NoDialogueError, ScriptImportError, parse_any)
                 try:
                     script = parse_any(
                         body["script_text"], title, int(number))
+                except NoDialogueError:
+                    # 纯叙述/故事梗概没有可逐字抽取的对白——这不是用户
+                    # 的错,自动转 AI 编剧:原文全文作为剧情素材做影视化
+                    # 改编(台词由编剧补写),剧本仍停在等待确认关口人工审。
+                    source = str(body["script_text"]).strip()[:6000]
+                    premise = str(body.get("premise") or "").strip()
+                    body["premise"] = (
+                        (premise + "\n\n" if premise else "")
+                        + "【剧情素材,按影视化改编规则处理】\n" + source)
+                    note = ((note + ";") if note else "") + (
+                        "未识别到对白,已自动转 AI 编剧改编;"
+                        "剧本生成后会停在「等待确认」供你审阅")
                 except ScriptImportError as exc:
                     return self._error(400, str(exc))
             style_pack_id = str(body.get("style_pack_id") or "").strip()

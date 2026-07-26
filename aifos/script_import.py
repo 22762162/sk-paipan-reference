@@ -91,6 +91,14 @@ class ScriptImportError(ValueError):
     pass
 
 
+class NoDialogueError(ScriptImportError):
+    """文本里没有任何可抽取的对白(纯叙述/梗概)。
+
+    上层据此自动改走 AI 编剧影视化改编,而不是把规则引擎的
+    抽取失败当成终点甩给用户。"""
+    pass
+
+
 def normalize_entity_label(value):
     """Remove Markdown decoration without changing a real character name."""
     value = str(value or "").strip()
@@ -645,7 +653,7 @@ def parse_text_script(text, project_title, episode_number):
 
     scenes = [s for s in scenes if s["lines"] or s["action"]]
     if not any(s["lines"] for s in scenes):
-        raise ScriptImportError(
+        raise NoDialogueError(
             "未识别到对白。已支持「角色名:台词」、中文引号对白、"
             "「某某说道:“……”」和「“……”某某问道」;请粘贴完整小说正文。"
             "如果只有故事梗概,请切换「AI 自动编剧」。")
