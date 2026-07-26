@@ -11,7 +11,8 @@
                 "--codex", "/Users/sk/.local/node22/bin/codex"]
   }
 
-支持能力:image(镜头关键图)、frames(首尾帧)、cover(封面)。
+支持能力:prompt_review(生图前提示词审核优化)、image(镜头关键图)、
+frames(首尾帧)、cover(封面)。
 说明:这是通用出图桥;若你的 Codex 工作流有专门的出图技能/脚本,
 把 build_instruction 中的指令替换为对应调用即可。
 """
@@ -34,6 +35,11 @@ from aifos.prompt_contract import readable_text_required, sanitize_text_whitelis
 # 非交互出图必需:可写沙箱 + 跳过 git 仓库检查(产物目录不是 git 仓库)。
 # 旧版 codex 不认识这些参数时,run() 会自动去掉重试。
 DEFAULT_EXEC_ARGS = ["--sandbox", "workspace-write", "--skip-git-repo-check"]
+PROMPT_REVIEW_EXEC_ARGS = [
+    "--sandbox", "read-only", "--skip-git-repo-check",
+    "--ephemeral", "--ignore-rules",
+    "-c", 'model_reasoning_effort="low"',
+]
 
 # 强制真实出图:Codex 是编码代理,放任它就会用 Pillow 画示意图充数
 # 画面语义硬约束:角色名不是物种;不画剧情外的杂物
@@ -261,6 +267,48 @@ def _screen_prop_rule(prompt_text, text_asset=None):
 def build_instruction(capability, payload, out_dir):
     """返回 (给 codex 的指令, 期望产出的文件列表, 应答的 data 字段)。"""
     out_dir = Path(out_dir)
+    if capability == "prompt_review":
+        source = str(payload.get("review_prompt") or "").strip()
+        context = payload.get("review_context") or {}
+        schema = str(
+            payload.get("review_schema")
+            or "aifos.codex-prompt-review/v1")
+        instruction = (
+            "你是AIFOS图片生成前的提示词审核员。只审核并优化提示词，"
+            "禁止调用imagegen、禁止生成图片、禁止修改任何文件。\n"
+            "目标：把AIFOS已编译提示词改成更准确、无冲突、可直接执行的"
+            "最终生图提示词，同时绝不改变剧本事实、人物身份、人数、服装、"
+            "头饰、妆发、道具、场景、动作、机位、起止状态、文字白名单和"
+            "参考图职责。\n"
+            "审核规则：\n"
+            "1. 删除重复、空泛、互相冲突和不可见的心理/背景描述；保留所有"
+            "生成所需的明确视觉事实与硬约束。\n"
+            "2. 不得新增人物、剧情、动作、道具、服装、颜色、文字、Logo或"
+            "参考图；不得把参考图服装错误升级为本镜服装。\n"
+            "3. 人物、场景、起止状态、镜头、可读文字和图N参考职责必须与"
+            "审核上下文完全一致；不确定时不得猜测。\n"
+            "4. 若输入事实源互相冲突、含mock/占位模板污染、缺少决定性人物"
+            "或造型事实，不能靠猜测修补，approved必须为false并说明阻断原因。\n"
+            "5. optimized_prompt必须是可以直接交给图片模型的完整提示词，"
+            "不得包含审核过程、Markdown代码围栏或JSON以外的说明。\n"
+            f"审核输出schema={schema}。\n"
+            "只输出一个JSON对象，严格使用以下字段："
+            '{"schema":"aifos.codex-prompt-review/v1",'
+            '"approved":true,'
+            '"optimized_prompt":"完整优化稿",'
+            '"issues_found":["原稿问题"],'
+            '"changes_made":["实际修改"],'
+            '"blocking_reason":""}。\n'
+            "当无法安全优化时approved=false、optimized_prompt置空。\n"
+            "【AIFOS原始提示词】\n"
+            f"{source[:24000]}\n"
+            "【不可变审核上下文】\n"
+            f"{json.dumps(context, ensure_ascii=False, sort_keys=True)[:30000]}"
+        )
+        return instruction, [], {
+            "schema": schema,
+            "source_length": len(source),
+        }
     width = int(payload.get("width", 1080))
     height = int(payload.get("height", 1920))
     size = f"{width}x{height},画幅 {payload.get('aspect', '9:16')}"
@@ -648,11 +696,17 @@ def build_instruction(capability, payload, out_dir):
         return instruction, [], {"qc": True}
     if capability == "cover":
         target = out_dir / "cover.png"
+        cover_prompt = str(
+            payload.get("prompt_compact")
+            or payload.get("prompt") or "").strip()
         instruction = (
             f"为账号内容生成封面并保存到 {target}(PNG,{size})。"
-            f"作品《{payload.get('title', '')}》第{payload.get('episode', 0)}集,"
-            f"主题:{payload.get('tagline', '')}。构图吸睛、适合短视频封面,"
-            f"可留出大标题排版空间。封面若出现人物，只允许出现并严格对应:"
+            + (f"{cover_prompt}。" if cover_prompt else
+               f"作品《{payload.get('title', '')}》"
+               f"第{payload.get('episode', 0)}集,"
+               f"主题:{payload.get('tagline', '')}。"
+               "构图吸睛、适合短视频封面,可留出大标题排版空间。")
+            + "封面若出现人物，只允许出现并严格对应:"
             f"{'、'.join(payload.get('characters', [])) or '无人'}。"
             f"{_ref_line(payload)}{common}只产出该文件。")
         return instruction, [target], {}
@@ -744,7 +798,10 @@ def run(request, codex, timeout, extra_args, plain=False):
         return {"ok": False, "error": f"codex 命令不存在: {codex}"}
     instruction, targets, data = build_instruction(
         capability, payload, out_dir)
-    exec_args = [] if plain else list(DEFAULT_EXEC_ARGS)
+    exec_args = (
+        [] if plain else list(
+            PROMPT_REVIEW_EXEC_ARGS
+            if capability == "prompt_review" else DEFAULT_EXEC_ARGS))
 
     def invoke(args):
         proc = subprocess.Popen(
@@ -788,6 +845,37 @@ def run(request, codex, timeout, extra_args, plain=False):
         return {"ok": False,
                 "error": f"codex 退出码 {proc.returncode}: "
                          f"{proc.stderr.strip()[:300]}"}
+    if capability == "prompt_review":
+        verdict = _extract_json(proc.stdout)
+        if verdict is None:
+            return {
+                "ok": False,
+                "error": "Codex 未返回可解析的提示词审核 JSON",
+            }
+        approved = verdict.get("approved")
+        optimized = str(verdict.get("optimized_prompt") or "").strip()
+        if not isinstance(approved, bool):
+            return {
+                "ok": False,
+                "error": "Codex 提示词审核缺少布尔字段 approved",
+            }
+        if approved and not optimized:
+            return {
+                "ok": False,
+                "error": "Codex 已批准提示词但没有返回 optimized_prompt",
+            }
+        verdict.setdefault(
+            "schema", payload.get(
+                "review_schema", "aifos.codex-prompt-review/v1"))
+        verdict.setdefault("issues_found", [])
+        verdict.setdefault("changes_made", [])
+        verdict.setdefault("blocking_reason", "")
+        return {
+            "ok": True,
+            "data": verdict,
+            "uri": "",
+            "model": "Codex 提示词审核优化",
+        }
     if capability == "image_qc":
         verdict = _extract_json(proc.stdout)
         if verdict is None or "pass" not in verdict:

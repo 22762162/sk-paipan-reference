@@ -994,6 +994,15 @@ class Director:
         if budget and episode["cost"] >= budget:
             raise BudgetExceeded(
                 f"单集成本 {episode['cost']:.2f} 已达预算 {budget},停止调度")
+        if capability in ("image", "frames", "cover"):
+            review = self.router.review_image_prompt(
+                capability, payload, ctx["out_root"] / sub_dir,
+                cancel=lambda: self._cancel_requested(ctx))
+            if review is not None:
+                self._task_cost += review.cost
+                self._task_providers.add(review.provider)
+                self.projects.add_episode_cost(
+                    ctx["episode"]["id"], review.cost)
         result = self.router.call(
             capability, payload, ctx["out_root"] / sub_dir,
             cancel=lambda: self._cancel_requested(ctx))
@@ -1001,6 +1010,79 @@ class Director:
         self._task_providers.add(result.provider)
         self.projects.add_episode_cost(ctx["episode"]["id"], result.cost)
         return result
+
+    def _review_image_tasks(self, ctx, tasks):
+        """并行完成整批Codex提示词审核，再冻结优化稿进入出图队列。"""
+        review_tasks = [
+            task for task in tasks
+            if task.get("capability") in ("image", "frames", "cover")
+            and isinstance(task.get("payload"), dict)
+        ]
+        if not review_tasks:
+            return
+        profiles = self._codex_parallel_profiles()
+        for index, task in enumerate(review_tasks):
+            payload = task["payload"]
+            if payload.get("_prompt_review_profile"):
+                continue
+            if payload.get("_codex_profile"):
+                payload["_prompt_review_profile"] = payload[
+                    "_codex_profile"]
+            elif profiles:
+                payload["_prompt_review_profile"] = profiles[
+                    index % len(profiles)]["id"]
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        workers = min(self._total_image_workers(), len(review_tasks))
+        cancel = lambda: self._cancel_requested(ctx)  # noqa: E731
+
+        def review_one(task):
+            return task, self.router.review_image_prompt(
+                task["capability"], task["payload"],
+                ctx["out_root"] / task["sub_dir"], cancel=cancel)
+
+        completed = []
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = [pool.submit(review_one, task) for task in review_tasks]
+            for future in as_completed(futures):
+                try:
+                    completed.append(future.result())
+                except Exception:
+                    for pending in futures:
+                        pending.cancel()
+                    raise
+        reviewed = 0
+        for task, result in completed:
+            audit = task["payload"].get("prompt_review") or {}
+            self._plan_mark(
+                ctx, task["item_id"],
+                self._plan_read_status(ctx, task["item_id"]),
+                extra={
+                    "prompt_review": copy.deepcopy(audit),
+                    "prompt_aifos_original": task["payload"].get(
+                        "prompt_aifos_original", ""),
+                    "prompt_optimized": (
+                        task["payload"].get("prompt_compact")
+                        or task["payload"].get("prompt") or ""),
+                })
+            if result is None:
+                continue
+            reviewed += 1
+            self._task_cost += result.cost
+            self._task_providers.add(result.provider)
+            self.projects.add_episode_cost(
+                ctx["episode"]["id"], result.cost)
+        if reviewed:
+            self.log.info(
+                "director",
+                f"Codex提示词审核优化完成:{reviewed}/{len(review_tasks)}条，"
+                "优化稿已冻结后进入图片生成")
+
+    def _plan_read_status(self, ctx, item_id):
+        """读取清单状态；提示词审核写审计信息时不得改变生产状态。"""
+        for item in self._plan_read(ctx).get("items", []):
+            if item.get("id") == item_id:
+                return item.get("status", "pending")
+        return "pending"
 
     # ---- 增量复用:已有资产落盘完好则直接使用 ----
     def _existing_asset_uri(self, ctx, kind, name):
@@ -2292,6 +2374,12 @@ class Director:
         issues = []
         if not prompt_used.strip():
             issues.append("最终提示词为空")
+        prompt_review = payload.get("prompt_review") or {}
+        review_status = str(prompt_review.get("status") or "")
+        if not (
+                prompt_review.get("approved") is True
+                or review_status == "not_applicable_mock_only"):
+            issues.append("最终提示词尚未通过Codex审核优化")
         if payload.get("shot_no") is not None:
             validation = validate_shot_prompt_contract(
                 payload.get("prompt_contract") or {})
@@ -2379,6 +2467,7 @@ class Director:
             "prompt_hash": self._stable_hash(prompt),
             "prompt_used": prompt_used,
             "prompt_used_hash": self._stable_hash(prompt_used),
+            "prompt_review": copy.deepcopy(prompt_review),
             "references": {
                 "required": True,
                 "count": len(reference_facts),
@@ -2396,6 +2485,8 @@ class Director:
             "item_id", "category", "capability", "prompt_hash",
             "prompt_used_hash",
             "reference_hash", "characters", "identity_map")}
+        token_basis["prompt_review_hash"] = prompt_review.get(
+            "optimized_hash", "")
         contract["token"] = self._stable_hash(token_basis)
         return contract
 
@@ -2481,7 +2572,7 @@ class Director:
             }, error=error)
 
     def _plan_run(self, ctx, item_id, fn, prompt=None, payload=None,
-                  revision_source="manual"):
+                  revision_source="manual", capability="image"):
         """包住一次出图调用:生成中 → 完成/失败;手动停止落回排队。
         完成时记录实际使用的产线(真实/占位)与回退原因,界面透明可见。"""
         payload = payload or {}
@@ -2496,6 +2587,14 @@ class Director:
                 raise AifosError(
                     "镜头生成合同前置校验失败，未调用生图 API："
                     + "；".join(validation["issues"]))
+        review = self.router.review_image_prompt(
+            capability, payload, ctx["out_root"] / "prompt_reviews",
+            cancel=lambda: self._cancel_requested(ctx))
+        if review is not None:
+            self._task_cost += review.cost
+            self._task_providers.add(review.provider)
+            self.projects.add_episode_cost(
+                ctx["episode"]["id"], review.cost)
         generation_input = self._image_generation_input(payload)
         self._plan_mark(ctx, item_id, "generating", prompt=prompt,
                         extra={
@@ -2506,6 +2605,11 @@ class Director:
                             "generation_input": generation_input,
                             "prompt_contract_validation": payload.get(
                                 "prompt_contract_validation") or {},
+                            "prompt_review": copy.deepcopy(
+                                payload.get("prompt_review") or {}),
+                            "prompt_aifos_original": payload.get(
+                                "prompt_aifos_original", ""),
+                            "prompt_optimized": generation_input["prompt"],
                             "reference_inputs": self._reference_inputs(
                                 payload),
                             "revision": {
@@ -2796,6 +2900,10 @@ class Director:
             "input_hash": generation_input_hash(prompt_sent, manifest),
             "prompt_contract": copy.deepcopy(
                 payload.get("prompt_contract") or {}),
+            "prompt_review": copy.deepcopy(
+                payload.get("prompt_review") or {}),
+            "prompt_aifos_original": str(
+                payload.get("prompt_aifos_original") or ""),
             "quality": str(payload.get("image_quality") or ""),
             "model": str(payload.get("model_override") or ""),
             "project_id": (qc_spec or {}).get("_project_id"),
@@ -3527,6 +3635,12 @@ class Director:
             self._attach_reference_manifest(payload)
         lesson_issues = []
         while True:
+            # 每次真正出图（包括QC修订重试）都以当前最终输入重新过Codex。
+            # 输入哈希未变化时路由器会复用已批准审核，不产生重复调用。
+            prompt_review = self.router.review_image_prompt(
+                capability, payload, out_dir, cancel=cancel)
+            if prompt_review is not None:
+                spent += float(prompt_review.cost or 0.0)
             generation_input = self._image_generation_input(
                 payload, qc_spec=qc_spec)
             result = self.router.call(capability, payload, out_dir,
@@ -3828,7 +3942,8 @@ class Director:
         data = getattr(result, "data", {}) or {}
         for key in ("first_source", "generation_calls", "model",
                     "image_task_class", "image_quality", "unit_cost",
-                    "codex_profile"):
+                    "codex_profile", "prompt_review",
+                    "prompt_aifos_original", "prompt_optimized"):
             if key in data:
                 extra[key] = data[key]
         model = getattr(result, "model", "")
@@ -3893,6 +4008,19 @@ class Director:
             "image_task_class": payload.get("image_task_class"),
             "image_quality": payload.get("image_quality"),
             "reference_inputs": self._reference_inputs(payload),
+            "prompt_review": copy.deepcopy(
+                payload.get("prompt_review") or {}),
+            "prompt_aifos_original": payload.get(
+                "prompt_aifos_original", ""),
+            "prompt_optimized": (
+                payload.get("prompt_compact")
+                or payload.get("prompt") or ""),
+            "prompt_used": (
+                payload.get("prompt_compact")
+                or payload.get("prompt") or ""),
+            "prompt_used_hash": self._stable_hash(
+                payload.get("prompt_compact")
+                or payload.get("prompt") or ""),
         }
         if task.get("_codex_profile"):
             generating_extra["codex_profile"] = task["_codex_profile"]
@@ -4025,6 +4153,9 @@ class Director:
         if not tasks:
             return ({}, []) if continue_on_qc_failure else {}
         self._assign_codex_profiles(tasks)
+        # 提示词审核必须发生在API加速合同和图片worker之前；否则清单记录
+        # 的哈希仍是AIFOS原稿，实际出图却用了另一份输入。
+        self._review_image_tasks(ctx, tasks)
         self._prepare_dispatch_contracts(ctx, tasks)
         tasks = sorted(tasks, key=lambda task: (
             -int(task.get("priority", 0)), str(task.get("item_id", ""))))
@@ -4083,6 +4214,19 @@ class Director:
                         "image_task_class": payload.get("image_task_class"),
                         "image_quality": payload.get("image_quality"),
                         "reference_inputs": self._reference_inputs(payload),
+                        "prompt_review": copy.deepcopy(
+                            payload.get("prompt_review") or {}),
+                        "prompt_aifos_original": payload.get(
+                            "prompt_aifos_original", ""),
+                        "prompt_optimized": (
+                            payload.get("prompt_compact")
+                            or payload.get("prompt") or ""),
+                        "prompt_used": (
+                            payload.get("prompt_compact")
+                            or payload.get("prompt") or ""),
+                        "prompt_used_hash": self._stable_hash(
+                            payload.get("prompt_compact")
+                            or payload.get("prompt") or ""),
                     }
                     if task.get("_codex_profile"):
                         generating_extra["codex_profile"] = task[
@@ -11010,7 +11154,8 @@ class Director:
                 prompt=self._prompt_with_feedback(
                     frames_payload["prompt"],
                     frames_payload["feedback"]),
-                payload=frames_payload, revision_source=revision_source)
+                payload=frames_payload, revision_source=revision_source,
+                capability="frames")
             meta = self._quality_meta(frames_payload["quality_decision"])
             new_first = self.assets.register(
                 ctx["project"]["id"], "first_frame", asset_name,
@@ -11731,7 +11876,8 @@ class Director:
                     ctx, "frames", frames_payload, "frames"),
                 prompt=self._prompt_with_feedback(
                     frames_payload["prompt"], feedback),
-                payload=frames_payload, revision_source=revision_source)
+                payload=frames_payload, revision_source=revision_source,
+                capability="frames")
             formal_ready = formal_reference_allowed(
                 frames_payload["image_quality"])
             sync_boundaries = {"last_frame"}

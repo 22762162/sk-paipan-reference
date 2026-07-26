@@ -81,6 +81,12 @@ DEFAULT_STANDARD = {
                 "prop_contract_schema": "aifos.prop-contract/v2.2",
                 "compact_prompt_sent_to_model": True,
                 "full_prompt_kept_for_audit": True,
+                "pre_generation_review_required": True,
+                "pre_generation_review_provider": "codex",
+                "pre_generation_review_schema":
+                    "aifos.codex-prompt-review/v1",
+                "pre_generation_review_fail_closed": True,
+                "optimized_prompt_sent_to_model": True,
                 "reference_roles": [
                     "identity", "wardrobe", "prop", "scene", "composition",
                     "spatial_blocking", "continuity", "style",
@@ -538,10 +544,26 @@ class StandardCenter:
         for key in (
                 "single_primary_action", "single_camera_move",
                 "static_frame_target_required",
-                "compact_prompt_sent_to_model", "full_prompt_kept_for_audit"):
+                "compact_prompt_sent_to_model", "full_prompt_kept_for_audit",
+                "pre_generation_review_required",
+                "pre_generation_review_fail_closed",
+                "optimized_prompt_sent_to_model"):
             bool_field(
                 prompt_contract, key,
                 f"rules.production.prompt_contract.{key}")
+        if prompt_contract.get(
+                "pre_generation_review_provider") != "codex":
+            issue(
+                "rules.production.prompt_contract."
+                "pre_generation_review_provider",
+                "所有真实图片提示词必须先由Codex审核优化")
+        if prompt_contract.get(
+                "pre_generation_review_schema") != \
+                "aifos.codex-prompt-review/v1":
+            issue(
+                "rules.production.prompt_contract."
+                "pre_generation_review_schema",
+                "Codex提示词审核合同版本不正确")
         order = prompt_contract.get("order")
         if (not isinstance(order, list) or len(order) < 5
                 or len(set(order)) != len(order)
