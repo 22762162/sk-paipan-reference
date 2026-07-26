@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 from ..generation_diagnostics import normalize_generation_diagnostics
+from ..speaker_labels import is_non_person_label
 from ..inner_persona import normalize_inner_persona_policy
 from ..story_logic import normalize_script_logic
 from ..story_analysis import STORY_ANALYSIS_SCHEMA, validate_story_analysis
@@ -74,6 +75,10 @@ SCRIPT_PROMPT = """你是兼具顶级类型片编剧、影视导演、场面调�
 - 跑龙套、群演、背景路人不得建立独立人物设定。只在 characters 中保留
   `name`、`role: "背景路人"`、`crowd_function` 和出现场次功能,不写外貌、性别、
   年龄、妆容、服装、经历或人物背景提示词,也不生成候选图/立绘/四视图;
+- 旁白、画外音、独白、心声、解说、音效、声效、配乐/BGM、环境音、字幕、
+  花字、提示音、广播这类叙事装置**不是人物**,一律不得写进 characters,
+  也不得出现在任何场次的 `characters` 名单里。它们只是声音或文字来源,
+  没有身体、不出现在画面中;台词内容照常保留在对应场次的叙述或对白里;
 - 人物重要度必须明确标为主角、重要配角、非重要配角或背景路人。
   所有正式角色后续统一生成 4 张候选图;场次中不得出现人物表未声明的新角色;
 - `costume_direction` 必须给出可画的服装逻辑(款式、材质、层次、颜色、职业制服/时代服饰和剧情场合),禁止所有角色默认现代都市便服;
@@ -593,6 +598,7 @@ def normalize_script_bible(script, payload=None):
 
 def validate_script_bible(script):
     """返回世界观/前情/人物介绍硬门禁错误；通过时返回 ``None``。"""
+    strip_non_person_speakers(script)
     world = script.get("story_world")
     if not isinstance(world, dict):
         return "缺少 story_world 故事世界设定"
@@ -639,7 +645,9 @@ def validate_script_bible(script):
         used.update(
             line.get("character") for line in scene.get("lines") or []
             if isinstance(line, dict) and line.get("character"))
-    unknown = sorted(used - declared)
+    # 旁白/音效是声音来源不是人物,不参与“角色必须已声明”的核对。
+    unknown = sorted(
+        name for name in (used - declared) if not is_non_person_label(name))
     if unknown:
         return "场次出现未在人物设定中介绍的角色: " + "、".join(unknown)
     logic = script.get("script_logic_audit") or {}
@@ -649,11 +657,66 @@ def validate_script_bible(script):
     return None
 
 
+def strip_non_person_speakers(script):
+    """旁白/音效/字幕不是人物:从人物表和场次名单剔除,台词保留并标记。
+
+    必须跑在“场次角色是否都已声明”的校验之前。否则模型把旁白正确地当成
+    声音来源写进台词、却(正确地)没写进人物表时,校验会判失败并要求重来
+    ——模型下一轮多半就把旁白补进人物表来迎合校验。这个反向激励正是该
+    问题被修好又反复出现的原因之一。
+    """
+    if not isinstance(script, dict):
+        return []
+    removed = []
+
+    def note(label):
+        label = str(label or "").strip()
+        if label and label not in removed:
+            removed.append(label)
+
+    characters = script.get("characters")
+    if isinstance(characters, list):
+        kept = []
+        for item in characters:
+            if isinstance(item, dict) and is_non_person_label(
+                    item.get("name")):
+                note(item.get("name"))
+                continue
+            kept.append(item)
+        script["characters"] = kept
+    for scene in script.get("scenes") or []:
+        if not isinstance(scene, dict):
+            continue
+        for line in scene.get("lines") or []:
+            if isinstance(line, dict) and is_non_person_label(
+                    line.get("character")):
+                line["non_person_voice"] = True
+        names = scene.get("characters")
+        if isinstance(names, list):
+            kept_names = []
+            for name in names:
+                if is_non_person_label(name):
+                    note(name)
+                    continue
+                kept_names.append(name)
+            scene["characters"] = kept_names
+    # 留痕给导演层记入经验库(能穿过子进程 JSON 回到主进程)
+    if removed:
+        existing = script.get("non_person_labels_removed")
+        merged = list(existing) if isinstance(existing, list) else []
+        for label in removed:
+            if label not in merged:
+                merged.append(label)
+        script["non_person_labels_removed"] = merged
+    return removed
+
+
 def validate_script(script, payload):
     if payload.get("character_design"):
         return validate_design(script, payload)
     if not isinstance(script, dict):
         return "输出不是 JSON 对象"
+    strip_non_person_speakers(script)
     if not script.get("scenes"):
         return "缺少 scenes"
     if not script.get("characters"):
@@ -676,7 +739,8 @@ def validate_script(script, payload):
             if not line.get("character") or not line.get("dialogue"):
                 return f"台词字段不全: {line}"
         scene.setdefault("characters", sorted(
-            {ln["character"] for ln in scene.get("lines", [])}))
+            {ln["character"] for ln in scene.get("lines", [])
+             if not ln.get("non_person_voice")}))
         scene.setdefault("action", "")
     # 平台侧字段兜底,避免下游因缺字段中断
     script.setdefault("project_title", payload.get("project_title", ""))
@@ -1209,6 +1273,9 @@ def build_prompt(capability, payload):
                 f"这是上一版剧本:\n{previous}\n\n"
                 f"用户的修改意见(必须逐条落实):{feedback}\n\n"
                 f"{source_policy}\n请在保留可取之处的前提下按意见重写。{prompt}")
+        lessons = str(payload.get("lessons") or "").strip()
+        if lessons:
+            prompt = f"{prompt}\n\n【经验库·严禁再犯】{lessons}"
         return prompt
     if capability == "storyboard":
         return STORYBOARD_PROMPT.format(

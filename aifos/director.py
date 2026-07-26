@@ -51,7 +51,8 @@ from .prompt_contract import (
     validate_shot_prompt_contract,
 )
 from .qc_feedback import optimize_qc_feedback
-from .lessons import lessons_block, project_lessons, record_lessons
+from .lessons import (DOMAIN_SCRIPT, lessons_block, project_lessons,
+                      record_lessons, script_lessons_block)
 from .relations import relation_lines, write_relations
 from .spatial_blocking import (
     build_spatial_plan,
@@ -317,7 +318,10 @@ def is_unresolved_character(character):
     if name == "待确认说话人" or "待确认" in role:
         return True
     from .script_import import is_likely_performance_label
-    return is_likely_performance_label(name)
+    from .speaker_labels import is_non_person_label
+    # 旁白/音效不生成任何人物资产。它和表演提示词不同:无需人工归并,
+    # 直接静默剔除,所以不进 unresolved_character_labels 的阻断名单。
+    return is_non_person_label(name) or is_likely_performance_label(name)
 
 
 def character_candidate_target(character):
@@ -4661,6 +4665,7 @@ class Director:
         provided = ctx.get("provided_script")
         if provided is not None:
             provided = self._adapt_imported_source(ctx, provided)
+            self._record_script_lessons(ctx, provided)
             self._normalize_script_character_profiles(
                 provided, ctx["episode"].get("premise", ""),
                 project_title=ctx["project"]["title"],
@@ -4722,6 +4727,11 @@ class Director:
             "template": ctx["project"]["kind"],       # drama / idol
             "persona": ctx["project"]["title"],       # 偶像人设名=项目名
         }
+        # 剧本域历史教训(仅人工批准过的)随编剧提示词下发
+        script_lessons = script_lessons_block(
+            self.assets, ctx["project"]["id"])
+        if script_lessons:
+            payload["lessons"] = script_lessons
         if ctx.get("feedback"):
             # 修改意见:连同上一版剧本一起交给编剧重写
             payload["feedback"] = ctx["feedback"]
@@ -4731,6 +4741,7 @@ class Director:
                 payload["previous_script"] = previous
         result = self._call(ctx, "script", payload, "script")
         script = result.data
+        self._record_script_lessons(ctx, script)
         self._normalize_script_character_profiles(
             script, ctx["episode"].get("premise", ""),
             project_title=ctx["project"]["title"],
@@ -4750,6 +4761,30 @@ class Director:
         return {"version": version, "scenes": len(script["scenes"]),
                 "story_analysis_version": analysis_version,
                 "world": analysis["world"]["name"]}
+
+    def _record_script_lessons(self, ctx, script):
+        """剧本解析域的自愈闭环:系统自动纠正过什么,就记住什么。
+
+        这些错误在图片质检里永远看不到——旁白被当成人物是在剧本阶段就
+        发生的,等到出图时已经变成一张多余立绘。所以要在这里留痕,并且
+        只进 script 域,不去稀释出图提示词。
+        """
+        labels = (script or {}).get("non_person_labels_removed")
+        if not labels:
+            return 0
+        issues = [
+            f"把「{label}」当成了人物写进人物表或场次名单;"
+            "旁白、音效、画外音、字幕这类叙事装置只是声音或文字来源,"
+            "没有身体、不出现在画面里,不得建立人物设定"
+            for label in labels[:6]
+        ]
+        try:
+            return record_lessons(
+                self.assets, ctx["project"]["id"], issues,
+                category="non_person_speaker", domain=DOMAIN_SCRIPT)
+        except (AifosError, KeyError, TypeError, ValueError):
+            # 经验库是增强项,任何异常都不能拖垮剧本生产主流程
+            return 0
 
     def _stage_continuity(self, ctx):
         """项目角色/场景/文字规则与生产配置的单集快照。"""

@@ -30,6 +30,9 @@
 import json
 import re
 
+# 转出给既有调用方;唯一事实源在 speaker_labels(零依赖叶子模块)。
+from .speaker_labels import is_non_person_label
+
 _SCENE_RE = re.compile(
     r"^\s*(?:【?第\s*([0-9一二三四五六七八九十百]+)\s*场】?|场景\s*(\d+))"
     r"[：:.\s]*(.*)$")
@@ -120,6 +123,11 @@ def non_person_label_kind(value):
     if value in {
             "优势", "缺点", "劣势", "总结", "总时长", "亮点", "钩子",
             "解析噪声", "说明", "备注", "节奏", "人物少", "场景少"}:
+        return "metadata"
+    # speaker_labels 是全系统唯一的非人物词表；这里仍负责把命中的
+    # 标签细分为导入器需要的 cue 类型。未被上面细分的非人物标签
+    # 作为元数据处理，绝不能回流人物表。
+    if is_non_person_label(value):
         return "metadata"
     return ""
 
@@ -280,7 +288,9 @@ def is_likely_performance_label(value):
 
 def _speaker(value, *, direct=False):
     value = str(value or "").strip(" \t，。！？；、:：")
+    # 旁白/音效即使写成标准「角色:台词」格式也不是人物,direct 也要拦。
     if (not value or len(value) > 12 or value in _INVALID_SPEAKERS
+            or is_non_person_label(value)
             or re.search(r"[，。！？；、:：\"“”‘’「」『』]", value)
             or (not direct and is_likely_performance_label(value))):
         return ""
@@ -454,6 +464,7 @@ def parse_text_script(text, project_title, episode_number):
         r"(?m)^\s*(?:[-+]\s*)?(?:#+\s*)?【?镜头\s*\d+】?",
         text))
     seen_shot_heading = False
+    non_person_labels = []
 
     def open_scene(location):
         nonlocal current
@@ -577,6 +588,11 @@ def parse_text_script(text, project_title, episode_number):
         if line_match:
             speaker = _speaker(line_match.group(1), direct=True)
             if not speaker:
+                # 旁白/音效写成「角色:台词」格式的,留痕给经验库
+                if is_non_person_label(line_match.group(1)):
+                    label = line_match.group(1).strip()
+                    if label not in non_person_labels:
+                        non_person_labels.append(label)
                 _append_action(current, line)
                 continue
             current["lines"].append({
@@ -640,8 +656,12 @@ def parse_text_script(text, project_title, episode_number):
         for line in scene["lines"]:
             counts[line["character"]] = counts.get(line["character"], 0) + 1
             speakers.append(line["character"])
-        scene["characters"] = sorted(set(speakers))
-    ordered = sorted(counts, key=lambda n: -counts[n])
+        scene["characters"] = sorted(
+            name for name in set(speakers)
+            if name == _NARRATOR_NAME or not is_non_person_label(name))
+    # 兜底:任何路径漏进来的旁白/音效标签都不得进入正式人物表。
+    ordered = [name for name in sorted(counts, key=lambda n: -counts[n])
+               if name == _NARRATOR_NAME or not is_non_person_label(name)]
     characters = [{
         "name": name,
         "role": (
@@ -676,6 +696,8 @@ def parse_text_script(text, project_title, episode_number):
             "dialogue_preserved_verbatim": True,
         },
     }
+    if non_person_labels:
+        script["non_person_labels_removed"] = non_person_labels
     return sanitize_script_entities(script)
 
 

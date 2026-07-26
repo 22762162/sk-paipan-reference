@@ -356,11 +356,11 @@ def unresolved_character_labels(script):
 
 
 def is_likely_non_person_name(name):
-    from .script_import import (
-        is_likely_performance_label, non_person_label_kind)
+    from .script_import import is_likely_performance_label
+    from .speaker_labels import is_non_person_label
     return (
         _text(name) == "待确认说话人"
-        or bool(non_person_label_kind(name))
+        or is_non_person_label(name)
         or is_likely_performance_label(name)
     )
 
@@ -607,6 +607,12 @@ def reconcile_character_entities(script, raw):
                 continue
             name = _text(line.get("character"))
             if not name:
+                continue
+            # 旁白/音效即使被 AI 逐句判成“说话人”,也只是声音来源,不是
+            # 人物实体:台词保留(后续可做画外配音),但绝不进人物表、不进
+            # 本场人物名单,也就永远不会生成立绘或占用每镜人数。
+            if is_likely_non_person_name(name):
+                line["non_person_voice"] = True
                 continue
             names.append(name)
             line_counts[name] = line_counts.get(name, 0) + 1
