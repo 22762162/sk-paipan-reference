@@ -1904,3 +1904,100 @@ def test_lesson_approval_endpoint_toggles_prompt_injection(server):
     status, _ = _json_request(
         server["port"], "POST", "/api/lessons/approve", {"approved": True})
     assert status == 400
+
+
+def test_single_image_redraws_queue_instead_of_blocking_each_other(tmp_path):
+    """一张图正在重画时,别的图必须能继续提交——排队,不是拒绝。
+
+    历史上这里有三个叠加缺陷:接口对本集任何在跑的任务一律 409;
+    改用 unique 又会把第二张并进第一张的 job(前端看到第一张成功就以为
+    两张都好了);而前端的"先暂停"判断把单图重画也当成整集生产,提交
+    第二张会直接打断第一张。
+    """
+    registry = JobRegistry(tmp_path / "ws")
+    release = threading.Event()
+    started = []
+    done = []
+
+    def slow_task(_app, _run_id, index=0):
+        started.append(index)
+        release.wait(timeout=10)
+        done.append(index)
+        return {"index": index}
+
+    first = registry.start_task(
+        "队列剧", 1, lambda app, rid: slow_task(app, rid, 1),
+        action="regen_image", queue=True)
+    for _ in range(100):
+        if started:
+            break
+        time.sleep(0.02)
+    assert started == [1]
+
+    # 第一张还在跑时提交第二、第三张:必须各自拿到独立 job 且进入排队
+    second = registry.start_task(
+        "队列剧", 1, lambda app, rid: slow_task(app, rid, 2),
+        action="regen_image", queue=True)
+    third = registry.start_task(
+        "队列剧", 1, lambda app, rid: slow_task(app, rid, 3),
+        action="regen_image", queue=True)
+    assert len({first, second, third}) == 3      # 不得合并成同一个 job
+    assert registry.get(second)["status"] == "queued"
+    assert registry.get(third)["status"] == "queued"
+    assert registry.get(second)["queue_position"] == 1
+    assert registry.get(third)["queue_position"] == 2
+    assert started == [1]                        # 排队期间不并行执行
+
+    # 单图重画不算“整集生产”,不该触发前端的先暂停逻辑
+    assert registry.production_running_for("队列剧", 1) == []
+    assert len(registry.running_for("队列剧", 1)) == 1
+
+    release.set()
+    for _ in range(300):
+        if len(done) == 3:
+            break
+        time.sleep(0.02)
+    assert done == [1, 2, 3]                     # 按提交顺序逐个执行
+    for job_id in (first, second, third):
+        assert registry.get(job_id)["status"] == "done"
+
+
+def test_queue_keeps_draining_after_a_failed_redraw(tmp_path):
+    """一张重画失败不能把整条队列卡死。"""
+    registry = JobRegistry(tmp_path / "ws")
+    release = threading.Event()
+    done = []
+
+    def boom(_app, _run_id):
+        release.wait(timeout=10)
+        raise RuntimeError("这张重画失败了")
+
+    first = registry.start_task(
+        "队列容错", 1, boom, action="regen_image", queue=True)
+    second = registry.start_task(
+        "队列容错", 1, lambda app, rid: done.append(2) or {"ok": True},
+        action="regen_image", queue=True)
+    release.set()
+    for _ in range(300):
+        if registry.get(second)["status"] == "done":
+            break
+        time.sleep(0.02)
+    assert registry.get(first)["status"] == "failed"
+    assert registry.get(second)["status"] == "done"
+    assert done == [2]
+
+
+def test_full_production_still_blocks_single_image_redraw(tmp_path):
+    """整集生产时并行 worker 在改整份 render_plan,改单张仍须先暂停。"""
+    registry = JobRegistry(tmp_path / "ws")
+    release = threading.Event()
+
+    registry.start_task(
+        "生产中", 1, lambda app, rid: release.wait(timeout=10),
+        action="produce")
+    for _ in range(100):
+        if registry.running_for("生产中", 1):
+            break
+        time.sleep(0.02)
+    assert len(registry.production_running_for("生产中", 1)) == 1
+    release.set()
