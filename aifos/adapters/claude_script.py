@@ -23,6 +23,7 @@ from ..speaker_labels import is_non_person_label
 from ..inner_persona import normalize_inner_persona_policy
 from ..story_logic import normalize_script_logic
 from ..story_analysis import STORY_ANALYSIS_SCHEMA, validate_story_analysis
+from ..script_import import sanitize_script_entities
 
 SCRIPT_PROMPT = """你是兼具顶级类型片编剧、影视导演、场面调度和连续性经验的漫剧主创。
 为作品《{title}》第{episode}集创作一集完整、能实际拍摄和生成的剧本。
@@ -241,6 +242,14 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
 - 每段只承载一个主要动作或一次情绪转折；台词逐字照抄，禁止改写；
 - 每场先给 1 个环境/肢体镜头，再为每句台词给 1 个对白镜头；
 - 关键台词后的听者反应与情绪高潮留白由平台补齐，不要用空镜凑时长；
+- `characters` 只列有独立身份资产的登记角色。所有没有独立身份资产但在画面中
+  可见的真人/人形（群众、路人、尸体、临时杀手、侍从等）必须逐类写入
+  `functional_figures`；每项使用 `name` 或 `label` 标明功能，`count` 必须是
+  精确正整数，可选写 `state` / `function`。禁止用“几名”“数名”“一群”
+  “多人”“若干”等模糊数量，禁止把这些功能人物混入 `characters`；
+- 平台按“登记角色数 + functional_figures 各项 count 之和”计算
+  `visible_figure_count`（画面可见真人总数）；`narrative_overlays` 是非现实
+  叙事叠层，不计入可见真人总数；
 - 若剧本 `inner_persona_policy.enabled=true`：穿越前该人物可作为真实人物；
   穿越后其真人形态必须从 `characters` 删除。只有必要的内心独白、内心吐槽、
   喜剧反应或决策冲突，才可输出一个 `narrative_overlays` Q版叠层；不得每句
@@ -273,6 +282,8 @@ JSON 格式:
 {{"episode_title": "...", "shots": [{{"shot_no": 1, "scene_no": 1,
   "kind": "environment", "description": "...", "camera": "镜头语言",
   "duration": 2.5, "characters": ["角色名"], "dialogue": null,
+  "functional_figures": [{{"name":"无独立身份资产的功能人物",
+    "count":2,"state":"当前可见状态","function":"本镜剧情功能"}}],
   "narrative_overlays": [{{"kind":"inner_persona_chibi",
     "function":"inner_monologue/inner_commentary/comic_reaction/decision_conflict",
     "name":"内心人格角色名","host_character":"宿主角色名",
@@ -767,7 +778,38 @@ def validate_storyboard(storyboard):
             return f"镜头时长非法: {shot}"
         if shot["duration"] <= 0:
             return f"镜头时长非法: {shot}"
-        shot.setdefault("characters", [])
+        characters = shot.setdefault("characters", [])
+        if not isinstance(characters, list):
+            return f"镜头 characters 需为数组: {shot}"
+        shot["characters"] = list(dict.fromkeys(
+            str(name).strip() for name in characters
+            if str(name).strip()))
+        functional_figures = shot.setdefault("functional_figures", [])
+        if not isinstance(functional_figures, list):
+            return f"镜头 functional_figures 需为数组: {shot}"
+        normalized_figures = []
+        fuzzy_counts = ("几名", "数名", "一群", "多人", "若干")
+        for figure in functional_figures:
+            if not isinstance(figure, dict):
+                return f"功能人物需为对象: {figure}"
+            label = str(
+                figure.get("name") or figure.get("label") or "").strip()
+            if not label:
+                return f"功能人物缺少 name/label: {figure}"
+            count = figure.get("count")
+            if type(count) is not int or count <= 0:
+                return f"功能人物 count 必须为精确正整数: {figure}"
+            wording = " ".join(str(figure.get(key) or "") for key in (
+                "name", "label", "state", "function"))
+            if any(token in wording for token in fuzzy_counts):
+                return f"功能人物禁止模糊数量词，必须使用精确 count: {figure}"
+            normalized = dict(figure)
+            normalized["count"] = count
+            normalized_figures.append(normalized)
+        shot["functional_figures"] = normalized_figures
+        shot["visible_figure_count"] = (
+            len(shot["characters"])
+            + sum(item["count"] for item in normalized_figures))
         shot.setdefault("kind",
                         "dialogue" if shot.get("dialogue") else "environment")
         shot.setdefault("description", "")
@@ -1045,6 +1087,25 @@ def build_select_prompt(payload):
 
 def build_qc_prompt(payload):
     characters = payload.get("characters") or []
+    functional_figures = [
+        dict(item) for item in (payload.get("functional_figures") or [])
+        if isinstance(item, dict)
+        and type(item.get("count")) is int and item.get("count") > 0
+    ]
+    functional_count = sum(
+        item["count"] for item in functional_figures)
+    try:
+        expected_real_people = int(payload.get(
+            "count", len(characters) + functional_count))
+    except (TypeError, ValueError):
+        expected_real_people = len(characters) + functional_count
+    functional_line = "、".join(
+        f"{item.get('name') or item.get('label') or '功能人物'}"
+        f"{item['count']}人"
+        + (f"({item.get('state') or item.get('function')})"
+           if item.get("state") or item.get("function") else "")
+        for item in functional_figures
+    ) or "无"
     identity_refs = payload.get("identity_references") or []
     generation = payload.get("generation_input")
     generation = generation if isinstance(generation, dict) else {}
@@ -1079,10 +1140,13 @@ def build_qc_prompt(payload):
         f"质检必须满足={'；'.join(quality.get('required') or [])};"
         f"质检禁止={'；'.join(quality.get('forbidden') or [])}"
         if isinstance(quality, dict) else "")
+    composition_visible = composition.get("expected_visible_figure_count")
+    if composition_visible is None:
+        composition_visible = expected_real_people
     composition_rules = (
         f"类型={composition.get('composition_type')};"
         f"正面主体={composition.get('expected_primary_count')};"
-        f"实际可见人形={composition.get('expected_visible_figure_count')};"
+        f"实际可见真人={composition_visible};实际可见人形={composition_visible};"
         f"{actor_rules};{composition.get('count_rule', '')};{quality_line}"
         if composition else "标准构图；按待检图实际可见视角逐人选择核验项")
     count_rule = (
@@ -1091,7 +1155,11 @@ def build_qc_prompt(payload):
         "人数不按出场人数核对"
         if payload.get("multi_view")
         else (
-            f"严格共 {payload.get('count', len(characters))} 个已登记角色；"
+            f"画面可见真人严格共 {expected_real_people} 人，其中登记角色"
+            f"共 {len(characters)} 个、即{len(characters)}人"
+            f"（{'、'.join(characters) or '无'}），"
+            f"功能人物{functional_count}人（{functional_line}）；"
+            "身份逐人核验只覆盖登记角色，功能人物只核对数量、状态和剧情功能；"
             + (composition.get("count_rule") or "每个人物只计一次")))
     physical = payload.get("physical_contract") or {}
     physical_rules = "；".join(physical.get("rules") or [])
@@ -1342,6 +1410,9 @@ def run(request, claude, timeout):
     data = extract_json(proc.stdout)
     if data is None:
         return {"ok": False, "error": "claude 输出中未找到 JSON 对象"}
+    if (capability == "script" and isinstance(data, dict)
+            and isinstance(data.get("scenes"), list)):
+        sanitize_script_entities(data)
     if capability == "image_qc":
         error = validate_image_qc(data)
     elif capability == "image_select":

@@ -489,6 +489,59 @@ def test_line_level_resolution_requires_every_dialogue():
     assert "场1第2句" in error
 
 
+def test_non_person_resolution_becomes_scene_cue_not_character():
+    imported = {
+        "project_title": "冒名入仕",
+        "characters": [
+            {"name": "林川", "role": "主角"},
+            {"name": "**音效", "role": "配角"},
+            {"name": "黑衣人", "role": "背景路人"},
+        ],
+        "scenes": [{
+            "scene_no": 1, "location": "树林",
+            "characters": ["林川", "**音效", "黑衣人"],
+            "lines": [
+                {"character": "林川", "dialogue": "快逃！"},
+                {"character": "**音效", "dialogue": "砰！"},
+            ],
+        }],
+        "import_analysis": {"character_count": 3},
+    }
+    raw = {
+        "line_speakers": [
+            {"scene_no": 1, "line_index": 1, "dialogue": "快逃！",
+             "raw_label": "林川", "canonical_name": "林川",
+             "confidence": 0.99},
+            {"scene_no": 1, "line_index": 2, "dialogue": "砰！",
+             "raw_label": "**音效",
+             "canonical_name": "（非人物·音效标记）",
+             "confidence": 0.99},
+        ],
+        "speaker_resolution": [{
+            "raw_label": "**音效",
+            "canonical_name": "（非人物·音效标记）",
+            "classification": "misparsed_label",
+            "confidence": 0.99,
+        }],
+        "characters": [
+            {"name": "林川", "importance": "主角"},
+            {"name": "黑衣人", "importance": "背景路人"},
+        ],
+    }
+
+    assert reconcile_character_entities(imported, raw) is True
+    assert [item["name"] for item in imported["characters"]] == [
+        "林川", "黑衣人"]
+    assert imported["scenes"][0]["characters"] == ["林川", "黑衣人"]
+    assert imported["scenes"][0]["lines"] == [{
+        "character": "林川", "dialogue": "快逃！",
+        "source_character_label": "林川",
+    }]
+    assert imported["scenes"][0]["sound_cues"] == [{
+        "text": "砰！", "source_label": "**音效",
+    }]
+
+
 def test_saved_analysis_is_versioned_and_rejects_stale_edit(tmp_path):
     app = App(tmp_path / "ws")
     try:

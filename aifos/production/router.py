@@ -103,8 +103,10 @@ class ProviderRouter:
         自定义 Provider 仍按用户配置作为回退。
         """
         strict_provider = str(payload.get("strict_provider") or "").strip()
-        if strict_provider:
-            return [strict_provider]
+        required_provider = str(
+            payload.get("required_provider") or "").strip()
+        if strict_provider or required_provider:
+            return [strict_provider or required_provider]
         base = list(self.config.get(
             "routing", capability, default=None) or ["mock"])
         if capability not in self.IMAGE_CAPABILITIES:
@@ -214,6 +216,8 @@ class ProviderRouter:
     # ---- 调用 ----
     def call(self, capability, payload, out_dir, cancel=None):
         strict_provider = str(payload.get("strict_provider") or "").strip()
+        required_provider = str(
+            payload.get("required_provider") or "").strip()
         strict_model = str(payload.get("model_override") or "").strip()
         if strict_provider:
             self.validate_image_selection(
@@ -300,6 +304,10 @@ class ProviderRouter:
                     "严格 API 加速实际产线/模型与预检不一致: "
                     f"请求 {strict_provider}/{strict_model}，"
                     f"实际 {result.provider}/{result.model or '未知'}")
+            if required_provider and result.provider != required_provider:
+                raise ProviderUnavailable(
+                    "指定分析产线与实际产线不一致: "
+                    f"请求 {required_provider}，实际 {result.provider}")
             if provider.quota_limit > 0:
                 self._consume_quota(name)
             result.fallbacks = fallbacks

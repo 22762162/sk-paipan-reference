@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime, timezone
+import json
 import re
 
 
@@ -428,6 +429,10 @@ def reconcile_character_entities(script, raw):
     """
     if not isinstance(script, dict) or not isinstance(raw, dict):
         return False
+    from .script_import import (
+        non_person_label_kind, normalize_entity_label,
+        sanitize_script_entities)
+
     cast = [
         item for item in script.get("characters", [])
         if isinstance(item, dict) and item.get("name")
@@ -526,6 +531,7 @@ def reconcile_character_entities(script, raw):
         mapping[source] = target
         resolution_meta[source] = item
 
+    removed_non_person_lines = 0
     for scene in script.get("scenes", []):
         if not isinstance(scene, dict):
             continue
@@ -544,8 +550,42 @@ def reconcile_character_entities(script, raw):
             if performance and not line.get("performance"):
                 line["performance"] = performance
 
+    # AI may correctly classify a Markdown label as sound/screen text/noise
+    # instead of a person. Move those lines to scene cue fields before the
+    # formal cast is rebuilt; named narration resolved to a real character is
+    # retained because its current canonical name is no longer non-person.
+    for scene in script.get("scenes", []):
+        if not isinstance(scene, dict):
+            continue
+        clean_lines = []
+        for line in scene.get("lines", []):
+            if not isinstance(line, dict):
+                continue
+            current = normalize_entity_label(line.get("character"))
+            kind = non_person_label_kind(current)
+            if not kind or kind == "narrator":
+                clean_lines.append(line)
+                continue
+            removed_non_person_lines += 1
+            text = _text(line.get("dialogue"))
+            if text and text != "**":
+                field = {
+                    "sound": "sound_cues",
+                    "screen_text": "screen_text_cues",
+                    "metadata": "discarded_import_cues",
+                }.get(kind, "discarded_import_cues")
+                scene.setdefault(field, []).append({
+                    "text": text,
+                    "source_label": _text(
+                        line.get("source_character_label") or current),
+                })
+        scene["lines"] = clean_lines
+
     if not line_meta and not mapping:
-        return False
+        before = json.dumps(script, ensure_ascii=False, sort_keys=True)
+        sanitize_script_entities(script)
+        return json.dumps(
+            script, ensure_ascii=False, sort_keys=True) != before
 
     # 按校正后的逐句人物重建正式角色表；不再让旧错误标签决定人物数量。
     source_order = []
@@ -554,6 +594,14 @@ def reconcile_character_entities(script, raw):
         if not isinstance(scene, dict):
             continue
         names = []
+        # Preserve real, non-speaking visual actors declared by the adapted
+        # script. The previous rebuild kept only dialogue speakers and could
+        # silently erase attackers, corpses, guards or other on-screen roles.
+        for declared in scene.get("characters", []) or []:
+            declared = normalize_entity_label(declared)
+            if (declared and not is_likely_non_person_name(declared)
+                    and declared not in names):
+                names.append(declared)
         for line in scene.get("lines", []):
             if not isinstance(line, dict):
                 continue
@@ -605,8 +653,9 @@ def reconcile_character_entities(script, raw):
             if source not in aliases:
                 aliases.append(source)
     for (scene_no, line_index), item in line_meta.items():
-        line = scene_map[scene_no]["lines"][line_index]
-        character = canonical.get(line.get("character"))
+        # Non-person lines may already have moved to scene cue fields, so the
+        # original positional index is no longer safe here.
+        character = canonical.get(_text(item.get("canonical_name")))
         performance = _text(item.get("performance"))
         if character and performance:
             cues = character.setdefault("performance_cues", [])
@@ -660,18 +709,19 @@ def reconcile_character_entities(script, raw):
     imported["line_speaker_corrections"] = [
         {
             "scene_no": scene_no, "line_index": line_index + 1,
-            "dialogue": scene_map[scene_no]["lines"][line_index].get(
-                "dialogue", ""),
-            "canonical_name": scene_map[scene_no]["lines"][line_index].get(
-                "character", ""),
+            "dialogue": _text(item.get("dialogue")),
+            "canonical_name": _text(item.get("canonical_name")),
         }
-        for scene_no, line_index in sorted(line_meta)
+        for (scene_no, line_index), item in sorted(line_meta.items())
     ]
     imported["misclassified_labels_removed"] = len(
         set(mapping) | {
             source for source, targets in source_targets.items()
             if any(target != source for target in targets)
         })
+    imported["non_person_lines_removed"] = (
+        int(imported.get("non_person_lines_removed") or 0)
+        + removed_non_person_lines)
     unresolved = set(unresolved_character_labels(script))
     imported["unresolved_dialogue_count"] = sum(
         1 for scene in script.get("scenes", [])
@@ -681,6 +731,7 @@ def reconcile_character_entities(script, raw):
         1 for scene in script.get("scenes", [])
         for line in scene.get("lines", [])
         if isinstance(line, dict) and line.get("performance"))
+    sanitize_script_entities(script)
     return True
 
 

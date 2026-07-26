@@ -60,7 +60,7 @@ def test_qc_prompt_and_validation():
     assert bad["issues"] == ["镜头9画成了动物"]
 
 
-def test_qc_keeps_broken_input_contract_advisory_when_image_is_correct(app):
+def test_qc_blocks_conflicting_input_contract_even_when_image_looks_correct(app):
     from aifos.adapters.claude_script import validate_image_qc
 
     report = app.director._assess_image_qc({
@@ -92,12 +92,44 @@ def test_qc_keeps_broken_input_contract_advisory_when_image_is_correct(app):
 
     assert report["image_passed"] is True
     assert report["input_contract_passed"] is False
-    assert report["passed"] is True
-    assert report["redraw_required"] is False
+    assert report["passed"] is False
+    assert report["redraw_required"] is True
     assert report["contract_repair_required"] is True
     assert report["input_contract_advisory"] is True
+    assert report["contract_hard_failure"] is True
+    assert report["hard_failure"] is True
     assert report["qc_policy"] == "visible_major_defects_v2"
     assert validate_image_qc({"issues": []}) == "缺少 pass 字段"
+
+
+def test_qc_keeps_wording_only_input_advice_non_blocking(app):
+    report = app.director._assess_image_qc({
+        "identity_required": False,
+        "gender_required": False,
+        "count_required": True,
+        "count": 1,
+        "physical_logic_required": False,
+    }, {
+        "pass": True,
+        "visual_pass": True,
+        "input_contract_pass": False,
+        "count_checked": True,
+        "count_match": True,
+        "issues": ["提示词略长，可进一步压缩"],
+        "prompt_diagnosis": {
+            "status": "needs_patch",
+            "issues": ["存在不影响执行的重复形容词"],
+            "irrelevant_or_conflicting_sections": []},
+        "reference_diagnosis": {
+            "status": "correct", "issues": [], "missing_roles": []},
+    }, attempts=1)
+
+    assert report["image_passed"] is True
+    assert report["input_contract_passed"] is False
+    assert report["passed"] is True
+    assert report["redraw_required"] is False
+    assert report["contract_hard_failure"] is False
+    assert report["hard_failure"] is False
 
 
 def test_qc_treats_visible_wardrobe_drift_as_hard_failure(app):
@@ -247,6 +279,36 @@ def test_codex_qc_prompt_uses_same_structured_input_diagnosis_contract(
     assert "reference_diagnosis" in instruction
     assert "targeted_prompt_patch" in instruction
     assert "reference_adjustments" in instruction
+    assert "同一人物不能同时穿两套互斥服装" in instruction
+    assert "已死亡人物不能继续呼吸" in instruction
+    assert "第二次生成" in instruction
+
+
+def test_codex_qc_checks_historical_prop_morphology(tmp_path):
+    from aifos.adapters.codex_image import build_instruction
+
+    instruction, _, _ = build_instruction("image_qc", {
+        "image_uri": "/tmp/ming-lamp.png",
+        "shot_no": 1,
+        "characters": [],
+        "count": 0,
+        "physical_contract": {
+            "rules": [
+                "时代物件锁定—油灯：只画明代陶制或青铜开放式浅盏油灯，"
+                "灯油与棉芯可见；绝不画玻璃灯罩或煤油灯筒",
+            ],
+        },
+        "generation_input": {
+            "scope": {"item_id": "shot:1", "shot_no": 1},
+            "prompt": "明代驿馆病榻旁一盏油灯将尽",
+            "reference_manifest": [],
+        },
+    }, tmp_path)
+
+    assert "时代物件锁定—油灯" in instruction
+    assert "玻璃灯罩" in instruction
+    assert "煤油灯" in instruction
+    assert "正确结构" in instruction
 
 
 def test_legacy_qc_validation_remains_compatible_but_disables_blind_retry():
@@ -430,6 +492,191 @@ def test_qc_fail_triggers_auto_redraw(app, tmp_path):
     assert len(result.qc["attempt_history"]) == 2
     assert result.qc["attempt_history"][0][
         "input_hash"] != result.qc["attempt_history"][1]["input_hash"]
+
+
+def test_two_consecutive_failures_escalate_to_codex_without_third_redraw(
+        app, tmp_path):
+    image = tmp_path / "twice-failed.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 24)
+    calls = {"image": 0, "qc": 0, "codex_payload": None}
+
+    def failed_verdict(*, escalated=False):
+        value = {
+            "pass": False,
+            "visual_pass": False,
+            "input_contract_pass": False,
+            "issues": ["双手动作与道具可见性互相冲突"],
+            "image_error": {
+                "summary": "静态画面无法同时完成两个手部动作",
+                "categories": ["action", "prop"],
+                "evidence": ["双手已被拱手动作占用"],
+            },
+            "prompt_diagnosis": {
+                "status": "conflicting",
+                "issues": ["既要求拱手又要求掌中道具清楚可见"],
+                "irrelevant_or_conflicting_sections": ["手部动作冲突"],
+            },
+            "reference_diagnosis": {
+                "status": "correct", "issues": [], "missing_roles": [],
+            },
+            "targeted_prompt_patch": {
+                "instructions": ["定格拱手完成瞬间，道具允许被手掌遮挡"],
+                "preserve": ["人物身份", "机位"],
+                "max_scope": "current_shot_only",
+            },
+            "reference_adjustments": [],
+        }
+        if escalated:
+            value["codex_escalation"] = {
+                "aifos_action": "repair_contract",
+                "reason": "不是继续抽卡能解决的问题",
+                "aifos_instructions": [
+                    "把静态关键帧改为唯一拱手完成瞬间",
+                    "将核桃标为本帧允许遮挡",
+                ],
+                "freeze_moment": "拱手完成",
+                "visible_props": [],
+                "hidden_props": ["核桃"],
+            }
+        return value
+
+    class StubRouter:
+        def call(self, capability, payload, out_dir, cancel=None):
+            if capability == "image":
+                calls["image"] += 1
+                return ProviderResult(
+                    provider="seedream", cost=0.2, uri=str(image))
+            calls["qc"] += 1
+            if payload.get("required_provider") == "codex":
+                calls["codex_payload"] = dict(payload)
+                return ProviderResult(
+                    provider="codex", cost=0.0,
+                    model="Codex 视觉质检",
+                    data=failed_verdict(escalated=True))
+            return ProviderResult(
+                provider="claude", cost=0.1,
+                data=failed_verdict())
+
+    app.director.router = StubRouter()
+    result = app.director._generate_image_with_qc(
+        "image", {"prompt": "赵德昌拱手", "shot_no": 8},
+        tmp_path, None, {
+            "characters": ["赵德昌"], "count": 1,
+            "location": "县衙", "action": "拱手", "forbid": [],
+        })
+
+    assert calls["image"] == 2
+    assert calls["qc"] == 3
+    assert calls["codex_payload"]["required_provider"] == "codex"
+    assert calls["codex_payload"]["codex_escalation_context"][
+        "consecutive_failures"] == 2
+    assert result.qc["consecutive_failures"] == 2
+    assert result.qc["codex_escalation"]["status"] == "completed"
+    assert result.qc["codex_escalation"]["aifos_action"] == \
+        "repair_contract"
+    assert "把静态关键帧改为唯一拱手完成瞬间" in \
+        result.qc["revision_feedback"]
+    assert result.qc["redraw_required"] is False
+    assert result.qc["retry_blocked"] is True
+
+
+def test_existing_image_recheck_keeps_failure_count_and_escalates(
+        app, tmp_path, monkeypatch):
+    project, _ = app.projects.get_or_create_project("复检失败计数")
+    episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+    image = tmp_path / "existing-failed.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"f" * 24)
+    ctx = {
+        "project": dict(project), "episode": dict(episode),
+        "out_root": tmp_path,
+    }
+    item = {
+        "id": "shot:3", "category": "shot_image", "shot_no": 3,
+        "status": "awaiting_human",
+        "qc": {
+            "passed": False, "attempts": 1,
+            "consecutive_failures": 1, "signature": "old",
+            "issues": ["第一次未过"],
+        },
+    }
+    spec = {
+        "identity_required": False,
+        "gender_required": False,
+        "count_required": False,
+        "physical_logic_required": False,
+    }
+    generation_input = {
+        "scope": {"item_id": "shot:3", "shot_no": 3},
+        "prompt": "唯一动作",
+        "reference_manifest": [],
+        "input_hash": "new-input",
+    }
+    marked = {}
+
+    def verdict(*, escalation=False):
+        data = {
+            "pass": False, "visual_pass": False,
+            "input_contract_pass": True,
+            "issues": ["第二次仍未过"],
+            "image_error": {
+                "summary": "动作峰值错误",
+                "categories": ["action"], "evidence": ["手势不成立"]},
+            "prompt_diagnosis": {
+                "status": "correct", "issues": [],
+                "irrelevant_or_conflicting_sections": []},
+            "reference_diagnosis": {
+                "status": "correct", "issues": [], "missing_roles": []},
+            "targeted_prompt_patch": {
+                "instructions": ["只修正手势"], "preserve": ["其他画面"],
+                "max_scope": "current_shot_only"},
+            "reference_adjustments": [],
+        }
+        if escalation:
+            data["codex_escalation"] = {
+                "aifos_action": "targeted_redraw",
+                "reason": "画面手势明确错误",
+                "aifos_instructions": ["保持其他内容，只重画手势"],
+            }
+        return data
+
+    class StubRouter:
+        def __init__(self):
+            self.calls = []
+
+        def call(self, capability, payload, out_dir, cancel=None):
+            self.calls.append(dict(payload))
+            if payload.get("required_provider") == "codex":
+                return ProviderResult(
+                    provider="codex", cost=0,
+                    data=verdict(escalation=True))
+            return ProviderResult(
+                provider="claude", cost=0, data=verdict())
+
+    router = StubRouter()
+    app.director.router = router
+    monkeypatch.setattr(
+        app.director, "_plan_item_asset",
+        lambda *_args, **_kwargs: (str(image), spec))
+    monkeypatch.setattr(
+        app.director, "_plan_generation_input",
+        lambda *_args, **_kwargs: generation_input)
+    monkeypatch.setattr(
+        app.director, "_qc_signature",
+        lambda *_args, **_kwargs: "new-signature")
+    monkeypatch.setattr(
+        app.director, "_plan_mark",
+        lambda _ctx, _item_id, _status, **kwargs:
+        marked.update(kwargs.get("extra") or {}))
+
+    report = app.director._qc_one(
+        dict(project), dict(episode), ctx, item)
+
+    assert report["consecutive_failures"] == 2
+    assert len(router.calls) == 2
+    assert router.calls[1]["required_provider"] == "codex"
+    assert report["codex_escalation"]["status"] == "completed"
+    assert report["codex_escalation"]["aifos_action"] == "targeted_redraw"
+    assert marked["qc"]["consecutive_failures"] == 2
 
 
 def test_incomplete_legacy_diagnosis_blocks_blind_second_generation(
@@ -1421,6 +1668,17 @@ def test_codex_qc_instruction_and_parse(tmp_path, monkeypatch):
     assert "允许与身份参考图不同" in instruction
     assert '"pass"' in instruction
     assert targets == [] and data["qc"] is True
+
+    escalation_instruction, _, _ = codex_image.build_instruction(
+        "image_qc", {
+            "image_uri": "/tmp/f.png",
+            "characters": ["小鹿"],
+            "codex_escalation_context": {"consecutive_failures": 2},
+        }, tmp_path)
+    assert "连续质检失败后的 Codex 升级分析" in escalation_instruction
+    assert "藏入袖内" in escalation_instruction
+    assert "split_shot" in escalation_instruction
+    assert "aifos_instructions" in escalation_instruction
 
     stdout = '思考中…\n{"pass": false, "issues": ["尾帧换了个人"]}\n完成'
 

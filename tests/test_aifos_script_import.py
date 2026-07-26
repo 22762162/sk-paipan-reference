@@ -101,6 +101,80 @@ def test_narration_states_are_performance_not_fake_characters():
     assert script["import_analysis"]["performance_cue_count"] == 4
 
 
+def test_markdown_screenplay_controls_never_become_cast():
+    source = """## 《冒名入仕》
+【镜头1】（3秒）
+烈日下，林川背着包袱走在明朝官道。
+**旁白：**
+> 我叫林川，一个现代公务员。
+**林川怒骂：**
+> “赶着投胎啊！”
+**音效：**
+> 砰！
+**字幕：**
+> 未完待续
+**优势：**
+> 高冲突、高信息密度
+"""
+    script = parse_text_script(source, "冒名入仕", 1)
+    assert [item["name"] for item in script["characters"]] == [
+        "旁白（画外声）", "林川"]
+    roles = {item["name"]: item["role"] for item in script["characters"]}
+    assert roles["旁白（画外声）"] == "背景人物"
+    assert roles["林川"] == "主角"
+    assert [line["dialogue"] for line in script["scenes"][0]["lines"]] == [
+        "我叫林川，一个现代公务员。", "赶着投胎啊！"]
+    assert script["scenes"][0]["lines"][1]["character"] == "林川"
+    assert script["scenes"][0]["sound_cues"] == [{
+        "text": "砰！", "source_label": "音效"}]
+    assert script["scenes"][0]["screen_text_cues"] == [{
+        "text": "未完待续", "source_label": "字幕"}]
+    assert not any(
+        token in item["name"]
+        for item in script["characters"]
+        for token in ("音效", "字幕", "优势", "**"))
+
+
+def test_markdown_shot_outline_becomes_shootable_scenes_not_analysis_noise():
+    source = """如果只是测试流程，这里是编辑建议。
+## 《冒名入仕》
+### 第1集（15秒）
+【镜头1】（3秒）
+烈日下，林川背着包袱走在明朝官道。
+> 我叫林川，一个现代公务员。
+---
+【镜头2】（3秒）
+林川怒骂：
+> “赶着投胎啊！”
+---
+【镜头3】（4秒）
+树林里，林川撞见几名黑衣人。
+> 我只是路过，却撞见了一场凶杀。
+---
+【镜头4】（3秒）
+木棍从林川身后砸下。
+> 砰！
+---
+【镜头5】（2秒）
+旁白：
+> 我，竟成了死去官员。
+### 总时长（约15秒）
+- 人物少、场景少，适合测试。
+"""
+    script = parse_text_script(source, "冒名入仕", 1)
+    assert len(script["scenes"]) == 5
+    assert [scene["duration"] for scene in script["scenes"]] == [
+        3.0, 3.0, 4.0, 3.0, 2.0]
+    assert script["scenes"][1]["lines"][0] == {
+        "character": "林川", "dialogue": "赶着投胎啊！"}
+    assert script["scenes"][3]["lines"] == []
+    assert script["scenes"][3]["sound_cues"] == [{
+        "text": "砰！", "source_label": "音效"}]
+    assert script["scenes"][4]["lines"][0]["character"] == "旁白（画外声）"
+    assert "编辑建议" not in script["scenes"][0]["action"]
+    assert "适合测试" not in script["scenes"][-1]["action"]
+
+
 def test_parse_rejects_no_dialogue():
     with pytest.raises(ScriptImportError):
         parse_text_script("只有描写没有台词", "T", 1)

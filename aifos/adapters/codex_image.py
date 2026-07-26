@@ -60,6 +60,80 @@ GEN_DIRECTIVE = (
     "并以非零码退出,不要伪造图片。")
 
 
+def _nonnegative_int(value):
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result >= 0 else None
+
+
+def _functional_figures(payload):
+    return [
+        dict(item) for item in (payload.get("functional_figures") or [])
+        if isinstance(item, dict)
+        and type(item.get("count")) is int and item.get("count") > 0
+    ]
+
+
+def _population_counts(payload):
+    """Resolve v2.1 population first, then legacy payload fields."""
+    contract = payload.get("prompt_contract")
+    contract = contract if isinstance(contract, dict) else {}
+    population = contract.get("population")
+    population = population if isinstance(population, dict) else {}
+    counts = population.get("counts")
+    counts = counts if isinstance(counts, dict) else {}
+    subject = contract.get("subject")
+    subject = subject if isinstance(subject, dict) else {}
+    composition = contract.get("composition")
+    composition = composition if isinstance(composition, dict) else {}
+    figures = _functional_figures(payload)
+
+    registered = next((
+        value for value in (
+            _nonnegative_int(counts.get("named_characters")),
+            _nonnegative_int(subject.get("registered_count")),
+            _nonnegative_int(payload.get("character_count")),
+            len(payload.get("characters") or []),
+        ) if value is not None), 0)
+    functional = next((
+        value for value in (
+            _nonnegative_int(counts.get("functional_people")),
+            _nonnegative_int(subject.get("functional_count")),
+            sum(item["count"] for item in figures),
+        ) if value is not None), 0)
+    visible = next((
+        value for value in (
+            _nonnegative_int(counts.get("real_people_total")),
+            _nonnegative_int(subject.get("visible_count")),
+            _nonnegative_int(payload.get("visible_figure_count")),
+            _nonnegative_int(payload.get("count")),
+            _nonnegative_int(
+                composition.get("expected_visible_figure_count")),
+            registered + functional,
+        ) if value is not None), registered + functional)
+    return registered, functional, visible
+
+
+def _population_line(payload):
+    registered, functional, visible = _population_counts(payload)
+    names = "、".join(payload.get("characters") or []) or "无"
+    figures = _functional_figures(payload)
+    figure_text = "、".join(
+        f"{item.get('name') or item.get('label') or '功能人物'}"
+        f"{item['count']}人"
+        + (f"({item.get('state') or item.get('function')})"
+           if item.get("state") or item.get("function") else "")
+        for item in figures
+    ) or ("按v2.1人口合同" if functional else "无")
+    return (
+        f"登记角色{registered}人（{names}）；功能人物{functional}人"
+        f"（{figure_text}）；画面可见真人严格共{visible}人。"
+        "身份与最终立绘核验只覆盖登记角色；功能人物只服从本镜数量、"
+        "状态与剧情功能；非现实叙事叠层不计入真人总数。")
+
+
 def _space_line(payload):
     constraint = str(payload.get("spatial_constraint") or "").strip()
     if not constraint:
@@ -90,7 +164,12 @@ def _ref_line(payload):
     if manifest:
         numbered = ";".join(
             f"图{item.get('index')}={item.get('label', '参考图')}"
-            f" {item.get('uri', '')}({item.get('binding', '')})"
+            f" {item.get('uri', '')}({item.get('binding', '')}"
+            + (f"；inherits={','.join(item.get('inherits') or [])}"
+               if item.get("inherits") else "")
+            + (f"；excludes={','.join(item.get('excludes') or [])}"
+               if item.get("excludes") else "")
+            + ")"
             for item in manifest if item.get("uri"))
         return ("参考图对照表(必须逐张真实打开读取,严格按编号对应使用:"
                 "每个人物只参考自己名下的图,禁止把一个人的脸画成另一张"
@@ -315,9 +394,8 @@ def build_instruction(capability, payload, out_dir):
         instruction = (
             f"为漫剧分镜生成一张关键图并保存到 {target}"
             f"(PNG,{size})。画面内容:{prompt_text}。"
-            f"出场角色:{'、'.join(payload.get('characters', []))}，"
-            f"严格共{payload.get('character_count', len(payload.get('characters', [])))}人，"
-            f"禁止新增或复制人物。{text_rule}"
+            f"人物总量合同:{_population_line(payload)}"
+            f"禁止新增、漏画、复制或合并任何真人。{text_rule}"
             f"镜头语言:{payload.get('camera', '')}。"
             f"{_ref_line(payload)}{common}"
             "只产出该文件,不要改动其他文件。"
@@ -389,6 +467,7 @@ def build_instruction(capability, payload, out_dir):
     if capability == "image_qc":
         image = payload.get("image_uri", "")
         chars = "、".join(payload.get("characters", [])) or "无人(空镜)"
+        _, _, expected_real_people = _population_counts(payload)
         forbid = "、".join(payload.get("forbid", [])) or "无"
         identity_refs = payload.get("identity_references") or []
         identity_line = "；".join(
@@ -407,10 +486,14 @@ def build_instruction(capability, payload, out_dir):
             f"质检必须满足={ '；'.join(quality.get('required') or []) };"
             f"质检禁止={ '；'.join(quality.get('forbidden') or []) }"
             if isinstance(quality, dict) else "")
+        composition_visible = composition.get(
+            "expected_visible_figure_count")
+        if composition_visible is None:
+            composition_visible = expected_real_people
         composition_line = (
             f"类型={composition.get('composition_type')};"
             f"正面主体={composition.get('expected_primary_count')};"
-            f"实际可见人形={composition.get('expected_visible_figure_count')};"
+            f"实际可见真人={composition_visible};"
             f"{actor_rules};{composition.get('count_rule', '')};{quality_line}"
             if composition else "标准构图；按待检图实际可见视角逐人核验")
         physical = payload.get("physical_contract") or {}
@@ -426,8 +509,7 @@ def build_instruction(capability, payload, out_dir):
             "画面中出现的每个人形、头像或局部都必须是该角色同一人,"
             "人数不按出场人数核对"
             if payload.get("multi_view") else
-            f"严格共 {payload.get('count', len(payload.get('characters', [])))} "
-            "个已登记角色；"
+            _population_line(payload)
             + (composition.get("count_rule") or "每个人物只计一次"))
         overlays = [
             item for item in (payload.get("narrative_overlays") or [])
@@ -465,6 +547,30 @@ def build_instruction(capability, payload, out_dir):
             "shot_no": payload.get("shot_no"),
             "frame_kind": payload.get("frame_kind", "keyframe"),
         }
+        escalation = payload.get("codex_escalation_context")
+        escalation = escalation if isinstance(escalation, dict) else {}
+        escalation_line = ""
+        escalation_schema = ""
+        if escalation:
+            escalation_line = (
+                "- 这是连续质检失败后的 Codex 升级分析，不是普通复检。"
+                f"连续失败次数={int(escalation.get('consecutive_failures') or 2)}；"
+                "必须先判断失败来自画面、提示词/参考图合同冲突，还是一个静态"
+                "关键帧无法同时承载多个先后动作。藏入袖内、被手掌或身体合理"
+                "遮挡的道具属于不可见状态，不能强迫画面把它展示出来；双手已"
+                "执行抱拳、拱手等占用动作时，也不能同时要求同一只手清楚展示"
+                "被遮挡道具。若合同要求在一张图里同时表现接取、检查、归还等"
+                "先后动作，应选择单一冻结瞬间或建议拆镜，不能继续盲目重画。"
+                "请用 codex_escalation.aifos_action 明确通知 AIFOS 下一步。\n")
+            escalation_schema = (
+                ', "codex_escalation": {"aifos_action":'
+                '"targeted_redraw/repair_contract/split_shot/'
+                'accept_current/manual_review",'
+                '"reason":"为什么这样处理","aifos_instructions":'
+                '["AIFOS下一步只需执行的具体修改"],'
+                '"freeze_moment":"静态关键帧唯一冻结瞬间",'
+                '"visible_props":["本帧必须可见的道具"],'
+                '"hidden_props":["本帧应隐藏或允许被遮挡的道具"]}')
         instruction = (
             f"你是漫剧图片质检员。用你的视觉能力查看图片文件 {image}"
             "(可直接读取该文件),逐项核对是否符合以下生产要求,"
@@ -477,10 +583,17 @@ def build_instruction(capability, payload, out_dir):
             f"{json.dumps(generation_references, ensure_ascii=False)[:16000]}\n"
             "除判断画面错误外，必须分别判断提示词是否准确、简洁、无冲突、"
             "无无关剧情，以及参考图是否属于本镜、人物与用途绑定是否正确、"
-            "是否缺失或冲突。不得虚构未提交的输入。输入诊断仅作后续优化建议："
-            "提示词重复、略长或参考图说明不够简洁，不得单独令 visual_pass 或"
-            " pass 为 false。\n"
-            "- 质检阈值：按手机竖屏正常播放观看，禁止放大像素挑刺。只有普通观众"
+            "是否缺失或冲突。必须逐项对照当前镜头剧本事实、起点、动作、"
+            "终点：同一人物不能同时穿两套互斥服装；同一件关键道具不能在"
+            "没有复制剧情时同时被人物持有/穿着又散置另一处；已死亡人物不能"
+            "继续呼吸、眨眼或表演微表情；一个静态帧不能同时承担多个先后"
+            "动作。不得虚构未提交的输入。只有提示词重复、略长或参考图说明"
+            "不够简洁时才作为建议；凡与剧本不符、逻辑冲突、关键描述不清或"
+            "缺少执行所需事实，input_contract_pass 必须为 false，pass 也必须"
+            "为 false，并在 targeted_prompt_patch 中给出可直接用于第二次生成"
+            "的唯一明确表述。\n"
+            + escalation_line
+            + "- 质检阈值：按手机竖屏正常播放观看，禁止放大像素挑刺。只有普通观众"
             "一眼可见、会影响身份识别、剧情理解或画面可信度的明显问题才失败："
             "明显错人/错性别/错人数、严重跑脸、关键服装/道具/场景/时代错误、"
             "剧情必需文字错误，以及明显肢体畸形、穿模、悬浮、设备反向或空间"
@@ -529,6 +642,11 @@ def build_instruction(capability, payload, out_dir):
             f"- 物理/空间逻辑硬检查:{physical_line}\n"
             "必须核对人物、镜头、道具的前后左右关系、朝向、视线、接触点、重力支撑和动作可达性；"
             "电脑/手机/屏幕等设备必须按真实使用方向成立，屏幕正面、键盘/手部和使用者关系不能反向。"
+            "凡物理合同中出现“时代物件锁定—”的对象，必须逐件核对结构、"
+            "材质和时代形态；例如明代开放式浅盏油灯若被画成带玻璃灯罩、"
+            "灯筒或现代旋钮的煤油灯，属于普通观众可见的关键时代错误，"
+            "visual_pass 必须为 false。修正指令不能只写“更符合时代”，必须"
+            "写清正确结构与明确禁止的错误结构。"
             "只有明显且影响剧情理解或画面可信度的物理/空间错误才令 pass 为 false；"
             "细微透视误差、遮挡造成的不确定关系和背景小物偏差不得失败。\n"
             f"- 不允许出现:{forbid}、字幕条、乱码文字、多余或缺失的人物\n"
@@ -579,7 +697,9 @@ def build_instruction(capability, payload, out_dir):
             '"target_index":参考图编号整数,"role":"用途",'
             '"character":"角色名或空","replacement_selector":'
             '{"asset_id":已有资产ID或null,"role":"用途",'
-            '"character":"角色名或空"},"reason":"调整原因"}]}'
+            '"character":"角色名或空"},"reason":"调整原因"}]'
+            + escalation_schema
+            + '}'
         )
         return instruction, [], {"qc": True}
     if capability == "image_select":

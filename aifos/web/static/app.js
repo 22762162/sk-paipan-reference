@@ -1338,6 +1338,7 @@ async function renderDashboard() {
 
     <div class="panel">
       <h2>账号矩阵 · IP 资产沉淀</h2>
+      <p class="dim">只统计当前有效资产；已删除、被替换和历史版本不计入数量，仍可在历史记录中追溯。</p>
       ${Object.keys(data.asset_stats).length ? Object.entries(data.asset_stats).map(([proj, rows]) => {
         const p = data.projects.find((x) => x.title === proj) || {};
         const kindCN = { drama: "漫剧", idol: "AI虚拟偶像" }[p.kind] || p.kind || "";
@@ -2887,8 +2888,162 @@ function bindRegen(container, episodeId, getData, onDone) {
   });
 }
 
+function revisionPlanItem(data, shotNo, kind) {
+  const itemId = kind === "shot"
+    ? `shot:${Number(shotNo)}` : `frames:${Number(shotNo)}`;
+  return (data?.render_plan?.items || []).find(
+    (item) => String(item.id || "") === itemId) || null;
+}
+
+function revisionReferenceRoleLabel(role) {
+  return ({
+    identity: "人物身份",
+    character_identity: "人物身份",
+    identity_detail: "人物细节",
+    character: "人物设定",
+    wardrobe: "本镜服装",
+    spatial: "空间调度",
+    spatial_blocking: "空间调度",
+    prop: "核心道具",
+    scene: "场景",
+    style: "项目画风",
+    keyframe: "关键帧",
+    continuity: "连续性",
+    revision_base: "待修改基底",
+  })[String(role || "")] || String(role || "参考图");
+}
+
+function revisionGenerationSnapshot(data, shotNo, kind) {
+  const item = revisionPlanItem(data, shotNo, kind);
+  const qc = item?.qc || {};
+  let generationInput = null;
+  let promptSource = "";
+  if (qc.generation_input?.prompt) {
+    generationInput = qc.generation_input;
+    promptSource = "质检保存的实际调用快照";
+  } else if (item?.generation_input?.prompt) {
+    generationInput = item.generation_input;
+    promptSource = "生产保存的实际调用快照";
+  }
+  const promptUsed = String(item?.prompt_used || "").trim();
+  const actualPrompt = String(generationInput?.prompt || promptUsed).trim();
+  const shot = (data?.storyboard?.shots || []).find(
+    (row) => Number(row.shot_no) === Number(shotNo)) || {};
+  const fallbackPrompt = String(
+    item?.prompt || shot.prompt || shot.seedance_prompt_compact || "").trim();
+  const prompt = actualPrompt || fallbackPrompt;
+  const promptIsActual = Boolean(actualPrompt);
+  if (!promptSource && promptUsed) promptSource = "生产记录中的实际调用提示词";
+  if (!promptSource) promptSource = prompt
+    ? "分镜基础提示词（非实际调用记录）" : "未找到提示词记录";
+
+  const displayRefs = item?.reference_inputs?.items || [];
+  const actualRefs = generationInput?.reference_manifest;
+  const rawRefs = Array.isArray(actualRefs) && actualRefs.length
+    ? actualRefs : displayRefs;
+  const catalog = data?.artifacts?.image_assets || [];
+  const references = rawRefs.map((ref, position) => {
+    const display = displayRefs.find((row) =>
+      (ref.asset_id != null && Number(row.asset_id) === Number(ref.asset_id))
+      || (ref.uri && String(row.uri || "") === String(ref.uri))) || {};
+    const catalogItem = catalog.find((row) =>
+      ref.asset_id != null && Number(row.asset_id) === Number(ref.asset_id)) || {};
+    return {
+      index: Number(ref.index || position + 1),
+      label: String(ref.label || ref.name || display.label
+        || display.name || `参考图${position + 1}`),
+      role: String(ref.role || ref.reference_role || display.reference_role
+        || display.kind || ref.kind || "reference"),
+      binding: String(ref.binding || display.binding || ""),
+      url: String(display.url || catalogItem.url || ""),
+    };
+  });
+
+  const frameName = kind === "first_frame" ? "首帧"
+    : kind === "last_frame" ? "尾帧" : "";
+  const diagnoses = Array.isArray(qc.input_diagnoses)
+    ? qc.input_diagnoses : [];
+  const diagnosis = (frameName
+    ? diagnoses.find((row) => String(row.frame || "") === frameName)
+    : null) || qc.input_diagnosis || {};
+  const issueValues = [
+    ...(qc.issues || []),
+    diagnosis.image_error?.summary,
+    ...(diagnosis.image_error?.evidence || []),
+    ...(diagnosis.prompt_diagnosis?.issues || []),
+    ...(diagnosis.reference_diagnosis?.issues || []),
+  ].map((value) => String(value || "").trim()).filter(Boolean);
+  const issues = [...new Set(issueValues)];
+  const quality = String(generationInput?.quality
+    || item?.image_quality || "").trim();
+  const qualityLabel = ({ low: "低质量", medium: "中质量", high: "高质量" })[
+    quality] || quality;
+  const productionMeta = [
+    promptSource,
+    item?.provider ? `通道 ${item.provider}` : "",
+    item?.model ? `模型 ${item.model}` : "",
+    qualityLabel,
+  ].filter(Boolean).join(" · ");
+  return {
+    item, qc, prompt, promptIsActual, promptSource, productionMeta,
+    references,
+    referencesAreActual: Boolean(
+      (Array.isArray(actualRefs) && actualRefs.length)
+      || displayRefs.length),
+    issues,
+  };
+}
+
+function revisionGenerationInputHtml(data, shotNo, kind) {
+  const snapshot = revisionGenerationSnapshot(data, shotNo, kind);
+  const promptLabel = snapshot.promptIsActual
+    ? "实际生产输入（原提示词）"
+    : "分镜基础提示词（非实际调用记录）";
+  const referenceLabel = snapshot.referencesAreActual
+    ? "实际提交参考图对照" : "参考图记录";
+  const qcState = snapshot.qc && Object.keys(snapshot.qc).length
+    ? (snapshot.issues.length ? "未通过 / 有问题" : "已通过")
+    : "尚无质检记录";
+  return `<section class="shot-generation-input ${
+      snapshot.promptIsActual ? "actual" : "fallback"}">
+    <div class="shot-generation-input-heading">
+      <b>🔎 原输入与质检对照</b>
+      <span>${snapshot.promptIsActual ? "真实调用记录" : "缺少调用快照"}</span>
+    </div>
+    <small class="shot-generation-input-meta">${esc(snapshot.productionMeta)}</small>
+    ${!snapshot.promptIsActual ? `<div class="shot-generation-input-warning">
+      旧记录未保存实际提交提示词；下面只能作为分镜依据，不能冒充当时真实调用输入。
+    </div>` : ""}
+    <details class="shot-original-prompt" open>
+      <summary>${promptLabel}</summary>
+      ${snapshot.prompt
+        ? `<pre class="shot-original-prompt-text">${esc(snapshot.prompt)}</pre>
+          <button type="button" class="shot-revision-copy-prompt">复制原提示词</button>`
+        : `<div class="shot-generation-input-empty">这张图没有可追溯的提示词记录</div>`}
+    </details>
+    <details class="shot-original-references">
+      <summary>${referenceLabel}（${snapshot.references.length} 张）</summary>
+      ${snapshot.references.length ? `<ol>${snapshot.references.map((ref) => `
+        <li>${ref.url ? `<img src="${esc(ref.url)}" alt="${esc(ref.label)}">` : ""}
+          <div><b>图${ref.index} · ${esc(ref.label)}</b>
+            <span>${esc(revisionReferenceRoleLabel(ref.role))}</span>
+            ${ref.binding ? `<small>${esc(ref.binding)}</small>` : ""}</div></li>`).join("")}
+      </ol>` : `<div class="shot-generation-input-empty">未保存参考图提交清单</div>`}
+    </details>
+    <div class="shot-generation-qc ${snapshot.issues.length ? "failed" : ""}">
+      <b>质检结论 · ${qcState}</b>
+      ${snapshot.issues.length
+        ? `<ul>${snapshot.issues.map((issue) => `<li>${esc(issue)}</li>`).join("")}</ul>`
+        : `<small>${qcState === "已通过"
+          ? "当前记录没有发现需要修正的问题。"
+          : "生成后会在这里显示画面、提示词和参考图的联合质检结果。"}</small>`}
+    </div>
+  </section>`;
+}
+
 /* 分镜生产表内直接修图：不再返回图片清单或画布侧栏找镜头。 */
-function shotInlineRevisionHtml(shotNo, hasImage, productionActive = false) {
+function shotInlineRevisionHtml(
+  shotNo, hasImage, productionActive = false, data = null) {
   if (!hasImage) return `<small class="shot-inline-revision-note">关键帧生成后可在此直接修改</small>`;
   const target = { kind: "shot", shot_no: Number(shotNo) };
   return `<details class="shot-inline-revision"
@@ -2896,6 +3051,10 @@ function shotInlineRevisionHtml(shotNo, hasImage, productionActive = false) {
     data-production-active="${productionActive ? "1" : "0"}">
     <summary class="shot-revision-toggle">✏️ 直接修改此图</summary>
     <div class="shot-revision-form">
+      ${revisionGenerationInputHtml(data, shotNo, "shot")}
+      <label class="shot-revision-feedback-label">本次修改意见
+        <small>只写当前这张图哪里错、应改成什么；对照上方原输入后再提交</small>
+      </label>
       <textarea rows="3" class="shot-revision-feedback"
         placeholder="必填：指出错误和正确画面，例如“程沐应为女性，脸和发型严格参考已锁定立绘；保持当前机位”"></textarea>
       ${qualitySelectHtml("shot-revision-quality")}
@@ -2912,7 +3071,7 @@ function shotInlineRevisionHtml(shotNo, hasImage, productionActive = false) {
 }
 
 function frameInlineRevisionHtml(
-  shotNo, kind, hasImage, productionActive = false) {
+  shotNo, kind, hasImage, productionActive = false, data = null) {
   const isFirst = kind === "first_frame";
   const label = isFirst ? "首帧" : "尾帧";
   if (!hasImage) {
@@ -2927,6 +3086,10 @@ function frameInlineRevisionHtml(
     data-production-active="${productionActive ? "1" : "0"}">
     <summary class="shot-revision-toggle">✏️ 修改${label}</summary>
     <div class="shot-revision-form">
+      ${revisionGenerationInputHtml(data, shotNo, kind)}
+      <label class="shot-revision-feedback-label">本次${label}修改意见
+        <small>只写当前${label}与原输入不符的地方；未提及内容保持不变</small>
+      </label>
       <textarea rows="3" class="shot-revision-feedback"
         placeholder="必填：只写这张${label}哪里错、要改成什么；未提及部分会保持不变"></textarea>
       ${qualitySelectHtml("shot-revision-quality")}
@@ -2964,6 +3127,14 @@ function bindShotInlineRevisions(root, data) {
     const targetLabel = target.kind === "first_frame" ? "首帧"
       : target.kind === "last_frame" ? "尾帧" : "参考分镜";
     const form = box.querySelector(".shot-revision-form");
+    const copyPrompt = box.querySelector(".shot-revision-copy-prompt");
+    if (copyPrompt) copyPrompt.onclick = async (event) => {
+      event.stopPropagation();
+      const prompt = box.querySelector(".shot-original-prompt-text")?.textContent || "";
+      await copyText(prompt);
+      copyPrompt.textContent = "✓ 已复制";
+      setTimeout(() => { copyPrompt.textContent = "复制原提示词"; }, 1200);
+    };
     const refBtn = box.querySelector(".shot-revision-ref");
     refBtn.onclick = (event) => {
       event.stopPropagation();
@@ -3114,6 +3285,19 @@ function planIsMock(item) {
   return item.status === "done" && item.real === false;
 }
 
+const CODEX_QC_ACTION_CN = {
+  targeted_redraw: "定向重画",
+  repair_contract: "先修镜头合同",
+  split_shot: "拆分镜头动作",
+  accept_current: "建议保留当前图",
+  manual_review: "人工确认",
+};
+
+function planCodexEscalation(item) {
+  const value = (planVisibleQc(item) || {}).codex_escalation;
+  return value && typeof value === "object" ? value : {};
+}
+
 function planQcBadge(item) {
   const qc = planVisibleQc(item);
   if (!qc) return "";
@@ -3121,6 +3305,11 @@ function planQcBadge(item) {
     return `<span class="plan-st st-manual" title="人工确认通过，原质检问题仍保留在审计记录">人工通过✓</span>`;
   if (qc.passed)
     return `<span class="plan-st st-qc-ok" title="视觉质检通过${qc.attempts > 1 ? `(重画 ${qc.attempts - 1} 次后通过)` : ""}">质检✓</span>`;
+  const codex = planCodexEscalation(item);
+  if (codex.status === "completed")
+    return `<span class="plan-st st-auto" title="${esc(codex.reason || "连续两次失败后已由 Codex 分析")}">🤖 Codex 已分析 · ${esc(CODEX_QC_ACTION_CN[codex.aifos_action] || codex.aifos_action || "待处理")}</span>`;
+  if (codex.status === "unavailable")
+    return `<span class="plan-st st-mock" title="${esc(codex.reason || "Codex 暂不可用")}">⚠ Codex 待接管</span>`;
   return `<span class="plan-st st-mock" title="${esc((qc.issues || []).join(";"))}">⚠ 质检未过</span>`;
 }
 
@@ -3133,10 +3322,21 @@ function planQcIssuesHtml(item) {
       ${issues.length ? `<span>原质检提示（已接受）：${esc(issues.join("；"))}</span>` : ""}</div>`;
   }
   if (qc.passed || !(qc.issues || []).length) return "";
-  const revision = qc.revision_feedback
+  const codex = planCodexEscalation(item);
+  const failureCount = Number(qc.consecutive_failures || 0);
+  const revision = qc.revision_feedback && codex.status !== "completed"
     ? `<div class="qc-revision"><b>自动优化修订：</b>${esc(qc.revision_feedback)}</div>` : "";
+  const codexNotice = codex.status === "completed"
+    ? `<div class="qc-revision qc-codex-notice"><b>Codex → AIFOS：</b>
+      ${esc(codex.instruction_to_aifos || "已完成分析，等待应用修改指令")}
+      <span class="dim">处理方式：${esc(CODEX_QC_ACTION_CN[codex.aifos_action] || codex.aifos_action || "待确认")}</span></div>`
+    : (codex.status === "unavailable"
+      ? `<div class="qc-revision qc-codex-notice"><b>Codex 暂未接管：</b>${esc(codex.reason || "分析通道暂不可用；已停止原样重画")}</div>`
+      : "");
   return `<div class="plan-err qc-fail-reason"><b>质检没有通过的原因：</b>${esc(qc.issues.join("；"))}
-    <span class="dim">(已自动重画 ${qc.attempts} 次仍未过,可改提示词手动重画)</span>${revision}</div>`;
+    <span class="dim">(${failureCount
+      ? `已连续失败 ${failureCount} 次`
+      : `已自动重画 ${Number(qc.attempts || 0)} 次仍未过`})</span>${codexNotice}${revision}</div>`;
 }
 
 function planQcReferenceGalleryHtml(item) {
@@ -3157,9 +3357,13 @@ function planQcReferenceGalleryHtml(item) {
 function planTraceBadges(item) {
   const revision = item.revision || {};
   const refs = item.reference_inputs || {};
+  const semantic = planSemanticCorrections(item);
   const auto = String(revision.source || "").startsWith("batch_");
   return `${auto && revision.prompt_modified
     ? `<span class="plan-st st-auto" title="批量重画已自动加入修正要求">自动改词✓</span>` : ""}
+    ${semantic.length
+      ? `<span class="plan-st st-auto" title="出图前已按当前镜头剧本事实纠正互斥状态">逻辑修正 ×${semantic.length}</span>`
+      : ""}
     ${refs.count
       ? `<span class="plan-st st-refs" title="本次实际交给出图产线的参考图">参考图 ×${refs.count}</span>`
       : (refs.required
@@ -3170,16 +3374,29 @@ function planTraceHtml(item) {
   const revision = item.revision || {};
   const refs = item.reference_inputs || {};
   const refItems = refs.items || [];
-  if (!revision.prompt_modified && !refItems.length && !refs.required) return "";
+  const semantic = planSemanticCorrections(item);
+  if (!revision.prompt_modified && !refItems.length && !refs.required
+      && !semantic.length) return "";
   return `<details class="plan-trace" ${item.status === "generating" ? "open" : ""}>
-    <summary>本次重画记录 · ${revision.prompt_modified ? "提示词已自动修正" : "提示词未改"}
+    <summary>生成输入记录 · ${semantic.length ? `出图前逻辑修正 ${semantic.length} 项` : (revision.prompt_modified ? "提示词已自动修正" : "提示词未改")}
       · ${refItems.length ? `已附 ${refItems.length} 张参考图` : (refs.required ? "缺少必需参考图" : "无需参考图")}</summary>
+    ${semantic.length ? `<div><b>出图前剧本/逻辑纠正：</b><ul>${semantic.map((entry) =>
+      `<li>${entry.character ? `${esc(entry.character)} · ` : ""}${esc(entry.field || "镜头事实")}：
+      ${entry.from ? `原「${esc(entry.from)}」 → ` : ""}改为「${esc(entry.to || "按当前镜头事实执行")}」
+      ${entry.reason ? `（${esc(entry.reason)}）` : ""}</li>`).join("")}</ul></div>` : ""}
     ${revision.feedback ? `<div><b>自动修正：</b>${esc(revision.feedback)}</div>` : ""}
     ${refItems.length ? `<div><b>参考图：</b>${refItems.map((ref) =>
       `${esc(ref.label || ref.kind)}「${esc(ref.name || "未命名") }」`
       + `${ref.reference_role ? `〔${esc(ref.reference_role)}${ref.attach_to ? `→${esc(ref.attach_to)}` : ""}〕` : ""}`
     ).join("；")}</div>` : ""}
   </details>`;
+}
+
+function planSemanticCorrections(item) {
+  const validation = item.prompt_contract_validation || {};
+  const values = validation.semantic_corrections || item.semantic_corrections || [];
+  return Array.isArray(values) ? values.filter((entry) =>
+    entry && typeof entry === "object" && (entry.reason || entry.to)) : [];
 }
 
 function planMockReasonHtml(item) {
@@ -4142,7 +4359,9 @@ const GENERATION_DIAG_FIELD_CN = {
   first_valid: "首帧有效", last_valid: "尾帧有效",
   source_frames_valid: "源帧有效", continuity_valid: "连续性有效",
   visual_checked: "已做视觉检查", provider: "生成通道", model: "模型",
-  generated_at: "生成时间",
+  generated_at: "生成时间", contract_hard_failure: "剧本/逻辑合同硬错误",
+  semantic_corrections: "出图前语义纠正",
+  era_object_constraints: "时代物件结构锁定",
 };
 const GENERATION_DIAG_HIDDEN_FIELDS = new Set([
   "schema", "diagnosis_complete", "prompt_hash", "reference_hash",
@@ -4313,18 +4532,26 @@ function videoFailurePanelHtml(failures) {
 function imageFailurePanelHtml(data) {
   const failures = data.image_failures || [];
   if (!failures.length) return "";
+  const codexReviewed = failures.filter(
+    (failure) => failure.codex_escalation?.status === "completed").length;
   return `<section class="image-failure-panel" role="alert"
     aria-label="待人工问题清单">
     <div class="image-failure-heading">
-      <div><b>⚠ 待人工问题清单 · ${failures.length} 张关键帧</b>
-        <span>系统已自动定向修图 1 次；这些图仍未通过，但其他关键帧会继续生产。</span></div>
+      <div><b>⚠ 连续失败问题清单 · ${failures.length} 张关键帧</b>
+        <span>连续两次未通过会自动交给 Codex 联合分析原图、提示词和参考图；
+          Codex 已完成 ${codexReviewed} 张，并把定向修改指令回传给 AIFOS。</span></div>
       <div class="image-failure-actions">
         <button type="button" class="image-failure-batch"
           data-image-failure-batch>🛠 打开清单批量优化</button>
         <small>失败稿不会进入正式资产或 Seedance 参考链。</small>
       </div>
     </div>
-    <div class="image-failure-list">${failures.map((failure) => `
+    <div class="image-failure-list">${failures.map((failure) => {
+      const codex = failure.codex_escalation || {};
+      const action = CODEX_QC_ACTION_CN[codex.aifos_action]
+        || codex.aifos_action || "等待第二次结果";
+      const count = Number(failure.consecutive_failures || 0);
+      return `
       <article class="image-failure-item generation-issue-card"
         data-image-failure-item="${esc(failure.item_id || "")}">
         ${failure.failed_output_url ? `<button type="button"
@@ -4335,16 +4562,22 @@ function imageFailurePanelHtml(data) {
         <div class="image-failure-copy">
           <b>镜头 ${String(failure.shot_no).padStart(2, "0")}</b>
           <span>${esc((failure.issues || []).join("；") || "图片质检未通过")}</span>
-          <small>已自动修图 ${Number(failure.auto_repairs || 1)} 次后仍未过</small>
+          <small>${count ? `连续失败 ${count} 次` : `已自动修图 ${Number(failure.auto_repairs || 0)} 次`}
+            · ${codex.status === "completed" ? `Codex 已分析：${esc(action)}`
+              : (codex.status === "unavailable" ? "Codex 暂不可用，已停止盲目重画"
+                : "未达到两次时保留原质检流程")}</small>
+          ${codex.status === "completed" ? `<span class="qc-codex-inline">
+            <b>Codex → AIFOS：</b>${esc(codex.instruction_to_aifos || "")}</span>` : ""}
         </div>
         <button type="button" class="primary image-failure-jump"
           data-image-failure-shot="${failure.shot_no}">
-          跳到镜头并展开修改</button>
+          ${codex.status === "completed" ? `按 Codex 指令处理 · ${esc(action)}` : "跳到镜头并展开修改"}</button>
         <button type="button" class="image-failure-pass"
           data-image-failure-pass="${esc(failure.item_id || "")}">
           ✅ 人工通过</button>
         ${generationDiagnosisHtml(failure, "image")}
-      </article>`).join("")}</div>
+      </article>`;
+    }).join("")}</div>
   </section>`;
 }
 
@@ -9258,17 +9491,19 @@ function shotProductionTableHtml(data, options = {}) {
             ${storyboardMediaThumb(keyframeUrl,
               failedKeyframe ? "二次质检失败稿" : "参考分镜", no, imageState)}
             ${shotInlineRevisionHtml(
-              no, !!keyframeUrl, context === "live")}</td>
+              no, !!keyframeUrl, context === "live", data)}</td>
           <td class="storyboard-frames" data-label="首尾帧"><div class="storyboard-frame-pair">
             <div class="storyboard-frame-item">
               ${storyboardMediaThumb((art.first || {})[no], "首帧", no, frameState)}
               ${frameInlineRevisionHtml(
-                no, "first_frame", !!(art.first || {})[no], context === "live")}
+                no, "first_frame", !!(art.first || {})[no],
+                context === "live", data)}
             </div>
             <div class="storyboard-frame-item">
               ${storyboardMediaThumb((art.last || {})[no], "尾帧", no, frameState)}
               ${frameInlineRevisionHtml(
-                no, "last_frame", !!(art.last || {})[no], context === "live")}
+                no, "last_frame", !!(art.last || {})[no],
+                context === "live", data)}
             </div>
           </div></td>
           <td class="storyboard-movement" data-label="运镜">${storyboardCameraHtml(shot)}</td>
@@ -9994,17 +10229,17 @@ class StoryboardCanvas {
         failedKeyframe ? "二次质检失败稿" : "关键图"}">` : ""}
       ${failedKeyframe ? `<div class="issue error">[关键帧二次质检]
         ${esc((failedKeyframe.issues || []).join("；") || "待人工修改")}</div>` : ""}
-      ${shotInlineRevisionHtml(shotNo, !!keyframeUrl)}
+      ${shotInlineRevisionHtml(shotNo, !!keyframeUrl, false, this.data)}
       <h4>首尾帧</h4>
       <div class="thumbs editable-frame-thumbs">
         <figure>${art.first[shotNo] ? `<img src="${esc(art.first[shotNo])}">` : ""}
           <figcaption>首帧</figcaption>
           ${frameInlineRevisionHtml(
-            shotNo, "first_frame", !!art.first[shotNo])}</figure>
+            shotNo, "first_frame", !!art.first[shotNo], false, this.data)}</figure>
         <figure>${art.last[shotNo] ? `<img src="${esc(art.last[shotNo])}">` : ""}
           <figcaption>尾帧</figcaption>
           ${frameInlineRevisionHtml(
-            shotNo, "last_frame", !!art.last[shotNo])}</figure>
+            shotNo, "last_frame", !!art.last[shotNo], false, this.data)}</figure>
       </div>
       ${mediaTag(art.videos[shotNo]) ? `<h4>镜头视频</h4>${mediaTag(art.videos[shotNo])}` : ""}
       ${shot.dialogue ? `<h4>台词</h4><div class="dialogue"><b>${esc(shot.dialogue.character)}</b>:${esc(shot.dialogue.dialogue)}</div>` : ""}

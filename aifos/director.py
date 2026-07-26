@@ -74,14 +74,19 @@ from .story_analysis import (
     validate_line_speaker_resolution,
     validate_story_analysis,
 )
+from .script_import import sanitize_script_entities
 from .workflow import (
     PIPELINE_VERSION,
+    _functional_figure_count,
+    _functional_figure_line,
+    _normalize_functional_figures,
     build_content_review,
     build_continuity_bible,
     build_preflight,
     enrich_storyboard,
     lock_text_assets,
     production_profile,
+    reconcile_shot_semantics,
     repair_storyboard_appearance_continuity,
     write_delivery_verifier,
     write_review_board,
@@ -2676,6 +2681,7 @@ class Director:
                  composition_contract=None, readable_text=None,
                  physical_contract=None, physical_logic_required=False,
                  era_exceptions=None, narrative_overlays=None,
+                 functional_figures=None,
                  character_sheet_key=None):
         """视觉质检规格：按角色在本镜可见角度选择核验依据。"""
         identity_characters = list(characters or [])
@@ -2736,6 +2742,11 @@ class Director:
             for item in (narrative_overlays or [])
             if isinstance(item, dict)
         ][:1]
+        functional_figures = _normalize_functional_figures(
+            functional_figures)
+        if expected_count is None:
+            count = len(visible_characters) + _functional_figure_count(
+                functional_figures)
         expected_wardrobe = {
             name: "；".join(filter(None, (
                 ("服装:" + str((backgrounds.get(name) or {}).get("costume")))
@@ -2756,6 +2767,7 @@ class Director:
             "characters": visible_characters,
             "identity_characters": identity_characters,
             "count": count,
+            "functional_figures": functional_figures,
             "narrative_overlays": overlays,
             "expected_overlay_count": len(overlays),
             "overlay_count_required": bool(overlays),
@@ -2782,6 +2794,11 @@ class Director:
                                        "location": location,
                                        "readable_text": readable_text or {},
                                    })),
+            "era_object_constraints": [
+                str(rule) for rule in (
+                    (physical_contract or {}).get("rules") or [])
+                if str(rule).startswith("时代物件锁定—")
+            ] if isinstance(physical_contract, dict) else [],
             "readable_text": (readable_text if isinstance(readable_text, dict)
                                else {}),
             "identity_view_policy": "adaptive_visible_angle_v2",
@@ -3216,6 +3233,14 @@ class Director:
         reference_status = str(
             input_diagnosis["reference_diagnosis"].get("status")
             or "").lower()
+        # Redundancy/wordiness remains advisory, but a contradictory or
+        # incomplete story contract is not production-ready.  Otherwise a
+        # lucky-looking first render can hide a broken prompt and the next
+        # attempt repeats the same wardrobe, prop or era mistake.
+        contract_hard_failure = (
+            prompt_status in {"conflicting", "insufficient"}
+            or reference_status in {
+                "needs_adjustment", "conflicting", "missing"})
         if "input_contract_pass" in verdict:
             input_contract_passed = checked_true(
                 verdict["input_contract_pass"])
@@ -3240,10 +3265,12 @@ class Director:
             image_passed = (
                 checked_true(verdict.get("pass"))
                 and not visual_hard_failure)
-        # 图片已经生成后，以普通观众实际能看到的成片结果决定是否放行。
-        # 提示词冗余、参考图说明不够简洁等输入合同问题继续记录为优化
-        # 建议，但不再把视觉合格的图片判失败或触发昂贵的自动重画。
-        passed = image_passed and visual_checks_passed
+        # A merely verbose prompt stays advisory. A story/logic/reference
+        # contradiction is a hard input failure: repair it and make the second
+        # attempt from changed input instead of certifying an accidental image.
+        passed = (
+            image_passed and visual_checks_passed
+            and not contract_hard_failure)
         report = {
             "passed": passed,
             "issues": issues,
@@ -3280,12 +3307,16 @@ class Director:
             "visual_pass": image_passed,
             "input_contract_passed": input_contract_passed,
             "input_contract_pass": input_contract_passed,
-            "redraw_required": not image_passed,
+            "redraw_required": bool(
+                not image_passed or contract_hard_failure),
             "contract_repair_required": not input_contract_passed,
             "production_ready": passed,
             "qc_policy": "visible_major_defects_v2",
             "input_contract_advisory": not input_contract_passed,
-            "hard_failure": bool(visual_hard_failure and not image_passed),
+            "hard_failure": bool(
+                (visual_hard_failure and not image_passed)
+                or contract_hard_failure),
+            "contract_hard_failure": contract_hard_failure,
         }
         report.update({
             "input_diagnosis": input_diagnosis,
@@ -3302,6 +3333,237 @@ class Director:
         })
         return report
 
+    @staticmethod
+    def _previous_qc_failure_count(qc):
+        """Read the durable consecutive-failure count, including legacy rows."""
+        qc = qc if isinstance(qc, dict) else {}
+        if qc.get("passed") is True:
+            return 0
+        for key in (
+                "consecutive_failures", "previous_consecutive_failures"):
+            try:
+                value = int(qc.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
+        history = qc.get("attempt_history")
+        if isinstance(history, list):
+            trailing = 0
+            for row in reversed(history):
+                if not isinstance(row, dict) or row.get("qc_passed") is True:
+                    break
+                trailing += 1
+            if trailing:
+                return trailing
+        # Older integrated generation reports only stored ``attempts``.
+        try:
+            return max(0, int(qc.get("attempts") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _codex_escalation_action(raw, codex_report):
+        raw = raw if isinstance(raw, dict) else {}
+        aliases = {
+            "redraw": "targeted_redraw",
+            "redraw_current": "targeted_redraw",
+            "fix_prompt": "repair_contract",
+            "contract_repair": "repair_contract",
+            "split": "split_shot",
+            "accept": "accept_current",
+            "pass": "accept_current",
+        }
+        action = str(raw.get("aifos_action") or "").strip().lower()
+        action = aliases.get(action, action)
+        allowed = {
+            "targeted_redraw", "repair_contract", "split_shot",
+            "accept_current", "manual_review",
+        }
+        if action in allowed:
+            return action
+        if codex_report.get("passed"):
+            return "accept_current"
+        if targeted_prompt_patch(
+                codex_report.get("input_diagnosis") or {}):
+            return "targeted_redraw"
+        if codex_report.get("contract_repair_required"):
+            return "repair_contract"
+        return "manual_review"
+
+    def _escalate_failed_image_to_codex(
+            self, report, qc_spec, image_uri, generation_input, out_dir,
+            cancel=None, codex_profile="", existing_result=None,
+            existing_verdict=None):
+        """After two failures, let Codex diagnose and notify AIFOS.
+
+        This is analysis only.  It never launches a third image generation.
+        A targeted redraw may happen later, using ``instruction_to_aifos``.
+        """
+        report = copy.deepcopy(report or {})
+        failures = self._previous_qc_failure_count(report)
+        if report.get("passed") or failures < 2:
+            return report, 0.0
+        existing_provider = str(
+            getattr(existing_result, "provider", "") or "").strip()
+        existing_model = str(
+            getattr(existing_result, "model", "") or "").strip()
+        verdict = (
+            copy.deepcopy(existing_verdict)
+            if isinstance(existing_verdict, dict) else {})
+        codex_report = None
+        cost = 0.0
+        try:
+            if (existing_provider == "codex"
+                    and isinstance(verdict.get("codex_escalation"), dict)):
+                codex_report = self._assess_image_qc(
+                    qc_spec, verdict, int(report.get("attempts") or 1))
+            else:
+                payload = {
+                    **qc_spec,
+                    "image_uri": image_uri,
+                    "generation_input": copy.deepcopy(generation_input),
+                    "generation_prompt": generation_input.get("prompt", ""),
+                    "reference_manifest": copy.deepcopy(
+                        generation_input.get("reference_manifest") or []),
+                    "required_provider": "codex",
+                    "_codex_profile": str(codex_profile or ""),
+                    "codex_escalation_context": {
+                        "consecutive_failures": failures,
+                        "previous_issues": list(report.get("issues") or []),
+                    },
+                }
+                codex_result = self.router.call(
+                    "image_qc", payload, out_dir, cancel=cancel)
+                cost = float(codex_result.cost or 0.0)
+                existing_provider = codex_result.provider
+                existing_model = (
+                    getattr(codex_result, "model", "") or "")
+                verdict = copy.deepcopy(codex_result.data or {})
+                codex_report = self._assess_image_qc(
+                    qc_spec, verdict, int(report.get("attempts") or 1))
+        except (ProviderUnavailable, ProviderError) as exc:
+            reason = str(exc)[:600]
+            report.update({
+                "redraw_required": False,
+                "production_ready": False,
+                "retry_blocked": True,
+                "retry_blocked_reason": (
+                    "连续两次质检未过，但 Codex 分析暂不可用；"
+                    "已禁止原样继续重画"),
+                "codex_escalation": {
+                    "schema": "aifos.codex-qc-escalation/v1",
+                    "triggered": True,
+                    "status": "unavailable",
+                    "trigger": "consecutive_qc_failures",
+                    "consecutive_failures": failures,
+                    "provider": "codex",
+                    "reason": reason,
+                    "aifos_action": "manual_review",
+                    "instruction_to_aifos": "",
+                    "analyzed_at": now(),
+                },
+            })
+            return report, cost
+
+        raw_escalation = verdict.get("codex_escalation")
+        raw_escalation = (
+            raw_escalation if isinstance(raw_escalation, dict) else {})
+        action = self._codex_escalation_action(
+            raw_escalation, codex_report)
+        raw_instructions = raw_escalation.get("aifos_instructions")
+        if isinstance(raw_instructions, str):
+            raw_instructions = [raw_instructions]
+        instructions = [
+            re.sub(r"\s+", " ", str(value or "")).strip()[:800]
+            for value in (
+                raw_instructions if isinstance(raw_instructions, list)
+                else [])
+            if str(value or "").strip()
+        ][:8]
+        patch = targeted_prompt_patch(
+            codex_report.get("input_diagnosis") or {})
+        if instructions:
+            instruction = (
+                "【Codex 通知 AIFOS】" + "；".join(instructions)
+                + "\n【范围】只修改当前镜头")
+        elif patch:
+            instruction = patch
+        elif action == "accept_current":
+            instruction = (
+                "【Codex 通知 AIFOS】当前失败来自质检合同冲突，"
+                "不要继续原样重画；保留当前图等待确认。")
+        else:
+            instruction = (
+                "【Codex 通知 AIFOS】先修复当前镜头合同或拆分动作，"
+                "确认唯一静态冻结瞬间后再重画。")
+        reason = re.sub(
+            r"\s+", " ", str(raw_escalation.get("reason") or (
+                (codex_report.get("image_error") or {}).get("summary")
+                or "连续失败后已完成画面、提示词和参考图联合诊断"
+            ))).strip()[:1200]
+
+        def escalation_list(key):
+            values = raw_escalation.get(key) or []
+            if isinstance(values, str):
+                values = [values]
+            if not isinstance(values, list):
+                return []
+            return [
+                re.sub(r"\s+", " ", str(value or "")).strip()[:160]
+                for value in values if str(value or "").strip()
+            ][:12]
+
+        # The Codex diagnosis becomes the authoritative next-input contract,
+        # while the earlier visual verdict remains in the audit trail.
+        report["pre_codex_input_diagnosis"] = copy.deepcopy(
+            report.get("input_diagnosis") or {})
+        for key in (
+                "input_diagnosis", "image_error", "prompt_diagnosis",
+                "reference_diagnosis", "targeted_prompt_patch",
+                "reference_adjustments", "diagnosis_complete"):
+            if key in codex_report:
+                report[key] = copy.deepcopy(codex_report[key])
+        report.update({
+            "production_ready": False,
+            "redraw_required": action == "targeted_redraw",
+            "contract_repair_required": action in {
+                "repair_contract", "split_shot"},
+            "retry_blocked": True,
+            "retry_blocked_reason": (
+                f"连续 {failures} 次质检未过，已由 Codex 分析；"
+                "禁止没有应用 Codex 指令的原样重画"),
+            "revision_feedback": instruction[:2400],
+            "auto_repair_exhausted": True,
+            "codex_escalation": {
+                "schema": "aifos.codex-qc-escalation/v1",
+                "triggered": True,
+                "status": "completed",
+                "trigger": "consecutive_qc_failures",
+                "consecutive_failures": failures,
+                "provider": existing_provider or "codex",
+                "model": existing_model or "Codex 视觉质检",
+                "aifos_action": action,
+                "reason": reason,
+                "aifos_instructions": instructions,
+                "instruction_to_aifos": instruction[:2400],
+                "freeze_moment": str(
+                    raw_escalation.get("freeze_moment") or "")[:600],
+                "visible_props": escalation_list("visible_props"),
+                "hidden_props": escalation_list("hidden_props"),
+                "issues": list(codex_report.get("issues") or [])[:16],
+                "analyzed_at": now(),
+            },
+            "retry_decision": {
+                "action": action,
+                "source": "codex_escalation",
+                "retry_blocked": True,
+                "retry_blocked_reason": (
+                    "必须先应用 Codex 回传的 AIFOS 修改指令"),
+            },
+        })
+        return report, cost
+
     def _generate_image_with_qc(self, capability, payload, out_dir,
                                 cancel, qc_spec):
         """出图 + 视觉质检 + 不合格自动重画(worker 线程安全:只调产线)。
@@ -3311,6 +3573,11 @@ class Director:
         spent = 0.0
         attempt_history = []
         payload = copy.deepcopy(payload or {})
+        try:
+            failure_count_base = max(
+                0, int(payload.get("qc_consecutive_failures_base") or 0))
+        except (TypeError, ValueError):
+            failure_count_base = 0
         if payload.get("character_sheet"):
             payload["feedback"] = self._sheet_feedback_for_key(
                 payload.get("feedback"), payload.get("character_sheet"))
@@ -3479,7 +3746,30 @@ class Director:
             if not report["passed"]:
                 lesson_issues.extend(report["issues"])
             report["lesson_issues"] = list(dict.fromkeys(lesson_issues))
+            trailing_failures = 0
+            for row in reversed(attempt_history):
+                if row.get("qc_passed") is True:
+                    break
+                trailing_failures += 1
+            report["consecutive_failures"] = (
+                0 if report["passed"]
+                else failure_count_base + trailing_failures)
+            report["qc_provider"] = qc_result.provider
+            report["qc_model"] = (
+                getattr(qc_result, "model", "") or "")
             result.qc = report
+            if (not report["passed"]
+                    and report["consecutive_failures"] >= 2):
+                report, escalation_cost = \
+                    self._escalate_failed_image_to_codex(
+                        report, qc_spec, uri, generation_input, out_dir,
+                        cancel=cancel,
+                        codex_profile=payload.get("_codex_profile", ""),
+                        existing_result=qc_result,
+                        existing_verdict=qc_result.data or {})
+                result.cost += escalation_cost
+                result.qc = report
+                return result
             if (report["passed"] or not report["redraw_required"]
                     or attempts >= self._qc_retries()):
                 return result
@@ -3619,6 +3909,18 @@ class Director:
     def _critical_qc_error(result):
         qc = getattr(result, "qc", None) or {}
         if qc.get("passed") is False:
+            codex = qc.get("codex_escalation") or {}
+            if codex.get("status") == "completed":
+                return (
+                    "图片连续两次质检未通过，Codex 已完成升级分析并通知 "
+                    f"AIFOS 执行 {codex.get('aifos_action', 'manual_review')}:"
+                    + str(codex.get("instruction_to_aifos") or "")
+                    + "；".join(qc.get("issues") or []))
+            if codex.get("status") == "unavailable":
+                return (
+                    "图片连续两次质检未通过，Codex 分析暂不可用；"
+                    "已禁止原样继续重画:"
+                    + str(codex.get("reason") or ""))
             if (qc.get("contract_repair_required")
                     and not qc.get("redraw_required")):
                 return (
@@ -4207,6 +4509,9 @@ class Director:
         """为人工导入/旧版剧本补齐人物背景与剧情圣经,不覆盖已有设定。"""
         if not isinstance(script, dict):
             return script
+        # Markdown 的“旁白/音效/字幕/优势”等控制标签必须先移出人物表，
+        # 否则通用人物档案补全会把解析噪声永久固化成配角。
+        sanitize_script_entities(script)
         scenes = script.get("scenes") or []
         locations = {}
         for scene in scenes:
@@ -4611,8 +4916,8 @@ class Director:
                         ctx["episode"]["id"], "storyboard", existing)
                     self.log.info(
                         "director",
-                        "已为复用分镜补齐服装/头饰/妆发连续性状态；"
-                        "未重写镜头、台词或时长")
+                        "已为复用分镜补齐服装/头饰/妆发连续性，并修复"
+                        "死亡后表演等确定性语义冲突；未改镜头号、台词或时长")
                 ctx["storyboard"] = existing
                 self._plan_seed_shots(ctx)
                 self.log.info("director", f"复用已有五维分镜 v{version}")
@@ -7107,14 +7412,8 @@ class Director:
                     current_wardrobe, locked_look.get("costume"))))
             headwear_matches = self._headwear_states_compatible(
                 current_headwear, self._look_headwear_text(locked_look))
-            if (current_wardrobe
-                    and wardrobe_matches and headwear_matches):
-                # One image can safely carry both responsibilities when the
-                # manually selected portrait visibly wears this exact look.
-                identity["wardrobe_lock"] = current_wardrobe
-                wardrobe_bound_names.add(character)
-            elif ((current_wardrobe or current_headwear)
-                  and self._look_headwear_text(locked_look)):
+            if ((current_wardrobe or current_headwear)
+                    and (not wardrobe_matches or not headwear_matches)):
                 # A full-body final portrait wearing another scene's outfit
                 # visually overpowers a clothes-only reference even when the
                 # prompt says "identity only". Replace the submitted image
@@ -7523,12 +7822,24 @@ class Director:
                 f"{actor_id}={name}（{line or '人物身份以最终立绘为准'}；"
                 "脸型、五官骨相、年龄、性别表达、发际线与发型轮廓只以"
                 "该角色最终立绘锁定；不得复制参考图的姿势、背景或未声明服装）")
+        functional_figures = _normalize_functional_figures(
+            shot.get("functional_figures"))
+        functional_count = _functional_figure_count(functional_figures)
+        visible_count = len(who) + functional_count
+        parts.append(
+            f"【POPULATION】登记角色{len(who)}人；功能人物"
+            f"{functional_count}人（{_functional_figure_line(functional_figures)}）；"
+            f"画面可见真人严格共{visible_count}人；非现实叙事叠层不计真人。")
         if who:
             parts.append(
-                f"【IDENTITY LOCK】画面严格共{len(who)}人；"
+                f"【IDENTITY LOCK】只核验以下{len(who)}名登记角色；"
                 + "；".join(who)
                 + "；每人只读取自己编号对应的最终立绘，禁止串脸、换性别、"
-                "新增、缺失、合并或复制人物")
+                "缺失、合并或复制登记角色；功能人物不得套用登记角色身份")
+        elif functional_figures:
+            parts.append(
+                "【IDENTITY LOCK】本镜没有需最终立绘核验的登记角色；"
+                "功能人物只按精确数量、状态和剧情功能呈现")
         else:
             parts.append(
                 "【IDENTITY LOCK】严格 0 人空镜；禁止人物、人体局部、"
@@ -7678,6 +7989,10 @@ class Director:
 
     def _shot_payload(self, ctx, shot, *, continuity_anchor=False,
                       quality_override=None, item_id=None):
+        # Defensive repair for saved legacy boards: the current-shot action is
+        # narrower than a global character design and must win before identity
+        # facts, references, prompt text or QC expectations are compiled.
+        shot = reconcile_shot_semantics(shot)
         locations = self._scene_locations(ctx)
         location = shot_local_scene(
             shot, locations.get(shot["scene_no"], ""))
@@ -7712,13 +8027,44 @@ class Director:
             name for name in shot["characters"]
             if name not in identity_characters
             and not is_background_character(script_characters.get(name, {})))
+        functional_figures = _normalize_functional_figures(
+            shot.get("functional_figures"))
+        visible_figure_count = (
+            len(shot["characters"])
+            + _functional_figure_count(functional_figures))
+        shot["functional_figures"] = functional_figures
+        shot["visible_figure_count"] = visible_figure_count
         character_background = self._shot_character_facts(ctx, shot)
         character_visuals = self._shot_character_visuals(
             ctx, shot, character_background)
-        composition_contract = build_composition_contract(shot)
+        composition_contract = copy.deepcopy(build_composition_contract(shot))
+        composition_contract["expected_visible_figure_count"] = (
+            visible_figure_count)
+        composition_contract.setdefault(
+            "registered_character_count", len(shot["characters"]))
+        composition_contract.setdefault(
+            "functional_figure_count",
+            _functional_figure_count(functional_figures))
+        composition_contract.setdefault(
+            "functional_figures", copy.deepcopy(functional_figures))
+        story_world = (ctx.get("script") or {}).get("story_world") or {}
+        era_context = "；".join(
+            str(value or "").strip() for value in (
+                story_world.get("name"),
+                story_world.get("era_and_location"),
+                story_world.get("hard_rules"),
+                shot.get("era_context"),
+            ) if str(value or "").strip())
+        sanctioned_anachronisms = list(
+            story_world.get("sanctioned_anachronisms") or
+            shot.get("sanctioned_anachronisms") or [])
         physical_contract = build_physical_contract({
             **shot, "spatial_blocking": spatial or {},
             "readable_text": readable_text,
+            "location": location,
+            "style": ctx["project"]["style"] or "",
+            "era_context": era_context,
+            "sanctioned_anachronisms": sanctioned_anachronisms,
         })
         narrative_overlays = [
             copy.deepcopy(item)
@@ -7746,10 +8092,9 @@ class Director:
             "identity_characters": identity_characters,
             "character_background": character_background,
             "character_visuals": character_visuals,
-            "character_count": shot.get(
-                "character_count", len(shot["characters"])),
-            "visible_figure_count": (
-                len(shot["characters"]) + len(narrative_overlays)),
+            "character_count": len(shot["characters"]),
+            "functional_figures": functional_figures,
+            "visible_figure_count": visible_figure_count,
             "narrative_overlays": narrative_overlays,
             "location": location,
             "dialogue": shot.get("dialogue"),
@@ -7757,6 +8102,8 @@ class Director:
             "action": shot.get("description", ""),
             "start_state": shot.get("start_state", {}),
             "end_state": shot.get("end_state", {}),
+            "semantic_corrections": copy.deepcopy(
+                shot.get("semantic_corrections") or []),
             "five_dimensions": shot.get("five_dimensions", {}),
             "readable_text": readable_text,
             # 正式关键帧默认中档；文字/群像/人脸情绪/连续性自动升高。
@@ -7771,6 +8118,8 @@ class Director:
             "sound_design": shot.get("sound_design", {}),
             "spatial_blocking": spatial or {},
             "spatial_constraint": (spatial or {}).get("constraint", ""),
+            "era_context": era_context,
+            "sanctioned_anachronisms": sanctioned_anachronisms,
             "standard_fingerprint": profile.get("standard_fingerprint", ""),
             "forbid_subtitles": not profile["burn_subtitles"],
             "style": ctx["project"]["style"] or "",
@@ -7839,7 +8188,9 @@ class Director:
              "composition_contract": composition_contract,
              "physical_contract": physical_contract,
              "spatial_blocking": spatial or {},
-             "readable_text": readable_text},
+             "readable_text": readable_text,
+             "era_context": era_context,
+             "sanctioned_anachronisms": sanctioned_anachronisms},
             location=location, style=payload.get("style", ""),
             references=payload.get("reference_manifest"), mode="image")
         payload["prompt_contract"] = contract
@@ -7862,17 +8213,71 @@ class Director:
         }
         entries, seen = [], set()
 
+        reference_scopes = {
+            "identity": (
+                ["face", "identity", "hair_silhouette", "age", "gender"],
+                [
+                    "wardrobe", "pose", "composition", "background",
+                    "lighting", "props", "prop_position",
+                ]),
+            "identity_detail": (
+                ["identity_detail"], ["wardrobe", "pose", "background"]),
+            "structure": (
+                ["body_structure", "view_structure"],
+                ["identity_override", "wardrobe", "pose", "background"]),
+            "wardrobe": (
+                ["wardrobe", "accessories"],
+                ["face", "identity", "pose", "background", "lighting"]),
+            "prop": (
+                ["prop_structure", "prop_material"],
+                ["background", "composition", "extra_props"]),
+            "spatial": (
+                ["blocking", "camera", "occlusion"],
+                ["identity", "wardrobe", "style", "diagram_artifacts"]),
+            "inner_persona": (
+                ["overlay_identity", "chibi_proportion", "current_wardrobe"],
+                ["real_person_count", "physical_blocking", "default_props"]),
+            "keyframe": (
+                ["composition", "blocking", "scene_state", "wardrobe", "props"],
+                ["identity_override", "known_errors"]),
+            "continuity": (
+                ["composition", "blocking", "scene_state", "wardrobe", "props"],
+                ["identity_override"]),
+            "scene": (
+                ["scene_layout", "materials", "lighting"],
+                ["identity", "wardrobe", "pose", "readable_text"]),
+            "style": (
+                ["render_style", "palette", "materials", "lighting_style"],
+                ["identity", "wardrobe", "pose", "scene_layout", "text"]),
+            "composition": (
+                ["composition", "camera", "blocking"],
+                ["identity", "wardrobe", "scene_style"]),
+            "revision_base": (
+                ["unchanged_pixels", "composition", "current_state"],
+                ["known_errors"]),
+            "manual": (
+                ["weak_composition"], [
+                    "identity", "gender", "population", "wardrobe",
+                    "scene", "readable_text"]),
+        }
+
         def add(uri, label, binding, character="", role="", asset_id=None,
-                kind=""):
+                kind="", inherits=None, excludes=None):
             value = str(uri or "").strip()
             if not value or value in seen:
                 return
             seen.add(value)
             match = matches.get(value) or {}
+            default_inherits, default_excludes = reference_scopes.get(
+                role, (["declared_binding_only"], ["cross_role_propagation"]))
             entries.append({
                 "index": len(entries) + 1, "uri": value,
                 "label": label, "binding": binding,
                 "character": character, "role": role,
+                "inherits": list(
+                    inherits or match.get("inherits") or default_inherits),
+                "excludes": list(
+                    excludes or match.get("excludes") or default_excludes),
                 "asset_id": (
                     asset_id if asset_id is not None
                     else match.get("asset_id")),
@@ -7885,19 +8290,11 @@ class Director:
                 continue
             who = str(ref.get("character") or "角色")
             actor = str(ref.get("actor_id") or f"P{pos:02d}")
-            wardrobe_lock = str(ref.get("wardrobe_lock") or "").strip()
             face_only = (
                 ref.get("identity_anchor_type") == "face_only_derived")
-            wardrobe_binding = (
-                f"；本图同时是{who}本镜当前服装「{wardrobe_lock}」的"
-                "服装参考，锁定其外层服装结构、材质、配色、鞋履和配饰"
-                if wardrobe_lock else
-                "；不得复制此图的服装")
             add(ref["uri"], (
-                    f"{actor}·{who}最终立绘兼当前服装参考"
-                    if wardrobe_lock else (
-                        f"{actor}·{who}最终立绘面部锚"
-                        if face_only else f"{actor}·{who}最终立绘")),
+                    f"{actor}·{who}最终立绘面部锚"
+                    if face_only else f"{actor}·{who}最终立绘"),
                 (
                     f"本图是从人工锁定的{who}最终立绘派生的面部锚；只锁定"
                     f"{who}的脸型、五官骨相、年龄、性别表达、发际线与发型"
@@ -7905,7 +8302,7 @@ class Director:
                     "或光线；服装只服从本镜服装参考；禁止参考他人图片"
                     if face_only else
                     f"只锁定{who}的脸型、五官骨相、年龄、性别表达、发际线、"
-                    f"发型轮廓、体型与身份标志{wardrobe_binding}；不得复制"
+                    "发型轮廓、体型与身份标志；不得复制此图的服装、"
                     "姿势、构图、背景或光线；禁止参考他人图片"),
                 character=who, role="identity",
                 asset_id=ref.get("asset_id"),
@@ -8270,7 +8667,7 @@ class Director:
                     action=payload.get("action", ""),
                     forbid=self._FORBID + ["字幕条"],
                     expected_characters=payload.get("characters", []),
-                    expected_count=payload.get("character_count"),
+                    expected_count=payload.get("visible_figure_count"),
                     character_background=payload.get(
                         "character_background", {}),
                     camera=payload.get("camera", ""),
@@ -8281,7 +8678,9 @@ class Director:
                     physical_logic_required=True,
                     era_exceptions=self._era_exceptions(ctx),
                     narrative_overlays=payload.get(
-                        "narrative_overlays"))}})
+                        "narrative_overlays"),
+                    functional_figures=payload.get(
+                        "functional_figures"))}})
         results, qc_failures = self._run_parallel(
             ctx, tasks, line="分镜画面",
             continue_on_qc_failure=True)
@@ -8441,7 +8840,7 @@ class Director:
                             "动作状态上连续"),
                         forbid=self._FORBID + ["字幕条"],
                         expected_characters=payload.get("characters", []),
-                        expected_count=payload.get("character_count"),
+                        expected_count=payload.get("visible_figure_count"),
                         character_background=payload.get(
                             "character_background", {}),
                         camera=payload.get("camera", ""),
@@ -8452,7 +8851,9 @@ class Director:
                         physical_logic_required=True,
                         era_exceptions=self._era_exceptions(ctx),
                         narrative_overlays=payload.get(
-                            "narrative_overlays"))}})
+                            "narrative_overlays"),
+                        functional_figures=payload.get(
+                            "functional_figures"))}})
             if not round_tasks:
                 continue
             results, qc_failures = self._run_parallel(
@@ -9933,11 +10334,13 @@ class Director:
                     forbid=self._FORBID + ["字幕条"],
                     expected_characters=shot.get("characters") or [],
                     expected_count=shot.get(
-                        "character_count", expected_count),
+                        "visible_figure_count", expected_count),
                     composition_contract=composition,
                     readable_text=shot.get("readable_text") or {},
                     narrative_overlays=shot.get(
-                        "narrative_overlays"))
+                        "narrative_overlays"),
+                    functional_figures=shot.get(
+                        "functional_figures"))
                 samples = [
                     ("首帧", first, "first_valid"),
                     ("尾帧", last, "last_valid"),
@@ -11161,18 +11564,25 @@ class Director:
         }.get(kind, lambda: "")()
         plan_item = None
         plan_diagnostics = {}
+        qc_failure_base = 0
         if item_id:
             plan_item = next(
                 (entry for entry in self._plan_read(ctx)["items"]
                  if entry.get("id") == item_id), None)
             old_qc = (plan_item or {}).get("qc") or {}
+            qc_failure_base = self._previous_qc_failure_count(old_qc)
             plan_diagnostics = normalize_generation_diagnostics(
                 old_qc.get("input_diagnosis") or {},
                 issues=old_qc.get("issues"))
-            auto_revision = old_qc.get("revision_feedback") or ""
+            codex_escalation = old_qc.get("codex_escalation") or {}
+            codex_instruction = (
+                codex_escalation.get("instruction_to_aifos")
+                if isinstance(codex_escalation, dict) else "")
+            auto_revision = (
+                codex_instruction or old_qc.get("revision_feedback") or "")
             # 兼容旧版计划:旧版本把“电脑屏幕空白”落成 generic。每次手动
             # 重画都依据当前质检原因重新编译，不能继续沿用旧的泛化提示。
-            if old_qc.get("issues"):
+            if old_qc.get("issues") and not codex_instruction:
                 refreshed_revision = optimize_qc_feedback(
                     old_qc.get("issues") or [], mode="image",
                     diagnostics=(
@@ -11347,6 +11757,7 @@ class Director:
                 ctx, shot, quality_override=quality_choice,
                 item_id=f"shot:{shot_no}")
             payload["feedback"] = feedback
+            payload["qc_consecutive_failures_base"] = qc_failure_base
             payload["revision"] = next_revision(
                 "image", self._shot_name(ctx, shot_no))
             if prompt_override:
@@ -11497,6 +11908,7 @@ class Director:
             payload["seedance_prompt"] = payload["prompt"]
             payload["frame_kind"] = kind
             payload["feedback"] = feedback
+            payload["qc_consecutive_failures_base"] = qc_failure_base
             payload["revision"] = next_revision(kind, asset_name)
 
             rows = [
@@ -12272,7 +12684,7 @@ class Director:
                     action=payload.get("action", ""),
                     forbid=self._FORBID + ["字幕条"],
                     expected_characters=payload.get("characters", []),
-                    expected_count=payload.get("character_count"),
+                    expected_count=payload.get("visible_figure_count"),
                     character_background=payload.get(
                         "character_background", {}),
                     camera=payload.get("camera", ""),
@@ -12282,7 +12694,9 @@ class Director:
                     physical_contract=payload.get("physical_contract"),
                     physical_logic_required=True,
                     narrative_overlays=payload.get(
-                        "narrative_overlays"))
+                        "narrative_overlays"),
+                    functional_figures=payload.get(
+                        "functional_figures"))
             else:
                 spec = self._qc_spec(project_id, [], forbid=self._FORBID)
         # 首尾帧:首帧 + 尾帧两张都要检,任一不符即整组不合格
@@ -12299,6 +12713,7 @@ class Director:
         signature = self._qc_signature(
             uris, spec, generation_input=generation_input)
         previous = item.get("qc") or {}
+        previous_failures = self._previous_qc_failure_count(previous)
         if previous.get("signature") == signature \
                 and "passed" in previous:
             cached = dict(previous)
@@ -12327,6 +12742,10 @@ class Director:
         image_passed_all = True
         input_contract_passed_all = True
         input_diagnoses = []
+        qc_providers = []
+        failed_qc_result = None
+        failed_qc_verdict = {}
+        failed_qc_uri = uri
         try:
             for label, one in uris:
                 result = self.router.call(
@@ -12343,14 +12762,25 @@ class Director:
                 cost += result.cost
                 one_report = self._assess_image_qc(
                     spec, result.data or {}, 1)
+                qc_providers.append({
+                    "frame": label,
+                    "provider": result.provider,
+                    "model": getattr(result, "model", "") or "",
+                })
                 input_diagnoses.append({
                     "frame": label,
+                    "provider": result.provider,
+                    "model": getattr(result, "model", "") or "",
                     "passed": bool(one_report["passed"]),
                     "image_passed": bool(one_report["image_passed"]),
                     "input_contract_passed": bool(
                         one_report["input_contract_passed"]),
                     **copy.deepcopy(one_report["input_diagnosis"]),
                 })
+                if not one_report["passed"] and failed_qc_result is None:
+                    failed_qc_result = result
+                    failed_qc_verdict = copy.deepcopy(result.data or {})
+                    failed_qc_uri = one
                 passed_all = passed_all and one_report["passed"]
                 image_passed_all = (
                     image_passed_all and one_report["image_passed"])
@@ -12388,7 +12818,14 @@ class Director:
         except (ProviderUnavailable, ProviderError) as exc:
             raise AifosError(f"质检产线不可用: {exc}") from exc
         report = {"passed": passed_all, "issues": issues,
-                  "attempts": previous.get("attempts", 0),
+                  "attempts": max(
+                      1, int(previous.get("attempts") or 0)),
+                  "consecutive_failures": (
+                      0 if passed_all else previous_failures + 1),
+                  "qc_providers": qc_providers,
+                  "qc_provider": (
+                      qc_providers[0]["provider"]
+                      if len(qc_providers) == 1 else "mixed"),
                   "identity_checked": identity_checked_all,
                   "identity_match": identity_match_all,
                   "gender_checked": gender_checked_all,
@@ -12424,6 +12861,15 @@ class Director:
             diagnostics=report.get("input_diagnosis"))
         report["revision_feedback"] = revision["text"]
         report["revision_categories"] = revision["categories"]
+        if not report["passed"] and report["consecutive_failures"] >= 2:
+            report, escalation_cost = self._escalate_failed_image_to_codex(
+                report, spec, failed_qc_uri, generation_input,
+                ctx["out_root"],
+                cancel=lambda: self._cancel_requested(ctx),
+                codex_profile=codex_profile,
+                existing_result=failed_qc_result,
+                existing_verdict=failed_qc_verdict)
+            cost += escalation_cost
         self.projects.add_episode_cost(episode["id"], cost)
         self._plan_mark(ctx, item["id"], item.get("status", "done"),
                         extra={"qc": report})
@@ -12437,6 +12883,12 @@ class Director:
     def _auto_repair_qc_item(self, project, episode, ctx, item, report):
         """身份/性别/人数硬错误：以失败图为基底自动修图并立即复检。"""
         if report.get("passed") or not report.get("hard_failure"):
+            return report, 0
+        if (self._previous_qc_failure_count(report) >= 2
+                or (report.get("codex_escalation") or {}).get("triggered")):
+            # The second failure has already been handed to Codex.  Do not
+            # spend a third image call until AIFOS applies its returned
+            # instruction (or the contract is repaired/split).
             return report, 0
         repaired = 0
         current = report
@@ -12497,7 +12949,9 @@ class Director:
                 if candidate["id"] == item["id"]), item)
             current = self._qc_one(
                 project, episode, ctx, refreshed)
-            if current.get("passed") or not current.get("hard_failure"):
+            if (current.get("passed") or not current.get("hard_failure")
+                    or (current.get("codex_escalation") or {}).get(
+                        "triggered")):
                 break
         current = dict(current)
         current["auto_repaired"] = repaired
@@ -12530,6 +12984,8 @@ class Director:
                 "issues": ["分镜合同已更新，旧图正在按当前人物、人数和空间图重新质检"],
                 "previous_passed": old_qc.get("passed"),
                 "previous_signature": old_qc.get("signature", ""),
+                "previous_consecutive_failures":
+                    self._previous_qc_failure_count(old_qc),
             }
             self._plan_mark(
                 ctx, item["id"], "retrying",
@@ -12870,7 +13326,12 @@ class Director:
                     return {"index": index, "item_id": item_id,
                             "label": label, "failed": True,
                             "error": "无法解析批量重画目标"}
-                issues = list((item.get("qc") or {}).get("issues") or [])
+                item_qc = item.get("qc") or {}
+                issues = list(item_qc.get("issues") or [])
+                codex_escalation = item_qc.get("codex_escalation") or {}
+                codex_instruction = (
+                    codex_escalation.get("instruction_to_aifos")
+                    if isinstance(codex_escalation, dict) else "")
                 if not only_failed:
                     shot = shot_by_no.get(
                         int(target.get("shot_no") or 0))
@@ -12896,6 +13357,9 @@ class Director:
                         "身份图中的旧服装；服装只服从本镜当前服装参考；"
                         "其余人数、站位、机位、动作、道具和场景服从当前合同")
                     revision_source = "batch_current_contract"
+                elif codex_instruction:
+                    feedback = str(codex_instruction)[:2400]
+                    revision_source = "codex_escalation"
                 elif issues:
                     revision = optimize_qc_feedback(issues, mode="image")
                     feedback = revision["text"][:1600]

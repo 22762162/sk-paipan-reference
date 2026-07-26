@@ -87,3 +87,78 @@ def test_cover_is_final_high_and_carries_locked_portraits(tmp_path):
     assert "人工锁定最终立绘" in instruction
     assert "允许与人物参考图服装不同" in instruction
     assert str(identity) in instruction
+
+
+def test_shot_payload_repairs_story_logic_before_provider_input(tmp_path):
+    app = App(tmp_path / "ws")
+    try:
+        project, _ = app.projects.get_or_create_project(
+            "大明合同修正", style="电影级明代历史漫剧")
+        episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+        for name in ("沈砚", "陈允"):
+            identity = tmp_path / f"{name}.png"
+            identity.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+            app.assets.register(
+                project["id"], "character_identity", name,
+                uri=str(identity),
+                meta={"locked": True, "character": name})
+        ctx = {
+            "project": dict(project),
+            "episode": dict(episode),
+            "script": {
+                "story_world": {
+                    "name": "洪武大明",
+                    "era_and_location": "明初清河驿馆",
+                    "hard_rules": "服化道严格符合洪武年间",
+                    "sanctioned_anachronisms": [],
+                },
+                "characters": [
+                    {"name": "陈允"},
+                    {"name": "沈砚"},
+                ],
+                "scenes": [{
+                    "scene_no": 1,
+                    "location": "赴任途中·驿馆内室",
+                }],
+            },
+            "storyboard": {"shots": []},
+            "blocking": {},
+            "aspect": "9:16",
+            "dims": {"width": 1080, "height": 1920},
+        }
+        shot = {
+            "shot_no": 1,
+            "scene_no": 1,
+            "unit_id": "U01",
+            "prompt": "沈砚布旅装跪坐榻前，榻边搭青官袍",
+            "description": (
+                "沈砚布旅装跪坐榻前给陈允喂水，"
+                "榻边搭青官袍，几上油灯投暖光"),
+            "characters": ["陈允", "沈砚"],
+            "character_count": 2,
+            "camera": "中景固定",
+            "dialogue": None,
+            "start_state": {
+                "陈允": {"pose": "卧床", "wardrobe": "旧中衣"},
+                "沈砚": {"pose": "跪坐", "wardrobe": "宽松青官袍"},
+            },
+            "end_state": {
+                "陈允": {"pose": "卧床", "wardrobe": "旧中衣"},
+                "沈砚": {"pose": "跪坐", "wardrobe": "宽松青官袍"},
+            },
+            "appearance_state_required": True,
+            "five_dimensions": {},
+            "readable_text": {"required": False},
+        }
+
+        payload = app.director._shot_payload(ctx, shot)
+
+        assert payload["start_state"]["沈砚"]["wardrobe"] == "布旅装"
+        assert payload["end_state"]["沈砚"]["wardrobe"] == "布旅装"
+        assert len(payload["semantic_corrections"]) == 2
+        assert payload["prompt_contract_validation"]["passed"] is True
+        assert "开放式浅盏油灯" in payload["prompt_compact"]
+        assert "玻璃灯罩" in payload["prompt_compact"]
+        assert "煤油灯筒" in payload["prompt_compact"]
+    finally:
+        app.close()

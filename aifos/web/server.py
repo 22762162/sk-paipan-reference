@@ -611,6 +611,8 @@ def _generation_diagnostic_payload(item, qc=None):
             first_value("attempt_history", default=[])) or [],
         "retry_decision": _safe_diagnostic_value(decision) or {},
         "retry_blocked_reason": _safe_diagnostic_text(blocked_reason),
+        "codex_escalation": _safe_diagnostic_value(
+            first_value("codex_escalation", default={})) or {},
     }
 
 
@@ -2060,6 +2062,12 @@ def _episode_payload(app, episode_id, jobs=None):
                         item.get("label", ""), limit=240),
                     "status": item.get("status"),
                     "attempts": int(qc.get("attempts") or 0),
+                    "consecutive_failures": int(
+                        qc.get("consecutive_failures")
+                        or qc.get("previous_consecutive_failures")
+                        or 0),
+                    "qc_provider": _safe_diagnostic_text(
+                        qc.get("qc_provider", ""), limit=80),
                     "auto_repairs": int(qc.get("auto_repairs") or max(
                         0, int(qc.get("attempts") or 1) - 1)),
                     "issues": _safe_diagnostic_value(issues) or [],
@@ -2164,6 +2172,12 @@ def _overview_payload(app, jobs):
         "e.updated_at, p.title AS project "
         "FROM episodes e JOIN projects p ON p.id=e.project_id "
         "ORDER BY e.updated_at DESC")]
+    projects = [dict(r) for r in app.projects.list_projects()]
+    asset_stats = {}
+    for project in projects:
+        rows = [dict(row) for row in app.assets.stats(project["id"])]
+        if rows:
+            asset_stats[project["title"]] = rows
     done = [e for e in episodes if e["status"] == "done"]
     scored = [e["qc_score"] for e in episodes if e["qc_score"] is not None]
     active_standard = app.standards.active()
@@ -2175,7 +2189,7 @@ def _overview_payload(app, jobs):
                 "version_id", "profile_key", "version", "name",
                 "fingerprint", "created_at")
         },
-        "projects": [dict(r) for r in app.projects.list_projects()],
+        "projects": projects,
         "episodes": episodes,
         "stats": {
             "episodes": len(episodes),
@@ -2187,10 +2201,7 @@ def _overview_payload(app, jobs):
         "cost_by_stage": [dict(r) for r in app.system.cost_by_stage()],
         "cost_by_provider": [dict(r) for r in app.system.cost_by_provider()],
         "quota": [dict(r) for r in app.system.quota_status()],
-        "asset_stats": {
-            p["title"]: [dict(r) for r in app.assets.stats(p["id"])]
-            for p in app.projects.list_projects()
-        },
+        "asset_stats": asset_stats,
         "icloud_sync": app.icloud_sync.status(),
         "firefire": app.firefire.overview(),
         "jobs": jobs.list(),

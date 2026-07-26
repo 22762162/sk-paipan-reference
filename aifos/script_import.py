@@ -30,13 +30,15 @@
 import json
 import re
 
-from .adapters.claude_script import validate_script
 # 转出给既有调用方;唯一事实源在 speaker_labels(零依赖叶子模块)。
 from .speaker_labels import is_non_person_label
 
 _SCENE_RE = re.compile(
     r"^\s*(?:【?第\s*([0-9一二三四五六七八九十百]+)\s*场】?|场景\s*(\d+))"
     r"[：:.\s]*(.*)$")
+_SHOT_SCENE_RE = re.compile(
+    r"^\s*(?:[-+]\s*)?(?:#+\s*)?【?镜头\s*(?P<number>\d+)】?"
+    r"\s*(?:[（(]\s*(?P<duration>\d+(?:\.\d+)?)\s*秒\s*[）)])?\s*$")
 _LINE_RE = re.compile(r"^\s*([^\s：:]{1,12})\s*[：:]\s*(.+)$")
 _NAME = r"[A-Za-z\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff·]{0,11}"
 _MANNER = (
@@ -46,7 +48,7 @@ _MANNER = (
     r"缓缓|慢慢|忽然|忙|急忙)?")
 _SPEECH_VERB = (
     r"(?:开口说道|开口问道|开口道|说道|问道|答道|喊道|叫道|喝道|斥道|"
-    r"怒喝|反问|追问|低语|嘀咕|开口|说|问|答|喊|叫|道)")
+    r"怒喝|怒骂|反问|追问|低语|嘀咕|开口|说|问|答|喊|叫|道)")
 _PREFIX_COLON_RE = re.compile(
     rf"(?:^|[，。！？；、\s])(?P<speaker>{_NAME})\s*[：:]\s*$")
 _QUOTE_PATTERNS = tuple(
@@ -72,6 +74,14 @@ _PERFORMANCE_ENDINGS = (
     "地", "着", "嗓子", "回话", "垂手", "好奇", "说道", "问道",
     "答道", "喊道", "叫道", "喝道", "斥道", "低语", "嘀咕",
 )
+_MARKDOWN_DIRECTIVE_RE = re.compile(
+    r"^\s*(?:[-+]\s*)?\*{1,2}\s*"
+    r"(?P<label>[^*：:\n]{1,20})\s*[：:]\s*"
+    r"\*{0,2}\s*(?P<value>.*?)\s*\*{0,2}\s*$")
+_CONTROL_HEADING_RE = re.compile(
+    r"^\s*(?P<label>[^：:\n]{1,20})\s*[：:]\s*$")
+_BLOCKQUOTE_RE = re.compile(r"^\s*>\s?(?P<value>.*)$")
+_NARRATOR_NAME = "旁白（画外声）"
 
 _CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7,
            "八": 8, "九": 9, "十": 10}
@@ -79,6 +89,185 @@ _CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7,
 
 class ScriptImportError(ValueError):
     pass
+
+
+def normalize_entity_label(value):
+    """Remove Markdown decoration without changing a real character name."""
+    value = str(value or "").strip()
+    value = re.sub(r"^\s*(?:[-+]\s*)?", "", value)
+    value = value.strip(" \t*_`#")
+    return value.strip(" \t，。！？；、:：")
+
+
+def non_person_label_kind(value):
+    """Classify screenplay control labels that must never become cast."""
+    value = normalize_entity_label(value)
+    if not value:
+        return ""
+    if value.startswith(("（非人物·", "(非人物·")):
+        if any(token in value for token in ("音效", "声音", "拟音")):
+            return "sound"
+        if any(token in value for token in ("字幕", "屏幕文字", "画面文字")):
+            return "screen_text"
+        return "metadata"
+    if value in {
+            "旁白", "旁白（画外声）", "画外音", "解说", "内心旁白"}:
+        return "narrator"
+    if value.upper() in {"SFX", "BGM"} or value in {
+            "音效", "拟音", "环境音", "声音", "音乐"}:
+        return "sound"
+    if value in {
+            "字幕", "片尾字幕", "屏幕文字", "画面文字", "标题",
+            "大字", "文字"}:
+        return "screen_text"
+    if value in {
+            "优势", "缺点", "劣势", "总结", "总时长", "亮点", "钩子",
+            "解析噪声", "说明", "备注", "节奏", "人物少", "场景少"}:
+        return "metadata"
+    # speaker_labels 是全系统唯一的非人物词表；这里仍负责把命中的
+    # 标签细分为导入器需要的 cue 类型。未被上面细分的非人物标签
+    # 作为元数据处理，绝不能回流人物表。
+    if is_non_person_label(value):
+        return "metadata"
+    return ""
+
+
+def _clean_markdown_value(value):
+    value = str(value or "").strip()
+    quote = _BLOCKQUOTE_RE.match(value)
+    if quote:
+        value = quote.group("value").strip()
+    value = value.strip(" \t*_`")
+    return _unwrap_dialogue(value)
+
+
+def _looks_like_sound_cue(value):
+    value = _clean_markdown_value(value)
+    return bool(re.fullmatch(
+        r"(?:砰|嘭|轰|咚|啪|咔|嗖|唰|嗡|叮|哐|咣|吱|铛){1,4}"
+        r"[！!…~～]*",
+        value))
+
+
+def sanitize_script_entities(script):
+    """Move sound/text/Markdown controls out of the formal character table.
+
+    The operation is deterministic and idempotent. Narration remains a
+    background voice when it is not attributed to a named character; sound,
+    screen text and editorial metadata become scene cues rather than people.
+    """
+    if not isinstance(script, dict):
+        return script
+    existing_characters = [
+        item for item in script.get("characters", [])
+        if isinstance(item, dict) and item.get("name")
+    ]
+    profiles = {}
+    for item in existing_characters:
+        name = normalize_entity_label(item.get("name"))
+        kind = non_person_label_kind(name)
+        if kind in {"sound", "screen_text", "metadata"}:
+            continue
+        if kind == "narrator":
+            name = _NARRATOR_NAME
+            item = dict(item)
+            item["role"] = "背景人物"
+            item["asset_policy"] = "scene_only_no_individual_asset"
+        item = dict(item)
+        item["name"] = name
+        profiles.setdefault(name, item)
+
+    removed = 0
+    for scene in script.get("scenes", []):
+        if not isinstance(scene, dict):
+            continue
+        declared = []
+        for raw_name in scene.get("characters", []) or []:
+            name = normalize_entity_label(raw_name)
+            kind = non_person_label_kind(name)
+            if kind in {"sound", "screen_text", "metadata"}:
+                removed += 1
+                continue
+            if kind == "narrator":
+                name = _NARRATOR_NAME
+            if name and name not in declared:
+                declared.append(name)
+
+        clean_lines = []
+        for line in scene.get("lines", []) or []:
+            if not isinstance(line, dict):
+                continue
+            line = dict(line)
+            name = normalize_entity_label(line.get("character"))
+            kind = non_person_label_kind(name)
+            text = _clean_markdown_value(line.get("dialogue"))
+            if kind in {"sound", "screen_text", "metadata"}:
+                removed += 1
+                if text and text != "**":
+                    field = {
+                        "sound": "sound_cues",
+                        "screen_text": "screen_text_cues",
+                        "metadata": "discarded_import_cues",
+                    }[kind]
+                    cue = {"text": text}
+                    source = normalize_entity_label(
+                        line.get("source_character_label") or name)
+                    if source:
+                        cue["source_label"] = source
+                    scene.setdefault(field, []).append(cue)
+                continue
+            if kind == "narrator":
+                name = _NARRATOR_NAME
+            if not name or not text or text == "**":
+                removed += 1
+                continue
+            line["character"] = name
+            line["dialogue"] = text
+            clean_lines.append(line)
+            if name not in declared:
+                declared.append(name)
+        scene["lines"] = clean_lines
+        scene["characters"] = declared
+        for name in declared:
+            if name not in profiles:
+                profiles[name] = {
+                    "name": name,
+                    "role": (
+                        "背景人物" if name == _NARRATOR_NAME else "配角"),
+                    **({"asset_policy": "scene_only_no_individual_asset"}
+                       if name == _NARRATOR_NAME else {}),
+                }
+
+    # Preserve the authored character-table order. Scene character lists are
+    # often produced through set/sort operations and must not silently change
+    # the protagonist or first-appearance order.
+    ordered = list(profiles)
+    for scene in script.get("scenes", []):
+        for name in scene.get("characters", []) or []:
+            if name in profiles and name not in ordered:
+                ordered.append(name)
+    real_names = [
+        name for name in ordered
+        if profiles[name].get("role") != "背景人物"
+        and profiles[name].get("asset_policy")
+        != "scene_only_no_individual_asset"
+    ]
+    generic_roles = {"", "角色", "配角", "次要角色", "待定"}
+    if (real_names and not any(
+            "主角" in str(profiles[name].get("role") or "")
+            for name in real_names)
+            and all(
+                str(profiles[name].get("role") or "") in generic_roles
+                for name in real_names)):
+        profiles[real_names[0]]["role"] = "主角"
+    script["characters"] = [profiles[name] for name in ordered]
+    script["declared_character_names"] = ordered
+    imported = script.setdefault("import_analysis", {})
+    imported["character_count"] = len(ordered)
+    if removed:
+        imported["non_person_cues_removed"] = max(
+            int(imported.get("non_person_cues_removed") or 0), removed)
+    return script
 
 
 def is_likely_performance_label(value):
@@ -269,6 +458,12 @@ def parse_text_script(text, project_title, episode_number):
     inferred_dialogue_count = 0
     unresolved_dialogue_count = 0
     quote_dialogue_count = 0
+    pending_directive = ""
+    pending_blockquote_speaker = ""
+    has_shot_headings = bool(re.search(
+        r"(?m)^\s*(?:[-+]\s*)?(?:#+\s*)?【?镜头\s*\d+】?",
+        text))
+    seen_shot_heading = False
     non_person_labels = []
 
     def open_scene(location):
@@ -278,16 +473,114 @@ def parse_text_script(text, project_title, episode_number):
                    "characters": [], "action": "", "lines": []}
         scenes.append(current)
 
+    def append_directive(label, value):
+        kind = non_person_label_kind(label)
+        value = _clean_markdown_value(value)
+        if kind == "narrator":
+            if value:
+                current["lines"].append({
+                    "character": _NARRATOR_NAME,
+                    "dialogue": value,
+                    "source_character_label": normalize_entity_label(label),
+                })
+            return True
+        if kind in {"sound", "screen_text", "metadata"}:
+            if value:
+                field = {
+                    "sound": "sound_cues",
+                    "screen_text": "screen_text_cues",
+                    "metadata": "discarded_import_cues",
+                }[kind]
+                current.setdefault(field, []).append({
+                    "text": value,
+                    "source_label": normalize_entity_label(label),
+                })
+            return True
+        return False
+
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
+            continue
+        if (seen_shot_heading
+                and re.match(r"^\s*#{1,6}\s*总时长", line)):
+            break
+        shot_match = _SHOT_SCENE_RE.match(line)
+        if shot_match:
+            seen_shot_heading = True
+            open_scene(f"镜头{shot_match.group('number')}")
+            if shot_match.group("duration"):
+                current["duration"] = float(shot_match.group("duration"))
+            pending_directive = ""
+            pending_blockquote_speaker = ""
             continue
         scene_match = _SCENE_RE.match(line)
         if scene_match:
             open_scene(scene_match.group(3).strip())
             continue
+        if has_shot_headings and not seen_shot_heading:
+            # Introductory advice and Markdown titles before the first shot
+            # are source-document metadata, not shootable action.
+            continue
+        if line == "---":
+            continue
         if current is None:
             open_scene("主场景")
+        directive = _MARKDOWN_DIRECTIVE_RE.match(line)
+        if directive:
+            label = normalize_entity_label(directive.group("label"))
+            value = directive.group("value")
+            if non_person_label_kind(label):
+                if value:
+                    append_directive(label, value)
+                else:
+                    pending_directive = label
+                continue
+        control_heading = _CONTROL_HEADING_RE.match(
+            line.strip(" \t*_`"))
+        if control_heading:
+            label = normalize_entity_label(control_heading.group("label"))
+            if non_person_label_kind(label):
+                pending_directive = label
+                continue
+        blockquote = _BLOCKQUOTE_RE.match(line)
+        if pending_directive:
+            if blockquote:
+                append_directive(
+                    pending_directive, blockquote.group("value"))
+                pending_directive = ""
+                continue
+            pending_directive = ""
+        elif blockquote:
+            if pending_blockquote_speaker:
+                current["lines"].append({
+                    "character": pending_blockquote_speaker,
+                    "dialogue": _clean_markdown_value(
+                        blockquote.group("value")),
+                })
+                pending_blockquote_speaker = ""
+                explicit_dialogue_count += 1
+                quote_dialogue_count += 1
+                continue
+            if _looks_like_sound_cue(blockquote.group("value")):
+                append_directive("音效", blockquote.group("value"))
+                continue
+            # Markdown screenplay blockquotes without an explicit label are
+            # narration/voiceover, not action prose and never a visual actor.
+            append_directive("旁白", blockquote.group("value"))
+            continue
+        elif pending_blockquote_speaker:
+            pending_blockquote_speaker = ""
+        speech_heading = line.strip(" \t*_`")
+        if speech_heading.endswith(("：", ":")):
+            body, verb = _attribution_part(
+                speech_heading, prefix=True)
+            speaker, _ = _split_speaker_performance(body, known)
+            if verb and speaker:
+                pending_blockquote_speaker = speaker
+                _append_action(
+                    current, speech_heading.rstrip("：:"))
+                continue
         quoted = _quote_segments(line)
         # 带引号的“某某说道:……”优先走小说归属分析，避免把“说道”
         # 错当成人名；无引号的标准「角色:台词」仍走直接解析。
@@ -364,10 +657,11 @@ def parse_text_script(text, project_title, episode_number):
             counts[line["character"]] = counts.get(line["character"], 0) + 1
             speakers.append(line["character"])
         scene["characters"] = sorted(
-            name for name in set(speakers) if not is_non_person_label(name))
+            name for name in set(speakers)
+            if name == _NARRATOR_NAME or not is_non_person_label(name))
     # 兜底:任何路径漏进来的旁白/音效标签都不得进入正式人物表。
     ordered = [name for name in sorted(counts, key=lambda n: -counts[n])
-               if not is_non_person_label(name)]
+               if name == _NARRATOR_NAME or not is_non_person_label(name)]
     characters = [{
         "name": name,
         "role": (
@@ -404,7 +698,7 @@ def parse_text_script(text, project_title, episode_number):
     }
     if non_person_labels:
         script["non_person_labels_removed"] = non_person_labels
-    return script
+    return sanitize_script_entities(script)
 
 
 def parse_any(text, project_title, episode_number):
@@ -413,6 +707,9 @@ def parse_any(text, project_title, episode_number):
     if not text:
         raise ScriptImportError("剧本内容为空")
     if text.startswith("{"):
+        # Lazy import avoids a cycle: Claude adapters also reuse the
+        # deterministic non-person sanitizer from this module.
+        from .adapters.claude_script import validate_script
         try:
             script = json.loads(text)
         except ValueError as exc:
