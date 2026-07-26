@@ -48,6 +48,7 @@ def test_compact_contract_is_ordered_and_single_purpose():
             {"index": 3, "label": "林晚最终立绘", "kind": "identity"},
         ], mode="video")
 
+    assert PROMPT_CONTRACT_SCHEMA == "aifos.shot-prompt/v2.1"
     assert contract["schema"] == PROMPT_CONTRACT_SCHEMA
     assert prompt.index("【主体】") < prompt.index("【场景】")
     assert prompt.index("【场景】") < prompt.index("【单一主动作】")
@@ -477,3 +478,356 @@ def test_survivor_may_react_when_another_actor_dies():
     report = validate_shot_prompt_contract(contract)
 
     assert report["passed"] is True
+
+
+def _lin_chuan_witness_shot():
+    return {
+        "shot_no": 21,
+        "characters": ["林川"],
+        "functional_figures": [
+            {"label": "黑衣人", "count": 3},
+            {"label": "书童尸体", "count": 1},
+        ],
+        "visible_figure_count": 5,
+        "description": "林川循声走到院门，放下包袱，躲到门板后",
+        "start_state": {
+            "林川": {
+                "position": "院外石阶",
+                "pose": "背着包袱站立",
+                "direction": "面向院门",
+            },
+        },
+        "end_state": {
+            "林川": {
+                "position": "院门内侧门板后",
+                "pose": "屏息藏身，包袱静置脚边",
+                "direction": "望向院内",
+            },
+        },
+        "spatial_relations": [
+            {
+                "subject": "林川",
+                "relation": "藏在",
+                "object": "院门内侧门板后",
+            },
+            {
+                "subject": "黑衣人3名",
+                "relation": "围住",
+                "object": "书童尸体",
+            },
+        ],
+    }
+
+
+def _reference_scope(reference):
+    scope = reference.get("inherit_scope") or reference.get("scope") or {}
+    return {
+        "include": scope.get("include") or scope.get("inherits") or [],
+        "exclude": scope.get("exclude") or scope.get("excludes") or [],
+    }
+
+
+def _assert_single_freeze_section(prompt):
+    assert prompt.count("【定格状态】") == 1
+    assert "【首帧定格】" not in prompt
+    assert "【终点定格】" not in prompt
+
+
+def test_v21_registered_functional_and_visible_counts_are_distinct():
+    contract, prompt = compile_shot_prompt(
+        _lin_chuan_witness_shot(),
+        location="夜间深宅院落",
+        style="电影级半写实3D精品漫剧",
+        mode="image",
+    )
+
+    assert contract["schema"] == PROMPT_CONTRACT_SCHEMA
+    assert contract["subject"]["registered_count"] == 1
+    assert contract["subject"]["functional_count"] == 4
+    assert contract["subject"]["visible_count"] == 5
+    assert [
+        (item.get("name") or item.get("label"), item.get("count"))
+        for item in contract["subject"]["functional_figures"]
+    ] == [("黑衣人", 3), ("书童尸体", 1)]
+    assert contract["population"]["counts"] == {
+        "named_characters": 1,
+        "functional_people": 4,
+        "real_people_total": 5,
+        "non_real_overlays": 0,
+        "visible_entity_instances_total": 5,
+    }
+    assert contract["composition"]["expected_visible_figure_count"] == 5
+    assert validate_shot_prompt_contract(contract)["passed"]
+    assert (
+        "总可见人形严格为5" in prompt
+        or "画面可见真人严格共5人" in prompt)
+    assert "黑衣人3名" in prompt
+    assert "书童尸体1" in prompt
+
+
+def test_v21_image_prompt_renders_only_frozen_end_state_not_motion_process():
+    shot = _lin_chuan_witness_shot()
+    contract, prompt = compile_shot_prompt(
+        shot, location="夜间深宅院落", mode="image")
+
+    assert contract["output"] == {
+        "media": "image",
+        "frame_phase": "end",
+        "temporal_policy": "terminal_only",
+    }
+    assert isinstance(contract["frame_target"], dict)
+    assert contract["frame_target_source"] == "end_state"
+    _assert_single_freeze_section(prompt)
+    assert "院门内侧门板后" in prompt
+    assert "屏息藏身，包袱静置脚边" in prompt
+    assert "【起点】" not in prompt
+    assert "【单一主动作】" not in prompt
+    assert "【终点】" not in prompt
+    assert "循声走到" not in prompt
+    assert "放下包袱" not in prompt
+    assert "躲到" not in prompt
+
+
+def test_v21_explicit_image_or_freeze_state_overrides_motion_end_state():
+    shot = _lin_chuan_witness_shot()
+    shot["image_state"] = "林川贴在门板后，包袱已落地，目光越过门缝"
+    image_state_contract, image_state_prompt = compile_shot_prompt(
+        shot, location="夜间深宅院落", mode="image")
+    assert image_state_contract["frame_target_source"] == "image_state"
+    _assert_single_freeze_section(image_state_prompt)
+    assert "林川贴在门板后，包袱已落地，目光越过门缝" in image_state_prompt
+    assert "屏息藏身，包袱静置脚边" not in image_state_prompt
+
+    shot["freeze_state"] = "林川蹲在门板阴影里，包袱静置脚边"
+    freeze_state_contract, freeze_state_prompt = compile_shot_prompt(
+        shot, location="夜间深宅院落", mode="image")
+    assert freeze_state_contract["frame_target_source"] == "freeze_state"
+    _assert_single_freeze_section(freeze_state_prompt)
+    assert "林川蹲在门板阴影里，包袱静置脚边" in freeze_state_prompt
+    assert "目光越过门缝" not in freeze_state_prompt
+
+
+def test_v21_video_prompt_keeps_start_action_end_progression():
+    shot = _lin_chuan_witness_shot()
+    contract, prompt = compile_shot_prompt(
+        shot, location="夜间深宅院落", mode="video")
+
+    assert contract["output"] == {
+        "media": "video",
+        "frame_phase": "timeline",
+        "temporal_policy": "timeline",
+    }
+    assert prompt.index("【起点】") < prompt.index("【单一主动作】")
+    assert prompt.index("【单一主动作】") < prompt.index("【终点】")
+    assert "循声走到院门，放下包袱，躲到门板后" in prompt
+    assert "【定格状态】" not in prompt
+    assert "【首帧定格】" not in prompt
+    assert "【终点定格】" not in prompt
+
+
+def test_v21_vague_functional_figure_count_fails_before_generation():
+    for vague_count in ("几名", "数名"):
+        shot = _lin_chuan_witness_shot()
+        shot["functional_figures"] = [
+            {"label": "黑衣人", "count": vague_count},
+            {"label": "书童尸体", "count": 1},
+        ]
+        contract, _ = compile_shot_prompt(shot, mode="image")
+        report = validate_shot_prompt_contract(contract)
+
+        assert report["passed"] is False
+        assert any(
+            "功能人物" in issue and "精确" in issue
+            for issue in report["issues"])
+
+
+def test_v21_functional_sum_must_match_visible_figure_count():
+    shot = _lin_chuan_witness_shot()
+    shot["visible_figure_count"] = 6
+    contract, _ = compile_shot_prompt(shot, mode="image")
+    report = validate_shot_prompt_contract(contract)
+
+    assert report["passed"] is False
+    assert any(
+        ("人数" in issue or "population" in issue)
+        and all(value in issue for value in ("1", "4", "6"))
+        for issue in report["issues"])
+
+
+def test_v21_identity_reference_default_scope_is_identity_only():
+    contract, prompt = compile_shot_prompt(
+        {
+            "characters": ["林川"],
+            "description": "林川立在门板阴影中",
+            "end_state": {"林川": {"pose": "屏息立定"}},
+        },
+        references=[{
+            "index": 1,
+            "label": "林川身份定版",
+            "kind": "identity",
+            "character": "林川",
+        }],
+        mode="image",
+    )
+    reference = contract["references"][0]
+    scope = _reference_scope(reference)
+
+    assert scope["include"] == ["identity"]
+    assert set(scope["exclude"]) >= {
+        "wardrobe", "pose", "background", "props", "prop_position",
+    }
+    assert "identity" in prompt
+    for excluded in (
+            "wardrobe", "pose", "background", "props", "prop_position"):
+        assert excluded in prompt
+    assert validate_shot_prompt_contract(contract)["passed"]
+
+
+def test_v21_explicit_identity_scope_cannot_leak_nonidentity_fields():
+    contract, _ = compile_shot_prompt(
+        {"characters": ["林川"], "description": "林川立在院门后"},
+        references=[{
+            "index": 1,
+            "label": "林川身份定版",
+            "kind": "identity",
+            "character": "林川",
+            "inherit_scope": {
+                "include": ["identity"],
+                "exclude": [
+                    "wardrobe", "pose", "background", "props",
+                    "prop_position",
+                ],
+            },
+        }],
+    )
+    assert validate_shot_prompt_contract(contract)["passed"]
+
+
+def test_v21_reference_scope_inherits_excludes_overlap_fails():
+    contract, _ = compile_shot_prompt(
+        {"characters": ["林川"], "description": "林川立在院门后"},
+        references=[{
+            "index": 1,
+            "label": "林川身份定版",
+            "kind": "identity",
+            "character": "林川",
+            "inherit_scope": {
+                "include": ["identity", "wardrobe"],
+                "exclude": ["wardrobe", "pose", "background"],
+            },
+        }],
+    )
+    report = validate_shot_prompt_contract(contract)
+    assert report["passed"] is False
+    assert any(
+        (
+            ("include" in issue and "exclude" in issue)
+            or ("inherits" in issue and "excludes" in issue)
+        )
+        for issue in report["issues"])
+
+
+def test_v21_identity_reference_cannot_also_bind_wardrobe():
+    contract, _ = compile_shot_prompt(
+        {"characters": ["林川"], "description": "林川立在院门后"},
+        references=[{
+            "index": 1,
+            "label": "林川身份定版",
+            "kind": "identity",
+            "character": "林川",
+            "bindings": ["identity", "wardrobe"],
+        }],
+    )
+    report = validate_shot_prompt_contract(contract)
+    assert report["passed"] is False
+    assert any(
+        ("身份" in issue or "identity" in issue)
+        and ("服装" in issue or "wardrobe" in issue)
+        and "binding" in issue
+        for issue in report["issues"])
+
+
+def test_v21_spatial_relations_are_preserved_rendered_and_validated():
+    contract, prompt = compile_shot_prompt(
+        _lin_chuan_witness_shot(),
+        location="夜间深宅院落",
+        mode="image",
+    )
+    assert contract["spatial_relations"] == [
+        {
+            "subject": "林川",
+            "relation": "藏在",
+            "object": "院门内侧门板后",
+        },
+        {
+            "subject": "黑衣人3名",
+            "relation": "围住",
+            "object": "书童尸体",
+        },
+    ]
+    assert "【空间关系】" in prompt
+    assert "林川→藏在→院门内侧门板后" in prompt
+    assert "黑衣人3名→围住→书童尸体" in prompt
+    assert contract["physical"]["spatial_relations"] == (
+        contract["spatial_relations"])
+    assert validate_shot_prompt_contract(contract)["passed"]
+
+    for missing_key in ("subject", "object"):
+        shot = _lin_chuan_witness_shot()
+        shot["spatial_relations"] = [{
+            "subject": "林川",
+            "relation": "藏在",
+            "object": "门板后",
+        }]
+        shot["spatial_relations"][0].pop(missing_key)
+        broken, _ = compile_shot_prompt(shot, mode="image")
+        report = validate_shot_prompt_contract(broken)
+        assert report["passed"] is False
+        assert any(
+            "空间关系" in issue and missing_key in issue
+            for issue in report["issues"])
+
+
+def test_v21_conflicting_2d_and_3d_medium_fails():
+    contract, _ = compile_shot_prompt(
+        {"characters": ["林川"], "description": "林川立在门后"},
+        style="2D手绘平涂，同时使用3D写实渲染",
+        mode="image",
+    )
+    report = validate_shot_prompt_contract(contract)
+    assert report["passed"] is False
+    assert any(
+        "2D" in issue and "3D" in issue and "冲突" in issue
+        for issue in report["issues"])
+
+
+def test_v21_semi_realistic_3d_is_explicitly_not_live_action_photography():
+    contract, prompt = compile_shot_prompt(
+        {"characters": ["林川"], "description": "林川立在门后"},
+        style="电影级半写实3D精品漫剧",
+        mode="image",
+    )
+    assert contract["medium"]["dimension"] == "3D"
+    assert contract["medium"]["live_action_photography"] is False
+    assert "半写实3D" in prompt
+    assert "非真人摄影" in prompt
+    assert validate_shot_prompt_contract(contract)["passed"]
+
+
+def test_v21_legacy_shot_without_functional_figures_keeps_registered_count():
+    shot = _shot()
+    shot.pop("functional_figures", None)
+    shot.pop("visible_figure_count", None)
+    contract, prompt = compile_shot_prompt(
+        shot, location="直播办公室", mode="video")
+
+    assert contract["schema"] == "aifos.shot-prompt/v2.1"
+    assert contract["subject"]["count"] == 2
+    assert contract["subject"]["registered_count"] == 2
+    assert contract["subject"]["functional_count"] == 0
+    assert contract["subject"]["visible_count"] == 2
+    assert contract["population"]["counts"]["named_characters"] == 2
+    assert contract["population"]["counts"]["functional_people"] == 0
+    assert contract["population"]["counts"]["real_people_total"] == 2
+    assert "严格共2人" in prompt
+    assert validate_shot_prompt_contract(contract)["passed"]

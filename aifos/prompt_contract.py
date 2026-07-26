@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 
 
-PROMPT_CONTRACT_SCHEMA = "aifos.shot-prompt/v2"
+PROMPT_CONTRACT_SCHEMA = "aifos.shot-prompt/v2.1"
 PHYSICAL_CONTRACT_SCHEMA = "aifos.physical-space/v1"
 NON_PICTURE_TEXT_CARRIERS = ("字幕", "对白字幕", "旁白字幕", "台词字幕")
 FORBIDDEN_ON_SCREEN_METADATA = (
@@ -50,12 +50,449 @@ PREMODERN_CHINESE_ERA_TOKENS = (
     "明初", "明代", "大明", "洪武", "永乐", "古代", "县衙", "驿馆",
     "官舍", "公堂",
 )
+VAGUE_POPULATION_TOKENS = (
+    "几名", "数名", "多名", "若干名", "一群", "人群", "众人", "一众",
+    "多人", "几人", "数人", "若干人", "成群", "大批人",
+)
+CORPSE_TOKENS = ("尸体", "尸身", "遗体", "尸骸", "死者", "尸首")
+REFERENCE_ROLE_ALIASES = {
+    "identity": "identity",
+    "character_identity": "identity",
+    "character_art": "identity",
+    "character_candidate": "identity",
+    "identity_detail": "identity",
+    "character_sheet": "identity",
+    "structure": "identity",
+    "wardrobe": "wardrobe",
+    "costume": "wardrobe",
+    "costume_detail": "wardrobe",
+    "prop": "prop",
+    "prop_identity": "prop",
+    "prop_candidate": "prop",
+    "scene": "scene",
+    "scene_art": "scene",
+    "spatial": "spatial",
+    "spatial_blocking": "spatial",
+    "keyframe": "continuity",
+    "image": "continuity",
+    "first_frame": "continuity",
+    "last_frame": "continuity",
+    "continuity": "continuity",
+    "revision_base": "continuity",
+    "style": "style",
+    "style_ref": "style",
+    "composition": "composition",
+    "inner_persona": "narrative_overlay",
+    "narrative_overlay": "narrative_overlay",
+    "reference": "reference",
+    "manual": "reference",
+}
+REFERENCE_SCOPE_DEFAULTS = {
+    # The compact ``identity`` scope is deliberately coarse for downstream
+    # adapters. ``inherits`` below exposes the exact safe identity attributes.
+    "identity": {
+        "include": ["identity"],
+        "inherits": ["face", "hairstyle", "age", "gender"],
+        "exclude": [
+            "wardrobe", "pose", "composition", "background", "lighting",
+            "props", "prop_position",
+        ],
+    },
+    "scene": {
+        "include": ["space", "materials", "key_light"],
+        "inherits": ["space", "materials", "key_light"],
+        "exclude": [
+            "identity", "wardrobe", "pose", "action", "composition",
+            "props", "prop_position", "text",
+        ],
+    },
+    "wardrobe": {
+        "include": ["wardrobe", "accessories"],
+        "inherits": ["wardrobe", "accessories"],
+        "exclude": [
+            "identity", "pose", "composition", "background", "lighting",
+            "prop_position",
+        ],
+    },
+    "prop": {
+        "include": ["props"],
+        "inherits": ["shape", "structure", "materials", "craft"],
+        "exclude": [
+            "identity", "wardrobe", "pose", "composition", "background",
+            "lighting", "prop_position",
+        ],
+    },
+    "spatial": {
+        "include": ["spatial_blocking"],
+        "inherits": [
+            "figure_count", "positions", "occlusion", "camera_position",
+        ],
+        "exclude": [
+            "identity", "wardrobe", "style", "text", "reference_annotations",
+        ],
+    },
+    "continuity": {
+        "include": ["continuity"],
+        "inherits": [
+            "composition", "state", "wardrobe", "props", "lighting",
+        ],
+        "exclude": ["identity_redesign", "background_replacement"],
+    },
+    "style": {
+        "include": ["visual_medium", "materials", "palette", "lighting_style"],
+        "inherits": [
+            "visual_medium", "materials", "palette", "lighting_style",
+        ],
+        "exclude": [
+            "identity", "wardrobe", "pose", "composition", "background",
+            "prop_position",
+        ],
+    },
+    "composition": {
+        "include": ["camera_position", "composition", "action_path"],
+        "inherits": ["camera_position", "composition", "action_path"],
+        "exclude": ["identity", "wardrobe", "background", "lighting"],
+    },
+    "narrative_overlay": {
+        "include": ["overlay_identity", "chibi_proportion"],
+        "inherits": [
+            "face", "hairstyle", "current_wardrobe", "chibi_proportion",
+        ],
+        "exclude": [
+            "real_person_count", "spatial_blocking", "default_props",
+        ],
+    },
+    "reference": {
+        "include": [],
+        "inherits": [],
+        "exclude": [
+            "identity", "wardrobe", "pose", "composition", "background",
+            "lighting", "props", "prop_position",
+        ],
+    },
+}
+MEDIUM_2D_TOKENS = (
+    "2d", "二维", "平面动画", "二维动画", "手绘动画", "赛璐璐",
+)
+MEDIUM_3D_TOKENS = (
+    "3d", "三维", "三渲二", "cg三维", "半写实3d",
+)
+MEDIUM_LIVE_ACTION_TOKENS = (
+    "真人摄影", "真人实拍", "实景拍摄", "live action",
+    "live-action", "photographic live action",
+)
+MEDIUM_NON_LIVE_ACTION_TOKENS = (
+    "非真人摄影", "不是真人摄影", "非真人实拍", "不是真人实拍",
+)
 
 
 def _text(value, fallback=""):
     value = "" if value is None else str(value)
     value = re.sub(r"\s+", " ", value).strip()
     return value or fallback
+
+
+def _text_list(value):
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    output = []
+    for item in value:
+        text = _text(item)
+        if text and text not in output:
+            output.append(text)
+    return output
+
+
+def _state_value(value):
+    """Render a dedicated image/freeze state without assuming one shape."""
+    if isinstance(value, str):
+        return _text(value)
+    if not isinstance(value, dict):
+        return ""
+    nested = value.get("state")
+    if nested is not None and nested is not value:
+        rendered = _state_value(nested)
+        if rendered:
+            return rendered
+    for key in ("description", "freeze", "image", "value"):
+        if _text(value.get(key)):
+            return _text(value.get(key))
+    return _state_line(value)
+
+
+def _registered_state_value(shot, key):
+    """Ignore stale named states for actors no longer visible in this shot."""
+    value = shot.get(key)
+    if not isinstance(value, dict):
+        return _state_value(value)
+    characters = {_text(name) for name in shot.get("characters") or []}
+    state_fields = {
+        "position", "pose", "direction", "wardrobe", "headwear",
+        "hair_makeup", "prop", "injury", "emotion",
+    }
+    if state_fields & set(value):
+        return _state_value(value)
+    filtered = {
+        name: state for name, state in value.items()
+        if _text(name) in characters
+    }
+    return _state_value(filtered)
+
+
+def _normalize_mode(mode):
+    requested = _text(mode, "image").lower()
+    if requested in {"video", "motion", "seedance"}:
+        return "video", requested
+    if requested in {"image", "keyframe", "first_frame", "last_frame"}:
+        return "image", requested
+    return "image", requested
+
+
+def _frame_target(shot, mode, requested_mode=""):
+    """Select one static freeze state, or the three-part video timeline."""
+    start = _registered_state_value(
+        shot, "start_state") or "保持首帧状态"
+    end = _registered_state_value(
+        shot, "end_state") or "到达尾帧状态"
+    action = _text(
+        shot.get("description") or shot.get("action"),
+        "环境保持稳定，只执行自然微动",
+    )
+    if mode == "video":
+        return {
+            "phase": "timeline",
+            "state": {"start": start, "action": action, "end": end},
+            "source": "start_state/action/end_state",
+            "fallback": False,
+        }
+
+    frame_kind = (
+        _text(shot.get("frame_kind")).lower()
+        or _text(requested_mode).lower())
+    phase = "start" if frame_kind == "first_frame" else "end"
+    for source in ("freeze_state", "image_state"):
+        state = _state_value(shot.get(source))
+        if state:
+            return {
+                "phase": phase,
+                "state": state,
+                "source": source,
+                "fallback": False,
+            }
+    state_source = "start_state" if phase == "start" else "end_state"
+    state = _registered_state_value(shot, state_source)
+    if state:
+        return {
+            "phase": phase,
+            "state": state,
+            "source": state_source,
+            "fallback": False,
+        }
+    if _text(shot.get("description")):
+        source, state = "description", _text(shot.get("description"))
+    elif _text(shot.get("action")):
+        source, state = "action", _text(shot.get("action"))
+    else:
+        source, state = "default", "环境保持稳定"
+    return {
+        "phase": phase,
+        "state": state,
+        "source": source,
+        "fallback": True,
+    }
+
+
+def _normalize_functional_figures(shot):
+    raw_items = shot.get("functional_figures") or []
+    if isinstance(raw_items, dict):
+        raw_items = [raw_items]
+    normalized = []
+    issues = []
+    if not isinstance(raw_items, (list, tuple)):
+        raw_items = []
+        issues.append("functional_figures 必须是对象列表")
+    for position, item in enumerate(raw_items, 1):
+        if not isinstance(item, dict):
+            issues.append(f"第{position}个功能人物不是对象")
+            continue
+        label = _text(item.get("name") or item.get("label"))
+        raw_count = item.get("count")
+        valid_count = (
+            isinstance(raw_count, int)
+            and not isinstance(raw_count, bool)
+            and raw_count > 0
+        )
+        if not label:
+            issues.append(f"第{position}个功能人物缺少 name/label")
+        if not valid_count:
+            issues.append(
+                f"功能人物「{label or position}」的 count 必须是精确正整数")
+        normalized.append({
+            "name": _text(item.get("name")),
+            "label": _text(item.get("label")) or label,
+            "count": raw_count if valid_count else 0,
+            "state": _text(item.get("state")),
+            "function": _text(item.get("function")),
+        })
+    return normalized, issues
+
+
+def _functional_figure_line(item):
+    label = _text(item.get("name") or item.get("label"), "功能人物")
+    count = int(item.get("count") or 0)
+    counter = "具" if any(token in f"{label}{item.get('state', '')}"
+                          for token in CORPSE_TOKENS) else "名"
+    details = "；".join(filter(None, (
+        f"状态={_text(item.get('state'))}" if _text(item.get("state")) else "",
+        f"功能={_text(item.get('function'))}"
+        if _text(item.get("function")) else "",
+    )))
+    return f"{label}{count}{counter}" + (f"（{details}）" if details else "")
+
+
+def _normalize_role_value(value):
+    return REFERENCE_ROLE_ALIASES.get(_text(value).lower(), _text(value).lower())
+
+
+def _split_role_values(value):
+    if isinstance(value, (list, tuple, set)):
+        return [_normalize_role_value(item) for item in value if _text(item)]
+    text = _text(value)
+    if not text:
+        return []
+    parts = [
+        part for part in re.split(r"\s*(?:\+|,|，|、|\||/)\s*", text)
+        if part
+    ]
+    return [_normalize_role_value(part) for part in parts]
+
+
+def _normalize_reference(item):
+    raw_role = item.get("role")
+    raw_kind = item.get("kind")
+    raw_roles = item.get("roles")
+    role_values = _split_role_values(
+        raw_roles if raw_roles is not None
+        else raw_role if raw_role is not None else raw_kind)
+    role_issues = []
+    if len(set(role_values)) > 1:
+        role_issues.append("参考图声明了多个 role；每张参考图只能承担单一职责")
+    role = role_values[0] if role_values else "reference"
+    # ``kind`` is often the storage/asset type (character_sheet, image, etc.)
+    # while ``role`` is the one semantic responsibility for this request.
+    # When role is explicit it is authoritative; comparing it with kind would
+    # reject valid cases such as kind=image + role=revision_base.
+
+    defaults = REFERENCE_SCOPE_DEFAULTS.get(
+        role, REFERENCE_SCOPE_DEFAULTS["reference"])
+    raw_scope = item.get("inherit_scope")
+    raw_scope = raw_scope if isinstance(raw_scope, dict) else {}
+    explicit_include = (
+        raw_scope.get("include") if "include" in raw_scope
+        else item.get("inherits"))
+    explicit_exclude = (
+        raw_scope.get("exclude") if "exclude" in raw_scope
+        else item.get("excludes"))
+    include = (
+        _text_list(explicit_include)
+        if explicit_include is not None
+        else list(defaults["include"]))
+    excludes = list(defaults["exclude"])
+    for value in _text_list(explicit_exclude):
+        if value not in excludes:
+            excludes.append(value)
+    # Safe role boundaries cannot be weakened by an explicit include. Keeping
+    # an unsafe item in both lists makes the conflict visible to preflight.
+    inherits = (
+        _text_list(item.get("inherits"))
+        if item.get("inherits") is not None
+        else list(defaults["inherits"]))
+    for value in include:
+        if value not in inherits and role not in {"identity", "scene"}:
+            inherits.append(value)
+
+    raw_binding = item.get("binding")
+    bindings = item.get("bindings")
+    binding_values = _text_list(bindings)
+    if raw_binding is not None and not binding_values:
+        if isinstance(raw_binding, (list, tuple, set)):
+            binding_values = _text_list(raw_binding)
+    try:
+        index = int(item.get("index"))
+    except (TypeError, ValueError):
+        index = item.get("index")
+    return {
+        "index": index,
+        "label": _text(item.get("label") or item.get("name"), "参考图"),
+        "role": role,
+        "character": _text(item.get("character")),
+        "binding": raw_binding if raw_binding is not None else "",
+        "bindings": binding_values,
+        "inherit_scope": {
+            "include": include,
+            "exclude": excludes,
+        },
+        "inherits": inherits,
+        "excludes": excludes,
+        "role_issues": role_issues,
+    }
+
+
+def _normalize_spatial_relations(shot, explicit=None):
+    if isinstance(explicit, dict):
+        relations = explicit.get("spatial_relations")
+    else:
+        relations = None
+    if relations is None:
+        relations = shot.get("spatial_relations")
+    if isinstance(relations, dict):
+        relations = [relations]
+    if not isinstance(relations, (list, tuple)):
+        return []
+    return [
+        dict(item) if isinstance(item, dict) else item
+        for item in relations
+    ]
+
+
+def _normalize_visual_medium(shot, style=""):
+    explicit_values = [
+        _text(shot.get("visual_medium")),
+        _text(shot.get("medium")),
+        _text(style),
+        _text(shot.get("style")),
+    ]
+    text = "；".join(value for value in explicit_values if value)
+    lowered = text.lower()
+    has_2d = any(token in lowered for token in MEDIUM_2D_TOKENS)
+    has_3d = any(token in lowered for token in MEDIUM_3D_TOKENS)
+    negative_live = any(token in lowered
+                        for token in MEDIUM_NON_LIVE_ACTION_TOKENS)
+    live_action = (
+        any(token in lowered for token in MEDIUM_LIVE_ACTION_TOKENS)
+        and not negative_live
+    )
+    semi_realistic_3d = (
+        has_3d
+        and any(token in lowered for token in (
+            "半写实", "semi-realistic", "semirealistic"))
+    )
+    issues = []
+    if has_2d and has_3d:
+        issues.append("视觉媒介 2D 与 3D 声明冲突，无法执行")
+    dimension = (
+        "3D" if has_3d else "2D" if has_2d
+        else "live_action" if live_action else "unspecified")
+    return {
+        "raw": text,
+        "dimension": dimension,
+        "semi_realistic_3d": semi_realistic_3d,
+        "live_action_photography": live_action,
+        "photography_excluded": bool(semi_realistic_3d or negative_live),
+        "issues": issues,
+    }
 
 
 def sanitize_text_whitelist(values):
@@ -213,6 +650,8 @@ def build_era_object_constraints(shot):
 
 def _state_line(states):
     values = []
+    if not isinstance(states, dict):
+        return ""
     for name, state in (states or {}).items():
         state = state if isinstance(state, dict) else {}
         details = [
@@ -231,6 +670,8 @@ def _state_line(states):
 
 
 def _appearance_map(states):
+    if not isinstance(states, dict):
+        return {}
     return {
         _text(name): {
             key: _text(state.get(key))
@@ -353,6 +794,8 @@ def build_physical_contract(shot):
     explicit = (shot.get("physical_contract")
                 or shot.get("physical_logic")
                 or shot.get("spatial_logic"))
+    spatial_relations = _normalize_spatial_relations(
+        shot, explicit if isinstance(explicit, dict) else None)
     if isinstance(explicit, dict):
         raw_rules = explicit.get("rules") or explicit.get("constraints") or []
         if isinstance(raw_rules, str):
@@ -431,6 +874,7 @@ def build_physical_contract(shot):
         "required": True,
         "rules": rules,
         "objects": objects,
+        "spatial_relations": spatial_relations,
     }
 
 
@@ -462,6 +906,10 @@ def build_composition_contract(shot):
     """
     shot = shot or {}
     characters = list(shot.get("characters") or [])
+    functional_figures, _ = _normalize_functional_figures(shot)
+    functional_count = sum(
+        int(item.get("count") or 0) for item in functional_figures)
+    visible_count = len(characters) + functional_count
     dialogue = shot.get("dialogue") or {}
     contract = shot.get("shot_contract") or {}
     dimensions = shot.get("five_dimensions") or {}
@@ -566,7 +1014,7 @@ def build_composition_contract(shot):
             else "standard"),
         "expected_primary_count": (
             1 if over_shoulder and characters else len(characters)),
-        "expected_visible_figure_count": len(characters),
+        "expected_visible_figure_count": visible_count,
         "actors": actors,
         "count_rule": (
             "前景半身背影/肩膀是已登记的对话者本人，只计作该角色1人，"
@@ -578,13 +1026,23 @@ def build_composition_contract(shot):
     }
 
 
-def build_shot_prompt_contract(shot, *, location="", style="", references=None):
+def build_shot_prompt_contract(
+        shot, *, location="", style="", references=None, mode="image"):
     """从已通过五维分镜的镜头构造可审计的结构化合同。
 
     不读取故事背景长文；只有当镜头实际需要时才保留场景、动作和状态，避免
     全局风格/角色经历与参考图抢控制权。
     """
+    shot = shot if isinstance(shot, dict) else {}
     characters = list(shot.get("characters") or [])
+    output_media, requested_mode = _normalize_mode(mode)
+    target = _frame_target(shot, output_media, requested_mode)
+    functional_figures, population_issues = _normalize_functional_figures(
+        shot)
+    registered_count = len(characters)
+    functional_count = sum(
+        int(item.get("count") or 0) for item in functional_figures)
+    visible_count = registered_count + functional_count
     dialogue = shot.get("dialogue") or {}
     readable = shot.get("readable_text") or {}
     if readable_text_required(readable):
@@ -614,14 +1072,9 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
         text_rule = "无画面文字、无字幕、无Logo、无水印"
     refs = []
     for item in references or []:
-        if not isinstance(item, dict) or not item.get("index"):
+        if not isinstance(item, dict):
             continue
-        refs.append({
-            "index": item.get("index"),
-            "label": _text(item.get("label") or item.get("name"), "参考图"),
-            "role": _text(item.get("role") or item.get("kind"), "reference"),
-            "character": _text(item.get("character")),
-        })
+        refs.append(_normalize_reference(item))
     scene = shot_local_scene(shot, location)
     physical = build_physical_contract({
         **shot, "location": scene, "style": style,
@@ -652,6 +1105,32 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
             "inherit_signature_props": False,
             "host_mouth_closed": True,
         })
+    overlays = overlays[:1]
+    visible_entity_count = visible_count + len(overlays)
+    declared_visible = shot.get("visible_figure_count")
+    if declared_visible is not None:
+        if (not isinstance(declared_visible, int)
+                or isinstance(declared_visible, bool)):
+            population_issues.append("visible_figure_count 必须是整数")
+        elif declared_visible != visible_count:
+            population_issues.append(
+                "人数声明冲突："
+                f"visible_figure_count={declared_visible}，"
+                f"登记角色={registered_count}，功能人物={functional_count}，"
+                f"求和={visible_count}")
+    population_text = " ".join(_text(value) for value in (
+        shot.get("description"), shot.get("action"), shot.get("prompt"),
+        shot.get("camera"),
+        (shot.get("shot_contract") or {}).get("画面内容描述")
+        if isinstance(shot.get("shot_contract"), dict) else "",
+        (shot.get("shot_contract") or {}).get("构图")
+        if isinstance(shot.get("shot_contract"), dict) else "",
+    ) if _text(value))
+    if (functional_count == 0 and any(
+            token in population_text for token in VAGUE_POPULATION_TOKENS)):
+        population_issues.append(
+            "镜头使用了几名/数名/多名/一群等模糊人数，但未声明"
+            " functional_figures 的明确 count")
     # Never fall back to the raw storyboard prompt here. It may contain the
     # whole episode bible and unrelated scenes, which makes the provider blend
     # facts from other shots into this image.
@@ -659,26 +1138,65 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
         shot.get("description") or shot.get("action"),
         "环境保持稳定，只执行自然微动",
     )
+    composition = (
+        dict(shot.get("composition_contract"))
+        if isinstance(shot.get("composition_contract"), dict)
+        else build_composition_contract({
+            **shot, "functional_figures": functional_figures,
+        }))
+    composition["expected_visible_figure_count"] = visible_count
+    medium = _normalize_visual_medium(shot, style)
     contract = {
         "schema": PROMPT_CONTRACT_SCHEMA,
+        # ``mode=shot`` is a legacy discriminator. Media/output semantics live
+        # in the new structured ``output`` field.
         "mode": "shot",
+        "output": {
+            "media": output_media,
+            "frame_phase": target["phase"],
+            "temporal_policy": (
+                "timeline" if output_media == "video"
+                else "terminal_only"),
+        },
+        "frame_target": dict(target),
+        "frame_target_state": target["state"],
+        "frame_target_source": target["source"],
+        "frame_target_fallback": bool(target["fallback"]),
         "frame_kind": _text(shot.get("frame_kind")),
         "subject": {
-            "count": len(characters),
+            # v1/v2 compatibility: count remains the number of identity-locked
+            # named characters, not every visible human body.
+            "count": registered_count,
+            "registered_count": registered_count,
+            "functional_count": functional_count,
+            "visible_count": visible_count,
             "actors": _character_lines(shot),
+            "functional_figures": functional_figures,
         },
-        "composition": (
-            shot.get("composition_contract")
-            if isinstance(shot.get("composition_contract"), dict)
-            else build_composition_contract(shot)),
+        "population": {
+            "counts": {
+                "named_characters": registered_count,
+                "functional_people": functional_count,
+                "real_people_total": visible_count,
+                "non_real_overlays": len(overlays),
+                "visible_entity_instances_total": visible_entity_count,
+            },
+            "functional_figures": functional_figures,
+            "declared_visible_figure_count": declared_visible,
+            "issues": population_issues,
+        },
+        "composition": composition,
         "scene": scene,
         "script_reference": _text(shot.get("script_reference")),
         "era_context": _text(shot.get("era_context")),
         "era_object_constraints": build_era_object_constraints({
             **shot, "location": scene, "style": style,
         }),
-        "style": _text(style),
-        "start": _state_line(shot.get("start_state")) or "保持首帧状态",
+        "style": _text(style or shot.get("style")),
+        "visual_medium": medium["dimension"],
+        "medium": medium,
+        "start": _registered_state_value(
+            shot, "start_state") or "保持首帧状态",
         "start_appearance": _appearance_map(shot.get("start_state")),
         "action": action,
         "performance": _text(
@@ -687,7 +1205,9 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
         ),
         "camera": _camera(shot),
         "physical": physical,
-        "end": _state_line(shot.get("end_state")) or "到达尾帧状态",
+        "spatial_relations": list(physical.get("spatial_relations") or []),
+        "end": _registered_state_value(
+            shot, "end_state") or "到达尾帧状态",
         "end_appearance": _appearance_map(shot.get("end_state")),
         "appearance_state_required": bool(
             shot.get("appearance_state_required")),
@@ -709,12 +1229,20 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
             else _text(dialogue.get("character"))),
         "inner_voice": bool(dialogue.get("inner_voice")),
         "text": text_rule,
-        "narrative_overlays": overlays[:1],
+        "narrative_overlays": overlays,
         "references": refs,
+        "output_issues": (
+            [f"不支持的提示词输出 mode: {requested_mode}"]
+            if requested_mode not in {
+                "image", "keyframe", "first_frame", "last_frame",
+                "video", "motion", "seedance",
+            } else []),
         "hard": (
-            "只执行一个主动作和一个运镜；人物身份、服装、场景、构图分别服从"
+            "视频只执行一个主动作和一个运镜；静态图只定格 frame_target；"
+            "人物身份、服装、场景、构图分别服从"
             "对应参考图；不得重新设计人物，不得新增/复制真实人物或把参考图内容"
-            "贴进成片；服装、头饰、妆发必须逐人服从本镜起止状态，未写换装/"
+            "贴进成片（已声明的功能人物除外）；服装、头饰、妆发必须逐人服从"
+            "本镜起止状态，未写换装/"
             "摘戴/改妆动作时不得自行改变；非现实Q版叠层不得转化成真人、"
             "实体角色或空间站位"
         ),
@@ -723,7 +1251,7 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
 
 
 def _reference_role(item):
-    role = _text(item.get("role") or item.get("kind"))
+    role = _normalize_role_value(item.get("role") or item.get("kind"))
     if role in {"identity", "character_identity", "character_art", "character_candidate"}:
         return "身份：只锁脸、发型、年龄、性别"
     if role in {"identity_detail", "character_sheet", "structure"}:
@@ -750,69 +1278,119 @@ def _reference_role(item):
     return "弱参考：不得覆盖已锁定身份和场景"
 
 
-def render_shot_prompt(contract, *, mode="image"):
-    """把合同渲染成短句；图片和视频共用同一组语义，只改变媒介边界。"""
-    subject = "、".join(contract["subject"]["actors"]) or "无人"
-    count = contract["subject"]["count"]
-    camera = contract["camera"]
+def _render_spatial_relation(item):
+    if not isinstance(item, dict):
+        return _text(item)
+    subject = _text(item.get("subject"))
+    relation = _text(item.get("relation") or item.get("predicate"))
+    object_ = _text(item.get("object"))
+    if not (subject and relation and object_):
+        return ""
+    return f"{subject}→{relation}→{object_}"
+
+
+def _render_reference(item):
+    base = f"图{item['index']}={item['label']}({_reference_role(item)})"
+    scope = item.get("inherit_scope") or {}
+    include = "、".join(_text_list(scope.get("include")))
+    exclude = "、".join(_text_list(scope.get("exclude")))
+    details = []
+    binding = item.get("binding")
+    bindings = _text_list(item.get("bindings"))
+    if binding not in (None, ""):
+        details.append(f"binding={_text(binding)}")
+    elif bindings:
+        details.append(f"binding={'、'.join(bindings)}")
+    if include:
+        details.append(f"include={include}")
+    if exclude:
+        details.append(f"exclude={exclude}")
+    return base + (f"[{'；'.join(details)}]" if details else "")
+
+
+def _medium_prompt_line(medium):
+    medium = medium if isinstance(medium, dict) else {}
+    if medium.get("semi_realistic_3d"):
+        return "半写实3D视觉媒介；明确非真人摄影、非真人实拍"
+    if medium.get("dimension") == "3D":
+        return "3D视觉媒介"
+    if medium.get("dimension") == "2D":
+        return "2D视觉媒介"
+    if medium.get("live_action_photography"):
+        return "真人摄影/真人实拍视觉媒介"
+    return ""
+
+
+def render_shot_prompt(contract, *, mode=None):
+    """Render a still freeze or a video timeline, never a hybrid of both."""
+    contract = contract if isinstance(contract, dict) else {}
+    subject_contract = contract.get("subject") or {}
+    subject = "、".join(subject_contract.get("actors") or []) or "无人"
+    count = int(subject_contract.get("count") or 0)
+    visible_count = int(
+        subject_contract.get("visible_count", count) or 0)
+    functional_figures = subject_contract.get("functional_figures") or []
+    output = contract.get("output") or {}
+    if mode is None:
+        media = _text(output.get("media"), "image").lower()
+    else:
+        media, _ = _normalize_mode(mode)
+    camera = contract.get("camera") or {}
     camera_values = [
         camera.get("景别"), camera.get("角度"), camera.get("焦段"),
         camera.get("机位"),
     ]
-    if mode == "video":
+    if media == "video":
         camera_values.append(
             f"{camera.get('运镜')}({camera.get('动机')})")
     else:
-        camera_values.append("静态关键帧只定格最终可见机位与构图")
+        camera_values.append("静态关键帧只定格当前可见机位与构图")
     camera_values.append(f"构图{camera.get('构图')}")
     camera_line = "；".join(value for value in camera_values if value)
     lines = [
-        "【镜头合同v2】只执行下列事实，不自行补剧情。",
-        f"【主体】严格共{count}人：{subject}（均为真实人物）。",
-        f"【场景】{contract['scene']}。",
-        f"【起点】{contract['start']}。",
-        f"【单一主动作】{contract['action']}。",
-        f"【表演】{contract['performance']}。",
-        f"【镜头】{camera_line}。",
-        f"【终点】{contract['end']}。",
+        "【镜头合同v2.1】只执行下列事实，不自行补剧情。",
     ]
+    if media == "video":
+        lines.append(
+            "【输入】图1是唯一动作起点，图2是唯一动作终点；"
+            "只让已锁定画面动起来。")
+    lines.append(
+        f"【主体】严格共{count}人：{subject}（登记角色，均为真实人物）；"
+        f"画面可见真人严格共{visible_count}人。")
+    if functional_figures:
+        lines.append(
+            "【功能人物】"
+            + "；".join(_functional_figure_line(item)
+                       for item in functional_figures)
+            + "；功能人物不锁身份，但每具真人身体都计入总可见真人。")
     overlays = contract.get("narrative_overlays") or []
     if overlays:
         overlay = overlays[0]
         inner_dialogue = (
             f"；内心说「{overlay['dialogue']}」"
             if overlay.get("dialogue") else "")
-        lines.insert(
-            2,
+        lines.append(
             "【非现实内心Q版叠层】"
             f"{overlay['name']}是{overlay['host_character']}的内心人格，"
             f"用途={overlay['function']}；{overlay['expression']}；"
             f"{overlay['action']}{inner_dialogue}。它不是真实人物，不计入"
-            f"上述{count}名真实主体，不参与物理站位、遮挡、空间调度或真实"
+            f"上述{visible_count}名真实主体，不参与物理站位、遮挡、空间调度或真实"
             "连续性；只有宿主内心感知，其他人物不得看见、回应、触碰、对视；"
             "严格保持大头小身：约1.8头身，头占总高约58%，身体、肩宽、"
             "躯干、四肢、手脚都明显小于头部；"
             "继承锁定的当前衣着，不继承默认道具；内心发声时宿主闭口，"
             "不画旁白/吐槽字幕。")
-    physical = contract.get("physical") or {}
-    physical_rules = "；".join(physical.get("rules") or [])
-    if physical_rules:
-        lines.insert(
-            6,
-            f"【物理/空间逻辑】{physical_rules}"
-            + (f"；对象关系：{'；'.join(physical.get('objects') or [])}。"
-               if physical.get("objects") else "。"))
+    lines.append(f"【场景】{contract.get('scene', '按场景基准图')}。")
     composition = contract.get("composition") or {}
     if composition.get("composition_type") == "over_shoulder_dialogue":
         duties = "；".join(
             f"{item.get('character')}={item.get('role')}/"
             f"{item.get('expected_view')}"
             for item in composition.get("actors") or [])
-        lines.insert(
-            3,
+        lines.append(
             "【过肩构图】"
             f"主体{composition.get('expected_primary_count', 1)}人，"
-            f"实际可见人形{composition.get('expected_visible_figure_count', count)}人；"
+            f"实际可见人形{composition.get('expected_visible_figure_count', visible_count)}人；"
             f"{duties}；{composition.get('count_rule', '')}。")
     elif composition.get(
             "composition_type") == "single_subject_over_shoulder":
@@ -820,29 +1398,68 @@ def render_shot_prompt(contract, *, mode="image"):
             f"{item.get('character')}={item.get('role')}/"
             f"{item.get('expected_view')}"
             for item in composition.get("actors") or [])
-        lines.insert(
-            3,
+        lines.append(
             "【单人过肩构图】"
-            f"严格只有1名人物、1具连续身体；{duties}；"
-            f"{composition.get('count_rule', '')}。")
+            "严格只有1名人物、1具连续身体；"
+            f"实际可见人形{composition.get('expected_visible_figure_count', visible_count)}人；"
+            f"{duties}；{composition.get('count_rule', '')}。")
+    if media == "video":
+        lines.extend([
+            f"【起点】{contract.get('start', '保持首帧状态')}。",
+            f"【单一主动作】{contract.get('action', '环境保持稳定')}。",
+            f"【表演】{contract.get('performance', '自然微表情')}。",
+            f"【镜头】{camera_line}。",
+            f"【终点】{contract.get('end', '到达尾帧状态')}。",
+        ])
+    else:
+        target = contract.get("frame_target") or {}
+        target_state = (
+            target.get("state") if isinstance(target, dict)
+            else contract.get("frame_target_state"))
+        target_state = _text(
+            target_state or contract.get("frame_target_state"),
+            "环境保持稳定")
+        fallback = bool(
+            target.get("fallback")
+            if isinstance(target, dict)
+            else contract.get("frame_target_fallback"))
+        source = _text(
+            target.get("source") if isinstance(target, dict)
+            else contract.get("frame_target_source"))
+        fallback_note = (
+            f"（fallback=true；来源={source or 'description/action'}）"
+            if fallback else "")
+        lines.extend([
+            f"【定格状态】{target_state}{fallback_note}。",
+            f"【镜头】{camera_line}。",
+        ])
+    physical = contract.get("physical") or {}
+    physical_rules = "；".join(physical.get("rules") or [])
+    if physical_rules:
+        physical_line = (
+            f"【物理/空间逻辑】{physical_rules}"
+            + (f"；对象关系：{'；'.join(physical.get('objects') or [])}。"
+               if physical.get("objects") else "。"))
+        relation_lines = [
+            _render_spatial_relation(item)
+            for item in physical.get("spatial_relations") or []
+        ]
+        relation_lines = [value for value in relation_lines if value]
+        if relation_lines:
+            physical_line += "【空间关系】" + "；".join(relation_lines) + "。"
+        lines.append(physical_line)
+    medium_line = _medium_prompt_line(contract.get("medium"))
+    if medium_line:
+        lines.append(f"【视觉媒介】{medium_line}。")
     if contract.get("style"):
         lines.append(f"【画风】{contract['style']}（只沿用项目基准，不改媒介）。")
-    if contract.get("dialogue"):
+    if media == "video" and contract.get("dialogue"):
         speaker = contract.get("speaker") or "说话人"
         lines.append(f"【对白】{speaker}说出「{contract['dialogue']}」，自然口型；不画字幕。")
     lines.append(f"【文字】{contract['text']}。")
-    if mode == "video":
-        lines.insert(1, "【输入】图1是唯一动作起点，图2是唯一动作终点；只让已锁定画面动起来。")
-    if contract.get("frame_kind") in {"first_frame", "last_frame"}:
-        label = "首帧" if contract["frame_kind"] == "first_frame" else "尾帧"
-        state = contract["start"] if label == "首帧" else contract["end"]
-        lines.insert(
-            1,
-            f"【单帧修改】只生成{label}这一张；目标状态={state}；"
-            "保持待修改基底中未被反馈点名的内容不变。")
     if contract.get("references"):
         refs = "；".join(
-            f"图{item['index']}={item['label']}({_reference_role(item)})"
+            _render_reference(item)
             for item in contract["references"]
         )
         lines.append(f"【参考图职责】{refs}。")
@@ -852,8 +1469,48 @@ def render_shot_prompt(contract, *, mode="image"):
 
 def compile_shot_prompt(shot, *, location="", style="", references=None, mode="image"):
     contract = build_shot_prompt_contract(
-        shot, location=location, style=style, references=references)
-    return contract, render_shot_prompt(contract, mode=mode)
+        shot, location=location, style=style, references=references,
+        mode=mode)
+    return contract, render_shot_prompt(contract)
+
+
+def _binding_categories(reference):
+    values = []
+    raw = reference.get("binding")
+    if isinstance(raw, dict):
+        values.extend(_text(value) for value in raw.values() if _text(value))
+    elif isinstance(raw, (list, tuple, set)):
+        values.extend(_text_list(raw))
+    elif _text(raw):
+        # ``binding`` is a legacy human-readable instruction (for example
+        # “锁脸、发型；当前镜头服装服从状态表”).  It may mention several
+        # domains while explicitly saying that some of them are excluded, so
+        # keyword-mining the prose creates false multi-role conflicts.  Only a
+        # canonical single role is safe to interpret structurally; new callers
+        # must use ``bindings`` for an explicit multi-role declaration.
+        canonical = _normalize_role_value(raw)
+        if canonical in REFERENCE_SCOPE_DEFAULTS:
+            values.append(canonical)
+    values.extend(_text_list(reference.get("bindings")))
+    text = " ".join(values).lower()
+    categories = set()
+    token_map = {
+        "identity": (
+            "identity", "character_identity", "身份", "人物身份"),
+        "wardrobe": ("wardrobe", "costume", "服装", "造型"),
+        "scene": ("scene", "场景", "空间基准"),
+        "spatial": ("spatial", "blocking", "调度", "站位"),
+        "prop": ("prop", "道具"),
+        "style": ("style", "画风", "媒介"),
+        "composition": ("composition", "构图", "机位"),
+        "continuity": (
+            "continuity", "keyframe", "first_frame", "last_frame",
+            "连续性", "首帧", "尾帧"),
+    }
+    for category, tokens in token_map.items():
+        if any(token in text for token in tokens):
+            categories.add(category)
+    return categories
 
 
 def validate_shot_prompt_contract(contract):
@@ -861,10 +1518,73 @@ def validate_shot_prompt_contract(contract):
     contract = contract if isinstance(contract, dict) else {}
     issues = []
     subject = contract.get("subject") or {}
-    count = int(subject.get("count") or 0)
+    try:
+        count = int(subject.get("count") or 0)
+    except (TypeError, ValueError):
+        count = 0
+        issues.append("subject.count 必须是整数")
+    registered_count = subject.get("registered_count", count)
+    functional_figures = subject.get("functional_figures") or []
+    normalized_functional_count = 0
+    for position, item in enumerate(functional_figures, 1):
+        if not isinstance(item, dict):
+            issues.append(f"第{position}个功能人物不是对象")
+            continue
+        value = item.get("count")
+        if (not isinstance(value, int) or isinstance(value, bool)
+                or value <= 0):
+            issues.append(
+                "功能人物"
+                f"「{_text(item.get('name') or item.get('label'), position)}」"
+                "的 count 必须是精确正整数")
+            continue
+        if not _text(item.get("name") or item.get("label")):
+            issues.append(f"第{position}个功能人物缺少 name/label")
+        normalized_functional_count += value
+    functional_count = subject.get(
+        "functional_count", normalized_functional_count)
+    visible_count = subject.get(
+        "visible_count", count + normalized_functional_count)
+    for label, value in (
+            ("subject.registered_count", registered_count),
+            ("subject.functional_count", functional_count),
+            ("subject.visible_count", visible_count)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            issues.append(f"{label} 必须是整数")
+    if registered_count != count:
+        issues.append("subject.count 与 registered_count 不一致")
+    if functional_count != normalized_functional_count:
+        issues.append("subject.functional_count 与 functional_figures 求和不一致")
+    if visible_count != count + normalized_functional_count:
+        issues.append("subject.visible_count 与登记角色数和功能人物数之和不一致")
+    population = contract.get("population") or {}
+    population_counts = population.get("counts") or {}
+    expected_population_counts = {
+        "named_characters": count,
+        "functional_people": normalized_functional_count,
+        "real_people_total": count + normalized_functional_count,
+        "non_real_overlays": len(contract.get("narrative_overlays") or []),
+        "visible_entity_instances_total": (
+            count + normalized_functional_count
+            + len(contract.get("narrative_overlays") or [])),
+    }
+    for key, expected in expected_population_counts.items():
+        if key in population_counts and population_counts.get(key) != expected:
+            issues.append(f"population.counts.{key} 与镜头实体求和不一致")
+    issues.extend(
+        _text(value) for value in population.get("issues") or []
+        if _text(value))
+    declared_visible = population.get("declared_visible_figure_count")
+    if (declared_visible is not None
+            and declared_visible != count + normalized_functional_count):
+        issues.append(
+            "显式 visible_figure_count 与登记角色数和功能人物数之和不一致")
     composition = contract.get("composition") or {}
-    if composition.get("expected_visible_figure_count", count) != count:
-        issues.append("构图可见人数与镜头人物名单不一致")
+    if composition.get(
+            "expected_visible_figure_count",
+            count + normalized_functional_count,
+    ) != count + normalized_functional_count:
+        issues.append("构图可见人数与登记角色数和功能人物数之和不一致")
     if (composition.get("composition_type") == "over_shoulder_dialogue"
             and count < 2):
         issues.append("单人镜头不得使用双人过肩对话合同")
@@ -873,6 +1593,38 @@ def validate_shot_prompt_contract(contract):
     indexes = [item.get("index") for item in refs if isinstance(item, dict)]
     if indexes and indexes != list(range(1, len(indexes) + 1)):
         issues.append("参考图编号不是与提交顺序一致的连续编号")
+    for position, item in enumerate(refs, 1):
+        if not isinstance(item, dict):
+            issues.append(f"第{position}张参考图合同不是对象")
+            continue
+        issues.extend(
+            f"图{item.get('index') or position}：{_text(value)}"
+            for value in item.get("role_issues") or []
+            if _text(value))
+        role = _normalize_role_value(item.get("role"))
+        if not role:
+            issues.append(f"图{item.get('index') or position}缺少单一 role")
+        if len(set(_split_role_values(item.get("role")))) > 1:
+            issues.append(
+                f"图{item.get('index') or position}声明了多个 role")
+        scope = item.get("inherit_scope") or {}
+        include = set(_text_list(scope.get("include")))
+        exclude = set(_text_list(scope.get("exclude")))
+        overlap = sorted(include & exclude)
+        if overlap:
+            issues.append(
+                f"图{item.get('index') or position}的 include/exclude 交集:"
+                + "、".join(overlap))
+        binding_categories = _binding_categories(item)
+        if len(binding_categories) > 1:
+            issues.append(
+                f"图{item.get('index') or position}的 binding 声明多个参考职责:"
+                + "、".join(sorted(binding_categories)))
+        elif (binding_categories and role in REFERENCE_SCOPE_DEFAULTS
+              and role != "reference" and role not in binding_categories):
+            issues.append(
+                f"图{item.get('index') or position}的 binding 与"
+                f" {role} inherit_scope 明显冲突")
 
     action = _text(contract.get("action"))
     start_appearance = contract.get("start_appearance") or {}
@@ -998,13 +1750,69 @@ def validate_shot_prompt_contract(contract):
 
     camera = contract.get("camera") or {}
     angle = _text(camera.get("角度"))
-    physical = " ".join(contract.get("physical", {}).get("rules") or [])
+    physical_contract = contract.get("physical") or {}
+    if not isinstance(physical_contract, dict):
+        physical_contract = {}
+        issues.append("physical 必须是对象")
+    physical = " ".join(physical_contract.get("rules") or [])
     if angle in {"顶拍", "俯拍"} and any(
             token in physical for token in ("低机位", "仰拍")):
         issues.append("镜头要求俯拍/顶拍，但空间合同要求低机位/仰拍")
     if angle == "仰拍" and any(
             token in physical for token in ("顶拍", "摄影机在人物上方")):
         issues.append("镜头要求仰拍，但空间合同要求人物上方俯拍")
+
+    relations = (
+        contract.get("spatial_relations")
+        if "spatial_relations" in contract
+        else physical_contract.get("spatial_relations"))
+    if relations is None:
+        relations = []
+    if not isinstance(relations, list):
+        issues.append("spatial_relations 必须是列表")
+    else:
+        for position, item in enumerate(relations, 1):
+            if not isinstance(item, dict):
+                issues.append(f"第{position}条空间关系必须是对象")
+                continue
+            if not _text(item.get("subject")):
+                issues.append(f"第{position}条空间关系缺少 subject")
+            if not _text(item.get("relation") or item.get("predicate")):
+                issues.append(
+                    f"第{position}条空间关系缺少 relation/predicate")
+            if not _text(item.get("object")):
+                issues.append(f"第{position}条空间关系缺少 object")
+
+    medium = contract.get("medium") or {}
+    if not isinstance(medium, dict):
+        issues.append("medium 必须是对象")
+        medium = {}
+    issues.extend(
+        _text(value) for value in medium.get("issues") or []
+        if _text(value))
+    if (medium.get("dimension") == "2D"
+            and medium.get("semi_realistic_3d")):
+        issues.append("视觉媒介 2D 与 3D 声明冲突，无法执行")
+    output_present = "output" in contract
+    output = contract.get("output") or {}
+    if output_present and not isinstance(output, dict):
+        issues.append("output 必须是对象")
+    elif output_present:
+        media = _text(output.get("media"))
+        phase = _text(output.get("frame_phase"))
+        policy = _text(output.get("temporal_policy"))
+        if media not in {"image", "video"}:
+            issues.append("output.media 必须是 image 或 video")
+        if media == "image" and (
+                phase not in {"start", "end"}
+                or policy != "terminal_only"):
+            issues.append("静态图 output 必须指定 start/end 且只使用 terminal_only")
+        if media == "video" and (
+                phase != "timeline" or policy != "timeline"):
+            issues.append("视频 output 必须指定 timeline")
+    issues.extend(
+        _text(value) for value in contract.get("output_issues") or []
+        if _text(value))
 
     return {
         "passed": not issues,

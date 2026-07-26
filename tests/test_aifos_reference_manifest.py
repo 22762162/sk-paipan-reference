@@ -75,12 +75,47 @@ def test_prompt_carries_numbered_reference_binding(app):
     combined_entries = [
         item for item in manifest
         if "兼当前服装参考" in item.get("label", "")]
-    assert wardrobe_entries or combined_entries, \
-        "当前服装状态没有绑定服装参考职责"
+    identity_entries = [
+        item for item in manifest if item.get("role") == "identity"]
+    assert not combined_entries, "身份图不得再兼任服装参考"
+    assert identity_entries
+    assert all("identity" in item["inherits"] for item in identity_entries)
+    assert all(
+        {"wardrobe", "props", "prop_position"} <= set(item["excludes"])
+        for item in identity_entries)
     assert all("不得用此图覆盖脸" in item["binding"]
                for item in wardrobe_entries)
-    assert all("本镜当前服装" in item["binding"]
-               for item in combined_entries)
+    assert all("wardrobe" in item["inherits"]
+               and "face" in item["excludes"]
+               for item in wardrobe_entries)
+
+
+def test_shot_payload_preserves_functional_population_without_identity_refs(
+        app):
+    project, episode, _ = _preproduce(app, title="功能人物外围链")
+    storyboard, _ = app.projects.latest_document(
+        episode["id"], "storyboard")
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    shot = next(item for item in storyboard["shots"]
+                if item.get("characters"))
+    shot["functional_figures"] = [{
+        "name": "蒙面杀手", "count": 2, "function": "封锁出口",
+    }]
+    ctx = {
+        "project": dict(project), "episode": dict(episode),
+        "out_root": app.workspace.artifacts_dir
+        / f"p{project['id']:03d}" / "e001",
+        "script": script, "storyboard": storyboard,
+        "aspect": "9:16", "dims": {"width": 1080, "height": 1920},
+    }
+
+    payload = app.director._shot_payload(ctx, shot)
+
+    assert payload["functional_figures"] == shot["functional_figures"]
+    assert payload["visible_figure_count"] == len(shot["characters"]) + 2
+    assert "蒙面杀手" not in payload["identity_characters"]
+    assert payload["composition_contract"][
+        "expected_visible_figure_count"] == payload["visible_figure_count"]
 
 
 def test_later_qc_prefers_immutable_generation_snapshot(app):
@@ -365,7 +400,12 @@ def test_shot_provider_prompt_contains_current_frame_only(app):
 
     payload = app.director._shot_payload(ctx, shot)
     provider_prompt = payload["prompt_compact"]
-    assert current in provider_prompt
+    assert current not in provider_prompt
+    assert payload["prompt_contract"]["frame_target_source"] == "end_state"
+    assert provider_prompt.count("【定格状态】") == 1
+    assert all(
+        label not in provider_prompt
+        for label in ("【起点】", "【单一主动作】", "【终点】"))
     assert payload["prompt_contract_complete"] is True
     for forbidden in (
             "OLD_STORYBOARD_PROMPT_SENTINEL",

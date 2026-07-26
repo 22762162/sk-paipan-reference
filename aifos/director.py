@@ -73,6 +73,9 @@ from .story_analysis import (
 from .script_import import sanitize_script_entities
 from .workflow import (
     PIPELINE_VERSION,
+    _functional_figure_count,
+    _functional_figure_line,
+    _normalize_functional_figures,
     build_content_review,
     build_continuity_bible,
     build_preflight,
@@ -2615,6 +2618,7 @@ class Director:
                  composition_contract=None, readable_text=None,
                  physical_contract=None, physical_logic_required=False,
                  era_exceptions=None, narrative_overlays=None,
+                 functional_figures=None,
                  character_sheet_key=None):
         """视觉质检规格：按角色在本镜可见角度选择核验依据。"""
         identity_characters = list(characters or [])
@@ -2675,6 +2679,11 @@ class Director:
             for item in (narrative_overlays or [])
             if isinstance(item, dict)
         ][:1]
+        functional_figures = _normalize_functional_figures(
+            functional_figures)
+        if expected_count is None:
+            count = len(visible_characters) + _functional_figure_count(
+                functional_figures)
         expected_wardrobe = {
             name: "；".join(filter(None, (
                 ("服装:" + str((backgrounds.get(name) or {}).get("costume")))
@@ -2695,6 +2704,7 @@ class Director:
             "characters": visible_characters,
             "identity_characters": identity_characters,
             "count": count,
+            "functional_figures": functional_figures,
             "narrative_overlays": overlays,
             "expected_overlay_count": len(overlays),
             "overlay_count_required": bool(overlays),
@@ -6700,14 +6710,8 @@ class Director:
                     current_wardrobe, locked_look.get("costume"))))
             headwear_matches = self._headwear_states_compatible(
                 current_headwear, self._look_headwear_text(locked_look))
-            if (current_wardrobe
-                    and wardrobe_matches and headwear_matches):
-                # One image can safely carry both responsibilities when the
-                # manually selected portrait visibly wears this exact look.
-                identity["wardrobe_lock"] = current_wardrobe
-                wardrobe_bound_names.add(character)
-            elif ((current_wardrobe or current_headwear)
-                  and self._look_headwear_text(locked_look)):
+            if ((current_wardrobe or current_headwear)
+                    and (not wardrobe_matches or not headwear_matches)):
                 # A full-body final portrait wearing another scene's outfit
                 # visually overpowers a clothes-only reference even when the
                 # prompt says "identity only". Replace the submitted image
@@ -7116,12 +7120,24 @@ class Director:
                 f"{actor_id}={name}（{line or '人物身份以最终立绘为准'}；"
                 "脸型、五官骨相、年龄、性别表达、发际线与发型轮廓只以"
                 "该角色最终立绘锁定；不得复制参考图的姿势、背景或未声明服装）")
+        functional_figures = _normalize_functional_figures(
+            shot.get("functional_figures"))
+        functional_count = _functional_figure_count(functional_figures)
+        visible_count = len(who) + functional_count
+        parts.append(
+            f"【POPULATION】登记角色{len(who)}人；功能人物"
+            f"{functional_count}人（{_functional_figure_line(functional_figures)}）；"
+            f"画面可见真人严格共{visible_count}人；非现实叙事叠层不计真人。")
         if who:
             parts.append(
-                f"【IDENTITY LOCK】画面严格共{len(who)}人；"
+                f"【IDENTITY LOCK】只核验以下{len(who)}名登记角色；"
                 + "；".join(who)
                 + "；每人只读取自己编号对应的最终立绘，禁止串脸、换性别、"
-                "新增、缺失、合并或复制人物")
+                "缺失、合并或复制登记角色；功能人物不得套用登记角色身份")
+        elif functional_figures:
+            parts.append(
+                "【IDENTITY LOCK】本镜没有需最终立绘核验的登记角色；"
+                "功能人物只按精确数量、状态和剧情功能呈现")
         else:
             parts.append(
                 "【IDENTITY LOCK】严格 0 人空镜；禁止人物、人体局部、"
@@ -7309,10 +7325,26 @@ class Director:
             name for name in shot["characters"]
             if name not in identity_characters
             and not is_background_character(script_characters.get(name, {})))
+        functional_figures = _normalize_functional_figures(
+            shot.get("functional_figures"))
+        visible_figure_count = (
+            len(shot["characters"])
+            + _functional_figure_count(functional_figures))
+        shot["functional_figures"] = functional_figures
+        shot["visible_figure_count"] = visible_figure_count
         character_background = self._shot_character_facts(ctx, shot)
         character_visuals = self._shot_character_visuals(
             ctx, shot, character_background)
-        composition_contract = build_composition_contract(shot)
+        composition_contract = copy.deepcopy(build_composition_contract(shot))
+        composition_contract["expected_visible_figure_count"] = (
+            visible_figure_count)
+        composition_contract.setdefault(
+            "registered_character_count", len(shot["characters"]))
+        composition_contract.setdefault(
+            "functional_figure_count",
+            _functional_figure_count(functional_figures))
+        composition_contract.setdefault(
+            "functional_figures", copy.deepcopy(functional_figures))
         story_world = (ctx.get("script") or {}).get("story_world") or {}
         era_context = "；".join(
             str(value or "").strip() for value in (
@@ -7358,10 +7390,9 @@ class Director:
             "identity_characters": identity_characters,
             "character_background": character_background,
             "character_visuals": character_visuals,
-            "character_count": shot.get(
-                "character_count", len(shot["characters"])),
-            "visible_figure_count": (
-                len(shot["characters"]) + len(narrative_overlays)),
+            "character_count": len(shot["characters"]),
+            "functional_figures": functional_figures,
+            "visible_figure_count": visible_figure_count,
             "narrative_overlays": narrative_overlays,
             "location": location,
             "dialogue": shot.get("dialogue"),
@@ -7480,17 +7511,71 @@ class Director:
         }
         entries, seen = [], set()
 
+        reference_scopes = {
+            "identity": (
+                ["face", "identity", "hair_silhouette", "age", "gender"],
+                [
+                    "wardrobe", "pose", "composition", "background",
+                    "lighting", "props", "prop_position",
+                ]),
+            "identity_detail": (
+                ["identity_detail"], ["wardrobe", "pose", "background"]),
+            "structure": (
+                ["body_structure", "view_structure"],
+                ["identity_override", "wardrobe", "pose", "background"]),
+            "wardrobe": (
+                ["wardrobe", "accessories"],
+                ["face", "identity", "pose", "background", "lighting"]),
+            "prop": (
+                ["prop_structure", "prop_material"],
+                ["background", "composition", "extra_props"]),
+            "spatial": (
+                ["blocking", "camera", "occlusion"],
+                ["identity", "wardrobe", "style", "diagram_artifacts"]),
+            "inner_persona": (
+                ["overlay_identity", "chibi_proportion", "current_wardrobe"],
+                ["real_person_count", "physical_blocking", "default_props"]),
+            "keyframe": (
+                ["composition", "blocking", "scene_state", "wardrobe", "props"],
+                ["identity_override", "known_errors"]),
+            "continuity": (
+                ["composition", "blocking", "scene_state", "wardrobe", "props"],
+                ["identity_override"]),
+            "scene": (
+                ["scene_layout", "materials", "lighting"],
+                ["identity", "wardrobe", "pose", "readable_text"]),
+            "style": (
+                ["render_style", "palette", "materials", "lighting_style"],
+                ["identity", "wardrobe", "pose", "scene_layout", "text"]),
+            "composition": (
+                ["composition", "camera", "blocking"],
+                ["identity", "wardrobe", "scene_style"]),
+            "revision_base": (
+                ["unchanged_pixels", "composition", "current_state"],
+                ["known_errors"]),
+            "manual": (
+                ["weak_composition"], [
+                    "identity", "gender", "population", "wardrobe",
+                    "scene", "readable_text"]),
+        }
+
         def add(uri, label, binding, character="", role="", asset_id=None,
-                kind=""):
+                kind="", inherits=None, excludes=None):
             value = str(uri or "").strip()
             if not value or value in seen:
                 return
             seen.add(value)
             match = matches.get(value) or {}
+            default_inherits, default_excludes = reference_scopes.get(
+                role, (["declared_binding_only"], ["cross_role_propagation"]))
             entries.append({
                 "index": len(entries) + 1, "uri": value,
                 "label": label, "binding": binding,
                 "character": character, "role": role,
+                "inherits": list(
+                    inherits or match.get("inherits") or default_inherits),
+                "excludes": list(
+                    excludes or match.get("excludes") or default_excludes),
                 "asset_id": (
                     asset_id if asset_id is not None
                     else match.get("asset_id")),
@@ -7503,19 +7588,11 @@ class Director:
                 continue
             who = str(ref.get("character") or "角色")
             actor = str(ref.get("actor_id") or f"P{pos:02d}")
-            wardrobe_lock = str(ref.get("wardrobe_lock") or "").strip()
             face_only = (
                 ref.get("identity_anchor_type") == "face_only_derived")
-            wardrobe_binding = (
-                f"；本图同时是{who}本镜当前服装「{wardrobe_lock}」的"
-                "服装参考，锁定其外层服装结构、材质、配色、鞋履和配饰"
-                if wardrobe_lock else
-                "；不得复制此图的服装")
             add(ref["uri"], (
-                    f"{actor}·{who}最终立绘兼当前服装参考"
-                    if wardrobe_lock else (
-                        f"{actor}·{who}最终立绘面部锚"
-                        if face_only else f"{actor}·{who}最终立绘")),
+                    f"{actor}·{who}最终立绘面部锚"
+                    if face_only else f"{actor}·{who}最终立绘"),
                 (
                     f"本图是从人工锁定的{who}最终立绘派生的面部锚；只锁定"
                     f"{who}的脸型、五官骨相、年龄、性别表达、发际线与发型"
@@ -7523,7 +7600,7 @@ class Director:
                     "或光线；服装只服从本镜服装参考；禁止参考他人图片"
                     if face_only else
                     f"只锁定{who}的脸型、五官骨相、年龄、性别表达、发际线、"
-                    f"发型轮廓、体型与身份标志{wardrobe_binding}；不得复制"
+                    "发型轮廓、体型与身份标志；不得复制此图的服装、"
                     "姿势、构图、背景或光线；禁止参考他人图片"),
                 character=who, role="identity",
                 asset_id=ref.get("asset_id"),
@@ -7888,7 +7965,7 @@ class Director:
                     action=payload.get("action", ""),
                     forbid=self._FORBID + ["字幕条"],
                     expected_characters=payload.get("characters", []),
-                    expected_count=payload.get("character_count"),
+                    expected_count=payload.get("visible_figure_count"),
                     character_background=payload.get(
                         "character_background", {}),
                     camera=payload.get("camera", ""),
@@ -7899,7 +7976,9 @@ class Director:
                     physical_logic_required=True,
                     era_exceptions=self._era_exceptions(ctx),
                     narrative_overlays=payload.get(
-                        "narrative_overlays"))}})
+                        "narrative_overlays"),
+                    functional_figures=payload.get(
+                        "functional_figures"))}})
         results, qc_failures = self._run_parallel(
             ctx, tasks, line="分镜画面",
             continue_on_qc_failure=True)
@@ -8059,7 +8138,7 @@ class Director:
                             "动作状态上连续"),
                         forbid=self._FORBID + ["字幕条"],
                         expected_characters=payload.get("characters", []),
-                        expected_count=payload.get("character_count"),
+                        expected_count=payload.get("visible_figure_count"),
                         character_background=payload.get(
                             "character_background", {}),
                         camera=payload.get("camera", ""),
@@ -8070,7 +8149,9 @@ class Director:
                         physical_logic_required=True,
                         era_exceptions=self._era_exceptions(ctx),
                         narrative_overlays=payload.get(
-                            "narrative_overlays"))}})
+                            "narrative_overlays"),
+                        functional_figures=payload.get(
+                            "functional_figures"))}})
             if not round_tasks:
                 continue
             results, qc_failures = self._run_parallel(
@@ -9551,11 +9632,13 @@ class Director:
                     forbid=self._FORBID + ["字幕条"],
                     expected_characters=shot.get("characters") or [],
                     expected_count=shot.get(
-                        "character_count", expected_count),
+                        "visible_figure_count", expected_count),
                     composition_contract=composition,
                     readable_text=shot.get("readable_text") or {},
                     narrative_overlays=shot.get(
-                        "narrative_overlays"))
+                        "narrative_overlays"),
+                    functional_figures=shot.get(
+                        "functional_figures"))
                 samples = [
                     ("首帧", first, "first_valid"),
                     ("尾帧", last, "last_valid"),
@@ -11850,7 +11933,7 @@ class Director:
                     action=payload.get("action", ""),
                     forbid=self._FORBID + ["字幕条"],
                     expected_characters=payload.get("characters", []),
-                    expected_count=payload.get("character_count"),
+                    expected_count=payload.get("visible_figure_count"),
                     character_background=payload.get(
                         "character_background", {}),
                     camera=payload.get("camera", ""),
@@ -11860,7 +11943,9 @@ class Director:
                     physical_contract=payload.get("physical_contract"),
                     physical_logic_required=True,
                     narrative_overlays=payload.get(
-                        "narrative_overlays"))
+                        "narrative_overlays"),
+                    functional_figures=payload.get(
+                        "functional_figures"))
             else:
                 spec = self._qc_spec(project_id, [], forbid=self._FORBID)
         # 首尾帧:首帧 + 尾帧两张都要检,任一不符即整组不合格

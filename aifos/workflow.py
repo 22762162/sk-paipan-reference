@@ -86,6 +86,32 @@ APPEARANCE_CHANGE_TOKENS = (
 )
 
 
+def _normalize_functional_figures(value):
+    if isinstance(value, dict):
+        value = [value]
+    return [
+        copy.deepcopy(item) for item in (value or [])
+        if isinstance(item, dict)
+        and (item.get("name") or item.get("label"))
+        and type(item.get("count")) is int and item.get("count") > 0
+    ]
+
+
+def _functional_figure_count(value):
+    return sum(
+        item["count"] for item in _normalize_functional_figures(value))
+
+
+def _functional_figure_line(value):
+    figures = _normalize_functional_figures(value)
+    return "、".join(
+        f"{item.get('name') or item.get('label')}{item['count']}人"
+        + (f"({item.get('state') or item.get('function')})"
+           if item.get("state") or item.get("function") else "")
+        for item in figures
+    ) or "无"
+
+
 def _rules_from_standard(standard):
     content = (standard or {}).get("content", standard or {})
     rules = content.get("rules", {}) if isinstance(content, dict) else {}
@@ -1072,6 +1098,8 @@ def _normalize_ai_shot(raw):
     if isinstance(characters, str):
         characters = [characters]
     shot["characters"] = [str(c) for c in (characters or []) if c]
+    shot["functional_figures"] = _normalize_functional_figures(
+        shot.get("functional_figures"))
     overlays = shot.get("narrative_overlays")
     if isinstance(overlays, dict):
         overlays = [overlays]
@@ -1150,6 +1178,9 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
         previous_before_shot = copy.deepcopy(previous)
         kind = raw.get("kind") or ("dialogue" if raw.get("dialogue") else "environment")
         characters = list(dict.fromkeys(raw.get("characters", [])))
+        functional_figures = _normalize_functional_figures(
+            raw.get("functional_figures"))
+        functional_count = _functional_figure_count(functional_figures)
         narrative_overlays = [
             copy.deepcopy(item)
             for item in (raw.get("narrative_overlays") or [])
@@ -1168,6 +1199,7 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
                     scene.get("characters", []),
                     raw.get("timeline_state", "unknown"),
                     inner_policy)[:1]
+        visible_figure_count = len(characters) + functional_count
         action_text = "；".join(str(value or "") for value in (
             raw.get("description"), raw.get("physical_logic"),
             raw.get("prompt")))
@@ -1270,8 +1302,13 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             (f"【制作圣经】{seedance_master}。" if seedance_master else "") +
             "【输入】首帧是唯一动作起点，尾帧是唯一动作终点。"
             "【人物编号映射（仅用于提示词引用，不生成画面文字）】"
-            f"{numbered_people}；成片严格共{len(characters)}人"
-            f"（{people}），不得新增、复制、合并或换人。"
+            f"{numbered_people}。"
+            f"【真人总量】登记角色{len(characters)}人（{people}）；"
+            f"功能人物{functional_count}人"
+            f"（{_functional_figure_line(functional_figures)}）；"
+            f"成片实际可见真人严格共{visible_figure_count}人，不得新增、"
+            "漏画、复制、合并或换人；功能人物没有独立身份资产，只按"
+            "本镜精确数量、状态和剧情功能呈现。"
             f"【起点】{station or '无人空镜，保持场景初始状态'}。"
             f"【单一主动作】{raw.get('description', '') or '环境保持自然变化'}。"
             f"【表演】{gaze}；{micro_expression}，动作连贯自然。"
@@ -1341,9 +1378,10 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             "timecode": timecode,
             "characters": characters,
             "character_count": len(characters),
+            "functional_figures": functional_figures,
             "narrative_overlays": narrative_overlays,
             "inner_persona_policy": copy.deepcopy(inner_policy),
-            "visible_figure_count": len(characters) + len(narrative_overlays),
+            "visible_figure_count": visible_figure_count,
             "character_number_map": shot_character_map,
             "character_number_ids": list(shot_character_map),
             "type_word": _type_word(scene, raw),
@@ -1497,7 +1535,8 @@ def repair_storyboard_appearance_continuity(storyboard, continuity,
                 shot["characters"] = characters
                 shot["character_count"] = 1
                 shot["visible_figure_count"] = (
-                    1 + len(shot.get("narrative_overlays") or []))
+                    1 + _functional_figure_count(
+                        shot.get("functional_figures")))
                 actor = character_catalog.get(replacement)
                 shot["character_number_map"] = ({
                     actor["actor_id"]: copy.deepcopy(actor)
