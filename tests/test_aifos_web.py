@@ -1903,3 +1903,53 @@ def test_artifact_thumbnail_and_cache(server):
     resp.read()
     conn.close()
     assert "max-age" in cache
+
+
+def test_lesson_approval_endpoint_toggles_prompt_injection(server):
+    """审批接口:批准后教训才进提示词,撤销后立刻停止注入。"""
+    from aifos.lessons import (DOMAIN_SCRIPT, project_lessons, record_lessons,
+                               script_lessons_block)
+
+    app = App(server["workspace"])
+    try:
+        project, _ = app.projects.get_or_create_project("审批接口")
+        pid = project["id"]
+        record_lessons(app.assets, pid, ["把旁白当成了人物写进人物表"],
+                       category="non_person_speaker", domain=DOMAIN_SCRIPT)
+        [row] = project_lessons(app.assets, pid)
+    finally:
+        app.close()
+
+    status, reply = _json_request(
+        server["port"], "POST", "/api/lessons/approve",
+        {"project_id": pid, "lesson_id": row["id"], "approved": True})
+    assert status == 200
+    assert reply["approved_for_prompt"] is True
+    assert reply["status"] == "approved"
+    assert reply["domain"] == DOMAIN_SCRIPT
+
+    app = App(server["workspace"])
+    try:
+        assert "旁白" in script_lessons_block(app.assets, pid)
+    finally:
+        app.close()
+
+    status, reply = _json_request(
+        server["port"], "POST", "/api/lessons/approve",
+        {"project_id": pid, "lesson_id": row["id"], "approved": False})
+    assert status == 200
+    assert reply["approved_for_prompt"] is False
+
+    app = App(server["workspace"])
+    try:
+        assert script_lessons_block(app.assets, pid) == ""
+    finally:
+        app.close()
+
+    status, _ = _json_request(
+        server["port"], "POST", "/api/lessons/approve",
+        {"project_id": pid, "lesson_id": "missing", "approved": True})
+    assert status == 404
+    status, _ = _json_request(
+        server["port"], "POST", "/api/lessons/approve", {"approved": True})
+    assert status == 400
