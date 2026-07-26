@@ -529,7 +529,9 @@ class MockProvider(Provider):
 
     def _enrich_script_characters(self, script, payload, genre=None):
         """占位剧本也输出完整人物背景,让后续真实出图不靠默认都市模板。"""
-        for character in script.get("characters", []):
+        source_text = " ".join(str(payload.get(key) or "") for key in (
+            "project_title", "premise", "style", "template"))
+        for index, character in enumerate(script.get("characters", [])):
             genre_name = genre or self._design_genre(payload, character)
             story_pool = self.STORY_COSTUME_POOLS[genre_name]
             role = character.get("role") or "角色"
@@ -538,6 +540,31 @@ class MockProvider(Provider):
                        "当代校园" if genre_name == "campus" else
                        "当代舞台与练习室")
             name = character.get("name", "角色")
+            role_text = f"{name} {character.get('role') or ''}"
+            if any(token in role_text for token in (
+                    "皇帝", "太子", "父", "哥哥", "弟弟", "男主")):
+                gender = "男"
+            elif any(token in role_text for token in (
+                    "皇后", "公主", "母", "姐姐", "妹妹", "女主")):
+                gender = "女"
+            elif "女团" in source_text:
+                gender = "女"
+            elif "男团" in source_text:
+                gender = "男"
+            else:
+                # The mock author owns these invented characters, so it must
+                # declare their story identity instead of emitting a
+                # downstream placeholder. Imported user characters never pass
+                # through this authoring helper.
+                gender = "女" if index % 2 == 0 else "男"
+            age_range = {
+                "campus": "约16—18岁青少年",
+                "idol": "约20—26岁青年",
+                "urban": "约24—35岁青年",
+                "xianxia": "约20—35岁青年",
+            }.get(genre_name, "约20—35岁青年")
+            character.setdefault("gender", gender)
+            character.setdefault("age_range", age_range)
             character.setdefault(
                 "background_prompt",
                 f"{name}是{setting}中的{role},带着一段改变信念的过往;"

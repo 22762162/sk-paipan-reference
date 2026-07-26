@@ -4220,7 +4220,6 @@ textarea:focus-visible, select:focus-visible {
 }
 .lesson-approve:hover:not(:disabled) { background: rgba(250, 178, 25, .2); }
 .lesson-approve:disabled { opacity: .5; cursor: default; }
-
 /* ---- 提示词区：逐镜最高规则审计 ---- */
 .prompt-review-launch {
   border-color: rgba(114, 168, 255, .55);
@@ -4451,4 +4450,35 @@ textarea:focus-visible, select:focus-visible {
   .prompt-shot-head > .prompt-status { margin-left: 66px; }
   .prompt-variant > summary > span:first-child { min-width: 0; }
   .prompt-code { font-size: 11px; padding: 11px; }
+}
+
+.analysis-identity-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+  margin: 10px 0;
+}
+.analysis-identity-grid label {
+  display: grid;
+  gap: 5px;
+}
+.analysis-identity-grid span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.analysis-identity-grid input {
+  width: 100%;
+}
+.analysis-identity-grid .identity-missing input {
+  border-color: #ef9b37;
+  box-shadow: 0 0 0 1px rgba(239, 155, 55, .22);
+}
+.analysis-identity-summary,
+.identity-gate-warning {
+  margin: 10px 0;
+}
+@media (max-width: 720px) {
+  .analysis-identity-grid {
+    grid-template-columns: 1fr;
+  }
 }

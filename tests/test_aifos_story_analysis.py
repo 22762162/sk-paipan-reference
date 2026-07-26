@@ -25,8 +25,10 @@ def script():
         "episode_title": "雨夜重逢",
         "logline": "现代设计师在雨夜遇见旧日恋人",
         "characters": [
-            {"name": "苏念", "role": "主角", "gender": "女"},
-            {"name": "顾屿", "role": "重要配角", "gender": "男"},
+            {"name": "苏念", "role": "主角", "gender": "女",
+             "age_range": "约25岁青年"},
+            {"name": "顾屿", "role": "重要配角", "gender": "男",
+             "age_range": "约28岁青年"},
         ],
         "scenes": [{
             "scene_no": 1, "location": "现代城市设计事务所·夜",
@@ -65,8 +67,10 @@ def test_history_story_builds_its_own_style_without_modern_or_2d_default():
         "episode_title": "乾清宫急报",
         "logline": "崇祯命太子守住京城",
         "characters": [
-            {"name": "朱慈烺", "role": "主角"},
-            {"name": "崇祯", "role": "重要配角"},
+            {"name": "朱慈烺", "role": "主角", "gender": "男",
+             "age_range": "约15岁少年"},
+            {"name": "崇祯", "role": "重要配角", "gender": "男",
+             "age_range": "约32岁成年男性"},
         ],
         "scenes": [{
             "scene_no": 1, "location": "乾清宫",
@@ -88,6 +92,103 @@ def test_history_story_builds_its_own_style_without_modern_or_2d_default():
     assert "现代乙女" not in analysis["visual"]["user_style_constraint"]
     assert "清代服饰" in analysis["visual"]["forbidden_visuals"]
     assert validate_story_analysis(analysis) is None
+
+
+def test_unresolved_gender_and_age_stay_reviewable_but_cannot_lock():
+    draft = {
+        "project_title": "身份待确认",
+        "episode_number": 1,
+        "logline": "林川进入书房。",
+        "characters": [{
+            "name": "林川", "role": "主角",
+            "gender": "未指定（人物定版后以参考图为准）",
+            "age_range": "待确认",
+        }],
+        "scenes": [{
+            "scene_no": 1, "location": "书房",
+            "characters": ["林川"], "action": "林川推门进入。",
+            "lines": [],
+        }],
+    }
+    analysis = build_story_analysis(draft)
+    character = analysis["characters"][0]
+
+    assert character["identity_status"] == "needs_confirmation"
+    assert character["identity_missing_fields"] == ["性别", "年龄段"]
+    assert character["image_prompt"] == ""
+    assert validate_story_analysis(
+        analysis, require_resolved_identity=False) is None
+    assert "性别、年龄段" in validate_story_analysis(analysis)
+
+
+def test_manual_gender_and_age_rebuild_final_portrait_prompt():
+    draft = {
+        "project_title": "身份人工确认",
+        "episode_number": 1,
+        "logline": "林川进入书房。",
+        "characters": [{
+            "name": "林川", "role": "主角",
+            "gender": "未指定", "age_range": "未指定",
+        }],
+        "scenes": [{
+            "scene_no": 1, "location": "书房",
+            "characters": ["林川"], "action": "林川推门进入。",
+            "lines": [],
+        }],
+    }
+    original = build_story_analysis(draft)
+    original["characters"][0]["gender"] = "男"
+    original["characters"][0]["age_range"] = "约17岁少年"
+
+    confirmed = build_story_analysis(draft, raw=original)
+    character = confirmed["characters"][0]
+
+    assert character["identity_status"] == "ready"
+    assert character["identity_missing_fields"] == []
+    assert "男；约17岁少年" in character["image_prompt"]
+    assert validate_story_analysis(confirmed) is None
+
+
+def test_locked_manual_identity_is_saved_back_to_canonical_script(tmp_path):
+    app = App(tmp_path / "ws")
+    try:
+        app.director.produce("人工身份同步", 1, pause_for_confirm=True)
+        project = app.projects.get_project("人工身份同步")
+        episode = app.db.query_one(
+            "SELECT * FROM episodes WHERE project_id=? AND number=1",
+            (project["id"],))
+        script, _ = app.projects.latest_document(episode["id"], "script")
+        hero = next(
+            item for item in script["characters"]
+            if item.get("role") == "主角")
+        hero["gender"] = "未指定"
+        hero["age_range"] = "以参考图为准"
+        hero["image_prompt"] = ""
+        app.projects.save_document(episode["id"], "script", script)
+
+        draft = build_story_analysis(script, project["style"])
+        draft_hero = next(
+            item for item in draft["characters"]
+            if item["name"] == hero["name"])
+        draft_hero["gender"] = "女"
+        draft_hero["age_range"] = "约22岁青年女性"
+        _, current_version = app.projects.latest_document(
+            episode["id"], "story_analysis")
+        result = app.director.save_story_analysis(
+            episode["id"], draft,
+            expected_version=current_version, locked=True)
+
+        stored, stored_version = app.projects.latest_document(
+            episode["id"], "script")
+        stored_hero = next(
+            item for item in stored["characters"]
+            if item["name"] == hero["name"])
+        assert stored_hero["gender"] == "女"
+        assert stored_hero["age_range"] == "约22岁青年女性"
+        assert stored_hero["image_prompt"]
+        assert result["analysis"]["script_version"] == stored_version
+    finally:
+        app.close()
 
 
 def test_episode_anachronism_whitelist_overrides_derived_era_bans():
