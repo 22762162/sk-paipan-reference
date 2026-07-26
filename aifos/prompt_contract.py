@@ -599,20 +599,26 @@ def render_shot_prompt(contract, *, mode="image"):
     static_keyframe = (mode != "video"
                        and contract.get("frame_kind")
                        not in {"first_frame", "last_frame"})
+
+    def _s(text):
+        # 自由文本(剧本描述/物理规则)常自带句号,渲染层再追加会产生
+        # "。。"残留——从最初的失败合同一直带到质检提示词里。
+        return str(text or "").rstrip("。")
+
     if static_keyframe:
-        start_line = f"【起点·仅上下文，不入画】{contract['start']}。"
+        start_line = f"【起点·仅上下文，不入画】{_s(contract['start'])}。"
         end_line = (
-            f"【终点·唯一入画状态】画面只呈现此刻：{contract['end']}。")
+            f"【终点·唯一入画状态】画面只呈现此刻：{_s(contract['end'])}。")
     else:
-        start_line = f"【起点】{contract['start']}。"
-        end_line = f"【终点】{contract['end']}。"
+        start_line = f"【起点】{_s(contract['start'])}。"
+        end_line = f"【终点】{_s(contract['end'])}。"
     lines = [
         "【镜头合同v2】只执行下列事实，不自行补剧情。",
         f"【主体】严格共{count}人：{subject}（均为真实人物）。",
-        f"【场景】{contract['scene']}。",
+        f"【场景】{_s(contract['scene'])}。",
         start_line,
-        f"【单一主动作】{contract['action']}。",
-        f"【表演】{contract['performance']}。",
+        f"【单一主动作】{_s(contract['action'])}。",
+        f"【表演】{_s(contract['performance'])}。",
         f"【镜头】{camera_line}。",
         end_line,
     ]
@@ -635,12 +641,13 @@ def render_shot_prompt(contract, *, mode="image"):
             "继承锁定的当前衣着，不继承默认道具；内心发声时宿主闭口，"
             "不画旁白/吐槽字幕。")
     physical = contract.get("physical") or {}
-    physical_rules = "；".join(physical.get("rules") or [])
+    physical_rules = _s("；".join(
+        _s(rule) for rule in physical.get("rules") or []))
     if physical_rules:
         lines.insert(
             6,
             f"【物理/空间逻辑】{physical_rules}"
-            + (f"；对象关系：{'；'.join(physical.get('objects') or [])}。"
+            + (f"；对象关系：{_s('；'.join(physical.get('objects') or []))}。"
                if physical.get("objects") else "。"))
     composition = contract.get("composition") or {}
     if composition.get("composition_type") == "over_shoulder_dialogue":
@@ -670,7 +677,7 @@ def render_shot_prompt(contract, *, mode="image"):
     if contract.get("dialogue"):
         speaker = contract.get("speaker") or "说话人"
         lines.append(f"【对白】{speaker}说出「{contract['dialogue']}」，自然口型；不画字幕。")
-    lines.append(f"【文字】{contract['text']}。")
+    lines.append(f"【文字】{_s(contract['text'])}。")
     if mode == "video":
         lines.insert(1, "【输入】图1是唯一动作起点，图2是唯一动作终点；只让已锁定画面动起来。")
     if contract.get("frame_kind") in {"first_frame", "last_frame"}:
