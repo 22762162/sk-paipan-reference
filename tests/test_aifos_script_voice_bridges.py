@@ -357,3 +357,66 @@ def test_say_absent_from_defaults():
     assert DEFAULTS["routing"]["voice"] == ["doubao_tts", "api", "mock"]
     assert DEFAULTS["providers"]["jimeng"]["audio_in_video"] is True
     assert DEFAULTS["providers"]["ark"]["audio_in_video"] is True
+
+
+# 假 codex(两遍):首遍剧本带无法本地归一的 phase="midway";
+# 修复调用(提示词含"机器校验发现")返回改正后的完整 JSON
+FAKE_CODEX_REPAIR = '''#!/usr/bin/env python3
+import json, pathlib, sys
+args = sys.argv[1:]
+out = args[args.index("--output-last-message") + 1]
+prompt = args[-1]
+counter = pathlib.Path(sys.argv[0]).parent / "invocations.txt"
+count = int(counter.read_text()) if counter.exists() else 0
+counter.write_text(str(count + 1))
+registry_phase = "midway"
+if "机器校验发现" in prompt:
+    registry_phase = "start"
+data = {"episode_title": "妖王之章", "logline": "一句话",
+        "characters": [{"name": "甲", "role": "主角", "gender": "男",
+                        "age_range": "25-30"}],
+        "scenes": [{"scene_no": 1, "location": "古镇",
+                    "characters": ["甲"], "action": "走",
+                    "lines": [{"character": "甲", "dialogue": "你好"}]}],
+        "prop_registry": [{
+            "prop_id": "prop-letter", "name": "血书", "kind": "core",
+            "instance_count": 1,
+            "availability_start_event": {"event_id": "episode-start",
+                                          "phase": registry_phase},
+            "disclosure_policy": "explicit_frame_only"}]}
+with open(out, "w", encoding="utf-8") as f:
+    f.write(json.dumps(data, ensure_ascii=False))
+'''
+
+
+def test_codex_writer_repairs_invalid_enum_in_place(tmp_path):
+    """内容性校验失败 → 同引擎就地修复复检,不丢弃整份剧本换产线。"""
+    codex = _make_bin(tmp_path, "codex", FAKE_CODEX_REPAIR)
+    reply = _bridge("aifos.adapters.claude_script", {
+        "capability": "script",
+        "payload": {"project_title": "万妖图录", "episode_number": 15,
+                    "premise": "", "style": ""},
+        "out_dir": str(tmp_path / "out")},
+        ["--engine", "codex", "--codex", str(codex)])
+    assert reply["ok"], reply
+    assert reply.get("repaired_fields") is True
+    phase = reply["data"]["prop_registry"][0][
+        "availability_start_event"]["phase"]
+    assert phase == "start"
+    # 恰好两次调用:初次生成 + 一次局部修复
+    assert (codex.parent / "invocations.txt").read_text() == "2"
+
+
+def test_codex_writer_alias_phase_needs_no_repair_call(tmp_path):
+    """可本地归一的 phase 别名(开场→start)零成本通过,不触发修复调用。"""
+    content = FAKE_CODEX_REPAIR.replace('"midway"', '"开场"')
+    codex = _make_bin(tmp_path, "codex", content)
+    reply = _bridge("aifos.adapters.claude_script", {
+        "capability": "script",
+        "payload": {"project_title": "万妖图录", "episode_number": 15,
+                    "premise": "", "style": ""},
+        "out_dir": str(tmp_path / "out")},
+        ["--engine", "codex", "--codex", str(codex)])
+    assert reply["ok"], reply
+    assert not reply.get("repaired_fields")
+    assert (codex.parent / "invocations.txt").read_text() == "1"

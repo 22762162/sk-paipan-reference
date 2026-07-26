@@ -1602,27 +1602,11 @@ def _invoke_engine(engine, binary, prompt, timeout, codex_home=""):
     return True, proc.stdout
 
 
-def run(request, claude, timeout, engine="claude", codex="codex",
-        codex_home=""):
-    capability = request["capability"]
-    payload = request.get("payload", {})
-    binary = codex if engine == "codex" else claude
-    if shutil.which(binary) is None and not Path(binary).exists():
-        return {"ok": False, "error": f"{engine} 命令不存在: {binary}"}
-    try:
-        prompt = build_prompt(capability, payload)
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
-    try:
-        ok, text = _invoke_engine(engine, binary, prompt, timeout,
-                                  codex_home=codex_home)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return {"ok": False, "error": f"{engine} 调用失败: {exc}"}
-    if not ok:
-        return {"ok": False, "error": text}
-    data = extract_json(text)
-    if data is None:
-        return {"ok": False, "error": f"{engine} 输出中未找到 JSON 对象"}
+def _postprocess_and_validate(capability, payload, data):
+    """产出后处理(实体清洗/分镜规范化)+ 校验;返回 (data, error)。
+
+    初次生成与就地修复复检共用同一套逻辑,保证两条路径口径一致。
+    """
     if (capability == "script" and isinstance(data, dict)
             and isinstance(data.get("scenes"), list)):
         sanitize_script_entities(data)
@@ -1695,8 +1679,79 @@ def run(request, claude, timeout, engine="claude", codex="codex",
         error = validate_script(data, payload)
     else:
         error = validate_storyboard(data)
+    return data, error
+
+
+# 就地修复调用的耗时上限:只改几个字段,不该给整份重新生成的预算。
+REPAIR_TIMEOUT_CAP = 900
+
+
+def _repair_with_engine(engine, binary, capability, payload, data, error,
+                        timeout, codex_home=""):
+    """校验失败时的就地修复复检:同一引擎只修错误字段,不丢弃产出。
+
+    原则:内容性校验失败(枚举/字段不合规)就地修,只有超时、连不上
+    等系统性故障才交给路由换下一路。返回 (修复后的 data 或 None, 备注)。
+    """
+    try:
+        source = json.dumps(data, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None, "(产出不可序列化,跳过就地修复)"
+    prompt = (
+        "你刚为漫剧平台生成了一份 JSON 产出,机器校验发现以下问题:\n"
+        f"{error}\n\n"
+        "只修复校验指出的字段,其余内容一字不动;修复后输出完整 JSON,"
+        "不要任何解释或 Markdown 代码块。\n原 JSON:\n" + source)
+    repair_timeout = min(int(timeout or 600), REPAIR_TIMEOUT_CAP)
+    try:
+        ok, text = _invoke_engine(engine, binary, prompt, repair_timeout,
+                                  codex_home=codex_home)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"(就地修复调用失败: {exc})"
+    if not ok:
+        return None, f"(就地修复失败: {str(text)[:200]})"
+    fixed = extract_json(text)
+    if fixed is None:
+        return None, "(就地修复输出中未找到 JSON)"
+    fixed, fixed_error = _postprocess_and_validate(capability, payload, fixed)
+    if fixed_error:
+        return None, f"(就地修复复检仍未通过: {str(fixed_error)[:300]})"
+    return fixed, ""
+
+
+def run(request, claude, timeout, engine="claude", codex="codex",
+        codex_home=""):
+    capability = request["capability"]
+    payload = request.get("payload", {})
+    binary = codex if engine == "codex" else claude
+    if shutil.which(binary) is None and not Path(binary).exists():
+        return {"ok": False, "error": f"{engine} 命令不存在: {binary}"}
+    try:
+        prompt = build_prompt(capability, payload)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
+        ok, text = _invoke_engine(engine, binary, prompt, timeout,
+                                  codex_home=codex_home)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": f"{engine} 调用失败: {exc}"}
+    if not ok:
+        return {"ok": False, "error": text}
+    data = extract_json(text)
+    if data is None:
+        return {"ok": False, "error": f"{engine} 输出中未找到 JSON 对象"}
+    data, error = _postprocess_and_validate(capability, payload, data)
     if error:
-        return {"ok": False, "error": f"{engine} 输出校验失败: {error}"}
+        # 产出已在手,只是字段不合规——丢弃整份重来是对已消耗时间的
+        # 浪费;先让同一引擎局部修复并复检,复检仍不过才交回路由换路。
+        fixed, note = _repair_with_engine(
+            engine, binary, capability, payload, data, error, timeout,
+            codex_home=codex_home)
+        if fixed is not None:
+            return {"ok": True, "data": fixed, "uri": "",
+                    "repaired_fields": True}
+        return {"ok": False,
+                "error": f"{engine} 输出校验失败: {error}{note}"}
     return {"ok": True, "data": data, "uri": ""}
 
 

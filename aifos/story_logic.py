@@ -100,6 +100,46 @@ def _valid_prop_id(value) -> bool:
         and not re.search(r"[\s/\\]", text))
 
 
+# phase 枚举的无歧义别名:模型偶发写 begin/opening/开场 等同义词,
+# 语义唯一时本地归一,不值得为几个枚举字段丢弃整份剧本重新生成。
+_PROP_PHASE_ALIASES = {
+    "begin": "start", "beginning": "start", "opening": "start",
+    "open": "start", "first": "start", "intro": "start",
+    "introduce": "start", "introduced": "start", "appear": "start",
+    "appears": "start", "entry": "start", "enter": "start",
+    "起点": "start", "开始": "start", "开场": "start", "首帧": "start",
+    "入场": "start",
+    "finish": "end", "finished": "end", "final": "end", "close": "end",
+    "closing": "end", "last": "end", "exit": "end", "retire": "end",
+    "retired": "end", "leave": "end", "departure": "end",
+    "终点": "end", "结束": "end", "收场": "end", "尾帧": "end",
+    "离场": "end",
+    "hold": "freeze", "held": "freeze", "static": "freeze",
+    "frozen": "freeze", "still": "freeze", "pause": "freeze",
+    "定格": "freeze", "静止": "freeze", "冻结": "freeze",
+}
+# 按字母段切词(scene_start/at-end/startFrame 里的下划线、连字符
+# 都是分隔),再与合法枚举取交集;恰好命中一个才归一。
+_PROP_PHASE_WORD_RE = re.compile(r"[a-z]+")
+
+
+def _normalize_phase(phase):
+    """phase 同义词/复合写法(scene_start、at_end…)归一到合法枚举。
+
+    只在语义无歧义时归一;无法确定的值原样保留,交给校验与就地修复。
+    """
+    phase = _text(phase).lower()
+    if not phase or phase in PROP_FRAME_PHASES:
+        return phase
+    alias = _PROP_PHASE_ALIASES.get(phase)
+    if alias:
+        return alias
+    words = set(_PROP_PHASE_WORD_RE.findall(phase)) & PROP_FRAME_PHASES
+    if len(words) == 1:
+        return words.pop()
+    return phase
+
+
 def _normalize_event_ref(value):
     """Preserve stable event references; a bare shot number is intentionally invalid."""
     if isinstance(value, str):
@@ -113,7 +153,7 @@ def _normalize_event_ref(value):
     normalized = copy.deepcopy(value)
     normalized["event_id"] = event_id
     normalized.pop("unit_id", None)
-    phase = _text(normalized.get("phase")).lower()
+    phase = _normalize_phase(normalized.get("phase"))
     if phase:
         normalized["phase"] = phase
     else:
