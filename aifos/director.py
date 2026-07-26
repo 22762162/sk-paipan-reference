@@ -2144,6 +2144,46 @@ class Director:
         return (f"{prompt}。修改意见(必须落实):{feedback}"
                 if feedback else prompt)
 
+    @staticmethod
+    def _derive_generation_seed(payload):
+        """按资产身份+版本确定性派生 seed;与提示词内容无关。
+
+        seed 只随"是哪张图的第几版"变化,不随提示词措辞变化——这样才能
+        锁 seed 只改提示词做受控对比;重画求变靠 revision 递增换 seed。"""
+        basis = "|".join(str((payload or {}).get(key) or "") for key in (
+            "art_name", "shot_no", "frame_kind", "character_sheet",
+            "candidate_index", "revision"))
+        return int(hashlib.sha256(
+            basis.encode("utf-8")).hexdigest()[:8], 16) % 2147483647
+
+    # 自动生成的修订块以这些段标开头;人工手写意见没有这些标记。
+    _AUTO_FEEDBACK_MARKERS = (
+        "【质检原因】", "【自动优化修订】", "【修订边界】",
+        "【本镜定向修正】", "【保持不变】", "【范围】",
+        "【TEXT ASSET HARD GATE】",
+    )
+
+    @classmethod
+    def _merge_auto_feedback(cls, old_feedback, patch, limit=2400):
+        """新一轮自动修正取代上一轮自动补丁,人工手写意见原样保留。
+
+        旧实现是无差别拼接:上一轮"改成A"和这一轮"改成B"会在尾部同时
+        在场,把互斥指令并存问题又搬回 feedback;硬截断还会把指令拦腰
+        切断。这里先剥掉旧自动块再接新补丁,截断退回句边界。"""
+        old_feedback = str(old_feedback or "").strip()
+        patch = str(patch or "").strip()
+        positions = [old_feedback.find(marker)
+                     for marker in cls._AUTO_FEEDBACK_MARKERS
+                     if marker in old_feedback]
+        human = (old_feedback[:min(positions)] if positions
+                 else old_feedback).strip(" \n；;。")
+        combined = f"{human}\n{patch}" if human and patch else (human or patch)
+        if len(combined) > limit:
+            cut = combined[:limit]
+            boundary = max(cut.rfind(char) for char in "。；;\n")
+            combined = cut[:boundary + 1] if boundary > limit // 2 else cut
+        return combined
+
     @classmethod
     def _sheet_feedback_for_key(cls, feedback, key):
         """Keep retry feedback inside the current sheet's quality contract.
@@ -3296,6 +3336,11 @@ class Director:
         spent = 0.0
         attempt_history = []
         payload = copy.deepcopy(payload or {})
+        # 固定 seed:同一资产同一版本的重画可复现,"锁 seed 只改提示词"
+        # 的受控修图成为可能;revision 递增时 seed 随之改变以支持"求变"。
+        # 仅支持 seed 的产线(Seedream/Ark)会实际使用,其余产线忽略。
+        if payload.get("seed") in (None, ""):
+            payload["seed"] = self._derive_generation_seed(payload)
         if payload.get("character_sheet"):
             payload["feedback"] = self._sheet_feedback_for_key(
                 payload.get("feedback"), payload.get("character_sheet"))
@@ -3335,6 +3380,7 @@ class Director:
                 "prompt_hash": generation_input["prompt_hash"],
                 "reference_hash": generation_input["reference_hash"],
                 "input_hash": generation_input["input_hash"],
+                "seed": payload.get("seed"),
                 "generation_cost": generation_cost,
                 "applied_changes": copy.deepcopy(
                     payload.get("_applied_qc_changes") or []),
@@ -3503,10 +3549,8 @@ class Director:
                     patch = render_patch_text(
                         leftover, patch_data.get("preserve"))
             if patch:
-                old_feedback = str(next_payload.get("feedback") or "").strip()
-                next_payload["feedback"] = (
-                    f"{old_feedback}\n{patch}" if old_feedback else patch
-                )[:2400]
+                next_payload["feedback"] = self._merge_auto_feedback(
+                    next_payload.get("feedback"), patch)
             if ((patch or reference_changes["applied"])
                     and self._use_failed_image_as_revision_base(diagnostics)):
                 references = [uri]

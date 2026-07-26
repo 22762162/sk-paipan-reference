@@ -39,8 +39,14 @@ def sanitize_text_whitelist(values):
     return cleaned
 
 
-def _state_line(states):
+def _state_line(states, baseline=None):
+    """渲染起止状态。baseline 为起点外观时,终点未变的着装收敛为一句引用。
+
+    同一套服装在主体/起点/终点重复写三遍,是段间漂移(同一件官袍两种颜色
+    描述)的直接来源;未变化的外观只保留一个口径,有变化的仍逐项写明,
+    由连续性检查核对是否有对应换装动作。"""
     values = []
+    appearance_keys = ("wardrobe", "headwear", "hair_makeup")
     for name, state in (states or {}).items():
         state = state if isinstance(state, dict) else {}
         details = [
@@ -48,10 +54,21 @@ def _state_line(states):
             _text(state.get("pose")) or "自然状态",
             f"朝向{_text(state.get('direction')) or '按画面'}",
         ]
-        for key, label in (
-                ("wardrobe", "服装"), ("headwear", "头饰"),
-                ("hair_makeup", "妆发"), ("prop", "道具"),
-                ("injury", "伤势"), ("emotion", "情绪")):
+        base = (baseline or {}).get(_text(name)) or {}
+        appearance_unchanged = bool(base) and all(
+            _text(state.get(key)) == _text(base.get(key) or "")
+            for key in appearance_keys)
+        if appearance_unchanged and any(
+                _text(state.get(key)) for key in appearance_keys):
+            details.append("服装、头饰、妆发同起点不变")
+        else:
+            for key, label in (
+                    ("wardrobe", "服装"), ("headwear", "头饰"),
+                    ("hair_makeup", "妆发")):
+                if _text(state.get(key)):
+                    details.append(f"{label}{_text(state[key])}")
+        for key, label in (("prop", "道具"), ("injury", "伤势"),
+                           ("emotion", "情绪")):
             if _text(state.get(key)):
                 details.append(f"{label}{_text(state[key])}")
         values.append(f"{_text(name)}:" + ",".join(details))
@@ -499,7 +516,10 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
         ),
         "camera": _camera(shot),
         "physical": physical,
-        "end": _state_line(shot.get("end_state")) or "到达尾帧状态",
+        "end": _state_line(
+            shot.get("end_state"),
+            baseline=_appearance_map(shot.get("start_state")),
+        ) or "到达尾帧状态",
         "end_appearance": _appearance_map(shot.get("end_state")),
         "appearance_state_required": bool(
             shot.get("appearance_state_required")),
@@ -573,15 +593,28 @@ def render_shot_prompt(contract, *, mode="image"):
         camera_values.append("静态关键帧只定格最终可见机位与构图")
     camera_values.append(f"构图{camera.get('构图')}")
     camera_line = "；".join(value for value in camera_values if value)
+    # 静态关键帧只画一个瞬间。起点和终点等权同发时,"画哪一刻"有歧义,
+    # 质检只能事后用"只定格终点"来补课;这里直接在渲染层declare终点为
+    # 唯一入画状态,起点降为上下文。视频与首/尾单帧仍需要两端等权。
+    static_keyframe = (mode != "video"
+                       and contract.get("frame_kind")
+                       not in {"first_frame", "last_frame"})
+    if static_keyframe:
+        start_line = f"【起点·仅上下文，不入画】{contract['start']}。"
+        end_line = (
+            f"【终点·唯一入画状态】画面只呈现此刻：{contract['end']}。")
+    else:
+        start_line = f"【起点】{contract['start']}。"
+        end_line = f"【终点】{contract['end']}。"
     lines = [
         "【镜头合同v2】只执行下列事实，不自行补剧情。",
         f"【主体】严格共{count}人：{subject}（均为真实人物）。",
         f"【场景】{contract['scene']}。",
-        f"【起点】{contract['start']}。",
+        start_line,
         f"【单一主动作】{contract['action']}。",
         f"【表演】{contract['performance']}。",
         f"【镜头】{camera_line}。",
-        f"【终点】{contract['end']}。",
+        end_line,
     ]
     overlays = contract.get("narrative_overlays") or []
     if overlays:

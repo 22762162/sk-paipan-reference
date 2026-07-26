@@ -821,6 +821,12 @@ class SeedreamImageProvider(OpenAIImageProvider):
             "response_format": "b64_json",
             "watermark": bool(self.conf.get("watermark", False)),
         }
+        # 固定 seed:导演层按资产+版本派生,同版重画可复现、可控修图。
+        if payload.get("seed") not in (None, ""):
+            try:
+                body["seed"] = int(payload["seed"])
+            except (TypeError, ValueError):
+                pass
         if images:
             body["image"] = images
         reply = _request_json(

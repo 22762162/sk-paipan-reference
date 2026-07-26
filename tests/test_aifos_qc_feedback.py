@@ -145,3 +145,38 @@ def test_merge_patch_is_conservative_on_ambiguous_instructions():
         "没有任何段标记的普通提示词", ["机位唯一设为俯拍近景"])
     assert merged == "没有任何段标记的普通提示词"
     assert leftover == ["机位唯一设为俯拍近景"] and superseded == []
+
+
+def test_auto_feedback_supersedes_previous_auto_patch():
+    """重画 feedback:新自动补丁取代旧自动补丁,人工手写意见保留。
+
+    回归背景:旧实现无差别拼接,上一轮"改成A"与这一轮"改成B"会在
+    尾部同时在场;硬截断还会把指令拦腰切断。"""
+    from aifos.director import Director
+
+    old = ("人工备注:官袍颜色再灰一点\n"
+           "【本镜定向修正】机位改为顶拍\n【保持不变】人物身份\n"
+           "【范围】只修改当前镜头")
+    patch = "【本镜定向修正】机位改为侧前方高位俯拍\n【范围】只修改当前镜头"
+    merged = Director._merge_auto_feedback(old, patch)
+    assert "机位改为顶拍" not in merged
+    assert "机位改为侧前方高位俯拍" in merged
+    assert "人工备注:官袍颜色再灰一点" in merged
+    # 截断退回句边界,不把指令拦腰切断
+    long_patch = "【本镜定向修正】" + "修正甲；" * 400
+    truncated = Director._merge_auto_feedback("", long_patch, limit=100)
+    assert len(truncated) <= 100 and truncated.endswith("；")
+
+
+def test_generation_seed_is_stable_per_asset_version():
+    """seed 只随资产身份+版本变化,不随提示词措辞变化。"""
+    from aifos.director import Director
+
+    base = {"shot_no": 7, "revision": 1, "prompt": "版本A提示词"}
+    reworded = {"shot_no": 7, "revision": 1, "prompt": "措辞完全不同的版本B"}
+    assert (Director._derive_generation_seed(base)
+            == Director._derive_generation_seed(reworded))
+    assert (Director._derive_generation_seed(base)
+            != Director._derive_generation_seed(
+                {"shot_no": 7, "revision": 2}))
+    assert 0 <= Director._derive_generation_seed(base) < 2147483647

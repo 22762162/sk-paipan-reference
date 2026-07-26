@@ -343,3 +343,60 @@ def test_prompt_contract_blocks_standing_state_for_lying_action():
     report = validate_shot_prompt_contract(contract)
     assert not report["passed"]
     assert any("仰卧" in issue for issue in report["issues"])
+
+
+def _wake_shot(same_wardrobe=True):
+    wardrobe_end = ("青色低阶文官圆领官袍" if same_wardrobe else "赭色布衣")
+    return {
+        "shot_no": 7, "characters": ["林川"],
+        "start_state": {"林川": {
+            "position": "床榻", "pose": "平躺", "direction": "面部朝上",
+            "wardrobe": "青色低阶文官圆领官袍", "headwear": "网巾",
+            "hair_makeup": "黑色短碎发", "prop": "枕边文书",
+            "emotion": "昏迷转醒"}},
+        "end_state": {"林川": {
+            "position": "床榻", "pose": "坐起", "direction": "低头看官袍",
+            "wardrobe": wardrobe_end, "headwear": "网巾",
+            "hair_makeup": "黑色短碎发", "prop": "枕边文书",
+            "emotion": "错愕惊疑"}},
+        "description": "林川猛然惊醒坐起", "camera": "近景 俯拍",
+    }
+
+
+def test_end_state_dedups_unchanged_appearance_to_single_source():
+    """同一套着装不再在起点/终点各写一遍全量——重复即漂移面。"""
+    from aifos.prompt_contract import (
+        build_shot_prompt_contract, render_shot_prompt)
+
+    contract = build_shot_prompt_contract(_wake_shot(), location="驿舍")
+    assert "服装、头饰、妆发同起点不变" in contract["end"]
+    assert "青色低阶文官圆领官袍" not in contract["end"]
+    # 真实换装必须仍逐项写明,交由连续性检查核对换装动作
+    changed = build_shot_prompt_contract(
+        _wake_shot(same_wardrobe=False), location="驿舍")
+    assert "赭色布衣" in changed["end"]
+    assert "同起点不变" not in changed["end"]
+    # 情绪/道具/姿势不参与收敛
+    rendered = render_shot_prompt(contract, mode="image")
+    assert "情绪错愕惊疑" in rendered
+
+
+def test_static_keyframe_demotes_start_and_promotes_end():
+    """静态关键帧只画一个瞬间:终点是唯一入画状态,起点降为上下文。
+
+    回归背景:起终点等权同发时"画哪一刻"有歧义,质检只能事后用
+    "只定格终点"补课。视频与首/尾单帧仍保持两端等权。"""
+    from aifos.prompt_contract import (
+        build_shot_prompt_contract, render_shot_prompt)
+
+    contract = build_shot_prompt_contract(_wake_shot(), location="驿舍")
+    image = render_shot_prompt(contract, mode="image")
+    assert "【起点·仅上下文，不入画】" in image
+    assert "【终点·唯一入画状态】画面只呈现此刻：" in image
+    video = render_shot_prompt(contract, mode="video")
+    assert "【起点】" in video and "【起点·" not in video
+    assert "【终点】" in video and "【终点·" not in video
+    frame = dict(_wake_shot(), frame_kind="last_frame")
+    frame_prompt = render_shot_prompt(
+        build_shot_prompt_contract(frame, location="驿舍"), mode="image")
+    assert "【单帧修改】" in frame_prompt and "【起点·" not in frame_prompt
