@@ -91,3 +91,57 @@ def test_physical_logic_feedback_preserves_shot_boundary():
     assert result["categories"] == ["physics"]
     assert "电脑/手机屏幕" in result["text"]
     assert "同一空间坐标" in result["text"]
+
+
+def test_merge_patch_supersedes_single_voice_sections():
+    """定向修正必须落进镜头/文字/主动作段并替换旧口径,不得新旧并存。
+
+    回归背景:修正原来只贴在提示词尾部,合同段里的旧"顶拍"和补丁里的
+    "不要再写顶拍"同时发给模型,违反规则治理的唯一优先级原则。"""
+    from aifos.qc_feedback import merge_patch_into_prompt, render_patch_text
+
+    prompt = (
+        "【镜头合同v2】只执行下列事实，不自行补剧情。\n"
+        "【主体】严格共1人：P01=林川（……）（均为真实人物）。\n"
+        "【单一主动作】黑场延续半拍以远处车轮声过渡；林川猛然惊醒坐起。\n"
+        "【物理/空间逻辑】林川平躺于木质床榻；空间调度机位：正面。\n"
+        "【镜头】近景；顶拍；85mm；正面；静态关键帧只定格最终可见机位与构图；构图中心。\n"
+        "【终点】林川:驿舍床榻坐起，情绪错愕惊疑。\n"
+        "【文字】无画面文字、无字幕、无Logo、无水印。\n"
+        "【硬约束】只执行一个主动作和一个运镜。")
+    instructions = [
+        "静态关键帧只定格终点：林川已坐起，一手撑床板，低头看官袍。",
+        "机位唯一设为床榻侧前方高位俯拍的正面偏四分之三近景，85mm；"
+        "不要再写垂直顶拍。",
+        "官府任命文书仅1份，平放床榻旁靠枕一侧地面并由地面自然承托，"
+        "禁止放到人物手中。",
+    ]
+    merged, leftover, superseded = merge_patch_into_prompt(
+        prompt, instructions)
+    # 镜头/主动作整段替换:旧口径消失,新口径成为该段唯一内容
+    assert "顶拍；85mm；正面" not in merged
+    assert "【镜头】机位唯一设为床榻侧前方高位俯拍" in merged
+    assert "黑场延续半拍" not in merged
+    assert "【单一主动作】静态关键帧只定格终点" in merged
+    assert superseded == ["单一主动作", "镜头"]
+    # 多事实段(物理/道具)不整段替换,指令保守留在尾部补丁
+    assert "林川平躺于木质床榻" in merged
+    assert leftover == [instructions[2]]
+    tail = render_patch_text(leftover, ["林川身份"])
+    assert "【本镜定向修正】官府任命文书仅1份" in tail
+    assert "【保持不变】林川身份" in tail
+    assert "【范围】只修改当前镜头" in tail
+
+
+def test_merge_patch_is_conservative_on_ambiguous_instructions():
+    from aifos.qc_feedback import merge_patch_into_prompt
+
+    prompt = "【镜头】近景；顶拍。\n【文字】无画面文字。"
+    # 镜头与文字命中数打平的指令不落段;无段标记的提示词也不落段
+    ambiguous = ["改为俯拍构图，同时删除画面文字和水印"]
+    merged, leftover, superseded = merge_patch_into_prompt(prompt, ambiguous)
+    assert merged == prompt and leftover == ambiguous and superseded == []
+    merged, leftover, superseded = merge_patch_into_prompt(
+        "没有任何段标记的普通提示词", ["机位唯一设为俯拍近景"])
+    assert merged == "没有任何段标记的普通提示词"
+    assert leftover == ["机位唯一设为俯拍近景"] and superseded == []

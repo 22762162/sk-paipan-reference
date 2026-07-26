@@ -50,7 +50,11 @@ from .prompt_contract import (
     shot_local_scene,
     validate_shot_prompt_contract,
 )
-from .qc_feedback import optimize_qc_feedback
+from .qc_feedback import (
+    merge_patch_into_prompt,
+    optimize_qc_feedback,
+    render_patch_text,
+)
 from .lessons import lessons_block, project_lessons, record_lessons
 from .relations import relation_lines, write_relations
 from .spatial_blocking import (
@@ -3476,9 +3480,28 @@ class Director:
             reference_changes = self._apply_image_reference_adjustments(
                 next_payload, qc_spec, diagnostics)
             patch = targeted_prompt_patch(diagnostics)
+            superseded_sections = []
             if qc_spec.get("character_sheet_key"):
                 patch = self._sheet_feedback_for_key(
                     patch, qc_spec.get("character_sheet_key"))
+            else:
+                # 修正落段:镜头/文字/场景/主动作只允许一个口径。能整段替换
+                # 的指令直接改写合同段本体,不再进尾部"修改意见"——模型不会
+                # 同时看到"【镜头】顶拍"与"不要再写顶拍"两版互斥指令。
+                patch_data = (
+                    diagnostics.get("targeted_prompt_patch")
+                    if isinstance(diagnostics, dict) else None) or {}
+                prompt_key = ("prompt_compact"
+                              if next_payload.get("prompt_compact")
+                              else "prompt")
+                merged_prompt, leftover, superseded_sections = (
+                    merge_patch_into_prompt(
+                        next_payload.get(prompt_key),
+                        patch_data.get("instructions")))
+                if superseded_sections:
+                    next_payload[prompt_key] = merged_prompt
+                    patch = render_patch_text(
+                        leftover, patch_data.get("preserve"))
             if patch:
                 old_feedback = str(next_payload.get("feedback") or "").strip()
                 next_payload["feedback"] = (
@@ -3519,6 +3542,7 @@ class Director:
                 "prompt_changed": actual_prompt_changed,
                 "references_changed": actual_references_changed,
                 "prompt_patch": patch,
+                "superseded_sections": superseded_sections,
                 "reference_changes": reference_changes["applied"],
                 "skipped_reference_changes": reference_changes["skipped"],
                 "previous_input_hash": generation_input["input_hash"],

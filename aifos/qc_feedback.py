@@ -114,6 +114,75 @@ def _issue_text(issue):
     return str(issue or "").strip()
 
 
+# ---------------------------------------------------------------------------
+# 定向修正落段:替换而非尾部叠加。
+# 修正只贴在提示词尾部时,合同段里的旧口径仍然在场——模型会同时看到
+# "【镜头】顶拍"和"不要再写顶拍"两版互斥指令,违反规则治理的唯一优先级
+# 原则。对整段语义只有一个口径的段(镜头/文字/场景/单一主动作),修正必须
+# 整段替换;起止状态、主体、物理这类多事实段不能整段替换(会误删未被点名
+# 的事实),相关修正仍走尾部补丁。
+
+_PATCH_SECTION_RULES = (
+    ("镜头", ("机位", "运镜", "景别", "焦段", "顶拍", "俯拍", "仰拍", "平视",
+              "过肩", "大特写", "特写", "近景", "中景", "全景", "远景",
+              "构图", "mm")),
+    ("文字", ("文字", "字幕", "水印", "logo", "朱印", "印章", "空白纸",
+              "字样", "题字", "写字")),
+    ("场景", ("场景", "环境", "陈设", "空间结构", "建筑", "布景")),
+    ("单一主动作", ("主动作", "定格终点", "定格动作")),
+)
+
+
+def merge_patch_into_prompt(prompt, instructions):
+    """把定向修正替换进对应合同段;无法安全落段的指令留给尾部补丁。
+
+    返回 ``(revised_prompt, leftover_instructions, superseded_sections)``。
+    只在指令唯一命中一个段、且该段在合同中恰好出现一行时执行整段替换;
+    其余情况保守回退,行为与旧版尾部补丁完全一致。
+    """
+    lines = str(prompt or "").split("\n")
+    leftover, superseded = [], []
+    for instruction in instructions or []:
+        text = str(instruction or "").strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        scored = sorted(
+            ((sum(1 for token in tokens if token in lowered), section)
+             for section, tokens in _PATCH_SECTION_RULES),
+            reverse=True)
+        target = None
+        if scored and scored[0][0] > 0 and (
+                len(scored) == 1 or scored[0][0] > scored[1][0]):
+            target = scored[0][1]
+        marker = f"【{target}】"
+        positions = ([index for index, line in enumerate(lines)
+                      if line.strip().startswith(marker)]
+                     if target else [])
+        if not target or len(positions) != 1:
+            leftover.append(text)
+            continue
+        lines[positions[0]] = marker + text.rstrip("。；;，, ") + "。"
+        superseded.append(target)
+    return "\n".join(lines), leftover, superseded
+
+
+def render_patch_text(instructions, preserve):
+    """按 targeted_prompt_patch 同一版式渲染落段后剩余的尾部补丁。"""
+    instructions = [str(item).strip() for item in (instructions or [])
+                    if str(item).strip()]
+    preserve = [str(item).strip() for item in (preserve or [])
+                if str(item).strip()]
+    parts = []
+    if instructions:
+        parts.append("【本镜定向修正】" + "；".join(instructions))
+    if preserve:
+        parts.append("【保持不变】" + "、".join(preserve))
+    if parts:
+        parts.append("【范围】只修改当前镜头，不补写整集剧情或其他镜头")
+    return "\n".join(parts)
+
+
 def optimize_qc_feedback(
         issues, *, mode="image", readable_text=None, diagnostics=None):
     """返回原始原因、分类指令及可直接附加到提示词的修订文本。"""
