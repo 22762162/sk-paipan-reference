@@ -3254,9 +3254,13 @@ function planQcReferenceGalleryHtml(item) {
 function planTraceBadges(item) {
   const revision = item.revision || {};
   const refs = item.reference_inputs || {};
+  const review = item.prompt_review || {};
   const semantic = planSemanticCorrections(item);
   const auto = String(revision.source || "").startsWith("batch_");
-  return `${auto && revision.prompt_modified
+  return `${review.approved
+    ? `<span class="plan-st st-auto" title="AIFOS提示词已由Codex审核并优化，优化稿才会进入图片模型">Codex审词✓</span>`
+    : ""}
+    ${auto && revision.prompt_modified
     ? `<span class="plan-st st-auto" title="批量重画已自动加入修正要求">自动改词✓</span>` : ""}
     ${semantic.length
       ? `<span class="plan-st st-auto" title="出图前已按当前镜头剧本事实纠正互斥状态">逻辑修正 ×${semantic.length}</span>`
@@ -3270,13 +3274,17 @@ function planTraceBadges(item) {
 function planTraceHtml(item) {
   const revision = item.revision || {};
   const refs = item.reference_inputs || {};
+  const review = item.prompt_review || {};
   const refItems = refs.items || [];
   const semantic = planSemanticCorrections(item);
   if (!revision.prompt_modified && !refItems.length && !refs.required
-      && !semantic.length) return "";
+      && !semantic.length && !review.approved) return "";
   return `<details class="plan-trace" ${item.status === "generating" ? "open" : ""}>
-    <summary>生成输入记录 · ${semantic.length ? `出图前逻辑修正 ${semantic.length} 项` : (revision.prompt_modified ? "提示词已自动修正" : "提示词未改")}
+    <summary>生成输入记录 · ${review.approved ? "Codex审词通过" : (semantic.length ? `出图前逻辑修正 ${semantic.length} 项` : (revision.prompt_modified ? "提示词已自动修正" : "提示词未改"))}
       · ${refItems.length ? `已附 ${refItems.length} 张参考图` : (refs.required ? "缺少必需参考图" : "无需参考图")}</summary>
+    ${review.approved ? `<div><b>Codex提示词审核：</b>已批准并使用优化稿
+      ${(review.issues_found || []).length ? `；发现：${esc(review.issues_found.join("；"))}` : ""}
+      ${(review.changes_made || []).length ? `；修改：${esc(review.changes_made.join("；"))}` : ""}</div>` : ""}
     ${semantic.length ? `<div><b>出图前剧本/逻辑纠正：</b><ul>${semantic.map((entry) =>
       `<li>${entry.character ? `${esc(entry.character)} · ` : ""}${esc(entry.field || "镜头事实")}：
       ${entry.from ? `原「${esc(entry.from)}」 → ` : ""}改为「${esc(entry.to || "按当前镜头事实执行")}」

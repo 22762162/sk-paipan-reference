@@ -5,6 +5,9 @@
 - 全部不可用 → ProviderUnavailable。
 """
 
+import hashlib
+import json
+import re
 import threading
 
 from ..errors import ProviderError, ProviderUnavailable
@@ -35,6 +38,7 @@ class ProviderRouter:
     IMAGE_CAPABILITIES = {"image", "frames", "cover"}
     IMAGE_TASK_CLASSES = {"batch", "important", "final", "complex_text"}
     API_IMAGE_TYPES = {"image_api", "seedream_image"}
+    PROMPT_REVIEW_SCHEMA = "aifos.codex-prompt-review/v1"
 
     def __init__(self, config, db, logger):
         self.config = config
@@ -213,8 +217,248 @@ class ProviderRouter:
         return {"provider": provider_name, "model": model,
                 "capability": capability}
 
+    @staticmethod
+    def _stable_hash(value):
+        raw = json.dumps(
+            value, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), default=str).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+
+    @staticmethod
+    def _prompt_with_feedback(prompt, feedback):
+        prompt = str(prompt or "").strip()
+        feedback = str(feedback or "").strip()
+        return (
+            f"{prompt}。修改意见(必须落实):{feedback}"
+            if feedback else prompt)
+
+    def _real_image_provider_available(self, capability, payload):
+        """是否存在能执行当前图片任务的真实 Provider。
+
+        纯 mock 离线占位不消耗真实图片额度，也不冒充正式产物；只有真实
+        图片会进入 Codex 提示词审核硬门禁。
+        """
+        for name in self._routing_chain(capability, payload):
+            if name == "mock":
+                continue
+            provider = self.providers.get(name)
+            if provider is None:
+                continue
+            ok, _reason = provider.available(capability)
+            if ok:
+                return True
+        return False
+
+    @staticmethod
+    def _prompt_review_context(capability, payload):
+        """只给 Codex 当前图片所需事实，避免整集背景反向污染提示词。"""
+        keys = (
+            "title", "episode", "tagline",
+            "art_name", "role", "shot_no", "scene_no", "frame_kind",
+            "character_sheet", "sheet_label", "characters",
+            "character_count", "functional_figures", "location", "action",
+            "camera", "start_state", "end_state", "readable_text",
+            "composition_contract", "prompt_contract",
+            "reference_manifest", "identity_references",
+            "character_background", "story_world", "story_background",
+            "style", "aspect",
+        )
+        return {
+            "capability": capability,
+            **{
+                key: payload.get(key) for key in keys
+                if payload.get(key) not in (None, "", [], {})
+            },
+        }
+
+    @staticmethod
+    def _prompt_review_required_tokens(source, payload):
+        tokens = []
+        tokens.extend(
+            str(name).strip() for name in payload.get("characters") or []
+            if str(name).strip())
+        for value in (
+                payload.get("title"), payload.get("art_name"),
+                payload.get("location")):
+            value = str(value or "").strip()
+            if value:
+                tokens.append(value)
+        readable = payload.get("readable_text") or {}
+        tokens.extend(
+            str(value).strip() for value in readable.get("whitelist") or []
+            if str(value).strip())
+        # 服装/头饰是最容易被“优化”误删的镜头事实；若已有明确状态，
+        # 优化稿必须继续逐字携带。结构标题和版本号属于审计元数据，可由
+        # Codex去掉，真正的参考图职责仍由独立reference_manifest传输。
+        for states in (
+                payload.get("start_state"), payload.get("end_state")):
+            if not isinstance(states, dict):
+                continue
+            for state in states.values():
+                if not isinstance(state, dict):
+                    continue
+                for key in ("wardrobe", "headwear", "hair_makeup"):
+                    value = state.get(key)
+                    if isinstance(value, str) and value.strip():
+                        tokens.append(value.strip())
+        return list(dict.fromkeys(token for token in tokens if token))
+
+    @staticmethod
+    def _prompt_review_count_preserved(optimized, payload):
+        count = payload.get("character_count")
+        if type(count) is not int or count < 0:
+            return True
+        functional = sum(
+            item.get("count", 0)
+            for item in payload.get("functional_figures") or []
+            if isinstance(item, dict)
+            and type(item.get("count")) is int
+            and item.get("count") > 0)
+        expected = count + functional
+        if expected == 0:
+            return "无人" in optimized or bool(re.search(r"0\s*人", optimized))
+        if expected == 1 and any(
+                token in optimized for token in (
+                    "单人", "一人", "一名人物", "一个人")):
+            return True
+        return bool(re.search(
+            rf"(?<!\d){expected}\s*(?:人|名人物|个人)(?!\d)", optimized))
+
+    def review_image_prompt(self, capability, payload, out_dir, cancel=None):
+        """用 Codex 审核并优化真实出图前的最终提示词，原地冻结优化稿。
+
+        返回本次 Codex ProviderResult；若同一输入已经审核则返回 None。
+        任何审核失败、事实丢失或结构损坏都失败关闭，不能继续生图。
+        """
+        if capability not in self.IMAGE_CAPABILITIES:
+            return None
+        source = self._prompt_with_feedback(
+            payload.get("prompt_compact") or payload.get("prompt") or "",
+            payload.get("feedback"))
+        if not source:
+            # 兼容仅测试Provider路由/额度的历史低层调用；正式AIFOS任务在
+            # dispatch contract处仍会因“最终提示词为空”失败关闭。
+            payload["prompt_review"] = {
+                "schema": self.PROMPT_REVIEW_SCHEMA,
+                "approved": False,
+                "status": "not_applicable_legacy_empty_prompt",
+                "blocking_reason": "低层兼容调用未提供AIFOS生图提示词",
+            }
+            return None
+        context = self._prompt_review_context(capability, payload)
+        input_hash = self._stable_hash({
+            "prompt": source,
+            "context": context,
+            "schema": self.PROMPT_REVIEW_SCHEMA,
+        })
+        audit = payload.get("prompt_review") or {}
+        if (audit.get("approved") is True
+                and audit.get("reviewed_input_hash") == input_hash
+                and str(payload.get("prompt_compact")
+                        or payload.get("prompt") or "").strip()):
+            return None
+        if not self._real_image_provider_available(capability, payload):
+            payload["prompt_review"] = {
+                "schema": self.PROMPT_REVIEW_SCHEMA,
+                "approved": False,
+                "status": "not_applicable_mock_only",
+                "input_hash": input_hash,
+                "original_prompt": source,
+                "optimized_prompt": source,
+                "issues_found": [],
+                "changes_made": [],
+                "blocking_reason": (
+                    "当前只有mock离线占位产线；该产物不属于正式图片"),
+            }
+            return None
+        provider = self.providers.get("codex")
+        if provider is None:
+            raise ProviderUnavailable(
+                "真实图片已被阻止：未配置Codex提示词审核产线")
+        ok, reason = provider.available("prompt_review")
+        if not ok:
+            raise ProviderUnavailable(
+                "真实图片已被阻止：Codex提示词审核不可用：" + reason)
+        review_payload = {
+            "review_schema": self.PROMPT_REVIEW_SCHEMA,
+            "review_prompt": source,
+            "review_context": context,
+        }
+        profile_id = str(
+            payload.get("_prompt_review_profile")
+            or payload.get("_codex_profile") or "").strip()
+        if profile_id:
+            review_payload["_codex_profile"] = profile_id
+        slots = self._codex_profile_slots.get(profile_id)
+        if slots is None:
+            result = provider.generate(
+                "prompt_review", review_payload, out_dir, cancel=cancel)
+        else:
+            with slots:
+                result = provider.generate(
+                    "prompt_review", review_payload, out_dir, cancel=cancel)
+        data = result.data or {}
+        if data.get("schema") != self.PROMPT_REVIEW_SCHEMA:
+            raise ProviderError(
+                "Codex提示词审核返回schema不匹配："
+                + str(data.get("schema") or "缺失"))
+        if data.get("approved") is not True:
+            reason = str(
+                data.get("blocking_reason")
+                or "Codex未批准该提示词进入图片生成")
+            raise ProviderError("真实图片已被阻止：" + reason)
+        optimized = str(data.get("optimized_prompt") or "").strip()
+        if not optimized:
+            raise ProviderError("Codex提示词审核通过但优化稿为空")
+        if "```" in optimized:
+            raise ProviderError("Codex优化稿含Markdown代码围栏，拒绝生图")
+        missing = [
+            token for token in self._prompt_review_required_tokens(
+                source, payload)
+            if token not in optimized
+        ]
+        if not self._prompt_review_count_preserved(optimized, payload):
+            missing.append("人物总数")
+        if missing:
+            raise ProviderError(
+                "Codex优化稿删除了不可变事实，拒绝生图："
+                + "、".join(missing[:20]))
+        audit_record = {
+            "schema": self.PROMPT_REVIEW_SCHEMA,
+            "approved": True,
+            "status": "approved",
+            "provider": result.provider,
+            "model": result.model or "Codex 提示词审核优化",
+            "input_hash": input_hash,
+            "original_prompt": source,
+            "optimized_prompt": optimized,
+            "optimized_hash": self._stable_hash(optimized),
+            "issues_found": list(data.get("issues_found") or []),
+            "changes_made": list(data.get("changes_made") or []),
+            "blocking_reason": "",
+        }
+        payload.setdefault("prompt_aifos_original", source)
+        payload["prompt"] = optimized
+        if "prompt_compact" in payload:
+            payload["prompt_compact"] = optimized
+        if payload.get("feedback"):
+            payload["prompt_review_feedback_applied"] = payload["feedback"]
+            payload["feedback"] = ""
+        audit_record["reviewed_input_hash"] = self._stable_hash({
+            "prompt": optimized,
+            "context": context,
+            "schema": self.PROMPT_REVIEW_SCHEMA,
+        })
+        payload["prompt_review"] = audit_record
+        payload["prompt_review_schema"] = self.PROMPT_REVIEW_SCHEMA
+        return result
+
     # ---- 调用 ----
     def call(self, capability, payload, out_dir, cancel=None):
+        prompt_review_result = None
+        if capability in self.IMAGE_CAPABILITIES:
+            prompt_review_result = self.review_image_prompt(
+                capability, payload, out_dir, cancel=cancel)
         strict_provider = str(payload.get("strict_provider") or "").strip()
         required_provider = str(
             payload.get("required_provider") or "").strip()
@@ -318,6 +562,18 @@ class ProviderRouter:
                     "产出为示意内容而非真实 AI 生成;原因: "
                     + ";".join(f"{f['provider']}({f['reason']})"
                                for f in fallbacks))
+            if prompt_review_result is not None:
+                result.cost += float(prompt_review_result.cost or 0.0)
+            if not isinstance(result.data, dict):
+                result.data = {}
+            result.data.setdefault(
+                "prompt_review", payload.get("prompt_review") or {})
+            result.data.setdefault(
+                "prompt_aifos_original",
+                payload.get("prompt_aifos_original") or "")
+            result.data.setdefault(
+                "prompt_optimized",
+                payload.get("prompt_compact") or payload.get("prompt") or "")
             return result
         raise ProviderUnavailable(
             f"能力 {capability} 没有可用 Provider(链: {chain})")

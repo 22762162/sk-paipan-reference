@@ -1,7 +1,9 @@
-"""Claude 编剧适配桥:剧本 / 分镜由 Claude CLI 实际生成。
+"""Claude / Codex 编剧适配桥:剧本 / 分镜由真实编剧 CLI 生成。
 
-把 AIFOS 通用 CLI Provider 协议转换为 `claude -p` 非交互调用,
-要求 Claude 输出严格 JSON,解析并校验后回传平台。
+把 AIFOS 通用 CLI Provider 协议转换为非交互调用,要求模型输出严格
+JSON,解析并校验后回传平台。默认引擎是 `claude -p`;`--engine codex`
+切换为 `codex exec`(只读沙箱),供 Claude CLI 不可用时兜底编剧,
+两个引擎共用同一套提示词、校验器和分镜规范化逻辑。
 
 配置示例(workspace/config.json):
   "claude": {
@@ -9,13 +11,20 @@
     "command": ["python3", "-m", "aifos.adapters.claude_script",
                 "--claude", "claude"]
   }
+  "codex_writer": {
+    "enabled": true,
+    "command": ["python3", "-m", "aifos.adapters.claude_script",
+                "--engine", "codex", "--codex", "codex"]
+  }
 """
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from ..generation_diagnostics import normalize_generation_diagnostics
@@ -1534,30 +1543,71 @@ def build_prompt(capability, payload):
     raise ValueError(f"claude 编剧不支持能力: {capability}")
 
 
-def run(request, claude, timeout):
+# codex exec 作为备选编剧引擎:只读沙箱(编剧只产 JSON 文本,不需要
+# 写文件权限)、不落会话文件、无彩色控制符;最终答复经
+# --output-last-message 落盘,避免从进度日志里抠 JSON。
+CODEX_WRITER_ARGS = ("exec", "--sandbox", "read-only",
+                     "--skip-git-repo-check", "--ephemeral",
+                     "--color", "never")
+
+
+def _invoke_engine(engine, binary, prompt, timeout):
+    """调用编剧引擎,返回 (ok, 文本或错误信息)。"""
+    if engine == "codex":
+        fd, last = tempfile.mkstemp(prefix="aifos-codex-writer-",
+                                    suffix=".txt")
+        os.close(fd)
+        try:
+            proc = subprocess.run(
+                [binary, *CODEX_WRITER_ARGS,
+                 "--output-last-message", last, prompt],
+                capture_output=True, text=True, timeout=timeout)
+            if proc.returncode != 0:
+                detail = (proc.stderr.strip()
+                          or proc.stdout.strip())[-300:]
+                return False, f"codex 编剧退出码 {proc.returncode}: {detail}"
+            try:
+                text = Path(last).read_text(encoding="utf-8")
+            except OSError:
+                text = ""
+            # 最终答复文件为空的边角情况仍回退解析 stdout
+            # (extract_json 能容忍进度杂讯)。
+            return True, text.strip() or proc.stdout
+        finally:
+            try:
+                os.unlink(last)
+            except OSError:
+                pass
+    proc = subprocess.run(
+        [binary, "-p", prompt], capture_output=True, text=True,
+        timeout=timeout)
+    if proc.returncode != 0:
+        # claude CLI 的登录/鉴权错误(如 Not logged in)只写 stdout,
+        # stderr 为空;两路都带上,避免日志里只剩"退出码 1:"无法定位。
+        detail = proc.stderr.strip() or proc.stdout.strip()
+        return False, f"claude 退出码 {proc.returncode}: {detail[:300]}"
+    return True, proc.stdout
+
+
+def run(request, claude, timeout, engine="claude", codex="codex"):
     capability = request["capability"]
     payload = request.get("payload", {})
-    if shutil.which(claude) is None and not Path(claude).exists():
-        return {"ok": False, "error": f"claude 命令不存在: {claude}"}
+    binary = codex if engine == "codex" else claude
+    if shutil.which(binary) is None and not Path(binary).exists():
+        return {"ok": False, "error": f"{engine} 命令不存在: {binary}"}
     try:
         prompt = build_prompt(capability, payload)
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     try:
-        proc = subprocess.run(
-            [claude, "-p", prompt], capture_output=True, text=True,
-            timeout=timeout)
+        ok, text = _invoke_engine(engine, binary, prompt, timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return {"ok": False, "error": f"claude 调用失败: {exc}"}
-    if proc.returncode != 0:
-        # claude CLI 的登录/鉴权错误(如 Not logged in)只写 stdout,
-        # stderr 为空;两路都带上,避免日志里只剩"退出码 1:"无法定位。
-        detail = proc.stderr.strip() or proc.stdout.strip()
-        return {"ok": False,
-                "error": f"claude 退出码 {proc.returncode}: {detail[:300]}"}
-    data = extract_json(proc.stdout)
+        return {"ok": False, "error": f"{engine} 调用失败: {exc}"}
+    if not ok:
+        return {"ok": False, "error": text}
+    data = extract_json(text)
     if data is None:
-        return {"ok": False, "error": "claude 输出中未找到 JSON 对象"}
+        return {"ok": False, "error": f"{engine} 输出中未找到 JSON 对象"}
     if (capability == "script" and isinstance(data, dict)
             and isinstance(data.get("scenes"), list)):
         sanitize_script_entities(data)
@@ -1630,19 +1680,25 @@ def run(request, claude, timeout):
     else:
         error = validate_storyboard(data)
     if error:
-        return {"ok": False, "error": f"claude 输出校验失败: {error}"}
+        return {"ok": False, "error": f"{engine} 输出校验失败: {error}"}
     return {"ok": True, "data": data, "uri": ""}
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="AIFOS Claude 编剧适配桥")
+    parser = argparse.ArgumentParser(description="AIFOS Claude/Codex 编剧适配桥")
     parser.add_argument("--claude", default="claude",
                         help="claude 可执行文件路径")
+    parser.add_argument("--engine", choices=("claude", "codex"),
+                        default="claude",
+                        help="编剧引擎;codex 供 Claude CLI 不可用时兜底")
+    parser.add_argument("--codex", default="codex",
+                        help="codex 可执行文件路径(--engine codex 时用)")
     parser.add_argument("--timeout", type=int, default=600)
     args = parser.parse_args(argv)
     try:
         request = json.loads(sys.stdin.read())
-        reply = run(request, args.claude, args.timeout)
+        reply = run(request, args.claude, args.timeout,
+                    engine=args.engine, codex=args.codex)
     except Exception as exc:
         reply = {"ok": False, "error": str(exc)}
     print(json.dumps(reply, ensure_ascii=False))

@@ -20,6 +20,14 @@ class OpsCenter:
             "title": script["project_title"],
             "episode": script["episode_number"],
             "tagline": script.get("logline", ""),
+            "prompt": (
+                f"短视频竖版封面：《{script['project_title']}》"
+                f"第{script['episode_number']}集；"
+                f"本集主题：{script.get('logline', '') or '按本集剧情冲突表现'}；"
+                "构图有明确视觉中心和标题安全区，人物身份严格服从最终立绘，"
+                "不得新增人物、字幕、Logo、水印或乱码"
+            ),
+            "prompt_contract_complete": True,
             "image_task_class": "final",
             "image_quality": "high",
             "characters": [ref.get("character") for ref in
