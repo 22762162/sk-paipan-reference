@@ -26,6 +26,7 @@ from ..adapters.codex_image import _style_line as _api_style_line
 from ..adapters.codex_image import _space_line as _api_space_line
 from ..adapters.claude_script import (build_prompt, extract_json,
                                       validate_script, validate_storyboard)
+from ..script_import import sanitize_script_entities
 from ..errors import ProviderError
 from .base import Provider, ProviderResult
 
@@ -359,6 +360,9 @@ class ClaudeApiProvider(Provider):
         data = extract_json(text)
         if data is None:
             raise ProviderError(f"{self.name} 应答中未找到 JSON 对象")
+        if (capability == "script" and isinstance(data, dict)
+                and isinstance(data.get("scenes"), list)):
+            sanitize_script_entities(data)
         try:
             if capability == "image_qc":
                 from ..adapters.claude_script import validate_image_qc

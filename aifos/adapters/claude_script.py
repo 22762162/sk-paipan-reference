@@ -22,6 +22,7 @@ from ..generation_diagnostics import normalize_generation_diagnostics
 from ..inner_persona import normalize_inner_persona_policy
 from ..story_logic import normalize_script_logic
 from ..story_analysis import STORY_ANALYSIS_SCHEMA, validate_story_analysis
+from ..script_import import sanitize_script_entities
 
 SCRIPT_PROMPT = """你是兼具顶级类型片编剧、影视导演、场面调度和连续性经验的漫剧主创。
 为作品《{title}》第{episode}集创作一集完整、能实际拍摄和生成的剧本。
@@ -1239,6 +1240,9 @@ def run(request, claude, timeout):
     data = extract_json(proc.stdout)
     if data is None:
         return {"ok": False, "error": "claude 输出中未找到 JSON 对象"}
+    if (capability == "script" and isinstance(data, dict)
+            and isinstance(data.get("scenes"), list)):
+        sanitize_script_entities(data)
     if capability == "image_qc":
         error = validate_image_qc(data)
     elif capability == "script" and payload.get("story_analysis"):

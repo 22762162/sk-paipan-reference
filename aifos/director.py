@@ -69,6 +69,7 @@ from .story_analysis import (
     validate_line_speaker_resolution,
     validate_story_analysis,
 )
+from .script_import import sanitize_script_entities
 from .workflow import (
     PIPELINE_VERSION,
     build_content_review,
@@ -4431,6 +4432,9 @@ class Director:
         """为人工导入/旧版剧本补齐人物背景与剧情圣经,不覆盖已有设定。"""
         if not isinstance(script, dict):
             return script
+        # Markdown 的“旁白/音效/字幕/优势”等控制标签必须先移出人物表，
+        # 否则通用人物档案补全会把解析噪声永久固化成配角。
+        sanitize_script_entities(script)
         scenes = script.get("scenes") or []
         locations = {}
         for scene in scenes:
