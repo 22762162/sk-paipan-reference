@@ -8683,7 +8683,8 @@ async function pollJob(jobId, onDone, onProgress) {
     try {
       const job = await api(`/api/jobs/${jobId}`);
       if (onProgress) onProgress(job);
-      if (job.status !== "running") {
+      // queued 是"还没轮到",不是终态;当成终态会把排队误报成失败。
+      if (job.status !== "running" && job.status !== "queued") {
         finished = true;
         if (timer) clearInterval(timer);
         if (job.status === "failed") showToast(job.error || "任务失败", "error");
@@ -8970,6 +8971,10 @@ function bindRegen(container, episodeId, getData, onDone) {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ episode_id: episodeId, target, feedback, quality }),
         });
+        if (reply.status === "queued") {
+          showToast(`已排入重画队列,前面还有${reply.queue_position || 1}张;`
+            + "不用等,可以继续提交其他图片", "ok");
+        }
         pollJob(reply.job_id, (job) => {
           if (job.status === "done") {
             showToast("已重画完成", "ok");
@@ -8977,6 +8982,12 @@ function bindRegen(container, episodeId, getData, onDone) {
           } else {
             showToast("重画失败:" + (job.error || "未知错误"), "error");
             btn.disabled = false; btn.textContent = "重画";
+          }
+        }, (job) => {
+          if (job.status === "queued") {
+            btn.textContent = `排队中(${job.queue_position || 1})…`;
+          } else if (job.status === "running") {
+            btn.textContent = "重画中…";
           }
         });
       } catch (e) {
@@ -9111,6 +9122,12 @@ function bindShotInlineRevisions(root, data) {
             quality: form.querySelector(".shot-revision-quality").value,
           }),
         });
+        if (reply.status === "queued") {
+          const ahead = reply.queue_position || 1;
+          go.textContent = `排队中(前面还有${ahead}张)…`;
+          showToast(`已排入重画队列,前面还有${ahead}张;`
+            + "不用等,可以继续给其他图片写意见并提交", "ok");
+        }
         pollJob(reply.job_id, (job) => {
           if (job.status === "done") {
             const sync = (job.summary || {}).sync || {};
@@ -9127,6 +9144,14 @@ function bindShotInlineRevisions(root, data) {
           } else {
             showToast("修改失败：" + (job.error || "未知错误"), "error");
             go.disabled = false; go.textContent = original;
+          }
+        }, (job) => {
+          // 队列前进时同步按钮文案,避免一直停在“排队中”看不出进度
+          if (job.status === "queued") {
+            const ahead = job.queue_position || 1;
+            go.textContent = `排队中(前面还有${ahead}张)…`;
+          } else if (job.status === "running") {
+            go.textContent = "正在重画并同步…";
           }
         });
       } catch (error) {
@@ -11187,7 +11212,9 @@ function planSelectQcFailed() {
 
 async function ensureBatchRevisionCheckpoint(episodeId) {
   const current = await api(`/api/episode/${episodeId}`);
-  if (!current.production_progress?.overall?.running) return current;
+  // 只有整集生产才需要先暂停。别的单张图正在重画不该触发暂停——
+  // 那会把人家正在跑的重画直接打断,而且这一张也没必要等。
+  if (!current.production_progress?.overall?.production_running) return current;
   try {
     await api("/api/stop", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -11429,6 +11456,10 @@ function bindPlanRegen(container, episodeId, onDone) {
           body: JSON.stringify({ episode_id: episodeId, target,
                                  feedback, prompt, quality }),
         });
+        if (reply.status === "queued") {
+          showToast(`已排入重画队列,前面还有${reply.queue_position || 1}张;`
+            + "不用等,可以继续给其他图片写意见并提交", "ok");
+        }
         pollJob(reply.job_id, (job) => {
           if (job.status === "done") {
             showToast("这张图已按新提示词重画完成", "ok");
@@ -11437,6 +11468,12 @@ function bindPlanRegen(container, episodeId, onDone) {
             showToast(job.error || "重画失败", "error");
             btn.disabled = false;
             btn.textContent = "按上面的提示词重画这张";
+          }
+        }, (job) => {
+          if (job.status === "queued") {
+            btn.textContent = `排队中(前面还有${job.queue_position || 1}张)…`;
+          } else if (job.status === "running") {
+            btn.textContent = "已提交,重画中…";
           }
         });
       } catch (e) {

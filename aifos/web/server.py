@@ -130,12 +130,27 @@ def access_payload(bound_host, port, workspace=None):
     }
 
 
+# 整集生产:并行 worker 正在改整份 render_plan,此时改单张镜头不安全,
+# 必须让用户显式暂停。其余单点任务(单图重画、单图质检)不属于这一类——
+# 它们只该互相排队,不该互相拒绝,更不该互相打断。
+PRODUCTION_ACTIONS = frozenset({
+    "produce", "force_rebuild", "script_import", "series_next",
+    "confirm_script", "image_acceleration_resume",
+})
+
+
 class JobRegistry:
     """produce 后台任务:制作可能耗时(真实产线更久),Web 端异步执行。"""
+
+    PRODUCTION_ACTIONS = PRODUCTION_ACTIONS
 
     def __init__(self, workspace):
         self.workspace = workspace
         self._jobs = {}
+        # 单集串行队列:同一集的单点任务共享 render_plan.json 和相邻镜头
+        # 边界,不能并行;但也不该互相拒绝——否则用户改完一张必须盯着等它
+        # 跑完才能提交下一张。按提交顺序排队,逐个执行。
+        self._queues = {}
         self._lock = threading.Lock()
         self._seq = 0
         app = App(self.workspace)
@@ -195,7 +210,7 @@ class JobRegistry:
         return job_id
 
     def start_task(self, title, number, task, action="adjustment",
-                   request=None, tracked=False, unique=False):
+                   request=None, tracked=False, unique=False, queue=False):
         """通用后台任务(打磨重写/重画)。
 
         普通任务签名为 ``task(app, run_id)``；tracked=True 时额外传入
@@ -215,8 +230,8 @@ class JobRegistry:
             self._seq += 1
             job_id = f"j{self._seq}"
             self._jobs[job_id] = {
-                "id": job_id, "status": "running",
-                "title": title, "episode": number,
+                "id": job_id, "status": "queued" if queue else "running",
+                "title": title, "episode": number, "action": action,
                 "started_at": time.time(), "run_id": run_id,
             }
         def report(**fields):
@@ -306,8 +321,69 @@ class JobRegistry:
                                 error[:1000], ts, ts,
                             ))
 
-        self._run(job_id, accounted_runner)
+        if queue:
+            self._submit_serial(job_id, title, number, accounted_runner)
+        else:
+            self._run(job_id, accounted_runner)
         return job_id
+
+    def _episode_busy(self, title, number):
+        """调用方须持锁。本集是否已有任务在跑。"""
+        return any(
+            job["status"] == "running" and job["title"] == title
+            and int(job["episode"]) == int(number)
+            for job in self._jobs.values())
+
+    def _renumber_queue(self, key):
+        """调用方须持锁。刷新排队位次,界面据此显示"前面还有几张"。"""
+        for index, (queued_id, _) in enumerate(self._queues.get(key) or []):
+            job = self._jobs.get(queued_id)
+            if job is not None:
+                job["queue_position"] = index + 1
+
+    def _submit_serial(self, job_id, title, number, runner):
+        """本集空闲就立刻跑,否则排队,等前一个任务结束后自动接上。"""
+        key = (title, int(number))
+        with self._lock:
+            if self._episode_busy(title, number):
+                self._queues.setdefault(key, []).append((job_id, runner))
+                self._jobs[job_id]["status"] = "queued"
+                self._renumber_queue(key)
+                return
+            self._jobs[job_id]["status"] = "running"
+            self._jobs[job_id]["started_at"] = time.time()
+        self._run(job_id, runner)
+
+    def _drain_serial(self, title, number):
+        """前一个任务结束后启动队首;已失效的条目顺延跳过。"""
+        key = (title, int(number))
+        while True:
+            with self._lock:
+                pending = self._queues.get(key)
+                if not pending:
+                    self._queues.pop(key, None)
+                    return
+                if self._episode_busy(title, number):
+                    return
+                job_id, runner = pending.pop(0)
+                if not pending:
+                    self._queues.pop(key, None)
+                self._renumber_queue(key)
+                job = self._jobs.get(job_id)
+                if job is None:
+                    continue
+                job["status"] = "running"
+                job["started_at"] = time.time()
+                job.pop("queue_position", None)
+            self._run(job_id, runner)
+            return
+
+    def queued_for(self, title, number):
+        with self._lock:
+            return [self._jobs[queued_id]
+                    for queued_id, _ in (
+                        self._queues.get((title, int(number))) or [])
+                    if queued_id in self._jobs]
 
     def _run(self, job_id, task):
         def run():
@@ -340,6 +416,13 @@ class JobRegistry:
                     self._jobs[job_id]["run_id"], error=str(exc))
             finally:
                 app.close()
+                # 无论成败都要放行队首,否则一次失败就把整条队列卡死。
+                job = self._jobs.get(job_id) or {}
+                if job.get("title") is not None:
+                    try:
+                        self._drain_serial(job["title"], job["episode"])
+                    except Exception:
+                        pass
             if follow_up and not follow_up.get("done"):
                 try:
                     next_job = self.start_series_step(follow_up)
@@ -376,6 +459,11 @@ class JobRegistry:
     def list(self):
         return sorted(self._jobs.values(),
                       key=lambda j: j["started_at"], reverse=True)
+
+    def production_running_for(self, title, number):
+        """只统计整集生产类任务;单图重画/质检不算"本集正在生产"。"""
+        return [job for job in self.running_for(title, number)
+                if str(job.get("action") or "") in self.PRODUCTION_ACTIONS]
 
     def running_for(self, title, number):
         with self._lock:
@@ -890,6 +978,12 @@ def _production_progress(app, episode, render_plan):
         "AND status IN ('running', 'cancelling') "
         "ORDER BY id DESC LIMIT 1", (episode_id,))
     live_run = running_task is not None or running_run is not None
+    # 「整集生产中」与「有任务在跑」必须分开:单张重画也会建一条 run,
+    # 若混为一谈,提交第二张时前端会以为在生产而先发暂停,把第一张正在
+    # 重画的任务直接打断。
+    production_running = (
+        running_run is not None
+        and str(running_run["action"] or "") in PRODUCTION_ACTIONS)
     status_keys = (
         "done", "reused", "pending", "generating", "retrying",
         "awaiting_human", "failed",
@@ -1196,6 +1290,7 @@ def _production_progress(app, episode, render_plan):
         video_active = min(video_limit, missing_videos)
     overall.update({
         "running": live_run,
+        "production_running": production_running,
         "current_stage": current_stage,
         "current_stage_label": current_stage_label,
         "parallelism": {
@@ -3164,7 +3259,10 @@ def make_handler(workspace, jobs):
             if found is None:
                 return self._error(404, "剧集不存在")
             title, number = found
-            if jobs.running_for(title, number):
+            # 整集生产时并行 worker 正在改整份 render_plan,改单张不安全,
+            # 仍要求先暂停。但"另一张图正在重画"不该拦住这一张——排队即可,
+            # 否则用户改完一张必须盯着等它跑完才能提交下一张。
+            if jobs.production_running_for(title, number):
                 return self._error(
                     409, "本集正在生产，请先暂停，待状态稳定后再修改镜头")
             feedback = (body.get("feedback") or "").strip()
@@ -3184,8 +3282,15 @@ def make_handler(workspace, jobs):
                 action="regen_image",
                 request={"target": target, "feedback": feedback,
                          "prompt": prompt, "quality": quality},
-                unique=True)
-            return self._json({"job_id": job_id}, status=202)
+                # 不能用 unique:那会把第二张的请求并进第一张的 job,
+                # 前端轮询到第一张成功就以为改好了,第二张其实从未重画。
+                queue=True)
+            job = jobs.get(job_id) or {}
+            return self._json({
+                "job_id": job_id,
+                "status": job.get("status") or "running",
+                "queue_position": job.get("queue_position") or 0,
+            }, status=202)
 
         def _settings_update(self):
             """设置中心保存 Provider、能力路由或整套图片策略。"""
