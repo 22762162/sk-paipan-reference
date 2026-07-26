@@ -1562,9 +1562,11 @@ def run(request, claude, timeout):
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ok": False, "error": f"claude 调用失败: {exc}"}
     if proc.returncode != 0:
+        # claude CLI 的登录/鉴权错误(如 Not logged in)只写 stdout,
+        # stderr 为空;两路都带上,避免日志里只剩"退出码 1:"无法定位。
+        detail = proc.stderr.strip() or proc.stdout.strip()
         return {"ok": False,
-                "error": f"claude 退出码 {proc.returncode}: "
-                         f"{proc.stderr.strip()[:300]}"}
+                "error": f"claude 退出码 {proc.returncode}: {detail[:300]}"}
     data = extract_json(proc.stdout)
     if data is None:
         return {"ok": False, "error": "claude 输出中未找到 JSON 对象"}

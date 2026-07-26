@@ -27,6 +27,7 @@ from ..adapters.codex_image import _space_line as _api_space_line
 from ..adapters.claude_script import (build_prompt, extract_json,
                                       validate_script, validate_storyboard)
 from ..script_import import sanitize_script_entities
+from ..story_analysis import validate_story_analysis
 from ..errors import ProviderError
 from .base import Provider, ProviderResult
 
@@ -367,6 +368,11 @@ class ClaudeApiProvider(Provider):
             if capability == "image_qc":
                 from ..adapters.claude_script import validate_image_qc
                 error = validate_image_qc(data)
+            elif capability == "script" and payload.get("story_analysis"):
+                # 与 CLI 桥(claude_script.run)保持同一分支:制作圣经/剧本
+                # 自动分析的输出没有 scenes,必须用 story_analysis 校验器,
+                # 否则永远"缺少 scenes"并静默回退 mock 污染事实源。
+                error = validate_story_analysis(data)
             elif capability == "script":
                 error = validate_script(data, payload)
             else:
