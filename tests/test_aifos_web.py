@@ -254,6 +254,13 @@ def test_index_and_static(server):
     assert b"video-ref-preview" in app_js
     assert "直接修改此图".encode() in app_js
     assert b"frameInlineRevisionHtml" in app_js
+    assert b"revisionGenerationSnapshot" in app_js
+    assert "实际生产输入（原提示词）".encode() in app_js
+    assert "分镜基础提示词（非实际调用记录）".encode() in app_js
+    assert "旧记录未保存实际提交提示词".encode() in app_js
+    assert "实际提交参考图对照".encode() in app_js
+    assert "质检结论".encode() in app_js
+    assert "复制原提示词".encode() in app_js
     assert "同场上一镜的尾帧".encode() in app_js
     assert "同场下一镜的首帧".encode() in app_js
     assert b"first_frame" in app_js
@@ -297,6 +304,10 @@ def test_index_and_static(server):
     assert b".frame-inline-revision" in style_css
     assert b".storyboard-frame-item" in style_css
     assert b".shot-revision-form" in style_css
+    assert b".shot-generation-input" in style_css
+    assert b".shot-original-prompt-text" in style_css
+    assert b".shot-original-references" in style_css
+    assert b".shot-generation-qc" in style_css
     assert b".background-cast-note" in style_css
     status, ctype, raw = _request(
         server["port"], "GET", "/manifest.webmanifest")
@@ -522,6 +533,19 @@ def test_episode_exposes_image_failures_with_artifact_urls(server):
                 "attempts": 2,
                 "consecutive_failures": 2,
                 "issues": ["人物多出一人", "服装颜色与定版不一致"],
+                "generation_input": {
+                    "schema": "aifos.image-generation-input/v1",
+                    "prompt": "本次真正提交给生图模型的原提示词",
+                    "reference_manifest": [{
+                        "index": 1,
+                        "asset_id": 101,
+                        "label": "程沐最终立绘",
+                        "role": "identity",
+                        "binding": "只锁定程沐的脸型、五官、性别与发型",
+                        "uri": str(failed),
+                    }],
+                    "input_hash": "saved-generation-input",
+                },
                 "revision_feedback": f"按失败稿 {failed} 定向修正人数",
                 "codex_escalation": {
                     "status": "completed",
@@ -569,6 +593,9 @@ def test_episode_exposes_image_failures_with_artifact_urls(server):
         server["port"], "GET", f"/api/episode/{episode_id}")
     assert status == 200
     assert detail["render_plan"]["items"][0]["status"] == "awaiting_human"
+    saved_input = detail["render_plan"]["items"][0]["qc"]["generation_input"]
+    assert saved_input["prompt"] == "本次真正提交给生图模型的原提示词"
+    assert saved_input["reference_manifest"][0]["label"] == "程沐最终立绘"
     assert len(detail["image_failures"]) == 1
     failure = detail["image_failures"][0]
     assert failure["item_id"] == "shot:7"
