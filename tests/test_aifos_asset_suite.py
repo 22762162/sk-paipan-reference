@@ -464,6 +464,8 @@ def test_produced_image_soft_delete_preserves_history(app):
     """资产中心删图写墓碑版本，不物理删除历史文件。"""
     project = _preproduce(app)
     row = app.assets.active_list(project["id"], "scene_art")[0]
+    stats_before = {
+        item["kind"]: dict(item) for item in app.assets.stats(project["id"])}
     original = Path(row["uri"])
     history_before = len(app.assets.history(
         project["id"], row["kind"], row["name"]))
@@ -479,6 +481,10 @@ def test_produced_image_soft_delete_preserves_history(app):
     assert row["name"] not in {
         item["name"] for item in app.assets.active_list(
             project["id"], "scene_art")}
+    stats_after = {
+        item["kind"]: dict(item) for item in app.assets.stats(project["id"])}
+    assert (stats_after[row["kind"]]["total"]
+            == stats_before[row["kind"]]["total"] - 1)
     with pytest.raises(AifosError):
         app.director.delete_image_asset(project["title"], row["id"])
 
@@ -487,6 +493,9 @@ def test_corrected_asset_supersedes_old_version_without_deleting_history(app):
     """修正版进入当前资产，错误旧图只隐藏并保留可回溯关系。"""
     project = _preproduce(app, title="修正版替代")
     active_before = app.assets.active_list(project["id"], "scene_art")
+    total_before = {
+        item["kind"]: item["total"]
+        for item in app.assets.stats(project["id"])}["scene_art"]
     old = active_before[0]
     replacement = app.assets.register(
         project["id"], "scene_art", old["name"], uri=old["uri"],
@@ -504,6 +513,10 @@ def test_corrected_asset_supersedes_old_version_without_deleting_history(app):
     assert Path(old["uri"]).exists()
     assert len(app.assets.history(
         project["id"], "scene_art", old["name"])) == 2
+    total_after = {
+        item["kind"]: item["total"]
+        for item in app.assets.stats(project["id"])}["scene_art"]
+    assert total_after == total_before
 
 
 def test_video_references_are_versioned_and_used(app):

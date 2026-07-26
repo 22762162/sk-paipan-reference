@@ -1335,6 +1335,7 @@ async function renderDashboard() {
 
     <div class="panel">
       <h2>账号矩阵 · IP 资产沉淀</h2>
+      <p class="dim">只统计当前有效资产；已删除、被替换和历史版本不计入数量，仍可在历史记录中追溯。</p>
       ${Object.keys(data.asset_stats).length ? Object.entries(data.asset_stats).map(([proj, rows]) => {
         const p = data.projects.find((x) => x.title === proj) || {};
         const kindCN = { drama: "漫剧", idol: "AI虚拟偶像" }[p.kind] || p.kind || "";

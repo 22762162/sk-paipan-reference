@@ -2030,6 +2030,12 @@ def _overview_payload(app, jobs):
         "e.updated_at, p.title AS project "
         "FROM episodes e JOIN projects p ON p.id=e.project_id "
         "ORDER BY e.updated_at DESC")]
+    projects = [dict(r) for r in app.projects.list_projects()]
+    asset_stats = {}
+    for project in projects:
+        rows = [dict(row) for row in app.assets.stats(project["id"])]
+        if rows:
+            asset_stats[project["title"]] = rows
     done = [e for e in episodes if e["status"] == "done"]
     scored = [e["qc_score"] for e in episodes if e["qc_score"] is not None]
     active_standard = app.standards.active()
@@ -2041,7 +2047,7 @@ def _overview_payload(app, jobs):
                 "version_id", "profile_key", "version", "name",
                 "fingerprint", "created_at")
         },
-        "projects": [dict(r) for r in app.projects.list_projects()],
+        "projects": projects,
         "episodes": episodes,
         "stats": {
             "episodes": len(episodes),
@@ -2053,10 +2059,7 @@ def _overview_payload(app, jobs):
         "cost_by_stage": [dict(r) for r in app.system.cost_by_stage()],
         "cost_by_provider": [dict(r) for r in app.system.cost_by_provider()],
         "quota": [dict(r) for r in app.system.quota_status()],
-        "asset_stats": {
-            p["title"]: [dict(r) for r in app.assets.stats(p["id"])]
-            for p in app.projects.list_projects()
-        },
+        "asset_stats": asset_stats,
         "icloud_sync": app.icloud_sync.status(),
         "firefire": app.firefire.overview(),
         "jobs": jobs.list(),

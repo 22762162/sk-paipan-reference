@@ -87,6 +87,7 @@ def test_index_and_static(server):
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
+    assert "只统计当前有效资产".encode() in app_js
     assert b"stableProductionProgress(data.production_progress)" in app_js
     assert b"logEl.dataset.signature === signature" in app_js
     assert b"function planVisibleQc(item)" in app_js
@@ -504,6 +505,10 @@ def test_asset_delete_and_video_reference_api(server):
     assert len(assets) == 2
     assert assets[-1]["meta"]["deleted"] is True
     assert path.exists(), "删除资产中心卡片不应物理删除历史文件"
+    status, overview = _json_request(
+        server["port"], "GET", "/api/overview")
+    assert status == 200
+    assert "资产接口测试" not in overview["asset_stats"]
 
 
 def test_episode_exposes_image_failures_with_artifact_urls(server):

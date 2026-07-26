@@ -186,7 +186,15 @@ class AssetCenter:
         return self.soft_delete(project_id, kind, name)
 
     def stats(self, project_id):
-        return self.db.query(
-            "SELECT kind, COUNT(*) AS total, SUM(reuse_count) AS reused "
-            "FROM assets WHERE project_id=? GROUP BY kind ORDER BY kind",
-            (project_id,))
+        """统计当前有效资产，不累计墓碑、被替换项或历史版本。"""
+        grouped = {}
+        for asset in self.active_list(project_id):
+            kind = asset["kind"]
+            row = grouped.setdefault(kind, {
+                "kind": kind,
+                "total": 0,
+                "reused": 0,
+            })
+            row["total"] += 1
+            row["reused"] += int(asset["reuse_count"] or 0)
+        return [grouped[kind] for kind in sorted(grouped)]
