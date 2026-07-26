@@ -64,6 +64,88 @@ def _download(name, url, dest, timeout=600):
         raise ProviderError(f"{name} 下载产物失败: {exc}") from exc
 
 
+def _parse_sse_data(raw):
+    """SSE 一行 `data: {...}` → dict;非 JSON 数据行返回 None。"""
+    try:
+        event = json.loads(raw)
+    except ValueError:
+        return None
+    return event if isinstance(event, dict) else None
+
+
+def _stream_claude_text(name, url, headers, body, timeout):
+    """流式调用 Anthropic Messages API,聚合全文文本返回。
+
+    整集剧本/制作圣经生成常超 10 分钟,非流式请求会被远端断连
+    (Remote end closed connection without response)。流式下 socket
+    超时按「两次数据块之间的静默」计,长生成不再被掐。仅标准库。
+    """
+    body = dict(body)
+    body["stream"] = True
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"Content-Type": "application/json",
+                 "Accept": "text/event-stream", **headers})
+    parts = []
+    plain_lines = []
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    if line:
+                        # 兼容不认 stream 参数的网关/镜像端点:先攒下
+                        # 非 SSE 行,流式事件一无所获时按普通应答解析。
+                        plain_lines.append(line)
+                    continue
+                event = _parse_sse_data(line[5:].strip())
+                if event is None:
+                    continue
+                etype = event.get("type")
+                if etype == "content_block_delta":
+                    delta = event.get("delta") or {}
+                    if delta.get("type") == "text_delta":
+                        parts.append(str(delta.get("text") or ""))
+                elif etype == "error":
+                    detail = (event.get("error") or {}).get(
+                        "message") or "未知流式错误"
+                    raise ProviderError(f"{name} API 流式错误: {detail}")
+                elif etype == "message_delta":
+                    reason = (event.get("delta") or {}).get("stop_reason")
+                    if reason == "max_tokens":
+                        raise ProviderError(
+                            f"{name} 输出达到 max_tokens 上限被截断,"
+                            "请调大 providers 配置中的 max_tokens")
+                elif etype == "message_stop":
+                    break
+    except ProviderError:
+        raise
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            pass
+        raise ProviderError(
+            f"{name} API HTTP {exc.code}: {detail or exc.reason}") from exc
+    except Exception as exc:
+        raise ProviderError(f"{name} API 调用失败: {exc}") from exc
+    if parts:
+        return "".join(parts)
+    reply = _parse_sse_data("\n".join(plain_lines))
+    if isinstance(reply, dict):
+        if reply.get("type") == "error" or "error" in reply:
+            detail = (reply.get("error") or {})
+            raise ProviderError(
+                f"{name} API 错误: {detail.get('message') or reply}")
+        return "".join(block.get("text", "")
+                       for block in reply.get("content", [])
+                       if isinstance(block, dict)
+                       and block.get("type") == "text")
+    return ""
+
+
 _IMG_MEDIA = {".png": "image/png", ".jpg": "image/jpeg",
              ".jpeg": "image/jpeg", ".webp": "image/webp"}
 
@@ -343,7 +425,8 @@ class ClaudeApiProvider(Provider):
             content = prompt
         endpoint = (self.conf.get("endpoint")
                     or self.DEFAULT_ENDPOINT).rstrip("/")
-        reply = _request_json(
+        # 流式必选:整集剧本/圣经生成常超 10 分钟,非流式会被远端断连。
+        text = _stream_claude_text(
             self.name, f"{endpoint}/v1/messages",
             headers={
                 "x-api-key": self.conf["api_key"],
@@ -355,9 +438,6 @@ class ClaudeApiProvider(Provider):
                 "messages": [{"role": "user", "content": content}],
             },
             timeout=self.conf.get("timeout", 600))
-        text = "".join(block.get("text", "")
-                       for block in reply.get("content", [])
-                       if block.get("type") == "text")
         data = extract_json(text)
         if data is None:
             raise ProviderError(f"{self.name} 应答中未找到 JSON 对象")

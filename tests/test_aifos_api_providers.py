@@ -573,3 +573,69 @@ def test_router_falls_back_to_claude_api(fake_api, tmp_path):
         assert result.data["scenes"]
     finally:
         app.close()
+
+
+def test_stream_claude_text_aggregates_sse(monkeypatch):
+    """流式 SSE 聚合全文;10 分钟以上长生成不再被远端断连掐死。"""
+    import io
+    import urllib.request as _ur
+    from aifos.production.api_providers import _stream_claude_text
+
+    sse = (
+        b'event: message_start\n'
+        b'data: {"type":"message_start"}\n\n'
+        b'data: {"type":"content_block_delta",'
+        b'"delta":{"type":"text_delta","text":"{\\"scenes\\""}}\n\n'
+        b'data: {"type":"content_block_delta",'
+        b'"delta":{"type":"text_delta","text":": []}"}}\n\n'
+        b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n'
+        b'data: {"type":"message_stop"}\n\n')
+
+    class _FakeResp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    captured = {}
+
+    def fake_urlopen(request, timeout=None):
+        captured["stream"] = json.loads(
+            request.data.decode("utf-8"))["stream"]
+        return _FakeResp(sse)
+
+    monkeypatch.setattr(_ur, "urlopen", fake_urlopen)
+    text = _stream_claude_text(
+        "claude_api", "https://x/v1/messages", {"x-api-key": "k"},
+        {"model": "m", "max_tokens": 100,
+         "messages": [{"role": "user", "content": "hi"}]}, 600)
+    assert text == '{"scenes": []}'
+    assert captured["stream"] is True
+
+
+def test_stream_claude_text_reports_max_tokens_truncation(monkeypatch):
+    import io
+    import urllib.request as _ur
+    from aifos.production.api_providers import _stream_claude_text
+
+    sse = (
+        b'data: {"type":"content_block_delta",'
+        b'"delta":{"type":"text_delta","text":"partial"}}\n\n'
+        b'data: {"type":"message_delta",'
+        b'"delta":{"stop_reason":"max_tokens"}}\n\n')
+
+    class _FakeResp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(_ur, "urlopen",
+                        lambda request, timeout=None: _FakeResp(sse))
+    with pytest.raises(ProviderError, match="max_tokens"):
+        _stream_claude_text(
+            "claude_api", "https://x/v1/messages", {}, {
+                "model": "m", "max_tokens": 1,
+                "messages": []}, 600)
