@@ -31,6 +31,8 @@ import json
 import re
 
 from .adapters.claude_script import validate_script
+# 转出给既有调用方;唯一事实源在 speaker_labels(零依赖叶子模块)。
+from .speaker_labels import is_non_person_label
 
 _SCENE_RE = re.compile(
     r"^\s*(?:【?第\s*([0-9一二三四五六七八九十百]+)\s*场】?|场景\s*(\d+))"
@@ -97,7 +99,9 @@ def is_likely_performance_label(value):
 
 def _speaker(value, *, direct=False):
     value = str(value or "").strip(" \t，。！？；、:：")
+    # 旁白/音效即使写成标准「角色:台词」格式也不是人物,direct 也要拦。
     if (not value or len(value) > 12 or value in _INVALID_SPEAKERS
+            or is_non_person_label(value)
             or re.search(r"[，。！？；、:：\"“”‘’「」『』]", value)
             or (not direct and is_likely_performance_label(value))):
         return ""
@@ -353,8 +357,11 @@ def parse_text_script(text, project_title, episode_number):
         for line in scene["lines"]:
             counts[line["character"]] = counts.get(line["character"], 0) + 1
             speakers.append(line["character"])
-        scene["characters"] = sorted(set(speakers))
-    ordered = sorted(counts, key=lambda n: -counts[n])
+        scene["characters"] = sorted(
+            name for name in set(speakers) if not is_non_person_label(name))
+    # 兜底:任何路径漏进来的旁白/音效标签都不得进入正式人物表。
+    ordered = [name for name in sorted(counts, key=lambda n: -counts[n])
+               if not is_non_person_label(name)]
     characters = [{
         "name": name,
         "role": (

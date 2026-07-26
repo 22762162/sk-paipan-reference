@@ -11,6 +11,8 @@ from __future__ import annotations
 import copy
 import re
 
+from .speaker_labels import is_non_person_label
+
 
 SCRIPT_LOGIC_SCHEMA = "aifos.script-logic/v2"
 ADAPTATION_REVIEW_FIELDS = (
@@ -246,11 +248,18 @@ def audit_script_logic(script: dict) -> dict:
         scene_people = {
             str(name) for name in (scene.get("characters") or []) if name
         }
+        # 旁白/音效/字幕是声音来源,不是人物实体:不参与“角色必须已声明”
+        # 与“台词人物须在本场名单内”的核对。否则模型把旁白正确写成声音
+        # 来源反而校验失败,下一轮就会把旁白补进人物表来迎合校验。
         speakers = {
             str(line.get("character")) for line in lines
             if line.get("character")
+            and not line.get("non_person_voice")
+            and not is_non_person_label(line.get("character"))
         }
-        unknown = sorted((scene_people | speakers) - declared)
+        unknown = sorted(
+            name for name in ((scene_people | speakers) - declared)
+            if not is_non_person_label(name))
         if unknown:
             scene_issues.append("出现未声明角色：" + "、".join(unknown))
         if not speakers <= scene_people:

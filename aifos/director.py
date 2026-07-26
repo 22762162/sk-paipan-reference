@@ -315,7 +315,10 @@ def is_unresolved_character(character):
     if name == "待确认说话人" or "待确认" in role:
         return True
     from .script_import import is_likely_performance_label
-    return is_likely_performance_label(name)
+    from .speaker_labels import is_non_person_label
+    # 旁白/音效不生成任何人物资产。它和表演提示词不同:无需人工归并,
+    # 直接静默剔除,所以不进 unresolved_character_labels 的阻断名单。
+    return is_non_person_label(name) or is_likely_performance_label(name)
 
 
 def character_candidate_target(character):
