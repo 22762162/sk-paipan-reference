@@ -4108,3 +4108,11 @@ textarea:focus-visible, select:focus-visible {
 }
 .lesson-domain.script { color: #cfe4ff; background: rgba(57, 135, 229, .18); }
 .lesson-domain.image { color: #ffd0b8; background: rgba(236, 131, 90, .16); }
+.lesson-approve {
+  margin-left: 6px; padding: 1px 8px; font-size: 10.5px;
+  border-radius: 999px; cursor: pointer;
+  border: 1px solid rgba(250, 178, 25, .45);
+  background: rgba(250, 178, 25, .1); color: #ffd77a;
+}
+.lesson-approve:hover:not(:disabled) { background: rgba(250, 178, 25, .2); }
+.lesson-approve:disabled { opacity: .5; cursor: default; }

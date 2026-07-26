@@ -232,3 +232,55 @@ def test_legacy_lessons_without_domain_stay_in_the_image_domain(tmp_path):
         assert project_lessons(app.assets, pid, domain=DOMAIN_SCRIPT) == []
     finally:
         app.close()
+
+
+def test_human_approval_promotes_a_lesson_into_the_prompt(tmp_path):
+    """审批是唯一的升级通道:批准后才注入,撤销后立即停止注入。"""
+    from aifos.app import App
+    from aifos.lessons import (DOMAIN_SCRIPT, project_lessons, record_lessons,
+                               script_lessons_block, set_lesson_approval)
+
+    app = App(tmp_path / "ws")
+    try:
+        project, _ = app.projects.get_or_create_project("人工审批")
+        pid = project["id"]
+        record_lessons(app.assets, pid, ["把旁白当成了人物写进人物表"],
+                       category="non_person_speaker", domain=DOMAIN_SCRIPT)
+        [row] = project_lessons(app.assets, pid)
+        assert script_lessons_block(app.assets, pid) == ""
+
+        approved = set_lesson_approval(app.assets, pid, row["id"], True)
+        assert approved["status"] == "approved"
+        assert approved["domain"] == DOMAIN_SCRIPT
+        block = script_lessons_block(app.assets, pid)
+        assert "旁白" in block and "严禁重犯" in block
+        # 批准后必须真的出现在编剧提示词里,不能只停在 block
+        from aifos.adapters.claude_script import build_prompt
+        prompt = build_prompt("script", {
+            "project_title": "人工审批", "episode_number": 1,
+            "premise": "测试", "lessons": block})
+        assert "【经验库·严禁再犯】" in prompt
+        assert "旁白" in prompt
+
+        # 撤销批准要立刻停止注入,且计数与证据不能丢
+        set_lesson_approval(app.assets, pid, row["id"], False)
+        assert script_lessons_block(app.assets, pid) == ""
+        [again] = project_lessons(app.assets, pid)
+        assert again["count"] == 1
+        assert again["status"] == "pending_review"
+        assert again["domain"] == DOMAIN_SCRIPT
+    finally:
+        app.close()
+
+
+def test_approval_endpoint_rejects_unknown_lesson(tmp_path):
+    from aifos.app import App
+    from aifos.lessons import set_lesson_approval
+
+    app = App(tmp_path / "ws")
+    try:
+        project, _ = app.projects.get_or_create_project("审批容错")
+        with pytest.raises(KeyError):
+            set_lesson_approval(app.assets, project["id"], "nope", True)
+    finally:
+        app.close()

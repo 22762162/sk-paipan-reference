@@ -5401,8 +5401,35 @@ function lessonsPanelHtml(data) {
         <span class="lesson-domain ${item.domain === "script" ? "script" : "image"}"
           >${item.domain === "script" ? "剧本解析" : "出图质检"}</span>
         ${esc(item.issue)}
-        <span class="rule-badge ${item.approved_for_prompt ? "live" : "adjustable"}">${item.approved_for_prompt ? "已人工批准为项目规则" : "待审核·不注入"}</span></li>`).join("")}</ul>
+        <span class="rule-badge ${item.approved_for_prompt ? "live" : "adjustable"}">${item.approved_for_prompt ? "已人工批准为项目规则" : "待审核·不注入"}</span>
+        <button class="lesson-approve"
+          onclick="setLessonApproval(${data.project.id}, ${data.episode.id}, '${esc(item.id)}', ${item.approved_for_prompt ? "false" : "true"}, this)"
+          title="${item.approved_for_prompt
+            ? "撤销批准后,这条不再进入任何提示词"
+            : "批准后,这条会作为项目规则注入后续" + (item.domain === "script" ? "编剧" : "出图/视频") + "提示词"}"
+          >${item.approved_for_prompt ? "撤销批准" : "批准为项目规则"}</button></li>`).join("")}</ul>
   </div>`;
+}
+
+async function setLessonApproval(projectId, episodeId, lessonId, approved, btn) {
+  // 审批是这套闭环里唯一的“升级”通道:系统只观察和归档,把偶发问题
+  // 升级成永久规则必须由人决定,否则几轮之后提示词里全是互相冲突的禁令。
+  if (btn) { btn.disabled = true; btn.textContent = "处理中…"; }
+  try {
+    const reply = await api("/api/lessons/approve", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project_id: projectId, lesson_id: lessonId, approved,
+      }),
+    });
+    showToast(reply.approved_for_prompt
+      ? `已批准为项目规则,将注入后续${reply.domain === "script" ? "编剧" : "出图/视频"}提示词`
+      : "已撤销批准,这条不再进入任何提示词", "ok");
+    renderCanvasView(episodeId);
+  } catch (err) {
+    showToast(err.message || "审批失败", "err");
+    if (btn) { btn.disabled = false; btn.textContent = approved ? "批准为项目规则" : "撤销批准"; }
+  }
 }
 
 function relationCanvasHtml(data) {

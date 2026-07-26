@@ -39,7 +39,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from .. import __version__
 from ..app import App
 from ..asset_center import IMAGE_KINDS
-from ..lessons import project_lessons
+from ..lessons import project_lessons, set_lesson_approval
 from ..updater import (check_and_update, current_build, repo_root,
                        restart_process, start_auto_updater)
 from ..errors import AifosError
@@ -2333,6 +2333,8 @@ def make_handler(workspace, jobs):
                     return self._history_delete()
                 if parsed.path == "/api/video/references":
                     return self._video_references()
+                if parsed.path == "/api/lessons/approve":
+                    return self._lesson_approval()
                 if parsed.path == "/api/project/style":
                     return self._project_style()
                 if parsed.path == "/api/story-analysis":
@@ -3879,6 +3881,25 @@ def make_handler(workspace, jobs):
                         int(body["episode_id"]), int(body["shot_no"]),
                         body.get("asset_ids") or [],
                         reset=bool(body.get("reset"))))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _lesson_approval(self):
+            """人工审批一条质检观察:批准后才允许注入后续提示词。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            if body.get("project_id") is None or not body.get("lesson_id"):
+                return self._error(400, "缺少 project_id/lesson_id")
+            try:
+                result = self._with_app(
+                    lambda app: set_lesson_approval(
+                        app.assets, int(body["project_id"]),
+                        str(body["lesson_id"]),
+                        bool(body.get("approved", True))))
+            except KeyError:
+                return self._error(404, "经验库中没有这条记录")
             except Exception as exc:
                 return self._error(400, str(exc))
             return self._json(result)

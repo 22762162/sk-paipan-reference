@@ -127,6 +127,8 @@ def project_lessons(assets, project_id, limit=50, domain=None):
         if domain is not None and row_domain != domain:
             continue
         rows.append({
+            # 指纹即资产名,人工审批时用它定位这条教训
+            "id": row["name"],
             "issue": meta["issue"],
             "count": int(meta.get("count", 1)),
             "categories": meta.get("categories") or {},
@@ -139,6 +141,42 @@ def project_lessons(assets, project_id, limit=50, domain=None):
         })
     rows.sort(key=lambda item: (-item["count"], -(item["last_at"] or 0)))
     return rows[:limit]
+
+
+def set_lesson_approval(assets, project_id, lesson_id, approved,
+                        scope="project_rule"):
+    """人工审批一条教训:批准后才允许注入后续提示词。
+
+    审批是这套闭环里唯一的"升级"通道——系统只负责观察和归档,把一次性
+    的偶发问题升级成永久规则必须由人决定,否则修一次错就多一条永久约
+    束,几轮之后提示词里全是互相冲突的禁令。
+    """
+    row = assets.latest(project_id, "lesson", str(lesson_id))
+    if row is None:
+        raise KeyError(lesson_id)
+    raw = row["meta"]
+    if isinstance(raw, str):
+        try:
+            meta = json.loads(raw or "{}")
+        except ValueError:
+            meta = {}
+    else:
+        meta = dict(raw or {})
+    if not meta.get("issue"):
+        raise KeyError(lesson_id)
+    meta["approved_for_prompt"] = bool(approved)
+    meta["status"] = "approved" if approved else "pending_review"
+    meta["scope"] = scope if approved else "qc_observation"
+    meta["reviewed_at"] = time.time()
+    assets.register(project_id, "lesson", str(lesson_id), meta=meta,
+                    new_version=True)
+    return {
+        "id": str(lesson_id),
+        "issue": meta["issue"],
+        "domain": _row_domain(meta),
+        "status": meta["status"],
+        "approved_for_prompt": meta["approved_for_prompt"],
+    }
 
 
 def lesson_lines(assets, project_id, limit=MAX_INJECTED,
