@@ -192,6 +192,7 @@ const STATUS_CN = {
   queued_script: "已排队",
   awaiting_confirm: "待确认", awaiting_script: "剧本待确认",
   awaiting_cast: "人物待定版",
+  paused: "制作已暂停",
   cancelling: "正在暂停…",
   script: "剧本中", continuity: "锁连续性",
   cast: "画人物场景", storyboard: "五维分镜中", images: "关键帧中",
@@ -218,7 +219,7 @@ function runChip(status) {
 }
 function chip(status) {
   const cls = ["done", "failed", "qc_failed", "awaiting_confirm",
-    "awaiting_script", "awaiting_cast"].includes(status)
+    "awaiting_script", "awaiting_cast", "paused"].includes(status)
     ? status : "running";
   return `<span class="chip ${cls}">${esc(STATUS_CN[status] || status)}</span>`;
 }
@@ -1426,7 +1427,7 @@ async function renderDashboard() {
 
   const producing = data.episodes.some((e) =>
     !["done", "failed", "qc_failed", "created", "awaiting_script",
-      "awaiting_cast", "awaiting_confirm", "queued_script"].includes(e.status));
+      "awaiting_cast", "awaiting_confirm", "queued_script", "paused"].includes(e.status));
   if (runningJobs.length || producing)
     pollTimer = setInterval(refreshIfIdle, 2500);
 }
@@ -2831,7 +2832,7 @@ async function waitForShotRevisionCheckpoint(
   episodeId, projectTitle, episodeNumber, timeoutMs = 120000) {
   const deadline = Date.now() + timeoutMs;
   const stable = new Set(["awaiting_script", "awaiting_cast", "awaiting_confirm",
-    "done", "failed", "qc_failed", "created"]);
+    "paused", "done", "failed", "qc_failed", "created"]);
   while (Date.now() < deadline) {
     const [current, jobs] = await Promise.all([
       api(`/api/episode/${episodeId}`), api("/api/jobs"),
@@ -3491,8 +3492,18 @@ function productionProgressModel(data) {
   const shots = (data.storyboard || {}).shots || [];
   const tasks = data.tasks || [];
   const runningTask = tasks.find((task) => task.status === "running");
-  const activeItemsRaw = payload.active_items || overall.active_items
-    || plan.filter((item) => ["generating", "retrying"].includes(item.status));
+  const liveJob = (data.live_jobs || []).find((job) => job.status === "running");
+  const liveJobProgress = liveJob?.progress || {};
+  let activeItemsRaw = [...(payload.active_items || overall.active_items
+    || plan.filter((item) => ["generating", "retrying"].includes(item.status)))];
+  if (!activeItemsRaw.length && liveJobProgress.current_item) {
+    activeItemsRaw = [{
+      item_id: liveJobProgress.current_item,
+      label: liveJobProgress.current_label || liveJobProgress.current_item,
+      status: liveJobProgress.phase === "checking" ? "checking" : "generating",
+      detail: liveJobProgress.phase === "checking" ? "视觉质检中" : "生产中",
+    }];
+  }
   const activeItems = activeItemsRaw.map((item, index) => {
     const category = item.category || item.stage || overall.stage || runningTask?.stage || "";
     const shotNo = item.shot_no == null ? null : Number(item.shot_no);
@@ -3512,9 +3523,10 @@ function productionProgressModel(data) {
   });
   const episodeStatus = data.episode?.status || "created";
   const stableEpisode = ["done", "failed", "qc_failed", "created", "queued_script",
-    "awaiting_script", "awaiting_cast", "awaiting_confirm"].includes(episodeStatus);
+    "awaiting_script", "awaiting_cast", "awaiting_confirm", "paused"].includes(episodeStatus);
   const progressStatus = overall.status || payload.status || "";
-  const explicitRunning = overall.running ?? payload.running ?? payload.active;
+  const reportedRunning = overall.running ?? payload.running ?? payload.active;
+  const explicitRunning = liveJob ? true : reportedRunning;
   const active = explicitRunning != null
     ? ![false, 0, "0", "false", "idle", "stopped"].includes(explicitRunning)
     : progressStatus === "running" || !!runningTask || !stableEpisode;
@@ -3540,6 +3552,10 @@ function productionProgressModel(data) {
       key,
       label: category.label || PLAN_CAT_CN[key] || STAGE_CN[key] || key,
       total: productionProgressNumber(category.total, category.count),
+      generated: productionProgressNumber(
+        category.generated, category.produced,
+        productionProgressNumber(category.done)
+          + productionProgressNumber(category.reused)),
       completed: productionProgressNumber(
         category.usable, category.completed,
         productionProgressNumber(category.done) + productionProgressNumber(category.reused),
@@ -3548,6 +3564,14 @@ function productionProgressModel(data) {
       active: productionProgressNumber(category.active, category.running,
         productionProgressNumber(category.generating)
           + productionProgressNumber(category.retrying)),
+      awaitingReview: productionProgressNumber(
+        category.awaiting_review, category.needs_review),
+      needsRepair: productionProgressNumber(
+        category.needs_repair,
+        productionProgressNumber(category.awaiting_human)
+          + productionProgressNumber(category.failed)),
+      queued: productionProgressNumber(category.queued),
+      notGenerated: productionProgressNumber(category.not_generated),
       awaitingHuman: productionProgressNumber(category.awaiting_human),
       hardFailed: productionProgressNumber(category.failed),
       unverified: productionProgressNumber(category.unverified_done),
@@ -3581,8 +3605,11 @@ function productionProgressModel(data) {
     overall.keyframe_pending, payload.keyframe_pending,
     keyframeTotal - keyframeDone - keyframeFailed));
   const categoryTotal = categories.reduce((sum, row) => sum + row.total, 0);
+  const categoryGenerated = categories.reduce((sum, row) => sum + row.generated, 0);
   const categoryDone = categories.reduce((sum, row) => sum + row.completed, 0);
   const total = productionProgressNumber(overall.total, payload.total, categoryTotal);
+  const generated = productionProgressNumber(
+    overall.generated, payload.generated, categoryGenerated);
   const completed = productionProgressNumber(
     overall.usable, overall.completed,
     productionProgressNumber(overall.done) + productionProgressNumber(overall.reused),
@@ -3597,14 +3624,21 @@ function productionProgressModel(data) {
     overall.parallel, overall.concurrency,
     payload.parallel, payload.concurrency,
     activeItems.length));
-  const activeCount = Math.max(activeItems.length, productionProgressNumber(
-    parallelLane.active, overall.active_count, payload.active_count));
+  const jobRemaining = Math.max(0, productionProgressNumber(
+    liveJobProgress.total) - productionProgressNumber(
+    liveJobProgress.completed) - productionProgressNumber(
+    liveJobProgress.failed));
+  const jobWorkers = liveJob ? Math.min(jobRemaining,
+    productionProgressNumber(liveJobProgress.parallel_workers, 1)) : 0;
+  const activeCount = Math.max(activeItems.length, jobWorkers,
+    productionProgressNumber(
+      parallelLane.active, overall.active_count, payload.active_count));
   return {
     active: active && !["completed", "done", "idle", "stopped"].includes(progressStatus),
     stopping: episodeStatus === "cancelling" || progressStatus === "cancelling",
     stage,
     stageLabel: active ? stageLabel : "无生产阶段",
-    parallelism, activeCount, activeItems, categories, total, completed,
+    parallelism, activeCount, activeItems, categories, total, generated, completed,
     pending: productionProgressNumber(overall.pending, payload.pending,
       Math.max(0, total - completed)),
     failed: productionProgressNumber(overall.failed, payload.failed),
@@ -3663,6 +3697,15 @@ function productionGuidanceModel(data) {
     const total = productionProgressNumber(source.total, fallback.total);
     const usable = productionProgressNumber(
       source.usable, source.completed, source.done, fallback.usable);
+    const generated = productionProgressNumber(
+      source.generated, source.produced, usable);
+    const awaitingReview = productionProgressNumber(
+      source.awaiting_review, source.needs_review);
+    const needsRepair = productionProgressNumber(
+      source.needs_repair, source.awaiting_human, source.failed);
+    const queued = productionProgressNumber(source.queued);
+    const notGenerated = productionProgressNumber(source.not_generated,
+      Math.max(0, total - usable - awaitingReview - needsRepair));
     const pending = productionProgressNumber(source.pending, fallback.pending);
     const generating = productionProgressNumber(
       source.generating, source.active, fallback.generating);
@@ -3677,8 +3720,9 @@ function productionGuidanceModel(data) {
       : source.blocked_by ? "blocked"
       : awaitingHuman > 0 ? "attention" : "pending";
     return {
-      key, label: source.label || label, total, usable, pending, generating,
-      retrying, awaitingHuman, failed, remaining,
+      key, label: source.label || label, total, usable, generated,
+      awaitingReview, needsRepair, queued, notGenerated,
+      pending, generating, retrying, awaitingHuman, failed, remaining,
       status: statusClass(source.status, inferred),
       blockedBy: source.blocked_by || "",
       reason: source.reason || "",
@@ -3722,8 +3766,8 @@ function productionGuidanceModel(data) {
     issueSource.count, keyframes.awaitingHuman,
     issueShotNos.length);
   const reason = phase === "keyframes"
-    ? `${raw.reason ? `${raw.reason} ` : ""}`
-      + `当前正式可用 ${keyframes.usable}/${keyframes.total}，`
+    ? raw.reason || `已生成 ${keyframes.generated}/${keyframes.total}，`
+      + `可用于下游 ${keyframes.usable}/${keyframes.total}，`
       + `${pendingCount} 张待生产，${issueCount} 张待人工处理。`
       + "首尾帧必须基于全部合格关键帧，所以门禁尚未开放。"
     : raw.reason || (phase === "frames"
@@ -3738,11 +3782,50 @@ function productionGuidanceModel(data) {
   const headline = raw.headline || (state === "active"
     ? `正在${currentLabel}` : phase === "review" ? "已进入最终审阅"
       : `停在${currentLabel}`);
+  const storyboardCount = shots.length;
+  const blockingCount = (data.blocking?.scenes || []).length;
+  const selection = data.cast_selection || {};
+  const assetSelectionTotal = (selection.characters || []).length
+    + (selection.props || []).length;
+  const assetSelectionReady = [...(selection.characters || []),
+    ...(selection.props || [])].filter(
+    (item) => item.locked || item.selected).length;
+  const motherAssetRows = progress.categories.filter((row) =>
+    ["character_art", "scene_art", "prop_identity"].includes(row.key));
+  const motherAssetTotal = motherAssetRows.reduce(
+    (sum, row) => sum + row.total, 0);
+  const motherAssetGenerated = motherAssetRows.reduce(
+    (sum, row) => sum + row.generated, 0);
+  const motherAssetUsable = motherAssetRows.reduce(
+    (sum, row) => sum + row.completed, 0);
+  const completedDocumentStage = (key, label, complete, total = 1, usable = null) => ({
+    key, label, total, usable: usable == null ? (complete ? total : 0) : usable,
+    generated: usable == null ? (complete ? total : 0) : usable,
+    remaining: complete ? 0 : Math.max(1, total),
+    status: complete ? "complete" : "pending",
+  });
   const stages = [
+    completedDocumentStage("script", "剧本", !!data.script),
     {
-      key: "assets", label: "人物场景", total: 1, usable: 1, remaining: 0,
-      status: "complete", reason: "人物与场景母资产已完成",
+      ...completedDocumentStage(
+        "assets", "人物场景",
+        motherAssetTotal
+          ? motherAssetUsable >= motherAssetTotal
+          : !!selection.passed || assetSelectionTotal === 0,
+        Math.max(1, motherAssetTotal || assetSelectionTotal),
+        motherAssetTotal
+          ? motherAssetUsable
+          : assetSelectionTotal ? assetSelectionReady : (data.script ? 1 : 0)),
+      generated: motherAssetTotal ? motherAssetGenerated : assetSelectionReady,
+      reason: "人物与场景母资产",
     },
+    completedDocumentStage(
+      "storyboard", "五维分镜", storyboardCount > 0,
+      Math.max(1, storyboardCount), storyboardCount),
+    completedDocumentStage(
+      "blocking", "3D调度", blockingCount > 0,
+      Math.max(1, new Set(shots.map((shot) => shot.scene_no)).size),
+      blockingCount),
     keyframes,
     frames,
     videos,
@@ -3778,6 +3861,9 @@ function productionGuidanceModel(data) {
       resolveIssues: {
         count: issueCount,
         shotNos: issueShotNos,
+        mustFixCount: productionProgressNumber(issueSource.must_fix_count),
+        reviewCount: productionProgressNumber(
+          issueSource.review_or_accept_count),
         enabled: issueSource.enabled ?? issueCount > 0,
         label: issueSource.label
           || `处理 ${issueCount} 张问题图`,
@@ -3791,11 +3877,14 @@ function productionProgressPanelHtml(data) {
   const guidance = productionGuidanceModel(data);
   const progress = guidance.progress;
   const runtimeLabel = progress.stopping ? "正在安全暂停"
-    : progress.active ? `正在运行 · ${progress.activeCount} 项`
+    : progress.active && progress.activeCount
+      ? `正在运行 · ${progress.activeCount} 项`
+      : progress.active ? "任务运行中 · 正在准备或收尾"
       : "当前没有运行任务";
   const currentStage = guidance.stages.find((stage) => stage.key === guidance.phase);
   const stageCount = currentStage?.total
-    ? `${currentStage.usable}/${currentStage.total}` : "";
+    ? `已生成 ${currentStage.generated ?? currentStage.usable}/${currentStage.total}`
+      + ` · 可用 ${currentStage.usable}/${currentStage.total}` : "";
   const pendingAction = guidance.actions.pendingImages;
   const issueAction = guidance.actions.resolveIssues;
   const stageIcon = (status) => status === "complete" ? "✓"
@@ -3811,7 +3900,9 @@ function productionProgressPanelHtml(data) {
       </div>
       <div class="production-guidance-channel">
         <small>生产通道</small><b>${progress.active
-          ? `${progress.activeCount}/${progress.parallelism || progress.activeCount || 1}`
+          ? progress.activeCount
+            ? `${progress.activeCount}/${progress.parallelism || progress.activeCount || 1}`
+            : `准备中 / ${progress.parallelism || 1}`
           : "0 正在占用"}</b>
       </div>
     </div>
@@ -3822,13 +3913,21 @@ function productionProgressPanelHtml(data) {
       ${guidance.stages.map((stage, index) => `<li class="stage-${stage.status}">
         <span class="production-stage-icon">${stageIcon(stage.status)}</span>
         <div><b>${esc(stage.label)}</b>
-          <small>${stage.total > 1 ? `${stage.usable}/${stage.total}`
+          <small>${stage.total > 1
+            ? `已生成 ${stage.generated ?? stage.usable}/${stage.total} · 可用 ${stage.usable}/${stage.total}`
             : stage.status === "complete" ? "已完成"
               : stage.status === "blocked" ? "未解锁" : "待处理"}</small></div>
         ${index < guidance.stages.length - 1
           ? `<i class="production-stage-arrow" aria-hidden="true">→</i>` : ""}
       </li>`).join("")}
     </ol>
+    ${currentStage?.total ? `<div class="production-state-buckets" aria-label="当前环节状态拆分">
+      <span class="is-usable"><b>${currentStage.usable}</b><small>可用于下游</small></span>
+      <span><b>${currentStage.awaitingReview || 0}</b><small>已生成·待复核</small></span>
+      <span class="is-problem"><b>${currentStage.needsRepair || 0}</b><small>需修正</small></span>
+      <span class="is-active"><b>${(currentStage.generating || 0) + (currentStage.retrying || 0)}</b><small>生成/质检中</small></span>
+      <span><b>${(currentStage.queued || 0) + (currentStage.notGenerated || 0)}</b><small>排队/未生成</small></span>
+    </div>` : ""}
     ${guidance.stages.find((stage) => stage.key === "frames")?.note
       ? `<div class="production-stage-note"><b>首尾帧运行方式</b><span>${
         esc(guidance.stages.find((stage) => stage.key === "frames").note)}</span></div>`
@@ -3872,7 +3971,8 @@ function productionProgressPanelHtml(data) {
     ${progress.categories.length ? `<details class="production-progress-categories">
       <summary>查看各生产环节准确数量</summary>
       <div>${progress.categories.map((row) => `<span>
-        <b>${esc(row.label)}</b><small>完成 ${row.completed}/${row.total}
+        <b>${esc(row.label)}</b><small>已生成 ${row.generated}/${row.total}
+        · 可用 ${row.completed}/${row.total}
         · 生产中 ${row.active} · 待生产 ${row.pending}
         · 未形成正式资产 ${row.unverified} · 问题 ${row.failed}</small>
       </span>`).join("")}</div></details>` : ""}
@@ -4118,6 +4218,44 @@ function imageFailurePanelHtml(data) {
   </section>`;
 }
 
+function productionIssueCenterHtml(data) {
+  const guidance = productionGuidanceModel(data);
+  const imageAction = guidance.actions.resolveIssues;
+  const lastFailure = [...(data.tasks || [])].reverse().find(
+    (task) => task.status === "failed" && task.error);
+  const failureText = String(lastFailure?.error || "").trim();
+  const systemic = failureText && /合同|提示词|参考图|reference|prompt|input|共享|批次/.test(
+    failureText);
+  if (!systemic && !imageAction.count) return "";
+  return `<section class="production-issue-center" aria-label="生产问题中心">
+    <div class="production-issue-center-head">
+      <div><b>问题中心</b><span>系统输入问题与单张画面质检分开处理，避免把整批错误误当成单图重画。</span></div>
+      <strong>${(systemic ? 1 : 0) + Number(imageAction.count || 0)} 项待处理</strong>
+    </div>
+    <div class="production-issue-groups">
+      <article class="${systemic ? "has-issue" : "is-clear"}">
+        <small>系统输入 / 参考合同</small>
+        <b>${systemic ? "检测到批次级输入问题" : "未检测到系统性输入问题"}</b>
+        <p>${systemic ? esc(failureText.slice(0, 260))
+          : "提示词、参考图和镜头合同没有发现会影响整批生产的错误。"}</p>
+        ${systemic ? `<button type="button" data-open-production-audit>查看失败阶段审计</button>` : ""}
+      </article>
+      <article class="${imageAction.count ? "has-issue" : "is-clear"}">
+        <small>单张画面 / 视觉质检</small>
+        <b>${imageAction.count
+          ? `${imageAction.count} 张需要修正或人工复核`
+          : "没有待处理的画面问题"}</b>
+        <p>${imageAction.count
+          ? `${imageAction.mustFixCount || 0} 张必须修复，${imageAction.reviewCount || 0} 张可人工复核后放行。`
+          : "当前关键帧均无待人工视觉问题。"}</p>
+        ${imageAction.count ? `<button type="button" class="guidance-issue-action"
+          data-guidance-issues data-first-shot="${imageAction.shotNos[0] || ""}">
+          处理画面问题</button>` : ""}
+      </article>
+    </div>
+  </section>`;
+}
+
 function productionLedgerHtml(data, options = {}) {
   const rows = productionLedgerRows(data);
   const progress = productionProgressModel(data);
@@ -4132,10 +4270,27 @@ function productionLedgerHtml(data, options = {}) {
     .filter((item) => item.awaiting_human);
   const stageSummary = PRODUCTION_LEDGER_STAGES.map((stage) => {
     const list = rows.filter((row) => row.stageKey === stage.key);
-    const done = list.filter((row) => ["done", "reused", "selected"].includes(row.status)
+    let total = list.length;
+    let generated = list.filter((row) =>
+      ["done", "reused", "selected"].includes(row.status)
       || row.selected).length;
+    let done = generated;
+    const progressCategory = progress.categories.find(
+      (row) => row.key === stage.key);
+    if (["shot_image", "frames"].includes(stage.key) && progressCategory) {
+      total = progressCategory.total;
+      generated = progressCategory.generated;
+      done = progressCategory.completed;
+    } else if (stage.key === "video" && data.storyboard) {
+      total = (data.storyboard.shots || []).length;
+      generated = Object.keys((data.artifacts || {}).videos || {}).length;
+      done = generated;
+    }
     const active = list.some((row) => row.status === "generating");
-    return { ...stage, total: list.length, done, active };
+    return {
+      ...stage, total, done, generated, active,
+      showGenerated: ["shot_image", "frames", "video"].includes(stage.key),
+    };
   }).filter((stage) => stage.total || (stage.key === "video" && data.storyboard));
   const context = options.context || "live";
   return `<section class="production-ledger" data-ledger-context="${esc(context)}">
@@ -4145,21 +4300,29 @@ function productionLedgerHtml(data, options = {}) {
       <span class="production-ledger-current">${progress.active ? "当前阶段" : "生产状态"}：<b>${esc(currentLabel)}</b></span>
     </div>
     ${productionProgressPanelHtml(data)}
+    ${productionIssueCenterHtml(data)}
     ${videoFailurePanelHtml(humanVideoShots)}
     ${imageFailurePanelHtml(data)}
     <div class="production-ledger-summary">
       ${stageSummary.map((stage) => `<span class="production-ledger-stage ${stage.done === stage.total && stage.total ? "done" : stage.active ? "running" : "pending"}">
-        ${stage.label} <b>${stage.done}/${stage.total}</b></span>`).join("")}
+        ${stage.label} <b>${stage.showGenerated
+          ? `生成${stage.generated}/${stage.total} · 可用${stage.done}/${stage.total}`
+          : `${stage.done}/${stage.total}`}</b></span>`).join("")}
     </div>
-    <div class="production-ledger-controls">
-      <label>筛选生产项<select class="production-ledger-filter">
-        <option value="all">全部有效生产项</option><option value="active">正在生产</option>
-        <option value="pending">待补齐资料</option><option value="character">人物与场景</option>
-        <option value="shot">关键帧与首尾帧</option><option value="video">视频</option>
-      </select></label>
-      <span class="production-ledger-filter-summary">显示 ${rows.length}/${rows.length} 项</span>
-    </div>
-    ${rows.length ? `<div class="production-ledger-table-wrap" role="region" aria-label="全流程生产表，可横向滚动">
+    <details class="production-audit-records">
+      <summary><span><b>查看全流程审计记录</b>
+        <small>提示词、参考图、产物、状态与干预入口</small></span>
+        <strong>${rows.length} 项</strong></summary>
+      <div class="production-audit-records-body">
+        <div class="production-ledger-controls">
+          <label>筛选生产项<select class="production-ledger-filter">
+            <option value="all">全部有效生产项</option><option value="active">正在生产</option>
+            <option value="pending">待补齐资料</option><option value="character">人物与场景</option>
+            <option value="shot">关键帧与首尾帧</option><option value="video">视频</option>
+          </select></label>
+          <span class="production-ledger-filter-summary">显示 ${rows.length}/${rows.length} 项</span>
+        </div>
+        ${rows.length ? `<div class="production-ledger-table-wrap" role="region" aria-label="全流程生产表，可横向滚动">
       <table class="production-ledger-table"><caption>人物、场景、关键帧、首尾帧和视频生产状态</caption>
         <thead><tr><th>生产对象</th><th>生产环节</th><th>所需参考图</th><th>当前产物</th><th>状态标志</th><th>问题 / 干预</th></tr></thead>
         <tbody>${rows.map((row) => {
@@ -4183,6 +4346,8 @@ function productionLedgerHtml(data, options = {}) {
           </tr>`;
         }).join("")}</tbody>
       </table></div>` : `<div class="production-ledger-empty">当前还没有已选定或可用的生产资料。</div>`}
+      </div>
+    </details>
   </section>`;
 }
 
@@ -4252,6 +4417,15 @@ async function submitPendingKeyframes(data, episodeId, button) {
 
 function bindProductionLedger(root, data, episodeId) {
   if (!root) return;
+  root.querySelectorAll("[data-open-production-audit]").forEach((button) => {
+    button.onclick = () => {
+      const audit = root.querySelector(".production-audit-records")
+        || document.querySelector(".production-audit-records");
+      if (!audit) return;
+      audit.open = true;
+      audit.scrollIntoView({ behavior: "smooth", block: "start" });
+    };
+  });
   root.querySelectorAll("[data-guidance-resume]").forEach((button) => {
     button.onclick = (event) => armConfirm(
       event.currentTarget,
@@ -5337,7 +5511,7 @@ function renderPlanBoardHtml(data) {
       const ok = list.filter(
         (i) => ["done", "reused"].includes(i.status)).length;
       const avg = planAvgDuration(items, cat);
-      return `<div class="pb-cat">
+      return `<div class="pb-cat" data-plan-category="${esc(cat)}">
         <h3>${PLAN_CAT_CN[cat]} <span class="dim">${ok}/${list.length}</span></h3>
         <div class="pb-grid">${list.map(
           (i) => planCardHtml(data, i, avg)).join("")}</div></div>`;
@@ -5371,7 +5545,7 @@ function bindImageAccelerationLivebar(episodeId) {
   if (button) button.onclick = () => showImageAcceleration(episodeId);
 }
 
-async function showPlanOverlay(episodeId, focusId = "") {
+async function showPlanOverlay(episodeId, focusId = "", focusCategory = "") {
   let data;
   try { data = await api(`/api/episode/${episodeId}`); }
   catch (e) { showToast(e.message, "error"); return; }
@@ -5412,6 +5586,10 @@ async function showPlanOverlay(episodeId, focusId = "") {
       target.scrollIntoView({ behavior: "smooth", block: "center" });
       target.classList.add("selected");
     }
+  } else if (focusCategory) {
+    const category = overlay.querySelector(
+      `[data-plan-category="${CSS.escape(focusCategory)}"]`);
+    category?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 }
 
@@ -6595,11 +6773,14 @@ function renderProgressBanner(data) {
     (e) => e.status === "awaiting_cast");
   const awaiting = data.episodes.filter(
     (e) => e.status === "awaiting_confirm");
+  const paused = data.episodes.filter(
+    (e) => e.status === "paused");
   const producing = data.episodes.filter(
     (e) => !["done", "failed", "qc_failed", "created", "awaiting_script",
-             "awaiting_cast", "awaiting_confirm", "queued_script"].includes(e.status));
+             "awaiting_cast", "awaiting_confirm", "queued_script",
+             "paused"].includes(e.status));
   if (!producing.length && !awaiting.length && !awaitingScript.length
-      && !awaitingCast.length) {
+      && !awaitingCast.length && !paused.length) {
     el.innerHTML = ""; return;
   }
   el.innerHTML = awaitingScript.map((e) => `
@@ -6617,6 +6798,11 @@ function renderProgressBanner(data) {
       <div class="progress-text">《${esc(e.project)}》第${e.number}集 预生产完成,等你过目
         <span>连续性、五维分镜、关键帧与生产门禁均已通过</span></div>
       <button class="primary" onclick="location.hash='#/episode/${e.id}'">去确认 →</button>
+    </div>`).join("") + paused.map((e) => `
+    <div class="progress-card paused">
+      <div class="progress-text">《${esc(e.project)}》第${e.number}集 制作已暂停
+        <span>已生成的剧本、人物、场景、分镜和图片都保留；进入工作区可查看任一环节并从断点继续。</span></div>
+      <button class="primary" onclick="location.hash='#/episode/${e.id}'">查看断点与产物 →</button>
     </div>`).join("") + producing.map((e) => {
     const idx = STAGE_ORDER.indexOf(e.status);
     const step = idx >= 0 ? idx + 1 : 1;
@@ -6657,7 +6843,8 @@ function liveCounts(data) {
   }
   const plan = ((data.render_plan || {}).items) || [];
   if (plan.length) {
-    parts.push(`图片正式资产 ${progress.completed}/${progress.total}`);
+    parts.push(`图片已生成 ${progress.generated}/${progress.total}`
+      + ` · 可用于下游 ${progress.completed}/${progress.total}`);
   }
   if (total) {
     parts.push(`关键帧 ${progress.keyframeDone}/${progress.keyframeTotal}`);
@@ -7414,8 +7601,9 @@ function pausedProductionState(data) {
   const hasDownstreamTask = tasks.some((task) =>
     downstreamStages.has(task.stage)
     && ["done", "failed", "stopped", "cancelling"].includes(task.status));
-  const active = episode.status === "awaiting_script" && !!data.script
-    && (!!data.storyboard || ready > 0 || hasDownstreamTask);
+  const active = episode.status === "paused"
+    || (episode.status === "awaiting_script" && !!data.script
+      && (!!data.storyboard || ready > 0 || hasDownstreamTask));
   return {
     active,
     ready,
@@ -7432,22 +7620,92 @@ function pausedProductionAccessHtml(state) {
     <div class="paused-production-summary">
       <div><b>⏸ 制作已暂停，已有内容仍可查看</b>
         <span>暂停只停止继续生成，不会锁住剧本、人物、场景、分镜或图片。
-        「继续补齐」只负责恢复剩余生产。</span></div>
+        可从下方八个制作环节直接进入；「继续补齐」只恢复剩余生产。</span></div>
       <strong>${state.ready}/${state.total || 0} 项已完成 ·
         ${state.images}/${state.shots || 0} 张分镜图</strong>
     </div>
-    <nav class="paused-stage-links" aria-label="查看已完成的生产环节">
-      <button type="button" data-paused-access="script"><b>01</b> 剧本与制作圣经</button>
-      <button type="button" data-paused-access="assets"><b>02</b> 人物 / 场景</button>
-      <button type="button" data-paused-access="storyboard"><b>03</b> 分镜列表
-        <span>${state.shots}</span></button>
-      <button type="button" data-paused-access="blocking"><b>04</b> 3D 空间调度
-        <span>${state.blockingScenes}</span></button>
-      <button type="button" data-paused-access="images"><b>05</b> 图片清单
-        <span>${state.ready}/${state.total || 0}</span></button>
-      <button type="button" data-paused-access="canvas"><b>06</b> 全流程画布</button>
-    </nav>
   </section>`;
+}
+
+function episodeWorkspaceNavHtml(data, guidance) {
+  const current = guidance.phase === "review" ? "delivery" : guidance.phase;
+  const stateText = (stage) => {
+    if (stage.total > 1) {
+      const generated = stage.generated ?? stage.usable;
+      return ["keyframes", "frames", "videos"].includes(stage.key)
+        ? `生成${generated}/${stage.total} · 可用${stage.usable}/${stage.total}`
+        : `${stage.usable}/${stage.total}`;
+    }
+    if (stage.status === "complete") return "已完成";
+    if (stage.status === "active") return "进行中";
+    if (stage.status === "attention") return "需处理";
+    if (stage.status === "blocked") return "待上游";
+    return "可查看";
+  };
+  return `<nav class="episode-workspace-nav" aria-label="剧集制作环节">
+    ${guidance.stages.map((stage, index) => `<button type="button"
+      class="episode-workspace-stage state-${stage.status}${
+        stage.key === current ? " current" : ""}"
+      data-workspace-stage="${esc(stage.key)}"
+      aria-current="${stage.key === current ? "step" : "false"}">
+      <b>${String(index + 1).padStart(2, "0")}</b>
+      <span>${esc(stage.label)}</span><small>${esc(stateText(stage))}</small>
+    </button>`).join("")}
+  </nav>`;
+}
+
+function bindEpisodeWorkspaceNav(root, data, episodeId, setView) {
+  const showTheater = (selector, filterValue = "") => {
+    setView("theater");
+    requestAnimationFrame(() => {
+      const section = document.querySelector(selector);
+      if (!section) {
+        showToast("这个环节还没有产物；仍可查看当前门禁和等待原因", "info");
+        return;
+      }
+      if (section.matches(".production-ledger")) {
+        const audit = section.querySelector(".production-audit-records");
+        if (audit) audit.open = true;
+        const filter = section.querySelector(".production-ledger-filter");
+        if (filter && filterValue) {
+          filter.value = filterValue;
+          filter.dispatchEvent(new Event("change"));
+        }
+      }
+      if (section.matches(".shot-production-section") && filterValue) {
+        const filter = section.querySelector(".shot-table-filter");
+        if (filter) {
+          filter.value = filterValue;
+          filter.dispatchEvent(new Event("change"));
+        }
+      }
+      section.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  };
+  root.querySelectorAll("[data-workspace-stage]").forEach((button) => {
+    button.onclick = () => {
+      const stage = button.dataset.workspaceStage;
+      if (stage === "script") showScriptOverlay(data, episodeId);
+      else if (stage === "assets")
+        showTheater(".production-ledger", "character");
+      else if (stage === "storyboard")
+        showTheater(".shot-production-section");
+      else if (stage === "blocking")
+        showBlockingOverlay(episodeId);
+      else if (stage === "keyframes")
+        showPlanOverlay(episodeId, "", "shot_image");
+      else if (stage === "frames")
+        showPlanOverlay(episodeId, "", "frames");
+      else if (stage === "videos")
+        showTheater(".shot-production-section", "missing-video");
+      else if (stage === "delivery") {
+        const hasPlayable = data.artifacts?.final
+          || Object.keys(data.artifacts?.videos || {}).length;
+        if (hasPlayable) openPlayer(data);
+        else showToast("成片尚未生成；可先查看视频环节的门禁和缺失项", "info");
+      }
+    };
+  });
 }
 
 async function renderCanvasView(episodeId) {
@@ -7474,7 +7732,8 @@ async function renderCanvasView(episodeId) {
   }
   // 制作进行中一律进生产直播页(实况看板+日志+停止),画布留给审阅/成片
   const stable = ["done", "failed", "qc_failed", "created",
-    "awaiting_script", "awaiting_cast", "awaiting_confirm", "queued_script"];
+    "awaiting_script", "awaiting_cast", "awaiting_confirm", "queued_script",
+    "paused"];
   if (!stable.includes(ep.status)) {
     renderProductionView(data, episodeId);
     return;
@@ -7521,6 +7780,14 @@ async function renderCanvasView(episodeId) {
     ? [...(data.tasks || [])].reverse().find((t) => t.status === "failed")
     : null;
   const firstImageFailure = (data.image_failures || [])[0] || null;
+  const hasPlayable = !!data.artifacts?.final
+    || Object.keys(data.artifacts?.videos || {}).length > 0;
+  const primaryMode = productionGuidance.progress.active ? "stop"
+    : awaiting ? "confirm"
+    : productionGuidance.actions.pendingImages.enabled ? "resume"
+    : firstImageFailure ? "issues"
+    : ["keyframes", "frames"].includes(productionGuidance.phase) ? "resume"
+    : hasPlayable ? "play" : "resume";
   app.innerHTML = `
   <div class="canvas-view">
     ${pausedProductionAccessHtml(pausedProduction)}
@@ -7587,15 +7854,25 @@ async function renderCanvasView(episodeId) {
         <button id="view-theater">📋 分镜表</button>
         <button id="view-canvas">🗺 画布</button>
       </div>
-      <button id="btn-play" class="primary">▶ 播放本集</button>
-      <button id="btn-script">剧本</button>
-      <button id="btn-blocking" title="人物走位、镜头位置、视锥和轴线">🧭 空间调度</button>
-      <button id="btn-plan" title="每张图的状态与提示词;可单张改词重画">🖼 图片清单</button>
-      <button id="btn-stop-live" class="stop-btn" hidden
-        title="暂停生成:已完成的图片全部保留,可从断点继续">⏸ 暂停生成</button>
-      <button id="btn-reproduce" title="复用已完成的部分,只补做缺失内容">继续补齐</button>
-      <button id="btn-reproduce-force" class="danger"
-        title="推翻原有设定,清理本轮复用并从头重新生成图片、首尾帧和视频">⚠ 全部重新生成</button>
+      ${primaryMode === "play"
+        ? `<button id="btn-play" class="primary">▶ 播放本集</button>`
+        : primaryMode === "stop"
+          ? `<button id="btn-stop-live" class="stop-btn"
+            title="暂停生成：已完成的图片全部保留，可从断点继续">⏸ 暂停生成</button>`
+          : primaryMode === "confirm"
+            ? `<button id="btn-confirm-jump" class="primary">✅ 检查并确认视频生产</button>`
+            : `<button id="btn-reproduce" class="primary"
+              title="复用已完成部分，只补做缺失内容">${
+                primaryMode === "issues" ? "⚠ 处理问题图" : "▶ 继续补齐"}</button>`}
+      <details class="episode-more-menu">
+        <summary>更多</summary><div>
+          <button id="btn-script">查看剧本</button>
+          <button id="btn-blocking" title="人物走位、镜头位置、视锥和轴线">3D 空间调度</button>
+          <button id="btn-plan" title="每张图的状态、提示词和参考图">图片清单</button>
+          <button id="btn-reproduce-force" class="danger"
+            title="推翻原有设定，清理本轮复用并从头重新生成图片、首尾帧和视频">全部重新生成</button>
+        </div>
+      </details>
       <div class="zoom-group">
         <button id="zoom-out">−</button>
         <span class="zoom-pct" id="zoom-pct">100%</span>
@@ -7604,6 +7881,7 @@ async function renderCanvasView(episodeId) {
         <button id="layout-reset">重排</button>
       </div>
     </div>
+    ${episodeWorkspaceNavHtml(data, productionGuidance)}
     <div class="canvas-stage-nav" id="canvas-stage-nav" hidden
       aria-label="全生产链画布导航"></div>
     <div id="live-strip" class="live-strip" hidden></div>
@@ -7618,8 +7896,7 @@ async function renderCanvasView(episodeId) {
   document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
   const stopLive = document.getElementById("btn-stop-live");
   if (stopLive) {
-    const producingNow = !["done", "failed", "qc_failed", "created",
-      "awaiting_script", "awaiting_cast", "awaiting_confirm"].includes(ep.status);
+    const producingNow = productionGuidance.progress.active;
     const strip = document.getElementById("live-strip");
     if (strip) strip.hidden = !producingNow;
     if (producingNow) { updateLiveStrip(data); startLiveTicker(episodeId); }
@@ -7644,19 +7921,19 @@ async function renderCanvasView(episodeId) {
     } catch (e) { showToast(e.message, "error"); }
   };
   const reproduceButton = document.getElementById("btn-reproduce");
-  if (productionGuidance.actions.pendingImages.enabled) {
+  if (reproduceButton && productionGuidance.actions.pendingImages.enabled) {
     const pendingCount = productionGuidance.actions.pendingImages.count;
     reproduceButton.textContent = `继续补齐 ${pendingCount} 张`;
     reproduceButton.title = "只生产尚未生成的关键帧，不重做已通过图片，也不启动 Seedance";
     reproduceButton.onclick = (event) => armConfirm(
       event.currentTarget, `补齐 ${pendingCount} 张`,
       () => submitPendingKeyframes(data, episodeId, event.currentTarget));
-  } else if (firstImageFailure) {
+  } else if (reproduceButton && firstImageFailure) {
     reproduceButton.textContent = "先处理问题图";
     reproduceButton.title = "二次质检未过的关键帧人工修好后，再从断点补齐";
     reproduceButton.onclick = () => focusImageFailureShot(
       document, data, Number(firstImageFailure.shot_no));
-  } else {
+  } else if (reproduceButton) {
     reproduceButton.onclick = (ev) =>
       armConfirm(ev.target, "补齐", () => reproduce(false));
   }
@@ -7676,7 +7953,11 @@ async function renderCanvasView(episodeId) {
   document.getElementById("btn-script").onclick = () => showScriptOverlay(data, episodeId);
   document.getElementById("btn-blocking").onclick = () => showBlockingOverlay(episodeId);
   document.getElementById("btn-plan").onclick = () => showPlanOverlay(episodeId);
-  document.getElementById("btn-play").onclick = () => openPlayer(data);
+  document.getElementById("btn-play")?.addEventListener("click", () => openPlayer(data));
+  document.getElementById("btn-confirm-jump")?.addEventListener("click", () =>
+    document.getElementById("btn-confirm")?.scrollIntoView({
+      behavior: "smooth", block: "center",
+    }));
   if (awaiting) bindVideoReferenceControls(data, episodeId);
   const btnConfirm = document.getElementById("btn-confirm");
   if (btnConfirm) btnConfirm.onclick = async () => {
@@ -7701,7 +7982,7 @@ async function renderCanvasView(episodeId) {
   };
   // 制作进行中自动刷新画布(待确认是稳定状态,不轮询)
   if (!["done", "failed", "qc_failed", "created",
-        "awaiting_script", "awaiting_cast", "awaiting_confirm"].includes(ep.status))
+        "awaiting_script", "awaiting_cast", "awaiting_confirm", "paused"].includes(ep.status))
     pollCanvas(episodeId);
 
   const canvas = new StoryboardCanvas(data, shotIssues, lineIssues);
@@ -7734,30 +8015,7 @@ async function renderCanvasView(episodeId) {
   btnTheater.onclick = () => setView("theater");
   btnCanvas.onclick = () => setView("canvas");
   setView(localStorage.getItem("aifos.view") || "theater");
-  app.querySelectorAll("[data-paused-access]").forEach((button) => {
-    button.onclick = () => {
-      const target = button.dataset.pausedAccess;
-      if (target === "script") {
-        showScriptOverlay(data, episodeId);
-      } else if (target === "blocking") {
-        showBlockingOverlay(episodeId);
-      } else if (target === "images") {
-        showPlanOverlay(episodeId);
-      } else if (target === "canvas") {
-        setView("canvas");
-        document.getElementById("canvas-stage-nav")?.scrollIntoView({
-          behavior: "smooth", block: "nearest",
-        });
-      } else {
-        setView("theater");
-        const selector = target === "storyboard"
-          ? ".shot-production-section" : ".production-ledger";
-        requestAnimationFrame(() => document.querySelector(selector)?.scrollIntoView({
-          behavior: "smooth", block: "start",
-        }));
-      }
-    };
-  });
+  bindEpisodeWorkspaceNav(app, data, episodeId, setView);
 }
 
 /* ---- 剧本正文(审阅页与生产直播页共用) ---- */

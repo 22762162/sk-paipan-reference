@@ -61,7 +61,7 @@ def test_bootstrap_recovers_stale_episode_and_backfills_history(tmp_path):
     task = recovered.db.query_one(
         "SELECT * FROM tasks WHERE episode_id=?", (episode["id"],))
     history = recovered.history.list()
-    assert episode_row["status"] == "awaiting_script"
+    assert episode_row["status"] == "paused"
     assert task["status"] == "interrupted"
     assert history["stats"]["total"] == 1
     assert history["items"][0]["status"] == "interrupted"

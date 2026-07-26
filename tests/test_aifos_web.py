@@ -95,13 +95,15 @@ def test_index_and_static(server):
     assert b"pausedProductionState" in app_js
     assert b"pausedProductionAccessHtml" in app_js
     assert b'&& !pausedProduction.active' in app_js
-    assert b'data-paused-access="script"' in app_js
-    assert b'data-paused-access="assets"' in app_js
-    assert b'data-paused-access="storyboard"' in app_js
-    assert b'data-paused-access="blocking"' in app_js
-    assert b'data-paused-access="images"' in app_js
-    assert b'data-paused-access="canvas"' in app_js
+    assert b"episodeWorkspaceNavHtml" in app_js
+    assert b"bindEpisodeWorkspaceNav" in app_js
+    assert b'data-workspace-stage="${esc(stage.key)}"' in app_js
+    assert "可从下方八个制作环节直接进入".encode() in app_js
     assert "制作已暂停，已有内容仍可查看".encode() in app_js
+    assert "已生成".encode() in app_js
+    assert "可用于下游".encode() in app_js
+    assert b"production-audit-records" in app_js
+    assert "问题中心".encode() in app_js
     assert b"planNeedsRevision" in app_js
     assert "仅显示需修改".encode() in app_js
     assert "显示全部图片".encode() in app_js
@@ -671,7 +673,12 @@ def test_episode_production_progress_uses_verified_formal_assets(server):
                  if item["category"] == "shot_image")
     assert shots["total"] == 4
     assert shots["done"] == 1
+    assert shots["generated"] == 1
     assert shots["usable"] == 1
+    assert shots["awaiting_review"] == 0
+    assert shots["needs_repair"] == 1
+    assert shots["queued"] == 0
+    assert shots["not_generated"] == 1
     assert shots["unverified_done"] == 1
     assert shots["generating"] == 1
     assert shots["awaiting_human"] == 1

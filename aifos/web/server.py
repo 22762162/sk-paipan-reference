@@ -901,6 +901,33 @@ def _production_progress(app, episode, render_plan):
             item.get("asset_kind") and item.get("asset_name")
             and has_asset(str(item["asset_kind"]), str(item["asset_name"])))
 
+    def item_is_downstream_usable(item, formal_asset):
+        """正式文件存在后仍须通过当前镜头合同，才能交给下游。
+
+        ``generated`` 与 ``usable`` 必须分开：前者回答“图是否已经画出”，
+        后者回答“当前版本是否已通过质检并能进入首尾帧/Seedance”。
+        初始人物和场景母资产没有逐图 QC，登记成功即可使用。
+        """
+        if not formal_asset:
+            return False
+        if str(item.get("category") or "") not in {"shot_image", "frames"}:
+            return True
+        qc = item.get("qc") or {}
+        if not qc:
+            return not (
+                item.get("invalidated_previous_output")
+                or item.get("contract_recheck"))
+        if qc.get("passed") is not True or qc.get("stale"):
+            return False
+        required = (
+            "identity_checked", "identity_match",
+            "gender_checked", "gender_match",
+            "count_checked", "count_match",
+            "physical_logic_checked", "physical_logic_match",
+            "spatial_logic_checked", "spatial_logic_match",
+        )
+        return all(qc.get(field) is True for field in required)
+
     categories = {}
     active_items = []
     issues = []
@@ -913,6 +940,11 @@ def _production_progress(app, episode, render_plan):
             "total": 0,
             **{key: 0 for key in status_keys},
             "usable": 0,
+            "generated": 0,
+            "awaiting_review": 0,
+            "needs_repair": 0,
+            "queued": 0,
+            "not_generated": 0,
             "unverified_done": 0,
             "percent": 0,
         })
@@ -935,10 +967,16 @@ def _production_progress(app, episode, render_plan):
             })
             status = "pending"
         formal_asset = item_has_formal_asset(item)
+        output_exists = valid_uri(item.get("output_uri"))
+        downstream_usable = item_is_downstream_usable(item, formal_asset)
         if status in ("done", "reused"):
             if formal_asset:
                 stats[status] += 1
-                stats["usable"] += 1
+                stats["generated"] += 1
+                if downstream_usable:
+                    stats["usable"] += 1
+                else:
+                    stats["awaiting_review"] += 1
             else:
                 stats["unverified_done"] += 1
                 issues.append({
@@ -951,6 +989,22 @@ def _production_progress(app, episode, render_plan):
                 })
         else:
             stats[status] += 1
+            if output_exists:
+                stats["generated"] += 1
+
+        if downstream_usable:
+            pass
+        elif status in ("generating", "retrying"):
+            pass
+        elif status in ("awaiting_human", "failed"):
+            stats["needs_repair"] += 1
+        elif formal_asset or output_exists:
+            stats["awaiting_review"] += (
+                0 if status in ("done", "reused") else 1)
+        elif status == "pending" and live_run:
+            stats["queued"] += 1
+        else:
+            stats["not_generated"] += 1
 
         if status in ("generating", "retrying"):
             try:
@@ -985,6 +1039,11 @@ def _production_progress(app, episode, render_plan):
         "total": 0,
         **{key: 0 for key in status_keys},
         "usable": 0,
+        "generated": 0,
+        "awaiting_review": 0,
+        "needs_repair": 0,
+        "queued": 0,
+        "not_generated": 0,
         "unverified_done": 0,
         "percent": 0,
     }
@@ -994,7 +1053,10 @@ def _production_progress(app, episode, render_plan):
             category["usable"] * 100 / category["total"], 1
         ) if category["total"] else 0
         ordered_categories.append(category)
-        for key in ("total", *status_keys, "usable", "unverified_done"):
+        for key in (
+                "total", *status_keys, "usable", "generated",
+                "awaiting_review", "needs_repair", "queued",
+                "not_generated", "unverified_done"):
             overall[key] += int(category[key])
     overall["percent"] = round(
         overall["usable"] * 100 / overall["total"], 1
@@ -1127,17 +1189,27 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
         source = categories.get(key) or {}
         total = max(int(source.get("total") or 0), total_shots)
         usable = int(source.get("usable") or 0)
+        generating = int(source.get("generating") or 0)
+        retrying = int(source.get("retrying") or 0)
+        awaiting_human = int(source.get("awaiting_human") or 0)
+        failed = int(source.get("failed") or 0)
         return {
             "key": key,
             "label": label,
             "status": "paused",
             "total": total,
             "usable": usable,
+            "generated": int(source.get("generated") or usable),
+            "awaiting_review": int(source.get("awaiting_review") or 0),
+            "needs_repair": int(source.get("needs_repair") or (
+                awaiting_human + failed)),
+            "queued": int(source.get("queued") or 0),
+            "not_generated": int(source.get("not_generated") or 0),
             "pending": int(source.get("pending") or 0),
-            "generating": int(source.get("generating") or 0),
-            "retrying": int(source.get("retrying") or 0),
-            "awaiting_human": int(source.get("awaiting_human") or 0),
-            "failed": int(source.get("failed") or 0),
+            "generating": generating,
+            "retrying": retrying,
+            "awaiting_human": awaiting_human,
+            "failed": failed,
             "remaining": max(0, total - usable),
             "percent": round(usable * 100 / total, 1) if total else 0,
             "blocked_by": [],
@@ -1205,6 +1277,13 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
                 + stage["awaiting_human"] + stage["failed"])
             stage["pending"] = max(
                 stage["pending"], stage["remaining"] - accounted)
+            bucketed = (
+                stage["usable"] + stage["awaiting_review"]
+                + stage["needs_repair"] + stage["generating"]
+                + stage["retrying"] + stage["queued"]
+                + stage["not_generated"])
+            if bucketed < stage["total"]:
+                stage["not_generated"] += stage["total"] - bucketed
     continuity_keys = {
         str(shot.get("scene_no") or f"shot:{shot.get('shot_no')}")
         for shot in storyboard_shots
@@ -1236,6 +1315,11 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
         "status": "paused",
         "total": total_shots,
         "usable": min(usable_videos, total_shots),
+        "generated": min(usable_videos, total_shots),
+        "awaiting_review": 0,
+        "needs_repair": 0,
+        "queued": 0,
+        "not_generated": max(0, total_shots - usable_videos),
         "pending": max(0, total_shots - usable_videos),
         "generating": int(
             ((overall.get("parallelism") or {}).get("video") or {}).get(
@@ -1326,23 +1410,33 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
             }
         )
     )
+    keyframe_count_text = (
+        f"已生成 {keyframes['generated']}/{keyframes['total']}，"
+        f"可用于下游 {keyframes['usable']}/{keyframes['total']}。")
     if keyframes_ready:
         keyframes["status"] = "ready"
-        keyframes["reason"] = "全部关键帧均已登记为可读取的正式资产。"
+        keyframes["reason"] = (
+            f"{keyframe_count_text} 全部关键帧均已通过当前合同。")
     elif image_stage_active:
         keyframes["status"] = "active"
-        keyframes["reason"] = "关键帧生产任务正在运行。"
+        keyframes["reason"] = (
+            f"关键帧生产任务正在运行；{keyframe_count_text}")
     elif keyframes["pending"] > 0 or pending_shots:
         keyframes["status"] = "paused"
         keyframes["reason"] = (
-            f"当前没有运行任务；还有 {len(pending_shots) or keyframes['pending']} "
+            f"{keyframe_count_text} 当前没有运行任务；还有 "
+            f"{len(pending_shots) or keyframes['pending']} "
             "个镜头可继续生产。")
     elif keyframes["awaiting_human"] or keyframes["failed"]:
         keyframes["status"] = "blocked"
-        keyframes["reason"] = "剩余关键帧均需人工处理，暂时无法自动进入下一阶段。"
+        keyframes["reason"] = (
+            f"{keyframe_count_text} 剩余关键帧均需人工处理，"
+            "暂时无法自动进入下一阶段。")
     else:
         keyframes["status"] = "blocked"
-        keyframes["reason"] = "未找到完整的关键帧正式资产或可继续的生产项。"
+        keyframes["reason"] = (
+            f"{keyframe_count_text} 未找到完整的关键帧正式资产"
+            "或可继续的生产项。")
 
     keyframe_blockers = []
     if pending_shots or keyframes["pending"]:
@@ -1926,6 +2020,9 @@ def make_handler(workspace, jobs):
                             app, int(match.group(1))))
                     if payload is None:
                         return self._error(404, "剧集不存在")
+                    payload["live_jobs"] = copy.deepcopy(jobs.running_for(
+                        payload["project"]["title"],
+                        payload["episode"]["number"]))
                     return self._json(payload)
                 if route == "/api/assets":
                     return self._assets(query)

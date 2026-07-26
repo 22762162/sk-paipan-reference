@@ -6,6 +6,7 @@ import pytest
 
 from aifos.app import App
 from aifos.cli import main
+from aifos.db import now
 from aifos.director import MODERN_OTOME_STYLE, infer_visual_style
 from aifos.errors import AifosError
 
@@ -258,6 +259,26 @@ def test_stop_lands_back_to_reviewable_state(app):
     # 确认后可正常继续到完成
     summary = app.director.produce("停一下", 1)
     assert summary["status"] == "done"
+
+
+def test_stop_after_downstream_work_lands_on_paused_workspace(app):
+    """已经进入分镜/出图后暂停，应留在可查看全部环节的制作工作区。"""
+    project, _ = app.projects.get_or_create_project("暂停工作区")
+    episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+    app.projects.save_document(
+        episode["id"], "script",
+        {"characters": [], "scenes": [{"scene_no": 1}]})
+    stamp = now()
+    app.db.execute(
+        "INSERT INTO tasks(episode_id, stage, name, status, created_at, "
+        "updated_at) VALUES(?,?,?,?,?,?)",
+        (episode["id"], "storyboard", "五维分镜", "stopped", stamp, stamp))
+    app.projects.set_episode_status(episode["id"], "cancelling")
+
+    summary = app.director.produce("暂停工作区", 1)
+
+    assert summary["status"] == "paused"
+    assert app.projects.get_episode(episode["id"])["status"] == "paused"
 
 
 def test_cli_stop(tmp_path, capsys):

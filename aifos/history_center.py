@@ -18,6 +18,7 @@ DERIVED_VISUAL_STATE_KINDS = {
 STABLE_EPISODE_STATUSES = {
     "done", "failed", "qc_failed", "created",
     "awaiting_script", "awaiting_cast", "awaiting_confirm", "queued_script",
+    "paused",
 }
 
 
@@ -125,7 +126,7 @@ class HistoryCenter:
         elif result_status in {"failed", "qc_failed"}:
             status = "failed"
         elif result_status in {"awaiting_script", "awaiting_cast",
-                               "awaiting_confirm", "queued_script"}:
+                               "awaiting_confirm", "queued_script", "paused"}:
             status = "paused"
         elif result_status == "created":
             status = "stopped"
@@ -163,11 +164,27 @@ class HistoryCenter:
         gate = self.db.query_one(
             "SELECT COUNT(*) AS n FROM tasks WHERE episode_id=? "
             "AND stage='preflight' AND status='done'", (episode_id,))
+        downstream = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM tasks WHERE episode_id=? "
+            "AND stage IN ('storyboard','blocking','images','text_assets',"
+            "'frames','preflight','videos','voices','edit','qc','package',"
+            "'archive') AND status IN "
+            "('running','done','stopped','failed','interrupted')",
+            (episode_id,))
+        cast = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM tasks WHERE episode_id=? "
+            "AND stage='cast' AND status IN "
+            "('running','done','stopped','failed','interrupted')",
+            (episode_id,))
         script = self.db.query_one(
             "SELECT id FROM documents WHERE episode_id=? AND kind='script' "
             "LIMIT 1", (episode_id,))
         if gate and gate["n"]:
             return "awaiting_confirm"
+        if downstream and downstream["n"]:
+            return "paused"
+        if cast and cast["n"]:
+            return "awaiting_cast"
         if script is not None:
             return "awaiting_script"
         return "created"
@@ -207,7 +224,7 @@ class HistoryCenter:
         active = self.db.query(
             "SELECT id FROM episodes WHERE status NOT IN "
             "('done','failed','qc_failed','created','awaiting_script',"
-            "'awaiting_cast','awaiting_confirm','queued_script')")
+            "'awaiting_cast','awaiting_confirm','queued_script','paused')")
         for episode in active:
             self.recover_episode(
                 episode["id"], "服务重启，生成任务已安全恢复")
@@ -242,7 +259,7 @@ class HistoryCenter:
                       "failed" if episode["status"] in {"failed", "qc_failed"}
                       else "paused" if episode["status"] in {
                           "awaiting_script", "awaiting_cast",
-                          "awaiting_confirm", "queued_script"} else
+                          "awaiting_confirm", "queued_script", "paused"} else
                       "stopped")
             started = min((t["created_at"] for t in tasks),
                           default=episode["created_at"])

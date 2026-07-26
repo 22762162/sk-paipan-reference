@@ -817,6 +817,13 @@ class Director:
                 "SELECT COUNT(*) AS n FROM tasks WHERE episode_id=? "
                 "AND stage=? AND status='done'",
                 (episode["id"], CONFIRM_AFTER))
+            downstream_started = self.db.query_one(
+                "SELECT COUNT(*) AS n FROM tasks WHERE episode_id=? "
+                "AND stage IN ('storyboard','blocking','images','text_assets',"
+                "'frames','preflight','videos','voices','edit','qc','package',"
+                "'archive') AND status IN "
+                "('running','done','stopped','failed','interrupted')",
+                (episode["id"],))
             script_doc, _ = self.projects.latest_document(
                 episode["id"], "script")
             selection = self.production_asset_selection_status(
@@ -830,11 +837,14 @@ class Director:
             landing = ("awaiting_confirm" if gate_done and gate_done["n"]
                        else "awaiting_cast" if (
                            selection.get("required") and candidates_started)
+                       else "paused" if (
+                           downstream_started and downstream_started["n"])
                        else "awaiting_script" if script_doc else "created")
             self.projects.set_episode_status(episode["id"], landing)
             self.log.info(
                 "director",
-                f"已手动停止生成,回到「{landing}」;调整后确认即可继续")
+                f"已手动停止生成,停在「{landing}」;已有环节可继续查看，"
+                "恢复时只补剩余内容")
         elif paused == "script":
             self.projects.set_episode_status(
                 episode["id"], "awaiting_script")
