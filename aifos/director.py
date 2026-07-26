@@ -303,6 +303,20 @@ SCENE_ENVIRONMENT_PRESETS = (
      "剧情，不用无关建筑或随机人物填充"),
 )
 
+# 场景概念图是跨集复用的无人环境母资产：人物调度与案发痕迹属于镜头层。
+# 编剧的 production_design 字段按"这场戏"写作,天然带人物与事件；直接拼进
+# 空镜提示词会自相矛盾——LLM 中介产线(Codex)会替我们裁决,直连扩散模型
+# (即梦/Seedream)则会画出"半个人"或把一次性血迹烧进所有后续镜头的环境。
+# 按子句过滤:宁可少一句描述,不能让人物或事件进入母资产。
+SCENE_PERSON_TOKENS = (
+    "人物", "人体", "人影", "人群", "路人", "众人", "行人", "身影",
+    "剪影", "衣人", "尸", "书童", "侍卫", "士兵", "仆", "丫鬟",
+    "随从", "百姓", "藏于", "探看", "围立", "对峙", "倒伏",
+)
+SCENE_EVENT_TOKENS = ("血", "凶案", "凶器", "打斗", "厮杀", "搏斗", "追杀",
+                      "刀刃", "兵刃")
+SCENE_HEADCOUNT_RE = re.compile(r"[一两二三四五六七八九十数几多]名")
+
 
 def is_background_character(character):
     """背景路人可出现在镜头剧情中，但不创建单独人物母资产。"""
@@ -1515,7 +1529,31 @@ class Director:
                 "材质、设备、建筑与陈设严格服从剧本时代/世界观、地域和社会阶层，"
                 "不凭空加入不属于故事的现代或古代元素")
 
-    def _scene_prompt(self, location, style, scene=None, premise=""):
+    @staticmethod
+    def _scene_design_text(text, cast_names=()):
+        """把编剧场景字段清洗成纯环境描述(空镜母资产专用)。
+
+        与 _scene_style_line 同一职责方向:上游字段按"这场戏"写作,
+        这里不信任上游,逐子句丢弃含人物名、人称词、人数量词或一次性
+        事件痕迹(血迹/凶器)的子句,只保留可跨集复用的环境子句。"""
+        clauses = [part.strip() for part in
+                   re.split(r"[，,;；。、]", str(text or ""))
+                   if part.strip()]
+        kept = []
+        for clause in clauses:
+            if SCENE_HEADCOUNT_RE.search(clause):
+                continue
+            if any(token in clause for token in SCENE_PERSON_TOKENS):
+                continue
+            if any(token in clause for token in SCENE_EVENT_TOKENS):
+                continue
+            if any(name and name in clause for name in cast_names):
+                continue
+            kept.append(clause)
+        return "，".join(kept)
+
+    def _scene_prompt(self, location, style, scene=None, premise="",
+                      cast_names=()):
         """场景概念图提示词:只建立可复用环境,不把人物画风误当场景内容。"""
         scene = scene or {}
         place = str(location or scene.get("location") or "未命名地点")
@@ -1530,16 +1568,23 @@ class Director:
         production_design = (
             scene.get("production_design")
             if isinstance(scene.get("production_design"), dict) else {})
+        # story_function/production_design 是编剧按"这场戏"写的,常含人物
+        # 调度与案发事件;场景母资产是跨集复用的空镜,必须先去人物化。
         purpose = (
-            production_design.get("story_function")
-            or scene.get("scene_purpose")
+            self._scene_design_text(
+                production_design.get("story_function")
+                or scene.get("scene_purpose") or "", cast_names)
             or "建立本地点可复用的空间、出入口、表演区与摄影动线")
         analysis_line = "；".join(filter(None, (
-            str(scene.get("prompt_prefix") or "").strip(),
-            str(production_design.get("environment") or "").strip(),
-            str(production_design.get("layout") or "").strip(),
-            str(production_design.get("materials_and_props") or "").strip(),
-            str(production_design.get("lighting") or "").strip(),
+            self._scene_design_text(scene.get("prompt_prefix"), cast_names),
+            self._scene_design_text(
+                production_design.get("environment"), cast_names),
+            self._scene_design_text(
+                production_design.get("layout"), cast_names),
+            self._scene_design_text(
+                production_design.get("materials_and_props"), cast_names),
+            self._scene_design_text(
+                production_design.get("lighting"), cast_names),
         )))
         negative = str(scene.get("negative_prompt") or "").strip()
         return ";".join(filter(None, (
@@ -5710,6 +5755,10 @@ class Director:
         all_characters = ctx["script"].get("characters", [])
         characters = [
             c for c in all_characters if character_candidate_target(c) > 0]
+        # 场景提示词清洗用全量名单(含背景路人):任何人物名都不得进空镜。
+        cast_names = tuple(
+            str(c.get("name") or "").strip()
+            for c in all_characters if str(c.get("name") or "").strip())
         locations = []
         scene_context_by_location = {}
         for scene in ctx["script"]["scenes"]:
@@ -5804,7 +5853,8 @@ class Director:
              "label": loc, "name": loc,
              "prompt": self._scene_prompt(
                  loc, style, scene_context_by_location.get(loc),
-                 premise=ctx["episode"].get("premise", "")),
+                 premise=ctx["episode"].get("premise", ""),
+                 cast_names=cast_names),
              **self._quality_meta(scene_quality[loc])}
             for loc in locations])
         reused, created = 0, 0
@@ -5861,7 +5911,8 @@ class Director:
                     "action": scene.get("action", ""),
                     "prompt": self._scene_prompt(
                         location, style, scene,
-                        premise=ctx["episode"].get("premise", "")),
+                        premise=ctx["episode"].get("premise", ""),
+                        cast_names=cast_names),
                     "style": style,
                     "prompt_contract_complete": True,
                     **scene_references,
@@ -5870,7 +5921,16 @@ class Director:
                         scene_references["reference_images"]
                         or self._style_anchor_uri(project_id)),
                     "aspect": ctx["aspect"], **ctx["dims"],
-                }, "sub_dir": "cast", "tag": ("scene_art", location)})
+                },
+                # 空镜硬门:场景概念图此前不过机器质检,带人物的图会直达
+                # 人工候选。挂 0 人合同后,detected_count != 0 即自动判死。
+                "qc_spec": self._qc_spec(
+                    project_id, [], location=location,
+                    forbid=["人物", "人体局部", "剪影", "倒影中的人",
+                            "随机路人"],
+                    require_identity=False, expected_characters=[],
+                    expected_count=0),
+                "sub_dir": "cast", "tag": ("scene_art", location)})
         # 人物资产套件与场景图共用同一批次，引用各自立绘+风格基准图。
         for character in characters:
             name = character["name"]
@@ -5936,8 +5996,12 @@ class Director:
                     }), "sub_dir": "cast",
                     "tag": ("character_sheet", name, key, label),
                 })
-        for tag, result in self._run_parallel(
-                ctx, tasks, line="人物/场景独立资产").items():
+        # 场景任务带 0 人空镜 qc_spec:与关键帧同策略,质检失败不拖垮
+        # 整批——其余资产照常完成落库,失败项隔离待人工后统一报错。
+        asset_results, asset_qc_failures = self._run_parallel(
+            ctx, tasks, line="人物/场景独立资产",
+            continue_on_qc_failure=True)
+        for tag, result in asset_results.items():
             if tag[0] == "scene_art":
                 _kind, name = tag
                 self.assets.register(
@@ -5962,6 +6026,21 @@ class Director:
                       "quality_source": "auto",
                       "quality_rule": "mother_asset"})
             created += 1
+        if asset_qc_failures:
+            failed_labels = sorted(
+                (f"场景「{task['tag'][1]}」" if task["tag"][0] == "scene_art"
+                 else f"{task['tag'][1]}·{task['tag'][3]}")
+                for task, _error in asset_qc_failures)
+            self.log.warn(
+                "director",
+                f"人物/场景资产本批已完成其余 {len(asset_results)} 项；"
+                f"{len(failed_labels)} 项二次质检仍未通过，已隔离待人工: "
+                + "、".join(failed_labels))
+            raise AifosError(
+                f"{len(failed_labels)} 项资产自动修图 1 次后仍未通过"
+                "(常见原因:空镜场景图出现人物)；问题图已保留待人工处理，"
+                "其余资产已完成。请修改后从断点继续。问题项: "
+                + "、".join(failed_labels))
         # 保存包含独立母资产就绪状态的最新人物定版文档，供 UI/API 和
         # 后续生产门禁读取；合成审核板不计入正式参考图。
         ctx["cast_selection"] = self.production_asset_selection_status(
@@ -10518,7 +10597,11 @@ class Director:
                           if s["location"] == name), {})
             prompt = prompt_override or self._scene_prompt(
                 name, style, scene,
-                premise=episode["premise"] if episode else "")
+                premise=episode["premise"] if episode else "",
+                cast_names=tuple(
+                    str(c.get("name") or "").strip()
+                    for c in script.get("characters", [])
+                    if str(c.get("name") or "").strip()))
             reference_payload = self._user_reference_payload(
                 project["id"], [name],
                 allowed_roles={"scene", "composition"})
