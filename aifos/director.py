@@ -5989,13 +5989,20 @@ class Director:
 
     def _matching_produced_image_rows(self, project_id, characters,
                                       location, shot_no=None, limit=3,
-                                      wardrobe_states=None):
+                                      wardrobe_states=None,
+                                      headwear_states=None):
         """从资产中心找同人物/同场景的正式成图，优先作为连续性参考。"""
         wanted = set(characters or [])
         expected_appearance = {
-            str(name): str(wardrobe or "")
-            for name, wardrobe in (wardrobe_states or {}).items()
-            if str(wardrobe or "").strip()
+            str(name): {
+                "wardrobe": str(
+                    (wardrobe_states or {}).get(name) or "").strip(),
+                "headwear": str(
+                    (headwear_states or {}).get(name) or "").strip(),
+            }
+            for name in set(wardrobe_states or {}) | set(headwear_states or {})
+            if (str((wardrobe_states or {}).get(name) or "").strip()
+                or str((headwear_states or {}).get(name) or "").strip())
         }
         ranked = []
         for row in self.assets.active_list(project_id):
@@ -6026,11 +6033,20 @@ class Director:
                     continue
                 compatible = True
                 for name, expected in expected_appearance.items():
-                    actual = str(
-                        (row_appearance.get(name) or {}).get("wardrobe")
-                        or "")
-                    if not self._wardrobe_states_compatible(
-                            expected, actual):
+                    actual_state = row_appearance.get(name) or {}
+                    actual_wardrobe = str(
+                        actual_state.get("wardrobe") or "")
+                    actual_headwear = str(
+                        actual_state.get("headwear") or "")
+                    if (expected["wardrobe"]
+                            and not self._wardrobe_states_compatible(
+                                expected["wardrobe"], actual_wardrobe)):
+                        compatible = False
+                        break
+                    if (expected["headwear"]
+                            and not self._headwear_states_compatible(
+                                expected["headwear"],
+                                f"{actual_wardrobe} {actual_headwear}")):
                         compatible = False
                         break
                 if not compatible:
@@ -6137,6 +6153,56 @@ class Director:
             for family in families
         )
 
+    @staticmethod
+    def _visible_headwear_terms(value):
+        """Extract headwear that is visibly worn, ignoring removal prose."""
+        text = str(value or "")
+        terms = (
+            "乌纱帽", "乌纱", "网巾", "头巾", "发冠", "凤冠",
+            "冠", "帽", "盔", "簪", "钗",
+        )
+        removed = re.compile(
+            r"(?:摘(?:去|下)?|脱(?:去|下)?|去掉|除去|未戴|不戴|无)"
+            r".{0,8}(?:乌纱帽|乌纱|网巾|头巾|发冠|凤冠|冠|帽|盔|簪|钗)")
+        visible_text = removed.sub("", text)
+        return {
+            term for term in terms
+            if term in visible_text
+            and not any(
+                term != other and term in other and other in visible_text
+                for other in terms)
+        }
+
+    @staticmethod
+    def _headwear_state_is_none(value):
+        text = str(value or "").strip()
+        return text in {
+            "无", "无头饰", "不戴头饰", "未戴头饰", "去除头饰",
+            "摘下头饰", "光头", "裸头",
+        }
+
+    @classmethod
+    def _headwear_states_compatible(cls, expected, actual):
+        """Reject a visually conflicting hat even when the robe matches."""
+        expected = str(expected or "").strip()
+        if not expected:
+            return True
+        actual_terms = cls._visible_headwear_terms(actual)
+        if cls._headwear_state_is_none(expected):
+            return not actual_terms
+        expected_terms = cls._visible_headwear_terms(expected)
+        if not expected_terms:
+            return False
+        return bool(expected_terms & actual_terms)
+
+    @staticmethod
+    def _look_headwear_text(look):
+        look = look if isinstance(look, dict) else {}
+        return "；".join(
+            str(look.get(key) or "").strip()
+            for key in ("costume", "hair", "headwear", "accessories")
+            if str(look.get(key) or "").strip())
+
     @classmethod
     def _wardrobe_candidate_score(cls, wardrobe, costume):
         """Score a mother asset's *outer current look* for wardrobe binding."""
@@ -6163,7 +6229,7 @@ class Director:
         return score
 
     def _wardrobe_reference_row(self, project_id, name, wardrobe,
-                                used_uris=None):
+                                used_uris=None, headwear=""):
         """Reuse the closest locked mother asset strictly as a wardrobe ref."""
         target = self._wardrobe_terms(wardrobe)
         if not target:
@@ -6183,8 +6249,18 @@ class Director:
             quality = self._asset_quality(row)
             if not formal_reference_allowed(quality):
                 continue
+            # A full portrait used as "clothes only" still leaks its face into
+            # image models. Only dedicated face-free wardrobe assets may fill
+            # this role; ordinary candidates remain identity-selection assets.
+            if not (
+                    meta.get("wardrobe_face_free") is True
+                    or meta.get("reference_scope") == "wardrobe_only"):
+                continue
             look = meta.get("look_variant")
             look = look if isinstance(look, dict) else {}
+            if not self._headwear_states_compatible(
+                    headwear, self._look_headwear_text(look)):
+                continue
             score = self._wardrobe_candidate_score(
                 wardrobe, look.get("costume"))
             if score:
@@ -6197,12 +6273,19 @@ class Director:
         # its separately generated costume sheet. This avoids dual-binding one
         # image as both face identity and wardrobe.
         locked = self._locked_look_variant(project_id, name)
-        if self._wardrobe_candidate_score(
-                wardrobe, locked.get("costume")):
+        if (self._wardrobe_candidate_score(
+                wardrobe, locked.get("costume"))
+                and self._headwear_states_compatible(
+                    headwear, self._look_headwear_text(locked))):
             for key in ("costume", "costume_detail"):
                 row = self.assets.latest(
                     project_id, "character_sheet", f"{name}:{key}")
-                if (row and str(row["uri"] or "") not in used
+                meta = self._asset_meta(row) if row is not None else {}
+                if (row
+                        and (meta.get("wardrobe_face_free") is True
+                             or meta.get("reference_scope")
+                             == "wardrobe_only")
+                        and str(row["uri"] or "") not in used
                         and formal_reference_allowed(self._asset_quality(row))
                         and (str(row["uri"]).startswith(
                             ("http://", "https://"))
@@ -6230,7 +6313,7 @@ class Director:
     def _art_refs(self, ctx, characters, location, shot_no=None,
                   sheet_keys=None, sheet_keys_by_character=None,
                   spatial_ref="", inner_persona_ref="", prop_names=None,
-                  wardrobe_states=None):
+                  wardrobe_states=None, headwear_states=None):
         """最终立绘/人物套件/场景图/用户参考 → 真实多图参考输入。
 
         含人物画面缺任何一个最终立绘都直接阻断；禁止静默退化为文字生图。
@@ -6239,7 +6322,8 @@ class Director:
         """
         project_id = ctx["project"]["id"]
         refs = {"character_refs": [], "identity_references": [],
-                "prop_refs": [], "asset_matches": []}
+                "prop_refs": [], "asset_matches": [],
+                "appearance_reference_warnings": []}
         used_uris = set()
 
         def room():
@@ -6265,17 +6349,25 @@ class Director:
             current_wardrobe = str(
                 (wardrobe_states or {}).get(
                     character) or "").strip()
+            current_headwear = str(
+                (headwear_states or {}).get(
+                    character) or "").strip()
             locked_look = self._locked_look_variant(
                 project_id, character)
+            wardrobe_matches = (
+                not current_wardrobe
+                or bool(self._wardrobe_candidate_score(
+                    current_wardrobe, locked_look.get("costume"))))
+            headwear_matches = self._headwear_states_compatible(
+                current_headwear, self._look_headwear_text(locked_look))
             if (current_wardrobe
-                    and self._wardrobe_candidate_score(
-                        current_wardrobe, locked_look.get("costume"))):
+                    and wardrobe_matches and headwear_matches):
                 # One image can safely carry both responsibilities when the
                 # manually selected portrait visibly wears this exact look.
                 identity["wardrobe_lock"] = current_wardrobe
                 wardrobe_bound_names.add(character)
-            elif current_wardrobe and str(
-                    locked_look.get("costume") or "").strip():
+            elif ((current_wardrobe or current_headwear)
+                  and self._look_headwear_text(locked_look)):
                 # A full-body final portrait wearing another scene's outfit
                 # visually overpowers a clothes-only reference even when the
                 # prompt says "identity only". Replace the submitted image
@@ -6389,9 +6481,24 @@ class Director:
                 continue
             wardrobe = str(
                 (wardrobe_states or {}).get(name) or "").strip()
+            headwear = str(
+                (headwear_states or {}).get(name) or "").strip()
             row = self._wardrobe_reference_row(
-                project_id, name, wardrobe, used_uris)
-            if row is None or not remember(row["uri"]):
+                project_id, name, wardrobe, used_uris,
+                headwear=headwear)
+            if row is None:
+                if wardrobe:
+                    refs["appearance_reference_warnings"].append({
+                        "character": name,
+                        "wardrobe": wardrobe,
+                        "headwear": headwear,
+                        "reason": (
+                            "没有与当前服装和头饰同时匹配、且不含人物脸的"
+                            "专用服装参考；本镜仅使用面部身份锚和当前镜头"
+                            "造型文字合同，未上传冲突服装图"),
+                    })
+                continue
+            if not remember(row["uri"]):
                 continue
             refs["character_refs"].append(row["uri"])
             refs["asset_matches"].append({
@@ -6468,7 +6575,8 @@ class Director:
                 })
         matched_rows = (self._matching_produced_image_rows(
             project_id, characters, location, shot_no=shot_no, limit=3,
-            wardrobe_states=wardrobe_states)
+            wardrobe_states=wardrobe_states,
+            headwear_states=headwear_states)
             if shot_no is not None else [])
         # 只允许当前分镜合同下已经通过视觉质检的镜头图充当连续性参考。
         # 分镜重排后旧图片仍保存在资产历史中；如果仅按“同人物/同场景”
@@ -6941,6 +7049,15 @@ class Director:
                             "wardrobe")
                         or ((shot.get("start_state") or {}).get(name) or {}).get(
                             "wardrobe")
+                        or "")
+                    for name in identity_characters
+                },
+                headwear_states={
+                    name: str(
+                        ((shot.get("end_state") or {}).get(name) or {}).get(
+                            "headwear")
+                        or ((shot.get("start_state") or {}).get(name) or {}).get(
+                            "headwear")
                         or "")
                     for name in identity_characters
                 }),

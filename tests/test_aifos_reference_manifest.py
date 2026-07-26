@@ -268,6 +268,72 @@ def test_conflicting_full_body_identity_uses_face_only_anchor(
     assert "服装只服从本镜服装参考" in identity_entry["binding"]
 
 
+def test_headwear_conflict_cannot_reenter_through_wardrobe_reference(
+        app, monkeypatch):
+    project, episode, script = _preproduce(
+        app, title="头饰与服装参考职责隔离")
+    name = script["characters"][0]["name"]
+    closeup = app.assets.latest(
+        project["id"], "character_sheet", f"{name}:closeup")
+    assert closeup is not None
+    monkeypatch.setattr(
+        app.director, "_locked_look_variant",
+        lambda _project_id, _name: {
+            "costume": "深青官袍、乌纱帽、革带",
+            "hair": "束发压于乌纱帽下",
+        })
+
+    refs = app.director._art_refs(
+        {"project": dict(project), "episode": dict(episode)},
+        [name], "", wardrobe_states={name: "深青官袍"},
+        headwear_states={name: "无"})
+
+    identity = refs["identity_references"][0]
+    assert identity["identity_anchor_type"] == "face_only_derived"
+    assert identity["uri"] == closeup["uri"]
+    assert not [
+        item for item in refs["asset_matches"]
+        if item.get("kind") == "wardrobe_reference"]
+    warning = refs["appearance_reference_warnings"][0]
+    assert warning["headwear"] == "无"
+    assert "未上传冲突服装图" in warning["reason"]
+
+
+def test_continuity_reference_must_match_headwear_as_well_as_robe(
+        app, tmp_path):
+    project, _ = app.projects.get_or_create_project("头饰连续性参考测试")
+    with_hat = tmp_path / "official-with-hat.png"
+    no_hat = tmp_path / "official-no-hat.png"
+    with_hat.write_bytes(PNG)
+    no_hat.write_bytes(PNG)
+    with_hat_row = app.assets.register(
+        project["id"], "image", "with-hat",
+        uri=str(with_hat), meta={
+            "characters": ["赵德昌"], "location": "县衙公堂",
+            "image_quality": "medium",
+            "appearance_state": {
+                "赵德昌": {"wardrobe": "深青官袍", "headwear": "乌纱帽"},
+            },
+        })
+    no_hat_row = app.assets.register(
+        project["id"], "image", "no-hat",
+        uri=str(no_hat), meta={
+            "characters": ["赵德昌"], "location": "县衙公堂",
+            "image_quality": "medium",
+            "appearance_state": {
+                "赵德昌": {"wardrobe": "深青官袍", "headwear": "无"},
+            },
+        })
+
+    matched = app.director._matching_produced_image_rows(
+        project["id"], ["赵德昌"], "县衙公堂",
+        wardrobe_states={"赵德昌": "深青官袍"},
+        headwear_states={"赵德昌": "无"})
+    ids = {row["id"] for row in matched}
+    assert no_hat_row["id"] in ids
+    assert with_hat_row["id"] not in ids
+
+
 def test_shot_provider_prompt_contains_current_frame_only(app):
     project, episode, script = _preproduce(app, title="当前镜头提示词")
     storyboard, _ = app.projects.latest_document(
