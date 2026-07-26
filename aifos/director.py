@@ -2393,7 +2393,10 @@ class Director:
                 prompt_review.get("approved") is True
                 or review_status == "not_applicable_mock_only"):
             issues.append("最终提示词尚未通过Codex审核优化")
-        if payload.get("shot_no") is not None:
+        # 只有真正的分镜关键帧/首尾帧需要 v2.2 镜头合同。人物候选图
+        # 为便于排序也带有 shot_no=0，但它不是分镜，不能被误拦成
+        # “缺少镜头合同”。
+        if category in {"shot_image", "frames"}:
             validation = validate_shot_prompt_contract(
                 payload.get("prompt_contract") or {})
             if not validation["passed"]:

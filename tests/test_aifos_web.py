@@ -12,6 +12,7 @@ import pytest
 from aifos.app import App
 from aifos.db import now
 from aifos.director import character_candidate_target
+from aifos.prompt_contract import build_shot_prompt_contract
 from aifos.story_analysis import build_story_analysis, validate_story_analysis
 from aifos.web.server import JobRegistry, _current_render_plan_items, serve
 
@@ -1847,6 +1848,22 @@ def test_image_acceleration_options_and_preflight_api(server):
                 "shot_no": 1, "characters": ["林昭"],
                 "prompt": "林昭看向镜头", "aspect": "9:16",
                 "image_quality": "medium", "image_task_class": "batch",
+                "prompt_contract": build_shot_prompt_contract({
+                    "shot_no": 1,
+                    "characters": ["林昭"],
+                    "description": "林昭看向镜头",
+                    "frame_target": {
+                        "phase": "end",
+                        "state": "林昭看向镜头",
+                        "fallback": False,
+                    },
+                    "prop_registry": [],
+                }, location="室内", mode="image"),
+                "prompt_review": {
+                    "approved": True,
+                    "status": "approved",
+                    "optimized_hash": "test-approved",
+                },
                 "identity_references": [{
                     "character": "林昭", "asset_id": 1, "uri": str(ref)}],
                 "character_refs": [str(ref)],

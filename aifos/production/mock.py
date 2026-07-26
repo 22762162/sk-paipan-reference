@@ -14,6 +14,7 @@ from html import escape
 from pathlib import Path
 
 from ..adapters.claude_script import normalize_script_bible
+from ..identity_facts import explicit_age_range, explicit_gender
 from ..story_analysis import build_story_analysis
 from .base import Provider, ProviderResult
 from .cinematic import render_cover, render_portrait, render_shot
@@ -563,8 +564,13 @@ class MockProvider(Provider):
                 "urban": "约24—35岁青年",
                 "xianxia": "约20—35岁青年",
             }.get(genre_name, "约20—35岁青年")
-            character.setdefault("gender", gender)
-            character.setdefault("age_range", age_range)
+            # 这些人物由 mock 编剧本身创造；如果模板先放入了“未指定/
+            # 以参考图为准”之类占位值，编剧必须在交稿前明确事实，不能让
+            # 下游人物图替它猜性别和年龄。
+            if not explicit_gender(character.get("gender")):
+                character["gender"] = gender
+            if not explicit_age_range(character.get("age_range")):
+                character["age_range"] = age_range
             character.setdefault(
                 "background_prompt",
                 f"{name}是{setting}中的{role},带着一段改变信念的过往;"
