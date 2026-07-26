@@ -60,7 +60,7 @@ def test_qc_prompt_and_validation():
     assert bad["issues"] == ["镜头9画成了动物"]
 
 
-def test_qc_keeps_broken_input_contract_advisory_when_image_is_correct(app):
+def test_qc_blocks_conflicting_input_contract_even_when_image_looks_correct(app):
     from aifos.adapters.claude_script import validate_image_qc
 
     report = app.director._assess_image_qc({
@@ -92,12 +92,44 @@ def test_qc_keeps_broken_input_contract_advisory_when_image_is_correct(app):
 
     assert report["image_passed"] is True
     assert report["input_contract_passed"] is False
-    assert report["passed"] is True
-    assert report["redraw_required"] is False
+    assert report["passed"] is False
+    assert report["redraw_required"] is True
     assert report["contract_repair_required"] is True
     assert report["input_contract_advisory"] is True
+    assert report["contract_hard_failure"] is True
+    assert report["hard_failure"] is True
     assert report["qc_policy"] == "visible_major_defects_v2"
     assert validate_image_qc({"issues": []}) == "缺少 pass 字段"
+
+
+def test_qc_keeps_wording_only_input_advice_non_blocking(app):
+    report = app.director._assess_image_qc({
+        "identity_required": False,
+        "gender_required": False,
+        "count_required": True,
+        "count": 1,
+        "physical_logic_required": False,
+    }, {
+        "pass": True,
+        "visual_pass": True,
+        "input_contract_pass": False,
+        "count_checked": True,
+        "count_match": True,
+        "issues": ["提示词略长，可进一步压缩"],
+        "prompt_diagnosis": {
+            "status": "needs_patch",
+            "issues": ["存在不影响执行的重复形容词"],
+            "irrelevant_or_conflicting_sections": []},
+        "reference_diagnosis": {
+            "status": "correct", "issues": [], "missing_roles": []},
+    }, attempts=1)
+
+    assert report["image_passed"] is True
+    assert report["input_contract_passed"] is False
+    assert report["passed"] is True
+    assert report["redraw_required"] is False
+    assert report["contract_hard_failure"] is False
+    assert report["hard_failure"] is False
 
 
 def test_qc_treats_visible_wardrobe_drift_as_hard_failure(app):
@@ -247,6 +279,36 @@ def test_codex_qc_prompt_uses_same_structured_input_diagnosis_contract(
     assert "reference_diagnosis" in instruction
     assert "targeted_prompt_patch" in instruction
     assert "reference_adjustments" in instruction
+    assert "同一人物不能同时穿两套互斥服装" in instruction
+    assert "已死亡人物不能继续呼吸" in instruction
+    assert "第二次生成" in instruction
+
+
+def test_codex_qc_checks_historical_prop_morphology(tmp_path):
+    from aifos.adapters.codex_image import build_instruction
+
+    instruction, _, _ = build_instruction("image_qc", {
+        "image_uri": "/tmp/ming-lamp.png",
+        "shot_no": 1,
+        "characters": [],
+        "count": 0,
+        "physical_contract": {
+            "rules": [
+                "时代物件锁定—油灯：只画明代陶制或青铜开放式浅盏油灯，"
+                "灯油与棉芯可见；绝不画玻璃灯罩或煤油灯筒",
+            ],
+        },
+        "generation_input": {
+            "scope": {"item_id": "shot:1", "shot_no": 1},
+            "prompt": "明代驿馆病榻旁一盏油灯将尽",
+            "reference_manifest": [],
+        },
+    }, tmp_path)
+
+    assert "时代物件锁定—油灯" in instruction
+    assert "玻璃灯罩" in instruction
+    assert "煤油灯" in instruction
+    assert "正确结构" in instruction
 
 
 def test_legacy_qc_validation_remains_compatible_but_disables_blind_retry():

@@ -3055,9 +3055,13 @@ function planQcReferenceGalleryHtml(item) {
 function planTraceBadges(item) {
   const revision = item.revision || {};
   const refs = item.reference_inputs || {};
+  const semantic = planSemanticCorrections(item);
   const auto = String(revision.source || "").startsWith("batch_");
   return `${auto && revision.prompt_modified
     ? `<span class="plan-st st-auto" title="批量重画已自动加入修正要求">自动改词✓</span>` : ""}
+    ${semantic.length
+      ? `<span class="plan-st st-auto" title="出图前已按当前镜头剧本事实纠正互斥状态">逻辑修正 ×${semantic.length}</span>`
+      : ""}
     ${refs.count
       ? `<span class="plan-st st-refs" title="本次实际交给出图产线的参考图">参考图 ×${refs.count}</span>`
       : (refs.required
@@ -3068,16 +3072,29 @@ function planTraceHtml(item) {
   const revision = item.revision || {};
   const refs = item.reference_inputs || {};
   const refItems = refs.items || [];
-  if (!revision.prompt_modified && !refItems.length && !refs.required) return "";
+  const semantic = planSemanticCorrections(item);
+  if (!revision.prompt_modified && !refItems.length && !refs.required
+      && !semantic.length) return "";
   return `<details class="plan-trace" ${item.status === "generating" ? "open" : ""}>
-    <summary>本次重画记录 · ${revision.prompt_modified ? "提示词已自动修正" : "提示词未改"}
+    <summary>生成输入记录 · ${semantic.length ? `出图前逻辑修正 ${semantic.length} 项` : (revision.prompt_modified ? "提示词已自动修正" : "提示词未改")}
       · ${refItems.length ? `已附 ${refItems.length} 张参考图` : (refs.required ? "缺少必需参考图" : "无需参考图")}</summary>
+    ${semantic.length ? `<div><b>出图前剧本/逻辑纠正：</b><ul>${semantic.map((entry) =>
+      `<li>${entry.character ? `${esc(entry.character)} · ` : ""}${esc(entry.field || "镜头事实")}：
+      ${entry.from ? `原「${esc(entry.from)}」 → ` : ""}改为「${esc(entry.to || "按当前镜头事实执行")}」
+      ${entry.reason ? `（${esc(entry.reason)}）` : ""}</li>`).join("")}</ul></div>` : ""}
     ${revision.feedback ? `<div><b>自动修正：</b>${esc(revision.feedback)}</div>` : ""}
     ${refItems.length ? `<div><b>参考图：</b>${refItems.map((ref) =>
       `${esc(ref.label || ref.kind)}「${esc(ref.name || "未命名") }」`
       + `${ref.reference_role ? `〔${esc(ref.reference_role)}${ref.attach_to ? `→${esc(ref.attach_to)}` : ""}〕` : ""}`
     ).join("；")}</div>` : ""}
   </details>`;
+}
+
+function planSemanticCorrections(item) {
+  const validation = item.prompt_contract_validation || {};
+  const values = validation.semantic_corrections || item.semantic_corrections || [];
+  return Array.isArray(values) ? values.filter((entry) =>
+    entry && typeof entry === "object" && (entry.reason || entry.to)) : [];
 }
 
 function planMockReasonHtml(item) {
@@ -4040,7 +4057,9 @@ const GENERATION_DIAG_FIELD_CN = {
   first_valid: "首帧有效", last_valid: "尾帧有效",
   source_frames_valid: "源帧有效", continuity_valid: "连续性有效",
   visual_checked: "已做视觉检查", provider: "生成通道", model: "模型",
-  generated_at: "生成时间",
+  generated_at: "生成时间", contract_hard_failure: "剧本/逻辑合同硬错误",
+  semantic_corrections: "出图前语义纠正",
+  era_object_constraints: "时代物件结构锁定",
 };
 const GENERATION_DIAG_HIDDEN_FIELDS = new Set([
   "schema", "diagnosis_complete", "prompt_hash", "reference_hash",

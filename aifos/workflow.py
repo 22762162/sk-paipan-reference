@@ -47,7 +47,7 @@ SHOT_FUNCTIONS = {
     "beat": "留白", "physical": "蓄势", "inner_monologue": "内心戏",
 }
 APPEARANCE_STATE_FIELDS = ("wardrobe", "headwear", "hair_makeup")
-APPEARANCE_STATE_VERSION = 1
+APPEARANCE_STATE_VERSION = 2
 APPEARANCE_STATE_ALIASES = {
     "wardrobe": ("wardrobe", "costume", "clothing", "服装", "衣着"),
     "headwear": ("headwear", "hat", "头饰", "帽冠", "冠帽"),
@@ -55,10 +55,21 @@ APPEARANCE_STATE_ALIASES = {
         "hair_makeup", "hair_and_makeup", "styling", "妆发", "发型妆容"),
 }
 WARDROBE_TOKENS = (
-    "官袍", "直裰", "长衫", "长袍", "圆领袍", "交领袍", "盘领袍",
+    "官袍", "直裰", "旅装", "布衣", "麻衣", "短褐", "长衫", "长袍",
+    "圆领袍", "交领袍", "盘领袍",
     "朝服", "常服", "公服", "制服", "工装", "西装", "衬衫", "外套",
     "夹克", "风衣", "大氅", "斗篷", "披风", "裙", "裤", "铠甲",
     "盔甲", "校服", "礼服", "睡衣", "中衣", "襦裙", "道袍", "袈裟",
+)
+WARDROBE_CONFLICT_GROUPS = (
+    {
+        "官袍", "直裰", "旅装", "布衣", "麻衣", "短褐", "长衫",
+        "长袍", "圆领袍", "交领袍", "盘领袍", "朝服", "常服",
+        "公服", "制服", "工装", "西装", "校服", "礼服", "睡衣",
+        "中衣", "襦裙", "道袍", "袈裟", "铠甲", "盔甲",
+    },
+    {"裙", "裤"},
+    {"外套", "夹克", "风衣", "大氅", "斗篷", "披风"},
 )
 HEADWEAR_TOKENS = (
     "乌纱帽", "乌纱", "网巾", "发冠", "头冠", "冠", "帽", "头巾",
@@ -423,7 +434,16 @@ def _character_visual_clause(name, text):
         # first actor-local phrase only so another character's outfit can never
         # be recorded as this actor's wardrobe.
         clause = re.split(r"[，,。；\n]", tail, maxsplit=1)[0]
-        if any(token in clause for token in appearance_tokens):
+        separate_object = any(
+            marker in clause for marker in (
+                "身旁放", "旁边放", "边放", "挂着", "搭着", "摆着",
+                "搁着", "散落", "置于", "放在", "搭在"))
+        worn = any(
+            marker in clause for marker in (
+                "身穿", "穿着", "穿上", "换上", "换成", "改穿",
+                "套上", "披上", "披着", "着一身"))
+        if (any(token in clause for token in appearance_tokens)
+                and (not separate_object or worn)):
             return clause.strip(" ，,；。")
     return ""
 
@@ -503,9 +523,154 @@ def _appearance_conflicts(previous, current):
     """Only call two explicit looks different when their garment anchors clash."""
     previous_terms = _appearance_signature(previous)
     current_terms = _appearance_signature(current)
-    return bool(
-        previous_terms and current_terms
-        and previous_terms.isdisjoint(current_terms))
+    return any(
+        (previous_terms & group)
+        and (current_terms & group)
+        and (previous_terms & group).isdisjoint(current_terms & group)
+        for group in WARDROBE_CONFLICT_GROUPS)
+
+
+def _reconcile_explicit_appearance(name, text, explicit):
+    """Let actor-local shot facts override a leaked global appearance.
+
+    AI storyboard JSON can contain a structurally valid but story-invalid
+    wardrobe copied from a character bible.  For example, the action says
+    ``沈砚布旅装`` while ``start_state.沈砚.wardrobe`` contains his later
+    official robe.  A direct actor-local clause in the current shot is the
+    narrower source of truth and is safe to apply deterministically.
+    """
+    declared = _normalized_explicit_state(explicit)
+    visible = _visible_appearance(name, text)
+    corrections = []
+    transition = _appearance_transition(name, text)
+    for field in APPEARANCE_STATE_FIELDS:
+        visible_value = str(visible.get(field) or "").strip()
+        declared_value = str(declared.get(field) or "").strip()
+        if not visible_value:
+            continue
+        conflicts = (
+            _appearance_conflicts(declared_value, visible_value)
+            if field == "wardrobe"
+            else bool(declared_value and declared_value != visible_value
+                      and declared_value not in visible_value
+                      and visible_value not in declared_value))
+        if conflicts:
+            declared[field] = visible_value
+            corrections.append({
+                "character": str(name),
+                "field": field,
+                "from": declared_value,
+                "to": visible_value,
+                "reason": (
+                    "当前镜头明确换装后的可见状态优先"
+                    if transition else
+                    "当前镜头动作中的人物局部事实优先于全局人物设定"),
+            })
+        elif not declared_value:
+            declared[field] = visible_value
+    return declared, corrections
+
+
+def reconcile_shot_semantics(shot):
+    """Repair one saved/current shot without changing its story action.
+
+    The function is intentionally deterministic: it only reconciles explicit
+    actor-local appearance evidence already present in the shot.  It never
+    invents a new outfit, prop, action or plot beat.
+    """
+    repaired = copy.deepcopy(shot or {})
+    action_text = "；".join(str(value or "") for value in (
+        repaired.get("description"), repaired.get("action"),
+        repaired.get("prompt")))
+    start_states = (
+        repaired.get("start_state")
+        if isinstance(repaired.get("start_state"), dict) else {})
+    end_states = (
+        repaired.get("end_state")
+        if isinstance(repaired.get("end_state"), dict) else {})
+    corrections = list(repaired.get("semantic_corrections") or [])
+    transition = any(
+        token in action_text for token in APPEARANCE_CHANGE_TOKENS)
+    for name in repaired.get("characters") or []:
+        start = copy.deepcopy(start_states.get(name) or {})
+        end = copy.deepcopy(end_states.get(name) or {})
+        visible = _visible_appearance(name, action_text)
+        visible_wardrobe = str(visible.get("wardrobe") or "").strip()
+        if visible_wardrobe:
+            for label, state in (("start_state", start), ("end_state", end)):
+                current = str(state.get("wardrobe") or "").strip()
+                # A visible change may legitimately start in the old look;
+                # only its endpoint must match the new actor-local clause.
+                if transition and label == "start_state":
+                    continue
+                if (_appearance_conflicts(current, visible_wardrobe)
+                        or not current):
+                    if current != visible_wardrobe:
+                        corrections.append({
+                            "character": str(name),
+                            "field": f"{label}.wardrobe",
+                            "from": current,
+                            "to": visible_wardrobe,
+                            "reason": (
+                                "当前镜头动作中的人物局部服装事实优先于"
+                                "人物全局造型或后续场景造型"),
+                        })
+                    state["wardrobe"] = visible_wardrobe
+        start_states[name] = start
+        end_states[name] = end
+    repaired["start_state"] = start_states
+    repaired["end_state"] = end_states
+    repaired["semantic_corrections"] = list({
+        json.dumps(item, ensure_ascii=False, sort_keys=True): item
+        for item in corrections if isinstance(item, dict)
+    }.values())
+    return repaired
+
+
+def _actor_semantic_windows(text, name, actors):
+    """Actor-local clauses that stop before another named character."""
+    source = str(text or "")
+    actor = str(name or "")
+    if not source or not actor:
+        return []
+    windows = []
+    for match in re.finditer(re.escape(actor), source):
+        window = source[match.start():match.start() + 120]
+        cut_points = [
+            index for index in (
+                window.find("。"), window.find("；"), window.find("\n"))
+            if index >= 0
+        ]
+        for other in actors or []:
+            other = str(other or "")
+            if not other or other == actor:
+                continue
+            index = window.find(other, len(actor))
+            if index >= 0:
+                cut_points.append(index)
+        if cut_points:
+            window = window[:min(cut_points)]
+        windows.append(window)
+    return windows
+
+
+def _terminal_character_names(text, end_states, names):
+    terminal = set()
+    end_states = end_states if isinstance(end_states, dict) else {}
+    for name in names or []:
+        state_text = json.dumps(
+            end_states.get(name) or {},
+            ensure_ascii=False, default=str)
+        windows = _actor_semantic_windows(text, name, names)
+        if any(
+                any(token in window for token in (
+                    "咽气", "断气", "死亡", "死去", "身亡", "尸身"))
+                for window in windows):
+            terminal.add(name)
+        elif any(token in state_text for token in (
+                "已咽气", "断气", "死亡", "尸身态")):
+            terminal.add(name)
+    return terminal
 
 
 def _merge_shot_state(name, continuity, explicit, text, *, previous=None,
@@ -534,7 +699,14 @@ def _merge_shot_state(name, continuity, explicit, text, *, previous=None,
             # declared/current look.
             state[field] = prior_value
         elif declared_value:
-            state[field] = declared_value
+            if prior_value and not scene_changed and not transition:
+                # A compatible shorter phrase must not erase details already
+                # locked by the previous frame (青官袍 must not drop 乌纱);
+                # a conflicting phrase without a visible change is likewise
+                # rejected and reported by the continuity audit.
+                state[field] = prior_value
+            else:
+                state[field] = declared_value
         elif current_value and (
                 not prior_value or scene_changed or transition):
             state[field] = current_value
@@ -815,11 +987,19 @@ def _append_performance_beats(raw_shots, script, rules=None):
         scene = scenes.get(scene_no, {})
         scene_people = list(scene.get("characters", []))
         timeline = "unknown"
+        dead_names = set()
         for raw in grouped[scene_no]:
             timeline = shot_timeline_state(raw, timeline)
             physical_people = physical_scene_characters(
                 scene_people, timeline, inner_policy)
             out.append(raw)
+            terminal_text = " ".join(str(value or "") for value in (
+                raw.get("description"), raw.get("action"), raw.get("prompt")))
+            terminal_states = (
+                raw.get("end_state")
+                if isinstance(raw.get("end_state"), dict) else {})
+            dead_names.update(_terminal_character_names(
+                terminal_text, terminal_states, scene_people))
             dialogue = raw.get("dialogue")
             part = raw.get("dialogue_part") or {"index": 1, "total": 1}
             if (not dialogue or dialogue.get("inner_voice")
@@ -828,7 +1008,8 @@ def _append_performance_beats(raw_shots, script, rules=None):
                 continue
             speaker = dialogue.get("character")
             listeners = [
-                name for name in physical_people if name != speaker]
+                name for name in physical_people
+                if name != speaker and name not in dead_names]
             if listeners:
                 out.append({
                     "scene_no": scene_no,
@@ -845,8 +1026,11 @@ def _append_performance_beats(raw_shots, script, rules=None):
                     "prompt": f"{listeners[0]}听完{speaker}的话后的近景反应",
                     "source_dialogue": dialogue.get("dialogue", ""),
                 })
-        lead = physical_scene_characters(
-            scene_people, timeline, inner_policy)[:1]
+        lead = [
+            name for name in physical_scene_characters(
+                scene_people, timeline, inner_policy)
+            if name not in dead_names
+        ][:1]
         if lead and add_beat:
             out.append({
                 "scene_no": scene_no,
@@ -990,9 +1174,12 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
         declared_start = raw.get("start_state")
         declared_start = (
             declared_start if isinstance(declared_start, dict) else {})
+        semantic_corrections = []
         start_state = {}
         for name in characters:
-            explicit_state = declared_start.get(name)
+            explicit_state, corrections = _reconcile_explicit_appearance(
+                name, action_text, declared_start.get(name))
+            semantic_corrections.extend(corrections)
             start_state[name] = _merge_shot_state(
                 name, continuity, explicit_state, action_text,
                 previous=previous.get(name), emotion="专注",
@@ -1004,7 +1191,9 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             declared_end if isinstance(declared_end, dict) else {})
         end_state = {}
         for name in characters:
-            explicit_state = declared_end.get(name)
+            explicit_state, corrections = _reconcile_explicit_appearance(
+                name, action_text, declared_end.get(name))
+            semantic_corrections.extend(corrections)
             if not explicit_state and kind in ("reaction", "beat"):
                 explicit_state = _state(
                     name, continuity, emotion=emotion,
@@ -1163,6 +1352,15 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             "end_state": end_state,
             "appearance_state_required": True,
             "appearance_continuity_issues": appearance_continuity_issues,
+            "semantic_corrections": semantic_corrections,
+            "era_context": "；".join(str(value or "").strip() for value in (
+                (script.get("story_world") or {}).get("name"),
+                (script.get("story_world") or {}).get("era_and_location"),
+                (script.get("story_world") or {}).get("hard_rules"),
+            ) if str(value or "").strip()),
+            "sanctioned_anachronisms": list(
+                (script.get("story_world") or {}).get(
+                    "sanctioned_anachronisms") or []),
             "script_reference": script_reference,
             "readable_text": text_asset,
             "visual_hook": visual_hook,
@@ -1231,10 +1429,11 @@ def repair_storyboard_appearance_continuity(storyboard, continuity,
                                              script=None):
     """Upgrade a saved storyboard without re-running or expanding its shots.
 
-    Only structured appearance state and the derived compact prompt are
-    changed. Existing shot numbers, dialogue, timing, camera and assets remain
-    untouched, so a reused episode can be repaired without regenerating the
-    whole storyboard.
+    Structured appearance state and derived prompts are reconciled.  A legacy
+    auto-added reaction/beat that asks a dead actor to breathe is retargeted to
+    a living scene partner (or to environment-only motion when none exists).
+    Existing shot numbers, dialogue, timing, camera and assets remain
+    untouched, so a reused episode can be repaired without regenerating art.
     """
     repaired = copy.deepcopy(storyboard or {})
     if repaired.get("appearance_state_version") == APPEARANCE_STATE_VERSION:
@@ -1259,9 +1458,107 @@ def repair_storyboard_appearance_continuity(storyboard, continuity,
             or "")
     previous = {}
     previous_scene = None
-    for shot in repaired.get("shots", []):
+    scene_people = {
+        scene.get("scene_no"): list(scene.get("characters") or [])
+        for scene in (script or {}).get("scenes", [])
+        if isinstance(scene, dict)
+    }
+    dead_by_scene = {}
+    character_catalog = {
+        str(item.get("name")): copy.deepcopy(item)
+        for item in repaired.get("character_number_map", {}).values()
+        if isinstance(item, dict) and item.get("name")
+    }
+    for shot_index, original_shot in enumerate(
+            repaired.get("shots", [])):
+        shot = reconcile_shot_semantics(original_shot)
+        repaired["shots"][shot_index] = shot
         characters = list(dict.fromkeys(shot.get("characters") or []))
         scene_no = shot.get("scene_no")
+        dead_names = dead_by_scene.setdefault(scene_no, set())
+        living_performance = any(
+            token in " ".join(str(value or "") for value in (
+                shot.get("description"), shot.get("prompt"),
+                (shot.get("performance") or {}).get("micro_expression")
+                if isinstance(shot.get("performance"), dict) else ""))
+            for token in (
+                "呼吸", "喘息", "眼神", "视线", "微表情", "眨眼"))
+        retargeted_legacy_beat = False
+        if (shot.get("kind") in ("reaction", "beat")
+                and living_performance and characters
+                and all(name in dead_names for name in characters)):
+            replacement = next((
+                name for name in scene_people.get(scene_no, [])
+                if name not in dead_names), "")
+            old_description = str(shot.get("description") or "")
+            if replacement:
+                old_names = list(characters)
+                characters = [replacement]
+                shot["characters"] = characters
+                shot["character_count"] = 1
+                shot["visible_figure_count"] = (
+                    1 + len(shot.get("narrative_overlays") or []))
+                actor = character_catalog.get(replacement)
+                shot["character_number_map"] = ({
+                    actor["actor_id"]: copy.deepcopy(actor)
+                } if actor and actor.get("actor_id") else {})
+                shot["character_number_ids"] = list(
+                    shot["character_number_map"])
+                label = (
+                    "听者反应" if shot.get("kind") == "reaction"
+                    else "本场情绪余波")
+                shot["description"] = (
+                    f"{replacement}承接{label}，保持原位，以呼吸停顿、"
+                    "眼神和细微肢体表现冲击")
+                shot["prompt"] = (
+                    f"{replacement}无台词近景，承接上一镜情绪，"
+                    "只表现一次呼吸停顿与眼神变化")
+                performance = dict(shot.get("performance") or {})
+                performance.update({
+                    "goal": shot["description"],
+                    "gaze": f"{replacement}视线承接上一镜事件",
+                    "micro_expression": (
+                        f"{replacement}呼吸停顿、眼神凝住和极小幅度重心变化"),
+                })
+                shot["performance"] = performance
+                shot.setdefault("semantic_corrections", []).append({
+                    "field": "characters/description",
+                    "from": f"{'、'.join(old_names)}：{old_description}",
+                    "to": f"{replacement}：{shot['description']}",
+                    "reason": (
+                        "自动补出的反应/留白镜不得让已死亡人物继续呼吸"
+                        "或表演微表情，改由仍在场的存活人物承接"),
+                })
+            else:
+                names = "、".join(characters)
+                shot["description"] = (
+                    f"{names}尸身保持绝对静止；只由灯焰、帷帐或环境"
+                    "阴影完成本场余波")
+                shot["prompt"] = (
+                    f"{names}尸身绝对静止，无呼吸、无眨眼、无微表情；"
+                    "只允许环境光影微动")
+                performance = dict(shot.get("performance") or {})
+                performance.update({
+                    "goal": shot["description"],
+                    "gaze": "尸身无视线反应",
+                    "micro_expression": (
+                        "尸身绝对静止；禁止呼吸、眨眼、眼神或微表情变化"),
+                })
+                shot["performance"] = performance
+                shot.setdefault("semantic_corrections", []).append({
+                    "field": "description/performance",
+                    "from": old_description,
+                    "to": shot["description"],
+                    "reason": "场内无存活人物，改用环境变化承接情绪余波",
+                })
+            shot_contract = dict(shot.get("shot_contract") or {})
+            shot_contract.update({
+                "画面内容描述": shot["description"],
+                "表演重点": shot["description"],
+                "微表情": shot["performance"]["micro_expression"],
+            })
+            shot["shot_contract"] = shot_contract
+            retargeted_legacy_beat = True
         scene_changed = previous_scene is None or scene_no != previous_scene
         before = copy.deepcopy(previous)
         action_text = "；".join(str(value or "") for value in (
@@ -1273,13 +1570,23 @@ def repair_storyboard_appearance_continuity(storyboard, continuity,
             shot.get("end_state")
             if isinstance(shot.get("end_state"), dict) else {})
         start_state, end_state = {}, {}
+        semantic_corrections = list(
+            shot.get("semantic_corrections") or [])
         for name in characters:
+            start_explicit, start_corrections = \
+                _reconcile_explicit_appearance(
+                    name, action_text, declared_start.get(name))
+            end_explicit, end_corrections = \
+                _reconcile_explicit_appearance(
+                    name, action_text, declared_end.get(name))
+            semantic_corrections.extend(start_corrections)
+            semantic_corrections.extend(end_corrections)
             start_state[name] = _merge_shot_state(
-                name, continuity, declared_start.get(name), action_text,
+                name, continuity, start_explicit, action_text,
                 previous=before.get(name), emotion="专注",
                 scene_changed=scene_changed)
             end_state[name] = _merge_shot_state(
-                name, continuity, declared_end.get(name), action_text,
+                name, continuity, end_explicit, action_text,
                 previous=start_state[name], emotion=(
                     (declared_end.get(name) or {}).get("emotion")
                     if isinstance(declared_end.get(name), dict)
@@ -1290,18 +1597,40 @@ def repair_storyboard_appearance_continuity(storyboard, continuity,
             for name in characters:
                 current = _visible_appearance(
                     name, action_text, declared_start.get(name))
+                action_current = _visible_appearance(name, action_text)
                 if (_appearance_conflicts(
                         (before.get(name) or {}).get("wardrobe"),
                         current.get("wardrobe"))
                         and not _appearance_transition(name, action_text)):
-                    issues.append(
-                        f"{name}本镜声明服装与上一镜不一致，且没有换装动作；"
-                        "已继续继承上一镜服装")
+                    # A direct actor-local wardrobe in the shot action is a
+                    # genuine unresolved story conflict.  A conflicting value
+                    # found only in legacy structured state is a known global
+                    # design leak; inherit and audit the correction without
+                    # blocking production.
+                    if action_current.get("wardrobe"):
+                        issues.append(
+                            f"{name}本镜声明服装与上一镜不一致，且没有换装动作；"
+                            "已继续继承上一镜服装")
+                    semantic_corrections.append({
+                        "character": str(name),
+                        "field": "start_state/end_state.wardrobe",
+                        "from": str(current.get("wardrobe") or ""),
+                        "to": str(
+                            (before.get(name) or {}).get("wardrobe") or ""),
+                        "reason": "同场连续镜头没有换装动作，继承上一镜服装",
+                    })
         shot["start_state"] = start_state
         shot["end_state"] = end_state
         shot["appearance_state_required"] = True
         shot["appearance_continuity_issues"] = issues
+        shot["semantic_corrections"] = list({
+            json.dumps(item, ensure_ascii=False, sort_keys=True): item
+            for item in semantic_corrections if isinstance(item, dict)
+        }.values())
         previous.update(copy.deepcopy(end_state))
+        dead_names.update(_terminal_character_names(
+            action_text, end_state,
+            scene_people.get(scene_no, characters)))
         previous_scene = scene_no
         style = str(
             ((shot.get("prompt_contract") or {}).get("style")
@@ -1316,6 +1645,8 @@ def repair_storyboard_appearance_continuity(storyboard, continuity,
             style=style, mode="video")
         shot["prompt_contract"] = contract
         shot["seedance_prompt_compact"] = compact
+        if retargeted_legacy_beat:
+            shot["seedance_prompt"] = compact
     repaired["appearance_state_version"] = APPEARANCE_STATE_VERSION
     return repaired
 

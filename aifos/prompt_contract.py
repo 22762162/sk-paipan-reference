@@ -18,6 +18,38 @@ FORBIDDEN_ON_SCREEN_METADATA = (
     "镜头合同", "主体", "场景", "起点", "终点", "单一主动作", "TASK",
     "WORLD / STYLE", "质检原因", "自动优化修订", "参考图职责", "硬约束",
 )
+SEMANTIC_WARDROBE_TOKENS = (
+    "官袍", "直裰", "旅装", "布衣", "麻衣", "短褐", "中衣", "长衫",
+    "长袍", "圆领袍", "交领袍", "盘领袍", "朝服", "常服", "公服",
+    "制服", "工装", "西装", "衬衫", "外套", "夹克", "风衣", "大氅",
+    "斗篷", "披风", "襦裙", "裙", "裤", "铠甲", "盔甲", "校服",
+    "礼服", "睡衣", "道袍", "袈裟",
+)
+SEMANTIC_WARDROBE_CONFLICT_GROUPS = (
+    {
+        "官袍", "直裰", "旅装", "布衣", "麻衣", "短褐", "中衣",
+        "长衫", "长袍", "圆领袍", "交领袍", "盘领袍", "朝服",
+        "常服", "公服", "制服", "工装", "西装", "襦裙", "铠甲",
+        "盔甲", "校服", "礼服", "睡衣", "道袍", "袈裟",
+    },
+    {"裙", "裤"},
+    {"外套", "夹克", "风衣", "大氅", "斗篷", "披风"},
+)
+SEMANTIC_APPEARANCE_CHANGE_TOKENS = (
+    "换装", "更衣", "换上", "换成", "改穿", "穿上", "套上", "披上",
+    "披着", "已脱", "脱去", "脱下", "褪下", "摘下", "取下", "戴上",
+    "系上", "换",
+)
+TERMINAL_DEATH_TOKENS = (
+    "已咽气", "咽气", "断气", "尸身态", "死亡", "死去", "身亡",
+)
+LIVING_PERFORMANCE_TOKENS = (
+    "呼吸", "喘息", "眼神变化", "视线变化", "微表情", "眨眼", "开口",
+)
+PREMODERN_CHINESE_ERA_TOKENS = (
+    "明初", "明代", "大明", "洪武", "永乐", "古代", "县衙", "驿馆",
+    "官舍", "公堂",
+)
 
 
 def _text(value, fallback=""):
@@ -37,6 +69,146 @@ def sanitize_text_whitelist(values):
         if text not in cleaned:
             cleaned.append(text)
     return cleaned
+
+
+def _semantic_wardrobe_signature(value):
+    text = _text(value)
+    return {
+        token for token in SEMANTIC_WARDROBE_TOKENS
+        if token in text
+    }
+
+
+def _semantic_wardrobes_conflict(first, second):
+    left = _semantic_wardrobe_signature(first)
+    right = _semantic_wardrobe_signature(second)
+    return any(
+        (left & group)
+        and (right & group)
+        and (left & group).isdisjoint(right & group)
+        for group in SEMANTIC_WARDROBE_CONFLICT_GROUPS)
+
+
+def _actor_local_clause(text, actor):
+    """Return one actor-local visible clause from the current shot action."""
+    source = str(text or "")
+    if not source or not actor:
+        return ""
+    for match in re.finditer(re.escape(str(actor)), source):
+        clause = source[match.start():match.start() + 120]
+        clause = re.split(r"[，,。；\n]", clause, maxsplit=1)[0]
+        signature = _semantic_wardrobe_signature(clause)
+        separate_object = any(
+            marker in clause for marker in (
+                "身旁放", "旁边放", "边放", "挂着", "搭着", "摆着",
+                "搁着", "散落", "置于", "放在", "搭在"))
+        worn = any(
+            marker in clause for marker in (
+                "身穿", "穿着", "穿上", "换上", "换成", "改穿",
+                "套上", "披上", "披着", "着一身"))
+        if signature and (not separate_object or worn):
+            return clause.strip(" ，,；。")
+    return ""
+
+
+def _actor_semantic_clause(text, actor, actors=None):
+    """Return an actor-local semantic window without swallowing another actor."""
+    source = str(text or "")
+    name = str(actor or "")
+    if not source or not name:
+        return ""
+    match = re.search(re.escape(name), source)
+    if not match:
+        return ""
+    tail = source[match.start():match.start() + 180]
+    cut_points = [
+        index for index in (
+            tail.find("。"), tail.find("；"), tail.find("\n"))
+        if index >= 0
+    ]
+    for other in actors or []:
+        other = str(other or "")
+        if not other or other == name:
+            continue
+        index = tail.find(other, len(name))
+        if index >= 0:
+            cut_points.append(index)
+    if cut_points:
+        tail = tail[:min(cut_points)]
+    return tail.strip(" ，,；。")
+
+
+def _has_placed_object_mention(text, token):
+    """Detect an outfit/prop described as a separate placed scene object."""
+    source = str(text or "")
+    object_name = re.escape(str(token or ""))
+    if not source or not object_name:
+        return False
+    location = (
+        r"(?:榻边|床边|旁边|身旁|桌上|案上|地上|架上|椅上|"
+        r"墙上|一旁)")
+    placement = (
+        r"(?:挂着|搭着|搭在|放着|放在|摆着|摆在|搁着|搁在|"
+        r"散落|另放|平放|叠放)")
+    # Require an actual placement verb near this exact object.  A mere nearby
+    # location word (e.g. “沈砚布旅装跪坐榻边”) is not evidence that the
+    # garment itself exists in a second location.
+    patterns = (
+        rf"{location}[^，,。；]{{0,8}}{placement}"
+        rf"[^，,。；]{{0,8}}{object_name}",
+        rf"{placement}[^，,。；]{{0,8}}{object_name}",
+        rf"{object_name}[^，,。；]{{0,8}}"
+        rf"(?:挂在|搭在|放在|摆在|搁在){location}",
+    )
+    return any(re.search(pattern, source) for pattern in patterns)
+
+
+def build_era_object_constraints(shot):
+    """Compile high-risk historical props into visible morphology rules.
+
+    Generic nouns such as ``油灯`` are visually under-specified: image models
+    often turn them into a nineteenth-century glass-chimney kerosene lamp.
+    The rule is deterministic and shot-local, so the next prompt states what
+    the object is *and* which common anachronistic form is forbidden.
+    """
+    shot = shot if isinstance(shot, dict) else {}
+    context = " ".join(_text(value) for value in (
+        shot.get("era_context"), shot.get("era"), shot.get("world_state"),
+        shot.get("location"), shot.get("scene_context"), shot.get("style"),
+        shot.get("description"), shot.get("action"), shot.get("prompt"),
+    ) if _text(value))
+    visible = " ".join(_text(value) for value in (
+        shot.get("description"), shot.get("action"), shot.get("prompt"),
+        (shot.get("shot_contract") or {}).get("画面内容描述")
+        if isinstance(shot.get("shot_contract"), dict) else "",
+    ) if _text(value))
+    sanctioned = " ".join(
+        _text(value) for value in (
+            shot.get("sanctioned_anachronisms") or [])
+        if _text(value))
+    historical = any(token in context for token in
+                     PREMODERN_CHINESE_ERA_TOKENS)
+    if not historical:
+        return []
+    rules = []
+    if "油灯" in visible and not any(
+            token in sanctioned for token in (
+                "煤油灯", "玻璃灯罩", "玻璃罩灯")):
+        rules.append(
+            "时代物件锁定—油灯：只画明代可成立的陶制或青铜开放式浅盏"
+            "油灯，灯油与棉芯可见；绝不画玻璃灯罩、煤油灯筒、现代调节"
+            "旋钮、电灯泡或工业金属灯座")
+    if any(token in visible for token in ("提灯", "灯笼")) and not any(
+            token in sanctioned for token in (
+                "玻璃提灯", "煤油提灯")):
+        rules.append(
+            "时代物件锁定—提灯：只画明代竹木骨架配纸或薄绢灯罩的笼灯，"
+            "内部烛火受罩保护；绝不画玻璃煤油提灯、现代金属提手灯或电灯")
+    if any(token in visible for token in ("烛台", "烛火", "孤烛")):
+        rules.append(
+            "时代物件锁定—烛台：使用裸露蜡烛与明代可成立的铜、铁或陶"
+            "烛台；禁止套用玻璃灯罩、煤油灯芯机构或电灯结构")
+    return list(dict.fromkeys(rules))
 
 
 def _state_line(states):
@@ -222,6 +394,15 @@ def build_physical_contract(shot):
             "手腕、手臂和视线方向一致，禁止屏幕朝后却被人物读取。"
         )
         objects.append("手持屏幕：使用者/观看者↔屏幕正面")
+    era_object_constraints = build_era_object_constraints(shot)
+    rules.extend(era_object_constraints)
+    for rule in era_object_constraints:
+        object_name = (
+            "油灯" if "油灯" in rule
+            else "提灯" if "提灯" in rule
+            else "烛台" if "烛台" in rule
+            else "时代物件")
+        objects.append(f"{object_name}：结构与材质服从当前时代物件锁定")
     blocking = shot.get("spatial_blocking") or {}
     if isinstance(blocking, dict):
         camera = blocking.get("camera") or {}
@@ -442,7 +623,9 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
             "character": _text(item.get("character")),
         })
     scene = shot_local_scene(shot, location)
-    physical = build_physical_contract(shot)
+    physical = build_physical_contract({
+        **shot, "location": scene, "style": style,
+    })
     overlays = []
     for item in shot.get("narrative_overlays") or []:
         if not isinstance(item, dict):
@@ -489,6 +672,11 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
             if isinstance(shot.get("composition_contract"), dict)
             else build_composition_contract(shot)),
         "scene": scene,
+        "script_reference": _text(shot.get("script_reference")),
+        "era_context": _text(shot.get("era_context")),
+        "era_object_constraints": build_era_object_constraints({
+            **shot, "location": scene, "style": style,
+        }),
         "style": _text(style),
         "start": _state_line(shot.get("start_state")) or "保持首帧状态",
         "start_appearance": _appearance_map(shot.get("start_state")),
@@ -507,6 +695,11 @@ def build_shot_prompt_contract(shot, *, location="", style="", references=None):
             _text(value) for value in (
                 shot.get("appearance_continuity_issues") or [])
             if _text(value)
+        ],
+        "semantic_corrections": [
+            dict(value) for value in (
+                shot.get("semantic_corrections") or [])
+            if isinstance(value, dict)
         ],
         "dialogue": (
             "" if dialogue.get("inner_voice")
@@ -713,6 +906,96 @@ def validate_shot_prompt_contract(contract):
     if "站立" in state_text and sit:
         issues.append("人物状态要求站立，但当前动作要求坐姿/伏案")
 
+    # The current-shot action is more local than a character's global design.
+    # Reject contracts such as “沈砚布旅装” + “沈砚穿青官袍” before any
+    # billable generation call.
+    for name in actor_names:
+        local_clause = _actor_local_clause(action, name)
+        appearance_change = any(
+            token in local_clause
+            for token in SEMANTIC_APPEARANCE_CHANGE_TOKENS)
+        local_signature = _semantic_wardrobe_signature(local_clause)
+        start_wardrobe = _text(
+            (start_appearance.get(name) or {}).get("wardrobe"))
+        end_wardrobe = _text(
+            (end_appearance.get(name) or {}).get("wardrobe"))
+        start_signature = _semantic_wardrobe_signature(start_wardrobe)
+        end_signature = _semantic_wardrobe_signature(end_wardrobe)
+        if (local_signature and start_signature
+                and _semantic_wardrobes_conflict(
+                    local_clause, start_wardrobe)
+                and not appearance_change):
+            issues.append(
+                f"{name}当前动作服装「{local_clause}」与起点服装"
+                f"「{start_wardrobe}」冲突")
+        if (local_signature and end_signature
+                and _semantic_wardrobes_conflict(
+                    local_clause, end_wardrobe)):
+            issues.append(
+                f"{name}当前动作服装「{local_clause}」与终点服装"
+                f"「{end_wardrobe}」冲突")
+        if (start_signature and end_signature
+                and _semantic_wardrobes_conflict(
+                    start_wardrobe, end_wardrobe)
+                and not appearance_change):
+            issues.append(
+                f"{name}起点与终点服装不同，但本镜没有换装动作")
+        placed_signature = {
+            token for token in start_signature | end_signature
+            if _has_placed_object_mention(action, token)
+        }
+        duplicate_is_explicit = any(
+            marker in action for marker in (
+                "另一件", "另有一件", "第二件", "两件", "备用"))
+        if (placed_signature and not duplicate_is_explicit
+                and not local_signature.isdisjoint(placed_signature)):
+            # The actor-local clause explicitly wears the same garment that is
+            # also staged elsewhere.  Without a second-item fact, this is the
+            # exact “one robe worn and beside the bed” contradiction.
+            garment = "、".join(sorted(
+                local_signature & placed_signature))
+            issues.append(
+                f"{name}身上的「{garment}」又被当作独立物件放在场景中；"
+                "若确有第二件必须写明数量，否则只保留一个位置")
+
+    # Death/living-state checks are actor-local.  A surviving actor may still
+    # react in the same shot where another character dies.
+    for name in actor_names:
+        local_action = _actor_semantic_clause(action, name, actor_names)
+        state_clauses = []
+        for value in (start, end):
+            match = re.search(
+                rf"(?:^|；){re.escape(name)}:([^；]*)", value)
+            if match:
+                state_clauses.append(match.group(1))
+        actor_state = " ".join(state_clauses)
+        terminal_state = any(
+            token in f"{local_action} {actor_state}"
+            for token in TERMINAL_DEATH_TOKENS)
+        explicitly_living = any(
+            token in local_action for token in LIVING_PERFORMANCE_TOKENS)
+        if len(actor_names) == 1:
+            explicitly_living = explicitly_living or any(
+                token in f"{contract.get('performance', '')} {end}"
+                for token in LIVING_PERFORMANCE_TOKENS)
+        if terminal_state and explicitly_living:
+            issues.append(
+                f"{name}已死亡/呈尸身态，却仍被要求呼吸、眨眼或表演微表情")
+
+    era_constraints = [
+        _text(value) for value in (
+            contract.get("era_object_constraints") or [])
+        if _text(value)
+    ]
+    if ("油灯" in action
+            and any(token in f"{contract.get('scene', '')} "
+                    f"{contract.get('era_context', '')} "
+                    f"{contract.get('style', '')}"
+                    for token in PREMODERN_CHINESE_ERA_TOKENS)
+            and not any("时代物件锁定—油灯" in value
+                        for value in era_constraints)):
+        issues.append("历史场景中的油灯缺少时代结构锁定，容易误生成玻璃煤油灯")
+
     camera = contract.get("camera") or {}
     angle = _text(camera.get("角度"))
     physical = " ".join(contract.get("physical", {}).get("rules") or [])
@@ -726,4 +1009,9 @@ def validate_shot_prompt_contract(contract):
     return {
         "passed": not issues,
         "issues": list(dict.fromkeys(issues)),
+        "semantic_corrections": [
+            dict(value) for value in (
+                contract.get("semantic_corrections") or [])
+            if isinstance(value, dict)
+        ],
     }

@@ -82,8 +82,8 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260726-contract-poll-1" in html
-    assert "/static/app.js?v=20260726-contract-poll-1" in html
+    assert "/static/style.css?v=20260726-semantic-qc-1" in html
+    assert "/static/app.js?v=20260726-semantic-qc-1" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -182,6 +182,9 @@ def test_index_and_static(server):
     assert b"ensureBatchRevisionCheckpoint" in app_js
     assert b"/api/qc_override" in app_js
     assert "本次质检/重画实际附上的参考图".encode() in app_js
+    assert "出图前剧本/逻辑纠正".encode() in app_js
+    assert "逻辑修正 ×".encode() in app_js
+    assert b"planSemanticCorrections" in app_js
     assert "待人工问题清单".encode() in app_js
     assert b"imageFailurePanelHtml" in app_js
     assert b"focusImageFailureShot" in app_js

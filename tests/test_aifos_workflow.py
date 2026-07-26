@@ -238,3 +238,150 @@ def test_saved_storyboard_repairs_official_uniform_continuity_without_rewrite():
     assert shots[3]["end_state"]["沈砚"]["wardrobe"] == expected
     assert shots[3]["appearance_continuity_issues"]
     assert "服装" + expected in shots[2]["seedance_prompt_compact"]
+
+
+def test_current_shot_wardrobe_fact_repairs_leaked_global_costume():
+    from aifos.workflow import reconcile_shot_semantics
+
+    repaired = reconcile_shot_semantics({
+        "shot_no": 1,
+        "characters": ["沈砚", "陈允"],
+        "description": (
+            "沈砚布旅装跪坐床前给陈允喂水，"
+            "榻边搭着崭新青官袍"),
+        "start_state": {
+            "沈砚": {"pose": "跪坐", "wardrobe": "宽松青官袍"},
+            "陈允": {"pose": "卧床", "wardrobe": "中衣"},
+        },
+        "end_state": {
+            "沈砚": {"pose": "跪坐", "wardrobe": "宽松青官袍"},
+            "陈允": {"pose": "卧床", "wardrobe": "中衣"},
+        },
+    })
+
+    assert repaired["start_state"]["沈砚"]["wardrobe"] == "布旅装"
+    assert repaired["end_state"]["沈砚"]["wardrobe"] == "布旅装"
+    assert len(repaired["semantic_corrections"]) == 2
+    assert {
+        item["field"] for item in repaired["semantic_corrections"]
+    } == {"start_state.wardrobe", "end_state.wardrobe"}
+    assert all(
+        item["from"] == "宽松青官袍"
+        and item["to"] == "布旅装"
+        for item in repaired["semantic_corrections"])
+
+
+def test_scene_beat_never_makes_dead_character_breathe():
+    from aifos.workflow import _append_performance_beats
+
+    script = {
+        "characters": [
+            {"name": "陈允"},
+            {"name": "沈砚"},
+        ],
+        "scenes": [{
+            "scene_no": 1,
+            "location": "清河驿馆",
+            "characters": ["陈允", "沈砚"],
+        }],
+    }
+    shots = _append_performance_beats([{
+        "scene_no": 1,
+        "kind": "physical",
+        "characters": ["陈允", "沈砚"],
+        "description": "沈砚看着陈允咽气，身体僵住",
+        "end_state": {
+            "陈允": {"pose": "尸身静卧", "injury": "已咽气"},
+            "沈砚": {"pose": "跪坐僵住"},
+        },
+    }], script, {
+        "performance": {
+            "beat_at_emotional_peak": True,
+            "beat_seconds": [2, 4],
+        },
+    })
+
+    beat = shots[-1]
+    assert beat["kind"] == "beat"
+    assert beat["characters"] == ["沈砚"]
+    assert "沈砚" in beat["description"]
+    assert "陈允" not in beat["description"]
+
+
+def test_saved_dead_actor_beat_is_retargeted_without_changing_shot_number():
+    from aifos.workflow import repair_storyboard_appearance_continuity
+
+    continuity = {
+        "characters": [
+            {"name": "陈允", "default_wardrobe": "旧中衣"},
+            {"name": "沈砚", "default_wardrobe": "布旅装"},
+        ],
+    }
+    script = {
+        "scenes": [{
+            "scene_no": 1,
+            "characters": ["陈允", "沈砚"],
+        }],
+    }
+    storyboard = {
+        "appearance_state_version": 1,
+        "character_number_map": {
+            "P01": {"actor_id": "P01", "name": "陈允"},
+            "P02": {"actor_id": "P02", "name": "沈砚"},
+        },
+        "shots": [
+            {
+                "shot_no": 5,
+                "scene_no": 1,
+                "kind": "physical",
+                "characters": ["陈允", "沈砚"],
+                "description": "陈允咽气，沈砚僵住",
+                "start_state": {
+                    "陈允": {"pose": "仰卧", "wardrobe": "旧中衣"},
+                    "沈砚": {"pose": "跪坐", "wardrobe": "布旅装"},
+                },
+                "end_state": {
+                    "陈允": {
+                        "pose": "尸身态", "injury": "已咽气",
+                        "wardrobe": "旧中衣",
+                    },
+                    "沈砚": {"pose": "跪坐僵住", "wardrobe": "布旅装"},
+                },
+            },
+            {
+                "shot_no": 6,
+                "scene_no": 1,
+                "kind": "beat",
+                "characters": ["陈允"],
+                "description": "陈允用呼吸、眼神和细微肢体完成情绪余波",
+                "performance": {
+                    "micro_expression": "陈允呼吸和眼神发生变化",
+                },
+                "start_state": {
+                    "陈允": {
+                        "pose": "尸身态", "injury": "已咽气",
+                        "wardrobe": "旧中衣",
+                    },
+                },
+                "end_state": {
+                    "陈允": {
+                        "pose": "完成呼吸变化", "wardrobe": "旧中衣",
+                    },
+                },
+            },
+        ],
+    }
+
+    repaired = repair_storyboard_appearance_continuity(
+        storyboard, continuity, script)
+    beat = repaired["shots"][1]
+
+    assert beat["shot_no"] == 6
+    assert beat["characters"] == ["沈砚"]
+    assert beat["character_count"] == 1
+    assert list(beat["character_number_map"]) == ["P02"]
+    assert "沈砚" in beat["description"]
+    assert "陈允用呼吸" not in beat["description"]
+    assert any(
+        "已死亡人物" in item["reason"]
+        for item in beat["semantic_corrections"])

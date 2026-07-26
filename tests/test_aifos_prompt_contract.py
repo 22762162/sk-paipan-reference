@@ -343,3 +343,137 @@ def test_prompt_contract_blocks_standing_state_for_lying_action():
     report = validate_shot_prompt_contract(contract)
     assert not report["passed"]
     assert any("仰卧" in issue for issue in report["issues"])
+
+
+def test_prompt_contract_blocks_actor_local_wardrobe_conflict():
+    shot = {
+        "characters": ["沈砚", "陈允"],
+        "description": (
+            "沈砚身穿布旅装跪坐床前给陈允喂水，"
+            "榻边搭着一件崭新青官袍"),
+        "appearance_state_required": True,
+        "start_state": {
+            "沈砚": {"pose": "跪坐", "wardrobe": "宽松青官袍"},
+            "陈允": {"pose": "卧床", "wardrobe": "中衣"},
+        },
+        "end_state": {
+            "沈砚": {"pose": "跪坐", "wardrobe": "宽松青官袍"},
+            "陈允": {"pose": "卧床", "wardrobe": "中衣"},
+        },
+    }
+
+    contract, _ = compile_shot_prompt(
+        shot, location="洪武二十四年清河驿馆")
+    report = validate_shot_prompt_contract(contract)
+
+    assert report["passed"] is False
+    assert any(
+        "沈砚当前动作服装" in issue and "青官袍" in issue
+        for issue in report["issues"])
+
+
+def test_prompt_contract_blocks_one_worn_robe_staged_twice():
+    shot = {
+        "characters": ["沈砚"],
+        "description": "沈砚穿青官袍立在床前，床边又搭着青官袍",
+        "appearance_state_required": True,
+        "start_state": {
+            "沈砚": {"pose": "站立", "wardrobe": "青官袍"},
+        },
+        "end_state": {
+            "沈砚": {"pose": "站立", "wardrobe": "青官袍"},
+        },
+    }
+
+    contract, _ = compile_shot_prompt(
+        shot, location="洪武二十四年清河驿馆")
+    report = validate_shot_prompt_contract(contract)
+
+    assert report["passed"] is False
+    assert any("又被当作独立物件" in issue for issue in report["issues"])
+
+
+def test_garment_beside_actor_is_not_misread_as_worn():
+    shot = {
+        "characters": ["沈砚"],
+        "description": "沈砚跪坐病榻前，身旁放着崭新青官袍",
+        "appearance_state_required": True,
+        "start_state": {
+            "沈砚": {"pose": "跪坐", "wardrobe": "布旅装"},
+        },
+        "end_state": {
+            "沈砚": {"pose": "跪坐", "wardrobe": "布旅装"},
+        },
+    }
+
+    contract, _ = compile_shot_prompt(
+        shot, location="洪武二十四年清河驿馆")
+    report = validate_shot_prompt_contract(contract)
+
+    assert report["passed"] is True
+
+
+def test_historical_oil_lamp_gets_executable_morphology_lock():
+    shot = {
+        "characters": [],
+        "description": "驿馆病榻旁一盏油灯将尽",
+        "era_context": "大明洪武二十四年",
+    }
+
+    contract, prompt = compile_shot_prompt(
+        shot,
+        location="明代清河驿馆",
+        style="电影级历史漫剧",
+    )
+
+    assert any(
+        "开放式浅盏" in rule and "玻璃灯罩" in rule
+        for rule in contract["era_object_constraints"])
+    assert "煤油灯筒" in prompt
+    assert "灯油与棉芯可见" in prompt
+    assert validate_shot_prompt_contract(contract)["passed"]
+
+
+def test_dead_single_actor_cannot_receive_living_performance():
+    shot = {
+        "characters": ["陈允"],
+        "description": "陈允已咽气，尸身静卧病榻",
+        "performance": {"micro_expression": "眼神变化，保持微弱呼吸"},
+        "start_state": {
+            "陈允": {"pose": "尸身静卧", "injury": "已咽气"},
+        },
+        "end_state": {
+            "陈允": {"pose": "尸身静卧", "injury": "已咽气"},
+        },
+    }
+
+    contract, _ = compile_shot_prompt(
+        shot, location="明代清河驿馆")
+    report = validate_shot_prompt_contract(contract)
+
+    assert report["passed"] is False
+    assert any(
+        "陈允已死亡" in issue and "呼吸" in issue
+        for issue in report["issues"])
+
+
+def test_survivor_may_react_when_another_actor_dies():
+    shot = {
+        "characters": ["陈允", "沈砚"],
+        "description": "陈允咽气，沈砚眼神骤然凝住",
+        "performance": {"micro_expression": "沈砚呼吸一滞，眼神变化"},
+        "start_state": {
+            "陈允": {"pose": "卧床"},
+            "沈砚": {"pose": "跪坐"},
+        },
+        "end_state": {
+            "陈允": {"pose": "尸身静卧", "injury": "已咽气"},
+            "沈砚": {"pose": "跪坐僵住"},
+        },
+    }
+
+    contract, _ = compile_shot_prompt(
+        shot, location="明代清河驿馆")
+    report = validate_shot_prompt_contract(contract)
+
+    assert report["passed"] is True

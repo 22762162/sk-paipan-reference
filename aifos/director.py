@@ -77,6 +77,7 @@ from .workflow import (
     enrich_storyboard,
     lock_text_assets,
     production_profile,
+    reconcile_shot_semantics,
     repair_storyboard_appearance_continuity,
     write_delivery_verifier,
     write_review_board,
@@ -2715,6 +2716,11 @@ class Director:
                                        "location": location,
                                        "readable_text": readable_text or {},
                                    })),
+            "era_object_constraints": [
+                str(rule) for rule in (
+                    (physical_contract or {}).get("rules") or [])
+                if str(rule).startswith("时代物件锁定—")
+            ] if isinstance(physical_contract, dict) else [],
             "readable_text": (readable_text if isinstance(readable_text, dict)
                                else {}),
             "identity_view_policy": "adaptive_visible_angle_v2",
@@ -3149,6 +3155,14 @@ class Director:
         reference_status = str(
             input_diagnosis["reference_diagnosis"].get("status")
             or "").lower()
+        # Redundancy/wordiness remains advisory, but a contradictory or
+        # incomplete story contract is not production-ready.  Otherwise a
+        # lucky-looking first render can hide a broken prompt and the next
+        # attempt repeats the same wardrobe, prop or era mistake.
+        contract_hard_failure = (
+            prompt_status in {"conflicting", "insufficient"}
+            or reference_status in {
+                "needs_adjustment", "conflicting", "missing"})
         if "input_contract_pass" in verdict:
             input_contract_passed = checked_true(
                 verdict["input_contract_pass"])
@@ -3173,10 +3187,12 @@ class Director:
             image_passed = (
                 checked_true(verdict.get("pass"))
                 and not visual_hard_failure)
-        # 图片已经生成后，以普通观众实际能看到的成片结果决定是否放行。
-        # 提示词冗余、参考图说明不够简洁等输入合同问题继续记录为优化
-        # 建议，但不再把视觉合格的图片判失败或触发昂贵的自动重画。
-        passed = image_passed and visual_checks_passed
+        # A merely verbose prompt stays advisory. A story/logic/reference
+        # contradiction is a hard input failure: repair it and make the second
+        # attempt from changed input instead of certifying an accidental image.
+        passed = (
+            image_passed and visual_checks_passed
+            and not contract_hard_failure)
         report = {
             "passed": passed,
             "issues": issues,
@@ -3213,12 +3229,16 @@ class Director:
             "visual_pass": image_passed,
             "input_contract_passed": input_contract_passed,
             "input_contract_pass": input_contract_passed,
-            "redraw_required": not image_passed,
+            "redraw_required": bool(
+                not image_passed or contract_hard_failure),
             "contract_repair_required": not input_contract_passed,
             "production_ready": passed,
             "qc_policy": "visible_major_defects_v2",
             "input_contract_advisory": not input_contract_passed,
-            "hard_failure": bool(visual_hard_failure and not image_passed),
+            "hard_failure": bool(
+                (visual_hard_failure and not image_passed)
+                or contract_hard_failure),
+            "contract_hard_failure": contract_hard_failure,
         }
         report.update({
             "input_diagnosis": input_diagnosis,
@@ -4784,8 +4804,8 @@ class Director:
                         ctx["episode"]["id"], "storyboard", existing)
                     self.log.info(
                         "director",
-                        "已为复用分镜补齐服装/头饰/妆发连续性状态；"
-                        "未重写镜头、台词或时长")
+                        "已为复用分镜补齐服装/头饰/妆发连续性，并修复"
+                        "死亡后表演等确定性语义冲突；未改镜头号、台词或时长")
                 ctx["storyboard"] = existing
                 self._plan_seed_shots(ctx)
                 self.log.info("director", f"复用已有五维分镜 v{version}")
@@ -7212,6 +7232,10 @@ class Director:
 
     def _shot_payload(self, ctx, shot, *, continuity_anchor=False,
                       quality_override=None, item_id=None):
+        # Defensive repair for saved legacy boards: the current-shot action is
+        # narrower than a global character design and must win before identity
+        # facts, references, prompt text or QC expectations are compiled.
+        shot = reconcile_shot_semantics(shot)
         locations = self._scene_locations(ctx)
         location = shot_local_scene(
             shot, locations.get(shot["scene_no"], ""))
@@ -7250,9 +7274,24 @@ class Director:
         character_visuals = self._shot_character_visuals(
             ctx, shot, character_background)
         composition_contract = build_composition_contract(shot)
+        story_world = (ctx.get("script") or {}).get("story_world") or {}
+        era_context = "；".join(
+            str(value or "").strip() for value in (
+                story_world.get("name"),
+                story_world.get("era_and_location"),
+                story_world.get("hard_rules"),
+                shot.get("era_context"),
+            ) if str(value or "").strip())
+        sanctioned_anachronisms = list(
+            story_world.get("sanctioned_anachronisms") or
+            shot.get("sanctioned_anachronisms") or [])
         physical_contract = build_physical_contract({
             **shot, "spatial_blocking": spatial or {},
             "readable_text": readable_text,
+            "location": location,
+            "style": ctx["project"]["style"] or "",
+            "era_context": era_context,
+            "sanctioned_anachronisms": sanctioned_anachronisms,
         })
         narrative_overlays = [
             copy.deepcopy(item)
@@ -7291,6 +7330,8 @@ class Director:
             "action": shot.get("description", ""),
             "start_state": shot.get("start_state", {}),
             "end_state": shot.get("end_state", {}),
+            "semantic_corrections": copy.deepcopy(
+                shot.get("semantic_corrections") or []),
             "five_dimensions": shot.get("five_dimensions", {}),
             "readable_text": readable_text,
             # 正式关键帧默认中档；文字/群像/人脸情绪/连续性自动升高。
@@ -7305,6 +7346,8 @@ class Director:
             "sound_design": shot.get("sound_design", {}),
             "spatial_blocking": spatial or {},
             "spatial_constraint": (spatial or {}).get("constraint", ""),
+            "era_context": era_context,
+            "sanctioned_anachronisms": sanctioned_anachronisms,
             "standard_fingerprint": profile.get("standard_fingerprint", ""),
             "forbid_subtitles": not profile["burn_subtitles"],
             "style": ctx["project"]["style"] or "",
@@ -7373,7 +7416,9 @@ class Director:
              "composition_contract": composition_contract,
              "physical_contract": physical_contract,
              "spatial_blocking": spatial or {},
-             "readable_text": readable_text},
+             "readable_text": readable_text,
+             "era_context": era_context,
+             "sanctioned_anachronisms": sanctioned_anachronisms},
             location=location, style=payload.get("style", ""),
             references=payload.get("reference_manifest"), mode="image")
         payload["prompt_contract"] = contract
