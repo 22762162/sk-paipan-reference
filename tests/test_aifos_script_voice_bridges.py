@@ -420,3 +420,76 @@ def test_codex_writer_alias_phase_needs_no_repair_call(tmp_path):
     assert reply["ok"], reply
     assert not reply.get("repaired_fields")
     assert (codex.parent / "invocations.txt").read_text() == "1"
+
+
+# 假 codex(卡住):打一行进度后彻底静默,模拟断流/挂起
+FAKE_CODEX_STALLED = '''#!/usr/bin/env python3
+import sys, time
+print("[progress] started", flush=True)
+time.sleep(30)
+'''
+
+# 假 codex(形象改写):校验 refine 提示词要素,返回改写 JSON
+FAKE_CODEX_REFINE = '''#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+out = args[args.index("--output-last-message") + 1]
+prompt = args[-1]
+assert "造型总监" in prompt, "缺少改写角色设定的提示词"
+assert "头发再长" in prompt, "用户意见未进入提示词"
+data = {"image_prompt": "国风少女,及腰黑长直,肤色白皙透亮,眼神清冷,"
+                         "月白色襦裙,银质流苏耳饰,骨相与年龄感保持原设定",
+        "changes": ["发型:齐肩短发改为及腰黑长直(落实\\"头发再长一点\\")",
+                    "肤色:自然肤色提亮为白皙透亮(落实\\"皮肤更白\\")"],
+        "conflict_notes": []}
+with open(out, "w", encoding="utf-8") as f:
+    f.write(json.dumps(data, ensure_ascii=False))
+'''
+
+
+def test_codex_writer_stall_watchdog_terminates(tmp_path):
+    """连续无输出超过 stall 阈值 → 判定卡住终止,明确报错不回退。"""
+    codex = _make_bin(tmp_path, "codex", FAKE_CODEX_STALLED)
+    import time as _time
+    started = _time.monotonic()
+    reply = _bridge("aifos.adapters.claude_script", {
+        "capability": "script", "payload": {},
+        "out_dir": str(tmp_path)},
+        ["--engine", "codex", "--codex", str(codex),
+         "--timeout", "0", "--stall-timeout", "2"])
+    elapsed = _time.monotonic() - started
+    assert not reply["ok"]
+    assert "卡住" in reply["error"]
+    assert "无任何输出" in reply["error"]
+    assert elapsed < 20, f"看门狗未及时终止: {elapsed:.1f}s"
+
+
+def test_prompt_refine_capability_roundtrip(tmp_path):
+    """人物意见 → AI 改写形象提示词:要素齐全且通过校验。"""
+    codex = _make_bin(tmp_path, "codex", FAKE_CODEX_REFINE)
+    reply = _bridge("aifos.adapters.claude_script", {
+        "capability": "script",
+        "payload": {
+            "prompt_refine": True,
+            "character_name": "小狐",
+            "current_prompt": "国风少女,齐肩短发,自然肤色",
+            "character_context": {"introduction": "山中狐仙化形的少女",
+                                   "gender": "女", "age_range": "16-18"},
+            "style": "国风水墨",
+            "feedback": "头发再长一点,皮肤更白",
+        },
+        "out_dir": str(tmp_path / "out")},
+        ["--engine", "codex", "--codex", str(codex)])
+    assert reply["ok"], reply
+    assert "及腰" in reply["data"]["image_prompt"]
+    assert len(reply["data"]["changes"]) == 2
+
+
+def test_validate_prompt_refine_rules():
+    from aifos.adapters.claude_script import validate_prompt_refine
+    assert validate_prompt_refine({"image_prompt": "短"}) is not None
+    assert validate_prompt_refine(
+        {"image_prompt": "x" * 30, "changes": []}) is not None   # 必须说明改动
+    ok = {"image_prompt": "x" * 30, "changes": ["改了发型"]}
+    assert validate_prompt_refine(ok) is None
+    assert ok["conflict_notes"] == []   # 缺省字段被补齐

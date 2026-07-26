@@ -22,9 +22,12 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 from ..generation_diagnostics import normalize_generation_diagnostics
@@ -1454,8 +1457,66 @@ def validate_image_qc(data):
     return None
 
 
+CHARACTER_REFINE_PROMPT = """你是本剧的人物造型总监。用户对角色「{name}」的当前形象提出修改意见,
+你要深度理解意图,改写这个角色的人物形象提示词(设定卡)。
+
+当前形象提示词:
+{current}
+
+角色背景与身份事实(不可违背):
+{context}
+
+项目画风(不可改变):{style}
+
+用户意见(必须逐条落实):{feedback}
+
+要求:
+- 深度理解意见的真实意图;意见含糊时按最合理的造型逻辑具体化
+  (如"头发长点"要落成明确的长度、层次与轮廓,"皮肤更白点"要落成
+  具体肤色基调与质感,不能只是把原话抄进提示词);
+- 未被意见涉及的部分(骨相、五官、年龄感、身份特征、画风)一字不改保留;
+- 若某条意见与身份事实或项目画风冲突,不要硬改,在 conflict_notes
+  里说明冲突并给出最接近用户意图的可行方案;
+- image_prompt 必须是完整、独立、可直接生图的人物形象提示词,
+  不是增量补丁;
+- 只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块:
+{{"image_prompt": "改写后的完整人物形象提示词",
+ "changes": ["逐条说明改了什么,对应用户哪条意见"],
+ "conflict_notes": ["与设定/画风冲突的意见及处理方式;没有则给空数组"]}}
+"""
+
+
+def validate_prompt_refine(data):
+    """人物形象提示词改写输出的最小校验。"""
+    if not isinstance(data, dict):
+        return "输出必须是 JSON 对象"
+    prompt = str(data.get("image_prompt") or "").strip()
+    if len(prompt) < 20:
+        return "缺少 image_prompt 或内容过短"
+    for key in ("changes", "conflict_notes"):
+        value = data.get(key)
+        if value is None:
+            data[key] = []
+        elif not isinstance(value, list):
+            return f"{key} 必须是数组"
+    if not data["changes"]:
+        return "changes 必须逐条说明改动,不能为空"
+    return None
+
+
 def build_prompt(capability, payload):
     """构造编剧/分镜/人物设定提示词(CLI 桥与 Claude API Provider 共用)。"""
+    if capability == "script" and payload.get("prompt_refine"):
+        return CHARACTER_REFINE_PROMPT.format(
+            name=payload.get("character_name", ""),
+            current=(payload.get("current_prompt")
+                     or "(尚无成形提示词,请依据角色背景从零撰写)"),
+            context=json.dumps(
+                payload.get("character_context") or {},
+                ensure_ascii=False),
+            style=(payload.get("style")
+                   or "项目画风未指定;保持与已生成候选一致"),
+            feedback=payload.get("feedback", ""))
     if capability == "script" and payload.get("story_analysis"):
         return STORY_ANALYSIS_PROMPT.format(
             style=(payload.get("style")
@@ -1555,11 +1616,81 @@ CODEX_WRITER_ARGS = ("exec", "--sandbox", "read-only",
                      "--color", "never")
 
 
-def _invoke_engine(engine, binary, prompt, timeout, codex_home=""):
+def _terminate_group(proc, grace=5):
+    """TERM→KILL 整个进程组,不留幽灵子进程。"""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        proc.wait()
+
+
+def _run_with_stall_watchdog(cmd, env, timeout, stall_timeout):
+    """跑子进程并监控输出活性:静默超过 stall_timeout 判定卡住。
+
+    timeout<=0 表示不设总时长上限——活性检测取代硬超时,长任务不再
+    被一刀切,真卡死(断流/挂起)也不会无限等待。
+    返回 (returncode, stdout, stderr, stalled)。
+    """
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=env, start_new_session=True)
+    chunks = {"out": [], "err": []}
+    activity = {"at": time.monotonic()}
+
+    def pump(stream, key):
+        for line in iter(stream.readline, ""):
+            chunks[key].append(line)
+            activity["at"] = time.monotonic()
+        stream.close()
+
+    threads = [
+        threading.Thread(target=pump, args=(proc.stdout, "out"),
+                         daemon=True),
+        threading.Thread(target=pump, args=(proc.stderr, "err"),
+                         daemon=True),
+    ]
+    for item in threads:
+        item.start()
+    deadline = (time.monotonic() + timeout
+                if timeout and timeout > 0 else None)
+    stalled = False
+    while True:
+        try:
+            proc.wait(timeout=1)
+            break
+        except subprocess.TimeoutExpired:
+            now = time.monotonic()
+            if now - activity["at"] >= stall_timeout:
+                stalled = True
+                _terminate_group(proc)
+                break
+            if deadline is not None and now >= deadline:
+                _terminate_group(proc)
+                raise subprocess.TimeoutExpired(cmd, timeout)
+    for item in threads:
+        item.join(timeout=5)
+    return (proc.returncode, "".join(chunks["out"]),
+            "".join(chunks["err"]), stalled)
+
+
+def _invoke_engine(engine, binary, prompt, timeout, codex_home="",
+                   stall_timeout=0):
     """调用编剧引擎,返回 (ok, 文本或错误信息)。
 
     codex_home 指定 codex 登录态目录(CODEX_HOME),让编剧走独立
-    账号通道(如 B 通道),不占默认账号的额度。"""
+    账号通道(如 B 通道),不占默认账号的额度。
+    stall_timeout>0 时启用停滞看门狗:连续无任何输出即判卡住并终止,
+    配合 timeout=0(不设总时长)实现"长任务不掐、真卡住必停"。"""
     if engine == "codex":
         env = None
         if codex_home:
@@ -1571,21 +1702,33 @@ def _invoke_engine(engine, binary, prompt, timeout, codex_home=""):
                                     suffix=".txt")
         os.close(fd)
         try:
-            proc = subprocess.run(
-                [binary, *CODEX_WRITER_ARGS,
-                 "--output-last-message", last, prompt],
-                capture_output=True, text=True, timeout=timeout, env=env)
-            if proc.returncode != 0:
-                detail = (proc.stderr.strip()
-                          or proc.stdout.strip())[-300:]
-                return False, f"codex 编剧退出码 {proc.returncode}: {detail}"
+            cmd = [binary, *CODEX_WRITER_ARGS,
+                   "--output-last-message", last, prompt]
+            if stall_timeout and stall_timeout > 0:
+                returncode, out, err, stalled = _run_with_stall_watchdog(
+                    cmd, env, timeout, stall_timeout)
+                if stalled:
+                    return False, (
+                        f"codex 编剧卡住:连续 {int(stall_timeout)}s "
+                        "无任何输出,已终止本次调用;请检查网络/账号状态"
+                        "后重试(按约定不回退其他产线)")
+            else:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    timeout=(timeout if timeout and timeout > 0 else None),
+                    env=env)
+                returncode, out, err = (
+                    proc.returncode, proc.stdout, proc.stderr)
+            if returncode != 0:
+                detail = (err.strip() or out.strip())[-300:]
+                return False, f"codex 编剧退出码 {returncode}: {detail}"
             try:
                 text = Path(last).read_text(encoding="utf-8")
             except OSError:
                 text = ""
             # 最终答复文件为空的边角情况仍回退解析 stdout
             # (extract_json 能容忍进度杂讯)。
-            return True, text.strip() or proc.stdout
+            return True, text.strip() or out
         finally:
             try:
                 os.unlink(last)
@@ -1593,7 +1736,7 @@ def _invoke_engine(engine, binary, prompt, timeout, codex_home=""):
                 pass
     proc = subprocess.run(
         [binary, "-p", prompt], capture_output=True, text=True,
-        timeout=timeout)
+        timeout=(timeout if timeout and timeout > 0 else None))
     if proc.returncode != 0:
         # claude CLI 的登录/鉴权错误(如 Not logged in)只写 stdout,
         # stderr 为空;两路都带上,避免日志里只剩"退出码 1:"无法定位。
@@ -1672,6 +1815,8 @@ def _postprocess_and_validate(capability, payload, data):
         data["prop_registry"] = refined_registry
     if capability == "image_qc":
         error = validate_image_qc(data)
+    elif capability == "script" and payload.get("prompt_refine"):
+        error = validate_prompt_refine(data)
     elif capability == "script" and payload.get("story_analysis"):
         error = validate_story_analysis(
             data, require_resolved_identity=False)
@@ -1687,7 +1832,7 @@ REPAIR_TIMEOUT_CAP = 900
 
 
 def _repair_with_engine(engine, binary, capability, payload, data, error,
-                        timeout, codex_home=""):
+                        timeout, codex_home="", stall_timeout=0):
     """校验失败时的就地修复复检:同一引擎只修错误字段,不丢弃产出。
 
     原则:内容性校验失败(枚举/字段不合规)就地修,只有超时、连不上
@@ -1702,10 +1847,13 @@ def _repair_with_engine(engine, binary, capability, payload, data, error,
         f"{error}\n\n"
         "只修复校验指出的字段,其余内容一字不动;修复后输出完整 JSON,"
         "不要任何解释或 Markdown 代码块。\n原 JSON:\n" + source)
-    repair_timeout = min(int(timeout or 600), REPAIR_TIMEOUT_CAP)
+    # timeout=0(不设上限)时修复调用仍用自身上限兜底
+    repair_timeout = (min(int(timeout), REPAIR_TIMEOUT_CAP)
+                      if timeout and timeout > 0 else REPAIR_TIMEOUT_CAP)
     try:
         ok, text = _invoke_engine(engine, binary, prompt, repair_timeout,
-                                  codex_home=codex_home)
+                                  codex_home=codex_home,
+                                  stall_timeout=stall_timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return None, f"(就地修复调用失败: {exc})"
     if not ok:
@@ -1720,7 +1868,7 @@ def _repair_with_engine(engine, binary, capability, payload, data, error,
 
 
 def run(request, claude, timeout, engine="claude", codex="codex",
-        codex_home=""):
+        codex_home="", stall_timeout=0):
     capability = request["capability"]
     payload = request.get("payload", {})
     binary = codex if engine == "codex" else claude
@@ -1732,7 +1880,8 @@ def run(request, claude, timeout, engine="claude", codex="codex",
         return {"ok": False, "error": str(exc)}
     try:
         ok, text = _invoke_engine(engine, binary, prompt, timeout,
-                                  codex_home=codex_home)
+                                  codex_home=codex_home,
+                                  stall_timeout=stall_timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ok": False, "error": f"{engine} 调用失败: {exc}"}
     if not ok:
@@ -1746,7 +1895,7 @@ def run(request, claude, timeout, engine="claude", codex="codex",
         # 浪费;先让同一引擎局部修复并复检,复检仍不过才交回路由换路。
         fixed, note = _repair_with_engine(
             engine, binary, capability, payload, data, error, timeout,
-            codex_home=codex_home)
+            codex_home=codex_home, stall_timeout=stall_timeout)
         if fixed is not None:
             return {"ok": True, "data": fixed, "uri": "",
                     "repaired_fields": True}
@@ -1767,13 +1916,17 @@ def main(argv=None):
     parser.add_argument("--codex-home", default="",
                         help="codex 登录态目录(CODEX_HOME),"
                              "编剧走独立账号通道时指定")
-    parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--timeout", type=int, default=600,
+                        help="单次调用总时长上限;0=不设上限(配合停滞检测)")
+    parser.add_argument("--stall-timeout", type=int, default=0,
+                        help="连续无输出判定卡住的秒数;0=关闭活性检测")
     args = parser.parse_args(argv)
     try:
         request = json.loads(sys.stdin.read())
         reply = run(request, args.claude, args.timeout,
                     engine=args.engine, codex=args.codex,
-                    codex_home=args.codex_home)
+                    codex_home=args.codex_home,
+                    stall_timeout=args.stall_timeout)
     except Exception as exc:
         reply = {"ok": False, "error": str(exc)}
     print(json.dumps(reply, ensure_ascii=False))

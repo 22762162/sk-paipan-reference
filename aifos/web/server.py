@@ -2422,6 +2422,10 @@ def make_handler(workspace, jobs):
                     return self._character_assets_policy()
                 if parsed.path == "/api/character/regenerate":
                     return self._character_regenerate()
+                if parsed.path == "/api/character/refine-prompt":
+                    return self._character_refine_prompt()
+                if parsed.path == "/api/character/refine-prompt/apply":
+                    return self._character_refine_apply()
                 if parsed.path == "/api/revise":
                     return self._revise()
                 if parsed.path == "/api/regen_image":
@@ -3239,6 +3243,58 @@ def make_handler(workspace, jobs):
                     "character": character_name,
                     "prop": prop_name,
                 })
+            return self._json({"job_id": job_id}, status=202)
+
+        def _character_refine_prompt(self):
+            """用户意见 → AI 深度改写人物形象提示词(仅预览,不出图)。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            character = str(body.get("character") or "").strip()
+            feedback = str(body.get("feedback") or "").strip()
+            if not character:
+                return self._error(400, "缺少 character")
+            if not feedback:
+                return self._error(400, "请填写修改意见")
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id: app.director.refine_character_prompt(
+                    title, number, character, feedback),
+                action="refine_character_prompt",
+                request={"character": character, "feedback": feedback})
+            return self._json({"job_id": job_id}, status=202)
+
+        def _character_refine_apply(self):
+            """确认改写后的提示词:写入人物设定并重生成四张候选。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            character = str(body.get("character") or "").strip()
+            prompt = str(body.get("image_prompt") or "").strip()
+            if not character:
+                return self._error(400, "缺少 character")
+            if not prompt:
+                return self._error(400, "缺少确认后的 image_prompt")
+            if jobs.running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，请先暂停，待状态稳定后再改人物形象")
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id: app.director.apply_character_prompt(
+                    title, number, character, prompt,
+                    feedback=str(body.get("feedback") or ""),
+                    run_id=run_id),
+                action="regenerate_cast",
+                request={"reason": "refine_character_prompt_apply",
+                         "character": character})
             return self._json({"job_id": job_id}, status=202)
 
         def _episode_ref(self, body):

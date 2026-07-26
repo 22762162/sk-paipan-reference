@@ -5339,12 +5339,15 @@ class Director:
             if design:
                 upgraded = self._upgrade_character_visual_dna(
                     design, character)
+                # 用户经"提意见改形象"确认过的字段是最高事实源,
+                # 不得被剧本侧的同名字段静默覆盖。
+                user_locked = set(upgraded.get("user_locked_fields") or ())
                 for key in (
                         "gender", "age_range", "identity", "image_prompt",
                         "negative_prompt", "visual_direction",
                         "character_analysis", "visual_dna",
                         "continuity_anchors"):
-                    if character.get(key):
+                    if character.get(key) and key not in user_locked:
                         upgraded[key] = copy.deepcopy(character[key])
                 dna = character.get("visual_dna")
                 if character.get("image_prompt") and isinstance(dna, dict):
@@ -12067,6 +12070,101 @@ class Director:
                 self.assets.register(
                     project["id"], "scene_art", location, uri="",
                     meta={"invalidated": reason}, new_version=True)
+
+    def refine_character_prompt(self, project_title, episode_number,
+                                character_name, feedback):
+        """用户对人物形象的意见 → 编剧 AI 深度改写设定卡提示词。
+
+        只做改写与预览,不落盘、不出图;用户确认后经
+        apply_character_prompt 生效并重生成候选。
+        """
+        project, episode = self._episode_ctx(project_title, episode_number)
+        name = str(character_name or "").strip()
+        feedback = str(feedback or "").strip()
+        if not name:
+            raise AifosError("缺少角色名")
+        if not feedback:
+            raise AifosError("请填写修改意见")
+        design = self._character_design(project["id"], name) or {}
+        current = self._design_value(design.get("image_prompt")) or (
+            self._design_line(design, keys=(
+                "species", "gender", "age_range", "identity", "appearance",
+                "hair", "eyes", "costume", "accessories", "era_setting",
+                "occupation", "signature_props")))
+        script, _ = self.projects.latest_document(episode["id"], "script")
+        introduction = next(
+            (c.get("introduction", "")
+             for c in (script or {}).get("characters", [])
+             if c.get("name") == name), "")
+        context = {
+            "introduction": introduction,
+            "gender": self._design_value(design.get("gender")),
+            "age_range": self._design_value(design.get("age_range")),
+            "identity": self._design_value(design.get("identity")),
+            "visual_dna": design.get("visual_dna") or {},
+        }
+        ctx = {"project": dict(project), "episode": dict(episode),
+               "out_root": self._episode_dir(project, episode)}
+        self._task_cost = 0.0
+        self._task_providers = set()
+        result = self._call(ctx, "script", {
+            "prompt_refine": True,
+            "character_name": name,
+            "current_prompt": current,
+            "character_context": context,
+            "style": project["style"] or "",
+            "feedback": feedback,
+            "project_title": project["title"],
+            "episode_number": episode["number"],
+        }, "cast")
+        data = result.data or {}
+        return {
+            "status": "refined",
+            "character": name,
+            "feedback": feedback,
+            "current_prompt": current,
+            "image_prompt": str(data.get("image_prompt") or "").strip(),
+            "changes": data.get("changes") or [],
+            "conflict_notes": data.get("conflict_notes") or [],
+            "provider": result.provider,
+        }
+
+    def apply_character_prompt(self, project_title, episode_number,
+                               character_name, image_prompt,
+                               feedback="", run_id=None):
+        """确认改写:提示词写入人物设定(新版本+用户锁),重生成四张候选。"""
+        project, episode = self._episode_ctx(project_title, episode_number)
+        name = str(character_name or "").strip()
+        prompt = str(image_prompt or "").strip()
+        if not name:
+            raise AifosError("缺少角色名")
+        if len(prompt) < 20:
+            raise AifosError("确认的提示词为空或过短")
+        row = self.assets.latest(project["id"], "character", name)
+        if row is None:
+            raise AifosError(f"角色设定不存在: {name}")
+        meta = row["meta"]
+        if isinstance(meta, str):
+            meta = json.loads(meta or "{}")
+        meta = meta or {}
+        design = copy.deepcopy(meta.get("design") or {})
+        design["image_prompt"] = prompt
+        locked = set(design.get("user_locked_fields") or ())
+        locked.add("image_prompt")
+        design["user_locked_fields"] = sorted(locked)
+        history = design.setdefault("refine_history", [])
+        history.append({"feedback": str(feedback or "").strip(),
+                        "at": round(time.time(), 1)})
+        del history[:-10]   # 只留最近 10 次意见
+        self.assets.register(
+            project["id"], "character", name,
+            meta={**meta, "design": design}, new_version=True)
+        self.log.info(
+            "director",
+            f"人物形象提示词已按用户意见更新并锁定: {name};开始重生成候选")
+        return self.regenerate_character_candidates(
+            project_title, episode_number, run_id=run_id,
+            character_name=name)
 
     def regenerate_character_candidates(self, project_title, episode_number,
                                         run_id=None, character_name="",

@@ -2489,6 +2489,90 @@ async function pollJob(jobId, onDone, onProgress) {
   if (!finished) timer = setInterval(tick, 1200);
 }
 
+/* 人物形象意见改写:AI 深度理解意见 → 改写提示词 → 用户确认 → 重生成候选 */
+async function refineCharacterPrompt(button, data, episodeId) {
+  const character = button.dataset.character;
+  const feedback = (window.prompt(
+    `对「${character}」形象的修改意见,AI 会深度理解并改写形象提示词\n(例:头发再长一点、皮肤更白皙、眼神更冷)`) || "").trim();
+  if (!feedback) return;
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = "AI 理解意见中…";
+  try {
+    const reply = await api("/api/character/refine-prompt", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ episode_id: data.episode.id, character, feedback }),
+    });
+    pollJob(reply.job_id, (job) => {
+      button.disabled = false;
+      button.textContent = original;
+      const summary = job.summary || {};
+      if (job.status !== "done" || !summary.image_prompt) {
+        if (job.status === "done") showToast("AI 未返回可用的改写结果", "error");
+        return;   // failed 的错误 toast 由 pollJob 统一弹出
+      }
+      showRefinePromptOverlay(episodeId, data, character, feedback, summary);
+    });
+  } catch (e) {
+    showToast(e.message, "error");
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+function showRefinePromptOverlay(episodeId, data, character, feedback, summary) {
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay";
+  const changes = (summary.changes || []).map((c) => `<li>${esc(c)}</li>`).join("");
+  const conflicts = (summary.conflict_notes || []).map((c) => `<li>${esc(c)}</li>`).join("");
+  overlay.innerHTML = `
+    <div class="script-panel">
+      <div class="script-head">
+        <h3>「${esc(character)}」形象改写确认</h3>
+        <button class="close">关闭 Esc</button>
+      </div>
+      <div class="script-scroll" style="padding:12px 16px">
+        <p class="dim">你的意见:${esc(feedback)}</p>
+        ${changes ? `<p><b>AI 落实的改动</b></p><ul>${changes}</ul>` : ""}
+        ${conflicts ? `<p><b>⚠ 与设定冲突的处理</b></p><ul>${conflicts}</ul>` : ""}
+        <p><b>改写后的形象提示词(可再手工微调后确认)</b></p>
+        <textarea class="refine-prompt-edit" rows="12"
+          style="width:100%;box-sizing:border-box">${esc(summary.image_prompt)}</textarea>
+      </div>
+      <div class="revise-bar">
+        <div class="revise-actions">
+          <button class="primary refine-apply">✓ 确认并重生成4张候选</button>
+          <button class="refine-cancel">取消</button>
+        </div>
+      </div>
+    </div>`;
+  const close = () => overlay.remove();
+  overlay.querySelector(".close").onclick = close;
+  overlay.querySelector(".refine-cancel").onclick = close;
+  overlay.addEventListener("click", (ev) => { if (ev.target === overlay) close(); });
+  overlay.querySelector(".refine-apply").onclick = async (ev) => {
+    const prompt = overlay.querySelector(".refine-prompt-edit").value.trim();
+    if (prompt.length < 20) { showToast("提示词过短", "error"); return; }
+    ev.currentTarget.disabled = true;
+    ev.currentTarget.textContent = "提交中…";
+    try {
+      await api("/api/character/refine-prompt/apply", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ episode_id: data.episode.id, character,
+          image_prompt: prompt, feedback }),
+      });
+      close();
+      showToast(`「${character}」形象已更新并锁定,正在重生成4张候选`, "ok");
+      pollCanvas(episodeId);
+    } catch (e) {
+      showToast(e.message, "error");
+      ev.currentTarget.disabled = false;
+      ev.currentTarget.textContent = "✓ 确认并重生成4张候选";
+    }
+  };
+  document.body.appendChild(overlay);
+}
+
 /* 剧本阅读 + 打磨(意见重写 / 直接编辑) */
 function showScriptOverlay(data, episodeId) {
   const script = data.script;
@@ -7436,6 +7520,7 @@ function renderCastSelection(data, episodeId) {
         <div class="cast-choice-head"><div><h2>${esc(character.character)}</h2>
           <span class="dim">${esc(character.role || "角色")} · ${character.candidate_count || 0}/${character.candidate_target || selection.candidate_target || 4} 张候选</span></div>
           <button type="button" class="cast-regenerate-one" data-character="${esc(character.character)}">↻ 不满意，换4张</button>
+          <button type="button" class="cast-refine-one" data-character="${esc(character.character)}">✎ 提意见改形象</button>
           <strong class="${character.candidate_target === 0 ? "cast-locked" : (character.locked ? "cast-locked" : "cast-unlocked")}">
             ${character.candidate_target === 0 ? "无需单独立绘" : (character.locked ? "✓ 已锁定最终立绘" : "请选择1张")}</strong></div>
         ${castVisualDnaHtml(character)}
@@ -7574,6 +7659,9 @@ function renderCastSelection(data, episodeId) {
       button.textContent = "↻ 不满意，换4张";
     }
   };
+  app.querySelectorAll(".cast-refine-one").forEach((button) => {
+    button.onclick = () => refineCharacterPrompt(button, data, episodeId);
+  });
   app.querySelectorAll(".cast-regenerate-one").forEach((button) => {
     button.onclick = (event) => armConfirm(
       event.currentTarget, "保留旧版并生成新4张", () => regenerateOne(
