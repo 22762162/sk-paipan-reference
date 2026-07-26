@@ -58,6 +58,80 @@ GEN_DIRECTIVE = (
     "并以非零码退出,不要伪造图片。")
 
 
+def _nonnegative_int(value):
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result >= 0 else None
+
+
+def _functional_figures(payload):
+    return [
+        dict(item) for item in (payload.get("functional_figures") or [])
+        if isinstance(item, dict)
+        and type(item.get("count")) is int and item.get("count") > 0
+    ]
+
+
+def _population_counts(payload):
+    """Resolve v2.1 population first, then legacy payload fields."""
+    contract = payload.get("prompt_contract")
+    contract = contract if isinstance(contract, dict) else {}
+    population = contract.get("population")
+    population = population if isinstance(population, dict) else {}
+    counts = population.get("counts")
+    counts = counts if isinstance(counts, dict) else {}
+    subject = contract.get("subject")
+    subject = subject if isinstance(subject, dict) else {}
+    composition = contract.get("composition")
+    composition = composition if isinstance(composition, dict) else {}
+    figures = _functional_figures(payload)
+
+    registered = next((
+        value for value in (
+            _nonnegative_int(counts.get("named_characters")),
+            _nonnegative_int(subject.get("registered_count")),
+            _nonnegative_int(payload.get("character_count")),
+            len(payload.get("characters") or []),
+        ) if value is not None), 0)
+    functional = next((
+        value for value in (
+            _nonnegative_int(counts.get("functional_people")),
+            _nonnegative_int(subject.get("functional_count")),
+            sum(item["count"] for item in figures),
+        ) if value is not None), 0)
+    visible = next((
+        value for value in (
+            _nonnegative_int(counts.get("real_people_total")),
+            _nonnegative_int(subject.get("visible_count")),
+            _nonnegative_int(payload.get("visible_figure_count")),
+            _nonnegative_int(payload.get("count")),
+            _nonnegative_int(
+                composition.get("expected_visible_figure_count")),
+            registered + functional,
+        ) if value is not None), registered + functional)
+    return registered, functional, visible
+
+
+def _population_line(payload):
+    registered, functional, visible = _population_counts(payload)
+    names = "、".join(payload.get("characters") or []) or "无"
+    figures = _functional_figures(payload)
+    figure_text = "、".join(
+        f"{item.get('name') or item.get('label') or '功能人物'}"
+        f"{item['count']}人"
+        + (f"({item.get('state') or item.get('function')})"
+           if item.get("state") or item.get("function") else "")
+        for item in figures
+    ) or ("按v2.1人口合同" if functional else "无")
+    return (
+        f"登记角色{registered}人（{names}）；功能人物{functional}人"
+        f"（{figure_text}）；画面可见真人严格共{visible}人。"
+        "身份与最终立绘核验只覆盖登记角色；功能人物只服从本镜数量、"
+        "状态与剧情功能；非现实叙事叠层不计入真人总数。")
+
+
 def _space_line(payload):
     constraint = str(payload.get("spatial_constraint") or "").strip()
     if not constraint:
@@ -88,7 +162,12 @@ def _ref_line(payload):
     if manifest:
         numbered = ";".join(
             f"图{item.get('index')}={item.get('label', '参考图')}"
-            f" {item.get('uri', '')}({item.get('binding', '')})"
+            f" {item.get('uri', '')}({item.get('binding', '')}"
+            + (f"；inherits={','.join(item.get('inherits') or [])}"
+               if item.get("inherits") else "")
+            + (f"；excludes={','.join(item.get('excludes') or [])}"
+               if item.get("excludes") else "")
+            + ")"
             for item in manifest if item.get("uri"))
         return ("参考图对照表(必须逐张真实打开读取,严格按编号对应使用:"
                 "每个人物只参考自己名下的图,禁止把一个人的脸画成另一张"
@@ -259,9 +338,8 @@ def build_instruction(capability, payload, out_dir):
         instruction = (
             f"为漫剧分镜生成一张关键图并保存到 {target}"
             f"(PNG,{size})。画面内容:{prompt_text}。"
-            f"出场角色:{'、'.join(payload.get('characters', []))}，"
-            f"严格共{payload.get('character_count', len(payload.get('characters', [])))}人，"
-            f"禁止新增或复制人物。{text_rule}"
+            f"人物总量合同:{_population_line(payload)}"
+            f"禁止新增、漏画、复制或合并任何真人。{text_rule}"
             f"镜头语言:{payload.get('camera', '')}。"
             f"{_ref_line(payload)}{common}"
             "只产出该文件,不要改动其他文件。"
@@ -333,6 +411,7 @@ def build_instruction(capability, payload, out_dir):
     if capability == "image_qc":
         image = payload.get("image_uri", "")
         chars = "、".join(payload.get("characters", [])) or "无人(空镜)"
+        _, _, expected_real_people = _population_counts(payload)
         forbid = "、".join(payload.get("forbid", [])) or "无"
         identity_refs = payload.get("identity_references") or []
         identity_line = "；".join(
@@ -351,10 +430,14 @@ def build_instruction(capability, payload, out_dir):
             f"质检必须满足={ '；'.join(quality.get('required') or []) };"
             f"质检禁止={ '；'.join(quality.get('forbidden') or []) }"
             if isinstance(quality, dict) else "")
+        composition_visible = composition.get(
+            "expected_visible_figure_count")
+        if composition_visible is None:
+            composition_visible = expected_real_people
         composition_line = (
             f"类型={composition.get('composition_type')};"
             f"正面主体={composition.get('expected_primary_count')};"
-            f"实际可见人形={composition.get('expected_visible_figure_count')};"
+            f"实际可见真人={composition_visible};"
             f"{actor_rules};{composition.get('count_rule', '')};{quality_line}"
             if composition else "标准构图；按待检图实际可见视角逐人核验")
         physical = payload.get("physical_contract") or {}
@@ -370,8 +453,7 @@ def build_instruction(capability, payload, out_dir):
             "画面中出现的每个人形、头像或局部都必须是该角色同一人,"
             "人数不按出场人数核对"
             if payload.get("multi_view") else
-            f"严格共 {payload.get('count', len(payload.get('characters', [])))} "
-            "个已登记角色；"
+            _population_line(payload)
             + (composition.get("count_rule") or "每个人物只计一次"))
         overlays = [
             item for item in (payload.get("narrative_overlays") or [])

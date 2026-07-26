@@ -115,7 +115,8 @@ def test_inner_persona_is_non_physical_and_exaggerated(tmp_path):
     overlay = inner["narrative_overlays"][0]
     assert inner["characters"] == [HOST]
     assert inner["character_count"] == 1
-    assert inner["visible_figure_count"] == 2
+    assert inner["visible_figure_count"] == 1
+    assert len(inner["narrative_overlays"]) == 1  # Q版叠层另计，不计真人
     assert overlay["counts_as_real_character"] is False
     assert overlay["included_in_spatial_blocking"] is False
     assert overlay["visible_to"] == "host_only"
