@@ -2593,7 +2593,7 @@ class Director:
         完成时记录实际使用的产线(真实/占位)与回退原因,界面透明可见。"""
         payload = payload or {}
         feedback = payload.get("feedback", "")
-        if payload.get("shot_no") is not None:
+        if str(item_id).startswith(("shot:", "frames:")):
             if not isinstance(payload.get("reference_manifest"), list):
                 self._attach_reference_manifest(payload)
             validation = validate_shot_prompt_contract(

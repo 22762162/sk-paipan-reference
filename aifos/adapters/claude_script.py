@@ -888,7 +888,11 @@ def validate_script(script, payload):
     script.setdefault("episode_title", "")
     script.setdefault("logline", "")
     normalize_script_bible(script, payload)
-    return validate_script_bible(script)
+    # AI 初稿即使漏写性别/年龄也必须进入制作圣经供人工补录，不能在
+    # Provider 层静默回退成另一份 mock 剧本。真正锁定人物、生成候选图
+    # 时仍由 validate_script_bible 的默认严格模式阻断。
+    return validate_script_bible(
+        script, require_resolved_identity=False)
 
 
 def validate_storyboard(storyboard):
@@ -1674,7 +1678,8 @@ def run(request, claude, timeout, engine="claude", codex="codex"):
     if capability == "image_qc":
         error = validate_image_qc(data)
     elif capability == "script" and payload.get("story_analysis"):
-        error = validate_story_analysis(data)
+        error = validate_story_analysis(
+            data, require_resolved_identity=False)
     elif capability == "script":
         error = validate_script(data, payload)
     else:

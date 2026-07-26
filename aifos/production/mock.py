@@ -797,6 +797,29 @@ class MockProvider(Provider):
             shot["physical_logic"] = (
                 f"{'、'.join(names) or '空镜'}位于当前场景有效支撑面内；"
                 f"动作“{action}”的朝向、接触点、视线与道具使用方向可达")
+            subject = "、".join(names) or "空镜环境"
+            start_state = (
+                f"{subject}位于各自起始标记位，身体朝向、视线与姿态"
+                "定格为一个稳定可见状态")
+            end_state = (
+                f"{subject}位于各自终点标记位，身体朝向、视线与表情"
+                "定格为一个稳定可见状态")
+            # Mock 是上游分镜提供者，也必须像真实 AI 一样在交稿时明确
+            # 三种静帧目标；不能把决定拖到关键帧编译时再从动作文字猜。
+            shot["frame_targets"] = {
+                "keyframe": {
+                    "phase": "end", "state": end_state,
+                    "fallback": False,
+                },
+                "first_frame": {
+                    "phase": "start", "state": start_state,
+                    "fallback": False,
+                },
+                "last_frame": {
+                    "phase": "end", "state": end_state,
+                    "fallback": False,
+                },
+            }
         uri = _json_artifact(out_dir / "storyboard.json", storyboard)
         return storyboard, uri
 
