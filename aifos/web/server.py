@@ -2265,6 +2265,14 @@ def make_handler(workspace, jobs):
                         hours = 24.0
                     return self._json(summarize(
                         Path(workspace) / "logs", hours=hours))
+                if route == "/api/qc/failure-stats":
+                    from ..qc_stats import summarize_qc
+                    try:
+                        hours = float(query.get("hours", ["168"])[0])
+                    except (TypeError, ValueError):
+                        hours = 168.0
+                    return self._json(summarize_qc(
+                        Path(workspace) / "logs", hours=hours))
                 if route in ("/api/firefire", "/api/firefire/overview"):
                     return self._json(self._with_app(
                         lambda app: app.firefire.overview()))

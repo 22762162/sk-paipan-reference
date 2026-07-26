@@ -555,6 +555,9 @@ def _cmd_stats(app):
     from .channel_stats import format_table, summarize
     print("== Codex 通道出图速度(近 24 小时,image/frames/cover)==")
     print(format_table(summarize(app.workspace.logs_dir)))
+    from .qc_stats import format_qc_table, summarize_qc
+    print("== 质检失败原因分类(近 7 天)==")
+    print(format_qc_table(summarize_qc(app.workspace.logs_dir)))
     return 0
 
 

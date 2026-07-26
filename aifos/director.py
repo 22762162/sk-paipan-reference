@@ -54,6 +54,7 @@ from .prompt_contract import (
 from .qc_feedback import optimize_qc_feedback
 from .lessons import (DOMAIN_SCRIPT, lessons_block, project_lessons,
                       record_lessons, script_lessons_block)
+from .qc_stats import record_qc
 from .relations import relation_lines, write_relations
 from .spatial_blocking import (
     build_spatial_plan,
@@ -2177,6 +2178,29 @@ class Director:
                 # 质检问题只记录为待审核观察；临时修订不得自动升级成
                 # 项目永久规则，更不能污染其他镜头的提示词。
                 qc = (extra or {}).get("qc") or {}
+                if qc.get("passed") is not None:
+                    # 质检台账:通过/未通过都记,失败原因自动归类;
+                    # 供 `aifos stats` 与 /api/qc/failure-stats 聚合。
+                    try:
+                        record_qc(
+                            ctx["out_root"],
+                            episode_id=ctx["episode"]["id"],
+                            item_id=item_id,
+                            category=item.get("category", ""),
+                            capability=item.get("capability", ""),
+                            provider=str(
+                                (extra or {}).get("provider")
+                                or item.get("provider") or ""),
+                            model=str(
+                                (extra or {}).get("model")
+                                or item.get("model") or ""),
+                            task_class=str(
+                                item.get("image_task_class") or ""),
+                            passed=qc.get("passed"),
+                            issues=qc.get("issues"),
+                            attempts=qc.get("attempts"))
+                    except Exception:
+                        pass   # 台账失败绝不能影响生产主流程
                 issues = qc.get("lesson_issues") or (
                     qc.get("issues") if qc.get("passed") is False else [])
                 if issues:
