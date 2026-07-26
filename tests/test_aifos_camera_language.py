@@ -1,0 +1,45 @@
+"""镜头语言具象化:术语词典与镜头合同渲染注入。"""
+
+from aifos.camera_language import camera_geometry_clause
+from aifos.prompt_contract import compile_shot_prompt
+
+
+def test_geometry_clause_translates_known_terms():
+    clause = camera_geometry_clause(
+        {"景别": "全景", "角度": "俯拍", "机位": "背面"})
+    assert "按可见特征执行并核验" in clause
+    assert "头顶到脚底完整入画" in clause          # 景别边界
+    assert "头顶与双肩上表面" in clause            # 俯仰透视
+    assert "不出现眉、眼、鼻、嘴" in clause        # 背面身份判据
+
+
+def test_geometry_clause_skips_placeholders_and_unknown():
+    # 「按分镜」「保持轴线」等默认占位不产出条款
+    assert camera_geometry_clause(
+        {"景别": "按分镜", "角度": "保持轴线", "机位": ""}) == ""
+    assert camera_geometry_clause(None) == ""
+    assert camera_geometry_clause({"角度": "荷兰角"}) == ""
+
+
+def test_compiled_shot_prompt_carries_geometry_for_image_and_video():
+    shot = {
+        "shot_no": 1, "scene_no": 1, "kind": "dialogue",
+        "description": "林川抬头看向房梁", "camera": "特写·仰拍",
+        "duration": 2.5, "characters": ["林川"], "dialogue": None,
+        "prompt": "p",
+    }
+    _contract, image_prompt = compile_shot_prompt(
+        shot, location="驿馆内室", mode="image")
+    assert "肩线以下出画" in image_prompt        # 特写边界
+    assert "下颌底面与鼻底" in image_prompt      # 仰拍透视
+    _contract, video_prompt = compile_shot_prompt(
+        shot, location="驿馆内室", mode="video")
+    assert "下颌底面与鼻底" in video_prompt      # 视频同一标准
+
+
+def test_qc_feedback_camera_rule_references_visible_features():
+    from aifos.qc_feedback import optimize_qc_feedback
+    revision = optimize_qc_feedback(
+        ["视角接近后上方俯视，不符合合同要求的仰拍"])
+    assert "camera" in revision["categories"]
+    assert "可见特征执行并核验" in revision["text"]

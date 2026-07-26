@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import re
 
+from .camera_language import camera_geometry_clause
+
 
 PROMPT_CONTRACT_SCHEMA = "aifos.shot-prompt/v2.2"
 PHYSICAL_CONTRACT_SCHEMA = "aifos.physical-space/v1"
@@ -2306,6 +2308,11 @@ def render_shot_prompt(contract, *, mode=None):
         camera_values.append("静态关键帧只定格当前可见机位与构图")
     camera_values.append(f"构图{camera.get('构图')}")
     camera_line = "；".join(value for value in camera_values if value)
+    # 抽象镜头术语(俯拍/背面/过肩…)对图像模型约束力弱,是历史视角类
+    # 质检失败的主因;翻译成可见几何特征,生成与质检按同一标准执行。
+    camera_geometry = camera_geometry_clause(camera)
+    if camera_geometry:
+        camera_line = f"{camera_line}；{camera_geometry}"
     lines = [
         "【镜头合同v2.2】只执行下列事实，不自行补剧情。",
     ]
