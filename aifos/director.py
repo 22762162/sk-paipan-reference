@@ -7665,6 +7665,8 @@ class Director:
             "action": shot.get("description", ""),
             "start_state": shot.get("start_state", {}),
             "end_state": shot.get("end_state", {}),
+            "identity_facts_required": bool(shot.get("characters")),
+            "appearance_state_required": bool(shot.get("characters")),
             "frame_targets": copy.deepcopy(
                 shot.get("frame_targets") or {}),
             "frame_target": copy.deepcopy(

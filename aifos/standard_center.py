@@ -55,6 +55,13 @@ DEFAULT_STANDARD = {
             "prompt_strategy": "five_dimensions_per_segment",
             "prompt_contract": {
                 "schema": "aifos.shot-prompt/v2.2",
+                "authority": "highest_runtime_rule",
+                "conflict_policy": "block_and_return_upstream_never_guess",
+                "review_page_schema": "aifos.prompt-review/v1",
+                "per_shot_review_variants": [
+                    "keyframe", "first_frame", "last_frame", "video"],
+                "explicit_identity_fields_required": [
+                    "name", "gender", "age_range"],
                 "order": [
                     "subject", "scene", "frame_target", "start",
                     "character_conditions", "prop_registry", "frame_props",

@@ -6,6 +6,7 @@ API:
   GET  /api/overview            全局看板(项目/剧集/成本/额度/任务)
   GET  /api/episode/<id>        单集详情(阶段/剧本/分镜/质检/产物索引)
   GET  /api/episode/<id>/status 单集轻量变更摘要(用于手机端轮询)
+  GET  /api/episode/<id>/prompts 逐镜最高规则提示词与 PASS/WARN/BLOCK
   GET  /api/assets?project=T    项目资产列表
   GET  /api/logs?limit=N        最近日志
   GET  /api/jobs  /api/jobs/<id>后台制作任务
@@ -44,6 +45,7 @@ from ..updater import (check_and_update, current_build, repo_root,
                        restart_process, start_auto_updater)
 from ..errors import AifosError
 from ..quality_policy import normalize_quality, normalize_quality_policy
+from ..prompt_review import build_episode_prompt_review
 from ..smart_input import resolve_produce_target
 from ..standard_center import StandardConflictError, StandardValidationError
 from ..story_context import attach_shot_story_context
@@ -2279,6 +2281,15 @@ def make_handler(workspace, jobs):
                             app, int(match.group(1)), jobs))
                     if payload is None:
                         return self._error(404, "剧集不存在")
+                    return self._json(payload)
+                match = re.match(r"^/api/episode/(\d+)/prompts$", route)
+                if match:
+                    payload = self._with_app(
+                        lambda app: build_episode_prompt_review(
+                            app, int(match.group(1))))
+                    if payload is None:
+                        return self._error(404, "剧集不存在")
+                    payload["build"] = BUILD
                     return self._json(payload)
                 match = re.match(r"^/api/episode/(\d+)$", route)
                 if match:

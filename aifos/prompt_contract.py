@@ -1785,6 +1785,35 @@ def _character_lines(shot):
     ]
 
 
+def _character_identity_facts(shot):
+    """Return structured identity facts for every registered actor.
+
+    The rendered actor line remains optimized for image/video models, while
+    these fields give the validator an exact source for identity completeness.
+    Natural-language placeholders such as “以参考图为准” must not count as a
+    known gender or age range.
+    """
+    characters = list(shot.get("characters") or [])
+    raw = (
+        shot.get("character_facts")
+        if isinstance(shot.get("character_facts"), dict)
+        else shot.get("character_background"))
+    raw = raw if isinstance(raw, dict) else {}
+    facts = []
+    for name in characters:
+        value = raw.get(name)
+        value = value if isinstance(value, dict) else {}
+        facts.append({
+            "name": _text(name),
+            "species": _text(value.get("species"), "人类"),
+            "gender": _text(value.get("gender") or value.get("sex")),
+            "age_range": _text(value.get("age_range")),
+            "identity": _text(
+                value.get("identity") or value.get("occupation")),
+        })
+    return facts
+
+
 def build_composition_contract(shot):
     """Derive per-actor visibility duties from the current shot only.
 
@@ -2049,6 +2078,10 @@ def build_shot_prompt_contract(
         }))
     composition["expected_visible_figure_count"] = visible_count
     medium = _normalize_visual_medium(shot, style)
+    identity_facts_required = bool(
+        shot.get("identity_facts_required")
+        or isinstance(shot.get("character_facts"), dict)
+        or isinstance(shot.get("character_background"), dict))
     contract = {
         "schema": PROMPT_CONTRACT_SCHEMA,
         # ``mode=shot`` is a legacy discriminator. Media/output semantics live
@@ -2081,6 +2114,8 @@ def build_shot_prompt_contract(
             "functional_count": functional_count,
             "visible_count": visible_count,
             "actors": _character_lines(shot),
+            "identity_facts": _character_identity_facts(shot),
+            "identity_facts_required": identity_facts_required,
             "functional_figures": functional_figures,
         },
         "population": {
@@ -2586,6 +2621,49 @@ def validate_shot_prompt_contract(contract):
         issues.append(
             "单人过肩合同必须严格为1个登记角色、0个功能人物、1具连续身体")
 
+    identity_facts_required = bool(
+        subject.get("identity_facts_required"))
+    identity_facts = subject.get("identity_facts")
+    if not isinstance(identity_facts, list):
+        if identity_facts_required:
+            issues.append("subject.identity_facts 必须是按登记角色列出的列表")
+        identity_facts = []
+    identity_by_name = {
+        _text(item.get("name")): item
+        for item in identity_facts
+        if isinstance(item, dict) and _text(item.get("name"))
+    }
+    ambiguous_identity_tokens = (
+        "未指定", "未知", "不详", "待定", "待确认", "待补充",
+        "以参考图为准", "以剧本为准", "按参考图", "按剧本",
+        "自行判断", "自行推断", "模型判断", "自由发挥",
+    )
+
+    def explicit_identity_value(value):
+        value = _text(value)
+        return bool(value) and not any(
+            token in value for token in ambiguous_identity_tokens)
+
+    registered_names = []
+    for actor in subject.get("actors") or []:
+        value = _text(actor)
+        if "=" in value:
+            value = value.split("=", 1)[1].split("（", 1)[0].strip()
+        if value:
+            registered_names.append(value)
+    if identity_facts_required and len(identity_facts) != count:
+        issues.append(
+            "subject.identity_facts 数量必须与登记角色数完全一致")
+    for name in registered_names if identity_facts_required else []:
+        facts = identity_by_name.get(name)
+        if facts is None:
+            issues.append(f"{name}缺少结构化人物身份事实")
+            continue
+        if not explicit_identity_value(facts.get("gender")):
+            issues.append(f"{name}性别未明确，禁止交给图像/视频模型猜测")
+        if not explicit_identity_value(facts.get("age_range")):
+            issues.append(f"{name}年龄段未明确，禁止交给图像/视频模型猜测")
+
     refs = contract.get("references") or []
     indexes = [item.get("index") for item in refs if isinstance(item, dict)]
     if indexes and indexes != list(range(1, len(indexes) + 1)):
@@ -2626,13 +2704,7 @@ def validate_shot_prompt_contract(contract):
     action = _text(contract.get("action"))
     start_appearance = contract.get("start_appearance") or {}
     end_appearance = contract.get("end_appearance") or {}
-    actor_names = []
-    for actor in subject.get("actors") or []:
-        value = _text(actor)
-        if "=" in value:
-            value = value.split("=", 1)[1].split("（", 1)[0].strip()
-        if value:
-            actor_names.append(value)
+    actor_names = registered_names
     if contract.get("appearance_state_required"):
         for name in actor_names:
             start_look = start_appearance.get(name) or {}

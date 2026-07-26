@@ -232,6 +232,8 @@ function route() {
   }
   const standards = location.hash.match(/^#\/standards(?:\/([a-z_]+))?$/);
   const history = location.hash.match(/^#\/history(?:\/(\d+))?$/);
+  const promptReview = location.hash.match(
+    /^#\/episode\/(\d+)\/prompts$/);
   const m = location.hash.match(/^#\/episode\/(\d+)$/);
   const settings = location.hash === "#/settings";
   const assets = location.hash === "#/assets";
@@ -245,6 +247,7 @@ function route() {
   });
   if (standards) renderStandards(standards[1] || "production");
   else if (history) renderHistory(history[1] ? Number(history[1]) : null);
+  else if (promptReview) renderPromptReviewPage(Number(promptReview[1]));
   else if (m) renderCanvasView(Number(m[1]));
   else if (settings) renderSettings();
   else if (assets) renderAssetsCenter();
@@ -8016,6 +8019,241 @@ function bindEpisodeWorkspaceNav(root, data, episodeId, setView) {
   });
 }
 
+function promptReviewStatusBadge(status, label = "") {
+  const value = ["PASS", "WARN", "BLOCK"].includes(status) ? status : "BLOCK";
+  const text = label || ({ PASS: "通过", WARN: "警告", BLOCK: "阻断" }[value]);
+  const icon = { PASS: "✓", WARN: "!", BLOCK: "×" }[value];
+  return `<span class="prompt-status ${value.toLowerCase()}">${icon} ${esc(text)}</span>`;
+}
+
+function promptVariantHtml(shot, variant, index) {
+  const target = variant.frame_target || {};
+  const actual = variant.actual_generation;
+  const actualDifferent = actual && String(actual.prompt || "").trim()
+    !== String(variant.prompt || "").trim();
+  const defaultOpen = variant.kind === "keyframe" || variant.status === "BLOCK";
+  const targetText = target.phase
+    ? `${target.phase} · ${target.source || "显式登记"}`
+    : variant.media === "video" ? "完整时间线" : "未形成合法定格";
+  return `<details class="prompt-variant ${esc(variant.status.toLowerCase())}"
+      data-kind="${esc(variant.kind)}" ${defaultOpen ? "open" : ""}>
+    <summary>
+      <span>${esc(variant.label)}</span>
+      ${promptReviewStatusBadge(variant.status)}
+      <small>${esc(targetText)}</small>
+    </summary>
+    <div class="prompt-variant-body">
+      ${(variant.issues || []).length ? `<div class="prompt-diagnostics block">
+        <b>必须先修正</b>
+        <ul>${variant.issues.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>
+      </div>` : ""}
+      ${(variant.warnings || []).length ? `<div class="prompt-diagnostics warn">
+        <b>建议处理</b>
+        <ul>${variant.warnings.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>
+      </div>` : ""}
+      <div class="prompt-code-head">
+        <div><b>标准化提示词</b><span>由 ${esc(
+          "aifos.shot-prompt/v2.2")} 当前事实重新编译</span></div>
+        <button type="button" data-copy-prompt="${index}">复制提示词</button>
+      </div>
+      <pre class="prompt-code" tabindex="0">${esc(
+        variant.prompt || "当前合同无法生成可用提示词，请先修正阻断项。")}</pre>
+      ${actualDifferent ? `<details class="prompt-actual">
+        <summary>查看已经发送过的生产提示词 · ${esc(actual.source || "")}</summary>
+        <div class="prompt-code-head">
+          <div><b>历史实际输入</b><span>${esc(
+            [actual.provider, actual.status, actual.reviewed ? "已审词" : ""]
+              .filter(Boolean).join(" · "))}</span></div>
+          <button type="button" data-copy-actual="${index}">复制历史输入</button>
+        </div>
+        <pre class="prompt-code historical" tabindex="0">${esc(actual.prompt)}</pre>
+      </details>` : ""}
+      <details class="prompt-contract-json">
+        <summary>结构化合同与参考图职责</summary>
+        <pre>${esc(JSON.stringify(variant.contract || {}, null, 2))}</pre>
+      </details>
+    </div>
+  </details>`;
+}
+
+async function renderPromptReviewPage(episodeId) {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  app.innerHTML = `<div class="loading">正在按最高规则编译全镜头提示词…</div>`;
+  let data;
+  try {
+    data = await api(`/api/episode/${episodeId}/prompts`);
+  } catch (error) {
+    app.innerHTML = `<div class="loading">提示词区加载失败：${esc(
+      error.message)}<br><a href="#/episode/${episodeId}">返回本集</a></div>`;
+    return;
+  }
+  watchBuild(data);
+  const summary = data.summary || {};
+  const counts = summary.shots || {};
+  topbarRight.innerHTML = promptReviewStatusBadge(
+    summary.status, summary.ready ? "提示词可生产" : "提示词未放行");
+  const promptIndex = [];
+  const cards = (data.shots || []).map((shot) => {
+    const startIndex = promptIndex.length;
+    (shot.variants || []).forEach((variant) => {
+      promptIndex.push({ shot, variant });
+    });
+    const searchText = [
+      shot.shot_no, shot.scene_no, shot.location,
+      ...(shot.characters || []), shot.description, shot.script_reference,
+      ...(shot.issues || []), ...(shot.warnings || []),
+    ].join(" ").toLowerCase();
+    return `<article class="prompt-shot-card ${esc(shot.status.toLowerCase())}"
+        id="prompt-shot-${Number(shot.shot_no)}"
+        data-status="${esc(shot.status)}"
+        data-search="${esc(searchText)}">
+      <header class="prompt-shot-head">
+        <div class="prompt-shot-number"><span>镜头</span><b>${esc(shot.shot_no)}</b></div>
+        <div class="prompt-shot-title">
+          <h2>${esc(shot.location || `场景 ${shot.scene_no || "-"}`)}</h2>
+          <p>${esc((shot.characters || []).join("、") || "无人镜头")} ·
+            场 ${esc(shot.scene_no || "-")} · ${esc(shot.duration || "-")} 秒</p>
+        </div>
+        ${promptReviewStatusBadge(shot.status)}
+      </header>
+      <div class="prompt-shot-facts">
+        <div><b>剧本对应</b><span>${esc(
+          shot.script_reference || "未登记剧本对应原句")}</span></div>
+        <div><b>本镜动作</b><span>${esc(
+          shot.description || "未登记可见动作")}</span></div>
+      </div>
+      ${(shot.issues || []).length ? `<div class="prompt-shot-alert">
+        <b>本镜有 ${shot.issues.length} 个阻断事实</b>
+        <ul>${shot.issues.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>
+      </div>` : ""}
+      <div class="prompt-variant-list">
+        ${(shot.variants || []).map((variant, offset) =>
+          promptVariantHtml(shot, variant, startIndex + offset)).join("")}
+      </div>
+      <details class="prompt-source-facts">
+        <summary>查看人物结构化事实与原始分镜提示词</summary>
+        <div class="prompt-fact-grid">
+          <div><b>人物事实</b><pre>${esc(JSON.stringify(
+            shot.character_facts || {}, null, 2))}</pre></div>
+          <div><b>原始分镜提示词</b><pre>${esc(
+            shot.raw_storyboard_prompt || "未登记")}</pre></div>
+        </div>
+      </details>
+    </article>`;
+  }).join("");
+  const shotLinks = (data.shots || []).map((shot) =>
+    `<button type="button" data-jump-shot="${esc(shot.shot_no)}"
+      data-status="${esc(shot.status)}">
+      <span>镜头 ${esc(shot.shot_no)}</span>${promptReviewStatusBadge(shot.status)}
+    </button>`).join("");
+
+  app.innerHTML = `<div class="prompt-review-page">
+    <header class="prompt-review-hero">
+      <div class="prompt-review-title">
+        <button type="button" id="prompt-back">← 返回本集</button>
+        <div><span class="prompt-eyebrow">PROMPT CONTROL ROOM</span>
+          <h1>《${esc(data.project?.title || "")}》第${esc(
+            data.episode?.number)}集 · 提示词区</h1>
+          <p>逐镜检查关键帧、首帧、尾帧与 Seedance 2 视频提示词。页面与生产共用同一合同编译器。</p>
+        </div>
+      </div>
+      <div class="prompt-rule-priority">
+        <span>规则优先级</span><b>最高规则</b><small>${esc(data.contract_schema)}</small>
+      </div>
+    </header>
+    <section class="prompt-review-summary">
+      <div class="prompt-summary-main ${esc(String(summary.status || "BLOCK").toLowerCase())}">
+        ${promptReviewStatusBadge(summary.status)}
+        <div><b>${summary.ready ? "全部提示词已具备生产条件" : "存在阻断项，不应进入正式生产"}</b>
+          <span>${esc(data.rule_title || "")}</span></div>
+      </div>
+      <div class="prompt-summary-stat"><b>${esc(summary.shots_total || 0)}</b><span>镜头总数</span></div>
+      <div class="prompt-summary-stat pass"><b>${esc(counts.PASS || 0)}</b><span>已通过</span></div>
+      <div class="prompt-summary-stat warn"><b>${esc(counts.WARN || 0)}</b><span>有警告</span></div>
+      <div class="prompt-summary-stat block"><b>${esc(counts.BLOCK || 0)}</b><span>被阻断</span></div>
+    </section>
+    <details class="prompt-highest-rules">
+      <summary><b>查看最高规则清单</b><span>所有提示词必须同时满足 ${(data.rules || []).length} 条</span></summary>
+      <ol>${(data.rules || []).map((rule) => `<li>${esc(rule)}</li>`).join("")}</ol>
+    </details>
+    <div class="prompt-review-tools">
+      <label><span>查找镜头、人物或问题</span>
+        <input id="prompt-search" type="search" placeholder="例如：林川、年龄段、道具、镜头 8"></label>
+      <label><span>显示状态</span>
+        <select id="prompt-status-filter">
+          <option value="ALL">全部</option>
+          <option value="BLOCK">仅阻断</option>
+          <option value="WARN">仅警告</option>
+          <option value="PASS">仅通过</option>
+        </select></label>
+      <button type="button" id="prompt-copy-all" class="primary">复制本集全部标准提示词</button>
+    </div>
+    <div class="prompt-review-layout">
+      <aside class="prompt-shot-index">
+        <div><b>镜头目录</b><span id="prompt-visible-count">${esc(
+          summary.shots_total || 0)} / ${esc(summary.shots_total || 0)}</span></div>
+        <nav>${shotLinks || "<p>本集尚无分镜</p>"}</nav>
+      </aside>
+      <main class="prompt-shot-list">${cards || `<div class="prompt-empty">
+        <b>本集尚无可编译分镜</b><span>先完成并保存五维分镜，再进入提示词区。</span>
+      </div>`}</main>
+    </div>
+  </div>`;
+
+  document.getElementById("prompt-back").onclick = () => {
+    location.hash = `#/episode/${episodeId}`;
+  };
+  document.querySelectorAll("[data-jump-shot]").forEach((button) => {
+    button.onclick = () => document.getElementById(
+      `prompt-shot-${button.dataset.jumpShot}`)?.scrollIntoView({
+        behavior: "smooth", block: "start",
+      });
+  });
+  document.querySelectorAll("[data-copy-prompt]").forEach((button) => {
+    button.onclick = async () => {
+      const item = promptIndex[Number(button.dataset.copyPrompt)];
+      await copyText(item?.variant?.prompt || "");
+      showToast(`镜头 ${item?.shot?.shot_no} · ${item?.variant?.label} 已复制`, "ok");
+    };
+  });
+  document.querySelectorAll("[data-copy-actual]").forEach((button) => {
+    button.onclick = async () => {
+      const item = promptIndex[Number(button.dataset.copyActual)];
+      await copyText(item?.variant?.actual_generation?.prompt || "");
+      showToast(`镜头 ${item?.shot?.shot_no} 历史生产输入已复制`, "ok");
+    };
+  });
+  document.getElementById("prompt-copy-all").onclick = async () => {
+    const text = (data.shots || []).flatMap((shot) =>
+      (shot.variants || []).map((variant) =>
+        `===== 镜头 ${shot.shot_no} · ${variant.label} · ${variant.status} =====\n${variant.prompt}`)
+    ).join("\n\n");
+    await copyText(text);
+    showToast(`已复制 ${summary.prompts_total || 0} 条标准提示词`, "ok");
+  };
+  const search = document.getElementById("prompt-search");
+  const statusFilter = document.getElementById("prompt-status-filter");
+  const applyFilters = () => {
+    const query = search.value.trim().toLowerCase();
+    const status = statusFilter.value;
+    let visible = 0;
+    document.querySelectorAll(".prompt-shot-card").forEach((card) => {
+      const show = (!query || card.dataset.search.includes(query))
+        && (status === "ALL" || card.dataset.status === status);
+      card.hidden = !show;
+      if (show) visible += 1;
+    });
+    document.querySelectorAll(".prompt-shot-index [data-jump-shot]").forEach((button) => {
+      const card = document.getElementById(`prompt-shot-${button.dataset.jumpShot}`);
+      button.hidden = !card || card.hidden;
+    });
+    document.getElementById("prompt-visible-count").textContent =
+      `${visible} / ${summary.shots_total || 0}`;
+  };
+  search.oninput = applyFilters;
+  statusFilter.onchange = applyFilters;
+}
+
 async function renderCanvasView(episodeId) {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   let data;
@@ -8163,6 +8401,8 @@ async function renderCanvasView(episodeId) {
         <button id="view-theater">📋 分镜表</button>
         <button id="view-canvas">🗺 画布</button>
       </div>
+      <button id="btn-prompts" class="prompt-review-launch"
+        title="逐镜审核关键帧、首尾帧与 Seedance 2 提示词">⌘ 提示词区</button>
       ${primaryMode === "play"
         ? `<button id="btn-play" class="primary">▶ 播放本集</button>`
         : primaryMode === "stop"
@@ -8260,6 +8500,9 @@ async function renderCanvasView(episodeId) {
       };
   }
   document.getElementById("btn-script").onclick = () => showScriptOverlay(data, episodeId);
+  document.getElementById("btn-prompts").onclick = () => {
+    location.hash = `#/episode/${episodeId}/prompts`;
+  };
   document.getElementById("btn-blocking").onclick = () => showBlockingOverlay(episodeId);
   document.getElementById("btn-plan").onclick = () => showPlanOverlay(episodeId);
   document.getElementById("btn-play")?.addEventListener("click", () => openPlayer(data));
@@ -8406,6 +8649,8 @@ function renderProductionView(data, episodeId) {
       <span class="title">《${esc(data.project.title)}》第${ep.number}集</span>
       ${chip(ep.status)}
       <span class="spacer"></span>
+      <button id="btn-prompts-live" class="prompt-review-launch"
+        title="逐镜审核当前标准提示词与阻断项">⌘ 提示词区</button>
       <button id="btn-plan-live"
         title="查看每张图片的状态、提示词和参考图">🖼 图片清单</button>
       <button id="btn-stop" class="stop-btn big" ${stopping ? "disabled" : ""}
@@ -8450,6 +8695,9 @@ function renderProductionView(data, episodeId) {
     </div>
   </div>`;
   document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
+  document.getElementById("btn-prompts-live").onclick = () => {
+    location.hash = `#/episode/${episodeId}/prompts`;
+  };
   document.getElementById("btn-plan-live").onclick = () => showPlanOverlay(episodeId);
   bindImageAccelerationLivebar(episodeId);
   bindProductionLedger(app, data, episodeId);
