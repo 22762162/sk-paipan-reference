@@ -200,6 +200,15 @@ const STATUS_CN = {
   videos: "视频中", voices: "声音/口型", edit: "剪辑中",
   qc: "质检中", package: "包装中", archive: "沉淀中", running: "制作中",
 };
+// 可从断点续跑的状态:失败、质检未过、被暂停/中断,以及只建了壳
+// 或卡在中途阶段的剧集。produce(force=false) 会复用已完成部分。
+const RESUMABLE_STATUS = [
+  "failed", "qc_failed", "paused", "created", "queued_script",
+  "script", "continuity", "cast", "storyboard", "images",
+  "text_assets", "frames", "preflight", "videos", "voices",
+  "edit", "qc", "package", "archive",
+];
+
 const RUN_STATUS_CN = {
   running: "运行中", cancelling: "暂停中", completed: "完成",
   paused: "阶段暂停", failed: "失败", stopped: "已停止",
@@ -1014,10 +1023,10 @@ function episodesPanelHtml(data) {
           <td>${chip(e.status)}</td>
           <td class="num">${e.qc_score == null ? "-" : fmt(e.qc_score, 0)}</td>
           <td class="num">${fmt(e.cost)}</td>
-          <td>${["failed", "qc_failed"].includes(e.status) && !running
+          <td>${RESUMABLE_STATUS.includes(e.status) && !running
             ? `<button class="primary episode-resume" data-episode-id="${e.id}"
                 data-title="${esc(e.project)}" data-number="${e.number}"
-                title="从上次失败的断点接着做,已完成部分全部保留">▶ 继续</button> ` : ""}
+                title="从断点接着做(失败、暂停、中断或未开工都可以),已完成部分全部保留">▶ 继续</button> ` : ""}
           ${["failed", "qc_failed"].includes(e.status) && !running
             ? `<button class="danger episode-rebuild-all" data-episode-id="${e.id}"
                 data-title="${esc(e.project)}" data-number="${e.number}"
@@ -2487,6 +2496,25 @@ async function pollJob(jobId, onDone, onProgress) {
   };
   await tick();
   if (!finished) timer = setInterval(tick, 1200);
+}
+
+/* 剧本重写:任何阶段都能提意见重写(无剧本时=带意见重新创作) */
+async function rewriteScriptWithFeedback(data, episodeId) {
+  const hasScript = !!data.script;
+  const feedback = (window.prompt(hasScript
+    ? "对剧本的修改意见(AI 会按意见重写并重跑预生产,写好后停下等你确认)\n例:第2场冲突不够、把凶手改成管家、台词更口语"
+    : "本集还没有成形剧本。写下你的创作要求,AI 会据此重新创作剧本\n例:悬疑基调、5场戏、结尾反转") || "").trim();
+  if (!feedback) return;
+  try {
+    await api("/api/revise", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ episode_id: data.episode.id, feedback }),
+    });
+    showToast("已提交:AI 正在按意见重写剧本,写好后会停在待确认", "ok");
+    pollCanvas(episodeId);
+  } catch (e) {
+    showToast(e.message, "error");
+  }
 }
 
 /* 人物形象意见改写:AI 深度理解意见 → 改写提示词 → 用户确认 → 重生成候选 */
@@ -8384,7 +8412,7 @@ async function renderCanvasView(episodeId) {
   if (!sb) {
     // 只要有剧本、或制作已失败/中断,都必须给"从断点接着做"的入口,
     // 不能让用户面对一句"尚无分镜"无路可走
-    if (script || ["failed", "qc_failed"].includes(ep.status)) {
+    if (script || RESUMABLE_STATUS.includes(ep.status)) {
       renderRecoveryView(data, episodeId);
       return;
     }
@@ -9378,6 +9406,7 @@ function renderRecoveryView(data, episodeId) {
       ${chip(ep.status)}
       <span class="spacer"></span>
       ${hasScript ? `<button id="btn-script2">📖 看剧本</button>` : ""}
+      <button id="btn-rewrite-script">✏️ 按意见重写剧本</button>
       <button id="btn-plan2">🖼 图片清单</button>
       <button id="btn-rebuild-all-recovery" class="danger"
         title="推翻原有设定,清理本轮复用并从头重新生成图片、首尾帧和视频">⚠ 全部重新生成</button>
@@ -9393,6 +9422,8 @@ function renderRecoveryView(data, episodeId) {
     showScriptOverlay(data, episodeId));
   document.getElementById("btn-plan2").onclick = () =>
     showPlanOverlay(episodeId);
+  document.getElementById("btn-rewrite-script").onclick = () =>
+    rewriteScriptWithFeedback(data, episodeId);
   document.getElementById("btn-rebuild-all-recovery").onclick = (ev) =>
     armConfirm(ev.target, "全部重新生成", async () => {
       ev.target.disabled = true;

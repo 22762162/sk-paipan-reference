@@ -3332,6 +3332,12 @@ def make_handler(workspace, jobs):
             if found is None:
                 return self._error(404, "剧集不存在")
             title, number = found
+            # 重写会 force 重跑预生产,与正在跑的整集生产互斥;
+            # 先暂停再提交,避免两个任务同时改同一份 render_plan。
+            if jobs.production_running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，请先点「停止生成」，"
+                         "待状态稳定后再提交剧本重写")
             job_id = jobs.start_task(
                 title, number,
                 lambda app, run_id: app.director.revise_script(
