@@ -10,6 +10,7 @@ from aifos.director import (
     character_candidate_target,
     character_production_readiness_error,
 )
+from aifos.adapters.claude_script import validate_script_bible
 from aifos.errors import AifosError, ProviderUnavailable
 from aifos.production.base import ProviderResult
 
@@ -87,6 +88,59 @@ def test_unresolved_action_label_blocks_character_generation():
     error = character_production_readiness_error(script, {})
     assert "人物实体尚未确认" in error
     assert "AI 重新分析" in error
+
+
+def test_placeholder_gender_and_age_block_candidate_generation():
+    script = {
+        "characters": [{
+            "name": "林川", "role": "主角",
+            "gender": "未指定（人物定版后以参考图为准）",
+            "age_range": "待确认",
+            "image_prompt": "林川单人角色定妆母图",
+        }],
+        "scenes": [],
+    }
+    analysis = {
+        "characters": [{
+            "name": "林川",
+            "gender": "以参考图为准",
+            "age_range": "未指定",
+            "image_prompt": "林川单人角色定妆母图",
+        }],
+    }
+
+    error = character_production_readiness_error(script, analysis)
+    assert "性别、年龄段尚未明确" in error
+    assert "不会生成候选图" in error
+
+
+def test_script_bible_allows_identity_draft_but_strict_gate_rejects_it():
+    script = {
+        "story_world": {
+            "name": "测试世界", "overview": "测试",
+            "era_and_location": "当代城市", "social_order": "现实社会",
+            "hard_rules": "现实物理", "visual_baseline": "现实材质",
+            "forbidden_drift": ["禁止身份漂移"],
+        },
+        "story_background": {
+            "prior_events": "无", "current_situation": "开场",
+            "core_conflict": "冲突", "episode_goal": "推进",
+            "continuity_hooks": "承接",
+        },
+        "characters": [{
+            "name": "林川", "role": "主角",
+            "introduction": "本剧主角", "gender": "未指定",
+            "age_range": "以参考图为准", "identity": "学生",
+            "personality": "谨慎",
+        }],
+        "core_props": [],
+        "scenes": [],
+        "script_logic_audit": {"passed": True, "issues": []},
+    }
+
+    assert validate_script_bible(
+        script, require_resolved_identity=False) is None
+    assert "性别、年龄段必须明确" in validate_script_bible(script)
 
 
 def test_portrait_prompt_prioritizes_identity_over_reference_clothing(app):

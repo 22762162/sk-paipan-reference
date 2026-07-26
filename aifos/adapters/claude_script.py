@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 from ..generation_diagnostics import normalize_generation_diagnostics
+from ..identity_facts import unresolved_identity_fields
 from ..speaker_labels import is_non_person_label
 from ..inner_persona import normalize_inner_persona_policy
 from ..story_logic import (
@@ -687,7 +688,7 @@ def normalize_script_bible(script, payload=None):
     return script
 
 
-def validate_script_bible(script):
+def validate_script_bible(script, *, require_resolved_identity=True):
     """返回世界观/前情/人物介绍硬门禁错误；通过时返回 ``None``。"""
     strip_non_person_speakers(script)
     normalize_prop_contract(script)
@@ -753,6 +754,12 @@ def validate_script_bible(script):
         for field in CHARACTER_INTRO_FIELDS:
             if _missing(character.get(field)):
                 return f"{character['name']}人物设定字段不全: {field}"
+        if require_resolved_identity:
+            unresolved = unresolved_identity_fields(character)
+            if unresolved:
+                return (
+                    f"{character['name']}人物{'、'.join(unresolved)}必须明确，"
+                    "不能使用未指定、待确认或以参考图为准等占位表达")
     for prop in script.get("core_props") or []:
         if not isinstance(prop, dict) or _missing(prop.get("name")):
             return "核心道具字段不全: name"

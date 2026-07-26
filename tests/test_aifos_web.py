@@ -1168,6 +1168,17 @@ def test_episode_payload_compacts_valid_repeated_character_prompt(server):
     assert "说服父皇" not in prompt
 
 
+def test_story_analysis_ui_requires_manual_gender_and_age_before_images(server):
+    status, _, app_js = _request(server["port"], "GET", "/static/app.js")
+    assert status == 200
+    text = app_js.decode()
+    assert "性别（必填）" in text
+    assert "可见年龄段（必填）" in text
+    assert "参考图不能代替这两项" in text
+    assert 'data-identity-field="gender"' in text
+    assert 'data-identity-field="age_range"' in text
+
+
 def test_asset_image_catalog_has_category_origin_time_and_prompt(server):
     app2 = App(server["workspace"])
     try:

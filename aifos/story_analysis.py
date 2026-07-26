@@ -7,6 +7,11 @@ from datetime import datetime, timezone
 import json
 import re
 
+from .identity_facts import (
+    explicit_age_range,
+    explicit_gender,
+    unresolved_identity_fields,
+)
 
 STORY_ANALYSIS_SCHEMA = "aifos.story-analysis/v1"
 _GENERIC_ERA_MARKERS = (
@@ -772,6 +777,12 @@ def _visible_age(value):
 
 
 def _character_image_prompt(name, entry, visual, era):
+    # A reference image cannot decide story identity.  Keep the draft visible
+    # for human confirmation, but never manufacture a "final" portrait prompt
+    # while gender or visible age is unresolved.
+    if (not explicit_gender(entry.get("gender"))
+            or not explicit_age_range(entry.get("age_range"))):
+        return ""
     analysis = _dict(entry.get("character_analysis"))
     dna = _dict(entry.get("visual_dna"))
     raw = _source_character_image_prompt(entry.get("image_prompt"))
@@ -1054,6 +1065,10 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
                 item.get("prompt_prefix"),
                 f"{name}，同一人物身份；{visual['wardrobe_and_styling']}"),
         }
+        unresolved = unresolved_identity_fields(entry)
+        entry["identity_status"] = (
+            "needs_confirmation" if unresolved else "ready")
+        entry["identity_missing_fields"] = unresolved
         if importance not in ("背景路人", "待确认"):
             analysis = _character_analysis(character, item, narrative)
             entry["character_analysis"] = analysis
@@ -1172,7 +1187,7 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
     }
 
 
-def validate_story_analysis(analysis):
+def validate_story_analysis(analysis, *, require_resolved_identity=True):
     """返回可直接展示的错误；通过时返回 ``None``。"""
     if not isinstance(analysis, dict):
         return "制作圣经不是 JSON 对象"
@@ -1204,12 +1219,14 @@ def validate_story_analysis(analysis):
         for field in ("character_analysis", "visual_dna", "cast_dedup"):
             if not isinstance(character.get(field), dict):
                 return f"角色 {character.get('name')} 缺少 {field}"
-        if not _text(character.get("image_prompt")):
+        unresolved = unresolved_identity_fields(character)
+        if require_resolved_identity and unresolved:
+            return (
+                f"角色 {character.get('name')} 的{'、'.join(unresolved)}"
+                "尚未明确；请人工指定后再锁定人物生产")
+        if (require_resolved_identity
+                and not _text(character.get("image_prompt"))):
             return f"角色 {character.get('name')} 缺少可直接出图的人物提示词"
-        if not _text(character.get("gender")):
-            return f"角色 {character.get('name')} 缺少性别呈现"
-        if not _text(character.get("age_range")):
-            return f"角色 {character.get('name')} 缺少年龄段"
         keywords = character["visual_dna"].get("temperament_keywords")
         if not isinstance(keywords, list) or not 3 <= len(keywords) <= 8:
             return (
