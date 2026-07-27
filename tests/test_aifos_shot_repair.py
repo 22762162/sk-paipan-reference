@@ -73,5 +73,45 @@ class TraditionalSimplifiedClauseTest(unittest.TestCase):
         self.assertIn("不算新增或修改文字", policy)
 
 
+class ExtractJsonMendTest(unittest.TestCase):
+    """错误制导 JSON 修补:40KB 合法分镜不再因笔误全盘报废。"""
+
+    def test_stray_brace_before_object_member(self):
+        from aifos.adapters.claude_script import extract_json
+        # 凡人修仙传实测笔误:状态表成员前多出悬空 {
+        raw = ('{"shots":[{"shot_no":1,"start_state":{'
+               '"韩立":{"pose":"立"},{"李长老":{"pose":"站"}}}],'
+               '"prop_registry":[{"prop_id":"p1"},{"prop_id":"p2"}]}')
+        data = extract_json(raw)
+        self.assertEqual(len(data["shots"]), 1)
+        self.assertEqual(
+            data["shots"][0]["start_state"]["李长老"]["pose"], "站")
+        # 数组里合法的 },{ 绝不能被误伤
+        self.assertEqual(
+            [p["prop_id"] for p in data["prop_registry"]], ["p1", "p2"])
+
+    def test_wrapped_member_with_balanced_braces(self):
+        from aifos.adapters.claude_script import extract_json
+        raw = '{"s":{"甲":{"p":1},{"乙":{"p":2}},"t":[1]}}'
+        self.assertEqual(
+            extract_json(raw),
+            {"s": {"甲": {"p": 1}, "乙": {"p": 2}}, "t": [1]})
+
+    def test_trailing_comma_and_noise(self):
+        from aifos.adapters.claude_script import extract_json
+        raw = '思考过程… {"a":[1,2,],"b":{"k":1,}} 收尾说明'
+        self.assertEqual(extract_json(raw), {"a": [1, 2], "b": {"k": 1}})
+
+    def test_fragment_fallback_still_works(self):
+        from aifos.adapters.claude_script import extract_json
+        self.assertEqual(
+            extract_json('杂讯 {"small":1} 杂讯'), {"small": 1})
+
+    def test_unfixable_returns_largest_fragment(self):
+        from aifos.adapters.claude_script import extract_json
+        raw = '{"broken": [[[ {"ok":{"x":1}}'
+        self.assertEqual(extract_json(raw), {"ok": {"x": 1}})
+
+
 if __name__ == "__main__":
     unittest.main()

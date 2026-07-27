@@ -21,6 +21,7 @@ JSON,解析并校验后回传平台。默认引擎是 `claude -p`;`--engine code
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -500,12 +501,89 @@ JSON 结构:
 "seedance_prefix":"","readable_text_policy":"","continuity_rules":[]}}}}"""
 
 
+def _match_brace(text, start):
+    """返回 text[start]=='{' 的配对 '}' 下标(串内字符不计),找不到为 None。"""
+    depth = 0
+    in_str = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_str = False
+            continue
+        if char == '"':
+            in_str = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _mend_json_syntax(block, prefer_unwrap=False):
+    """错误制导的机械修补:每轮只动解析器报错的那一处,直到可解析。
+
+    实测教训(凡人修仙传分镜):40KB 合法产出因逐镜重复的一类笔误全盘
+    报废,extract_json 只捞回一个镜头碎片→「缺少 shots」→整路报废。
+    全局正则会误伤数组里合法的 },{ ,必须按解析器报错位置定点修:
+    - 对象成员前多出悬空 { ("甲":{...},{"乙":{...) → 删这一个字符;
+    - 对象成员被完整错包一层 {"乙":{...}} → 解开包裹层(删首尾一对);
+      两类肉眼难分——_match_brace 会把父对象的闭括号误当包裹层,
+      因此按 prefer_unwrap 分两遍策略跑,谁能让整体通过谁算数;
+    - 对象/数组尾随逗号 → 删除该逗号;
+    - JSON 主体后有杂讯(Extra data) → 截断到主体结束。
+    修不动或超轮数即放弃(返回 None),绝不猜测语义。
+    """
+    for _ in range(60):
+        try:
+            json.loads(block)
+            return block
+        except json.JSONDecodeError as exc:
+            pos, msg = exc.pos, exc.msg
+            if msg.startswith("Extra data"):
+                block = block[:pos]
+                continue
+            if pos >= len(block):
+                return None
+            char = block[pos]
+            if msg.startswith("Expecting property name") and char == "{":
+                close = _match_brace(block, pos) if prefer_unwrap else None
+                inner = (block[pos + 1:close].strip()
+                         if close is not None else "")
+                if close is not None and inner.startswith('"'):
+                    block = (block[:pos] + block[pos + 1:close]
+                             + block[close + 1:])
+                else:
+                    block = block[:pos] + block[pos + 1:]
+                continue
+            if (msg.startswith("Expecting property name")
+                    and char == "}") or (
+                    msg.startswith("Expecting value") and char == "]"):
+                comma = block.rfind(",", 0, pos)
+                if comma == -1:
+                    return None
+                block = block[:comma] + block[comma + 1:]
+                continue
+            return None
+    return None
+
+
 def extract_json(text):
     """从模型输出中提取最大的合法 JSON 对象(容忍前后杂讯)。
 
     推理型引擎的最终答复常带分析文字,里面可能夹着小的 {...} 片段
     (示例、引用)。取"第一个"会抓到这些碎片,把整份剧本/分镜误判成
     "缺少 scenes/shots";取"最大的"才是真正的产出。
+    整体解析失败时,对最外层大括号块做错误制导机械修补
+    (_mend_json_syntax);修补版能解析出更大的对象就用修补版
+    (局部碎片只是最后兜底)。
     """
     decoder = json.JSONDecoder()
     best = None
@@ -521,6 +599,32 @@ def extract_json(text):
             best, best_span = obj, end
         # 跳过整个已解析片段,避免重复解析其内部子对象
         idx = text.find("{", idx + max(end, 1))
+    last = text.rfind("}")
+    starts = []
+    first = text.find("{")
+    if first != -1:
+        starts.append(first)
+    # 真正的 JSON 根多在行首;杂讯里的花括号会让"从第一个 { 修起"走偏
+    starts.extend(m.end() - 1 for m in re.finditer(r"(?m)^\s*\{", text))
+    seen = set()
+    for start in starts[:9]:
+        if start in seen or last <= start:
+            continue
+        seen.add(start)
+        if (last - start) <= best_span:
+            continue
+        for prefer_unwrap in (False, True):
+            mended = _mend_json_syntax(
+                text[start:last + 1], prefer_unwrap=prefer_unwrap)
+            if not mended:
+                continue
+            try:
+                obj = json.loads(mended)
+            except ValueError:
+                continue
+            if isinstance(obj, dict) and len(mended) > best_span:
+                best, best_span = obj, len(mended)
+            break
     return best
 
 
