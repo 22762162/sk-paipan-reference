@@ -45,6 +45,7 @@ from .quality_policy import (
     set_policy_choices,
 )
 from .camera_language import scene_view_for_camera
+from .realism_language import realism_lines
 from .prompt_contract import (
     build_physical_contract,
     build_composition_contract,
@@ -175,6 +176,24 @@ CONFIRM_AFTER = "preflight"
 # 自动返工一次，第二次仍失败时必须停在人工检查点，不能继续烧额度。
 VIDEO_QC_AUTO_RETRIES = 1
 VIDEO_QC_SCHEMA = "aifos.video-qc/v1"
+# 图片:第 1 次质检失败就交给 Codex 出诊断并改写提示词，AIFOS 立即按新提示词
+# 重画一次；第 2 次仍不合格只做分析、不再出图，停在人工检查点。
+CODEX_ESCALATION_FINAL_FAILURES = 2
+CODEX_QC_ACTION_CN = {
+    "targeted_redraw": "按新提示词定向重画",
+    "repair_contract": "修复本镜生成合同",
+    "split_shot": "拆分本镜动作",
+    "accept_current": "保留当前图待人工确认",
+    "manual_review": "人工复核",
+}
+# Codex 判定这几类处理时，重画救不回来：出图前必须熔断，等合同真的改了
+# (生成输入哈希变化)或人工显式放行再放行。
+ESCALATION_NON_REDRAW_ACTIONS = {
+    "repair_contract": "先修好本镜提示词/参考图合同再重画",
+    "split_shot": "先把本镜拆成单一冻结瞬间再重画",
+    "accept_current": "重画解决不了，请走「人工通过」或改合同",
+    "manual_review": "需人工复核，确认前不再出图",
+}
 CHARACTER_CANDIDATES = 4
 PROP_CANDIDATES = 4
 LEGACY_CHARACTER_CANDIDATE_MAX = 5
@@ -1467,7 +1486,8 @@ class Director:
                 "场景和光影按本剧本及当集造型生成,允许与参考图服装不同,除非明确"
                 "要求保留参考图服装;"
                 + (f"职业服装:{workwear};" if workwear else "")
-                + CHARACTER_BACKGROUND_RULE)
+                + CHARACTER_BACKGROUND_RULE
+                + "".join(realism_lines(style)))
 
     def _candidate_variant(self, index, design=None):
         """四张候选共用首次登场状态和同一提示词，仅随机采样不同。"""
@@ -1967,7 +1987,8 @@ class Director:
             "【构图】单人、全身正面自然站姿、从头到脚完整、纯净中性棚拍背景；"
             "五官、手指、关节与身体比例自然。"
             "【禁止】其他人物、身份/性别/年龄漂移、时代错置、模板网红脸、"
-            "塑料皮肤、文字、字幕、Logo、水印、可辨认背景场景。")
+            "塑料皮肤、文字、字幕、Logo、水印、可辨认背景场景。"
+            + "".join(realism_lines(style)))
 
     @staticmethod
     def _scene_style_line(style):
@@ -2595,6 +2616,7 @@ class Director:
             "【硬禁止】不要补写剧情、不要把人物传记/动作/道具/第二套服装"
             "带入本张图；不要新增或复制角色，不要把四视图的同一人误画成多人。",
         ])
+        lines.extend(realism_lines(style))
         return "".join(lines)
 
     def _plan_path(self, ctx):
@@ -3189,6 +3211,15 @@ class Director:
             self.projects.add_episode_cost(
                 ctx["episode"]["id"], review.cost)
         generation_input = self._image_generation_input(payload)
+        # Codex 的 aifos_action 在这里真正分派:判「改合同/拆镜/人工」时
+        # 熔断在生图 API 之前,不把升级指令当普通修改意见再烧一张。
+        # 必须放在提示词审核之后——审核会改写提示词,哈希要同口径比。
+        escalation_block = self.escalation_redraw_block(
+            payload.get("qc_escalation"), generation_input)
+        if escalation_block:
+            self._plan_mark(
+                ctx, item_id, "awaiting_human", error=escalation_block[:300])
+            raise AifosError(escalation_block)
         self._plan_mark(ctx, item_id, "generating", prompt=prompt,
                         extra={
                             "qc": None,
@@ -4038,15 +4069,21 @@ class Director:
             self, report, qc_spec, image_uri, generation_input, out_dir,
             cancel=None, codex_profile="", existing_result=None,
             existing_verdict=None):
-        """After two failures, let Codex diagnose and notify AIFOS.
+        """Let Codex diagnose the failure and rewrite the prompt.
 
-        This is analysis only.  It never launches a third image generation.
-        A targeted redraw may happen later, using ``instruction_to_aifos``.
+        First failure (``executable``): Codex returns the revised instruction
+        and AIFOS immediately redraws once with it — no local rule compiler
+        guessing, no wasted round.  Second failure: analysis only, and it
+        never launches a third image generation; a redraw may happen later
+        only after ``instruction_to_aifos`` is applied.
         """
         report = copy.deepcopy(report or {})
         failures = self._previous_qc_failure_count(report)
-        if report.get("passed") or failures < 2:
+        if report.get("passed") or failures < 1:
             return report, 0.0
+        # 第一次失败:Codex 出诊断 + 改提示词,AIFOS 立刻按新提示词重画一次。
+        # 第二次失败:只诊断不出图,停在人工检查点。
+        executable = failures < CODEX_ESCALATION_FINAL_FAILURES
         existing_provider = str(
             getattr(existing_result, "provider", "") or "").strip()
         existing_model = str(
@@ -4092,18 +4129,24 @@ class Director:
                 "production_ready": False,
                 "retry_blocked": True,
                 "retry_blocked_reason": (
-                    "连续两次质检未过，但 Codex 分析暂不可用；"
-                    "已禁止原样继续重画"),
+                    f"第 {failures} 次质检未过，但 Codex 分析暂不可用；"
+                    "已禁止没有新提示词的原样重画"),
+                "auto_repair_exhausted": True,
                 "codex_escalation": {
                     "schema": "aifos.codex-qc-escalation/v1",
                     "triggered": True,
                     "status": "unavailable",
+                    "stage": ("first_failure_autofix" if executable
+                              else "final_analysis"),
+                    "executable": False,
                     "trigger": "consecutive_qc_failures",
                     "consecutive_failures": failures,
                     "provider": "codex",
                     "reason": reason,
                     "aifos_action": "manual_review",
                     "instruction_to_aifos": "",
+                    "contract_input_hash": str(
+                        (generation_input or {}).get("input_hash") or ""),
                     "analyzed_at": now(),
                 },
             })
@@ -4167,21 +4210,28 @@ class Director:
                 "reference_adjustments", "diagnosis_complete"):
             if key in codex_report:
                 report[key] = copy.deepcopy(codex_report[key])
+        # 只有"第一次失败 + Codex 判定定向重画"才允许立刻按新提示词再出一张;
+        # 合同类处理(改合同/拆镜/人工)与第二次失败一律不出图。
+        redraw_now = bool(executable and action == "targeted_redraw")
+        blocked_reason = "" if redraw_now else (
+            f"第 {failures} 次质检未过，已由 Codex 分析；"
+            "禁止没有应用 Codex 指令的原样重画")
         report.update({
             "production_ready": False,
             "redraw_required": action == "targeted_redraw",
             "contract_repair_required": action in {
                 "repair_contract", "split_shot"},
-            "retry_blocked": True,
-            "retry_blocked_reason": (
-                f"连续 {failures} 次质检未过，已由 Codex 分析；"
-                "禁止没有应用 Codex 指令的原样重画"),
+            "retry_blocked": not redraw_now,
+            "retry_blocked_reason": blocked_reason,
             "revision_feedback": instruction[:2400],
-            "auto_repair_exhausted": True,
+            "auto_repair_exhausted": not redraw_now,
             "codex_escalation": {
                 "schema": "aifos.codex-qc-escalation/v1",
                 "triggered": True,
                 "status": "completed",
+                "stage": ("first_failure_autofix" if executable
+                          else "final_analysis"),
+                "executable": redraw_now,
                 "trigger": "consecutive_qc_failures",
                 "consecutive_failures": failures,
                 "provider": existing_provider or "codex",
@@ -4195,17 +4245,73 @@ class Director:
                 "visible_props": escalation_list("visible_props"),
                 "hidden_props": escalation_list("hidden_props"),
                 "issues": list(codex_report.get("issues") or [])[:16],
+                "contract_input_hash": str(
+                    (generation_input or {}).get("input_hash") or ""),
                 "analyzed_at": now(),
             },
             "retry_decision": {
                 "action": action,
                 "source": "codex_escalation",
-                "retry_blocked": True,
+                "retry_blocked": not redraw_now,
                 "retry_blocked_reason": (
+                    "" if redraw_now else
                     "必须先应用 Codex 回传的 AIFOS 修改指令"),
             },
         })
         return report, cost
+
+    @staticmethod
+    def escalation_context(qc):
+        """把计划项里已落盘的 Codex 升级结论压成可随 payload 下传的上下文。"""
+        escalation = (qc or {}).get("codex_escalation")
+        escalation = escalation if isinstance(escalation, dict) else {}
+        if not escalation.get("triggered"):
+            return {}
+        return {
+            "triggered": True,
+            "status": str(escalation.get("status") or ""),
+            "stage": str(escalation.get("stage") or ""),
+            "aifos_action": str(escalation.get("aifos_action") or ""),
+            "instruction_to_aifos": str(
+                escalation.get("instruction_to_aifos") or "")[:2400],
+            "reason": str(escalation.get("reason") or "")[:600],
+            "freeze_moment": str(escalation.get("freeze_moment") or "")[:600],
+            "consecutive_failures": int(
+                escalation.get("consecutive_failures") or 0),
+            "contract_input_hash": str(
+                escalation.get("contract_input_hash") or ""),
+        }
+
+    @staticmethod
+    def escalation_redraw_block(escalation, generation_input):
+        """按 Codex 的 aifos_action 分派：非重画类处理在出图前熔断。
+
+        Codex 判「改合同/拆镜/人工」时重画救不回来，把指令当普通修改意见
+        再画一张只是多烧一次额度。合同真的改了(生成输入哈希变化)就自动
+        放行——那正是要求的修复动作已经落地的客观证据。
+        """
+        escalation = escalation if isinstance(escalation, dict) else {}
+        if not escalation.get("triggered"):
+            return ""
+        if escalation.get("override"):
+            return ""
+        action = str(escalation.get("aifos_action") or "")
+        hint = ESCALATION_NON_REDRAW_ACTIONS.get(action)
+        if not hint:
+            return ""
+        old_hash = str(escalation.get("contract_input_hash") or "")
+        new_hash = str((generation_input or {}).get("input_hash") or "")
+        if old_hash and new_hash and old_hash != new_hash:
+            return ""
+        label = CODEX_QC_ACTION_CN.get(action, action)
+        detail = str(escalation.get("reason") or "").strip()
+        freeze = str(escalation.get("freeze_moment") or "").strip()
+        return (
+            f"Codex 升级分析判定本镜应「{label}」，不是重画能解决的问题，"
+            f"已在调用生图 API 前熔断：{hint}。"
+            + (f"诊断:{detail}。" if detail else "")
+            + (f"建议冻结瞬间:{freeze}。" if freeze else "")
+            + "修改本镜提示词/参考图或分镜后会自动放行。")
 
     # 连抽选优:单抽命中率 p 时 N 抽至少一中 = 1-(1-p)^N。
     # 按重要度分档,普通批量不加抽;首个通过即停,期望成本 ≈ 1/p 抽。
@@ -4491,8 +4597,10 @@ class Director:
             report["qc_model"] = (
                 getattr(qc_result, "model", "") or "")
             result.qc = report
+            # 第一次失败就升级 Codex:出诊断 + 改提示词,随后本轮继续按新提示词
+            # 重画;第二次失败时 executable=False,升级只做分析并在此收口。
             if (not report["passed"]
-                    and report["consecutive_failures"] >= 2):
+                    and report["consecutive_failures"] >= 1):
                 report, escalation_cost = \
                     self._escalate_failed_image_to_codex(
                         report, qc_spec, uri, generation_input, out_dir,
@@ -4502,7 +4610,8 @@ class Director:
                         existing_verdict=qc_result.data or {})
                 result.cost += escalation_cost
                 result.qc = report
-                return result
+                if report.get("retry_blocked"):
+                    return result
             if (report["passed"] or not report["redraw_required"]
                     or attempts >= self._qc_retries()):
                 return result
@@ -4518,6 +4627,16 @@ class Director:
             reference_changes = self._apply_image_reference_adjustments(
                 next_payload, qc_spec, diagnostics)
             patch = targeted_prompt_patch(diagnostics)
+            # Codex 升级指令是权威修订：它看过成品图、实际提示词和参考图
+            # 清单，压过本地规则编译器按判词猜出来的 patch。
+            codex_instruction = str(
+                (report.get("codex_escalation") or {}).get(
+                    "instruction_to_aifos") or "").strip()
+            if codex_instruction:
+                patch = codex_instruction
+                revision = dict(revision)
+                revision["text"] = codex_instruction
+                revision["source"] = "codex_escalation"
             if qc_spec.get("character_sheet_key"):
                 patch = self._sheet_feedback_for_key(
                     patch, qc_spec.get("character_sheet_key"))
@@ -12316,11 +12435,14 @@ class Director:
 
     def regen_image(self, project_title, episode_number, target,
                     feedback="", prompt_override="", quality_override=None,
-                    revision_source="manual", codex_profile=""):
+                    revision_source="manual", codex_profile="",
+                    escalation_override=False):
         """重画单张图:target = {"kind": character_art|scene_art|shot|
         first_frame|last_frame, "name"|"shot_no"};附意见时按意见调整;
         prompt_override 非空则整句替换默认提示词(所见即所得)。
-        镜头画面重画会连带重生成首尾帧并作废旧视频(补齐时重拍)。"""
+        镜头画面重画会连带重生成首尾帧并作废旧视频(补齐时重拍)。
+        escalation_override=True 表示人工确认合同已修好,放行 Codex
+        判为「改合同/拆镜/人工」的镜头。"""
         project = self.projects.get_project(project_title)
         if project is None:
             raise AifosError(f"项目不存在: {project_title}")
@@ -12371,12 +12493,16 @@ class Director:
         plan_item = None
         plan_diagnostics = {}
         qc_failure_base = 0
+        escalation_ctx = {}
         if item_id:
             plan_item = next(
                 (entry for entry in self._plan_read(ctx)["items"]
                  if entry.get("id") == item_id), None)
             old_qc = (plan_item or {}).get("qc") or {}
             qc_failure_base = self._previous_qc_failure_count(old_qc)
+            escalation_ctx = self.escalation_context(old_qc)
+            if escalation_ctx and escalation_override:
+                escalation_ctx["override"] = True
             plan_diagnostics = normalize_generation_diagnostics(
                 old_qc.get("input_diagnosis") or {},
                 issues=old_qc.get("issues"))
@@ -12564,6 +12690,7 @@ class Director:
                 item_id=f"shot:{shot_no}")
             payload["feedback"] = feedback
             payload["qc_consecutive_failures_base"] = qc_failure_base
+            payload["qc_escalation"] = copy.deepcopy(escalation_ctx)
             payload["revision"] = next_revision(
                 "image", self._shot_name(ctx, shot_no))
             if prompt_override:
@@ -12715,6 +12842,7 @@ class Director:
             payload["frame_kind"] = kind
             payload["feedback"] = feedback
             payload["qc_consecutive_failures_base"] = qc_failure_base
+            payload["qc_escalation"] = copy.deepcopy(escalation_ctx)
             payload["revision"] = next_revision(kind, asset_name)
 
             rows = [
@@ -13753,7 +13881,7 @@ class Director:
             diagnostics=report.get("input_diagnosis"))
         report["revision_feedback"] = revision["text"]
         report["revision_categories"] = revision["categories"]
-        if not report["passed"] and report["consecutive_failures"] >= 2:
+        if not report["passed"] and report["consecutive_failures"] >= 1:
             report, escalation_cost = self._escalate_failed_image_to_codex(
                 report, spec, failed_qc_uri, generation_input,
                 ctx["out_root"],
@@ -13776,8 +13904,11 @@ class Director:
         """身份/性别/人数硬错误：以失败图为基底自动修图并立即复检。"""
         if report.get("passed") or not report.get("hard_failure"):
             return report, 0
-        if (self._previous_qc_failure_count(report) >= 2
-                or (report.get("codex_escalation") or {}).get("triggered")):
+        escalation = report.get("codex_escalation") or {}
+        if (self._previous_qc_failure_count(report)
+                >= CODEX_ESCALATION_FINAL_FAILURES
+                or (escalation.get("triggered")
+                    and not escalation.get("executable"))):
             # The second failure has already been handed to Codex.  Do not
             # spend a third image call until AIFOS applies its returned
             # instruction (or the contract is repaired/split).
@@ -13789,7 +13920,12 @@ class Director:
                 current.get("input_diagnosis") or {},
                 issues=current.get("issues"))
             patch = targeted_prompt_patch(diagnostics)
-            if not diagnostics.get("diagnosis_complete"):
+            # 第一次失败已由 Codex 出诊断并改写提示词，直接用它的指令。
+            codex_instruction = str(
+                (current.get("codex_escalation") or {}).get(
+                    "instruction_to_aifos") or "").strip()
+            if not diagnostics.get("diagnosis_complete") \
+                    and not codex_instruction:
                 current = dict(current)
                 current["retry_blocked"] = True
                 current["retry_blocked_reason"] = (
@@ -13798,7 +13934,7 @@ class Director:
                     ctx, item["id"], "awaiting_human",
                     extra={"qc": current})
                 break
-            if not patch:
+            if not patch and not codex_instruction:
                 current = dict(current)
                 current["retry_blocked"] = True
                 current["retry_blocked_reason"] = (
@@ -13824,26 +13960,33 @@ class Director:
                                  else "last_frame"),
                         "shot_no": int(item.get("shot_no")),
                     }
-            revision = optimize_qc_feedback(
-                current.get("issues") or [], mode="image",
-                diagnostics=diagnostics)
-            feedback = revision["text"][:1600]
+            if codex_instruction:
+                feedback = codex_instruction[:2400]
+                revision_source = "codex_escalation"
+            else:
+                revision = optimize_qc_feedback(
+                    current.get("issues") or [], mode="image",
+                    diagnostics=diagnostics)
+                feedback = revision["text"][:1600]
+                revision_source = "auto_qc_identity"
             self.log.warn(
                 "director",
-                f"{item['id']} 触发自动修图第{attempt + 1}次:"
-                + "；".join(current.get("issues") or []))
+                f"{item['id']} 触发自动修图第{attempt + 1}次"
+                + ("(按 Codex 新提示词)" if codex_instruction else "")
+                + ":" + "；".join(current.get("issues") or []))
             self.regen_image(
                 project["title"], episode["number"], target,
-                feedback=feedback, revision_source="auto_qc_identity")
+                feedback=feedback, revision_source=revision_source)
             repaired += 1
             refreshed = next((
                 candidate for candidate in self._plan_read(ctx)["items"]
                 if candidate["id"] == item["id"]), item)
             current = self._qc_one(
                 project, episode, ctx, refreshed)
+            next_escalation = current.get("codex_escalation") or {}
             if (current.get("passed") or not current.get("hard_failure")
-                    or (current.get("codex_escalation") or {}).get(
-                        "triggered")):
+                    or (next_escalation.get("triggered")
+                        and not next_escalation.get("executable"))):
                 break
         current = dict(current)
         current["auto_repaired"] = repaired
@@ -14096,9 +14239,11 @@ class Director:
                 "auto_repaired": auto_repaired}
 
     def redo_items(self, project_title, episode_number, item_ids=None,
-                   only_failed=False, quality_override=None, progress=None):
+                   only_failed=False, quality_override=None, progress=None,
+                   escalation_override=False):
         """批量重画:按 item_ids 重画;only_failed=True 时重画所有质检
-        未过的图。可暂停,重画后自动复检。"""
+        未过的图。可暂停,重画后自动复检。escalation_override=True 表示
+        人工确认合同已修好,放行 Codex 判为非重画类处理的镜头。"""
         project, episode = self._episode_ctx(project_title, episode_number)
         ctx = {"project": dict(project), "episode": dict(episode),
                "out_root": self._episode_dir(project, episode)}
@@ -14302,7 +14447,8 @@ class Director:
                             prompt_override=prompt_override,
                             quality_override=quality_override,
                             revision_source=revision_source,
-                            codex_profile=profile_id)
+                            codex_profile=profile_id,
+                            escalation_override=bool(escalation_override))
                         worker_project, worker_episode = \
                             worker_director._episode_ctx(
                                 project_title, episode_number)
