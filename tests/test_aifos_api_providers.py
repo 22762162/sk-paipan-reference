@@ -27,13 +27,13 @@ MP4_FAKE = b"\x00\x00\x00 ftypisom" + b"\x00" * 64
 def test_candidate_api_prompt_locks_project_style_and_identity():
     provider = OpenAIImageProvider("image_api", {"enabled": True})
     payload = {"portrait_candidate": True, "style": "现代都市半写实"}
-    prompt = provider._semantic_prompt("五套造型候选", payload, [object()])
+    prompt = provider._semantic_prompt("四张同词初始候选", payload, [object()])
     assert "人物身份与脸是最高标准" in prompt
     assert "不得改脸" in prompt
-    assert "不得改脸、换发型或换妆造" in prompt
-    assert "同一项目画风" in prompt
+    assert "同一人物四张候选必须复用完全相同" in prompt
+    assert "只靠模型随机采样" in prompt
     assert "纯净无场景背景" in prompt
-    assert "不得用同一造型只换动作" in prompt
+    assert "禁止换装、换妆、换动作" in prompt
 
 
 def test_complete_character_prompt_is_not_reexpanded_with_story_biography():

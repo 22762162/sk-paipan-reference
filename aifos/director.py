@@ -176,6 +176,8 @@ VIDEO_QC_SCHEMA = "aifos.video-qc/v1"
 CHARACTER_CANDIDATES = 4
 PROP_CANDIDATES = 4
 LEGACY_CHARACTER_CANDIDATE_MAX = 5
+CHARACTER_CANDIDATE_PROMPT_SCHEMA = (
+    "aifos.character-candidate/v3-initial-state")
 CHARACTER_BACKGROUND_RULE = (
     "人物立绘必须是纯净、无文字的单人物资产背景;背景只允许纯色、柔和渐变"
     "或干净无辨识度的棚拍底,禁止任何场景、建筑、室内、街道、自然环境、"
@@ -344,7 +346,9 @@ def character_candidate_target(character):
 def character_candidate_policy_text():
     return ("主角、重要配角和普通配角统一4张候选；"
             "跑龙套/背景路人不做独立设定、不生成候选图或立绘；"
-            "所有候选继承本剧唯一画风，只比较人物身份与剧情造型细节")
+            "同一人物4张候选使用完全相同的首次登场基础定妆提示词，"
+            "只靠模型随机采样比较人物形象；不得换装、换妆、加入淋湿、"
+            "泥污、伤情、死亡态或其他后续剧情状态")
 
 
 def core_prop_definitions(script):
@@ -410,51 +414,9 @@ def character_production_readiness_error(script, analysis=None):
                 "请先重新运行 AI 人物分析。")
     return None
 
-# 人物定版候选不承担“选画风”的职责。本剧画风由项目/制作圣经唯一锁定；
-# 多张候选只用于比较同一画风下的人物身份、表情和剧情造型细节。候选被人工
-# 锁定后，其完整脸、发型、妆容与服装才成为后续镜头不可漂移的身份锚点。
-CHARACTER_LOOK_VARIANTS = (
-    {
-        "variant_id": "story_baseline",
-        "variant_label": "候选 A · 基准身份",
-        "look_variant": {
-            "hair": "采用剧本人物设定中的基准发型",
-            "makeup": "采用剧本人物设定中的基准妆容或面部修饰",
-            "costume": "采用剧本人物设定中的基准服装与配色",
-            "temperament": "准确呈现剧本设定的核心性格与气质",
-        },
-    },
-    {
-        "variant_id": "clean_minimal",
-        "variant_label": "候选 B · 发型细节",
-        "look_variant": {
-            "hair": "同一发型体系内做轻微梳理和发丝整理差异，不改变身份轮廓",
-            "makeup": "保持基准妆造和本剧统一媒介，只做不可改变身份的轻微强弱差异",
-            "costume": "保持基准服装体系，只调整剧情允许的层次或细节",
-            "temperament": "同一核心性格，表情略偏清爽自然，不能改变人物气质",
-        },
-    },
-    {
-        "variant_id": "sharp_professional",
-        "variant_label": "候选 C · 表情细节",
-        "look_variant": {
-            "hair": "保持基准发型轮廓、发际线和发色家族，不更换发型体系",
-            "makeup": "保持基准妆造，只让眉眼表情和面部明暗更清晰",
-            "costume": "保持基准服装体系，不能以更换画风或时代服装制造差异",
-            "temperament": "同一核心性格，表情略偏专注坚定，不能变成另一种人设",
-        },
-    },
-    {
-        "variant_id": "soft_relaxed",
-        "variant_label": "候选 D · 职业细节",
-        "look_variant": {
-            "hair": "保持基准发型轮廓，只允许不改变身份的自然发丝差异",
-            "makeup": "保持基准妆造体系，不能改成另一种媒介或人物年龄感",
-            "costume": "保持职业、时代和剧情服装体系，突出一个可追溯的职业细节",
-            "temperament": "同一核心性格，补充与职业/经历一致的自然状态",
-        },
-    },
-)
+# 人物定版候选不承担“选画风”或“展示剧情换装”的职责。本剧画风与人物
+# 首次登场基础定妆只编译一次，同一人物的四张图复用同一份最终提示词；
+# 四选一只比较模型随机采样出来的人脸、比例与整体完成度。
 
 # 人物完整资产套件：16:9 合成板只用于审核；面部、正面、严格侧面和
 # 完整背面必须分别生成高清单图，作为后续镜头真正使用的母资产。
@@ -1026,7 +988,7 @@ class Director:
         return result
 
     def _review_image_tasks(self, ctx, tasks):
-        """并行完成整批Codex提示词审核，再冻结优化稿进入出图队列。"""
+        """并行审核提示词；显式同词组只审核一次并复用同一优化稿。"""
         review_tasks = [
             task for task in tasks
             if task.get("capability") in ("image", "frames", "cover")
@@ -1034,6 +996,28 @@ class Director:
         ]
         if not review_tasks:
             return
+        groups = {}
+        for task in review_tasks:
+            payload = task["payload"]
+            explicit_group = str(
+                payload.get("prompt_review_group_key") or "").strip()
+            if explicit_group:
+                source = str(
+                    payload.get("prompt_compact")
+                    or payload.get("prompt") or "").strip()
+                context = self.router._prompt_review_context(
+                    task["capability"], payload)
+                fingerprint = self._stable_hash({
+                    "capability": task["capability"],
+                    "prompt": source,
+                    "context": context,
+                })
+                group_key = (
+                    "shared", explicit_group, fingerprint)
+            else:
+                group_key = ("single", task["item_id"])
+            groups.setdefault(group_key, []).append(task)
+        review_groups = list(groups.values())
         profiles = self._codex_parallel_profiles()
         for index, task in enumerate(review_tasks):
             payload = task["payload"]
@@ -1046,17 +1030,19 @@ class Director:
                 payload["_prompt_review_profile"] = profiles[
                     index % len(profiles)]["id"]
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        workers = min(self._total_image_workers(), len(review_tasks))
+        workers = min(self._total_image_workers(), len(review_groups))
         cancel = lambda: self._cancel_requested(ctx)  # noqa: E731
 
-        def review_one(task):
-            return task, self.router.review_image_prompt(
+        def review_one(group):
+            task = group[0]
+            return group, self.router.review_image_prompt(
                 task["capability"], task["payload"],
                 ctx["out_root"] / task["sub_dir"], cancel=cancel)
 
         completed = []
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            futures = [pool.submit(review_one, task) for task in review_tasks]
+            futures = [pool.submit(review_one, group)
+                       for group in review_groups]
             for future in as_completed(futures):
                 try:
                     completed.append(future.result())
@@ -1065,19 +1051,35 @@ class Director:
                         pending.cancel()
                     raise
         reviewed = 0
-        for task, result in completed:
-            audit = task["payload"].get("prompt_review") or {}
-            self._plan_mark(
-                ctx, task["item_id"],
-                self._plan_read_status(ctx, task["item_id"]),
-                extra={
-                    "prompt_review": copy.deepcopy(audit),
-                    "prompt_aifos_original": task["payload"].get(
-                        "prompt_aifos_original", ""),
-                    "prompt_optimized": (
-                        task["payload"].get("prompt_compact")
-                        or task["payload"].get("prompt") or ""),
-                })
+        for group, result in completed:
+            source_payload = group[0]["payload"]
+            for task in group[1:]:
+                target_payload = task["payload"]
+                for key in (
+                        "prompt", "prompt_compact",
+                        "prompt_aifos_original", "prompt_review",
+                        "prompt_review_schema",
+                        "prompt_review_feedback_applied", "feedback"):
+                    if key in source_payload:
+                        target_payload[key] = copy.deepcopy(
+                            source_payload[key])
+                    elif key in target_payload and key in (
+                            "prompt_compact", "feedback"):
+                        target_payload.pop(key, None)
+            for task in group:
+                payload = task["payload"]
+                audit = payload.get("prompt_review") or {}
+                self._plan_mark(
+                    ctx, task["item_id"],
+                    self._plan_read_status(ctx, task["item_id"]),
+                    extra={
+                        "prompt_review": copy.deepcopy(audit),
+                        "prompt_aifos_original": payload.get(
+                            "prompt_aifos_original", ""),
+                        "prompt_optimized": (
+                            payload.get("prompt_compact")
+                            or payload.get("prompt") or ""),
+                    })
             if result is None:
                 continue
             reviewed += 1
@@ -1088,8 +1090,9 @@ class Director:
         if reviewed:
             self.log.info(
                 "director",
-                f"Codex提示词审核优化完成:{reviewed}/{len(review_tasks)}条，"
-                "优化稿已冻结后进入图片生成")
+                f"Codex提示词审核优化完成:{reviewed}/{len(review_groups)}组，"
+                f"覆盖{len(review_tasks)}张图；同词组复用同一优化稿后进入"
+                "图片生成")
 
     def _plan_read_status(self, ctx, item_id):
         """读取清单状态；提示词审核写审计信息时不得改变生产状态。"""
@@ -1459,50 +1462,28 @@ class Director:
                 + CHARACTER_BACKGROUND_RULE)
 
     def _candidate_variant(self, index, design=None):
-        """返回同一项目画风下的候选差异轴和资产元数据。"""
-        template = CHARACTER_LOOK_VARIANTS[index - 1]
-        look = dict(template["look_variant"])
-        if design:
-            base_costume = ";".join(filter(None, (
-                str(design.get("costume") or "").strip(),
-                str(design.get("costume_detail") or "").strip(),
-            )))
-            base = {
-                "hair": str(design.get("hair") or "").strip(),
-                "makeup": str(design.get("makeup") or "").strip(),
-                "costume": base_costume,
-                "temperament": str(design.get("temperament") or "").strip(),
-            }
-            for key, value in base.items():
-                if not value:
-                    continue
-                if index == 1:
-                    look[key] = value
-                else:
-                    look[key] = f"基准设定:{value}；本候选{look[key]}"
+        """四张候选共用首次登场状态和同一提示词，仅随机采样不同。"""
+        if index < 1 or index > CHARACTER_CANDIDATES:
+            raise AifosError(f"人物候选序号超出范围: {index}")
         story_variants = self._story_variants(design)
-        story_variant = (story_variants[index - 1]
-                         if index <= len(story_variants) else None)
-        if story_variant:
-            label = story_variant.get("label") or story_variant.get("name")
-            if label:
-                story_label = str(label)
-            else:
-                story_label = ""
-            for key in ("hair", "makeup", "costume", "temperament"):
-                if story_variant.get(key):
-                    look[key] = self._design_value(story_variant[key])
+        if story_variants:
+            initial = copy.deepcopy(story_variants[0])
         else:
-            story_label = ""
+            initial = self._candidate_design_initial_variant(design or {})
+        initial = self._compile_candidate_story_variant(
+            design or {}, initial)
+        look = {
+            key: self._design_value(initial.get(key))
+            for key in ("hair", "makeup", "costume", "temperament")
+        }
+        slot = "ABCD"[index - 1]
         return {
-            "variant_id": template["variant_id"],
-            "variant_label": (f"{template['variant_label']} · "
-                              f"{story_label}"
-                              if story_label
-                              else template["variant_label"]),
+            "variant_id": f"initial_state_sample_{slot.lower()}",
+            "variant_label": f"初始状态同提示词候选 {slot}",
             "look_variant": look,
-            "variant_source": "generated",
-            "story_variant": story_variant or {},
+            "variant_source": "initial_state_same_prompt",
+            "story_variant": initial,
+            "candidate_prompt_schema": CHARACTER_CANDIDATE_PROMPT_SCHEMA,
         }
 
     @staticmethod
@@ -1527,68 +1508,419 @@ class Director:
                 for part in value.replace("；", "|").split("|")
                 if part.strip()]
 
+    @staticmethod
+    def _freeze_candidate_static_field(value):
+        """把初始定妆中的“可/或”备选冻结为一个明确静态状态。"""
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        replacements = (
+            ("可摘下", "已经摘下"),
+            ("可脱下", "已经脱下"),
+            ("可重新戴", "重新戴"),
+            ("可佩戴", "佩戴"),
+            ("可手持", "手持"),
+            ("可提", "提"),
+            ("可以", ""),
+        )
+        for old, new in replacements:
+            text = text.replace(old, new)
+        clauses = []
+        for clause in re.split(r"([；;。])", text):
+            if clause in ("；", ";", "。"):
+                if clauses and not clauses[-1].endswith(("；", ";", "。")):
+                    clauses[-1] += clause
+                continue
+            clause = clause.strip()
+            if not clause:
+                continue
+            if "或" in clause:
+                first, alternative = clause.split("或", 1)
+                trailing_verb = next((
+                    verb for verb in (
+                        "保护", "携带", "佩戴", "持握", "放置",
+                        "展示", "使用", "收起", "固定")
+                    if alternative.rstrip("，,；;。").endswith(verb)), "")
+                clause = first.rstrip("，, ")
+                if trailing_verb and not clause.endswith(trailing_verb):
+                    clause += trailing_verb
+            clauses.append(clause)
+        return "".join(clauses).strip()
+
+    @staticmethod
+    def _clean_candidate_initial_state_text(value):
+        """剥离淋湿、泥污、伤情、死亡等一次性剧情状态。
+
+        磨旧、补丁、旧疤等稳定人物设计仍保留；首次登场即使发生在
+        雨中，人物候选母版也只表现自然、干燥、无伤的基础状态。
+        """
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        replacements = (
+            ("旧湿布包", "旧布包"),
+            ("湿旧蓝布包袱", "旧蓝布包袱"),
+            ("湿旧布包袱", "旧布包袱"),
+            ("被雨打湿的", ""),
+            ("被暴雨浸透的", ""),
+            ("被大雨浸透的", ""),
+            ("淋湿的", ""),
+            ("湿透的", ""),
+            ("湿碎发", "自然碎发"),
+            ("湿发贴额", "碎发自然贴近额角"),
+            ("湿发", "自然发丝"),
+            ("湿灰褐", "灰褐"),
+            ("雨浸黑褐", "黑褐"),
+            ("雨水与泥点", ""),
+            ("雨水、泥点", ""),
+            ("雨水和泥点", ""),
+            ("和雨水泥点", ""),
+            ("与雨水泥点", ""),
+            ("雨水泥点", ""),
+            ("雨水和风霜", "风霜"),
+            ("数日风雨后", ""),
+            ("唇色因湿冷略淡", ""),
+            ("衣料半干半湿", ""),
+            ("半干半湿", ""),
+            ("吸水塌软的", "磨旧的"),
+            ("雨后贴肩下压", "自然贴合肩部"),
+            ("泥黄色", "土黄色"),
+            ("泥黄", "土黄"),
+        )
+        for old, new in replacements:
+            text = text.replace(old, new)
+        # 剧本经常把稳定服装与临时状态写在同一个短句里，例如
+        # “青灰粗布长衫沾黄泥水”。先只剥离状态后缀，不能因为短句里
+        # 出现“泥水/血迹”就把长衫本身一起删除。
+        inline_state_patterns = (
+            r"(?:被)?(?:暴雨|大雨|雨水|雨)?(?:浸透|打湿|淋湿|淋透|浸湿)",
+            r"(?:衣料)?(?:受潮|湿漉漉)",
+            r"(?:沾|溅|带|覆|满是|混着|拖着)"
+            r"(?:少量|些许|一层|黄|黑|暗红|深色)?"
+            r"(?:泥水|泥点|泥渍|泥污|泥浆|泥)",
+            r"(?:沾|带|覆|满是|混着)"
+            r"(?:少量|些许|一层|暗红|鲜红)?"
+            r"(?:血迹|血污|血水|血)",
+        )
+        for pattern in inline_state_patterns:
+            text = re.sub(pattern, "", text)
+
+        transient = (
+            "被暴雨浸透", "被雨打湿", "淋湿", "湿透", "雨水打湿",
+            "衣料受潮", "雨水", "雨夜", "水渍", "泥点", "泥水",
+            "溅泥", "沾泥", "沾少量旧泥", "泥渍", "拖泥",
+            "新沾深泥", "后脑", "血丝", "流血", "血迹", "暗红伤",
+            "刀刺", "刺伤", "擦伤", "擦痕", "擦破",
+            "肿伤", "伤口", "负伤", "遇害", "尸体", "死亡妆",
+            "眩晕", "骑行", "赶路", "奔逃", "跌倒", "昏迷",
+            "松开后", "随行弓兵",
+        )
+        clauses = []
+        for clause in re.split(r"[；;。]", text):
+            fragments = [
+                fragment.strip(" ，,")
+                for fragment in re.split(r"[，,]", clause)
+                if fragment.strip(" ，,")
+            ]
+            safe = [
+                fragment for fragment in fragments
+                if not any(token in fragment for token in transient)
+            ]
+            if safe:
+                clauses.append("，".join(safe))
+        result = "；".join(dict.fromkeys(clauses))
+        result = re.sub(r"[、，；]{2,}", "；", result)
+        return result.strip(" ，,；;。")
+
+    @classmethod
+    def _candidate_static_accessories(cls, value):
+        """初始母版只保留确定入画的配饰，删除可选和跨阶段内容。"""
+        kept = []
+        for clause in re.split(r"[；;。]", str(value or "")):
+            clause = clause.strip()
+            if not clause or any(token in clause for token in (
+                    "遇害后", "撤离时", "后续", "结尾", "后来",
+                    "受伤后", "仅在", "才允许")):
+                continue
+            if "可" in clause or "或" in clause:
+                continue
+            cleaned = cls._clean_candidate_initial_state_text(clause)
+            if cleaned:
+                kept.append(cleaned)
+        return "；".join(kept)
+
+    @classmethod
+    def _candidate_initial_design_field(cls, value):
+        """没有造型表时，优先保留全局描述中的开场/初始段。"""
+        kept = []
+        for clause in re.split(r"[；;。]", str(value or "")):
+            clause = clause.strip()
+            if not clause:
+                continue
+            if any(token in clause for token in (
+                    "结尾", "后来", "后续", "换装后", "受伤后",
+                    "遇害后", "嫁祸后")):
+                continue
+            clause = re.sub(r"^(?:开场|初始|首次登场)[:：]?", "", clause)
+            cleaned = cls._clean_candidate_initial_state_text(clause)
+            if cleaned:
+                kept.append(cleaned)
+        return "；".join(dict.fromkeys(kept))
+
+    def _candidate_design_initial_variant(self, design):
+        """旧设定没有造型表时，编译唯一的无剧情状态初始母版。"""
+        design = design if isinstance(design, dict) else {}
+        costume = self._candidate_initial_design_field("；".join(
+            filter(None, (
+                str(design.get("costume") or "").strip(),
+                str(design.get("costume_detail") or "").strip(),
+            ))))
+        props = self._candidate_static_accessories(
+            design.get("accessories"))
+        if not props:
+            props = self._candidate_static_accessories(
+                design.get("signature_props"))
+        return {
+            "label": "人物首次登场基础定妆",
+            "occasion": "人物首次登场前的基础定妆状态",
+            "hair": str(design.get("hair") or "").strip(),
+            "makeup": str(design.get("makeup") or "").strip(),
+            "costume": costume or "采用人物设定中唯一明确的初始基础服装",
+            "palette": str(design.get("palette") or "").strip(),
+            "props": props,
+            "temperament": str(
+                design.get("temperament")
+                or design.get("personality") or "").strip(),
+            "derived_from": "character_design_initial_look",
+        }
+
+    def _compile_candidate_story_variant(self, design, story_variant):
+        """把首次造型编译成无临时剧情状态的唯一初始母版。"""
+        result = copy.deepcopy(story_variant)
+        for key in (
+                "costume", "props", "accessories", "hair", "makeup",
+                "palette", "temperament"):
+            value = result.get(key)
+            if value:
+                value = self._freeze_candidate_static_field(value)
+                result[key] = self._clean_candidate_initial_state_text(value)
+        if not result.get("hair"):
+            result["hair"] = self._clean_candidate_initial_state_text(
+                (design or {}).get("hair"))
+        if not result.get("makeup"):
+            result["makeup"] = self._clean_candidate_initial_state_text(
+                (design or {}).get("makeup"))
+        if not result.get("temperament"):
+            result["temperament"] = self._clean_candidate_initial_state_text(
+                (design or {}).get("temperament")
+                or (design or {}).get("personality"))
+        face_cover = "；".join(str(result.get(key) or "")
+                              for key in ("costume", "props", "accessories"))
+        cover_tokens = ("蒙巾", "蒙黑布", "面罩", "面纱", "口罩")
+        if not any(token in face_cover for token in cover_tokens):
+            for key in ("hair", "makeup"):
+                result[key] = "；".join(
+                    clause.strip()
+                    for clause in re.split(
+                        r"[；;。]", str(result.get(key) or ""))
+                    if clause.strip()
+                    and not any(token in clause for token in cover_tokens))
+        hair_clauses = [
+            clause.strip()
+            for clause in re.split(r"[；;。]", result.get("hair") or "")
+            if clause.strip()
+        ]
+        if any(token in face_cover for token in (
+                "帽", "斗笠", "幞头", "冠")):
+            hair_clauses = [
+                clause for clause in hair_clauses
+                if not clause.startswith(("摘帽后", "脱帽后", "去冠后"))
+            ]
+        else:
+            revealed = next((
+                re.sub(r"^(?:摘帽后|脱帽后|去冠后)(?:为)?", "", clause)
+                for clause in hair_clauses
+                if clause.startswith(("摘帽后", "脱帽后", "去冠后"))), "")
+            if revealed:
+                hair_clauses = [revealed]
+        result["hair"] = "；".join(hair_clauses) \
+            or "保持人物首次登场时唯一明确的基础发型"
+        result["occasion"] = "人物首次登场前的基础定妆状态（非具体剧情镜头）"
+        result["injury_state"] = (
+            "初始人物母版：衣着与发肤保持自然干燥洁净状态；"
+            "无泥污、血迹、伤口、尸体妆或后续换装")
+        result["initial_state_policy"] = (
+            "只保留首次登场基础服装、发型、妆容与稳定身份特征")
+        return result
+
+    def _candidate_identity_card(self, design):
+        """候选图只继承稳定身份，不继承全局服装、道具或剧情状态。
+
+        ``image_prompt`` 与 ``visual_dna`` 中的服装/剧情道具通常描述某个
+        代表性剧情状态。初始候选不得把这些后续状态反向写进身份母版，
+        因此这里只编译脸、年龄、性别、体态与稳定身体痕迹。
+        """
+        design = design if isinstance(design, dict) else {}
+        parts = []
+        for key, label in (
+                ("species", "形态"),
+                ("gender", "性别"),
+                ("age_range", "年龄段"),
+                ("appearance", "脸部与体态"),
+                ("eyes", "眼睛")):
+            value = design.get(key)
+            if key == "gender" and not value:
+                value = design.get("sex")
+            value = self._clean_candidate_initial_state_text(
+                self._design_value(value))
+            if value:
+                parts.append(f"{label}:{value}")
+
+        dna = design.get("visual_dna")
+        if isinstance(dna, dict):
+            dna_keys = (
+                ("face_structure", "脸部骨相"),
+                ("body_or_occupation_marks", "稳定体态/身体痕迹"),
+            )
+            dna_parts = []
+            for key, label in dna_keys:
+                value = self._clean_candidate_initial_state_text(
+                    self._design_value(dna.get(key)))
+                if value and value not in "；".join(dna_parts):
+                    dna_parts.append(f"{label}:{value}")
+            if dna_parts:
+                parts.append("人物视觉DNA:" + "；".join(dna_parts))
+        return "；".join(parts)
+
+    def _candidate_prompt_review_context(
+            self, name, role, style, design, variant, has_reference=False):
+        """生成四张完全相同的初始候选审核事实。"""
+        look = variant.get("look_variant") or {}
+        story_variant = variant.get("story_variant") or {}
+        props = self._design_value(
+            story_variant.get("props")
+            or story_variant.get("accessories"))
+        occasion = self._design_value(
+            story_variant.get("occasion")
+            or story_variant.get("scene"))
+        palette = self._design_value(story_variant.get("palette"))
+        injury_state = self._design_value(
+            story_variant.get("injury_state"))
+        if has_reference:
+            hair = (
+                "只服从身份参考图的发际线、发型轮廓、发量和发色家族；"
+                "不继承参考图服装或剧情状态")
+            makeup = (
+                "只服从身份参考图的眉眼、眼线、睫毛、唇妆与稳定妆造；"
+                "不继承参考图服装或剧情状态")
+        else:
+            hair = self._design_value(look.get("hair"))
+            makeup = self._design_value(look.get("makeup"))
+        return {
+            "schema": "aifos.character-candidate-review/v3-initial-state",
+            "candidate_prompt_schema": CHARACTER_CANDIDATE_PROMPT_SCHEMA,
+            "candidate_policy": (
+                "同一人物四张图片必须复用完全相同的初始状态最终提示词，"
+                "仅利用图片模型随机采样；审核不得为不同槽位创造差异"),
+            "task": "single_character_initial_identity_candidate",
+            "characters": [name],
+            "character_count": 1,
+            "role": role,
+            "identity_lock": (
+                self._candidate_identity_card(design)
+                or "仅锁定姓名、年龄、性别表达与同一人物身份"),
+            "initial_character_state": {
+                "hair": hair,
+                "makeup": makeup,
+                "wardrobe": self._design_value(look.get("costume")),
+                "palette": palette,
+                "accessories_and_props": (
+                    props or
+                    "无额外剧情道具；不得继承人物全局道具或其他候选道具"),
+                "temperament": self._design_value(
+                    look.get("temperament")),
+                "occasion": occasion,
+                "injury_state": injury_state,
+                "state_policy": story_variant.get(
+                    "initial_state_policy", ""),
+            },
+            "source_precedence": (
+                "initial_character_state是四张候选共同且唯一的服装、配色、"
+                "妆容、配饰与状态事实源；不得继承人物全局最终出图卡、"
+                "全局服装/标志道具或前后剧情造型"),
+            "reference_identity_lock": bool(has_reference),
+            "reference_scope": (
+                "若有参考图，只锁脸型、五官骨相、年龄、性别表达、"
+                "发际线、发型轮廓与稳定妆造；明确排除参考图服装、"
+                "配饰、手持物、姿势、背景和光线"
+                if has_reference else "本候选没有身份参考图"),
+            "style": style,
+            "composition": (
+                "严格1名人物、单一连续身体、全身正面自然站姿、"
+                "纯净无文字中性背景"),
+        }
+
     def _candidate_portrait_prompt(self, name, role, style, design, variant,
                                    has_reference=False):
         """把内部分析编译成同一项目画风下、单张图可执行的提示词。"""
-        final_card = self._design_value(
-            (design or {}).get("image_prompt"))
-        if final_card:
-            identity = final_card
-        else:
-            identity = self._design_line(
-                design, keys=("species", "gender", "age_range", "identity",
-                              "appearance", "eyes", "era_setting", "occupation",
-                              "signature_props"))
-            dna = (design or {}).get("visual_dna")
-            if isinstance(dna, dict):
-                compact_dna = "；".join(
-                    f"{label}:{value}" for key, label in (
-                        ("face_structure", "脸部骨相"),
-                        ("hair_silhouette", "发型轮廓"),
-                        ("body_or_occupation_marks", "体态/职业痕迹"),
-                        ("clothing_structure", "服装结构"),
-                        ("story_visual_symbol", "视觉符号"),
-                        ("signature_accessory", "核心配饰"),
-                        ("temperament_keywords", "气质"),
-                    )
-                    if (value := self._design_value(dna.get(key))))
-                if compact_dna:
-                    identity = f"{identity}；人物视觉DNA:{compact_dna}"
-        look = variant["look_variant"]
+        identity = self._candidate_identity_card(design)
+        look = variant.get("look_variant") or {}
+        story_variant = variant.get("story_variant") or {}
         if has_reference:
             hair = (
                 "严格保持参考图发型轮廓、发际线、发量和发色家族；"
-                "候选不改变发型身份，只允许自然发丝状态差异")
+                "四张候选不得更换发型身份")
             makeup = (
                 "严格保持参考图妆造、眉眼、眼线、睫毛和唇妆身份；"
-                "候选不改变妆造体系")
+                "四张候选不得改变妆造体系")
             variant_rule = (
                 "有参考图时只锁人物脸型、五官骨相、年龄、性别表达、发际线"
-                "、发型、妆造和身份标志；候选只允许剧情服装细节、表情和轻微"
-                "姿态差异，禁止换脸、换发型或换画风")
+                "、发型、妆造和身份标志；参考图中的服装、配饰、手持物、"
+                "姿势、背景和光线不得继承；四张图禁止换脸、换发型、"
+                "换妆造、换服装或换画风")
         else:
-            hair = look["hair"]
-            makeup = look["makeup"]
+            hair = self._design_value(look.get("hair")) \
+                or "保持同一人物的明确发型轮廓"
+            makeup = self._design_value(look.get("makeup")) \
+                or "保持同一人物的明确妆造"
             variant_rule = (
-                "无参考图时,可在同一项目画风、时代、职业和核心人物气质内"
-                "做有限的发型/妆容/表情细节差异,不得制作不同画风候选")
-        workwear = self._sheet_workwear_line(f"{name};{role}", design)
+                "无参考图时，四张图仍必须使用同一人物身份、同一发型、"
+                "同一妆容、同一服装、同一构图和同一项目画风；"
+                "只允许图片模型自身随机采样产生自然结果差异")
+        costume = self._design_value(look.get("costume")) \
+            or "采用人物首次登场时唯一明确的基础服装"
+        temperament = self._design_value(look.get("temperament")) \
+            or "保持核心人物气质"
+        occasion = self._design_value(
+            story_variant.get("occasion") or story_variant.get("scene"))
+        palette = self._design_value(story_variant.get("palette"))
+        props = self._design_value(
+            story_variant.get("props") or story_variant.get("accessories"))
+        injury_state = self._design_value(
+            story_variant.get("injury_state"))
+        props_line = (
+            props if props else
+            "无额外剧情道具；不得从人物全局设定或前后剧情"
+            "造型自动继承手持道具")
         return (
-            f"【任务】{name}（{role}）单人定角候选 · {variant['variant_label']}。"
-            "不同候选是互斥造型，不是同一套衣服只换动作。"
-            f"【最终人物出图卡】{identity or '年龄、物种、性别表达与核心身份不变'}。"
-            f"【本张造型覆盖项】仅以下字段覆盖出图卡中的对应字段："
-            f"发型:{hair}；妆容:{makeup}；服装:{look['costume']}；"
-            f"表情气质:{look['temperament']}。{variant_rule}。"
-            + (f";剧情场合:{variant.get('story_variant', {}).get('occasion') or variant.get('story_variant', {}).get('scene')}"
-               if variant.get("story_variant", {}).get("occasion")
-               or variant.get("story_variant", {}).get("scene") else "")
-            + (f";配饰/道具:{variant.get('story_variant', {}).get('props') or variant.get('story_variant', {}).get('accessories')}"
-               if variant.get("story_variant", {}).get("props")
-               or variant.get("story_variant", {}).get("accessories") else "")
+            f"【任务】{name}（{role}）单人初始状态定角候选。"
+            "【四图同词】本角色四张候选必须复用本条经审核后的完全相同"
+            "最终提示词；只利用图片模型随机采样比较人物形象，不得换装、"
+            "换妆、换发型、换道具、换构图或切换剧情阶段。"
+            f"【稳定身份锚】{identity or '年龄、物种、性别表达与同一人物身份不变'}；"
+            "本段不定义服装、配色或剧情道具。"
+            f"【共同初始造型】发型:{hair}；妆容:{makeup}；"
+            f"服装:{costume}；"
+            + (f"配色:{palette}；" if palette else "")
+            + f"配饰/道具:{props_line}；表情气质:{temperament}。"
+            + (f"定妆时点:{occasion}。" if occasion else "")
+            + (f"【状态边界】{injury_state}。" if injury_state else "")
+            + "【造型优先级】“共同初始造型”是四张图共用且唯一的服装、"
+            "配色、妆容、配饰与手持道具事实源；不得继承人物全局最终"
+            "出图卡、全局服装/标志道具或前后剧情造型。"
+            + f"{variant_rule}。"
             + f"【PROJECT STYLE LOCK】本项目唯一画风:{style}；"
             "所有候选必须完全一致，不得制作不同画风候选。"
-            + (f"职业服装:{workwear}。" if workwear else "")
             + "人物立绘必须是纯净、无文字的单人物资产背景。"
             "【构图】单人、全身正面自然站姿、从头到脚完整、纯净中性棚拍背景；"
             "五官、手指、关节与身体比例自然。"
@@ -5666,6 +5998,11 @@ class Director:
                     "variant_label": meta.get("variant_label", ""),
                     "look_variant": look_variant,
                     "variant_source": variant_source or "generated",
+                    "candidate_prompt_schema": meta.get(
+                        "candidate_prompt_schema", ""),
+                    "current_candidate_policy": (
+                        meta.get("candidate_prompt_schema")
+                        == CHARACTER_CANDIDATE_PROMPT_SCHEMA),
                     "selected": bool(
                         locked and selected_meta.get("candidate_asset_id") == row["id"]),
                 })
@@ -5830,10 +6167,11 @@ class Director:
             "无字幕、无Logo、无水印；自然比例与材质真实可制造。")
 
     def _ensure_character_candidates(self, ctx, characters, designs, style):
-        """按角色重要度补足候选；候选之间并行，后续等待人工选择。"""
+        """每个人物用同一初始提示词并行生成4张，随后等待人工选择。"""
         project_id = ctx["project"]["id"]
         seed = []
         tasks = []
+        reused_slots = set()
         quality_by_candidate = {}
         variant_by_candidate = {}
         for character in characters:
@@ -5850,9 +6188,46 @@ class Director:
                 meta = self._asset_meta(row)
                 idx = int(meta.get("candidate_index") or 0)
                 uri = row["uri"]
+                if (meta.get("candidate_prompt_schema")
+                        != CHARACTER_CANDIDATE_PROMPT_SCHEMA):
+                    # 旧版按剧情状态拆分的候选仍保留在资产历史中，但不能
+                    # 被新版初始状态四选一流程复用。
+                    continue
+                if (not meta.get("variant_label")
+                        or not isinstance(meta.get("look_variant"), dict)
+                        or not str(meta.get("prompt") or "").strip()):
+                    continue
                 if idx and uri and (uri.startswith(("http://", "https://"))
                                     or Path(uri).exists()):
                     existing[idx] = row
+                    reused_slots.add((name, idx))
+            existing_prompts = {
+                str(self._asset_meta(row).get("prompt") or "").strip()
+                for row in existing.values()
+            }
+            if len(existing_prompts) > 1:
+                # 同一v3批次若出现多个最终提示词，说明旧运行没有真正
+                # 执行“四图同词”；整组作废并另起版本，历史文件不删除。
+                reused_slots.difference_update(
+                    (name, index) for index in existing)
+                existing = {}
+                existing_prompts = set()
+            shared_existing_prompt = next(
+                iter(existing_prompts), "")
+            shared_existing_meta = (
+                self._asset_meta(next(iter(existing.values())))
+                if existing else {})
+            shared_review_seed = {}
+            if shared_existing_prompt:
+                audit = shared_existing_meta.get("prompt_review")
+                if isinstance(audit, dict) and audit:
+                    shared_review_seed["prompt_review"] = copy.deepcopy(
+                        audit)
+                original = str(
+                    shared_existing_meta.get("prompt_aifos_original")
+                    or "").strip()
+                if original:
+                    shared_review_seed["prompt_aifos_original"] = original
             if locked and not existing:
                 # 人工上传的最终立绘没有候选集，仍视为明确人工定版。
                 continue
@@ -5879,10 +6254,12 @@ class Director:
                         variant = {
                             key: existing_meta[key] for key in (
                                 "variant_id", "variant_label", "look_variant",
-                                "variant_source", "story_variant")
+                                "variant_source", "story_variant",
+                                "candidate_prompt_schema")
                             if key in existing_meta
                         }
-                        variant.setdefault("variant_source", "generated")
+                        variant.setdefault(
+                            "variant_source", "initial_state_same_prompt")
                     else:
                         variant = {
                             "variant_id": "",
@@ -5891,8 +6268,12 @@ class Director:
                             "variant_source": "legacy",
                         }
                 variant_by_candidate[(name, index)] = variant
-                if variant["variant_source"] == "legacy":
-                    prompt = "历史候选未记录候选差异轴，请按当前项目唯一画风和角色重要度规则重新生成"
+                if index in existing:
+                    prompt = str(
+                        self._asset_meta(existing[index]).get("prompt")
+                        or shared_existing_prompt)
+                elif shared_existing_prompt:
+                    prompt = shared_existing_prompt
                 else:
                     prompt = self._candidate_portrait_prompt(
                         name, role, style, designs.get(name), variant,
@@ -5920,8 +6301,17 @@ class Director:
                         "quality_decision": quality,
                         "art_name": f"{name}_candidate_{index:02d}",
                         "role": role, "shot_no": 0,
-                        "characters": [name], "location": "",
+                        "characters": [name], "character_count": 1,
+                        "location": "",
                         "prompt": prompt, "style": style,
+                        **shared_review_seed,
+                        "prompt_review_group_key": (
+                            f"character-initial:{project_id}:{name}:"
+                            f"{CHARACTER_CANDIDATE_PROMPT_SCHEMA}"),
+                        "prompt_review_context":
+                            self._candidate_prompt_review_context(
+                                name, role, style, designs.get(name),
+                                variant, has_reference=bool(refs)),
                         # 候选提示词已编译为可直接出图的视觉合同。人物
                         # 剧情设定仍保留在 payload 供审计/QC 使用，但不再
                         # 由 API Provider 二次拼入模型提示词。
@@ -5942,24 +6332,34 @@ class Director:
         # 已存在的候选明确标成复用，避免重新排队。
         for item in seed:
             name, index = item["name"], item["candidate_index"]
-            status = self.character_selection_status(project_id, [name])
-            if any(c["index"] == index
-                   for c in status["characters"][0]["candidates"]):
+            if (name, index) in reused_slots:
                 self._plan_mark(ctx, item["id"], "reused", only_pending=True)
         for (name, index, role), result in self._run_parallel(
                 ctx, tasks,
                 line=f"人物定妆候选({character_candidate_policy_text()})").items():
             quality = quality_by_candidate[(name, index)]
             variant = variant_by_candidate[(name, index)]
+            result_data = result.data if isinstance(result.data, dict) else {}
+            stored_prompt = str(
+                result_data.get("prompt_optimized")
+                or next(
+                    item["prompt"] for item in seed
+                    if item["id"] == f"candidate:{name}:{index}"))
             self.assets.register(
                 project_id, "character_candidate", f"{name}:{index:02d}",
                 uri=result.uri,
                 meta={"character": name, "role": role,
                       "candidate_index": index,
                       **variant,
-                      "prompt": next(
-                          item["prompt"] for item in seed
-                          if item["id"] == f"candidate:{name}:{index}"),
+                      "prompt": stored_prompt,
+                      "prompt_aifos_original": str(
+                          result_data.get("prompt_aifos_original")
+                          or next(
+                              item["prompt"] for item in seed
+                              if item["id"]
+                              == f"candidate:{name}:{index}")),
+                      "prompt_review": copy.deepcopy(
+                          result_data.get("prompt_review") or {}),
                       "reference_images": list(
                           next(task["payload"].get("reference_images", [])
                                for task in tasks
@@ -5967,7 +6367,10 @@ class Director:
                                f"candidate:{name}:{index}")),
                       "provider": result.provider,
                       "model": getattr(result, "model", ""),
-                      **self._quality_meta(quality)})
+                      **self._quality_meta(quality)},
+                new_version=self.assets.latest(
+                    project_id, "character_candidate",
+                    f"{name}:{index:02d}", include_deleted=True) is not None)
         return self.character_selection_status(project_id, characters)
 
     def _ensure_prop_candidates(self, ctx, props, style):
@@ -6115,10 +6518,16 @@ class Director:
             raise AifosError(
                 "低质量试错图不能锁为正式人物参考，请把选中形象以高质量重生后再定版")
         candidate_meta = self._asset_meta(candidate)
+        if (candidate_meta.get("candidate_prompt_schema")
+                != CHARACTER_CANDIDATE_PROMPT_SCHEMA):
+            raise AifosError(
+                "该图由旧版“不同剧情状态候选”规则生成，不能再锁为"
+                "初始人物母版；请先续跑生成4张同提示词的新候选")
         variant_meta = {
             key: candidate_meta[key] for key in (
                 "variant_id", "variant_label", "look_variant",
-                "variant_source") if key in candidate_meta
+                "variant_source", "candidate_prompt_schema")
+            if key in candidate_meta
         }
         meta = {
             "character": character_name,

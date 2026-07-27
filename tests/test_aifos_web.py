@@ -84,7 +84,7 @@ def test_index_and_static(server):
     assert "AIFOS" in html
     assert "历史记录" in html
     assert "/static/style.css?v=20260727-character-identity-1" in html
-    assert "/static/app.js?v=20260727-character-identity-1" in html
+    assert "/static/app.js?v=20260727-character-initial-2" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -1476,7 +1476,10 @@ def test_produce_flow_and_episode_api(server):
     assert all(candidate["url"].startswith("/artifacts/")
                for c in selection["characters"]
                for candidate in c["candidates"])
-    assert all(candidate["variant_source"] == "generated"
+    assert all(candidate["variant_source"] == "initial_state_same_prompt"
+               for c in selection["characters"]
+               for candidate in c["candidates"])
+    assert all(candidate["current_candidate_policy"]
                for c in selection["characters"]
                for candidate in c["candidates"])
     assert all(candidate["variant_label"] and candidate["look_variant"]

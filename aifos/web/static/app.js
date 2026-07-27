@@ -7219,7 +7219,7 @@ function renderProgressBanner(data) {
     </div>`).join("") + awaitingCast.map((e) => `
     <div class="progress-card confirm">
       <div class="progress-text">《${esc(e.project)}》第${e.number}集 人物/核心道具候选已就绪 👤
-        <span>所有正式角色统一4张候选（主角、重要配角和普通配角都认真挑选；跑龙套/背景路人不做独立设定，也不生成候选图或立绘）；全部定版后才生成后续图片</span></div>
+        <span>所有正式角色统一4张候选；每名角色用同一份首次登场基础定妆提示词随机生成，不展示后续换装、淋湿或伤情；跑龙套/背景路人不做独立设定；全部定版后才生成后续图片</span></div>
       <button class="primary" onclick="location.hash='#/episode/${e.id}'">去选人物/道具 →</button>
     </div>`).join("") + awaiting.map((e) => `
     <div class="progress-card confirm">
@@ -7452,10 +7452,11 @@ const CANVAS_SHOTS_TOP = 2240;
 
 function castLookHtml(candidate) {
   const look = candidate.look_variant;
-  const valid = candidate.variant_source !== "legacy"
+  const valid = candidate.current_candidate_policy !== false
+    && candidate.variant_source !== "legacy"
     && candidate.variant_label && look && typeof look === "object";
   if (!valid) return `<div class="cast-look legacy">
-    <b>历史候选</b><span>未记录候选差异轴；建议按本剧唯一画风规则重新生成后再比较。</span>
+    <b>旧规则候选</b><span>这张图可能含不同剧情阶段造型，已退出当前四选一；续跑后会生成同一初始提示词的新候选。</span>
   </div>`;
   const rows = [
     ["服装", look.costume], ["发型", look.hair],
@@ -7506,14 +7507,14 @@ function renderCastSelection(data, episodeId) {
       ? "已选择简化版：人工豁免三视图门禁，不生成独立正侧背和细节图"
       : "已选择完整版：生成视觉DNA、三视图审核板及独立高清正侧背母资产");
   const policy = selection.candidate_policy
-    || "主角、重要配角和普通配角统一4张候选；跑龙套/背景路人不做独立设定、不生成候选图或立绘";
+    || "每名正式角色统一4张候选；四张复用同一份首次登场基础定妆提示词，只靠模型随机采样";
   app.innerHTML = `<div class="canvas-view cast-select-view">
     <div class="confirm-banner">
       <div><b>先定人物和核心道具，再生产后续图片 👤</b>
         <span>${esc(policy)}；${esc(selection.prop_candidate_policy || "核心道具统一4张候选并人工定版")}。有参考图时人物脸和发型是最高标准，职业角色必须穿工作服；人物候选统一使用纯背景，不得出现文字或场景。
         每名正式角色先从剧情推导视觉DNA并与全剧角色去重，再统一生成4张同一画风下的候选图；
-        所有候选继承本剧唯一画风，不提供多个画风选项，只比较人物身份、表情、轻微姿态和剧情造型细节，
-        请各选1张作为最终立绘。
+        同一人物4张图复用同一份经过Codex审核优化的初始状态最终提示词，只靠图片模型随机采样比较人物形象；
+        不得换装、换妆、换动作，也不得带入官服、淋湿、泥污、受伤、死亡等后续剧情状态。请各选1张作为最终立绘。
         定版后完整版会生成面部、正面、严格90°侧面和完整180°背面独立母资产；
         16:9三视图拼板只用于审核，不作为正式镜头参考。
         后续关键帧、首尾帧和其他图片 API 都会真实携带这张参考图，
@@ -7552,9 +7553,10 @@ function renderCastSelection(data, episodeId) {
           <strong class="${character.candidate_target === 0 ? "cast-locked" : (character.locked ? "cast-locked" : "cast-unlocked")}">
             ${character.candidate_target === 0 ? "无需单独立绘" : (character.locked ? "✓ 已锁定最终立绘" : "请选择1张")}</strong></div>
         ${castVisualDnaHtml(character)}
-        <div class="cast-candidate-grid" role="list" aria-label="${esc(character.character)}的造型候选">${(character.candidates || []).map((candidate) => {
-          const variant = candidate.variant_source === "legacy" || !candidate.variant_label
-            ? "历史候选" : candidate.variant_label;
+        <div class="cast-candidate-grid" role="list" aria-label="${esc(character.character)}的初始人物候选">${(character.candidates || []).map((candidate) => {
+          const outdated = candidate.current_candidate_policy === false
+            || candidate.variant_source === "legacy" || !candidate.variant_label;
+          const variant = outdated ? "旧规则候选" : candidate.variant_label;
           const title = `${character.character} · 候选${candidate.index} · ${variant}`;
           return `<article class="cast-candidate${candidate.selected ? " selected" : ""}" role="listitem">
             <button type="button" class="cast-image" data-full="${esc(candidate.url || "")}" data-title="${esc(title)}" aria-label="查看${esc(title)}大图">
@@ -7565,8 +7567,8 @@ function renderCastSelection(data, episodeId) {
               ${castLookHtml(candidate)}
               <button type="button" class="${candidate.selected ? "selected" : "primary"} cast-pick"
                 data-character="${esc(character.character)}" data-index="${candidate.index}"
-                aria-pressed="${candidate.selected ? "true" : "false"}" ${candidate.selected ? "disabled" : ""}>
-                ${candidate.selected ? "✓ 当前最终立绘" : "选定这套造型"}</button></div>
+                aria-pressed="${candidate.selected ? "true" : "false"}" ${(candidate.selected || outdated) ? "disabled" : ""}>
+                ${candidate.selected ? "✓ 当前最终立绘" : (outdated ? "等待新规则候选" : "选定这张")}</button></div>
           </article>`;
         }).join("")}</div>
       </section>`).join("")}</div>
