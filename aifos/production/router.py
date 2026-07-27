@@ -348,6 +348,11 @@ class ProviderRouter:
                 "must_keep_verbatim 中的每一项都是下游合同逐字校验的"
                 "不可变事实,优化稿必须原样保留(可另加修饰,但不得改写、"
                 "缩写、拆分或删除);删除任何一项都会导致整张图被拒绝生成"),
+            "count_policy": (
+                "人数是逐字校验的决定性事实:优化稿必须保留一句明确的"
+                "人数字面表述——0人写「空镜/画面中不出现人物」,1人写"
+                "「单人/1名人物」,N人写「共N人」;不得改写成只有具体"
+                "人名或隐含表达,否则整张图被拒绝生成"),
             "adjudication": prompt_adjudication_clause(),
         }
 
@@ -388,8 +393,13 @@ class ProviderRouter:
                         tokens.append(value.strip())
         return list(dict.fromkeys(token for token in tokens if token))
 
-    @staticmethod
-    def _prompt_review_count_preserved(optimized, payload):
+    # 中文数字与阿拉伯数字都算数——审核优化稿写「两名人物」不等于
+    # 丢了人数事实。
+    _CN_NUM = {1: "一", 2: "两", 3: "三", 4: "四", 5: "五",
+               6: "六", 7: "七", 8: "八", 9: "九", 10: "十"}
+
+    @classmethod
+    def _prompt_review_count_preserved(cls, optimized, payload):
         count = payload.get("character_count")
         if type(count) is not int or count < 0:
             return True
@@ -401,13 +411,21 @@ class ProviderRouter:
             and item.get("count") > 0)
         expected = count + functional
         if expected == 0:
-            return "无人" in optimized or bool(re.search(r"0\s*人", optimized))
+            return any(token in optimized for token in (
+                "无人", "空镜", "不出现人物", "无人物",
+                "不出现任何人")) or bool(re.search(r"0\s*人", optimized))
         if expected == 1 and any(
                 token in optimized for token in (
-                    "单人", "一人", "一名人物", "一个人")):
+                    "单人", "一人", "一名人物", "一个人", "单一人物",
+                    "单一角色", "同一角色", "一名角色", "单名人物")):
             return True
+        numerals = str(expected)
+        cn = cls._CN_NUM.get(expected)
+        if cn:
+            numerals = f"(?:{expected}|{cn})"
         return bool(re.search(
-            rf"(?<!\d){expected}\s*(?:人|名人物|个人)(?!\d)", optimized))
+            rf"(?<!\d){numerals}\s*(?:人|名人物|个人|名角色|位人物|位角色)"
+            r"(?!\d)", optimized))
 
     def review_image_prompt(self, capability, payload, out_dir, cancel=None):
         """用 Codex 审核并优化真实出图前的最终提示词，原地冻结优化稿。

@@ -94,3 +94,32 @@ def test_reviewer_instruction_renders_adjudication_block():
     assert "【冲突裁决规则】" in instruction
     assert "同级互斥" in instruction          # 只有同级才允许阻断
     assert "用户已锁定" in instruction        # 最高级在场
+
+
+# ---- 人数校验:语义等价表述不算丢失,只有人名不算人数 ----
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize("optimized, count, ok", [
+    ("同一角色完整全身正面、严格90度侧面、完整180度背面", 1, True),
+    ("单人全身正面自然站姿", 1, True),
+    ("空镜:环境建立镜头,预留表演动线", 0, True),
+    ("画面中不出现人物", 0, True),
+    ("两名人物对峙于长街", 2, True),
+    ("三位人物围坐", 3, True),
+    ("严格共3人", 3, True),
+    ("林川与阿砚在房内", 2, False),   # 只有人名 → 人数事实仍算丢失
+])
+def test_count_preservation_accepts_semantic_equivalents(
+        optimized, count, ok):
+    from aifos.production.router import ProviderRouter
+    assert ProviderRouter._prompt_review_count_preserved(
+        optimized, {"character_count": count}) is ok
+
+
+def test_review_payload_carries_count_policy():
+    from aifos.production.router import ProviderRouter
+    router = ProviderRouter.__new__(ProviderRouter)
+    review = router._build_review_payload("p", {}, {"character_count": 1})
+    assert "人数" in review["count_policy"]
+    assert "空镜" in review["count_policy"]
