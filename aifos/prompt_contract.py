@@ -1462,11 +1462,13 @@ def _character_condition_map(
                 if start_signature == end_signature:
                     actor_conditions["freeze"] = dict(end_condition)
                 else:
+                    # 编剧未显式声明定格状态时,按静帧的默认电影语义
+                    # 承接"动作完成态"(end);带 derived 溯源标记供审计,
+                    # 不再作为阻断性缺陷——漏写的机械默认可本地补齐,
+                    # 显式声明(上方分支)永远优先。
                     actor_conditions["freeze"] = {
                         **dict(end_condition),
-                        "issues": [
-                            "start/end condition 不同，phase=freeze 必须显式"
-                            "声明 character_conditions.freeze"],
+                        "derived_from": "end_condition",
                     }
         output[_text(name)] = actor_conditions
     return output

@@ -134,3 +134,25 @@ def test_aspect_tokens_stripped_from_camera_and_precedence_declared():
     for value in contract["camera"].values():
         assert "16:9" not in str(value)
     assert "唯一执行值" in contract["aspect_precedence"]
+
+
+def test_freeze_condition_derived_from_end_when_missing():
+    """start≠end 且未显式声明定格状态 → 按"动作完成态"承接 end,
+    带 derived_from 溯源,不再阻断(阿砚 freeze 冲突真实事故)。"""
+    from aifos.prompt_contract import compile_shot_prompt
+    shot = {"shot_no": 15, "scene_no": 3, "kind": "action",
+            "camera": "中景", "description": "阿砚收拾文书包",
+            "duration": 2.0, "characters": ["阿砚"], "dialogue": None,
+            "prompt": "p",
+            "frame_targets": {"keyframe": {"phase": "freeze",
+                                            "state": "阿砚半蹲收拾"}},
+            "start_state": {"阿砚": {"pose": "站立整理桌面"}},
+            "end_state": {"阿砚": {"pose": "半蹲合拢包袱"}}}
+    contract, _prompt = compile_shot_prompt(
+        shot, location="茶棚", mode="image")
+    freeze = contract["character_conditions"]["阿砚"]["freeze"]
+    # 定格状态存在且不携带任何阻断性 issue;合同级 issues 亦无 freeze 冲突
+    assert isinstance(freeze, dict)
+    assert not freeze.get("issues")
+    assert not any("freeze" in str(item)
+                   for item in contract.get("issues", []))
