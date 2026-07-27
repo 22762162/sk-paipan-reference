@@ -511,6 +511,13 @@ DETAIL_CHARACTER_SHEETS = [
 CHARACTER_SHEETS = CANONICAL_CHARACTER_SHEETS + DETAIL_CHARACTER_SHEETS
 CANONICAL_CHARACTER_SHEET_KEYS = ("closeup", "front", "profile", "back")
 
+# 这些设定表的合同硬性要求看清面部(清晰面部近景/底妆眉眼唇妆/五官
+# 特征拆解)。人物定版宣告「面部不可见(剪影)」时,两者同级互斥、
+# 审核只能熔断(《长夏记事》纱幕后人 makeup 表实案)——身份隐藏型
+# 角色的设定图套件必须按可见性裁剪,只保留轮廓/服装类母资产表。
+FACE_DEPENDENT_SHEET_KEYS = frozenset(
+    {"turnaround", "closeup", "features", "makeup"})
+
 CHARACTER_ASSET_POLICY_SCHEMA = "aifos.character-assets/v1"
 CHARACTER_ASSET_MODES = ("auto", "simple", "full")
 CHARACTER_ASSET_COMPLEXITY_TOKENS = (
@@ -2787,6 +2794,51 @@ class Director:
             if keyword in text:
                 return requirement
         return ""
+
+    @staticmethod
+    def character_face_hidden(design):
+        """人物定版宣告面部不可见(剪影/背光遮蔽)时为 True。
+
+        只看面部权威字段(visual_dna.face_structure 与 image_prompt 的
+        「脸部骨相」段),且只认「不可见/剪影」判词——「刘海遮挡额头」
+        这类普通描述不得误判。宁可漏判(照旧生成,审核兜底)不可误裁。
+        """
+        design = design if isinstance(design, dict) else {}
+        segments = []
+        dna = design.get("visual_dna")
+        if isinstance(dna, dict):
+            segments.append(str(dna.get("face_structure") or ""))
+        elif dna:
+            match = re.search(
+                r"face_structure[\"']?\s*[:：]\s*[\"']([^\"']+)", str(dna))
+            if match:
+                segments.append(match.group(1))
+        match = re.search(
+            r"脸部骨相[:：]([^;；]+)",
+            str(design.get("image_prompt") or ""))
+        if match:
+            segments.append(match.group(1))
+        text = "；".join(segments)
+        return ("不可见" in text) or ("剪影" in text)
+
+    def _sheet_suite_for(self, name, design, definitions):
+        """按人物面部可见性裁剪设定图套件。
+
+        面部不可见的角色生成妆容/面部特写表必然撞上「妆容无 vs 底妆
+        眉眼清晰」类同级互斥合同(熔断),只保留轮廓/服装类表。
+        """
+        if not definitions or not self.character_face_hidden(design):
+            return definitions
+        pruned = [row for row in definitions
+                  if row[0] not in FACE_DEPENDENT_SHEET_KEYS]
+        dropped = [row[1] for row in definitions
+                   if row[0] in FACE_DEPENDENT_SHEET_KEYS]
+        if dropped:
+            self.log.info(
+                "director",
+                f"{name} 定版为面部不可见(剪影),设定图套件裁剪:"
+                f"跳过 {'、'.join(dropped)},保留轮廓/服装类母资产")
+        return pruned
 
     def _sheet_prompt(self, name, role, style, label, desc, key=None,
                       design=None, locked_look=None):
@@ -7862,7 +7914,8 @@ class Director:
                  key=key, design=designs.get(c["name"]),
                  locked_look=locked_looks.get(c["name"]))}
             for c in characters
-            for key, label, desc in sheet_definitions])
+            for key, label, desc in self._sheet_suite_for(
+                c["name"], designs.get(c["name"]), sheet_definitions)])
         self._plan_seed(ctx, "scene_art", [
             {"id": f"scene:{loc}", "category": "scene_art",
              "label": loc, "name": loc,

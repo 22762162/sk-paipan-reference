@@ -24,8 +24,10 @@ from aifos.workflow import _camera_plan
 
 def test_scale_capacity_matches_geometry():
     # 容量与 SCALE_GEOMETRY 同源:特写肩线以下出画,装不下第二个人。
+    # 覆盖镜头词汇扩展后的全部收紧景别(中近景/七分身/膝上景)。
     assert CAMERA_SCALE_CAPACITY == {
-        "大特写": 1, "特写": 1, "近景": 2, "中景": 4}
+        "大特写": 1, "特写": 1, "近景": 2, "中近景": 2,
+        "七分身": 3, "中景": 4, "膝上景": 4}
     assert scale_capacity("全景") > 100
     assert scale_capacity("") > 100  # 未知景别不设限,宁可漏修不误改
 
@@ -226,3 +228,37 @@ def test_reconcile_reports_awaiting_human_shots_for_gate(app):
            "storyboard": storyboard}
     result = app.director.reconcile_completed_shot_images(ctx)
     assert result["awaiting_human_shots"] == sorted(gated)
+
+
+# ---------- 身份隐藏型角色:设定图套件按可见性裁剪 ----------
+
+def test_character_face_hidden_detection():
+    from aifos.director import Director
+    hidden_dict = {"visual_dna": {"face_structure": "背光剪影，面部处于阴影中不可见"}}
+    hidden_str = {"visual_dna": "{'face_structure': '纱幕遮挡，不可见（剪影无细节）', 'hair': 'x'}"}
+    hidden_prompt = {"image_prompt": "定妆母图：某人；脸部骨相：因背光剪影而完全不可见；发型轮廓：束发"}
+    # 普通遮挡描述(刘海遮额头)绝不能误判成身份隐藏。
+    normal = {"visual_dna": {"face_structure": "鹅蛋脸，刘海遮挡额头，双眼清晰"},
+              "image_prompt": "定妆母图：沈眉；脸部骨相：鹅蛋脸颧骨柔和；"}
+    assert Director.character_face_hidden(hidden_dict) is True
+    assert Director.character_face_hidden(hidden_str) is True
+    assert Director.character_face_hidden(hidden_prompt) is True
+    assert Director.character_face_hidden(normal) is False
+    assert Director.character_face_hidden(None) is False
+    assert Director.character_face_hidden({}) is False
+
+
+def test_sheet_suite_pruned_for_hidden_face(app):
+    from aifos.director import (
+        CHARACTER_SHEETS, FACE_DEPENDENT_SHEET_KEYS)
+    d = app.director
+    hidden = {"visual_dna": {"face_structure": "剪影，不可见"}}
+    pruned = d._sheet_suite_for("纱幕后人", hidden, CHARACTER_SHEETS)
+    kept = {row[0] for row in pruned}
+    assert kept.isdisjoint(FACE_DEPENDENT_SHEET_KEYS)
+    # 轮廓/服装类母资产必须保留——身份稳定仍然需要。
+    assert {"front", "profile", "back", "costume"} <= kept
+    # 可见面部角色套件原样不动。
+    normal = {"visual_dna": {"face_structure": "鹅蛋脸，双眼清晰"}}
+    assert d._sheet_suite_for("沈眉", normal, CHARACTER_SHEETS) \
+        == CHARACTER_SHEETS
