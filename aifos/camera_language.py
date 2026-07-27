@@ -67,17 +67,33 @@ def scene_view_for_camera(camera):
     return "main"
 
 
+# 顶拍(垂直向下)语境:机位词描述的是躯干朝向,不是面部可见性——
+# 「顶拍+正面」若同时断言"只见头顶"与"双眼可见",物理互斥必熔断。
+TOP_DOWN_POSITION_GEOMETRY = {
+    "正面": "顶拍语境:人物躯干腹面朝上、头在画面上方脚在下方的正躺/"
+            "仰面朝向;眼部判据不适用",
+    "背面": "顶拍语境:人物躯干背面朝上(俯卧/背对天空)的朝向;"
+            "不出现面部",
+    "侧面": "顶拍语境:人物侧躺或侧向站位,躯干长轴与画面一侧平行",
+    "过肩": "顶拍语境:前景近端为一人头顶与双肩,主体在其下方画面中",
+}
+
+
 def camera_geometry_clause(camera):
     """结构化镜头(dict,含 景别/角度/机位)→ 可核验几何条款。
 
     只翻译词典命中的术语;「按分镜」「保持轴线」等默认占位不产出
     条款。无任何命中返回空串,调用方按无此行处理。
+    角度=顶拍时,机位几何切换到躯干朝向语义,避免与"只见头顶"互斥。
     """
     camera = camera if isinstance(camera, dict) else {}
+    angle_value = str(camera.get("角度") or "").strip()
+    position_table = (TOP_DOWN_POSITION_GEOMETRY
+                      if angle_value == "顶拍" else POSITION_GEOMETRY)
     parts = []
     for field, table in (("景别", SCALE_GEOMETRY),
                          ("角度", ANGLE_GEOMETRY),
-                         ("机位", POSITION_GEOMETRY)):
+                         ("机位", position_table)):
         value = str(camera.get(field) or "").strip()
         rule = table.get(value)
         if rule:

@@ -87,3 +87,19 @@ def test_shot_contract_declares_camera_precedence():
     assert "唯一执行镜位" in contract["camera_precedence"]
     assert "不构成需要裁决的冲突" in contract["camera_precedence"]
     assert "唯一执行镜位(camera_precedence)" in prompt
+
+
+def test_top_down_position_geometry_avoids_facial_claims():
+    """顶拍+正面曾物理互斥熔断:「只见头顶」vs「双眼可见」。
+
+    顶拍语境的机位词描述躯干朝向,不得断言面部可见性;
+    平视/俯拍语境保持原眼部判据。
+    """
+    top = camera_geometry_clause(
+        {"景别": "近景", "角度": "顶拍", "机位": "正面"})
+    assert "双眼可见" not in top
+    assert "只见头顶" in top and "躯干腹面朝上" in top
+    level = camera_geometry_clause({"角度": "平视", "机位": "正面"})
+    assert "双眼可见" in level
+    high = camera_geometry_clause({"角度": "俯拍", "机位": "正面"})
+    assert "双眼可见" in high      # 俯拍非垂直,面部仍可见,两者兼容
