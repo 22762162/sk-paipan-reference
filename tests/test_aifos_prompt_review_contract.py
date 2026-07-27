@@ -123,3 +123,11 @@ def test_review_payload_carries_count_policy():
     review = router._build_review_payload("p", {}, {"character_count": 1})
     assert "人数" in review["count_policy"]
     assert "空镜" in review["count_policy"]
+
+
+def test_contract_checked_markers_are_required_verbatim():
+    """下游合同点名的结构标记(【质检同源合同】)必须整块保留。"""
+    source = "【CANONICAL FRONT】全身正面…【质检同源合同】皮肤质感自然"
+    tokens = required(source, {"characters": ["林川"]})
+    assert "【质检同源合同】" in tokens
+    assert "【质检同源合同】" not in required("普通场景图", {})

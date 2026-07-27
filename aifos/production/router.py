@@ -377,6 +377,12 @@ class ProviderRouter:
         tokens.extend(
             str(value).strip() for value in readable.get("whitelist") or []
             if str(value).strip())
+        # 下游派发合同逐字校验的结构标记:出现在原稿里就必须整块保留。
+        # 「结构标题可由审核去掉」不适用于这些被合同点名的标记——
+        # 删掉【质检同源合同】会直接判"未携带质检同源合同"并卡死。
+        for marker in ("【质检同源合同】",):
+            if marker in source:
+                tokens.append(marker)
         # 服装/头饰是最容易被“优化”误删的镜头事实；若已有明确状态，
         # 优化稿必须继续逐字携带。结构标题和版本号属于审计元数据，可由
         # Codex去掉，真正的参考图职责仍由独立reference_manifest传输。
