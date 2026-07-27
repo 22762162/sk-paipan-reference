@@ -135,6 +135,12 @@ def test_background_extra_carries_a_generic_wardrobe_state():
         "appearance_state_required": True,
         "start_state": {"站台路人": state},
         "end_state": {"站台路人": state},
+        # v2.2 起静态图必须显式声明单一定格,不再从描述回退。
+        "frame_target": {
+            "phase": "end",
+            "state": "站台路人侧身贴立柱，通道已让开",
+            "fallback": False,
+        },
     }
     contract, _prompt = compile_shot_prompt(shot, location="车站")
     assert validate_shot_prompt_contract(contract)["passed"]

@@ -239,6 +239,9 @@ def test_scene_candidate_passes_the_dispatch_contract(app):
             "art_name": f"{location}_candidate_01",
             "characters": [], "location": location,
             "prompt": item["prompt"], "shot_no": 0,
+            # 派发合同同时要求提示词已过 Codex 审核;本用例只校验对象名
+            # 解析,审核环节用已通过的结论占位。
+            "prompt_review": {"approved": True, "status": "approved"},
         },
     }
     contract = app.director._build_dispatch_contract(task, item)

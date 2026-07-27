@@ -462,7 +462,9 @@ def test_old_story_state_candidate_is_kept_as_history_but_not_reused(app):
     second = app.director.produce(
         title, 1, pause_for_confirm=True)
 
-    assert second["status"] == "awaiting_cast"
+    # 旧剧情态候选不被复用 → 整组重画;新候选由 CODEX 评选自动确认,
+    # 因此这里不再停在人工四选一,而是直接走到开拍门禁。
+    assert second["status"] == "awaiting_confirm"
     history = app.assets.history(
         project["id"], "character_candidate", f"{name}:01")
     assert len(history) == 2

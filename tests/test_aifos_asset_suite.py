@@ -258,7 +258,10 @@ def test_background_extra_dialogue_does_not_block_the_episode(app):
         "project_title": "路人台词", "episode_number": 1,
         "episode_title": "车站", "logline": "线索在车站",
         "characters": [
-            {"name": "林昭", "role": "主角"},
+            # 出图前必须先有性别与年龄段(不得由参考图代替身份事实);
+            # 背景路人不建人物母资产，因此不受这道门禁约束。
+            {"name": "林昭", "role": "主角",
+             "species": "人类", "gender": "男", "age_range": "24岁"},
             {"name": "站台路人", "role": "背景路人"},
         ],
         "scenes": [{

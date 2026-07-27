@@ -8707,11 +8707,24 @@ class Director:
             for item in (ctx.get("script") or {}).get("characters", [])
             if isinstance(item, dict) and item.get("name")
         }
+        # 背景路人不建人物母资产,剧本里也通常不写性别年龄,但逐镜身份
+        # 合同要求每个登记出场人物都明确这两项。连续性圣经已经为路人
+        # 确定性地定下并记录了具体值(见 build_continuity_bible),这里把
+        # 它作为兜底事实源接上,避免整集卡在关键帧。
+        continuity_profiles = {
+            item.get("name"): item
+            for item in (ctx.get("continuity") or {}).get("characters", [])
+            if isinstance(item, dict) and item.get("name")
+            and item.get("background_role")
+        }
         result = {}
         for name in shot.get("characters", []) or []:
             merged = {
+                **continuity_profiles.get(name, {}),
                 **(self._character_design(project_id, name) or {}),
-                **script_profiles.get(name, {}),
+                **{key: value
+                   for key, value in script_profiles.get(name, {}).items()
+                   if value not in (None, "", [], {})},
                 **self._locked_look_variant(project_id, name),
             }
             # Identity is locked by the final portrait. The selected candidate
