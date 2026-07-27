@@ -337,11 +337,13 @@ class ProviderRouter:
             if str(name).strip())
         for value in (
                 payload.get("title"), payload.get("art_name"),
-                payload.get("location")):
+                payload.get("prop_name"), payload.get("location")):
             value = str(value or "").strip()
             # 标题、资产文件名等调度元数据不一定是画面事实。只有原始
             # 提示词明确写入时才要求优化稿逐字保留，避免把
             # ``林川_candidate_01`` 之类内部文件名塞进生图提示词。
+            # prop_name 必须在列:下游派发合同逐字校验道具名,漏掉它
+            # 会让优化稿把「旧靛青举人青袍」改写成「青袍」后卡死。
             if value and value in source:
                 tokens.append(value)
         readable = payload.get("readable_text") or {}
@@ -440,10 +442,19 @@ class ProviderRouter:
         if not ok:
             raise ProviderUnavailable(
                 "真实图片已被阻止：Codex提示词审核不可用：" + reason)
+        # 下游派发合同会逐字校验这些词。此前审核从未被告知它们不可
+        # 改写,于是把「旧靛青举人青袍」优化成「青袍」,合同随即判定
+        # "提示词没有明确写出对象"并卡死——先说清楚,再校验。
+        required_tokens = self._prompt_review_required_tokens(source, payload)
         review_payload = {
             "review_schema": self.PROMPT_REVIEW_SCHEMA,
             "review_prompt": source,
             "review_context": context,
+            "must_keep_verbatim": required_tokens,
+            "must_keep_policy": (
+                "must_keep_verbatim 中的每一项都是下游合同逐字校验的"
+                "不可变事实,优化稿必须原样保留(可另加修饰,但不得改写、"
+                "缩写、拆分或删除);删除任何一项都会导致整张图被拒绝生成"),
         }
         profile_id = str(
             payload.get("_prompt_review_profile")
