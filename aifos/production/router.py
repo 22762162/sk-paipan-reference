@@ -391,6 +391,16 @@ class ProviderRouter:
         for marker in ("【质检同源合同】",):
             if marker in source:
                 tokens.append(marker)
+        # 排除性约束(「严禁/不得出现X」)是审词最爱删的一类:它读起来
+        # 像冗余负面词,删掉却直接放走画面事实。《长夏记事》纱幕后人
+        # 实案——原稿写明"严禁用面纱/帷帽/兜帽等实体遮蔽物实现面部
+        # 不可见",优化稿整段丢弃,四张候选全把纱披到人物头上。
+        # 只收句子级排除条款,不收零散否定词,避免把整篇写死。
+        for match in re.finditer(
+                r"(?:严禁|绝不|不得|禁止)[^。；\n]{6,80}", source):
+            clause = match.group(0).strip()
+            if clause:
+                tokens.append(clause)
         # 服装/头饰是最容易被“优化”误删的镜头事实；若已有明确状态，
         # 优化稿必须继续逐字携带。结构标题和版本号属于审计元数据，可由
         # Codex去掉，真正的参考图职责仍由独立reference_manifest传输。

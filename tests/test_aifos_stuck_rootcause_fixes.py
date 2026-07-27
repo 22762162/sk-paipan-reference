@@ -262,3 +262,31 @@ def test_sheet_suite_pruned_for_hidden_face(app):
     normal = {"visual_dna": {"face_structure": "鹅蛋脸，双眼清晰"}}
     assert d._sheet_suite_for("沈眉", normal, CHARACTER_SHEETS) \
         == CHARACTER_SHEETS
+
+
+# ---------- 排除性约束必须逐字幸存审词 ----------
+
+def test_exclusion_clauses_are_required_verbatim():
+    """「严禁用实体遮蔽物」类条款被审词删掉 = 画面事实被放走。"""
+    from aifos.production.router import ProviderRouter
+    source = (
+        "单人角色定妆母图：纱幕后人；面部处于阴影中不可见。"
+        "严禁用任何实体遮蔽物实现：不得有面纱、头纱、帷帽、兜帽覆盖头面部；"
+        "全身正面自然站姿，纯净中性深色棚拍背景。")
+    tokens = ProviderRouter._prompt_review_required_tokens(
+        source, {"characters": ["纱幕后人"]})
+    joined = "；".join(tokens)
+    assert "纱幕后人" in tokens
+    assert "严禁用任何实体遮蔽物实现" in joined
+    assert "不得有面纱、头纱、帷帽、兜帽覆盖头面部" in joined
+
+
+def test_exclusion_capture_does_not_swallow_whole_prompt():
+    """只收句子级排除条款,不把整篇写死(否则审词无法做任何优化)。"""
+    from aifos.production.router import ProviderRouter
+    source = "人物站立。不得漂浮。严禁出现现代装备与电子设备在画面里。"
+    tokens = ProviderRouter._prompt_review_required_tokens(source, {})
+    # 「不得漂浮」太短(<6字)不收,长条款收。
+    assert not any(t == "不得漂浮" for t in tokens)
+    assert any("严禁出现现代装备" in t for t in tokens)
+    assert all(len(t) <= 90 for t in tokens)
