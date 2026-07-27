@@ -142,3 +142,26 @@ def test_frame_phase_pairs_backfilled_locally():
     s3 = sb["shots"][1]["frame_props"]
     assert {r["phase"] for r in s3} == {"freeze", "start", "end"}
     assert len(sb["shots"][2]["frame_props"]) == 2   # 未回填
+
+
+def test_synthesized_beat_shots_inherit_scene_event_id():
+    """节拍镜是 workflow 合成的,必须继承剧本场次稳定事件号。
+
+    否则前置校验以「scene_event_id 与剧本稳定事件不一致」拦下整份
+    分镜(《雨夜凶杀》镜头5/13/19 的真实事故)。
+    """
+    from aifos.workflow import _append_performance_beats
+    script = {"scenes": [{
+        "scene_no": 1, "event_id": "YYXS-E01-S01-SHELTER",
+        "characters": ["林川"], "location": "屋檐下",
+        "lines": [{"character": "林川", "dialogue": "雨太大了。"}]}]}
+    shots = [{"shot_no": 1, "scene_no": 1, "kind": "dialogue",
+              "description": "林川躲雨", "camera": "中景",
+              "duration": 3.0, "characters": ["林川"],
+              "dialogue": {"character": "林川", "dialogue": "雨太大了。"},
+              "prompt": "p"}]
+    out = _append_performance_beats(shots, script)
+    beats = [s for s in out if s.get("kind") == "beat"]
+    assert beats, "应生成场末节拍镜"
+    for beat in beats:
+        assert beat.get("scene_event_id") == "YYXS-E01-S01-SHELTER"

@@ -1277,6 +1277,11 @@ def _append_performance_beats(raw_shots, script, rules=None):
                 "情绪停在本场余波最清晰的单一表情")
             out.append({
                 "scene_no": scene_no,
+                # 节拍镜是本函数合成的,不经编剧桥的场次事件映射;
+                # 必须在此继承剧本场次的稳定事件号,否则前置校验会以
+                # "scene_event_id 与剧本稳定事件不一致"拦下整份分镜。
+                "scene_event_id": str(
+                    scene.get("event_id") or f"scene:{scene_no}"),
                 "kind": "beat",
                 "description": f"{lead[0]}用呼吸、眼神和细微肢体完成本场情绪余波",
                 "camera": "特写定镜",
