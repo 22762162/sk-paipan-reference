@@ -220,3 +220,27 @@ def test_camera_precedence_covers_orientation_visibility():
     assert "被机位背向的面部表情" in clause
     assert "以机位为准" in clause
     assert "不构成需要裁决的冲突" in clause
+
+
+def test_scale_visibility_tiering_in_contract_and_qc():
+    """尺度可辨性:远景分辨不出刀刃缺口——微细节按景别分级免验,
+    道具在场性/大形态/持有人任何景别必验(用户拍板的裁决)。"""
+    from aifos.prompt_contract import compile_shot_prompt
+    shot = {"shot_no": 6, "scene_no": 2, "kind": "environment",
+            "camera": "远景", "description": "雨夜长街全景",
+            "duration": 3, "characters": ["黑衣人"], "dialogue": None,
+            "prompt": "p"}
+    contract, _prompt = compile_shot_prompt(
+        shot, location="长街", mode="image")
+    clause = contract["camera_precedence"]
+    assert "低于本景别物理可辨尺度的微细节" in clause
+    assert "刃口缺口" in clause
+    assert "在场性、大形态、颜色系与持有人" in clause   # 不在免验之列
+
+    from aifos.adapters.claude_script import build_qc_prompt
+    base = {"image_uri": "/tmp/x.png", "characters": ["黑衣人"],
+            "identity_references": []}
+    far = build_qc_prompt({**base, "camera": "远景·俯拍"})
+    assert "不得作为不合格理由" in far
+    close = build_qc_prompt({**base, "camera": "特写"})
+    assert "必须核验一致" in close
