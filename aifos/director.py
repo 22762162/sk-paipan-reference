@@ -1014,15 +1014,20 @@ class Director:
         self.projects.add_episode_cost(ctx["episode"]["id"], result.cost)
         return result
 
-    def _review_image_tasks(self, ctx, tasks):
-        """并行审核提示词；显式同词组只审核一次并复用同一优化稿。"""
+    def _review_image_tasks(self, ctx, tasks, continue_on_block=False):
+        """并行审核提示词；显式同词组只审核一次并复用同一优化稿。
+
+        continue_on_block=True(关键帧批次)时,审核熔断的镜头不再一镜
+        报废整批:先交编剧就地修镜头(只许改景别/取景表述)后复检一次,
+        仍熔断才隔离为 awaiting_human 并继续其余镜头。返回被隔离的
+        [(task, exc)] 列表,供调用方并入待人工清单。"""
         review_tasks = [
             task for task in tasks
             if task.get("capability") in ("image", "frames", "cover")
             and isinstance(task.get("payload"), dict)
         ]
         if not review_tasks:
-            return
+            return []
         groups = {}
         for task in review_tasks:
             payload = task["payload"]
@@ -1067,16 +1072,66 @@ class Director:
                 ctx["out_root"] / task["sub_dir"], cancel=cancel)
 
         completed = []
+        blocked_groups = []
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            futures = [pool.submit(review_one, group)
-                       for group in review_groups]
+            futures = {pool.submit(review_one, group): group
+                       for group in review_groups}
             for future in as_completed(futures):
+                group = futures[future]
                 try:
                     completed.append(future.result())
+                except ProviderError as exc:
+                    # 内容性熔断(同级事实互斥等)只隔离本镜,系统性故障
+                    # (ProviderUnavailable/超时)仍中止整批换人修。
+                    if (continue_on_block
+                            and len(group) == 1
+                            and "真实图片已被阻止" in str(exc)
+                            and str(group[0].get("item_id", "")
+                                    ).startswith("shot:")):
+                        blocked_groups.append((group, exc))
+                        continue
+                    for pending in futures:
+                        pending.cancel()
+                    raise
                 except Exception:
                     for pending in futures:
                         pending.cancel()
                     raise
+        quarantined = []
+        for group, exc in blocked_groups:
+            task = group[0]
+            reason = str(exc)
+            repaired_note = ""
+            try:
+                repaired_note = self._repair_blocked_prompt_shot(
+                    ctx, task, reason)
+            except Exception as repair_exc:
+                self.log.warn(
+                    "director",
+                    f"镜头{task['tag']}审核熔断,编剧就地修失败:"
+                    f"{str(repair_exc)[:300]}")
+            if repaired_note:
+                try:
+                    completed.append((group, self.router.review_image_prompt(
+                        task["capability"], task["payload"],
+                        ctx["out_root"] / task["sub_dir"], cancel=cancel)))
+                    self.log.info(
+                        "director",
+                        f"镜头{task['tag']}审核熔断已由编剧就地修复并复检"
+                        f"通过:{repaired_note[:200]}")
+                    continue
+                except ProviderError as exc2:
+                    reason = str(exc2)
+            for member in group:
+                self._plan_mark(
+                    ctx, member["item_id"], "awaiting_human",
+                    error=("提示词审核熔断(编剧就地修1次后仍未通过,"
+                           "待人工修改镜头): " + reason)[:300])
+                quarantined.append((member, ProviderError(reason)))
+            self.log.warn(
+                "director",
+                f"镜头{task['tag']}提示词审核熔断,已隔离待人工,"
+                f"其余镜头继续: {reason[:200]}")
         reviewed = 0
         for group, result in completed:
             source_payload = group[0]["payload"]
@@ -1120,6 +1175,54 @@ class Director:
                 f"Codex提示词审核优化完成:{reviewed}/{len(review_groups)}组，"
                 f"覆盖{len(review_tasks)}张图；同词组复用同一优化稿后进入"
                 "图片生成")
+        return quarantined
+
+    def _repair_blocked_prompt_shot(self, ctx, task, blocking_reason):
+        """审核熔断镜头的编剧就地修:只改景别/取景表述,存回分镜文档。
+
+        用户铁律「出错就地修改而不是换其他通道」在镜头合同层的落地:
+        熔断说明镜头自身几何互斥(如85mm特写却要求三人三区域同框),
+        resume 撞同一份坏数据只会原地熔断。修复后重建 payload 与
+        qc_spec,返回修复摘要;任何失败抛异常由调用方隔离该镜。"""
+        shot_no = int(task["tag"])
+        shot = next(
+            s for s in ctx["storyboard"]["shots"]
+            if int(s.get("shot_no", -1)) == shot_no)
+        result = self._call(ctx, "script", {
+            "shot_repair": True,
+            "project_title": ctx["project"]["title"],
+            "style": ctx["project"].get("style", "") or "",
+            "shot": shot,
+            "location": self._shot_location(ctx.get("script"), shot),
+            "blocking_reason": str(blocking_reason)[:2000],
+        }, "storyboard")
+        data = result.data or {}
+        camera = data.get("camera")
+        if isinstance(shot.get("camera"), dict):
+            if isinstance(camera, dict) and camera:
+                shot["camera"] = camera
+        elif str(camera or "").strip():
+            shot["camera"] = (
+                camera if isinstance(camera, str) else str(camera))
+        description = str(data.get("description") or "").strip()
+        if description:
+            shot["description"] = description
+        summary = str(data.get("repair_summary") or "").strip() or "已修复"
+        shot["prompt_block_repair"] = {
+            "blocking_reason": str(blocking_reason)[:600],
+            "repair_summary": summary[:300],
+            "repaired_at": now(),
+        }
+        self.projects.save_document(
+            ctx["episode"]["id"], "storyboard", ctx["storyboard"])
+        payload = self._shot_payload(ctx, shot)
+        for key in ("_codex_profile", "_prompt_review_profile"):
+            if task["payload"].get(key):
+                payload[key] = task["payload"][key]
+        task["payload"] = payload
+        if task.get("qc_spec"):
+            task["qc_spec"] = self._shot_qc_spec(ctx, payload)
+        return summary
 
     def _plan_read_status(self, ctx, item_id):
         """读取清单状态；提示词审核写审计信息时不得改变生产状态。"""
@@ -4951,7 +5054,13 @@ class Director:
         self._assign_codex_profiles(tasks)
         # 提示词审核必须发生在API加速合同和图片worker之前；否则清单记录
         # 的哈希仍是AIFOS原稿，实际出图却用了另一份输入。
-        self._review_image_tasks(ctx, tasks)
+        blocked = self._review_image_tasks(
+            ctx, tasks, continue_on_block=continue_on_qc_failure)
+        if blocked:
+            blocked_ids = {id(task) for task, _exc in blocked}
+            tasks = [t for t in tasks if id(t) not in blocked_ids]
+            if not tasks:
+                return ({}, list(blocked))
         self._prepare_dispatch_contracts(ctx, tasks)
         tasks = sorted(tasks, key=lambda task: (
             -int(task.get("priority", 0)), str(task.get("item_id", ""))))
@@ -4959,7 +5068,7 @@ class Director:
         # 单通道最多 8 路；A/B/C 三通道就合计最多 24 路。
         workers = self._total_image_workers()
         if workers == 1 or len(tasks) == 1:
-            out, qc_failures = {}, []
+            out, qc_failures = {}, list(blocked)
             for task in tasks:
                 result = self._run_one_task(
                     ctx, task,
@@ -4984,7 +5093,7 @@ class Director:
             "director",
             f"{line}并行开工:共 {len(tasks)} 张,{workers} 路同时生成")
         cancel = lambda: self._cancel_requested(ctx)   # noqa: E731
-        results, failures, qc_failures = {}, [], []
+        results, failures, qc_failures = {}, [], list(blocked)
         cancelled = False
         started_at = time.monotonic()
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -5338,10 +5447,55 @@ class Director:
                 + (10 if any(word in action for word in
                              ("走", "跑", "进入", "离开", "追")) else 0))
 
+    # ---- 场次跳过(暂不生成):单场跑通全流程的测试开关 ----
+    def _scene_plan_doc(self, ctx):
+        """episode 级场次生产计划文档:{"skipped_scenes": [2, 3]}。"""
+        if "scene_plan" not in ctx:
+            doc, _version = self.projects.latest_document(
+                ctx["episode"]["id"], "scene_plan")
+            ctx["scene_plan"] = doc or {}
+        return ctx["scene_plan"] or {}
+
+    def _skipped_scenes(self, ctx):
+        skipped = set()
+        for value in self._scene_plan_doc(ctx).get("skipped_scenes") or []:
+            try:
+                skipped.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return skipped
+
+    def _active_shots(self, ctx):
+        """扣除「暂不生成」场次后的镜头列表;分镜文档本身保持完整,
+        恢复该场后断点续写自然补齐。"""
+        shots = (ctx.get("storyboard") or {}).get("shots") or []
+        skipped = self._skipped_scenes(ctx)
+        if not skipped:
+            return shots
+        return [s for s in shots
+                if int(s.get("scene_no") or 0) not in skipped]
+
+    def _active_storyboard(self, ctx):
+        """给纯消费方(门禁/质检/内容复核/拆条)的过滤视图;
+        绝不能把这个视图存回 storyboard 文档。"""
+        storyboard = ctx.get("storyboard") or {}
+        skipped = self._skipped_scenes(ctx)
+        if not skipped:
+            return storyboard
+        return {**storyboard, "shots": self._active_shots(ctx)}
+
+    def _active_scenes(self, ctx):
+        scenes = (ctx.get("script") or {}).get("scenes") or []
+        skipped = self._skipped_scenes(ctx)
+        if not skipped:
+            return scenes
+        return [s for s in scenes
+                if int(s.get("scene_no") or 0) not in skipped]
+
     def _plan_seed_shots(self, ctx):
         """分镜确定后,把每个镜头的关键帧与首尾帧登记进清单。
         清单展示实际发送的当前镜头短合同，所见即所得。"""
-        shots = (ctx.get("storyboard") or {}).get("shots") or []
+        shots = self._active_shots(ctx)
         scene_counts = {}
         for shot in shots:
             scene_counts[shot.get("scene_no")] = (
@@ -7158,14 +7312,34 @@ class Director:
         all_characters = ctx["script"].get("characters", [])
         characters = [
             c for c in all_characters if character_candidate_target(c) > 0]
+        # 「暂不生成」场次:只出现在跳过场次的角色/场景不生成候选与
+        # 概念图(测试单场跑通时不浪费额度);恢复场次后续跑自动补齐。
+        active_scenes = self._active_scenes(ctx)
+        if self._skipped_scenes(ctx):
+            needed_names = set()
+            for scene in active_scenes:
+                needed_names.update(
+                    str(name).strip()
+                    for name in (scene.get("characters") or [])
+                    if str(name).strip())
+            if needed_names:
+                dropped = [c["name"] for c in characters
+                           if c["name"] not in needed_names]
+                if dropped:
+                    self.log.info(
+                        "director",
+                        "以下角色只出现在暂不生成的场次,本轮不出定妆: "
+                        + "、".join(dropped))
+                characters = [c for c in characters
+                              if c["name"] in needed_names]
         locations = []
         scene_context_by_location = {}
-        for scene in ctx["script"]["scenes"]:
+        for scene in active_scenes:
             if scene["location"] not in locations:
                 locations.append(scene["location"])
                 scene_context_by_location[scene["location"]] = dict(scene)
         location_reuse = {
-            location: sum(1 for scene in ctx["script"]["scenes"]
+            location: sum(1 for scene in active_scenes
                           if scene.get("location") == location)
             for location in locations
         }
@@ -9380,19 +9554,49 @@ class Director:
                 return True
         return False
 
+    def _shot_qc_spec(self, ctx, payload):
+        """关键帧质检规格;镜头被就地修复后必须用新 payload 重建,
+        否则质检仍按旧景别/旧构图判图。"""
+        return {**self._qc_spec(
+            ctx["project"]["id"],
+            payload.get("identity_characters",
+                        payload.get("characters", [])),
+            location=payload.get("location", ""),
+            action=payload.get("action", ""),
+            forbid=self._FORBID + ["字幕条"],
+            expected_characters=payload.get("characters", []),
+            expected_count=payload.get("visible_figure_count"),
+            character_background=payload.get("character_background", {}),
+            camera=payload.get("camera", ""),
+            composition_contract=payload.get("composition_contract"),
+            readable_text=payload.get("readable_text"),
+            physical_contract=payload.get("physical_contract"),
+            physical_logic_required=True,
+            era_exceptions=self._era_exceptions(ctx),
+            narrative_overlays=payload.get("narrative_overlays"),
+            functional_figures=payload.get("functional_figures"))}
+
     def _stage_images(self, ctx):
         self._plan_seed_shots(ctx)
         reconciliation = self.reconcile_completed_shot_images(ctx)
         # 生产画布:出图一开始就落盘人物/场景/镜头关系线,
         # 前端画布与出图/质检提示词共用,牵引人物关联性不漂移
         ctx["relations"] = write_relations(
-            ctx["out_root"], ctx.get("script"), ctx.get("storyboard"))
+            ctx["out_root"], ctx.get("script"),
+            self._active_storyboard(ctx))
         ctx["images"] = []
         reused = 0
         tasks = []
         quality_by_shot = {}
         seen_scenes = set()
-        for shot in ctx["storyboard"]["shots"]:
+        skipped_scenes = self._skipped_scenes(ctx)
+        if skipped_scenes:
+            self.log.info(
+                "director",
+                "场次暂不生成: 第"
+                + "、".join(str(v) for v in sorted(skipped_scenes))
+                + "场;本批只推进其余场次,恢复后断点续写自动补齐")
+        for shot in self._active_shots(ctx):
             scene_first = shot.get("scene_no") not in seen_scenes
             seen_scenes.add(shot.get("scene_no"))
             payload = self._shot_payload(ctx, shot)
@@ -9425,27 +9629,7 @@ class Director:
                 "payload": payload,
                 "sub_dir": "images", "tag": shot["shot_no"],
                 "priority": self._shot_priority(shot, scene_first),
-                "qc_spec": {**self._qc_spec(
-                    ctx["project"]["id"],
-                    payload.get("identity_characters", payload.get("characters", [])),
-                    location=payload.get("location", ""),
-                    action=payload.get("action", ""),
-                    forbid=self._FORBID + ["字幕条"],
-                    expected_characters=payload.get("characters", []),
-                    expected_count=payload.get("visible_figure_count"),
-                    character_background=payload.get(
-                        "character_background", {}),
-                    camera=payload.get("camera", ""),
-                    composition_contract=payload.get(
-                        "composition_contract"),
-                    readable_text=payload.get("readable_text"),
-                    physical_contract=payload.get("physical_contract"),
-                    physical_logic_required=True,
-                    era_exceptions=self._era_exceptions(ctx),
-                    narrative_overlays=payload.get(
-                        "narrative_overlays"),
-                    functional_figures=payload.get(
-                        "functional_figures"))}})
+                "qc_spec": self._shot_qc_spec(ctx, payload)})
         results, qc_failures = self._run_parallel(
             ctx, tasks, line="分镜画面",
             continue_on_qc_failure=True)
@@ -9467,13 +9651,14 @@ class Director:
             self.log.warn(
                 "director",
                 f"关键帧本批已完成其余 {len(results)} 张；"
-                f"{len(failed_shots)} 张二次质检仍未通过，"
-                "已隔离到待人工问题清单: "
+                f"{len(failed_shots)} 张仍未通过(二次质检失败或提示词"
+                "审核熔断)，已隔离到待人工问题清单: "
                 + "、".join(f"镜头{value}" for value in failed_shots))
             raise AifosError(
-                f"{len(failed_shots)} 张关键帧自动修图 1 次后仍未通过；"
-                "问题图已保留并列入待人工问题清单，其他关键帧已继续完成。"
-                "请点击问题项定位并手动修改后，从断点继续。"
+                f"{len(failed_shots)} 张关键帧经自动修复后仍未通过"
+                "(视觉质检失败或提示词审核熔断)；"
+                "问题项已列入待人工问题清单，其他关键帧已继续完成。"
+                "请点击问题项查看原因并手动修改后，从断点继续。"
                 "问题镜头: "
                 + "、".join(str(value) for value in failed_shots))
         return {
@@ -9495,6 +9680,20 @@ class Director:
         storyboard, manifest = lock_text_assets(
             ctx["storyboard"], images,
             ctx["production_profile"]["text_lock_provider"])
+        # 「暂不生成」场次的文字镜头没有关键帧,不能拖垮整集文字门;
+        # 分镜文档仍保存完整版,只在清单与判定里剔除跳过场次。
+        skipped_scenes = self._skipped_scenes(ctx)
+        if skipped_scenes:
+            scene_by_shot = {
+                s.get("shot_no"): int(s.get("scene_no") or 0)
+                for s in storyboard.get("shots", [])}
+            manifest["assets"] = [
+                asset for asset in manifest["assets"]
+                if scene_by_shot.get(asset.get("shot_no"))
+                not in skipped_scenes]
+            manifest["passed"] = all(
+                item["locked_by"] and item["keyframe_uri"]
+                for item in manifest["assets"])
         if storyboard != ctx["storyboard"]:
             sb_version = self.projects.save_document(
                 ctx["episode"]["id"], "storyboard", storyboard)
@@ -9522,7 +9721,7 @@ class Director:
                 ctx).get("items", [])
             if item.get("category") == "frames"}
         chains = {}
-        for shot in ctx["storyboard"]["shots"]:
+        for shot in self._active_shots(ctx):
             chains.setdefault(shot.get("scene_no"), []).append(shot)
         chain_list = list(chains.values())
         last_by_scene = {}
@@ -9678,7 +9877,7 @@ class Director:
     def _stage_preflight(self, ctx):
         """确认前硬门禁：任一项未过都不能消耗 Seedance 额度。"""
         report = build_preflight(
-            ctx["script"], ctx["storyboard"], ctx["continuity"],
+            ctx["script"], self._active_storyboard(ctx), ctx["continuity"],
             ctx["text_assets"], ctx["frames"], ctx["production_profile"],
             ctx.get("blocking"), ctx.get("quality_policy"), {
                 "policy": ctx.get("character_asset_policy") or {},
@@ -9702,7 +9901,7 @@ class Director:
         ctx["videos"] = []
         reused = 0
         pending = []
-        for shot in ctx["storyboard"]["shots"]:
+        for shot in self._active_shots(ctx):
             name = self._shot_name(ctx, shot["shot_no"])
             existing = self._existing_asset_uri(ctx, "video", name)
             if existing:
@@ -11695,7 +11894,7 @@ class Director:
     def _stage_qc(self, ctx):
         """自动检查 + 图文检查板 + 逐段内容复核 + 交付脚本。"""
         content_review = build_content_review(
-            ctx["script"], ctx["storyboard"], ctx["continuity"])
+            ctx["script"], self._active_storyboard(ctx), ctx["continuity"])
         content_path = ctx["out_root"] / "content_review.json"
         content_path.write_text(
             json.dumps(content_review, ensure_ascii=False, indent=2),
@@ -11720,7 +11919,8 @@ class Director:
         report = None
         video_qc = previous_video_qc
         for attempt in range(max_rounds):
-            report = self.qc.run(ctx["script"], ctx["storyboard"], ctx)
+            report = self.qc.run(
+                ctx["script"], self._active_storyboard(ctx), ctx)
             video_qc = self._build_video_qc_report(
                 ctx, report, previous=video_qc)
             self._save_video_qc_report(ctx, video_qc)
@@ -11883,7 +12083,7 @@ class Director:
         ctx["titles"] = self.ops.make_titles(
             ctx["script"], kind=ctx["project"]["kind"])
         ctx["clips"] = self.ops.make_clips(
-            ctx["storyboard"], ctx["out_root"] / "ops")
+            self._active_storyboard(ctx), ctx["out_root"] / "ops")
         project_id = ctx["project"]["id"]
         self.assets.register(
             project_id, "cover", ep_name, uri=ctx["cover_uri"])
@@ -13175,6 +13375,113 @@ class Director:
         return self.regenerate_character_candidates(
             project_title, episode_number, run_id=run_id,
             character_name=name)
+
+    def set_scene_generation(self, project_title, episode_number,
+                             scene_no, skip):
+        """场次「暂不生成/恢复生成」开关(单场跑通全流程的测试利器)。
+
+        只写 episode 级 scene_plan 文档;剧本、分镜、已产资产全部保留。
+        跳过的场次不进清单、不出图、不进门禁与质检;恢复后断点续写
+        自动补齐。生产运行中也允许切换,下次恢复生产时生效。"""
+        project, episode = self._episode_ctx(project_title, episode_number)
+        scene_no = int(scene_no)
+        script, _sv = self.projects.latest_document(episode["id"], "script")
+        scenes = (script or {}).get("scenes") or []
+        known = {int(s.get("scene_no") or 0) for s in scenes}
+        if scenes and scene_no not in known:
+            raise AifosError(f"第{scene_no}场不存在")
+        doc, _v = self.projects.latest_document(episode["id"], "scene_plan")
+        doc = dict(doc or {})
+        skipped = set()
+        for value in doc.get("skipped_scenes") or []:
+            try:
+                skipped.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        if skip:
+            skipped.add(scene_no)
+            if scenes and skipped >= known:
+                raise AifosError("不能跳过全部场次,至少保留一场")
+        else:
+            skipped.discard(scene_no)
+        doc["skipped_scenes"] = sorted(skipped)
+        self.projects.save_document(episode["id"], "scene_plan", doc)
+        self.log.info(
+            "director",
+            f"《{project_title}》第{episode_number}集 第{scene_no}场"
+            + ("标记为暂不生成" if skip else "恢复生成")
+            + (";当前跳过: 第"
+               + "、".join(str(v) for v in sorted(skipped)) + "场"
+               if skipped else ";当前无跳过场次"))
+        return {"skipped_scenes": sorted(skipped)}
+
+    def delete_scene(self, project_title, episode_number, scene_no):
+        """删除一场:剧本与分镜同步去场,关联镜头图片/首尾帧/视频软删,
+        连续性圣经因剧本版本变化在下次生产时自动按新剧本重建(线索同步)。
+
+        分镜文档就地去场并盖上新剧本版本号,保证其余场次的镜头号与
+        已产关键帧原样复用,不触发整份分镜重生成。"""
+        project, episode = self._episode_ctx(project_title, episode_number)
+        scene_no = int(scene_no)
+        script, _sv = self.projects.latest_document(episode["id"], "script")
+        if not script or not script.get("scenes"):
+            raise AifosError("本集还没有剧本,无场可删")
+        scenes = script["scenes"]
+        keep = [s for s in scenes if int(s.get("scene_no") or 0) != scene_no]
+        if len(keep) == len(scenes):
+            raise AifosError(f"第{scene_no}场不存在")
+        if not keep:
+            raise AifosError("不能删除最后一场;请改用「暂不生成」")
+        script["scenes"] = keep
+        new_script_version = self.projects.save_document(
+            episode["id"], "script", script)
+        removed_shots = []
+        storyboard, _bv = self.projects.latest_document(
+            episode["id"], "storyboard")
+        if storyboard and storyboard.get("shots"):
+            removed_shots = [
+                int(s.get("shot_no") or 0)
+                for s in storyboard["shots"]
+                if int(s.get("scene_no") or 0) == scene_no]
+            if removed_shots:
+                storyboard["shots"] = [
+                    s for s in storyboard["shots"]
+                    if int(s.get("scene_no") or 0) != scene_no]
+            # 盖新剧本版本号:其余镜头照常复用,不整份重生成
+            storyboard["script_version"] = new_script_version
+            self.projects.save_document(
+                episode["id"], "storyboard", storyboard)
+        # 关联产物软删(保留历史可追溯,精选视图与复用检索不再命中)
+        ep_prefix = f"e{episode['number']:03d}"
+        for shot_no in removed_shots:
+            shot_name = f"{ep_prefix}_shot{shot_no:03d}"
+            for kind in ("image", "frames", "video"):
+                try:
+                    if self.assets.latest(project["id"], kind, shot_name):
+                        self.assets.soft_delete(
+                            project["id"], kind, shot_name,
+                            meta={"deleted_reason":
+                                  f"删除第{scene_no}场级联"})
+                except Exception:
+                    continue
+        # 场次计划里同步清掉该场的跳过标记
+        plan_doc, _pv = self.projects.latest_document(
+            episode["id"], "scene_plan")
+        if plan_doc and plan_doc.get("skipped_scenes"):
+            cleaned = [v for v in plan_doc["skipped_scenes"]
+                       if int(v) != scene_no]
+            if cleaned != plan_doc["skipped_scenes"]:
+                plan_doc["skipped_scenes"] = cleaned
+                self.projects.save_document(
+                    episode["id"], "scene_plan", plan_doc)
+        self.log.info(
+            "director",
+            f"《{project_title}》第{episode_number}集 已删除第{scene_no}场;"
+            f"级联软删镜头 {len(removed_shots)} 个;"
+            "连续性圣经将于下次生产按新剧本自动重建")
+        return {"deleted_scene": scene_no,
+                "removed_shots": removed_shots,
+                "script_version": new_script_version}
 
     def regenerate_character_candidates(self, project_title, episode_number,
                                         run_id=None, character_name="",

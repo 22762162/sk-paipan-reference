@@ -451,6 +451,9 @@ class ClaudeApiProvider(Provider):
             elif capability == "script" and payload.get("prompt_refine"):
                 from ..adapters.claude_script import validate_prompt_refine
                 error = validate_prompt_refine(data)
+            elif capability == "script" and payload.get("shot_repair"):
+                from ..adapters.claude_script import validate_shot_repair
+                error = validate_shot_repair(data, payload)
             elif capability == "script" and payload.get("story_analysis"):
                 # 与 CLI 桥(claude_script.run)保持同一分支:制作圣经/剧本
                 # 自动分析的输出没有 scenes,必须用 story_analysis 校验器,
@@ -538,11 +541,14 @@ class OpenAIChatProvider(Provider):
 
     def _validate(self, capability, payload, data):
         from ..adapters.claude_script import (validate_image_qc,
-                                              validate_prompt_refine)
+                                              validate_prompt_refine,
+                                              validate_shot_repair)
         if capability == "image_qc":
             return validate_image_qc(data)
         if capability == "script" and payload.get("prompt_refine"):
             return validate_prompt_refine(data)
+        if capability == "script" and payload.get("shot_repair"):
+            return validate_shot_repair(data, payload)
         if capability == "script" and payload.get("story_analysis"):
             return validate_story_analysis(
                 data, require_resolved_identity=False)

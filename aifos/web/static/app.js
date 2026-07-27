@@ -2635,19 +2635,9 @@ function showScriptOverlay(data, episodeId) {
       <div class="script-character-profiles">${(script.characters || [])
         .map(characterProfileHtml).join("")}</div>
       ${corePropsHtml(script)}
-      ${script.scenes.map((s) => `
-        <section class="scene">
-          <div class="scene-head"><span class="scene-no">第 ${s.scene_no} 场</span>
-            <span class="scene-loc">${esc(s.location)}</span></div>
-          ${s.action ? `<p class="action">△ ${esc(s.action)}</p>` : ""}
-          ${(s.lines || []).map((l) => `
-            <div class="line-block">
-              <div class="speaker">${esc(l.character)}</div>
-              <div class="speech">${esc(l.dialogue)}
-                ${l.performance ? `<small class="performance-cue">表演：${esc(l.performance)}</small>` : ""}
-              </div>
-            </div>`).join("")}
-        </section>`).join("")}
+      ${scenesSectionsHtml(script, {
+        skipped: (data.scene_plan || {}).skipped_scenes,
+        episodeId: data.episode.id, manage: true })}
     </div>`;
   const close = () => { overlay.remove(); document.removeEventListener("keydown", onKey); };
   const onKey = (ev) => { if (ev.key === "Escape") close(); };
@@ -7508,32 +7498,31 @@ function renderCastSelection(data, episodeId) {
       : "已选择完整版：生成视觉DNA、三视图审核板及独立高清正侧背母资产");
   const policy = selection.candidate_policy
     || "每名正式角色统一4张候选；四张复用同一份首次登场基础定妆提示词，只靠模型随机采样";
+  const lockedCount = selection.asset_locked || 0;
+  const lockTotal = selection.asset_total || characters.length + props.length;
   app.innerHTML = `<div class="canvas-view cast-select-view">
-    <div class="confirm-banner">
-      <div><b>先定人物和核心道具，再生产后续图片 👤</b>
-        <span>${esc(policy)}；${esc(selection.prop_candidate_policy || "核心道具统一4张候选并人工定版")}。有参考图时人物脸和发型是最高标准，职业角色必须穿工作服；人物候选统一使用纯背景，不得出现文字或场景。
-        每名正式角色先从剧情推导视觉DNA并与全剧角色去重，再统一生成4张同一画风下的候选图；
-        同一人物4张图复用同一份经过Codex审核优化的初始状态最终提示词，只靠图片模型随机采样比较人物形象；
-        不得换装、换妆、换动作，也不得带入官服、淋湿、泥污、受伤、死亡等后续剧情状态。请各选1张作为最终立绘。
-        定版后完整版会生成面部、正面、严格90°侧面和完整180°背面独立母资产；
-        16:9三视图拼板只用于审核，不作为正式镜头参考。
-        后续关键帧、首尾帧和其他图片 API 都会真实携带这张参考图，
-        视觉质检也会将成图与它逐人比对。</span></div>
-        <div class="cast-asset-policy">
-          <label for="cast-asset-mode"><b>人物扩展资产</b>
-            <select id="cast-asset-mode">
-              <option value="auto" ${assetMode === "auto" ? "selected" : ""}>自动判断（推荐）</option>
-              <option value="simple" ${assetMode === "simple" ? "selected" : ""}>简化版 · 人工豁免三视图</option>
-              <option value="full" ${assetMode === "full" ? "selected" : ""}>完整版 · 视觉DNA与独立三视图母资产</option>
-            </select>
-          </label>
-          <span id="cast-asset-policy-status" class="dim" aria-live="polite">${esc(assetPolicyStatus)}</span>
-        </div>
-      <div class="cast-actions">
-        <button id="cast-regenerate" title="保留旧版本，为全部人物和核心道具各重生成4张">↻ 全部重生成4张</button>
-        <button class="primary" id="cast-continue" ${selection.passed ? "" : "disabled"}>
-          ${selection.passed ? "✅ 全部定版，继续预生产" : `已定版 ${selection.asset_locked || 0}/${selection.asset_total || characters.length + props.length}`}
-        </button>
+    <div class="confirm-banner cast-slim-banner">
+      <div><b>逐个点开大图对比，各选 1 张定版 👤</b>
+        <span>点候选图进入全屏对比：左右滑动看4张，底部一键选定。已定版 ${lockedCount}/${lockTotal}。</span>
+        <details class="cast-rules">
+          <summary>ℹ️ 定版规则与资产说明</summary>
+          <p>${esc(policy)}；${esc(selection.prop_candidate_policy || "核心道具统一4张候选并人工定版")}。有参考图时人物脸和发型是最高标准，职业角色必须穿工作服；人物候选统一使用纯背景，不得出现文字或场景。
+          同一人物4张图复用同一份经过Codex审核优化的初始状态最终提示词，只靠图片模型随机采样比较人物形象；
+          不得换装、换妆、换动作，也不得带入官服、淋湿、泥污、受伤、死亡等后续剧情状态。
+          定版后完整版会生成面部、正面、严格90°侧面和完整180°背面独立母资产；
+          16:9三视图拼板只用于审核。后续关键帧、首尾帧和其他图片 API 都会真实携带最终立绘，视觉质检逐人比对。</p>
+          <div class="cast-asset-policy">
+            <label for="cast-asset-mode"><b>人物扩展资产</b>
+              <select id="cast-asset-mode">
+                <option value="auto" ${assetMode === "auto" ? "selected" : ""}>自动判断（推荐）</option>
+                <option value="simple" ${assetMode === "simple" ? "selected" : ""}>简化版 · 人工豁免三视图</option>
+                <option value="full" ${assetMode === "full" ? "selected" : ""}>完整版 · 视觉DNA与独立三视图母资产</option>
+              </select>
+            </label>
+            <span id="cast-asset-policy-status" class="dim" aria-live="polite">${esc(assetPolicyStatus)}</span>
+          </div>
+          <button id="cast-regenerate" title="保留旧版本，为全部人物和核心道具各重生成4张">↻ 全部重生成4张</button>
+        </details>
       </div>
     </div>
     ${imageAccelerationLivebarHtml(data)}
@@ -7543,15 +7532,20 @@ function renderCastSelection(data, episodeId) {
       ${chip(data.episode.status)}<span class="spacer"></span>
       <button id="cast-script">📖 看剧本</button>
     </div>
-    ${productionLedgerHtml(data, { context: "cast" })}
+    <details class="asset-production-details cast-ledger-details">
+      <summary>📋 查看图片生产清单与进度</summary>
+      ${productionLedgerHtml(data, { context: "cast" })}
+    </details>
     <div class="cast-selection-list">${characters.map((character) => `
       <section class="cast-choice panel">
-        <div class="cast-choice-head"><div><h2>${esc(character.character)}</h2>
-          <span class="dim">${esc(character.role || "角色")} · ${character.candidate_count || 0}/${character.candidate_target || selection.candidate_target || 4} 张候选</span></div>
-          <button type="button" class="cast-regenerate-one" data-character="${esc(character.character)}">↻ 不满意，换4张</button>
-          <button type="button" class="cast-refine-one" data-character="${esc(character.character)}">✎ 提意见改形象</button>
+        <div class="cast-choice-head"><div><h2>${esc(character.character)}
           <strong class="${character.candidate_target === 0 ? "cast-locked" : (character.locked ? "cast-locked" : "cast-unlocked")}">
-            ${character.candidate_target === 0 ? "无需单独立绘" : (character.locked ? "✓ 已锁定最终立绘" : "请选择1张")}</strong></div>
+            ${character.candidate_target === 0 ? "无需单独立绘" : (character.locked ? "✓ 已定版" : "待选 1 张")}</strong></h2>
+          <span class="dim">${esc(character.role || "角色")} · ${character.candidate_count || 0}/${character.candidate_target || selection.candidate_target || 4} 张候选 · 点图放大对比</span></div>
+          <span class="cast-choice-tools">
+            <button type="button" class="cast-refine-one" data-character="${esc(character.character)}">✎ 提意见改形象</button>
+            <button type="button" class="cast-regenerate-one" data-character="${esc(character.character)}">↻ 换4张</button>
+          </span></div>
         ${castVisualDnaHtml(character)}
         <div class="cast-candidate-grid" role="list" aria-label="${esc(character.character)}的初始人物候选">${(character.candidates || []).map((candidate) => {
           const outdated = candidate.current_candidate_policy === false
@@ -7559,12 +7553,16 @@ function renderCastSelection(data, episodeId) {
           const variant = outdated ? "旧规则候选" : candidate.variant_label;
           const title = `${character.character} · 候选${candidate.index} · ${variant}`;
           return `<article class="cast-candidate${candidate.selected ? " selected" : ""}" role="listitem">
-            <button type="button" class="cast-image" data-full="${esc(candidate.url || "")}" data-title="${esc(title)}" aria-label="查看${esc(title)}大图">
+            <button type="button" class="cast-image cast-compare-open" data-kind="character"
+              data-name="${esc(character.character)}" data-start="${candidate.index}"
+              data-full="${esc(candidate.url || "")}" data-title="${esc(title)}" aria-label="全屏对比${esc(title)}">
               ${candidate.url ? `<img src="${esc(thumbUrl(candidate.url, 520))}" loading="lazy" alt="${esc(title)}">`
                 : `<span class="plan-thumb-empty">图片缺失</span>`}
+              ${candidate.selected ? `<span class="cast-selected-badge">✓ 最终立绘</span>` : ""}
             </button>
             <div class="cast-candidate-foot"><div class="cast-candidate-title"><span>候选 ${candidate.index}</span><b>${esc(variant)}</b></div>
-              ${castLookHtml(candidate)}
+              ${outdated ? castLookHtml(candidate)
+                : `<details class="cast-look-details"><summary>造型说明</summary>${castLookHtml(candidate)}</details>`}
               <button type="button" class="${candidate.selected ? "selected" : "primary"} cast-pick"
                 data-character="${esc(character.character)}" data-index="${candidate.index}"
                 aria-pressed="${candidate.selected ? "true" : "false"}" ${(candidate.selected || outdated) ? "disabled" : ""}>
@@ -7588,9 +7586,12 @@ function renderCastSelection(data, episodeId) {
           const variant = candidate.variant_label || `方案${candidate.index}`;
           const title = `${prop.prop} · 候选${candidate.index} · ${variant}`;
           return `<article class="cast-candidate${candidate.selected ? " selected" : ""}" role="listitem">
-            <button type="button" class="cast-image" data-full="${esc(candidate.url || "")}" data-title="${esc(title)}" aria-label="查看${esc(title)}大图">
+            <button type="button" class="cast-image cast-compare-open" data-kind="prop"
+              data-name="${esc(prop.prop)}" data-start="${candidate.index}"
+              data-full="${esc(candidate.url || "")}" data-title="${esc(title)}" aria-label="全屏对比${esc(title)}">
               ${candidate.url ? `<img src="${esc(thumbUrl(candidate.url, 520))}" loading="lazy" alt="${esc(title)}">`
                 : `<span class="plan-thumb-empty">图片缺失</span>`}
+              ${candidate.selected ? `<span class="cast-selected-badge">✓ 母资产</span>` : ""}
             </button>
             <div class="cast-candidate-foot"><div class="cast-candidate-title"><span>候选 ${candidate.index}</span><b>${esc(variant)}</b></div>
               <button type="button" class="${candidate.selected ? "selected" : "primary"} prop-pick"
@@ -7600,6 +7601,12 @@ function renderCastSelection(data, episodeId) {
           </article>`;
         }).join("")}</div>
       </section>`).join("")}</div>` : ""}
+    <div class="cast-bottom-bar">
+      <span class="cast-bottom-progress">${selection.passed
+        ? "✅ 全部定版完成" : `已定版 ${lockedCount}/${lockTotal}`}</span>
+      <button class="primary" id="cast-continue" ${selection.passed ? "" : "disabled"}>
+        ${selection.passed ? "继续预生产 →" : "全部选完才能继续"}</button>
+    </div>
   </div>`;
   bindImageAccelerationLivebar(episodeId);
   bindProductionLedger(app, data, episodeId);
@@ -7622,10 +7629,98 @@ function renderCastSelection(data, episodeId) {
         ev.currentTarget.textContent = "↻ 全部重生成4张";
       }
     });
-  app.querySelectorAll(".cast-image").forEach((button) => {
-    button.onclick = () => {
-      if (button.dataset.full) showImageLightbox(button.dataset.full, button.dataset.title || "人物候选大图");
+  const selectCandidate = async (kind, name, index) => {
+    const path = kind === "prop" ? "/api/prop/select" : "/api/character/select";
+    const body = kind === "prop"
+      ? { episode_id: data.episode.id, prop: name,
+          candidate_index: Number(index) }
+      : { episode_id: data.episode.id, character: name,
+          candidate_index: Number(index) };
+    await api(path, { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body) });
+    showToast(`${name} 已锁定候选 ${index}`, "ok");
+    renderCanvasView(episodeId);
+  };
+  /* 全屏4张对比:左右滑动看大图,底部一键选定——手机端主选片入口 */
+  const showCandidateCompare = (kind, name, startIndex) => {
+    const source = kind === "prop"
+      ? (props.find((p) => p.prop === name) || {})
+      : (characters.find((c) => c.character === name) || {});
+    const list = (source.candidates || []).filter((c) => c.url);
+    if (!list.length) return;
+    const overlay = document.createElement("div");
+    overlay.className = "cast-compare-overlay";
+    overlay.innerHTML = `
+      <div class="cast-compare-head">
+        <b>${esc(name)}</b>
+        <span class="cast-compare-counter"></span>
+        <button type="button" class="cast-compare-close">关闭 ✕</button>
+      </div>
+      <div class="cast-compare-track">${list.map((c) => {
+        const outdated = kind !== "prop" && (
+          c.current_candidate_policy === false
+          || c.variant_source === "legacy" || !c.variant_label);
+        return `<figure class="cast-compare-slide" data-index="${c.index}"
+          data-outdated="${outdated ? "1" : "0"}"
+          data-selected="${c.selected ? "1" : "0"}"
+          data-variant="${esc(c.variant_label || `方案${c.index}`)}">
+          <img src="${esc(c.url)}" alt="${esc(name)} 候选${c.index}">
+        </figure>`;
+      }).join("")}</div>
+      <div class="cast-compare-foot">
+        <div class="cast-compare-dots">${list.map((c) =>
+          `<i data-index="${c.index}"></i>`).join("")}</div>
+        <div class="cast-compare-label"></div>
+        <button type="button" class="primary cast-compare-pick"></button>
+      </div>`;
+    document.body.appendChild(overlay);
+    const track = overlay.querySelector(".cast-compare-track");
+    const slides = [...overlay.querySelectorAll(".cast-compare-slide")];
+    const counter = overlay.querySelector(".cast-compare-counter");
+    const label = overlay.querySelector(".cast-compare-label");
+    const pick = overlay.querySelector(".cast-compare-pick");
+    const dots = [...overlay.querySelectorAll(".cast-compare-dots i")];
+    let current = Math.max(0, slides.findIndex(
+      (s) => Number(s.dataset.index) === Number(startIndex)));
+    const sync = () => {
+      const slide = slides[current];
+      if (!slide) return;
+      counter.textContent = `${current + 1} / ${slides.length}`;
+      label.textContent = `候选 ${slide.dataset.index} · ${slide.dataset.variant}`;
+      const outdated = slide.dataset.outdated === "1";
+      const selected = slide.dataset.selected === "1";
+      pick.disabled = outdated || selected;
+      pick.textContent = selected
+        ? "✓ 已是当前定版" : (outdated ? "旧规则候选,不可选" : `✓ 选定这张(候选 ${slide.dataset.index})`);
+      dots.forEach((dot, i) => dot.classList.toggle("on", i === current));
     };
+    const close = () => overlay.remove();
+    overlay.querySelector(".cast-compare-close").onclick = close;
+    overlay.addEventListener("click", (ev) => {
+      if (ev.target === overlay || ev.target === track) close();
+    });
+    track.addEventListener("scroll", () => {
+      const idx = Math.round(track.scrollLeft / track.clientWidth);
+      if (idx !== current && slides[idx]) { current = idx; sync(); }
+    }, { passive: true });
+    pick.onclick = async () => {
+      const slide = slides[current];
+      pick.disabled = true;
+      pick.textContent = "锁定中…";
+      try {
+        await selectCandidate(kind, name, slide.dataset.index);
+        close();
+      } catch (e) { showToast(e.message, "error"); sync(); }
+    };
+    sync();
+    if (current > 0) requestAnimationFrame(() => {
+      track.scrollTo({ left: track.clientWidth * current });
+    });
+  };
+  app.querySelectorAll(".cast-compare-open").forEach((button) => {
+    button.onclick = () => showCandidateCompare(
+      button.dataset.kind, button.dataset.name, button.dataset.start);
   });
   app.querySelectorAll(".cast-pick").forEach((button) => {
     button.onclick = async () => {
@@ -7634,20 +7729,14 @@ function renderCastSelection(data, episodeId) {
       group.forEach((item) => { item.disabled = true; });
       button.textContent = "锁定中…";
       try {
-        await api("/api/character/select", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ episode_id: data.episode.id,
-            character: button.dataset.character,
-            candidate_index: Number(button.dataset.index) }),
-        });
-        showToast(`${button.dataset.character} 已锁定候选 ${button.dataset.index}`, "ok");
-        renderCanvasView(episodeId);
+        await selectCandidate(
+          "character", button.dataset.character, button.dataset.index);
       } catch (e) {
         showToast(e.message, "error");
         group.forEach((item) => {
           item.disabled = item.getAttribute("aria-pressed") === "true";
         });
-        button.textContent = "选定这套造型";
+        button.textContent = "选定这张";
       }
     };
   });
@@ -7658,14 +7747,7 @@ function renderCastSelection(data, episodeId) {
       group.forEach((item) => { item.disabled = true; });
       button.textContent = "锁定中…";
       try {
-        await api("/api/prop/select", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ episode_id: data.episode.id,
-            prop: button.dataset.prop,
-            candidate_index: Number(button.dataset.index) }),
-        });
-        showToast(`${button.dataset.prop} 已锁定候选 ${button.dataset.index}`, "ok");
-        renderCanvasView(episodeId);
+        await selectCandidate("prop", button.dataset.prop, button.dataset.index);
       } catch (e) {
         showToast(e.message, "error");
         group.forEach((item) => { item.disabled = false; });
@@ -8697,7 +8779,7 @@ async function renderCanvasView(episodeId) {
 }
 
 /* ---- 剧本正文(审阅页与生产直播页共用) ---- */
-function scriptBodyHtml(script) {
+function scriptBodyHtml(script, sceneOpts = {}) {
   const imported = script.import_analysis || {};
   const logic = script.script_logic_audit || {};
   const corrections = imported.entity_corrections || [];
@@ -8744,10 +8826,33 @@ function scriptBodyHtml(script) {
       <div class="script-character-profiles">${(script.characters || [])
         .map(characterProfileHtml).join("")}</div>
       ${corePropsHtml(script)}
-      ${script.scenes.map((s) => `
-        <section class="scene">
+      ${scenesSectionsHtml(script, sceneOpts)}`;
+}
+
+/* 场次段落(含「暂不生成/删除」管理工具);单场跑通全流程测试用 */
+function scenesSectionsHtml(script, sceneOpts = {}) {
+  const skipped = (sceneOpts.skipped || []).map(Number);
+  const manage = !!sceneOpts.manage && !!sceneOpts.episodeId
+    && (script.scenes || []).length > 1;
+  const hint = manage ? `
+      <p class="scene-manage-hint">🎬 场次管理：「⏸ 暂不生成」跳过该场全部出图与视频，随时可恢复，断点续写自动补齐——先单场跑通全流程再放开其余场次；「🗑 删除本场」连同该场镜头、图片一起移除（生产运行中不可删）。</p>` : "";
+  return hint + (script.scenes || []).map((s) => {
+    const isSkipped = skipped.includes(Number(s.scene_no));
+    return `
+        <section class="scene${isSkipped ? " scene-skipped" : ""}">
           <div class="scene-head"><span class="scene-no">第 ${s.scene_no} 场</span>
-            <span class="scene-loc">${esc(s.location)}</span></div>
+            <span class="scene-loc">${esc(s.location)}</span>
+            ${isSkipped ? `<span class="chip scene-skip-chip">⏸ 暂不生成</span>` : ""}
+            ${manage ? `
+            <span class="scene-tools">
+              <button type="button" class="scene-skip-btn"
+                data-episode="${sceneOpts.episodeId}" data-scene="${s.scene_no}"
+                data-skip="${isSkipped ? "0" : "1"}">${isSkipped ? "▶ 恢复生成" : "⏸ 暂不生成"}</button>
+              <button type="button" class="scene-delete-btn"
+                data-episode="${sceneOpts.episodeId}"
+                data-scene="${s.scene_no}">🗑 删除本场</button>
+            </span>` : ""}
+          </div>
           ${s.action ? `<p class="action">△ ${esc(s.action)}</p>` : ""}
           ${(s.lines || []).map((l) => `
             <div class="line-block">
@@ -8756,8 +8861,39 @@ function scriptBodyHtml(script) {
                 ${l.performance ? `<small class="performance-cue">表演：${esc(l.performance)}</small>` : ""}
               </div>
             </div>`).join("")}
-        </section>`).join("")}`;
+        </section>`;
+  }).join("");
 }
+
+/* 场次管理按钮:全局事件委托(剧本确认页/剧本弹层/生产实时页共用) */
+document.addEventListener("click", async (ev) => {
+  const btn = ev.target.closest?.(".scene-skip-btn, .scene-delete-btn");
+  if (!btn) return;
+  const episodeId = Number(btn.dataset.episode);
+  const sceneNo = Number(btn.dataset.scene);
+  if (!episodeId || !sceneNo) return;
+  const isDelete = btn.classList.contains("scene-delete-btn");
+  if (isDelete && !window.confirm(
+    `确认删除第 ${sceneNo} 场？该场镜头与已生成图片会一并移除，` +
+    "线索圣经会按新剧本自动重建。只是想先不生成的话,请用「⏸ 暂不生成」。")) return;
+  btn.disabled = true;
+  try {
+    const path = isDelete ? "/api/scene/delete" : "/api/scene/skip";
+    const body = { episode_id: episodeId, scene_no: sceneNo };
+    if (!isDelete) body.skip = btn.dataset.skip === "1";
+    await api(path, { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body) });
+    showToast(isDelete ? `第 ${sceneNo} 场已删除,关联镜头与图片已移除`
+      : (body.skip ? `第 ${sceneNo} 场已标记「暂不生成」,恢复生产时生效`
+        : `第 ${sceneNo} 场已恢复生成,断点续写会自动补齐`), "ok");
+    document.querySelector(".script-overlay")?.remove();
+    pollCanvas(episodeId);
+  } catch (e) {
+    showToast(e.message, "error");
+    btn.disabled = false;
+  }
+});
 
 /* ---- 生产直播页:每一步实时可见,剧本一出即可阅读,可随时停止 ---- */
 function renderProductionView(data, episodeId) {
@@ -8815,7 +8951,9 @@ function renderProductionView(data, episodeId) {
           </details>` : renderPlanBoardHtml(data)}
         ${data.script ? `<div class="script-review">
           <div class="dim" style="margin-bottom:6px">📖 剧本已就绪,可边生产边阅读:</div>
-          ${scriptBodyHtml(data.script)}
+          ${scriptBodyHtml(data.script, {
+            skipped: (data.scene_plan || {}).skipped_scenes,
+            episodeId: data.episode.id, manage: true })}
         </div>` : `<div class="panel dim">剧本生成中,写好会第一时间显示在这里…</div>`}
       </div>
     </div>
@@ -9242,7 +9380,9 @@ function renderScriptReview(data, episodeId) {
          人物形象和画风会稳定得多;之后在「资产中心」也能管理。</div>`}
     </div>
     ${storyAnalysisEditorHtml(storyAnalysis, data.story_analysis_version)}
-    <div class="script-review">${scriptBodyHtml(script)}</div>
+    <div class="script-review">${scriptBodyHtml(script, {
+      skipped: (data.scene_plan || {}).skipped_scenes,
+      episodeId: data.episode.id, manage: true })}</div>
   </div>`;
   document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
   document.getElementById("btn-polish").onclick = () =>

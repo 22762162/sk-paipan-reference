@@ -1557,6 +1557,64 @@ def validate_prompt_refine(data):
     return None
 
 
+SHOT_REPAIR_PROMPT = """你是本剧的分镜导演。镜头{shot_no}的提示词在进入图片生成前被审核熔断,
+原因是镜头自身的几何/构图要求互斥(例如特写景别却要求多名相距很远的人物
+与多个空间区域同时入框)。你要就地修复这个镜头,让它几何上自洽。
+
+被熔断的镜头(分镜原文):
+{shot}
+
+场景地点:{location}
+项目画风:{style}
+
+审核熔断原因(必须逐条化解):
+{blocking_reason}
+
+修复边界(铁律):
+- 只允许修改 camera(景别/机位/构图方式)和 description 中的取景表述;
+- 景别必须能真实容纳镜头宣称的全部可见人物与画面区域;若剧情本意是
+  只看局部,则在 description 里明确写出只框入哪些人物/道具、其余出画;
+- 不得增删人物、道具,不得改变任何人物状态/朝向/位置等剧情事实,
+  不得改动对白、时长、事件(event_id/phase)、prop_registry;
+- camera 保持与原镜头相同的结构:原来是字符串就输出字符串,
+  原来是对象就输出同结构的完整对象。
+
+只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块:
+{{"schema": "aifos.shot_repair.v1",
+ "shot_no": {shot_no},
+ "camera": "修复后的镜头(与原结构一致)",
+ "description": "修复后的完整镜头描述;不需要改时省略此键",
+ "repair_summary": "一句话说明改了什么、如何化解每条熔断原因"}}
+"""
+
+
+def validate_shot_repair(data, payload):
+    """审核熔断镜头就地修复输出的最小校验。"""
+    if not isinstance(data, dict):
+        return "输出必须是 JSON 对象"
+    if data.get("schema") != "aifos.shot_repair.v1":
+        return "schema 必须是 aifos.shot_repair.v1"
+    shot = (payload or {}).get("shot") or {}
+    try:
+        if int(data.get("shot_no")) != int(shot.get("shot_no")):
+            return "shot_no 与被修复镜头不一致"
+    except (TypeError, ValueError):
+        return "shot_no 非法"
+    camera = data.get("camera")
+    original = shot.get("camera")
+    if isinstance(original, dict):
+        if not isinstance(camera, dict) or not camera:
+            return "原镜头 camera 是对象,修复输出必须保持同结构对象"
+    elif not str(camera or "").strip():
+        return "camera 缺失或为空"
+    description = data.get("description")
+    if description is not None and not str(description).strip():
+        return "description 若输出则不能为空"
+    if not str(data.get("repair_summary") or "").strip():
+        return "缺少 repair_summary"
+    return None
+
+
 def build_prompt(capability, payload):
     """构造编剧/分镜/人物设定提示词(CLI 桥与 Claude API Provider 共用)。"""
     if capability == "script" and payload.get("prompt_refine"):
@@ -1570,6 +1628,15 @@ def build_prompt(capability, payload):
             style=(payload.get("style")
                    or "项目画风未指定;保持与已生成候选一致"),
             feedback=payload.get("feedback", ""))
+    if capability == "script" and payload.get("shot_repair"):
+        shot = payload.get("shot") or {}
+        return SHOT_REPAIR_PROMPT.format(
+            shot_no=shot.get("shot_no", 0),
+            shot=json.dumps(shot, ensure_ascii=False),
+            location=payload.get("location", "") or "见镜头描述",
+            style=(payload.get("style")
+                   or "项目画风未指定;保持与已生成画面一致"),
+            blocking_reason=payload.get("blocking_reason", ""))
     if capability == "script" and payload.get("story_analysis"):
         return STORY_ANALYSIS_PROMPT.format(
             style=(payload.get("style")
@@ -1910,6 +1977,8 @@ def _postprocess_and_validate(capability, payload, data):
         error = validate_image_qc(data)
     elif capability == "script" and payload.get("prompt_refine"):
         error = validate_prompt_refine(data)
+    elif capability == "script" and payload.get("shot_repair"):
+        error = validate_shot_repair(data, payload)
     elif capability == "script" and payload.get("story_analysis"):
         error = validate_story_analysis(
             data, require_resolved_identity=False)
