@@ -73,7 +73,9 @@ class DreaminaProvider(Provider):
                 value = str(Path(value).resolve())
             if value not in references and value not in (first, last):
                 references.append(value)
-        references = references[:7]
+        # 资产参考上限与导演端一致(实测 Seedance2 可收 9 张,不含首尾帧)
+        references = references[
+            :int(self.conf.get("max_reference_assets", 9))]
         shot_no = int(payload.get("shot_no", 0))
         model_version = self.conf.get(
             "model_version", REQUIRED_MODEL_VERSION)

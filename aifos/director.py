@@ -542,6 +542,9 @@ REFERENCE_ROLES = {
 # 参考图，避免同一任务切换模型时图序、人物或构图语义发生漂移。
 IMAGE_REFERENCE_LIMIT = 10
 SHOT_BASE_REFERENCE_LIMIT = 8
+# Seedance 2 资产参考上限(首/尾帧另计):实测可提交 9 张;
+# 原硬编码 7 导致"3立绘+空间图+4道具=8"的正常群像镜被拒。
+SEEDANCE_ASSET_REFERENCE_LIMIT = 9
 
 # render_plan.json is shared by the parallel image workers.  Keep the
 # read/write pair atomic inside one Python process; the actual image calls stay
@@ -9654,11 +9657,13 @@ class Director:
             raise AifosError(
                 "以下核心道具缺少人工锁定母资产，禁止选择 Seedance 参考图:"
                 + "、".join(missing_props))
-        if len(mandatory_ids) > 7:
+        if len(mandatory_ids) > SEEDANCE_ASSET_REFERENCE_LIMIT:
             raise AifosError(
                 f"本镜空间图与人物最终立绘已占 {len(mandatory_ids)} 张，"
-                "超过 Seedance 2 资产参考上限7张；请拆分群像镜头")
-        manual_limit = max(0, 7 - len(mandatory_ids))
+                f"超过 Seedance 2 资产参考上限"
+                f"{SEEDANCE_ASSET_REFERENCE_LIMIT}张；请拆分群像镜头")
+        manual_limit = max(
+            0, SEEDANCE_ASSET_REFERENCE_LIMIT - len(mandatory_ids))
         unique_ids = [
             asset_id for asset_id in unique_ids
             if asset_id not in mandatory_ids]
@@ -9816,10 +9821,11 @@ class Director:
             raise AifosError(
                 "以下核心道具缺少人工锁定母资产，禁止交给 Seedance:"
                 + "、".join(missing_props))
-        if len(rows) > 7:
+        if len(rows) > SEEDANCE_ASSET_REFERENCE_LIMIT:
             raise AifosError(
                 f"镜头{shot_no}的空间图与人物最终立绘已占{len(rows)}张，"
-                "超过 Seedance 2 资产参考上限7张；请拆分群像镜头")
+                f"超过 Seedance 2 资产参考上限"
+                f"{SEEDANCE_ASSET_REFERENCE_LIMIT}张；请拆分群像镜头")
         # 本镜分镜示例图承载构图事实；它即使是低档候选也可在首尾帧之外
         # 作为构图参考，但不能挤掉必传空间图与人物身份图。
         shot_image = self.assets.latest(
@@ -9843,7 +9849,7 @@ class Director:
                 allowed_roles={
                     "identity", "wardrobe", "scene", "composition", "style"},
                 include_global_style=True):
-            if len(rows) >= 7:
+            if len(rows) >= SEEDANCE_ASSET_REFERENCE_LIMIT:
                 break
             add(row)
         return rows
@@ -10066,10 +10072,11 @@ class Director:
                     or Path(uri).exists()) and row["id"] not in seen:
                 seen.add(row["id"])
                 rows.append(row)
-        if len(rows) > 7:
+        if len(rows) > SEEDANCE_ASSET_REFERENCE_LIMIT:
             raise AifosError(
                 f"镜头{shot_no}的空间图、人物最终立绘与人工参考共"
-                f"{len(rows)}张，超过 Seedance 2 资产参考上限7张；"
+                f"{len(rows)}张，超过 Seedance 2 资产参考上限"
+                f"{SEEDANCE_ASSET_REFERENCE_LIMIT}张；"
                 "请减少人工额外参考或拆分群像镜头")
         return rows
 
@@ -10927,8 +10934,10 @@ class Director:
         indices = [item.get("index") for item in manifest]
         if len(indices) != len(set(indices)):
             reference_problems.append("参考图序号重复，图文对应关系不唯一")
-        if len(manifest) > 7:
-            reference_problems.append("首尾帧之外参考图超过 Seedance 上限7张")
+        if len(manifest) > SEEDANCE_ASSET_REFERENCE_LIMIT:
+            reference_problems.append(
+                "首尾帧之外参考图超过 Seedance 上限"
+                f"{SEEDANCE_ASSET_REFERENCE_LIMIT}张")
         for item in manifest:
             uri = str(item.get("uri") or "")
             if not uri:

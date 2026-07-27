@@ -165,3 +165,14 @@ def test_synthesized_beat_shots_inherit_scene_event_id():
     assert beats, "应生成场末节拍镜"
     for beat in beats:
         assert beat.get("scene_event_id") == "YYXS-E01-S01-SHELTER"
+
+
+def test_seedance_asset_reference_limit_is_nine():
+    """即梦 Seedance2 实测可收 9 张资产参考(不含首尾帧);
+    原硬编码 7 让「3立绘+空间图+4道具」的正常群像镜被拒。"""
+    from aifos.director import SEEDANCE_ASSET_REFERENCE_LIMIT
+    assert SEEDANCE_ASSET_REFERENCE_LIMIT == 9
+    import inspect
+    from aifos import director
+    src = inspect.getsource(director)
+    assert "参考上限7张" not in src        # 不许再有硬编码文案
