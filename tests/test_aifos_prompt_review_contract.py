@@ -131,3 +131,24 @@ def test_contract_checked_markers_are_required_verbatim():
     tokens = required(source, {"characters": ["林川"]})
     assert "【质检同源合同】" in tokens
     assert "【质检同源合同】" not in required("普通场景图", {})
+
+
+def test_back_profile_sheet_scopes_match_their_binding(tmp_path):
+    """背面/侧面设定图 binding 说"补充服装/配饰/道具位置",作用域就
+    不得再排除它们——同一条目自我互斥曾熔断关键帧(图6事故)。"""
+    from aifos.director import Director
+    director = Director.__new__(Director)
+    img = tmp_path / "sheet_back.png"
+    img.write_bytes(b"\x89PNG\r\n")
+    payload = {
+        "character_refs": [str(img)],
+        "asset_matches": [{"uri": str(img), "kind": "character_sheet",
+                           "name": "林川:back",
+                           "label": "林川人物设定图·背面"}],
+    }
+    entries = director._reference_manifest(payload)
+    back = next(e for e in entries if "背面" in e["label"])
+    assert "wardrobe" in back["inherits"]
+    assert "prop_position" in back["inherits"]
+    assert "wardrobe" not in back["excludes"]
+    assert "face_identity_override" in back["excludes"]

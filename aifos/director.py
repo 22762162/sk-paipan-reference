@@ -8842,6 +8842,8 @@ class Director:
             sheet = name.split(":", 1)[1] if ":" in name else ""
             declared_role = str(
                 match.get("reference_role") or "").strip()
+            scope_inherits = None
+            scope_excludes = None
             if (declared_role == "wardrobe"
                     or sheet in ("wardrobe", "costume", "costume_detail")):
                 binding = (
@@ -8868,6 +8870,18 @@ class Director:
                         "发型和妆容细节；身份仍以最终立绘为准，不复制服装、"
                         "姿势或背景")
                 role = "identity_detail"
+                # 背面/侧面图的 binding 明确要求补充服装背片、配饰与
+                # 道具位置;identity_detail 的默认排除域(wardrobe/pose)
+                # 会与之同级互斥并熔断,必须按图别声明一致的作用域。
+                if sheet in ("back", "profile"):
+                    view = "背面" if sheet == "back" else "侧面"
+                    scope_inherits = [
+                        f"{view}轮廓", "hair_silhouette", "body_shape",
+                        "wardrobe", "accessories", "prop_position"]
+                    scope_excludes = [
+                        "face_identity_override", "pose", "background",
+                        "lighting"]
+
             elif sheet == "turnaround":
                 binding = (
                     f"只补充{who or '对应人物'}的体型比例、发型轮廓与"
@@ -8880,7 +8894,8 @@ class Director:
                     "不得把图片中的其他人物、姿势或背景带入本镜")
                 role = "character_detail"
             add(uri, label,
-                binding, character=who, role=role)
+                binding, character=who, role=role,
+                inherits=scope_inherits, excludes=scope_excludes)
         add(payload.get("image_uri"), "本镜已通过的关键图",
             "只锁定本镜构图、人物站位、场景、道具、服装和已锁定文字；"
             "人物脸和性别仍以各自最终立绘为准，不得复制关键图中的错误",
