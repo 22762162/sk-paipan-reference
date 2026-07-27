@@ -199,3 +199,36 @@ def test_wardrobe_props_yield_when_seedance_slots_tight():
     kept3, y3 = director._yield_seedance_prop_rows(
         [("短刀", {"id": 1})], 1)
     assert not y3 and len(kept3) == 1
+
+
+def test_hallucinated_availability_event_falls_back_to_episode_bounds():
+    """模型引用幻觉场次号(eval_test_scene 真实事故)时本地回落
+    episode-start/end——修复引擎不知道合法号,回落才是确定性解;
+    原值留档 unresolved_event_id 供审计。"""
+    from aifos.adapters.claude_script import validate_script
+    script = {
+        "episode_title": "t", "logline": "l",
+        "characters": [{"name": "韩立", "role": "主角",
+                        "gender": "男", "age_range": "16-18"}],
+        "story_world": {"name": "n", "overview": "o",
+                        "era_and_location": "e", "social_order": "s",
+                        "hard_rules": "h", "visual_baseline": "v",
+                        "forbidden_drift": ["现代物品"]},
+        "story_background": {"prior_events": "p", "current_situation": "c",
+                             "core_conflict": "x", "episode_goal": "g",
+                             "continuity_hooks": "h"},
+        "scenes": [{"scene_no": 1, "event_id": "FRXX-E01-S01-TEST",
+                    "location": "七玄门", "characters": ["韩立"],
+                    "action": "走",
+                    "lines": [{"character": "韩立", "dialogue": "是"}]}],
+        "prop_registry": [{
+            "prop_id": "prop_testing_stone_01", "name": "测灵石",
+            "kind": "core", "instance_count": 1,
+            "availability_start_event": {"event_id": "eval_test_scene",
+                                          "phase": "start"},
+            "disclosure_policy": "explicit_frame_only"}]}
+    error = validate_script(script, {})
+    assert "未对应稳定场次" not in str(error or "")
+    ref = script["prop_registry"][0]["availability_start_event"]
+    assert ref["event_id"] == "episode-start"
+    assert ref["unresolved_event_id"] == "eval_test_scene"

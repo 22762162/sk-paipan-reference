@@ -742,8 +742,10 @@ def validate_script_bible(script, *, require_resolved_identity=True):
     for item in script.get("prop_registry") or []:
         if not isinstance(item, dict):
             continue
-        for field in (
-                "availability_start_event", "availability_end_event"):
+        for field, alias, fallback in (
+                ("availability_start_event", "introduced_at",
+                 "episode-start"),
+                ("availability_end_event", "retired_at", "episode-end")):
             ref = item.get(field)
             if not ref:
                 continue
@@ -751,9 +753,14 @@ def validate_script_bible(script, *, require_resolved_identity=True):
                 ref.get("event_id") if isinstance(ref, dict) else ref
             ).strip()
             if event_id not in known_events:
-                return (
-                    f"{item.get('prop_id') or item.get('name')} 的 {field} "
-                    f"未对应稳定场次 event_id: {event_id}")
+                # 模型偶发引用幻觉场次号(如 eval_test_scene),修复引擎也
+                # 不知道合法号——本地回落到最宽可用窗口(episode 边界):
+                # 语义安全,帧级 frame_props 照常管每镜可见性;原值留档。
+                phase = "start" if fallback == "episode-start" else "end"
+                repaired = {"event_id": fallback, "phase": phase,
+                            "unresolved_event_id": event_id}
+                item[field] = repaired
+                item[alias] = dict(repaired)
     world = script.get("story_world")
     if not isinstance(world, dict):
         return "缺少 story_world 故事世界设定"
