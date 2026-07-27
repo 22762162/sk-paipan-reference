@@ -43,3 +43,32 @@ def test_qc_feedback_camera_rule_references_visible_features():
         ["视角接近后上方俯视，不符合合同要求的仰拍"])
     assert "camera" in revision["categories"]
     assert "可见特征执行并核验" in revision["text"]
+
+
+# ---- 场景多视角:机位映射与母版一致性合同 ----
+def test_scene_view_mapping_from_camera():
+    from aifos.camera_language import scene_view_for_camera
+    assert scene_view_for_camera({"机位": "过肩"}) == "reverse"
+    assert scene_view_for_camera({"机位": "背面"}) == "reverse"
+    assert scene_view_for_camera("中景·背面跟拍") == "reverse"
+    assert scene_view_for_camera({"机位": "侧面"}) == "side"
+    assert scene_view_for_camera("全景·俯拍·推") == "main"
+    assert scene_view_for_camera(None) == "main"      # 永不阻断
+
+
+def test_scene_view_prompt_and_contract():
+    from aifos.director import Director
+    director = Director.__new__(Director)
+    scene = {"location": "雨夜公寓单元房", "time_of_day": "深夜暴雨",
+             "production_design": {"environment": "老式单元房,昏黄吸顶灯"}}
+    prompt = director._scene_view_prompt(
+        "雨夜公寓单元房", "写实悬疑", scene,
+        "雨夜公寓单元房·反打视角", "反打视角",
+        "从主视角正对面的机位回看同一空间")
+    # 派发合同逐字校验对象名:提示词必须写出 art_name
+    assert "【本图对象】雨夜公寓单元房·反打视角" in prompt
+    assert "逐项一致" in prompt and "只允许摄影机位改变" in prompt
+    context = director._scene_view_review_context(
+        "雨夜公寓单元房", "写实悬疑", scene, "反打视角")
+    assert "不构成需要裁决的冲突" in context["view_consistency_precedence"]
+    assert "master_state_precedence" in context     # 空镜条款仍然在场

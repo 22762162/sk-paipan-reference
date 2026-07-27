@@ -43,6 +43,7 @@ from .quality_policy import (
     resolve_video_quality,
     set_policy_choices,
 )
+from .camera_language import scene_view_for_camera
 from .prompt_contract import (
     build_physical_contract,
     build_composition_contract,
@@ -2028,6 +2029,147 @@ class Director:
                 "与表演动线,机位高度与光线方向稳定,后续镜头可复用"),
             "style": style,
         }
+
+    # 高复用场景(出现 ≥ 该值场次)生成多视角母版:主视角出图后,
+    # 反打/侧向以主视角为参考链式生成,保证空间跨机位一致。
+    SCENE_VIEW_MIN_REUSE = 2
+    SCENE_VIEW_DEFS = (
+        ("reverse", "反打视角", "从主视角正对面的机位回看同一空间"),
+        ("side", "侧向视角", "与主视角成约90度的侧向机位"),
+    )
+
+    @staticmethod
+    def _scene_view_asset_name(location, view_key):
+        return f"{location}::view:{view_key}"
+
+    def _scene_view_prompt(self, location, style, scene, art_name,
+                           view_label, view_desc):
+        """视角母版提示词 = 主场景事实 + 同空间一致性铁律。"""
+        base = self._scene_prompt(location, style, scene)
+        return (
+            f"【本图对象】{art_name}。{base};"
+            f"多视角一致性:本图是「{location}」的{view_label}"
+            f"——{view_desc}。参考图是同一空间的主视角母版:"
+            "空间结构、户型、门窗与出入口位置、材质、陈设、光源方向"
+            "与色温必须与参考图逐项一致,只允许摄影机位改变;"
+            "禁止新增或移除家具与陈设,禁止改变空间尺度与层高。")
+
+    def _scene_view_review_context(self, location, style, scene,
+                                   view_label):
+        """视角母版审核合同 = 空镜合同 + 视角一致性显式裁决条款。"""
+        context = self._scene_art_review_context(location, style, scene)
+        context["view"] = view_label
+        context["view_consistency_precedence"] = (
+            f"本图为同一空间的{view_label}:与参考图(主视角母版)的空间"
+            "结构、材质、光源、陈设逐项一致是最高优先事实,仅摄影机位"
+            "不同;与其他描述并列时直接按本条执行,不构成需要裁决的冲突")
+        return context
+
+    def _scene_view_reference(self, project_id, location, camera):
+        """按镜头机位选最贴近的场景母版视角;缺视角图回退主视角。"""
+        view = scene_view_for_camera(camera)
+        if view != "main":
+            row = self.assets.latest(
+                project_id, "scene_art",
+                self._scene_view_asset_name(location, view))
+            if (row and row["uri"] and Path(row["uri"]).exists()
+                    and formal_reference_allowed(self._asset_quality(row))):
+                label = dict(
+                    (key, name) for key, name, _ in self.SCENE_VIEW_DEFS
+                ).get(view, view)
+                return row, f"场景:{location}({label})"
+        row = self.assets.latest(project_id, "scene_art", location)
+        return row, f"场景:{location}"
+
+    def _ensure_scene_view_masters(self, ctx, scene_quality,
+                                   location_reuse, style):
+        """第二波:为高复用场景生成反打/侧向母版(以主视角为参考)。"""
+        project_id = ctx["project"]["id"]
+        scene_by_location = {}
+        for scene in ctx["script"]["scenes"]:
+            scene_by_location.setdefault(scene["location"], scene)
+        tasks, seed = [], []
+        for location, scene in scene_by_location.items():
+            if location_reuse.get(location, 0) < self.SCENE_VIEW_MIN_REUSE:
+                continue
+            main_row = self.assets.latest(project_id, "scene_art", location)
+            main_uri = (main_row["uri"] if main_row and main_row["uri"]
+                        and Path(main_row["uri"]).exists() else "")
+            if not main_uri:
+                continue   # 主视角缺失时不做视角扩展
+            for key, label, desc in self.SCENE_VIEW_DEFS:
+                asset_name = self._scene_view_asset_name(location, key)
+                existing = self.assets.latest(
+                    project_id, "scene_art", asset_name)
+                if (existing and existing["uri"]
+                        and Path(existing["uri"]).exists()
+                        and self._quality_meets(
+                            self._asset_quality(existing),
+                            scene_quality[location]["level"])):
+                    self._plan_mark(
+                        ctx, f"scene:{location}:view:{key}", "reused",
+                        only_pending=True)
+                    continue
+                art_name = f"{location}·{label}"
+                seed.append({
+                    "id": f"scene:{location}:view:{key}",
+                    "category": "scene_art",
+                    "label": f"{location} · {label}",
+                    "name": asset_name,
+                    "prompt": self._scene_view_prompt(
+                        location, style, scene, art_name, label, desc),
+                    **self._quality_meta(scene_quality[location]),
+                })
+                tasks.append({
+                    "item_id": f"scene:{location}:view:{key}",
+                    "capability": "image",
+                    "payload": {
+                        "scene_art": True, "art_name": art_name,
+                        "image_task_class": image_task_class_for(
+                            scene_quality[location]["level"]),
+                        "image_quality": scene_quality[location]["level"],
+                        "quality_decision": scene_quality[location],
+                        "shot_no": 0, "characters": [],
+                        "location": location,
+                        "prompt": self._scene_view_prompt(
+                            location, style, scene, art_name, label, desc),
+                        "style": style,
+                        "prompt_contract_complete": True,
+                        "prompt_review_context":
+                            self._scene_view_review_context(
+                                location, style, scene, label),
+                        "scene_ref": main_uri,
+                        "style_ref": self._style_anchor_uri(project_id),
+                        "require_reference_images": True,
+                        "aspect": ctx["aspect"], **ctx["dims"],
+                    },
+                    "sub_dir": "cast",
+                    "tag": ("scene_view", location, key),
+                })
+        if seed:
+            # _plan_seed 是整类目替换:必须携带既有 scene_art 条目
+            # (主视角等)一起播种,否则它们会从图片清单上消失。
+            plan = self._plan_read(ctx)
+            existing_items = [
+                item for item in plan["items"]
+                if item.get("category") == "scene_art"]
+            existing_ids = {item["id"] for item in existing_items}
+            self._plan_seed(ctx, "scene_art", existing_items + [
+                item for item in seed if item["id"] not in existing_ids])
+        if not tasks:
+            return 0
+        created = 0
+        for tag, result in self._run_parallel(
+                ctx, tasks, line="场景多视角母版").items():
+            _kind, location, key = tag
+            self.assets.register(
+                project_id, "scene_art",
+                self._scene_view_asset_name(location, key),
+                uri=result.uri,
+                meta={**self._quality_meta(scene_quality[location]),
+                      "view": key, "base_location": location})
+            created += 1
+        return created
 
     def _scene_prompt(self, location, style, scene=None, premise=""):
         """场景概念图提示词:只建立可复用环境,不把人物画风误当场景内容。"""
@@ -7066,6 +7208,10 @@ class Director:
                       "quality_source": "auto",
                       "quality_rule": "mother_asset"})
             created += 1
+        # 第二波:高复用场景的反打/侧向视角母版(以主视角图为参考,
+        # 保证同一空间跨机位一致;关键帧按镜头机位自动选用)。
+        created += self._ensure_scene_view_masters(
+            ctx, scene_quality, location_reuse, style)
         # 保存包含独立母资产就绪状态的最新人物定版文档，供 UI/API 和
         # 后续生产门禁读取；合成审核板不计入正式参考图。
         ctx["cast_selection"] = self.production_asset_selection_status(
@@ -7455,7 +7601,8 @@ class Director:
                   sheet_keys=None, sheet_keys_by_character=None,
                   spatial_ref="", inner_persona_ref="", prop_names=None,
                   prop_reference_modes=None,
-                  wardrobe_states=None, headwear_states=None):
+                  wardrobe_states=None, headwear_states=None,
+                  camera=None):
         """最终立绘/人物套件/场景图/用户参考 → 真实多图参考输入。
 
         含人物画面缺任何一个最终立绘都直接阻断；禁止静默退化为文字生图。
@@ -7706,14 +7853,17 @@ class Director:
                     })
                     break
         if location:
-            row = self.assets.latest(project_id, "scene_art", location)
+            # 按本镜机位选最贴近的场景母版视角(反打/侧向),缺则回退
+            # 主视角——同一空间不同机位不再各画各的。
+            row, scene_label = self._scene_view_reference(
+                project_id, location, camera)
             if (row and formal_reference_allowed(self._asset_quality(row))
                     and row["uri"] and Path(row["uri"]).exists()
                     and remember(row["uri"])):
                 refs["scene_ref"] = row["uri"]
                 refs["asset_matches"].append({
                     "asset_id": row["id"], "kind": row["kind"],
-                    "name": row["name"], "label": f"场景:{location}",
+                    "name": row["name"], "label": scene_label,
                     "uri": row["uri"],
                 })
         matched_rows = (self._matching_produced_image_rows(
@@ -8462,6 +8612,7 @@ class Director:
             **self._art_refs(
                 ctx, identity_characters, location,
                 shot_no=shot["shot_no"],
+                camera=shot.get("camera"),
                 sheet_keys=self._shot_reference_sheet_keys(shot),
                 sheet_keys_by_character=(
                     self._shot_reference_sheet_keys_by_character(

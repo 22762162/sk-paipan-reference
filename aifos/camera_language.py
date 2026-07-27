@@ -41,6 +41,32 @@ POSITION_GEOMETRY = {
 }
 
 
+# 场景母版视角集:key → (中文名, 机位描述)。反打/侧向以主视角图为
+# 参考链式生成,保证同一空间在不同机位下结构一致。
+SCENE_VIEWS = {
+    "main": ("主视角", "建立镜头的默认机位"),
+    "reverse": ("反打视角", "从主视角正对面的机位回看同一空间"),
+    "side": ("侧向视角", "与主视角成约90度的侧向机位"),
+}
+
+
+def scene_view_for_camera(camera):
+    """镜头机位 → 最贴近的场景母版视角 key(main/reverse/side)。
+
+    接受结构化 camera dict(取「机位」字段)或原始镜头文本;
+    未命中一律回主视角,绝不因视角判断阻断出图。
+    """
+    if isinstance(camera, dict):
+        text = str(camera.get("机位") or "")
+    else:
+        text = str(camera or "")
+    if any(token in text for token in ("背面", "背后", "过肩", "反打")):
+        return "reverse"
+    if any(token in text for token in ("侧面", "侧脸", "侧向")):
+        return "side"
+    return "main"
+
+
 def camera_geometry_clause(camera):
     """结构化镜头(dict,含 景别/角度/机位)→ 可核验几何条款。
 
