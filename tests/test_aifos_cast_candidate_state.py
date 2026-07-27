@@ -1,0 +1,50 @@
+"""人物定妆母版:一次性剧情状态(湿/泥/伤/姿态)必须剥离。
+
+定妆母版硬规定「全身正面自然站姿」。把场次里的失去支撑、跪地、
+搀扶等动作姿态写进母版,会与该硬规则直接矛盾,提示词审核禁止
+猜测取舍只能熔断,整批人物图卡死(《雨夜凶杀》cast 阶段两次熔断
+的真实成因)。稳定人物设计(材质、磨旧、旧疤、配饰)必须完整保留。
+"""
+
+import pytest
+
+from aifos.director import Director
+
+clean = Director._clean_candidate_initial_state_text
+
+
+@pytest.mark.parametrize("text, gone, kept", [
+    # 真实熔断语料:审核报「姿态与遇害动作状态直接冲突」
+    ("青灰粗布长衫，正面全身可见但正在失去支撑的护包姿态，怀中紧抱蓝布包袱",
+     ("失去支撑", "护包", "紧抱"), ("青灰粗布长衫",)),
+    ("土黄短打，跪地扶住伤口，面色苍白",
+     ("跪地", "扶住", "伤口"), ("土黄短打",)),
+    ("灰褐布衣被暴雨浸透，沾黄泥水，踉跄着俯身",
+     ("浸透", "泥水", "踉跄", "俯身"), ("灰褐布衣",)),
+    ("月白襦裙，蜷缩在墙角，肩头颤抖着",
+     ("蜷缩", "颤抖"), ("月白襦裙",)),
+    ("玄色劲装，转身伸手指向门外",
+     ("转身", "伸手", "指向"), ("玄色劲装",)),
+])
+def test_transient_states_and_postures_are_stripped(text, gone, kept):
+    result = clean(text)
+    for token in gone:
+        assert token not in result, f"{token!r} 未被剥离: {result}"
+    for token in kept:
+        assert token in result, f"稳定设计 {token!r} 被误删: {result}"
+
+
+@pytest.mark.parametrize("text", [
+    "藏青长衫，磨旧下摆，腰间旧革带",
+    "赭石色圆领袍，肘部补丁，左眉旧疤",
+    "靛蓝粗布短褐，草绳束腰，木簪挽发",
+])
+def test_stable_design_survives_untouched(text):
+    """稳定人物设计不含一次性状态时必须一字不改。"""
+    assert clean(text) == text
+
+
+def test_empty_and_none_are_safe():
+    assert clean(None) == ""
+    assert clean("") == ""
+    assert clean("，，；") == ""
