@@ -1719,6 +1719,73 @@ def validate_asset_prompt(data):
     return None
 
 
+RULE_APPEAL_PROMPT = """你是本剧生产平台的规则仲裁官(终审法庭)。平台的内置校验规则做初审,
+它是死的字面规则;你要判断这次判败到底是**真违规**,还是**规则字面化误杀 /
+剧情本来就需要这样**。
+
+被判败的规则:{rule_id}
+规则给出的判败理由:
+{rule_reason}
+
+被检查的实际内容(判决对象):
+{subject}
+
+剧情与镜头上下文(事实源):
+{context}
+
+平台冲突裁决规则(优先级宪法,你的判决必须与它一致):
+{adjudication}
+
+判决准则:
+- 只要事实**实质存在**,写法不同不算违规:数字区间「25-30」等同「25至30岁」;
+  「共7名可见真人:3名登记角色加4名弓兵」等同「7人」;繁简异体同字;
+  同义表述(单人/一名角色/同一角色)等同;
+- 规则要求的东西在本镜**物理上不可能或不该出现**(景别太远看不见、被裁切、
+  被背向遮挡、剧情要求该物不在场),不算违规;
+- 剧本/镜头合同明确要求的剧情安排,不因与通用默认规则不符而判违规;
+- 反过来:事实**真的被删改**(人数变了、角色被合并、道具消失、锁定文字被改),
+  必须维持原判——这类放行会直接产出废图,后果比误杀更严重;
+- 不确定时维持原判(宁可多修一次,不可放行错图)。
+
+举证要求(硬性):撤销原判必须在 evidence 里**逐字引用**被检查内容中
+证明事实存在的原文片段;引用不出来就必须维持原判。
+
+只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块:
+{{"schema": "aifos.rule_appeal.v1",
+ "verdict": "upheld 或 overturned",
+ "reason": "一句话说明判决依据",
+ "evidence": "撤销时逐字引用的原文片段;维持原判时写空字符串",
+ "suggested_rule_fix": "若判定为规则字面化误杀,用一句话说明规则该怎么改才不再误杀;否则空字符串"}}
+"""
+
+
+def validate_rule_appeal(data, payload=None):
+    """规则仲裁输出的最小校验:撤销原判必须举证。"""
+    if not isinstance(data, dict):
+        return "输出必须是 JSON 对象"
+    if data.get("schema") != "aifos.rule_appeal.v1":
+        return "schema 必须是 aifos.rule_appeal.v1"
+    verdict = str(data.get("verdict") or "").strip().lower()
+    if verdict not in {"upheld", "overturned"}:
+        return "verdict 只能是 upheld 或 overturned"
+    data["verdict"] = verdict
+    if not str(data.get("reason") or "").strip():
+        return "缺少 reason"
+    evidence = str(data.get("evidence") or "").strip()
+    if verdict == "overturned":
+        if len(evidence) < 4:
+            return "撤销原判必须在 evidence 逐字引用证明事实存在的原文"
+        subject = str((payload or {}).get("subject") or "")
+        if subject and evidence not in subject:
+            # 允许仲裁做最小裁剪(去引号/省略号),但主干必须真的在原文里
+            core = evidence.strip("「」\"'．. …").strip()
+            if not core or core not in subject:
+                return "evidence 不是被检查内容中的原文,不能作为撤销依据"
+    for key in ("reason", "evidence", "suggested_rule_fix"):
+        data[key] = str(data.get(key) or "").strip()
+    return None
+
+
 PROP_DESIGN_PROMPT = """你是本剧的道具设计总监。以下核心/身份识别道具已进入剧本的道具登记表,
 但还没有可出图的设计卡。你要只依据正式剧本中的事实与合理工艺推导,为每件道具补全设计卡。
 
@@ -1861,6 +1928,15 @@ def build_prompt(capability, payload):
             feedback=payload.get("feedback", "") or "(无)",
             references=references or "(无)",
             style=payload.get("style", "") or "(未指定)")
+    if capability == "script" and payload.get("rule_appeal"):
+        return RULE_APPEAL_PROMPT.format(
+            rule_id=payload.get("rule_id", ""),
+            rule_reason=payload.get("rule_reason", ""),
+            subject=str(payload.get("subject") or "")[:8000],
+            context=json.dumps(payload.get("context") or {},
+                               ensure_ascii=False)[:8000],
+            adjudication=json.dumps(payload.get("adjudication") or {},
+                                    ensure_ascii=False))
     if capability == "script" and payload.get("prop_design"):
         return PROP_DESIGN_PROMPT.format(
             script=json.dumps(payload.get("script") or {},
@@ -2224,6 +2300,8 @@ def _postprocess_and_validate(capability, payload, data):
         error = validate_shot_repair(data, payload)
     elif capability == "script" and payload.get("prop_design"):
         error = validate_prop_design(data, payload)
+    elif capability == "script" and payload.get("rule_appeal"):
+        error = validate_rule_appeal(data, payload)
     elif capability == "script" and payload.get("story_analysis"):
         error = validate_story_analysis(
             data, require_resolved_identity=False)

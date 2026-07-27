@@ -558,6 +558,9 @@ def _cmd_stats(app):
     from .qc_stats import format_qc_table, summarize_qc
     print("== 质检失败原因分类(近 7 天)==")
     print(format_qc_table(summarize_qc(app.workspace.logs_dir)))
+    from .rule_appeals import format_appeal_table, summarize_appeals
+    print("== 规则上诉庭:死规则误杀台账(近 7 天)==")
+    print(format_appeal_table(summarize_appeals(app.workspace.logs_dir)))
     return 0
 
 

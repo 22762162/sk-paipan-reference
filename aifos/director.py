@@ -3341,9 +3341,42 @@ class Director:
             return task
         contract = task.get("_dispatch_contract") or {}
         if contract.get("passed") is not True:
-            raise AifosError(
-                "提示词/参考图输入合同未通过，未调用生图模型："
-                + "；".join(contract.get("issues") or ["未知输入错误"]))
+            issues = list(contract.get("issues") or ["未知输入错误"])
+            reason = ("提示词/参考图输入合同未通过，未调用生图模型："
+                      + "；".join(issues))
+            # 规则上诉庭:合同校验是纯字面死规则(交集/相位/枚举),
+            # 今晚多起批量熔断都出在这里。判败先交仲裁复核一次,
+            # 事实实质无碍即放行并记误杀台账;真违规照常拦。
+            payload = task.get("payload") or {}
+            appeal = self.router._appeal_rule_verdict(
+                rule_id="dispatch_contract.validation",
+                rule_reason=reason,
+                subject=str(payload.get("prompt_compact")
+                            or payload.get("prompt") or "")[:8000],
+                context={
+                    "issues": issues[:12],
+                    "shot_no": payload.get("shot_no"),
+                    "camera": payload.get("camera"),
+                    "characters": payload.get("characters"),
+                    "visible_figure_count": payload.get(
+                        "visible_figure_count"),
+                    "frame_props": (payload.get("prop_contract") or {}).get(
+                        "frame_props"),
+                    "prop_transitions": (
+                        payload.get("prop_contract") or {}).get(
+                            "prop_transitions"),
+                },
+                out_dir=ctx["out_root"],
+                payload={"episode_id": ctx["episode"]["id"],
+                         "item_id": task.get("item_id", "")},
+                capability=task.get("capability", ""),
+                cancel=lambda: self._cancel_requested(ctx))
+            if not appeal.get("overturned"):
+                raise AifosError(reason)
+            self.log.info(
+                "director",
+                f"{task.get('item_id')} 合同校验判败经仲裁撤销(规则误杀)"
+                f",放行生产: {str(appeal.get('reason') or '')[:200]}")
         request = self.image_acceleration.claim(
             ctx["episode"]["id"], task["item_id"], token)
         if request is None:
