@@ -118,3 +118,27 @@ def test_character_master_declares_precedence_over_fact_source():
     from aifos.director import CHARACTER_CANDIDATE_PROMPT_SCHEMA
     # schema 版本必须随裁决条款升级,否则旧提示词会被继续复用
     assert "v4" in CHARACTER_CANDIDATE_PROMPT_SCHEMA
+
+
+def test_scene_master_context_excludes_drama_facts():
+    """空镜合同只带环境事实;场次人物/尸体/动作绝不入合同。
+
+    《雨夜凶杀》独立资产批次熔断:「镜头局部合同中的人物与尸体出镜
+    要求,和同属镜头局部合同的空镜要求相互排斥」——正是 action 被
+    装进了空镜合同。
+    """
+    director = Director.__new__(Director)
+    scene = {"location": "雨夜公寓单元房", "time_of_day": "深夜暴雨",
+             "action": "林川推门发现书童尸体倒在血泊中,黑衣人跃出",
+             "production_design": {"environment": "老式单元房,昏黄吸顶灯",
+                                    "lighting": "单一顶光,窗外闪电"}}
+    context = director._scene_art_review_context(
+        "雨夜公寓单元房", "写实悬疑", scene)
+    blob = str(context)
+    # 禁止条款里合法出现裸词「尸体」("画面绝不出现…尸体");
+    # 只断言戏剧原文短语没有混入。
+    for drama in ("尸体倒在", "血泊", "黑衣人", "推门", "跃出"):
+        assert drama not in blob, f"戏剧事实 {drama!r} 混入空镜合同"
+    assert "昏黄吸顶灯" in blob            # 环境事实保留
+    assert "优先级最高" in context["master_state_precedence"]
+    assert context["time_and_weather"] == "深夜暴雨"

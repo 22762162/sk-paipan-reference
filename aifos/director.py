@@ -1991,6 +1991,44 @@ class Director:
                 "材质、设备、建筑与陈设严格服从剧本时代/世界观、地域和社会阶层，"
                 "不凭空加入不属于故事的现代或古代元素")
 
+    def _scene_art_review_context(self, location, style, scene):
+        """场景环境母版(空镜)的独立审核事实合同。
+
+        场次 action 是"这场戏里发生了什么"(人物、尸体、动作),不是
+        环境事实;把它与「空镜无人物」并列进合同,就是一对同级互斥,
+        审核只能照章阻断。母版合同只带环境事实,空镜规则升格为显式
+        裁决条款(全局裁决第(a)级直接执行)。
+        """
+        scene = scene or {}
+        production_design = (
+            scene.get("production_design")
+            if isinstance(scene.get("production_design"), dict) else {})
+        environment = {
+            key: str(production_design.get(key) or "").strip()
+            for key in ("environment", "layout",
+                        "materials_and_props", "lighting")
+            if str(production_design.get(key) or "").strip()
+        }
+        return {
+            "schema": "aifos.scene-art-review/v1-master-precedence",
+            "task": "scene_environment_master_asset",
+            "location": location,
+            "time_and_weather": str(
+                scene.get("time_of_day") or scene.get("time") or "").strip(),
+            "environment_facts": environment,
+            "master_state_precedence": (
+                "本合同是场景环境母版(空镜):画面绝不出现人物、尸体、"
+                "人体局部、剪影、倒影中的人或随机路人。场次剧情中的人物、"
+                "动作与事件只用于推断环境痕迹的合理性(如陈设、光源、"
+                "使用痕迹),人物本身一律不进入画面。本条优先级最高,"
+                "与任何来源的人物/出镜要求并列时直接按本条执行,"
+                "不构成需要裁决的冲突"),
+            "composition": (
+                "环境建立镜头:前景/主体区/背景层次清楚,预留角色进出"
+                "与表演动线,机位高度与光线方向稳定,后续镜头可复用"),
+            "style": style,
+        }
+
     def _scene_prompt(self, location, style, scene=None, premise=""):
         """场景概念图提示词:只建立可复用环境,不把人物画风误当场景内容。"""
         scene = scene or {}
@@ -6919,12 +6957,17 @@ class Director:
                     "image_quality": scene_quality[location]["level"],
                     "quality_decision": scene_quality[location],
                     "shot_no": 0, "characters": [], "location": location,
-                    "action": scene.get("action", ""),
+                    # 场次 action(人物/尸体/剧情动作)是戏剧事实,不是
+                    # 环境事实——进入空镜合同会构成同级互斥,已移除;
+                    # 环境线索经 production_design 与场景提示词传递。
                     "prompt": self._scene_prompt(
                         location, style, scene,
                         premise=ctx["episode"].get("premise", "")),
                     "style": style,
                     "prompt_contract_complete": True,
+                    "prompt_review_context":
+                        self._scene_art_review_context(
+                            location, style, scene),
                     **scene_references,
                     "style_ref": self._style_anchor_uri(project_id),
                     "require_reference_images": bool(
