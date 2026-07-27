@@ -501,16 +501,27 @@ JSON 结构:
 
 
 def extract_json(text):
-    """从 Claude 输出中提取第一个合法 JSON 对象(容忍前后杂讯)。"""
+    """从模型输出中提取最大的合法 JSON 对象(容忍前后杂讯)。
+
+    推理型引擎的最终答复常带分析文字,里面可能夹着小的 {...} 片段
+    (示例、引用)。取"第一个"会抓到这些碎片,把整份剧本/分镜误判成
+    "缺少 scenes/shots";取"最大的"才是真正的产出。
+    """
     decoder = json.JSONDecoder()
+    best = None
+    best_span = -1
     idx = text.find("{")
     while idx != -1:
         try:
-            obj, _ = decoder.raw_decode(text[idx:])
-            return obj
+            obj, end = decoder.raw_decode(text[idx:])
         except ValueError:
             idx = text.find("{", idx + 1)
-    return None
+            continue
+        if isinstance(obj, dict) and end > best_span:
+            best, best_span = obj, end
+        # 跳过整个已解析片段,避免重复解析其内部子对象
+        idx = text.find("{", idx + max(end, 1))
+    return best
 
 
 WORLD_FIELDS = (
@@ -1951,8 +1962,21 @@ def run(request, claude, timeout, engine="claude", codex="codex",
         if fixed is not None:
             return {"ok": True, "data": fixed, "uri": "",
                     "repaired_fields": True}
+        # 原始输出落盘:校验失败的现场证据,免得下次盲猜模型到底
+        # 回了什么(路径回传在错误信息里)。
+        dump_note = ""
+        try:
+            out_dir = Path(request.get("out_dir") or ".")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            dump = out_dir / f"writer_failure_{capability}.txt"
+            dump.write_text(
+                f"engine={engine}\nerror={error}{note}\n"
+                f"--- raw output ---\n{text}\n", encoding="utf-8")
+            dump_note = f"(原始输出已存 {dump})"
+        except OSError:
+            pass
         return {"ok": False,
-                "error": f"{engine} 输出校验失败: {error}{note}"}
+                "error": f"{engine} 输出校验失败: {error}{note}{dump_note}"}
     return {"ok": True, "data": data, "uri": ""}
 
 
