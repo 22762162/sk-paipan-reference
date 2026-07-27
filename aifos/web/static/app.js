@@ -6808,6 +6808,7 @@ function assetCardHtml(ep, target, url, label, mock, assetId = null) {
 
 const ASSET_BOARD_GROUPS = [
   { key: "production", label: "主生产资产", hint: "会直接进入镜头、首尾帧或视频" },
+  { key: "studio", label: "自建资产库", hint: "自己在资产工坊生产的人物/风格/场景/物品" },
   { key: "character_support", label: "人物辅助设定", hint: "四视图、服装、妆容和细节参考" },
   { key: "candidate", label: "候选与历史", hint: "未定版候选只用于挑选，不进入镜头" },
   { key: "reference", label: "上传参考图", hint: "按角色或场景关联调用" },
@@ -6815,6 +6816,7 @@ const ASSET_BOARD_GROUPS = [
 ];
 
 function assetBoardGroupKey(item) {
+  if (item.studio) return "studio";
   if (item.board_group) return item.board_group;
   if (["character_art", "scene_art", "image", "first_frame",
     "last_frame", "cover"].includes(item.kind)) return "production";
@@ -6834,11 +6836,20 @@ function assetCatalogCardHtml(item) {
   const source = `《${item.source_project || "未命名作品"}》`
     + (item.source_episode ? ` · 第 ${item.source_episode} 集` : " · 项目公共资产");
   const group = assetBoardGroupKey(item);
-  return `<article class="asset-catalog-card" data-category="${esc(item.category)}" data-group="${esc(group)}">
+  const studioActions = item.studio ? `
+    <button class="studio-edit" data-studio-edit="${item.asset_id}"
+      title="按当前这张图和提示词继续改，改好的图作为同名资产的新版本">✎ 改一改</button>
+    <button class="studio-copy" data-studio-copy="${item.asset_id}"
+      title="把这张自建资产复用到其他作品，共用同一张图">↗ 复用到其他作品</button>` : "";
+  return `<article class="asset-catalog-card${item.studio ? " studio-card" : ""}"
+    data-category="${esc(item.category)}" data-group="${esc(group)}">
     <div class="asset-catalog-media"><img class="zoomable"
       src="${esc(thumbUrl(item.url, 480))}" loading="lazy" alt="${esc(item.label)}"></div>
     <div class="asset-catalog-head"><span class="asset-category-chip">${esc(item.category_label)}</span>
       <span class="asset-usage-chip ${item.selected ? "selected" : ""}">${esc(item.usage_label || assetBoardGroupLabel(item))}</span>
+      ${item.studio ? `<span class="studio-chip">${STUDIO_TYPE_ICONS[item.studio_asset_type] || "🎬"} 自建</span>` : ""}
+      ${item.studio && item.real === false ? `<span class="plan-st st-mock"
+        title="占位产线画的示意图；接入真实出图产线后重画才是真实 AI 图">⚠ 占位图</span>` : ""}
       <b>${esc(item.label)}</b></div>
     <dl class="asset-origin-meta">
       <div><dt>来源作品</dt><dd>${esc(source)}</dd></div>
@@ -6847,9 +6858,311 @@ function assetCatalogCardHtml(item) {
     </dl>
     <details class="asset-prompt"><summary>查看提示词</summary>
       <p class="${item.prompt_status === "recorded" ? "" : "dim"}">${esc(item.prompt)}</p></details>
-    <button class="asset-del danger" data-asset-id="${item.asset_id}"
-      title="从资产中心隐藏当前版本；历史版本和原文件仍会保留">🗑 删除</button>
+    <div class="asset-card-actions">${studioActions}
+      <button class="asset-del danger" data-asset-id="${item.asset_id}"
+        title="从资产中心隐藏当前版本；历史版本和原文件仍会保留">🗑 删除</button></div>
   </article>`;
+}
+
+/* ================= 资产工坊:自建资产库 =================
+   自己命名任意角色/风格/场景/物品,自己写提示词或让 AI 代写;
+   产出登记为参考图资产,后续制作按「用途 + 关联对象」自动或手动调用。*/
+const STUDIO_TYPE_ICONS = {
+  character: "👤", style: "🎨", scene: "🏞", prop: "🧰",
+};
+const STUDIO_TYPE_PLACEHOLDERS = {
+  character: "如：林晚·冷艳版",
+  style: "如：夜雨霓虹画风基准",
+  scene: "如：雨夜天台",
+  prop: "如：青铜罗盘",
+};
+const STUDIO_BRIEF_PLACEHOLDERS = {
+  character: "一句话说清人物：如「二十七岁女警，冷艳短发，黑风衣，锐利眼神」",
+  style: "一句话说清画风：如「水墨渲染，青灰配色，留白构图，宣纸质感」",
+  scene: "一句话说清场景：如「雨夜写字楼天台，霓虹反光，湿滑地面」",
+  prop: "一句话说清物品：如「手掌大小的青铜罗盘，篆刻刻度，磨损铜绿」",
+};
+/* 表单草稿常驻内存:出图后页面会重载资产列表,输入不能被清掉 */
+let studioDraft = null;
+
+function studioDefaults(options) {
+  const first = ((options || {}).asset_types || [])[0] || {};
+  return {
+    asset_type: first.value || "character",
+    name: "", brief: "", prompt: "", negative_prompt: "",
+    feedback: "", attach_to: "", reference_role: "",
+    aspect: first.aspect || "9:16", count: 1, optimize: false,
+    prompt_source: "manual", references: [],
+    base_asset_id: null, base_label: "",
+  };
+}
+
+function studioTypeConf(options, value) {
+  return ((options || {}).asset_types || [])
+    .find((item) => item.value === value) || {};
+}
+
+function assetStudioHtml(options, draft, catalogItems) {
+  const types = options.asset_types || [];
+  const conf = studioTypeConf(options, draft.asset_type);
+  const roles = options.reference_roles || [];
+  const activeRole = draft.reference_role || conf.reference_role || "";
+  const refs = (catalogItems || []).filter((item) => item.url);
+  const chosen = new Set((draft.references || []).map(Number));
+  return `<section class="panel asset-panel asset-studio" id="asset-studio">
+    <h2>🎬 生产资产图片 <span class="dim">自己命名、自己写提示词（也可让 AI 写），
+      人物 / 画风 / 场景 / 物品都能做；做好的图直接进资产库，
+      后续制作按用途自动或手动当参考图用</span></h2>
+    <div class="studio-types">${types.map((item) => `
+      <button class="studio-type ${draft.asset_type === item.value ? "active" : ""}"
+        data-studio-type="${esc(item.value)}" title="${esc(item.hint)}">
+        <b>${STUDIO_TYPE_ICONS[item.value] || "🎬"} ${esc(item.label)}</b>
+        <span>${esc(item.hint)}</span></button>`).join("")}
+    </div>
+    ${draft.base_asset_id ? `<div class="studio-base-chip">✎ 正在改：
+      <b>${esc(draft.base_label)}</b>
+      <span class="dim">改好的图会成为同名资产的新版本，旧版本和原文件都保留</span>
+      <button id="studio-base-clear">改成新建资产</button></div>` : ""}
+    <div class="studio-grid">
+      <label>资产名称（自己起，随便什么角色都行）
+        <input id="studio-name" value="${esc(draft.name)}"
+          placeholder="${esc(STUDIO_TYPE_PLACEHOLDERS[draft.asset_type] || "自己起个名字")}"></label>
+      <label>参考用途（决定它在制作里能覆盖什么）
+        <select id="studio-role">${roles.map((item) => `<option value="${esc(item.value)}"
+          ${activeRole === item.value ? "selected" : ""}>${esc(item.label)}</option>`).join("")}
+        </select></label>
+      <label>关联角色 / 场景
+        <input id="studio-attach" list="studio-attach-list" value="${esc(draft.attach_to)}"
+          placeholder="${draft.asset_type === "style" ? "画风可留空＝全项目通用"
+            : "留空则按资产名称自动关联"}"></label>
+      <label>画幅
+        <select id="studio-aspect">${(options.aspects || ["9:16", "16:9"]).map((item) =>
+          `<option ${draft.aspect === item ? "selected" : ""}>${esc(item)}</option>`).join("")}
+        </select></label>
+      <label>一次出几张
+        <select id="studio-count" ${draft.base_asset_id ? "disabled" : ""}>
+          ${Array.from({ length: options.max_count || 4 }, (_, i) => i + 1).map((n) =>
+            `<option ${Number(draft.count) === n ? "selected" : ""}>${n}</option>`).join("")}
+        </select></label>
+    </div>
+    <datalist id="studio-attach-list">${(options.attach_options || []).map((n) =>
+      `<option>${esc(n)}</option>`).join("")}</datalist>
+    <div class="studio-brief-row">
+      <input id="studio-brief" value="${esc(draft.brief)}"
+        placeholder="${esc(STUDIO_BRIEF_PLACEHOLDERS[draft.asset_type] || "一句话说清你要什么")}">
+      <button id="studio-ai-prompt">🤖 让 AI 写提示词</button>
+    </div>
+    <label class="studio-prompt-label">出图提示词
+      <span class="dim">可以完全自己写；点上面按钮让 AI 写完后仍然可以随便改</span>
+      <textarea id="studio-prompt" rows="6"
+        placeholder="直接写你要的画面。写得越具体越稳：外貌、服装、光线、背景、画风">${esc(draft.prompt)}</textarea>
+    </label>
+    <div id="studio-notes" class="studio-notes dim">${(draft.notes || []).map((n) =>
+      `<div>· ${esc(n)}</div>`).join("")}</div>
+    <div class="studio-grid studio-grid-2">
+      <label>不希望出现的内容（可留空）
+        <input id="studio-negative" value="${esc(draft.negative_prompt)}"
+          placeholder="如：文字、水印、多余人物"></label>
+      <label>修改意见（改图时必须落实，可留空）
+        <input id="studio-feedback" value="${esc(draft.feedback)}"
+          placeholder="如：头发再长一点，改成齐肩"></label>
+    </div>
+    <details class="studio-refs" ${chosen.size ? "open" : ""}>
+      <summary>📎 选参考图（可选，勾上的图会真实发给出图产线）
+        <span class="studio-ref-count">${chosen.size ? `已选 ${chosen.size} 张` : "未选"}</span></summary>
+      ${refs.length ? `<div class="studio-ref-grid">${refs.map((item) => `
+        <label class="studio-ref-card ${chosen.has(Number(item.asset_id)) ? "on" : ""}">
+          <input type="checkbox" class="studio-ref" value="${item.asset_id}"
+            ${chosen.has(Number(item.asset_id)) ? "checked" : ""}>
+          <img src="${esc(thumbUrl(item.url, 240))}" loading="lazy" alt="">
+          <span class="studio-ref-name">${esc(item.name)}</span>
+          <span class="studio-ref-role dim">${esc(item.usage_label || item.category_label || "")}</span>
+        </label>`).join("")}</div>`
+        : `<div class="dim">本作品还没有可选的图片资产。</div>`}
+    </details>
+    <label class="studio-optimize">
+      <input type="checkbox" id="studio-optimize" ${draft.optimize ? "checked" : ""}>
+      <span>出图前先让 AI 审核优化提示词<small>更稳，但会改写你的原稿；
+        不勾选则严格按你写的执行</small></span></label>
+    <div class="studio-actions">
+      <button class="primary" id="studio-generate">🎬 开始生产</button>
+      <span id="studio-status" class="dim"></span>
+    </div>
+  </section>`;
+}
+
+function readStudioForm(draft) {
+  const value = (id) => (document.getElementById(id) || {}).value || "";
+  return {
+    ...draft,
+    name: value("studio-name").trim(),
+    brief: value("studio-brief").trim(),
+    prompt: value("studio-prompt").trim(),
+    negative_prompt: value("studio-negative").trim(),
+    feedback: value("studio-feedback").trim(),
+    attach_to: value("studio-attach").trim(),
+    reference_role: value("studio-role"),
+    aspect: value("studio-aspect"),
+    count: Number(value("studio-count") || 1),
+    optimize: !!(document.getElementById("studio-optimize") || {}).checked,
+    references: [...document.querySelectorAll(".studio-ref:checked")]
+      .map((box) => Number(box.value)),
+  };
+}
+
+function bindAssetStudio(title, options, rerender, reload) {
+  const status = document.getElementById("studio-status");
+  const sync = () => { studioDraft = readStudioForm(studioDraft); };
+  document.querySelectorAll("[data-studio-type]").forEach((btn) => {
+    btn.onclick = () => {
+      sync();
+      const next = btn.dataset.studioType;
+      const conf = studioTypeConf(options, next);
+      studioDraft.asset_type = next;
+      // 换类型时用途/画幅回到该类型的默认值，避免「画风资产」还挂着
+      // 人物身份用途去污染角色。
+      studioDraft.reference_role = conf.reference_role || "";
+      studioDraft.aspect = conf.aspect || studioDraft.aspect;
+      rerender();
+    };
+  });
+  const clearBase = document.getElementById("studio-base-clear");
+  if (clearBase) clearBase.onclick = () => {
+    sync();
+    studioDraft.base_asset_id = null;
+    studioDraft.base_label = "";
+    rerender();
+  };
+  document.querySelectorAll(".studio-ref").forEach((box) => {
+    box.onchange = () => {
+      box.closest(".studio-ref-card").classList.toggle("on", box.checked);
+      const count = document.querySelectorAll(".studio-ref:checked").length;
+      const chip = document.querySelector(".studio-ref-count");
+      if (chip) chip.textContent = count ? `已选 ${count} 张` : "未选";
+    };
+  });
+  const aiBtn = document.getElementById("studio-ai-prompt");
+  if (aiBtn) aiBtn.onclick = async () => {
+    sync();
+    if (!studioDraft.brief && !studioDraft.prompt && !studioDraft.feedback) {
+      showToast("先写一句需求，AI 才知道要画什么", "error");
+      return;
+    }
+    aiBtn.disabled = true;
+    status.textContent = "AI 正在写提示词…";
+    try {
+      const result = await api("/api/asset-studio/prompt", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project: title, asset_type: studioDraft.asset_type,
+          name: studioDraft.name, brief: studioDraft.brief,
+          prompt: studioDraft.prompt, feedback: studioDraft.feedback,
+          reference_asset_ids: studioDraft.references,
+        }),
+      });
+      studioDraft.prompt = result.image_prompt || "";
+      studioDraft.negative_prompt = result.negative_prompt
+        || studioDraft.negative_prompt;
+      studioDraft.notes = result.notes || [];
+      studioDraft.prompt_source = "ai";
+      rerender();
+      showToast(result.real === false
+        ? "提示词由占位产线生成，仅供参考；接入真实编剧产线后更准"
+        : `AI 提示词已生成（${result.provider}），可以直接改`, "ok");
+    } catch (e) {
+      showToast(e.message, "error");
+    } finally {
+      aiBtn.disabled = false;
+      if (status) status.textContent = "";
+    }
+  };
+  const genBtn = document.getElementById("studio-generate");
+  if (genBtn) genBtn.onclick = async () => {
+    sync();
+    if (!studioDraft.name) {
+      showToast("先给这个资产起个名字", "error");
+      return;
+    }
+    if (studioDraft.prompt.length < 8) {
+      showToast("提示词太短；自己写一条，或点「让 AI 写提示词」", "error");
+      return;
+    }
+    genBtn.disabled = true;
+    const count = studioDraft.base_asset_id ? 1 : Number(studioDraft.count || 1);
+    status.textContent = `正在生产 ${count} 张，真实出图通常要 1-3 分钟…`;
+    try {
+      const result = await api("/api/asset-studio/generate", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project: title, asset_type: studioDraft.asset_type,
+          name: studioDraft.name, prompt: studioDraft.prompt,
+          negative_prompt: studioDraft.negative_prompt,
+          feedback: studioDraft.feedback,
+          attach_to: studioDraft.attach_to,
+          reference_role: studioDraft.reference_role,
+          reference_asset_ids: studioDraft.references,
+          base_asset_id: studioDraft.base_asset_id,
+          aspect: studioDraft.aspect, count,
+          optimize_prompt: studioDraft.optimize,
+          prompt_source: studioDraft.prompt_source,
+        }),
+      });
+      studioDraft.base_asset_id = null;
+      studioDraft.base_label = "";
+      showToast(result.mock
+        ? `已生成 ${result.items.length} 张，但走的是占位产线，不是真实 AI 出图`
+        : `已生产 ${result.items.length} 张「${result.items[0].name}」，`
+          + `用途：${result.role_label}${result.attach_to ? "·关联 " + result.attach_to : ""}`,
+        result.mock ? "info" : "ok");
+      reload();
+    } catch (e) {
+      showToast(e.message, "error");
+      status.textContent = "";
+    } finally {
+      genBtn.disabled = false;
+    }
+  };
+}
+
+function showStudioCopyDialog(item, projects, currentTitle) {
+  const targets = (projects || []).filter((p) => p.title !== currentTitle);
+  if (!targets.length) {
+    showToast("还没有其他作品可复用；先新建一部作品", "info");
+    return;
+  }
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay studio-copy-overlay";
+  overlay.innerHTML = `<div class="studio-copy-box">
+    <h3>↗ 把「${esc(item.name)}」复用到其他作品</h3>
+    <p class="dim">共用同一张图，不复制文件；在目标作品里同样按用途和关联对象生效。</p>
+    <select id="studio-copy-target">${targets.map((p) =>
+      `<option>${esc(p.title)}</option>`).join("")}</select>
+    <div class="studio-copy-actions">
+      <button class="primary" id="studio-copy-go">确认复用</button>
+      <button id="studio-copy-cancel">取消</button></div></div>`;
+  const close = () => overlay.remove();
+  overlay.addEventListener("click", (ev) => {
+    if (ev.target === overlay) close();
+  });
+  overlay.querySelector("#studio-copy-cancel").onclick = close;
+  overlay.querySelector("#studio-copy-go").onclick = async (ev) => {
+    ev.target.disabled = true;
+    try {
+      const result = await api("/api/asset-studio/copy", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project: currentTitle, asset_id: item.asset_id,
+          target_project: overlay.querySelector("#studio-copy-target").value,
+        }),
+      });
+      showToast(`已复用到《${result.project}》，名称：${result.name}`, "ok");
+      close();
+    } catch (e) {
+      showToast(e.message, "error");
+      ev.target.disabled = false;
+    }
+  };
+  document.body.appendChild(overlay);
 }
 
 function assetCatalogHtml(items, category = "all") {
@@ -6912,6 +7225,14 @@ async function renderAssetsCenter(selectedTitle) {
     const catalog = await api(`/api/asset-images?project=${encodeURIComponent(title)}`);
     art.image_assets = catalog.items || [];
   } catch (e) { art.image_assets = art.image_assets || []; }
+  let studioOptions = null;
+  try {
+    studioOptions = await api(
+      `/api/asset-studio/options?project=${encodeURIComponent(title)}`);
+  } catch (e) { studioOptions = null; }
+  // 换作品时草稿必须重置:勾选的参考图 id 只在原作品里有效
+  if (studioOptions && (!studioDraft || studioDraft.project !== title))
+    studioDraft = { ...studioDefaults(studioOptions), project: title };
   // 占位图标注:该资产最后一次是占位产线画的 → 卡片红标提醒
   const mockIds = new Set(
     (((epData || {}).render_plan || {}).items || [])
@@ -6946,6 +7267,7 @@ async function renderAssetsCenter(selectedTitle) {
         `<option ${p.title === title ? "selected" : ""}>${esc(p.title)}</option>`).join("")}</select>
       <span class="hint">人物资产范围可按集选择;最终人物形象图始终进入出图与质检</span>
     </div>
+    ${studioOptions ? assetStudioHtml(studioOptions, studioDraft, boardItems) : ""}
     <section class="panel asset-panel asset-catalog-panel">
       <div class="asset-catalog-toolbar"><div><h2>🧭 资产画布</h2>
         <p class="dim">先看会进入生产的资产，再展开人物设定、候选和上传参考；避免所有图片混在一列。</p></div>
@@ -7074,7 +7396,49 @@ async function renderAssetsCenter(selectedTitle) {
       } catch (e) { showToast(e.message, "error"); }
     });
   const reload = () => renderAssetsCenter(title);
+  const renderStudio = () => {
+    if (!studioOptions) return;
+    const host = document.getElementById("asset-studio");
+    if (!host) return;
+    host.outerHTML = assetStudioHtml(
+      studioOptions, studioDraft, art.image_assets || []);
+    bindAssetStudio(title, studioOptions, renderStudio, reload);
+  };
+  if (studioOptions) bindAssetStudio(title, studioOptions, renderStudio, reload);
+  const bindStudioAssetButtons = () => {
+    app.querySelectorAll("[data-studio-edit]").forEach((btn) => {
+      btn.onclick = () => {
+        const item = (art.image_assets || []).find((row) =>
+          String(row.asset_id) === btn.dataset.studioEdit);
+        if (!item || !studioOptions) return;
+        studioDraft = {
+          ...studioDefaults(studioOptions),
+          project: title,
+          asset_type: item.studio_asset_type || "character",
+          name: item.name,
+          prompt: item.prompt_status === "recorded" ? item.prompt : "",
+          attach_to: item.attach_to || "",
+          reference_role: item.reference_role || "",
+          base_asset_id: item.asset_id,
+          base_label: item.name,
+          count: 1,
+        };
+        renderStudio();
+        const host = document.getElementById("asset-studio");
+        if (host) host.scrollIntoView({ behavior: "smooth", block: "start" });
+        showToast("已载入这张图；写下修改意见后点「开始生产」出新版本", "info");
+      };
+    });
+    app.querySelectorAll("[data-studio-copy]").forEach((btn) => {
+      btn.onclick = () => {
+        const item = (art.image_assets || []).find((row) =>
+          String(row.asset_id) === btn.dataset.studioCopy);
+        if (item) showStudioCopyDialog(item, projects, title);
+      };
+    });
+  };
   const bindAssetDeleteButtons = () => {
+    bindStudioAssetButtons();
     app.querySelectorAll(".asset-del").forEach((btn) => {
       btn.onclick = (ev) => armConfirm(ev.target, "删除", async () => {
         try {

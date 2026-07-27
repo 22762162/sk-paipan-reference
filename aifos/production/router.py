@@ -54,6 +54,9 @@ class ProviderRouter:
         except (TypeError, ValueError):
             self._codex_parallel_per_channel = 3
         self._codex_profile_slots = {}
+        # 本次运行内因题材安全策略拒收的 (provider, capability):
+        # 悬疑/凶案类剧集会被某些图片 API 整集拒绝,记一次即绕开。
+        self._safety_blocked = set()
         # 通道取用优先级 = 配置列表顺序(只含启用通道):前面的通道并发
         # 占满后才溢出到后面的通道(如 B、C 先行,A 兜底)。
         self._codex_profile_order = []
@@ -475,6 +478,23 @@ class ProviderRouter:
                 "blocking_reason": "低层兼容调用未提供AIFOS生图提示词",
             }
             return None
+        if payload.get("prompt_review_exempt"):
+            # 资产工坊(用户自建资产):没有剧本、人数、道具等下游逐字合同
+            # 要守,用户自己写的提示词就是唯一事实源。此处只登记豁免事实,
+            # 不进入剧集产线的 Codex 提示词审核硬门禁,也不改写用户原稿。
+            payload["prompt_review"] = {
+                "schema": self.PROMPT_REVIEW_SCHEMA,
+                "approved": False,
+                "status": "not_applicable_user_studio",
+                "original_prompt": source,
+                "optimized_prompt": source,
+                "issues_found": [],
+                "changes_made": [],
+                "blocking_reason": (
+                    "用户自建资产按原提示词执行;"
+                    "该产物不参与剧集提示词审核门禁"),
+            }
+            return None
         context = self._prompt_review_context(capability, payload)
         input_hash = self._stable_hash({
             "prompt": source,
@@ -550,9 +570,31 @@ class ProviderRouter:
                 if segments:
                     evidence = "；优化稿人数相关片段:「" + "／".join(
                         seg[:60] for seg in segments) + "」"
-            raise ProviderError(
+            rule_reason = (
                 "Codex优化稿删除了不可变事实，拒绝生图："
                 + "、".join(missing[:20]) + evidence)
+            # 死规则只是初审:字面校验判败的,交 AI 仲裁复核一次。
+            # 事实实质存在(换了写法/等价表述)即撤销原判放行并记台账;
+            # 事实真被删改则维持原判,照常拒绝生图。
+            appeal = self._appeal_rule_verdict(
+                rule_id="prompt_review.immutable_facts",
+                rule_reason=rule_reason,
+                subject=optimized,
+                context={
+                    "missing_tokens": missing[:20],
+                    "expected_character_count": payload.get(
+                        "character_count"),
+                    "functional_figures": payload.get("functional_figures"),
+                    "original_prompt": source[:4000],
+                },
+                out_dir=out_dir, payload=payload, capability=capability,
+                cancel=cancel)
+            if not appeal.get("overturned"):
+                raise ProviderError(rule_reason)
+            self.log.info(
+                "router",
+                "字面校验判败经仲裁撤销(规则误杀),放行本稿: "
+                + str(appeal.get("reason") or "")[:200])
         audit_record = {
             "schema": self.PROMPT_REVIEW_SCHEMA,
             "approved": True,
@@ -584,6 +626,79 @@ class ProviderRouter:
         return result
 
     # ---- 调用 ----
+    @staticmethod
+    def _is_safety_rejection(exc):
+        """产线是否因内容安全策略拒收(而非临时故障)。
+
+        题材决定的拒绝对同一集的其它镜头一样会发生,重试与逐张试错
+        都没有意义,应当整条产线绕开;临时故障则照常按张回退重试。
+        """
+        text = str(exc)
+        return any(token in text for token in (
+            "safety_violations", "rejected by the safety system",
+            "safety system", "content_policy_violation",
+            "content policy", "内容安全", "安全策略",
+        ))
+
+    def _appeal_rule_verdict(self, *, rule_id, rule_reason, subject,
+                             context, out_dir, payload=None,
+                             capability="", cancel=None):
+        """规则上诉庭:内置死规则判败 → AI 仲裁复核一次。
+
+        用户拍板的三级法院(2026-07-28):规则是死的、剧情是活的。
+        规则做零成本初审,通过的直接生产;判败的才上诉,由仲裁带着
+        裁决条款与上下文判断"真违规 vs 字面化误杀"。撤销必须逐字
+        举证(validate_rule_appeal 强制),证据对不上一律维持原判。
+        返回 {"overturned": bool, "reason": str, ...};仲裁本身
+        不可用/出错时按维持原判处理(失败关闭,不放行未知风险)。
+        """
+        from ..rule_governance import prompt_adjudication_clause
+        from ..rule_appeals import (VERDICT_OVERTURNED, VERDICT_UPHELD,
+                                    record_appeal)
+        result = None
+        data = {}
+        try:
+            result = self.call("script", {
+                "rule_appeal": True,
+                "rule_id": rule_id,
+                "rule_reason": rule_reason,
+                "subject": subject,
+                "context": context,
+                "adjudication": prompt_adjudication_clause(),
+            }, out_dir, cancel=cancel)
+            data = result.data or {}
+        except (ProviderError, ProviderUnavailable) as exc:
+            self.log.warn(
+                "router",
+                f"规则仲裁不可用({str(exc)[:160]}),维持原判: {rule_id}")
+        except Exception as exc:   # 仲裁绝不能反过来拖垮产线
+            self.log.warn(
+                "router",
+                f"规则仲裁异常({str(exc)[:160]}),维持原判: {rule_id}")
+        overturned = str(data.get("verdict") or "") == VERDICT_OVERTURNED
+        if data:
+            record_appeal(
+                out_dir,
+                episode_id=(payload or {}).get("episode_id"),
+                item_id=str((payload or {}).get("item_id")
+                            or (payload or {}).get("shot_no") or ""),
+                rule_id=rule_id,
+                capability=capability,
+                verdict=(VERDICT_OVERTURNED if overturned
+                         else VERDICT_UPHELD),
+                rule_reason=rule_reason,
+                arbiter_reason=data.get("reason", ""),
+                evidence=data.get("evidence", ""),
+                provider=(result.provider if result is not None else ""),
+                model=(result.model if result is not None else ""),
+                suggested_rule_fix=data.get("suggested_rule_fix", ""))
+        return {
+            "overturned": overturned,
+            "reason": data.get("reason", ""),
+            "evidence": data.get("evidence", ""),
+            "suggested_rule_fix": data.get("suggested_rule_fix", ""),
+        }
+
     def call(self, capability, payload, out_dir, cancel=None):
         prompt_review_result = None
         if capability in self.IMAGE_CAPABILITIES:
@@ -627,6 +742,10 @@ class ProviderRouter:
                     fallbacks.append(
                         {"provider": name, "reason": "订阅额度已耗尽"})
                     continue
+            if (name, capability) in self._safety_blocked:
+                reason = "本集题材已被该产线安全策略整体拒收"
+                fallbacks.append({"provider": name, "reason": reason})
+                continue
             ok, reason = provider.available(capability)
             if not ok:
                 self.log.info(
@@ -665,8 +784,20 @@ class ProviderRouter:
                     result = provider.generate(capability, payload, out_dir,
                                                cancel=cancel)
             except ProviderError as exc:
-                self.log.warn(
-                    "router", f"{name} 执行失败({exc}),回退({capability})")
+                if self._is_safety_rejection(exc):
+                    # 题材级拒绝:《雨夜凶杀》这类有尸体/血迹的剧,
+                    # OpenAI 安全系统会拒掉本集几乎每一张图(实测 73 次
+                    # 全拒)。每张都先撞一次墙再回退纯属浪费,记下来
+                    # 本次运行内不再向该产线投同类任务。
+                    self._safety_blocked.add((name, capability))
+                    self.log.warn(
+                        "router",
+                        f"{name} 因题材安全策略拒绝本集内容(尸体/血迹等),"
+                        f"本次运行不再向它投递 {capability},直接用后续产线")
+                else:
+                    self.log.warn(
+                        "router",
+                        f"{name} 执行失败({exc}),回退({capability})")
                 fallbacks.append(
                     {"provider": name, "reason": f"执行失败: {exc}"})
                 continue

@@ -593,6 +593,63 @@ REFERENCE_ROLES = {
     "identity", "wardrobe", "scene", "composition", "style", "manual",
     "inner_persona",
 }
+
+# 资产工坊:用户自建资产库。名称完全由用户决定,不需要剧本里存在这个角色;
+# 产物登记为 reference 资产,后续制作按 用途(role)+关联对象(attach_to)
+# 自动进入对应任务,或在参考图选择器里手动调用。
+STUDIO_ASSET_TYPES = {
+    "character": {
+        "label": "人物形象",
+        "hint": "自己命名任意角色;剧本出现同名角色时自动作为定妆与设定图的身份参考",
+        "reference_role": "identity",
+        "aspect": "9:16",
+        "attach_defaults_to_name": True,
+    },
+    "style": {
+        "label": "画风基准",
+        "hint": "只控制媒介、色调与质感;不绑定人物,全项目通用,视频参考自动带上",
+        "reference_role": "style",
+        "aspect": "16:9",
+        "attach_defaults_to_name": False,
+    },
+    "scene": {
+        "label": "场景空间",
+        "hint": "空间概念图;与场景同名时自动作为该场景参考",
+        "reference_role": "scene",
+        "aspect": "16:9",
+        "attach_defaults_to_name": True,
+    },
+    "prop": {
+        "label": "物品道具",
+        "hint": "单件物品母资产;关联到角色后作为其服装/道具参考",
+        "reference_role": "wardrobe",
+        "aspect": "9:16",
+        "attach_defaults_to_name": False,
+    },
+}
+STUDIO_TYPE_ALIASES = {
+    "人物": "character", "角色": "character", "形象": "character",
+    "风格": "style", "画风": "style",
+    "场景": "scene", "空间": "scene",
+    "物品": "prop", "道具": "prop",
+}
+STUDIO_ROLE_LABELS = {
+    "identity": "人物身份参考", "wardrobe": "服装/道具参考",
+    "scene": "场景空间参考", "composition": "构图/动作参考",
+    "style": "画风参考", "manual": "手动参考图",
+    "inner_persona": "内心Q版参考",
+}
+# 勾选已有资产当参考时,按资产类型推断它能承担的单一职责。
+STUDIO_KIND_ROLES = {
+    "character_art": "identity", "character_identity": "identity",
+    "character_candidate": "identity", "inner_persona": "identity",
+    "character_sheet": "wardrobe", "prop_identity": "wardrobe",
+    "prop_candidate": "wardrobe", "scene_art": "scene",
+    "image": "composition", "first_frame": "composition",
+    "last_frame": "composition", "cover": "composition",
+    "spatial_blocking": "composition",
+}
+STUDIO_MAX_COUNT = 4
 # Seedream 5 Lite 当前最多接收 10 张参考图。导演层按最小公共上限组织
 # 参考图，避免同一任务切换模型时图序、人物或构图语义发生漂移。
 IMAGE_REFERENCE_LIMIT = 10
@@ -3284,9 +3341,42 @@ class Director:
             return task
         contract = task.get("_dispatch_contract") or {}
         if contract.get("passed") is not True:
-            raise AifosError(
-                "提示词/参考图输入合同未通过，未调用生图模型："
-                + "；".join(contract.get("issues") or ["未知输入错误"]))
+            issues = list(contract.get("issues") or ["未知输入错误"])
+            reason = ("提示词/参考图输入合同未通过，未调用生图模型："
+                      + "；".join(issues))
+            # 规则上诉庭:合同校验是纯字面死规则(交集/相位/枚举),
+            # 今晚多起批量熔断都出在这里。判败先交仲裁复核一次,
+            # 事实实质无碍即放行并记误杀台账;真违规照常拦。
+            payload = task.get("payload") or {}
+            appeal = self.router._appeal_rule_verdict(
+                rule_id="dispatch_contract.validation",
+                rule_reason=reason,
+                subject=str(payload.get("prompt_compact")
+                            or payload.get("prompt") or "")[:8000],
+                context={
+                    "issues": issues[:12],
+                    "shot_no": payload.get("shot_no"),
+                    "camera": payload.get("camera"),
+                    "characters": payload.get("characters"),
+                    "visible_figure_count": payload.get(
+                        "visible_figure_count"),
+                    "frame_props": (payload.get("prop_contract") or {}).get(
+                        "frame_props"),
+                    "prop_transitions": (
+                        payload.get("prop_contract") or {}).get(
+                            "prop_transitions"),
+                },
+                out_dir=ctx["out_root"],
+                payload={"episode_id": ctx["episode"]["id"],
+                         "item_id": task.get("item_id", "")},
+                capability=task.get("capability", ""),
+                cancel=lambda: self._cancel_requested(ctx))
+            if not appeal.get("overturned"):
+                raise AifosError(reason)
+            self.log.info(
+                "director",
+                f"{task.get('item_id')} 合同校验判败经仲裁撤销(规则误杀)"
+                f",放行生产: {str(appeal.get('reason') or '')[:200]}")
         request = self.image_acceleration.claim(
             ctx["episode"]["id"], task["item_id"], token)
         if request is None:
@@ -3404,6 +3494,138 @@ class Director:
     # ---- 图片视觉质检:生成后核对剧本要求,不合格自动带意见重画 ----
     def _image_qc_enabled(self):
         return bool(self.config.get("defaults", "image_qc", default=True))
+
+    def _dual_review_enabled(self, consecutive_failures=0):
+        """双路会诊开关:默认只在首检失败后启用(诊断最值钱的地方)。
+
+        defaults.dual_qc = off | on_failure(默认) | always。
+        首检单路省额度,失败后才上第二路分工深查。
+        """
+        mode = str(self.config.get(
+            "defaults", "dual_qc", default="on_failure")).strip().lower()
+        if mode in ("off", "false", "0", "no"):
+            return False
+        if mode in ("always", "true", "1", "yes"):
+            return True
+        return int(consecutive_failures or 0) >= 1
+
+    def _merge_dual_verdicts(self, primary, secondary):
+        """两路判定合并:判定取共识、问题取并集、矛盾单列。
+
+        - 都说过 → 过;任一路说不过 → 不过(漏放的代价远大于多修一次);
+        - 问题并集去重(同义两说合一),矛盾指令(一个要加一个要删同一
+          对象)单独标出,绝不把互斥指令一起塞给修图模型——那正是
+          "多份事实源各说各话"在修图端复现。
+        """
+        from .qc_feedback import issue_severity
+        merged = copy.deepcopy(primary or {})
+        secondary = secondary or {}
+        primary_pass = primary.get("pass") is True
+        secondary_pass = secondary.get("pass") is True
+        merged["pass"] = primary_pass and secondary_pass
+        issues, seen = [], set()
+        for issue in [*(primary.get("issues") or []),
+                      *(secondary.get("issues") or [])]:
+            text = str(issue).strip()
+            if not text:
+                continue
+            key = re.sub(r"[\s，。；、,.:：]+", "", text)[:40]
+            if key in seen:
+                continue
+            seen.add(key)
+            issues.append(text)
+        issues.sort(key=issue_severity)
+        merged["issues"] = issues
+        conflicts = self._conflicting_issue_pairs(issues)
+        if conflicts:
+            merged["dual_review_conflicts"] = conflicts
+        merged["dual_review"] = {
+            "primary_pass": primary_pass,
+            "secondary_pass": secondary_pass,
+            "agreed": primary_pass == secondary_pass,
+            "primary_issue_count": len(primary.get("issues") or []),
+            "secondary_issue_count": len(secondary.get("issues") or []),
+            "merged_issue_count": len(issues),
+            "conflicts": conflicts,
+        }
+        for key in ("detected_count", "detected_overlay_count"):
+            if merged.get(key) in (None, "") and secondary.get(key) not in (
+                    None, ""):
+                merged[key] = secondary[key]
+        return merged
+
+    def _resolve_dual_conflicts(self, issues, conflicts, qc_spec, out_dir,
+                                cancel=None):
+        """两路互斥意见交上诉庭裁一次,败方从修订清单里剔除。
+
+        仲裁不可用时保守处理:两条都撤下(宁可本轮不修这一项,也不
+        把互斥指令一起下发——那必然产出更糟的图)。
+        """
+        removed = set()
+        for pair in conflicts:
+            first, second = pair.get("a", ""), pair.get("b", "")
+            appeal = self.router._appeal_rule_verdict(
+                rule_id="dual_qc.conflicting_issues",
+                rule_reason=(
+                    "两路质检对同一对象给出互斥修改意见,必须按本镜合同"
+                    f"裁定哪一条成立:①{first} ②{second}"),
+                subject=f"①{first}\n②{second}",
+                context={
+                    "shot_contract": qc_spec.get("composition_contract"),
+                    "physical_contract": qc_spec.get("physical_contract"),
+                    "expected_characters": qc_spec.get(
+                        "expected_characters"),
+                    "readable_text": qc_spec.get("readable_text"),
+                    "instruction": (
+                        "verdict=upheld 表示①成立(剔除②);"
+                        "verdict=overturned 表示②成立(剔除①);"
+                        "evidence 必须逐字引自被检查内容"),
+                },
+                out_dir=out_dir,
+                payload={"item_id": qc_spec.get("item_id", "")},
+                capability="image_qc", cancel=cancel)
+            if not appeal.get("reason"):
+                removed.update({first, second})
+                self.log.warn(
+                    "director",
+                    "两路互斥意见未能裁决,本轮双方都不下发,避免互相"
+                    f"抵消: ①{first[:60]} ②{second[:60]}")
+                continue
+            loser = second if not appeal.get("overturned") else first
+            removed.add(loser)
+            self.log.info(
+                "director",
+                "两路互斥意见已裁决,剔除败方: "
+                + f"{loser[:80]}(依据: {str(appeal.get('reason'))[:120]})")
+        return [item for item in issues if item not in removed]
+
+    @staticmethod
+    def _conflicting_issue_pairs(issues):
+        """互斥修改意见对(一路要加、另一路要删同一对象)。"""
+        add_tokens = ("缺少", "没有", "未出现", "不可见", "应当出现",
+                      "少了", "缺失")
+        drop_tokens = ("多余", "不应出现", "多出", "禁止出现", "删除",
+                       "额外")
+        conflicts = []
+        for index, first in enumerate(issues):
+            for second in issues[index + 1:]:
+                first_add = any(t in first for t in add_tokens)
+                first_drop = any(t in first for t in drop_tokens)
+                second_add = any(t in second for t in add_tokens)
+                second_drop = any(t in second for t in drop_tokens)
+                if not ((first_add and second_drop)
+                        or (first_drop and second_add)):
+                    continue
+                # 指向同一对象才算矛盾:取双方 2 字以上的共同名词片段
+                grams = {first[i:i + 2] for i in range(len(first) - 1)}
+                shared = [
+                    second[i:i + 2] for i in range(len(second) - 1)
+                    if second[i:i + 2] in grams
+                    and not re.search(r"[，。；、,.:：\s]", second[i:i + 2])
+                ]
+                if len(set(shared)) >= 3:
+                    conflicts.append({"a": first[:160], "b": second[:160]})
+        return conflicts[:5]
 
     def _qc_retries(self):
         try:
@@ -4543,6 +4765,30 @@ class Director:
             "的一张进入人工/修图流程")
         return final_result
 
+    @staticmethod
+    def _repeated_core_issues(attempt_history):
+        """连续两轮都出现、且属于决定性档位的问题(修图没修动的证据)。
+
+        判据用决定性档位而不是逐字比对:判官每轮措辞都不同("少了1名
+        弓兵" vs "只有6人少于要求的7人"),逐字比对必然漏判;文本分类
+        器同样会被措辞带偏。连续两轮都在决定性档(人数/身份/性别/生死/
+        道具在场)翻车,就说明改图这条路对本图无效,该重新起画。
+        细节类(服装/景别/构图)反复不触发换策略。
+        """
+        from .qc_feedback import issue_severity
+        rounds = [
+            row.get("qc_issues") or []
+            for row in attempt_history[-2:]
+            if row.get("qc_passed") is False]
+        if len(rounds) < 2:
+            return []
+        decisive_per_round = [
+            [issue for issue in issues if issue_severity(issue) <= 30]
+            for issues in rounds]
+        if not all(decisive_per_round):
+            return []
+        return decisive_per_round[-1]
+
     def _generate_image_with_qc(self, capability, payload, out_dir,
                                 cancel, qc_spec):
         """出图 + 视觉质检 + 不合格自动重画(worker 线程安全:只调产线)。
@@ -4653,9 +4899,42 @@ class Director:
                 if payload.get("_codex_profile"):
                     qc_payload["_codex_profile"] = payload[
                         "_codex_profile"]
+                dual = self._dual_review_enabled(
+                    failure_count_base + attempts)
+                if dual:
+                    qc_payload["review_lens"] = "identity"
                 qc_result = self.router.call(
                     "image_qc", qc_payload, out_dir,
                     cancel=cancel)
+                if dual:
+                    # 第二路:同一张图、同一份合同,重点核查另一半清单。
+                    # 判定取共识、问题取并集;第二路故障自动降级单路,
+                    # 绝不因会诊失败卡住产线。
+                    second_payload = copy.deepcopy(qc_payload)
+                    second_payload["review_lens"] = "scene"
+                    second_payload.pop("_codex_profile", None)
+                    try:
+                        second_result = self.router.call(
+                            "image_qc", second_payload, out_dir,
+                            cancel=cancel)
+                        result.cost += float(second_result.cost or 0.0)
+                        qc_result.data = self._merge_dual_verdicts(
+                            qc_result.data or {}, second_result.data or {})
+                        merge_info = (qc_result.data or {}).get(
+                            "dual_review") or {}
+                        self.log.info(
+                            "director",
+                            "双路会诊完成(身份路+场景路):判定"
+                            + ("一致" if merge_info.get("agreed") else "分歧")
+                            + f",问题并集 {merge_info.get('merged_issue_count')} 条"
+                            + (f",互斥意见 {len(merge_info.get('conflicts') or [])} 组"
+                               if merge_info.get("conflicts") else ""))
+                    except ProduceCancelled:
+                        raise
+                    except (ProviderUnavailable, ProviderError) as exc:
+                        self.log.warn(
+                            "director",
+                            f"第二路质检不可用,本图降级单路: {str(exc)[:160]}")
             except (ProviderUnavailable, ProviderError) as exc:
                 # 人物镜头不能在质检故障时静默放行。保留已生成图片供人工
                 # 查看，但明确标成质检未过，后续不得当作正式参考图。
@@ -4715,8 +4994,18 @@ class Director:
                 }
                 return result
             result.cost += qc_result.cost
+            verdict_data = qc_result.data or {}
+            conflicts = verdict_data.get("dual_review_conflicts") or []
+            if conflicts:
+                # 两路给出互斥指令(一路要加、一路要删同一对象):绝不能
+                # 把矛盾一起塞给修图模型(那是"多份事实源各说各话"在
+                # 修图端复现)。交上诉庭按镜头合同裁一次,只留胜方。
+                verdict_data = copy.deepcopy(verdict_data)
+                verdict_data["issues"] = self._resolve_dual_conflicts(
+                    verdict_data.get("issues") or [], conflicts,
+                    qc_spec, out_dir, cancel=cancel)
             report = self._assess_image_qc(
-                qc_spec, qc_result.data or {}, attempts + 1)
+                qc_spec, verdict_data, attempts + 1)
             revision = optimize_qc_feedback(
                 report["issues"], mode="image",
                 readable_text=qc_spec.get("readable_text"),
@@ -4726,6 +5015,9 @@ class Director:
             history_row.update({
                 "qc_passed": bool(report["passed"]),
                 "qc_cost": float(qc_result.cost or 0.0),
+                # 逐轮问题原文:换策略判据(同一决定性问题是否跨轮存活)
+                "qc_issues": [str(item) for item in
+                              (report.get("issues") or [])][:12],
                 "image_error": copy.deepcopy(report["image_error"]),
                 "prompt_diagnosis": copy.deepcopy(
                     report["prompt_diagnosis"]),
@@ -4771,6 +5063,37 @@ class Director:
             if (report["passed"] or not report["redraw_required"]
                     or attempts >= self._qc_retries()):
                 return result
+            # 修图不收敛就换策略:同一条核心问题连修两轮还在,继续微调
+            # 只会打地鼠(实测镜头21 四轮 5→7→10 条,还撞出新的身份漂移)。
+            # 改为丢掉"待修改基底"重新起画——重抽比死磕更省更准。
+            if (report["consecutive_failures"] >= 2
+                    and not payload.get("_qc_fresh_redraw")):
+                repeated = self._repeated_core_issues(attempt_history)
+                if repeated:
+                    payload = copy.deepcopy(payload)
+                    payload["_qc_fresh_redraw"] = True
+                    payload.pop("source_qc_uri", None)
+                    payload["revision_mode"] = "fresh_redraw"
+                    payload["feedback"] = (
+                        "上一版连续两轮都没修好以下决定性问题,本次不要在"
+                        "旧图上修改,重新起画并首先保证这些点正确:"
+                        + "；".join(item[:120] for item in repeated[:3]))
+                    payload["reference_images"] = [
+                        uri_ for uri_ in (
+                            payload.get("reference_images") or [])
+                        if uri_ != uri]
+                    payload["asset_matches"] = [
+                        match for match in (
+                            payload.get("asset_matches") or [])
+                        if match.get("reference_role") != "revision_base"]
+                    self._attach_reference_manifest(payload)
+                    self.log.info(
+                        "director",
+                        f"{qc_spec.get('item_id') or '本图'}连续两轮未修好"
+                        f"核心问题,转为重新起画(不再在废图上改): "
+                        + "；".join(item[:60] for item in repeated[:2]))
+                    attempts += 1
+                    continue
             diagnostics = report["input_diagnosis"]
             proposed = retry_input_decision(
                 generation_input["prompt"],
@@ -15451,6 +15774,384 @@ class Director:
         return {"status": "done", "redone": redone}
 
     # ---- 参考图管理:上传的参考图会自动进入出图提示(关联角色/场景) ----
+    # ---- 资产工坊:自定义命名的自建资产库 ----
+
+    def _studio_project(self, project_title):
+        project = self.projects.get_project(project_title)
+        if project is None:
+            raise AifosError(f"项目不存在: {project_title}")
+        return project
+
+    @staticmethod
+    def _studio_type(asset_type):
+        key = str(asset_type or "").strip().lower()
+        key = STUDIO_TYPE_ALIASES.get(key, key)
+        if key not in STUDIO_ASSET_TYPES:
+            raise AifosError(
+                "资产类型必须是 character(人物)/style(风格)/"
+                "scene(场景)/prop(物品)")
+        return key, STUDIO_ASSET_TYPES[key]
+
+    def _studio_dir(self, project):
+        path = self.artifacts_root / f"p{project['id']:03d}" / "studio"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _studio_reference_payload(self, project, asset_ids, base_row=None):
+        """把用户勾选的资产中心图片编成本次出图的参考图与单一职责说明。
+
+        base_row 是「改一改」的原图:标注为待修改基底，下游会按
+        「只改意见提到的部分」绑定，不当成新的身份/服装来源。
+        """
+        rows = []
+        if base_row is not None:
+            rows.append((base_row, True))
+        for value in asset_ids or []:
+            try:
+                row = self.assets.get(int(value))
+            except (TypeError, ValueError):
+                raise AifosError(f"参考图 id 不合法: {value}")
+            if row is None or int(row["project_id"]) != int(project["id"]):
+                raise AifosError(f"参考图不属于本作品: {value}")
+            rows.append((row, False))
+        uris, matches, seen = [], [], set()
+        for row, is_base in rows:
+            uri = str(row["uri"] or "")
+            if not uri or uri in seen:
+                continue
+            if not uri.startswith(("http://", "https://")) \
+                    and not Path(uri).exists():
+                raise AifosError(f"参考图文件缺失: {row['name']}")
+            seen.add(uri)
+            meta = self._asset_meta(row)
+            if is_base:
+                role = "manual"
+                label = f"{row['name']}·待修改基底"
+            else:
+                role = (self._reference_role(row)
+                        if row["kind"] == "reference"
+                        else STUDIO_KIND_ROLES.get(row["kind"], "manual"))
+                label = f"{row['name']}·{STUDIO_ROLE_LABELS.get(role, '参考图')}"
+            uris.append(uri)
+            matches.append({
+                "asset_id": row["id"], "kind": row["kind"],
+                "name": row["name"], "label": label, "uri": uri,
+                "reference_role": role,
+                "attach_to": str(meta.get("attach_to") or ""),
+            })
+        if len(uris) > IMAGE_REFERENCE_LIMIT:
+            raise AifosError(
+                f"参考图最多 {IMAGE_REFERENCE_LIMIT} 张,当前选了 {len(uris)} 张")
+        return uris, matches
+
+    def studio_asset_options(self, project_title):
+        """资产工坊表单选项:资产类型、参考用途、画幅与可关联的角色/场景。"""
+        project = self._studio_project(project_title)
+        attach_options = set()
+        for row in self.assets.active_list(project["id"]):
+            meta = self._asset_meta(row)
+            if row["kind"] in ("character_art", "scene_art", "character"):
+                attach_options.add(row["name"])
+            elif meta.get("attach_to"):
+                attach_options.add(str(meta["attach_to"]))
+        return {
+            "project": project["title"],
+            "style": project["style"] or "",
+            "asset_types": [
+                {"value": key, "label": conf["label"], "hint": conf["hint"],
+                 "reference_role": conf["reference_role"],
+                 "aspect": conf["aspect"]}
+                for key, conf in STUDIO_ASSET_TYPES.items()],
+            "reference_roles": [
+                {"value": role, "label": STUDIO_ROLE_LABELS[role]}
+                for role in ("identity", "wardrobe", "scene",
+                             "composition", "style", "manual")],
+            "aspects": sorted(ASPECT_DIMS),
+            "max_count": STUDIO_MAX_COUNT,
+            "attach_options": sorted(attach_options),
+        }
+
+    def studio_prompt(self, project_title, asset_type, name="", brief="",
+                      current_prompt="", feedback="",
+                      reference_asset_ids=None, style=None):
+        """AI 代写出图提示词:只产出文本供用户确认修改,不出图、不落盘。"""
+        project = self._studio_project(project_title)
+        kind, conf = self._studio_type(asset_type)
+        brief = str(brief or "").strip()
+        feedback = str(feedback or "").strip()
+        current = str(current_prompt or "").strip()
+        name = str(name or "").strip()
+        if not (brief or current or feedback):
+            raise AifosError(
+                "请先写一句需求,例如「冷艳短发女特工,黑色皮衣,雨夜霓虹」")
+        uris, _matches = self._studio_reference_payload(
+            project, reference_asset_ids)
+        result = self.router.call("script", {
+            "asset_prompt": True,
+            "asset_type": kind,
+            "asset_type_label": conf["label"],
+            "asset_name": name,
+            "brief": brief,
+            "current_prompt": current,
+            "feedback": feedback,
+            "references": uris,
+            "style": (str(style).strip() if style is not None
+                      else (project["style"] or "")),
+            "project_title": project["title"],
+        }, self._studio_dir(project))
+        data = result.data or {}
+        prompt = str(data.get("image_prompt") or "").strip()
+        if not prompt:
+            raise AifosError("AI 没有写出提示词,请补充需求后重试")
+        self.log.info(
+            "director",
+            f"资产工坊已为「{name or brief[:12]}」({conf['label']})"
+            f"生成出图提示词(产线:{result.provider})")
+        return {
+            "asset_type": kind,
+            "asset_type_label": conf["label"],
+            "image_prompt": prompt,
+            "negative_prompt": str(data.get("negative_prompt") or "").strip(),
+            "notes": [str(item) for item in (data.get("notes") or [])],
+            "provider": result.provider,
+            "real": result.provider != "mock",
+            "cost": float(result.cost or 0.0),
+        }
+
+    def _studio_asset_names(self, project_id, name, count, reuse=False):
+        """自建资产命名:改图沿用原名(叠新版本),新建则自动避重。"""
+        if reuse:
+            return [name] * count
+        names, taken = [], set()
+        for index in range(count):
+            candidate = name if index == 0 else f"{name} {index + 1:02d}"
+            serial = index + 1
+            while (candidate in taken
+                   or self.assets.latest(
+                       project_id, "reference", candidate) is not None):
+                serial += 1
+                candidate = f"{name} {serial:02d}"
+            taken.add(candidate)
+            names.append(candidate)
+        return names
+
+    def generate_studio_asset(self, project_title, asset_type, name, prompt,
+                              negative_prompt="", feedback="", attach_to="",
+                              reference_role="", note="",
+                              reference_asset_ids=None, base_asset_id=None,
+                              aspect="", style=None, count=1,
+                              optimize_prompt=False, prompt_source="manual"):
+        """生产一张(或几张)自建资产图片并登记进资产中心。
+
+        产物 kind=reference:后续制作按 用途+关联对象 自动进入对应任务,
+        没有关联对象的图仍可在参考图选择器里手动调用。
+        """
+        project = self._studio_project(project_title)
+        kind, conf = self._studio_type(asset_type)
+        prompt = str(prompt or "").strip()
+        if len(prompt) < 8:
+            raise AifosError("提示词太短;请自己写一条或点「AI 写提示词」")
+        base_row = None
+        if base_asset_id not in (None, ""):
+            try:
+                base_row = self.assets.get(int(base_asset_id))
+            except (TypeError, ValueError):
+                raise AifosError(f"待修改资产 id 不合法: {base_asset_id}")
+            if base_row is None \
+                    or int(base_row["project_id"]) != int(project["id"]):
+                raise AifosError("待修改资产不存在或不属于本作品")
+            if self.assets.is_deleted(base_row):
+                raise AifosError("待修改资产已删除;请先选一张有效的图")
+        name = str(name or "").strip() or (
+            str(base_row["name"]) if base_row is not None else "")
+        if not name:
+            raise AifosError("请给这个资产起个名字(如「林晚·冷艳版」)")
+        if len(name) > 60:
+            raise AifosError("资产名称不能超过 60 个字")
+        # 改图沿用原资产名叠加新版本;旧版本与原文件全部保留可回溯。
+        reuse_name = (base_row is not None
+                      and base_row["kind"] == "reference"
+                      and name == str(base_row["name"]))
+        try:
+            count = int(count or 1)
+        except (TypeError, ValueError):
+            raise AifosError("生成张数必须是 1-4 的整数")
+        count = max(1, min(count, STUDIO_MAX_COUNT))
+        if reuse_name:
+            count = 1   # 同名改图一次只出一张,避免历史版本被连叠淹没
+        role = str(reference_role or "").strip().lower()
+        role = {
+            "人物": "identity", "身份": "identity",
+            "服装": "wardrobe", "道具": "wardrobe",
+            "场景": "scene", "空间": "scene",
+            "构图": "composition", "动作": "composition",
+            "画风": "style", "风格": "style",
+        }.get(role, role)
+        if not role:
+            role = conf["reference_role"]
+        if role not in REFERENCE_ROLES:
+            raise AifosError(
+                "参考图用途必须是 identity/wardrobe/scene/"
+                "composition/style/manual")
+        attach_to = str(attach_to or "").strip()
+        if not attach_to and conf["attach_defaults_to_name"]:
+            # 用户自己命名的角色/场景默认关联到同名对象:剧本里出现这个
+            # 名字时自动生效,不出现时仍可手动调用,不会污染其他角色。
+            attach_to = name
+        if role != "style" and not attach_to:
+            role = "manual"
+        aspect = str(aspect or "").strip() or conf["aspect"]
+        if aspect not in ASPECT_DIMS:
+            raise AifosError(f"画幅必须是 {'/'.join(sorted(ASPECT_DIMS))}")
+        dims = ASPECT_DIMS[aspect]
+        style_text = (str(style).strip() if style is not None
+                      else (project["style"] or ""))
+        negative_prompt = str(negative_prompt or "").strip()
+        feedback = str(feedback or "").strip()
+        ref_uris, ref_matches = self._studio_reference_payload(
+            project, reference_asset_ids, base_row=base_row)
+        studio_dir = self._studio_dir(project)
+        names = self._studio_asset_names(
+            project["id"], name, count, reuse=reuse_name)
+        prompt_text = prompt
+        if negative_prompt:
+            prompt_text = f"{prompt_text}。画面中不得出现:{negative_prompt}"
+        registered, total_cost, providers = [], 0.0, set()
+        for asset_name in names:
+            existing = self.assets.latest(
+                project["id"], "reference", asset_name, include_deleted=True)
+            version = (int(existing["version"]) + 1) if existing else 1
+            # 文件名按每张资产各自的名字取:一次连出多张时,
+            # 每张必须落到独立文件,不能互相覆盖。
+            safe = "".join(
+                c if c.isalnum() else "_" for c in asset_name)[:40] or "asset"
+            payload = {
+                "studio_asset": kind,
+                "studio_asset_label": conf["label"],
+                "art_name": asset_name,
+                "prompt": prompt_text,
+                "prompt_compact": prompt_text,
+                "prompt_contract_complete": True,
+                "feedback": feedback,
+                "style": style_text,
+                "aspect": aspect,
+                "width": dims["width"], "height": dims["height"],
+                "image_task_class": "important",
+                "image_quality": "high",
+                "reference_images": list(ref_uris),
+                "asset_matches": copy.deepcopy(ref_matches),
+                # 自建资产没有剧本人数/道具等逐字合同要守,用户提示词本身
+                # 就是唯一事实源;勾选「让 AI 审核优化」才走剧集审核产线。
+                "prompt_review_exempt": not bool(optimize_prompt),
+            }
+            self._attach_reference_manifest(payload)
+            result = self.router.call("image", payload, studio_dir)
+            source = Path(str(result.uri or ""))
+            if not source.exists():
+                raise AifosError(f"产线没有产出图片文件: {result.uri or '(空)'}")
+            dest = studio_dir / f"{safe}_{kind}_v{version}{source.suffix}"
+            if source.resolve() != dest.resolve():
+                shutil.move(str(source), str(dest))
+            total_cost += float(result.cost or 0.0)
+            providers.add(result.provider)
+            meta = {
+                "attach_to": attach_to,
+                "note": str(note or "").strip(),
+                "reference_role": role,
+                "studio": True,
+                "studio_asset_type": kind,
+                "studio_asset_label": conf["label"],
+                "prompt": prompt,
+                "prompt_used": prompt_text,
+                "prompt_source": ("ai" if str(prompt_source) == "ai"
+                                  else "manual"),
+                "negative_prompt": negative_prompt,
+                "feedback": feedback,
+                "aspect": aspect,
+                "style": style_text,
+                "provider": result.provider,
+                "model": result.model or "",
+                "real": result.provider != "mock",
+                "created_at": now(),
+                "image_quality": "high",
+                "recommended_quality": "high",
+                "quality_source": "asset_studio",
+                "reference_asset_ids": [
+                    item["asset_id"] for item in ref_matches],
+                "prompt_review": (result.data or {}).get("prompt_review") or {},
+            }
+            if base_row is not None:
+                meta["base_asset_id"] = int(base_row["id"])
+                meta["base_asset_name"] = str(base_row["name"])
+            row = self.assets.register(
+                project["id"], "reference", asset_name, uri=str(dest),
+                meta=meta, new_version=existing is not None)
+            registered.append({
+                "asset_id": row["id"], "name": asset_name,
+                "uri": str(dest), "version": int(row["version"]),
+                "provider": result.provider,
+                "real": result.provider != "mock",
+                "reference_role": role, "attach_to": attach_to,
+            })
+        placeholder = any(not item["real"] for item in registered)
+        binding = attach_to or (
+            "全项目通用" if role == "style" else "仅手动选择")
+        self.log.info(
+            "director",
+            f"资产工坊已生产 {len(registered)} 张「{name}」({conf['label']})"
+            f";用途:{STUDIO_ROLE_LABELS.get(role, role)};关联:{binding}"
+            f";产线:{'、'.join(sorted(providers))}"
+            + ("(占位产线,不是真实 AI 出图)" if placeholder else ""))
+        return {
+            "project": project["title"],
+            "asset_type": kind,
+            "asset_type_label": conf["label"],
+            "reference_role": role,
+            "role_label": STUDIO_ROLE_LABELS.get(role, role),
+            "attach_to": attach_to,
+            "aspect": aspect,
+            "prompt": prompt,
+            "items": registered,
+            "cost": round(total_cost, 4),
+            "providers": sorted(providers),
+            "mock": placeholder,
+        }
+
+    def copy_studio_asset(self, project_title, asset_id, target_project):
+        """把自建资产复用到另一部作品:共用同一张图,不复制文件。"""
+        source = self._studio_project(project_title)
+        target = self._studio_project(target_project)
+        if int(source["id"]) == int(target["id"]):
+            raise AifosError("目标作品与来源作品相同")
+        try:
+            row = self.assets.get(int(asset_id))
+        except (TypeError, ValueError):
+            raise AifosError(f"资产 id 不合法: {asset_id}")
+        if row is None or int(row["project_id"]) != int(source["id"]):
+            raise AifosError("资产不存在或不属于来源作品")
+        if self.assets.is_deleted(row):
+            raise AifosError("该资产已删除")
+        uri = str(row["uri"] or "")
+        if not uri or (not uri.startswith(("http://", "https://"))
+                       and not Path(uri).exists()):
+            raise AifosError("资产文件缺失,无法复用")
+        meta = dict(self._asset_meta(row))
+        meta.update({
+            "copied_from_project": source["title"],
+            "copied_from_asset_id": int(row["id"]),
+            "copied_at": now(),
+        })
+        name = self._studio_asset_names(
+            target["id"], str(row["name"]), 1)[0]
+        created = self.assets.register(
+            target["id"], "reference", name, uri=uri, meta=meta)
+        self.log.info(
+            "director",
+            f"自建资产「{row['name']}」已复用到《{target['title']}》"
+            f"(同一张图,不复制文件)")
+        return {"asset_id": created["id"], "name": name,
+                "project": target["title"], "uri": uri}
+
     def add_reference(self, project_title, name, file_bytes, ext,
                       attach_to="", note="", reference_role=""):
         """上传带单一用途的参考图。

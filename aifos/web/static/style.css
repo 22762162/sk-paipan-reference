@@ -3182,7 +3182,7 @@ textarea:focus-visible, select:focus-visible {
   border: 1px solid var(--hairline); border-radius: 8px; padding: 7px 9px;
 }
 .asset-board-summary {
-  display: grid; grid-template-columns: repeat(5, minmax(0, 1fr));
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
   gap: 8px; margin: 4px 0 14px;
 }
 .asset-board-filter {
@@ -3203,7 +3203,7 @@ textarea:focus-visible, select:focus-visible {
   min-width: 0; padding: 11px; border: 1px solid var(--hairline);
   border-radius: 11px; background: rgba(0, 0, 0, .08);
 }
-.asset-lane-production { grid-column: 1 / -1; }
+.asset-lane-production, .asset-lane-studio { grid-column: 1 / -1; }
 .asset-lane-head {
   display: flex; align-items: flex-start; justify-content: space-between;
   gap: 10px; margin-bottom: 9px;
@@ -3250,6 +3250,137 @@ textarea:focus-visible, select:focus-visible {
 .asset-prompt summary { color: var(--ink-2); cursor: pointer; }
 .asset-prompt p { margin-top: 6px; max-height: 118px; overflow: auto; white-space: pre-wrap; line-height: 1.55; }
 .asset-catalog-card > .asset-del { margin-left: 10px; }
+.asset-card-actions {
+  display: flex; flex-wrap: wrap; gap: 6px; padding: 0 10px; margin-top: 6px;
+}
+.asset-card-actions .asset-del { margin-left: 0; }
+.asset-catalog-card.studio-card { border-color: rgba(212, 160, 74, .45); }
+.studio-chip {
+  flex: none; padding: 2px 6px; border-radius: 999px; color: #f0cd94;
+  background: rgba(212, 160, 74, .18); font-size: 10px;
+}
+.studio-edit, .studio-copy {
+  font-size: 11px; color: var(--ink-2); background: var(--surface-3);
+  border: 1px solid var(--hairline); border-radius: 8px;
+  padding: 4px 8px; cursor: pointer;
+}
+.studio-edit:hover, .studio-copy:hover {
+  color: var(--ink); border-color: rgba(212, 160, 74, .6);
+}
+
+/* ---- 资产工坊:自建资产库 ---- */
+.asset-studio { border-color: rgba(212, 160, 74, .35); }
+.studio-types {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+  gap: 8px; margin-bottom: 12px;
+}
+.studio-type {
+  display: grid; gap: 3px; padding: 9px 11px; text-align: left; min-width: 0;
+  border: 1px solid var(--hairline); border-radius: 10px;
+  background: var(--surface-2); color: var(--ink-2); cursor: pointer;
+}
+.studio-type b { font-size: 12px; color: var(--ink); }
+.studio-type span { font-size: 10px; color: var(--ink-3); line-height: 1.5; }
+.studio-type.active {
+  border-color: rgba(212, 160, 74, .72); background: rgba(212, 160, 74, .12);
+  box-shadow: 0 0 0 1px rgba(212, 160, 74, .16);
+}
+.studio-base-chip {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  margin-bottom: 10px; padding: 8px 11px; border-radius: 9px;
+  border: 1px solid rgba(212, 160, 74, .45);
+  background: rgba(212, 160, 74, .1); font-size: 12px;
+}
+.studio-base-chip .dim { font-size: 11px; }
+.studio-base-chip button {
+  margin-left: auto; font-size: 11px; color: var(--ink-2);
+  background: var(--surface-3); border: 1px solid var(--hairline);
+  border-radius: 8px; padding: 4px 8px; cursor: pointer;
+}
+.studio-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 10px; margin-bottom: 10px;
+}
+.studio-grid-2 { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.studio-grid label {
+  display: grid; gap: 4px; min-width: 0;
+  color: var(--ink-3); font-size: 11px;
+}
+.studio-grid input, .studio-grid select {
+  min-width: 0; background: var(--page); color: var(--ink);
+  border: 1px solid var(--hairline); border-radius: 8px;
+  padding: 8px 10px; font-size: 13px;
+}
+.studio-brief-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.studio-brief-row input {
+  flex: 1; min-width: 220px; background: var(--page); color: var(--ink);
+  border: 1px solid var(--hairline); border-radius: 8px;
+  padding: 8px 10px; font-size: 13px;
+}
+.studio-brief-row button {
+  flex: none; font-size: 12px; color: var(--ink);
+  background: var(--surface-3); border: 1px solid rgba(212, 160, 74, .5);
+  border-radius: 8px; padding: 8px 12px; cursor: pointer;
+}
+.studio-brief-row button:disabled { opacity: .55; cursor: progress; }
+.studio-prompt-label { display: grid; gap: 5px; color: var(--ink-3); font-size: 11px; }
+.studio-prompt-label textarea {
+  width: 100%; background: var(--page); color: var(--ink);
+  border: 1px solid var(--hairline); border-radius: 9px;
+  padding: 10px 11px; font-size: 13px; line-height: 1.6; resize: vertical;
+}
+.studio-notes:empty { display: none; }
+.studio-notes { margin: 7px 0 10px; font-size: 11px; line-height: 1.6; }
+.studio-refs { margin: 4px 0 10px; font-size: 12px; }
+.studio-refs summary { color: var(--ink-2); cursor: pointer; }
+.studio-ref-count { margin-left: 6px; color: var(--ink-3); font-size: 11px; }
+.studio-ref-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: 8px; margin-top: 9px; max-height: 268px; overflow: auto;
+}
+.studio-ref-card {
+  position: relative; display: grid; gap: 3px; min-width: 0; padding: 6px;
+  border: 1px solid var(--hairline); border-radius: 9px;
+  background: var(--surface-2); cursor: pointer;
+}
+.studio-ref-card.on {
+  border-color: rgba(212, 160, 74, .72); background: rgba(212, 160, 74, .12);
+}
+.studio-ref-card input { position: absolute; top: 8px; left: 8px; z-index: 1; }
+.studio-ref-card img {
+  width: 100%; aspect-ratio: 1 / 1; object-fit: cover;
+  border-radius: 6px; background: #080a0d;
+}
+.studio-ref-name {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11px; color: var(--ink);
+}
+.studio-ref-role { font-size: 10px; }
+.studio-optimize {
+  display: flex; align-items: flex-start; gap: 8px;
+  margin: 4px 0 12px; font-size: 12px; color: var(--ink-2); cursor: pointer;
+}
+.studio-optimize small { display: block; color: var(--ink-3); font-size: 11px; }
+.studio-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.studio-actions #studio-status { font-size: 12px; }
+.studio-copy-overlay { display: flex; align-items: center; justify-content: center; }
+.studio-copy-box {
+  width: min(420px, 92vw); padding: 18px 20px; border-radius: 13px;
+  background: var(--surface); border: 1px solid var(--hairline);
+}
+.studio-copy-box h3 { margin: 0 0 6px; font-size: 15px; }
+.studio-copy-box p { margin: 0 0 12px; font-size: 12px; line-height: 1.6; }
+.studio-copy-box select {
+  width: 100%; background: var(--page); color: var(--ink);
+  border: 1px solid var(--hairline); border-radius: 8px;
+  padding: 8px 10px; font-size: 13px;
+}
+.studio-copy-actions { display: flex; gap: 8px; margin-top: 14px; }
+.studio-copy-actions button {
+  flex: 1; padding: 8px 12px; font-size: 13px; cursor: pointer;
+  border-radius: 8px; border: 1px solid var(--hairline);
+  background: var(--surface-3); color: var(--ink-2);
+}
 
 /* ---- 剧本确认页:画风与参考面板 ---- */
 .style-panel {
@@ -3764,7 +3895,12 @@ textarea:focus-visible, select:focus-visible {
   .asset-board-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .asset-board-filter:last-child { grid-column: 1 / -1; }
   .asset-board-lanes { grid-template-columns: minmax(0, 1fr); }
-  .asset-lane-production { grid-column: auto; }
+  .asset-lane-production, .asset-lane-studio { grid-column: auto; }
+  .studio-types { grid-template-columns: minmax(0, 1fr); }
+  .studio-grid, .studio-grid-2 { grid-template-columns: minmax(0, 1fr); }
+  .studio-brief-row { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .studio-brief-row input { min-width: 0; }
+  .studio-actions { display: grid; grid-template-columns: minmax(0, 1fr); }
   .asset-lane .asset-catalog-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .asset-lane { padding: 9px; }
   .ref-form { display: grid; grid-template-columns: minmax(0, 1fr); }

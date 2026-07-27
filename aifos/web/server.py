@@ -631,7 +631,13 @@ def _image_asset_catalog(app, project_id):
         "character": "人物", "scene": "场景", "costume": "服装",
         "shot": "镜头", "frame": "首尾帧", "cover": "封面",
         "reference": "参考图", "inner_persona": "内心Q版",
-        "prop": "道具",
+        "prop": "道具", "style": "画风",
+    }
+    # 资产工坊自建资产按它自己声明的类型归类,不跟着 reference 一起
+    # 堆在「参考图」里,否则自建人物形象会和上传素材混成一列。
+    studio_categories = {
+        "character": "character", "scene": "scene",
+        "prop": "prop", "style": "style",
     }
     project = app.db.query_one(
         "SELECT id, title FROM projects WHERE id=?", (project_id,))
@@ -716,8 +722,15 @@ def _image_asset_catalog(app, project_id):
         "production": "主生产资产",
         "character_support": "人物辅助设定",
         "candidate": "候选与历史",
+        "studio": "自建资产库",
         "reference": "上传参考图",
         "other": "其他资产",
+    }
+    studio_role_labels = {
+        "identity": "人物身份参考", "wardrobe": "服装/道具参考",
+        "scene": "场景空间参考", "composition": "构图/动作参考",
+        "style": "画风参考", "manual": "手动参考图",
+        "inner_persona": "内心Q版参考",
     }
 
     def usage_for(kind, row_id, selected=False):
@@ -816,10 +829,33 @@ def _image_asset_catalog(app, project_id):
         quality = meta.get("image_quality", "medium")
         board_group = board_group_for(row["kind"])
         selected = str(row["id"]) in selected_candidate_ids
+        studio = bool(meta.get("studio"))
+        studio_type = str(meta.get("studio_asset_type") or "")
+        studio_role = str(meta.get("reference_role") or "")
+        label = f"{labels[row['kind']]} · {row['name']}"
+        usage_label = usage_for(row["kind"], row["id"], selected)
+        if studio:
+            board_group = "studio"
+            category = studio_categories.get(studio_type, category)
+            label = (f"{meta.get('studio_asset_label') or '自建资产'}"
+                     f" · {row['name']}")
+            attached = str(meta.get("attach_to") or "")
+            usage_label = (
+                studio_role_labels.get(studio_role, "自建资产")
+                + "·" + (f"关联{attached}" if attached
+                         else ("全项目通用" if studio_role == "style"
+                               else "仅手动选择")))
         items.append({
             "asset_id": row["id"], "kind": row["kind"],
             "name": row["name"], "version": row["version"],
-            "label": f"{labels[row['kind']]} · {row['name']}",
+            "label": label,
+            "studio": studio,
+            "studio_asset_type": studio_type,
+            "studio_asset_label": str(meta.get("studio_asset_label") or ""),
+            "reference_role": studio_role,
+            "role_label": studio_role_labels.get(studio_role, ""),
+            "attach_to": str(meta.get("attach_to") or ""),
+            "real": bool(meta.get("real", True)),
             "url": url, "quality": quality,
             "usable_for_video": quality != "low",
             "category": category,
@@ -827,7 +863,7 @@ def _image_asset_catalog(app, project_id):
             "board_group": board_group,
             "board_group_label": board_group_labels[board_group],
             "selected": selected,
-            "usage_label": usage_for(row["kind"], row["id"], selected),
+            "usage_label": usage_label,
             "generated_at": row["created_at"],
             "source_project": project["title"],
             "source_episode": episode_number,
@@ -2292,6 +2328,17 @@ def make_handler(workspace, jobs):
                         hours = 168.0
                     return self._json(summarize_qc(
                         Path(workspace) / "logs", hours=hours))
+                if route == "/api/rules/appeals":
+                    from ..rule_appeals import (rules_needing_fix,
+                                                summarize_appeals)
+                    try:
+                        hours = float(query.get("hours", ["168"])[0])
+                    except (TypeError, ValueError):
+                        hours = 168.0
+                    summary = summarize_appeals(
+                        Path(workspace) / "logs", hours=hours)
+                    summary["needs_rule_fix"] = rules_needing_fix(summary)
+                    return self._json(summary)
                 if route in ("/api/firefire", "/api/firefire/overview"):
                     return self._json(self._with_app(
                         lambda app: app.firefire.overview()))
@@ -2343,6 +2390,8 @@ def make_handler(workspace, jobs):
                     return self._image_acceleration_options(query)
                 if route == "/api/asset-images":
                     return self._asset_images(query)
+                if route == "/api/asset-studio/options":
+                    return self._asset_studio_options(query)
                 if route == "/api/logs":
                     limit = int(query.get("limit", ["50"])[0])
                     return self._json(self._with_app(
@@ -2489,6 +2538,12 @@ def make_handler(workspace, jobs):
                     return self._reference_delete()
                 if parsed.path == "/api/asset/delete":
                     return self._asset_delete()
+                if parsed.path == "/api/asset-studio/prompt":
+                    return self._asset_studio_prompt()
+                if parsed.path == "/api/asset-studio/generate":
+                    return self._asset_studio_generate()
+                if parsed.path == "/api/asset-studio/copy":
+                    return self._asset_studio_copy()
                 if parsed.path == "/api/history/delete":
                     return self._history_delete()
                 if parsed.path == "/api/video/references":
@@ -2614,6 +2669,97 @@ def make_handler(workspace, jobs):
             if items is None:
                 return self._error(404, f"项目不存在: {title}")
             return self._json({"project": title, "items": items})
+
+        def _asset_studio_options(self, query):
+            """资产工坊表单选项:资产类型、用途、可勾选参考图、可关联对象。"""
+            title = query.get("project", [""])[0].strip()
+            if not title:
+                return self._error(400, "缺少 project")
+            try:
+                return self._json(self._with_app(
+                    lambda app: app.director.studio_asset_options(title)))
+            except Exception as exc:
+                return self._error(400, str(exc))
+
+        @staticmethod
+        def _asset_studio_reference_ids(body):
+            values = body.get("reference_asset_ids")
+            if values in (None, ""):
+                return []
+            if not isinstance(values, list):
+                raise AifosError("reference_asset_ids 必须是数组")
+            return values
+
+        def _asset_studio_prompt(self):
+            """AI 代写自建资产的出图提示词(只出文本,用户可再改)。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            title = (body.get("project") or "").strip()
+            if not title:
+                return self._error(400, "缺少 project")
+            try:
+                refs = self._asset_studio_reference_ids(body)
+                result = self._with_app(lambda app: app.director.studio_prompt(
+                    title, body.get("asset_type", ""),
+                    name=(body.get("name") or ""),
+                    brief=(body.get("brief") or ""),
+                    current_prompt=(body.get("prompt") or ""),
+                    feedback=(body.get("feedback") or ""),
+                    reference_asset_ids=refs,
+                    style=body.get("style")))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _asset_studio_generate(self):
+            """生产自建资产图片并登记进资产中心(可直接用于后续制作)。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            title = (body.get("project") or "").strip()
+            if not title:
+                return self._error(400, "缺少 project")
+            try:
+                refs = self._asset_studio_reference_ids(body)
+                result = self._with_app(
+                    lambda app: app.director.generate_studio_asset(
+                        title, body.get("asset_type", ""),
+                        (body.get("name") or ""), (body.get("prompt") or ""),
+                        negative_prompt=(body.get("negative_prompt") or ""),
+                        feedback=(body.get("feedback") or ""),
+                        attach_to=(body.get("attach_to") or ""),
+                        reference_role=(body.get("reference_role") or ""),
+                        note=(body.get("note") or ""),
+                        reference_asset_ids=refs,
+                        base_asset_id=body.get("base_asset_id"),
+                        aspect=(body.get("aspect") or ""),
+                        style=body.get("style"),
+                        count=body.get("count", 1),
+                        optimize_prompt=bool(body.get("optimize_prompt")),
+                        prompt_source=(body.get("prompt_source") or "manual")))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result, status=201)
+
+        def _asset_studio_copy(self):
+            """把自建资产复用到另一部作品(共用同一张图)。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            title = (body.get("project") or "").strip()
+            target = (body.get("target_project") or "").strip()
+            if not title or not target:
+                return self._error(400, "缺少 project/target_project")
+            if body.get("asset_id") is None:
+                return self._error(400, "缺少 asset_id")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.copy_studio_asset(
+                        title, body["asset_id"], target))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result, status=201)
 
         def _standards(self):
             def fetch(app):

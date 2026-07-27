@@ -1383,6 +1383,35 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 "reason":"调整原因"}}]}}"""
 
 
+# 双路会诊的分工清单:两路都看全图、都给整体判定,但各自深查一半。
+# 单判官扛二十项清单必然前详后略(台账 other 桶最大即是证据),拆成
+# 两份重点清单,同样成本换更细的核验;任一路缺席自动降级单路。
+REVIEW_LENSES = {
+    "identity": {
+        "index": 1,
+        "label": "身份与人物",
+        "focus": (
+            "①人数:画面可见真人总数与合同是否严格一致(逐个点数并报出你数到"
+            "的人,别漏背景里的人);②每个人物的脸型、五官骨相、发型轮廓"
+            "是否与其最终立绘同一人,有无张冠李戴;③性别表达与年龄段;"
+            "④物种形态(设定没写非人就必须是人);⑤生死/昏迷等硬状态在"
+            "面部与身体上是否成立(尸体不得有注视方向与表情张力);"
+            "⑥人物朝向与镜位是否自洽"),
+    },
+    "scene": {
+        "index": 2,
+        "label": "道具与场景",
+        "focus": (
+            "①核心道具是否在场、形制是否与母版同一件、持有人与佩戴"
+            "位置对不对;②画面可读文字是否只出现白名单内容,有无乱码、"
+            "字幕条、水印;③物理与空间关系(重力、支撑、接触、穿模、"
+            "前后遮挡、站位与空间图是否一致);④服装妆发与本镜锁定造型"
+            "是否一致;⑤景别、机位、构图是否落在合同规定档位;"
+            "⑥场景陈设与光线方向是否与场景母版连续"),
+    },
+}
+
+
 def build_qc_prompt(payload):
     characters = payload.get("characters") or []
     functional_figures = [
@@ -1489,6 +1518,17 @@ def build_qc_prompt(payload):
             "本镜为近景/特写档:识别性微细节(如道具的刃口缺口、"
             "标志性磨损、印文)在可见面内必须核验一致")
     physical_text += f"；【尺度判级】{scale_tier}"
+    lens = str(payload.get("review_lens") or "").strip().lower()
+    if lens in REVIEW_LENSES:
+        # 双路会诊的分工:两路都看全图、都给整体判定,但各自深查一半。
+        # 单个判官扛二十项清单必然前详后略(台账里 other 桶最大就是
+        # 证据);拆成两份重点清单,同样成本换更细的核验。
+        physical_text += (
+            f"；【本次重点核查(第{REVIEW_LENSES[lens]['index']}路)】"
+            + REVIEW_LENSES[lens]["focus"]
+            + "。以上维度必须逐条深查并给出结论;其余维度仍要通扫,"
+            "一旦看到明显问题照常写进 issues(由另一路负责深查,"
+            "但你不得因此放过肉眼可见的错误)")
     overlays = [
         item for item in (payload.get("narrative_overlays") or [])
         if isinstance(item, dict)
@@ -1661,6 +1701,131 @@ def validate_prompt_refine(data):
     return None
 
 
+ASSET_PROMPT_PROMPT = """你是 AI 漫剧的美术资产总监。用户在资产工坊里要生产一张
+自建资产图片,请你把用户的一句话需求写成一条完整、可直接交给图片模型执行的出图提示词。
+
+资产类型:{asset_type_label}
+资产名称:{name}
+用户需求(必须逐条落实):{brief}
+当前提示词(为空表示从零撰写):
+{current}
+用户补充意见(为空表示无):{feedback}
+参考图(文件路径;为空表示无):
+{references}
+项目画风(为空表示由你按需求判断,不套用无关默认画风):{style}
+
+要求:
+- 只按用户需求写,不发明剧情、不硬套任何剧集设定;需求没提到的部分按该资产
+  类型的常规美术逻辑补全到可执行程度,不留"自行发挥"式空话;
+- 含糊表述必须具体化(如"帅一点"要落成明确的骨相、五官、气质与光影,
+  "复古风"要落成明确的年代、媒介、色调与材质),不能把原话抄进提示词;
+- 人物类:必须写清性别表达、年龄感、骨相五官、发型发色、妆容、体态气质、
+  服装与配饰、背景处理;人物立绘默认纯净无场景背景;
+- 风格类:必须写清媒介与笔触、色调与配色、光影、材质质感、构图特征,
+  不要绑定具体人物身份;
+- 场景类:必须写清空间类型、时代地域、结构与陈设、材质、光源与时间、
+  视角与景别,画面中不出现人物;
+- 物品类:必须写清形制、相对尺寸、结构、材质工艺、磨损与识别细节,
+  单体展示,不画人物和场景故事;
+- 有参考图时,写明每张参考图各自的职责(身份/服装/场景/构图/画风),
+  不得让一张参考图越权覆盖其他维度;
+- image_prompt 必须是完整独立的出图提示词,不是增量补丁,不含
+  Markdown、编号列表标题或解释性文字;
+- 只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块:
+{{"image_prompt": "完整的出图提示词",
+ "negative_prompt": "不希望出现的内容;没有则给空字符串",
+ "notes": ["把用户哪条需求落成了什么具体画面事实"]}}
+"""
+
+
+def validate_asset_prompt(data):
+    """资产工坊 AI 提示词输出的最小校验。"""
+    if not isinstance(data, dict):
+        return "输出必须是 JSON 对象"
+    prompt = str(data.get("image_prompt") or "").strip()
+    if len(prompt) < 20:
+        return "缺少 image_prompt 或内容过短"
+    if "```" in prompt:
+        return "image_prompt 含 Markdown 代码围栏"
+    if data.get("negative_prompt") is None:
+        data["negative_prompt"] = ""
+    elif not isinstance(data["negative_prompt"], str):
+        return "negative_prompt 必须是字符串"
+    notes = data.get("notes")
+    if notes is None:
+        data["notes"] = []
+    elif not isinstance(notes, list):
+        return "notes 必须是数组"
+    return None
+
+
+RULE_APPEAL_PROMPT = """你是本剧生产平台的规则仲裁官(终审法庭)。平台的内置校验规则做初审,
+它是死的字面规则;你要判断这次判败到底是**真违规**,还是**规则字面化误杀 /
+剧情本来就需要这样**。
+
+被判败的规则:{rule_id}
+规则给出的判败理由:
+{rule_reason}
+
+被检查的实际内容(判决对象):
+{subject}
+
+剧情与镜头上下文(事实源):
+{context}
+
+平台冲突裁决规则(优先级宪法,你的判决必须与它一致):
+{adjudication}
+
+判决准则:
+- 只要事实**实质存在**,写法不同不算违规:数字区间「25-30」等同「25至30岁」;
+  「共7名可见真人:3名登记角色加4名弓兵」等同「7人」;繁简异体同字;
+  同义表述(单人/一名角色/同一角色)等同;
+- 规则要求的东西在本镜**物理上不可能或不该出现**(景别太远看不见、被裁切、
+  被背向遮挡、剧情要求该物不在场),不算违规;
+- 剧本/镜头合同明确要求的剧情安排,不因与通用默认规则不符而判违规;
+- 反过来:事实**真的被删改**(人数变了、角色被合并、道具消失、锁定文字被改),
+  必须维持原判——这类放行会直接产出废图,后果比误杀更严重;
+- 不确定时维持原判(宁可多修一次,不可放行错图)。
+
+举证要求(硬性):撤销原判必须在 evidence 里**逐字引用**被检查内容中
+证明事实存在的原文片段;引用不出来就必须维持原判。
+
+只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块:
+{{"schema": "aifos.rule_appeal.v1",
+ "verdict": "upheld 或 overturned",
+ "reason": "一句话说明判决依据",
+ "evidence": "撤销时逐字引用的原文片段;维持原判时写空字符串",
+ "suggested_rule_fix": "若判定为规则字面化误杀,用一句话说明规则该怎么改才不再误杀;否则空字符串"}}
+"""
+
+
+def validate_rule_appeal(data, payload=None):
+    """规则仲裁输出的最小校验:撤销原判必须举证。"""
+    if not isinstance(data, dict):
+        return "输出必须是 JSON 对象"
+    if data.get("schema") != "aifos.rule_appeal.v1":
+        return "schema 必须是 aifos.rule_appeal.v1"
+    verdict = str(data.get("verdict") or "").strip().lower()
+    if verdict not in {"upheld", "overturned"}:
+        return "verdict 只能是 upheld 或 overturned"
+    data["verdict"] = verdict
+    if not str(data.get("reason") or "").strip():
+        return "缺少 reason"
+    evidence = str(data.get("evidence") or "").strip()
+    if verdict == "overturned":
+        if len(evidence) < 4:
+            return "撤销原判必须在 evidence 逐字引用证明事实存在的原文"
+        subject = str((payload or {}).get("subject") or "")
+        if subject and evidence not in subject:
+            # 允许仲裁做最小裁剪(去引号/省略号),但主干必须真的在原文里
+            core = evidence.strip("「」\"'．. …").strip()
+            if not core or core not in subject:
+                return "evidence 不是被检查内容中的原文,不能作为撤销依据"
+    for key in ("reason", "evidence", "suggested_rule_fix"):
+        data[key] = str(data.get(key) or "").strip()
+    return None
+
+
 PROP_DESIGN_PROMPT = """你是本剧的道具设计总监。以下核心/身份识别道具已进入剧本的道具登记表,
 但还没有可出图的设计卡。你要只依据正式剧本中的事实与合理工艺推导,为每件道具补全设计卡。
 
@@ -1790,6 +1955,28 @@ def build_prompt(capability, payload):
             style=(payload.get("style")
                    or "项目画风未指定;保持与已生成候选一致"),
             feedback=payload.get("feedback", ""))
+    if capability == "script" and payload.get("asset_prompt"):
+        references = "\n".join(
+            f"- {item}" for item in (payload.get("references") or []) if item)
+        return ASSET_PROMPT_PROMPT.format(
+            asset_type_label=(payload.get("asset_type_label")
+                              or payload.get("asset_type") or "自建资产"),
+            name=payload.get("asset_name", "") or "(用户未命名)",
+            brief=payload.get("brief", "") or "(未填写,请按资产名称与类型撰写)",
+            current=(payload.get("current_prompt")
+                     or "(尚无提示词,请从零撰写)"),
+            feedback=payload.get("feedback", "") or "(无)",
+            references=references or "(无)",
+            style=payload.get("style", "") or "(未指定)")
+    if capability == "script" and payload.get("rule_appeal"):
+        return RULE_APPEAL_PROMPT.format(
+            rule_id=payload.get("rule_id", ""),
+            rule_reason=payload.get("rule_reason", ""),
+            subject=str(payload.get("subject") or "")[:8000],
+            context=json.dumps(payload.get("context") or {},
+                               ensure_ascii=False)[:8000],
+            adjudication=json.dumps(payload.get("adjudication") or {},
+                                    ensure_ascii=False))
     if capability == "script" and payload.get("prop_design"):
         return PROP_DESIGN_PROMPT.format(
             script=json.dumps(payload.get("script") or {},
@@ -2172,10 +2359,14 @@ def _postprocess_and_validate(capability, payload, data):
         error = validate_image_qc(data)
     elif capability == "script" and payload.get("prompt_refine"):
         error = validate_prompt_refine(data)
+    elif capability == "script" and payload.get("asset_prompt"):
+        error = validate_asset_prompt(data)
     elif capability == "script" and payload.get("shot_repair"):
         error = validate_shot_repair(data, payload)
     elif capability == "script" and payload.get("prop_design"):
         error = validate_prop_design(data, payload)
+    elif capability == "script" and payload.get("rule_appeal"):
+        error = validate_rule_appeal(data, payload)
     elif capability == "script" and payload.get("story_analysis"):
         error = validate_story_analysis(
             data, require_resolved_identity=False)

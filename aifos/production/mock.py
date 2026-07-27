@@ -271,6 +271,8 @@ class MockProvider(Provider):
             uri = _json_artifact(
                 out_dir / "story_analysis.json", analysis)
             return analysis, uri
+        if payload.get("asset_prompt"):
+            return self._gen_asset_prompt(payload, out_dir)
         if payload.get("character_design"):
             return self._gen_character_design(payload, out_dir)
         if (payload.get("source_material_adaptation")
@@ -407,6 +409,47 @@ class MockProvider(Provider):
         if any(word in text for word in GENRE_KEYWORDS["urban"]):
             return "urban"
         return "xianxia"
+
+    def _gen_asset_prompt(self, payload, out_dir):
+        """资产工坊的离线占位提示词:把用户需求原样编成可执行结构。
+
+        占位产线不会凭空发明画面事实,只做「需求 + 该资产类型的常规
+        美术条款」的确定性拼接,让离线环境也能跑通整条工坊链路。
+        """
+        kind = str(payload.get("asset_type") or "character")
+        brief = str(payload.get("brief") or "").strip()
+        current = str(payload.get("current_prompt") or "").strip()
+        feedback = str(payload.get("feedback") or "").strip()
+        name = str(payload.get("asset_name") or "").strip()
+        style = str(payload.get("style") or "").strip()
+        rules = {
+            "character": "单人全身立绘,纯净无场景背景,五官清晰,自然光影,"
+                         "服装材质可辨,不出现文字与多余道具",
+            "style": "只表达媒介、笔触、色调、光影与材质质感,不绑定人物身份,"
+                     "不出现文字与拼图分格",
+            "scene": "空间结构与陈设清晰,主光方向明确,画面中不出现人物",
+            "prop": "单件物品居中展示,形制、结构、材质与磨损细节可辨,"
+                    "不出现人物与使用场景",
+        }.get(kind, "画面干净可复用,不出现文字、水印与边框")
+        parts = [part for part in (
+            f"{name}:" if name else "",
+            current or brief or "按资产名称执行",
+            f"修改要求:{feedback}" if feedback else "",
+            f"画风:{style}" if style else "",
+            rules,
+            "(占位产线拼接稿:未接入真实编剧产线,请人工确认后再出图)",
+        ) if part]
+        data = {
+            "image_prompt": "。".join(parts),
+            "negative_prompt": "文字、水印、Logo、边框、多余人物",
+            "notes": [item for item in (
+                f"需求「{brief}」原样保留" if brief else "",
+                f"修改意见「{feedback}」已写入" if feedback else "",
+                f"已补齐{kind}类资产的常规美术条款",
+            ) if item],
+        }
+        uri = _json_artifact(out_dir / "asset_prompt.json", data)
+        return data, uri
 
     def _gen_character_design(self, payload, out_dir):
         seed = _digest(payload)
@@ -849,6 +892,16 @@ class MockProvider(Provider):
     def _gen_image(self, payload, out_dir):
         seed = int.from_bytes(_digest(payload)[:4], "big")
         width, height = _dims(payload)
+        if payload.get("studio_asset"):
+            name = payload.get("art_name", "")
+            kind = str(payload["studio_asset"])
+            path = out_dir / f"studio_{kind}_{_safe_name(name)}.svg"
+            path.write_text(
+                render_portrait(
+                    width, height, seed, name,
+                    payload.get("studio_asset_label", "自建资产")),
+                encoding="utf-8")
+            return {"name": name, "studio_asset": kind}, str(path)
         if payload.get("prop_candidate"):
             name = payload.get("art_name", "")
             path = out_dir / f"prop_{_safe_name(name)}.svg"
