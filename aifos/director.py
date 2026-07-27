@@ -10237,13 +10237,24 @@ class Director:
                 continue
             key = str(int(no))
             spatial = self._spatial_reference_requirement(ctx, no)
-            reference_rows = self._video_reference_rows(ctx, no)
+            # 本方法只服务展示(剧集详情页逐镜参考列)。资产未定版时
+            # 装配会按生产门禁抛错;展示端必须逐镜降级为待办说明,
+            # 否则「道具没选→详情页打不开→更没法去选」死锁
+            # (2026-07-28 凡人修仙传实测)。真正提交 Seedance 的生产
+            # 路径不走本方法,门禁依旧硬。
+            try:
+                reference_rows = self._video_reference_rows(ctx, no)
+                pending_reason = ""
+            except AifosError as exc:
+                reference_rows = []
+                pending_reason = str(exc)
             shots[key] = {
                 "mode": "manual" if key in manual else "auto",
                 "spatial_reference_required": spatial["required"],
                 "spatial_reference_ready": spatial["ready"],
                 "spatial_reference_reason": spatial["reason"],
                 "spatial_reference_error": spatial["error"],
+                "pending_reason": pending_reason,
                 "items": [{
                     "asset_id": row["id"], "kind": row["kind"],
                     "name": row["name"], "uri": row["uri"],
