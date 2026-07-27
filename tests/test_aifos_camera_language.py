@@ -103,3 +103,17 @@ def test_top_down_position_geometry_avoids_facial_claims():
     assert "双眼可见" in level
     high = camera_geometry_clause({"角度": "俯拍", "机位": "正面"})
     assert "双眼可见" in high      # 俯拍非垂直,面部仍可见,两者兼容
+
+
+def test_camera_precedence_covers_crop_visibility():
+    """景别边界裁出画的伤口/道具,「必须可见」自动不适用——
+    「特写肩线以下出画」vs「肩下伤口必须可见」曾同级互斥熔断。"""
+    from aifos.prompt_contract import compile_shot_prompt
+    shot = {"shot_no": 9, "scene_no": 2, "kind": "action",
+            "camera": "特写", "description": "林川特写", "duration": 2,
+            "characters": ["林川"], "dialogue": None, "prompt": "p"}
+    contract, _prompt = compile_shot_prompt(
+        shot, location="公寓", mode="image")
+    clause = contract["camera_precedence"]
+    assert "裁出画" in clause and "自动不适用" in clause
+    assert "不构成可见性冲突" in clause
