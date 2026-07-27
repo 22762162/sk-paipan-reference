@@ -67,7 +67,7 @@ def test_prop_master_drops_scene_continuity_states():
         "continuity_states": "初始油纸外包→雨中拆开→沾血"})
     for token in ("油纸外包", "拆开", "沾血"):
         assert token not in prompt, f"场次状态 {token!r} 混入母版"
-    assert "未包装" in prompt and "未拆封" in prompt
+    assert "出厂/初始的完整形态" in prompt
     # 稳定道具事实必须保留
     assert "骑缝印" in prompt and "桑皮纸" in prompt
 
@@ -90,3 +90,31 @@ def test_plain_prop_keeps_no_text_rule():
         "era_material": "青铜"})
     assert "无新增文字" in prompt
     assert "不可辨读" not in prompt
+
+
+def test_prop_master_declares_precedence_over_fact_source():
+    """事实源把外包装/破损写进视觉结构时,母版必须给出确定裁决。
+
+    审核规则禁止猜测:只有明确宣告"母版规则优先于事实源相应描述",
+    才不会因「油纸外包 vs 无包装」判定冲突而熔断整批道具图。
+    """
+    prompt = _prop_prompt({
+        "name": "江浦县主簿吏部札付原件",
+        "story_function": "把林川与赴任官员身份强行绑定",
+        "visual_design": "米黄色桑皮纸札付，纵向折为三折，正文墨书楷体，"
+                          "落有吏部朱印；外包一层边角发白的半透明油纸，"
+                          "右下角有一道旧折裂。",
+        "era_material": "手工桑皮纸、松烟墨"})
+    assert "优先级最高" in prompt
+    assert "不需要在两者之间做取舍" in prompt
+    for token in ("外包装", "污渍", "血迹", "破损", "折裂"):
+        assert token in prompt, f"母版未点名排除 {token!r}"
+    # 稳定工艺事实仍在
+    assert "桑皮纸" in prompt and "朱印" in prompt
+
+
+def test_character_master_declares_precedence_over_fact_source():
+    """人物母版同理:泥渍/血迹/姿态冲突必须由优先级条款裁决。"""
+    from aifos.director import CHARACTER_CANDIDATE_PROMPT_SCHEMA
+    # schema 版本必须随裁决条款升级,否则旧提示词会被继续复用
+    assert "v4" in CHARACTER_CANDIDATE_PROMPT_SCHEMA
