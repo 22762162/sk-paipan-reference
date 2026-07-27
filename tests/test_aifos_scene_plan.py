@@ -96,3 +96,37 @@ class CorePropUnionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PropDesignDerivationTest(unittest.TestCase):
+    """登记表孤儿道具缺设计卡:编剧从剧本推导补卡的提示词与校验。"""
+
+    def test_prompt_carries_script_and_rules(self):
+        from aifos.adapters.claude_script import build_prompt
+        prompt = build_prompt("script", {
+            "prop_design": True,
+            "script": {"scenes": [{"scene_no": 1, "action": "握紧包裹绳结"}]},
+            "style": "3D半写实",
+            "props": [{"name": "旧麻布包裹", "kind": "identity_prop"}]})
+        self.assertIn("旧麻布包裹", prompt)
+        self.assertIn("握紧包裹绳结", prompt)
+        self.assertIn("尺寸级别", prompt)
+        self.assertIn("aifos.prop_design.v1", prompt)
+
+    def test_validate_requires_all_requested_cards(self):
+        from aifos.adapters.claude_script import validate_prop_design
+        payload = {"props": [{"name": "旧麻布包裹"}, {"name": "密信"}]}
+        ok = {"schema": "aifos.prop_design.v1", "props": [
+            {"name": "旧麻布包裹", "story_function": "随身行李,以绳结手提",
+             "visual_design": "粗麻方包袱,单手可提,绳结封口,磨白起毛边"},
+            {"name": "密信", "story_function": "剧情关键信件,怀揣传递",
+             "visual_design": "折叠桑皮纸信,掌心大小,火漆闭合,边缘磨损"},
+        ]}
+        self.assertIsNone(validate_prop_design(ok, payload))
+        missing = {"schema": "aifos.prop_design.v1",
+                   "props": ok["props"][:1]}
+        self.assertIn("密信", validate_prop_design(missing, payload))
+        lazy = {"schema": "aifos.prop_design.v1", "props": [
+            {"name": "旧麻布包裹", "story_function": "包",
+             "visual_design": "布包"}]}
+        self.assertIn("敷衍", validate_prop_design(lazy, payload))

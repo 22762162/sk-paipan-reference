@@ -1661,6 +1661,64 @@ def validate_prompt_refine(data):
     return None
 
 
+PROP_DESIGN_PROMPT = """你是本剧的道具设计总监。以下核心/身份识别道具已进入剧本的道具登记表,
+但还没有可出图的设计卡。你要只依据正式剧本中的事实与合理工艺推导,为每件道具补全设计卡。
+
+正式剧本(唯一事实源):
+{script}
+
+项目画风:{style}
+
+待补卡道具(名称与登记信息):
+{props}
+
+铁律:
+- 用途、持有人、出场方式只能取自剧本(如剧本写「握紧包裹绳结」,可推导出
+  绳结封口、可单手提携;不得发明剧本没有的剧情或功能);
+- visual_design 必须写全:整体形制、尺寸级别(相对人体,如可单手提/斜挎/
+  怀揣)、可握持或可使用的具体结构、材质工艺、磨损与识别细节;
+- era_material 必须符合剧本时代与持有人阶层,不得出现超时代工艺;
+- 不确定的装饰细节按持有人身份取最朴素的合理设计,不添加剧情性文字或印记。
+
+只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块:
+{{"schema": "aifos.prop_design.v1",
+ "props": [{{"name": "道具名(与登记表逐字一致)",
+   "story_function": "剧情功能与用途(源自剧本)",
+   "visual_design": "形制+尺寸级别+可握持/使用结构+材质+磨损识别细节",
+   "era_material": "时代与材质工艺",
+   "owner": "归属/持有人"}}]}}
+"""
+
+
+def validate_prop_design(data, payload):
+    """道具设计卡补全输出的最小校验:每件待补卡道具都要有可执行事实。"""
+    if not isinstance(data, dict):
+        return "输出必须是 JSON 对象"
+    if data.get("schema") != "aifos.prop_design.v1":
+        return "schema 必须是 aifos.prop_design.v1"
+    cards = data.get("props")
+    if not isinstance(cards, list) or not cards:
+        return "props 必须是非空数组"
+    by_name = {}
+    for card in cards:
+        if not isinstance(card, dict):
+            return "props 成员必须是对象"
+        name = str(card.get("name") or "").strip()
+        if not name:
+            return "设计卡缺少 name"
+        for field in ("story_function", "visual_design"):
+            if len(str(card.get(field) or "").strip()) < 8:
+                return f"道具「{name}」的 {field} 缺失或过于敷衍"
+        by_name[name] = card
+    requested = [
+        str(item.get("name") if isinstance(item, dict) else item).strip()
+        for item in (payload or {}).get("props") or []]
+    missing = [name for name in requested if name and name not in by_name]
+    if missing:
+        return "以下待补卡道具没有输出设计卡: " + "、".join(missing)
+    return None
+
+
 SHOT_REPAIR_PROMPT = """你是本剧的分镜导演。镜头{shot_no}的提示词在进入图片生成前被审核熔断,
 原因是镜头自身的几何/构图要求互斥(例如特写景别却要求多名相距很远的人物
 与多个空间区域同时入框)。你要就地修复这个镜头,让它几何上自洽。
@@ -1732,6 +1790,14 @@ def build_prompt(capability, payload):
             style=(payload.get("style")
                    or "项目画风未指定;保持与已生成候选一致"),
             feedback=payload.get("feedback", ""))
+    if capability == "script" and payload.get("prop_design"):
+        return PROP_DESIGN_PROMPT.format(
+            script=json.dumps(payload.get("script") or {},
+                              ensure_ascii=False),
+            style=(payload.get("style")
+                   or "未指定;按剧本时代与题材自动匹配"),
+            props=json.dumps(payload.get("props") or [],
+                             ensure_ascii=False))
     if capability == "script" and payload.get("shot_repair"):
         shot = payload.get("shot") or {}
         return SHOT_REPAIR_PROMPT.format(
@@ -2083,6 +2149,8 @@ def _postprocess_and_validate(capability, payload, data):
         error = validate_prompt_refine(data)
     elif capability == "script" and payload.get("shot_repair"):
         error = validate_shot_repair(data, payload)
+    elif capability == "script" and payload.get("prop_design"):
+        error = validate_prop_design(data, payload)
     elif capability == "script" and payload.get("story_analysis"):
         error = validate_story_analysis(
             data, require_resolved_identity=False)

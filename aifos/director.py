@@ -7059,6 +7059,58 @@ class Director:
                     f"{name}:{index:02d}", include_deleted=True) is not None)
         return self.character_selection_status(project_id, characters)
 
+    def _complete_prop_designs(self, ctx, prop_defs):
+        """登记表孤儿道具缺设计卡→编剧从剧本推导补卡,不猜、不发明。
+
+        候选提示词审核要求「用途/尺寸级别/可握持结构」等决定性事实且
+        禁止猜测;登记表条目只有名字与生命周期,直接送审必熔断。此处
+        在生成候选前用 script 链(deepseek 秒级)从剧本推导设计卡,只对
+        既无设计卡、又无母版、也无现成候选的道具发起,一次批量补全。"""
+        project_id = ctx["project"]["id"]
+        pending = []
+        for prop in prop_defs:
+            if self._design_value(prop.get("visual_design")):
+                continue
+            name = prop["name"]
+            if self._locked_prop(project_id, name):
+                continue
+            if all(
+                    self.assets.latest(
+                        project_id, "prop_candidate", f"{name}:{index:02d}")
+                    is not None
+                    for index in range(1, PROP_CANDIDATES + 1)):
+                continue
+            pending.append(prop)
+        if not pending:
+            return prop_defs
+        result = self._call(ctx, "script", {
+            "prop_design": True,
+            "project_title": ctx["project"]["title"],
+            "style": ctx["project"].get("style", "") or "",
+            "script": ctx["script"],
+            "props": [{
+                "name": prop["name"],
+                "prop_id": prop.get("prop_id", ""),
+                "kind": prop.get("kind", ""),
+            } for prop in pending],
+        }, "cast")
+        cards = {
+            str(card.get("name") or "").strip(): card
+            for card in (result.data or {}).get("props", [])
+            if isinstance(card, dict)
+        }
+        for prop in pending:
+            card = cards.get(prop["name"]) or {}
+            for key in ("story_function", "visual_design",
+                        "era_material", "owner"):
+                if self._design_value(card.get(key)):
+                    prop[key] = card[key]
+        self.log.info(
+            "director",
+            "编剧已从剧本推导补全道具设计卡(不猜测、只取剧本事实): "
+            + "、".join(prop["name"] for prop in pending))
+        return prop_defs
+
     def _ensure_prop_candidates(self, ctx, props, style):
         """为剧本明确的核心道具补足四张高质量候选。"""
         project_id = ctx["project"]["id"]
@@ -7395,7 +7447,8 @@ class Director:
         character_selection = self._ensure_character_candidates(
             ctx, characters, designs, style)
         prop_selection = self._ensure_prop_candidates(
-            ctx, core_prop_definitions(ctx["script"]), style)
+            ctx, self._complete_prop_designs(
+                ctx, core_prop_definitions(ctx["script"])), style)
         selection = self._combine_asset_selection(
             character_selection, prop_selection)
         self.projects.save_document(
