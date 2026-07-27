@@ -22,6 +22,7 @@ from ..adapters.codex_image import SUBJECT_DIRECTIVE as _SUBJECT_DIRECTIVE
 from ..adapters.codex_image import (
     CHARACTER_BACKGROUND_DIRECTIVE as _CHARACTER_BACKGROUND_DIRECTIVE,
 )
+from ..adapters.codex_image import STUDIO_ASSET_RULES as _STUDIO_ASSET_RULES
 from ..adapters.codex_image import _style_line as _api_style_line
 from ..adapters.codex_image import _space_line as _api_space_line
 from ..adapters.claude_script import (build_prompt, extract_json,
@@ -451,6 +452,9 @@ class ClaudeApiProvider(Provider):
             elif capability == "script" and payload.get("prompt_refine"):
                 from ..adapters.claude_script import validate_prompt_refine
                 error = validate_prompt_refine(data)
+            elif capability == "script" and payload.get("asset_prompt"):
+                from ..adapters.claude_script import validate_asset_prompt
+                error = validate_asset_prompt(data)
             elif capability == "script" and payload.get("shot_repair"):
                 from ..adapters.claude_script import validate_shot_repair
                 error = validate_shot_repair(data, payload)
@@ -553,6 +557,9 @@ class OpenAIChatProvider(Provider):
             return validate_image_qc(data)
         if capability == "script" and payload.get("prompt_refine"):
             return validate_prompt_refine(data)
+        if capability == "script" and payload.get("asset_prompt"):
+            from ..adapters.claude_script import validate_asset_prompt
+            return validate_asset_prompt(data)
         if capability == "script" and payload.get("shot_repair"):
             return validate_shot_repair(data, payload)
         if capability == "script" and payload.get("prop_design"):
@@ -760,6 +767,14 @@ class OpenAIImageProvider(Provider):
         if not complete:
             parts.extend((_api_style_line(payload), _api_space_line(payload)))
         parts.append(_SUBJECT_DIRECTIVE)
+        if payload.get("studio_asset"):
+            # 资产工坊自建资产:与 CLI 桥同一套单一职责约束,避免
+            # 「画件道具」返回一张有人举着它的剧照。
+            parts.append(
+                _STUDIO_ASSET_RULES.get(str(payload["studio_asset"]), ""))
+            parts.append(
+                "这张图会进入用户的资产库并在后续制作中作为参考图复用,"
+                "必须干净可复用:不加字幕条、水印、Logo、边框和拼图分格。")
         if (payload.get("portrait") or payload.get("portrait_candidate")
                 or payload.get("character_sheet")) and not complete:
             parts.append(_CHARACTER_BACKGROUND_DIRECTIVE)
@@ -857,7 +872,12 @@ class OpenAIImageProvider(Provider):
             prompt = f"{prompt}。修改意见(必须落实):{payload['feedback']}"
         if capability == "image":
             safe = _safe_name(payload.get("art_name", ""))
-            if payload.get("prop_candidate"):
+            if payload.get("studio_asset"):
+                kind = str(payload["studio_asset"])
+                target = out_dir / f"studio_{kind}_{safe}.png"
+                data = {"name": payload.get("art_name"),
+                        "studio_asset": kind}
+            elif payload.get("prop_candidate"):
                 target = out_dir / f"prop_{safe}.png"
                 data = {
                     "name": payload.get("art_name"),

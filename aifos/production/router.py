@@ -475,6 +475,23 @@ class ProviderRouter:
                 "blocking_reason": "低层兼容调用未提供AIFOS生图提示词",
             }
             return None
+        if payload.get("prompt_review_exempt"):
+            # 资产工坊(用户自建资产):没有剧本、人数、道具等下游逐字合同
+            # 要守,用户自己写的提示词就是唯一事实源。此处只登记豁免事实,
+            # 不进入剧集产线的 Codex 提示词审核硬门禁,也不改写用户原稿。
+            payload["prompt_review"] = {
+                "schema": self.PROMPT_REVIEW_SCHEMA,
+                "approved": False,
+                "status": "not_applicable_user_studio",
+                "original_prompt": source,
+                "optimized_prompt": source,
+                "issues_found": [],
+                "changes_made": [],
+                "blocking_reason": (
+                    "用户自建资产按原提示词执行;"
+                    "该产物不参与剧集提示词审核门禁"),
+            }
+            return None
         context = self._prompt_review_context(capability, payload)
         input_hash = self._stable_hash({
             "prompt": source,
