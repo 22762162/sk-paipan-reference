@@ -117,3 +117,20 @@ def test_camera_precedence_covers_crop_visibility():
     clause = contract["camera_precedence"]
     assert "裁出画" in clause and "自动不适用" in clause
     assert "不构成可见性冲突" in clause
+
+
+def test_aspect_tokens_stripped_from_camera_and_precedence_declared():
+    """分镜把 16:9 写进 camera 曾与项目画幅 9:16 同级互斥熔断。
+
+    画幅唯一执行值是 aspect 字段:编译时从镜头字段剥离比例字样,
+    并声明 aspect_precedence。
+    """
+    from aifos.prompt_contract import compile_shot_prompt
+    shot = {"shot_no": 1, "scene_no": 1, "kind": "environment",
+            "camera": "16:9广角固定机位·远景", "description": "雨夜街巷",
+            "duration": 3, "characters": [], "dialogue": None, "prompt": "p"}
+    contract, _prompt = compile_shot_prompt(
+        shot, location="街巷", mode="image")
+    for value in contract["camera"].values():
+        assert "16:9" not in str(value)
+    assert "唯一执行值" in contract["aspect_precedence"]

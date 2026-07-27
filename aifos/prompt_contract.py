@@ -1620,23 +1620,30 @@ def _camera(shot):
         ("跟拍", "跟拍"), ("拉远", "拉"), ("横移", "移"),
         ("固定", "固定"),
     ))
+    def _strip_aspect(value):
+        # 画幅比例(16:9/2.35:1…)不属于镜头语言,唯一画幅执行值是
+        # 项目 aspect 字段;残留在镜头字段里会与之同级互斥并熔断。
+        cleaned = re.sub(
+            r"\d+(?:\.\d+)?\s*[:：]\s*\d+(?:\.\d+)?", "", str(value or ""))
+        return re.sub(r"[、，;；]{2,}", "，", cleaned).strip(" ，、;；·")
+
     return {
-        "景别": _text(
+        "景别": _strip_aspect(_text(
             raw_scale or contract.get("景别") or design.get("shot_scale"),
-            "按分镜"),
-        "角度": _text(
+            "按分镜")),
+        "角度": _strip_aspect(_text(
             raw_angle or contract.get("角度") or design.get("angle"),
-            "保持轴线"),
-        "焦段": _text(design.get("lens") or contract.get("焦段")),
-        "机位": _text(
+            "保持轴线")),
+        "焦段": _strip_aspect(_text(design.get("lens") or contract.get("焦段"))),
+        "机位": _strip_aspect(_text(
             raw_position or contract.get("机位")
-            or design.get("camera_position")),
-        "运镜": _text(
+            or design.get("camera_position"))),
+        "运镜": _strip_aspect(_text(
             raw_movement or contract.get("运镜") or design.get("movement"),
-            "固定"),
+            "固定")),
         "动机": _text(design.get("movement_motivation"), "服务主体动作"),
-        "构图": _text(
-            contract.get("构图") or design.get("composition"), "主体清楚"),
+        "构图": _strip_aspect(_text(
+            contract.get("构图") or design.get("composition"), "主体清楚")),
     }
 
 
@@ -2155,6 +2162,10 @@ def build_shot_prompt_contract(
         # 镜位显式裁决条款:_camera 已按「分镜原文 > 镜头合同 > 五维
         # 默认」融合出唯一执行值;审核上下文里若还残留其他来源的机位
         # /构图描述,以融合值为准,不构成需要裁决的同级冲突。
+        "aspect_precedence": (
+            "画幅以 aspect 字段为唯一执行值(来自项目/本集制作标准);"
+            "镜头或其他描述中出现的画幅比例字样已在编译时剥离,"
+            "如仍残留仅为杂讯,不构成画幅冲突,也不需要裁决"),
         "camera_precedence": (
             "本合同 camera 字段是唯一执行镜位,已按「分镜原文 > 镜头"
             "合同 > 五维默认」融合完毕;上下文中任何其他来源的机位、"
