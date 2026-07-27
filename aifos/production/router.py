@@ -10,6 +10,7 @@ import json
 import re
 import threading
 import time
+from pathlib import Path
 
 from ..errors import ProduceCancelled, ProviderError, ProviderUnavailable
 from .api_providers import (ArkVideoProvider, ClaudeApiProvider,
@@ -41,6 +42,18 @@ class ProviderRouter:
     IMAGE_TASK_CLASSES = {"batch", "important", "final", "complex_text"}
     API_IMAGE_TYPES = {"image_api", "seedream_image"}
     PROMPT_REVIEW_SCHEMA = "aifos.codex-prompt-review/v1"
+    # 人数校验:中文数字与阿拉伯数字等价。Codex 写中文提示词时「两人」
+    # 远比「2人」自然,只认阿拉伯数字会把完全正确的优化稿判成删除了
+    # 人物总数,整张图被拒绝生成。
+    COUNT_WORDS = {
+        0: ("零",), 1: ("一",), 2: ("二", "两", "俩"), 3: ("三",),
+        4: ("四",), 5: ("五",), 6: ("六",), 7: ("七",), 8: ("八",),
+        9: ("九",), 10: ("十",),
+    }
+    # 量词放宽到 人/名/位/个:限定为「人」会误杀「两位女子」这类写法。
+    COUNT_QUANTIFIER = "(?:人|名|位|个)"
+    # 前缀边界:阻止 expected=3 命中「13人」「十三人」。
+    COUNT_BOUNDARY = "0-9零一二三四五六七八九十两俩"
 
     def __init__(self, config, db, logger):
         self.config = config
@@ -57,6 +70,8 @@ class ProviderRouter:
         # 通道取用优先级 = 配置列表顺序(只含启用通道):前面的通道并发
         # 占满后才溢出到后面的通道(如 B、C 先行,A 兜底)。
         self._codex_profile_order = []
+        # profile_id -> 配置的 CODEX_HOME;抢槽前据此剔除未初始化通道。
+        self._codex_profile_homes = {}
         for name, conf in (config.get("providers") or {}).items():
             cls = PROVIDER_TYPES.get(conf.get("type"))
             if cls is None:
@@ -78,6 +93,8 @@ class ProviderRouter:
                             and profile.get("id")):
                         continue
                     profile_id = str(profile["id"])
+                    self._codex_profile_homes[profile_id] = str(
+                        profile.get("codex_home") or "").strip()
                     self._codex_profile_slots.setdefault(
                         profile_id,
                         threading.BoundedSemaphore(
@@ -86,19 +103,49 @@ class ProviderRouter:
                             and profile_id
                             not in self._codex_profile_order):
                         self._codex_profile_order.append(profile_id)
+                unusable = [
+                    profile_id for profile_id in self._codex_profile_order
+                    if not self._codex_profile_ready(profile_id)]
+                if unusable:
+                    logger.warn(
+                        "router",
+                        "Codex 通道 CODEX_HOME 不存在,已排除出抢槽序列"
+                        "(该通道不再参与审核/出图): " + "、".join(unusable))
             if provider.quota_limit > 0:
                 self._ensure_quota_row(name, provider.quota_limit)
 
     # ---- 订阅额度 ----
     # ---- Codex 通道溢出调度 ----
+    def _codex_profile_ready(self, profile_id):
+        """通道的 CODEX_HOME 是否真实存在。
+
+        CliProvider 拿到 ``_codex_profile`` 后会强制要求该目录存在,否则
+        直接抛 ProviderError。而提示词审核不捕获 ProviderError,异常会
+        穿透整个 router.call——未初始化的通道足以让所有正式出图硬失败,
+        且因为审核在路由链之前,可用的图片 API 根本够不着。所以未就绪
+        的通道必须在抢槽前就排除掉。
+        """
+        home = self._codex_profile_homes.get(profile_id)
+        if not home:
+            return False
+        try:
+            return Path(home).expanduser().is_dir()
+        except OSError:
+            return False
+
     def _acquire_codex_slot(self, cancel=None):
         """按通道优先级抢一个并发槽:B、C 先行,占满才溢出到 A。
 
         非阻塞扫描全部启用通道;全占满则每 0.5s 重扫一轮(响应用户
         停止)。返回 (profile_id, slot);未配置启用通道时返回
         ("", None),调用方走无槽路径(保持旧配置兼容)。
+
+        CODEX_HOME 缺失的通道视为未配置:全部通道都未就绪时同样走
+        ("", None) 无槽路径,由环境自带的 CODEX_HOME 兜底,行为与引入
+        通道调度之前一致。
         """
-        order = self._codex_profile_order
+        order = [profile_id for profile_id in self._codex_profile_order
+                 if self._codex_profile_ready(profile_id)]
         if not order:
             return "", None
         while True:
@@ -366,8 +413,8 @@ class ProviderRouter:
                         tokens.append(value.strip())
         return list(dict.fromkeys(token for token in tokens if token))
 
-    @staticmethod
-    def _prompt_review_count_preserved(optimized, payload):
+    @classmethod
+    def _prompt_review_count_preserved(cls, optimized, payload):
         count = payload.get("character_count")
         if type(count) is not int or count < 0:
             return True
@@ -378,14 +425,22 @@ class ProviderRouter:
             and type(item.get("count")) is int
             and item.get("count") > 0)
         expected = count + functional
+        boundary = rf"(?<![{cls.COUNT_BOUNDARY}])"
         if expected == 0:
-            return "无人" in optimized or bool(re.search(r"0\s*人", optimized))
+            return ("无人" in optimized or bool(re.search(
+                rf"{boundary}(?:0|零)\s*{cls.COUNT_QUANTIFIER}", optimized)))
         if expected == 1 and any(
                 token in optimized for token in (
-                    "单人", "一人", "一名人物", "一个人")):
+                    "单人", "一人", "一名人物", "一个人", "独自")):
             return True
+        # 「双人」没有对应数词写法,单独放行。
+        if expected == 2 and "双人" in optimized:
+            return True
+        forms = "|".join(
+            re.escape(form) for form
+            in (str(expected), *cls.COUNT_WORDS.get(expected, ())))
         return bool(re.search(
-            rf"(?<!\d){expected}\s*(?:人|名人物|个人)(?!\d)", optimized))
+            rf"{boundary}(?:{forms})\s*{cls.COUNT_QUANTIFIER}", optimized))
 
     def review_image_prompt(self, capability, payload, out_dir, cancel=None):
         """用 Codex 审核并优化真实出图前的最终提示词，原地冻结优化稿。
