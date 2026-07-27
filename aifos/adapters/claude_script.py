@@ -1362,6 +1362,29 @@ def build_qc_prompt(payload):
         ("必须执行硬检查；" if payload.get("physical_logic_required") else "仅作辅助检查；")
         + (physical_rules or "人物、镜头、道具关系按当前镜头实际构图核对")
         + (f"；对象关系：{physical_objects}" if physical_objects else ""))
+    # 尺度判级:远景里物理上分辨不出刀刃缺口——按景别分级核验,
+    # 低于可辨尺度的微细节不得作为 FAIL 理由(由近景镜头承担)。
+    camera_text = str(
+        (payload.get("camera") if not isinstance(
+            payload.get("camera"), dict)
+         else "·".join(str(v) for v in payload["camera"].values() if v))
+        or generation.get("camera") or "")
+    if any(t in camera_text for t in ("远景", "全景")):
+        scale_tier = (
+            "本镜为远景/全景:只核对人数、身份大轮廓(发型剪影/体型/"
+            "性别)、服装大形制与色系、道具在场性与持有人;刃口缺口、"
+            "指腹墨渍、织物纹理、饰品细纹、印文等微细节低于本景别"
+            "可辨尺度,一律不得作为不合格理由,由近景镜头承担核验")
+    elif any(t in camera_text for t in ("中景", "膝上", "半身")):
+        scale_tier = (
+            "本镜为中景:核对至服装结构、道具形态与佩戴位置;"
+            "刃口缺口、指渍、织物纹理、印文等微细节不得作为"
+            "不合格理由,由近景/特写镜头承担核验")
+    else:
+        scale_tier = (
+            "本镜为近景/特写档:识别性微细节(如道具的刃口缺口、"
+            "标志性磨损、印文)在可见面内必须核验一致")
+    physical_text += f"；【尺度判级】{scale_tier}"
     overlays = [
         item for item in (payload.get("narrative_overlays") or [])
         if isinstance(item, dict)
