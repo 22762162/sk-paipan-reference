@@ -772,6 +772,9 @@ def test_design_prompt_and_validation(tmp_path):
                "characters": [{"name": "洛尘", "role": "主角"}]}
     prompt = build_prompt("script", payload)
     assert "人物设定" in prompt and "洛尘" in prompt and "designs" in prompt
+    assert "第1项必须是首次登场前" in prompt
+    assert "人物定角4张候选必须复用第1项" in prompt
+    assert "禁止官服等后续换装、淋湿、泥污、血迹、伤口或死亡态" in prompt
     ok = {"designs": [{"name": "洛尘", "personality": "外冷内热",
                        "appearance": "瓜子脸冷白皮", "costume": "交领长衫"}]}
     assert validate_script(ok, payload) is None

@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from aifos.app import App
 from aifos.config import Config
 from aifos.errors import ProviderError
 from aifos.production.base import ProviderResult
@@ -173,10 +174,10 @@ def test_prompt_review_instruction_forbids_image_generation(tmp_path):
     assert "【任务】角色正面母资产：林川。" in instruction
 
 
-def test_candidate_review_uses_explicit_single_look_context(tmp_path):
+def test_candidate_review_uses_explicit_initial_state_context(tmp_path):
     source = (
-        "【任务】林川单人定角候选。"
-        "【本张唯一造型】灰褐麻布短褐，携湿旧蓝布包袱。"
+        "【任务】林川单人初始状态定角候选。"
+        "【共同初始造型】灰褐麻布短褐，携旧蓝布包袱。"
     )
     router, codex = _router(source)
     payload = {
@@ -190,12 +191,12 @@ def test_candidate_review_uses_explicit_single_look_context(tmp_path):
             "signature_props": "吏部札付",
         },
         "prompt_review_context": {
-            "schema": "aifos.character-candidate-review/v2",
+            "schema": "aifos.character-candidate-review/v3-initial-state",
             "characters": ["林川"],
             "character_count": 1,
-            "current_candidate_variant": {
+            "initial_character_state": {
                 "wardrobe": "灰褐麻布短褐",
-                "accessories_and_props": "湿旧蓝布包袱",
+                "accessories_and_props": "旧蓝布包袱",
             },
         },
     }
@@ -204,7 +205,7 @@ def test_candidate_review_uses_explicit_single_look_context(tmp_path):
 
     review_context = codex.calls[0][1]["review_context"]
     assert review_context["capability"] == "image"
-    assert review_context["current_candidate_variant"]["wardrobe"] \
+    assert review_context["initial_character_state"]["wardrobe"] \
         == "灰褐麻布短褐"
     assert "character_background" not in review_context
     assert "旧靛青举人袍" not in str(review_context)
@@ -223,3 +224,74 @@ def test_regular_shot_review_keeps_full_character_background():
 
     assert context["character_background"]["林川"]["costume"] \
         == "青色圆领官袍"
+
+
+def test_same_prompt_candidate_group_reuses_one_codex_optimized_prompt(
+        tmp_path, monkeypatch):
+    app = App(tmp_path / "ws")
+
+    class ReviewRouter:
+        calls = 0
+
+        @staticmethod
+        def _prompt_review_context(capability, payload):
+            return {
+                **payload["prompt_review_context"],
+                "capability": capability,
+            }
+
+        def review_image_prompt(
+                self, capability, payload, out_dir, cancel=None):
+            self.calls += 1
+            source = payload["prompt"]
+            payload["prompt_aifos_original"] = source
+            payload["prompt"] = "Codex统一优化后的初始人物提示词"
+            payload["prompt_review"] = {
+                "approved": True,
+                "status": "approved",
+                "reviewed_input_hash": "shared",
+            }
+            payload["prompt_review_schema"] = (
+                "aifos.codex-prompt-review/v1")
+            return None
+
+    router = ReviewRouter()
+    app.director.router = router
+    monkeypatch.setattr(
+        app.director, "_plan_mark", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        app.director, "_plan_read_status",
+        lambda *_args, **_kwargs: "pending")
+    tasks = []
+    for index in range(1, 5):
+        tasks.append({
+            "item_id": f"candidate:林川:{index}",
+            "capability": "image",
+            "sub_dir": "cast/candidates",
+            "payload": {
+                "art_name": f"林川_candidate_{index:02d}",
+                "prompt": "AIFOS完全相同的初始人物提示词",
+                "prompt_review_group_key": "character-initial:1:林川:v3",
+                "prompt_review_context": {
+                    "schema":
+                        "aifos.character-candidate-review/v3-initial-state",
+                    "characters": ["林川"],
+                    "character_count": 1,
+                    "initial_character_state": {
+                        "wardrobe": "灰褐粗麻短褐",
+                    },
+                },
+            },
+        })
+
+    try:
+        app.director._review_image_tasks(
+            {"out_root": tmp_path}, tasks)
+    finally:
+        app.close()
+
+    assert router.calls == 1
+    assert {task["payload"]["prompt"] for task in tasks} == {
+        "Codex统一优化后的初始人物提示词"}
+    assert all(task["payload"]["prompt_review"]["approved"]
+               for task in tasks)
