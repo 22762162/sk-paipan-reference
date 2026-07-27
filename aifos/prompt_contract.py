@@ -2344,6 +2344,43 @@ def render_shot_prompt(contract, *, mode=None):
     lines = [
         "【镜头合同v2.2】只执行下列事实，不自行补剧情。",
     ]
+    # 首句权重:图像模型对提示词开头的服从度最高。台账TOP1缺陷
+    # (核心道具执行缺失13次)与状态执行不到位,都源于核心事实被埋在
+    # 合同中部。把"这张图必须画出什么"压缩成一句放在最前。
+    if media != "video":
+        target_ref = contract.get("frame_target")
+        core_state = _text(
+            target_ref.get("state") if isinstance(target_ref, dict)
+            else contract.get("frame_target_state"))
+        core_props = []
+        # 内部 prop_id 不入提示词(会被判提示词泄漏);经注册表解析中文名
+        registry_names = {
+            _text(entry.get("prop_id")): _text(entry.get("name"))
+            for entry in (contract.get("prop_registry") or [])
+            if isinstance(entry, dict)}
+        for item in (contract.get("frame_props") or []):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("visibility") or "") != "visible":
+                continue
+            prop_name = _text(item.get("name")) or registry_names.get(
+                _text(item.get("prop_id")), "")
+            if not prop_name or any(
+                    prop_name in existing for existing in core_props):
+                continue
+            holder = _text(item.get("holder"))
+            state = _text(item.get("physical_state"))
+            detail = "、".join(filter(None, (
+                f"由{holder}持有" if holder else "", state)))
+            core_props.append(
+                f"{prop_name}({detail})" if detail else prop_name)
+            if len(core_props) >= 2:
+                break
+        if core_state or core_props:
+            core_line = core_state or "按定格状态执行"
+            if core_props:
+                core_line += "；必须清晰画出:" + "、".join(core_props)
+            lines.append(f"【核心画面】{core_line}。")
     if media == "video":
         lines.append(
             "【输入】图1是唯一动作起点，图2是唯一动作终点；"

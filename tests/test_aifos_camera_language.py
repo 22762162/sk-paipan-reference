@@ -179,3 +179,28 @@ def test_dead_state_renders_forceful_visual_clause():
              "characters": ["林川"], "dialogue": None, "prompt": "p"}
     _c2, p2 = compile_shot_prompt(plain, location="茶棚", mode="image")
     assert "【硬状态·强制执行】" not in p2
+
+
+def test_core_picture_line_leads_the_prompt():
+    """首句权重:核心动作+关键道具状态置顶(道具执行缺失13次的对策);
+    内部 prop_id 不得入提示词,经注册表解析中文名。"""
+    from aifos.prompt_contract import compile_shot_prompt
+    shot = {"shot_no": 9, "scene_no": 2, "kind": "action",
+            "camera": "中景", "description": "黑衣人持刀逼近",
+            "duration": 2.5, "characters": ["黑衣人"], "dialogue": None,
+            "prompt": "p",
+            "prop_registry": [{"prop_id": "YYXS-E01-PROP-DAGGER-001",
+                                "name": "缺口单刃短刀", "kind": "core",
+                                "instance_count": 1}],
+            "frame_targets": {"keyframe": {"phase": "end",
+                "state": "黑衣人右手反握短刀,刀尖朝下,刃面带血"}},
+            "frame_props": [
+                {"prop_id": "YYXS-E01-PROP-DAGGER-001", "phase": "end",
+                 "visibility": "visible", "holder": "黑衣人",
+                 "physical_state": "刀尖朝下,刃面带血"}]}
+    _contract, prompt = compile_shot_prompt(
+        shot, location="茶棚", mode="image")
+    line2 = prompt.split("\n")[1]
+    assert line2.startswith("【核心画面】")
+    assert "缺口单刃短刀" in line2 and "由黑衣人持有" in line2
+    assert "YYXS-E01" not in line2
