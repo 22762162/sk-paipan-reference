@@ -1832,8 +1832,13 @@ class Director:
         else:
             hair = self._design_value(look.get("hair"))
             makeup = self._design_value(look.get("makeup"))
+        # 审核把本合同当不可变事实源。若这里残留淋湿/泥渍/血迹/伤情/
+        # 场次姿态,就会与下方 composition 的"干净、自然站姿"互斥,
+        # 审核规则禁止猜测优先级 → 整批熔断。故合同内的状态字段先经
+        # 同一套剥离器净化,再由 master_state_precedence 显式裁决。
+        clean = self._clean_candidate_initial_state_text
         return {
-            "schema": "aifos.character-candidate-review/v3-initial-state",
+            "schema": "aifos.character-candidate-review/v4-master-precedence",
             "candidate_prompt_schema": CHARACTER_CANDIDATE_PROMPT_SCHEMA,
             "candidate_policy": (
                 "同一人物四张图片必须复用完全相同的初始状态最终提示词，"
@@ -1846,24 +1851,32 @@ class Director:
                 self._candidate_identity_card(design)
                 or "仅锁定姓名、年龄、性别表达与同一人物身份"),
             "initial_character_state": {
-                "hair": hair,
-                "makeup": makeup,
-                "wardrobe": self._design_value(look.get("costume")),
+                "hair": clean(hair) if not has_reference else hair,
+                "makeup": clean(makeup) if not has_reference else makeup,
+                "wardrobe": clean(self._design_value(look.get("costume"))),
                 "palette": palette,
                 "accessories_and_props": (
-                    props or
+                    clean(props) or
                     "无额外剧情道具；不得继承人物全局道具或其他候选道具"),
                 "temperament": self._design_value(
                     look.get("temperament")),
-                "occasion": occasion,
-                "injury_state": injury_state,
-                "state_policy": story_variant.get(
-                    "initial_state_policy", ""),
+                "occasion": clean(occasion),
+                # 母版恒为无伤无污;稳定旧疤等永久特征已在 identity_lock。
+                "injury_state": "无伤、无污、无包扎（母版基准状态）",
+                "state_policy": clean(str(story_variant.get(
+                    "initial_state_policy", ""))),
             },
             "source_precedence": (
                 "initial_character_state是四张候选共同且唯一的服装、配色、"
                 "妆容、配饰与状态事实源；不得继承人物全局最终出图卡、"
                 "全局服装/标志道具或前后剧情造型"),
+            "master_state_precedence": (
+                "本合同是定妆母版:恒为干燥、洁净、无伤、无包扎的基础状态"
+                "与自然站姿。任何来源(剧本、人物设定、场次状态、参考图)"
+                "中的淋湿、水痕、泥点、泥渍、血迹、伤口、死亡态,以及跪地、"
+                "蜷缩、搀扶、失去支撑等场次动作姿态,母版一律不表现。"
+                "本条优先级最高,与其他事实并列出现时直接按本条执行,"
+                "不构成需要裁决的冲突,也不需要猜测优先级"),
             "reference_identity_lock": bool(has_reference),
             "reference_scope": (
                 "若有参考图，只锁脸型、五官骨相、年龄、性别表达、"
@@ -6184,6 +6197,46 @@ class Director:
             "name", "visual_design", "story_function", "era_material"))
         return any(token in blob for token in cls._TEXT_BEARING_PROP_TOKENS)
 
+    def _prop_candidate_review_context(self, prop, style, variant):
+        """道具母版的独立审核事实合同。
+
+        与人物母版同构:只给当前这张图需要的事实,并显式宣告母版状态
+        优先级,避免审核把外包装/污损/文书正文当成必须裁决的冲突。
+        """
+        clean = self._clean_candidate_initial_state_text
+        return {
+            "schema": "aifos.prop-candidate-review/v1-master-precedence",
+            "task": "single_prop_master_asset_candidate",
+            "prop_name": prop.get("name", ""),
+            "candidate_policy": (
+                "同一道具四张候选复用完全相同的母版提示词，"
+                "仅利用图片模型随机采样比较造型方案"),
+            "prop_facts": {
+                key: clean(self._design_value(prop.get(key)))
+                for key in ("story_function", "visual_design",
+                            "era_material", "owner")
+                if self._design_value(prop.get(key))
+            },
+            "variant_axis": variant.get("variant_focus", ""),
+            "master_state_precedence": (
+                "本合同是道具母版:只表现道具本体出厂/初始的完整形态。"
+                "任何来源中的外包装(油纸、布套、匣盒)、污渍、泥点、血迹、"
+                "水痕、破损、折裂及其他场次临时状态,母版一律不表现。"
+                "本条优先级最高,与其他事实并列出现时直接按本条执行,"
+                "不构成需要裁决的冲突,也不需要猜测优先级"),
+            "text_policy": (
+                "本道具是文字载体:母版以卷合/折叠/闭合/斜角呈现,"
+                "正文一律不可辨读;禁止编造任何文字、印章或落款内容——"
+                "具体文字由后续「锁文字」阶段统一定版,母版不需要也"
+                "不允许确定文字内容,这不构成事实缺失"
+                if self._prop_has_text_surface(prop) else
+                "本道具非文字载体:画面不得出现任何文字、Logo 或水印"),
+            "style": style,
+            "composition": (
+                "单件道具完整居中、三分之四视角、纯净中性棚拍背景、"
+                "无人物、无手、无场景"),
+        }
+
     def _prop_candidate_prompt(self, prop, style, variant):
         # 连续性状态是场次事实(油纸外包→拆封→沾血),不是母版事实。
         # 把它写进母版会与"无包装/无污损"的母版约束直接矛盾,
@@ -6498,6 +6551,12 @@ class Director:
                         "prompt": prompt,
                         "style": style,
                         "prompt_contract_complete": True,
+                        # 不走默认审核上下文:那会把 story_world、
+                        # character_background 等全局事实(含场次状态)
+                        # 混进不可变事实源,与母版规则互斥并熔断。
+                        "prompt_review_context":
+                            self._prop_candidate_review_context(
+                                prop, style, variant),
                         **reference_payload,
                         "require_reference_images": bool(refs),
                         "aspect": "1:1", "width": 1024, "height": 1024,
