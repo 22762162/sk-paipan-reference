@@ -3376,14 +3376,19 @@ def make_handler(workspace, jobs):
                         quality, allow_auto=True, field="image_quality")
                 except AifosError as exc:
                     return self._error(400, str(exc))
+            # Codex 判「改合同/拆镜/人工」时默认熔断；前端确认合同已修好后
+            # 带 escalation_override 再来，才放行这一张。
+            override = bool(body.get("escalation_override"))
             job_id = jobs.start_task(
                 title, number,
                 lambda app, run_id: app.director.regen_image(
                     title, number, target, feedback=feedback,
-                    prompt_override=prompt, quality_override=quality),
+                    prompt_override=prompt, quality_override=quality,
+                    escalation_override=override),
                 action="regen_image",
                 request={"target": target, "feedback": feedback,
-                         "prompt": prompt, "quality": quality},
+                         "prompt": prompt, "quality": quality,
+                         "escalation_override": override},
                 # 不能用 unique:那会把第二张的请求并进第一张的 job,
                 # 前端轮询到第一张成功就以为改好了,第二张其实从未重画。
                 queue=True)
@@ -3894,15 +3899,17 @@ def make_handler(workspace, jobs):
                         quality, allow_auto=True, field="image_quality")
                 except AifosError as exc:
                     return self._error(400, str(exc))
+            override = bool(body.get("escalation_override"))
             job_id = jobs.start_task(
                 title, number,
                 lambda app, run_id, report: app.director.redo_items(
                     title, number, item_ids=item_ids,
                     only_failed=only_failed, quality_override=quality,
-                    progress=report),
+                    progress=report, escalation_override=override),
                 action="redo_items", tracked=True,
                 request={"item_ids": item_ids,
-                         "only_failed": only_failed, "quality": quality})
+                         "only_failed": only_failed, "quality": quality,
+                         "escalation_override": override})
             return self._json({"job_id": job_id}, status=202)
 
         def _redo_video(self):

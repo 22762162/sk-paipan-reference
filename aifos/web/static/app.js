@@ -2801,10 +2801,26 @@ function qualitySelectHtml(cls = "quality-select", selected = "auto") {
     `<option value="${v}" ${selected === v ? "selected" : ""}>${label}</option>`).join("")}</select>`;
 }
 
-function regenControls(target, label) {
+/* Codex 判这几类处理时重画救不回来,后端在调生图 API 前就熔断。 */
+const CODEX_NON_REDRAW_ACTIONS = [
+  "repair_contract", "split_shot", "accept_current", "manual_review",
+];
+
+function regenControls(target, label, escalation) {
+  const codex = escalation && typeof escalation === "object" ? escalation : {};
+  const blocked = codex.triggered
+    && CODEX_NON_REDRAW_ACTIONS.includes(codex.aifos_action);
+  const notice = blocked ? `<div class="regen-escalation-notice">
+      <b>重画已熔断：</b>Codex 判定本镜应「${
+        esc(CODEX_QC_ACTION_CN[codex.aifos_action] || codex.aifos_action)
+      }」，重画解决不了。改完本镜提示词/分镜后重画会自动放行。
+      <label><input type="checkbox" class="regen-escalation-override">
+        我已按 Codex 指令修好，强制重画</label>
+    </div>` : "";
   return `<div class="regen-box" data-target="${esc(JSON.stringify(target))}">
     <button class="regen-toggle">🔄 ${esc(label)}</button>
     <div class="regen-form" hidden>
+      ${notice}
       <input placeholder="修改意见,如:换成夜晚/表情更凶(可留空)">
       ${qualitySelectHtml("regen-quality")}
       <button class="regen-ref" title="上传参考图并自动挂到本对象,点重画立即生效">📎 参考图</button>
@@ -2869,9 +2885,13 @@ function bindRegen(container, episodeId, getData, onDone) {
       const btn = box.querySelector(".regen-go");
       btn.disabled = true; btn.textContent = "重画中…";
       try {
+        const overrideBox = form.querySelector(".regen-escalation-override");
         const reply = await api("/api/regen_image", {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ episode_id: episodeId, target, feedback, quality }),
+          body: JSON.stringify({
+            episode_id: episodeId, target, feedback, quality,
+            escalation_override: !!(overrideBox && overrideBox.checked),
+          }),
         });
         if (reply.status === "queued") {
           showToast(`已排入重画队列,前面还有${reply.queue_position || 1}张;`
@@ -3316,7 +3336,7 @@ function planQcBadge(item) {
     return `<span class="plan-st st-qc-ok" title="视觉质检通过${qc.attempts > 1 ? `(重画 ${qc.attempts - 1} 次后通过)` : ""}">质检✓</span>`;
   const codex = planCodexEscalation(item);
   if (codex.status === "completed")
-    return `<span class="plan-st st-auto" title="${esc(codex.reason || "连续两次失败后已由 Codex 分析")}">🤖 Codex 已分析 · ${esc(CODEX_QC_ACTION_CN[codex.aifos_action] || codex.aifos_action || "待处理")}</span>`;
+    return `<span class="plan-st st-auto" title="${esc(codex.reason || "质检失败后已由 Codex 分析")}">🤖 Codex 已分析 · ${esc(CODEX_QC_ACTION_CN[codex.aifos_action] || codex.aifos_action || "待处理")}${codex.executable ? " · 已自动按新提示词重画" : ""}</span>`;
   if (codex.status === "unavailable")
     return `<span class="plan-st st-mock" title="${esc(codex.reason || "Codex 暂不可用")}">⚠ Codex 待接管</span>`;
   return `<span class="plan-st st-mock" title="${esc((qc.issues || []).join(";"))}">⚠ 质检未过</span>`;
@@ -4580,9 +4600,11 @@ function imageFailurePanelHtml(data) {
           <b>镜头 ${String(failure.shot_no).padStart(2, "0")}</b>
           <span>${esc((failure.issues || []).join("；") || "图片质检未通过")}</span>
           <small>${count ? `连续失败 ${count} 次` : `已自动修图 ${Number(failure.auto_repairs || 0)} 次`}
-            · ${codex.status === "completed" ? `Codex 已分析：${esc(action)}`
+            · ${codex.status === "completed"
+              ? `Codex 已分析：${esc(action)}${codex.executable
+                ? "（已自动按新提示词重画一次）" : "（不再自动出图）"}`
               : (codex.status === "unavailable" ? "Codex 暂不可用，已停止盲目重画"
-                : "未达到两次时保留原质检流程")}</small>
+                : "质检失败后由 Codex 接管")}</small>
           ${codex.status === "completed" ? `<span class="qc-codex-inline">
             <b>Codex → AIFOS：</b>${esc(codex.instruction_to_aifos || "")}</span>` : ""}
         </div>
@@ -10516,7 +10538,8 @@ class StoryboardCanvas {
         ${lineNo != null ? this.link("配音", art.voices[lineNo]) : ""}
       </ul>
       <h4>画面不满意?</h4>
-      ${regenControls({ kind: "shot", shot_no: shotNo }, "附意见重画本镜头")}
+      ${regenControls({ kind: "shot", shot_no: shotNo }, "附意见重画本镜头",
+        failedKeyframe ? failedKeyframe.codex_escalation : null)}
       <h4>下载修改后上传</h4>
       <div class="io-row"><span>画面</span>
         ${ioControls({ kind: "shot", shot_no: shotNo },

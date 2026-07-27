@@ -1,5 +1,6 @@
 """图片视觉质检:核对剧本要求,不合格自动重画;镜头景别多样性。"""
 
+import copy
 import json
 import threading
 from pathlib import Path
@@ -494,90 +495,346 @@ def test_qc_fail_triggers_auto_redraw(app, tmp_path):
         "input_hash"] != result.qc["attempt_history"][1]["input_hash"]
 
 
-def test_two_consecutive_failures_escalate_to_codex_without_third_redraw(
-        app, tmp_path):
-    image = tmp_path / "twice-failed.png"
-    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 24)
-    calls = {"image": 0, "qc": 0, "codex_payload": None}
-
-    def failed_verdict(*, escalated=False):
-        value = {
-            "pass": False,
-            "visual_pass": False,
-            "input_contract_pass": False,
-            "issues": ["双手动作与道具可见性互相冲突"],
-            "image_error": {
-                "summary": "静态画面无法同时完成两个手部动作",
-                "categories": ["action", "prop"],
-                "evidence": ["双手已被拱手动作占用"],
-            },
-            "prompt_diagnosis": {
-                "status": "conflicting",
-                "issues": ["既要求拱手又要求掌中道具清楚可见"],
-                "irrelevant_or_conflicting_sections": ["手部动作冲突"],
-            },
-            "reference_diagnosis": {
-                "status": "correct", "issues": [], "missing_roles": [],
-            },
-            "targeted_prompt_patch": {
-                "instructions": ["定格拱手完成瞬间，道具允许被手掌遮挡"],
-                "preserve": ["人物身份", "机位"],
-                "max_scope": "current_shot_only",
-            },
-            "reference_adjustments": [],
+def _escalation_verdict(*, escalated=False, action="repair_contract",
+                        instructions=None):
+    value = {
+        "pass": False,
+        "visual_pass": False,
+        "input_contract_pass": False,
+        "issues": ["双手动作与道具可见性互相冲突"],
+        "image_error": {
+            "summary": "静态画面无法同时完成两个手部动作",
+            "categories": ["action", "prop"],
+            "evidence": ["双手已被拱手动作占用"],
+        },
+        "prompt_diagnosis": {
+            "status": "conflicting",
+            "issues": ["既要求拱手又要求掌中道具清楚可见"],
+            "irrelevant_or_conflicting_sections": ["手部动作冲突"],
+        },
+        "reference_diagnosis": {
+            "status": "correct", "issues": [], "missing_roles": [],
+        },
+        "targeted_prompt_patch": {
+            "instructions": ["定格拱手完成瞬间，道具允许被手掌遮挡"],
+            "preserve": ["人物身份", "机位"],
+            "max_scope": "current_shot_only",
+        },
+        "reference_adjustments": [],
+    }
+    if escalated:
+        value["codex_escalation"] = {
+            "aifos_action": action,
+            "reason": "不是继续抽卡能解决的问题",
+            "aifos_instructions": instructions if instructions is not None
+            else ["把静态关键帧改为唯一拱手完成瞬间", "将核桃标为本帧允许遮挡"],
+            "freeze_moment": "拱手完成",
+            "visible_props": [],
+            "hidden_props": ["核桃"],
         }
-        if escalated:
-            value["codex_escalation"] = {
-                "aifos_action": "repair_contract",
-                "reason": "不是继续抽卡能解决的问题",
-                "aifos_instructions": [
-                    "把静态关键帧改为唯一拱手完成瞬间",
-                    "将核桃标为本帧允许遮挡",
-                ],
-                "freeze_moment": "拱手完成",
-                "visible_props": [],
-                "hidden_props": ["核桃"],
-            }
-        return value
+    return value
 
-    class StubRouter:
-        def call(self, capability, payload, out_dir, cancel=None):
-            if capability == "image":
-                calls["image"] += 1
-                return ProviderResult(
-                    provider="seedream", cost=0.2, uri=str(image))
-            calls["qc"] += 1
-            if payload.get("required_provider") == "codex":
-                calls["codex_payload"] = dict(payload)
-                return ProviderResult(
-                    provider="codex", cost=0.0,
-                    model="Codex 视觉质检",
-                    data=failed_verdict(escalated=True))
+
+class _EscalationRouter:
+    """出图/质检双桩：质检恒判不合格，required_provider=codex 时回升级结论。"""
+
+    def __init__(self, image_uri, action):
+        self.image_uri = image_uri
+        self.action = action
+        self.calls = {"image": 0, "qc": 0}
+        self.image_payloads = []
+        self.codex_payloads = []
+
+    # 真实 Router 在每次出图前都会过一次提示词审核；桩必须提供同名方法，
+    # 否则被测代码在调用生图前就 AttributeError，测不到本来要测的东西。
+    def review_image_prompt(self, capability, payload, out_dir, cancel=None):
+        return None
+
+    def call(self, capability, payload, out_dir, cancel=None):
+        if capability == "image":
+            self.calls["image"] += 1
+            self.image_payloads.append(copy.deepcopy(payload))
             return ProviderResult(
-                provider="claude", cost=0.1,
-                data=failed_verdict())
+                provider="seedream", cost=0.2, uri=str(self.image_uri))
+        self.calls["qc"] += 1
+        if payload.get("required_provider") == "codex":
+            self.codex_payloads.append(copy.deepcopy(payload))
+            return ProviderResult(
+                provider="codex", cost=0.0, model="Codex 视觉质检",
+                data=_escalation_verdict(
+                    escalated=True, action=self.action))
+        return ProviderResult(
+            provider="claude", cost=0.1, data=_escalation_verdict())
 
-    app.director.router = StubRouter()
+
+def _qc_spec():
+    return {"characters": ["赵德昌"], "count": 1,
+            "location": "县衙", "action": "拱手", "forbid": []}
+
+
+def test_first_failure_escalates_then_redraws_with_codex_prompt(
+        app, tmp_path):
+    """第 1 次不合格:Codex 出诊断改提示词,立刻按新提示词重画一次。"""
+    image = tmp_path / "first-failed.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 24)
+    router = _EscalationRouter(image, "targeted_redraw")
+    app.director.router = router
+
     result = app.director._generate_image_with_qc(
         "image", {"prompt": "赵德昌拱手", "shot_no": 8},
-        tmp_path, None, {
-            "characters": ["赵德昌"], "count": 1,
-            "location": "县衙", "action": "拱手", "forbid": [],
-        })
+        tmp_path, None, _qc_spec())
 
-    assert calls["image"] == 2
-    assert calls["qc"] == 3
-    assert calls["codex_payload"]["required_provider"] == "codex"
-    assert calls["codex_payload"]["codex_escalation_context"][
-        "consecutive_failures"] == 2
+    # 第 1 次失败就升级(不再等到第 2 次)，且带的是第 1 次的失败计数。
+    assert router.codex_payloads[0]["required_provider"] == "codex"
+    assert router.codex_payloads[0]["codex_escalation_context"][
+        "consecutive_failures"] == 1
+    # 出图 2 张:初版 + 按 Codex 新提示词自动重画的那张。
+    assert router.calls["image"] == 2
+    # 质检 4 次:2 次画面判定 + 2 次 Codex 升级分析。
+    assert router.calls["qc"] == 4
+    # 第二张确实按 Codex 回传的指令生成，而不是本地规则编译出来的话术。
+    second_feedback = router.image_payloads[1].get("feedback") or ""
+    assert "把静态关键帧改为唯一拱手完成瞬间" in second_feedback
+    assert router.image_payloads[1]["revision_mode"] == "targeted_qc_fix"
+    assert router.image_payloads[1]["qc_revision"]["source"] == \
+        "codex_escalation"
+    # 第二次仍不合格:只分析不再出第三张，停在人工检查点。
     assert result.qc["consecutive_failures"] == 2
-    assert result.qc["codex_escalation"]["status"] == "completed"
-    assert result.qc["codex_escalation"]["aifos_action"] == \
-        "repair_contract"
-    assert "把静态关键帧改为唯一拱手完成瞬间" in \
-        result.qc["revision_feedback"]
-    assert result.qc["redraw_required"] is False
+    assert result.qc["codex_escalation"]["stage"] == "final_analysis"
+    assert result.qc["codex_escalation"]["executable"] is False
     assert result.qc["retry_blocked"] is True
+    assert result.qc["auto_repair_exhausted"] is True
+
+
+def test_contract_repair_verdict_stops_before_second_image(app, tmp_path):
+    """Codex 判「改合同」时重画救不回来:第 1 次失败后就不再出图。"""
+    image = tmp_path / "contract-failed.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 24)
+    router = _EscalationRouter(image, "repair_contract")
+    app.director.router = router
+
+    result = app.director._generate_image_with_qc(
+        "image", {"prompt": "赵德昌拱手", "shot_no": 8},
+        tmp_path, None, _qc_spec())
+
+    assert router.calls["image"] == 1
+    assert router.calls["qc"] == 2
+    assert result.qc["consecutive_failures"] == 1
+    assert result.qc["codex_escalation"]["stage"] == "first_failure_autofix"
+    assert result.qc["codex_escalation"]["executable"] is False
+    assert result.qc["codex_escalation"]["aifos_action"] == "repair_contract"
+    assert result.qc["redraw_required"] is False
+    assert result.qc["contract_repair_required"] is True
+    assert result.qc["retry_blocked"] is True
+    assert "把静态关键帧改为唯一拱手完成瞬间" in result.qc["revision_feedback"]
+    # 升级结论记住了当时的生成输入指纹，供后续重画闸门比对。
+    assert result.qc["codex_escalation"]["contract_input_hash"]
+
+
+def _escalation_qc(action="targeted_redraw",
+                   instruction="【Codex 通知 AIFOS】定格拱手完成瞬间",
+                   input_hash="hash-old"):
+    return {
+        "passed": False,
+        "hard_failure": True,
+        "issues": ["双手动作与道具可见性互相冲突"],
+        "consecutive_failures": 1,
+        "attempts": 1,
+        "redraw_required": action == "targeted_redraw",
+        "contract_repair_required": action in ("repair_contract",
+                                               "split_shot"),
+        "revision_feedback": instruction,
+        "codex_escalation": {
+            "schema": "aifos.codex-qc-escalation/v1",
+            "triggered": True,
+            "status": "completed",
+            "stage": "first_failure_autofix",
+            "executable": action == "targeted_redraw",
+            "aifos_action": action,
+            "reason": "一张静帧承担不了两个先后动作",
+            "freeze_moment": "拱手完成",
+            "instruction_to_aifos": instruction,
+            "consecutive_failures": 1,
+            "contract_input_hash": input_hash,
+        },
+    }
+
+
+def test_escalation_gate_blocks_non_redraw_until_contract_changes(app):
+    """Codex 判非重画类处理时熔断；合同真变了或人工放行才通过。"""
+    block = app.director.escalation_redraw_block
+    context = app.director.escalation_context
+
+    same_input = {"input_hash": "hash-old"}
+    repair = context(_escalation_qc(action="repair_contract"))
+    assert repair["aifos_action"] == "repair_contract"
+    assert repair["contract_input_hash"] == "hash-old"
+
+    reason = block(repair, same_input)
+    assert "修复本镜生成合同" in reason
+    assert "熔断" in reason
+    # 诊断与建议冻结瞬间要带进熔断说明，用户才知道该改什么。
+    assert "一张静帧承担不了两个先后动作" in reason
+    assert "拱手完成" in reason
+
+    # 合同真的改了(生成输入哈希变化)→ 自动放行，不需要人工点确认。
+    assert block(repair, {"input_hash": "hash-new"}) == ""
+    # 人工确认已按指令修好 → 放行。
+    assert block({**repair, "override": True}, same_input) == ""
+    # 判定就是定向重画 / 根本没升级过 → 不拦。
+    assert block(context(_escalation_qc()), same_input) == ""
+    assert block({}, same_input) == ""
+    assert context({}) == {}
+
+    for action in ("split_shot", "accept_current", "manual_review"):
+        blocked = block(context(_escalation_qc(action=action)), same_input)
+        assert blocked, f"{action} 应当熔断"
+
+
+def test_plan_run_blocks_image_call_when_codex_requires_contract_repair(
+        app, tmp_path):
+    """闸门落在 _plan_run:判「改合同」时根本不会调到生图 API。"""
+    calls = {"image": 0}
+
+    class StubRouter:
+        def review_image_prompt(self, capability, payload, out_dir,
+                                cancel=None):
+            return None
+
+        def call(self, capability, payload, out_dir, cancel=None):
+            calls["image"] += 1
+            return ProviderResult(provider="seedream", cost=0.2, uri="")
+
+    app.director.router = StubRouter()
+    marks = []
+    app.director._plan_mark = (
+        lambda ctx, item_id, status, **kw: marks.append((item_id, status)))
+    ctx = {"out_root": tmp_path, "episode": {"id": 1}}
+    payload = {
+        "prompt": "赵德昌拱手",
+        "reference_manifest": [],
+        "qc_escalation": app.director.escalation_context(
+            _escalation_qc(action="repair_contract", input_hash="")),
+    }
+    # 哈希留空表示"拿不到旧指纹"，此时按最保守处理:照样熔断。
+    with pytest.raises(AifosError) as excinfo:
+        app.director._plan_run(
+            ctx, "scene:县衙", lambda *a, **k: None, payload=payload)
+
+    assert "修复本镜生成合同" in str(excinfo.value)
+    assert calls["image"] == 0, "熔断必须发生在调用生图 API 之前"
+    assert ("scene:县衙", "awaiting_human") in marks
+
+
+def _inject_escalation_qc(app, project, item_category="shot_image",
+                          **kwargs):
+    """把一条 Codex 升级结论写进 render_plan 的目标条目。
+
+    返回 (item_id, shot_no)——镜头图条目的 id 形如 ``shot:3``。
+    """
+    plan_path = (app.workspace.artifacts_dir
+                 / f"p{project['id']:03d}" / "e001" / "render_plan.json")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    target = next(item for item in plan["items"]
+                  if item["category"] == item_category)
+    target["qc"] = _escalation_qc(**kwargs)
+    target["status"] = "awaiting_human"
+    plan_path.write_text(json.dumps(plan, ensure_ascii=False),
+                         encoding="utf-8")
+    return target["id"], int(str(target["id"]).split(":")[1])
+
+
+def test_regen_image_applies_codex_instruction(app, monkeypatch):
+    """重画消费侧:Codex 指令进 feedback，升级上下文随 payload 下传。"""
+    project = _preproduce(app, title="升级指令重画")
+    instruction = "【Codex 通知 AIFOS】定格拱手完成瞬间，核桃允许被手掌遮挡"
+    _item_id, shot_no = _inject_escalation_qc(
+        app, project, instruction=instruction)
+
+    captured = {}
+
+    class _Stop(Exception):
+        pass
+
+    def fake_plan_run(self, ctx, item_id, fn, prompt=None, payload=None,
+                      revision_source="manual", capability="image"):
+        captured["item_id"] = item_id
+        captured["payload"] = payload or {}
+        captured["revision_source"] = revision_source
+        raise _Stop()
+
+    from aifos.director import Director
+    monkeypatch.setattr(Director, "_plan_run", fake_plan_run)
+
+    with pytest.raises(_Stop):
+        app.director.regen_image(
+            "升级指令重画", 1,
+            {"kind": "shot", "shot_no": shot_no})
+
+    # Codex 指令压过本地规则编译器，直接成为本次重画的修改意见。
+    assert instruction in captured["payload"]["feedback"]
+    # 升级上下文必须随 payload 下传，_plan_run 的闸门才有依据。
+    escalation = captured["payload"]["qc_escalation"]
+    assert escalation["aifos_action"] == "targeted_redraw"
+    assert escalation["instruction_to_aifos"] == instruction
+    assert escalation.get("override") is None
+    assert captured["payload"]["qc_consecutive_failures_base"] == 1
+
+
+def test_regen_image_passes_human_override_into_escalation(app, monkeypatch):
+    """人工确认合同已修好时，override 要真的传到闸门上。"""
+    project = _preproduce(app, title="升级指令放行")
+    _item_id, shot_no = _inject_escalation_qc(
+        app, project, action="repair_contract")
+
+    captured = {}
+
+    class _Stop(Exception):
+        pass
+
+    def fake_plan_run(self, ctx, item_id, fn, prompt=None, payload=None,
+                      revision_source="manual", capability="image"):
+        captured["payload"] = payload or {}
+        raise _Stop()
+
+    from aifos.director import Director
+    monkeypatch.setattr(Director, "_plan_run", fake_plan_run)
+
+    with pytest.raises(_Stop):
+        app.director.regen_image(
+            "升级指令放行", 1,
+            {"kind": "shot", "shot_no": shot_no},
+            escalation_override=True)
+
+    assert captured["payload"]["qc_escalation"]["override"] is True
+
+
+def test_redo_items_uses_codex_instruction_as_feedback(app, monkeypatch):
+    """批量重画失败项:走 codex_escalation 来源，而不是本地 batch_qc 文案。"""
+    project = _preproduce(app, title="批量升级指令")
+    instruction = "【Codex 通知 AIFOS】只保留两名已登记角色"
+    _item_id, shot_no = _inject_escalation_qc(
+        app, project, instruction=instruction)
+
+    calls = []
+
+    from aifos.director import Director
+
+    def fake_regen(self, project_title, episode_number, target, **kwargs):
+        calls.append({"target": target, **kwargs})
+        return {}
+
+    monkeypatch.setattr(Director, "regen_image", fake_regen)
+
+    summary = app.director.redo_items("批量升级指令", 1, only_failed=True)
+
+    assert summary["status"] != "blocked"
+    mine = [call for call in calls
+            if int(call["target"].get("shot_no") or 0) == shot_no]
+    assert mine, "被升级的失败项应当进入批量重画目标"
+    assert mine[0]["feedback"] == instruction
+    assert mine[0]["revision_source"] == "codex_escalation"
+    assert mine[0]["escalation_override"] is False
 
 
 def test_existing_image_recheck_keeps_failure_count_and_escalates(
@@ -1675,10 +1932,25 @@ def test_codex_qc_instruction_and_parse(tmp_path, monkeypatch):
             "characters": ["小鹿"],
             "codex_escalation_context": {"consecutive_failures": 2},
         }, tmp_path)
-    assert "连续质检失败后的 Codex 升级分析" in escalation_instruction
+    assert "质检失败后的 Codex 升级分析" in escalation_instruction
     assert "藏入袖内" in escalation_instruction
     assert "split_shot" in escalation_instruction
     assert "aifos_instructions" in escalation_instruction
+    # 第 2 次是最终裁决:必须明确告诉 Codex 之后不会再自动出图。
+    assert "最终裁决" in escalation_instruction
+    assert "AIFOS 不会再自动" in escalation_instruction
+
+    # 第 1 次失败要的是"可直接拼进下一次提示词"的可执行表述,不是建议。
+    first_failure_instruction, _, _ = codex_image.build_instruction(
+        "image_qc", {
+            "image_uri": "/tmp/f.png",
+            "characters": ["小鹿"],
+            "codex_escalation_context": {"consecutive_failures": 1},
+        }, tmp_path)
+    assert "第 1 次质检失败" in first_failure_instruction
+    assert "立即按你给出的新提示词" in first_failure_instruction
+    assert "targeted_redraw" in first_failure_instruction
+    assert "最终裁决" not in first_failure_instruction
 
     stdout = '思考中…\n{"pass": false, "issues": ["尾帧换了个人"]}\n完成'
 

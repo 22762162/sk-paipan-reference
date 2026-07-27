@@ -561,10 +561,20 @@ def build_instruction(capability, payload, out_dir):
         escalation_line = ""
         escalation_schema = ""
         if escalation:
+            failures = int(escalation.get("consecutive_failures") or 2)
+            stage_line = (
+                "本镜是第 1 次质检失败：AIFOS 会立即按你给出的新提示词"
+                "自动重画一次，所以 aifos_instructions 必须是可以直接拼进"
+                "下一次生成提示词的完整、唯一、无歧义表述，不要写"
+                "「建议」「可考虑」这类不可执行的话。只要重画能救回来就用"
+                "targeted_redraw。\n"
+                if failures <= 1 else
+                "本镜已连续 2 次质检失败：这是最终裁决，AIFOS 不会再自动"
+                "出图，你的结论直接决定停在人工检查点还是改合同。\n")
             escalation_line = (
-                "- 这是连续质检失败后的 Codex 升级分析，不是普通复检。"
-                f"连续失败次数={int(escalation.get('consecutive_failures') or 2)}；"
-                "必须先判断失败来自画面、提示词/参考图合同冲突，还是一个静态"
+                "- 这是质检失败后的 Codex 升级分析，不是普通复检。"
+                f"连续失败次数={failures}；" + stage_line
+                + "必须先判断失败来自画面、提示词/参考图合同冲突，还是一个静态"
                 "关键帧无法同时承载多个先后动作。藏入袖内、被手掌或身体合理"
                 "遮挡的道具属于不可见状态，不能强迫画面把它展示出来；双手已"
                 "执行抱拳、拱手等占用动作时，也不能同时要求同一只手清楚展示"
@@ -576,7 +586,8 @@ def build_instruction(capability, payload, out_dir):
                 '"targeted_redraw/repair_contract/split_shot/'
                 'accept_current/manual_review",'
                 '"reason":"为什么这样处理","aifos_instructions":'
-                '["AIFOS下一步只需执行的具体修改"],'
+                '["AIFOS下一步只需执行的具体修改；targeted_redraw 时必须是'
+                '可直接用于下一次生成的提示词表述"],'
                 '"freeze_moment":"静态关键帧唯一冻结瞬间",'
                 '"visible_props":["本帧必须可见的道具"],'
                 '"hidden_props":["本帧应隐藏或允许被遮挡的道具"]}')
