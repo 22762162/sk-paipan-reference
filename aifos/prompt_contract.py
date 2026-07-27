@@ -2385,6 +2385,38 @@ def render_shot_prompt(contract, *, mode=None):
                 f"mobility={condition.get('mobility', 'unknown')}")
     if condition_lines:
         lines.append("【人物状态合同】" + "；".join(condition_lines) + "。")
+    # 死亡/昏迷/静止是顶着模型"活人先验"的反常态内容,英文键值对
+    # (life=dead)约束力近零——实测阿砚"已死亡"被画成睁眼注视的活人。
+    # 翻译成强制性视觉判据,与质检同一口径。
+    hard_state_lines = []
+    for name, phases in (
+            contract.get("character_conditions") or {}).items():
+        if not isinstance(phases, dict):
+            continue
+        condition = phases.get(
+            "end" if media == "video" else target_phase) or {}
+        life = str(condition.get("life_state") or "")
+        consciousness = str(condition.get("consciousness_state") or "")
+        mobility = str(condition.get("mobility") or "")
+        if life in ("dead", "nonliving"):
+            hard_state_lines.append(
+                f"{name}已死亡:双眼完全闭合,无任何眼神、注视方向或"
+                "表情张力,面部肌肉彻底松弛静止;身体无自主支撑,姿态"
+                "完全由重力与接触面决定;绝不允许睁眼、聚焦、惊恐、"
+                "咬牙或任何『活人感』")
+        elif consciousness in ("unconscious", "none"):
+            hard_state_lines.append(
+                f"{name}昏迷/无意识:双眼闭合,面部松弛无表情张力,"
+                "身体无自主支撑,不得出现注视、皱眉或主动姿态")
+        elif mobility in ("immobile", "none"):
+            hard_state_lines.append(
+                f"{name}身体完全静止:无动作趋势、无重心移动,"
+                "四肢位置由当前支撑决定")
+    if hard_state_lines:
+        lines.append(
+            "【硬状态·强制执行】" + "；".join(hard_state_lines)
+            + "。本条为最高优先视觉事实,任何表情/动作描述与之冲突时"
+            "以本条为准。")
     overlays = contract.get("narrative_overlays") or []
     if overlays:
         overlay = overlays[0]

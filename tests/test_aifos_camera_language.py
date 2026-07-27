@@ -156,3 +156,26 @@ def test_freeze_condition_derived_from_end_when_missing():
     assert not freeze.get("issues")
     assert not any("freeze" in str(item)
                    for item in contract.get("issues", []))
+
+
+def test_dead_state_renders_forceful_visual_clause():
+    """life=dead 键值对约束力近零(阿砚被画成睁眼活人的真实事故);
+    死亡/昏迷/静止须翻译成强制性视觉判据,常规镜头零污染。"""
+    from aifos.prompt_contract import compile_shot_prompt
+    shot = {"shot_no": 11, "scene_no": 2, "kind": "action",
+            "camera": "近景·俯拍", "description": "林川俯身查看阿砚",
+            "duration": 2.5, "characters": ["林川", "阿砚"],
+            "dialogue": None, "prompt": "p",
+            "start_state": {"阿砚": {"pose": "仰卧",
+                                      "condition": {"life_state": "dead"}}},
+            "end_state": {"阿砚": {"pose": "仰卧",
+                                    "condition": {"life_state": "dead"}}}}
+    _contract, prompt = compile_shot_prompt(
+        shot, location="茶棚", mode="image")
+    assert "【硬状态·强制执行】" in prompt
+    assert "阿砚已死亡" in prompt and "绝不允许睁眼" in prompt
+    plain = {"shot_no": 1, "scene_no": 1, "kind": "dialogue",
+             "camera": "中景", "description": "对话", "duration": 2,
+             "characters": ["林川"], "dialogue": None, "prompt": "p"}
+    _c2, p2 = compile_shot_prompt(plain, location="茶棚", mode="image")
+    assert "【硬状态·强制执行】" not in p2
