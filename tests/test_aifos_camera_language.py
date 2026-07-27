@@ -72,3 +72,18 @@ def test_scene_view_prompt_and_contract():
         "雨夜公寓单元房", "写实悬疑", scene, "反打视角")
     assert "不构成需要裁决的冲突" in context["view_consistency_precedence"]
     assert "master_state_precedence" in context     # 空镜条款仍然在场
+
+
+def test_shot_contract_declares_camera_precedence():
+    """镜头合同必须带 camera_precedence 显式裁决:多套机位并存时
+    以融合后的 camera 字段为唯一执行值(关键帧首熔断的点名要求)。"""
+    from aifos.prompt_contract import compile_shot_prompt
+    shot = {"shot_no": 7, "scene_no": 1, "kind": "action",
+            "camera": "近景·俯拍·严格侧面", "description": "林川侧身窥视",
+            "duration": 2.5, "characters": ["林川"], "dialogue": None,
+            "prompt": "p"}
+    contract, prompt = compile_shot_prompt(
+        shot, location="屋檐下", mode="image")
+    assert "唯一执行镜位" in contract["camera_precedence"]
+    assert "不构成需要裁决的冲突" in contract["camera_precedence"]
+    assert "唯一执行镜位(camera_precedence)" in prompt

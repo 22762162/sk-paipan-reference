@@ -2152,6 +2152,14 @@ def build_shot_prompt_contract(
             "表演严格服从逐角色 condition，不自行增加任何行为",
         ),
         "camera": _camera(shot),
+        # 镜位显式裁决条款:_camera 已按「分镜原文 > 镜头合同 > 五维
+        # 默认」融合出唯一执行值;审核上下文里若还残留其他来源的机位
+        # /构图描述,以融合值为准,不构成需要裁决的同级冲突。
+        "camera_precedence": (
+            "本合同 camera 字段是唯一执行镜位,已按「分镜原文 > 镜头"
+            "合同 > 五维默认」融合完毕;上下文中任何其他来源的机位、"
+            "视角或构图描述与之并列时,直接以 camera 字段为准,仅作"
+            "溯源参考,不构成需要裁决的冲突,也不需要猜测优先级"),
         "physical": physical,
         "spatial_relations": list(physical.get("spatial_relations") or []),
         "prop_registry": [
@@ -2313,6 +2321,10 @@ def render_shot_prompt(contract, *, mode=None):
     camera_geometry = camera_geometry_clause(camera)
     if camera_geometry:
         camera_line = f"{camera_line}；{camera_geometry}"
+    if contract.get("camera_precedence"):
+        camera_line = (
+            f"{camera_line}；本行为唯一执行镜位(camera_precedence):"
+            "与其他机位/构图描述并列冲突时直接以本行为准")
     lines = [
         "【镜头合同v2.2】只执行下列事实，不自行补剧情。",
     ]
