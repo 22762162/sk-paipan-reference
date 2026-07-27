@@ -176,3 +176,31 @@ class DualReviewMergeTest(unittest.TestCase):
             {"pass": False, "issues": ["缺少核心道具青灰文书包"]},
             {"pass": False, "issues": ["画面多出一名背景路人，不应出现"]})
         self.assertFalse(merged["dual_review"]["conflicts"])
+
+
+class SafetyRejectionRoutingTest(unittest.TestCase):
+    """题材级安全拒收:整条产线绕开,不再逐张撞墙。
+
+    《雨夜凶杀》有尸体与血迹,OpenAI 图片 API 整集拒绝(实测 73 次
+    全拒),每张先撞一次墙再回退纯属浪费。"""
+
+    def test_safety_rejection_detected(self):
+        from aifos.errors import ProviderError
+        from aifos.production.router import ProviderRouter
+        rejected = ProviderError(
+            'image_api API HTTP 400: {"error": {"message": "Your request '
+            'was rejected by the safety system. safety_violations='
+            '[violence]."}}')
+        self.assertTrue(ProviderRouter._is_safety_rejection(rejected))
+        self.assertTrue(ProviderRouter._is_safety_rejection(
+            ProviderError("content_policy_violation")))
+
+    def test_transient_failures_not_treated_as_safety(self):
+        """临时故障必须照常按张回退重试,不能被整条拉黑。"""
+        from aifos.errors import ProviderError
+        from aifos.production.router import ProviderRouter
+        for text in ("HTTP 500 upstream timeout", "连接被重置",
+                     "额度已耗尽", "Remote end closed connection"):
+            self.assertFalse(
+                ProviderRouter._is_safety_rejection(ProviderError(text)),
+                text)

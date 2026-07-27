@@ -151,6 +151,26 @@ _IMG_MEDIA = {".png": "image/png", ".jpg": "image/jpeg",
              ".jpeg": "image/jpeg", ".webp": "image/webp"}
 
 
+def sniff_image_media(data, fallback="image/png"):
+    """按真实字节判定图片 media_type;后缀只作兜底。
+
+    生成产线存在「.png 文件装着 JPEG 字节」的产物(下游模型按内容
+    输出、按约定名落盘);Anthropic API 校验声明与字节一致,后缀猜
+    media_type 必 400——这曾把 image_qc 阶梯的 claude_api 级整个打挂,
+    质检全部落到 codex 挤占出图通道。
+    """
+    head = bytes(data[:16])
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    return fallback
+
+
 def _local_refs(payload):
     """本地参考图路径：最终立绘优先，其后才是衔接/场景/风格/用户图。
     有 reference_manifest 时严格按对照表顺序(与提示词"图N"编号一致)。"""
@@ -245,7 +265,9 @@ def _data_image(path):
     media = _IMG_MEDIA.get(path.suffix.lower())
     if media is None:
         raise ProviderError(f"不支持的参考图格式: {path}")
-    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    data = path.read_bytes()
+    media = sniff_image_media(data, media)
+    encoded = base64.b64encode(data).decode("ascii")
     return f"data:{media};base64,{encoded}"
 
 
@@ -258,12 +280,14 @@ def _multipart_post(name, url, headers, fields, files, timeout):
                  f'Content-Disposition: form-data; name="{key}"\r\n\r\n'
                  f"{value}\r\n").encode("utf-8")
     for field, path in files:
-        media = _IMG_MEDIA.get(path.suffix.lower(), "image/png")
+        payload_bytes = path.read_bytes()
+        media = sniff_image_media(
+            payload_bytes, _IMG_MEDIA.get(path.suffix.lower(), "image/png"))
         body += (f"--{boundary}\r\n"
                  f'Content-Disposition: form-data; name="{field}"; '
                  f'filename="{path.name}"\r\n'
                  f"Content-Type: {media}\r\n\r\n").encode("utf-8")
-        body += path.read_bytes()
+        body += payload_bytes
         body += b"\r\n"
     body += f"--{boundary}--\r\n".encode("utf-8")
     request = urllib.request.Request(
@@ -344,6 +368,9 @@ class ClaudeApiProvider(Provider):
             data = path.read_bytes()
             if len(data) > 20 * 1024 * 1024:
                 raise ProviderError(f"{label}超过 20MB")
+            # 后缀会撒谎(.png 装 JPEG 字节),声明必须跟真实字节走,
+            # 否则 API 400、QC 阶梯断级。
+            media = sniff_image_media(data, media)
             return {"type": "image", "source": {
                 "type": "base64", "media_type": media,
                 "data": base64.b64encode(data).decode()}}
@@ -402,6 +429,7 @@ class ClaudeApiProvider(Provider):
                 data = path.read_bytes()
                 if len(data) > 20 * 1024 * 1024:
                     continue
+                media = sniff_image_media(data, media)
                 blocks.append({"type": "text",
                                "text": f"下面是{name}的参考图,该角色脸部"
                                        "特征与风格以此图为最高标准。"})

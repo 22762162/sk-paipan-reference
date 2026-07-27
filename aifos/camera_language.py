@@ -41,6 +41,45 @@ POSITION_GEOMETRY = {
 }
 
 
+# 景别容量:在「画面可见真人严格共N人」的人数合同下,各景别最多能
+# 完整容纳几名真人。与 SCALE_GEOMETRY 同源推导:特写肩线以下出画→
+# 只装得下 1 人;近景胸口以上→ 2 人并肩已是极限;中景带双臂动作→
+# 4 人;全景/远景不设限。景别与人数合同同级互斥时裁决体系只能熔断
+# (rule_governance 条款(c)),所以必须在编译期就不让互斥合同诞生。
+CAMERA_SCALE_CAPACITY = {"大特写": 1, "特写": 1, "近景": 2, "中景": 4}
+_CAPACITY_UPGRADE_ORDER = ("中景", "全景", "远景")
+
+
+def scale_capacity(scale):
+    """该景别在全员必见合同下的最大真人数;未知景别视为不设限。"""
+    return CAMERA_SCALE_CAPACITY.get(str(scale or "").strip(), 10 ** 6)
+
+
+def enforce_scale_capacity(scale, visible_count, allowed=None):
+    """景别装不下必见人数时升到最近的可行档;返回 (执行景别, 修正说明)。
+
+    只升不降:人数合同(严格共N人)不可被景别豁免,可行的唯一方向是
+    放宽取景。visible_count 缺失/非法时不动——宁可漏修不可误改。
+    """
+    try:
+        count = int(visible_count)
+    except (TypeError, ValueError):
+        return scale, ""
+    if count <= 0 or scale_capacity(scale) >= count:
+        return scale, ""
+    candidates = [
+        value for value in _CAPACITY_UPGRADE_ORDER
+        if scale_capacity(value) >= count
+        and (not allowed or value in allowed)]
+    if not candidates:
+        return scale, ""
+    upgraded = candidates[0]
+    note = (
+        f"景别容量修正:{scale}最多完整容纳{scale_capacity(scale)}人,"
+        f"本镜人数合同要求{count}人全部可见,已升档为{upgraded}")
+    return upgraded, note
+
+
 # 场景母版视角集:key → (中文名, 机位描述)。反打/侧向以主视角图为
 # 参考链式生成,保证同一空间在不同机位下结构一致。
 SCENE_VIEWS = {

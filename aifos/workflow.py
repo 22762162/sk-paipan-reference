@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .adapters.claude_script import (is_background_role,
                                      validate_script_bible)
+from .camera_language import enforce_scale_capacity
 from .quality_policy import default_quality_policy, resolve_video_quality
 from .inner_persona import (
     apply_inner_persona_to_shots,
@@ -332,7 +333,7 @@ def _type_word(scene, shot):
 
 
 def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
-                 scene_start=False):
+                 scene_start=False, visible_count=None):
     library = (rules or {}).get("camera_library", {})
     storyboard_rules = (rules or {}).get("storyboard", {})
     scales = library.get(
@@ -371,6 +372,11 @@ def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
         # 标准要求相邻景别变化:与上一镜相同时顺位换一档
         scale = next((s for s in ("中景", "全景", "近景", "特写")
                       if s in scales and s != prev_scale), scale)
+    # 可行性门禁:景别容量 < 人数合同(严格共N人全见)时,编译出来的
+    # 合同同级互斥、审核必熔断——盲轮换/显式特写都在此升到可行档。
+    # 这里不知道人数(visible_count=None)就不动,由合同编译期兜底。
+    scale, capacity_note = enforce_scale_capacity(
+        scale, visible_count, scales)
     if any(token in camera for token in ("顶拍", "顶视", "鸟瞰")):
         angle = "顶拍"
     elif any(token in camera for token in ("俯拍", "高机位", "高角度")):
@@ -407,7 +413,7 @@ def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
         value for value in positions if value not in ("低机位", "高机位")]
     if not lateral_positions:
         lateral_positions = ["正面", "斜侧", "过肩", "侧面"]
-    return {
+    plan = {
         "shot_scale": scale,
         "angle": angle,
         "lens": "85mm" if scale in ("近景", "特写") else "35mm",
@@ -425,6 +431,10 @@ def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
         "movement_motivation": "靠近角色情绪" if movement in ("推", "急推", "微推")
         else "建立清晰空间关系",
     }
+    if capacity_note:
+        # 落进分镜文档留审计;提示词渲染按键取值,该键不会进提示词。
+        plan["capacity_note"] = capacity_note
+    return plan
 
 
 def _state(name, continuity, emotion="专注", pose="站立，重心稳定"):
@@ -1490,7 +1500,8 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             raw.get("camera", ""), kind, index, rules,
             prev_scale=prev_camera_scale,
             scene_start=(raw.get("scene_no") != prev_scene_no
-                         and kind == "environment"))
+                         and kind == "environment"),
+            visible_count=visible_figure_count)
         prev_camera_scale = camera["shot_scale"]
         prev_scene_no = raw.get("scene_no")
         text_asset = _text_asset(raw, rules)

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 
-from .camera_language import camera_geometry_clause
+from .camera_language import camera_geometry_clause, enforce_scale_capacity
 
 
 PROMPT_CONTRACT_SCHEMA = "aifos.shot-prompt/v2.2"
@@ -1601,7 +1601,7 @@ def readable_text_required(value):
     return bool(sanitize_text_whitelist(value.get("whitelist") or []))
 
 
-def _camera(shot):
+def _camera(shot, visible_count=None):
     dimensions = shot.get("five_dimensions") or {}
     design = dimensions.get("camera_design") or {}
     contract = shot.get("shot_contract") or {}
@@ -1639,14 +1639,24 @@ def _camera(shot):
             r"\d+(?:\.\d+)?\s*[:：]\s*\d+(?:\.\d+)?", "", str(value or ""))
         return re.sub(r"[、，;；]{2,}", "，", cleaned).strip(" ，、;；·")
 
-    return {
-        "景别": _strip_aspect(_text(
-            raw_scale or contract.get("景别") or design.get("shot_scale"),
-            "按分镜")),
+    resolved_scale = _strip_aspect(_text(
+        raw_scale or contract.get("景别") or design.get("shot_scale"),
+        "按分镜"))
+    # 可行性门禁(编译侧兜底):已保存的旧分镜可能带着「特写×N人全见」
+    # 这类同级互斥合同;裁决体系(条款(c))对同级互斥只能熔断,唯一
+    # 可行方向是编译时把景别升到装得下人数合同的档位。
+    executed_scale, capacity_note = enforce_scale_capacity(
+        resolved_scale, visible_count)
+    lens = _strip_aspect(_text(design.get("lens") or contract.get("焦段")))
+    if capacity_note and lens.startswith("85"):
+        # 85mm 是近景/特写的绑定焦段;景别升档后保留会再造一对矛盾。
+        lens = "35mm"
+    result = {
+        "景别": executed_scale,
         "角度": _strip_aspect(_text(
             raw_angle or contract.get("角度") or design.get("angle"),
             "保持轴线")),
-        "焦段": _strip_aspect(_text(design.get("lens") or contract.get("焦段"))),
+        "焦段": lens,
         "机位": _strip_aspect(_text(
             raw_position or contract.get("机位")
             or design.get("camera_position"))),
@@ -1657,6 +1667,10 @@ def _camera(shot):
         "构图": _strip_aspect(_text(
             contract.get("构图") or design.get("composition"), "主体清楚")),
     }
+    if capacity_note:
+        # 渲染按键取值,本键只进合同 JSON 留审计,不进提示词正文。
+        result["容量修正"] = capacity_note
+    return result
 
 
 def shot_local_scene(shot, fallback=""):
@@ -2170,7 +2184,7 @@ def build_shot_prompt_contract(
             (shot.get("performance") or {}).get("micro_expression"),
             "表演严格服从逐角色 condition，不自行增加任何行为",
         ),
-        "camera": _camera(shot),
+        "camera": _camera(shot, visible_count=visible_count),
         # 镜位显式裁决条款:_camera 已按「分镜原文 > 镜头合同 > 五维
         # 默认」融合出唯一执行值;审核上下文里若还残留其他来源的机位
         # /构图描述,以融合值为准,不构成需要裁决的同级冲突。

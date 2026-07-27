@@ -2093,6 +2093,29 @@ CODEX_WRITER_ARGS = ("exec", "--sandbox", "read-only",
                      "--color", "never")
 
 
+# 在途引擎子进程登记簿:适配器被父进程 TERM 收割时转发终止到整个
+# 进程组。子进程用 start_new_session 起在独立会话里,不转发的话
+# TERM 只杀适配器本体,claude/codex 引擎会以孤儿身份继续跑并烧额度。
+_LIVE_GROUPS = set()
+
+
+def _register_term_forwarding():
+    """SIGTERM → 终止全部在途引擎进程组后退出(幂等注册)。"""
+
+    def _forward(_signum, _frame):
+        for proc in list(_LIVE_GROUPS):
+            try:
+                _terminate_group(proc, grace=3)
+            except Exception:
+                pass
+        raise SystemExit(143)
+
+    try:
+        signal.signal(signal.SIGTERM, _forward)
+    except (ValueError, OSError):
+        pass  # 非主线程/受限环境:保持默认行为
+
+
 def _terminate_group(proc, grace=5):
     """TERM→KILL 整个进程组,不留幽灵子进程。"""
     if proc.poll() is not None:
@@ -2146,6 +2169,7 @@ def _run_with_stall_watchdog(cmd, env, timeout, stall_timeout):
         cmd, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, env=env, start_new_session=True)
+    _LIVE_GROUPS.add(proc)
     chunks = {"out": [], "err": []}
     activity = {"at": time.monotonic()}
 
@@ -2195,6 +2219,7 @@ def _run_with_stall_watchdog(cmd, env, timeout, stall_timeout):
                 raise subprocess.TimeoutExpired(cmd, timeout)
     for item in threads:
         item.join(timeout=5)
+    _LIVE_GROUPS.discard(proc)
     return (proc.returncode, "".join(chunks["out"]),
             "".join(chunks["err"]), stalled)
 
@@ -2459,6 +2484,7 @@ def main(argv=None):
     parser.add_argument("--stall-timeout", type=int, default=0,
                         help="连续无输出判定卡住的秒数;0=关闭活性检测")
     args = parser.parse_args(argv)
+    _register_term_forwarding()
     try:
         request = json.loads(sys.stdin.read())
         reply = run(request, args.claude, args.timeout,

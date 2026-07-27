@@ -784,12 +784,28 @@ def main(argv=None):
             print("外网访问:另开一个终端运行 `aifos tunnel` 起隧道,"
                   "手机扫码即可(地址会显示在这里与网页面板)")
         print("Ctrl+C 停止")
+        # SIGTERM(launchctl/优雅重启)与 Ctrl+C 走同一条干净退出路径。
+        # 不注册的话 TERM 直接掐死进程:在途适配器全部孤儿化,继续烧
+        # Codex 并发,产物写进断管被丢——同图额度双烧的根源。
+        import signal as _signal
+
+        def _graceful_term(_signum, _frame):
+            raise KeyboardInterrupt
+
+        try:
+            _signal.signal(_signal.SIGTERM, _graceful_term)
+        except (ValueError, OSError):
+            pass  # 非主线程/受限环境,保持旧行为
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
             print("\n已停止")
         finally:
             httpd.server_close()
+            from .production.external import reap_live_children
+            reaped = reap_live_children()
+            if reaped:
+                print(f"已回收 {reaped} 个在途适配器子进程")
         return 0
     if args.command == "tunnel":
         return _cmd_tunnel(args)
