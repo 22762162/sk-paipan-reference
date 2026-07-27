@@ -11,6 +11,34 @@ from __future__ import annotations
 import re
 
 from .camera_language import camera_geometry_clause, enforce_scale_capacity
+from .lighting_language import lighting_clause
+from .realism_language import realism_applicable
+
+
+def lighting_lines_for_shot(shot, style, scene):
+    """本镜【光影】条款:按剧本已有事实选型,非写实画风自动留空。"""
+    if not realism_applicable(style or (shot or {}).get("style")):
+        return ""
+    shot = shot if isinstance(shot, dict) else {}
+    camera = shot.get("camera")
+    camera_text = (
+        "·".join(str(value) for value in camera.values() if value)
+        if isinstance(camera, dict) else str(camera or ""))
+    return lighting_clause(
+        location=str(scene or shot.get("location") or ""),
+        time_of_day=str(shot.get("time_of_day")
+                        or shot.get("era_context") or ""),
+        mood=str(shot.get("mood") or shot.get("emotion") or ""),
+        camera=camera_text,
+        scene_action=" ".join(str(value) for value in (
+            shot.get("description"), shot.get("action"),
+            shot.get("script_reference")) if value),
+        style_override=str(shot.get("lighting_style") or ""),
+        # 题材决定视听基调:仙侠逆光体积光、悬疑低调硬光、甜宠柔光高调
+        genre=" ".join(str(value) for value in (
+            style, shot.get("genre"), shot.get("kind_label"),
+            shot.get("project_kind"), shot.get("era_context"),
+            shot.get("script_reference")) if value))
 
 
 PROMPT_CONTRACT_SCHEMA = "aifos.shot-prompt/v2.2"
@@ -2192,6 +2220,9 @@ def build_shot_prompt_contract(
             "画幅以 aspect 字段为唯一执行值(来自项目/本集制作标准);"
             "镜头或其他描述中出现的画幅比例字样已在编译时剥离,"
             "如仍残留仅为杂讯,不构成画幅冲突,也不需要裁决"),
+        # 光影执行条款:按场景时间/地点/情绪与本镜景别自动选型,
+        # 非写实画风自动为空(不给二次元塞摄影术语)。
+        "lighting": lighting_lines_for_shot(shot, style, scene),
         "camera_precedence": (
             "本合同 camera 字段是唯一执行镜位,已按「分镜原文 > 镜头"
             "合同 > 五维默认」融合完毕;上下文中任何其他来源的机位、"
@@ -2372,6 +2403,9 @@ def render_shot_prompt(contract, *, mode=None):
     camera_geometry = camera_geometry_clause(camera)
     if camera_geometry:
         camera_line = f"{camera_line}；{camera_geometry}"
+    # 光影是第四维:只说机位不说布光,模型必然给平光,成片没有氛围
+    # (2026-07-28 盘点:镜头语言14条全在景别/角度/机位,光影为0)。
+    lighting_line = contract.get("lighting") or ""
     if contract.get("camera_precedence"):
         camera_line = (
             f"{camera_line}；本行为唯一执行镜位(camera_precedence):"
@@ -2537,6 +2571,7 @@ def render_shot_prompt(contract, *, mode=None):
             f"【单一主动作】{contract.get('action', '环境保持稳定')}。",
             f"【表演】{contract.get('performance', '自然微表情')}。",
             f"【镜头】{camera_line}。",
+            *([f"【光影】{lighting_line}。"] if lighting_line else []),
             f"【终点】{contract.get('end', '到达尾帧状态')}。",
         ])
     else:
@@ -2561,6 +2596,7 @@ def render_shot_prompt(contract, *, mode=None):
         lines.extend([
             f"【定格状态】{target_state}{fallback_note}。",
             f"【镜头】{camera_line}。",
+            *([f"【光影】{lighting_line}。"] if lighting_line else []),
         ])
     frame_props = contract.get("frame_props") or []
     visible_props = (

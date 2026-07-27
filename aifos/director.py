@@ -45,6 +45,7 @@ from .quality_policy import (
     set_policy_choices,
 )
 from .camera_language import scene_view_for_camera
+from .lighting_language import lighting_lines
 from .realism_language import realism_lines
 from .prompt_contract import (
     build_physical_contract,
@@ -2435,6 +2436,18 @@ class Director:
             f"当前场景图用途:{purpose}",
             "构图:适配项目画幅的环境建立镜头，前景/主体区/背景层次清楚，"
             "留出角色进出与表演动线，机位高度和光线方向稳定，后续镜头可复用",
+            # 场景母版就是全场光影的基准:这里定了调,后续镜头才有得继承。
+            # 母版是空镜,只给环境布光,不给人物布光条款。
+            *[line for line in lighting_lines(
+                style,
+                location=place,
+                time_of_day=time_state,
+                mood=str(scene.get("mood") or ""),
+                camera="全景",
+                scene_action=str(scene.get("action") or ""),
+                genre=" ".join(str(value) for value in (
+                    style, scene.get("genre"), premise) if value))
+              if "负面" not in line[:8]],
             "空镜:画面中不出现人物、人体局部、剪影、倒影中的人或随机路人",
             "场景只保留与剧情有关的设备、道具和陈设；所有屏幕、纸张、招牌和包装"
             "均无可读文字、字幕、Logo、水印、乱码和品牌标识",
