@@ -460,7 +460,7 @@ def test_codex_writer_stall_watchdog_terminates(tmp_path):
     elapsed = _time.monotonic() - started
     assert not reply["ok"]
     assert "卡住" in reply["error"]
-    assert "无任何输出" in reply["error"]
+    assert "无输出且无 CPU 活动" in reply["error"]
     assert elapsed < 20, f"看门狗未及时终止: {elapsed:.1f}s"
 
 
@@ -493,3 +493,35 @@ def test_validate_prompt_refine_rules():
     ok = {"image_prompt": "x" * 30, "changes": ["改了发型"]}
     assert validate_prompt_refine(ok) is None
     assert ok["conflict_notes"] == []   # 缺省字段被补齐
+
+
+FAKE_CODEX_SILENT_BUSY = '''#!/usr/bin/env python3
+import json, sys, time
+args = sys.argv[1:]
+out = args[args.index("--output-last-message") + 1]
+t0 = time.time()
+while time.time() - t0 < 8:        # 8 秒纯计算,零输出(模拟长思考)
+    sum(i * i for i in range(20000))
+data = {"episode_title": "妖王之章", "logline": "一句话",
+        "characters": [{"name": "甲", "role": "主角", "gender": "男",
+                        "age_range": "25-30"}],
+        "scenes": [{"scene_no": 1, "location": "古镇",
+                    "characters": ["甲"], "action": "走",
+                    "lines": [{"character": "甲", "dialogue": "你好"}]}]}
+with open(out, "w", encoding="utf-8") as f:
+    f.write(json.dumps(data, ensure_ascii=False))
+'''
+
+
+def test_stall_watchdog_does_not_kill_silent_but_working_codex(tmp_path):
+    """codex 长思考期几乎零输出;只要 CPU 在推进就必须判定存活。"""
+    codex = _make_bin(tmp_path, "codex", FAKE_CODEX_SILENT_BUSY)
+    reply = _bridge("aifos.adapters.claude_script", {
+        "capability": "script",
+        "payload": {"project_title": "万妖图录", "episode_number": 15,
+                    "premise": "", "style": ""},
+        "out_dir": str(tmp_path / "out")},
+        ["--engine", "codex", "--codex", str(codex),
+         "--timeout", "0", "--stall-timeout", "4"])
+    assert reply["ok"], reply      # 静默 8s > 阈值 4s,但 CPU 在跑
+    assert reply["data"]["scenes"]
