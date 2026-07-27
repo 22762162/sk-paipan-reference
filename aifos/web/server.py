@@ -1906,6 +1906,8 @@ def _episode_payload(app, episode_id, jobs=None):
         script, storyboard)
     continuity, continuity_v = app.projects.latest_document(
         episode_id, "continuity")
+    scene_plan, _scene_plan_v = app.projects.latest_document(
+        episode_id, "scene_plan")
     blocking, blocking_v = app.projects.latest_document(
         episode_id, "blocking")
     text_assets, text_assets_v = app.projects.latest_document(
@@ -2070,6 +2072,7 @@ def _episode_payload(app, episode_id, jobs=None):
         "storyboard": storyboard,
         "storyboard_version": sb_v,
         "continuity": continuity,
+        "scene_plan": scene_plan or {"skipped_scenes": []},
         "continuity_version": continuity_v,
         "blocking": blocking,
         "blocking_version": blocking_v,
@@ -2426,6 +2429,10 @@ def make_handler(workspace, jobs):
                     return self._character_refine_prompt()
                 if parsed.path == "/api/character/refine-prompt/apply":
                     return self._character_refine_apply()
+                if parsed.path == "/api/scene/skip":
+                    return self._scene_skip()
+                if parsed.path == "/api/scene/delete":
+                    return self._scene_delete()
                 if parsed.path == "/api/revise":
                     return self._revise()
                 if parsed.path == "/api/regen_image":
@@ -3320,6 +3327,55 @@ def make_handler(workspace, jobs):
                     self.rfile.read(length).decode("utf-8")) if length else {}
             except ValueError:
                 return None
+
+        def _scene_skip(self):
+            """场次「暂不生成/恢复生成」:{title/episode_id, scene_no, skip}。
+            随时可切换,下次(恢复)生产时生效;单场跑通全流程测试用。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            try:
+                scene_no = int(body.get("scene_no"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少 scene_no")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.set_scene_generation(
+                        title, number, scene_no,
+                        bool(body.get("skip", True))))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
+
+        def _scene_delete(self):
+            """删除一场并级联:剧本/分镜去场、镜头产物软删、
+            连续性圣经下次生产自动按新剧本重建。生产运行中禁止。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            try:
+                scene_no = int(body.get("scene_no"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少 scene_no")
+            if jobs.production_running_for(title, number):
+                return self._error(
+                    409, "本集正在生产，请先点「停止生成」，"
+                         "待状态稳定后再删除场次")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.delete_scene(
+                        title, number, scene_no))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
 
         def _revise(self):
             body = self._read_body()
