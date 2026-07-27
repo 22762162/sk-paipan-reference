@@ -2376,6 +2376,8 @@ def make_handler(workspace, jobs):
                     return self._asset_images(query)
                 if route == "/api/asset-studio/options":
                     return self._asset_studio_options(query)
+                if route == "/api/project/shell":
+                    return self._project_shell(query)
                 if route == "/api/logs":
                     limit = int(query.get("limit", ["50"])[0])
                     return self._json(self._with_app(
@@ -2540,6 +2542,10 @@ def make_handler(workspace, jobs):
                     return self._story_analysis()
                 if parsed.path == "/api/project/rename":
                     return self._project_rename()
+                if parsed.path == "/api/project/create":
+                    return self._project_create()
+                if parsed.path == "/api/project/delete":
+                    return self._project_delete()
                 if parsed.path == "/api/stop":
                     return self._stop()
                 if parsed.path == "/api/standards/save":
@@ -3886,6 +3892,59 @@ def make_handler(workspace, jobs):
             except AifosError as exc:
                 return self._error(400, str(exc))
             return self._json(project)
+
+        def _project_create(self):
+            """自定义作品名/资产库名:不必先跑一集就能建壳并往里存资产。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            title = (body.get("title") or "").strip()
+            if not title:
+                return self._error(400, "请填写作品名")
+            if len(title) > 60:
+                return self._error(400, "作品名不能超过 60 个字")
+
+            def task(app):
+                project, created = app.projects.get_or_create_project(
+                    title, style=(body.get("style") or "").strip(),
+                    aspect=(body.get("aspect") or "").strip())
+                if created:
+                    app.logger.info(
+                        "web", f"已新建作品/资产库《{title}》(暂无剧集,"
+                        "可直接在资产中心生产自建资产)")
+                return {**dict(project), "created": created}
+
+            try:
+                return self._json(self._with_app(task), status=201)
+            except Exception as exc:
+                return self._error(400, str(exc))
+
+        def _project_shell(self, query):
+            """删除剧名前的体检:还剩几集、几张图,能不能删。"""
+            title = query.get("project", [""])[0].strip()
+            if not title:
+                return self._error(400, "缺少 project")
+            summary = self._with_app(
+                lambda app: app.history.project_shell_summary(title))
+            if summary is None:
+                return self._error(404, f"作品不存在: {title}")
+            return self._json(summary)
+
+        def _project_delete(self):
+            """删除只剩空壳的剧名;有剧集记录的一律拒绝,磁盘原图不动。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            title = (body.get("title") or "").strip()
+            if not title:
+                return self._error(400, "缺少 title")
+            try:
+                result = self._with_app(
+                    lambda app: app.history.delete_project(
+                        title, delete_assets=bool(body.get("delete_assets"))))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
 
         def _project_rename(self):
             body = self._read_body()

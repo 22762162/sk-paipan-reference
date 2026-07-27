@@ -3268,6 +3268,50 @@ textarea:focus-visible, select:focus-visible {
   color: var(--ink); border-color: rgba(212, 160, 74, .6);
 }
 
+/* ---- 作品名(剧名)管理:新建 / 改名 / 删空壳 ---- */
+.project-shell-btn {
+  flex: none; font-size: 12px; color: var(--ink-2);
+  background: var(--surface-2); border: 1px solid var(--hairline);
+  border-radius: 8px; padding: 6px 10px; cursor: pointer;
+}
+.project-shell-btn:hover { color: var(--ink); border-color: rgba(57, 135, 229, .6); }
+.project-shell-btn.danger:hover { color: #ef8f8f; border-color: var(--critical); }
+.assets-empty { display: grid; gap: 12px; justify-items: center; text-align: center; }
+.assets-empty p { margin: 0; max-width: 46em; line-height: 1.7; }
+.project-shell-overlay { display: flex; align-items: center; justify-content: center; }
+.project-shell-box {
+  width: min(460px, 92vw); padding: 18px 20px; border-radius: 13px;
+  background: var(--surface); border: 1px solid var(--hairline);
+}
+.project-shell-box h3 { margin: 0 0 6px; font-size: 15px; }
+.project-shell-box p { margin: 0 0 12px; font-size: 12px; line-height: 1.7; }
+.project-shell-box code {
+  padding: 1px 5px; border-radius: 5px; background: var(--surface-3);
+  font-size: 11px; word-break: break-all;
+}
+.project-shell-box input {
+  width: 100%; background: var(--page); color: var(--ink);
+  border: 1px solid var(--hairline); border-radius: 8px;
+  padding: 9px 11px; font-size: 14px;
+}
+.project-shell-meta { margin: 0 0 12px; }
+.project-shell-meta > div {
+  display: flex; justify-content: space-between; gap: 10px; padding: 4px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+.project-shell-meta dt { color: var(--ink-3); font-size: 11px; }
+.project-shell-meta dd { margin: 0; color: var(--ink-2); font-size: 11px; }
+.project-shell-blocked {
+  padding: 10px 12px; border-radius: 9px; color: #f0c07f;
+  border: 1px solid rgba(212, 160, 74, .45); background: rgba(212, 160, 74, .1);
+}
+.project-shell-actions { display: flex; gap: 8px; margin-top: 14px; }
+.project-shell-actions button {
+  flex: 1; padding: 8px 12px; font-size: 13px; cursor: pointer;
+  border-radius: 8px; border: 1px solid var(--hairline);
+  background: var(--surface-3); color: var(--ink-2);
+}
+
 /* ---- 资产工坊:自建资产库 ---- */
 .asset-studio { border-color: rgba(212, 160, 74, .35); }
 .studio-types {

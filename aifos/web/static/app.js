@@ -7191,6 +7191,139 @@ function assetBoardHtml(items, category = "all", group = "all") {
   }).join("")}</div>`;
 }
 
+/* ---- 作品名(剧名)管理:自己起名、改名、删掉只剩空壳的死名字 ---- */
+function showProjectNameDialog({ heading, note, value = "", confirmLabel,
+                                 placeholder = "", onConfirm }) {
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay project-shell-overlay";
+  overlay.innerHTML = `<div class="project-shell-box">
+    <h3>${esc(heading)}</h3>
+    <p class="dim">${note}</p>
+    <input id="project-shell-input" value="${esc(value)}"
+      placeholder="${esc(placeholder)}" maxlength="60">
+    <div class="project-shell-actions">
+      <button class="primary" id="project-shell-go">${esc(confirmLabel)}</button>
+      <button id="project-shell-cancel">取消</button></div></div>`;
+  const close = () => overlay.remove();
+  overlay.addEventListener("click", (ev) => {
+    if (ev.target === overlay) close();
+  });
+  overlay.querySelector("#project-shell-cancel").onclick = close;
+  const go = overlay.querySelector("#project-shell-go");
+  const input = overlay.querySelector("#project-shell-input");
+  const submit = async () => {
+    const name = input.value.trim();
+    if (!name) { showToast("名字不能为空", "error"); return; }
+    go.disabled = true;
+    try { await onConfirm(name); close(); }
+    catch (e) { showToast(e.message, "error"); go.disabled = false; }
+  };
+  go.onclick = submit;
+  input.onkeydown = (ev) => { if (ev.key === "Enter") submit(); };
+  document.body.appendChild(overlay);
+  input.focus();
+  input.select();
+}
+
+async function showProjectDeleteDialog(title, onDone) {
+  let shell;
+  try {
+    shell = await api(
+      `/api/project/shell?project=${encodeURIComponent(title)}`);
+  } catch (e) { showToast(e.message, "error"); return; }
+  const blocked = shell.episode_count > 0;
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay project-shell-overlay";
+  overlay.innerHTML = `<div class="project-shell-box">
+    <h3>🗑 删除剧名《${esc(shell.project)}》</h3>
+    <dl class="project-shell-meta">
+      <div><dt>作品记录</dt><dd>${shell.episode_count} 集</dd></div>
+      <div><dt>图片资产</dt><dd>${shell.image_asset_count} 张</dd></div>
+      <div><dt>历史运行</dt><dd>${shell.run_count} 条</dd></div>
+    </dl>
+    ${blocked ? `<p class="project-shell-blocked">这个剧名下还有
+      ${shell.episode_count} 集作品记录（${esc(shell.episodes.slice(0, 6)
+        .map((e) => "第" + e.number + "集").join("、"))}${
+        shell.episodes.length > 6 ? "…" : ""}），不能直接删剧名。<br>
+      请先到<b>历史记录</b>或<b>生产总览</b>删掉这些作品，再回来删剧名——
+      这样你才有机会决定每一集的图片是留是删。</p>`
+      : `<p class="dim">只删数据库里的剧名与资产记录；
+        <b>磁盘上的原图一张都不会删</b>，仍在
+        <code>${esc(shell.artifacts_dir || "artifacts 目录")}</code>，可人工找回。
+        ${shell.image_asset_count ? `<br>确认后这
+        ${shell.image_asset_count} 张图片会从资产中心消失。` : ""}</p>`}
+    <div class="project-shell-actions">
+      ${blocked ? "" : `<button class="primary danger" id="project-shell-go">
+        确认删除剧名</button>`}
+      <button id="project-shell-cancel">${blocked ? "知道了" : "取消"}</button>
+    </div></div>`;
+  const close = () => overlay.remove();
+  overlay.addEventListener("click", (ev) => {
+    if (ev.target === overlay) close();
+  });
+  overlay.querySelector("#project-shell-cancel").onclick = close;
+  const go = overlay.querySelector("#project-shell-go");
+  if (go) go.onclick = (ev) => armConfirm(ev.target, "删除", async () => {
+    try {
+      const result = await api("/api/project/delete", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, delete_assets: true }),
+      });
+      showToast(`剧名《${result.deleted_project}》已删除，`
+        + `磁盘原图保留在 ${result.artifacts_dir || "artifacts 目录"}`, "ok");
+      close();
+      onDone();
+    } catch (e) { showToast(e.message, "error"); }
+  });
+  document.body.appendChild(overlay);
+}
+
+function bindProjectShellControls(title) {
+  const newBtn = document.getElementById("project-new");
+  if (newBtn) newBtn.onclick = () => showProjectNameDialog({
+    heading: "＋ 新建作品 / 资产库",
+    note: "名字随你起。新建后不用先跑剧集，"
+      + "可以直接在这里生产自建资产，之后要开拍也能用同一个名字。",
+    placeholder: "如：我的资产库 / 雨夜凶杀",
+    confirmLabel: "建好并切过去",
+    onConfirm: async (name) => {
+      const result = await api("/api/project/create", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: name }),
+      });
+      showToast(result.created ? `已新建《${name}》` : `《${name}》已存在，切过去了`,
+        "ok");
+      localStorage.setItem("aifos.assets.project", name);
+      studioDraft = null;
+      renderAssetsCenter(name);
+    },
+  });
+  const renameBtn = document.getElementById("project-rename");
+  if (renameBtn) renameBtn.onclick = () => showProjectNameDialog({
+    heading: `✎ 给《${title}》改名`,
+    note: "剧集、资产和产物都按内部 ID 关联，改名不动任何数据。",
+    value: title,
+    confirmLabel: "确认改名",
+    onConfirm: async (name) => {
+      await api("/api/project/rename", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, new_title: name }),
+      });
+      showToast(`已改名为《${name}》`, "ok");
+      localStorage.setItem("aifos.assets.project", name);
+      studioDraft = null;
+      renderAssetsCenter(name);
+    },
+  });
+  const deleteBtn = document.getElementById("project-delete");
+  if (deleteBtn) deleteBtn.onclick = () =>
+    showProjectDeleteDialog(title, () => {
+      localStorage.removeItem("aifos.assets.project");
+      studioDraft = null;
+      renderAssetsCenter();
+    });
+}
+
 async function renderAssetsCenter(selectedTitle) {
   topbarRight.innerHTML = "";
   let ov;
@@ -7201,8 +7334,11 @@ async function renderAssetsCenter(selectedTitle) {
   }
   const projects = ov.projects || [];
   if (!projects.length) {
-    app.innerHTML = `<div class="loading">还没有项目。先在生产总览用一句话开始制作,
-      剧本确认后可选择只用最终人物形象图，或生成完整人物资产套件。</div>`;
+    app.innerHTML = `<div class="loading assets-empty">
+      <p>还没有作品。可以在生产总览用一句话开始制作,
+        也可以直接在这里自己起个名字建一个资产库,先把人物/画风/场景/物品做出来。</p>
+      <button class="primary" id="project-new">＋ 新建作品 / 资产库</button></div>`;
+    bindProjectShellControls("");
     return;
   }
   const stored = localStorage.getItem("aifos.assets.project");
@@ -7265,6 +7401,12 @@ async function renderAssetsCenter(selectedTitle) {
       <span class="title">🗂 资产中心</span>
       <select id="asset-project">${projects.map((p) =>
         `<option ${p.title === title ? "selected" : ""}>${esc(p.title)}</option>`).join("")}</select>
+      <button class="project-shell-btn" id="project-new"
+        title="自己起个名字建一个作品/资产库，不用先跑一集">＋ 新建</button>
+      <button class="project-shell-btn" id="project-rename"
+        title="给当前作品改名；剧集、资产和产物都按 ID 关联，改名不动数据">✎ 改名</button>
+      <button class="project-shell-btn danger" id="project-delete"
+        title="删除只剩空壳的剧名；还有作品记录的会被拒绝，磁盘原图一律不动">🗑 删剧名</button>
       <span class="hint">人物资产范围可按集选择;最终人物形象图始终进入出图与质检</span>
     </div>
     ${studioOptions ? assetStudioHtml(studioOptions, studioDraft, boardItems) : ""}
@@ -7379,6 +7521,7 @@ async function renderAssetsCenter(selectedTitle) {
   </div>`;
   document.getElementById("asset-project").onchange = (ev) =>
     renderAssetsCenter(ev.target.value);
+  bindProjectShellControls(title);
   bindImageLineControls();
   const restyleBtn = document.getElementById("btn-restyle");
   if (restyleBtn && ep) restyleBtn.onclick = (ev) =>

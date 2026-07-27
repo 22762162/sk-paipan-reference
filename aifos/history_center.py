@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .asset_center import AssetCenter, IMAGE_KINDS
 from .db import now
+from .errors import AifosError
 
 
 DERIVED_VISUAL_STATE_KINDS = {
@@ -427,6 +428,91 @@ class HistoryCenter:
             int(episode["id"]), int(episode["project_id"]),
             int(episode["number"]), episode["project_title"],
             delete_assets=delete_assets)
+
+    def project_shell_summary(self, title):
+        """删除剧名前的体检:还剩几集、几张图、几条历史,好让用户看清后果。"""
+        project = self.db.query_one(
+            "SELECT * FROM projects WHERE title=?", (str(title or "").strip(),))
+        if project is None:
+            return None
+        center = AssetCenter(self.db)
+        episodes = [dict(row) for row in self.db.query(
+            "SELECT number, title, status FROM episodes WHERE project_id=? "
+            "ORDER BY number", (project["id"],))]
+        images = [row for row in center.active_list(project["id"])
+                  if row["kind"] in IMAGE_KINDS]
+        runs = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM production_runs WHERE project_title=?",
+            (project["title"],))["n"]
+        return {
+            "project": project["title"],
+            "project_id": project["id"],
+            "episodes": episodes,
+            "episode_count": len(episodes),
+            "image_asset_count": len(images),
+            "asset_row_count": self.db.query_one(
+                "SELECT COUNT(*) AS n FROM assets WHERE project_id=?",
+                (project["id"],))["n"],
+            "run_count": runs,
+            "deletable": not episodes,
+            "artifacts_dir": (
+                str(self.artifacts_root / f"p{project['id']:03d}")
+                if self.artifacts_root is not None else ""),
+        }
+
+    def delete_project(self, title, delete_assets=False):
+        """删除只剩空壳的剧名(资产中心作品下拉里的残留项)。
+
+        删除整集作品时项目壳会被刻意保留(承载跨集母资产与软删版本链),
+        作品全删光后这个壳就成了下拉框里的死名字。这里只清空壳:
+        **还有剧集记录的项目一律拒绝**,请先在历史记录里删除那些作品。
+        壳里还挂着图片资产时必须显式确认;磁盘上的产物文件一律不动,
+        artifacts 目录原样保留,可人工找回。
+        """
+        summary = self.project_shell_summary(title)
+        if summary is None:
+            raise AifosError(f"作品不存在: {title}")
+        if summary["episode_count"]:
+            numbers = "、".join(
+                f"第{item['number']}集" for item in summary["episodes"][:8])
+            raise AifosError(
+                f"《{summary['project']}》还有 {summary['episode_count']} 集作品记录"
+                f"({numbers}{'…' if summary['episode_count'] > 8 else ''}),"
+                "不能直接删剧名;请先在历史记录或生产总览里删除这些作品,"
+                "再回来删剧名")
+        if summary["image_asset_count"] and not delete_assets:
+            raise AifosError(
+                f"《{summary['project']}》名下还有 {summary['image_asset_count']} 张图片资产;"
+                "确认要连同资产记录一起删除后再操作(磁盘上的原图不会删)")
+        project_id = summary["project_id"]
+        batch_ids = [row["id"] for row in self.db.query(
+            "SELECT id FROM series_batches WHERE project_id=?", (project_id,))]
+        for batch_id in batch_ids:
+            self.db.execute(
+                "DELETE FROM series_batch_items WHERE batch_id=?", (batch_id,))
+        self.db.execute(
+            "DELETE FROM series_batches WHERE project_id=?", (project_id,))
+        assets_removed = summary["asset_row_count"]
+        self.db.execute("DELETE FROM assets WHERE project_id=?", (project_id,))
+        # 未绑定剧集的早期历史行只认项目名,壳没了它们也失去归属。
+        runs_removed = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM production_runs "
+            "WHERE project_title=? AND episode_id IS NULL",
+            (summary["project"],))["n"]
+        self.db.execute(
+            "DELETE FROM production_runs "
+            "WHERE project_title=? AND episode_id IS NULL",
+            (summary["project"],))
+        self.db.execute("DELETE FROM projects WHERE id=?", (project_id,))
+        return {
+            "deleted_project": summary["project"],
+            "assets_removed": assets_removed,
+            "image_assets_removed": summary["image_asset_count"],
+            "series_batches_removed": len(batch_ids),
+            "runs_removed": runs_removed,
+            "asset_files_preserved": True,
+            "artifacts_dir": summary["artifacts_dir"],
+        }
 
     def _delete_episode_target(self, episode_id, project_id,
                                episode_number, project_title,
