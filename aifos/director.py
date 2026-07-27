@@ -4616,6 +4616,16 @@ class Director:
                     # not only the final character portraits.
                     "reference_manifest": generation_input[
                         "reference_manifest"],
+                    # 让 QC 判词直接携带升级结论(aifos_action/新提示词):
+                    # 失败时 _escalate_failed_image_to_codex 复用同一份
+                    # verdict,省掉一次独立 Codex 升级调用(实测 p50≈253s,
+                    # 24h 内这类调用吃掉约1.5通道小时)。
+                    "codex_escalation_context": {
+                        # 此前(不含本次判定)已连续失败的次数;首检=0。
+                        "consecutive_failures": failure_count_base
+                        + attempts,
+                        "previous_issues": list(lesson_issues[-8:]),
+                    },
                 }
                 if frame_pair:
                     qc_payload["frame_pair"] = copy.deepcopy(frame_pair)
@@ -9565,6 +9575,26 @@ class Director:
         recovered = 0
         exposed_failures = 0
         changed = False
+        # 僵尸认领清扫:本函数只在新一轮生产入口运行(同集生产互斥),
+        # 此刻仍是 generating/retrying 的条目必是上一轮被重启/中断打断
+        # 的遗留认领——认领进程已死,没有任何代码会再更新它,不清扫
+        # 就永远停在"生成中"并把走动的秒表当成活着的假象。
+        stale_reset = 0
+        for item in plan.get("items", []):
+            if item.get("status") in ("generating", "retrying"):
+                item["stale_reset"] = {
+                    "previous_status": item.get("status"),
+                    "reason": "上一轮生产中断遗留的认领,已在断点对账时重置",
+                    "reset_at": now(),
+                }
+                item["status"] = "pending"
+                stale_reset += 1
+                changed = True
+        if stale_reset:
+            self.log.warn(
+                "director",
+                f"断点对账:清扫 {stale_reset} 条上轮中断遗留的生成中"
+                "认领(重置回待生成)")
         for shot in (ctx.get("storyboard") or {}).get("shots", []):
             shot_no = int(shot["shot_no"])
             item = by_id.get(f"shot:{shot_no}")
@@ -9639,6 +9669,13 @@ class Director:
         return {
             "recovered": recovered,
             "awaiting_human": exposed_failures,
+            "stale_reset": stale_reset,
+            "awaiting_human_shots": sorted(
+                int(str(item.get("id")).split(":")[1])
+                for item in plan.get("items", [])
+                if item.get("category") == "shot_image"
+                and item.get("status") == "awaiting_human"
+                and str(item.get("id") or "").startswith("shot:")),
         }
 
     def _preflight_plan_incomplete(self, ctx):
@@ -9708,9 +9745,19 @@ class Director:
                 "场次暂不生成: 第"
                 + "、".join(str(v) for v in sorted(skipped_scenes))
                 + "场;本批只推进其余场次,恢复后断点续写自动补齐")
+        # 人工门禁持久化:awaiting_human 是「停下来等人裁决」的显式检查
+        # 点。旧逻辑只看资产存在性,失败稿没登记资产→重启后整批自动
+        # 重派,门禁形同虚设还重复烧额度。人工放行的出口不变:人工通过
+        # (状态转 done)或点重画(状态转 generating→done)后自然回流。
+        awaiting_shots = set(
+            reconciliation.get("awaiting_human_shots") or [])
+        skipped_awaiting = []
         for shot in self._active_shots(ctx):
             scene_first = shot.get("scene_no") not in seen_scenes
             seen_scenes.add(shot.get("scene_no"))
+            if int(shot.get("shot_no") or 0) in awaiting_shots:
+                skipped_awaiting.append(int(shot["shot_no"]))
+                continue
             payload = self._shot_payload(ctx, shot)
             required_quality = payload["quality_decision"]["level"]
             existing = self._existing_asset_uri(
@@ -9757,6 +9804,15 @@ class Director:
                 "shot_no": shot_no, "uri": result.uri,
                 "image_quality": quality["level"]})
         ctx["images"].sort(key=lambda i: i["shot_no"])
+        if skipped_awaiting and not qc_failures:
+            # 本批新任务全部完成,但仍有历史失败稿停在人工检查点——
+            # 必须以同一出口停下,不能带着缺图静默流入首尾帧/视频阶段。
+            raise AifosError(
+                f"{len(skipped_awaiting)} 张关键帧仍停在人工检查点"
+                "(上轮质检失败/审核熔断,本轮已按人工门禁跳过重画)。"
+                "请在问题清单里逐张处理(人工通过或按意见重画)后,"
+                "从断点继续。待处理镜头: "
+                + "、".join(str(value) for value in skipped_awaiting))
         if qc_failures:
             failed_shots = sorted(
                 int(task["tag"]) for task, _error in qc_failures)
@@ -9772,7 +9828,11 @@ class Director:
                 "问题项已列入待人工问题清单，其他关键帧已继续完成。"
                 "请点击问题项查看原因并手动修改后，从断点继续。"
                 "问题镜头: "
-                + "、".join(str(value) for value in failed_shots))
+                + "、".join(str(value) for value in failed_shots)
+                + (
+                    "；另有历史待人工镜头(本轮按人工门禁未自动重画): "
+                    + "、".join(str(value) for value in skipped_awaiting)
+                    if skipped_awaiting else ""))
         return {
             "count": len(ctx["images"]), "reused": reused,
             "recovered": reconciliation["recovered"],

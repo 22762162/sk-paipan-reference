@@ -1393,7 +1393,11 @@ def test_reconcile_completed_shot_images_recovers_only_qc_passed_files(app):
 
     result = app.director.reconcile_completed_shot_images(ctx)
 
-    assert result == {"recovered": 1, "awaiting_human": 2}
+    assert result["recovered"] == 1
+    assert result["awaiting_human"] == 2
+    # 断点对账现在同时汇报僵尸清扫数与待人工镜头清单(人工门禁用)。
+    assert result["stale_reset"] == 0
+    assert result["awaiting_human_shots"] == [2, 4]
     formal = app.assets.active_list(project["id"], kind="image")
     assert [(row["name"], row["uri"]) for row in formal] == [
         ("e001_shot001", str(passed_uri))]
@@ -1947,10 +1951,24 @@ def test_codex_qc_instruction_and_parse(tmp_path, monkeypatch):
             "characters": ["小鹿"],
             "codex_escalation_context": {"consecutive_failures": 1},
         }, tmp_path)
-    assert "第 1 次质检失败" in first_failure_instruction
-    assert "立即按你给出的新提示词" in first_failure_instruction
+    assert "此前已失败 1 次" in first_failure_instruction
+    assert "按你给出的新提示词" in first_failure_instruction
     assert "targeted_redraw" in first_failure_instruction
     assert "最终裁决" not in first_failure_instruction
+
+    # 预授权模式(随首检下发,此前失败=0):判定必须保持中立,
+    # 不得因为带了升级上下文就预设本图已失败。
+    prearmed_instruction, _, _ = codex_image.build_instruction(
+        "image_qc", {
+            "image_uri": "/tmp/f.png",
+            "characters": ["小鹿"],
+            "codex_escalation_context": {"consecutive_failures": 0},
+        }, tmp_path)
+    assert "不预设结论" in prearmed_instruction
+    assert "判定通过则" in prearmed_instruction
+    assert "codex_escalation" in prearmed_instruction
+    assert "这是质检失败后的 Codex 升级分析" not in prearmed_instruction
+    assert "最终裁决" not in prearmed_instruction
 
     stdout = '思考中…\n{"pass": false, "issues": ["尾帧换了个人"]}\n完成'
 

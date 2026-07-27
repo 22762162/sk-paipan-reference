@@ -1186,6 +1186,7 @@ def _production_progress(app, episode, render_plan):
                 started_at = float(item.get("started_at") or timestamp)
             except (TypeError, ValueError):
                 started_at = timestamp
+            elapsed = round(max(0.0, timestamp - started_at), 1)
             active_items.append({
                 "item_id": item.get("id", ""),
                 "category": category,
@@ -1194,7 +1195,10 @@ def _production_progress(app, episode, render_plan):
                 "label": item.get("label", ""),
                 "status": status,
                 "started_at": started_at,
-                "elapsed": round(max(0.0, timestamp - started_at), 1),
+                "elapsed": elapsed,
+                # 超过停滞阈值(1800s,与产线停滞检测同口径)仍在"生成中"
+                # 大概率是遗留认领——秒表继续走会误导用户"没卡住"。
+                "stale": elapsed > 1800,
             })
         if status in ("awaiting_human", "failed"):
             qc = item.get("qc") or {}
@@ -2015,6 +2019,18 @@ def _episode_payload(app, episode_id, jobs=None):
                 issues = list(qc.get("issues") or [])
                 if not issues and item.get("error"):
                     issues = [item["error"]]
+                if not issues:
+                    # codex 内置 image_gen 等来源的失败常常 issues 双空,
+                    # 前端只能显示兜底文案"图片质检未通过"——把诊断里
+                    # 已有的原因逐级捞出来,失败必须带可读原因。
+                    fallback_reason = next((
+                        str(value).strip() for value in (
+                            (qc.get("image_error") or {}).get("summary"),
+                            qc.get("retry_blocked_reason"),
+                            (qc.get("codex_escalation") or {}).get("reason"),
+                        ) if str(value or "").strip()), "")
+                    if fallback_reason:
+                        issues = [fallback_reason]
                 image_failures.append({
                     "item_id": _safe_diagnostic_text(
                         item.get("id", ""), limit=160),

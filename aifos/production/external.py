@@ -7,6 +7,7 @@ CLI 协议:向命令 stdin 写入一行 JSON
 非零退出码 / 非法输出 → ProviderError,路由器自动回退下一个 Provider。
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -15,11 +16,39 @@ import sys
 import threading
 import time
 import urllib.request
+import weakref
 from pathlib import Path
 
 from ..channel_stats import record as record_channel_stat
 from ..errors import ProduceCancelled, ProviderError, ProviderUnavailable
 from .base import Provider, ProviderResult
+
+
+# 在途适配器子进程登记簿。服务被 TERM/异常退出时,不收割这些子进程
+# 就会产生孤儿(ppid=1 的适配器 + 其 codex exec 子孙):它们继续占
+# Codex 账号侧并发,产物却写进断裂的 stdout 管道被丢弃——同一张图
+# 下一批还会重生成一次,额度双烧。2026-07-28 03:09 重启实测一次留下
+# 3 个孤儿。WeakSet:正常退出的 Popen 被 GC 后自动出簿。
+_LIVE_CHILDREN = weakref.WeakSet()
+
+
+def reap_live_children(grace=5):
+    """终止本进程尚存活的全部适配器子进程(先 TERM 后 KILL)。
+
+    进程退出路径(SIGTERM/atexit)调用;幂等,子进程已退出时无操作。
+    """
+    reaped = 0
+    for proc in list(_LIVE_CHILDREN):
+        try:
+            if proc.poll() is None:
+                _terminate_process(proc, grace=grace)
+                reaped += 1
+        except Exception:
+            pass
+    return reaped
+
+
+atexit.register(reap_live_children)
 
 
 def run_interruptible(name, command, input_text, timeout, cancel=None,
@@ -39,6 +68,7 @@ def run_interruptible(name, command, input_text, timeout, cancel=None,
             text=True, cwd=cwd, env=env)
     except OSError as exc:
         raise ProviderError(f"{name} 调用失败: {exc}") from exc
+    _LIVE_CHILDREN.add(proc)
     chunks = {"out": [], "err": []}
 
     def _pump(stream, key):

@@ -7309,8 +7309,12 @@ function updateLiveStrip(data) {
   const secs = Math.floor((Date.now() - liveState.since) / 1000);
   const mm = Math.floor(secs / 60), ss = String(secs % 60).padStart(2, "0");
   const counts = liveCounts(data);
-  const slow = secs > 120 && stage !== "cancelling"
-    ? " · 外部产线(出图/视频)可能需要几分钟,只要本条时间在走就没卡住" : "";
+  // 秒表走字只说明前端在数秒,不代表产线活着;30分钟(产线停滞检测
+  // 同口径)仍无进展就该怀疑遗留认领或挂死调用,明确提示用户处理。
+  const slow = secs > 1800 && stage !== "cancelling"
+    ? " · ⚠ 本步已超过30分钟无完成,可能是中断遗留或调用挂死;可安全暂停后从断点继续"
+    : (secs > 120 && stage !== "cancelling"
+      ? " · 外部产线(出图/视频)单步通常需要几分钟到二十分钟" : "");
   const stageText = progress.active
     ? STAGE_PLAIN[stage] || STAGE_CN[stage] || stage
     : "当前没有生产任务";
@@ -7374,15 +7378,17 @@ function startLiveTicker(episodeId) {
       elapsed.textContent = elapsed.textContent.replace(
         /本步已进行 \d+:\d+/, `本步已进行 ${mm}:${ss}`);
     }
-    // 看板上"正在画"的卡片:秒表每秒走字
+    // 看板上"正在画"的卡片:秒表每秒走字;超过停滞阈值改为明确告警,
+    // 不再让走动的数字替挂死/遗留的任务背书。
     document.querySelectorAll(".pc-timer[data-started]").forEach((el) => {
       const started = Number(el.dataset.started);
       if (!started) return;
       const s = Math.max(0, Math.floor(Date.now() / 1000 - started));
       const mm2 = Math.floor(s / 60), ss2 = String(s % 60).padStart(2, "0");
       const eta = Number(el.dataset.eta);
-      el.textContent = `正在画 ${mm2}:${ss2}`
-        + (eta ? ` · 预计 ~${fmtDur(eta)}` : "");
+      el.textContent = s > 1800
+        ? `⚠ 已 ${mm2}:${ss2} 未完成,疑似停滞`
+        : `正在画 ${mm2}:${ss2}` + (eta ? ` · 预计 ~${fmtDur(eta)}` : "");
     });
   }, 1000);
 }
@@ -9097,8 +9103,8 @@ function renderProductionView(data, episodeId) {
               : state === "run" ? "⏳" : "○"} ${esc(STAGE_CN[stage] || stage)}${extra}</li>`;
           }).join("")}
         </ol>
-        <div class="dim">每完成一步自动点亮;真实产线(出图/视频)单步可能要几分钟,
-        看上方状态条的秒表在走就没卡住。</div>
+        <div class="dim">每完成一步自动点亮;真实产线(出图/视频)单步可能要几分钟。
+        秒表只代表计时,不代表产线一定活着——超过30分钟无完成会在状态条明确告警。</div>
         <h2 style="margin-top:14px">产线实时日志</h2>
         <div class="log-list" id="live-log"><div class="dim">加载中…</div></div>
       </div>
