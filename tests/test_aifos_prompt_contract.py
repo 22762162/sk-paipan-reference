@@ -48,7 +48,7 @@ def test_compact_contract_is_ordered_and_single_purpose():
             {"index": 3, "label": "林晚最终立绘", "kind": "identity"},
         ], mode="video")
 
-    assert PROMPT_CONTRACT_SCHEMA == "aifos.shot-prompt/v2.1"
+    assert PROMPT_CONTRACT_SCHEMA == "aifos.shot-prompt/v2.2"
     assert contract["schema"] == PROMPT_CONTRACT_SCHEMA
     assert prompt.index("【主体】") < prompt.index("【场景】")
     assert prompt.index("【场景】") < prompt.index("【单一主动作】")
@@ -862,7 +862,7 @@ def test_v21_legacy_shot_without_functional_figures_keeps_registered_count():
     contract, prompt = compile_shot_prompt(
         shot, location="直播办公室", mode="video")
 
-    assert contract["schema"] == "aifos.shot-prompt/v2.1"
+    assert contract["schema"] == "aifos.shot-prompt/v2.2"
     assert contract["subject"]["count"] == 2
     assert contract["subject"]["registered_count"] == 2
     assert contract["subject"]["functional_count"] == 0

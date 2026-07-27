@@ -46,11 +46,14 @@ SHOT_FUNCTIONS = {
     "environment": "铺垫", "dialogue": "信息交代", "reaction": "反应",
     "beat": "留白", "physical": "蓄势", "inner_monologue": "内心戏",
 }
-APPEARANCE_STATE_FIELDS = ("wardrobe", "headwear", "hair_makeup")
+APPEARANCE_STATE_FIELDS = (
+    "wardrobe", "headwear", "hair_visibility", "hair_makeup")
 APPEARANCE_STATE_VERSION = 2
 APPEARANCE_STATE_ALIASES = {
     "wardrobe": ("wardrobe", "costume", "clothing", "服装", "衣着"),
     "headwear": ("headwear", "hat", "头饰", "帽冠", "冠帽"),
+    "hair_visibility": (
+        "hair_visibility", "hair_exposure", "头发可见度"),
     "hair_makeup": (
         "hair_makeup", "hair_and_makeup", "styling", "妆发", "发型妆容"),
 }
@@ -83,6 +86,28 @@ APPEARANCE_CHANGE_TOKENS = (
     "换装", "更衣", "换上", "换成", "改穿", "穿上", "套上", "披上",
     "披着", "已脱", "脱去", "脱下", "褪下", "摘下", "取下",
     "戴上", "系上", "换",
+)
+CONDITION_FIELDS = (
+    "life_state", "consciousness_state", "embodiment", "mobility")
+NORMAL_CONDITION = {
+    "life_state": "alive",
+    "consciousness_state": "awake",
+    "embodiment": "physical",
+    "mobility": "active",
+}
+TERMINAL_STATE_TOKENS = (
+    "已咽气", "咽气", "断气", "死亡", "死去", "身亡", "尸身",
+    "被杀", "杀死", "毙命", "击毙", "殒命", "丧命", "害死",
+    "被刺死", "刺死", "被砍死", "砍死", "中刀而亡",
+)
+WAKE_STATE_TOKENS = (
+    "醒来", "惊醒", "苏醒", "转醒", "恢复意识", "清醒过来",
+)
+SLEEP_STATE_TOKENS = (
+    "睡着", "入睡", "沉睡", "闭眼睡去", "陷入睡眠",
+)
+UNCONSCIOUS_STATE_TOKENS = (
+    "昏迷", "昏厥", "失去意识", "晕倒", "昏倒", "被打昏",
 )
 
 
@@ -165,7 +190,7 @@ def production_profile(config, standard=None):
                 "text_lock_provider", "ChatGPT关键帧")),
         "prompt_contract": copy.deepcopy(
             production.get("prompt_contract") or {
-                "schema": "aifos.shot-prompt/v2",
+                "schema": "aifos.shot-prompt/v2.2",
                 "compact_prompt_sent_to_model": True,
                 "full_prompt_kept_for_audit": True,
             }),
@@ -421,6 +446,13 @@ def _state(name, continuity, emotion="专注", pose="站立，重心稳定"):
         "emotion": emotion,
         "direction": "面向本镜主体，视线不越轴",
         "position": anchor.get("default_position", "画面中"),
+        "headwear": {
+            "presence": "none",
+            "kind": "none",
+            "name": "none",
+        },
+        "hair_visibility": "fully_visible",
+        "condition": copy.deepcopy(NORMAL_CONDITION),
     }
     wardrobe = str(anchor.get("default_wardrobe") or "").strip()
     if wardrobe:
@@ -430,7 +462,30 @@ def _state(name, continuity, emotion="专注", pose="站立，重心稳定"):
             and not any(token != other and token in other
                         for other in HEADWEAR_TOKENS if other in wardrobe)
         ]
-        state["headwear"] = "、".join(dict.fromkeys(headwear)) or "无"
+        headwear = list(dict.fromkeys(headwear))
+        if headwear:
+            headwear_name = "、".join(headwear)
+            if any(token in headwear_name for token in ("乌纱帽", "乌纱")):
+                kind = "official_hat"
+            elif "头盔" in headwear_name:
+                kind = "helmet"
+            elif any(
+                    token in headwear_name
+                    for token in ("发冠", "头冠", "冠")):
+                kind = "crown"
+            elif any(token in headwear_name for token in ("簪", "钗")):
+                kind = "hair_ornament"
+            else:
+                kind = "soft_hat"
+            state["headwear"] = {
+                "presence": "worn",
+                "kind": kind,
+                "name": headwear_name,
+            }
+            state["hair_visibility"] = (
+                "covered" if kind == "helmet"
+                else "fully_visible" if kind == "hair_ornament"
+                else "partially_visible")
     return state
 
 
@@ -442,7 +497,10 @@ def _normalized_explicit_state(value):
             continue
         for alias in aliases:
             if state.get(alias):
-                state[canonical] = str(state[alias]).strip()
+                state[canonical] = (
+                    copy.deepcopy(state[alias])
+                    if isinstance(state[alias], dict)
+                    else str(state[alias]).strip())
                 break
     return state
 
@@ -486,7 +544,7 @@ def _character_visual_clause(name, text):
 def _visible_appearance(name, text, explicit=None):
     explicit = _normalized_explicit_state(explicit)
     result = {
-        field: str(explicit.get(field) or "").strip()
+        field: copy.deepcopy(explicit.get(field))
         for field in APPEARANCE_STATE_FIELDS
         if str(explicit.get(field) or "").strip()
     }
@@ -579,9 +637,16 @@ def _reconcile_explicit_appearance(name, text, explicit):
     corrections = []
     transition = _appearance_transition(name, text)
     for field in APPEARANCE_STATE_FIELDS:
-        visible_value = str(visible.get(field) or "").strip()
-        declared_value = str(declared.get(field) or "").strip()
+        visible_raw = visible.get(field)
+        declared_raw = declared.get(field)
+        visible_value = str(visible_raw or "").strip()
+        declared_value = str(declared_raw or "").strip()
         if not visible_value:
+            continue
+        # v2.2 structured headwear is authoritative. A narrow legacy phrase in
+        # the action may be audited against it, but must never flatten the
+        # object back into an untyped string.
+        if field == "headwear" and isinstance(declared_raw, dict):
             continue
         conflicts = (
             _appearance_conflicts(declared_value, visible_value)
@@ -689,28 +754,125 @@ def _actor_semantic_windows(text, name, actors):
     return windows
 
 
+def _condition_from_state(state, *, default=None):
+    """Return one complete v2.2 condition without mutating the source state."""
+    state = state if isinstance(state, dict) else {}
+    nested = state.get("condition")
+    nested = nested if isinstance(nested, dict) else {}
+    values = copy.deepcopy(default) if isinstance(default, dict) else {}
+    for field in CONDITION_FIELDS:
+        value = nested.get(field)
+        if value is None:
+            value = state.get(field)
+        if value is not None and str(value).strip():
+            values[field] = str(value).strip()
+    return values
+
+
+def _condition_signature(value):
+    value = value if isinstance(value, dict) else {}
+    return tuple(str(value.get(field) or "").strip() for field in CONDITION_FIELDS)
+
+
+def _condition_transition_kind(name, text, actors=None):
+    context = "；".join(_actor_semantic_windows(text, name, actors))
+    actor = re.escape(str(name or ""))
+    if not context or not actor:
+        return ""
+    passive_death_tokens = (
+        "已咽气", "咽气", "断气", "死亡", "死去", "身亡", "尸身",
+        "被杀", "毙命", "殒命", "丧命", "被刺死", "被砍死", "中刀而亡",
+    )
+    death_after_actor = any(
+        re.search(
+            rf"{actor}[^，,。；\n]{{0,36}}{re.escape(token)}",
+            context)
+        for token in passive_death_tokens)
+    source = str(text or "")
+    death_before_actor = any(
+        re.search(
+            rf"{re.escape(token)}[^，,。；\n]{{0,16}}{actor}",
+            source)
+        for token in (
+            "杀死", "击毙", "害死", "刺死", "砍死"))
+    if death_after_actor or death_before_actor:
+        return "death"
+    for kind, tokens in (
+            ("wake", WAKE_STATE_TOKENS),
+            ("sleep", SLEEP_STATE_TOKENS),
+            ("unconscious", UNCONSCIOUS_STATE_TOKENS)):
+        if any(
+                re.search(
+                    rf"{actor}[^，,。；\n]{{0,36}}{re.escape(token)}",
+                    context)
+                for token in tokens):
+            return kind
+    return ""
+
+
+def _condition_change_allowed(
+        name, text, previous, declared, actors=None):
+    previous = previous if isinstance(previous, dict) else {}
+    declared = declared if isinstance(declared, dict) else {}
+    if _condition_signature(previous) == _condition_signature(declared):
+        return True
+    transition = _condition_transition_kind(name, text, actors)
+    previous_life = str(previous.get("life_state") or "")
+    declared_life = str(declared.get("life_state") or "")
+    previous_consciousness = str(
+        previous.get("consciousness_state") or "")
+    declared_consciousness = str(
+        declared.get("consciousness_state") or "")
+    if transition == "death":
+        return previous_life != "dead" and declared_life == "dead"
+    if previous_life == "dead" or declared_life == "dead":
+        return False
+    if transition == "wake":
+        return (
+            previous_consciousness in {"asleep", "unconscious"}
+            and declared_consciousness == "awake")
+    if transition == "sleep":
+        return (
+            previous_consciousness == "awake"
+            and declared_consciousness == "asleep")
+    if transition == "unconscious":
+        return (
+            previous_consciousness == "awake"
+            and declared_consciousness == "unconscious")
+    return False
+
+
 def _terminal_character_names(text, end_states, names):
     terminal = set()
     end_states = end_states if isinstance(end_states, dict) else {}
     for name in names or []:
-        state_text = json.dumps(
-            end_states.get(name) or {},
-            ensure_ascii=False, default=str)
+        state = end_states.get(name) or {}
+        state_text = json.dumps(state, ensure_ascii=False, default=str)
+        condition = (
+            state.get("condition")
+            if isinstance(state, dict) else {})
+        condition = condition if isinstance(condition, dict) else {}
+        life_state = str(
+            condition.get("life_state")
+            or state.get("life_state") or "").strip().lower()
+        if life_state:
+            if life_state == "dead":
+                terminal.add(name)
+            continue
         windows = _actor_semantic_windows(text, name, names)
-        if any(
-                any(token in window for token in (
-                    "咽气", "断气", "死亡", "死去", "身亡", "尸身"))
-                for window in windows):
+        if (_condition_transition_kind(name, text, names) == "death"
+                or any(
+                    any(token in window for token in TERMINAL_STATE_TOKENS)
+                    for window in windows)):
             terminal.add(name)
-        elif any(token in state_text for token in (
-                "已咽气", "断气", "死亡", "尸身态")):
+        elif any(token in state_text for token in TERMINAL_STATE_TOKENS):
             terminal.add(name)
     return terminal
 
 
 def _merge_shot_state(name, continuity, explicit, text, *, previous=None,
                       emotion="专注", ending=False, scene_changed=False):
-    """Merge pose/prop state with an inherited, transition-aware appearance."""
+    """Merge pose/prop with transition-aware appearance and condition state."""
     declared = _normalized_explicit_state(explicit)
     inherited = copy.deepcopy(previous or {})
     if declared:
@@ -723,34 +885,68 @@ def _merge_shot_state(name, continuity, explicit, text, *, previous=None,
             name, continuity, text, previous=inherited,
             emotion=emotion, ending=ending)
 
+    inherited_condition = (
+        _condition_from_state(inherited, default=NORMAL_CONDITION)
+        if inherited else {})
+    declared_condition = _condition_from_state(declared)
+    state_condition = _condition_from_state(
+        state, default=NORMAL_CONDITION)
+    if inherited_condition:
+        if not ending:
+            # The first frame is the previous shot's terminal fact. The action
+            # in this shot must never be pre-applied to its start state.
+            state_condition = copy.deepcopy(inherited_condition)
+        elif not declared_condition:
+            state_condition = copy.deepcopy(inherited_condition)
+        else:
+            candidate = _condition_from_state(
+                declared, default=inherited_condition)
+            state_condition = (
+                candidate
+                if _condition_change_allowed(
+                    name, text, inherited_condition, candidate,
+                    actors=[
+                        item.get("name") for item in (
+                            continuity.get("characters") or [])
+                        if isinstance(item, dict) and item.get("name")
+                    ])
+                else copy.deepcopy(inherited_condition))
+    elif declared_condition:
+        state_condition = _condition_from_state(
+            declared, default=NORMAL_CONDITION)
+    state["condition"] = state_condition
+
     current = _visible_appearance(name, text, declared)
     transition = _appearance_transition(name, text)
     for field in APPEARANCE_STATE_FIELDS:
-        prior_value = str(inherited.get(field) or "").strip()
-        current_value = str(current.get(field) or "").strip()
-        declared_value = str(declared.get(field) or "").strip()
+        prior_raw = copy.deepcopy(inherited.get(field))
+        current_raw = copy.deepcopy(current.get(field))
+        declared_raw = copy.deepcopy(declared.get(field))
+        prior_value = str(prior_raw or "").strip()
+        current_value = str(current_raw or "").strip()
+        declared_value = str(declared_raw or "").strip()
         if transition and not ending and prior_value and not scene_changed:
             # A visible change starts in the inherited look and finishes in the
             # declared/current look.
-            state[field] = prior_value
+            state[field] = prior_raw
         elif declared_value:
             if prior_value and not scene_changed and not transition:
                 # A compatible shorter phrase must not erase details already
                 # locked by the previous frame (青官袍 must not drop 乌纱);
                 # a conflicting phrase without a visible change is likewise
                 # rejected and reported by the continuity audit.
-                state[field] = prior_value
+                state[field] = prior_raw
             else:
-                state[field] = declared_value
+                state[field] = declared_raw
         elif current_value and (
                 not prior_value or scene_changed or transition):
-            state[field] = current_value
+            state[field] = current_raw
         elif prior_value:
             # Within one continuous scene, clothes may change only through a
             # declared visible transition. The inherited state is authoritative.
-            state[field] = prior_value
+            state[field] = prior_raw
         elif current_value:
-            state[field] = current_value
+            state[field] = current_raw
     return state
 
 
@@ -1046,6 +1242,10 @@ def _append_performance_beats(raw_shots, script, rules=None):
                 name for name in physical_people
                 if name != speaker and name not in dead_names]
             if listeners:
+                listener = listeners[0]
+                reaction_end = (
+                    f"{listener}仍在原站位，视线停在{speaker}，"
+                    "眉眼与下颌已形成明确反应，身体由原支撑面稳定承托")
                 out.append({
                     "scene_no": scene_no,
                     "kind": "reaction",
@@ -1056,9 +1256,23 @@ def _append_performance_beats(raw_shots, script, rules=None):
                     "duration": max(
                         float(reaction_range[0]),
                         float(raw.get("duration", 3)) * reaction_ratio),
-                    "characters": listeners[:2],
+                    "characters": [listener],
                     "dialogue": None,
                     "prompt": f"{listeners[0]}听完{speaker}的话后的近景反应",
+                    "frame_targets": {
+                        "keyframe": {
+                            "phase": "end", "state": reaction_end,
+                            "fallback": False},
+                        "first_frame": {
+                            "phase": "start",
+                            "state": (
+                                f"{listener}保持上一镜结束站位与支撑，"
+                                f"刚听完{speaker}的话，表情尚未发生本镜反应"),
+                            "fallback": False},
+                        "last_frame": {
+                            "phase": "end", "state": reaction_end,
+                            "fallback": False},
+                    },
                     "source_dialogue": dialogue.get("dialogue", ""),
                 })
         lead = [
@@ -1067,6 +1281,9 @@ def _append_performance_beats(raw_shots, script, rules=None):
             if name not in dead_names
         ][:1]
         if lead and add_beat:
+            beat_end = (
+                f"{lead[0]}保持本场结束站位与支撑，视线稳定，"
+                "情绪停在本场余波最清晰的单一表情")
             out.append({
                 "scene_no": scene_no,
                 "kind": "beat",
@@ -1076,6 +1293,20 @@ def _append_performance_beats(raw_shots, script, rules=None):
                 "characters": lead,
                 "dialogue": None,
                 "prompt": f"{lead[0]}无台词留白表演，具体微表情与呼吸变化",
+                "frame_targets": {
+                    "keyframe": {
+                        "phase": "end", "state": beat_end,
+                        "fallback": False},
+                    "first_frame": {
+                        "phase": "start",
+                        "state": (
+                            f"{lead[0]}保持本场最后一个动作完成时的站位、"
+                            "支撑和朝向，情绪尚未收束"),
+                        "fallback": False},
+                    "last_frame": {
+                        "phase": "end", "state": beat_end,
+                        "fallback": False},
+                },
             })
     return out
 
@@ -1300,8 +1531,36 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
                      else "不生成字幕条或任何画面文字")
         station = "；".join(
             f"{name}{state['position']}" for name, state in start_state.items())
-        gaze = "主体 → 凝视/瞥向 → 对手或核心物件"
-        micro_expression = "眉眼变化·下颌张力·呼吸节奏"
+        gaze_parts = []
+        micro_expression_parts = []
+        for actor_name in characters:
+            actor_state_text = json.dumps(
+                {
+                    "start": start_state.get(actor_name) or {},
+                    "end": end_state.get(actor_name) or {},
+                },
+                ensure_ascii=False, default=str)
+            if any(token in actor_state_text for token in (
+                    '"life_state": "dead"', "已咽气", "断气",
+                    "死亡", "尸身态")):
+                actor_gaze = "视线固定，不发生追视"
+                actor_micro = "身体与面部肌肉保持完全静止"
+            elif any(token in actor_state_text for token in (
+                    '"consciousness_state": "asleep"',
+                    '"consciousness_state": "unconscious"',
+                    "熟睡", "昏迷", "昏厥")):
+                actor_gaze = "双眼保持闭合，不发生追视"
+                actor_micro = "身体保持被动稳定"
+            else:
+                actor_gaze = "凝视/瞥向对手或核心物件"
+                actor_micro = "眉眼变化·下颌张力·呼吸节奏"
+            gaze_parts.append(f"{actor_name}:{actor_gaze}")
+            micro_expression_parts.append(
+                f"{actor_name}:{actor_micro}")
+        gaze = "；".join(gaze_parts) or "无人，不发生人物视线行为"
+        micro_expression = (
+            "；".join(micro_expression_parts)
+            or "无人，不发生人物表演")
         if narrative_overlays:
             micro_expression += (
                 "；内心Q版以夸张眉眼、嘴形、手势和身体弹性强化吐槽/冲突，"
@@ -1377,11 +1636,17 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             "shot_contract": shot_contract,
             "readable_text": text_asset,
         })
+        frame_targets = copy.deepcopy(raw.get("frame_targets") or {})
+        keyframe_target = copy.deepcopy(
+            frame_targets.get("keyframe") or {})
         shot = {
             **raw,
             "shot_no": index,
             "unit_id": f"U{index:02d}",
             "pipeline_version": PIPELINE_VERSION,
+            "prop_registry": copy.deepcopy(
+                script.get("prop_registry")
+                or script.get("core_props") or []),
             "kind": kind,
             "duration": duration,
             "timecode": timecode,
@@ -1397,6 +1662,10 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             "shot_function": SHOT_FUNCTIONS.get(kind, "信息交代"),
             "start_state": start_state,
             "end_state": end_state,
+            # v2.2 只传递编剧/分镜上游已经登记的唯一静态目标；这里不从
+            # start/end 或动作文本临时推导，缺失时由合同硬门禁阻断。
+            "frame_targets": frame_targets,
+            "frame_target": keyframe_target,
             "appearance_state_required": True,
             "appearance_continuity_issues": appearance_continuity_issues,
             "semantic_corrections": semantic_corrections,
@@ -1458,6 +1727,10 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
     return {
         "episode_title": storyboard.get("episode_title", script.get("episode_title", "")),
         "pipeline_version": PIPELINE_VERSION,
+        "prop_contract_schema": "aifos.prop-contract/v2.2",
+        "prop_registry": copy.deepcopy(
+            script.get("prop_registry")
+            or script.get("core_props") or []),
         "appearance_state_version": APPEARANCE_STATE_VERSION,
         "profile": copy.deepcopy(profile),
         "standard_fingerprint": profile.get("standard_fingerprint", ""),

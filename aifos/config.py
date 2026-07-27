@@ -106,8 +106,10 @@ DEFAULTS = {
             # 经 aifos.adapters.codex_image 桥接真实 codex exec;
             # 实机把 --codex 指到 codex 绝对路径后 enabled 置 true
             "type": "cli", "enabled": False,
-            "capabilities": ["image", "frames", "cover", "image_qc",
-                             "image_select"],
+            "capabilities": [
+                "prompt_review", "image", "frames", "cover", "image_qc",
+                "image_select",
+            ],
             "command": ["python3", "-m", "aifos.adapters.codex_image",
                         "--codex", "codex"],
             "reference_images": True,
@@ -213,6 +215,9 @@ DEFAULTS = {
     },
     # 能力路由:按顺序尝试,前者不可用/失败自动回退后者(CLI → API → mock)
     "routing": {
+        # 所有真实图片在进入出图 Provider 前必须先由 Codex 审核并优化
+        # 最终提示词；该能力失败时真实图片任务失败关闭，不回退 mock。
+        "prompt_review": ["codex"],
         "script": ["claude", "claude_api", "mock"],
         "image_qc": ["codex", "image_api", "claude", "claude_api", "mock"],
         # 一组四张候选的评选与自动确认:CODEX 主导,视觉评选失败逐级回退,
@@ -601,10 +606,16 @@ def _normalize_legacy(data):
         if isinstance(caps, list) and "image" in caps \
                 and "image_qc" not in caps:
             caps.append("image_qc")
+        if name == "codex" and isinstance(caps, list) \
+                and "image" in caps and "prompt_review" not in caps:
+            caps.append("prompt_review")
     codex_caps = (providers.get("codex") or {}).get("capabilities")
     if isinstance(codex_caps, list) and "image" in codex_caps \
             and "image_select" not in codex_caps:
         codex_caps.append("image_select")
+    routing = data.setdefault("routing", {})
+    if "prompt_review" not in routing:
+        routing["prompt_review"] = ["codex"]
     mock_conf = providers.get("mock")
     mock_caps = (mock_conf.get("capabilities")
                  if isinstance(mock_conf, dict) else None)

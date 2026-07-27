@@ -1,5 +1,6 @@
 """正式人物统一4选1定版、参考图硬门禁与视觉身份质检。"""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -7,9 +8,11 @@ import pytest
 from aifos.app import App
 from aifos.adapters.codex_image import _ref_line, _style_line
 from aifos.director import (
+    CHARACTER_CANDIDATE_PROMPT_SCHEMA,
     character_candidate_target,
     character_production_readiness_error,
 )
+from aifos.adapters.claude_script import validate_script_bible
 from aifos.errors import AifosError, ProviderUnavailable
 from aifos.production.base import ProviderResult
 
@@ -56,11 +59,29 @@ def test_role_based_candidates_pause_before_downstream_images(app):
         target = character["candidate_target"]
         assert len({item["variant_id"] for item in character["candidates"]}) == target
         assert len({item["variant_label"] for item in character["candidates"]}) == target
-        assert all(item["variant_source"] == "generated"
+        assert all(item["variant_source"] == "initial_state_same_prompt"
+                   for item in character["candidates"])
+        assert all(item["candidate_prompt_schema"]
+                   == CHARACTER_CANDIDATE_PROMPT_SCHEMA
+                   for item in character["candidates"])
+        assert all(item["current_candidate_policy"]
                    for item in character["candidates"])
         assert all(set(item["look_variant"]) == {
             "hair", "makeup", "costume", "temperament"}
                    for item in character["candidates"])
+        assert len({
+            json.dumps(item["look_variant"], ensure_ascii=False,
+                       sort_keys=True)
+            for item in character["candidates"]
+        }) == 1
+        metas = [
+            app.assets.meta(row)
+            for row in app.assets.list(
+                project["id"], "character_candidate")
+            if app.assets.meta(row).get("character")
+            == character["character"]
+        ]
+        assert len({meta["prompt"] for meta in metas}) == 1
     assert app.projects.latest_document(episode["id"], "storyboard")[0] is None
     assert app.assets.list(project["id"], "character_sheet") == []
     assert app.assets.list(project["id"], "scene_art") == []
@@ -91,6 +112,59 @@ def test_unresolved_action_label_blocks_character_generation():
     assert "AI 重新分析" in error
 
 
+def test_placeholder_gender_and_age_block_candidate_generation():
+    script = {
+        "characters": [{
+            "name": "林川", "role": "主角",
+            "gender": "未指定（人物定版后以参考图为准）",
+            "age_range": "待确认",
+            "image_prompt": "林川单人角色定妆母图",
+        }],
+        "scenes": [],
+    }
+    analysis = {
+        "characters": [{
+            "name": "林川",
+            "gender": "以参考图为准",
+            "age_range": "未指定",
+            "image_prompt": "林川单人角色定妆母图",
+        }],
+    }
+
+    error = character_production_readiness_error(script, analysis)
+    assert "性别、年龄段尚未明确" in error
+    assert "不会生成候选图" in error
+
+
+def test_script_bible_allows_identity_draft_but_strict_gate_rejects_it():
+    script = {
+        "story_world": {
+            "name": "测试世界", "overview": "测试",
+            "era_and_location": "当代城市", "social_order": "现实社会",
+            "hard_rules": "现实物理", "visual_baseline": "现实材质",
+            "forbidden_drift": ["禁止身份漂移"],
+        },
+        "story_background": {
+            "prior_events": "无", "current_situation": "开场",
+            "core_conflict": "冲突", "episode_goal": "推进",
+            "continuity_hooks": "承接",
+        },
+        "characters": [{
+            "name": "林川", "role": "主角",
+            "introduction": "本剧主角", "gender": "未指定",
+            "age_range": "以参考图为准", "identity": "学生",
+            "personality": "谨慎",
+        }],
+        "core_props": [],
+        "scenes": [],
+        "script_logic_audit": {"passed": True, "issues": []},
+    }
+
+    assert validate_script_bible(
+        script, require_resolved_identity=False) is None
+    assert "性别、年龄段必须明确" in validate_script_bible(script)
+
+
 def test_portrait_prompt_prioritizes_identity_over_reference_clothing(app):
     prompt = app.director._portrait_prompt(
         "林昭", "主角", "现代都市3D半写实",
@@ -99,7 +173,7 @@ def test_portrait_prompt_prioritizes_identity_over_reference_clothing(app):
     assert "允许与参考图服装不同" in prompt
 
 
-def test_candidate_prompts_create_real_look_variants_without_locking_style(app):
+def test_candidate_prompts_reuse_one_initial_state_and_prompt(app):
     design = {
         "species": "人类", "appearance": "暖白肤色鹅蛋脸，约25岁",
         "eyes": "深棕杏眼", "personality": "认真但有亲和力",
@@ -110,15 +184,27 @@ def test_candidate_prompts_create_real_look_variants_without_locking_style(app):
     prompts = [app.director._candidate_portrait_prompt(
         "林昭", "主角", "现代都市半写实", design, variant)
         for variant in variants]
+    contexts = [app.director._candidate_prompt_review_context(
+        "林昭", "主角", "现代都市半写实", design, variant)
+        for variant in variants]
     assert len({item["variant_id"] for item in variants}) == 4
-    assert len({tuple(item["look_variant"].values()) for item in variants}) == 4
-    assert all("不是同一套衣服只换动作" in prompt for prompt in prompts)
+    assert len({tuple(item["look_variant"].values()) for item in variants}) == 1
+    assert len(set(prompts)) == 1
+    assert len({
+        json.dumps(context, ensure_ascii=False, sort_keys=True)
+        for context in contexts
+    }) == 1
+    assert all("【四图同词】" in prompt for prompt in prompts)
+    assert all("只利用图片模型随机采样" in prompt for prompt in prompts)
     assert all("人物立绘必须是纯净、无文字的单人物资产背景" in prompt
                for prompt in prompts)
     assert all("无参考图时" in prompt for prompt in prompts)
     assert all("PROJECT STYLE LOCK" in prompt for prompt in prompts)
     assert all("不得制作不同画风候选" in prompt for prompt in prompts)
     assert "齐肩内扣短发" in prompts[0]
+    assert all(item["candidate_prompt_schema"]
+               == CHARACTER_CANDIDATE_PROMPT_SCHEMA
+               for item in variants)
 
 
 def test_visual_dna_is_compiled_without_dumping_internal_audit_json(app):
@@ -148,11 +234,97 @@ def test_visual_dna_is_compiled_without_dumping_internal_audit_json(app):
         "林昭", "主角", "电影级半写实", design,
         app.director._candidate_variant(1, design))
     assert "人物视觉DNA" in prompt
-    assert "旧怀表" in prompt
-    assert "本张造型覆盖项" in prompt
+    assert "右手虎口工具磨痕" in prompt
+    assert "旧怀表" not in prompt
+    assert "共同初始造型" in prompt
     assert "全剧角色去重" not in prompt
     assert '"overlap_threshold"' not in prompt
     assert "模板网红脸" in prompt
+
+
+def test_story_candidates_all_use_clean_initial_look_without_later_states(app):
+    design = {
+        "species": "人类",
+        "gender": "男",
+        "age_range": "24岁",
+        "appearance": "清瘦长脸，眉眼清秀",
+        "eyes": "深棕眼，警觉",
+        "hair": "束发无冠，湿碎发贴额",
+        "makeup": "自然素面；雨水与泥点；后脑有肿伤及少量血丝",
+        "costume": "旧靛青举人袍",
+        "signature_props": "吏部札付",
+        "image_prompt": (
+            "林川，旧靛青举人袍，手持吏部札付，作为嫁祸关键定版态"),
+        "visual_dna": {
+            "face_structure": "清瘦长脸",
+            "hair_silhouette": "束发无冠",
+            "clothing_structure": "旧靛青举人袍",
+            "story_visual_symbol": "吏部札付",
+            "signature_accessory": "吏部札付",
+            "temperament_keywords": ["警觉", "克制"],
+        },
+        "visual_variants": [
+            {
+                "label": "进京谋生日常态",
+                "occasion": "雨后进城",
+                "hair": "束发无冠",
+                "makeup": "雨水打湿的自然素面",
+                "costume": (
+                    "青灰粗布圆领长衫沾黄泥水；"
+                    "灰褐麻布短褐；衣料半干半湿"),
+                "palette": "灰褐与泥黄",
+                "props": "湿旧蓝布包袱",
+                "temperament": "疲惫而警觉",
+            },
+            {
+                "label": "过渡态",
+                "costume": "洗旧青灰长衫",
+                "props": "旧蓝布包袱",
+            },
+            {
+                "label": "嫁祸关键定版态",
+                "costume": "旧靛青举人袍",
+                "props": "吏部札付",
+                "temperament": "强压惊疑",
+            },
+        ],
+    }
+    variants = [app.director._candidate_variant(i, design)
+                for i in range(1, 5)]
+    prompts = [app.director._candidate_portrait_prompt(
+        "林川", "主角", "明初电影级半写实", design, variant)
+        for variant in variants]
+    contexts = [app.director._candidate_prompt_review_context(
+        "林川", "主角", "明初电影级半写实", design, variant)
+        for variant in variants]
+
+    assert len(set(prompts)) == 1
+    assert len({
+        json.dumps(context, ensure_ascii=False, sort_keys=True)
+        for context in contexts
+    }) == 1
+    prompt = prompts[0]
+    review_context = contexts[0]
+    assert "青灰粗布圆领长衫" in prompt
+    assert "灰褐麻布短褐" in prompt
+    assert "青灰粗布圆领长衫沾黄泥水" not in prompt
+    assert "黄泥水" not in prompt
+    assert "旧蓝布包袱" in prompt
+    assert "湿旧蓝布包袱" not in prompt
+    assert "雨水打湿" not in prompt
+    assert "衣料半干半湿" not in prompt
+    assert "后脑有肿伤" not in prompt
+    assert "少量血丝" not in prompt
+    assert "旧靛青举人袍" not in prompt
+    assert "吏部札付" not in prompt
+    assert "全局服装/标志道具" in prompt
+    assert review_context["initial_character_state"]["wardrobe"] \
+        == "青灰粗布圆领长衫；灰褐麻布短褐"
+    assert review_context["initial_character_state"][
+        "accessories_and_props"] == "旧蓝布包袱"
+    serialized_context = str(review_context)
+    assert "旧靛青举人袍" not in serialized_context
+    assert "吏部札付" not in serialized_context
 
 
 def test_legacy_character_design_is_upgraded_without_losing_fields(app):
@@ -207,10 +379,11 @@ def test_reference_portrait_locks_face_hair_makeup_and_workwear(app):
         has_reference=True)
     assert "只锁人物脸型、五官骨相" in prompt
     assert "严格保持参考图发型轮廓" in prompt
-    assert "候选不改变发型身份" in prompt
-    assert "候选不改变妆造体系" in prompt
+    assert "四张候选不得更换发型身份" in prompt
+    assert "四张候选不得改变妆造体系" in prompt
     assert "禁止换脸" in prompt
-    assert "外卖小哥" in prompt and "工作服/制服" in prompt
+    assert "外卖小哥" in prompt and "外卖制服" in prompt
+    assert "职业服装:" not in prompt
     assert "纯净、无文字的单人物资产背景" in prompt
 
 
@@ -223,11 +396,12 @@ def test_candidate_reference_semantics_lock_project_style_and_identity():
     ref_line = _ref_line(payload)
     assert "脸是最高标准" in ref_line
     assert "发型轮廓、发量、发色家族、妆造" in ref_line
-    assert "不得改脸、换发型、换妆造或换画风" in ref_line
+    assert "不得改脸、换发型、换妆造、换服装、换动作或换画风" in ref_line
     style_line = _style_line(payload)
     assert "不存在候选画风选项" in style_line
-    assert "不得通过更换媒介、渲染、色彩系统或时代制造差异" in style_line
-    assert "不得用同一造型只换动作" in style_line
+    assert "完全相同的初始状态提示词" in style_line
+    assert "只靠图片模型随机采样" in style_line
+    assert "不得换装、换妆、换动作" in style_line
     normal = _ref_line({"reference_images": ["/tmp/identity.png"]})
     assert "禁止换脸或换发型" in normal
 
@@ -248,6 +422,56 @@ def test_legacy_candidate_is_not_given_a_fake_look_label(app):
     assert candidate["variant_source"] == "legacy"
     assert candidate["variant_label"] == ""
     assert candidate["look_variant"] is None
+    assert candidate["current_candidate_policy"] is False
+    with pytest.raises(AifosError, match="旧版"):
+        app.director.select_character_candidate(
+            project["title"], 1, name, 1)
+
+
+def test_old_story_state_candidate_is_kept_as_history_but_not_reused(app):
+    title = "旧剧情状态候选迁移"
+    first = app.director.produce(
+        title, 1, pause_for_confirm=True)
+    assert first["status"] == "awaiting_script"
+    project = app.projects.get_project(title)
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    name = script["characters"][0]["name"]
+    old_uri = app.workspace.artifacts_dir / "old-official-state.png"
+    old_uri.write_bytes(b"\x89PNG\r\n\x1a\nold")
+    app.assets.register(
+        project["id"], "character_candidate", f"{name}:01",
+        uri=str(old_uri),
+        meta={
+            "character": name,
+            "candidate_index": 1,
+            "variant_id": "story_final",
+            "variant_label": "官服关键态",
+            "variant_source": "generated",
+            "look_variant": {
+                "hair": "束发",
+                "makeup": "后脑伤",
+                "costume": "青色官袍",
+                "temperament": "眩晕",
+            },
+            "prompt": "青色官袍、后脑伤与泥水状态",
+        })
+
+    second = app.director.produce(
+        title, 1, pause_for_confirm=True)
+
+    assert second["status"] == "awaiting_cast"
+    history = app.assets.history(
+        project["id"], "character_candidate", f"{name}:01")
+    assert len(history) == 2
+    assert app.assets.meta(history[0])["variant_label"] == "官服关键态"
+    latest_meta = app.assets.meta(history[-1])
+    assert latest_meta["candidate_prompt_schema"] \
+        == CHARACTER_CANDIDATE_PROMPT_SCHEMA
+    assert latest_meta["variant_source"] == "initial_state_same_prompt"
+    assert "青色官袍、后脑伤与泥水状态" != latest_meta["prompt"]
 
 
 def test_locked_candidate_becomes_only_identity_reference(app):

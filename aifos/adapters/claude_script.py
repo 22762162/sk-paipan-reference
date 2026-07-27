@@ -1,7 +1,9 @@
-"""Claude 编剧适配桥:剧本 / 分镜由 Claude CLI 实际生成。
+"""Claude / Codex 编剧适配桥:剧本 / 分镜由真实编剧 CLI 生成。
 
-把 AIFOS 通用 CLI Provider 协议转换为 `claude -p` 非交互调用,
-要求 Claude 输出严格 JSON,解析并校验后回传平台。
+把 AIFOS 通用 CLI Provider 协议转换为非交互调用,要求模型输出严格
+JSON,解析并校验后回传平台。默认引擎是 `claude -p`;`--engine codex`
+切换为 `codex exec`(只读沙箱),供 Claude CLI 不可用时兜底编剧,
+两个引擎共用同一套提示词、校验器和分镜规范化逻辑。
 
 配置示例(workspace/config.json):
   "claude": {
@@ -9,19 +11,36 @@
     "command": ["python3", "-m", "aifos.adapters.claude_script",
                 "--claude", "claude"]
   }
+  "codex_writer": {
+    "enabled": true,
+    "command": ["python3", "-m", "aifos.adapters.claude_script",
+                "--engine", "codex", "--codex", "codex"]
+  }
 """
 
 import argparse
 import json
+import os
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 from pathlib import Path
 
 from ..generation_diagnostics import normalize_generation_diagnostics
+from ..identity_facts import unresolved_identity_fields
 from ..speaker_labels import is_non_person_label
 from ..inner_persona import normalize_inner_persona_policy
-from ..story_logic import normalize_script_logic
+from ..story_logic import (
+    PROP_CONTRACT_SCHEMA,
+    audit_prop_contract,
+    audit_storyboard_prop_contract,
+    normalize_prop_contract,
+    normalize_script_logic,
+)
 from ..story_analysis import STORY_ANALYSIS_SCHEMA, validate_story_analysis
 from ..script_import import sanitize_script_entities
 
@@ -48,6 +67,13 @@ SCRIPT_PROMPT = """你是兼具顶级类型片编剧、影视导演、场面调�
   后续镜头的核心道具；每件写清剧情功能、外形结构、时代材质、持有人与状态变化，
   并固定 `candidate_count:4` 供人工四选一。一次性普通小物只写进场次道具台账，
   不得为了凑资产而列入 `core_props`;
+- 同时建立 `aifos.prop-contract/v2.2` 的 `prop_registry`。只登记核心、剧情敏感或
+  必须跨镜追踪的物理实例，不登记普通布景陈设；每件必须有稳定且全片唯一的
+  `prop_id`，同名同款的两件实物也必须使用两个不同 ID。必须写 `kind`、
+  `instance_count:1`、可与分镜 `event_id` 对齐的 `introduced_at` /
+  `availability_start_event`、可选 `retired_at` / `availability_end_event`，
+  以及明确 `disclosure_policy`。事件引用必须使用稳定 event_id，禁止只写会因
+  重排而变化的 shot_no;
 - 每场必须明确人物信息状态：本场开始时各自知道什么、不知道什么、通过何种
   可见证据新获知什么；禁止角色突然知道未听见、未看见、未被告知的内容;
 - 每场必须明确时间关系和动作耗时。上一场出口、本场入口、本场出口和下一场入口
@@ -82,7 +108,11 @@ SCRIPT_PROMPT = """你是兼具顶级类型片编剧、影视导演、场面调�
 - 人物重要度必须明确标为主角、重要配角、非重要配角或背景路人。
   所有正式角色后续统一生成 4 张候选图;场次中不得出现人物表未声明的新角色;
 - `costume_direction` 必须给出可画的服装逻辑(款式、材质、层次、颜色、职业制服/时代服饰和剧情场合),禁止所有角色默认现代都市便服;
-- `visual_variants` 至少给出 3 个剧情兼容的造型方案(例如日常、行动/冲突、仪式/舞台);它们是服装、道具和表演细节，不是画风选项；全剧候选图必须继承同一个项目画风;
+- `visual_variants` 至少给出 3 个按剧情时间顺序排列的造型方案；
+  第 1 项必须是人物首次登场前的基础定妆，只保留初始服装、发型、妆容与稳定身份特征，
+  明确排除淋湿、泥污、伤情、死亡态和后续换装；后续项才写行动/冲突/仪式等剧情状态。
+  `visual_variants` 供后续镜头连续性使用，不用于把4张人物定角候选做成4种状态；
+  定角4张图必须复用第1项编译出的同一提示词，只靠图片模型随机采样;
 - 每个正式角色必须先完成 `character_analysis`，再生成 `visual_dna`：
   从身份阶层、成长环境、当前处境、欲望、恐惧、关键经历、性格优缺点和
   行为习惯，推导脸部骨相、发型轮廓、身体/职业痕迹、服装结构与磨损、
@@ -127,7 +157,14 @@ JSON 格式(字段必须齐全):
    "cast_dedup": {{"compared_with":["其他角色"],"dimensions":["发型","服装结构","身体特征","视觉符号","核心配饰","气质关键词"],"status":"passed","conflicts":[]}}}},
   {{"name": "路人功能名", "role": "背景路人",
    "crowd_function": "在哪一场以几人、什么剧情功能短暂出现;无独立人物资产"}}],
- "core_props": [{{"name":"核心道具唯一名称",
+ "prop_contract_schema":"aifos.prop-contract/v2.2",
+ "prop_registry":[{{"prop_id":"稳定且唯一的道具实例ID","name":"全剧唯一实例显示名称",
+   "kind":"core/plot_sensitive/identity_prop","instance_count":1,
+   "introduced_at":{{"event_id":"稳定剧情事件ID","phase":"start"}},
+   "availability_start_event":{{"event_id":"同一稳定剧情事件ID","phase":"start"}},
+   "retired_at":null,"availability_end_event":null,
+   "disclosure_policy":"explicit_frame_only/conceal_until_introduced/available_after_introduction/never_visualize"}}],
+ "core_props": [{{"prop_id":"与prop_registry一致的稳定ID","name":"核心道具唯一名称",
    "story_function":"为什么会影响多镜头或核心剧情",
    "visual_design":"可直接画出的外形、结构、尺寸级别与识别点",
    "era_material":"符合世界观的材质、工艺和磨损",
@@ -149,7 +186,7 @@ JSON 格式(字段必须齐全):
    "shootability": "核心事件如何由镜头直接拍出",
    "local_rewrite_policy": "逻辑返编时如何锁定前后边界、分析影响并只使受影响资产失效",
    "self_reviewed": true}},
- "scenes": [{{"scene_no": 1, "location": "地点",
+ "scenes": [{{"scene_no": 1, "event_id":"稳定场次事件ID","location": "地点",
    "characters": ["出场角色名"], "action": "本场动作描述",
    "director_logic": {{
      "dramatic_function": "本场给观众带来的新信息/冲突/转折",
@@ -184,7 +221,9 @@ IDOL_PROMPT = """你是 AI 虚拟偶像「{persona}」的内容策划。为第{e
   「{persona}」一人口播;
 - 每个正式成员都要写与团内定位、歌曲主题、成长经历和本期冲突绑定的人物背景提示词、
   职业/舞台身份、性格外化方式、服装逻辑和至少 3 套练习室/后台/舞台剧情造型方案；
-  这些方案不改变全剧唯一画风，候选图只比较人物身份与剧情细节;
+  第1套必须是无淋湿、泥污、伤情或后续换装的首次登场基础定妆；
+  其余方案只供后续镜头连续性使用。人物定角4张图复用第1套同一提示词，
+  只靠图片模型随机采样比较人物形象;
 - 每个正式成员先写人物分析和视觉 DNA，再与全团其他成员做视觉去重；
   发型、服装结构、身体特征、视觉符号、核心配饰、气质关键词中两项以上
   重叠必须重设计，不能只靠换衣服颜色区分成员;
@@ -257,18 +296,43 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
   衣服但无默认道具，表情动作可以夸张；比例固定为大头小身，约1.8头身，
   头占总高约58%，身体与四肢明显小于头；内心发声时真人宿主闭口且不生成字幕；
 - shot_no 从 1 连续编号；duration 单位秒，优先 5-8 秒，最长 15 秒；
+- 每镜必须输出 `frame_targets`，分别锁定 keyframe、first_frame、last_frame
+  三种静态用途；每项只含一个 phase(start/end/freeze) 和一个可见、可拍、
+  无时间过程的 state，并明确 fallback:false。人物镜可引用已经写清的起止状态，
+  空镜也必须写场景、光线、陈设和环境变化完成后的唯一静态结果；禁止把“走过去、
+  拿起来、从躺到坐”等动作过程直接当静态定格；
 - prompt 只含本镜头真正可见且会影响生成的世界状态、场景、准确人物名单、主体动作、
   光影、机位与结尾状态；不得复制整集前情、其他镜头、人物传记或无关道具；
+- 保留剧本 `prop_registry` 的 prop_id、名称、实例身份和场次生命周期边界；
+  可把 availability_start/end 从源场次边界细化到同一场内的准确镜头 event_id，
+  不得跨场移动、改名、删项或复制。每镜输出稳定且唯一的 `event_id`。仅对本镜
+  实际相关的已登记剧情道具输出结构化 `frame_props`，不得
+  通过全文搜索道具名猜测状态，也不得把未登记的普通布景陈设强行纳入该合同；
+  每项必须写 prop_id、phase(start/end/freeze)、physical_state、holder、location、
+  support、visibility(visible/occluded/hidden/absent) 和
+  representation(physical/reflection/screen/painting/overlay)。反射、屏幕、画中画
+  和叠层都算剧情披露，但不算第二件物理实例；hidden/absent 不得偷画成背景露角;
+- 同一道具在 start/end 的持有人、位置、支撑、可见性、呈现方式或物理状态发生
+  变化时，必须输出 `prop_transitions`，写明 prop_id、from_phase、to_phase 和
+  唯一可见 action。静态 freeze 不写跨时间动作；同一 phase 的 physical 实体数
+  不得重复；多件同款物品必须分别登记不同 prop_id;
 - 每个镜头必须额外输出 `physical_logic`，只写本镜可见的物理/空间事实：人物、
   道具、桌面/地面、镜头的相对位置，使用方向、接触点、视线和动作可达性；
   涉及电脑/手机/屏幕时必须明确屏幕正面、键盘/手部、使用者和摄影机同侧关系，
   禁止人物坐在屏幕后方却看到屏幕正面等反向构图；
 - 每个有角色的镜头必须输出 `start_state` 和 `end_state`，按角色名分别写
-  pose、position、direction、prop、injury、emotion、wardrobe、headwear、
-  hair_makeup；服装、头饰、妆发必须写当前镜头唯一可见状态，不能把多套剧情
+  pose、position、direction、prop、injury、emotion、wardrobe、结构化
+  headwear(presence:none/worn、kind、name)、hair_visibility 和 hair_makeup；
+  同时写 condition 的 life_state(alive/dead/nonliving)、
+  consciousness_state(awake/asleep/unconscious/not_applicable)、
+  embodiment(physical/statue/portrait/imagined/overlay)、
+  mobility(active/limited/immobile/not_applicable)。服装、头饰、妆发和人物状态
+  必须写当前镜头唯一可见状态，不能把多套剧情
   造型同时塞入同一镜。姿态必须说明站/坐/跪/躺/伏案及真实支撑面，终态必须
   被下一镜逐项继承；没有明确换装/摘戴/改妆动作时，下一镜不得改动 wardrobe、
-  headwear 或 hair_makeup。空镜输出空对象；
+  headwear、hair_visibility 或 hair_makeup；没有醒来、入睡、昏迷、死亡等
+  明确过程时不得改变 condition。睡眠/昏迷/死亡/非生命形态不得出现与状态
+  冲突的注视、眨眼、说话、主动动作或微表情。空镜输出空对象；
 - prompt 中人物形态按人物设定描写(名字只是称呼,「小鹿」若设定为
   人类不能当动物写;设定为动物/精怪的按设定写,全片保持一致);
 - 不生成对白字幕。手机屏、弹幕、合同等可读文字只描述载体与准确文字，
@@ -279,7 +343,16 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
 - 只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块。
 
 JSON 格式:
-{{"episode_title": "...", "shots": [{{"shot_no": 1, "scene_no": 1,
+{{"episode_title": "...","prop_contract_schema":"aifos.prop-contract/v2.2",
+ "prop_registry":[{{"prop_id":"稳定道具实例ID","name":"全剧唯一实例显示名称",
+   "kind":"core/plot_sensitive/identity_prop","instance_count":1,
+   "introduced_at":{{"event_id":"同一源场次内首次可披露的准确镜头event_id","phase":"start"}},
+   "availability_start_event":{{"event_id":"同一准确镜头event_id","phase":"start"}},
+   "retired_at":null,"availability_end_event":null,
+   "disclosure_policy":"explicit_frame_only"}}],
+ "shots": [{{"shot_no": 1, "scene_no": 1,
+  "scene_event_id":"源剧本对应场次的稳定event_id",
+  "event_id":"稳定且唯一的镜头事件ID",
   "kind": "environment", "description": "...", "camera": "镜头语言",
   "duration": 2.5, "characters": ["角色名"], "dialogue": null,
   "functional_figures": [{{"name":"无独立身份资产的功能人物",
@@ -290,15 +363,36 @@ JSON 格式:
     "expression":"夸张Q版表情","action":"夸张Q版动作",
     "dialogue":"必要时的内心台词；否则空字符串"}}],
   "physical_logic": "本镜物理/空间关系",
+  "frame_props":[
+    {{"prop_id":"稳定道具实例ID","phase":"start",
+      "physical_state":"起点物理状态","holder":"持有人或none",
+      "location":"起点唯一主位置或none","support":"支撑/接触面或none",
+      "visibility":"visible/occluded/hidden/absent","representation":"physical"}},
+    {{"prop_id":"同一道具实例ID","phase":"end",
+      "physical_state":"终点物理状态","holder":"持有人或none",
+      "location":"终点唯一主位置或none","support":"支撑/接触面或none",
+      "visibility":"visible/occluded/hidden/absent","representation":"physical"}}],
+  "prop_transitions":[{{"prop_id":"稳定道具实例ID","from_phase":"start",
+    "to_phase":"end","action":"单一可见拿取/交接/移动/状态变化"}}],
+  "frame_targets":{{
+    "keyframe":{{"phase":"end","state":"本镜代表性唯一静态结果","fallback":false}},
+    "first_frame":{{"phase":"start","state":"动作发生前唯一可见状态","fallback":false}},
+    "last_frame":{{"phase":"end","state":"动作完成后唯一可见状态","fallback":false}}}},
   "start_state": {{"角色名":{{"pose":"动作起点姿态及支撑面",
     "position":"相对场景和其他人物的位置","direction":"身体朝向和视线对象",
     "prop":"手中/身上道具","injury":"伤势","emotion":"可见情绪",
-    "wardrobe":"当前唯一服装","headwear":"当前头饰/冠帽或无",
+    "wardrobe":"当前唯一服装",
+    "headwear":{{"presence":"none/worn","kind":"official_hat/crown/helmet/soft_hat/veil/hair_ornament/other/none","name":"具体名称或none"}},
+    "hair_visibility":"fully_visible/partially_visible/covered",
+    "condition":{{"life_state":"alive/dead/nonliving","consciousness_state":"awake/asleep/unconscious/not_applicable","embodiment":"physical/statue/portrait/imagined/overlay","mobility":"active/limited/immobile/not_applicable"}},
     "hair_makeup":"当前发型与妆容"}}}},
   "end_state": {{"角色名":{{"pose":"动作完成后的姿态及支撑面",
     "position":"终点位置","direction":"终点朝向和视线对象",
     "prop":"终点持物","injury":"终点伤势","emotion":"终点情绪",
-    "wardrobe":"结尾唯一服装","headwear":"结尾头饰/冠帽或无",
+    "wardrobe":"结尾唯一服装",
+    "headwear":{{"presence":"none/worn","kind":"official_hat/crown/helmet/soft_hat/veil/hair_ornament/other/none","name":"具体名称或none"}},
+    "hair_visibility":"fully_visible/partially_visible/covered",
+    "condition":{{"life_state":"alive/dead/nonliving","consciousness_state":"awake/asleep/unconscious/not_applicable","embodiment":"physical/statue/portrait/imagined/overlay","mobility":"active/limited/immobile/not_applicable"}},
     "hair_makeup":"结尾发型与妆容"}}}},
   "readable_text": {{"carrier":"电脑屏幕", "whitelist":["逐字原文"],
     "layout":"版式/位置", "style":"字体/颜色/层级", "perspective":"透视/反光",
@@ -475,6 +569,12 @@ def normalize_script_bible(script, payload=None):
         payload.get("style")
         or "待 AI 根据剧本全文生成的本剧专属制作风格")
     scenes = script.get("scenes") or []
+    for position, scene in enumerate(scenes, 1):
+        if not isinstance(scene, dict):
+            continue
+        scene.setdefault(
+            "event_id",
+            f"scene:{scene.get('scene_no', position)}")
     locations = "、".join(dict.fromkeys(
         scene.get("location") for scene in scenes
         if isinstance(scene, dict) and scene.get("location")
@@ -606,9 +706,42 @@ def normalize_script_bible(script, payload=None):
     return script
 
 
-def validate_script_bible(script):
+def validate_script_bible(script, *, require_resolved_identity=True):
     """返回世界观/前情/人物介绍硬门禁错误；通过时返回 ``None``。"""
     strip_non_person_speakers(script)
+    normalize_prop_contract(script)
+    prop_report = audit_prop_contract(script)
+    if not prop_report["passed"]:
+        return "结构化道具合同无效: " + "；".join(prop_report["issues"])
+    scene_event_ids = []
+    for position, scene in enumerate(script.get("scenes") or [], 1):
+        if not isinstance(scene, dict):
+            continue
+        scene.setdefault(
+            "event_id",
+            f"scene:{scene.get('scene_no', position)}")
+        event_id = str(scene.get("event_id") or "").strip()
+        if not event_id:
+            return f"第{position}场缺少稳定 event_id"
+        if event_id in scene_event_ids:
+            return f"场次 event_id 重复: {event_id}"
+        scene_event_ids.append(event_id)
+    known_events = set(scene_event_ids) | {"episode-start", "episode-end"}
+    for item in script.get("prop_registry") or []:
+        if not isinstance(item, dict):
+            continue
+        for field in (
+                "availability_start_event", "availability_end_event"):
+            ref = item.get(field)
+            if not ref:
+                continue
+            event_id = str(
+                ref.get("event_id") if isinstance(ref, dict) else ref
+            ).strip()
+            if event_id not in known_events:
+                return (
+                    f"{item.get('prop_id') or item.get('name')} 的 {field} "
+                    f"未对应稳定场次 event_id: {event_id}")
     world = script.get("story_world")
     if not isinstance(world, dict):
         return "缺少 story_world 故事世界设定"
@@ -639,6 +772,12 @@ def validate_script_bible(script):
         for field in CHARACTER_INTRO_FIELDS:
             if _missing(character.get(field)):
                 return f"{character['name']}人物设定字段不全: {field}"
+        if require_resolved_identity:
+            unresolved = unresolved_identity_fields(character)
+            if unresolved:
+                return (
+                    f"{character['name']}人物{'、'.join(unresolved)}必须明确，"
+                    "不能使用未指定、待确认或以参考图为准等占位表达")
     for prop in script.get("core_props") or []:
         if not isinstance(prop, dict) or _missing(prop.get("name")):
             return "核心道具字段不全: name"
@@ -758,7 +897,11 @@ def validate_script(script, payload):
     script.setdefault("episode_title", "")
     script.setdefault("logline", "")
     normalize_script_bible(script, payload)
-    return validate_script_bible(script)
+    # AI 初稿即使漏写性别/年龄也必须进入制作圣经供人工补录，不能在
+    # Provider 层静默回退成另一份 mock 剧本。真正锁定人物、生成候选图
+    # 时仍由 validate_script_bible 的默认严格模式阻断。
+    return validate_script_bible(
+        script, require_resolved_identity=False)
 
 
 def validate_storyboard(storyboard):
@@ -766,9 +909,20 @@ def validate_storyboard(storyboard):
         return "缺少 shots"
     if not isinstance(storyboard["shots"], list):
         return "shots 需为数组"
-    for shot in storyboard["shots"]:
+    normalize_prop_contract(storyboard)
+    prop_registry_report = audit_prop_contract(storyboard)
+    if not prop_registry_report["passed"]:
+        return "分镜 prop_registry 无效: " + "；".join(
+            prop_registry_report["issues"])
+    for shot_position, shot in enumerate(storyboard["shots"], 1):
         if not isinstance(shot, dict):
             return f"镜头需为对象,收到: {str(shot)[:80]}"
+        shot.setdefault(
+            "event_id",
+            str(shot.get("unit_id") or f"shot:{shot_position}"))
+        shot.setdefault(
+            "scene_event_id",
+            f"scene:{shot.get('scene_no')}")
         for field in ("scene_no", "duration", "prompt"):
             if field not in shot:
                 return f"镜头缺少字段 {field}: {shot}"
@@ -819,10 +973,60 @@ def validate_storyboard(storyboard):
         shot.setdefault("start_state", {})
         shot.setdefault("end_state", {})
         shot.setdefault("readable_text", None)
+        frame_targets = shot.get("frame_targets")
+        if not isinstance(frame_targets, dict):
+            return f"镜头缺少显式 frame_targets: {shot}"
+        for target_name, expected_phase in (
+                ("keyframe", {"start", "end", "freeze"}),
+                ("first_frame", {"start", "freeze"}),
+                ("last_frame", {"end", "freeze"})):
+            target = frame_targets.get(target_name)
+            if not isinstance(target, dict):
+                return f"镜头 frame_targets.{target_name} 必须是对象: {shot}"
+            phase = str(target.get("phase") or "").strip().lower()
+            if phase not in expected_phase:
+                return (
+                    f"镜头 frame_targets.{target_name}.phase 非法: "
+                    f"{phase or '空'}")
+            target_state = target.get("state")
+            if (_missing(target_state)
+                    or (isinstance(target_state, (dict, list))
+                        and not target_state)):
+                return f"镜头 frame_targets.{target_name}.state 不能为空"
+            if target.get("fallback") is not False:
+                return (
+                    f"镜头 frame_targets.{target_name}.fallback 必须明确为 false")
+        frame_props = shot.setdefault("frame_props", [])
+        if not isinstance(frame_props, list):
+            return f"镜头 frame_props 需为数组: {shot}"
+        for frame_prop in frame_props:
+            if not isinstance(frame_prop, dict):
+                continue
+            frame_prop["prop_id"] = str(
+                frame_prop.get("prop_id") or "").strip()
+            for field in ("phase", "visibility", "representation"):
+                frame_prop[field] = str(
+                    frame_prop.get(field) or "").strip().lower()
+        transitions = shot.setdefault("prop_transitions", [])
+        if not isinstance(transitions, list):
+            return f"镜头 prop_transitions 需为数组: {shot}"
+        for transition in transitions:
+            if not isinstance(transition, dict):
+                continue
+            transition["prop_id"] = str(
+                transition.get("prop_id") or "").strip()
+            for field in ("from_phase", "to_phase"):
+                transition[field] = str(
+                    transition.get(field) or "").strip().lower()
     # 编号强制连续,避免下游连续性质检失败
     for index, shot in enumerate(storyboard["shots"], start=1):
         shot["shot_no"] = index
+    prop_report = audit_storyboard_prop_contract(storyboard)
+    if not prop_report["passed"]:
+        return "结构化镜头道具合同无效: " + "；".join(
+            prop_report["issues"])
     storyboard.setdefault("episode_title", "")
+    storyboard["prop_contract_schema"] = PROP_CONTRACT_SCHEMA
     return None
 
 
@@ -858,8 +1062,10 @@ DESIGN_PROMPT = """你是漫剧人物设定师。为作品《{title}》的角色
 - `era_setting`、`occupation`、`motivation`、`backstory`、`relationships`、
   `costume_direction`、`signature_props` 必须具体;职业身份要能从服装和装备一眼识别;
 - `visual_variants` 必须给出 3-5 个与剧情兼容的造型方案,每项写清场合、服装、材质、
-  配色、配饰/道具和气质变化；它们不改变本剧唯一画风，候选图不得把画风作为变量，
-  也不是同一套衣服只换动作;
+  配色、配饰/道具和气质变化，并按剧情时间顺序排列；第1项必须是首次登场前的
+  干燥、洁净、无伤基础定妆，禁止官服等后续换装、淋湿、泥污、血迹、伤口或死亡态；
+  后续项只供镜头连续性使用。人物定角4张候选必须复用第1项编译出的同一最终提示词，
+  不得为4张图分别设计服装、妆容、动作或剧情状态，只靠图片模型随机采样;
 - 传入的正式角色必须标注重要度:主角、重要配角或非重要配角;不得补画或扩写
   跑龙套/背景路人,这类角色只在剧本场次中保留人数与功能标签,不建立独立设定或人物资产;
 - 性格要能从表情神态与站姿体现;外貌含脸型/肤色/身材比例;
@@ -1293,8 +1499,66 @@ def validate_image_qc(data):
     return None
 
 
+CHARACTER_REFINE_PROMPT = """你是本剧的人物造型总监。用户对角色「{name}」的当前形象提出修改意见,
+你要深度理解意图,改写这个角色的人物形象提示词(设定卡)。
+
+当前形象提示词:
+{current}
+
+角色背景与身份事实(不可违背):
+{context}
+
+项目画风(不可改变):{style}
+
+用户意见(必须逐条落实):{feedback}
+
+要求:
+- 深度理解意见的真实意图;意见含糊时按最合理的造型逻辑具体化
+  (如"头发长点"要落成明确的长度、层次与轮廓,"皮肤更白点"要落成
+  具体肤色基调与质感,不能只是把原话抄进提示词);
+- 未被意见涉及的部分(骨相、五官、年龄感、身份特征、画风)一字不改保留;
+- 若某条意见与身份事实或项目画风冲突,不要硬改,在 conflict_notes
+  里说明冲突并给出最接近用户意图的可行方案;
+- image_prompt 必须是完整、独立、可直接生图的人物形象提示词,
+  不是增量补丁;
+- 只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块:
+{{"image_prompt": "改写后的完整人物形象提示词",
+ "changes": ["逐条说明改了什么,对应用户哪条意见"],
+ "conflict_notes": ["与设定/画风冲突的意见及处理方式;没有则给空数组"]}}
+"""
+
+
+def validate_prompt_refine(data):
+    """人物形象提示词改写输出的最小校验。"""
+    if not isinstance(data, dict):
+        return "输出必须是 JSON 对象"
+    prompt = str(data.get("image_prompt") or "").strip()
+    if len(prompt) < 20:
+        return "缺少 image_prompt 或内容过短"
+    for key in ("changes", "conflict_notes"):
+        value = data.get(key)
+        if value is None:
+            data[key] = []
+        elif not isinstance(value, list):
+            return f"{key} 必须是数组"
+    if not data["changes"]:
+        return "changes 必须逐条说明改动,不能为空"
+    return None
+
+
 def build_prompt(capability, payload):
     """构造编剧/分镜/人物设定提示词(CLI 桥与 Claude API Provider 共用)。"""
+    if capability == "script" and payload.get("prompt_refine"):
+        return CHARACTER_REFINE_PROMPT.format(
+            name=payload.get("character_name", ""),
+            current=(payload.get("current_prompt")
+                     or "(尚无成形提示词,请依据角色背景从零撰写)"),
+            context=json.dumps(
+                payload.get("character_context") or {},
+                ensure_ascii=False),
+            style=(payload.get("style")
+                   or "项目画风未指定;保持与已生成候选一致"),
+            feedback=payload.get("feedback", ""))
     if capability == "script" and payload.get("story_analysis"):
         return STORY_ANALYSIS_PROMPT.format(
             style=(payload.get("style")
@@ -1388,56 +1652,368 @@ def build_prompt(capability, payload):
     raise ValueError(f"claude 编剧不支持能力: {capability}")
 
 
-def run(request, claude, timeout):
-    capability = request["capability"]
-    payload = request.get("payload", {})
-    if shutil.which(claude) is None and not Path(claude).exists():
-        return {"ok": False, "error": f"claude 命令不存在: {claude}"}
+# codex exec 作为备选编剧引擎:只读沙箱(编剧只产 JSON 文本,不需要
+# 写文件权限)、不落会话文件、无彩色控制符;最终答复经
+# --output-last-message 落盘,避免从进度日志里抠 JSON。
+CODEX_WRITER_ARGS = ("exec", "--sandbox", "read-only",
+                     "--skip-git-repo-check", "--ephemeral",
+                     "--color", "never")
+
+
+def _terminate_group(proc, grace=5):
+    """TERM→KILL 整个进程组,不留幽灵子进程。"""
+    if proc.poll() is not None:
+        return
     try:
-        prompt = build_prompt(capability, payload)
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
     try:
-        proc = subprocess.run(
-            [claude, "-p", prompt], capture_output=True, text=True,
-            timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return {"ok": False, "error": f"claude 调用失败: {exc}"}
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        proc.wait()
+
+
+def _process_cpu_seconds(pid):
+    """进程组累计 CPU 时间(秒);取不到返回 None。仅标准库。"""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "time=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not out:
+        return None
+    parts = out.replace("-", ":").split(":")
+    try:
+        seconds = float(parts[-1])
+        for index, value in enumerate(reversed(parts[:-1]), start=1):
+            seconds += float(value) * (60 ** index)
+    except ValueError:
+        return None
+    return seconds
+
+
+def _run_with_stall_watchdog(cmd, env, timeout, stall_timeout):
+    """跑子进程并监控存活迹象:输出活性 + CPU 时间推进,双信号任一即算
+    活着;两者同时静止超过 stall_timeout 才判定卡住。
+
+    codex 在长思考期几乎不产出任何 stdout/stderr(实测 100s 任务里
+    静默 99.3s),只看输出必然误杀正常长任务;CPU 时间能反映它仍在
+    本地解码/处理。真卡死(网络断流后挂起)两个信号会同时归零。
+
+    timeout<=0 表示不设总时长上限——活性检测取代硬超时。
+    返回 (returncode, stdout, stderr, stalled)。
+    """
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=env, start_new_session=True)
+    chunks = {"out": [], "err": []}
+    activity = {"at": time.monotonic()}
+
+    def pump(stream, key):
+        for line in iter(stream.readline, ""):
+            chunks[key].append(line)
+            activity["at"] = time.monotonic()
+        stream.close()
+
+    threads = [
+        threading.Thread(target=pump, args=(proc.stdout, "out"),
+                         daemon=True),
+        threading.Thread(target=pump, args=(proc.stderr, "err"),
+                         daemon=True),
+    ]
+    for item in threads:
+        item.start()
+    deadline = (time.monotonic() + timeout
+                if timeout and timeout > 0 else None)
+    stalled = False
+    cpu_seen = _process_cpu_seconds(proc.pid)
+    cpu_checked_at = time.monotonic()
+    # 采样间隔必须明显小于判定阈值,否则还没采到就先判卡住了。
+    cpu_interval = max(1.0, min(10.0, stall_timeout / 3.0))
+    while True:
+        try:
+            proc.wait(timeout=1)
+            break
+        except subprocess.TimeoutExpired:
+            now = time.monotonic()
+            # CPU 采样每 10s 一次:进程仍在消耗 CPU 说明它在干活,
+            # 与输出一样算作存活迹象。
+            if now - cpu_checked_at >= cpu_interval:
+                cpu_checked_at = now
+                cpu_now = _process_cpu_seconds(proc.pid)
+                if (cpu_now is not None and cpu_seen is not None
+                        and cpu_now > cpu_seen):
+                    activity["at"] = now
+                if cpu_now is not None:
+                    cpu_seen = cpu_now
+            if now - activity["at"] >= stall_timeout:
+                stalled = True
+                _terminate_group(proc)
+                break
+            if deadline is not None and now >= deadline:
+                _terminate_group(proc)
+                raise subprocess.TimeoutExpired(cmd, timeout)
+    for item in threads:
+        item.join(timeout=5)
+    return (proc.returncode, "".join(chunks["out"]),
+            "".join(chunks["err"]), stalled)
+
+
+def _invoke_engine(engine, binary, prompt, timeout, codex_home="",
+                   stall_timeout=0):
+    """调用编剧引擎,返回 (ok, 文本或错误信息)。
+
+    codex_home 指定 codex 登录态目录(CODEX_HOME),让编剧走独立
+    账号通道(如 B 通道),不占默认账号的额度。
+    stall_timeout>0 时启用停滞看门狗:连续无任何输出即判卡住并终止,
+    配合 timeout=0(不设总时长)实现"长任务不掐、真卡住必停"。"""
+    if engine == "codex":
+        env = None
+        if codex_home:
+            home = Path(codex_home).expanduser()
+            if not home.is_dir():
+                return False, f"codex 编剧 CODEX_HOME 不存在: {home}"
+            env = dict(os.environ, CODEX_HOME=str(home.resolve()))
+        fd, last = tempfile.mkstemp(prefix="aifos-codex-writer-",
+                                    suffix=".txt")
+        os.close(fd)
+        try:
+            cmd = [binary, *CODEX_WRITER_ARGS,
+                   "--output-last-message", last, prompt]
+            if stall_timeout and stall_timeout > 0:
+                returncode, out, err, stalled = _run_with_stall_watchdog(
+                    cmd, env, timeout, stall_timeout)
+                if stalled:
+                    return False, (
+                        f"codex 编剧卡住:连续 {int(stall_timeout)}s "
+                        "无输出且无 CPU 活动,已终止本次调用;"
+                        "请检查网络/账号状态后重试"
+                        "(按约定不回退其他产线)")
+            else:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    timeout=(timeout if timeout and timeout > 0 else None),
+                    env=env)
+                returncode, out, err = (
+                    proc.returncode, proc.stdout, proc.stderr)
+            if returncode != 0:
+                detail = (err.strip() or out.strip())[-300:]
+                return False, f"codex 编剧退出码 {returncode}: {detail}"
+            try:
+                text = Path(last).read_text(encoding="utf-8")
+            except OSError:
+                text = ""
+            # 最终答复文件为空的边角情况仍回退解析 stdout
+            # (extract_json 能容忍进度杂讯)。
+            return True, text.strip() or out
+        finally:
+            try:
+                os.unlink(last)
+            except OSError:
+                pass
+    proc = subprocess.run(
+        [binary, "-p", prompt], capture_output=True, text=True,
+        timeout=(timeout if timeout and timeout > 0 else None))
     if proc.returncode != 0:
-        return {"ok": False,
-                "error": f"claude 退出码 {proc.returncode}: "
-                         f"{proc.stderr.strip()[:300]}"}
-    data = extract_json(proc.stdout)
-    if data is None:
-        return {"ok": False, "error": "claude 输出中未找到 JSON 对象"}
+        # claude CLI 的登录/鉴权错误(如 Not logged in)只写 stdout,
+        # stderr 为空;两路都带上,避免日志里只剩"退出码 1:"无法定位。
+        detail = proc.stderr.strip() or proc.stdout.strip()
+        return False, f"claude 退出码 {proc.returncode}: {detail[:300]}"
+    return True, proc.stdout
+
+
+def _postprocess_and_validate(capability, payload, data):
+    """产出后处理(实体清洗/分镜规范化)+ 校验;返回 (data, error)。
+
+    初次生成与就地修复复检共用同一套逻辑,保证两条路径口径一致。
+    """
     if (capability == "script" and isinstance(data, dict)
             and isinstance(data.get("scenes"), list)):
         sanitize_script_entities(data)
+    if capability == "storyboard" and isinstance(data, dict):
+        # The script registry is authoritative. The storyboard model may assign
+        # frame-local states and refine a scene boundary to one exact shot in
+        # that same scene, but it may not rename, delete, duplicate or move a
+        # tracked prop lifecycle into another scene.
+        source_script = json.loads(json.dumps(
+            payload.get("script") or {}, ensure_ascii=False))
+        normalize_prop_contract(source_script)
+        scene_events = {
+            str(scene.get("scene_no")): str(
+                scene.get("event_id") or f"scene:{scene.get('scene_no')}")
+            for scene in source_script.get("scenes") or []
+            if isinstance(scene, dict) and scene.get("scene_no") is not None
+        }
+        for shot in data.get("shots") or []:
+            if not isinstance(shot, dict):
+                continue
+            scene_no = str(shot.get("scene_no"))
+            shot["scene_event_id"] = scene_events.get(
+                scene_no, f"scene:{scene_no}")
+        shot_event_scenes = {
+            str(shot.get("event_id")): str(shot.get("scene_event_id"))
+            for shot in data.get("shots") or []
+            if isinstance(shot, dict) and shot.get("event_id")
+            and shot.get("scene_event_id")
+        }
+        proposed_registry = {
+            str(item.get("prop_id")): item
+            for item in data.get("prop_registry") or []
+            if isinstance(item, dict) and item.get("prop_id")
+        }
+        refined_registry = []
+        for source_prop in source_script["prop_registry"]:
+            item = json.loads(json.dumps(
+                source_prop, ensure_ascii=False))
+            proposed = proposed_registry.get(str(item.get("prop_id"))) or {}
+            for field, alias in (
+                    ("availability_start_event", "introduced_at"),
+                    ("availability_end_event", "retired_at")):
+                source_ref = item.get(field) or item.get(alias)
+                proposed_ref = proposed.get(field) or proposed.get(alias)
+                if not (isinstance(source_ref, dict)
+                        and isinstance(proposed_ref, dict)):
+                    continue
+                source_event = str(
+                    source_ref.get("event_id") or "").strip()
+                proposed_event = str(
+                    proposed_ref.get("event_id") or "").strip()
+                # An exact shot refinement is valid only inside the source
+                # scene boundary. episode-start/end remain immutable.
+                if (source_event not in {"episode-start", "episode-end"}
+                        and shot_event_scenes.get(proposed_event)
+                        == source_event):
+                    item[field] = json.loads(json.dumps(
+                        proposed_ref, ensure_ascii=False))
+                    item[alias] = json.loads(json.dumps(
+                        proposed_ref, ensure_ascii=False))
+            refined_registry.append(item)
+        data["prop_contract_schema"] = PROP_CONTRACT_SCHEMA
+        data["prop_registry"] = refined_registry
     if capability == "image_qc":
         error = validate_image_qc(data)
     elif capability == "image_select":
         from aifos.auto_select import validate_image_select
         error = validate_image_select(data)
+    elif capability == "script" and payload.get("prompt_refine"):
+        error = validate_prompt_refine(data)
     elif capability == "script" and payload.get("story_analysis"):
-        error = validate_story_analysis(data)
+        error = validate_story_analysis(
+            data, require_resolved_identity=False)
     elif capability == "script":
         error = validate_script(data, payload)
     else:
         error = validate_storyboard(data)
+    return data, error
+
+
+# 就地修复调用的耗时上限:只改几个字段,不该给整份重新生成的预算。
+REPAIR_TIMEOUT_CAP = 900
+
+
+def _repair_with_engine(engine, binary, capability, payload, data, error,
+                        timeout, codex_home="", stall_timeout=0):
+    """校验失败时的就地修复复检:同一引擎只修错误字段,不丢弃产出。
+
+    原则:内容性校验失败(枚举/字段不合规)就地修,只有超时、连不上
+    等系统性故障才交给路由换下一路。返回 (修复后的 data 或 None, 备注)。
+    """
+    try:
+        source = json.dumps(data, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None, "(产出不可序列化,跳过就地修复)"
+    prompt = (
+        "你刚为漫剧平台生成了一份 JSON 产出,机器校验发现以下问题:\n"
+        f"{error}\n\n"
+        "只修复校验指出的字段,其余内容一字不动;修复后输出完整 JSON,"
+        "不要任何解释或 Markdown 代码块。\n原 JSON:\n" + source)
+    # timeout=0(不设上限)时修复调用仍用自身上限兜底
+    repair_timeout = (min(int(timeout), REPAIR_TIMEOUT_CAP)
+                      if timeout and timeout > 0 else REPAIR_TIMEOUT_CAP)
+    try:
+        ok, text = _invoke_engine(engine, binary, prompt, repair_timeout,
+                                  codex_home=codex_home,
+                                  stall_timeout=stall_timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"(就地修复调用失败: {exc})"
+    if not ok:
+        return None, f"(就地修复失败: {str(text)[:200]})"
+    fixed = extract_json(text)
+    if fixed is None:
+        return None, "(就地修复输出中未找到 JSON)"
+    fixed, fixed_error = _postprocess_and_validate(capability, payload, fixed)
+    if fixed_error:
+        return None, f"(就地修复复检仍未通过: {str(fixed_error)[:300]})"
+    return fixed, ""
+
+
+def run(request, claude, timeout, engine="claude", codex="codex",
+        codex_home="", stall_timeout=0):
+    capability = request["capability"]
+    payload = request.get("payload", {})
+    binary = codex if engine == "codex" else claude
+    if shutil.which(binary) is None and not Path(binary).exists():
+        return {"ok": False, "error": f"{engine} 命令不存在: {binary}"}
+    try:
+        prompt = build_prompt(capability, payload)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
+        ok, text = _invoke_engine(engine, binary, prompt, timeout,
+                                  codex_home=codex_home,
+                                  stall_timeout=stall_timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": f"{engine} 调用失败: {exc}"}
+    if not ok:
+        return {"ok": False, "error": text}
+    data = extract_json(text)
+    if data is None:
+        return {"ok": False, "error": f"{engine} 输出中未找到 JSON 对象"}
+    data, error = _postprocess_and_validate(capability, payload, data)
     if error:
-        return {"ok": False, "error": f"claude 输出校验失败: {error}"}
+        # 产出已在手,只是字段不合规——丢弃整份重来是对已消耗时间的
+        # 浪费;先让同一引擎局部修复并复检,复检仍不过才交回路由换路。
+        fixed, note = _repair_with_engine(
+            engine, binary, capability, payload, data, error, timeout,
+            codex_home=codex_home, stall_timeout=stall_timeout)
+        if fixed is not None:
+            return {"ok": True, "data": fixed, "uri": "",
+                    "repaired_fields": True}
+        return {"ok": False,
+                "error": f"{engine} 输出校验失败: {error}{note}"}
     return {"ok": True, "data": data, "uri": ""}
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="AIFOS Claude 编剧适配桥")
+    parser = argparse.ArgumentParser(description="AIFOS Claude/Codex 编剧适配桥")
     parser.add_argument("--claude", default="claude",
                         help="claude 可执行文件路径")
-    parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--engine", choices=("claude", "codex"),
+                        default="claude",
+                        help="编剧引擎;codex 供 Claude CLI 不可用时兜底")
+    parser.add_argument("--codex", default="codex",
+                        help="codex 可执行文件路径(--engine codex 时用)")
+    parser.add_argument("--codex-home", default="",
+                        help="codex 登录态目录(CODEX_HOME),"
+                             "编剧走独立账号通道时指定")
+    parser.add_argument("--timeout", type=int, default=600,
+                        help="单次调用总时长上限;0=不设上限(配合停滞检测)")
+    parser.add_argument("--stall-timeout", type=int, default=0,
+                        help="连续无输出判定卡住的秒数;0=关闭活性检测")
     args = parser.parse_args(argv)
     try:
         request = json.loads(sys.stdin.read())
-        reply = run(request, args.claude, args.timeout)
+        reply = run(request, args.claude, args.timeout,
+                    engine=args.engine, codex=args.codex,
+                    codex_home=args.codex_home,
+                    stall_timeout=args.stall_timeout)
     except Exception as exc:
         reply = {"ok": False, "error": str(exc)}
     print(json.dumps(reply, ensure_ascii=False))

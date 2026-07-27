@@ -255,3 +255,17 @@ def test_cli_script_file(tmp_path, capsys):
     bad.write_text("没有台词", encoding="utf-8")
     assert main(["--workspace", ws, "produce", "--title", "万妖图录",
                  "--episode", "21", "--script-file", str(bad)]) == 2
+
+
+def test_pure_narration_raises_no_dialogue_error():
+    """纯叙述梗概(无一句对白)→ NoDialogueError,供上层自动转 AI 编剧。"""
+    from aifos.script_import import NoDialogueError, ScriptImportError, parse_any
+    synopsis = (
+        "洪武二十四年，二十四岁的穿越者林川进京谋生，途中撞见黑衣人"
+        "杀死一名书童。他正想逃走，却被人从身后打晕。醒来时，林川发现"
+        "自己换上了举人青袍，手里还多了一份任命江浦县主簿的吏部札付。"
+        "远处马蹄声骤然逼近，官差已经赶到。")
+    with pytest.raises(NoDialogueError):
+        parse_any(synopsis, "冒名入仕", 1)
+    # NoDialogueError 必须是 ScriptImportError 子类:旧调用方行为不变
+    assert issubclass(NoDialogueError, ScriptImportError)

@@ -30,13 +30,51 @@ if "分镜师" in prompt:
          "prompt": "p2"}]}
 else:
     data = {"episode_title": "妖王之章", "logline": "一句话",
-            "characters": [{"name": "甲", "role": "主角"}],
+            "characters": [{"name": "甲", "role": "主角", "gender": "男",
+                            "age_range": "25-30"}],
             "scenes": [{"scene_no": 1, "location": "古镇",
                         "characters": ["甲"], "action": "走",
                         "lines": [{"character": "甲", "dialogue": "你好"}]}]}
 print("好的,以下是结果:")
 print(json.dumps(data, ensure_ascii=False))
 print("(完)")
+'''
+
+# 假 codex:校验编剧引擎参数(exec/只读沙箱/最终答复文件),
+# stdout 只有进度杂讯,JSON 落在 --output-last-message 文件里
+FAKE_CODEX = '''#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+assert args[0] == "exec", args
+assert args[args.index("--sandbox") + 1] == "read-only", args
+assert "--skip-git-repo-check" in args, args
+out = args[args.index("--output-last-message") + 1]
+prompt = args[-1]
+import os, pathlib
+probe = pathlib.Path(sys.argv[0]).parent / "codex_home_probe.txt"
+probe.write_text(os.environ.get("CODEX_HOME", ""), encoding="utf-8")
+if "分镜师" in prompt:
+    data = {"episode_title": "T", "shots": [
+        {"shot_no": 1, "scene_no": 1, "kind": "environment",
+         "description": "d", "camera": "远景", "duration": 2.5,
+         "characters": ["甲"], "dialogue": None, "prompt": "p1"}]}
+else:
+    data = {"episode_title": "妖王之章", "logline": "一句话",
+            "characters": [{"name": "甲", "role": "主角", "gender": "男",
+                            "age_range": "25-30"}],
+            "scenes": [{"scene_no": 1, "location": "古镇",
+                        "characters": ["甲"], "action": "走",
+                        "lines": [{"character": "甲", "dialogue": "你好"}]}]}
+print("[progress] thinking {not-json}")
+with open(out, "w", encoding="utf-8") as f:
+    f.write(json.dumps(data, ensure_ascii=False))
+'''
+
+# 假 codex(故障):模拟账号限流/断流,错误只写 stdout
+FAKE_CODEX_DOWN = '''#!/usr/bin/env python3
+import sys
+print("stream error: exhausted retries")
+sys.exit(1)
 '''
 
 # 假 say:解析 -o 输出路径,写合法 WAV(1 秒静音)
@@ -96,6 +134,58 @@ def test_claude_missing_binary(tmp_path):
         "capability": "script", "payload": {},
         "out_dir": str(tmp_path)}, ["--claude", "/missing/claude"])
     assert not reply["ok"]
+
+
+# ---- Codex 编剧引擎(同一桥,--engine codex) ----
+def test_codex_writer_script_generation(tmp_path):
+    codex = _make_bin(tmp_path, "codex", FAKE_CODEX)
+    reply = _bridge("aifos.adapters.claude_script", {
+        "capability": "script",
+        "payload": {"project_title": "万妖图录", "episode_number": 15,
+                    "premise": "", "style": ""},
+        "out_dir": str(tmp_path / "out")},
+        ["--engine", "codex", "--codex", str(codex)])
+    assert reply["ok"], reply
+    assert reply["data"]["scenes"]
+    assert reply["data"]["project_title"] == "万妖图录"
+
+
+def test_codex_writer_failure_reports_stdout(tmp_path):
+    codex = _make_bin(tmp_path, "codex", FAKE_CODEX_DOWN)
+    reply = _bridge("aifos.adapters.claude_script", {
+        "capability": "script", "payload": {},
+        "out_dir": str(tmp_path)},
+        ["--engine", "codex", "--codex", str(codex)])
+    assert not reply["ok"]
+    assert "codex 编剧退出码 1" in reply["error"]
+    assert "exhausted retries" in reply["error"]
+
+
+def test_codex_writer_uses_dedicated_codex_home(tmp_path):
+    codex = _make_bin(tmp_path, "codex", FAKE_CODEX)
+    home_b = tmp_path / "codex-home-b"
+    home_b.mkdir()
+    reply = _bridge("aifos.adapters.claude_script", {
+        "capability": "script",
+        "payload": {"project_title": "万妖图录", "episode_number": 15,
+                    "premise": "", "style": ""},
+        "out_dir": str(tmp_path / "out")},
+        ["--engine", "codex", "--codex", str(codex),
+         "--codex-home", str(home_b)])
+    assert reply["ok"], reply
+    probe = (codex.parent / "codex_home_probe.txt").read_text("utf-8")
+    assert probe == str(home_b.resolve())
+
+
+def test_codex_writer_missing_codex_home_fails_clearly(tmp_path):
+    codex = _make_bin(tmp_path, "codex", FAKE_CODEX)
+    reply = _bridge("aifos.adapters.claude_script", {
+        "capability": "script", "payload": {},
+        "out_dir": str(tmp_path)},
+        ["--engine", "codex", "--codex", str(codex),
+         "--codex-home", str(tmp_path / "no-such-home")])
+    assert not reply["ok"]
+    assert "CODEX_HOME 不存在" in reply["error"]
 
 
 def test_extract_json_tolerates_noise():
@@ -267,3 +357,171 @@ def test_say_absent_from_defaults():
     assert DEFAULTS["routing"]["voice"] == ["doubao_tts", "api", "mock"]
     assert DEFAULTS["providers"]["jimeng"]["audio_in_video"] is True
     assert DEFAULTS["providers"]["ark"]["audio_in_video"] is True
+
+
+# 假 codex(两遍):首遍剧本带无法本地归一的 phase="midway";
+# 修复调用(提示词含"机器校验发现")返回改正后的完整 JSON
+FAKE_CODEX_REPAIR = '''#!/usr/bin/env python3
+import json, pathlib, sys
+args = sys.argv[1:]
+out = args[args.index("--output-last-message") + 1]
+prompt = args[-1]
+counter = pathlib.Path(sys.argv[0]).parent / "invocations.txt"
+count = int(counter.read_text()) if counter.exists() else 0
+counter.write_text(str(count + 1))
+registry_phase = "midway"
+if "机器校验发现" in prompt:
+    registry_phase = "start"
+data = {"episode_title": "妖王之章", "logline": "一句话",
+        "characters": [{"name": "甲", "role": "主角", "gender": "男",
+                        "age_range": "25-30"}],
+        "scenes": [{"scene_no": 1, "location": "古镇",
+                    "characters": ["甲"], "action": "走",
+                    "lines": [{"character": "甲", "dialogue": "你好"}]}],
+        "prop_registry": [{
+            "prop_id": "prop-letter", "name": "血书", "kind": "core",
+            "instance_count": 1,
+            "availability_start_event": {"event_id": "episode-start",
+                                          "phase": registry_phase},
+            "disclosure_policy": "explicit_frame_only"}]}
+with open(out, "w", encoding="utf-8") as f:
+    f.write(json.dumps(data, ensure_ascii=False))
+'''
+
+
+def test_codex_writer_repairs_invalid_enum_in_place(tmp_path):
+    """内容性校验失败 → 同引擎就地修复复检,不丢弃整份剧本换产线。"""
+    codex = _make_bin(tmp_path, "codex", FAKE_CODEX_REPAIR)
+    reply = _bridge("aifos.adapters.claude_script", {
+        "capability": "script",
+        "payload": {"project_title": "万妖图录", "episode_number": 15,
+                    "premise": "", "style": ""},
+        "out_dir": str(tmp_path / "out")},
+        ["--engine", "codex", "--codex", str(codex)])
+    assert reply["ok"], reply
+    assert reply.get("repaired_fields") is True
+    phase = reply["data"]["prop_registry"][0][
+        "availability_start_event"]["phase"]
+    assert phase == "start"
+    # 恰好两次调用:初次生成 + 一次局部修复
+    assert (codex.parent / "invocations.txt").read_text() == "2"
+
+
+def test_codex_writer_alias_phase_needs_no_repair_call(tmp_path):
+    """可本地归一的 phase 别名(开场→start)零成本通过,不触发修复调用。"""
+    content = FAKE_CODEX_REPAIR.replace('"midway"', '"开场"')
+    codex = _make_bin(tmp_path, "codex", content)
+    reply = _bridge("aifos.adapters.claude_script", {
+        "capability": "script",
+        "payload": {"project_title": "万妖图录", "episode_number": 15,
+                    "premise": "", "style": ""},
+        "out_dir": str(tmp_path / "out")},
+        ["--engine", "codex", "--codex", str(codex)])
+    assert reply["ok"], reply
+    assert not reply.get("repaired_fields")
+    assert (codex.parent / "invocations.txt").read_text() == "1"
+
+
+# 假 codex(卡住):打一行进度后彻底静默,模拟断流/挂起
+FAKE_CODEX_STALLED = '''#!/usr/bin/env python3
+import sys, time
+print("[progress] started", flush=True)
+time.sleep(30)
+'''
+
+# 假 codex(形象改写):校验 refine 提示词要素,返回改写 JSON
+FAKE_CODEX_REFINE = '''#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+out = args[args.index("--output-last-message") + 1]
+prompt = args[-1]
+assert "造型总监" in prompt, "缺少改写角色设定的提示词"
+assert "头发再长" in prompt, "用户意见未进入提示词"
+data = {"image_prompt": "国风少女,及腰黑长直,肤色白皙透亮,眼神清冷,"
+                         "月白色襦裙,银质流苏耳饰,骨相与年龄感保持原设定",
+        "changes": ["发型:齐肩短发改为及腰黑长直(落实\\"头发再长一点\\")",
+                    "肤色:自然肤色提亮为白皙透亮(落实\\"皮肤更白\\")"],
+        "conflict_notes": []}
+with open(out, "w", encoding="utf-8") as f:
+    f.write(json.dumps(data, ensure_ascii=False))
+'''
+
+
+def test_codex_writer_stall_watchdog_terminates(tmp_path):
+    """连续无输出超过 stall 阈值 → 判定卡住终止,明确报错不回退。"""
+    codex = _make_bin(tmp_path, "codex", FAKE_CODEX_STALLED)
+    import time as _time
+    started = _time.monotonic()
+    reply = _bridge("aifos.adapters.claude_script", {
+        "capability": "script", "payload": {},
+        "out_dir": str(tmp_path)},
+        ["--engine", "codex", "--codex", str(codex),
+         "--timeout", "0", "--stall-timeout", "2"])
+    elapsed = _time.monotonic() - started
+    assert not reply["ok"]
+    assert "卡住" in reply["error"]
+    assert "无输出且无 CPU 活动" in reply["error"]
+    assert elapsed < 20, f"看门狗未及时终止: {elapsed:.1f}s"
+
+
+def test_prompt_refine_capability_roundtrip(tmp_path):
+    """人物意见 → AI 改写形象提示词:要素齐全且通过校验。"""
+    codex = _make_bin(tmp_path, "codex", FAKE_CODEX_REFINE)
+    reply = _bridge("aifos.adapters.claude_script", {
+        "capability": "script",
+        "payload": {
+            "prompt_refine": True,
+            "character_name": "小狐",
+            "current_prompt": "国风少女,齐肩短发,自然肤色",
+            "character_context": {"introduction": "山中狐仙化形的少女",
+                                   "gender": "女", "age_range": "16-18"},
+            "style": "国风水墨",
+            "feedback": "头发再长一点,皮肤更白",
+        },
+        "out_dir": str(tmp_path / "out")},
+        ["--engine", "codex", "--codex", str(codex)])
+    assert reply["ok"], reply
+    assert "及腰" in reply["data"]["image_prompt"]
+    assert len(reply["data"]["changes"]) == 2
+
+
+def test_validate_prompt_refine_rules():
+    from aifos.adapters.claude_script import validate_prompt_refine
+    assert validate_prompt_refine({"image_prompt": "短"}) is not None
+    assert validate_prompt_refine(
+        {"image_prompt": "x" * 30, "changes": []}) is not None   # 必须说明改动
+    ok = {"image_prompt": "x" * 30, "changes": ["改了发型"]}
+    assert validate_prompt_refine(ok) is None
+    assert ok["conflict_notes"] == []   # 缺省字段被补齐
+
+
+FAKE_CODEX_SILENT_BUSY = '''#!/usr/bin/env python3
+import json, sys, time
+args = sys.argv[1:]
+out = args[args.index("--output-last-message") + 1]
+t0 = time.time()
+while time.time() - t0 < 8:        # 8 秒纯计算,零输出(模拟长思考)
+    sum(i * i for i in range(20000))
+data = {"episode_title": "妖王之章", "logline": "一句话",
+        "characters": [{"name": "甲", "role": "主角", "gender": "男",
+                        "age_range": "25-30"}],
+        "scenes": [{"scene_no": 1, "location": "古镇",
+                    "characters": ["甲"], "action": "走",
+                    "lines": [{"character": "甲", "dialogue": "你好"}]}]}
+with open(out, "w", encoding="utf-8") as f:
+    f.write(json.dumps(data, ensure_ascii=False))
+'''
+
+
+def test_stall_watchdog_does_not_kill_silent_but_working_codex(tmp_path):
+    """codex 长思考期几乎零输出;只要 CPU 在推进就必须判定存活。"""
+    codex = _make_bin(tmp_path, "codex", FAKE_CODEX_SILENT_BUSY)
+    reply = _bridge("aifos.adapters.claude_script", {
+        "capability": "script",
+        "payload": {"project_title": "万妖图录", "episode_number": 15,
+                    "premise": "", "style": ""},
+        "out_dir": str(tmp_path / "out")},
+        ["--engine", "codex", "--codex", str(codex),
+         "--timeout", "0", "--stall-timeout", "4"])
+    assert reply["ok"], reply      # 静默 8s > 阈值 4s,但 CPU 在跑
+    assert reply["data"]["scenes"]

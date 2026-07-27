@@ -595,6 +595,12 @@ def _cmd_stats(app):
                 print(f"{name} 实时余额: {provider.credit()}")
             except Exception as exc:
                 print(f"{name} 余额查询失败: {exc}")
+    from .channel_stats import format_table, summarize
+    print("== Codex 通道出图速度(近 24 小时,image/frames/cover)==")
+    print(format_table(summarize(app.workspace.logs_dir)))
+    from .qc_stats import format_qc_table, summarize_qc
+    print("== 质检失败原因分类(近 7 天)==")
+    print(format_qc_table(summarize_qc(app.workspace.logs_dir)))
     return 0
 
 

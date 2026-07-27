@@ -200,6 +200,15 @@ const STATUS_CN = {
   videos: "视频中", voices: "声音/口型", edit: "剪辑中",
   qc: "质检中", package: "包装中", archive: "沉淀中", running: "制作中",
 };
+// 可从断点续跑的状态:失败、质检未过、被暂停/中断,以及只建了壳
+// 或卡在中途阶段的剧集。produce(force=false) 会复用已完成部分。
+const RESUMABLE_STATUS = [
+  "failed", "qc_failed", "paused", "created", "queued_script",
+  "script", "continuity", "cast", "storyboard", "images",
+  "text_assets", "frames", "preflight", "videos", "voices",
+  "edit", "qc", "package", "archive",
+];
+
 const RUN_STATUS_CN = {
   running: "运行中", cancelling: "暂停中", completed: "完成",
   paused: "阶段暂停", failed: "失败", stopped: "已停止",
@@ -233,6 +242,8 @@ function route() {
   }
   const standards = location.hash.match(/^#\/standards(?:\/([a-z_]+))?$/);
   const history = location.hash.match(/^#\/history(?:\/(\d+))?$/);
+  const promptReview = location.hash.match(
+    /^#\/episode\/(\d+)\/prompts$/);
   const m = location.hash.match(/^#\/episode\/(\d+)$/);
   const cast = location.hash.match(/^#\/cast\/(\d+)$/);
   const settings = location.hash === "#/settings";
@@ -247,6 +258,7 @@ function route() {
   });
   if (standards) renderStandards(standards[1] || "production");
   else if (history) renderHistory(history[1] ? Number(history[1]) : null);
+  else if (promptReview) renderPromptReviewPage(Number(promptReview[1]));
   else if (m) renderCanvasView(Number(m[1]));
   else if (cast) renderCanvasView(Number(cast[1]), { view: "cast" });
   else if (settings) renderSettings();
@@ -1014,10 +1026,10 @@ function episodesPanelHtml(data) {
           <td>${chip(e.status)}</td>
           <td class="num">${e.qc_score == null ? "-" : fmt(e.qc_score, 0)}</td>
           <td class="num">${fmt(e.cost)}</td>
-          <td>${["failed", "qc_failed"].includes(e.status) && !running
+          <td>${RESUMABLE_STATUS.includes(e.status) && !running
             ? `<button class="primary episode-resume" data-episode-id="${e.id}"
                 data-title="${esc(e.project)}" data-number="${e.number}"
-                title="从上次失败的断点接着做,已完成部分全部保留">▶ 继续</button> ` : ""}
+                title="从断点接着做(失败、暂停、中断或未开工都可以),已完成部分全部保留">▶ 继续</button> ` : ""}
           ${["failed", "qc_failed"].includes(e.status) && !running
             ? `<button class="danger episode-rebuild-all" data-episode-id="${e.id}"
                 data-title="${esc(e.project)}" data-number="${e.number}"
@@ -2489,6 +2501,109 @@ async function pollJob(jobId, onDone, onProgress) {
   if (!finished) timer = setInterval(tick, 1200);
 }
 
+/* 剧本重写:任何阶段都能提意见重写(无剧本时=带意见重新创作) */
+async function rewriteScriptWithFeedback(data, episodeId) {
+  const hasScript = !!data.script;
+  const feedback = (window.prompt(hasScript
+    ? "对剧本的修改意见(AI 会按意见重写并重跑预生产,写好后停下等你确认)\n例:第2场冲突不够、把凶手改成管家、台词更口语"
+    : "本集还没有成形剧本。写下你的创作要求,AI 会据此重新创作剧本\n例:悬疑基调、5场戏、结尾反转") || "").trim();
+  if (!feedback) return;
+  try {
+    await api("/api/revise", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ episode_id: data.episode.id, feedback }),
+    });
+    showToast("已提交:AI 正在按意见重写剧本,写好后会停在待确认", "ok");
+    pollCanvas(episodeId);
+  } catch (e) {
+    showToast(e.message, "error");
+  }
+}
+
+/* 人物形象意见改写:AI 深度理解意见 → 改写提示词 → 用户确认 → 重生成候选 */
+async function refineCharacterPrompt(button, data, episodeId) {
+  const character = button.dataset.character;
+  const feedback = (window.prompt(
+    `对「${character}」形象的修改意见,AI 会深度理解并改写形象提示词\n(例:头发再长一点、皮肤更白皙、眼神更冷)`) || "").trim();
+  if (!feedback) return;
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = "AI 理解意见中…";
+  try {
+    const reply = await api("/api/character/refine-prompt", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ episode_id: data.episode.id, character, feedback }),
+    });
+    pollJob(reply.job_id, (job) => {
+      button.disabled = false;
+      button.textContent = original;
+      const summary = job.summary || {};
+      if (job.status !== "done" || !summary.image_prompt) {
+        if (job.status === "done") showToast("AI 未返回可用的改写结果", "error");
+        return;   // failed 的错误 toast 由 pollJob 统一弹出
+      }
+      showRefinePromptOverlay(episodeId, data, character, feedback, summary);
+    });
+  } catch (e) {
+    showToast(e.message, "error");
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+function showRefinePromptOverlay(episodeId, data, character, feedback, summary) {
+  const overlay = document.createElement("div");
+  overlay.className = "script-overlay";
+  const changes = (summary.changes || []).map((c) => `<li>${esc(c)}</li>`).join("");
+  const conflicts = (summary.conflict_notes || []).map((c) => `<li>${esc(c)}</li>`).join("");
+  overlay.innerHTML = `
+    <div class="script-panel">
+      <div class="script-head">
+        <h3>「${esc(character)}」形象改写确认</h3>
+        <button class="close">关闭 Esc</button>
+      </div>
+      <div class="script-scroll" style="padding:12px 16px">
+        <p class="dim">你的意见:${esc(feedback)}</p>
+        ${changes ? `<p><b>AI 落实的改动</b></p><ul>${changes}</ul>` : ""}
+        ${conflicts ? `<p><b>⚠ 与设定冲突的处理</b></p><ul>${conflicts}</ul>` : ""}
+        <p><b>改写后的形象提示词(可再手工微调后确认)</b></p>
+        <textarea class="refine-prompt-edit" rows="12"
+          style="width:100%;box-sizing:border-box">${esc(summary.image_prompt)}</textarea>
+      </div>
+      <div class="revise-bar">
+        <div class="revise-actions">
+          <button class="primary refine-apply">✓ 确认并重生成4张候选</button>
+          <button class="refine-cancel">取消</button>
+        </div>
+      </div>
+    </div>`;
+  const close = () => overlay.remove();
+  overlay.querySelector(".close").onclick = close;
+  overlay.querySelector(".refine-cancel").onclick = close;
+  overlay.addEventListener("click", (ev) => { if (ev.target === overlay) close(); });
+  overlay.querySelector(".refine-apply").onclick = async (ev) => {
+    const prompt = overlay.querySelector(".refine-prompt-edit").value.trim();
+    if (prompt.length < 20) { showToast("提示词过短", "error"); return; }
+    ev.currentTarget.disabled = true;
+    ev.currentTarget.textContent = "提交中…";
+    try {
+      await api("/api/character/refine-prompt/apply", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ episode_id: data.episode.id, character,
+          image_prompt: prompt, feedback }),
+      });
+      close();
+      showToast(`「${character}」形象已更新并锁定,正在重生成4张候选`, "ok");
+      pollCanvas(episodeId);
+    } catch (e) {
+      showToast(e.message, "error");
+      ev.currentTarget.disabled = false;
+      ev.currentTarget.textContent = "✓ 确认并重生成4张候选";
+    }
+  };
+  document.body.appendChild(overlay);
+}
+
 /* 剧本阅读 + 打磨(意见重写 / 直接编辑) */
 function showScriptOverlay(data, episodeId) {
   const script = data.script;
@@ -3357,9 +3472,13 @@ function planQcReferenceGalleryHtml(item) {
 function planTraceBadges(item) {
   const revision = item.revision || {};
   const refs = item.reference_inputs || {};
+  const review = item.prompt_review || {};
   const semantic = planSemanticCorrections(item);
   const auto = String(revision.source || "").startsWith("batch_");
-  return `${auto && revision.prompt_modified
+  return `${review.approved
+    ? `<span class="plan-st st-auto" title="AIFOS提示词已由Codex审核并优化，优化稿才会进入图片模型">Codex审词✓</span>`
+    : ""}
+    ${auto && revision.prompt_modified
     ? `<span class="plan-st st-auto" title="批量重画已自动加入修正要求">自动改词✓</span>` : ""}
     ${semantic.length
       ? `<span class="plan-st st-auto" title="出图前已按当前镜头剧本事实纠正互斥状态">逻辑修正 ×${semantic.length}</span>`
@@ -3373,13 +3492,17 @@ function planTraceBadges(item) {
 function planTraceHtml(item) {
   const revision = item.revision || {};
   const refs = item.reference_inputs || {};
+  const review = item.prompt_review || {};
   const refItems = refs.items || [];
   const semantic = planSemanticCorrections(item);
   if (!revision.prompt_modified && !refItems.length && !refs.required
-      && !semantic.length) return "";
+      && !semantic.length && !review.approved) return "";
   return `<details class="plan-trace" ${item.status === "generating" ? "open" : ""}>
-    <summary>生成输入记录 · ${semantic.length ? `出图前逻辑修正 ${semantic.length} 项` : (revision.prompt_modified ? "提示词已自动修正" : "提示词未改")}
+    <summary>生成输入记录 · ${review.approved ? "Codex审词通过" : (semantic.length ? `出图前逻辑修正 ${semantic.length} 项` : (revision.prompt_modified ? "提示词已自动修正" : "提示词未改"))}
       · ${refItems.length ? `已附 ${refItems.length} 张参考图` : (refs.required ? "缺少必需参考图" : "无需参考图")}</summary>
+    ${review.approved ? `<div><b>Codex提示词审核：</b>已批准并使用优化稿
+      ${(review.issues_found || []).length ? `；发现：${esc(review.issues_found.join("；"))}` : ""}
+      ${(review.changes_made || []).length ? `；修改：${esc(review.changes_made.join("；"))}` : ""}</div>` : ""}
     ${semantic.length ? `<div><b>出图前剧本/逻辑纠正：</b><ul>${semantic.map((entry) =>
       `<li>${entry.character ? `${esc(entry.character)} · ` : ""}${esc(entry.field || "镜头事实")}：
       ${entry.from ? `原「${esc(entry.from)}」 → ` : ""}改为「${esc(entry.to || "按当前镜头事实执行")}」
@@ -7202,7 +7325,7 @@ function renderProgressBanner(data) {
     </div>`).join("") + awaitingCast.map((e) => `
     <div class="progress-card confirm">
       <div class="progress-text">《${esc(e.project)}》第${e.number}集 人物/核心道具候选已就绪 👤
-        <span>所有正式角色统一4张候选（主角、重要配角和普通配角都认真挑选；跑龙套/背景路人不做独立设定，也不生成候选图或立绘）；全部定版后才生成后续图片</span></div>
+        <span>所有正式角色统一4张候选；每名角色用同一份首次登场基础定妆提示词随机生成，不展示后续换装、淋湿或伤情；跑龙套/背景路人不做独立设定；全部定版后才生成后续图片</span></div>
       <button class="primary" onclick="location.hash='#/episode/${e.id}'">去选人物/道具 →</button>
     </div>`).join("") + awaiting.map((e) => `
     <div class="progress-card confirm">
@@ -7435,10 +7558,11 @@ const CANVAS_SHOTS_TOP = 2240;
 
 function castLookHtml(candidate) {
   const look = candidate.look_variant;
-  const valid = candidate.variant_source !== "legacy"
+  const valid = candidate.current_candidate_policy !== false
+    && candidate.variant_source !== "legacy"
     && candidate.variant_label && look && typeof look === "object";
   if (!valid) return `<div class="cast-look legacy">
-    <b>历史候选</b><span>未记录候选差异轴；建议按本剧唯一画风规则重新生成后再比较。</span>
+    <b>旧规则候选</b><span>这张图可能含不同剧情阶段造型，已退出当前四选一；续跑后会生成同一初始提示词的新候选。</span>
   </div>`;
   const rows = [
     ["服装", look.costume], ["发型", look.hair],
@@ -7516,7 +7640,7 @@ function renderCastSelection(data, episodeId) {
       ? "已选择简化版：人工豁免三视图门禁，不生成独立正侧背和细节图"
       : "已选择完整版：生成视觉DNA、三视图审核板及独立高清正侧背母资产");
   const policy = selection.candidate_policy
-    || "主角、重要配角和普通配角统一4张候选；跑龙套/背景路人不做独立设定、不生成候选图或立绘";
+    || "每名正式角色统一4张候选；四张复用同一份首次登场基础定妆提示词，只靠模型随机采样";
   app.innerHTML = `<div class="canvas-view cast-select-view">
     <div class="confirm-banner">
       <div><b>每组画面4张候选，CODEX 评选自动确认1张 🤖</b>
@@ -7524,7 +7648,9 @@ function renderCastSelection(data, episodeId) {
         ${esc(policy)}；${esc(selection.prop_candidate_policy || "核心道具统一4张候选并定版")}；${esc(selection.scene_candidate_policy || "每个场景统一4张空镜候选并定版")}。
         有参考图时人物脸和发型是最高标准，职业角色必须穿工作服；人物候选统一使用纯背景，不得出现文字或场景。
         每名正式角色先从剧情推导视觉DNA并与全剧角色去重，再统一生成4张同一画风下的候选图；
-        所有候选继承本剧唯一画风，不提供多个画风选项，只比较人物身份、表情、轻微姿态和剧情造型细节。
+        同一人物4张图复用同一份经过Codex审核优化的初始状态最终提示词，只靠图片模型随机采样比较人物形象；
+        所有候选继承本剧唯一画风，不提供多个画风选项；
+        不得换装、换妆、换动作，也不得带入官服、淋湿、泥污、受伤、死亡等后续剧情状态。
         定版后完整版会生成面部、正面、严格90°侧面和完整180°背面独立母资产；
         16:9三视图拼板只用于审核，不作为正式镜头参考。
         后续关键帧、首尾帧和其他图片 API 都会真实携带这张参考图，
@@ -7560,13 +7686,15 @@ function renderCastSelection(data, episodeId) {
         <div class="cast-choice-head"><div><h2>${esc(character.character)}</h2>
           <span class="dim">${esc(character.role || "角色")} · ${character.candidate_count || 0}/${character.candidate_target || selection.candidate_target || 4} 张候选</span></div>
           <button type="button" class="cast-regenerate-one" data-character="${esc(character.character)}">↻ 不满意，换4张</button>
+          <button type="button" class="cast-refine-one" data-character="${esc(character.character)}">✎ 提意见改形象</button>
           <strong class="${character.candidate_target === 0 ? "cast-locked" : (character.locked ? "cast-locked" : "cast-unlocked")}">
             ${character.candidate_target === 0 ? "无需单独立绘" : (character.locked ? "✓ 已锁定最终立绘" : "请选择1张")}</strong></div>
         ${autoSelectBadge(character)}
         ${castVisualDnaHtml(character)}
-        <div class="cast-candidate-grid" role="list" aria-label="${esc(character.character)}的造型候选">${(character.candidates || []).map((candidate) => {
-          const variant = candidate.variant_source === "legacy" || !candidate.variant_label
-            ? "历史候选" : candidate.variant_label;
+        <div class="cast-candidate-grid" role="list" aria-label="${esc(character.character)}的初始人物候选">${(character.candidates || []).map((candidate) => {
+          const outdated = candidate.current_candidate_policy === false
+            || candidate.variant_source === "legacy" || !candidate.variant_label;
+          const variant = outdated ? "旧规则候选" : candidate.variant_label;
           const title = `${character.character} · 候选${candidate.index} · ${variant}`;
           return `<article class="cast-candidate${candidate.selected ? " selected" : ""}" role="listitem">
             <button type="button" class="cast-image" data-full="${esc(candidate.url || "")}" data-title="${esc(title)}" aria-label="查看${esc(title)}大图">
@@ -7577,8 +7705,8 @@ function renderCastSelection(data, episodeId) {
               ${castLookHtml(candidate)}
               <button type="button" class="${candidate.selected ? "selected" : "primary"} cast-pick"
                 data-character="${esc(character.character)}" data-index="${candidate.index}"
-                aria-pressed="${candidate.selected ? "true" : "false"}" ${candidate.selected ? "disabled" : ""}>
-                ${candidate.selected ? "✓ 当前最终立绘" : "选定这套造型"}</button></div>
+                aria-pressed="${candidate.selected ? "true" : "false"}" ${(candidate.selected || outdated) ? "disabled" : ""}>
+                ${candidate.selected ? "✓ 当前最终立绘" : (outdated ? "等待新规则候选" : "选定这张")}</button></div>
           </article>`;
         }).join("")}</div>
       </section>`).join("")}</div>
@@ -7747,6 +7875,9 @@ function renderCastSelection(data, episodeId) {
       button.textContent = "↻ 不满意，换4张";
     }
   };
+  app.querySelectorAll(".cast-refine-one").forEach((button) => {
+    button.onclick = () => refineCharacterPrompt(button, data, episodeId);
+  });
   app.querySelectorAll(".cast-regenerate-one").forEach((button) => {
     button.onclick = (event) => armConfirm(
       event.currentTarget, "保留旧版并生成新4张", () => regenerateOne(
@@ -8205,6 +8336,241 @@ function bindEpisodeWorkspaceNav(root, data, episodeId, setView) {
   });
 }
 
+function promptReviewStatusBadge(status, label = "") {
+  const value = ["PASS", "WARN", "BLOCK"].includes(status) ? status : "BLOCK";
+  const text = label || ({ PASS: "通过", WARN: "警告", BLOCK: "阻断" }[value]);
+  const icon = { PASS: "✓", WARN: "!", BLOCK: "×" }[value];
+  return `<span class="prompt-status ${value.toLowerCase()}">${icon} ${esc(text)}</span>`;
+}
+
+function promptVariantHtml(shot, variant, index) {
+  const target = variant.frame_target || {};
+  const actual = variant.actual_generation;
+  const actualDifferent = actual && String(actual.prompt || "").trim()
+    !== String(variant.prompt || "").trim();
+  const defaultOpen = variant.kind === "keyframe" || variant.status === "BLOCK";
+  const targetText = target.phase
+    ? `${target.phase} · ${target.source || "显式登记"}`
+    : variant.media === "video" ? "完整时间线" : "未形成合法定格";
+  return `<details class="prompt-variant ${esc(variant.status.toLowerCase())}"
+      data-kind="${esc(variant.kind)}" ${defaultOpen ? "open" : ""}>
+    <summary>
+      <span>${esc(variant.label)}</span>
+      ${promptReviewStatusBadge(variant.status)}
+      <small>${esc(targetText)}</small>
+    </summary>
+    <div class="prompt-variant-body">
+      ${(variant.issues || []).length ? `<div class="prompt-diagnostics block">
+        <b>必须先修正</b>
+        <ul>${variant.issues.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>
+      </div>` : ""}
+      ${(variant.warnings || []).length ? `<div class="prompt-diagnostics warn">
+        <b>建议处理</b>
+        <ul>${variant.warnings.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>
+      </div>` : ""}
+      <div class="prompt-code-head">
+        <div><b>标准化提示词</b><span>由 ${esc(
+          "aifos.shot-prompt/v2.2")} 当前事实重新编译</span></div>
+        <button type="button" data-copy-prompt="${index}">复制提示词</button>
+      </div>
+      <pre class="prompt-code" tabindex="0">${esc(
+        variant.prompt || "当前合同无法生成可用提示词，请先修正阻断项。")}</pre>
+      ${actualDifferent ? `<details class="prompt-actual">
+        <summary>查看已经发送过的生产提示词 · ${esc(actual.source || "")}</summary>
+        <div class="prompt-code-head">
+          <div><b>历史实际输入</b><span>${esc(
+            [actual.provider, actual.status, actual.reviewed ? "已审词" : ""]
+              .filter(Boolean).join(" · "))}</span></div>
+          <button type="button" data-copy-actual="${index}">复制历史输入</button>
+        </div>
+        <pre class="prompt-code historical" tabindex="0">${esc(actual.prompt)}</pre>
+      </details>` : ""}
+      <details class="prompt-contract-json">
+        <summary>结构化合同与参考图职责</summary>
+        <pre>${esc(JSON.stringify(variant.contract || {}, null, 2))}</pre>
+      </details>
+    </div>
+  </details>`;
+}
+
+async function renderPromptReviewPage(episodeId) {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  app.innerHTML = `<div class="loading">正在按最高规则编译全镜头提示词…</div>`;
+  let data;
+  try {
+    data = await api(`/api/episode/${episodeId}/prompts`);
+  } catch (error) {
+    app.innerHTML = `<div class="loading">提示词区加载失败：${esc(
+      error.message)}<br><a href="#/episode/${episodeId}">返回本集</a></div>`;
+    return;
+  }
+  watchBuild(data);
+  const summary = data.summary || {};
+  const counts = summary.shots || {};
+  topbarRight.innerHTML = promptReviewStatusBadge(
+    summary.status, summary.ready ? "提示词可生产" : "提示词未放行");
+  const promptIndex = [];
+  const cards = (data.shots || []).map((shot) => {
+    const startIndex = promptIndex.length;
+    (shot.variants || []).forEach((variant) => {
+      promptIndex.push({ shot, variant });
+    });
+    const searchText = [
+      shot.shot_no, shot.scene_no, shot.location,
+      ...(shot.characters || []), shot.description, shot.script_reference,
+      ...(shot.issues || []), ...(shot.warnings || []),
+    ].join(" ").toLowerCase();
+    return `<article class="prompt-shot-card ${esc(shot.status.toLowerCase())}"
+        id="prompt-shot-${Number(shot.shot_no)}"
+        data-status="${esc(shot.status)}"
+        data-search="${esc(searchText)}">
+      <header class="prompt-shot-head">
+        <div class="prompt-shot-number"><span>镜头</span><b>${esc(shot.shot_no)}</b></div>
+        <div class="prompt-shot-title">
+          <h2>${esc(shot.location || `场景 ${shot.scene_no || "-"}`)}</h2>
+          <p>${esc((shot.characters || []).join("、") || "无人镜头")} ·
+            场 ${esc(shot.scene_no || "-")} · ${esc(shot.duration || "-")} 秒</p>
+        </div>
+        ${promptReviewStatusBadge(shot.status)}
+      </header>
+      <div class="prompt-shot-facts">
+        <div><b>剧本对应</b><span>${esc(
+          shot.script_reference || "未登记剧本对应原句")}</span></div>
+        <div><b>本镜动作</b><span>${esc(
+          shot.description || "未登记可见动作")}</span></div>
+      </div>
+      ${(shot.issues || []).length ? `<div class="prompt-shot-alert">
+        <b>本镜有 ${shot.issues.length} 个阻断事实</b>
+        <ul>${shot.issues.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>
+      </div>` : ""}
+      <div class="prompt-variant-list">
+        ${(shot.variants || []).map((variant, offset) =>
+          promptVariantHtml(shot, variant, startIndex + offset)).join("")}
+      </div>
+      <details class="prompt-source-facts">
+        <summary>查看人物结构化事实与原始分镜提示词</summary>
+        <div class="prompt-fact-grid">
+          <div><b>人物事实</b><pre>${esc(JSON.stringify(
+            shot.character_facts || {}, null, 2))}</pre></div>
+          <div><b>原始分镜提示词</b><pre>${esc(
+            shot.raw_storyboard_prompt || "未登记")}</pre></div>
+        </div>
+      </details>
+    </article>`;
+  }).join("");
+  const shotLinks = (data.shots || []).map((shot) =>
+    `<button type="button" data-jump-shot="${esc(shot.shot_no)}"
+      data-status="${esc(shot.status)}">
+      <span>镜头 ${esc(shot.shot_no)}</span>${promptReviewStatusBadge(shot.status)}
+    </button>`).join("");
+
+  app.innerHTML = `<div class="prompt-review-page">
+    <header class="prompt-review-hero">
+      <div class="prompt-review-title">
+        <button type="button" id="prompt-back">← 返回本集</button>
+        <div><span class="prompt-eyebrow">PROMPT CONTROL ROOM</span>
+          <h1>《${esc(data.project?.title || "")}》第${esc(
+            data.episode?.number)}集 · 提示词区</h1>
+          <p>逐镜检查关键帧、首帧、尾帧与 Seedance 2 视频提示词。页面与生产共用同一合同编译器。</p>
+        </div>
+      </div>
+      <div class="prompt-rule-priority">
+        <span>规则优先级</span><b>最高规则</b><small>${esc(data.contract_schema)}</small>
+      </div>
+    </header>
+    <section class="prompt-review-summary">
+      <div class="prompt-summary-main ${esc(String(summary.status || "BLOCK").toLowerCase())}">
+        ${promptReviewStatusBadge(summary.status)}
+        <div><b>${summary.ready ? "全部提示词已具备生产条件" : "存在阻断项，不应进入正式生产"}</b>
+          <span>${esc(data.rule_title || "")}</span></div>
+      </div>
+      <div class="prompt-summary-stat"><b>${esc(summary.shots_total || 0)}</b><span>镜头总数</span></div>
+      <div class="prompt-summary-stat pass"><b>${esc(counts.PASS || 0)}</b><span>已通过</span></div>
+      <div class="prompt-summary-stat warn"><b>${esc(counts.WARN || 0)}</b><span>有警告</span></div>
+      <div class="prompt-summary-stat block"><b>${esc(counts.BLOCK || 0)}</b><span>被阻断</span></div>
+    </section>
+    <details class="prompt-highest-rules">
+      <summary><b>查看最高规则清单</b><span>所有提示词必须同时满足 ${(data.rules || []).length} 条</span></summary>
+      <ol>${(data.rules || []).map((rule) => `<li>${esc(rule)}</li>`).join("")}</ol>
+    </details>
+    <div class="prompt-review-tools">
+      <label><span>查找镜头、人物或问题</span>
+        <input id="prompt-search" type="search" placeholder="例如：林川、年龄段、道具、镜头 8"></label>
+      <label><span>显示状态</span>
+        <select id="prompt-status-filter">
+          <option value="ALL">全部</option>
+          <option value="BLOCK">仅阻断</option>
+          <option value="WARN">仅警告</option>
+          <option value="PASS">仅通过</option>
+        </select></label>
+      <button type="button" id="prompt-copy-all" class="primary">复制本集全部标准提示词</button>
+    </div>
+    <div class="prompt-review-layout">
+      <aside class="prompt-shot-index">
+        <div><b>镜头目录</b><span id="prompt-visible-count">${esc(
+          summary.shots_total || 0)} / ${esc(summary.shots_total || 0)}</span></div>
+        <nav>${shotLinks || "<p>本集尚无分镜</p>"}</nav>
+      </aside>
+      <main class="prompt-shot-list">${cards || `<div class="prompt-empty">
+        <b>本集尚无可编译分镜</b><span>先完成并保存五维分镜，再进入提示词区。</span>
+      </div>`}</main>
+    </div>
+  </div>`;
+
+  document.getElementById("prompt-back").onclick = () => {
+    location.hash = `#/episode/${episodeId}`;
+  };
+  document.querySelectorAll("[data-jump-shot]").forEach((button) => {
+    button.onclick = () => document.getElementById(
+      `prompt-shot-${button.dataset.jumpShot}`)?.scrollIntoView({
+        behavior: "smooth", block: "start",
+      });
+  });
+  document.querySelectorAll("[data-copy-prompt]").forEach((button) => {
+    button.onclick = async () => {
+      const item = promptIndex[Number(button.dataset.copyPrompt)];
+      await copyText(item?.variant?.prompt || "");
+      showToast(`镜头 ${item?.shot?.shot_no} · ${item?.variant?.label} 已复制`, "ok");
+    };
+  });
+  document.querySelectorAll("[data-copy-actual]").forEach((button) => {
+    button.onclick = async () => {
+      const item = promptIndex[Number(button.dataset.copyActual)];
+      await copyText(item?.variant?.actual_generation?.prompt || "");
+      showToast(`镜头 ${item?.shot?.shot_no} 历史生产输入已复制`, "ok");
+    };
+  });
+  document.getElementById("prompt-copy-all").onclick = async () => {
+    const text = (data.shots || []).flatMap((shot) =>
+      (shot.variants || []).map((variant) =>
+        `===== 镜头 ${shot.shot_no} · ${variant.label} · ${variant.status} =====\n${variant.prompt}`)
+    ).join("\n\n");
+    await copyText(text);
+    showToast(`已复制 ${summary.prompts_total || 0} 条标准提示词`, "ok");
+  };
+  const search = document.getElementById("prompt-search");
+  const statusFilter = document.getElementById("prompt-status-filter");
+  const applyFilters = () => {
+    const query = search.value.trim().toLowerCase();
+    const status = statusFilter.value;
+    let visible = 0;
+    document.querySelectorAll(".prompt-shot-card").forEach((card) => {
+      const show = (!query || card.dataset.search.includes(query))
+        && (status === "ALL" || card.dataset.status === status);
+      card.hidden = !show;
+      if (show) visible += 1;
+    });
+    document.querySelectorAll(".prompt-shot-index [data-jump-shot]").forEach((button) => {
+      const card = document.getElementById(`prompt-shot-${button.dataset.jumpShot}`);
+      button.hidden = !card || card.hidden;
+    });
+    document.getElementById("prompt-visible-count").textContent =
+      `${visible} / ${summary.shots_total || 0}`;
+  };
+  search.oninput = applyFilters;
+  statusFilter.onchange = applyFilters;
+}
+
 async function renderCanvasView(episodeId, options = {}) {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   let data;
@@ -8240,7 +8606,7 @@ async function renderCanvasView(episodeId, options = {}) {
   if (!sb) {
     // 只要有剧本、或制作已失败/中断,都必须给"从断点接着做"的入口,
     // 不能让用户面对一句"尚无分镜"无路可走
-    if (script || ["failed", "qc_failed"].includes(ep.status)) {
+    if (script || RESUMABLE_STATUS.includes(ep.status)) {
       renderRecoveryView(data, episodeId);
       return;
     }
@@ -8356,6 +8722,8 @@ async function renderCanvasView(episodeId, options = {}) {
         <button id="view-theater">📋 分镜表</button>
         <button id="view-canvas">🗺 画布</button>
       </div>
+      <button id="btn-prompts" class="prompt-review-launch"
+        title="逐镜审核关键帧、首尾帧与 Seedance 2 提示词">⌘ 提示词区</button>
       ${primaryMode === "play"
         ? `<button id="btn-play" class="primary">▶ 播放本集</button>`
         : primaryMode === "stop"
@@ -8453,6 +8821,9 @@ async function renderCanvasView(episodeId, options = {}) {
       };
   }
   document.getElementById("btn-script").onclick = () => showScriptOverlay(data, episodeId);
+  document.getElementById("btn-prompts").onclick = () => {
+    location.hash = `#/episode/${episodeId}/prompts`;
+  };
   document.getElementById("btn-blocking").onclick = () => showBlockingOverlay(episodeId);
   document.getElementById("btn-plan").onclick = () => showPlanOverlay(episodeId);
   document.getElementById("btn-play")?.addEventListener("click", () => openPlayer(data));
@@ -8601,6 +8972,8 @@ function renderProductionView(data, episodeId) {
       <span class="title">《${esc(data.project.title)}》第${ep.number}集</span>
       ${chip(ep.status)}
       <span class="spacer"></span>
+      <button id="btn-prompts-live" class="prompt-review-launch"
+        title="逐镜审核当前标准提示词与阻断项">⌘ 提示词区</button>
       <button id="btn-plan-live"
         title="查看每张图片的状态、提示词和参考图">🖼 图片清单</button>
       <button id="btn-stop" class="stop-btn big" ${stopping ? "disabled" : ""}
@@ -8645,6 +9018,9 @@ function renderProductionView(data, episodeId) {
     </div>
   </div>`;
   document.getElementById("btn-back").onclick = () => { location.hash = "#/"; };
+  document.getElementById("btn-prompts-live").onclick = () => {
+    location.hash = `#/episode/${episodeId}/prompts`;
+  };
   document.getElementById("btn-plan-live").onclick = () => showPlanOverlay(episodeId);
   bindImageAccelerationLivebar(episodeId);
   bindProductionLedger(app, data, episodeId);
@@ -8826,6 +9202,15 @@ function analysisText(value) {
   return Array.isArray(value) ? value.join("、") : (value == null ? "" : String(value));
 }
 
+function analysisIdentityMissing(value, field) {
+  const text = String(value || "").trim();
+  if (!text || /(未指定|未知|不详|未明示|待定|待确认|待补充|待人工|需人工|参考图再定|由参考图决定|以参考图为准|以剧本为准|按参考图|按剧本|自行判断|自行推断|模型判断|自由发挥)/.test(text))
+    return true;
+  if (field === "gender")
+    return !/(男性|女性|男|女|非二元|无性别|不适用)/.test(text);
+  return !/(岁|婴儿|幼儿|儿童|孩童|少年|少女|青少年|未成年|青年|成年|中年|老年|老人)/.test(text);
+}
+
 function storyAnalysisEditorHtml(analysis, version) {
   if (!analysis) return `<section class="analysis-studio missing">
     <div class="analysis-head"><div><span class="eyebrow">STEP 02</span>
@@ -8847,23 +9232,44 @@ function storyAnalysisEditorHtml(analysis, version) {
     </details>`).join("");
   const productionCharacters = (analysis.characters || [])
     .filter((character) => character.importance !== "背景路人");
-  const characterCards = productionCharacters.map((character) => `
-    <details class="analysis-scene">
+  const identityPending = productionCharacters.filter((character) =>
+    analysisIdentityMissing(character.gender, "gender")
+    || analysisIdentityMissing(character.age_range, "age_range"));
+  const characterCards = productionCharacters.map((character, index) => {
+    const genderMissing = analysisIdentityMissing(character.gender, "gender");
+    const ageMissing = analysisIdentityMissing(character.age_range, "age_range");
+    return `
+    <details class="analysis-scene" ${genderMissing || ageMissing ? "open" : ""}>
       <summary>${character.importance === "待确认" ? "⚠️" : "🧬"}
         ${esc(character.name || "未命名")} · ${esc(character.importance || "角色")}</summary>
-      <div><b>性别 / 年龄：</b>${esc(character.gender || "待确认")} ·
-        ${esc(character.age_range || "待确认")}</div>
+      <div class="analysis-identity-grid">
+        <label class="${genderMissing ? "identity-missing" : ""}">
+          <span>性别（必填）</span>
+          <input data-analysis-character="${index}" data-identity-field="gender"
+            value="${esc(character.gender || "")}"
+            placeholder="例如：男 / 女 / 非二元"></label>
+        <label class="${ageMissing ? "identity-missing" : ""}">
+          <span>可见年龄段（必填）</span>
+          <input data-analysis-character="${index}" data-identity-field="age_range"
+            value="${esc(character.age_range || "")}"
+            placeholder="例如：约15岁少年 / 25—30岁青年"></label>
+      </div>
+      ${genderMissing || ageMissing
+        ? `<div class="warn identity-gate-warning">⚠️ 性别和年龄是人物身份硬事实。
+          请人工填写；未填写时不会生成候选图，参考图不能代替这两项。</div>`
+        : ""}
       <div><b>身份：</b>${esc(character.identity_facts || "")}</div>
       <div><b>视觉方向：</b>${esc(character.visual_direction || "")}</div>
       <div><b>最终人物出图提示词：</b>${esc(character.image_prompt
-        || "尚未形成；不会进入人物出图")}</div>
+        || "等待性别与年龄确认；确认后系统自动重建，不会进入人物出图")}</div>
       ${character.negative_prompt
         ? `<div><b>负面提示词：</b>${esc(character.negative_prompt)}</div>` : ""}
       ${character.importance === "待确认"
         ? `<div class="warn">系统无法从原文可靠判断这句由谁说。
           <button type="button" class="analysis-confirm-speaker">
             去编辑剧本确认说话人</button></div>` : ""}
-    </details>`).join("");
+    </details>`;
+  }).join("");
   return `<section class="analysis-studio" data-version="${Number(version || 0)}">
     <div class="analysis-head"><div><span class="eyebrow">STEP 02 · AI PRODUCTION BIBLE</span>
       <h2>世界观、环境与视觉制作圣经</h2>
@@ -8905,6 +9311,9 @@ function storyAnalysisEditorHtml(analysis, version) {
       <div class="analysis-scene-grid">${sceneCards || "暂无场景分析"}</div></details>
     <details class="analysis-scenes" open><summary>真实人物与最终出图卡 ·
       ${productionCharacters.length} 人</summary>
+      ${identityPending.length ? `<div class="warn analysis-identity-summary">
+        ⛔ ${identityPending.length} 名正式角色的性别或年龄尚未明确。
+        这是人物图生产硬门禁，请先在下方人物卡填写并保存。</div>` : ""}
       <div class="analysis-scene-grid">${characterCards || "暂无人物分析"}</div></details>
     <div class="analysis-actions">
       <input id="analysis-direction" placeholder="可选补充，如：更考据、更克制、雨夜冷调；留空则完全按剧本重建">
@@ -8942,6 +9351,14 @@ function collectStoryAnalysis(analysis) {
   next.prompt_bible.scene_prefix = value("analysis-scene-prefix");
   next.prompt_bible.keyframe_prefix = value("analysis-keyframe-prefix");
   next.prompt_bible.seedance_prefix = value("analysis-seedance-prefix");
+  next.characters ||= [];
+  document.querySelectorAll("[data-analysis-character][data-identity-field]")
+    .forEach((input) => {
+      const index = Number(input.dataset.analysisCharacter);
+      const field = input.dataset.identityField;
+      if (next.characters[index] && ["gender", "age_range"].includes(field))
+        next.characters[index][field] = input.value.trim();
+    });
   return next;
 }
 
@@ -9188,6 +9605,7 @@ function renderRecoveryView(data, episodeId) {
       ${chip(ep.status)}
       <span class="spacer"></span>
       ${hasScript ? `<button id="btn-script2">📖 看剧本</button>` : ""}
+      <button id="btn-rewrite-script">✏️ 按意见重写剧本</button>
       <button id="btn-plan2">🖼 图片清单</button>
       <button id="btn-rebuild-all-recovery" class="danger"
         title="推翻原有设定,清理本轮复用并从头重新生成图片、首尾帧和视频">⚠ 全部重新生成</button>
@@ -9203,6 +9621,8 @@ function renderRecoveryView(data, episodeId) {
     showScriptOverlay(data, episodeId));
   document.getElementById("btn-plan2").onclick = () =>
     showPlanOverlay(episodeId);
+  document.getElementById("btn-rewrite-script").onclick = () =>
+    rewriteScriptWithFeedback(data, episodeId);
   document.getElementById("btn-rebuild-all-recovery").onclick = (ev) =>
     armConfirm(ev.target, "全部重新生成", async () => {
       ev.target.disabled = true;

@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import re
 
+from .camera_language import camera_geometry_clause
 
-PROMPT_CONTRACT_SCHEMA = "aifos.shot-prompt/v2.1"
+
+PROMPT_CONTRACT_SCHEMA = "aifos.shot-prompt/v2.2"
 PHYSICAL_CONTRACT_SCHEMA = "aifos.physical-space/v1"
 NON_PICTURE_TEXT_CARRIERS = ("字幕", "对白字幕", "旁白字幕", "台词字幕")
 FORBIDDEN_ON_SCREEN_METADATA = (
@@ -42,10 +44,75 @@ SEMANTIC_APPEARANCE_CHANGE_TOKENS = (
 )
 TERMINAL_DEATH_TOKENS = (
     "已咽气", "咽气", "断气", "尸身态", "死亡", "死去", "身亡",
+    "被杀", "被刺死", "毙命", "中刀而亡", "当场死亡",
 )
-LIVING_PERFORMANCE_TOKENS = (
-    "呼吸", "喘息", "眼神变化", "视线变化", "微表情", "眨眼", "开口",
+DEATH_TRANSITION_TOKENS = (
+    *TERMINAL_DEATH_TOKENS, "杀死", "刺死", "击毙", "处死",
 )
+HEADWEAR_PRESENCE_VALUES = {"none", "worn", "unknown"}
+HEADWEAR_KIND_VALUES = {
+    "none", "hair_only", "soft_hat", "official_hat", "crown", "helmet",
+    "veil", "hair_ornament", "other", "unknown",
+}
+HAIR_VISIBILITY_VALUES = {
+    "fully_visible", "partially_visible", "covered", "unknown",
+}
+HEADWEAR_NONE_TOKENS = (
+    "无头饰", "未戴头饰", "不戴头饰", "去除头饰", "摘下头饰",
+    "无外戴帽冠", "无外戴", "无冠", "未戴冠", "不戴冠", "裸头", "光头",
+)
+HEADWEAR_KIND_TOKENS = (
+    ("official_hat", ("乌纱帽", "乌纱", "官帽")),
+    ("helmet", ("头盔", "盔", "兜鍪")),
+    ("veil", ("面纱", "帷帽", "幂篱", "幕离")),
+    ("soft_hat", ("网巾", "头巾", "软帽", "斗笠", "帽")),
+    ("hair_ornament", ("簪", "钗", "步摇")),
+    ("crown", ("凤冠", "发冠", "头冠", "戴冠", "冠")),
+)
+LIFE_STATE_VALUES = {"alive", "dead", "nonliving", "unknown"}
+CONSCIOUSNESS_STATE_VALUES = {
+    "awake", "asleep", "unconscious", "not_applicable", "unknown",
+}
+EMBODIMENT_VALUES = {
+    "physical", "statue", "portrait", "imagined", "overlay", "unknown",
+}
+MOBILITY_VALUES = {
+    "active", "limited", "immobile", "not_applicable", "unknown",
+}
+CONDITION_FIELD_ALIASES = {
+    "life_state": ("life_state", "life", "vital_state", "生命状态"),
+    "consciousness_state": (
+        "consciousness_state", "consciousness", "awareness", "意识状态"),
+    "embodiment": ("embodiment", "presence_type", "存在形态"),
+    "mobility": ("mobility", "movement_capability", "行动能力"),
+}
+ACTIVE_GAZE_TOKENS = (
+    "注视", "凝视", "看向", "望向", "眼神", "视线", "眨眼", "睁眼",
+)
+ACTIVE_SPEECH_TOKENS = (
+    "开口", "说话", "说道", "说出", "回答", "呼喊", "低语", "呢喃", "对白",
+)
+ACTIVE_EXPRESSION_TOKENS = (
+    "微表情", "微笑", "冷笑", "皱眉", "挑眉", "咬唇", "嘴角", "眼神变化",
+)
+ACTIVE_BREATH_TOKENS = ("呼吸", "喘息", "喘气", "吐息")
+ACTIVE_MOTION_TOKENS = (
+    "站起", "坐起", "转身", "抬手", "伸手", "走", "跑", "冲", "挣扎",
+    "点头", "摇头", "身体前倾", "起身",
+)
+WAKE_TRANSITION_TOKENS = (
+    "醒来", "惊醒", "苏醒", "转醒", "睁眼醒来", "恢复意识",
+)
+SLEEP_TRANSITION_TOKENS = (
+    "睡着", "入睡", "沉睡", "熟睡", "睡眠", "闭眼睡去",
+)
+UNCONSCIOUS_TRANSITION_TOKENS = (
+    "昏迷", "昏厥", "失去意识", "晕倒",
+)
+PROP_DISCLOSURE_TYPES = {
+    "reflection", "mirror", "screen", "display", "painting", "picture",
+    "inset", "overlay", "disclosure", "反射", "镜中", "屏幕", "画中画",
+}
 PREMODERN_CHINESE_ERA_TOKENS = (
     "明初", "明代", "大明", "洪武", "永乐", "古代", "县衙", "驿馆",
     "官舍", "公堂",
@@ -53,6 +120,14 @@ PREMODERN_CHINESE_ERA_TOKENS = (
 VAGUE_POPULATION_TOKENS = (
     "几名", "数名", "多名", "若干名", "一群", "人群", "众人", "一众",
     "多人", "几人", "数人", "若干人", "成群", "大批人",
+)
+STATIC_PROCESS_PATTERNS = (
+    r"从.{1,48}(?:到|至|变成|变为|转为)",
+    r"由.{1,48}(?:到|至|变成|变为|转为)",
+    r"先.{1,48}(?:再|随后|然后)",
+    r"(?:开始|正在|逐渐|慢慢).{0,12}"
+    r"(?:走|跑|起身|坐起|拿起|打开|转身|换装|摘下|戴上)",
+    r"→",
 )
 CORPSE_TOKENS = ("尸体", "尸身", "遗体", "尸骸", "死者", "尸首")
 REFERENCE_ROLE_ALIASES = {
@@ -230,7 +305,9 @@ def _registered_state_value(shot, key):
     characters = {_text(name) for name in shot.get("characters") or []}
     state_fields = {
         "position", "pose", "direction", "wardrobe", "headwear",
-        "hair_makeup", "prop", "injury", "emotion",
+        "hair_visibility", "hair_makeup", "prop", "injury", "emotion",
+        "condition", "character_condition", "life_state",
+        "consciousness_state", "embodiment", "mobility",
     }
     if state_fields & set(value):
         return _state_value(value)
@@ -250,6 +327,45 @@ def _normalize_mode(mode):
     return "image", requested
 
 
+def _static_frame_policy(shot):
+    """Return the explicit policy controlling legacy static-frame derivation.
+
+    v2.2 requires a producer-authored frame target. Existing saved storyboards
+    may opt into their old start/end or description fallback, but the opt-in has
+    to be carried by the shot rather than silently enabled at runtime.
+    """
+    raw = (
+        shot.get("frame_target_policy")
+        if "frame_target_policy" in shot
+        else shot.get("static_frame_policy"))
+    allow = False
+    name = "strict_explicit"
+    if isinstance(raw, dict):
+        allow = bool(
+            raw.get("allow_legacy_fallback")
+            or raw.get("allow_start_end_derivation")
+            or raw.get("legacy_compatibility"))
+        name = _text(
+            raw.get("name") or raw.get("policy"),
+            "legacy_explicit" if allow else name)
+    elif isinstance(raw, bool):
+        allow = raw
+        name = "legacy_explicit" if raw else name
+    else:
+        value = _text(raw).lower()
+        allow = value in {
+            "legacy", "legacy_explicit", "legacy_start_end",
+            "allow_legacy_fallback", "allow_start_end_derivation",
+        }
+        if value:
+            name = value
+    return {
+        "name": name,
+        "allow_legacy_fallback": allow,
+        "explicitly_declared": raw is not None,
+    }
+
+
 def _frame_target(shot, mode, requested_mode=""):
     """Select one static freeze state, or the three-part video timeline."""
     start = _registered_state_value(
@@ -266,20 +382,69 @@ def _frame_target(shot, mode, requested_mode=""):
             "state": {"start": start, "action": action, "end": end},
             "source": "start_state/action/end_state",
             "fallback": False,
+            "explicit": True,
+            "compatibility_policy": "not_applicable",
+            "legacy_compatibility": False,
         }
 
+    policy = _static_frame_policy(shot)
     frame_kind = (
         _text(shot.get("frame_kind")).lower()
         or _text(requested_mode).lower())
     phase = "start" if frame_kind == "first_frame" else "end"
+    target_key = (
+        frame_kind
+        if frame_kind in {"first_frame", "last_frame"}
+        else "keyframe")
+    targets = shot.get("frame_targets")
+    declared = (
+        targets.get(target_key)
+        if isinstance(targets, dict) and target_key in targets
+        else shot.get("frame_target"))
+    declared_source = (
+        f"frame_targets.{target_key}"
+        if isinstance(targets, dict) and target_key in targets
+        else "frame_target")
+    if declared is not None:
+        declared_phase = ""
+        declared_state = ""
+        declared_fallback = False
+        if isinstance(declared, dict):
+            declared_phase = _text(
+                declared.get("phase") or declared.get("frame_phase")).lower()
+            declared_state = _state_value(
+                declared.get("state")
+                if "state" in declared else declared.get("frame_state"))
+            declared_fallback = bool(declared.get("fallback"))
+        else:
+            declared_state = _state_value(declared)
+        if declared_state:
+            return {
+                # Keep an invalid/missing phase invalid so validation can
+                # BLOCK it; never wash malformed upstream state into start/end.
+                "phase": declared_phase,
+                "state": declared_state,
+                "source": declared_source,
+                "fallback": (
+                    declared_fallback or not isinstance(declared, dict)),
+                "explicit": isinstance(declared, dict),
+                "fallback_declared": (
+                    isinstance(declared, dict)
+                    and "fallback" in declared),
+                "compatibility_policy": policy["name"],
+                "legacy_compatibility": policy["allow_legacy_fallback"],
+            }
     for source in ("freeze_state", "image_state"):
         state = _state_value(shot.get(source))
         if state:
             return {
-                "phase": phase,
+                "phase": "freeze",
                 "state": state,
                 "source": source,
-                "fallback": False,
+                "fallback": True,
+                "explicit": False,
+                "compatibility_policy": policy["name"],
+                "legacy_compatibility": policy["allow_legacy_fallback"],
             }
     state_source = "start_state" if phase == "start" else "end_state"
     state = _registered_state_value(shot, state_source)
@@ -288,7 +453,10 @@ def _frame_target(shot, mode, requested_mode=""):
             "phase": phase,
             "state": state,
             "source": state_source,
-            "fallback": False,
+            "fallback": True,
+            "explicit": False,
+            "compatibility_policy": policy["name"],
+            "legacy_compatibility": policy["allow_legacy_fallback"],
         }
     if _text(shot.get("description")):
         source, state = "description", _text(shot.get("description"))
@@ -301,6 +469,9 @@ def _frame_target(shot, mode, requested_mode=""):
         "state": state,
         "source": source,
         "fallback": True,
+        "explicit": False,
+        "compatibility_policy": policy["name"],
+        "legacy_compatibility": policy["allow_legacy_fallback"],
     }
 
 
@@ -350,6 +521,196 @@ def _functional_figure_line(item):
         if _text(item.get("function")) else "",
     )))
     return f"{label}{count}{counter}" + (f"（{details}）" if details else "")
+
+
+def _object_items(value, identity_key):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if not isinstance(value, dict):
+        return value
+    if identity_key in value or "name" in value or "label" in value:
+        return [value]
+    output = []
+    for key, item in value.items():
+        if isinstance(item, dict):
+            normalized = dict(item)
+            normalized.setdefault(identity_key, key)
+        else:
+            normalized = {identity_key: key, "position": item}
+        output.append(normalized)
+    return output
+
+
+def _normalize_prop_phase(value, target_phase="end"):
+    raw = _text(value).lower()
+    aliases = {
+        "起点": "start", "开始": "start", "start": "start",
+        "终点": "end", "结束": "end", "end": "end",
+        "freeze": "freeze", "current": "freeze", "frame": "freeze",
+        "当前": "freeze", "定格": "freeze",
+    }
+    return aliases.get(raw, raw or target_phase)
+
+
+def _is_prop_disclosure(value):
+    occurrence = _text(value).lower()
+    return bool(
+        occurrence
+        and any(token in occurrence for token in PROP_DISCLOSURE_TYPES))
+
+
+def _prop_main_position(item):
+    if not isinstance(item, dict):
+        return ""
+    holder = _text(item.get("holder"))
+    location = _text(
+        item.get("location") or item.get("primary_position")
+        or item.get("position"))
+    support = _text(item.get("support"))
+    if holder:
+        return f"holder:{holder}"
+    if location:
+        return f"location:{location}"
+    if support:
+        return f"support:{support}"
+    return ""
+
+
+def _normalize_frame_props(shot, target_phase="end"):
+    raw_items = _object_items(shot.get("frame_props"), "prop_id")
+    issues = []
+    if not isinstance(raw_items, list):
+        return [], ["frame_props 必须是对象列表或 prop_id 映射"]
+    output = []
+    for index, raw in enumerate(raw_items, 1):
+        if not isinstance(raw, dict):
+            issues.append(f"第{index}个 frame_prop 必须是对象")
+            continue
+        prop_id = _text(raw.get("prop_id") or raw.get("id"))
+        representation = _text(
+            raw.get("representation") or raw.get("occurrence_type")
+            or raw.get("presence_type") or raw.get("channel"),
+            "physical").lower()
+        visibility = _text(raw.get("visibility"), "visible").lower()
+        holder = _text(raw.get("holder"))
+        location = _text(
+            raw.get("location") or raw.get("primary_position")
+            or raw.get("position"))
+        support = _text(raw.get("support"))
+        phase = _normalize_prop_phase(raw.get("phase"), target_phase)
+        if not _text(raw.get("phase")):
+            issues.append(
+                f"frame_prop「{prop_id or index}」缺少显式 phase")
+        if not _text(raw.get("visibility")):
+            issues.append(
+                f"frame_prop「{prop_id or index}」缺少显式 visibility")
+        if not _text(
+                raw.get("representation")
+                or raw.get("occurrence_type")
+                or raw.get("presence_type")
+                or raw.get("channel")):
+            issues.append(
+                f"frame_prop「{prop_id or index}」缺少显式 representation")
+        normalized = {
+            "prop_id": prop_id,
+            "phase": phase,
+            "physical_state": _text(
+                raw.get("physical_state") or raw.get("state")
+                or raw.get("current_state")),
+            "holder": holder,
+            "location": location,
+            "support": support,
+            "visibility": visibility,
+            "representation": representation,
+        }
+        physical = (
+            visibility != "absent"
+            and not _is_prop_disclosure(representation))
+        if not prop_id:
+            issues.append(f"第{index}个 frame_prop 缺少 prop_id")
+        if physical and not _prop_main_position(normalized):
+            issues.append(
+                f"frame_prop「{prop_id or index}」是物理实例但缺少主位置")
+        output.append(normalized)
+    return output, issues
+
+
+def _normalize_prop_transitions(shot):
+    raw_items = _object_items(shot.get("prop_transitions"), "prop_id")
+    issues = []
+    if not isinstance(raw_items, list):
+        return [], ["prop_transitions 必须是对象列表或 prop_id 映射"]
+    output = []
+    for index, raw in enumerate(raw_items, 1):
+        if not isinstance(raw, dict):
+            issues.append(f"第{index}个 prop_transition 必须是对象")
+            continue
+        prop_id = _text(raw.get("prop_id") or raw.get("id"))
+        from_phase = _normalize_prop_phase(
+            raw.get("from_phase") or raw.get("start_phase"), "start")
+        to_phase = _normalize_prop_phase(
+            raw.get("to_phase") or raw.get("end_phase"), "end")
+        if not prop_id:
+            issues.append(f"第{index}个 prop_transition 缺少 prop_id")
+        output.append({
+            "prop_id": prop_id,
+            "from_phase": from_phase,
+            "to_phase": to_phase,
+            "action": _text(
+                raw.get("action") or raw.get("transition")
+                or raw.get("motion")),
+        })
+    return output, issues
+
+
+def _render_frame_prop(item):
+    representation = _text(item.get("representation"), "physical")
+    visibility = _text(item.get("visibility"), "visible")
+    disclosure = _is_prop_disclosure(representation)
+    location = _prop_main_position(item) or "未声明位置"
+    line = (
+        f"{_text(item.get('prop_id'), '未登记道具')}="
+        f"phase={_text(item.get('phase'))}；"
+        f"physical_state={_text(item.get('physical_state'), '未声明')}；"
+        f"holder={_text(item.get('holder'), '无')}；"
+        f"location={_text(item.get('location'), '无')}；"
+        f"support={_text(item.get('support'), '无')}；"
+        f"visibility={visibility}；representation={representation}；"
+        f"{'披露位置' if disclosure else '物理主位置'}={location}")
+    if disclosure or visibility == "absent":
+        line += (
+            "；不计作第二个物理实例"
+            if disclosure else "；本 phase 不计物理实例")
+    return line
+
+
+def _render_prop_transition(item, positions=None):
+    positions = positions or {}
+    prop_id = _text(item.get("prop_id"), "未登记道具")
+    from_phase = _text(item.get("from_phase"), "start")
+    to_phase = _text(item.get("to_phase"), "end")
+    from_position = positions.get((prop_id, from_phase), "由 frame_props 锁定")
+    to_position = positions.get((prop_id, to_phase), "由 frame_props 锁定")
+    return (
+        f"{prop_id}："
+        f"{from_phase}@{from_position}"
+        f"→{to_phase}@{to_position}"
+        + (f"；动作={_text(item.get('action'))}"
+           if _text(item.get("action")) else ""))
+
+
+def _prop_transition_position(item):
+    if not isinstance(item, dict):
+        return ""
+    visibility = _text(item.get("visibility"), "visible")
+    representation = _text(item.get("representation"), "physical")
+    if visibility == "absent":
+        return "visibility=absent"
+    if _is_prop_disclosure(representation):
+        return f"representation={representation}"
+    return _prop_main_position(item)
 
 
 def _normalize_role_value(value):
@@ -557,7 +918,18 @@ def _actor_semantic_clause(text, actor, actors=None):
     match = re.search(re.escape(name), source)
     if not match:
         return ""
-    tail = source[match.start():match.start() + 180]
+    prefix = source[max(0, match.start() - 32):match.start()]
+    transition_hits = [
+        prefix.rfind(token)
+        for token in DEATH_TRANSITION_TOKENS
+        if token in prefix
+    ]
+    # “刺客杀死书童”把死亡动词写在受害者姓名之前。只把最靠近姓名
+    # 的死亡谓词带入受害者窗口，不吞入施害者此前的冲刺等主动动作。
+    prefix = (
+        prefix[max(transition_hits):]
+        if transition_hits else "")
+    tail = prefix + source[match.start():match.start() + 180]
     cut_points = [
         index for index in (
             tail.find("。"), tail.find("；"), tail.find("\n"))
@@ -573,6 +945,22 @@ def _actor_semantic_clause(text, actor, actors=None):
     if cut_points:
         tail = tail[:min(cut_points)]
     return tail.strip(" ，,；。")
+
+
+def _actor_death_transition(text, actor, actors=None):
+    """Recognize that this actor dies without assigning the killer's verb."""
+    local = _actor_semantic_clause(text, actor, actors)
+    if any(token in local for token in TERMINAL_DEATH_TOKENS):
+        return True
+    source = str(text or "")
+    name = re.escape(str(actor or ""))
+    if not source or not name:
+        return False
+    return any(
+        re.search(
+            rf"{re.escape(token)}[^，,。；\n]{{0,16}}{name}",
+            source)
+        for token in ("杀死", "刺死", "击毙", "处死", "害死"))
 
 
 def _has_placed_object_mention(text, token):
@@ -648,6 +1036,484 @@ def build_era_object_constraints(shot):
     return list(dict.fromkeys(rules))
 
 
+def _semantic_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return " ".join(
+            part for part in (
+                _semantic_text(key) + " " + _semantic_text(item)
+                for key, item in value.items())
+            if part.strip())
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(_semantic_text(item) for item in value)
+    return _text(value)
+
+
+def _canonical_headwear_kind(value):
+    raw = _text(value).lower()
+    aliases = {
+        "无": "none", "none": "none", "hair_only": "hair_only",
+        "仅头发": "hair_only", "soft_hat": "soft_hat", "软帽": "soft_hat",
+        "official_hat": "official_hat", "官帽": "official_hat",
+        "crown": "crown", "冠": "crown", "helmet": "helmet",
+        "头盔": "helmet", "veil": "veil", "面纱": "veil",
+        "hair_ornament": "hair_ornament", "发饰": "hair_ornament",
+        "other": "other", "其他": "other", "unknown": "unknown",
+        "未知": "unknown",
+    }
+    if raw in aliases:
+        return aliases[raw]
+    for kind, tokens in HEADWEAR_KIND_TOKENS:
+        if any(token.lower() in raw for token in tokens):
+            return kind
+    return "other" if raw else "unknown"
+
+
+def _canonical_headwear_presence(value):
+    raw = _text(value).lower()
+    if raw in {"none", "无", "未佩戴", "不佩戴", "absent"}:
+        return "none"
+    if raw in {"worn", "佩戴", "戴着", "present", "有"}:
+        return "worn"
+    return "unknown"
+
+
+def _canonical_hair_visibility(value):
+    raw = _text(value).lower()
+    aliases = {
+        "fully_visible": "fully_visible", "full": "fully_visible",
+        "完整可见": "fully_visible", "完全可见": "fully_visible",
+        "全露": "fully_visible", "partially_visible": "partially_visible",
+        "partial": "partially_visible", "部分可见": "partially_visible",
+        "半遮": "partially_visible", "covered": "covered",
+        "遮盖": "covered", "完全遮盖": "covered", "不可见": "covered",
+        "unknown": "unknown", "未知": "unknown",
+    }
+    return aliases.get(raw, "unknown")
+
+
+def _normalize_headwear(state):
+    """Normalize structured and legacy headwear without dropping source text."""
+    state = state if isinstance(state, dict) else {}
+    raw_value = (
+        state.get("headwear")
+        if "headwear" in state else state.get("headwear_state"))
+    raw = raw_value if isinstance(raw_value, dict) else {}
+    legacy = "" if isinstance(raw_value, dict) else _text(raw_value)
+    presence = _canonical_headwear_presence(
+        raw.get("presence") or state.get("headwear_presence"))
+    kind = _canonical_headwear_kind(
+        raw.get("kind") or raw.get("category")
+        or state.get("headwear_kind"))
+    name = _text(
+        raw.get("name") or raw.get("label")
+        or state.get("headwear_name") or legacy)
+    hair_makeup = _text(state.get("hair_makeup"))
+    semantic = " ".join(filter(None, (legacy, name, hair_makeup)))
+    headwear_declares_none = (
+        legacy.strip() in {"无", "none"}
+        or any(token in f"{legacy} {name}" for token in HEADWEAR_NONE_TOKENS))
+    hair_declares_none = any(
+        token in hair_makeup for token in HEADWEAR_NONE_TOKENS)
+    visible_headwear_text = f"{legacy} {name}"
+    if legacy.strip() in {"无", "none"}:
+        visible_headwear_text = ""
+    for token in HEADWEAR_NONE_TOKENS:
+        visible_headwear_text = visible_headwear_text.replace(token, "")
+    detected_kind = _canonical_headwear_kind(
+        visible_headwear_text) if visible_headwear_text.strip() else "unknown"
+    if kind == "unknown" and detected_kind != "unknown":
+        kind = detected_kind
+    if presence == "unknown":
+        if (headwear_declares_none and kind == "unknown") or kind in {
+                "none", "hair_only"}:
+            presence = "none"
+        elif kind not in {"unknown", "none"} or name:
+            presence = "worn"
+        elif hair_declares_none:
+            presence = "none"
+    if kind == "unknown" and presence == "none":
+        kind = "none"
+
+    visibility_value = (
+        state.get("hair_visibility")
+        if "hair_visibility" in state
+        else raw.get("hair_visibility"))
+    hair_visibility = _canonical_hair_visibility(visibility_value)
+    if hair_visibility == "unknown":
+        if presence == "none" or kind in {"hair_only", "hair_ornament"}:
+            hair_visibility = "fully_visible"
+        elif kind == "helmet":
+            hair_visibility = "covered"
+        elif presence == "worn":
+            hair_visibility = "partially_visible"
+
+    issues = []
+    visually_worn_kind = kind not in {
+        "none", "hair_only", "unknown", "hair_ornament",
+    }
+    if presence == "none" and visually_worn_kind:
+        issues.append("headwear.presence=none 但 kind/name 声明了在戴头饰")
+    if (presence == "none"
+            and detected_kind not in {"unknown", "none", "hair_only"}):
+        issues.append(
+            "headwear.presence=none 但 name/legacy_text 含可见头饰")
+    if presence == "worn" and kind in {"none", "hair_only"}:
+        issues.append("headwear.presence=worn 与 kind=none/hair_only 冲突")
+    if ((hair_declares_none or headwear_declares_none)
+            and presence == "worn" and visually_worn_kind):
+        issues.append("无冠/无头饰声明与正在佩戴的 headwear 冲突")
+    if (hair_visibility == "fully_visible"
+            and kind in {
+                "soft_hat", "official_hat", "crown", "helmet", "veil"}):
+        issues.append(
+            f"hair_visibility=fully_visible 与 headwear.kind={kind} 冲突")
+    if (hair_visibility == "covered"
+            and presence == "none"
+            and kind in {"none", "hair_only", "unknown"}):
+        issues.append("hair_visibility=covered 但未声明任何遮盖头部的头饰")
+    if presence not in HEADWEAR_PRESENCE_VALUES:
+        issues.append(f"未知 headwear.presence:{presence}")
+    if kind not in HEADWEAR_KIND_VALUES:
+        issues.append(f"未知 headwear.kind:{kind}")
+    if hair_visibility not in HAIR_VISIBILITY_VALUES:
+        issues.append(f"未知 hair_visibility:{hair_visibility}")
+    return {
+        "presence": presence,
+        "kind": kind,
+        "name": name,
+        "hair_visibility": hair_visibility,
+        "legacy_text": legacy,
+        "issues": list(dict.fromkeys(issues)),
+    }
+
+
+def _render_headwear(value):
+    if not isinstance(value, dict):
+        return _text(value)
+    presence = _text(value.get("presence"), "unknown")
+    kind = _text(value.get("kind"), "unknown")
+    name = _text(value.get("name"))
+    visibility = _text(value.get("hair_visibility"), "unknown")
+    return (
+        f"presence={presence},kind={kind}"
+        + (f",name={name}" if name else "")
+        + f",hair_visibility={visibility}")
+
+
+def _condition_value(source, field):
+    source = source if isinstance(source, dict) else {}
+    for alias in CONDITION_FIELD_ALIASES[field]:
+        if source.get(alias) is not None:
+            return source.get(alias)
+    return None
+
+
+def _canonical_condition_value(field, value):
+    raw = _text(value).lower()
+    aliases = {
+        "life_state": {
+            "alive": "alive", "生存": "alive", "活着": "alive",
+            "dead": "dead", "死亡": "dead", "已死亡": "dead",
+            "nonliving": "nonliving", "非生命": "nonliving",
+            "not_applicable": "nonliving", "unknown": "unknown", "未知": "unknown",
+        },
+        "consciousness_state": {
+            "awake": "awake", "清醒": "awake", "asleep": "asleep",
+            "睡眠": "asleep", "熟睡": "asleep", "unconscious": "unconscious",
+            "昏迷": "unconscious", "昏厥": "unconscious",
+            "not_applicable": "not_applicable", "不适用": "not_applicable",
+            "unknown": "unknown", "未知": "unknown",
+        },
+        "embodiment": {
+            "physical": "physical", "实体": "physical", "真人实体": "physical",
+            "statue": "statue", "雕像": "statue", "portrait": "portrait",
+            "画像": "portrait", "imagined": "imagined", "想象": "imagined",
+            "overlay": "overlay", "叠层": "overlay", "unknown": "unknown",
+            "未知": "unknown",
+        },
+        "mobility": {
+            "active": "active", "可主动行动": "active", "limited": "limited",
+            "受限": "limited", "immobile": "immobile", "不可主动行动": "immobile",
+            "not_applicable": "not_applicable", "不适用": "not_applicable",
+            "unknown": "unknown", "未知": "unknown",
+        },
+    }
+    return aliases[field].get(raw, raw or "unknown")
+
+
+def _normalize_character_condition(state, extra_text=""):
+    state = state if isinstance(state, dict) else {}
+    raw_condition = (
+        state.get("condition")
+        if state.get("condition") is not None
+        else state.get("character_condition"))
+    legacy_condition = _text(
+        raw_condition).lower() if not isinstance(raw_condition, dict) else ""
+    legacy_defaults = {
+        "normal": {
+            "life_state": "alive", "consciousness_state": "awake",
+            "embodiment": "physical", "mobility": "active",
+        },
+        "正常": {
+            "life_state": "alive", "consciousness_state": "awake",
+            "embodiment": "physical", "mobility": "active",
+        },
+        "asleep": {
+            "life_state": "alive", "consciousness_state": "asleep",
+            "embodiment": "physical", "mobility": "limited",
+        },
+        "熟睡": {
+            "life_state": "alive", "consciousness_state": "asleep",
+            "embodiment": "physical", "mobility": "limited",
+        },
+        "unconscious": {
+            "life_state": "alive", "consciousness_state": "unconscious",
+            "embodiment": "physical", "mobility": "immobile",
+        },
+        "昏迷": {
+            "life_state": "alive", "consciousness_state": "unconscious",
+            "embodiment": "physical", "mobility": "immobile",
+        },
+        "dead": {
+            "life_state": "dead", "consciousness_state": "not_applicable",
+            "embodiment": "physical", "mobility": "immobile",
+        },
+        "死亡": {
+            "life_state": "dead", "consciousness_state": "not_applicable",
+            "embodiment": "physical", "mobility": "immobile",
+        },
+        "statue": {
+            "life_state": "nonliving",
+            "consciousness_state": "not_applicable",
+            "embodiment": "statue", "mobility": "immobile",
+        },
+        "portrait": {
+            "life_state": "nonliving",
+            "consciousness_state": "not_applicable",
+            "embodiment": "portrait", "mobility": "not_applicable",
+        },
+        "imagined": {
+            "life_state": "nonliving",
+            "consciousness_state": "not_applicable",
+            "embodiment": "imagined", "mobility": "not_applicable",
+        },
+    }
+    nested = raw_condition or {}
+    nested = nested if isinstance(nested, dict) else {}
+    if legacy_condition in legacy_defaults:
+        nested = legacy_defaults[legacy_condition]
+    values = {
+        field: _canonical_condition_value(
+            field,
+            _condition_value(nested, field)
+            if _condition_value(nested, field) is not None
+            else _condition_value(state, field))
+        for field in CONDITION_FIELD_ALIASES
+    }
+    text = " ".join(filter(None, (
+        _semantic_text(state), _text(extra_text))))
+    if values["embodiment"] == "unknown":
+        if any(token in text for token in ("雕像", "石像", "塑像")):
+            values["embodiment"] = "statue"
+        elif any(token in text for token in ("画像", "肖像", "画中人物")):
+            values["embodiment"] = "portrait"
+        elif any(token in text for token in ("想象", "幻象", "脑海中")):
+            values["embodiment"] = "imagined"
+        elif any(token in text for token in ("叠层", "Q版", "内心人格")):
+            values["embodiment"] = "overlay"
+    if values["life_state"] == "unknown":
+        if any(token in text for token in TERMINAL_DEATH_TOKENS):
+            values["life_state"] = "dead"
+        elif values["embodiment"] in {
+                "statue", "portrait", "imagined", "overlay"}:
+            values["life_state"] = "nonliving"
+        elif any(token in text for token in (
+                *WAKE_TRANSITION_TOKENS, *SLEEP_TRANSITION_TOKENS,
+                *UNCONSCIOUS_TRANSITION_TOKENS, "清醒", "正常")):
+            values["life_state"] = "alive"
+    if values["consciousness_state"] == "unknown":
+        if values["life_state"] in {"dead", "nonliving"}:
+            values["consciousness_state"] = "not_applicable"
+        elif any(token in text for token in WAKE_TRANSITION_TOKENS):
+            values["consciousness_state"] = "awake"
+        elif any(token in text for token in UNCONSCIOUS_TRANSITION_TOKENS):
+            values["consciousness_state"] = "unconscious"
+        elif any(token in text for token in SLEEP_TRANSITION_TOKENS):
+            values["consciousness_state"] = "asleep"
+        elif "清醒" in text:
+            values["consciousness_state"] = "awake"
+    if values["embodiment"] == "unknown" and values["life_state"] in {
+            "alive", "dead"}:
+        values["embodiment"] = "physical"
+    if values["mobility"] == "unknown":
+        if (values["life_state"] in {"dead", "nonliving"}
+                or values["consciousness_state"] == "unconscious"):
+            values["mobility"] = "immobile"
+        elif values["consciousness_state"] == "asleep":
+            values["mobility"] = "limited"
+        elif (values["life_state"] == "alive"
+              and values["consciousness_state"] == "awake"):
+            values["mobility"] = "active"
+
+    issues = []
+    allowed = {
+        "life_state": LIFE_STATE_VALUES,
+        "consciousness_state": CONSCIOUSNESS_STATE_VALUES,
+        "embodiment": EMBODIMENT_VALUES,
+        "mobility": MOBILITY_VALUES,
+    }
+    for field, valid in allowed.items():
+        if values[field] not in valid:
+            issues.append(f"未知 {field}:{values[field]}")
+    if (values["life_state"] in {"dead", "nonliving"}
+            and values["consciousness_state"] not in {
+                "not_applicable", "unknown"}):
+        issues.append(
+            f"life_state={values['life_state']} 与 "
+            f"consciousness_state={values['consciousness_state']} 冲突")
+    if (values["life_state"] in {"dead", "nonliving"}
+            and values["mobility"] in {"active", "limited"}):
+        issues.append(
+            f"life_state={values['life_state']} 与 mobility="
+            f"{values['mobility']} 冲突")
+    nonphysical = values["embodiment"] in {
+        "statue", "portrait", "imagined", "overlay",
+    }
+    if nonphysical and values["life_state"] not in {
+            "nonliving", "unknown"}:
+        issues.append(
+            f"embodiment={values['embodiment']} 必须使用 "
+            "life_state=nonliving")
+    if nonphysical and values["consciousness_state"] not in {
+            "not_applicable", "unknown"}:
+        issues.append(
+            f"embodiment={values['embodiment']} 不得声明清醒、睡眠或昏迷")
+    allowed_nonphysical_mobility = (
+        {"immobile", "not_applicable", "unknown"}
+        if values["embodiment"] in {"statue", "portrait"}
+        else {"not_applicable", "unknown"})
+    if nonphysical and values["mobility"] not in allowed_nonphysical_mobility:
+        issues.append(
+            f"embodiment={values['embodiment']} 与 "
+            f"mobility={values['mobility']} 冲突")
+    values["issues"] = list(dict.fromkeys(issues))
+    return values
+
+
+def _character_condition_map(
+        shot, characters, action, target_phase="end"):
+    start_states = (
+        shot.get("start_state")
+        if isinstance(shot.get("start_state"), dict) else {})
+    end_states = (
+        shot.get("end_state")
+        if isinstance(shot.get("end_state"), dict) else {})
+    declared = (
+        shot.get("character_conditions")
+        if isinstance(shot.get("character_conditions"), dict) else {})
+    output = {}
+    for name in characters:
+        local = _actor_semantic_clause(action, name, characters)
+        if len(characters) == 1 and not local:
+            local = _text(action)
+        per_actor = declared.get(name) or {}
+        per_actor = per_actor if isinstance(per_actor, dict) else {}
+        start_state = dict(start_states.get(name) or {})
+        end_state = dict(end_states.get(name) or {})
+        explicit_start = (
+            per_actor.get("start")
+            if "start" in per_actor else per_actor.get("start_condition"))
+        explicit_end = (
+            per_actor.get("end")
+            if "end" in per_actor else per_actor.get("end_condition"))
+        if (explicit_start is None and explicit_end is None
+                and any(
+                    _condition_value(per_actor, field) is not None
+                    for field in CONDITION_FIELD_ALIASES)):
+            explicit_start = per_actor
+            explicit_end = per_actor
+        if isinstance(explicit_start, dict):
+            start_state["condition"] = explicit_start
+        if isinstance(explicit_end, dict):
+            end_state["condition"] = explicit_end
+        start_condition = _normalize_character_condition(start_state)
+        end_condition = _normalize_character_condition(end_state, local)
+        actor_conditions = {
+            "start": start_condition,
+            "end": end_condition,
+        }
+        if target_phase == "freeze":
+            explicit_freeze = (
+                per_actor.get("freeze")
+                if "freeze" in per_actor
+                else per_actor.get("freeze_condition"))
+            if isinstance(explicit_freeze, dict):
+                actor_conditions["freeze"] = (
+                    _normalize_character_condition(
+                        {"condition": explicit_freeze}))
+            else:
+                condition_fields = tuple(CONDITION_FIELD_ALIASES)
+                start_signature = tuple(
+                    start_condition.get(field) for field in condition_fields)
+                end_signature = tuple(
+                    end_condition.get(field) for field in condition_fields)
+                if start_signature == end_signature:
+                    actor_conditions["freeze"] = dict(end_condition)
+                else:
+                    actor_conditions["freeze"] = {
+                        **dict(end_condition),
+                        "issues": [
+                            "start/end condition 不同，phase=freeze 必须显式"
+                            "声明 character_conditions.freeze"],
+                    }
+        output[_text(name)] = actor_conditions
+    return output
+
+
+def _behavior_hits(text):
+    """Return positive visible behaviours, ignoring explicit prohibitions."""
+    groups = {
+        "呼吸": ACTIVE_BREATH_TOKENS,
+        "注视/眨眼": ACTIVE_GAZE_TOKENS,
+        "说话": ACTIVE_SPEECH_TOKENS,
+        "微表情": ACTIVE_EXPRESSION_TOKENS,
+        "主动动作": ACTIVE_MOTION_TOKENS,
+    }
+    hits = set()
+    for major_clause in re.split(r"[。；\n]", _text(text)):
+        if not major_clause:
+            continue
+        first_behavior = min(
+            (major_clause.find(token) for tokens in groups.values()
+             for token in tokens if token in major_clause),
+            default=-1)
+        prefix = (
+            major_clause[:first_behavior]
+            if first_behavior >= 0 else major_clause)
+        if any(marker in prefix for marker in (
+                "禁止", "不得", "不能", "不允许", "没有", "无")):
+            continue
+        for clause in re.split(r"[，,]", major_clause):
+            if not clause:
+                continue
+            first_clause_behavior = min(
+                (clause.find(token) for tokens in groups.values()
+                 for token in tokens if token in clause),
+                default=-1)
+            clause_prefix = (
+                clause[:first_clause_behavior]
+                if first_clause_behavior >= 0 else clause)
+            if any(marker in clause_prefix for marker in (
+                    "禁止", "不得", "不能", "不允许", "没有", "无")):
+                continue
+            for label, tokens in groups.items():
+                if any(token in clause for token in tokens):
+                    hits.add(label)
+    return hits
+
+
 def _state_line(states):
     values = []
     if not isinstance(states, dict):
@@ -659,12 +1525,27 @@ def _state_line(states):
             _text(state.get("pose")) or "自然状态",
             f"朝向{_text(state.get('direction')) or '按画面'}",
         ]
+        if state.get("headwear") is not None or any(
+                state.get(key) is not None for key in (
+                    "headwear_state", "headwear_presence", "headwear_kind",
+                    "headwear_name", "hair_visibility")):
+            details.append(f"头饰{_render_headwear(_normalize_headwear(state))}")
         for key, label in (
-                ("wardrobe", "服装"), ("headwear", "头饰"),
-                ("hair_makeup", "妆发"), ("prop", "道具"),
-                ("injury", "伤势"), ("emotion", "情绪")):
+                ("wardrobe", "服装"), ("hair_makeup", "妆发"),
+                ("prop", "道具"), ("injury", "伤势"), ("emotion", "情绪")):
             if _text(state.get(key)):
                 details.append(f"{label}{_text(state[key])}")
+        if any(
+                state.get(key) is not None for key in (
+                    "condition", "character_condition", "life_state",
+                    "consciousness_state", "embodiment", "mobility")):
+            condition = _normalize_character_condition(state)
+            details.append(
+                "状态"
+                f"life_state={condition['life_state']},"
+                f"consciousness_state={condition['consciousness_state']},"
+                f"embodiment={condition['embodiment']},"
+                f"mobility={condition['mobility']}")
         values.append(f"{_text(name)}:" + ",".join(details))
     return "；".join(values)
 
@@ -672,15 +1553,24 @@ def _state_line(states):
 def _appearance_map(states):
     if not isinstance(states, dict):
         return {}
-    return {
-        _text(name): {
-            key: _text(state.get(key))
-            for key in ("wardrobe", "headwear", "hair_makeup")
-            if _text(state.get(key))
-        }
-        for name, state in (states or {}).items()
-        if isinstance(state, dict)
-    }
+    output = {}
+    for name, state in (states or {}).items():
+        if not isinstance(state, dict):
+            continue
+        look = {}
+        if _text(state.get("wardrobe")):
+            look["wardrobe"] = _text(state.get("wardrobe"))
+        if _text(state.get("hair_makeup")):
+            look["hair_makeup"] = _text(state.get("hair_makeup"))
+        if state.get("headwear") is not None or any(
+                state.get(key) is not None for key in (
+                    "headwear_state", "headwear_presence", "headwear_kind",
+                    "headwear_name", "hair_visibility")):
+            headwear = _normalize_headwear(state)
+            look["headwear"] = headwear
+            look["hair_visibility"] = headwear["hair_visibility"]
+        output[_text(name)] = look
+    return output
 
 
 def readable_text_required(value):
@@ -897,6 +1787,35 @@ def _character_lines(shot):
     ]
 
 
+def _character_identity_facts(shot):
+    """Return structured identity facts for every registered actor.
+
+    The rendered actor line remains optimized for image/video models, while
+    these fields give the validator an exact source for identity completeness.
+    Natural-language placeholders such as “以参考图为准” must not count as a
+    known gender or age range.
+    """
+    characters = list(shot.get("characters") or [])
+    raw = (
+        shot.get("character_facts")
+        if isinstance(shot.get("character_facts"), dict)
+        else shot.get("character_background"))
+    raw = raw if isinstance(raw, dict) else {}
+    facts = []
+    for name in characters:
+        value = raw.get(name)
+        value = value if isinstance(value, dict) else {}
+        facts.append({
+            "name": _text(name),
+            "species": _text(value.get("species"), "人类"),
+            "gender": _text(value.get("gender") or value.get("sex")),
+            "age_range": _text(value.get("age_range")),
+            "identity": _text(
+                value.get("identity") or value.get("occupation")),
+        })
+    return facts
+
+
 def build_composition_contract(shot):
     """Derive per-actor visibility duties from the current shot only.
 
@@ -953,7 +1872,10 @@ def build_composition_contract(shot):
         name for name, view in actor_views.items() if view == "front"}
     profile_names = {
         name for name, view in actor_views.items() if view == "profile"}
-    single_over_shoulder = "过肩" in framing_text and len(characters) == 1
+    single_over_shoulder = (
+        "过肩" in framing_text
+        and len(characters) == 1
+        and visible_count == 1)
     over_shoulder = ("过肩" in framing_text and len(characters) >= 2) or (
         ("背面" in framing_text or "背影" in framing_text)
         and len(characters) >= 2
@@ -1037,6 +1959,23 @@ def build_shot_prompt_contract(
     characters = list(shot.get("characters") or [])
     output_media, requested_mode = _normalize_mode(mode)
     target = _frame_target(shot, output_media, requested_mode)
+    # Never fall back to the raw storyboard prompt here. It may contain the
+    # whole episode bible and unrelated scenes, which makes the provider blend
+    # facts from other shots into this image.
+    action = _text(
+        shot.get("description") or shot.get("action"),
+        "环境保持稳定，只执行自然微动",
+    )
+    target_phase = (
+        target.get("phase")
+        if target.get("phase") in {"start", "end", "freeze"}
+        else "end")
+    frame_props, frame_prop_issues = _normalize_frame_props(
+        shot, target_phase)
+    prop_transitions, prop_transition_issues = _normalize_prop_transitions(
+        shot)
+    character_conditions = _character_condition_map(
+        shot, characters, action, target_phase)
     functional_figures, population_issues = _normalize_functional_figures(
         shot)
     registered_count = len(characters)
@@ -1079,6 +2018,8 @@ def build_shot_prompt_contract(
     physical = build_physical_contract({
         **shot, "location": scene, "style": style,
     })
+    physical["frame_props"] = list(frame_props)
+    physical["prop_transitions"] = list(prop_transitions)
     overlays = []
     for item in shot.get("narrative_overlays") or []:
         if not isinstance(item, dict):
@@ -1131,13 +2072,6 @@ def build_shot_prompt_contract(
         population_issues.append(
             "镜头使用了几名/数名/多名/一群等模糊人数，但未声明"
             " functional_figures 的明确 count")
-    # Never fall back to the raw storyboard prompt here. It may contain the
-    # whole episode bible and unrelated scenes, which makes the provider blend
-    # facts from other shots into this image.
-    action = _text(
-        shot.get("description") or shot.get("action"),
-        "环境保持稳定，只执行自然微动",
-    )
     composition = (
         dict(shot.get("composition_contract"))
         if isinstance(shot.get("composition_contract"), dict)
@@ -1146,6 +2080,10 @@ def build_shot_prompt_contract(
         }))
     composition["expected_visible_figure_count"] = visible_count
     medium = _normalize_visual_medium(shot, style)
+    identity_facts_required = bool(
+        shot.get("identity_facts_required")
+        or isinstance(shot.get("character_facts"), dict)
+        or isinstance(shot.get("character_background"), dict))
     contract = {
         "schema": PROMPT_CONTRACT_SCHEMA,
         # ``mode=shot`` is a legacy discriminator. Media/output semantics live
@@ -1162,6 +2100,13 @@ def build_shot_prompt_contract(
         "frame_target_state": target["state"],
         "frame_target_source": target["source"],
         "frame_target_fallback": bool(target["fallback"]),
+        "frame_target_explicit": bool(target.get("explicit")),
+        "frame_target_policy": {
+            "name": _text(
+                target.get("compatibility_policy"), "strict_explicit"),
+            "allow_legacy_fallback": bool(
+                target.get("legacy_compatibility")),
+        },
         "frame_kind": _text(shot.get("frame_kind")),
         "subject": {
             # v1/v2 compatibility: count remains the number of identity-locked
@@ -1171,6 +2116,8 @@ def build_shot_prompt_contract(
             "functional_count": functional_count,
             "visible_count": visible_count,
             "actors": _character_lines(shot),
+            "identity_facts": _character_identity_facts(shot),
+            "identity_facts_required": identity_facts_required,
             "functional_figures": functional_figures,
         },
         "population": {
@@ -1198,14 +2145,25 @@ def build_shot_prompt_contract(
         "start": _registered_state_value(
             shot, "start_state") or "保持首帧状态",
         "start_appearance": _appearance_map(shot.get("start_state")),
+        "character_conditions": character_conditions,
         "action": action,
         "performance": _text(
             (shot.get("performance") or {}).get("micro_expression"),
-            "自然微表情、呼吸和重心变化",
+            "表演严格服从逐角色 condition，不自行增加任何行为",
         ),
         "camera": _camera(shot),
         "physical": physical,
         "spatial_relations": list(physical.get("spatial_relations") or []),
+        "prop_registry": [
+            dict(value) for value in (shot.get("prop_registry") or [])
+            if isinstance(value, dict)
+        ],
+        "frame_props": frame_props,
+        "prop_transitions": prop_transitions,
+        "prop_issues": [
+            *frame_prop_issues,
+            *prop_transition_issues,
+        ],
         "end": _registered_state_value(
             shot, "end_state") or "到达尾帧状态",
         "end_appearance": _appearance_map(shot.get("end_state")),
@@ -1244,7 +2202,10 @@ def build_shot_prompt_contract(
             "贴进成片（已声明的功能人物除外）；服装、头饰、妆发必须逐人服从"
             "本镜起止状态，未写换装/"
             "摘戴/改妆动作时不得自行改变；非现实Q版叠层不得转化成真人、"
-            "实体角色或空间站位"
+            "实体角色或空间站位；逐角色生命、意识、存在形态和行动能力必须"
+            "服从 condition；同一 physical prop_id 在同一 phase 只能有一个"
+            "物理主位置，reflection/screen/painting/overlay 只作披露，"
+            "visibility=absent 不计物理实例"
         ),
     }
     return contract
@@ -1347,8 +2308,13 @@ def render_shot_prompt(contract, *, mode=None):
         camera_values.append("静态关键帧只定格当前可见机位与构图")
     camera_values.append(f"构图{camera.get('构图')}")
     camera_line = "；".join(value for value in camera_values if value)
+    # 抽象镜头术语(俯拍/背面/过肩…)对图像模型约束力弱,是历史视角类
+    # 质检失败的主因;翻译成可见几何特征,生成与质检按同一标准执行。
+    camera_geometry = camera_geometry_clause(camera)
+    if camera_geometry:
+        camera_line = f"{camera_line}；{camera_geometry}"
     lines = [
-        "【镜头合同v2.1】只执行下列事实，不自行补剧情。",
+        "【镜头合同v2.2】只执行下列事实，不自行补剧情。",
     ]
     if media == "video":
         lines.append(
@@ -1363,6 +2329,34 @@ def render_shot_prompt(contract, *, mode=None):
             + "；".join(_functional_figure_line(item)
                        for item in functional_figures)
             + "；功能人物不锁身份，但每具真人身体都计入总可见真人。")
+    condition_lines = []
+    target_phase = _text(output.get("frame_phase"), "end")
+    for name, phases in (
+            contract.get("character_conditions") or {}).items():
+        if not isinstance(phases, dict):
+            continue
+        if media == "video":
+            start_condition = phases.get("start") or {}
+            end_condition = phases.get("end") or {}
+            condition_lines.append(
+                f"{name}:start("
+                f"life={start_condition.get('life_state', 'unknown')},"
+                f"consciousness={start_condition.get('consciousness_state', 'unknown')},"
+                f"embodiment={start_condition.get('embodiment', 'unknown')},"
+                f"mobility={start_condition.get('mobility', 'unknown')})→end("
+                f"life={end_condition.get('life_state', 'unknown')},"
+                f"consciousness={end_condition.get('consciousness_state', 'unknown')},"
+                f"embodiment={end_condition.get('embodiment', 'unknown')},"
+                f"mobility={end_condition.get('mobility', 'unknown')})")
+        else:
+            condition = phases.get(target_phase) or {}
+            condition_lines.append(
+                f"{name}:life={condition.get('life_state', 'unknown')},"
+                f"consciousness={condition.get('consciousness_state', 'unknown')},"
+                f"embodiment={condition.get('embodiment', 'unknown')},"
+                f"mobility={condition.get('mobility', 'unknown')}")
+    if condition_lines:
+        lines.append("【人物状态合同】" + "；".join(condition_lines) + "。")
     overlays = contract.get("narrative_overlays") or []
     if overlays:
         overlay = overlays[0]
@@ -1427,12 +2421,49 @@ def render_shot_prompt(contract, *, mode=None):
             target.get("source") if isinstance(target, dict)
             else contract.get("frame_target_source"))
         fallback_note = (
-            f"（fallback=true；来源={source or 'description/action'}）"
+            f"（fallback=true；来源={source or 'description/action'}；"
+            "默认生产阻断，只有显式 legacy policy 可兼容）"
             if fallback else "")
         lines.extend([
             f"【定格状态】{target_state}{fallback_note}。",
             f"【镜头】{camera_line}。",
         ])
+    frame_props = contract.get("frame_props") or []
+    visible_props = (
+        frame_props if media == "video"
+        else [
+            item for item in frame_props
+            if _text(item.get("phase")) == target_phase
+        ])
+    if visible_props:
+        lines.append(
+            "【道具定格】"
+            + "；".join(_render_frame_prop(item) for item in visible_props)
+            + "。")
+    prop_transitions = contract.get("prop_transitions") or []
+    if prop_transitions:
+        prop_positions = {
+            (_text(item.get("prop_id")), _text(item.get("phase"))):
+            _prop_transition_position(item)
+            for item in frame_props
+            if isinstance(item, dict)
+            and _prop_transition_position(item)
+        }
+        if media == "video":
+            lines.append(
+                "【道具状态变化】"
+                + "；".join(
+                    _render_prop_transition(item, prop_positions)
+                    for item in prop_transitions)
+                + "。")
+        else:
+            lines.append(
+                "【道具变化审计】"
+                + "；".join(
+                    _render_prop_transition(item, prop_positions)
+                    for item in prop_transitions)
+                + "；静态帧禁止表现变化过程，只以【道具定格】的当前 phase"
+                " 主位置为准。")
     physical = contract.get("physical") or {}
     physical_rules = "；".join(physical.get("rules") or [])
     if physical_rules:
@@ -1517,6 +2548,9 @@ def validate_shot_prompt_contract(contract):
     """Fail before generation when a shot contract cannot be executed."""
     contract = contract if isinstance(contract, dict) else {}
     issues = []
+    if _text(contract.get("schema")) != PROMPT_CONTRACT_SCHEMA:
+        issues.append(
+            f"镜头合同 schema 必须是 {PROMPT_CONTRACT_SCHEMA}")
     subject = contract.get("subject") or {}
     try:
         count = int(subject.get("count") or 0)
@@ -1588,6 +2622,54 @@ def validate_shot_prompt_contract(contract):
     if (composition.get("composition_type") == "over_shoulder_dialogue"
             and count < 2):
         issues.append("单人镜头不得使用双人过肩对话合同")
+    if (composition.get("composition_type")
+            == "single_subject_over_shoulder"
+            and (count != 1 or normalized_functional_count != 0)):
+        issues.append(
+            "单人过肩合同必须严格为1个登记角色、0个功能人物、1具连续身体")
+
+    identity_facts_required = bool(
+        subject.get("identity_facts_required"))
+    identity_facts = subject.get("identity_facts")
+    if not isinstance(identity_facts, list):
+        if identity_facts_required:
+            issues.append("subject.identity_facts 必须是按登记角色列出的列表")
+        identity_facts = []
+    identity_by_name = {
+        _text(item.get("name")): item
+        for item in identity_facts
+        if isinstance(item, dict) and _text(item.get("name"))
+    }
+    ambiguous_identity_tokens = (
+        "未指定", "未知", "不详", "待定", "待确认", "待补充",
+        "以参考图为准", "以剧本为准", "按参考图", "按剧本",
+        "自行判断", "自行推断", "模型判断", "自由发挥",
+    )
+
+    def explicit_identity_value(value):
+        value = _text(value)
+        return bool(value) and not any(
+            token in value for token in ambiguous_identity_tokens)
+
+    registered_names = []
+    for actor in subject.get("actors") or []:
+        value = _text(actor)
+        if "=" in value:
+            value = value.split("=", 1)[1].split("（", 1)[0].strip()
+        if value:
+            registered_names.append(value)
+    if identity_facts_required and len(identity_facts) != count:
+        issues.append(
+            "subject.identity_facts 数量必须与登记角色数完全一致")
+    for name in registered_names if identity_facts_required else []:
+        facts = identity_by_name.get(name)
+        if facts is None:
+            issues.append(f"{name}缺少结构化人物身份事实")
+            continue
+        if not explicit_identity_value(facts.get("gender")):
+            issues.append(f"{name}性别未明确，禁止交给图像/视频模型猜测")
+        if not explicit_identity_value(facts.get("age_range")):
+            issues.append(f"{name}年龄段未明确，禁止交给图像/视频模型猜测")
 
     refs = contract.get("references") or []
     indexes = [item.get("index") for item in refs if isinstance(item, dict)]
@@ -1629,13 +2711,7 @@ def validate_shot_prompt_contract(contract):
     action = _text(contract.get("action"))
     start_appearance = contract.get("start_appearance") or {}
     end_appearance = contract.get("end_appearance") or {}
-    actor_names = []
-    for actor in subject.get("actors") or []:
-        value = _text(actor)
-        if "=" in value:
-            value = value.split("=", 1)[1].split("（", 1)[0].strip()
-        if value:
-            actor_names.append(value)
+    actor_names = registered_names
     if contract.get("appearance_state_required"):
         for name in actor_names:
             start_look = start_appearance.get(name) or {}
@@ -1643,6 +2719,57 @@ def validate_shot_prompt_contract(contract):
             if not _text(
                     start_look.get("wardrobe") or end_look.get("wardrobe")):
                 issues.append(f"{name}缺少当前镜头唯一服装状态")
+    headwear_change_tokens = (
+        "戴上", "戴好", "摘下", "摘去", "取下", "脱下", "去掉",
+        "除去", "换帽", "换冠", "换头饰", "重新戴",
+    )
+    for name in actor_names:
+        phase_headwear = {}
+        for phase, appearances in (
+                ("start", start_appearance), ("end", end_appearance)):
+            look = appearances.get(name) or {}
+            raw_headwear = look.get("headwear")
+            if raw_headwear is None and look.get("hair_visibility") is None:
+                continue
+            headwear = _normalize_headwear({
+                "headwear": raw_headwear,
+                "hair_visibility": (
+                    look.get("hair_visibility")
+                    or (raw_headwear.get("hair_visibility")
+                        if isinstance(raw_headwear, dict) else None)),
+                "hair_makeup": look.get("hair_makeup"),
+            })
+            phase_headwear[phase] = headwear
+            issues.extend(
+                f"{name}{phase}头部状态冲突：{_text(value)}"
+                for value in headwear.get("issues") or []
+                if _text(value))
+        start_headwear = phase_headwear.get("start")
+        end_headwear = phase_headwear.get("end")
+        if start_headwear and end_headwear:
+            start_signature = (
+                start_headwear.get("presence"),
+                start_headwear.get("kind"),
+                _text(start_headwear.get("name")),
+                start_headwear.get("hair_visibility"),
+            )
+            end_signature = (
+                end_headwear.get("presence"),
+                end_headwear.get("kind"),
+                _text(end_headwear.get("name")),
+                end_headwear.get("hair_visibility"),
+            )
+            local_action = _actor_semantic_clause(
+                action, name, actor_names)
+            if len(actor_names) == 1 and not local_action:
+                local_action = action
+            if (start_signature != end_signature
+                    and not any(
+                        token in local_action
+                        for token in headwear_change_tokens)):
+                issues.append(
+                    f"{name}起点与终点 headwear/hair_visibility 不同，"
+                    "但本镜没有摘戴或更换头饰动作")
     issues.extend(
         _text(value) for value in contract.get("appearance_issues") or []
         if _text(value))
@@ -1710,29 +2837,165 @@ def validate_shot_prompt_contract(contract):
                 f"{name}身上的「{garment}」又被当作独立物件放在场景中；"
                 "若确有第二件必须写明数量，否则只保留一个位置")
 
-    # Death/living-state checks are actor-local.  A surviving actor may still
-    # react in the same shot where another character dies.
+    # Condition checks are actor-local. A surviving actor may react while
+    # another dies, and an awakening actor may act only after the declared
+    # consciousness transition.
+    conditions = contract.get("character_conditions") or {}
+    if not isinstance(conditions, dict):
+        issues.append("character_conditions 必须是按角色名索引的对象")
+        conditions = {}
+    performance = _text(contract.get("performance"))
+    speaker = _text(contract.get("speaker"))
+    dialogue = _text(contract.get("dialogue"))
     for name in actor_names:
         local_action = _actor_semantic_clause(action, name, actor_names)
-        state_clauses = []
-        for value in (start, end):
+        if len(actor_names) == 1 and not local_action:
+            local_action = action
+        local_performance = _actor_semantic_clause(
+            performance, name, actor_names)
+        if len(actor_names) == 1 and not local_performance:
+            local_performance = performance
+        state_clauses = {}
+        for phase, value in (("start", start), ("end", end)):
             match = re.search(
                 rf"(?:^|；){re.escape(name)}:([^；]*)", value)
             if match:
-                state_clauses.append(match.group(1))
-        actor_state = " ".join(state_clauses)
-        terminal_state = any(
-            token in f"{local_action} {actor_state}"
-            for token in TERMINAL_DEATH_TOKENS)
-        explicitly_living = any(
-            token in local_action for token in LIVING_PERFORMANCE_TOKENS)
-        if len(actor_names) == 1:
-            explicitly_living = explicitly_living or any(
-                token in f"{contract.get('performance', '')} {end}"
-                for token in LIVING_PERFORMANCE_TOKENS)
-        if terminal_state and explicitly_living:
+                state_clauses[phase] = match.group(1)
+        phases = conditions.get(name) or {}
+        if not isinstance(phases, dict):
+            issues.append(f"{name}的 character_conditions 必须是对象")
+            phases = {}
+        raw_start_condition = phases.get("start")
+        raw_end_condition = phases.get("end")
+        start_condition = _normalize_character_condition(
+            {"condition": raw_start_condition}
+            if isinstance(raw_start_condition, dict)
+            else {"pose": state_clauses.get("start", "")})
+        end_condition = _normalize_character_condition(
+            {"condition": raw_end_condition}
+            if isinstance(raw_end_condition, dict)
+            else {"pose": state_clauses.get("end", "")},
+            local_action)
+        phase_conditions = [
+            ("start", start_condition), ("end", end_condition)]
+        condition_output = contract.get("output") or {}
+        if (isinstance(condition_output, dict)
+                and condition_output.get("media") == "image"
+                and condition_output.get("frame_phase") == "freeze"):
+            raw_freeze_condition = phases.get("freeze")
+            if not isinstance(raw_freeze_condition, dict):
+                issues.append(
+                    f"{name}的 phase=freeze 缺少 "
+                    "character_conditions.freeze")
+            else:
+                issues.extend(
+                    f"{name}freeze condition 冲突：{_text(value)}"
+                    for value in raw_freeze_condition.get("issues") or []
+                    if _text(value))
+                phase_conditions.append((
+                    "freeze",
+                    _normalize_character_condition({
+                        "condition": raw_freeze_condition})))
+        for phase, condition in phase_conditions:
+            issues.extend(
+                f"{name}{phase} condition 冲突：{_text(value)}"
+                for value in condition.get("issues") or []
+                if _text(value))
+
+        action_hits = _behavior_hits(local_action)
+        performance_hits = _behavior_hits(local_performance)
+        state_hits = _behavior_hits(
+            " ".join(state_clauses.values()))
+        dialogue_hits = {"说话"} if speaker == name and dialogue else set()
+        all_hits = (
+            action_hits | performance_hits | state_hits | dialogue_hits)
+        start_life = start_condition.get("life_state")
+        end_life = end_condition.get("life_state")
+        death_transition = _actor_death_transition(
+            action, name, actor_names)
+        if death_transition and end_life != "dead":
             issues.append(
-                f"{name}已死亡/呈尸身态，却仍被要求呼吸、眨眼或表演微表情")
+                f"{name}发生明确死亡过程，但 end.condition.life_state"
+                " 未登记为 dead")
+        forbidden = set()
+        if start_life == "dead":
+            forbidden |= all_hits
+        elif end_life == "dead":
+            if not death_transition:
+                forbidden |= all_hits
+            else:
+                # Actions before a declared death may be alive actions. Anything
+                # assigned to performance/end state, or written after the death
+                # token, is post-terminal and therefore impossible.
+                forbidden |= performance_hits
+                terminal_indexes = [
+                    local_action.find(token)
+                    for token in TERMINAL_DEATH_TOKENS
+                    if token in local_action]
+                if terminal_indexes:
+                    forbidden |= _behavior_hits(
+                        local_action[min(terminal_indexes):])
+        if start_life == "nonliving" or end_life == "nonliving":
+            forbidden |= all_hits
+        if forbidden:
+            if "dead" in {start_life, end_life}:
+                issues.append(
+                    f"{name}已死亡/呈尸身态，却仍被要求"
+                    + "、".join(sorted(forbidden)))
+            else:
+                issues.append(
+                    f"{name}的 life_state={end_life or start_life}，"
+                    "却仍被要求" + "、".join(sorted(forbidden)))
+
+        start_consciousness = start_condition.get("consciousness_state")
+        end_consciousness = end_condition.get("consciousness_state")
+        restrictive_states = {"asleep", "unconscious"}
+        wake_transition = any(
+            token in local_action for token in WAKE_TRANSITION_TOKENS)
+        sleep_transition = any(
+            token in local_action for token in SLEEP_TRANSITION_TOKENS)
+        loses_consciousness = any(
+            token in local_action for token in UNCONSCIOUS_TRANSITION_TOKENS)
+        active_mind_hits = all_hits & {
+            "注视/眨眼", "说话", "微表情", "主动动作",
+        }
+        consciousness_forbidden = set()
+        if (start_consciousness in restrictive_states
+                and end_consciousness in restrictive_states):
+            consciousness_forbidden |= active_mind_hits
+        elif (start_consciousness in restrictive_states
+              and end_consciousness == "awake"):
+            if not wake_transition:
+                consciousness_forbidden |= active_mind_hits
+        elif end_consciousness in restrictive_states:
+            expected_transition = (
+                sleep_transition
+                if end_consciousness == "asleep"
+                else loses_consciousness)
+            if not expected_transition:
+                consciousness_forbidden |= active_mind_hits
+            else:
+                # End-state performance belongs after the transition.
+                consciousness_forbidden |= performance_hits & {
+                    "注视/眨眼", "说话", "微表情", "主动动作",
+                }
+        if consciousness_forbidden:
+            issues.append(
+                f"{name}的 consciousness_state="
+                f"{end_consciousness or start_consciousness}，"
+                "却仍被要求"
+                + "、".join(sorted(consciousness_forbidden)))
+
+        mobility_values = {
+            start_condition.get("mobility"),
+            end_condition.get("mobility"),
+        }
+        if ("immobile" in mobility_values
+                and "主动动作" in all_hits
+                and not (wake_transition or sleep_transition
+                         or loses_consciousness or death_transition)):
+            issues.append(
+                f"{name}的 mobility=immobile，却仍被要求主动动作")
 
     era_constraints = [
         _text(value) for value in (
@@ -1761,6 +3024,150 @@ def validate_shot_prompt_contract(contract):
     if angle == "仰拍" and any(
             token in physical for token in ("顶拍", "摄影机在人物上方")):
         issues.append("镜头要求仰拍，但空间合同要求人物上方俯拍")
+
+    issues.extend(
+        _text(value) for value in contract.get("prop_issues") or []
+        if _text(value))
+    frame_props = contract.get("frame_props")
+    if frame_props is None:
+        frame_props = physical_contract.get("frame_props") or []
+    if not isinstance(frame_props, list):
+        issues.append("frame_props 必须是列表")
+        frame_props = []
+    prop_registry = contract.get("prop_registry")
+    if not isinstance(prop_registry, list):
+        issues.append("prop_registry 必须是列表")
+        prop_registry = []
+    registered_prop_ids = set()
+    for position, item in enumerate(prop_registry, 1):
+        if not isinstance(item, dict):
+            issues.append(f"prop_registry[{position}] 必须是对象")
+            continue
+        prop_id = _text(item.get("prop_id"))
+        if not prop_id:
+            issues.append(f"prop_registry[{position}] 缺少 prop_id")
+        elif prop_id in registered_prop_ids:
+            issues.append(f"prop_registry 中 prop_id 重复：{prop_id}")
+        else:
+            registered_prop_ids.add(prop_id)
+    physical_positions = {}
+    physical_prop_phases = set()
+    declared_prop_phases = set()
+    for position, item in enumerate(frame_props, 1):
+        if not isinstance(item, dict):
+            issues.append(f"第{position}个 frame_prop 必须是对象")
+            continue
+        prop_id = _text(item.get("prop_id"))
+        phase = _text(item.get("phase"))
+        location = _prop_main_position(item)
+        representation = _text(
+            item.get("representation") or item.get("occurrence_type")
+            or item.get("presence_type") or item.get("channel"),
+            "physical").lower()
+        visibility = _text(item.get("visibility"), "visible").lower()
+        disclosure = _is_prop_disclosure(representation)
+        physical_instance = visibility != "absent" and not disclosure
+        if not prop_id:
+            issues.append(f"第{position}个 frame_prop 缺少 prop_id")
+            continue
+        if prop_id not in registered_prop_ids:
+            issues.append(f"frame_prop「{prop_id}」未登记到 prop_registry")
+        if visibility not in {"visible", "occluded", "hidden", "absent"}:
+            issues.append(
+                f"frame_prop「{prop_id}」的 visibility 非法：{visibility}")
+        if representation not in {
+                "physical", "reflection", "screen", "painting", "overlay"}:
+            issues.append(
+                f"frame_prop「{prop_id}」的 representation 非法："
+                f"{representation}")
+        for field in ("physical_state", "holder", "location", "support"):
+            if not _text(item.get(field)):
+                issues.append(
+                    f"frame_prop「{prop_id}」的 {field} 必须显式填写，"
+                    "无则写 none")
+        declared_prop_phases.add((prop_id, phase))
+        if phase not in {"start", "end", "freeze"}:
+            issues.append(
+                f"frame_prop「{prop_id}」的 phase 必须是 start/end/freeze")
+        if physical_instance and not location:
+            issues.append(
+                f"frame_prop「{prop_id}」是物理实例但缺少主位置")
+        if not physical_instance:
+            # Mirror/screen/painting appearances disclose the same object but
+            # never create another physical location.
+            continue
+        key = (prop_id, phase)
+        physical_prop_phases.add(key)
+        previous_location = physical_positions.get(key)
+        if previous_location:
+            if previous_location != location:
+                issues.append(
+                    f"同一 physical prop_id「{prop_id}」在 phase={phase}"
+                    f"同时位于「{previous_location}」和「{location}」；"
+                    "同一 phase 只能有一个物理主位置")
+            else:
+                issues.append(
+                    f"同一 physical prop_id「{prop_id}」在 phase={phase}"
+                    "被重复登记；一个 prop_id 只能代表一个物理实例")
+        elif location:
+            physical_positions[key] = location
+
+    prop_transitions = contract.get("prop_transitions")
+    if prop_transitions is None:
+        prop_transitions = physical_contract.get("prop_transitions") or []
+    if not isinstance(prop_transitions, list):
+        issues.append("prop_transitions 必须是列表")
+        prop_transitions = []
+    for position, item in enumerate(prop_transitions, 1):
+        if not isinstance(item, dict):
+            issues.append(f"第{position}个 prop_transition 必须是对象")
+            continue
+        prop_id = _text(item.get("prop_id"))
+        from_phase = _text(item.get("from_phase"))
+        to_phase = _text(item.get("to_phase"))
+        if not prop_id:
+            issues.append(f"第{position}个 prop_transition 缺少 prop_id")
+        if from_phase != "start" or to_phase != "end":
+            issues.append(
+                f"prop_transition「{prop_id or position}」必须从 start 到 end")
+        if prop_id and (prop_id, from_phase) not in declared_prop_phases:
+            issues.append(
+                f"prop_transition「{prop_id}」的 {from_phase} 状态"
+                "必须由对应 frame_props 声明")
+        if prop_id and (prop_id, to_phase) not in declared_prop_phases:
+            issues.append(
+                f"prop_transition「{prop_id}」的 {to_phase} 状态"
+                "必须由对应 frame_props 声明")
+
+    output_for_props = contract.get("output") or {}
+    if isinstance(output_for_props, dict):
+        prop_media = _text(output_for_props.get("media"))
+        target_phase = _text(output_for_props.get("frame_phase"))
+        if prop_media == "video":
+            timeline_prop_ids = {
+                prop_id for prop_id, phase in declared_prop_phases
+                if phase in {"start", "end"}}
+            for prop_id in timeline_prop_ids:
+                for required_phase in ("start", "end"):
+                    if (prop_id, required_phase) not in declared_prop_phases:
+                        issues.append(
+                            f"视频中的 prop_id「{prop_id}」缺少 "
+                            f"phase={required_phase} 的 frame_props；"
+                            "未出现时也必须显式写 visibility=absent")
+        if prop_media == "image" and prop_transitions:
+            for item in prop_transitions:
+                if not isinstance(item, dict):
+                    continue
+                prop_id = _text(item.get("prop_id"))
+                if (prop_id
+                        and (prop_id, "freeze") not in declared_prop_phases
+                        and (prop_id, target_phase)
+                        not in declared_prop_phases):
+                    issues.append(
+                        f"静态图中的 prop_id「{prop_id}」只有 transition，"
+                        "缺少 phase=freeze（或当前 start/end）的 frame_props"
+                        " 定格记录；"
+                        "transition 不能代替静态定格状态")
 
     relations = (
         contract.get("spatial_relations")
@@ -1804,9 +3211,48 @@ def validate_shot_prompt_contract(contract):
         if media not in {"image", "video"}:
             issues.append("output.media 必须是 image 或 video")
         if media == "image" and (
-                phase not in {"start", "end"}
+                phase not in {"start", "end", "freeze"}
                 or policy != "terminal_only"):
-            issues.append("静态图 output 必须指定 start/end 且只使用 terminal_only")
+            issues.append(
+                "静态图 output 必须指定 start/end/freeze 且只使用 terminal_only")
+        if media == "image":
+            frame_target = contract.get("frame_target")
+            target_policy = contract.get("frame_target_policy") or {}
+            if not isinstance(target_policy, dict):
+                target_policy = {}
+            allow_legacy = bool(
+                target_policy.get("allow_legacy_fallback"))
+            if not isinstance(frame_target, dict):
+                issues.append("静态图缺少显式 frame_target 对象")
+                frame_target = {}
+            target_state = _state_value(
+                frame_target.get("state")
+                if "state" in frame_target
+                else contract.get("frame_target_state"))
+            fallback = bool(
+                frame_target.get(
+                    "fallback", contract.get("frame_target_fallback")))
+            explicit = bool(
+                frame_target.get(
+                    "explicit", contract.get("frame_target_explicit")))
+            if not target_state:
+                issues.append("静态图 frame_target 缺少唯一可见定格状态")
+            elif any(
+                    re.search(pattern, target_state)
+                    for pattern in STATIC_PROCESS_PATTERNS):
+                issues.append(
+                    "静态图 frame_target 同时描述多个时间状态或动作过程；"
+                    "必须改写为单一可见定格结果")
+            if (fallback or not explicit) and not allow_legacy:
+                issues.append(
+                    "静态图必须由人工/上游显式声明 frame_target；"
+                    "运行时从 start/end/description/action 回退默认阻断")
+            if (explicit and not frame_target.get("fallback_declared")):
+                issues.append(
+                    "静态图 frame_target 必须显式声明 fallback=false")
+            if allow_legacy and not _text(target_policy.get("name")):
+                issues.append(
+                    "静态图 legacy 兼容必须显式命名 frame_target_policy")
         if media == "video" and (
                 phase != "timeline" or policy != "timeline"):
             issues.append("视频 output 必须指定 timeline")
@@ -1814,12 +3260,29 @@ def validate_shot_prompt_contract(contract):
         _text(value) for value in contract.get("output_issues") or []
         if _text(value))
 
+    issues = list(dict.fromkeys(issues))
+    warnings = []
+    target_policy = contract.get("frame_target_policy") or {}
+    frame_target = contract.get("frame_target") or {}
+    if (isinstance(target_policy, dict)
+            and target_policy.get("allow_legacy_fallback")
+            and isinstance(frame_target, dict)
+            and (frame_target.get("fallback")
+                 or not frame_target.get("explicit"))):
+        warnings.append(
+            "当前静态图使用显式 legacy frame_target 兼容策略；"
+            "应尽快迁移为上游直接登记的唯一静态定格")
+    semantic_corrections = [
+        dict(value) for value in (
+            contract.get("semantic_corrections") or [])
+        if isinstance(value, dict)
+    ]
+    status = "BLOCK" if issues else ("WARN" if warnings else "PASS")
     return {
         "passed": not issues,
-        "issues": list(dict.fromkeys(issues)),
-        "semantic_corrections": [
-            dict(value) for value in (
-                contract.get("semantic_corrections") or [])
-            if isinstance(value, dict)
-        ],
+        "status": status,
+        "severity": status,
+        "issues": issues,
+        "warnings": warnings,
+        "semantic_corrections": semantic_corrections,
     }

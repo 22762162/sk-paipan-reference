@@ -13,6 +13,7 @@ from .config import (CODEX_PROFILE_LIMIT, Config, normalize_codex_profile)
 from .errors import AifosError
 
 CAPABILITY_CN = {
+    "prompt_review": "Codex提示词审核优化",
     "script": "剧本", "storyboard": "分镜", "image": "图片",
     "frames": "首尾帧", "video": "视频", "voice": "配音",
     "edit": "剪辑", "cover": "封面",

@@ -84,3 +84,38 @@ def test_source_adaptation_prompt_makes_props_and_local_rewrite_explicit():
     assert "人物信息状态" in prompt
     assert "局部返编问题场" in prompt
     assert '"continuity_contract"' in prompt
+
+
+def test_prop_phase_aliases_normalize_before_audit():
+    """模型写 begin/开场/scene_start 等同义 phase → 本地归一,不丢弃剧本。"""
+    from aifos.story_logic import audit_prop_contract, normalize_prop_contract
+
+    def registry_with(phase):
+        return {
+            "scenes": [{"scene_no": 1, "event_id": "scene:1"}],
+            "prop_registry": [{
+                "prop_id": "prop-letter", "name": "血书", "kind": "core",
+                "instance_count": 1,
+                "availability_start_event": {
+                    "event_id": "episode-start", "phase": phase},
+                "disclosure_policy": "explicit_frame_only"}]}
+
+    for alias, expected in (("begin", "start"), ("开场", "start"),
+                            ("scene_start", "start"), ("Retired", "end"),
+                            ("尾帧", "end"), ("定格", "freeze")):
+        script = registry_with(alias)
+        normalize_prop_contract(script)
+        got = script["prop_registry"][0][
+            "availability_start_event"]["phase"]
+        assert got == expected, (alias, got)
+        assert not [issue for issue
+                    in audit_prop_contract(script)["issues"]
+                    if "phase" in issue]
+
+    # 语义不明的值保留原样,交给校验(继而就地修复),不得瞎猜
+    script = registry_with("midway")
+    normalize_prop_contract(script)
+    assert script["prop_registry"][0][
+        "availability_start_event"]["phase"] == "midway"
+    assert [issue for issue in audit_prop_contract(script)["issues"]
+            if "phase" in issue]

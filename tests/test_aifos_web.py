@@ -12,6 +12,7 @@ import pytest
 from aifos.app import App
 from aifos.db import now
 from aifos.director import character_candidate_target
+from aifos.prompt_contract import build_shot_prompt_contract
 from aifos.story_analysis import build_story_analysis, validate_story_analysis
 from aifos.web.server import JobRegistry, _current_render_plan_items, serve
 
@@ -82,8 +83,8 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260726-semantic-qc-1" in html
-    assert "/static/app.js?v=20260726-semantic-qc-1" in html
+    assert "/static/style.css?v=20260727-character-identity-1" in html
+    assert "/static/app.js?v=20260727-character-initial-2" in html
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
@@ -1168,6 +1169,17 @@ def test_episode_payload_compacts_valid_repeated_character_prompt(server):
     assert "说服父皇" not in prompt
 
 
+def test_story_analysis_ui_requires_manual_gender_and_age_before_images(server):
+    status, _, app_js = _request(server["port"], "GET", "/static/app.js")
+    assert status == 200
+    text = app_js.decode()
+    assert "性别（必填）" in text
+    assert "可见年龄段（必填）" in text
+    assert "参考图不能代替这两项" in text
+    assert 'data-identity-field="gender"' in text
+    assert 'data-identity-field="age_range"' in text
+
+
 def test_asset_image_catalog_has_category_origin_time_and_prompt(server):
     app2 = App(server["workspace"])
     try:
@@ -1448,6 +1460,8 @@ def test_produce_flow_and_episode_api(server):
     assert pre["storyboard"] is None
     assert pre["artifacts"]["cast_art"] == []
 
+    assert pre["artifacts"]["scene_art"] == []
+
     # 人物资产模式在开画前就能选定
     assert pre["character_asset_policy"]["mode"] == "auto"
     policy_version = pre["character_asset_policy_version"]
@@ -1493,7 +1507,7 @@ def test_produce_flow_and_episode_api(server):
     assert all(candidate["url"].startswith("/artifacts/")
                for c in selection["characters"]
                for candidate in c["candidates"])
-    assert all(candidate["variant_source"] == "generated"
+    assert all(candidate["variant_source"] == "initial_state_same_prompt"
                for c in selection["characters"]
                for candidate in c["candidates"])
     assert all(candidate["variant_label"] and candidate["look_variant"]
@@ -1843,6 +1857,22 @@ def test_image_acceleration_options_and_preflight_api(server):
                 "shot_no": 1, "characters": ["林昭"],
                 "prompt": "林昭看向镜头", "aspect": "9:16",
                 "image_quality": "medium", "image_task_class": "batch",
+                "prompt_contract": build_shot_prompt_contract({
+                    "shot_no": 1,
+                    "characters": ["林昭"],
+                    "description": "林昭看向镜头",
+                    "frame_target": {
+                        "phase": "end",
+                        "state": "林昭看向镜头",
+                        "fallback": False,
+                    },
+                    "prop_registry": [],
+                }, location="室内", mode="image"),
+                "prompt_review": {
+                    "approved": True,
+                    "status": "approved",
+                    "optimized_hash": "test-approved",
+                },
                 "identity_references": [{
                     "character": "林昭", "asset_id": 1, "uri": str(ref)}],
                 "character_refs": [str(ref)],

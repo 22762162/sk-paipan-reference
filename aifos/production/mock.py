@@ -14,6 +14,7 @@ from html import escape
 from pathlib import Path
 
 from ..adapters.claude_script import normalize_script_bible
+from ..identity_facts import explicit_age_range, explicit_gender
 from ..story_analysis import build_story_analysis
 from .base import Provider, ProviderResult
 from .cinematic import render_cover, render_portrait, render_shot
@@ -563,7 +564,9 @@ class MockProvider(Provider):
 
     def _enrich_script_characters(self, script, payload, genre=None):
         """占位剧本也输出完整人物背景,让后续真实出图不靠默认都市模板。"""
-        for character in script.get("characters", []):
+        source_text = " ".join(str(payload.get(key) or "") for key in (
+            "project_title", "premise", "style", "template"))
+        for index, character in enumerate(script.get("characters", [])):
             genre_name = genre or self._design_genre(payload, character)
             story_pool = self.STORY_COSTUME_POOLS[genre_name]
             role = character.get("role") or "角色"
@@ -572,6 +575,36 @@ class MockProvider(Provider):
                        "当代校园" if genre_name == "campus" else
                        "当代舞台与练习室")
             name = character.get("name", "角色")
+            role_text = f"{name} {character.get('role') or ''}"
+            if any(token in role_text for token in (
+                    "皇帝", "太子", "父", "哥哥", "弟弟", "男主")):
+                gender = "男"
+            elif any(token in role_text for token in (
+                    "皇后", "公主", "母", "姐姐", "妹妹", "女主")):
+                gender = "女"
+            elif "女团" in source_text:
+                gender = "女"
+            elif "男团" in source_text:
+                gender = "男"
+            else:
+                # The mock author owns these invented characters, so it must
+                # declare their story identity instead of emitting a
+                # downstream placeholder. Imported user characters never pass
+                # through this authoring helper.
+                gender = "女" if index % 2 == 0 else "男"
+            age_range = {
+                "campus": "约16—18岁青少年",
+                "idol": "约20—26岁青年",
+                "urban": "约24—35岁青年",
+                "xianxia": "约20—35岁青年",
+            }.get(genre_name, "约20—35岁青年")
+            # 这些人物由 mock 编剧本身创造；如果模板先放入了“未指定/
+            # 以参考图为准”之类占位值，编剧必须在交稿前明确事实，不能让
+            # 下游人物图替它猜性别和年龄。
+            if not explicit_gender(character.get("gender")):
+                character["gender"] = gender
+            if not explicit_age_range(character.get("age_range")):
+                character["age_range"] = age_range
             character.setdefault(
                 "background_prompt",
                 f"{name}是{setting}中的{role},带着一段改变信念的过往;"
@@ -798,6 +831,29 @@ class MockProvider(Provider):
             shot["physical_logic"] = (
                 f"{'、'.join(names) or '空镜'}位于当前场景有效支撑面内；"
                 f"动作“{action}”的朝向、接触点、视线与道具使用方向可达")
+            subject = "、".join(names) or "空镜环境"
+            start_state = (
+                f"{subject}位于各自起始标记位，身体朝向、视线与姿态"
+                "定格为一个稳定可见状态")
+            end_state = (
+                f"{subject}位于各自终点标记位，身体朝向、视线与表情"
+                "定格为一个稳定可见状态")
+            # Mock 是上游分镜提供者，也必须像真实 AI 一样在交稿时明确
+            # 三种静帧目标；不能把决定拖到关键帧编译时再从动作文字猜。
+            shot["frame_targets"] = {
+                "keyframe": {
+                    "phase": "end", "state": end_state,
+                    "fallback": False,
+                },
+                "first_frame": {
+                    "phase": "start", "state": start_state,
+                    "fallback": False,
+                },
+                "last_frame": {
+                    "phase": "end", "state": end_state,
+                    "fallback": False,
+                },
+            }
         uri = _json_artifact(out_dir / "storyboard.json", storyboard)
         return storyboard, uri
 

@@ -34,6 +34,7 @@ from .generation_diagnostics import (
     targeted_prompt_patch,
 )
 from .image_acceleration import ImageAccelerationStore
+from .identity_facts import unresolved_identity_fields
 from .quality_policy import (
     default_quality_policy,
     formal_reference_allowed,
@@ -57,6 +58,7 @@ from .prompt_contract import (
 from .qc_feedback import optimize_qc_feedback
 from .lessons import (DOMAIN_SCRIPT, lessons_block, project_lessons,
                       record_lessons, script_lessons_block)
+from .qc_stats import record_qc
 from .relations import relation_lines, write_relations
 from .spatial_blocking import (
     build_spatial_plan,
@@ -73,6 +75,11 @@ from .story_analysis import (
     unresolved_character_labels,
     validate_line_speaker_resolution,
     validate_story_analysis,
+)
+from .story_logic import (
+    PROP_CONTRACT_SCHEMA,
+    audit_prop_contract,
+    audit_storyboard_prop_contract,
 )
 from .script_import import sanitize_script_entities
 from .workflow import (
@@ -186,6 +193,11 @@ RESELECTABLE_STATUSES = frozenset({
 # 的检查点;正在跑批次的剧集仍然一律拒绝。
 ASSET_POLICY_STATUSES = frozenset(
     RESELECTABLE_STATUSES | {"created", "awaiting_script"})
+# v4:母版基准状态改为"优先级最高"的显式裁决条款(旧版只罗列事实,
+# 与母版硬规则互斥时审核只能判冲突并熔断)。版本号变化会让沿用旧
+# 提示词的计划项与资产自动失效重建,不会复用带矛盾的陈旧提示词。
+CHARACTER_CANDIDATE_PROMPT_SCHEMA = (
+    "aifos.character-candidate/v4-master-precedence")
 CHARACTER_BACKGROUND_RULE = (
     "人物立绘必须是纯净、无文字的单人物资产背景;背景只允许纯色、柔和渐变"
     "或干净无辨识度的棚拍底,禁止任何场景、建筑、室内、街道、自然环境、"
@@ -354,7 +366,9 @@ def character_candidate_target(character):
 def character_candidate_policy_text():
     return ("主角、重要配角和普通配角统一4张候选；"
             "跑龙套/背景路人不做独立设定、不生成候选图或立绘；"
-            "所有候选继承本剧唯一画风，只比较人物身份与剧情造型细节")
+            "同一人物4张候选使用完全相同的首次登场基础定妆提示词，"
+            "只靠模型随机采样比较人物形象；不得换装、换妆、加入淋湿、"
+            "泥污、伤情、死亡态或其他后续剧情状态")
 
 
 def core_prop_definitions(script):
@@ -413,6 +427,18 @@ def character_production_readiness_error(script, analysis=None):
                 or is_unresolved_character(character)):
             continue
         item = analysis_map.get(character.get("name")) or {}
+        effective_identity = {
+            "gender": item.get("gender") or character.get("gender"),
+            "age_range": (
+                item.get("age_range") or character.get("age_range")),
+        }
+        unresolved = unresolved_identity_fields(effective_identity)
+        if unresolved:
+            return (
+                f"人物「{character.get('name')}」的"
+                f"{'、'.join(unresolved)}尚未明确。"
+                "请在制作圣经的人物卡中人工填写；"
+                "未确认前不会生成候选图，参考图不能代替人物身份事实。")
         if not str(
                 item.get("image_prompt")
                 or character.get("image_prompt") or "").strip():
@@ -421,51 +447,9 @@ def character_production_readiness_error(script, analysis=None):
                 "请先重新运行 AI 人物分析。")
     return None
 
-# 人物定版候选不承担“选画风”的职责。本剧画风由项目/制作圣经唯一锁定；
-# 多张候选只用于比较同一画风下的人物身份、表情和剧情造型细节。候选被人工
-# 锁定后，其完整脸、发型、妆容与服装才成为后续镜头不可漂移的身份锚点。
-CHARACTER_LOOK_VARIANTS = (
-    {
-        "variant_id": "story_baseline",
-        "variant_label": "候选 A · 基准身份",
-        "look_variant": {
-            "hair": "采用剧本人物设定中的基准发型",
-            "makeup": "采用剧本人物设定中的基准妆容或面部修饰",
-            "costume": "采用剧本人物设定中的基准服装与配色",
-            "temperament": "准确呈现剧本设定的核心性格与气质",
-        },
-    },
-    {
-        "variant_id": "clean_minimal",
-        "variant_label": "候选 B · 发型细节",
-        "look_variant": {
-            "hair": "同一发型体系内做轻微梳理和发丝整理差异，不改变身份轮廓",
-            "makeup": "保持基准妆造和本剧统一媒介，只做不可改变身份的轻微强弱差异",
-            "costume": "保持基准服装体系，只调整剧情允许的层次或细节",
-            "temperament": "同一核心性格，表情略偏清爽自然，不能改变人物气质",
-        },
-    },
-    {
-        "variant_id": "sharp_professional",
-        "variant_label": "候选 C · 表情细节",
-        "look_variant": {
-            "hair": "保持基准发型轮廓、发际线和发色家族，不更换发型体系",
-            "makeup": "保持基准妆造，只让眉眼表情和面部明暗更清晰",
-            "costume": "保持基准服装体系，不能以更换画风或时代服装制造差异",
-            "temperament": "同一核心性格，表情略偏专注坚定，不能变成另一种人设",
-        },
-    },
-    {
-        "variant_id": "soft_relaxed",
-        "variant_label": "候选 D · 职业细节",
-        "look_variant": {
-            "hair": "保持基准发型轮廓，只允许不改变身份的自然发丝差异",
-            "makeup": "保持基准妆造体系，不能改成另一种媒介或人物年龄感",
-            "costume": "保持职业、时代和剧情服装体系，突出一个可追溯的职业细节",
-            "temperament": "同一核心性格，补充与职业/经历一致的自然状态",
-        },
-    },
-)
+# 人物定版候选不承担“选画风”或“展示剧情换装”的职责。本剧画风与人物
+# 首次登场基础定妆只编译一次，同一人物的四张图复用同一份最终提示词；
+# 四选一只比较模型随机采样出来的人脸、比例与整体完成度。
 
 # 人物完整资产套件：16:9 合成板只用于审核；面部、正面、严格侧面和
 # 完整背面必须分别生成高清单图，作为后续镜头真正使用的母资产。
@@ -1023,6 +1007,15 @@ class Director:
         if budget and episode["cost"] >= budget:
             raise BudgetExceeded(
                 f"单集成本 {episode['cost']:.2f} 已达预算 {budget},停止调度")
+        if capability in ("image", "frames", "cover"):
+            review = self.router.review_image_prompt(
+                capability, payload, ctx["out_root"] / sub_dir,
+                cancel=lambda: self._cancel_requested(ctx))
+            if review is not None:
+                self._task_cost += review.cost
+                self._task_providers.add(review.provider)
+                self.projects.add_episode_cost(
+                    ctx["episode"]["id"], review.cost)
         result = self.router.call(
             capability, payload, ctx["out_root"] / sub_dir,
             cancel=lambda: self._cancel_requested(ctx))
@@ -1030,6 +1023,120 @@ class Director:
         self._task_providers.add(result.provider)
         self.projects.add_episode_cost(ctx["episode"]["id"], result.cost)
         return result
+
+    def _review_image_tasks(self, ctx, tasks):
+        """并行审核提示词；显式同词组只审核一次并复用同一优化稿。"""
+        review_tasks = [
+            task for task in tasks
+            if task.get("capability") in ("image", "frames", "cover")
+            and isinstance(task.get("payload"), dict)
+        ]
+        if not review_tasks:
+            return
+        groups = {}
+        for task in review_tasks:
+            payload = task["payload"]
+            explicit_group = str(
+                payload.get("prompt_review_group_key") or "").strip()
+            if explicit_group:
+                source = str(
+                    payload.get("prompt_compact")
+                    or payload.get("prompt") or "").strip()
+                context = self.router._prompt_review_context(
+                    task["capability"], payload)
+                fingerprint = self._stable_hash({
+                    "capability": task["capability"],
+                    "prompt": source,
+                    "context": context,
+                })
+                group_key = (
+                    "shared", explicit_group, fingerprint)
+            else:
+                group_key = ("single", task["item_id"])
+            groups.setdefault(group_key, []).append(task)
+        review_groups = list(groups.values())
+        profiles = self._codex_parallel_profiles()
+        for index, task in enumerate(review_tasks):
+            payload = task["payload"]
+            if payload.get("_prompt_review_profile"):
+                continue
+            if payload.get("_codex_profile"):
+                payload["_prompt_review_profile"] = payload[
+                    "_codex_profile"]
+            elif profiles:
+                payload["_prompt_review_profile"] = profiles[
+                    index % len(profiles)]["id"]
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        workers = min(self._total_image_workers(), len(review_groups))
+        cancel = lambda: self._cancel_requested(ctx)  # noqa: E731
+
+        def review_one(group):
+            task = group[0]
+            return group, self.router.review_image_prompt(
+                task["capability"], task["payload"],
+                ctx["out_root"] / task["sub_dir"], cancel=cancel)
+
+        completed = []
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = [pool.submit(review_one, group)
+                       for group in review_groups]
+            for future in as_completed(futures):
+                try:
+                    completed.append(future.result())
+                except Exception:
+                    for pending in futures:
+                        pending.cancel()
+                    raise
+        reviewed = 0
+        for group, result in completed:
+            source_payload = group[0]["payload"]
+            for task in group[1:]:
+                target_payload = task["payload"]
+                for key in (
+                        "prompt", "prompt_compact",
+                        "prompt_aifos_original", "prompt_review",
+                        "prompt_review_schema",
+                        "prompt_review_feedback_applied", "feedback"):
+                    if key in source_payload:
+                        target_payload[key] = copy.deepcopy(
+                            source_payload[key])
+                    elif key in target_payload and key in (
+                            "prompt_compact", "feedback"):
+                        target_payload.pop(key, None)
+            for task in group:
+                payload = task["payload"]
+                audit = payload.get("prompt_review") or {}
+                self._plan_mark(
+                    ctx, task["item_id"],
+                    self._plan_read_status(ctx, task["item_id"]),
+                    extra={
+                        "prompt_review": copy.deepcopy(audit),
+                        "prompt_aifos_original": payload.get(
+                            "prompt_aifos_original", ""),
+                        "prompt_optimized": (
+                            payload.get("prompt_compact")
+                            or payload.get("prompt") or ""),
+                    })
+            if result is None:
+                continue
+            reviewed += 1
+            self._task_cost += result.cost
+            self._task_providers.add(result.provider)
+            self.projects.add_episode_cost(
+                ctx["episode"]["id"], result.cost)
+        if reviewed:
+            self.log.info(
+                "director",
+                f"Codex提示词审核优化完成:{reviewed}/{len(review_groups)}组，"
+                f"覆盖{len(review_tasks)}张图；同词组复用同一优化稿后进入"
+                "图片生成")
+
+    def _plan_read_status(self, ctx, item_id):
+        """读取清单状态；提示词审核写审计信息时不得改变生产状态。"""
+        for item in self._plan_read(ctx).get("items", []):
+            if item.get("id") == item_id:
+                return item.get("status", "pending")
+        return "pending"
 
     # ---- 增量复用:已有资产落盘完好则直接使用 ----
     def _existing_asset_uri(self, ctx, kind, name):
@@ -1392,50 +1499,28 @@ class Director:
                 + CHARACTER_BACKGROUND_RULE)
 
     def _candidate_variant(self, index, design=None):
-        """返回同一项目画风下的候选差异轴和资产元数据。"""
-        template = CHARACTER_LOOK_VARIANTS[index - 1]
-        look = dict(template["look_variant"])
-        if design:
-            base_costume = ";".join(filter(None, (
-                str(design.get("costume") or "").strip(),
-                str(design.get("costume_detail") or "").strip(),
-            )))
-            base = {
-                "hair": str(design.get("hair") or "").strip(),
-                "makeup": str(design.get("makeup") or "").strip(),
-                "costume": base_costume,
-                "temperament": str(design.get("temperament") or "").strip(),
-            }
-            for key, value in base.items():
-                if not value:
-                    continue
-                if index == 1:
-                    look[key] = value
-                else:
-                    look[key] = f"基准设定:{value}；本候选{look[key]}"
+        """四张候选共用首次登场状态和同一提示词，仅随机采样不同。"""
+        if index < 1 or index > CHARACTER_CANDIDATES:
+            raise AifosError(f"人物候选序号超出范围: {index}")
         story_variants = self._story_variants(design)
-        story_variant = (story_variants[index - 1]
-                         if index <= len(story_variants) else None)
-        if story_variant:
-            label = story_variant.get("label") or story_variant.get("name")
-            if label:
-                story_label = str(label)
-            else:
-                story_label = ""
-            for key in ("hair", "makeup", "costume", "temperament"):
-                if story_variant.get(key):
-                    look[key] = self._design_value(story_variant[key])
+        if story_variants:
+            initial = copy.deepcopy(story_variants[0])
         else:
-            story_label = ""
+            initial = self._candidate_design_initial_variant(design or {})
+        initial = self._compile_candidate_story_variant(
+            design or {}, initial)
+        look = {
+            key: self._design_value(initial.get(key))
+            for key in ("hair", "makeup", "costume", "temperament")
+        }
+        slot = "ABCD"[index - 1]
         return {
-            "variant_id": template["variant_id"],
-            "variant_label": (f"{template['variant_label']} · "
-                              f"{story_label}"
-                              if story_label
-                              else template["variant_label"]),
+            "variant_id": f"initial_state_sample_{slot.lower()}",
+            "variant_label": f"初始状态同提示词候选 {slot}",
             "look_variant": look,
-            "variant_source": "generated",
-            "story_variant": story_variant or {},
+            "variant_source": "initial_state_same_prompt",
+            "story_variant": initial,
+            "candidate_prompt_schema": CHARACTER_CANDIDATE_PROMPT_SCHEMA,
         }
 
     @staticmethod
@@ -1460,68 +1545,453 @@ class Director:
                 for part in value.replace("；", "|").split("|")
                 if part.strip()]
 
+    @staticmethod
+    def _freeze_candidate_static_field(value):
+        """把初始定妆中的“可/或”备选冻结为一个明确静态状态。"""
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        replacements = (
+            ("可摘下", "已经摘下"),
+            ("可脱下", "已经脱下"),
+            ("可重新戴", "重新戴"),
+            ("可佩戴", "佩戴"),
+            ("可手持", "手持"),
+            ("可提", "提"),
+            ("可以", ""),
+        )
+        for old, new in replacements:
+            text = text.replace(old, new)
+        clauses = []
+        for clause in re.split(r"([；;。])", text):
+            if clause in ("；", ";", "。"):
+                if clauses and not clauses[-1].endswith(("；", ";", "。")):
+                    clauses[-1] += clause
+                continue
+            clause = clause.strip()
+            if not clause:
+                continue
+            if "或" in clause:
+                first, alternative = clause.split("或", 1)
+                trailing_verb = next((
+                    verb for verb in (
+                        "保护", "携带", "佩戴", "持握", "放置",
+                        "展示", "使用", "收起", "固定")
+                    if alternative.rstrip("，,；;。").endswith(verb)), "")
+                clause = first.rstrip("，, ")
+                if trailing_verb and not clause.endswith(trailing_verb):
+                    clause += trailing_verb
+            clauses.append(clause)
+        return "".join(clauses).strip()
+
+    @staticmethod
+    def _clean_candidate_initial_state_text(value):
+        """剥离淋湿、泥污、伤情、死亡、场次动作姿态等一次性剧情状态。
+
+        磨旧、补丁、旧疤等稳定人物设计仍保留；首次登场即使发生在
+        雨中，人物候选母版也只表现自然、干燥、无伤的基础状态。
+
+        姿态尤其关键:定妆母版硬规定「全身正面自然站姿」，若把场次里
+        的失去支撑、搀扶、蜷缩等动作姿态写进母版，就与该硬规则直接
+        矛盾，提示词审核只能熔断(禁止猜测取舍)，整批人物图卡死。
+        """
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        replacements = (
+            ("旧湿布包", "旧布包"),
+            ("湿旧蓝布包袱", "旧蓝布包袱"),
+            ("湿旧布包袱", "旧布包袱"),
+            ("被雨打湿的", ""),
+            ("被暴雨浸透的", ""),
+            ("被大雨浸透的", ""),
+            ("淋湿的", ""),
+            ("湿透的", ""),
+            ("湿碎发", "自然碎发"),
+            ("湿发贴额", "碎发自然贴近额角"),
+            ("湿发", "自然发丝"),
+            ("湿灰褐", "灰褐"),
+            ("雨浸黑褐", "黑褐"),
+            ("雨水与泥点", ""),
+            ("雨水、泥点", ""),
+            ("雨水和泥点", ""),
+            ("和雨水泥点", ""),
+            ("与雨水泥点", ""),
+            ("雨水泥点", ""),
+            ("雨水和风霜", "风霜"),
+            ("数日风雨后", ""),
+            ("唇色因湿冷略淡", ""),
+            ("衣料半干半湿", ""),
+            ("半干半湿", ""),
+            ("吸水塌软的", "磨旧的"),
+            ("雨后贴肩下压", "自然贴合肩部"),
+            ("泥黄色", "土黄色"),
+            ("泥黄", "土黄"),
+        )
+        for old, new in replacements:
+            text = text.replace(old, new)
+        # 剧本经常把稳定服装与临时状态写在同一个短句里，例如
+        # “青灰粗布长衫沾黄泥水”。先只剥离状态后缀，不能因为短句里
+        # 出现“泥水/血迹”就把长衫本身一起删除。
+        inline_state_patterns = (
+            r"(?:被)?(?:暴雨|大雨|雨水|雨)?(?:浸透|打湿|淋湿|淋透|浸湿)",
+            r"(?:衣料)?(?:受潮|湿漉漉)",
+            r"(?:沾|溅|带|覆|满是|混着|拖着)"
+            r"(?:少量|些许|一层|黄|黑|暗红|深色)?"
+            r"(?:泥水|泥点|泥渍|泥污|泥浆|泥)",
+            r"(?:沾|带|覆|满是|混着)"
+            r"(?:少量|些许|一层|暗红|鲜红)?"
+            r"(?:血迹|血污|血水|血)",
+        )
+        for pattern in inline_state_patterns:
+            text = re.sub(pattern, "", text)
+
+        transient = (
+            "被暴雨浸透", "被雨打湿", "淋湿", "湿透", "雨水打湿",
+            "衣料受潮", "雨水", "雨夜", "水渍", "泥点", "泥水",
+            "溅泥", "沾泥", "沾少量旧泥", "泥渍", "拖泥",
+            "新沾深泥", "后脑", "血丝", "流血", "血迹", "暗红伤",
+            "刀刺", "刺伤", "擦伤", "擦痕", "擦破",
+            "肿伤", "伤口", "负伤", "遇害", "尸体", "死亡妆",
+            "眩晕", "骑行", "赶路", "奔逃", "跌倒", "昏迷",
+            "松开后", "随行弓兵",
+            # 场次动作姿态:与母版硬规则「全身正面自然站姿」互斥,
+            # 必须剥离,否则审核判定事实源冲突并熔断整批人物图。
+            "失去支撑", "失去平衡", "重心不稳", "站立不稳", "踉跄",
+            "瘫软", "倒地", "倒下", "扑倒", "跪地", "跪倒", "半跪",
+            "蜷缩", "俯身", "弯腰", "侧卧", "仰卧", "趴伏", "伏地",
+            "搀扶", "被扶", "扶住", "撑地", "撑住", "护包", "抱紧",
+            "紧抱", "死死抓", "攥紧", "挣扎", "抽搐", "颤抖着",
+            "转身", "回头", "奔跑", "疾走", "举手", "抬手", "伸手",
+            "指向", "推开", "拉扯", "抬臂格挡", "格挡",
+        )
+        clauses = []
+        for clause in re.split(r"[；;。]", text):
+            fragments = [
+                fragment.strip(" ，,")
+                for fragment in re.split(r"[，,]", clause)
+                if fragment.strip(" ，,")
+            ]
+            safe = [
+                fragment for fragment in fragments
+                if not any(token in fragment for token in transient)
+            ]
+            if safe:
+                clauses.append("，".join(safe))
+        result = "；".join(dict.fromkeys(clauses))
+        result = re.sub(r"[、，；]{2,}", "；", result)
+        return result.strip(" ，,；;。")
+
+    @classmethod
+    def _candidate_static_accessories(cls, value):
+        """初始母版只保留确定入画的配饰，删除可选和跨阶段内容。"""
+        kept = []
+        for clause in re.split(r"[；;。]", str(value or "")):
+            clause = clause.strip()
+            if not clause or any(token in clause for token in (
+                    "遇害后", "撤离时", "后续", "结尾", "后来",
+                    "受伤后", "仅在", "才允许")):
+                continue
+            if "可" in clause or "或" in clause:
+                continue
+            cleaned = cls._clean_candidate_initial_state_text(clause)
+            if cleaned:
+                kept.append(cleaned)
+        return "；".join(kept)
+
+    @classmethod
+    def _candidate_initial_design_field(cls, value):
+        """没有造型表时，优先保留全局描述中的开场/初始段。"""
+        kept = []
+        for clause in re.split(r"[；;。]", str(value or "")):
+            clause = clause.strip()
+            if not clause:
+                continue
+            if any(token in clause for token in (
+                    "结尾", "后来", "后续", "换装后", "受伤后",
+                    "遇害后", "嫁祸后")):
+                continue
+            clause = re.sub(r"^(?:开场|初始|首次登场)[:：]?", "", clause)
+            cleaned = cls._clean_candidate_initial_state_text(clause)
+            if cleaned:
+                kept.append(cleaned)
+        return "；".join(dict.fromkeys(kept))
+
+    def _candidate_design_initial_variant(self, design):
+        """旧设定没有造型表时，编译唯一的无剧情状态初始母版。"""
+        design = design if isinstance(design, dict) else {}
+        costume = self._candidate_initial_design_field("；".join(
+            filter(None, (
+                str(design.get("costume") or "").strip(),
+                str(design.get("costume_detail") or "").strip(),
+            ))))
+        props = self._candidate_static_accessories(
+            design.get("accessories"))
+        if not props:
+            props = self._candidate_static_accessories(
+                design.get("signature_props"))
+        return {
+            "label": "人物首次登场基础定妆",
+            "occasion": "人物首次登场前的基础定妆状态",
+            "hair": str(design.get("hair") or "").strip(),
+            "makeup": str(design.get("makeup") or "").strip(),
+            "costume": costume or "采用人物设定中唯一明确的初始基础服装",
+            "palette": str(design.get("palette") or "").strip(),
+            "props": props,
+            "temperament": str(
+                design.get("temperament")
+                or design.get("personality") or "").strip(),
+            "derived_from": "character_design_initial_look",
+        }
+
+    def _compile_candidate_story_variant(self, design, story_variant):
+        """把首次造型编译成无临时剧情状态的唯一初始母版。"""
+        result = copy.deepcopy(story_variant)
+        for key in (
+                "costume", "props", "accessories", "hair", "makeup",
+                "palette", "temperament"):
+            value = result.get(key)
+            if value:
+                value = self._freeze_candidate_static_field(value)
+                result[key] = self._clean_candidate_initial_state_text(value)
+        if not result.get("hair"):
+            result["hair"] = self._clean_candidate_initial_state_text(
+                (design or {}).get("hair"))
+        if not result.get("makeup"):
+            result["makeup"] = self._clean_candidate_initial_state_text(
+                (design or {}).get("makeup"))
+        if not result.get("temperament"):
+            result["temperament"] = self._clean_candidate_initial_state_text(
+                (design or {}).get("temperament")
+                or (design or {}).get("personality"))
+        face_cover = "；".join(str(result.get(key) or "")
+                              for key in ("costume", "props", "accessories"))
+        cover_tokens = ("蒙巾", "蒙黑布", "面罩", "面纱", "口罩")
+        if not any(token in face_cover for token in cover_tokens):
+            for key in ("hair", "makeup"):
+                result[key] = "；".join(
+                    clause.strip()
+                    for clause in re.split(
+                        r"[；;。]", str(result.get(key) or ""))
+                    if clause.strip()
+                    and not any(token in clause for token in cover_tokens))
+        hair_clauses = [
+            clause.strip()
+            for clause in re.split(r"[；;。]", result.get("hair") or "")
+            if clause.strip()
+        ]
+        if any(token in face_cover for token in (
+                "帽", "斗笠", "幞头", "冠")):
+            hair_clauses = [
+                clause for clause in hair_clauses
+                if not clause.startswith(("摘帽后", "脱帽后", "去冠后"))
+            ]
+        else:
+            revealed = next((
+                re.sub(r"^(?:摘帽后|脱帽后|去冠后)(?:为)?", "", clause)
+                for clause in hair_clauses
+                if clause.startswith(("摘帽后", "脱帽后", "去冠后"))), "")
+            if revealed:
+                hair_clauses = [revealed]
+        result["hair"] = "；".join(hair_clauses) \
+            or "保持人物首次登场时唯一明确的基础发型"
+        result["occasion"] = "人物首次登场前的基础定妆状态（非具体剧情镜头）"
+        result["injury_state"] = (
+            "初始人物母版：衣着与发肤保持自然干燥洁净状态；"
+            "无泥污、血迹、伤口、尸体妆或后续换装")
+        result["initial_state_policy"] = (
+            "只保留首次登场基础服装、发型、妆容与稳定身份特征")
+        return result
+
+    def _candidate_identity_card(self, design):
+        """候选图只继承稳定身份，不继承全局服装、道具或剧情状态。
+
+        ``image_prompt`` 与 ``visual_dna`` 中的服装/剧情道具通常描述某个
+        代表性剧情状态。初始候选不得把这些后续状态反向写进身份母版，
+        因此这里只编译脸、年龄、性别、体态与稳定身体痕迹。
+        """
+        design = design if isinstance(design, dict) else {}
+        parts = []
+        for key, label in (
+                ("species", "形态"),
+                ("gender", "性别"),
+                ("age_range", "年龄段"),
+                ("appearance", "脸部与体态"),
+                ("eyes", "眼睛")):
+            value = design.get(key)
+            if key == "gender" and not value:
+                value = design.get("sex")
+            value = self._clean_candidate_initial_state_text(
+                self._design_value(value))
+            if value:
+                parts.append(f"{label}:{value}")
+
+        dna = design.get("visual_dna")
+        if isinstance(dna, dict):
+            dna_keys = (
+                ("face_structure", "脸部骨相"),
+                ("body_or_occupation_marks", "稳定体态/身体痕迹"),
+            )
+            dna_parts = []
+            for key, label in dna_keys:
+                value = self._clean_candidate_initial_state_text(
+                    self._design_value(dna.get(key)))
+                if value and value not in "；".join(dna_parts):
+                    dna_parts.append(f"{label}:{value}")
+            if dna_parts:
+                parts.append("人物视觉DNA:" + "；".join(dna_parts))
+        return "；".join(parts)
+
+    def _candidate_prompt_review_context(
+            self, name, role, style, design, variant, has_reference=False):
+        """生成四张完全相同的初始候选审核事实。"""
+        look = variant.get("look_variant") or {}
+        story_variant = variant.get("story_variant") or {}
+        props = self._design_value(
+            story_variant.get("props")
+            or story_variant.get("accessories"))
+        occasion = self._design_value(
+            story_variant.get("occasion")
+            or story_variant.get("scene"))
+        palette = self._design_value(story_variant.get("palette"))
+        injury_state = self._design_value(
+            story_variant.get("injury_state"))
+        if has_reference:
+            hair = (
+                "只服从身份参考图的发际线、发型轮廓、发量和发色家族；"
+                "不继承参考图服装或剧情状态")
+            makeup = (
+                "只服从身份参考图的眉眼、眼线、睫毛、唇妆与稳定妆造；"
+                "不继承参考图服装或剧情状态")
+        else:
+            hair = self._design_value(look.get("hair"))
+            makeup = self._design_value(look.get("makeup"))
+        # 审核把本合同当不可变事实源。若这里残留淋湿/泥渍/血迹/伤情/
+        # 场次姿态,就会与下方 composition 的"干净、自然站姿"互斥,
+        # 审核规则禁止猜测优先级 → 整批熔断。故合同内的状态字段先经
+        # 同一套剥离器净化,再由 master_state_precedence 显式裁决。
+        clean = self._clean_candidate_initial_state_text
+        return {
+            "schema": "aifos.character-candidate-review/v4-master-precedence",
+            "candidate_prompt_schema": CHARACTER_CANDIDATE_PROMPT_SCHEMA,
+            "candidate_policy": (
+                "同一人物四张图片必须复用完全相同的初始状态最终提示词，"
+                "仅利用图片模型随机采样；审核不得为不同槽位创造差异"),
+            "task": "single_character_initial_identity_candidate",
+            "characters": [name],
+            "character_count": 1,
+            "role": role,
+            "identity_lock": (
+                self._candidate_identity_card(design)
+                or "仅锁定姓名、年龄、性别表达与同一人物身份"),
+            "initial_character_state": {
+                "hair": clean(hair) if not has_reference else hair,
+                "makeup": clean(makeup) if not has_reference else makeup,
+                "wardrobe": clean(self._design_value(look.get("costume"))),
+                "palette": palette,
+                "accessories_and_props": (
+                    clean(props) or
+                    "无额外剧情道具；不得继承人物全局道具或其他候选道具"),
+                "temperament": self._design_value(
+                    look.get("temperament")),
+                "occasion": clean(occasion),
+                # 母版恒为无伤无污;稳定旧疤等永久特征已在 identity_lock。
+                "injury_state": "无伤、无污、无包扎（母版基准状态）",
+                "state_policy": clean(str(story_variant.get(
+                    "initial_state_policy", ""))),
+            },
+            "source_precedence": (
+                "initial_character_state是四张候选共同且唯一的服装、配色、"
+                "妆容、配饰与状态事实源；不得继承人物全局最终出图卡、"
+                "全局服装/标志道具或前后剧情造型"),
+            "master_state_precedence": (
+                "本合同是定妆母版:恒为干燥、洁净、无伤、无包扎的基础状态"
+                "与自然站姿。任何来源(剧本、人物设定、场次状态、参考图)"
+                "中的淋湿、水痕、泥点、泥渍、血迹、伤口、死亡态,以及跪地、"
+                "蜷缩、搀扶、失去支撑等场次动作姿态,母版一律不表现。"
+                "本条优先级最高,与其他事实并列出现时直接按本条执行,"
+                "不构成需要裁决的冲突,也不需要猜测优先级"),
+            "reference_identity_lock": bool(has_reference),
+            "reference_scope": (
+                "若有参考图，只锁脸型、五官骨相、年龄、性别表达、"
+                "发际线、发型轮廓与稳定妆造；明确排除参考图服装、"
+                "配饰、手持物、姿势、背景和光线"
+                if has_reference else "本候选没有身份参考图"),
+            "style": style,
+            "composition": (
+                "严格1名人物、单一连续身体、全身正面自然站姿、"
+                "纯净无文字中性背景"),
+        }
+
     def _candidate_portrait_prompt(self, name, role, style, design, variant,
                                    has_reference=False):
         """把内部分析编译成同一项目画风下、单张图可执行的提示词。"""
-        final_card = self._design_value(
-            (design or {}).get("image_prompt"))
-        if final_card:
-            identity = final_card
-        else:
-            identity = self._design_line(
-                design, keys=("species", "gender", "age_range", "identity",
-                              "appearance", "eyes", "era_setting", "occupation",
-                              "signature_props"))
-            dna = (design or {}).get("visual_dna")
-            if isinstance(dna, dict):
-                compact_dna = "；".join(
-                    f"{label}:{value}" for key, label in (
-                        ("face_structure", "脸部骨相"),
-                        ("hair_silhouette", "发型轮廓"),
-                        ("body_or_occupation_marks", "体态/职业痕迹"),
-                        ("clothing_structure", "服装结构"),
-                        ("story_visual_symbol", "视觉符号"),
-                        ("signature_accessory", "核心配饰"),
-                        ("temperament_keywords", "气质"),
-                    )
-                    if (value := self._design_value(dna.get(key))))
-                if compact_dna:
-                    identity = f"{identity}；人物视觉DNA:{compact_dna}"
-        look = variant["look_variant"]
+        identity = self._candidate_identity_card(design)
+        look = variant.get("look_variant") or {}
+        story_variant = variant.get("story_variant") or {}
         if has_reference:
             hair = (
                 "严格保持参考图发型轮廓、发际线、发量和发色家族；"
-                "候选不改变发型身份，只允许自然发丝状态差异")
+                "四张候选不得更换发型身份")
             makeup = (
                 "严格保持参考图妆造、眉眼、眼线、睫毛和唇妆身份；"
-                "候选不改变妆造体系")
+                "四张候选不得改变妆造体系")
             variant_rule = (
                 "有参考图时只锁人物脸型、五官骨相、年龄、性别表达、发际线"
-                "、发型、妆造和身份标志；候选只允许剧情服装细节、表情和轻微"
-                "姿态差异，禁止换脸、换发型或换画风")
+                "、发型、妆造和身份标志；参考图中的服装、配饰、手持物、"
+                "姿势、背景和光线不得继承；四张图禁止换脸、换发型、"
+                "换妆造、换服装或换画风")
         else:
-            hair = look["hair"]
-            makeup = look["makeup"]
+            hair = self._design_value(look.get("hair")) \
+                or "保持同一人物的明确发型轮廓"
+            makeup = self._design_value(look.get("makeup")) \
+                or "保持同一人物的明确妆造"
             variant_rule = (
-                "无参考图时,可在同一项目画风、时代、职业和核心人物气质内"
-                "做有限的发型/妆容/表情细节差异,不得制作不同画风候选")
-        workwear = self._sheet_workwear_line(f"{name};{role}", design)
+                "无参考图时，四张图仍必须使用同一人物身份、同一发型、"
+                "同一妆容、同一服装、同一构图和同一项目画风；"
+                "只允许图片模型自身随机采样产生自然结果差异")
+        costume = self._design_value(look.get("costume")) \
+            or "采用人物首次登场时唯一明确的基础服装"
+        temperament = self._design_value(look.get("temperament")) \
+            or "保持核心人物气质"
+        occasion = self._design_value(
+            story_variant.get("occasion") or story_variant.get("scene"))
+        palette = self._design_value(story_variant.get("palette"))
+        props = self._design_value(
+            story_variant.get("props") or story_variant.get("accessories"))
+        injury_state = self._design_value(
+            story_variant.get("injury_state"))
+        props_line = (
+            props if props else
+            "无额外剧情道具；不得从人物全局设定或前后剧情"
+            "造型自动继承手持道具")
         return (
-            f"【任务】{name}（{role}）单人定角候选 · {variant['variant_label']}。"
-            "不同候选是互斥造型，不是同一套衣服只换动作。"
-            f"【最终人物出图卡】{identity or '年龄、物种、性别表达与核心身份不变'}。"
-            f"【本张造型覆盖项】仅以下字段覆盖出图卡中的对应字段："
-            f"发型:{hair}；妆容:{makeup}；服装:{look['costume']}；"
-            f"表情气质:{look['temperament']}。{variant_rule}。"
-            + (f";剧情场合:{variant.get('story_variant', {}).get('occasion') or variant.get('story_variant', {}).get('scene')}"
-               if variant.get("story_variant", {}).get("occasion")
-               or variant.get("story_variant", {}).get("scene") else "")
-            + (f";配饰/道具:{variant.get('story_variant', {}).get('props') or variant.get('story_variant', {}).get('accessories')}"
-               if variant.get("story_variant", {}).get("props")
-               or variant.get("story_variant", {}).get("accessories") else "")
+            f"【任务】{name}（{role}）单人初始状态定角候选。"
+            "【四图同词】本角色四张候选必须复用本条经审核后的完全相同"
+            "最终提示词；只利用图片模型随机采样比较人物形象，不得换装、"
+            "换妆、换发型、换道具、换构图或切换剧情阶段。"
+            f"【稳定身份锚】{identity or '年龄、物种、性别表达与同一人物身份不变'}；"
+            "本段不定义服装、配色或剧情道具。"
+            f"【共同初始造型】发型:{hair}；妆容:{makeup}；"
+            f"服装:{costume}；"
+            + (f"配色:{palette}；" if palette else "")
+            + f"配饰/道具:{props_line}；表情气质:{temperament}。"
+            + (f"定妆时点:{occasion}。" if occasion else "")
+            + (f"【状态边界】{injury_state}。" if injury_state else "")
+            + "【造型优先级】“共同初始造型”是四张图共用且唯一的服装、"
+            "配色、妆容、配饰与手持道具事实源；不得继承人物全局最终"
+            "出图卡、全局服装/标志道具或前后剧情造型。"
+            # 事实源里若残留淋湿/泥污/血迹/伤情/动作姿态,与母版硬规则
+            # (干净、无伤、正面自然站姿)互斥,审核禁止猜测取舍只能熔断。
+            # 明确宣告母版规则优先,把"需要猜"变成"有规可依"。
+            + "【母版基准状态·优先级最高】定妆母版只表现人物干燥、洁净、"
+            "无伤、无污的基础状态与自然站姿。若上文出现淋湿、水痕、泥点、"
+            "泥渍、血迹、伤口、包扎、死亡态,或跪地、蜷缩、搀扶、失去支撑等"
+            "场次动作姿态,母版一律不表现；本条优先于上文相应描述，"
+            "不需要在两者之间做取舍判断。"
+            + f"{variant_rule}。"
             + f"【PROJECT STYLE LOCK】本项目唯一画风:{style}；"
             "所有候选必须完全一致，不得制作不同画风候选。"
-            + (f"职业服装:{workwear}。" if workwear else "")
             + "人物立绘必须是纯净、无文字的单人物资产背景。"
             "【构图】单人、全身正面自然站姿、从头到脚完整、纯净中性棚拍背景；"
             "五官、手指、关节与身体比例自然。"
@@ -2137,6 +2607,29 @@ class Director:
                 # 质检问题只记录为待审核观察；临时修订不得自动升级成
                 # 项目永久规则，更不能污染其他镜头的提示词。
                 qc = (extra or {}).get("qc") or {}
+                if qc.get("passed") is not None:
+                    # 质检台账:通过/未通过都记,失败原因自动归类;
+                    # 供 `aifos stats` 与 /api/qc/failure-stats 聚合。
+                    try:
+                        record_qc(
+                            ctx["out_root"],
+                            episode_id=ctx["episode"]["id"],
+                            item_id=item_id,
+                            category=item.get("category", ""),
+                            capability=item.get("capability", ""),
+                            provider=str(
+                                (extra or {}).get("provider")
+                                or item.get("provider") or ""),
+                            model=str(
+                                (extra or {}).get("model")
+                                or item.get("model") or ""),
+                            task_class=str(
+                                item.get("image_task_class") or ""),
+                            passed=qc.get("passed"),
+                            issues=qc.get("issues"),
+                            attempts=qc.get("attempts"))
+                    except Exception:
+                        pass   # 台账失败绝不能影响生产主流程
                 issues = qc.get("lesson_issues") or (
                     qc.get("issues") if qc.get("passed") is False else [])
                 if issues:
@@ -2347,7 +2840,16 @@ class Director:
         issues = []
         if not prompt_used.strip():
             issues.append("最终提示词为空")
-        if payload.get("shot_no") is not None:
+        prompt_review = payload.get("prompt_review") or {}
+        review_status = str(prompt_review.get("status") or "")
+        if not (
+                prompt_review.get("approved") is True
+                or review_status == "not_applicable_mock_only"):
+            issues.append("最终提示词尚未通过Codex审核优化")
+        # 只有真正的分镜关键帧/首尾帧需要 v2.2 镜头合同。人物候选图
+        # 为便于排序也带有 shot_no=0，但它不是分镜，不能被误拦成
+        # “缺少镜头合同”。
+        if category in {"shot_image", "frames"}:
             validation = validate_shot_prompt_contract(
                 payload.get("prompt_contract") or {})
             if not validation["passed"]:
@@ -2437,6 +2939,7 @@ class Director:
             "prompt_hash": self._stable_hash(prompt),
             "prompt_used": prompt_used,
             "prompt_used_hash": self._stable_hash(prompt_used),
+            "prompt_review": copy.deepcopy(prompt_review),
             "references": {
                 "required": True,
                 "count": len(reference_facts),
@@ -2454,6 +2957,8 @@ class Director:
             "item_id", "category", "capability", "prompt_hash",
             "prompt_used_hash",
             "reference_hash", "characters", "identity_map")}
+        token_basis["prompt_review_hash"] = prompt_review.get(
+            "optimized_hash", "")
         contract["token"] = self._stable_hash(token_basis)
         return contract
 
@@ -2539,12 +3044,12 @@ class Director:
             }, error=error)
 
     def _plan_run(self, ctx, item_id, fn, prompt=None, payload=None,
-                  revision_source="manual"):
+                  revision_source="manual", capability="image"):
         """包住一次出图调用:生成中 → 完成/失败;手动停止落回排队。
         完成时记录实际使用的产线(真实/占位)与回退原因,界面透明可见。"""
         payload = payload or {}
         feedback = payload.get("feedback", "")
-        if payload.get("shot_no") is not None:
+        if str(item_id).startswith(("shot:", "frames:")):
             if not isinstance(payload.get("reference_manifest"), list):
                 self._attach_reference_manifest(payload)
             validation = validate_shot_prompt_contract(
@@ -2554,6 +3059,14 @@ class Director:
                 raise AifosError(
                     "镜头生成合同前置校验失败，未调用生图 API："
                     + "；".join(validation["issues"]))
+        review = self.router.review_image_prompt(
+            capability, payload, ctx["out_root"] / "prompt_reviews",
+            cancel=lambda: self._cancel_requested(ctx))
+        if review is not None:
+            self._task_cost += review.cost
+            self._task_providers.add(review.provider)
+            self.projects.add_episode_cost(
+                ctx["episode"]["id"], review.cost)
         generation_input = self._image_generation_input(payload)
         self._plan_mark(ctx, item_id, "generating", prompt=prompt,
                         extra={
@@ -2564,6 +3077,11 @@ class Director:
                             "generation_input": generation_input,
                             "prompt_contract_validation": payload.get(
                                 "prompt_contract_validation") or {},
+                            "prompt_review": copy.deepcopy(
+                                payload.get("prompt_review") or {}),
+                            "prompt_aifos_original": payload.get(
+                                "prompt_aifos_original", ""),
+                            "prompt_optimized": generation_input["prompt"],
                             "reference_inputs": self._reference_inputs(
                                 payload),
                             "revision": {
@@ -2854,6 +3372,10 @@ class Director:
             "input_hash": generation_input_hash(prompt_sent, manifest),
             "prompt_contract": copy.deepcopy(
                 payload.get("prompt_contract") or {}),
+            "prompt_review": copy.deepcopy(
+                payload.get("prompt_review") or {}),
+            "prompt_aifos_original": str(
+                payload.get("prompt_aifos_original") or ""),
             "quality": str(payload.get("image_quality") or ""),
             "model": str(payload.get("model_override") or ""),
             "project_id": (qc_spec or {}).get("_project_id"),
@@ -3585,6 +4107,12 @@ class Director:
             self._attach_reference_manifest(payload)
         lesson_issues = []
         while True:
+            # 每次真正出图（包括QC修订重试）都以当前最终输入重新过Codex。
+            # 输入哈希未变化时路由器会复用已批准审核，不产生重复调用。
+            prompt_review = self.router.review_image_prompt(
+                capability, payload, out_dir, cancel=cancel)
+            if prompt_review is not None:
+                spent += float(prompt_review.cost or 0.0)
             generation_input = self._image_generation_input(
                 payload, qc_spec=qc_spec)
             result = self.router.call(capability, payload, out_dir,
@@ -3886,7 +4414,8 @@ class Director:
         data = getattr(result, "data", {}) or {}
         for key in ("first_source", "generation_calls", "model",
                     "image_task_class", "image_quality", "unit_cost",
-                    "codex_profile"):
+                    "codex_profile", "prompt_review",
+                    "prompt_aifos_original", "prompt_optimized"):
             if key in data:
                 extra[key] = data[key]
         model = getattr(result, "model", "")
@@ -3951,6 +4480,19 @@ class Director:
             "image_task_class": payload.get("image_task_class"),
             "image_quality": payload.get("image_quality"),
             "reference_inputs": self._reference_inputs(payload),
+            "prompt_review": copy.deepcopy(
+                payload.get("prompt_review") or {}),
+            "prompt_aifos_original": payload.get(
+                "prompt_aifos_original", ""),
+            "prompt_optimized": (
+                payload.get("prompt_compact")
+                or payload.get("prompt") or ""),
+            "prompt_used": (
+                payload.get("prompt_compact")
+                or payload.get("prompt") or ""),
+            "prompt_used_hash": self._stable_hash(
+                payload.get("prompt_compact")
+                or payload.get("prompt") or ""),
         }
         if task.get("_codex_profile"):
             generating_extra["codex_profile"] = task["_codex_profile"]
@@ -4083,6 +4625,9 @@ class Director:
         if not tasks:
             return ({}, []) if continue_on_qc_failure else {}
         self._assign_codex_profiles(tasks)
+        # 提示词审核必须发生在API加速合同和图片worker之前；否则清单记录
+        # 的哈希仍是AIFOS原稿，实际出图却用了另一份输入。
+        self._review_image_tasks(ctx, tasks)
         self._prepare_dispatch_contracts(ctx, tasks)
         tasks = sorted(tasks, key=lambda task: (
             -int(task.get("priority", 0)), str(task.get("item_id", ""))))
@@ -4141,6 +4686,19 @@ class Director:
                         "image_task_class": payload.get("image_task_class"),
                         "image_quality": payload.get("image_quality"),
                         "reference_inputs": self._reference_inputs(payload),
+                        "prompt_review": copy.deepcopy(
+                            payload.get("prompt_review") or {}),
+                        "prompt_aifos_original": payload.get(
+                            "prompt_aifos_original", ""),
+                        "prompt_optimized": (
+                            payload.get("prompt_compact")
+                            or payload.get("prompt") or ""),
+                        "prompt_used": (
+                            payload.get("prompt_compact")
+                            or payload.get("prompt") or ""),
+                        "prompt_used_hash": self._stable_hash(
+                            payload.get("prompt_compact")
+                            or payload.get("prompt") or ""),
                     }
                     if task.get("_codex_profile"):
                         generating_extra["codex_profile"] = task[
@@ -4552,7 +5110,11 @@ class Director:
             "premise": premise,
             "style": style,
         })
-        error = validate_script_bible(script)
+        # Drafts with unresolved identity must remain reviewable so the user
+        # can fill the two fields.  The lock/cast gates call the strict
+        # validator and cannot advance to image generation.
+        error = validate_script_bible(
+            script, require_resolved_identity=False)
         if error:
             raise AifosError(f"剧本世界观/人物设定门禁失败: {error}")
         return script
@@ -4600,7 +5162,8 @@ class Director:
                 and current.get("script_version") == ctx.get(
                     "script_version")
                 and current.get("project_style") == project_style
-                and validate_story_analysis(current) is None):
+                and validate_story_analysis(
+                    current, require_resolved_identity=False) is None):
             analysis = build_story_analysis(
                 script, style, raw=current,
                 source=current.get("source", "saved"))
@@ -4644,7 +5207,8 @@ class Director:
         analysis = build_story_analysis(
             script, style, raw=result.data, source=result.provider)
         persist_auto_style(analysis)
-        error = validate_story_analysis(analysis)
+        error = validate_story_analysis(
+            analysis, require_resolved_identity=False)
         if error:
             raise AifosError(f"剧本 AI 分析失败: {error}")
         apply_story_analysis(script, analysis)
@@ -5207,12 +5771,15 @@ class Director:
             if design:
                 upgraded = self._upgrade_character_visual_dna(
                     design, character)
+                # 用户经"提意见改形象"确认过的字段是最高事实源,
+                # 不得被剧本侧的同名字段静默覆盖。
+                user_locked = set(upgraded.get("user_locked_fields") or ())
                 for key in (
                         "gender", "age_range", "identity", "image_prompt",
                         "negative_prompt", "visual_direction",
                         "character_analysis", "visual_dna",
                         "continuity_anchors"):
-                    if character.get(key):
+                    if character.get(key) and key not in user_locked:
                         upgraded[key] = copy.deepcopy(character[key])
                 dna = character.get("visual_dna")
                 if character.get("image_prompt") and isinstance(dna, dict):
@@ -5611,6 +6178,11 @@ class Director:
                     "variant_label": meta.get("variant_label", ""),
                     "look_variant": look_variant,
                     "variant_source": variant_source or "generated",
+                    "candidate_prompt_schema": meta.get(
+                        "candidate_prompt_schema", ""),
+                    "current_candidate_policy": (
+                        meta.get("candidate_prompt_schema")
+                        == CHARACTER_CANDIDATE_PROMPT_SCHEMA),
                     "selected": bool(
                         locked and selected_meta.get("candidate_asset_id") == row["id"]),
                 })
@@ -5769,7 +6341,66 @@ class Director:
             "variant_focus": focus,
         }
 
+    # 文书类道具:本体必然带正文,但正文由后续「锁文字」阶段统一定版。
+    # 母版若要求写出具体文字,模型只能编造 → 审核判定"缺少决定性文字
+    # 内容"并熔断;因此母版一律以不可辨读的方式呈现文字面。
+    _TEXT_BEARING_PROP_TOKENS = (
+        "札付", "文书", "公文", "信", "书信", "密信", "契", "契约",
+        "字条", "手札", "奏折", "折子", "卷宗", "账本", "册",
+        "名帖", "拜帖", "告示", "布告", "榜文", "牌匾", "匾",
+        "令牌", "腰牌", "路引", "地图", "图纸", "书", "经卷",
+    )
+
+    @classmethod
+    def _prop_has_text_surface(cls, prop):
+        blob = " ".join(str(prop.get(key) or "") for key in (
+            "name", "visual_design", "story_function", "era_material"))
+        return any(token in blob for token in cls._TEXT_BEARING_PROP_TOKENS)
+
+    def _prop_candidate_review_context(self, prop, style, variant):
+        """道具母版的独立审核事实合同。
+
+        与人物母版同构:只给当前这张图需要的事实,并显式宣告母版状态
+        优先级,避免审核把外包装/污损/文书正文当成必须裁决的冲突。
+        """
+        clean = self._clean_candidate_initial_state_text
+        return {
+            "schema": "aifos.prop-candidate-review/v1-master-precedence",
+            "task": "single_prop_master_asset_candidate",
+            "prop_name": prop.get("name", ""),
+            "candidate_policy": (
+                "同一道具四张候选复用完全相同的母版提示词，"
+                "仅利用图片模型随机采样比较造型方案"),
+            "prop_facts": {
+                key: clean(self._design_value(prop.get(key)))
+                for key in ("story_function", "visual_design",
+                            "era_material", "owner")
+                if self._design_value(prop.get(key))
+            },
+            "variant_axis": variant.get("variant_focus", ""),
+            "master_state_precedence": (
+                "本合同是道具母版:只表现道具本体出厂/初始的完整形态。"
+                "任何来源中的外包装(油纸、布套、匣盒)、污渍、泥点、血迹、"
+                "水痕、破损、折裂及其他场次临时状态,母版一律不表现。"
+                "本条优先级最高,与其他事实并列出现时直接按本条执行,"
+                "不构成需要裁决的冲突,也不需要猜测优先级"),
+            "text_policy": (
+                "本道具是文字载体:母版以卷合/折叠/闭合/斜角呈现,"
+                "正文一律不可辨读;禁止编造任何文字、印章或落款内容——"
+                "具体文字由后续「锁文字」阶段统一定版,母版不需要也"
+                "不允许确定文字内容,这不构成事实缺失"
+                if self._prop_has_text_surface(prop) else
+                "本道具非文字载体:画面不得出现任何文字、Logo 或水印"),
+            "style": style,
+            "composition": (
+                "单件道具完整居中、三分之四视角、纯净中性棚拍背景、"
+                "无人物、无手、无场景"),
+        }
+
     def _prop_candidate_prompt(self, prop, style, variant):
+        # 连续性状态是场次事实(油纸外包→拆封→沾血),不是母版事实。
+        # 把它写进母版会与"无包装/无污损"的母版约束直接矛盾,
+        # 审核禁止猜测取舍只能熔断整批道具图。
         facts = "；".join(
             f"{label}:{self._design_value(prop.get(key))}"
             for key, label in (
@@ -5777,26 +6408,46 @@ class Director:
                 ("visual_design", "视觉结构"),
                 ("era_material", "时代与材质"),
                 ("owner", "归属/持有人"),
-                ("continuity_states", "连续性状态"),
             ) if self._design_value(prop.get(key)))
+        text_rule = (
+            "【文字面】本道具带文字载体:母版只呈现其物理形态与工艺,"
+            "一律以卷合、折叠、闭合或斜角呈现,使正文不可辨读;"
+            "禁止编造任何具体文字、印章内容或落款——正文由后续"
+            "「锁文字」阶段统一定版。"
+            if self._prop_has_text_surface(prop) else
+            "无新增文字、无字幕、无Logo、无水印；")
         return (
             f"【任务】核心道具「{prop['name']}」四选一候选 · "
             f"{variant['variant_label']}。"
             f"【道具事实】{facts or '外形、功能、材质与时代必须服从正式剧本'}。"
+            # 事实源常把外包装、污损、破口写进视觉结构。母版必须给出
+            # 确定的取舍规则,否则审核面对"包装 vs 无包装"只能判冲突
+            # 并熔断(规则禁止猜测)。这里明确宣告优先级,消除歧义。
+            "【母版基准状态·优先级最高】只画道具本体出厂/初始的完整形态。"
+            "若上文事实中出现外包装(油纸、布套、匣盒等)、污渍、泥点、"
+            "血迹、水痕、破损、折裂或任何场次临时状态,母版一律不画,"
+            "只保留道具本体;本条优先于事实源中的相应描述,不需要在两者"
+            "之间做取舍判断。"
+            f"{text_rule}"
             f"【本候选优化轴】{variant['variant_focus']}；"
             "只改变不影响剧情功能的轮廓、材质、工艺和细节方案，不得改变"
             "用途、尺寸级别、持有人、时代、文字内容或连续性状态。"
             f"【PROJECT STYLE LOCK】本项目唯一画风:{style}。"
             "单件道具完整居中，三分之四视角，结构和可握持/可使用部位清晰，"
-            "纯净中性棚拍背景，无人物、无手、无场景、无包装、无新增文字、"
-            "无字幕、无Logo、无水印；自然比例与材质真实可制造。")
+            "纯净中性棚拍背景，无人物、无手、无场景；"
+            "自然比例与材质真实可制造。")
 
     def _ensure_character_candidates(self, ctx, characters, designs, style,
                                      batch=None):
-        """补足人物候选。batch 非空时只登记任务，由调用方统一并行执行。"""
+        """每个人物用同一初始提示词生成4张候选。
+
+        batch 非空时只登记任务，由调用方把人物/道具/场景合并成同一批
+        并行执行，随后统一交给 CODEX 评选自动确认。
+        """
         project_id = ctx["project"]["id"]
         seed = []
         tasks = []
+        reused_slots = set()
         quality_by_candidate = {}
         variant_by_candidate = {}
         for character in characters:
@@ -5813,9 +6464,46 @@ class Director:
                 meta = self._asset_meta(row)
                 idx = int(meta.get("candidate_index") or 0)
                 uri = row["uri"]
+                if (meta.get("candidate_prompt_schema")
+                        != CHARACTER_CANDIDATE_PROMPT_SCHEMA):
+                    # 旧版按剧情状态拆分的候选仍保留在资产历史中，但不能
+                    # 被新版初始状态四选一流程复用。
+                    continue
+                if (not meta.get("variant_label")
+                        or not isinstance(meta.get("look_variant"), dict)
+                        or not str(meta.get("prompt") or "").strip()):
+                    continue
                 if idx and uri and (uri.startswith(("http://", "https://"))
                                     or Path(uri).exists()):
                     existing[idx] = row
+                    reused_slots.add((name, idx))
+            existing_prompts = {
+                str(self._asset_meta(row).get("prompt") or "").strip()
+                for row in existing.values()
+            }
+            if len(existing_prompts) > 1:
+                # 同一v3批次若出现多个最终提示词，说明旧运行没有真正
+                # 执行“四图同词”；整组作废并另起版本，历史文件不删除。
+                reused_slots.difference_update(
+                    (name, index) for index in existing)
+                existing = {}
+                existing_prompts = set()
+            shared_existing_prompt = next(
+                iter(existing_prompts), "")
+            shared_existing_meta = (
+                self._asset_meta(next(iter(existing.values())))
+                if existing else {})
+            shared_review_seed = {}
+            if shared_existing_prompt:
+                audit = shared_existing_meta.get("prompt_review")
+                if isinstance(audit, dict) and audit:
+                    shared_review_seed["prompt_review"] = copy.deepcopy(
+                        audit)
+                original = str(
+                    shared_existing_meta.get("prompt_aifos_original")
+                    or "").strip()
+                if original:
+                    shared_review_seed["prompt_aifos_original"] = original
             if locked and not existing:
                 # 人工上传的最终立绘没有候选集，仍视为明确人工定版。
                 continue
@@ -5842,10 +6530,12 @@ class Director:
                         variant = {
                             key: existing_meta[key] for key in (
                                 "variant_id", "variant_label", "look_variant",
-                                "variant_source", "story_variant")
+                                "variant_source", "story_variant",
+                                "candidate_prompt_schema")
                             if key in existing_meta
                         }
-                        variant.setdefault("variant_source", "generated")
+                        variant.setdefault(
+                            "variant_source", "initial_state_same_prompt")
                     else:
                         variant = {
                             "variant_id": "",
@@ -5854,8 +6544,12 @@ class Director:
                             "variant_source": "legacy",
                         }
                 variant_by_candidate[(name, index)] = variant
-                if variant["variant_source"] == "legacy":
-                    prompt = "历史候选未记录候选差异轴，请按当前项目唯一画风和角色重要度规则重新生成"
+                if index in existing:
+                    prompt = str(
+                        self._asset_meta(existing[index]).get("prompt")
+                        or shared_existing_prompt)
+                elif shared_existing_prompt:
+                    prompt = shared_existing_prompt
                 else:
                     prompt = self._candidate_portrait_prompt(
                         name, role, style, designs.get(name), variant,
@@ -5883,8 +6577,17 @@ class Director:
                         "quality_decision": quality,
                         "art_name": f"{name}_candidate_{index:02d}",
                         "role": role, "shot_no": 0,
-                        "characters": [name], "location": "",
+                        "characters": [name], "character_count": 1,
+                        "location": "",
                         "prompt": prompt, "style": style,
+                        **shared_review_seed,
+                        "prompt_review_group_key": (
+                            f"character-initial:{project_id}:{name}:"
+                            f"{CHARACTER_CANDIDATE_PROMPT_SCHEMA}"),
+                        "prompt_review_context":
+                            self._candidate_prompt_review_context(
+                                name, role, style, designs.get(name),
+                                variant, has_reference=bool(refs)),
                         # 候选提示词已编译为可直接出图的视觉合同。人物
                         # 剧情设定仍保留在 payload 供审计/QC 使用，但不再
                         # 由 API Provider 二次拼入模型提示词。
@@ -5905,24 +6608,32 @@ class Director:
         # 已存在的候选明确标成复用，避免重新排队。
         for item in seed:
             name, index = item["name"], item["candidate_index"]
-            status = self.character_selection_status(project_id, [name])
-            if any(c["index"] == index
-                   for c in status["characters"][0]["candidates"]):
+            if (name, index) in reused_slots:
                 self._plan_mark(ctx, item["id"], "reused", only_pending=True)
 
         def register(results):
             for (name, index, role), result in results.items():
                 quality = quality_by_candidate[(name, index)]
                 variant = variant_by_candidate[(name, index)]
+                result_data = (result.data if isinstance(result.data, dict)
+                               else {})
+                seed_prompt = next(
+                    item["prompt"] for item in seed
+                    if item["id"] == f"candidate:{name}:{index}")
+                stored_prompt = str(
+                    result_data.get("prompt_optimized") or seed_prompt)
                 self.assets.register(
                     project_id, "character_candidate", f"{name}:{index:02d}",
                     uri=result.uri,
                     meta={"character": name, "role": role,
                           "candidate_index": index,
                           **variant,
-                          "prompt": next(
-                              item["prompt"] for item in seed
-                              if item["id"] == f"candidate:{name}:{index}"),
+                          "prompt": stored_prompt,
+                          "prompt_aifos_original": str(
+                              result_data.get("prompt_aifos_original")
+                              or seed_prompt),
+                          "prompt_review": copy.deepcopy(
+                              result_data.get("prompt_review") or {}),
                           "reference_images": list(
                               next(task["payload"].get(
                                   "reference_images", [])
@@ -5931,7 +6642,11 @@ class Director:
                                   f"candidate:{name}:{index}")),
                           "provider": result.provider,
                           "model": getattr(result, "model", ""),
-                          **self._quality_meta(quality)})
+                          **self._quality_meta(quality)},
+                    new_version=self.assets.latest(
+                        project_id, "character_candidate",
+                        f"{name}:{index:02d}", include_deleted=True)
+                    is not None)
             return self.character_selection_status(project_id, characters)
 
         if batch is not None:
@@ -6010,6 +6725,12 @@ class Director:
                         "prompt": prompt,
                         "style": style,
                         "prompt_contract_complete": True,
+                        # 不走默认审核上下文:那会把 story_world、
+                        # character_background 等全局事实(含场次状态)
+                        # 混进不可变事实源,与母版规则互斥并熔断。
+                        "prompt_review_context":
+                            self._prop_candidate_review_context(
+                                prop, style, variant),
                         **reference_payload,
                         "require_reference_images": bool(refs),
                         "aspect": "1:1", "width": 1024, "height": 1024,
@@ -6257,10 +6978,16 @@ class Director:
             raise AifosError(
                 "低质量试错图不能锁为正式人物参考，请把选中形象以高质量重生后再定版")
         candidate_meta = self._asset_meta(candidate)
+        if (candidate_meta.get("candidate_prompt_schema")
+                != CHARACTER_CANDIDATE_PROMPT_SCHEMA):
+            raise AifosError(
+                "该图由旧版“不同剧情状态候选”规则生成，不能再锁为"
+                "初始人物母版；请先续跑生成4张同提示词的新候选")
         variant_meta = {
             key: candidate_meta[key] for key in (
                 "variant_id", "variant_label", "look_variant",
-                "variant_source") if key in candidate_meta
+                "variant_source", "candidate_prompt_schema")
+            if key in candidate_meta
         }
         meta = {
             "character": character_name,
@@ -7049,12 +7776,12 @@ class Director:
             str(name): {
                 "wardrobe": str(
                     (wardrobe_states or {}).get(name) or "").strip(),
-                "headwear": str(
-                    (headwear_states or {}).get(name) or "").strip(),
+                "headwear": copy.deepcopy(
+                    (headwear_states or {}).get(name) or {}),
             }
             for name in set(wardrobe_states or {}) | set(headwear_states or {})
-            if (str((wardrobe_states or {}).get(name) or "").strip()
-                or str((headwear_states or {}).get(name) or "").strip())
+            if ((wardrobe_states or {}).get(name)
+                or (headwear_states or {}).get(name))
         }
         ranked = []
         for row in self.assets.active_list(project_id):
@@ -7088,8 +7815,8 @@ class Director:
                     actual_state = row_appearance.get(name) or {}
                     actual_wardrobe = str(
                         actual_state.get("wardrobe") or "")
-                    actual_headwear = str(
-                        actual_state.get("headwear") or "")
+                    actual_headwear = copy.deepcopy(
+                        actual_state.get("headwear") or {})
                     if (expected["wardrobe"]
                             and not self._wardrobe_states_compatible(
                                 expected["wardrobe"], actual_wardrobe)):
@@ -7098,7 +7825,7 @@ class Director:
                     if (expected["headwear"]
                             and not self._headwear_states_compatible(
                                 expected["headwear"],
-                                f"{actual_wardrobe} {actual_headwear}")):
+                                actual_headwear or actual_wardrobe)):
                         compatible = False
                         break
                 if not compatible:
@@ -7208,7 +7935,9 @@ class Director:
     @staticmethod
     def _visible_headwear_terms(value):
         """Extract headwear that is visibly worn, ignoring removal prose."""
-        text = str(value or "")
+        text = (
+            json.dumps(value, ensure_ascii=False, sort_keys=True)
+            if isinstance(value, dict) else str(value or ""))
         terms = (
             "乌纱帽", "乌纱", "网巾", "头巾", "发冠", "凤冠",
             "冠", "帽", "盔", "簪", "钗",
@@ -7227,6 +7956,14 @@ class Director:
 
     @staticmethod
     def _headwear_state_is_none(value):
+        if isinstance(value, dict):
+            presence = str(value.get("presence") or "").strip().lower()
+            kind = str(value.get("kind") or "").strip().lower()
+            name = str(value.get("name") or "").strip().lower()
+            return (
+                presence == "none"
+                or kind in {"none", "hair_only"}
+                or name in {"none", "无", "无头饰"})
         text = str(value or "").strip()
         return text in {
             "无", "无头饰", "不戴头饰", "未戴头饰", "去除头饰",
@@ -7236,13 +7973,22 @@ class Director:
     @classmethod
     def _headwear_states_compatible(cls, expected, actual):
         """Reject a visually conflicting hat even when the robe matches."""
-        expected = str(expected or "").strip()
         if not expected:
             return True
         actual_terms = cls._visible_headwear_terms(actual)
         if cls._headwear_state_is_none(expected):
             return not actual_terms
         expected_terms = cls._visible_headwear_terms(expected)
+        if isinstance(expected, dict) and not expected_terms:
+            kind_terms = {
+                "official_hat": {"乌纱帽", "乌纱", "官帽"},
+                "crown": {"发冠", "凤冠", "冠"},
+                "helmet": {"头盔", "盔"},
+                "soft_hat": {"网巾", "头巾", "帽", "斗笠"},
+                "hair_ornament": {"簪", "钗"},
+            }
+            expected_terms = kind_terms.get(
+                str(expected.get("kind") or "").strip().lower(), set())
         if not expected_terms:
             return False
         return bool(expected_terms & actual_terms)
@@ -7250,10 +7996,15 @@ class Director:
     @staticmethod
     def _look_headwear_text(look):
         look = look if isinstance(look, dict) else {}
+        def display(value):
+            if isinstance(value, (dict, list)):
+                return json.dumps(
+                    value, ensure_ascii=False, sort_keys=True)
+            return str(value or "").strip()
         return "；".join(
-            str(look.get(key) or "").strip()
+            display(look.get(key))
             for key in ("costume", "hair", "headwear", "accessories")
-            if str(look.get(key) or "").strip())
+            if display(look.get(key)))
 
     @classmethod
     def _wardrobe_candidate_score(cls, wardrobe, costume):
@@ -7365,6 +8116,7 @@ class Director:
     def _art_refs(self, ctx, characters, location, shot_no=None,
                   sheet_keys=None, sheet_keys_by_character=None,
                   spatial_ref="", inner_persona_ref="", prop_names=None,
+                  prop_reference_modes=None,
                   wardrobe_states=None, headwear_states=None):
         """最终立绘/人物套件/场景图/用户参考 → 真实多图参考输入。
 
@@ -7401,9 +8153,8 @@ class Director:
             current_wardrobe = str(
                 (wardrobe_states or {}).get(
                     character) or "").strip()
-            current_headwear = str(
-                (headwear_states or {}).get(
-                    character) or "").strip()
+            current_headwear = copy.deepcopy(
+                (headwear_states or {}).get(character) or {})
             locked_look = self._locked_look_variant(
                 project_id, character)
             wardrobe_matches = (
@@ -7509,6 +8260,8 @@ class Director:
                     f"本镜人物、空间与核心道具参考图超过"
                     f"{SHOT_BASE_REFERENCE_LIMIT}张，请拆分镜头")
             refs["prop_refs"].append(row["uri"])
+            prop_mode = dict(
+                (prop_reference_modes or {}).get(name) or {})
             refs["asset_matches"].append({
                 "asset_id": row["id"],
                 "kind": "prop_identity",
@@ -7517,6 +8270,12 @@ class Director:
                 "uri": row["uri"],
                 "reference_role": "prop",
                 "attach_to": name,
+                "prop_id": prop_mode.get("prop_id", ""),
+                "prop_representation": prop_mode.get(
+                    "representation", "physical"),
+                "prop_phase": prop_mode.get("phase", ""),
+                "prop_states": copy.deepcopy(
+                    prop_mode.get("states") or []),
             })
         # Current wardrobe is a separate responsibility from face identity.
         # Prefer a high-quality existing candidate/sheet that matches the
@@ -7527,8 +8286,8 @@ class Director:
                 continue
             wardrobe = str(
                 (wardrobe_states or {}).get(name) or "").strip()
-            headwear = str(
-                (headwear_states or {}).get(name) or "").strip()
+            headwear = copy.deepcopy(
+                (headwear_states or {}).get(name) or {})
             row = self._wardrobe_reference_row(
                 project_id, name, wardrobe, used_uris,
                 headwear=headwear)
@@ -7687,24 +8446,230 @@ class Director:
             or refs.get("inner_persona_ref") or refs.get("prop_refs"))
         return refs
 
-    def _shot_core_prop_names(self, ctx, shot):
-        """按镜头局部合同精确匹配需要携带母资产的核心道具。"""
-        explicit = {
-            str(value).strip()
-            for value in (shot.get("props") or [])
-            if str(value).strip()
+    def _shot_core_prop_references(self, ctx, shot, phases=None):
+        """返回本次静态相位/视频时间线真正可见的核心道具参考。
+
+        不再从提示词全文猜测道具：否定句、未来剧情说明或对白里提到名字，
+        都不能成为上传核心道具参考图的理由。旧分镜仅兼容显式 ``props``
+        名单；新分镜以 ``frame_props`` 为唯一事实源。
+        """
+        script = ctx.get("script") or {}
+        registry = self._prop_registry(script)
+        by_id = {
+            str(item.get("prop_id") or "").strip(): item
+            for item in registry if str(item.get("prop_id") or "").strip()
         }
-        text = json.dumps({
-            key: shot.get(key)
-            for key in (
-                "description", "prompt", "seedance_prompt", "dialogue",
-                "start_state", "end_state", "physical_logic",
-                "physical_contract", "shot_contract", "five_dimensions")
-        }, ensure_ascii=False, default=str)
+        by_name = {
+            str(item.get("name") or "").strip(): item
+            for item in registry if str(item.get("name") or "").strip()
+        }
+        references = []
+        seen = set()
+        references_by_id = {}
+        allowed_phases = {
+            str(value).strip().lower() for value in (phases or [])
+            if str(value).strip()}
+        frame_props = shot.get("frame_props") or []
+        has_structured_frame_props = any(
+            isinstance(item, dict) for item in frame_props)
+        for frame_prop in frame_props:
+            if not isinstance(frame_prop, dict):
+                continue
+            visibility = str(
+                frame_prop.get("visibility") or "visible").strip().lower()
+            representation = str(
+                frame_prop.get("representation") or "physical").strip().lower()
+            phase = str(
+                frame_prop.get("phase") or "").strip().lower()
+            if (allowed_phases and phase not in allowed_phases) or (
+                    visibility not in {"visible", "occluded"}):
+                continue
+            prop_id = str(frame_prop.get("prop_id") or "").strip()
+            name = str(frame_prop.get("name") or "").strip()
+            registered = by_id.get(prop_id) or by_name.get(name) or {}
+            name = str(registered.get("name") or name).strip()
+            if prop_id and name:
+                reference = references_by_id.get(prop_id)
+                if reference is None:
+                    reference = {
+                        "prop_id": prop_id,
+                        "name": name,
+                        "phase": phase,
+                        "representation": representation,
+                        "visibility": visibility,
+                        "states": [],
+                    }
+                    references_by_id[prop_id] = reference
+                    references.append(reference)
+                    seen.add(prop_id)
+                state = {
+                    "phase": phase,
+                    "representation": representation,
+                    "visibility": visibility,
+                }
+                if state not in reference["states"]:
+                    reference["states"].append(state)
+        for reference in references:
+            phases = list(dict.fromkeys(
+                state["phase"] for state in reference["states"]))
+            representations = list(dict.fromkeys(
+                state["representation"] for state in reference["states"]))
+            reference["phase"] = ",".join(phases)
+            reference["representation"] = (
+                representations[0] if len(representations) == 1 else "mixed")
+        if has_structured_frame_props:
+            return references
+
+        # 旧数据只接受结构化的显式名单，不扫描 description/dialogue。
+        for value in shot.get("props") or []:
+            name = str(value).strip()
+            registered = by_id.get(name) or by_name.get(name) or {}
+            name = str(registered.get("name") or name).strip()
+            prop_id = str(registered.get("prop_id") or name).strip()
+            if name and name in by_name and prop_id not in seen:
+                seen.add(prop_id)
+                references.append({
+                    "prop_id": prop_id,
+                    "name": name,
+                    "phase": "",
+                    "representation": "physical",
+                    "visibility": "visible",
+                })
+        return references
+
+    def _shot_core_prop_names(self, ctx, shot, phases=None):
         return [
-            prop["name"] for prop in core_prop_definitions(ctx.get("script"))
-            if prop["name"] in explicit or prop["name"] in text
-        ]
+            item["name"] for item in self._shot_core_prop_references(
+                ctx, shot, phases=phases)]
+
+    @staticmethod
+    def _prop_registry(script):
+        """返回稳定 ID 的核心道具登记表，同时兼容旧 ``core_props``。"""
+        rows = (script or {}).get("prop_registry")
+        if not isinstance(rows, list) or (
+                not rows and (script or {}).get("core_props")):
+            rows = (script or {}).get("core_props") or []
+        result = []
+        seen = set()
+        for index, raw in enumerate(rows, 1):
+            item = {"name": raw} if isinstance(raw, str) else raw
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            prop_id = str(item.get("prop_id") or "").strip()
+            if not prop_id:
+                prop_id = f"legacy_prop_{index:03d}"
+            if not name or prop_id in seen:
+                continue
+            seen.add(prop_id)
+            result.append({**copy.deepcopy(item), "prop_id": prop_id,
+                           "name": name})
+        return result
+
+    def _shot_prop_contract(self, ctx, shot):
+        """把集级登记表与镜头级实例状态送入生成前合同。"""
+        return {
+            "prop_registry": self._prop_registry(ctx.get("script") or {}),
+            "frame_props": copy.deepcopy(shot.get("frame_props") or []),
+            "prop_transitions": copy.deepcopy(
+                shot.get("prop_transitions") or []),
+        }
+
+    def _require_valid_storyboard_prop_contract(self, ctx):
+        """Recheck the authoritative prop timeline immediately before spend."""
+        storyboard = copy.deepcopy(ctx.get("storyboard") or {})
+        if not isinstance(storyboard, dict) or not storyboard.get("shots"):
+            return
+        script = copy.deepcopy(ctx.get("script") or {})
+        registry_report = audit_prop_contract(script)
+        issues = list(registry_report.get("issues") or [])
+
+        # A storyboard scene event must resolve to the authoritative script
+        # scene with the same scene_no.  This closes the gap where a saved or
+        # imported board could claim a later scene event on an earlier shot.
+        expected_scene_events = {}
+        event_scene_numbers = {}
+        for position, scene in enumerate(script.get("scenes") or [], 1):
+            if not isinstance(scene, dict):
+                continue
+            scene_no = str(
+                scene.get("scene_no")
+                if scene.get("scene_no") is not None else position).strip()
+            event_id = str(
+                scene.get("event_id") or f"scene:{scene_no}").strip()
+            previous_scene = event_scene_numbers.setdefault(event_id, scene_no)
+            if previous_scene != scene_no:
+                issues.append(
+                    f"剧本 scene_event_id={event_id} 被多个 scene_no 复用："
+                    f"{previous_scene}、{scene_no}")
+            previous_event = expected_scene_events.setdefault(
+                scene_no, event_id)
+            if previous_event != event_id:
+                issues.append(
+                    f"剧本 scene_no={scene_no} 绑定了多个 scene_event_id："
+                    f"{previous_event}、{event_id}")
+        for position, shot in enumerate(storyboard.get("shots") or [], 1):
+            if not isinstance(shot, dict):
+                continue
+            scene_no = str(
+                shot.get("scene_no")
+                if shot.get("scene_no") is not None else "").strip()
+            expected = expected_scene_events.get(scene_no)
+            actual = str(
+                shot.get("scene_event_id")
+                or (f"scene:{scene_no}" if scene_no else "")).strip()
+            if not expected:
+                issues.append(
+                    f"镜头{position}.scene_no={scene_no or '空'} "
+                    "未对应剧本场次")
+            elif actual != expected:
+                issues.append(
+                    f"镜头{position}.scene_event_id 与剧本 scene_no="
+                    f"{scene_no} 的稳定事件不一致：{actual} != {expected}")
+
+        storyboard["prop_contract_schema"] = PROP_CONTRACT_SCHEMA
+        storyboard["prop_registry"] = copy.deepcopy(
+            script.get("prop_registry") or [])
+        report = audit_storyboard_prop_contract(storyboard)
+        issues.extend(report.get("issues") or [])
+        issues = list(dict.fromkeys(issues))
+        if issues:
+            raise AifosError(
+                "结构化道具合同前置校验失败，未调用生成 API："
+                + "；".join(issues))
+
+    @staticmethod
+    def _select_explicit_frame_target(payload):
+        """Select an upstream-authored static target without deriving one."""
+        targets = payload.get("frame_targets")
+        if not isinstance(targets, dict):
+            return
+        frame_kind = str(payload.get("frame_kind") or "keyframe").strip()
+        target_key = (
+            frame_kind if frame_kind in {"first_frame", "last_frame"}
+            else "keyframe")
+        target = targets.get(target_key)
+        if isinstance(target, dict) and target.get("state"):
+            payload["frame_target"] = copy.deepcopy(target)
+
+    @staticmethod
+    def _shot_reference_phases(shot, frame_kind="keyframe"):
+        """Return exact prop phases relevant to one image request."""
+        kind = str(frame_kind or "keyframe").strip().lower()
+        if kind in {"timeline", "video"}:
+            return {"start", "freeze", "end"}
+        if kind == "frames":
+            return {"start", "end"}
+        targets = shot.get("frame_targets")
+        targets = targets if isinstance(targets, dict) else {}
+        key = kind if kind in {"first_frame", "last_frame"} else "keyframe"
+        target = targets.get(key)
+        if not isinstance(target, dict):
+            target = shot.get("frame_target")
+        phase = str(
+            (target or {}).get("phase")
+            if isinstance(target, dict) else "").strip().lower()
+        return {phase} if phase in {"start", "end", "freeze"} else set()
 
     def _relations(self, ctx):
         """画布关系图:ctx 内缓存优先,单图重画等路径从落盘文件回读。"""
@@ -7766,7 +8731,8 @@ class Director:
             if current_state.get("wardrobe"):
                 facts["costume"] = str(current_state["wardrobe"])
             if current_state.get("headwear"):
-                facts["accessories"] = str(current_state["headwear"])
+                facts["accessories"] = copy.deepcopy(
+                    current_state["headwear"])
             if current_state.get("hair_makeup"):
                 facts["hair"] = str(current_state["hair_makeup"])
             if (current_state.get("prop")
@@ -7879,6 +8845,10 @@ class Director:
                 f"{duties}；{composition.get('count_rule', '')}")
         start_state = shot.get("start_state") or {}
         def state_line(name, state):
+            def display(value):
+                return (
+                    json.dumps(value, ensure_ascii=False, sort_keys=True)
+                    if isinstance(value, dict) else str(value))
             details = [
                 str(state.get("position") or ""),
                 str(state.get("pose") or ""),
@@ -7888,7 +8858,12 @@ class Director:
                     ("wardrobe", "服装"), ("headwear", "头饰"),
                     ("hair_makeup", "妆发"), ("prop", "道具")):
                 if state.get(key):
-                    details.append(f"{label}{state[key]}")
+                    details.append(f"{label}{display(state[key])}")
+            if state.get("hair_visibility"):
+                details.append(f"头发可见度{state['hair_visibility']}")
+            condition = state.get("condition")
+            if condition:
+                details.append(f"人物状态{display(condition)}")
             return f"{name}:" + ",".join(value for value in details if value)
         if start_state:
             parts.append("【START STATE】" + "；".join(
@@ -7918,14 +8893,17 @@ class Director:
                 f"{'情绪' + emo + '；' if emo else ''}"
                 "用视线、眉眼、下颌张力和呼吸体现，不把台词画成字幕")
         elif shot.get("kind") == "reaction":
+            performance = shot.get("performance") or {}
             parts.append(
-                "【EYES / EXPRESSION】表现听者即时反应；眼神先变，随后"
-                "眉眼和呼吸产生微小变化，避免夸张表情包")
+                "【EYES / EXPRESSION】"
+                f"{performance.get('gaze') or '逐角色视线严格服从condition'}；"
+                f"{performance.get('micro_expression') or '逐角色表演严格服从condition'}")
         else:
             performance = shot.get("performance") or {}
             parts.append(
-                f"【EYES / EXPRESSION】{performance.get('gaze') or '视线服务主体动作'}；"
-                f"{performance.get('micro_expression') or '自然微表情和呼吸'}")
+                "【EYES / EXPRESSION】"
+                f"{performance.get('gaze') or '逐角色视线严格服从condition'}；"
+                f"{performance.get('micro_expression') or '逐角色表演严格服从condition'}")
         camera = shot.get("camera", "")
         contract = shot.get("shot_contract") or {}
         parts.append(
@@ -7988,11 +8966,19 @@ class Director:
         return "\n".join(p for p in parts if p)
 
     def _shot_payload(self, ctx, shot, *, continuity_anchor=False,
-                      quality_override=None, item_id=None):
+                      quality_override=None, item_id=None,
+                      frame_kind="keyframe"):
         # Defensive repair for saved legacy boards: the current-shot action is
         # narrower than a global character design and must win before identity
         # facts, references, prompt text or QC expectations are compiled.
         shot = reconcile_shot_semantics(shot)
+        self._require_valid_storyboard_prop_contract(ctx)
+        prop_contract = self._shot_prop_contract(ctx, shot)
+        prop_reference_rows = self._shot_core_prop_references(
+            ctx, shot, phases=self._shot_reference_phases(
+                shot, frame_kind))
+        prop_reference_modes = {
+            item["name"]: item for item in prop_reference_rows}
         locations = self._scene_locations(ctx)
         location = shot_local_scene(
             shot, locations.get(shot["scene_no"], ""))
@@ -8085,6 +9071,7 @@ class Director:
         payload = {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
+            "frame_kind": frame_kind,
             "prompt": self._rich_shot_prompt(ctx, shot, location),
             "seedance_prompt": shot.get("seedance_prompt", shot["prompt"]),
             "characters": shot["characters"],
@@ -8102,6 +9089,12 @@ class Director:
             "action": shot.get("description", ""),
             "start_state": shot.get("start_state", {}),
             "end_state": shot.get("end_state", {}),
+            "identity_facts_required": bool(shot.get("characters")),
+            "appearance_state_required": bool(shot.get("characters")),
+            "frame_targets": copy.deepcopy(
+                shot.get("frame_targets") or {}),
+            "frame_target": copy.deepcopy(
+                shot.get("frame_target") or {}),
             "semantic_corrections": copy.deepcopy(
                 shot.get("semantic_corrections") or []),
             "five_dimensions": shot.get("five_dimensions", {}),
@@ -8115,6 +9108,7 @@ class Director:
             "shot_contract": shot.get("shot_contract", {}),
             "composition_contract": composition_contract,
             "physical_contract": physical_contract,
+            **prop_contract,
             "sound_design": shot.get("sound_design", {}),
             "spatial_blocking": spatial or {},
             "spatial_constraint": (spatial or {}).get("constraint", ""),
@@ -8138,7 +9132,9 @@ class Director:
                     (spatial or {}).get("spatial_reference_uri", "")
                     if requires_spatial_reference(spatial or {}) else ""),
                 inner_persona_ref=inner_persona_ref,
-                prop_names=self._shot_core_prop_names(ctx, shot),
+                prop_names=[
+                    item["name"] for item in prop_reference_rows],
+                prop_reference_modes=prop_reference_modes,
                 wardrobe_states={
                     name: str(
                         ((shot.get("end_state") or {}).get(name) or {}).get(
@@ -8149,12 +9145,12 @@ class Director:
                     for name in identity_characters
                 },
                 headwear_states={
-                    name: str(
+                    name: copy.deepcopy(
                         ((shot.get("end_state") or {}).get(name) or {}).get(
                             "headwear")
                         or ((shot.get("start_state") or {}).get(name) or {}).get(
                             "headwear")
-                        or "")
+                        or {})
                     for name in identity_characters
                 }),
         }
@@ -8182,21 +9178,13 @@ class Director:
         # 发送给图片模型的版本只保留本镜事实；完整 prompt 仍保留在
         # payload['prompt'] 供人工审计，避免故事背景、全局风格与参考图
         # 在模型输入里重复争权。
-        contract, compact = compile_shot_prompt(
-            {**shot,
-             "character_visuals": character_visuals,
-             "composition_contract": composition_contract,
-             "physical_contract": physical_contract,
-             "spatial_blocking": spatial or {},
-             "readable_text": readable_text,
-             "era_context": era_context,
-             "sanctioned_anachronisms": sanctioned_anachronisms},
-            location=location, style=payload.get("style", ""),
-            references=payload.get("reference_manifest"), mode="image")
-        payload["prompt_contract"] = contract
-        payload["prompt_compact"] = compact
+        # _attach_reference_manifest 已经按 frame_kind 从上游
+        # frame_targets 中选定 keyframe/first_frame/last_frame 并编译合同。
+        # 此处禁止再用 shot.frame_target（默认 keyframe）二次覆盖，否则首尾
+        # 帧会被错误编译成同一个代表帧。
         payload["prompt_contract_validation"] = (
-            validate_shot_prompt_contract(contract))
+            validate_shot_prompt_contract(
+                payload.get("prompt_contract") or {}))
         return payload
 
     def _reference_manifest(self, payload):
@@ -8325,11 +9313,37 @@ class Director:
         for uri in payload.get("prop_refs") or []:
             match = matches.get(uri) or {}
             name = str(match.get("name") or "核心道具")
+            representation = str(
+                match.get("prop_representation") or "physical").strip()
+            phase = str(match.get("prop_phase") or "").strip()
+            phase_rule = f"（phase={phase}）" if phase else ""
+            states = [
+                item for item in (match.get("prop_states") or [])
+                if isinstance(item, dict)
+            ]
+            carrier_states = [
+                f"{str(item.get('phase') or '').strip()}="
+                f"{str(item.get('representation') or '').strip()}"
+                for item in states
+                if str(item.get("representation") or "").strip()
+                not in {"", "physical"}
+            ]
+            if not carrier_states and representation not in {
+                    "", "physical", "mixed"}:
+                carrier_states = [f"{phase or '当前'}={representation}"]
+            carrier_rule = (
+                "仅在合同声明的"
+                + "、".join(dict.fromkeys(carrier_states))
+                + "载体披露状态中使用母资产，不得据此在载体外新增第二个"
+                "物理实体；"
+                if carrier_states else "")
             add(
                 uri, match.get("label") or f"核心道具:{name}",
                 f"只锁定核心道具「{name}」的轮廓、结构、材质、工艺、"
                 "磨损和识别细节；本镜中的尺寸、持有人、动作与状态服从"
-                "当前镜头合同，不得把纯背景、棚拍构图或额外道具带入画面",
+                f"当前镜头合同{phase_rule}；"
+                f"{carrier_rule}"
+                "不得把纯背景、棚拍构图或额外道具带入画面",
                 role="prop", kind="prop_identity")
         for uri in payload.get("character_refs") or []:
             match = matches.get(uri) or {}
@@ -8484,14 +9498,54 @@ class Director:
         if ("shot_no" in payload and not payload.get("portrait")
                 and not payload.get("character_sheet")
                 and not payload.get("scene_art")):
-            contract, compact = compile_shot_prompt(
-                payload, location=payload.get("location", ""),
-                style=payload.get("style", ""), references=manifest,
-                mode="image")
-            payload["prompt_contract"] = contract
-            payload["prompt_compact"] = compact
-            payload["prompt_contract_validation"] = (
-                validate_shot_prompt_contract(contract))
+            if str(payload.get("frame_kind") or "") == "frames":
+                frame_contracts = {}
+                frame_compacts = {}
+                frame_validations = {}
+                for kind in ("first_frame", "last_frame"):
+                    variant = copy.deepcopy(payload)
+                    variant["frame_kind"] = kind
+                    self._select_explicit_frame_target(variant)
+                    contract, compact = compile_shot_prompt(
+                        variant, location=payload.get("location", ""),
+                        style=payload.get("style", ""),
+                        references=manifest, mode="image")
+                    frame_contracts[kind] = contract
+                    frame_compacts[kind] = compact
+                    frame_validations[kind] = (
+                        validate_shot_prompt_contract(contract))
+                invalid = [
+                    f"{kind}:{'；'.join(report.get('issues') or [])}"
+                    for kind, report in frame_validations.items()
+                    if not report.get("passed")
+                ]
+                if invalid:
+                    raise AifosError(
+                        "首尾帧独立静态合同校验失败，未调用生成 API："
+                        + "；".join(invalid))
+                payload["frame_prompt_contracts"] = frame_contracts
+                payload["frame_prompt_contract_validations"] = (
+                    frame_validations)
+                payload["prompt_contract"] = frame_contracts["first_frame"]
+                payload["prompt_contract_validation"] = (
+                    frame_validations["first_frame"])
+                payload["prompt_compact"] = (
+                    "【首帧独立静态合同】\n"
+                    + frame_compacts["first_frame"]
+                    + "\n【尾帧独立静态合同】\n"
+                    + frame_compacts["last_frame"]
+                    + "\n【联合生成约束】分别执行两份静态合同；"
+                    "首帧不得混入尾帧状态，尾帧不得保留已完成动作的起点状态。")
+            else:
+                self._select_explicit_frame_target(payload)
+                contract, compact = compile_shot_prompt(
+                    payload, location=payload.get("location", ""),
+                    style=payload.get("style", ""), references=manifest,
+                    mode="image")
+                payload["prompt_contract"] = contract
+                payload["prompt_compact"] = compact
+                payload["prompt_contract_validation"] = (
+                    validate_shot_prompt_contract(contract))
         else:
             # 人物/场景资产也只把未附表的视觉合同交给 Provider。
             # 参考图及绑定职责由 manifest/真实上传通道单独传递；若继续把
@@ -8778,7 +9832,8 @@ class Director:
                 name = self._shot_name(ctx, shot["shot_no"])
                 payload = self._shot_payload(
                     ctx, shot, continuity_anchor=len(chain) > 1,
-                    item_id=f"frames:{shot['shot_no']}")
+                    item_id=f"frames:{shot['shot_no']}",
+                    frame_kind="frames")
                 required_quality = payload["quality_decision"]["level"]
                 first = self._existing_asset_uri(ctx, "first_frame", name)
                 last = self._existing_asset_uri(ctx, "last_frame", name)
@@ -9073,10 +10128,28 @@ class Director:
                 missing_identities.append(name)
             else:
                 mandatory_ids.add(row["id"])
+        inner_row = self._inner_persona_row_for_shot(ctx, target_shot)
+        if target_shot.get("narrative_overlays") and inner_row is None:
+            raise AifosError(
+                f"镜头{shot_no}声明了内心Q版，但对应母资产缺失或质量不足")
+        if inner_row is not None:
+            mandatory_ids.add(inner_row["id"])
+        missing_props = []
+        for name in self._shot_core_prop_names(
+                ctx, target_shot, phases={"start", "freeze", "end"}):
+            row = self._locked_prop(episode["project_id"], name)
+            if row is None:
+                missing_props.append(name)
+            else:
+                mandatory_ids.add(row["id"])
         if missing_identities:
             raise AifosError(
                 "以下出场角色缺少最终立绘，禁止选择 Seedance 参考图:"
                 + "、".join(missing_identities))
+        if missing_props:
+            raise AifosError(
+                "以下核心道具缺少人工锁定母资产，禁止选择 Seedance 参考图:"
+                + "、".join(missing_props))
         if len(mandatory_ids) > 7:
             raise AifosError(
                 f"本镜空间图与人物最终立绘已占 {len(mandatory_ids)} 张，"
@@ -9105,7 +10178,7 @@ class Director:
             if row["kind"] == "spatial_blocking":
                 raise AifosError("空间调度图由系统按镜头强制加入，无需人工选择")
             mismatch = self._video_reference_mismatch(
-                row, target_shot, location)
+                row, target_shot, location, script=script)
             if mismatch:
                 raise AifosError(mismatch)
             if not formal_reference_allowed(self._asset_quality(row)):
@@ -9150,6 +10223,7 @@ class Director:
                 continue
             key = str(int(no))
             spatial = self._spatial_reference_requirement(ctx, no)
+            reference_rows = self._video_reference_rows(ctx, no)
             shots[key] = {
                 "mode": "manual" if key in manual else "auto",
                 "spatial_reference_required": spatial["required"],
@@ -9159,8 +10233,9 @@ class Director:
                 "items": [{
                     "asset_id": row["id"], "kind": row["kind"],
                     "name": row["name"], "uri": row["uri"],
-                    "binding": self._video_reference_binding(row),
-                } for row in self._video_reference_rows(ctx, no)],
+                    "binding": self._video_reference_binding(
+                        row, shot=shot, script=ctx.get("script") or {}),
+                } for row in reference_rows],
             }
         return {"schema": "aifos.video-references-effective/v1",
                 "shots": shots}
@@ -9222,7 +10297,8 @@ class Director:
                 f"镜头{shot_no}声明了内心Q版，但对应母资产缺失或质量不足")
         add(inner_row)
         missing_props = []
-        for name in self._shot_core_prop_names(ctx, shot):
+        for name in self._shot_core_prop_names(
+                ctx, shot, phases={"start", "freeze", "end"}):
             prop_row = self._locked_prop(project_id, name)
             if prop_row is None:
                 missing_props.append(name)
@@ -9315,7 +10391,7 @@ class Director:
             return None
         return row
 
-    def _video_reference_mismatch(self, row, shot, location=""):
+    def _video_reference_mismatch(self, row, shot, location="", script=None):
         """返回 Seedance 资产与当前镜头不兼容的原因；空串表示可用。
 
         这个检查既用于新选择，也用于读取历史选择，避免旧版本保存的
@@ -9350,11 +10426,51 @@ class Director:
             prop = str(
                 self._asset_meta(row).get("prop")
                 or str(row["name"]).split(":", 1)[0])
-            shot_text = json.dumps(
-                shot, ensure_ascii=False, default=str)
-            if prop not in shot_text:
+            registry = self._prop_registry(script or {})
+            by_id = {
+                str(item.get("prop_id") or "").strip(): item
+                for item in registry
+                if str(item.get("prop_id") or "").strip()
+            }
+            by_name = {
+                str(item.get("name") or "").strip(): item
+                for item in registry
+                if str(item.get("name") or "").strip()
+            }
+            frame_props = shot.get("frame_props") or []
+            structured = any(
+                isinstance(item, dict) for item in frame_props)
+            visible_names = set()
+            if structured:
+                for item in frame_props:
+                    if not isinstance(item, dict):
+                        continue
+                    if str(item.get("phase") or "").strip().lower() not in {
+                            "start", "freeze", "end"}:
+                        continue
+                    if str(
+                            item.get("visibility") or ""
+                    ).strip().lower() not in {"visible", "occluded"}:
+                        continue
+                    prop_id = str(item.get("prop_id") or "").strip()
+                    name = str(item.get("name") or "").strip()
+                    registered = by_id.get(prop_id) or by_name.get(name) or {}
+                    visible_name = str(
+                        registered.get("name") or name).strip()
+                    if visible_name:
+                        visible_names.add(visible_name)
+            else:
+                for value in shot.get("props") or []:
+                    name = str(value or "").strip()
+                    registered = by_id.get(name) or by_name.get(name) or {}
+                    visible_name = str(
+                        registered.get("name") or name).strip()
+                    if visible_name in by_name:
+                        visible_names.add(visible_name)
+            if prop not in visible_names:
                 return (
-                    f"道具资产「{prop}」未在本镜合同中出现，"
+                    f"道具资产「{prop}」未在本镜结构化 frame_props 的"
+                    "可见/遮挡相位中出现，"
                     "禁止作为本镜参考")
         if kind == "reference":
             meta = self._asset_meta(row)
@@ -9412,7 +10528,8 @@ class Director:
             seen.add(inner_row["id"])
             rows.append(inner_row)
         missing_props = []
-        for name in self._shot_core_prop_names(ctx, shot):
+        for name in self._shot_core_prop_names(
+                ctx, shot, phases={"start", "freeze", "end"}):
             row = self._locked_prop(ctx["project"]["id"], name)
             if row is None:
                 missing_props.append(name)
@@ -9437,7 +10554,8 @@ class Director:
                     or self.assets.is_deleted(row) or not row["uri"]
                     or not formal_reference_allowed(self._asset_quality(row))):
                 continue
-            if self._video_reference_mismatch(row, shot, location):
+            if self._video_reference_mismatch(
+                    row, shot, location, script=script):
                 continue
             uri = row["uri"]
             if (uri.startswith(("http://", "https://"))
@@ -9451,7 +10569,7 @@ class Director:
                 "请减少人工额外参考或拆分群像镜头")
         return rows
 
-    def _video_reference_binding(self, row):
+    def _video_reference_binding(self, row, shot=None, script=None):
         """Seedance 每张资产的单一职责，禁止“身份/服装/场景全都锁”。"""
         kind = row["kind"]
         meta = self._asset_meta(row)
@@ -9487,10 +10605,41 @@ class Director:
                 "身份仍以最终立绘为准，不复制服装、姿势或背景")
         if kind in ("prop_identity", "prop_candidate"):
             prop = str(meta.get("prop") or name.split(":", 1)[0])
+            carrier_rule = ""
+            if isinstance(shot, dict):
+                registry = self._prop_registry(script or {})
+                ids = {
+                    str(item.get("prop_id") or "").strip()
+                    for item in registry
+                    if str(item.get("name") or "").strip() == prop
+                }
+                carrier_states = []
+                for item in shot.get("frame_props") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    item_prop_id = str(
+                        item.get("prop_id") or "").strip()
+                    item_name = str(item.get("name") or "").strip()
+                    visibility = str(
+                        item.get("visibility") or "").strip().lower()
+                    representation = str(
+                        item.get("representation") or "").strip().lower()
+                    phase = str(item.get("phase") or "").strip().lower()
+                    if (item_prop_id not in ids and item_name != prop) or (
+                            visibility not in {"visible", "occluded"}
+                            or representation in {"", "physical"}):
+                        continue
+                    carrier_states.append(f"{phase}={representation}")
+                if carrier_states:
+                    carrier_rule = (
+                        "；仅在合同声明的"
+                        + "、".join(dict.fromkeys(carrier_states))
+                        + "载体披露状态中使用母资产，不得因此在载体外新增"
+                        "第二个物理实体")
             return (
                 f"只锁定核心道具「{prop}」的轮廓、结构、材质、工艺、"
                 "磨损和识别细节；尺寸、持有人、动作及状态服从首尾帧，"
-                "不得带入棚拍背景或额外物件")
+                f"不得带入棚拍背景或额外物件{carrier_rule}")
         if kind == "scene_art":
             return (
                 "只锁定场景空间、陈设、材质与主光方向；忽略图中人物、"
@@ -9542,10 +10691,17 @@ class Director:
         def state_line(states):
             values = []
             for name, state in (states or {}).items():
+                condition = state.get("condition")
+                condition_text = (
+                    json.dumps(
+                        condition, ensure_ascii=False, sort_keys=True)
+                    if isinstance(condition, dict) else str(condition or ""))
                 values.append(
                     f"{name}:{state.get('position', '')},"
                     f"{state.get('pose', '')},情绪{state.get('emotion', '')},"
-                    f"朝向{state.get('direction', '')}")
+                    f"朝向{state.get('direction', '')}"
+                    + (f",condition={condition_text}"
+                       if condition_text else ""))
             return "；".join(values)
 
         camera = ((shot.get("five_dimensions") or {}).get(
@@ -9580,8 +10736,8 @@ class Director:
             "脸和性别按各自最终立绘，服装/道具按首尾帧。",
             f"【起点】{state_line(shot.get('start_state')) or '保持首帧可见状态'}。",
             f"【单一主动作】{shot.get('description') or shot.get('prompt') or '环境自然变化'}。",
-            f"【表演】{performance.get('gaze') or '视线服务主体动作'}；"
-            f"{performance.get('micro_expression') or '自然微表情、呼吸和重心变化'}"
+            f"【表演】{performance.get('gaze') or '逐角色视线严格服从condition'}；"
+            f"{performance.get('micro_expression') or '逐角色表演严格服从condition'}"
             f"{dialogue_rule}。",
             f"【运镜】只执行一次{movement}；"
             f"{camera.get('shot_scale') or (shot.get('shot_contract') or {}).get('景别') or '保持既定景别'}，"
@@ -9752,6 +10908,8 @@ class Director:
     def _prepare_video_call(self, ctx, shot, frames):
         """在主线程锁定单镜首尾帧、人物/场景资产和空间图映射。"""
         shot_no = int(shot["shot_no"])
+        self._require_valid_storyboard_prop_contract(ctx)
+        prop_contract = self._shot_prop_contract(ctx, shot)
         diagnosis = self._video_diagnosis_from_ctx(ctx, shot_no)
         decision = diagnosis.get("decision") or {}
         if (decision.get("action") == "repair_frames_first"
@@ -9786,7 +10944,8 @@ class Director:
             "index": index + 3,
             **asset,
             "uri": row["uri"],
-            "binding": self._video_reference_binding(row),
+            "binding": self._video_reference_binding(
+                row, shot=shot, script=ctx.get("script") or {}),
         } for index, (row, asset) in enumerate(
             zip(reference_rows, reference_assets))]
         video_prompt = self._seedance_video_prompt(
@@ -9797,7 +10956,8 @@ class Director:
             *reference_manifest,
         ]
         contract, compact = compile_shot_prompt(
-            shot, location=self._shot_location(ctx.get("script"), shot),
+            {**shot, **prop_contract},
+            location=self._shot_location(ctx.get("script"), shot),
             style=ctx["project"].get("style", ""), references=video_refs,
             mode="video")
         manual_feedback = (ctx.get("video_feedback") or {}).get(
@@ -9832,6 +10992,7 @@ class Director:
             "reference_images": [row["uri"] for row in reference_rows],
             "reference_assets": reference_assets,
             "reference_manifest": reference_manifest,
+            **prop_contract,
             "dialogue": video_dialogue,
             "voice": ctx["production_profile"]["voice"],
             "lip_sync": ctx["production_profile"]["lip_sync"],
@@ -11093,9 +12254,40 @@ class Director:
         normalized["project_style"] = project["style"]
         normalized["locked"] = bool(locked)
         normalized["updated_at"] = now()
-        error = validate_story_analysis(normalized)
+        error = validate_story_analysis(
+            normalized, require_resolved_identity=bool(locked))
         if error:
             raise AifosError(f"制作圣经保存失败: {error}")
+        # Manual identity confirmation becomes the canonical script fact, not
+        # a UI-only override.  Save only when explicit values changed.
+        character_map = {
+            item.get("name"): item
+            for item in normalized.get("characters", [])
+            if isinstance(item, dict) and item.get("name")
+        }
+        script_changed = False
+        for character in script.get("characters", []):
+            if (not isinstance(character, dict)
+                    or is_background_character(character)):
+                continue
+            item = character_map.get(character.get("name")) or {}
+            if unresolved_identity_fields(item):
+                continue
+            for field in ("gender", "age_range"):
+                value = str(item.get(field) or "").strip()
+                if value and character.get(field) != value:
+                    character[field] = value
+                    script_changed = True
+            prompt = str(item.get("image_prompt") or "").strip()
+            if prompt and character.get("image_prompt") != prompt:
+                character["image_prompt"] = prompt
+                script_changed = True
+        if script_changed:
+            stored_script = copy.deepcopy(script)
+            stored_script.pop("production_analysis", None)
+            script_version = self.projects.save_document(
+                episode["id"], "script", stored_script)
+            normalized["script_version"] = script_version
         if locked:
             error = character_production_readiness_error(script, normalized)
             if error:
@@ -11284,7 +12476,8 @@ class Director:
             frames_payload = self._shot_payload(
                 ctx, shot, continuity_anchor=len(scene_shots) > 1,
                 quality_override=choice,
-                item_id=f"frames:{shot['shot_no']}")
+                item_id=f"frames:{shot['shot_no']}",
+                frame_kind="frames")
             if formal_reference_allowed(self._asset_quality(image_row)):
                 frames_payload["image_uri"] = image_row["uri"]
             else:
@@ -11311,7 +12504,8 @@ class Director:
                 prompt=self._prompt_with_feedback(
                     frames_payload["prompt"],
                     frames_payload["feedback"]),
-                payload=frames_payload, revision_source=revision_source)
+                payload=frames_payload, revision_source=revision_source,
+                capability="frames")
             meta = self._quality_meta(frames_payload["quality_decision"])
             new_first = self.assets.register(
                 ctx["project"]["id"], "first_frame", asset_name,
@@ -11876,7 +13070,7 @@ class Director:
             payload = self._shot_payload(
                 ctx, shot, continuity_anchor=len(scene_shots) > 1,
                 quality_override=quality_choice,
-                item_id=f"frames:{shot_no}")
+                item_id=f"frames:{shot_no}", frame_kind=kind)
             if plan_diagnostics.get("diagnosis_complete"):
                 reference_changes = self._apply_image_reference_adjustments(
                     payload, {"_project_id": project["id"]},
@@ -11991,7 +13185,7 @@ class Director:
                 **self._shot_payload(
                     ctx, shot, continuity_anchor=len(scene_shots) > 1,
                     quality_override=quality_choice,
-                    item_id=f"frames:{shot_no}"),
+                    item_id=f"frames:{shot_no}", frame_kind="frames"),
                 "feedback": feedback,
                 "revision": next_revision("first_frame", asset_name),
             }
@@ -12032,7 +13226,8 @@ class Director:
                     ctx, "frames", frames_payload, "frames"),
                 prompt=self._prompt_with_feedback(
                     frames_payload["prompt"], feedback),
-                payload=frames_payload, revision_source=revision_source)
+                payload=frames_payload, revision_source=revision_source,
+                capability="frames")
             formal_ready = formal_reference_allowed(
                 frames_payload["image_quality"])
             sync_boundaries = {"last_frame"}
@@ -12160,6 +13355,101 @@ class Director:
                     f"{item}:{index:02d}", uri="",
                     meta={"location": item, "candidate_index": index,
                           "invalidated": reason}, new_version=True)
+
+    def refine_character_prompt(self, project_title, episode_number,
+                                character_name, feedback):
+        """用户对人物形象的意见 → 编剧 AI 深度改写设定卡提示词。
+
+        只做改写与预览,不落盘、不出图;用户确认后经
+        apply_character_prompt 生效并重生成候选。
+        """
+        project, episode = self._episode_ctx(project_title, episode_number)
+        name = str(character_name or "").strip()
+        feedback = str(feedback or "").strip()
+        if not name:
+            raise AifosError("缺少角色名")
+        if not feedback:
+            raise AifosError("请填写修改意见")
+        design = self._character_design(project["id"], name) or {}
+        current = self._design_value(design.get("image_prompt")) or (
+            self._design_line(design, keys=(
+                "species", "gender", "age_range", "identity", "appearance",
+                "hair", "eyes", "costume", "accessories", "era_setting",
+                "occupation", "signature_props")))
+        script, _ = self.projects.latest_document(episode["id"], "script")
+        introduction = next(
+            (c.get("introduction", "")
+             for c in (script or {}).get("characters", [])
+             if c.get("name") == name), "")
+        context = {
+            "introduction": introduction,
+            "gender": self._design_value(design.get("gender")),
+            "age_range": self._design_value(design.get("age_range")),
+            "identity": self._design_value(design.get("identity")),
+            "visual_dna": design.get("visual_dna") or {},
+        }
+        ctx = {"project": dict(project), "episode": dict(episode),
+               "out_root": self._episode_dir(project, episode)}
+        self._task_cost = 0.0
+        self._task_providers = set()
+        result = self._call(ctx, "script", {
+            "prompt_refine": True,
+            "character_name": name,
+            "current_prompt": current,
+            "character_context": context,
+            "style": project["style"] or "",
+            "feedback": feedback,
+            "project_title": project["title"],
+            "episode_number": episode["number"],
+        }, "cast")
+        data = result.data or {}
+        return {
+            "status": "refined",
+            "character": name,
+            "feedback": feedback,
+            "current_prompt": current,
+            "image_prompt": str(data.get("image_prompt") or "").strip(),
+            "changes": data.get("changes") or [],
+            "conflict_notes": data.get("conflict_notes") or [],
+            "provider": result.provider,
+        }
+
+    def apply_character_prompt(self, project_title, episode_number,
+                               character_name, image_prompt,
+                               feedback="", run_id=None):
+        """确认改写:提示词写入人物设定(新版本+用户锁),重生成四张候选。"""
+        project, episode = self._episode_ctx(project_title, episode_number)
+        name = str(character_name or "").strip()
+        prompt = str(image_prompt or "").strip()
+        if not name:
+            raise AifosError("缺少角色名")
+        if len(prompt) < 20:
+            raise AifosError("确认的提示词为空或过短")
+        row = self.assets.latest(project["id"], "character", name)
+        if row is None:
+            raise AifosError(f"角色设定不存在: {name}")
+        meta = row["meta"]
+        if isinstance(meta, str):
+            meta = json.loads(meta or "{}")
+        meta = meta or {}
+        design = copy.deepcopy(meta.get("design") or {})
+        design["image_prompt"] = prompt
+        locked = set(design.get("user_locked_fields") or ())
+        locked.add("image_prompt")
+        design["user_locked_fields"] = sorted(locked)
+        history = design.setdefault("refine_history", [])
+        history.append({"feedback": str(feedback or "").strip(),
+                        "at": round(time.time(), 1)})
+        del history[:-10]   # 只留最近 10 次意见
+        self.assets.register(
+            project["id"], "character", name,
+            meta={**meta, "design": design}, new_version=True)
+        self.log.info(
+            "director",
+            f"人物形象提示词已按用户意见更新并锁定: {name};开始重生成候选")
+        return self.regenerate_character_candidates(
+            project_title, episode_number, run_id=run_id,
+            character_name=name)
 
     def regenerate_character_candidates(self, project_title, episode_number,
                                         run_id=None, character_name="",

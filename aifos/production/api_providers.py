@@ -27,6 +27,7 @@ from ..adapters.codex_image import _space_line as _api_space_line
 from ..adapters.claude_script import (build_prompt, extract_json,
                                       validate_script, validate_storyboard)
 from ..script_import import sanitize_script_entities
+from ..story_analysis import validate_story_analysis
 from ..errors import ProviderError
 from .base import Provider, ProviderResult
 
@@ -61,6 +62,88 @@ def _download(name, url, dest, timeout=600):
             dest.write_bytes(resp.read())
     except Exception as exc:
         raise ProviderError(f"{name} 下载产物失败: {exc}") from exc
+
+
+def _parse_sse_data(raw):
+    """SSE 一行 `data: {...}` → dict;非 JSON 数据行返回 None。"""
+    try:
+        event = json.loads(raw)
+    except ValueError:
+        return None
+    return event if isinstance(event, dict) else None
+
+
+def _stream_claude_text(name, url, headers, body, timeout):
+    """流式调用 Anthropic Messages API,聚合全文文本返回。
+
+    整集剧本/制作圣经生成常超 10 分钟,非流式请求会被远端断连
+    (Remote end closed connection without response)。流式下 socket
+    超时按「两次数据块之间的静默」计,长生成不再被掐。仅标准库。
+    """
+    body = dict(body)
+    body["stream"] = True
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"Content-Type": "application/json",
+                 "Accept": "text/event-stream", **headers})
+    parts = []
+    plain_lines = []
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    if line:
+                        # 兼容不认 stream 参数的网关/镜像端点:先攒下
+                        # 非 SSE 行,流式事件一无所获时按普通应答解析。
+                        plain_lines.append(line)
+                    continue
+                event = _parse_sse_data(line[5:].strip())
+                if event is None:
+                    continue
+                etype = event.get("type")
+                if etype == "content_block_delta":
+                    delta = event.get("delta") or {}
+                    if delta.get("type") == "text_delta":
+                        parts.append(str(delta.get("text") or ""))
+                elif etype == "error":
+                    detail = (event.get("error") or {}).get(
+                        "message") or "未知流式错误"
+                    raise ProviderError(f"{name} API 流式错误: {detail}")
+                elif etype == "message_delta":
+                    reason = (event.get("delta") or {}).get("stop_reason")
+                    if reason == "max_tokens":
+                        raise ProviderError(
+                            f"{name} 输出达到 max_tokens 上限被截断,"
+                            "请调大 providers 配置中的 max_tokens")
+                elif etype == "message_stop":
+                    break
+    except ProviderError:
+        raise
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            pass
+        raise ProviderError(
+            f"{name} API HTTP {exc.code}: {detail or exc.reason}") from exc
+    except Exception as exc:
+        raise ProviderError(f"{name} API 调用失败: {exc}") from exc
+    if parts:
+        return "".join(parts)
+    reply = _parse_sse_data("\n".join(plain_lines))
+    if isinstance(reply, dict):
+        if reply.get("type") == "error" or "error" in reply:
+            detail = (reply.get("error") or {})
+            raise ProviderError(
+                f"{name} API 错误: {detail.get('message') or reply}")
+        return "".join(block.get("text", "")
+                       for block in reply.get("content", [])
+                       if isinstance(block, dict)
+                       and block.get("type") == "text")
+    return ""
 
 
 _IMG_MEDIA = {".png": "image/png", ".jpg": "image/jpeg",
@@ -372,7 +455,8 @@ class ClaudeApiProvider(Provider):
             content = prompt
         endpoint = (self.conf.get("endpoint")
                     or self.DEFAULT_ENDPOINT).rstrip("/")
-        reply = _request_json(
+        # 流式必选:整集剧本/圣经生成常超 10 分钟,非流式会被远端断连。
+        text = _stream_claude_text(
             self.name, f"{endpoint}/v1/messages",
             headers={
                 "x-api-key": self.conf["api_key"],
@@ -384,9 +468,6 @@ class ClaudeApiProvider(Provider):
                 "messages": [{"role": "user", "content": content}],
             },
             timeout=self.conf.get("timeout", 600))
-        text = "".join(block.get("text", "")
-                       for block in reply.get("content", [])
-                       if block.get("type") == "text")
         data = extract_json(text)
         if data is None:
             raise ProviderError(f"{self.name} 应答中未找到 JSON 对象")
@@ -400,6 +481,15 @@ class ClaudeApiProvider(Provider):
             elif capability == "image_select":
                 from ..auto_select import validate_image_select
                 error = validate_image_select(data)
+            elif capability == "script" and payload.get("prompt_refine"):
+                from ..adapters.claude_script import validate_prompt_refine
+                error = validate_prompt_refine(data)
+            elif capability == "script" and payload.get("story_analysis"):
+                # 与 CLI 桥(claude_script.run)保持同一分支:制作圣经/剧本
+                # 自动分析的输出没有 scenes,必须用 story_analysis 校验器,
+                # 否则永远"缺少 scenes"并静默回退 mock 污染事实源。
+                error = validate_story_analysis(
+                    data, require_resolved_identity=False)
             elif capability == "script":
                 error = validate_script(data, payload)
             else:
@@ -411,6 +501,153 @@ class ClaudeApiProvider(Provider):
             raise ProviderError(f"{self.name} 输出校验失败: {error}")
         return ProviderResult(
             provider=self.name, cost=self.cost_per_call, data=data)
+
+
+class OpenAIChatProvider(Provider):
+    """OpenAI 兼容对话 API 编剧(DeepSeek / 通义 / Kimi / 本地网关等)。
+
+    与 Claude/Codex 编剧共用同一套提示词与校验器,产出口径完全一致;
+    校验失败时按"就地修复"原则先让同一模型改错误字段并复检,
+    复检仍不过才抛错交回路由。
+    """
+
+    DEFAULT_ENDPOINT = "https://api.deepseek.com"
+    DEFAULT_MODEL = "deepseek-chat"
+
+    def available(self, capability):
+        ok, reason = super().available(capability)
+        if not ok:
+            return ok, reason
+        if not self.conf.get("api_key"):
+            return False, "未配置 api_key"
+        return True, ""
+
+    def ping(self):
+        """真实连通性测试:发一个极小的对话请求。
+
+        max_tokens 极小时 finish_reason 必然是 length,那是预期而非
+        故障——连通性只看请求有没有被正常受理。
+        """
+        try:
+            self._chat([{"role": "user", "content": "ping"}],
+                       max_tokens=4, timeout=30)
+        except ProviderError as exc:
+            if "max_tokens 上限被截断" not in str(exc):
+                return False, str(exc)
+        model = self.conf.get("model") or self.DEFAULT_MODEL
+        return True, f"真实连通成功(model={model})"
+
+    def _chat(self, messages, max_tokens=None, timeout=None):
+        endpoint = (self.conf.get("endpoint")
+                    or self.DEFAULT_ENDPOINT).rstrip("/")
+        url = (endpoint if endpoint.endswith("/chat/completions")
+               else f"{endpoint}/v1/chat/completions")
+        body = {
+            "model": self.conf.get("model") or self.DEFAULT_MODEL,
+            "messages": messages,
+            "max_tokens": int(max_tokens
+                              or self.conf.get("max_tokens", 8192)),
+            "stream": False,
+        }
+        temperature = self.conf.get("temperature")
+        if temperature is not None:
+            body["temperature"] = float(temperature)
+        reply = _request_json(
+            self.name, url,
+            headers={"Authorization": f"Bearer {self.conf['api_key']}"},
+            body=body,
+            timeout=timeout or self.conf.get("timeout", 1800))
+        choices = reply.get("choices") or []
+        if not choices:
+            raise ProviderError(f"{self.name} 应答缺少 choices")
+        message = (choices[0] or {}).get("message") or {}
+        finish = str((choices[0] or {}).get("finish_reason") or "")
+        text = str(message.get("content") or "")
+        if finish == "length":
+            raise ProviderError(
+                f"{self.name} 输出达到 max_tokens 上限被截断,"
+                "请调大 providers 配置中的 max_tokens")
+        return text
+
+    def _validate(self, capability, payload, data):
+        from ..adapters.claude_script import (validate_image_qc,
+                                              validate_prompt_refine)
+        if capability == "image_qc":
+            return validate_image_qc(data)
+        if capability == "script" and payload.get("prompt_refine"):
+            return validate_prompt_refine(data)
+        if capability == "script" and payload.get("story_analysis"):
+            return validate_story_analysis(
+                data, require_resolved_identity=False)
+        if capability == "script":
+            return validate_script(data, payload)
+        return validate_storyboard(data)
+
+    def _postprocess(self, capability, data):
+        if (capability == "script" and isinstance(data, dict)
+                and isinstance(data.get("scenes"), list)):
+            sanitize_script_entities(data)
+        return data
+
+    def generate(self, capability, payload, out_dir, cancel=None):
+        try:
+            prompt = build_prompt(capability, payload)
+        except ValueError as exc:
+            raise ProviderError(str(exc)) from exc
+        messages = [
+            {"role": "system",
+             "content": "你只输出一个 JSON 对象,不要任何解释或 Markdown 代码块。"},
+            {"role": "user", "content": prompt},
+        ]
+        text = self._chat(messages)
+        data = extract_json(text)
+        if data is None:
+            raise ProviderError(f"{self.name} 应答中未找到 JSON 对象")
+        data = self._postprocess(capability, data)
+        try:
+            error = self._validate(capability, payload, data)
+        except Exception as exc:
+            raise ProviderError(
+                f"{self.name} 输出结构异常: {exc}") from exc
+        if error:
+            # 就地修复:内容已在手,只是字段不合规,先让同一模型改错处。
+            fixed, note = self._repair(capability, payload, data, error)
+            if fixed is None:
+                raise ProviderError(
+                    f"{self.name} 输出校验失败: {error}{note}")
+            data = fixed
+        return ProviderResult(
+            provider=self.name, cost=self.cost_per_call, data=data,
+            model=self.conf.get("model") or self.DEFAULT_MODEL)
+
+    def _repair(self, capability, payload, data, error):
+        try:
+            source = json.dumps(data, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return None, "(产出不可序列化,跳过就地修复)"
+        messages = [
+            {"role": "system",
+             "content": "你只输出一个 JSON 对象,不要任何解释或 Markdown 代码块。"},
+            {"role": "user", "content":
+                "你刚生成的 JSON 产出未通过机器校验:\n"
+                f"{error}\n\n只修复校验指出的字段,其余内容一字不动;"
+                "输出完整 JSON。\n原 JSON:\n" + source},
+        ]
+        try:
+            text = self._chat(messages)
+        except ProviderError as exc:
+            return None, f"(就地修复调用失败: {exc})"
+        fixed = extract_json(text)
+        if fixed is None:
+            return None, "(就地修复输出中未找到 JSON)"
+        fixed = self._postprocess(capability, fixed)
+        try:
+            fixed_error = self._validate(capability, payload, fixed)
+        except Exception as exc:
+            return None, f"(就地修复复检异常: {exc})"
+        if fixed_error:
+            return None, f"(就地修复复检仍未通过: {str(fixed_error)[:300]})"
+        return fixed, ""
 
 
 class OpenAIImageProvider(Provider):
@@ -555,9 +792,11 @@ class OpenAIImageProvider(Provider):
                     "已随请求真实上传定角参考图。参考图人物身份与脸是最高标准；"
                     "脸型、五官比例、眼鼻嘴结构、肤色、年龄感、性别表达、"
                     "发际线、发型轮廓、发量、发色家族、妆造和稳定身份特征必须保持"
-                    "同一个人，不得改脸、换发型或换妆造；候选只允许在同一项目画风"
-                    "下比较剧情服装细节、表情和轻微姿态，禁止通过更换媒介、渲染、"
-                    "色彩系统或时代制造不同画风。")
+                    "同一个人，不得改脸、换发型或换妆造；参考图服装、配饰、"
+                    "手持物、姿势、背景和光线不得覆盖"
+                    "本次初始造型合同；同一人物四张候选必须复用完全相同的最终"
+                    "提示词，只靠模型随机采样，禁止换装、换妆、换动作、加入"
+                    "淋湿/泥污/伤情或通过不同剧情阶段制造差异。")
             elif payload.get("reference_manifest"):
                 parts.append(
                     "本请求已提供逐图参考对照表。每张参考图只能执行表中声明的"

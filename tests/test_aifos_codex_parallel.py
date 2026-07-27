@@ -143,3 +143,88 @@ def test_codex_cli_profile_missing_home_fails_closed(tmp_path):
     })
     with pytest.raises(ProviderError, match="CODEX_HOME 不存在"):
         provider.generate("image", {"_codex_profile": "codex_a"}, tmp_path)
+
+
+# ---- 通道溢出调度:B、C 先行,占满才用 A ----
+def _overflow_app(tmp_path, parallel=1):
+    profiles, _a, _b, _c = _three_profiles(tmp_path)
+    by_id = {p["id"]: p for p in profiles}
+    ordered = [by_id["codex_b"], by_id["codex_c"], by_id["codex_a"]]
+    return App(tmp_path / "ws", config_overrides={
+        "defaults": {"parallel_images": parallel},
+        "codex_parallel": {"profiles": ordered},
+    })
+
+
+def test_router_slot_order_prefers_b_c_then_overflows_to_a(tmp_path):
+    app = _overflow_app(tmp_path, parallel=1)
+    try:
+        router = app.router
+        assert router._codex_profile_order == [
+            "codex_b", "codex_c", "codex_a"]
+        p1, s1 = router._acquire_codex_slot()
+        p2, s2 = router._acquire_codex_slot()
+        p3, s3 = router._acquire_codex_slot()
+        assert [p1, p2, p3] == ["codex_b", "codex_c", "codex_a"]
+        # C 释放后,新任务优先回填 C(B 仍满),而不是继续用 A
+        s2.release()
+        p4, s4 = router._acquire_codex_slot()
+        assert p4 == "codex_c"
+        for slot in (s1, s3, s4):
+            slot.release()
+    finally:
+        app.close()
+
+
+def test_router_slot_acquire_cancel_while_full(tmp_path):
+    app = _overflow_app(tmp_path, parallel=1)
+    try:
+        router = app.router
+        held = [router._acquire_codex_slot() for _ in range(3)]
+        from aifos.errors import ProduceCancelled
+        with pytest.raises(ProduceCancelled):
+            router._acquire_codex_slot(cancel=lambda: True)
+        for _pid, slot in held:
+            slot.release()
+    finally:
+        app.close()
+
+
+def test_router_generate_via_slot_rewrites_payload_profile(tmp_path):
+    app = _overflow_app(tmp_path, parallel=1)
+    try:
+        router = app.router
+        seen = []
+
+        class _FakeProvider:
+            def generate(self, capability, payload, out_dir, cancel=None):
+                seen.append(payload.get("_codex_profile"))
+                return "ok"
+
+        # 静态分配写的是 codex_a,执行时应被改写为优先通道 codex_b
+        payload = {"_codex_profile": "codex_a"}
+        assert router._generate_via_codex_slot(
+            _FakeProvider(), "image", payload, tmp_path) == "ok"
+        assert seen == ["codex_b"]
+        assert payload["_codex_profile"] == "codex_b"
+        # 槽已释放:再次取用仍从 codex_b 开始
+        pid, slot = router._acquire_codex_slot()
+        assert pid == "codex_b"
+        slot.release()
+    finally:
+        app.close()
+
+
+def test_disabled_profile_excluded_from_slot_order(tmp_path):
+    profiles, _a, _b, _c = _three_profiles(tmp_path)
+    by_id = {p["id"]: p for p in profiles}
+    by_id["codex_a"]["enabled"] = False
+    ordered = [by_id["codex_b"], by_id["codex_c"], by_id["codex_a"]]
+    app = App(tmp_path / "ws", config_overrides={
+        "defaults": {"parallel_images": 1},
+        "codex_parallel": {"profiles": ordered},
+    })
+    try:
+        assert app.router._codex_profile_order == ["codex_b", "codex_c"]
+    finally:
+        app.close()

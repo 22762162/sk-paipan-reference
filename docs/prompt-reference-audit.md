@@ -11,18 +11,20 @@
 3. 质检把模型漏答的身份、性别和人数检查字段当成通过。
 
 这些问题会直接造成串脸、换性别、服装串用、人物变多、错误场景和首尾帧
-修改不生效。v2.1 修复后的原则是：**每张参考图只有一个用途；身份图默认
+修改不生效。v2.1 已正式实现并形成稳定基线，其原则是：**每张参考图只有一个用途；身份图默认
 只继承身份；登记人物、功能人物和总可见人数分别计数；图片只描述一张已经
 发生完毕的定格画面；视频才描述起点、单一主动作和终点；质检必须逐项显式
-回答后才允许放行。**
+回答后才允许放行。** v2.2 hardening 在此基础上锁紧单人过肩、显式静态
+目标、头饰/头发可见性、人物生命状态、道具物理实例和诊断严重度。
 
-## 镜头提示词合同 v2.1
+## 镜头提示词合同 v2.1 基线与 v2.2 hardening
 
-新编译合同统一使用 `aifos.shot-prompt/v2.1`。v2.1 是 v2 的向后兼容读取
-升级：系统仍可读取没有 `functional_figures`、`visible_figure_count`、
-`spatial_relations`、`medium` 和参考图 `inherit_scope` 的 v2 镜头，但任何重新
-编译、自动修复或付费生成前保存的合同都必须归一化为 v2.1。不得继续生成
-新的 v2 合同。
+`aifos.shot-prompt/v2.1` 的人数、图片/视频分流、空间关系、媒介和参考图
+职责已经落地，不再列为待实现项。当前规范写入目标升级为
+`aifos.shot-prompt/v2.2`。系统仍可读取 v2.1 和更早镜头，但任何重新编译、
+自动修复、重试或付费生成前保存的合同必须输出 v2.2；需要从旧起止状态或
+描述回退时，必须显式启用带名称的 legacy `frame_target_policy`，不得继续
+写入新的 v2/v2.1 合同，也不得借隐式回退绕过硬门禁。
 
 ### 人数三元组
 
@@ -76,14 +78,16 @@
 “放下包袱”“躲到”一类过程动作原样塞进图片模型。定格状态按以下优先级
 取值：
 
-1. 显式 `freeze_state`；
-2. 显式 `image_state`；
-3. `frame_kind=first_frame` 时使用显式 `start_state`；
-4. 其余图片（包括 `last_frame`）使用显式 `end_state`；
-5. 目标状态缺失时，才采用仅供旧镜头兼容的静态回退。
+1. 与 `frame_kind` 对应的 `frame_targets.keyframe` /
+   `frame_targets.first_frame` / `frame_targets.last_frame`；
+2. 显式 `frame_target`；
+3. 显式 `freeze_state`；
+4. 显式 `image_state`；
+5. 只有显式启用 legacy fallback 时，才从 `start_state`、`end_state`、
+   description 或 action 生成兼容目标；否则阻断。
 
 合同同时记录
-`output={media:image, frame_phase:start|end, temporal_policy:terminal_only}`、
+`output={media:image, frame_phase:start|end|freeze, temporal_policy:terminal_only}`、
 结构化 `frame_target`、`frame_target_state` 和 `frame_target_source`，
 让质检能够证明图片究竟继承了哪个显式状态；不能只凭最终提示词猜测。
 视频对应 `output={media:video, frame_phase:timeline,
@@ -110,6 +114,144 @@ temporal_policy:timeline}`。
 同一镜头同时要求 2D 与 3D 时属于硬冲突，不能让 Provider 自行二选一。
 “电影级半写实 3D 精品漫剧”必须明确为 3D 且“非真人摄影”；半写实指
 材质与光影层次，不得被扩写成真人照片、摄影棚人像或 live action。
+
+## v2.2 hardening
+
+### 单人过肩是项目专用单主体构图
+
+AIFOS 的 `single_subject_over_shoulder` 不等同于通用影视语义中的双人
+过肩。它表示一个登记主体、一具连续身体和 `real_people_total=1`：近机位
+肩背、后脑、侧脸与躯干都是同一个人，不能因为出现“肩”就自动补第二名
+对话者、陌生前景人或镜中分身。
+
+该构图必须在合同中明确 `composition_type=single_subject_over_shoulder`
+及单连续身体约束。若剧情确实需要第二人，分镜必须升级为多人过肩，并将
+第二人写入登记角色或带精确 `count` 的功能人物；Provider 不得自行猜测。
+
+### 静态 frame_target 默认硬阻断
+
+v2.2 的静态任务必须显式提供唯一 `frame_target`，并记录
+`frame_target_state`、`frame_target_source` 和图片相位。缺失目标、目标
+来源互相冲突，或只能从动作过程长文猜测冻结瞬间时，默认结果是 `BLOCK`。
+不能再以“旧数据兼容”为由自动选一个看似合理的尾帧。
+
+legacy 镜头已有结构化 `frame_target`、`freeze_state` 或 `image_state` 时，
+编译器将该显式状态归一化为合同中的唯一 `frame_target`。只有必须从
+`start_state`、`end_state`、description 或 action 回退时，镜头才需要显式
+携带：
+
+```json
+{"frame_target_policy":{"name":"legacy_explicit","allow_legacy_fallback":true}}
+```
+
+使用该兼容策略的合同返回 `WARN`；未显式允许时返回 `BLOCK`。
+
+### headwear 与 hair_visibility
+
+人物状态必须分别记录结构化 `headwear` 和 `hair_visibility`。
+`headwear.presence` 取 `none` / `worn` / `unknown`；
+`headwear.kind` 取 `none` / `hair_only` / `soft_hat` /
+`official_hat` / `crown` / `helmet` / `veil` / `hair_ornament` /
+`other` / `unknown`，具体名称放在 `name`。`hair_visibility` 取
+`fully_visible` / `partially_visible` / `covered` / `unknown`。身份图
+锁定头发身份，并不意味着帽冠遮挡时仍要画出完整发髻。
+
+无摘戴动作却跨帧换帽、声明 `covered` 却要求完整头发可见、声明无头饰却
+出现帽冠，均为连续性 `BLOCK`。侧背镜中正面发际线不可见本身不是错误；
+非关键发丝数量等纯视觉偏差不由结构化镜头合同 validator 判定。
+
+### 人物 life / consciousness / embodiment / mobility
+
+人物的生命与表演资格拆成四维：
+
+| 字段 | 典型值 | 约束对象 |
+|---|---|---|
+| `life_state` | `alive` / `dead` / `nonliving` / `unknown` | 是否允许生命活动 |
+| `consciousness_state` | `awake` / `asleep` / `unconscious` / `not_applicable` / `unknown` | 是否允许主动反应 |
+| `embodiment` | `physical` / `statue` / `portrait` / `imagined` / `overlay` / `unknown` | 当前存在形态 |
+| `mobility` | `active` / `limited` / `immobile` / `not_applicable` / `unknown` | 是否允许真实位移 |
+
+尸体虽然计入可见真人，但应为
+`dead + not_applicable + physical + immobile`，禁止呼吸、眨眼、主动视线
+或自行移动。昏迷者仍是活人，但不能执行有意识反应；灵魂和内心 Q 版不能
+获得真人重力、遮挡和站位。状态转变缺少可见事件或前后边界时必须 `BLOCK`。
+
+### 道具注册、实例与转移
+
+v2.2 将逻辑道具、当前物理实例和跨帧变化分开：
+
+```json
+{
+  "prop_registry": [
+    {
+      "prop_id": "prop_bag_01",
+      "name": "林川的包袱",
+      "kind": "core",
+      "instance_count": 1,
+      "availability_start_event": {
+        "event_id": "scene:1",
+        "phase": "start"
+      },
+      "disclosure_policy": "explicit_frame_only"
+    }
+  ],
+  "frame_props": [
+    {
+      "prop_id": "prop_bag_01",
+      "phase": "start",
+      "physical_state": "背在身上",
+      "holder": "林川",
+      "location": "none",
+      "support": "林川肩背",
+      "visibility": "visible",
+      "representation": "physical"
+    },
+    {
+      "prop_id": "prop_bag_01",
+      "phase": "end",
+      "physical_state": "完整",
+      "holder": "none",
+      "location": "林川脚边",
+      "support": "地面",
+      "visibility": "visible",
+      "representation": "physical"
+    }
+  ],
+  "prop_transitions": [
+    {
+      "prop_id": "prop_bag_01",
+      "from_phase": "start",
+      "to_phase": "end",
+      "action": "放下"
+    }
+  ]
+}
+```
+
+`prop_registry` 的每个 `prop_id` 代表一个受追踪物理实例，且
+`instance_count` 固定为 1；同款多件必须拆成不同 `prop_id`。`frame_props`
+记录该实例在 `start` / `end` / `freeze` 相位的状态；`visibility` 使用
+`visible` / `occluded` / `hidden` / `absent`，`representation` 使用
+`physical` / `reflection` / `screen` / `painting` / `overlay`。
+`prop_transitions` 用 `from_phase` / `to_phase` 连接同一 `prop_id` 的相位。
+
+剧本提及、角色知情、镜头外存在或审计披露不等于当前物理实例出现；反射、
+屏幕、画中画和叠层只作披露，不建立第二个物理位置。同一 `prop_id` 在同一
+相位出现两个物理主位置、转移缺少相位状态、持有人/位置与定格状态冲突时均
+为 `BLOCK`。
+
+### PASS / WARN / BLOCK severity
+
+当前镜头合同 validator 使用聚合 `status`：
+
+- `PASS`：合同没有阻断问题或兼容告警，可进入下一阶段；
+- `WARN`：合同通过，但使用了显式允许的 legacy `frame_target` 回退；
+- `BLOCK`：硬事实缺失或冲突，禁止付费生成、自动放行和下游消费。
+
+兼容字段 `passed` 仅在 `BLOCK` 时为 false；`severity` 为对应的小写
+`pass` / `warn` / `block`。具体阻断原因进入字符串数组 `issues`，legacy
+兼容提示进入 `warnings`。该返回结构不承诺每条字符串问题都携带独立
+`rule_id`、字段路径、证据或修复对象；视觉质检继续使用自身已有报告结构。
 
 ## 参考图 scope 与 binding
 
@@ -143,7 +285,7 @@ temporal_policy:timeline}`。
 但它们必须与 `inherit_scope.include` / `exclude` 完全一致；验证与新代码
 以 `inherit_scope` 为规范来源，不能维护两套互相矛盾的范围。
 
-## 从 v2 迁移
+## 从 v2/v2.1 迁移到 v2.2
 
 迁移采用“宽读严写”：
 
@@ -151,12 +293,24 @@ temporal_policy:timeline}`。
 2. 没有总可见人数则以登记人物数作为 `visible_count`；
 3. `subject.count` 继续表示登记人物数，避免破坏旧调用方；
 4. 旧 identity reference 自动补齐 identity-only scope；
-5. 旧图片合同重新编译时改成定格状态，旧视频合同保留时序结构；
-6. 保存、自动修复、重试和正式生成时一律输出 v2.1，并执行 v2.1 validator。
+5. 旧静态合同若需从起止状态或描述回退，必须显式提供带名称且
+   `allow_legacy_fallback:true` 的 `frame_target_policy`；否则阻断；
+6. 缺少头饰/头发、人物四维状态或道具实例台账时，只能按证据确定性迁移，
+   不能从人物传记或参考图服装猜测；
+7. 旧视频合同保留起点—动作—终点时序，但仍需补齐 v2.2 状态与道具边界；
+8. 保存、自动修复、重试和正式生成时一律输出 v2.2，并执行 v2.2 validator。
 
 兼容只用于读取和确定性补缺，不能绕过新门禁。旧数据中一旦出现不精确
 功能人数、人数和不一致、参考图职责冲突、无端点的空间关系或媒介冲突，
 必须要求修订，不能因为来源是 v2 就继续付费生成。
+
+## 实施状态
+
+v2.1 的人数三元组、非现实叠层分计数、图片/视频渲染分流、空间关系、
+媒介一致性及参考图 scope/binding 已正式实现并进入生产基线。本文不再将
+这些能力描述为待实现。v2.2 hardening 的本文字段以当前合同构造器、
+validator 和生成输入已经采用的结构为准；视觉 QC 继续使用自身已有报告
+结构。
 
 ## 各环节问题与修复
 
