@@ -375,8 +375,29 @@ def character_candidate_policy_text():
             "泥污、伤情、死亡态或其他后续剧情状态")
 
 
+# 「一次性小物」类道具 kind:登记进台账、参与连续性,但不建母资产、
+# 不上参考图。除此之外(core/identity_prop/plot_sensitive/high_reuse/
+# 留空的旧数据)一律按母资产道具对待——生成4张候选并要求人工定版。
+NON_MASTER_PROP_KINDS = {
+    "minor", "one_off", "oneoff", "consumable", "background",
+    "environment", "set_dressing", "disposable",
+}
+
+
+def master_prop_kind(kind):
+    """道具 kind 是否属于必须人工锁定母资产的类别。"""
+    return str(kind or "").strip().lower() not in NON_MASTER_PROP_KINDS
+
+
 def core_prop_definitions(script):
-    """返回编剧明确列出的核心/高复用道具；一次性小物不建立母资产。"""
+    """返回需要建立母资产的道具定义;一次性小物不建立母资产。
+
+    实测教训(凡人修仙传 script v5):编剧把「韩立的旧麻布包裹」登记进
+    prop_registry(kind=identity_prop)却没写进 core_props 设计卡——候选
+    生成只吃 core_props,镜头引用却按登记表要母资产,必现「尚未人工
+    锁定」熔断。此处取两者并集:core_props 提供富设计卡,登记表里
+    母资产类 kind 的孤儿条目补最小定义(外观交给候选提示词按剧情设计)。
+    """
     result = []
     seen = set()
     for raw in (script or {}).get("core_props", []) or []:
@@ -385,6 +406,19 @@ def core_prop_definitions(script):
             continue
         name = str(item.get("name") or "").strip()
         if not name or name in seen:
+            continue
+        seen.add(name)
+        result.append({
+            **item,
+            "name": name,
+            "candidate_count": PROP_CANDIDATES,
+        })
+    for item in (script or {}).get("prop_registry") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if (not name or name in seen
+                or not master_prop_kind(item.get("kind"))):
             continue
         seen.add(name)
         result.append({
@@ -8357,6 +8391,11 @@ class Director:
             name = str(frame_prop.get("name") or "").strip()
             registered = by_id.get(prop_id) or by_name.get(name) or {}
             name = str(registered.get("name") or name).strip()
+            # 只有登记表里母资产类道具才要求参考图与人工锁定;
+            # 未登记条目与一次性小物由镜头描述承载,不建母资产。
+            if not registered or not master_prop_kind(
+                    registered.get("kind")):
+                continue
             if prop_id and name:
                 reference = references_by_id.get(prop_id)
                 if reference is None:
@@ -8395,6 +8434,8 @@ class Director:
             registered = by_id.get(name) or by_name.get(name) or {}
             name = str(registered.get("name") or name).strip()
             prop_id = str(registered.get("prop_id") or name).strip()
+            if not master_prop_kind(registered.get("kind")):
+                continue
             if name and name in by_name and prop_id not in seen:
                 seen.add(prop_id)
                 references.append({

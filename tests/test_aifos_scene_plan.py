@@ -63,5 +63,36 @@ class ScenePlanFilterTest(unittest.TestCase):
             [s["shot_no"] for s in d._active_shots(ctx)], [1, 4])
 
 
+
+class CorePropUnionTest(unittest.TestCase):
+    """道具母资产口径统一:候选生成必须覆盖登记表里的母资产类孤儿。
+
+    实测(凡人修仙传 script v5):「韩立的旧麻布包裹」只在 prop_registry
+    (identity_prop)不在 core_props——候选生成漏掉它,镜头引用却要母资产,
+    必现「尚未人工锁定」熔断。"""
+
+    def test_registry_orphan_master_props_included(self):
+        from aifos.director import core_prop_definitions
+        script = {
+            "core_props": [{"name": "粗陶水壶", "visual_design": "灰褐陶"}],
+            "prop_registry": [
+                {"prop_id": "a", "name": "旧麻布包裹",
+                 "kind": "identity_prop"},
+                {"prop_id": "b", "name": "粗陶水壶", "kind": "core"},
+                {"prop_id": "c", "name": "路边石子", "kind": "minor"},
+            ],
+        }
+        names = [d["name"] for d in core_prop_definitions(script)]
+        self.assertEqual(names, ["粗陶水壶", "旧麻布包裹"])
+
+    def test_minor_kind_props_skip_master_demand(self):
+        from aifos.director import master_prop_kind
+        self.assertTrue(master_prop_kind("identity_prop"))
+        self.assertTrue(master_prop_kind("core"))
+        self.assertTrue(master_prop_kind(""))       # 旧数据留空=母资产
+        self.assertFalse(master_prop_kind("minor"))
+        self.assertFalse(master_prop_kind("one_off"))
+
+
 if __name__ == "__main__":
     unittest.main()
