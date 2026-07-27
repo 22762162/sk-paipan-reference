@@ -244,3 +244,42 @@ def test_scale_visibility_tiering_in_contract_and_qc():
     assert "不得作为不合格理由" in far
     close = build_qc_prompt({**base, "camera": "特写"})
     assert "必须核验一致" in close
+
+
+def test_explicit_reference_scope_overrides_role_defaults():
+    """显式 include+exclude=作者已裁决:排除域不再并角色默认。
+
+    实测(镜头02/16 批量熔断):背面立绘/穿着类道具的显式继承里必须有
+    wardrobe、prop_position,而角色默认排除也含它们——旧逻辑排除域
+    永远并默认,显式覆盖不可能生效,include/exclude 必然交集。"""
+    from aifos.prompt_contract import compile_shot_prompt
+    shot = {"shot_no": 2, "scene_no": 1, "kind": "environment",
+            "camera": "全景", "description": "d", "duration": 3,
+            "characters": [], "dialogue": None, "prompt": "p"}
+    refs = [{
+        "index": 1, "label": "旧靛青举人青袍", "role": "prop",
+        "binding": "穿着类道具", "uri": "/tmp/x.png",
+        "inherits": ["prop_structure", "prop_material",
+                     "wardrobe", "prop_position"],
+        "excludes": ["background", "composition", "extra_props"],
+    }, {
+        "index": 2, "label": "背面母资产", "role": "identity_detail",
+        "binding": "背面轮廓", "uri": "/tmp/y.png",
+        "inherits": ["背面轮廓", "hair_silhouette", "wardrobe",
+                     "prop_position"],
+        "excludes": ["face_identity_override", "pose", "background"],
+    }, {
+        # 只给 include 的条目仍受角色默认排除保护
+        "index": 3, "label": "普通参考", "role": "prop",
+        "binding": "结构", "uri": "/tmp/z.png",
+        "inherits": ["prop_structure"],
+    }]
+    contract, _ = compile_shot_prompt(
+        shot, location="废茶棚", mode="image", references=refs)
+    for ref in contract["references"]:
+        scope = ref.get("inherit_scope") or {}
+        overlap = set(scope.get("include") or []) & set(
+            scope.get("exclude") or [])
+        assert not overlap, (ref.get("index"), sorted(overlap))
+    third = next(r for r in contract["references"] if r["index"] == 3)
+    assert "wardrobe" in (third["inherit_scope"]["exclude"] or [])

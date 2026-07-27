@@ -760,12 +760,22 @@ def _normalize_reference(item):
         _text_list(explicit_include)
         if explicit_include is not None
         else list(defaults["include"]))
-    excludes = list(defaults["exclude"])
-    for value in _text_list(explicit_exclude):
-        if value not in excludes:
-            excludes.append(value)
-    # Safe role boundaries cannot be weakened by an explicit include. Keeping
-    # an unsafe item in both lists makes the conflict visible to preflight.
+    if explicit_include is not None and explicit_exclude is not None:
+        # 装配方同时显式给出 include 与 exclude = 该图作用域已被人为
+        # 裁决(如背面立绘要继承 wardrobe/prop_position、穿着类道具要
+        # 继承 wardrobe)。此时排除域以显式声明为准,不再并入角色默认
+        # ——否则显式覆盖永远无法移除默认排除项,include/exclude 必然
+        # 交集,预检把全部此类镜头批量熔断(2026-07-28 镜头02/16实测)。
+        # 显式声明内部自相矛盾仍会被下方交集检查拦截并可见。
+        excludes = _text_list(explicit_exclude)
+    else:
+        # Safe role boundaries cannot be weakened by a lone explicit
+        # include. Keeping an unsafe item in both lists makes the
+        # conflict visible to preflight.
+        excludes = list(defaults["exclude"])
+        for value in _text_list(explicit_exclude):
+            if value not in excludes:
+                excludes.append(value)
     inherits = (
         _text_list(item.get("inherits"))
         if item.get("inherits") is not None
