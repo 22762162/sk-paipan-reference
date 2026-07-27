@@ -115,6 +115,90 @@ def _screen_text_instruction(reason, whitelist=None, carrier=""):
     )
 
 
+# 修订限流:一轮塞进去的问题越多,模型顾此失彼越严重。实测(ep24
+# 镜头21)一次背 5→7→10 条,问题不降反升,第3轮还撞出了全新的身份
+# 漂移。改为按决定性程度排序、每轮只修最要命的前 N 条,逐轮收敛。
+MAX_REVISION_ISSUES = 3
+
+# 决定性程度分档(数字越小越先修):画错了人是废图,细节不对只是瑕疵。
+_SEVERITY_TIERS = (
+    (10, ("人数", "多余人物", "新增人物", "复制人物", "遗漏", "少了",
+          "只有", "身份", "立绘不一致", "骨相", "五官", "脸型",
+          "性别", "男性", "女性", "少女", "少年", "年龄")),
+    (20, ("死亡", "尸体", "活人感", "睁眼", "双眼", "昏迷", "无意识",
+          "硬状态", "生死", "致命", "伤口", "血迹", "剧情信息",
+          "关键剧情")),
+    (30, ("道具", "持有人", "手持", "佩戴", "不在场", "缺失", "兵器",
+          "刀", "包", "灯")),
+    (40, ("物理", "重力", "支撑", "漂浮", "穿模", "接触", "站位",
+          "空间", "朝向", "方向反")),
+    (50, ("文字", "字幕", "水印", "乱码", "印文", "屏幕")),
+    (60, ("服装", "妆发", "发型", "头饰", "配饰", "穿戴")),
+    (70, ("景别", "镜位", "机位", "构图", "视角", "俯拍", "仰拍",
+          "取景")),
+)
+
+# 只有"输入本身自相矛盾"才是改图治不好的:模型再听话也画不出互斥的
+# 画面。"成片与合同不符/景别偏大"属于正常的改图素材,不能混进来,
+# 否则会把可修的问题一起踢出修订清单。
+_INPUT_LEVEL_TOKENS = (
+    "合同自相冲突", "输入合同自相", "合同冲突", "提示词冲突",
+    "自相矛盾", "互斥", "输入合同错误",
+)
+
+
+# 失败类型 → 决定性程度基线。与 qc_stats 共用同一套分类器,避免两处
+# 各写一份关键词表、各自字面化(今晚已被这个毛病咬过四次)。
+_CATEGORY_SEVERITY = {
+    "figure_count": 10, "gender": 10, "species": 10, "identity_drift": 10,
+    "props": 30, "continuity": 40, "onscreen_text": 50,
+    "wardrobe": 60, "camera": 70, "contract": 75, "other": 80,
+}
+
+
+def issue_severity(issue):
+    """单条质检问题 → 决定性程度分值(越小越致命)。
+
+    取「共用分类器给的基线」与「关键词档位」中更严重的一个:分类器
+    覆盖常见表述,关键词补它没有的维度(生死硬状态、致命伤等剧情
+    关键信息)。
+    """
+    from .qc_stats import classify_issue
+    text = str(issue or "")
+    score = _CATEGORY_SEVERITY.get(classify_issue(text), 80)
+    for tier_score, tokens in _SEVERITY_TIERS:
+        if any(token in text for token in tokens):
+            score = min(score, tier_score)
+            break
+    return score
+
+
+def input_level_issues(issues):
+    """挑出"改图治不好、要回输入端修"的问题(合同/景别口径冲突)。"""
+    return [
+        str(issue) for issue in (issues or [])
+        if any(token in str(issue) for token in _INPUT_LEVEL_TOKENS)
+    ]
+
+
+def rank_issues(issues, limit=MAX_REVISION_ISSUES):
+    """按决定性程度排序并限流,返回 (本轮要修的, 本轮暂缓的)。
+
+    稳定排序:同档保持判官给出的原始顺序(判官通常先说最重的)。
+    输入自相矛盾类问题排到最后:改图治不了它们,占着修订名额只会
+    挤掉真正能修的问题(由 input_level_issues 走合同修复路径)。
+    """
+    texts = [str(issue) for issue in (issues or []) if str(issue).strip()]
+    input_level = set(input_level_issues(texts))
+    ordered = sorted(
+        texts,
+        key=lambda text: (
+            1 if text in input_level else 0, issue_severity(text)))
+    if limit and limit > 0:
+        return ordered[:limit], ordered[limit:]
+    return ordered, []
+
+
 def _issue_text(issue):
     if isinstance(issue, dict):
         return str(issue.get("message") or issue.get("reason")
@@ -123,8 +207,17 @@ def _issue_text(issue):
 
 
 def optimize_qc_feedback(
-        issues, *, mode="image", readable_text=None, diagnostics=None):
-    """返回原始原因、分类指令及可直接附加到提示词的修订文本。"""
+        issues, *, mode="image", readable_text=None, diagnostics=None,
+        limit=MAX_REVISION_ISSUES):
+    """返回原始原因、分类指令及可直接附加到提示词的修订文本。
+
+    limit 生效时按决定性程度排序并只下发前 N 条(其余留待下一轮),
+    治"一次塞十条→顾此失彼→越修越糟"。传 limit=0 关闭限流。
+    """
+    all_issues = [str(item) for item in (issues or []) if str(item).strip()]
+    focus, deferred = rank_issues(all_issues, limit=limit)
+    if focus:
+        issues = focus
     reasons = []
     instructions = []
     categories = []
@@ -218,12 +311,19 @@ def optimize_qc_feedback(
             + "。\n【自动优化修订】" + "；".join(instructions)
             + "\n【修订边界】" + scope)
     )
+    if deferred:
+        text += (
+            "\n【本轮不修(下一轮再说)】以下问题本轮一律不动,以免顾此失彼"
+            "破坏已经正确的部分:" + "；".join(item[:80] for item in deferred))
     result = {
         "mode": mode,
         "issues": reasons,
         "categories": categories,
         "instructions": instructions,
         "text": text,
+        "all_issues": all_issues,
+        "deferred_issues": deferred,
+        "input_level_issues": input_level_issues(all_issues),
     }
     if normalized_diagnostics is not None:
         result.update({

@@ -4576,6 +4576,30 @@ class Director:
             "的一张进入人工/修图流程")
         return final_result
 
+    @staticmethod
+    def _repeated_core_issues(attempt_history):
+        """连续两轮都出现、且属于决定性档位的问题(修图没修动的证据)。
+
+        判据用决定性档位而不是逐字比对:判官每轮措辞都不同("少了1名
+        弓兵" vs "只有6人少于要求的7人"),逐字比对必然漏判;文本分类
+        器同样会被措辞带偏。连续两轮都在决定性档(人数/身份/性别/生死/
+        道具在场)翻车,就说明改图这条路对本图无效,该重新起画。
+        细节类(服装/景别/构图)反复不触发换策略。
+        """
+        from .qc_feedback import issue_severity
+        rounds = [
+            row.get("qc_issues") or []
+            for row in attempt_history[-2:]
+            if row.get("qc_passed") is False]
+        if len(rounds) < 2:
+            return []
+        decisive_per_round = [
+            [issue for issue in issues if issue_severity(issue) <= 30]
+            for issues in rounds]
+        if not all(decisive_per_round):
+            return []
+        return decisive_per_round[-1]
+
     def _generate_image_with_qc(self, capability, payload, out_dir,
                                 cancel, qc_spec):
         """出图 + 视觉质检 + 不合格自动重画(worker 线程安全:只调产线)。
@@ -4749,6 +4773,9 @@ class Director:
             history_row.update({
                 "qc_passed": bool(report["passed"]),
                 "qc_cost": float(qc_result.cost or 0.0),
+                # 逐轮问题原文:换策略判据(同一决定性问题是否跨轮存活)
+                "qc_issues": [str(item) for item in
+                              (report.get("issues") or [])][:12],
                 "image_error": copy.deepcopy(report["image_error"]),
                 "prompt_diagnosis": copy.deepcopy(
                     report["prompt_diagnosis"]),
@@ -4794,6 +4821,37 @@ class Director:
             if (report["passed"] or not report["redraw_required"]
                     or attempts >= self._qc_retries()):
                 return result
+            # 修图不收敛就换策略:同一条核心问题连修两轮还在,继续微调
+            # 只会打地鼠(实测镜头21 四轮 5→7→10 条,还撞出新的身份漂移)。
+            # 改为丢掉"待修改基底"重新起画——重抽比死磕更省更准。
+            if (report["consecutive_failures"] >= 2
+                    and not payload.get("_qc_fresh_redraw")):
+                repeated = self._repeated_core_issues(attempt_history)
+                if repeated:
+                    payload = copy.deepcopy(payload)
+                    payload["_qc_fresh_redraw"] = True
+                    payload.pop("source_qc_uri", None)
+                    payload["revision_mode"] = "fresh_redraw"
+                    payload["feedback"] = (
+                        "上一版连续两轮都没修好以下决定性问题,本次不要在"
+                        "旧图上修改,重新起画并首先保证这些点正确:"
+                        + "；".join(item[:120] for item in repeated[:3]))
+                    payload["reference_images"] = [
+                        uri_ for uri_ in (
+                            payload.get("reference_images") or [])
+                        if uri_ != uri]
+                    payload["asset_matches"] = [
+                        match for match in (
+                            payload.get("asset_matches") or [])
+                        if match.get("reference_role") != "revision_base"]
+                    self._attach_reference_manifest(payload)
+                    self.log.info(
+                        "director",
+                        f"{qc_spec.get('item_id') or '本图'}连续两轮未修好"
+                        f"核心问题,转为重新起画(不再在废图上改): "
+                        + "；".join(item[:60] for item in repeated[:2]))
+                    attempts += 1
+                    continue
             diagnostics = report["input_diagnosis"]
             proposed = retry_input_decision(
                 generation_input["prompt"],
