@@ -1527,34 +1527,111 @@ class Director:
                 for part in value.replace("；", "|").split("|")
                 if part.strip()]
 
+    def _candidate_identity_card(self, design):
+        """候选图只继承稳定身份，不继承全局服装、道具或最终出图卡。
+
+        ``image_prompt`` 与 ``visual_dna`` 中的服装/剧情道具通常描述某个
+        代表性剧情状态。候选图却可能正在展示另一个互斥状态；把两者同时
+        写进提示词会形成两个事实源。因此这里仅编译脸、年龄、性别、体态
+        与身体痕迹等身份锚。
+        """
+        design = design if isinstance(design, dict) else {}
+        parts = []
+        for key, label in (
+                ("species", "形态"),
+                ("gender", "性别"),
+                ("age_range", "年龄段"),
+                ("appearance", "脸部与体态"),
+                ("eyes", "眼睛")):
+            value = design.get(key)
+            if key == "gender" and not value:
+                value = design.get("sex")
+            value = self._design_value(value)
+            if value:
+                parts.append(f"{label}:{value}")
+
+        dna = design.get("visual_dna")
+        if isinstance(dna, dict):
+            dna_keys = (
+                ("face_structure", "脸部骨相"),
+                ("body_or_occupation_marks", "稳定体态/身体痕迹"),
+            )
+            dna_parts = []
+            for key, label in dna_keys:
+                value = self._design_value(dna.get(key))
+                if value and value not in "；".join(dna_parts):
+                    dna_parts.append(f"{label}:{value}")
+            if dna_parts:
+                parts.append("人物视觉DNA:" + "；".join(dna_parts))
+        return "；".join(parts)
+
+    def _candidate_prompt_review_context(
+            self, name, role, style, design, variant, has_reference=False):
+        """生成候选专用审核事实；明确隔离人物全局造型与其他候选。"""
+        look = variant.get("look_variant") or {}
+        story_variant = variant.get("story_variant") or {}
+        props = self._design_value(
+            story_variant.get("props")
+            or story_variant.get("accessories"))
+        occasion = self._design_value(
+            story_variant.get("occasion")
+            or story_variant.get("scene"))
+        palette = self._design_value(story_variant.get("palette"))
+        if has_reference:
+            hair = (
+                "只服从身份参考图的发际线、发型轮廓、发量和发色家族；"
+                "不继承参考图服装或剧情状态")
+            makeup = (
+                "只服从身份参考图的眉眼、眼线、睫毛、唇妆与稳定妆造；"
+                "不继承参考图服装或剧情状态")
+        else:
+            hair = self._design_value(look.get("hair"))
+            makeup = self._design_value(look.get("makeup"))
+        return {
+            "schema": "aifos.character-candidate-review/v2",
+            "task": "single_character_identity_candidate",
+            "characters": [name],
+            "character_count": 1,
+            "role": role,
+            "identity_lock": (
+                self._candidate_identity_card(design)
+                or "仅锁定姓名、年龄、性别表达与同一人物身份"),
+            "current_candidate_variant": {
+                "variant_id": variant.get("variant_id", ""),
+                "variant_label": variant.get("variant_label", ""),
+                "hair": hair,
+                "makeup": makeup,
+                "wardrobe": self._design_value(look.get("costume")),
+                "palette": palette,
+                "accessories_and_props": (
+                    props or
+                    "无额外剧情道具；不得继承人物全局道具或其他候选道具"),
+                "temperament": self._design_value(
+                    look.get("temperament")),
+                "occasion": occasion,
+            },
+            "source_precedence": (
+                "current_candidate_variant是本图服装、配色、妆容、配饰、"
+                "手持道具和表演状态的唯一事实源；不得继承人物全局最终"
+                "出图卡、全局服装/标志道具、其他候选或前后剧情造型"),
+            "reference_identity_lock": bool(has_reference),
+            "reference_scope": (
+                "若有参考图，只锁脸型、五官骨相、年龄、性别表达、"
+                "发际线、发型轮廓与稳定妆造；明确排除参考图服装、"
+                "配饰、手持物、姿势、背景和光线"
+                if has_reference else "本候选没有身份参考图"),
+            "style": style,
+            "composition": (
+                "严格1名人物、单一连续身体、全身正面自然站姿、"
+                "纯净无文字中性背景"),
+        }
+
     def _candidate_portrait_prompt(self, name, role, style, design, variant,
                                    has_reference=False):
         """把内部分析编译成同一项目画风下、单张图可执行的提示词。"""
-        final_card = self._design_value(
-            (design or {}).get("image_prompt"))
-        if final_card:
-            identity = final_card
-        else:
-            identity = self._design_line(
-                design, keys=("species", "gender", "age_range", "identity",
-                              "appearance", "eyes", "era_setting", "occupation",
-                              "signature_props"))
-            dna = (design or {}).get("visual_dna")
-            if isinstance(dna, dict):
-                compact_dna = "；".join(
-                    f"{label}:{value}" for key, label in (
-                        ("face_structure", "脸部骨相"),
-                        ("hair_silhouette", "发型轮廓"),
-                        ("body_or_occupation_marks", "体态/职业痕迹"),
-                        ("clothing_structure", "服装结构"),
-                        ("story_visual_symbol", "视觉符号"),
-                        ("signature_accessory", "核心配饰"),
-                        ("temperament_keywords", "气质"),
-                    )
-                    if (value := self._design_value(dna.get(key))))
-                if compact_dna:
-                    identity = f"{identity}；人物视觉DNA:{compact_dna}"
-        look = variant["look_variant"]
+        identity = self._candidate_identity_card(design)
+        look = variant.get("look_variant") or {}
+        story_variant = variant.get("story_variant") or {}
         if has_reference:
             hair = (
                 "严格保持参考图发型轮廓、发际线、发量和发色家族；"
@@ -1565,30 +1642,45 @@ class Director:
             variant_rule = (
                 "有参考图时只锁人物脸型、五官骨相、年龄、性别表达、发际线"
                 "、发型、妆造和身份标志；候选只允许剧情服装细节、表情和轻微"
-                "姿态差异，禁止换脸、换发型或换画风")
+                "姿态差异；参考图中的服装、配饰、手持物、姿势、背景和光线"
+                "不得继承，禁止换脸、换发型或换画风")
         else:
-            hair = look["hair"]
-            makeup = look["makeup"]
+            hair = self._design_value(look.get("hair")) \
+                or "保持同一人物的明确发型轮廓"
+            makeup = self._design_value(look.get("makeup")) \
+                or "保持同一人物的明确妆造"
             variant_rule = (
                 "无参考图时,可在同一项目画风、时代、职业和核心人物气质内"
                 "做有限的发型/妆容/表情细节差异,不得制作不同画风候选")
-        workwear = self._sheet_workwear_line(f"{name};{role}", design)
+        costume = self._design_value(look.get("costume")) \
+            or "采用本候选明确的一套剧情服装"
+        temperament = self._design_value(look.get("temperament")) \
+            or "保持核心人物气质"
+        occasion = self._design_value(
+            story_variant.get("occasion") or story_variant.get("scene"))
+        palette = self._design_value(story_variant.get("palette"))
+        props = self._design_value(
+            story_variant.get("props") or story_variant.get("accessories"))
+        props_line = (
+            props if props else
+            "无额外剧情道具；不得从人物全局设定、其他候选或前后剧情"
+            "造型自动继承手持道具")
         return (
             f"【任务】{name}（{role}）单人定角候选 · {variant['variant_label']}。"
             "不同候选是互斥造型，不是同一套衣服只换动作。"
-            f"【最终人物出图卡】{identity or '年龄、物种、性别表达与核心身份不变'}。"
-            f"【本张造型覆盖项】仅以下字段覆盖出图卡中的对应字段："
-            f"发型:{hair}；妆容:{makeup}；服装:{look['costume']}；"
-            f"表情气质:{look['temperament']}。{variant_rule}。"
-            + (f";剧情场合:{variant.get('story_variant', {}).get('occasion') or variant.get('story_variant', {}).get('scene')}"
-               if variant.get("story_variant", {}).get("occasion")
-               or variant.get("story_variant", {}).get("scene") else "")
-            + (f";配饰/道具:{variant.get('story_variant', {}).get('props') or variant.get('story_variant', {}).get('accessories')}"
-               if variant.get("story_variant", {}).get("props")
-               or variant.get("story_variant", {}).get("accessories") else "")
+            f"【稳定身份锚】{identity or '年龄、物种、性别表达与同一人物身份不变'}；"
+            "本段不定义服装、配色或剧情道具。"
+            f"【本张唯一造型】发型:{hair}；妆容:{makeup}；"
+            f"服装:{costume}；"
+            + (f"配色:{palette}；" if palette else "")
+            + f"配饰/道具:{props_line}；表情气质:{temperament}。"
+            + (f"剧情场合:{occasion}。" if occasion else "")
+            + "【造型优先级】“本张唯一造型”是本图服装、配色、妆容、"
+            "配饰、手持道具和表演状态的唯一事实源；不得继承人物全局最终"
+            "出图卡、全局服装/标志道具、其他候选或前后剧情造型。"
+            + f"{variant_rule}。"
             + f"【PROJECT STYLE LOCK】本项目唯一画风:{style}；"
             "所有候选必须完全一致，不得制作不同画风候选。"
-            + (f"职业服装:{workwear}。" if workwear else "")
             + "人物立绘必须是纯净、无文字的单人物资产背景。"
             "【构图】单人、全身正面自然站姿、从头到脚完整、纯净中性棚拍背景；"
             "五官、手指、关节与身体比例自然。"
@@ -5920,8 +6012,13 @@ class Director:
                         "quality_decision": quality,
                         "art_name": f"{name}_candidate_{index:02d}",
                         "role": role, "shot_no": 0,
-                        "characters": [name], "location": "",
+                        "characters": [name], "character_count": 1,
+                        "location": "",
                         "prompt": prompt, "style": style,
+                        "prompt_review_context":
+                            self._candidate_prompt_review_context(
+                                name, role, style, designs.get(name),
+                                variant, has_reference=bool(refs)),
                         # 候选提示词已编译为可直接出图的视觉合同。人物
                         # 剧情设定仍保留在 payload 供审计/QC 使用，但不再
                         # 由 API Provider 二次拼入模型提示词。

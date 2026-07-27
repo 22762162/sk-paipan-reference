@@ -171,3 +171,55 @@ def test_prompt_review_instruction_forbids_image_generation(tmp_path):
     assert "禁止调用imagegen" in instruction
     assert "optimized_prompt" in instruction
     assert "【任务】角色正面母资产：林川。" in instruction
+
+
+def test_candidate_review_uses_explicit_single_look_context(tmp_path):
+    source = (
+        "【任务】林川单人定角候选。"
+        "【本张唯一造型】灰褐麻布短褐，携湿旧蓝布包袱。"
+    )
+    router, codex = _router(source)
+    payload = {
+        "portrait_candidate": True,
+        "art_name": "林川_candidate_01",
+        "prompt": source,
+        "characters": ["林川"],
+        "character_count": 1,
+        "character_background": {
+            "costume": "旧靛青举人袍",
+            "signature_props": "吏部札付",
+        },
+        "prompt_review_context": {
+            "schema": "aifos.character-candidate-review/v2",
+            "characters": ["林川"],
+            "character_count": 1,
+            "current_candidate_variant": {
+                "wardrobe": "灰褐麻布短褐",
+                "accessories_and_props": "湿旧蓝布包袱",
+            },
+        },
+    }
+
+    router.call("image", payload, tmp_path)
+
+    review_context = codex.calls[0][1]["review_context"]
+    assert review_context["capability"] == "image"
+    assert review_context["current_candidate_variant"]["wardrobe"] \
+        == "灰褐麻布短褐"
+    assert "character_background" not in review_context
+    assert "旧靛青举人袍" not in str(review_context)
+    assert "吏部札付" not in str(review_context)
+    # 技术文件名不属于画面事实，不应强迫 Codex 把它写入优化稿。
+    assert "林川_candidate_01" not in payload["prompt"]
+
+
+def test_regular_shot_review_keeps_full_character_background():
+    context = ProviderRouter._prompt_review_context("image", {
+        "characters": ["林川"],
+        "character_background": {
+            "林川": {"costume": "青色圆领官袍"},
+        },
+    })
+
+    assert context["character_background"]["林川"]["costume"] \
+        == "青色圆领官袍"

@@ -298,6 +298,17 @@ class ProviderRouter:
     @staticmethod
     def _prompt_review_context(capability, payload):
         """只给 Codex 当前图片所需事实，避免整集背景反向污染提示词。"""
+        explicit = payload.get("prompt_review_context")
+        if isinstance(explicit, dict) and explicit:
+            # 候选图等特殊任务已经把当前可执行事实编译成独立合同。
+            # 此时不能再把 character_background 中互斥的全局服装、
+            # 标志道具或其他剧情造型重新混入不可变审核上下文。
+            context = {**dict(explicit), "capability": capability}
+            for key in ("reference_manifest", "identity_references"):
+                value = payload.get(key)
+                if value not in (None, "", [], {}) and key not in context:
+                    context[key] = value
+            return context
         keys = (
             "title", "episode", "tagline",
             "art_name", "role", "shot_no", "scene_no", "frame_kind",
@@ -327,7 +338,10 @@ class ProviderRouter:
                 payload.get("title"), payload.get("art_name"),
                 payload.get("location")):
             value = str(value or "").strip()
-            if value:
+            # 标题、资产文件名等调度元数据不一定是画面事实。只有原始
+            # 提示词明确写入时才要求优化稿逐字保留，避免把
+            # ``林川_candidate_01`` 之类内部文件名塞进生图提示词。
+            if value and value in source:
                 tokens.append(value)
         readable = payload.get("readable_text") or {}
         tokens.extend(

@@ -200,11 +200,83 @@ def test_visual_dna_is_compiled_without_dumping_internal_audit_json(app):
         "林昭", "主角", "电影级半写实", design,
         app.director._candidate_variant(1, design))
     assert "人物视觉DNA" in prompt
-    assert "旧怀表" in prompt
-    assert "本张造型覆盖项" in prompt
+    assert "右手虎口工具磨痕" in prompt
+    assert "旧怀表" not in prompt
+    assert "本张唯一造型" in prompt
     assert "全剧角色去重" not in prompt
     assert '"overlap_threshold"' not in prompt
     assert "模板网红脸" in prompt
+
+
+def test_story_candidate_uses_one_look_without_global_outfit_or_prop(app):
+    design = {
+        "species": "人类",
+        "gender": "男",
+        "age_range": "24岁",
+        "appearance": "清瘦长脸，眉眼清秀",
+        "eyes": "深棕眼，警觉",
+        "hair": "束发无冠",
+        "makeup": "自然素面",
+        "costume": "旧靛青举人袍",
+        "signature_props": "吏部札付",
+        "image_prompt": (
+            "林川，旧靛青举人袍，手持吏部札付，作为嫁祸关键定版态"),
+        "visual_dna": {
+            "face_structure": "清瘦长脸",
+            "hair_silhouette": "束发无冠",
+            "clothing_structure": "旧靛青举人袍",
+            "story_visual_symbol": "吏部札付",
+            "signature_accessory": "吏部札付",
+            "temperament_keywords": ["警觉", "克制"],
+        },
+        "visual_variants": [
+            {
+                "label": "进京谋生日常态",
+                "occasion": "雨后进城",
+                "hair": "束发无冠",
+                "makeup": "雨水打湿的自然素面",
+                "costume": "灰褐麻布短褐",
+                "palette": "灰褐与泥黄",
+                "props": "湿旧蓝布包袱",
+                "temperament": "疲惫而警觉",
+            },
+            {
+                "label": "过渡态",
+                "costume": "洗旧青灰长衫",
+                "props": "旧蓝布包袱",
+            },
+            {
+                "label": "嫁祸关键定版态",
+                "costume": "旧靛青举人袍",
+                "props": "吏部札付",
+                "temperament": "强压惊疑",
+            },
+        ],
+    }
+    daily_variant = app.director._candidate_variant(1, design)
+    framed_variant = app.director._candidate_variant(3, design)
+
+    daily = app.director._candidate_portrait_prompt(
+        "林川", "主角", "明初电影级半写实", design, daily_variant)
+    framed = app.director._candidate_portrait_prompt(
+        "林川", "主角", "明初电影级半写实", design, framed_variant)
+    review_context = app.director._candidate_prompt_review_context(
+        "林川", "主角", "明初电影级半写实", design, daily_variant)
+
+    assert "灰褐麻布短褐" in daily
+    assert "湿旧蓝布包袱" in daily
+    assert "旧靛青举人袍" not in daily
+    assert "吏部札付" not in daily
+    assert "全局服装/标志道具" in daily
+    assert "旧靛青举人袍" in framed
+    assert "吏部札付" in framed
+    assert review_context["current_candidate_variant"]["wardrobe"] \
+        == "灰褐麻布短褐"
+    assert review_context["current_candidate_variant"][
+        "accessories_and_props"] == "湿旧蓝布包袱"
+    serialized_context = str(review_context)
+    assert "旧靛青举人袍" not in serialized_context
+    assert "吏部札付" not in serialized_context
 
 
 def test_legacy_character_design_is_upgraded_without_losing_fields(app):
@@ -262,7 +334,8 @@ def test_reference_portrait_locks_face_hair_makeup_and_workwear(app):
     assert "候选不改变发型身份" in prompt
     assert "候选不改变妆造体系" in prompt
     assert "禁止换脸" in prompt
-    assert "外卖小哥" in prompt and "工作服/制服" in prompt
+    assert "外卖小哥" in prompt and "外卖制服" in prompt
+    assert "职业服装:" not in prompt
     assert "纯净、无文字的单人物资产背景" in prompt
 
 
