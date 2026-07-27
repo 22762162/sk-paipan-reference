@@ -457,6 +457,9 @@ class ClaudeApiProvider(Provider):
             elif capability == "script" and payload.get("prop_design"):
                 from ..adapters.claude_script import validate_prop_design
                 error = validate_prop_design(data, payload)
+            elif capability == "script" and payload.get("rule_appeal"):
+                from ..adapters.claude_script import validate_rule_appeal
+                error = validate_rule_appeal(data, payload)
             elif capability == "script" and payload.get("story_analysis"):
                 # 与 CLI 桥(claude_script.run)保持同一分支:制作圣经/剧本
                 # 自动分析的输出没有 scenes,必须用 story_analysis 校验器,
@@ -555,6 +558,9 @@ class OpenAIChatProvider(Provider):
         if capability == "script" and payload.get("prop_design"):
             from ..adapters.claude_script import validate_prop_design
             return validate_prop_design(data, payload)
+        if capability == "script" and payload.get("rule_appeal"):
+            from ..adapters.claude_script import validate_rule_appeal
+            return validate_rule_appeal(data, payload)
         if capability == "script" and payload.get("story_analysis"):
             return validate_story_analysis(
                 data, require_resolved_identity=False)

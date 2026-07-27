@@ -550,9 +550,31 @@ class ProviderRouter:
                 if segments:
                     evidence = "；优化稿人数相关片段:「" + "／".join(
                         seg[:60] for seg in segments) + "」"
-            raise ProviderError(
+            rule_reason = (
                 "Codex优化稿删除了不可变事实，拒绝生图："
                 + "、".join(missing[:20]) + evidence)
+            # 死规则只是初审:字面校验判败的,交 AI 仲裁复核一次。
+            # 事实实质存在(换了写法/等价表述)即撤销原判放行并记台账;
+            # 事实真被删改则维持原判,照常拒绝生图。
+            appeal = self._appeal_rule_verdict(
+                rule_id="prompt_review.immutable_facts",
+                rule_reason=rule_reason,
+                subject=optimized,
+                context={
+                    "missing_tokens": missing[:20],
+                    "expected_character_count": payload.get(
+                        "character_count"),
+                    "functional_figures": payload.get("functional_figures"),
+                    "original_prompt": source[:4000],
+                },
+                out_dir=out_dir, payload=payload, capability=capability,
+                cancel=cancel)
+            if not appeal.get("overturned"):
+                raise ProviderError(rule_reason)
+            self.log.info(
+                "router",
+                "字面校验判败经仲裁撤销(规则误杀),放行本稿: "
+                + str(appeal.get("reason") or "")[:200])
         audit_record = {
             "schema": self.PROMPT_REVIEW_SCHEMA,
             "approved": True,
@@ -584,6 +606,65 @@ class ProviderRouter:
         return result
 
     # ---- 调用 ----
+    def _appeal_rule_verdict(self, *, rule_id, rule_reason, subject,
+                             context, out_dir, payload=None,
+                             capability="", cancel=None):
+        """规则上诉庭:内置死规则判败 → AI 仲裁复核一次。
+
+        用户拍板的三级法院(2026-07-28):规则是死的、剧情是活的。
+        规则做零成本初审,通过的直接生产;判败的才上诉,由仲裁带着
+        裁决条款与上下文判断"真违规 vs 字面化误杀"。撤销必须逐字
+        举证(validate_rule_appeal 强制),证据对不上一律维持原判。
+        返回 {"overturned": bool, "reason": str, ...};仲裁本身
+        不可用/出错时按维持原判处理(失败关闭,不放行未知风险)。
+        """
+        from ..rule_governance import prompt_adjudication_clause
+        from ..rule_appeals import (VERDICT_OVERTURNED, VERDICT_UPHELD,
+                                    record_appeal)
+        result = None
+        data = {}
+        try:
+            result = self.call("script", {
+                "rule_appeal": True,
+                "rule_id": rule_id,
+                "rule_reason": rule_reason,
+                "subject": subject,
+                "context": context,
+                "adjudication": prompt_adjudication_clause(),
+            }, out_dir, cancel=cancel)
+            data = result.data or {}
+        except (ProviderError, ProviderUnavailable) as exc:
+            self.log.warn(
+                "router",
+                f"规则仲裁不可用({str(exc)[:160]}),维持原判: {rule_id}")
+        except Exception as exc:   # 仲裁绝不能反过来拖垮产线
+            self.log.warn(
+                "router",
+                f"规则仲裁异常({str(exc)[:160]}),维持原判: {rule_id}")
+        overturned = str(data.get("verdict") or "") == VERDICT_OVERTURNED
+        if data:
+            record_appeal(
+                out_dir,
+                episode_id=(payload or {}).get("episode_id"),
+                item_id=str((payload or {}).get("item_id")
+                            or (payload or {}).get("shot_no") or ""),
+                rule_id=rule_id,
+                capability=capability,
+                verdict=(VERDICT_OVERTURNED if overturned
+                         else VERDICT_UPHELD),
+                rule_reason=rule_reason,
+                arbiter_reason=data.get("reason", ""),
+                evidence=data.get("evidence", ""),
+                provider=(result.provider if result is not None else ""),
+                model=(result.model if result is not None else ""),
+                suggested_rule_fix=data.get("suggested_rule_fix", ""))
+        return {
+            "overturned": overturned,
+            "reason": data.get("reason", ""),
+            "evidence": data.get("evidence", ""),
+            "suggested_rule_fix": data.get("suggested_rule_fix", ""),
+        }
+
     def call(self, capability, payload, out_dir, cancel=None):
         prompt_review_result = None
         if capability in self.IMAGE_CAPABILITIES:
