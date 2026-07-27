@@ -470,6 +470,153 @@ class ClaudeApiProvider(Provider):
             provider=self.name, cost=self.cost_per_call, data=data)
 
 
+class OpenAIChatProvider(Provider):
+    """OpenAI 兼容对话 API 编剧(DeepSeek / 通义 / Kimi / 本地网关等)。
+
+    与 Claude/Codex 编剧共用同一套提示词与校验器,产出口径完全一致;
+    校验失败时按"就地修复"原则先让同一模型改错误字段并复检,
+    复检仍不过才抛错交回路由。
+    """
+
+    DEFAULT_ENDPOINT = "https://api.deepseek.com"
+    DEFAULT_MODEL = "deepseek-chat"
+
+    def available(self, capability):
+        ok, reason = super().available(capability)
+        if not ok:
+            return ok, reason
+        if not self.conf.get("api_key"):
+            return False, "未配置 api_key"
+        return True, ""
+
+    def ping(self):
+        """真实连通性测试:发一个极小的对话请求。
+
+        max_tokens 极小时 finish_reason 必然是 length,那是预期而非
+        故障——连通性只看请求有没有被正常受理。
+        """
+        try:
+            self._chat([{"role": "user", "content": "ping"}],
+                       max_tokens=4, timeout=30)
+        except ProviderError as exc:
+            if "max_tokens 上限被截断" not in str(exc):
+                return False, str(exc)
+        model = self.conf.get("model") or self.DEFAULT_MODEL
+        return True, f"真实连通成功(model={model})"
+
+    def _chat(self, messages, max_tokens=None, timeout=None):
+        endpoint = (self.conf.get("endpoint")
+                    or self.DEFAULT_ENDPOINT).rstrip("/")
+        url = (endpoint if endpoint.endswith("/chat/completions")
+               else f"{endpoint}/v1/chat/completions")
+        body = {
+            "model": self.conf.get("model") or self.DEFAULT_MODEL,
+            "messages": messages,
+            "max_tokens": int(max_tokens
+                              or self.conf.get("max_tokens", 8192)),
+            "stream": False,
+        }
+        temperature = self.conf.get("temperature")
+        if temperature is not None:
+            body["temperature"] = float(temperature)
+        reply = _request_json(
+            self.name, url,
+            headers={"Authorization": f"Bearer {self.conf['api_key']}"},
+            body=body,
+            timeout=timeout or self.conf.get("timeout", 1800))
+        choices = reply.get("choices") or []
+        if not choices:
+            raise ProviderError(f"{self.name} 应答缺少 choices")
+        message = (choices[0] or {}).get("message") or {}
+        finish = str((choices[0] or {}).get("finish_reason") or "")
+        text = str(message.get("content") or "")
+        if finish == "length":
+            raise ProviderError(
+                f"{self.name} 输出达到 max_tokens 上限被截断,"
+                "请调大 providers 配置中的 max_tokens")
+        return text
+
+    def _validate(self, capability, payload, data):
+        from ..adapters.claude_script import (validate_image_qc,
+                                              validate_prompt_refine)
+        if capability == "image_qc":
+            return validate_image_qc(data)
+        if capability == "script" and payload.get("prompt_refine"):
+            return validate_prompt_refine(data)
+        if capability == "script" and payload.get("story_analysis"):
+            return validate_story_analysis(
+                data, require_resolved_identity=False)
+        if capability == "script":
+            return validate_script(data, payload)
+        return validate_storyboard(data)
+
+    def _postprocess(self, capability, data):
+        if (capability == "script" and isinstance(data, dict)
+                and isinstance(data.get("scenes"), list)):
+            sanitize_script_entities(data)
+        return data
+
+    def generate(self, capability, payload, out_dir, cancel=None):
+        try:
+            prompt = build_prompt(capability, payload)
+        except ValueError as exc:
+            raise ProviderError(str(exc)) from exc
+        messages = [
+            {"role": "system",
+             "content": "你只输出一个 JSON 对象,不要任何解释或 Markdown 代码块。"},
+            {"role": "user", "content": prompt},
+        ]
+        text = self._chat(messages)
+        data = extract_json(text)
+        if data is None:
+            raise ProviderError(f"{self.name} 应答中未找到 JSON 对象")
+        data = self._postprocess(capability, data)
+        try:
+            error = self._validate(capability, payload, data)
+        except Exception as exc:
+            raise ProviderError(
+                f"{self.name} 输出结构异常: {exc}") from exc
+        if error:
+            # 就地修复:内容已在手,只是字段不合规,先让同一模型改错处。
+            fixed, note = self._repair(capability, payload, data, error)
+            if fixed is None:
+                raise ProviderError(
+                    f"{self.name} 输出校验失败: {error}{note}")
+            data = fixed
+        return ProviderResult(
+            provider=self.name, cost=self.cost_per_call, data=data,
+            model=self.conf.get("model") or self.DEFAULT_MODEL)
+
+    def _repair(self, capability, payload, data, error):
+        try:
+            source = json.dumps(data, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return None, "(产出不可序列化,跳过就地修复)"
+        messages = [
+            {"role": "system",
+             "content": "你只输出一个 JSON 对象,不要任何解释或 Markdown 代码块。"},
+            {"role": "user", "content":
+                "你刚生成的 JSON 产出未通过机器校验:\n"
+                f"{error}\n\n只修复校验指出的字段,其余内容一字不动;"
+                "输出完整 JSON。\n原 JSON:\n" + source},
+        ]
+        try:
+            text = self._chat(messages)
+        except ProviderError as exc:
+            return None, f"(就地修复调用失败: {exc})"
+        fixed = extract_json(text)
+        if fixed is None:
+            return None, "(就地修复输出中未找到 JSON)"
+        fixed = self._postprocess(capability, fixed)
+        try:
+            fixed_error = self._validate(capability, payload, fixed)
+        except Exception as exc:
+            return None, f"(就地修复复检异常: {exc})"
+        if fixed_error:
+            return None, f"(就地修复复检仍未通过: {str(fixed_error)[:300]})"
+        return fixed, ""
+
+
 class OpenAIImageProvider(Provider):
     """OpenAI 兼容出图 API:/v1/images/generations,b64_json 或 url 均可。
 

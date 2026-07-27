@@ -214,20 +214,30 @@ def normalize_prop_contract(script: dict) -> dict:
         if "instance_count" not in item:
             item["instance_count"] = 1
         normalization_issues = []
-        if (item.get("availability_start_event") not in (None, "")
-                and item.get("introduced_at") not in (None, "")
-                and _normalize_event_ref(
-                    item.get("availability_start_event"))
-                != _normalize_event_ref(item.get("introduced_at"))):
-            normalization_issues.append(
-                "introduced_at 与 availability_start_event 冲突")
-        if (item.get("availability_end_event") not in (None, "")
-                and item.get("retired_at") not in (None, "")
-                and _normalize_event_ref(
-                    item.get("availability_end_event"))
-                != _normalize_event_ref(item.get("retired_at"))):
-            normalization_issues.append(
-                "retired_at 与 availability_end_event 冲突")
+        for primary, alias, label in (
+                ("availability_start_event", "introduced_at",
+                 "introduced_at 与 availability_start_event 冲突"),
+                ("availability_end_event", "retired_at",
+                 "retired_at 与 availability_end_event 冲突")):
+            if item.get(primary) in (None, "") or item.get(alias) in (None, ""):
+                continue
+            left = _normalize_event_ref(item.get(primary))
+            right = _normalize_event_ref(item.get(alias))
+            if left == right:
+                continue
+            # 两者是同一事实的别名。只有 phase 不同、且其中一方非法时,
+            # 这不是真矛盾而是模型漏改了另一个别名(局部修复常见);
+            # 采用合法的一方,不为此丢弃整份剧本。
+            if (_event_ref_id(left) == _event_ref_id(right)
+                    and isinstance(left, dict) and isinstance(right, dict)):
+                left_ok = left.get("phase") in PROP_FRAME_PHASES
+                right_ok = right.get("phase") in PROP_FRAME_PHASES
+                if left_ok != right_ok:
+                    winner = left if left_ok else right
+                    item[primary] = copy.deepcopy(winner)
+                    item[alias] = copy.deepcopy(winner)
+                    continue
+            normalization_issues.append(label)
         if normalization_issues:
             item["_prop_contract_normalization_issues"] = (
                 normalization_issues)

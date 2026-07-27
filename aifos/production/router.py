@@ -13,8 +13,8 @@ import time
 
 from ..errors import ProduceCancelled, ProviderError, ProviderUnavailable
 from .api_providers import (ArkVideoProvider, ClaudeApiProvider,
-                            DoubaoTtsProvider, OpenAIImageProvider,
-                            SeedreamImageProvider)
+                            DoubaoTtsProvider, OpenAIChatProvider,
+                            OpenAIImageProvider, SeedreamImageProvider)
 from .base import ProviderResult  # noqa: F401  (re-export for callers)
 from .dreamina import DreaminaProvider
 from .external import ApiProvider, CliProvider
@@ -26,6 +26,7 @@ PROVIDER_TYPES = {
     "api": ApiProvider,
     "dreamina": DreaminaProvider,
     "claude_api": ClaudeApiProvider,
+    "openai_chat": OpenAIChatProvider,
     "image_api": OpenAIImageProvider,
     "seedream_image": SeedreamImageProvider,
     "ark_video": ArkVideoProvider,

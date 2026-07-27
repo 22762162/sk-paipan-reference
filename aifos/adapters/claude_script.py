@@ -1634,15 +1634,40 @@ def _terminate_group(proc, grace=5):
         proc.wait()
 
 
-def _run_with_stall_watchdog(cmd, env, timeout, stall_timeout):
-    """跑子进程并监控输出活性:静默超过 stall_timeout 判定卡住。
+def _process_cpu_seconds(pid):
+    """进程组累计 CPU 时间(秒);取不到返回 None。仅标准库。"""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "time=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not out:
+        return None
+    parts = out.replace("-", ":").split(":")
+    try:
+        seconds = float(parts[-1])
+        for index, value in enumerate(reversed(parts[:-1]), start=1):
+            seconds += float(value) * (60 ** index)
+    except ValueError:
+        return None
+    return seconds
 
-    timeout<=0 表示不设总时长上限——活性检测取代硬超时,长任务不再
-    被一刀切,真卡死(断流/挂起)也不会无限等待。
+
+def _run_with_stall_watchdog(cmd, env, timeout, stall_timeout):
+    """跑子进程并监控存活迹象:输出活性 + CPU 时间推进,双信号任一即算
+    活着;两者同时静止超过 stall_timeout 才判定卡住。
+
+    codex 在长思考期几乎不产出任何 stdout/stderr(实测 100s 任务里
+    静默 99.3s),只看输出必然误杀正常长任务;CPU 时间能反映它仍在
+    本地解码/处理。真卡死(网络断流后挂起)两个信号会同时归零。
+
+    timeout<=0 表示不设总时长上限——活性检测取代硬超时。
     返回 (returncode, stdout, stderr, stalled)。
     """
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cmd, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, env=env, start_new_session=True)
     chunks = {"out": [], "err": []}
     activity = {"at": time.monotonic()}
@@ -1664,12 +1689,26 @@ def _run_with_stall_watchdog(cmd, env, timeout, stall_timeout):
     deadline = (time.monotonic() + timeout
                 if timeout and timeout > 0 else None)
     stalled = False
+    cpu_seen = _process_cpu_seconds(proc.pid)
+    cpu_checked_at = time.monotonic()
+    # 采样间隔必须明显小于判定阈值,否则还没采到就先判卡住了。
+    cpu_interval = max(1.0, min(10.0, stall_timeout / 3.0))
     while True:
         try:
             proc.wait(timeout=1)
             break
         except subprocess.TimeoutExpired:
             now = time.monotonic()
+            # CPU 采样每 10s 一次:进程仍在消耗 CPU 说明它在干活,
+            # 与输出一样算作存活迹象。
+            if now - cpu_checked_at >= cpu_interval:
+                cpu_checked_at = now
+                cpu_now = _process_cpu_seconds(proc.pid)
+                if (cpu_now is not None and cpu_seen is not None
+                        and cpu_now > cpu_seen):
+                    activity["at"] = now
+                if cpu_now is not None:
+                    cpu_seen = cpu_now
             if now - activity["at"] >= stall_timeout:
                 stalled = True
                 _terminate_group(proc)
@@ -1710,8 +1749,9 @@ def _invoke_engine(engine, binary, prompt, timeout, codex_home="",
                 if stalled:
                     return False, (
                         f"codex 编剧卡住:连续 {int(stall_timeout)}s "
-                        "无任何输出,已终止本次调用;请检查网络/账号状态"
-                        "后重试(按约定不回退其他产线)")
+                        "无输出且无 CPU 活动,已终止本次调用;"
+                        "请检查网络/账号状态后重试"
+                        "(按约定不回退其他产线)")
             else:
                 proc = subprocess.run(
                     cmd, capture_output=True, text=True,
