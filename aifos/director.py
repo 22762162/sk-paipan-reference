@@ -3495,6 +3495,138 @@ class Director:
     def _image_qc_enabled(self):
         return bool(self.config.get("defaults", "image_qc", default=True))
 
+    def _dual_review_enabled(self, consecutive_failures=0):
+        """双路会诊开关:默认只在首检失败后启用(诊断最值钱的地方)。
+
+        defaults.dual_qc = off | on_failure(默认) | always。
+        首检单路省额度,失败后才上第二路分工深查。
+        """
+        mode = str(self.config.get(
+            "defaults", "dual_qc", default="on_failure")).strip().lower()
+        if mode in ("off", "false", "0", "no"):
+            return False
+        if mode in ("always", "true", "1", "yes"):
+            return True
+        return int(consecutive_failures or 0) >= 1
+
+    def _merge_dual_verdicts(self, primary, secondary):
+        """两路判定合并:判定取共识、问题取并集、矛盾单列。
+
+        - 都说过 → 过;任一路说不过 → 不过(漏放的代价远大于多修一次);
+        - 问题并集去重(同义两说合一),矛盾指令(一个要加一个要删同一
+          对象)单独标出,绝不把互斥指令一起塞给修图模型——那正是
+          "多份事实源各说各话"在修图端复现。
+        """
+        from .qc_feedback import issue_severity
+        merged = copy.deepcopy(primary or {})
+        secondary = secondary or {}
+        primary_pass = primary.get("pass") is True
+        secondary_pass = secondary.get("pass") is True
+        merged["pass"] = primary_pass and secondary_pass
+        issues, seen = [], set()
+        for issue in [*(primary.get("issues") or []),
+                      *(secondary.get("issues") or [])]:
+            text = str(issue).strip()
+            if not text:
+                continue
+            key = re.sub(r"[\s，。；、,.:：]+", "", text)[:40]
+            if key in seen:
+                continue
+            seen.add(key)
+            issues.append(text)
+        issues.sort(key=issue_severity)
+        merged["issues"] = issues
+        conflicts = self._conflicting_issue_pairs(issues)
+        if conflicts:
+            merged["dual_review_conflicts"] = conflicts
+        merged["dual_review"] = {
+            "primary_pass": primary_pass,
+            "secondary_pass": secondary_pass,
+            "agreed": primary_pass == secondary_pass,
+            "primary_issue_count": len(primary.get("issues") or []),
+            "secondary_issue_count": len(secondary.get("issues") or []),
+            "merged_issue_count": len(issues),
+            "conflicts": conflicts,
+        }
+        for key in ("detected_count", "detected_overlay_count"):
+            if merged.get(key) in (None, "") and secondary.get(key) not in (
+                    None, ""):
+                merged[key] = secondary[key]
+        return merged
+
+    def _resolve_dual_conflicts(self, issues, conflicts, qc_spec, out_dir,
+                                cancel=None):
+        """两路互斥意见交上诉庭裁一次,败方从修订清单里剔除。
+
+        仲裁不可用时保守处理:两条都撤下(宁可本轮不修这一项,也不
+        把互斥指令一起下发——那必然产出更糟的图)。
+        """
+        removed = set()
+        for pair in conflicts:
+            first, second = pair.get("a", ""), pair.get("b", "")
+            appeal = self.router._appeal_rule_verdict(
+                rule_id="dual_qc.conflicting_issues",
+                rule_reason=(
+                    "两路质检对同一对象给出互斥修改意见,必须按本镜合同"
+                    f"裁定哪一条成立:①{first} ②{second}"),
+                subject=f"①{first}\n②{second}",
+                context={
+                    "shot_contract": qc_spec.get("composition_contract"),
+                    "physical_contract": qc_spec.get("physical_contract"),
+                    "expected_characters": qc_spec.get(
+                        "expected_characters"),
+                    "readable_text": qc_spec.get("readable_text"),
+                    "instruction": (
+                        "verdict=upheld 表示①成立(剔除②);"
+                        "verdict=overturned 表示②成立(剔除①);"
+                        "evidence 必须逐字引自被检查内容"),
+                },
+                out_dir=out_dir,
+                payload={"item_id": qc_spec.get("item_id", "")},
+                capability="image_qc", cancel=cancel)
+            if not appeal.get("reason"):
+                removed.update({first, second})
+                self.log.warn(
+                    "director",
+                    "两路互斥意见未能裁决,本轮双方都不下发,避免互相"
+                    f"抵消: ①{first[:60]} ②{second[:60]}")
+                continue
+            loser = second if not appeal.get("overturned") else first
+            removed.add(loser)
+            self.log.info(
+                "director",
+                "两路互斥意见已裁决,剔除败方: "
+                + f"{loser[:80]}(依据: {str(appeal.get('reason'))[:120]})")
+        return [item for item in issues if item not in removed]
+
+    @staticmethod
+    def _conflicting_issue_pairs(issues):
+        """互斥修改意见对(一路要加、另一路要删同一对象)。"""
+        add_tokens = ("缺少", "没有", "未出现", "不可见", "应当出现",
+                      "少了", "缺失")
+        drop_tokens = ("多余", "不应出现", "多出", "禁止出现", "删除",
+                       "额外")
+        conflicts = []
+        for index, first in enumerate(issues):
+            for second in issues[index + 1:]:
+                first_add = any(t in first for t in add_tokens)
+                first_drop = any(t in first for t in drop_tokens)
+                second_add = any(t in second for t in add_tokens)
+                second_drop = any(t in second for t in drop_tokens)
+                if not ((first_add and second_drop)
+                        or (first_drop and second_add)):
+                    continue
+                # 指向同一对象才算矛盾:取双方 2 字以上的共同名词片段
+                grams = {first[i:i + 2] for i in range(len(first) - 1)}
+                shared = [
+                    second[i:i + 2] for i in range(len(second) - 1)
+                    if second[i:i + 2] in grams
+                    and not re.search(r"[，。；、,.:：\s]", second[i:i + 2])
+                ]
+                if len(set(shared)) >= 3:
+                    conflicts.append({"a": first[:160], "b": second[:160]})
+        return conflicts[:5]
+
     def _qc_retries(self):
         try:
             # Integrated QC gets one targeted repair. A second failed result
@@ -4757,9 +4889,42 @@ class Director:
                 if payload.get("_codex_profile"):
                     qc_payload["_codex_profile"] = payload[
                         "_codex_profile"]
+                dual = self._dual_review_enabled(
+                    failure_count_base + attempts)
+                if dual:
+                    qc_payload["review_lens"] = "identity"
                 qc_result = self.router.call(
                     "image_qc", qc_payload, out_dir,
                     cancel=cancel)
+                if dual:
+                    # 第二路:同一张图、同一份合同,重点核查另一半清单。
+                    # 判定取共识、问题取并集;第二路故障自动降级单路,
+                    # 绝不因会诊失败卡住产线。
+                    second_payload = copy.deepcopy(qc_payload)
+                    second_payload["review_lens"] = "scene"
+                    second_payload.pop("_codex_profile", None)
+                    try:
+                        second_result = self.router.call(
+                            "image_qc", second_payload, out_dir,
+                            cancel=cancel)
+                        result.cost += float(second_result.cost or 0.0)
+                        qc_result.data = self._merge_dual_verdicts(
+                            qc_result.data or {}, second_result.data or {})
+                        merge_info = (qc_result.data or {}).get(
+                            "dual_review") or {}
+                        self.log.info(
+                            "director",
+                            "双路会诊完成(身份路+场景路):判定"
+                            + ("一致" if merge_info.get("agreed") else "分歧")
+                            + f",问题并集 {merge_info.get('merged_issue_count')} 条"
+                            + (f",互斥意见 {len(merge_info.get('conflicts') or [])} 组"
+                               if merge_info.get("conflicts") else ""))
+                    except ProduceCancelled:
+                        raise
+                    except (ProviderUnavailable, ProviderError) as exc:
+                        self.log.warn(
+                            "director",
+                            f"第二路质检不可用,本图降级单路: {str(exc)[:160]}")
             except (ProviderUnavailable, ProviderError) as exc:
                 # 人物镜头不能在质检故障时静默放行。保留已生成图片供人工
                 # 查看，但明确标成质检未过，后续不得当作正式参考图。
@@ -4819,8 +4984,18 @@ class Director:
                 }
                 return result
             result.cost += qc_result.cost
+            verdict_data = qc_result.data or {}
+            conflicts = verdict_data.get("dual_review_conflicts") or []
+            if conflicts:
+                # 两路给出互斥指令(一路要加、一路要删同一对象):绝不能
+                # 把矛盾一起塞给修图模型(那是"多份事实源各说各话"在
+                # 修图端复现)。交上诉庭按镜头合同裁一次,只留胜方。
+                verdict_data = copy.deepcopy(verdict_data)
+                verdict_data["issues"] = self._resolve_dual_conflicts(
+                    verdict_data.get("issues") or [], conflicts,
+                    qc_spec, out_dir, cancel=cancel)
             report = self._assess_image_qc(
-                qc_spec, qc_result.data or {}, attempts + 1)
+                qc_spec, verdict_data, attempts + 1)
             revision = optimize_qc_feedback(
                 report["issues"], mode="image",
                 readable_text=qc_spec.get("readable_text"),

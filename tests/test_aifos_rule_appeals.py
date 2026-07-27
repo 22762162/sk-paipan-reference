@@ -118,3 +118,61 @@ class AppealLedgerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DualReviewMergeTest(unittest.TestCase):
+    """双路会诊:两路都看全图、各自深查一半;判定取共识、问题取并集、
+    互斥意见单列交仲裁(绝不把矛盾指令一起塞给修图模型)。"""
+
+    def _director(self):
+        from aifos.director import Director
+        return Director.__new__(Director)
+
+    def test_lenses_cover_full_checklist_between_them(self):
+        from aifos.adapters.claude_script import REVIEW_LENSES, build_qc_prompt
+        self.assertEqual(set(REVIEW_LENSES), {"identity", "scene"})
+        joint = " ".join(item["focus"] for item in REVIEW_LENSES.values())
+        for dimension in ("人数", "骨相", "性别", "物种", "道具",
+                          "文字", "物理", "服装", "景别", "光线"):
+            self.assertIn(dimension, joint, dimension)
+        prompt = build_qc_prompt({
+            "image_uri": "/tmp/x.png", "characters": ["林川"],
+            "identity_references": [], "camera": "中景",
+            "review_lens": "identity"})
+        self.assertIn("本次重点核查", prompt)
+        # 分工不等于只看一半:非重点维度仍要通扫
+        self.assertIn("其余维度仍要通扫", prompt)
+
+    def test_consensus_verdict_and_union_of_issues(self):
+        director = self._director()
+        merged = director._merge_dual_verdicts(
+            {"pass": True, "issues": [], "detected_count": 7},
+            {"pass": False, "issues": ["核心道具短刀不在场", "多余字幕条"]})
+        self.assertFalse(merged["pass"])          # 任一路不过即不过
+        self.assertEqual(len(merged["issues"]), 2)
+        self.assertFalse(merged["dual_review"]["agreed"])
+        self.assertEqual(merged["detected_count"], 7)
+
+    def test_same_issue_two_phrasings_deduped_and_ranked(self):
+        director = self._director()
+        merged = director._merge_dual_verdicts(
+            {"pass": False, "issues": ["画面可见真人只有6人，少了1名弓兵"]},
+            {"pass": False, "issues": ["画面可见真人只有6人,少了1名弓兵",
+                                       "服装色系不符"]})
+        self.assertEqual(len(merged["issues"]), 2)
+        self.assertIn("弓兵", merged["issues"][0])   # 决定性问题排最前
+
+    def test_contradictory_instructions_flagged(self):
+        director = self._director()
+        merged = director._merge_dual_verdicts(
+            {"pass": False, "issues": ["林川右手缺少缺口单刃短刀，应当出现"]},
+            {"pass": False, "issues": ["林川右手多余的缺口单刃短刀，不应出现"]})
+        self.assertTrue(merged["dual_review"]["conflicts"])
+
+    def test_unrelated_add_and_drop_not_flagged(self):
+        """一个说缺道具、一个说多个人,不是矛盾,不该误报。"""
+        director = self._director()
+        merged = director._merge_dual_verdicts(
+            {"pass": False, "issues": ["缺少核心道具青灰文书包"]},
+            {"pass": False, "issues": ["画面多出一名背景路人，不应出现"]})
+        self.assertFalse(merged["dual_review"]["conflicts"])
