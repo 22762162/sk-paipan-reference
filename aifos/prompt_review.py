@@ -28,6 +28,30 @@ FRAME_VARIANTS = (
     ("video", "Seedance 2 视频", "video"),
 )
 
+# 非镜头资产同样按提示词生产，提示词区不能只覆盖镜头：一集里人物、候选、
+# 道具和场景母版的提示词条数通常是镜头的两三倍，它们出错一样毁整集。
+ASSET_CATEGORIES = (
+    ("character_candidate", "定角候选"),
+    ("character_art", "人物立绘"),
+    ("character_sheet", "人物设定图"),
+    ("prop_candidate", "道具候选"),
+    ("prop_art", "道具母资产"),
+    ("scene_art", "场景母版"),
+    ("cover", "封面"),
+)
+
+PRODUCED_STATUSES = frozenset({"done", "reused"})
+
+# 「没有记录」有三种完全不同的含义，页面必须分得开，否则用户看到一片空白
+# 无法判断是还没做、还是做了但没留痕、还是这一类根本不进清单。
+ACTUAL_STATES = {
+    "produced": "已生产并留有实际输入",
+    "pending": "尚未生产",
+    "missing": "已生产但缺实际输入记录",
+    "planned": "未生产，显示将要提交的输入",
+    "not_tracked": "该类目不进出图清单",
+}
+
 HIGHEST_RULES = (
     "提示词合同是生产最高规则；与剧本摘要、旧提示词或模型自由发挥冲突时，以合同为准。",
     "每个正式人物必须明确姓名、性别、年龄段、当前服装与头部状态；不得用未指定或以参考图为准代替事实。",
@@ -118,7 +142,114 @@ def _actual_prompt(item, kind):
         "reviewed": bool(
             isinstance(review, dict) and review.get("approved")),
         "source": "render_plan 实际生产输入",
+        "state": "produced",
     }
+
+
+def _actual_state(item, actual):
+    """区分「还没做」「做了没留痕」「不进清单」——空白必须可解释。"""
+    if isinstance(actual, dict) and actual.get("state"):
+        return str(actual["state"])
+    if not isinstance(item, dict):
+        return "not_tracked"
+    if str(item.get("status") or "") in PRODUCED_STATUSES:
+        return "missing"
+    return "pending"
+
+
+def _video_actual(shot, video_qc, shot_no):
+    """视频不进 render_plan：已产读视频质检快照，未产回落分镜将提交稿。"""
+    for row in (video_qc or {}).get("shots") or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            if int(row.get("shot_no")) != int(shot_no):
+                continue
+        except (TypeError, ValueError):
+            continue
+        generation = row.get("generation_input") or row.get("input_snapshot")
+        generation = generation if isinstance(generation, dict) else {}
+        prompt = str(
+            generation.get("prompt_compact")
+            or generation.get("prompt")
+            or row.get("prompt") or "").strip()
+        if prompt:
+            return {
+                "prompt": prompt,
+                "status": str(row.get("status") or ""),
+                "provider": str(row.get("provider") or ""),
+                "reviewed": False,
+                "source": "视频质检记录的实际输入",
+                "state": "produced",
+            }
+    planned = str(
+        shot.get("seedance_prompt_compact")
+        or shot.get("seedance_prompt") or "").strip()
+    if not planned:
+        return None
+    return {
+        "prompt": planned,
+        "status": "",
+        "provider": "",
+        "reviewed": False,
+        "source": "分镜登记的 Seedance 待提交提示词",
+        "state": "planned",
+    }
+
+
+def _asset_prompt_rows(render_plan):
+    """把非镜头资产的提示词按类目整理成可审阅的行。"""
+    by_category = {}
+    for item in (render_plan or {}).get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        category = str(item.get("category") or "")
+        if category not in dict(ASSET_CATEGORIES):
+            continue
+        compiled = str(item.get("prompt") or "").strip()
+        sent = str(
+            item.get("prompt_used") or item.get("prompt_compact") or "").strip()
+        qc = item.get("qc") if isinstance(item.get("qc"), dict) else {}
+        review = item.get("prompt_review")
+        review = review if isinstance(review, dict) else {}
+        actual = {
+            "prompt": sent,
+            "status": str(item.get("status") or ""),
+            "provider": str(item.get("provider") or ""),
+            "reviewed": bool(review.get("approved")),
+            "source": "render_plan 实际发送提示词",
+            "state": "produced",
+        } if sent else None
+        by_category.setdefault(category, []).append({
+            "id": str(item.get("id") or ""),
+            "category": category,
+            "name": str(item.get("name") or ""),
+            "label": str(item.get("label") or item.get("name") or ""),
+            "status": str(item.get("status") or ""),
+            "prompt": compiled,
+            "prompt_hash": str(item.get("prompt_used_hash") or ""),
+            "references": _reference_manifest(item),
+            "actual_generation": actual,
+            "actual_state": _actual_state(item, actual),
+            "prompt_review_approved": bool(review.get("approved")),
+            "qc_passed": qc.get("passed"),
+            "qc_issues": _dedupe(qc.get("issues") or []),
+        })
+    groups = []
+    for category, label in ASSET_CATEGORIES:
+        rows = by_category.get(category)
+        if not rows:
+            continue
+        rows.sort(key=lambda row: (row["name"], row["id"]))
+        groups.append({
+            "category": category,
+            "label": label,
+            "total": len(rows),
+            "with_prompt": sum(1 for row in rows if row["prompt"]),
+            "missing_prompt": sum(1 for row in rows if not row["prompt"]),
+            "items": rows,
+        })
+    return groups
 
 
 def _dedupe(values):
@@ -187,6 +318,28 @@ def build_episode_prompt_review(app, episode_id):
     render_plan = _read_render_plan(
         app, project["id"], episode["number"])
     actual_items = _actual_items_by_shot(render_plan)
+    video_qc, _ = app.projects.latest_document(episode_id, "video_qc_report")
+    video_references = {}
+    video_reference_notes = {}
+    try:
+        effective = app.director.effective_video_references(episode_id)
+        for key, row in ((effective or {}).get("shots") or {}).items():
+            row = row if isinstance(row, dict) else {}
+            video_references[str(key)] = [
+                copy.deepcopy(value) for value in row.get("items") or []
+                if isinstance(value, dict)]
+            video_reference_notes[str(key)] = {
+                "mode": str(row.get("mode") or ""),
+                "spatial_reference_required": bool(
+                    row.get("spatial_reference_required")),
+                "spatial_reference_ready": bool(
+                    row.get("spatial_reference_ready")),
+                "spatial_reference_reason": str(
+                    row.get("spatial_reference_reason") or ""),
+            }
+    except Exception:  # 参考选择器不可用时页面照常打开，只是这一栏空
+        video_references = {}
+        video_reference_notes = {}
     scene_locations = {
         scene.get("scene_no"): scene.get("location", "")
         for scene in (script or {}).get("scenes") or []
@@ -223,7 +376,15 @@ def build_episode_prompt_review(app, episode_id):
                 else image_item if kind == "keyframe"
                 else None
             )
-            variants.append(_compile_variant(
+            manifest = _reference_manifest(source_item)
+            if kind == "video":
+                # 视频不进 render_plan，参考图要问视频参考选择器，否则这一栏
+                # 结构性永远空白——用户只会以为“视频没有参考图”。
+                manifest = video_references.get(str(shot_no)) or []
+                actual = _video_actual(shot, video_qc, shot_no)
+            else:
+                actual = _actual_prompt(source_item, kind)
+            variant = _compile_variant(
                 shot,
                 kind=kind,
                 label=label,
@@ -231,8 +392,17 @@ def build_episode_prompt_review(app, episode_id):
                 location=location,
                 style=str(project.get("style") or ""),
                 references=_reference_manifest(source_item),
-                actual=_actual_prompt(source_item, kind),
-            ))
+                actual=actual,
+            )
+            variant["submitted_references"] = manifest
+            variant["actual_state"] = (
+                "not_tracked"
+                if kind == "video" and actual is None
+                else _actual_state(source_item, actual))
+            if kind == "video":
+                variant["reference_notes"] = video_reference_notes.get(
+                    str(shot_no), {})
+            variants.append(variant)
         statuses = [item["status"] for item in variants]
         status = (
             "BLOCK" if "BLOCK" in statuses
@@ -285,6 +455,9 @@ def build_episode_prompt_review(app, episode_id):
         else "PASS" if results
         else "BLOCK"
     )
+    asset_groups = _asset_prompt_rows(render_plan)
+    asset_total = sum(group["total"] for group in asset_groups)
+    asset_missing = sum(group["missing_prompt"] for group in asset_groups)
     return {
         "schema": PROMPT_REVIEW_SCHEMA,
         "contract_schema": PROMPT_CONTRACT_SCHEMA,
@@ -307,6 +480,7 @@ def build_episode_prompt_review(app, episode_id):
             "script": script_version,
             "storyboard": storyboard_version,
         },
+        "actual_states": dict(ACTUAL_STATES),
         "summary": {
             "status": overall,
             "ready": overall != "BLOCK" and bool(results),
@@ -314,6 +488,9 @@ def build_episode_prompt_review(app, episode_id):
             "shots": counts,
             "prompts_total": len(results) * len(FRAME_VARIANTS),
             "prompts": variant_counts,
+            "assets_total": asset_total,
+            "assets_missing_prompt": asset_missing,
         },
         "shots": results,
+        "assets": asset_groups,
     }

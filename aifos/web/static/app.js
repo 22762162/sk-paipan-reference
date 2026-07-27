@@ -8174,12 +8174,38 @@ function promptReviewStatusBadge(status, label = "") {
   return `<span class="prompt-status ${value.toLowerCase()}">${icon} ${esc(text)}</span>`;
 }
 
+/* 空白必须可解释:是还没做、做了没留痕、还是这一类根本不进出图清单。 */
+const PROMPT_ACTUAL_STATE_CN = {
+  produced: { label: "已生产", hint: "下面是当时真实发送的输入" },
+  pending: { label: "尚未生产", hint: "这一张还没出图，所以没有实际输入" },
+  missing: { label: "缺实际输入记录", hint: "已生产但没留下提示词记录，无法追溯" },
+  planned: { label: "待提交", hint: "尚未生产，显示的是将要提交的输入" },
+  not_tracked: { label: "不进出图清单", hint: "该类目不落 render_plan" },
+};
+
+function promptReferenceListHtml(references, title) {
+  const rows = (references || []).filter((row) => row && (row.uri || row.name));
+  if (!rows.length) return "";
+  return `<details class="prompt-submitted-refs">
+    <summary>${esc(title)} · ${rows.length} 张</summary>
+    <ol class="prompt-ref-rows">${rows.map((row) => `<li>
+      <b>${esc(row.label || row.name || row.kind || "参考图")}</b>
+      ${row.kind ? `<span class="prompt-ref-kind">${esc(row.kind)}</span>` : ""}
+      ${row.character ? `<span class="prompt-ref-kind">${esc(row.character)}</span>` : ""}
+      ${row.binding ? `<span class="prompt-ref-binding">${esc(row.binding)}</span>` : ""}
+    </li>`).join("")}</ol>
+  </details>`;
+}
+
 function promptVariantHtml(shot, variant, index) {
   const target = variant.frame_target || {};
   const actual = variant.actual_generation;
   const actualDifferent = actual && String(actual.prompt || "").trim()
     !== String(variant.prompt || "").trim();
   const defaultOpen = variant.kind === "keyframe" || variant.status === "BLOCK";
+  const state = PROMPT_ACTUAL_STATE_CN[variant.actual_state]
+    || PROMPT_ACTUAL_STATE_CN.not_tracked;
+  const notes = variant.reference_notes || {};
   const targetText = target.phase
     ? `${target.phase} · ${target.source || "显式登记"}`
     : variant.media === "video" ? "完整时间线" : "未形成合法定格";
@@ -8206,6 +8232,18 @@ function promptVariantHtml(shot, variant, index) {
       </div>
       <pre class="prompt-code" tabindex="0">${esc(
         variant.prompt || "当前合同无法生成可用提示词，请先修正阻断项。")}</pre>
+      ${promptReferenceListHtml(
+        variant.submitted_references,
+        variant.kind === "video" ? "实际提交给 Seedance 的参考图"
+          : "本张实际提交的参考图")}
+      ${variant.kind === "video" && notes.spatial_reference_required ? `<div
+        class="prompt-diagnostics ${notes.spatial_reference_ready ? "warn" : "block"}">
+        <b>空间调度参考图${notes.spatial_reference_ready ? "已就绪" : "缺失"}</b>
+        <ul><li>${esc(notes.spatial_reference_reason || "本镜需要空间调度图")}
+          ${notes.mode ? ` · 选择模式 ${esc(notes.mode)}` : ""}</li></ul>
+      </div>` : ""}
+      <div class="prompt-actual-state ${esc(variant.actual_state || "")}">
+        <b>实际生产输入：${esc(state.label)}</b><span>${esc(state.hint)}</span></div>
       ${actualDifferent ? `<details class="prompt-actual">
         <summary>查看已经发送过的生产提示词 · ${esc(actual.source || "")}</summary>
         <div class="prompt-code-head">
@@ -8222,6 +8260,77 @@ function promptVariantHtml(shot, variant, index) {
       </details>
     </div>
   </details>`;
+}
+
+/* 非镜头资产(人物/候选/道具/场景/封面)同样按提示词出图，一集通常比镜头
+   多两三倍，提示词区不能只覆盖镜头。 */
+function promptAssetRowHtml(row) {
+  const state = PROMPT_ACTUAL_STATE_CN[row.actual_state]
+    || PROMPT_ACTUAL_STATE_CN.not_tracked;
+  const qcBadge = row.qc_passed === true
+    ? `<span class="prompt-asset-badge pass">质检✓</span>`
+    : row.qc_passed === false
+      ? `<span class="prompt-asset-badge block">质检未过</span>` : "";
+  const searchText = [row.label, row.name, row.category, row.status,
+    ...(row.qc_issues || [])].join(" ").toLowerCase();
+  const actual = row.actual_generation;
+  const actualDifferent = actual && String(actual.prompt || "").trim()
+    !== String(row.prompt || "").trim();
+  return `<details class="prompt-asset-row" data-asset-search="${esc(searchText)}">
+    <summary>
+      <b>${esc(row.label || row.name || row.id)}</b>
+      <span class="prompt-asset-badge">${esc(row.status || "未知状态")}</span>
+      ${row.prompt_review_approved
+        ? `<span class="prompt-asset-badge pass">Codex审词✓</span>` : ""}
+      ${qcBadge}
+      ${row.prompt ? "" : `<span class="prompt-asset-badge block">无提示词记录</span>`}
+    </summary>
+    <div class="prompt-variant-body">
+      ${(row.qc_issues || []).length ? `<div class="prompt-diagnostics block">
+        <b>质检问题</b>
+        <ul>${row.qc_issues.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>
+      </div>` : ""}
+      <div class="prompt-code-head">
+        <div><b>提示词</b><span>${esc(row.id || "")}</span></div>
+        <button type="button" data-copy-asset="${esc(row.id)}">复制提示词</button>
+      </div>
+      <pre class="prompt-code" tabindex="0">${esc(
+        row.prompt || "这一条没有留下提示词记录。")}</pre>
+      ${promptReferenceListHtml(row.references, "本张实际提交的参考图")}
+      <div class="prompt-actual-state ${esc(row.actual_state || "")}">
+        <b>实际生产输入：${esc(state.label)}</b><span>${esc(state.hint)}</span></div>
+      ${actualDifferent ? `<details class="prompt-actual">
+        <summary>查看实际发送稿（与编译稿不同）</summary>
+        <pre class="prompt-code historical" tabindex="0">${esc(actual.prompt)}</pre>
+      </details>` : ""}
+    </div>
+  </details>`;
+}
+
+function promptAssetSectionHtml(data) {
+  const groups = data.assets || [];
+  const total = (data.summary || {}).assets_total || 0;
+  if (!groups.length) {
+    return `<section class="prompt-asset-section">
+      <header><h2>非镜头资产提示词</h2>
+        <p>本集清单里还没有人物、道具或场景资产条目。</p></header>
+    </section>`;
+  }
+  return `<section class="prompt-asset-section">
+    <header>
+      <h2>非镜头资产提示词 · ${total} 条</h2>
+      <p>人物、定角候选、道具和场景母版同样由提示词出图，出错一样毁整集；
+        这里与镜头提示词共用同一份 render_plan 记录。</p>
+      <button type="button" id="prompt-copy-assets">复制全部资产提示词</button>
+    </header>
+    ${groups.map((group) => `<details class="prompt-asset-group" open>
+      <summary><b>${esc(group.label)}</b>
+        <span>${group.total} 条${group.missing_prompt
+          ? ` · ${group.missing_prompt} 条缺提示词` : ""}</span></summary>
+      <div class="prompt-asset-list">${
+        group.items.map(promptAssetRowHtml).join("")}</div>
+    </details>`).join("")}
+  </section>`;
 }
 
 async function renderPromptReviewPage(episodeId) {
@@ -8319,6 +8428,10 @@ async function renderPromptReviewPage(episodeId) {
       <div class="prompt-summary-stat pass"><b>${esc(counts.PASS || 0)}</b><span>已通过</span></div>
       <div class="prompt-summary-stat warn"><b>${esc(counts.WARN || 0)}</b><span>有警告</span></div>
       <div class="prompt-summary-stat block"><b>${esc(counts.BLOCK || 0)}</b><span>被阻断</span></div>
+      <div class="prompt-summary-stat ${summary.assets_missing_prompt ? "warn" : ""}">
+        <b>${esc(summary.assets_total || 0)}</b>
+        <span>非镜头资产提示词${summary.assets_missing_prompt
+          ? ` · 缺 ${esc(summary.assets_missing_prompt)}` : ""}</span></div>
     </section>
     <details class="prompt-highest-rules">
       <summary><b>查看最高规则清单</b><span>所有提示词必须同时满足 ${(data.rules || []).length} 条</span></summary>
@@ -8346,6 +8459,7 @@ async function renderPromptReviewPage(episodeId) {
         <b>本集尚无可编译分镜</b><span>先完成并保存五维分镜，再进入提示词区。</span>
       </div>`}</main>
     </div>
+    ${promptAssetSectionHtml(data)}
   </div>`;
 
   document.getElementById("prompt-back").onclick = () => {
@@ -8371,6 +8485,24 @@ async function renderPromptReviewPage(episodeId) {
       showToast(`镜头 ${item?.shot?.shot_no} 历史生产输入已复制`, "ok");
     };
   });
+  const assetById = new Map((data.assets || []).flatMap((group) =>
+    (group.items || []).map((row) => [row.id, row])));
+  document.querySelectorAll("[data-copy-asset]").forEach((button) => {
+    button.onclick = async () => {
+      const row = assetById.get(button.dataset.copyAsset);
+      await copyText(row?.prompt || "");
+      showToast(`${row?.label || button.dataset.copyAsset} 提示词已复制`, "ok");
+    };
+  });
+  const copyAssets = document.getElementById("prompt-copy-assets");
+  if (copyAssets) copyAssets.onclick = async () => {
+    const text = (data.assets || []).flatMap((group) =>
+      (group.items || []).map((row) =>
+        `===== ${group.label} · ${row.label || row.id} · ${row.status} =====\n${row.prompt}`)
+    ).join("\n\n");
+    await copyText(text);
+    showToast(`已复制 ${summary.assets_total || 0} 条资产提示词`, "ok");
+  };
   document.getElementById("prompt-copy-all").onclick = async () => {
     const text = (data.shots || []).flatMap((shot) =>
       (shot.variants || []).map((variant) =>
@@ -8397,6 +8529,14 @@ async function renderPromptReviewPage(episodeId) {
     });
     document.getElementById("prompt-visible-count").textContent =
       `${visible} / ${summary.shots_total || 0}`;
+    // 搜索同时过滤资产条目；状态筛选只对镜头有意义，资产不受它影响。
+    document.querySelectorAll("[data-asset-search]").forEach((row) => {
+      row.hidden = !!query && !row.dataset.assetSearch.includes(query);
+    });
+    document.querySelectorAll(".prompt-asset-group").forEach((group) => {
+      const rows = [...group.querySelectorAll("[data-asset-search]")];
+      group.hidden = rows.length > 0 && rows.every((row) => row.hidden);
+    });
   };
   search.oninput = applyFilters;
   statusFilter.onchange = applyFilters;
