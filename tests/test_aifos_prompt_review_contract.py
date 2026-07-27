@@ -152,3 +152,16 @@ def test_back_profile_sheet_scopes_match_their_binding(tmp_path):
     assert "prop_position" in back["inherits"]
     assert "wardrobe" not in back["excludes"]
     assert "face_identity_override" in back["excludes"]
+
+
+@_pytest.mark.parametrize("optimized, count, ok", [
+    ("3名登记角色林川、赵百户、阿砚，加4名巡检弓兵", 7, True),
+    ("三名登记角色与四名弓兵", 7, True),
+    ("3名角色与3名弓兵", 7, False),          # 和不等于期望仍拒
+    ("林川、赵百户、阿砚与巡检弓兵们", 7, False),   # 无数字仍拒
+])
+def test_count_preservation_accepts_component_sums(optimized, count, ok):
+    """分组人数相加等于期望值也是明确的人数字面(7人群像真实事故)。"""
+    from aifos.production.router import ProviderRouter
+    assert ProviderRouter._prompt_review_count_preserved(
+        optimized, {"character_count": count}) is ok

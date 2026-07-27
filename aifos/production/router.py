@@ -431,9 +431,19 @@ class ProviderRouter:
         cn = cls._CN_NUM.get(expected)
         if cn:
             numerals = f"(?:{expected}|{cn})"
-        return bool(re.search(
-            rf"(?<!\d){numerals}\s*(?:人|名人物|个人|名角色|位人物|位角色)"
-            r"(?!\d)", optimized))
+        if re.search(
+                rf"(?<!\d){numerals}\s*(?:人|名人物|个人|名角色|位人物|位角色)"
+                r"(?!\d)", optimized):
+            return True
+        # 分组求和:「3名登记角色…加4名巡检弓兵」= 7 同样是明确的人数
+        # 字面;各组数量相加等于期望值即算保留。
+        cn_to_int = {v: k for k, v in cls._CN_NUM.items()}
+        groups = re.findall(
+            r"(?<!\d)(\d+|[一两三四五六七八九十])\s*[名位个](?!\d)",
+            optimized)
+        total = sum(
+            int(g) if g.isdigit() else cn_to_int.get(g, 0) for g in groups)
+        return bool(groups) and total == expected
 
     def review_image_prompt(self, capability, payload, out_dir, cancel=None):
         """用 Codex 审核并优化真实出图前的最终提示词，原地冻结优化稿。
@@ -523,9 +533,17 @@ class ProviderRouter:
         if not self._prompt_review_count_preserved(optimized, payload):
             missing.append("人物总数")
         if missing:
+            evidence = ""
+            if "人物总数" in missing:
+                segments = [
+                    seg.strip() for seg in re.split(r"[；。\n]", optimized)
+                    if any(t in seg for t in ("人", "名", "位"))][:3]
+                if segments:
+                    evidence = "；优化稿人数相关片段:「" + "／".join(
+                        seg[:60] for seg in segments) + "」"
             raise ProviderError(
                 "Codex优化稿删除了不可变事实，拒绝生图："
-                + "、".join(missing[:20]))
+                + "、".join(missing[:20]) + evidence)
         audit_record = {
             "schema": self.PROMPT_REVIEW_SCHEMA,
             "approved": True,
