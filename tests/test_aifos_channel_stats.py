@@ -132,3 +132,21 @@ def test_non_codex_provider_not_recorded(tmp_path):
         "command": [sys.executable, str(bridge)], "timeout": 30})
     provider.generate("image", {}, out_dir)
     assert not stats_file.exists()
+
+
+def test_run_interruptible_survives_large_output(tmp_path):
+    """子进程输出远超 64KB 管道缓冲也必须完整收回(死锁回归)。
+
+    先 wait 后 read 的旧实现会与大回复互相等死:整份 v2.2 分镜 JSON
+    回复(>64KB)让适配器在 print 上被憋住 46 分钟。
+    """
+    import sys as _sys
+    from aifos.production.external import run_interruptible
+    script = tmp_path / "big_out.py"
+    script.write_text(
+        "print('{\"ok\": true, \"data\": \"' + 'x' * 300000 + '\"}')",
+        encoding="utf-8")
+    rc, out, _err = run_interruptible(
+        "test", [_sys.executable, str(script)], None, 30)
+    assert rc == 0
+    assert len(out) > 300000

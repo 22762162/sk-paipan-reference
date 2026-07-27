@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -26,6 +27,10 @@ def run_interruptible(name, command, input_text, timeout, cancel=None,
     """可中断的子进程执行:每 2 秒检查一次停止信号,先 TERM 再 KILL。
 
     返回 (returncode, stdout, stderr);用户停止 → ProduceCancelled。
+
+    stdout/stderr 由独立线程边跑边收——先 wait 后 read 会在子进程
+    输出超过管道缓冲(64KB)时死锁:子进程 print 大 JSON 回复被憋住,
+    父进程等它退出才读,两边互相等到永远(整份 v2.2 分镜回复就踩中过)。
     """
     try:
         proc = subprocess.Popen(
@@ -34,6 +39,28 @@ def run_interruptible(name, command, input_text, timeout, cancel=None,
             text=True, cwd=cwd, env=env)
     except OSError as exc:
         raise ProviderError(f"{name} 调用失败: {exc}") from exc
+    chunks = {"out": [], "err": []}
+
+    def _pump(stream, key):
+        try:
+            for line in iter(stream.readline, ""):
+                chunks[key].append(line)
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    readers = [
+        threading.Thread(target=_pump, args=(proc.stdout, "out"),
+                         daemon=True),
+        threading.Thread(target=_pump, args=(proc.stderr, "err"),
+                         daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
     try:
         if input_text is not None:
             try:
@@ -54,16 +81,15 @@ def run_interruptible(name, command, input_text, timeout, cancel=None,
                 if time.monotonic() >= deadline:
                     _terminate_process(proc)
                     raise ProviderError(f"{name} 调用超时({timeout}s)")
-        stdout = proc.stdout.read() if proc.stdout else ""
-        stderr = proc.stderr.read() if proc.stderr else ""
-        return proc.returncode, stdout, stderr
+        for reader in readers:
+            reader.join(timeout=10)
+        return proc.returncode, "".join(chunks["out"]), "".join(chunks["err"])
     finally:
-        for stream in (proc.stdin, proc.stdout, proc.stderr):
-            try:
-                if stream:
-                    stream.close()
-            except OSError:
-                pass
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except OSError:
+            pass
 
 
 def _terminate_process(proc, grace=5):
