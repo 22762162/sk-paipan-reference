@@ -54,6 +54,9 @@ class ProviderRouter:
         except (TypeError, ValueError):
             self._codex_parallel_per_channel = 3
         self._codex_profile_slots = {}
+        # 本次运行内因题材安全策略拒收的 (provider, capability):
+        # 悬疑/凶案类剧集会被某些图片 API 整集拒绝,记一次即绕开。
+        self._safety_blocked = set()
         # 通道取用优先级 = 配置列表顺序(只含启用通道):前面的通道并发
         # 占满后才溢出到后面的通道(如 B、C 先行,A 兜底)。
         self._codex_profile_order = []
@@ -623,6 +626,20 @@ class ProviderRouter:
         return result
 
     # ---- 调用 ----
+    @staticmethod
+    def _is_safety_rejection(exc):
+        """产线是否因内容安全策略拒收(而非临时故障)。
+
+        题材决定的拒绝对同一集的其它镜头一样会发生,重试与逐张试错
+        都没有意义,应当整条产线绕开;临时故障则照常按张回退重试。
+        """
+        text = str(exc)
+        return any(token in text for token in (
+            "safety_violations", "rejected by the safety system",
+            "safety system", "content_policy_violation",
+            "content policy", "内容安全", "安全策略",
+        ))
+
     def _appeal_rule_verdict(self, *, rule_id, rule_reason, subject,
                              context, out_dir, payload=None,
                              capability="", cancel=None):
@@ -725,6 +742,10 @@ class ProviderRouter:
                     fallbacks.append(
                         {"provider": name, "reason": "订阅额度已耗尽"})
                     continue
+            if (name, capability) in self._safety_blocked:
+                reason = "本集题材已被该产线安全策略整体拒收"
+                fallbacks.append({"provider": name, "reason": reason})
+                continue
             ok, reason = provider.available(capability)
             if not ok:
                 self.log.info(
@@ -763,8 +784,20 @@ class ProviderRouter:
                     result = provider.generate(capability, payload, out_dir,
                                                cancel=cancel)
             except ProviderError as exc:
-                self.log.warn(
-                    "router", f"{name} 执行失败({exc}),回退({capability})")
+                if self._is_safety_rejection(exc):
+                    # 题材级拒绝:《雨夜凶杀》这类有尸体/血迹的剧,
+                    # OpenAI 安全系统会拒掉本集几乎每一张图(实测 73 次
+                    # 全拒)。每张都先撞一次墙再回退纯属浪费,记下来
+                    # 本次运行内不再向该产线投同类任务。
+                    self._safety_blocked.add((name, capability))
+                    self.log.warn(
+                        "router",
+                        f"{name} 因题材安全策略拒绝本集内容(尸体/血迹等),"
+                        f"本次运行不再向它投递 {capability},直接用后续产线")
+                else:
+                    self.log.warn(
+                        "router",
+                        f"{name} 执行失败({exc}),回退({capability})")
                 fallbacks.append(
                     {"provider": name, "reason": f"执行失败: {exc}"})
                 continue
