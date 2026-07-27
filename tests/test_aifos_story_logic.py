@@ -167,12 +167,35 @@ def test_synthesized_beat_shots_inherit_scene_event_id():
         assert beat.get("scene_event_id") == "YYXS-E01-S01-SHELTER"
 
 
-def test_seedance_asset_reference_limit_is_nine():
-    """即梦 Seedance2 实测可收 9 张资产参考(不含首尾帧);
-    原硬编码 7 让「3立绘+空间图+4道具」的正常群像镜被拒。"""
+def test_seedance_asset_reference_limit_is_seven():
+    """Seedance2 图片总上限 9 = 首帧+尾帧+7 张资产参考。"""
     from aifos.director import SEEDANCE_ASSET_REFERENCE_LIMIT
-    assert SEEDANCE_ASSET_REFERENCE_LIMIT == 9
+    assert SEEDANCE_ASSET_REFERENCE_LIMIT == 7
     import inspect
     from aifos import director
     src = inspect.getsource(director)
     assert "参考上限7张" not in src        # 不许再有硬编码文案
+
+
+def test_wardrobe_props_yield_when_seedance_slots_tight():
+    """参考位超限时服装类道具让位(形象由穿着者立绘+首尾帧承载);
+    证物/器物绝不让;无可让位时保留原样交由上限报错。"""
+    from aifos.director import Director
+
+    class _Log:
+        def info(self, *args):
+            pass
+
+    director = Director.__new__(Director)
+    director.log = _Log()
+    rows = [("旧靛青举人青袍", {"id": 11}), ("吏部札付", {"id": 12}),
+            ("缺口单刃短刀", {"id": 13}), ("青灰文书包", {"id": 14})]
+    kept, yielded = director._yield_seedance_prop_rows(rows, 1, shot_no=20)
+    assert yielded == ["旧靛青举人青袍"]
+    assert [name for name, _ in kept] == [
+        "吏部札付", "缺口单刃短刀", "青灰文书包"]
+    kept2, y2 = director._yield_seedance_prop_rows(rows, 0)
+    assert not y2 and len(kept2) == 4
+    kept3, y3 = director._yield_seedance_prop_rows(
+        [("短刀", {"id": 1})], 1)
+    assert not y3 and len(kept3) == 1

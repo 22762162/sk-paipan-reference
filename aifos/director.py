@@ -542,9 +542,9 @@ REFERENCE_ROLES = {
 # 参考图，避免同一任务切换模型时图序、人物或构图语义发生漂移。
 IMAGE_REFERENCE_LIMIT = 10
 SHOT_BASE_REFERENCE_LIMIT = 8
-# Seedance 2 资产参考上限(首/尾帧另计):实测可提交 9 张;
-# 原硬编码 7 导致"3立绘+空间图+4道具=8"的正常群像镜被拒。
-SEEDANCE_ASSET_REFERENCE_LIMIT = 9
+# Seedance 2 图片总上限 9 张 = 首帧 + 尾帧 + 7 张资产参考;
+# 资产位紧张时按镜内可见性收敛(absent 道具不占位),而非硬拆群像。
+SEEDANCE_ASSET_REFERENCE_LIMIT = 7
 
 # render_plan.json is shared by the parallel image workers.  Keep the
 # read/write pair atomic inside one Python process; the actual image calls stay
@@ -9642,13 +9642,14 @@ class Director:
         if inner_row is not None:
             mandatory_ids.add(inner_row["id"])
         missing_props = []
+        prop_rows = []
         for name in self._shot_core_prop_names(
                 ctx, target_shot, phases={"start", "freeze", "end"}):
             row = self._locked_prop(episode["project_id"], name)
             if row is None:
                 missing_props.append(name)
             else:
-                mandatory_ids.add(row["id"])
+                prop_rows.append((name, row))
         if missing_identities:
             raise AifosError(
                 "以下出场角色缺少最终立绘，禁止选择 Seedance 参考图:"
@@ -9657,6 +9658,13 @@ class Director:
             raise AifosError(
                 "以下核心道具缺少人工锁定母资产，禁止选择 Seedance 参考图:"
                 + "、".join(missing_props))
+        over_by = (len(mandatory_ids) + len(prop_rows)
+                   - SEEDANCE_ASSET_REFERENCE_LIMIT)
+        if over_by > 0:
+            prop_rows, _yielded = self._yield_seedance_prop_rows(
+                prop_rows, over_by, shot_no=shot_no)
+        for _name, row in prop_rows:
+            mandatory_ids.add(row["id"])
         if len(mandatory_ids) > SEEDANCE_ASSET_REFERENCE_LIMIT:
             raise AifosError(
                 f"本镜空间图与人物最终立绘已占 {len(mandatory_ids)} 张，"
@@ -9806,13 +9814,21 @@ class Director:
                 f"镜头{shot_no}声明了内心Q版，但对应母资产缺失或质量不足")
         add(inner_row)
         missing_props = []
+        pending_prop_rows = []
         for name in self._shot_core_prop_names(
                 ctx, shot, phases={"start", "freeze", "end"}):
             prop_row = self._locked_prop(project_id, name)
             if prop_row is None:
                 missing_props.append(name)
             else:
-                add(prop_row)
+                pending_prop_rows.append((name, prop_row))
+        over_by = (len(rows) + len(pending_prop_rows)
+                   - SEEDANCE_ASSET_REFERENCE_LIMIT)
+        if over_by > 0:
+            pending_prop_rows, _yielded = self._yield_seedance_prop_rows(
+                pending_prop_rows, over_by, shot_no=shot_no)
+        for _name, prop_row in pending_prop_rows:
+            add(prop_row)
         if missing:
             raise AifosError(
                 "以下出场角色缺少最终立绘，禁止交给 Seedance:"
@@ -10079,6 +10095,43 @@ class Director:
                 f"{SEEDANCE_ASSET_REFERENCE_LIMIT}张；"
                 "请减少人工额外参考或拆分群像镜头")
         return rows
+
+
+    # 参考位紧张时的道具让位序:穿在人物身上的服装类道具,其形象已由
+    # 穿着者立绘与首尾帧承载,可让出 Seedance 资产位;真正独立的证物/
+    # 器物(短刀、札付、包袱)绝不让位。
+    _WARDROBE_PROP_TOKENS = (
+        "袍", "衣", "衫", "裙", "甲", "靴", "帽", "冠", "巾", "披风",
+        "斗篷", "腰带", "束带",
+    )
+
+    @classmethod
+    def _wardrobe_class_prop(cls, name):
+        return any(token in str(name or "")
+                   for token in cls._WARDROBE_PROP_TOKENS)
+
+    def _yield_seedance_prop_rows(self, prop_rows, over_by, shot_no=None):
+        """按让位序丢弃服装类道具行,返回 (保留行, 让位名单)。
+
+        prop_rows: [(name, row)];只在超限时被调用,让位数量以补齐
+        超额为限;非服装类道具一律保留。
+        """
+        yielded = []
+        kept = list(prop_rows)
+        for name, row in list(kept):
+            if over_by <= 0:
+                break
+            if self._wardrobe_class_prop(name):
+                kept.remove((name, row))
+                yielded.append(name)
+                over_by -= 1
+        if yielded:
+            self.log.info(
+                "director",
+                (f"镜头{shot_no}" if shot_no is not None else "本镜")
+                + "Seedance 资产位超限,服装类道具让位(形象由穿着者"
+                "立绘与首尾帧承载): " + "、".join(yielded))
+        return kept, yielded
 
     def _video_reference_binding(self, row, shot=None, script=None):
         """Seedance 每张资产的单一职责，禁止“身份/服装/场景全都锁”。"""
