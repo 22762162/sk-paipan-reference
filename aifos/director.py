@@ -6157,7 +6157,26 @@ class Director:
             "variant_focus": focus,
         }
 
+    # 文书类道具:本体必然带正文,但正文由后续「锁文字」阶段统一定版。
+    # 母版若要求写出具体文字,模型只能编造 → 审核判定"缺少决定性文字
+    # 内容"并熔断;因此母版一律以不可辨读的方式呈现文字面。
+    _TEXT_BEARING_PROP_TOKENS = (
+        "札付", "文书", "公文", "信", "书信", "密信", "契", "契约",
+        "字条", "手札", "奏折", "折子", "卷宗", "账本", "册",
+        "名帖", "拜帖", "告示", "布告", "榜文", "牌匾", "匾",
+        "令牌", "腰牌", "路引", "地图", "图纸", "书", "经卷",
+    )
+
+    @classmethod
+    def _prop_has_text_surface(cls, prop):
+        blob = " ".join(str(prop.get(key) or "") for key in (
+            "name", "visual_design", "story_function", "era_material"))
+        return any(token in blob for token in cls._TEXT_BEARING_PROP_TOKENS)
+
     def _prop_candidate_prompt(self, prop, style, variant):
+        # 连续性状态是场次事实(油纸外包→拆封→沾血),不是母版事实。
+        # 把它写进母版会与"无包装/无污损"的母版约束直接矛盾,
+        # 审核禁止猜测取舍只能熔断整批道具图。
         facts = "；".join(
             f"{label}:{self._design_value(prop.get(key))}"
             for key, label in (
@@ -6165,19 +6184,28 @@ class Director:
                 ("visual_design", "视觉结构"),
                 ("era_material", "时代与材质"),
                 ("owner", "归属/持有人"),
-                ("continuity_states", "连续性状态"),
             ) if self._design_value(prop.get(key)))
+        text_rule = (
+            "【文字面】本道具带文字载体:母版只呈现其物理形态与工艺,"
+            "一律以卷合、折叠、闭合或斜角呈现,使正文不可辨读;"
+            "禁止编造任何具体文字、印章内容或落款——正文由后续"
+            "「锁文字」阶段统一定版。"
+            if self._prop_has_text_surface(prop) else
+            "无新增文字、无字幕、无Logo、无水印；")
         return (
             f"【任务】核心道具「{prop['name']}」四选一候选 · "
             f"{variant['variant_label']}。"
             f"【道具事实】{facts or '外形、功能、材质与时代必须服从正式剧本'}。"
+            "【母版基准状态】只画道具本体出厂/初始的完整形态:未包装、"
+            "未拆封、无破损、无污渍、无血迹,不表现任何场次里的临时状态。"
+            f"{text_rule}"
             f"【本候选优化轴】{variant['variant_focus']}；"
             "只改变不影响剧情功能的轮廓、材质、工艺和细节方案，不得改变"
             "用途、尺寸级别、持有人、时代、文字内容或连续性状态。"
             f"【PROJECT STYLE LOCK】本项目唯一画风:{style}。"
             "单件道具完整居中，三分之四视角，结构和可握持/可使用部位清晰，"
-            "纯净中性棚拍背景，无人物、无手、无场景、无包装、无新增文字、"
-            "无字幕、无Logo、无水印；自然比例与材质真实可制造。")
+            "纯净中性棚拍背景，无人物、无手、无场景；"
+            "自然比例与材质真实可制造。")
 
     def _ensure_character_candidates(self, ctx, characters, designs, style):
         """每个人物用同一初始提示词并行生成4张，随后等待人工选择。"""

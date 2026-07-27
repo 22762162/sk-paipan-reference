@@ -48,3 +48,45 @@ def test_empty_and_none_are_safe():
     assert clean(None) == ""
     assert clean("") == ""
     assert clean("，，；") == ""
+
+
+# ---- 核心道具母版:同一段提示词不得自相矛盾 ----
+def _prop_prompt(prop):
+    director = Director.__new__(Director)
+    return director._prop_candidate_prompt(
+        prop, "写实历史", {"variant_label": "方案1",
+                           "variant_focus": "轮廓与工艺"})
+
+
+def test_prop_master_drops_scene_continuity_states():
+    """连续性状态是场次事实,写进母版会与「未包装」约束互斥并熔断。"""
+    prompt = _prop_prompt({
+        "name": "吏部札付", "story_function": "冒名入仕的凭证",
+        "visual_design": "折叠公文，骑缝印",
+        "era_material": "明代桑皮纸、朱印", "owner": "林川",
+        "continuity_states": "初始油纸外包→雨中拆开→沾血"})
+    for token in ("油纸外包", "拆开", "沾血"):
+        assert token not in prompt, f"场次状态 {token!r} 混入母版"
+    assert "未包装" in prompt and "未拆封" in prompt
+    # 稳定道具事实必须保留
+    assert "骑缝印" in prompt and "桑皮纸" in prompt
+
+
+def test_text_bearing_prop_never_invents_document_text():
+    """文书类母版不得编造正文——正文由「锁文字」阶段统一定版。"""
+    prompt = _prop_prompt({
+        "name": "吏部札付", "visual_design": "折叠公文",
+        "era_material": "明代桑皮纸"})
+    assert "不可辨读" in prompt
+    assert "禁止编造" in prompt
+    # 旧的「无新增文字」与文书本体矛盾,不应再出现
+    assert "无新增文字" not in prompt
+
+
+def test_plain_prop_keeps_no_text_rule():
+    """非文字载体道具仍禁止任何画面文字,且不套用文书规则。"""
+    prompt = _prop_prompt({
+        "name": "铜匕首", "visual_design": "短刃、缠绳柄",
+        "era_material": "青铜"})
+    assert "无新增文字" in prompt
+    assert "不可辨读" not in prompt
