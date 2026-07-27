@@ -115,3 +115,26 @@ class ExtractJsonMendTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExplicitAgeRangeTest(unittest.TestCase):
+    """身份门禁:裸数字年龄区间(25-30)不能因缺「岁」字被打回人工。
+
+    实测:凡人修仙传 script v5 陈师兄 age_range="25-30",门禁却报
+    「年龄段尚未明确」熔断整条 cast 产线——校验器过度字面化。"""
+
+    def test_bare_numeric_ranges_accepted(self):
+        from aifos.identity_facts import explicit_age_range
+        for value in ("25-30", "17", "25至30", "25~30", "25-30岁", "青年"):
+            self.assertTrue(explicit_age_range(value), value)
+
+    def test_ambiguous_values_still_rejected(self):
+        from aifos.identity_facts import explicit_age_range
+        for value in ("", "未知", "模糊", "3000", "随便"):
+            self.assertFalse(explicit_age_range(value), value)
+
+    def test_chen_shixiong_card_resolves(self):
+        from aifos.identity_facts import unresolved_identity_fields
+        self.assertEqual(
+            unresolved_identity_fields(
+                {"gender": "男", "age_range": "25-30"}), [])
