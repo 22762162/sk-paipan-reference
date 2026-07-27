@@ -25,6 +25,8 @@ def app(tmp_path):
 
 
 def _to_cast_selection(app, title="人物定版测试"):
+    """本文件校验人工四选一门禁本身：关掉 CODEX 自动确认后逐张人工定版。"""
+    app.config.data["defaults"]["auto_select_candidates"] = False
     first = app.director.produce(title, 1, pause_for_confirm=True)
     assert first["status"] == "awaiting_script"
     second = app.director.produce(title, 1, pause_for_confirm=True)
@@ -460,7 +462,9 @@ def test_old_story_state_candidate_is_kept_as_history_but_not_reused(app):
     second = app.director.produce(
         title, 1, pause_for_confirm=True)
 
-    assert second["status"] == "awaiting_cast"
+    # 旧剧情态候选不被复用 → 整组重画;新候选由 CODEX 评选自动确认,
+    # 因此这里不再停在人工四选一,而是直接走到开拍门禁。
+    assert second["status"] == "awaiting_confirm"
     history = app.assets.history(
         project["id"], "character_candidate", f"{name}:01")
     assert len(history) == 2
@@ -487,6 +491,8 @@ def test_locked_candidate_becomes_only_identity_reference(app):
             project["id"], "character_art", character["character"])
         assert identity["uri"] == selected["uri"] == portrait["uri"]
 
+    # 人物已人工定版；场景/道具交回 CODEX 自动确认后继续预生产
+    app.config.data["defaults"]["auto_select_candidates"] = True
     summary = app.director.produce(title, 1, pause_for_confirm=True)
     assert summary["status"] == "awaiting_confirm"
     storyboard, _ = app.projects.latest_document(episode["id"], "storyboard")
@@ -554,6 +560,7 @@ def test_visual_qc_requires_identity_ack_and_reuses_signature(app, tmp_path):
     title = "视觉身份质检"
     project, episode, script = _to_cast_selection(app, title)
     _lock_all(app, title, script)
+    app.config.data["defaults"]["auto_select_candidates"] = True
     summary = app.director.produce(title, 1, pause_for_confirm=True)
     assert summary["status"] == "awaiting_confirm"
     storyboard, _ = app.projects.latest_document(episode["id"], "storyboard")

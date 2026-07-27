@@ -18,7 +18,7 @@ def test_five_dimension_preflight_and_delivery(tmp_path):
         assert paused["status"] == "awaiting_script"
         paused = app.director.produce(
             "逆光成团", 1, pause_for_confirm=True)  # 剧本确认
-        assert paused["status"] == "awaiting_cast"
+        assert paused["status"] == "awaiting_confirm"
         project = app.projects.get_project("逆光成团")
         episode = app.db.query_one(
             "SELECT * FROM episodes WHERE project_id=? AND number=1",

@@ -19,8 +19,7 @@ def test_cli_init_and_produce(tmp_path, capsys):
     code = main(["--workspace", ws, "produce", "开始制作《万妖图录》第15集"])
     out = capsys.readouterr().out
     assert code == 0
-    assert "制作人物/道具待选" in out
-    assert "统一4张候选" in out
+    assert "制作完成" in out
     app = App(ws)
     try:
         project = app.projects.get_project("万妖图录")

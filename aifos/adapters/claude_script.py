@@ -1257,6 +1257,40 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 "reason":"调整原因"}}]}}"""
 
 
+def build_select_prompt(payload):
+    """一组四张候选的评选提示词(与 Codex 桥同一份合同,备用产线共用)。"""
+    candidates = [item for item in (payload.get("candidates") or [])
+                  if isinstance(item, dict) and item.get("uri")]
+    listing = "\n".join(
+        f"候选{item.get('index')}:{item.get('uri')}"
+        f"(差异轴={item.get('variant_label') or '未标注'})"
+        for item in candidates)
+    requirements = "\n".join(
+        f"- {line}" for line in (payload.get("requirements") or [])
+    ) or "- 全部要求以正式剧本与本剧唯一画风为准"
+    criteria = "\n".join(
+        f"{i}. {line}"
+        for i, line in enumerate(payload.get("criteria") or [], start=1)
+    ) or "1. 与剧本要求的符合度"
+    return (
+        f"你是漫剧图片资产评选员。为{payload.get('subject_label') or '图片资产'}"
+        f"「{payload.get('subject_name') or ''}」从同一组候选中选出最符合本剧本"
+        "要求的一张,选中即自动确认为定版母图,后续全部镜头以它为锚点。\n"
+        f"候选图(按顺序附在本消息中,与编号一一对应):\n{listing}\n"
+        f"本剧唯一画风:{payload.get('style') or '以候选图共同呈现的画风为准'}\n"
+        f"必须满足的剧本要求(逐条核对):\n{requirements}\n"
+        f"评分维度(权重递减,总分 100):\n{criteria}\n"
+        "只在这几张之间横向比较;剧本没写的细节属于合理发挥,不得扣分;"
+        "身份/性别/时代错误、画面崩坏、画风不统一、场景图出现人物等硬性违规"
+        "必须记入 violations 并大幅扣分。四张都存在硬性违规时才把 needs_human "
+        "置为 true。confidence 用 0-1 表示自动确认的把握。\n"
+        "只输出一行 JSON:"
+        '{"best_index": 整数, "confidence": 0到1小数, '
+        '"needs_human": true或false, "reason": "一句话理由", '
+        '"scores": [{"index": 整数, "score": 0到100, '
+        '"match": ["符合点"], "violations": ["违规点"]}]}')
+
+
 def build_qc_prompt(payload):
     characters = payload.get("characters") or []
     functional_figures = [
@@ -1613,6 +1647,8 @@ def build_prompt(capability, payload):
             script=json.dumps(payload.get("script", {}), ensure_ascii=False))
     if capability == "image_qc":
         return build_qc_prompt(payload)
+    if capability == "image_select":
+        return build_select_prompt(payload)
     raise ValueError(f"claude 编剧不支持能力: {capability}")
 
 
@@ -1863,6 +1899,9 @@ def _postprocess_and_validate(capability, payload, data):
         data["prop_registry"] = refined_registry
     if capability == "image_qc":
         error = validate_image_qc(data)
+    elif capability == "image_select":
+        from aifos.auto_select import validate_image_select
+        error = validate_image_select(data)
     elif capability == "script" and payload.get("prompt_refine"):
         error = validate_prompt_refine(data)
     elif capability == "script" and payload.get("story_analysis"):

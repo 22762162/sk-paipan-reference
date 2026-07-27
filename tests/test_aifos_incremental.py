@@ -19,17 +19,10 @@ def _stage(summary, name):
 
 
 def _finish(app, title, number):
+    """图片资产自动定版后整集一次跑完。"""
     summary = app.director.produce(title, number)
-    assert summary["status"] == "awaiting_cast"
-    project = app.projects.get_project(title)
-    episode = app.db.query_one(
-        "SELECT * FROM episodes WHERE project_id=? AND number=?",
-        (project["id"], number))
-    script, _ = app.projects.latest_document(episode["id"], "script")
-    for character in script["characters"]:
-        app.director.select_character_candidate(
-            title, number, character["name"], 1)
-    return app.director.produce(title, number)
+    assert summary["status"] == "done"
+    return summary
 
 
 def test_second_run_reuses_everything(app):

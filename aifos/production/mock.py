@@ -259,6 +259,40 @@ class MockProvider(Provider):
                     "max_scope": "current_shot_only"},
                 "reference_adjustments": []}, ""
 
+    # ---- 候选评选:占位版按候选顺序确定性打分(真实评选需 Codex 视觉) ----
+    def _gen_image_select(self, payload, out_dir):
+        candidates = [item for item in (payload.get("candidates") or [])
+                      if isinstance(item, dict) and item.get("index")]
+        if not candidates:
+            return {"best_index": 0, "confidence": 0.0, "needs_human": True,
+                    "reason": "没有可评选的候选图", "scores": []}, ""
+        if "评选必挂" in json.dumps(payload, ensure_ascii=False):
+            return {"best_index": 0, "confidence": 0.0, "needs_human": True,
+                    "reason": "测试触发:四张候选都不符合剧本要求",
+                    "scores": [
+                        {"index": int(item["index"]), "score": 10.0,
+                         "match": [], "violations": ["mock 评选标记触发"]}
+                        for item in candidates]}, ""
+        # 差异轴顺序即基准优先级:基准造型最贴剧本事实,后续差异轴依次递减。
+        scores = [
+            {"index": int(item["index"]),
+             "score": max(40.0, 92.0 - 8.0 * position),
+             "match": [f"{payload.get('subject_name', '资产')}"
+                       f"·{item.get('variant_label') or '候选'}"
+                       "与剧本要求一致"],
+             "violations": []}
+            for position, item in enumerate(
+                sorted(candidates, key=lambda c: int(c["index"])))
+        ]
+        best = max(scores, key=lambda item: (item["score"], -item["index"]))
+        return {"best_index": best["index"], "confidence": 0.75,
+                "needs_human": False,
+                "reason": (
+                    f"占位评选:{payload.get('subject_label') or '图片资产'}"
+                    f"「{payload.get('subject_name') or ''}」按差异轴基准"
+                    f"选中候选{best['index']}"),
+                "scores": scores}, ""
+
     # ---- 剧本:按题材分流(偶像/都市/校园/仙侠) ----
     def _gen_script(self, payload, out_dir):
         if payload.get("story_analysis"):

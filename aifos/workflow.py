@@ -221,12 +221,38 @@ def build_continuity_bible(project, script, profile):
     for index, character in enumerate(script.get("characters", []), 1):
         name = character["name"]
         if is_background_role(character):
+            # 逐镜身份合同要求每个登记出场人物都有明确的性别与年龄段，
+            # 否则判死整集。背景路人剧本里通常不写这两项，但"由模型
+            # 临场猜"正是合同要禁的事；这里由系统按名字确定性地定下
+            # 一个具体值并落进连续性圣经，人工可在人物卡里直接改写。
+            # 路人不建母资产、不跨镜比对，定成哪个值都不影响连续性。
+            extra_gender = str(
+                character.get("gender")
+                or ("男" if sum(ord(ch) for ch in name) % 2 == 0 else "女"))
+            extra_age = str(
+                character.get("age_range") or "青年(20-35岁)")
             characters.append({
                 "name": name,
                 "role": character.get("role", "背景路人"),
                 "background_role": True,
                 "crowd_function": character.get("crowd_function", ""),
+                "gender": extra_gender,
+                "age_range": extra_age,
+                "identity": str(
+                    character.get("identity")
+                    or character.get("crowd_function")
+                    or "本场背景路人"),
+                "identity_source": "system_default_background_extra",
                 "identity_anchor": "仅锁定场次功能与人数；无独立人物设定或身份参考图",
+                # 背景路人不建人物母资产，但仍必须有唯一的可见服装状态：
+                # 缺这一条，逐镜生产合同会因为"缺少当前镜头唯一服装状态"
+                # 直接判死，整集卡在关键帧。路人只锁时代/身份档次，不锁款式。
+                "default_wardrobe": str(
+                    character.get("costume_direction")
+                    or "与本场时代、地域和身份相称的普通常服，"
+                       "不得出现跨时代或现代服饰"),
+                "costume_anchor": "只需符合本场时代与身份档次；不锁具体款式，"
+                                  "不跨镜比对同一路人的衣服细节",
                 "default_position": ["画面左1/3", "画面中", "画面右2/3"][
                     (index - 1) % 3],
             })

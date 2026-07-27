@@ -18,7 +18,8 @@ def app(tmp_path):
     instance.close()
 
 
-def _lock_all(app, title, number):
+def _lock_all(app, title, number, index=1):
+    """人工确认/改选:自动确认之后仍然随时可用。"""
     project = app.projects.get_project(title)
     episode = app.db.query_one(
         "SELECT * FROM episodes WHERE project_id=? AND number=?",
@@ -26,14 +27,12 @@ def _lock_all(app, title, number):
     script, _ = app.projects.latest_document(episode["id"], "script")
     for character in script["characters"]:
         app.director.select_character_candidate(
-            title, number, character["name"], 1)
+            title, number, character["name"], index)
 
 
 def _to_preflight(app, title="万妖图录", number=1):
+    """剧本确认后图片资产自动定版,一路画到开拍门禁。"""
     app.director.produce(title, number, pause_for_confirm=True)
-    cast = app.director.produce(title, number, pause_for_confirm=True)
-    assert cast["status"] == "awaiting_cast"
-    _lock_all(app, title, number)
     return app.director.produce(title, number, pause_for_confirm=True)
 
 
@@ -63,17 +62,28 @@ def test_xianxia_title_is_not_overridden_by_modern_default():
     assert "现代都市" not in style
 
 
-def test_script_confirm_pauses_before_video(app):
-    """人物四选一后才画场景/分镜/首尾帧,再停等开拍。"""
+def test_script_confirm_starts_assets_and_auto_confirms(app):
+    """剧本确认后立即生产图片资产:每组四张 → CODEX 评选 → 自动确认一张,
+    不再停在人工四选一,直接画到开拍门禁。"""
     app.director.produce("万妖图录", 1, pause_for_confirm=True)
     summary = app.director.produce("万妖图录", 1, pause_for_confirm=True)
-    assert summary["status"] == "awaiting_cast"
-    project = app.projects.get_project("万妖图录")
-    assert len(app.assets.list(project["id"], "character_candidate")) >= 5
-    assert app.assets.list(project["id"], "scene_art") == []
-    _lock_all(app, "万妖图录", 1)
-    summary = app.director.produce("万妖图录", 1, pause_for_confirm=True)
     assert summary["status"] == "awaiting_confirm"
+    project = app.projects.get_project("万妖图录")
+    assert len(app.assets.list(project["id"], "character_candidate")) >= 4
+    assert len(app.assets.list(project["id"], "scene_candidate")) >= 4
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    auto, _ = app.projects.latest_document(
+        episode["id"], "cast_auto_selection")
+    assert auto["auto_confirmed"] >= 1
+    assert auto["pending"] == 0
+    selection, _ = app.projects.latest_document(
+        episode["id"], "cast_selection")
+    assert selection["passed"] is True
+    assert selection["asset_locked"] == selection["asset_total"]
+    assert all(item["selection_source"] == "auto_codex"
+               for item in selection["characters"])
     stages = [s["stage"] for s in summary["stages"]]
     assert stages == [
         "script", "continuity", "cast", "storyboard", "blocking", "images",
@@ -140,8 +150,7 @@ def test_provided_script_pauses_for_story_analysis(app):
     assert analysis["prompt_bible"]["keyframe_prefix"]
     summary = app.director.produce(
         "万妖图录", 9, pause_for_confirm=True)
-    assert summary["status"] == "awaiting_cast"
-    _lock_all(app, "万妖图录", 9)
+    assert summary["status"] == "awaiting_confirm"
     summary = app.director.produce(
         "万妖图录", 9, pause_for_confirm=True)
     assert summary["status"] == "awaiting_confirm"
@@ -182,9 +191,7 @@ def test_imported_novel_is_writer_adapted_before_any_image(app):
 
 def test_cast_art_reused_across_episodes(app):
     first = app.director.produce("万妖图录", 1)
-    assert first["status"] == "awaiting_cast"
-    _lock_all(app, "万妖图录", 1)
-    app.director.produce("万妖图录", 1)
+    assert first["status"] == "done"
     project = app.projects.get_project("万妖图录")
     first_arts = {r["name"]: r["uri"]
                   for r in app.assets.list(project["id"], "character_art")}
@@ -211,22 +218,15 @@ def test_cli_review_and_confirm(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 0
     assert "剧本已确认" in out
-    assert "人物/道具待选" in out
-    # 人工定角门禁:未选不能继续。
-    assert main(["--workspace", ws, "confirm", "--project", "万妖图录",
-                 "--episode", "1"]) == 1
-    assert "尚未全部选定" in capsys.readouterr().err
+    # 剧本确认即开始生产图片资产，CODEX 评选自动确认后直接停在开拍门禁
+    assert "图片资产" in out
+    assert "待确认" in out
+    # 自动确认之后人工仍可改选并重新确认
     locked = App(ws)
     try:
         _lock_all(locked, "万妖图录", 1)
     finally:
         locked.close()
-    # 第二停:人物已定版，完成预生产 → 再确认开拍
-    code = main(["--workspace", ws, "confirm", "--project", "万妖图录",
-                 "--episode", "1"])
-    out = capsys.readouterr().out
-    assert code == 0
-    assert "待确认" in out
     code = main(["--workspace", ws, "confirm", "--project", "万妖图录",
                  "--episode", "1"])
     out = capsys.readouterr().out
@@ -245,11 +245,13 @@ def test_stop_lands_back_to_reviewable_state(app):
     app.projects.set_episode_status(episode["id"], "cancelling")
     summary = app.director.produce("停一下", 1, pause_for_confirm=True)
     assert summary["status"] == "awaiting_script"
-    # 人物候选已生成 → 停止后落回人物选择。
+    # 候选已生成但自动确认关闭 → 停止后落回人物/道具/场景定版。
+    app.config.data["defaults"]["auto_select_candidates"] = False
     app.director.produce("停一下", 1, pause_for_confirm=True)
     app.projects.set_episode_status(episode["id"], "cancelling")
     summary = app.director.produce("停一下", 1)
     assert summary["status"] == "awaiting_cast"
+    app.config.data["defaults"]["auto_select_candidates"] = True
     _lock_all(app, "停一下", 1)
     # 预生产门禁已过 → 停止后落回开拍确认
     app.director.produce("停一下", 1, pause_for_confirm=True)
@@ -306,7 +308,8 @@ def test_render_plan_lists_every_image_with_prompt(app):
     plan = _plan_of(app, "万妖图录", 1)
     cats = {i["category"] for i in plan["items"]}
     assert cats == {"character_candidate", "character_art",
-                    "character_sheet", "scene_art", "shot_image", "frames"}
+                    "character_sheet", "scene_candidate", "scene_art",
+                    "shot_image", "frames"}
     assert all(i["prompt"] for i in plan["items"])
     assert all(i["status"] in ("done", "reused") for i in plan["items"])
     # 现画的图都有单张耗时(前端据此估算剩余时间)

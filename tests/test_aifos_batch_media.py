@@ -15,7 +15,8 @@ def test_batch_cli(tmp_path, capsys):
                  "--from", "1", "--to", "2"])
     out = capsys.readouterr().out
     assert code == 0
-    assert out.count("人物/道具待选") >= 2
+    # 图片资产自动定版后整集跑完，批量命令直接给出完成状态
+    assert out.count("完成") >= 2
     assert main(["--workspace", ws, "batch", "万妖图录",
                  "--from", "3", "--to", "2"]) == 2
 

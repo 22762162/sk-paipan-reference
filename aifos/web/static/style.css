@@ -1658,6 +1658,30 @@ button.canvas-stage-item:hover, button.canvas-stage-item:focus-visible {
 .cast-look.legacy span { color: var(--ink-2); font-size: 11px; line-height: 1.45; }
 .cast-pick { min-height: 44px; margin-top: auto; }
 .cast-pick.selected { color: var(--good); border-color: var(--good); }
+.scene-pick, .prop-pick { min-height: 44px; margin-top: auto; }
+/* CODEX 评选自动确认的说明条:一眼分清哪组是机器定的、哪组是人工改的 */
+.cast-auto-note { display: grid; gap: 3px; margin-bottom: 12px; padding: 9px 11px; border-radius: 10px; background: rgba(90, 140, 250, .12); border: 1px solid rgba(90, 140, 250, .3); }
+.cast-auto-note b { color: var(--accent); font-size: 12px; }
+.cast-auto-note span { color: var(--ink-2); font-size: 11px; line-height: 1.5; }
+.cast-auto-note.human { background: rgba(12, 163, 12, .1); border-color: rgba(12, 163, 12, .3); }
+.cast-auto-note.human b { color: var(--good); }
+.cast-auto-pending { margin: 0 16px 12px; padding: 10px 12px; border-radius: 10px; background: rgba(250, 178, 25, .12); border: 1px solid rgba(250, 178, 25, .35); }
+.cast-auto-pending b { color: var(--warning); font-size: 12px; }
+.cast-auto-pending ul { margin: 6px 0 0; padding-left: 18px; color: var(--ink-2); font-size: 11px; line-height: 1.6; }
+.confirm-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+/* 分镜画面按需多版:默认每镜1张,不满意时才现要 1-4 张备选 */
+.shot-candidate-box { display: grid; gap: 10px; }
+.shot-candidate-ask { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.shot-candidate-ask .dim { flex: 1 0 100%; font-size: 11px; }
+.shot-candidate-ask input { flex: 1 1 150px; min-width: 0; }
+.shot-candidate-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.shot-candidate { border: 2px solid var(--hairline); border-radius: 10px; overflow: hidden; background: var(--surface-2); display: flex; flex-direction: column; }
+.shot-candidate.recommended { border-color: var(--accent); }
+.shot-candidate.selected { border-color: var(--good); box-shadow: 0 0 0 3px rgba(12, 163, 12, .18); }
+.shot-candidate-foot { padding: 8px; display: grid; gap: 6px; }
+.shot-candidate-tip { color: var(--accent); font-size: 10px; line-height: 1.45; }
+.shot-candidate-tip.dim { color: var(--ink-3); }
+.shot-candidate-pick { min-height: 36px; }
 
 @media (max-width: 760px) {
   .cast-selection-list { padding: 10px; }

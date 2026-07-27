@@ -12,7 +12,8 @@
   }
 
 支持能力:prompt_review(生图前提示词审核优化)、image(镜头关键图)、
-frames(首尾帧)、cover(封面)。
+frames(首尾帧)、cover(封面)、image_qc(视觉质检)、
+image_select(一组四张候选的评选与自动确认)。
 说明:这是通用出图桥;若你的 Codex 工作流有专门的出图技能/脚本,
 把 build_instruction 中的指令替换为对应调用即可。
 """
@@ -27,6 +28,7 @@ import sys
 import threading
 from pathlib import Path
 
+from aifos.auto_select import validate_image_select
 from aifos.generation_diagnostics import normalize_generation_diagnostics
 from aifos.adapters.claude_script import validate_image_qc
 from aifos.prompt_contract import readable_text_required, sanitize_text_whitelist
@@ -263,6 +265,60 @@ def _screen_prop_rule(prompt_text, text_asset=None):
         "屏幕内页面，电脑金属外壳、人物、服装、场景、构图和光线保持不变；"
         "屏幕外仍禁止字幕、Logo、水印和无关文字。"
     )
+
+
+def _build_select_instruction(payload):
+    """一组四张候选的 CODEX 评选:只读图、只打印结论,不产出任何文件。"""
+    subject = payload.get("subject_label") or "图片资产"
+    name = payload.get("subject_name") or ""
+    candidates = [item for item in (payload.get("candidates") or [])
+                  if isinstance(item, dict) and item.get("uri")]
+    listing = "\n".join(
+        f"  候选{item.get('index')}:{item.get('uri')}"
+        f"(差异轴={item.get('variant_label') or '未标注'}"
+        + (f"/{item.get('variant_focus')}"
+           if item.get("variant_focus") else "")
+        + ")"
+        for item in candidates)
+    requirements = "\n".join(
+        f"  - {line}" for line in (payload.get("requirements") or [])
+    ) or "  - 全部要求以正式剧本与本剧唯一画风为准"
+    criteria = "\n".join(
+        f"  {i}. {line}"
+        for i, line in enumerate(payload.get("criteria") or [], start=1)
+    ) or "  1. 与剧本要求的符合度"
+    instruction = (
+        f"你是漫剧图片资产评选员。本次要为{subject}「{name}」从同一组候选中"
+        "选出最符合本剧本要求的一张,选中后系统会自动确认为该资产的定版母图,"
+        "后续全部镜头都以它为身份/视觉锚点,请按定版标准严格评选。\n"
+        "用你的视觉能力逐张真实打开下列图片文件(可直接读取路径),"
+        "看不到文件或无法判断时该张记 0 分并在 violations 写明原因:\n"
+        f"{listing}\n"
+        f"- 本剧唯一画风:{payload.get('style') or '以候选图共同呈现的画风为准'}\n"
+        f"- 作品/集数:《{payload.get('project_title') or '未命名'}》"
+        f"第{payload.get('episode_number') or 0}集"
+        + (f";本集梗概:{payload.get('premise')}" if payload.get("premise")
+           else "") + "\n"
+        f"- 本资产必须满足的剧本要求(逐条核对):\n{requirements}\n"
+        f"- 评分维度(按顺序权重递减,总分 100):\n{criteria}\n"
+        "评选规则:只在这几张候选之间横向比较,不要求它们达到理想状态;"
+        "剧本没写的细节属于合理发挥,不得当成扣分项;出现硬性违规"
+        "(身份/性别/时代错误、画面崩坏、画风不统一、场景图里出现人物)"
+        "的候选必须记入 violations 并大幅扣分。best_index 必须是你实际"
+        "打开并评分过的候选编号。只有当四张都存在硬性违规、无法定版时,"
+        "才把 needs_human 置为 true 交人工处理。confidence 用 0-1 表示"
+        "你对这次自动确认的把握:第一名明显领先给 0.8 以上,"
+        "与第二名难分伯仲给 0.5 以下。\n"
+        "只在标准输出打印一行 JSON,不要产出任何文件,不要多余文字:"
+        '{"best_index": 选中的候选编号整数, '
+        '"confidence": 0到1之间的小数, '
+        '"needs_human": true或false, '
+        '"reason": "一句话说明为什么这张最符合本剧本要求", '
+        '"scores": [{"index": 候选编号整数, "score": 0到100的分数, '
+        '"match": ["符合剧本要求的具体点"], '
+        '"violations": ["硬性违规或扣分点"]}]}'
+    )
+    return instruction, [], {"select": True}
 
 
 def build_instruction(capability, payload, out_dir):
@@ -703,6 +759,8 @@ def build_instruction(capability, payload, out_dir):
             + '}'
         )
         return instruction, [], {"qc": True}
+    if capability == "image_select":
+        return _build_select_instruction(payload)
     if capability == "cover":
         target = out_dir / "cover.png"
         cover_prompt = str(
@@ -921,6 +979,17 @@ def run(request, codex, timeout, extra_args, plain=False):
             verdict, issues=verdict.get("issues")))
         return {"ok": True, "data": verdict, "uri": "",
                 "model": "Codex 视觉质检"}
+    if capability == "image_select":
+        # 评选失败一律 ok:false,交路由回退下一路;全部不可用时导演中心
+        # 保留人工四选一门禁,绝不凭猜测自动确认。
+        verdict = _extract_json(proc.stdout)
+        if verdict is None:
+            return {"ok": False, "error": "codex 未返回可解析的候选评选 JSON"}
+        error = validate_image_select(verdict)
+        if error:
+            return {"ok": False, "error": f"codex 候选评选结构无效: {error}"}
+        return {"ok": True, "data": verdict, "uri": "",
+                "model": "Codex 视觉评选"}
     missing = [str(t) for t in targets if not t.exists()]
     if missing:
         return {"ok": False,

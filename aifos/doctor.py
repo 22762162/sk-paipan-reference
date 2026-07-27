@@ -120,6 +120,9 @@ _HINTS = {
              "--enable --appid … --api-key …",
     "edit": "pip3 install pyJianYingDraft 并在设置里启用「剪映草稿」:"
             "剪辑后草稿自动进剪映,打开剪映导出即可",
+    "image_select": "一组四张候选的自动确认由 CODEX 视觉评选主导:"
+                    "接 Codex CLI(detect)或 Claude;未接入时评选不下判断，"
+                    "候选会停在人工四选一",
 }
 
 

@@ -97,17 +97,10 @@ def _make_app(tmp_path, binary, extra=None):
 
 
 def _lock_cast_and_continue(app, title, number):
+    """图片资产由 CODEX 评选自动确认，整集一次跑完。"""
     summary = app.director.produce(title, number)
-    assert summary["status"] == "awaiting_cast"
-    project = app.projects.get_project(title)
-    episode = app.db.query_one(
-        "SELECT * FROM episodes WHERE project_id=? AND number=?",
-        (project["id"], number))
-    script, _ = app.projects.latest_document(episode["id"], "script")
-    for character in script["characters"]:
-        app.director.select_character_candidate(
-            title, number, character["name"], 1)
-    return app.director.produce(title, number)
+    assert summary["status"] == "done"
+    return summary
 
 
 def test_frames2video_command_shape(tmp_path, fake_dreamina):

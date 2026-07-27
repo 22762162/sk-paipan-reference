@@ -25,18 +25,15 @@ def app(tmp_path):
 
 
 def _to_preflight(app, title="万妖图录", number=1, finish=False):
-    summary = app.director.produce(title, number)
-    assert summary["status"] == "awaiting_cast"
-    project = app.projects.get_project(title)
-    episode = app.db.query_one(
-        "SELECT * FROM episodes WHERE project_id=? AND number=?",
-        (project["id"], number))
-    script, _ = app.projects.latest_document(episode["id"], "script")
-    for character in script["characters"]:
-        app.director.select_character_candidate(
-            title, number, character["name"], 1)
-    return app.director.produce(
-        title, number, pause_for_confirm=not finish)
+    """剧本确认后图片资产自动定版；finish=True 时直接跑完整集。"""
+    if finish:
+        summary = app.director.produce(title, number)
+        assert summary["status"] == "done"
+        return summary
+    app.director.produce(title, number, pause_for_confirm=True)
+    summary = app.director.produce(title, number, pause_for_confirm=True)
+    assert summary["status"] == "awaiting_confirm"
+    return summary
 
 
 def test_import_character_art(app):
@@ -51,7 +48,8 @@ def test_import_character_art(app):
     result = app.director.import_image(
         "万妖图录", 1, {"kind": "character_art", "name": name}, PNG, ".png")
     row = app.assets.latest(project["id"], "character_art", name)
-    assert row["version"] == 1
+    # v1 是 CODEX 评选自动确认的立绘，人工上传覆盖为 v2(旧版本仍保留)
+    assert row["version"] == 2
     assert json.loads(row["meta"])["uploaded"] is True
     identity = app.assets.latest(project["id"], "character_identity", name)
     assert json.loads(identity["meta"])["locked"] is True

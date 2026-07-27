@@ -18,6 +18,11 @@ DEFAULTS = {
         "aspect": "9:16",              # 全局默认画幅(抖音竖屏);项目可设 16:9
         # Seedance 逐镜视频默认 4 路并行；可在设置页按账号限流调低/调高。
         "parallel_videos": 4,
+        # 剧本确认后开始生产图片资产:每组画面 4 张候选,由 CODEX 主导的
+        # 视觉评选自动确认其中一张;关掉即退回全人工四选一。
+        "auto_select_candidates": True,
+        # 评选置信度低于该阈值不自动确认,留给人工定版。
+        "auto_select_min_confidence": 0.6,
     },
     # Codex 多实例不注册成多个 Provider，避免破坏现有 routing。旧工作区
     # 没有 profiles 时会自动把 providers.codex 映射成一个兼容 profile；
@@ -90,7 +95,8 @@ DEFAULTS = {
         "claude": {
             # 经 aifos.adapters.claude_script 桥接 claude -p 实际编剧
             "type": "cli", "enabled": False,
-            "capabilities": ["script", "storyboard", "image_qc"],
+            "capabilities": ["script", "storyboard", "image_qc",
+                             "image_select"],
             "command": ["python3", "-m", "aifos.adapters.claude_script",
                         "--claude", "claude"],
             "reference_images": True,
@@ -102,6 +108,7 @@ DEFAULTS = {
             "type": "cli", "enabled": False,
             "capabilities": [
                 "prompt_review", "image", "frames", "cover", "image_qc",
+                "image_select",
             ],
             "command": ["python3", "-m", "aifos.adapters.codex_image",
                         "--codex", "codex"],
@@ -132,7 +139,8 @@ DEFAULTS = {
         "claude_api": {
             # Claude 官方 API 直连(Messages API):Claude CLI 的 API 模式
             "type": "claude_api", "enabled": False,
-            "capabilities": ["script", "storyboard", "image_qc"],
+            "capabilities": ["script", "storyboard", "image_qc",
+                             "image_select"],
             "endpoint": "https://api.anthropic.com", "api_key": "",
             "model": "claude-opus-4-8", "max_tokens": 16000,
             "reference_images": True,
@@ -198,7 +206,8 @@ DEFAULTS = {
         },
         "mock": {
             "type": "mock", "enabled": True,
-            "capabilities": ["script", "storyboard", "image_qc", "image", "frames",
+            "capabilities": ["script", "storyboard", "image_qc",
+                             "image_select", "image", "frames",
                              "video", "voice", "edit", "cover"],
             "reference_images": True,
             "cost_per_call": 0.1,
@@ -211,6 +220,9 @@ DEFAULTS = {
         "prompt_review": ["codex"],
         "script": ["claude", "claude_api", "mock"],
         "image_qc": ["codex", "image_api", "claude", "claude_api", "mock"],
+        # 一组四张候选的评选与自动确认:CODEX 主导,视觉评选失败逐级回退,
+        # 全部不可用时导演中心保留人工四选一门禁。
+        "image_select": ["codex", "claude", "claude_api", "mock"],
         "storyboard": ["claude", "claude_api", "mock"],
         "image": ["codex", "image_api", "api", "mock"],
         "frames": ["codex", "image_api", "mock"],
@@ -581,9 +593,13 @@ def _normalize_legacy(data):
     for name in ("claude", "claude_api"):
         conf = providers.get(name)
         caps = conf.get("capabilities") if isinstance(conf, dict) else None
-        if isinstance(caps, list) and "script" in caps \
-                and "image_qc" not in caps:
-            caps.append("image_qc")
+        if isinstance(caps, list) and "script" in caps:
+            if "image_qc" not in caps:
+                caps.append("image_qc")
+            # 候选评选是后加的能力:旧工作区保存过 capabilities 列表,
+            # 不补齐就永远路由不到真实产线,只能落回 mock 占位评选。
+            if "image_select" not in caps:
+                caps.append("image_select")
     for name in ("codex", "image_api"):
         conf = providers.get(name)
         caps = conf.get("capabilities") if isinstance(conf, dict) else None
@@ -593,14 +609,20 @@ def _normalize_legacy(data):
         if name == "codex" and isinstance(caps, list) \
                 and "image" in caps and "prompt_review" not in caps:
             caps.append("prompt_review")
+    codex_caps = (providers.get("codex") or {}).get("capabilities")
+    if isinstance(codex_caps, list) and "image" in codex_caps \
+            and "image_select" not in codex_caps:
+        codex_caps.append("image_select")
     routing = data.setdefault("routing", {})
     if "prompt_review" not in routing:
         routing["prompt_review"] = ["codex"]
     mock_conf = providers.get("mock")
     mock_caps = (mock_conf.get("capabilities")
                  if isinstance(mock_conf, dict) else None)
-    if isinstance(mock_caps, list) and "image_qc" not in mock_caps:
-        mock_caps.append("image_qc")
+    if isinstance(mock_caps, list):
+        for capability in ("image_qc", "image_select"):
+            if capability not in mock_caps:
+                mock_caps.append(capability)
     if not remove:
         return data
     providers.pop("say", None)
