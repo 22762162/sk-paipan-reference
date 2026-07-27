@@ -600,14 +600,14 @@ REFERENCE_ROLES = {
 STUDIO_ASSET_TYPES = {
     "character": {
         "label": "人物形象",
-        "hint": "自己命名任意角色;镜头出现同名角色时自动作为身份参考",
+        "hint": "自己命名任意角色;剧本出现同名角色时自动作为定妆与设定图的身份参考",
         "reference_role": "identity",
         "aspect": "9:16",
         "attach_defaults_to_name": True,
     },
     "style": {
         "label": "画风基准",
-        "hint": "只控制媒介、色调与质感;不绑定人物,可全项目通用",
+        "hint": "只控制媒介、色调与质感;不绑定人物,全项目通用,视频参考自动带上",
         "reference_role": "style",
         "aspect": "16:9",
         "attach_defaults_to_name": False,
