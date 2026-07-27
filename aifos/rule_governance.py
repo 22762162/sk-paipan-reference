@@ -125,6 +125,57 @@ MANDATORY_GATE_IDS = {
 
 ADVISORY_GATE_IDS = {"performance", "camera"}
 
+PROMPT_ADJUDICATION_SCHEMA = "aifos.prompt-adjudication/v1"
+
+# 审核上下文常见字段 → 唯一优先级六级的归属。审核据此对并列冲突
+# 直接取高层级执行,不再把"两条事实同时出现"当成需要猜测的死局。
+CONTEXT_FIELD_PRECEDENCE = {
+    "user_locked_fact": (
+        "identity_references", "reference_manifest", "locked_identity",
+        "user_locked_fields", "manual_revision", "feedback"),
+    "episode_fact_bible": (
+        "story_world", "story_background", "character_background",
+        "characters", "identity_lock", "prop_facts", "style", "era"),
+    "shot_local_contract": (
+        "action", "camera", "location", "start_state", "end_state",
+        "composition", "composition_contract", "prompt_contract",
+        "readable_text", "frame_kind", "shot_no", "scene_no",
+        "functional_figures", "character_count",
+        "initial_character_state", "variant_axis"),
+    "episode_standard_and_policy": (
+        "image_task_class", "image_quality", "aspect",
+        "candidate_policy", "source_precedence"),
+}
+
+
+def prompt_adjudication_clause():
+    """统一冲突裁决条款:提示词审核遇到并列事实时的执行版优先级。
+
+    《雨夜凶杀》连续熔断的共同病理是"多份事实源各说各话、无人裁决";
+    审核最后一次的阻断原因甚至明写「现有事实源直接冲突且无优先级
+    条款」。裁决标准其实一直存在(RULE_PRECEDENCE),只是从未随审核
+    请求送达——本函数就是把宪法送到法官手里的那份文书。
+    """
+    levels = "；".join(
+        f"{index}.{rule['label']}"
+        for index, rule in enumerate(RULE_PRECEDENCE, 1))
+    return {
+        "schema": PROMPT_ADJUDICATION_SCHEMA,
+        "policy": (
+            "事实并列冲突时禁止靠猜,但必须先按本条裁决,而不是直接阻断:"
+            "(a) 上下文中写明「优先级最高/本条优先」的显式裁决条款"
+            "(如 master_state_precedence、text_policy),是平台对该任务的"
+            "既定裁决,直接执行,不算冲突;"
+            "(b) 其余并列冲突按唯一优先级取高层级事实执行,低层级只能"
+            f"补缺不得覆盖:{levels};"
+            "(c) 只有同一层级内两条事实互斥、且没有任何显式裁决条款时,"
+            "才允许 approved=false,并在阻断原因里写明是哪两条同级事实、"
+            "各自出处——不得再以「无优先级条款」为由阻断。"),
+        "field_precedence": {
+            level: list(fields)
+            for level, fields in CONTEXT_FIELD_PRECEDENCE.items()},
+    }
+
 
 def default_rule_governance():
     return {

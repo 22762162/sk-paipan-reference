@@ -55,4 +55,42 @@ def test_reviewer_may_follow_explicit_precedence_instead_of_blocking():
         "prompt_review",
         {"review_prompt": "母版", "review_context": {}}, "/tmp")
     assert "master_state_precedence" in instruction
-    assert "不算需要猜测的冲突" in instruction
+    assert "事实源冲突本身不再是阻断理由" in instruction
+
+
+# ---- 全局冲突裁决条款:宪法必须送到法官手里 ----
+def test_adjudication_clause_carries_all_six_levels():
+    from aifos.rule_governance import (
+        RULE_PRECEDENCE, prompt_adjudication_clause)
+    clause = prompt_adjudication_clause()
+    for rule in RULE_PRECEDENCE:
+        assert rule["label"] in clause["policy"]
+    assert "不得再以「无优先级条款」为由阻断" in clause["policy"]
+    # 字段层级对照必须覆盖审核上下文的关键字段
+    fp = clause["field_precedence"]
+    assert "identity_references" in fp["user_locked_fact"]
+    assert "story_world" in fp["episode_fact_bible"]
+    assert "action" in fp["shot_local_contract"]
+
+
+def test_every_review_payload_carries_adjudication():
+    """所有图片审核请求统一携带裁决条款与必留词。"""
+    from aifos.production.router import ProviderRouter
+    router = ProviderRouter.__new__(ProviderRouter)
+    payload = {"prop_name": "旧靛青举人青袍", "characters": ["林川"]}
+    review = router._build_review_payload(
+        "核心道具「旧靛青举人青袍」,林川的青袍", {"style": "写实"}, payload)
+    assert review["adjudication"]["schema"] == "aifos.prompt-adjudication/v1"
+    assert "旧靛青举人青袍" in review["must_keep_verbatim"]
+    assert "林川" in review["must_keep_verbatim"]
+
+
+def test_reviewer_instruction_renders_adjudication_block():
+    from aifos.rule_governance import prompt_adjudication_clause
+    instruction, _t, _d = build_instruction(
+        "prompt_review",
+        {"review_prompt": "p", "review_context": {},
+         "adjudication": prompt_adjudication_clause()}, "/tmp")
+    assert "【冲突裁决规则】" in instruction
+    assert "同级互斥" in instruction          # 只有同级才允许阻断
+    assert "用户已锁定" in instruction        # 最高级在场

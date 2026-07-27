@@ -329,6 +329,28 @@ class ProviderRouter:
             },
         }
 
+    def _build_review_payload(self, source, context, payload):
+        """审核请求 = 提示词 + 事实上下文 + 必留词 + 统一裁决条款。
+
+        必留词:下游派发合同会逐字校验这些词,审核不知道就会把
+        「旧靛青举人青袍」优化成「青袍」后卡死——先说清楚再校验。
+        裁决条款:事实并列冲突时按治理优先级执行,不得再以
+        「无优先级条款」为由整批熔断(rule_governance 是唯一事实源)。
+        """
+        from ..rule_governance import prompt_adjudication_clause
+        required_tokens = self._prompt_review_required_tokens(source, payload)
+        return {
+            "review_schema": self.PROMPT_REVIEW_SCHEMA,
+            "review_prompt": source,
+            "review_context": context,
+            "must_keep_verbatim": required_tokens,
+            "must_keep_policy": (
+                "must_keep_verbatim 中的每一项都是下游合同逐字校验的"
+                "不可变事实,优化稿必须原样保留(可另加修饰,但不得改写、"
+                "缩写、拆分或删除);删除任何一项都会导致整张图被拒绝生成"),
+            "adjudication": prompt_adjudication_clause(),
+        }
+
     @staticmethod
     def _prompt_review_required_tokens(source, payload):
         tokens = []
@@ -442,20 +464,7 @@ class ProviderRouter:
         if not ok:
             raise ProviderUnavailable(
                 "真实图片已被阻止：Codex提示词审核不可用：" + reason)
-        # 下游派发合同会逐字校验这些词。此前审核从未被告知它们不可
-        # 改写,于是把「旧靛青举人青袍」优化成「青袍」,合同随即判定
-        # "提示词没有明确写出对象"并卡死——先说清楚,再校验。
-        required_tokens = self._prompt_review_required_tokens(source, payload)
-        review_payload = {
-            "review_schema": self.PROMPT_REVIEW_SCHEMA,
-            "review_prompt": source,
-            "review_context": context,
-            "must_keep_verbatim": required_tokens,
-            "must_keep_policy": (
-                "must_keep_verbatim 中的每一项都是下游合同逐字校验的"
-                "不可变事实,优化稿必须原样保留(可另加修饰,但不得改写、"
-                "缩写、拆分或删除);删除任何一项都会导致整张图被拒绝生成"),
-        }
+        review_payload = self._build_review_payload(source, context, payload)
         profile_id = str(
             payload.get("_prompt_review_profile")
             or payload.get("_codex_profile") or "").strip()
