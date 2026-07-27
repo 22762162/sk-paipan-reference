@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import re
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -4206,6 +4207,90 @@ class Director:
         })
         return report, cost
 
+    # 连抽选优:单抽命中率 p 时 N 抽至少一中 = 1-(1-p)^N。
+    # 按重要度分档,普通批量不加抽;首个通过即停,期望成本 ≈ 1/p 抽。
+    DEFAULT_IMAGE_GACHA = {
+        "batch": 1, "important": 2, "final": 3, "complex_text": 3}
+
+    def _gacha_pulls(self, payload):
+        table = self.config.get(
+            "defaults", "image_gacha", default=None) or {}
+        task_class = str((payload or {}).get("image_task_class") or "")
+        default = self.DEFAULT_IMAGE_GACHA.get(task_class, 1)
+        try:
+            pulls = int(table.get(task_class, default))
+        except (TypeError, ValueError, AttributeError):
+            pulls = default
+        return max(1, min(pulls, 4))
+
+    def _generate_image_gacha(self, capability, payload, out_dir,
+                              cancel, qc_spec):
+        """连抽选优:重要/终稿类多次完整生成+质检,首个通过即采纳。
+
+        全部未过时恢复得分最高的一张(canonical 路径),交由既有的
+        人工问题清单/定向修图流程;各抽成本累加进最终结果,不漏账。
+        只对 capability=image 生效;frames 成对首尾另有连续性语义。
+        """
+        pulls = self._gacha_pulls(payload)
+        if (pulls <= 1 or capability != "image"
+                or not qc_spec or not self._image_qc_enabled()):
+            return self._generate_image_with_qc(
+                capability, payload, out_dir, cancel, qc_spec)
+        best = None                    # (score, result, snapshot)
+        snapshots = []
+        previous_cost = 0.0
+        for pull in range(1, pulls + 1):
+            result = self._generate_image_with_qc(
+                capability, copy.deepcopy(payload), out_dir, cancel,
+                qc_spec)
+            report = getattr(result, "qc", None) or {}
+            result.cost += previous_cost
+            if report.get("passed"):
+                for snap in snapshots:
+                    try:
+                        snap.unlink()
+                    except OSError:
+                        pass
+                if pull > 1:
+                    self.log.info(
+                        "director",
+                        f"连抽第{pull}抽通过质检,采纳并结束本镜抽取")
+                return result
+            previous_cost = float(result.cost or 0.0)
+            uri = str(result.uri or "")
+            score = float(report.get("score") or 0.0)
+            if uri and Path(uri).exists() and pull < pulls:
+                snap = Path(uri).with_name(
+                    Path(uri).stem + f".gacha{pull}" + Path(uri).suffix)
+                try:
+                    shutil.copy2(uri, snap)
+                    snapshots.append(snap)
+                    if best is None or score > best[0]:
+                        best = (score, result, snap)
+                except OSError:
+                    pass
+            elif best is None or score > (best[0] if best else -1):
+                best = (score, result, None)
+        # 全部未过:恢复得分最高的一张到 canonical 路径
+        final_score, final_result, final_snap = best if best else (
+            0.0, result, None)
+        if final_snap is not None and final_snap.exists():
+            try:
+                shutil.copy2(final_snap, final_result.uri)
+            except OSError:
+                pass
+        for snap in snapshots:
+            try:
+                snap.unlink()
+            except OSError:
+                pass
+        final_result.cost = previous_cost
+        self.log.info(
+            "director",
+            f"连抽{pulls}张均未过质检,保留得分最高({final_score:.0f})"
+            "的一张进入人工/修图流程")
+        return final_result
+
     def _generate_image_with_qc(self, capability, payload, out_dir,
                                 cancel, qc_spec):
         """出图 + 视觉质检 + 不合格自动重画(worker 线程安全:只调产线)。
@@ -4621,7 +4706,7 @@ class Director:
         self._plan_mark(ctx, task["item_id"], "generating",
                         extra=generating_extra)
         try:
-            result = self._generate_image_with_qc(
+            result = self._generate_image_gacha(
                 task["capability"], task["payload"],
                 ctx["out_root"] / task["sub_dir"],
                 lambda: self._cancel_requested(ctx), task.get("qc_spec"))
