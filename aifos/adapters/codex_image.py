@@ -56,6 +56,22 @@ CHARACTER_BACKGROUND_DIRECTIVE = (
     "道具和其他人物。若角色有职业身份，必须穿真实可辨认的工作服或制服，"
     "不得用普通便服代替。")
 
+# 资产工坊四类自建资产的单一职责约束:防止「画个场景」返回一张剧照、
+# 「画件道具」返回一个人举着它。用户提示词仍是唯一内容事实源。
+STUDIO_ASSET_RULES = {
+    "character": (
+        "这是人物形象母资产:单人全身或半身立绘,纯净无场景背景"
+        "(纯色、柔和渐变或干净棚拍底),不出现第二个人、文字和多余道具;"),
+    "style": (
+        "这是画风基准图:只表达媒介、笔触、色调、光影和材质质感,"
+        "不绑定具体人物身份,不写文字、不做拼图色卡分格;"),
+    "scene": (
+        "这是场景概念图:只画空间与陈设,画面中不出现任何人物;"),
+    "prop": (
+        "这是单件物品母资产:只画该物品本体,居中单体展示,"
+        "不画人物、不画使用场景故事;"),
+}
+
 GEN_DIRECTIVE = (
     "收到任务后第一步立即调用内置 $imagegen 图像生成能力，不要搜索资料、"
     "解释方案或编写绘图代码。你必须真实生成图片;禁止用 Pillow / "
@@ -345,6 +361,20 @@ def build_instruction(capability, payload, out_dir):
     if capability == "image":
         safe = "".join(c if c.isalnum() else "_"
                        for c in str(payload.get("art_name", "")))[:40]
+        if payload.get("studio_asset"):
+            # 资产工坊:用户自建资产库。提示词由用户自己写或 AI 代写,
+            # 已是唯一事实源;这里只负责真实出图与单一职责约束。
+            kind = str(payload.get("studio_asset"))
+            target = out_dir / f"studio_{kind}_{safe}.png"
+            instruction = (
+                f"生成一张{payload.get('studio_asset_label', '资产')}图片并保存到"
+                f" {target}(PNG,{size})。{prompt_text}。"
+                f"{STUDIO_ASSET_RULES.get(kind, '')}"
+                "这张图会进入用户的资产库并在后续制作中作为参考图复用,"
+                "必须干净可复用:不加字幕条、水印、Logo、边框和拼图分格。"
+                f"{_ref_line(payload)}{common}只产出该文件。")
+            return instruction, [target], {
+                "name": payload.get("art_name"), "studio_asset": kind}
         if payload.get("prop_candidate"):
             target = out_dir / f"prop_{safe}.png"
             instruction = (

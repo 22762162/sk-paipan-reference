@@ -593,6 +593,63 @@ REFERENCE_ROLES = {
     "identity", "wardrobe", "scene", "composition", "style", "manual",
     "inner_persona",
 }
+
+# 资产工坊:用户自建资产库。名称完全由用户决定,不需要剧本里存在这个角色;
+# 产物登记为 reference 资产,后续制作按 用途(role)+关联对象(attach_to)
+# 自动进入对应任务,或在参考图选择器里手动调用。
+STUDIO_ASSET_TYPES = {
+    "character": {
+        "label": "人物形象",
+        "hint": "自己命名任意角色;镜头出现同名角色时自动作为身份参考",
+        "reference_role": "identity",
+        "aspect": "9:16",
+        "attach_defaults_to_name": True,
+    },
+    "style": {
+        "label": "画风基准",
+        "hint": "只控制媒介、色调与质感;不绑定人物,可全项目通用",
+        "reference_role": "style",
+        "aspect": "16:9",
+        "attach_defaults_to_name": False,
+    },
+    "scene": {
+        "label": "场景空间",
+        "hint": "空间概念图;与场景同名时自动作为该场景参考",
+        "reference_role": "scene",
+        "aspect": "16:9",
+        "attach_defaults_to_name": True,
+    },
+    "prop": {
+        "label": "物品道具",
+        "hint": "单件物品母资产;关联到角色后作为其服装/道具参考",
+        "reference_role": "wardrobe",
+        "aspect": "9:16",
+        "attach_defaults_to_name": False,
+    },
+}
+STUDIO_TYPE_ALIASES = {
+    "人物": "character", "角色": "character", "形象": "character",
+    "风格": "style", "画风": "style",
+    "场景": "scene", "空间": "scene",
+    "物品": "prop", "道具": "prop",
+}
+STUDIO_ROLE_LABELS = {
+    "identity": "人物身份参考", "wardrobe": "服装/道具参考",
+    "scene": "场景空间参考", "composition": "构图/动作参考",
+    "style": "画风参考", "manual": "手动参考图",
+    "inner_persona": "内心Q版参考",
+}
+# 勾选已有资产当参考时,按资产类型推断它能承担的单一职责。
+STUDIO_KIND_ROLES = {
+    "character_art": "identity", "character_identity": "identity",
+    "character_candidate": "identity", "inner_persona": "identity",
+    "character_sheet": "wardrobe", "prop_identity": "wardrobe",
+    "prop_candidate": "wardrobe", "scene_art": "scene",
+    "image": "composition", "first_frame": "composition",
+    "last_frame": "composition", "cover": "composition",
+    "spatial_blocking": "composition",
+}
+STUDIO_MAX_COUNT = 4
 # Seedream 5 Lite 当前最多接收 10 张参考图。导演层按最小公共上限组织
 # 参考图，避免同一任务切换模型时图序、人物或构图语义发生漂移。
 IMAGE_REFERENCE_LIMIT = 10
@@ -15391,6 +15448,384 @@ class Director:
         return {"status": "done", "redone": redone}
 
     # ---- 参考图管理:上传的参考图会自动进入出图提示(关联角色/场景) ----
+    # ---- 资产工坊:自定义命名的自建资产库 ----
+
+    def _studio_project(self, project_title):
+        project = self.projects.get_project(project_title)
+        if project is None:
+            raise AifosError(f"项目不存在: {project_title}")
+        return project
+
+    @staticmethod
+    def _studio_type(asset_type):
+        key = str(asset_type or "").strip().lower()
+        key = STUDIO_TYPE_ALIASES.get(key, key)
+        if key not in STUDIO_ASSET_TYPES:
+            raise AifosError(
+                "资产类型必须是 character(人物)/style(风格)/"
+                "scene(场景)/prop(物品)")
+        return key, STUDIO_ASSET_TYPES[key]
+
+    def _studio_dir(self, project):
+        path = self.artifacts_root / f"p{project['id']:03d}" / "studio"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _studio_reference_payload(self, project, asset_ids, base_row=None):
+        """把用户勾选的资产中心图片编成本次出图的参考图与单一职责说明。
+
+        base_row 是「改一改」的原图:标注为待修改基底，下游会按
+        「只改意见提到的部分」绑定，不当成新的身份/服装来源。
+        """
+        rows = []
+        if base_row is not None:
+            rows.append((base_row, True))
+        for value in asset_ids or []:
+            try:
+                row = self.assets.get(int(value))
+            except (TypeError, ValueError):
+                raise AifosError(f"参考图 id 不合法: {value}")
+            if row is None or int(row["project_id"]) != int(project["id"]):
+                raise AifosError(f"参考图不属于本作品: {value}")
+            rows.append((row, False))
+        uris, matches, seen = [], [], set()
+        for row, is_base in rows:
+            uri = str(row["uri"] or "")
+            if not uri or uri in seen:
+                continue
+            if not uri.startswith(("http://", "https://")) \
+                    and not Path(uri).exists():
+                raise AifosError(f"参考图文件缺失: {row['name']}")
+            seen.add(uri)
+            meta = self._asset_meta(row)
+            if is_base:
+                role = "manual"
+                label = f"{row['name']}·待修改基底"
+            else:
+                role = (self._reference_role(row)
+                        if row["kind"] == "reference"
+                        else STUDIO_KIND_ROLES.get(row["kind"], "manual"))
+                label = f"{row['name']}·{STUDIO_ROLE_LABELS.get(role, '参考图')}"
+            uris.append(uri)
+            matches.append({
+                "asset_id": row["id"], "kind": row["kind"],
+                "name": row["name"], "label": label, "uri": uri,
+                "reference_role": role,
+                "attach_to": str(meta.get("attach_to") or ""),
+            })
+        if len(uris) > IMAGE_REFERENCE_LIMIT:
+            raise AifosError(
+                f"参考图最多 {IMAGE_REFERENCE_LIMIT} 张,当前选了 {len(uris)} 张")
+        return uris, matches
+
+    def studio_asset_options(self, project_title):
+        """资产工坊表单选项:资产类型、参考用途、画幅与可关联的角色/场景。"""
+        project = self._studio_project(project_title)
+        attach_options = set()
+        for row in self.assets.active_list(project["id"]):
+            meta = self._asset_meta(row)
+            if row["kind"] in ("character_art", "scene_art", "character"):
+                attach_options.add(row["name"])
+            elif meta.get("attach_to"):
+                attach_options.add(str(meta["attach_to"]))
+        return {
+            "project": project["title"],
+            "style": project["style"] or "",
+            "asset_types": [
+                {"value": key, "label": conf["label"], "hint": conf["hint"],
+                 "reference_role": conf["reference_role"],
+                 "aspect": conf["aspect"]}
+                for key, conf in STUDIO_ASSET_TYPES.items()],
+            "reference_roles": [
+                {"value": role, "label": STUDIO_ROLE_LABELS[role]}
+                for role in ("identity", "wardrobe", "scene",
+                             "composition", "style", "manual")],
+            "aspects": sorted(ASPECT_DIMS),
+            "max_count": STUDIO_MAX_COUNT,
+            "attach_options": sorted(attach_options),
+        }
+
+    def studio_prompt(self, project_title, asset_type, name="", brief="",
+                      current_prompt="", feedback="",
+                      reference_asset_ids=None, style=None):
+        """AI 代写出图提示词:只产出文本供用户确认修改,不出图、不落盘。"""
+        project = self._studio_project(project_title)
+        kind, conf = self._studio_type(asset_type)
+        brief = str(brief or "").strip()
+        feedback = str(feedback or "").strip()
+        current = str(current_prompt or "").strip()
+        name = str(name or "").strip()
+        if not (brief or current or feedback):
+            raise AifosError(
+                "请先写一句需求,例如「冷艳短发女特工,黑色皮衣,雨夜霓虹」")
+        uris, _matches = self._studio_reference_payload(
+            project, reference_asset_ids)
+        result = self.router.call("script", {
+            "asset_prompt": True,
+            "asset_type": kind,
+            "asset_type_label": conf["label"],
+            "asset_name": name,
+            "brief": brief,
+            "current_prompt": current,
+            "feedback": feedback,
+            "references": uris,
+            "style": (str(style).strip() if style is not None
+                      else (project["style"] or "")),
+            "project_title": project["title"],
+        }, self._studio_dir(project))
+        data = result.data or {}
+        prompt = str(data.get("image_prompt") or "").strip()
+        if not prompt:
+            raise AifosError("AI 没有写出提示词,请补充需求后重试")
+        self.log.info(
+            "director",
+            f"资产工坊已为「{name or brief[:12]}」({conf['label']})"
+            f"生成出图提示词(产线:{result.provider})")
+        return {
+            "asset_type": kind,
+            "asset_type_label": conf["label"],
+            "image_prompt": prompt,
+            "negative_prompt": str(data.get("negative_prompt") or "").strip(),
+            "notes": [str(item) for item in (data.get("notes") or [])],
+            "provider": result.provider,
+            "real": result.provider != "mock",
+            "cost": float(result.cost or 0.0),
+        }
+
+    def _studio_asset_names(self, project_id, name, count, reuse=False):
+        """自建资产命名:改图沿用原名(叠新版本),新建则自动避重。"""
+        if reuse:
+            return [name] * count
+        names, taken = [], set()
+        for index in range(count):
+            candidate = name if index == 0 else f"{name} {index + 1:02d}"
+            serial = index + 1
+            while (candidate in taken
+                   or self.assets.latest(
+                       project_id, "reference", candidate) is not None):
+                serial += 1
+                candidate = f"{name} {serial:02d}"
+            taken.add(candidate)
+            names.append(candidate)
+        return names
+
+    def generate_studio_asset(self, project_title, asset_type, name, prompt,
+                              negative_prompt="", feedback="", attach_to="",
+                              reference_role="", note="",
+                              reference_asset_ids=None, base_asset_id=None,
+                              aspect="", style=None, count=1,
+                              optimize_prompt=False, prompt_source="manual"):
+        """生产一张(或几张)自建资产图片并登记进资产中心。
+
+        产物 kind=reference:后续制作按 用途+关联对象 自动进入对应任务,
+        没有关联对象的图仍可在参考图选择器里手动调用。
+        """
+        project = self._studio_project(project_title)
+        kind, conf = self._studio_type(asset_type)
+        prompt = str(prompt or "").strip()
+        if len(prompt) < 8:
+            raise AifosError("提示词太短;请自己写一条或点「AI 写提示词」")
+        base_row = None
+        if base_asset_id not in (None, ""):
+            try:
+                base_row = self.assets.get(int(base_asset_id))
+            except (TypeError, ValueError):
+                raise AifosError(f"待修改资产 id 不合法: {base_asset_id}")
+            if base_row is None \
+                    or int(base_row["project_id"]) != int(project["id"]):
+                raise AifosError("待修改资产不存在或不属于本作品")
+            if self.assets.is_deleted(base_row):
+                raise AifosError("待修改资产已删除;请先选一张有效的图")
+        name = str(name or "").strip() or (
+            str(base_row["name"]) if base_row is not None else "")
+        if not name:
+            raise AifosError("请给这个资产起个名字(如「林晚·冷艳版」)")
+        if len(name) > 60:
+            raise AifosError("资产名称不能超过 60 个字")
+        # 改图沿用原资产名叠加新版本;旧版本与原文件全部保留可回溯。
+        reuse_name = (base_row is not None
+                      and base_row["kind"] == "reference"
+                      and name == str(base_row["name"]))
+        try:
+            count = int(count or 1)
+        except (TypeError, ValueError):
+            raise AifosError("生成张数必须是 1-4 的整数")
+        count = max(1, min(count, STUDIO_MAX_COUNT))
+        if reuse_name:
+            count = 1   # 同名改图一次只出一张,避免历史版本被连叠淹没
+        role = str(reference_role or "").strip().lower()
+        role = {
+            "人物": "identity", "身份": "identity",
+            "服装": "wardrobe", "道具": "wardrobe",
+            "场景": "scene", "空间": "scene",
+            "构图": "composition", "动作": "composition",
+            "画风": "style", "风格": "style",
+        }.get(role, role)
+        if not role:
+            role = conf["reference_role"]
+        if role not in REFERENCE_ROLES:
+            raise AifosError(
+                "参考图用途必须是 identity/wardrobe/scene/"
+                "composition/style/manual")
+        attach_to = str(attach_to or "").strip()
+        if not attach_to and conf["attach_defaults_to_name"]:
+            # 用户自己命名的角色/场景默认关联到同名对象:剧本里出现这个
+            # 名字时自动生效,不出现时仍可手动调用,不会污染其他角色。
+            attach_to = name
+        if role != "style" and not attach_to:
+            role = "manual"
+        aspect = str(aspect or "").strip() or conf["aspect"]
+        if aspect not in ASPECT_DIMS:
+            raise AifosError(f"画幅必须是 {'/'.join(sorted(ASPECT_DIMS))}")
+        dims = ASPECT_DIMS[aspect]
+        style_text = (str(style).strip() if style is not None
+                      else (project["style"] or ""))
+        negative_prompt = str(negative_prompt or "").strip()
+        feedback = str(feedback or "").strip()
+        ref_uris, ref_matches = self._studio_reference_payload(
+            project, reference_asset_ids, base_row=base_row)
+        studio_dir = self._studio_dir(project)
+        names = self._studio_asset_names(
+            project["id"], name, count, reuse=reuse_name)
+        prompt_text = prompt
+        if negative_prompt:
+            prompt_text = f"{prompt_text}。画面中不得出现:{negative_prompt}"
+        registered, total_cost, providers = [], 0.0, set()
+        for asset_name in names:
+            existing = self.assets.latest(
+                project["id"], "reference", asset_name, include_deleted=True)
+            version = (int(existing["version"]) + 1) if existing else 1
+            # 文件名按每张资产各自的名字取:一次连出多张时,
+            # 每张必须落到独立文件,不能互相覆盖。
+            safe = "".join(
+                c if c.isalnum() else "_" for c in asset_name)[:40] or "asset"
+            payload = {
+                "studio_asset": kind,
+                "studio_asset_label": conf["label"],
+                "art_name": asset_name,
+                "prompt": prompt_text,
+                "prompt_compact": prompt_text,
+                "prompt_contract_complete": True,
+                "feedback": feedback,
+                "style": style_text,
+                "aspect": aspect,
+                "width": dims["width"], "height": dims["height"],
+                "image_task_class": "important",
+                "image_quality": "high",
+                "reference_images": list(ref_uris),
+                "asset_matches": copy.deepcopy(ref_matches),
+                # 自建资产没有剧本人数/道具等逐字合同要守,用户提示词本身
+                # 就是唯一事实源;勾选「让 AI 审核优化」才走剧集审核产线。
+                "prompt_review_exempt": not bool(optimize_prompt),
+            }
+            self._attach_reference_manifest(payload)
+            result = self.router.call("image", payload, studio_dir)
+            source = Path(str(result.uri or ""))
+            if not source.exists():
+                raise AifosError(f"产线没有产出图片文件: {result.uri or '(空)'}")
+            dest = studio_dir / f"{safe}_{kind}_v{version}{source.suffix}"
+            if source.resolve() != dest.resolve():
+                shutil.move(str(source), str(dest))
+            total_cost += float(result.cost or 0.0)
+            providers.add(result.provider)
+            meta = {
+                "attach_to": attach_to,
+                "note": str(note or "").strip(),
+                "reference_role": role,
+                "studio": True,
+                "studio_asset_type": kind,
+                "studio_asset_label": conf["label"],
+                "prompt": prompt,
+                "prompt_used": prompt_text,
+                "prompt_source": ("ai" if str(prompt_source) == "ai"
+                                  else "manual"),
+                "negative_prompt": negative_prompt,
+                "feedback": feedback,
+                "aspect": aspect,
+                "style": style_text,
+                "provider": result.provider,
+                "model": result.model or "",
+                "real": result.provider != "mock",
+                "created_at": now(),
+                "image_quality": "high",
+                "recommended_quality": "high",
+                "quality_source": "asset_studio",
+                "reference_asset_ids": [
+                    item["asset_id"] for item in ref_matches],
+                "prompt_review": (result.data or {}).get("prompt_review") or {},
+            }
+            if base_row is not None:
+                meta["base_asset_id"] = int(base_row["id"])
+                meta["base_asset_name"] = str(base_row["name"])
+            row = self.assets.register(
+                project["id"], "reference", asset_name, uri=str(dest),
+                meta=meta, new_version=existing is not None)
+            registered.append({
+                "asset_id": row["id"], "name": asset_name,
+                "uri": str(dest), "version": int(row["version"]),
+                "provider": result.provider,
+                "real": result.provider != "mock",
+                "reference_role": role, "attach_to": attach_to,
+            })
+        placeholder = any(not item["real"] for item in registered)
+        binding = attach_to or (
+            "全项目通用" if role == "style" else "仅手动选择")
+        self.log.info(
+            "director",
+            f"资产工坊已生产 {len(registered)} 张「{name}」({conf['label']})"
+            f";用途:{STUDIO_ROLE_LABELS.get(role, role)};关联:{binding}"
+            f";产线:{'、'.join(sorted(providers))}"
+            + ("(占位产线,不是真实 AI 出图)" if placeholder else ""))
+        return {
+            "project": project["title"],
+            "asset_type": kind,
+            "asset_type_label": conf["label"],
+            "reference_role": role,
+            "role_label": STUDIO_ROLE_LABELS.get(role, role),
+            "attach_to": attach_to,
+            "aspect": aspect,
+            "prompt": prompt,
+            "items": registered,
+            "cost": round(total_cost, 4),
+            "providers": sorted(providers),
+            "mock": placeholder,
+        }
+
+    def copy_studio_asset(self, project_title, asset_id, target_project):
+        """把自建资产复用到另一部作品:共用同一张图,不复制文件。"""
+        source = self._studio_project(project_title)
+        target = self._studio_project(target_project)
+        if int(source["id"]) == int(target["id"]):
+            raise AifosError("目标作品与来源作品相同")
+        try:
+            row = self.assets.get(int(asset_id))
+        except (TypeError, ValueError):
+            raise AifosError(f"资产 id 不合法: {asset_id}")
+        if row is None or int(row["project_id"]) != int(source["id"]):
+            raise AifosError("资产不存在或不属于来源作品")
+        if self.assets.is_deleted(row):
+            raise AifosError("该资产已删除")
+        uri = str(row["uri"] or "")
+        if not uri or (not uri.startswith(("http://", "https://"))
+                       and not Path(uri).exists()):
+            raise AifosError("资产文件缺失,无法复用")
+        meta = dict(self._asset_meta(row))
+        meta.update({
+            "copied_from_project": source["title"],
+            "copied_from_asset_id": int(row["id"]),
+            "copied_at": now(),
+        })
+        name = self._studio_asset_names(
+            target["id"], str(row["name"]), 1)[0]
+        created = self.assets.register(
+            target["id"], "reference", name, uri=uri, meta=meta)
+        self.log.info(
+            "director",
+            f"自建资产「{row['name']}」已复用到《{target['title']}》"
+            f"(同一张图,不复制文件)")
+        return {"asset_id": created["id"], "name": name,
+                "project": target["title"], "uri": uri}
+
     def add_reference(self, project_title, name, file_bytes, ext,
                       attach_to="", note="", reference_role=""):
         """上传带单一用途的参考图。

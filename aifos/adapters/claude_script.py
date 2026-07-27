@@ -1661,6 +1661,64 @@ def validate_prompt_refine(data):
     return None
 
 
+ASSET_PROMPT_PROMPT = """你是 AI 漫剧的美术资产总监。用户在资产工坊里要生产一张
+自建资产图片,请你把用户的一句话需求写成一条完整、可直接交给图片模型执行的出图提示词。
+
+资产类型:{asset_type_label}
+资产名称:{name}
+用户需求(必须逐条落实):{brief}
+当前提示词(为空表示从零撰写):
+{current}
+用户补充意见(为空表示无):{feedback}
+参考图(文件路径;为空表示无):
+{references}
+项目画风(为空表示由你按需求判断,不套用无关默认画风):{style}
+
+要求:
+- 只按用户需求写,不发明剧情、不硬套任何剧集设定;需求没提到的部分按该资产
+  类型的常规美术逻辑补全到可执行程度,不留"自行发挥"式空话;
+- 含糊表述必须具体化(如"帅一点"要落成明确的骨相、五官、气质与光影,
+  "复古风"要落成明确的年代、媒介、色调与材质),不能把原话抄进提示词;
+- 人物类:必须写清性别表达、年龄感、骨相五官、发型发色、妆容、体态气质、
+  服装与配饰、背景处理;人物立绘默认纯净无场景背景;
+- 风格类:必须写清媒介与笔触、色调与配色、光影、材质质感、构图特征,
+  不要绑定具体人物身份;
+- 场景类:必须写清空间类型、时代地域、结构与陈设、材质、光源与时间、
+  视角与景别,画面中不出现人物;
+- 物品类:必须写清形制、相对尺寸、结构、材质工艺、磨损与识别细节,
+  单体展示,不画人物和场景故事;
+- 有参考图时,写明每张参考图各自的职责(身份/服装/场景/构图/画风),
+  不得让一张参考图越权覆盖其他维度;
+- image_prompt 必须是完整独立的出图提示词,不是增量补丁,不含
+  Markdown、编号列表标题或解释性文字;
+- 只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块:
+{{"image_prompt": "完整的出图提示词",
+ "negative_prompt": "不希望出现的内容;没有则给空字符串",
+ "notes": ["把用户哪条需求落成了什么具体画面事实"]}}
+"""
+
+
+def validate_asset_prompt(data):
+    """资产工坊 AI 提示词输出的最小校验。"""
+    if not isinstance(data, dict):
+        return "输出必须是 JSON 对象"
+    prompt = str(data.get("image_prompt") or "").strip()
+    if len(prompt) < 20:
+        return "缺少 image_prompt 或内容过短"
+    if "```" in prompt:
+        return "image_prompt 含 Markdown 代码围栏"
+    if data.get("negative_prompt") is None:
+        data["negative_prompt"] = ""
+    elif not isinstance(data["negative_prompt"], str):
+        return "negative_prompt 必须是字符串"
+    notes = data.get("notes")
+    if notes is None:
+        data["notes"] = []
+    elif not isinstance(notes, list):
+        return "notes 必须是数组"
+    return None
+
+
 PROP_DESIGN_PROMPT = """你是本剧的道具设计总监。以下核心/身份识别道具已进入剧本的道具登记表,
 但还没有可出图的设计卡。你要只依据正式剧本中的事实与合理工艺推导,为每件道具补全设计卡。
 
@@ -1790,6 +1848,19 @@ def build_prompt(capability, payload):
             style=(payload.get("style")
                    or "项目画风未指定;保持与已生成候选一致"),
             feedback=payload.get("feedback", ""))
+    if capability == "script" and payload.get("asset_prompt"):
+        references = "\n".join(
+            f"- {item}" for item in (payload.get("references") or []) if item)
+        return ASSET_PROMPT_PROMPT.format(
+            asset_type_label=(payload.get("asset_type_label")
+                              or payload.get("asset_type") or "自建资产"),
+            name=payload.get("asset_name", "") or "(用户未命名)",
+            brief=payload.get("brief", "") or "(未填写,请按资产名称与类型撰写)",
+            current=(payload.get("current_prompt")
+                     or "(尚无提示词,请从零撰写)"),
+            feedback=payload.get("feedback", "") or "(无)",
+            references=references or "(无)",
+            style=payload.get("style", "") or "(未指定)")
     if capability == "script" and payload.get("prop_design"):
         return PROP_DESIGN_PROMPT.format(
             script=json.dumps(payload.get("script") or {},
@@ -2147,6 +2218,8 @@ def _postprocess_and_validate(capability, payload, data):
         error = validate_image_qc(data)
     elif capability == "script" and payload.get("prompt_refine"):
         error = validate_prompt_refine(data)
+    elif capability == "script" and payload.get("asset_prompt"):
+        error = validate_asset_prompt(data)
     elif capability == "script" and payload.get("shot_repair"):
         error = validate_shot_repair(data, payload)
     elif capability == "script" and payload.get("prop_design"):
