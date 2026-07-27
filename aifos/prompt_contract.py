@@ -2175,7 +2175,13 @@ def build_shot_prompt_contract(
             "溯源参考,不构成需要裁决的冲突,也不需要猜测优先级。"
             "景别取景边界同为执行值:被边界裁出画的身体部位、伤情、"
             "服装细节或道具,其『必须可见』要求在本镜自动不适用"
-            "(由包含该部位的其他镜头承担核验),不构成可见性冲突"),
+            "(由包含该部位的其他镜头承担核验),不构成可见性冲突。"
+            "机位同样决定人物可见面与朝向语义:被机位背向的面部表情、"
+            "口型、眼神及胸前/正面细节,其『必须可见/清晰画出』要求"
+            "本镜自动不适用,由包含相应朝向的其他镜头承担;人物朝向、"
+            "表演与正面细节描述和机位并列冲突时一律以机位为准"
+            "(如背面机位下的『相向』指两人身体相对、以背面呈现),"
+            "不构成需要裁决的冲突"),
         "physical": physical,
         "spatial_relations": list(physical.get("spatial_relations") or []),
         "prop_registry": [
@@ -2380,7 +2386,9 @@ def render_shot_prompt(contract, *, mode=None):
             core_line = core_state or "按定格状态执行"
             if core_props:
                 core_line += "；必须清晰画出:" + "、".join(core_props)
-            lines.append(f"【核心画面】{core_line}。")
+            lines.append(
+                f"【核心画面】{core_line}(以上均以本镜机位的可见面"
+                "为准,被机位背向或裁出画的细节免验)。")
     if media == "video":
         lines.append(
             "【输入】图1是唯一动作起点，图2是唯一动作终点；"

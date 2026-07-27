@@ -204,3 +204,19 @@ def test_core_picture_line_leads_the_prompt():
     assert line2.startswith("【核心画面】")
     assert "缺口单刃短刀" in line2 and "由黑衣人持有" in line2
     assert "YYXS-E01" not in line2
+
+
+def test_camera_precedence_covers_orientation_visibility():
+    """背面机位 vs 相向/张口/胸前细节曾同级互斥:机位决定可见面,
+    被背向的正面细节自动免验,朝向按机位语境重解。"""
+    from aifos.prompt_contract import compile_shot_prompt
+    shot = {"shot_no": 13, "scene_no": 3, "kind": "dialogue",
+            "camera": "中景·背面", "description": "两人背身对话",
+            "duration": 2.5, "characters": ["林川", "阿砚"],
+            "dialogue": None, "prompt": "p"}
+    contract, _prompt = compile_shot_prompt(
+        shot, location="茶棚", mode="image")
+    clause = contract["camera_precedence"]
+    assert "被机位背向的面部表情" in clause
+    assert "以机位为准" in clause
+    assert "不构成需要裁决的冲突" in clause
