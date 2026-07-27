@@ -130,3 +130,39 @@ class PropDesignDerivationTest(unittest.TestCase):
             {"name": "旧麻布包裹", "story_function": "包",
              "visual_design": "布包"}]}
         self.assertIn("敷衍", validate_prop_design(lazy, payload))
+
+
+class FreezeBackfillTest(unittest.TestCase):
+    """静态关键帧要 freeze 定格行:写明 start/end 却漏 freeze 的,
+    按「定格=尾态」既定裁决机械回填(凡人修仙传镜头2/3/4实测)。"""
+
+    def test_freeze_cloned_from_end_state(self):
+        from aifos.story_logic import normalize_storyboard_frame_phase_pairs
+        shot = {"frame_props": [
+            {"prop_id": "p1", "phase": "start", "physical_state": "闭合",
+             "visibility": "visible"},
+            {"prop_id": "p1", "phase": "end", "physical_state": "闭合",
+             "visibility": "visible"},
+        ], "prop_transitions": [
+            {"prop_id": "p1", "from_phase": "start", "to_phase": "end",
+             "action": "静置未变"},
+        ]}
+        normalize_storyboard_frame_phase_pairs({"shots": [shot]})
+        freeze = [r for r in shot["frame_props"]
+                  if r["phase"] == "freeze"]
+        self.assertEqual(len(freeze), 1)
+        self.assertTrue(freeze[0]["phase_backfilled"])
+        self.assertEqual(freeze[0]["derived_from"], "end_state")
+        self.assertEqual(freeze[0]["physical_state"], "闭合")
+
+    def test_existing_freeze_not_duplicated(self):
+        from aifos.story_logic import normalize_storyboard_frame_phase_pairs
+        shot = {"frame_props": [
+            {"prop_id": "p1", "phase": "freeze", "physical_state": "定格",
+             "visibility": "visible"},
+        ]}
+        normalize_storyboard_frame_phase_pairs({"shots": [shot]})
+        freezes = [r for r in shot["frame_props"]
+                   if r["phase"] == "freeze" and not r.get(
+                       "phase_backfilled")]
+        self.assertEqual(len(freezes), 1)

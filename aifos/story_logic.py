@@ -520,12 +520,25 @@ def normalize_storyboard_frame_phase_pairs(storyboard: dict) -> dict:
             elif freezes and not starts and not ends:
                 source, missing = freezes[:1], ("start", "end")
             else:
-                continue
+                source, missing = [], ()
             for phase in missing:
                 for template in source:
                     clone = copy.deepcopy(template)
                     clone["phase"] = phase
                     clone["phase_backfilled"] = True
+                    rows.append(clone)
+            # 静态关键帧合同要求 transition 道具有 freeze 定格行;
+            # 「定格状态=本镜尾态」是既定裁决(freeze derives from end),
+            # 写明 start/end 却漏 freeze 的,按尾态机械回填
+            # (凡人修仙传镜头2/3/4实测:hl_01_pack 因此被拒生图)。
+            if not freezes:
+                template = ((phases.get("end") or [])
+                            or (phases.get("start") or []))[:1]
+                for row in template:
+                    clone = copy.deepcopy(row)
+                    clone["phase"] = "freeze"
+                    clone["phase_backfilled"] = True
+                    clone["derived_from"] = "end_state"
                     rows.append(clone)
     return storyboard
 

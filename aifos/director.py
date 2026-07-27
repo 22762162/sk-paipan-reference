@@ -79,6 +79,7 @@ from .story_logic import (
     PROP_CONTRACT_SCHEMA,
     audit_prop_contract,
     audit_storyboard_prop_contract,
+    normalize_storyboard_frame_phase_pairs,
 )
 from .script_import import sanitize_script_entities
 from .workflow import (
@@ -1115,11 +1116,13 @@ class Director:
                 try:
                     completed.append(future.result())
                 except ProviderError as exc:
-                    # 内容性熔断(同级事实互斥等)只隔离本镜,系统性故障
-                    # (ProviderUnavailable/超时)仍中止整批换人修。
+                    # 内容性熔断(同级事实互斥、优化稿丢字面被拒等)只
+                    # 隔离本镜,系统性故障(ProviderUnavailable/超时)仍
+                    # 中止整批换人修。
                     if (continue_on_block
                             and len(group) == 1
-                            and "真实图片已被阻止" in str(exc)
+                            and ("真实图片已被阻止" in str(exc)
+                                 or "拒绝生图" in str(exc))
                             and str(group[0].get("item_id", "")
                                     ).startswith("shot:")):
                         blocked_groups.append((group, exc))
@@ -1136,14 +1139,20 @@ class Director:
             task = group[0]
             reason = str(exc)
             repaired_note = ""
-            try:
-                repaired_note = self._repair_blocked_prompt_shot(
-                    ctx, task, reason)
-            except Exception as repair_exc:
-                self.log.warn(
-                    "director",
-                    f"镜头{task['tag']}审核熔断,编剧就地修失败:"
-                    f"{str(repair_exc)[:300]}")
+            if "真实图片已被阻止" in reason:
+                try:
+                    repaired_note = self._repair_blocked_prompt_shot(
+                        ctx, task, reason)
+                except Exception as repair_exc:
+                    self.log.warn(
+                        "director",
+                        f"镜头{task['tag']}审核熔断,编剧就地修失败:"
+                        f"{str(repair_exc)[:300]}")
+            else:
+                # 优化稿字面校验被拒:镜头数据本身没问题,重审一次
+                # (审核是随机采样,新一稿通常保留全部字面)即可,
+                # 不必劳驾编剧改镜头。
+                repaired_note = "优化稿字面校验未过,直接重审一次"
             if repaired_note:
                 try:
                     completed.append((group, self.router.review_image_prompt(
@@ -8530,12 +8539,21 @@ class Director:
         return result
 
     def _shot_prop_contract(self, ctx, shot):
-        """把集级登记表与镜头级实例状态送入生成前合同。"""
-        return {
-            "prop_registry": self._prop_registry(ctx.get("script") or {}),
+        """把集级登记表与镜头级实例状态送入生成前合同。
+
+        已保存的分镜可能缺 freeze 定格行或起止对(旧文档没经过最新
+        归一化);在合同装配的唯一咽喉做每镜机械回填(定格=尾态既定
+        裁决),覆盖续跑/导入等一切来源,不改动分镜文档本体。"""
+        normalized = {"shots": [{
             "frame_props": copy.deepcopy(shot.get("frame_props") or []),
             "prop_transitions": copy.deepcopy(
                 shot.get("prop_transitions") or []),
+        }]}
+        normalize_storyboard_frame_phase_pairs(normalized)
+        return {
+            "prop_registry": self._prop_registry(ctx.get("script") or {}),
+            "frame_props": normalized["shots"][0]["frame_props"],
+            "prop_transitions": normalized["shots"][0]["prop_transitions"],
         }
 
     def _require_valid_storyboard_prop_contract(self, ctx):

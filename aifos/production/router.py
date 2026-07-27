@@ -434,19 +434,25 @@ class ProviderRouter:
         cn = cls._CN_NUM.get(expected)
         if cn:
             numerals = f"(?:{expected}|{cn})"
+        # 「7人」「7名」「7位」都是明确总数;「严格共7名可见真人」实测
+        # 曾因只认「名人物/名角色」后缀被误判成删除人数。
         if re.search(
-                rf"(?<!\d){numerals}\s*(?:人|名人物|个人|名角色|位人物|位角色)"
-                r"(?!\d)", optimized):
+                rf"(?<!\d){numerals}\s*(?:人|名|位|个)(?!\d)", optimized):
             return True
         # 分组求和:「3名登记角色…加4名巡检弓兵」= 7 同样是明确的人数
-        # 字面;各组数量相加等于期望值即算保留。
+        # 字面;各组数量相加等于期望值即算保留。文本同时写总数与分组
+        # (「共7名:3名…加4名」)时求和会翻倍,总数组+分组各占一半同样
+        # 算保留,不得误判为改动人数。
         cn_to_int = {v: k for k, v in cls._CN_NUM.items()}
-        groups = re.findall(
-            r"(?<!\d)(\d+|[一两三四五六七八九十])\s*[名位个](?!\d)",
-            optimized)
-        total = sum(
-            int(g) if g.isdigit() else cn_to_int.get(g, 0) for g in groups)
-        return bool(groups) and total == expected
+        groups = [
+            int(g) if g.isdigit() else cn_to_int.get(g, 0)
+            for g in re.findall(
+                r"(?<!\d)(\d+|[一两三四五六七八九十])\s*[名位个](?!\d)",
+                optimized)]
+        total = sum(groups)
+        return bool(groups) and (
+            total == expected
+            or (expected in groups and total == expected * 2))
 
     def review_image_prompt(self, capability, payload, out_dir, cancel=None):
         """用 Codex 审核并优化真实出图前的最终提示词，原地冻结优化稿。
