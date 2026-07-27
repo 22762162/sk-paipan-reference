@@ -40,6 +40,7 @@ from ..story_logic import (
     audit_storyboard_prop_contract,
     normalize_prop_contract,
     normalize_script_logic,
+    normalize_storyboard_frame_phase_pairs,
 )
 from ..story_analysis import STORY_ANALYSIS_SCHEMA, validate_story_analysis
 from ..script_import import sanitize_script_entities
@@ -910,6 +911,9 @@ def validate_storyboard(storyboard):
     if not isinstance(storyboard["shots"], list):
         return "shots 需为数组"
     normalize_prop_contract(storyboard)
+    # 本地就地修:道具时间线缺失端(start/end 不成对、仅 freeze)按
+    # "该镜内无状态变化"克隆回填,不为几行显式条目丢弃整份分镜。
+    normalize_storyboard_frame_phase_pairs(storyboard)
     prop_registry_report = audit_prop_contract(storyboard)
     if not prop_registry_report["passed"]:
         return "分镜 prop_registry 无效: " + "；".join(

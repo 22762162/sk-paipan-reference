@@ -483,6 +483,53 @@ def _event_order(storyboard: dict) -> tuple[dict, list[str]]:
     return order, issues
 
 
+def normalize_storyboard_frame_phase_pairs(storyboard: dict) -> dict:
+    """补齐镜头道具时间线的显式起止对(本地就地修,零模型调用)。
+
+    v2.2 要求道具参加视频时间线时 start 与 end 成对、未出现也要显式
+    absent。模型常只写一端(或只写 freeze)——缺失端的语义就是"该镜
+    内无状态变化",可机械克隆同状态行回填,不必为几行显式条目丢弃
+    整份分镜重新生成。回填行带 phase_backfilled 供审计溯源;真正的
+    状态矛盾(起止状态不一致)仍由 audit 照常拦截。
+    """
+    if not isinstance(storyboard, dict):
+        return storyboard
+    for shot in storyboard.get("shots") or []:
+        if not isinstance(shot, dict):
+            continue
+        rows = shot.get("frame_props")
+        if not isinstance(rows, list) or not rows:
+            continue
+        by_prop: dict = {}
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            prop_id = _text(item.get("prop_id"))
+            phase = _text(item.get("phase")).lower()
+            if prop_id and phase in PROP_FRAME_PHASES:
+                by_prop.setdefault(prop_id, {}).setdefault(
+                    phase, []).append(item)
+        for phases in by_prop.values():
+            starts = phases.get("start") or []
+            ends = phases.get("end") or []
+            freezes = phases.get("freeze") or []
+            if starts and not ends:
+                source, missing = starts, ("end",)
+            elif ends and not starts:
+                source, missing = ends, ("start",)
+            elif freezes and not starts and not ends:
+                source, missing = freezes[:1], ("start", "end")
+            else:
+                continue
+            for phase in missing:
+                for template in source:
+                    clone = copy.deepcopy(template)
+                    clone["phase"] = phase
+                    clone["phase_backfilled"] = True
+                    rows.append(clone)
+    return storyboard
+
+
 def audit_storyboard_prop_contract(storyboard: dict) -> dict:
     """Validate frame-local prop instances and event-order availability."""
     issues = []

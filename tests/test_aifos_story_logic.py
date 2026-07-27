@@ -119,3 +119,26 @@ def test_prop_phase_aliases_normalize_before_audit():
         "availability_start_event"]["phase"] == "midway"
     assert [issue for issue in audit_prop_contract(script)["issues"]
             if "phase" in issue]
+
+
+def test_frame_phase_pairs_backfilled_locally():
+    """道具时间线缺失端按"无状态变化"克隆回填;真矛盾仍留给 audit。"""
+    from aifos.story_logic import normalize_storyboard_frame_phase_pairs
+    sb = {"shots": [
+        {"shot_no": 2, "frame_props": [
+            {"prop_id": "P1", "phase": "start", "visibility": "visible",
+             "holder": "阿砚", "physical_state": "完好"}]},
+        {"shot_no": 3, "frame_props": [
+            {"prop_id": "P1", "phase": "freeze", "visibility": "absent",
+             "physical_state": "完好"}]},
+        {"shot_no": 4, "frame_props": [          # 成对的不动
+            {"prop_id": "P1", "phase": "start", "visibility": "visible"},
+            {"prop_id": "P1", "phase": "end", "visibility": "visible"}]},
+    ]}
+    normalize_storyboard_frame_phase_pairs(sb)
+    s2 = sb["shots"][0]["frame_props"]
+    assert any(r["phase"] == "end" and r.get("phase_backfilled")
+               and r["holder"] == "阿砚" for r in s2)
+    s3 = sb["shots"][1]["frame_props"]
+    assert {r["phase"] for r in s3} == {"freeze", "start", "end"}
+    assert len(sb["shots"][2]["frame_props"]) == 2   # 未回填
