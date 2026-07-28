@@ -420,3 +420,49 @@ def test_compile_swaps_over_shoulder_for_solo_shot():
         shot, location="书阁", style="古风", references=[], mode="image")
     assert contract["camera"]["机位"] == "斜侧"
     assert "机位容量修正" in contract["camera"]["容量修正"]
+
+
+# ---------- 合同不一致不是硬伤:人工必须能放行 ----------
+
+def _qc_verdict(*, image_pass=True, prompt_status="conflicting"):
+    """画面全部达标,只有合同一致性不过。"""
+    return {
+        "pass": image_pass,
+        "visual_pass": image_pass,
+        "input_contract_pass": False,
+        "identity_checked": True, "identity_match": True,
+        "gender_checked": True, "gender_match": True,
+        "count_checked": True, "count_match": True,
+        "wardrobe_checked": True, "wardrobe_match": True,
+        "physical_logic_checked": True, "physical_logic_match": True,
+        "spatial_logic_checked": True, "spatial_logic_match": True,
+        "issues": ["景别与合同不符：合同要求大特写，成片为中近景"],
+        "image_error": {"summary": "画面本身达到放行阈值",
+                        "categories": ["camera"], "evidence": []},
+        "prompt_diagnosis": {"status": prompt_status, "issues": ["焦段互斥"]},
+        "reference_diagnosis": {"status": "correct", "issues": []},
+        "targeted_prompt_patch": {"instructions": [], "preserve": [],
+                                  "max_scope": "current_shot_only"},
+        "reference_adjustments": [],
+    }
+
+
+def test_contract_mismatch_alone_is_not_a_hard_failure(app):
+    """画面达标、只有合同对不上时,不得判硬伤——否则错合同一票否决。"""
+    report = app.director._assess_image_qc(
+        {"characters": ["沈眉"], "count": 1},
+        _qc_verdict(image_pass=True), 1)
+    assert report["visual_pass"] is True
+    assert report["input_contract_pass"] is False
+    assert report["contract_hard_failure"] is True
+    # 关键:人工仍然可以放行。
+    assert report["hard_failure"] is False
+
+
+def test_contract_mismatch_with_bad_image_stays_hard(app):
+    """画面自身也没过时,合同不一致并入硬伤——那才是真要重画。"""
+    report = app.director._assess_image_qc(
+        {"characters": ["沈眉"], "count": 1},
+        _qc_verdict(image_pass=False), 1)
+    assert report["visual_pass"] is False
+    assert report["hard_failure"] is True

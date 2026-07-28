@@ -4425,9 +4425,17 @@ class Director:
             "production_ready": passed,
             "qc_policy": "visible_major_defects_v2",
             "input_contract_advisory": not input_contract_passed,
+            # hard_failure 的语义是「不能出街、也不允许人工放行」——身份、
+            # 性别、人数这类硬伤。合同不一致(景别/焦段/机位与合同对不上)
+            # 不属于这一档:画面本身可能完全达标,只是没按一份可能本来就
+            # 错的合同拍。把它算进硬伤,等于让错合同拥有一票否决权,人工
+            # 连放行的权力都没有(《长夏记事》实案:visual_pass=True、
+            # identity/count/spatial 全 True、质检自己写「画面本身达到放行
+            # 阈值」,仍因 contract_hard_failure 被锁死在人工检查点)。
+            # 画面自身没过时,合同不一致仍并入硬伤——那才是真要重画。
             "hard_failure": bool(
-                (visual_hard_failure and not image_passed)
-                or contract_hard_failure),
+                visual_hard_failure and not image_passed
+                or (contract_hard_failure and not image_passed)),
             "contract_hard_failure": contract_hard_failure,
         }
         report.update({
