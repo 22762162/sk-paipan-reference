@@ -879,6 +879,12 @@ def run(request, codex, timeout, extra_args, plain=False):
     def invoke(args):
         proc = subprocess.Popen(
             [codex, "exec", *args, *extra_args, instruction],
+            # stdin 必须显式给 DEVNULL:codex exec 一旦发现 stdin 是打开
+            # 的管道就停在「Reading additional input from stdin...」永等,
+            # 直到超时被杀,报「退出码 1」。不指定时子进程继承父进程的
+            # stdin——服务在前台跑(终端)时没事,以 nohup/launchd 起来时
+            # stdin 是管道,整条出图产线全灭(《长夏记事》images 阶段实案)。
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             cwd=str(out_dir), start_new_session=True)
         previous_handlers = {}

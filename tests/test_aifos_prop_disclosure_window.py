@@ -176,3 +176,76 @@ def test_repair_shots_declines_when_everything_is_broken():
     data = {"shots": [{"shot_no": 1}, {"shot_no": 2}]}
     merged, note = provider._repair_shots({}, data, "镜头1.x；镜头2.y")
     assert merged is None and note == ""
+
+
+# ---------- codex exec 必须 stdin=DEVNULL ----------
+
+def test_codex_image_never_inherits_stdin(monkeypatch, tmp_path):
+    """codex exec 继承管道 stdin 会停在「Reading additional input」永等。
+
+    服务在终端前台跑时 stdin 是 tty 没事;以 nohup/launchd 起来时
+    stdin 是管道,整条出图产线全灭(《长夏记事》images 阶段实案)。
+    claude_script 早有 DEVNULL,codex_image 漏了——出图的单点故障。
+    """
+    import subprocess as sp
+    from aifos.adapters import codex_image
+
+    captured = {}
+
+    class _FakeProc:
+        returncode = 1
+
+        def __init__(self, *args, **kwargs):
+            captured["kwargs"] = kwargs
+            self.stdout = None
+            self.stderr = None
+
+        def communicate(self, *a, **k):
+            return "", "stub"
+
+        def poll(self):
+            return 1
+
+        def wait(self, *a, **k):
+            return 1
+
+        def kill(self):
+            return None
+
+    monkeypatch.setattr(codex_image.subprocess, "Popen", _FakeProc)
+    monkeypatch.setattr(codex_image.shutil, "which", lambda _cmd: "/bin/true")
+    request = {"capability": "image",
+               "payload": {"prompt": "画一张图", "characters": [],
+                           "shot_no": 1, "count": 0},
+               "out_dir": str(tmp_path)}
+    try:
+        codex_image.run(request, "codex", 1, [])
+    except Exception:
+        pass  # 只关心 Popen 的调用参数
+    assert captured, "未捕获到 Popen 调用"
+    assert captured["kwargs"].get("stdin") is sp.DEVNULL
+
+
+def test_all_provider_popen_calls_pin_stdin():
+    """静态兜底:适配器/产线里的 Popen 一律显式给 stdin,不许继承。"""
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "aifos"
+    offenders = []
+    for path in root.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for match in re.finditer(r"subprocess\.Popen\(", text):
+            tail = text[match.end():match.end() + 500]
+            depth, window = 1, ""
+            for char in tail:
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                window += char
+            if "stdin=" not in window:
+                offenders.append(f"{path.name}:{text[:match.start()].count(chr(10)) + 1}")
+    assert not offenders, f"Popen 未指定 stdin: {offenders}"
