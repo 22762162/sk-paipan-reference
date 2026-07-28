@@ -383,3 +383,40 @@ def test_compile_upgrades_scale_and_drops_long_lens_for_anchors():
     assert camera["构图"] == "框中框"      # 中景装得下,构图保留
     assert "空间锚点" in camera["容量修正"]
     assert "容量修正" not in prompt        # 审计键不进提示词正文
+
+
+def test_over_shoulder_needs_two_actors():
+    """过肩=前景一人后脑肩背+远端另一人;独角戏构不成这种关系。"""
+    from aifos.camera_language import enforce_position_capacity
+    pos, note = enforce_position_capacity("过肩", 1)
+    assert pos == "斜侧" and "构不成" in note
+    pos, note = enforce_position_capacity("反打", 1)
+    assert pos == "斜侧" and note
+    # 两人及以上成立,原样不动。
+    assert enforce_position_capacity("过肩", 2) == ("过肩", "")
+    assert enforce_position_capacity("反打", 3) == ("反打", "")
+    # 单人本就成立的机位不受影响。
+    assert enforce_position_capacity("侧面", 1) == ("侧面", "")
+    assert enforce_position_capacity("背面", 1) == ("背面", "")
+    # 人数未知时不猜。
+    assert enforce_position_capacity("过肩", None) == ("过肩", "")
+
+
+def test_compile_swaps_over_shoulder_for_solo_shot():
+    """《长夏记事》镜2 实况:1 人却被盲轮换配到过肩。"""
+    from aifos.prompt_contract import compile_shot_prompt
+    shot = {
+        "shot_no": 2, "scene_no": 1, "kind": "reaction",
+        "camera": "过肩,俯拍", "characters": ["沈眉"],
+        "description": "指尖触到别针，手指顿住",
+        "action": "沈眉指尖停住",
+        "five_dimensions": {"camera_design": {
+            "shot_scale": "特写", "lens": "100mm", "angle": "俯拍",
+            "camera_position": "过肩", "composition": "三分法",
+            "movement": "固定"}},
+        "start_state": {}, "end_state": {},
+    }
+    contract, _prompt = compile_shot_prompt(
+        shot, location="书阁", style="古风", references=[], mode="image")
+    assert contract["camera"]["机位"] == "斜侧"
+    assert "机位容量修正" in contract["camera"]["容量修正"]

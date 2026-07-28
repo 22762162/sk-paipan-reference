@@ -186,6 +186,42 @@ _ENVIRONMENT_SAFE_SCALES = frozenset(
     {"中景", "膝上景", "七分身", "全景", "远景", "大远景"})
 
 
+# 机位容量:过肩/反打按定义需要「前景一个人的后脑肩背 + 远端另一个
+# 人物」,单人镜头根本构不成这种关系。盲轮换把过肩配给独角戏时,模型
+# 只能画成普通正面,再被质检判「过肩关系缺失」——与景别容量、构图
+# 容量同一病根:镜头维度分配不看本镜有几个人。
+MULTI_ACTOR_POSITIONS = {
+    "过肩": "需要前景一名人物的后脑肩背与远端另一名人物",
+    "反打": "需要对话双方分处两个互补机位",
+}
+_SINGLE_ACTOR_POSITIONS = ("斜侧", "侧面", "正面", "四分之三面")
+
+
+def enforce_position_capacity(position, visible_count, allowed=None):
+    """单人镜头拿到过肩/反打时换成单人成立的机位。
+
+    visible_count 未知或已达 2 人时不动;宁可漏修不可误改。
+    """
+    pos_text = str(position or "").strip()
+    if pos_text not in MULTI_ACTOR_POSITIONS:
+        return position, ""
+    try:
+        count = int(visible_count)
+    except (TypeError, ValueError):
+        return position, ""
+    if count >= 2:
+        return position, ""
+    fallback = next(
+        (value for value in _SINGLE_ACTOR_POSITIONS
+         if not allowed or value in allowed), "")
+    if not fallback:
+        return position, ""
+    note = (
+        f"机位容量修正:{pos_text}{MULTI_ACTOR_POSITIONS[pos_text]},"
+        f"本镜可见真人{count}人构不成该关系,已改用{fallback}")
+    return fallback, note
+
+
 def enforce_composition_scale(scale, composition, allowed=None):
     """紧景别装不下环境类构图时换掉构图;返回 (执行构图, 修正说明)。
 

@@ -13,6 +13,7 @@ import re
 from .camera_language import (
     camera_geometry_clause,
     enforce_composition_scale,
+    enforce_position_capacity,
     enforce_scale_capacity,
     enforce_spatial_anchor_scale,
 )
@@ -1724,15 +1725,19 @@ def _camera(shot, visible_count=None):
         executed_scale, composition)
     if composition_note:
         notes.append(composition_note)
+    position = _strip_aspect(_text(
+        raw_position or contract.get("机位") or design.get("camera_position")))
+    position, position_note = enforce_position_capacity(
+        position, visible_count)
+    if position_note:
+        notes.append(position_note)
     result = {
         "景别": executed_scale,
         "角度": _strip_aspect(_text(
             raw_angle or contract.get("角度") or design.get("angle"),
             "保持轴线")),
         "焦段": lens,
-        "机位": _strip_aspect(_text(
-            raw_position or contract.get("机位")
-            or design.get("camera_position"))),
+        "机位": position,
         "运镜": _strip_aspect(_text(
             raw_movement or contract.get("运镜") or design.get("movement"),
             "固定")),
