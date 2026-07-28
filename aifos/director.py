@@ -63,6 +63,8 @@ from .lessons import (DISTILL_MIN_PENDING, DOMAIN_IMAGE, DOMAIN_SCRIPT,
 from .qc_stats import record_qc
 from .relations import relation_lines, write_relations
 from .spatial_language import derive_movement_term, spatial_lines
+from .storyboard_preflight import (describe_issues, preflight_storyboard,
+                                  repairable_shots)
 from .camera_language import MOVEMENT_GEOMETRY
 from .spatial_blocking import (
     build_spatial_plan,
@@ -6499,6 +6501,111 @@ class Director:
         return {"version": version, "shots": len(storyboard["shots"]),
                 "pipeline_version": storyboard["pipeline_version"]}
 
+    def _preflight_storyboard_shootability(self, ctx):
+        """分镜可拍性预检 + 就地修:分镜出厂即可拍,下游只做翻译。
+
+        用户指出的病理:上游发明了下游做不到的事、自己却不知道,一路
+        拖到出图前才爆(特写装3人、声明特写却把机位摆5米外、道具缺
+        定格行、同场越轴)。空间调度是确定性计算、零额度成本,这里正是
+        最早能算出这些矛盾的地方。不合格当场交编剧改镜头(只许改景别/
+        取景表述),重建空间后复检一次;仍不过只记警告不阻断——下游门禁
+        照常兜底,不能因为预检把整条产线卡死。
+        """
+        if not self.config.get(
+                "defaults", "storyboard_preflight", default=True):
+            return {"issues": [], "repaired": 0}
+        report = preflight_storyboard(
+            ctx.get("script"), ctx.get("storyboard"), ctx.get("blocking"))
+        if report["passed"]:
+            return {"issues": [], "repaired": 0}
+        targets = repairable_shots(report)
+        self.log.warn(
+            "director",
+            f"分镜可拍性预检发现 {len(report['issues'])} 条问题"
+            f"(涉及 {len(report['by_shot'])} 镜),交编剧就地修 "
+            f"{len(targets)} 镜: "
+            + "、".join(f"镜头{no}" for no in targets))
+        shots = {int(s.get("shot_no", -1)): s
+                 for s in (ctx["storyboard"].get("shots") or [])
+                 if isinstance(s, dict)}
+        repaired = 0
+        for shot_no in targets:
+            shot = shots.get(int(shot_no))
+            if shot is None:
+                continue
+            try:
+                summary = self._repair_shot_for_shootability(
+                    ctx, shot, describe_issues(report, shot_no))
+            except Exception as exc:
+                self.log.warn(
+                    "director",
+                    f"镜头{shot_no}可拍性就地修失败(不阻断): "
+                    f"{str(exc)[:200]}")
+                continue
+            if summary:
+                repaired += 1
+                self.log.info(
+                    "director",
+                    f"镜头{shot_no}已按可拍性预检修正: {summary[:160]}")
+        if not repaired:
+            return {"issues": report["issues"], "repaired": 0}
+        # 镜头改了,空间调度必须按新机位重算,再复检一次
+        self.projects.save_document(
+            ctx["episode"]["id"], "storyboard", ctx["storyboard"])
+        rules = ctx["production_profile"].get("rules", {}).get(
+            "storyboard", {})
+        blocking = build_spatial_plan(
+            ctx["script"], ctx["storyboard"], ctx["continuity"],
+            group_threshold=int(rules.get(
+                "spatial_blocking_required_for_group", 3)))
+        mark_spatial_reference_requirements(blocking)
+        write_spatial_svgs(blocking, ctx["out_root"] / "blocking")
+        write_spatial_reference_pngs(
+            blocking, ctx["out_root"] / "blocking" / "seedance")
+        self.projects.save_document(
+            ctx["episode"]["id"], "blocking", blocking)
+        ctx["blocking"] = blocking
+        again = preflight_storyboard(
+            ctx.get("script"), ctx.get("storyboard"), blocking)
+        before, after = len(report["issues"]), len(again["issues"])
+        self.log.info(
+            "director",
+            f"可拍性复检:问题由 {before} 条降到 {after} 条"
+            + ("(分镜出厂即可拍)" if again["passed"]
+               else ";剩余项留给下游门禁,不阻断本阶段"))
+        return {"issues": again["issues"], "repaired": repaired}
+
+    def _repair_shot_for_shootability(self, ctx, shot, reason):
+        """交编剧按可拍性问题改镜头(复用 shot_repair 的修复边界)。"""
+        result = self._call(ctx, "script", {
+            "shot_repair": True,
+            "project_title": ctx["project"]["title"],
+            "style": ctx["project"].get("style", "") or "",
+            "shot": shot,
+            "location": self._shot_location(ctx.get("script"), shot),
+            "blocking_reason": (
+                "分镜可拍性预检不通过(这些问题会在出图阶段必然熔断或"
+                "产出对不上的画面,必须在分镜层解决):" + str(reason)[:1500]),
+        }, "blocking")
+        data = result.data or {}
+        camera = data.get("camera")
+        if isinstance(shot.get("camera"), dict):
+            if isinstance(camera, dict) and camera:
+                shot["camera"] = camera
+        elif str(camera or "").strip():
+            shot["camera"] = (
+                camera if isinstance(camera, str) else str(camera))
+        description = str(data.get("description") or "").strip()
+        if description:
+            shot["description"] = description
+        summary = str(data.get("repair_summary") or "").strip()
+        shot["shootability_repair"] = {
+            "issues": str(reason)[:600],
+            "repair_summary": summary[:300],
+            "repaired_at": now(),
+        }
+        return summary or "已修正"
+
     def _stage_blocking(self, ctx):
         """五维分镜 → 确定性 3D 空间调度，不消耗任何出图额度。"""
         rules = ctx["production_profile"].get("rules", {}).get(
@@ -6537,9 +6644,12 @@ class Director:
                     "reason": block.get("spatial_reference_reason", ""),
                 })
         ctx["blocking"] = blocking
+        preflight = self._preflight_storyboard_shootability(ctx)
         return {
             "version": version,
             "reused": reused,
+            "shootability_issues": len(preflight.get("issues") or []),
+            "shootability_repaired": preflight.get("repaired", 0),
             "scenes": len(blocking.get("scenes", [])),
             "required_scenes": blocking.get("summary", {}).get(
                 "required_scenes", 0),
