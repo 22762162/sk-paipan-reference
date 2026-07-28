@@ -1219,8 +1219,15 @@ async function renderDashboard() {
   const runningJobs = data.jobs.filter((j) => j.status === "running");
   const activeStandard = data.production_standard || {};
   const firefire = data.firefire || {};
-  const approvedFireStyles = (firefire.styles || []).filter((style) =>
-    style.status === "approved");
+  const approvedFireStyles = Object.values((firefire.styles || [])
+    .filter((style) => style.status === "approved")
+    .reduce((latest, style) => {
+      const current = latest[style.name];
+      if (!current || Number(style.version || 0) > Number(current.version || 0)) {
+        latest[style.name] = style;
+      }
+      return latest;
+    }, {}));
   updateTopbar(data);
 
   const maxStage = Math.max(1, ...data.cost_by_stage.map((r) => r.total || 0));
@@ -1590,6 +1597,7 @@ function openFireFireLab(initial) {
           <select name="session_id"><option value="">不关联会话</option>${sessions.map((s) => `<option value="${s.id}">${esc(s.name)} · #${s.id}</option>`).join("")}</select>
           <textarea name="summary" rows="2" placeholder="风格摘要与适用剧情"></textarea>
           <textarea name="compiled_style" rows="4" placeholder="可直接执行的完整风格提示词（含时代、人物、服装、灯光、镜头和禁用项）" required></textarea>
+          <textarea name="director_knowledge" rows="8" placeholder='风格导演知识 JSON（发布必填）：{"shot_language":{"shot_patterns":["中景缓推到近景"],"shot_scales":["中景","近景"],"camera_angles":["平视"],"camera_positions":["过肩"],"lenses":["85mm"],"camera_moves":["推"],"compositions":["前景遮挡"],"transitions":["视线匹配硬切"],"rhythm":["一镜一个动作"],"forbidden":["无动机环绕"]},"visual_effects":{"lighting":["45度暖金侧光"],"atmosphere":["薄雾"],"optical":["浅景深"],"color_grade":["低饱和暖调"],"materials":["金属与布料分层"],"particles":[],"post_process":["黑柔"],"forbidden":["特效遮脸"]},"selection_rules":[{"when":"对白试探","shots":["过肩近景"],"effects":["暖金轮廓光"],"purpose":"强化关系距离"}]}' required></textarea>
           <textarea name="positive_prompt" rows="2" placeholder="正向提示词（可选）"></textarea>
           <textarea name="negative_prompt" rows="2" placeholder="负向提示词（可选）"></textarea>
           <button type="submit">保存草稿，等待人工确认</button>
@@ -1599,7 +1607,7 @@ function openFireFireLab(initial) {
         <h4>学习会话与分析状态</h4>
         ${sessions.length ? sessions.map((s) => `<article class="firefire-record"><div><b>#${s.id} ${esc(s.name)}</b><span class="chip">${esc(s.status)}</span></div><small>${esc(s.source_url || s.notes || "未填写来源")}</small>${s.rights_confirmed && s.status !== "complete" ? `<button class="mini-btn firefire-analyse" data-id="${s.id}">建立分析工作单</button>` : `<small>${s.rights_confirmed ? "已完成" : "等待权利确认"}</small>`}</article>`).join("") : `<div class="empty">还没有学习会话</div>`}
         <h4>独立风格包</h4>
-        ${styles.length ? styles.map((style) => `<article class="firefire-record"><div><b>${esc(style.name)} · v${esc(style.version)}</b><span class="chip">${esc(style.status)}</span></div><small>${esc(style.summary || style.compiled_style.slice(0, 120))}</small>${style.status === "draft" ? `<button class="mini-btn firefire-publish" data-id="${esc(style.id)}">人工确认并发布</button>` : ""}</article>`).join("") : `<div class="empty">还没有风格草稿</div>`}
+        ${styles.length ? styles.map((style) => `<article class="firefire-record"><div><b>${esc(style.name)} · v${esc(style.version)}</b><span class="chip">${esc(style.status)}</span><span class="chip">${style.director_ready ? "导演知识已就绪" : "缺导演知识"}</span></div><small>${esc(style.summary || style.compiled_style.slice(0, 120))}</small><small>镜头语言 ${Number(style.director_counts?.shot_language || 0)} · 视觉效果 ${Number(style.director_counts?.visual_effects || 0)} · 选择规则 ${Number(style.director_counts?.selection_rules || 0)}</small>${style.status === "draft" ? `<button class="mini-btn firefire-publish" data-id="${esc(style.id)}">人工确认并发布</button>` : ""}</article>`).join("") : `<div class="empty">还没有风格草稿</div>`}
       </div>`;
     panel.querySelector("[data-firefire-session-form]").onsubmit = async (event) => {
       event.preventDefault(); const form = event.currentTarget;
@@ -1611,7 +1619,13 @@ function openFireFireLab(initial) {
     };
     panel.querySelector("[data-firefire-style-form]").onsubmit = async (event) => {
       event.preventDefault(); const form = event.currentTarget;
-      try { await api("/api/firefire/style", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: form.name.value, session_id: form.session_id.value || null, summary: form.summary.value, compiled_style: form.compiled_style.value, positive_prompt: form.positive_prompt.value, negative_prompt: form.negative_prompt.value }) }); showToast("风格草稿已保存", "ok"); render(await api("/api/firefire")); } catch (error) { showToast(error.message, "error"); }
+      try {
+        let directorKnowledge;
+        try { directorKnowledge = JSON.parse(form.director_knowledge.value); }
+        catch (_) { throw new Error("风格导演知识必须是合法 JSON"); }
+        await api("/api/firefire/style", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: form.name.value, session_id: form.session_id.value || null, summary: form.summary.value, compiled_style: form.compiled_style.value, director_knowledge: directorKnowledge, positive_prompt: form.positive_prompt.value, negative_prompt: form.negative_prompt.value }) });
+        showToast("风格草稿已保存", "ok"); render(await api("/api/firefire"));
+      } catch (error) { showToast(error.message, "error"); }
     };
     panel.querySelectorAll(".firefire-analyse").forEach((button) => button.onclick = async () => {
       try { await api("/api/firefire/analyse", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: button.dataset.id }) }); showToast("已建立分析工作单，请继续绑定证据", "ok"); render(await api("/api/firefire")); } catch (error) { showToast(error.message, "error"); }

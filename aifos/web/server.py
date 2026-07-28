@@ -3108,7 +3108,8 @@ def make_handler(workspace, jobs):
                     positive_prompt=body.get("positive_prompt", ""),
                     negative_prompt=body.get("negative_prompt", ""),
                     references=body.get("references") or [],
-                    validation=body.get("validation") or {}))
+                    validation=body.get("validation") or {},
+                    director_knowledge=body.get("director_knowledge") or {}))
             except (AifosError, ValueError) as exc:
                 return self._error(400, str(exc))
             return self._json(result, status=201)
