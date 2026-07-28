@@ -280,6 +280,12 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
   不得擅自改时代、组织、能力、技术、物种、性别、年龄段、身份与人物关系;
 - 必须读取 `production_analysis` 制作圣经；逐场继承其中的环境、布局、材质、
   时段天气、主光方向和提示词前缀；继承全局画风、负面提示词与连续性规则;
+- 若 `production_analysis.visual.director_knowledge` 中存在
+  `firefire.director-style/v1`，它就是本风格唯一的高频镜头与视觉效果库：
+  每镜必须依据叙事功能从 `shot_patterns` 选择一个主要镜头组合，并从
+  `visual_effects` 只选本镜必要的效果；不得套用其他风格的惯用运镜，不得把
+  整套粒子、滤镜和光效同时堆入一镜。`camera` 必须明确景别、角度、机位、
+  焦段、一个主要运镜和构图；同时输出 `style_direction` 记录选择结果与动机;
 - 每段只承载一个主要动作或一次情绪转折；台词逐字照抄，禁止改写；
 - 每场先给 1 个环境/肢体镜头，再为每句台词给 1 个对白镜头；
 - 关键台词后的听者反应与情绪高潮留白由平台补齐，不要用空镜凑时长；
@@ -356,6 +362,10 @@ JSON 格式:
   "scene_event_id":"源剧本对应场次的稳定event_id",
   "event_id":"稳定且唯一的镜头事件ID",
   "kind": "environment", "description": "...", "camera": "镜头语言",
+  "style_direction":{{"schema":"firefire.director-style/v1",
+    "shot_pattern":"从本风格高频镜头组合中选中的一项",
+    "visual_effects":["只列本镜实际使用的必要视觉效果"],
+    "selection_reason":"说明该镜头与效果如何服务剧情功能"}},
   "duration": 2.5, "characters": ["角色名"], "dialogue": null,
   "functional_figures": [{{"name":"无独立身份资产的功能人物",
     "count":2,"state":"当前可见状态","function":"本镜剧情功能"}}],
@@ -1094,6 +1104,23 @@ def validate_storyboard(storyboard):
                         "dialogue" if shot.get("dialogue") else "environment")
         shot.setdefault("description", "")
         shot.setdefault("camera", "")
+        style_direction = shot.setdefault("style_direction", {})
+        if not isinstance(style_direction, dict):
+            return f"镜头 style_direction 需为对象: {shot}"
+        if style_direction:
+            if style_direction.get("schema") not in (
+                    None, "", "firefire.director-style/v1"):
+                return f"镜头 style_direction.schema 非法: {shot}"
+            style_direction["schema"] = "firefire.director-style/v1"
+            style_direction["shot_pattern"] = str(
+                style_direction.get("shot_pattern") or "").strip()
+            effects = style_direction.get("visual_effects") or []
+            if not isinstance(effects, list):
+                return f"镜头 style_direction.visual_effects 需为数组: {shot}"
+            style_direction["visual_effects"] = list(dict.fromkeys(
+                str(item).strip() for item in effects if str(item).strip()))
+            style_direction["selection_reason"] = str(
+                style_direction.get("selection_reason") or "").strip()
         shot.setdefault("dialogue", None)
         shot.setdefault("physical_logic", "")
         shot.setdefault("start_state", {})
@@ -1518,6 +1545,12 @@ def build_qc_prompt(payload):
             "本镜为近景/特写档:识别性微细节(如道具的刃口缺口、"
             "标志性磨损、印文)在可见面内必须核验一致")
     physical_text += f"；【尺度判级】{scale_tier}"
+    staging = payload.get("spatial_staging")
+    if isinstance(staging, dict) and staging:
+        # 3D 空间调度的文字合同与出图提示词同源:屏幕定位、遮挡顺序、
+        # 行动路线、屏幕左右关系都是可逐条比对的判据,比"看示意图"硬。
+        physical_text += "；【空间调度核验(与提示词同源)】" + "；".join(
+            f"{label}:{text}" for label, text in staging.items() if text)
     lens = str(payload.get("review_lens") or "").strip().lower()
     if lens in REVIEW_LENSES:
         # 双路会诊的分工:两路都看全图、都给整体判定,但各自深查一半。

@@ -18,6 +18,7 @@ from pathlib import Path
 
 
 SCHEMA = "aifos.spatial-blocking/v3"
+DIALOGUE_SCHEMA = "aifos.dialogue-continuity/v1"
 WIDTH, HEIGHT = 1000, 700
 WORLD_WIDTH_M, WORLD_DEPTH_M = 10.0, 7.0
 DEFAULT_ACTOR_HEIGHT_M = 1.68
@@ -30,6 +31,10 @@ ACTOR_COLORS = (
 MOTION_WORDS = (
     "走", "跑", "冲", "追", "进入", "进门", "离开", "起身", "靠近",
     "后退", "转身", "移动", "绕", "穿过", "上前", "退到", "跟随",
+)
+DIALOGUE_WORDS = (
+    "对话", "交谈", "谈话", "对视", "问话", "回答", "质问", "争辩",
+    "试探", "谈判", "寒暄", "告白",
 )
 
 
@@ -151,6 +156,213 @@ def _direction(start, end):
     return f"{horizontal}{vertical}"
 
 
+def _axis_side(a, b, point):
+    """Return the signed half-plane of point around directed line a→b."""
+    try:
+        ax, ay = float(a["x"]), float(a["y"])
+        bx, by = float(b["x"]), float(b["y"])
+        px, py = float(point["x"]), float(point["y"])
+    except (KeyError, TypeError, ValueError):
+        return 0
+    cross = (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+    if abs(cross) < 1e-6:
+        return 0
+    return 1 if cross > 0 else -1
+
+
+def _reflect_across_axis(point, a, b):
+    """Reflect a 2D canvas point across the actor-to-actor axis."""
+    dx, dy = b["x"] - a["x"], b["y"] - a["y"]
+    length_sq = dx * dx + dy * dy
+    if length_sq <= 1e-6:
+        return dict(point)
+    ratio = (
+        (point["x"] - a["x"]) * dx
+        + (point["y"] - a["y"]) * dy) / length_sq
+    projection = {
+        "x": a["x"] + ratio * dx,
+        "y": a["y"] + ratio * dy,
+    }
+    return _point(
+        2 * projection["x"] - point["x"],
+        2 * projection["y"] - point["y"])
+
+
+def _dialogue_shot(shot, positions):
+    if len(positions) != 2:
+        return False
+    if shot.get("kind") == "dialogue":
+        return True
+    dialogue = shot.get("dialogue")
+    if isinstance(dialogue, dict) and dialogue.get("dialogue"):
+        return True
+    text = " ".join(str(shot.get(key) or "") for key in (
+        "description", "prompt", "action"))
+    return any(word in text for word in DIALOGUE_WORDS)
+
+
+def _dialogue_pair_key(positions):
+    return "|".join(sorted(
+        str(actor.get("actor_id") or "") for actor in positions))
+
+
+def _force_camera_half_plane(camera, axis, side, actor_points):
+    """Keep both camera endpoints on one side of the dialogue axis."""
+    a, b = axis["a"], axis["b"]
+    perimeter = (
+        [_point(x, 585) for x in (120, 240, 360, 500, 640, 760, 880)]
+        + [_point(x, 115) for x in (120, 240, 360, 500, 640, 760, 880)]
+        + [_point(90, y) for y in (190, 300, 410, 520)]
+        + [_point(910, y) for y in (190, 300, 410, 520)]
+    )
+
+    def clear_on_side(original, occupied):
+        reflected = _reflect_across_axis(original, a, b)
+        candidates = [original, reflected, *perimeter]
+        candidates = sorted(
+            {(_candidate["x"], _candidate["y"]): _candidate
+             for _candidate in candidates}.values(),
+            key=lambda candidate: _distance(candidate, original))
+        return next((
+            candidate for candidate in candidates
+            if _axis_side(a, b, candidate) == side
+            and all(_distance(candidate, actor) >= MIN_CAMERA_SEPARATION
+                    for actor in occupied)
+        ), original)
+
+    original_moving = bool(camera.get("moving"))
+    start = clear_on_side(camera["start"], actor_points)
+    end = (
+        clear_on_side(camera["end"], actor_points + [start])
+        if original_moving else start)
+    moving = original_moving and start != end
+    direction = _direction(start, end)
+    camera.update({
+        "start": start,
+        "end": end,
+        "moving": moving,
+        "route": (
+            [dict(start, phase="start"), dict(end, phase="end")]
+            if moving else [dict(start, phase="fixed")]),
+        "direction": direction,
+        "direction_label": (
+            f"镜头{camera.get('movement') or '移动'}：起点→终点，{direction}"
+            if moving else "静止机位：起点=终点"),
+        "dialogue_axis_side": side,
+    })
+    return camera
+
+
+def _dialogue_contract(shot, positions, camera, memory, scene_no):
+    """Build one cross-shot contract for a two-person dialogue pair."""
+    if not _dialogue_shot(shot, positions):
+        return {}
+    pair_key = _dialogue_pair_key(positions)
+    previous = memory.get(pair_key) or {}
+    by_x = sorted(
+        positions,
+        key=lambda actor: (
+            actor["end"]["x"], actor["end"]["y"], actor["actor_id"]))
+    left_id = previous.get("screen_left_actor_id") or by_x[0]["actor_id"]
+    right_id = previous.get("screen_right_actor_id") or by_x[-1]["actor_id"]
+    actor_by_id = {actor["actor_id"]: actor for actor in positions}
+    if left_id not in actor_by_id or right_id not in actor_by_id:
+        left_id, right_id = by_x[0]["actor_id"], by_x[-1]["actor_id"]
+    left, right = actor_by_id[left_id], actor_by_id[right_id]
+    axis = {
+        "a": dict(left["end"]),
+        "b": dict(right["end"]),
+        "a_3d": dict(left["end_3d"]),
+        "b_3d": dict(right["end_3d"]),
+        "rule": "摄影机起点与终点保持在演员连线同一侧；越轴须可见重建",
+    }
+    side = int(previous.get("camera_side_sign") or 0)
+    if side not in (-1, 1):
+        side = _axis_side(axis["a"], axis["b"], camera["start"]) or 1
+    axis_id = previous.get("axis_id") or (
+        f"S{int(scene_no):02d}-{pair_key.replace('|', '-')}-A01")
+    camera = _force_camera_half_plane(
+        camera, axis, side,
+        [point for actor in positions
+         for point in (actor["start"], actor["end"])])
+    # 轴线校正会把机位弹到画布边缘的固定环上,距离随之失真;守住轴线
+    # 所在的半平面方向不变,只把距离重新拉回声明景别应有的值。
+    if camera.get("scale_distance_m"):
+        target = _point(
+            sum(p["end"]["x"] for p in positions) / max(1, len(positions)),
+            sum(p["end"]["y"] for p in positions) / max(1, len(positions)))
+        _rescale_to_declared_distance(
+            camera, target, camera["scale_distance_m"])
+    for actor, other in ((left, right), (right, left)):
+        actor["facing"] = f"面向{other['name']}"
+        actor["gaze_target_actor_id"] = other["actor_id"]
+        actor["gaze_target_name"] = other["name"]
+        actor["eyeline_screen_direction"] = (
+            "向右" if actor["actor_id"] == left_id else "向左")
+        actor["spatial_anchor"] = (
+            "left" if actor["actor_id"] == left_id else "right")
+    camera_design = (
+        (shot.get("five_dimensions") or {}).get("camera_design") or {})
+    scale = str(camera_design.get("shot_scale") or "")
+    position = str(
+        camera.get("position")
+        or camera_design.get("camera_position") or "")
+    if "过肩" in position:
+        coverage = "同侧过肩正反打"
+    elif scale in ("远景", "全景", "中景"):
+        coverage = "双人建立镜头"
+    else:
+        coverage = "同侧情绪近景"
+    speaker = str((shot.get("dialogue") or {}).get("character") or "")
+    subject = next(
+        (actor for actor in positions if actor["name"] == speaker), None)
+    foreground = (
+        next((actor for actor in positions if actor is not subject), None)
+        if coverage == "同侧过肩正反打" and subject else None)
+    contract = {
+        "schema": DIALOGUE_SCHEMA,
+        "pair_id": pair_key,
+        "pair_actor_ids": [left_id, right_id],
+        "screen_left_actor_id": left_id,
+        "screen_right_actor_id": right_id,
+        "screen_left_name": left["name"],
+        "screen_right_name": right["name"],
+        "axis_id": axis_id,
+        "axis": axis,
+        "camera_side_sign": side,
+        "camera_side": "positive" if side > 0 else "negative",
+        "coverage": coverage,
+        "foreground_actor_id": (
+            foreground.get("actor_id") if foreground else ""),
+        "subject_actor_id": subject.get("actor_id") if subject else "",
+        "eyelines": {
+            left_id: {
+                "target_actor_id": right_id,
+                "target_name": right["name"],
+                "screen_direction": "向右",
+            },
+            right_id: {
+                "target_actor_id": left_id,
+                "target_name": left["name"],
+                "screen_direction": "向左",
+            },
+        },
+        "rules": [
+            "左右锚点跨镜稳定，不得交换两人方位",
+            "摄影机起点与终点保持在演员连线同一侧",
+            "双方身体朝向彼此，画内视线方向互补",
+            "过肩前景只能属于另一位对话者，不得生成随机第三人",
+            "越轴必须通过可见运镜、人物走位或中性机位重建新轴线",
+        ],
+    }
+    memory[pair_key] = {
+        key: contract[key] for key in (
+            "screen_left_actor_id", "screen_right_actor_id",
+            "axis_id", "camera_side_sign")
+    }
+    return contract
+
+
 def _actor_is_moving(name, people, shot, state_start, state_end):
     if (state_start.get("position") and state_end.get("position")
             and state_start.get("position") != state_end.get("position")):
@@ -201,6 +413,79 @@ def build_character_number_map(continuity, storyboard=None):
             "color": ACTOR_COLORS[(index - 1) % len(ACTOR_COLORS)],
         }
     return result
+
+
+# 景别 → 摄影机到主体的目标距离(米)。与 spatial_language 的距离分档
+# 同源(取各档中值),保证"声明景别"与"三维机位"从一开始就一致。
+# 此前机位距离是画布布局的副产品(固定 start_y=625 换算而来),与声明
+# 景别完全无关——实测 ep24 12 镜里 4 镜声明特写/中近景却把机位摆在
+# 4~5 米外,成片必然对不上,改图也改不动(输入本身矛盾)。
+SUBJECT_EYE_HEIGHT_M = 1.43   # 1.68m 主体的胸眼高度
+SCALE_TARGET_DISTANCE_M = {
+    "大特写": 0.8, "特写": 1.0, "近景": 1.7, "中近景": 1.9,
+    "中景": 2.8, "膝上景": 3.0, "七分身": 3.2,
+    "全景": 4.6, "远景": 7.5, "大远景": 10.0,
+}
+_SCALE_TOKENS = tuple(SCALE_TARGET_DISTANCE_M)
+
+
+def declared_scale(shot):
+    """镜头声明的景别(五维优先,退回镜头原文);未命中返回空串。"""
+    design = ((shot.get("five_dimensions") or {}).get("camera_design") or {})
+    for source in (design.get("shot_size"), design.get("scale"),
+                   shot.get("camera")):
+        text = str(source or "")
+        for token in _SCALE_TOKENS:
+            if token in text:
+                return token
+    return ""
+
+
+def _scale_camera_distance(camera, target, shot):
+    """把机位沿现有方向拉到声明景别应有的距离(2D 与 3D 同步)。
+
+    只改距离、不改方向与高度:机位角度是分镜的创作选择,距离才是被
+    画布布局意外决定的。2D 坐标同步修正,保证示意图与文字合同一致。
+    """
+    scale = declared_scale(shot)
+    desired = SCALE_TARGET_DISTANCE_M.get(scale)
+    if not desired:
+        return camera
+    camera["scale_distance_m"] = desired
+    camera["scale_for_distance"] = scale
+    return _rescale_to_declared_distance(camera, target, desired)
+
+
+def _rescale_to_declared_distance(camera, target, desired):
+    """沿现有方向把机位拉到 desired 米(只改距离,不改方向与高度)。"""
+    # 目标点抬到主体胸眼高度:与 spatial_language 的被摄距离同口径,
+    # 否则"按水平距离摆位、按三维距离核验"两边永远对不上。
+    world_target = _world_point(target, SUBJECT_EYE_HEIGHT_M)
+    for key in ("start", "end"):
+        point = camera.get(key)
+        if not isinstance(point, dict):
+            continue
+        world_cam = _world_point(
+            point, _camera_height(
+                str(camera.get("position") or ""),
+                str(camera.get("movement") or ""),
+                "start" if key == "start" else "end"))
+        current = math.dist(
+            (world_cam["x"], world_cam["y"], world_cam["z"]),
+            (world_target["x"], world_target["y"], world_target["z"]))
+        if current < 1e-3:
+            continue
+        ratio = desired / current
+        if abs(ratio - 1.0) < 0.05:
+            continue
+        camera[key] = _point(
+            target["x"] + (point["x"] - target["x"]) * ratio,
+            target["y"] + (point["y"] - target["y"]) * ratio)
+    start, end = camera["start"], camera["end"]
+    camera["moving"] = start != end
+    camera["route"] = ([dict(start, phase="start"), dict(end, phase="end")]
+                       if camera["moving"] else [dict(start, phase="fixed")])
+    return camera
 
 
 def _lens_and_fov(shot):
@@ -358,11 +643,17 @@ def _camera_block(shot, target):
         end_y -= 90
     lens, fov = _lens_and_fov(shot)
     start, end = _point(start_x, start_y), _point(end_x, end_y)
+    block = {"start": start, "end": end}
+    # 机位距离按声明景别校正:此前它只是画布布局的副产品,与景别无关。
+    _scale_camera_distance(block, target, shot)
+    start, end = block["start"], block["end"]
     moving = start != end
     direction = _direction(start, end)
     return {
         "start": start,
         "end": end,
+        "scale_distance_m": block.get("scale_distance_m"),
+        "scale_for_distance": block.get("scale_for_distance", ""),
         "target": target,
         "movement": movement,
         "moving": moving,
@@ -432,6 +723,17 @@ def _needs_map(shots, group_threshold):
     reasons = []
     if max_people >= group_threshold:
         reasons.append(f"多人场景（最高 {max_people} 人）")
+    if any(
+            len(list(dict.fromkeys(shot.get("characters", [])))) == 2
+            and (
+                shot.get("kind") == "dialogue"
+                or (isinstance(shot.get("dialogue"), dict)
+                    and shot["dialogue"].get("dialogue"))
+                or any(word in " ".join(str(shot.get(key) or "")
+                                        for key in ("description", "prompt"))
+                       for word in DIALOGUE_WORDS))
+            for shot in shots):
+        reasons.append("双人对话需要固定左右锚点、180°轴线与互锁视线")
     if any(word in text for word in MOTION_WORDS):
         reasons.append("包含人物走位")
     if any(word in " ".join((
@@ -464,6 +766,7 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
                  if int(s.get("scene_no", 0)) == scene_no]
         required, reasons = _needs_map(shots, int(group_threshold or 3))
         previous_end = {}
+        dialogue_memory = {}
         scene_shots = []
         for local_index, shot in enumerate(shots):
             people = list(dict.fromkeys(shot.get("characters", [])))
@@ -567,9 +870,17 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
                 / max(1, len(positions)))
             actor_markers = [point for position in positions
                              for point in (position["start"], position["end"])]
-            camera = _attach_camera_3d(
+            # 先避让人物标记(防图标压住人物),再按声明景别定距——
+            # 顺序反了的话避让会把机位弹到画布边缘的固定环上,
+            # 距离校正被整个抹掉(实测:声明特写仍在 4~5 米外)。
+            camera_2d = _scale_camera_distance(
                 _clear_camera_icons(
                     _camera_block(shot, target), actor_markers),
+                target, shot)
+            dialogue_continuity = _dialogue_contract(
+                shot, positions, camera_2d, dialogue_memory, scene_no)
+            camera = _attach_camera_3d(
+                camera_2d,
                 start_target, target,
                 sum(p["target_start_height_m"] for p in positions)
                 / max(1, len(positions)),
@@ -598,6 +909,19 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
                 "编号、坐标和路线仅供生产约束引用，最终画面不得出现人物编号、"
                 "姓名标签、坐标、箭头或调度图符号。"
             )
+            if dialogue_continuity:
+                left_id = dialogue_continuity["screen_left_actor_id"]
+                right_id = dialogue_continuity["screen_right_actor_id"]
+                constraint += (
+                    f" 双人对话轴线锁：axis_id="
+                    f"{dialogue_continuity['axis_id']}；"
+                    f"{left_id}固定空间左锚点，{right_id}固定空间右锚点；"
+                    f"摄影机起点与终点保持演员连线"
+                    f"{dialogue_continuity['camera_side']}半平面；"
+                    f"{left_id}看{right_id}，{right_id}看{left_id}，"
+                    "画内视线方向互补；禁止左右互换、并排同向、看空气、"
+                    "随机第三人过肩或无重建越轴。"
+                )
             block = {
                 "shot_no": int(shot.get("shot_no", 0)),
                 "scene_no": scene_no,
@@ -611,11 +935,16 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
                 },
                 "actors": positions,
                 "camera": camera,
-                "axis": {"a": _point(120, target["y"]),
-                         "b": _point(880, target["y"]),
-                         "a_3d": _world_point(_point(120, target["y"])),
-                         "b_3d": _world_point(_point(880, target["y"])),
-                         "rule": "机位保持在同一轴线侧，越轴须另建镜头"},
+                "axis": (
+                    dialogue_continuity["axis"]
+                    if dialogue_continuity else {
+                        "a": _point(120, target["y"]),
+                        "b": _point(880, target["y"]),
+                        "a_3d": _world_point(_point(120, target["y"])),
+                        "b_3d": _world_point(_point(880, target["y"])),
+                        "rule": "机位保持在同一轴线侧，越轴须另建镜头",
+                    }),
+                "dialogue_continuity": dialogue_continuity,
                 "constraint": constraint,
             }
             scene_shots.append(block)
@@ -684,6 +1013,7 @@ def validate_spatial_plan(plan, storyboard):
         for scene in plan.get("scenes", []) for shot in scene.get("shots", [])
     }
     previous = {}
+    previous_dialogue = {}
     for shot in storyboard.get("shots", []):
         shot_no = str(shot.get("shot_no"))
         block = index.get(shot_no)
@@ -781,6 +1111,58 @@ def validate_spatial_plan(plan, storyboard):
         elif (not camera.get("moving")
               and camera.get("start") != camera.get("end")):
             issues.append(f"镜头 {shot_no} 静止机位起终点不一致")
+        dialogue = block.get("dialogue_continuity") or {}
+        if dialogue:
+            if dialogue.get("schema") != DIALOGUE_SCHEMA:
+                issues.append(
+                    f"镜头 {shot_no} 双人对话合同版本错误")
+            pair_ids = list(dialogue.get("pair_actor_ids") or [])
+            actual_ids = [actor.get("actor_id") for actor in actor_points]
+            if len(pair_ids) != 2 or set(pair_ids) != set(actual_ids):
+                issues.append(
+                    f"镜头 {shot_no} 双人对话角色编号与空间人物不一致")
+            left_id = dialogue.get("screen_left_actor_id")
+            right_id = dialogue.get("screen_right_actor_id")
+            if (not left_id or not right_id or left_id == right_id
+                    or {left_id, right_id} != set(actual_ids)):
+                issues.append(
+                    f"镜头 {shot_no} 缺少稳定的双人左右锚点")
+            actor_by_id = {
+                actor.get("actor_id"): actor for actor in actor_points}
+            for actor_id, other_id in (
+                    (left_id, right_id), (right_id, left_id)):
+                actor = actor_by_id.get(actor_id) or {}
+                other = actor_by_id.get(other_id) or {}
+                if (actor.get("gaze_target_actor_id") != other_id
+                        or other.get("name") not in str(
+                            actor.get("facing") or "")):
+                    issues.append(
+                        f"镜头 {shot_no} 的 {actor_id} 未与"
+                        f"{other_id} 建立互锁视线/相向站位")
+            axis = dialogue.get("axis") or {}
+            axis_a, axis_b = axis.get("a") or {}, axis.get("b") or {}
+            expected_side = int(dialogue.get("camera_side_sign") or 0)
+            if expected_side not in (-1, 1):
+                issues.append(
+                    f"镜头 {shot_no} 双人对话未声明许可机位半平面")
+            elif any(
+                    _axis_side(axis_a, axis_b, camera.get(phase) or {})
+                    != expected_side
+                    for phase in ("start", "end")):
+                issues.append(
+                    f"镜头 {shot_no} 摄影机跨越双人表演轴或落在轴线上")
+            dialogue_key = (
+                scene_no, str(dialogue.get("pair_id") or ""))
+            prior = previous_dialogue.get(dialogue_key)
+            current = {
+                key: dialogue.get(key) for key in (
+                    "screen_left_actor_id", "screen_right_actor_id",
+                    "axis_id", "camera_side_sign")
+            }
+            if prior and current != prior:
+                issues.append(
+                    f"镜头 {shot_no} 双人左右锚点/轴线侧未继承上一镜")
+            previous_dialogue[dialogue_key] = current
         for point in {
                 ((camera.get(phase) or {}).get("x"),
                  (camera.get(phase) or {}).get("y"))

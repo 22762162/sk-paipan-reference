@@ -18,7 +18,33 @@ from .camera_language import (
     enforce_spatial_anchor_scale,
 )
 from .lighting_language import lighting_clause
+from .spatial_language import spatial_lines
 from .realism_language import realism_applicable
+
+
+def _spatial_staging_block(shot):
+    """3D 空间调度 → {标签: 条款} 的可核验空间事实。"""
+    shot = shot if isinstance(shot, dict) else {}
+    block = shot.get("spatial_blocking")
+    if not isinstance(block, dict) or not block.get("actors"):
+        return {}
+    camera = shot.get("camera")
+    scale = ""
+    if isinstance(camera, dict):
+        scale = str(camera.get("景别") or "")
+    else:
+        for token in ("大特写", "特写", "中近景", "近景", "膝上景",
+                      "七分身", "中景", "大远景", "全景", "远景"):
+            if token in str(camera or ""):
+                scale = token
+                break
+    phase = str(shot.get("frame_phase")
+                or (shot.get("frame_target") or {}).get("phase")
+                or "start").lower()
+    phase = phase if phase in ("start", "end") else "start"
+    return {
+        label: text for label, text in spatial_lines(
+            block, phase=phase, declared_scale=scale)}
 
 
 def lighting_lines_for_shot(shot, style, scene):
@@ -1862,11 +1888,29 @@ def build_physical_contract(shot):
                     continue
                 name = _text(actor.get("name") or actor.get("character"))
                 pos = _text(actor.get("start") or actor.get("position"))
-                direction = _text(actor.get("direction"))
+                direction = _text(
+                    actor.get("direction") or actor.get("facing"))
                 if name and (pos or direction):
                     positions.append(f"{name}:{pos or '原位'}{('，朝向' + direction) if direction else ''}")
             if positions:
                 rules.append("人物站位与朝向：" + "；".join(positions) + "。")
+        dialogue = blocking.get("dialogue_continuity") or {}
+        if isinstance(dialogue, dict) and dialogue.get("axis_id"):
+            left = _text(dialogue.get("screen_left_name"))
+            right = _text(dialogue.get("screen_right_name"))
+            side = _text(dialogue.get("camera_side"))
+            coverage = _text(dialogue.get("coverage"))
+            rules.append(
+                "双人对话180°轴线合同："
+                f"axis_id={dialogue.get('axis_id')}；"
+                f"{left or '左侧角色'}固定空间左锚点，"
+                f"{right or '右侧角色'}固定空间右锚点；"
+                f"摄影机起点和终点都在演员连线的{side or '指定'}半平面；"
+                f"本镜制式={coverage or '同侧对话镜头'}；"
+                "双方身体朝向彼此，视线精确落在对方双眼附近且画内方向互补；"
+                "禁止交换左右、并排同向、看空气、随机第三人过肩、"
+                "镜像翻转或无可见重建的越轴。"
+            )
     rules = list(dict.fromkeys(rule for rule in rules if rule))
     objects = list(dict.fromkeys(_text(value) for value in objects if _text(value)))
     return {
@@ -2250,6 +2294,9 @@ def build_shot_prompt_contract(
             **shot, "location": scene, "style": style,
         }),
         "style": _text(style or shot.get("style")),
+        "style_direction": (
+            dict(shot.get("style_direction"))
+            if isinstance(shot.get("style_direction"), dict) else {}),
         "visual_medium": medium["dimension"],
         "medium": medium,
         "start": _registered_state_value(
@@ -2272,6 +2319,10 @@ def build_shot_prompt_contract(
         # 光影执行条款:按场景时间/地点/情绪与本镜景别自动选型,
         # 非写实画风自动为空(不给二次元塞摄影术语)。
         "lighting": lighting_lines_for_shot(shot, style, scene),
+        # 3D 空间调度 → 可核验文字:屏幕定位、遮挡序、朝向视线、
+        # 行动路线、屏幕方向轴线。此前这些数字只画进示意图,模型得
+        # "看懂图";现在图与文字各司其职,质检也按同一判据核验。
+        "spatial_staging": _spatial_staging_block(shot),
         "camera_precedence": (
             "本合同 camera 字段是唯一执行镜位,已按「分镜原文 > 镜头"
             "合同 > 五维默认」融合完毕;上下文中任何其他来源的机位、"
@@ -2455,6 +2506,11 @@ def render_shot_prompt(contract, *, mode=None):
     # 光影是第四维:只说机位不说布光,模型必然给平光,成片没有氛围
     # (2026-07-28 盘点:镜头语言14条全在景别/角度/机位,光影为0)。
     lighting_line = contract.get("lighting") or ""
+    # 空间调度文字合同:屏幕定位/遮挡序/朝向视线/行动路线/轴线方向
+    staging_lines = [
+        f"【{label}】{text}。"
+        for label, text in (contract.get("spatial_staging") or {}).items()
+        if text]
     if contract.get("camera_precedence"):
         camera_line = (
             f"{camera_line}；本行为唯一执行镜位(camera_precedence):"
@@ -2621,6 +2677,7 @@ def render_shot_prompt(contract, *, mode=None):
             f"【表演】{contract.get('performance', '自然微表情')}。",
             f"【镜头】{camera_line}。",
             *([f"【光影】{lighting_line}。"] if lighting_line else []),
+            *staging_lines,
             f"【终点】{contract.get('end', '到达尾帧状态')}。",
         ])
     else:
@@ -2646,6 +2703,7 @@ def render_shot_prompt(contract, *, mode=None):
             f"【定格状态】{target_state}{fallback_note}。",
             f"【镜头】{camera_line}。",
             *([f"【光影】{lighting_line}。"] if lighting_line else []),
+            *staging_lines,
         ])
     frame_props = contract.get("frame_props") or []
     visible_props = (
@@ -2703,6 +2761,17 @@ def render_shot_prompt(contract, *, mode=None):
         lines.append(f"【视觉媒介】{medium_line}。")
     if contract.get("style"):
         lines.append(f"【画风】{contract['style']}（只沿用项目基准，不改媒介）。")
+    direction = contract.get("style_direction") or {}
+    if isinstance(direction, dict) and (
+            direction.get("shot_pattern")
+            or direction.get("visual_effects")):
+        effects = "、".join(direction.get("visual_effects") or [])
+        lines.append(
+            "【风格导演执行】"
+            + (f"镜头组合={direction.get('shot_pattern')}；"
+               if direction.get("shot_pattern") else "")
+            + (f"视觉效果={effects}；" if effects else "")
+            + f"动机={direction.get('selection_reason') or '服务本镜叙事功能'}。")
     if media == "video" and contract.get("dialogue"):
         speaker = contract.get("speaker") or "说话人"
         lines.append(f"【对白】{speaker}说出「{contract['dialogue']}」，自然口型；不画字幕。")
