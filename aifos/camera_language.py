@@ -104,6 +104,39 @@ CAMERA_SCALE_CAPACITY = {
 }
 _CAPACITY_UPGRADE_ORDER = ("中景", "全景", "远景")
 
+# 「人物 + 不在其手上的道具」要同框表现空间关系(沈眉站在书案右侧、
+# 银铃静止在书案上),取景必须同时装下人和那件道具。特写/近景只框
+# 得住人物本身,这类合同必然执行不了——与人数容量同一病根:景别
+# 分配不看本镜要表现什么。
+_ANCHOR_SAFE_SCALES = frozenset(
+    {"中景", "膝上景", "七分身", "全景", "远景", "大远景"})
+
+
+def enforce_spatial_anchor_scale(scale, anchor_count, allowed=None):
+    """本镜要同框呈现的空间锚点(人物+离身道具)超过一个时放宽景别。
+
+    anchor_count<=1 或未知时不动;人数容量走 enforce_scale_capacity,
+    两者取更宽的那个由调用方按顺序应用即可。
+    """
+    try:
+        count = int(anchor_count)
+    except (TypeError, ValueError):
+        return scale, ""
+    scale_text = str(scale or "").strip()
+    if count <= 1 or not scale_text or scale_text in _ANCHOR_SAFE_SCALES:
+        return scale, ""
+    candidates = [
+        value for value in _CAPACITY_UPGRADE_ORDER
+        if not allowed or value in allowed]
+    if not candidates:
+        return scale, ""
+    upgraded = candidates[0]
+    note = (
+        f"空间锚点修正:本镜需同框呈现 {count} 个空间锚点"
+        f"(人物与离身道具的位置关系),{scale_text}装不下,已升档为"
+        f"{upgraded}")
+    return upgraded, note
+
 
 def scale_capacity(scale):
     """该景别在全员必见合同下的最大真人数;未知景别视为不设限。"""
@@ -133,6 +166,83 @@ def enforce_scale_capacity(scale, visible_count, allowed=None):
         f"景别容量修正:{scale}最多完整容纳{scale_capacity(scale)}人,"
         f"本镜人数合同要求{count}人全部可见,已升档为{upgraded}")
     return upgraded, note
+
+
+# 构图容量:这些构图按定义需要环境结构或画面纵深进入取景,肩线以下
+# 全部出画的紧景别根本装不下。旧版把景别与构图各自轮换分配,编译出
+# 「大特写 + 框中框」这种几何上不可能的合同:模型只能拉宽成中景去
+# 满足框中框,再被质检判「景别严重不符」——《长夏记事》8/8 关键帧
+# 全灭同一原因。构图是次要审美,景别是导演意图,冲突时让构图。
+ENVIRONMENT_COMPOSITIONS = {
+    "框中框": "需要门框/窗棂/帷幔等环境结构入画",
+    "引导线": "需要画面内线条汇聚指向主体",
+    "水平分割": "需要地平线/桌面/水面横向分割画面",
+    "对角线": "需要画面对角方向的空间动势",
+}
+# 任何景别都成立的安全构图,按优先级回落。
+_SAFE_COMPOSITIONS = ("三分法", "中心构图", "中心对称", "留白")
+# 环境类构图至少需要这些景别之一。
+_ENVIRONMENT_SAFE_SCALES = frozenset(
+    {"中景", "膝上景", "七分身", "全景", "远景", "大远景"})
+
+
+# 机位容量:过肩/反打按定义需要「前景一个人的后脑肩背 + 远端另一个
+# 人物」,单人镜头根本构不成这种关系。盲轮换把过肩配给独角戏时,模型
+# 只能画成普通正面,再被质检判「过肩关系缺失」——与景别容量、构图
+# 容量同一病根:镜头维度分配不看本镜有几个人。
+MULTI_ACTOR_POSITIONS = {
+    "过肩": "需要前景一名人物的后脑肩背与远端另一名人物",
+    "反打": "需要对话双方分处两个互补机位",
+}
+_SINGLE_ACTOR_POSITIONS = ("斜侧", "侧面", "正面", "四分之三面")
+
+
+def enforce_position_capacity(position, visible_count, allowed=None):
+    """单人镜头拿到过肩/反打时换成单人成立的机位。
+
+    visible_count 未知或已达 2 人时不动;宁可漏修不可误改。
+    """
+    pos_text = str(position or "").strip()
+    if pos_text not in MULTI_ACTOR_POSITIONS:
+        return position, ""
+    try:
+        count = int(visible_count)
+    except (TypeError, ValueError):
+        return position, ""
+    if count >= 2:
+        return position, ""
+    fallback = next(
+        (value for value in _SINGLE_ACTOR_POSITIONS
+         if not allowed or value in allowed), "")
+    if not fallback:
+        return position, ""
+    note = (
+        f"机位容量修正:{pos_text}{MULTI_ACTOR_POSITIONS[pos_text]},"
+        f"本镜可见真人{count}人构不成该关系,已改用{fallback}")
+    return fallback, note
+
+
+def enforce_composition_scale(scale, composition, allowed=None):
+    """紧景别装不下环境类构图时换掉构图;返回 (执行构图, 修正说明)。
+
+    只动构图不动景别:景别承载导演的情绪意图(要看清银铃的浅刻纹),
+    构图是可替换的次要审美。allowed 给定时只在该集合里回落。
+    """
+    scale_text = str(scale or "").strip()
+    comp_text = str(composition or "").strip()
+    if comp_text not in ENVIRONMENT_COMPOSITIONS:
+        return composition, ""
+    if not scale_text or scale_text in _ENVIRONMENT_SAFE_SCALES:
+        return composition, ""
+    fallback = next(
+        (value for value in _SAFE_COMPOSITIONS
+         if not allowed or value in allowed), "")
+    if not fallback:
+        return composition, ""
+    note = (
+        f"构图容量修正:{comp_text}{ENVIRONMENT_COMPOSITIONS[comp_text]},"
+        f"{scale_text}装不下,已改用{fallback}")
+    return fallback, note
 
 
 # 场景母版视角集:key → (中文名, 机位描述)。反打/侧向以主视角图为

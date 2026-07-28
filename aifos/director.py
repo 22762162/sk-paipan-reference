@@ -56,10 +56,14 @@ from .prompt_contract import (
     validate_shot_prompt_contract,
 )
 from .qc_feedback import optimize_qc_feedback
-from .lessons import (DOMAIN_SCRIPT, lessons_block, project_lessons,
-                      record_lessons, script_lessons_block)
+from .lessons import (DISTILL_MIN_PENDING, DOMAIN_IMAGE, DOMAIN_SCRIPT,
+                      adopt_distilled_rules, lessons_block,
+                      pending_observations, project_lessons, record_lessons,
+                      script_lessons_block)
 from .qc_stats import record_qc
 from .relations import relation_lines, write_relations
+from .spatial_language import derive_movement_term, spatial_lines
+from .camera_language import MOVEMENT_GEOMETRY
 from .spatial_blocking import (
     build_spatial_plan,
     mark_spatial_reference_requirements,
@@ -4524,9 +4528,17 @@ class Director:
             "production_ready": passed,
             "qc_policy": "visible_major_defects_v2",
             "input_contract_advisory": not input_contract_passed,
+            # hard_failure 的语义是「不能出街、也不允许人工放行」——身份、
+            # 性别、人数这类硬伤。合同不一致(景别/焦段/机位与合同对不上)
+            # 不属于这一档:画面本身可能完全达标,只是没按一份可能本来就
+            # 错的合同拍。把它算进硬伤,等于让错合同拥有一票否决权,人工
+            # 连放行的权力都没有(《长夏记事》实案:visual_pass=True、
+            # identity/count/spatial 全 True、质检自己写「画面本身达到放行
+            # 阈值」,仍因 contract_hard_failure 被锁死在人工检查点)。
+            # 画面自身没过时,合同不一致仍并入硬伤——那才是真要重画。
             "hard_failure": bool(
-                (visual_hard_failure and not image_passed)
-                or contract_hard_failure),
+                visual_hard_failure and not image_passed
+                or (contract_hard_failure and not image_passed)),
             "contract_hard_failure": contract_hard_failure,
         }
         report.update({
@@ -10253,8 +10265,58 @@ class Director:
             narrative_overlays=payload.get("narrative_overlays"),
             functional_figures=payload.get("functional_figures"))}
 
+    def _distill_lessons(self, ctx, domain=DOMAIN_IMAGE):
+        """把反复出现的原始质检观察归纳成可复用通用规则并自动采纳。
+
+        病灶(2026-07-28 实测):《雨夜凶杀》攒了 372 条真实教训,状态全是
+        pending_review——"未人工批准前不会注入后续提示词"。没人会去手工
+        批 372 条;而且原始观察是镜头级的(某人某处的伤口),直接注入所有
+        提示词反而是污染。解法是归纳:AI 把反复出现的观察提炼成不含镜头
+        级专名、可跨镜执行的规则,这类结论才自动采纳进提示词;原始观察
+        仍保持 pending,看板上可查可撤。
+        """
+        if not self.config.get("defaults", "lesson_distill", default=True):
+            return 0
+        project_id = ctx["project"]["id"]
+        pending = pending_observations(self.assets, project_id, domain=domain)
+        if len(pending) < DISTILL_MIN_PENDING:
+            return 0
+        # 专名清单交给校验器兜底:归纳规则里出现任何角色/道具名即打回
+        proper_nouns = [
+            str(item.get("name") or "")
+            for item in (ctx.get("script") or {}).get("characters", [])
+            if item.get("name")]
+        proper_nouns += [
+            str(item.get("name") or "")
+            for item in (ctx.get("script") or {}).get("core_props", [])
+            if isinstance(item, dict) and item.get("name")]
+        try:
+            result = self._call(ctx, "script", {
+                "lesson_distill": True,
+                "observations": [str(item.get("issue") or "")
+                                 for item in pending],
+                "proper_nouns": [name for name in proper_nouns if name],
+                "max_rules": 8,
+            }, "images")
+        except Exception as exc:
+            self.log.warn(
+                "director", f"教训归纳失败,本轮跳过(不影响出图): "
+                            f"{str(exc)[:200]}")
+            return 0
+        rules = (result.data or {}).get("rules") or []
+        written = adopt_distilled_rules(
+            self.assets, project_id, rules, domain=domain)
+        if written:
+            self.log.info(
+                "director",
+                f"已把 {len(pending)} 条反复出现的质检观察归纳为 {written} "
+                "条通用规则并自动采纳进后续提示词: "
+                + "；".join(str(r.get("rule"))[:40] for r in rules[:3]))
+        return written
+
     def _stage_images(self, ctx):
         self._plan_seed_shots(ctx)
+        self._distill_lessons(ctx)
         reconciliation = self.reconcile_completed_shot_images(ctx)
         # 生产画布:出图一开始就落盘人物/场景/镜头关系线,
         # 前端画布与出图/质检提示词共用,牵引人物关联性不漂移
@@ -11390,6 +11452,18 @@ class Director:
         performance = shot.get("performance") or {}
         spatial = shot_blocking(ctx.get("blocking"), shot["shot_no"]) or {}
         spatial_rule = str(spatial.get("constraint") or "").strip()
+        # 运镜:分镜只给一个词(如"缓推"),对视频模型约束力弱。用 3D 机位
+        # 起终点推导出实际运动,再翻译成可核验的画面变化(取景由宽变窄、
+        # 背景视差、主体在画面中的大小变化)。两者不一致时以三维调度为准。
+        derived_movement = derive_movement_term(spatial.get("camera") or {})
+        movement_geometry = MOVEMENT_GEOMETRY.get(
+            derived_movement) or MOVEMENT_GEOMETRY.get(
+                next((word for word in MOVEMENT_GEOMETRY
+                      if word in movement), ""), "")
+        # 空间文字合同:屏幕定位/遮挡序/行动路线,与关键帧同源
+        spatial_text = "；".join(
+            f"{label}:{text}" for label, text in spatial_lines(
+                spatial, phase="start") if text and label != "空间冲突")
         readable = shot.get("readable_text") or {}
         if readable_text_required(readable):
             text_rule = (
@@ -11417,13 +11491,20 @@ class Director:
             f"【表演】{performance.get('gaze') or '逐角色视线严格服从condition'}；"
             f"{performance.get('micro_expression') or '逐角色表演严格服从condition'}"
             f"{dialogue_rule}。",
-            f"【运镜】只执行一次{movement}；"
-            f"{camera.get('shot_scale') or (shot.get('shot_contract') or {}).get('景别') or '保持既定景别'}，"
+            f"【运镜】只执行一次{movement}"
+            + (f"(三维调度推导={derived_movement})"
+               if derived_movement and derived_movement not in movement
+               else "")
+            + (f"；按可见变化执行并核验:{movement_geometry}"
+               if movement_geometry else "")
+            + f"；{camera.get('shot_scale') or (shot.get('shot_contract') or {}).get('景别') or '保持既定景别'}，"
             f"{camera.get('angle') or (shot.get('shot_contract') or {}).get('角度') or '保持轴线'}；"
             f"动机={camera.get('movement_motivation') or '服务主体动作'}。",
         ]
         if spatial_rule:
             lines.append(f"【空间路径】{spatial_rule}")
+        if spatial_text:
+            lines.append(f"【空间调度】{spatial_text}。")
         lines.extend([
             f"【终点】{state_line(shot.get('end_state')) or '准确到达尾帧状态'}。",
             f"【文字】{text_rule}。",

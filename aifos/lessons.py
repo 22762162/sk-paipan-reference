@@ -179,6 +179,61 @@ def set_lesson_approval(assets, project_id, lesson_id, approved,
     }
 
 
+DISTILLED_SCOPE = "distilled_project_rule"
+DISTILL_MIN_PENDING = 12       # 少于这么多条不值得归纳
+DISTILL_MIN_COUNT = 2          # 只喂反复出现过的观察,一次性抱怨不进
+
+
+def pending_observations(assets, project_id, domain=DOMAIN_IMAGE,
+                         min_count=DISTILL_MIN_COUNT, limit=40):
+    """待归纳的原始观察(按出现次数降序):只取反复出现的。
+
+    一次性观察多半是判官对单镜的即兴描述,归纳价值低、噪音大。
+    """
+    return [
+        item for item in project_lessons(
+            assets, project_id, limit=200, domain=domain)
+        if not item.get("approved_for_prompt")
+        and int(item.get("count") or 1) >= min_count
+    ][:limit]
+
+
+def adopt_distilled_rules(assets, project_id, rules, domain=DOMAIN_IMAGE):
+    """把归纳出的通用规则登记为已批准教训(直接进后续提示词)。
+
+    归纳规则是"经验的结论"而不是"原始观察":它已被明确要求不含镜头级
+    专名、可跨镜执行,所以自动采纳;原始观察仍保持 pending,人工看板
+    上照常可查可撤。返回实际写入的条数。
+    """
+    written = 0
+    for index, rule in enumerate(rules or [], 1):
+        text = str((rule or {}).get("rule")
+                   if isinstance(rule, dict) else rule or "").strip()
+        if not text:
+            continue
+        lesson_id = f"distilled:{domain}:{_digest(text)}"
+        assets.register(project_id, "lesson", lesson_id, meta={
+            "issue": text,
+            "domain": domain,
+            "count": int((rule or {}).get("count") or 1)
+            if isinstance(rule, dict) else 1,
+            "status": "approved",
+            "approved_for_prompt": True,
+            "scope": DISTILLED_SCOPE,
+            "source": "ai_distilled",
+            "covers": list((rule or {}).get("covers") or [])
+            if isinstance(rule, dict) else [],
+            "reviewed_at": time.time(),
+        }, new_version=True)
+        written += 1
+    return written
+
+
+def _digest(text):
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
 def lesson_lines(assets, project_id, limit=MAX_INJECTED,
                  domain=DOMAIN_IMAGE):
     """只返回人工批准的项目规则；旧记录也默认不注入。"""

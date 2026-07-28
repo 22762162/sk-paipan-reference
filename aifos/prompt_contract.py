@@ -10,7 +10,13 @@ from __future__ import annotations
 
 import re
 
-from .camera_language import camera_geometry_clause, enforce_scale_capacity
+from .camera_language import (
+    camera_geometry_clause,
+    enforce_composition_scale,
+    enforce_position_capacity,
+    enforce_scale_capacity,
+    enforce_spatial_anchor_scale,
+)
 from .lighting_language import lighting_clause
 from .spatial_language import spatial_lines
 from .realism_language import realism_applicable
@@ -1655,6 +1661,32 @@ def readable_text_required(value):
     return bool(sanitize_text_whitelist(value.get("whitelist") or []))
 
 
+def _spatial_anchor_count(shot):
+    """本镜必须同框呈现的空间锚点数:人物 + 不在任何人手上的可见道具。
+
+    「沈眉站在书案右侧、银铃静止在书案上」这类空间指向,取景要同时
+    装下人和那件离身道具;特写只框得住人物本身,合同必然执行不了。
+    只数「可见且无人持有」的道具,握在手里的道具随人入画不额外占位。
+    """
+    shot = shot or {}
+    characters = [
+        name for name in (shot.get("characters") or []) if _text(name)]
+    anchors = 1 if characters else 0
+    seen = set()
+    for row in (shot.get("frame_props") or []):
+        if not isinstance(row, dict):
+            continue
+        if _text(row.get("visibility")).lower() not in ("visible", "occluded"):
+            continue
+        holder = _text(row.get("holder")).lower()
+        if holder and holder not in ("none", "无", "无人", "无人持有", "-"):
+            continue  # 握在手上,随人入画
+        prop_id = _text(row.get("prop_id"))
+        if prop_id and prop_id not in seen:
+            seen.add(prop_id)
+    return anchors + len(seen)
+
+
 def _camera(shot, visible_count=None):
     dimensions = shot.get("five_dimensions") or {}
     design = dimensions.get("camera_design") or {}
@@ -1701,29 +1733,46 @@ def _camera(shot, visible_count=None):
     # 可行方向是编译时把景别升到装得下人数合同的档位。
     executed_scale, capacity_note = enforce_scale_capacity(
         resolved_scale, visible_count)
+    # 空间锚点:本镜要同框呈现「人物 + 不在其手上的道具」时,紧景别
+    # 框不住两者的位置关系,模型只能拉宽再被质检判景别不符。
+    executed_scale, anchor_note = enforce_spatial_anchor_scale(
+        executed_scale, _spatial_anchor_count(shot))
+    notes = [note for note in (capacity_note, anchor_note) if note]
     lens = _strip_aspect(_text(design.get("lens") or contract.get("焦段")))
-    if capacity_note and lens.startswith("85"):
-        # 85mm 是近景/特写的绑定焦段;景别升档后保留会再造一对矛盾。
-        lens = "35mm"
+    if notes:
+        # 长焦(≥85mm)绑定近景与特写;景别升档后仍写长焦会再造一对
+        # 矛盾(合同要中景、焦段却宣告特写观感),模型两头不讨好。
+        focal = re.match(r"\s*(\d+)", lens)
+        if focal and int(focal.group(1)) >= 85:
+            lens = "35mm"
+    composition = _strip_aspect(_text(
+        contract.get("构图") or design.get("composition"), "主体清楚"))
+    composition, composition_note = enforce_composition_scale(
+        executed_scale, composition)
+    if composition_note:
+        notes.append(composition_note)
+    position = _strip_aspect(_text(
+        raw_position or contract.get("机位") or design.get("camera_position")))
+    position, position_note = enforce_position_capacity(
+        position, visible_count)
+    if position_note:
+        notes.append(position_note)
     result = {
         "景别": executed_scale,
         "角度": _strip_aspect(_text(
             raw_angle or contract.get("角度") or design.get("angle"),
             "保持轴线")),
         "焦段": lens,
-        "机位": _strip_aspect(_text(
-            raw_position or contract.get("机位")
-            or design.get("camera_position"))),
+        "机位": position,
         "运镜": _strip_aspect(_text(
             raw_movement or contract.get("运镜") or design.get("movement"),
             "固定")),
         "动机": _text(design.get("movement_motivation"), "服务主体动作"),
-        "构图": _strip_aspect(_text(
-            contract.get("构图") or design.get("composition"), "主体清楚")),
+        "构图": composition,
     }
-    if capacity_note:
+    if notes:
         # 渲染按键取值,本键只进合同 JSON 留审计,不进提示词正文。
-        result["容量修正"] = capacity_note
+        result["容量修正"] = "；".join(notes)
     return result
 
 

@@ -1859,6 +1859,61 @@ def validate_rule_appeal(data, payload=None):
     return None
 
 
+LESSON_DISTILL_PROMPT = """你是本剧生产平台的质量总结官。下面是本项目真实质检中反复出现的
+出错观察(原始记录,按出现次数排序)。你要把它们归纳成少量**可复用的通用规则**,
+供后续所有镜头的提示词自查。
+
+原始出错观察:
+{observations}
+
+归纳要求(铁律):
+- 只归纳**跨镜头普遍适用**的规则;单个镜头的一次性事实(某人某处的伤口、
+  某张纸上的字)不要写成规则;
+- 每条规则必须是**可执行、可核验的正向要求或明确禁止**,不能是"注意质量"
+  这类空话;
+- **不得出现具体角色名、道具名、场次或镜头号**——规则要对新镜头同样成立;
+- 同类观察合并成一条;最多输出 {max_rules} 条,宁缺毋滥;
+- 每条不超过 40 字。
+
+只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块:
+{{"schema": "aifos.lesson_distill.v1",
+ "rules": [{{"rule": "通用规则原文", "covers": ["被它覆盖的原始观察序号"]}}]}}
+"""
+
+
+def validate_lesson_distill(data, payload=None):
+    """教训归纳输出校验:必须是通用规则,不能夹带镜头级专名。"""
+    if not isinstance(data, dict):
+        return "输出必须是 JSON 对象"
+    if data.get("schema") != "aifos.lesson_distill.v1":
+        return "schema 必须是 aifos.lesson_distill.v1"
+    rules = data.get("rules")
+    if not isinstance(rules, list):
+        return "rules 必须是数组"
+    forbidden = [str(name) for name in
+                 ((payload or {}).get("proper_nouns") or []) if name]
+    cleaned = []
+    for item in rules:
+        if isinstance(item, str):
+            item = {"rule": item, "covers": []}
+        if not isinstance(item, dict):
+            return "rules 成员必须是对象或字符串"
+        text = str(item.get("rule") or "").strip()
+        if len(text) < 6:
+            return "存在过短或空的规则"
+        if len(text) > 60:
+            return f"规则过长(>60字),必须精炼: {text[:30]}…"
+        hit = next((name for name in forbidden if name and name in text), "")
+        if hit:
+            return f"规则里出现了镜头级专名「{hit}」,必须改写成通用表述"
+        cleaned.append({"rule": text,
+                        "covers": list(item.get("covers") or [])})
+    if not cleaned:
+        return "rules 为空:至少归纳出一条,或说明确无可复用规则"
+    data["rules"] = cleaned
+    return None
+
+
 PROP_DESIGN_PROMPT = """你是本剧的道具设计总监。以下核心/身份识别道具已进入剧本的道具登记表,
 但还没有可出图的设计卡。你要只依据正式剧本中的事实与合理工艺推导,为每件道具补全设计卡。
 
@@ -2010,6 +2065,12 @@ def build_prompt(capability, payload):
                                ensure_ascii=False)[:8000],
             adjudication=json.dumps(payload.get("adjudication") or {},
                                     ensure_ascii=False))
+    if capability == "script" and payload.get("lesson_distill"):
+        return LESSON_DISTILL_PROMPT.format(
+            observations="\n".join(
+                f"{index}. {item}" for index, item in enumerate(
+                    payload.get("observations") or [], 1)),
+            max_rules=int(payload.get("max_rules") or 8))
     if capability == "script" and payload.get("prop_design"):
         return PROP_DESIGN_PROMPT.format(
             script=json.dumps(payload.get("script") or {},
@@ -2400,6 +2461,8 @@ def _postprocess_and_validate(capability, payload, data):
         error = validate_prop_design(data, payload)
     elif capability == "script" and payload.get("rule_appeal"):
         error = validate_rule_appeal(data, payload)
+    elif capability == "script" and payload.get("lesson_distill"):
+        error = validate_lesson_distill(data, payload)
     elif capability == "script" and payload.get("story_analysis"):
         error = validate_story_analysis(
             data, require_resolved_identity=False)
