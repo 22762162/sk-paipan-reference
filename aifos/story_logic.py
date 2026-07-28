@@ -645,14 +645,31 @@ def audit_storyboard_prop_contract(storyboard: dict) -> dict:
 
             prop = registry_by_id.get(prop_id) or {}
             is_disclosure = visibility in {"visible", "occluded"}
+            # 实体在场(含隐藏)只用于同相位实例数校验,不再参与可披露
+            # 窗口判定——见下方 is_disclosure 处的说明。
             is_physical_presence = (
                 representation == "physical" and visibility != "absent")
+            _ = is_physical_presence
             if is_disclosure:
                 policy = _text(prop.get("disclosure_policy")).lower()
                 if policy == "never_visualize":
                     issues.append(f"{prefix} 违反 never_visualize 披露策略")
-            if is_disclosure or is_physical_presence:
-                current_order = order.get((event_id, phase))
+            # 「藏而未露」不是披露:银铃缝在衣襟内侧、暗器藏于袖中、
+            # 信物压在箱底——道具实体存在但 visibility=hidden,观众看
+            # 不到。可披露窗口约束的是「什么时候允许被看见」,把隐藏
+            # 状态也一并卡死,伏笔类道具必然全灭:编剧把 availability
+            # 设在揭示镜,前面几镜的隐藏行就被判「在首次可披露事件之前
+            # 出现」;设在第一镜又与「揭示时刻」语义打架。两难的根子是
+            # 校验把「存在」与「可见」混成了一个窗口。
+            # (《长夏记事》实案:两条编剧产线同一错误全灭,整集卡死。)
+            if is_disclosure:
+                # 定格(freeze)按平台既定裁决等于本镜尾态(见 normalize_
+                # storyboard_frame_phase_pairs:「freeze derives from
+                # end_state」)。但时间轴上 freeze 排在 end 之前,道具
+                # 若恰好在本镜 end 才可披露,它自己的定格行会被判「早于
+                # 可披露点」——纯粹是排序假象。按裁决对齐到 end 再比。
+                lookup_phase = "end" if phase == "freeze" else phase
+                current_order = order.get((event_id, lookup_phase))
                 start_ref = (
                     prop.get("availability_start_event")
                     or prop.get("introduced_at"))

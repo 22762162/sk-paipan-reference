@@ -11,7 +11,9 @@
 """
 
 import base64
+import copy
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -640,7 +642,76 @@ class OpenAIChatProvider(Provider):
             provider=self.name, cost=self.cost_per_call, data=data,
             model=self.conf.get("model") or self.DEFAULT_MODEL)
 
+    @staticmethod
+    def _error_shot_positions(error):
+        """从校验判词里取出出问题的镜头序号(1-indexed 位置)。"""
+        return sorted({
+            int(value) for value in re.findall(r"镜头(\d+)", str(error or ""))
+        })
+
+    def _repair_shots(self, payload, data, error):
+        """只回传出问题的镜头,本地合并——整份重发必被 max_tokens 截断。
+
+        一整集分镜 JSON 常 40KB 以上,远超对话模型的输出上限;要求模型
+        「输出完整 JSON」时,修复调用必然中途截断,连带把这条产线判死
+        (《长夏记事》实案:codex_writer 与 deepseek 双双卡在同一校验,
+        deepseek 的补救又被截断,整集 storyboard 阶段无可用 Provider)。
+        """
+        shots = data.get("shots")
+        positions = self._error_shot_positions(error)
+        if not positions or not isinstance(shots, list):
+            return None, ""
+        broken = [
+            {"_position": position, **shots[position - 1]}
+            for position in positions
+            if 1 <= position <= len(shots)
+            and isinstance(shots[position - 1], dict)
+        ]
+        if not broken or len(broken) >= len(shots):
+            return None, ""  # 整份都坏就没有省的余地,走原路
+        messages = [
+            {"role": "system",
+             "content": "你只输出一个 JSON 对象,不要任何解释或代码块。"},
+            {"role": "user", "content":
+                "你生成的分镜未通过机器校验:\n" + str(error) + "\n\n"
+                "下面只给出出问题的镜头(每个带 _position 标明它在整份"
+                "分镜里的序号)。只修复校验指出的字段,其余一字不动。"
+                '输出 {"shots":[...]},数组里每个对象保留原 _position,'
+                "不要包含其它镜头。\n" +
+                json.dumps(broken, ensure_ascii=False)},
+        ]
+        try:
+            text = self._chat(messages)
+        except ProviderError as exc:
+            return None, f"(镜头级就地修复调用失败: {exc})"
+        patch = extract_json(text)
+        rows = (patch or {}).get("shots")
+        if not isinstance(rows, list) or not rows:
+            return None, "(镜头级就地修复未返回 shots)"
+        merged = copy.deepcopy(data)
+        applied = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                position = int(row.pop("_position"))
+            except (TypeError, ValueError, KeyError):
+                continue
+            if 1 <= position <= len(merged["shots"]):
+                merged["shots"][position - 1] = row
+                applied += 1
+        if not applied:
+            return None, "(镜头级就地修复没有可合并的镜头)"
+        return merged, f"(镜头级就地修复合并 {applied} 个镜头)"
+
     def _repair(self, capability, payload, data, error):
+        # 分镜整份太大,先试镜头级增量修复;失败再退回整份重发。
+        if capability == "storyboard" and isinstance(data, dict):
+            patched, note = self._repair_shots(payload, data, error)
+            if patched is not None:
+                fixed = self._postprocess(capability, patched)
+                if not self._validate(capability, payload, fixed):
+                    return fixed, note
         try:
             source = json.dumps(data, ensure_ascii=False)
         except (TypeError, ValueError):
