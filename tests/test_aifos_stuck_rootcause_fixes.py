@@ -290,3 +290,96 @@ def test_exclusion_capture_does_not_swallow_whole_prompt():
     assert not any(t == "不得漂浮" for t in tokens)
     assert any("严禁出现现代装备" in t for t in tokens)
     assert all(len(t) <= 90 for t in tokens)
+
+
+# ---------- 景别 vs 构图 / 空间锚点 ----------
+
+def test_environment_composition_dropped_on_tight_scale():
+    """大特写装不下框中框:让构图,不动景别(景别承载导演意图)。"""
+    from aifos.camera_language import enforce_composition_scale
+    comp, note = enforce_composition_scale("大特写", "框中框")
+    assert comp == "三分法" and "框中框" in note and "装不下" in note
+    comp, note = enforce_composition_scale("特写", "引导线")
+    assert comp == "三分法" and note
+    # 中景及更宽装得下,原样不动。
+    assert enforce_composition_scale("中景", "框中框") == ("框中框", "")
+    assert enforce_composition_scale("全景", "引导线") == ("引导线", "")
+    # 非环境类构图任何景别都成立。
+    assert enforce_composition_scale("大特写", "留白") == ("留白", "")
+    assert enforce_composition_scale("大特写", "前景遮挡") == ("前景遮挡", "")
+    # 景别未知时不猜。
+    assert enforce_composition_scale("", "框中框") == ("框中框", "")
+
+
+def test_spatial_anchor_scale_upgrades_for_off_body_prop():
+    from aifos.camera_language import enforce_spatial_anchor_scale
+    scale, note = enforce_spatial_anchor_scale("大特写", 2)
+    assert scale == "中景" and "空间锚点" in note
+    # 单锚点(只有人物)不动。
+    assert enforce_spatial_anchor_scale("大特写", 1) == ("大特写", "")
+    assert enforce_spatial_anchor_scale("大特写", None) == ("大特写", "")
+    # 已经够宽的不动。
+    assert enforce_spatial_anchor_scale("全景", 3) == ("全景", "")
+
+
+def test_spatial_anchor_count_ignores_held_props():
+    """握在手里的道具随人入画,不额外占取景位;离身道具才占。"""
+    from aifos.prompt_contract import _spatial_anchor_count
+    held = {
+        "characters": ["沈眉"],
+        "frame_props": [{"prop_id": "p1", "visibility": "visible",
+                         "holder": "沈眉"}],
+    }
+    assert _spatial_anchor_count(held) == 1
+    off_body = {
+        "characters": ["沈眉"],
+        "frame_props": [{"prop_id": "p1", "visibility": "visible",
+                         "holder": "none"}],
+    }
+    assert _spatial_anchor_count(off_body) == 2
+    # 隐藏道具不占取景位。
+    hidden = {
+        "characters": ["沈眉"],
+        "frame_props": [{"prop_id": "p1", "visibility": "hidden",
+                         "holder": "none"}],
+    }
+    assert _spatial_anchor_count(hidden) == 1
+    # 同一道具多行只算一次。
+    duplicated = {
+        "characters": ["沈眉"],
+        "frame_props": [
+            {"prop_id": "p1", "visibility": "visible", "holder": "none"},
+            {"prop_id": "p1", "visibility": "occluded", "holder": "none"},
+        ],
+    }
+    assert _spatial_anchor_count(duplicated) == 2
+
+
+def test_compile_upgrades_scale_and_drops_long_lens_for_anchors():
+    """《长夏记事》镜头3 实况:大特写×框中框×135mm + 桌上银铃。"""
+    from aifos.prompt_contract import compile_shot_prompt
+    shot = {
+        "shot_no": 3, "scene_no": 1, "kind": "beat",
+        "camera": "大特写,俯拍,侧面",
+        "characters": ["沈眉"],
+        "description": "银铃脱离衣襟静止在书案上",
+        "action": "沈眉视线下落至书案银铃",
+        "frame_props": [{
+            "prop_id": "prop_bell_001", "phase": "freeze",
+            "visibility": "visible", "representation": "physical",
+            "holder": "none", "location": "书案中心偏右",
+            "support": "桌面", "physical_state": "完好"}],
+        "five_dimensions": {"camera_design": {
+            "shot_scale": "大特写", "lens": "135mm", "angle": "俯拍",
+            "camera_position": "侧面", "composition": "框中框",
+            "movement": "固定"}},
+        "start_state": {}, "end_state": {},
+    }
+    contract, prompt = compile_shot_prompt(
+        shot, location="书阁", style="古风", references=[], mode="image")
+    camera = contract["camera"]
+    assert camera["景别"] == "中景"
+    assert camera["焦段"] == "35mm"       # 长焦不得残留
+    assert camera["构图"] == "框中框"      # 中景装得下,构图保留
+    assert "空间锚点" in camera["容量修正"]
+    assert "容量修正" not in prompt        # 审计键不进提示词正文
