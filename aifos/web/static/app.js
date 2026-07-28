@@ -7191,6 +7191,78 @@ function assetBoardHtml(items, category = "all", group = "all") {
   }).join("")}</div>`;
 }
 
+/* ---- 场景视角扩展:720° 全景母版 + 四个朝向,后续镜头自动按机位取图 ---- */
+const SCENE_VIEW_ICONS = {
+  panorama: "🌐", main: "⬆", side: "➡", reverse: "⬇", side_left: "⬅",
+};
+
+function sceneExpansionHtml(overview) {
+  if (!overview) return "";
+  const scenes = overview.scenes || [];
+  return `<section class="panel asset-panel scene-expansion" id="scene-expansion">
+    <h2>🧭 场景视角扩展 <span class="dim">先出一张 720° 全景母版当空间基准，
+      再从它切出正向 / 右侧 / 反打 / 左侧四个朝向；
+      之后镜头按机位自动取对应视角，同一场景跨镜头不会跑到另一个空间去</span></h2>
+    ${scenes.length ? `<div class="scene-expansion-list">${scenes.map((scene) => {
+      const done = scene.views.filter((v) => v.ready).length;
+      return `<div class="scene-expansion-row" data-location="${esc(scene.location)}">
+        <div class="scene-expansion-head">
+          <b>${esc(scene.location)}</b>
+          <span class="dim">${done}/${scene.views.length} 张就位${
+            scene.has_main_art ? "" : " · 还没有概念图"}</span>
+        </div>
+        <div class="scene-view-chips">${scene.views.map((view) =>
+          `<span class="scene-view-chip ${view.ready ? "ready" : "missing"}"
+            title="${esc(view.label)}${view.ready ? "" : "（还没生成）"}">
+            ${SCENE_VIEW_ICONS[view.view] || "•"} ${esc(view.label)}</span>`).join("")}
+        </div>
+        <div class="scene-expansion-actions">
+          <button class="primary scene-expand" data-location="${esc(scene.location)}"
+            ${scene.missing.length ? "" : "disabled"}
+            title="只补还缺的那几张，已有的不会重复烧额度">
+            ${scene.missing.length ? `🧭 生成缺的 ${scene.missing.length} 张` : "✓ 五视角齐了"}</button>
+          <button class="scene-expand-redo" data-location="${esc(scene.location)}"
+            title="全景与四向全部重画一遍；旧版本保留可回溯">↻ 全部重画</button>
+        </div>
+      </div>`;
+    }).join("")}</div>`
+      : `<div class="dim">本作品还没有场景。确认剧本后会自动出现，
+        也可以在上面的资产工坊自己做一个「场景空间」资产。</div>`}
+  </section>`;
+}
+
+function bindSceneExpansion(title, reload) {
+  const run = async (btn, location, regenerate) => {
+    const original = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = regenerate ? "重画中…" : "生成中…";
+    showToast(`「${location}」正在出图，全景+四向通常要几分钟…`, "info");
+    try {
+      const result = await api("/api/scene/expand", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project: title, location, regenerate }),
+      });
+      showToast(result.mock
+        ? `「${location}」已出 ${result.created.length} 张，但走的是占位产线`
+        : `「${location}」新出 ${result.created.length} 张`
+          + (result.reused.length ? `，复用 ${result.reused.length} 张` : ""),
+        result.mock ? "info" : "ok");
+      reload();
+    } catch (e) {
+      showToast(e.message, "error");
+      btn.disabled = false;
+      btn.textContent = original;
+    }
+  };
+  document.querySelectorAll(".scene-expand").forEach((btn) => {
+    btn.onclick = () => run(btn, btn.dataset.location, false);
+  });
+  document.querySelectorAll(".scene-expand-redo").forEach((btn) => {
+    btn.onclick = (ev) => armConfirm(ev.target, "重画", () =>
+      run(btn, btn.dataset.location, true));
+  });
+}
+
 /* ---- 作品名(剧名)管理:自己起名、改名、删掉只剩空壳的死名字 ---- */
 function showProjectNameDialog({ heading, note, value = "", confirmLabel,
                                  placeholder = "", onConfirm }) {
@@ -7366,6 +7438,11 @@ async function renderAssetsCenter(selectedTitle) {
     studioOptions = await api(
       `/api/asset-studio/options?project=${encodeURIComponent(title)}`);
   } catch (e) { studioOptions = null; }
+  let sceneExpansion = null;
+  try {
+    sceneExpansion = await api(
+      `/api/scene/expansion?project=${encodeURIComponent(title)}`);
+  } catch (e) { sceneExpansion = null; }
   // 换作品时草稿必须重置:勾选的参考图 id 只在原作品里有效
   if (studioOptions && (!studioDraft || studioDraft.project !== title))
     studioDraft = { ...studioDefaults(studioOptions), project: title };
@@ -7496,6 +7573,7 @@ async function renderAssetsCenter(selectedTitle) {
       : `<div class="dim">本项目还没有人物资产。开始制作一集并确认剧本后,
          可选择只生成最终人物形象图，或生成每个角色的完整扩展套件。</div>`}
     </section>
+    ${sceneExpansionHtml(sceneExpansion)}
     <section class="panel asset-panel">
       <h2>🏞 场景概念图</h2>
       <div class="pb-grid">${(art.scene_art || []).map((s) =>
@@ -7539,6 +7617,7 @@ async function renderAssetsCenter(selectedTitle) {
       } catch (e) { showToast(e.message, "error"); }
     });
   const reload = () => renderAssetsCenter(title);
+  bindSceneExpansion(title, reload);
   const renderStudio = () => {
     if (!studioOptions) return;
     const host = document.getElementById("asset-studio");

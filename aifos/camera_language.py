@@ -145,10 +145,12 @@ SCENE_VIEWS = {
 
 
 def scene_view_for_camera(camera):
-    """镜头机位 → 最贴近的场景母版视角 key(main/reverse/side)。
+    """镜头机位 → 最贴近的场景母版视角 key。
 
     接受结构化 camera dict(取「机位」字段)或原始镜头文本;
     未命中一律回主视角,绝不因视角判断阻断出图。
+    场景做过四向扩展时左右侧向是两张不同的图,机位写明左/右就各归各位;
+    没写明方向仍回通用 side(调用方按回退链找实际存在的那张)。
     """
     if isinstance(camera, dict):
         text = str(camera.get("机位") or "")
@@ -157,7 +159,7 @@ def scene_view_for_camera(camera):
     if any(token in text for token in ("背面", "背后", "过肩", "反打")):
         return "reverse"
     if any(token in text for token in ("侧面", "侧脸", "侧向")):
-        return "side"
+        return "side_left" if "左" in text else "side"
     return "main"
 
 

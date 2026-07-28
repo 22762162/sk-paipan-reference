@@ -101,10 +101,16 @@ from .workflow import (
 )
 
 # 画幅 → 像素尺寸(视频/图片);封面用竖版比例
+# 2:1 只用于场景全景母版(等距圆柱投影的标准比例),不进镜头/视频链路。
 ASPECT_DIMS = {
     "9:16": {"width": 1080, "height": 1920},
     "16:9": {"width": 1920, "height": 1080},
+    "2:1": {"width": 2048, "height": 1024},
 }
+PANORAMA_ASPECT = "2:1"
+# 用户可自选的画幅只有出片用的两种;2:1 是全景母版专用比例,它必须配套
+# 「无缝环绕」合同才有意义,单独选它只会得到一张普通宽图。
+SHOT_ASPECTS = ("9:16", "16:9")
 
 MODERN_OTOME_STYLE = (
     "现代都市乙女游戏CG，精致3D半写实角色渲染，亚洲当代青年，"
@@ -2273,6 +2279,27 @@ class Director:
         ("reverse", "反打视角", "从主视角正对面的机位回看同一空间"),
         ("side", "侧向视角", "与主视角成约90度的侧向机位"),
     )
+    # 场景扩展:先出一张 360°×180° 全景母版当空间基准,再从它切出四个
+    # 正交朝向。四向视角复用既有 main/reverse/side 语义(镜头机位已按它
+    # 选图),只补一个左侧向,所以扩展完的场景在后续镜头里自动生效。
+    SCENE_PANORAMA_KEY = "panorama"
+    SCENE_DIRECTION_DEFS = (
+        ("main", "正向视角", 0, "全景母版正前方(0°)朝向"),
+        ("side", "右侧向视角", 90, "自正向右转90°的朝向"),
+        ("reverse", "反打视角", 180, "自正向转180°的正对面朝向"),
+        ("side_left", "左侧向视角", 270, "自正向左转90°(270°)的朝向"),
+    )
+    SCENE_VIEW_LABELS = {
+        "panorama": "720°全景母版", "main": "正向视角",
+        "side": "右侧向视角", "reverse": "反打视角",
+        "side_left": "左侧向视角",
+    }
+    # 缺图回退链:左侧向缺席时退到通用侧向,再退主视角,绝不因此阻断出图。
+    SCENE_VIEW_FALLBACK = {
+        "side_left": ("side_left", "side"),
+        "side": ("side", "side_left"),
+        "reverse": ("reverse",),
+    }
 
     @staticmethod
     def _scene_view_asset_name(location, view_key):
@@ -2290,6 +2317,58 @@ class Director:
             "与色温必须与参考图逐项一致,只允许摄影机位改变;"
             "禁止新增或移除家具与陈设,禁止改变空间尺度与层高。")
 
+    def _scene_panorama_prompt(self, location, style, scene, art_name):
+        """全景母版提示词:一张图交代整个空间,后续四向视角都从它切。"""
+        base = self._scene_prompt(location, style, scene)
+        return (
+            f"【本图对象】{art_name}。{base};"
+            "全景规格:等距圆柱投影(equirectangular)的 360°×180° 环视"
+            "全景图,水平覆盖整整一圈、左右两条边必须能无缝首尾相接,"
+            "垂直覆盖从地面到天花/天空;画面横向连续展开,不做拼图分格、"
+            "不加边框与说明文字;镜头高度取站立视平线,保持全幅曝光与"
+            "白平衡一致。这张图是本空间的唯一几何基准:门窗与出入口的"
+            "数量和相对方位、承重结构、家具陈设的位置与朝向、材质、"
+            "主光源方位与色温都以本图为准,后续任何机位都不得与它冲突。")
+
+    def _scene_panorama_review_context(self, location, style, scene):
+        context = self._scene_art_review_context(location, style, scene)
+        context["view"] = self.SCENE_VIEW_LABELS[self.SCENE_PANORAMA_KEY]
+        context["panorama_contract"] = (
+            "本图是 360°×180° 等距圆柱全景:必须横向连续、左右边可无缝"
+            "相接、不分格不加框;人物一律不入画。全景规格与空镜规则并列"
+            "时两条同时成立,不构成需要裁决的冲突")
+        return context
+
+    def _scene_direction_prompt(self, location, style, scene, art_name,
+                                view_label, degrees, view_desc,
+                                from_panorama=True):
+        """四向视角提示词:声明它是全景母版上某个朝向的透视还原。"""
+        base = self._scene_prompt(location, style, scene)
+        source = ("参考图是本空间的 360° 全景母版"
+                  if from_panorama else "参考图是本空间的主视角母版")
+        return (
+            f"【本图对象】{art_name}。{base};"
+            f"多视角一致性:本图是「{location}」的{view_label}"
+            f"——{view_desc}({degrees}°)。{source}:"
+            "本图必须是同一空间在该朝向上的正常透视画面(不是全景变形图),"
+            "空间结构、户型、门窗与出入口位置、承重结构、家具陈设的位置"
+            "与朝向、材质、光源方位与色温必须与参考图逐项一致,"
+            "只允许摄影机朝向改变;禁止新增或移除家具与陈设,"
+            "禁止改变空间尺度与层高,禁止把全景的桶形畸变带进画面。")
+
+    def _scene_direction_review_context(self, location, style, scene,
+                                        view_label, degrees,
+                                        from_panorama=True):
+        context = self._scene_art_review_context(location, style, scene)
+        context["view"] = view_label
+        context["view_consistency_precedence"] = (
+            f"本图为同一空间自正向旋转{degrees}°的{view_label}:与参考图"
+            + ("(360°全景母版)" if from_panorama else "(主视角母版)")
+            + "的空间结构、材质、光源、陈设逐项一致是最高优先事实,"
+            "仅摄影机朝向不同;本图是正常透视画面而非全景变形图;"
+            "与其他描述并列时直接按本条执行,不构成需要裁决的冲突")
+        return context
+
     def _scene_view_review_context(self, location, style, scene,
                                    view_label):
         """视角母版审核合同 = 空镜合同 + 视角一致性显式裁决条款。"""
@@ -2301,19 +2380,33 @@ class Director:
             "不同;与其他描述并列时直接按本条执行,不构成需要裁决的冲突")
         return context
 
+    def _scene_view_row(self, project_id, location, view_key):
+        """取某个视角母版;文件缺失或质量不够正式参考的一律当没有。"""
+        row = self.assets.latest(
+            project_id, "scene_art",
+            self._scene_view_asset_name(location, view_key))
+        if (row and row["uri"] and Path(row["uri"]).exists()
+                and formal_reference_allowed(self._asset_quality(row))):
+            return row
+        return None
+
     def _scene_view_reference(self, project_id, location, camera):
-        """按镜头机位选最贴近的场景母版视角;缺视角图回退主视角。"""
+        """按镜头机位选最贴近的场景母版视角;缺视角图按回退链降级。
+
+        左侧向缺席时退通用侧向,再退主视角——四向扩展只是把可选项变多,
+        没扩展过的场景行为与以前完全一致。
+        """
         view = scene_view_for_camera(camera)
         if view != "main":
-            row = self.assets.latest(
-                project_id, "scene_art",
-                self._scene_view_asset_name(location, view))
-            if (row and row["uri"] and Path(row["uri"]).exists()
-                    and formal_reference_allowed(self._asset_quality(row))):
-                label = dict(
-                    (key, name) for key, name, _ in self.SCENE_VIEW_DEFS
-                ).get(view, view)
-                return row, f"场景:{location}({label})"
+            for candidate in self.SCENE_VIEW_FALLBACK.get(view, (view,)):
+                row = self._scene_view_row(project_id, location, candidate)
+                if row is not None:
+                    label = self.SCENE_VIEW_LABELS.get(candidate, candidate)
+                    return row, f"场景:{location}({label})"
+        # 做过四向扩展的场景,正向母版与全景同源;没扩展过的照旧用概念图。
+        row = self._scene_view_row(project_id, location, "main")
+        if row is not None:
+            return row, f"场景:{location}({self.SCENE_VIEW_LABELS['main']})"
         row = self.assets.latest(project_id, "scene_art", location)
         return row, f"场景:{location}"
 
@@ -2328,7 +2421,13 @@ class Director:
         for location, scene in scene_by_location.items():
             if location_reuse.get(location, 0) < self.SCENE_VIEW_MIN_REUSE:
                 continue
-            main_row = self.assets.latest(project_id, "scene_art", location)
+            # 已经做过 720° 扩展的场景优先拿全景当基准:它是整个空间的
+            # 几何真相,比单张主视角更能锁住跨机位一致。
+            panorama_row = self._scene_view_row(
+                project_id, location, self.SCENE_PANORAMA_KEY)
+            main_row = (panorama_row if panorama_row is not None
+                        else self.assets.latest(
+                            project_id, "scene_art", location))
             main_uri = (main_row["uri"] if main_row and main_row["uri"]
                         and Path(main_row["uri"]).exists() else "")
             if not main_uri:
@@ -15840,6 +15939,297 @@ class Director:
         return {"status": "done", "redone": redone}
 
     # ---- 参考图管理:上传的参考图会自动进入出图提示(关联角色/场景) ----
+    # ---- 场景扩展:720°全景母版 + 四向视角 ----
+
+    def _scene_facts(self, project, location):
+        """跨集找这个场景的剧本事实;自建场景找不到就按空事实走。"""
+        for episode in self.projects.list_episodes(project["id"]):
+            script, _ = self.projects.latest_document(
+                episode["id"], "script")
+            for scene in (script or {}).get("scenes") or []:
+                if str(scene.get("location") or "") == location:
+                    return scene
+        return {}
+
+    def scene_expansion_state(self, project_title, location):
+        """某个场景已经有哪些视角母版,还缺哪些。"""
+        project = self._studio_project(project_title)
+        location = str(location or "").strip()
+        if not location:
+            raise AifosError("请指定场景名")
+        main = self.assets.latest(project["id"], "scene_art", location)
+        views = []
+        for key in (self.SCENE_PANORAMA_KEY,
+                    *(item[0] for item in self.SCENE_DIRECTION_DEFS)):
+            row = self.assets.latest(
+                project["id"], "scene_art",
+                self._scene_view_asset_name(location, key))
+            if row is None and key == "main":
+                row = main
+            ready = bool(row and row["uri"] and Path(row["uri"]).exists())
+            views.append({
+                "view": key,
+                "label": self.SCENE_VIEW_LABELS.get(key, key),
+                "ready": ready,
+                "asset_id": row["id"] if ready else None,
+                "version": row["version"] if ready else 0,
+            })
+        return {
+            "project": project["title"],
+            "location": location,
+            "has_main_art": bool(
+                main and main["uri"] and Path(main["uri"]).exists()),
+            "views": views,
+            "missing": [item["view"] for item in views if not item["ready"]],
+        }
+
+    def scene_expansion_overview(self, project_title):
+        """本作品所有场景 + 各自的视角母版完成度(含尚无概念图的场景)。"""
+        project = self._studio_project(project_title)
+        locations = []
+        for row in self.assets.active_list(project["id"], kind="scene_art"):
+            name = str(row["name"])
+            meta = self._asset_meta(row)
+            base = str(meta.get("base_location") or "")
+            if "::view:" in name:
+                base = base or name.split("::view:", 1)[0]
+            else:
+                base = base or name
+            if base and base not in locations:
+                locations.append(base)
+        # 资产工坊做的「场景空间」登记为 reference,同样算这个作品的场景
+        for row in self.assets.active_list(project["id"], kind="reference"):
+            meta = self._asset_meta(row)
+            if str(meta.get("studio_asset_type") or "") != "scene":
+                continue
+            place = str(meta.get("attach_to") or row["name"]).strip()
+            if place and place not in locations:
+                locations.append(place)
+        for episode in self.projects.list_episodes(project["id"]):
+            script, _ = self.projects.latest_document(
+                episode["id"], "script")
+            for scene in (script or {}).get("scenes") or []:
+                place = str(scene.get("location") or "").strip()
+                if place and place not in locations:
+                    locations.append(place)
+        return {
+            "project": project["title"],
+            "view_order": [
+                {"view": self.SCENE_PANORAMA_KEY,
+                 "label": self.SCENE_VIEW_LABELS[self.SCENE_PANORAMA_KEY]},
+                *({"view": key, "label": label}
+                  for key, label, _deg, _desc in self.SCENE_DIRECTION_DEFS),
+            ],
+            "scenes": [
+                self.scene_expansion_state(project["title"], place)
+                for place in sorted(locations)
+            ],
+        }
+
+    def _scene_expansion_call(self, project, item_id, payload, out_dir):
+        """单张场景母版:走正常路由(含提示词审核),不吃剧集预算。"""
+        result = self.router.call("image", payload, out_dir)
+        uri = str(result.uri or "")
+        if not uri or not Path(uri).exists():
+            raise AifosError(f"{item_id} 没有产出图片文件: {uri or '(空)'}")
+        return result
+
+    def expand_scene_views(self, project_title, location, *,
+                           regenerate=False, style=None, quality="high",
+                           include_panorama=True, directions=None):
+        """给一个场景生成 720° 全景母版,再从它切出四个朝向的视角图。
+
+        全景是本空间唯一几何基准,四向视角都以它为参考链式生成——
+        后续镜头按机位自动取对应视角,跨镜头空间一致性由此成立。
+        已存在且文件健在的视角默认跳过(regenerate=True 才重画)。
+        """
+        project = self._studio_project(project_title)
+        location = str(location or "").strip()
+        if not location:
+            raise AifosError("请指定场景名")
+        wanted = [key for key, *_ in self.SCENE_DIRECTION_DEFS
+                  if directions is None or key in set(directions)]
+        if directions is not None and not wanted:
+            raise AifosError(
+                "方向必须是 main/side/reverse/side_left 中的若干个")
+        scene = self._scene_facts(project, location)
+        style_text = (str(style).strip() if style is not None
+                      else (project["style"] or ""))
+        out_dir = (self.artifacts_root / f"p{project['id']:03d}" / "scenes")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        style_ref = self._style_anchor_uri(project["id"])
+        quality_meta = {"image_quality": quality,
+                        "recommended_quality": quality,
+                        "quality_source": "scene_expansion"}
+        created, reused, total_cost, providers = [], [], 0.0, set()
+
+        def existing_uri(asset_name):
+            row = self.assets.latest(project["id"], "scene_art", asset_name)
+            if row and row["uri"] and Path(row["uri"]).exists():
+                return row, str(row["uri"])
+            return None, ""
+
+        def base_image():
+            """全景的起点:优先场景概念图,其次资产工坊做的同名场景资产。"""
+            row, uri = existing_uri(location)
+            if uri:
+                return row, uri
+            for candidate in self.assets.active_list(
+                    project["id"], kind="reference"):
+                meta = self._asset_meta(candidate)
+                if str(meta.get("studio_asset_type") or "") != "scene":
+                    continue
+                place = str(meta.get("attach_to") or candidate["name"]).strip()
+                if place != location:
+                    continue
+                uri = str(candidate["uri"] or "")
+                if uri and Path(uri).exists():
+                    return candidate, uri
+            return None, ""
+
+        def register(asset_name, art_name, view_key, result, extra=None):
+            row = self.assets.latest(
+                project["id"], "scene_art", asset_name)
+            safe = "".join(
+                c if c.isalnum() else "_" for c in asset_name)[:60] or "scene"
+            version = (int(row["version"]) + 1) if row else 1
+            source = Path(str(result.uri))
+            dest = out_dir / f"{safe}_v{version}{source.suffix}"
+            if source.resolve() != dest.resolve():
+                shutil.move(str(source), str(dest))
+            saved = self.assets.register(
+                project["id"], "scene_art", asset_name, uri=str(dest),
+                meta={**quality_meta, "view": view_key,
+                      "base_location": location,
+                      "scene_expansion": True,
+                      "provider": result.provider,
+                      "model": result.model or "",
+                      "real": result.provider != "mock",
+                      "created_at": now(), **(extra or {})},
+                new_version=row is not None)
+            return saved, str(dest)
+
+        # ① 全景母版:有主视角概念图时以它为参考,保证不另起一个空间
+        panorama_name = self._scene_view_asset_name(
+            location, self.SCENE_PANORAMA_KEY)
+        panorama_row, panorama_uri = existing_uri(panorama_name)
+        if include_panorama and (regenerate or not panorama_uri):
+            _main_row, main_uri = base_image()
+            art_name = f"{location}·{self.SCENE_VIEW_LABELS[self.SCENE_PANORAMA_KEY]}"
+            payload = {
+                "scene_art": True, "art_name": art_name,
+                "image_task_class": image_task_class_for(quality),
+                "image_quality": quality,
+                "shot_no": 0, "characters": [], "location": location,
+                "prompt": self._scene_panorama_prompt(
+                    location, style_text, scene, art_name),
+                "style": style_text,
+                "prompt_contract_complete": True,
+                "prompt_review_context": self._scene_panorama_review_context(
+                    location, style_text, scene),
+                "aspect": PANORAMA_ASPECT, **ASPECT_DIMS[PANORAMA_ASPECT],
+            }
+            if main_uri:
+                payload["scene_ref"] = main_uri
+                payload["require_reference_images"] = True
+            if style_ref:
+                payload["style_ref"] = style_ref
+            result = self._scene_expansion_call(
+                project, "全景母版", payload, out_dir)
+            total_cost += float(result.cost or 0.0)
+            providers.add(result.provider)
+            panorama_row, panorama_uri = register(
+                panorama_name, art_name, self.SCENE_PANORAMA_KEY, result,
+                extra={"panorama": True, "aspect": PANORAMA_ASPECT})
+            created.append({"view": self.SCENE_PANORAMA_KEY,
+                            "label": self.SCENE_VIEW_LABELS[
+                                self.SCENE_PANORAMA_KEY],
+                            "asset_id": panorama_row["id"], "uri": panorama_uri})
+        elif panorama_uri:
+            reused.append(self.SCENE_PANORAMA_KEY)
+
+        # ② 四向视角:全景在就以全景为基准,否则退回主视角母版
+        base_uri = panorama_uri
+        from_panorama = bool(panorama_uri)
+        if not base_uri:
+            _main_row, base_uri = base_image()
+        if not base_uri:
+            raise AifosError(
+                f"「{location}」既没有全景母版也没有主视角概念图,"
+                "无法保证四向一致;请先生成全景或场景概念图")
+        for key, label, degrees, desc in self.SCENE_DIRECTION_DEFS:
+            if key not in wanted:
+                continue
+            asset_name = self._scene_view_asset_name(location, key)
+            _row, current = existing_uri(asset_name)
+            if current and not regenerate:
+                reused.append(key)
+                continue
+            art_name = f"{location}·{label}"
+            payload = {
+                "scene_art": True, "art_name": art_name,
+                "image_task_class": image_task_class_for(quality),
+                "image_quality": quality,
+                "shot_no": 0, "characters": [], "location": location,
+                "prompt": self._scene_direction_prompt(
+                    location, style_text, scene, art_name, label, degrees,
+                    desc, from_panorama=from_panorama),
+                "style": style_text,
+                "prompt_contract_complete": True,
+                "prompt_review_context":
+                    self._scene_direction_review_context(
+                        location, style_text, scene, label, degrees,
+                        from_panorama=from_panorama),
+                "scene_ref": base_uri,
+                "require_reference_images": True,
+                "aspect": "16:9", **ASPECT_DIMS["16:9"],
+            }
+            if style_ref:
+                payload["style_ref"] = style_ref
+            result = self._scene_expansion_call(project, label, payload,
+                                                out_dir)
+            total_cost += float(result.cost or 0.0)
+            providers.add(result.provider)
+            saved, uri = register(
+                asset_name, art_name, key, result,
+                extra={"degrees": degrees,
+                       "from_panorama": from_panorama,
+                       "panorama_asset_id": (
+                           panorama_row["id"] if panorama_row else None)})
+            created.append({"view": key, "label": label,
+                            "asset_id": saved["id"], "uri": uri})
+            # 场景第一次有正向母版时同步补上主概念图,后续镜头照旧按
+            # 场景名取图,不必改任何既有取图逻辑。
+            if key == "main":
+                main_row = self.assets.latest(
+                    project["id"], "scene_art", location)
+                if not (main_row and main_row["uri"]
+                        and Path(main_row["uri"]).exists()):
+                    self.assets.register(
+                        project["id"], "scene_art", location, uri=uri,
+                        meta={**quality_meta, "view": "main",
+                              "base_location": location,
+                              "scene_expansion": True,
+                              "derived_from_view_asset_id": saved["id"]},
+                        new_version=main_row is not None)
+        placeholder = any(
+            provider == "mock" for provider in providers)
+        self.log.info(
+            "director",
+            f"场景「{location}」视角扩展完成:新生成 {len(created)} 张"
+            f"(复用 {len(reused)} 张);产线:{'、'.join(sorted(providers)) or '无'}"
+            + ("(占位产线,不是真实 AI 出图)" if placeholder else ""))
+        return {
+            "project": project["title"],
+            "location": location,
+            "created": created,
+            "reused": reused,
+            "cost": round(total_cost, 4),
+            "providers": sorted(providers),
+            "mock": placeholder,
+            "state": self.scene_expansion_state(project["title"], location),
+        }
+
     # ---- 资产工坊:自定义命名的自建资产库 ----
 
     def _studio_project(self, project_title):
@@ -15932,7 +16322,7 @@ class Director:
                 {"value": role, "label": STUDIO_ROLE_LABELS[role]}
                 for role in ("identity", "wardrobe", "scene",
                              "composition", "style", "manual")],
-            "aspects": sorted(ASPECT_DIMS),
+            "aspects": sorted(SHOT_ASPECTS),
             "max_count": STUDIO_MAX_COUNT,
             "attach_options": sorted(attach_options),
         }
@@ -16067,8 +16457,12 @@ class Director:
         if role != "style" and not attach_to:
             role = "manual"
         aspect = str(aspect or "").strip() or conf["aspect"]
-        if aspect not in ASPECT_DIMS:
-            raise AifosError(f"画幅必须是 {'/'.join(sorted(ASPECT_DIMS))}")
+        if aspect not in SHOT_ASPECTS:
+            # 2:1 是场景全景母版专用:它要配套「360° 无缝环绕」合同才成立,
+            # 在工坊单独选它只会得到一张普通宽图,反而误导。
+            raise AifosError(
+                f"画幅必须是 {'/'.join(sorted(SHOT_ASPECTS))};"
+                "720° 全景请用场景视角扩展生成")
         dims = ASPECT_DIMS[aspect]
         style_text = (str(style).strip() if style is not None
                       else (project["style"] or ""))

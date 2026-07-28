@@ -1096,6 +1096,9 @@ class SeedreamImageProvider(OpenAIImageProvider):
             "3:2": "2496x1664",
             "2:3": "1664x2496",
             "1:1": "2048x2048",
+            # 场景全景母版:等距圆柱投影必须是 2:1,退化成方图会把
+            # 360° 环视压成普通广角,四向视角就对不上同一个空间。
+            "2:1": "2560x1280",
         }.get(payload.get("aspect", "9:16"), "2048x2048")
 
     def _audit_data(self, data, payload, unit_cost):

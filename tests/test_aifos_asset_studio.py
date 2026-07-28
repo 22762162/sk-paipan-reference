@@ -320,6 +320,7 @@ def test_studio_options_expose_types_roles_and_attach_targets(app):
     assert [item["value"] for item in options["asset_types"]] == [
         "character", "style", "scene", "prop"]
     assert "identity" in {item["value"] for item in options["reference_roles"]}
+    # 2:1 是场景全景母版专用比例,不进工坊画幅下拉
     assert options["aspects"] == ["16:9", "9:16"]
     assert options["max_count"] == 4
     assert "林晚" in options["attach_options"]
@@ -353,11 +354,13 @@ def test_studio_rejects_reference_from_another_project(app):
     assert "不属于本作品" in str(excinfo.value)
 
 
-def test_studio_rejects_unknown_aspect(app):
+@pytest.mark.parametrize("aspect", ["4:3", "2:1"])
+def test_studio_rejects_non_shot_aspect(app, aspect):
+    """2:1 虽在 ASPECT_DIMS 里,但它是全景母版专用,工坊不许单独选。"""
     with pytest.raises(AifosError) as excinfo:
         app.director.generate_studio_asset(
             "雨夜凶杀", "character", "林晚", "冷艳短发女警,黑风衣",
-            aspect="4:3")
+            aspect=aspect)
     assert "画幅" in str(excinfo.value)
 
 

@@ -3268,6 +3268,40 @@ textarea:focus-visible, select:focus-visible {
   color: var(--ink); border-color: rgba(212, 160, 74, .6);
 }
 
+/* ---- 场景视角扩展:全景母版 + 四向 ---- */
+.scene-expansion-list { display: grid; gap: 10px; }
+.scene-expansion-row {
+  display: grid; gap: 8px; min-width: 0; padding: 11px 12px;
+  border: 1px solid var(--hairline); border-radius: 11px;
+  background: var(--surface-2);
+}
+.scene-expansion-head {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+}
+.scene-expansion-head b { font-size: 13px; }
+.scene-expansion-head .dim { font-size: 11px; }
+.scene-view-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.scene-view-chip {
+  padding: 3px 8px; border-radius: 999px; font-size: 10px;
+  border: 1px solid var(--hairline); color: var(--ink-3);
+  background: var(--surface-3); white-space: nowrap;
+}
+.scene-view-chip.ready {
+  color: #7fd97f; border-color: rgba(12, 163, 12, .4);
+  background: rgba(12, 163, 12, .14);
+}
+.scene-view-chip.missing { opacity: .62; }
+.scene-expansion-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.scene-expansion-actions button {
+  font-size: 12px; padding: 6px 11px; border-radius: 8px; cursor: pointer;
+  border: 1px solid var(--hairline); background: var(--surface-3);
+  color: var(--ink-2);
+}
+.scene-expansion-actions button:disabled { opacity: .55; cursor: default; }
+.scene-expansion-actions .scene-expand-redo:hover {
+  color: var(--ink); border-color: rgba(212, 160, 74, .6);
+}
+
 /* ---- 作品名(剧名)管理:新建 / 改名 / 删空壳 ---- */
 .project-shell-btn {
   flex: none; font-size: 12px; color: var(--ink-2);

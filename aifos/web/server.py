@@ -2394,6 +2394,8 @@ def make_handler(workspace, jobs):
                     return self._asset_studio_options(query)
                 if route == "/api/project/shell":
                     return self._project_shell(query)
+                if route == "/api/scene/expansion":
+                    return self._scene_expansion(query)
                 if route == "/api/logs":
                     limit = int(query.get("limit", ["50"])[0])
                     return self._json(self._with_app(
@@ -2500,6 +2502,8 @@ def make_handler(workspace, jobs):
                     return self._scene_skip()
                 if parsed.path == "/api/scene/delete":
                     return self._scene_delete()
+                if parsed.path == "/api/scene/expand":
+                    return self._scene_expand()
                 if parsed.path == "/api/revise":
                     return self._revise()
                 if parsed.path == "/api/regen_image":
@@ -3908,6 +3912,48 @@ def make_handler(workspace, jobs):
             except AifosError as exc:
                 return self._error(400, str(exc))
             return self._json(project)
+
+        def _scene_expansion(self, query):
+            """场景视角母版完成度:带 location 查单个,不带查全部。"""
+            title = query.get("project", [""])[0].strip()
+            if not title:
+                return self._error(400, "缺少 project")
+            location = query.get("location", [""])[0].strip()
+            try:
+                if location:
+                    return self._json(self._with_app(
+                        lambda app: app.director.scene_expansion_state(
+                            title, location)))
+                return self._json(self._with_app(
+                    lambda app: app.director.scene_expansion_overview(title)))
+            except Exception as exc:
+                return self._error(400, str(exc))
+
+        def _scene_expand(self):
+            """生成 720° 全景母版 + 四向视角;已有的默认跳过不重复烧额度。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            title = (body.get("project") or "").strip()
+            location = (body.get("location") or "").strip()
+            if not title or not location:
+                return self._error(400, "缺少 project/location")
+            directions = body.get("directions")
+            if directions is not None and not isinstance(directions, list):
+                return self._error(400, "directions 必须是数组")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.expand_scene_views(
+                        title, location,
+                        regenerate=bool(body.get("regenerate")),
+                        style=body.get("style"),
+                        quality=(body.get("quality") or "high"),
+                        include_panorama=body.get(
+                            "include_panorama", True) is not False,
+                        directions=directions))
+            except Exception as exc:
+                return self._error(400, str(exc))
+            return self._json(result, status=201)
 
         def _project_create(self):
             """自定义作品名/资产库名:不必先跑一集就能建壳并往里存资产。"""
