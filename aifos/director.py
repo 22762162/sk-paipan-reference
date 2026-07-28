@@ -82,6 +82,7 @@ from .story_logic import (
     audit_storyboard_prop_contract,
     normalize_storyboard_frame_phase_pairs,
 )
+from .style_director import compile_director_style
 from .script_import import sanitize_script_entities
 from .workflow import (
     PIPELINE_VERSION,
@@ -3883,7 +3884,7 @@ class Director:
                  composition_contract=None, readable_text=None,
                  physical_contract=None, physical_logic_required=False,
                  era_exceptions=None, narrative_overlays=None,
-                 functional_figures=None,
+                 functional_figures=None, spatial_staging=None,
                  character_sheet_key=None):
         """视觉质检规格：按角色在本镜可见角度选择核验依据。"""
         identity_characters = list(characters or [])
@@ -3986,6 +3987,10 @@ class Director:
                                for item in (era_exceptions or [])
                                if str(item).strip()],
             "composition_contract": composition_contract,
+            # 3D 空间调度文字合同:屏幕定位/遮挡序/行动路线/轴线方向,
+            # 与提示词同源,质检按同一判据核验(不再只靠看示意图)。
+            "spatial_staging": (spatial_staging
+                                if isinstance(spatial_staging, dict) else {}),
             "physical_contract": (physical_contract
                                    if isinstance(physical_contract, dict)
                                    else build_physical_contract({
@@ -6148,6 +6153,8 @@ class Director:
         # 空值代表“AI 根据完整剧本自动设计”,不要把制作标准中的通用兜底
         # 冒充用户锁定画风。分析完成后会把本剧专属结果写回项目。
         project_style = str(ctx["project"].get("style") or "").strip()
+        style_pack_id = str(
+            ctx["project"].get("style_pack_id") or "").strip()
         current, version = self.projects.latest_document(
             episode_id, "story_analysis")
         current_visual = (
@@ -6158,9 +6165,11 @@ class Director:
             == str(current_visual.get("user_style_constraint") or "").strip())
         # 已保存的自动风格不是用户约束；重新分析时仍允许 AI 根据新剧本重建。
         style = "" if current_auto_style else project_style
+        analysis_style = self._style_with_director_knowledge(
+            style, style_pack_id)
 
         def persist_auto_style(analysis):
-            nonlocal style
+            nonlocal style, analysis_style
             visual = analysis.get("visual") or {}
             derived = str(
                 visual.get("user_style_constraint") or "").strip()
@@ -6173,17 +6182,21 @@ class Director:
                 project["style"] = derived
                 ctx["project"] = project
                 style = derived
+                analysis_style = derived
             analysis["project_style"] = project_style
+            analysis["project_style_pack_id"] = style_pack_id
             return analysis
 
         if (not force and current is not None
                 and current.get("script_version") == ctx.get(
                     "script_version")
                 and current.get("project_style") == project_style
+                and str(current.get("project_style_pack_id") or "")
+                == style_pack_id
                 and validate_story_analysis(
                     current, require_resolved_identity=False) is None):
             analysis = build_story_analysis(
-                script, style, raw=current,
+                script, analysis_style, raw=current,
                 source=current.get("source", "saved"))
             analysis["script_version"] = ctx.get("script_version")
             persist_auto_style(analysis)
@@ -6197,7 +6210,7 @@ class Director:
                 "project_title": ctx["project"]["title"],
                 "episode_number": ctx["episode"]["number"],
                 "script": script,
-                "style": style,
+                "style": analysis_style,
                 "creative_direction": creative_direction,
                 "analysis_rules": analysis_rules,
                 "production_profile": ctx.get("production_profile") or {},
@@ -6223,7 +6236,7 @@ class Director:
                 "style": style,
             })
         analysis = build_story_analysis(
-            script, style, raw=result.data, source=result.provider)
+            script, analysis_style, raw=result.data, source=result.provider)
         persist_auto_style(analysis)
         error = validate_story_analysis(
             analysis, require_resolved_identity=False)
@@ -6254,9 +6267,32 @@ class Director:
             uri=result.uri,
             meta={"version": version,
                   "script_version": ctx.get("script_version"),
-                  "style": style},
+                  "style": style,
+                  "style_pack_id": style_pack_id},
             episode_id=episode_id)
         return analysis, version, False
+
+    def _style_with_director_knowledge(self, style, style_pack_id):
+        """仅给制作圣经附加风格导演库，项目基础画风保持干净。
+
+        结构化镜头/特效知识不能直接写进 ``projects.style``，否则人物
+        身份卡、立绘和资产工坊也会误吃运镜与转场。这里按已批准风格包
+        临时封装，只供故事分析拆分并分发到分镜链路。
+        """
+        style_pack_id = str(style_pack_id or "").strip()
+        if not style_pack_id:
+            return str(style or "").strip()
+        row = self.db.query_one(
+            "SELECT director_knowledge FROM firefire_styles "
+            "WHERE id=? AND status='approved'",
+            (style_pack_id,))
+        if row is None:
+            return str(style or "").strip()
+        try:
+            knowledge = json.loads(row["director_knowledge"] or "{}")
+        except (TypeError, ValueError):
+            knowledge = {}
+        return compile_director_style(style, knowledge)
 
     def _adapt_imported_source(self, ctx, source):
         """把小说/文本解析稿交给编剧完成正式影视化，不把解析稿直接拿去出图。"""
@@ -10208,6 +10244,10 @@ class Director:
             composition_contract=payload.get("composition_contract"),
             readable_text=payload.get("readable_text"),
             physical_contract=payload.get("physical_contract"),
+            # 空间调度文字合同同时交给质检:生成与核验用同一份判据,
+            # 屏幕定位/遮挡序/行动路线不再只靠"看示意图"。
+            spatial_staging=(payload.get("prompt_contract") or {}).get(
+                "spatial_staging"),
             physical_logic_required=True,
             era_exceptions=self._era_exceptions(ctx),
             narrative_overlays=payload.get("narrative_overlays"),
@@ -12849,11 +12889,14 @@ class Director:
             raise AifosError("制作圣经已在其他页面更新，请刷新后再保存")
         project = self.db.query_one(
             "SELECT * FROM projects WHERE id=?", (episode["project_id"],))
+        analysis_style = self._style_with_director_knowledge(
+            project["style"], project["style_pack_id"])
         normalized = build_story_analysis(
-            script, project["style"], raw=analysis,
+            script, analysis_style, raw=analysis,
             source=("manual_adjusted" if current else "manual"))
         normalized["script_version"] = script_version
         normalized["project_style"] = project["style"]
+        normalized["project_style_pack_id"] = project["style_pack_id"]
         normalized["locked"] = bool(locked)
         normalized["updated_at"] = now()
         error = validate_story_analysis(
