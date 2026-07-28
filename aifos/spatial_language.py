@@ -73,6 +73,24 @@ def framing_for_distance(distance):
     return ""
 
 
+# 被摄距离按"到演员胸眼高度"计,而不是到脚点:脚点会把机位高差
+# (默认 1.55 米)整个算进距离,1 米的特写被报成 1.84 米,与按景别
+# 摆位的机位对不上。摄影上说的被摄距离本就是到主体上半身。
+SUBJECT_EYE_RATIO = 0.85
+DEFAULT_SUBJECT_HEIGHT_M = 1.68
+
+
+def subject_point(actor_point, height_m=None):
+    """把演员的地面点抬到胸眼高度,用于距离与投影计算。"""
+    if not isinstance(actor_point, dict):
+        return actor_point
+    try:
+        height = float(height_m or DEFAULT_SUBJECT_HEIGHT_M)
+    except (TypeError, ValueError):
+        height = DEFAULT_SUBJECT_HEIGHT_M
+    return {**actor_point, "y": round(height * SUBJECT_EYE_RATIO, 2)}
+
+
 def project(camera_point, target_point, actor_point, fov_degrees=54.4):
     """把演员世界坐标投影到画面横向偏移(-1..1)与距离。
 
@@ -124,7 +142,9 @@ def _actor_line(actor, camera, phase):
     cam_point = camera.get(f"{phase}_3d") or camera.get("start_3d")
     aim = camera.get(f"target_{phase}_3d") or camera.get("target_3d")
     fov = camera.get("fov_degrees")
-    actor_point = actor.get(f"{phase}_3d") or actor.get("start_3d")
+    actor_point = subject_point(
+        actor.get(f"{phase}_3d") or actor.get("start_3d"),
+        actor.get("height_m"))
     offset, distance = project(cam_point, aim, actor_point, fov)
     parts = [str(actor.get("name") or actor.get("actor_id") or "角色")]
     if offset is not None:
@@ -298,7 +318,7 @@ def derive_movement_term(camera):
     return "移"
 
 
-def framing_conflict(block, declared_scale):
+def framing_conflict(block, declared_scale, *, phase="start"):
     """距离+焦段推算的取景档与声明景别是否矛盾(出图前抓)。
 
     只在明显跨档时报(相邻档不报):特写声明配 6 米机位这种才是真错。
@@ -311,10 +331,14 @@ def framing_conflict(block, declared_scale):
     actors = [a for a in (block.get("actors") or []) if isinstance(a, dict)]
     if not actors:
         return ""
-    cam = _point(camera.get("start_3d"))
+    # 必须与空间站位同相位:人物在镜头内移动时,拿 start 位置去核对
+    # 定格在 end 的画面,会报出根本不存在的矛盾(实测 ep24 镜头5)。
+    cam = _point(camera.get(f"{phase}_3d") or camera.get("start_3d"))
     nearest = None
     for actor in actors:
-        point = _point(actor.get("start_3d"))
+        point = _point(subject_point(
+            actor.get(f"{phase}_3d") or actor.get("start_3d"),
+            actor.get("height_m")))
         distance = _distance(cam, point)
         if distance is not None and (nearest is None or distance < nearest):
             nearest = distance
@@ -347,7 +371,7 @@ def spatial_lines(block, *, phase="start", declared_scale=""):
     direction = screen_direction_clause(block, phase=phase)
     if direction:
         lines.append(("屏幕方向", direction))
-    conflict = framing_conflict(block, declared_scale)
+    conflict = framing_conflict(block, declared_scale, phase=phase)
     if conflict:
         lines.append(("空间冲突", conflict))
     return lines

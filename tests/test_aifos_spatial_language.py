@@ -190,3 +190,47 @@ class ContractInjectionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SubjectDistanceConventionTest(unittest.TestCase):
+    """被摄距离按"到主体胸眼高度"计,不是到脚点。
+
+    脚点会把机位高差(默认1.55米)整个算进距离:1米的特写被报成1.84米,
+    与按景别摆位的机位永远对不上(实测 ep24)。摄影上说的被摄距离本就
+    是到主体上半身。
+    """
+
+    def test_subject_point_lifts_to_chest_height(self):
+        from aifos.spatial_language import subject_point
+        lifted = subject_point({"x": 1.0, "y": 0.0, "z": 2.0}, 1.68)
+        self.assertGreater(lifted["y"], 1.3)
+        self.assertLess(lifted["y"], 1.6)
+        self.assertEqual((lifted["x"], lifted["z"]), (1.0, 2.0))
+
+    def test_camera_distance_matches_declared_scale(self):
+        """3D 机位按声明景别摆位,两端口径一致后距离应落在该景别带。"""
+        from aifos.spatial_blocking import (SCALE_TARGET_DISTANCE_M,
+                                            declared_scale)
+        self.assertEqual(declared_scale({"camera": "85mm特写·平视"}), "特写")
+        self.assertEqual(
+            declared_scale({"five_dimensions": {
+                "camera_design": {"shot_size": "全景"}}}), "全景")
+        self.assertLess(SCALE_TARGET_DISTANCE_M["特写"],
+                        SCALE_TARGET_DISTANCE_M["中景"])
+        self.assertLess(SCALE_TARGET_DISTANCE_M["中景"],
+                        SCALE_TARGET_DISTANCE_M["远景"])
+
+    def test_conflict_check_uses_the_frozen_phase(self):
+        """人物在镜头内移动时,拿 start 位置核对定格在 end 的画面,
+        会报出根本不存在的矛盾(实测 ep24 镜头5)。"""
+        block = _block()
+        actor = block["actors"][0]
+        block["actors"] = [actor]
+        actor.update({"moving": True,
+                      "start_3d": {"x": 0.0, "y": 0.0, "z": -3.0},
+                      "end_3d": {"x": 0.0, "y": 0.0, "z": 3.2}})
+        # end 相位人物就在机位跟前 → 特写成立,不该报冲突
+        self.assertEqual(framing_conflict(block, "特写", phase="end"), "")
+        # start 相位远在 7 米外 → 特写确实不成立
+        self.assertIn("不一致", framing_conflict(block, "特写",
+                                                phase="start"))
