@@ -4816,7 +4816,10 @@ class Director:
             "禁止没有应用 Codex 指令的原样重画")
         report.update({
             "production_ready": False,
-            "redraw_required": action == "targeted_redraw",
+            # 自动修复过合同的 repair_contract 同样需要立刻重画一次——
+            # QC 循环在 not redraw_required 处直接返回,不声明就走不到第二张
+            "redraw_required": (action == "targeted_redraw"
+                                or auto_contract_repair),
             "contract_repair_required": action in {
                 "repair_contract", "split_shot"},
             "retry_blocked": not redraw_now,

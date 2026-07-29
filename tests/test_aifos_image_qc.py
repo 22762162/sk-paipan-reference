@@ -606,8 +606,15 @@ def test_first_failure_escalates_then_redraws_with_codex_prompt(
     assert result.qc["auto_repair_exhausted"] is True
 
 
-def test_contract_repair_verdict_stops_before_second_image(app, tmp_path):
-    """Codex 判「改合同」时重画救不回来:第 1 次失败后就不再出图。"""
+def test_contract_repair_auto_applies_then_stops_on_second_failure(
+        app, tmp_path):
+    """repair_contract 不再是死路:首失败把 Codex 修合同指令自动落到提示词
+    基底并重画一次;第二次仍不合格才停手交人工。
+
+    旧契约(首失败即停)的死结:Codex 下达了修合同指令,但全仓库没有代码
+    执行它——escalation_redraw_block 等着「合同真的改了就放行」,而没有人
+    去改,合同类失败只能人工介入。
+    """
     image = tmp_path / "contract-failed.png"
     image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 24)
     router = _EscalationRouter(image, "repair_contract")
@@ -617,16 +624,18 @@ def test_contract_repair_verdict_stops_before_second_image(app, tmp_path):
         "image", {"prompt": "赵德昌拱手", "shot_no": 8},
         tmp_path, None, _qc_spec())
 
-    assert router.calls["image"] == 1
-    assert router.calls["qc"] == 2
-    assert result.qc["consecutive_failures"] == 1
-    assert result.qc["codex_escalation"]["stage"] == "first_failure_autofix"
+    # 首失败自动修复一次 → 共出两张;第二张仍未过 → 停手
+    assert router.calls["image"] == 2
+    # 第二次出图的提示词必须携带已应用的合同修订
+    second_prompt = str(router.image_payloads[1].get("prompt") or "")
+    assert "【Codex合同修订·必须执行】" in second_prompt
+    assert "把静态关键帧改为唯一拱手完成瞬间" in second_prompt
+    assert result.qc["consecutive_failures"] == 2
+    assert result.qc["codex_escalation"]["stage"] == "final_analysis"
     assert result.qc["codex_escalation"]["executable"] is False
     assert result.qc["codex_escalation"]["aifos_action"] == "repair_contract"
-    assert result.qc["redraw_required"] is False
     assert result.qc["contract_repair_required"] is True
     assert result.qc["retry_blocked"] is True
-    assert "把静态关键帧改为唯一拱手完成瞬间" in result.qc["revision_feedback"]
     # 升级结论记住了当时的生成输入指纹，供后续重画闸门比对。
     assert result.qc["codex_escalation"]["contract_input_hash"]
 
