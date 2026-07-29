@@ -4485,9 +4485,19 @@ class Director:
         # A merely verbose prompt stays advisory. A story/logic/reference
         # contradiction is a hard input failure: repair it and make the second
         # attempt from changed input instead of certifying an accidental image.
+        # 画面逐项达标(身份/性别/服装/人数/叠层/物理/空间全 True,质检自己
+        # 也判 visual_pass)时,「输入合同诊断不完美」不再判失败。
+        # 理由:contract_hard_failure 说的是「没按一份可能本来就错的合同
+        # 拍」,不是画面有错;而 Codex 的合同修改指令现在由
+        # _auto_apply_codex_escalation 自动落实,合同该修照修、后续镜头照样
+        # 受益,没必要再把这一张合格图判死。旧口径下这类图会连重两轮后锁进
+        # 待人工,而它的问题全部标着 [建议·不影响通过](ep1 shot:8 实案)。
+        # hard_failure 早就按同一口径修过,这里补上 passed,两者语义统一。
+        contract_only_defect = contract_hard_failure and image_passed \
+            and visual_checks_passed
         passed = (
             image_passed and visual_checks_passed
-            and not contract_hard_failure)
+            and (not contract_hard_failure or contract_only_defect))
         report = {
             "passed": passed,
             "issues": issues,
@@ -4530,6 +4540,9 @@ class Director:
             "production_ready": passed,
             "qc_policy": "visible_major_defects_v2",
             "input_contract_advisory": not input_contract_passed,
+            # 审计:这张图是「画面达标但合同诊断不完美」被放行的,合同本身
+            # 仍要靠 Codex 指令自动修,不是无声吞掉。
+            "contract_only_defect": contract_only_defect,
             # hard_failure 的语义是「不能出街、也不允许人工放行」——身份、
             # 性别、人数这类硬伤。合同不一致(景别/焦段/机位与合同对不上)
             # 不属于这一档:画面本身可能完全达标,只是没按一份可能本来就
@@ -5448,6 +5461,74 @@ class Director:
                 + "；".join(qc.get("issues") or []))
         return ""
 
+    # 同一镜头最多自动改几次合同:Codex 每次给的是不同诊断,但连改三次
+    # 还不过说明问题不在合同表述上,再改只是烧额度。
+    CODEX_CONTRACT_REPAIR_LIMIT = 2
+
+    def _auto_apply_codex_escalation(self, ctx, task, result):
+        """Codex 给了具体修改指令就自动执行,不再推给人工。
+
+        既有分派只自动执行 ``targeted_redraw``;判「改合同/拆镜/人工」时
+        熔断等人来改分镜。但 Codex 的 ``instruction_to_aifos`` 已经把要改
+        成什么一字不差写好了(焦段统一为50mm、站位唯一化、取景边界…),
+        让它躺在报告里等人,等于修复方案齐全却无人执行——ep1 有 6/15 个
+        镜头就死在这一步。
+
+        这里把它接到既有的「阻断即修」链上:把 Codex 指令当作修复依据交给
+        编剧就地改镜头合同,存回分镜文档并重建 payload/qc_spec。合同真的
+        变了(生成输入哈希变化)正是既有自动放行条件,不新增任何放行口子。
+        返回修复摘要;不适用或修不动时返回空串,调用方按原路落人工。
+        """
+        qc = getattr(result, "qc", None) or {}
+        escalation = qc.get("codex_escalation") or {}
+        if not escalation.get("triggered"):
+            return ""
+        instruction = str(
+            escalation.get("instruction_to_aifos") or "").strip()
+        action = str(escalation.get("aifos_action") or "")
+        # targeted_redraw 在质检循环里已经自动执行过了,这里只接非重画类。
+        if action not in ESCALATION_NON_REDRAW_ACTIONS or not instruction:
+            return ""
+        item_id = str(task.get("item_id") or "")
+        if not item_id.startswith(("shot:", "frames:")):
+            return ""   # 只有镜头类任务有可改的分镜合同
+        if not (ctx.get("storyboard") or {}).get("shots"):
+            return ""
+        counters = ctx.setdefault("_codex_contract_repairs", {})
+        used = int(counters.get(item_id, 0))
+        if used >= self.CODEX_CONTRACT_REPAIR_LIMIT:
+            return ""
+        before = self._image_generation_input(task.get("payload") or {})
+        try:
+            summary = self._repair_blocked_prompt_shot(
+                ctx, task,
+                f"Codex 升级分析判定本镜应「"
+                f"{CODEX_QC_ACTION_CN.get(action, action)}」。"
+                f"必须落实的修改指令:{instruction}")
+        except Exception as exc:
+            self.log.warn(
+                "director",
+                f"{item_id} 自动执行 Codex 修改指令失败,转人工: {exc}")
+            return ""
+        after = self._image_generation_input(task.get("payload") or {})
+        if before.get("input_hash") == after.get("input_hash"):
+            # 合同没真的变,再画一次撞的是同一份坏数据。
+            self.log.warn(
+                "director",
+                f"{item_id} 按 Codex 指令改完合同后生成输入未变化,转人工")
+            return ""
+        counters[item_id] = used + 1
+        # 新一轮从干净状态起画:旧的升级结论已经落实,不能再随 payload
+        # 下传,否则出图前会被既有的熔断逻辑按旧哈希拦住。
+        task["payload"].pop("qc_escalation", None)
+        task["payload"]["feedback"] = instruction[:1200]
+        self.log.info(
+            "director",
+            f"{item_id} 已自动执行 Codex 的"
+            f"{CODEX_QC_ACTION_CN.get(action, action)}指令"
+            f"(第 {used + 1} 次): {summary[:120]}")
+        return summary or "已按 Codex 指令修正本镜合同"
+
     def _run_one_task(self, ctx, task, *, continue_on_qc_failure=False):
         """串行执行单个出图任务(含质检),记账并更新清单。"""
         if self._cancel_requested(ctx):
@@ -5506,6 +5587,36 @@ class Director:
         self._task_providers.add(result.provider)
         self.projects.add_episode_cost(ctx["episode"]["id"], result.cost)
         critical_error = self._critical_qc_error(result)
+        if critical_error:
+            # Codex 已经写清楚要改什么时,先自动落实再重画一轮,
+            # 不把可执行的修复方案推给人工。
+            repair = self._auto_apply_codex_escalation(ctx, task, result)
+            if repair:
+                self._plan_mark(
+                    ctx, task["item_id"], "generating",
+                    extra={**generating_extra,
+                           "codex_contract_repair": repair[:300]})
+                try:
+                    result = self._generate_image_gacha(
+                        task["capability"], task["payload"],
+                        ctx["out_root"] / task["sub_dir"],
+                        lambda: self._cancel_requested(ctx),
+                        task.get("qc_spec"))
+                except ProduceCancelled:
+                    self._finish_dispatch_task(
+                        ctx, task, error="已手动停止生成")
+                    self._plan_mark(ctx, task["item_id"], "pending")
+                    raise
+                except Exception as exc:
+                    self._finish_dispatch_task(ctx, task, error=str(exc))
+                    self._plan_mark(ctx, task["item_id"], "failed",
+                                    error=str(exc)[:300])
+                    raise
+                self._task_cost += result.cost
+                self._task_providers.add(result.provider)
+                self.projects.add_episode_cost(
+                    ctx["episode"]["id"], result.cost)
+                critical_error = self._critical_qc_error(result)
         if critical_error:
             self._finish_dispatch_task(ctx, task, error=critical_error)
             self._plan_mark(
