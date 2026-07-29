@@ -1784,3 +1784,79 @@ def write_spatial_svgs(plan, out_dir):
         scene["svg_uri"] = str(path.resolve())
         paths.append(str(path.resolve()))
     return paths
+
+
+# ---------------------------------------------------------------------------
+# 信息状态 × 空间事实交叉校验(警示级)
+# v7 实证漏洞:全景重排把纱幔窗挪到人物正前方,人影从镜1就站在她两米外,
+# 而她镜7才「惊疑发现」——发现拍点穿帮。空间一变,「谁能看见谁」必须重推。
+_DISCOVERY_RE = re.compile(
+    r"发现|惊觉|察觉|注意到|惊疑|抬眸.{0,6}(?:望|看)|回头.{0,6}(?:望|看)")
+
+
+def awareness_sightline_issues(storyboard, blocking, max_distance=6.0):
+    """「迟到的发现」穿帮检测:X 在镜 N 才发现 Y,但更早的镜里 Y 已与 X
+    近距同场——要么 Y 晚点出现,要么给出遮挡/注意力理由,要么删掉发现拍点。
+
+    只做警示不阻断:近距同场可以有合法理由(遮挡物、背对、注意力),
+    但必须是**有意选择**而不是空间重排后的无意穿帮。
+    """
+    issues = []
+    shot_index = (blocking or {}).get("shot_index") or {}
+    shots = list((storyboard or {}).get("shots") or [])
+    for shot in shots:
+        text = " ".join(
+            str(shot.get(key) or "")
+            for key in ("action", "prompt", "performance", "camera_notes"))
+        if not _DISCOVERY_RE.search(text):
+            continue
+        shot_no = shot.get("shot_no")
+        block = shot_index.get(str(shot_no)) or {}
+        actors = block.get("actors") or []
+        if len(actors) < 2:
+            continue
+        observer = actors[0]
+        discovered = [a for a in actors[1:] if a.get("name")]
+        for target in discovered:
+            for earlier in shots:
+                early_no = earlier.get("shot_no")
+                if (early_no is None or shot_no is None
+                        or early_no >= shot_no
+                        or earlier.get("scene_no") != shot.get("scene_no")):
+                    continue
+                early_block = shot_index.get(str(early_no)) or {}
+                early_names = {
+                    str(a.get("name") or "")
+                    for a in (early_block.get("actors") or [])}
+                if (str(observer.get("name")) not in early_names
+                        or str(target.get("name")) not in early_names):
+                    continue
+                by_name = {str(a.get("name")): a
+                           for a in early_block.get("actors") or []}
+                obs_early = by_name[str(observer.get("name"))]
+                tgt_early = by_name[str(target.get("name"))]
+                try:
+                    distance = math.hypot(
+                        float(tgt_early["start_3d"]["x"])
+                        - float(obs_early["start_3d"]["x"]),
+                        float(tgt_early["start_3d"]["z"])
+                        - float(obs_early["start_3d"]["z"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if distance > max_distance:
+                    continue
+                issues.append({
+                    "shot_no": shot_no,
+                    "earlier_shot_no": early_no,
+                    "observer": observer.get("name"),
+                    "target": target.get("name"),
+                    "distance_m": round(distance, 1),
+                    "severity": "warning",
+                    "message": (
+                        f"镜{shot_no}「{observer.get('name')}」才发现"
+                        f"「{target.get('name')}」,但镜{early_no}里两人已"
+                        f"近距同场(约{distance:.1f}米)——发现拍点可能穿帮。"
+                        "要么让对方更晚出现,要么声明遮挡/背对/注意力理由。"),
+                })
+                break        # 每对报最早一处即可
+    return issues

@@ -62,6 +62,7 @@ from .lessons import (DISTILL_MIN_PENDING, DOMAIN_IMAGE, DOMAIN_SCRIPT,
                       pending_observations, project_lessons, record_lessons,
                       script_lessons_block)
 from .qc_stats import record_qc
+from .pano_slice import slice_for_block
 from .relations import relation_lines, write_relations
 from .rule_governance import next_revision_round, stack_revision_feedback
 from .spatial_language import derive_movement_term, spatial_lines
@@ -69,6 +70,7 @@ from .storyboard_preflight import (describe_issues, preflight_storyboard,
                                   repairable_shots)
 from .camera_language import MOVEMENT_GEOMETRY
 from .spatial_blocking import (
+    awareness_sightline_issues,
     build_spatial_plan,
     mark_spatial_reference_requirements,
     requires_spatial_reference,
@@ -2398,6 +2400,29 @@ class Director:
                 and formal_reference_allowed(self._asset_quality(row))):
             return row
         return None
+
+    def _scene_slice_for_shot(self, ctx, location, shot_no):
+        """本镜机位的全景切片(空间前置核心):失败一律静默返 ""。
+
+        条件:该场景已有 720° 全景母版 + ctx.blocking 里有本镜三维机位
+        + ffmpeg 可用。切片缓存在 p{pid}/scenes/slices,同参数复用。
+        """
+        if not self.config.get("defaults", "pano_slice", default=True):
+            return ""
+        if not location or shot_no is None:
+            return ""
+        blocking = (ctx or {}).get("blocking") or {}
+        block = (blocking.get("shot_index") or {}).get(str(int(shot_no)))
+        if not block:
+            return ""
+        project_id = ctx["project"]["id"]
+        pano = self._scene_view_row(
+            project_id, location, self.SCENE_PANORAMA_KEY)
+        if pano is None or not pano["uri"] or not Path(pano["uri"]).exists():
+            return ""
+        out_dir = (self.artifacts_root / f"p{project_id:03d}"
+                   / "scenes" / "slices")
+        return slice_for_block(pano["uri"], out_dir, block)
 
     def _scene_view_reference(self, project_id, location, camera):
         """按镜头机位选最贴近的场景母版视角;缺视角图按回退链降级。
@@ -6652,7 +6677,34 @@ class Director:
                 "characters": len(continuity["characters"]),
                 "scenes": len(continuity["scenes"])}
 
+    def _ensure_space_first_scenes(self, ctx):
+        """空间前置:进分镜前先把每个场景的 720° 全景母版与四向视角备好。
+
+        顺序即架构:剧本 → **空间(全景=几何唯一真相)** → 分镜 → 关键帧。
+        分镜与关键帧都以空间为参考,陈设与站位有了唯一事实源,漂移从
+        「靠 QC 抓」变成「无从发生」(v6→v7 实证)。expand_scene_views
+        幂等,已有全景的场景直接跳过。
+        """
+        if not self.config.get("defaults", "space_first", default=False):
+            return
+        project = ctx["project"]
+        for scene in (ctx.get("script") or {}).get("scenes", []):
+            location = str(scene.get("location") or "").strip()
+            if not location:
+                continue
+            pano = self._scene_view_row(
+                project["id"], location, self.SCENE_PANORAMA_KEY)
+            if (pano is not None and pano["uri"]
+                    and Path(pano["uri"]).exists()):
+                continue
+            self.log.info(
+                "director",
+                f"空间前置:为「{location}」生成 720° 全景母版与四向视角")
+            self.expand_scene_views(
+                project["title"], location, include_panorama=True)
+
     def _stage_storyboard(self, ctx):
+        self._ensure_space_first_scenes(ctx)
         if not ctx.get("force"):
             existing, version = self.projects.latest_document(
                 ctx["episode"]["id"], "storyboard")
@@ -6786,6 +6838,14 @@ class Director:
             group_threshold=int(rules.get(
                 "spatial_blocking_required_for_group", 3)))
         mark_spatial_reference_requirements(blocking)
+        # 信息状态×空间事实交叉校验:「迟到的发现」穿帮警示(v7 实证:
+        # 空间一变,「谁能看见谁」必须重推,否则发现拍点悄悄失效)。
+        awareness = awareness_sightline_issues(ctx["storyboard"], blocking)
+        if awareness:
+            blocking.setdefault("validation", {})[
+                "awareness_warnings"] = awareness
+            for item in awareness[:4]:
+                self.log.warn("director", item["message"])
         write_spatial_svgs(blocking, ctx["out_root"] / "blocking")
         write_spatial_reference_pngs(
             blocking, ctx["out_root"] / "blocking" / "seedance")
@@ -9114,19 +9174,33 @@ class Director:
                     })
                     break
         if location:
-            # 按本镜机位选最贴近的场景母版视角(反打/侧向),缺则回退
-            # 主视角——同一空间不同机位不再各画各的。
-            row, scene_label = self._scene_view_reference(
-                project_id, location, camera)
-            if (row and formal_reference_allowed(self._asset_quality(row))
-                    and row["uri"] and Path(row["uri"]).exists()
-                    and remember(row["uri"])):
-                refs["scene_ref"] = row["uri"]
+            # 空间前置:优先用全景按**本镜机位**切出的背景基准(确定性
+            # 数学投影,零成本零漂移);没有全景/blocking 数据时回退到
+            # 四向静态母版,再回退主视角——行为向下兼容。
+            slice_uri = self._scene_slice_for_shot(ctx, location, shot_no)
+            if slice_uri and remember(slice_uri):
+                refs["scene_ref"] = slice_uri
                 refs["asset_matches"].append({
-                    "asset_id": row["id"], "kind": row["kind"],
-                    "name": row["name"], "label": scene_label,
-                    "uri": row["uri"],
+                    "asset_id": None, "kind": "scene_slice",
+                    "name": f"{location}::view:slice",
+                    "label": f"场景:{location}(本镜机位全景切片)",
+                    "uri": slice_uri,
                 })
+            else:
+                # 按本镜机位选最贴近的场景母版视角(反打/侧向),缺则回退
+                # 主视角——同一空间不同机位不再各画各的。
+                row, scene_label = self._scene_view_reference(
+                    project_id, location, camera)
+                if (row and formal_reference_allowed(
+                        self._asset_quality(row))
+                        and row["uri"] and Path(row["uri"]).exists()
+                        and remember(row["uri"])):
+                    refs["scene_ref"] = row["uri"]
+                    refs["asset_matches"].append({
+                        "asset_id": row["id"], "kind": row["kind"],
+                        "name": row["name"], "label": scene_label,
+                        "uri": row["uri"],
+                    })
         matched_rows = (self._matching_produced_image_rows(
             project_id, characters, location, shot_no=shot_no, limit=3,
             wardrobe_states=wardrobe_states,
