@@ -12,6 +12,14 @@ from .identity_facts import (
     explicit_gender,
     unresolved_identity_fields,
 )
+from .style_director import (
+    camera_language_summary,
+    director_ready,
+    extract_director_knowledge,
+    normalize_director_knowledge,
+    strip_director_knowledge,
+    visual_effects_summary,
+)
 
 STORY_ANALYSIS_SCHEMA = "aifos.story-analysis/v1"
 _GENERIC_ERA_MARKERS = (
@@ -875,10 +883,23 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
     story_world = _dict(script.get("story_world"))
     story_background = _dict(script.get("story_background"))
     inferred = infer_story_visual_context(script)
-    requested_style = _text(style)
-    raw_style = _text(raw_visual.get("user_style_constraint"))
+    requested_style_payload = _text(style)
+    requested_director = extract_director_knowledge(
+        requested_style_payload)
+    requested_style = strip_director_knowledge(
+        requested_style_payload)
+    raw_style_payload = _text(raw_visual.get("user_style_constraint"))
+    raw_style = strip_director_knowledge(raw_style_payload)
     if raw_style.startswith(("未指定", "自动分析", "AI自动")):
         raw_style = ""
+    raw_director = normalize_director_knowledge(
+        raw_visual.get("director_knowledge"))
+    style_changed = bool(
+        requested_style and raw_style and requested_style != raw_style)
+    director_knowledge = (
+        requested_director if director_ready(requested_director)
+        else (normalize_director_knowledge({})
+              if style_changed else raw_director))
     locked_style = requested_style or raw_style or inferred["style"]
     raw_style_source = _text(raw_visual.get("style_source"))
     style_source = (
@@ -948,6 +969,19 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
         "forbidden_drift": _list(
             raw_world.get("forbidden_drift"), forbidden),
     }
+    style_camera_language = camera_language_summary(
+        director_knowledge)
+    style_visual_effects = visual_effects_summary(
+        director_knowledge)
+    raw_camera_language = (
+        "" if style_changed
+        else _text(raw_visual.get("camera_language")))
+    camera_language = "；".join(
+        value for value in (
+            (f"风格专属导演镜头库（按剧情功能选用，禁止整库堆叠）："
+             f"{style_camera_language}" if style_camera_language else ""),
+            raw_camera_language,
+        ) if value)
     visual = {
         "user_style_constraint": locked_style,
         "style_source": style_source,
@@ -963,8 +997,15 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
             raw_visual.get("lighting"),
             "主光方向固定，人物面部可读，光影参与情绪叙事"),
         "camera_language": _text(
-            raw_visual.get("camera_language"),
+            camera_language,
             "景别有节奏变化；对话正反打；关键台词后给反应镜，高潮给留白镜"),
+        "visual_effect_language": _text(
+            style_visual_effects,
+            _text(
+                "" if style_changed
+                else raw_visual.get("visual_effect_language"),
+                  "视觉效果服从本镜叙事功能，不遮挡人物身份、动作与道具")),
+        "director_knowledge": copy.deepcopy(director_knowledge),
         "texture_and_render": _text(
             raw_visual.get("texture_and_render"),
             "前中后景层次清楚，自然材质，避免塑料感和过度锐化"),
@@ -1123,7 +1164,9 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
         "seedance_prefix": _text(
             raw_prompts.get("seedance_prefix"),
             "单段不超过15秒；每段单一主动作；人物数量、身份、服装、"
-            "道具、空间、光线和起止状态连续；台词逐字保真；不要字幕"),
+            "道具、空间、光线和起止状态连续；台词逐字保真；"
+            "每镜从风格专属导演知识中只选择一个主要镜头组合和必要视觉效果，"
+            "不得套用其他风格的惯用运镜，不得把整套特效同时堆入一镜；不要字幕"),
         "readable_text_policy": _text(
             raw_prompts.get("readable_text_policy"),
             "手机、合同、招牌等可读文字必须先由关键帧准确锁字；"
@@ -1201,9 +1244,21 @@ def validate_story_analysis(analysis, *, require_resolved_identity=True):
             return f"制作圣经世界设定缺少 {field}"
     for field in (
             "user_style_constraint", "lighting", "camera_language",
-            "architecture_and_environment", "wardrobe_and_styling"):
+            "visual_effect_language", "architecture_and_environment",
+            "wardrobe_and_styling"):
         if not _text(analysis["visual"].get(field)):
             return f"制作圣经视觉设定缺少 {field}"
+    knowledge = normalize_director_knowledge(
+        analysis["visual"].get("director_knowledge"))
+    if any(
+            value for section in (
+                knowledge["shot_language"],
+                knowledge["visual_effects"])
+            for value in section.values()):
+        if not director_ready(knowledge):
+            return (
+                "制作圣经的风格导演知识不完整：镜头语言、视觉效果和"
+                "按剧情功能选择规则必须同时存在")
     for field in (
             "global_image_prefix", "negative_prompt", "character_prefix",
             "scene_prefix", "keyframe_prefix", "seedance_prefix"):
@@ -1318,7 +1373,8 @@ def apply_story_analysis(script, analysis):
         "visual_baseline": (
             f"{visual['user_style_constraint']}；{visual['medium']}；"
             f"{visual['palette']}；{visual['lighting']}；"
-            f"{visual['texture_and_render']}"),
+            f"{visual['texture_and_render']}；"
+            f"{visual.get('visual_effect_language', '')}"),
         "forbidden_drift": forbidden,
     })
     prompt_bible = analysis["prompt_bible"]

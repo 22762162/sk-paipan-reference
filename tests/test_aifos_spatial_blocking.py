@@ -11,6 +11,7 @@ from aifos.spatial_blocking import (MIN_ACTOR_SEPARATION,
                                     validate_spatial_plan,
                                     write_spatial_reference_pngs,
                                     write_spatial_svgs)
+from aifos.prompt_contract import build_physical_contract
 
 
 def _shot(no, characters, movement="固定", action="站在原位"):
@@ -186,6 +187,88 @@ def test_validation_rejects_character_drift():
     report = validate_spatial_plan(plan, storyboard)
     assert not report["passed"]
     assert "人物名单/数量" in report["issues"][0]
+
+
+def test_two_person_dialogue_locks_axis_screen_sides_and_eyelines():
+    first = _shot(1, ["沈眉", "顾长渊"], "固定", "两人隔案对话试探")
+    first.update({
+        "kind": "dialogue",
+        "dialogue": {"character": "沈眉", "dialogue": "你究竟是谁？"},
+    })
+    first["five_dimensions"]["camera_design"].update({
+        "shot_scale": "全景", "camera_position": "正面",
+        "axis_offset_degrees": -30,
+    })
+    second = _shot(2, ["沈眉", "顾长渊"], "固定", "顾长渊回答沈眉")
+    second.update({
+        "kind": "dialogue",
+        "dialogue": {"character": "顾长渊", "dialogue": "你很快会知道。"},
+    })
+    second["five_dimensions"]["camera_design"].update({
+        "shot_scale": "近景", "camera_position": "过肩",
+        "axis_offset_degrees": 30,
+    })
+    storyboard = {"shots": [first, second]}
+    plan = build_spatial_plan(
+        {"scenes": [{"scene_no": 1, "location": "书阁"}]},
+        storyboard,
+        {"characters": [
+            {"name": "沈眉", "role": "主角"},
+            {"name": "顾长渊", "role": "重要配角"},
+        ], "scenes": [{"name": "书阁"}]})
+
+    assert plan["validation"]["passed"], plan["validation"]["issues"]
+    assert any("双人对话" in reason
+               for reason in plan["scenes"][0]["reasons"])
+    one = shot_blocking(plan, 1)
+    two = shot_blocking(plan, 2)
+    d1 = one["dialogue_continuity"]
+    d2 = two["dialogue_continuity"]
+    assert d1["schema"] == "aifos.dialogue-continuity/v1"
+    assert d1["screen_left_actor_id"] == d2["screen_left_actor_id"]
+    assert d1["screen_right_actor_id"] == d2["screen_right_actor_id"]
+    assert d1["axis_id"] == d2["axis_id"]
+    assert d1["camera_side_sign"] == d2["camera_side_sign"]
+    assert d1["coverage"] == "双人建立镜头"
+    assert d2["coverage"] == "同侧过肩正反打"
+    for block in (one, two):
+        left_id = block["dialogue_continuity"]["screen_left_actor_id"]
+        right_id = block["dialogue_continuity"]["screen_right_actor_id"]
+        actors = {
+            actor["actor_id"]: actor for actor in block["actors"]}
+        assert actors[left_id]["gaze_target_actor_id"] == right_id
+        assert actors[right_id]["gaze_target_actor_id"] == left_id
+        assert actors[left_id]["eyeline_screen_direction"] == "向右"
+        assert actors[right_id]["eyeline_screen_direction"] == "向左"
+        assert "双人对话轴线锁" in block["constraint"]
+
+    physical = build_physical_contract({
+        **second, "spatial_blocking": two})
+    assert any("双人对话180°轴线合同" in rule
+               and "禁止交换左右" in rule
+               for rule in physical["rules"])
+
+
+def test_dialogue_validation_rejects_camera_on_or_across_axis():
+    shot = _shot(1, ["甲", "乙"], "固定", "甲乙对话")
+    shot.update({
+        "kind": "dialogue",
+        "dialogue": {"character": "甲", "dialogue": "你来了。"},
+    })
+    storyboard = {"shots": [shot]}
+    plan = build_spatial_plan(
+        {"scenes": [{"scene_no": 1, "location": "房间"}]},
+        storyboard,
+        {"characters": [{"name": "甲"}, {"name": "乙"}], "scenes": []})
+    block = shot_blocking(plan, 1)
+    on_axis = dict(block["dialogue_continuity"]["axis"]["a"])
+    block["camera"]["start"] = on_axis
+    block["camera"]["end"] = on_axis
+
+    report = validate_spatial_plan(plan, storyboard)
+
+    assert not report["passed"]
+    assert any("跨越双人表演轴" in issue for issue in report["issues"])
 
 
 def test_validation_rejects_malformed_3d_actor_and_camera_contract():

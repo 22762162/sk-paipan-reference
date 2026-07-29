@@ -10,6 +10,12 @@ import uuid
 
 from .db import now
 from .errors import AifosError
+from .style_director import (
+    compile_director_style,
+    director_counts,
+    director_ready,
+    normalize_director_knowledge,
+)
 
 
 BRAIN_NAME = "火火漫剧研究室"
@@ -54,6 +60,15 @@ class FireFireCenter:
         result = dict(row)
         result["references"] = _json(result.pop("references_json", "[]"), [])
         result["validation"] = _json(result.get("validation"), {})
+        result["director_knowledge"] = normalize_director_knowledge(
+            _json(result.get("director_knowledge"), {}))
+        result["director_counts"] = director_counts(
+            result["director_knowledge"])
+        result["director_ready"] = director_ready(
+            result["director_knowledge"])
+        result["director_prompt"] = compile_director_style(
+            result.get("compiled_style", ""),
+            result["director_knowledge"])
         return result
 
     @staticmethod
@@ -198,7 +213,8 @@ class FireFireCenter:
 
     def create_style(self, *, name, session_id=None, summary="",
                      compiled_style="", positive_prompt="",
-                     negative_prompt="", references=None, validation=None):
+                     negative_prompt="", references=None, validation=None,
+                     director_knowledge=None):
         name = str(name or "").strip()
         compiled_style = str(compiled_style or "").strip()
         if not name or not compiled_style:
@@ -216,16 +232,18 @@ class FireFireCenter:
         version = int(row["version"] or 0) + 1
         style_id = f"ffstyle-{uuid.uuid4().hex[:12]}"
         timestamp = now()
+        knowledge = normalize_director_knowledge(director_knowledge)
         self.db.execute(
             "INSERT INTO firefire_styles(id, name, version, status, session_id, "
             "summary, compiled_style, positive_prompt, negative_prompt, "
-            "references_json, validation, created_at, updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "references_json, director_knowledge, validation, created_at, "
+            "updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (style_id, name, version, "draft", session_id,
              str(summary or "").strip(), compiled_style,
              str(positive_prompt or "").strip(),
              str(negative_prompt or "").strip(),
              json.dumps(references or [], ensure_ascii=False),
+             json.dumps(knowledge, ensure_ascii=False),
              json.dumps(validation or {}, ensure_ascii=False),
              timestamp, timestamp),
         )
@@ -255,6 +273,10 @@ class FireFireCenter:
             raise AifosError("独立风格不存在")
         if style["status"] != "draft":
             raise AifosError("只有草稿风格可以发布")
+        if not style.get("director_ready"):
+            raise AifosError(
+                "独立风格缺少结构化导演知识：必须同时填写镜头语言、"
+                "视觉效果和按剧情功能选择规则，不能只发布一段总提示词")
         approved_by = str(approved_by or "human").strip()
         validation = dict(style.get("validation") or {})
         validation.update({

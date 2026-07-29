@@ -273,6 +273,7 @@ CREATE TABLE IF NOT EXISTS firefire_styles(
   positive_prompt TEXT NOT NULL DEFAULT '',
   negative_prompt TEXT NOT NULL DEFAULT '',
   references_json TEXT NOT NULL DEFAULT '[]',
+  director_knowledge TEXT NOT NULL DEFAULT '{}',
   validation TEXT NOT NULL DEFAULT '{}',
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL,
@@ -325,6 +326,7 @@ MIGRATIONS = [
     ("projects", "aspect", "TEXT NOT NULL DEFAULT ''"),
     ("projects", "style_pack_id", "TEXT NOT NULL DEFAULT ''"),
     ("tasks", "run_id", "INTEGER REFERENCES production_runs(id)"),
+    ("firefire_styles", "director_knowledge", "TEXT NOT NULL DEFAULT '{}'"),
 ]
 
 

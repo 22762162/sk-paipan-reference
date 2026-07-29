@@ -36,6 +36,11 @@ from .spatial_blocking import (
     requires_spatial_reference,
     validate_spatial_plan,
 )
+from .style_director import (
+    director_ready,
+    normalize_director_knowledge,
+    select_shot_direction,
+)
 
 
 PIPELINE_VERSION = "sk-manju-v5"
@@ -332,10 +337,27 @@ def _type_word(scene, shot):
     return "独白抒情" if shot.get("kind") in ("dialogue", "beat") else "大场面定场"
 
 
+def _director_terms(values, allowed):
+    result = []
+    for value in values or []:
+        text = str(value or "")
+        for token in sorted(allowed, key=len, reverse=True):
+            if token in text and token not in result:
+                result.append(token)
+                break
+    return result
+
+
 def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
-                 scene_start=False, visible_count=None):
+                 scene_start=False, visible_count=None,
+                 director_knowledge=None):
     library = (rules or {}).get("camera_library", {})
     storyboard_rules = (rules or {}).get("storyboard", {})
+    style_knowledge = normalize_director_knowledge(
+        director_knowledge)
+    style_camera = (
+        style_knowledge["shot_language"]
+        if director_ready(style_knowledge) else {})
     scales = library.get(
         "shot_scales", ["远景", "全景", "中景", "近景", "特写", "大特写"])
     angles = library.get(
@@ -346,6 +368,35 @@ def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
         "movements", ["固定", "推", "拉", "摇", "移", "跟", "环绕", "手持", "升降"])
     compositions = library.get(
         "compositions", ["黄金分割", "引导线", "中心构图", "对称构图"])
+    style_scales = _director_terms(
+        style_camera.get("shot_scales"),
+        ("大特写", "特写", "近景", "中景", "全景", "远景", "大远景"))
+    style_angles = _director_terms(
+        style_camera.get("camera_angles"),
+        ("顶拍", "俯拍", "仰拍", "平视", "高角度", "低角度"))
+    style_positions = _director_terms(
+        style_camera.get("camera_positions"),
+        ("过肩", "背面", "侧面", "斜侧", "正面", "四分之三面"))
+    style_movements = _director_terms(
+        style_camera.get("camera_moves"),
+        ("固定", "环绕", "手持", "升降", "急推", "推", "拉", "摇", "移", "跟"))
+    style_compositions = _director_terms(
+        style_camera.get("compositions"),
+        ("中心对称", "框中框", "引导线", "前景遮挡", "留白",
+         "对角线", "水平分割", "三分法", "黄金分割", "中心构图", "对称构图"))
+    style_lenses = _director_terms(
+        style_camera.get("lenses"),
+        ("200mm", "135mm", "100mm", "85mm", "50mm", "35mm", "16mm", "8mm"))
+    if style_scales:
+        scales = style_scales
+    if style_angles:
+        angles = style_angles
+    if style_positions:
+        positions = style_positions
+    if style_movements:
+        movements = style_movements
+    if style_compositions:
+        compositions = style_compositions
     camera = camera or ""
     explicit = next((mark for mark in ("大特写", "特写", "近景", "中景",
                                        "全景", "远景") if mark in camera),
@@ -416,7 +467,10 @@ def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
     plan = {
         "shot_scale": scale,
         "angle": angle,
-        "lens": "85mm" if scale in ("近景", "特写") else "35mm",
+        "lens": (
+            style_lenses[(index - 1) % len(style_lenses)]
+            if style_lenses else
+            "85mm" if scale in ("近景", "特写") else "35mm"),
         "camera_position": (
             explicit_position
             or lateral_positions[(index - 1) % len(lateral_positions)]),
@@ -1384,6 +1438,8 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
     visual_bible = (
         production_analysis.get("visual")
         if isinstance(production_analysis.get("visual"), dict) else {})
+    director_knowledge = normalize_director_knowledge(
+        visual_bible.get("director_knowledge"))
     seedance_master = str(
         prompt_bible.get("seedance_prefix") or "").strip()
     scenes = _scene_map(script)
@@ -1501,7 +1557,11 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             prev_scale=prev_camera_scale,
             scene_start=(raw.get("scene_no") != prev_scene_no
                          and kind == "environment"),
-            visible_count=visible_figure_count)
+            visible_count=visible_figure_count,
+            director_knowledge=director_knowledge)
+        style_direction = select_shot_direction(
+            director_knowledge, index,
+            raw=raw, camera=camera, kind=kind)
         prev_camera_scale = camera["shot_scale"]
         prev_scene_no = raw.get("scene_no")
         text_asset = _text_asset(raw, rules)
@@ -1590,6 +1650,13 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             f"【运镜】只执行一次{camera['movement']}，"
             f"{camera['shot_scale']}·{camera['angle']}，"
             f"动机是{camera['movement_motivation']}。"
+            + (
+                f"【风格镜头】{style_direction['shot_pattern']}；"
+                f"【视觉效果】{'、'.join(style_direction['visual_effects'])}；"
+                f"选择动机：{style_direction['selection_reason']}。"
+                if style_direction["shot_pattern"]
+                or style_direction["visual_effects"] else "")
+            +
             f"【终点】{end_summary or '保持空镜构图稳定'}。"
             f"【文字】{text_rule}。"
             "【禁止】最终画面不得出现P01等人物编号、姓名标签、坐标、箭头、"
@@ -1635,6 +1702,8 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             "音效": environment_sound,
             "视觉钩子": visual_hook,
             "镜头功能": SHOT_FUNCTIONS.get(kind, "信息交代"),
+            "风格镜头组合": style_direction["shot_pattern"],
+            "视觉效果": "、".join(style_direction["visual_effects"]),
         }
         physical_contract = build_physical_contract({
             **raw,
@@ -1687,6 +1756,7 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             "script_reference": script_reference,
             "readable_text": text_asset,
             "visual_hook": visual_hook,
+            "style_direction": style_direction,
             "performance": {
                 "goal": performance_goal,
                 "gaze": gaze,
@@ -1718,6 +1788,8 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
                                or "高反差、暗部保留层次、轻微胶片颗粒"),
                     "palette": visual_bible.get("palette") or [],
                     "lighting": visual_bible.get("lighting") or "",
+                    "visual_effects": style_direction["visual_effects"],
+                    "shot_pattern": style_direction["shot_pattern"],
                     "purpose": "服务事件可读性与角色情绪",
                 },
             },
@@ -1739,6 +1811,12 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             script.get("prop_registry")
             or script.get("core_props") or []),
         "appearance_state_version": APPEARANCE_STATE_VERSION,
+        "style_director_schema": (
+            director_knowledge.get("schema")
+            if director_ready(director_knowledge) else ""),
+        "style_director_knowledge": (
+            copy.deepcopy(director_knowledge)
+            if director_ready(director_knowledge) else {}),
         "profile": copy.deepcopy(profile),
         "standard_fingerprint": profile.get("standard_fingerprint", ""),
         "total_duration": elapsed,

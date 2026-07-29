@@ -6,6 +6,38 @@ from aifos.app import App
 from aifos.web.server import serve
 
 
+DIRECTOR_KNOWLEDGE = {
+    "shot_language": {
+        "shot_patterns": ["斜侧近景缓推"],
+        "shot_scales": ["近景"],
+        "camera_angles": ["平视"],
+        "camera_positions": ["斜侧"],
+        "lenses": ["85mm"],
+        "camera_moves": ["推"],
+        "compositions": ["三分法"],
+        "transitions": ["硬切"],
+        "rhythm": ["一镜一个动作"],
+        "forbidden": ["无动机环绕"],
+    },
+    "visual_effects": {
+        "lighting": ["暖色侧光"],
+        "atmosphere": ["薄雾"],
+        "optical": ["浅景深"],
+        "color_grade": ["低饱和暖调"],
+        "materials": ["布料与金属分层"],
+        "particles": [],
+        "post_process": ["高光晕染"],
+        "forbidden": ["特效遮脸"],
+    },
+    "selection_rules": [{
+        "when": "对白",
+        "shots": ["斜侧近景缓推"],
+        "effects": ["暖色侧光"],
+        "purpose": "靠近人物情绪",
+    }],
+}
+
+
 def _request(port, method, path, body=None):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
     payload = None
@@ -46,8 +78,10 @@ def test_firefire_web_control_plane_and_style_gate(tmp_path):
         status, style = _request(port, "POST", "/api/firefire/style", {
             "name": "验证草稿", "session_id": ready["id"],
             "compiled_style": "剧情适配的可执行风格提示词，禁止字幕、logo、水印",
+            "director_knowledge": DIRECTOR_KNOWLEDGE,
         })
         assert status == 201 and style["status"] == "draft"
+        assert style["director_ready"] is True
         status, reply = _request(port, "POST", "/api/produce", {
             "title": "风格门禁测试", "episode": 1,
             "style_pack_id": style["id"], "review": True,
