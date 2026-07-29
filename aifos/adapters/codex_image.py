@@ -177,10 +177,36 @@ def _style_line(payload):
             "整部作品所有画面保持同一画风、同一人物造型。")
 
 
-def _ref_line(payload):
+def _state_brief(state, limit=300):
+    """人物状态 dict → 紧凑中文行。
+
+    旧行为把 Python dict 的 repr 直接写进提示词:带英文键名/引号/花括号,
+    单条 1022 字(占该提示词 20%),且内容与上文自然语言合同完全重复。
+    """
+    if not isinstance(state, dict) or not state:
+        return "见上文合同"
+    parts = []
+    for name, value in list(state.items())[:4]:
+        if isinstance(value, dict):
+            bits = [str(value.get(key)) for key in
+                    ("pose", "direction", "position", "prop", "emotion")
+                    if value.get(key)]
+            parts.append(f"{name}:{'、'.join(bits) if bits else '见上文'}")
+        elif value:
+            parts.append(f"{name}:{value}")
+    return ("；".join(parts) or "见上文合同")[:limit]
+
+
+def _ref_line(payload, prompt_text=""):
     # 导演中心前置生成的参考图对照表:编号绑定"谁参考哪张图",
     # CLI 侧原样照读,禁止自行重排或忽略
     manifest = payload.get("reference_manifest") or []
+    if manifest and "参考图对照表" in str(prompt_text):
+        # 编译合同里已带整份对照表(含每图 binding)。旧行为在末尾再展开
+        # 一遍,同一份绑定文字在一条提示词里出现两次、合计占下发稿约47%,
+        # 审核环节刚压缩掉的又被原样加回。只留执行指针,不再复注。
+        return ("参考图对照表已在上文——必须逐张真实打开读取,"
+                "严格按编号执行各自绑定职责,禁止跨用途传播。")
     if manifest:
         numbered = ";".join(
             f"图{item.get('index')}={item.get('label', '参考图')}"
@@ -372,7 +398,7 @@ def build_instruction(capability, payload, out_dir):
                 f"{STUDIO_ASSET_RULES.get(kind, '')}"
                 "这张图会进入用户的资产库并在后续制作中作为参考图复用,"
                 "必须干净可复用:不加字幕条、水印、Logo、边框和拼图分格。"
-                f"{_ref_line(payload)}{common}只产出该文件。")
+                f"{_ref_line(payload, prompt_text)}{common}只产出该文件。")
             return instruction, [target], {
                 "name": payload.get("art_name"), "studio_asset": kind}
         if payload.get("prop_candidate"):
@@ -381,7 +407,7 @@ def build_instruction(capability, payload, out_dir):
                 f"为核心道具生成单件候选图并保存到 {target}(PNG,{size})。"
                 f"{prompt_text}。这是供人工四选一的道具母资产候选，"
                 "不得画成人物立绘或场景图。"
-                f"{_ref_line(payload)}{common}只产出该文件。")
+                f"{_ref_line(payload, prompt_text)}{common}只产出该文件。")
             return instruction, [target], {
                 "name": payload.get("art_name"),
                 "prop": payload.get("prop_name", "")}
@@ -395,7 +421,7 @@ def build_instruction(capability, payload, out_dir):
                 f"{prompt_text}。{purpose}。"
                 + ("" if payload.get("prompt_contract_complete")
                    else CHARACTER_BACKGROUND_DIRECTIVE)
-                + f"{_ref_line(payload)}{common}"
+                + f"{_ref_line(payload, prompt_text)}{common}"
                 "只产出该文件。")
             return instruction, [target], {"name": payload.get("art_name")}
         if payload.get("character_sheet"):
@@ -409,7 +435,7 @@ def build_instruction(capability, payload, out_dir):
                 + ("" if payload.get("prompt_contract_complete")
                    else CHARACTER_BACKGROUND_DIRECTIVE)
                 + _screen_prop_rule(prompt_text)
-                + f"{_ref_line(payload)}{common}"
+                + f"{_ref_line(payload, prompt_text)}{common}"
                 "只产出该文件。")
             return instruction, [target], {
                 "name": payload.get("art_name"), "sheet": key}
@@ -418,7 +444,7 @@ def build_instruction(capability, payload, out_dir):
             instruction = (
                 f"为场景生成概念图并保存到 {target}(PNG,{size})。"
                 f"{prompt_text}。这张概念图是该场景的美术基准。"
-                f"{_ref_line(payload)}{common}只产出该文件。")
+                f"{_ref_line(payload, prompt_text)}{common}只产出该文件。")
             return instruction, [target], {"name": payload.get("art_name")}
         shot_no = int(payload["shot_no"])
         target = out_dir / f"shot_{shot_no:03d}.keyframe.png"
@@ -436,7 +462,7 @@ def build_instruction(capability, payload, out_dir):
             f"人物总量合同:{_population_line(payload)}"
             f"禁止新增、漏画、复制或合并任何真人。{text_rule}"
             f"镜头语言:{payload.get('camera', '')}。"
-            f"{_ref_line(payload)}{common}"
+            f"{_ref_line(payload, prompt_text)}{common}"
             "只产出该文件,不要改动其他文件。"
         )
         return instruction, [target], {"shot_no": shot_no}
@@ -461,10 +487,10 @@ def build_instruction(capability, payload, out_dir):
                 f"{image_uri}(均可直接读取)只生成本镜尾帧,"
                 f"保存到 {last}(PNG,{size})。"
                 f"镜头内容:{prompt_text}。"
-                f"结尾状态:{payload.get('end_state', {})};"
+                f"结尾状态:{_state_brief(payload.get('end_state'))};"
                 "画面从首帧状态自然演进到结尾状态,"
                 "人物、服装、道具、场景与首帧完全一致,"
-                f"不新增字幕条。{_ref_line(payload)}{common}"
+                f"不新增字幕条。{_ref_line(payload, prompt_text)}{common}"
                 "只产出尾帧这一个文件。"
             )
             return instruction, [first, last], {
@@ -481,9 +507,9 @@ def build_instruction(capability, payload, out_dir):
                 "不要改动它)。请基于该首帧只生成本镜尾帧,"
                 f"保存到 {last}(PNG,{size})。"
                 f"镜头内容:{prompt_text}。"
-                f"结尾状态:{payload.get('end_state', {})};"
+                f"结尾状态:{_state_brief(payload.get('end_state'))};"
                 "画面从首帧自然演进到结尾状态，人物、服装、道具、场景与"
-                f"首帧完全一致，不新增字幕条。{_ref_line(payload)}{common}"
+                f"首帧完全一致，不新增字幕条。{_ref_line(payload, prompt_text)}{common}"
                 "只产出尾帧这一个文件。")
             return instruction, [first, last], {
                 "first": str(first), "last": str(last),
@@ -493,11 +519,11 @@ def build_instruction(capability, payload, out_dir):
             "为镜头生成首帧与尾帧,"
             f"分别保存到 {first} 和 {last}(PNG,{size})。"
             f"镜头内容:{prompt_text}。"
-            f"起始状态:{payload.get('start_state', {})};"
-            f"结尾状态:{payload.get('end_state', {})};"
+            f"起始状态:{_state_brief(payload.get('start_state'))};"
+            f"结尾状态:{_state_brief(payload.get('end_state'))};"
             "首帧为动作起始、尾帧为动作结束，构图与关键图连贯，"
             "保持人物、服装、道具、场景与任何已锁定文字完全一致，"
-            f"不新增字幕条。{_ref_line(payload)}{common}"
+            f"不新增字幕条。{_ref_line(payload, prompt_text)}{common}"
             "只产出这两个文件。"
         )
         return instruction, [first, last], {
@@ -781,7 +807,7 @@ def build_instruction(capability, payload, out_dir):
                "构图吸睛、适合短视频封面,可留出大标题排版空间。")
             + "封面若出现人物，只允许出现并严格对应:"
             f"{'、'.join(payload.get('characters', [])) or '无人'}。"
-            f"{_ref_line(payload)}{common}只产出该文件。")
+            f"{_ref_line(payload, prompt_text)}{common}只产出该文件。")
         return instruction, [target], {}
     raise ValueError(f"codex 适配桥不支持能力: {capability}")
 
