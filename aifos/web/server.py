@@ -1915,6 +1915,63 @@ def _episode_status_payload(app, episode_id, jobs):
     return payload
 
 
+def _scene3d_payload(app, episode_id):
+    """3D 空间查看器数据:blocking 三维调度 + 该场景的 720° 全景母版。
+
+    全景是房间几何真相,blocking 是人和机位在房间里的位置——两者同一
+    坐标系(全景中心 yaw0 = blocking +Z),叠在一起才是完整的空间事实。
+    """
+    episode = app.projects.get_episode(episode_id)
+    if episode is None:
+        return None
+    blocking, blocking_v = app.projects.latest_document(
+        episode_id, "blocking")
+    if blocking is None:
+        return {"episode_id": episode_id, "blocking": None,
+                "panoramas": {}, "message": "本集尚未生成空间调度"}
+    project_id = episode["project_id"]
+    artifacts = app.workspace.artifacts_dir.resolve()
+    panoramas = {}
+    for scene in (blocking.get("scenes") or []):
+        location = str(scene.get("location") or "").strip()
+        if not location or location in panoramas:
+            continue
+        row = app.assets.latest(
+            project_id, "scene_art", f"{location}::view:panorama")
+        if row is None or not row["uri"]:
+            continue
+        uri = Path(row["uri"]).resolve()
+        try:
+            rel = uri.relative_to(artifacts)
+        except ValueError:
+            continue
+        panoramas[location] = {
+            "url": "/artifacts/" + str(rel),
+            "version": row["version"],
+        }
+    storyboard, _sv = app.projects.latest_document(episode_id, "storyboard")
+    actions = {}
+    for shot in ((storyboard or {}).get("shots") or []):
+        try:
+            actions[str(int(shot.get("shot_no")))] = {
+                "action": str(shot.get("action") or "")[:200],
+                "camera": str(shot.get("camera") or "")[:120],
+            }
+        except (TypeError, ValueError):
+            continue
+    return {
+        "episode_id": episode_id,
+        "episode_number": episode["number"],
+        "project_title": (app.db.query_one(
+            "SELECT title FROM projects WHERE id=?", (project_id,))
+            or {"title": ""})["title"],
+        "blocking": blocking,
+        "blocking_version": blocking_v,
+        "panoramas": panoramas,
+        "shot_actions": actions,
+    }
+
+
 def _episode_payload(app, episode_id, jobs=None):
     episode = app.projects.get_episode(episode_id)
     if episode is None:
@@ -2309,6 +2366,21 @@ def make_handler(workspace, jobs):
                     if not data:
                         return self._error(400, "缺少 data 参数")
                     return self._qr_svg(data)
+                if route == "/scene3d":
+                    return self._file(STATIC_DIR / "scene3d.html",
+                                      no_cache=True)
+                if route == "/api/scene3d":
+                    try:
+                        episode_id = int(query.get("episode", ["0"])[0])
+                    except (TypeError, ValueError):
+                        return self._error(400, "episode 必须是数字")
+                    if not episode_id:
+                        return self._error(400, "缺少 episode 参数")
+                    payload = self._with_app(
+                        lambda app: _scene3d_payload(app, episode_id))
+                    if payload is None:
+                        return self._error(404, "剧集不存在")
+                    return self._json(payload)
                 if route == "/api/overview":
                     return self._json(self._with_app(
                         lambda app: _overview_payload(app, jobs)))
