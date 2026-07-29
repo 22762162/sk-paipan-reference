@@ -1302,12 +1302,14 @@ async function renderDashboard() {
     <section class="panel firefire-summary-panel">
       <div class="panel-heading-row"><div><span class="eyebrow">RESEARCH BRAIN</span><h2>火火漫剧研究室</h2></div>
         <button type="button" class="mini-btn" data-firefire-open>打开研究室</button></div>
-      <p class="muted">把公开短剧/平台案例拆成可追溯证据，生成验证任务；只有人工确认后，独立风格才会出现在上面的首步选择器。</p>
+      <p class="muted">研究资料先做价值、证据、边界和标准兼容审核；通过后才进入版本化知识大脑，人工激活且仍对齐当前标准的知识才能被 Skill 调用。</p>
       <div class="firefire-stats">
         <span><b>${firefire.counts?.sessions || 0}</b>学习会话</span>
         <span><b>${firefire.counts?.evidence || 0}</b>证据</span>
         <span><b>${firefire.counts?.draft_styles || 0}</b>待确认风格</span>
         <span><b>${firefire.counts?.approved_styles || 0}</b>已发布风格</span>
+        <span><b>${firefire.counts?.knowledge_review || 0}</b>待审知识</span>
+        <span><b>${firefire.counts?.knowledge_active || 0}</b>可调用知识</span>
       </div>
       ${approvedFireStyles.length ? `<div class="asset-chips firefire-style-chips">${approvedFireStyles.map((style) => `<span class="chip">${esc(style.name)} · v${esc(style.version)}</span>`).join("")}</div>` : `<div class="empty">还没有人工确认的独立风格</div>`}
     </section>
@@ -1558,7 +1560,7 @@ function openFireFireLab(initial) {
   overlay.className = "script-overlay firefire-overlay";
   overlay.innerHTML = `<div class="script-panel firefire-panel">
     <div class="script-head"><div><span class="eyebrow">RESEARCH BRAIN</span><h3>火火漫剧研究室</h3></div><button class="close">关闭 Esc</button></div>
-    <p class="logline">学习资料只进入研究空间；证据、分析草稿和验证任务可追溯，独立风格必须人工确认后才能用于新剧。</p>
+    <p class="logline">研究资料不会直接污染生产：先过价值门禁，再由人工激活成不可变版本；制作标准变化后自动暂停调用，复核产生新版本。</p>
     <div class="firefire-lab-body"></div>
   </div>`;
   document.body.appendChild(overlay);
@@ -1572,6 +1574,7 @@ function openFireFireLab(initial) {
   const render = (data) => {
     const sessions = data.sessions || [];
     const styles = data.styles || [];
+    const knowledge = data.knowledge || [];
     panel.innerHTML = `
       <div class="firefire-grid">
         <form class="firefire-form" data-firefire-session-form>
@@ -1603,6 +1606,66 @@ function openFireFireLab(initial) {
           <button type="submit">保存草稿，等待人工确认</button>
         </form>
       </div>
+      <section class="firefire-knowledge-lab">
+        <div class="firefire-knowledge-head">
+          <div><span class="eyebrow">KNOWLEDGE GATE</span><h4>知识大脑 · 入库审核与调用</h4></div>
+          <small>低于 70 分、无来源、无边界、无验证计划或未对齐制作标准的内容拒绝入库。</small>
+        </div>
+        <div class="firefire-knowledge-grid">
+          <form class="firefire-form" data-firefire-knowledge-form>
+            <h4>提交知识/技能候选</h4>
+            <div class="firefire-form-split">
+              <input name="knowledge_key" placeholder="稳定 ID，例如 depth-structure-control" required>
+              <input name="title" placeholder="知识标题" required>
+            </div>
+            <div class="firefire-form-split">
+              <select name="kind"><option value="knowledge">知识</option><option value="skill">技能</option></select>
+              <select name="domain"><option value="cross_stage">跨阶段</option><option value="script">剧本</option><option value="storyboard">分镜</option><option value="blocking">调度</option><option value="image">图片</option><option value="video">视频</option><option value="qc">质检</option><option value="delivery">交付</option></select>
+            </div>
+            <textarea name="summary" rows="2" placeholder="一句话说明解决什么问题" required></textarea>
+            <input name="source_url" type="url" placeholder="来源链接" required>
+            <input name="source_title" placeholder="来源标题" required>
+            <input name="author" placeholder="作者/机构（可选）">
+            <input name="stages" placeholder="适用阶段，逗号分隔：blocking,images,video" required>
+            <input name="task_types" placeholder="任务类型，逗号分隔" required>
+            <input name="triggers" placeholder="调用触发词，逗号分隔" required>
+            <textarea name="principles" rows="3" placeholder="原则，每行一条" required></textarea>
+            <textarea name="workflow" rows="4" placeholder="工作流，每行一步，至少两步" required></textarea>
+            <textarea name="limitations" rows="3" placeholder="能力边界，每行一条" required></textarea>
+            <textarea name="exclusions" rows="3" placeholder="不适用场景/替代方法，每行一条" required></textarea>
+            <textarea name="quality_gates" rows="3" placeholder="质量门槛，每行一条" required></textarea>
+            <textarea name="validation_plan" rows="3" placeholder="验证计划，每行一条" required></textarea>
+            <textarea name="evidence" rows="3" placeholder="证据摘要，每行一条" required></textarea>
+            <button class="primary" type="submit">先检测价值，再保存候选</button>
+          </form>
+          <div class="firefire-knowledge-side">
+            <form class="firefire-form" data-firefire-resolve-form>
+              <h4>测试 Skill 调用</h4>
+              <div class="firefire-form-split">
+                <input name="stage" placeholder="阶段，如 video">
+                <input name="task_type" placeholder="任务，如 depth_control">
+              </div>
+              <textarea name="query" rows="3" placeholder="描述当前任务，知识大脑只返回已激活、匹配且标准未过期的条目"></textarea>
+              <button type="submit">检索可调用知识</button>
+              <div class="firefire-resolution" data-firefire-resolution>尚未检索</div>
+            </form>
+            <div class="firefire-knowledge-records">
+              <h4>知识版本</h4>
+              ${knowledge.length ? knowledge.map((item) => {
+                const score = Number(item.assessment?.score || 0);
+                const status = item.state_status === "review" ? "待人工审核" : "已激活";
+                const standard = item.standard_status === "current" ? "标准已对齐" : "标准已变化，暂停调用";
+                const actions = item.state_status === "review"
+                  ? `<button class="mini-btn firefire-knowledge-publish" data-key="${esc(item.knowledge_key)}">人工确认并激活</button>`
+                  : (item.standard_status !== "current"
+                    ? `<button class="mini-btn firefire-knowledge-refresh" data-key="${esc(item.knowledge_key)}">生成最新标准候选</button>`
+                    : "");
+                return `<article class="firefire-record knowledge-record"><div><b>${esc(item.title)} · v${esc(item.version)}</b><span class="chip">${status}</span><span class="chip">${standard}</span></div><small>${esc(item.summary)}</small><small>价值评分 ${score}/100 · ${esc(item.kind)} · ${esc(item.domain)}</small>${actions}</article>`;
+              }).join("") : `<div class="empty">还没有通过价值门禁的知识</div>`}
+            </div>
+          </div>
+        </div>
+      </section>
       <div class="firefire-records">
         <h4>学习会话与分析状态</h4>
         ${sessions.length ? sessions.map((s) => `<article class="firefire-record"><div><b>#${s.id} ${esc(s.name)}</b><span class="chip">${esc(s.status)}</span></div><small>${esc(s.source_url || s.notes || "未填写来源")}</small>${s.rights_confirmed && s.status !== "complete" ? `<button class="mini-btn firefire-analyse" data-id="${s.id}">建立分析工作单</button>` : `<small>${s.rights_confirmed ? "已完成" : "等待权利确认"}</small>`}</article>`).join("") : `<div class="empty">还没有学习会话</div>`}
@@ -1627,6 +1690,54 @@ function openFireFireLab(initial) {
         showToast("风格草稿已保存", "ok"); render(await api("/api/firefire"));
       } catch (error) { showToast(error.message, "error"); }
     };
+    panel.querySelector("[data-firefire-knowledge-form]").onsubmit = async (event) => {
+      event.preventDefault(); const form = event.currentTarget;
+      const lines = (value) => String(value || "").split(/[\n,，;；]+/).map((item) => item.trim()).filter(Boolean);
+      const payload = {
+        knowledge_key: form.knowledge_key.value,
+        title: form.title.value,
+        kind: form.kind.value,
+        domain: form.domain.value,
+        summary: form.summary.value,
+        content: {
+          principles: lines(form.principles.value),
+          workflow: lines(form.workflow.value),
+          limitations: lines(form.limitations.value),
+          quality_gates: lines(form.quality_gates.value),
+          validation_plan: lines(form.validation_plan.value),
+          standard_refs: ["rules.production", "rules.quality_gates"],
+        },
+        applicability: {
+          stages: lines(form.stages.value),
+          task_types: lines(form.task_types.value),
+          triggers: lines(form.triggers.value),
+          tags: lines(form.triggers.value),
+          exclusions: lines(form.exclusions.value),
+        },
+        provenance: {
+          source_url: form.source_url.value,
+          source_title: form.source_title.value,
+          author: form.author.value,
+          checked_at: new Date().toISOString().slice(0, 10),
+          evidence: lines(form.evidence.value),
+        },
+      };
+      try {
+        const created = await api("/api/firefire/knowledge", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        showToast(`价值门禁通过：${created.assessment.score}/100，已进入人工审核`, "ok");
+        render(await api("/api/firefire"));
+      } catch (error) { showToast(error.message, "error"); }
+    };
+    panel.querySelector("[data-firefire-resolve-form]").onsubmit = async (event) => {
+      event.preventDefault(); const form = event.currentTarget;
+      const output = form.querySelector("[data-firefire-resolution]");
+      try {
+        const result = await api("/api/firefire/knowledge/resolve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ stage: form.stage.value, task_type: form.task_type.value, query: form.query.value }) });
+        output.innerHTML = result.matches.length
+          ? result.matches.map((item) => `<article><b>${esc(item.title)} · v${esc(item.version)}</b><small>${esc(item.summary)}</small></article>`).join("")
+          : `<small>没有匹配的已激活知识${result.skipped_stale?.length ? "；部分知识因制作标准变化已暂停调用" : ""}</small>`;
+      } catch (error) { showToast(error.message, "error"); }
+    };
     panel.querySelectorAll(".firefire-analyse").forEach((button) => button.onclick = async () => {
       try { await api("/api/firefire/analyse", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: button.dataset.id }) }); showToast("已建立分析工作单，请继续绑定证据", "ok"); render(await api("/api/firefire")); } catch (error) { showToast(error.message, "error"); }
     });
@@ -1634,8 +1745,15 @@ function openFireFireLab(initial) {
       if (!window.confirm("确认已查看验证结果，并把这个风格发布到新剧首步选择器吗？")) return;
       try { await api("/api/firefire/style/publish", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ style_id: button.dataset.id, approved_by: "human" }) }); showToast("独立风格已发布", "ok"); render(await api("/api/firefire")); } catch (error) { showToast(error.message, "error"); }
     });
+    panel.querySelectorAll(".firefire-knowledge-publish").forEach((button) => button.onclick = async () => {
+      if (!window.confirm("确认这条知识有证据、可执行、有边界，并且不会与当前制作标准冲突吗？")) return;
+      try { await api("/api/firefire/knowledge/publish", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ knowledge_key: button.dataset.key, approved_by: "human", note: "在研究室界面完成价值与标准复核" }) }); showToast("知识已激活，可供 Skill 调用", "ok"); render(await api("/api/firefire")); } catch (error) { showToast(error.message, "error"); }
+    });
+    panel.querySelectorAll(".firefire-knowledge-refresh").forEach((button) => button.onclick = async () => {
+      try { await api("/api/firefire/knowledge/refresh", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ knowledge_key: button.dataset.key }) }); showToast("已生成对齐最新标准的新候选，需再次人工审核", "ok"); render(await api("/api/firefire")); } catch (error) { showToast(error.message, "error"); }
+    });
   };
-  render(initial || { sessions: [], styles: [] });
+  render(initial || { sessions: [], styles: [], knowledge: [] });
 }
 
 async function onProduce(ev) {

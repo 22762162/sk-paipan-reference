@@ -10,6 +10,7 @@ import uuid
 
 from .db import now
 from .errors import AifosError
+from .knowledge_brain import KnowledgeBrain
 from .style_director import (
     compile_director_style,
     director_counts,
@@ -32,9 +33,11 @@ def _json(value, default):
 class FireFireCenter:
     """管理学习会话、引用证据、分析草稿和人工确认的风格包。"""
 
-    def __init__(self, db, artifacts_root=None):
+    def __init__(self, db, artifacts_root=None, standards=None):
         self.db = db
         self.artifacts_root = artifacts_root
+        self.knowledge = KnowledgeBrain(db, standards=standards)
+        self.knowledge.ensure_seed()
 
     @staticmethod
     def _session(row, *, include_evidence=False):
@@ -84,6 +87,7 @@ class FireFireCenter:
     def overview(self):
         sessions = self.list_sessions(limit=20)
         styles = self.list_styles()
+        knowledge = self.knowledge.list()
         validation = [self._validation(row) for row in self.db.query(
             "SELECT * FROM firefire_validation_tasks "
             "ORDER BY created_at DESC LIMIT 20")]
@@ -92,6 +96,7 @@ class FireFireCenter:
             "analysis_schema": ANALYSIS_SCHEMA,
             "sessions": sessions,
             "styles": styles,
+            "knowledge": knowledge,
             "validation_tasks": validation,
             "counts": {
                 "sessions": int(self.db.query_one(
@@ -107,8 +112,30 @@ class FireFireCenter:
                 "validation_tasks": int(self.db.query_one(
                     "SELECT COUNT(*) AS n FROM firefire_validation_tasks"
                 )["n"]),
+                "knowledge_active": int(self.db.query_one(
+                    "SELECT COUNT(*) AS n FROM firefire_knowledge_state "
+                    "WHERE status='active' AND active_version_id IS NOT NULL"
+                )["n"]),
+                "knowledge_review": int(self.db.query_one(
+                    "SELECT COUNT(*) AS n FROM firefire_knowledge_state "
+                    "WHERE status='review' AND candidate_version_id IS NOT NULL"
+                )["n"]),
             },
         }
+
+    def create_knowledge(self, payload):
+        return self.knowledge.create_candidate(payload)
+
+    def publish_knowledge(self, knowledge_key, *, approved_by="human",
+                          note=""):
+        return self.knowledge.publish(
+            knowledge_key, approved_by=approved_by, note=note)
+
+    def refresh_knowledge(self, knowledge_key):
+        return self.knowledge.refresh_alignment(knowledge_key)
+
+    def resolve_knowledge(self, **context):
+        return self.knowledge.resolve(**context)
 
     def create_session(self, name="", source_url="", source_type="url",
                        rights_confirmed=False, notes=""):
