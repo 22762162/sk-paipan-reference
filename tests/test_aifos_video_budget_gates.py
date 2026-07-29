@@ -134,3 +134,61 @@ class ConfirmationWiringTest(unittest.TestCase):
             src,
             "视频 payload 必须把 manual 档位翻译成确认标记,"
             "否则正常的高档生产会被预算闸门误拦")
+
+
+class PublicQueueUpgradeTest(unittest.TestCase):
+    """非 VIP 型号走公共排队,不是省钱是换时间(实测滞留 40 分钟~2 小时);
+    且 mini 45 积分反而比 fast 25 积分更贵。一律升到对应 VIP 型号。"""
+
+    def _model_of(self, conf, payload=None):
+        captured = {}
+
+        def _capture(tag, cmd, _cwd, _timeout, cancel=None):
+            captured["cmd"] = cmd
+            raise _ReachedCli()
+
+        provider = _provider(conf)
+        with mock.patch.object(dreamina_module, "run_interruptible",
+                               side_effect=_capture):
+            with self.assertRaises(_ReachedCli):
+                provider.generate("video", _payload(**(payload or {})),
+                                  "/tmp/out")
+        joined = " ".join(captured["cmd"])
+        match = [a for a in captured["cmd"]
+                 if a.startswith("--model_version=")]
+        self.assertTrue(match, joined)
+        return match[0].split("=", 1)[1]
+
+    def test_mini_upgrades_to_fast_vip(self):
+        self.assertEqual(
+            self._model_of({"model_version": "seedance2.0mini"}),
+            "seedance2.0fast_vip")
+
+    def test_fast_upgrades_to_fast_vip(self):
+        self.assertEqual(
+            self._model_of({"model_version": "seedance2.0fast"}),
+            "seedance2.0fast_vip")
+
+    def test_plain_20_upgrades_to_vip(self):
+        self.assertEqual(
+            self._model_of({"model_version": "seedance2.0"}),
+            "seedance2.0_vip")
+
+    def test_vip_models_are_left_alone(self):
+        self.assertEqual(
+            self._model_of({"model_version": "seedance2.0fast_vip"}),
+            "seedance2.0fast_vip")
+
+    def test_public_queue_can_be_opted_into_explicitly(self):
+        self.assertEqual(
+            self._model_of({"model_version": "seedance2.0mini",
+                            "allow_public_queue": True}),
+            "seedance2.0mini")
+
+    def test_1080p_still_reverse_selects_full_vip(self):
+        """分辨率反选优先级高于队列升级:1080p 只有 seedance2.0_vip 支持。"""
+        self.assertEqual(
+            self._model_of({"model_version": "seedance2.0mini"},
+                           {"video_resolution": "1080p",
+                            "video_final_confirmed": True}),
+            "seedance2.0_vip")

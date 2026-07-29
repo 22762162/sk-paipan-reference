@@ -102,7 +102,20 @@ class DreaminaProvider(Provider):
         if (video_resolution.lower() in ("1080p", "4k")
                 and model_version != "seedance2.0_vip"):
             model_version = "seedance2.0_vip"
-        # 预算规则(用户 2026-07-29 定):一切迭代验证用 mini 720p(45积分/段),
+        # 非 VIP 型号走**公共排队**,不是省钱是换时间——实测 mini 单段滞留
+        # 40 分钟(v5 镜5)到 2 小时(v7 镜2),而同批 vip 段 2-3 分钟就出;
+        # 且 mini 45 积分反而比 fast 25 积分更贵。VIP 通道不排队,fast_vip
+        # 是 720p 迭代的正确档位(本模块开头的注释一直这么写,是 workspace
+        # 配置把它覆盖成了 mini)。自动升到对应 VIP 型号,不静默排队。
+        public_queue_upgrade = {
+            "seedance2.0mini": "seedance2.0fast_vip",
+            "seedance2.0fast": "seedance2.0fast_vip",
+            "seedance2.0": "seedance2.0_vip",
+        }
+        if (model_version in public_queue_upgrade
+                and not self.conf.get("allow_public_queue")):
+            model_version = public_queue_upgrade[model_version]
+        # 预算规则(用户 2026-07-29 定):一切迭代验证用 720p fast_vip,
         # vip 1080p(165/段)只给「用户确认过的最终成片」。vip 提交必须带显式
         # final 标记,否则宁可报错也不静默花钱——一次全量 8 镜误上 vip 的
         # 代价是 960 积分,而报错的代价是零。
