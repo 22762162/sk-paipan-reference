@@ -4664,9 +4664,16 @@ class Director:
                 "reference_adjustments", "diagnosis_complete"):
             if key in codex_report:
                 report[key] = copy.deepcopy(codex_report[key])
-        # 只有"第一次失败 + Codex 判定定向重画"才允许立刻按新提示词再出一张;
-        # 合同类处理(改合同/拆镜/人工)与第二次失败一律不出图。
-        redraw_now = bool(executable and action == "targeted_redraw")
+        # "第一次失败 + 定向重画"立即按新提示词再出一张。
+        # repair_contract 此前是死路:Codex 下达了修合同指令,全仓库没有
+        # 代码执行它,合同类失败只能人工介入。现在首失败时把指令自动应用
+        # 为合同修订(落到提示词基底,输入哈希随之变化,escalation_redraw_block
+        # 的「合同真的改了就放行」条件自然成立),给一次自动修复机会;
+        # 第二次失败仍旧停手交人工——自动修复只许试一轮。
+        auto_contract_repair = bool(
+            executable and action == "repair_contract" and instruction)
+        redraw_now = bool(executable and (
+            action == "targeted_redraw" or auto_contract_repair))
         blocked_reason = "" if redraw_now else (
             f"第 {failures} 次质检未过，已由 Codex 分析；"
             "禁止没有应用 Codex 指令的原样重画")
@@ -4686,6 +4693,7 @@ class Director:
                 "stage": ("first_failure_autofix" if executable
                           else "final_analysis"),
                 "executable": redraw_now,
+                "auto_contract_repair": auto_contract_repair,
                 "trigger": "consecutive_qc_failures",
                 "consecutive_failures": failures,
                 "provider": existing_provider or "codex",
@@ -5210,6 +5218,27 @@ class Director:
                 revision = dict(revision)
                 revision["text"] = codex_instruction
                 revision["source"] = "codex_escalation"
+            escalation_ctx = report.get("codex_escalation") or {}
+            if (escalation_ctx.get("auto_contract_repair")
+                    and codex_instruction):
+                # repair_contract 自动执行:修订落到提示词**基底**。落在
+                # feedback 会被审核清空;落在 prompt 会在下一轮被
+                # _attach_reference_manifest 用 _reference_prompt_base
+                # 整个重建回原始稿(v6 实测:上一轮修订就是这样直接丢失的)。
+                amendment = ("\n【Codex合同修订·必须执行】"
+                             + codex_instruction[:1200])
+                base = str(next_payload.get("_reference_prompt_base")
+                           or next_payload.get("prompt") or "")
+                if amendment not in base:
+                    next_payload["_reference_prompt_base"] = base + amendment
+                    next_payload["prompt"] = (
+                        str(next_payload.get("prompt") or "") + amendment)
+                    if next_payload.get("prompt_compact"):
+                        next_payload["prompt_compact"] = (
+                            str(next_payload["prompt_compact"]) + amendment)
+                    next_payload.setdefault("_applied_qc_changes", []).append(
+                        {"kind": "auto_contract_repair",
+                         "instruction": codex_instruction[:600]})
             if qc_spec.get("character_sheet_key"):
                 patch = self._sheet_feedback_for_key(
                     patch, qc_spec.get("character_sheet_key"))
