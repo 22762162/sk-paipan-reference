@@ -252,9 +252,11 @@ REFERENCE_SCOPE_DEFAULTS = {
     "prop": {
         "include": ["props"],
         "inherits": ["shape", "structure", "materials", "craft"],
+        # ``frame_share`` 是道具母图最容易外溢的一项:母图是占满画面的
+        # 棚拍特写,不排除掉,模型会把「铃铛很大」当成道具事实继承。
         "exclude": [
             "identity", "wardrobe", "pose", "composition", "background",
-            "lighting", "prop_position",
+            "lighting", "prop_position", "frame_share",
         ],
     },
     "spatial": {
@@ -2527,9 +2529,19 @@ def render_shot_prompt(contract, *, mode=None):
             target_ref.get("state") if isinstance(target_ref, dict)
             else contract.get("frame_target_state"))
         core_props = []
+        unscaled_props = []
         # 内部 prop_id 不入提示词(会被判提示词泄漏);经注册表解析中文名
         registry_names = {
             _text(entry.get("prop_id")): _text(entry.get("name"))
+            for entry in (contract.get("prop_registry") or [])
+            if isinstance(entry, dict)}
+        # 道具尺度必须写成「画面内参照物」。缺这一条时,binding 里的
+        # 「尺寸服从当前镜头合同」就指向一份对尺寸只字未提的合同,模型
+        # 只能退回去继承参考图——而道具母图是占满画面的棚拍特写,于是
+        # 一枚两指可捏的小铃铛被画成 3-4 倍大(2026-07-28 EP1 实测)。
+        # 实测「1.5厘米」这类绝对尺寸无效,只有参照物描述能纠正。
+        registry_scales = {
+            _text(entry.get("prop_id")): _text(entry.get("scale_reference"))
             for entry in (contract.get("prop_registry") or [])
             if isinstance(entry, dict)}
         for item in (contract.get("frame_props") or []):
@@ -2544,10 +2556,15 @@ def render_shot_prompt(contract, *, mode=None):
                 continue
             holder = _text(item.get("holder"))
             state = _text(item.get("physical_state"))
+            scale = _text(item.get("scale_reference")) or registry_scales.get(
+                _text(item.get("prop_id")), "")
             detail = "、".join(filter(None, (
-                f"由{holder}持有" if holder else "", state)))
+                f"由{holder}持有" if holder else "", state,
+                f"画面内尺度:{scale}" if scale else "")))
             core_props.append(
                 f"{prop_name}({detail})" if detail else prop_name)
+            if not scale:
+                unscaled_props.append(prop_name)
             if len(core_props) >= 2:
                 break
         if core_state or core_props:
@@ -2557,6 +2574,16 @@ def render_shot_prompt(contract, *, mode=None):
             lines.append(
                 f"【核心画面】{core_line}(以上均以本镜机位的可见面"
                 "为准,被机位背向或裁出画的细节免验)。")
+        if unscaled_props:
+            # 存量剧本没有 scale_reference。没有这句兜底,「尺寸服从合同」
+            # 就指向一份对尺寸只字未提的合同,模型只能退回去继承道具母图
+            # ——而母图是占满画面的棚拍特写,小物件因此被画成数倍大。
+            lines.append(
+                "【道具尺度】" + "、".join(dict.fromkeys(unscaled_props))
+                + "未声明画面内尺度：严禁参照其母资产图在画面中的占比"
+                "(母图是把道具放大数十倍的棚拍特写)，必须按本镜的持有"
+                "方式、与人手/身体/家具的真实比例关系推断它应有的大小，"
+                "宁小勿大。")
     if media == "video":
         lines.append(
             "【输入】图1是唯一动作起点，图2是唯一动作终点；"
@@ -3574,3 +3601,70 @@ def validate_shot_prompt_contract(contract):
         "warnings": warnings,
         "semantic_corrections": semantic_corrections,
     }
+
+
+_FRAME_SEGMENT_SPLIT = re.compile(r"(?=【)")
+_FRAME_SEGMENT_HEAD = re.compile(r"^【([^】]{1,24})】")
+
+
+def _frame_segments(text):
+    """把渲染好的静态合同按【标题】切段，保序。"""
+    return [seg.rstrip()
+            for seg in _FRAME_SEGMENT_SPLIT.split(str(text or ""))
+            if seg.strip()]
+
+
+def _frame_segment_head(segment):
+    match = _FRAME_SEGMENT_HEAD.match(str(segment or ""))
+    return match.group(1) if match else ""
+
+
+def merge_frame_compacts(first_compact, last_compact):
+    """首尾帧两份静态合同合并成「两帧共用 + 首帧独有 + 尾帧独有」。
+
+    旧写法是把两份**完整**合同前后拼接。实测 EP1 一条 frames 提示词
+    9153 字、35 段，两半各 17 段结构完全相同，其中 13 段逐字节重复
+    (主体 435、参考图职责 1468、画风 464、道具定格 363…)，合计 4348 字
+    = 全文 47.5% 是纯复制。真正区分首尾帧的只有【核心画面】和
+    【定格状态】两段、加起来不到 270 字。
+
+    模型要在两份几乎一样的合同里找出那几处差别，差别反而被淹没——
+    这正是「提示词越长越不准」的具体机制。合并后共用段只说一次，
+    差异段单独列出并显式标注归属。
+    """
+    first_segs = _frame_segments(first_compact)
+    last_segs = _frame_segments(last_compact)
+    if not first_segs or not last_segs:
+        # 任一侧解析不出段落就退回原样拼接，宁可冗余也不丢事实。
+        return None
+    last_pool = {}
+    for seg in last_segs:
+        last_pool.setdefault(_frame_segment_head(seg), []).append(seg)
+    shared, first_only, matched = [], [], set()
+    for seg in first_segs:
+        head = _frame_segment_head(seg)
+        pool = last_pool.get(head) or []
+        if seg in pool:
+            shared.append(seg)
+            pool.remove(seg)
+            matched.add(id(seg))
+        else:
+            first_only.append(seg)
+    remaining = [seg for segs in last_pool.values() for seg in segs]
+    last_only = [seg for seg in last_segs if seg in remaining]
+    if not first_only and not last_only:
+        # 两份完全一致说明相位没生效，这本身是缺陷；照原样返回让上游可见。
+        return None
+    blocks = ["【两帧共用】以下事实首帧与尾帧完全相同，只声明一次：",
+              "\n".join(shared)]
+    if first_only:
+        blocks += ["【仅首帧】以下是首帧独有的状态，尾帧不得沿用：",
+                   "\n".join(first_only)]
+    if last_only:
+        blocks += ["【仅尾帧】以下是尾帧独有的状态，首帧不得提前出现：",
+                   "\n".join(last_only)]
+    blocks.append(
+        "【联合生成约束】分别执行两份静态合同；共用段两帧照搬，"
+        "差异段各归各帧；首帧不得混入尾帧状态，"
+        "尾帧不得保留已完成动作的起点状态。")
+    return "\n".join(blocks)

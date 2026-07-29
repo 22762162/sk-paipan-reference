@@ -51,6 +51,7 @@ from .prompt_contract import (
     build_physical_contract,
     build_composition_contract,
     compile_shot_prompt,
+    merge_frame_compacts,
     readable_text_required,
     shot_local_scene,
     validate_shot_prompt_contract,
@@ -62,6 +63,7 @@ from .lessons import (DISTILL_MIN_PENDING, DOMAIN_IMAGE, DOMAIN_SCRIPT,
                       script_lessons_block)
 from .qc_stats import record_qc
 from .relations import relation_lines, write_relations
+from .rule_governance import next_revision_round, stack_revision_feedback
 from .spatial_language import derive_movement_term, spatial_lines
 from .storyboard_preflight import (describe_issues, preflight_storyboard,
                                   repairable_shots)
@@ -5166,7 +5168,15 @@ class Director:
                     "physical_logic_match": False,
                     "spatial_logic_checked": False,
                     "spatial_logic_match": False,
-                    "hard_failure": True,
+                    # 质检产线自己挂了(网络、额度、进程被杀)不等于画面
+                    # 有硬伤。hard_failure 的语义是「不能出街、也不允许
+                    # 人工放行」;把基础设施故障写成 hard_failure,等于用
+                    # 一次网络抖动把这张图永久锁死——人工放行按钮对它
+                    # 无效,重画也解决不了,只能整集重来。
+                    # 这里一个字段都没检查过(identity/gender/count/
+                    # physical/spatial 全是 False),没有任何判定依据。
+                    "hard_failure": False,
+                    "qc_infrastructure_failure": True,
                     "image_passed": False,
                     "visual_pass": False,
                     "input_contract_passed": False,
@@ -5316,10 +5326,17 @@ class Director:
                 patch = self._sheet_feedback_for_key(
                     patch, qc_spec.get("character_sheet_key"))
             if patch:
-                old_feedback = str(next_payload.get("feedback") or "").strip()
-                next_payload["feedback"] = (
-                    f"{old_feedback}\n{patch}" if old_feedback else patch
-                )[:2400]
+                # 轮次不能用 attempts:提示词审核通过后 router 会把
+                # payload["feedback"] 清空并转存到 prompt_review_feedback_applied
+                # (router.py:626),所以这里的 feedback 恒为空、attempts 又被
+                # _qc_retries() 钳为 0,直接用 attempts+1 会让每一轮都自称
+                # 「第1轮」,把跨次人工重画攒下的更高轮次判成更新的。
+                # 改为从两个字段里已有的标记推下一轮,保证全局单调。
+                next_payload["feedback"] = stack_revision_feedback(
+                    next_payload.get("feedback"), patch,
+                    next_revision_round(
+                        next_payload.get("feedback"),
+                        next_payload.get("prompt_review_feedback_applied")))
             if ((patch or reference_changes["applied"])
                     and self._use_failed_image_as_revision_base(diagnostics)):
                 references = [uri]
@@ -9967,7 +9984,7 @@ class Director:
                 ["face", "identity", "pose", "background", "lighting"]),
             "prop": (
                 ["prop_structure", "prop_material"],
-                ["background", "composition", "extra_props"]),
+                ["background", "composition", "extra_props", "frame_share"]),
             "spatial": (
                 ["blocking", "camera", "occlusion"],
                 ["identity", "wardrobe", "style", "diagram_artifacts"]),
@@ -10092,6 +10109,9 @@ class Director:
                 "磨损和识别细节；本镜中的尺寸、持有人、动作与状态服从"
                 f"当前镜头合同{phase_rule}；"
                 f"{carrier_rule}"
+                "参考图是把该道具放大数十倍的棚拍特写，只用于认形制与"
+                "材质，严禁继承它在画面中的占比——本镜里它必须按合同"
+                "声明的画面内尺度呈现；"
                 "不得把纯背景、棚拍构图或额外道具带入画面",
                 role="prop", kind="prop_identity")
         for uri in payload.get("character_refs") or []:
@@ -10293,7 +10313,14 @@ class Director:
                 payload["prompt_contract"] = frame_contracts["first_frame"]
                 payload["prompt_contract_validation"] = (
                     frame_validations["first_frame"])
-                payload["prompt_compact"] = (
+                # 两份合同结构完全相同,只有【核心画面】【定格状态】等
+                # 少数几段随相位变化;直接前后拼接会把其余段逐字复制一遍
+                # ——实测 9153 字里 4348 字(47.5%)是纯重复,真正区分首尾帧
+                # 的不到 270 字,差别被淹没在重复里。合并后共用段只说一次。
+                merged = merge_frame_compacts(
+                    frame_compacts["first_frame"],
+                    frame_compacts["last_frame"])
+                payload["prompt_compact"] = merged if merged else (
                     "【首帧独立静态合同】\n"
                     + frame_compacts["first_frame"]
                     + "\n【尾帧独立静态合同】\n"
@@ -10695,7 +10722,43 @@ class Director:
         """首尾帧·帧链模式:同一场内「上一镜尾帧 = 下一镜首帧」,
         两段视频拼接处画面连贯;不同场之间是剪辑硬切,各自独立,
         因此按轮推进——每轮并行处理各场的第 N 镜,场内保持串行。"""
+        self._require_scene_views(ctx)
         self._plan_seed_shots(ctx)
+        return self._stage_frames_impl(ctx)
+
+    def _require_scene_views(self, ctx):
+        """帧链前置闸门:本集每个场景必须已有 720° 全景母版。
+
+        单角度概念图只锁得住同方向的镜头,一转机位模型就得自己发明那一侧
+        的房间——v6 实测:九张关键帧各画各的房间,6/8 镜出现「镜内场景
+        重生成跳变」。全景母版是唯一几何基准(功能在 expand_scene_views),
+        产线此前不强制,等于没有。默认关闭以兼容存量与测试,生产工作区
+        用 defaults.require_scene_views=true 开启。
+        """
+        if not self.config.get("defaults", "require_scene_views",
+                               default=False):
+            return
+        project_id = ctx["project"]["id"]
+        missing = []
+        for scene in (ctx.get("script") or {}).get("scenes", []):
+            location = str(scene.get("location") or "").strip()
+            if not location:
+                continue
+            row = self.assets.latest(
+                project_id, "scene_art", f"{location}::view:panorama")
+            if (row is None or not row["uri"]
+                    or not Path(row["uri"]).exists()):
+                if location not in missing:
+                    missing.append(location)
+        if missing:
+            raise AifosError(
+                "场景缺少 720° 全景母版,帧链不开工(否则每张关键帧会"
+                "自己发明房间细节,镜内出现换布景级跳变):"
+                + "、".join(missing)
+                + "。请先运行 expand_scene_views(项目, 场景名) 或在"
+                "网页端「场景视角扩展」生成后重试")
+
+    def _stage_frames_impl(self, ctx):
         images = {i["shot_no"]: i for i in ctx["images"]}
         ctx["frames"] = []
         reused = 0
@@ -10716,11 +10779,24 @@ class Director:
                     continue
                 shot = chain[round_no]
                 scene_no = shot.get("scene_no")
-                if round_no > 0 and scene_no not in last_by_scene:
+                # 锚点必须来自**紧邻的上一镜**。last_by_scene 只在成功时
+                # 写入、从不删除,而旧门禁只问「这一场有没有过尾帧」——
+                # 于是镜3 失败后,镜4 会拿到还留在字典里的镜2 尾帧当首帧,
+                # 静默跳过镜3。合同声称「上一镜尾帧=本镜首帧」,实际接的是
+                # 两镜之前的画面,而且全程不报错:帧链断在这里最难发现。
+                expected_prev = (
+                    chain[round_no - 1].get("shot_no") if round_no > 0
+                    else None)
+                anchor = last_by_scene.get(scene_no)
+                if round_no > 0 and (
+                        not anchor
+                        or anchor.get("shot_no") != expected_prev):
+                    stale = (f"；当前可用锚点来自镜{anchor.get('shot_no')}，"
+                             "不是紧邻的上一镜，不能接" if anchor else "")
                     self._plan_mark(
                         ctx, f"frames:{shot['shot_no']}", "pending",
-                        error=(
-                            "等待同场上一镜尾帧通过质检；本镜未调用生图模型"))
+                        error=(f"等待同场上一镜(镜{expected_prev})尾帧"
+                               f"通过质检；本镜未调用生图模型{stale}"))
                     continue
                 name = self._shot_name(ctx, shot["shot_no"])
                 payload = self._shot_payload(
@@ -10754,7 +10830,8 @@ class Director:
                         self._plan_mark(ctx, f"frames:{shot['shot_no']}",
                                         "reused", only_pending=True)
                         last_by_scene[scene_no] = {
-                            "uri": last, "image_quality": frame_quality}
+                            "uri": last, "image_quality": frame_quality,
+                            "shot_no": shot["shot_no"]}
                         continue
                 image = images[shot["shot_no"]]
                 if formal_reference_allowed(
@@ -10833,6 +10910,7 @@ class Director:
                 last_by_scene[task["scene"]] = {
                     "uri": result.data["last"],
                     "image_quality": decision["level"],
+                    "shot_no": shot_no,
                 }
             if qc_failures:
                 failed_shots = sorted(
@@ -11979,6 +12057,10 @@ class Director:
             "forbid_subtitles": not ctx["production_profile"]["burn_subtitles"],
             "video_quality": quality["level"],
             "video_resolution": quality["resolution"],
+            # 预算闸门的确认信号:1080p/4k 属最终成片档,provider 侧
+            # fail-closed 拒绝未确认的 vip 提交。用户在确认页亲手选高档
+            # (source=manual)本身就是确认;auto 推出来的高档不算,照拦。
+            "video_final_confirmed": quality.get("source") == "manual",
             "standard_fingerprint": ctx["production_profile"].get(
                 "standard_fingerprint", ""),
             "aspect": ctx["aspect"], **ctx["dims"],
@@ -13744,8 +13826,18 @@ class Director:
                     and revision_source != "batch_current_contract"
                     and prompt_is_unchanged
                     and "【自动优化修订】" not in feedback):
-                feedback = ((auto_revision + "\n【人工补充】" + feedback)
-                            if feedback else auto_revision)[:2400]
+                # 跨次人工重画是真正会累积出互斥修订的路径(质检自动重试
+                # 被 _qc_retries() 钳为单轮)。旧写法 [:2400] 把最新的人工
+                # 补充截在末尾丢掉,且没有轮次可排序,几轮之后按治理条款
+                # (c) 同级互斥只能熔断,单镜永久卡死。
+                # 轮次取「已有标记推出的下一轮」与「历史连续失败数+1」的
+                # 较大者:自动修订文本未必带得住标记,而 qc_failure_base 是
+                # 跨次持久化的计数,两者取大保证全局单调。
+                feedback = stack_revision_feedback(
+                    auto_revision, feedback,
+                    max(next_revision_round(auto_revision),
+                        int(qc_failure_base or 0) + 1)) if feedback else (
+                            auto_revision[:2400])
         policy = self._episode_quality_policy(episode["id"])
         if quality_override is not None and item_id:
             policy = set_policy_choices(
@@ -16043,12 +16135,17 @@ class Director:
             # 二次失败稿没有正式资产时,允许用户明确放行 output_uri;
             # 没有真实文件则拒绝把“通过”写成空壳状态。
             candidate = item.get("output_uri")
+            # frames 必须和 shot_image 一样能提升 output_uri。旧写法只认
+            # shot_image:frames 条目走到下面那行时 uri 原样保持 None,
+            # 紧接着被「没有可用图片，不能人工放行」跳过——UI 上按钮可见
+            # 可点,后端 100% 跳过,合同类失败的首尾帧因此没有任何出口。
             promote_candidate = (
-                category == "shot_image"
+                category in ("shot_image", "frames")
                 and item.get("status") in ("awaiting_human", "failed")
                 and valid_uri(candidate))
             if promote_candidate or (not uri and valid_uri(candidate)):
-                uri = str(candidate) if category == "shot_image" else uri
+                if category in ("shot_image", "frames"):
+                    uri = str(candidate)
                 if category == "shot_image":
                     shot = next((value for value in ctx["storyboard"].get(
                         "shots", []) if int(value.get("shot_no", -1))
@@ -16148,7 +16245,11 @@ class Director:
              if int(item.get("shot_no", -1)) == requested_shot_no), None)
         auto_revision = (previous_shot_qc or {}).get("revision_feedback") or ""
         if auto_revision and "【自动优化修订】" not in feedback:
-            feedback = (auto_revision + "\n【人工补充】" + feedback)[:2400]
+            # 与图片侧同一处病理:最新的人工补充排在末尾,被 [:2400] 截掉。
+            feedback = stack_revision_feedback(
+                auto_revision, feedback,
+                next_revision_round(auto_revision)) if feedback else (
+                    auto_revision[:2400])
         script, _ = self.projects.latest_document(episode["id"], "script")
         storyboard, _ = self.projects.latest_document(
             episode["id"], "storyboard")

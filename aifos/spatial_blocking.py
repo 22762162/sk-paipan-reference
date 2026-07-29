@@ -294,7 +294,12 @@ def _dialogue_contract(shot, positions, camera, memory, scene_no):
         _rescale_to_declared_distance(
             camera, target, camera["scale_distance_m"])
     for actor, other in ((left, right), (right, left)):
+        # 双人对话镜刻意覆写朝向以锁 180° 轴线。三个键必须一起写:
+        # 下游 staging_clause 优先读 facing_{phase},只改 facing 会让
+        # 轴线覆写被静默绕过,双人镜退回分镜原文、越轴。
         actor["facing"] = f"面向{other['name']}"
+        actor["facing_start"] = actor["facing"]
+        actor["facing_end"] = actor["facing"]
         actor["gaze_target_actor_id"] = other["actor_id"]
         actor["gaze_target_name"] = other["name"]
         actor["eyeline_screen_direction"] = (
@@ -857,6 +862,15 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
                     "route_direction": route_direction,
                     "route_label": (f"起点→终点，{route_direction}"
                                     if start != end else "原地静止"),
+                    # 朝向必须分相位。只留一个 facing 会让首帧合同拿到
+                    # 尾帧视线——实测本集 7/8 镜命中:镜6 首帧一边写
+                    # 「银铃仍由木面承托、右拳尚未成形」,一边写「视线仍落
+                    # 在右拳」,要求模型注视一个此刻还不存在的东西。
+                    # facing 保留为尾帧值,供 1138 行的对视审计与存量文档。
+                    "facing_start": state_start.get("direction")
+                                    or state_end.get("direction") or "面向主体",
+                    "facing_end": state_end.get("direction")
+                                  or state_start.get("direction") or "面向主体",
                     "facing": state_end.get("direction")
                               or state_start.get("direction") or "面向主体",
                 })

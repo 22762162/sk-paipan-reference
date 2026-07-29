@@ -309,15 +309,35 @@ def normalize_prop_contract(script: dict) -> dict:
     return script
 
 
+# 绝对尺寸(厘米/毫米/寸)对出图模型无效——实测写「直径1.5厘米」铃铛仍然
+# 过大,改写成「两指可捏住、比线装书还薄」才纠正得过来。判定标准:出现了
+# 计量单位、却没有任何画面内参照物的比较语。
+_ABSOLUTE_UNIT_RE = re.compile(
+    r"\d+\s*(?:厘米|毫米|公分|cm|mm|米|寸|分)", re.IGNORECASE)
+_SCALE_COMPARISON_CUES = (
+    "比", "如", "像", "相当", "不超过", "不足", "可", "能", "捏", "握",
+    "藏", "指", "掌", "手", "拳", "大小", "差不多", "近似", "般",
+)
+
+
+def _absolute_size_only(text) -> bool:
+    text = _text(text)
+    if not text or not _ABSOLUTE_UNIT_RE.search(text):
+        return False
+    return not any(cue in text for cue in _SCALE_COMPARISON_CUES)
+
+
 def audit_prop_contract(script: dict) -> dict:
     """Validate stable IDs and event-addressable lifecycles without NLP scans."""
     issues = []
+    warnings = []
     registry = script.get("prop_registry")
     if not isinstance(registry, list):
         return {
             "schema": PROP_CONTRACT_SCHEMA,
             "passed": False,
             "issues": ["prop_registry 必须是数组"],
+            "warnings": [],
             "registered_prop_ids": [],
         }
     seen_ids = set()
@@ -352,6 +372,21 @@ def audit_prop_contract(script: dict) -> dict:
             seen_names.add(name)
         if not _text(item.get("kind")):
             issues.append(f"{prefix}.kind 缺失")
+        # scale_reference 是后加的必备事实(见 PRODUCTION_INCIDENT_LEDGER 四)。
+        # 存量剧本一律没有这个字段,做成阻断级会让所有既有项目一夜不合格,
+        # 还会短路掉本函数下游的既有修复路径。因此这里只出警告,真正的
+        # 兜底放在 prompt_contract:道具实际可见时才注入禁令。
+        scale = _text(item.get("scale_reference"))
+        if not scale:
+            warnings.append(
+                f"{prefix}.scale_reference 缺失；建议用画面内参照物说明该"
+                "道具多大(如「比一册线装书还薄、两指可捏住」)。缺这一条时"
+                "出图侧「尺寸服从合同」无物可依，模型容易继承道具母图"
+                "(占满画面的棚拍特写)的画面占比，把小物件画成数倍大")
+        elif _absolute_size_only(scale):
+            warnings.append(
+                f"{prefix}.scale_reference 只写了绝对尺寸「{scale}」；"
+                "绝对尺寸对出图模型无效，建议改写成画面内可见的参照物比较")
         instance_count = item.get("instance_count")
         if type(instance_count) is not int or instance_count != 1:
             issues.append(
@@ -390,6 +425,7 @@ def audit_prop_contract(script: dict) -> dict:
         "schema": PROP_CONTRACT_SCHEMA,
         "passed": not issues,
         "issues": list(dict.fromkeys(issues)),
+        "warnings": list(dict.fromkeys(warnings)),
         "registered_prop_ids": sorted(registered),
     }
 

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import copy
+import re
 
 
 RULE_GOVERNANCE_SCHEMA = "aifos.rule-governance/v1"
@@ -172,9 +173,14 @@ def prompt_adjudication_clause():
             "修改意见明确要求更改字形本身;"
             "(b) 其余并列冲突按唯一优先级取高层级事实执行,低层级只能"
             f"补缺不得覆盖:{levels};"
-            "(c) 只有同一层级内两条事实互斥、且没有任何显式裁决条款时,"
-            "才允许 approved=false,并在阻断原因里写明是哪两条同级事实、"
-            "各自出处——不得再以「无优先级条款」为由阻断。"),
+            "(b2) 同级冲突的两条事实若都来自逐项人工修订/质检反馈"
+            "(带「第N轮修订」标记),按轮次取最后一条执行,前面的轮次"
+            "视为已被本人替换、不再生效,也不构成冲突——人工在后一轮"
+            "改口是修订的正常形态,不是自相矛盾;"
+            "(c) 只有同一层级内两条事实互斥、且没有任何显式裁决条款、"
+            "且不属于 (b2) 的可排序修订时,才允许 approved=false,并在"
+            "阻断原因里写明是哪两条同级事实、各自出处——不得再以"
+            "「无优先级条款」为由阻断。"),
         "field_precedence": {
             level: list(fields)
             for level, fields in CONTEXT_FIELD_PRECEDENCE.items()},
@@ -339,3 +345,57 @@ def audit_rule_configuration(content):
             "severity": "block",
         })
     return issues
+
+
+# 逐项人工修订/质检反馈是「同级可排序事实」：后一轮改口是修订的正常
+# 形态，不是自相矛盾。裁决条款 (b2) 靠这个标记来判定谁在后。
+REVISION_ROUND_PREFIX = "【第{round}轮修订·后条覆盖前条】"
+REVISION_FEEDBACK_BUDGET = 2400
+_REVISION_ROUND_RE = re.compile(r"【第(\d+)轮修订")
+
+
+def next_revision_round(*texts):
+    """下一轮轮次 = 已出现过的最大轮次 + 1。
+
+    轮次必须跨「人工重画」与「质检自动重画」两条路径全局单调,否则
+    (b2)「取轮次最大的一条」会把最新的意见判成已失效。质检重试在单次
+    调用内被 ``_qc_retries()`` 钳为 1 轮,真正的多轮来自跨次人工重画,
+    两边共用同一个计数来源:已有文本里的标记本身。
+    """
+    highest = 0
+    for text in texts:
+        for match in _REVISION_ROUND_RE.finditer(str(text or "")):
+            try:
+                highest = max(highest, int(match.group(1)))
+            except ValueError:
+                continue
+    return highest + 1
+
+
+def stack_revision_feedback(previous, patch, round_no,
+                            budget=REVISION_FEEDBACK_BUDGET):
+    """把新一轮修订叠到既有反馈上，并保证最新一轮永远不被截断。
+
+    旧实现是 ``f"{old}\\n{patch}"[:2400]``——纯累加，且截断保留的是**最旧**
+    的那几轮、丢掉最新一轮，与优先级正好相反。累积几轮后两条人工修订
+    互斥，按治理条款 (c) 同级互斥只能熔断，单镜就永久卡死。
+
+    现在每轮带上轮次标记，超预算时从**最旧**的一端丢起，新一轮一定完整
+    保留；下游按条款 (b2) 取轮次最大的一条执行。
+    """
+    patch = str(patch or "").strip()
+    if not patch:
+        return str(previous or "").strip()
+    head = REVISION_ROUND_PREFIX.format(round=max(1, int(round_no or 1)))
+    latest = f"{head}{patch}"
+    blocks = [
+        block for block in str(previous or "").split("\n") if block.strip()]
+    blocks.append(latest)
+    # 最新一轮独占预算也要保住；不够就只留它。
+    while len(blocks) > 1 and len("\n".join(blocks)) > budget:
+        blocks.pop(0)
+    if len(blocks) == 1 and len(latest) > budget:
+        # 单轮就超预算时截正文，但轮次标记必须留住——否则条款 (b2)
+        # 无从判断谁在后。
+        return head + patch[:max(0, budget - len(head))]
+    return "\n".join(blocks)

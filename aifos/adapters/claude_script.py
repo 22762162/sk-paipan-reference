@@ -76,6 +76,12 @@ SCRIPT_PROMPT = """你是兼具顶级类型片编剧、影视导演、场面调�
   `availability_start_event`、可选 `retired_at` / `availability_end_event`，
   以及明确 `disclosure_policy`。事件引用必须使用稳定 event_id，禁止只写会因
   重排而变化的 shot_no;
+- 每件 `prop_registry` 条目必须写 `scale_reference`：用**画面内可见的参照物**
+  描述它有多大，禁止只写厘米/毫米等绝对尺寸。绝对尺寸对出图模型无效，只有
+  参照物有效——写「比一册线装书还薄、两指指尖即可捏住、五指合拢可藏进掌心」，
+  不要写「直径1.5厘米」。参照物必须选本片场景里真实存在的物件或人体部位。
+  没有这一条，出图时道具会继承母图(占满画面的棚拍特写)的画面占比而被画成
+  数倍大;
 - 每场必须明确人物信息状态：本场开始时各自知道什么、不知道什么、通过何种
   可见证据新获知什么；禁止角色突然知道未听见、未看见、未被告知的内容;
 - 每场必须明确时间关系和动作耗时。上一场出口、本场入口、本场出口和下一场入口
@@ -162,6 +168,7 @@ JSON 格式(字段必须齐全):
  "prop_contract_schema":"aifos.prop-contract/v2.2",
  "prop_registry":[{{"prop_id":"稳定且唯一的道具实例ID","name":"全剧唯一实例显示名称",
    "kind":"core/plot_sensitive/identity_prop","instance_count":1,
+   "scale_reference":"用画面内参照物说明它多大(如:比一册线装书还薄、两指可捏住、掌心可藏住);禁止只写厘米",
    "introduced_at":{{"event_id":"稳定剧情事件ID","phase":"start"}},
    "availability_start_event":{{"event_id":"同一稳定剧情事件ID","phase":"start"}},
    "retired_at":null,"availability_end_event":null,
@@ -353,6 +360,7 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
 JSON 格式:
 {{"episode_title": "...","prop_contract_schema":"aifos.prop-contract/v2.2",
  "prop_registry":[{{"prop_id":"稳定道具实例ID","name":"全剧唯一实例显示名称",
+   "scale_reference":"用画面内参照物说明它多大;禁止只写厘米",
    "kind":"core/plot_sensitive/identity_prop","instance_count":1,
    "introduced_at":{{"event_id":"同一源场次内首次可披露的准确镜头event_id","phase":"start"}},
    "availability_start_event":{{"event_id":"同一准确镜头event_id","phase":"start"}},
@@ -1349,6 +1357,7 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 当前镜头逐角色服装/头饰/妆发状态:{expected_wardrobe}
 只要本镜声明了服装状态，就必须逐人核对实际画面；上一镜已经锁定官服而本镜
 无换装动作却变成常服、漏掉帽冠、擅自改发型或妆容，一律是连续性硬错误。
+场景连续性对照:{scene_continuity}
 背面/侧面镜头按可见服装轮廓、背片、材质、颜色、头饰与发型核对，不要求正脸。
 必须点数画面里实际可见的人物总数，并与要求人数逐一核对；多一个、少一个、
 同一角色被复制两次或把两人合成一人都必须失败。
@@ -1581,7 +1590,28 @@ def build_qc_prompt(payload):
         overlay_rules = (
             "本镜不允许非现实内心Q版叠层；detected_overlay_count 必须为0，"
             "不得擅自新增Q版、分身、幽灵或意识小人。")
+    # 相邻帧对比判据。QC 早就随请求收到 role=continuity 的对照图
+    # (同镜首帧/上一镜尾帧),但判据里从没要求对照它查场景——于是
+    # 单帧重画后凭空多出灯笼、书架换款、纱幕变厚帘、色温整体偏橙
+    # 这类漂移(2026-07-29 实测)全靠人眼兜底。有对照图就必须机器拦。
+    continuity_labels = [
+        str(entry.get("label") or "对照帧")
+        for entry in (generation_references or [])
+        if isinstance(entry, dict)
+        and str(entry.get("role") or "") == "continuity"]
+    if continuity_labels:
+        scene_continuity = (
+            "以参考图中的「" + "」「".join(continuity_labels[:3]) + "」为"
+            "同场对照基准，逐项核对:陈设的种类与数量、家具款式、门窗/"
+            "帷幔/墙面材质、光线方向与色温。画面出现对照图中不存在的"
+            "新陈设(灯笼、额外家具、多出的器物)、既有陈设换款式、或"
+            "色温明显偏移(变橙/变冷/变暗)，属于场景连续性错误，"
+            "visual_pass 必须为 false 并在 issues 里写明是哪一件；"
+            "人物动作与视线按本镜合同变化，不参与本项对比。")
+    else:
+        scene_continuity = "本镜无同场对照帧，跳过本项。"
     return IMAGE_QC_PROMPT.format(
+        scene_continuity=scene_continuity,
         image=payload.get("image_uri", ""),
         generation_scope=json.dumps(
             generation_scope, ensure_ascii=False, separators=(",", ":")),

@@ -491,6 +491,10 @@ def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
     return plan
 
 
+# beat/reaction 兜底朝向的模板字面。它不是可画的画面事实，
+# 只用来判定「这一条是不是模板值」，判定为模板就回落去继承起点朝向。
+_STATE_DEFAULT_DIRECTION = "面向本镜主体，视线不越轴"
+
 def _state(name, continuity, emotion="专注", pose="站立，重心稳定"):
     anchor = next(
         (c for c in continuity.get("characters", []) if c["name"] == name), {})
@@ -499,7 +503,7 @@ def _state(name, continuity, emotion="专注", pose="站立，重心稳定"):
         "injury": "无伤",
         "prop": anchor.get("signature_prop", "无"),
         "emotion": emotion,
-        "direction": "面向本镜主体，视线不越轴",
+        "direction": _STATE_DEFAULT_DIRECTION,
         "position": anchor.get("default_position", "画面中"),
         "headwear": {
             "presence": "none",
@@ -1532,6 +1536,20 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
                 explicit_state = _state(
                     name, continuity, emotion=emotion,
                     pose="保持原位，完成眼神与呼吸变化")
+                # _state() 的 direction 是模板文字「面向本镜主体，视线
+                # 不越轴」——单人镜里「本镜主体」自指,「不越轴」是给摄影
+                # 指导看的规则而非可画的画面事实,对图像模型等价于「随便
+                # 画」。而下面 _merge_shot_state 的 state.update(declared)
+                # 会用它**覆盖掉**刚从起点继承来的具体朝向。
+                # beat/reaction 按定义是「保持上一镜结束姿态、只做眼神与
+                # 呼吸变化」,继承起点朝向才是它本来应有的事实。
+                inherited_direction = str(
+                    (start_state.get(name) or {}).get("direction") or "").strip()
+                if (inherited_direction
+                        and inherited_direction != _STATE_DEFAULT_DIRECTION):
+                    explicit_state["direction"] = inherited_direction
+                else:
+                    explicit_state.pop("direction", None)
             end_state[name] = _merge_shot_state(
                 name, continuity, explicit_state, action_text,
                 previous=start_state.get(name), emotion=emotion,
@@ -1619,7 +1637,28 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
                 actor_gaze = "双眼保持闭合，不发生追视"
                 actor_micro = "身体保持被动稳定"
             else:
-                actor_gaze = "凝视/瞥向对手或核心物件"
+                # 旧写法是硬编码的「凝视/瞥向对手或核心物件」——斜杠是
+                # 未决选项而不是指令,且对全片全角色恒等,对视频模型是零
+                # 信息量的噪声。首尾帧图片里视线已被【空间站位】定死,
+                # 视频提示词却从不复述,于是模型在中段拥有完全的视线自由
+                # 裁量权:两端都对、中间被拉走,这就是「转头望向纱幕」被
+                # 演成「背着人影往反方向看」的成因(覆盖 248/254 镜)。
+                # 改为从本镜已解析好的起止朝向派生出可演的过渡指令。
+                start_dir = str((start_state.get(actor_name) or {}).get(
+                    "direction") or "").strip()
+                end_dir = str((end_state.get(actor_name) or {}).get(
+                    "direction") or "").strip()
+                if start_dir and end_dir and start_dir != end_dir:
+                    actor_gaze = (
+                        f"起点{start_dir}→终点{end_dir}；"
+                        "中段视线只在这两者之间连续过渡，"
+                        "不得看向第三方向、不得看镜头")
+                elif end_dir or start_dir:
+                    actor_gaze = (
+                        f"{end_dir or start_dir}；"
+                        "全程保持该注视对象不变，不得看镜头")
+                else:
+                    actor_gaze = "视线锁定本镜动作对象，全程不变，不得看镜头"
                 actor_micro = "眉眼变化·下颌张力·呼吸节奏"
             gaze_parts.append(f"{actor_name}:{actor_gaze}")
             micro_expression_parts.append(

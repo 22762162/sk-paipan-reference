@@ -116,7 +116,7 @@ def test_frames2video_command_shape(tmp_path, fake_dreamina):
         result = app.router.call("video", {
             "shot_no": 1, "prompt": "妖气翻涌的古镇长街",
             "first": "/tmp/first.png", "last": "/tmp/last.png",
-            "duration": 2.5,
+            "duration": 4.5,
         }, app.workspace.artifacts_dir)
         assert result.provider == "jimeng"
         # 成片从即梦输出路径归档进平台产物目录
@@ -130,7 +130,7 @@ def test_frames2video_command_shape(tmp_path, fake_dreamina):
         assert f"--first={Path('/tmp/first.png').resolve()}" in call
         assert f"--last={Path('/tmp/last.png').resolve()}" in call
         assert "--prompt=妖气翻涌的古镇长街" in call
-        assert "--duration=3" in call
+        assert "--duration=5" in call
         assert "--video_resolution=720p" in call
         assert "--model_version=seedance2.0fast_vip" in call
         assert "--poll=30" in call
@@ -213,6 +213,8 @@ def test_payload_can_select_three_seedance_quality_levels(
             "shot_no": 1, "prompt": "镜头缓推",
             "first": "/tmp/first.png", "last": "/tmp/last.png",
             "video_quality": quality, "video_resolution": resolution,
+            # 1080p 属最终成片档;预算闸门要求显式确认,否则 fail-closed
+            "video_final_confirmed": resolution == "1080p",
         }, app.workspace.artifacts_dir)
         (call,) = _calls(fake_dreamina)
         assert f"--video_resolution={resolution}" in call
@@ -310,7 +312,7 @@ def test_dialogue_voiced_in_video_prompt(tmp_path, fake_dreamina):
             "shot_no": 2, "prompt": "特写镜头",
             "dialogue": {"character": "林昭", "dialogue": "妖气不对劲"},
             "first": "/tmp/first.png", "last": "/tmp/last.png",
-            "duration": 3.0,
+            "duration": 5.0,
         }, app.workspace.artifacts_dir)
     finally:
         app.close()
