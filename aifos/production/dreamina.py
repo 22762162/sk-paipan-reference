@@ -95,9 +95,35 @@ class DreaminaProvider(Provider):
         if video_resolution.lower() not in ("480p", "720p", "1080p"):
             raise ProviderError(
                 "Seedance video_resolution 只允许 480p/720p/1080p")
+        # 只有 seedance2.0_vip 支持 1080p/4k;其余型号(含 mini、fast_vip)
+        # 一律只出 720p。不按分辨率反选型号,「高档 1080P」就是个不可达
+        # 的假选项:用户选了 1080p,请求照发,即梦静默降回 720p——而关键帧
+        # 母图是 1080x1920,线性分辨率白丢 33%,全程不报错。
+        if (video_resolution.lower() in ("1080p", "4k")
+                and model_version != "seedance2.0_vip"):
+            model_version = "seedance2.0_vip"
+        # 预算规则(用户 2026-07-29 定):一切迭代验证用 mini 720p(45积分/段),
+        # vip 1080p(165/段)只给「用户确认过的最终成片」。vip 提交必须带显式
+        # final 标记,否则宁可报错也不静默花钱——一次全量 8 镜误上 vip 的
+        # 代价是 960 积分,而报错的代价是零。
+        if (video_resolution.lower() in ("1080p", "4k")
+                and not payload.get("video_final_confirmed")
+                and not self.conf.get("allow_vip_without_confirmation")):
+            raise ProviderError(
+                "1080p/4k 属最终成片档(seedance2.0_vip, 165积分/段)，"
+                "迭代验证请用 720p(mini, 45积分/段)。确为最终成片时在"
+                " payload 带 video_final_confirmed=true 再提交")
         # 即梦 CLI 接受整秒；0.5 秒分镜用常规四舍五入，避免 Python
         # bankers rounding 把 2.5 秒意外压成 2 秒。
         duration = max(1, min(15, int(requested_duration + 0.5)))
+        # Seedance 全家族时长下限 4 秒。分镜偶发产出 1.5-3.0 秒镜头,
+        # 旧代码 max(1,...) 只兜到 1 秒,提交后必然被即梦拒收——白付一次
+        # 往返。这是分镜时长合同的缺口,fail-closed 打回去改分镜,
+        # 不做静默拉长(拉长会悄悄改变叙事节奏)。
+        if duration < 4:
+            raise ProviderError(
+                f"Seedance 最短 4 秒,本镜声明 {requested_duration} 秒。"
+                "请回分镜层修正时长(或与相邻镜合并),不做静默拉长")
         if references:
             prompt += (
                 "。多图边界：图1仅为动作起点，图2仅为动作终点；"
@@ -106,6 +132,14 @@ class DreaminaProvider(Provider):
                 "禁止跨人物复制属性或把参考图拼贴进画面。")
             cmd = self._command() + ["multimodal2video"]
             cmd.extend(f"--image={uri}" for uri in [first, last, *references])
+            # frames2video 从首帧尺寸推断画幅,multimodal2video 不会——
+            # 不显式传 --ratio,画幅会被参考图里的横版空间调度图带偏,
+            # 9:16 竖屏短剧实测出成 1280x720 横屏。而「勾了资产参考图」
+            # 几乎是每一镜的常态(空间调度图与出场人物立绘是强制参考)。
+            ratio = str(payload.get("aspect")
+                        or self.conf.get("ratio", "9:16")).strip()
+            if ratio:
+                cmd.append(f"--ratio={ratio}")
         else:
             cmd = self._command() + [
                 "frames2video", f"--first={first}", f"--last={last}"]
