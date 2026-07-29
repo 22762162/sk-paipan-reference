@@ -18,7 +18,9 @@ from concurrent.futures import ThreadPoolExecutor
 SRC = "/Users/sk/AIFOS/workspace/artifacts/p014/e001/states_v2"
 OUT = "/Users/sk/AIFOS/workspace/artifacts/p014/e001/videos_v7"
 FFMPEG = os.path.expanduser("~/.local/bin/ffmpeg")
-MODEL = "seedance2.0mini"
+# 必须走 VIP 通道:非 VIP 型号排公共队列,实测单段滞留 40 分钟~2 小时,
+# 且 mini(45积分) 比 fast(25) 还贵。fast_vip = VIP通道 + 720p 迭代档。
+MODEL = "seedance2.0fast_vip"
 RES = "720p"
 DUR = 5
 EXPECT_W, EXPECT_H = 720, 1280

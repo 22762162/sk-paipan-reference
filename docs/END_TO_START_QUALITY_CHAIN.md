@@ -91,7 +91,7 @@
 
 | 场景 | 档位 | 单价 |
 |---|---|---|
-| 一切迭代验证（连贯性/动作/物理） | `seedance2.0mini` 720p | 45 |
+| 一切迭代验证（连贯性/动作/物理） | `seedance2.0fast_vip` 720p | VIP通道·不排队 |
 | 画质对比 | **只取 1 镜**上 vip 1080p | 165 |
 | 用户确认后的最终成片 | `seedance2.0_vip` 1080p 全量 | 165 |
 
@@ -142,3 +142,27 @@ fail-closed 拒绝提交（宁可报错也不静默花钱）。用户在确认�
 剧本的 information_state 声明「X 未察觉 Y」时,空间事实必须满足
 「Y 不在 X 的视野内」或「有遮挡/注意力理由」;否则 fail-closed 打回。
 这属于空间图前置架构(任务#6)的信息状态校验环节。
+
+## 8. VIP 通道:「便宜档」的隐性代价是排队(2026-07-30,用户发现)
+
+即梦的非 VIP 型号(`seedance2.0mini` / `seedance2.0fast` / `seedance2.0`)走
+**公共排队**,VIP 型号(`*_vip`)不排队。实测对照:
+
+| 版本 | 型号 | 结果 |
+|---|---|---|
+| v6 | seedance2.0_vip | 8/8 段 2-3 分钟出 |
+| v5 | seedance2.0mini | 镜5 滞留 40 分钟 |
+| v7 | seedance2.0mini | 镜2 滞留 2 小时 |
+
+而且 **mini 45 积分反而比 fast 25 积分更贵**——我选的「便宜档」两头都亏。
+`aifos/production/dreamina.py` 模块注释一直写着「必须使用 seedance2.0fast_vip」,
+是 workspace 配置把它覆盖成了 mini,我照着跑了整轮。
+
+**归因教训**:此前我把单段滞留归因为「即梦偶发慢」,还为此写了双队列竞速、
+换 fast 补交等一堆缓解措施——全都是在给错误归因打补丁。正确做法是先问
+「同批其他段为什么不慢」,那个差异(v6 全 vip vs v5/v7 全 mini)一直摆在数据里。
+
+**已落地**:provider 层自动把非 VIP 型号升到对应 VIP 型号(mini/fast→fast_vip,
+2.0→2.0_vip),可用 conf `allow_public_queue` 显式选择排队;config 与原型脚本
+同步改为 fast_vip;1080p 的分辨率反选优先级仍高于队列升级。
+
