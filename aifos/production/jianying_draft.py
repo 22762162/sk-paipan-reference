@@ -105,15 +105,31 @@ class JianyingDraftProvider(Provider):
         script.add_track(TrackType.video)
         script.add_track(TrackType.text)
 
+        def _material(cls, source):
+            kind = "Video" if cls is VideoSegment else "Audio"
+            material_cls = _api(jd, f"{kind}Material", f"{kind}_material")
+            return material_cls(source)
+
+        def _real_seconds(cls, source, planned):
+            """素材真实时长(秒);读不到就退回计划时长。
+
+            分镜里的计划时长是「想要几秒」,Seedance 实际吐出来的是
+            5.017 秒这种零头。旧代码直接拿计划时长去切素材,只要多出
+            一丝(5.09 > 5.017)剪映草稿就整份失败——一集里任意一段
+            对不上,全集都进不了剪映。
+            """
+            try:
+                micros = int(getattr(_material(cls, source), "duration", 0))
+            except Exception:
+                return planned
+            return round(micros / 1_000_000, 3) if micros > 0 else planned
+
         def _segment(cls, source, span):
             """新版本可直接传路径,旧版本需要先包 Material。"""
             try:
                 return cls(source, span)
             except Exception:
-                kind = "Video" if cls is VideoSegment else "Audio"
-                material_cls = _api(jd, f"{kind}Material",
-                                    f"{kind}_material")
-                return cls(material_cls(source), span)
+                return cls(_material(cls, source), span)
 
         # 镜头视频顺序铺满视频轨;有台词的镜头同步铺字幕
         shots = payload.get("shots") or []
@@ -122,11 +138,22 @@ class JianyingDraftProvider(Provider):
         cursor = 0.0
         line_no = 0
         missing = []
+        clamped = []
         for shot in shots:
             uri = shot.get("uri", "")
             duration = float(shot.get("duration") or 3.0)
+            playable = uri and Path(uri).exists() and uri.endswith(".mp4")
+            if playable:
+                # 时间轴长度以素材真实时长为准:超出会被剪映判「截取范围
+                # 超出素材时长」而整份草稿失败,短于素材则只是不用完。
+                real = _real_seconds(VideoSegment, uri, duration)
+                if real < duration:
+                    clamped.append(
+                        {"shot_no": shot.get("shot_no"),
+                         "planned": duration, "actual": real})
+                    duration = real
             span = trange(f"{cursor}s", f"{duration}s")
-            if uri and Path(uri).exists() and uri.endswith(".mp4"):
+            if playable:
                 script.add_segment(_segment(VideoSegment, uri, span))
             else:
                 missing.append(shot.get("shot_no"))
@@ -162,9 +189,13 @@ class JianyingDraftProvider(Provider):
         note = f"草稿已进剪映:{draft_name}(打开剪映导出成片)"
         if missing:
             note += f";缺视频镜头 {missing} 未上轨"
+        if clamped:
+            note += (f";{len(clamped)} 段按素材真实时长收敛"
+                     f"(计划与实际有零头,已避免草稿整份失败)")
         return ProviderResult(
             provider=self.name, cost=self.cost_per_call,
             data={"draft": str(draft_path), "draft_name": draft_name,
                   "total_duration": round(cursor, 2), "note": note,
-                  "missing_shots": missing},
+                  "missing_shots": missing,
+                  "clamped_segments": clamped},
             uri=str(draft_path))
