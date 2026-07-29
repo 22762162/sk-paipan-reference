@@ -58,7 +58,8 @@ class App:
         self.assets = AssetCenter(
             self.db, on_registered=self.icloud_sync.enqueue_asset)
         self.data = DataCenter(self.db)
-        self.firefire = FireFireCenter(self.db, self.workspace.artifacts_dir)
+        self.firefire = FireFireCenter(
+            self.db, self.workspace.artifacts_dir, standards=self.standards)
         self.router = ProviderRouter(self.config, self.db, self.logger)
         self.qc = QcCenter(self.config)
         self.ops = OpsCenter(self.router)

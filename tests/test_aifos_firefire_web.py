@@ -95,6 +95,25 @@ def test_firefire_web_control_plane_and_style_gate(tmp_path):
         assert status == 200
         assert any(item["id"] == style["id"]
                    for item in overview["firefire"]["styles"])
+        assert overview["firefire"]["counts"]["knowledge_active"] == 2
+        status, resolved = _request(
+            port, "POST", "/api/firefire/knowledge/resolve", {
+                "stage": "video",
+                "task_type": "depth_control",
+                "query": "用深度视频复刻动作和运镜",
+            })
+        assert status == 200
+        assert resolved["matches"][0][
+            "knowledge_key"] == "depth-structure-control"
+        status, rejected = _request(
+            port, "POST", "/api/firefire/knowledge", {
+                "knowledge_key": "water",
+                "title": "万能高级感",
+                "summary": "高级一点",
+                "provenance": {"source_url": "https://example.com/water"},
+            })
+        assert status == 400
+        assert "价值门禁" in rejected["error"]
     finally:
         server.shutdown()
         server.server_close()

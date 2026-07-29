@@ -300,6 +300,42 @@ CREATE TABLE IF NOT EXISTS firefire_validation_tasks(
 CREATE INDEX IF NOT EXISTS firefire_validation_status_idx
 ON firefire_validation_tasks(status, created_at DESC);
 
+-- 知识大脑:候选先过价值门禁，版本内容只追加不修改；state 只保存
+-- 当前激活版本和等待人工复核的候选版本。
+CREATE TABLE IF NOT EXISTS firefire_knowledge_versions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  knowledge_key TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'knowledge',
+  domain TEXT NOT NULL DEFAULT 'cross_stage',
+  summary TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL DEFAULT '{}',
+  applicability TEXT NOT NULL DEFAULT '{}',
+  provenance TEXT NOT NULL DEFAULT '{}',
+  assessment TEXT NOT NULL DEFAULT '{}',
+  standard_snapshot TEXT NOT NULL DEFAULT '{}',
+  fingerprint TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  UNIQUE(knowledge_key, version),
+  UNIQUE(knowledge_key, fingerprint)
+);
+
+CREATE INDEX IF NOT EXISTS firefire_knowledge_version_idx
+ON firefire_knowledge_versions(knowledge_key, version DESC);
+
+CREATE TABLE IF NOT EXISTS firefire_knowledge_state(
+  knowledge_key TEXT PRIMARY KEY,
+  active_version_id INTEGER
+    REFERENCES firefire_knowledge_versions(id) ON DELETE RESTRICT,
+  candidate_version_id INTEGER
+    REFERENCES firefire_knowledge_versions(id) ON DELETE RESTRICT,
+  status TEXT NOT NULL DEFAULT 'review',
+  reviewed_by TEXT NOT NULL DEFAULT '',
+  review_note TEXT NOT NULL DEFAULT '',
+  updated_at REAL NOT NULL
+);
+
 -- 数据库级保护，避免绕过 StandardCenter 意外篡改历史版本。
 CREATE TRIGGER IF NOT EXISTS production_standard_versions_immutable_update
 BEFORE UPDATE ON production_standard_versions
@@ -311,6 +347,18 @@ CREATE TRIGGER IF NOT EXISTS production_standard_versions_immutable_delete
 BEFORE DELETE ON production_standard_versions
 BEGIN
   SELECT RAISE(ABORT, 'production standard versions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS firefire_knowledge_versions_immutable_update
+BEFORE UPDATE ON firefire_knowledge_versions
+BEGIN
+  SELECT RAISE(ABORT, 'knowledge versions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS firefire_knowledge_versions_immutable_delete
+BEFORE DELETE ON firefire_knowledge_versions
+BEGIN
+  SELECT RAISE(ABORT, 'knowledge versions are immutable');
 END;
 """
 

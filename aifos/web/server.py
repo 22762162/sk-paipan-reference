@@ -2428,6 +2428,15 @@ def make_handler(workspace, jobs):
                     if payload is None:
                         return self._error(404, "火火独立风格不存在")
                     return self._json(payload)
+                match = re.match(
+                    r"^/api/firefire/knowledge/([\w-]+)$", route)
+                if match:
+                    payload = self._with_app(
+                        lambda app: app.firefire.knowledge.get(
+                            match.group(1)))
+                    if payload is None:
+                        return self._error(404, "知识条目不存在")
+                    return self._json(payload)
                 match = re.match(r"^/api/episode/(\d+)/status$", route)
                 if match:
                     payload = self._with_app(
@@ -2548,6 +2557,14 @@ def make_handler(workspace, jobs):
                     return self._firefire_style_archive()
                 if parsed.path == "/api/firefire/validation":
                     return self._firefire_validation()
+                if parsed.path == "/api/firefire/knowledge":
+                    return self._firefire_knowledge()
+                if parsed.path == "/api/firefire/knowledge/publish":
+                    return self._firefire_knowledge_publish()
+                if parsed.path == "/api/firefire/knowledge/refresh":
+                    return self._firefire_knowledge_refresh()
+                if parsed.path == "/api/firefire/knowledge/resolve":
+                    return self._firefire_knowledge_resolve()
                 if parsed.path == "/api/series/preview":
                     return self._series_preview()
                 if parsed.path == "/api/series/import":
@@ -3238,6 +3255,67 @@ def make_handler(workspace, jobs):
             except (AifosError, ValueError) as exc:
                 return self._error(400, str(exc))
             return self._json(result, status=201)
+
+        def _firefire_knowledge(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                result = self._with_app(
+                    lambda app: app.firefire.create_knowledge(body))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(result, status=201)
+
+        def _firefire_knowledge_publish(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            knowledge_key = str(
+                body.get("knowledge_key") or "").strip()
+            if not knowledge_key:
+                return self._error(400, "缺少 knowledge_key")
+            try:
+                result = self._with_app(
+                    lambda app: app.firefire.publish_knowledge(
+                        knowledge_key,
+                        approved_by=body.get("approved_by", "human"),
+                        note=body.get("note", "")))
+            except AifosError as exc:
+                return self._error(409, str(exc))
+            return self._json(result)
+
+        def _firefire_knowledge_refresh(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            knowledge_key = str(
+                body.get("knowledge_key") or "").strip()
+            if not knowledge_key:
+                return self._error(400, "缺少 knowledge_key")
+            try:
+                result = self._with_app(
+                    lambda app: app.firefire.refresh_knowledge(
+                        knowledge_key))
+            except AifosError as exc:
+                return self._error(409, str(exc))
+            return self._json(result, status=201)
+
+        def _firefire_knowledge_resolve(self):
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                result = self._with_app(
+                    lambda app: app.firefire.resolve_knowledge(
+                        stage=body.get("stage", ""),
+                        task_type=body.get("task_type", ""),
+                        query=body.get("query", ""),
+                        tags=body.get("tags") or [],
+                        limit=body.get("limit", 4)))
+            except (AifosError, TypeError, ValueError) as exc:
+                return self._error(400, str(exc))
+            return self._json(result)
 
         def _produce(self):
             length = int(self.headers.get("Content-Length", "0"))

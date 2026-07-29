@@ -4483,7 +4483,7 @@ textarea:focus-visible, select:focus-visible {
 .muted { color:var(--ink-3); line-height:1.55; }
 .independent-style-field small { color:var(--ink-3); font-size:10px; line-height:1.35; }
 .firefire-summary-panel { border-color:rgba(170,125,255,.35); background:linear-gradient(135deg,rgba(76,45,130,.16),rgba(24,31,60,.2)); }
-.firefire-stats { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; margin:12px 0; }
+.firefire-stats { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:8px; margin:12px 0; }
 .firefire-stats span { display:grid; gap:3px; padding:9px 10px; border:1px solid var(--hairline); border-radius:9px; color:var(--ink-3); font-size:10px; }
 .firefire-stats b { color:var(--ink); font-size:17px; }
 .firefire-style-chips { margin-top:8px; }
@@ -4499,9 +4499,27 @@ textarea:focus-visible, select:focus-visible {
 .firefire-record > div { display:flex; align-items:center; gap:8px; }
 .firefire-record small { color:var(--ink-3); overflow-wrap:anywhere; line-height:1.45; }
 .firefire-record .mini-btn { justify-self:start; }
+.firefire-knowledge-lab { margin-top:14px; padding:14px; border:1px solid rgba(170,125,255,.3); border-radius:12px; background:linear-gradient(135deg,rgba(76,45,130,.12),rgba(14,18,35,.22)); }
+.firefire-knowledge-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:10px; }
+.firefire-knowledge-head h4 { margin:3px 0 0; color:var(--accent); }
+.firefire-knowledge-head small { max-width:460px; color:var(--ink-3); line-height:1.5; text-align:right; }
+.firefire-knowledge-grid { display:grid; grid-template-columns:minmax(0,1.05fr) minmax(0,.95fr); gap:12px; align-items:start; }
+.firefire-form-split { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px; }
+.firefire-knowledge-side { display:grid; gap:12px; }
+.firefire-knowledge-records { display:grid; gap:7px; }
+.firefire-knowledge-records > h4 { margin:0; color:var(--accent); }
+.knowledge-record > div { flex-wrap:wrap; }
+.firefire-resolution { min-height:42px; padding:8px; border:1px dashed var(--hairline); border-radius:8px; color:var(--ink-3); font-size:10px; }
+.firefire-resolution article { display:grid; gap:3px; padding:6px 0; border-bottom:1px solid var(--hairline); }
+.firefire-resolution article:last-child { border-bottom:0; }
+.firefire-resolution b { color:var(--ink); }
+.firefire-resolution small { line-height:1.4; }
 @media (max-width:760px) {
   .firefire-stats { grid-template-columns:repeat(2,minmax(0,1fr)); }
   .firefire-grid { grid-template-columns:1fr; }
+  .firefire-knowledge-grid,.firefire-form-split { grid-template-columns:1fr; }
+  .firefire-knowledge-head { display:grid; }
+  .firefire-knowledge-head small { text-align:left; }
   .firefire-panel { margin:12px; padding:14px; }
 }
 @media (max-width:760px) {

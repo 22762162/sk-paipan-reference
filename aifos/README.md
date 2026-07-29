@@ -76,6 +76,10 @@ python3 -m aifos tunnel --record https://xxxx.trycloudflare.com/
   模板和交付规则变成可编辑的生产合同;按基础生产、分段节奏、台词、表演、
   镜头、连续性、声音交付和质量门禁分类编辑,支持即时校验、版本说明、历史
   激活、恢复厂标及 JSON 导入/导出;
+- **火火漫剧研究室 · 知识大脑**:外部课程、案例和技能先通过价值、证据、
+  适用范围、能力边界、可验证性和标准兼容门禁,再进入待人工审核候选;
+  激活版本不可变,制作标准更新后旧知识自动暂停调用,复核产生新版本;
+  Skill 可按阶段、任务类型、触发词和标签调用当前有效知识;
 - **分镜画布**(点击剧集进入):按场分行陈列全部镜头卡片——关键图、
   五维参数、起止状态、剧本映射、人物数量、时长、即梦声画与质检徽章;
   支持**滚轮缩放、拖拽平移、
@@ -102,7 +106,7 @@ python3 -m aifos tunnel --record https://xxxx.trycloudflare.com/
 - 产物文件(关键图 SVG、成片、封面、拆条、dreamina 日志)经
   `/artifacts/` 直接在线预览,含目录穿越防护。
 
-## 九大核心模块 → 代码映射
+## 十大核心模块 → 代码映射
 
 | 模块 | 职责 | 代码 |
 |---|---|---|
@@ -110,6 +114,7 @@ python3 -m aifos tunnel --record https://xxxx.trycloudflare.com/
 | IP资产中心 | 角色/场景/动作/镜头/Prompt/首尾帧/图片/视频/配音沉淀,版本管理与复用 | `asset_center.py` |
 | AI导演中心 | 总控:拆解任务、调度 Provider、控制流程与成本、质检自动重跑 | `director.py` |
 | 制作标准中心 | SK Skill/制作规则结构化、校验、不可变版本、激活指针、逐集快照与交换包 | `standard_center.py` |
+| 火火漫剧研究室 | 研究证据、独立风格、知识价值门禁、不可变知识版本、标准对齐与运行时检索 | `firefire_center.py` `knowledge_brain.py` |
 | AI生产中心 | ChatGPT/Codex 关键帧、Seedance 2.0 Fast VIP 720P、随视频配音/口型、豆包 TTS 备选、剪映剪辑 | `production/` |
 | AI质检中心 | 结构/连续性/声画技术检查 + 抽帧检查板 + 逐段内容复核 + 交付脚本 | `qc_center.py` `workflow.py` |
 | AI运营中心 | 自动封面、标题、拆条(后续扩展发布与数据分析) | `ops_center.py` |
