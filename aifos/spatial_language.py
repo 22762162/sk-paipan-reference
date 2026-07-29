@@ -190,7 +190,12 @@ def staging_clause(block, *, phase="start"):
     facing_parts = []
     for row in rows:
         actor = row["actor"]
-        facing_text = str(actor.get("facing") or "")
+        # 与同函数内 pose_label_{phase} / support_{phase} 取法一致:
+        # 朝向必须跟着相位走,否则首帧会拿到尾帧视线。
+        # `or actor.get("facing")` 保证存量 blocking 文档(只有 facing)
+        # 渲染结果与改动前完全相同。
+        facing_text = str(actor.get(f"facing_{phase}")
+                          or actor.get("facing") or "")
         target_offset = None
         for other_name, other in by_name.items():
             if other_name and other_name != str(actor.get("name") or "") \
