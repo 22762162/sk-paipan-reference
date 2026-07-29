@@ -6276,6 +6276,8 @@ function blocking3dSceneHtml(scene, sceneIndex) {
         <button type="button" data-view="top">俯视</button>
         <button type="button" data-view="camera">机位方向</button>
         <button type="button" data-view="reset" aria-label="重置3D视角">重置</button>
+        <button type="button" class="active" data-view="pano"
+          aria-pressed="true" aria-label="切换720全景房间底图">全景</button>
       </div>
     </div>
     <canvas class="blocking-3d-canvas" tabindex="0" role="img"
@@ -6387,6 +6389,141 @@ function mountBlocking3d(stage, scene) {
   let logicalHeight = 0;
   let frame = 0;
 
+  // ---- 720° 全景作为真实房间 ----
+  // 空间调度不再是抽象线框:等距全景按「射线打进房间盒取远侧内表面」
+  // 反投影,得到地板/后墙/顶的真实贴图(前墙自然透空 = 玻璃屋剖视),
+  // 火柴人与视锥落在同一坐标系里,人的大小就是定位刻度。
+  const pano = {
+    img: null, data: null, w: 0, h: 0, on: true,
+    cache: null, key: "", pending: false,
+  };
+  const CAPTURE = { x: 0, y: 1.55, z: 0 };   // 全景拍摄点:房间中心视平线
+  const room = (() => {
+    const world = scene.world || {};
+    return {
+      fw: Number(world.floor_width_m) || 10,
+      fd: Number(world.floor_depth_m) || 7,
+      h: Number(world.wall_height_m) || 4.2,
+    };
+  })();
+  const panoUrl = scene.panorama_url || "";
+  if (panoUrl) {
+    const img = new Image();
+    img.onload = () => {
+      const off = document.createElement("canvas");
+      const scaleDown = Math.min(1, 1024 / Math.max(1, img.width));
+      off.width = Math.max(2, Math.round(img.width * scaleDown));
+      off.height = Math.max(2, Math.round(img.height * scaleDown));
+      const octx = off.getContext("2d", { willReadFrequently: true });
+      if (!octx) return;
+      octx.drawImage(img, 0, 0, off.width, off.height);
+      try {
+        const d = octx.getImageData(0, 0, off.width, off.height);
+        pano.data = d.data; pano.w = d.width; pano.h = d.height;
+        pano.img = img; pano.key = "";
+        requestRender();
+      } catch (_e) { /* 取像素失败就退回线框视图 */ }
+    };
+    img.src = panoUrl;
+  }
+
+  const panoSample = (dx, dy, dz) => {
+    const len = Math.hypot(dx, dy, dz) || 1;
+    const u = Math.atan2(dx / len, dz / len) / (Math.PI * 2) + 0.5;
+    const v = 0.5 - Math.asin(Math.max(-1, Math.min(1, dy / len))) / Math.PI;
+    const px = Math.min(pano.w - 1, Math.max(0, (u * pano.w) | 0));
+    const py = Math.min(pano.h - 1, Math.max(0, (v * pano.h) | 0));
+    return ((py * pano.w) + px) * 4;
+  };
+
+  // 屏幕像素 → 视线(正交投影的逆) → 与房间盒求交,取**远侧**内表面
+  const renderPanoRoom = () => {
+    if (!pano.data || !pano.on || !logicalWidth || !logicalHeight) return null;
+    const key = [logicalWidth, logicalHeight, state.yaw.toFixed(3),
+                 state.pitch.toFixed(3), state.zoom.toFixed(3),
+                 state.panX | 0, state.panY | 0].join("|");
+    if (pano.cache && pano.key === key) return pano.cache;
+    const step = 2;                                  // 半分辨率:够清且流畅
+    const bw = Math.max(2, Math.ceil(logicalWidth / step));
+    const bh = Math.max(2, Math.ceil(logicalHeight / step));
+    const out = document.createElement("canvas");
+    out.width = bw; out.height = bh;
+    const octx = out.getContext("2d");
+    if (!octx) return null;
+    const buf = octx.createImageData(bw, bh);
+    const px = buf.data;
+    const cosY = Math.cos(state.yaw), sinY = Math.sin(state.yaw);
+    const cosP = Math.cos(state.pitch), sinP = Math.sin(state.pitch);
+    const scale = Math.min(logicalWidth / 13, logicalHeight / 8.5) * state.zoom;
+    const cx = logicalWidth / 2 + state.panX;
+    const cy = logicalHeight * .57 + state.panY;
+    const hx = room.fw / 2, hz = room.fd / 2;
+    // 视线「远离观察者」的方向 = 投影零空间的**负**向(观察者在 +z 上方)。
+    // 取正会把天花板当远侧面,俯视只见梁架、看不见地板。
+    const dirR = { x: 0, y: -sinP, z: -cosP };
+    const dW = {
+      x: dirR.x * cosY + dirR.z * sinY,
+      y: dirR.y,
+      z: -dirR.x * sinY + dirR.z * cosY,
+    };
+    for (let j = 0; j < bh; j++) {
+      const sy = j * step;
+      for (let i = 0; i < bw; i++) {
+        const sx = i * step;
+        const u = (sx - cx) / scale;
+        const v = (cy - sy) / scale;
+        // 旋转系内的射线原点:u*右 + v*上
+        const oR = { x: u, y: v * cosP, z: -v * sinP };
+        const oW = {
+          x: oR.x * cosY + oR.z * sinY,
+          y: oR.y,
+          z: -oR.x * sinY + oR.z * cosY,
+        };
+        // 与房间盒求交(slab 法),取远侧交点
+        let t0 = -1e9, t1 = 1e9;
+        const slab = (o, d, lo, hi) => {
+          if (Math.abs(d) < 1e-9) { if (o < lo || o > hi) { t0 = 1e9; } return; }
+          let a = (lo - o) / d, b = (hi - o) / d;
+          if (a > b) { const t = a; a = b; b = t; }
+          if (a > t0) t0 = a;
+          if (b < t1) t1 = b;
+        };
+        slab(oW.x, dW.x, -hx, hx);
+        slab(oW.y, dW.y, 0, room.h);
+        slab(oW.z, dW.z, -hz, hz);
+        const o4 = ((j * bw) + i) * 4;
+        if (t0 > t1) { px[o4 + 3] = 0; continue; }
+        // 开顶剖视:出射面不含天花板,否则俯视看不进屋里
+        let tex = 1e9;
+        const exitAt = (o, d, lo, hi) => {
+          if (Math.abs(d) < 1e-9) return;
+          const a = (lo - o) / d, b = (hi - o) / d;
+          tex = Math.min(tex, Math.max(a, b));
+        };
+        exitAt(oW.x, dW.x, -hx, hx);
+        exitAt(oW.z, dW.z, -hz, hz);
+        if (dW.y < -1e-9) tex = Math.min(tex, (0 - oW.y) / dW.y);
+        const t = tex;
+        if (t >= 1e9 || oW.y + dW.y * t > room.h + 1e-6) {
+          px[o4 + 3] = 0; continue;
+        }
+        const hxp = oW.x + dW.x * t;
+        const hyp = oW.y + dW.y * t;
+        const hzp = oW.z + dW.z * t;
+        const s4 = panoSample(hxp - CAPTURE.x, hyp - CAPTURE.y,
+                              hzp - CAPTURE.z);
+        // 略压暗,让火柴人与视锥仍是视觉主体
+        px[o4] = pano.data[s4] * 0.72;
+        px[o4 + 1] = pano.data[s4 + 1] * 0.72;
+        px[o4 + 2] = pano.data[s4 + 2] * 0.72;
+        px[o4 + 3] = 255;
+      }
+    }
+    octx.putImageData(buf, 0, 0);
+    pano.cache = out; pano.key = key;
+    return out;
+  };
+
   const project = (point) => {
     const cosY = Math.cos(state.yaw);
     const sinY = Math.sin(state.yaw);
@@ -6494,15 +6631,27 @@ function mountBlocking3d(stage, scene) {
     ctx.fillStyle = background;
     ctx.fillRect(0, 0, logicalWidth, logicalHeight);
 
+    const panoRoom = renderPanoRoom();
+    const hx = room.fw / 2, hz = room.fd / 2;
+    if (panoRoom) {
+      ctx.save();
+      ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(panoRoom, 0, 0, logicalWidth, logicalHeight);
+      ctx.restore();
+    }
     const floor = [
-      { x: -5, y: 0, z: -3.5 }, { x: 5, y: 0, z: -3.5 },
-      { x: 5, y: 0, z: 3.5 }, { x: -5, y: 0, z: 3.5 },
+      { x: -hx, y: 0, z: -hz }, { x: hx, y: 0, z: -hz },
+      { x: hx, y: 0, z: hz }, { x: -hx, y: 0, z: hz },
     ];
-    polygon(floor, "rgba(21,39,61,.86)", "#52627a");
-    for (let x = -5; x <= 5; x += 1)
-      line({ x, y: 0, z: -3.5 }, { x, y: 0, z: 3.5 }, "#2c405a", .7);
-    for (let z = -3.5; z <= 3.5; z += .5)
-      line({ x: -5, y: 0, z }, { x: 5, y: 0, z }, "#263b54", .7);
+    if (!panoRoom) polygon(floor, "rgba(21,39,61,.86)", "#52627a");
+    // 有全景时网格降为淡定位刻度,不再是主视觉
+    const gMajor = panoRoom ? "rgba(217,164,65,.30)" : "#2c405a";
+    const gMinor = panoRoom ? "rgba(217,164,65,.16)" : "#263b54";
+    for (let x = -hx; x <= hx + 1e-6; x += 1)
+      line({ x, y: 0, z: -hz }, { x, y: 0, z: hz }, gMajor, .7);
+    for (let z = -hz; z <= hz + 1e-6; z += .5)
+      line({ x: -hx, y: 0, z }, { x: hx, y: 0, z },
+            (Math.abs(z % 1) < 1e-6 ? gMajor : gMinor), .7);
     line({ x: 0, y: 0, z: 0 }, { x: 1.3, y: 0, z: 0 }, "#f87171", 2);
     line({ x: 0, y: 0, z: 0 }, { x: 0, y: 1.3, z: 0 }, "#4ade80", 2);
     line({ x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 1.3 }, "#60a5fa", 2);
@@ -6619,8 +6768,17 @@ function mountBlocking3d(stage, scene) {
     });
   });
   stage.querySelectorAll("[data-view]").forEach((button) => {
-    button.addEventListener("click", () =>
-      applyView(button.dataset.view === "reset" ? "orbit" : button.dataset.view));
+    button.addEventListener("click", () => {
+      // 全景是底图开关,不是视角:单独处理,不进 applyView
+      if (button.dataset.view === "pano") {
+        pano.on = !pano.on;
+        button.classList.toggle("active", pano.on);
+        button.setAttribute("aria-pressed", String(pano.on));
+        requestRender();
+        return;
+      }
+      applyView(button.dataset.view === "reset" ? "orbit" : button.dataset.view);
+    });
   });
   const onPointerDown = (event) => {
     state.dragging = true;

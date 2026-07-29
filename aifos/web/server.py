@@ -2165,6 +2165,18 @@ def _episode_payload(app, episode_id, jobs=None):
                 app, scene.get("svg_uri", ""))
             scene["svg_url"] = _versioned(
                 scene_url, {"version": blocking_v or 1})
+            # 空间调度的 3D 视图直接用本场 720° 全景当房间——调度不再是
+            # 抽象线框,而是「真实房间里的人和机位」。全景是几何唯一真相,
+            # 与 blocking 同坐标系(全景水平中心 = +Z)。
+            location = str(scene.get("location") or "").strip()
+            if location:
+                row = app.assets.latest(
+                    project["id"], "scene_art",
+                    f"{location}::view:panorama")
+                if row is not None and row["uri"]:
+                    scene["panorama_url"] = _versioned(
+                        _artifact_url(app, row["uri"]),
+                        {"version": row["version"] or 1})
     production_progress = _production_progress(
         app, episode, render_plan)
     production_guidance = _production_guidance(

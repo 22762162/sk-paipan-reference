@@ -2305,6 +2305,9 @@ def build_shot_prompt_contract(
             shot, "start_state") or "保持首帧状态",
         "start_appearance": _appearance_map(shot.get("start_state")),
         "character_conditions": character_conditions,
+        # subject.actors 已被渲染成「P01=林川（外观）」,取不到裸名;
+        # 逐镜负向清单要按名字点出该静止的角色,所以另存一份原始名单。
+        "actor_names": list(characters),
         "action": action,
         "performance": _text(
             (shot.get("performance") or {}).get("micro_expression"),
@@ -2472,6 +2475,98 @@ def _medium_prompt_line(medium):
     if medium.get("live_action_photography"):
         return "真人摄影/真人实拍视觉媒介"
     return ""
+
+
+_PLACEHOLDER_CAMERA_VALUES = (
+    "按分镜", "按合同", "未指定", "未知", "不详", "待定", "待确认",
+    "待补充", "以参考图为准", "以剧本为准", "自行判断", "自由发挥",
+)
+
+
+def _is_placeholder(value):
+    """未裁决出具体值时不要生成锁定句。
+
+    `_camera` 在分镜没写景别时回落到占位符「按分镜」。把它照抄进负向清单会
+    产出"景别锁定为按分镜"这种无可执行标准的指令——正是原文批评的"自然过渡"
+    式空话,反而占掉开头权重。宁可少一条也不给模型假约束。
+    """
+    text = _text(value)
+    if not text:
+        return True
+    return any(token in text for token in _PLACEHOLDER_CAMERA_VALUES)
+
+
+def build_model_constraints(contract, *, media="video"):
+    """把本镜已知事实反写成"模型不许做的事",逐镜生成。
+
+    2026-07-30 A/B 实测(即梦 Seedance 2.0 Fast VIP / 720P / 5s,同一首帧、
+    同一参数,只换提示词写法):只给正向描述时,模型把"人物慢慢向树后缩"
+    执行成了镜头追着脸推近——2 秒后中景 3 名杀手与倒地书童被挤出画面,
+    可见人形 5→1,景别中景→大特写,机位从侧面偷窥转成正面,一次违反 6 项
+    合同硬约束;把同一批事实补成带具体数字与角色名的负向清单后,9 项全过。
+
+    已有的【硬约束】是 shot 无关的常量,说不出"严格 N 人"、"只执行这一种
+    运镜"、"景别锁死为中景",所以另起本清单按镜生成。只反写合同里已经存在
+    的事实,不引入新判断。
+    """
+    contract = contract if isinstance(contract, dict) else {}
+    subject = contract.get("subject") or {}
+    camera = contract.get("camera") or {}
+    clauses = []
+
+    # 人数:常量硬约束只说"不得新增/复制",说不出上限是几。实测里丢人先于
+    # 加人,但同一句把上限写成具体数字,两个方向一起封。
+    visible_count = int(subject.get(
+        "visible_count", subject.get("count", 0)) or 0)
+    if visible_count > 0:
+        clauses.append(
+            f"总可见人形严格为 {visible_count} 人,"
+            f"禁止出现第 {visible_count + 1} 人,"
+            "禁止复制、倒影或以海报/画中人形式增加人形")
+
+    # 景别:A 组从中景一路推成大特写,是本次最直接的违约项。
+    scale = camera.get("景别")
+    if not _is_placeholder(scale):
+        clauses.append(
+            f"景别锁定为{_text(scale)},镜内不得改变景别、不得推成更紧景别")
+
+    if media == "video":
+        # 运镜:合同已裁决出唯一执行值,这里显式否掉其余全部运动。
+        # A 组崩溃的机制就是模型自行叠加了一次推近。占位符按"固定"处理:
+        # 分镜没写运镜时,模型自由运镜的代价远高于一个不动的机位。
+        move = camera.get("运镜")
+        if not _is_placeholder(move) and _text(move) not in {
+                "固定", "静止", "锁定"}:
+            clauses.append(
+                f"本镜只执行「{_text(move)}」一种镜头运动,"
+                "不得叠加推、拉、摇、移、升降、环绕或变焦")
+        else:
+            clauses.append(
+                "机位固定,不推、不拉、不摇、不移、不升降、不环绕、不变焦")
+
+        # 机位/角度:越轴会让反打关系与视线方向失效。
+        held = "、".join(
+            _text(value) for value in (camera.get("机位"), camera.get("角度"))
+            if not _is_placeholder(value))
+        if held:
+            clauses.append(f"机位保持{held},不得越轴到对侧")
+
+        # 未参与主动作的角色必须静止。实测 B 组里"杀手不得走动、不得挥刀;
+        # 书童不得起身"是守住中景的关键句;名字不出现在主动作里的角色,
+        # 就是本镜该按住的角色。
+        action_text = _text(contract.get("action"))
+        idle = [
+            name for name in (contract.get("actor_names") or [])
+            if name and name not in action_text
+        ]
+        if idle:
+            clauses.append(
+                "、".join(idle)
+                + "保持起点状态,不执行本合同未写的动作、不移动站位")
+    else:
+        clauses.append("只定格当前状态,不表现任何动作过程或运动拖影")
+
+    return clauses
 
 
 def render_shot_prompt(contract, *, mode=None):
@@ -2809,6 +2904,11 @@ def render_shot_prompt(contract, *, mode=None):
             for item in contract["references"]
         )
         lines.append(f"【参考图职责】{refs}。")
+    # 逐镜负向清单排在 shot 无关的【硬约束】之前:实测中模型对带具体数字与
+    # 角色名的否定句服从度明显高于通用禁令,让它先被读到。
+    model_constraints = build_model_constraints(contract, media=media)
+    if model_constraints:
+        lines.append("【模型约束】" + ";".join(model_constraints) + "。")
     lines.append(f"【硬约束】{contract['hard']}。")
     return "\n".join(lines)
 

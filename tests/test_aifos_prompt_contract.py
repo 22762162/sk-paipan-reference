@@ -1,6 +1,7 @@
 from aifos.prompt_contract import (
     PROMPT_CONTRACT_SCHEMA,
     build_composition_contract,
+    build_model_constraints,
     build_physical_contract,
     compile_shot_prompt,
     readable_text_required,
@@ -831,3 +832,82 @@ def test_v21_legacy_shot_without_functional_figures_keeps_registered_count():
     assert contract["population"]["counts"]["real_people_total"] == 2
     assert "严格共2人" in prompt
     assert validate_shot_prompt_contract(contract)["passed"]
+
+
+def test_video_model_constraints_lock_count_scale_camera_and_idle_actors():
+    """逐镜负向清单必须写出具体人数、锁死景别并按名字按住非主动作角色。
+
+    2026-07-30 A/B 实测:同一首帧同一参数,只给正向描述时模型把「人物向树
+    后缩」执行成镜头追脸推近,中景 3 名杀手与倒地书童被挤出画面,可见人形
+    5→1、景别中景→大特写;补上本清单后 9 项合同约束全过。shot 无关的
+    【硬约束】常量说不出这三件事,所以本测试锁的是"按镜生成"这一能力。
+    """
+    shot = {
+        "characters": ["林川", "杀手甲", "杀手乙", "杀手丙", "书童"],
+        "description": "林川屏息不动，极缓慢把身体向树干后收回半寸",
+        "camera": "35mm 平视中景 侧面 固定",
+        "start_state": "林川蹲在前景树干后侧向观察",
+        "end_state": "林川仍在树干后，比起点更贴向树干",
+    }
+    contract, video_prompt = compile_shot_prompt(shot, mode="video")
+
+    assert contract["actor_names"] == [
+        "林川", "杀手甲", "杀手乙", "杀手丙", "书童"]
+    constraints = build_model_constraints(contract, media="video")
+    rendered = "；".join(constraints)
+
+    # 人数上下界一起封:实测里丢人先于加人。
+    assert "总可见人形严格为 5 人" in rendered
+    assert "禁止出现第 6 人" in rendered
+    # 景别锁的是执行值(5 人已把景别升档),不是导演随手写的值。
+    assert f"景别锁定为{contract['camera']['景别']}" in rendered
+    assert "不得推成更紧景别" in rendered
+    # 固定机位必须显式否掉全部运动,这是 A 组崩溃的直接机制。
+    assert "不推、不拉、不摇、不移、不升降、不环绕、不变焦" in rendered
+    assert "不得越轴到对侧" in rendered
+    # 名字不出现在主动作里的角色要被按住;主动作执行者不得被按住。
+    assert "杀手甲、杀手乙、杀手丙、书童保持起点状态" in rendered
+    assert "林川保持起点状态" not in rendered
+
+    assert "【模型约束】" in video_prompt
+    assert "总可见人形严格为 5 人" in video_prompt
+
+
+def test_still_model_constraints_forbid_motion_and_skip_camera_movement():
+    """静态帧只需禁止动作过程,不该出现运镜类否定句。"""
+    shot = {
+        "characters": ["林川"],
+        "description": "林川独自站在官道旁",
+        "camera": "近景 平视 正面 推",
+    }
+    contract, image_prompt = compile_shot_prompt(shot, mode="image")
+    constraints = build_model_constraints(contract, media="image")
+    rendered = "；".join(constraints)
+
+    assert "只定格当前状态" in rendered
+    assert "不推、不拉" not in rendered
+    assert "保持起点状态" not in rendered
+    assert "总可见人形严格为 1 人" in rendered
+    assert "【模型约束】" in image_prompt
+
+
+def test_model_constraints_skip_unresolved_camera_placeholders():
+    """分镜没写景别时,_camera 回落到占位符「按分镜」。
+
+    照抄进负向清单会得到"景别锁定为按分镜"——没有可执行画面标准的空话,
+    正是原文批评的"镜头自然过渡"式写法,还会占掉提示词开头权重。
+    宁可少一条,也不给模型假约束;运镜缺失时按"机位固定"兜底,因为让模型
+    自由运镜的代价远高于一个不动的机位。
+    """
+    shot = {
+        "characters": ["林川"],
+        "description": "林川屏息不动",
+        "camera": "35mm",
+    }
+    contract, video_prompt = compile_shot_prompt(shot, mode="video")
+    rendered = "；".join(build_model_constraints(contract, media="video"))
+
+    assert "按分镜" not in rendered
+    assert "景别锁定为" not in rendered
+    assert "机位固定,不推、不拉" in rendered
+    assert "按分镜" not in video_prompt.split("【模型约束】")[1]
