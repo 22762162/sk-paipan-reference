@@ -157,6 +157,114 @@ DEPTH_STRUCTURE_SEED = {
     },
 }
 
+SCRIPT_DEVELOPMENT_SEED = {
+    "knowledge_key": "idea-to-shootable-script",
+    "title": "点子到可拍剧本：目标、阻力、代价、选择与伏笔回收",
+    "kind": "skill",
+    "domain": "script",
+    "summary": (
+        "在进入人物资产和分镜前，把模糊点子收敛为可见的主角目标、"
+        "主要阻力、失败代价和关键选择；需要反转时，用已经出现的动作、"
+        "道具、声音或镜头线索改变观众理解，并先比较少量差异化走向。"
+    ),
+    "content": {
+        "principles": [
+            "剧本必须先回答主角要完成什么、什么直接阻止他、失败会失去什么；三者都要能由具体画面、动作、关系或道具状态表现。",
+            "高潮选择必须让主角在两个都有代价的选项之间取舍，禁止用轻易两全、巧合解围或临时新增设定收束。",
+            "反转不是突兀换身份，而是让观众重新理解前面已经看见或听见的动作、道具、声音和镜头信息。",
+            "同一核心点子的候选走向必须真正改变目标、冲突来源、关键选择、反转机制或结尾情绪，不能只换职业、地点和道具名称。",
+        ],
+        "workflow": [
+            "从点子中提取主角、异常事件、潜在冲突和开场疑问，先不直接生成完整剧本。",
+            "分别提出可见的主角目标、直接阻力、失败代价和行动窗口，再组合成因果成立的少量故事框架。",
+            "为每个框架写开场钩子、第一次行动、压力升级、关键选择、结尾画面以及 AI 视频制作难点。",
+            "按戏剧张力、视觉表现力、人物可信度、反转完成度和 AI 视频可控性筛选，只把一个入选方案交给正式剧本。",
+            "需要反转时建立信息释放表，记录观众开场知道什么、中段误读什么、高潮揭示什么、结尾刻意保留什么。",
+            "把入选方案写成分场剧本；每场都必须制造阻力、提供线索、改变关系、迫使选择或形成结果，并与前后场建立因果。",
+        ],
+        "prompt_templates": [
+            (
+                "先建立点子开发合同：主角的具体行动目标、直接阻力、"
+                "失败代价、行动窗口、两个都有代价的关键选择和可拍开场钩子。"
+                "重要信息只通过动作、空间、道具、声音或镜头呈现。"
+            ),
+            (
+                "如需反转，列出至少两条前段可见或可听线索，以及观众的"
+                "初始理解、真实含义和回收位置；禁止用旁白或结尾对白解释真相。"
+            ),
+        ],
+        "limitations": [
+            "并非所有题材都需要反转；温情、日常、表演或氛围短片可用选择与关系变化完成收束。",
+            "多方案发散只属于视觉资产生成前的开发阶段；已锁定并生成资产的剧本不得自动回退重写。",
+            "三分钟、三个人、三处场景和固定生成十个走向只是示例预算，不是通用硬标准。",
+        ],
+        "anti_patterns": [
+            "把抽象愿望写成目标，例如只写证明自己、寻找真相或获得认可，却没有可执行动作。",
+            "用死亡、爆炸或巨大灾难强行抬高失败代价，而代价与人物目标无直接关系。",
+            "反转依赖卧底、幻觉、主角已死、突然变坏或巧合获知真相，却没有前段线索。",
+            "把五个目标、五个阻力、五个代价和十个走向固定成每次运行的机械数量。",
+            "在下游已经锁定人物或镜头后重新发散多个故事版本，导致正式事实源分叉。",
+        ],
+        "quality_gates": [
+            "目标是可完成或失败的具体行动，阻力会迫使主角改变行动方式，失败代价具体、相关且可见。",
+            "每场至少完成制造阻力、提供线索、改变关系、迫使选择或形成结果中的一项。",
+            "关键选择不存在无代价的轻易两全方案。",
+            "反转至少由两条已经出现的可见或可听线索支撑，揭示后能重新解释既有内容。",
+            "入选方案的人物和场景规模、道具数量、信息表达方式符合本项目时长与 AI 视频可控性。",
+            "最后一个镜头同时明确已经解决的冲突和刻意保留的信息，不重复解释反转。",
+        ],
+        "validation_plan": [
+            "用同一模糊点子分别走直接生成与开发合同流程，对比主角目标清晰度、解释性对白数量、场景冗余和可拆镜率。",
+            "对每个场次建立戏剧功能表，删除既不制造阻力、不提供线索、不改变关系也不形成结果的场次。",
+            "对反转逐条做二刷回溯：若无法从前段至少两条线索推回结果，退回剧本阶段重写。",
+            "在生成任何人物或场景资产前核对只保留一个正式入选方案，其他候选不得进入制作圣经。",
+        ],
+        "standard_refs": [
+            "rules.script_development",
+            "rules.story_analysis",
+            "rules.quality_gates.script_bible",
+            "rules.production.prompt_contract",
+        ],
+    },
+    "applicability": {
+        "stages": ["script"],
+        "task_types": [
+            "idea_expansion", "script_development", "story_selection",
+            "twist_design", "script_repair",
+        ],
+        "triggers": [
+            "点子写成剧本", "目标阻力代价", "失败代价", "关键选择",
+            "剧情走向", "反转", "伏笔回收", "信息释放", "可拍剧本",
+        ],
+        "tags": [
+            "剧本开发", "故事结构", "视觉叙事", "反转设计",
+            "伏笔回收", "AI视频可控性",
+        ],
+        "exclusions": [
+            "已锁定并生成角色、场景、分镜或视频资产的项目，除非先完成人工影响分析并批准局部返编。",
+            "不需要反转的题材不得为了套模板强行增加身份揭露或信息欺骗。",
+            "页面链接的第三方 GitHub Skill 未经独立代码与权限审查，不自动安装、运行或信任。",
+        ],
+    },
+    "provenance": {
+        "source_url": "https://www.super-i.cn/info-2955.html",
+        "source_title": "【提示词创作第六十九节】一个点子，如何写成能拍的AI短片剧本？",
+        "author": "西瓜 / 刺猬星球 super-i",
+        "published_at": "2026-07",
+        "checked_at": "2026-07-30",
+        "evidence": [
+            "课程正文给出点子展开、创作定位、反转设计、多走向筛选和可执行剧本接口的完整链路。",
+            "AIFOS 代码审计确认现有剧本总闸门已覆盖因果、动机、信息、物理、空间、时间、道具、可拍性与密度，本条只保留失败代价、关键选择、信息释放表和多方案筛选等增量。",
+            "知识条目只保存结构化方法与边界，不复制课程全文，也不自动信任页面链接的第三方 Skill。",
+        ],
+    },
+}
+
+BUILTIN_SEEDS = (
+    DEPTH_STRUCTURE_SEED,
+    SCRIPT_DEVELOPMENT_SEED,
+)
+
 
 class KnowledgeBrain:
     """知识候选、价值审核、人工激活、版本升级与运行时检索。"""
@@ -563,26 +671,30 @@ class KnowledgeBrain:
         return "\n".join(part for part in parts if part)
 
     def ensure_seed(self):
-        """把本次用户明确批准的高价值知识作为首个激活版本写入新库。"""
-        state = self.db.query_one(
-            "SELECT active_version_id FROM firefire_knowledge_state "
-            "WHERE knowledge_key=?",
-            (DEPTH_STRUCTURE_SEED["knowledge_key"],))
-        if state is not None:
-            return
-        try:
-            candidate = self.create_candidate(DEPTH_STRUCTURE_SEED)
-            self.publish(
-                candidate["knowledge_key"],
-                approved_by="user-approved-2026-07-30",
-                note="用户确认该课程有用，并要求更新 AIFOS 知识大脑。",
-            )
-        except (AifosError, sqlite3.IntegrityError):
-            # 并行 worker 在全新 workspace 同时初始化时，另一连接可能已
-            # 完成同一份内置知识；只有确认激活指针已存在时才吞掉竞态。
+        """把用户投喂且通过价值门禁的内置知识激活到新库。"""
+        for seed in BUILTIN_SEEDS:
             state = self.db.query_one(
                 "SELECT active_version_id FROM firefire_knowledge_state "
                 "WHERE knowledge_key=?",
-                (DEPTH_STRUCTURE_SEED["knowledge_key"],))
-            if state is None or not state["active_version_id"]:
-                raise
+                (seed["knowledge_key"],))
+            if state is not None and state["active_version_id"]:
+                continue
+            try:
+                candidate = self.create_candidate(seed)
+                self.publish(
+                    candidate["knowledge_key"],
+                    approved_by="user-fed-2026-07-30",
+                    note=(
+                        "用户要求学习外部课程；该条已完成去重、价值审核、"
+                        "适用范围与验证计划检查，允许进入 AIFOS 知识大脑。"
+                    ),
+                )
+            except (AifosError, sqlite3.IntegrityError):
+                # 并行 worker 在全新 workspace 同时初始化时，另一连接可能
+                # 已完成同一条知识；只有确认激活指针存在时才吞掉竞态。
+                state = self.db.query_one(
+                    "SELECT active_version_id FROM firefire_knowledge_state "
+                    "WHERE knowledge_key=?",
+                    (seed["knowledge_key"],))
+                if state is None or not state["active_version_id"]:
+                    raise

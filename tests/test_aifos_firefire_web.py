@@ -95,7 +95,7 @@ def test_firefire_web_control_plane_and_style_gate(tmp_path):
         assert status == 200
         assert any(item["id"] == style["id"]
                    for item in overview["firefire"]["styles"])
-        assert overview["firefire"]["counts"]["knowledge_active"] == 1
+        assert overview["firefire"]["counts"]["knowledge_active"] == 2
         status, resolved = _request(
             port, "POST", "/api/firefire/knowledge/resolve", {
                 "stage": "video",

@@ -5,7 +5,10 @@ import pytest
 
 from aifos.app import App
 from aifos.errors import AifosError
-from aifos.knowledge_brain import DEPTH_STRUCTURE_SEED
+from aifos.knowledge_brain import (
+    DEPTH_STRUCTURE_SEED,
+    SCRIPT_DEVELOPMENT_SEED,
+)
 
 
 def _candidate(key="camera-axis-control"):
@@ -63,12 +66,18 @@ def test_seed_knowledge_is_scored_active_and_callable(tmp_path):
     app = App(tmp_path)
     try:
         overview = app.firefire.overview()
-        assert overview["counts"]["knowledge_active"] == 1
-        [item] = overview["knowledge"]
-        assert item["knowledge_key"] == DEPTH_STRUCTURE_SEED["knowledge_key"]
-        assert item["state_status"] == "active"
-        assert item["standard_status"] == "current"
-        assert item["assessment"]["score"] >= 90
+        assert overview["counts"]["knowledge_active"] == 2
+        items = {
+            item["knowledge_key"]: item for item in overview["knowledge"]}
+        assert set(items) == {
+            DEPTH_STRUCTURE_SEED["knowledge_key"],
+            SCRIPT_DEVELOPMENT_SEED["knowledge_key"],
+        }
+        assert all(
+            item["state_status"] == "active"
+            and item["standard_status"] == "current"
+            and item["assessment"]["score"] >= 90
+            for item in items.values())
 
         resolved = app.firefire.resolve_knowledge(
             stage="video", task_type="depth_control",
@@ -77,6 +86,15 @@ def test_seed_knowledge_is_scored_active_and_callable(tmp_path):
             "depth-structure-control"]
         assert "每份参考素材只承担一个主要控制职责" in (
             resolved["matches"][0]["callable_context"])
+
+        script_matches = app.firefire.resolve_knowledge(
+            stage="script", task_type="idea_expansion",
+            query="点子写成剧本，先锁目标阻力失败代价和伏笔回收")
+        assert [match["knowledge_key"] for match in
+                script_matches["matches"]] == [
+                    "idea-to-shootable-script"]
+        assert "主角要完成什么、什么直接阻止他" in (
+            script_matches["matches"][0]["callable_context"])
     finally:
         app.close()
 
