@@ -624,22 +624,24 @@ def build_instruction(capability, payload, out_dir):
                 stage_line = (
                     "本次是正常质检,不预设结论。仅当你判定不通过时,"
                     "才需要附 codex_escalation:AIFOS 会立即按你给出的"
-                    "新提示词自动重画一次,所以 aifos_instructions 必须是"
+                    "新提示词生成3张候选并自动选优,所以 aifos_instructions 必须是"
                     "可以直接拼进下一次生成提示词的完整、唯一、无歧义"
                     "表述,不要写「建议」「可考虑」这类不可执行的话。"
                     "只要重画能救回来就用 targeted_redraw;判定通过则"
                     "省略 codex_escalation。\n")
             elif failures < 2:
                 stage_line = (
-                    "本镜此前已失败 1 次:AIFOS 会立即按你给出的新提示词"
-                    "自动重画一次，所以 aifos_instructions 必须是可以直接拼进"
-                    "下一次生成提示词的完整、唯一、无歧义表述，不要写"
+                    "本镜此前已失败 1 次:AIFOS 会按你给出的新提示词"
+                    "一次生成3张候选、全部质检后自动选最优，所以 "
+                    "aifos_instructions 必须是可直接拼进下一次生成提示词的"
+                    "完整、唯一、无歧义表述，不要写"
                     "「建议」「可考虑」这类不可执行的话。只要重画能救回来就用"
                     "targeted_redraw。\n")
             else:
                 stage_line = (
-                    "本镜已连续 2 次质检失败：这是最终裁决，AIFOS 不会再自动"
-                    "出图，你的结论直接决定停在人工检查点还是改合同。\n")
+                    "本镜的修订候选组仍未通过：请输出下一轮唯一可执行的"
+                    "合同修复或定向重画指令；AIFOS 会自动应用，不会停在"
+                    "人工确认点。\n")
             escalation_line = (
                 ("- 质检附升级预授权(不改变判定标准)。"
                  if failures <= 0 else
@@ -897,6 +899,22 @@ def run(request, codex, timeout, extra_args, plain=False):
         return {"ok": False, "error": f"codex 命令不存在: {codex}"}
     instruction, targets, data = build_instruction(
         capability, payload, out_dir)
+    # 断点续跑时 canonical 目标可能已经存在。只检查 exists 会把一次
+    # “Codex 没有产出任何文件”的失败调用误认成成功，并把上一轮旧图
+    # 当作本轮新候选反复质检。记录调用前指纹，调用后必须看到真正更新。
+    freshness_targets = list(targets)
+    if capability == "frames" and data.get("first_source"):
+        # 帧链/关键帧复用会在 build_instruction 中主动铺好首帧；该文件
+        # 按合同就是不应修改的，只要求本轮新生成的尾帧发生变化。
+        freshness_targets = [Path(data["last"])]
+    before_targets = {}
+    for target in freshness_targets:
+        path = Path(target)
+        try:
+            stat = path.stat()
+            before_targets[str(path)] = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            before_targets[str(path)] = None
     exec_args = (
         [] if plain else list(
             PROMPT_REVIEW_EXEC_ARGS
@@ -1021,6 +1039,26 @@ def run(request, codex, timeout, extra_args, plain=False):
     if missing:
         return {"ok": False,
                 "error": f"codex 未产出期望文件: {', '.join(missing)}"}
+    stale = []
+    for target in freshness_targets:
+        path = Path(target)
+        previous = before_targets.get(str(path))
+        if previous is None:
+            continue
+        try:
+            stat = path.stat()
+            current = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            continue
+        if current == previous:
+            stale.append(str(path))
+    if stale:
+        return {
+            "ok": False,
+            "error": (
+                "codex 本轮未更新期望文件，拒绝把断点旧图冒充新结果: "
+                + ", ".join(stale)),
+        }
     return {"ok": True, "data": data, "uri": str(targets[0]),
             "model": "gpt-image-2 (Codex 内置 image_gen)"}
 

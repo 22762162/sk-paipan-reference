@@ -65,6 +65,58 @@ LIGHTING_STYLES = {
     },
 }
 
+# ---- 轮廓分离(作为附加项时的正确写法) ----
+# 2026-07-31 修:rim 作为 extras 附加时,原先直接拼 rim_backlight 整段,
+# 而那段开头就是「主光位于人物后方偏侧」——于是「灯笼是主光」和「主光
+# 在后方」同时出现在一条提示词里,两个主光互相打架,模型只能二选一或各
+# 打一半。附加项只承担「轮廓分离」这一辅助功能,不得再声明一次主光位置。
+RIM_ACCENT_CLAUSE = (
+    "轮廓分离(辅助光,不是主光):在主光反侧补一道弱后侧光,勾出发丝边缘、"
+    "肩线与衣缘,把人物从背景里剥离;强度明显低于主光,不改变主光方向,"
+    "面部结构仍由主光决定,禁止轮廓与正脸同时无因过亮")
+
+# ---- 动机化打光的因果收口 ----
+# 依据知识大脑 motivated-lighting-contract(源 super-i info-2899,已实测)。
+# A/B 实测暴露本模块的真实缺口:只写灯型、色温和景深,模型会交出「画面里
+# 的灯笼没点亮、墙面却有一块无来源亮斑」这种无因照明。补上受光区域、暗部
+# 边界、补光/眼神光与背景衰减四项,光才有可核验的因果,而不只是有风格。
+LIT_AREA_CLAUSE = (
+    "受光区域:逐项落实主光先照到哪里——近侧脸颊、鼻梁、肩线、手部与手中"
+    "道具按距离依次变亮,背光侧顺次转暗;暗部保留五官、皮肤与衣料的可辨"
+    "细节,不得死黑,亮部不得整片过曝")
+WIDE_LIT_AREA_CLAUSE = (
+    "受光区域:逐项落实主光先照到哪里——主体、地面与近处结构按距离依次"
+    "变亮,远处顺次转暗;暗部保留可辨的结构与材质,不得死黑,亮部不得"
+    "整片过曝")
+FILL_CLAUSE = (
+    "补光:只保留一道来源可信的弱补光(环境反射或墙面回光),强度明显低于"
+    "主光,不得把明暗结构重新抹平")
+CATCHLIGHT_CLAUSE = (
+    "眼神光:双眼各一个小型眼神光,方位、数量与色温必须与主光一致,"
+    "禁止无来源的多重眼神光")
+BACKGROUND_FALLOFF_CLAUSE = (
+    "背景关系:背景比主体暗一至两档,靠光线自然衰减退开;画面里没有对应"
+    "光源的地方不得出现亮斑")
+
+_WIDE_TOKENS = ("远景", "全景")
+_CLOSE_TOKENS = ("特写", "近景")
+
+
+def causality_clauses(camera=""):
+    """返回本镜的因果收口条款(受光/暗部、补光、眼神光、背景衰减)。
+
+    按景别裁剪:远景写主体与环境的受光层次,近景才写脸颊鼻梁;眼神光
+    只在看得见眼睛的景别里要求——远景强行要眼神光是给模型加噪声。
+    """
+    camera_text = str(camera or "")
+    wide = _has(camera_text, _WIDE_TOKENS)
+    parts = [WIDE_LIT_AREA_CLAUSE if wide else LIT_AREA_CLAUSE, FILL_CLAUSE]
+    if _has(camera_text, _CLOSE_TOKENS):
+        parts.append(CATCHLIGHT_CLAUSE)
+    parts.append(BACKGROUND_FALLOFF_CLAUSE)
+    return parts
+
+
 # ---- 光质与氛围附加条款 ----
 VOLUMETRIC_CLAUSE = (
     "空气中有可见的介质(薄雾、尘埃、香烟或雨丝),光线穿过时形成可辨的"
@@ -82,7 +134,9 @@ DEEP_FOCUS_CLAUSE = (
 NEGATIVE_CONTROLS = (
     "【光影负面】禁止:无方向的平光与全局均匀曝光、人物像被贴在背景上"
     "的剪贴感、没有任何阴影或投影、暗部糊成一团死黑、光源方向与画面内"
-    "可见光源矛盾、同一场景跨镜主光忽左忽右")
+    "可见光源矛盾、画面内的灯具没点亮却出现它的照明效果、墙面地面出现"
+    "无来源亮斑、同时出现两个方向互相矛盾的主光、同一场景跨镜主光忽左"
+    "忽右")
 
 # ---- 自动选型:按时间/地点/情绪匹配布光 ----
 _NIGHT_TOKENS = ("夜", "晚", "深夜", "子时", "黄昏", "傍晚", "入夜")
@@ -175,7 +229,8 @@ def lighting_clause(*, location="", time_of_day="", mood="", camera="",
     entry = LIGHTING_STYLES[key]
     parts = [f"{entry['label']}:{entry['clause']}"]
     if "rim" in extras and key != "rim_backlight":
-        parts.append(LIGHTING_STYLES["rim_backlight"]["clause"])
+        parts.append(RIM_ACCENT_CLAUSE)
+    parts.extend(causality_clauses(camera))
     if "volumetric" in extras:
         parts.append(VOLUMETRIC_CLAUSE)
     if "warm_cool" in extras:

@@ -110,11 +110,15 @@ def test_every_non_redraw_action_with_an_instruction_is_auto_applied(
         ctx, task, _Result(_escalation_qc(action=action)))
 
 
-def test_targeted_redraw_is_left_to_the_existing_qc_loop(app, monkeypatch):
-    """定向重画质检循环里已经自动执行过,这里不能重复插一手。"""
+def test_targeted_redraw_instruction_is_persisted_for_next_candidate_group(
+        app, monkeypatch):
+    """并行/断点入口也必须落实定向重画指令，不能只靠内层循环。"""
     ctx, task = _ctx_and_task(app, monkeypatch)
-    assert app.director._auto_apply_codex_escalation(
-        ctx, task, _Result(_escalation_qc(action="targeted_redraw"))) == ""
+    summary = app.director._auto_apply_codex_escalation(
+        ctx, task, _Result(_escalation_qc(action="targeted_redraw")))
+    assert summary
+    assert "Codex自动修订" in task["payload"]["prompt"]
+    assert "50mm" in task["payload"]["feedback"]
 
 
 def test_escalation_without_a_concrete_instruction_still_goes_to_human(
@@ -164,6 +168,201 @@ def test_non_shot_tasks_have_no_contract_to_repair(app, monkeypatch):
     ctx, task = _ctx_and_task(app, monkeypatch, item_id="scene:废茶棚")
     assert app.director._auto_apply_codex_escalation(
         ctx, task, _Result(_escalation_qc())) == ""
+
+
+def test_stage_images_seeds_stored_codex_repair_directly_into_three_draws(
+        app, monkeypatch):
+    project, _ = app.projects.get_or_create_project("断点自动三抽")
+    episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+    out_root = app.workspace.artifacts_dir / f"p{project['id']:03d}" / "e001"
+    out_root.mkdir(parents=True, exist_ok=True)
+    stored_qc = _escalation_qc(
+        instruction="统一为135mm平视双人胸像")
+    stored_qc.update({"attempts": 2, "consecutive_failures": 2})
+    ctx = {
+        "project": dict(project),
+        "episode": dict(episode),
+        "out_root": out_root,
+        "script": {"scenes": [{"scene_no": 1, "location": "内书房"}]},
+        "storyboard": {"shots": [{
+            "shot_no": 15, "scene_no": 1, "characters": [],
+        }]},
+    }
+    app.director._plan_write(ctx, {"items": [{
+        "id": "shot:15", "category": "shot_image",
+        "status": "awaiting_human", "qc": stored_qc,
+    }]})
+
+    monkeypatch.setattr(app.director, "_plan_seed_shots", lambda _ctx: None)
+    monkeypatch.setattr(app.director, "_distill_lessons", lambda _ctx: 0)
+    monkeypatch.setattr(
+        app.director, "reconcile_completed_shot_images",
+        lambda _ctx: {
+            "recovered": 0, "awaiting_human": 0,
+            "autonomous_retry": 1, "stale_reset": 0,
+            "awaiting_human_shots": [],
+        })
+    monkeypatch.setattr("aifos.director.write_relations",
+                        lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(app.director, "_shot_payload", lambda _ctx, shot: {
+        "shot_no": shot["shot_no"],
+        "prompt": "旧镜头提示词",
+        "characters": [],
+        "quality_decision": {
+            "level": "medium", "recommended": "medium",
+            "source": "test", "rule": "", "reasons": [],
+        },
+    })
+    monkeypatch.setattr(app.director, "_shot_qc_spec",
+                        lambda _ctx, _payload: {})
+
+    def apply(_ctx, task, result):
+        assert result.qc == stored_qc
+        task["payload"]["prompt"] = "已落实135mm平视双人胸像"
+        return "合同已修复"
+
+    captured = {}
+
+    def run(_ctx, tasks, **_kwargs):
+        captured["task"] = tasks[0]
+        return {}, []
+
+    monkeypatch.setattr(app.director, "_auto_apply_codex_escalation", apply)
+    monkeypatch.setattr(app.director, "_run_parallel", run)
+
+    app.director._stage_images(ctx)
+
+    payload = captured["task"]["payload"]
+    assert payload["_autonomous_repair_seeded"] is True
+    assert payload["qc_consecutive_failures_base"] == 2
+    assert "135mm" in payload["prompt"]
+
+
+def test_codex_numbered_remove_changes_actual_prop_reference_but_not_identity(
+        app, tmp_path):
+    identity = tmp_path / "identity.png"
+    prop = tmp_path / "prop.png"
+    identity.write_bytes(b"identity")
+    prop.write_bytes(b"prop")
+    payload = {
+        "prompt": "本镜",
+        "identity_references": [{
+            "character": "甲", "uri": str(identity), "asset_id": 1,
+        }],
+        "prop_refs": [str(prop)],
+        "asset_matches": [{
+            "asset_id": 2, "kind": "prop_identity", "name": "路引",
+            "label": "核心道具:路引", "uri": str(prop),
+            "reference_role": "prop",
+        }],
+    }
+    app.director._attach_reference_manifest(payload)
+    assert [item["role"] for item in payload["reference_manifest"]] == [
+        "identity", "prop"]
+
+    changes = app.director._apply_image_reference_adjustments(
+        payload, {}, {
+            "reference_diagnosis": {"status": "correct", "issues": []},
+            "reference_adjustments": [],
+        }, instruction="移除参考图2；不得读取原图2")
+
+    assert str(prop) not in payload["prop_refs"]
+    assert payload["identity_references"][0]["uri"] == str(identity)
+    assert changes["applied"][0]["source"] == "codex_instruction"
+
+    # Even an explicit numbered instruction cannot delete a locked identity.
+    blocked = app.director._apply_image_reference_adjustments(
+        payload, {}, {
+            "reference_diagnosis": {"status": "conflicting", "issues": []},
+            "reference_adjustments": [],
+        }, instruction="删除参考图1")
+    assert payload["identity_references"][0]["uri"] == str(identity)
+    assert blocked["applied"] == []
+    assert "锁定人物身份" in blocked["skipped"][0]["reason"]
+
+
+def test_scene_replacement_without_asset_id_resolves_same_project_panorama(
+        app, tmp_path):
+    project, _ = app.projects.get_or_create_project("场景语义换图")
+    main = tmp_path / "main.png"
+    panorama = tmp_path / "panorama.png"
+    main.write_bytes(b"main")
+    panorama.write_bytes(b"panorama")
+    main_row = app.assets.register(
+        project["id"], "scene_art", "内书室::view:main",
+        uri=str(main), meta={"base_location": "内书室", "view": "main"})
+    pano_row = app.assets.register(
+        project["id"], "scene_art", "内书室::view:panorama",
+        uri=str(panorama), meta={
+            "base_location": "内书室", "view": "panorama",
+            "panorama": True,
+        })
+    payload = {
+        "prompt": "本镜", "location": "内书室",
+        "scene_ref": str(main),
+        "asset_matches": [{
+            "asset_id": main_row["id"], "kind": "scene_art",
+            "name": main_row["name"], "label": main_row["name"],
+            "uri": str(main), "reference_role": "scene",
+        }],
+    }
+    app.director._attach_reference_manifest(payload)
+    changes = app.director._apply_image_reference_adjustments(
+        payload, {
+            "_project_id": project["id"], "location": "内书室",
+        }, {
+            "reference_diagnosis": {
+                "status": "needs_adjustment", "issues": ["当前图过窄"]},
+            "reference_adjustments": [{
+                "action": "replace", "target_index": 1, "role": "scene",
+                "reason": "替换为清晰同场景广角全景基准图",
+                "replacement_selector": {
+                    "asset_id": None, "role": "scene", "character": "",
+                },
+            }],
+        })
+
+    assert payload["scene_ref"] == str(panorama)
+    assert changes["applied"][0]["replacement_asset_id"] == pano_row["id"]
+    assert all(
+        item["project_id"] == project["id"]
+        for item in [app.assets.get(
+            changes["applied"][0]["replacement_asset_id"])])
+
+
+def test_persisted_reference_remove_survives_payload_rebuild(
+        app, monkeypatch, tmp_path):
+    project, _ = app.projects.get_or_create_project("参考图断点持久化")
+    episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+    prop = tmp_path / "prop.png"
+    prop.write_bytes(b"prop")
+    ctx = {
+        "project": dict(project), "episode": dict(episode),
+        "storyboard": {"shots": [{"shot_no": 7}]},
+    }
+    task = {"tag": 7, "payload": {}}
+    changes = {"applied": [{
+        "action": "remove", "target_uri": str(prop),
+        "target_asset_id": 99, "role": "prop",
+        "reason": "冲突道具参考",
+    }]}
+    assert app.director._persist_codex_reference_overrides(
+        ctx, task, changes) == 1
+
+    rebuilt = {
+        "prompt": "断点重建", "location": "内书室",
+        "prop_refs": [str(prop)],
+        "asset_matches": [{
+            "asset_id": 99, "kind": "prop_identity", "name": "路引",
+            "label": "核心道具:路引", "uri": str(prop),
+            "reference_role": "prop",
+        }],
+    }
+    replay = app.director._apply_persisted_reference_overrides(
+        ctx, rebuilt, ctx["storyboard"]["shots"][0])
+    assert replay["applied"]
+    assert rebuilt["prop_refs"] == []
+    assert rebuilt["asset_matches"] == []
 
 
 # ---- 画面达标却被合同诊断一票否决(ep1 shot:8) ----

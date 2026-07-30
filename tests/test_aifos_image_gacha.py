@@ -77,6 +77,53 @@ def test_gacha_restores_best_when_all_fail(tmp_path):
     assert not list(tmp_path.glob("*.gacha*"))
 
 
+def test_repair_round_draws_all_three_then_selects_best_pass(tmp_path):
+    director = _director()
+    target = tmp_path / "shot_015.keyframe.png"
+    calls = {"n": 0}
+
+    def fake(cap, payload, out_dir, cancel, qc_spec):
+        calls["n"] += 1
+        target.write_bytes(b"PULL%d" % calls["n"])
+        result = _Res(
+            str(target), 1.0, calls["n"] in (1, 2), 0)
+        if calls["n"] == 1:
+            result.qc.update({
+                "identity_checked": True, "identity_match": True,
+                "count_checked": True, "count_match": True,
+            })
+        elif calls["n"] == 2:
+            result.qc.update({
+                "image_passed": True,
+                "identity_checked": True, "identity_match": True,
+                "gender_checked": True, "gender_match": True,
+                "wardrobe_checked": True, "wardrobe_match": True,
+                "count_checked": True, "count_match": True,
+                "physical_logic_checked": True,
+                "physical_logic_match": True,
+                "spatial_logic_checked": True,
+                "spatial_logic_match": True,
+                "input_contract_passed": True,
+            })
+        return result
+
+    director._generate_image_with_qc = fake
+    result = director._generate_image_gacha(
+        "image",
+        {
+            "_gacha_pulls_override": 3,
+            "_gacha_select_best_after_all": True,
+        },
+        tmp_path, None, {"s": 1})
+
+    assert calls["n"] == 3              # 第1张通过也必须抽满3张
+    assert result.qc["passed"] is True
+    assert result.qc["gacha"]["selected_pull"] == 2
+    assert target.read_bytes() == b"PULL2"
+    assert result.cost == 3.0
+    assert not list(tmp_path.glob("*.gacha*"))
+
+
 def test_gacha_skips_batch_and_frames(tmp_path):
     director = _director()
     target = tmp_path / "x.png"

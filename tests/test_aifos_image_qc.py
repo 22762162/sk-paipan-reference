@@ -574,7 +574,7 @@ def _qc_spec():
 
 def test_first_failure_escalates_then_redraws_with_codex_prompt(
         app, tmp_path):
-    """第 1 次不合格:Codex 出诊断改提示词,立刻按新提示词重画一次。"""
+    """第1张不合格:Codex 改提示词，第二轮固定生成3张并全量选优。"""
     image = tmp_path / "first-failed.png"
     image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 24)
     router = _EscalationRouter(image, "targeted_redraw")
@@ -588,28 +588,28 @@ def test_first_failure_escalates_then_redraws_with_codex_prompt(
     assert router.codex_payloads[0]["required_provider"] == "codex"
     assert router.codex_payloads[0]["codex_escalation_context"][
         "consecutive_failures"] == 1
-    # 出图 2 张:初版 + 按 Codex 新提示词自动重画的那张。
-    assert router.calls["image"] == 2
-    # 质检 4 次:2 次画面判定 + 2 次 Codex 升级分析。
-    assert router.calls["qc"] == 4
-    # 第二张确实按 Codex 回传的指令生成，而不是本地规则编译出来的话术。
-    second_feedback = router.image_payloads[1].get("feedback") or ""
-    assert "把静态关键帧改为唯一拱手完成瞬间" in second_feedback
-    assert router.image_payloads[1]["revision_mode"] == "targeted_qc_fix"
-    assert router.image_payloads[1]["qc_revision"]["source"] == \
-        "codex_escalation"
-    # 第二次仍不合格:只分析不再出第三张，停在人工检查点。
+    # 初版1张 + 同一份 Codex 修订合同候选3张，候选不得提前停止。
+    assert router.calls["image"] == 4
+    # 初检1 + 首败升级1 + 3张候选双路会诊6 + 全败升级1。
+    assert router.calls["qc"] == 9
+    for candidate in router.image_payloads[1:]:
+        feedback = candidate.get("feedback") or ""
+        assert "把静态关键帧改为唯一拱手完成瞬间" in feedback
+        assert candidate["revision_mode"] == "targeted_qc_fix"
+        assert candidate["qc_revision"]["source"] == "codex_escalation"
+    # 三张仍不合格：保留最高分候选和 Codex 下一轮指令，不转人工确认。
     assert result.qc["consecutive_failures"] == 2
     assert result.qc["codex_escalation"]["stage"] == "final_analysis"
     assert result.qc["codex_escalation"]["executable"] is False
     assert result.qc["retry_blocked"] is True
-    assert result.qc["auto_repair_exhausted"] is True
+    assert result.qc["gacha"]["pulls"] == 3
+    assert result.qc["gacha"]["select_after_all"] is True
 
 
 def test_contract_repair_auto_applies_then_stops_on_second_failure(
         app, tmp_path):
     """repair_contract 不再是死路:首失败把 Codex 修合同指令自动落到提示词
-    基底并重画一次;第二次仍不合格才停手交人工。
+    基底，第二轮用同一份新合同固定生成3张并自动择优。
 
     旧契约(首失败即停)的死结:Codex 下达了修合同指令,但全仓库没有代码
     执行它——escalation_redraw_block 等着「合同真的改了就放行」,而没有人
@@ -624,12 +624,11 @@ def test_contract_repair_auto_applies_then_stops_on_second_failure(
         "image", {"prompt": "赵德昌拱手", "shot_no": 8},
         tmp_path, None, _qc_spec())
 
-    # 首失败自动修复一次 → 共出两张;第二张仍未过 → 停手
-    assert router.calls["image"] == 2
-    # 第二次出图的提示词必须携带已应用的合同修订
-    second_prompt = str(router.image_payloads[1].get("prompt") or "")
-    assert "【Codex合同修订·必须执行】" in second_prompt
-    assert "把静态关键帧改为唯一拱手完成瞬间" in second_prompt
+    assert router.calls["image"] == 4
+    for candidate in router.image_payloads[1:]:
+        prompt = str(candidate.get("prompt") or "")
+        assert "【Codex合同修订·必须执行】" in prompt
+        assert "把静态关键帧改为唯一拱手完成瞬间" in prompt
     assert result.qc["consecutive_failures"] == 2
     assert result.qc["codex_escalation"]["stage"] == "final_analysis"
     assert result.qc["codex_escalation"]["executable"] is False
@@ -1318,11 +1317,11 @@ def test_stage_images_collects_qc_failure_and_finishes_later_shots(
     assert {row["name"] for row in formal} == {
         "e001_shot001", "e001_shot003", "e001_shot004"}
     assert not any(row["uri"] == str(output_by_shot[2]) for row in formal)
-    assert output_by_shot[2].exists(), "失败图必须留给人工查看和定向修改"
+    assert output_by_shot[2].exists(), "失败图必须保留给下一轮自动分析"
 
     plan = app.director._plan_read(ctx)
     by_id = {item["id"]: item for item in plan["items"]}
-    assert by_id["shot:2"]["status"] == "awaiting_human"
+    assert by_id["shot:2"]["status"] == "failed"
     assert by_id["shot:2"]["output_uri"] == str(output_by_shot[2])
     assert by_id["shot:2"]["qc"]["passed"] is False
     assert by_id["shot:2"]["qc"]["attempts"] == 2
@@ -1403,21 +1402,22 @@ def test_reconcile_completed_shot_images_recovers_only_qc_passed_files(app):
     result = app.director.reconcile_completed_shot_images(ctx)
 
     assert result["recovered"] == 1
-    assert result["awaiting_human"] == 2
-    # 断点对账现在同时汇报僵尸清扫数与待人工镜头清单(人工门禁用)。
+    assert result["awaiting_human"] == 0
+    assert result["autonomous_retry"] == 2
+    # 旧待人工状态迁移为自动重试，不再生成用户确认门。
     assert result["stale_reset"] == 0
-    assert result["awaiting_human_shots"] == [2, 4]
+    assert result["awaiting_human_shots"] == []
     formal = app.assets.active_list(project["id"], kind="image")
     assert [(row["name"], row["uri"]) for row in formal] == [
         ("e001_shot001", str(passed_uri))]
     plan = app.director._plan_read(ctx)
     by_id = {item["id"]: item for item in plan["items"]}
     assert by_id["shot:1"]["output_uri"] == str(passed_uri)
-    assert by_id["shot:2"]["status"] == "awaiting_human"
+    assert by_id["shot:2"]["status"] == "failed"
     assert by_id["shot:2"]["output_uri"] == str(failed_uri)
     assert by_id["shot:2"]["qc"]["auto_repair_exhausted"] is True
     assert "output_uri" not in by_id["shot:3"]
-    assert by_id["shot:4"]["status"] == "awaiting_human"
+    assert by_id["shot:4"]["status"] == "failed"
     assert by_id["shot:4"]["output_uri"] == str(legacy_failed_uri)
     assert by_id["shot:5"]["output_uri"] == str(unchecked_uri)
     assert app.assets.latest(
@@ -1949,9 +1949,10 @@ def test_codex_qc_instruction_and_parse(tmp_path, monkeypatch):
     assert "藏入袖内" in escalation_instruction
     assert "split_shot" in escalation_instruction
     assert "aifos_instructions" in escalation_instruction
-    # 第 2 次是最终裁决:必须明确告诉 Codex 之后不会再自动出图。
-    assert "最终裁决" in escalation_instruction
-    assert "AIFOS 不会再自动" in escalation_instruction
+    # 候选组三抽仍失败后，Codex 继续给唯一自动执行指令，不转人工。
+    assert "修订候选组仍未通过" in escalation_instruction
+    assert "AIFOS 会自动应用" in escalation_instruction
+    assert "不会停在人工确认点" in escalation_instruction
 
     # 第 1 次失败要的是"可直接拼进下一次提示词"的可执行表述,不是建议。
     first_failure_instruction, _, _ = codex_image.build_instruction(

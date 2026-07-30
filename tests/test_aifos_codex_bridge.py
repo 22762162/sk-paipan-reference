@@ -80,6 +80,32 @@ def test_image_capability(tmp_path, fake_codex):
     assert Path(reply["uri"]).exists()
 
 
+def test_existing_target_must_be_updated_by_current_codex_call(tmp_path):
+    binary = tmp_path / "bin" / "codex-noop"
+    binary.parent.mkdir(parents=True)
+    binary.write_text(
+        "#!/usr/bin/env python3\nprint('ok but no image written')\n",
+        encoding="utf-8")
+    binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+    out = tmp_path / "out"
+    out.mkdir()
+    target = out / "shot_001.keyframe.png"
+    target.write_bytes(b"old-failed-image")
+
+    reply = _bridge({
+        "capability": "image",
+        "payload": {
+            "shot_no": 1, "prompt": "必须重新生成",
+            "characters": ["林昭"],
+        },
+        "out_dir": str(out),
+    }, binary)
+
+    assert reply["ok"] is False
+    assert "拒绝把断点旧图冒充新结果" in reply["error"]
+    assert target.read_bytes() == b"old-failed-image"
+
+
 def test_frames_capability(tmp_path, fake_codex):
     out = tmp_path / "out"
     reply = _bridge({

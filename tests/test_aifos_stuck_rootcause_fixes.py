@@ -206,14 +206,19 @@ def test_reconcile_resets_stale_generating_claims(app):
         assert "中断遗留" in reset["reason"]
 
 
-def test_reconcile_reports_awaiting_human_shots_for_gate(app):
-    """awaiting_human 镜头清单必须上报,供生产入口跳过(人工门禁)。"""
+def test_reconcile_migrates_recoverable_awaiting_human_to_auto_retry(app):
+    """有产物的 awaiting_human 迁移成 failed 自动重排——不再占人工。
+
+    这是新产线的契约:人工确认点不再由断点对账创建,失败稿只要文件还在
+    就自动重新排队。旧契约(原样上报供人工)已被取代。
+    """
     project, episode = _preproduce(app)
     plan_path = _plan_path(app, project)
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     gated = []
     for item in plan["items"]:
-        if item["category"] == "shot_image" and len(gated) < 2:
+        if (item["category"] == "shot_image" and len(gated) < 2
+                and item.get("output_uri")):
             item["status"] = "awaiting_human"
             item["qc"] = {"passed": False, "issues": ["测试失败原因"]}
             gated.append(int(item["id"].split(":")[1]))
@@ -227,10 +232,44 @@ def test_reconcile_reports_awaiting_human_shots_for_gate(app):
            / f"p{project['id']:03d}" / "e001",
            "storyboard": storyboard}
     result = app.director.reconcile_completed_shot_images(ctx)
+
+    assert result["autonomous_retry"] >= len(gated)
+    refreshed = json.loads(plan_path.read_text(encoding="utf-8"))
+    by_id = {item["id"]: item for item in refreshed["items"]}
+    for shot_no in gated:
+        item = by_id[f"shot:{shot_no}"]
+        assert item["status"] == "failed"
+        assert item["qc"]["awaiting_human"] is False
+        assert item["qc"]["autonomous_repair_required"] is True
+
+
+def test_reconcile_reports_unmigratable_awaiting_human_for_gate(app):
+    """迁移不了的(产物已丢失)必须原样上报——_stage_images 靠它跳过。
+
+    写死成空清单等于把那道闸门变成死代码,历史待人工的镜头会被静默重跑。
+    """
+    project, episode = _preproduce(app)
+    plan_path = _plan_path(app, project)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    gated = []
+    for item in plan["items"]:
+        if item["category"] == "shot_image" and len(gated) < 2:
+            item["status"] = "awaiting_human"
+            item["output_uri"] = ""          # 产物已丢失:无法自动重排
+            item["qc"] = {"passed": False, "issues": ["历史待人工"]}
+            gated.append(int(item["id"].split(":")[1]))
+    plan_path.write_text(json.dumps(plan, ensure_ascii=False),
+                         encoding="utf-8")
+
+    storyboard, _ = app.projects.latest_document(
+        episode["id"], "storyboard")
+    ctx = {"project": dict(project), "episode": dict(episode),
+           "out_root": app.workspace.artifacts_dir
+           / f"p{project['id']:03d}" / "e001",
+           "storyboard": storyboard}
+    result = app.director.reconcile_completed_shot_images(ctx)
     assert result["awaiting_human_shots"] == sorted(gated)
-
-
-# ---------- 身份隐藏型角色:设定图套件按可见性裁剪 ----------
+    assert result["awaiting_human"] == len(gated)
 
 def test_character_face_hidden_detection():
     from aifos.director import Director

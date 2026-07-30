@@ -11,6 +11,7 @@ import re
 import threading
 import time
 
+from .. import knowledge_apply
 from ..errors import ProduceCancelled, ProviderError, ProviderUnavailable
 from .api_providers import (ArkVideoProvider, ClaudeApiProvider,
                             DoubaoTtsProvider, OpenAIChatProvider,
@@ -42,10 +43,13 @@ class ProviderRouter:
     API_IMAGE_TYPES = {"image_api", "seedream_image"}
     PROMPT_REVIEW_SCHEMA = "aifos.codex-prompt-review/v1"
 
-    def __init__(self, config, db, logger):
+    def __init__(self, config, db, logger, knowledge=None):
         self.config = config
         self.db = db
         self.log = logger
+        # 知识大脑(可选):写作类能力在派发前挂上已激活知识,见
+        # knowledge_apply。传 None 时行为与接线前完全一致。
+        self.knowledge = knowledge
         self.providers = {}
         try:
             self._codex_parallel_per_channel = max(
@@ -710,6 +714,13 @@ class ProviderRouter:
         }
 
     def call(self, capability, payload, out_dir, cancel=None):
+        # 全库唯一的能力派发漏斗:知识大脑在这里接进生产。只有写作类
+        # 能力会被挂上(图片/视频模型读不懂工作流指导),详见 knowledge_apply。
+        if self.knowledge is not None and knowledge_apply.attach(
+                self.knowledge, capability, payload,
+                warn=lambda message: self.log.warn("knowledge", message)):
+            self.log.info(
+                "router", f"{capability} 已挂载知识大脑指令")
         prompt_review_result = None
         if capability in self.IMAGE_CAPABILITIES:
             prompt_review_result = self.review_image_prompt(

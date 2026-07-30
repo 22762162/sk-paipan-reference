@@ -48,6 +48,59 @@ class LightingSelectionTest(unittest.TestCase):
         self.assertIn("服从本场景母版", clause)   # 不与连续性锚点打架
 
 
+class MotivatedLightingTest(unittest.TestCase):
+    """动机化打光合同(知识大脑 motivated-lighting-contract)的落地。"""
+
+    def test_practical_light_does_not_declare_a_second_key_light(self):
+        """回归:灯笼当主光时,不能再拼一句「主光位于人物后方偏侧」。
+
+        原 bug:practical_lit 选中后无条件 append rim,而 rim_backlight
+        整段开头就在声明主光位置,一条提示词里两个主光互相打架。
+        """
+        clause = lighting_clause(
+            location="沈府书房", time_of_day="深夜", camera="近景",
+            scene_action="就着案上灯笼翻看密信", genre="古装悬疑")
+        self.assertIn("实用光源主导", clause)
+        self.assertNotIn("主光位于人物后方偏侧", clause)
+        self.assertIn("轮廓分离(辅助光,不是主光)", clause)
+        # 全条款里"主光位于"只能出现一次(即被选中的那个灯型自己)
+        self.assertLessEqual(clause.count("主光位于"), 1, clause)
+
+    def test_rim_as_key_style_keeps_full_clause(self):
+        """rim 本身是主灯型时,仍要保留完整的主光位置描述。"""
+        clause = lighting_clause(
+            location="山门", time_of_day="清晨", camera="全景",
+            genre="仙侠修真")
+        self.assertIn("主光位于人物后方偏侧", clause)
+
+    def test_causality_clauses_close_up(self):
+        """近景要写全受光区域、暗部、补光、眼神光与背景衰减。"""
+        clause = lighting_clause(
+            location="沈府书房", time_of_day="深夜", camera="近景",
+            scene_action="就着案上灯笼翻看密信")
+        for feature in ("受光区域", "补光", "眼神光", "暗一至两档", "亮斑"):
+            self.assertIn(feature, clause, feature)
+
+    def test_no_catchlight_in_wide_shots(self):
+        """远景看不见眼睛,强行要眼神光只是给模型加噪声。"""
+        clause = lighting_clause(
+            location="山门广场", time_of_day="夜", camera="远景",
+            scene_action="灯笼列队")
+        self.assertNotIn("眼神光", clause)
+        self.assertIn("受光区域", clause)
+        self.assertNotIn("近侧脸颊", clause)   # 远景写环境层次,不写五官
+
+    def test_negatives_cover_the_observed_failure_modes(self):
+        """A/B 实测拍到的两种病灶必须进负面清单。"""
+        lines = lighting_lines(
+            "电影级3D半写实", location="档案室", time_of_day="夜",
+            camera="近景", scene_action="灯笼旁翻卷宗")
+        negatives = lines[-1]
+        self.assertIn("没点亮却出现它的照明效果", negatives)
+        self.assertIn("无来源亮斑", negatives)
+        self.assertIn("两个方向互相矛盾的主光", negatives)
+
+
 class GenreLookTest(unittest.TestCase):
     def test_each_genre_matched_and_distinct(self):
         expected = {

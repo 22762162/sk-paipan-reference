@@ -43,7 +43,11 @@ from ..story_logic import (
     normalize_script_logic,
     normalize_storyboard_frame_phase_pairs,
 )
-from ..story_analysis import STORY_ANALYSIS_SCHEMA, validate_story_analysis
+from ..story_analysis import (
+    STORY_ANALYSIS_SCHEMA,
+    build_story_analysis,
+    validate_story_analysis,
+)
 from ..script_import import sanitize_script_entities
 
 SCRIPT_PROMPT = """你是兼具顶级类型片编剧、影视导演、场面调度和连续性经验的漫剧主创。
@@ -492,6 +496,7 @@ JSON 结构:
 "visual":{{"user_style_constraint":"明确风格则保留；未指定则写入根据剧本生成的本剧制作风格",
 "style_source":"user_override或ai_inferred","analysis_basis":["时代/地域/题材等文本证据"],"medium":"",
 "realism":"","palette":[],"lighting":"","camera_language":"",
+"visual_effect_language":"按剧情功能选择的光效、氛围、材质与后期语言",
 "texture_and_render":"","architecture_and_environment":"",
 "wardrobe_and_styling":"","props_and_graphics":"","forbidden_visuals":[]}},
 "scenes":[{{"scene_no":1,"location":"","story_function":"",
@@ -2061,7 +2066,20 @@ def validate_shot_repair(data, payload):
 
 
 def build_prompt(capability, payload):
-    """构造编剧/分镜/人物设定提示词(CLI 桥与 Claude API Provider 共用)。"""
+    """构造编剧/分镜/人物设定提示词(CLI 桥与 Claude API Provider 共用)。
+
+    尾部挂知识大脑指令:由 ProviderRouter 在派发前写进
+    payload["knowledge_directives"](见 aifos/knowledge_apply.py)。适配器
+    是子进程,自己没有 db 句柄,只负责渲染,不负责检索。
+    """
+    prompt = _build_prompt_body(capability, payload)
+    directives = str((payload or {}).get("knowledge_directives") or "").strip()
+    if directives:
+        prompt = f"{prompt}\n\n{directives}"
+    return prompt
+
+
+def _build_prompt_body(capability, payload):
     if capability == "script" and payload.get("prompt_refine"):
         return CHARACTER_REFINE_PROMPT.format(
             name=payload.get("character_name", ""),
@@ -2494,6 +2512,16 @@ def _postprocess_and_validate(capability, payload, data):
     elif capability == "script" and payload.get("lesson_distill"):
         error = validate_lesson_distill(data, payload)
     elif capability == "script" and payload.get("story_analysis"):
+        # 制作圣经的规范化器会补齐新增的派生字段（例如
+        # visual_effect_language）并保留模型已经生成的内容。先规范化再
+        # 校验，避免旧提示词或偶发漏字段触发一次“整份 JSON 重发”：
+        # 这类产出通常很大，修复调用容易被截断并把整条 Provider 判死。
+        data = build_story_analysis(
+            payload.get("script") or {},
+            payload.get("style") or "",
+            raw=data,
+            source=str(data.get("source") or "ai"),
+        )
         error = validate_story_analysis(
             data, require_resolved_identity=False)
     elif capability == "script":

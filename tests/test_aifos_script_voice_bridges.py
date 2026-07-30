@@ -9,8 +9,13 @@ from pathlib import Path
 import pytest
 
 from aifos.adapters.claude_script import (
-    extract_json, validate_script, validate_storyboard)
+    _postprocess_and_validate,
+    extract_json,
+    validate_script,
+    validate_storyboard,
+)
 from aifos.app import App
+from aifos.story_analysis import build_story_analysis
 
 REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 
@@ -265,6 +270,36 @@ def test_script_bible_is_required_normalized_and_declared_cast_only():
     assert extra["crowd_function"]
     assert "introduction" not in extra
     assert "background_prompt" not in extra
+
+
+def test_story_analysis_missing_derived_visual_field_is_normalized_locally():
+    """新增派生字段缺失时本地补齐，不能要求模型重发整份制作圣经。"""
+    script = {
+        "project_title": "归途",
+        "characters": [{"name": "甲", "role": "主角", "gender": "男",
+                        "age_range": "25至30岁"}],
+        "scenes": [{"scene_no": 1, "location": "旧车站",
+                    "characters": ["甲"],
+                    "action": "甲走进站台",
+                    "lines": [{"character": "甲", "dialogue": "我回来了"}]}],
+    }
+    assert validate_script(
+        script, {"project_title": "归途", "episode_number": 1,
+                 "premise": "甲回到故乡", "style": "九十年代现实主义"}
+    ) is None
+    raw = build_story_analysis(script, "九十年代现实主义")
+    raw["visual"].pop("visual_effect_language")
+
+    normalized, error = _postprocess_and_validate(
+        "script",
+        {"story_analysis": True, "script": script,
+         "style": "九十年代现实主义"},
+        raw,
+    )
+
+    assert error is None
+    assert normalized["schema"] == "aifos.story-analysis/v1"
+    assert normalized["visual"]["visual_effect_language"]
 
 
 def test_router_uses_claude_for_script(tmp_path, monkeypatch):

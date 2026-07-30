@@ -14,6 +14,7 @@ import shutil
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from .adapters.claude_script import (is_background_role,
                                      normalize_script_bible,
@@ -1136,8 +1137,8 @@ class Director:
 
         continue_on_block=True(关键帧批次)时,审核熔断的镜头不再一镜
         报废整批:先交编剧就地修镜头(只许改景别/取景表述)后复检一次,
-        仍熔断才隔离为 awaiting_human 并继续其余镜头。返回被隔离的
-        [(task, exc)] 列表,供调用方并入待人工清单。"""
+        仍熔断则标记失败并继续其余镜头，后续断点按失败原因自动重建；
+        不再创建要求用户确认的 awaiting_human。"""
         review_tasks = [
             task for task in tasks
             if task.get("capability") in ("image", "frames", "cover")
@@ -1249,13 +1250,13 @@ class Director:
                     reason = str(exc2)
             for member in group:
                 self._plan_mark(
-                    ctx, member["item_id"], "awaiting_human",
+                    ctx, member["item_id"], "failed",
                     error=("提示词审核熔断(编剧就地修1次后仍未通过,"
-                           "待人工修改镜头): " + reason)[:300])
+                           "等待自动重建镜头合同): " + reason)[:300])
                 quarantined.append((member, ProviderError(reason)))
             self.log.warn(
                 "director",
-                f"镜头{task['tag']}提示词审核熔断,已隔离待人工,"
+                f"镜头{task['tag']}提示词审核熔断,已隔离为自动修复失败项,"
                 f"其余镜头继续: {reason[:200]}")
         reviewed = 0
         for group, result in completed:
@@ -3107,7 +3108,8 @@ class Director:
                             "qc", "started_at", "finished_at", "duration",
                             "reference_inputs", "revision", "prompt_used",
                             "prompt_used_hash", "generation_input",
-                            "prompt_contract_validation", "output_uri"):
+                            "prompt_contract_validation", "output_uri",
+                            "autonomous_repair_seeded"):
                     if key in prev:
                         item[key] = prev[key]
                 if prev.get("custom_prompt"):
@@ -4104,6 +4106,38 @@ class Director:
         }
 
     @staticmethod
+    def _remove_reference_uri(payload, uri):
+        """Remove one submitted reference from every provider-facing field."""
+        uri = str(uri or "")
+        if not uri:
+            return False
+        changed = False
+        for key in (
+                "spatial_ref", "image_uri", "chain_first_uri", "scene_ref",
+                "style_ref", "inner_persona_ref"):
+            if str(payload.get(key) or "") == uri:
+                payload[key] = ""
+                changed = True
+        for key in ("character_refs", "reference_images", "prop_refs"):
+            values = list(payload.get(key) or [])
+            revised = [value for value in values if str(value) != uri]
+            if revised != values:
+                payload[key] = revised
+                changed = True
+        for key in ("identity_references", "character_reference_map",
+                    "asset_matches"):
+            values = list(payload.get(key) or [])
+            revised = [
+                value for value in values
+                if not (isinstance(value, dict)
+                        and str(value.get("uri") or "") == uri)
+            ]
+            if revised != values:
+                payload[key] = revised
+                changed = True
+        return changed
+
+    @staticmethod
     def _replace_reference_uri(payload, old_uri, new_uri):
         """Replace one submitted reference without widening its scope."""
         old_uri, new_uri = str(old_uri or ""), str(new_uri or "")
@@ -4112,45 +4146,156 @@ class Director:
         changed = False
         for key in (
                 "spatial_ref", "image_uri", "chain_first_uri", "scene_ref",
-                "style_ref"):
+                "style_ref", "inner_persona_ref"):
             if str(payload.get(key) or "") == old_uri:
                 payload[key] = new_uri
                 changed = True
-        for key in ("character_refs", "reference_images"):
+        for key in ("character_refs", "reference_images", "prop_refs"):
             values = list(payload.get(key) or [])
             revised = [new_uri if str(uri) == old_uri else uri
                        for uri in values]
             if revised != values:
                 payload[key] = list(dict.fromkeys(revised))
                 changed = True
-        for ref in payload.get("identity_references") or []:
-            if (isinstance(ref, dict)
-                    and str(ref.get("uri") or "") == old_uri):
-                ref["uri"] = new_uri
-                changed = True
+        for key in ("identity_references", "character_reference_map"):
+            for ref in payload.get(key) or []:
+                if (isinstance(ref, dict)
+                        and str(ref.get("uri") or "") == old_uri):
+                    ref["uri"] = new_uri
+                    changed = True
         return changed
 
-    def _resolve_reference_replacement(self, qc_spec, selector):
-        """Resolve only an existing same-project asset selected by id."""
+    def _resolve_reference_replacement(
+            self, qc_spec, selector, *, role="", reason="", current_uri=""):
+        """Resolve an existing same-project asset by id or safe scene semantics."""
         selector = selector if isinstance(selector, dict) else {}
         asset_id = selector.get("asset_id")
-        if asset_id in (None, ""):
-            return None
-        try:
-            row = self.assets.get(int(asset_id))
-        except (TypeError, ValueError):
-            return None
-        if row is None or not row["uri"] or not Path(row["uri"]).exists():
-            return None
         project_id = (qc_spec or {}).get("_project_id")
-        if project_id is not None and int(row["project_id"]) != int(project_id):
+        if asset_id not in (None, ""):
+            try:
+                row = self.assets.get(int(asset_id))
+            except (TypeError, ValueError):
+                return None
+            uri = str(row["uri"] or "") if row is not None else ""
+            if (row is None or not uri
+                    or (not uri.startswith(("http://", "https://"))
+                        and not Path(uri).exists())):
+                return None
+            if (project_id is not None
+                    and int(row["project_id"]) != int(project_id)):
+                return None
+            if self.assets.is_deleted(row):
+                return None
+            return row
+
+        # Codex can correctly diagnose "replace with a clearer/wider scene
+        # master" without knowing the database asset id.  Resolve only a
+        # current, same-project scene asset whose base_location exactly
+        # matches the shot location; arbitrary URI invention remains banned.
+        semantic_role = str(
+            selector.get("role") or role or "").strip().lower()
+        location = str((qc_spec or {}).get("location") or "").strip()
+        if (semantic_role not in {"scene", "scene_art"}
+                or project_id in (None, "") or not location):
             return None
-        if self.assets.is_deleted(row):
+        wants_panorama = bool(re.search(
+            r"广角|全景|宽幅|panorama|720", str(reason or ""),
+            flags=re.IGNORECASE))
+        ranked = []
+        for row in self.assets.active_list(
+                int(project_id), kind="scene_art"):
+            uri = str(row["uri"] or "")
+            if (not uri or uri == str(current_uri or "")
+                    or (not uri.startswith(("http://", "https://"))
+                        and not Path(uri).exists())):
+                continue
+            meta = self._asset_meta(row)
+            name = str(row["name"] or "")
+            base_location = str(
+                meta.get("base_location")
+                or name.split("::view:", 1)[0]).strip()
+            if base_location != location and name != location:
+                continue
+            view = str(meta.get("view") or "").strip().lower()
+            panorama = bool(
+                meta.get("panorama") or view == "panorama"
+                or "::view:panorama" in name)
+            exact_main = name == location or view == "main"
+            score = (
+                (100 if wants_panorama and panorama else 0)
+                + (40 if not wants_panorama and exact_main else 0)
+                + (20 if panorama else 0)
+                + int(row["id"]) / 1000000.0
+            )
+            ranked.append((score, row))
+        if not ranked:
             return None
-        return row
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return ranked[0][1]
+
+    @staticmethod
+    def _codex_instruction_reference_actions(instruction, payload):
+        """Parse only explicit numbered remove/replace commands from Codex."""
+        text = str(instruction or "")
+        if not text:
+            return []
+        manifest = {
+            int(item.get("index")): item
+            for item in (payload.get("reference_manifest") or [])
+            if isinstance(item, dict) and item.get("index") is not None
+        }
+        actions = []
+        remove_patterns = (
+            r"(?:移除|删除|去掉|剔除|禁用|不再使用|不得读取)"
+            r"(?:原)?(?:参考)?图\s*(\d+)",
+            r"(?:原)?(?:参考)?图\s*(\d+)"
+            r"[^。；\n]{0,20}(?:移除|删除|去掉|剔除|禁用|不再使用|不得读取)",
+        )
+        seen = set()
+        for pattern in remove_patterns:
+            for match in re.finditer(pattern, text):
+                index = int(match.group(1))
+                if index in seen:
+                    continue
+                seen.add(index)
+                target = manifest.get(index) or {}
+                actions.append({
+                    "action": "remove",
+                    "target_index": index,
+                    "role": str(target.get("role") or ""),
+                    "reason": "Codex 明确指令:" + match.group(0)[:160],
+                    "_codex_explicit": True,
+                })
+        replace_patterns = (
+            r"(?:将|把)?(?:原)?(?:参考)?图\s*(\d+)"
+            r"[^。；\n]{0,16}(?:替换|更换|换成|改用)",
+            r"(?:替换|更换)(?:原)?(?:参考)?图\s*(\d+)",
+        )
+        replaced = set()
+        for pattern in replace_patterns:
+            for match in re.finditer(pattern, text):
+                index = int(match.group(1))
+                if index in replaced:
+                    continue
+                replaced.add(index)
+                target = manifest.get(index) or {}
+                role = str(target.get("role") or "")
+                actions.append({
+                    "action": "replace",
+                    "target_index": index,
+                    "role": role,
+                    "reason": "Codex 明确指令:" + match.group(0)[:160],
+                    "replacement_selector": {
+                        "asset_id": None,
+                        "role": role,
+                        "character": str(target.get("character") or ""),
+                    },
+                    "_codex_explicit": True,
+                })
+        return actions
 
     def _apply_image_reference_adjustments(
-            self, payload, qc_spec, diagnostics):
+            self, payload, qc_spec, diagnostics, *, instruction=""):
         """Apply model proposals through a narrow asset-safe allowlist.
 
         A visual model may identify a bad reference, but it may never invent a
@@ -4159,6 +4304,20 @@ class Director:
         retry decision to use only changes that were actually applied.
         """
         actions = reference_actions(diagnostics)
+        explicit_actions = self._codex_instruction_reference_actions(
+            instruction, payload)
+        # Structured QC remains authoritative when it already names the same
+        # operation.  Explicit numbered commands fill the common gap where
+        # Codex says "remove image 6" in prose but emits only keep rows.
+        structured_keys = {
+            (str(action.get("action") or ""),
+             action.get("target_index"))
+            for action in actions
+        }
+        actions.extend(
+            action for action in explicit_actions
+            if (str(action.get("action") or ""),
+                action.get("target_index")) not in structured_keys)
         manifest = {
             int(item.get("index")): item
             for item in (payload.get("reference_manifest") or [])
@@ -4171,6 +4330,10 @@ class Director:
             "manual", "composition", "continuity", "revision_base",
             "qc_revision_base", "style",
         }
+        reference_status = str(
+            (diagnostics.get("reference_diagnosis") or {}).get(
+                "status") or "").strip().lower() if isinstance(
+                    diagnostics, dict) else ""
         applied, skipped = [], []
 
         def skip(action, reason):
@@ -4212,6 +4375,7 @@ class Director:
                         "action": kind,
                         "target_indices": [
                             item.get("index") for item in candidates],
+                        "target_uris": removed,
                         "reason": action.get("reason") or "",
                     })
                 else:
@@ -4224,22 +4388,24 @@ class Director:
                 skip(action, "锁定人物身份/人物母资产禁止自动移除、换绑或替换")
                 continue
             if kind == "remove":
-                if target_role not in removable_roles:
+                explicit = bool(action.get("_codex_explicit"))
+                diagnosed_conflict = bool(
+                    reference_status == "conflicting"
+                    and target_role in {"prop", "spatial", "scene"})
+                if (target_role not in removable_roles
+                        and not explicit and not diagnosed_conflict):
                     skip(action, f"{target_role or '未标注'}参考图不是可自动移除的弱引用")
                     continue
-                payload["reference_images"] = [
-                    value for value in (payload.get("reference_images") or [])
-                    if str(value) != target_uri]
-                payload["asset_matches"] = [
-                    value for value in (payload.get("asset_matches") or [])
-                    if str(value.get("uri") or "") != target_uri]
-                for field in (
-                        "image_uri", "chain_first_uri", "style_ref"):
-                    if str(payload.get(field) or "") == target_uri:
-                        payload[field] = ""
+                if not self._remove_reference_uri(payload, target_uri):
+                    skip(action, "目标参考图未在实际提交字段中找到")
+                    continue
                 applied.append({
                     "action": kind, "target_index": target.get("index"),
+                    "target_uri": target_uri,
+                    "target_asset_id": target.get("asset_id"),
                     "role": target_role, "reason": action.get("reason") or "",
+                    "source": (
+                        "codex_instruction" if explicit else "visual_qc"),
                 })
                 continue
             if kind == "rebind":
@@ -4254,22 +4420,41 @@ class Director:
                              "label": target.get("label"),
                              "uri": target_uri}
                     matches.append(match)
-                match["reference_role"] = (
+                requested_role = str(
                     action.get("role") or target_role or "manual")
+                if requested_role in {
+                        "spatial_blocking", "blocking_only"}:
+                    match["reference_role"] = "spatial"
+                    match["inherits"] = [
+                        "blocking", "occlusion", "screen_direction",
+                        "relative_distance",
+                    ]
+                    match["excludes"] = [
+                        "camera", "lens", "focal_length", "field_of_view",
+                        "identity", "wardrobe", "style",
+                        "diagram_artifacts",
+                    ]
+                else:
+                    match["reference_role"] = requested_role
                 match["attach_to"] = action.get("character") or ""
                 payload["asset_matches"] = matches
                 applied.append({
                     "action": kind, "target_index": target.get("index"),
-                    "role": match["reference_role"],
+                    "target_uri": target_uri,
+                    "target_asset_id": target.get("asset_id"),
+                    "role": requested_role,
                     "character": match["attach_to"],
                     "reason": action.get("reason") or "",
                 })
                 continue
             if kind in ("replace", "add"):
                 row = self._resolve_reference_replacement(
-                    qc_spec, action.get("replacement_selector"))
+                    qc_spec, action.get("replacement_selector"),
+                    role=str(action.get("role") or target_role or ""),
+                    reason=str(action.get("reason") or instruction or ""),
+                    current_uri=target_uri)
                 if row is None:
-                    skip(action, "替换资产未提供有效的本项目已有 asset_id")
+                    skip(action, "未找到符合条件的本项目已有替换资产")
                     continue
                 new_uri = str(row["uri"])
                 role = str(action.get("role") or target_role or "manual")
@@ -4298,12 +4483,241 @@ class Director:
                 applied.append({
                     "action": kind,
                     "target_index": (target or {}).get("index"),
+                    "target_uri": target_uri,
+                    "target_asset_id": (target or {}).get("asset_id"),
+                    "replacement_uri": new_uri,
+                    "replacement_asset_id": row["id"],
                     "asset_id": row["id"], "role": role,
                     "character": character,
                     "reason": action.get("reason") or "",
                 })
                 continue
             skip(action, "不支持的参考图调整动作")
+        return {"applied": applied, "skipped": skipped}
+
+    def _persist_codex_reference_overrides(self, ctx, task, changes):
+        """Persist applied reference edits on the shot for pause/resume."""
+        applied = list((changes or {}).get("applied") or [])
+        if not applied:
+            return 0
+        try:
+            shot_no = int(task.get("tag"))
+        except (TypeError, ValueError):
+            return 0
+        shot = next((
+            item for item in (ctx.get("storyboard") or {}).get("shots", [])
+            if int(item.get("shot_no", -1)) == shot_no), None)
+        if shot is None:
+            return 0
+        stored = copy.deepcopy(
+            shot.get("codex_reference_overrides") or {})
+        operations = [
+            item for item in (stored.get("operations") or [])
+            if isinstance(item, dict)
+        ]
+
+        def append(operation):
+            key = (
+                str(operation.get("action") or ""),
+                str(operation.get("target_uri") or ""),
+                str(operation.get("target_asset_id") or ""),
+                str(operation.get("replacement_asset_id") or ""),
+                str(operation.get("role") or ""),
+            )
+            operations[:] = [
+                item for item in operations
+                if (
+                    str(item.get("action") or ""),
+                    str(item.get("target_uri") or ""),
+                    str(item.get("target_asset_id") or ""),
+                    str(item.get("replacement_asset_id") or ""),
+                    str(item.get("role") or ""),
+                ) != key
+            ]
+            operations.append(operation)
+
+        written = 0
+        for item in applied:
+            action = str(item.get("action") or "")
+            if action == "drop_revision_base":
+                for uri in item.get("target_uris") or []:
+                    append({
+                        "action": "remove",
+                        "target_uri": str(uri),
+                        "role": "revision_base",
+                        "reason": str(item.get("reason") or "")[:600],
+                    })
+                    written += 1
+                continue
+            if action not in {"remove", "replace", "add", "rebind"}:
+                continue
+            append({
+                "action": action,
+                "target_uri": str(item.get("target_uri") or ""),
+                "target_asset_id": item.get("target_asset_id"),
+                "replacement_uri": str(
+                    item.get("replacement_uri") or ""),
+                "replacement_asset_id": item.get(
+                    "replacement_asset_id", item.get("asset_id")),
+                "role": str(item.get("role") or ""),
+                "character": str(item.get("character") or ""),
+                "reason": str(item.get("reason") or "")[:600],
+            })
+            written += 1
+        if not written:
+            return 0
+        shot["codex_reference_overrides"] = {
+            "schema": "aifos.codex-reference-overrides/v1",
+            "operations": operations[-32:],
+            "updated_at": now(),
+        }
+        self.projects.save_document(
+            ctx["episode"]["id"], "storyboard", ctx["storyboard"])
+        return written
+
+    def _apply_persisted_reference_overrides(self, ctx, payload, shot):
+        """Reapply safe, resolved Codex reference edits after payload rebuild."""
+        stored = (
+            shot.get("codex_reference_overrides")
+            if isinstance(shot, dict) else {})
+        operations = list(
+            (stored or {}).get("operations") or [])
+        if not operations:
+            return {"applied": [], "skipped": []}
+        protected_roles = {
+            "identity", "identity_detail", "structure", "wardrobe",
+        }
+        project_id = int(ctx["project"]["id"])
+        applied, skipped = [], []
+        for operation in operations:
+            if not isinstance(operation, dict):
+                continue
+            action = str(operation.get("action") or "")
+            manifest = self._reference_manifest(payload)
+            target_uri = str(operation.get("target_uri") or "")
+            target_asset_id = operation.get("target_asset_id")
+            declared_role = str(operation.get("role") or "")
+            target = next((
+                item for item in manifest
+                if (target_uri and str(item.get("uri") or "") == target_uri)
+                or (target_asset_id not in (None, "")
+                    and str(item.get("asset_id") or "")
+                    == str(target_asset_id))), None)
+            if (target is None and action == "replace"
+                    and declared_role in {"scene", "spatial"}):
+                same_role = [
+                    item for item in manifest
+                    if str(item.get("role") or "") == declared_role]
+                if len(same_role) == 1:
+                    target = same_role[0]
+            if target is not None:
+                target_uri = str(target.get("uri") or target_uri)
+            role = str(
+                declared_role
+                if action == "rebind" and declared_role
+                else ((target or {}).get("role") or declared_role))
+            if role in protected_roles:
+                skipped.append({
+                    "action": action, "target_uri": target_uri,
+                    "reason": "持久化覆盖不得修改锁定人物身份资产",
+                })
+                continue
+            if action in {"remove", "replace", "rebind"} and target is None:
+                # Already absent is the desired state for a persisted remove.
+                if action == "remove":
+                    continue
+                skipped.append({
+                    "action": action, "target_uri": target_uri,
+                    "reason": "重建后的输入中找不到原参考资产",
+                })
+                continue
+            if action == "remove":
+                if self._remove_reference_uri(payload, target_uri):
+                    applied.append({
+                        "action": action, "target_uri": target_uri,
+                        "role": role,
+                    })
+                continue
+            if action in {"replace", "add"}:
+                row = self._resolve_reference_replacement(
+                    {"_project_id": project_id,
+                     "location": payload.get("location", "")},
+                    {"asset_id": operation.get(
+                        "replacement_asset_id")},
+                    role=role,
+                    reason=operation.get("reason", ""),
+                    current_uri=target_uri)
+                if row is None:
+                    skipped.append({
+                        "action": action, "target_uri": target_uri,
+                        "reason": "持久化替换资产已失效或不属于本项目",
+                    })
+                    continue
+                new_uri = str(row["uri"])
+                if action == "replace":
+                    if not self._replace_reference_uri(
+                            payload, target_uri, new_uri):
+                        skipped.append({
+                            "action": action, "target_uri": target_uri,
+                            "reason": "原参考图未在实际字段中找到",
+                        })
+                        continue
+                    payload["asset_matches"] = [
+                        item for item in (payload.get("asset_matches") or [])
+                        if str(item.get("uri") or "") != target_uri]
+                else:
+                    refs = list(payload.get("reference_images") or [])
+                    if new_uri not in [str(value) for value in refs]:
+                        refs.append(new_uri)
+                        payload["reference_images"] = refs
+                matches = [
+                    item for item in (payload.get("asset_matches") or [])
+                    if str(item.get("uri") or "") != new_uri]
+                matches.append({
+                    "asset_id": row["id"], "kind": row["kind"],
+                    "name": row["name"], "label": row["name"],
+                    "uri": new_uri, "reference_role": role or "manual",
+                    "attach_to": str(operation.get("character") or ""),
+                })
+                payload["asset_matches"] = matches
+                applied.append({
+                    "action": action, "target_uri": target_uri,
+                    "replacement_uri": new_uri,
+                    "replacement_asset_id": row["id"], "role": role,
+                })
+                continue
+            if action == "rebind":
+                match = next((
+                    item for item in (payload.get("asset_matches") or [])
+                    if str(item.get("uri") or "") == target_uri), None)
+                if match is None:
+                    skipped.append({
+                        "action": action, "target_uri": target_uri,
+                        "reason": "重建后的资产绑定不存在",
+                    })
+                    continue
+                if role in {"spatial_blocking", "blocking_only"}:
+                    match["reference_role"] = "spatial"
+                    match["inherits"] = [
+                        "blocking", "occlusion", "screen_direction",
+                        "relative_distance",
+                    ]
+                    match["excludes"] = [
+                        "camera", "lens", "focal_length", "field_of_view",
+                        "identity", "wardrobe", "style",
+                        "diagram_artifacts",
+                    ]
+                else:
+                    match["reference_role"] = role or "manual"
+                match["attach_to"] = str(
+                    operation.get("character") or "")
+                applied.append({
+                    "action": action, "target_uri": target_uri,
+                    "role": role or match["reference_role"],
+                })
+        if applied:
+            payload["codex_reference_overrides_applied"] = copy.deepcopy(
+                applied)
         return {"applied": applied, "skipped": skipped}
 
     @staticmethod
@@ -4933,55 +5347,72 @@ class Director:
 
     def _generate_image_gacha(self, capability, payload, out_dir,
                               cancel, qc_spec):
-        """连抽选优:重要/终稿类多次完整生成+质检,首个通过即采纳。
+        """连抽选优:重要/终稿类多次完整生成+质检。
 
-        全部未过时恢复得分最高的一张(canonical 路径),交由既有的
-        人工问题清单/定向修图流程;各抽成本累加进最终结果,不漏账。
+        常规抽卡首个通过即采纳；首次失败后的修订轮使用
+        ``_gacha_select_best_after_all``，固定生成完整候选组后再按质检
+        得分选最优，不因第一张碰巧过线就提前结束。全部未过时恢复得分
+        最高的一张(canonical 路径),交由后续 Codex 自动分析/修复流程；
+        各抽成本累加进最终结果,不漏账。
         只对 capability=image 生效;frames 成对首尾另有连续性语义。
         """
-        pulls = self._gacha_pulls(payload)
+        try:
+            override = int((payload or {}).get("_gacha_pulls_override") or 0)
+        except (TypeError, ValueError):
+            override = 0
+        pulls = max(1, min(override, 4)) if override else \
+            self._gacha_pulls(payload)
+        select_after_all = bool(
+            (payload or {}).get("_gacha_select_best_after_all"))
         if (pulls <= 1 or capability != "image"
                 or not qc_spec or not self._image_qc_enabled()):
             return self._generate_image_with_qc(
                 capability, payload, out_dir, cancel, qc_spec)
         best = None                    # (score, result, snapshot)
         snapshots = []
-        previous_cost = 0.0
+        total_cost = 0.0
+        candidates = []
         for pull in range(1, pulls + 1):
             result = self._generate_image_with_qc(
                 capability, copy.deepcopy(payload), out_dir, cancel,
                 qc_spec)
             report = getattr(result, "qc", None) or {}
-            result.cost += previous_cost
-            if report.get("passed"):
+            total_cost += float(result.cost or 0.0)
+            score = self._image_qc_selection_score(report)
+            candidates.append({
+                "pull": pull,
+                "passed": bool(report.get("passed")),
+                "score": score,
+                "issues": list(report.get("issues") or [])[:8],
+            })
+            if report.get("passed") and not select_after_all:
                 for snap in snapshots:
                     try:
                         snap.unlink()
                     except OSError:
                         pass
+                result.cost = total_cost
                 if pull > 1:
                     self.log.info(
                         "director",
                         f"连抽第{pull}抽通过质检,采纳并结束本镜抽取")
                 return result
-            previous_cost = float(result.cost or 0.0)
             uri = str(result.uri or "")
-            score = float(report.get("score") or 0.0)
-            if uri and Path(uri).exists() and pull < pulls:
+            snap = None
+            if uri and Path(uri).exists():
                 snap = Path(uri).with_name(
                     Path(uri).stem + f".gacha{pull}" + Path(uri).suffix)
                 try:
                     shutil.copy2(uri, snap)
                     snapshots.append(snap)
-                    if best is None or score > best[0]:
-                        best = (score, result, snap)
                 except OSError:
-                    pass
-            elif best is None or score > (best[0] if best else -1):
-                best = (score, result, None)
-        # 全部未过:恢复得分最高的一张到 canonical 路径
-        final_score, final_result, final_snap = best if best else (
-            0.0, result, None)
+                    snap = None
+            rank = (1 if report.get("passed") else 0, score)
+            if best is None or rank > best[0]:
+                best = (rank, result, snap, pull)
+        # 完整候选组生成完后,恢复质检排名最高的一张到 canonical 路径。
+        final_rank, final_result, final_snap, selected_pull = (
+            best if best else ((0, 0.0), result, None, pulls))
         if final_snap is not None and final_snap.exists():
             try:
                 shutil.copy2(final_snap, final_result.uri)
@@ -4992,12 +5423,88 @@ class Director:
                 snap.unlink()
             except OSError:
                 pass
-        final_result.cost = previous_cost
-        self.log.info(
-            "director",
-            f"连抽{pulls}张均未过质检,保留得分最高({final_score:.0f})"
-            "的一张进入人工/修图流程")
+        final_result.cost = total_cost
+        final_report = getattr(final_result, "qc", None)
+        if isinstance(final_report, dict):
+            final_report["gacha"] = {
+                "pulls": pulls,
+                "select_after_all": select_after_all,
+                "selected_pull": selected_pull,
+                "selected_score": float(final_rank[1]),
+                "candidates": candidates,
+            }
+        if final_rank[0]:
+            self.log.info(
+                "director",
+                f"修订后3抽全部完成,自动选择第{selected_pull}张"
+                f"(质检得分 {final_rank[1]:.0f})")
+        else:
+            self.log.info(
+                "director",
+                f"连抽{pulls}张均未过质检,保留第{selected_pull}张最高分"
+                f"({final_rank[1]:.0f})进入下一轮 Codex 自动修复")
         return final_result
+
+    @staticmethod
+    def _image_qc_selection_score(report):
+        """把图片 QC 的结构化硬检查压成抽卡选优分。
+
+        通过优先级高于一切；同为通过或同为失败时，再按画面判定、身份、
+        性别、服装、人数、叠层、物理和空间八项逐项计分，最后用问题数
+        破平。这样三张候选不会按生成顺序碰运气选中。
+        """
+        report = report if isinstance(report, dict) else {}
+        score = 1000.0 if report.get("passed") else 0.0
+        if report.get("image_passed") or report.get("visual_pass"):
+            score += 160.0
+        checks = (
+            ("identity_checked", "identity_match", 120.0),
+            ("gender_checked", "gender_match", 100.0),
+            ("wardrobe_checked", "wardrobe_match", 80.0),
+            ("count_checked", "count_match", 140.0),
+            ("overlay_count_checked", "overlay_count_match", 40.0),
+            ("physical_logic_checked", "physical_logic_match", 110.0),
+            ("spatial_logic_checked", "spatial_logic_match", 110.0),
+        )
+        for checked, matched, weight in checks:
+            if report.get(checked):
+                score += weight if report.get(matched) else -weight
+        if report.get("input_contract_passed"):
+            score += 60.0
+        score -= min(240.0, len(report.get("issues") or []) * 20.0)
+        return score
+
+    def _generate_repair_candidate_group(
+            self, capability, payload, out_dir, cancel, qc_spec):
+        """用同一份 Codex 修订合同生成3张，全部判分后自动选优。
+
+        三张全败时，只对最高分候选再做一次 Codex 根因分析，产出下一轮
+        可执行修改指令；不会把三个候选分别改成三套互相漂移的合同。
+        """
+        candidate_payload = copy.deepcopy(payload or {})
+        candidate_payload["_qc_candidate_only"] = True
+        candidate_payload["_gacha_pulls_override"] = 3
+        candidate_payload["_gacha_select_best_after_all"] = True
+        candidate_payload["qc_consecutive_failures_base"] = max(
+            1, int(candidate_payload.get(
+                "qc_consecutive_failures_base") or 1))
+        selected = self._generate_image_gacha(
+            capability, candidate_payload, out_dir, cancel, qc_spec)
+        report = getattr(selected, "qc", None) or {}
+        if report.get("passed"):
+            return selected
+        generation_input = report.get("generation_input") or \
+            self._image_generation_input(
+                candidate_payload, qc_spec=qc_spec)
+        report["consecutive_failures"] = max(
+            2, int(report.get("consecutive_failures") or 0))
+        report, escalation_cost = self._escalate_failed_image_to_codex(
+            report, qc_spec, selected.uri, generation_input, out_dir,
+            cancel=cancel,
+            codex_profile=candidate_payload.get("_codex_profile", ""))
+        selected.cost += escalation_cost
+        selected.qc = report
+        return selected
 
     @staticmethod
     def _repeated_core_issues(attempt_history):
@@ -5286,9 +5793,15 @@ class Director:
             report["qc_provider"] = qc_result.provider
             report["qc_model"] = (
                 getattr(qc_result, "model", "") or "")
+            report["score"] = self._image_qc_selection_score(report)
             result.qc = report
+            # 修订后的三张候选只负责独立成像与判分。每张失败都再次让
+            # Codex 改合同会让三张使用不同输入，失去“同一修订合同抽卡
+            # 选优”的意义；三张全败后才对最高分候选做下一轮根因分析。
+            if payload.get("_qc_candidate_only"):
+                return result
             # 第一次失败就升级 Codex:出诊断 + 改提示词,随后本轮继续按新提示词
-            # 重画;第二次失败时 executable=False,升级只做分析并在此收口。
+            # 进入三张候选抽卡;三张全败后再对最高分候选做下一轮分析。
             if (not report["passed"]
                     and report["consecutive_failures"] >= 1):
                 report, escalation_cost = \
@@ -5345,14 +5858,15 @@ class Director:
                     attempt_history[-2]["input_hash"]
                     if len(attempt_history) > 1 else ""))
             next_payload = copy.deepcopy(payload)
-            reference_changes = self._apply_image_reference_adjustments(
-                next_payload, qc_spec, diagnostics)
-            patch = targeted_prompt_patch(diagnostics)
             # Codex 升级指令是权威修订：它看过成品图、实际提示词和参考图
             # 清单，压过本地规则编译器按判词猜出来的 patch。
             codex_instruction = str(
                 (report.get("codex_escalation") or {}).get(
                     "instruction_to_aifos") or "").strip()
+            reference_changes = self._apply_image_reference_adjustments(
+                next_payload, qc_spec, diagnostics,
+                instruction=codex_instruction)
+            patch = targeted_prompt_patch(diagnostics)
             if codex_instruction:
                 patch = codex_instruction
                 revision = dict(revision)
@@ -5462,17 +5976,50 @@ class Director:
             result.qc = report
             if blocked_reason:
                 return result
-            spent = result.cost
-            attempts += 1
             next_payload["_applied_qc_changes"] = [
                 {
-                    "source_attempt": attempts,
+                    "source_attempt": attempts + 1,
                     "prompt_changed": actual_prompt_changed,
                     "references_changed": actual_references_changed,
                     "prompt_patch": patch,
                     "reference_changes": reference_changes["applied"],
                 }
             ]
+            if (capability == "image"
+                    and report["consecutive_failures"] == 1):
+                # 生产规则:首图失败→Codex 修订→第二轮固定重生三张→
+                # 三张全部质检后选最符合的一张。候选共享同一修订合同，
+                # 不使用失败图作逐张修图基底，确保抽的是独立随机样本。
+                candidate_payload = copy.deepcopy(next_payload)
+                candidate_payload["qc_consecutive_failures_base"] = 1
+                candidate_payload.pop("source_qc_uri", None)
+                candidate_payload["reference_images"] = [
+                    ref for ref in (
+                        candidate_payload.get("reference_images") or [])
+                    if ref != uri]
+                candidate_payload["asset_matches"] = [
+                    match for match in (
+                        candidate_payload.get("asset_matches") or [])
+                    if match.get("reference_role") != "revision_base"]
+                self._attach_reference_manifest(candidate_payload)
+                self.log.info(
+                    "director",
+                    f"{qc_spec.get('item_id') or '本图'}首图质检未过，"
+                    "Codex 修订已应用；第二轮固定生成3张并全量选优")
+                selected = self._generate_repair_candidate_group(
+                    capability, candidate_payload, out_dir, cancel, qc_spec)
+                selected.cost += float(result.cost or 0.0)
+                selected_report = getattr(selected, "qc", None) or {}
+                selected_report["first_failure"] = {
+                    "issues": list(report.get("issues") or [])[:16],
+                    "input_hash": generation_input.get("input_hash", ""),
+                    "codex_instruction": codex_instruction[:2400],
+                }
+                selected_report["generation_attempts"] = 4
+                selected.qc = selected_report
+                return selected
+            spent = result.cost
+            attempts += 1
             payload = next_payload
 
     def _plan_done_extra(self, result):
@@ -5481,8 +6028,8 @@ class Director:
                  "fallbacks": getattr(result, "fallbacks", [])}
         uri = getattr(result, "uri", "")
         if uri:
-            # 二次质检仍未通过的图片不会登记为正式资产，但必须保留
-            # 最终失败稿，供问题清单预览和人工定向修改。
+            # 自动修复仍未通过的图片不会登记为正式资产，但保留最高分
+            # 失败稿供下一轮 Codex 根因分析与断点重试。
             extra["output_uri"] = uri
         data = getattr(result, "data", {}) or {}
         for key in ("first_source", "generation_calls", "model",
@@ -5500,7 +6047,8 @@ class Director:
             if qc.get("passed") is False:
                 attempts = int(qc.get("attempts") or 1)
                 qc.update({
-                    "awaiting_human": True,
+                    "awaiting_human": False,
+                    "autonomous_repair_required": True,
                     "auto_repairs": max(0, attempts - 1),
                     "auto_repair_exhausted": True,
                 })
@@ -5514,13 +6062,13 @@ class Director:
             codex = qc.get("codex_escalation") or {}
             if codex.get("status") == "completed":
                 return (
-                    "图片连续两次质检未通过，Codex 已完成升级分析并通知 "
+                    "图片候选组质检未通过，Codex 已完成升级分析并要求 "
                     f"AIFOS 执行 {codex.get('aifos_action', 'manual_review')}:"
                     + str(codex.get("instruction_to_aifos") or "")
                     + "；".join(qc.get("issues") or []))
             if codex.get("status") == "unavailable":
                 return (
-                    "图片连续两次质检未通过，Codex 分析暂不可用；"
+                    "图片候选组质检未通过，Codex 分析暂不可用；"
                     "已禁止原样继续重画:"
                     + str(codex.get("reason") or ""))
             if (qc.get("contract_repair_required")
@@ -5542,8 +6090,9 @@ class Director:
     def _auto_apply_codex_escalation(self, ctx, task, result):
         """Codex 给了具体修改指令就自动执行,不再推给人工。
 
-        既有分派只自动执行 ``targeted_redraw``;判「改合同/拆镜/人工」时
-        熔断等人来改分镜。但 Codex 的 ``instruction_to_aifos`` 已经把要改
+        ``targeted_redraw`` 直接固化进下一轮生成基底；判「改合同/拆镜/
+        人工」但同时给出了可执行指令时，交给编剧就地改分镜。Codex 的
+        ``instruction_to_aifos`` 已经把要改
         成什么一字不差写好了(焦段统一为50mm、站位唯一化、取景边界…),
         让它躺在报告里等人,等于修复方案齐全却无人执行——ep1 有 6/15 个
         镜头就死在这一步。
@@ -5551,7 +6100,7 @@ class Director:
         这里把它接到既有的「阻断即修」链上:把 Codex 指令当作修复依据交给
         编剧就地改镜头合同,存回分镜文档并重建 payload/qc_spec。合同真的
         变了(生成输入哈希变化)正是既有自动放行条件,不新增任何放行口子。
-        返回修复摘要;不适用或修不动时返回空串,调用方按原路落人工。
+        返回修复摘要;不适用或修不动时返回空串,调用方标记自动修复失败。
         """
         qc = getattr(result, "qc", None) or {}
         escalation = qc.get("codex_escalation") or {}
@@ -5560,8 +6109,9 @@ class Director:
         instruction = str(
             escalation.get("instruction_to_aifos") or "").strip()
         action = str(escalation.get("aifos_action") or "")
-        # targeted_redraw 在质检循环里已经自动执行过了,这里只接非重画类。
-        if action not in ESCALATION_NON_REDRAW_ACTIONS or not instruction:
+        if (action not in {*ESCALATION_NON_REDRAW_ACTIONS,
+                           "targeted_redraw"}
+                or not instruction):
             return ""
         item_id = str(task.get("item_id") or "")
         if not item_id.startswith(("shot:", "frames:")):
@@ -5573,23 +6123,65 @@ class Director:
         if used >= self.CODEX_CONTRACT_REPAIR_LIMIT:
             return ""
         before = self._image_generation_input(task.get("payload") or {})
-        try:
-            summary = self._repair_blocked_prompt_shot(
-                ctx, task,
-                f"Codex 升级分析判定本镜应「"
-                f"{CODEX_QC_ACTION_CN.get(action, action)}」。"
-                f"必须落实的修改指令:{instruction}")
-        except Exception as exc:
-            self.log.warn(
-                "director",
-                f"{item_id} 自动执行 Codex 修改指令失败,转人工: {exc}")
-            return ""
+        diagnostics = normalize_generation_diagnostics(
+            qc.get("input_diagnosis") or qc,
+            issues=qc.get("issues"))
+        reference_changes = {"applied": [], "skipped": []}
+        if action == "targeted_redraw":
+            target = task.get("payload") or {}
+            amendment = "\n【Codex自动修订·必须执行】" + instruction[:1600]
+            base = str(target.get("_reference_prompt_base")
+                       or target.get("prompt") or "")
+            if amendment not in base:
+                target["_reference_prompt_base"] = base + amendment
+                target["prompt"] = str(target.get("prompt") or "") + amendment
+                if target.get("prompt_compact"):
+                    target["prompt_compact"] = (
+                        str(target["prompt_compact"]) + amendment)
+            target["feedback"] = stack_revision_feedback(
+                target.get("feedback"), instruction,
+                next_revision_round(
+                    target.get("feedback"),
+                    target.get("prompt_review_feedback_applied")))
+            reference_changes = self._apply_image_reference_adjustments(
+                target, task.get("qc_spec") or {}, diagnostics,
+                instruction=instruction)
+            self._attach_reference_manifest(target)
+            summary = "已把 Codex 定向重画指令固化进下一轮生成合同"
+        else:
+            try:
+                summary = self._repair_blocked_prompt_shot(
+                    ctx, task,
+                    f"Codex 升级分析判定本镜应「"
+                    f"{CODEX_QC_ACTION_CN.get(action, action)}」。"
+                    f"必须落实的修改指令:{instruction}")
+            except Exception as exc:
+                self.log.warn(
+                    "director",
+                    f"{item_id} 自动执行 Codex 修改指令失败,自动修复中止: "
+                    f"{exc}")
+                return ""
+            # _repair_blocked_prompt_shot rebuilds the complete payload from
+            # the storyboard, so reference edits must happen after it.
+            reference_changes = self._apply_image_reference_adjustments(
+                task.get("payload") or {}, task.get("qc_spec") or {},
+                diagnostics, instruction=instruction)
+            self._attach_reference_manifest(task["payload"])
+        if reference_changes["applied"]:
+            task["payload"]["qc_reference_changes"] = copy.deepcopy(
+                reference_changes)
+            persisted = self._persist_codex_reference_overrides(
+                ctx, task, reference_changes)
+            summary += (
+                f"；已实际修改 {len(reference_changes['applied'])} 项参考图"
+                + (f"并持久化 {persisted} 项" if persisted else ""))
         after = self._image_generation_input(task.get("payload") or {})
         if before.get("input_hash") == after.get("input_hash"):
             # 合同没真的变,再画一次撞的是同一份坏数据。
             self.log.warn(
                 "director",
-                f"{item_id} 按 Codex 指令改完合同后生成输入未变化,转人工")
+                f"{item_id} 按 Codex 指令改完合同后生成输入未变化,"
+                "自动修复中止")
             return ""
         counters[item_id] = used + 1
         # 新一轮从干净状态起画:旧的升级结论已经落实,不能再随 payload
@@ -5634,6 +6226,8 @@ class Director:
             "prompt_used_hash": self._stable_hash(
                 payload.get("prompt_compact")
                 or payload.get("prompt") or ""),
+            "autonomous_repair_seeded": bool(
+                payload.get("_autonomous_repair_seeded")),
         }
         if task.get("_codex_profile"):
             generating_extra["codex_profile"] = task["_codex_profile"]
@@ -5642,10 +6236,24 @@ class Director:
         self._plan_mark(ctx, task["item_id"], "generating",
                         extra=generating_extra)
         try:
-            result = self._generate_image_gacha(
-                task["capability"], task["payload"],
-                ctx["out_root"] / task["sub_dir"],
-                lambda: self._cancel_requested(ctx), task.get("qc_spec"))
+            if (task["capability"] == "image"
+                    and str(task.get("item_id") or "").startswith("shot:")):
+                # 镜头首图严格只出1张；失败后的修订轮才启用固定3抽。
+                generate = (
+                    self._generate_repair_candidate_group
+                    if payload.get("_autonomous_repair_seeded")
+                    else self._generate_image_with_qc)
+                result = generate(
+                    task["capability"], task["payload"],
+                    ctx["out_root"] / task["sub_dir"],
+                    lambda: self._cancel_requested(ctx),
+                    task.get("qc_spec"))
+            else:
+                result = self._generate_image_gacha(
+                    task["capability"], task["payload"],
+                    ctx["out_root"] / task["sub_dir"],
+                    lambda: self._cancel_requested(ctx),
+                    task.get("qc_spec"))
         except ProduceCancelled:
             self._finish_dispatch_task(ctx, task, error="已手动停止生成")
             self._plan_mark(ctx, task["item_id"], "pending")
@@ -5661,49 +6269,55 @@ class Director:
         self._task_providers.add(result.provider)
         self.projects.add_episode_cost(ctx["episode"]["id"], result.cost)
         critical_error = self._critical_qc_error(result)
-        if critical_error:
+        while critical_error:
             # Codex 已经写清楚要改什么时,先自动落实再重画一轮,
             # 不把可执行的修复方案推给人工。
             repair = self._auto_apply_codex_escalation(ctx, task, result)
-            if repair:
-                self._plan_mark(
-                    ctx, task["item_id"], "generating",
-                    extra={**generating_extra,
-                           "codex_contract_repair": repair[:300]})
-                try:
-                    result = self._generate_image_gacha(
-                        task["capability"], task["payload"],
-                        ctx["out_root"] / task["sub_dir"],
-                        lambda: self._cancel_requested(ctx),
-                        task.get("qc_spec"))
-                except ProduceCancelled:
-                    self._finish_dispatch_task(
-                        ctx, task, error="已手动停止生成")
-                    self._plan_mark(ctx, task["item_id"], "pending")
-                    raise
-                except Exception as exc:
-                    self._finish_dispatch_task(ctx, task, error=str(exc))
-                    self._plan_mark(ctx, task["item_id"], "failed",
-                                    error=str(exc)[:300])
-                    raise
-                self._task_cost += result.cost
-                self._task_providers.add(result.provider)
-                self.projects.add_episode_cost(
-                    ctx["episode"]["id"], result.cost)
-                critical_error = self._critical_qc_error(result)
+            if not repair:
+                break
+            self._plan_mark(
+                ctx, task["item_id"], "generating",
+                extra={**generating_extra,
+                       "codex_contract_repair": repair[:300],
+                       "autonomous_repair": True,
+                       "candidate_count": 3})
+            try:
+                result = self._generate_repair_candidate_group(
+                    task["capability"], task["payload"],
+                    ctx["out_root"] / task["sub_dir"],
+                    lambda: self._cancel_requested(ctx),
+                    task.get("qc_spec"))
+            except ProduceCancelled:
+                self._finish_dispatch_task(
+                    ctx, task, error="已手动停止生成")
+                self._plan_mark(ctx, task["item_id"], "pending")
+                raise
+            except Exception as exc:
+                self._finish_dispatch_task(ctx, task, error=str(exc))
+                self._plan_mark(ctx, task["item_id"], "failed",
+                                error=str(exc)[:300])
+                raise
+            self._task_cost += result.cost
+            self._task_providers.add(result.provider)
+            self.projects.add_episode_cost(
+                ctx["episode"]["id"], result.cost)
+            critical_error = self._critical_qc_error(result)
         if critical_error:
             self._finish_dispatch_task(ctx, task, error=critical_error)
             self._plan_mark(
-                ctx, task["item_id"],
-                ("awaiting_human" if continue_on_qc_failure else "failed"),
+                ctx, task["item_id"], "failed",
                 error=critical_error[:300],
                 extra=self._plan_done_extra(result))
             if continue_on_qc_failure:
                 return None
             raise AifosError(critical_error)
         self._finish_dispatch_task(ctx, task, result=result)
-        self._plan_mark(ctx, task["item_id"], "done",
-                        extra=self._plan_done_extra(result))
+        self._plan_mark(
+            ctx, task["item_id"], "done",
+            extra={
+                **self._plan_done_extra(result),
+                "autonomous_repair_seeded": False,
+            })
         return result
 
     def _parallel_workers(self):
@@ -5790,9 +6404,10 @@ class Director:
         worker 线程只做产线调用;记账/资产登记/清单状态全在主线程。
         tasks: [{"item_id","capability","payload","sub_dir","tag","priority"}]
         默认返回 {tag: ProviderResult};暂停时未完成条目回到排队并保留
-        已完成。continue_on_qc_failure=True 时，二次视觉质检失败的单项
-        标为 awaiting_human 并继续补投剩余任务，返回
-        (results, qc_failures)，真正的 Provider/预算错误仍会中止整批。"""
+        已完成。continue_on_qc_failure=True 时，修订组三抽仍失败的单项
+        标为 failed 并继续补投剩余任务，返回
+        (results, qc_failures)，失败项不进入正式资产链，也不要求用户
+        确认；真正的 Provider/预算错误仍会中止整批。"""
         if not tasks:
             return ({}, []) if continue_on_qc_failure else {}
         self._assign_codex_profiles(tasks)
@@ -5820,7 +6435,7 @@ class Director:
                 if result is None:
                     qc_failures.append((
                         task, AifosError(
-                            "图片二次质检仍未通过，等待人工修改")))
+                            "图片修订组三抽仍未通过，等待自动重建合同")))
                     continue
                 out[task["tag"]] = result
             return ((out, qc_failures)
@@ -5876,6 +6491,8 @@ class Director:
                         "prompt_used_hash": self._stable_hash(
                             payload.get("prompt_compact")
                             or payload.get("prompt") or ""),
+                        "autonomous_repair_seeded": bool(
+                            payload.get("_autonomous_repair_seeded")),
                     }
                     if task.get("_codex_profile"):
                         generating_extra["codex_profile"] = task[
@@ -5885,10 +6502,14 @@ class Director:
                             "_acceleration"]
                     self._plan_mark(ctx, task["item_id"], "generating",
                                     extra=generating_extra)
+                    generate = (
+                        self._generate_repair_candidate_group
+                        if payload.get("_autonomous_repair_seeded")
+                        else self._generate_image_with_qc)
                     future = pool.submit(
-                        self._generate_image_with_qc, task["capability"],
-                        task["payload"], ctx["out_root"] / task["sub_dir"],
-                        cancel, task.get("qc_spec"))
+                        generate, task["capability"], task["payload"],
+                        ctx["out_root"] / task["sub_dir"], cancel,
+                        task.get("qc_spec"))
                     futures[future] = task
                     return True
 
@@ -5922,6 +6543,31 @@ class Director:
                         ctx["episode"]["id"], result.cost)
                     critical_error = self._critical_qc_error(result)
                     if critical_error:
+                        # 并行关键帧入口此前漏掉了串行入口已有的自动执行：
+                        # Codex 指令写进报告后直接落 awaiting_human。现在
+                        # 主线程先落实合同修订，再把同一镜头以“三抽全量
+                        # 选优”重新放回 worker 池，无需人工确认。
+                        repair = self._auto_apply_codex_escalation(
+                            ctx, task, result)
+                        if repair:
+                            payload = task.get("payload") or {}
+                            payload["qc_consecutive_failures_base"] = max(
+                                1, int(((getattr(result, "qc", None) or {})
+                                       .get("consecutive_failures") or 1)))
+                            self._plan_mark(
+                                ctx, task["item_id"], "generating",
+                                extra={
+                                    "codex_contract_repair": repair[:300],
+                                    "autonomous_repair": True,
+                                    "candidate_count": 3,
+                                })
+                            retry_future = pool.submit(
+                                self._generate_repair_candidate_group,
+                                task["capability"], task["payload"],
+                                ctx["out_root"] / task["sub_dir"],
+                                cancel, task.get("qc_spec"))
+                            futures[retry_future] = task
+                            continue
                         error = AifosError(critical_error)
                         target = (qc_failures if continue_on_qc_failure
                                   else failures)
@@ -5930,14 +6576,17 @@ class Director:
                             ctx, task, error=critical_error)
                         self._plan_mark(
                             ctx, task["item_id"],
-                            ("awaiting_human"
-                             if continue_on_qc_failure else "failed"),
+                            "failed",
                             error=critical_error[:300],
                             extra=self._plan_done_extra(result))
                         continue
                     self._finish_dispatch_task(ctx, task, result=result)
-                    self._plan_mark(ctx, task["item_id"], "done",
-                                    extra=self._plan_done_extra(result))
+                    self._plan_mark(
+                        ctx, task["item_id"], "done",
+                        extra={
+                            **self._plan_done_extra(result),
+                            "autonomous_repair_seeded": False,
+                        })
                     results[task["tag"]] = result
                 if not cancelled and not failures \
                         and not self._cancel_requested(ctx):
@@ -6829,6 +7478,17 @@ class Director:
             ctx.get("script"), ctx.get("storyboard"), ctx.get("blocking"))
         if report["passed"]:
             return {"issues": [], "repaired": 0}
+        issue_signature = self._stable_hash(report.get("issues") or [])
+        repair_state = (
+            (ctx.get("storyboard") or {}).get(
+                "shootability_repair_state") or {})
+        if repair_state.get("no_progress_signature") == issue_signature:
+            self.log.info(
+                "director",
+                "分镜可拍性问题与上次无进展复检完全相同，"
+                "本轮跳过重复编剧修复调用，继续交由下游门禁处理")
+            return {"issues": report["issues"], "repaired": 0,
+                    "repair_skipped": "unchanged_no_progress"}
         targets = repairable_shots(report)
         self.log.warn(
             "director",
@@ -6887,6 +7547,21 @@ class Director:
         again = preflight_storyboard(
             ctx.get("script"), ctx.get("storyboard"), blocking)
         before, after = len(report["issues"]), len(again["issues"])
+        if after >= before:
+            ctx["storyboard"]["shootability_repair_state"] = {
+                "no_progress_signature": self._stable_hash(
+                    again.get("issues") or []),
+                "issue_count": after,
+                "attempted_shots": [int(value) for value in targets],
+                "updated_at": now(),
+            }
+            self.projects.save_document(
+                ctx["episode"]["id"], "storyboard", ctx["storyboard"])
+        else:
+            if ctx["storyboard"].pop(
+                    "shootability_repair_state", None) is not None:
+                self.projects.save_document(
+                    ctx["episode"]["id"], "storyboard", ctx["storyboard"])
         self.log.info(
             "director",
             f"可拍性复检:问题由 {before} 条降到 {after} 条"
@@ -10044,6 +10719,12 @@ class Director:
             "uri": next((ref.get("uri") for ref in mapped_refs
                          if ref.get("character") == name), ""),
         } for name in shot.get("characters", [])]
+        # Codex may have removed a conflicting prop/blocking reference or
+        # replaced a narrow scene crop after QC.  _shot_payload is rebuilt on
+        # every resume, so replay those resolved same-project edits before the
+        # manifest is numbered; otherwise the old reference silently returns.
+        self._apply_persisted_reference_overrides(
+            ctx, payload, shot)
         # 前置绑定:参考图对照表进提示词——每张图是谁的、参考什么,
         # 出图前就写死,而不是靠事后质检纠错
         self._attach_reference_manifest(payload)
@@ -10458,7 +11139,8 @@ class Director:
         登记正式资产；若其中一张失败，已经通过的图片文件会留在磁盘，
         却没有进入资产中心。断点续跑前先按三重条件恢复：
         render_plan=done/reused、QC 明确通过、约定文件真实存在。失败稿
-        只补 output_uri 并升级为 awaiting_human，绝不登记成正式资产。
+        只补 output_uri 并标记为可自动重试，绝不登记成正式资产，也不再
+        转成要求用户确认的 awaiting_human。
         """
         plan = self._plan_read(ctx)
         by_id = {item.get("id"): item for item in plan.get("items", [])}
@@ -10505,12 +11187,13 @@ class Director:
                 continue
             qc = item.get("qc") or {}
             if qc.get("passed") is False:
-                if item.get("status") != "awaiting_human":
-                    item["status"] = "awaiting_human"
+                if item.get("status") != "failed":
+                    item["status"] = "failed"
                     changed = True
                 attempts = int(qc.get("attempts") or 1)
                 qc.update({
-                    "awaiting_human": True,
+                    "awaiting_human": False,
+                    "autonomous_repair_required": True,
                     "auto_repairs": max(0, attempts - 1),
                     "auto_repair_exhausted": True,
                 })
@@ -10555,17 +11238,24 @@ class Director:
             self.log.info(
                 "director",
                 f"关键帧断点对账:补登记 {recovered} 张已通过图片，"
-                f"保留 {exposed_failures} 张待人工失败稿")
+                f"保留 {exposed_failures} 张失败稿并自动重新排队")
+        # 新产线不再**创建** awaiting_human,但必须**上报**历史遗留的这类
+        # 条目——_stage_images 正是靠这份清单跳过待人工镜头。写死成空
+        # 等于把那道闸门变成死代码,历史待人工的镜头会被静默重跑。
+        awaiting_shots = sorted({
+            int(str(item.get("id", "")).split(":")[1])
+            for item in plan.get("items", [])
+            if item.get("category") == "shot_image"
+            and item.get("status") == "awaiting_human"
+            and str(item.get("id", "")).count(":") == 1
+            and str(item.get("id", "")).split(":")[1].isdigit()
+        })
         return {
             "recovered": recovered,
-            "awaiting_human": exposed_failures,
+            "awaiting_human": len(awaiting_shots),
+            "autonomous_retry": exposed_failures,
             "stale_reset": stale_reset,
-            "awaiting_human_shots": sorted(
-                int(str(item.get("id")).split(":")[1])
-                for item in plan.get("items", [])
-                if item.get("category") == "shot_image"
-                and item.get("status") == "awaiting_human"
-                and str(item.get("id") or "").startswith("shot:")),
+            "awaiting_human_shots": awaiting_shots,
         }
 
     def _preflight_plan_incomplete(self, ctx):
@@ -10669,9 +11359,21 @@ class Director:
         return written
 
     def _stage_images(self, ctx):
+        # Capture failure/QC evidence before _plan_seed_shots refreshes items.
+        # A repaired storyboard changes content_hash by design; seeding may
+        # reset the current item to pending, but the Codex diagnosis from the
+        # failed input is still exactly what must be applied to that repaired
+        # payload.  Reading after seed silently discarded those instructions.
+        prior_plan = {
+            item.get("id"): copy.deepcopy(item)
+            for item in self._plan_read(ctx).get("items", [])
+        }
         self._plan_seed_shots(ctx)
         self._distill_lessons(ctx)
         reconciliation = self.reconcile_completed_shot_images(ctx)
+        # 断点里已经有 Codex 最终修改指令的旧失败镜头，不能重新从首图
+        # 开始、更不能继续等人工。先把指令落实到当前分镜合同，随后直接
+        # 进入同一新版提示词的三候选全量抽卡。
         # 生产画布:出图一开始就落盘人物/场景/镜头关系线,
         # 前端画布与出图/质检提示词共用,牵引人物关联性不漂移
         ctx["relations"] = write_relations(
@@ -10689,10 +11391,9 @@ class Director:
                 "场次暂不生成: 第"
                 + "、".join(str(v) for v in sorted(skipped_scenes))
                 + "场;本批只推进其余场次,恢复后断点续写自动补齐")
-        # 人工门禁持久化:awaiting_human 是「停下来等人裁决」的显式检查
-        # 点。旧逻辑只看资产存在性,失败稿没登记资产→重启后整批自动
-        # 重派,门禁形同虚设还重复烧额度。人工放行的出口不变:人工通过
-        # (状态转 done)或点重画(状态转 generating→done)后自然回流。
+        # 兼容读取历史 awaiting_human；新产线不会再创建这类用户确认点。
+        # 旧失败项由断点对账改成 failed 并自动重排，只有无法迁移的历史
+        # 数据才会进入这个集合。
         awaiting_shots = set(
             reconciliation.get("awaiting_human_shots") or [])
         skipped_awaiting = []
@@ -10725,14 +11426,62 @@ class Director:
                         ctx, f"shot:{shot['shot_no']}", "reused",
                         only_pending=True)
                     continue
-            quality_by_shot[shot["shot_no"]] = payload["quality_decision"]
-            tasks.append({
+            task = {
                 "item_id": f"shot:{shot['shot_no']}",
                 "capability": "image",
                 "payload": payload,
                 "sub_dir": "images", "tag": shot["shot_no"],
                 "priority": self._shot_priority(shot, scene_first),
-                "qc_spec": self._shot_qc_spec(ctx, payload)})
+                "qc_spec": self._shot_qc_spec(ctx, payload)}
+            stored = prior_plan.get(task["item_id"]) or {}
+            stored_qc = stored.get("qc") or {}
+            stored_escalation = stored_qc.get("codex_escalation") or {}
+            repair_meta = shot.get("prompt_block_repair") or {}
+            stale_reset = stored.get("stale_reset") or {}
+            resumed_repair_group = bool(
+                stored.get("autonomous_repair_seeded")
+                or (
+                    stored.get("status") in ("failed", "pending")
+                    and "Codex 升级分析" in str(
+                        repair_meta.get("blocking_reason") or ""))
+                or (
+                    stale_reset.get("previous_status")
+                    in ("generating", "retrying")
+                    and bool(stored.get("output_uri"))))
+            if resumed_repair_group:
+                task["payload"]["_autonomous_repair_seeded"] = True
+                try:
+                    failure_base = int(
+                        stored_qc.get("consecutive_failures") or 1)
+                except (TypeError, ValueError):
+                    failure_base = 1
+                task["payload"]["qc_consecutive_failures_base"] = max(
+                    1, failure_base)
+            if (stored_qc.get("passed") is False
+                    and stored_escalation.get("status") == "completed"):
+                repair = self._auto_apply_codex_escalation(
+                    ctx, task, SimpleNamespace(qc=stored_qc))
+                if repair:
+                    task["payload"]["_autonomous_repair_seeded"] = True
+                    try:
+                        failure_base = int(
+                            stored_qc.get("consecutive_failures") or 1)
+                    except (TypeError, ValueError):
+                        failure_base = 1
+                    task["payload"]["qc_consecutive_failures_base"] = max(
+                        1, failure_base)
+                    self.log.info(
+                        "director",
+                        f"{task['item_id']} 已承接断点中的 Codex 修改指令，"
+                        "本轮直接生成3张候选并全部质检选优")
+            elif resumed_repair_group:
+                self.log.info(
+                    "director",
+                    f"{task['item_id']} 上一轮三候选因产线中断未完成，"
+                    "已从修订合同断点恢复并继续固定3张全量选优")
+            payload = task["payload"]
+            quality_by_shot[shot["shot_no"]] = payload["quality_decision"]
+            tasks.append(task)
         results, qc_failures = self._run_parallel(
             ctx, tasks, line="分镜画面",
             continue_on_qc_failure=True)
@@ -10749,13 +11498,10 @@ class Director:
                 "image_quality": quality["level"]})
         ctx["images"].sort(key=lambda i: i["shot_no"])
         if skipped_awaiting and not qc_failures:
-            # 本批新任务全部完成,但仍有历史失败稿停在人工检查点——
-            # 必须以同一出口停下,不能带着缺图静默流入首尾帧/视频阶段。
+            # 无法迁移的历史检查点仍不得带着缺图流入首尾帧/视频阶段。
             raise AifosError(
-                f"{len(skipped_awaiting)} 张关键帧仍停在人工检查点"
-                "(上轮质检失败/审核熔断,本轮已按人工门禁跳过重画)。"
-                "请在问题清单里逐张处理(人工通过或按意见重画)后,"
-                "从断点继续。待处理镜头: "
+                f"{len(skipped_awaiting)} 张历史关键帧状态无法自动迁移，"
+                "已停止进入下游；需要由 AIFOS 自动修复器重建状态。镜头: "
                 + "、".join(str(value) for value in skipped_awaiting))
         if qc_failures:
             failed_shots = sorted(
@@ -10763,18 +11509,18 @@ class Director:
             self.log.warn(
                 "director",
                 f"关键帧本批已完成其余 {len(results)} 张；"
-                f"{len(failed_shots)} 张仍未通过(二次质检失败或提示词"
-                "审核熔断)，已隔离到待人工问题清单: "
+                f"{len(failed_shots)} 张仍未通过(修订组三抽失败或提示词"
+                "审核熔断)，已隔离为自动修复失败项: "
                 + "、".join(f"镜头{value}" for value in failed_shots))
             raise AifosError(
                 f"{len(failed_shots)} 张关键帧经自动修复后仍未通过"
                 "(视觉质检失败或提示词审核熔断)；"
-                "问题项已列入待人工问题清单，其他关键帧已继续完成。"
-                "请点击问题项查看原因并手动修改后，从断点继续。"
+                "失败稿及 Codex 诊断已保留，其他关键帧已继续完成；"
+                "下一断点由 AIFOS 自动重建合同后继续，不要求用户确认。"
                 "问题镜头: "
                 + "、".join(str(value) for value in failed_shots)
                 + (
-                    "；另有历史待人工镜头(本轮按人工门禁未自动重画): "
+                    "；另有无法自动迁移的历史镜头: "
                     + "、".join(str(value) for value in skipped_awaiting)
                     if skipped_awaiting else ""))
         return {
@@ -14116,7 +14862,7 @@ class Director:
             if plan_diagnostics.get("diagnosis_complete"):
                 reference_changes = self._apply_image_reference_adjustments(
                     payload, {"_project_id": project["id"]},
-                    plan_diagnostics)
+                    plan_diagnostics, instruction=codex_instruction)
                 if reference_changes["applied"]:
                     payload["qc_reference_changes"] = reference_changes
                     self._attach_reference_manifest(payload)
@@ -14227,7 +14973,7 @@ class Director:
             if plan_diagnostics.get("diagnosis_complete"):
                 reference_changes = self._apply_image_reference_adjustments(
                     payload, {"_project_id": project["id"]},
-                    plan_diagnostics)
+                    plan_diagnostics, instruction=codex_instruction)
                 if reference_changes["applied"]:
                     payload["qc_reference_changes"] = reference_changes
             label = "首帧" if kind == "first_frame" else "尾帧"
@@ -14346,7 +15092,7 @@ class Director:
             if plan_diagnostics.get("diagnosis_complete"):
                 reference_changes = self._apply_image_reference_adjustments(
                     frames_payload, {"_project_id": project["id"]},
-                    plan_diagnostics)
+                    plan_diagnostics, instruction=codex_instruction)
                 if reference_changes["applied"]:
                     frames_payload["qc_reference_changes"] = (
                         reference_changes)

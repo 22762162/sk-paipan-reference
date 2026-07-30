@@ -642,6 +642,43 @@ def test_v21_vague_functional_figure_count_fails_before_generation():
             for issue in report["issues"])
 
 
+def test_v22_exact_visible_count_overrides_vague_population_heuristic():
+    shot = _shot()
+    shot["visible_figure_count"] = 2
+    shot["description"] += "；禁止出现一群围观者"
+    shot["frame_targets"] = {
+        "keyframe": {
+            "phase": "freeze",
+            "state": "林晚与白芷严格共2人，手机停在两人之间",
+            "fallback": False,
+        },
+    }
+
+    contract, _ = compile_shot_prompt(shot, mode="image")
+    report = validate_shot_prompt_contract(contract)
+
+    assert report["passed"] is True
+    assert contract["subject"]["visible_count"] == 2
+
+
+def test_v22_vague_population_without_exact_count_still_fails():
+    shot = _shot()
+    shot["description"] += "；门外另有一群围观者"
+    shot["frame_targets"] = {
+        "keyframe": {
+            "phase": "freeze",
+            "state": "林晚与白芷停在手机两侧",
+            "fallback": False,
+        },
+    }
+
+    contract, _ = compile_shot_prompt(shot, mode="image")
+    report = validate_shot_prompt_contract(contract)
+
+    assert report["passed"] is False
+    assert any("模糊人数" in issue for issue in report["issues"])
+
+
 def test_v21_functional_sum_must_match_visible_figure_count():
     shot = _lin_chuan_witness_shot()
     shot["visible_figure_count"] = 6

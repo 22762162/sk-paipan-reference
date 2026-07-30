@@ -60,7 +60,8 @@ class App:
         self.data = DataCenter(self.db)
         self.firefire = FireFireCenter(
             self.db, self.workspace.artifacts_dir, standards=self.standards)
-        self.router = ProviderRouter(self.config, self.db, self.logger)
+        self.router = ProviderRouter(self.config, self.db, self.logger,
+                                     knowledge=self.firefire.knowledge)
         self.qc = QcCenter(self.config)
         self.ops = OpsCenter(self.router)
         self.director = Director(

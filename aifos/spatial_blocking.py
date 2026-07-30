@@ -16,6 +16,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from .director_camera import solve_camera
+
 
 SCHEMA = "aifos.spatial-blocking/v3"
 DIALOGUE_SCHEMA = "aifos.dialogue-continuity/v1"
@@ -23,6 +25,7 @@ WIDTH, HEIGHT = 1000, 700
 WORLD_WIDTH_M, WORLD_DEPTH_M = 10.0, 7.0
 DEFAULT_ACTOR_HEIGHT_M = 1.68
 DEFAULT_CAMERA_HEIGHT_M = 1.55
+MAX_SOLVED_CAMERA_HEIGHT_M = 4.6
 MIN_ACTOR_SEPARATION = 72
 MIN_CAMERA_SEPARATION = 90
 ACTOR_COLORS = (
@@ -586,10 +589,19 @@ def _attach_camera_3d(
         start_target_height=1.25, end_target_height=1.25):
     position = str(camera.get("position") or "")
     movement = str(camera.get("movement") or "")
-    start = _world_point(
-        camera["start"], _camera_height(position, movement, "start"))
-    end = _world_point(
-        camera["end"], _camera_height(position, movement, "end"))
+    # 调度器解出的镜高是按「角度」维度算的(俯拍抬高、仰拍压低);
+    # 旧启发式只读机位/运动,读不到角度,镜高因此恒为默认值。
+    solved_h = camera.get("director_height_m")
+    start_h = (float(solved_h) if solved_h is not None
+               else _camera_height(position, movement, "start"))
+    end_h = (float(solved_h) if solved_h is not None
+             else _camera_height(position, movement, "end"))
+    if solved_h is not None and "升" in movement:
+        end_h = min(MAX_SOLVED_CAMERA_HEIGHT_M, start_h + 1.2)
+    elif solved_h is not None and "降" in movement:
+        end_h = max(.35, start_h - .9)
+    start = _world_point(camera["start"], start_h)
+    end = _world_point(camera["end"], end_h)
     target_start = _world_point(start_target, start_target_height)
     target_end = _world_point(end_target, end_target_height)
     horizontal_fov = float(camera.get("fov_degrees") or 39.6)
@@ -612,6 +624,54 @@ def _attach_camera_3d(
         "vertical_fov_degrees": round(vertical_fov, 1),
         "frustum": {"near_m": .1, "far_m": 18.0, "aspect_ratio": "9:16"},
     })
+    return camera
+
+
+def _canvas_from_world(world_point):
+    """世界坐标(米) → 二维画布坐标。_world_point 的逆,让示意图与三维同源。"""
+    try:
+        wx = float(world_point.get("x", 0.0))
+        wz = float(world_point.get("z", 0.0))
+    except (TypeError, ValueError):
+        return _point(WIDTH / 2, HEIGHT / 2)
+    return _point(
+        WIDTH / 2 + wx / WORLD_WIDTH_M * (WIDTH - 180),
+        HEIGHT / 2 + wz / WORLD_DEPTH_M * (HEIGHT - 230))
+
+
+def _apply_director_camera(camera, shot, positions, world=None):
+    """用导演调度器求出的三维机位覆盖画布副产品(三维为权威)。
+
+    此前机位是画布(500,625)固定点朝主体拉出来的:方位是「画布点→主体」
+    连线的方向(主体一动方位就变,不是导演选择),镜高只读机位/运动两个
+    字段(俯拍写在「角度」里永远读不到),距离在像素里校正、换算成三维后
+    不守恒——EP1 实测八镜只有 2 镜吻合声明景别,镜高恒定 1.55m,
+    方位逐镜乱跳 134°→168°→-93°→15°。
+    """
+    solved = solve_camera(
+        shot, positions, axis_side=1, scene_center=(0.0, 0.0),
+        world=world if isinstance(world, dict) else {})
+    if not solved:
+        return camera
+    canvas = _canvas_from_world(solved["position_3d"])
+    moving = bool(camera.get("moving"))
+    delta = {"x": camera["end"]["x"] - camera["start"]["x"],
+             "y": camera["end"]["y"] - camera["start"]["y"]} if moving else None
+    camera["start"] = canvas
+    camera["end"] = (_point(canvas["x"] + delta["x"], canvas["y"] + delta["y"])
+                     if delta else dict(canvas))
+    camera["director_camera"] = {
+        "distance_m": solved["distance_m"],
+        "desired_distance_m": solved["desired_distance_m"],
+        "height_m": solved["height_m"],
+        "yaw_deg": solved["yaw_deg"],
+        "pitch_deg": solved["pitch_deg"],
+        "declared": solved["declared"],
+        "wall_clamped": solved["wall_clamped"],
+    }
+    camera["scale_distance_m"] = solved["desired_distance_m"]
+    camera["scale_for_distance"] = solved["declared"]["shot_size"]
+    camera["director_height_m"] = solved["height_m"]
     return camera
 
 
@@ -887,10 +947,14 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
             # 先避让人物标记(防图标压住人物),再按声明景别定距——
             # 顺序反了的话避让会把机位弹到画布边缘的固定环上,
             # 距离校正被整个抹掉(实测:声明特写仍在 4~5 米外)。
-            camera_2d = _scale_camera_distance(
-                _clear_camera_icons(
-                    _camera_block(shot, target), actor_markers),
-                target, shot)
+            camera_2d = _apply_director_camera(
+                _scale_camera_distance(
+                    _clear_camera_icons(
+                        _camera_block(shot, target), actor_markers),
+                    target, shot),
+                shot, positions,
+                {"floor_width_m": WORLD_WIDTH_M,
+                 "floor_depth_m": WORLD_DEPTH_M})
             dialogue_continuity = _dialogue_contract(
                 shot, positions, camera_2d, dialogue_memory, scene_no)
             camera = _attach_camera_3d(
