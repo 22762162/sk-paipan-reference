@@ -177,6 +177,9 @@ PREMODERN_CHINESE_ERA_TOKENS = (
     "明初", "明代", "大明", "洪武", "永乐", "古代", "县衙", "驿馆",
     "官舍", "公堂",
 )
+# 明确数字人数(严格共7人/共4名/3位…):存在即消除模糊词的歧义
+_EXPLICIT_COUNT_RE = re.compile(
+    r"(?:严格)?共?\s*\d+\s*[人名位](?!\d)")
 VAGUE_POPULATION_TOKENS = (
     "几名", "数名", "多名", "若干名", "一群", "人群", "众人", "一众",
     "多人", "几人", "数人", "若干人", "成群", "大批人",
@@ -189,6 +192,7 @@ STATIC_PROCESS_PATTERNS = (
     r"(?:走|跑|起身|坐起|拿起|打开|转身|换装|摘下|戴上)",
     r"→",
 )
+_HISTORY_MARKER_RE = re.compile(r"已经|已从|先前|此前|早已|业已")
 CORPSE_TOKENS = ("尸体", "尸身", "遗体", "尸骸", "死者", "尸首")
 REFERENCE_ROLE_ALIASES = {
     "identity": "identity",
@@ -2223,8 +2227,14 @@ def build_shot_prompt_contract(
         (shot.get("shot_contract") or {}).get("构图")
         if isinstance(shot.get("shot_contract"), dict) else "",
     ) if _text(value))
-    if (functional_count == 0 and any(
-            token in population_text for token in VAGUE_POPULATION_TOKENS)):
+    # 上诉庭固化(12次误杀里9次是本条):文本里已有明确数字人数
+    # (「严格共7人」「4名弓兵」)时,模糊词只是修辞,歧义已被消除;
+    # 只有全镜找不到任何明确数量时才判败。
+    if (functional_count == 0
+            and declared_visible is None
+            and not _EXPLICIT_COUNT_RE.search(population_text)
+            and any(token in population_text
+                    for token in VAGUE_POPULATION_TOKENS)):
         population_issues.append(
             "镜头使用了几名/数名/多名/一群等模糊人数，但未声明"
             " functional_figures 的明确 count")
@@ -3687,7 +3697,12 @@ def validate_shot_prompt_contract(contract):
                 issues.append("静态图 frame_target 缺少唯一可见定格状态")
             elif any(
                     re.search(pattern, target_state)
-                    for pattern in STATIC_PROCESS_PATTERNS):
+                    for pattern in STATIC_PROCESS_PATTERNS) and not (
+                    _HISTORY_MARKER_RE.search(target_state)
+                    and not re.search(r"→", target_state)):
+                # 上诉庭固化:「已经从昏迷中醒来」是交代历史、终态唯一,
+                # 不是要求同帧画出两个阶段;带已/已经/先前/此前标记且
+                # 无显式箭头轨迹的,放行。
                 issues.append(
                     "静态图 frame_target 同时描述多个时间状态或动作过程；"
                     "必须改写为单一可见定格结果")

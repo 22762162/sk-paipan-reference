@@ -283,3 +283,56 @@ def test_explicit_reference_scope_overrides_role_defaults():
         assert not overlap, (ref.get("index"), sorted(overlap))
     third = next(r for r in contract["references"] if r["index"] == 3)
     assert "wardrobe" in (third["inherit_scope"]["exclude"] or [])
+
+
+def test_vague_population_disarmed_by_explicit_counts():
+    """上诉庭固化(12次误杀中9次):文本已有明确数字人数时,
+    「一群/众人」只是修辞,不再判「模糊人数」。"""
+    from aifos.prompt_contract import compile_shot_prompt
+    base = {"shot_no": 1, "scene_no": 1, "kind": "environment",
+            "duration": 3, "characters": ["林川"], "dialogue": None,
+            "prompt": "p", "camera": "全景",
+            "frame_target": {"phase": "end", "state": "队列静立",
+                             "fallback": False, "explicit": True,
+                             "fallback_declared": True}}
+    # 有明确数字 → 不判
+    c1, _ = compile_shot_prompt(
+        {**base, "description": "画面严格共5人,一群巡检弓兵列于身后"},
+        location="驿道", style="写实", mode="image")
+    assert not [i for i in (c1.get("population") or {}).get("issues", [])
+                if "模糊人数" in i]
+    # 无任何明确数量 → 照判
+    c2, _ = compile_shot_prompt(
+        {**base, "description": "一群百姓围观"},
+        location="驿道", style="写实", mode="image")
+    assert [i for i in (c2.get("population") or {}).get("issues", [])
+            if "模糊人数" in i]
+
+
+def test_history_narration_is_not_a_process_violation():
+    """上诉庭固化:「已经从昏迷中醒来」是交代历史、终态唯一,
+    不是要求同帧画两个阶段。"""
+    from aifos.prompt_contract import validate_shot_prompt_contract, \
+        compile_shot_prompt
+    base = {"shot_no": 1, "scene_no": 1, "kind": "dialogue",
+            "duration": 3, "characters": ["林川"], "dialogue": None,
+            "prompt": "p", "camera": "近景"}
+    ok, _ = compile_shot_prompt(
+        {**base, "frame_target": {
+            "phase": "end", "state": "林川已经从昏迷中醒来,坐靠柱脚",
+            "fallback": False, "explicit": True,
+            "fallback_declared": True}},
+        location="废茶棚", style="写实", mode="image")
+    report = validate_shot_prompt_contract(ok)
+    assert not [i for i in report.get("issues", [])
+                if "多个时间状态" in i], report["issues"]
+    # 真过程(显式轨迹箭头)仍要拦
+    bad, _ = compile_shot_prompt(
+        {**base, "frame_target": {
+            "phase": "end", "state": "林川 起身→行至门边→推门",
+            "fallback": False, "explicit": True,
+            "fallback_declared": True}},
+        location="废茶棚", style="写实", mode="image")
+    report2 = validate_shot_prompt_contract(bad)
+    assert [i for i in report2.get("issues", [])
+            if "多个时间状态" in i]
