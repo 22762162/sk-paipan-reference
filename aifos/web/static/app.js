@@ -243,7 +243,9 @@ function route() {
   const history = location.hash.match(/^#\/history(?:\/(\d+))?$/);
   const promptReview = location.hash.match(
     /^#\/episode\/(\d+)\/prompts$/);
-  const m = location.hash.match(/^#\/episode\/(\d+)$/);
+  // /board 与 /canvas 子路由:生产进行中也能进完整剧集页看分镜表和画布。
+  // 默认仍进生产直播页,只有用户显式点入口才切过去。
+  const m = location.hash.match(/^#\/episode\/(\d+)(?:\/(board|canvas))?$/);
   const settings = location.hash === "#/settings";
   const assets = location.hash === "#/assets";
   const area = standards ? "standards" : history ? "history"
@@ -257,7 +259,7 @@ function route() {
   if (standards) renderStandards(standards[1] || "production");
   else if (history) renderHistory(history[1] ? Number(history[1]) : null);
   else if (promptReview) renderPromptReviewPage(Number(promptReview[1]));
-  else if (m) renderCanvasView(Number(m[1]));
+  else if (m) renderCanvasView(Number(m[1]), m[2] || "");
   else if (settings) renderSettings();
   else if (assets) renderAssetsCenter();
   else renderDashboard();
@@ -9799,7 +9801,7 @@ async function renderPromptReviewPage(episodeId) {
   statusFilter.onchange = applyFilters;
 }
 
-async function renderCanvasView(episodeId) {
+async function renderCanvasView(episodeId, forceView = "") {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   let data;
   try { data = await api(`/api/episode/${episodeId}`); }
@@ -9826,7 +9828,9 @@ async function renderCanvasView(episodeId) {
   const stable = ["done", "failed", "qc_failed", "created",
     "awaiting_script", "awaiting_cast", "awaiting_confirm", "queued_script",
     "paused"];
-  if (!stable.includes(ep.status)) {
+  // forceView 是用户从实况/恢复视图显式点进来的:生产中也要能看分镜表和
+  // 画布。缺分镜时仍然回落到原有分流,不能给一个空壳页面。
+  if (!stable.includes(ep.status) && !(forceView && sb)) {
     renderProductionView(data, episodeId);
     return;
   }
@@ -10112,7 +10116,11 @@ async function renderCanvasView(episodeId) {
   };
   btnTheater.onclick = () => setView("theater");
   btnCanvas.onclick = () => setView("canvas");
-  setView(localStorage.getItem("aifos.view") || "theater");
+  // 从实况/恢复视图点「分镜表」「画布」进来时按子路由定视图,
+  // 否则沿用上次记忆。
+  setView(forceView === "canvas" ? "canvas"
+    : forceView === "board" ? "theater"
+      : (localStorage.getItem("aifos.view") || "theater"));
   bindEpisodeWorkspaceNav(app, data, episodeId, setView);
 }
 
@@ -10255,6 +10263,12 @@ function renderProductionView(data, episodeId) {
         title="查看每张图片的状态、提示词和参考图">🖼 图片清单</button>
       <button id="jump-prod-canvas"
         title="导演工作台:泳道×镜头图卡,点资产看引用,点卡直接重画">🎬 生产画布</button>
+      <button id="btn-board-live"
+        title="逐镜看五维分镜、机位与状态,生产中同样可查">📋 分镜表</button>
+      <button id="btn-canvas-live"
+        title="自由画布:镜头卡片与连线,生产中同样可查">🗺 画布</button>
+      <button id="btn-blocking-live"
+        title="人物走位、镜头位置、视锥和轴线">🧊 3D 空间调度</button>
       <button id="btn-stop" class="stop-btn big" ${stopping ? "disabled" : ""}
         title="暂停生成:已完成的图片全部保留,可从断点继续">${stopping ? "暂停中…" : "⏸ 暂停生成"}</button>
     </div>
@@ -10304,6 +10318,13 @@ function renderProductionView(data, episodeId) {
     location.hash = `#/episode/${episodeId}/prompts`;
   };
   document.getElementById("btn-plan-live").onclick = () => showPlanOverlay(episodeId);
+  // 生产中也能进完整视图:子路由绕过「制作进行中一律进直播页」的分流
+  document.getElementById("btn-board-live")?.addEventListener(
+    "click", () => { location.hash = `#/episode/${episodeId}/board`; });
+  document.getElementById("btn-canvas-live")?.addEventListener(
+    "click", () => { location.hash = `#/episode/${episodeId}/canvas`; });
+  document.getElementById("btn-blocking-live")?.addEventListener(
+    "click", () => showBlockingOverlay(episodeId));
   bindImageAccelerationLivebar(episodeId);
   bindProductionLedger(app, data, episodeId);
   document.getElementById("btn-stop").onclick = (ev) => {
@@ -10891,6 +10912,12 @@ function renderRecoveryView(data, episodeId) {
       ${hasScript ? `<button id="btn-script2">📖 看剧本</button>` : ""}
       <button id="btn-rewrite-script">✏️ 按意见重写剧本</button>
       <button id="btn-plan2">🖼 图片清单</button>
+      <button id="btn-board-recovery"
+        title="逐镜看五维分镜、机位与状态">📋 分镜表</button>
+      <button id="btn-canvas-recovery"
+        title="自由画布:镜头卡片与连线">🗺 画布</button>
+      <button id="btn-blocking-recovery"
+        title="人物走位、镜头位置、视锥和轴线">🧊 3D 空间调度</button>
       <button id="btn-rebuild-all-recovery" class="danger"
         title="推翻原有设定,清理本轮复用并从头重新生成图片、首尾帧和视频">⚠ 全部重新生成</button>
     </div>
@@ -10905,6 +10932,13 @@ function renderRecoveryView(data, episodeId) {
     showScriptOverlay(data, episodeId));
   document.getElementById("btn-plan2").onclick = () =>
     showPlanOverlay(episodeId);
+  // 恢复视图同样给出完整视图入口:断点等待时也要能查分镜与空间
+  document.getElementById("btn-board-recovery")?.addEventListener(
+    "click", () => { location.hash = `#/episode/${episodeId}/board`; });
+  document.getElementById("btn-canvas-recovery")?.addEventListener(
+    "click", () => { location.hash = `#/episode/${episodeId}/canvas`; });
+  document.getElementById("btn-blocking-recovery")?.addEventListener(
+    "click", () => showBlockingOverlay(episodeId));
   document.getElementById("btn-rewrite-script").onclick = () =>
     rewriteScriptWithFeedback(data, episodeId);
   document.getElementById("btn-rebuild-all-recovery").onclick = (ev) =>
