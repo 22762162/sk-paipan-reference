@@ -6183,6 +6183,16 @@ function _pcApplyTransform() {
   }, { passive: false });
 })();
 
+/* 直达生产画布:面板藏在长页深处,不定位用户根本发现不了 */
+document.addEventListener("click", (ev) => {
+  if (!ev.target.closest?.("#jump-prod-canvas")) return;
+  const panel = document.querySelector(".pc-panel");
+  if (!panel) { showToast("生产画布在分镜生成后出现", "ok"); return; }
+  panel.scrollIntoView({ block: "start", behavior: "smooth" });
+  panel.classList.remove("pc-flash");
+  requestAnimationFrame(() => panel.classList.add("pc-flash"));
+});
+
 /* 工具条 + 资产高亮 + 镜头卡浮层(全部事件委托,重绘不丢绑定) */
 document.addEventListener("click", async (ev) => {
   const layerBtn = ev.target.closest?.(".pc-layer");
@@ -6357,7 +6367,6 @@ function renderPlanBoardHtml(data) {
     </div>
     ${mockWarnHtml(data)}
     ${lessonsPanelHtml(data)}
-    ${relationCanvasHtml(data)}
     ${cats.map((cat) => {
       const list = items.filter((i) => i.category === cat);
       const ok = list.filter(
@@ -9937,6 +9946,7 @@ async function renderCanvasView(episodeId) {
         <button id="view-theater">📋 分镜表</button>
         <button id="view-canvas">🗺 画布</button>
       </div>
+      <button id="jump-prod-canvas" title="导演工作台:泳道×镜头图卡,点资产看引用,点卡直接重画">🎬 生产画布</button>
       <button id="btn-prompts" class="prompt-review-launch"
         title="逐镜审核关键帧、首尾帧与 Seedance 2 提示词">⌘ 提示词区</button>
       ${primaryMode === "play"
@@ -10243,6 +10253,8 @@ function renderProductionView(data, episodeId) {
         title="逐镜审核当前标准提示词与阻断项">⌘ 提示词区</button>
       <button id="btn-plan-live"
         title="查看每张图片的状态、提示词和参考图">🖼 图片清单</button>
+      <button id="jump-prod-canvas"
+        title="导演工作台:泳道×镜头图卡,点资产看引用,点卡直接重画">🎬 生产画布</button>
       <button id="btn-stop" class="stop-btn big" ${stopping ? "disabled" : ""}
         title="暂停生成:已完成的图片全部保留,可从断点继续">${stopping ? "暂停中…" : "⏸ 暂停生成"}</button>
     </div>
@@ -10271,6 +10283,7 @@ function renderProductionView(data, episodeId) {
       <div class="produce-main">
         ${productionLedgerHtml(data, { context: "live" })}
         ${imageAccelerationLivebarHtml(data)}
+        ${relationCanvasHtml(data)}
         ${data.storyboard ? `${shotProductionTableHtml(data, {
           shotIssues: storyboardShotIssues(data), context: "live" })}
           <details class="asset-production-details">
@@ -11348,6 +11361,7 @@ function renderTheater(data, canvas) {
         </figure>`).join("")}
     </div>` : ""}
     ${productionLedgerHtml(data, { context: "review" })}
+    ${relationCanvasHtml(data)}
     ${shotProductionTableHtml(data, {
       shotIssues: canvas.shotIssues, context: "review" })}`;
 

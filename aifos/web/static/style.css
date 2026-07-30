@@ -5014,3 +5014,10 @@ textarea:focus-visible, select:focus-visible {
   .pc-shot-body { grid-template-columns: 1fr; }
   .pc-viewport { height: 58vh; }
 }
+#jump-prod-canvas { border-color: var(--accent); color: var(--accent); }
+.pc-flash { animation: pc-flash 1.6s ease-out 1; }
+@keyframes pc-flash {
+  0%, 45% { box-shadow: 0 0 0 4px var(--accent-soft),
+    0 0 34px rgba(57,135,229,.55); }
+  100% { box-shadow: none; }
+}
