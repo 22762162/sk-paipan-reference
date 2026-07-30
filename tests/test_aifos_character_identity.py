@@ -85,6 +85,173 @@ def test_role_based_candidates_pause_before_downstream_images(app):
     assert app.assets.list(project["id"], "scene_art") == []
 
 
+def test_aifos_visual_qc_auto_selects_best_candidate(
+        app, tmp_path, monkeypatch):
+    project, _ = app.projects.get_or_create_project("自动候选选优")
+    episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+    character = {
+        "name": "顾明昭", "role": "主角", "gender": "女",
+        "age_range": "27岁", "image_prompt": "晚明女官，单人全身正面",
+    }
+    script = {
+        "characters": [character],
+        "core_props": [],
+        "scenes": [],
+    }
+    design = {
+        "gender": "女", "age_range": "27岁",
+        "costume": "晚明烟墨色窄袖长衫",
+        "hair": "乌黑低圆髻", "appearance": "偏方鹅卵脸",
+    }
+    for index in range(1, 5):
+        uri = tmp_path / f"candidate-{index}.png"
+        uri.write_bytes(b"\x89PNG\r\n\x1a\n" + bytes([index]) * 32)
+        app.assets.register(
+            project["id"], "character_candidate",
+            f"顾明昭:{index:02d}", uri=str(uri),
+            meta={
+                "character": "顾明昭", "role": "主角",
+                "candidate_index": index,
+                "candidate_prompt_schema":
+                    CHARACTER_CANDIDATE_PROMPT_SCHEMA,
+                "variant_id": f"sample-{index}",
+                "variant_label": f"候选{index}",
+                "variant_source": "initial_state_same_prompt",
+                "look_variant": {
+                    "hair": "乌黑低圆髻", "makeup": "淡妆",
+                    "costume": "晚明烟墨色窄袖长衫",
+                    "temperament": "克制",
+                },
+                "prompt": "晚明女官，单人全身正面，纯净背景",
+                "image_quality": "high",
+            })
+
+    def qc_call(capability, payload, out_dir, cancel=None):
+        assert capability == "image_qc"
+        index = int(Path(payload["image_uri"]).stem.rsplit("-", 1)[1])
+        passed = index == 3
+        return ProviderResult(
+            provider="codex", cost=0.01,
+            data={
+                "pass": passed,
+                "visual_pass": passed,
+                "input_contract_pass": True,
+                "identity_checked": True,
+                "identity_match": True,
+                "gender_checked": True,
+                "gender_match": True,
+                "wardrobe_checked": True,
+                "wardrobe_match": True,
+                "count_checked": True,
+                "count_match": True,
+                "overlay_count_checked": True,
+                "overlay_count_match": True,
+                "physical_logic_checked": True,
+                "physical_logic_match": True,
+                "spatial_logic_checked": True,
+                "spatial_logic_match": True,
+                "detected_count": 1,
+                "detected_overlay_count": 0,
+                "issues": [] if passed else ["整体完成度低于候选3"],
+            })
+
+    monkeypatch.setattr(app.router, "call", qc_call)
+    out_root = tmp_path / "episode"
+    out_root.mkdir()
+    ctx = {
+        "project": dict(project), "episode": dict(episode),
+        "script": script, "out_root": out_root,
+        "fresh_assets": True, "run_id": 77,
+    }
+    app.director._task_cost = 0.0
+    app.director._task_providers = set()
+    status = app.director._auto_select_asset_candidates(
+        ctx, [character], {"顾明昭": design}, [])
+
+    identity = app.assets.latest(
+        project["id"], "character_identity", "顾明昭")
+    meta = app.assets.meta(identity)
+    assert status["passed"] is True
+    assert meta["candidate_index"] == 3
+    assert meta["auto_selected"] is True
+    assert meta["selection_method"] == "aifos_visual_qc_rank"
+    assert meta["selection_qc_passed"] is True
+    assert meta["fresh_run_id"] == 77
+
+
+def test_fresh_assets_regenerates_all_candidates_without_old_references(
+        app, tmp_path, monkeypatch):
+    project, _ = app.projects.get_or_create_project("全新资产隔离")
+    episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+    character = {
+        "name": "沈砚舟", "role": "主角", "gender": "男",
+        "age_range": "24岁", "image_prompt": "晚明青年文官",
+    }
+    design = {
+        "gender": "男", "age_range": "24岁",
+        "costume": "晚明靛青直裰", "hair": "束发",
+    }
+    old = tmp_path / "old.png"
+    old.write_bytes(b"\x89PNG\r\n\x1a\nold")
+    for index in range(1, 5):
+        app.assets.register(
+            project["id"], "character_candidate",
+            f"沈砚舟:{index:02d}", uri=str(old),
+            meta={
+                "character": "沈砚舟", "candidate_index": index,
+                "candidate_prompt_schema":
+                    CHARACTER_CANDIDATE_PROMPT_SCHEMA,
+                "variant_label": f"旧候选{index}",
+                "look_variant": dict(design),
+                "prompt": "旧提示词", "image_quality": "high",
+            })
+    app.assets.register(
+        project["id"], "character_identity", "沈砚舟", uri=str(old),
+        meta={"character": "沈砚舟", "locked": True,
+              "image_quality": "high"})
+
+    captured = []
+
+    def fake_parallel(ctx, tasks, line="", **kwargs):
+        captured.extend(tasks)
+        results = {}
+        for task in tasks:
+            fresh = tmp_path / f"fresh-{task['tag'][1]}.png"
+            fresh.write_bytes(
+                b"\x89PNG\r\n\x1a\n" + bytes([task["tag"][1]]) * 32)
+            results[task["tag"]] = ProviderResult(
+                provider="image_api", cost=1.0, uri=str(fresh), data={})
+        return results
+
+    monkeypatch.setattr(app.director, "_run_parallel", fake_parallel)
+    out_root = tmp_path / "fresh-run"
+    out_root.mkdir()
+    ctx = {
+        "project": dict(project), "episode": dict(episode),
+        "script": {"characters": [character], "scenes": []},
+        "out_root": out_root, "aspect": "9:16",
+        "dims": {"width": 1080, "height": 1920},
+        "quality_policy": {}, "fresh_assets": True, "run_id": 99,
+    }
+    status = app.director._ensure_character_candidates(
+        ctx, [character], {"沈砚舟": design}, "超写实晚明短剧")
+
+    assert len(captured) == 4
+    assert all(
+        task["payload"]["allow_text_to_image_bootstrap"] is True
+        and task["payload"]["reference_images"] == []
+        and task["payload"]["asset_matches"] == []
+        for task in captured)
+    assert status["characters"][0]["candidate_count"] == 4
+    for index in range(1, 5):
+        row = app.assets.latest(
+            project["id"], "character_candidate",
+            f"沈砚舟:{index:02d}")
+        assert row["version"] == 2
+        assert row["uri"] != str(old)
+        assert app.assets.meta(row)["fresh_run_id"] == 99
+
+
 def test_candidate_count_is_four_for_every_formal_role():
     assert character_candidate_target({"role": "主角"}) == 4
     assert character_candidate_target({"role": "重要配角"}) == 4

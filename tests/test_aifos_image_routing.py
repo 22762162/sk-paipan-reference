@@ -139,6 +139,48 @@ def test_text_only_batch_skips_paid_image_apis_and_uses_codex(tmp_path):
         app.close()
 
 
+def test_explicit_cold_start_can_fall_back_to_paid_text_to_image(tmp_path):
+    """Fresh mother assets must not deadlock when Codex has no image tool."""
+    app = App(tmp_path / "ws", config_overrides={
+        "providers": {
+            "image_api": {"enabled": True, "api_key": "openai-test"},
+            "codex": {"enabled": True},
+            "mock": {"enabled": False},
+        },
+        "routing": {"image": ["codex", "image_api"]},
+    })
+    calls = []
+    try:
+        codex = app.router.providers["codex"]
+        image_api = app.router.providers["image_api"]
+        codex.available = image_api.available = \
+            lambda capability: (True, "")
+
+        def codex_fail(*args, **kwargs):
+            calls.append("codex")
+            raise ProviderError("nested Codex has no image_gen")
+
+        def image_generate(*args, **kwargs):
+            calls.append("image_api")
+            return ProviderResult(provider="image_api", cost=1.12, data={})
+
+        app.router._generate_via_codex_slot = codex_fail
+        image_api.generate = image_generate
+        result = app.router.call("image", {
+            "portrait_candidate": True,
+            "allow_text_to_image_bootstrap": True,
+            "art_name": "cold_start",
+            "prompt": "single character mother asset",
+            "prompt_review_exempt": True,
+            "image_task_class": "important",
+            "image_quality": "high",
+        }, app.workspace.artifacts_dir)
+        assert result.provider == "image_api"
+        assert calls == ["codex", "image_api"]
+    finally:
+        app.close()
+
+
 @pytest.mark.parametrize(("task_class", "requested", "sent", "cost"), [
     ("batch", "high", "medium", 0.28),
     ("important", "high", "high", 1.12),

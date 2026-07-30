@@ -94,8 +94,11 @@ class WiringTest(unittest.TestCase):
 
         from aifos import director
 
-        src = inspect.getsource(director.Director._stage_storyboard)
-        self.assertIn("_ensure_space_first_scenes", src.split("\n")[1],
+        # 读模块文件而不是类属性:前面的测试可能 monkeypatch 掉方法且不
+        # 还原,getsource(类属性) 会返回替身的源码。
+        src = inspect.getsource(director)
+        body = src[src.find("def _stage_storyboard(self, ctx):"):][:400]
+        self.assertIn("_ensure_space_first_scenes", body,
                       "空间前置必须是分镜阶段的第一步")
 
 

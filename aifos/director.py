@@ -841,7 +841,8 @@ class Director:
     # ---- 入口:一句话开工 ----
     def produce(self, project_title, episode_number, premise="", style="",
                 force=False, script=None, pause_for_confirm=False,
-                kind=None, feedback="", run_id=None, style_pack_id=""):
+                kind=None, feedback="", run_id=None, style_pack_id="",
+                auto_select_assets=False, fresh_assets=False):
         """force=False 时增量生产:已有且落盘完好的产物直接复用,
         只补齐缺失部分——真实产线(即梦按镜头计费)断点续产的关键。
         script:用户自带剧本(标准 JSON);提供时跳过 AI 编剧,
@@ -898,6 +899,12 @@ class Director:
             "episode": dict(episode),
             "out_root": self._episode_dir(project, episode),
             "force": force,
+            # auto_select_assets=True:候选图由 AIFOS 视觉质检全量打分并
+            # 自动锁定最高分，不进入人工四选一检查点。
+            "auto_select_assets": bool(auto_select_assets),
+            # fresh_assets=True:本轮不读取项目内任何历史图片资产或参考图。
+            # 历史版本仍保留审计，但不能成为本轮输入或完成项。
+            "fresh_assets": bool(fresh_assets),
             "aspect": aspect,
             "dims": ASPECT_DIMS.get(aspect, ASPECT_DIMS["9:16"]),
             "provided_script": script,
@@ -1460,9 +1467,10 @@ class Director:
                 parts.append(f"{label}:{value}")
         return ",".join(parts)
 
-    def _anchor_character(self, project_id, characters=None):
+    def _anchor_character(self, project_id, characters=None, fresh=False):
         """风格锚角色:主角优先,否则名单第一位;记入 style_anchor 资产。"""
-        row = self.assets.latest(project_id, "style_anchor", "default")
+        row = (None if fresh else
+               self.assets.latest(project_id, "style_anchor", "default"))
         if row is not None:
             meta = row["meta"]
             if isinstance(meta, str):
@@ -1474,8 +1482,13 @@ class Director:
         anchor = next((c["name"] for c in characters
                        if "主" in (c.get("role") or "")),
                       characters[0]["name"])
-        self.assets.register(project_id, "style_anchor", "default",
-                             meta={"character": anchor})
+        self.assets.register(
+            project_id, "style_anchor", "default",
+            meta={"character": anchor, "fresh_selection": bool(fresh)},
+            new_version=bool(
+                fresh and self.assets.latest(
+                    project_id, "style_anchor", "default",
+                    include_deleted=True) is not None))
         return anchor
 
     def _style_anchor_uri(self, project_id, exclude_name=None):
@@ -2409,6 +2422,10 @@ class Director:
         条件:该场景已有 720° 全景母版 + ctx.blocking 里有本镜三维机位
         + ffmpeg 可用。切片缓存在 p{pid}/scenes/slices,同参数复用。
         """
+        if ctx.get("fresh_assets"):
+            # A panorama from an earlier production cannot be sliced into a
+            # supposedly all-new rebuild.
+            return ""
         if not self.config.get("defaults", "pano_slice", default=True):
             return ""
         if not location or shot_no is None:
@@ -2426,7 +2443,8 @@ class Director:
                    / "scenes" / "slices")
         return slice_for_block(pano["uri"], out_dir, block)
 
-    def _scene_view_reference(self, project_id, location, camera):
+    def _scene_view_reference(self, project_id, location, camera,
+                              fresh_run_id=None):
         """按镜头机位选最贴近的场景母版视角;缺视角图按回退链降级。
 
         左侧向缺席时退通用侧向,再退主视角——四向扩展只是把可选项变多,
@@ -2436,14 +2454,26 @@ class Director:
         if view != "main":
             for candidate in self.SCENE_VIEW_FALLBACK.get(view, (view,)):
                 row = self._scene_view_row(project_id, location, candidate)
+                if (row is not None and fresh_run_id is not None
+                        and self._asset_meta(row).get(
+                            "fresh_run_id") != fresh_run_id):
+                    row = None
                 if row is not None:
                     label = self.SCENE_VIEW_LABELS.get(candidate, candidate)
                     return row, f"场景:{location}({label})"
         # 做过四向扩展的场景,正向母版与全景同源;没扩展过的照旧用概念图。
         row = self._scene_view_row(project_id, location, "main")
+        if (row is not None and fresh_run_id is not None
+                and self._asset_meta(row).get(
+                    "fresh_run_id") != fresh_run_id):
+            row = None
         if row is not None:
             return row, f"场景:{location}({self.SCENE_VIEW_LABELS['main']})"
         row = self.assets.latest(project_id, "scene_art", location)
+        if (row is not None and fresh_run_id is not None
+                and self._asset_meta(row).get(
+                    "fresh_run_id") != fresh_run_id):
+            row = None
         return row, f"场景:{location}"
 
     def _ensure_scene_view_masters(self, ctx, scene_quality,
@@ -2459,8 +2489,10 @@ class Director:
                 continue
             # 已经做过 720° 扩展的场景优先拿全景当基准:它是整个空间的
             # 几何真相,比单张主视角更能锁住跨机位一致。
-            panorama_row = self._scene_view_row(
-                project_id, location, self.SCENE_PANORAMA_KEY)
+            panorama_row = (
+                None if ctx.get("fresh_assets")
+                else self._scene_view_row(
+                    project_id, location, self.SCENE_PANORAMA_KEY))
             main_row = (panorama_row if panorama_row is not None
                         else self.assets.latest(
                             project_id, "scene_art", location))
@@ -2470,8 +2502,10 @@ class Director:
                 continue   # 主视角缺失时不做视角扩展
             for key, label, desc in self.SCENE_VIEW_DEFS:
                 asset_name = self._scene_view_asset_name(location, key)
-                existing = self.assets.latest(
-                    project_id, "scene_art", asset_name)
+                existing = (
+                    None if ctx.get("fresh_assets")
+                    else self.assets.latest(
+                        project_id, "scene_art", asset_name))
                 if (existing and existing["uri"]
                         and Path(existing["uri"]).exists()
                         and self._quality_meets(
@@ -2538,7 +2572,16 @@ class Director:
                 self._scene_view_asset_name(location, key),
                 uri=result.uri,
                 meta={**self._quality_meta(scene_quality[location]),
-                      "view": key, "base_location": location})
+                      "view": key, "base_location": location,
+                      "fresh_run_id": (
+                          ctx.get("run_id")
+                          if ctx.get("fresh_assets") else None)},
+                new_version=bool(
+                    ctx.get("fresh_assets")
+                    and self.assets.latest(
+                        project_id, "scene_art",
+                        self._scene_view_asset_name(location, key),
+                        include_deleted=True) is not None))
             created += 1
         return created
 
@@ -3110,7 +3153,8 @@ class Director:
                             "reference_inputs", "revision", "prompt_used",
                             "prompt_used_hash", "generation_input",
                             "prompt_contract_validation", "output_uri",
-                            "autonomous_repair_seeded"):
+                            "autonomous_repair_seeded",
+                            "codex_contract_repair_count"):
                     if key in prev:
                         item[key] = prev[key]
                 if prev.get("custom_prompt"):
@@ -6104,9 +6148,20 @@ class Director:
                 + "；".join(qc.get("issues") or []))
         return ""
 
-    # 同一镜头最多自动改几次合同:Codex 每次给的是不同诊断,但连改三次
-    # 还不过说明问题不在合同表述上,再改只是烧额度。
-    CODEX_CONTRACT_REPAIR_LIMIT = 2
+    # 同一镜头最多自动改几次合同。前两轮落实逐项诊断；第三轮不再继续
+    # 叠加提示词，而是交给编剧做一次“保剧情、删过约束”的深度瘦身。
+    # 这样既不把可执行问题推回人工，也避免无上限烧额度。
+    CODEX_CONTRACT_REPAIR_LIMIT = 3
+    DEEP_CONTRACT_SLIMMING_MARKER = "【连续失败后的深度合同瘦身】"
+    DEEP_CONTRACT_SLIMMING_GUIDANCE = (
+        "【连续失败后的深度合同瘦身】这是第3轮自动修复，"
+        "禁止继续把新要求叠加到旧提示词上。保留剧情不可替代事实："
+        "人物身份/性别/人数、关键物证的唯一性与持有人、动作终点、"
+        "场景和屏幕方向；删除、合并或放宽不影响观众理解的过度硬"
+        "要求，例如家具每条腿必须全显、亚像素级裁切、精确到指甲"
+        "比例的道具尺寸、重复灯光/焦段/负面条款。关键物证仍需"
+        "可辨，但允许为手机端叙事可读性做克制的电影化尺度调整。"
+        "输出一份更短、无互斥、单帧真实可拍的唯一合同。")
 
     def _auto_apply_codex_escalation(self, ctx, task, result):
         """Codex 给了具体修改指令就自动执行,不再推给人工。
@@ -6140,7 +6195,13 @@ class Director:
         if not (ctx.get("storyboard") or {}).get("shots"):
             return ""
         counters = ctx.setdefault("_codex_contract_repairs", {})
-        used = int(counters.get(item_id, 0))
+        try:
+            payload_used = int(
+                (task.get("payload") or {}).get(
+                    "_codex_contract_repair_count") or 0)
+        except (TypeError, ValueError):
+            payload_used = 0
+        used = max(int(counters.get(item_id, 0)), payload_used)
         if used >= self.CODEX_CONTRACT_REPAIR_LIMIT:
             return ""
         before = self._image_generation_input(task.get("payload") or {})
@@ -6148,7 +6209,8 @@ class Director:
             qc.get("input_diagnosis") or qc,
             issues=qc.get("issues"))
         reference_changes = {"applied": [], "skipped": []}
-        if action == "targeted_redraw":
+        deep_contract_repair = used >= 2
+        if action == "targeted_redraw" and not deep_contract_repair:
             target = task.get("payload") or {}
             amendment = "\n【Codex自动修订·必须执行】" + instruction[:1600]
             base = str(target.get("_reference_prompt_base")
@@ -6170,12 +6232,16 @@ class Director:
             self._attach_reference_manifest(target)
             summary = "已把 Codex 定向重画指令固化进下一轮生成合同"
         else:
+            repair_reason = (
+                f"Codex 升级分析判定本镜应「"
+                f"{CODEX_QC_ACTION_CN.get(action, action)}」。"
+                f"必须落实的修改指令:{instruction}")
+            if deep_contract_repair:
+                repair_reason += (
+                    "\n" + self.DEEP_CONTRACT_SLIMMING_GUIDANCE)
             try:
                 summary = self._repair_blocked_prompt_shot(
-                    ctx, task,
-                    f"Codex 升级分析判定本镜应「"
-                    f"{CODEX_QC_ACTION_CN.get(action, action)}」。"
-                    f"必须落实的修改指令:{instruction}")
+                    ctx, task, repair_reason)
             except Exception as exc:
                 self.log.warn(
                     "director",
@@ -6205,6 +6271,7 @@ class Director:
                 "自动修复中止")
             return ""
         counters[item_id] = used + 1
+        task["payload"]["_codex_contract_repair_count"] = used + 1
         # 新一轮从干净状态起画:旧的升级结论已经落实,不能再随 payload
         # 下传,否则出图前会被既有的熔断逻辑按旧哈希拦住。
         task["payload"].pop("qc_escalation", None)
@@ -6249,6 +6316,8 @@ class Director:
                 or payload.get("prompt") or ""),
             "autonomous_repair_seeded": bool(
                 payload.get("_autonomous_repair_seeded")),
+            "codex_contract_repair_count": int(
+                payload.get("_codex_contract_repair_count") or 0),
         }
         if task.get("_codex_profile"):
             generating_extra["codex_profile"] = task["_codex_profile"]
@@ -6300,6 +6369,9 @@ class Director:
                 ctx, task["item_id"], "generating",
                 extra={**generating_extra,
                        "codex_contract_repair": repair[:300],
+                       "codex_contract_repair_count": int(
+                           task["payload"].get(
+                               "_codex_contract_repair_count") or 0),
                        "autonomous_repair": True,
                        "candidate_count": 3})
             try:
@@ -6514,6 +6586,9 @@ class Director:
                             or payload.get("prompt") or ""),
                         "autonomous_repair_seeded": bool(
                             payload.get("_autonomous_repair_seeded")),
+                        "codex_contract_repair_count": int(
+                            payload.get(
+                                "_codex_contract_repair_count") or 0),
                     }
                     if task.get("_codex_profile"):
                         generating_extra["codex_profile"] = task[
@@ -6579,6 +6654,10 @@ class Director:
                                 ctx, task["item_id"], "generating",
                                 extra={
                                     "codex_contract_repair": repair[:300],
+                                    "codex_contract_repair_count": int(
+                                        payload.get(
+                                            "_codex_contract_repair_count")
+                                        or 0),
                                     "autonomous_repair": True,
                                     "candidate_count": 3,
                                 })
@@ -7867,7 +7946,9 @@ class Director:
             for character in characters}
         for character in characters:
             name = character["name"]
-            design = self._character_design(project_id, name)
+            design = (
+                None if ctx.get("fresh_assets")
+                else self._character_design(project_id, name))
             if design:
                 upgraded = self._upgrade_character_visual_dna(
                     design, character)
@@ -7941,9 +8022,10 @@ class Director:
             # 为最高标准撰写(编剧 AI 可直接读取图片文件)
             "characters": [{"name": c["name"],
                             "role": c.get("role", ""),
-                            "reference_images":
-                                self._character_reference_uris(
-                                    project_id, c["name"])}
+                            "reference_images": (
+                                [] if ctx.get("fresh_assets")
+                                else self._character_reference_uris(
+                                    project_id, c["name"]))}
                            for c in missing],
         }, "script")
         by_name = {d.get("name"): d
@@ -7954,7 +8036,8 @@ class Director:
             if not design:
                 continue
             has_reference = bool(
-                self._character_reference_uris(project_id, name))
+                not ctx.get("fresh_assets")
+                and self._character_reference_uris(project_id, name))
             # 制作圣经先于人物设定，最终人物出图卡是身份事实源。Provider
             # 不得用另一套随机模板覆盖它；尤其 mock 仅用于跑通流程，绝不能
             # 把仙侠发色/道袍混进历史或现代人物。
@@ -8441,7 +8524,7 @@ class Director:
             "自然比例与材质真实可制造。")
 
     def _ensure_character_candidates(self, ctx, characters, designs, style):
-        """每个人物用同一初始提示词并行生成4张，随后等待人工选择。"""
+        """每个人物用同一初始提示词并行生成4张，随后人工或自动选优。"""
         project_id = ctx["project"]["id"]
         seed = []
         tasks = []
@@ -8452,9 +8535,12 @@ class Director:
             name = character["name"]
             role = character.get("role", "")
             target = character_candidate_target(character)
-            locked = self._locked_identity(project_id, name)
+            locked = (
+                None if ctx.get("fresh_assets")
+                else self._locked_identity(project_id, name))
             existing = {}
-            for index in range(1, target + 1):
+            for index in (() if ctx.get("fresh_assets")
+                          else range(1, target + 1)):
                 row = self.assets.latest(
                     project_id, "character_candidate", f"{name}:{index:02d}")
                 if row is None:
@@ -8505,9 +8591,13 @@ class Director:
             if locked and not existing:
                 # 人工上传的最终立绘没有候选集，仍视为明确人工定版。
                 continue
-            reference_payload = self._user_reference_payload(
-                project_id, [name],
-                allowed_roles={"identity", "wardrobe", "composition"})
+            reference_payload = (
+                {"reference_images": [], "asset_matches": []}
+                if ctx.get("fresh_assets")
+                else self._user_reference_payload(
+                    project_id, [name],
+                    allowed_roles={
+                        "identity", "wardrobe", "composition"}))
             refs = reference_payload["reference_images"]
             quality = resolve_image_quality(
                 recommend_asset_quality("character_candidate"),
@@ -8568,6 +8658,11 @@ class Director:
                     "payload": {
                         "portrait": True,
                         "portrait_candidate": True,
+                        # 冷启动没有最终立绘可作为参考；若 Codex 图片通道
+                        # 偶发不落盘，允许真实图片 API 以同一已审核提示词
+                        # 承担首次母资产生成。仅资产候选可用，镜头不得借此
+                        # 丢掉已锁定身份参考。
+                        "allow_text_to_image_bootstrap": not bool(refs),
                         **variant,
                         "image_task_class": image_task_class_for(
                             quality["level"]),
@@ -8641,6 +8736,9 @@ class Director:
                                f"candidate:{name}:{index}")),
                       "provider": result.provider,
                       "model": getattr(result, "model", ""),
+                      "fresh_run_id": (
+                          ctx.get("run_id")
+                          if ctx.get("fresh_assets") else None),
                       **self._quality_meta(quality)},
                 new_version=self.assets.latest(
                     project_id, "character_candidate",
@@ -8660,13 +8758,14 @@ class Director:
             if self._design_value(prop.get("visual_design")):
                 continue
             name = prop["name"]
-            if self._locked_prop(project_id, name):
+            if (not ctx.get("fresh_assets")
+                    and self._locked_prop(project_id, name)):
                 continue
-            if all(
+            if (not ctx.get("fresh_assets") and all(
                     self.assets.latest(
                         project_id, "prop_candidate", f"{name}:{index:02d}")
                     is not None
-                    for index in range(1, PROP_CANDIDATES + 1)):
+                    for index in range(1, PROP_CANDIDATES + 1))):
                 continue
             pending.append(prop)
         if not pending:
@@ -8706,9 +8805,12 @@ class Director:
         quality_by_candidate = {}
         for prop in props:
             name = prop["name"]
-            locked = self._locked_prop(project_id, name)
+            locked = (
+                None if ctx.get("fresh_assets")
+                else self._locked_prop(project_id, name))
             existing = {}
-            for index in range(1, PROP_CANDIDATES + 1):
+            for index in (() if ctx.get("fresh_assets")
+                          else range(1, PROP_CANDIDATES + 1)):
                 row = self.assets.latest(
                     project_id, "prop_candidate", f"{name}:{index:02d}")
                 if row is None:
@@ -8722,9 +8824,12 @@ class Director:
                     existing[index] = row
             if locked and not existing:
                 continue
-            reference_payload = self._user_reference_payload(
-                project_id, [name],
-                allowed_roles={"wardrobe", "composition"})
+            reference_payload = (
+                {"reference_images": [], "asset_matches": []}
+                if ctx.get("fresh_assets")
+                else self._user_reference_payload(
+                    project_id, [name],
+                    allowed_roles={"wardrobe", "composition"}))
             refs = reference_payload["reference_images"]
             quality = resolve_image_quality(
                 recommend_asset_quality(
@@ -8757,6 +8862,7 @@ class Director:
                     "capability": "image",
                     "payload": {
                         "prop_candidate": True,
+                        "allow_text_to_image_bootstrap": not bool(refs),
                         "image_task_class": image_task_class_for(
                             quality["level"]),
                         "image_quality": quality["level"],
@@ -8815,10 +8921,351 @@ class Director:
                             == f"prop_candidate:{name}:{index}")),
                     "provider": result.provider,
                     "model": getattr(result, "model", ""),
+                    "fresh_run_id": (
+                        ctx.get("run_id")
+                        if ctx.get("fresh_assets") else None),
                     **self._quality_meta(quality),
-                })
+                },
+                new_version=self.assets.latest(
+                    project_id, "prop_candidate",
+                    f"{name}:{index:02d}",
+                    include_deleted=True) is not None)
         return self.prop_selection_status(
             project_id, {"core_props": props})
+
+    def _candidate_selection_qc_payload(
+            self, project_id, candidate, *, kind, definition, design=None):
+        """Build a self-contained visual-QC contract for one asset candidate.
+
+        Candidate selection happens before a final identity exists, so the
+        contract deliberately contains no previous identity/reference image.
+        That prevents an old locked portrait from silently becoming the judge
+        of a fresh rebuild.
+        """
+        meta = self._asset_meta(candidate)
+        prompt = str(meta.get("prompt") or "")
+        index = int(meta.get("candidate_index") or 0)
+        if kind == "character":
+            name = str(definition.get("name") or "")
+            background = {name: copy.deepcopy(design or {})}
+            composition = {
+                "composition_type": "single_character_mother_asset",
+                "expected_primary_count": 1,
+                "expected_visible_figure_count": 1,
+                "count_rule": "严格只有1名完整人物，不得复制、拼接或出现旁人",
+                "actors": [{
+                    "character": name,
+                    "role": definition.get("role", ""),
+                    "expected_view": "front_or_three_quarter",
+                    "identity_basis": "本轮人物设定与实际候选画面",
+                }],
+                "quality_requirements": {
+                    "required": [
+                        "人物脸部与全身结构自然",
+                        "年龄、性别、时代、职业和基础造型符合人物设定",
+                        "全身正面自然站姿，五官与服装可供后续母资产引用",
+                        "无明显肢体畸形、融合、重复肢体或裁切错误",
+                    ],
+                    "forbidden": [
+                        "第二个人、分身、拼图、多视图、字幕、水印、乱码",
+                        "与人物设定冲突的物种、性别、年代或服装",
+                    ],
+                },
+            }
+            physical = {
+                "rules": [
+                    "严格一名人物、单一连续身体、双手双足数量与连接自然",
+                    "人物重心、站姿、衣物层叠与时代穿着方式必须成立",
+                ],
+                "objects": [],
+            }
+            spec = self._qc_spec(
+                project_id, [name], require_identity=False,
+                expected_characters=[name], expected_count=1,
+                character_background=background,
+                action="单人初始状态定妆母图，比较脸、比例与整体完成度",
+                camera="全身正面或轻微四分之三，纯净中性背景",
+                composition_contract=composition,
+                physical_contract=physical,
+                physical_logic_required=True,
+                forbid=[
+                    "第二个人", "分身", "拼图", "多视图", "字幕条",
+                    "水印", "乱码文字", "明显肢体畸形",
+                ])
+            # _qc_spec(required=False) may still discover an older locked
+            # identity. Fresh candidate ranking must never see or use it.
+            spec["identity_references"] = []
+            spec["identity_required"] = False
+            spec["identity_match_required"] = False
+            spec["gender_required"] = bool(spec.get("expected_genders"))
+            spec["wardrobe_required"] = bool(
+                spec.get("expected_wardrobe"))
+            label = f"人物{name}候选{index}"
+        else:
+            name = str(definition.get("name") or "")
+            facts = "；".join(filter(None, (
+                str(definition.get("story_function") or ""),
+                str(definition.get("visual_design") or ""),
+                str(definition.get("era_material") or ""),
+                str(definition.get("owner") or ""),
+            )))
+            composition = {
+                "composition_type": "single_prop_mother_asset",
+                "expected_primary_count": 0,
+                "expected_visible_figure_count": 0,
+                "count_rule": "画面中不得出现任何人物、手或人体局部",
+                "actors": [],
+                "quality_requirements": {
+                    "required": [
+                        "单件道具完整居中且结构、用途、材质与时代成立",
+                        "形体清楚、可制造、可握持或可使用部位可信",
+                        "无明显畸变、悬浮、融合、断裂或错误文字",
+                    ],
+                    "forbidden": [
+                        "人物、手、人体局部、第二件重复道具、拼图",
+                        "字幕、水印、乱码、与剧本功能或时代冲突的结构",
+                    ],
+                },
+            }
+            physical = {
+                "rules": [
+                    "单件道具完整呈现，结构、重力、连接、开合与使用方式成立",
+                    f"剧本道具事实：{facts or '服从候选生成提示词'}",
+                ],
+                "objects": [name],
+            }
+            spec = self._qc_spec(
+                project_id, [], require_identity=False,
+                expected_characters=[], expected_count=0,
+                action=f"核心道具母资产：{name}；{facts}",
+                camera="单件道具三分之四视角，纯净中性棚拍背景",
+                composition_contract=composition,
+                physical_contract=physical,
+                physical_logic_required=True,
+                forbid=[
+                    "人物", "手", "人体局部", "第二件重复道具",
+                    "拼图", "字幕条", "水印", "乱码文字",
+                ])
+            spec["identity_references"] = []
+            label = f"道具{name}候选{index}"
+        generation_input = {
+            "schema": "aifos.asset-candidate-selection-input/v1",
+            "scope": {
+                "item_id": (
+                    f"candidate:{name}:{index}" if kind == "character"
+                    else f"prop_candidate:{name}:{index}"),
+                "frame_kind": f"{kind}_candidate",
+                "candidate_index": index,
+            },
+            "prompt": prompt,
+            "reference_manifest": [],
+        }
+        return spec, {
+            **spec,
+            "image_uri": str(candidate["uri"] or ""),
+            "generation_prompt": prompt,
+            "generation_input": generation_input,
+            "reference_manifest": [],
+            "candidate_selection": True,
+            "candidate_label": label,
+        }
+
+    def _auto_select_asset_candidates(
+            self, ctx, characters, designs, props):
+        """QC every candidate and lock the highest-ranked image autonomously."""
+        project_id = ctx["project"]["id"]
+        work = []
+        for character in characters:
+            name = character["name"]
+            for index in range(1, character_candidate_target(character) + 1):
+                row = self.assets.latest(
+                    project_id, "character_candidate",
+                    f"{name}:{index:02d}")
+                if row is None or not row["uri"]:
+                    continue
+                spec, payload = self._candidate_selection_qc_payload(
+                    project_id, row, kind="character",
+                    definition=character, design=designs.get(name) or {})
+                work.append({
+                    "kind": "character", "name": name, "index": index,
+                    "definition": character, "candidate": row,
+                    "spec": spec, "payload": payload,
+                })
+        for prop in props:
+            name = prop["name"]
+            for index in range(1, PROP_CANDIDATES + 1):
+                row = self.assets.latest(
+                    project_id, "prop_candidate", f"{name}:{index:02d}")
+                if row is None or not row["uri"]:
+                    continue
+                spec, payload = self._candidate_selection_qc_payload(
+                    project_id, row, kind="prop", definition=prop)
+                work.append({
+                    "kind": "prop", "name": name, "index": index,
+                    "definition": prop, "candidate": row,
+                    "spec": spec, "payload": payload,
+                })
+        if not work:
+            return self.production_asset_selection_status(
+                project_id, ctx["script"])
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        workers = max(1, min(4, self._total_image_workers(), len(work)))
+        cancel = lambda: self._cancel_requested(ctx)  # noqa: E731
+        out_dir = ctx["out_root"] / "cast" / "selection_qc"
+
+        def inspect(item):
+            result = self.router.call(
+                "image_qc", item["payload"], out_dir, cancel=cancel)
+            report = self._assess_image_qc(
+                item["spec"], result.data or {}, 1)
+            report["score"] = self._image_qc_selection_score(report)
+            return result, report
+
+        inspected = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(inspect, item): item for item in work}
+            for future in as_completed(futures):
+                item = futures[future]
+                key = (item["kind"], item["name"], item["index"])
+                try:
+                    result, report = future.result()
+                    inspected[key] = report
+                    self._task_cost += float(result.cost or 0.0)
+                    if result.provider:
+                        self._task_providers.add(result.provider)
+                    self.projects.add_episode_cost(
+                        ctx["episode"]["id"], float(result.cost or 0.0))
+                except ProduceCancelled:
+                    for pending in futures:
+                        pending.cancel()
+                    raise
+                except Exception as exc:
+                    # Infrastructure trouble is evidence about the QC route,
+                    # not permission to pause a no-human production. Keep a
+                    # deterministic low score so another inspected candidate
+                    # wins; if all routes fail, candidate 1 is selected.
+                    inspected[key] = {
+                        "passed": False,
+                        "production_ready": False,
+                        "qc_infrastructure_failure": True,
+                        "issues": [f"候选视觉质检不可用:{str(exc)[:180]}"],
+                        "score": -1000.0,
+                    }
+
+        groups = {}
+        for item in work:
+            key = (item["kind"], item["name"])
+            report = inspected.get(
+                (item["kind"], item["name"], item["index"])) or {
+                    "passed": False, "issues": ["未收到视觉质检结果"],
+                    "score": -1000.0,
+                }
+            groups.setdefault(key, []).append((item, report))
+
+        for (kind, name), rows in groups.items():
+            item, report = max(
+                rows, key=lambda pair: (
+                    1 if pair[1].get("passed") else 0,
+                    float(
+                        pair[1]["score"]
+                        if pair[1].get("score") is not None
+                        else -1000.0),
+                    -int(pair[0]["index"])))
+            candidate = item["candidate"]
+            index = int(item["index"])
+            candidate_meta = self._asset_meta(candidate)
+            quality = self._asset_quality(candidate, default="high")
+            base_meta = {
+                "locked": True,
+                "auto_selected": True,
+                "selection_method": "aifos_visual_qc_rank",
+                "candidate_index": index,
+                "candidate_asset_id": candidate["id"],
+                "candidate_version": candidate["version"],
+                "locked_at": now(),
+                "selection_score": float(
+                    report["score"]
+                    if report.get("score") is not None else -1000.0),
+                "selection_qc_passed": bool(report.get("passed")),
+                "selection_qc": copy.deepcopy(report),
+                "image_quality": quality,
+                "recommended_quality": "high",
+                "quality_source": "automatic_visual_qc",
+                "fresh_run_id": (
+                    ctx.get("run_id")
+                    if ctx.get("fresh_assets") else None),
+            }
+            if kind == "character":
+                definition = item["definition"]
+                variant_meta = {
+                    key: candidate_meta[key] for key in (
+                        "variant_id", "variant_label", "look_variant",
+                        "variant_source", "candidate_prompt_schema")
+                    if key in candidate_meta
+                }
+                meta = {
+                    **base_meta,
+                    "character": name,
+                    "role": definition.get("role", ""),
+                    **variant_meta,
+                }
+                identity = self.assets.register(
+                    project_id, "character_identity", name,
+                    uri=candidate["uri"], meta=meta, new_version=True)
+                self.assets.register(
+                    project_id, "character_art", name,
+                    uri=candidate["uri"], meta=meta, new_version=True)
+                identity_kind = "人物"
+            else:
+                definition = item["definition"]
+                meta = {
+                    **base_meta,
+                    "prop": name,
+                    "story_function": definition.get(
+                        "story_function", ""),
+                    "visual_design": definition.get("visual_design", ""),
+                    "variant_id": candidate_meta.get("variant_id", ""),
+                    "variant_label": candidate_meta.get(
+                        "variant_label", ""),
+                }
+                identity = self.assets.register(
+                    project_id, "prop_identity", name,
+                    uri=candidate["uri"], meta=meta, new_version=True)
+                identity_kind = "核心道具"
+            category = (
+                "character_candidate" if kind == "character"
+                else "prop_candidate")
+            for plan_item in self._plan_read(ctx).get("items", []):
+                if (plan_item.get("category") == category
+                        and plan_item.get("name") == name):
+                    self._plan_mark(
+                        ctx, plan_item["id"],
+                        plan_item.get("status", "done"),
+                        extra={
+                            "selected": int(plan_item.get(
+                                "candidate_index", 0)) == index,
+                            "selection_score": (
+                                float(
+                                    report["score"]
+                                    if report.get("score") is not None
+                                    else -1000.0)
+                                if int(plan_item.get(
+                                    "candidate_index", 0)) == index
+                                else None),
+                            "selection_method": "aifos_visual_qc_rank",
+                        })
+            self.log.info(
+                "director",
+                f"{identity_kind}自动定版:{name} 选中候选{index}"
+                f"(视觉质检{'通过' if report.get('passed') else '未全过但最高分'},"
+                f"得分 {float(report['score'] if report.get('score') is not None else -1000.0):.0f},"
+                f"identity_v{identity['version']})")
+        status = self.production_asset_selection_status(
+            project_id, ctx["script"])
+        self.projects.save_document(
+            ctx["episode"]["id"], "cast_selection", status)
+        return status
 
     def select_character_candidate(self, project_title, episode_number,
                                    character_name, candidate_index):
@@ -9029,14 +9476,23 @@ class Director:
         # 立绘与全部资产套件的提示词据此丰富;项目级一次,跨集复用
         designs = self._ensure_character_designs(ctx, characters)
         # 风格锚:主角立绘最先画,成为全项目形象的风格基准图
-        anchor_name = self._anchor_character(project_id, characters)
+        anchor_name = self._anchor_character(
+            project_id, characters, fresh=bool(ctx.get("fresh_assets")))
         characters = sorted(
             characters, key=lambda c: c["name"] != anchor_name)
         character_selection = self._ensure_character_candidates(
             ctx, characters, designs, style)
+        props = self._complete_prop_designs(
+            ctx, core_prop_definitions(ctx["script"]))
         prop_selection = self._ensure_prop_candidates(
-            ctx, self._complete_prop_designs(
-                ctx, core_prop_definitions(ctx["script"])), style)
+            ctx, props, style)
+        if ctx.get("auto_select_assets"):
+            self._auto_select_asset_candidates(
+                ctx, characters, designs, props)
+            character_selection = self.character_selection_status(
+                project_id, characters)
+            prop_selection = self.prop_selection_status(
+                project_id, {"core_props": props})
         selection = self._combine_asset_selection(
             character_selection, prop_selection)
         self.projects.save_document(
@@ -9131,8 +9587,10 @@ class Director:
         for scene in ctx["script"]["scenes"]:
             location = scene["location"]
             self.assets.acquire(project_id, "scene", location)
-            existing_scene = self._existing_asset_uri(
-                ctx, "scene_art", location)
+            existing_scene = (
+                "" if ctx.get("fresh_assets")
+                else self._existing_asset_uri(
+                    ctx, "scene_art", location))
             if existing_scene:
                 row = self.assets.latest(project_id, "scene_art", location)
                 if self._quality_meets(
@@ -9144,13 +9602,22 @@ class Director:
                     continue
             if any(t["tag"] == ("scene_art", location) for t in tasks):
                 continue
-            scene_references = self._user_reference_payload(
-                project_id, [location],
-                allowed_roles={"scene", "composition"})
+            scene_references = (
+                {"reference_images": [], "asset_matches": []}
+                if ctx.get("fresh_assets")
+                else self._user_reference_payload(
+                    project_id, [location],
+                    allowed_roles={"scene", "composition"}))
+            style_reference = (
+                None if ctx.get("fresh_assets")
+                else self._style_anchor_uri(project_id))
             tasks.append({
                 "item_id": f"scene:{location}", "capability": "image",
                 "payload": {
                     "scene_art": True, "art_name": location,
+                    "allow_text_to_image_bootstrap": not bool(
+                        scene_references["reference_images"]
+                        or style_reference),
                     "image_task_class": image_task_class_for(
                         scene_quality[location]["level"]),
                     "image_quality": scene_quality[location]["level"],
@@ -9168,10 +9635,10 @@ class Director:
                         self._scene_art_review_context(
                             location, style, scene),
                     **scene_references,
-                    "style_ref": self._style_anchor_uri(project_id),
+                    "style_ref": style_reference,
                     "require_reference_images": bool(
                         scene_references["reference_images"]
-                        or self._style_anchor_uri(project_id)),
+                        or style_reference),
                     "aspect": ctx["aspect"], **ctx["dims"],
                 }, "sub_dir": "cast", "tag": ("scene_art", location)})
         # 人物资产套件与场景图共用同一批次，引用各自立绘+风格基准图。
@@ -9182,9 +9649,13 @@ class Director:
             portrait_uri = (portrait["uri"]
                             if portrait and portrait["uri"]
                             and Path(portrait["uri"]).exists() else None)
-            reference_payload = self._user_reference_payload(
-                project_id, [name],
-                allowed_roles={"identity", "wardrobe", "composition"})
+            reference_payload = (
+                {"reference_images": [], "asset_matches": []}
+                if ctx.get("fresh_assets")
+                else self._user_reference_payload(
+                    project_id, [name],
+                    allowed_roles={
+                        "identity", "wardrobe", "composition"}))
             for key, label, desc in sheet_definitions:
                 asset_name = f"{name}:{key}"
                 sheet_aspect = (
@@ -9194,8 +9665,10 @@ class Director:
                     else ctx["aspect"])
                 sheet_dims = ASPECT_DIMS.get(
                     sheet_aspect, ctx["dims"])
-                existing_sheet = self._existing_asset_uri(
-                    ctx, "character_sheet", asset_name)
+                existing_sheet = (
+                    "" if ctx.get("fresh_assets")
+                    else self._existing_asset_uri(
+                        ctx, "character_sheet", asset_name))
                 if existing_sheet:
                     row = self.assets.latest(
                         project_id, "character_sheet", asset_name)
@@ -9234,7 +9707,9 @@ class Director:
                             project_id, [name]),
                         "require_reference_images": True,
                         **reference_payload,
-                        "style_ref": self._style_anchor_uri(project_id),
+                        "style_ref": (
+                            None if ctx.get("fresh_assets")
+                            else self._style_anchor_uri(project_id)),
                         "aspect": sheet_aspect, **sheet_dims,
                     }), "sub_dir": "cast",
                     "tag": ("character_sheet", name, key, label),
@@ -9245,7 +9720,17 @@ class Director:
                 _kind, name = tag
                 self.assets.register(
                     project_id, "scene_art", name, uri=result.uri,
-                    meta=self._quality_meta(scene_quality[name]))
+                    meta={
+                        **self._quality_meta(scene_quality[name]),
+                        "fresh_run_id": (
+                            ctx.get("run_id")
+                            if ctx.get("fresh_assets") else None),
+                    },
+                    new_version=bool(
+                        ctx.get("fresh_assets")
+                        and self.assets.latest(
+                            project_id, "scene_art", name,
+                            include_deleted=True) is not None))
                 created += 1
                 continue
             _kind, name, key, label = tag
@@ -9263,7 +9748,15 @@ class Director:
                       "image_quality": "high",
                       "recommended_quality": "high",
                       "quality_source": "auto",
-                      "quality_rule": "mother_asset"})
+                      "quality_rule": "mother_asset",
+                      "fresh_run_id": (
+                          ctx.get("run_id")
+                          if ctx.get("fresh_assets") else None)},
+                new_version=bool(
+                    ctx.get("fresh_assets")
+                    and self.assets.latest(
+                        project_id, "character_sheet", f"{name}:{key}",
+                        include_deleted=True) is not None))
             created += 1
         # 第二波:高复用场景的反打/侧向视角母版(以主视角图为参考,
         # 保证同一空间跨机位一致;关键帧按镜头机位自动选用)。
@@ -9573,7 +10066,8 @@ class Director:
         return score
 
     def _wardrobe_reference_row(self, project_id, name, wardrobe,
-                                used_uris=None, headwear=""):
+                                used_uris=None, headwear="",
+                                fresh_run_id=None):
         """Reuse the closest locked mother asset strictly as a wardrobe ref."""
         target = self._wardrobe_terms(wardrobe)
         if not target:
@@ -9584,6 +10078,9 @@ class Director:
                 project_id, kind="character_candidate"):
             meta = self._asset_meta(row)
             if str(meta.get("character") or "") != str(name):
+                continue
+            if (fresh_run_id is not None
+                    and meta.get("fresh_run_id") != fresh_run_id):
                 continue
             uri = str(row["uri"] or "")
             if not uri or uri in used or (
@@ -9626,6 +10123,8 @@ class Director:
                     project_id, "character_sheet", f"{name}:{key}")
                 meta = self._asset_meta(row) if row is not None else {}
                 if (row
+                        and (fresh_run_id is None
+                             or meta.get("fresh_run_id") == fresh_run_id)
                         and (meta.get("wardrobe_face_free") is True
                              or meta.get("reference_scope")
                              == "wardrobe_only")
@@ -9637,13 +10136,18 @@ class Director:
                     return row
         return None
 
-    def _face_only_identity_row(self, project_id, name, used_uris=None):
+    def _face_only_identity_row(self, project_id, name, used_uris=None,
+                                fresh_run_id=None):
         """Return a formal face anchor that cannot leak an obsolete outfit."""
         used = {str(value) for value in (used_uris or []) if value}
         for key in ("closeup", "features", "makeup"):
             row = self.assets.latest(
                 project_id, "character_sheet", f"{name}:{key}")
             if row is None:
+                continue
+            if (fresh_run_id is not None
+                    and self._asset_meta(row).get(
+                        "fresh_run_id") != fresh_run_id):
                 continue
             uri = str(row["uri"] or "")
             if (not uri or uri in used
@@ -9713,7 +10217,10 @@ class Director:
                 # with a high-quality face crop derived from that locked
                 # identity, while preserving the immutable source for audit.
                 face_row = self._face_only_identity_row(
-                    project_id, character, used_uris)
+                    project_id, character, used_uris,
+                    fresh_run_id=(
+                        ctx.get("run_id")
+                        if ctx.get("fresh_assets") else None))
                 if face_row is not None:
                     identity.update({
                         "source_identity_asset_id": identity.get("asset_id"),
@@ -9832,7 +10339,10 @@ class Director:
                 (headwear_states or {}).get(name) or {})
             row = self._wardrobe_reference_row(
                 project_id, name, wardrobe, used_uris,
-                headwear=headwear)
+                headwear=headwear,
+                fresh_run_id=(
+                    ctx.get("run_id")
+                    if ctx.get("fresh_assets") else None))
             if row is None:
                 if wardrobe:
                     refs["appearance_reference_warnings"].append({
@@ -9883,7 +10393,11 @@ class Director:
                 for key in per_actor_keys:
                     row = self.assets.latest(
                         project_id, "character_sheet", f"{name}:{key}")
+                    row_meta = self._asset_meta(row) if row else {}
                     if (not row
+                            or (ctx.get("fresh_assets")
+                                and row_meta.get("fresh_run_id")
+                                != ctx.get("run_id"))
                             or not formal_reference_allowed(
                                 self._asset_quality(row))
                             or not row["uri"]
@@ -9926,7 +10440,10 @@ class Director:
                 # 按本镜机位选最贴近的场景母版视角(反打/侧向),缺则回退
                 # 主视角——同一空间不同机位不再各画各的。
                 row, scene_label = self._scene_view_reference(
-                    project_id, location, camera)
+                    project_id, location, camera,
+                    fresh_run_id=(
+                        ctx.get("run_id")
+                        if ctx.get("fresh_assets") else None))
                 if (row and formal_reference_allowed(
                         self._asset_quality(row))
                         and row["uri"] and Path(row["uri"]).exists()
@@ -9937,11 +10454,13 @@ class Director:
                         "name": row["name"], "label": scene_label,
                         "uri": row["uri"],
                     })
-        matched_rows = (self._matching_produced_image_rows(
-            project_id, characters, location, shot_no=shot_no, limit=3,
-            wardrobe_states=wardrobe_states,
-            headwear_states=headwear_states)
-            if shot_no is not None else [])
+        matched_rows = (
+            [] if ctx.get("fresh_assets")
+            else (self._matching_produced_image_rows(
+                project_id, characters, location, shot_no=shot_no, limit=3,
+                wardrobe_states=wardrobe_states,
+                headwear_states=headwear_states)
+                if shot_no is not None else []))
         # 只允许当前分镜合同下已经通过视觉质检的镜头图充当连续性参考。
         # 分镜重排后旧图片仍保存在资产历史中；如果仅按“同人物/同场景”
         # 选图，旧合同里画错的人物会重新污染本轮返工。
@@ -9974,10 +10493,12 @@ class Director:
                 "uri": row["uri"],
             })
         attach_names = list(characters or []) + ([location] if location else [])
-        user_rows = self._reference_rows(
-            project_id, attach_names,
-            allowed_roles={
-                "identity", "wardrobe", "scene", "composition"})
+        user_rows = (
+            [] if ctx.get("fresh_assets")
+            else self._reference_rows(
+                project_id, attach_names,
+                allowed_roles={
+                    "identity", "wardrobe", "scene", "composition"}))
         reference = list(matched)
         for row in user_rows:
             if not remember(row["uri"]):
@@ -9987,7 +10508,9 @@ class Director:
                 self._reference_asset_match(row))
         if reference:
             refs["reference_images"] = reference
-        anchor = self._style_anchor_uri(project_id)
+        anchor = (
+            None if ctx.get("fresh_assets")
+            else self._style_anchor_uri(project_id))
         if anchor and remember(anchor):
             refs["style_ref"] = anchor
             style_row = next((
@@ -11467,6 +11990,57 @@ class Director:
             stored_escalation = stored_qc.get("codex_escalation") or {}
             repair_meta = shot.get("prompt_block_repair") or {}
             stale_reset = stored.get("stale_reset") or {}
+            try:
+                persisted_repair_count = int(
+                    stored.get("codex_contract_repair_count") or 0)
+            except (TypeError, ValueError):
+                persisted_repair_count = 0
+            # 兼容当前版本以前没有显式计数的断点：一个失败项若已记录
+            # Codex 合同修复，说明至少完成过两轮自动修复后仍未通过。
+            if (not persisted_repair_count
+                    and stored.get("status") == "failed"
+                    and stored.get("codex_contract_repair")):
+                persisted_repair_count = 2
+            elif (not persisted_repair_count
+                    and stored.get("codex_contract_repair")):
+                persisted_repair_count = 1
+            repair_reason = str(
+                repair_meta.get("blocking_reason") or "")
+            # v28 之前没有把修复轮次写入 render_plan，但编剧就地修过的
+            # Codex blocking_reason 会持久化在 storyboard。当前项又在
+            # 修订组三抽中，说明至少两轮已失败，恢复时应直接进入第三轮
+            # 深度瘦身，而不是把前两轮重新烧一遍。
+            if (not persisted_repair_count
+                    and stored.get("autonomous_repair_seeded")
+                    and "Codex 升级分析" in repair_reason):
+                persisted_repair_count = 2
+            elif (not persisted_repair_count
+                    and stored.get("autonomous_repair_seeded")):
+                persisted_repair_count = 1
+            if (persisted_repair_count >= 2
+                    and self.DEEP_CONTRACT_SLIMMING_MARKER
+                    not in repair_reason):
+                try:
+                    summary = self._repair_blocked_prompt_shot(
+                        ctx, task,
+                        repair_reason + "\n"
+                        + self.DEEP_CONTRACT_SLIMMING_GUIDANCE)
+                    persisted_repair_count = 3
+                    task["payload"]["_autonomous_repair_seeded"] = True
+                    self.log.info(
+                        "director",
+                        f"{task['item_id']} 已从旧断点直接执行第3轮"
+                        f"深度合同瘦身: {summary[:140]}")
+                except Exception as exc:
+                    self.log.warn(
+                        "director",
+                        f"{task['item_id']} 旧断点深度合同瘦身失败，"
+                        f"保留原修订组继续: {str(exc)[:180]}")
+            if persisted_repair_count:
+                task["payload"]["_codex_contract_repair_count"] = (
+                    persisted_repair_count)
+                ctx.setdefault("_codex_contract_repairs", {})[
+                    task["item_id"]] = persisted_repair_count
             resumed_repair_group = bool(
                 stored.get("autonomous_repair_seeded")
                 or (

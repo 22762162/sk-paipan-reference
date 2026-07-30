@@ -128,7 +128,7 @@ def test_escalation_without_a_concrete_instruction_still_goes_to_human(
         ctx, task, _Result(_escalation_qc(instruction=""))) == ""
 
 
-def test_repair_is_capped_so_a_bad_shot_cannot_burn_quota_forever(
+def test_repair_is_capped_after_third_round_so_bad_shot_cannot_burn_forever(
         app, monkeypatch):
     ctx, task = _ctx_and_task(app, monkeypatch)
     # Codex 每轮给的是不同诊断,合同每次都真的变;这样才走得到上限,
@@ -149,9 +149,31 @@ def test_repair_is_capped_so_a_bad_shot_cannot_burn_quota_forever(
     for _ in range(Director.CODEX_CONTRACT_REPAIR_LIMIT):
         assert app.director._auto_apply_codex_escalation(
             ctx, task, _Result(_escalation_qc()))
-    # 超过上限后转人工,不再无限改
+    # 第三轮会走深度合同瘦身；超过上限后停手，不再无限改。
     assert app.director._auto_apply_codex_escalation(
         ctx, task, _Result(_escalation_qc())) == ""
+
+
+def test_third_targeted_redraw_becomes_deep_contract_slimming(
+        app, monkeypatch):
+    ctx, task = _ctx_and_task(app, monkeypatch)
+    ctx["_codex_contract_repairs"] = {"shot:2": 2}
+    seen = {}
+
+    def deep_repair(_ctx, _task, reason):
+        seen["reason"] = reason
+        _task["payload"]["prompt"] = "第三轮精简后的唯一50mm合同"
+        _task["payload"]["prompt_compact"] = _task["payload"]["prompt"]
+        return "已完成深度合同瘦身"
+
+    monkeypatch.setattr(
+        app.director, "_repair_blocked_prompt_shot", deep_repair)
+    summary = app.director._auto_apply_codex_escalation(
+        ctx, task, _Result(_escalation_qc(action="targeted_redraw")))
+    assert summary
+    assert "深度合同瘦身" in seen["reason"]
+    assert "家具每条腿必须全显" in seen["reason"]
+    assert task["payload"]["_codex_contract_repair_count"] == 3
 
 
 def test_repair_that_does_not_change_the_input_falls_back_to_human(

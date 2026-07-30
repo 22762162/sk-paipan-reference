@@ -763,7 +763,11 @@ def _apply_director_camera(camera, shot, positions, world=None):
     }
     camera["director_end_height_m"] = (
         solved.get("end_position_3d") or {}).get("y")
-    camera["director_end_target_3d"] = solved.get("end_target_3d")
+    # 只有摇/移才真的需要改瞄准点(摇是机位不动只转机身,移是瞄准点随机位
+    # 平移)。其余运镜沿用既有的瞄准点计算——它按姿态算高度(躺姿/坐姿的
+    # 瞄准点比站姿低),比求解器用 height_m 粗算的眼高准。
+    if solved.get("movement") in ("摇", "移"):
+        camera["director_end_target_3d"] = solved.get("end_target_3d")
     camera["scale_distance_m"] = solved["desired_distance_m"]
     camera["scale_for_distance"] = solved["declared"]["shot_size"]
     camera["director_height_m"] = solved["height_m"]

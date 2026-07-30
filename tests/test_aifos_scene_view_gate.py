@@ -47,8 +47,11 @@ class SceneViewGateTest(unittest.TestCase):
 
     def test_gate_runs_before_frame_generation(self):
         import inspect
-        src = inspect.getsource(Director._stage_frames)
-        self.assertIn("_require_scene_views", src)
+        # 同上:读模块文件,避开遗留 monkeypatch
+        from aifos import director as director_module
+        src = inspect.getsource(director_module)
+        body = src[src.find("def _stage_frames(self, ctx):"):][:600]
+        self.assertIn("_require_scene_views", body)
 
 
 if __name__ == "__main__":

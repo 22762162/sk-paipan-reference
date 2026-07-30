@@ -173,7 +173,8 @@ class JobRegistry:
 
     def start(self, title, number, premise="", style="", force=False,
               script=None, review=False, kind=None, action="produce",
-              unique=False, style_pack_id=""):
+              unique=False, style_pack_id="", auto_select_assets=False,
+              fresh_assets=False):
         """启动生产；unique=True 时同一集重复提交复用正在运行的任务。
 
         检查、创建历史和登记 job 必须处在同一把锁内，否则两个浏览器标签
@@ -193,7 +194,9 @@ class JobRegistry:
                 request={"premise": premise, "style": style,
                          "style_pack_id": style_pack_id,
                          "review": bool(review), "kind": kind,
-                         "script_supplied": script is not None})
+                         "script_supplied": script is not None,
+                         "auto_select_assets": bool(auto_select_assets),
+                         "fresh_assets": bool(fresh_assets)})
             self._seq += 1
             job_id = f"j{self._seq}"
             self._jobs[job_id] = {
@@ -206,7 +209,9 @@ class JobRegistry:
             return app.director.produce(
                 title, number, premise=premise, style=style, force=force,
                 script=script, pause_for_confirm=review, kind=kind,
-                run_id=run_id, style_pack_id=style_pack_id)
+                run_id=run_id, style_pack_id=style_pack_id,
+                auto_select_assets=auto_select_assets,
+                fresh_assets=fresh_assets)
 
         self._run(job_id, task)
         return job_id
@@ -3391,6 +3396,11 @@ def make_handler(workspace, jobs):
                 action=("force_rebuild" if body.get("force") else
                         "script_import" if script is not None else
                         "produce"),
+                auto_select_assets=bool(
+                    body.get("auto_select_assets",
+                             not bool(body.get("review", True)))),
+                fresh_assets=bool(
+                    body.get("fresh_assets", body.get("force", False))),
                 unique=True)
             return self._json(
                 {"job_id": job_id, "title": title,

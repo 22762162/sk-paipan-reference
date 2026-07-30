@@ -736,6 +736,8 @@ class ProviderRouter:
         fallbacks = []
         requires_refs = bool(payload.get("require_reference_images")
                              or payload.get("identity_required"))
+        allows_text_bootstrap = bool(
+            payload.get("allow_text_to_image_bootstrap"))
         supplied_refs = []
         for key in ("style_ref", "scene_ref", "chain_first_uri"):
             if payload.get(key):
@@ -786,7 +788,8 @@ class ProviderRouter:
             # generation.
             if (capability in self.IMAGE_CAPABILITIES
                     and provider.conf.get("type") in self.API_IMAGE_TYPES
-                    and not supplied_refs):
+                    and not supplied_refs
+                    and not allows_text_bootstrap):
                 reason = "未携带参考图，禁止图片 API 纯文字生成"
                 self.log.info(
                     "router", f"{name} {reason},回退({capability})")
