@@ -2065,6 +2065,56 @@ def validate_shot_repair(data, payload):
     return None
 
 
+SCENE_ANNOTATE_PROMPT = """你在读一张 720° 等距圆柱全景图(equirectangular),
+它是场景「{location}」的几何真相。请标出画面里每一件**落在地面上的实体**。
+
+关键:你**不需要估计距离**。平台会用「物体底部在图里的位置」做地面射线
+求交,精确解出它的三维坐标——你只要把接触点标准。距离猜测反而会引入误差。
+
+坐标约定:
+- base_u ∈ [0,1):物体与地面接触处的**水平**位置,自图左缘起的比例。
+  图的水平中心 u=0.5 是场景正前方。
+- base_v ∈ [0,1]:同一接触点的**纵向**位置,自图顶起的比例。必须落在
+  物体与地板真正相交的那条线上(不是物体中心,不是顶部)。
+- top_v:该物体最高点的纵向比例(用于解高度)。看不清可省略。
+- width_u:该物体在图里占的水平宽度比例(用于解宽度)。看不清可省略。
+
+只标真实存在于画面里的东西。不要补画面上没有的家具,不要把墙面纹理、
+光斑、影子当成物体。人物不要标(场景是空镜)。
+
+category 取值:furniture(桌椅柜架床)、prop(炉瓶书卷等可移动物件)、
+opening(门窗)、light(灯具)、decor(帷幔挂画盆栽)。
+
+严格输出 JSON:
+{{"objects":[{{"name":"物体中文名","category":"furniture",
+  "base_u":0.5,"base_v":0.78,"top_v":0.55,"width_u":0.12,
+  "note":"用于定位的接触点描述"}}]}}
+只输出 JSON,不要额外说明。
+"""
+
+
+def validate_scene_annotation(data):
+    """场景标注结构校验:只收能解出落地点的条目。"""
+    if not isinstance(data, dict):
+        return "场景标注必须是 JSON 对象"
+    objects = data.get("objects")
+    if not isinstance(objects, list) or not objects:
+        return "场景标注缺少 objects 数组"
+    for index, item in enumerate(objects, 1):
+        if not isinstance(item, dict):
+            return f"objects[{index}] 必须是对象"
+        if not str(item.get("name") or "").strip():
+            return f"objects[{index}] 缺少 name"
+        for key in ("base_u", "base_v"):
+            try:
+                value = float(item[key])
+            except (KeyError, TypeError, ValueError):
+                return f"objects[{index}] 的 {key} 缺失或非数字"
+            if not 0.0 <= value <= 1.0:
+                return f"objects[{index}] 的 {key} 必须在 0~1 之间"
+    return ""
+
+
 def build_prompt(capability, payload):
     """构造编剧/分镜/人物设定提示词(CLI 桥与 Claude API Provider 共用)。
 
@@ -2224,6 +2274,9 @@ def _build_prompt_body(capability, payload):
             script=json.dumps(payload.get("script", {}), ensure_ascii=False))
     if capability == "image_qc":
         return build_qc_prompt(payload)
+    if capability == "scene_annotate":
+        return SCENE_ANNOTATE_PROMPT.format(
+            location=str(payload.get("location") or "该场景"))
     raise ValueError(f"claude 编剧不支持能力: {capability}")
 
 

@@ -448,7 +448,7 @@ class ClaudeApiProvider(Provider):
             prompt = build_prompt(capability, payload)
         except ValueError as exc:
             raise ProviderError(str(exc)) from exc
-        if capability == "image_qc":
+        if capability in ("image_qc", "scene_annotate"):
             content = self._qc_content(prompt, payload)
         elif capability == "script" and payload.get("character_design"):
             content = self._design_content(prompt, payload)
@@ -476,7 +476,12 @@ class ClaudeApiProvider(Provider):
                 and isinstance(data.get("scenes"), list)):
             sanitize_script_entities(data)
         try:
-            if capability == "image_qc":
+            if capability == "scene_annotate":
+                from ..adapters.claude_script import validate_scene_annotation
+                error = validate_scene_annotation(data)
+                if error:
+                    raise ProviderError(f"场景标注无效: {error}")
+            elif capability == "image_qc":
                 from ..adapters.claude_script import validate_image_qc
                 error = validate_image_qc(data)
             elif capability == "script" and payload.get("prompt_refine"):

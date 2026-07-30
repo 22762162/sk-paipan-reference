@@ -65,12 +65,15 @@ from .lessons import (DISTILL_MIN_PENDING, DOMAIN_IMAGE, DOMAIN_SCRIPT,
 from .qc_stats import record_qc
 from .pano_slice import slice_for_block
 from .relations import relation_lines, write_relations
+from .scene_model import actor_placement_issues, build_scene_model
 from .rule_governance import next_revision_round, stack_revision_feedback
 from .spatial_language import derive_movement_term, spatial_lines
 from .storyboard_preflight import (describe_issues, preflight_storyboard,
                                   repairable_shots)
 from .camera_language import MOVEMENT_GEOMETRY
 from .spatial_blocking import (
+    WORLD_DEPTH_M,
+    WORLD_WIDTH_M,
     awareness_sightline_issues,
     build_spatial_plan,
     director_camera_issues,
@@ -2442,6 +2445,71 @@ class Director:
         out_dir = (self.artifacts_root / f"p{project_id:03d}"
                    / "scenes" / "slices")
         return slice_for_block(pano["uri"], out_dir, block)
+
+
+    def build_scene_model(self, project_title, location, *, force=False):
+        """从本场 720° 全景反解出真实三维场景(物体位置/尺寸/落地点)。
+
+        全景此前只当贴图用:看着像那间屋,但平台不知道「书案在哪、多大、
+        人能不能站进去」。有了物体表,人物位置才不再只是文字,物理逻辑
+        (站进家具里、穿墙、够不着)才真正可判。
+        视觉模型只需标出「物体底部在图里的位置」——距离由地面射线求交
+        精确解出,不靠估计。
+        """
+        project = self._studio_project(project_title)
+        location = str(location or "").strip()
+        if not location:
+            raise AifosError("请指定场景名")
+        existing = self.assets.latest(project["id"], "scene_model", location)
+        if existing is not None and not force:
+            try:
+                return json.loads(
+                    Path(existing["uri"]).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass
+        pano = self._scene_view_row(
+            project["id"], location, self.SCENE_PANORAMA_KEY)
+        if pano is None or not pano["uri"] or not Path(pano["uri"]).exists():
+            raise AifosError(
+                f"场景「{location}」还没有 720° 全景母版;"
+                "请先运行 expand_scene_views 再反解三维场景")
+        out_dir = self.artifacts_root / f"p{project['id']:03d}" / "scenes"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "location": location,
+            # 全景本身就是被分析的图(不是"参考图"),视觉通道按待检图上传
+            "image_uri": str(pano["uri"]),
+            "reference_manifest": [{
+                "index": 1, "uri": str(pano["uri"]),
+                "label": f"{location} 720°全景母版", "role": "scene",
+                "binding": "本场几何真相,按它标出每件落地实体的接触点",
+            }],
+        }
+        result = self.router.call("scene_annotate", payload, out_dir)
+        data = getattr(result, "data", None) or {}
+        model = build_scene_model(
+            data.get("objects") or [], location=location,
+            room={"floor_width_m": WORLD_WIDTH_M,
+                  "floor_depth_m": WORLD_DEPTH_M,
+                  "wall_height_m": 4.2},
+            panorama_uri=str(pano["uri"]))
+        model["provider"] = getattr(result, "provider", "")
+        model["panorama_version"] = pano["version"]
+        safe = "".join(ch if ch.isalnum() else "_" for ch in location)[:40]
+        dest = out_dir / f"scene_model_{safe}.json"
+        dest.write_text(json.dumps(model, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
+        self.assets.register(
+            project["id"], "scene_model", location, str(dest),
+            meta={"objects": len(model["objects"]),
+                  "issues": len(model["issues"]),
+                  "panorama_version": pano["version"]})
+        self.log.info(
+            "director",
+            f"场景「{location}」反解出 {len(model['objects'])} 件实体"
+            + (f",{len(model['issues'])} 条自检问题"
+               if model["issues"] else ""))
+        return model
 
     def _scene_view_reference(self, project_id, location, camera,
                               fresh_run_id=None):

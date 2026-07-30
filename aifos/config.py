@@ -90,7 +90,8 @@ DEFAULTS = {
         "claude": {
             # 经 aifos.adapters.claude_script 桥接 claude -p 实际编剧
             "type": "cli", "enabled": False,
-            "capabilities": ["script", "storyboard", "image_qc"],
+            "capabilities": ["script", "storyboard", "image_qc",
+                             "scene_annotate"],
             "command": ["python3", "-m", "aifos.adapters.claude_script",
                         "--claude", "claude"],
             "reference_images": True,
@@ -132,7 +133,8 @@ DEFAULTS = {
         "claude_api": {
             # Claude 官方 API 直连(Messages API):Claude CLI 的 API 模式
             "type": "claude_api", "enabled": False,
-            "capabilities": ["script", "storyboard", "image_qc"],
+            "capabilities": ["script", "storyboard", "image_qc",
+                             "scene_annotate"],
             "endpoint": "https://api.anthropic.com", "api_key": "",
             "model": "claude-opus-4-8", "max_tokens": 16000,
             "reference_images": True,
