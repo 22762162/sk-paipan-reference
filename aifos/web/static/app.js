@@ -5969,67 +5969,351 @@ async function setLessonApproval(projectId, episodeId, lessonId, approved, btn) 
   }
 }
 
-function relationCanvasHtml(data) {
-  const rel = data.relations;
-  if (!rel || !(rel.nodes || []).length) return "";
+/* ================= 生产画布 v2 · 导演工作台 =================
+   参照 LibTV 无限画布的精髓(所有素材一目了然、节点即流程、可直接
+   操作),按 AIFOS 自动产线的定位改造:不做自由连线的创作画布,做
+   "一屏看全生产、点卡即可动手"的导演板。
+   - 无限平移缩放;每场一条泳道,镜头=图卡(关键帧/首帧/尾帧/视频层)
+   - 相邻卡之间是帧链接点(尾帧→首帧),断链标红
+   - 顶部资产栏:人物/道具/场景母版;点资产→高亮引用它的镜头卡
+     (以 reference_inputs 实配为准,取代旧版蜘蛛网连线)
+   - 点镜头卡→浮层:大图/提示词/QC问题/一键重画/人工通过
+   轮询重绘不丢视角:平移缩放/图层/选中态存在 prodCanvasState。 */
+const prodCanvasState = { x: 40, y: 24, scale: 1, layer: "keyframe",
+                          assetFocus: "", episodeId: 0 };
+
+function _pcShotModel(data) {
+  const art = data.artifacts || {};
   const items = ((data.render_plan || {}).items) || [];
-  const shotStatus = {};
+  const planByShot = {};
   items.forEach((i) => {
     const m = /^shot:(\d+)$/.exec(i.id || "");
-    if (m) shotStatus[Number(m[1])] = i.status;
+    if (m) planByShot[Number(m[1])] = i;
   });
-  const chars = rel.nodes.filter((n) => n.type === "character");
-  const scenes = rel.nodes.filter((n) => n.type === "scene");
-  const shots = rel.nodes.filter((n) => n.type === "shot");
-  const GAP = 46, TOP = 30;
-  const colY = (list, idx) => TOP + idx * GAP
-    + Math.max(0, (Math.max(chars.length, scenes.length, shots.length)
-      - list.length) / 2) * GAP;
-  const pos = {};
-  chars.forEach((n, i) => { pos[n.id] = { x: 120, y: colY(chars, i) }; });
-  scenes.forEach((n, i) => { pos[n.id] = { x: 360, y: colY(scenes, i) }; });
-  shots.forEach((n, i) => { pos[n.id] = { x: 600, y: colY(shots, i) }; });
-  const H = TOP + Math.max(chars.length, scenes.length, shots.length, 1) * GAP;
-  const edgeEls = (rel.edges || []).map((e) => {
-    const a = pos[e.from], b = pos[e.to];
-    if (!a || !b) return "";
-    const common = `class="rel-edge rel-${e.type}" data-from="${esc(e.from)}" data-to="${esc(e.to)}"`;
-    if (e.type === "co_scene") {
-      const bend = 70 + Math.abs(a.y - b.y) / 5;
-      return `<g ${common}><path d="M ${a.x - 46} ${a.y} C ${a.x - bend} ${a.y}, ${b.x - bend} ${b.y}, ${b.x - 46} ${b.y}" fill="none"/>
-        <text x="${a.x - bend + 6}" y="${(a.y + b.y) / 2 - 4}">${esc(e.label || "同场")}</text></g>`;
-    }
-    const x1 = a.x + 46, x2 = b.x - 46;
-    return `<g ${common}><path d="M ${x1} ${a.y} C ${x1 + 60} ${a.y}, ${x2 - 60} ${b.y}, ${x2} ${b.y}" fill="none"/></g>`;
-  }).join("");
-  const nodeEl = (n) => {
-    const p = pos[n.id];
-    let cls = `rel-node rel-node-${n.type}`;
-    let sub = "";
-    if (n.type === "character") sub = n.role || "";
-    if (n.type === "scene") sub = `第${n.scene_no}场`;
-    if (n.type === "shot") {
-      const st = shotStatus[n.shot_no] || "";
-      cls += st ? ` st-${st}` : "";
-      sub = { done: "✓完成", reused: "✓复用", generating: "生成中",
-        failed: "✗失败" }[st] || (st ? st : "待产");
-    }
-    return `<g class="${cls}" data-node="${esc(n.id)}" transform="translate(${p.x},${p.y})">
-      <rect x="-46" y="-16" width="92" height="32" rx="8"/>
-      <text class="rel-label" y="${sub ? -2 : 4}">${esc(n.label)}</text>
-      ${sub ? `<text class="rel-sub" y="12">${esc(sub)}</text>` : ""}</g>`;
+  const frameByShot = {};
+  items.forEach((i) => {
+    const m = /^frames:(\d+)$/.exec(i.id || "");
+    if (m) frameByShot[Number(m[1])] = i;
+  });
+  const layers = {
+    keyframe: art.images || {}, first: art.first || {},
+    last: art.last || {}, video: art.videos || {},
   };
-  return `<div class="relation-canvas">
-    <h3>🧭 生产画布 <span class="dim">人物—场景—镜头关系线(点节点高亮它的线;
-      出图与质检提示词自动携带同一份关系线,保持人物关联一致)</span></h3>
-    <div class="rel-scroll"><svg viewBox="0 0 740 ${H}" width="740" height="${H}"
-      class="rel-svg" role="img" aria-label="人物场景镜头关系画布">
-      <text class="rel-col" x="120" y="14">人物</text>
-      <text class="rel-col" x="360" y="14">场景</text>
-      <text class="rel-col" x="600" y="14">镜头</text>
-      ${edgeEls}
-      ${rel.nodes.map(nodeEl).join("")}
-    </svg></div></div>`;
+  const scenes = {};
+  ((data.storyboard || {}).shots || []).forEach((shot) => {
+    const no = Number(shot.shot_no);
+    const sceneNo = shot.scene_no ?? "?";
+    const plan = planByShot[no] || {};
+    const frames = frameByShot[no] || {};
+    const qc = plan.qc || {};
+    const issues = (qc.issues || []).length
+      || (plan.error ? 1 : 0);
+    (scenes[sceneNo] = scenes[sceneNo] || []).push({
+      no, shot, plan, frames,
+      status: plan.status || "pending",
+      frameStatus: frames.status || "",
+      issues,
+      // 资产→镜头映射用确定性事实:出场名单+场次+描述文本
+      // (reference_inputs 只在生成时短暂存在,存档后为空)
+      refText: [
+        ...(shot.characters || []),
+        String(shot.location || ""),
+        String(shot.description || "").slice(0, 160),
+        String(shot.prompt || "").slice(0, 160),
+      ].join(" "),
+      thumbs: {
+        keyframe: layers.keyframe[String(no)] || "",
+        first: layers.first[String(no)] || "",
+        last: layers.last[String(no)] || "",
+        video: layers.video[String(no)] || "",
+      },
+    });
+  });
+  Object.values(scenes).forEach((list) => list.sort((a, b) => a.no - b.no));
+  return scenes;
+}
+
+function _pcAssets(data) {
+  const art = data.artifacts || {};
+  const rows = [];
+  (art.cast_art || []).forEach((a) => rows.push(
+    { kind: "人物", label: a.name || a.label || "", url: a.url || a.uri || "" }));
+  (art.prop_art || []).forEach((a) => rows.push(
+    { kind: "道具", label: a.name || a.label || "", url: a.url || a.uri || "" }));
+  (art.scene_art || []).forEach((a) => rows.push(
+    { kind: "场景", label: a.name || a.label || "", url: a.url || a.uri || "" }));
+  // 场景的 ::view:xxx 派生视角与主图同名同高亮,单列只是噪音
+  return rows.filter((r) => r.url && !String(r.label).includes("::view:"));
+}
+
+const PC_STATUS_LABEL = {
+  done: "完成", reused: "复用", generating: "生成中",
+  retrying: "自动修图", awaiting_human: "待人工", failed: "失败",
+  pending: "排队",
+};
+
+function relationCanvasHtml(data) {
+  try {
+    return _relationCanvasHtmlInner(data);
+  } catch (err) {
+    console.error("生产画布渲染失败(不影响页面其余部分):", err);
+    return `<div class="panel dim">生产画布渲染失败:${esc(
+      String(err && err.message || err).slice(0, 120))}</div>`;
+  }
+}
+
+function _relationCanvasHtmlInner(data) {
+  const scenes = _pcShotModel(data);
+  const sceneNos = Object.keys(scenes);
+  if (!sceneNos.length) return "";
+  prodCanvasState.episodeId = data.episode.id;
+  const assets = _pcAssets(data);
+  const layer = prodCanvasState.layer;
+  const lanes = sceneNos.map((sceneNo) => {
+    const cards = scenes[sceneNo].map((cell, idx) => {
+      const src = cell.thumbs[layer] || cell.thumbs.keyframe || "";
+      const st = layer === "first" || layer === "last"
+        ? (cell.frameStatus || cell.status) : cell.status;
+      const refKeys = cell.refText || "";
+      // 帧链接点:上一卡尾帧 ↔ 本卡首帧
+      let link = "";
+      if (idx > 0) {
+        const prev = scenes[sceneNo][idx - 1];
+        const ok = prev.thumbs.last && cell.thumbs.first;
+        const broken = !prev.thumbs.last && cell.thumbs.first;
+        link = `<div class="pc-link ${ok ? "ok" : broken ? "broken" : ""}"
+          title="${ok ? "帧链已接:上一镜尾帧=本镜首帧"
+            : broken ? "断链:本镜首帧已出,但上一镜尾帧缺失"
+            : "帧链未生成"}">${ok ? "⟶" : broken ? "⚠" : "┄"}</div>`;
+      }
+      return link + `
+      <div class="pc-card st-${st}${cell.issues ? " has-issues" : ""}"
+        data-shot="${cell.no}" data-refs="${esc(refKeys)}"
+        title="镜头${cell.no} · ${PC_STATUS_LABEL[st] || st}">
+        <div class="pc-thumb">${src
+          ? (layer === "video" && cell.thumbs.video
+             ? `<video src="${esc(cell.thumbs.video)}" muted playsinline
+                  preload="metadata"></video>`
+             : `<img src="${esc(thumbUrl(src, 360))}" loading="lazy"
+                  alt="镜头${cell.no}">`)
+          : `<span class="pc-empty">${PC_STATUS_LABEL[st] || "未生成"}</span>`}
+          ${cell.issues ? `<span class="pc-badge">!${cell.issues}</span>` : ""}
+        </div>
+        <div class="pc-foot"><b>#${cell.no}</b>
+          <span>${esc(String((cell.shot || {}).camera || "").split("·")[0]
+            .slice(0, 8))}</span>
+          <i class="pc-dot"></i></div>
+      </div>`;
+    }).join("");
+    return `<div class="pc-lane">
+      <div class="pc-lane-head">第 ${esc(String(sceneNo))} 场
+        <span class="dim">${scenes[sceneNo].length} 镜</span></div>
+      <div class="pc-lane-cards">${cards}</div>
+    </div>`;
+  }).join("");
+  const assetRail = assets.length ? `<div class="pc-assets">${assets.map(
+    (a) => `<button type="button" class="pc-asset" data-asset="${
+      esc(a.label || (a.url || "").split("/").pop().split("?")[0])}"
+      title="${esc(a.kind)}·${esc(a.label)}:点击高亮使用它的镜头">
+      <img src="${esc(thumbUrl(a.url, 120))}" loading="lazy" alt="">
+      <span>${esc(a.label.slice(0, 6))}</span></button>`).join("")}
+    </div>` : "";
+  return `<div class="panel pc-panel">
+    <div class="pc-toolbar">
+      <h3>🎬 生产画布 <span class="dim">拖拽平移·滚轮缩放·点资产看引用·点镜头卡操作</span></h3>
+      <div class="pc-tools">
+        ${["keyframe", "first", "last", "video"].map((k) =>
+          `<button type="button" class="pc-layer${layer === k ? " on" : ""}"
+            data-layer="${k}">${{keyframe: "关键帧", first: "首帧",
+            last: "尾帧", video: "视频"}[k]}</button>`).join("")}
+        <span class="pc-sep"></span>
+        <button type="button" class="pc-zoom" data-zoom="out">−</button>
+        <button type="button" class="pc-zoom" data-zoom="in">＋</button>
+        <button type="button" class="pc-zoom" data-zoom="fit">适应</button>
+      </div>
+    </div>
+    ${assetRail}
+    <div class="pc-viewport" id="pc-viewport">
+      <div class="pc-world" id="pc-world"
+        style="transform:translate(${prodCanvasState.x}px,${prodCanvasState.y}px) scale(${prodCanvasState.scale})">
+        ${lanes}
+      </div>
+    </div>
+  </div>`;
+}
+
+function _pcApplyTransform() {
+  const world = document.getElementById("pc-world");
+  if (world) world.style.transform =
+    `translate(${prodCanvasState.x}px,${prodCanvasState.y}px) scale(${prodCanvasState.scale})`;
+}
+
+/* 平移(拖拽空白处)+缩放(滚轮):状态存全局,轮询重绘不丢视角 */
+(() => {
+  let drag = null;
+  document.addEventListener("pointerdown", (ev) => {
+    const vp = ev.target.closest?.("#pc-viewport");
+    if (!vp || ev.target.closest(".pc-card") || ev.target.closest("button"))
+      return;
+    drag = { x: ev.clientX, y: ev.clientY,
+             ox: prodCanvasState.x, oy: prodCanvasState.y };
+    vp.setPointerCapture?.(ev.pointerId);
+  });
+  document.addEventListener("pointermove", (ev) => {
+    if (!drag) return;
+    prodCanvasState.x = drag.ox + ev.clientX - drag.x;
+    prodCanvasState.y = drag.oy + ev.clientY - drag.y;
+    _pcApplyTransform();
+  });
+  document.addEventListener("pointerup", () => { drag = null; });
+  document.addEventListener("wheel", (ev) => {
+    const vp = ev.target.closest?.("#pc-viewport");
+    if (!vp) return;
+    ev.preventDefault();
+    const rect = vp.getBoundingClientRect();
+    const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+    const prev = prodCanvasState.scale;
+    const next = Math.min(2.4, Math.max(
+      0.25, prev * (ev.deltaY > 0 ? 0.9 : 1.11)));
+    // 以光标为缩放中心
+    prodCanvasState.x = mx - (mx - prodCanvasState.x) * (next / prev);
+    prodCanvasState.y = my - (my - prodCanvasState.y) * (next / prev);
+    prodCanvasState.scale = next;
+    _pcApplyTransform();
+  }, { passive: false });
+})();
+
+/* 工具条 + 资产高亮 + 镜头卡浮层(全部事件委托,重绘不丢绑定) */
+document.addEventListener("click", async (ev) => {
+  const layerBtn = ev.target.closest?.(".pc-layer");
+  if (layerBtn) {
+    prodCanvasState.layer = layerBtn.dataset.layer;
+    renderCanvasView(prodCanvasState.episodeId);
+    return;
+  }
+  const zoomBtn = ev.target.closest?.(".pc-zoom");
+  if (zoomBtn) {
+    if (zoomBtn.dataset.zoom === "fit") {
+      Object.assign(prodCanvasState, { x: 40, y: 24, scale: 1 });
+    } else {
+      prodCanvasState.scale = Math.min(2.4, Math.max(0.25,
+        prodCanvasState.scale * (zoomBtn.dataset.zoom === "in" ? 1.2 : 0.83)));
+    }
+    _pcApplyTransform();
+    return;
+  }
+  const assetBtn = ev.target.closest?.(".pc-asset");
+  if (assetBtn) {
+    const key = assetBtn.dataset.asset || "";
+    const on = prodCanvasState.assetFocus !== key;
+    prodCanvasState.assetFocus = on ? key : "";
+    document.querySelectorAll(".pc-asset").forEach((el) =>
+      el.classList.toggle("on", on && el === assetBtn));
+    // 全名不中时用尾词兜底:「沈砚青旧路引」在镜头描述里常只写
+    // 「旧路引」,人物名前缀省略是常态
+    const tails = [key.slice(-4), key.slice(-3)].filter(
+      (t) => t.length >= 3 && t !== key);
+    document.querySelectorAll(".pc-card").forEach((card) => {
+      const refs = card.dataset.refs || "";
+      const hit = on && (refs.includes(key)
+        || tails.some((t) => refs.includes(t)));
+      card.classList.toggle("ref-hit", hit);
+      card.classList.toggle("ref-dim", on && !hit);
+    });
+    return;
+  }
+  const card = ev.target.closest?.(".pc-card");
+  if (card && card.closest("#pc-viewport")) {
+    _pcOpenShotPanel(Number(card.dataset.shot));
+  }
+});
+
+async function _pcOpenShotPanel(shotNo) {
+  const data = await api(`/api/episode/${prodCanvasState.episodeId}`);
+  const scenes = _pcShotModel(data);
+  let cell = null;
+  Object.values(scenes).forEach((list) => list.forEach((c) => {
+    if (c.no === shotNo) cell = c;
+  }));
+  if (!cell) return;
+  document.querySelector(".pc-shot-overlay")?.remove();
+  const qc = (cell.plan || {}).qc || {};
+  const issues = qc.issues || [];
+  const big = cell.thumbs[prodCanvasState.layer] || cell.thumbs.keyframe;
+  const overlay = document.createElement("div");
+  overlay.className = "pc-shot-overlay";
+  overlay.innerHTML = `<div class="pc-shot-panel">
+    <div class="pc-shot-head"><b>镜头 ${cell.no}</b>
+      <span class="chip">${PC_STATUS_LABEL[cell.status] || cell.status}</span>
+      <button type="button" class="close">关闭 ✕</button></div>
+    <div class="pc-shot-body">
+      <div class="pc-shot-media">${big
+        ? (prodCanvasState.layer === "video" && cell.thumbs.video
+           ? `<video src="${esc(cell.thumbs.video)}" controls playsinline></video>`
+           : `<img src="${esc(big)}" alt="镜头${cell.no}">`)
+        : `<div class="pc-empty big">尚未生成</div>`}</div>
+      <div class="pc-shot-info">
+        <p class="dim">${esc(String((cell.shot || {}).camera || ""))}</p>
+        <p>${esc(String((cell.shot || {}).description || "").slice(0, 160))}</p>
+        ${issues.length ? `<div class="pc-issues"><b>质检问题 ${issues.length} 条</b>
+          <ul>${issues.slice(0, 5).map((i) =>
+            `<li>${esc(String(i).slice(0, 90))}</li>`).join("")}</ul></div>`
+          : (cell.plan.error
+             ? `<div class="pc-issues"><b>错误</b><p>${
+                 esc(String(cell.plan.error).slice(0, 160))}</p></div>` : "")}
+        <details><summary>查看实际提示词</summary>
+          <pre class="pc-prompt">${esc(String(
+            cell.plan.prompt_used || cell.plan.prompt || "").slice(0, 1800))}</pre>
+        </details>
+        <div class="pc-shot-actions">
+          <button type="button" class="primary" data-act="redo">🔁 重画本镜</button>
+          ${["awaiting_human", "failed"].includes(cell.status)
+            ? `<button type="button" data-act="pass">✅ 人工通过</button>` : ""}
+          <button type="button" data-act="table">📋 到分镜表定位</button>
+        </div>
+      </div>
+    </div>
+  </div>`;
+  const close = () => overlay.remove();
+  overlay.addEventListener("click", (ev) => {
+    if (ev.target === overlay) close();
+  });
+  overlay.querySelector(".close").onclick = close;
+  overlay.querySelectorAll("[data-act]").forEach((btn) => {
+    btn.onclick = async () => {
+      const act = btn.dataset.act;
+      if (act === "table") {
+        close();
+        location.hash = `#/episode/${prodCanvasState.episodeId}`;
+        setTimeout(() => document.querySelector(
+          `[data-shot-row="${cell.no}"]`)?.scrollIntoView(
+            { block: "center", behavior: "smooth" }), 400);
+        return;
+      }
+      btn.disabled = true;
+      try {
+        if (act === "redo") {
+          await api("/api/redo_items", { method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              episode_id: prodCanvasState.episodeId,
+              item_ids: [`shot:${cell.no}`] }) });
+          showToast(`镜头${cell.no} 已加入重画队列`, "ok");
+        } else if (act === "pass") {
+          await api("/api/qc_override", { method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              episode_id: prodCanvasState.episodeId,
+              item_ids: [`shot:${cell.no}`],
+              note: "画布人工通过" }) });
+          showToast(`镜头${cell.no} 已人工通过`, "ok");
+        }
+        close();
+        pollCanvas(prodCanvasState.episodeId);
+      } catch (e) { showToast(e.message, "error"); btn.disabled = false; }
+    };
+  });
+  document.body.appendChild(overlay);
 }
 
 /* 画布节点点击高亮(事件委托:看板轮询重绘也不丢绑定) */
