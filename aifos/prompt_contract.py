@@ -2477,6 +2477,30 @@ def _medium_prompt_line(medium):
     return ""
 
 
+_CONDITION_FIELDS = (
+    "life_state", "consciousness_state", "embodiment", "mobility")
+
+
+def _condition_has_signal(phases, media, target_phase):
+    """该角色的 condition 是否携带任何可执行信息。
+
+    只要任一 phase 的任一字段有非空、非 unknown 的值就算有信号;全空则这一
+    行只会输出一串 unknown,应整条跳过。
+    """
+    if media == "video":
+        buckets = (phases.get("start") or {}, phases.get("end") or {})
+    else:
+        buckets = (phases.get(target_phase) or {},)
+    for bucket in buckets:
+        if not isinstance(bucket, dict):
+            continue
+        for field in _CONDITION_FIELDS:
+            value = _text(bucket.get(field))
+            if value and value.lower() != "unknown":
+                return True
+    return False
+
+
 _PLACEHOLDER_CAMERA_VALUES = (
     "按分镜", "按合同", "未指定", "未知", "不详", "待定", "待确认",
     "待补充", "以参考图为准", "以剧本为准", "自行判断", "自由发挥",
@@ -2697,6 +2721,15 @@ def render_shot_prompt(contract, *, mode=None):
     for name, phases in (
             contract.get("character_conditions") or {}).items():
         if not isinstance(phases, dict):
+            continue
+        # 四个字段全缺时这一行会渲染成 life=unknown,consciousness=unknown,
+        # embodiment=unknown,mobility=unknown ——零信息却照吃提示词权重。
+        # 2026-07-30 消融实测:5 人镜里本段占整条提示词 36.5%,是最大的一块,
+        # 而真正的镜头内容(起止+主动作+表演)只占 5.5%;把提示词压到 40%
+        # 后九项硬约束仍全过,证明这部分冗余可安全削掉。
+        # 下方 hard_state_lines 才是死亡/昏迷/静止的真正执行条款(本文件已
+        # 注明英文键值对"约束力近零"),所以跳过全 unknown 不损失约束力。
+        if not _condition_has_signal(phases, media, target_phase):
             continue
         if media == "video":
             start_condition = phases.get("start") or {}

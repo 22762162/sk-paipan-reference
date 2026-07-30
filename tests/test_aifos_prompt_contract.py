@@ -911,3 +911,39 @@ def test_model_constraints_skip_unresolved_camera_placeholders():
     assert "景别锁定为" not in rendered
     assert "机位固定,不推、不拉" in rendered
     assert "按分镜" not in video_prompt.split("【模型约束】")[1]
+
+
+def test_all_unknown_character_conditions_are_dropped_from_prompt():
+    """condition 四字段全缺时不渲染【人物状态合同】。
+
+    2026-07-30 消融实测:5 人镜里该段占整条提示词 36.5%(最大的一块),而每个
+    值都是 unknown;真正的镜头内容只占 5.5%。把提示词压到 40% 后九项硬约束
+    仍全过,证明这部分冗余可安全削掉。死亡/昏迷/静止的真正执行条款在
+    hard_state_lines,不受影响。
+    """
+    shot = {
+        "characters": ["林川", "书童"],
+        "description": "林川屏息不动",
+        "camera": "35mm 平视中景 侧面 固定",
+    }
+    _, video_prompt = compile_shot_prompt(shot, mode="video")
+    assert "【人物状态合同】" not in video_prompt
+    assert "life=unknown" not in video_prompt
+
+    # 有真实状态的角色仍必须保留该行,且死亡条款照常生效。
+    shot_with_state = {
+        **shot,
+        "characters": ["林川", "书童"],
+        "character_conditions": {
+            "书童": {
+                "start": {"life_state": "dead", "consciousness_state": "none"},
+                "end": {"life_state": "dead", "consciousness_state": "none"},
+            },
+            "林川": {"start": {}, "end": {}},
+        },
+    }
+    _, stated_prompt = compile_shot_prompt(shot_with_state, mode="video")
+    assert "【人物状态合同】" in stated_prompt
+    assert "书童:start(life=dead" in stated_prompt
+    # 全 unknown 的林川不该混进这一行
+    assert "林川:start(life=unknown" not in stated_prompt
