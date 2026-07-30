@@ -16,7 +16,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .director_camera import solve_camera
+from .director_camera import (primary_actor, solve_camera,
+                              solve_camera_motion)
 
 
 SCHEMA = "aifos.spatial-blocking/v3"
@@ -592,18 +593,25 @@ def _attach_camera_3d(
     # 调度器解出的镜高是按「角度」维度算的(俯拍抬高、仰拍压低);
     # 旧启发式只读机位/运动,读不到角度,镜高因此恒为默认值。
     solved_h = camera.get("director_height_m")
+    solved_end_h = camera.get("director_end_height_m")
     start_h = (float(solved_h) if solved_h is not None
                else _camera_height(position, movement, "start"))
-    end_h = (float(solved_h) if solved_h is not None
-             else _camera_height(position, movement, "end"))
-    if solved_h is not None and "升" in movement:
-        end_h = min(MAX_SOLVED_CAMERA_HEIGHT_M, start_h + 1.2)
-    elif solved_h is not None and "降" in movement:
-        end_h = max(.35, start_h - .9)
+    # 终点高度由运镜求解给出(升/降已在其中算好),不再二次加减
+    end_h = (float(solved_end_h) if solved_end_h is not None
+             else (float(solved_h) if solved_h is not None
+                   else _camera_height(position, movement, "end")))
     start = _world_point(camera["start"], start_h)
     end = _world_point(camera["end"], end_h)
     target_start = _world_point(start_target, start_target_height)
     target_end = _world_point(end_target, end_target_height)
+    # 摇/移/跟 的终点瞄准点由运镜求解决定:摇是机位不动只转机身,
+    # 用「人物终点」当瞄准点会把它错算成机位平移。
+    solved_target = camera.get("director_end_target_3d")
+    if isinstance(solved_target, dict) and solved_target:
+        target_end = {"x": round(float(solved_target.get("x", 0.0)), 2),
+                      "y": round(float(solved_target.get(
+                          "y", end_target_height)), 2),
+                      "z": round(float(solved_target.get("z", 0.0)), 2)}
     horizontal_fov = float(camera.get("fov_degrees") or 39.6)
     vertical_fov = math.degrees(
         2 * math.atan(math.tan(math.radians(horizontal_fov) / 2) * 16 / 9))
@@ -654,6 +662,15 @@ def director_camera_issues(blocking):
                     "severity": "warning", "field": "shot_size",
                     "message": (f"镜{shot_no} 未声明景别,机位按中景兜底;"
                                 "景别是机距的唯一依据,请在分镜写明"),
+                })
+            if dc.get("movement_wall_clamped"):
+                issues.append({
+                    "scene_no": scene_no, "shot_no": shot_no,
+                    "severity": "warning", "field": "movement",
+                    "message": (
+                        f"镜{shot_no} 的「{dc.get('movement')}」运镜会把机位"
+                        f"推出墙外,已钳在室内({dc.get('movement_amount')});"
+                        "请缩短运镜幅度或改机位方向"),
                 })
             if dc.get("wall_clamped"):
                 issues.append({
@@ -709,18 +726,27 @@ def _apply_director_camera(camera, shot, positions, world=None):
     不守恒——EP1 实测八镜只有 2 镜吻合声明景别,镜高恒定 1.55m,
     方位逐镜乱跳 134°→168°→-93°→15°。
     """
+    world_dict = world if isinstance(world, dict) else {}
     solved = solve_camera(
         shot, positions, axis_side=1, scene_center=(0.0, 0.0),
-        world=world if isinstance(world, dict) else {})
+        world=world_dict)
     if not solved:
         return camera
-    canvas = _canvas_from_world(solved["position_3d"])
-    moving = bool(camera.get("moving"))
-    delta = {"x": camera["end"]["x"] - camera["start"]["x"],
-             "y": camera["end"]["y"] - camera["start"]["y"]} if moving else None
-    camera["start"] = canvas
-    camera["end"] = (_point(canvas["x"] + delta["x"], canvas["y"] + delta["y"])
-                     if delta else dict(canvas))
+    # 运镜也求解:此前终点只是画布像素位移(end_x += 150 之类),既没有米制
+    # 依据,也和 MOVEMENT_GEOMETRY 写死的几何对不上——提示词说「沿视线
+    # 推近」,三维里可能是斜着平移。现在每个运镜词有确定的几何解。
+    subject = primary_actor(positions) or {}
+    start_xz = (float((subject.get("start_3d") or {}).get("x", 0.0)),
+                float((subject.get("start_3d") or {}).get("z", 0.0)))
+    end_xz = (float((subject.get("end_3d") or {}).get("x", start_xz[0])),
+              float((subject.get("end_3d") or {}).get("z", start_xz[1])))
+    solved = solve_camera_motion(
+        solved, shot, subject_start=start_xz, subject_end=end_xz,
+        world=world_dict)
+    camera["start"] = _canvas_from_world(solved["position_3d"])
+    camera["end"] = _canvas_from_world(solved["end_position_3d"])
+    camera["moving"] = bool(solved.get("moving"))
+    camera["movement"] = solved.get("movement") or camera.get("movement")
     camera["director_camera"] = {
         "distance_m": solved["distance_m"],
         "desired_distance_m": solved["desired_distance_m"],
@@ -729,7 +755,15 @@ def _apply_director_camera(camera, shot, positions, world=None):
         "pitch_deg": solved["pitch_deg"],
         "declared": solved["declared"],
         "wall_clamped": solved["wall_clamped"],
+        "movement": solved.get("movement"),
+        "movement_amount": solved.get("movement_amount"),
+        "movement_wall_clamped": solved.get("movement_wall_clamped"),
+        "end_position_3d": solved.get("end_position_3d"),
+        "end_target_3d": solved.get("end_target_3d"),
     }
+    camera["director_end_height_m"] = (
+        solved.get("end_position_3d") or {}).get("y")
+    camera["director_end_target_3d"] = solved.get("end_target_3d")
     camera["scale_distance_m"] = solved["desired_distance_m"]
     camera["scale_for_distance"] = solved["declared"]["shot_size"]
     camera["director_height_m"] = solved["height_m"]

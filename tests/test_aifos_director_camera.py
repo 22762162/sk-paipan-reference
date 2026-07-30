@@ -229,3 +229,146 @@ class BlockingIssueAggregationTest(unittest.TestCase):
         src = inspect.getsource(director)
         self.assertIn("director_camera_warnings", src)
         self.assertIn("director_camera_issues(blocking)", src)
+
+
+class MovementSolverTest(unittest.TestCase):
+    """运镜必须解成米制起止机位——此前只是画布像素位移,和运镜词表
+    写死的几何对不上(提示词说「沿视线推近」,三维里可能是斜着平移)。"""
+
+    def _solve(self, movement, subject=(0.0, 0.0), subject_end=None,
+               size="中景"):
+        from aifos.director_camera import solve_camera_motion
+        shot = _shot(f"{size}，平视，正面，{movement}")
+        actors = [_actor(x=subject[0], z=subject[1])]
+        if subject_end:
+            actors[0]["end_3d"] = {"x": subject_end[0], "y": 0.0,
+                                   "z": subject_end[1]}
+        cam = solve_camera(shot, actors)
+        return solve_camera_motion(
+            cam, shot, subject_start=subject, subject_end=subject_end,
+            world={"floor_width_m": 10, "floor_depth_m": 7})
+
+    def _dist(self, point, subject):
+        return math.dist((point["x"], point["z"]), subject)
+
+    def test_push_shortens_distance_along_sight_line(self):
+        cam = self._solve("推")
+        start = self._dist(cam["position_3d"], (0, 0))
+        end = self._dist(cam["end_position_3d"], (0, 0))
+        self.assertLess(end, start)
+        self.assertIn("推近", cam["movement_amount"])
+
+    def test_fast_push_is_stronger_than_push(self):
+        near = self._dist(self._solve("急推")["end_position_3d"], (0, 0))
+        normal = self._dist(self._solve("推")["end_position_3d"], (0, 0))
+        self.assertLess(near, normal)
+
+    def test_pull_lengthens_distance(self):
+        cam = self._solve("拉", size="特写")
+        self.assertGreater(self._dist(cam["end_position_3d"], (0, 0)),
+                           self._dist(cam["position_3d"], (0, 0)))
+
+    def test_pan_keeps_camera_still_and_sweeps_target(self):
+        """摇 = 机位不动只转机身。用「人物终点」当瞄准点会错算成机位平移。"""
+        cam = self._solve("摇")
+        self.assertEqual(cam["position_3d"], cam["end_position_3d"])
+        self.assertNotEqual(cam["target_3d"], cam["end_target_3d"])
+
+    def test_orbit_preserves_distance(self):
+        cam = self._solve("环绕")
+        self.assertAlmostEqual(self._dist(cam["position_3d"], (0, 0)),
+                               self._dist(cam["end_position_3d"], (0, 0)),
+                               delta=0.05)
+
+    def test_follow_preserves_relative_distance(self):
+        """跟拍的正确性判据:主体在画面里位置基本不变 = 相对机距守恒。"""
+        cam = self._solve("跟", subject=(0.0, 0.0), subject_end=(1.5, 0.0))
+        before = self._dist(cam["position_3d"], (0.0, 0.0))
+        after = self._dist(cam["end_position_3d"], (1.5, 0.0))
+        self.assertAlmostEqual(before, after, delta=0.05)
+        self.assertIn("跟移", cam["movement_amount"])
+
+    def test_crane_changes_height_not_distance(self):
+        up = self._solve("升")
+        self.assertGreater(up["end_position_3d"]["y"], up["position_3d"]["y"])
+        self.assertAlmostEqual(self._dist(up["position_3d"], (0, 0)),
+                               self._dist(up["end_position_3d"], (0, 0)),
+                               delta=0.05)
+        down = self._solve("降")
+        self.assertLess(down["end_position_3d"]["y"],
+                        down["position_3d"]["y"])
+
+    def test_static_and_handheld_have_no_net_displacement(self):
+        for movement in ("固定", "手持"):
+            cam = self._solve(movement)
+            self.assertEqual(cam["position_3d"], cam["end_position_3d"])
+            self.assertFalse(cam["moving"])
+
+    def test_movement_amount_is_metric_and_citable(self):
+        """运动量要能直接进视频提示词,必须带米/度这类可核验的量。"""
+        for movement in ("推", "拉", "摇", "移", "环绕", "升", "降"):
+            amount = self._solve(movement)["movement_amount"]
+            self.assertTrue(any(unit in amount for unit in ("米", "°")),
+                            f"{movement} 的运动量缺可核验的量: {amount}")
+
+    def test_wall_clamp_is_reported_for_movement(self):
+        cam = self._solve("拉", subject=(0.0, 2.8), size="全景")
+        if cam["movement_wall_clamped"]:
+            from aifos.spatial_blocking import director_camera_issues
+            blocking = {"shot_index": {"1": {
+                "scene_no": 1, "camera": {"director_camera": {
+                    "declared": {"shot_size": "全景"},
+                    "yaw_deg": 0.0, "wall_clamped": False,
+                    "movement_wall_clamped": True, "movement": "拉",
+                    "movement_amount": cam["movement_amount"],
+                    "desired_distance_m": 4.6, "distance_m": 4.6}}}}}
+            fields = {i["field"] for i in director_camera_issues(blocking)}
+            self.assertIn("movement", fields)
+
+    def test_longest_movement_token_wins(self):
+        from aifos.director_camera import declared_movement
+        self.assertEqual(declared_movement(_shot("中景，急推")), "急推")
+        self.assertEqual(declared_movement(_shot("中景，推")), "推")
+        self.assertEqual(declared_movement(_shot("中景")), "固定")
+
+
+class VideoPromptMotionTest(unittest.TestCase):
+    """米制运动量必须进视频提示词——此前只有「推」「摇」这类词,幅度全靠
+    模型自己想:同一个「推」可能推半米也可能推三米,和空间调度对不上。"""
+
+    def _clause(self, movement, amount, actors=None):
+        from aifos.spatial_language import motion_clause
+        # 相机需带真实三维字段:_actor_line 靠它算屏幕分区与被摄距离
+        camera = {
+            "start_3d": {"x": 0.0, "y": 1.5, "z": 4.0},
+            "end_3d": {"x": 0.0, "y": 1.5, "z": 4.0},
+            "target_3d": {"x": 0.0, "y": 1.2, "z": 0.0},
+            "target_start_3d": {"x": 0.0, "y": 1.2, "z": 0.0},
+            "target_end_3d": {"x": 0.0, "y": 1.2, "z": 0.0},
+            "fov_degrees": 54.4, "movement": movement,
+            "director_camera": {"movement": movement,
+                                "movement_amount": amount},
+        }
+        return motion_clause({"camera": camera, "actors": actors or []})
+
+    def test_metric_amount_reaches_the_prompt(self):
+        text = self._clause("推", "沿视线推近约 1.1 米(机距 2.8→1.7m)")
+        self.assertIn("沿视线推近约 1.1 米", text)
+        self.assertIn("摄影机运镜", text)
+
+    def test_static_shot_emits_nothing(self):
+        self.assertEqual(self._clause("固定", "机位与焦距全程不变"), "")
+
+    def test_camera_moves_while_actor_stays(self):
+        text = self._clause("环绕", "以主体为圆心绕行约 30°(机距保持 2.8m)")
+        self.assertIn("绕行约 30°", text)
+        self.assertIn("人物不位移", text)
+
+    def test_actor_motion_still_rendered_alongside(self):
+        actor = {"name": "沈眉", "moving": True,
+                 "start_3d": {"x": -1.0, "y": 0, "z": 0},
+                 "end_3d": {"x": 1.0, "y": 0, "z": 0},
+                 "pose_label_start": "站姿", "pose_label_end": "站姿"}
+        text = self._clause("跟", "与主体同速同向跟移约 2.0 米", [actor])
+        self.assertIn("跟移约 2.0 米", text)
+        self.assertIn("沈眉", text)

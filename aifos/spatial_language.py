@@ -250,9 +250,21 @@ def motion_clause(block):
             segs.append(f"姿态由{pose_start}变为{pose_end}")
         if segs:
             moving.append(f"{name}:" + "、".join(segs))
+    # 运镜的米制运动量:导演调度器解出来的,与三维起止机位同源。
+    # 此前提示词只有「推」「摇」这类词,幅度全靠模型自己想——同一个
+    # 「推」可能推半米也可能推三米,和空间调度对不上。
+    director = camera.get("director_camera") or {}
+    amount = str(director.get("movement_amount") or "").strip()
+    movement_line = ""
+    if amount and str(director.get("movement") or "") not in ("", "固定"):
+        movement_line = f"摄影机运镜:{amount}"
     if not moving:
-        return ""
-    return ("；".join(moving)
+        return (movement_line + "；本镜人物不位移,只有摄影机在动"
+                if movement_line else "")
+    body = "；".join(moving)
+    if movement_line:
+        body = f"{movement_line}；{body}"
+    return (body
             + "；静态关键帧只定格所属相位的位置,不表现移动过程;"
             "视频单元中该位移必须连续且脚步与地面接触真实")
 

@@ -284,3 +284,150 @@ def solve_scene(shots_with_actors, *, scene_center=(0.0, 0.0), world=None):
         solved.append(camera)
         previous = camera
     return {"cameras": solved, "issues": issues, "axis_side": side}
+
+
+# ---------------------------------------------------------------------------
+# 运镜求解:把运镜词解成米制的起止机位
+#
+# 此前运镜只改画布像素(end_x += 150 之类),换算成三维后既没有米制依据,
+# 也和 MOVEMENT_GEOMETRY 里写死的几何描述对不上——提示词说"沿视线推近",
+# 三维里却可能是斜着平移。现在每个词有确定的几何解与可核验的运动量。
+
+MOVEMENT_KINDS = (
+    "急推", "推", "拉", "摇", "移", "跟", "升", "降", "环绕", "手持", "固定")
+PUSH_RATIO = 0.62          # 推:机距收到 62%(约紧一档景别)
+FAST_PUSH_RATIO = 0.45     # 急推:更狠
+PULL_RATIO = 1.55          # 拉:机距放到 155%
+PAN_SWEEP_DEG = 25.0       # 摇:机身扫过的角度(机位不动)
+ORBIT_SWEEP_DEG = 30.0     # 环绕:绕主体扫过的角度
+TRACK_SHIFT_M = 1.2        # 移:横向平移量
+CRANE_UP_M = 1.2
+CRANE_DOWN_M = 0.9
+
+
+def declared_movement(shot):
+    design = ((shot or {}).get("five_dimensions") or {}).get(
+        "camera_design") or {}
+    for source in (design.get("movement"), (shot or {}).get("camera")):
+        text = _text(source)
+        if not text:
+            continue
+        for token in MOVEMENT_KINDS:      # 急推 先于 推,长词优先
+            if token in text:
+                return token
+    return "固定"
+
+
+def _polar(subject_xz, distance, yaw_deg, height):
+    return {
+        "x": round(subject_xz[0] + distance * math.sin(math.radians(yaw_deg)),
+                   2),
+        "y": round(height, 2),
+        "z": round(subject_xz[1] + distance * math.cos(math.radians(yaw_deg)),
+                   2),
+    }
+
+
+def _clamp_room(point, world):
+    world = world if isinstance(world, dict) else {}
+    try:
+        half_w = float(world.get("floor_width_m") or 10.0) / 2 - 0.15
+        half_d = float(world.get("floor_depth_m") or 7.0) / 2 - 0.15
+    except (TypeError, ValueError):
+        half_w, half_d = 4.85, 3.35
+    clamped = abs(point["x"]) > half_w or abs(point["z"]) > half_d
+    point["x"] = round(max(-half_w, min(half_w, point["x"])), 2)
+    point["z"] = round(max(-half_d, min(half_d, point["z"])), 2)
+    return point, clamped
+
+
+def solve_camera_motion(camera, shot, *, subject_start, subject_end=None,
+                        world=None):
+    """按运镜词求解终点机位与终点瞄准点(米制)。
+
+    camera 是 solve_camera 的返回值。返回新增字段:
+    end_position_3d / end_target_3d / movement / movement_amount(可核验的
+    运动量文字,给视频提示词直接引用)。
+    """
+    if not camera:
+        return camera
+    movement = declared_movement(shot)
+    start = dict(camera["position_3d"])
+    target = dict(camera["target_3d"])
+    sx, sz = float(subject_start[0]), float(subject_start[1])
+    ex, ez = ((float(subject_end[0]), float(subject_end[1]))
+              if subject_end else (sx, sz))
+    distance = float(camera["distance_m"]) or 1.0
+    yaw = float(camera["yaw_deg"])
+    height = float(camera["height_m"])
+    side = 1 if int(camera.get("axis_side", 1)) >= 0 else -1
+    end_pos, end_target, amount = dict(start), dict(target), ""
+    clamped = False
+
+    if movement in ("推", "急推"):
+        ratio = FAST_PUSH_RATIO if movement == "急推" else PUSH_RATIO
+        new_d = max(0.45, distance * ratio)
+        end_pos = _polar((sx, sz), new_d, yaw, height)
+        amount = f"沿视线推近约 {distance - new_d:.1f} 米(机距 {distance:.1f}→{new_d:.1f}m)"
+    elif movement == "拉":
+        new_d = distance * PULL_RATIO
+        end_pos = _polar((sx, sz), new_d, yaw, height)
+        end_pos, clamped = _clamp_room(end_pos, world)
+        actual = math.dist((end_pos["x"], end_pos["z"]), (sx, sz))
+        amount = f"沿视线后拉约 {actual - distance:.1f} 米(机距 {distance:.1f}→{actual:.1f}m)"
+    elif movement == "摇":
+        # 机位不动,只转机身:终点瞄准点绕机位扫过 PAN_SWEEP_DEG
+        sweep = PAN_SWEEP_DEG * side
+        base = _yaw_between((start["x"], start["z"]), (target["x"], target["z"]))
+        reach = math.dist((start["x"], start["z"]), (target["x"], target["z"])) or 1.0
+        end_target = {
+            "x": round(start["x"] + reach * math.sin(math.radians(base + sweep)), 2),
+            "y": target["y"],
+            "z": round(start["z"] + reach * math.cos(math.radians(base + sweep)), 2),
+        }
+        amount = f"机位不动,机身水平摇过约 {abs(sweep):.0f}°"
+    elif movement == "环绕":
+        sweep = ORBIT_SWEEP_DEG * side
+        end_pos = _polar((sx, sz), distance, yaw + sweep, height)
+        end_pos, clamped = _clamp_room(end_pos, world)
+        amount = f"以主体为圆心绕行约 {abs(sweep):.0f}°(机距保持 {distance:.1f}m)"
+    elif movement == "移":
+        lateral = math.radians(yaw + 90.0 * side)
+        end_pos = {"x": round(start["x"] + TRACK_SHIFT_M * math.sin(lateral), 2),
+                   "y": start["y"],
+                   "z": round(start["z"] + TRACK_SHIFT_M * math.cos(lateral), 2)}
+        end_pos, clamped = _clamp_room(end_pos, world)
+        end_target = {"x": round(target["x"] + (end_pos["x"] - start["x"]), 2),
+                      "y": target["y"],
+                      "z": round(target["z"] + (end_pos["z"] - start["z"]), 2)}
+        amount = f"横向平移约 {TRACK_SHIFT_M:.1f} 米(前后景产生视差)"
+    elif movement == "跟":
+        # 与主体同速同向:相机随主体位移平移,画面里主体位置基本不变
+        dx, dz = ex - sx, ez - sz
+        end_pos = {"x": round(start["x"] + dx, 2), "y": start["y"],
+                   "z": round(start["z"] + dz, 2)}
+        end_pos, clamped = _clamp_room(end_pos, world)
+        end_target = {"x": round(ex, 2), "y": target["y"], "z": round(ez, 2)}
+        moved = math.hypot(dx, dz)
+        amount = (f"与主体同速同向跟移约 {moved:.1f} 米"
+                  if moved > 0.05 else "主体未位移,跟拍退化为固定机位")
+    elif movement in ("升", "降"):
+        delta = CRANE_UP_M if movement == "升" else -CRANE_DOWN_M
+        new_h = max(MIN_CAMERA_HEIGHT_M,
+                    min(MAX_CAMERA_HEIGHT_M, height + delta))
+        end_pos = {"x": start["x"], "y": round(new_h, 2), "z": start["z"]}
+        amount = f"机位{'升' if delta > 0 else '降'}约 {abs(new_h - height):.1f} 米"
+    elif movement == "手持":
+        amount = "机位无净位移,只有手持呼吸感的轻微晃动"
+    else:
+        amount = "机位与焦距全程不变"
+
+    camera.update({
+        "movement": movement,
+        "end_position_3d": end_pos,
+        "end_target_3d": end_target,
+        "movement_amount": amount,
+        "movement_wall_clamped": clamped,
+        "moving": end_pos != start or end_target != target,
+    })
+    return camera
