@@ -73,6 +73,7 @@ from .camera_language import MOVEMENT_GEOMETRY
 from .spatial_blocking import (
     awareness_sightline_issues,
     build_spatial_plan,
+    director_camera_issues,
     mark_spatial_reference_requirements,
     requires_spatial_reference,
     shot_blocking,
@@ -4294,6 +4295,25 @@ class Director:
                 })
         return actions
 
+    @staticmethod
+    def _spatial_rebind_excludes_camera(role, reason):
+        """Recognize a spatial-only rebind even when the role stays spatial."""
+        role = str(role or "").strip().lower()
+        if role in {"spatial_blocking", "blocking_only"}:
+            return True
+        if role != "spatial":
+            return False
+        text = str(reason or "")
+        camera_terms = r"相机|摄影机|焦段|镜头参数|视场角|FOV|camera|lens"
+        exclusion_terms = r"排除|不继承|禁止继承|不得继承|忽略|不读取"
+        return bool(
+            re.search(
+                rf"(?:{exclusion_terms}).{{0,60}}(?:{camera_terms})",
+                text, flags=re.IGNORECASE)
+            or re.search(
+                rf"(?:{camera_terms}).{{0,60}}(?:{exclusion_terms})",
+                text, flags=re.IGNORECASE))
+
     def _apply_image_reference_adjustments(
             self, payload, qc_spec, diagnostics, *, instruction=""):
         """Apply model proposals through a narrow asset-safe allowlist.
@@ -4422,8 +4442,8 @@ class Director:
                     matches.append(match)
                 requested_role = str(
                     action.get("role") or target_role or "manual")
-                if requested_role in {
-                        "spatial_blocking", "blocking_only"}:
+                if self._spatial_rebind_excludes_camera(
+                        requested_role, action.get("reason")):
                     match["reference_role"] = "spatial"
                     match["inherits"] = [
                         "blocking", "occlusion", "screen_direction",
@@ -4696,7 +4716,8 @@ class Director:
                         "reason": "重建后的资产绑定不存在",
                     })
                     continue
-                if role in {"spatial_blocking", "blocking_only"}:
+                if self._spatial_rebind_excludes_camera(
+                        role, operation.get("reason")):
                     match["reference_role"] = "spatial"
                     match["inherits"] = [
                         "blocking", "occlusion", "screen_direction",
@@ -7537,6 +7558,14 @@ class Director:
             blocking.setdefault("validation", {})[
                 "awareness_warnings"] = awareness
             for item in awareness[:4]:
+                self.log.warn("director", item["message"])
+        # 导演调度问题(缺景别声明/贴墙摆位/相邻镜近似跳帧)——机位问题
+        # 到出图层才发现就已经浪费一次生成,必须在文本层暴露。
+        camera_issues = director_camera_issues(blocking)
+        if camera_issues:
+            blocking.setdefault("validation", {})[
+                "director_camera_warnings"] = camera_issues
+            for item in camera_issues[:4]:
                 self.log.warn("director", item["message"])
         write_spatial_svgs(blocking, ctx["out_root"] / "blocking")
         write_spatial_reference_pngs(

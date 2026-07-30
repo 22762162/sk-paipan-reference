@@ -175,3 +175,57 @@ class WiringTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BlockingIssueAggregationTest(unittest.TestCase):
+    """跨镜调度问题必须在文本层暴露——到出图层才发现已浪费一次生成。"""
+
+    def _blocking(self, rows):
+        return {"shot_index": {
+            str(n): {"scene_no": 1, "camera": {"director_camera": dc}}
+            for n, dc in rows}}
+
+    def _dc(self, size="中景", yaw=0.0, clamped=False, want=2.8, got=2.8):
+        return {"declared": {"shot_size": size, "angle": "平视",
+                             "position": "正面"},
+                "yaw_deg": yaw, "wall_clamped": clamped,
+                "desired_distance_m": want, "distance_m": got}
+
+    def test_flags_near_identical_consecutive_setups(self):
+        from aifos.spatial_blocking import director_camera_issues
+        issues = director_camera_issues(self._blocking([
+            (1, self._dc(yaw=10.0)), (2, self._dc(yaw=14.0))]))
+        self.assertTrue(any(i["field"] == "coverage" for i in issues))
+
+    def test_size_change_is_a_legitimate_cut(self):
+        from aifos.spatial_blocking import director_camera_issues
+        issues = director_camera_issues(self._blocking([
+            (1, self._dc(size="中景", yaw=10.0)),
+            (2, self._dc(size="特写", yaw=12.0))]))
+        self.assertFalse(any(i["field"] == "coverage" for i in issues))
+
+    def test_flags_missing_shot_size_and_wall_clamp(self):
+        from aifos.spatial_blocking import director_camera_issues
+        issues = director_camera_issues(self._blocking([
+            (1, self._dc(size="")),
+            (2, self._dc(size="远景", yaw=90.0, clamped=True,
+                         want=7.5, got=3.1))]))
+        fields = {i["field"] for i in issues}
+        self.assertIn("shot_size", fields)
+        self.assertIn("distance", fields)
+
+    def test_yaw_wrap_is_handled(self):
+        """179° 与 -179° 只差 2°,不能算成 358°。"""
+        from aifos.spatial_blocking import director_camera_issues
+        issues = director_camera_issues(self._blocking([
+            (1, self._dc(yaw=179.0)), (2, self._dc(yaw=-179.0))]))
+        self.assertTrue(any(i["field"] == "coverage" for i in issues))
+
+    def test_wired_into_blocking_validation(self):
+        import inspect
+
+        from aifos import director
+
+        src = inspect.getsource(director)
+        self.assertIn("director_camera_warnings", src)
+        self.assertIn("director_camera_issues(blocking)", src)

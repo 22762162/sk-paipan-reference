@@ -365,6 +365,37 @@ def test_persisted_reference_remove_survives_payload_rebuild(
     assert rebuilt["asset_matches"] == []
 
 
+def test_spatial_rebind_reason_excludes_camera_even_with_generic_role(
+        app, tmp_path):
+    spatial = tmp_path / "blocking.png"
+    spatial.write_bytes(b"blocking")
+    payload = {
+        "prompt": "本镜",
+        "spatial_ref": str(spatial),
+        "asset_matches": [{
+            "asset_id": 88, "kind": "spatial_blocking",
+            "name": "shot_021_space", "label": "本镜空间调度图",
+            "uri": str(spatial), "reference_role": "spatial",
+        }],
+    }
+    app.director._attach_reference_manifest(payload)
+    changes = app.director._apply_image_reference_adjustments(
+        payload, {}, {
+            "reference_diagnosis": {
+                "status": "needs_adjustment", "issues": []},
+            "reference_adjustments": [{
+                "action": "rebind", "target_index": 1, "role": "spatial",
+                "reason": "保留站位遮挡，但明确排除图内135mm焦段",
+            }],
+        })
+    assert changes["applied"]
+    app.director._attach_reference_manifest(payload)
+    item = payload["reference_manifest"][0]
+    assert "blocking" in item["inherits"]
+    assert "camera" not in item["inherits"]
+    assert "focal_length" in item["excludes"]
+
+
 # ---- 画面达标却被合同诊断一票否决(ep1 shot:8) ----
 
 def _assess(verdict, spec=None):

@@ -627,6 +627,67 @@ def _attach_camera_3d(
     return camera
 
 
+def director_camera_issues(blocking):
+    """从已求解的机位里汇总导演调度问题(跨镜连续性/缺声明/贴墙)。
+
+    机位在 _apply_director_camera 里逐镜求解;这里只做**跨镜**判定,
+    避免重复求解。写进 blocking.validation,供分镜出厂预检在文本层拦住
+    ——机位问题到出图层才发现就已经浪费一次生成。
+    """
+    issues = []
+    by_scene = {}
+    for key, block in sorted((blocking.get("shot_index") or {}).items(),
+                             key=lambda kv: int(kv[0]) if str(kv[0]).isdigit()
+                             else 0):
+        dc = (block.get("camera") or {}).get("director_camera") or {}
+        if not dc:
+            continue
+        by_scene.setdefault(block.get("scene_no"), []).append((key, block, dc))
+    for scene_no, rows in by_scene.items():
+        previous = None
+        for key, _block, dc in rows:
+            shot_no = key
+            declared = dc.get("declared") or {}
+            if not declared.get("shot_size"):
+                issues.append({
+                    "scene_no": scene_no, "shot_no": shot_no,
+                    "severity": "warning", "field": "shot_size",
+                    "message": (f"镜{shot_no} 未声明景别,机位按中景兜底;"
+                                "景别是机距的唯一依据,请在分镜写明"),
+                })
+            if dc.get("wall_clamped"):
+                issues.append({
+                    "scene_no": scene_no, "shot_no": shot_no,
+                    "severity": "warning", "field": "distance",
+                    "message": (
+                        f"镜{shot_no} 按声明景别应退到 "
+                        f"{dc.get('desired_distance_m')}m 但会穿墙,已贴墙"
+                        f"摆位(实际 {dc.get('distance_m')}m);"
+                        "请改景别或把人物挪离墙面"),
+                })
+            if previous is not None:
+                delta = abs(_wrap_deg(
+                    float(dc.get("yaw_deg") or 0)
+                    - float(previous[2].get("yaw_deg") or 0)))
+                same = (declared.get("shot_size")
+                        == (previous[2].get("declared") or {}).get("shot_size"))
+                if same and delta < 12.0:
+                    issues.append({
+                        "scene_no": scene_no, "shot_no": shot_no,
+                        "severity": "warning", "field": "coverage",
+                        "message": (
+                            f"镜{shot_no} 与镜{previous[0]} 机位方位仅差 "
+                            f"{delta:.0f}°、景别相同,剪在一起近似跳帧;"
+                            "请换景别或换机位"),
+                    })
+            previous = (shot_no, _block, dc)
+    return issues
+
+
+def _wrap_deg(deg):
+    return ((float(deg) + 180.0) % 360.0) - 180.0
+
+
 def _canvas_from_world(world_point):
     """世界坐标(米) → 二维画布坐标。_world_point 的逆,让示意图与三维同源。"""
     try:

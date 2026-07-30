@@ -4,6 +4,7 @@ import base64
 import copy
 import http.client
 import json
+import re
 import threading
 import time
 
@@ -83,8 +84,14 @@ def test_index_and_static(server):
     html = raw.decode("utf-8")
     assert "AIFOS" in html
     assert "历史记录" in html
-    assert "/static/style.css?v=20260727-character-identity-1" in html
-    assert "/static/app.js?v=20260727-character-initial-2" in html
+    # 断言缓存版本号的**存在与形态**,不写死字面量:每次 UI 改动都要
+    # bump 版本号(PWA 缓存靠它失效),写死字面量会让这条断言变成
+    # 「谁改 UI 谁挂测试」的噪声,真正该守的是「版本号没丢」。
+    for asset in ("style.css", "app.js"):
+        match = re.search(
+            rf"/static/{re.escape(asset)}\?v=([0-9]{{8}}-[A-Za-z0-9._-]+)",
+            html)
+        assert match, f"{asset} 缺少缓存版本号(?v=YYYYMMDD-…)"
     status, ctype, app_js = _request(server["port"], "GET", "/static/app.js")
     assert status == 200 and "javascript" in ctype
     assert b"showBlockingOverlay" in app_js
