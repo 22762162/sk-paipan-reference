@@ -175,5 +175,47 @@ class ReportShapeTest(unittest.TestCase):
         self.assertEqual(report["shots"], 1)
 
 
+class DurationTest(unittest.TestCase):
+    """时长越界是分镜层就能算出的废镜:短于4秒提交必拒(真实案例:
+    mock 产线写 2.5 秒镜头,一路混到视频提交才被拒),超上限禁止静默截短。"""
+
+    @staticmethod
+    def _shot(duration, **extra):
+        return {"shot_no": 1, "scene_no": 1, "camera": "全景",
+                "characters": ["甲"], "duration": duration, **extra}
+
+    def test_below_four_seconds_is_caught(self):
+        report = preflight_storyboard({}, {"shots": [self._shot(2.5)]})
+        kinds = [item["kind"] for item in report["issues"]]
+        self.assertEqual(kinds, ["duration_short"])
+        self.assertIn("4秒", report["issues"][0]["detail"])
+
+    def test_over_fifteen_without_upgrade_is_caught(self):
+        report = preflight_storyboard({}, {"shots": [self._shot(20)]})
+        kinds = [item["kind"] for item in report["issues"]]
+        self.assertEqual(kinds, ["duration_long"])
+        self.assertIn("seedance2_5", report["issues"][0]["suggestion"])
+
+    def test_upgrade_tier_shot_may_run_16_to_30_seconds(self):
+        report = preflight_storyboard({}, {"shots": [
+            self._shot(24, video_model_tier="seedance2_5")]})
+        self.assertTrue(report["passed"])
+
+    def test_upgrade_tier_still_capped_at_thirty(self):
+        report = preflight_storyboard({}, {"shots": [
+            self._shot(45, video_model_tier="seedance2_5")]})
+        kinds = [item["kind"] for item in report["issues"]]
+        self.assertEqual(kinds, ["duration_long"])
+        self.assertIn("30秒", report["issues"][0]["detail"])
+
+    def test_normal_band_and_missing_duration_pass(self):
+        report = preflight_storyboard({}, {"shots": [
+            self._shot(5.5),
+            {"shot_no": 2, "scene_no": 1, "camera": "全景",
+             "characters": ["甲"]},
+        ]})
+        self.assertTrue(report["passed"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -177,6 +177,12 @@ def production_profile(config, standard=None):
             "fingerprint", "legacy-config"),
         "video_model": production.get(
             "video_model", jimeng.get("model_version", "seedance2.0fast_vip")),
+        # Seedance 2.5 is an optional, shot-scoped capability upgrade.  Keep
+        # the immutable default model above intact and carry the policy in the
+        # archived production profile so the director/UI can explain why an
+        # individual shot was (or was not) upgraded.
+        "model_upgrade_policy": copy.deepcopy(
+            production.get("model_upgrade_policy") or {}),
         "resolution": production.get(
             "resolution", jimeng.get("video_resolution", "720p")),
         "preferred_segment_seconds": production.get(
@@ -1200,6 +1206,14 @@ def _split_dialogue_text(text, max_chars):
     return [piece for piece in pieces if piece]
 
 
+# Seedance 全家族时长硬下限。五维标准的表演语法(拆句对白/独立肢体镜/
+# 听者反应镜/情绪留白镜)按叙事节奏会算出 1.5-3.5 秒的镜头,提交层必被
+# 拒收——真实产线曾因此白付往返(dreamina 适配器的老注释就是这坑)。
+# 2-4 秒的"情绪节拍"仍是表演意图,落到镜头时长时用呼吸感/入出画余量
+# 垫到硬底之上;在生成器内垫底,而不是让下游预检逐镜叫编剧返工。
+SEEDANCE_MIN_SHOT_SECONDS = 4.0
+
+
 def _split_dialogue_shots(raw_shots, rules):
     dialogue_rules = rules.get("dialogue", {})
     performance_rules = rules.get("performance", {})
@@ -1223,8 +1237,9 @@ def _split_dialogue_shots(raw_shots, rules):
             physical = copy.deepcopy(raw)
             physical["kind"] = "physical"
             physical["dialogue"] = None
-            physical["duration"] = max(
-                2.0, min(4.0, float(raw.get("duration") or 3.0) / 2))
+            # 动作快镜原为父镜一半、带宽 2-4 秒;提交硬底 4 秒后带宽
+            # 收敛为定值——快感由起止状态的干脆表达承担,不靠压秒数。
+            physical["duration"] = SEEDANCE_MIN_SHOT_SECONDS
             physical["prompt"] = f"独立肢体动作镜：{description}"
             out.append(physical)
             speaker = dialogue.get("character", "角色")
@@ -1244,8 +1259,9 @@ def _split_dialogue_shots(raw_shots, rules):
                 "index": part_index, "total": len(parts),
                 "source_duration": source_duration,
             }
-            split["duration"] = _dialogue_duration(
-                split["dialogue"], rules, emotion)
+            split["duration"] = max(
+                SEEDANCE_MIN_SHOT_SECONDS,
+                _dialogue_duration(split["dialogue"], rules, emotion))
             split["speech_emotion"] = emotion
             out.append(split)
     return out
@@ -1313,6 +1329,7 @@ def _append_performance_beats(raw_shots, script, rules=None):
                     # 听者镜头 ≥ 当前说话镜的 2/3 是硬规则；reaction_seconds
                     # 仅作为常规建议区间，不能反过来截短有效反应。
                     "duration": max(
+                        SEEDANCE_MIN_SHOT_SECONDS,
                         float(reaction_range[0]),
                         float(raw.get("duration", 3)) * reaction_ratio),
                     "characters": [listener],
@@ -1353,7 +1370,9 @@ def _append_performance_beats(raw_shots, script, rules=None):
                 "kind": "beat",
                 "description": f"{lead[0]}用呼吸、眼神和细微肢体完成本场情绪余波",
                 "camera": "特写定镜",
-                "duration": sum(float(x) for x in beat_range) / len(beat_range),
+                "duration": max(
+                    SEEDANCE_MIN_SHOT_SECONDS,
+                    sum(float(x) for x in beat_range) / len(beat_range)),
                 "characters": lead,
                 "dialogue": None,
                 "prompt": f"{lead[0]}无台词留白表演，具体微表情与呼吸变化",

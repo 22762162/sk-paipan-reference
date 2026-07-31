@@ -314,7 +314,8 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
   台词后自动插入。Q版不计真实人数、不参与站位、不被他人感知，继承当前锁定
   衣服但无默认道具，表情动作可以夸张；比例固定为大头小身，约1.8头身，
   头占总高约58%，身体与四肢明显小于头；内心发声时真人宿主闭口且不生成字幕；
-- shot_no 从 1 连续编号；duration 单位秒，优先 5-8 秒，最长 15 秒；
+- shot_no 从 1 连续编号；duration 单位秒，优先 5-8 秒，最长 15 秒，
+  最短 4 秒(Seedance 硬下限,短于4秒的节拍并入相邻镜头或用反应拍填满)；
 - 每镜必须输出 `frame_targets`，分别锁定 keyframe、first_frame、last_frame
   三种静态用途；每项只含一个 phase(start/end/freeze) 和一个可见、可拍、
   无时间过程的 state，并明确 fallback:false。人物镜可引用已经写清的起止状态，
@@ -2129,7 +2130,8 @@ SHOT_REPAIR_PROMPT = """你是本剧的分镜导演。镜头{shot_no}的提示�
 - 景别必须能真实容纳镜头宣称的全部可见人物与画面区域;若剧情本意是
   只看局部,则在 description 里明确写出只框入哪些人物/道具、其余出画;
 - 不得增删人物、道具,不得改变任何人物状态/朝向/位置等剧情事实,
-  不得改动对白、时长、事件(event_id/phase)、prop_registry;
+  不得改动对白、事件(event_id/phase)、prop_registry;
+- {duration_rule}
 - camera 保持与原镜头相同的结构:原来是字符串就输出字符串,
   原来是对象就输出同结构的完整对象。
 
@@ -2138,8 +2140,19 @@ SHOT_REPAIR_PROMPT = """你是本剧的分镜导演。镜头{shot_no}的提示�
  "shot_no": {shot_no},
  "camera": "修复后的镜头(与原结构一致)",
  "description": "修复后的完整镜头描述;不需要改时省略此键",
+ "duration": "仅在被授权修时长时输出修正后的秒数,否则省略此键",
  "repair_summary": "一句话说明改了什么、如何化解每条熔断原因"}}
 """
+
+# 时长默认不许动(悄悄改时长=悄悄改叙事节奏);只有熔断原因本身就是
+# 时长违规时,导演层才授权本次修复动 duration——那不是"静默拉长",
+# 而是编剧带着叙事意识回分镜层改时长,并把表演内容填满新时长。
+DURATION_RULE_LOCKED = "不得改动时长(duration);"
+DURATION_RULE_ALLOWED = (
+    "本次熔断包含时长违规,你被授权且必须把 duration 修到合法档内"
+    "(Seedance 最短4秒;常规上限15秒):过短就用反应拍/呼吸感/情绪留白"
+    "把表演拉满,并把补充的表演写进 description;过长就压缩表演节拍。"
+    "禁止只改数字不改表演内容;")
 
 
 def validate_shot_repair(data, payload):
@@ -2164,6 +2177,21 @@ def validate_shot_repair(data, payload):
     description = data.get("description")
     if description is not None and not str(description).strip():
         return "description 若输出则不能为空"
+    duration = data.get("duration")
+    if duration is not None:
+        if not (payload or {}).get("allow_duration_change"):
+            return "本次修复未授权改动时长,不得输出 duration"
+        try:
+            seconds = float(duration)
+        except (TypeError, ValueError):
+            return "duration 必须是秒数"
+        # 修复后的时长必须直接落在可提交档内,否则修了等于没修
+        if seconds < 4:
+            return "修复后时长仍低于 Seedance 硬下限4秒"
+        if seconds > 15:
+            return "修复后时长超过常规上限15秒;超长镜头应拆分而非拉长"
+        if not str(description or "").strip():
+            return "改时长必须同步改 description 写明补充/压缩的表演"
     if not str(data.get("repair_summary") or "").strip():
         return "缺少 repair_summary"
     return None
@@ -2320,7 +2348,11 @@ def _build_prompt_body(capability, payload):
             location=payload.get("location", "") or "见镜头描述",
             style=(payload.get("style")
                    or "项目画风未指定;保持与已生成画面一致"),
-            blocking_reason=payload.get("blocking_reason", ""))
+            blocking_reason=payload.get("blocking_reason", ""),
+            duration_rule=(
+                DURATION_RULE_ALLOWED
+                if payload.get("allow_duration_change")
+                else DURATION_RULE_LOCKED))
     if capability == "script" and payload.get("story_analysis"):
         return STORY_ANALYSIS_PROMPT.format(
             style=(payload.get("style")

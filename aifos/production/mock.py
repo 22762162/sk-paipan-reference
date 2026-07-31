@@ -807,7 +807,10 @@ class MockProvider(Provider):
                 "kind": "environment",
                 "description": scene["action"],
                 "camera": _pick(CAMERAS, seed, shot_no),
-                "duration": 2.5,
+                # 离线契约模拟必须服从真实 Seedance 契约(最短4秒):
+                # 曾因写 2.5/3.0 秒,全链路测试在视频层被真实 fail-closed
+                # 拦下、静默回退 mock,报错却指向产线而不是这里。
+                "duration": 5.0,
                 "characters": scene["characters"],
                 "dialogue": None,
                 "prompt": (
@@ -823,7 +826,7 @@ class MockProvider(Provider):
                     "kind": "dialogue",
                     "description": f"{line['character']}说话",
                     "camera": _pick(CAMERAS, seed, shot_no),
-                    "duration": 3.0,
+                    "duration": 6.0,
                     "characters": [line["character"]],
                     "dialogue": line,
                     "prompt": (
@@ -963,7 +966,7 @@ class MockProvider(Provider):
     # ---- 视频 ----
     def _gen_video(self, payload, out_dir):
         shot_no = payload["shot_no"]
-        duration = float(payload.get("duration", 3.0))
+        duration = float(payload.get("duration", 5.0))
         uri = _json_artifact(out_dir / f"shot_{shot_no:03d}.video.json", {
             "type": "mock-video",
             "shot_no": shot_no,

@@ -28,7 +28,18 @@ KIND_FIXERS = {
     "framing_distance": "camera",
     "prop_phase": "props",
     "axis_flip": "camera",
+    "duration_short": "timing",
+    "duration_long": "timing",
 }
+
+# Seedance 全家族时长硬下限 4 秒;2.0 世代上限 15 秒。低于下限的镜头
+# 拖到视频提交层才会被拒收(白等一轮),超上限则被禁止静默截短——两者
+# 都是分镜层就能算出来的废镜,必须在这里暴露。2.5 按镜升级(声明
+# video_model_tier=seedance2_5)的镜头上限另由 seedance_policy 运行时
+# 核验,预检只放行其 16-30 秒声明,不代替运行时闸门。
+DURATION_MIN_SECONDS = 4.0
+DURATION_MAX_BASELINE = 15.0
+DURATION_MAX_UPGRADE = 30.0
 
 
 def _scale_of(shot):
@@ -115,6 +126,40 @@ def _check_prop_phases(shot):
         "本镜内无变化就克隆同一状态")
 
 
+def _shot_upgrade_tier(shot):
+    tier = str(shot.get("video_model_tier") or "").strip().lower()
+    return tier in ("seedance2_5", "seedance2.5")
+
+
+def _check_duration(shot):
+    """时长越界在分镜层就是废镜:短于4秒提交必拒,超上限禁止静默截短。"""
+    raw = shot.get("duration")
+    if raw is None:
+        return None  # 缺失由分镜结构校验负责,预检不重复报
+    try:
+        duration = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if duration < DURATION_MIN_SECONDS:
+        return _issue(
+            shot, "duration_short",
+            f"本镜声明{duration:g}秒,低于 Seedance 硬下限4秒,"
+            "视频提交必被拒收",
+            "用反应拍/呼吸感/情绪留白把表演拉满到4秒以上,"
+            "或与相邻镜头合并叙事")
+    ceiling = (DURATION_MAX_UPGRADE if _shot_upgrade_tier(shot)
+               else DURATION_MAX_BASELINE)
+    if duration > ceiling:
+        label = ("Seedance 2.5 升级档上限30秒" if _shot_upgrade_tier(shot)
+                 else "Seedance 2.0 上限15秒")
+        return _issue(
+            shot, "duration_long",
+            f"本镜声明{duration:g}秒,超过{label},提交层禁止静默截短",
+            "拆分为多镜;确属不可分割长镜头且在16-30秒内,"
+            "按镜声明 video_model_tier=seedance2_5 并写明升级理由")
+    return None
+
+
 def _screen_order(block, phase="start"):
     """本镜人物的画面左右次序(按投影偏移升序)。"""
     if not isinstance(block, dict):
@@ -181,7 +226,8 @@ def preflight_storyboard(script, storyboard, blocking=None):
     previous = None
     for shot in shots:
         block = index.get(str(shot.get("shot_no"))) or {}
-        for issue in (_check_capacity(shot), _check_prop_phases(shot)):
+        for issue in (_check_capacity(shot), _check_prop_phases(shot),
+                      _check_duration(shot)):
             if issue:
                 issues.append(issue)
         if block:

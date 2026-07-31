@@ -62,6 +62,49 @@ class ShotRepairValidateTest(unittest.TestCase):
                       validate_shot_repair(data, {"shot": SHOT}))
 
 
+class DurationRepairTest(unittest.TestCase):
+    """时长默认锁死;只有熔断原因就是时长违规时才授权本次修复动
+    duration,且必须落在可提交档内并同步改写表演内容。"""
+
+    @staticmethod
+    def _data(**extra):
+        return {"schema": "aifos.shot_repair.v1", "shot_no": 12,
+                "camera": "全景·仰拍·侧面",
+                "repair_summary": "拉满表演到5秒", **extra}
+
+    def test_unauthorized_duration_output_rejected(self):
+        error = validate_shot_repair(
+            self._data(duration=5), {"shot": SHOT})
+        self.assertIn("未授权", error)
+
+    def test_authorized_repair_needs_performance_rewrite(self):
+        payload = {"shot": SHOT, "allow_duration_change": True}
+        error = validate_shot_repair(self._data(duration=5), payload)
+        self.assertIn("description", error)
+        self.assertIsNone(validate_shot_repair(
+            self._data(duration=5, description="补上黑衣人抬眼的反应拍"),
+            payload))
+
+    def test_authorized_repair_must_land_in_legal_band(self):
+        payload = {"shot": SHOT, "allow_duration_change": True}
+        self.assertIn("4秒", validate_shot_repair(
+            self._data(duration=3, description="x"), payload))
+        self.assertIn("拆分", validate_shot_repair(
+            self._data(duration=22, description="x"), payload))
+        self.assertIn("秒数", validate_shot_repair(
+            self._data(duration="很久", description="x"), payload))
+
+    def test_prompt_switches_duration_rule_by_authorization(self):
+        base = {"shot_repair": True, "shot": SHOT, "location": "废茶棚",
+                "style": "写实", "blocking_reason": "本镜声明3秒,低于硬下限"}
+        locked = build_prompt("script", base)
+        self.assertIn("不得改动时长", locked)
+        allowed = build_prompt(
+            "script", {**base, "allow_duration_change": True})
+        self.assertIn("被授权且必须把 duration 修到合法档内", allowed)
+        self.assertIn("禁止只改数字不改表演内容", allowed)
+
+
 class TraditionalSimplifiedClauseTest(unittest.TestCase):
     def test_adjudication_covers_script_variants(self):
         """縣/县 曾以「用户级同级互斥」熔断整段;裁决条款必须明写
