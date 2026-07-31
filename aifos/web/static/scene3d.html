@@ -57,6 +57,28 @@ button.on{color:var(--ink);background:var(--gold);border-color:var(--gold);
   font-weight:600}
 button.ghost.on{color:var(--gold);background:transparent;
   border-color:var(--gold-dim);font-weight:600}
+#pvInfo{font-size:12px;color:var(--paper);letter-spacing:.03em;
+  min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+#pvInfo b{color:var(--gold)}
+#pvScrub{flex:1;min-width:120px;accent-color:var(--gold);height:18px}
+#pvClock{font-size:11px;color:var(--paper-dim);
+  font-variant-numeric:tabular-nums;min-width:86px;text-align:right}
+#pvIssues{display:none;max-height:130px;overflow:auto;border:1px solid #6b4a33;
+  border-radius:4px;background:rgba(38,26,18,.92);padding:6px 8px;font-size:11px;
+  line-height:1.55}
+#pvIssues.show{display:block}
+.pv-issue{cursor:pointer;padding:2px 4px;border-radius:3px;color:#e8c77e}
+.pv-issue:hover{background:rgba(217,164,65,.14)}
+.pv-issue b{color:#f0b357}
+#pvBadge{position:absolute;left:12px;bottom:12px;display:none;
+  font-size:12px;letter-spacing:.08em;color:var(--gold);
+  background:rgba(16,14,12,.82);border:1px solid var(--gold-dim);
+  border-radius:3px;padding:4px 9px;pointer-events:none}
+#pip{position:absolute;right:12px;bottom:12px;border:1px solid var(--gold-dim);
+  border-radius:4px;overflow:hidden;display:none;pointer-events:none;
+  box-shadow:0 10px 30px rgba(0,0,0,.45)}
+#pipTag{position:absolute;left:6px;top:5px;font-size:10px;color:var(--gold);
+  letter-spacing:.14em;text-shadow:0 1px 2px #000}
 </style>
 </head>
 <body>
@@ -70,9 +92,27 @@ button.ghost.on{color:var(--gold);background:transparent;
     <div id="labels"></div>
     <div id="hud"></div>
     <div id="notice" role="status" aria-live="polite"></div>
+    <div id="pvBadge"></div>
+    <div id="pip"><span id="pipTag">镜头视窗</span></div>
     <div id="err"></div>
   </div>
   <footer>
+    <div class="row"><span class="row-label">预演</span>
+      <button id="pvPlay">▶ 播放</button>
+      <button id="pvPrev" title="上一镜">⏮</button>
+      <button id="pvNext" title="下一镜">⏭</button>
+      <select id="pvSpeed" style="font:inherit;font-size:12px;background:transparent;
+        color:var(--paper);border:1px solid var(--line);border-radius:3px;padding:3px 4px">
+        <option value="0.5">0.5×</option>
+        <option value="1" selected>1×</option>
+        <option value="2">2×</option>
+      </select>
+      <input id="pvScrub" type="range" min="0" max="1000" value="0">
+      <span id="pvClock">0.0s / 0.0s</span>
+      <button id="pvChecks" class="ghost">连贯性 0</button>
+    </div>
+    <div class="row"><span id="pvInfo">动态预演:按 ▶ 从当前镜开始播放</span></div>
+    <div id="pvIssues"></div>
     <div class="row"><span class="row-label">镜头</span>
       <div class="row" id="shots" style="gap:5px"></div></div>
     <div class="row"><span class="row-label">视角</span>
@@ -233,6 +273,16 @@ function hex(c,fb=[0.85,0.68,0.35]){
          parseInt(m.slice(4,6),16)/255]}
 
 const clamp=(value,min,max)=>Math.max(min,Math.min(max,Number(value)));
+// ---- 动态预演:时间轴状态与插值 ----
+const previz={on:false,t:0,speed:1,order:[],total:0,last:0,idx:-1};
+const PV={active:false,u:0};           // 当前帧插值状态(供几何/相机取用)
+const lerp3=(a,b,u)=>[a[0]+(b[0]-a[0])*u,a[1]+(b[1]-a[1])*u,a[2]+(b[2]-a[2])*u];
+const easeInOut=u=>u<0.5?2*u*u:1-Math.pow(-2*u+2,2)/2;
+function pvEntry(){return previz.idx>=0?previz.order[previz.idx]:null}
+function pvLocate(t){
+ for(let i=0;i<previz.order.length;i++){const e=previz.order[i];
+  if(t<e.start+e.wall||i===previz.order.length-1)return i}
+ return -1}
 const finite=(value,fallback)=>Number.isFinite(Number(value))?Number(value):fallback;
 function locationEntry(group){
  const location=String((SCENE&&SCENE.location)||"");
@@ -317,7 +367,7 @@ function updateSceneStatus(extra=[]){
  if(!pano)rows.push("本场没有全景母版，房间背景将使用纯色结构底。");
  warn(rows,Boolean(modelEntry&&modelEntry.error))}
 
-function buildGeometry(){
+function buildGeometry(silent){
  const L=[],PT=[],LIT=[],SHADOW=[];
  const push=(a,b,c)=>{L.push(a[0],a[1],a[2],c[0],c[1],c[2],
                              b[0],b[1],b[2],c[0],c[1],c[2])};
@@ -401,29 +451,38 @@ function buildGeometry(){
     offZ=-light.direction[2]/sy*Math.min(.55,height*.16);
    shadowEllipse(x,z,width*.60,depth*.62,offX,offZ,.13);
    shadowEllipse(x,z,width*.48,depth*.48,0,0,.24)}}
- if(!SHOT){finish();updateSceneStatus();return geo}
+ if(!SHOT){finish();if(!silent)updateSceneStatus();return geo}
  const cam=SHOT.camera||{},acts=SHOT.actors||[];
+ const uMove=PV.active?easeInOut(PV.u):0;
  if(show.control&&show.axis&&SHOT.axis&&SHOT.axis.a_3d&&SHOT.axis.b_3d){
   const a=P(SHOT.axis.a_3d),b=P(SHOT.axis.b_3d),c=[.55,.42,.2];
   for(let t=0;t<1;t+=.05){const p=V.add(a,V.scale(V.sub(b,a),t)),
    q=V.add(a,V.scale(V.sub(b,a),Math.min(1,t+.028)));
    push([p[0],.02,p[2]],[q[0],.02,q[2]],c)}}
  acts.forEach(a=>{
-  const col=hex(a.color),s=P(a.start_3d),e=P(a.end_3d),
+  const col=hex(a.color),s0=P(a.start_3d),e=P(a.end_3d),
         startH=Math.max(.7,finite(a.start_height_m??a.height_m,1.7)),
         endH=Math.max(.7,finite(a.end_height_m??a.height_m,startH));
-  if(structure)stickman(s[0],s[1],s[2],startH,col);
-  else{addActorSolid(s[0],s[1],s[2],startH,col);
-   shadowEllipse(s[0]+.04*startH,s[2],.15*startH,.10*startH,0,0,.27)}
-  if(show.control)PT.push(s[0],s[1]+.9*startH,s[2],col[0],col[1],col[2]);
-  if(show.control&&show.path&&(a.moving||V.len(V.sub(e,s))>.05)){
+  // 预演播放:人物沿起终点连线随时间插值(缓入缓出),身高同步过渡
+  const s=PV.active?lerp3(s0,e,uMove):s0,
+        h0=PV.active?startH+(endH-startH)*uMove:startH;
+  if(structure)stickman(s[0],s[1],s[2],h0,col);
+  else{addActorSolid(s[0],s[1],s[2],h0,col);
+   shadowEllipse(s[0]+.04*h0,s[2],.15*h0,.10*h0,0,0,.27)}
+  if(show.control)PT.push(s[0],s[1]+.9*h0,s[2],col[0],col[1],col[2]);
+  if(show.control&&show.path&&!PV.active&&(a.moving||V.len(V.sub(e,s0))>.05)){
    const dim=V.scale(col,.62);push([s[0],s[1]+.05,s[2]],[e[0],e[1]+.05,e[2]],dim);
    for(let i=0;i<12;i++){const t0=i/12*Math.PI*2,t1=(i+1)/12*Math.PI*2;
     push([e[0]+.18*Math.cos(t0),e[1]+.03,e[2]+.18*Math.sin(t0)],
          [e[0]+.18*Math.cos(t1),e[1]+.03,e[2]+.18*Math.sin(t1)],dim)}
    stickman(e[0],e[1],e[2],endH,dim)}});
  if(show.control){
-  const cs=P(cam.start_3d,1.55),tg=P(cam.target_3d||cam.target_start_3d,1.2),
+  const cs0=P(cam.start_3d,1.55),
+        ce=P(cam.end_3d||cam.start_3d,1.55),
+        ts=P(cam.target_start_3d||cam.target_3d,1.2),
+        te=P(cam.target_end_3d||cam.target_3d||cam.target_start_3d,1.2),
+        cs=PV.active?lerp3(cs0,ce,PV.u):cs0,
+        tg=PV.active?lerp3(ts,te,PV.u):P(cam.target_3d||cam.target_start_3d,1.2),
         camCol=[.85,.64,.26];
   push([cs[0],0,cs[2]],[cs[0],cs[1],cs[2]],V.scale(camCol,.5));
   if(show.frus){const fwd=V.norm(V.sub(tg,cs)),up0=[0,1,0],
@@ -442,7 +501,7 @@ function buildGeometry(){
     q=V.add(cs,V.scale(V.sub(tg,cs),Math.min(1,t+.045)));
     push(p,q,V.scale(camCol,.4))}}
   PT.push(cs[0],cs[1],cs[2],camCol[0],camCol[1],camCol[2])}
- finish();updateSceneStatus();return geo;
+ finish();if(!silent)updateSceneStatus();return geo;
  function finish(){
   for(const old of [geo.lit,geo.shadow,geo.lines,geo.pts])if(old)gl.deleteBuffer(old);
   geo.lit=buffer(LIT);geo.litCount=LIT.length/12;
@@ -450,15 +509,22 @@ function buildGeometry(){
   geo.lines=buffer(L);geo.lineCount=L.length/6;
   geo.pts=buffer(PT);geo.ptCount=PT.length/6}}
 
+function shotCam(asp){
+ // 本镜相机:预演播放时按 PV.u 在起终机位/瞄准点之间插值——运镜的
+ // 真实感受(推近变大、环绕换面、俯冲视平线下坠)就来自这里。
+ const cam=(SHOT&&SHOT.camera)||{},
+       e0=P(cam.start_3d,1.55),e1=P(cam.end_3d||cam.start_3d,1.55),
+       t0=P(cam.target_start_3d||cam.target_3d,1.2),
+       t1=P(cam.target_end_3d||cam.target_3d||cam.target_start_3d,1.2),
+       e=PV.active?lerp3(e0,e1,PV.u):e0,
+       t=PV.active?lerp3(t0,t1,PV.u):P(cam.target_3d||cam.target_start_3d,1.2),
+       vf=(Number(cam.vertical_fov_degrees)||
+           (Number(cam.fov_degrees)||46)*16/9)*Math.PI/180;
+ return {view:M4.look(e,t,[0,1,0]),
+         proj:M4.persp(Math.min(2.2,vf),asp,0.05,120),eye:e}}
 function camMatrices(){
  const asp=cv.width/Math.max(1,cv.height);
- if(mode==="shot"&&SHOT){
-  const cam=SHOT.camera||{},
-        e=P(cam.start_3d,1.55),t=P(cam.target_3d||cam.target_start_3d,1.2),
-        vf=(Number(cam.vertical_fov_degrees)||
-            (Number(cam.fov_degrees)||46)*16/9)*Math.PI/180;
-  return {view:M4.look(e,t,[0,1,0]),
-          proj:M4.persp(Math.min(2.2,vf),asp,0.05,120),eye:e}}
+ if(mode==="shot"&&SHOT)return shotCam(asp);
  const e=[orbit.target[0]+orbit.dist*Math.cos(orbit.pitch)*Math.sin(orbit.yaw),
           orbit.target[1]+orbit.dist*Math.sin(orbit.pitch),
           orbit.target[2]+orbit.dist*Math.cos(orbit.pitch)*Math.cos(orbit.yaw)];
@@ -503,14 +569,8 @@ function drawLabels(mvp){
   add([p[0],p[1]+height+.08,p[2]],
       `<b>${escapeHtml(obj.name||obj.object_id||"场景物体")}</b>`,"obj")}}
 
-function draw(){
- if(!gl)return;
- const d=Math.min(devicePixelRatio||1,2);
- if(cv.width!==Math.round(cv.clientWidth*d)||
-    cv.height!==Math.round(cv.clientHeight*d)){
-  cv.width=Math.round(cv.clientWidth*d);cv.height=Math.round(cv.clientHeight*d);
-  gl.viewport(0,0,cv.width,cv.height)}
- const {view,proj,eye}=camMatrices(),mvp=M4.mul(proj,view);
+function renderScene(view,proj,eye){
+ const mvp=M4.mul(proj,view);
  gl.clearColor(0.063,0.055,0.047,1);
  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
  gl.enable(gl.DEPTH_TEST);
@@ -573,6 +633,41 @@ function draw(){
   if(geo.ptCount){bindAttr(pLine,"pos",geo.pts,3,6,0);
    bindAttr(pLine,"col",geo.pts,3,6,3);
    gl.drawArrays(gl.POINTS,0,geo.ptCount)}}
+ return mvp}
+
+const pip=document.getElementById("pip");
+function pipRect(){
+ // 镜头视窗:右下角 9:16 竖幅小窗(CSS 像素),与成片画幅一致
+ const W=cv.clientWidth,H=cv.clientHeight;
+ let w=Math.min(210,Math.round(W*0.26)),h=Math.round(w*16/9);
+ if(h>H*0.52){h=Math.round(H*0.52);w=Math.round(h*9/16)}
+ return {left:W-w-12,top:H-h-12,w,h}}
+
+function draw(now){
+ if(!gl)return;
+ const d=Math.min(devicePixelRatio||1,2);
+ if(cv.width!==Math.round(cv.clientWidth*d)||
+    cv.height!==Math.round(cv.clientHeight*d)){
+  cv.width=Math.round(cv.clientWidth*d);cv.height=Math.round(cv.clientHeight*d)}
+ pvTick(typeof now==="number"?now:performance.now());
+ gl.disable(gl.SCISSOR_TEST);
+ gl.viewport(0,0,cv.width,cv.height);
+ const main=camMatrices(),mvp=renderScene(main.view,main.proj,main.eye);
+ // 双视窗:环视时叠加"镜头所见"画中画,运镜表达直接可见
+ const showPip=previz.on&&mode==="orbit"&&SHOT;
+ if(showPip){
+  const r=pipRect();
+  pip.style.display="block";pip.style.left=r.left+"px";pip.style.top=r.top+"px";
+  pip.style.width=r.w+"px";pip.style.height=r.h+"px";
+  const gx=Math.round(r.left*d),gw=Math.round(r.w*d),gh=Math.round(r.h*d),
+        gy=cv.height-Math.round(r.top*d)-gh;
+  gl.enable(gl.SCISSOR_TEST);gl.scissor(gx,gy,gw,gh);
+  gl.viewport(gx,gy,gw,gh);
+  const cam2=shotCam(gw/Math.max(1,gh));
+  renderScene(cam2.view,cam2.proj,cam2.eye);
+  gl.disable(gl.SCISSOR_TEST);
+  gl.viewport(0,0,cv.width,cv.height)}
+ else pip.style.display="none";
  drawLabels(mvp);
  const viewText=mode==="shot"
   ? `本镜机位 · fov ${(Number((SHOT&&SHOT.camera||{}).fov_degrees)||0).toFixed(0)}°`
@@ -580,6 +675,107 @@ function draw(){
  hud.textContent=`${displayMode==="realistic"?"写实":"结构"} · ${viewText}`+
   ` · 实体 ${renderStats.objects}`;
  requestAnimationFrame(draw)}
+
+// ---- 动态预演:播放引擎 ----
+const pvPlayBtn=document.getElementById("pvPlay"),
+      pvPrevBtn=document.getElementById("pvPrev"),
+      pvNextBtn=document.getElementById("pvNext"),
+      pvSpeedEl=document.getElementById("pvSpeed"),
+      pvScrubEl=document.getElementById("pvScrub"),
+      pvClockEl=document.getElementById("pvClock"),
+      pvInfoEl=document.getElementById("pvInfo"),
+      pvChecksBtn=document.getElementById("pvChecks"),
+      pvIssuesEl=document.getElementById("pvIssues"),
+      pvBadgeEl=document.getElementById("pvBadge");
+
+function pvInit(){
+ const acts=DATA.shot_actions||{},idx=(DATA.blocking||{}).shot_index||{};
+ const nos=Object.keys(idx).map(Number).filter(n=>!isNaN(n)).sort((a,b)=>a-b);
+ let t=0;previz.order=[];
+ nos.forEach(no=>{
+  const a=acts[String(no)]||{};
+  const dur=Math.max(0.5,Number(a.duration)||5);
+  // 升格镜按 2.2 倍墙钟时间播放,预演里直接感受慢放
+  const wall=dur*(a.movement==="升格"?2.2:1);
+  previz.order.push({no,start:t,dur,wall,
+   movement:a.movement||"",scale:a.scale||"",kind:a.kind||"",
+   speaker:a.speaker||"",dialogue:a.dialogue||"",
+   desc:a.description||a.action||""});
+  t+=wall});
+ previz.total=t;previz.idx=previz.order.length?0:-1;
+ pvUpdateUi(previz.order[0]||null,0);
+ const checks=(DATA.previz_checks||{}).issues||[];
+ pvChecksBtn.textContent=`连贯性 ${checks.length}`;
+ pvChecksBtn.classList.toggle("on",checks.length>0);
+ pvIssuesEl.innerHTML=checks.length
+  ? checks.map((item,i)=>`<div class="pv-issue" data-no="${item.shot_no}">`+
+     `<b>[镜${item.shot_no}]</b> ${String(item.detail||item.kind||"")
+      .replace(/[&<>]/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[ch]))}</div>`).join("")
+  : `<div style="color:#9a8d7b">时间维度连贯性检查通过:无跨镜传送、路径碰撞、交叉相撞与相机穿模。</div>`;
+ pvIssuesEl.querySelectorAll(".pv-issue").forEach(row=>{
+  row.onclick=()=>pvSeekShot(Number(row.dataset.no))})}
+
+function pvUpdateUi(entry,u){
+ const t=previz.t;
+ if(!pvScrubbing)pvScrubEl.value=String(Math.round(
+  previz.total>0?t/previz.total*1000:0));
+ pvClockEl.textContent=`${t.toFixed(1)}s / ${previz.total.toFixed(1)}s`;
+ if(entry){
+  const line=`<b>镜${entry.no}</b> ${entry.scale||""}`+
+   `${entry.movement?"·"+entry.movement:""}`+
+   `${entry.kind?" · "+entry.kind:""} · `+
+   (entry.speaker?`${entry.speaker}:「${entry.dialogue}」`:entry.desc);
+  if(pvInfoEl.dataset.line!==line){pvInfoEl.dataset.line=line;
+   pvInfoEl.innerHTML=line}
+  if(previz.on&&entry.movement&&entry.movement!=="固定"){
+   pvBadgeEl.style.display="block";
+   pvBadgeEl.textContent=`运镜 · ${entry.movement}`+
+    (entry.movement==="升格"?"(慢放)":"")}
+  else pvBadgeEl.style.display="none"}
+ else pvBadgeEl.style.display="none"}
+
+function pvApply(t,playing){
+ if(!previz.order.length)return;
+ previz.t=Math.max(0,Math.min(previz.total,t));
+ const i=pvLocate(previz.t);previz.idx=i;
+ const entry=previz.order[i];
+ if(entry&&(!SHOT||Number(SHOT.shot_no)!==entry.no))selectShot(entry.no);
+ const u=entry?Math.max(0,Math.min(1,(previz.t-entry.start)/entry.wall)):0;
+ PV.u=u;PV.active=Boolean(playing||u>0.001);
+ buildGeometry(true);
+ pvUpdateUi(entry,u)}
+
+function pvTick(now){
+ if(!previz.on){previz.last=now;return}
+ const dt=Math.min(0.2,Math.max(0,(now-previz.last)/1000))*previz.speed;
+ previz.last=now;
+ pvApply(previz.t+dt,true);
+ if(previz.t>=previz.total-0.001)pvPause()}
+
+function pvStart(){
+ if(!previz.order.length)return;
+ if(previz.t>=previz.total-0.05)previz.t=0;
+ previz.on=true;previz.last=performance.now();
+ pvPlayBtn.textContent="⏸ 暂停";pvPlayBtn.classList.add("on")}
+function pvPause(){
+ previz.on=false;
+ pvPlayBtn.textContent="▶ 播放";pvPlayBtn.classList.remove("on")}
+function pvSeekShot(no){
+ const entry=previz.order.find(e=>e.no===Number(no));
+ if(entry)pvApply(entry.start+0.001,previz.on);
+ else selectShot(no)}
+
+let pvScrubbing=false;
+pvPlayBtn.onclick=()=>previz.on?pvPause():pvStart();
+pvPrevBtn.onclick=()=>{const i=Math.max(0,previz.idx-1);
+ if(previz.order[i])pvApply(previz.order[i].start+0.001,previz.on)};
+pvNextBtn.onclick=()=>{const i=Math.min(previz.order.length-1,previz.idx+1);
+ if(previz.order[i])pvApply(previz.order[i].start+0.001,previz.on)};
+pvSpeedEl.onchange=()=>{previz.speed=Number(pvSpeedEl.value)||1};
+pvScrubEl.addEventListener("input",()=>{pvScrubbing=true;
+ pvApply(Number(pvScrubEl.value)/1000*previz.total,previz.on)});
+pvScrubEl.addEventListener("change",()=>{pvScrubbing=false});
+pvChecksBtn.onclick=()=>pvIssuesEl.classList.toggle("show");
 
 // ---- 交互 ----
 let drag=null;
@@ -708,8 +904,9 @@ else{
    const box=document.getElementById("shots");
    nos.forEach(n=>{const b=document.createElement("button");
     b.textContent="镜"+n;b.dataset.no=String(n);
-    b.onclick=()=>selectShot(n);box.appendChild(b)});
+    b.onclick=()=>pvSeekShot(n);box.appendChild(b)});
    selectShot(nos[0]);
+   pvInit();
    draw()})
   .catch(e=>fail("加载失败: "+e.message))}
 </script>

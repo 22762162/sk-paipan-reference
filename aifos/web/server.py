@@ -1985,15 +1985,42 @@ def _scene3d_payload(app, episode_id):
         for location in locations
     }
     storyboard, _sv = app.projects.latest_document(episode_id, "storyboard")
+    from ..camera_language import MOVEMENT_GEOMETRY, SCALE_GEOMETRY
+    movement_terms = sorted(MOVEMENT_GEOMETRY, key=len, reverse=True)
+    scale_terms = sorted(SCALE_GEOMETRY, key=len, reverse=True)
     actions = {}
     for shot in ((storyboard or {}).get("shots") or []):
         try:
-            actions[str(int(shot.get("shot_no")))] = {
-                "action": str(shot.get("action") or "")[:200],
-                "camera": str(shot.get("camera") or "")[:120],
-            }
+            shot_no = int(shot.get("shot_no"))
         except (TypeError, ValueError):
             continue
+        camera = shot.get("camera")
+        camera_text = ("·".join(
+            str(value) for value in camera.values() if value)
+            if isinstance(camera, dict) else str(camera or ""))
+        dialogue = shot.get("dialogue") or {}
+        try:
+            duration = max(0.5, float(shot.get("duration")))
+        except (TypeError, ValueError):
+            duration = 5.0
+        actions[str(shot_no)] = {
+            "action": str(shot.get("action") or "")[:200],
+            "camera": camera_text[:120],
+            # 动态预演播放器的时间轴与信息条数据
+            "duration": duration,
+            "kind": str(shot.get("kind") or "")[:20],
+            "scene_no": shot.get("scene_no"),
+            "description": str(shot.get("description") or "")[:120],
+            "movement": next(
+                (term for term in movement_terms if term in camera_text), ""),
+            "scale": next(
+                (term for term in scale_terms if term in camera_text), ""),
+            "dialogue": (str(dialogue.get("dialogue") or "")[:80]
+                         if isinstance(dialogue, dict) else ""),
+            "speaker": (str(dialogue.get("character") or "")[:20]
+                        if isinstance(dialogue, dict) else ""),
+        }
+    from ..previz_checks import previz_report
     return {
         "episode_id": episode_id,
         "episode_number": episode["number"],
@@ -2006,6 +2033,8 @@ def _scene3d_payload(app, episode_id):
         "scene_models": scene_models,
         "render_contracts": render_contracts,
         "shot_actions": actions,
+        # 时间维度连贯性:跨镜传送/中途碰撞/交叉相撞/相机穿模(warn级)
+        "previz_checks": previz_report(blocking, storyboard, scene_models),
     }
 
 
