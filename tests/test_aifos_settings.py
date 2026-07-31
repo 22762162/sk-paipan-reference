@@ -34,6 +34,7 @@ def test_defaults_include_api_providers(tmp_path):
             ["jimeng", "ark", "api", "mock"]
         assert app.config.get("routing", "image") == \
             ["codex", "image_api", "api", "mock"]
+        assert app.config.get("routing", "scene_annotate") == ["claude_api"]
     finally:
         app.close()
 
@@ -68,6 +69,39 @@ def test_config_load_migrates_only_builtin_legacy_say(tmp_path):
     custom = Config.load(config_path)
     assert custom.get("providers", "say", "command") == ["custom-say"]
     assert custom.get("routing", "voice") == ["say", "mock"]
+
+
+def test_config_load_migrates_scene_annotation_to_visual_api(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "providers": {
+            "claude": {
+                "type": "cli", "enabled": True,
+                "capabilities": ["script", "storyboard", "scene_annotate"],
+            },
+            "claude_api": {
+                "type": "claude_api", "enabled": True,
+                "capabilities": ["script", "storyboard"],
+            },
+            "mock": {
+                "type": "mock", "enabled": True,
+                "capabilities": ["script", "scene_annotate"],
+            },
+        },
+        "routing": {
+            "scene_annotate": ["claude_api", "claude", "mock"],
+        },
+    }), encoding="utf-8")
+
+    migrated = Config.load(config_path)
+
+    assert "scene_annotate" not in migrated.get(
+        "providers", "claude", "capabilities")
+    assert "scene_annotate" in migrated.get(
+        "providers", "claude_api", "capabilities")
+    assert "scene_annotate" not in migrated.get(
+        "providers", "mock", "capabilities")
+    assert migrated.get("routing", "scene_annotate") == ["claude_api"]
 
 
 def test_settings_payload_masks_key(tmp_path):

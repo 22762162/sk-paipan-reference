@@ -46,6 +46,7 @@ from ..updater import (check_and_update, current_build, repo_root,
 from ..errors import AifosError
 from ..quality_policy import normalize_quality, normalize_quality_policy
 from ..prompt_review import build_episode_prompt_review
+from ..scene_render import build_scene_render_contract
 from ..smart_input import resolve_produce_target
 from ..standard_center import StandardConflictError, StandardValidationError
 from ..story_context import attach_shot_story_context
@@ -1933,15 +1934,25 @@ def _scene3d_payload(app, episode_id):
         episode_id, "blocking")
     if blocking is None:
         return {"episode_id": episode_id, "blocking": None,
-                "panoramas": {}, "message": "本集尚未生成空间调度"}
+                "panoramas": {}, "scene_models": {},
+                "render_contracts": {},
+                "message": "本集尚未生成空间调度"}
     project_id = episode["project_id"]
     artifacts = app.workspace.artifacts_dir.resolve()
     panoramas = {}
     scene_models = {}
-    for scene in (blocking.get("scenes") or []):
+    raw_scenes = (blocking.get("scenes")
+                  if isinstance(blocking, dict) else [])
+    scenes = raw_scenes if isinstance(raw_scenes, list) else []
+    locations = []
+    for scene in scenes:
+        if not isinstance(scene, dict):
+            continue
         location = str(scene.get("location") or "").strip()
         if not location:
             continue
+        if location not in locations:
+            locations.append(location)
         if location not in scene_models:
             model_row = app.assets.latest(
                 project_id, "scene_model", location)
@@ -1967,6 +1978,12 @@ def _scene3d_payload(app, episode_id):
                 "url": "/artifacts/" + str(rel),
                 "version": row["version"],
             }
+    render_contracts = {
+        location: build_scene_render_contract(
+            scene_models.get(location), panoramas.get(location),
+            location=location)
+        for location in locations
+    }
     storyboard, _sv = app.projects.latest_document(episode_id, "storyboard")
     actions = {}
     for shot in ((storyboard or {}).get("shots") or []):
@@ -1987,6 +2004,7 @@ def _scene3d_payload(app, episode_id):
         "blocking_version": blocking_v,
         "panoramas": panoramas,
         "scene_models": scene_models,
+        "render_contracts": render_contracts,
         "shot_actions": actions,
     }
 

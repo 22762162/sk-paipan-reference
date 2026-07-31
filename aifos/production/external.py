@@ -158,6 +158,11 @@ class CliProvider(Provider):
         ok, reason = super().available(capability)
         if not ok:
             return ok, reason
+        if (capability == "scene_annotate"
+                and not self.conf.get("scene_image_transport")):
+            return False, (
+                "文本 CLI 不能附加全景图；scene_annotate 必须使用"
+                "支持图片输入的视觉 API")
         command = self.conf.get("command") or []
         if not command:
             return False, "未配置 command"

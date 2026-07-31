@@ -30,11 +30,18 @@ canvas.drag{cursor:grabbing}
   background:rgba(16,14,12,.82);letter-spacing:.03em}
 .tag b{font-weight:600}
 .tag.cam{color:var(--gold);border-color:var(--gold-dim)}
+.tag.obj{color:#d6c5aa;border-color:#6f604e;background:rgba(26,21,17,.88)}
 #hud{position:absolute;top:10px;right:12px;font-size:11px;color:var(--paper-dim);
   background:rgba(16,14,12,.78);padding:5px 9px;border:1px solid var(--line);
   border-radius:3px;font-variant-numeric:tabular-nums;pointer-events:none}
+#notice{position:absolute;top:10px;left:12px;max-width:min(520px,calc(100% - 150px));
+  display:none;padding:7px 10px;border:1px solid #7a5f2b;border-radius:4px;
+  background:rgba(34,27,17,.9);color:#e8c77e;font-size:11px;line-height:1.55;
+  box-shadow:0 8px 26px rgba(0,0,0,.28);pointer-events:none}
+#notice.bad{border-color:#8b3f36;color:#f0aaa0;background:rgba(45,19,17,.92)}
 #err{position:absolute;inset:0;display:none;place-items:center;text-align:center;
-  padding:24px;color:var(--paper-dim);font-size:13px;line-height:1.8}
+  z-index:4;padding:24px;color:#f0aaa0;font-size:13px;line-height:1.8;
+  background:rgba(16,14,12,.92)}
 footer{border-top:1px solid var(--line);background:var(--panel);
   padding:9px 12px 11px;display:flex;flex-direction:column;gap:7px}
 .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -61,6 +68,7 @@ button.ghost.on{color:var(--gold);background:transparent;
     <canvas id="c"></canvas>
     <div id="labels"></div>
     <div id="hud"></div>
+    <div id="notice" role="status" aria-live="polite"></div>
     <div id="err"></div>
   </div>
   <footer>
@@ -69,11 +77,16 @@ button.ghost.on{color:var(--gold);background:transparent;
     <div class="row"><span class="row-label">视角</span>
       <button id="orbit" class="on">俯瞰环视</button>
       <button id="enter">进入本镜机位</button>
+      <span class="row-label" style="margin-left:6px">模式</span>
+      <button id="modeReal" class="on">写实</button>
+      <button id="modeStructure">结构</button>
       <span class="row-label" style="margin-left:6px">显示</span>
       <button id="tPano" class="ghost on">全景</button>
-      <button id="tPath" class="ghost on">路线</button>
-      <button id="tFrus" class="ghost on">视锥</button>
-      <button id="tAxis" class="ghost on">轴线</button>
+      <button id="tControl" class="ghost" aria-pressed="false">控制标注</button>
+      <button id="tPath" class="ghost" disabled>路线</button>
+      <button id="tFrus" class="ghost" disabled>视锥</button>
+      <button id="tAxis" class="ghost" disabled>轴线</button>
+      <button id="exportPng">导出效果图</button>
     </div>
   </footer>
 </div>
@@ -101,24 +114,65 @@ const V={
 const P=(o,d=0)=>[Number(o&&o.x)||0,Number(o&&o.y)||d,Number(o&&o.z)||0];
 
 const cv=document.getElementById("c"),hud=document.getElementById("hud"),
-      labels=document.getElementById("labels"),errBox=document.getElementById("err");
-const gl=cv.getContext("webgl",{antialias:true,alpha:false});
+      labels=document.getElementById("labels"),errBox=document.getElementById("err"),
+      notice=document.getElementById("notice");
+const gl=cv.getContext("webgl",{
+ antialias:true,alpha:false,preserveDrawingBuffer:true});
 function fail(msg){errBox.style.display="grid";errBox.textContent=msg}
+function warn(messages,bad=false){
+ const rows=(Array.isArray(messages)?messages:[messages]).filter(Boolean);
+ notice.textContent=rows.join("\n");notice.style.whiteSpace="pre-line";
+ notice.style.display=rows.length?"block":"none";
+ notice.classList.toggle("bad",bad)}
 if(!gl){fail("此浏览器不支持 WebGL,无法显示 3D 空间。")}
 
-// ---- 着色器:一个管颜色几何,一个管全景球 ----
+// ---- 着色器:控制线、受光实体、透明阴影、全景房间 ----
 function prog(vs,fs){const p=gl.createProgram();
  for(const [t,src] of [[gl.VERTEX_SHADER,vs],[gl.FRAGMENT_SHADER,fs]]){
   const s=gl.createShader(t);gl.shaderSource(s,src);gl.compileShader(s);
-  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))
-   fail("着色器编译失败: "+gl.getShaderInfoLog(s));
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){
+   const detail=gl.getShaderInfoLog(s)||"未知错误";
+   fail("3D 着色器编译失败: "+detail);throw new Error(detail)}
   gl.attachShader(p,s)}
- gl.linkProgram(p);return p}
+ gl.linkProgram(p);
+ if(!gl.getProgramParameter(p,gl.LINK_STATUS)){
+  const detail=gl.getProgramInfoLog(p)||"未知错误";
+  fail("3D 着色器链接失败: "+detail);throw new Error(detail)}
+ return p}
 const pLine=prog(
  `attribute vec3 pos;attribute vec3 col;uniform mat4 mvp;varying vec3 vc;
   void main(){vc=col;gl_Position=mvp*vec4(pos,1.0);gl_PointSize=7.0;}`,
  `precision mediump float;varying vec3 vc;uniform float alpha;
   void main(){gl_FragColor=vec4(vc,alpha);}`);
+const pLit=prog(
+ `attribute vec3 pos;attribute vec3 nor;attribute vec3 col;attribute vec3 mat;
+  uniform mat4 mvp;varying vec3 wp;varying vec3 wn;varying vec3 vc;
+  varying vec3 vm;
+  void main(){wp=pos;wn=nor;vc=col;vm=mat;gl_Position=mvp*vec4(pos,1.0);}`,
+ `precision mediump float;varying vec3 wp;varying vec3 wn;varying vec3 vc;
+  varying vec3 vm;uniform vec3 eye;uniform vec3 lightDir;
+  uniform vec3 lightColor;uniform float ambient;uniform float keyLight;
+  uniform float alpha;uniform float realistic;uniform sampler2D panoTex;
+  uniform vec3 panoEye0;uniform float panoAvailable;
+  void main(){vec3 n=normalize(wn);vec3 l=normalize(lightDir);
+   float ndl=max(dot(n,l),0.0);
+   vec3 v=normalize(eye-wp);vec3 h=normalize(l+v);
+   float shine=mix(7.0,80.0,clamp(vm.y,0.0,1.0));
+   float spec=pow(max(dot(n,h),0.0),shine)*vm.x*realistic;
+   float rim=pow(1.0-max(dot(n,v),0.0),3.0)*0.09*realistic;
+   vec3 surface=vc;
+   if(panoAvailable>0.5&&vm.z>0.0){vec3 pd=normalize(wp-panoEye0);
+    float pu=atan(pd.x,pd.z)/6.2831853+0.5;
+    float pv=0.5-asin(clamp(pd.y,-1.0,1.0))/3.14159265;
+    surface=mix(vc,texture2D(panoTex,vec2(pu,pv)).rgb,clamp(vm.z,0.0,.82));}
+   vec3 lit=surface*(vec3(ambient)+keyLight*ndl*lightColor)+
+            lightColor*spec+surface*rim;
+   gl_FragColor=vec4(clamp(lit,0.0,1.0),alpha);}`);
+const pAlpha=prog(
+ `attribute vec3 pos;attribute float opa;uniform mat4 mvp;varying float va;
+  void main(){va=opa;gl_Position=mvp*vec4(pos,1.0);}`,
+ `precision mediump float;varying float va;uniform vec3 color;
+  void main(){gl_FragColor=vec4(color,va);}`);
 const pPano=prog(
  `attribute vec3 pos;uniform mat4 mvp;varying vec3 vw;
   void main(){vw=pos;gl_Position=mvp*vec4(pos,1.0);}`,
@@ -144,6 +198,7 @@ function bindAttr(p,name,buf,size,stride,off){
 let roomFaces=[];
 const CAPTURE=[0,1.55,0];   // 全景拍摄点:房间中心、站立视平线
 function buildRoomBox(fw,fd,h){
+ for(const old of roomFaces)if(old&&old.buf)gl.deleteBuffer(old.buf);
  const x=fw/2,z=fd/2;
  const face=(a,b,c,d,center,inward)=>({
   buf:buffer([...a,...b,...c,...a,...c,...d]),count:6,center,inward});
@@ -161,96 +216,238 @@ const panoTex=gl.createTexture();let panoReady=false;
 // ---- 状态 ----
 let DATA=null,SHOT=null,SCENE=null;
 let orbit={yaw:0.6,pitch:0.85,dist:11,target:[0,1,0]},mode="orbit";
-const show={pano:true,path:true,frus:true,axis:true};
-let geo={lines:null,lineCount:0,pts:null,ptCount:0};
+let displayMode="realistic";
+const show={pano:true,path:true,frus:true,axis:true,control:false};
+let geo={lit:null,litCount:0,shadow:null,shadowCount:0,
+         lines:null,lineCount:0,pts:null,ptCount:0};
 
 function hex(c,fb=[0.85,0.68,0.35]){
+ if(Array.isArray(c)&&c.length>=3){const scale=c.some(v=>Number(v)>1)?255:1;
+  return c.slice(0,3).map(v=>Math.max(0,Math.min(1,(Number(v)||0)/scale)))}
  if(typeof c!=="string")return fb;
- const m=c.replace("#","");if(m.length!==6)return fb;
+ const named={wood:"8b6747",metal:"8c9399",stone:"858079",fabric:"76685e",
+              glass:"6d9cac",paper:"b8aa8c",ceramic:"9b8e7c"};
+ const m=(named[c.toLowerCase()]||c.replace("#","")).trim();if(m.length!==6)return fb;
  return [parseInt(m.slice(0,2),16)/255,parseInt(m.slice(2,4),16)/255,
          parseInt(m.slice(4,6),16)/255]}
 
+const clamp=(value,min,max)=>Math.max(min,Math.min(max,Number(value)));
+const finite=(value,fallback)=>Number.isFinite(Number(value))?Number(value):fallback;
+function locationEntry(group){
+ const location=String((SCENE&&SCENE.location)||"");
+ return ((DATA&&DATA[group])||{})[location]}
+function activeSceneModel(){
+ const entry=locationEntry("scene_models");
+ const model=entry&&(entry.model||entry.scene_model||entry.data||entry);
+ if(model&&Array.isArray(model.objects))return model;
+ const embedded=SCENE&&(SCENE.scene_model||SCENE.model);
+ return embedded&&Array.isArray(embedded.objects)?embedded:{objects:[]}}
+function activeRenderContract(){
+ const entry=locationEntry("render_contracts");
+ return entry&&(entry.contract||entry.render_contract||entry.data||entry)||{}}
+function lookupContractObject(contract,obj){
+ const keys=[obj.object_id,obj.id,obj.name].filter(Boolean).map(String);
+ for(const group of [contract.objects,contract.materials,contract.object_materials]){
+  if(Array.isArray(group)){
+   const found=group.find(row=>row&&keys.includes(String(
+    row.object_id??row.id??row.object??row.name??"")));
+   if(found)return found}
+  else if(group&&typeof group==="object"){
+   for(const key of keys)if(group[key])return group[key]}}
+ return {}}
+function materialFor(obj){
+ const contract=activeRenderContract(),row=lookupContractObject(contract,obj);
+ const raw=(row.material&&typeof row.material==="object"?row.material:row)||{};
+ const own=(obj.material&&typeof obj.material==="object"?obj.material:{})||{};
+ const category=String(obj.category||"furniture");
+ const defaults={
+  furniture:{color:"#72543d",roughness:.66,metallic:.04},
+  prop:{color:"#8b623d",roughness:.55,metallic:.12},
+  opening:{color:"#607b82",roughness:.34,metallic:.08},
+  light:{color:"#c69b52",roughness:.28,metallic:.48},
+  decor:{color:"#74685b",roughness:.7,metallic:.03}}[category]||
+  {color:"#70665b",roughness:.62,metallic:.04};
+ const color=hex(raw.base_color??raw.color??raw.albedo??own.base_color??
+                 own.color??obj.color??defaults.color,hex(defaults.color));
+ const roughness=clamp(raw.roughness??own.roughness??defaults.roughness,0,1);
+ const metallic=clamp(raw.metallic??raw.metalness??own.metallic??
+                      own.metalness??defaults.metallic,0,1);
+ const gloss=clamp(raw.gloss??raw.glossiness??own.gloss??(1-roughness),0,1);
+ const specular=clamp(raw.specular??own.specular??(.14+metallic*.58),0,1);
+ return {color,roughness,metallic,gloss,specular,panoBlend:.68,
+         usedDefault:raw.source==="category_render_default"||
+          !(Object.keys(raw).length||Object.keys(own).length)}}
+function lightingFor(){
+ const contract=activeRenderContract();
+ const light=contract.lighting||contract.light||contract.directional_light||{};
+ const directionRaw=light.direction;
+ const direction=Array.isArray(directionRaw)?directionRaw:
+  directionRaw&&typeof directionRaw==="object"?
+   [finite(directionRaw.x,-.45),finite(directionRaw.y,.82),
+    finite(directionRaw.z,.34)]:
+   [finite(light.x,-.45),finite(light.y,.82),finite(light.z,.34)];
+ return {direction:V.norm(direction.map(Number)),
+  color:hex(light.color||contract.light_color||"#ffe4bc",[1,.9,.74]),
+  ambient:clamp(light.ambient??light.ambient_intensity??
+                contract.ambient_intensity??.30,.08,.8),
+  intensity:clamp(light.intensity??light.key_intensity??
+                  contract.key_intensity??.78,.15,1.5)}}
+let renderStats={objects:0,invalid:0,defaultMaterials:0};
+function updateSceneStatus(extra=[]){
+ const rows=[...extra],modelEntry=locationEntry("scene_models"),
+       renderEntry=locationEntry("render_contracts"),model=activeSceneModel();
+ if(!model.objects.length)rows.push(
+  "本场没有可用的三维场景模型：仅显示全景房间与人物，请先生成 scene_model。");
+ if(modelEntry&&(modelEntry.error||modelEntry.message))
+  rows.push("三维模型失败："+(modelEntry.error||modelEntry.message));
+ if(!renderEntry)rows.push("本场没有材质渲染合同，已使用安全默认材质与灯光。");
+ else if(renderEntry.error||renderEntry.message)
+  rows.push("写实渲染合同异常："+(renderEntry.error||renderEntry.message));
+ const contractWarnings=renderEntry&&Array.isArray(renderEntry.warnings)?
+  renderEntry.warnings.filter(item=>item&&item.message):[];
+ if(contractWarnings.length){
+  rows.push(`本场有 ${contractWarnings.length} 项搭景数据尚未验证。`);
+  contractWarnings.slice(0,2).forEach(item=>rows.push(item.message));
+  if(contractWarnings.length>2)rows.push("其余问题请回到场景模型中补充实测数据。");}
+ if(renderStats.invalid)rows.push(`已跳过 ${renderStats.invalid} 件坐标或尺寸无效的物体。`);
+ if(renderStats.defaultMaterials&&renderEntry)
+  rows.push(`${renderStats.defaultMaterials} 件物体缺少材质，已使用分类默认值。`);
+ const pano=((DATA&&DATA.panoramas)||{})[String((SCENE&&SCENE.location)||"")];
+ if(!pano)rows.push("本场没有全景母版，房间背景将使用纯色结构底。");
+ warn(rows,Boolean(modelEntry&&modelEntry.error))}
+
 function buildGeometry(){
- const L=[],PT=[];
+ const L=[],PT=[],LIT=[],SHADOW=[];
  const push=(a,b,c)=>{L.push(a[0],a[1],a[2],c[0],c[1],c[2],
                              b[0],b[1],b[2],c[0],c[1],c[2])};
- const w=(SCENE&&SCENE.world)||{};
- const fw=Number(w.floor_width_m)||10,fd=Number(w.floor_depth_m)||7;
- const grid=[.22,.19,.16],gridMain=[.34,.29,.23];
- for(let x=-fw/2;x<=fw/2+1e-6;x+=1){
-  push([x,0.002,-fd/2],[x,0.002,fd/2],Math.abs(x)<1e-6?gridMain:grid)}
- for(let z=-fd/2;z<=fd/2+1e-6;z+=1){
-  push([-fw/2,0.002,z],[fw/2,0.002,z],Math.abs(z)<1e-6?gridMain:grid)}
- if(!SHOT)return finish();
- const cam=SHOT.camera||{},acts=SHOT.actors||[];
- // 180° 轴线
- if(show.axis&&SHOT.axis&&SHOT.axis.a_3d&&SHOT.axis.b_3d){
-  const a=P(SHOT.axis.a_3d),b=P(SHOT.axis.b_3d),c=[.55,.42,.2];
-  for(let t=0;t<1;t+=0.05){
-   const p=V.add(a,V.scale(V.sub(b,a),t)),
-         q=V.add(a,V.scale(V.sub(b,a),Math.min(1,t+0.028)));
-   push([p[0],0.02,p[2]],[q[0],0.02,q[2]],c)}}
- // 人物:竖杆 + 底盘 + 朝向箭 + 行动路线
- // 火柴人按真人比例画(总高=height_m):大小即定位刻度,
- // 一根细杆读不出「人有多大」,在全景房间里就定不准位。
- function stickman(x,z,h,col){
-  const hip=0.50*h, shoulder=0.80*h, headC=0.90*h, headR=0.09*h;
-  push([x,hip,z],[x,shoulder,z],col);                    // 躯干
+ const litVertex=(p,n,m)=>LIT.push(
+  p[0],p[1],p[2],n[0],n[1],n[2],m.color[0],m.color[1],m.color[2],
+  m.specular,m.gloss,finite(m.panoBlend,0));
+ const tri=(a,b,c,m)=>{const n=V.norm(V.cross(V.sub(b,a),V.sub(c,a)));
+  litVertex(a,n,m);litVertex(b,n,m);litVertex(c,n,m)};
+ const face=(a,b,c,d,m)=>{tri(a,b,c,m);tri(a,c,d,m)};
+ const edgePairs=[[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],
+                  [0,4],[1,5],[2,6],[3,7]];
+ function addBox(center,width,height,depth,yawDeg,m,edges=false){
+  const x=center[0],y=center[1],z=center[2],yaw=yawDeg*Math.PI/180,
+        co=Math.cos(yaw),si=Math.sin(yaw),w=width/2,d=depth/2,
+        corner=(lx,yy,lz)=>[x+lx*co+lz*si,yy,z-lx*si+lz*co],
+        v=[corner(-w,y,-d),corner(w,y,-d),corner(w,y,d),corner(-w,y,d),
+           corner(-w,y+height,-d),corner(w,y+height,-d),
+           corner(w,y+height,d),corner(-w,y+height,d)];
+  face(v[0],v[1],v[2],v[3],m);face(v[4],v[7],v[6],v[5],m);
+  face(v[0],v[4],v[5],v[1],m);face(v[1],v[5],v[6],v[2],m);
+  face(v[2],v[6],v[7],v[3],m);face(v[3],v[7],v[4],v[0],m);
+  if(edges){const edge=m.color.map(v=>Math.min(1,v*1.35));
+   edgePairs.forEach(pair=>push(v[pair[0]],v[pair[1]],edge))}}
+ function shadowEllipse(x,z,rx,rz,offX,offZ,alpha){
+  const count=20,c=[x+offX,.008,z+offZ];
+  for(let i=0;i<count;i++){
+   const t0=i/count*Math.PI*2,t1=(i+1)/count*Math.PI*2,
+         p0=[c[0]+rx*Math.cos(t0),c[1],c[2]+rz*Math.sin(t0)],
+         p1=[c[0]+rx*Math.cos(t1),c[1],c[2]+rz*Math.sin(t1)];
+   SHADOW.push(c[0],c[1],c[2],alpha,p0[0],p0[1],p0[2],.015,
+               p1[0],p1[1],p1[2],.015)}}
+ function addActorSolid(x,y,z,h,col){
+  const skin={color:col.map(v=>Math.min(1,v*1.18)),specular:.18,gloss:.22,
+              panoBlend:0},
+        cloth={color:col.map(v=>v*.72),specular:.12,gloss:.16,panoBlend:0};
+  addBox([x,y,z],.075*h,.49*h,.09*h,0,cloth);
+  addBox([x+.09*h,y,z],.065*h,.49*h,.085*h,0,cloth);
+  addBox([x+.045*h,y+.49*h,z],.27*h,.29*h,.14*h,0,cloth);
+  addBox([x-.13*h,y+.48*h,z],.055*h,.29*h,.07*h,0,cloth);
+  addBox([x+.22*h,y+.48*h,z],.055*h,.29*h,.07*h,0,cloth);
+  addBox([x+.045*h,y+.80*h,z],.16*h,.18*h,.15*h,0,skin)}
+ function stickman(x,y,z,h,col){
+  const hip=y+.50*h,shoulder=y+.80*h,headC=y+.90*h,headR=.09*h;
+  push([x,hip,z],[x,shoulder,z],col);
   for(let i=0;i<14;i++){const t0=i/14*Math.PI*2,t1=(i+1)/14*Math.PI*2;
    push([x+headR*Math.sin(t0),headC+headR*Math.cos(t0),z],
         [x+headR*Math.sin(t1),headC+headR*Math.cos(t1),z],col);
    push([x,headC+headR*Math.cos(t0),z+headR*Math.sin(t0)],
         [x,headC+headR*Math.cos(t1),z+headR*Math.sin(t1)],col)}
-  const armY=shoulder-0.02*h, handY=0.42*h, spread=0.16*h;
-  push([x,armY,z],[x-spread,handY,z],col);               // 双臂
-  push([x,armY,z],[x+spread,handY,z],col);
-  const footSpread=0.10*h;                               // 双腿
-  push([x,hip,z],[x-footSpread,0,z],col);
-  push([x,hip,z],[x+footSpread,0,z],col);
-  const r=0.30;                                          // 站位底盘
-  for(let i=0;i<16;i++){const t0=i/16*Math.PI*2,t1=(i+1)/16*Math.PI*2;
-   push([x+r*Math.cos(t0),0.01,z+r*Math.sin(t0)],
-        [x+r*Math.cos(t1),0.01,z+r*Math.sin(t1)],col)}}
+  push([x,shoulder-.02*h,z],[x-.16*h,y+.42*h,z],col);
+  push([x,shoulder-.02*h,z],[x+.16*h,y+.42*h,z],col);
+  push([x,hip,z],[x-.10*h,y,z],col);push([x,hip,z],[x+.10*h,y,z],col)}
+
+ const model=activeSceneModel(),modelRoom=model.room||{},
+       w=Object.assign({},modelRoom,(SCENE&&SCENE.world)||{}),
+       fw=finite(w.floor_width_m,10),fd=finite(w.floor_depth_m,7),
+       structure=displayMode==="structure",light=lightingFor();
+ if(structure){const grid=[.22,.19,.16],gridMain=[.34,.29,.23];
+  for(let x=-fw/2;x<=fw/2+1e-6;x+=1)
+   push([x,.002,-fd/2],[x,.002,fd/2],Math.abs(x)<1e-6?gridMain:grid);
+  for(let z=-fd/2;z<=fd/2+1e-6;z+=1)
+   push([-fw/2,.002,z],[fw/2,.002,z],Math.abs(z)<1e-6?gridMain:grid)}
+ renderStats={objects:0,invalid:0,defaultMaterials:0};
+ for(const obj of model.objects||[]){
+  if(!obj||typeof obj!=="object"){renderStats.invalid++;continue}
+  const transform=obj.transform||{},bounds=obj.bounds||{},
+        rawPos=obj.position_3d||transform.position_3d||transform.position;
+  if(!rawPos||![rawPos.x,rawPos.y??0,rawPos.z].every(v=>Number.isFinite(Number(v)))){
+   renderStats.invalid++;continue}
+  const x=Number(rawPos.x),y=finite(rawPos.y,0),z=Number(rawPos.z),
+        width=Math.max(.08,finite(obj.width_m??obj.width??bounds.width_m??bounds.width,.6)),
+        height=Math.max(.08,finite(obj.height_m??obj.height??bounds.height_m??bounds.height,.8)),
+        depth=Math.max(.08,finite(obj.depth_m??obj.depth??bounds.depth_m??bounds.depth,
+                                  Math.min(width*.55,.8))),
+        yaw=finite(obj.rotation_y_deg??transform.rotation_y_deg??transform.yaw_deg,0),
+        material=materialFor(obj);
+  renderStats.objects++;if(material.usedDefault)renderStats.defaultMaterials++;
+  addBox([x,y,z],width,height,depth,yaw,material,structure);
+  if(!structure){const sy=Math.max(.24,Math.abs(light.direction[1])),
+    offX=-light.direction[0]/sy*Math.min(.55,height*.16),
+    offZ=-light.direction[2]/sy*Math.min(.55,height*.16);
+   shadowEllipse(x,z,width*.60,depth*.62,offX,offZ,.13);
+   shadowEllipse(x,z,width*.48,depth*.48,0,0,.24)}}
+ if(!SHOT){finish();updateSceneStatus();return geo}
+ const cam=SHOT.camera||{},acts=SHOT.actors||[];
+ if(show.control&&show.axis&&SHOT.axis&&SHOT.axis.a_3d&&SHOT.axis.b_3d){
+  const a=P(SHOT.axis.a_3d),b=P(SHOT.axis.b_3d),c=[.55,.42,.2];
+  for(let t=0;t<1;t+=.05){const p=V.add(a,V.scale(V.sub(b,a),t)),
+   q=V.add(a,V.scale(V.sub(b,a),Math.min(1,t+.028)));
+   push([p[0],.02,p[2]],[q[0],.02,q[2]],c)}}
  acts.forEach(a=>{
   const col=hex(a.color),s=P(a.start_3d),e=P(a.end_3d),
-        h=Number(a.height_m)||1.7;
-  stickman(s[0],s[2],h,col);
-  PT.push(s[0],0.90*h,s[2],col[0],col[1],col[2]);
-  if(show.path&&(a.moving||V.len(V.sub(e,s))>0.05)){
-   const dim=V.scale(col,0.62);
-   push([s[0],0.05,s[2]],[e[0],0.05,e[2]],dim);
+        startH=Math.max(.7,finite(a.start_height_m??a.height_m,1.7)),
+        endH=Math.max(.7,finite(a.end_height_m??a.height_m,startH));
+  if(structure)stickman(s[0],s[1],s[2],startH,col);
+  else{addActorSolid(s[0],s[1],s[2],startH,col);
+   shadowEllipse(s[0]+.04*startH,s[2],.15*startH,.10*startH,0,0,.27)}
+  if(show.control)PT.push(s[0],s[1]+.9*startH,s[2],col[0],col[1],col[2]);
+  if(show.control&&show.path&&(a.moving||V.len(V.sub(e,s))>.05)){
+   const dim=V.scale(col,.62);push([s[0],s[1]+.05,s[2]],[e[0],e[1]+.05,e[2]],dim);
    for(let i=0;i<12;i++){const t0=i/12*Math.PI*2,t1=(i+1)/12*Math.PI*2;
-    push([e[0]+0.18*Math.cos(t0),0.03,e[2]+0.18*Math.sin(t0)],
-         [e[0]+0.18*Math.cos(t1),0.03,e[2]+0.18*Math.sin(t1)],dim)}
-   stickman(e[0],e[2],h,dim)}});
- // 机位:位置柱 + 视锥 + 瞄准线
- const cs=P(cam.start_3d,1.55),tg=P(cam.target_3d||cam.target_start_3d,1.2);
- const camCol=[.85,.64,.26];
- push([cs[0],0,cs[2]],[cs[0],cs[1],cs[2]],V.scale(camCol,0.5));
- if(show.frus){
-  const fwd=V.norm(V.sub(tg,cs)),up0=[0,1,0],
-        right=V.norm(V.cross(fwd,up0)),up=V.cross(right,fwd),
-        hf=(Number(cam.horizontal_fov_degrees||cam.fov_degrees)||46)*Math.PI/180,
-        vf=(Number(cam.vertical_fov_degrees)||hf*16/9)*Math.PI/180,
-        D=Math.max(1.2,V.len(V.sub(tg,cs)))*1.35,
-        hw=Math.tan(hf/2)*D,hh=Math.tan(vf/2)*D,
-        ctr=V.add(cs,V.scale(fwd,D)),
-        c1=V.add(V.add(ctr,V.scale(right,hw)),V.scale(up,hh)),
-        c2=V.add(V.sub(ctr,V.scale(right,hw)),V.scale(up,hh)),
-        c3=V.sub(V.sub(ctr,V.scale(right,hw)),V.scale(up,hh)),
-        c4=V.sub(V.add(ctr,V.scale(right,hw)),V.scale(up,hh));
-  [c1,c2,c3,c4].forEach(c=>push(cs,c,V.scale(camCol,0.55)));
-  push(c1,c2,camCol);push(c2,c3,camCol);push(c3,c4,camCol);push(c4,c1,camCol);
-  const dim=V.scale(camCol,0.4);
-  for(let t=0;t<1;t+=0.08){
-   const p=V.add(cs,V.scale(V.sub(tg,cs),t)),
-         q=V.add(cs,V.scale(V.sub(tg,cs),Math.min(1,t+0.045)));
-   push(p,q,dim)}}
- PT.push(cs[0],cs[1],cs[2],camCol[0],camCol[1],camCol[2]);
+    push([e[0]+.18*Math.cos(t0),e[1]+.03,e[2]+.18*Math.sin(t0)],
+         [e[0]+.18*Math.cos(t1),e[1]+.03,e[2]+.18*Math.sin(t1)],dim)}
+   stickman(e[0],e[1],e[2],endH,dim)}});
+ if(show.control){
+  const cs=P(cam.start_3d,1.55),tg=P(cam.target_3d||cam.target_start_3d,1.2),
+        camCol=[.85,.64,.26];
+  push([cs[0],0,cs[2]],[cs[0],cs[1],cs[2]],V.scale(camCol,.5));
+  if(show.frus){const fwd=V.norm(V.sub(tg,cs)),up0=[0,1,0],
+    right=V.norm(V.cross(fwd,up0)),up=V.cross(right,fwd),
+    hf=(finite(cam.horizontal_fov_degrees??cam.fov_degrees,46))*Math.PI/180,
+    vf=finite(cam.vertical_fov_degrees,hf*180/Math.PI*16/9)*Math.PI/180,
+    D=Math.max(1.2,V.len(V.sub(tg,cs)))*1.35,hw=Math.tan(hf/2)*D,
+    hh=Math.tan(vf/2)*D,ctr=V.add(cs,V.scale(fwd,D)),
+    c1=V.add(V.add(ctr,V.scale(right,hw)),V.scale(up,hh)),
+    c2=V.add(V.sub(ctr,V.scale(right,hw)),V.scale(up,hh)),
+    c3=V.sub(V.sub(ctr,V.scale(right,hw)),V.scale(up,hh)),
+    c4=V.sub(V.add(ctr,V.scale(right,hw)),V.scale(up,hh));
+   [c1,c2,c3,c4].forEach(c=>push(cs,c,V.scale(camCol,.55)));
+   push(c1,c2,camCol);push(c2,c3,camCol);push(c3,c4,camCol);push(c4,c1,camCol);
+   for(let t=0;t<1;t+=.08){const p=V.add(cs,V.scale(V.sub(tg,cs),t)),
+    q=V.add(cs,V.scale(V.sub(tg,cs),Math.min(1,t+.045)));
+    push(p,q,V.scale(camCol,.4))}}
+  PT.push(cs[0],cs[1],cs[2],camCol[0],camCol[1],camCol[2])}
+ finish();updateSceneStatus();return geo;
  function finish(){
+  for(const old of [geo.lit,geo.shadow,geo.lines,geo.pts])if(old)gl.deleteBuffer(old);
+  geo.lit=buffer(LIT);geo.litCount=LIT.length/12;
+  geo.shadow=buffer(SHADOW);geo.shadowCount=SHADOW.length/4;
   geo.lines=buffer(L);geo.lineCount=L.length/6;
-  geo.pts=buffer(PT);geo.ptCount=PT.length/6;return geo}
- return finish()}
+  geo.pts=buffer(PT);geo.ptCount=PT.length/6}}
 
 function camMatrices(){
  const asp=cv.width/Math.max(1,cv.height);
@@ -276,8 +473,10 @@ function project(p,mvp,w,h){
 
 function drawLabels(mvp){
  labels.innerHTML="";
- if(!SHOT)return;
+ if(!show.control||!SHOT)return;
  const w=cv.clientWidth,h=cv.clientHeight;
+ const escapeHtml=value=>String(value??"").replace(/[&<>"']/g,ch=>({
+  "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
  const add=(p,txt,cls)=>{const s=project(p,mvp,w,h);if(!s)return;
   if(s[0]<-80||s[0]>w+80||s[1]<-40||s[1]>h+40)return;
   const d=document.createElement("div");d.className="tag"+(cls?" "+cls:"");
@@ -287,13 +486,21 @@ function drawLabels(mvp){
   const s=P(a.start_3d),h2=Number(a.height_m)||1.7;
   const raw=String(a.facing||"");
   const facing=raw.length>20?raw.slice(0,20)+"…":raw;
-  add([s[0],h2+0.16,s[2]],
-      `<b>${a.display_label||a.name||"人物"}</b>`+
-      (facing?` <span style="color:#9a8d7b">${facing}</span>`:""))});
+  add([s[0],s[1]+h2+0.16,s[2]],
+      `<b>${escapeHtml(a.display_label||a.name||"人物")}</b>`+
+      (facing?` <span style="color:#9a8d7b">${escapeHtml(facing)}</span>`:""))});
  const cam=SHOT.camera||{},cs=P(cam.start_3d,1.55);
  add([cs[0],cs[1]+0.22,cs[2]],
      `<b>机位</b> ${cam.lens_mm?cam.lens_mm+"mm ":""}`+
-     `${(Number(cam.fov_degrees)||0).toFixed(0)}°`,"cam")}
+     `${(Number(cam.fov_degrees)||0).toFixed(0)}°`,"cam");
+ for(const obj of activeSceneModel().objects||[]){
+  if(!obj||typeof obj!=="object")continue;
+  const transform=obj.transform||{},bounds=obj.bounds||{},
+        p=P(obj.position_3d||transform.position_3d||transform.position),
+        height=Math.max(.08,finite(obj.height_m??obj.height??
+                                   bounds.height_m??bounds.height,.8));
+  add([p[0],p[1]+height+.08,p[2]],
+      `<b>${escapeHtml(obj.name||obj.object_id||"场景物体")}</b>`,"obj")}}
 
 function draw(){
  if(!gl)return;
@@ -311,7 +518,8 @@ function draw(){
   gl.useProgram(pPano);
   gl.uniformMatrix4fv(gl.getUniformLocation(pPano,"mvp"),false,new Float32Array(mvp));
   gl.uniform3fv(gl.getUniformLocation(pPano,"eye0"),new Float32Array(CAPTURE));
-  gl.uniform1f(gl.getUniformLocation(pPano,"dim"),mode==="shot"?1.0:0.82);
+   gl.uniform1f(gl.getUniformLocation(pPano,"dim"),
+    displayMode==="realistic"?(mode==="shot"?1.0:.9):.72);
   gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,panoTex);
   gl.uniform1i(gl.getUniformLocation(pPano,"tex"),0);
   // 自动剖切:只画「内表面朝向相机」的面。屋外俯瞰时顶与近墙自动
@@ -321,6 +529,38 @@ function draw(){
    if(V.dot(f.inward,toEye)<=0.02)continue;
    bindAttr(pPano,"pos",f.buf,3,3,0);
    gl.drawArrays(gl.TRIANGLES,0,f.count)}}
+ if(displayMode==="realistic"&&geo.shadowCount){
+  gl.useProgram(pAlpha);
+  gl.uniformMatrix4fv(gl.getUniformLocation(pAlpha,"mvp"),false,new Float32Array(mvp));
+  gl.uniform3fv(gl.getUniformLocation(pAlpha,"color"),new Float32Array([.025,.02,.016]));
+  bindAttr(pAlpha,"pos",geo.shadow,3,4,0);bindAttr(pAlpha,"opa",geo.shadow,1,4,3);
+  gl.depthMask(false);gl.depthFunc(gl.LEQUAL);
+  gl.drawArrays(gl.TRIANGLES,0,geo.shadowCount);
+  gl.depthMask(true);gl.depthFunc(gl.LESS)}
+ if(geo.litCount){const light=lightingFor();
+  gl.useProgram(pLit);
+  gl.uniformMatrix4fv(gl.getUniformLocation(pLit,"mvp"),false,new Float32Array(mvp));
+  gl.uniform3fv(gl.getUniformLocation(pLit,"eye"),new Float32Array(eye));
+  gl.uniform3fv(gl.getUniformLocation(pLit,"lightDir"),new Float32Array(light.direction));
+  gl.uniform3fv(gl.getUniformLocation(pLit,"lightColor"),new Float32Array(light.color));
+  gl.uniform1f(gl.getUniformLocation(pLit,"ambient"),
+               displayMode==="realistic"?light.ambient:.52);
+  gl.uniform1f(gl.getUniformLocation(pLit,"keyLight"),
+               displayMode==="realistic"?light.intensity:.48);
+  gl.uniform1f(gl.getUniformLocation(pLit,"realistic"),
+               displayMode==="realistic"?1:0);
+  gl.uniform1f(gl.getUniformLocation(pLit,"alpha"),
+               displayMode==="realistic"?1:.58);
+  gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,panoTex);
+  gl.uniform1i(gl.getUniformLocation(pLit,"panoTex"),1);
+  gl.uniform3fv(gl.getUniformLocation(pLit,"panoEye0"),new Float32Array(CAPTURE));
+  gl.uniform1f(gl.getUniformLocation(pLit,"panoAvailable"),
+               displayMode==="realistic"&&panoReady?1:0);
+  bindAttr(pLit,"pos",geo.lit,3,12,0);bindAttr(pLit,"nor",geo.lit,3,12,3);
+  bindAttr(pLit,"col",geo.lit,3,12,6);bindAttr(pLit,"mat",geo.lit,3,12,9);
+  gl.enable(gl.POLYGON_OFFSET_FILL);gl.polygonOffset(1,1);
+  gl.drawArrays(gl.TRIANGLES,0,geo.litCount);
+  gl.disable(gl.POLYGON_OFFSET_FILL)}
  if(geo.lineCount){
   gl.useProgram(pLine);
   gl.uniformMatrix4fv(gl.getUniformLocation(pLine,"mvp"),false,new Float32Array(mvp));
@@ -331,9 +571,11 @@ function draw(){
    bindAttr(pLine,"col",geo.pts,3,6,3);
    gl.drawArrays(gl.POINTS,0,geo.ptCount)}}
  drawLabels(mvp);
- hud.textContent = mode==="shot"
-  ? `本镜机位视角 · fov ${(Number((SHOT&&SHOT.camera||{}).fov_degrees)||0).toFixed(0)}°`
-  : `环视 · 距离 ${orbit.dist.toFixed(1)}m`;
+ const viewText=mode==="shot"
+  ? `本镜机位 · fov ${(Number((SHOT&&SHOT.camera||{}).fov_degrees)||0).toFixed(0)}°`
+  : `环视 · ${orbit.dist.toFixed(1)}m`;
+ hud.textContent=`${displayMode==="realistic"?"写实":"结构"} · ${viewText}`+
+  ` · 实体 ${renderStats.objects}`;
  requestAnimationFrame(draw)}
 
 // ---- 交互 ----
@@ -355,10 +597,60 @@ function setMode(m){mode=m;
  document.getElementById("enter").classList.toggle("on",m==="shot")}
 document.getElementById("orbit").onclick=()=>setMode("orbit");
 document.getElementById("enter").onclick=()=>setMode("shot");
+function syncDisplayControls(){
+ document.getElementById("modeReal").classList.toggle("on",displayMode==="realistic");
+ document.getElementById("modeStructure").classList.toggle("on",displayMode==="structure");
+ const control=document.getElementById("tControl");
+ control.classList.toggle("on",show.control);
+ control.setAttribute("aria-pressed",String(show.control));
+ labels.style.display=show.control?"":"none";
+ for(const [id,key] of [["tPath","path"],["tFrus","frus"],["tAxis","axis"]]){
+  const item=document.getElementById(id);item.disabled=!show.control;
+  item.classList.toggle("on",show.control&&show[key])}}
+function setDisplayMode(next){
+ displayMode=next==="structure"?"structure":"realistic";
+ // 写实默认是干净导演视图；控制信息仍可由用户显式重新打开。
+ if(displayMode==="realistic")show.control=false;
+ syncDisplayControls();buildGeometry()}
+document.getElementById("modeReal").onclick=()=>setDisplayMode("realistic");
+document.getElementById("modeStructure").onclick=()=>setDisplayMode("structure");
 [["tPano","pano"],["tPath","path"],["tFrus","frus"],["tAxis","axis"]]
  .forEach(([id,key])=>{const b=document.getElementById(id);
   b.onclick=()=>{show[key]=!show[key];b.classList.toggle("on",show[key]);
    buildGeometry()}});
+document.getElementById("tControl").onclick=()=>{
+ show.control=!show.control;syncDisplayControls();buildGeometry()};
+async function exportCleanPng(){
+ const previousControl=show.control;
+ const button=document.getElementById("exportPng"),saved={
+  displayMode,path:show.path,frus:show.frus,axis:show.axis};
+ let exportError="";
+ button.disabled=true;button.textContent="正在导出…";
+ try{
+  displayMode="realistic";show.control=false;show.path=false;show.frus=false;
+  show.axis=false;syncDisplayControls();buildGeometry();
+  // WebGL 使用 preserveDrawingBuffer；仍等待至少一帧，确保新几何已绘制。
+  await new Promise(resolve=>requestAnimationFrame(()=>resolve()));
+  const blob=await new Promise((resolve,reject)=>cv.toBlob(
+   value=>value?resolve(value):reject(new Error("浏览器没有生成 PNG 数据")),
+   "image/png"));
+  const url=URL.createObjectURL(blob),link=document.createElement("a"),
+        shotNo=String((SHOT&&SHOT.shot_no)||"current").replace(/[^0-9A-Za-z_-]/g,"_"),
+        episodeNo=String((DATA&&DATA.episode_number)||episode||"episode")
+         .replace(/[^0-9A-Za-z_-]/g,"_");
+  link.href=url;link.download=`AIFOS_ep${episodeNo}_shot${shotNo}_photoreal.png`;
+  document.body.appendChild(link);link.click();link.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000)
+ }catch(error){
+  exportError="导出效果图失败："+
+   (error&&error.message?error.message:String(error))
+ }finally{
+  displayMode=saved.displayMode;show.control=previousControl;show.path=saved.path;
+  show.frus=saved.frus;show.axis=saved.axis;syncDisplayControls();buildGeometry();
+  button.disabled=false;button.textContent="导出效果图";
+  if(exportError)warn(exportError,true)}}
+document.getElementById("exportPng").onclick=exportCleanPng;
+syncDisplayControls();
 
 function selectShot(no){
  const idx=(DATA.blocking||{}).shot_index||{};
@@ -374,7 +666,7 @@ function selectShot(no){
  document.getElementById("meta").textContent =
   `${DATA.project_title} 第${DATA.episode_number}集 · 镜${no}` +
   (act.camera?` · ${act.camera}`:"") + (act.action?` — ${act.action}`:"");
- const w=(SCENE&&SCENE.world)||{};
+ const w=Object.assign({},activeSceneModel().room||{},(SCENE&&SCENE.world)||{});
  buildRoomBox(Number(w.floor_width_m)||10,Number(w.floor_depth_m)||7,
               Number(w.ceiling_height_m)||4.2);
  if(SHOT){const cam=SHOT.camera||{},t=P(cam.target_3d,1.2);
@@ -384,8 +676,8 @@ let panoLoc=null;
 function loadPano(location){
  if(!location||location===panoLoc)return;
  const info=(DATA.panoramas||{})[location];
- if(!info){panoReady=false;panoLoc=location;return}
- panoLoc=location;
+ panoReady=false;panoLoc=location;
+ if(!info){updateSceneStatus();return}
  const img=new Image();
  img.onload=()=>{gl.bindTexture(gl.TEXTURE_2D,panoTex);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,0);  // 采样公式已含垂直方向,再翻转=天地颠倒
@@ -393,8 +685,9 @@ function loadPano(location){
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
-  panoReady=true};
- img.onerror=()=>{panoReady=false};
+  panoReady=true;updateSceneStatus()};
+ img.onerror=()=>{panoReady=false;
+  updateSceneStatus(["全景母版加载失败："+(info.url||"地址为空")])};
  img.src=info.url+(info.version?("?v="+info.version):"")}
 
 const qs=new URLSearchParams(location.search);

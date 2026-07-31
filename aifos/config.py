@@ -90,8 +90,7 @@ DEFAULTS = {
         "claude": {
             # 经 aifos.adapters.claude_script 桥接 claude -p 实际编剧
             "type": "cli", "enabled": False,
-            "capabilities": ["script", "storyboard", "image_qc",
-                             "scene_annotate"],
+            "capabilities": ["script", "storyboard", "image_qc"],
             "command": ["python3", "-m", "aifos.adapters.claude_script",
                         "--claude", "claude"],
             "reference_images": True,
@@ -214,6 +213,8 @@ DEFAULTS = {
         "script": ["claude", "claude_api", "mock"],
         "image_qc": ["codex", "image_api", "claude", "claude_api", "mock"],
         "storyboard": ["claude", "claude_api", "mock"],
+        # 全景标注必须真实携带图片，禁止文本 CLI/mock 猜测三维坐标。
+        "scene_annotate": ["claude_api"],
         "image": ["codex", "image_api", "api", "mock"],
         "frames": ["codex", "image_api", "mock"],
         "video": ["jimeng", "ark", "api", "mock"],
@@ -586,6 +587,11 @@ def _normalize_legacy(data):
         if isinstance(caps, list) and "script" in caps \
                 and "image_qc" not in caps:
             caps.append("image_qc")
+        if name == "claude" and isinstance(caps, list):
+            caps[:] = [cap for cap in caps if cap != "scene_annotate"]
+        if name == "claude_api" and isinstance(caps, list) \
+                and "scene_annotate" not in caps:
+            caps.append("scene_annotate")
     for name in ("codex", "image_api"):
         conf = providers.get(name)
         caps = conf.get("capabilities") if isinstance(conf, dict) else None
@@ -598,11 +604,15 @@ def _normalize_legacy(data):
     routing = data.setdefault("routing", {})
     if "prompt_review" not in routing:
         routing["prompt_review"] = ["codex"]
+    routing["scene_annotate"] = ["claude_api"]
     mock_conf = providers.get("mock")
     mock_caps = (mock_conf.get("capabilities")
                  if isinstance(mock_conf, dict) else None)
     if isinstance(mock_caps, list) and "image_qc" not in mock_caps:
         mock_caps.append("image_qc")
+    if isinstance(mock_caps, list):
+        mock_caps[:] = [
+            cap for cap in mock_caps if cap != "scene_annotate"]
     if not remove:
         return data
     providers.pop("say", None)
