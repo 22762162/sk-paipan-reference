@@ -10417,7 +10417,10 @@ class Director:
         # 人物资产只依赖已锁定最终立绘；场景只依赖场景/风格参考图。
         # 不要先等唯一一张场景图完成，再启动全部人物资产。
         tasks = []
-        for scene in ctx["script"]["scenes"]:
+        # 只为未跳过的场次备场景资产:locations/scene_quality 都按
+        # active_scenes 构建,这里若遍历全量 scenes,跳过场次的地点
+        # 会以 KeyError 崩掉整条 cast(2026-07-31 端到端测试首镜即中)。
+        for scene in active_scenes:
             location = scene["location"]
             self.assets.acquire(project_id, "scene", location)
             existing_scene = (
