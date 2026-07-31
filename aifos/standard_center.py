@@ -25,6 +25,44 @@ DEFAULT_PROFILE_KEY = "sk-manju-v5"
 STANDARD_BUNDLE_SCHEMA = "aifos.production-standard/v1"
 
 
+MODEL_UPGRADE_POLICY = {
+    "schema": "aifos.video-model-upgrade/v1",
+    "enabled": True,
+    "scope": "per_shot",
+    "default_model": "seedance2.0fast_vip",
+    "candidate_capability_key": "seedance2_5",
+    "candidate_display_name": "Seedance 2.5",
+    "normal_profile": {
+        "preferred_segment_seconds": [5, 8],
+        "max_segment_seconds": 15,
+    },
+    "upgrade_duration_range_seconds": [16, 30],
+    "reported_limits": {
+        "max_material_assets": 40,
+        "max_total_references": 50,
+        "max_duration_seconds": 30,
+    },
+    "allowed_reasons": [
+        "indivisible_continuous_take_16_to_30_seconds",
+        "required_references_exceed_seedance2_0_limit",
+        "reference_video_required",
+        "complex_continuous_action",
+    ],
+    "required_shot_fields": [
+        "video_model",
+        "video_model_reason",
+        "runtime_capability_verified",
+    ],
+    "runtime_capability_required": True,
+    "unverified_runtime_action": "BLOCK",
+    "fallback": "split_or_block",
+    "keep_resolution": "720p",
+    "preserve_voice": "jimeng_builtin",
+    "preserve_lip_sync": True,
+    "silent_truncation_forbidden": True,
+}
+
+
 DEFAULT_STANDARD = {
     "profile_key": DEFAULT_PROFILE_KEY,
     "name": "SK AI 漫剧工业制作标准 V5",
@@ -32,7 +70,7 @@ DEFAULT_STANDARD = {
     "source_skill": {
         "id": "sk-manju-storyboard-skill",
         "name": "SK 漫剧五维分镜制作 Skill",
-        "version": "5.3",
+        "version": "5.4",
         "reference": "five-dimension-storyboard-template-v5.txt",
         "principle": (
             "先把小说或梗概改编成因果、物理、时间、空间、人物信息与道具"
@@ -53,6 +91,7 @@ DEFAULT_STANDARD = {
             "max_segment_seconds": 15,
             "time_precision_seconds": 0.5,
             "prompt_strategy": "five_dimensions_per_segment",
+            "model_upgrade_policy": copy.deepcopy(MODEL_UPGRADE_POLICY),
             "prompt_contract": {
                 "schema": "aifos.shot-prompt/v2.2",
                 "authority": "highest_runtime_rule",
@@ -533,6 +572,22 @@ class StandardCenter:
         for key in ("pipeline_version", "text_lock_provider", "prompt_strategy",
                     "fast_vip_real_face_conflict"):
             nonempty_string(production, key, f"rules.production.{key}")
+        # 旧标准在迁移前允许暂时缺少该字段；一旦存在，就必须严格符合
+        # 逐镜按需升级合同，避免把 2.5 当成全局默认或静默截断素材/时长。
+        model_upgrade_policy = production.get("model_upgrade_policy")
+        if model_upgrade_policy is not None:
+            if not isinstance(model_upgrade_policy, dict):
+                issue(
+                    "rules.production.model_upgrade_policy",
+                    "必须是逐镜模型升级策略对象")
+            else:
+                for key, expected in MODEL_UPGRADE_POLICY.items():
+                    value = model_upgrade_policy.get(key)
+                    if type(value) is not type(expected) or value != expected:
+                        issue(
+                            f"rules.production.model_upgrade_policy.{key}",
+                            "升级规则已锁定为 "
+                            f"{json.dumps(expected, ensure_ascii=False)}")
         prompt_contract = required_dict(
             production, "prompt_contract", "rules.production.prompt_contract")
         nonempty_string(

@@ -25,6 +25,15 @@ from pathlib import Path
 
 
 from ..errors import ProduceCancelled, ProviderError
+from ..seedance_policy import (
+    DEFAULT_TIER,
+    UPGRADE_TIER,
+    SeedancePolicyError,
+    configured_model_alias,
+    probe_cli_help,
+    requested_tier,
+    validate_runtime_request,
+)
 from .base import Provider, ProviderResult
 from .external import run_interruptible
 
@@ -36,6 +45,19 @@ class DreaminaProvider(Provider):
     def _command(self):
         """完整命令前缀(支持绝对路径与全局旗标),子命令追加其后。"""
         return list(self.conf.get("command") or ["dreamina"])
+
+    def _upgrade_help_probe(self, alias):
+        """Probe once per provider/alias; every video still validates limits."""
+        key = (tuple(self._command()), str(alias))
+        cache = getattr(self, "_seedance_help_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._seedance_help_cache = cache
+        if key not in cache:
+            cache[key] = probe_cli_help(
+                self._command(), alias,
+                timeout=float(self.conf.get("help_timeout", 10) or 10))
+        return cache[key]
 
     def available(self, capability):
         ok, reason = super().available(capability)
@@ -73,12 +95,20 @@ class DreaminaProvider(Provider):
                 value = str(Path(value).resolve())
             if value not in references and value not in (first, last):
                 references.append(value)
-        # 图片总上限 9 = 首帧 + 尾帧 + 7 张资产参考(与导演端一致)
-        references = references[
-            :int(self.conf.get("max_reference_assets", 7))]
         shot_no = int(payload.get("shot_no", 0))
-        model_version = self.conf.get(
-            "model_version", REQUIRED_MODEL_VERSION)
+        try:
+            tier = requested_tier(payload)
+            runtime = validate_runtime_request(
+                {**payload, "first": first, "last": last,
+                 "reference_images": references},
+                self.conf, command=self._command(),
+                help_probe=(
+                    lambda: self._upgrade_help_probe(
+                        configured_model_alias(self.conf, tier))
+                    if tier == UPGRADE_TIER else None))
+        except SeedancePolicyError as exc:
+            raise ProviderError(str(exc)) from exc
+        model_version = runtime["model_alias"]
         # 导演同时保存完整审计提示词与镜头合同；真实请求使用合同短版，
         # 避免全局故事背景和重复禁词稀释首尾帧/单一动作。
         prompt = payload.get("prompt_compact") or payload.get("prompt", "")
@@ -87,19 +117,23 @@ class DreaminaProvider(Provider):
             # Seedance2 有声视频:台词随视频自动配音,免单独 TTS
             prompt += (f"。让角色开口说出这句台词并自动配音"
                        f"(中文自然人声,口型对应):「{dialogue['dialogue']}」")
-        requested_duration = float(payload.get(
-            "duration", self.conf.get("duration", 8)))
+        requested_duration = runtime["requested_duration"]
         video_quality = str(payload.get("video_quality") or "medium")
         video_resolution = str(payload.get(
             "video_resolution") or self.conf.get("video_resolution", "720p"))
         if video_resolution.lower() not in ("480p", "720p", "1080p"):
             raise ProviderError(
                 "Seedance video_resolution 只允许 480p/720p/1080p")
+        if tier == UPGRADE_TIER and video_resolution.lower() != "720p":
+            raise ProviderError(
+                "seedance2_5 当前运行时合同只验证了 720p；"
+                "未证明的分辨率禁止提交")
         # 只有 seedance2.0_vip 支持 1080p/4k;其余型号(含 mini、fast_vip)
         # 一律只出 720p。不按分辨率反选型号,「高档 1080P」就是个不可达
         # 的假选项:用户选了 1080p,请求照发,即梦静默降回 720p——而关键帧
         # 母图是 1080x1920,线性分辨率白丢 33%,全程不报错。
-        if (video_resolution.lower() in ("1080p", "4k")
+        if (tier == DEFAULT_TIER
+                and video_resolution.lower() in ("1080p", "4k")
                 and model_version != "seedance2.0_vip"):
             model_version = "seedance2.0_vip"
         # 非 VIP 型号走**公共排队**,不是省钱是换时间——实测 mini 单段滞留
@@ -112,7 +146,7 @@ class DreaminaProvider(Provider):
             "seedance2.0fast": "seedance2.0fast_vip",
             "seedance2.0": "seedance2.0_vip",
         }
-        if (model_version in public_queue_upgrade
+        if (tier == DEFAULT_TIER and model_version in public_queue_upgrade
                 and not self.conf.get("allow_public_queue")):
             model_version = public_queue_upgrade[model_version]
         # 预算规则(用户 2026-07-29 定):一切迭代验证用 720p fast_vip,
@@ -124,19 +158,12 @@ class DreaminaProvider(Provider):
                 and not self.conf.get("allow_vip_without_confirmation")):
             raise ProviderError(
                 "1080p/4k 属最终成片档(seedance2.0_vip, 165积分/段)，"
-                "迭代验证请用 720p(mini, 45积分/段)。确为最终成片时在"
+                "迭代验证请用 720p Fast VIP。确为最终成片时在"
                 " payload 带 video_final_confirmed=true 再提交")
-        # 即梦 CLI 接受整秒；0.5 秒分镜用常规四舍五入，避免 Python
-        # bankers rounding 把 2.5 秒意外压成 2 秒。
-        duration = max(1, min(15, int(requested_duration + 0.5)))
-        # Seedance 全家族时长下限 4 秒。分镜偶发产出 1.5-3.0 秒镜头,
-        # 旧代码 max(1,...) 只兜到 1 秒,提交后必然被即梦拒收——白付一次
-        # 往返。这是分镜时长合同的缺口,fail-closed 打回去改分镜,
-        # 不做静默拉长(拉长会悄悄改变叙事节奏)。
-        if duration < 4:
-            raise ProviderError(
-                f"Seedance 最短 4 秒,本镜声明 {requested_duration} 秒。"
-                "请回分镜层修正时长(或与相邻镜合并),不做静默拉长")
+        # Policy validates the requested maximum before whole-second rounding,
+        # validates the minimum against the actual rounded submission, and
+        # never clips an over-limit duration or drops excess references.
+        duration = runtime["submitted_duration"]
         if references:
             prompt += (
                 "。多图边界：图1仅为动作起点，图2仅为动作终点；"
@@ -195,6 +222,9 @@ class DreaminaProvider(Provider):
             data={
                 "shot_no": shot_no,
                 "duration": duration,
+                "requested_duration": requested_duration,
+                "video_model_tier": tier,
+                "video_model_reason": runtime["upgrade_reason"],
                 "model_version": model_version,
                 "video_quality": video_quality,
                 "video_resolution": video_resolution,
@@ -202,10 +232,16 @@ class DreaminaProvider(Provider):
                 "lip_sync": bool(payload.get("lip_sync", True)),
                 "forbid_subtitles": bool(payload.get("forbid_subtitles", True)),
                 "reference_images_used": references,
+                "material_reference_count": runtime[
+                    "material_reference_count"],
+                "total_reference_count": runtime[
+                    "total_reference_count"],
+                "seedance_limits": runtime["limits"],
                 "reference_assets": list(payload.get("reference_assets") or []),
                 "log": str(log_path),
             },
             uri=uri,
+            model=model_version,
         )
 
     @staticmethod

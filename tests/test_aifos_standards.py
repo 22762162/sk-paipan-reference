@@ -9,6 +9,7 @@ from aifos.app import App
 from aifos.standard_center import (
     DEFAULT_STANDARD,
     REQUIRED_GATE_IDS,
+    StandardCenter,
     StandardConflictError,
     StandardValidationError,
 )
@@ -75,7 +76,7 @@ def test_default_standard_is_complete_and_active(tmp_path):
         assert contract["compact_prompt_sent_to_model"] is True
         assert contract["full_prompt_kept_for_audit"] is True
         assert contract["order"][:4] == [
-            "subject", "scene", "start", "single_action"]
+            "subject", "scene", "frame_target", "start"]
         assert story_analysis["downstream_consumers"] == [
             "character", "scene", "storyboard", "keyframe", "seedance",
         ]
@@ -91,6 +92,33 @@ def test_default_standard_is_complete_and_active(tmp_path):
         assert "质检原因" in text_assets["forbidden_system_fields"]
         assert production["preferred_segment_seconds"] == [5, 8]
         assert production["max_segment_seconds"] == 15
+        upgrade = production["model_upgrade_policy"]
+        assert upgrade["enabled"] is True
+        assert upgrade["scope"] == "per_shot"
+        assert upgrade["candidate_capability_key"] == "seedance2_5"
+        assert upgrade["normal_profile"] == {
+            "preferred_segment_seconds": [5, 8],
+            "max_segment_seconds": 15,
+        }
+        assert upgrade["upgrade_duration_range_seconds"] == [16, 30]
+        assert upgrade["reported_limits"] == {
+            "max_material_assets": 40,
+            "max_total_references": 50,
+            "max_duration_seconds": 30,
+        }
+        assert upgrade["allowed_reasons"] == [
+            "indivisible_continuous_take_16_to_30_seconds",
+            "required_references_exceed_seedance2_0_limit",
+            "reference_video_required",
+            "complex_continuous_action",
+        ]
+        assert upgrade["runtime_capability_required"] is True
+        assert upgrade["unverified_runtime_action"] == "BLOCK"
+        assert upgrade["silent_truncation_forbidden"] is True
+        assert upgrade["fallback"] == "split_or_block"
+        assert upgrade["keep_resolution"] == "720p"
+        assert upgrade["preserve_voice"] == "jimeng_builtin"
+        assert upgrade["preserve_lip_sync"] is True
         assert production["time_precision_seconds"] == 0.5
         assert len(rules["storyboard"]["five_dimensions"]) == 5
         assert len(rules["storyboard"]["required_columns"]) == 17
@@ -130,12 +158,17 @@ def test_existing_standard_is_upgraded_with_story_analysis_rules(tmp_path):
         legacy = copy.deepcopy(active)
         legacy["content"]["rules"].pop("script_development")
         legacy["content"]["rules"].pop("story_analysis")
+        legacy["content"]["rules"]["production"].pop(
+            "model_upgrade_policy")
         upgraded = app.standards._upgrade_spatial_standard(legacy)
         assert upgraded["version"] == active["version"] + 1
         assert upgraded["content"]["rules"]["story_analysis"] == (
             DEFAULT_STANDARD["rules"]["story_analysis"])
         assert upgraded["content"]["rules"]["script_development"] == (
             DEFAULT_STANDARD["rules"]["script_development"])
+        assert upgraded["content"]["rules"]["production"][
+            "model_upgrade_policy"] == DEFAULT_STANDARD["rules"][
+                "production"]["model_upgrade_policy"]
         assert "剧本分析" in upgraded["change_note"]
         assert len(app.standards.history("sk-manju-v5")) == 2
     finally:
@@ -209,6 +242,44 @@ def test_invalid_save_is_atomic_and_returns_structured_issues(tmp_path):
         assert len(app.standards.history("sk-manju-v5")) == 1
     finally:
         app.close()
+
+
+def test_model_upgrade_policy_is_strict_when_present(tmp_path):
+    app = App(tmp_path / "ws")
+    try:
+        before = app.standards.active()
+        bad = copy.deepcopy(before["content"])
+        policy = bad["rules"]["production"]["model_upgrade_policy"]
+        policy["scope"] = "project"
+        policy["reported_limits"]["max_material_assets"] = 41
+        policy["runtime_capability_required"] = False
+        policy["unverified_runtime_action"] = "truncate"
+        policy["fallback"] = "silent_default"
+        policy["keep_resolution"] = "1080p"
+        with pytest.raises(StandardValidationError) as caught:
+            app.standards.save(bad, change_note="非法放宽2.5升级规则")
+        paths = {item["path"] for item in caught.value.issues}
+        assert paths.issuperset({
+            "rules.production.model_upgrade_policy.scope",
+            "rules.production.model_upgrade_policy.reported_limits",
+            "rules.production.model_upgrade_policy.runtime_capability_required",
+            "rules.production.model_upgrade_policy.unverified_runtime_action",
+            "rules.production.model_upgrade_policy.fallback",
+            "rules.production.model_upgrade_policy.keep_resolution",
+        })
+        assert app.standards.active()["version_id"] == before["version_id"]
+    finally:
+        app.close()
+
+
+def test_legacy_standard_without_model_upgrade_policy_still_validates():
+    legacy = copy.deepcopy(DEFAULT_STANDARD)
+    legacy["rules"]["production"].pop("model_upgrade_policy")
+    issues = StandardCenter.validate(legacy)
+    assert not any(
+        item["path"].startswith(
+            "rules.production.model_upgrade_policy")
+        for item in issues)
 
 
 def test_expected_active_id_detects_conflict_atomically(tmp_path):

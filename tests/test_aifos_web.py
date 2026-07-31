@@ -253,6 +253,11 @@ def test_index_and_static(server):
     assert b"missing-frames" in app_js
     assert b"missing-video" in app_js
     assert "Seedance 参考图输入表".encode() in app_js
+    assert "默认 Seedance 2.0 Fast VIP".encode() in app_js
+    assert "Seedance 2.5 按需升级".encode() in app_js
+    assert "40 素材 / 总 50 参考 / 最长 30 秒".encode() in app_js
+    assert "实际可用性由运行时能力检测决定".encode() in app_js
+    assert b"model_upgrade_policy" in app_js
     assert "首帧（必传）".encode() in app_js
     assert "尾帧（必传）".encode() in app_js
     assert "资产参考图（最多 7 张）".encode() in app_js

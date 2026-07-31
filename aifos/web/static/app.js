@@ -549,7 +549,7 @@ const STANDARD_SECTIONS = [
       { path: "description", label: "标准说明", help: "写清适用题材、画面目标和团队共识。" },
       { path: "profile_key", label: "标准标识", locked: true, help: "版本链的稳定标识，保存后不可更换。" },
       { path: "rules.production.video_model", label: "视频模型", locked: true,
-        help: "锁定 Seedance 2.0 Fast VIP；遇到真人脸限制时暂停，不静默切普通 VIP。" },
+        help: "默认锁定 Seedance 2.0 Fast VIP；Seedance 2.5 仅作按需升级候选，须通过运行时能力检测和镜头升级门禁，不会改写默认模型。遇到真人脸限制时暂停，不静默切普通 VIP。" },
       { path: "rules.production.resolution", label: "默认输出分辨率", locked: true,
         help: "自动/中档默认 720P；用户把单镜 Seedance 质量改为低或高时，分别明确使用 480P 或 1080P，并记录在该镜头合同中。" },
       { path: "rules.production.voice", label: "对白声音", locked: true,
@@ -861,11 +861,36 @@ function standardImpactHtml() {
       <div><dt>情绪留白</dt><dd>${esc((perf.beat_seconds || []).join("–"))}s</dd></div>
       <div><dt>镜头合同</dt><dd>${columns.length} 列字段</dd></div>
       <div><dt>开拍门禁</dt><dd>${enabledGates} 项启用</dd></div>
+      <div><dt>模型策略</dt><dd>${seedance25CapabilityText(p.model_upgrade_policy)}</dd></div>
       <div><dt>交付声音</dt><dd>Seedance2 随视频配音/口型 · 无字幕母版</dd></div>
     </dl>
     <div class="change-summary">${changes ? `已修改 ${changes} 个值，尚未保存` : "与当前生效版本一致"}</div>
     ${errors.length ? `<ul class="validation-list">${errors.map((e) => `<li>${esc(e.message)}</li>`).join("")}</ul>` : ""}
   </div>`;
+}
+
+const SEEDANCE25_DEFAULT_LIMITS_LABEL = "40 素材 / 总 50 参考 / 最长 30 秒";
+
+function seedance25CapabilityText(policy) {
+  const limits = policy?.reported_limits || {};
+  const materialAssets = Number(limits.max_material_assets) || 40;
+  const totalReferences = Number(limits.max_total_references) || 50;
+  const maxDuration = Number(limits.max_duration_seconds) || 30;
+  const limitsLabel = materialAssets === 40 && totalReferences === 50
+    && maxDuration === 30 ? SEEDANCE25_DEFAULT_LIMITS_LABEL
+    : `${materialAssets} 素材 / 总 ${totalReferences} 参考 / 最长 ${maxDuration} 秒`;
+  return `Seedance 2.5 按需升级 · ${limitsLabel} · 实际可用性由运行时能力检测决定`;
+}
+
+function seedance25CapabilityHtml(policy) {
+  const enabled = policy?.enabled !== false;
+  return `<article class="skill-manifest">
+    <div><span>OPTIONAL MODEL UPGRADE</span><b>Seedance 2.5 按需升级能力</b></div>
+    <p>${esc(seedance25CapabilityText(policy))}</p>
+    <p>${enabled
+      ? "只有镜头确有长时长或高参考容量需求、且运行时检测通过时才可升级；默认仍为 Seedance 2.0 Fast VIP / 720P。"
+      : "当前制作标准未启用候选升级；默认继续使用 Seedance 2.0 Fast VIP / 720P。"}</p>
+  </article>`;
 }
 
 async function renderStandards(sectionId) {
@@ -884,13 +909,15 @@ async function renderStandards(sectionId) {
   const active = standardsMeta.active;
   topbarRight.innerHTML = `<span class="standard-live">标准 v${esc(active.version)} 生效中</span>`;
   const source = standardsDraft.source_skill || {};
+  const upgradePolicy = standardsDraft?.rules?.production?.model_upgrade_policy;
   const skillManifest = section.id === "production" ? `
     ${ruleGovernanceHtml()}
     <article class="skill-manifest">
       <div><span>SKILL SOURCE</span><b>${esc(source.name || "SK 漫剧五维分镜制作 Skill")}</b></div>
       <dl><div><dt>技能 ID</dt><dd>${esc(source.id || "sk-manju-storyboard-skill")}</dd></div><div><dt>模板</dt><dd>${esc(source.reference || "five-dimension-storyboard-template-v5.txt")}</dd></div></dl>
       <p>${esc(source.principle || "先完成五维分镜和硬门校验，再进入关键帧与 Seedance 生产。")}</p>
-    </article>` : "";
+    </article>
+    ${seedance25CapabilityHtml(upgradePolicy)}` : "";
   const content = section.id === "gates" ? renderGatesEditor()
     : section.id === "ai_director" ? renderAiDirectorKnowledge()
     : section.id === "history" ? renderVersionHistory()
@@ -10249,7 +10276,8 @@ async function renderCanvasView(episodeId, forceView = "") {
     ${videoReferencePanelHtml(data)}` : ""}
     <div class="profile-strip">
       <span><b>${esc(profile.standard_name || "SK 五维工业流")}</b> v${esc(profile.standard_version || 1)}</span>
-      <span>Seedance 2.0 Fast VIP</span><span>${esc(profile.resolution || "720p")}</span>
+      <span>默认 Seedance 2.0 Fast VIP</span><span>默认 ${esc(profile.resolution || "720p")}</span>
+      <span>${esc(seedance25CapabilityText(profile.model_upgrade_policy))}</span>
       <span>Seedance2 随视频配音</span><span>口型同步</span><span>无字幕母版</span>
       <strong>${gates.filter((g) => g.passed).length}/${gates.length || 0} 门禁通过</strong>
       <a href="#/standards/history">查看制作标准</a>

@@ -68,6 +68,12 @@ from .relations import relation_lines, write_relations
 from .scene_model import (actor_placement_issues, build_scene_model,
                           camera_placement_issues, occlusion_issues,
                           scene_layout_clause)
+from .seedance_policy import (
+    DEFAULT_TIER,
+    SeedancePolicyError,
+    normalize_tier,
+    requested_upgrade_reason,
+)
 from .rule_governance import next_revision_round, stack_revision_feedback
 from .spatial_language import derive_movement_term, spatial_lines
 from .storyboard_preflight import (describe_issues, preflight_storyboard,
@@ -14150,6 +14156,29 @@ class Director:
                     "index", "asset_id", "kind", "name", "version", "uri",
                     "binding")
             })
+        requested_references = list(dict.fromkeys(
+            str(uri) for uri in (payload.get("reference_images") or [])))
+        if "reference_images_used" in result_data:
+            used_references = list(dict.fromkeys(
+                str(uri) for uri in (
+                    result_data.get("reference_images_used") or [])))
+        else:
+            used_references = list(requested_references)
+        boundary_count = int(bool(payload.get("first"))) + int(
+            bool(payload.get("last")))
+        model_tier = str(
+            result_data.get("video_model_tier")
+            or payload.get("video_model_tier")
+            or DEFAULT_TIER)
+        model_reason = str(
+            result_data.get("video_model_reason")
+            or requested_upgrade_reason(payload))
+        requested_model = str(payload.get("model_version") or model_tier)
+        actual_model = str(
+            getattr(result, "model", "")
+            or result_data.get("model_version")
+            or payload.get("model_version")
+            or model_tier)
         snapshot = {
             "schema": "aifos.video-input-snapshot/v1",
             "shot_no": payload.get("shot_no"),
@@ -14162,13 +14191,21 @@ class Director:
             "first_frame": str(payload.get("first") or ""),
             "last_frame": str(payload.get("last") or ""),
             "reference_manifest": manifest,
-            "reference_images": [
-                str(uri) for uri in (payload.get("reference_images") or [])],
-            "reference_images_used": [
-                str(uri) for uri in (
-                    result_data.get("reference_images_used")
-                    or payload.get("reference_images") or [])],
+            "reference_images": requested_references,
+            "reference_images_used": used_references,
+            "material_reference_count_requested": len(requested_references),
+            "material_reference_count_used": len(used_references),
+            "total_reference_count_requested": (
+                len(requested_references) + boundary_count),
+            "total_reference_count_used": (
+                len(used_references) + boundary_count),
             "duration": payload.get("duration"),
+            "duration_submitted": result_data.get(
+                "duration", payload.get("duration")),
+            "video_model_tier": model_tier,
+            "video_model_reason": model_reason,
+            "model_version_requested": requested_model,
+            "model_version_actual": actual_model,
             "video_quality": payload.get("video_quality"),
             "video_resolution": payload.get("video_resolution"),
             "standard_fingerprint": payload.get("standard_fingerprint", ""),
@@ -14176,7 +14213,11 @@ class Director:
         signature_source = {
             key: snapshot[key] for key in (
                 "prompt_sent", "keyframe", "first_frame", "last_frame",
-                "reference_manifest", "reference_images", "duration",
+                "reference_manifest", "reference_images",
+                "material_reference_count_requested",
+                "total_reference_count_requested", "duration",
+                "video_model_tier", "video_model_reason",
+                "model_version_requested",
                 "video_quality", "video_resolution", "standard_fingerprint")
         }
         snapshot["input_signature"] = hashlib.sha256(json.dumps(
@@ -14268,9 +14309,28 @@ class Director:
                 frame.get("image_quality", "medium")):
             raise AifosError(
                 f"镜头{shot['shot_no']}首尾帧为低质量试错图，禁止交给 Seedance")
+        quality_policy = (
+            ctx.get("quality_policy") or default_quality_policy())
         quality = resolve_video_quality(
-            ctx.get("quality_policy") or default_quality_policy(),
+            quality_policy,
             shot_no=shot["shot_no"])
+        raw_model_tier = (
+            shot.get("video_model_tier")
+            or shot.get("model_upgrade_tier")
+            or ((quality_policy or {}).get("video_model_tier")
+                if isinstance(quality_policy, dict) else None)
+            or DEFAULT_TIER)
+        try:
+            video_model_tier = normalize_tier(raw_model_tier)
+        except SeedancePolicyError as exc:
+            raise AifosError(str(exc)) from exc
+        video_model_reason = str(
+            shot.get("video_model_reason")
+            or shot.get("model_upgrade_reason")
+            or "").strip()
+        upgrade_policy = copy.deepcopy(
+            (((ctx.get("production_profile") or {}).get("rules") or {})
+             .get("production") or {}).get("model_upgrade_policy") or {})
         reference_rows = self._video_reference_rows(ctx, shot["shot_no"])
         spatial = self._spatial_reference_requirement(
             ctx, shot["shot_no"])
@@ -14345,6 +14405,14 @@ class Director:
             "forbid_subtitles": not ctx["production_profile"]["burn_subtitles"],
             "video_quality": quality["level"],
             "video_resolution": quality["resolution"],
+            # Semantic request only.  The Provider resolves seedance2_5 to a
+            # configured real alias after probing the installed CLI help.
+            "video_model_tier": video_model_tier,
+            "video_model_reason": video_model_reason,
+            "model_version": (
+                ctx["production_profile"].get("video_model", "")
+                if video_model_tier == DEFAULT_TIER else ""),
+            "model_upgrade_policy": upgrade_policy,
             # 预算闸门的确认信号:1080p/4k 属最终成片档,provider 侧
             # fail-closed 拒绝未确认的 vip 提交。用户在确认页亲手选高档
             # (source=manual)本身就是确认;auto 推出来的高档不算,照拦。

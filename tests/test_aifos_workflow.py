@@ -41,6 +41,13 @@ def test_five_dimension_preflight_and_delivery(tmp_path):
         profile = storyboard["profile"]
         assert profile == continuity["production_profile"]
         assert profile["video_model"] == "seedance2.0fast_vip"
+        assert profile["model_upgrade_policy"]["candidate_capability_key"] == (
+            "seedance2_5")
+        assert profile["model_upgrade_policy"]["reported_limits"] == {
+            "max_material_assets": 40,
+            "max_total_references": 50,
+            "max_duration_seconds": 30,
+        }
         assert profile["resolution"] == "720p"
         assert profile["voice"] == "jimeng_builtin"
         assert profile["lip_sync"] is True
