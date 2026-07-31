@@ -870,7 +870,8 @@ class ProviderRouter:
         allows_text_bootstrap = bool(
             payload.get("allow_text_to_image_bootstrap"))
         supplied_refs = []
-        for key in ("style_ref", "scene_ref", "chain_first_uri", "image_uri"):
+        for key in ("style_ref", "scene_ref", "chain_first_uri",
+                    "image_uri"):
             if payload.get(key):
                 supplied_refs.append(payload[key])
         for key in ("character_refs", "prop_refs", "reference_images"):

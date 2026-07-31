@@ -163,7 +163,9 @@ class CliProvider(Provider):
             # 通用 stdin/stdout CLI 桥只传 JSON 文本；配置里写
             # reference_images=True 并不会把全景图片真正送进子进程。
             # 禁止让它根据文件路径和提示词臆造家具坐标。
-            return False, "CLI 未实现全景图片附件传输"
+            return False, (
+                "CLI 未实现全景图片附件传输；scene_annotate 必须使用"
+                "支持图片输入、可真实携带全景图的视觉 API")
         command = self.conf.get("command") or []
         if not command:
             return False, "未配置 command"

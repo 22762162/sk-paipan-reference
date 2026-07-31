@@ -214,7 +214,8 @@ DEFAULTS = {
         "image_qc": ["codex", "image_api", "claude", "claude_api", "mock"],
         "storyboard": ["claude", "claude_api", "mock"],
         # 全景图实测标注必须走支持图片附件的真实视觉 API；
-        # 禁止回退文本 CLI / mock，避免伪造家具坐标污染后续搭景。
+        # 必须真实携带图片，禁止回退文本 CLI / mock 猜测三维坐标，
+        # 避免伪造家具坐标污染后续搭景。
         "scene_annotate": ["claude_api"],
         "image": ["codex", "image_api", "api", "mock"],
         "frames": ["codex", "image_api", "mock"],
