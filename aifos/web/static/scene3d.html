@@ -79,6 +79,23 @@ button.ghost.on{color:var(--gold);background:transparent;
   box-shadow:0 10px 30px rgba(0,0,0,.45)}
 #pipTag{position:absolute;left:6px;top:5px;font-size:10px;color:var(--gold);
   letter-spacing:.14em;text-shadow:0 1px 2px #000}
+#stmtPanel{position:absolute;top:10px;right:12px;z-index:5;display:none;
+  width:min(340px,calc(100% - 24px));max-height:calc(100% - 24px);
+  overflow:auto;background:rgba(20,17,14,.96);border:1px solid var(--gold-dim);
+  border-radius:5px;padding:12px 13px;box-shadow:0 14px 40px rgba(0,0,0,.5)}
+#stmtPanel.show{display:block}
+#stmtPanel h2{font-size:13px;color:var(--gold);letter-spacing:.1em;
+  margin-bottom:4px}
+#stmtPanel p.hint{font-size:10px;color:var(--paper-dim);line-height:1.6;
+  margin-bottom:8px}
+.stmt-field{margin-bottom:8px}
+.stmt-field label{display:block;font-size:10px;color:var(--gold-dim);
+  letter-spacing:.14em;margin-bottom:3px}
+.stmt-field textarea{width:100%;font:inherit;font-size:12px;line-height:1.5;
+  color:var(--paper);background:rgba(16,14,12,.8);border:1px solid var(--line);
+  border-radius:3px;padding:5px 7px;resize:vertical;min-height:34px}
+.stmt-field textarea:focus{outline:none;border-color:var(--gold-dim)}
+#stmtStatus{font-size:11px;color:var(--paper-dim);margin-left:8px}
 </style>
 </head>
 <body>
@@ -86,6 +103,7 @@ button.ghost.on{color:var(--gold);background:transparent;
   <div id="top">
     <h1>3D 空间</h1>
     <span class="meta" id="meta">加载中…</span>
+    <button id="stmtBtn" class="ghost" style="margin-left:auto">导演阐述</button>
   </div>
   <div id="view">
     <canvas id="c"></canvas>
@@ -94,6 +112,27 @@ button.ghost.on{color:var(--gold);background:transparent;
     <div id="notice" role="status" aria-live="polite"></div>
     <div id="pvBadge"></div>
     <div id="pip"><span id="pipTag">镜头视窗</span></div>
+    <div id="stmtPanel">
+      <h2>本集导演阐述</h2>
+      <p class="hint">意图锚:AI 导演逐镜建议、预演审片都以这份阐述为查偏基准。
+        写清你想要的效果,分镜就不会偏。</p>
+      <div class="stmt-field"><label>一句话意图</label>
+        <textarea id="stmt_intent" rows="1" placeholder="这一集要让观众感到什么"></textarea></div>
+      <div class="stmt-field"><label>基调</label>
+        <textarea id="stmt_tone" rows="1" placeholder="如:压抑中的隐忍,冷色实用光"></textarea></div>
+      <div class="stmt-field"><label>节奏</label>
+        <textarea id="stmt_pacing" rows="1" placeholder="如:前紧后缓,高潮在第2场"></textarea></div>
+      <div class="stmt-field"><label>重点镜</label>
+        <textarea id="stmt_key_shots" rows="2" placeholder="哪些镜头必须出彩,想要什么处理"></textarea></div>
+      <div class="stmt-field"><label>情绪高点</label>
+        <textarea id="stmt_emotional_peaks" rows="1" placeholder="在哪一场哪一拍,用什么运镜托住"></textarea></div>
+      <div class="stmt-field"><label>避免</label>
+        <textarea id="stmt_avoid" rows="1" placeholder="不想看到的处理,如:滥用特写/平光"></textarea></div>
+      <div class="row">
+        <button id="stmtSave">保存阐述</button>
+        <span id="stmtStatus"></span>
+      </div>
+    </div>
     <div id="err"></div>
   </div>
   <footer>
@@ -777,6 +816,43 @@ pvScrubEl.addEventListener("input",()=>{pvScrubbing=true;
 pvScrubEl.addEventListener("change",()=>{pvScrubbing=false});
 pvChecksBtn.onclick=()=>pvIssuesEl.classList.toggle("show");
 
+// ---- 导演阐述:本集意图锚(AI 导演查偏基准) ----
+const STMT_KEYS=["intent","tone","pacing","key_shots","emotional_peaks","avoid"];
+const stmtPanel=document.getElementById("stmtPanel"),
+      stmtBtn=document.getElementById("stmtBtn"),
+      stmtStatus=document.getElementById("stmtStatus");
+stmtBtn.onclick=()=>stmtPanel.classList.toggle("show");
+function stmtMarkFilled(statement){
+ const filled=STMT_KEYS.some(k=>String((statement||{})[k]||"").trim());
+ stmtBtn.textContent=filled?"导演阐述 ●":"导演阐述";
+ stmtBtn.classList.toggle("on",filled)}
+async function loadStatement(){
+ try{
+  const r=await fetch("/api/director-statement?episode="+
+   encodeURIComponent(episode));
+  if(!r.ok)return;
+  const d=await r.json(),s=d.statement||{};
+  STMT_KEYS.forEach(k=>{
+   const el=document.getElementById("stmt_"+k);
+   if(el)el.value=String(s[k]||"")});
+  stmtMarkFilled(s)
+ }catch(e){/* 阐述读不到不阻断预演 */}}
+document.getElementById("stmtSave").onclick=async()=>{
+ const statement={};
+ STMT_KEYS.forEach(k=>{
+  const el=document.getElementById("stmt_"+k);
+  statement[k]=el?el.value.trim():""});
+ stmtStatus.textContent="保存中…";
+ try{
+  const r=await fetch("/api/director-statement",{method:"POST",
+   headers:{"Content-Type":"application/json"},
+   body:JSON.stringify({episode_id:Number(episode),statement})});
+  const d=await r.json();
+  if(!r.ok||d.error)throw new Error(d.error||r.status);
+  stmtStatus.textContent="已保存 v"+d.version;
+  stmtMarkFilled(statement)
+ }catch(e){stmtStatus.textContent="保存失败:"+e.message}};
+
 // ---- 交互 ----
 let drag=null;
 cv.addEventListener("pointerdown",e=>{drag={x:e.clientX,y:e.clientY};
@@ -907,6 +983,7 @@ else{
     b.onclick=()=>pvSeekShot(n);box.appendChild(b)});
    selectShot(nos[0]);
    pvInit();
+   loadStatement();
    draw()})
   .catch(e=>fail("加载失败: "+e.message))}
 </script>

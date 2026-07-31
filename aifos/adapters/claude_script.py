@@ -1860,6 +1860,11 @@ AI_DIRECTOR_PROMPT = """你是本剧的 AI 导演。你精通镜头语言(景别
 本剧题材与画风:{genre}
 题材视听基调:{genre_grammar}
 
+本集导演阐述(查偏基准——你的每一项建议都必须与它一致;发现本镜与
+阐述冲突时,优先给出让本镜回到阐述轨道的处理,并在 rationale 点明
+冲突在哪;阐述未填写时按题材基调执行):
+{director_statement}
+
 本镜事实(不可改变的剧情内容):
 {shot_facts}
 
@@ -2316,6 +2321,8 @@ def _build_prompt_body(capability, payload):
             genre=payload.get("genre", "") or "未指定",
             genre_grammar=payload.get("genre_grammar", "")
             or "无题材专属基调,按通用叙事语法",
+            director_statement=str(
+                payload.get("director_statement") or "(未填写)")[:1200],
             shot_facts=json.dumps(payload.get("shot_facts") or {},
                                   ensure_ascii=False)[:4000],
             context_shots=json.dumps(payload.get("context_shots") or [],

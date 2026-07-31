@@ -2471,6 +2471,26 @@ def make_handler(workspace, jobs):
                     if payload is None:
                         return self._error(404, "剧集不存在")
                     return self._json(payload)
+                if route == "/api/director-statement":
+                    try:
+                        episode_id = int(query.get("episode", ["0"])[0])
+                    except (TypeError, ValueError):
+                        return self._error(400, "episode 必须是数字")
+                    if not episode_id:
+                        return self._error(400, "缺少 episode 参数")
+
+                    def _load(app):
+                        if app.projects.get_episode(episode_id) is None:
+                            return None
+                        statement, version = app.projects.latest_document(
+                            episode_id, "director_statement")
+                        return {"episode_id": episode_id,
+                                "statement": statement or {},
+                                "version": version or 0}
+                    payload = self._with_app(_load)
+                    if payload is None:
+                        return self._error(404, "剧集不存在")
+                    return self._json(payload)
                 if route == "/api/overview":
                     return self._json(self._with_app(
                         lambda app: _overview_payload(app, jobs)))
@@ -2790,6 +2810,8 @@ def make_handler(workspace, jobs):
                     return self._update_now()
                 if parsed.path == "/api/redo_mock":
                     return self._redo_mock()
+                if parsed.path == "/api/director-statement":
+                    return self._director_statement_save()
                 if parsed.path == "/api/qc_item":
                     return self._qc_item()
                 if parsed.path == "/api/qc_override":
@@ -3834,6 +3856,38 @@ def make_handler(workspace, jobs):
                     self.rfile.read(length).decode("utf-8")) if length else {}
             except ValueError:
                 return None
+
+        def _director_statement_save(self):
+            """导演阐述:{episode_id, statement{intent,tone,pacing,
+            key_shots,emotional_peaks,avoid}}。本集意图锚,AI 导演逐镜
+            查偏的基准;previz 页可读写。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            try:
+                episode_id = int(body.get("episode_id") or body.get("episode"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少 episode_id")
+            raw = body.get("statement")
+            if not isinstance(raw, dict):
+                return self._error(400, "缺少 statement 对象")
+            from ..director import Director
+            statement = {
+                key: str(raw.get(key) or "").strip()[:400]
+                for key, _label in Director.STATEMENT_FIELDS}
+            statement["schema"] = "aifos.director-statement/v1"
+
+            def _save(app):
+                if app.projects.get_episode(episode_id) is None:
+                    raise AifosError("剧集不存在")
+                version = app.projects.save_document(
+                    episode_id, "director_statement", statement)
+                return {"ok": True, "version": version,
+                        "statement": statement}
+            try:
+                return self._json(self._with_app(_save))
+            except AifosError as exc:
+                return self._error(400, str(exc))
 
         def _shot_ai_direct(self):
             """AI 导演审单镜:{episode_id, shot_no}。同步返回建议

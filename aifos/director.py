@@ -78,12 +78,13 @@ from .rule_governance import next_revision_round, stack_revision_feedback
 from .spatial_language import derive_movement_term, spatial_lines
 from .storyboard_preflight import (describe_issues, preflight_storyboard,
                                   repairable_shots)
-from .camera_language import MOVEMENT_GEOMETRY
+from .camera_language import MOVEMENT_GEOMETRY, movement_geometry_for
 from .spatial_blocking import (
     WORLD_DEPTH_M,
     WORLD_WIDTH_M,
     awareness_sightline_issues,
     build_spatial_plan,
+    canvas_from_world,
     director_camera_issues,
     mark_spatial_reference_requirements,
     requires_spatial_reference,
@@ -8278,9 +8279,15 @@ class Director:
             shot = shots.get(int(shot_no))
             if shot is None:
                 continue
+            shot_kinds = {
+                str(item.get("kind") or "")
+                for item in (report.get("by_shot") or {}).get(
+                    str(shot_no)) or []}
             try:
                 summary = self._repair_shot_for_shootability(
-                    ctx, shot, describe_issues(report, shot_no))
+                    ctx, shot, describe_issues(report, shot_no),
+                    allow_duration_change=any(
+                        kind.startswith("duration") for kind in shot_kinds))
             except Exception as exc:
                 self.log.warn(
                     "director",
@@ -8354,19 +8361,30 @@ class Director:
                else ";剩余项留给下游门禁,不阻断本阶段"))
         return {"issues": again["issues"], "repaired": repaired}
 
-    def _repair_shot_for_shootability(self, ctx, shot, reason):
-        """交编剧按可拍性问题改镜头(复用 shot_repair 的修复边界)。"""
+    def _repair_shot_for_shootability(self, ctx, shot, reason,
+                                      allow_duration_change=False):
+        """交编剧按可拍性问题改镜头(复用 shot_repair 的修复边界)。
+
+        时长默认锁死;只有预检问题本身就是时长违规(duration_short/
+        duration_long)时才授权本次修复动 duration——编剧必须把补充或
+        压缩的表演写进 description,不是只改数字。"""
         result = self._call(ctx, "script", {
             "shot_repair": True,
             "project_title": ctx["project"]["title"],
             "style": ctx["project"].get("style", "") or "",
             "shot": shot,
             "location": self._shot_location(ctx.get("script"), shot),
+            "allow_duration_change": bool(allow_duration_change),
             "blocking_reason": (
                 "分镜可拍性预检不通过(这些问题会在出图阶段必然熔断或"
                 "产出对不上的画面,必须在分镜层解决):" + str(reason)[:1500]),
         }, "blocking")
         data = result.data or {}
+        if allow_duration_change and data.get("duration") is not None:
+            try:
+                shot["duration"] = round(float(data["duration"]) * 2) / 2
+            except (TypeError, ValueError):
+                pass  # 适配器已校验;异常输出宁可保留原时长交下游门禁
         camera = data.get("camera")
         if isinstance(shot.get("camera"), dict):
             if isinstance(camera, dict) and camera:
@@ -14046,13 +14064,12 @@ class Director:
         spatial = shot_blocking(ctx.get("blocking"), shot["shot_no"]) or {}
         spatial_rule = str(spatial.get("constraint") or "").strip()
         # 运镜:分镜只给一个词(如"缓推"),对视频模型约束力弱。用 3D 机位
-        # 起终点推导出实际运动,再翻译成可核验的画面变化(取景由宽变窄、
-        # 背景视差、主体在画面中的大小变化)。两者不一致时以三维调度为准。
+        # 起终点推导出实际运动,再翻译成可核验的画面变化;两者不一致时
+        # 以三维调度为准。例外:表现性运镜(甩镜/穿越/俯冲/螺旋环绕/
+        # 升格/希区柯克变焦)没有米制求解模型,推导只会误报"固定"把
+        # 艺术运镜抹掉——它们以词典文字合同为准(helper 内置该优先级)。
         derived_movement = derive_movement_term(spatial.get("camera") or {})
-        movement_geometry = MOVEMENT_GEOMETRY.get(
-            derived_movement) or MOVEMENT_GEOMETRY.get(
-                next((word for word in MOVEMENT_GEOMETRY
-                      if word in movement), ""), "")
+        movement_geometry = movement_geometry_for(movement, derived_movement)
         # 空间文字合同:屏幕定位/遮挡序/行动路线,与关键帧同源
         spatial_text = "；".join(
             f"{label}:{text}" for label, text in spatial_lines(
@@ -17051,6 +17068,24 @@ class Director:
             f"导演台指令已写入镜头{shot_no}: " + "；".join(changed))
         return {"shot_no": int(shot_no), "changes": changed}
 
+    # 导演阐述文档的字段与展示顺序(存档 kind=director_statement)
+    STATEMENT_FIELDS = (
+        ("intent", "一句话意图"), ("tone", "基调"), ("pacing", "节奏"),
+        ("key_shots", "重点镜"), ("emotional_peaks", "情绪高点"),
+        ("avoid", "避免"))
+
+    def _director_statement_text(self, episode_id):
+        """本集导演阐述 → 查偏基准文本;未填写返回空串。"""
+        statement, _v = self.projects.latest_document(
+            episode_id, "director_statement")
+        if not isinstance(statement, dict):
+            return ""
+        parts = [
+            f"{label}:{str(statement.get(key) or '').strip()}"
+            for key, label in self.STATEMENT_FIELDS
+            if str(statement.get(key) or "").strip()]
+        return "；".join(parts)
+
     def ai_direct_shot(self, project_title, episode_number, shot_no,
                        apply=False):
         """AI 导演:用平台全部专业词汇对单镜给出导演处理建议。
@@ -17135,6 +17170,9 @@ class Director:
             "genre": " ".join(v for v in (
                 style, genre_look.get("label", "")) if v),
             "genre_grammar": genre_look.get("grammar", ""),
+            # 导演阐述=本集意图锚:AI 导演的建议必须与它一致(查偏)
+            "director_statement": self._director_statement_text(
+                episode["id"]),
             "shot_facts": {**_shot_brief(shot),
                            "action": str(shot.get("action") or "")[:200],
                            "必须可见人数": visible_count,

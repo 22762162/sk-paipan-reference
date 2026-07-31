@@ -200,6 +200,36 @@ class AiDirectorTest(unittest.TestCase):
         for token in ("AI 导演", "赵典吏查看官凭", "低调硬光", "景别偏宽",
                       "容量", "轴线", "不改剧情", "aifos.ai_director.v1"):
             self.assertIn(token, prompt, token)
+        # 阐述未填写时槽位有明确占位,不是空洞
+        self.assertIn("(未填写)", prompt)
+
+    def test_prompt_anchors_on_director_statement(self):
+        from aifos.adapters.claude_script import build_prompt
+        prompt = build_prompt("script", {
+            "ai_director": True,
+            "director_statement": "基调:压抑隐忍；情绪高点:第2场官凭到手",
+            "shot_facts": {}, "vocabulary": {}})
+        self.assertIn("查偏基准", prompt)
+        self.assertIn("压抑隐忍", prompt)
+        self.assertIn("回到阐述轨道", prompt)
+
+    def test_statement_text_assembled_in_field_order(self):
+        from types import SimpleNamespace
+        from aifos.director import Director
+        doc = {"tone": "压抑隐忍", "intent": "让观众替沈砚舟捏汗",
+               "avoid": "", "pacing": "  "}
+        stub = SimpleNamespace(
+            STATEMENT_FIELDS=Director.STATEMENT_FIELDS,
+            projects=SimpleNamespace(
+                latest_document=lambda _eid, _kind: (doc, 3)))
+        text = Director._director_statement_text(stub, 7)
+        self.assertEqual(
+            text, "一句话意图:让观众替沈砚舟捏汗；基调:压抑隐忍")
+        stub_empty = SimpleNamespace(
+            STATEMENT_FIELDS=Director.STATEMENT_FIELDS,
+            projects=SimpleNamespace(
+                latest_document=lambda _eid, _kind: (None, 0)))
+        self.assertEqual(Director._director_statement_text(stub_empty, 7), "")
 
     def test_valid_suggestion_passes_and_is_cleaned(self):
         from aifos.adapters.claude_script import validate_ai_director
