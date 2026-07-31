@@ -305,7 +305,7 @@ GENRE_LOOKS = {
     "palace": {
         "label": "宫斗/权谋",
         "tokens": ("宫斗", "权谋", "朝堂", "宅斗", "后宫", "官场",
-                   "夺嫡"),
+                   "夺嫡", "权臣", "入仕", "官途"),
         "style": "practical_lit",
         "extras": ("rim", "volumetric", "warm_cool", "shallow_dof"),
         "grammar": (

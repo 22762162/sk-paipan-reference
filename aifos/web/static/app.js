@@ -6314,6 +6314,7 @@ async function _pcOpenShotPanel(shotNo) {
             placeholder="导演意见(会随提示词下达,例如:脸部再亮半档,保持忧郁感;刀不要反光)">${
             esc(String((cell.shot || {}).director_note || ""))}</textarea>
           <div class="pc-shot-actions">
+            <button type="button" data-act="ai-direct">🤖 请AI导演</button>
             <button type="button" class="primary" data-act="direct">🎬 按导演指令重画</button>
             ${(cell.shot || {}).director_note
               ? `<button type="button" data-act="clear-note">清除意见</button>` : ""}
@@ -6346,6 +6347,41 @@ async function _pcOpenShotPanel(shotNo) {
       }
       btn.disabled = true;
       try {
+        if (act === "ai-direct") {
+          btn.textContent = "AI导演审片中…";
+          const s = await api("/api/shot/ai-direct", { method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              episode_id: prodCanvasState.episodeId, shot_no: cell.no }) });
+          // 建议填入导演台表单,由人审后按「按导演指令重画」执行
+          const camera = s.camera || {};
+          overlay.querySelectorAll(".pc-direct-grid select[data-dim]")
+            .forEach((sel) => {
+              if (sel.dataset.dim === "__lighting") {
+                if (s.lighting_style) sel.value = s.lighting_style;
+              } else if (camera[sel.dataset.dim]) {
+                sel.value = camera[sel.dataset.dim];
+              }
+            });
+          if (s.note) overlay.querySelector(".pc-direct-note").value = s.note;
+          let box = overlay.querySelector(".pc-ai-rationale");
+          if (!box) {
+            box = document.createElement("div");
+            box.className = "pc-ai-rationale";
+            overlay.querySelector(".pc-direct").appendChild(box);
+          }
+          const picks = Object.entries(camera).map(
+            ([k, v]) => `${k}=${v}`).join("、");
+          box.innerHTML = `<b>🤖 AI导演${s.genre
+            ? `(${esc(s.genre)})` : ""}:</b> ${esc(s.rationale || "")}`
+            + (picks ? `<br><span class="dim">建议已填入上方:${esc(picks)}${
+                s.lighting_style ? "、光影=" + esc(s.lighting_style) : ""
+              }</span>` : "");
+          showToast("AI导演建议已填入,确认后点「按导演指令重画」", "ok");
+          btn.disabled = false;
+          btn.textContent = "🤖 请AI导演";
+          return;
+        }
         if (act === "direct" || act === "clear-note") {
           const camera = {};
           overlay.querySelectorAll(".pc-direct-grid select[data-dim]")
@@ -7068,9 +7104,11 @@ function mountBlocking3d(stage, scene) {
           fill: "rgba(139,131,119,.28)", stroke: "#aaa092",
         };
         const corner = (lx, y, lz) => ({
-          x: px + lx * cos - lz * sin,
+          // 右手系 Y-up：正朝向从 +Z 转向 +X；必须与 Python
+          // scene_model._object_footprint 使用同一旋转公式。
+          x: px + lx * cos + lz * sin,
           y,
-          z: pz + lx * sin + lz * cos,
+          z: pz - lx * sin + lz * cos,
         });
         const vertices = [
           corner(-w / 2, py, -d / 2), corner(w / 2, py, -d / 2),
@@ -7352,10 +7390,13 @@ async function showBlockingOverlay(episodeId) {
   catch (e) { showToast(e.message, "error"); return; }
   const blocking = data.blocking || {};
   const scenes = blocking.scenes || [];
+  const physicsIssues = blocking.validation?.scene_physics_issues || [];
   const overlay = document.createElement("div");
   overlay.className = "script-overlay";
   const sceneHtml = scenes.map((scene, sceneIndex) => {
     const svgUrl = scene.svg_url || scene.map_url || scene.svg || "";
+    const sceneIssues = physicsIssues.filter((item) =>
+      String(item.scene_no ?? "") === String(scene.scene_no ?? ""));
     return `
     <section class="blocking-scene">
       <div class="blocking-scene-head">
@@ -7363,6 +7404,13 @@ async function showBlockingOverlay(episodeId) {
           <span class="dim">${esc((scene.reasons || []).join(" · "))}</span></div>
         <span class="${scene.required ? "warn" : "pass"}">${scene.required ? "重点调度" : "连续性参考"}</span>
       </div>
+      ${sceneIssues.length ? `<details class="blocking-empty" open>
+        <summary><b class="warn">本场物理/空间检查 ${sceneIssues.length} 项</b></summary>
+        <ul>${sceneIssues.map((item) => `<li>
+          <b>${item.severity === "block" ? "阻断" : "提醒"}${item.shot_no != null ? ` · S${esc(item.shot_no)}` : ""}</b>：
+          ${esc(item.message || item.field || "空间关系待复核")}
+        </li>`).join("")}</ul>
+      </details>` : ""}
       ${blockingLegendHtml(scene, blocking)}
       ${blocking3dSceneHtml(scene, sceneIndex)}
       ${svgUrl
@@ -7385,6 +7433,10 @@ async function showBlockingOverlay(episodeId) {
         <b>${blocking.summary?.required_scenes || 0}</b> 个重点调度场景
         <span class="${blocking.validation?.passed ? "pass" : "warn"}">${blocking.validation?.passed ? "空间门禁 PASS" : "空间门禁待生成"}</span>
       </div>
+      ${physicsIssues.length ? `<div class="blocking-empty">
+        <b class="warn">真实搭景检查发现 ${physicsIssues.length} 项</b>：
+        红色阻断项必须先调整人物/机位；默认深度或朝向造成的低置信问题只提醒，不会误卡生产。
+      </div>` : ""}
       <p class="dim">交互 3D 与模型参考图共用同一套米制坐标；人物站位、路线、机位高度、瞄准点和视锥只约束构图，不会画进最终画面。</p>
       ${sceneHtml || `<div class="blocking-empty">本集还没有空间调度图；确认剧本并完成五维分镜后会自动生成。</div>`}
     </div>`;

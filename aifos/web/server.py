@@ -2632,6 +2632,8 @@ def make_handler(workspace, jobs):
                     return self._character_refine_apply()
                 if parsed.path == "/api/shot/direct":
                     return self._shot_direct()
+                if parsed.path == "/api/shot/ai-direct":
+                    return self._shot_ai_direct()
                 if parsed.path == "/api/scene/skip":
                     return self._scene_skip()
                 if parsed.path == "/api/scene/delete":
@@ -3700,6 +3702,30 @@ def make_handler(workspace, jobs):
                     self.rfile.read(length).decode("utf-8")) if length else {}
             except ValueError:
                 return None
+
+        def _shot_ai_direct(self):
+            """AI 导演审单镜:{episode_id, shot_no}。同步返回建议
+            (镜头五维/光影/意见/理由),由前端填入导演台供人审;
+            不直接改分镜(apply 由人按「按导演指令重画」触发)。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            try:
+                shot_no = int(body.get("shot_no"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少 shot_no")
+            try:
+                suggestion = self._with_app(
+                    lambda app: app.director.ai_direct_shot(
+                        title, number, shot_no,
+                        apply=bool(body.get("apply"))))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(suggestion)
 
         def _shot_direct(self):
             """导演台:{episode_id, shot_no, camera{五维}, lighting_style,

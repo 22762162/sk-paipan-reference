@@ -177,3 +177,67 @@ class ContractInjectionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AiDirectorTest(unittest.TestCase):
+    """AI 导演:专业词汇约束下的逐镜导演建议(人审后同通道执行)。"""
+
+    def _payload(self, count=1):
+        return {"visible_count": count}
+
+    def test_prompt_carries_facts_vocab_and_principles(self):
+        from aifos.adapters.claude_script import build_prompt
+        prompt = build_prompt("script", {
+            "ai_director": True,
+            "genre": "古装悬疑·悬疑/罪案",
+            "genre_grammar": "低调硬光,框中框制造窥视感",
+            "shot_facts": {"shot_no": 5, "description": "赵典吏查看官凭",
+                           "必须可见人数": 1},
+            "context_shots": [{"位置": "上一镜", "camera": "中景"}],
+            "spatial": "赵典吏在画面左三分之一,距摄影机2.1米",
+            "qc_issues": ["景别偏宽"],
+            "vocabulary": {"景别": ["特写", "中景"]}})
+        for token in ("AI 导演", "赵典吏查看官凭", "低调硬光", "景别偏宽",
+                      "容量", "轴线", "不改剧情", "aifos.ai_director.v1"):
+            self.assertIn(token, prompt, token)
+
+    def test_valid_suggestion_passes_and_is_cleaned(self):
+        from aifos.adapters.claude_script import validate_ai_director
+        data = {"schema": "aifos.ai_director.v1",
+                "camera": {"景别": "特写", "构图": "框中框", "角度": ""},
+                "lighting_style": "practical_lit",
+                "note": "官凭纸面向光,指腹压痕清晰",
+                "rationale": "单人查证信息镜,特写+框中框强化窥视与紧张"}
+        self.assertIsNone(validate_ai_director(data, self._payload(1)))
+        self.assertNotIn("角度", data["camera"])   # 空值清掉
+
+    def test_out_of_vocabulary_terms_rejected(self):
+        from aifos.adapters.claude_script import validate_ai_director
+        data = {"schema": "aifos.ai_director.v1",
+                "camera": {"景别": "超级大特写"},
+                "rationale": "想更近一点看清楚"}
+        self.assertIn("词典", validate_ai_director(data, self._payload(1)))
+
+    def test_capacity_physics_cannot_be_violated(self):
+        """AI导演也不许给3人镜头开特写——与预检同一条物理。"""
+        from aifos.adapters.claude_script import validate_ai_director
+        data = {"schema": "aifos.ai_director.v1",
+                "camera": {"景别": "特写"},
+                "rationale": "特写更有冲击力"}
+        error = validate_ai_director(data, self._payload(3))
+        self.assertIn("装不下", error)
+
+    def test_rationale_is_mandatory(self):
+        from aifos.adapters.claude_script import validate_ai_director
+        data = {"schema": "aifos.ai_director.v1",
+                "camera": {"景别": "中景"}, "rationale": ""}
+        self.assertIn("rationale", validate_ai_director(
+            data, self._payload(1)))
+
+    def test_all_empty_suggestion_rejected(self):
+        from aifos.adapters.claude_script import validate_ai_director
+        data = {"schema": "aifos.ai_director.v1", "camera": {},
+                "lighting_style": "", "note": "",
+                "rationale": "现状已经是最优处理,无需改动"}
+        self.assertIn("至少给一项", validate_ai_director(
+            data, self._payload(1)))

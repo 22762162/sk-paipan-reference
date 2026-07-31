@@ -1827,6 +1827,104 @@ def validate_asset_prompt(data):
     return None
 
 
+AI_DIRECTOR_PROMPT = """你是本剧的 AI 导演。你精通镜头语言(景别/角度/机位/运镜/构图)、
+布光语法与题材视听基调,现在要对单个镜头给出专业导演处理——目的只有一个:
+让这一镜更好看、更会讲故事、更符合本剧基调,同时严格尊重剧情事实。
+
+本剧题材与画风:{genre}
+题材视听基调:{genre_grammar}
+
+本镜事实(不可改变的剧情内容):
+{shot_facts}
+
+前后镜头(节奏与轴线参考):
+{context_shots}
+
+空间调度事实(人物站位/遮挡/朝向,若有):
+{spatial}
+
+质检指出的问题(若有,导演处理应能化解它们):
+{qc_issues}
+
+可用词汇(只能从这些词条里选,不得发明新词):
+{vocabulary}
+
+导演准则:
+- 景别必须装得下必须可见的人数(容量:大特写/特写=1人,近景/中近景=2人,
+  七分身=3人,中景/膝上景=4人,全景以上不限)——绝不给多人镜头开特写;
+- 与前后镜头形成节奏:连续三镜同景别是流水账,该切就切;对话正反打
+  遵守轴线,两人左右关系不得翻转;
+- 构图为叙事服务:压迫用俯拍/框中框,力量用低角度,窥视用前景遮挡,
+  抒情用留白——不是为了花哨;
+- 光影按题材基调选,画面内有实体光源(灯笼/烛火/窗光)时优先实用光源主导;
+- 意见只写画面可核验的要求(亮度档位/视线方向/道具反光……),不写空话;
+- 不改剧情:人物、动作、道具、生死状态一个都不许动;
+- 现状已经很好时,允许少改甚至只给意见——改动越少越好,每一项改动都要
+  在 rationale 里说出为什么。
+
+只输出一个 JSON 对象,不要任何其他文字或 Markdown 代码块:
+{{"schema": "aifos.ai_director.v1",
+ "camera": {{"景别": "留空表示不改", "角度": "", "机位": "", "运镜": "",
+             "构图": ""}},
+ "lighting_style": "7种风格key之一/auto/留空不改",
+ "note": "给生成模型的导演意见,可核验、≤200字;没有就留空",
+ "rationale": "用人话向剧组解释这样处理的理由(≤200字)"}}
+"""
+
+
+def validate_ai_director(data, payload):
+    """AI 导演输出校验:词条必须在词典内、景别必须装得下人数。"""
+    from ..camera_language import (ANGLE_GEOMETRY, COMPOSITION_GEOMETRY,
+                                   MOVEMENT_GEOMETRY, POSITION_GEOMETRY,
+                                   SCALE_GEOMETRY, scale_capacity)
+    from ..lighting_language import LIGHTING_STYLES
+    if not isinstance(data, dict):
+        return "输出必须是 JSON 对象"
+    if data.get("schema") != "aifos.ai_director.v1":
+        return "schema 必须是 aifos.ai_director.v1"
+    tables = {"景别": SCALE_GEOMETRY, "角度": ANGLE_GEOMETRY,
+              "机位": POSITION_GEOMETRY, "运镜": MOVEMENT_GEOMETRY,
+              "构图": COMPOSITION_GEOMETRY}
+    camera = data.get("camera")
+    camera = camera if isinstance(camera, dict) else {}
+    cleaned = {}
+    for dim, value in camera.items():
+        value = str(value or "").strip()
+        if not value:
+            continue
+        table = tables.get(str(dim).strip())
+        if table is None:
+            return f"未知镜头维度「{dim}」"
+        if value not in table:
+            return (f"「{value}」不在{dim}词典里,只能从可用词汇中选")
+        cleaned[str(dim).strip()] = value
+    scale = cleaned.get("景别")
+    if scale:
+        try:
+            count = int((payload or {}).get("visible_count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count > 0 and scale_capacity(scale) < count:
+            return (f"景别{scale}装不下本镜必须可见的{count}人——"
+                    "导演不能违反容量物理")
+    data["camera"] = cleaned
+    lighting = str(data.get("lighting_style") or "").strip()
+    if lighting and lighting != "auto" and lighting not in LIGHTING_STYLES:
+        return f"未知光影风格「{lighting}」"
+    data["lighting_style"] = lighting
+    note = str(data.get("note") or "").strip()
+    if len(note) > 220:
+        return "导演意见过长(>200字),必须精炼"
+    data["note"] = note
+    rationale = str(data.get("rationale") or "").strip()
+    if len(rationale) < 8:
+        return "缺少 rationale:必须向剧组说明处理理由"
+    data["rationale"] = rationale[:300]
+    if not cleaned and not lighting and not note:
+        return "镜头/光影/意见全为空:至少给一项处理,或在意见里说明现状已最优"
+    return None
+
+
 RULE_APPEAL_PROMPT = """你是本剧生产平台的规则仲裁官(终审法庭)。平台的内置校验规则做初审,
 它是死的字面规则;你要判断这次判败到底是**真违规**,还是**规则字面化误杀 /
 剧情本来就需要这样**。
@@ -2078,6 +2176,11 @@ SCENE_ANNOTATE_PROMPT = """你在读一张 720° 等距圆柱全景图(equirecta
   物体与地板真正相交的那条线上(不是物体中心,不是顶部)。
 - top_v:该物体最高点的纵向比例(用于解高度)。看不清可省略。
 - width_u:该物体在图里占的水平宽度比例(用于解宽度)。看不清可省略。
+- depth_m:结合房间尺度判断的实体前后深度(米)。桌椅柜架、可移动道具
+  必须给出；门窗、帷幔等薄面给真实厚度，禁止把宽度重复当深度。
+- rotation_y_deg:物体绕竖直轴的朝向，0°表示宽边沿世界X轴，
+  90°表示宽边沿世界-Z轴；按全景中的边线/墙线判断。看不清可省略，
+  平台会记录为估计值而不会冒充测量值。
 
 只标真实存在于画面里的东西。不要补画面上没有的家具,不要把墙面纹理、
 光斑、影子当成物体。人物不要标(场景是空镜)。
@@ -2088,6 +2191,7 @@ opening(门窗)、light(灯具)、decor(帷幔挂画盆栽)。
 严格输出 JSON:
 {{"objects":[{{"name":"物体中文名","category":"furniture",
   "base_u":0.5,"base_v":0.78,"top_v":0.55,"width_u":0.12,
+  "depth_m":0.8,"rotation_y_deg":0,
   "note":"用于定位的接触点描述"}}]}}
 只输出 JSON,不要额外说明。
 """
@@ -2112,6 +2216,15 @@ def validate_scene_annotation(data):
                 return f"objects[{index}] 的 {key} 缺失或非数字"
             if not 0.0 <= value <= 1.0:
                 return f"objects[{index}] 的 {key} 必须在 0~1 之间"
+        for key in ("depth_m", "rotation_y_deg"):
+            if item.get(key) is None:
+                continue
+            try:
+                value = float(item[key])
+            except (TypeError, ValueError):
+                return f"objects[{index}] 的 {key} 必须是数字"
+            if key == "depth_m" and not 0.02 <= value <= 20.0:
+                return f"objects[{index}] 的 depth_m 必须在 0.02~20 米之间"
     return ""
 
 
@@ -2154,6 +2267,21 @@ def _build_prompt_body(capability, payload):
             feedback=payload.get("feedback", "") or "(无)",
             references=references or "(无)",
             style=payload.get("style", "") or "(未指定)")
+    if capability == "script" and payload.get("ai_director"):
+        return AI_DIRECTOR_PROMPT.format(
+            genre=payload.get("genre", "") or "未指定",
+            genre_grammar=payload.get("genre_grammar", "")
+            or "无题材专属基调,按通用叙事语法",
+            shot_facts=json.dumps(payload.get("shot_facts") or {},
+                                  ensure_ascii=False)[:4000],
+            context_shots=json.dumps(payload.get("context_shots") or [],
+                                     ensure_ascii=False)[:2000],
+            spatial=str(payload.get("spatial") or "无")[:1500],
+            qc_issues="；".join(
+                str(i) for i in (payload.get("qc_issues") or [])[:6])
+            or "无",
+            vocabulary=json.dumps(payload.get("vocabulary") or {},
+                                  ensure_ascii=False))
     if capability == "script" and payload.get("rule_appeal"):
         return RULE_APPEAL_PROMPT.format(
             rule_id=payload.get("rule_id", ""),
@@ -2550,7 +2678,9 @@ def _postprocess_and_validate(capability, payload, data):
             refined_registry.append(item)
         data["prop_contract_schema"] = PROP_CONTRACT_SCHEMA
         data["prop_registry"] = refined_registry
-    if capability == "image_qc":
+    if capability == "scene_annotate":
+        error = validate_scene_annotation(data)
+    elif capability == "image_qc":
         error = validate_image_qc(data)
     elif capability == "script" and payload.get("prompt_refine"):
         error = validate_prompt_refine(data)
@@ -2560,6 +2690,8 @@ def _postprocess_and_validate(capability, payload, data):
         error = validate_shot_repair(data, payload)
     elif capability == "script" and payload.get("prop_design"):
         error = validate_prop_design(data, payload)
+    elif capability == "script" and payload.get("ai_director"):
+        error = validate_ai_director(data, payload)
     elif capability == "script" and payload.get("rule_appeal"):
         error = validate_rule_appeal(data, payload)
     elif capability == "script" and payload.get("lesson_distill"):
@@ -2588,6 +2720,110 @@ def _postprocess_and_validate(capability, payload, data):
 REPAIR_TIMEOUT_CAP = 900
 
 
+def _storyboard_error_shot_positions(error, shot_count):
+    """从分镜校验错误里提取 1-based 镜头位置，供增量修复使用。"""
+    positions = []
+    for value in re.findall(r"镜头\s*(\d+)", str(error or "")):
+        position = int(value)
+        if 1 <= position <= shot_count and position not in positions:
+            positions.append(position)
+    return positions
+
+
+def _merge_storyboard_shot_repairs(data, repaired, positions):
+    """把模型返回的少量坏镜头合并回原分镜，其余镜头保持不动。"""
+    if isinstance(repaired, list):
+        rows = repaired
+    elif isinstance(repaired, dict) and isinstance(
+            repaired.get("shots"), list):
+        rows = repaired["shots"]
+    elif isinstance(repaired, dict) and (
+            repaired.get("shot_no") is not None
+            or repaired.get("_position") is not None):
+        rows = [repaired]
+    else:
+        return None
+    rows = [row for row in rows if isinstance(row, dict)]
+    if not rows:
+        return None
+    source_shots = data.get("shots") or []
+    allowed = set(positions)
+    assigned = {}
+    for index, row in enumerate(rows):
+        position = row.get("_position")
+        if type(position) is not int:
+            shot_no = row.get("shot_no")
+            matches = [
+                item_index + 1
+                for item_index, source in enumerate(source_shots)
+                if isinstance(source, dict)
+                and source.get("shot_no") == shot_no
+                and item_index + 1 in allowed
+            ]
+            if len(matches) == 1:
+                position = matches[0]
+            elif len(rows) == len(positions):
+                position = positions[index]
+        if type(position) is not int or position not in allowed:
+            continue
+        clean = json.loads(json.dumps(row, ensure_ascii=False))
+        clean.pop("_position", None)
+        assigned[position] = clean
+    if not assigned:
+        return None
+    merged = json.loads(json.dumps(data, ensure_ascii=False))
+    for position, row in assigned.items():
+        merged["shots"][position - 1] = row
+    return merged
+
+
+def _repair_storyboard_shots_with_engine(
+        engine, binary, payload, data, error, repair_timeout,
+        codex_home="", stall_timeout=0):
+    """只重发校验点名的坏镜头，避免整集分镜修复被输出上限截断。"""
+    shots = data.get("shots") if isinstance(data, dict) else None
+    if not isinstance(shots, list):
+        return None, ""
+    positions = _storyboard_error_shot_positions(error, len(shots))
+    if not positions or len(positions) >= len(shots):
+        return None, ""
+    broken = []
+    for position in positions:
+        row = json.loads(json.dumps(shots[position - 1], ensure_ascii=False))
+        row["_position"] = position
+        broken.append(row)
+    prompt = (
+        "你刚为漫剧平台生成了一份分镜 JSON，机器只发现以下镜头字段错误：\n"
+        f"{error}\n\n"
+        "只修复下面列出的坏镜头。返回且只返回 JSON 对象 "
+        "{\"shots\":[完整修复后的镜头对象]}。每个镜头必须保留 "
+        "_position（原 shots 数组的 1-based 位置）；除校验点名字段外"
+        "不得改写剧情、人物、台词、机位或其他字段。不要解释，不要"
+        "Markdown 代码块。\n坏镜头：\n"
+        + json.dumps({"shots": broken}, ensure_ascii=False))
+    try:
+        ok, text = _invoke_engine(
+            engine, binary, prompt, repair_timeout,
+            codex_home=codex_home, stall_timeout=stall_timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"(镜头级就地修复调用失败: {exc})"
+    if not ok:
+        return None, f"(镜头级就地修复失败: {str(text)[:200]})"
+    repaired = extract_json(text)
+    if repaired is None:
+        return None, "(镜头级就地修复输出中未找到 JSON)"
+    merged = _merge_storyboard_shot_repairs(data, repaired, positions)
+    if merged is None:
+        return None, "(镜头级就地修复未返回可合并的 shots)"
+    fixed, fixed_error = _postprocess_and_validate(
+        "storyboard", payload, merged)
+    if fixed_error:
+        return None, (
+            "(镜头级就地修复复检仍未通过: "
+            f"{str(fixed_error)[:300]})")
+    return fixed, f"(镜头级就地修复合并 {len(positions)} 个镜头)"
+
+
 def _repair_with_engine(engine, binary, capability, payload, data, error,
                         timeout, codex_home="", stall_timeout=0):
     """校验失败时的就地修复复检:同一引擎只修错误字段,不丢弃产出。
@@ -2607,6 +2843,12 @@ def _repair_with_engine(engine, binary, capability, payload, data, error,
     # timeout=0(不设上限)时修复调用仍用自身上限兜底
     repair_timeout = (min(int(timeout), REPAIR_TIMEOUT_CAP)
                       if timeout and timeout > 0 else REPAIR_TIMEOUT_CAP)
+    if capability == "storyboard":
+        fixed, note = _repair_storyboard_shots_with_engine(
+            engine, binary, payload, data, error, repair_timeout,
+            codex_home=codex_home, stall_timeout=stall_timeout)
+        if fixed is not None:
+            return fixed, note
     try:
         ok, text = _invoke_engine(engine, binary, prompt, repair_timeout,
                                   codex_home=codex_home,

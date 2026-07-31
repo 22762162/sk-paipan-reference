@@ -5035,3 +5035,5 @@ textarea:focus-visible, select:focus-visible {
   border-radius: 8px; }
 .pc-direct-note { width: 100%; font-size: 12.5px; border-radius: 8px;
   padding: 7px 9px; resize: vertical; }
+.pc-ai-rationale { margin-top: 8px; padding: 8px 10px; border-radius: 10px;
+  background: var(--accent-soft); font-size: 12.5px; line-height: 1.6; }

@@ -66,7 +66,8 @@ from .qc_stats import record_qc
 from .pano_slice import slice_for_block, slice_panorama
 from .relations import relation_lines, write_relations
 from .scene_model import (actor_placement_issues, build_scene_model,
-                          occlusion_issues, scene_layout_clause)
+                          camera_placement_issues, occlusion_issues,
+                          scene_layout_clause)
 from .rule_governance import next_revision_round, stack_revision_feedback
 from .spatial_language import derive_movement_term, spatial_lines
 from .storyboard_preflight import (describe_issues, preflight_storyboard,
@@ -2520,25 +2521,42 @@ class Director:
         location = str(location or "").strip()
         if not location:
             raise AifosError("请指定场景名")
-        existing = self.assets.latest(project["id"], "scene_model", location)
-        if existing is not None and not force:
-            try:
-                return json.loads(
-                    Path(existing["uri"]).read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                pass
         pano = self._scene_view_row(
             project["id"], location, self.SCENE_PANORAMA_KEY)
         if pano is None or not pano["uri"] or not Path(pano["uri"]).exists():
             raise AifosError(
                 f"场景「{location}」还没有 720° 全景母版;"
                 "请先运行 expand_scene_views 再反解三维场景")
+        pano_meta = self._asset_meta(pano)
+        if (str(pano_meta.get("provider") or "") == "mock"
+                or pano_meta.get("real") is False):
+            raise AifosError(
+                f"场景「{location}」当前只有 mock 全景占位图，"
+                "不能据此建立真实三维搭景；请先生成真实全景母版")
+        existing = self.assets.latest(project["id"], "scene_model", location)
+        if existing is not None and not force:
+            try:
+                saved = json.loads(
+                    Path(existing["uri"]).read_text(encoding="utf-8"))
+                saved_pano_version = int(
+                    saved.get("panorama_version")
+                    or self._asset_meta(existing).get("panorama_version")
+                    or 0)
+                if (isinstance(saved, dict)
+                        and saved_pano_version == int(pano["version"] or 0)):
+                    return saved
+                self.log.info(
+                    "director",
+                    f"场景「{location}」全景版本已变化，自动重建三维搭景")
+            except (OSError, ValueError, TypeError):
+                pass
         out_dir = self.artifacts_root / f"p{project['id']:03d}" / "scenes"
         out_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "location": location,
             # 全景本身就是被分析的图(不是"参考图"),视觉通道按待检图上传
             "image_uri": str(pano["uri"]),
+            "require_reference_images": True,
             "reference_manifest": [{
                 "index": 1, "uri": str(pano["uri"]),
                 "label": f"{location} 720°全景母版", "role": "scene",
@@ -2546,6 +2564,10 @@ class Director:
             }],
         }
         result = self.router.call("scene_annotate", payload, out_dir)
+        if getattr(result, "provider", "") == "mock":
+            raise AifosError(
+                f"场景「{location}」没有可读取全景图的真实视觉通道，"
+                "禁止用 mock 坐标冒充真实三维搭景")
         data = getattr(result, "data", None) or {}
         model = build_scene_model(
             data.get("objects") or [], location=location,
@@ -2555,21 +2577,156 @@ class Director:
             panorama_uri=str(pano["uri"]))
         model["provider"] = getattr(result, "provider", "")
         model["panorama_version"] = pano["version"]
+        model["panorama_asset_id"] = pano["id"]
+        model["built_at"] = now()
         safe = "".join(ch if ch.isalnum() else "_" for ch in location)[:40]
-        dest = out_dir / f"scene_model_{safe}.json"
+        previous = self.assets.latest(
+            project["id"], "scene_model", location, include_deleted=True)
+        next_version = int(previous["version"] + 1) if previous else 1
+        model["asset_version"] = next_version
+        dest = out_dir / f"scene_model_{safe}_v{next_version}.json"
         dest.write_text(json.dumps(model, ensure_ascii=False, indent=1),
                         encoding="utf-8")
         self.assets.register(
             project["id"], "scene_model", location, str(dest),
             meta={"objects": len(model["objects"]),
                   "issues": len(model["issues"]),
-                  "panorama_version": pano["version"]})
+                  "panorama_version": pano["version"],
+                  "panorama_asset_id": pano["id"],
+                  "provider": model["provider"],
+                  "real": True},
+            new_version=previous is not None)
         self.log.info(
             "director",
             f"场景「{location}」反解出 {len(model['objects'])} 件实体"
             + (f",{len(model['issues'])} 条自检问题"
                if model["issues"] else ""))
         return model
+
+    def _scene_model_state(self, project_id, location):
+        """读取场景几何，并确认它仍对应当前全景版本。"""
+        location = str(location or "").strip()
+        if not location:
+            return None, None, True, "场景名为空"
+        row = self.assets.latest(project_id, "scene_model", location)
+        if row is None or not row["uri"]:
+            return None, row, True, "尚未建立真实三维搭景"
+        try:
+            model = json.loads(
+                Path(row["uri"]).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return None, row, True, "三维搭景文件损坏或不可读"
+        if not isinstance(model, dict):
+            return None, row, True, "三维搭景不是有效对象"
+        pano = self._scene_view_row(
+            project_id, location, self.SCENE_PANORAMA_KEY)
+        if pano is None:
+            return model, row, True, "对应的 720° 全景母版缺失"
+        try:
+            model_pano_version = int(
+                model.get("panorama_version")
+                or self._asset_meta(row).get("panorama_version")
+                or 0)
+            current_pano_version = int(pano["version"] or 0)
+        except (TypeError, ValueError):
+            return model, row, True, "三维搭景缺少有效的全景版本"
+        if model_pano_version != current_pano_version:
+            return (
+                model, row, True,
+                f"三维搭景基于全景 v{model_pano_version}，"
+                f"当前全景已是 v{current_pano_version}")
+        return model, row, False, ""
+
+    def _attach_scene_physics(self, ctx, blocking):
+        """把真实搭景作为 blocking 的物理门禁，而不只是查看器装饰。"""
+        validation = blocking.setdefault("validation", {})
+        spatial_passed = bool(validation.get(
+            "spatial_passed", validation.get("passed", True)))
+        validation["spatial_passed"] = spatial_passed
+        issues = []
+        fingerprint_rows = []
+        require_models = bool(self.config.get(
+            "defaults", "space_first", default=False))
+        for scene in (blocking.get("scenes") or []):
+            location = str(scene.get("location") or "").strip()
+            model, row, stale, reason = self._scene_model_state(
+                ctx["project"]["id"], location)
+            if model is None or stale:
+                fingerprint_rows.append({
+                    "location": location,
+                    "asset_version": int(row["version"] or 0) if row else 0,
+                    "state": reason,
+                })
+                if require_models:
+                    issues.append({
+                        "severity": "block",
+                        "field": (
+                            "scene_model_stale" if model is not None
+                            else "scene_model_missing"),
+                        "scene_no": scene.get("scene_no"),
+                        "location": location,
+                        "message": (
+                            f"场景「{location}」{reason}；"
+                            "必须先按当前全景重建真实三维搭景，"
+                            "否则人物、家具和机位没有共同空间事实源"),
+                    })
+                continue
+            scene["scene_model_asset_version"] = int(row["version"] or 0)
+            scene["scene_model_panorama_version"] = int(
+                model.get("panorama_version") or 0)
+            fingerprint_rows.append({
+                "location": location,
+                "asset_version": scene["scene_model_asset_version"],
+                "panorama_version": scene[
+                    "scene_model_panorama_version"],
+                "objects": [
+                    {
+                        "name": item.get("name"),
+                        "position_3d": item.get("position_3d"),
+                        "width_m": item.get("width_m"),
+                        "height_m": item.get("height_m"),
+                        "depth_m": item.get("depth_m"),
+                        "rotation_y_deg": item.get("rotation_y_deg"),
+                    }
+                    for item in (model.get("objects") or [])
+                    if isinstance(item, dict)
+                ],
+            })
+            for shot in (scene.get("shots") or []):
+                shot_no = shot.get("shot_no")
+                for item in actor_placement_issues(
+                        model, shot.get("actors") or []):
+                    issues.append({
+                        **item,
+                        "scene_no": scene.get("scene_no"),
+                        "shot_no": shot_no,
+                        "location": location,
+                    })
+                for item in camera_placement_issues(
+                        model, shot.get("camera") or {}):
+                    issues.append({
+                        **item,
+                        "scene_no": scene.get("scene_no"),
+                        "shot_no": shot_no,
+                        "location": location,
+                    })
+                for item in occlusion_issues(
+                        model, shot.get("camera") or {},
+                        shot.get("actors") or []):
+                    issues.append({
+                        **item,
+                        "scene_no": scene.get("scene_no"),
+                        "shot_no": shot_no,
+                        "location": location,
+                    })
+        fingerprint = self._stable_hash(fingerprint_rows)
+        blocking["scene_model_fingerprint"] = fingerprint
+        validation["scene_physics_issues"] = issues
+        validation["scene_physics_passed"] = not any(
+            item.get("severity") == "block" for item in issues)
+        validation["passed"] = bool(
+            spatial_passed and validation["scene_physics_passed"])
+        return issues
 
     def _scene_view_reference(self, project_id, location, camera,
                               fresh_run_id=None):
@@ -7974,7 +8131,7 @@ class Director:
         顺序即架构:剧本 → **空间(全景=几何唯一真相)** → 分镜 → 关键帧。
         分镜与关键帧都以空间为参考,陈设与站位有了唯一事实源,漂移从
         「靠 QC 抓」变成「无从发生」(v6→v7 实证)。expand_scene_views
-        幂等,已有全景的场景直接跳过。
+        幂等；全景就绪后必须继续反解真实家具盒体，不能只停在贴图。
         """
         if not self.config.get("defaults", "space_first", default=False):
             return
@@ -7985,14 +8142,14 @@ class Director:
                 continue
             pano = self._scene_view_row(
                 project["id"], location, self.SCENE_PANORAMA_KEY)
-            if (pano is not None and pano["uri"]
+            if not (pano is not None and pano["uri"]
                     and Path(pano["uri"]).exists()):
-                continue
-            self.log.info(
-                "director",
-                f"空间前置:为「{location}」生成 720° 全景母版与四向视角")
-            self.expand_scene_views(
-                project["title"], location, include_panorama=True)
+                self.log.info(
+                    "director",
+                    f"空间前置:为「{location}」生成 720° 全景母版与四向视角")
+                self.expand_scene_views(
+                    project["title"], location, include_panorama=True)
+            self.build_scene_model(project["title"], location)
 
     def _stage_storyboard(self, ctx):
         self._ensure_space_first_scenes(ctx)
@@ -8156,6 +8313,9 @@ class Director:
                 "director_camera_warnings"] = camera_issues
             for item in camera_issues[:4]:
                 self.log.warn("director", item["message"])
+        # 分镜修复会重新求解人物和机位；必须再次与真实家具盒体碰撞，
+        # 否则第一次合格、修镜后反而穿进桌柜也不会被发现。
+        self._attach_scene_physics(ctx, blocking)
         write_spatial_svgs(blocking, ctx["out_root"] / "blocking")
         write_spatial_reference_pngs(
             blocking, ctx["out_root"] / "blocking" / "seedance")
@@ -8227,13 +8387,18 @@ class Director:
         candidate = build_spatial_plan(
             ctx["script"], ctx["storyboard"], ctx["continuity"],
             group_threshold=threshold)
+        self._attach_scene_physics(ctx, candidate)
         existing, version = self.projects.latest_document(
             ctx["episode"]["id"], "blocking")
         reused = (not ctx.get("force") and existing is not None
                   and existing.get("source_fingerprint")
                   == candidate["source_fingerprint"]
+                  and existing.get("scene_model_fingerprint")
+                  == candidate.get("scene_model_fingerprint")
                   and (existing.get("validation") or {}).get("passed"))
         blocking = existing if reused else candidate
+        if reused:
+            self._attach_scene_physics(ctx, blocking)
         paths = write_spatial_svgs(
             blocking, ctx["out_root"] / "blocking")
         reference_paths = write_spatial_reference_pngs(
@@ -11608,6 +11773,42 @@ class Director:
         return "\n".join(p for p in parts if p)
 
 
+    def _shot_scene_physics(self, ctx, location, spatial):
+        """正式出图前再校一次，防止旧 blocking/旧模型被断点复用。"""
+        if not self.config.get(
+                "defaults", "space_first", default=False):
+            return {"passed": True, "issues": [], "asset_version": 0}
+        model, row, stale, reason = self._scene_model_state(
+            ctx["project"]["id"], location)
+        if model is None or stale:
+            raise AifosError(
+                f"场景「{location}」{reason}；已在关键帧出图前阻断。"
+                "请先重新建立该场景的真实三维搭景")
+        spatial = spatial if isinstance(spatial, dict) else {}
+        issues = []
+        issues.extend(actor_placement_issues(
+            model, spatial.get("actors") or []))
+        issues.extend(camera_placement_issues(
+            model, spatial.get("camera") or {}))
+        issues.extend(occlusion_issues(
+            model, spatial.get("camera") or {},
+            spatial.get("actors") or []))
+        blockers = [
+            item for item in issues if item.get("severity") == "block"]
+        if blockers:
+            summary = "；".join(
+                str(item.get("message") or "") for item in blockers[:4])
+            raise AifosError(
+                f"场景「{location}」物理/空间逻辑未通过：{summary}。"
+                "请在三维调度中移动人物或机位后再生成，"
+                "禁止带着穿墙、穿家具问题继续抽卡")
+        return {
+            "passed": True,
+            "issues": issues,
+            "asset_version": int(row["version"] or 0),
+            "panorama_version": int(model.get("panorama_version") or 0),
+        }
+
     def _scene_layout_clause(self, ctx, location, spatial):
         """本镜的【场景陈设定位】条款;没有三维场景表时返回空串。
 
@@ -11653,6 +11854,7 @@ class Director:
                    or production_profile(
                        self.config, ctx.get("production_standard")))
         spatial = shot_blocking(ctx.get("blocking"), shot["shot_no"])
+        scene_physics = self._shot_scene_physics(ctx, location, spatial)
         readable_text = shot.get("readable_text", {}) or {}
         text_required = readable_text_required(readable_text)
         quality = resolve_image_quality(
@@ -11782,6 +11984,7 @@ class Director:
             "sound_design": shot.get("sound_design", {}),
             "spatial_blocking": spatial or {},
             "spatial_constraint": (spatial or {}).get("constraint", ""),
+            "scene_physics": scene_physics,
             # 场景陈设的固定坐标:同一场每一镜都相同,并按本镜机位换算成
             # 「画面哪一侧、第几层」。缺它时【场景】只有一句地名,模型每张
             # 图重新想象家具在哪——「说在纱帐后面却画在镜前」就是这么来的。
@@ -16775,6 +16978,130 @@ class Director:
             f"导演台指令已写入镜头{shot_no}: " + "；".join(changed))
         return {"shot_no": int(shot_no), "changes": changed}
 
+    def ai_direct_shot(self, project_title, episode_number, shot_no,
+                       apply=False):
+        """AI 导演:用平台全部专业词汇对单镜给出导演处理建议。
+
+        输入=本镜事实+前后镜头(节奏与轴线)+题材基调+空间站位+QC问题;
+        输出=镜头五维(必须在词典内)+光影风格+可核验意见+人话理由——
+        校验器硬约束词条越界与景别容量(特写不许装多人)。apply=True 时
+        经 direct_shot 同通道写入分镜(与人工导演台完全同权,可审计),
+        默认只返回建议由人审。
+        """
+        project, episode = self._episode_ctx(project_title, episode_number)
+        project, episode = dict(project), dict(episode)
+        storyboard, _v = self.projects.latest_document(
+            episode["id"], "storyboard")
+        if not storyboard or not storyboard.get("shots"):
+            raise AifosError("本集还没有分镜")
+        shots = [s for s in storyboard["shots"] if isinstance(s, dict)]
+        index = next((i for i, s in enumerate(shots)
+                      if int(s.get("shot_no", -1)) == int(shot_no)), None)
+        if index is None:
+            raise AifosError(f"镜头{shot_no}不存在")
+        shot = shots[index]
+        script, _sv = self.projects.latest_document(episode["id"], "script")
+        style = str(project.get("style") or "")
+        premise = str((script or {}).get("logline")
+                      or episode.get("premise") or "")
+        from .lighting_language import GENRE_LOOKS, match_genre
+        genre_key = match_genre(style, premise, project.get("title", ""))
+        genre_look = GENRE_LOOKS.get(genre_key) or {}
+        blocking, _bv = self.projects.latest_document(
+            episode["id"], "blocking")
+        block = ((blocking or {}).get("shot_index") or {}).get(
+            str(int(shot_no))) or {}
+        from .spatial_language import spatial_lines
+        spatial_text = "；".join(
+            f"{label}:{text}" for label, text in spatial_lines(block)
+            if text)
+
+        def _shot_brief(s):
+            camera = s.get("camera")
+            return {
+                "shot_no": s.get("shot_no"),
+                "camera": ("·".join(str(v) for v in camera.values() if v)
+                           if isinstance(camera, dict) else str(camera or "")),
+                "duration": s.get("duration"),
+                "characters": s.get("characters"),
+                "description": str(s.get("description") or "")[:120],
+            }
+        context_shots = [
+            {"位置": "上一镜", **_shot_brief(shots[index - 1])}
+            if index > 0 else {"位置": "上一镜", "说明": "本场首镜"},
+            {"位置": "下一镜", **_shot_brief(shots[index + 1])}
+            if index + 1 < len(shots)
+            else {"位置": "下一镜", "说明": "本场末镜"},
+        ]
+        visible_count = len(shot.get("characters") or [])
+        for figure in (shot.get("functional_figures") or []):
+            if isinstance(figure, dict):
+                try:
+                    visible_count += max(0, int(figure.get("count") or 0))
+                except (TypeError, ValueError):
+                    continue
+        # QC 问题取自生产清单(若该镜有失败记录)
+        ctx = {"project": dict(project), "episode": dict(episode),
+               "out_root": self._episode_dir(project, episode)}
+        qc_issues = []
+        for item in self._plan_read(ctx).get("items", []):
+            if item.get("id") == f"shot:{int(shot_no)}":
+                qc_issues = list(
+                    ((item.get("qc") or {}).get("issues")) or [])[:6]
+                break
+        from .camera_language import (ANGLE_GEOMETRY, COMPOSITION_GEOMETRY,
+                                      MOVEMENT_GEOMETRY, POSITION_GEOMETRY,
+                                      SCALE_GEOMETRY)
+        from .lighting_language import LIGHTING_STYLES
+        # 同步 App 方法在生产任务外调用 _call,须自备成本记账槽
+        # (refine_character_prompt 同款前置)
+        self._task_cost = 0.0
+        self._task_providers = set()
+        result = self._call(ctx, "script", {
+            "ai_director": True,
+            "genre": " ".join(v for v in (
+                style, genre_look.get("label", "")) if v),
+            "genre_grammar": genre_look.get("grammar", ""),
+            "shot_facts": {**_shot_brief(shot),
+                           "action": str(shot.get("action") or "")[:200],
+                           "必须可见人数": visible_count,
+                           "现有导演意见": str(
+                               shot.get("director_note") or "")},
+            "context_shots": context_shots,
+            "spatial": spatial_text,
+            "qc_issues": qc_issues,
+            "visible_count": visible_count,
+            "vocabulary": {
+                "景别": list(SCALE_GEOMETRY), "角度": list(ANGLE_GEOMETRY),
+                "机位": list(POSITION_GEOMETRY),
+                "运镜": list(MOVEMENT_GEOMETRY),
+                "构图": list(COMPOSITION_GEOMETRY),
+                "光影": {key: value["label"]
+                         for key, value in LIGHTING_STYLES.items()},
+            },
+        }, "storyboard")
+        # 只保留导演字段,滤掉 provider 管线混入的审核残留键
+        raw = result.data or {}
+        suggestion = {key: raw.get(key) for key in
+                      ("schema", "camera", "lighting_style", "note",
+                       "rationale") if key in raw}
+        suggestion["shot_no"] = int(shot_no)
+        suggestion["genre"] = genre_look.get("label", "")
+        if apply and (suggestion.get("camera")
+                      or suggestion.get("lighting_style")
+                      or suggestion.get("note")):
+            applied = self.direct_shot(
+                project_title, episode_number, shot_no,
+                camera=suggestion.get("camera"),
+                lighting_style=suggestion.get("lighting_style"),
+                note=suggestion.get("note"))
+            suggestion["applied"] = applied["changes"]
+        self.log.info(
+            "director",
+            f"AI导演已审镜头{shot_no}: "
+            + str(suggestion.get("rationale") or "")[:120])
+        return suggestion
+
     def regenerate_character_candidates(self, project_title, episode_number,
                                         run_id=None, character_name="",
                                         prop_name=""):
@@ -18890,6 +19217,20 @@ class Director:
             f"场景「{location}」视角扩展完成:新生成 {len(created)} 张"
             f"(复用 {len(reused)} 张);产线:{'、'.join(sorted(providers)) or '无'}"
             + ("(占位产线,不是真实 AI 出图)" if placeholder else ""))
+        scene_model_summary = None
+        if (include_panorama and panorama_uri
+                and self.config.get(
+                    "defaults", "space_first", default=False)):
+            model = self.build_scene_model(
+                project["title"], location,
+                force=bool(regenerate and self.SCENE_PANORAMA_KEY in {
+                    item.get("view") for item in created}))
+            scene_model_summary = {
+                "asset_version": model.get("asset_version"),
+                "panorama_version": model.get("panorama_version"),
+                "objects": len(model.get("objects") or []),
+                "issues": len(model.get("issues") or []),
+            }
         return {
             "project": project["title"],
             "location": location,
@@ -18898,6 +19239,7 @@ class Director:
             "cost": round(total_cost, 4),
             "providers": sorted(providers),
             "mock": placeholder,
+            "scene_model": scene_model_summary,
             "state": self.scene_expansion_state(project["title"], location),
         }
 

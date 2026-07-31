@@ -496,6 +496,9 @@ class ClaudeApiProvider(Provider):
             elif capability == "script" and payload.get("prop_design"):
                 from ..adapters.claude_script import validate_prop_design
                 error = validate_prop_design(data, payload)
+            elif capability == "script" and payload.get("ai_director"):
+                from ..adapters.claude_script import validate_ai_director
+                error = validate_ai_director(data, payload)
             elif capability == "script" and payload.get("rule_appeal"):
                 from ..adapters.claude_script import validate_rule_appeal
                 error = validate_rule_appeal(data, payload)
@@ -603,6 +606,9 @@ class OpenAIChatProvider(Provider):
         if capability == "script" and payload.get("prop_design"):
             from ..adapters.claude_script import validate_prop_design
             return validate_prop_design(data, payload)
+        if capability == "script" and payload.get("ai_director"):
+            from ..adapters.claude_script import validate_ai_director
+            return validate_ai_director(data, payload)
         if capability == "script" and payload.get("rule_appeal"):
             from ..adapters.claude_script import validate_rule_appeal
             return validate_rule_appeal(data, payload)
@@ -793,6 +799,10 @@ class OpenAIImageProvider(Provider):
             return "1536x1024"
         if aspect == "9:16":
             return "1024x1536"
+        if aspect == "2:1":
+            raise ProviderError(
+                f"{self.name} 不支持 2:1 等距圆柱全景尺寸，"
+                "必须回退到原生支持 2:1 的图片产线")
         return "1024x1024"
 
     def _quality(self, payload):
@@ -1109,7 +1119,9 @@ class SeedreamImageProvider(OpenAIImageProvider):
             "1:1": "2048x2048",
             # 场景全景母版:等距圆柱投影必须是 2:1,退化成方图会把
             # 360° 环视压成普通广角,四向视角就对不上同一个空间。
-            "2:1": "2560x1280",
+            # Seedream 5 Lite 同时要求至少 3,686,400 像素；
+            # 2880x1440 保持严格 2:1 且满足该真实 API 下限。
+            "2:1": "2880x1440",
         }.get(payload.get("aspect", "9:16"), "2048x2048")
 
     def _audit_data(self, data, payload, unit_cost):
