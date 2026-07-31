@@ -381,3 +381,27 @@ def test_expressive_movement_flows_into_video_contract_clause():
     from aifos.camera_language import camera_geometry_clause
     clause = camera_geometry_clause({"景别": "近景", "运镜": "俯冲"})
     assert "俯冲" in clause and "视平线急速下移" in clause
+
+
+def test_movement_frame_deltas_cover_all_movements():
+    """AI 导演咨询产出的首尾帧差异规则:全词覆盖、无位移类正确。"""
+    from aifos.camera_language import (MOVEMENT_FRAME_DELTAS,
+                                       MOVEMENT_GEOMETRY)
+    assert set(MOVEMENT_FRAME_DELTAS) == set(MOVEMENT_GEOMETRY)
+    no_delta = {m for m, r in MOVEMENT_FRAME_DELTAS.items()
+                if r.get("no_delta")}
+    assert no_delta == {"固定", "手持", "升格"}
+    for movement, rule in MOVEMENT_FRAME_DELTAS.items():
+        assert rule.get("framing_delta"), movement
+        if not rule.get("no_delta"):
+            assert rule.get("first_frame") and rule.get("last_frame"), movement
+
+
+def test_movement_frame_delta_accessor_longest_match():
+    from aifos.camera_language import movement_frame_delta
+    assert movement_frame_delta("中景·推·三分法")[
+        "framing_delta"].startswith("尾帧比首帧紧")
+    assert "宽" in movement_frame_delta("拉")["framing_delta"]
+    assert movement_frame_delta("螺旋环绕") is not movement_frame_delta("环绕")
+    assert movement_frame_delta("固定")["no_delta"] is True
+    assert movement_frame_delta("按分镜") is None
