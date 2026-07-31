@@ -158,6 +158,12 @@ class CliProvider(Provider):
         ok, reason = super().available(capability)
         if not ok:
             return ok, reason
+        if (capability == "scene_annotate"
+                and not self.conf.get("scene_image_transport", False)):
+            # 通用 stdin/stdout CLI 桥只传 JSON 文本；配置里写
+            # reference_images=True 并不会把全景图片真正送进子进程。
+            # 禁止让它根据文件路径和提示词臆造家具坐标。
+            return False, "CLI 未实现全景图片附件传输"
         command = self.conf.get("command") or []
         if not command:
             return False, "未配置 command"

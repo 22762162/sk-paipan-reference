@@ -97,6 +97,7 @@ from .story_logic import (
     PROP_CONTRACT_SCHEMA,
     audit_prop_contract,
     audit_storyboard_prop_contract,
+    normalize_prop_contract,
     normalize_storyboard_frame_phase_pairs,
 )
 from .style_director import compile_director_style
@@ -11388,6 +11389,10 @@ class Director:
         if not isinstance(storyboard, dict) or not storyboard.get("shots"):
             return
         script = copy.deepcopy(ctx.get("script") or {})
+        # 旧项目/导入剧本可能没有数组形态的 prop_registry。先在副本上
+        # 做确定性迁移，再执行严格条目审计；不修改已保存剧本，也不放松
+        # 任何真实道具的事件、数量与阶段门禁。
+        normalize_prop_contract(script)
         registry_report = audit_prop_contract(script)
         issues = list(registry_report.get("issues") or [])
 

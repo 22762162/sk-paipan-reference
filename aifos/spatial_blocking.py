@@ -29,6 +29,9 @@ DEFAULT_CAMERA_HEIGHT_M = 1.55
 MAX_SOLVED_CAMERA_HEIGHT_M = 4.6
 MIN_ACTOR_SEPARATION = 72
 MIN_CAMERA_SEPARATION = 90
+# 成片门禁只检查真实三维机位与演员的物理净距；二维图标为了可读性
+# 使用的 90px 间距不能反过来推翻导演求出的合法特写/过肩机位。
+MIN_CAMERA_ACTOR_CLEARANCE_M = .3
 ACTOR_COLORS = (
     "#ff5d8f", "#52b8ff", "#ffc857", "#69db9d", "#ad8cff", "#ff8c5a",
 )
@@ -747,6 +750,18 @@ def _apply_director_camera(camera, shot, positions, world=None):
     camera["end"] = _canvas_from_world(solved["end_position_3d"])
     camera["moving"] = bool(solved.get("moving"))
     camera["movement"] = solved.get("movement") or camera.get("movement")
+    direction = _direction(camera["start"], camera["end"])
+    camera["route"] = (
+        [dict(camera["start"], phase="start"),
+         dict(camera["end"], phase="end")]
+        if camera["moving"]
+        else [dict(camera["start"], phase="fixed")]
+    )
+    camera["direction"] = direction
+    camera["direction_label"] = (
+        f"镜头{camera['movement'] or '移动'}：起点→终点，{direction}"
+        if camera["moving"] else "静止机位：起点=终点"
+    )
     camera["director_camera"] = {
         "distance_m": solved["distance_m"],
         "desired_distance_m": solved["desired_distance_m"],
@@ -1340,15 +1355,20 @@ def validate_spatial_plan(plan, storyboard):
                 issues.append(
                     f"镜头 {shot_no} 双人左右锚点/轴线侧未继承上一镜")
             previous_dialogue[dialogue_key] = current
-        for point in {
-                ((camera.get(phase) or {}).get("x"),
-                 (camera.get(phase) or {}).get("y"))
-                for phase in ("start", "end") if camera.get(phase)}:
-            camera_point = {"x": point[0], "y": point[1]}
-            if any(_distance(camera_point, actor_point) < MIN_CAMERA_SEPARATION
-                   for actor in actor_points
-                   for actor_point in (actor.get("start"), actor.get("end"))):
-                issues.append(f"镜头 {shot_no} 摄像机图标与人物标记重叠")
+        camera_phases = (
+            ("start_3d", "start_3d"), ("end_3d", "end_3d"))
+        if any(
+                math.hypot(
+                    float((camera.get(camera_key) or {}).get("x", math.inf))
+                    - float((actor.get(actor_key) or {}).get("x", 0.0)),
+                    float((camera.get(camera_key) or {}).get("z", math.inf))
+                    - float((actor.get(actor_key) or {}).get("z", 0.0)),
+                ) < MIN_CAMERA_ACTOR_CLEARANCE_M
+                for camera_key, actor_key in camera_phases
+                for actor in actor_points):
+            issues.append(
+                f"镜头 {shot_no} 摄影机与演员物理净距不足 "
+                f"{MIN_CAMERA_ACTOR_CLEARANCE_M}m")
     return {"passed": not issues, "issues": issues,
             "checked_shots": len(storyboard.get("shots", []))}
 

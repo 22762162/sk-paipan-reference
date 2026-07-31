@@ -94,6 +94,31 @@ def test_character_sheet_contract_is_single_subject(app):
     assert contract["actors"][0]["character"] == "林川"
 
 
+def test_character_sheet_reuse_is_bound_to_locked_candidate(app):
+    sheet = {
+        "meta": json.dumps({"source_candidate_asset_id": 11}),
+    }
+    same_candidate = {
+        "id": 101,
+        "meta": json.dumps({"candidate_asset_id": 11}),
+    }
+    changed_candidate = {
+        "id": 102,
+        "meta": json.dumps({"candidate_asset_id": 12}),
+    }
+    legacy_sheet = {"meta": "{}"}
+    manual_sheet = {
+        "meta": json.dumps({"source_identity_asset_id": 201}),
+    }
+    manual_identity = {"id": 201, "meta": "{}"}
+
+    matches = app.director._character_sheet_matches_locked_identity
+    assert matches(sheet, same_candidate)
+    assert not matches(sheet, changed_candidate)
+    assert not matches(legacy_sheet, same_candidate)
+    assert matches(manual_sheet, manual_identity)
+
+
 def test_character_sheet_prompt_and_qc_share_minimal_contract(app):
     design = {
         "species": "人类", "gender": "男", "age_range": "24岁",
@@ -651,6 +676,37 @@ def test_codex_bridge_declares_managed_model(monkeypatch, tmp_path):
     }, "codex", 30, [])
     assert reply["ok"] is True
     assert reply["model"] == "gpt-image-2 (Codex 内置 image_gen)"
+
+
+def test_codex_bridge_surfaces_missing_imagegen_capability(
+        monkeypatch, tmp_path):
+    from aifos.adapters import codex_image
+
+    class FakePopen:
+        def __init__(self, args, **_kwargs):
+            self.args = args
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return (
+                "错误：当前会话未提供可调用的内置 `image_gen` "
+                "图像生成能力，未生成图片。",
+                "",
+            )
+
+    monkeypatch.setattr(codex_image.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(codex_image.shutil, "which",
+                        lambda _cmd: "/usr/bin/codex")
+    reply = codex_image.run({
+        "capability": "image",
+        "payload": {"portrait": True, "art_name": "周鹿"},
+        "out_dir": str(tmp_path),
+    }, "codex", 30, [])
+
+    assert reply == {
+        "ok": False,
+        "error": "codex 子会话缺少内置 image_gen 图像生成能力",
+    }
 
 
 def test_codex_frames_reuse_keyframe_and_lock_space(tmp_path):

@@ -7,9 +7,11 @@
 """
 
 import pytest
+from types import SimpleNamespace
 
 from aifos.app import App
 from aifos.director import Director
+from aifos.errors import ProviderError
 
 
 @pytest.fixture()
@@ -128,7 +130,7 @@ def test_escalation_without_a_concrete_instruction_still_goes_to_human(
         ctx, task, _Result(_escalation_qc(instruction=""))) == ""
 
 
-def test_repair_is_capped_after_third_round_so_bad_shot_cannot_burn_forever(
+def test_repair_is_bounded_but_can_continue_after_third_round(
         app, monkeypatch):
     ctx, task = _ctx_and_task(app, monkeypatch)
     # Codex 每轮给的是不同诊断,合同每次都真的变;这样才走得到上限,
@@ -149,9 +151,66 @@ def test_repair_is_capped_after_third_round_so_bad_shot_cannot_burn_forever(
     for _ in range(Director.CODEX_CONTRACT_REPAIR_LIMIT):
         assert app.director._auto_apply_codex_escalation(
             ctx, task, _Result(_escalation_qc()))
-    # 第三轮会走深度合同瘦身；超过上限后停手，不再无限改。
+    # 第三轮起走深度合同瘦身；明确的第4轮指令仍会自动执行，但最终
+    # 仍受有界上限保护，不会无限烧额度。
+    assert task["payload"]["_codex_contract_repair_count"] == (
+        Director.CODEX_CONTRACT_REPAIR_LIMIT)
     assert app.director._auto_apply_codex_escalation(
         ctx, task, _Result(_escalation_qc())) == ""
+
+
+def test_fourth_repair_instruction_is_applied_without_human_confirmation(
+        app, monkeypatch):
+    ctx, task = _ctx_and_task(app, monkeypatch)
+    ctx["_codex_contract_repairs"] = {"shot:2": 3}
+    task["payload"]["_codex_contract_repair_count"] = 3
+
+    def fourth_repair(_ctx, _task, reason):
+        assert "深度合同瘦身" in reason
+        _task["payload"]["prompt"] = "第4轮：赵典吏移到右后层并补背面锚"
+        _task["payload"]["prompt_compact"] = _task["payload"]["prompt"]
+        return "已执行第4轮空间与参考图修复"
+
+    monkeypatch.setattr(
+        app.director, "_repair_blocked_prompt_shot", fourth_repair)
+    summary = app.director._auto_apply_codex_escalation(
+        ctx, task, _Result(_escalation_qc(action="repair_contract")))
+    assert summary
+    assert task["payload"]["_codex_contract_repair_count"] == 4
+    assert "赵典吏移到右后层" in task["payload"]["prompt"]
+
+
+def test_shot_plan_content_change_preserves_repair_round_and_instruction(app):
+    ctx = {
+        "out_root": app.workspace.artifacts_dir / "p001" / "e001",
+    }
+    old_qc = _escalation_qc(
+        instruction="第4轮：赵典吏移到右后层并补背面锚")
+    app.director._plan_write(ctx, {"items": [{
+        "id": "shot:20",
+        "category": "shot_image",
+        "content_hash": "old-contract",
+        "status": "failed",
+        "autonomous_repair_seeded": True,
+        "codex_contract_repair_count": 3,
+        "codex_contract_repair": "前三轮已执行",
+        "qc": old_qc,
+    }]})
+
+    app.director._plan_seed(ctx, "shot_image", [{
+        "id": "shot:20",
+        "category": "shot_image",
+        "content_hash": "new-contract",
+        "prompt": "新合同",
+    }])
+
+    stored = app.director._plan_read(ctx)["items"][0]
+    assert stored["status"] == "pending"
+    assert stored["autonomous_repair_seeded"] is True
+    assert stored["codex_contract_repair_count"] == 3
+    assert stored["codex_contract_repair"] == "前三轮已执行"
+    assert stored["qc"]["codex_escalation"]["instruction_to_aifos"].startswith(
+        "第4轮")
 
 
 def test_third_targeted_redraw_becomes_deep_contract_slimming(
@@ -176,20 +235,192 @@ def test_third_targeted_redraw_becomes_deep_contract_slimming(
     assert task["payload"]["_codex_contract_repair_count"] == 3
 
 
-def test_repair_that_does_not_change_the_input_falls_back_to_human(
+def test_repair_that_does_not_change_the_input_uses_codex_override(
         app, monkeypatch):
-    """合同没真的变时再画一次撞的是同一份坏数据,必须转人工。"""
+    """编剧漏改时也要执行 Codex 指令，不得重新推回人工确认。"""
     ctx, task = _ctx_and_task(app, monkeypatch)
     monkeypatch.setattr(Director, "_shot_payload",
                         lambda _s, _c, _shot: dict(task["payload"]))  # 合同没变
-    assert app.director._auto_apply_codex_escalation(
-        ctx, task, _Result(_escalation_qc())) == ""
+    monkeypatch.setattr(
+        Director, "_image_generation_input",
+        lambda _s, payload, qc_spec=None: {
+            "prompt": (
+                str((payload or {}).get("prompt") or "")
+                + str((payload or {}).get("feedback") or "")),
+            "input_hash": Director._stable_hash(
+                str((payload or {}).get("prompt") or "")
+                + str((payload or {}).get("feedback") or "")),
+            "reference_manifest": []})
+    summary = app.director._auto_apply_codex_escalation(
+        ctx, task, _Result(_escalation_qc()))
+    assert summary and "最终修复覆盖层" in summary
+    assert task["payload"]["_codex_contract_repair_count"] == 1
+    assert "取代并作废" in task["payload"]["feedback"]
+    assert "50mm" in task["payload"]["feedback"]
+
+
+def test_nested_prompt_review_block_is_repaired_and_keeps_three_draw_mode(
+        app, monkeypatch):
+    """合同改完后的内层预审冲突也必须自动修，不能把镜头直接标失败。"""
+    ctx, task = _ctx_and_task(app, monkeypatch, item_id="shot:12", shot_no=12)
+    ctx["_codex_contract_repairs"] = {"shot:12": 3}
+    task["payload"].update({
+        "_codex_contract_repair_count": 3,
+        "_autonomous_repair_seeded": True,
+        "camera": "135mm微俯压缩近景",
+        "shot_contract": {"景别": "近景", "焦段": "135mm"},
+        "action": "铜符落案后的唯一静态终点",
+    })
+
+    def repair(_ctx, current, reason):
+        assert "中景" in reason and "近景" in reason
+        current["payload"].update({
+            "prompt": "最新135mm近景合同",
+            "prompt_compact": "最新135mm近景合同",
+            "camera": "135mm微俯压缩近景",
+            "shot_contract": {"景别": "近景", "焦段": "135mm"},
+            "action": "铜符落案后的唯一静态终点",
+        })
+        return "删除旧中景模型约束，只执行最新近景合同"
+
+    monkeypatch.setattr(
+        app.director, "_repair_blocked_prompt_shot", repair)
+    monkeypatch.setattr(
+        app.director, "_shot_qc_spec",
+        lambda _ctx, _payload: {"item_id": "shot:12"})
+    monkeypatch.setattr(
+        app.director, "_attach_reference_manifest", lambda _payload: None)
+
+    summary = app.director._auto_repair_prompt_review_block(
+        ctx, task, ProviderError(
+            "真实图片已被阻止：最新135mm近景与旧景别锁定为中景互斥"))
+
+    assert summary
+    payload = task["payload"]
+    assert payload["_codex_contract_repair_count"] == 4
+    assert payload["_autonomous_repair_seeded"] is True
+    assert payload["prompt_conflict_resolution"]["shot_contract"]["景别"] \
+        == "近景"
+    assert "替代并作废旧提示词" in payload["feedback"]
+
+
+def test_repaired_prompt_review_context_explicitly_voids_stale_contract(app):
+    payload = {
+        "prompt": "旧模型约束写中景",
+        "shot_no": 12,
+        "camera": "135mm微俯压缩近景",
+        "shot_contract": {"景别": "近景", "焦段": "135mm"},
+        "action": "铜符落案后的唯一静态终点",
+        "_codex_contract_repair_count": 4,
+        "prompt_conflict_resolution": {
+            "revision_round": 4,
+            "policy": "最新近景合同替代旧中景约束",
+        },
+    }
+
+    context = app.router._prompt_review_context("image", payload)
+
+    assert context["shot_contract"]["景别"] == "近景"
+    master = context["master_state_precedence"]
+    assert master["revision_round"] == 4
+    assert master["latest_shot_contract"]["焦段"] == "135mm"
+    assert "作废" in master["policy"]
 
 
 def test_non_shot_tasks_have_no_contract_to_repair(app, monkeypatch):
     ctx, task = _ctx_and_task(app, monkeypatch, item_id="scene:废茶棚")
     assert app.director._auto_apply_codex_escalation(
         ctx, task, _Result(_escalation_qc())) == ""
+
+
+def test_completed_shot_is_registered_immediately_and_idempotently(
+        app, tmp_path):
+    project, _ = app.projects.get_or_create_project("逐张登记")
+    episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+    uri = tmp_path / "shot_001.keyframe.png"
+    uri.write_bytes(b"new-image")
+    ctx = {
+        "project": dict(project),
+        "episode": dict(episode),
+        "script": {"scenes": [{"scene_no": 1, "location": "验牒书房"}]},
+    }
+    shot = {
+        "shot_no": 1,
+        "scene_no": 1,
+        "characters": ["沈砚舟"],
+        "end_state": {"沈砚舟": {
+            "wardrobe": "深靛圆领袍",
+            "headwear": "素黑网巾",
+            "hair_makeup": "黑发低髻",
+        }},
+    }
+    result = SimpleNamespace(
+        uri=str(uri), provider="image_api", model="gpt-image-2",
+        fallbacks=[], data={"image_quality": "high"},
+        qc={"passed": True, "score": 1900})
+    quality = {
+        "level": "high", "recommended": "high",
+        "source": "auto", "rule": "critical",
+        "reasons": ["主角关键帧"],
+    }
+
+    app.director._register_completed_shot_result(
+        ctx, shot, quality, result)
+    app.director._register_completed_shot_result(
+        ctx, shot, quality, result)
+
+    rows = app.assets.history(
+        project["id"], "image", "e001_shot001")
+    assert len(rows) == 1
+    assert rows[0]["uri"] == str(uri)
+    meta = app.director._asset_meta(rows[0])
+    assert meta["shot_no"] == 1
+    assert meta["qc"]["passed"] is True
+    assert result.data["_shot_asset_registered"] is True
+
+
+def test_reconcile_replaces_stale_same_name_asset_metadata(app, tmp_path):
+    project, _ = app.projects.get_or_create_project("断点补登当前镜头")
+    episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+    out_root = tmp_path / "p001" / "e001"
+    image_uri = out_root / "images" / "shot_001.keyframe.png"
+    image_uri.parent.mkdir(parents=True)
+    image_uri.write_bytes(b"current-shot")
+    shot = {
+        "shot_no": 1, "scene_no": 1, "characters": ["沈砚舟"],
+        "description": "当前剧本的验牒镜头",
+    }
+    ctx = {
+        "project": dict(project),
+        "episode": dict(episode),
+        "out_root": out_root,
+        "script": {"scenes": [{
+            "scene_no": 1, "location": "临江县衙验牒书房",
+        }]},
+        "storyboard": {"shots": [shot]},
+    }
+    # 同一 project_id/name 下仍有上一个剧本留下的登记记录；文件路径
+    # 已被当前通过图覆盖，但元数据哈希还是旧合同。
+    app.assets.register(
+        project["id"], "image", "e001_shot001",
+        uri=str(image_uri),
+        meta={"shot_content_hash": "old-script", "qc": {"passed": True}})
+    app.director._plan_write(ctx, {"items": [{
+        "id": "shot:1", "category": "shot_image",
+        "status": "done", "output_uri": str(image_uri),
+        "image_quality": "high",
+        "qc": {"passed": True, "score": 1880},
+    }]})
+
+    report = app.director.reconcile_completed_shot_images(ctx)
+
+    assert report["recovered"] == 1
+    row = app.assets.latest(
+        project["id"], "image", "e001_shot001")
+    meta = app.director._asset_meta(row)
+    assert meta["shot_content_hash"] == app.director._shot_content_hash(shot)
+    assert meta["location"] == "临江县衙验牒书房"
+    assert meta["qc"]["passed"] is True
 
 
 def test_stage_images_seeds_stored_codex_repair_directly_into_three_draws(
@@ -200,6 +431,8 @@ def test_stage_images_seeds_stored_codex_repair_directly_into_three_draws(
     out_root.mkdir(parents=True, exist_ok=True)
     stored_qc = _escalation_qc(
         instruction="统一为135mm平视双人胸像")
+    # 兼容旧版断点：有 triggered 与完整指令，但没有 status 字段。
+    stored_qc["codex_escalation"].pop("status")
     stored_qc.update({"attempts": 2, "consecutive_failures": 2})
     ctx = {
         "project": dict(project),
@@ -350,6 +583,58 @@ def test_scene_replacement_without_asset_id_resolves_same_project_panorama(
         item["project_id"] == project["id"]
         for item in [app.assets.get(
             changes["applied"][0]["replacement_asset_id"])])
+
+
+def test_add_back_identity_detail_resolves_current_same_project_sheet(
+        app, tmp_path):
+    project, _ = app.projects.get_or_create_project("背面身份补充")
+    identity = tmp_path / "identity.png"
+    back = tmp_path / "back.png"
+    identity.write_bytes(b"identity")
+    back.write_bytes(b"back")
+    identity_row = app.assets.register(
+        project["id"], "character_art", "沈砚舟",
+        uri=str(identity), meta={"candidate_asset_id": 700})
+    back_row = app.assets.register(
+        project["id"], "character_sheet", "沈砚舟:back",
+        uri=str(back), meta={"source_candidate_asset_id": 700})
+    payload = {
+        "prompt": "过肩镜头",
+        "identity_references": [{
+            "character": "沈砚舟", "uri": str(identity),
+            "asset_id": identity_row["id"],
+        }],
+        "asset_matches": [],
+    }
+    app.director._attach_reference_manifest(payload)
+    changes = app.director._apply_image_reference_adjustments(
+        payload, {"_project_id": project["id"]}, {
+            "reference_diagnosis": {
+                "status": "needs_adjustment", "issues": ["缺少背面轮廓"]},
+            "reference_adjustments": [{
+                "action": "add",
+                # Codex links the supplement to the existing identity anchor.
+                # This index must not be mistaken for a protected replacement.
+                "target_index": 1,
+                "role": "identity_back_silhouette",
+                "character": "沈砚舟",
+                "reason": "加入已登记背面图，锁定后脑与肩背轮廓",
+                "replacement_selector": {
+                    "asset_id": None,
+                    "role": "identity_back_silhouette",
+                    "character": "沈砚舟",
+                },
+            }],
+        })
+
+    assert changes["skipped"] == []
+    assert changes["applied"][0]["replacement_asset_id"] == back_row["id"]
+    assert str(back) in payload["reference_images"]
+    supplement = next(
+        item for item in payload["asset_matches"]
+        if item["asset_id"] == back_row["id"])
+    assert supplement["reference_role"] == "identity_detail"
+    assert supplement["attach_to"] == "沈砚舟"
 
 
 def test_persisted_reference_remove_survives_payload_rebuild(

@@ -9,6 +9,7 @@ from aifos.app import App
 from aifos.cli import main
 from aifos.config import Config
 from aifos.doctor import apply_detected, detect_clis, run_doctor
+from aifos.settings import CAPABILITY_CN
 from aifos.web.server import serve
 
 
@@ -60,7 +61,7 @@ def test_doctor_all_mock(tmp_path):
     try:
         report = run_doctor(app)
         assert report["real_count"] == 0
-        assert report["total"] == 9
+        assert report["total"] == len(CAPABILITY_CN)
         video = next(c for c in report["capabilities"]
                      if c["capability"] == "video")
         assert video["provider"] == "mock" and not video["real"]
@@ -121,14 +122,15 @@ def test_cli_doctor_and_detect(tmp_path, monkeypatch, capsys):
     assert "视频" in out and "即梦" in out
     # 配音随视频自动完成 → 与视频一起算作已接真实产线
     assert "随视频自动配音" in out
-    assert "内置模拟" in out and "真实产线 2/9" in out
+    assert "内置模拟" in out
+    assert f"真实产线 2/{len(CAPABILITY_CN)}" in out
 
 
 def test_cli_doctor_all_mock_exit(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("PATH", "/nonexistent")
     ws = str(tmp_path / "ws")
     assert main(["--workspace", ws, "doctor"]) == 1
-    assert "0/9" in capsys.readouterr().out
+    assert f"0/{len(CAPABILITY_CN)}" in capsys.readouterr().out
 
 
 def test_web_doctor_and_detect(tmp_path, monkeypatch):
@@ -146,7 +148,8 @@ def test_web_doctor_and_detect(tmp_path, monkeypatch):
         resp = conn.getresponse()
         report = json.loads(resp.read().decode("utf-8"))
         assert resp.status == 200
-        assert report["total"] == 9 and report["real_count"] == 0
+        assert report["total"] == len(CAPABILITY_CN)
+        assert report["real_count"] == 0
 
         conn.request("POST", "/api/settings/detect")
         resp = conn.getresponse()

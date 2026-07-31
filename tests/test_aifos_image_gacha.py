@@ -124,6 +124,59 @@ def test_repair_round_draws_all_three_then_selects_best_pass(tmp_path):
     assert not list(tmp_path.glob("*.gacha*"))
 
 
+def test_repair_round_freezes_first_reviewed_prompt_for_all_three(tmp_path):
+    director = _director()
+    target = tmp_path / "shot_018.keyframe.png"
+    seen = []
+
+    def fake(cap, payload, out_dir, cancel, qc_spec):
+        seen.append({
+            "prompt": payload.get("prompt"),
+            "prompt_review": payload.get("prompt_review"),
+            "feedback": payload.get("feedback"),
+        })
+        target.write_bytes(b"PULL%d" % len(seen))
+        result = _Res(str(target), 1.0, True, 0)
+        optimized = (
+            "Codex冻结后的同一修订提示词"
+            if len(seen) == 1 else payload.get("prompt"))
+        result.data = {
+            "prompt_optimized": optimized,
+            "prompt_review": {
+                "approved": True,
+                "reviewed_input_hash": "frozen-review",
+            },
+        }
+        return result
+
+    director._generate_image_with_qc = fake
+    result = director._generate_image_gacha(
+        "image",
+        {
+            "prompt": "第一次失败后的原始定向修订",
+            "feedback": "首图失败后 Codex 给出的定向修改意见",
+            "_gacha_pulls_override": 3,
+            "_gacha_select_best_after_all": True,
+        },
+        tmp_path, None, {"s": 1})
+
+    assert len(seen) == 3
+    assert seen[0]["prompt"] == "第一次失败后的原始定向修订"
+    assert seen[1]["prompt"] == "Codex冻结后的同一修订提示词"
+    assert seen[2]["prompt"] == "Codex冻结后的同一修订提示词"
+    assert seen[0]["feedback"] == "首图失败后 Codex 给出的定向修改意见"
+    assert seen[1]["feedback"] == ""
+    assert seen[2]["feedback"] == ""
+    assert seen[1]["prompt_review"]["approved"] is True
+    assert seen[2]["prompt_review"]["approved"] is True
+    assert result.qc["gacha"]["same_prompt"] is True
+    hashes = {
+        row["prompt_hash"]
+        for row in result.qc["gacha"]["candidates"]
+    }
+    assert hashes == {result.qc["gacha"]["frozen_prompt_hash"]}
+
+
 def test_gacha_skips_batch_and_frames(tmp_path):
     director = _director()
     target = tmp_path / "x.png"
@@ -142,3 +195,38 @@ def test_gacha_skips_batch_and_frames(tmp_path):
     director._generate_image_gacha(
         "frames", {"image_task_class": "final"}, tmp_path, None, {"s": 1})
     assert calls["n"] == 1                 # frames 成对语义,不参与连抽
+
+
+def test_repair_gacha_reuse_requires_three_identical_prompt_hashes():
+    frozen = "frozen-hash"
+    valid = {
+        "qc": {
+            "gacha": {
+                "pulls": 3,
+                "select_after_all": True,
+                "same_prompt": True,
+                "frozen_prompt_hash": frozen,
+                "candidates": [
+                    {"pull": index, "prompt_hash": frozen}
+                    for index in range(1, 4)
+                ],
+            },
+        },
+    }
+    assert Director._repair_gacha_prompt_invariant_valid(valid) is True
+    drifted = {
+        "qc": {
+            "gacha": {
+                **valid["qc"]["gacha"],
+                "same_prompt": False,
+                "candidates": [
+                    {"pull": 1, "prompt_hash": frozen},
+                    {"pull": 2, "prompt_hash": "drifted-hash"},
+                    {"pull": 3, "prompt_hash": frozen},
+                ],
+            },
+        },
+    }
+    assert Director._repair_gacha_prompt_invariant_valid(drifted) is False
+    assert Director._repair_gacha_prompt_invariant_valid(
+        {"qc": {"passed": True}}) is True

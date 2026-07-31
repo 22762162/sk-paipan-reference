@@ -158,3 +158,91 @@ class ActorPlacementTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LayoutClauseTest(unittest.TestCase):
+    """把三维场景写成提示词条款——用户实测的穿帮就出在这里缺位:
+    【场景】只有一句地名,物体一个坐标都没有,模型每张图重新想象家具
+    在哪,「后面纱帐经常变」是必然结果。"""
+
+    def _model(self):
+        def annot(name, x, z, cat="furniture", **kw):
+            u, v = equirect_from_direction(x, -DEFAULT_CAPTURE_HEIGHT_M, z)
+            return {"name": name, "category": cat,
+                    "base_u": u, "base_v": v, **kw}
+        return build_scene_model(
+            [annot("书案", 0.0, 0.9, width_u=0.1),
+             annot("纱帐", 0.0, 3.4, "decor"),
+             annot("书架", -4.8, 0.0)], room=ROOM)
+
+    def _camera(self, x=0.0, z=-2.8):
+        return {"position_3d": {"x": x, "y": 1.43, "z": z},
+                "target_3d": {"x": 0.0, "y": 1.43, "z": 0.0}}
+
+    def test_every_object_gets_a_fixed_coordinate(self):
+        from aifos.scene_model import scene_layout_clause
+        text = scene_layout_clause(self._model(), self._camera())
+        for name in ("书案", "纱帐", "书架"):
+            self.assertIn(name, text)
+        self.assertIn("固定在", text)
+        self.assertIn("不得挪动", text)
+
+    def test_positions_are_translated_to_screen_side_and_depth(self):
+        """模型执行不了世界坐标,要的是「画面哪一侧、第几层」。"""
+        from aifos.scene_model import scene_layout_clause
+        text = scene_layout_clause(self._model(), self._camera())
+        self.assertIn("距本镜机位", text)
+        self.assertTrue(any(w in text for w in ("画面正中", "画面左", "画面右")))
+        self.assertTrue(any(w in text for w in ("前景", "近景层", "中景层",
+                                                "背景层")))
+
+    def test_no_camera_still_gives_world_coordinates(self):
+        from aifos.scene_model import scene_layout_clause
+        text = scene_layout_clause(self._model())
+        self.assertIn("固定在", text)
+        self.assertNotIn("距本镜机位", text)
+
+    def test_empty_model_emits_nothing(self):
+        from aifos.scene_model import scene_layout_clause
+        self.assertEqual(scene_layout_clause({"objects": []}), "")
+        self.assertEqual(scene_layout_clause(None), "")
+
+    def test_far_side_objects_are_marked_possibly_out_of_frame(self):
+        """取景裁掉的可以不画,但必须说清是「可能出画」而不是「改到别处」。"""
+        from aifos.scene_model import scene_layout_clause
+        text = scene_layout_clause(self._model(), self._camera(z=-2.8))
+        self.assertIn("被本镜取景裁掉的可以不画", text)
+
+
+class OcclusionTest(unittest.TestCase):
+    """遮挡穿帮:声明「在 X 后面」,几何上却在 X 前面。"""
+
+    def _model(self):
+        u, v = equirect_from_direction(0.0, -DEFAULT_CAPTURE_HEIGHT_M, 3.4)
+        return build_scene_model(
+            [{"name": "纱帐", "category": "decor", "base_u": u, "base_v": v}],
+            room=ROOM)
+
+    def test_actor_declared_behind_but_geometrically_in_front(self):
+        from aifos.scene_model import occlusion_issues
+        camera = {"position_3d": {"x": 0.0, "y": 1.43, "z": -3.0}}
+        actor = {"name": "沈眉", "facing": "站在纱帐后面",
+                 "start_3d": {"x": 0.0, "y": 0.0, "z": -1.0}}
+        issues = occlusion_issues(self._model(), camera, [actor])
+        self.assertTrue(issues)
+        self.assertIn("穿帮", issues[0]["message"])
+
+    def test_actor_genuinely_behind_is_fine(self):
+        from aifos.scene_model import occlusion_issues
+        camera = {"position_3d": {"x": 0.0, "y": 1.43, "z": -3.0}}
+        actor = {"name": "沈眉", "facing": "站在纱帐后面",
+                 "start_3d": {"x": 0.0, "y": 0.0, "z": 3.9}}
+        self.assertEqual(
+            occlusion_issues(self._model(), camera, [actor]), [])
+
+    def test_no_declared_relation_means_no_check(self):
+        from aifos.scene_model import occlusion_issues
+        camera = {"position_3d": {"x": 0.0, "y": 1.43, "z": -3.0}}
+        actor = {"name": "沈眉", "start_3d": {"x": 0.0, "y": 0.0, "z": -1.0}}
+        self.assertEqual(
+            occlusion_issues(self._model(), camera, [actor]), [])

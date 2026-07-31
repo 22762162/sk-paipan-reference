@@ -9,6 +9,7 @@ import http.client
 import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -98,6 +99,40 @@ def test_four_directions_are_chained_from_the_panorama(app, monkeypatch):
     # 四向全部以同一张全景为参考——这正是空间一致性的来源
     assert len(set(refs.values())) == 1
     assert all(ref for ref in refs.values())
+
+
+def test_real_panorama_uses_deterministic_four_direction_projection(
+        app, monkeypatch, tmp_path):
+    router_calls = []
+    projected_yaws = []
+
+    def fake_router(capability, payload, out_dir, cancel=None):
+        router_calls.append(payload.get("art_name", ""))
+        source = tmp_path / "real-panorama.png"
+        source.write_bytes(b"\x89PNG\r\n\x1a\nreal")
+        return SimpleNamespace(
+            provider="seedream5_lite", model="seedream", cost=1.0,
+            data={}, uri=str(source))
+
+    def fake_slice(pano_path, out_dir, yaw, pitch, h_fov, size):
+        projected_yaws.append((yaw, pitch, h_fov, size, pano_path))
+        dest = Path(out_dir) / f"yaw-{yaw}.png"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"\x89PNG\r\n\x1a\nslice")
+        return str(dest)
+
+    monkeypatch.setattr(app.router, "call", fake_router)
+    monkeypatch.setattr("aifos.director.slice_panorama", fake_slice)
+    result = app.director.expand_scene_views("雨夜凶杀", "雨夜天台")
+
+    assert router_calls == ["雨夜天台·720°全景母版"]
+    assert [row[0] for row in projected_yaws] == [0, 90, 180, -90]
+    assert all(row[1:4] == (0, 90, (1920, 1080))
+               for row in projected_yaws)
+    assert all(row["view"] in {
+        "panorama", "main", "side", "reverse", "side_left"}
+        for row in result["created"])
+    assert "panorama_slice" in result["providers"]
 
 
 def test_direction_prompts_declare_degrees_and_forbid_panorama_distortion(app):

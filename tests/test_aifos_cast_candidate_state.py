@@ -67,7 +67,7 @@ def test_prop_master_drops_scene_continuity_states():
         "continuity_states": "初始油纸外包→雨中拆开→沾血"})
     for token in ("油纸外包", "拆开", "沾血"):
         assert token not in prompt, f"场次状态 {token!r} 混入母版"
-    assert "出厂/初始的完整形态" in prompt
+    assert "道具本体的基准形态" in prompt
     # 稳定道具事实必须保留
     assert "骑缝印" in prompt and "桑皮纸" in prompt
 
@@ -117,7 +117,22 @@ def test_character_master_declares_precedence_over_fact_source():
     """人物母版同理:泥渍/血迹/姿态冲突必须由优先级条款裁决。"""
     from aifos.director import CHARACTER_CANDIDATE_PROMPT_SCHEMA
     # schema 版本必须随裁决条款升级,否则旧提示词会被继续复用
-    assert "v4" in CHARACTER_CANDIDATE_PROMPT_SCHEMA
+    assert "v5" in CHARACTER_CANDIDATE_PROMPT_SCHEMA
+
+
+def test_prop_master_preserves_intrinsic_damage_and_separates_back_design():
+    """永久缺角属于身份，不得被“无临时破损”规则误删；正背纹样不串面。"""
+    prompt = _prop_prompt({
+        "name": "顾氏缺角旧铜符",
+        "visual_design": (
+            "扁平鱼形铜符，尾端固定缺去一角，正面是水波纹，"
+            "背面靠边是回雁旁纹，边缘三处旧磕痕"),
+        "era_material": "失蜡法铸铜、黑褐氧化"})
+    assert "永久固有识别结构" in prompt
+    assert "固定缺角" in prompt
+    assert "本张只展示正面" in prompt
+    assert "背面内容在本视角不可见" in prompt
+    assert "四选一候选" not in prompt
 
 
 def test_scene_master_context_excludes_drama_facts():

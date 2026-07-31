@@ -108,6 +108,8 @@ _HINTS = {
     "script": "接 Claude:aifos config detect --apply(有 CLI)或 "
               "aifos config set --provider claude_api --enable --api-key …",
     "storyboard": "同「剧本」:接 Claude CLI 或 claude_api",
+    "scene_annotate": "接 Claude API 并开启图片参考能力；全景实测搭景"
+                      "禁止回退 mock，以免生成虚假家具坐标",
     "image": "批量图优先接 Seedream 5.0 Lite:aifos config set "
              "--provider seedream5_lite --enable --api-key …;"
              "或接 Codex CLI(detect) / image_api",

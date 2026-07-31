@@ -1,6 +1,7 @@
 """Seedream 5.0 Lite 参考图接入与图片成本分层回归。"""
 
 import base64
+import struct
 
 import pytest
 
@@ -11,10 +12,27 @@ from aifos.production import api_providers
 from aifos.production.api_providers import (OpenAIImageProvider,
                                             SeedreamImageProvider)
 from aifos.production.base import ProviderResult
+from aifos.production.router import ProviderRouter
 
 
 def _png(path, marker=b"0"):
     path.write_bytes(b"\x89PNG\r\n\x1a\n" + marker * 16)
+    return str(path)
+
+
+def _png_header(path, width, height):
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + struct.pack(">I", 13)
+        + b"IHDR"
+        + struct.pack(">II", width, height))
+    return str(path)
+
+
+def _jpeg_header(path, width, height):
+    path.write_bytes(
+        b"\xff\xd8\xff\xc0"
+        + struct.pack(">HBHHB", 8, 8, height, width, 3))
     return str(path)
 
 
@@ -59,6 +77,45 @@ def test_router_class_policy_keeps_batch_cost_first_with_codex_emergency(
                 "image", {"image_task_class": "expensive"})
     finally:
         app.close()
+
+
+def test_openai_image_provider_rejects_two_to_one_panorama_before_network():
+    provider = OpenAIImageProvider("image_api", {
+        "type": "image_api", "enabled": True,
+        "capabilities": ["image"], "api_key": "sk-test",
+    })
+    with pytest.raises(ProviderError, match="不支持 2:1"):
+        provider._size({"aspect": "2:1"})
+
+
+def test_seedream_two_to_one_panorama_meets_real_api_minimum_pixels():
+    provider = SeedreamImageProvider("seedream5_lite", {
+        "type": "seedream_image", "enabled": True,
+        "capabilities": ["image"], "api_key": "ark-test",
+    })
+    assert provider._size({"aspect": "2:1"}) == "2880x1440"
+
+
+def test_router_rejects_square_panorama_and_accepts_strict_two_to_one(
+        tmp_path):
+    square = ProviderResult(
+        provider="image_api", cost=1,
+        uri=_png_header(tmp_path / "square.png", 1024, 1024))
+    with pytest.raises(ProviderError, match="不是严格 2:1"):
+        ProviderRouter._validate_generated_image_shape(
+            "image", {"aspect": "2:1"}, square)
+
+    panorama = ProviderResult(
+        provider="seedream5_lite", cost=1,
+        uri=_png_header(tmp_path / "panorama.png", 2560, 1280))
+    ProviderRouter._validate_generated_image_shape(
+        "image", {"aspect": "2:1"}, panorama)
+
+    jpeg_in_png_path = ProviderResult(
+        provider="seedream5_lite", cost=1,
+        uri=_jpeg_header(tmp_path / "panorama_from_api.png", 2880, 1440))
+    ProviderRouter._validate_generated_image_shape(
+        "image", {"aspect": "2:1"}, jpeg_in_png_path)
 
 
 def test_batch_fallback_is_seedream_then_gpt_then_codex_emergency(tmp_path):
@@ -177,6 +234,58 @@ def test_explicit_cold_start_can_fall_back_to_paid_text_to_image(tmp_path):
         }, app.workspace.artifacts_dir)
         assert result.provider == "image_api"
         assert calls == ["codex", "image_api"]
+    finally:
+        app.close()
+
+
+def test_deterministic_codex_image_unavailable_is_circuit_broken(tmp_path):
+    app = App(tmp_path / "ws", config_overrides={
+        "providers": {
+            "image_api": {"enabled": True, "api_key": "openai-test"},
+            "codex": {"enabled": True},
+            "mock": {"enabled": False},
+        },
+        "routing": {"image": ["codex", "image_api"]},
+    })
+    calls = []
+    try:
+        codex = app.router.providers["codex"]
+        image_api = app.router.providers["image_api"]
+        codex.available = image_api.available = \
+            lambda capability: (True, "")
+
+        def codex_fail(*args, **kwargs):
+            calls.append("codex")
+            raise ProviderError(
+                "当前会话未提供可调用的内置 `image_gen` 图像生成能力")
+
+        def image_generate(*args, **kwargs):
+            calls.append("image_api")
+            return ProviderResult(provider="image_api", cost=1.12, data={})
+
+        app.router._generate_via_codex_slot = codex_fail
+        image_api.generate = image_generate
+        payload = {
+            "portrait_candidate": True,
+            "allow_text_to_image_bootstrap": True,
+            "art_name": "cold_start",
+            "prompt": "single character mother asset",
+            "prompt_review_exempt": True,
+            "image_task_class": "important",
+            "image_quality": "high",
+        }
+        first = app.router.call(
+            "image", dict(payload), app.workspace.artifacts_dir)
+        second = app.router.call(
+            "image", dict(payload), app.workspace.artifacts_dir)
+
+        assert first.provider == second.provider == "image_api"
+        assert calls == ["codex", "image_api", "image_api"]
+        assert ("codex", "image") in app.router._capability_blocked
+        assert second.fallbacks[0] == {
+            "provider": "codex",
+            "reason": "本服务进程已确认该产线缺少此生成能力",
+        }
     finally:
         app.close()
 

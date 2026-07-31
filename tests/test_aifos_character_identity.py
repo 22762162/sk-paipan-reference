@@ -359,13 +359,17 @@ def test_candidate_prompts_reuse_one_initial_state_and_prompt(app):
         json.dumps(context, ensure_ascii=False, sort_keys=True)
         for context in contexts
     }) == 1
-    assert all("【四图同词】" in prompt for prompt in prompts)
-    assert all("只利用图片模型随机采样" in prompt for prompt in prompts)
+    assert all("【单次输出硬约束】" in prompt for prompt in prompts)
+    assert all("本次只输出1张独立竖幅图片" in prompt for prompt in prompts)
+    assert all("四宫格" in prompt and "候选合集" in prompt
+               for prompt in prompts)
+    assert all("四张候选" not in prompt and "四图同词" not in prompt
+               for prompt in prompts)
     assert all("人物立绘必须是纯净、无文字的单人物资产背景" in prompt
                for prompt in prompts)
     assert all("无参考图时" in prompt for prompt in prompts)
     assert all("PROJECT STYLE LOCK" in prompt for prompt in prompts)
-    assert all("不得制作不同画风候选" in prompt for prompt in prompts)
+    assert all("当前图片不得切换画风" in prompt for prompt in prompts)
     assert "齐肩内扣短发" in prompts[0]
     assert all(item["candidate_prompt_schema"]
                == CHARACTER_CANDIDATE_PROMPT_SCHEMA
@@ -544,8 +548,8 @@ def test_reference_portrait_locks_face_hair_makeup_and_workwear(app):
         has_reference=True)
     assert "只锁人物脸型、五官骨相" in prompt
     assert "严格保持参考图发型轮廓" in prompt
-    assert "四张候选不得更换发型身份" in prompt
-    assert "四张候选不得改变妆造体系" in prompt
+    assert "不得更换发型身份" in prompt
+    assert "不得改变妆造体系" in prompt
     assert "禁止换脸" in prompt
     assert "外卖小哥" in prompt and "外卖制服" in prompt
     assert "职业服装:" not in prompt

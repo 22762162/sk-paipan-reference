@@ -8,8 +8,10 @@
 import hashlib
 import json
 import re
+import struct
 import threading
 import time
+from pathlib import Path
 
 from .. import knowledge_apply
 from ..errors import ProduceCancelled, ProviderError, ProviderUnavailable
@@ -61,6 +63,11 @@ class ProviderRouter:
         # 本次运行内因题材安全策略拒收的 (provider, capability):
         # 悬疑/凶案类剧集会被某些图片 API 整集拒绝,记一次即绕开。
         self._safety_blocked = set()
+        # 本服务进程内已经证实“能力根本不存在”的 Provider/能力组合。
+        # 例如 Codex 子会话没有内置 image_gen：继续给同批每张图都启动
+        # 一次几十秒的必败进程没有任何抽卡价值，只会延迟后续真实 API。
+        # 这里仅熔断确定性的能力缺失；普通单图失败仍照常逐张回退。
+        self._capability_blocked = set()
         # 通道取用优先级 = 配置列表顺序(只含启用通道):前面的通道并发
         # 占满后才溢出到后面的通道(如 B、C 先行,A 兜底)。
         self._codex_profile_order = []
@@ -190,6 +197,23 @@ class ProviderRouter:
         return list(dict.fromkeys(preferred + base))
 
     @staticmethod
+    def _is_deterministic_capability_failure(name, capability, error):
+        if name != "codex" or capability not in \
+                ProviderRouter.IMAGE_CAPABILITIES:
+            return False
+        text = str(error or "").lower()
+        signals = (
+            "built-in image_gen capability is unavailable",
+            "no image_gen",
+            "image_gen 图像生成能力",
+            "未提供可调用的内置 `image_gen`",
+            "未提供内置 `image_gen`",
+            "缺少内置 image_gen",
+            "没有图像生成能力",
+        )
+        return any(signal.lower() in text for signal in signals)
+
+    @staticmethod
     def _provider_models(provider):
         configured = provider.conf.get("models") or []
         values = []
@@ -202,6 +226,82 @@ class ProviderRouter:
         if current and str(current) not in values:
             values.insert(0, str(current))
         return values
+
+    @staticmethod
+    def _image_dimensions(uri):
+        """Read PNG/JPEG dimensions without adding a Pillow dependency.
+
+        Some image APIs return JPEG bytes while the requested destination
+        still has a .png suffix, so detection must use the file signature.
+        """
+        path = Path(str(uri or ""))
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return None
+        if (len(data) >= 24
+                and data[:8] == b"\x89PNG\r\n\x1a\n"
+                and data[12:16] == b"IHDR"):
+            return struct.unpack(">II", data[16:24])
+        if len(data) < 4 or data[:2] != b"\xff\xd8":
+            return None
+        offset = 2
+        sof_markers = {
+            0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+            0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+        }
+        while offset + 4 <= len(data):
+            if data[offset] != 0xFF:
+                offset += 1
+                continue
+            while offset < len(data) and data[offset] == 0xFF:
+                offset += 1
+            if offset >= len(data):
+                break
+            marker = data[offset]
+            offset += 1
+            if marker in (0x01, *range(0xD0, 0xDA)):
+                continue
+            if offset + 2 > len(data):
+                break
+            length = struct.unpack(">H", data[offset:offset + 2])[0]
+            if length < 2 or offset + length > len(data):
+                break
+            if marker in sof_markers and length >= 7:
+                height, width = struct.unpack(
+                    ">HH", data[offset + 3:offset + 7])
+                return width, height
+            offset += length
+        return None
+
+    @classmethod
+    def _validate_generated_image_shape(cls, capability, payload, result):
+        """Fail a provider result when a panorama silently becomes a square.
+
+        The 720° scene master is the geometry source for all later camera
+        slices. Accepting a 1:1 image here makes every derived direction a
+        different room, so a bad result must re-enter the normal provider
+        fallback chain instead of being registered as a usable panorama.
+        """
+        if (capability not in cls.IMAGE_CAPABILITIES
+                or str(payload.get("aspect") or "") != "2:1"):
+            return
+        # Mock artifacts are deliberately non-production SVG placeholders,
+        # sometimes stored behind a .png path for legacy tests. They never
+        # become a formal scene geometry source.
+        if getattr(result, "provider", "") == "mock":
+            return
+        dimensions = cls._image_dimensions(getattr(result, "uri", ""))
+        if dimensions is None:
+            raise ProviderError(
+                f"{getattr(result, 'provider', '图片产线')} 的 2:1 全景产物"
+                "无法读取 PNG/JPEG 尺寸，拒绝登记为全景母版")
+        width, height = dimensions
+        if height <= 0 or width != height * 2:
+            raise ProviderError(
+                f"{getattr(result, 'provider', '图片产线')} 的全景产物尺寸"
+                f"为 {width}x{height}，不是严格 2:1；"
+                "拒绝登记并回退下一图片产线")
 
     def image_api_options(self):
         """返回可供单批次严格选择的真实图片 API/模型。"""
@@ -323,6 +423,7 @@ class ProviderRouter:
             "character_sheet", "sheet_label", "characters",
             "character_count", "functional_figures", "location", "action",
             "camera", "camera_precedence", "aspect_precedence",
+            "shot_contract", "prompt_conflict_resolution",
             "start_state", "end_state",
             "readable_text",
             "composition_contract", "prompt_contract",
@@ -330,13 +431,43 @@ class ProviderRouter:
             "character_background", "story_world", "story_background",
             "style", "aspect",
         )
-        return {
+        context = {
             "capability": capability,
             **{
                 key: payload.get(key) for key in keys
                 if payload.get(key) not in (None, "", [], {})
             },
         }
+        try:
+            repair_round = int(
+                payload.get("_codex_contract_repair_count") or 0)
+        except (TypeError, ValueError):
+            repair_round = 0
+        if repair_round:
+            # A repaired shot may still carry stale clauses inside a previously
+            # compiled prompt (real case: the latest camera says 135mm close-up
+            # while an old model-constraint line still says medium shot).
+            # Make the latest structured shot state an explicit adjudication,
+            # so prompt review deletes the obsolete clause instead of blocking
+            # the autonomous run as an alleged same-level conflict.
+            context["master_state_precedence"] = {
+                "policy": (
+                    "这是第N轮后的最新镜头合同。latest_camera、"
+                    "latest_shot_contract、latest_action 与"
+                    "prompt_conflict_resolution 共同替代并作废"
+                    "AIFOS原始提示词、旧模型约束或旧审核稿中一切冲突的"
+                    "景别、焦段、机位、构图、运镜、视线、裁切和道具终态；"
+                    "审核必须按最新值生成优化稿，不得把已作废旧句当作"
+                    "同级冲突再次阻断。人物身份、性别、人数、服装、"
+                    "关键道具唯一性、场景和文字白名单仍不得改变。"),
+                "revision_round": repair_round,
+                "latest_camera": payload.get("camera"),
+                "latest_shot_contract": payload.get("shot_contract") or {},
+                "latest_action": payload.get("action"),
+                "prompt_conflict_resolution": payload.get(
+                    "prompt_conflict_resolution") or {},
+            }
+        return context
 
     def _build_review_payload(self, source, context, payload):
         """审核请求 = 提示词 + 事实上下文 + 必留词 + 统一裁决条款。
@@ -739,7 +870,7 @@ class ProviderRouter:
         allows_text_bootstrap = bool(
             payload.get("allow_text_to_image_bootstrap"))
         supplied_refs = []
-        for key in ("style_ref", "scene_ref", "chain_first_uri"):
+        for key in ("style_ref", "scene_ref", "chain_first_uri", "image_uri"):
             if payload.get(key):
                 supplied_refs.append(payload[key])
         for key in ("character_refs", "prop_refs", "reference_images"):
@@ -767,6 +898,10 @@ class ProviderRouter:
                     continue
             if (name, capability) in self._safety_blocked:
                 reason = "本集题材已被该产线安全策略整体拒收"
+                fallbacks.append({"provider": name, "reason": reason})
+                continue
+            if (name, capability) in self._capability_blocked:
+                reason = "本服务进程已确认该产线缺少此生成能力"
                 fallbacks.append({"provider": name, "reason": reason})
                 continue
             ok, reason = provider.available(capability)
@@ -807,6 +942,8 @@ class ProviderRouter:
                 else:
                     result = provider.generate(capability, payload, out_dir,
                                                cancel=cancel)
+                self._validate_generated_image_shape(
+                    capability, payload, result)
             except ProviderError as exc:
                 if self._is_safety_rejection(exc):
                     # 题材级拒绝:《雨夜凶杀》这类有尸体/血迹的剧,
@@ -818,6 +955,13 @@ class ProviderRouter:
                         "router",
                         f"{name} 因题材安全策略拒绝本集内容(尸体/血迹等),"
                         f"本次运行不再向它投递 {capability},直接用后续产线")
+                elif self._is_deterministic_capability_failure(
+                        name, capability, exc):
+                    self._capability_blocked.add((name, capability))
+                    self.log.warn(
+                        "router",
+                        f"{name} 已确认缺少 {capability} 生成能力；"
+                        "本服务进程后续图片直接使用下一真实产线")
                 else:
                     self.log.warn(
                         "router",

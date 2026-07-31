@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 
-SCHEMA = "aifos.scene-model/v1"
+SCHEMA = "aifos.scene-model/v2"
 DEFAULT_CAPTURE_HEIGHT_M = 1.55
 # 视线过于接近水平时,地面交点会跑到无穷远——超过这个距离一律判为
 # 「看不出落地点」,而不是给一个荒谬的坐标。
@@ -87,6 +87,113 @@ def _room_height(room):
 
 WALL_TOLERANCE_M = 0.6   # 贴墙家具解到墙外一点是常态,不当异常报
 
+_DEFAULT_GEOMETRY = {
+    "furniture": {"width_m": 0.8, "height_m": 0.9, "depth_ratio": 0.58,
+                  "min_depth_m": 0.35, "max_depth_m": 1.2},
+    "prop": {"width_m": 0.3, "height_m": 0.3, "depth_ratio": 0.72,
+             "min_depth_m": 0.12, "max_depth_m": 0.55},
+    "opening": {"width_m": 1.0, "height_m": 2.2, "depth_ratio": 0.08,
+                "min_depth_m": 0.08, "max_depth_m": 0.18},
+    "light": {"width_m": 0.35, "height_m": 1.5, "depth_ratio": 0.72,
+              "min_depth_m": 0.18, "max_depth_m": 0.5},
+    "decor": {"width_m": 0.5, "height_m": 1.2, "depth_ratio": 0.12,
+              "min_depth_m": 0.08, "max_depth_m": 0.35},
+}
+
+
+def _positive_number(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def _normal_angle(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = 0.0
+    return round(((number + 180.0) % 360.0) - 180.0, 1)
+
+
+def _object_footprint(x, z, width, depth, rotation_y_deg):
+    """返回旋转盒体的四个地面角点；本地宽轴=X，本地深度轴=Z。"""
+    half_w, half_d = float(width) / 2.0, float(depth) / 2.0
+    yaw = math.radians(float(rotation_y_deg))
+    cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
+    points = []
+    for local_x, local_z in (
+            (-half_w, -half_d), (half_w, -half_d),
+            (half_w, half_d), (-half_w, half_d)):
+        points.append({
+            "x": round(x + local_x * cos_yaw + local_z * sin_yaw, 3),
+            "y": 0.0,
+            "z": round(z - local_x * sin_yaw + local_z * cos_yaw, 3),
+        })
+    return points
+
+
+def _footprint_inside_room(points, room):
+    room = room if isinstance(room, dict) else {}
+    try:
+        half_w = float(room.get("floor_width_m") or 10.0) / 2.0
+        half_d = float(room.get("floor_depth_m") or 7.0) / 2.0
+    except (TypeError, ValueError):
+        half_w, half_d = 5.0, 3.5
+    return all(
+        abs(float(point["x"])) <= half_w + WALL_TOLERANCE_M
+        and abs(float(point["z"])) <= half_d + WALL_TOLERANCE_M
+        for point in points)
+
+
+def _clamp_footprint_center(x, z, width, depth, rotation_y_deg, room):
+    """把完整旋转盒体钳进房间，返回中心与是否无需修正。"""
+    room = room if isinstance(room, dict) else {}
+    try:
+        half_room_w = float(room.get("floor_width_m") or 10.0) / 2.0
+        half_room_d = float(room.get("floor_depth_m") or 7.0) / 2.0
+    except (TypeError, ValueError):
+        half_room_w, half_room_d = 5.0, 3.5
+    yaw = math.radians(float(rotation_y_deg))
+    half_w, half_d = float(width) / 2.0, float(depth) / 2.0
+    extent_x = abs(math.cos(yaw)) * half_w + abs(math.sin(yaw)) * half_d
+    extent_z = abs(math.sin(yaw)) * half_w + abs(math.cos(yaw)) * half_d
+    limit_x = max(0.0, half_room_w - extent_x)
+    limit_z = max(0.0, half_room_d - extent_z)
+    clamped_x = max(-limit_x, min(limit_x, float(x)))
+    clamped_z = max(-limit_z, min(limit_z, float(z)))
+    unchanged = (
+        abs(clamped_x - float(x)) < 1e-9
+        and abs(clamped_z - float(z)) < 1e-9)
+    return clamped_x, clamped_z, unchanged
+
+
+def _footprints_overlap(left, right, gap=0.0):
+    """二维旋转矩形 SAT；gap>0 时把安全余量计入投影。"""
+    if len(left) != 4 or len(right) != 4:
+        return False
+    axes = []
+    for points in (left, right):
+        for index in (0, 1):
+            a, b = points[index], points[index + 1]
+            edge_x = float(b["x"]) - float(a["x"])
+            edge_z = float(b["z"]) - float(a["z"])
+            length = math.hypot(edge_x, edge_z)
+            if length > 1e-9:
+                axes.append((-edge_z / length, edge_x / length))
+    for axis_x, axis_z in axes:
+        left_values = [
+            float(point["x"]) * axis_x + float(point["z"]) * axis_z
+            for point in left]
+        right_values = [
+            float(point["x"]) * axis_x + float(point["z"]) * axis_z
+            for point in right]
+        if (max(left_values) + gap < min(right_values)
+                or max(right_values) + gap < min(left_values)):
+            return False
+    return True
+
 
 def _clamp_room(x, z, room):
     """钳进房间;inside 用容差判定——书架/帷幔本来就贴墙,解到墙外
@@ -110,9 +217,15 @@ def build_object(annotation, *, capture_height=DEFAULT_CAPTURE_HEIGHT_M,
     标注字段(视觉模型只需给出「在全景图里的比例位置」,不必估距离):
       name           物体名
       category       furniture/prop/opening/light/decor
-      base_u, base_v 底部着地点在全景里的归一化坐标
+      base_u, base_v 底边中心与地面接触点在全景里的归一化坐标
       top_v          顶部在全景里的纵向比例(可选,用于解高度)
       width_u        物体在全景里的水平跨度比例(可选,用于解宽度)
+      depth_m        物体真实前后深度(可选,视觉模型按房间尺度给出)
+      rotation_y_deg 物体绕竖直轴朝向(可选,角度约定同 blocking)
+
+    单张全景能精确反解落地点、宽度和高度，不能凭几何唯一反解深度与
+    朝向。因此 depth/rotation 优先使用视觉标注；缺失时使用明确记录的
+    类别兜底值，绝不把估计冒充成测量值。
     """
     annotation = annotation if isinstance(annotation, dict) else {}
     name = str(annotation.get("name") or "").strip()
@@ -130,6 +243,9 @@ def build_object(annotation, *, capture_height=DEFAULT_CAPTURE_HEIGHT_M,
     x, z, inside = _clamp_room(x, z, room)
     distance = math.hypot(x, z)
 
+    category = str(annotation.get("category") or "furniture")
+    defaults = _DEFAULT_GEOMETRY.get(
+        category, _DEFAULT_GEOMETRY["furniture"])
     height = None
     height_overflow = False
     top_v = annotation.get("top_v")
@@ -157,18 +273,74 @@ def build_object(annotation, *, capture_height=DEFAULT_CAPTURE_HEIGHT_M,
         except (TypeError, ValueError):
             width = None
 
+    measured_width = _positive_number(width)
+    measured_height = _positive_number(height)
+    final_width = measured_width or float(defaults["width_m"])
+    final_height = measured_height or float(defaults["height_m"])
+    annotated_depth = _positive_number(annotation.get("depth_m"))
+    final_depth = annotated_depth
+    if final_depth is None:
+        final_depth = max(
+            float(defaults["min_depth_m"]),
+            min(float(defaults["max_depth_m"]),
+                final_width * float(defaults["depth_ratio"])))
+    annotated_rotation = (
+        annotation.get("rotation_y_deg")
+        if annotation.get("rotation_y_deg") is not None
+        else annotation.get("orientation_deg"))
+    # 缺朝向时让盒体正面朝全景拍摄点：宽轴与观察射线相切。这个回退
+    # 至少能让门窗、帷幔、书架贴墙，而不是全部沿世界 X 轴硬排。
+    measured_position = {
+        "x": round(x, 3), "y": 0.0, "z": round(z, 3)}
+    position_yaw = math.degrees(math.atan2(x, z))
+    rotation_y = _normal_angle(
+        annotated_rotation
+        if annotated_rotation is not None else position_yaw)
+    footprint_clamped = False
+    if category in ("furniture", "prop"):
+        x, z, unchanged = _clamp_footprint_center(
+            x, z, final_width, final_depth, rotation_y, room)
+        footprint_clamped = not unchanged
+    distance = math.hypot(x, z)
+    footprint = _object_footprint(
+        x, z, final_width, final_depth, rotation_y)
+
     return {
         "name": name,
-        "category": str(annotation.get("category") or "furniture"),
-        "position_3d": {"x": round(x, 2), "y": 0.0, "z": round(z, 2)},
+        "category": category,
+        # 毫米级保留是为了钳位后的盒体不因二位小数回舍再次越墙。
+        "position_3d": {"x": round(x, 3), "y": 0.0, "z": round(z, 3)},
         "distance_m": round(distance, 2),
         "yaw_deg": round(math.degrees(math.atan2(x, z)), 1),
-        "height_m": height,
-        "width_m": width,
+        "rotation_y_deg": rotation_y,
+        "height_m": round(final_height, 3),
+        "width_m": round(final_width, 3),
+        "depth_m": round(final_depth, 3),
+        "footprint_3d": footprint,
         "inside_room": inside,
+        "footprint_inside_room": _footprint_inside_room(footprint, room),
+        "footprint_clamped": footprint_clamped,
         "height_clamped": height_overflow,
+        "geometry_sources": {
+            "position": "panorama_floor_intersection",
+            "width": (
+                "panorama_angular_span"
+                if measured_width is not None else "category_default"),
+            "height": (
+                "panorama_vertical_ray"
+                if measured_height is not None else "category_default"),
+            "depth": (
+                "visual_annotation"
+                if annotated_depth is not None else "category_default"),
+            "rotation": (
+                "visual_annotation"
+                if annotated_rotation is not None else "radial_fallback"),
+        },
         "source": {"base_u": round(base_u, 4), "base_v": round(base_v, 4),
-                   "top_v": top_v, "width_u": span},
+                   "top_v": top_v, "width_u": span,
+                   "depth_m": annotation.get("depth_m"),
+                   "rotation_y_deg": annotated_rotation,
+                   "measured_position_3d": measured_position},
     }
 
 
@@ -197,6 +369,17 @@ def build_scene_model(annotations, *, location="",
                 "message": (f"「{built['name']}」解出的位置在房间外,已钳到"
                             "墙内;可能是标注点没落在物体与地面的接触处"),
             })
+        elif (built["footprint_clamped"]
+              and built["category"] in ("furniture", "prop")):
+            issues.append({
+                "severity": "warning", "field": "footprint_bounds",
+                "object": built["name"],
+                "message": (
+                    f"「{built['name']}」原始底边中心虽在房间内,但按宽"
+                    f"{built['width_m']:.2f}m×深{built['depth_m']:.2f}m"
+                    "画出的完整盒体会越墙,已整体钳回室内;"
+                    "请复核深度、朝向或底边中心"),
+            })
         objects.append(built)
     issues.extend(overlap_issues(objects))
     return {
@@ -211,7 +394,7 @@ def build_scene_model(annotations, *, location="",
 
 
 def overlap_issues(objects, min_gap_m=0.25):
-    """同类家具占位重叠 = 标注把两件东西解到了同一处,或房间尺寸不对。"""
+    """同类家具盒体重叠 = 标注、朝向、尺寸或房间尺度至少一项有误。"""
     issues = []
     furniture = [o for o in objects
                  if o.get("category") in ("furniture", "prop")]
@@ -220,16 +403,20 @@ def overlap_issues(objects, min_gap_m=0.25):
             gap = math.dist(
                 (a["position_3d"]["x"], a["position_3d"]["z"]),
                 (b["position_3d"]["x"], b["position_3d"]["z"]))
-            if gap < min_gap_m:
+            overlap = _footprints_overlap(
+                a.get("footprint_3d") or [],
+                b.get("footprint_3d") or [],
+                gap=float(min_gap_m))
+            if overlap:
                 issues.append({
                     "severity": "warning", "field": "overlap",
                     "object": a["name"],
-                    "message": (f"「{a['name']}」与「{b['name']}」解出的位置"
-                                f"相距仅 {gap:.2f}m,几乎重叠;请检查标注的"
-                                "落地点是否指向了同一处"),
+                    "message": (
+                        f"「{a['name']}」与「{b['name']}」的真实盒体"
+                        f"相交或间距小于 {min_gap_m:.2f}m"
+                        f"(中心距 {gap:.2f}m);请检查底边中心、深度与朝向"),
                 })
     return issues
-
 
 def find_object(scene_model, name):
     name = str(name or "").strip()
@@ -242,6 +429,22 @@ def find_object(scene_model, name):
         if name in str(obj.get("name") or ""):
             return obj
     return None
+
+
+def _point_box_gap(x, z, obj):
+    """点到旋转盒体占地的距离；在盒内返回 0。"""
+    center = obj.get("position_3d") or {}
+    ox, _oy, oz = _xyz_of(center)
+    yaw = math.radians(float(obj.get("rotation_y_deg") or 0.0))
+    cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
+    dx, dz = float(x) - ox, float(z) - oz
+    local_x = dx * cos_yaw - dz * sin_yaw
+    local_z = dx * sin_yaw + dz * cos_yaw
+    half_w = float(obj.get("width_m") or 0.6) / 2.0
+    half_d = float(obj.get("depth_m") or 0.4) / 2.0
+    outside_x = max(abs(local_x) - half_w, 0.0)
+    outside_z = max(abs(local_z) - half_d, 0.0)
+    return math.hypot(outside_x, outside_z)
 
 
 def actor_placement_issues(scene_model, actors, *, clearance_m=0.35):
@@ -257,29 +460,263 @@ def actor_placement_issues(scene_model, actors, *, clearance_m=0.35):
     for actor in (actors or []):
         if not isinstance(actor, dict):
             continue
-        start = actor.get("start_3d") or {}
-        try:
-            ax, az = float(start.get("x", 0.0)), float(start.get("z", 0.0))
-        except (TypeError, ValueError):
-            continue
         name = str(actor.get("name") or actor.get("actor_id") or "角色")
-        _cx, _cz, inside = _clamp_room(ax, az, room)
+        points = actor.get("route_3d") or []
+        if not points:
+            points = [
+                actor.get("start_3d") or {},
+                actor.get("end_3d") or actor.get("start_3d") or {},
+            ]
+        seen = set()
+        for index, point in enumerate(points):
+            try:
+                ax = float((point or {}).get("x", 0.0))
+                az = float((point or {}).get("z", 0.0))
+            except (TypeError, ValueError):
+                continue
+            point_key = (round(ax, 4), round(az, 4))
+            if point_key in seen:
+                continue
+            seen.add(point_key)
+            phase = str((point or {}).get("phase") or f"route_{index}")
+            _cx, _cz, inside = _clamp_room(ax, az, room)
+            if not inside:
+                issues.append({
+                    "severity": "block", "field": "actor_bounds",
+                    "actor": name, "phase": phase,
+                    "message": (
+                        f"「{name}」在 {phase} 的站位({ax:.2f},{az:.2f})"
+                        "位于房间外,画面上会是穿墙"),
+                })
+            for obj in objects:
+                gap = _point_box_gap(ax, az, obj)
+                if gap < clearance_m:
+                    sources = obj.get("geometry_sources") or {}
+                    measured_box = (
+                        sources.get("depth") == "visual_annotation"
+                        and sources.get("rotation") == "visual_annotation")
+                    collision = gap <= 0.02
+                    severity = (
+                        "block" if collision and measured_box else "warning")
+                    issues.append({
+                        "severity": severity, "field": "actor_furniture",
+                        "actor": name, "object": obj["name"], "phase": phase,
+                        "message": (
+                            f"「{name}」在 {phase} 距「{obj['name']}」"
+                            f"盒体边缘仅 {gap:.2f}m,小于 {clearance_m:.2f}m"
+                            "安全余量——"
+                            + ("人物会站进已测量家具盒体"
+                               if severity == "block"
+                               else "可能是合理接触，也可能擦碰；"
+                               "深度/朝向未完全测准时只警告，需人工看图")),
+                    })
+    return issues
+
+
+def camera_placement_issues(scene_model, camera, *, clearance_m=0.15):
+    """摄影机路线不能穿墙或穿过真实家具盒体。
+
+    高机位允许从家具上方通过；只有镜头中心高度仍落在物体盒体高度内
+    才判碰撞，避免把摇臂/俯拍误杀成地面摄影机。
+    """
+    issues = []
+    camera = camera if isinstance(camera, dict) else {}
+    points = camera.get("route_3d") or []
+    if not points:
+        points = [
+            camera.get("start_3d") or camera.get("position_3d") or {},
+            camera.get("end_3d") or camera.get("start_3d")
+            or camera.get("position_3d") or {},
+        ]
+    objects = [o for o in (scene_model or {}).get("objects", [])
+               if o.get("category") in ("furniture", "prop")]
+    room = (scene_model or {}).get("room") or {}
+    seen = set()
+    for index, point in enumerate(points):
+        cx, cy, cz = _xyz_of(point)
+        phase = str((point or {}).get("phase") or f"route_{index}")
+        marker = (round(cx, 4), round(cy, 4), round(cz, 4), phase)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        _room_x, _room_z, inside = _clamp_room(cx, cz, room)
         if not inside:
             issues.append({
-                "severity": "block", "field": "actor_bounds",
-                "actor": name,
-                "message": f"「{name}」站位在房间外,画面上会是穿墙",
+                "severity": "block", "field": "camera_bounds",
+                "phase": phase,
+                "message": (
+                    f"摄影机在 {phase} 的位置({cx:.2f},{cy:.2f},"
+                    f"{cz:.2f})位于房间外，运镜会穿墙"),
             })
         for obj in objects:
-            gap = math.dist((ax, az), (obj["position_3d"]["x"],
-                                       obj["position_3d"]["z"]))
-            footprint = (float(obj.get("width_m") or 0.6)) / 2
-            if gap < footprint + clearance_m:
+            base_y = float((obj.get("position_3d") or {}).get("y") or 0.0)
+            top_y = base_y + float(obj.get("height_m") or 0.8)
+            if cy > top_y + clearance_m:
+                continue
+            gap = _point_box_gap(cx, cz, obj)
+            if gap < clearance_m:
+                sources = obj.get("geometry_sources") or {}
+                measured_box = (
+                    sources.get("depth") == "visual_annotation"
+                    and sources.get("rotation") == "visual_annotation")
+                collision = gap <= 0.02
+                severity = (
+                    "block" if collision and measured_box else "warning")
                 issues.append({
-                    "severity": "warning", "field": "actor_furniture",
-                    "actor": name, "object": obj["name"],
-                    "message": (f"「{name}」站位距「{obj['name']}」中心仅 "
-                                f"{gap:.2f}m,小于该家具半宽 {footprint:.2f}m "
-                                f"加 {clearance_m}m 余量——画面上会站进家具里"),
+                    "severity": severity, "field": "camera_furniture",
+                    "object": obj.get("name"), "phase": phase,
+                    "message": (
+                        f"摄影机在 {phase} 距「{obj.get('name')}」盒体"
+                        f"仅 {gap:.2f}m(镜高 {cy:.2f}m)；"
+                        + ("已穿入测量盒体，请移动机位或提高镜头"
+                           if severity == "block"
+                           else "几何置信度不足，只警告并交人工复核")),
+                })
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# 把三维场景写成提示词条款
+#
+# 用户实测的穿帮:「说在东廊纱帐后面,实际画在镜前桌子很近的位置,
+# 后面纱帐还经常变」。根因是提示词里【场景】只有一句地名,物体一个坐标
+# 都没有——模型每张图重新想象家具在哪,位置当然每次都不一样。
+# 有了三维场景表,就能把每件东西钉在固定坐标上,并按本镜机位换算成
+# 「在画面里的哪一侧、离镜头多远」这种模型真正能执行的说法。
+
+def _screen_side(relative_yaw_deg):
+    """物体相对机位视线的方位 → 画面左右描述。"""
+    yaw = ((float(relative_yaw_deg) + 180.0) % 360.0) - 180.0
+    if abs(yaw) <= 12:
+        return "画面正中"
+    if abs(yaw) >= 150:
+        return "机位背后(画面外)"
+    side = "右" if yaw > 0 else "左"
+    if abs(yaw) <= 45:
+        return f"画面中偏{side}"
+    if abs(yaw) <= 90:
+        return f"画面{side}侧"
+    return f"画面{side}后方(可能出画)"
+
+
+def _depth_word(distance_m):
+    if distance_m <= 1.2:
+        return "紧贴镜头的前景"
+    if distance_m <= 2.5:
+        return "近景层"
+    if distance_m <= 4.5:
+        return "中景层"
+    return "背景层"
+
+
+def scene_layout_clause(scene_model, camera=None, *, max_items=8):
+    """【场景陈设定位】条款:每件东西钉死在坐标上,并换算成本镜画面位置。
+
+    没有机位时只给世界坐标(适用于场景概念图);给了机位则同时给出
+    「在画面哪一侧、属于前景还是背景」——这才是模型能执行的说法。
+    """
+    objects = [o for o in (scene_model or {}).get("objects", [])
+               if isinstance(o, dict)]
+    if not objects:
+        return ""
+    cam = camera if isinstance(camera, dict) else {}
+    cam_pos = cam.get("position_3d") or cam.get("start_3d")
+    cam_target = cam.get("target_3d") or cam.get("target_start_3d")
+    view_yaw = None
+    if isinstance(cam_pos, dict) and isinstance(cam_target, dict):
+        cx, _cy, cz = _xyz_of(cam_pos)
+        tx, _ty, tz = _xyz_of(cam_target)
+        view_yaw = math.degrees(math.atan2(tx - cx, tz - cz))
+
+    ranked = []
+    for obj in objects:
+        pos = obj.get("position_3d") or {}
+        ox, _oy, oz = _xyz_of(pos)
+        if view_yaw is None:
+            ranked.append((obj.get("distance_m") or 0.0, obj, None, None))
+            continue
+        cx, _cy, cz = _xyz_of(cam_pos)
+        rel_distance = math.dist((ox, oz), (cx, cz))
+        obj_yaw = math.degrees(math.atan2(ox - cx, oz - cz))
+        ranked.append((rel_distance, obj, rel_distance, obj_yaw - view_yaw))
+    ranked.sort(key=lambda row: row[0])
+
+    parts = []
+    for _key, obj, rel_distance, rel_yaw in ranked[:max_items]:
+        pos = obj.get("position_3d") or {}
+        ox, _oy, oz = _xyz_of(pos)
+        bits = [f"{obj.get('name')}"]
+        size = []
+        if obj.get("width_m"):
+            size.append(f"宽{float(obj['width_m']):.1f}米")
+        if obj.get("height_m"):
+            size.append(f"高{float(obj['height_m']):.1f}米")
+        if obj.get("depth_m"):
+            size.append(f"深{float(obj['depth_m']):.1f}米")
+        if obj.get("rotation_y_deg") is not None:
+            size.append(f"朝向{float(obj['rotation_y_deg']):.0f}度")
+        bits.append(f"固定在({ox:+.1f},{oz:+.1f})米"
+                    + ("、" + "、".join(size) if size else ""))
+        if rel_distance is not None:
+            bits.append(f"距本镜机位{rel_distance:.1f}米、"
+                        f"{_screen_side(rel_yaw)}、{_depth_word(rel_distance)}")
+        parts.append("".join([bits[0], "(", "；".join(bits[1:]), ")"]))
+    return ("【场景陈设定位】本场家具陈设的位置是固定事实,每一镜都相同,"
+            "不得挪动、增删或换款式:" + "；".join(parts)
+            + "。画面里这些物体必须出现在上述相对位置上——"
+            "被本镜取景裁掉的可以不画,但不得改到别处。")
+
+
+def _xyz_of(point):
+    point = point if isinstance(point, dict) else {}
+    def num(key):
+        try:
+            return float(point.get(key, 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+    return num("x"), num("y"), num("z")
+
+
+def occlusion_issues(scene_model, camera, actors, *, near_margin_m=0.25):
+    """遮挡穿帮检测:声明「在 X 后面」,几何上却在 X 前面。
+
+    用户实测:「说在东廊纱帐后面,却在镜头前桌子很近的位置」——这类
+    前后关系错乱以前只能靠肉眼在成片里发现。
+    """
+    issues = []
+    cam = camera if isinstance(camera, dict) else {}
+    cam_pos = cam.get("position_3d") or cam.get("start_3d")
+    if not isinstance(cam_pos, dict):
+        return issues
+    cx, _cy, cz = _xyz_of(cam_pos)
+    objects = [o for o in (scene_model or {}).get("objects", [])
+               if isinstance(o, dict)]
+    for actor in (actors or []):
+        if not isinstance(actor, dict):
+            continue
+        ax, _ay, az = _xyz_of(actor.get("start_3d"))
+        actor_distance = math.dist((ax, az), (cx, cz))
+        name = str(actor.get("name") or actor.get("actor_id") or "角色")
+        for obj in objects:
+            ox, _oy, oz = _xyz_of(obj.get("position_3d"))
+            obj_distance = math.dist((ox, oz), (cx, cz))
+            relation = " ".join(str(actor.get(key) or "") for key in (
+                "facing", "facing_start", "facing_end", "occluded_by"))
+            object_name = str(obj.get("name") or "")
+            declared_behind = (
+                object_name in relation
+                and any(word in relation for word in (
+                    "后面", "之后", "后方", "背后", "遮挡", "挡住")))
+            if not declared_behind:
+                continue
+            if obj_distance > actor_distance + near_margin_m:
+                issues.append({
+                    "severity": "warning", "field": "occlusion",
+                    "actor": name, "object": obj.get("name"),
+                    "message": (
+                        f"合同说「{name}」在「{obj.get('name')}」之后,但本镜"
+                        f"机位下 {name} 距镜头 {actor_distance:.1f}米、"
+                        f"{obj.get('name')} 距镜头 {obj_distance:.1f}米——"
+                        "几何上是人在前、物在后,画出来必然穿帮"),
                 })
     return issues

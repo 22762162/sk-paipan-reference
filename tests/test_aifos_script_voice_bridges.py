@@ -9,7 +9,9 @@ from pathlib import Path
 import pytest
 
 from aifos.adapters.claude_script import (
+    _merge_storyboard_shot_repairs,
     _postprocess_and_validate,
+    _storyboard_error_shot_positions,
     extract_json,
     validate_script,
     validate_storyboard,
@@ -197,6 +199,33 @@ def test_extract_json_tolerates_noise():
     assert extract_json('前缀 {"a": 1} 后缀')["a"] == 1
     assert extract_json("{broken} {\"b\": 2}")["b"] == 2
     assert extract_json("没有对象") is None
+
+
+def test_storyboard_repair_targets_only_reported_shots_and_merges():
+    error = (
+        "镜头1的 PROP-A 起止状态变化但缺少 start→end prop_transitions；"
+        "镜头6的 PROP-A 起止状态变化但缺少 start→end prop_transitions")
+    assert _storyboard_error_shot_positions(error, 8) == [1, 6]
+    source = {
+        "episode_title": "袖中官凭",
+        "shots": [
+            {"shot_no": index, "keep": f"source-{index}"}
+            for index in range(1, 9)
+        ],
+    }
+    repaired = {"shots": [
+        {"_position": 1, "shot_no": 1, "fixed": True},
+        {"_position": 6, "shot_no": 6, "fixed": True},
+    ]}
+    merged = _merge_storyboard_shot_repairs(
+        source, repaired, positions=[1, 6])
+    assert merged["shots"][0] == {
+        "shot_no": 1, "fixed": True}
+    assert merged["shots"][5] == {
+        "shot_no": 6, "fixed": True}
+    assert merged["shots"][1] == {
+        "shot_no": 2, "keep": "source-2"}
+    assert source["shots"][0]["keep"] == "source-1"
 
 
 def test_validators():

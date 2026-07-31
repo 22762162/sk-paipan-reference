@@ -2300,6 +2300,10 @@ def build_shot_prompt_contract(
         },
         "composition": composition,
         "scene": scene,
+        # 场景陈设的固定坐标条款(由 blocking 层按三维场景+本镜机位算好)。
+        # 没有它,【场景】只有一句地名,模型每张图重新想象家具在哪——
+        # 「说在纱帐后面却画在镜前」「后面纱帐经常变」就是这么来的。
+        "scene_layout": _text(shot.get("scene_layout")),
         "script_reference": _text(shot.get("script_reference")),
         "era_context": _text(shot.get("era_context")),
         "era_object_constraints": build_era_object_constraints({
@@ -2813,6 +2817,9 @@ def render_shot_prompt(contract, *, mode=None):
             "继承锁定的当前衣着，不继承默认道具；内心发声时宿主闭口，"
             "不画旁白/吐槽字幕。")
     lines.append(f"【场景】{contract.get('scene', '按场景基准图')}。")
+    scene_layout = _text(contract.get("scene_layout"))
+    if scene_layout:
+        lines.append(scene_layout)
     composition = contract.get("composition") or {}
     if composition.get("composition_type") == "over_shoulder_dialogue":
         duties = "；".join(

@@ -133,13 +133,15 @@ PROMPT_ADJUDICATION_SCHEMA = "aifos.prompt-adjudication/v1"
 CONTEXT_FIELD_PRECEDENCE = {
     "user_locked_fact": (
         "identity_references", "reference_manifest", "locked_identity",
-        "user_locked_fields", "manual_revision", "feedback"),
+        "user_locked_fields", "manual_revision", "feedback",
+        "master_state_precedence", "prompt_conflict_resolution"),
     "episode_fact_bible": (
         "story_world", "story_background", "character_background",
         "characters", "identity_lock", "prop_facts", "style", "era"),
     "shot_local_contract": (
         "action", "camera", "location", "start_state", "end_state",
         "composition", "composition_contract", "prompt_contract",
+        "shot_contract",
         "readable_text", "frame_kind", "shot_no", "scene_no",
         "functional_figures", "character_count",
         "initial_character_state", "variant_axis"),
@@ -165,7 +167,8 @@ def prompt_adjudication_clause():
         "policy": (
             "事实并列冲突时禁止靠猜,但必须先按本条裁决,而不是直接阻断:"
             "(a) 上下文中写明「优先级最高/本条优先」的显式裁决条款"
-            "(如 master_state_precedence、text_policy),是平台对该任务的"
+            "(如 master_state_precedence、prompt_conflict_resolution、"
+            "text_policy),是平台对该任务的"
             "既定裁决,直接执行,不算冲突;"
             "(a2) 同一词语的繁体/简体/异体字形(如 縣/县、臺/台)是同一"
             "事实的两种书写,不构成事实冲突,也不算新增或修改文字;执行"

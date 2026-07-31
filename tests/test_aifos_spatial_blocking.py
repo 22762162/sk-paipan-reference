@@ -2,7 +2,7 @@ import math
 from pathlib import Path
 
 from aifos.spatial_blocking import (MIN_ACTOR_SEPARATION,
-                                    MIN_CAMERA_SEPARATION,
+                                    MIN_CAMERA_ACTOR_CLEARANCE_M,
                                     build_character_number_map,
                                     build_spatial_plan,
                                     mark_spatial_reference_requirements,
@@ -74,7 +74,8 @@ def test_group_scene_builds_routes_camera_and_continuity(tmp_path):
     assert first["camera"]["lens_mm"] == 35
     assert first["camera"]["movement"] == "跟"
     assert first["camera"]["moving"]
-    assert first["camera"]["start_3d"]["y"] == 1.55
+    assert first["camera"]["start_3d"]["y"] == \
+        first["camera"]["director_camera"]["height_m"]
     assert first["camera"]["target_3d"]["y"] == 1.25
     assert first["camera"]["horizontal_fov_degrees"] > 0
     assert first["camera"]["vertical_fov_degrees"] > \
@@ -327,10 +328,14 @@ def test_crowded_center_positions_are_spread_and_routes_remain_parseable(
         for right in all_actor_markers[index + 1:]
     )
     assert all(
-        math.dist((camera_point["x"], camera_point["y"]),
-                  (marker[2]["x"], marker[2]["y"])) >= MIN_CAMERA_SEPARATION
-        for camera_point in (block["camera"]["start"], block["camera"]["end"])
-        for marker in all_actor_markers
+        math.dist(
+            (block["camera"][camera_phase]["x"],
+             block["camera"][camera_phase]["z"]),
+            (actor[actor_phase]["x"], actor[actor_phase]["z"]),
+        ) >= MIN_CAMERA_ACTOR_CLEARANCE_M
+        for camera_phase, actor_phase in (
+            ("start_3d", "start_3d"), ("end_3d", "end_3d"))
+        for actor in block["actors"]
     )
     assert all(actor["moving"] and len(actor["route"]) == 2
                and actor["route_direction"] != "静止"

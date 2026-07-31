@@ -30,6 +30,7 @@ canvas.drag{cursor:grabbing}
   background:rgba(16,14,12,.82);letter-spacing:.03em}
 .tag b{font-weight:600}
 .tag.cam{color:var(--gold);border-color:var(--gold-dim)}
+.tag.obj{color:#d8c7a1;border-color:#78684e}
 #hud{position:absolute;top:10px;right:12px;font-size:11px;color:var(--paper-dim);
   background:rgba(16,14,12,.78);padding:5px 9px;border:1px solid var(--line);
   border-radius:3px;font-variant-numeric:tabular-nums;pointer-events:none}
@@ -44,6 +45,7 @@ button{font:inherit;font-size:12px;color:var(--paper);background:transparent;
   border:1px solid var(--line);border-radius:3px;padding:4px 10px;cursor:pointer;
   transition:border-color .18s,background .18s,color .18s}
 button:hover{border-color:var(--gold-dim)}
+button:disabled{opacity:.35;cursor:default}
 button:focus-visible{outline:2px solid var(--gold);outline-offset:1px}
 button.on{color:var(--ink);background:var(--gold);border-color:var(--gold);
   font-weight:600}
@@ -74,6 +76,8 @@ button.ghost.on{color:var(--gold);background:transparent;
       <button id="tPath" class="ghost on">路线</button>
       <button id="tFrus" class="ghost on">视锥</button>
       <button id="tAxis" class="ghost on">轴线</button>
+      <button id="tControl" class="ghost on"
+        aria-pressed="true">控制标注</button>
     </div>
   </footer>
 </div>
@@ -161,8 +165,8 @@ const panoTex=gl.createTexture();let panoReady=false;
 // ---- 状态 ----
 let DATA=null,SHOT=null,SCENE=null;
 let orbit={yaw:0.6,pitch:0.85,dist:11,target:[0,1,0]},mode="orbit";
-const show={pano:true,path:true,frus:true,axis:true};
-let geo={lines:null,lineCount:0,pts:null,ptCount:0};
+const show={pano:true,path:true,frus:true,axis:true,control:true};
+let geo={solids:null,solidCount:0,lines:null,lineCount:0,pts:null,ptCount:0};
 
 function hex(c,fb=[0.85,0.68,0.35]){
  if(typeof c!=="string")return fb;
@@ -170,21 +174,67 @@ function hex(c,fb=[0.85,0.68,0.35]){
  return [parseInt(m.slice(0,2),16)/255,parseInt(m.slice(2,4),16)/255,
          parseInt(m.slice(4,6),16)/255]}
 
+function activeSceneModel(){
+ const embedded=SCENE&&SCENE.scene_model;
+ if(embedded&&Array.isArray(embedded.objects)&&embedded.objects.length)
+  return embedded;
+ const models=(DATA&&DATA.scene_models)||{};
+ return models[(SCENE&&SCENE.location)||""]||embedded||{objects:[]}}
+
 function buildGeometry(){
- const L=[],PT=[];
+ const L=[],PT=[],SOLID=[];
  const push=(a,b,c)=>{L.push(a[0],a[1],a[2],c[0],c[1],c[2],
                              b[0],b[1],b[2],c[0],c[1],c[2])};
- const w=(SCENE&&SCENE.world)||{};
+ const tri=(a,b,c,col)=>{for(const p of [a,b,c])
+  SOLID.push(p[0],p[1],p[2],col[0],col[1],col[2])};
+ const face=(a,b,c,d,col)=>{tri(a,b,c,col);tri(a,c,d,col)};
+ const modelRoom=activeSceneModel().room||{};
+ const w=Object.assign({},modelRoom,(SCENE&&SCENE.world)||{});
  const fw=Number(w.floor_width_m)||10,fd=Number(w.floor_depth_m)||7;
  const grid=[.22,.19,.16],gridMain=[.34,.29,.23];
  for(let x=-fw/2;x<=fw/2+1e-6;x+=1){
   push([x,0.002,-fd/2],[x,0.002,fd/2],Math.abs(x)<1e-6?gridMain:grid)}
  for(let z=-fd/2;z<=fd/2+1e-6;z+=1){
   push([-fw/2,0.002,z],[fw/2,0.002,z],Math.abs(z)<1e-6?gridMain:grid)}
+ // 家具/道具是场景几何，不依赖某个镜头。position_3d.y 是盒体底面，
+ // width/height/depth 全部使用真实米制；rotation_y_deg 绕 Y 轴旋转。
+ const objectPalette={
+  furniture:[.74,.56,.19],prop:[.78,.38,.16],opening:[.28,.58,.73],
+  light:[.88,.70,.31],decor:[.48,.43,.36]};
+ const shade=(c,k)=>c.map(v=>Math.min(1,v*k));
+ for(const obj of (activeSceneModel().objects||[])){
+  if(!obj||typeof obj!=="object")continue;
+  const p=obj.position_3d||{},x=Number(p.x)||0,y=Number(p.y)||0,z=Number(p.z)||0,
+        width=Math.max(.15,Number(obj.width_m??obj.width)||.6),
+        height=Math.max(.15,Number(obj.height_m??obj.height)||.8),
+        depth=Math.max(.15,Number(obj.depth_m??obj.depth)||
+                       Math.min(width*.55,.8)),
+        yaw=(Number(obj.rotation_y_deg)||0)*Math.PI/180,
+        co=Math.cos(yaw),si=Math.sin(yaw),
+        col=objectPalette[obj.category]||[.47,.43,.38];
+  // 右手系 Y-up：正朝向从 +Z 转向 +X，与后端碰撞足迹完全同源。
+  const corner=(lx,yy,lz)=>[x+lx*co+lz*si,yy,z-lx*si+lz*co];
+  const v=[
+   corner(-width/2,y,-depth/2),corner(width/2,y,-depth/2),
+   corner(width/2,y,depth/2),corner(-width/2,y,depth/2),
+   corner(-width/2,y+height,-depth/2),
+   corner(width/2,y+height,-depth/2),
+   corner(width/2,y+height,depth/2),
+   corner(-width/2,y+height,depth/2)];
+  face(v[0],v[1],v[2],v[3],shade(col,.56));
+  face(v[4],v[7],v[6],v[5],shade(col,1.12));
+  face(v[0],v[4],v[5],v[1],shade(col,.82));
+  face(v[1],v[5],v[6],v[2],shade(col,.7));
+  face(v[2],v[6],v[7],v[3],shade(col,.94));
+  face(v[3],v[7],v[4],v[0],shade(col,.76));
+  const edge=shade(col,1.28);
+  for(const [a,b] of [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],
+                       [6,7],[7,4],[0,4],[1,5],[2,6],[3,7]])
+   push(v[a],v[b],edge)}
  if(!SHOT)return finish();
  const cam=SHOT.camera||{},acts=SHOT.actors||[];
  // 180° 轴线
- if(show.axis&&SHOT.axis&&SHOT.axis.a_3d&&SHOT.axis.b_3d){
+ if(show.control&&show.axis&&SHOT.axis&&SHOT.axis.a_3d&&SHOT.axis.b_3d){
   const a=P(SHOT.axis.a_3d),b=P(SHOT.axis.b_3d),c=[.55,.42,.2];
   for(let t=0;t<1;t+=0.05){
    const p=V.add(a,V.scale(V.sub(b,a),t)),
@@ -193,41 +243,43 @@ function buildGeometry(){
  // 人物:竖杆 + 底盘 + 朝向箭 + 行动路线
  // 火柴人按真人比例画(总高=height_m):大小即定位刻度,
  // 一根细杆读不出「人有多大」,在全景房间里就定不准位。
- function stickman(x,z,h,col){
-  const hip=0.50*h, shoulder=0.80*h, headC=0.90*h, headR=0.09*h;
+ function stickman(x,y,z,h,col){
+  const hip=y+0.50*h,shoulder=y+0.80*h,
+        headC=y+0.90*h,headR=0.09*h;
   push([x,hip,z],[x,shoulder,z],col);                    // 躯干
   for(let i=0;i<14;i++){const t0=i/14*Math.PI*2,t1=(i+1)/14*Math.PI*2;
    push([x+headR*Math.sin(t0),headC+headR*Math.cos(t0),z],
         [x+headR*Math.sin(t1),headC+headR*Math.cos(t1),z],col);
    push([x,headC+headR*Math.cos(t0),z+headR*Math.sin(t0)],
         [x,headC+headR*Math.cos(t1),z+headR*Math.sin(t1)],col)}
-  const armY=shoulder-0.02*h, handY=0.42*h, spread=0.16*h;
+  const armY=shoulder-0.02*h,handY=y+0.42*h,spread=0.16*h;
   push([x,armY,z],[x-spread,handY,z],col);               // 双臂
   push([x,armY,z],[x+spread,handY,z],col);
   const footSpread=0.10*h;                               // 双腿
-  push([x,hip,z],[x-footSpread,0,z],col);
-  push([x,hip,z],[x+footSpread,0,z],col);
+  push([x,hip,z],[x-footSpread,y,z],col);
+  push([x,hip,z],[x+footSpread,y,z],col);
   const r=0.30;                                          // 站位底盘
   for(let i=0;i<16;i++){const t0=i/16*Math.PI*2,t1=(i+1)/16*Math.PI*2;
-   push([x+r*Math.cos(t0),0.01,z+r*Math.sin(t0)],
-        [x+r*Math.cos(t1),0.01,z+r*Math.sin(t1)],col)}}
+   push([x+r*Math.cos(t0),y+.01,z+r*Math.sin(t0)],
+        [x+r*Math.cos(t1),y+.01,z+r*Math.sin(t1)],col)}}
  acts.forEach(a=>{
   const col=hex(a.color),s=P(a.start_3d),e=P(a.end_3d),
-        h=Number(a.height_m)||1.7;
-  stickman(s[0],s[2],h,col);
-  PT.push(s[0],0.90*h,s[2],col[0],col[1],col[2]);
-  if(show.path&&(a.moving||V.len(V.sub(e,s))>0.05)){
+        startH=Number(a.start_height_m||a.height_m)||1.7,
+        endH=Number(a.end_height_m||a.height_m)||startH;
+  stickman(s[0],s[1],s[2],startH,col);
+  PT.push(s[0],s[1]+.90*startH,s[2],col[0],col[1],col[2]);
+  if(show.control&&show.path&&(a.moving||V.len(V.sub(e,s))>0.05)){
    const dim=V.scale(col,0.62);
-   push([s[0],0.05,s[2]],[e[0],0.05,e[2]],dim);
+   push([s[0],s[1]+.05,s[2]],[e[0],e[1]+.05,e[2]],dim);
    for(let i=0;i<12;i++){const t0=i/12*Math.PI*2,t1=(i+1)/12*Math.PI*2;
-    push([e[0]+0.18*Math.cos(t0),0.03,e[2]+0.18*Math.sin(t0)],
-         [e[0]+0.18*Math.cos(t1),0.03,e[2]+0.18*Math.sin(t1)],dim)}
-   stickman(e[0],e[2],h,dim)}});
+    push([e[0]+0.18*Math.cos(t0),e[1]+.03,e[2]+0.18*Math.sin(t0)],
+         [e[0]+0.18*Math.cos(t1),e[1]+.03,e[2]+0.18*Math.sin(t1)],dim)}
+   stickman(e[0],e[1],e[2],endH,dim)}});
  // 机位:位置柱 + 视锥 + 瞄准线
  const cs=P(cam.start_3d,1.55),tg=P(cam.target_3d||cam.target_start_3d,1.2);
  const camCol=[.85,.64,.26];
  push([cs[0],0,cs[2]],[cs[0],cs[1],cs[2]],V.scale(camCol,0.5));
- if(show.frus){
+ if(show.control&&show.frus){
   const fwd=V.norm(V.sub(tg,cs)),up0=[0,1,0],
         right=V.norm(V.cross(fwd,up0)),up=V.cross(right,fwd),
         hf=(Number(cam.horizontal_fov_degrees||cam.fov_degrees)||46)*Math.PI/180,
@@ -248,6 +300,9 @@ function buildGeometry(){
    push(p,q,dim)}}
  PT.push(cs[0],cs[1],cs[2],camCol[0],camCol[1],camCol[2]);
  function finish(){
+  for(const old of [geo.solids,geo.lines,geo.pts])
+   if(old)gl.deleteBuffer(old);
+  geo.solids=buffer(SOLID);geo.solidCount=SOLID.length/6;
   geo.lines=buffer(L);geo.lineCount=L.length/6;
   geo.pts=buffer(PT);geo.ptCount=PT.length/6;return geo}
  return finish()}
@@ -276,24 +331,32 @@ function project(p,mvp,w,h){
 
 function drawLabels(mvp){
  labels.innerHTML="";
- if(!SHOT)return;
+ if(!show.control||!SHOT)return;
  const w=cv.clientWidth,h=cv.clientHeight;
+ const escapeHtml=value=>String(value??"").replace(/[&<>"']/g,ch=>({
+  "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
  const add=(p,txt,cls)=>{const s=project(p,mvp,w,h);if(!s)return;
   if(s[0]<-80||s[0]>w+80||s[1]<-40||s[1]>h+40)return;
   const d=document.createElement("div");d.className="tag"+(cls?" "+cls:"");
   d.innerHTML=txt;d.style.left=s[0]+"px";d.style.top=(s[1]-6)+"px";
   labels.appendChild(d)};
  (SHOT.actors||[]).forEach(a=>{
-  const s=P(a.start_3d),h2=Number(a.height_m)||1.7;
+  const s=P(a.start_3d),h2=Number(a.start_height_m||a.height_m)||1.7;
   const raw=String(a.facing||"");
   const facing=raw.length>20?raw.slice(0,20)+"…":raw;
-  add([s[0],h2+0.16,s[2]],
-      `<b>${a.display_label||a.name||"人物"}</b>`+
-      (facing?` <span style="color:#9a8d7b">${facing}</span>`:""))});
+  add([s[0],s[1]+h2+0.16,s[2]],
+      `<b>${escapeHtml(a.display_label||a.name||"人物")}</b>`+
+      (facing?` <span style="color:#9a8d7b">${escapeHtml(facing)}</span>`:""))});
  const cam=SHOT.camera||{},cs=P(cam.start_3d,1.55);
  add([cs[0],cs[1]+0.22,cs[2]],
      `<b>机位</b> ${cam.lens_mm?cam.lens_mm+"mm ":""}`+
-     `${(Number(cam.fov_degrees)||0).toFixed(0)}°`,"cam")}
+     `${(Number(cam.fov_degrees)||0).toFixed(0)}°`,"cam");
+ for(const obj of (activeSceneModel().objects||[])){
+  if(!obj||typeof obj!=="object")continue;
+  const p=P(obj.position_3d),height=Math.max(
+    .15,Number(obj.height_m??obj.height)||.8);
+  add([p[0],p[1]+height+.08,p[2]],
+      `<b>${escapeHtml(obj.name||"场景物体")}</b>`,"obj")}}
 
 function draw(){
  if(!gl)return;
@@ -321,12 +384,23 @@ function draw(){
    if(V.dot(f.inward,toEye)<=0.02)continue;
    bindAttr(pPano,"pos",f.buf,3,3,0);
    gl.drawArrays(gl.TRIANGLES,0,f.count)}}
+ if(geo.solidCount){
+  gl.useProgram(pLine);
+  gl.uniformMatrix4fv(gl.getUniformLocation(pLine,"mvp"),false,new Float32Array(mvp));
+  gl.uniform1f(gl.getUniformLocation(pLine,"alpha"),0.42);
+  bindAttr(pLine,"pos",geo.solids,3,6,0);
+  bindAttr(pLine,"col",geo.solids,3,6,3);
+  gl.enable(gl.POLYGON_OFFSET_FILL);gl.polygonOffset(1,1);
+  gl.drawArrays(gl.TRIANGLES,0,geo.solidCount);
+  gl.disable(gl.POLYGON_OFFSET_FILL)}
  if(geo.lineCount){
   gl.useProgram(pLine);
   gl.uniformMatrix4fv(gl.getUniformLocation(pLine,"mvp"),false,new Float32Array(mvp));
   gl.uniform1f(gl.getUniformLocation(pLine,"alpha"),0.95);
   bindAttr(pLine,"pos",geo.lines,3,6,0);bindAttr(pLine,"col",geo.lines,3,6,3);
+  gl.depthFunc(gl.LEQUAL);
   gl.drawArrays(gl.LINES,0,geo.lineCount);
+  gl.depthFunc(gl.LESS);
   if(geo.ptCount){bindAttr(pLine,"pos",geo.pts,3,6,0);
    bindAttr(pLine,"col",geo.pts,3,6,3);
    gl.drawArrays(gl.POINTS,0,geo.ptCount)}}
@@ -359,6 +433,17 @@ document.getElementById("enter").onclick=()=>setMode("shot");
  .forEach(([id,key])=>{const b=document.getElementById(id);
   b.onclick=()=>{show[key]=!show[key];b.classList.toggle("on",show[key]);
    buildGeometry()}});
+document.getElementById("tControl").onclick=()=>{
+ show.control=!show.control;
+ const b=document.getElementById("tControl");
+ b.classList.toggle("on",show.control);
+ b.setAttribute("aria-pressed",String(show.control));
+ labels.style.display=show.control?"":"none";
+ for(const [id,key] of [["tPath","path"],["tFrus","frus"],["tAxis","axis"]]){
+  const item=document.getElementById(id);
+  item.disabled=!show.control;
+  item.classList.toggle("on",show.control&&show[key])}
+ buildGeometry()};
 
 function selectShot(no){
  const idx=(DATA.blocking||{}).shot_index||{};
@@ -374,7 +459,8 @@ function selectShot(no){
  document.getElementById("meta").textContent =
   `${DATA.project_title} 第${DATA.episode_number}集 · 镜${no}` +
   (act.camera?` · ${act.camera}`:"") + (act.action?` — ${act.action}`:"");
- const w=(SCENE&&SCENE.world)||{};
+ const modelRoom=activeSceneModel().room||{};
+ const w=Object.assign({},modelRoom,(SCENE&&SCENE.world)||{});
  buildRoomBox(Number(w.floor_width_m)||10,Number(w.floor_depth_m)||7,
               Number(w.ceiling_height_m)||4.2);
  if(SHOT){const cam=SHOT.camera||{},t=P(cam.target_3d,1.2);
