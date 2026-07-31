@@ -2143,8 +2143,9 @@ SHOT_REPAIR_PROMPT = """你是本剧的分镜导演。镜头{shot_no}的提示�
 - 只允许修改 camera(景别/机位/构图方式)和 description 中的取景表述;
 - 景别必须能真实容纳镜头宣称的全部可见人物与画面区域;若剧情本意是
   只看局部,则在 description 里明确写出只框入哪些人物/道具、其余出画;
-- 不得增删人物、道具,不得改变任何人物状态/朝向/位置等剧情事实,
+- 不得增删人物、道具,不得改变任何人物状态(动作/生死/情绪)剧情事实,
   不得改动对白、事件(event_id/phase)、prop_registry;
+- {staging_rule}
 - {duration_rule}
 - camera 保持与原镜头相同的结构:原来是字符串就输出字符串,
   原来是对象就输出同结构的完整对象。
@@ -2161,6 +2162,16 @@ SHOT_REPAIR_PROMPT = """你是本剧的分镜导演。镜头{shot_no}的提示�
 # 时长默认不许动(悄悄改时长=悄悄改叙事节奏);只有熔断原因本身就是
 # 时长违规时,导演层才授权本次修复动 duration——那不是"静默拉长",
 # 而是编剧带着叙事意识回分镜层改时长,并把表演内容填满新时长。
+# 走位默认锁死(站位/朝向/路线是空间求解的输入事实);只有预检/预演
+# 判定的问题本身就是走位类(路径穿模/跨镜传送/交叉相撞)时,导演层才
+# 授权本次修复在 description 里改写调度——绕障、错时、衔接站位,
+# 不是改剧情。
+STAGING_RULE_LOCKED = "不得改变任何人物朝向、站位与行走路线;"
+STAGING_RULE_ALLOWED = (
+    "本次熔断包含走位/路径问题,你被授权且必须在 description 里改写"
+    "站位与行走路线:绕开写明的障碍物、错开两人相遇时机、消除跨镜"
+    "瞬移(本镜开始站位必须衔接上一镜结束站位或写明位移过程)。"
+    "只改调度,不改剧情语义(谁在场/做什么/生死);")
 DURATION_RULE_LOCKED = "不得改动时长(duration);"
 DURATION_RULE_ALLOWED = (
     "本次熔断包含时长违规,你被授权且必须把 duration 修到合法档内"
@@ -2368,7 +2379,11 @@ def _build_prompt_body(capability, payload):
             duration_rule=(
                 DURATION_RULE_ALLOWED
                 if payload.get("allow_duration_change")
-                else DURATION_RULE_LOCKED))
+                else DURATION_RULE_LOCKED),
+            staging_rule=(
+                STAGING_RULE_ALLOWED
+                if payload.get("allow_staging_change")
+                else STAGING_RULE_LOCKED))
     if capability == "script" and payload.get("story_analysis"):
         return STORY_ANALYSIS_PROMPT.format(
             style=(payload.get("style")

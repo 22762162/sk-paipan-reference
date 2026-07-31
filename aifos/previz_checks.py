@@ -111,6 +111,26 @@ def _issue(shot_no, scene_no, kind, detail):
             "kind": kind, "severity": "warn", "detail": detail}
 
 
+def describe_for_repair(report, shot_no):
+    """某镜的时间维度问题 → 交给编剧的修复理由(带改法指引)。"""
+    items = [item for item in (report or {}).get("issues") or []
+             if str(item.get("shot_no")) == str(shot_no)]
+    return "；".join(str(item.get("detail") or "") for item in items)
+
+
+def shots_with_issues(report, limit=6):
+    """按问题数降序给出需要修的镜头号(限量,避免一轮改太多)。"""
+    counts = {}
+    for item in (report or {}).get("issues") or []:
+        try:
+            counts[int(item.get("shot_no"))] = counts.get(
+                int(item.get("shot_no")), 0) + 1
+        except (TypeError, ValueError):
+            continue
+    ranked = sorted(counts.items(), key=lambda row: (-row[1], row[0]))
+    return [shot_no for shot_no, _count in ranked[:limit]]
+
+
 def previz_report(blocking, storyboard=None, scene_models=None):
     """时间维度连贯性报告 {"schema","issues":[...],"shots":N}。
 

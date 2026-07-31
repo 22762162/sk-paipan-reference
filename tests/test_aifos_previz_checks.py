@@ -148,3 +148,21 @@ class ReportShapeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RepairBridgeTest(unittest.TestCase):
+    """previz 报告 → 就地修桥接:排序限量 + 人话理由。"""
+
+    def test_shots_ranked_and_described(self):
+        from aifos.previz_checks import (describe_for_repair,
+                                         shots_with_issues)
+        report = {"issues": [
+            {"shot_no": 5, "kind": "teleport", "detail": "甲瞬移2米"},
+            {"shot_no": 2, "kind": "path_collision", "detail": "乙穿过长桌"},
+            {"shot_no": 5, "kind": "crossing", "detail": "甲乙路径交汇"},
+        ]}
+        self.assertEqual(shots_with_issues(report), [5, 2])
+        text = describe_for_repair(report, 5)
+        self.assertIn("瞬移", text)
+        self.assertIn("交汇", text)
+        self.assertEqual(describe_for_repair(report, 99), "")

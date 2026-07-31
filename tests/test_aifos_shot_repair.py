@@ -181,3 +181,21 @@ class ExplicitAgeRangeTest(unittest.TestCase):
         self.assertEqual(
             unresolved_identity_fields(
                 {"gender": "男", "age_range": "25-30"}), [])
+
+
+class StagingRepairTest(unittest.TestCase):
+    """走位默认锁死;previz 判定走位类问题时授权改写调度,不许动剧情。"""
+
+    def test_prompt_switches_staging_rule_by_authorization(self):
+        base = {"shot_repair": True, "shot": SHOT, "location": "废茶棚",
+                "style": "写实",
+                "blocking_reason": "林川的移动路径在44%处穿过长桌"}
+        locked = build_prompt("script", base)
+        self.assertIn("不得改变任何人物朝向、站位与行走路线", locked)
+        allowed = build_prompt(
+            "script", {**base, "allow_staging_change": True})
+        self.assertIn("被授权且必须在 description 里改写", allowed)
+        self.assertIn("绕开写明的障碍物", allowed)
+        self.assertIn("不改剧情语义", allowed)
+        # 两种授权互不串线:走位授权不解锁时长
+        self.assertIn("不得改动时长", allowed)

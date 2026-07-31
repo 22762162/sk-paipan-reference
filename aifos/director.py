@@ -8361,13 +8361,129 @@ class Director:
                else ";剩余项留给下游门禁,不阻断本阶段"))
         return {"issues": again["issues"], "repaired": repaired}
 
+    def _previz_scene_models(self, ctx):
+        """当前 blocking 各场景的最新有效三维模型 {location: model}。"""
+        models = {}
+        for scene in (ctx.get("blocking") or {}).get("scenes") or []:
+            location = str(scene.get("location") or "").strip()
+            if not location or location in models:
+                continue
+            model, _row, stale, _reason = self._scene_model_state(
+                ctx["project"]["id"], location)
+            if model is not None and not stale:
+                models[location] = model
+        return models
+
+    def _preflight_temporal_previz(self, ctx):
+        """时间维度(previz)预检 + 就地修:过程问题不留到成片才发现。
+
+        端点碰撞已由场景物理的确定性微调兜住;这里查的是**过程**——
+        路径中途穿模、跨镜传送、双人交叉、相机穿模。这些是走位类调度
+        事实,只有编剧能带着叙事改,授权本次修复改写 description 里的
+        站位与路线;修后重建空间复检一次,仍有问题记 warning 不阻断
+        (previz 页与生产同源可见)。"""
+        from .previz_checks import (describe_for_repair, previz_report,
+                                    shots_with_issues)
+        if not self.config.get(
+                "defaults", "storyboard_preflight", default=True):
+            return {"issues": [], "repaired": 0}
+        models = self._previz_scene_models(ctx)
+        report = previz_report(
+            ctx.get("blocking"), ctx.get("storyboard"), models)
+        blocking = ctx.get("blocking") or {}
+        blocking.setdefault("validation", {})[
+            "previz_issues"] = report["issues"]
+        if report["passed"]:
+            return {"issues": [], "repaired": 0}
+        state = (ctx.get("storyboard") or {}).get(
+            "previz_repair_state") or {}
+        signature = self._stable_hash(report["issues"])
+        if state.get("no_progress_signature") == signature:
+            self.log.info(
+                "director",
+                "时间维度问题与上次无进展复检相同,跳过重复修复,"
+                "交 previz 页人工处理")
+            return {"issues": report["issues"], "repaired": 0,
+                    "repair_skipped": "unchanged_no_progress"}
+        shots = {int(s.get("shot_no", -1)): s
+                 for s in (ctx["storyboard"].get("shots") or [])
+                 if isinstance(s, dict)}
+        targets = shots_with_issues(report)
+        self.log.warn(
+            "director",
+            f"动态预演查出 {len(report['issues'])} 条时间维度问题"
+            f"(传送/穿模/交叉/相机),交编剧改走位 {len(targets)} 镜: "
+            + "、".join(f"镜头{no}" for no in targets))
+        repaired = 0
+        for shot_no in targets:
+            shot = shots.get(int(shot_no))
+            if shot is None:
+                continue
+            try:
+                summary = self._repair_shot_for_shootability(
+                    ctx, shot, describe_for_repair(report, shot_no),
+                    allow_staging_change=True)
+            except Exception as exc:
+                self.log.warn(
+                    "director",
+                    f"镜头{shot_no}走位就地修失败(不阻断): "
+                    f"{str(exc)[:200]}")
+                continue
+            if summary:
+                repaired += 1
+                self.log.info(
+                    "director",
+                    f"镜头{shot_no}已按预演问题改走位: {summary[:160]}")
+        if not repaired:
+            return {"issues": report["issues"], "repaired": 0}
+        # 走位改了 → 空间重解 → 复检一次;结果与 previz 页同源
+        self.projects.save_document(
+            ctx["episode"]["id"], "storyboard", ctx["storyboard"])
+        rules = ctx["production_profile"].get("rules", {}).get(
+            "storyboard", {})
+        blocking = build_spatial_plan(
+            ctx["script"], ctx["storyboard"], ctx["continuity"],
+            group_threshold=int(rules.get(
+                "spatial_blocking_required_for_group", 3)))
+        mark_spatial_reference_requirements(blocking)
+        self._attach_scene_physics(
+            ctx, blocking, repair_actor_collisions=True)
+        write_spatial_svgs(blocking, ctx["out_root"] / "blocking")
+        write_spatial_reference_pngs(
+            blocking, ctx["out_root"] / "blocking" / "seedance")
+        again = previz_report(blocking, ctx.get("storyboard"), models)
+        blocking.setdefault("validation", {})[
+            "previz_issues"] = again["issues"]
+        self.projects.save_document(
+            ctx["episode"]["id"], "blocking", blocking)
+        ctx["blocking"] = blocking
+        before, after = len(report["issues"]), len(again["issues"])
+        if after >= before:
+            ctx["storyboard"]["previz_repair_state"] = {
+                "no_progress_signature": self._stable_hash(again["issues"]),
+                "issue_count": after,
+                "updated_at": now(),
+            }
+        else:
+            ctx["storyboard"].pop("previz_repair_state", None)
+        self.projects.save_document(
+            ctx["episode"]["id"], "storyboard", ctx["storyboard"])
+        self.log.info(
+            "director",
+            f"预演问题就地修复检: {before} → {after} 条"
+            + ("(仍有残留,previz 页可逐条查看)" if after else ",全清"))
+        return {"issues": again["issues"], "repaired": repaired}
+
     def _repair_shot_for_shootability(self, ctx, shot, reason,
-                                      allow_duration_change=False):
+                                      allow_duration_change=False,
+                                      allow_staging_change=False):
         """交编剧按可拍性问题改镜头(复用 shot_repair 的修复边界)。
 
         时长默认锁死;只有预检问题本身就是时长违规(duration_short/
         duration_long)时才授权本次修复动 duration——编剧必须把补充或
-        压缩的表演写进 description,不是只改数字。"""
+        压缩的表演写进 description,不是只改数字。走位同理:只有
+        previz 时间维度判定的走位类问题(路径穿模/跨镜传送/交叉相撞)
+        才授权改写 description 里的站位与行走路线。"""
         result = self._call(ctx, "script", {
             "shot_repair": True,
             "project_title": ctx["project"]["title"],
@@ -8375,6 +8491,7 @@ class Director:
             "shot": shot,
             "location": self._shot_location(ctx.get("script"), shot),
             "allow_duration_change": bool(allow_duration_change),
+            "allow_staging_change": bool(allow_staging_change),
             "blocking_reason": (
                 "分镜可拍性预检不通过(这些问题会在出图阶段必然熔断或"
                 "产出对不上的画面,必须在分镜层解决):" + str(reason)[:1500]),
@@ -8447,11 +8564,14 @@ class Director:
                 })
         ctx["blocking"] = blocking
         preflight = self._preflight_storyboard_shootability(ctx)
+        temporal = self._preflight_temporal_previz(ctx)
         return {
             "version": version,
             "reused": reused,
             "shootability_issues": len(preflight.get("issues") or []),
             "shootability_repaired": preflight.get("repaired", 0),
+            "previz_issues": len(temporal.get("issues") or []),
+            "previz_repaired": temporal.get("repaired", 0),
             "scenes": len(blocking.get("scenes", [])),
             "required_scenes": blocking.get("summary", {}).get(
                 "required_scenes", 0),
