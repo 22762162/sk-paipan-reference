@@ -466,6 +466,80 @@ function showHistoryDeleteDialog(target, onDeleted = null) {
 }
 
 /* ================= 制作标准中心 ================= */
+
+/* AI导演知识库:异步取 /api/director/knowledge,渲染成可浏览的手册。
+   数据直接来自运行时词典模块——这里展示的就是 AI 导演实际执行的。 */
+function renderAiDirectorKnowledge() {
+  queueMicrotask(loadAiDirectorKnowledge);
+  return `<div id="ai-director-knowledge" class="ai-dk">
+    <div class="dim">正在读取运行时词典…</div></div>`;
+}
+
+async function loadAiDirectorKnowledge() {
+  const host = document.getElementById("ai-director-knowledge");
+  if (!host) return;
+  let k;
+  try { k = await api("/api/director/knowledge"); }
+  catch (e) { host.innerHTML = `<div class="dim">读取失败:${esc(e.message)}</div>`; return; }
+  const dict = (title, obj, open) => `<details class="ai-dk-block"${open ? " open" : ""}>
+    <summary>${esc(title)} <span class="dim">${Object.keys(obj).length} 条</span></summary>
+    <table class="ai-dk-table">${Object.entries(obj).map(([term, rule]) =>
+      `<tr><th>${esc(term)}</th><td>${esc(String(rule))}</td></tr>`).join("")}
+    </table></details>`;
+  const cameraBlocks = Object.entries(k.camera || {}).map(
+    ([dim, table]) => dict(`镜头语言 · ${dim}`, table)).join("");
+  const capacity = `<details class="ai-dk-block"><summary>景别容量物理
+    <span class="dim">AI导演不许违反</span></summary>
+    <table class="ai-dk-table">${Object.entries(k.capacity || {}).map(
+      ([scale, n]) => `<tr><th>${esc(scale)}</th><td>最多完整容纳 ${n} 人</td></tr>`).join("")}
+      <tr><th>全景/远景/大远景</th><td>不设限</td></tr></table></details>`;
+  const lighting = `<details class="ai-dk-block">
+    <summary>光影语法 <span class="dim">${Object.keys((k.lighting || {}).styles || {}).length} 种布光 + 光质附加</span></summary>
+    <table class="ai-dk-table">${Object.entries((k.lighting || {}).styles || {}).map(
+      ([key, s]) => `<tr><th>${esc(s.label)}<br><small class="dim">${esc(key)}</small></th>
+        <td>${esc(s.clause)}</td></tr>`).join("")}
+    ${Object.entries((k.lighting || {}).extras || {}).map(([name, clause]) =>
+      `<tr><th>${esc(name)}</th><td>${esc(clause)}</td></tr>`).join("")}
+    <tr><th>负面控制</th><td>${esc((k.lighting || {}).negative || "")}</td></tr>
+    </table></details>`;
+  const genres = `<details class="ai-dk-block" open>
+    <summary>题材视听基调盘 <span class="dim">${Object.keys(k.genres || {}).length} 套</span></summary>
+    <div class="ai-dk-genres">${Object.values(k.genres || {}).map((g) => `
+      <article><h4>${esc(g.label)}</h4>
+        <p>${esc(g.grammar)}</p>
+        <p class="dim">默认布光:${esc((((k.lighting || {}).styles || {})[g.style] || {}).label || g.style)}
+          ${Object.keys(g.camera || {}).length ? " · 镜头倾向:" + Object.entries(g.camera)
+            .map(([d, v]) => `${d}=${v}`).join("、") : ""}</p>
+        <p class="dim">触发词:${(g.tokens || []).join("、")}</p>
+      </article>`).join("")}</div></details>`;
+  const spatial = `<details class="ai-dk-block"><summary>空间语言
+    <span class="dim">3D调度翻译成可核验文字</span></summary>
+    <table class="ai-dk-table">
+      <tr><th>画面分区</th><td>${((k.spatial || {}).screen_zones || []).map((z) => z.label).join(" | ")}</td></tr>
+      <tr><th>被摄距离→取景档</th><td>${((k.spatial || {}).distance_framing || []).map(
+        (b) => `${b.label}:${b.range[0]}~${b.range[1] == null ? "∞" : b.range[1]}米`).join(" | ")}</td></tr>
+      ${((k.spatial || {}).clauses || []).map((c) => {
+        const parts = String(c).split(":");
+        return `<tr><th>${esc(parts[0])}</th><td>${esc(parts.slice(1).join(":"))}</td></tr>`;
+      }).join("")}
+    </table></details>`;
+  const realism = `<details class="ai-dk-block"><summary>真实感层
+    <span class="dim">写实/半写实画风启用</span></summary>
+    <table class="ai-dk-table">
+      <tr><th>正向判据</th><td>${esc((k.realism || {}).clause || "")}</td></tr>
+      <tr><th>负面控制</th><td>${esc((k.realism || {}).negative || "")}</td></tr>
+      <tr><th>启用画风</th><td>${((k.realism || {}).enabled_styles || []).join("、")}</td></tr>
+      <tr><th>跳过画风</th><td>${((k.realism || {}).disabled_styles || []).join("、")}</td></tr>
+    </table></details>`;
+  host.innerHTML = `
+    <p class="ai-dk-note">📌 ${esc(k.source_note || "")}</p>
+    <details class="ai-dk-block" open><summary>导演准则
+      <span class="dim">${(k.principles || []).length} 条,逐条写进 AI 导演提示词</span></summary>
+      <ol class="ai-dk-principles">${(k.principles || []).map(
+        (p) => `<li>${esc(p)}</li>`).join("")}</ol></details>
+    ${genres}${lighting}${cameraBlocks}${capacity}${spatial}${realism}`;
+}
+
 const STANDARD_SECTIONS = [
   {
     id: "production", label: "基础生产", icon: "01",
@@ -619,6 +693,9 @@ const STANDARD_SECTIONS = [
       { path: "rules.delivery.archive_standard_snapshot", label: "成品包归档标准快照", type: "boolean" },
     ],
   },
+  { id: "ai_director", label: "AI导演知识库", icon: "🤖",
+    blurb: "AI导演审片时的全部专业能力——直接读取运行时词典,所见即所用。",
+    fields: [] },
   { id: "gates", label: "门禁质检", icon: "07", blurb: "系统永久硬门不可关闭；镜头语言和表演启发只提示、不阻断。", fields: [] },
   { id: "camera", label: "镜头词库", icon: "08", blurb: "统一摄影词汇，避免模型收到互相冲突或不存在的运镜指令。", fields: [
     { path: "rules.camera_library.shot_scales", label: "景别词库", type: "list" },
@@ -815,6 +892,7 @@ async function renderStandards(sectionId) {
       <p>${esc(source.principle || "先完成五维分镜和硬门校验，再进入关键帧与 Seedance 生产。")}</p>
     </article>` : "";
   const content = section.id === "gates" ? renderGatesEditor()
+    : section.id === "ai_director" ? renderAiDirectorKnowledge()
     : section.id === "history" ? renderVersionHistory()
     : `${skillManifest}<div class="standard-fields">${section.fields.map(renderStandardField).join("")}</div>`;
   app.innerHTML = `<div class="standards-page">

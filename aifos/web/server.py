@@ -2443,6 +2443,91 @@ def make_handler(workspace, jobs):
                         hours = 168.0
                     return self._json(summarize_qc(
                         Path(workspace) / "logs", hours=hours))
+                if route == "/api/director/knowledge":
+                    # AI 导演知识库:直接读取运行时词典模块——所见即所用,
+                    # 不存副本,词典升级这里自动同步。
+                    from ..adapters.claude_script import DIRECTOR_PRINCIPLES
+                    from ..camera_language import (
+                        ANGLE_GEOMETRY, CAMERA_SCALE_CAPACITY,
+                        COMPOSITION_GEOMETRY, MOVEMENT_GEOMETRY,
+                        POSITION_GEOMETRY, SCALE_GEOMETRY,
+                        TOP_DOWN_POSITION_GEOMETRY)
+                    from ..lighting_language import (
+                        DEEP_FOCUS_CLAUSE, GENRE_LOOKS, LIGHTING_STYLES,
+                        NEGATIVE_CONTROLS, SHALLOW_DOF_CLAUSE,
+                        VOLUMETRIC_CLAUSE, WARM_COOL_CLAUSE)
+                    from ..realism_language import (
+                        NEGATIVE_CONTROLS as REALISM_NEGATIVE,
+                        NON_REALISTIC_TOKENS, REALISM_CLAUSE,
+                        REALISTIC_STYLE_TOKENS)
+                    from ..spatial_language import (_DISTANCE_FRAMING,
+                                                    _H_ZONES)
+                    return self._json({
+                        "schema": "aifos.director-knowledge/v1",
+                        "source_note": (
+                            "以下内容直接读取自运行时词典模块"
+                            "(camera_language/lighting_language/"
+                            "spatial_language/realism_language),"
+                            "AI导演与生成、质检共用同一份——所见即所用"),
+                        "principles": list(DIRECTOR_PRINCIPLES),
+                        "camera": {
+                            "景别": SCALE_GEOMETRY,
+                            "角度": ANGLE_GEOMETRY,
+                            "机位": POSITION_GEOMETRY,
+                            "机位·顶拍语境": TOP_DOWN_POSITION_GEOMETRY,
+                            "运镜": MOVEMENT_GEOMETRY,
+                            "构图": COMPOSITION_GEOMETRY,
+                        },
+                        "capacity": CAMERA_SCALE_CAPACITY,
+                        "lighting": {
+                            "styles": {
+                                key: value for key, value in
+                                LIGHTING_STYLES.items()},
+                            "extras": {
+                                "体积光": VOLUMETRIC_CLAUSE,
+                                "冷暖对比": WARM_COOL_CLAUSE,
+                                "浅景深": SHALLOW_DOF_CLAUSE,
+                                "大景深": DEEP_FOCUS_CLAUSE,
+                            },
+                            "negative": NEGATIVE_CONTROLS,
+                        },
+                        "genres": {
+                            key: {"label": look["label"],
+                                  "tokens": list(look["tokens"]),
+                                  "style": look["style"],
+                                  "grammar": look["grammar"],
+                                  "camera": dict(look.get("camera") or {})}
+                            for key, look in GENRE_LOOKS.items()},
+                        "spatial": {
+                            "screen_zones": [
+                                {"range": [low, high], "label": label}
+                                for low, high, label in _H_ZONES],
+                            "distance_framing": [
+                                # float('inf') 会被序列化成 Infinity,
+                                # 浏览器 JSON.parse 拒收 → 前端拿到空对象
+                                {"range": [low,
+                                           None if high == float("inf")
+                                           else high],
+                                 "label": label}
+                                for low, high, label in _DISTANCE_FRAMING],
+                            "clauses": [
+                                "空间站位:画面分区+被摄距离(到主体胸眼"
+                                "高度)+由近及远遮挡顺序+朝向视线",
+                                "行动路线:起点→终点的分区位移+走近/远离"
+                                "摄影机米数+姿态变化",
+                                "屏幕方向:180度轴线锁,同场跨镜左右关系"
+                                "不得翻转",
+                                "空间冲突:声明景别与机位距离跨两档即报,"
+                                "出图前拦截",
+                            ],
+                        },
+                        "realism": {
+                            "clause": REALISM_CLAUSE,
+                            "negative": REALISM_NEGATIVE,
+                            "enabled_styles": list(REALISTIC_STYLE_TOKENS),
+                            "disabled_styles": list(NON_REALISTIC_TOKENS),
+                        },
+                    })
                 if route == "/api/rules/appeals":
                     from ..rule_appeals import (rules_needing_fix,
                                                 summarize_appeals)

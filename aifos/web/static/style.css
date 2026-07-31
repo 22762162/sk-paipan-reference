@@ -5037,3 +5037,25 @@ textarea:focus-visible, select:focus-visible {
   padding: 7px 9px; resize: vertical; }
 .pc-ai-rationale { margin-top: 8px; padding: 8px 10px; border-radius: 10px;
   background: var(--accent-soft); font-size: 12.5px; line-height: 1.6; }
+/* AI导演知识库 */
+.ai-dk-note { color: var(--ink-2); font-size: 12.5px; padding: 8px 12px;
+  background: var(--accent-soft); border-radius: 10px; }
+.ai-dk-block { margin: 10px 0; border: 1px solid var(--hairline);
+  border-radius: 12px; padding: 10px 14px; }
+.ai-dk-block > summary { cursor: pointer; font-weight: 700;
+  font-size: 14px; list-style: none; }
+.ai-dk-table { width: 100%; border-collapse: collapse; margin-top: 8px;
+  font-size: 12.5px; }
+.ai-dk-table th { text-align: left; white-space: nowrap; padding: 6px 10px
+  6px 0; vertical-align: top; color: var(--accent); width: 110px; }
+.ai-dk-table td { padding: 6px 0; color: var(--ink-2); line-height: 1.65;
+  border-bottom: 1px dashed var(--hairline); }
+.ai-dk-principles { margin: 8px 0 0; padding-left: 20px; font-size: 13px;
+  line-height: 1.8; color: var(--ink-2); }
+.ai-dk-genres { display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  margin-top: 8px; }
+.ai-dk-genres article { border: 1px solid var(--hairline);
+  border-radius: 10px; padding: 10px 12px; font-size: 12.5px; }
+.ai-dk-genres h4 { margin: 0 0 6px; }
+.ai-dk-genres p { margin: 4px 0; line-height: 1.6; }
