@@ -336,3 +336,48 @@ def test_history_narration_is_not_a_process_violation():
     report2 = validate_shot_prompt_contract(bad)
     assert [i for i in report2.get("issues", [])
             if "多个时间状态" in i]
+
+
+# ---- 表现性运镜:词条齐备、长词优先、艺术运镜不被求解覆盖 ----
+
+def test_expressive_movements_registered_with_verifiable_clauses():
+    from aifos.camera_language import (EXPRESSIVE_MOVEMENTS,
+                                       MOVEMENT_GEOMETRY)
+    assert EXPRESSIVE_MOVEMENTS == {
+        "甩镜", "螺旋环绕", "穿越", "俯冲", "升格", "希区柯克变焦"}
+    for term in EXPRESSIVE_MOVEMENTS:
+        assert term in MOVEMENT_GEOMETRY
+        # 每条都必须是"画面里应该看到什么"的可核验描述
+        assert len(MOVEMENT_GEOMETRY[term]) >= 20
+    assert "实验级" in MOVEMENT_GEOMETRY["希区柯克变焦"]
+
+
+def test_movement_priority_expressive_wins_over_derived_static():
+    from aifos.camera_language import (MOVEMENT_GEOMETRY,
+                                       movement_geometry_for)
+    # 病根复现:分镜写了艺术运镜,3D 求解误报"固定"——词典合同必须获胜
+    assert movement_geometry_for(
+        "甩镜", "固定") == MOVEMENT_GEOMETRY["甩镜"]
+    assert movement_geometry_for(
+        "情绪极点升格慢放", "固定") == MOVEMENT_GEOMETRY["升格"]
+    # 经典运镜维持"三维调度为准"的既有优先级
+    assert movement_geometry_for(
+        "缓推", "拉") == MOVEMENT_GEOMETRY["拉"]
+    assert movement_geometry_for("缓推", "") == MOVEMENT_GEOMETRY["推"]
+    assert movement_geometry_for("按分镜", "") == ""
+
+
+def test_movement_longest_token_wins_over_substring():
+    from aifos.camera_language import (MOVEMENT_GEOMETRY,
+                                       movement_geometry_for)
+    # 「螺旋环绕」不得被子串「环绕」截胡
+    assert movement_geometry_for(
+        "螺旋环绕", "固定") == MOVEMENT_GEOMETRY["螺旋环绕"]
+    assert movement_geometry_for(
+        "螺旋环绕上升", "环绕") == MOVEMENT_GEOMETRY["螺旋环绕"]
+
+
+def test_expressive_movement_flows_into_video_contract_clause():
+    from aifos.camera_language import camera_geometry_clause
+    clause = camera_geometry_clause({"景别": "近景", "运镜": "俯冲"})
+    assert "俯冲" in clause and "视平线急速下移" in clause
