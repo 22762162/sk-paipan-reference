@@ -2019,6 +2019,8 @@ function icloudSyncHtml(sync = {}) {
 
 function providerCostHint(provider) {
   const id = `${provider.name || ""} ${provider.type || ""} ${provider.model || ""}`.toLowerCase();
+  if (provider.name === "deepseek" || id.includes("deepseek-v4-flash"))
+    return `<div class="pc-cost subscription"><b>DeepSeek V4 Flash（0731）</b> · 1M 上下文 · AIFOS 默认非思考模式，保持原备用通道速度</div>`;
   if (id.includes("seedream"))
     return `<div class="pc-cost batch"><b>¥0.22/张</b> · Seedream 5.0 Lite 批量优先</div>`;
   if (provider.name === "codex")
@@ -2469,7 +2471,8 @@ function checksHtml(checks) {
 
 function providerCard(p) {
   const isApi = ["api", "claude_api", "image_api", "seedream_image", "seedream",
-    "seedream_lite", "seedream5_lite", "ark_video", "doubao_tts"].includes(p.type)
+    "seedream_lite", "seedream5_lite", "ark_video", "doubao_tts",
+    "openai_chat"].includes(p.type)
     || ["seedream5_lite", "seedream_lite", "seedream"].includes(p.name);
   const isCli = ["cli", "dreamina"].includes(p.type);
   const state = p.ready ? ["done", "就绪"]
@@ -2487,6 +2490,11 @@ function providerCard(p) {
   if (isApi && !["api", "doubao_tts"].includes(p.type))
     advanced.push(`<label class="set-row"><span>模型</span>
       <input data-field="model" value="${esc(p.model)}"></label>`);
+  if (p.type === "openai_chat") advanced.push(`<label class="set-row"><span>思考模式</span>
+      <select data-field="thinking_mode">
+        <option value="disabled" ${p.thinking_mode !== "enabled" ? "selected" : ""}>关闭（快速，兼容原 deepseek-chat）</option>
+        <option value="enabled" ${p.thinking_mode === "enabled" ? "selected" : ""}>开启（复杂推理）</option>
+      </select></label>`);
   if (p.type === "doubao_tts") advanced.push(`<label class="set-row"><span>音色</span>
       <input data-field="voice_type" value="${esc(p.voice_type || "")}"
         placeholder="如 BV700_streaming"></label>`);
@@ -6414,6 +6422,14 @@ async function _pcOpenShotPanel(shotNo) {
                 `<option value="${k}"${(cell.shot || {}).lighting_style === k
                   ? " selected" : ""}>${v}</option>`).join("")}
             </select></label>
+            <label>运动参考<select data-dim="__motion">
+              <option value="">(不改)</option>
+              <option value="latest"${(cell.shot || {}).motion_reference
+                === "latest" ? " selected" : ""
+                }>重画时以当前视频为运动骨架</option>
+              ${(cell.shot || {}).motion_reference
+                ? `<option value="clear">清除运动参考</option>` : ""}
+            </select></label>
           </div>
           <textarea class="pc-direct-note" rows="2"
             placeholder="导演意见(会随提示词下达,例如:脸部再亮半档,保持忧郁感;刀不要反光)">${
@@ -6491,20 +6507,23 @@ async function _pcOpenShotPanel(shotNo) {
           const camera = {};
           overlay.querySelectorAll(".pc-direct-grid select[data-dim]")
             .forEach((sel) => {
-              if (sel.dataset.dim !== "__lighting" && sel.value)
+              if (!sel.dataset.dim.startsWith("__") && sel.value)
                 camera[sel.dataset.dim] = sel.value;
             });
           const lighting = overlay.querySelector(
             'select[data-dim="__lighting"]').value;
+          const motion = overlay.querySelector(
+            'select[data-dim="__motion"]').value;
           const note = overlay.querySelector(".pc-direct-note").value.trim();
           const body = {
             episode_id: prodCanvasState.episodeId, shot_no: cell.no,
             camera, lighting_style: lighting, note,
+            motion_reference: motion,
             clear_note: act === "clear-note", redo: act === "direct",
           };
           if (act === "direct" && !Object.keys(camera).length
-              && !lighting && !note) {
-            showToast("先选一项镜头/光影,或写一句意见", "error");
+              && !lighting && !motion && !note) {
+            showToast("先选一项镜头/光影/运动参考,或写一句意见", "error");
             btn.disabled = false; return;
           }
           const reply = await api("/api/shot/direct", { method: "POST",

@@ -95,6 +95,26 @@ class DreaminaProvider(Provider):
                 value = str(Path(value).resolve())
             if value not in references and value not in (first, last):
                 references.append(value)
+
+        def _media_refs(key, label, limit):
+            """参考视频/音频(multimodal2video 在 2.0 全家族即支持):
+            CLI 硬上限 video<=3 / audio<=3,超限 fail-closed 不静默丢弃
+            (2.5 才放宽到各 10 条)。"""
+            rows = []
+            for uri in payload.get(key) or []:
+                value = str(uri)
+                if not value.startswith(("http://", "https://")):
+                    value = str(Path(value).resolve())
+                if value and value not in rows:
+                    rows.append(value)
+            if len(rows) > limit:
+                raise ProviderError(
+                    f"Seedance 2.0 单次最多 {limit} 条{label},"
+                    f"当前 {len(rows)} 条;请删减,或按镜升级 seedance2_5"
+                    f"(上限 10 条)后再提交,禁止静默丢弃")
+            return rows
+        reference_videos = _media_refs("reference_videos", "参考视频", 3)
+        reference_audios = _media_refs("reference_audios", "参考音频", 3)
         shot_no = int(payload.get("shot_no", 0))
         try:
             tier = requested_tier(payload)
@@ -164,14 +184,25 @@ class DreaminaProvider(Provider):
         # validates the minimum against the actual rounded submission, and
         # never clips an over-limit duration or drops excess references.
         duration = runtime["submitted_duration"]
-        if references:
-            prompt += (
-                "。多图边界：图1仅为动作起点，图2仅为动作终点；"
-                "图3及之后必须逐张服从提示词内的“资产图单一职责”，"
-                "禁止把一张图同时当人物、服装、场景和画风依据，"
-                "禁止跨人物复制属性或把参考图拼贴进画面。")
+        if references or reference_videos or reference_audios:
+            if references:
+                prompt += (
+                    "。多图边界：图1仅为动作起点，图2仅为动作终点；"
+                    "图3及之后必须逐张服从提示词内的“资产图单一职责”，"
+                    "禁止把一张图同时当人物、服装、场景和画风依据，"
+                    "禁止跨人物复制属性或把参考图拼贴进画面。")
+            if reference_videos:
+                # 多人身份泄漏实测教训:实拍参考的外观先验会压过身份图。
+                # 参考视频只授权运动骨架,外观一律以图片资产为准。
+                prompt += (
+                    "。参考视频边界：视频只授权动作节奏、运动轨迹与镜头"
+                    "运动(运动骨架)，画面外观、人物身份、发型服装、场景"
+                    "与光线一律以图片资产和文字提示词为准；禁止从参考"
+                    "视频复制人脸、服饰、道具或场景元素。")
             cmd = self._command() + ["multimodal2video"]
             cmd.extend(f"--image={uri}" for uri in [first, last, *references])
+            cmd.extend(f"--video={uri}" for uri in reference_videos)
+            cmd.extend(f"--audio={uri}" for uri in reference_audios)
             # frames2video 从首帧尺寸推断画幅,multimodal2video 不会——
             # 不显式传 --ratio,画幅会被参考图里的横版空间调度图带偏,
             # 9:16 竖屏短剧实测出成 1280x720 横屏。而「勾了资产参考图」
@@ -232,6 +263,8 @@ class DreaminaProvider(Provider):
                 "lip_sync": bool(payload.get("lip_sync", True)),
                 "forbid_subtitles": bool(payload.get("forbid_subtitles", True)),
                 "reference_images_used": references,
+                "reference_videos_used": reference_videos,
+                "reference_audios_used": reference_audios,
                 "material_reference_count": runtime[
                     "material_reference_count"],
                 "total_reference_count": runtime[

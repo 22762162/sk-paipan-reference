@@ -3935,7 +3935,9 @@ def make_handler(workspace, jobs):
                         camera=body.get("camera"),
                         lighting_style=str(body.get("lighting_style") or ""),
                         note=str(body.get("note") or ""),
-                        clear_note=bool(body.get("clear_note"))))
+                        clear_note=bool(body.get("clear_note")),
+                        motion_reference=str(
+                            body.get("motion_reference") or "")))
             except AifosError as exc:
                 return self._error(400, str(exc))
             result["redo_queued"] = False

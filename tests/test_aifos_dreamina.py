@@ -385,3 +385,54 @@ def test_doctor_voice_carried_by_video(tmp_path, fake_dreamina):
         assert "随视频自动配音" in voice["provider_label"]
     finally:
         app.close()
+
+
+class _ReachedCliStop(RuntimeError):
+    """策略闸全过,已到达真实付费调用点。"""
+
+
+def _capture_cmd(captured):
+    def _capture(_tag, cmd, _cwd, _timeout, cancel=None):
+        captured["cmd"] = cmd
+        raise _ReachedCliStop()
+    return _capture
+
+
+def test_reference_video_rides_multimodal_on_seedance20(tmp_path):
+    """2.0 全家族即支持参考视频:--video 上车、运动骨架边界条款注入。"""
+    from unittest import mock
+    from aifos.production import dreamina as dreamina_module
+    captured = {}
+    provider = DreaminaProvider("jimeng", {
+        "enabled": True, "capabilities": ["video"]})
+    payload = {
+        "shot_no": 3, "first": "/tmp/a.png", "last": "/tmp/b.png",
+        "duration": 8, "prompt": "single action",
+        "video_resolution": "720p",
+        "reference_videos": ["/tmp/motion.mp4"],
+    }
+    with mock.patch.object(dreamina_module, "run_interruptible",
+                           side_effect=_capture_cmd(captured)):
+        with pytest.raises(_ReachedCliStop):
+            provider.generate("video", payload, tmp_path)
+    cmd = captured["cmd"]
+    assert "multimodal2video" in cmd            # 无图片参考也走全能参考
+    assert any(c.startswith("--video=") and c.endswith("motion.mp4")
+               for c in cmd)
+    prompt_arg = next(c for c in cmd if c.startswith("--prompt="))
+    assert "运动骨架" in prompt_arg              # 身份泄漏防线
+    assert "禁止从参考视频复制人脸" in prompt_arg
+
+
+def test_more_than_three_reference_videos_fail_closed(tmp_path):
+    provider = DreaminaProvider("jimeng", {
+        "enabled": True, "capabilities": ["video"]})
+    payload = {
+        "shot_no": 3, "first": "/tmp/a.png", "last": "/tmp/b.png",
+        "duration": 8, "prompt": "p", "video_resolution": "720p",
+        "reference_videos": [f"/tmp/m{i}.mp4" for i in range(4)],
+    }
+    with pytest.raises(Exception) as exc:
+        provider.generate("video", payload, tmp_path)
+    assert "最多 3 条参考视频" in str(exc.value)
+    assert "seedance2_5" in str(exc.value)      # 指路升级而不是静默丢弃

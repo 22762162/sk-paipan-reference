@@ -14150,6 +14150,25 @@ class Director:
             lines.append("【严禁再犯】" + lessons)
         return "\n".join(lines)
 
+    def _motion_reference_uri(self, ctx, shot):
+        """导演台标记 motion_reference=latest 时,取本镜当前成片视频作
+        运动参考;找不到只告警不阻断(运动参考是增强,不是生产合同)。"""
+        if str(shot.get("motion_reference") or "").lower() != "latest":
+            return ""
+        shot_no = int(shot.get("shot_no") or -1)
+        for item in (ctx.get("videos") or []):
+            if int(item.get("shot_no") or -1) != shot_no:
+                continue
+            uri = str(item.get("uri") or "")
+            if uri.startswith(("http://", "https://")) or Path(uri).exists():
+                return uri
+            break
+        self.log.warn(
+            "director",
+            f"镜头{shot_no}标记了运动参考,但当前没有可用成片视频,"
+            "本次按无参考提交")
+        return ""
+
     @staticmethod
     def _video_input_snapshot(payload, result=None):
         """Freeze the exact director-side Seedance inputs for audit/retry.
@@ -14210,6 +14229,9 @@ class Director:
             "reference_manifest": manifest,
             "reference_images": requested_references,
             "reference_images_used": used_references,
+            # 运动参考视频(2.0 即支持):进签名——挂/摘参考都算输入变化
+            "reference_videos": list(dict.fromkeys(
+                str(uri) for uri in (payload.get("reference_videos") or []))),
             "material_reference_count_requested": len(requested_references),
             "material_reference_count_used": len(used_references),
             "total_reference_count_requested": (
@@ -14231,6 +14253,7 @@ class Director:
             key: snapshot[key] for key in (
                 "prompt_sent", "keyframe", "first_frame", "last_frame",
                 "reference_manifest", "reference_images",
+                "reference_videos",
                 "material_reference_count_requested",
                 "total_reference_count_requested", "duration",
                 "video_model_tier", "video_model_reason",
@@ -14399,6 +14422,7 @@ class Director:
             video_dialogue["character"] = (
                 video_dialogue.get("performed_by")
                 or video_dialogue.get("character"))
+        motion_reference_uri = self._motion_reference_uri(ctx, shot)
         payload = {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
@@ -14413,6 +14437,10 @@ class Director:
             "first": frame["first"],
             "last": frame["last"],
             "reference_images": [row["uri"] for row in reference_rows],
+            # 导演台标记的运动参考(2.0 multimodal2video 即支持 --video):
+            # 只授权运动骨架,外观身份由图片资产钳制(适配器注入边界条款)
+            **({"reference_videos": [motion_reference_uri]}
+               if motion_reference_uri else {}),
             "reference_assets": reference_assets,
             "reference_manifest": reference_manifest,
             **prop_contract,
@@ -16981,7 +17009,7 @@ class Director:
 
     def direct_shot(self, project_title, episode_number, shot_no, *,
                     camera=None, lighting_style="", note="",
-                    clear_note=False):
+                    clear_note=False, motion_reference=""):
         """导演台:对单镜直接下指令(镜头五维/光影风格/导演意见)。
 
         指令写进分镜文档成为新版本事实——重画时提示词按最新分镜重新
@@ -16989,6 +17017,9 @@ class Director:
         camera 只更新给出的维度,保持原结构(str 或 dict);光影走
         lighting_language 的 style_override 通道;意见存 director_note,
         经 _shot_payload 注入 payload.feedback,与 QC 修订同机制。
+        motion_reference="latest" 标记「重画时以当前视频为运动参考」
+        (Seedance 2.0 multimodal2video 即支持 --video,只授权运动骨架,
+        外观以图片资产为准);"clear" 清除标记。
         """
         project, episode = self._episode_ctx(project_title, episode_number)
         storyboard, _v = self.projects.latest_document(
@@ -17058,6 +17089,12 @@ class Director:
         elif str(note or "").strip():
             shot["director_note"] = str(note).strip()[:1200]
             changed.append("意见:" + shot["director_note"][:60])
+        motion = str(motion_reference or "").strip().lower()
+        if motion == "latest":
+            shot["motion_reference"] = "latest"
+            changed.append("运动参考:重画时以当前视频为运动骨架")
+        elif motion == "clear" and shot.pop("motion_reference", None):
+            changed.append("已清除运动参考标记")
         if not changed:
             raise AifosError("没有任何导演指令(镜头/光影/意见至少给一项)")
         shot["directed_at"] = now()
