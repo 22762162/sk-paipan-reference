@@ -6048,6 +6048,24 @@ function _pcAssets(data) {
   return rows.filter((r) => r.url && !String(r.label).includes("::view:"));
 }
 
+/* 导演台词典(与 aifos/camera_language.py、lighting_language.py 同源) */
+const PC_DIRECT_DIMS = {
+  "景别": ["大特写", "特写", "近景", "中近景", "中景", "膝上景", "七分身",
+           "全景", "远景", "大远景"],
+  "角度": ["顶拍", "俯拍", "仰拍", "平视", "低角度", "高角度", "斜角",
+           "主观视角"],
+  "机位": ["过肩", "背面", "侧面", "正面", "正侧面", "四分之三面", "反打"],
+  "运镜": ["固定", "推", "拉", "摇", "移", "跟", "升降", "环绕", "手持"],
+  "构图": ["三分法", "中心对称", "框中框", "引导线", "前景遮挡", "留白",
+           "对角线", "水平分割"],
+};
+const PC_LIGHTING_STYLES = {
+  auto: "自动(按题材与场景选型)", rim_backlight: "逆光轮廓光",
+  rembrandt: "伦勃朗光", low_key: "低调照明",
+  practical_lit: "实用光源主导", top_light: "顶光",
+  soft_daylight: "柔和天光", overcast_flat: "阴天散射光",
+};
+
 const PC_STATUS_LABEL = {
   done: "完成", reused: "复用", generating: "生成中",
   retrying: "自动修图", awaiting_human: "待人工", failed: "失败",
@@ -6277,6 +6295,30 @@ async function _pcOpenShotPanel(shotNo) {
           <pre class="pc-prompt">${esc(String(
             cell.plan.prompt_used || cell.plan.prompt || "").slice(0, 1800))}</pre>
         </details>
+        <details class="pc-direct">
+          <summary>🎬 导演台:改镜头/光影/下意见,按指令重画</summary>
+          <div class="pc-direct-grid">
+            ${Object.entries(PC_DIRECT_DIMS).map(([dim, opts]) => `
+            <label>${dim}<select data-dim="${dim}">
+              <option value="">(不改)</option>
+              ${opts.map((o) => `<option>${o}</option>`).join("")}
+            </select></label>`).join("")}
+            <label>光影<select data-dim="__lighting">
+              <option value="">(不改)</option>
+              ${Object.entries(PC_LIGHTING_STYLES).map(([k, v]) =>
+                `<option value="${k}"${(cell.shot || {}).lighting_style === k
+                  ? " selected" : ""}>${v}</option>`).join("")}
+            </select></label>
+          </div>
+          <textarea class="pc-direct-note" rows="2"
+            placeholder="导演意见(会随提示词下达,例如:脸部再亮半档,保持忧郁感;刀不要反光)">${
+            esc(String((cell.shot || {}).director_note || ""))}</textarea>
+          <div class="pc-shot-actions">
+            <button type="button" class="primary" data-act="direct">🎬 按导演指令重画</button>
+            ${(cell.shot || {}).director_note
+              ? `<button type="button" data-act="clear-note">清除意见</button>` : ""}
+          </div>
+        </details>
         <div class="pc-shot-actions">
           <button type="button" class="primary" data-act="redo">🔁 重画本镜</button>
           ${["awaiting_human", "failed"].includes(cell.status)
@@ -6304,6 +6346,38 @@ async function _pcOpenShotPanel(shotNo) {
       }
       btn.disabled = true;
       try {
+        if (act === "direct" || act === "clear-note") {
+          const camera = {};
+          overlay.querySelectorAll(".pc-direct-grid select[data-dim]")
+            .forEach((sel) => {
+              if (sel.dataset.dim !== "__lighting" && sel.value)
+                camera[sel.dataset.dim] = sel.value;
+            });
+          const lighting = overlay.querySelector(
+            'select[data-dim="__lighting"]').value;
+          const note = overlay.querySelector(".pc-direct-note").value.trim();
+          const body = {
+            episode_id: prodCanvasState.episodeId, shot_no: cell.no,
+            camera, lighting_style: lighting, note,
+            clear_note: act === "clear-note", redo: act === "direct",
+          };
+          if (act === "direct" && !Object.keys(camera).length
+              && !lighting && !note) {
+            showToast("先选一项镜头/光影,或写一句意见", "error");
+            btn.disabled = false; return;
+          }
+          const reply = await api("/api/shot/direct", { method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body) });
+          showToast(reply.redo_queued
+            ? `镜头${cell.no} 指令已下达,正在按新指令重画`
+            : `镜头${cell.no} 指令已保存` + (reply.redo_note
+              ? `(${reply.redo_note})` : ""),
+            "ok");
+          close();
+          pollCanvas(prodCanvasState.episodeId);
+          return;
+        }
         if (act === "redo") {
           await api("/api/redo_items", { method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -6608,51 +6682,83 @@ function blockingStickFigureGeometry(anchor, height, pose) {
   });
   let joints;
   if (actorPose === "lying") {
-    const bodyLength = Math.max(1.4, actorHeight * 2.8);
+    // lying 的 height_m 是人物躺下后的垂直包络（常见约 .55m），不是
+    // 站立身高；直接乘 2.8 会让不同体型失去比例，传入站立身高时更会
+    // 画出四五米长的人。先还原等效身高，再按真人头脚长度绘制。
+    const stature = actorHeight < .9
+      ? Math.max(1.2, Math.min(2.1, actorHeight / .33))
+      : Math.max(.9, Math.min(2.1, actorHeight));
+    const bodyLength = stature * .96;
+    const halfShoulder = stature * .115;
+    const halfElbow = stature * .165;
+    const halfHand = stature * .19;
+    const halfKnee = stature * .065;
+    const halfFoot = stature * .09;
     joints = {
-      head: point(bodyLength * .45, actorHeight * .72),
-      neck: point(bodyLength * .32, actorHeight * .61),
-      shoulderL: point(bodyLength * .24, actorHeight * .58, -.18),
-      shoulderR: point(bodyLength * .24, actorHeight * .58, .18),
-      hip: point(-bodyLength * .12, actorHeight * .50),
-      elbowL: point(bodyLength * .05, actorHeight * .45, -.28),
-      elbowR: point(bodyLength * .05, actorHeight * .45, .28),
-      handL: point(-bodyLength * .10, actorHeight * .36, -.34),
-      handR: point(-bodyLength * .10, actorHeight * .36, .34),
-      kneeL: point(-bodyLength * .31, actorHeight * .38, -.10),
-      kneeR: point(-bodyLength * .31, actorHeight * .38, .10),
-      footL: point(-bodyLength * .48, actorHeight * .26, -.16),
-      footR: point(-bodyLength * .48, actorHeight * .26, .16),
+      head: point(bodyLength * .46, actorHeight * .72),
+      neck: point(bodyLength * .37, actorHeight * .61),
+      shoulderL: point(bodyLength * .30, actorHeight * .58, -halfShoulder),
+      shoulderR: point(bodyLength * .30, actorHeight * .58, halfShoulder),
+      hip: point(-bodyLength * .03, actorHeight * .50),
+      elbowL: point(bodyLength * .13, actorHeight * .45, -halfElbow),
+      elbowR: point(bodyLength * .13, actorHeight * .45, halfElbow),
+      handL: point(-bodyLength * .02, actorHeight * .36, -halfHand),
+      handR: point(-bodyLength * .02, actorHeight * .36, halfHand),
+      kneeL: point(-bodyLength * .27, actorHeight * .38, -halfKnee),
+      kneeR: point(-bodyLength * .27, actorHeight * .38, halfKnee),
+      footL: point(-bodyLength * .48, actorHeight * .26, -halfFoot),
+      footR: point(-bodyLength * .48, actorHeight * .26, halfFoot),
     };
   } else {
+    // 人体测量学比例(占身高的比值,7.5 头身标准成人):火柴人必须是
+    // 真人比例,否则在真实尺寸的房间里读不出人与家具的大小关系——
+    // 1.33 米高的书案挡不挡得住人,全靠这个比例说话。
+    // 旧值:胯 .43(真人 .52)、膝 .22(真人 .285)、肩 .75(真人 .82);
+    // 且肩/肘/手用的是**绝对米数**,1.2 米的孩子和 1.9 米的成人肩一样宽。
+    const CANON = {
+      head: .94, neck: .86, shoulder: .82, elbow: .63, wrist: .48,
+      hand: .42, hip: .52, knee: .285, foot: 0,
+      halfShoulder: .115,   // 肩宽 ≈ .23H,取半
+      halfElbow: .155, halfHand: .175, halfKnee: .055, halfFoot: .085,
+    };
     const profiles = {
       standing: { headX: 0, neckX: 0, shoulderX: 0, hipX: 0,
-        hipY: .43, kneeX: .11, kneeY: .22, footX: .18 },
+        hipY: CANON.hip, kneeY: CANON.knee, kneeSpread: 1, footSpread: 1 },
       sitting: { headX: .05, neckX: .03, shoulderX: .02, hipX: 0,
-        hipY: .48, kneeX: .25, kneeY: .30, footX: .25 },
+        hipY: .58, kneeY: .40, kneeSpread: 3.4, footSpread: 2.6 },
       leaning_seated: { headX: .18, neckX: .13, shoulderX: .09, hipX: 0,
-        hipY: .46, kneeX: .25, kneeY: .29, footX: .26 },
+        hipY: .56, kneeY: .39, kneeSpread: 3.4, footSpread: 2.7 },
       kneeling: { headX: .03, neckX: .02, shoulderX: 0, hipX: 0,
-        hipY: .45, kneeX: .21, kneeY: .09, footX: .31 },
+        hipY: .50, kneeY: .10, kneeSpread: 2.6, footSpread: 3.2 },
       crouching: { headX: .10, neckX: .07, shoulderX: .03, hipX: -.04,
-        hipY: .39, kneeX: .28, kneeY: .16, footX: .35 },
+        hipY: .44, kneeY: .20, kneeSpread: 3.8, footSpread: 3.6 },
     };
     const profile = profiles[actorPose] || profiles.standing;
-    const armDrop = actorPose === "standing" ? .42 : .38;
+    const armDrop = actorPose === "standing" ? CANON.hand : CANON.hand + .04;
+    // 横向也按身高缩放:同一个人物在不同身高下比例才恒定
+    const w = (fraction) => actorHeight * fraction;
     joints = {
-      head: point(profile.headX, actorHeight * .91),
-      neck: point(profile.neckX, actorHeight * .80),
-      shoulderL: point(profile.shoulderX - .20, actorHeight * .75),
-      shoulderR: point(profile.shoulderX + .20, actorHeight * .75),
+      head: point(profile.headX, actorHeight * CANON.head),
+      neck: point(profile.neckX, actorHeight * CANON.neck),
+      shoulderL: point(profile.shoulderX - w(CANON.halfShoulder),
+        actorHeight * CANON.shoulder),
+      shoulderR: point(profile.shoulderX + w(CANON.halfShoulder),
+        actorHeight * CANON.shoulder),
       hip: point(profile.hipX, actorHeight * profile.hipY),
-      elbowL: point(profile.shoulderX - .29, actorHeight * .58),
-      elbowR: point(profile.shoulderX + .29, actorHeight * .58),
-      handL: point(profile.shoulderX - .33, actorHeight * armDrop),
-      handR: point(profile.shoulderX + .33, actorHeight * armDrop),
-      kneeL: point(profile.hipX - profile.kneeX, actorHeight * profile.kneeY),
-      kneeR: point(profile.hipX + profile.kneeX, actorHeight * profile.kneeY),
-      footL: point(-profile.footX, 0),
-      footR: point(profile.footX, 0),
+      elbowL: point(profile.shoulderX - w(CANON.halfElbow),
+        actorHeight * CANON.elbow),
+      elbowR: point(profile.shoulderX + w(CANON.halfElbow),
+        actorHeight * CANON.elbow),
+      handL: point(profile.shoulderX - w(CANON.halfHand),
+        actorHeight * armDrop),
+      handR: point(profile.shoulderX + w(CANON.halfHand),
+        actorHeight * armDrop),
+      kneeL: point(profile.hipX - w(CANON.halfKnee * profile.kneeSpread),
+        actorHeight * profile.kneeY),
+      kneeR: point(profile.hipX + w(CANON.halfKnee * profile.kneeSpread),
+        actorHeight * profile.kneeY),
+      footL: point(-w(CANON.halfFoot * profile.footSpread), CANON.foot),
+      footR: point(w(CANON.halfFoot * profile.footSpread), CANON.foot),
     };
   }
   return {
@@ -6694,7 +6800,10 @@ function mountBlocking3d(stage, scene) {
   };
   const CAPTURE = { x: 0, y: 1.55, z: 0 };   // 全景拍摄点:房间中心视平线
   const room = (() => {
-    const world = scene.world || {};
+    const world = {
+      ...((scene.scene_model || {}).room || {}),
+      ...(scene.world || {}),
+    };
     return {
       fw: Number(world.floor_width_m) || 10,
       fd: Number(world.floor_depth_m) || 7,
@@ -6928,6 +7037,82 @@ function mountBlocking3d(stage, scene) {
 
     const panoRoom = renderPanoRoom();
     const hx = room.fw / 2, hz = room.fd / 2;
+    // 真实家具:三维场景表里的物体按实际位置尺寸画成立方体。
+    // 贴图只是"看着像那间屋",画成盒子才说得清人站在案前还是案后、
+    // 纱帐到底在谁后面——镜头穿帮就是从这里判出来的。
+    const sceneObjects = (scene.scene_model || {}).objects || [];
+    const drawSceneBoxes = () => {
+      if (!sceneObjects.length) return;
+      const palette = {
+        furniture: { fill: "rgba(201,162,39,.32)", stroke: "#e7c75b" },
+        prop: { fill: "rgba(217,140,63,.38)", stroke: "#f1ae67" },
+        opening: { fill: "rgba(111,179,217,.24)", stroke: "#8dd3f4" },
+        light: { fill: "rgba(232,196,106,.34)", stroke: "#f4dc93" },
+        decor: { fill: "rgba(154,143,123,.28)", stroke: "#b8aa91" },
+      };
+      const faces = [];
+      const labels = [];
+      sceneObjects.forEach((obj) => {
+        const p = obj.position_3d || {};
+        const px = Number(p.x) || 0;
+        const py = Number(p.y) || 0;
+        const pz = Number(p.z) || 0;
+        const w = Math.max(.15, Number(obj.width_m ?? obj.width) || .6);
+        const h = Math.max(.15, Number(obj.height_m ?? obj.height) || .8);
+        const d = Math.max(
+          .15, Number(obj.depth_m ?? obj.depth) || Math.min(w * .55, .8));
+        const yaw = (Number(obj.rotation_y_deg) || 0) * Math.PI / 180;
+        const cos = Math.cos(yaw);
+        const sin = Math.sin(yaw);
+        const paletteEntry = palette[obj.category] || {
+          fill: "rgba(139,131,119,.28)", stroke: "#aaa092",
+        };
+        const corner = (lx, y, lz) => ({
+          x: px + lx * cos - lz * sin,
+          y,
+          z: pz + lx * sin + lz * cos,
+        });
+        const vertices = [
+          corner(-w / 2, py, -d / 2), corner(w / 2, py, -d / 2),
+          corner(w / 2, py, d / 2), corner(-w / 2, py, d / 2),
+          corner(-w / 2, py + h, -d / 2), corner(w / 2, py + h, -d / 2),
+          corner(w / 2, py + h, d / 2), corner(-w / 2, py + h, d / 2),
+        ];
+        [
+          { indices: [0, 1, 2, 3], alpha: .72 },
+          { indices: [4, 7, 6, 5], alpha: 1 },
+          { indices: [0, 4, 5, 1], alpha: .84 },
+          { indices: [1, 5, 6, 2], alpha: .74 },
+          { indices: [2, 6, 7, 3], alpha: .9 },
+          { indices: [3, 7, 4, 0], alpha: .78 },
+        ].forEach((face) => {
+          const points = face.indices.map((index) => vertices[index]);
+          const depth = points.reduce(
+            (total, point) => total + project(point).depth, 0) / points.length;
+          faces.push({
+            points, depth,
+            fill: paletteEntry.fill.replace(
+              /,\s*[\d.]+\)$/, `,${face.alpha * .36})`),
+            stroke: paletteEntry.stroke,
+          });
+        });
+        labels.push({
+          text: String(obj.name || ""),
+          point: { x: px, y: py + h, z: pz },
+          color: paletteEntry.stroke,
+        });
+      });
+      // 当前环视投影中 depth 越小越远；逐面排序后再绘制，转动视角时
+      // 近处家具会自然盖住远处家具，而不是沿用全景拍摄点的固定距离。
+      faces.sort((a, b) => a.depth - b.depth);
+      faces.forEach((face) =>
+        polygon(face.points, face.fill, face.stroke));
+      // 名称属于导演控制层；嵌入式空间图本身就是控制视图，不会作为
+      // 干净生成画面导出。独立 scene3d 页面另有显式控制层开关。
+      labels.forEach((item) => {
+        if (item.text) label(item.text, item.point, item.color, -4);
+      });
+    };
     if (panoRoom) {
       ctx.save();
       ctx.imageSmoothingEnabled = true;
@@ -6950,6 +7135,8 @@ function mountBlocking3d(stage, scene) {
     line({ x: 0, y: 0, z: 0 }, { x: 1.3, y: 0, z: 0 }, "#f87171", 2);
     line({ x: 0, y: 0, z: 0 }, { x: 0, y: 1.3, z: 0 }, "#4ade80", 2);
     line({ x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 1.3 }, "#60a5fa", 2);
+
+    drawSceneBoxes();
 
     const shot = shots[state.shotIndex] || shots[0];
     const camera = shot.camera || {};

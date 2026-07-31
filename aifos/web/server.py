@@ -1937,23 +1937,36 @@ def _scene3d_payload(app, episode_id):
     project_id = episode["project_id"]
     artifacts = app.workspace.artifacts_dir.resolve()
     panoramas = {}
+    scene_models = {}
     for scene in (blocking.get("scenes") or []):
         location = str(scene.get("location") or "").strip()
-        if not location or location in panoramas:
+        if not location:
             continue
-        row = app.assets.latest(
-            project_id, "scene_art", f"{location}::view:panorama")
-        if row is None or not row["uri"]:
-            continue
-        uri = Path(row["uri"]).resolve()
-        try:
-            rel = uri.relative_to(artifacts)
-        except ValueError:
-            continue
-        panoramas[location] = {
-            "url": "/artifacts/" + str(rel),
-            "version": row["version"],
-        }
+        if location not in scene_models:
+            model_row = app.assets.latest(
+                project_id, "scene_model", location)
+            if model_row is not None and model_row["uri"]:
+                try:
+                    model = json.loads(
+                        Path(model_row["uri"]).read_text(encoding="utf-8"))
+                    if isinstance(model, dict):
+                        scene_models[location] = model
+                except (OSError, ValueError, TypeError):
+                    pass
+        if location not in panoramas:
+            row = app.assets.latest(
+                project_id, "scene_art", f"{location}::view:panorama")
+            if row is None or not row["uri"]:
+                continue
+            uri = Path(row["uri"]).resolve()
+            try:
+                rel = uri.relative_to(artifacts)
+            except ValueError:
+                continue
+            panoramas[location] = {
+                "url": "/artifacts/" + str(rel),
+                "version": row["version"],
+            }
     storyboard, _sv = app.projects.latest_document(episode_id, "storyboard")
     actions = {}
     for shot in ((storyboard or {}).get("shots") or []):
@@ -1973,6 +1986,7 @@ def _scene3d_payload(app, episode_id):
         "blocking": blocking,
         "blocking_version": blocking_v,
         "panoramas": panoramas,
+        "scene_models": scene_models,
         "shot_actions": actions,
     }
 
@@ -2182,6 +2196,18 @@ def _episode_payload(app, episode_id, jobs=None):
                     scene["panorama_url"] = _versioned(
                         _artifact_url(app, row["uri"]),
                         {"version": row["version"] or 1})
+                # 三维场景表:物体的真实位置与尺寸(由全景反解)。有了它,
+                # 3D 调度视图画的是真家具而不只是贴图,人物与物件的空间
+                # 关系才看得清、镜头才不会穿帮。
+                model_row = app.assets.latest(
+                    project["id"], "scene_model", location)
+                if model_row is not None and model_row["uri"]:
+                    try:
+                        scene["scene_model"] = json.loads(
+                            Path(model_row["uri"]).read_text(
+                                encoding="utf-8"))
+                    except (OSError, ValueError):
+                        pass
     production_progress = _production_progress(
         app, episode, render_plan)
     production_guidance = _production_guidance(
@@ -2604,6 +2630,8 @@ def make_handler(workspace, jobs):
                     return self._character_refine_prompt()
                 if parsed.path == "/api/character/refine-prompt/apply":
                     return self._character_refine_apply()
+                if parsed.path == "/api/shot/direct":
+                    return self._shot_direct()
                 if parsed.path == "/api/scene/skip":
                     return self._scene_skip()
                 if parsed.path == "/api/scene/delete":
@@ -3672,6 +3700,53 @@ def make_handler(workspace, jobs):
                     self.rfile.read(length).decode("utf-8")) if length else {}
             except ValueError:
                 return None
+
+        def _shot_direct(self):
+            """导演台:{episode_id, shot_no, camera{五维}, lighting_style,
+            note, clear_note, redo}。指令写进分镜;redo=true 且产线空闲时
+            顺手把该镜加入重画队列。生产运行中只写指令不重画。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            try:
+                shot_no = int(body.get("shot_no"))
+            except (TypeError, ValueError):
+                return self._error(400, "缺少 shot_no")
+            try:
+                result = self._with_app(
+                    lambda app: app.director.direct_shot(
+                        title, number, shot_no,
+                        camera=body.get("camera"),
+                        lighting_style=str(body.get("lighting_style") or ""),
+                        note=str(body.get("note") or ""),
+                        clear_note=bool(body.get("clear_note"))))
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            result["redo_queued"] = False
+            if body.get("redo"):
+                if jobs.production_running_for(title, number):
+                    result["redo_note"] = (
+                        "生产运行中:指令已保存,恢复后重画本镜生效;"
+                        "或先暂停再点重画")
+                else:
+                    # 重画是分钟级长任务,必须走后台任务通道,
+                    # 不能在请求线程里同步跑
+                    job_id = jobs.start_task(
+                        title, number,
+                        lambda app, run_id, report: app.director.redo_items(
+                            title, number,
+                            item_ids=[f"shot:{shot_no}"],
+                            progress=report),
+                        action="redo_items", tracked=True,
+                        request={"item_ids": [f"shot:{shot_no}"],
+                                 "source": "director_console"})
+                    result["redo_queued"] = True
+                    result["job_id"] = job_id
+            return self._json(result)
 
         def _scene_skip(self):
             """场次「暂不生成/恢复生成」:{title/episode_id, scene_no, skip}。
