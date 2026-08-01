@@ -1,7 +1,8 @@
 import math
 from pathlib import Path
 
-from aifos.spatial_blocking import (MIN_ACTOR_SEPARATION,
+from aifos.spatial_blocking import (CAMERA_ACTOR_CLEARANCE_SAFETY_M,
+                                    MIN_ACTOR_SEPARATION,
                                     MIN_CAMERA_ACTOR_CLEARANCE_M,
                                     build_character_number_map,
                                     build_spatial_plan,
@@ -288,6 +289,69 @@ def test_validation_rejects_malformed_3d_actor_and_camera_contract():
                for issue in report["issues"])
     assert any("缺少合法三维机位/视锥" in issue
                for issue in report["issues"])
+
+
+def test_final_director_camera_clearance_survives_canvas_quantization():
+    """回归旗舰 e2e 镜4：顶拍特写机位曾量化成 0.2997m。"""
+    shot = _shot(4, ["墨童"], "固定", "墨童说话")
+    shot.update({
+        "kind": "dialogue",
+        "camera": "特写",
+        "dialogue": {
+            "character": "墨童",
+            "dialogue": "白澈，小心！它就藏在附近。",
+        },
+    })
+    shot["start_state"]["墨童"]["position"] = "画面中"
+    shot["end_state"]["墨童"]["position"] = "画面中"
+    shot["five_dimensions"]["camera_design"].update({
+        "shot_scale": "特写",
+        "angle": "顶拍",
+        "lens": "85mm",
+        "camera_position": "过肩",
+        "movement": "固定",
+        "axis_offset_degrees": -30,
+    })
+    script = {"scenes": [{"scene_no": 1, "location": "妖市地穴"}]}
+    storyboard = {"shots": [shot]}
+    continuity = {
+        "characters": [{"name": "墨童", "role": "同伴"}],
+        "scenes": [{"name": "妖市地穴"}],
+    }
+
+    results = [
+        build_spatial_plan(script, storyboard, continuity)
+        for _ in range(20)
+    ]
+
+    assert all(plan["validation"]["passed"] for plan in results)
+    resolved = [shot_blocking(plan, 4) for plan in results]
+    assert len({
+        (block["camera"]["start"]["x"],
+         block["camera"]["start"]["y"])
+        for block in resolved
+    }) == 1
+    for block in resolved:
+        camera = block["camera"]
+        director = camera["director_camera"]
+        assert director["clearance_adjusted"] is True
+        assert director["clearance_before_m"] < \
+            MIN_CAMERA_ACTOR_CLEARANCE_M
+        assert director["clearance_m"] >= \
+            CAMERA_ACTOR_CLEARANCE_SAFETY_M
+        assert camera["start"] == camera["end"]
+        assert camera["moving"] is False
+        assert camera["lens_mm"] == 85
+        assert director["desired_distance_m"] == 1.0
+        assert all(
+            math.hypot(
+                camera[camera_phase]["x"] - actor[actor_phase]["x"],
+                camera[camera_phase]["z"] - actor[actor_phase]["z"],
+            ) >= MIN_CAMERA_ACTOR_CLEARANCE_M
+            for camera_phase in ("start_3d", "end_3d")
+            for actor_phase in ("start_3d", "end_3d")
+            for actor in block["actors"]
+        )
 
 
 def test_crowded_center_positions_are_spread_and_routes_remain_parseable(
