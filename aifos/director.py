@@ -115,6 +115,12 @@ from .story_analysis import (
     validate_line_speaker_resolution,
     validate_story_analysis,
 )
+from .story_intelligence import (
+    build_script_review_court,
+    build_storyboard_review_documents,
+    derive_episode_continuity_input,
+    review_document,
+)
 from .story_logic import (
     PROP_CONTRACT_SCHEMA,
     audit_prop_contract,
@@ -8536,6 +8542,207 @@ class Director:
             episode_id=ctx["episode"]["id"])
         return adapted
 
+    def _save_review_document(self, episode_id, kind, document):
+        """幂等保存非阻断审阅文档，避免断点续产制造空版本。"""
+        current, version = self.projects.latest_document(episode_id, kind)
+        if current == document:
+            return version
+        return self.projects.save_document(episode_id, kind, document)
+
+    def _previous_episode_continuity(self, ctx):
+        """读取紧邻前集的真实落盘事实，压缩成下一集编剧输入。
+
+        不向更早的非相邻集回退，防止缺集时把错误出口状态冒充上一集；
+        抽取或保存失败只留日志，不影响本集编剧继续工作。
+        """
+        try:
+            episode = ctx["episode"]
+            current_number = int(episode["number"] or 0)
+            previous = next((
+                item for item in self.projects.list_episodes(
+                    ctx["project"]["id"])
+                if int(item["number"]) == current_number - 1
+            ), None)
+            if previous is None:
+                return None
+            previous_script, script_version = self.projects.latest_document(
+                previous["id"], "script")
+            previous_storyboard, storyboard_version = (
+                self.projects.latest_document(previous["id"], "storyboard"))
+            previous_continuity, continuity_version = (
+                self.projects.latest_document(previous["id"], "continuity"))
+            report = derive_episode_continuity_input(
+                previous_episode_id=str(previous["id"]),
+                previous_script=previous_script,
+                previous_storyboard=previous_storyboard,
+                previous_continuity=previous_continuity,
+            )
+            document = review_document(report)
+            document["previous_episode_number"] = int(previous["number"])
+            document["source_versions"] = {
+                "script": int(script_version or 0),
+                "storyboard": int(storyboard_version or 0),
+                "continuity": int(continuity_version or 0),
+            }
+            self._save_review_document(
+                episode["id"], "previous_episode_continuity", document)
+            # 编剧只吃出口、钩子和当前仍有效的状态，避免把整集文档塞入
+            # 上下文；每条都来自上面保存的真实前集文档及其证据。
+            return {
+                "schema": document["schema"],
+                "previous_episode_id": document["previous_episode_id"],
+                "previous_episode_number": document[
+                    "previous_episode_number"],
+                "previous_exit_state": document["previous_exit_state"],
+                "unresolved_hooks": document.get(
+                    "unresolved_hooks", [])[:6],
+                "states": [
+                    {
+                        "domain": item.get("domain", ""),
+                        "entity_id": item.get("entity_id", ""),
+                        "state": item.get("state", ""),
+                        "evidence": item.get("evidence", ""),
+                    }
+                    for item in document.get("states", [])[:12]
+                    if isinstance(item, dict)
+                ],
+                "instructions": document.get("instructions", []),
+                "source_versions": document["source_versions"],
+            }
+        except Exception as exc:
+            self.log.warn(
+                "director",
+                "上一集连续性事实抽取失败，已跳过且未编造状态："
+                f"{str(exc)[:240]}")
+            return None
+
+    def _persist_script_review(self, ctx, result=None):
+        """只接受真正独立的五维审稿；否则明确保存待评审建议。"""
+        episode_id = ctx["episode"]["id"]
+        script_version = str(ctx.get("script_version") or "unknown")
+        try:
+            current, current_version = self.projects.latest_document(
+                episode_id, "script_review")
+        except Exception as exc:
+            self.log.warn(
+                "director", "剧本独立评审状态读取失败，已跳过且不阻断："
+                f"{str(exc)[:240]}")
+            return 0
+        current_dimensions = (
+            current.get("dimensions") if isinstance(current, dict) else None)
+        current_ready = bool(
+            result is None
+            and isinstance(current, dict)
+            and current.get("status") == "ready"
+            and str(current.get("script_version") or "") == script_version
+            and str(current.get("generator_run_id") or "").strip()
+            and str(current.get("reviewer_run_id") or "").strip()
+            and current.get("generator_run_id") != current.get(
+                "reviewer_run_id")
+            and str(current.get("reviewer_source") or "").strip().lower()
+            not in {"", "generator", "self", "self_report", "生成器", "自评"}
+            and isinstance(current_dimensions, list)
+            and len(current_dimensions) == 5
+            and all(
+                isinstance(item, dict)
+                and item.get("score") is not None
+                and item.get("evidence")
+                and item.get("directed_revision")
+                for item in current_dimensions))
+        if current_ready:
+            # 复用同一版剧本时不得用“本轮没有 reviewer result”把已经
+            # 成立的独立审稿降级成 pending。
+            return current_version
+        if (result is None and isinstance(current, dict)
+                and current.get("status") == "pending"
+                and str(current.get("script_version") or "")
+                == script_version):
+            return current_version
+        provider = str(getattr(result, "provider", "") or "").strip()
+        data = getattr(result, "data", None)
+        raw = (
+            data.get("independent_review")
+            if isinstance(data, dict)
+            and isinstance(data.get("independent_review"), dict)
+            else None)
+        generator_run_id = ""
+        if raw is not None:
+            generator_run_id = str(
+                raw.get("generator_run_id") or ctx.get("run_id") or ""
+            ).strip()
+        try:
+            if raw is None:
+                raise ValueError("当前编剧 Provider 未返回独立评审运行")
+            court = build_script_review_court(
+                script_version=script_version,
+                generator_run_id=generator_run_id,
+                reviewer_run_id=raw.get("reviewer_run_id"),
+                reviewer_source=raw.get("reviewer_source"),
+                dimension_reviews=raw.get("dimension_reviews"),
+            )
+            document = review_document(court)
+            document["status"] = "ready"
+        except (TypeError, ValueError) as exc:
+            # 不复制生成器自评分、不补默认分，也不把“没有审稿”写成通过。
+            stale_from = (
+                str(current.get("script_version") or "")
+                if isinstance(current, dict)
+                and str(current.get("script_version") or "")
+                not in {"", script_version}
+                else "")
+            document = {
+                "schema": "aifos.story-review-pending/v1",
+                "kind": "review",
+                "production_blocking": False,
+                "status": "pending",
+                "script_version": script_version,
+                "generator_run_id": generator_run_id,
+                "generator_source": provider,
+                "scores_available": False,
+                "reason": str(exc),
+                "advice": [
+                    "等待与剧本生成运行独立的审稿来源返回完整五维证据后复评。",
+                    "本记录只作提示，不阻断分镜与后续生产。",
+                ],
+            }
+            if stale_from:
+                document.update({
+                    "reason": "剧本版本已更新，旧独立评审不再适用；"
+                    "等待新版本独立五维复评。",
+                    "stale_from_script_version": stale_from,
+                })
+        try:
+            return self._save_review_document(
+                episode_id, "script_review", document)
+        except Exception as exc:
+            self.log.warn(
+                "director", "剧本独立评审文档保存失败，已跳过且不阻断："
+                f"{str(exc)[:240]}")
+            return 0
+
+    def _persist_storyboard_reviews(self, ctx, keyframes=()):
+        """保存导演审片与浏览九宫格；二者永不进入资产/参考图链。"""
+        try:
+            storyboard = ctx.get("storyboard") or {}
+            documents = build_storyboard_review_documents(
+                episode_id=str(ctx["episode"]["id"]),
+                storyboard=storyboard,
+                keyframes=keyframes,
+                storyboard_version=ctx.get("storyboard_version") or "",
+            )
+            versions = {}
+            for kind, key in (
+                    ("episode_director_review", "director_review"),
+                    ("nine_grid_browser", "nine_grid_browser")):
+                versions[kind] = self._save_review_document(
+                    ctx["episode"]["id"], kind, documents[key])
+            return versions
+        except Exception as exc:
+            self.log.warn(
+                "director", "导演审片/九宫格文档更新失败，已跳过且不阻断："
+                f"{str(exc)[:240]}")
+            return {}
+
     def _stage_script(self, ctx):
         episode = ctx["episode"]
         provided = ctx.get("provided_script")
@@ -8556,6 +8763,7 @@ class Director:
                 ctx, force=True)
             ctx["script_is_new"] = True
             version = ctx["script_version"]
+            self._persist_script_review(ctx)
             self.log.info(
                 "director", f"使用用户自带剧本(v{version})，"
                 f"AI 制作圣经(v{analysis_version})已完成，等待确认")
@@ -8583,6 +8791,7 @@ class Director:
                     self._ensure_story_analysis(
                         ctx, force=normalized_changed)
                 version = ctx["script_version"]
+                self._persist_script_review(ctx)
                 if normalized_changed:
                     self.log.info(
                         "director",
@@ -8603,6 +8812,10 @@ class Director:
             "template": ctx["project"]["kind"],       # drama / idol
             "persona": ctx["project"]["title"],       # 偶像人设名=项目名
         }
+        previous_episode_continuity = self._previous_episode_continuity(ctx)
+        if previous_episode_continuity is not None:
+            payload["previous_episode_continuity"] = (
+                previous_episode_continuity)
         # 剧本域历史教训(仅人工批准过的)随编剧提示词下发
         script_lessons = script_lessons_block(
             self.assets, ctx["project"]["id"])
@@ -8630,6 +8843,7 @@ class Director:
             ctx, force=True)
         version = ctx["script_version"]
         ctx["script_is_new"] = True     # 新写的剧本 → 触发剧本确认暂停
+        self._persist_script_review(ctx, result)
         self.data.record(
             "prompt", "success", prompt=f"script:{ctx['project']['title']}"
             f":e{episode['number']}", uri=result.uri,
@@ -8751,6 +8965,7 @@ class Director:
                 ctx["storyboard"] = existing
                 ctx["storyboard_version"] = version
                 self._plan_seed_shots(ctx)
+                self._persist_storyboard_reviews(ctx)
                 self.log.info("director", f"复用已有五维分镜 v{version}")
                 return {"version": version, "reused": True,
                         "shots": len(existing["shots"])}
@@ -8797,6 +9012,7 @@ class Director:
                       "seedance_prompt": shot["seedance_prompt"],
                       "unit_id": shot["unit_id"]})
         self._plan_seed_shots(ctx)
+        self._persist_storyboard_reviews(ctx)
         return {"version": version, "shots": len(storyboard["shots"]),
                 "pipeline_version": storyboard["pipeline_version"]}
 
@@ -14077,6 +14293,9 @@ class Director:
                 "shot_no": shot_no, "uri": result.uri,
                 "image_quality": quality["level"]})
         ctx["images"].sort(key=lambda i: i["shot_no"])
+        # 只把已经正式选中的关键帧 URI 写回浏览板。候选图、拼贴图和
+        # 未晋升结果不会进入九宫格，更不会因此被注册成生成参考资产。
+        self._persist_storyboard_reviews(ctx, keyframes=ctx["images"])
         if skipped_awaiting and not qc_failures:
             # 无法迁移的历史检查点仍不得带着缺图流入首尾帧/视频阶段。
             raise AifosError(
