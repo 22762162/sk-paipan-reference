@@ -1445,13 +1445,9 @@ def test_standard_center_api_lifecycle(server):
 
 
 def test_produce_flow_and_episode_api(server):
-    # 这里覆盖传统自动完成整集的兼容流程；新版默认选片模式会在关键帧
-    # 四候选齐全后等待人工/AI 明确选择，已由独立候选 API/UI 用例覆盖。
-    set_defaults(server["workspace"] / "config.json", {
-        "selection_mode": False,
-    })
     port = server["port"]
-    # Web 默认流程:剧本 → 正式人物/核心道具四选一 → 预生产 → 开拍确认
+    # Web 默认流程:剧本 → 正式人物/核心道具四选一 → 预生产 →
+    # 开拍确认 → 每镜四候选明确选片 → 自动续产成片。
     status, reply = _json_request(port, "POST", "/api/produce", {
         "sentence": "开始制作《万妖图录》第15集"})
     assert status == 202
@@ -1584,12 +1580,54 @@ def test_produce_flow_and_episode_api(server):
     assert pre["artifacts"]["scene_art"], "确认页需要场景概念图"
     assert pre["artifacts"]["videos"] == {}, "确认前不应生产视频"
 
-    # 开拍确认 → 自动完成剩余全部阶段
+    # 开拍确认 → 每镜固定生成4张并停在选片，不得把推荐稿偷偷晋升。
     status, reply = _json_request(port, "POST", "/api/confirm", {
         "episode_id": episode_id, "video_quality": "high"})
     assert status == 202
     job = _wait_job(port, reply["job_id"])
-    assert job["summary"]["status"] == "done"
+    assert job["summary"]["status"] == "awaiting_confirm"
+    image_stage = next(
+        stage for stage in job["summary"]["stages"]
+        if stage["stage"] == "images")
+    assert image_stage["detail"]["awaiting_selection"] is True
+
+    status, selecting = _json_request(
+        port, "GET", f"/api/episode/{episode_id}")
+    assert status == 200
+    candidate_items = sorted(
+        (item for item in selecting["render_plan"]["items"]
+         if item.get("category") == "shot_image"),
+        key=lambda item: int(item["shot_no"]))
+    assert candidate_items
+    assert all(item["status"] == "awaiting_selection"
+               for item in candidate_items)
+    assert all(len(item["candidate_group"]["candidates"]) == 4
+               for item in candidate_items)
+
+    # 每一镜都明确选择当前版本候选；只有最后一镜会原子排一次续产任务。
+    resume_job_id = None
+    for item in candidate_items:
+        group = item["candidate_group"]
+        candidate = group["candidates"][0]
+        status, selected_shot = _json_request(
+            port, "POST", "/api/shot-candidates/select", {
+                "episode_id": episode_id,
+                "shot_no": item["shot_no"],
+                "candidate_set_id": group["candidate_set_id"],
+                "candidate_set_token": group["candidate_set_token"],
+                "contract_revision": group["contract_revision"],
+                "candidate_revision": group["candidate_revision"],
+                "candidate_id": candidate["candidate_id"],
+                "candidate_index": candidate["candidate_index"],
+            })
+        assert status == 200
+        if selected_shot.get("resume_job_id"):
+            assert resume_job_id is None
+            resume_job_id = selected_shot["resume_job_id"]
+    assert resume_job_id
+    job = _wait_job(port, resume_job_id)
+    assert job["summary"]["status"] == "done", json.dumps(
+        job["summary"], ensure_ascii=False)
 
     status, detail = _json_request(port, "GET", f"/api/episode/{episode_id}")
     assert status == 200
