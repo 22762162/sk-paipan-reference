@@ -142,7 +142,8 @@ def test_qc_failure_auto_records_lesson(app, tmp_path):
 
     app.director.router = StubRouter()
     result = app.director._generate_image_with_qc(
-        "image", {"prompt": "x", "shot_no": 1}, tmp_path, None,
+        "image", {"prompt": "x", "shot_no": 1,
+                  "_episode_id": "unit-test"}, tmp_path, None,
         {"characters": [], "count": 0, "designs": "", "location": "",
          "action": "", "forbid": []})
     assert result.qc["passed"] is True
