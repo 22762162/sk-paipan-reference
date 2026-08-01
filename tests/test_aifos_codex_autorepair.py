@@ -17,6 +17,11 @@ from aifos.errors import ProviderError
 @pytest.fixture()
 def app(tmp_path):
     instance = App(tmp_path / "ws")
+    # 这些用例覆盖严格QC后的Codex自动修订链；创作选片模式默认关闭
+    # 内容QC，故在本测试域显式启用旧严格路径。
+    instance.config.data.setdefault("defaults", {})[
+        "selection_mode"] = False
+    instance.config.data["defaults"]["image_content_qc"] = True
     yield instance
     instance.close()
 
@@ -450,6 +455,8 @@ def test_stage_images_seeds_stored_codex_repair_directly_into_three_draws(
 
     monkeypatch.setattr(app.director, "_plan_seed_shots", lambda _ctx: None)
     monkeypatch.setattr(app.director, "_distill_lessons", lambda _ctx: 0)
+    monkeypatch.setattr(app.director, "_generation_preflight_issues",
+                        lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         app.director, "reconcile_completed_shot_images",
         lambda _ctx: {

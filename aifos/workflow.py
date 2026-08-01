@@ -1145,7 +1145,11 @@ def _text_asset(shot, rules=None):
     # 同一条要求通常同时出现在 description 和 prompt；白名单必须只来自
     # 当前镜头明确声明的原文，不能从某个历史项目推断并永久追加专有词。
     texts = sanitize_text_whitelist(texts)
-    required = bool(carrier)
+    # Legacy prose can mention a screen/book/sign without spelling the exact
+    # visible wording.  A carrier alone is not a renderable text asset and
+    # must never be reported as "locked": otherwise the image model invents
+    # glyphs while the workflow falsely claims exact text was verified.
+    required = bool(carrier and texts)
     return {
         "required": required,
         "carrier": carrier,
@@ -1157,7 +1161,11 @@ def _text_asset(shot, rules=None):
         "source": "legacy_inferred" if required else "none",
         "locked_by": "",
         "keyframe_uri": "",
-        "rule": "文字必须由ChatGPT关键帧锁定，Seedance只保持原字" if required else "无可读文字",
+        "rule": (
+            "文字必须由ChatGPT关键帧锁定，Seedance只保持原字"
+            if required else
+            ("检测到文字载体但没有逐字白名单，禁止自行生成文字"
+             if carrier else "无可读文字")),
     }
 
 
@@ -2526,6 +2534,14 @@ def _gate(gate_id, label, passed, detail):
     return {"id": gate_id, "label": label, "passed": bool(passed), "detail": detail}
 
 
+def frame_content_qc_accepted(frame):
+    """True for an actual content verdict or an explicit policy waiver."""
+    frame = frame if isinstance(frame, dict) else {}
+    return bool(
+        frame.get("qc_passed") is True
+        or frame.get("content_qc_waived") is True)
+
+
 def build_preflight(script, storyboard, continuity, text_manifest, frames,
                     profile, blocking=None, quality_policy=None,
                     character_assets=None):
@@ -2554,8 +2570,13 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
     formal_frame_quality_ok = all(
         str(frame.get("image_quality", "medium")).lower()
         in ("medium", "high") for frame in frames)
+    # Content-QC off is an explicit production policy, not a fake PASS.
+    # Technical frame existence/quality remains enforced below; the visual
+    # gate accepts either an actual verdict or an auditable waiver.
     frame_visual_qc_ok = all(
-        frame.get("qc_passed") is True for frame in frames)
+        frame_content_qc_accepted(frame) for frame in frames)
+    frame_content_qc_waived = bool(frames) and all(
+        frame.get("content_qc_waived") is True for frame in frames)
     required = (
         "unit_id", "character_count", "start_state", "end_state",
         "shot_function", "script_reference", "readable_text", "visual_hook",
@@ -2825,7 +2846,11 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
               and all(f.get("first") and f.get("last") for f in frames)
               and formal_frame_quality_ok and frame_visual_qc_ok,
               f"{len(frame_map)}/{len(shots)} 个单元首尾帧就绪；"
-              + ("均为中/高质量且已通过视觉质检"
+              + ("均为中/高质量；内容质检已按选片模式明确豁免，"
+                 "未伪造视觉PASS"
+                 if (formal_frame_quality_ok and frame_visual_qc_ok
+                     and frame_content_qc_waived)
+                 else "均为中/高质量且已通过视觉质检"
                  if formal_frame_quality_ok and frame_visual_qc_ok
                  else "含低质量试错帧或缺少视觉质检")),
         _gate("audio", "环境声与声音策略", sound_ok,

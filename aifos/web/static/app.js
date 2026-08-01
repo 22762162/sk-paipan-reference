@@ -42,6 +42,7 @@ async function api(path, opts) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const error = new Error(data.message || data.error || `HTTP ${res.status}`);
+    error.status = res.status;
     error.details = data;
     throw error;
   }
@@ -3524,6 +3525,9 @@ const PLAN_STATUS_CN = {
   pending: "排队中", generating: "生成中", done: "已完成",
   failed: "失败", reused: "复用已有", selected: "已选定",
   awaiting_human: "二次质检未过 · 待人工修改",
+  awaiting_selection: "4张已齐 · 待选正式图",
+  regenerating_candidates: "正在并行换4张",
+  technical_incomplete: "候选技术未补齐",
 };
 const PLAN_QC_CATS = new Set(["shot_image", "frames"]);
 function planQcEnabled(item) { return PLAN_QC_CATS.has(item.category); }
@@ -3750,6 +3754,64 @@ function thumbUrl(url, w = 480) {
   return url + (url.includes("?") ? "&" : "?") + "w=" + w;
 }
 
+function shotCandidateGroup(item) {
+  if (!item || item.category !== "shot_image") return null;
+  const group = item.candidate_group || item.shot_candidate_group;
+  return group && typeof group === "object" && group.selection_required
+    ? group : null;
+}
+
+function shotCandidateUrl(candidate) {
+  return String((candidate || {}).uri || (candidate || {}).url || "").trim();
+}
+
+function shotCandidates(item) {
+  const group = shotCandidateGroup(item);
+  if (!group) return [];
+  const seen = new Set();
+  return (group.candidates || []).filter((candidate) => {
+    const index = shotCandidateIndex(candidate);
+    if (!candidate || !shotCandidateUrl(candidate)
+        || index < 1 || index > 4 || seen.has(index)) return false;
+    seen.add(index);
+    return true;
+  }).sort((left, right) =>
+    shotCandidateIndex(left) - shotCandidateIndex(right));
+}
+
+function shotCandidateIndex(candidate) {
+  return Number((candidate || {}).candidate_index || (candidate || {}).index || 0);
+}
+
+function shotCandidateSelected(group, candidate) {
+  const selection = (group || {}).selection || {};
+  if (!selection || typeof selection !== "object") return false;
+  const candidateId = String(candidate.candidate_id || "");
+  const selectedId = String(selection.candidate_id || "");
+  if (candidateId && selectedId) return candidateId === selectedId;
+  const selectedIndex = Number(selection.candidate_index || 0);
+  const currentToken = String(group.candidate_set_token || "");
+  const selectedToken = String(selection.candidate_set_token || selection.token || "");
+  if (selectedIndex && currentToken && selectedToken)
+    return currentToken === selectedToken
+      && shotCandidateIndex(candidate) === selectedIndex;
+  return String(selection.selected_uri || selection.selected_url || "")
+    === shotCandidateUrl(candidate);
+}
+
+function shotCandidateState(item) {
+  const group = shotCandidateGroup(item);
+  if (!group) return null;
+  const candidates = shotCandidates(item);
+  // 当前产品合同固定四候选；服务端即便遇到旧/损坏计数也钳制为4，
+  // 前端同样不能因为脏字段扩成5格或缩成3格。
+  const expected = 4;
+  const missing = Math.max(0, expected - candidates.length);
+  const technicalIncomplete = group.technical_incomplete === true
+    || item.status === "technical_incomplete" || missing > 0;
+  return { group, candidates, expected, missing, technicalIncomplete };
+}
+
 function planItemThumbs(data, item) {
   const art = data.artifacts || {};
   let urls = [];
@@ -3770,7 +3832,9 @@ function planItemThumbs(data, item) {
     const row = (art.scene_art || []).find((s) => s.name === item.name);
     if (row && row.url) urls = [row.url];
   } else if (item.category === "shot_image") {
-    if ((art.images || {})[item.shot_no]) urls = [art.images[item.shot_no]];
+    const candidates = shotCandidates(item).map(shotCandidateUrl);
+    if (candidates.length) urls = candidates;
+    else if ((art.images || {})[item.shot_no]) urls = [art.images[item.shot_no]];
     else if (item.output_url) urls = [item.output_url];
   } else if (item.category === "frames") {
     if ((art.first || {})[item.shot_no]) urls.push(art.first[item.shot_no]);
@@ -3792,13 +3856,87 @@ function planTargetOf(item) {
   return { kind: "shot", shot_no: item.shot_no };
 }
 
+function shotCandidateSetPayload(episodeId, item, candidate = null) {
+  const group = shotCandidateGroup(item) || {};
+  const version = group.version || {};
+  return {
+    episode_id: Number(episodeId),
+    item_id: item.id,
+    shot_no: Number(item.shot_no),
+    candidate_set_id: String(group.candidate_set_id || ""),
+    candidate_set_token: String(group.candidate_set_token || version.token || ""),
+    contract_revision: Number(group.contract_revision || version.contract_revision || 1),
+    candidate_revision: Number(group.candidate_revision || version.candidate_revision || 1),
+    candidate_id: candidate ? String(candidate.candidate_id || "") : "",
+    candidate_index: candidate ? shotCandidateIndex(candidate) : 0,
+  };
+}
+
+function shotCandidateGridHtml(item, editable) {
+  const state = shotCandidateState(item);
+  if (!state) return "";
+  const { group, candidates, expected, missing, technicalIncomplete } = state;
+  const selected = candidates.find((candidate) =>
+    shotCandidateSelected(group, candidate));
+  const errors = (group.candidate_errors || []).map((row) =>
+    `候选${row.candidate_index || "?"}：${row.error || "技术生成失败"}`);
+  const byIndex = new Map(candidates.map((candidate) =>
+    [shotCandidateIndex(candidate), candidate]));
+  const slots = [1, 2, 3, 4].map((index) => ({
+    index, candidate: byIndex.get(index) || null,
+  }));
+  return `<section class="shot-candidate-panel" aria-label="本镜4张候选">
+    <div class="shot-candidate-head"><div><b>本镜4张候选</b>
+      <span>${selected ? `已选候选 ${shotCandidateIndex(selected)} 为正式关键帧；4张均保留回看`
+        : (technicalIncomplete ? `技术未补齐，当前 ${candidates.length}/${expected} 张`
+          : "4张使用同一冻结提示词与参考图；请选择1张正式关键帧")}</span></div>
+      <span class="plan-st st-${technicalIncomplete ? "technical_incomplete" : (selected ? "done" : "awaiting_selection")}">
+        ${technicalIncomplete ? `缺 ${missing || Math.max(1, expected - candidates.length)} 张 · 暂不可选`
+          : (selected ? "正式图已选" : "待人工选片")}</span></div>
+    ${errors.length ? `<div class="shot-candidate-technical-error">${esc(errors.join("；"))}</div>` : ""}
+    <div class="shot-candidate-grid">${slots.map(({ index, candidate }) => {
+      if (!candidate) return `<article class="shot-candidate missing"
+        aria-label="候选 ${index} 尚未生成">
+        <div class="shot-candidate-image plan-thumb-empty" aria-hidden="true">🖼</div>
+        <div class="shot-candidate-foot"><span>候选 ${index}</span>
+          <button type="button" disabled>等待技术补齐</button></div>
+      </article>`;
+      const isSelected = shotCandidateSelected(group, candidate);
+      const url = shotCandidateUrl(candidate);
+      return `<article class="shot-candidate${isSelected ? " selected" : ""}">
+        <button type="button" class="shot-candidate-image shot-candidate-open"
+          data-plan-id="${esc(item.id)}" data-candidate-index="${index}"
+          title="点开放大候选 ${index}" aria-label="放大候选 ${index}">
+          <img src="${esc(thumbUrl(url, 520))}" loading="lazy" alt="${esc(item.label)} · 候选${index}">
+          ${isSelected ? `<span class="shot-candidate-selected">✓ 正式关键帧</span>` : ""}
+        </button>
+        <div class="shot-candidate-foot"><span>候选 ${index}</span>
+          <button type="button" class="${isSelected ? "selected" : "primary"} shot-candidate-pick"
+            data-plan-id="${esc(item.id)}" data-candidate-index="${index}"
+            ${(!editable || technicalIncomplete || isSelected) ? "disabled" : ""}>
+            ${isSelected ? "✓ 已选为正式图" : (technicalIncomplete ? "补齐4张后可选" : "选定这张")}</button>
+        </div></article>`;
+    }).join("")}</div>
+    ${editable ? `<div class="shot-candidate-controls">
+      <button type="button" class="shot-candidate-edit-toggle">✎ 修改提示词，整组换4张</button>
+      <div class="shot-candidate-regenerate-form" hidden>
+        <textarea class="shot-candidate-prompt" rows="3">${esc(item.prompt_used || item.prompt || "")}</textarea>
+        <button type="button" class="primary shot-candidate-regenerate"
+          data-plan-id="${esc(item.id)}">整组并行换4张</button>
+        <small>会作废当前选择并生成新的候选组；其他镜头继续生产，不会暂停整集。</small>
+      </div></div>` : ""}
+  </section>`;
+}
+
 function planItemHtml(data, item, editable) {
   const thumbs = planItemThumbs(data, item);
   const st = item.status || "pending";
+  const candidateMode = !!shotCandidateGroup(item);
   const canEdit = editable && item.category !== "character_candidate";
-  const selectable = canEdit && ["done", "reused", "awaiting_human", "failed"].includes(st);
+  const selectable = canEdit && !candidateMode
+    && ["done", "reused", "awaiting_human", "failed"].includes(st);
   const qcFailed = planNeedsRevision(item);
-  return `<div class="plan-item plan-selectable st-${st}" data-plan-select="${esc(item.id)}"
+  return `<div class="plan-item plan-selectable${candidateMode ? " has-shot-candidates" : ""} st-${st}" data-plan-select="${esc(item.id)}"
     role="button" tabindex="0" aria-pressed="false"
     aria-label="选择查看 ${esc(item.label)}">
     <div class="plan-thumbs">${thumbs.length
@@ -3839,7 +3977,8 @@ function planItemHtml(data, item, editable) {
       ${planQcIssuesHtml(item)}
       ${planQcReferenceGalleryHtml(item)}
       ${planTraceHtml(item)}
-      ${canEdit ? `<div class="plan-edit" data-target="${esc(JSON.stringify(planTargetOf(item)))}">
+      ${shotCandidateGridHtml(item, editable)}
+      ${canEdit && !candidateMode ? `<div class="plan-edit" data-target="${esc(JSON.stringify(planTargetOf(item)))}">
         <button class="plan-edit-toggle">🔄 修改提示词/重画这张</button>
         <div class="plan-edit-form" hidden>
           <textarea class="plan-edit-prompt" rows="3">${esc(item.prompt_used || item.prompt || "")}</textarea>
@@ -5688,8 +5827,11 @@ async function refreshOpenPlanOverlay(episodeId, force = false) {
   const panel = overlay?.querySelector(".plan-overlay-content");
   if (!panel) return false;
   const active = document.activeElement;
-  if (!force && (panel.querySelector(".plan-edit-form:not([hidden])")
-      || active?.closest(".plan-edit-form"))) {
+  if (!force && (panel.dataset.shotCandidateMutation === "1"
+      || panel.querySelector(".plan-edit-form:not([hidden])")
+      || panel.querySelector(".shot-candidate-regenerate-form:not([hidden])")
+      || panel.querySelector('.shot-candidate-regenerate[data-armed="1"]')
+      || active?.closest(".plan-edit-form, .shot-candidate-regenerate-form"))) {
     // 用户正在改词时不替换 DOM；否则 textarea 会失焦、滚动位置也会跳走。
     return false;
   }
@@ -5710,7 +5852,8 @@ async function refreshOpenPlanOverlay(episodeId, force = false) {
     panel.innerHTML = renderPlanHtml(data, true)
       || `<div class="dim">本集还没有图片生产计划。</div>`;
     bindPlanSelection(panel, data, episodeId);
-    bindPlanRegen(panel, episodeId, () => refreshOpenPlanOverlay(episodeId));
+    bindPlanRegen(panel, episodeId,
+      () => refreshOpenPlanOverlay(episodeId), data);
     panel.querySelectorAll(".plan-pick-box").forEach((box) => {
       box.checked = checked.has(box.dataset.pick);
     });
@@ -5835,7 +5978,200 @@ function manualPassSelected(episodeId, btn) {
   manualPassItems(episodeId, ids, btn, () => refreshOpenPlanOverlay(episodeId));
 }
 
-function bindPlanRegen(container, episodeId, onDone) {
+async function refreshShotCandidatePlan(episodeId, onDone, force = true) {
+  if (document.querySelector(`.plan-overlay[data-episode="${episodeId}"]`))
+    return refreshOpenPlanOverlay(episodeId, force);
+  if (onDone) return onDone();
+  return renderCanvasView(episodeId);
+}
+
+async function selectShotCandidate(episodeId, item, candidate, btn, onDone) {
+  const panel = btn.closest(".plan-overlay-content");
+  const original = btn.textContent;
+  if (panel) panel.dataset.shotCandidateMutation = "1";
+  btn.disabled = true;
+  btn.textContent = "正在锁定…";
+  try {
+    await api("/api/shot-candidates/select", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...shotCandidateSetPayload(episodeId, item, candidate),
+        source: "manual",
+      }),
+    });
+    showToast(`镜头 ${item.shot_no} 已选候选 ${shotCandidateIndex(candidate)} 为正式关键帧；其余3张保留回看`, "ok");
+    if (panel) delete panel.dataset.shotCandidateMutation;
+    await refreshShotCandidatePlan(episodeId, onDone, true);
+  } catch (error) {
+    if (panel) delete panel.dataset.shotCandidateMutation;
+    if (error.status === 409) {
+      showToast("这组候选已经更新，正在刷新到最新4张，请重新选择", "error");
+      await refreshShotCandidatePlan(episodeId, onDone, true);
+      return;
+    }
+    showToast(error.message, "error");
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+}
+
+function showShotCandidateCompare(
+    episodeId, item, startIndex, editable, onDone) {
+  const state = shotCandidateState(item);
+  if (!state || !state.candidates.length) return;
+  const { group, candidates, technicalIncomplete } = state;
+  const overlay = document.createElement("div");
+  overlay.className = "cast-compare-overlay shot-candidate-compare";
+  overlay.innerHTML = `
+    <div class="cast-compare-head">
+      <b>${esc(item.label)} · 4张候选</b>
+      <span class="cast-compare-counter"></span>
+      <button type="button" class="cast-compare-close">关闭 ✕</button>
+    </div>
+    <div class="cast-compare-track">${candidates.map((candidate) => {
+      const index = shotCandidateIndex(candidate);
+      return `<figure class="cast-compare-slide" data-index="${index}"
+        data-selected="${shotCandidateSelected(group, candidate) ? "1" : "0"}">
+        <img src="${esc(shotCandidateUrl(candidate))}"
+          alt="${esc(item.label)} · 候选${index}">
+      </figure>`;
+    }).join("")}</div>
+    <div class="cast-compare-foot">
+      <div class="cast-compare-dots">${candidates.map((candidate) =>
+        `<i data-index="${shotCandidateIndex(candidate)}"></i>`).join("")}</div>
+      <div class="cast-compare-label"></div>
+      <button type="button" class="primary cast-compare-pick"></button>
+    </div>`;
+  document.body.appendChild(overlay);
+  const track = overlay.querySelector(".cast-compare-track");
+  const slides = [...overlay.querySelectorAll(".cast-compare-slide")];
+  const counter = overlay.querySelector(".cast-compare-counter");
+  const label = overlay.querySelector(".cast-compare-label");
+  const pick = overlay.querySelector(".cast-compare-pick");
+  const dots = [...overlay.querySelectorAll(".cast-compare-dots i")];
+  let current = Math.max(0, slides.findIndex(
+    (slide) => Number(slide.dataset.index) === Number(startIndex)));
+  const sync = () => {
+    const slide = slides[current];
+    if (!slide) return;
+    const selected = slide.dataset.selected === "1";
+    counter.textContent = `${current + 1} / ${slides.length}`;
+    label.textContent = `候选 ${slide.dataset.index}${selected ? " · 当前正式关键帧" : ""}`;
+    pick.disabled = !editable || technicalIncomplete || selected;
+    pick.textContent = selected ? "✓ 已选为正式图"
+      : (technicalIncomplete ? "技术补齐4张后才能选"
+        : `✓ 选定这张（候选 ${slide.dataset.index}）`);
+    dots.forEach((dot, index) => dot.classList.toggle("on", index === current));
+  };
+  const close = () => overlay.remove();
+  overlay.querySelector(".cast-compare-close").onclick = close;
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay || event.target === track) close();
+  });
+  track.addEventListener("scroll", () => {
+    const index = Math.round(track.scrollLeft / track.clientWidth);
+    if (index !== current && slides[index]) { current = index; sync(); }
+  }, { passive: true });
+  pick.onclick = async () => {
+    const candidate = candidates.find((row) =>
+      shotCandidateIndex(row) === Number(slides[current].dataset.index));
+    if (!candidate) return;
+    await selectShotCandidate(episodeId, item, candidate, pick, onDone);
+    if (!document.body.contains(pick) || pick.disabled) close();
+  };
+  requestAnimationFrame(() => {
+    track.scrollLeft = current * track.clientWidth;
+    sync();
+  });
+}
+
+function bindShotCandidateControls(container, data, episodeId, onDone) {
+  const items = ((data || {}).render_plan || {}).items || [];
+  const byId = new Map(items.map((item) => [String(item.id), item]));
+  const resolve = (button) => {
+    const item = byId.get(String(button.dataset.planId || ""));
+    if (!item) return {};
+    const candidate = shotCandidates(item).find((row) =>
+      shotCandidateIndex(row) === Number(button.dataset.candidateIndex || 0));
+    return { item, candidate };
+  };
+  container.querySelectorAll(".shot-candidate-open").forEach((button) => {
+    button.onclick = (event) => {
+      event.stopPropagation();
+      const { item, candidate } = resolve(button);
+      if (item && candidate) showShotCandidateCompare(
+        episodeId, item, shotCandidateIndex(candidate), true, onDone);
+    };
+  });
+  container.querySelectorAll(".shot-candidate-pick").forEach((button) => {
+    button.onclick = async (event) => {
+      event.stopPropagation();
+      const { item, candidate } = resolve(button);
+      if (item && candidate)
+        await selectShotCandidate(episodeId, item, candidate, button, onDone);
+    };
+  });
+  container.querySelectorAll(".shot-candidate-controls").forEach((controls) => {
+    const form = controls.querySelector(".shot-candidate-regenerate-form");
+    const toggle = controls.querySelector(".shot-candidate-edit-toggle");
+    toggle.onclick = (event) => {
+      event.stopPropagation();
+      form.hidden = !form.hidden;
+      toggle.textContent = form.hidden ? "✎ 修改提示词，整组换4张" : "收起整组修改";
+      if (!form.hidden) form.querySelector("textarea").focus();
+    };
+    const button = controls.querySelector(".shot-candidate-regenerate");
+    button.onclick = (event) => {
+      event.stopPropagation();
+      armConfirm(button, "整组换4张", async () => {
+        const item = byId.get(String(button.dataset.planId || ""));
+        if (!item) return;
+        const panel = button.closest(".plan-overlay-content");
+        const prompt = form.querySelector(".shot-candidate-prompt").value.trim();
+        if (!prompt) {
+          showToast("提示词不能为空", "error");
+          return;
+        }
+        if (panel) panel.dataset.shotCandidateMutation = "1";
+        button.disabled = true;
+        button.textContent = "正在提交4路并行生成…";
+        try {
+          const reply = await api("/api/shot-candidates/regenerate", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              ...shotCandidateSetPayload(episodeId, item),
+              prompt, confirm_regenerate: true,
+            }),
+          });
+          showToast(`镜头 ${item.shot_no} 已开始整组换4张；其他镜头继续生产`, "ok");
+          if (panel) delete panel.dataset.shotCandidateMutation;
+          await refreshShotCandidatePlan(episodeId, onDone, true);
+          if (reply.job_id) pollJob(reply.job_id, async (job) => {
+            if (job.status === "done")
+              showToast(`镜头 ${item.shot_no} 的新4张候选已生成完毕`, "ok");
+            else if (job.status === "failed")
+              showToast(job.error || "整组候选生成失败", "error");
+            await refreshShotCandidatePlan(episodeId, onDone, true);
+          });
+          pollCanvas(episodeId);
+        } catch (error) {
+          if (panel) delete panel.dataset.shotCandidateMutation;
+          if (error.status === 409) {
+            showToast("候选组已变化，已刷新到最新版本；请重新提交修改", "error");
+            await refreshShotCandidatePlan(episodeId, onDone, true);
+            return;
+          }
+          showToast(error.message, "error");
+          button.disabled = false;
+          button.textContent = "整组并行换4张";
+        }
+      });
+    };
+  });
+}
+
+function bindPlanRegen(container, episodeId, onDone, data = null) {
+  if (data) bindShotCandidateControls(container, data, episodeId, onDone);
   container.querySelectorAll(".plan-pick-box").forEach((box) => {
     box.onchange = planUpdateSelCount;
   });
@@ -6696,7 +7032,8 @@ async function showPlanOverlay(episodeId, focusId = "", focusCategory = "") {
   document.addEventListener("keydown", onKey);
   document.body.appendChild(overlay);
   bindPlanSelection(overlay, data, episodeId);
-  bindPlanRegen(overlay, episodeId, () => { close(); showPlanOverlay(episodeId); });
+  bindPlanRegen(overlay, episodeId,
+    () => refreshOpenPlanOverlay(episodeId), data);
   if (focusId) {
     const target = [...overlay.querySelectorAll("[data-plan-select]")]
       .find((card) => card.dataset.planSelect === focusId);
@@ -8484,6 +8821,7 @@ async function renderAssetsCenter(selectedTitle) {
         <button class="primary" id="btn-restyle" ${ep ? "" : "disabled"}>🎨 按此画风重做全部形象</button>
       </div>
       ${imageLineControlsHtml()}
+      ${selectionModeControlsHtml()}
       <div class="dim">重做会消耗出图额度(每张一次);过程在本集页面实况可见,
         可随时暂停,已完成的保留。分镜画面如需同步新画风,重做完成后到本集点「全部重做」。</div>
     </section>
@@ -8567,6 +8905,7 @@ async function renderAssetsCenter(selectedTitle) {
     renderAssetsCenter(ev.target.value);
   bindProjectShellControls(title);
   bindImageLineControls();
+  bindSelectionModeControls();
   const restyleBtn = document.getElementById("btn-restyle");
   if (restyleBtn && ep) restyleBtn.onclick = (ev) =>
     armConfirm(ev.target, "重做", async () => {
@@ -10736,6 +11075,75 @@ function imageLineControlsHtml() {
   </div>`;
 }
 
+/* ---- 创作选片模式:一键关闭内容质检,每镜固定4张候选人工选片 ---- */
+function selectionModeControlsHtml() {
+  return `<div class="style-row selection-mode-row">
+    <label>创作选片模式</label>
+    <label class="il-label sm-toggle">
+      <input type="checkbox" id="sm-master" disabled> 一键开启
+    </label>
+    <label class="il-label sm-toggle">
+      <input type="checkbox" id="sm-image-qc" disabled> 图片内容质检
+    </label>
+    <label class="il-label sm-toggle">
+      <input type="checkbox" id="sm-video-qc" disabled> 视频内容质检
+    </label>
+    <span class="dim" id="sm-hint">加载中…</span>
+  </div>`;
+}
+
+async function bindSelectionModeControls() {
+  const master = document.getElementById("sm-master");
+  const imgQc = document.getElementById("sm-image-qc");
+  const vidQc = document.getElementById("sm-video-qc");
+  const hint = document.getElementById("sm-hint");
+  if (!master || !imgQc || !vidQc) return;
+  let st;
+  try { st = await api("/api/selection-mode"); } catch (e) { return; }
+  const render = () => {
+    master.checked = !!st.selection_mode;
+    imgQc.checked = !!st.image_content_qc;
+    vidQc.checked = !!st.video_content_qc;
+    // 选片模式开启时内容质检一律视为关闭:子开关只读展示,不误导
+    imgQc.disabled = vidQc.disabled = !!st.selection_mode;
+    master.disabled = false;
+    if (!st.selection_mode) { imgQc.disabled = vidQc.disabled = false; }
+    hint.textContent = st.selection_mode
+      ? `选片模式开启:每镜固定 ${st.shot_candidate_count} 张候选,`
+        + "内容质检不判定、不阻断、不自动返工;不满意改词重抽。"
+        + "生成前导演合同检查与技术完整性检查始终开启"
+      : `选片模式关闭(每镜候选固定 ${st.shot_candidate_count} 张;`
+        + "内容质检按左侧两个独立开关执行)";
+  };
+  const save = async (body, revert) => {
+    master.disabled = imgQc.disabled = vidQc.disabled = true;
+    try {
+      st = await api("/api/selection-mode", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      render();
+      showToast(st.selection_mode
+        ? "创作选片模式已开启:内容质检不再判定,由你选片"
+        : "设置已保存", "ok");
+    } catch (e) {
+      revert();
+      render();
+      showToast(staleServerHint(e), "error");
+    }
+  };
+  master.onchange = () => save(
+    { enabled: master.checked },
+    () => { st.selection_mode = !master.checked; });
+  imgQc.onchange = () => save(
+    { image_content_qc: imgQc.checked },
+    () => { st.image_content_qc = !imgQc.checked; });
+  vidQc.onchange = () => save(
+    { video_content_qc: vidQc.checked },
+    () => { st.video_content_qc = !vidQc.checked; });
+  render();
+}
+
 /* 界面已更新但服务进程还是旧版时,接口会报旧错误 → 给出重启指引 */
 function staleServerHint(e) {
   const msg = String((e && e.message) || e);
@@ -11047,6 +11455,248 @@ function collectStoryAnalysis(analysis) {
   return next;
 }
 
+const STORY_REVIEW_STATUS = {
+  ready: ["已生成建议", "ready"],
+  advisory: ["有建议 · 不阻断", "advisory"],
+  pending: ["待独立评审 · 不影响生产", "pending"],
+  stale: ["基于旧剧本 · 建议复评", "stale"],
+  not_applicable: ["无前集", "neutral"],
+  unavailable: ["暂不可用 · 不影响生产", "neutral"],
+  invalid: ["记录需核对 · 不影响生产", "advisory"],
+};
+
+function storyReviewStatusHtml(entry, fallback = "已生成建议") {
+  const status = entry?.status || "ready";
+  const [label, tone] = STORY_REVIEW_STATUS[status] || [fallback, "neutral"];
+  return `<span class="story-review-status ${esc(tone)}">${esc(label)}</span>`;
+}
+
+function storyDistributionHtml(title, rows) {
+  const values = Array.isArray(rows) ? rows : [];
+  return `<div class="story-director-stat"><b>${esc(title)}</b><div>${values.length
+    ? values.map((row) => `<span>${esc(row?.[0] || "未标注")} <strong>${Number(row?.[1]) || 0}</strong></span>`).join("")
+    : `<small>暂无数据</small>`}</div></div>`;
+}
+
+function episodeDirectorReviewHtml(review, statusEntry = null) {
+  if (!review || review.kind !== "review" || review.production_blocking !== false) {
+    return `<div class="story-review-empty">${storyReviewStatusHtml(
+      statusEntry || { status: "unavailable" })}<p>${esc(
+        statusEntry?.message || "全集导演摘要暂不可用 · 不影响生产")}</p></div>`;
+  }
+  const completeness = review.input_completeness || {};
+  const missingGroups = [
+    ["台词", completeness.dialogue_missing],
+    ["动作节拍", completeness.beat_missing],
+    ["光影", completeness.lighting_missing],
+    ["剧本故事", completeness.script_reference_missing],
+    ["五维分镜", completeness.five_dimensions_missing],
+    ["起止状态", completeness.start_end_state_missing],
+  ].filter((item) => Array.isArray(item[1]) && item[1].length);
+  return `<div class="story-director-summary">
+    <div class="story-director-kpis">
+      <span><b>${Number(review.shot_count) || 0}</b><small>镜头</small></span>
+      <span><b>${fmt(review.total_duration_seconds || 0, 1)}</b><small>秒</small></span>
+      <span><b>${(review.scenes || []).length}</b><small>场次</small></span>
+      <span><b>${(review.adjacent_repetitions || []).length}</b><small>相邻重复建议</small></span>
+    </div>
+    <div class="story-director-distributions">
+      ${storyDistributionHtml("景别分布", review.shot_scale_distribution)}
+      ${storyDistributionHtml("运镜分布", review.camera_movement_distribution)}
+      ${storyDistributionHtml("戏剧功能", review.shot_function_distribution)}
+    </div>
+    <div class="story-director-scenes">${(review.scenes || []).map((scene) => `<article>
+      <b>第${Number(scene.scene_no) || 0}场 · ${esc(scene.dramatic_function || "待补戏剧功能")}</b>
+      <span>${Number(scene.shot_count) || 0} 镜</span><small>${esc(scene.advice || "")}</small>
+    </article>`).join("") || `<p class="dim">暂无场次摘要</p>`}</div>
+    ${missingGroups.length ? `<details class="story-review-advice">
+      <summary>导演输入完整性建议（不影响生产）</summary>
+      ${missingGroups.map(([label, shots]) => `<p><b>${esc(label)}：</b>镜头 ${shots.map(Number).join("、")}</p>`).join("")}
+    </details>` : `<p class="story-review-ok">导演输入齐备，可继续人工审片。</p>`}
+  </div>`;
+}
+
+function validNineGridBrowser(browser) {
+  if (!browser || browser.kind !== "review"
+      || browser.production_blocking !== false
+      || browser.render_mode !== "independent_shot_cells"
+      || browser.generates_reference_asset !== false
+      || browser.single_image_multi_panel !== false
+      || browser.reference_chain_eligible !== false
+      || browser.view_only !== true || !Array.isArray(browser.pages)) return false;
+  const forbidden = ["composite_uri", "composite_url", "reference_images",
+    "reference_manifest", "reference_assets"];
+  const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+  return !forbidden.some((key) => hasOwn(browser, key))
+    && browser.pages.every((page) => page
+      && page.render_mode === "independent_shot_cells"
+      && page.single_image_multi_panel === false
+      && page.reference_chain_eligible === false
+      && Array.isArray(page.cells) && page.cells.length <= 9
+      && !forbidden.some((key) => hasOwn(page, key)));
+}
+
+function nineGridBrowserHtml(browser, statusEntry = null) {
+  if (!validNineGridBrowser(browser)) {
+    return `<div class="story-review-empty">${storyReviewStatusHtml(
+      statusEntry || { status: "unavailable" })}<p>${esc(
+        statusEntry?.message || "九宫格暂不可用 · 不影响生产")}</p></div>`;
+  }
+  const pages = browser.pages;
+  if (!pages.length) return `<div class="story-review-empty">
+    <span class="story-review-status neutral">尚无分镜 · 不影响生产</span>
+    <p>分镜保存后，这里会按场次生成每页最多九个独立镜头格。</p></div>`;
+  return `<div class="nine-grid-browser" data-nine-grid-page="0">
+    <div class="nine-grid-controls"><button type="button" data-nine-grid-prev aria-label="上一页">←</button>
+      <strong data-nine-grid-label></strong>
+      <button type="button" data-nine-grid-next aria-label="下一页">→</button></div>
+    <div class="nine-grid-invariant">只读审片 · 每格一镜 · 不进入参考链</div>
+    ${pages.map((page, pageIndex) => `<section class="nine-grid-page"
+      data-nine-grid-page-index="${pageIndex}" ${pageIndex ? "hidden" : ""}
+      data-scene-no="${Number(page.scene_no) || 0}" data-scene-page="${Number(page.page_no) || 1}">
+      <div class="nine-grid-cells">${(page.cells || []).slice(0, 9).map((cell) => {
+        const imageUrl = String(cell.keyframe_uri || "");
+        const safeImage = imageUrl.startsWith("/artifacts/") ? imageUrl : "";
+        const shotNo = Number(cell.shot_no) || 0;
+        return `<article class="nine-grid-cell" data-shot-no="${shotNo}"
+          aria-label="第${shotNo}镜，第${Number(cell.scene_no) || 0}场，${esc(cell.shot_scale || "未标注")}，${esc(cell.camera_movement || "固定")}">
+          <button type="button" class="nine-grid-preview" ${safeImage
+            ? `data-nine-grid-preview="${esc(safeImage)}"` : "disabled"}
+            aria-label="${safeImage ? `放大第${shotNo}镜关键帧` : `第${shotNo}镜关键帧待生成`}">
+            ${safeImage ? `<img src="${esc(thumbUrl(safeImage, 360))}" loading="lazy" alt="第${shotNo}镜关键帧">`
+              : `<span class="nine-grid-placeholder">关键帧待生成</span>`}
+            <b>镜头 ${String(shotNo).padStart(2, "0")}</b><small>${fmt(cell.duration_seconds || 0, 1)}s</small>
+          </button>
+          <button type="button" class="nine-grid-select" data-nine-grid-select="${shotNo}">
+            <span>${esc(cell.shot_scale || "未标注")} · ${esc(cell.camera_movement || "固定")}</span>
+            <small>${esc(cell.shot_function || "未标注")}</small>
+          </button>
+        </article>`;
+      }).join("")}</div></section>`).join("")}
+    <div class="nine-grid-detail" data-nine-grid-detail hidden></div>
+  </div>`;
+}
+
+function crossEpisodeContinuityHtml(entry) {
+  const review = entry?.review;
+  if (!review) return `<div class="story-review-empty">${storyReviewStatusHtml(
+    entry || { status: "unavailable" })}<p>${esc(
+      entry?.message || "跨集连续性暂不可用 · 不影响生产")}</p></div>`;
+  return `<div class="continuity-review">
+    <div class="story-review-line">${storyReviewStatusHtml(entry)}<span>来源：第${Number(entry.previous_episode_number) || "-"}集</span></div>
+    <article><b>前集出口状态</b><p>${esc(review.previous_exit_state || "待人工核对")}</p></article>
+    <article><b>未解钩子</b><div class="story-review-tags">${(review.unresolved_hooks || []).map(
+      (hook) => `<span>${esc(hook)}</span>`).join("") || `<small>暂无明确钩子</small>`}</div></article>
+    <div class="continuity-state-grid">${(review.states || []).map((state) => `<article>
+      <b>${esc(state.entity_id || "未命名")} · ${esc(state.domain || "state")}</b>
+      <p>${esc(state.state || "")}</p><small>${esc(state.evidence || "")}</small>
+    </article>`).join("") || `<p class="dim">暂无结构化状态，建议人工核对。</p>`}</div>
+  </div>`;
+}
+
+function scriptIndependentReviewHtml(entry, compact = false) {
+  const review = entry?.review;
+  if (!review) return `<section class="script-independent-review ${compact ? "compact" : ""}">
+    <header><div><b>独立剧本评审</b><small>建议视图 · 非生产门禁</small></div>
+      ${storyReviewStatusHtml(entry || { status: "pending" })}</header>
+    <p>${esc(entry?.message || "待独立评审 · 不影响生产")}</p></section>`;
+  return `<section class="script-independent-review ${compact ? "compact" : ""}">
+    <header><div><b>独立剧本评审</b><small>建议视图 · 非生产门禁</small></div>
+      ${storyReviewStatusHtml(entry)}</header>
+    <div class="script-review-scores">${(review.dimensions || []).map((item) => `<article>
+      <div><b>${esc(item.label || item.dimension || "评审维度")}</b><strong>${Number(item.score) || 0}/5</strong></div>
+      <p>${esc((item.evidence || []).join("；"))}</p>
+      <small>${esc((item.directed_revision || []).join("；"))}</small>
+    </article>`).join("")}</div>
+    <footer>剧本版本 ${esc(review.script_version || "-")} · 评审来源 ${esc(review.reviewer_source || "-")}</footer>
+  </section>`;
+}
+
+function storyIntelligenceHtml(data) {
+  const brain = data.story_intelligence;
+  if (!brain || brain.kind !== "review" || brain.production_blocking !== false) return "";
+  return `<section class="story-intelligence-panel" aria-label="AI导演建议">
+    <header class="story-intelligence-head"><div><span>火火漫剧研究室</span><h2>AI导演建议</h2>
+      <p>整集节奏、九宫格、跨集连续性与独立剧本评审 · 非生产门禁</p></div>
+      <span class="story-review-status ready">只读建议 · 不阻断</span></header>
+    <nav class="story-intelligence-tabs" aria-label="审片视图">
+      <button type="button" class="active" data-story-view-tab="director">全集导演摘要</button>
+      <button type="button" data-story-view-tab="grid">九宫格浏览板</button>
+      <button type="button" data-story-view-tab="continuity">跨集连续性</button>
+      <button type="button" data-story-view-tab="script">剧本独立评审</button>
+    </nav>
+    <div class="story-intelligence-view" data-story-view="director">${episodeDirectorReviewHtml(
+      brain.director_review, brain.director_review_status)}</div>
+    <div class="story-intelligence-view" data-story-view="grid" hidden>${nineGridBrowserHtml(
+      brain.nine_grid_browser, brain.nine_grid_status)}</div>
+    <div class="story-intelligence-view" data-story-view="continuity" hidden>${crossEpisodeContinuityHtml(
+      brain.cross_episode_continuity)}</div>
+    <div class="story-intelligence-view" data-story-view="script" hidden>${scriptIndependentReviewHtml(
+      brain.script_independent_review, true)}</div>
+  </section>`;
+}
+
+function bindStoryIntelligence(root, data, canvas) {
+  const panel = root.querySelector(".story-intelligence-panel");
+  if (!panel) return;
+  panel.querySelectorAll("[data-story-view-tab]").forEach((button) => {
+    button.onclick = () => {
+      panel.querySelectorAll("[data-story-view-tab]").forEach((item) =>
+        item.classList.toggle("active", item === button));
+      panel.querySelectorAll("[data-story-view]").forEach((view) => {
+        view.hidden = view.dataset.storyView !== button.dataset.storyViewTab;
+      });
+    };
+  });
+  const browser = data.story_intelligence?.nine_grid_browser;
+  const grid = panel.querySelector(".nine-grid-browser");
+  if (!grid || !validNineGridBrowser(browser)) return;
+  const pages = [...grid.querySelectorAll("[data-nine-grid-page-index]")];
+  const label = grid.querySelector("[data-nine-grid-label]");
+  const previous = grid.querySelector("[data-nine-grid-prev]");
+  const next = grid.querySelector("[data-nine-grid-next]");
+  const showPage = (requested) => {
+    const pageIndex = Math.max(0, Math.min(pages.length - 1, requested));
+    grid.dataset.nineGridPage = String(pageIndex);
+    pages.forEach((page, index) => { page.hidden = index !== pageIndex; });
+    const page = pages[pageIndex];
+    label.textContent = `第${page?.dataset.sceneNo || "-"}场 · 第${page?.dataset.scenePage || 1}页 · ${pageIndex + 1}/${pages.length}`;
+    previous.disabled = pageIndex === 0; next.disabled = pageIndex === pages.length - 1;
+  };
+  previous.onclick = () => showPage(Number(grid.dataset.nineGridPage) - 1);
+  next.onclick = () => showPage(Number(grid.dataset.nineGridPage) + 1);
+  showPage(0);
+  const cellByShot = new Map();
+  (browser.pages || []).forEach((page) => (page.cells || []).forEach((cell) =>
+    cellByShot.set(Number(cell.shot_no), cell)));
+  const focusShot = (shotNo) => {
+    if (canvas?.select) canvas.select(shotNo);
+    const row = root.querySelector(`.storyboard-table-row[data-shot="${shotNo}"]`)
+      || document.querySelector(`.storyboard-table-row[data-shot="${shotNo}"]`);
+    if (row) { row.scrollIntoView({ behavior: "smooth", block: "center" }); row.focus({ preventScroll: true }); }
+  };
+  const showDetail = (shotNo) => {
+    const cell = cellByShot.get(Number(shotNo));
+    const detail = grid.querySelector("[data-nine-grid-detail]");
+    if (!cell || !detail) return;
+    detail.hidden = false;
+    detail.innerHTML = `<div><b>镜头 ${Number(cell.shot_no) || 0} · 第${Number(cell.scene_no) || 0}场</b>
+      <span>${esc(cell.shot_scale || "未标注")} · ${esc(cell.camera_movement || "固定")} · ${fmt(cell.duration_seconds || 0, 1)}s</span></div>
+      <p><b>对应剧本故事：</b>${esc(cell.script_reference || "待补")}</p>
+      <p><b>台词：</b>${esc(cell.dialogue || "无")}</p>
+      <p><b>视觉钩子：</b>${esc(cell.visual_hook || "待补")}</p>
+      <button type="button" data-nine-grid-locate="${Number(cell.shot_no) || 0}">定位到分镜表</button>`;
+    detail.querySelector("[data-nine-grid-locate]").onclick = () => focusShot(Number(cell.shot_no));
+  };
+  grid.querySelectorAll("[data-nine-grid-select]").forEach((button) => {
+    button.onclick = () => showDetail(Number(button.dataset.nineGridSelect));
+  });
+  grid.querySelectorAll("[data-nine-grid-preview]").forEach((button) => {
+    button.onclick = () => showImageLightbox(button.dataset.nineGridPreview,
+      button.getAttribute("aria-label") || "关键帧预览");
+  });
+}
+
 function renderScriptReview(data, episodeId) {
   const script = data.script;
   const storyAnalysis = data.story_analysis || script.production_analysis || null;
@@ -11104,6 +11754,7 @@ function renderScriptReview(data, episodeId) {
         <button id="style-save">保存画风</button>
       </div>
       ${imageLineControlsHtml()}
+      ${selectionModeControlsHtml()}
       <div class="style-row">
         <label>参考图</label>
         <input id="ref-name" placeholder="名称,如:女主官方设定(可留空)">
@@ -11124,6 +11775,8 @@ function renderScriptReview(data, episodeId) {
          人物形象和画风会稳定得多;之后在「资产中心」也能管理。</div>`}
     </div>
     ${storyAnalysisEditorHtml(storyAnalysis, data.story_analysis_version)}
+    ${scriptIndependentReviewHtml(
+      data.story_intelligence?.script_independent_review)}
     <div class="script-review">${scriptBodyHtml(script, {
       skipped: (data.scene_plan || {}).skipped_scenes,
       episodeId: data.episode.id, manage: true })}</div>
@@ -11137,6 +11790,7 @@ function renderScriptReview(data, episodeId) {
   bindImageAccelerationLivebar(episodeId);
   bindLightbox(app);
   bindImageLineControls();
+  bindSelectionModeControls();
   const post = (path, body) => api(path, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body) });
@@ -11778,6 +12432,7 @@ function renderTheater(data, canvas) {
     </div>` : ""}
     ${productionLedgerHtml(data, { context: "review" })}
     ${relationCanvasHtml(data)}
+    ${storyIntelligenceHtml(data)}
     ${shotProductionTableHtml(data, {
       shotIssues: canvas.shotIssues, context: "review" })}`;
 
@@ -11789,6 +12444,7 @@ function renderTheater(data, canvas) {
     renameProject(data.project.title,
       () => renderCanvasView(data.episode.id));
   bindProductionLedger(el, data, data.episode.id);
+  bindStoryIntelligence(el, data, canvas);
   bindShotProductionTable(el, data, (shotNo) => {
     canvas.select(shotNo);
     if (window.matchMedia("(max-width: 780px)").matches) {

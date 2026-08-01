@@ -749,3 +749,6 @@ def test_spatial_diagram_is_uploaded_for_keyframe_with_single_role(
     assert entry["uri"] == str(spatial)
     assert "不得把3D示意视角" in entry["binding"]
     assert payload["reference_manifest"][0]["role"] == "identity"
+    identity = payload["reference_manifest"][0]
+    assert {"face", "hair_silhouette", "makeup", "stable_makeup"} <= set(
+        identity["inherits"])

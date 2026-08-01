@@ -556,6 +556,24 @@ def test_reference_portrait_locks_face_hair_makeup_and_workwear(app):
     assert "纯净、无文字的单人物资产背景" in prompt
 
 
+def test_initial_candidate_fills_real_workwear_when_occupation_has_no_costume(
+        app):
+    design = {
+        "occupation": "外卖员",
+        "appearance": "年轻清瘦男性",
+        "hair": "利落短发",
+    }
+    variant = app.director._candidate_variant(1, design)
+    prompt = app.director._candidate_portrait_prompt(
+        "周辰", "非重要配角", "现代半写实", design, variant)
+    review = app.director._candidate_prompt_review_context(
+        "周辰", "非重要配角", "现代半写实", design, variant)
+
+    assert "外卖配送员工作服/制服" in prompt
+    assert "外卖配送员工作服/制服" in review[
+        "initial_character_state"]["wardrobe"]
+
+
 def test_candidate_reference_semantics_lock_project_style_and_identity():
     payload = {
         "portrait_candidate": True,

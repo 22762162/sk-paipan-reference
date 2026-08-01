@@ -280,7 +280,14 @@ REFERENCE_SCOPE_DEFAULTS = {
     # adapters. ``inherits`` below exposes the exact safe identity attributes.
     "identity": {
         "include": ["identity"],
-        "inherits": ["face", "hairstyle", "age", "gender"],
+        # 用户上传的人物参考图是身份最高标准：不仅锁脸与发型，也锁
+        # 稳定妆造（眉眼、眼线、睫毛、唇妆体系）。服装仍由剧情另行
+        # 决定；镜头若明确换妆，应通过当前 appearance state 覆盖，
+        # 不能让服装/场景参考反向改掉人物身份妆造。
+        "inherits": [
+            "face", "hairstyle", "age", "gender", "makeup",
+            "stable_makeup",
+        ],
         "exclude": [
             "wardrobe", "pose", "composition", "background", "lighting",
             "props", "prop_position",
@@ -2237,6 +2244,38 @@ def build_physical_contract(shot, *, media="video"):
             "手腕、手臂和视线方向一致，禁止屏幕朝后却被人物读取。"
         )
         objects.append("手持屏幕：使用者/观看者↔屏幕正面")
+    # “马车”不是一个可独立运动的箱体。历史失败里模型只画车厢、漏掉
+    # 马匹与挽具，画面虽像马车却没有动力来源。只在本镜明确表现移动/
+    # 驾驶时强制完整动力链；停放、纯车厢内景、马已死亡或逃离等剧情
+    # 状态不擅自补马，交给剧本当前事实决定。
+    carriage_present = _mentions_present_object(object_text, ("马车",))
+    carriage_motion = bool(re.search(
+        r"马车.{0,8}(?:疾驰|奔驰|飞驰|驶入|驶出|行进|前行|移动|冲来|冲出|赶来)",
+        object_text,
+    )) or any(token in object_text for token in (
+        "马车疾驰", "马车奔驰", "马车飞驰", "马车驶", "马车冲",
+        "马车赶", "马车前行", "马车行进", "马车移动", "车轮滚动",
+        "赶着马车", "驾驶马车", "驾着马车", "赶车", "策马驾车",
+    ))
+    horse_explicitly_absent = bool(re.search(
+        r"(?:马|马匹).{0,4}(?:已经|已|都)?(?:死|逃|跑)", object_text,
+    )) or any(token in object_text for token in (
+        "无马", "没有马", "马已死", "马死了", "死马", "马跑了",
+        "马匹逃走", "马已逃", "解下马匹", "卸下马匹",
+    ))
+    if carriage_present and carriage_motion:
+        if horse_explicitly_absent:
+            rules.append(
+                "马车动力合同冲突：本镜同时要求马车移动且明确没有可用马匹；"
+                "生成前必须由剧本明确其他真实动力来源，禁止让无动力车厢自行滑行。")
+            objects.append("马车：移动要求与无马状态冲突，需先修剧情动力来源")
+        else:
+            rules.append(
+                "移动马车完整动力链：画面必须存在与车体正确连接的马匹、"
+                "辕杆/车衡和受力合理的挽具；车夫持缰控制，马匹朝行进方向，"
+                "蹄步、车轮转动与车身位移方向一致。禁止只画车厢不画马、"
+                "挽具断开、马匹朝反向或车体无动力自行移动。")
+            objects.append("移动马车：马匹↔挽具/辕杆↔车体↔车夫缰绳")
     era_object_constraints = build_era_object_constraints(shot)
     rules.extend(era_object_constraints)
     for rule in era_object_constraints:

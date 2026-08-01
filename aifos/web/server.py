@@ -45,11 +45,17 @@ from ..updater import (check_and_update, current_build, repo_root,
                        restart_process, start_auto_updater)
 from ..errors import AifosError
 from ..quality_policy import normalize_quality, normalize_quality_policy
+from ..selection_mode import CANDIDATES_PER_SHOT
 from ..prompt_review import build_episode_prompt_review
 from ..scene_render import build_scene_render_contract
 from ..smart_input import resolve_produce_target
 from ..standard_center import StandardConflictError, StandardValidationError
 from ..story_context import attach_shot_story_context
+from ..story_intelligence import (
+    build_storyboard_review_documents,
+    derive_episode_continuity_input,
+    review_document,
+)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -138,7 +144,10 @@ def access_payload(bound_host, port, workspace=None):
 # 它们只该互相排队,不该互相拒绝,更不该互相打断。
 PRODUCTION_ACTIONS = frozenset({
     "produce", "force_rebuild", "script_import", "series_next",
-    "confirm_script", "image_acceleration_resume",
+    "confirm_script", "image_acceleration_resume", "image_selection_resume",
+    # 整组候选重生会作废当前正式关键帧及其下游链，必须与整集生产、
+    # 旧单图重画等入口互斥；同一集内仍由串行队列按提交顺序执行。
+    "regenerate_shot_candidates",
 })
 
 
@@ -218,14 +227,28 @@ class JobRegistry:
         return job_id
 
     def start_task(self, title, number, task, action="adjustment",
-                   request=None, tracked=False, unique=False, queue=False):
+                   request=None, tracked=False, unique=False, queue=False,
+                   unique_action=False):
         """通用后台任务(打磨重写/重画)。
 
         普通任务签名为 ``task(app, run_id)``；tracked=True 时额外传入
         ``report(**fields)``，让长批次把逐项进度写进 job，前端无需猜测。
+        ``unique_action=True`` 只合并同一集、同一 action 的运行/排队任务，
+        用于“最后一镜选完后恢复生产”这类必须 exactly-once 排队的动作；
+        它不会像旧 ``unique`` 那样误复用本集另一个无关任务。
         """
         with self._lock:
-            if unique:
+            if unique_action:
+                existing = next((
+                    job for job in self._jobs.values()
+                    if job["status"] in {"running", "queued"}
+                    and job["title"] == title
+                    and int(job["episode"]) == int(number)
+                    and str(job.get("action") or "") == str(action)
+                ), None)
+                if existing is not None:
+                    return existing["id"]
+            elif unique:
                 existing = next((
                     job for job in self._jobs.values()
                     if job["status"] == "running"
@@ -297,6 +320,10 @@ class JobRegistry:
                             "qc_all": ("qc", "图片批量复检"),
                             "recheck_current_storyboard": (
                                 "qc", "当前分镜合同批量复检"),
+                            "image_selection_resume": (
+                                "images", "关键帧选片完成后断点续产"),
+                            "regenerate_shot_candidates": (
+                                "images", "关键帧候选整组重生成"),
                             "redo_items": ("images", "图片批量重画"),
                             "redo_video": ("videos", "视频定向修改"),
                             "redo_placeholders": ("images", "占位图片补真"),
@@ -500,6 +527,136 @@ def _artifact_url(app, uri):
     except ValueError:
         return None
     return "/artifacts/" + rel.as_posix()
+
+
+def _candidate_group_current_selection(item):
+    """返回当前候选组的有效明确选择；旧 token/迟到点击一律无效。"""
+    group = (item or {}).get("candidate_group") or {}
+    selection = group.get("selection") or {}
+    candidates = group.get("candidates") or []
+    if (not isinstance(group, dict) or not isinstance(selection, dict)
+            or group.get("complete") is not True
+            or group.get("technical_incomplete") is True):
+        return None
+    group_id = str(group.get("candidate_set_id") or "")
+    group_token = str(group.get("candidate_set_token") or "")
+    try:
+        group_revision = int(group.get("candidate_revision") or 0)
+        selected_revision = int(
+            selection.get("candidate_revision") or 0)
+        selected_index = int(selection.get("candidate_index") or 0)
+    except (TypeError, ValueError):
+        return None
+    if (not group_id or not group_token or group_revision < 1
+            or str(selection.get("candidate_set_id") or "") != group_id
+            or str(selection.get("candidate_set_token")
+                   or selection.get("token") or "") != group_token
+            or selected_revision != group_revision
+            or str(selection.get("source") or "") not in {"manual", "ai"}
+            or selected_index < 1):
+        return None
+    selected_id = str(selection.get("candidate_id") or "")
+    candidate = None
+    for row in candidates:
+        if not isinstance(row, dict):
+            continue
+        try:
+            row_index = int(row.get("candidate_index") or 0)
+        except (TypeError, ValueError):
+            continue
+        if (row_index == selected_index
+                and str(row.get("candidate_set_token") or "") == group_token
+                and (not selected_id
+                     or str(row.get("candidate_id") or "") == selected_id)):
+            candidate = row
+            break
+    if candidate is None:
+        return None
+    selected_locations = {
+        str(selection.get(key) or "").strip()
+        for key in ("selected_uri", "selected_url")
+        if str(selection.get(key) or "").strip()
+    }
+    candidate_locations = {
+        str(candidate.get(key) or "").strip()
+        for key in ("uri", "url")
+        if str(candidate.get(key) or "").strip()
+    }
+    if (selected_locations and candidate_locations
+            and selected_locations.isdisjoint(candidate_locations)):
+        return None
+    return selection
+
+
+def _selection_mode_enabled(app):
+    return _selection_mode_payload(app)["selection_mode"]
+
+
+def _selection_mode_payload(app):
+    return _selection_mode_payload_from_config(app.config)
+
+
+def _selection_mode_payload_from_config(config):
+    """用设置层唯一布尔解析器回显选片设置，候选数永远钳制为四。"""
+    # 延迟导入避免 Web 启动时扩大 settings 的导入链；这里复用保存接口的
+    # 唯一布尔语义，不能再用 bool("false") 这种会误判为 True 的写法。
+    from ..settings import _coerce_bool
+
+    def flag(key, default):
+        return _coerce_bool(
+            key, config.get("defaults", key, default=default))
+
+    return {
+        "selection_mode": flag("selection_mode", True),
+        "image_content_qc": flag("image_content_qc", True),
+        "video_content_qc": flag("video_content_qc", True),
+        # 当前契约固定四图。即使旧配置被手工写坏，API/UI 也不能回显出
+        # 一个 Director 不会执行的数量；保存非法值仍由 set_defaults 拒绝。
+        "shot_candidate_count": CANDIDATES_PER_SHOT,
+    }
+
+
+def _sanitize_candidate_group_urls(app, item):
+    """候选图只向浏览器暴露受控 URL，不泄露服务端文件系统路径。"""
+    group = item.get("candidate_group")
+    if not isinstance(group, dict):
+        return
+    for candidate in group.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        candidate["url"] = (
+            _artifact_url(app, str(candidate.get("uri") or ""))
+            or candidate.get("url"))
+        candidate.pop("uri", None)
+    selection = group.get("selection")
+    if isinstance(selection, dict):
+        selection["selected_url"] = (
+            _artifact_url(app, str(selection.get("selected_uri") or ""))
+            or selection.get("selected_url"))
+        selection.pop("selected_uri", None)
+    uris = item.pop("candidate_uris", None)
+    if isinstance(uris, list):
+        item["candidate_urls"] = [
+            url for url in (
+                _artifact_url(app, str(uri or "")) for uri in uris)
+            if url
+        ]
+
+
+def _candidate_request_value(body, name, *aliases):
+    for key in (name, *aliases):
+        value = body.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _candidate_conflict(exc):
+    message = str(exc)
+    return any(marker in message for marker in (
+        "stale_candidate_set", "selection_conflict",
+        "候选组已更新", "候选组冲突",
+    ))
 
 
 _DIAGNOSTIC_FIELDS = (
@@ -977,6 +1134,167 @@ def _collect_artifacts(app, project_id, ep_num):
     return out
 
 
+def _nonblocking_story_status(status, message, **extra):
+    """Return one fail-soft story-intelligence view status.
+
+    These values are deliberately review-only.  They must never be reused as
+    production task, gate, or episode status values.
+    """
+    return {
+        "kind": "review",
+        "production_blocking": False,
+        "available": status in {"ready", "advisory", "stale"},
+        "status": status,
+        "message": message,
+        **extra,
+    }
+
+
+def _saved_script_review_payload(app, episode_id, script_version):
+    """Expose an independently produced review without manufacturing one.
+
+    A detail GET has no reviewer run, evidence, or model call of its own, so it
+    may only read a saved review document.  Invalid and stale documents remain
+    visible as advice states and never become production failures.
+    """
+    saved, document_version = app.projects.latest_document(
+        episode_id, "script_review")
+    if saved is None:
+        return _nonblocking_story_status(
+            "pending", "待独立评审 · 不影响生产",
+            document_version=document_version)
+    try:
+        document = review_document(saved)
+        if (document.get("schema") == "aifos.story-review-pending/v1"
+                or document.get("status") == "pending"):
+            message = str(document.get("reason") or "").strip()
+            return _nonblocking_story_status(
+                "pending",
+                ((message + " · ") if message else "")
+                + "待独立评审 · 不影响生产",
+                document_version=document_version)
+        if document.get("schema") != "aifos.story-review/v1":
+            raise ValueError("独立评审 schema 不匹配")
+        generator_run = str(document.get("generator_run_id") or "").strip()
+        reviewer_run = str(document.get("reviewer_run_id") or "").strip()
+        reviewer_source = str(document.get("reviewer_source") or "").strip()
+        if not generator_run or not reviewer_run or generator_run == reviewer_run:
+            raise ValueError("独立评审必须来自不同于编剧生成的运行")
+        if reviewer_source.lower() in {
+                "", "generator", "self", "self_report", "生成器", "自评"}:
+            raise ValueError("独立评审来源无效")
+        dimensions = document.get("dimensions")
+        if not isinstance(dimensions, list) or len(dimensions) != 5:
+            raise ValueError("独立评审必须完整提供五维")
+    except (TypeError, ValueError) as exc:
+        return _nonblocking_story_status(
+            "invalid", f"独立评审记录无效：{exc} · 不影响生产",
+            document_version=document_version)
+
+    current_version = str(script_version or "")
+    review_version = str(document.get("script_version") or "")
+    if not current_version or review_version != current_version:
+        return _nonblocking_story_status(
+            "stale", "基于旧剧本 · 建议复评 · 不影响生产",
+            document_version=document_version, review=document)
+    return _nonblocking_story_status(
+        "ready", "已完成独立评审 · 非生产门禁",
+        document_version=document_version, review=document)
+
+
+def _previous_episode_continuity_payload(app, episode, project_id):
+    """Derive advice from the exact preceding episode, never a distant one."""
+    previous_number = int(episode["number"]) - 1
+    if previous_number < 1:
+        return _nonblocking_story_status(
+            "not_applicable", "本集没有前集 · 非生产门禁")
+    previous = app.db.query_one(
+        "SELECT id, number FROM episodes WHERE project_id=? AND number=?",
+        (project_id, previous_number))
+    if previous is None:
+        return _nonblocking_story_status(
+            "unavailable", "未找到紧邻前集 · 不影响生产",
+            previous_episode_number=previous_number)
+    previous_script, _ = app.projects.latest_document(
+        previous["id"], "script")
+    previous_storyboard, _ = app.projects.latest_document(
+        previous["id"], "storyboard")
+    previous_continuity, _ = app.projects.latest_document(
+        previous["id"], "continuity")
+    try:
+        document = review_document(derive_episode_continuity_input(
+            previous_episode_id=str(previous["id"]),
+            previous_script=previous_script or {},
+            previous_storyboard=previous_storyboard or {},
+            previous_continuity=previous_continuity or {},
+        ))
+    except (TypeError, ValueError) as exc:
+        return _nonblocking_story_status(
+            "unavailable", f"前集连续性暂不可用：{exc} · 不影响生产",
+            previous_episode_id=previous["id"],
+            previous_episode_number=previous["number"])
+    has_saved_facts = bool(
+        document.get("states") or document.get("unresolved_hooks"))
+    return _nonblocking_story_status(
+        "ready" if has_saved_facts else "advisory",
+        ("已读取前集出口状态 · 非生产门禁" if has_saved_facts
+         else "前集资料不完整，请人工核对 · 不影响生产"),
+        previous_episode_id=previous["id"],
+        previous_episode_number=previous["number"], review=document)
+
+
+def _story_intelligence_payload(
+        app, episode, project, storyboard, storyboard_version,
+        script_version, artifacts):
+    """Build deterministic, read-only story views for the episode payload."""
+    result = {
+        "schema": "aifos.story-intelligence-view/v1",
+        "kind": "review",
+        "production_blocking": False,
+        "status": "partial",
+        "director_review": None,
+        "nine_grid_browser": None,
+    }
+    # The grid may only receive browser-safe artifact URLs.  Absolute paths or
+    # non-artifact URLs are omitted rather than leaking into the review model.
+    safe_keyframes = {
+        shot_no: url for shot_no, url in (artifacts.get("images") or {}).items()
+        if isinstance(url, str) and url.startswith("/artifacts/")
+    }
+    try:
+        documents = build_storyboard_review_documents(
+            episode_id=str(episode["id"]),
+            storyboard=storyboard or {"shots": []},
+            keyframes=safe_keyframes,
+            storyboard_version=storyboard_version or "unknown",
+        )
+        result["director_review"] = review_document(
+            documents["director_review"])
+        result["nine_grid_browser"] = review_document(
+            documents["nine_grid_browser"])
+        result["status"] = "ready" if storyboard else "partial"
+    except (TypeError, ValueError) as exc:
+        result["director_review_status"] = _nonblocking_story_status(
+            "unavailable", f"全集导演摘要暂不可用：{exc} · 不影响生产")
+        result["nine_grid_status"] = _nonblocking_story_status(
+            "unavailable", f"九宫格暂不可用：{exc} · 不影响生产")
+
+    try:
+        result["cross_episode_continuity"] = (
+            _previous_episode_continuity_payload(
+                app, episode, project["id"]))
+    except Exception as exc:  # review enrichment must never break production GET
+        result["cross_episode_continuity"] = _nonblocking_story_status(
+            "unavailable", f"跨集连续性暂不可用：{exc} · 不影响生产")
+    try:
+        result["script_independent_review"] = _saved_script_review_payload(
+            app, episode["id"], script_version)
+    except Exception as exc:  # corrupt advisory data also fails soft
+        result["script_independent_review"] = _nonblocking_story_status(
+            "unavailable", f"独立剧本评审暂不可用：{exc} · 不影响生产")
+    return result
+
+
 def _current_render_plan_items(render_plan):
     """返回当前有效清单，并屏蔽已废止的母资产历史 QC。"""
     current = []
@@ -1028,9 +1346,11 @@ def _production_progress(app, episode, render_plan):
     production_running = (
         running_run is not None
         and str(running_run["action"] or "") in PRODUCTION_ACTIONS)
+    selection_mode = _selection_mode_enabled(app)
     status_keys = (
         "done", "reused", "pending", "generating", "retrying",
-        "awaiting_human", "failed",
+        "awaiting_selection", "regenerating_candidates",
+        "technical_incomplete", "awaiting_human", "failed",
     )
     category_labels = {
         "character_candidate": "人物候选",
@@ -1129,6 +1449,15 @@ def _production_progress(app, episode, render_plan):
             return False
         if str(item.get("category") or "") not in {"shot_image", "frames"}:
             return True
+        if selection_mode:
+            if str(item.get("category") or "") == "shot_image":
+                # 选片模式的唯一门禁是：本轮候选 token 已被人工/AI 明确
+                # 选择，且该选择已经晋升为正式资产。内容 QC 仅作建议，
+                # 不能重新把产线变回阻断式。
+                return _candidate_group_current_selection(item) is not None
+            return not (
+                item.get("invalidated_previous_output")
+                or item.get("contract_recheck"))
         qc = item.get("qc") or {}
         if not qc:
             return not (
@@ -1173,7 +1502,9 @@ def _production_progress(app, episode, render_plan):
         }.get(raw_status, raw_status)
         if status not in status_keys:
             status = "pending"
-        if status in ("generating", "retrying") and not live_run:
+        active_statuses = {
+            "generating", "retrying", "regenerating_candidates"}
+        if status in active_statuses and not live_run:
             issues.append({
                 "item_id": item.get("id", ""),
                 "category": category,
@@ -1185,6 +1516,11 @@ def _production_progress(app, episode, render_plan):
             status = "pending"
         formal_asset = item_has_formal_asset(item)
         output_exists = valid_uri(item.get("output_uri"))
+        candidate_outputs = [
+            row for row in ((item.get("candidate_group") or {}).get(
+                "candidates") or [])
+            if isinstance(row, dict) and valid_uri(row.get("uri"))]
+        candidate_generated = bool(candidate_outputs)
         downstream_usable = item_is_downstream_usable(item, formal_asset)
         if status in ("done", "reused"):
             if formal_asset:
@@ -1206,13 +1542,17 @@ def _production_progress(app, episode, render_plan):
                 })
         else:
             stats[status] += 1
-            if output_exists:
+            if output_exists or candidate_generated:
                 stats["generated"] += 1
 
         if downstream_usable:
             pass
-        elif status in ("generating", "retrying"):
+        elif status in active_statuses:
             pass
+        elif status == "awaiting_selection":
+            stats["awaiting_review"] += 1
+        elif status == "technical_incomplete":
+            stats["needs_repair"] += 1
         elif status in ("awaiting_human", "failed"):
             stats["needs_repair"] += 1
         elif formal_asset or output_exists:
@@ -1223,7 +1563,7 @@ def _production_progress(app, episode, render_plan):
         else:
             stats["not_generated"] += 1
 
-        if status in ("generating", "retrying"):
+        if status in active_statuses:
             try:
                 started_at = float(item.get("started_at") or timestamp)
             except (TypeError, ValueError):
@@ -1242,9 +1582,15 @@ def _production_progress(app, episode, render_plan):
                 # 大概率是遗留认领——秒表继续走会误导用户"没卡住"。
                 "stale": elapsed > 1800,
             })
-        if status in ("awaiting_human", "failed"):
+        if status in ("awaiting_human", "failed", "technical_incomplete"):
             qc = item.get("qc") or {}
             item_issues = list(qc.get("issues") or [])
+            if status == "technical_incomplete" and not item_issues:
+                errors = (item.get("candidate_group") or {}).get(
+                    "candidate_errors") or []
+                item_issues = [
+                    str(row.get("error") or "候选图技术生成失败")
+                    for row in errors if isinstance(row, dict)]
             if not item_issues and item.get("error"):
                 item_issues = [item["error"]]
             issues.append({
@@ -1373,6 +1719,7 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
     current_stage = str(overall.get("current_stage") or "")
     episode_number = int(episode["number"])
     project_id = int(episode["project_id"])
+    selection_mode = _selection_mode_enabled(app)
 
     storyboard_shots = list((storyboard or {}).get("shots") or [])
     storyboard_numbers = {
@@ -1430,6 +1777,12 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
             "pending": int(source.get("pending") or 0),
             "generating": generating,
             "retrying": retrying,
+            "awaiting_selection": int(
+                source.get("awaiting_selection") or 0),
+            "regenerating_candidates": int(
+                source.get("regenerating_candidates") or 0),
+            "technical_incomplete": int(
+                source.get("technical_incomplete") or 0),
             "awaiting_human": awaiting_human,
             "failed": failed,
             "remaining": max(0, total - usable),
@@ -1454,6 +1807,12 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
             item = plan_by_stage_and_shot.get((category, int(shot_no)))
             if not item or item.get("status") not in ("done", "reused"):
                 return False
+            if selection_mode:
+                if category == "shot_image":
+                    return _candidate_group_current_selection(item) is not None
+                return not (
+                    item.get("invalidated_previous_output")
+                    or item.get("contract_recheck"))
             qc = item.get("qc") or {}
             if not qc:
                 # 兼容明确关闭图片 QC 的历史项目；一旦条目标记过期或进入
@@ -1496,6 +1855,9 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
             ) if stage["total"] else 0
             accounted = (
                 stage["generating"] + stage["retrying"]
+                + stage["awaiting_selection"]
+                + stage["regenerating_candidates"]
+                + stage["technical_incomplete"]
                 + stage["awaiting_human"] + stage["failed"])
             stage["pending"] = max(
                 stage["pending"], stage["remaining"] - accounted)
@@ -2161,6 +2523,7 @@ def _episode_payload(app, episode_id, jobs=None):
                     shot_story_contexts[shot_no])
             for ref in (item.get("reference_inputs") or {}).get("items", []):
                 ref["url"] = _artifact_url(app, ref.get("uri", ""))
+            _sanitize_candidate_group_urls(app, item)
             output_url = _artifact_url(app, item.get("output_uri", ""))
             if output_url:
                 try:
@@ -2259,6 +2622,10 @@ def _episode_payload(app, episode_id, jobs=None):
         app, episode, render_plan)
     production_guidance = _production_guidance(
         app, episode, storyboard, render_plan, production_progress)
+    artifacts = _collect_artifacts(
+        app, project["id"], episode["number"])
+    story_intelligence = _story_intelligence_payload(
+        app, episode, project, storyboard, sb_v, script_v, artifacts)
     payload = {
         "build": BUILD,
         "episode": dict(episode),
@@ -2307,6 +2674,7 @@ def _episode_payload(app, episode_id, jobs=None):
         "production_guidance": production_guidance,
         "image_failures": image_failures,
         "relations": relations,
+        "story_intelligence": story_intelligence,
         "lessons": project_lessons(app.assets, project["id"], limit=20),
         "image_acceleration": {
             "summary": image_acceleration["summary"],
@@ -2314,8 +2682,7 @@ def _episode_payload(app, episode_id, jobs=None):
             "default_model": image_acceleration["default_model"],
             "default_quality": image_acceleration["default_quality"],
         },
-        "artifacts": _collect_artifacts(
-            app, project["id"], episode["number"]),
+        "artifacts": artifacts,
     }
     if jobs is not None:
         status = _episode_status_payload(app, episode_id, jobs)
@@ -2719,9 +3086,19 @@ def make_handler(workspace, jobs):
                 match = re.match(r"^/api/export/(\d+)$", route)
                 if match:
                     return self._export(int(match.group(1)))
+                if route == "/api/selection-mode":
+                    # 创作选片模式现状(独立内容质检开关接口,只读设置,
+                    # 不触碰生成/QC流程)
+                    return self._json(self._with_app(
+                        _selection_mode_payload))
                 if route == "/api/settings":
                     from ..settings import settings_payload
-                    return self._json(self._with_app(settings_payload))
+                    def settings_view(app):
+                        payload = settings_payload(app)
+                        payload.setdefault("defaults", {}).update(
+                            _selection_mode_payload(app))
+                        return payload
+                    return self._json(self._with_app(settings_view))
                 if route == "/api/doctor":
                     from ..doctor import run_doctor
                     ping = query.get("ping", ["0"])[0] == "1"
@@ -2794,10 +3171,16 @@ def make_handler(workspace, jobs):
                     return self._scene_expand()
                 if parsed.path == "/api/revise":
                     return self._revise()
+                if parsed.path == "/api/shot-candidates/select":
+                    return self._shot_candidate_select()
+                if parsed.path == "/api/shot-candidates/regenerate":
+                    return self._shot_candidates_regenerate()
                 if parsed.path == "/api/regen_image":
                     return self._regen_image()
                 if parsed.path == "/api/upload":
                     return self._upload()
+                if parsed.path == "/api/selection-mode":
+                    return self._selection_mode_update()
                 if parsed.path == "/api/settings":
                     return self._settings_update()
                 if parsed.path == "/api/settings/test":
@@ -4037,6 +4420,213 @@ def make_handler(workspace, jobs):
                 action="revise_script", request={"feedback": feedback})
             return self._json({"job_id": job_id}, status=202)
 
+        def _shot_candidate_request(self, body, *, require_contract=False):
+            """规范化候选组 CAS；兼容新 UI 与 expected_* 正式字段。"""
+            try:
+                shot_no = int(body.get("shot_no"))
+                revision = int(_candidate_request_value(
+                    body, "expected_candidate_revision",
+                    "candidate_revision", "expected_revision", "revision"))
+            except (TypeError, ValueError):
+                raise AifosError(
+                    "缺少合法 shot_no/expected_candidate_revision")
+            group_id = str(_candidate_request_value(
+                body, "expected_candidate_set_id", "candidate_set_id")
+                or "").strip()
+            token = str(_candidate_request_value(
+                body, "expected_candidate_set_token",
+                "candidate_set_token", "expected_token", "token")
+                or "").strip()
+            if shot_no < 1 or revision < 1 or not group_id or not token:
+                raise AifosError(
+                    "缺少完整候选组CAS：candidate_set_id/token/revision")
+            contract_revision = _candidate_request_value(
+                body, "expected_contract_revision", "contract_revision")
+            if require_contract and contract_revision in (None, ""):
+                raise AifosError(
+                    "整组重生成必须提供 contract_revision")
+            if contract_revision not in (None, ""):
+                try:
+                    contract_revision = int(contract_revision)
+                except (TypeError, ValueError) as exc:
+                    raise AifosError(
+                        "contract_revision 必须是正整数") from exc
+                if contract_revision < 1:
+                    raise AifosError(
+                        "contract_revision 必须是正整数")
+            return {
+                "shot_no": shot_no,
+                "candidate_set_id": group_id,
+                "candidate_set_token": token,
+                "candidate_revision": revision,
+                "contract_revision": contract_revision,
+            }
+
+        @staticmethod
+        def _assert_candidate_cas(app, title, number, expected):
+            """重生成入队前先快照校验；后台 Director 仍会再次原子校验。"""
+            state = app.director.shot_candidate_selection_state(
+                title, number, shot_no=expected["shot_no"])
+            item = next((
+                row for row in (state.get("items") or [])
+                if int(row.get("shot_no") or 0) == expected["shot_no"]
+            ), None)
+            if item is None:
+                raise AifosError(
+                    "selection_conflict: 当前镜头没有可重生成的候选组")
+            group = (item.get("candidate_group") or item.get("group")
+                     or item)
+            try:
+                actual_revision = int(
+                    group.get("candidate_revision") or 0)
+                actual_contract = int(
+                    group.get("contract_revision") or 0)
+            except (TypeError, ValueError):
+                actual_revision = 0
+                actual_contract = 0
+            stale = (
+                str(group.get("candidate_set_id") or "")
+                != expected["candidate_set_id"]
+                or str(group.get("candidate_set_token") or "")
+                != expected["candidate_set_token"]
+                or actual_revision != expected["candidate_revision"]
+                or (expected.get("contract_revision") is not None
+                    and actual_contract != expected["contract_revision"]))
+            if stale:
+                raise AifosError(
+                    "stale_candidate_set: 候选组已更新，请刷新后再操作")
+            return state
+
+        def _shot_candidate_select(self):
+            """明确选择一张当前候选；选择本身永不被旧生产门禁拦截。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            try:
+                expected = self._shot_candidate_request(body)
+                candidate_id = str(
+                    body.get("candidate_id") or "").strip()
+                candidate_index = body.get("candidate_index")
+                if candidate_index not in (None, ""):
+                    candidate_index = int(candidate_index)
+                else:
+                    candidate_index = 0
+                if not candidate_id and candidate_index < 1:
+                    raise AifosError(
+                        "缺少 candidate_id/candidate_index")
+            except (AifosError, TypeError, ValueError) as exc:
+                return self._error(400, str(exc))
+            title, number = found
+
+            def select(app):
+                result = dict(app.director.select_shot_candidate(
+                    title, number, expected["shot_no"],
+                    expected["candidate_set_id"],
+                    expected["candidate_set_token"],
+                    expected["candidate_revision"],
+                    candidate_id, candidate_index,
+                    source="manual"))
+                # 选择接口也遵守路径边界；前端刷新 episode 获取完整候选组。
+                selected_uri = str(result.pop("selected_uri", "") or "")
+                result["selected_url"] = (
+                    _artifact_url(app, selected_uri)
+                    or result.get("selected_url"))
+                result["source"] = "manual"
+                return result
+
+            try:
+                result = self._with_app(select)
+            except AifosError as exc:
+                return self._error(
+                    409 if _candidate_conflict(exc) else 400, str(exc))
+
+            # 只有“本次刚好选完最后一镜”才排断点续产。Director 的幂等
+            # 返回 + JobRegistry 的同 action 原子去重共同保证不会重复开工。
+            if (result.get("need_resume")
+                    and result.get("last_pending")
+                    and not result.get("already_selected")):
+                job_id = jobs.start_task(
+                    title, number,
+                    lambda app, run_id: app.director.produce(
+                        title, number, run_id=run_id),
+                    action="image_selection_resume",
+                    request={
+                        "source": "shot_candidate_selection",
+                        "shot_no": expected["shot_no"],
+                        "candidate_set_id": expected[
+                            "candidate_set_id"],
+                        "candidate_revision": expected[
+                            "candidate_revision"],
+                    },
+                    queue=True, unique_action=True)
+                result["resume_job_id"] = job_id
+                job = jobs.get(job_id) or {}
+                result["resume_job_status"] = (
+                    job.get("status") or "queued")
+            else:
+                result["resume_job_id"] = None
+            return self._json(result)
+
+        def _shot_candidates_regenerate(self):
+            """推翻当前候选组并排队重生成；不打断同集其他工作。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            if body.get("confirm_regenerate") is not True:
+                return self._error(
+                    400, "整组重新生成需要 confirm_regenerate=true 二次确认")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            prompt = str(
+                body.get("prompt") or body.get("feedback") or "").strip()
+            if not prompt:
+                return self._error(400, "整组重生成必须提供完整 prompt")
+            try:
+                expected = self._shot_candidate_request(
+                    body, require_contract=True)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            title, number = found
+            try:
+                self._with_app(lambda app: self._assert_candidate_cas(
+                    app, title, number, expected))
+            except AifosError as exc:
+                return self._error(
+                    409 if _candidate_conflict(exc) else 400, str(exc))
+
+            def regenerate(app, run_id):
+                result = dict(app.director.regenerate_shot_candidates(
+                    title, number, expected["shot_no"],
+                    expected["candidate_set_id"],
+                    expected["candidate_set_token"],
+                    expected["candidate_revision"], prompt,
+                    confirm=True))
+                if result.get("need_resume"):
+                    result["resume"] = app.director.produce(
+                        title, number, run_id=run_id)
+                return result
+
+            job_id = jobs.start_task(
+                title, number, regenerate,
+                action="regenerate_shot_candidates",
+                request={
+                    **expected,
+                    "prompt": prompt,
+                    "confirm_regenerate": True,
+                },
+                queue=True)
+            job = jobs.get(job_id) or {}
+            return self._json({
+                "job_id": job_id,
+                "status": job.get("status") or "queued",
+                "queue_position": job.get("queue_position") or 0,
+                "shot_no": expected["shot_no"],
+            }, status=202)
+
         def _regen_image(self):
             body = self._read_body()
             if body is None:
@@ -4053,6 +4643,16 @@ def make_handler(workspace, jobs):
             if found is None:
                 return self._error(404, "剧集不存在")
             title, number = found
+            if (target.get("kind") == "shot"
+                    and self._with_app(_selection_mode_enabled)):
+                return self._error(
+                    409,
+                    "创作选片模式下禁止使用旧的单镜头重画接口；"
+                    "请在本镜候选区修改完整提示词，并调用 "
+                    "/api/shot-candidates/regenerate 携带当前候选组的 "
+                    "candidate_set_id、candidate_set_token、"
+                    "candidate_revision 和 contract_revision，整组重新生成4张。"
+                    "只有 /api/shot-candidates/select 可把其中1张晋升为正式图")
             # 整集生产时并行 worker 正在改整份 render_plan,改单张不安全,
             # 仍要求先暂停。但"另一张图正在重画"不该拦住这一张——排队即可,
             # 否则用户改完一张必须盯着等它跑完才能提交下一张。
@@ -4090,6 +4690,38 @@ def make_handler(workspace, jobs):
                 "status": job.get("status") or "running",
                 "queue_position": job.get("queue_position") or 0,
             }, status=202)
+
+        def _selection_mode_update(self):
+            """一键创作选片模式:{enabled} 或按键传
+            image_content_qc/video_content_qc。只写 defaults 配置并回显,
+            生成/QC 流程语义由 director 侧消费方实现。"""
+            from ..settings import set_defaults
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            updates = {}
+            if "enabled" in body:
+                updates["selection_mode"] = body.get("enabled")
+            for key in ("selection_mode", "image_content_qc",
+                        "video_content_qc", "shot_candidate_count"):
+                if key in body:
+                    updates[key] = body.get(key)
+            if not updates:
+                return self._error(
+                    400, "缺少 enabled 或任一开关键")
+
+            def task(app):
+                from ..config import Config
+                set_defaults(app.workspace.config_path, updates)
+                # app.config 在写入前加载;重读文件回显持久化后的真实现状
+                fresh = Config.load(app.workspace.config_path)
+                result = _selection_mode_payload_from_config(fresh)
+                result["ok"] = True
+                return result
+            try:
+                return self._json(self._with_app(task))
+            except AifosError as exc:
+                return self._error(400, str(exc))
 
         def _settings_update(self):
             """设置中心保存 Provider、能力路由或整套图片策略。"""

@@ -123,6 +123,25 @@ def test_settings_payload_masks_key(tmp_path):
     assert mask_key("short") == "****"
 
 
+def test_settings_payload_coerces_legacy_boolean_strings(tmp_path):
+    """设置回显与保存接口共用布尔语义，不能把字符串 false 当成开启。"""
+    app = App(tmp_path / "ws")
+    try:
+        app.config.data.setdefault("defaults", {}).update({
+            "selection_mode": "false",
+            "image_content_qc": "off",
+            "video_content_qc": "true",
+        })
+
+        defaults = settings_payload(app)["defaults"]
+
+        assert defaults["selection_mode"] is False
+        assert defaults["image_content_qc"] is False
+        assert defaults["video_content_qc"] is True
+    finally:
+        app.close()
+
+
 def test_update_provider_and_masked_key_kept(tmp_path):
     app = App(tmp_path / "ws")
     config_path = app.workspace.config_path
@@ -384,3 +403,98 @@ def test_test_provider_reports_missing_bridge_binary(tmp_path, monkeypatch):
             app2.close()
     finally:
         app.close()
+
+
+def test_selection_mode_defaults_roundtrip(tmp_path):
+    """创作选片模式三开关+固定候选数:类型校验、持久化与非法值拒绝。"""
+    from aifos.settings import set_defaults
+    config_path = tmp_path / "config.json"
+    saved = set_defaults(config_path, {
+        "selection_mode": True,
+        "image_content_qc": False,
+        "video_content_qc": "off",
+        "shot_candidate_count": 4,
+    })
+    assert saved == {"selection_mode": True, "image_content_qc": False,
+                     "video_content_qc": False, "shot_candidate_count": 4}
+    stored = json.loads(config_path.read_text(encoding="utf-8"))["defaults"]
+    assert stored["selection_mode"] is True
+    assert stored["video_content_qc"] is False
+
+    with pytest.raises(AifosError, match="固定为 4"):
+        set_defaults(config_path, {"shot_candidate_count": 3})
+    with pytest.raises(AifosError, match="布尔值"):
+        set_defaults(config_path, {"selection_mode": "也许"})
+    with pytest.raises(AifosError, match="不支持的默认项"):
+        set_defaults(config_path, {"image_qc_retries": 2})
+
+
+def test_selection_mode_web_endpoints(tmp_path):
+    """一键接口:GET 现状→POST 开启→回显与 /api/settings 持久化一致。"""
+    ws = tmp_path / "ws"
+    App(ws).close()
+    httpd = serve(ws, host="127.0.0.1", port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", httpd.server_address[1], timeout=30)
+
+        def call(method, path, body=None):
+            conn.request(method, path,
+                         body=json.dumps(body) if body else None,
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+
+        status, view = call("GET", "/api/selection-mode")
+        assert status == 200
+        # 升级后的新产线默认:选片模式开箱即开(旧 workspace 无键同样生效)
+        assert view == {"selection_mode": True, "image_content_qc": True,
+                        "video_content_qc": True, "shot_candidate_count": 4}
+
+        # 兼容手工写入的旧布尔字符串，并钳制损坏的候选数回显；UI 不得
+        # 把字符串 "false" 当真，也不能展示 Director 不会执行的 99 张。
+        config_path = ws / "config.json"
+        raw = (json.loads(config_path.read_text(encoding="utf-8"))
+               if config_path.exists() else {})
+        raw.setdefault("defaults", {}).update({
+            "selection_mode": "false",
+            "shot_candidate_count": 99,
+        })
+        config_path.write_text(
+            json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        status, view = call("GET", "/api/selection-mode")
+        assert status == 200
+        assert view["selection_mode"] is False
+        assert view["shot_candidate_count"] == 4
+        status, settings = call("GET", "/api/settings")
+        assert status == 200
+        assert settings["defaults"]["selection_mode"] is False
+        assert settings["defaults"]["shot_candidate_count"] == 4
+
+        status, view = call("POST", "/api/selection-mode", {"enabled": False})
+        assert status == 200 and view["ok"] and view["selection_mode"] is False
+
+        status, view = call("POST", "/api/selection-mode", {"enabled": True})
+        assert status == 200 and view["ok"] and view["selection_mode"]
+
+        status, view = call("POST", "/api/selection-mode",
+                            {"video_content_qc": False})
+        assert status == 200 and view["video_content_qc"] is False
+        assert view["selection_mode"] is True  # 已持久化,不被后续写覆盖
+
+        status, view = call("GET", "/api/settings")
+        assert status == 200
+        defaults = view["defaults"]
+        assert defaults["selection_mode"] is True
+        assert defaults["video_content_qc"] is False
+        assert defaults["shot_candidate_count"] == 4
+
+        status, err = call("POST", "/api/selection-mode",
+                           {"shot_candidate_count": 2})
+        assert status == 400 and "固定为 4" in err["error"]
+
+        status, err = call("POST", "/api/selection-mode", {})
+        assert status == 400
+    finally:
+        httpd.shutdown()

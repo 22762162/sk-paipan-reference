@@ -1,11 +1,27 @@
 """出错经验库:质检失败原因自动归档 → 注入后续出图/视频提示词。"""
 
+import struct
+import zlib
+
 import pytest
 
 from aifos.app import App
 from aifos.lessons import (lesson_lines, lesson_worthy, lessons_block,
                            project_lessons, record_lessons)
 from aifos.production.base import ProviderResult
+
+
+def _valid_png(width=9, height=16):
+    def chunk(kind, data):
+        crc = zlib.crc32(kind)
+        crc = zlib.crc32(data, crc) & 0xFFFFFFFF
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", crc))
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    pixels = (b"\x00" + b"\x14\x28\x3c" * width) * height
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b""))
 
 
 @pytest.fixture()
@@ -29,7 +45,10 @@ def test_record_and_aggregate(app):
     top = lessons[0]
     assert "笔记本电脑" in top["issue"]
     assert top["count"] == 2                      # 同类问题聚合(镜头号归一)
-    assert top["categories"] == {"shot_image": 1, "frames": 1}
+    assert top["categories"]["shot_image"] == 1
+    assert top["categories"]["frames"] == 1
+    assert top["categories"]["era"] == 2
+    assert top["categories"]["prop"] == 2
     lines = lesson_lines(app.assets, project["id"])
     assert lines == []  # 质检观察未人工批准前不得污染后续提示词
     assert top["scope"] == "qc_observation"
@@ -72,11 +91,18 @@ def test_unapproved_qc_observations_do_not_enter_other_shot_prompts(app):
 
 def test_qc_failure_auto_records_lesson(app, tmp_path):
     """质检失败(即使重画后通过)自动进经验库——闭环的核心。"""
+    # 新产线默认是选片模式；本测试专门验证显式开启内容QC时的旧闭环。
+    app.config.data.setdefault("defaults", {})["selection_mode"] = False
+    app.config.data["defaults"]["image_content_qc"] = True
     image = tmp_path / "shot.png"
-    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 8)
+    image.write_bytes(_valid_png())
     calls = {"qc": 0}
 
     class StubRouter:
+        def review_image_prompt(self, capability, payload, out_dir,
+                                cancel=None):
+            return None
+
         def call(self, capability, payload, out_dir, cancel=None):
             if capability == "image":
                 return ProviderResult(provider="codex", cost=1.0,
@@ -135,21 +161,37 @@ def test_qc_failure_auto_records_lesson(app, tmp_path):
                     "instructions": ["只删除现代笔记本电脑"],
                     "preserve": ["人物", "构图", "古代大殿"],
                 },
+                "codex_escalation": {
+                    "aifos_action": "targeted_redraw",
+                    "reason": "删除时代错误的现代设备",
+                    "aifos_instructions": ["只删除现代笔记本电脑"],
+                },
                 "reference_adjustments": [],
             } if first else {})
             return ProviderResult(
                 provider="codex", cost=0.1,
                 data={"pass": not first,
+                      "visual_pass": not first,
+                      "input_contract_pass": not first,
                       "identity_checked": True, "identity_match": True,
                       "gender_checked": True, "gender_match": True,
+                      "wardrobe_checked": True,
+                      "wardrobe_match": True,
                       "count_checked": True, "count_match": True,
+                      "overlay_count_checked": True,
+                      "overlay_count_match": True,
+                      "physical_logic_checked": True,
+                      "physical_logic_match": True,
+                      "spatial_logic_checked": True,
+                      "spatial_logic_match": True,
                       "issues": (["镜头1古代大殿里出现了笔记本电脑"]
                                  if first else []),
                       **diagnostics})
 
     app.director.router = StubRouter()
     result = app.director._generate_image_with_qc(
-        "image", {"prompt": "x", "shot_no": 1}, tmp_path, None,
+        "image", {"prompt": "x", "shot_no": 1,
+                  "_episode_id": "unit-test"}, tmp_path, None,
         {"characters": [], "count": 0, "designs": "", "location": "",
          "action": "", "forbid": []})
     assert result.qc["passed"] is True

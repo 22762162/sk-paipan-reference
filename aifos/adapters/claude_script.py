@@ -1688,7 +1688,7 @@ def build_qc_prompt(payload):
             "人物动作与视线按本镜合同变化，不参与本项对比。")
     else:
         scene_continuity = "本镜无同场对照帧，跳过本项。"
-    return IMAGE_QC_PROMPT.format(
+    prompt = IMAGE_QC_PROMPT.format(
         scene_continuity=scene_continuity,
         image=payload.get("image_uri", ""),
         generation_scope=json.dumps(
@@ -1727,6 +1727,23 @@ def build_qc_prompt(payload):
             "这些物品出现是正确的,禁止当成时代错乱判失败):"
             + "、".join(payload["era_exceptions"]))
            if payload.get("era_exceptions") else ""))
+    sequence_samples = [
+        item for item in (payload.get("video_sequence_samples") or [])
+        if isinstance(item, dict) and item.get("uri")
+    ]
+    if sequence_samples:
+        sequence = json.dumps(
+            sequence_samples, ensure_ascii=False, separators=(",", ":"))
+        prompt = (
+            "【真实视频五点抽帧联合质检】\n"
+            f"按时间顺序逐张打开并联合比较这些证据帧:{sequence}\n"
+            "检查0/25/50/75/100%之间是否出现明显跑脸、服装或场景漂移、"
+            "人物/道具瞬移、同一道具无过程消失或复制、穿模悬浮、支撑关系"
+            "断裂、屏幕/设备方向反转、起止动作阶段倒置。只有普通观众一眼"
+            "可见且影响剧情或可信度的问题才失败；轻微生成波动必须放行。"
+            "这些图片仅是质检证据，严禁登记为资产或进入后续生成参考链。\n\n"
+            + prompt)
+    return prompt
 
 
 def validate_image_qc(data):
@@ -2533,6 +2550,26 @@ def _build_prompt_body(capability, payload):
                 style=(payload.get("style", "")
                        or "未指定；根据剧本自动分析，不套用固定画风"),
                 premise=payload.get("premise", "") or "自由发挥")
+        previous_continuity = payload.get("previous_episode_continuity")
+        if isinstance(previous_continuity, dict):
+            # 只给编剧上一集出口事实、未决钩子和仍有效状态；绝不把
+            # 前集全文或审查文档整包塞进提示词，避免噪声改写当前剧情。
+            compact_continuity = {
+                "previous_episode_number": previous_continuity.get(
+                    "previous_episode_number"),
+                "previous_exit_state": previous_continuity.get(
+                    "previous_exit_state", ""),
+                "unresolved_hooks": list(
+                    previous_continuity.get("unresolved_hooks") or [])[:6],
+                "states": list(previous_continuity.get("states") or [])[:12],
+            }
+            prompt = (
+                f"{prompt}\n\n【紧邻前集连续性硬约束】\n"
+                f"{json.dumps(compact_continuity, ensure_ascii=False)}\n"
+                "本集开场必须承接上述已发生事实；不得复活已毁坏道具、"
+                "改变人物伤势/位置/持有关系，或跳过未决钩子。若本集剧情"
+                "明确写出改变过程，才可在过程完成后更新状态。"
+            )
         if feedback:
             previous = json.dumps(
                 payload.get("previous_script", {}), ensure_ascii=False)

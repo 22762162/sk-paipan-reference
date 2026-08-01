@@ -1,5 +1,6 @@
 from aifos.prompt_contract import (
     PROMPT_CONTRACT_SCHEMA,
+    REFERENCE_SCOPE_DEFAULTS,
     build_composition_contract,
     build_model_constraints,
     build_physical_contract,
@@ -229,6 +230,26 @@ def test_negative_subtitle_instruction_is_not_a_readable_text_asset():
     assert "白名单为空" not in instruction
     assert "画面中不要生成字幕条" in instruction
 
+
+def test_legacy_text_carrier_without_exact_whitelist_is_not_locked_asset():
+    detected = _text_asset({
+        "description": "人物望向电脑屏幕，页面内容不可辨认",
+        "prompt": "近景拍摄显示器",
+    })
+
+    assert detected["carrier"]
+    assert detected["whitelist"] == []
+    assert detected["required"] is False
+    assert detected["locked_by"] == ""
+    assert "禁止自行生成文字" in detected["rule"]
+
+
+def test_identity_reference_scope_includes_stable_makeup():
+    identity = REFERENCE_SCOPE_DEFAULTS["identity"]
+
+    assert {"face", "hairstyle", "makeup", "stable_makeup"} <= set(
+        identity["inherits"])
+
     review = build_content_review(
         {},
         {"shots": [{
@@ -297,6 +318,26 @@ def test_laptop_contract_states_user_screen_and_camera_side():
     _, prompt = compile_shot_prompt(shot, location="现代书房")
     assert "【物理/空间逻辑】" in prompt
     assert "禁止人物坐在屏幕背面却看到屏幕正面" in prompt
+
+
+def test_moving_carriage_requires_horse_harness_driver_and_force_chain():
+    physical = build_physical_contract({
+        "description": "车夫赶着马车疾驰入城，车轮滚动扬起薄尘",
+    })
+
+    rendered = "；".join(physical["rules"] + physical["objects"])
+    assert "只画车厢不画马" in rendered
+    assert "马匹↔挽具/辕杆↔车体↔车夫缰绳" in rendered
+
+
+def test_stationary_or_interior_carriage_does_not_invent_visible_horse():
+    physical = build_physical_contract({
+        "description": "停放的马车车厢内，人物掀开车帘低声交谈",
+    })
+
+    rendered = "；".join(physical["rules"] + physical["objects"])
+    assert "移动马车完整动力链" not in rendered
+    assert "马匹↔挽具" not in rendered
 
 
 def test_negative_device_list_does_not_reinject_laptop_contract():

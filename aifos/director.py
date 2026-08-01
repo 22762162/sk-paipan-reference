@@ -7,6 +7,7 @@
 """
 
 import copy
+import difflib
 import hashlib
 import json
 import re
@@ -14,6 +15,7 @@ import shutil
 import subprocess
 import threading
 import time
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,7 +34,14 @@ from .generation_diagnostics import (
     retry_input_decision,
     targeted_prompt_patch,
 )
+from .generation_quality import (
+    evaluate_post_generation,
+    infer_quality_categories,
+    preflight_shot_contract,
+    quality_rule_lines,
+)
 from .image_acceleration import ImageAccelerationStore
+from .image_media_qc import image_is_technically_usable, probe_image
 from .identity_facts import unresolved_identity_fields
 from .quality_policy import (
     default_quality_policy,
@@ -61,7 +70,8 @@ from .prompt_contract import (
 )
 from .qc_feedback import optimize_qc_feedback
 from .lessons import (DISTILL_MIN_PENDING, DOMAIN_IMAGE, DOMAIN_SCRIPT,
-                      adopt_distilled_rules, lessons_block,
+                      DOMAIN_VIDEO, adopt_distilled_rules,
+                      infer_lesson_categories, lesson_lines,
                       pending_observations, project_lessons, record_lessons,
                       script_lessons_block)
 from .qc_stats import record_qc
@@ -77,6 +87,13 @@ from .seedance_policy import (
     SeedancePolicyError,
     normalize_tier,
     requested_upgrade_reason,
+)
+from .selection_mode import (
+    CandidateResultVersion,
+    CandidateSetVersion,
+    build_candidate_result_versions,
+    build_candidate_set_version,
+    evaluate_candidate_promotion,
 )
 from .rule_governance import next_revision_round, stack_revision_feedback
 from .spatial_language import derive_movement_term, spatial_lines
@@ -103,6 +120,17 @@ from .story_analysis import (
     unresolved_character_labels,
     validate_line_speaker_resolution,
     validate_story_analysis,
+)
+from .story_intelligence import (
+    build_script_review_court,
+    build_storyboard_review_documents,
+    derive_episode_continuity_input,
+    review_document,
+)
+from .video_media_qc import (
+    evaluate_video_technical,
+    extract_video_qc_frames,
+    probe_video,
 )
 from .story_logic import (
     PROP_CONTRACT_SCHEMA,
@@ -975,6 +1003,13 @@ class Director:
             if (stage == "cast" and ctx.get("cast_selection_required")):
                 paused = "cast"
                 break
+            if (stage == "images" and ctx.get("shot_selection_required")):
+                paused = "images"
+                break
+            if (stage == "videos"
+                    and ctx.get("video_contract_repair_required")):
+                paused = "videos"
+                break
             if pause_for_confirm and stage == CONFIRM_AFTER:
                 paused = "preflight"
                 break
@@ -1370,6 +1405,9 @@ class Director:
             for task in group:
                 payload = task["payload"]
                 audit = payload.get("prompt_review") or {}
+                reviewed_input = self._image_generation_input(payload)
+                payload["_prompt_review_frozen_input_hash"] = \
+                    reviewed_input["input_hash"]
                 self._plan_mark(
                     ctx, task["item_id"],
                     self._plan_read_status(ctx, task["item_id"]),
@@ -2245,6 +2283,11 @@ class Director:
         # 审核规则禁止猜测优先级 → 整批熔断。故合同内的状态字段先经
         # 同一套剥离器净化,再由 master_state_precedence 显式裁决。
         clean = self._clean_candidate_initial_state_text
+        candidate_costume = clean(self._design_value(look.get("costume")))
+        workwear = self._sheet_workwear_line(role, design)
+        if (not candidate_costume
+                or candidate_costume.startswith("采用人物设定中唯一明确")):
+            candidate_costume = workwear or candidate_costume
         return {
             "schema": "aifos.character-candidate-review/v5-single-sample",
             "candidate_prompt_schema": CHARACTER_CANDIDATE_PROMPT_SCHEMA,
@@ -2267,7 +2310,9 @@ class Director:
             "initial_character_state": {
                 "hair": clean(hair) if not has_reference else hair,
                 "makeup": clean(makeup) if not has_reference else makeup,
-                "wardrobe": clean(self._design_value(look.get("costume"))),
+                "wardrobe": (
+                    candidate_costume
+                    or "采用人物首次登场时唯一明确的基础服装"),
                 "palette": palette,
                 "accessories_and_props": (
                     clean(props) or
@@ -2330,8 +2375,12 @@ class Director:
                 "无参考图时，当前图必须使用既定人物身份、既定发型、"
                 "同一妆容、同一服装、同一构图和同一项目画风；"
                 "不得自行创造第二套造型")
-        costume = self._design_value(look.get("costume")) \
-            or "采用人物首次登场时唯一明确的基础服装"
+        costume = self._design_value(look.get("costume"))
+        workwear = self._sheet_workwear_line(role, design)
+        if (not costume
+                or costume.startswith("采用人物设定中唯一明确")):
+            costume = workwear or costume
+        costume = costume or "采用人物首次登场时唯一明确的基础服装"
         temperament = self._design_value(look.get("temperament")) \
             or "保持核心人物气质"
         occasion = self._design_value(
@@ -3611,6 +3660,14 @@ class Director:
 
     def _plan_seed(self, ctx, category, items):
         """登记(或刷新)某分类要生成的全部图片;同 id 条目保留状态。"""
+        # Seeding is a read-modify-write transaction.  Locking only
+        # _plan_read/_plan_write leaves a window where another worker can
+        # publish status or candidate metadata and this refresh overwrites it.
+        with _PLAN_IO_LOCK:
+            return self._plan_seed_locked(ctx, category, items)
+
+    def _plan_seed_locked(self, ctx, category, items):
+        """Implementation for :meth:`_plan_seed`; caller holds plan lock."""
         plan = self._plan_read(ctx)
         old = {i["id"]: i for i in plan["items"]
                if i.get("category") == category}
@@ -3637,7 +3694,13 @@ class Director:
                             "prompt_used_hash", "generation_input",
                             "prompt_contract_validation", "output_uri",
                             "autonomous_repair_seeded",
-                            "codex_contract_repair_count"):
+                            "codex_contract_repair_count",
+                            "candidate_group", "candidate_uris",
+                            "candidate_count", "candidate_set_token",
+                            "candidate_revision", "selection",
+                            "selection_required", "technical_incomplete",
+                            "candidate_group_history",
+                            "candidate_generation_status"):
                     if key in prev:
                         item[key] = prev[key]
                 if prev.get("custom_prompt"):
@@ -3903,6 +3966,50 @@ class Director:
     def _shot_content_hash(self, shot, payload=None):
         """Hash the semantic shot contract; old art may reuse only on match."""
         payload = payload or {}
+        # Generated images may later be attached as optional continuity or
+        # revision references.  They did not exist when the current image was
+        # approved, so allowing them to alter its identity creates a
+        # self-invalidating loop (done → pending → redraw).  Master identity,
+        # wardrobe, prop, scene, spatial and style references remain hashed.
+        derived_reference_roles = {
+            "continuity", "keyframe", "revision_base"}
+        stable_references = [
+            copy.deepcopy(item)
+            for item in (payload.get("reference_manifest") or [])
+            if isinstance(item, dict)
+            and str(item.get("role") or "") not in derived_reference_roles
+        ]
+        # The compiled prompt contract contains a second, URI-free copy of
+        # the same reference manifest.  Filtering only reference_manifest is
+        # insufficient: once a generated keyframe is attached as a
+        # continuity aid, prompt_contract.references and prompt_compact both
+        # change and would still turn a completed item back into ``pending``.
+        # Keep every semantic contract field while removing only references
+        # that are downstream products of this very generation cycle.
+        stable_prompt_contract = copy.deepcopy(
+            payload.get("prompt_contract")
+            or shot.get("prompt_contract") or {})
+        if isinstance(stable_prompt_contract, dict):
+            contract_references = [
+                copy.deepcopy(item)
+                for item in (stable_prompt_contract.get("references") or [])
+                if isinstance(item, dict)
+                and str(item.get("role") or "")
+                not in derived_reference_roles
+            ]
+            for index, item in enumerate(contract_references, 1):
+                item["index"] = index
+            if "references" in stable_prompt_contract:
+                stable_prompt_contract["references"] = contract_references
+        # prompt_compact is a rendered duplicate of prompt_contract.  Hash it
+        # only for legacy payloads without the structured contract; otherwise
+        # generated reference labels would reintroduce the self-invalidating
+        # loop that the normalization above intentionally removes.
+        fallback_prompt_compact = ""
+        if not stable_prompt_contract:
+            fallback_prompt_compact = (
+                payload.get("prompt_compact")
+                or shot.get("seedance_prompt_compact") or "")
         return self._stable_hash({
             "shot_no": shot.get("shot_no"),
             "scene_no": shot.get("scene_no"),
@@ -3912,13 +4019,9 @@ class Director:
             "dialogue": shot.get("dialogue"),
             "start_state": shot.get("start_state") or {},
             "end_state": shot.get("end_state") or {},
-            "prompt_contract": (
-                payload.get("prompt_contract")
-                or shot.get("prompt_contract") or {}),
-            "prompt_compact": (
-                payload.get("prompt_compact")
-                or shot.get("seedance_prompt_compact") or ""),
-            "reference_manifest": payload.get("reference_manifest") or [],
+            "prompt_contract": stable_prompt_contract,
+            "prompt_compact": fallback_prompt_compact,
+            "reference_manifest": stable_references,
         })
 
     def _build_dispatch_contract(self, task, item):
@@ -4211,8 +4314,10 @@ class Director:
         # Codex 的 aifos_action 在这里真正分派:判「改合同/拆镜/人工」时
         # 熔断在生图 API 之前,不把升级指令当普通修改意见再烧一张。
         # 必须放在提示词审核之后——审核会改写提示词,哈希要同口径比。
-        escalation_block = self.escalation_redraw_block(
-            payload.get("qc_escalation"), generation_input)
+        escalation_block = (
+            self.escalation_redraw_block(
+                payload.get("qc_escalation"), generation_input)
+            if self._image_qc_enabled() else "")
         if escalation_block:
             self._plan_mark(
                 ctx, item_id, "awaiting_human", error=escalation_block[:300])
@@ -4253,10 +4358,25 @@ class Director:
         return result
 
     # ---- 图片视觉质检:生成后核对剧本要求,不合格自动带意见重画 ----
+    @staticmethod
+    def _setting_enabled(value, default=True):
+        """配置布尔值兼容 YAML/JSON 以及旧版字符串写法。"""
+        if value is None:
+            return bool(default)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ("", "off", "false", "0", "no", "disabled"):
+                return False
+            if normalized in (
+                    "on", "true", "1", "yes", "enabled", "selection"):
+                return True
+        return bool(value)
+
     def _director_autonomy_enabled(self):
         """用户是否已把视觉判断与成片决策全权交给 AI 导演。"""
-        return bool(self.config.get(
-            "defaults", "director_autonomy_mode", default=False))
+        return self._setting_enabled(self.config.get(
+            "defaults", "director_autonomy_mode", default=False),
+            default=False)
 
     def _preview_qc_bypass_enabled(self):
         """是否旁路会触发视觉返工的内容检查。
@@ -4267,18 +4387,50 @@ class Director:
         """
         return (
             self._director_autonomy_enabled()
-            or bool(self.config.get(
-                "defaults", "preview_qc_bypass", default=False)))
+            or self._setting_enabled(self.config.get(
+                "defaults", "preview_qc_bypass", default=False),
+                default=False))
+
+    def _selection_mode_enabled(self):
+        return self._setting_enabled(self.config.get(
+            "defaults", "selection_mode", default=True), default=True)
 
     def _image_qc_enabled(self):
-        return (
-            not self._preview_qc_bypass_enabled()
-            and bool(self.config.get(
-                "defaults", "image_qc", default=True)))
+        """图片内容 QC 开关；不影响普通选片模式的生成前合同审核。"""
+        if (self._preview_qc_bypass_enabled()
+                or self._selection_mode_enabled()):
+            return False
+        value = self.config.get(
+            "defaults", "image_content_qc", default=None)
+        if value is None:
+            value = self.config.get(
+                "defaults", "image_qc", default=True)
+        return self._setting_enabled(value, default=True)
+
+    def _video_content_qc_enabled(self):
+        if (self._preview_qc_bypass_enabled()
+                or self._selection_mode_enabled()):
+            return False
+        return self._setting_enabled(self.config.get(
+            "defaults", "video_content_qc", default=True), default=True)
 
     def _prompt_review_enabled(self):
         """预览片只使用已编译提示词，不再追加生成前的 AI 审核等待。"""
         return not self._preview_qc_bypass_enabled()
+
+    def _shot_candidate_count(self):
+        """关键帧新产线固定四候选，配置值只用于审计兼容。"""
+        try:
+            configured = int(self.config.get(
+                "defaults", "shot_candidate_count", default=4))
+        except (TypeError, ValueError):
+            configured = 4
+        if configured != 4:
+            self.log.warn(
+                "director",
+                f"shot_candidate_count={configured} 不在当前标准内，"
+                "已按每镜固定4张执行")
+        return 4
 
     def _dual_review_enabled(self, consecutive_failures=0):
         """双路会诊开关:默认只在首检失败后启用(诊断最值钱的地方)。
@@ -5639,9 +5791,16 @@ class Director:
         contract_only_defect = (
             contract_hard_failure and not reference_hard_failure
             and image_passed and visual_checks_passed)
+        contract_only_advisory = bool(issues) and all(
+            "[建议·不影响通过]" in issue for issue in issues)
+        effective_contract_hard_failure = (
+            reference_hard_failure
+            or (contract_hard_failure
+                and not contract_only_defect
+                and not contract_only_advisory))
         passed = (
             image_passed and visual_checks_passed
-            and (not contract_hard_failure or contract_only_defect))
+            and not effective_contract_hard_failure)
         report = {
             "passed": passed,
             "issues": issues,
@@ -5683,16 +5842,17 @@ class Director:
             "input_contract_passed": input_contract_passed,
             "input_contract_pass": input_contract_passed,
             "redraw_required": bool(
-                not image_passed or contract_hard_failure),
+                not image_passed or effective_contract_hard_failure),
             "contract_repair_required": not input_contract_passed,
             "production_ready": passed,
             "qc_policy": (
                 "critical_facts_with_creative_tolerance_v1"
                 if tiered_fidelity else "visible_major_defects_v2"),
             "input_contract_advisory": not input_contract_passed,
-            # 审计:这张图是「画面达标但合同诊断不完美」被放行的,合同本身
-            # 仍要靠 Codex 指令自动修,不是无声吞掉。
+            # 审计:画面可能达标，但输入合同仍必须修正；不得把偶然正确
+            # 误记成正式通过。
             "contract_only_defect": contract_only_defect,
+            "contract_only_advisory": contract_only_advisory,
             # hard_failure 的语义是「不能出街、也不允许人工放行」——身份、
             # 性别、人数这类硬伤。合同不一致(景别/焦段/机位与合同对不上)
             # 不属于这一档:画面本身可能完全达标,只是没按一份可能本来就
@@ -5703,8 +5863,7 @@ class Director:
             # 画面自身没过时,合同不一致仍并入硬伤——那才是真要重画。
             "hard_failure": bool(
                 visual_hard_failure and not image_passed
-                or reference_hard_failure
-                or (contract_hard_failure and not image_passed)),
+                or effective_contract_hard_failure),
             "contract_hard_failure": contract_hard_failure,
             "reference_hard_failure": reference_hard_failure,
         }
@@ -6056,9 +6215,382 @@ class Director:
             pulls = default
         return max(1, min(pulls, 4))
 
+    def _generate_selection_candidates_parallel(
+            self, capability, payload, out_dir, cancel, qc_spec, pulls):
+        """四路候选真并行：一次审核冻结合同，各自写独立目录。"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        working_payload = copy.deepcopy(payload or {})
+        if not isinstance(working_payload.get("reference_manifest"), list):
+            self._attach_reference_manifest(working_payload)
+        # Prompt review 与内容 QC 是两个闸门；选片模式仍先审核
+        # 并冻结一份精准提示词，不让4个worker各自改写。
+        before_review = self._image_generation_input(
+            working_payload, qc_spec=qc_spec)
+        already_reviewed = (
+            str(working_payload.get(
+                "_prompt_review_frozen_input_hash") or "")
+            == before_review["input_hash"])
+        review = None
+        if not already_reviewed:
+            review = self.router.review_image_prompt(
+                capability, working_payload, out_dir, cancel=cancel)
+        review_cost = float(review.cost or 0.0) if review is not None else 0.0
+        frozen_input = self._image_generation_input(
+            working_payload, qc_spec=qc_spec)
+        # 候选 worker 只能复用这一次已批准的冻结合同。marker 必须与
+        # 输入哈希同时匹配；任何提示词/参考图变化都会自动失效并重新审核。
+        working_payload["_prompt_review_frozen_input_hash"] = \
+            frozen_input["input_hash"]
+        frozen_prompt_hash = frozen_input["prompt_hash"]
+        frozen_reference_hash = frozen_input["reference_hash"]
+        frozen_input_hash = frozen_input["input_hash"]
+        version = build_candidate_set_version(
+            episode_id=working_payload.get("_episode_id"),
+            shot_no=working_payload.get("shot_no"),
+            contract_revision=working_payload.get(
+                "_contract_revision") or 1,
+            candidate_revision=working_payload.get(
+                "_candidate_revision") or 1,
+            prompt=frozen_input["prompt"],
+            reference_manifest=frozen_input["reference_manifest"],
+        )
+        version_data = asdict(version)
+        result_versions = {
+            item.candidate_index: item
+            for item in build_candidate_result_versions(version)}
+        candidate_set_id = str(
+            working_payload.get("_candidate_set_id")
+            or version.token.split(":", 1)[-1][:16])
+        root = Path(out_dir) / "candidate_sets" / candidate_set_id
+        root.mkdir(parents=True, exist_ok=True)
+
+        def generate_one(index):
+            candidate_payload = copy.deepcopy(working_payload)
+            result_version = result_versions[index]
+            seed = int(hashlib.sha256(
+                f"{candidate_set_id}:{index}".encode("utf-8")
+            ).hexdigest()[:8], 16)
+            candidate_payload.update({
+                "_candidate_set_id": candidate_set_id,
+                "_candidate_index": index,
+                "_candidate_seed": seed,
+                "seed": seed,
+                "candidate_set_token": result_version.candidate_set_token,
+                "candidate_index": result_version.candidate_index,
+                # 每张可独立记录 QC，但不在候选worker内自动修图。
+                "_qc_candidate_only": True,
+            })
+            candidate_out = root / f"candidate_{index:02d}"
+            candidate_out.mkdir(parents=True, exist_ok=True)
+            result = self._generate_image_with_qc(
+                capability, candidate_payload, candidate_out,
+                cancel, qc_spec)
+            candidate_input = self._image_generation_input(
+                candidate_payload, qc_spec=qc_spec)
+            report = getattr(result, "qc", None) or {}
+            uri = str(result.uri or "")
+            if not uri:
+                raise AifosError(f"候选图{index}未返回产物地址")
+            if (not uri.startswith(("http://", "https://"))
+                    and not Path(uri).exists()):
+                raise AifosError(f"候选图{index}产物未落盘:{uri}")
+            result_data = getattr(result, "data", None) or {}
+            provider_name = str(getattr(result, "provider", "") or "")
+            # Built-in mock assets are intentionally SVG diagnostics, not
+            # production images.  Every real provider result must be a local,
+            # non-empty, genuinely decoded raster with the requested aspect
+            # before it can occupy a candidate slot or enter Seedance's
+            # reference chain.
+            if provider_name == "mock" and Path(uri).suffix.lower() == ".svg":
+                technical_probe = {
+                    "schema": "aifos.image-media-probe/v1",
+                    "status": "synthetic_mock",
+                    "probe_ok": True,
+                    "ok": True,
+                    "synthetic": True,
+                }
+            else:
+                technical_probe = probe_image(
+                    uri, expected_aspect=(
+                        candidate_payload.get("aspect") or None))
+                if not image_is_technically_usable(technical_probe):
+                    raise AifosError(
+                        f"候选图{index}技术完整性未通过:"
+                        f"{technical_probe.get('error') or technical_probe.get('status')}")
+            # Most current image providers deliberately do not expose a seed
+            # contract (Seedream included).  Keep a stable variation key for
+            # audit/four-slot identity, but only call it a reproducible seed
+            # when the provider explicitly confirms consumption.
+            seed_consumed = bool(result_data.get("seed_consumed"))
+            return index, result, {
+                "pull": index,
+                "candidate_index": index,
+                "candidate_id": f"{version.token}#{index}",
+                "candidate_set_token": result_version.candidate_set_token,
+                "candidate_seed": seed if seed_consumed else None,
+                "candidate_variation_key": f"variation-{seed:08x}",
+                "seed_requested": seed,
+                "seed_consumed": seed_consumed,
+                "reproducible": seed_consumed,
+                "candidate_seed_semantics": (
+                    "provider_reproducible_seed" if seed_consumed
+                    else "request_variation_marker_not_reproducible"),
+                "variation_strategy": (
+                    "provider_seed" if seed_consumed
+                    else "independent_provider_generation"),
+                "uri": uri,
+                "passed": bool(report.get("passed")),
+                "score": self._image_qc_selection_score(report),
+                "issues": list(report.get("issues") or [])[:8],
+                "prompt_hash": candidate_input["prompt_hash"],
+                "reference_hash": candidate_input["reference_hash"],
+                "input_hash": candidate_input["input_hash"],
+                "provider": provider_name,
+                "model": getattr(result, "model", ""),
+                "technical_probe": technical_probe,
+            }
+
+        results = {}
+        resume_group = working_payload.get("_resume_candidate_group") or {}
+        if (isinstance(resume_group, dict)
+                and resume_group.get("candidate_set_id") == candidate_set_id
+                and resume_group.get("candidate_set_token") == version.token
+                and resume_group.get("frozen_input_hash")
+                == frozen_input_hash):
+            for candidate in resume_group.get("candidates") or []:
+                try:
+                    index = int(candidate.get("candidate_index") or 0)
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                uri = str(candidate.get("uri") or "")
+                reusable = bool(
+                    1 <= index <= pulls
+                    and candidate.get("candidate_set_token") == version.token
+                    and candidate.get("prompt_hash") == frozen_prompt_hash
+                    and candidate.get("reference_hash")
+                    == frozen_reference_hash
+                    and uri
+                    and self._candidate_file_technically_usable(candidate))
+                if reusable:
+                    results[index] = (None, copy.deepcopy(candidate))
+
+        failures = {}
+
+        def run_wave(indices, attempt):
+            if not indices:
+                return
+            with ThreadPoolExecutor(
+                    # Four slots are mandatory, but the provider concurrency
+                    # ceiling is still authoritative.  With a configured
+                    # capacity below four, fill the four slots in waves
+                    # instead of bursting past the API/account limit.
+                    max_workers=min(
+                        len(indices), self._total_image_workers()),
+                    thread_name_prefix="aifos-shot-candidate") as pool:
+                futures = {
+                    pool.submit(generate_one, index): index
+                    for index in indices}
+                for future in as_completed(futures):
+                    index = futures[future]
+                    try:
+                        got_index, result, candidate = future.result()
+                        if (candidate.get("prompt_hash") != frozen_prompt_hash
+                                or candidate.get("reference_hash")
+                                != frozen_reference_hash
+                                or candidate.get("input_hash")
+                                != frozen_input_hash):
+                            raise AifosError(
+                                f"候选图{index}偏离冻结提示词/参考图合同")
+                        candidate["technical_attempts"] = attempt
+                        results[got_index] = (result, candidate)
+                        failures.pop(index, None)
+                    except Exception as exc:
+                        failures[index] = {
+                            "candidate_index": index,
+                            "candidate_set_token": version.token,
+                            "attempts": attempt,
+                            "error": str(exc)[:600],
+                            "retryable": attempt < 2,
+                        }
+
+        missing = [
+            index for index in range(1, pulls + 1)
+            if index not in results]
+        run_wave(missing, 1)
+        # API/文件落盘等技术错误只补该槽位一次，不牵连另外三张。
+        run_wave(sorted(failures), 2)
+
+        ordered = [results[index] for index in sorted(results)]
+        candidates = [candidate for _result, candidate in ordered]
+        same_prompt = all(
+            row["prompt_hash"] == frozen_prompt_hash for row in candidates)
+        same_references = all(
+            row["reference_hash"] == frozen_reference_hash
+            for row in candidates)
+        complete = bool(
+            len(candidates) == pulls and same_prompt and same_references)
+        recommended_result = max(
+            ordered,
+            key=lambda item: (
+                1 if item[1].get("passed") else 0,
+                float(item[1].get("score") or 0.0),
+                -int(item[1].get("candidate_index") or 0)),
+            default=(None, {}))
+        recommended_candidate = recommended_result[1]
+        recommended_index = int(
+            recommended_candidate.get("candidate_index") or 0)
+        selected = (
+            recommended_result[0]
+            if recommended_result[0] is not None else next(
+                (result for result, _candidate in ordered
+                 if result is not None), None)) or \
+            SimpleNamespace(
+                provider="", model="", cost=0.0, data={}, uri="",
+                fallbacks=[])
+        candidate_errors = [
+            {**failures[index], "retryable": False}
+            for index in sorted(failures)]
+        group = {
+            "schema": "aifos.shot-candidate-group/v1",
+            "version": version_data,
+            "candidate_set_id": candidate_set_id,
+            "candidate_set_token": version.token,
+            "contract_revision": version.contract_revision,
+            "candidate_revision": version.candidate_revision,
+            "candidate_count": len(candidates),
+            "expected_count": pulls,
+            "selection_required": True,
+            "complete": complete,
+            "technical_incomplete": not complete,
+            "candidate_errors": candidate_errors,
+            # 推荐只是排序信息，不是选择 token，更不伪造 QC 通过。
+            # 只有后续明确的 manual/ai selection 才能晋升正式资产。
+            "recommended_candidate_index": (
+                recommended_index
+                if self._image_qc_enabled() and recommended_index else None),
+            "recommended_candidate_id": (
+                str(recommended_candidate.get("candidate_id") or "")
+                if self._image_qc_enabled() and recommended_index else ""),
+            "frozen_prompt_hash": frozen_prompt_hash,
+            "frozen_reference_hash": frozen_reference_hash,
+            "frozen_input_hash": frozen_input_hash,
+            "same_prompt": same_prompt,
+            "same_references": same_references,
+            "parallelism": min(pulls, self._total_image_workers()),
+            "candidates": copy.deepcopy(candidates),
+        }
+        selected.cost = review_cost + sum(
+            float(result.cost or 0.0) for result, _candidate in ordered
+            if result is not None)
+        # 候选组完成不等于正式关键帧完成。禁止通过
+        # result.uri 偷偷让第一张流入首尾帧/视频参考链。
+        selected.uri = ""
+        if not isinstance(selected.data, dict):
+            selected.data = {}
+        selected.data.update({
+            "candidate_group": group,
+            "candidate_uris": [row["uri"] for row in candidates],
+            "candidate_count": len(candidates),
+            "candidate_set_token": version.token,
+            "candidate_revision": version.candidate_revision,
+        })
+        report = getattr(selected, "qc", None)
+        if isinstance(report, dict):
+            report["gacha"] = {
+                "pulls": pulls,
+                "select_after_all": True,
+                "recommended_candidate_index": recommended_index,
+                "recommended_score": float(
+                    recommended_candidate.get("score") or 0),
+                "candidate_set_id": candidate_set_id,
+                "frozen_prompt_hash": frozen_prompt_hash,
+                "frozen_reference_hash": frozen_reference_hash,
+                "same_prompt": same_prompt,
+                "same_references": same_references,
+                "candidates": copy.deepcopy(candidates),
+                "technical_incomplete": not complete,
+                "candidate_errors": copy.deepcopy(candidate_errors),
+            }
+        if complete:
+            self.log.info(
+                "director",
+                f"镜头{working_payload.get('shot_no', '')} 4张候选已"
+                f"{pulls}路并行完成，等待明确选片")
+        else:
+            self.log.warn(
+                "director",
+                f"镜头{working_payload.get('shot_no', '')} 候选技术补位后"
+                f"仍为{len(candidates)}/{pulls}；成功图已保留，缺槽位可续补")
+        return selected
+
+    def _ai_promote_generated_candidate_group(self, selected):
+        """Promote a QC-passing current candidate in legacy strict mode.
+
+        Creative selection mode always waits for an explicit later choice.
+        This helper is deliberately downstream of the immutable candidate
+        version builder and calls the same promotion policy as the public CAS
+        selector; it does not relax or bypass that validator.
+        """
+        if self._selection_mode_enabled() or not self._image_qc_enabled():
+            return selected
+        data = getattr(selected, "data", None) or {}
+        group = data.get("candidate_group") or {}
+        if not isinstance(group, dict) or not group.get("complete"):
+            return selected
+        candidates = group.get("candidates") or []
+        try:
+            index = int(group.get("recommended_candidate_index") or 0)
+            current_version = CandidateSetVersion(**(
+                group.get("version") or {}))
+        except (TypeError, ValueError):
+            return selected
+        candidate = next((
+            row for row in candidates
+            if int((row or {}).get("candidate_index") or 0) == index
+        ), None)
+        if candidate is None or candidate.get("passed") is not True:
+            return selected
+        result_version = CandidateResultVersion(
+            candidate_set_token=str(
+                candidate.get("candidate_set_token") or ""),
+            candidate_index=index)
+        decision = evaluate_candidate_promotion(
+            result_version, current_version, selection_source="ai")
+        if not decision.allowed:
+            return selected
+        selected_uri = str(candidate.get("uri") or "")
+        if (not selected_uri
+                or (not selected_uri.startswith(("http://", "https://"))
+                    and not Path(selected_uri).is_file())):
+            return selected
+        selection = {
+            "candidate_set_id": str(group.get("candidate_set_id") or ""),
+            "candidate_set_token": current_version.token,
+            "token": current_version.token,
+            "candidate_revision": current_version.candidate_revision,
+            "candidate_id": str(candidate.get("candidate_id") or ""),
+            "candidate_index": index,
+            "candidate_seed": candidate.get("candidate_seed"),
+            "candidate_variation_key": candidate.get(
+                "candidate_variation_key"),
+            "seed_consumed": bool(candidate.get("seed_consumed")),
+            "selected_uri": selected_uri,
+            "source": "ai",
+            "selected_at": now(),
+            "promotion_policy": decision.reason,
+        }
+        group["selection"] = copy.deepcopy(selection)
+        group["selection_required"] = False
+        data["candidate_group"] = group
+        data["selection"] = copy.deepcopy(selection)
+        selected.data = data
+        selected.uri = selected_uri
+        return selected
+
     def _generate_image_gacha(self, capability, payload, out_dir,
                               cancel, qc_spec):
-        """连抽选优:重要/终稿类多次完整生成+质检。
+        """连抽选优:重要/终稿类多次完整生成+可选质检。
 
         常规抽卡首个通过即采纳；首次失败后的修订轮使用
         ``_gacha_select_best_after_all``，固定生成完整候选组后再按质检
@@ -6073,10 +6605,21 @@ class Director:
             override = 0
         pulls = max(1, min(override, 4)) if override else \
             self._gacha_pulls(payload)
+        selection_group = bool(
+            (payload or {}).get("_selection_candidate_group"))
         select_after_all = bool(
-            (payload or {}).get("_gacha_select_best_after_all"))
-        if (pulls <= 1 or capability != "image"
-                or not qc_spec or not self._image_qc_enabled()):
+            (payload or {}).get("_gacha_select_best_after_all")
+            or selection_group)
+        if pulls <= 1 or capability != "image":
+            return self._generate_image_with_qc(
+                capability, payload, out_dir, cancel, qc_spec)
+        if selection_group:
+            return self._generate_selection_candidates_parallel(
+                capability, payload, out_dir, cancel, qc_spec, pulls)
+        # 旧连抽依赖 QC 选优；新选片组即使关闭内容 QC，
+        # 也必须完整产出4张供人工选择。
+        if (not selection_group
+                and (not qc_spec or not self._image_qc_enabled())):
             return self._generate_image_with_qc(
                 capability, payload, out_dir, cancel, qc_spec)
         best = None                    # (score, result, snapshot)
@@ -6108,14 +6651,6 @@ class Director:
                 if isinstance(prompt_review, dict):
                     working_payload["prompt_review"] = copy.deepcopy(
                         prompt_review)
-                # review_image_prompt folds ``feedback`` into the text it
-                # hashes, then clears feedback only on its private per-call
-                # payload.  Without clearing the gacha working copy here,
-                # pulls 2/3 see "frozen prompt + old feedback" as a new input
-                # and can be non-deterministically re-reviewed into different
-                # prompts.  The feedback has already been incorporated into
-                # ``optimized_prompt``; carrying it again is both duplicate
-                # instruction and a violation of same-prompt triple draw.
                 if working_payload.get("feedback"):
                     working_payload["prompt_review_feedback_applied"] = \
                         working_payload["feedback"]
@@ -6128,13 +6663,6 @@ class Director:
                        or pull_payload.get("prompt") or ""))
             candidate_prompt_hash = hashlib.sha256(
                 candidate_prompt.encode("utf-8")).hexdigest()
-            candidates.append({
-                "pull": pull,
-                "passed": bool(report.get("passed")),
-                "score": score,
-                "issues": list(report.get("issues") or [])[:8],
-                "prompt_hash": candidate_prompt_hash,
-            })
             if report.get("passed") and not select_after_all:
                 for snap in snapshots:
                     try:
@@ -6157,6 +6685,13 @@ class Director:
                     snapshots.append(snap)
                 except OSError:
                     snap = None
+            candidates.append({
+                "pull": pull,
+                "passed": bool(report.get("passed")),
+                "score": score,
+                "issues": list(report.get("issues") or [])[:8],
+                "prompt_hash": candidate_prompt_hash,
+            })
             rank = (1 if report.get("passed") else 0, score)
             if best is None or rank > best[0]:
                 best = (rank, result, snap, pull)
@@ -6186,7 +6721,7 @@ class Director:
                     frozen_prompt_hash
                     and all(row.get("prompt_hash") == frozen_prompt_hash
                             for row in candidates)),
-                "candidates": candidates,
+                "candidates": copy.deepcopy(candidates),
             }
         if final_rank[0]:
             self.log.info(
@@ -6247,47 +6782,128 @@ class Director:
             return True
         candidates = gacha.get("candidates") or []
         frozen = str(gacha.get("frozen_prompt_hash") or "")
+        pulls = int(gacha.get("pulls") or 0)
         return bool(
-            int(gacha.get("pulls") or 0) == 3
+            pulls in (3, 4)
             and gacha.get("same_prompt") is True
-            and len(candidates) == 3
+            and len(candidates) == pulls
             and frozen
             and all(
                 isinstance(row, dict)
                 and str(row.get("prompt_hash") or "") == frozen
                 for row in candidates))
 
-    def _generate_repair_candidate_group(
-            self, capability, payload, out_dir, cancel, qc_spec):
-        """用同一份 Codex 修订合同生成3张，全部判分后自动选优。
+    @staticmethod
+    def _candidate_file_technically_usable(candidate):
+        """Revalidate new candidate bytes; preserve legacy groups in place."""
+        candidate = candidate or {}
+        uri = str(candidate.get("uri") or "")
+        if not uri:
+            return False
+        if (not uri.startswith(("http://", "https://"))
+                and not Path(uri).is_file()):
+            return False
+        stored = candidate.get("technical_probe")
+        # Older completed groups predate deterministic media probing.  They
+        # keep the previous existence-only compatibility contract so an
+        # upgrade never forces paid re-generation of historical episodes.
+        if not isinstance(stored, dict):
+            return True
+        if stored.get("synthetic") is True:
+            return bool(Path(uri).is_file())
+        expected = stored.get("expected_aspect")
+        expected_label = (
+            expected.get("label") if isinstance(expected, dict) else None)
+        current = probe_image(uri, expected_aspect=expected_label)
+        return image_is_technically_usable(current)
 
-        三张全败时，只对最高分候选再做一次 Codex 根因分析，产出下一轮
-        可执行修改指令；不会把三个候选分别改成三套互相漂移的合同。
-        """
+    @staticmethod
+    def _shot_candidate_group_valid(plan_item):
+        """新关键帧只在4张候选都真实归档后才可断点复用。"""
+        group = (plan_item or {}).get("candidate_group") or {}
+        if not isinstance(group, dict):
+            return False
+        candidates = group.get("candidates") or []
+        token = str(group.get("candidate_set_token") or "")
+        version = group.get("version") or {}
+        if (group.get("schema") != "aifos.shot-candidate-group/v1"
+                or int(group.get("candidate_count") or 0) != 4
+                or int(group.get("expected_count") or 0) != 4
+                or len(candidates) != 4
+                or group.get("complete") is not True
+                or not token
+                or not isinstance(version, dict)
+                or str(version.get("token") or "") != token
+                or group.get("same_prompt") is not True
+                or group.get("same_references") is not True):
+            return False
+        for row in candidates:
+            if str((row or {}).get("candidate_set_token") or "") != token:
+                return False
+            if not Director._candidate_file_technically_usable(row):
+                return False
+        return True
+
+    @staticmethod
+    def _candidate_diagnostic_uri(result):
+        """严格QC模式用于诊断的候选，不代表已晋升正式资产。"""
+        group = ((getattr(result, "data", None) or {}).get(
+            "candidate_group") or {})
+        candidates = group.get("candidates") or []
+        try:
+            index = int(group.get("recommended_candidate_index") or 1)
+        except (TypeError, ValueError):
+            index = 1
+        if 1 <= index <= len(candidates):
+            return str((candidates[index - 1] or {}).get("uri") or "")
+        return ""
+
+    def _generate_shot_candidate_group(
+            self, capability, payload, out_dir, cancel, qc_spec):
+        """首次即生成完整4张关键帧，不因某张质检通过早停。"""
         candidate_payload = copy.deepcopy(payload or {})
+        candidate_payload["_selection_candidate_group"] = True
         candidate_payload["_qc_candidate_only"] = True
-        candidate_payload["_gacha_pulls_override"] = 3
+        candidate_payload["_gacha_pulls_override"] = \
+            self._shot_candidate_count()
         candidate_payload["_gacha_select_best_after_all"] = True
-        candidate_payload["qc_consecutive_failures_base"] = max(
-            1, int(candidate_payload.get(
-                "qc_consecutive_failures_base") or 1))
         selected = self._generate_image_gacha(
             capability, candidate_payload, out_dir, cancel, qc_spec)
         report = getattr(selected, "qc", None) or {}
-        if report.get("passed"):
-            return selected
+        if not self._image_qc_enabled() or report.get("passed"):
+            return self._ai_promote_generated_candidate_group(selected)
+        # 旧严格模式仍保留原有的 Codex 根因分析/修复链；
+        # 选片模式和图片内容QC关闭时不会进入这条分支。
         generation_input = report.get("generation_input") or \
             self._image_generation_input(
                 candidate_payload, qc_spec=qc_spec)
         report["consecutive_failures"] = max(
-            2, int(report.get("consecutive_failures") or 0))
+            1, int(report.get("consecutive_failures") or 0))
         report, escalation_cost = self._escalate_failed_image_to_codex(
-            report, qc_spec, selected.uri, generation_input, out_dir,
+            report, qc_spec, self._candidate_diagnostic_uri(selected),
+            generation_input, out_dir,
             cancel=cancel,
             codex_profile=candidate_payload.get("_codex_profile", ""))
         selected.cost += escalation_cost
         selected.qc = report
         return selected
+
+    def _generate_repair_candidate_group(
+            self, capability, payload, out_dir, cancel, qc_spec):
+        """Regenerate the current frozen contract through the four-slot path.
+
+        Selection/content-QC-off modes must never fall back to the historical
+        single-canonical gacha path.  Strict mode uses the same four candidates
+        and promotes only a QC-passing best result through the AI promotion
+        policy.  A second failed strict batch is diagnosed but never blindly
+        redrawn again.
+        """
+        candidate_payload = copy.deepcopy(payload or {})
+        candidate_payload["qc_consecutive_failures_base"] = max(
+            1, int(candidate_payload.get(
+                "qc_consecutive_failures_base") or 1))
+        return self._generate_shot_candidate_group(
+            capability, candidate_payload, out_dir, cancel, qc_spec)
 
     @staticmethod
     def _repeated_core_issues(attempt_history):
@@ -6336,15 +6952,21 @@ class Director:
         while True:
             # 每次真正出图（包括QC修订重试）都以当前最终输入重新过Codex。
             # 输入哈希未变化时路由器会复用已批准审核，不产生重复调用。
-            review_image_prompt = (
-                getattr(self.router, "review_image_prompt", None)
-                if self._prompt_review_enabled() else None)
-            prompt_review = (
-                review_image_prompt(
-                    capability, payload, out_dir, cancel=cancel)
-                if callable(review_image_prompt) else None)
-            if prompt_review is not None:
-                spent += float(prompt_review.cost or 0.0)
+            current_input = self._image_generation_input(
+                payload, qc_spec=qc_spec)
+            frozen_review_hash = str(
+                payload.get("_prompt_review_frozen_input_hash") or "")
+            if (self._prompt_review_enabled()
+                    and not (frozen_review_hash
+                             and frozen_review_hash
+                             == current_input["input_hash"])):
+                reviewer = getattr(
+                    self.router, "review_image_prompt", None)
+                prompt_review = (
+                    reviewer(capability, payload, out_dir, cancel=cancel)
+                    if callable(reviewer) else None)
+                if prompt_review is not None:
+                    spent += float(prompt_review.cost or 0.0)
             generation_input = self._image_generation_input(
                 payload, qc_spec=qc_spec)
             result = self.router.call(capability, payload, out_dir,
@@ -6591,9 +7213,9 @@ class Director:
                 getattr(qc_result, "model", "") or "")
             report["score"] = self._image_qc_selection_score(report)
             result.qc = report
-            # 修订后的三张候选只负责独立成像与判分。每张失败都再次让
-            # Codex 改合同会让三张使用不同输入，失去“同一修订合同抽卡
-            # 选优”的意义；三张全败后才对最高分候选做下一轮根因分析。
+            # 修订后的四张候选只负责独立成像与判分。每张失败都再次让
+            # Codex 改合同会让四张使用不同输入，失去“同一修订合同抽卡
+            # 选优”的意义；四张全败后才对最高分候选做下一轮根因分析。
             if payload.get("_qc_candidate_only"):
                 return result
             # 第一次失败就升级 Codex:出诊断 + 改提示词,随后本轮继续按新提示词
@@ -6783,8 +7405,8 @@ class Director:
             ]
             if (capability == "image"
                     and report["consecutive_failures"] == 1):
-                # 生产规则:首图失败→Codex 修订→第二轮固定重生三张→
-                # 三张全部质检后选最符合的一张。候选共享同一修订合同，
+                # 旧严格内容QC规则:首图失败→Codex 修订→第二轮固定重生
+                # 四张→四张全部质检后选最符合的一张。候选共享同一修订合同，
                 # 不使用失败图作逐张修图基底，确保抽的是独立随机样本。
                 candidate_payload = copy.deepcopy(next_payload)
                 candidate_payload["qc_consecutive_failures_base"] = 1
@@ -6801,7 +7423,7 @@ class Director:
                 self.log.info(
                     "director",
                     f"{qc_spec.get('item_id') or '本图'}首图质检未过，"
-                    "Codex 修订已应用；第二轮固定生成3张并全量选优")
+                    "Codex 修订已应用；第二轮固定生成4张并全量选优")
                 selected = self._generate_repair_candidate_group(
                     capability, candidate_payload, out_dir, cancel, qc_spec)
                 selected.cost += float(result.cost or 0.0)
@@ -6813,9 +7435,10 @@ class Director:
                 }
                 selected_report["lesson_issues"] = list(dict.fromkeys([
                     *(report.get("lesson_issues") or []),
+                    *(report.get("issues") or []),
                     *(selected_report.get("lesson_issues") or []),
                 ]))
-                selected_report["generation_attempts"] = 4
+                selected_report["generation_attempts"] = 5
                 selected.qc = selected_report
                 return selected
             spent = result.cost
@@ -6835,7 +7458,10 @@ class Director:
         for key in ("first_source", "generation_calls", "model",
                     "image_task_class", "image_quality", "unit_cost",
                     "codex_profile", "prompt_review",
-                    "prompt_aifos_original", "prompt_optimized"):
+                    "prompt_aifos_original", "prompt_optimized",
+                    "candidate_group", "candidate_uris",
+                    "candidate_count", "candidate_set_token",
+                    "candidate_revision", "selection"):
             if key in data:
                 extra[key] = data[key]
         model = getattr(result, "model", "")
@@ -6856,7 +7482,58 @@ class Director:
         return extra
 
     @staticmethod
-    def _critical_qc_error(result):
+    def _candidate_group_technical_incomplete(result):
+        data = getattr(result, "data", None) or {}
+        group = data.get("candidate_group") or {}
+        return bool(
+            isinstance(group, dict)
+            and group.get("selection_required")
+            and (group.get("technical_incomplete") is True
+                 or int(group.get("candidate_count") or 0)
+                 < int(group.get("expected_count") or 4)))
+
+    @staticmethod
+    def _candidate_selection_pending(result):
+        data = getattr(result, "data", None) or {}
+        group = data.get("candidate_group") or {}
+        if not isinstance(group, dict) or not group.get("selection_required"):
+            return False
+        selection = group.get("selection") or {}
+        if not isinstance(selection, dict):
+            return True
+        selected_uri = str(selection.get("selected_uri") or "").strip()
+        selected = next((
+            row for row in group.get("candidates") or []
+            if str((row or {}).get("uri") or "") == selected_uri
+        ), None)
+        if selected is None:
+            return True
+        try:
+            current_version = CandidateSetVersion(**(
+                group.get("version") or {}))
+            selected_result = CandidateResultVersion(
+                candidate_set_token=str(
+                    selection.get("candidate_set_token")
+                    or selection.get("token") or ""),
+                candidate_index=int(
+                    selection.get("candidate_index")
+                    or selected.get("candidate_index") or 0),
+            )
+        except (TypeError, ValueError):
+            return True
+        # URI、序号、版本令牌三者必须指向同一张当前候选；旧页面的
+        # 迟到点击即使带着合法 manual/ai 来源也不能覆盖新候选组。
+        if (selected_result.candidate_index
+                != int(selected.get("candidate_index") or 0)):
+            return True
+        decision = evaluate_candidate_promotion(
+            selected_result, current_version,
+            selection_source=str(selection.get("source") or ""))
+        return not decision.allowed
+
+    def _critical_qc_error(self, result):
+        if not self._image_qc_enabled():
+            return ""
         qc = getattr(result, "qc", None) or {}
         if qc.get("passed") is False:
             codex = qc.get("codex_escalation") or {}
@@ -7141,6 +7818,16 @@ class Director:
         """串行执行单个出图任务(含质检),记账并更新清单。"""
         if self._cancel_requested(ctx):
             raise ProduceCancelled("已手动停止生成")
+        # Older acceleration/retry callers construct a minimal shot payload
+        # and rely on the surrounding episode context.  Four-candidate set
+        # versioning requires an episode id, so normalize that internal audit
+        # field here instead of crashing or inventing a non-versioned group.
+        payload = task.get("payload") or {}
+        if (task.get("capability") == "image"
+                and str(task.get("item_id") or "").startswith("shot:")
+                and not payload.get("_episode_id")):
+            payload["_episode_id"] = (ctx.get("episode") or {}).get("id")
+            task["payload"] = payload
         if task.get("capability") in ("image", "frames", "cover"):
             self._attach_reference_manifest(task["payload"])
         try:
@@ -7184,12 +7871,12 @@ class Director:
                 payload = task.get("payload") or {}
                 if (task["capability"] == "image"
                         and str(task.get("item_id") or "").startswith("shot:")):
-                    # 镜头首图严格只出1张；失败后的修订轮才启用固定3抽。
+                    # 镜头关键帧首轮即冻结合同并4路并行；
+                    # 严格QC模式的修订轮同样保持4候选。
                     generate = (
                         self._generate_repair_candidate_group
-                        if (payload.get("_autonomous_repair_seeded")
-                            and self._image_qc_enabled())
-                        else self._generate_image_with_qc)
+                        if payload.get("_autonomous_repair_seeded")
+                        else self._generate_shot_candidate_group)
                     result = generate(
                         task["capability"], task["payload"],
                         ctx["out_root"] / task["sub_dir"],
@@ -7221,7 +7908,7 @@ class Director:
                                 current.get(
                                     "_codex_contract_repair_count") or 0),
                             "autonomous_repair": True,
-                            "candidate_count": 3,
+                            "candidate_count": self._shot_candidate_count(),
                             "prompt_review_block_repaired": True,
                         })
                     continue
@@ -7235,6 +7922,17 @@ class Director:
         self._task_cost += result.cost
         self._task_providers.add(result.provider)
         self.projects.add_episode_cost(ctx["episode"]["id"], result.cost)
+        if self._candidate_group_technical_incomplete(result):
+            self._finish_dispatch_task(
+                ctx, task, error="关键帧候选技术补位未完成")
+            self._plan_mark(
+                ctx, task["item_id"], "technical_incomplete",
+                extra={
+                    **self._plan_done_extra(result),
+                    "selection_required": True,
+                    "technical_incomplete": True,
+                })
+            return result
         critical_error = self._critical_qc_error(result)
         while critical_error:
             # Codex 已经写清楚要改什么时,先自动落实再重画一轮,
@@ -7250,7 +7948,7 @@ class Director:
                            task["payload"].get(
                                "_codex_contract_repair_count") or 0),
                        "autonomous_repair": True,
-                       "candidate_count": 3})
+                       "candidate_count": self._shot_candidate_count()})
             while True:
                 try:
                     result = self._generate_repair_candidate_group(
@@ -7293,7 +7991,7 @@ class Director:
                                         "_codex_contract_repair_count")
                                     or 0),
                                 "autonomous_repair": True,
-                                "candidate_count": 3,
+                                "candidate_count": self._shot_candidate_count(),
                                 "prompt_review_block_repaired": True,
                             })
                         continue
@@ -7317,6 +8015,16 @@ class Director:
             if continue_on_qc_failure:
                 return None
             raise AifosError(critical_error)
+        if self._candidate_selection_pending(result):
+            self._finish_dispatch_task(ctx, task, result=result)
+            self._plan_mark(
+                ctx, task["item_id"], "awaiting_selection",
+                extra={
+                    **self._plan_done_extra(result),
+                    "autonomous_repair_seeded": False,
+                    "selection_required": True,
+                })
+            return result
         self._finish_dispatch_task(ctx, task, result=result)
         self._plan_mark(
             ctx, task["item_id"], "done",
@@ -7444,6 +8152,16 @@ class Director:
         # parallel_images 表示每条通道的容量，不是所有通道合计容量：
         # 单通道最多 8 路；A/B/C 三通道就合计最多 24 路。
         workers = self._total_image_workers()
+        # A shot task fans out into four provider calls.  Treat configured
+        # image workers as the global call budget rather than nesting N outer
+        # shot workers × 4 inner candidates (which previously turned 8 into
+        # 32 live calls and caused rate-limit/restart cascades).
+        candidate_fanout = self._shot_candidate_count() if any(
+            task.get("capability") == "image"
+            and str(task.get("item_id") or "").startswith("shot:")
+            for task in tasks) else 1
+        if candidate_fanout > 1:
+            workers = max(1, workers // candidate_fanout)
         if workers == 1 or len(tasks) == 1:
             out, qc_failures = {}, list(blocked)
             for task in tasks:
@@ -7523,11 +8241,17 @@ class Director:
                             "_acceleration"]
                     self._plan_mark(ctx, task["item_id"], "generating",
                                     extra=generating_extra)
-                    generate = (
-                        self._generate_repair_candidate_group
-                        if (payload.get("_autonomous_repair_seeded")
-                            and self._image_qc_enabled())
-                        else self._generate_image_with_qc)
+                    is_shot = (
+                        task.get("capability") == "image"
+                        and str(task.get("item_id") or "").startswith(
+                            "shot:"))
+                    if is_shot:
+                        generate = (
+                            self._generate_repair_candidate_group
+                            if payload.get("_autonomous_repair_seeded")
+                            else self._generate_shot_candidate_group)
+                    else:
+                        generate = self._generate_image_with_qc
                     future = pool.submit(
                         generate, task["capability"], task["payload"],
                         ctx["out_root"] / task["sub_dir"], cancel,
@@ -7566,7 +8290,8 @@ class Director:
                                             "_codex_contract_repair_count")
                                         or 0),
                                     "autonomous_repair": True,
-                                    "candidate_count": 3,
+                                    "candidate_count":
+                                        self._shot_candidate_count(),
                                     "prompt_review_block_repaired": True,
                                 })
                             retry_future = pool.submit(
@@ -7588,11 +8313,24 @@ class Director:
                     self._task_providers.add(result.provider)
                     self.projects.add_episode_cost(
                         ctx["episode"]["id"], result.cost)
+                    if self._candidate_group_technical_incomplete(result):
+                        self._finish_dispatch_task(
+                            ctx, task,
+                            error="关键帧候选技术补位未完成")
+                        self._plan_mark(
+                            ctx, task["item_id"], "technical_incomplete",
+                            extra={
+                                **self._plan_done_extra(result),
+                                "selection_required": True,
+                                "technical_incomplete": True,
+                            })
+                        results[task["tag"]] = result
+                        continue
                     critical_error = self._critical_qc_error(result)
                     if critical_error:
                         # 并行关键帧入口此前漏掉了串行入口已有的自动执行：
                         # Codex 指令写进报告后直接落 awaiting_human。现在
-                        # 主线程先落实合同修订，再把同一镜头以“三抽全量
+                        # 主线程先落实合同修订，再把同一镜头以“四候选全量
                         # 选优”重新放回 worker 池，无需人工确认。
                         repair = self._auto_apply_codex_escalation(
                             ctx, task, result)
@@ -7610,7 +8348,8 @@ class Director:
                                             "_codex_contract_repair_count")
                                         or 0),
                                     "autonomous_repair": True,
-                                    "candidate_count": 3,
+                                    "candidate_count":
+                                        self._shot_candidate_count(),
                                 })
                             retry_future = pool.submit(
                                 self._generate_repair_candidate_group,
@@ -7630,6 +8369,18 @@ class Director:
                             "failed",
                             error=critical_error[:300],
                             extra=self._plan_done_extra(result))
+                        continue
+                    if self._candidate_selection_pending(result):
+                        self._finish_dispatch_task(
+                            ctx, task, result=result)
+                        self._plan_mark(
+                            ctx, task["item_id"], "awaiting_selection",
+                            extra={
+                                **self._plan_done_extra(result),
+                                "autonomous_repair_seeded": False,
+                                "selection_required": True,
+                            })
+                        results[task["tag"]] = result
                         continue
                     self._finish_dispatch_task(ctx, task, result=result)
                     self._plan_mark(
@@ -8269,6 +9020,207 @@ class Director:
             episode_id=ctx["episode"]["id"])
         return adapted
 
+    def _save_review_document(self, episode_id, kind, document):
+        """幂等保存非阻断审阅文档，避免断点续产制造空版本。"""
+        current, version = self.projects.latest_document(episode_id, kind)
+        if current == document:
+            return version
+        return self.projects.save_document(episode_id, kind, document)
+
+    def _previous_episode_continuity(self, ctx):
+        """读取紧邻前集的真实落盘事实，压缩成下一集编剧输入。
+
+        不向更早的非相邻集回退，防止缺集时把错误出口状态冒充上一集；
+        抽取或保存失败只留日志，不影响本集编剧继续工作。
+        """
+        try:
+            episode = ctx["episode"]
+            current_number = int(episode["number"] or 0)
+            previous = next((
+                item for item in self.projects.list_episodes(
+                    ctx["project"]["id"])
+                if int(item["number"]) == current_number - 1
+            ), None)
+            if previous is None:
+                return None
+            previous_script, script_version = self.projects.latest_document(
+                previous["id"], "script")
+            previous_storyboard, storyboard_version = (
+                self.projects.latest_document(previous["id"], "storyboard"))
+            previous_continuity, continuity_version = (
+                self.projects.latest_document(previous["id"], "continuity"))
+            report = derive_episode_continuity_input(
+                previous_episode_id=str(previous["id"]),
+                previous_script=previous_script,
+                previous_storyboard=previous_storyboard,
+                previous_continuity=previous_continuity,
+            )
+            document = review_document(report)
+            document["previous_episode_number"] = int(previous["number"])
+            document["source_versions"] = {
+                "script": int(script_version or 0),
+                "storyboard": int(storyboard_version or 0),
+                "continuity": int(continuity_version or 0),
+            }
+            self._save_review_document(
+                episode["id"], "previous_episode_continuity", document)
+            # 编剧只吃出口、钩子和当前仍有效的状态，避免把整集文档塞入
+            # 上下文；每条都来自上面保存的真实前集文档及其证据。
+            return {
+                "schema": document["schema"],
+                "previous_episode_id": document["previous_episode_id"],
+                "previous_episode_number": document[
+                    "previous_episode_number"],
+                "previous_exit_state": document["previous_exit_state"],
+                "unresolved_hooks": document.get(
+                    "unresolved_hooks", [])[:6],
+                "states": [
+                    {
+                        "domain": item.get("domain", ""),
+                        "entity_id": item.get("entity_id", ""),
+                        "state": item.get("state", ""),
+                        "evidence": item.get("evidence", ""),
+                    }
+                    for item in document.get("states", [])[:12]
+                    if isinstance(item, dict)
+                ],
+                "instructions": document.get("instructions", []),
+                "source_versions": document["source_versions"],
+            }
+        except Exception as exc:
+            self.log.warn(
+                "director",
+                "上一集连续性事实抽取失败，已跳过且未编造状态："
+                f"{str(exc)[:240]}")
+            return None
+
+    def _persist_script_review(self, ctx, result=None):
+        """只接受真正独立的五维审稿；否则明确保存待评审建议。"""
+        episode_id = ctx["episode"]["id"]
+        script_version = str(ctx.get("script_version") or "unknown")
+        try:
+            current, current_version = self.projects.latest_document(
+                episode_id, "script_review")
+        except Exception as exc:
+            self.log.warn(
+                "director", "剧本独立评审状态读取失败，已跳过且不阻断："
+                f"{str(exc)[:240]}")
+            return 0
+        current_dimensions = (
+            current.get("dimensions") if isinstance(current, dict) else None)
+        current_ready = bool(
+            result is None
+            and isinstance(current, dict)
+            and current.get("status") == "ready"
+            and str(current.get("script_version") or "") == script_version
+            and str(current.get("generator_run_id") or "").strip()
+            and str(current.get("reviewer_run_id") or "").strip()
+            and current.get("generator_run_id") != current.get(
+                "reviewer_run_id")
+            and str(current.get("reviewer_source") or "").strip().lower()
+            not in {"", "generator", "self", "self_report", "生成器", "自评"}
+            and isinstance(current_dimensions, list)
+            and len(current_dimensions) == 5
+            and all(
+                isinstance(item, dict)
+                and item.get("score") is not None
+                and item.get("evidence")
+                and item.get("directed_revision")
+                for item in current_dimensions))
+        if current_ready:
+            # 复用同一版剧本时不得用“本轮没有 reviewer result”把已经
+            # 成立的独立审稿降级成 pending。
+            return current_version
+        if (result is None and isinstance(current, dict)
+                and current.get("status") == "pending"
+                and str(current.get("script_version") or "")
+                == script_version):
+            return current_version
+        provider = str(getattr(result, "provider", "") or "").strip()
+        data = getattr(result, "data", None)
+        raw = (
+            data.get("independent_review")
+            if isinstance(data, dict)
+            and isinstance(data.get("independent_review"), dict)
+            else None)
+        generator_run_id = ""
+        if raw is not None:
+            generator_run_id = str(
+                raw.get("generator_run_id") or ctx.get("run_id") or ""
+            ).strip()
+        try:
+            if raw is None:
+                raise ValueError("当前编剧 Provider 未返回独立评审运行")
+            court = build_script_review_court(
+                script_version=script_version,
+                generator_run_id=generator_run_id,
+                reviewer_run_id=raw.get("reviewer_run_id"),
+                reviewer_source=raw.get("reviewer_source"),
+                dimension_reviews=raw.get("dimension_reviews"),
+            )
+            document = review_document(court)
+            document["status"] = "ready"
+        except (TypeError, ValueError) as exc:
+            # 不复制生成器自评分、不补默认分，也不把“没有审稿”写成通过。
+            stale_from = (
+                str(current.get("script_version") or "")
+                if isinstance(current, dict)
+                and str(current.get("script_version") or "")
+                not in {"", script_version}
+                else "")
+            document = {
+                "schema": "aifos.story-review-pending/v1",
+                "kind": "review",
+                "production_blocking": False,
+                "status": "pending",
+                "script_version": script_version,
+                "generator_run_id": generator_run_id,
+                "generator_source": provider,
+                "scores_available": False,
+                "reason": str(exc),
+                "advice": [
+                    "等待与剧本生成运行独立的审稿来源返回完整五维证据后复评。",
+                    "本记录只作提示，不阻断分镜与后续生产。",
+                ],
+            }
+            if stale_from:
+                document.update({
+                    "reason": "剧本版本已更新，旧独立评审不再适用；"
+                    "等待新版本独立五维复评。",
+                    "stale_from_script_version": stale_from,
+                })
+        try:
+            return self._save_review_document(
+                episode_id, "script_review", document)
+        except Exception as exc:
+            self.log.warn(
+                "director", "剧本独立评审文档保存失败，已跳过且不阻断："
+                f"{str(exc)[:240]}")
+            return 0
+
+    def _persist_storyboard_reviews(self, ctx, keyframes=()):
+        """保存导演审片与浏览九宫格；二者永不进入资产/参考图链。"""
+        try:
+            storyboard = ctx.get("storyboard") or {}
+            documents = build_storyboard_review_documents(
+                episode_id=str(ctx["episode"]["id"]),
+                storyboard=storyboard,
+                keyframes=keyframes,
+                storyboard_version=ctx.get("storyboard_version") or "",
+            )
+            versions = {}
+            for kind, key in (
+                    ("episode_director_review", "director_review"),
+                    ("nine_grid_browser", "nine_grid_browser")):
+                versions[kind] = self._save_review_document(
+                    ctx["episode"]["id"], kind, documents[key])
+            return versions
+        except Exception as exc:
+            self.log.warn(
+                "director", "导演审片/九宫格文档更新失败，已跳过且不阻断："
+                f"{str(exc)[:240]}")
+            return {}
+
     def _stage_script(self, ctx):
         episode = ctx["episode"]
         provided = ctx.get("provided_script")
@@ -8289,6 +9241,7 @@ class Director:
                 ctx, force=True)
             ctx["script_is_new"] = True
             version = ctx["script_version"]
+            self._persist_script_review(ctx)
             self.log.info(
                 "director", f"使用用户自带剧本(v{version})，"
                 f"AI 制作圣经(v{analysis_version})已完成，等待确认")
@@ -8316,6 +9269,7 @@ class Director:
                     self._ensure_story_analysis(
                         ctx, force=normalized_changed)
                 version = ctx["script_version"]
+                self._persist_script_review(ctx)
                 if normalized_changed:
                     self.log.info(
                         "director",
@@ -8336,6 +9290,10 @@ class Director:
             "template": ctx["project"]["kind"],       # drama / idol
             "persona": ctx["project"]["title"],       # 偶像人设名=项目名
         }
+        previous_episode_continuity = self._previous_episode_continuity(ctx)
+        if previous_episode_continuity is not None:
+            payload["previous_episode_continuity"] = (
+                previous_episode_continuity)
         # 剧本域历史教训(仅人工批准过的)随编剧提示词下发
         script_lessons = script_lessons_block(
             self.assets, ctx["project"]["id"])
@@ -8363,6 +9321,7 @@ class Director:
             ctx, force=True)
         version = ctx["script_version"]
         ctx["script_is_new"] = True     # 新写的剧本 → 触发剧本确认暂停
+        self._persist_script_review(ctx, result)
         self.data.record(
             "prompt", "success", prompt=f"script:{ctx['project']['title']}"
             f":e{episode['number']}", uri=result.uri,
@@ -8482,7 +9441,8 @@ class Director:
                         "已为复用分镜补齐服装/头饰/妆发连续性，并修复"
                         "死亡后表演等确定性语义冲突；未改镜头号、台词或时长")
                 ctx["storyboard"] = existing
-                self._plan_seed_shots(ctx)
+                ctx["storyboard_version"] = version
+                self._persist_storyboard_reviews(ctx)
                 self.log.info("director", f"复用已有五维分镜 v{version}")
                 return {"version": version, "reused": True,
                         "shots": len(existing["shots"])}
@@ -8518,6 +9478,7 @@ class Director:
         version = self.projects.save_document(
             ctx["episode"]["id"], "storyboard", storyboard)
         ctx["storyboard"] = storyboard
+        ctx["storyboard_version"] = version
         # 分镜变了 → 旧的关键帧/首尾帧/视频全部作废重做
         ctx["force"] = True
         for shot in storyboard["shots"]:
@@ -8527,7 +9488,7 @@ class Director:
                 meta={"prompt": shot["prompt"],
                       "seedance_prompt": shot["seedance_prompt"],
                       "unit_id": shot["unit_id"]})
-        self._plan_seed_shots(ctx)
+        self._persist_storyboard_reviews(ctx)
         return {"version": version, "shots": len(storyboard["shots"]),
                 "pipeline_version": storyboard["pipeline_version"]}
 
@@ -8926,6 +9887,13 @@ class Director:
         ctx["blocking"] = blocking
         preflight = self._preflight_storyboard_shootability(ctx)
         temporal = self._preflight_temporal_previz(ctx)
+        # Shot-image identity includes the spatial reference produced from
+        # blocking.  Seeding during _stage_storyboard used a weaker contract
+        # (no blocking/spatial_ref), so every ordinary resume invalidated all
+        # explicitly selected four-up groups and burned a fresh batch.  Seed
+        # only after both spatial preflights have finalized the contract;
+        # _stage_images repeats this as an idempotent final check.
+        self._plan_seed_shots(ctx)
         return {
             "version": version,
             "reused": reused,
@@ -12486,10 +13454,6 @@ class Director:
         parts.append(
             "【NEGATIVE】禁止身份漂移、性别错误、人数错误、脸部融合、"
             "重复人物、错误服装、无关杂物、脏污皮肤、塑料脸、字幕和标签")
-        # 出错经验库:本项目此前真实犯过的错,逐条声明严禁再犯
-        lessons = lessons_block(self.assets, ctx["project"]["id"])
-        if lessons:
-            parts.append("【LESSONS·严禁再犯】" + lessons)
         return "\n".join(p for p in parts if p)
 
 
@@ -12602,7 +13566,16 @@ class Director:
                        self.config, ctx.get("production_standard")))
         spatial = shot_blocking(ctx.get("blocking"), shot["shot_no"])
         scene_physics = self._shot_scene_physics(ctx, location, spatial)
-        readable_text = shot.get("readable_text", {}) or {}
+        # ``locked_by`` and ``keyframe_uri`` are post-generation audit
+        # metadata.  Feeding them back into the next image contract changes
+        # its hash after the image has already been selected and can expose a
+        # local file path as irrelevant prompt text.  Visible wording/layout
+        # stays; internal lock bookkeeping never enters generation.
+        readable_text = {
+            key: copy.deepcopy(value)
+            for key, value in (shot.get("readable_text", {}) or {}).items()
+            if key not in {"locked_by", "keyframe_uri"}
+        }
         text_required = readable_text_required(readable_text)
         quality = resolve_image_quality(
             recommend_shot_image_quality(
@@ -12684,6 +13657,9 @@ class Director:
                     inner_persona_ref = str(row["uri"] or "").strip()
                     overlay["asset_uri"] = inner_persona_ref
         payload = {
+            "_episode_id": ctx["episode"]["id"],
+            "_contract_revision": max(
+                1, int(ctx.get("storyboard_version") or 1)),
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
             # 导演台意见:走既有 feedback 修订机制(审核与生成都会带上),
@@ -12816,6 +13792,10 @@ class Director:
         payload["prompt_contract_validation"] = (
             validate_shot_prompt_contract(
                 payload.get("prompt_contract") or {}))
+        self._append_generation_rules(
+            payload,
+            self._generation_rule_lines(
+                ctx, shot, payload, modality="image"))
         return payload
 
     def _reference_manifest(self, payload):
@@ -12834,7 +13814,10 @@ class Director:
 
         reference_scopes = {
             "identity": (
-                ["face", "identity", "hair_silhouette", "age", "gender"],
+                [
+                    "face", "identity", "hair_silhouette", "age", "gender",
+                    "makeup", "stable_makeup",
+                ],
                 [
                     "wardrobe", "pose", "composition", "background",
                     "lighting", "props", "prop_position",
@@ -12954,6 +13937,7 @@ class Director:
             if headwear_anchor:
                 identity_inherits = [
                     "face", "identity", "hair_silhouette", "age", "gender",
+                    "makeup", "stable_makeup",
                     "headwear_shape", "headwear_material", "headwear_color",
                     "headwear_placement", "headwear_signature_details",
                 ]
@@ -12963,12 +13947,14 @@ class Director:
                 (
                     f"本图是从人工锁定的{who}最终立绘派生的面部锚；只锁定"
                     f"{who}的脸型、五官骨相、年龄、性别表达、发际线与发型"
-                    "轮廓；不得推断或继承图外服装、体型、姿势、构图、背景"
+                    "轮廓、眉眼、眼线、睫毛、唇妆与稳定妆造；不得推断或"
+                    "继承图外服装、体型、姿势、构图、背景"
                     "或光线；服装只服从本镜服装参考；禁止参考他人图片"
                     + headwear_binding
                     if face_only else
                     f"只锁定{who}的脸型、五官骨相、年龄、性别表达、发际线、"
-                    "发型轮廓、体型与身份标志；不得复制此图的服装、"
+                    "发型轮廓、眉眼、眼线、睫毛、唇妆、稳定妆造、体型与"
+                    "身份标志；不得复制此图的服装、"
                     "姿势、构图、背景或光线；禁止参考他人图片"
                     + headwear_binding),
                 character=who, role="identity",
@@ -13254,6 +14240,303 @@ class Director:
             "", value)
         return re.sub(r"[；。]{2,}", "。", cleaned).strip()
 
+    _QUALITY_TO_LESSON_CATEGORIES = {
+        "identity": ("identity",),
+        "gender_age": ("identity",),
+        "count": ("people_count",),
+        "wardrobe": ("wardrobe",),
+        "era": ("era",),
+        "text": ("text",),
+        "camera_contract": ("camera",),
+        "spatial_logic": ("space", "camera"),
+        "prop_physics": ("prop", "physics", "motion"),
+        "lighting": ("lighting",),
+        "video_state_chain": ("motion", "physics"),
+        "video_camera_motion": ("camera", "motion"),
+        "video_identity_continuity": ("identity",),
+        "video_prop_state": ("prop", "physics", "motion"),
+        "reference_budget": ("identity", "prop", "scene"),
+        "audio_lipsync": ("audio",),
+    }
+
+    @staticmethod
+    def _quality_context(shot, payload, modality):
+        """Return only shot-local facts used to select concise rules.
+
+        Never rank rules against the full screenplay or the whole project
+        history.  That was the source of unrelated clauses leaking into image
+        prompts and competing with the actual camera/action contract.
+        """
+        shot = shot if isinstance(shot, dict) else {}
+        payload = payload if isinstance(payload, dict) else {}
+        return {
+            "modality": modality,
+            "characters": list(payload.get("characters") or
+                               shot.get("characters") or []),
+            "visible_figure_count": payload.get("visible_figure_count"),
+            "character_facts": payload.get("character_background") or {},
+            "era": payload.get("era_context") or shot.get("era_context")
+            or shot.get("era") or "",
+            "camera": payload.get("camera") or shot.get("camera") or
+            shot.get("shot_contract") or {},
+            "action": payload.get("action") or shot.get("description") or
+            shot.get("prompt") or "",
+            "start_state": payload.get("start_state") or
+            shot.get("start_state") or {},
+            "end_state": payload.get("end_state") or
+            shot.get("end_state") or {},
+            "readable_text": payload.get("readable_text") or
+            shot.get("readable_text") or {},
+            "physical_contract": payload.get("physical_contract") or {},
+            "spatial_blocking": payload.get("spatial_blocking") or {},
+            "references": payload.get("reference_manifest") or [],
+            "dialogue": payload.get("dialogue") or shot.get("dialogue") or {},
+        }
+
+    @staticmethod
+    def _contract_safe_copy(value):
+        """Copy JSON contract data without leaking sqlite3.Row/provider objects."""
+        if isinstance(value, dict):
+            return {
+                str(key): Director._contract_safe_copy(item)
+                for key, item in value.items()
+            }
+        if hasattr(value, "keys") and callable(value.keys):
+            return {
+                str(key): Director._contract_safe_copy(value[key])
+                for key in value.keys()
+            }
+        if isinstance(value, (list, tuple)):
+            return [Director._contract_safe_copy(item) for item in value]
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
+
+    def _generation_rule_lines(self, ctx, shot, payload, modality):
+        """Select at most five relevant built-in/project rules per request."""
+        context = self._quality_context(shot, payload, modality)
+        context_values = [
+            value for key, value in context.items() if key != "modality"]
+        categories = set(infer_quality_categories(
+            context_values, modality=modality))
+        if context["characters"]:
+            categories.update(("identity", "gender_age"))
+        if context["visible_figure_count"] is not None:
+            categories.add("count")
+        if context["era"]:
+            categories.add("era")
+        if context["camera"]:
+            categories.add("camera_contract")
+        if context["spatial_blocking"]:
+            categories.add("spatial_logic")
+        if context["physical_contract"]:
+            categories.add("prop_physics")
+        if context["references"]:
+            categories.add("reference_budget")
+        if modality == "video":
+            action = str(context.get("action") or "")
+            start_state = context.get("start_state") or {}
+            end_state = context.get("end_state") or {}
+            complex_action = bool(
+                shot.get("complex_action")
+                or str(shot.get("action_complexity") or "").lower()
+                in {"complex", "high", "复杂", "multi_stage", "multi-stage"}
+                or len(shot.get("action_steps") or []) >= 2)
+            if complex_action:
+                categories.add("video_state_chain")
+            camera_text = json.dumps(
+                context.get("camera") or {}, ensure_ascii=False,
+                default=str) + action
+            if any(token in camera_text for token in (
+                    "推镜", "拉镜", "摇镜", "跟拍", "环绕", "移动",
+                    "tracking", "pan", "dolly", "zoom")):
+                categories.add("video_camera_motion")
+            if context["characters"]:
+                categories.add("video_identity_continuity")
+            prop_text = json.dumps(
+                [start_state, end_state, context.get("physical_contract")],
+                ensure_ascii=False, default=str)
+            if any(token in prop_text for token in (
+                    "道具", "手持", "拿", "放", "递", "开合", "prop")):
+                categories.add("video_prop_state")
+            dialogue = context.get("dialogue")
+            has_dialogue = bool(
+                dialogue.get("dialogue") if isinstance(dialogue, dict)
+                else str(dialogue or "").strip())
+            if has_dialogue:
+                categories.add("audio_lipsync")
+
+        # Project history may reweight a rule that this shot already needs;
+        # it must never be the sole reason a new category enters an empty
+        # prompt contract.
+        if not categories:
+            return ()
+
+        lesson_categories = set()
+        for category in categories:
+            lesson_categories.update(
+                self._QUALITY_TO_LESSON_CATEGORIES.get(category, (category,)))
+        domain = DOMAIN_VIDEO if modality == "video" else DOMAIN_IMAGE
+        # Critical current-shot facts always win. Historical observations can
+        # fill unused positions, never evict action/physics/identity/count or
+        # camera constraints merely because they happened more often before.
+        output = []
+        if "video_state_chain" in categories:
+            output.extend(quality_rule_lines(
+                categories=["video_state_chain"], modality=modality, limit=1))
+        if "prop_physics" in categories:
+            output.extend(quality_rule_lines(
+                categories=["prop_physics"], modality=modality, limit=1))
+        if "spatial_logic" in categories:
+            output.extend(quality_rule_lines(
+                categories=["spatial_logic"], modality=modality, limit=1))
+        if {"identity", "count"} <= categories:
+            output.append(
+                "人脸发型妆造沿用锁定母图；人数严格等于镜头合同，不增人复制。")
+        else:
+            for category in ("identity", "count"):
+                if category in categories:
+                    output.extend(quality_rule_lines(
+                        categories=[category], modality=modality, limit=1))
+        if "camera_contract" in categories:
+            output.extend(quality_rule_lines(
+                categories=["camera_contract"], modality=modality, limit=1))
+        output = list(dict.fromkeys(output))[:5]
+
+        learned_candidates = lesson_lines(
+            self.assets, ctx["project"]["id"], limit=20,
+            domain=domain, categories=lesson_categories, context=context)
+        learned = [
+            line for line in learned_candidates
+            if (not lesson_categories
+                or lesson_categories.intersection(
+                    infer_lesson_categories(line)))
+        ]
+        output.extend(
+            f"历史验证：{line}" for line in learned[:5 - len(output)])
+        if len(output) < 5:
+            remaining = categories - {
+                "video_state_chain", "prop_physics", "spatial_logic",
+                "identity", "count", "camera_contract",
+            }
+            output.extend(quality_rule_lines(
+                categories=remaining, context=context_values,
+                modality=modality, limit=5 - len(output)))
+        return tuple(dict.fromkeys(output))[:5]
+
+    @staticmethod
+    def _append_generation_rules(payload, rules):
+        """Append one idempotent concise block to actual provider prompts."""
+        rules = [str(rule).strip() for rule in rules if str(rule).strip()][:5]
+        payload["generation_quality_rules"] = rules
+        if not rules:
+            return payload
+        marker = "【本镜质量规则·最多5条】"
+        block = marker + "\n" + "\n".join(
+            f"{index}. {rule}" for index, rule in enumerate(rules, 1))
+        for key in ("prompt", "prompt_compact"):
+            value = str(payload.get(key) or "").strip()
+            if marker not in value:
+                payload[key] = (value + "\n" + block).strip()
+        return payload
+
+    @staticmethod
+    def _generation_preflight_contract(shot, payload, modality):
+        """Adapt the real provider payload to the deterministic preflight."""
+        shot = shot if isinstance(shot, dict) else {}
+        payload = payload if isinstance(payload, dict) else {}
+        expected = payload.get("visible_figure_count")
+        visible = list(payload.get("characters") or shot.get("characters")
+                       or [])
+        functional = payload.get("functional_figures") or []
+        if expected is not None:
+            try:
+                missing = max(0, int(expected) - len(visible))
+            except (TypeError, ValueError):
+                missing = 0
+            visible.extend(
+                f"功能人物#{index}" for index in range(1, missing + 1))
+        manifest = []
+        for row in payload.get("reference_manifest") or []:
+            if not isinstance(row, dict):
+                continue
+            role = str(row.get("role") or row.get("kind") or
+                       "declared_binding").strip()
+            manifest.append({
+                **Director._contract_safe_copy(row),
+                "responsibilities": [role],
+                "target": row.get("character") or row.get("attach_to") or "",
+                "primary": bool(row.get("primary", role == "identity")),
+            })
+        prop_names = []
+        for row in payload.get("frame_props") or []:
+            if isinstance(row, dict):
+                name = row.get("name") or row.get("prop_name")
+                if name:
+                    prop_names.append(name)
+        physical = payload.get("physical_contract") or {}
+        spatial = payload.get("spatial_blocking") or {}
+        spatial_required = bool(
+            spatial.get("spatial_reference_required")
+            or spatial.get("requires_spatial_reference"))
+        tier = str(payload.get("video_model_tier") or "").lower()
+        model = "Seedance 2.5" if "2.5" in tier else (
+            "Seedance 2.0 Fast VIP" if modality == "video" else "image")
+        return {
+            "shot_no": payload.get("shot_no", shot.get("shot_no")),
+            # Motion checks must inspect only the authored main action.  The
+            # full compact contract contains start/end connective wording and
+            # would otherwise make every legitimate single action look like a
+            # multi-action prompt.
+            "prompt": payload.get("action") or shot.get("description")
+            or shot.get("prompt") or "",
+            "description": payload.get("action") or
+            shot.get("description") or "",
+            "camera_contract": (
+                shot.get("shot_contract") or
+                (shot.get("five_dimensions") or {}).get("camera_design") or
+                payload.get("camera") or {}),
+            "expected_people_count": expected,
+            "visible_characters": visible,
+            "era_context": payload.get("era_context") or
+            shot.get("era_context") or shot.get("era") or "",
+            "props": prop_names,
+            "sanctioned_anachronisms": payload.get(
+                "sanctioned_anachronisms") or [],
+            "references": manifest,
+            "total_reference_count": (
+                len(manifest) + (2 if modality == "video" else 0)),
+            "asset_reference_count": len(manifest),
+            "max_total_references": (
+                None if modality == "video" else IMAGE_REFERENCE_LIMIT),
+            "max_asset_references": (
+                None if modality == "video" else IMAGE_REFERENCE_LIMIT),
+            "model": model,
+            "spatial_required": spatial_required,
+            "spatial_blocking": spatial,
+            "spatial_ref": payload.get("spatial_ref") or "",
+            # Every storyboard shot, including an empty room, has gravity,
+            # support, occlusion and camera-space constraints. Mother assets
+            # do not use this adapter, so requiring the compact physical
+            # contract here is safe and deterministic.
+            "physical_contract_required": True,
+            "physical_contract": physical,
+            "single_action": bool(
+                shot.get("single_action") is True
+                or str(shot.get("action_mode") or "").lower()
+                in {"single", "single_action", "单动作", "单一动作"}),
+            "action_steps": Director._contract_safe_copy(
+                shot.get("action_steps") or []),
+            "states": [payload.get("start_state") or {},
+                       payload.get("end_state") or {}],
+            "action_complexity": shot.get("action_complexity") or "",
+            "complex_action": bool(shot.get("complex_action")),
+        }
+
+    def _generation_preflight_issues(self, shot, payload, modality):
+        return preflight_shot_contract(
+            self._generation_preflight_contract(shot, payload, modality))
+
     def _attach_reference_manifest(self, payload):
         """把参考图对照表写进 payload 与提示词(编号=实际提交顺序)。"""
         # Structured prompt-review context is audited alongside the prompt.
@@ -13361,6 +14644,15 @@ class Director:
             payload["prompt_compact"] = base_prompt
 
     def reconcile_completed_shot_images(self, ctx):
+        """Atomically reconcile render-plan shot images with formal assets."""
+        # This routine resets stale claims, mutates several plan rows and then
+        # writes the complete plan.  Hold one RMW lock for the entire pass so a
+        # live candidate/status update cannot be replaced by the snapshot read
+        # at the beginning of reconciliation.
+        with _PLAN_IO_LOCK:
+            return self._reconcile_completed_shot_images_locked(ctx)
+
+    def _reconcile_completed_shot_images_locked(self, ctx):
         """补登记旧批次已通过 QC、但因批次中途失败而遗留的关键帧。
 
         旧并行调度会先把每张图及 QC 状态写入 render_plan，随后才批量
@@ -13372,6 +14664,7 @@ class Director:
         """
         plan = self._plan_read(ctx)
         by_id = {item.get("id"): item for item in plan.get("items", [])}
+        image_content_qc = self._image_qc_enabled()
         recovered = 0
         exposed_failures = 0
         changed = False
@@ -13389,6 +14682,28 @@ class Director:
                 }
                 item["status"] = "pending"
                 stale_reset += 1
+                changed = True
+            if (not image_content_qc
+                    and item.get("category") == "shot_image"
+                    and item.get("status") in ("awaiting_human", "failed")):
+                # 关闭内容QC后，历史红牌不得继续作为隐形闸门。
+                # 旧单图不伪装成新四候选，回到 pending 后按新标准重生。
+                previous = item.get("status")
+                item["status"] = "pending"
+                item["error"] = ""
+                qc = dict(item.get("qc") or {})
+                if qc:
+                    qc.update({
+                        "advisory_only": True,
+                        "blocking": False,
+                        "awaiting_human": False,
+                        "waived_by": "selection_mode_or_image_content_qc",
+                    })
+                    item["qc"] = qc
+                item["content_qc_migration"] = {
+                    "previous_status": previous,
+                    "reset_at": now(),
+                }
                 changed = True
         if stale_reset:
             self.log.warn(
@@ -13414,6 +14729,19 @@ class Director:
                     and not Path(uri).exists()):
                 continue
             qc = item.get("qc") or {}
+            has_candidate_group = "candidate_group" in item
+            candidate_group_valid = (
+                self._shot_candidate_group_valid(item)
+                if has_candidate_group else True)
+            if (not image_content_qc and has_candidate_group
+                    and not candidate_group_valid):
+                # 新候选记录必须证明4张均已落盘；没有 candidate_group 字段
+                # 的旧存量仍按旧资产+镜头内容哈希规则复用，不能被升级时
+                # 误判成“缺4张”而整集重画。
+                if item.get("status") != "pending":
+                    item["status"] = "pending"
+                    changed = True
+                continue
             if (qc.get("passed") is True
                     and not self._repair_gacha_prompt_invariant_valid(item)):
                 item["status"] = "failed"
@@ -13423,14 +14751,14 @@ class Director:
                 qc["retry_blocked"] = False
                 qc["issues"] = list(dict.fromkeys([
                     *(qc.get("issues") or []),
-                    "修订组三张候选未证明使用同一冻结提示词，"
+                    "修订组候选未证明使用同一冻结提示词，"
                     "该批作废并由AIFOS自动重抽",
                 ]))
                 item["qc"] = qc
                 exposed_failures += 1
                 changed = True
                 continue
-            if qc.get("passed") is False:
+            if image_content_qc and qc.get("passed") is False:
                 if item.get("status") != "failed":
                     item["status"] = "failed"
                     changed = True
@@ -13445,8 +14773,11 @@ class Director:
                 exposed_failures += 1
                 changed = True
                 continue
+            acceptable = (
+                qc.get("passed") is True if image_content_qc
+                else candidate_group_valid)
             if (item.get("status") not in ("done", "reused")
-                    or qc.get("passed") is not True):
+                    or not acceptable):
                 continue
             asset_name = self._shot_name(ctx, shot_no)
             existing_row = self.assets.latest(
@@ -13486,6 +14817,7 @@ class Director:
                     "provider", "model", "real", "fallbacks",
                     "image_task_class", "unit_cost", "qc",
                     "reference_inputs", "prompt_used", "prompt_used_hash",
+                    "candidate_group", "candidate_uris", "candidate_count",
                     "started_at", "finished_at", "duration"):
                 if key in item:
                     recovered_meta[key] = item[key]
@@ -13527,8 +14859,11 @@ class Director:
             category = item.get("category")
             if category not in ("shot_image", "frames"):
                 continue
+            qc_failed = (
+                self._image_qc_enabled()
+                and (item.get("qc") or {}).get("passed") is False)
             if (item.get("status") not in ("done", "reused")
-                    or (item.get("qc") or {}).get("passed") is False):
+                    or qc_failed):
                 return True
             shot_no = item.get("shot_no")
             if shot_no is None:
@@ -13710,16 +15045,84 @@ class Director:
         awaiting_shots = set(
             reconciliation.get("awaiting_human_shots") or [])
         skipped_awaiting = []
+        awaiting_selection = []
+        technical_incomplete = []
+        preflight_failures = []
         for shot in self._active_shots(ctx):
             scene_first = shot.get("scene_no") not in seen_scenes
             seen_scenes.add(shot.get("scene_no"))
             if int(shot.get("shot_no") or 0) in awaiting_shots:
                 skipped_awaiting.append(int(shot["shot_no"]))
                 continue
-            payload = self._shot_payload(ctx, shot)
-            required_quality = payload["quality_decision"]["level"]
             stored_prior = prior_plan.get(
                 f"shot:{shot['shot_no']}") or {}
+            if (stored_prior.get("status") == "awaiting_selection"
+                    and self._shot_candidate_group_valid(stored_prior)):
+                awaiting_selection.append(int(shot["shot_no"]))
+                continue
+            payload = self._shot_payload(ctx, shot)
+            contract_issues = self._generation_preflight_issues(
+                shot, payload, modality="image")
+            if contract_issues:
+                reason = "；".join(
+                    issue.message for issue in contract_issues)
+                self._plan_mark(
+                    ctx, f"shot:{shot['shot_no']}",
+                    ("awaiting_contract"
+                     if self._selection_mode_enabled() else "failed"),
+                    error=("本镜生成前合同未通过，未调用生图模型："
+                           + reason))
+                preflight_failures.append((
+                    int(shot["shot_no"]), tuple(contract_issues)))
+                self.log.warn(
+                    "director",
+                    f"镜头{shot['shot_no']}生成前合同已隔离；"
+                    f"其余镜头继续并行：{reason[:500]}")
+                continue
+            prior_group = stored_prior.get("candidate_group") or {}
+            try:
+                prior_candidate_revision = int(
+                    prior_group.get("candidate_revision") or 0)
+            except (TypeError, ValueError, AttributeError):
+                prior_candidate_revision = 0
+            payload["_episode_id"] = ctx["episode"]["id"]
+            payload["_candidate_revision"] = max(
+                1, prior_candidate_revision + 1)
+            pending_candidate_regeneration = bool(
+                stored_prior.get("candidate_generation_status")
+                == "regenerating_candidates"
+                and isinstance(prior_group, dict)
+                and prior_group.get("candidate_set_id")
+                and not (prior_group.get("candidates") or []))
+            if pending_candidate_regeneration:
+                custom_prompt = str(stored_prior.get("prompt") or "").strip()
+                if not custom_prompt:
+                    raise AifosError(
+                        f"镜头{shot['shot_no']}候选重生缺少完整自定义提示词")
+                payload.update({
+                    "prompt": custom_prompt,
+                    "prompt_compact": custom_prompt,
+                    "action": custom_prompt,
+                    "seedance_prompt": custom_prompt,
+                    "_reference_prompt_base": custom_prompt,
+                    "_candidate_set_id": prior_group["candidate_set_id"],
+                    "_candidate_revision": max(
+                        1, int(prior_group.get("candidate_revision") or 1)),
+                    "_contract_revision": max(
+                        1, int(prior_group.get("contract_revision") or 1)),
+                })
+            if (stored_prior.get("status") == "technical_incomplete"
+                    and isinstance(prior_group, dict)
+                    and prior_group.get("candidate_set_id")):
+                payload["_candidate_set_id"] = prior_group[
+                    "candidate_set_id"]
+                payload["_candidate_revision"] = max(
+                    1, prior_candidate_revision)
+                payload["_contract_revision"] = max(
+                    1, int(prior_group.get("contract_revision") or 1))
+                payload["_resume_candidate_group"] = copy.deepcopy(
+                    prior_group)
+            required_quality = payload["quality_decision"]["level"]
             existing = self._existing_asset_uri(
                 ctx, "image", self._shot_name(ctx, shot["shot_no"]))
             # 用户明确禁止视觉返工后，断点里已经生成并由流水线冻结的
@@ -13765,6 +15168,7 @@ class Director:
                         })
                     continue
             if (existing
+                    and self._shot_candidate_group_valid(stored_prior)
                     and self._repair_gacha_prompt_invariant_valid(
                         stored_prior)):
                 row = self.assets.latest(
@@ -13828,7 +15232,7 @@ class Director:
                 repair_meta.get("blocking_reason") or "")
             # v28 之前没有把修复轮次写入 render_plan，但编剧就地修过的
             # Codex blocking_reason 会持久化在 storyboard。当前项又在
-            # 修订组三抽中，说明至少两轮已失败，恢复时应直接进入第三轮
+            # 修订候选组中，说明至少两轮已失败，恢复时应直接进入第三轮
             # 深度瘦身，而不是把前两轮重新烧一遍。
             if (not persisted_repair_count
                     and stored.get("autonomous_repair_seeded")
@@ -13904,12 +15308,12 @@ class Director:
                     self.log.info(
                         "director",
                         f"{task['item_id']} 已承接断点中的 Codex 修改指令，"
-                        "本轮直接生成3张候选并全部质检选优")
+                        "本轮直接生成4张候选并全部选优")
             elif resumed_repair_group:
                 self.log.info(
                     "director",
-                    f"{task['item_id']} 上一轮三候选因产线中断未完成，"
-                    "已从修订合同断点恢复并继续固定3张全量选优")
+                    f"{task['item_id']} 上一轮四候选因产线中断未完成，"
+                    "已从修订合同断点恢复并继续固定4张并行选优")
             payload = task["payload"]
             quality_by_shot[shot["shot_no"]] = payload["quality_decision"]
             payload_by_shot[shot["shot_no"]] = payload
@@ -13917,8 +15321,35 @@ class Director:
         results, qc_failures = self._run_parallel(
             ctx, tasks, line="分镜画面",
             continue_on_qc_failure=True)
+        if qc_failures and self._selection_mode_enabled():
+            # Selection mode never turns a shot-local contract/content issue
+            # into an episode failure. Keep successful four-up sets, mark only
+            # the affected shot for contract repair (or technical refill), and
+            # pause at the image workbench for a precise resume.
+            for task, error in qc_failures:
+                shot_no = int(task["tag"])
+                reason = str(error)
+                if self._prompt_review_block_reason(error):
+                    self._plan_mark(
+                        ctx, task["item_id"], "awaiting_contract",
+                        error=("本镜提示词合同需修改；其他镜头不受影响："
+                               + reason[:900]))
+                    preflight_failures.append((shot_no, ()))
+                else:
+                    self._plan_mark(
+                        ctx, task["item_id"], "technical_incomplete",
+                        error=("本镜技术执行未完成；已保留其他镜头与候选："
+                               + reason[:900]))
+                    technical_incomplete.append(shot_no)
+            qc_failures = []
         for shot_no in sorted(results):
             result = results[shot_no]
+            if self._candidate_group_technical_incomplete(result):
+                technical_incomplete.append(int(shot_no))
+                continue
+            if self._candidate_selection_pending(result):
+                awaiting_selection.append(int(shot_no))
+                continue
             quality = quality_by_shot[shot_no]
             self._register_completed_shot_result(
                 ctx,
@@ -13929,6 +15360,9 @@ class Director:
                 "shot_no": shot_no, "uri": result.uri,
                 "image_quality": quality["level"]})
         ctx["images"].sort(key=lambda i: i["shot_no"])
+        # 只把已经正式选中的关键帧 URI 写回浏览板。候选图、拼贴图和
+        # 未晋升结果不会进入九宫格，更不会因此被注册成生成参考资产。
+        self._persist_storyboard_reviews(ctx, keyframes=ctx["images"])
         if skipped_awaiting and not qc_failures:
             # 无法迁移的历史检查点仍不得带着缺图流入首尾帧/视频阶段。
             raise AifosError(
@@ -13936,17 +15370,17 @@ class Director:
                 "已停止进入下游；需要由 AIFOS 自动修复器重建状态。镜头: "
                 + "、".join(str(value) for value in skipped_awaiting))
         if qc_failures:
-            failed_shots = sorted(
-                int(task["tag"]) for task, _error in qc_failures)
+            failed_shots = sorted(set(
+                int(task["tag"]) for task, _error in qc_failures))
             self.log.warn(
                 "director",
                 f"关键帧本批已完成其余 {len(results)} 张；"
-                f"{len(failed_shots)} 张仍未通过(修订组三抽失败或提示词"
-                "审核熔断)，已隔离为自动修复失败项: "
+                f"{len(failed_shots)} 张仍未通过(生成前合同、修订组四候选"
+                "或提示词审核)，已逐镜隔离: "
                 + "、".join(f"镜头{value}" for value in failed_shots))
             raise AifosError(
-                f"{len(failed_shots)} 张关键帧经自动修复后仍未通过"
-                "(视觉质检失败或提示词审核熔断)；"
+                f"{len(failed_shots)} 张关键帧未通过本镜生成前合同或"
+                "生成任务；"
                 "失败稿及 Codex 诊断已保留，其他关键帧已继续完成；"
                 "下一断点由 AIFOS 自动重建合同后继续，不要求用户确认。"
                 "问题镜头: "
@@ -13955,6 +15389,43 @@ class Director:
                     "；另有无法自动迁移的历史镜头: "
                     + "、".join(str(value) for value in skipped_awaiting)
                     if skipped_awaiting else ""))
+        if preflight_failures and not self._selection_mode_enabled():
+            failed_shots = [
+                shot_no for shot_no, _issues in preflight_failures]
+            raise AifosError(
+                f"{len(failed_shots)} 张关键帧生成前合同未通过；"
+                "其他镜头已继续完成。问题镜头："
+                + "、".join(str(value) for value in failed_shots))
+        if awaiting_selection or technical_incomplete or preflight_failures:
+            ctx["shot_selection_required"] = True
+            ctx["shot_selection_shots"] = sorted(set(awaiting_selection))
+            ctx["shot_candidate_repair_required"] = bool(
+                technical_incomplete)
+            ctx["shot_candidate_repair_shots"] = sorted(
+                set(technical_incomplete))
+            ctx["shot_contract_repair_required"] = bool(
+                preflight_failures)
+            ctx["shot_contract_repair_shots"] = sorted(
+                shot_no for shot_no, _issues in preflight_failures)
+            self.log.info(
+                "director",
+                f"{len(set(awaiting_selection))} 个镜头的4张候选已并行"
+                "落盘，等待人工或AI明确选片；"
+                f"{len(set(technical_incomplete))} 个镜头仍需技术补位；"
+                "均未晋升正式关键帧")
+            return {
+                "count": len(ctx["images"]), "reused": reused,
+                "recovered": reconciliation["recovered"],
+                "awaiting_selection": bool(awaiting_selection),
+                "awaiting_selection_shots": sorted(
+                    set(awaiting_selection)),
+                "technical_incomplete": bool(technical_incomplete),
+                "technical_incomplete_shots": sorted(
+                    set(technical_incomplete)),
+                "contract_incomplete": bool(preflight_failures),
+                "contract_incomplete_shots": sorted(
+                    shot_no for shot_no, _issues in preflight_failures),
+            }
         return {
             "count": len(ctx["images"]), "reused": reused,
             "recovered": reconciliation["recovered"],
@@ -14105,13 +15576,15 @@ class Director:
                         or {})
                     if (self._quality_meets(
                             frame_quality, required_quality)
-                            and (saved_qc.get("passed") is True
-                                 or self._director_autonomy_enabled())):
-                        qc_passed = saved_qc.get("passed") is True
+                            and (not self._image_qc_enabled()
+                                 or saved_qc.get("passed") is True)):
+                        content_qc_waived = not self._image_qc_enabled()
                         ctx["frames"].append({
                             "shot_no": shot["shot_no"], "first": first,
                             "last": last, "image_quality": frame_quality,
-                            "qc_passed": qc_passed,
+                            "qc_passed": bool(saved_qc.get("passed") is True),
+                            "content_qc_enabled": not content_qc_waived,
+                            "content_qc_waived": content_qc_waived,
                             "inspection_waived":
                                 self._director_autonomy_enabled()})
                         reused += 1
@@ -14184,8 +15657,11 @@ class Director:
                 shot_no = task["tag"]
                 decision = task["payload"]["quality_decision"]
                 meta = self._quality_meta(decision)
+                content_qc_waived = not self._image_qc_enabled()
                 meta["qc_passed"] = bool(
                     (getattr(result, "qc", None) or {}).get("passed"))
+                meta["content_qc_enabled"] = not content_qc_waived
+                meta["content_qc_waived"] = content_qc_waived
                 self._register_shot_asset(
                     ctx, "first_frame", shot_no, result.data["first"],
                     meta=meta)
@@ -14198,6 +15674,8 @@ class Director:
                     "last": result.data["last"],
                     "image_quality": decision["level"],
                     "qc_passed": meta["qc_passed"],
+                    "content_qc_enabled": not content_qc_waived,
+                    "content_qc_waived": content_qc_waived,
                 })
                 last_by_scene[task["scene"]] = {
                     "uri": result.data["last"],
@@ -14296,6 +15774,7 @@ class Director:
         ctx["videos"] = []
         reused = 0
         pending = []
+        preparation_failures = []
         for shot in self._active_shots(ctx):
             name = self._shot_name(ctx, shot["shot_no"])
             existing = self._existing_asset_uri(ctx, "video", name)
@@ -14313,14 +15792,34 @@ class Director:
                         "video_resolution", "720p")})
                 reused += 1
                 continue
-            pending.append(self._prepare_video_call(ctx, shot, frames))
+            try:
+                pending.append(self._prepare_video_call(ctx, shot, frames))
+            except AifosError as exc:
+                preparation_failures.append((int(shot["shot_no"]), exc))
+                self.log.warn(
+                    "director",
+                    f"镜头{shot['shot_no']}视频生成前合同已隔离；"
+                    f"其余镜头继续并行：{str(exc)[:500]}")
         generated = self._run_videos_parallel(ctx, pending)
         ctx["videos"].extend(generated.values())
         ctx["videos"].sort(key=lambda item: int(item["shot_no"]))
+        if preparation_failures and not self._selection_mode_enabled():
+            raise AifosError(
+                f"{len(preparation_failures)} 个视频镜头生成前合同未通过；"
+                "其他可生成镜头已继续完成。问题镜头："
+                + "、".join(
+                    str(shot_no) for shot_no, _exc in preparation_failures))
+        if preparation_failures:
+            ctx["video_contract_repair_required"] = True
+            ctx["video_contract_repair_shots"] = sorted(
+                shot_no for shot_no, _exc in preparation_failures)
         return {
             "count": len(ctx["videos"]),
             "reused": reused,
             "generated": len(generated),
+            "contract_incomplete": bool(preparation_failures),
+            "contract_incomplete_shots": sorted(
+                shot_no for shot_no, _exc in preparation_failures),
             "parallel_workers": min(
                 self._video_parallel_workers(), max(1, len(pending))),
         }
@@ -15233,9 +16732,35 @@ class Director:
             "和逻辑；人物服从重力、惯性、关节、重心和支撑，物品位移、"
             "旋转、碰撞、接触与交接连续且有明确受力来源；严禁漂浮、"
             "瞬移、拉长、扭曲、穿模或无支撑运动。")
-        lessons = lessons_block(self.assets, ctx["project"]["id"])
-        if lessons:
-            lines.append("【严禁再犯】" + lessons)
+        quality_payload = {
+            "shot_no": shot.get("shot_no"),
+            "characters": characters,
+            "visible_figure_count": shot.get(
+                "visible_figure_count", len(characters)),
+            "character_background": self._shot_character_facts(ctx, shot),
+            "era_context": "；".join(filter(None, (
+                str(world.get("name") or "").strip(),
+                str(world.get("era_and_location") or "").strip(),
+                str(shot.get("era_context") or shot.get("era") or "").strip(),
+            ))),
+            "camera": shot.get("camera") or shot.get("shot_contract") or {},
+            "action": shot.get("description") or shot.get("prompt") or "",
+            "start_state": shot.get("start_state") or {},
+            "end_state": shot.get("end_state") or {},
+            "readable_text": readable,
+            "physical_contract": build_physical_contract({
+                **shot, "spatial_blocking": spatial}),
+            "spatial_blocking": spatial,
+            "reference_manifest": reference_manifest,
+            "dialogue": dialogue,
+        }
+        quality_rules = self._generation_rule_lines(
+            ctx, shot, quality_payload, modality="video")
+        if quality_rules:
+            lines.append(
+                "【本镜质量规则·最多5条】\n" + "\n".join(
+                    f"{index}. {rule}"
+                    for index, rule in enumerate(quality_rules, 1)))
         return "\n".join(lines)
 
     def _motion_reference_uri(self, ctx, shot):
@@ -15482,6 +17007,7 @@ class Director:
             self._video_reference_rows(ctx, shot["shot_no"])
             if reference_mode == "all_around" else [])
         spatial = self._spatial_reference_requirement(ctx, shot["shot_no"])
+        spatial_block = shot_blocking(ctx.get("blocking"), shot_no) or {}
         if (reference_mode == "all_around"
                 and spatial["required"]
                 and not self._director_autonomy_enabled()
@@ -15569,6 +17095,44 @@ class Director:
             "seedance_reference_mode": reference_mode,
             **prop_contract,
             "dialogue": video_dialogue,
+            "characters": list(shot.get("characters") or []),
+            "functional_figures": self._contract_safe_copy(
+                shot.get("functional_figures") or []),
+            "visible_figure_count": shot.get(
+                "visible_figure_count", len(shot.get("characters") or [])),
+            "camera": shot.get("camera") or shot.get("shot_contract") or {},
+            "action": shot.get("description") or shot.get("prompt") or "",
+            "start_state": self._contract_safe_copy(
+                shot.get("start_state") or {}),
+            "end_state": self._contract_safe_copy(
+                shot.get("end_state") or {}),
+            "readable_text": self._contract_safe_copy(
+                shot.get("readable_text") or {}),
+            "spatial_blocking": {
+                **self._contract_safe_copy(spatial_block),
+                "spatial_reference_required": bool(
+                    spatial["required"] and reference_mode == "all_around"),
+                "spatial_reference_uri": next((
+                    str(row.get("uri") or "")
+                    for row in reference_manifest
+                    if row.get("kind") == "spatial_blocking"), ""),
+            },
+            "spatial_ref": next((
+                str(row.get("uri") or "") for row in reference_manifest
+                if row.get("kind") == "spatial_blocking"), ""),
+            "physical_contract": build_physical_contract({
+                **shot, **prop_contract, "spatial_blocking": spatial_block}),
+            "era_context": "；".join(filter(None, (
+                str((((ctx.get("script") or {}).get("story_world") or {})
+                    .get("name") or "")).strip(),
+                str((((ctx.get("script") or {}).get("story_world") or {})
+                    .get("era_and_location") or "")).strip(),
+                str(shot.get("era_context") or shot.get("era") or "").strip(),
+            ))),
+            "sanctioned_anachronisms": list(
+                (((ctx.get("script") or {}).get("story_world") or {})
+                 .get("sanctioned_anachronisms") or
+                 shot.get("sanctioned_anachronisms") or [])),
             "voice": ctx["production_profile"]["voice"],
             "lip_sync": ctx["production_profile"]["lip_sync"],
             "forbid_subtitles": not ctx["production_profile"]["burn_subtitles"],
@@ -15590,6 +17154,12 @@ class Director:
                 "standard_fingerprint", ""),
             "aspect": ctx["aspect"], **ctx["dims"],
         }
+        contract_issues = self._generation_preflight_issues(
+            shot, payload, modality="video")
+        if contract_issues:
+            raise AifosError(
+                f"镜头{shot_no}视频生成前合同未通过，未调用 Seedance："
+                + "；".join(issue.message for issue in contract_issues))
         snapshot = self._video_input_snapshot(payload)
         payload["input_snapshot"] = snapshot
         payload["input_signature"] = snapshot["input_signature"]
@@ -15684,8 +17254,8 @@ class Director:
             output = {}
             for task in tasks:
                 try:
-                    result = self._call(
-                        ctx, "video", task["payload"], "videos")
+                    result = self._call_video_with_technical_retry(
+                        ctx, task, direct_router=False)
                 except Exception as exc:
                     if not self._director_autonomy_enabled():
                         raise
@@ -15722,9 +17292,8 @@ class Director:
                 except StopIteration:
                     return False
                 future = pool.submit(
-                    self.router.call, "video", task["payload"],
-                    ctx.get("video_out_dir")
-                    or (ctx["out_root"] / "videos"), cancel)
+                    self._call_video_with_technical_retry,
+                    ctx, task, direct_router=True, cancel=cancel)
                 futures[future] = task
                 return True
 
@@ -15913,6 +17482,41 @@ class Director:
                 f"技术镜头补音轨失败:{mux.stderr.strip()[:500]}")
         muxed.replace(output)
         return mode
+
+    def _call_video_with_technical_retry(
+            self, ctx, task, *, direct_router=False, cancel=None):
+        """Retry one provider/transport failure; never retry content advice."""
+        attempts = 0
+        while True:
+            try:
+                if direct_router:
+                    result = self.router.call(
+                        "video", task["payload"],
+                        ctx.get("video_out_dir")
+                        or (ctx["out_root"] / "videos"), cancel)
+                else:
+                    result = self._call(
+                        ctx, "video", task["payload"], "videos")
+                if not isinstance(result.data, dict):
+                    result.data = {}
+                result.data["technical_retry_count"] = attempts
+                task["technical_retry_count"] = attempts
+                return result
+            except ProduceCancelled:
+                raise
+            except (ProviderUnavailable, ProviderError, OSError) as exc:
+                decision = evaluate_post_generation([{
+                    "category": "technical_provider",
+                    "message": str(exc),
+                }], attempts_remaining=1 - attempts)
+                if not decision.retry_allowed:
+                    raise
+                attempts += 1
+                self.log.warn(
+                    "director",
+                    f"镜头{task['shot'].get('shot_no')}视频供应商技术失败，"
+                    "保留同一合同自动重试1次；不因内容意见重拍："
+                    f"{str(exc)[:300]}")
 
     def _make_video(self, ctx, shot, frames):
         """兼容单镜调用；正式视频阶段由 4 路并行调度器执行。"""
@@ -16227,6 +17831,383 @@ class Director:
                         encoding="utf-8")
         self.projects.save_document(
             ctx["episode"]["id"], "video_qc_report", report)
+        return report
+
+    @staticmethod
+    def _local_media_binary(name):
+        """Resolve media tools for launchd, whose PATH may omit ~/.local/bin."""
+        resolved = shutil.which(name)
+        if resolved:
+            return resolved
+        bundled = Path.home() / ".local" / "bin" / name
+        return str(bundled) if bundled.is_file() else name
+
+    def _video_sample_qc_spec(
+            self, ctx, shot, *, generation_snapshot=None):
+        """Build video frame-review gates from the actual Seedance contract.
+
+        New videos persist the exact prompt contract submitted to Seedance.
+        Use that frozen contract as the QC fact source so a later storyboard
+        edit cannot make the judge check a different physical/spatial setup.
+        Legacy videos may not have a frozen contract, so reconstruct the same
+        shot-local video contract from the saved shot and blocking map.
+        """
+        frozen = (
+            (generation_snapshot or {}).get("prompt_contract") or {})
+        physical_contract = (
+            copy.deepcopy(frozen.get("physical"))
+            if isinstance(frozen.get("physical"), dict) else {})
+        spatial_staging = (
+            copy.deepcopy(frozen.get("spatial_staging"))
+            if isinstance(frozen.get("spatial_staging"), dict) else {})
+        if not physical_contract or not spatial_staging:
+            blocking = shot_blocking(
+                ctx.get("blocking"), shot.get("shot_no")) or {}
+            fallback_contract, _prompt = compile_shot_prompt(
+                {**shot, "spatial_blocking": blocking},
+                location=self._shot_location(ctx.get("script"), shot),
+                style=ctx["project"].get("style", "") or "",
+                references=[], mode="video")
+            if not physical_contract:
+                physical_contract = copy.deepcopy(
+                    fallback_contract.get("physical") or
+                    build_physical_contract({
+                        **shot, "spatial_blocking": blocking,
+                    }, media="video"))
+            if not spatial_staging:
+                spatial_staging = copy.deepcopy(
+                    fallback_contract.get("spatial_staging") or {})
+        expected_characters = shot.get("characters") or []
+        return self._qc_spec(
+            ctx["project"]["id"],
+            self._video_identity_names(ctx, shot),
+            location=self._shot_location(ctx.get("script"), shot),
+            action=shot.get("description") or shot.get("prompt") or "",
+            forbid=self._FORBID + ["字幕条"],
+            expected_characters=expected_characters,
+            expected_count=shot.get(
+                "visible_figure_count", len(expected_characters)),
+            composition_contract=(
+                shot.get("composition_contract")
+                or build_composition_contract(shot)),
+            readable_text=shot.get("readable_text") or {},
+            physical_contract=physical_contract,
+            spatial_staging=spatial_staging,
+            physical_logic_required=True,
+            era_exceptions=self._era_exceptions(ctx),
+            narrative_overlays=shot.get("narrative_overlays"),
+            functional_figures=shot.get("functional_figures"))
+
+    def _run_video_media_qc(self, ctx, content_enabled):
+        """Probe every produced clip; optionally inspect five real video frames.
+
+        Technical media facts are always checked.  Turning video content QC
+        off performs no extraction and no AI calls.  Extracted frames live in
+        a review-only cache and are never registered as assets or references.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        shots = {
+            int(item.get("shot_no")): item
+            for item in self._active_shots(ctx)
+            if item.get("shot_no") is not None
+        }
+        videos = [
+            item for item in (ctx.get("videos") or [])
+            if int(item.get("shot_no") or -1) in shots
+        ]
+        ffprobe = self._local_media_binary("ffprobe")
+        ffmpeg = self._local_media_binary("ffmpeg")
+        cache_root = ctx["out_root"] / "qc_evidence"
+
+        def inspect_media(video):
+            shot_no = int(video["shot_no"])
+            shot = shots[shot_no]
+            uri = str(video.get("uri") or "")
+            # 内置 mock 用 JSON 合同模拟视频，只用于离线回归；它不是
+            # 可交付媒体，也不能喂给 ffmpeg。仅在 provider 明确为 mock
+            # 时豁免，真实 Provider 即便误返回 .json 仍会技术失败。
+            if (str(video.get("provider") or "").lower() == "mock"
+                    and Path(uri).suffix.lower() == ".json"):
+                technical = {
+                    "schema": "aifos.video-technical-qc/v1",
+                    "passed": True,
+                    "issues": [],
+                    "checks": [{
+                        "name": "mock_provider_contract",
+                        "passed": True,
+                    }],
+                    "mock_provider_contract": True,
+                    "reference_chain_eligible": False,
+                }
+                frames = ({
+                    "passed": True,
+                    "samples": [],
+                    "issues": [],
+                    "mock_provider_contract": True,
+                    "reference_chain_eligible": False,
+                    "asset_registration_allowed": False,
+                } if content_enabled else None)
+                return shot_no, technical, frames
+            probe = probe_video(
+                uri, ffprobe=ffprobe, ffmpeg=ffmpeg)
+            expected_duration = shot.get("duration")
+            try:
+                tolerance = max(0.5, float(expected_duration) * 0.1)
+            except (TypeError, ValueError):
+                tolerance = 0.5
+            profile = ctx.get("production_profile") or {}
+            require_audio = bool(
+                profile.get("voice", "jimeng_builtin") == "jimeng_builtin"
+                and profile.get("lip_sync", True))
+            technical = evaluate_video_technical(
+                probe,
+                expected_aspect=ctx.get("aspect") or "9:16",
+                expected_resolution=(
+                    video.get("video_resolution") or "720p"),
+                expected_duration=expected_duration,
+                duration_tolerance=tolerance,
+                require_audio=require_audio,
+            )
+            frames = None
+            if content_enabled and technical.get("passed"):
+                frames = extract_video_qc_frames(
+                    video.get("uri", ""), cache_root,
+                    probe=probe, ffmpeg=ffmpeg)
+            return shot_no, technical, frames
+
+        per_shot = {}
+        workers = min(max(1, self._video_parallel_workers()),
+                      max(1, len(videos)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(inspect_media, video) for video in videos]
+            for future in as_completed(futures):
+                shot_no, technical, frames = future.result()
+                per_shot[shot_no] = {
+                    "shot_no": shot_no,
+                    "technical": technical,
+                    "frame_evidence": frames,
+                    "content_qc_enabled": bool(content_enabled),
+                    "content_qc_waived": not content_enabled,
+                    "reference_chain_eligible": False,
+                    "asset_registration_allowed": False,
+                    "visual_verdicts": [],
+                }
+
+        visual_tasks = []
+        if content_enabled:
+            for shot_no, item in per_shot.items():
+                evidence = item.get("frame_evidence") or {}
+                if not evidence.get("passed"):
+                    continue
+                shot = shots[shot_no]
+                snapshot, signature, _history = self._video_input_for_qc(
+                    ctx, shot_no)
+                spec = self._video_sample_qc_spec(
+                    ctx, shot, generation_snapshot=snapshot)
+                sequence_samples = [
+                    {
+                        "label": sample.get("label"),
+                        "timestamp": sample.get("timestamp"),
+                        "uri": sample.get("uri"),
+                    }
+                    for sample in evidence.get("samples") or []
+                ]
+                sequence_manifest = [
+                    {
+                        "index": index + 1,
+                        "uri": sample["uri"],
+                        "label": f"视频{sample['label']}抽帧",
+                        "role": "video_qc_sequence",
+                        "binding": (
+                            "仅作本次视频时序质检证据，不得进入生成参考链"),
+                        "reference_chain_eligible": False,
+                    }
+                    for index, sample in enumerate(sequence_samples)
+                ]
+                generation_input = {
+                    "schema": "aifos.video-frame-review-input/v1",
+                    "scope": {"shot_no": shot_no,
+                              "frame_kind": "video_qc_sequence"},
+                    "prompt": snapshot.get("prompt_sent") or "",
+                    "prompt_contract": copy.deepcopy(
+                        snapshot.get("prompt_contract") or {}),
+                    "reference_manifest": (
+                        copy.deepcopy(
+                            snapshot.get("reference_manifest") or [])
+                        + sequence_manifest),
+                    "input_signature": signature,
+                    "reference_chain_eligible": False,
+                }
+                if sequence_samples:
+                    payload = {
+                        **spec,
+                        "image_uri": sequence_samples[0]["uri"],
+                        "generation_input": generation_input,
+                        "generation_prompt": generation_input["prompt"],
+                        "reference_manifest": generation_input[
+                            "reference_manifest"],
+                        "video_sequence_samples": sequence_samples,
+                        "video_qc_focus": (
+                            "联合检查五点抽帧中明显影响剧情的身份漂移、"
+                            "道具瞬移、物理支撑、空间朝向和动作阶段；"
+                            "不要因微小美术差异失败。"),
+                    }
+                    sequence = {
+                        "label": "/".join(
+                            sample["label"] for sample in sequence_samples),
+                        "timestamp": [
+                            sample["timestamp"]
+                            for sample in sequence_samples],
+                    }
+                    visual_tasks.append((shot_no, sequence, spec, payload))
+
+        def inspect_sample(task):
+            shot_no, sample, spec, payload = task
+            try:
+                result = self.router.call(
+                    "image_qc", payload, ctx["out_root"],
+                    cancel=lambda: self._cancel_requested(ctx))
+                verdict = self._assess_image_qc(
+                    spec, result.data or {}, 1)
+            except (AifosError, ProviderUnavailable, ProviderError) as exc:
+                # 内容审片能力临时不可用时只留可见建议状态；它不能
+                # 反过来阻塞已通过本地技术检查的视频或触发盲目重拍。
+                result = SimpleNamespace(
+                    cost=0.0, provider="", data={})
+                verdict = {
+                    "passed": None,
+                    "issues": [],
+                    "unavailable": str(exc),
+                }
+            return shot_no, sample, verdict, result
+
+        if visual_tasks:
+            workers = min(max(1, self._parallel_workers()), len(visual_tasks))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(inspect_sample, task)
+                    for task in visual_tasks
+                ]
+                for future in as_completed(futures):
+                    shot_no, sample, verdict, result = future.result()
+                    if result.cost:
+                        self._task_cost = (
+                            getattr(self, "_task_cost", 0.0) + result.cost)
+                        if not hasattr(self, "_task_providers"):
+                            self._task_providers = set()
+                        self._task_providers.add(result.provider)
+                        self.projects.add_episode_cost(
+                            ctx["episode"]["id"], result.cost)
+                    per_shot[shot_no]["visual_verdicts"].append({
+                        "label": sample.get("label"),
+                        "timestamp": sample.get("timestamp"),
+                        "passed": verdict.get("passed"),
+                        "issues": list(verdict.get("issues") or []),
+                        "physical_logic_checked": verdict.get(
+                            "physical_logic_checked"),
+                        "physical_logic_match": verdict.get(
+                            "physical_logic_match"),
+                        "spatial_logic_checked": verdict.get(
+                            "spatial_logic_checked"),
+                        "spatial_logic_match": verdict.get(
+                            "spatial_logic_match"),
+                        "provider": result.provider,
+                        "unavailable": verdict.get("unavailable", ""),
+                    })
+
+        issues = []
+        for shot_no in sorted(per_shot):
+            item = per_shot[shot_no]
+            for issue in (item["technical"].get("issues") or []):
+                issues.append({
+                    **copy.deepcopy(issue),
+                    "check": "video_technical",
+                    "shot_no": shot_no,
+                    "rerunnable": True,
+                })
+            evidence = item.get("frame_evidence") or {}
+            if content_enabled:
+                for issue in evidence.get("issues") or []:
+                    issues.append({
+                        **copy.deepcopy(issue),
+                        "check": "video_technical",
+                        "shot_no": shot_no,
+                        "rerunnable": True,
+                    })
+                visual_messages = []
+                unavailable = []
+                for verdict in item.get("visual_verdicts") or []:
+                    if verdict.get("passed") is None:
+                        unavailable.append(
+                            f"{verdict.get('label')}:"
+                            f"{verdict.get('unavailable') or '内容审片不可用'}")
+                        continue
+                    if verdict.get("passed"):
+                        continue
+                    visual_messages.extend(
+                        f"{verdict.get('label')}:{message}"
+                        for message in verdict.get("issues") or [])
+                visual_messages = list(dict.fromkeys(visual_messages))
+                if visual_messages:
+                    revision = optimize_qc_feedback(
+                        visual_messages, mode="video")
+                    patch = list(revision.get("instructions") or [])
+                    diagnosis = {
+                        "schema": "aifos.generation-input-diagnosis/v1",
+                        "mode": "video",
+                        "diagnosis_complete": True,
+                        "issues": visual_messages,
+                        "targeted_prompt_patch": {"instructions": patch},
+                        "decision": {
+                            "action": ("direct_video_retry"
+                                       if patch else "awaiting_human"),
+                            "safe_to_auto_retry": bool(patch),
+                            "input_changed": bool(patch),
+                            "prompt_patch": patch,
+                            "reason": (
+                                "真实视频五点抽帧发现明确内容偏差，"
+                                "按问题定向修订后最多重拍一次"),
+                        },
+                    }
+                    issues.append({
+                        "check": "video_visual",
+                        "severity": "error",
+                        "shot_no": shot_no,
+                        "rerunnable": bool(patch),
+                        "message": "；".join(visual_messages[:8]),
+                        "input_diagnosis": diagnosis,
+                    })
+                if unavailable:
+                    issues.append({
+                        "check": "video_visual",
+                        "severity": "warn",
+                        "shot_no": shot_no,
+                        "rerunnable": False,
+                        "blocking": False,
+                        "advisory_only": True,
+                        "message": "；".join(unavailable[:5]),
+                    })
+
+        report = {
+            "schema": "aifos.video-media-qc/v1",
+            "content_qc_enabled": bool(content_enabled),
+            "content_qc_waived": not content_enabled,
+            "technical_qc_enabled": True,
+            "shots": [per_shot[key] for key in sorted(per_shot)],
+            "issues": issues,
+            "passed": not any(
+                issue.get("severity") == "error" for issue in issues),
+            "reference_chain_eligible": False,
+            "asset_registration_allowed": False,
+        }
+        ctx["video_media_qc_report"] = report
+        path = ctx["out_root"] / "video_media_qc_report.json"
+        path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        self._save_review_document(
+            ctx["episode"]["id"], "video_media_qc_report", report)
         return report
 
     def _video_input_for_qc(self, ctx, shot_no):
@@ -16679,7 +18660,10 @@ class Director:
             for item in previous.get("shots", [])
             if isinstance(item, dict) and item.get("shot_no") is not None
         }
-        direct_checks = {"video", "media_sanity", "integrated_audio"}
+        direct_checks = {
+            "video", "media_sanity", "integrated_audio",
+            "video_technical", "video_visual",
+        }
         all_issues = qc_report.get("issues") or []
         global_issues = [
             str(issue.get("message") or issue.get("check"))
@@ -16806,6 +18790,96 @@ class Director:
             "last_total_qc_passed": bool(qc_report.get("passed")),
         }
 
+    def _build_technical_video_qc_report(
+            self, ctx, qc_report, previous=None):
+        """关闭视频内容QC后只保留产物/媒体健全性，永不待人工。"""
+        previous = previous or {}
+        previous_shots = {
+            str(item.get("shot_no")): item
+            for item in previous.get("shots", [])
+            if isinstance(item, dict) and item.get("shot_no") is not None
+        }
+        issues = qc_report.get("issues") or []
+        shot_checks = {"video", "media_sanity", "video_technical"}
+        global_checks = {
+            "video", "media_sanity", "video_technical", "voice",
+            "integrated_audio", "subtitle",
+        }
+        shots = []
+        for shot in (ctx.get("storyboard") or {}).get("shots", []):
+            shot_no = int(shot.get("shot_no"))
+            related = [
+                issue for issue in issues
+                if issue.get("check") in shot_checks
+                and issue.get("shot_no") == shot_no
+                and issue.get("severity") == "error"]
+            messages = list(dict.fromkeys(
+                str(issue.get("message") or issue.get("check"))
+                for issue in related))
+            old = previous_shots.get(str(shot_no), {})
+            used = int(old.get("auto_retries_used") or 0)
+            retry_available = bool(
+                messages
+                and any(issue.get("rerunnable") for issue in related)
+                and used < VIDEO_QC_AUTO_RETRIES)
+            decision = {
+                "action": (
+                    "direct_video_retry" if retry_available else "none"),
+                "safe_to_auto_retry": retry_available,
+                "input_changed": retry_available,
+                "prompt_patch": (
+                    "技术恢复：严格沿用已冻结的本镜首尾帧、"
+                    "提示词和参考图，重新生成并完整落盘"
+                    if retry_available else ""),
+                "reason": (
+                    "视频文件缺失或损坏，只执行一次技术恢复"
+                    if retry_available else
+                    ("技术产物仍不完整，不再自动重试"
+                     if messages else "")),
+            }
+            shots.append({
+                "shot_no": shot_no,
+                "passed": not messages,
+                "status": "passed" if not messages else "failed",
+                "issues": messages,
+                "generation_attempts": int(
+                    old.get("generation_attempts") or 1),
+                "auto_retries_used": used,
+                "auto_retry_limit": VIDEO_QC_AUTO_RETRIES,
+                "revision_feedback": "",
+                "revision_categories": ["technical"] if messages else [],
+                "decision": decision,
+                "awaiting_human": False,
+                "content_qc_enabled": False,
+            })
+        failed = [item for item in shots if not item["passed"]]
+        global_issues = list(dict.fromkeys(
+            str(issue.get("message") or issue.get("check"))
+            for issue in issues
+            if issue.get("check") in global_checks
+            and issue.get("shot_no") is None
+            and issue.get("severity") == "error"))
+        content_observations = [
+            copy.deepcopy(issue) for issue in issues
+            if issue.get("check") not in global_checks
+            and issue.get("check") not in shot_checks]
+        return {
+            "schema": VIDEO_QC_SCHEMA,
+            "passed": not failed and not global_issues,
+            "shots": shots,
+            "failed_shots": [item["shot_no"] for item in failed],
+            "awaiting_human": False,
+            "awaiting_human_shots": [],
+            "repair_frames_first_shots": [],
+            "global_issues": global_issues,
+            "global_status": "failed" if global_issues else "passed",
+            "auto_retry_limit": VIDEO_QC_AUTO_RETRIES,
+            "last_total_qc_passed": bool(qc_report.get("passed")),
+            "content_qc_enabled": False,
+            "content_qc_waived": True,
+            "content_observations": content_observations,
+        }
+
     @staticmethod
     def _video_retry_candidates(video_qc_report):
         return [item["shot_no"] for item in video_qc_report.get("shots", [])
@@ -16820,99 +18894,14 @@ class Director:
 
     def _stage_qc(self, ctx):
         """自动检查 + 图文检查板 + 逐段内容复核 + 交付脚本。"""
-        if self._preview_qc_bypass_enabled():
-            # 让流水线继续到可播放产物，同时把“未做内容检查”写进所有
-            # 机器可读报告，绝不伪造分数或检查 PASS。导演自主模式产物
-            # 是用户授权的最终合成，不标记成临时预览。
-            autonomy = self._director_autonomy_enabled()
-            skipped_at = now()
-            content_review = {
-                "schema": "aifos.content-review/v1",
-                "passed": False,
-                "preview_only": not autonomy,
-                "inspection_waived": autonomy,
-                "skipped": True,
-                "reason": (
-                    "用户授权AI导演全权处理并直接最终合成"
-                    if autonomy else
-                    "用户要求临时关闭质检，先查看预览成片效果"),
-                "units": [],
-                "updated_at": skipped_at,
-            }
-            report = {
-                "schema": (
-                    "aifos.director-autonomy/v1" if autonomy
-                    else "aifos.preview-qc-bypass/v1"),
-                # passed=True 只表示允许生产阶段继续，不伪造内容检查。
-                "passed": True,
-                "formal_passed": False,
-                "preview_only": not autonomy,
-                "inspection_waived": autonomy,
-                "final_output_allowed": autonomy,
-                "skipped": True,
-                "score": None,
-                "issues": [],
-                "content_passed": False,
-                "content_review": content_review,
-                "review_board": "",
-                "delivery_check": {
-                    "passed": False, "skipped": True,
-                    "reason": "preview_qc_bypass",
-                },
-                "bypassed_checks": [
-                    "image_qc", "frames_qc", "video_qc",
-                    "content_review", "delivery_verifier"],
-                "updated_at": skipped_at,
-            }
-            video_qc = {
-                "schema": VIDEO_QC_SCHEMA,
-                "passed": False,
-                "formal_passed": False,
-                "preview_only": not autonomy,
-                "inspection_waived": autonomy,
-                "skipped": True,
-                "failed_shots": [],
-                "awaiting_human": False,
-                "awaiting_human_shots": [],
-                "global_issues": [
-                    "AI导演全权成片模式未执行视频质检"
-                    if autonomy else "预览模式未执行视频质检"],
-                "updated_at": skipped_at,
-            }
-            ctx["content_review"] = content_review
-            ctx["review_board"] = ""
-            ctx["qc_report"] = report
-            ctx["video_qc_report"] = video_qc
-            (ctx["out_root"] / "content_review.json").write_text(
-                json.dumps(content_review, ensure_ascii=False, indent=2),
-                encoding="utf-8")
-            (ctx["out_root"] / "qc_report.json").write_text(
-                json.dumps(report, ensure_ascii=False, indent=2),
-                encoding="utf-8")
-            self.projects.save_document(
-                ctx["episode"]["id"], "content_review", content_review)
-            self.projects.save_document(
-                ctx["episode"]["id"], "qc_report", report)
-            self._save_video_qc_report(ctx, video_qc)
-            self.log.warn(
-                "qc",
-                ("AI导演全权成片模式：图片、首尾帧、视频和内容检查均已"
-                 "按用户授权跳过；不触发返工，直接进入最终合成"
-                 if autonomy else
-                 "临时预览模式：已跳过图片、首尾帧、视频、内容与交付"
-                 "质检；当前产物仅供查看效果"))
-            return {
-                "score": None, "passed": True,
-                "formal_passed": False, "preview_only": not autonomy,
-                "inspection_waived": autonomy,
-                "final_output_allowed": autonomy,
-                "issues": 0, "content_passed": False,
-                "delivery_passed": False, "video_qc_passed": False,
-                "video_qc_awaiting_human": False,
-                "video_qc_auto_retry_limit": VIDEO_QC_AUTO_RETRIES,
-            }
+        video_content_qc = self._video_content_qc_enabled()
         content_review = build_content_review(
             ctx["script"], self._active_storyboard(ctx), ctx["continuity"])
+        if not video_content_qc:
+            content_review["advisory_only"] = True
+            content_review["blocking"] = False
+            content_review["waived_by"] = (
+                "selection_mode_or_video_content_qc")
         content_path = ctx["out_root"] / "content_review.json"
         content_path.write_text(
             json.dumps(content_review, ensure_ascii=False, indent=2),
@@ -16939,8 +18928,32 @@ class Director:
         for attempt in range(max_rounds):
             report = self.qc.run(
                 ctx["script"], self._active_storyboard(ctx), ctx)
-            video_qc = self._build_video_qc_report(
-                ctx, report, previous=video_qc)
+            media_qc = self._run_video_media_qc(
+                ctx, content_enabled=video_content_qc)
+            media_issues = copy.deepcopy(media_qc.get("issues") or [])
+            if media_issues:
+                report["issues"].extend(media_issues)
+                hard_media_errors = [
+                    issue for issue in media_issues
+                    if issue.get("severity") == "error"]
+                report["score"] = max(
+                    0, int(report.get("score") or 0)
+                    - 15 * len(hard_media_errors))
+                if hard_media_errors:
+                    report["passed"] = False
+                report["rerun_shots"] = sorted(set(
+                    list(report.get("rerun_shots") or [])
+                    + [int(issue["shot_no"])
+                       for issue in media_issues
+                       if issue.get("shot_no") is not None
+                       and issue.get("rerunnable")]))
+            report["video_media_qc"] = media_qc
+            video_qc = (
+                self._build_video_qc_report(
+                    ctx, report, previous=video_qc)
+                if video_content_qc else
+                self._build_technical_video_qc_report(
+                    ctx, report, previous=video_qc))
             self._save_video_qc_report(ctx, video_qc)
             self.log.info(
                 "qc", f"质检第{attempt + 1}轮:得分 {report['score']}"
@@ -16986,8 +18999,13 @@ class Director:
                     int(item.get("auto_retries_used") or 0)
                     for item in video_qc.get("shots", []))
                 self._save_video_qc_report(ctx, video_qc)
+        delivery_review = content_review
+        if not video_content_qc:
+            # 交付脚本仍校验文件、数量、成片和标准指纹；
+            # 只把已关闭的内容判定从「passed」计算中豁免。
+            delivery_review = {**content_review, "passed": True}
         delivery = write_delivery_verifier(
-            ctx, review_board, content_review)
+            ctx, review_board, delivery_review)
         if not delivery.get("passed"):
             report["issues"].append({
                 "check": "delivery", "severity": "error",
@@ -16999,10 +19017,54 @@ class Director:
         report["content_review"] = content_review
         report["review_board"] = review_board
         report["delivery_check"] = delivery
-        report["technical_passed"] = not any(
-            i["severity"] == "error" and i["check"] not in ("content",)
-            for i in report["issues"])
-        report["content_passed"] = content_review["passed"]
+        if not video_content_qc:
+            technical_checks = {
+                "video", "media_sanity", "video_technical", "voice",
+                "integrated_audio", "subtitle", "delivery",
+            }
+            observations = []
+            normalized_issues = []
+            for issue in report["issues"]:
+                item = copy.deepcopy(issue)
+                if item.get("check") not in technical_checks:
+                    observations.append(copy.deepcopy(item))
+                    item["severity"] = "warn"
+                    item["blocking"] = False
+                    item["advisory_only"] = True
+                normalized_issues.append(item)
+            report["issues"] = normalized_issues
+            technical_errors = [
+                issue for issue in normalized_issues
+                if issue.get("check") in technical_checks
+                and issue.get("severity") == "error"]
+            report["technical_passed"] = not technical_errors
+            report["content_observations"] = observations
+            report["content_observed_passed"] = bool(
+                content_review.get("passed"))
+            report["content_passed"] = True
+            report["content_qc_enabled"] = False
+            report["content_qc_waived"] = True
+            report["score"] = max(0, 100 - 15 * len(technical_errors))
+            report["passed"] = bool(
+                report["technical_passed"] and delivery.get("passed"))
+            report["rerun_shots"] = sorted({
+                int(issue["shot_no"]) for issue in technical_errors
+                if issue.get("shot_no") is not None
+                and issue.get("rerunnable")})
+            report["rerun_lines"] = sorted({
+                int(issue["line_no"]) for issue in technical_errors
+                if issue.get("line_no") is not None
+                and issue.get("rerunnable")})
+        else:
+            report["technical_passed"] = not any(
+                i["severity"] == "error"
+                and i["check"] not in ("content", "video_visual")
+                for i in report["issues"])
+            report["content_passed"] = bool(
+                content_review["passed"] and not any(
+                    i["severity"] == "error"
+                    and i["check"] == "video_visual"
+                    for i in report["issues"]))
         ctx["qc_report"] = report
         # 交付复核完成后再写一次，让前端拿到最终的总质检状态与“待人工”
         # 镜头，而不是停留在返工前的中间快照。
@@ -17010,9 +19072,10 @@ class Director:
         video_qc["passed"] = (
             not bool(video_qc.get("failed_shots"))
             and not bool(video_qc.get("global_issues")))
-        video_qc["awaiting_human"] = bool(
-            video_qc.get("awaiting_human_shots")
-            or video_qc.get("global_issues"))
+        video_qc["awaiting_human"] = (
+            bool(video_qc.get("awaiting_human_shots")
+                 or video_qc.get("global_issues"))
+            if video_content_qc else False)
         self._save_video_qc_report(ctx, video_qc)
         self.projects.set_qc_score(ctx["episode"]["id"], report["score"])
         report_path = ctx["out_root"] / "qc_report.json"
@@ -18287,6 +20350,585 @@ class Director:
             raise AifosError(f"剧集不存在: 第{episode_number}集")
         return project, episode
 
+    def _shot_candidate_ctx(self, project_title, episode_number, shot_no):
+        """Build the minimum authoritative context for shot selection edits."""
+        project, episode = self._episode_ctx(project_title, episode_number)
+        try:
+            normalized_shot_no = int(shot_no)
+        except (TypeError, ValueError):
+            raise AifosError("shot_no 必须是有效镜头编号")
+        storyboard, _ = self.projects.latest_document(
+            episode["id"], "storyboard")
+        shot = next((
+            value for value in (storyboard or {}).get("shots", [])
+            if int(value.get("shot_no", -1)) == normalized_shot_no
+        ), None)
+        if shot is None:
+            raise AifosError(f"镜头不存在: {normalized_shot_no}")
+        script, _ = self.projects.latest_document(episode["id"], "script")
+        ctx = {
+            "project": dict(project),
+            "episode": dict(episode),
+            "out_root": self._episode_dir(project, episode),
+            "storyboard": storyboard or {"shots": []},
+            "script": script or {"scenes": [], "characters": []},
+        }
+        return ctx, shot
+
+    @staticmethod
+    def _candidate_selection_from_item(item):
+        group = (item or {}).get("candidate_group") or {}
+        selection = group.get("selection") or (item or {}).get("selection")
+        if not isinstance(group, dict) or not isinstance(selection, dict):
+            return None
+        candidates = group.get("candidates") or []
+        try:
+            current_version = CandidateSetVersion(**(group.get("version") or {}))
+            selected_index = int(selection.get("candidate_index") or 0)
+        except (TypeError, ValueError):
+            return None
+        candidate = next((
+            row for row in candidates
+            if int((row or {}).get("candidate_index") or 0) == selected_index
+        ), None)
+        if candidate is None:
+            return None
+        candidate_id = str(candidate.get("candidate_id") or "")
+        selected_uri = str(selection.get("selected_uri") or "")
+        if (str(selection.get("candidate_id") or "") != candidate_id
+                or selected_uri != str(candidate.get("uri") or "")):
+            return None
+        result = CandidateResultVersion(
+            candidate_set_token=str(
+                selection.get("candidate_set_token")
+                or selection.get("token") or ""),
+            candidate_index=selected_index,
+        )
+        decision = evaluate_candidate_promotion(
+            result, current_version,
+            selection_source=str(selection.get("source") or ""))
+        return selection if decision.allowed else None
+
+    def _shot_candidate_selection_summary(self, plan, shot_no=None):
+        """Summarize current candidate groups without trusting UI state."""
+        wanted = None if shot_no is None else int(shot_no)
+        rows = []
+        for item in plan.get("items") or []:
+            if item.get("category") != "shot_image":
+                continue
+            try:
+                current_shot = int(item.get("shot_no"))
+            except (TypeError, ValueError):
+                continue
+            if wanted is not None and current_shot != wanted:
+                continue
+            group = item.get("candidate_group") or {}
+            if not isinstance(group, dict) or not group:
+                continue
+            selection = self._candidate_selection_from_item(item)
+            complete = self._shot_candidate_group_valid(item)
+            technical_incomplete = bool(
+                group.get("technical_incomplete") is True
+                or not complete)
+            rows.append({
+                "shot_no": current_shot,
+                "status": item.get("status", "pending"),
+                "candidate_set_id": str(
+                    group.get("candidate_set_id") or ""),
+                "candidate_set_token": str(
+                    group.get("candidate_set_token") or ""),
+                "candidate_revision": int(
+                    group.get("candidate_revision") or 0),
+                "contract_revision": int(
+                    group.get("contract_revision") or 0),
+                "candidate_count": int(group.get("candidate_count") or 0),
+                "expected_count": int(group.get("expected_count") or 4),
+                "complete": bool(complete),
+                "technical_incomplete": technical_incomplete,
+                "selected": selection is not None,
+                "selection": copy.deepcopy(selection) if selection else None,
+            })
+        rows.sort(key=lambda value: value["shot_no"])
+        remaining = sum(1 for row in rows if not row["selected"])
+        all_selected = bool(rows) and remaining == 0
+        return {
+            "status": "done",
+            "total": len(rows),
+            "selected": len(rows) - remaining,
+            "remaining": remaining,
+            "all_selected": all_selected,
+            "need_resume": all_selected,
+            "items": rows,
+        }
+
+    def shot_candidate_selection_state(
+            self, project_title, episode_number, shot_no=None):
+        """Return the authoritative selection progress for one episode."""
+        project, episode = self._episode_ctx(project_title, episode_number)
+        ctx = {"project": dict(project), "episode": dict(episode),
+               "out_root": self._episode_dir(project, episode)}
+        with _PLAN_IO_LOCK:
+            plan = self._plan_read(ctx)
+            state = self._shot_candidate_selection_summary(plan, shot_no)
+            if shot_no is not None and not state["items"]:
+                raise AifosError(
+                    f"镜头{int(shot_no)}尚无可选择的四图候选组")
+            return state
+
+    def select_shot_candidate(
+            self, project_title, episode_number, shot_no,
+            expected_candidate_set_id, expected_candidate_set_token,
+            expected_candidate_revision, candidate_id, candidate_index,
+            source="manual"):
+        """CAS-promote one current candidate into the formal image chain.
+
+        The URI is always resolved from ``render_plan.json``.  A browser may
+        identify a candidate, but it can never submit a file path to promote.
+        """
+        source = str(source or "").strip().lower()
+        if source not in ("manual", "ai"):
+            raise AifosError("候选只能由 manual 或 ai 明确选中")
+        try:
+            normalized_index = int(candidate_index)
+            normalized_revision = int(expected_candidate_revision)
+        except (TypeError, ValueError):
+            raise AifosError("stale_candidate_set: 候选序号或版本无效")
+        expected_id = str(expected_candidate_set_id or "").strip()
+        expected_token = str(expected_candidate_set_token or "").strip()
+        requested_candidate_id = str(candidate_id or "").strip()
+        ctx, shot = self._shot_candidate_ctx(
+            project_title, episode_number, shot_no)
+        item_id = f"shot:{int(shot['shot_no'])}"
+
+        with _PLAN_IO_LOCK:
+            plan = self._plan_read(ctx)
+            item = next((
+                row for row in plan.get("items") or []
+                if row.get("id") == item_id
+                and row.get("category") == "shot_image"
+            ), None)
+            if item is None:
+                raise AifosError(
+                    "stale_candidate_set: 当前镜头候选组不存在，请刷新")
+            group = item.get("candidate_group") or {}
+            actual_id = str(group.get("candidate_set_id") or "")
+            actual_token = str(group.get("candidate_set_token") or "")
+            try:
+                actual_revision = int(group.get("candidate_revision") or 0)
+            except (TypeError, ValueError):
+                actual_revision = 0
+            if (not expected_id or not expected_token
+                    or expected_id != actual_id
+                    or expected_token != actual_token
+                    or normalized_revision != actual_revision):
+                raise AifosError(
+                    "stale_candidate_set: 候选组已更新，请刷新后重新选择")
+            if not self._shot_candidate_group_valid(item):
+                raise AifosError(
+                    "candidate_group_incomplete: 四张候选尚未全部技术完成，"
+                    "当前不能选片")
+            previous = self._candidate_selection_from_item(item)
+            if previous is not None:
+                same = bool(
+                    str(previous.get("candidate_id") or "")
+                    == requested_candidate_id
+                    and int(previous.get("candidate_index") or 0)
+                    == normalized_index)
+                if not same:
+                    raise AifosError(
+                        "selection_conflict: 本候选组已经选定另一张图片，"
+                        "请刷新后再操作")
+                row = self.assets.latest(
+                    ctx["project"]["id"], "image",
+                    self._shot_name(ctx, int(shot["shot_no"])))
+                if row is None:
+                    raise AifosError(
+                        "selection_asset_conflict: 选片记录存在但正式资产缺失，"
+                        "请从断点执行资产对账")
+                meta = self._asset_meta(row)
+                if (str(meta.get("candidate_set_token") or "")
+                        != actual_token
+                        or str(meta.get("candidate_id") or "")
+                        != requested_candidate_id):
+                    raise AifosError(
+                        "selection_asset_conflict: 正式资产已被其他修订替换，"
+                        "请刷新后再操作")
+                summary = self._shot_candidate_selection_summary(plan)
+                return {
+                    "status": "selected",
+                    "shot_no": int(shot["shot_no"]),
+                    "candidate_set_id": actual_id,
+                    "candidate_set_token": actual_token,
+                    "candidate_revision": actual_revision,
+                    "candidate_id": requested_candidate_id,
+                    "candidate_index": normalized_index,
+                    "selected_uri": str(previous.get("selected_uri") or ""),
+                    "source": str(previous.get("source") or source),
+                    "asset_id": row["id"], "asset_version": row["version"],
+                    "already_selected": True,
+                    "remaining": summary["remaining"],
+                    "all_selected": summary["all_selected"],
+                    "need_resume": summary["need_resume"],
+                    "last_pending": False,
+                }
+
+            candidate = next((
+                row for row in group.get("candidates") or []
+                if int((row or {}).get("candidate_index") or 0)
+                == normalized_index
+            ), None)
+            if (candidate is None
+                    or str(candidate.get("candidate_id") or "")
+                    != requested_candidate_id):
+                raise AifosError(
+                    "stale_candidate_set: 候选不属于当前四图组，请刷新")
+            result_version = CandidateResultVersion(
+                candidate_set_token=str(
+                    candidate.get("candidate_set_token") or ""),
+                candidate_index=normalized_index)
+            try:
+                current_version = CandidateSetVersion(**(
+                    group.get("version") or {}))
+            except TypeError:
+                raise AifosError(
+                    "stale_candidate_set: 当前候选版本损坏，请重新生成候选")
+            decision = evaluate_candidate_promotion(
+                result_version, current_version, selection_source=source)
+            if not decision.allowed:
+                marker = "stale_candidate_set" if decision.stale \
+                    else "candidate_promotion_denied"
+                raise AifosError(f"{marker}: {decision.reason}")
+            selected_uri = str(candidate.get("uri") or "")
+            if (not selected_uri
+                    or (not selected_uri.startswith(("http://", "https://"))
+                        and not Path(selected_uri).is_file())):
+                raise AifosError(
+                    "candidate_group_incomplete: 所选候选文件不存在，不能晋升")
+
+            before = self._shot_candidate_selection_summary(plan)
+            quality = {
+                "level": item.get("image_quality") or "medium",
+                "recommended": item.get("recommended_quality")
+                or item.get("image_quality") or "medium",
+                "source": item.get("quality_source") or "candidate_selection",
+                "rule": item.get("quality_rule") or "",
+                "reasons": list(item.get("quality_reasons") or []),
+            }
+            asset_name = self._shot_name(ctx, int(shot["shot_no"]))
+            latest = self.assets.latest(
+                ctx["project"]["id"], "image", asset_name)
+            latest_meta = self._asset_meta(latest)
+            if (latest is not None
+                    and str(latest_meta.get("candidate_set_token") or "")
+                    == actual_token
+                    and str(latest_meta.get("candidate_id") or "")
+                    == requested_candidate_id):
+                asset = latest
+            else:
+                asset = self.assets.register(
+                    ctx["project"]["id"], "image", asset_name,
+                    uri=selected_uri,
+                    meta=self._shot_image_meta(ctx, shot, quality, {
+                        "selected_from_candidate_group": True,
+                        # The render-plan hash was compiled with the exact
+                        # prompt/reference contract used by all four
+                        # candidates.  Preserve that authoritative hash when
+                        # promoting one candidate; recomputing from ``shot``
+                        # alone drops payload-only fields and makes the next
+                        # resume treat every explicit selection as stale.
+                        "shot_content_hash": (
+                            item.get("content_hash")
+                            or self._shot_content_hash(shot)),
+                        "candidate_set_id": actual_id,
+                        "candidate_set_token": actual_token,
+                        "candidate_revision": actual_revision,
+                        "contract_revision": int(
+                            group.get("contract_revision") or 0),
+                        "candidate_id": requested_candidate_id,
+                        "candidate_index": normalized_index,
+                        "candidate_seed": candidate.get("candidate_seed"),
+                        "selection_source": source,
+                        "selected_at": now(),
+                    }),
+                    new_version=latest is not None)
+            selection = {
+                "candidate_set_id": actual_id,
+                "candidate_set_token": actual_token,
+                "token": actual_token,
+                "candidate_revision": actual_revision,
+                "candidate_id": requested_candidate_id,
+                "candidate_index": normalized_index,
+                "candidate_seed": candidate.get("candidate_seed"),
+                "selected_uri": selected_uri,
+                "source": source,
+                "selected_at": now(),
+                "asset_id": asset["id"],
+                "asset_version": asset["version"],
+            }
+            group["selection"] = copy.deepcopy(selection)
+            item["candidate_group"] = group
+            item["selection"] = copy.deepcopy(selection)
+            item["status"] = "done"
+            item["output_uri"] = selected_uri
+            item["selection_required"] = False
+            item["technical_incomplete"] = False
+            item["error"] = ""
+            item["finished_at"] = round(time.time(), 1)
+            self._plan_write(ctx, plan)
+            summary = self._shot_candidate_selection_summary(plan)
+            last_pending = before["remaining"] == 1
+            return {
+                "status": "selected",
+                "shot_no": int(shot["shot_no"]),
+                "candidate_set_id": actual_id,
+                "candidate_set_token": actual_token,
+                "candidate_revision": actual_revision,
+                "candidate_id": requested_candidate_id,
+                "candidate_index": normalized_index,
+                "selected_uri": selected_uri,
+                "source": source,
+                "asset_id": asset["id"], "asset_version": asset["version"],
+                "already_selected": False,
+                "remaining": summary["remaining"],
+                "all_selected": summary["all_selected"],
+                "need_resume": summary["need_resume"],
+                "last_pending": last_pending,
+            }
+
+    def regenerate_shot_candidates(
+            self, project_title, episode_number, shot_no,
+            expected_candidate_set_id, expected_candidate_set_token,
+            expected_candidate_revision, prompt, confirm=False,
+            user_feedback=""):
+        """Retire one four-image set and queue a fresh four-image revision.
+
+        This method deliberately does not call an image provider.  It commits
+        a CAS-protected pending group which the normal production worker can
+        resume, preserving one owner for generation, billing and cancellation.
+        Candidate files are historical evidence and are never deleted here.
+        """
+        if confirm is not True:
+            raise AifosError("全部重生成候选需要再次确认(confirm=true)")
+        full_prompt = str(prompt or "").strip()
+        if not full_prompt:
+            raise AifosError("新的完整镜头提示词不能为空")
+        try:
+            normalized_revision = int(expected_candidate_revision)
+        except (TypeError, ValueError):
+            raise AifosError("stale_candidate_set: 候选版本无效")
+        expected_id = str(expected_candidate_set_id or "").strip()
+        expected_token = str(expected_candidate_set_token or "").strip()
+        ctx, shot = self._shot_candidate_ctx(
+            project_title, episode_number, shot_no)
+        shot_no = int(shot["shot_no"])
+        item_id = f"shot:{shot_no}"
+
+        with _PLAN_IO_LOCK:
+            plan = self._plan_read(ctx)
+            item = next((
+                row for row in plan.get("items") or []
+                if row.get("id") == item_id
+                and row.get("category") == "shot_image"
+            ), None)
+            if item is None:
+                raise AifosError(
+                    "stale_candidate_set: 当前镜头候选组不存在，请刷新")
+            if item.get("status") in ("generating", "retrying"):
+                raise AifosError(
+                    "candidate_set_busy: 当前候选仍在生成，请待状态稳定后重试")
+            old_group = item.get("candidate_group") or {}
+            actual_id = str(old_group.get("candidate_set_id") or "")
+            actual_token = str(old_group.get("candidate_set_token") or "")
+            try:
+                old_candidate_revision = int(
+                    old_group.get("candidate_revision") or 0)
+                old_contract_revision = int(
+                    old_group.get("contract_revision")
+                    or (old_group.get("version") or {}).get(
+                        "contract_revision") or 0)
+            except (TypeError, ValueError, AttributeError):
+                old_candidate_revision = 0
+                old_contract_revision = 0
+            if (not expected_id or not expected_token
+                    or expected_id != actual_id
+                    or expected_token != actual_token
+                    or normalized_revision != old_candidate_revision):
+                raise AifosError(
+                    "stale_candidate_set: 候选组已更新，请刷新后再全部重生成")
+
+            previous_prompt = str(
+                item.get("prompt_used") or item.get("prompt") or "")
+            regeneration_audit = self._candidate_regeneration_audit(
+                previous_prompt, full_prompt, user_feedback=user_feedback)
+
+            new_candidate_revision = max(1, old_candidate_revision + 1)
+            new_contract_revision = max(1, old_contract_revision + 1)
+            candidate_set_id = hashlib.sha256(
+                (f"{ctx['episode']['id']}:{shot_no}:"
+                 f"{new_contract_revision}:{new_candidate_revision}:"
+                 f"{full_prompt}:{time.time_ns()}").encode("utf-8")
+            ).hexdigest()[:16]
+            history = list(item.get("candidate_group_history") or [])
+            retired = copy.deepcopy(old_group)
+            retired.update({
+                "retired_at": now(),
+                "retired_reason": "user_regenerate_all_candidates",
+                "replaced_by_candidate_set_id": candidate_set_id,
+                "render_qc": copy.deepcopy(item.get("qc")),
+                "regeneration_feedback": copy.deepcopy(
+                    regeneration_audit),
+            })
+            history.append(retired)
+            pending_group = {
+                "schema": "aifos.shot-candidate-group/v1",
+                "version": {},
+                "candidate_set_id": candidate_set_id,
+                "candidate_set_token": "",
+                "contract_revision": new_contract_revision,
+                "candidate_revision": new_candidate_revision,
+                "candidate_count": 0,
+                "expected_count": 4,
+                "selection_required": True,
+                "complete": False,
+                "technical_incomplete": False,
+                "candidate_errors": [],
+                "candidates": [],
+                "generation_status": "regenerating_candidates",
+                "requested_at": now(),
+                "prompt_hash": self._stable_hash(full_prompt),
+                "regeneration_feedback": copy.deepcopy(
+                    regeneration_audit),
+            }
+
+            # Invalidate the formal chain before publishing the new pending
+            # plan.  If an asset operation fails, the old CAS identity remains
+            # retryable and no half-published candidate revision is visible.
+            project_id = ctx["project"]["id"]
+            episode_id = ctx["episode"]["id"]
+            asset_name = self._shot_name(ctx, shot_no)
+            old_image = self.assets.latest(project_id, "image", asset_name)
+            referenced_video_shots = self._sync_revised_video_references(
+                episode_id, project_id,
+                old_image["id"] if old_image is not None else None,
+                None, usable=False)
+            invalidated_assets = []
+
+            def invalidate(kind, name, *, reason_shot=shot_no):
+                if self.assets.latest(project_id, kind, name) is None:
+                    return
+                self.assets.soft_delete(
+                    project_id, kind, name,
+                    meta={
+                        "invalidated_by_candidate_regeneration": reason_shot,
+                        "retired_candidate_set_id": actual_id,
+                        "retired_candidate_set_token": actual_token,
+                    })
+                invalidated_assets.append({"kind": kind, "name": name})
+
+            invalidate("image", asset_name)
+            scene_shots = [
+                candidate for candidate in ctx["storyboard"].get("shots", [])
+                if int(candidate.get("scene_no") or 0)
+                == int(shot.get("scene_no") or 0)
+                and int(candidate.get("shot_no") or 0) >= shot_no
+            ]
+            frame_affected = []
+            for candidate in scene_shots:
+                current_no = int(candidate["shot_no"])
+                current_name = self._shot_name(ctx, current_no)
+                has_frames = bool(
+                    self.assets.latest(project_id, "first_frame", current_name)
+                    or self.assets.latest(
+                        project_id, "last_frame", current_name))
+                if not has_frames:
+                    if current_no != shot_no:
+                        break
+                else:
+                    invalidate("first_frame", current_name)
+                    invalidate("last_frame", current_name)
+                    frame_affected.append(current_no)
+            affected_shots = sorted({
+                shot_no, *frame_affected, *referenced_video_shots})
+            for affected_no in affected_shots:
+                invalidate(
+                    "video", self._shot_name(ctx, affected_no),
+                    reason_shot=shot_no)
+            delivery = self._invalidate_revised_delivery(
+                ctx, shot, formal_ready=False,
+                affected_shots=affected_shots,
+                source_kind="shot_candidates")
+
+            item["candidate_group_history"] = history
+            item["candidate_group"] = pending_group
+            item["candidate_uris"] = []
+            item["candidate_count"] = 0
+            item["candidate_set_token"] = ""
+            item["candidate_revision"] = new_candidate_revision
+            item["selection_required"] = True
+            item["technical_incomplete"] = False
+            item["candidate_generation_status"] = \
+                "regenerating_candidates"
+            item["status"] = "pending"
+            item["error"] = ""
+            item["prompt"] = full_prompt
+            item["custom_prompt"] = True
+            item["prompt_used"] = full_prompt
+            item["prompt_used_hash"] = self._stable_hash(full_prompt)
+            item["prompt_aifos_original"] = full_prompt
+            item["candidate_regeneration_feedback"] = copy.deepcopy(
+                regeneration_audit)
+            item.pop("prompt_optimized", None)
+            item.pop("prompt_review", None)
+            item.pop("selection", None)
+            item.pop("output_uri", None)
+            item.pop("qc", None)
+            item.pop("started_at", None)
+            item.pop("finished_at", None)
+            item.pop("duration", None)
+            self._plan_write(ctx, plan)
+            state = self._shot_candidate_selection_summary(plan)
+            return {
+                "status": "regenerating_candidates",
+                "shot_no": shot_no,
+                "candidate_set_id": candidate_set_id,
+                "candidate_set_token": "",
+                "candidate_revision": new_candidate_revision,
+                "contract_revision": new_contract_revision,
+                "history_count": len(history),
+                "remaining": state["remaining"],
+                "all_selected": False,
+                "need_resume": True,
+                "invalidated_assets": invalidated_assets,
+                "invalidated_outputs": delivery.get(
+                    "invalidated_outputs") or [],
+                "affected_shots": affected_shots,
+            }
+
+    def _candidate_regeneration_audit(
+            self, previous_prompt, new_prompt, *, user_feedback=""):
+        """Persist actionable user feedback without promoting it to a rule."""
+        previous_prompt = str(previous_prompt or "")
+        new_prompt = str(new_prompt or "")
+        feedback_text = re.sub(
+            r"\s+", " ", str(user_feedback or "").strip())[:1200]
+        if not feedback_text:
+            feedback_text = (
+                "用户明确要求整组重新生成，并以本次提交的新提示词"
+                "替换上一版镜头合同")
+        prompt_diff = "\n".join(difflib.unified_diff(
+            previous_prompt.splitlines(), new_prompt.splitlines(),
+            fromfile="previous_prompt", tofile="new_prompt",
+            lineterm=""))[:6000]
+        return {
+            "requested_at": now(),
+            "source": "user_regenerate_all_candidates",
+            "user_feedback": feedback_text,
+            "previous_prompt_hash": self._stable_hash(previous_prompt),
+            "new_prompt_hash": self._stable_hash(new_prompt),
+            "prompt_changed": previous_prompt != new_prompt,
+            "prompt_diff": prompt_diff,
+        }
+
     def _invalidate_cast_assets(self, project, script, reason,
                                 character_name="", prop_name="",
                                 invalidate_scenes=False):
@@ -19529,6 +22171,15 @@ class Director:
 
     def _auto_repair_qc_item(self, project, episode, ctx, item, report):
         """身份/性别/人数硬错误：以失败图为基底自动修图并立即复检。"""
+        if not self._image_qc_enabled():
+            report = dict(report or {})
+            report.update({
+                "advisory_only": True,
+                "blocking": False,
+                "awaiting_human": False,
+                "auto_repaired": 0,
+            })
+            return report, 0
         if report.get("passed") or not report.get("hard_failure"):
             return report, 0
         escalation = report.get("codex_escalation") or {}
@@ -19792,6 +22443,13 @@ class Director:
         镜头也必须重新检查；auto_repair=False 可先得到完整失败清单，再
         交给 Codex 多通道只重画失败项。
         """
+        if not self._image_qc_enabled():
+            return {
+                "status": "done", "checked": 0, "passed": 0,
+                "failed": 0, "auto_repaired": 0,
+                "skipped": True,
+                "reason": "选片模式或图片内容质检已关闭",
+            }
         project, episode = self._episode_ctx(project_title, episode_number)
         ctx = {"project": dict(project), "episode": dict(episode),
                "out_root": self._episode_dir(project, episode)}
@@ -19915,7 +22573,12 @@ class Director:
                            "redraw_required", True)
                        and i.get("category") in self.SHOT_QC_CATEGORIES
                        and i.get("status") in (
-                           "done", "reused", "awaiting_human", "failed")]
+                           "done", "reused", "awaiting_human", "failed",
+                           # A later plan refresh may legitimately return a
+                           # previously rendered item to pending while its
+                           # explicit failed QC verdict and asset still exist.
+                           # Batch repair must not silently drop that item.
+                           "pending")]
         else:
             targets = [tid for tid in (item_ids or []) if tid in by_id]
         if not targets:

@@ -43,6 +43,10 @@ def _ctx(app, root):
 def test_video_qc_only_retries_once_then_waits_for_human(tmp_path):
     app = App(tmp_path / "ws")
     try:
+        # 本用例只验证显式开启的内容质检返工上限；新默认选片模式会
+        # 关闭内容判定，因此这里关闭选片模式并隔离另有专项覆盖的
+        # 真实媒体探测。
+        app.config.data.setdefault("defaults", {})["selection_mode"] = False
         ctx = _ctx(app, tmp_path / "artifacts")
         calls = []
 
@@ -56,6 +60,14 @@ def test_video_qc_only_retries_once_then_waits_for_human(tmp_path):
             }
 
         app.director.qc.run = always_fail
+        app.director._run_video_media_qc = lambda *_args, **_kwargs: {
+            "schema": "aifos.video-media-qc/v1",
+            "passed": True,
+            "issues": [],
+            "shots": [],
+            "technical_qc_enabled": True,
+            "content_qc_enabled": True,
+        }
 
         def count_only(_ctx, _report, video_shots=None):
             calls.append(list(video_shots or []))

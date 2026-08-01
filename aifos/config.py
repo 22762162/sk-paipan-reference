@@ -26,6 +26,19 @@ DEFAULTS = {
         # 质检，也不因视觉判定触发重生成；优先复用断点已有选定稿，缺失
         # 素材只生成一次，随后直接剪辑合成。仍保留文件、时序和音轨完整性。
         "director_autonomy_mode": False,
+        # 创作选片模式:开启后图片/视频**内容**质检不判定、不阻断、不自动
+        # 返工——每镜固定出 4 张候选,由人工(或 AI 推荐)选片,不满意改词
+        # 重抽。生成前导演合同检查与文件/解码/尺寸/音轨技术完整性检查
+        # 始终开启,不属于本开关范围。
+        # 默认开启=升级后的新产线形态(用户定调"不再用阻断式");旧
+        # workspace 未保存本键时按新默认生效,显式关闭后按保存值生效。
+        "selection_mode": True,
+        # 内容质检独立开关(非选片模式下的独立偏好;选片模式开启时
+        # 二者一律视为关闭,消费方以 selection_mode 优先)
+        "image_content_qc": True,
+        "video_content_qc": True,
+        # 每镜关键帧候选张数:当前版本固定 4,不提供 1-4 分档
+        "shot_candidate_count": 4,
     },
     # Codex 多实例不注册成多个 Provider，避免破坏现有 routing。旧工作区
     # 没有 profiles 时会自动把 providers.codex 映射成一个兼容 profile；

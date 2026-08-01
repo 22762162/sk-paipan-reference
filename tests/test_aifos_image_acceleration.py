@@ -1,6 +1,8 @@
 """尚未开工图片的严格 API 批量加速。"""
 
 import json
+import struct
+import zlib
 
 import pytest
 
@@ -12,7 +14,19 @@ from aifos.prompt_contract import build_shot_prompt_contract
 
 def _png(path, marker=b"r"):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"\x89PNG\r\n\x1a\n" + marker * 32)
+    def chunk(kind, data):
+        crc = zlib.crc32(kind)
+        crc = zlib.crc32(data, crc) & 0xFFFFFFFF
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", crc))
+
+    value = marker[0] if marker else 0
+    width, height = 9, 16
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    pixels = (b"\x00" + bytes((value, 40, 60)) * width) * height
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b""))
     return str(path)
 
 
@@ -250,7 +264,9 @@ def test_original_scheduler_claims_queued_api_without_fallback(tmp_path):
         assert dispatch["acceleration_status"] == "done"
         plan = json.loads((ctx["out_root"] / "render_plan.json").read_text())
         plan_item = plan["items"][0]
-        assert plan_item["status"] == "done"
+        assert plan_item["status"] == "awaiting_selection"
+        assert plan_item["candidate_group"]["candidate_count"] == 4
+        assert plan_item["selection_required"] is True
         assert plan_item["acceleration"]["provider"] == "image_api"
     finally:
         app.close()

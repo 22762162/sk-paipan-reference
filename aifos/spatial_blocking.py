@@ -35,6 +35,10 @@ MIN_CAMERA_ACTOR_CLEARANCE_M = .3
 # 过肩镜头允许摄影机贴近柔焦肩背前景；仍保留 12cm 硬净距，避免机位
 # 与演员锚点完全重合。景别由主拍对象距离决定，不由这名前景演员决定。
 OVER_SHOULDER_CAMERA_CLEARANCE_M = .12
+# 最终机位会经历「世界坐标→整数画布→两位小数世界坐标」量化。若求解器
+# 恰好把机位放在 0.30m 边界，量化后可能变成 0.299...m，导致同一份
+# 分镜偶发预检失败。生产机位因此保留 5cm 安全余量，门禁仍按 0.30m。
+CAMERA_ACTOR_CLEARANCE_SAFETY_M = .35
 ACTOR_COLORS = (
     "#ff5d8f", "#52b8ff", "#ffc857", "#69db9d", "#ad8cff", "#ff8c5a",
 )
@@ -887,6 +891,206 @@ def _clear_camera_icons(camera, actor_points):
     return camera
 
 
+def _clear_final_camera_actor_clearance(
+        camera, positions, dialogue_continuity=None):
+    """在导演/轴线求解完成后，为最终机位执行确定性物理避障。
+
+    ``_clear_camera_icons`` 只负责二维示意图可读性，而且发生在导演求解
+    之前；导演求解和对话轴线校正都会覆盖它。这里以最终量化后的米制坐标
+    为准，同时检查机位起终点对所有演员起终点，避免 0.30m 边界因整数
+    画布及两位小数转换掉到门禁线下。
+    """
+    actor_world_points = [
+        {
+            "actor_id": actor.get("actor_id"),
+            "point": actor.get(phase) or {},
+        }
+        for actor in positions
+        for phase in ("start_3d", "end_3d")
+        if _point_3d_valid(actor.get(phase))
+    ]
+    if not actor_world_points:
+        return camera
+
+    dialogue = (
+        dialogue_continuity if isinstance(dialogue_continuity, dict) else {})
+    axis = dialogue.get("axis") or {}
+    axis_a, axis_b = axis.get("a") or {}, axis.get("b") or {}
+    side = int(dialogue.get("camera_side_sign") or 0)
+    axis_locked = side in (-1, 1) and axis_a and axis_b
+    foreground_actor_id = str(dialogue.get("foreground_actor_id") or "")
+
+    def required_clearance(actor_point, safety=False):
+        required = (
+            OVER_SHOULDER_CAMERA_CLEARANCE_M
+            if foreground_actor_id
+            and str(actor_point.get("actor_id") or "")
+            == foreground_actor_id
+            else MIN_CAMERA_ACTOR_CLEARANCE_M)
+        return required + (.05 if safety else 0.0)
+
+    def actor_clearances(world_point):
+        return [(
+            math.hypot(
+                float(world_point["x"]) - float(actor["point"]["x"]),
+                float(world_point["z"]) - float(actor["point"]["z"])),
+            actor,
+        ) for actor in actor_world_points]
+
+    def clearance(world_point):
+        return min(distance for distance, _actor in actor_clearances(
+            world_point))
+
+    def clearance_valid(world_point, safety=False):
+        return all(
+            distance >= required_clearance(actor, safety=safety)
+            for distance, actor in actor_clearances(world_point))
+
+    def quantize(wx, wz):
+        canvas = canvas_from_world({"x": wx, "z": wz})
+        return canvas, _world_point(canvas)
+
+    def axis_allowed(canvas):
+        return (not axis_locked
+                or _axis_side(axis_a, axis_b, canvas) == side)
+
+    def choose(original):
+        original_canvas = _point(original["x"], original["y"])
+        original_world = _world_point(original_canvas)
+        if (clearance_valid(original_world, safety=True)
+                and axis_allowed(original_canvas)):
+            return original_canvas, original_world
+
+        nearest = min(actor_world_points, key=lambda actor: math.hypot(
+            float(original_world["x"]) - float(actor["point"]["x"]),
+            float(original_world["z"]) - float(actor["point"]["z"])))
+        nearest_point = nearest["point"]
+        away_x = float(original_world["x"]) - float(nearest_point["x"])
+        away_z = float(original_world["z"]) - float(nearest_point["z"])
+        preferred_angle = (
+            math.atan2(away_z, away_x)
+            if math.hypot(away_x, away_z) > 1e-9 else 0.0)
+
+        # 先从原机位向最近演员的反方向小步搜索。每个候选都先经过与
+        # 正式产物相同的 canvas/world 量化再验距，不能在浮点候选上放行。
+        seen = set()
+        for step in range(1, 41):
+            radius = step * .05
+            candidates = []
+            for angle_step in range(72):
+                angle = preferred_angle + math.radians(
+                    (angle_step + 1) // 2 * 5
+                    * (-1 if angle_step % 2 else 1))
+                canvas, world_point = quantize(
+                    float(original_world["x"]) + radius * math.cos(angle),
+                    float(original_world["z"]) + radius * math.sin(angle))
+                key = (canvas["x"], canvas["y"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                if (not clearance_valid(world_point, safety=True)
+                        or not axis_allowed(canvas)):
+                    continue
+                displacement = math.hypot(
+                    float(world_point["x"]) - float(original_world["x"]),
+                    float(world_point["z"]) - float(original_world["z"]))
+                angular_change = abs(_wrap_deg(math.degrees(
+                    math.atan2(
+                        float(world_point["z"])
+                        - float(nearest_point["z"]),
+                        float(world_point["x"]) - float(nearest_point["x"]))
+                    - preferred_angle)))
+                candidates.append((
+                    round(displacement, 6), round(angular_change, 6),
+                    canvas["y"], canvas["x"], canvas, world_point))
+            if candidates:
+                best = min(candidates)
+                return best[-2], best[-1]
+
+        # 极端密集站位的确定性兜底：扫描合法画布，仍以离原机位最近为准。
+        fallback = []
+        for y in range(115, HEIGHT - 114, 20):
+            for x in range(90, WIDTH - 89, 20):
+                canvas = _point(x, y)
+                world_point = _world_point(canvas)
+                if (not clearance_valid(world_point, safety=True)
+                        or not axis_allowed(canvas)):
+                    continue
+                fallback.append((
+                    round(math.hypot(
+                        float(world_point["x"])
+                        - float(original_world["x"]),
+                        float(world_point["z"])
+                        - float(original_world["z"])), 6),
+                    canvas["y"], canvas["x"], canvas, world_point))
+        if fallback:
+            best = min(fallback)
+            return best[-2], best[-1]
+        return original_canvas, original_world
+
+    original_start = dict(camera["start"])
+    original_end = dict(camera["end"])
+    original_moving = bool(camera.get("moving"))
+    start, start_world = choose(original_start)
+    if original_moving:
+        end, end_world = choose(original_end)
+    else:
+        end, end_world = start, start_world
+    changed = start != original_start or end != original_end
+
+    # 「移」的瞄准点随终点机位平移；其余运镜继续看原目标。
+    if changed and camera.get("movement") == "移":
+        target = camera.get("director_end_target_3d")
+        if isinstance(target, dict) and target:
+            old_end_world = _world_point(original_end)
+            camera["director_end_target_3d"] = {
+                "x": round(float(target.get("x", 0.0))
+                           + end_world["x"] - old_end_world["x"], 2),
+                "y": round(float(target.get("y", 0.0)), 2),
+                "z": round(float(target.get("z", 0.0))
+                           + end_world["z"] - old_end_world["z"], 2),
+            }
+
+    moving = original_moving and start != end
+    direction = _direction(start, end)
+    camera.update({
+        "start": start,
+        "end": end,
+        "moving": moving,
+        "route": ([dict(start, phase="start"), dict(end, phase="end")]
+                  if moving else [dict(start, phase="fixed")]),
+        "direction": direction,
+        "direction_label": (
+            f"镜头{camera.get('movement') or '移动'}：起点→终点，{direction}"
+            if moving else "静止机位：起点=终点"),
+    })
+    director = camera.get("director_camera")
+    if isinstance(director, dict):
+        before_points = (
+            _world_point(original_start), _world_point(original_end))
+        director.update({
+            "clearance_adjusted": changed,
+            "clearance_before_m": round(min(
+                clearance(point) for point in before_points), 4),
+            "clearance_m": round(min(
+                clearance(point) for point in (start_world, end_world)), 3),
+            "clearance_required_m": MIN_CAMERA_ACTOR_CLEARANCE_M,
+            "clearance_safety_m": CAMERA_ACTOR_CLEARANCE_SAFETY_M,
+            "over_shoulder_foreground_actor_id": foreground_actor_id,
+            "over_shoulder_clearance_m": (
+                OVER_SHOULDER_CAMERA_CLEARANCE_M
+                if foreground_actor_id else None),
+        })
+        end_position = director.get("end_position_3d")
+        if isinstance(end_position, dict):
+            director["end_position_3d"] = {
+                **end_position, "x": end_world["x"], "z": end_world["z"]}
+        if camera.get("movement") == "移" and changed:
+            director["end_target_3d"] = camera.get(
+                "director_end_target_3d")
+    return camera
+
+
 def _scene_location(script, continuity, scene_no):
     for scene in script.get("scenes", []):
         if int(scene.get("scene_no", 0)) == int(scene_no):
@@ -1099,6 +1303,8 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
                  "floor_depth_m": WORLD_DEPTH_M})
             dialogue_continuity = _dialogue_contract(
                 shot, positions, camera_2d, dialogue_memory, scene_no)
+            camera_2d = _clear_final_camera_actor_clearance(
+                camera_2d, positions, dialogue_continuity)
             camera = _attach_camera_3d(
                 camera_2d,
                 start_target, target,
@@ -1393,24 +1599,39 @@ def validate_spatial_plan(plan, storyboard):
                 issues.append(
                     f"镜头 {shot_no} 双人左右锚点/轴线侧未继承上一镜")
             previous_dialogue[dialogue_key] = current
-        camera_phases = (
-            ("start_3d", "start_3d"), ("end_3d", "end_3d"))
-        camera_clearance = (
-            OVER_SHOULDER_CAMERA_CLEARANCE_M
-            if "过肩" in str(camera.get("position") or "")
-            else MIN_CAMERA_ACTOR_CLEARANCE_M)
-        if any(
+        # 起终机位都要对演员的起终状态留出净距；只检查同相位会漏掉
+        # 演员路线终点与摄影机起点（或反向）的空间冲突。
+        camera_phases = ("start_3d", "end_3d")
+        actor_phases = ("start_3d", "end_3d")
+        foreground_actor_id = str(
+            dialogue.get("foreground_actor_id") or "")
+        clearance_violations = [
+            (
                 math.hypot(
-                    float((camera.get(camera_key) or {}).get("x", math.inf))
+                    float((camera.get(camera_key) or {}).get(
+                        "x", math.inf))
                     - float((actor.get(actor_key) or {}).get("x", 0.0)),
-                    float((camera.get(camera_key) or {}).get("z", math.inf))
-                    - float((actor.get(actor_key) or {}).get("z", 0.0)),
-                ) < camera_clearance
-                for camera_key, actor_key in camera_phases
-                for actor in actor_points):
+                    float((camera.get(camera_key) or {}).get(
+                        "z", math.inf))
+                    - float((actor.get(actor_key) or {}).get("z", 0.0))),
+                OVER_SHOULDER_CAMERA_CLEARANCE_M
+                if foreground_actor_id
+                and str(actor.get("actor_id") or "")
+                == foreground_actor_id
+                else MIN_CAMERA_ACTOR_CLEARANCE_M,
+            )
+            for camera_key in camera_phases
+            for actor_key in actor_phases
+            for actor in actor_points
+        ]
+        if any(distance < required
+               for distance, required in clearance_violations):
+            failed_clearance = min(
+                required for distance, required in clearance_violations
+                if distance < required)
             issues.append(
                 f"镜头 {shot_no} 摄影机与演员物理净距不足 "
-                f"{camera_clearance}m")
+                f"{failed_clearance}m")
     return {"passed": not issues, "issues": issues,
             "checked_shots": len(storyboard.get("shots", []))}
 

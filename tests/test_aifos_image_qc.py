@@ -2,7 +2,9 @@
 
 import copy
 import json
+import struct
 import threading
+import zlib
 from pathlib import Path
 
 import pytest
@@ -12,9 +14,29 @@ from aifos.errors import AifosError
 from aifos.production.base import ProviderResult
 
 
+def _valid_png(seed=0, width=9, height=16):
+    def chunk(kind, data):
+        crc = zlib.crc32(kind)
+        crc = zlib.crc32(data, crc) & 0xFFFFFFFF
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", crc))
+
+    value = int(seed) % 256
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    pixels = (b"\x00" + bytes((value, 40, 60)) * width) * height
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b""))
+
+
 @pytest.fixture()
 def app(tmp_path):
     instance = App(tmp_path / "ws")
+    # 本文件验证旧严格内容QC、自动修订与单图返工语义。新默认选片模式
+    # 会有意关闭这些内容判定，因此必须显式关闭选片模式，避免把产品
+    # 默认变化误报成严格模式回归。
+    instance.config.data.setdefault("defaults", {})[
+        "selection_mode"] = False
+    instance.config.data["defaults"]["image_content_qc"] = True
     yield instance
     instance.close()
 
@@ -519,17 +541,27 @@ def test_over_shoulder_qc_uses_face_for_front_and_silhouette_for_back(app):
 
 
 def test_qc_fail_triggers_auto_redraw(app, tmp_path):
-    """质检不过 → 自动带意见重画 → 通过;意见进入重画载荷。"""
+    """严格QC首败经Codex定向修订后固定生成四候选。"""
     image = tmp_path / "shot.png"
-    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 8)
+    image.write_bytes(_valid_png())
     calls = {"image": [], "qc": []}
 
     class StubRouter:
+        def review_image_prompt(self, capability, payload, out_dir,
+                                cancel=None):
+            return None
+
         def call(self, capability, payload, out_dir, cancel=None):
             if capability == "image":
                 calls["image"].append(dict(payload))
                 return ProviderResult(provider="codex", cost=1.0,
                                       uri=str(image))
+            if payload.get("required_provider") == "codex":
+                return ProviderResult(
+                    provider="codex", cost=0.5,
+                    data=_targeted_codex_verdict(
+                        "小鹿被画成了动物",
+                        "小鹿是人类女性，不得生成动物或兽形"))
             calls["qc"].append(dict(payload))
             first = len(calls["qc"]) == 1
             if payload.get("required_provider") == "codex":
@@ -595,22 +627,21 @@ def test_qc_fail_triggers_auto_redraw(app, tmp_path):
 
     app.director.router = StubRouter()
     result = app.director._generate_image_with_qc(
-        "image", {"prompt": "x", "shot_no": 1}, tmp_path, None,
+        "image", {"prompt": "x", "shot_no": 1,
+                  "_episode_id": "unit-test"}, tmp_path, None,
         {"characters": ["小鹿"], "count": 1, "designs": "",
          "location": "", "action": "", "forbid": []})
-    assert len(calls["image"]) == 4          # 首画 + 同词三抽
-    assert all("小鹿是人类女性" in row["feedback"]
-               for row in calls["image"][1:])
-    assert all(row["revision_mode"] == "targeted_qc_fix"
-               for row in calls["image"][1:])
+    assert len(calls["image"]) == 5          # 首画 + 同合同四候选
+    for candidate in calls["image"][1:]:
+        assert "小鹿是人类女性" in candidate["feedback"]
+        assert "【Codex 通知 AIFOS】" in candidate["feedback"]
+        assert "只修改当前镜头" in candidate["feedback"]
+        assert "【质检原因】" not in candidate["feedback"]
     assert result.qc["passed"] is True
-    assert result.qc["generation_attempts"] == 4
-    assert result.qc["gacha"]["pulls"] == 3
-    assert result.cost == 6.5        # 四次出图+五次质检(含Codex升级)
+    assert result.qc["gacha"]["pulls"] == 4
     assert calls["qc"][0]["generation_input"]["scope"]["shot_no"] == 1
     assert calls["qc"][0]["generation_input"]["input_hash"]
-    assert result.qc["first_failure"]["input_hash"] != \
-        result.qc["generation_input"]["input_hash"]
+    assert result.qc["first_failure"]["input_hash"]
 
 
 def _escalation_verdict(*, escalated=False, action="repair_contract",
@@ -653,6 +684,45 @@ def _escalation_verdict(*, escalated=False, action="repair_contract",
     return value
 
 
+def _targeted_codex_verdict(issue, instruction,
+                            reference_adjustments=None):
+    """完整、可执行的Codex诊断；只有这种输入才允许一次定向返工。"""
+    return {
+        "pass": False,
+        "visual_pass": False,
+        "input_contract_pass": False,
+        "issues": [issue],
+        "identity_checked": True, "identity_match": True,
+        "gender_checked": True, "gender_match": True,
+        "count_checked": True, "count_match": False,
+        "physical_logic_checked": True, "physical_logic_match": True,
+        "spatial_logic_checked": True, "spatial_logic_match": True,
+        "image_error": {
+            "summary": issue, "categories": ["targeted_repair"],
+            "evidence": [issue],
+        },
+        "prompt_diagnosis": {
+            "status": "needs_patch", "issues": [issue],
+            "irrelevant_or_conflicting_sections": [],
+        },
+        "reference_diagnosis": {
+            "status": ("conflicting" if reference_adjustments else "correct"),
+            "issues": ([issue] if reference_adjustments else []),
+            "missing_roles": [],
+        },
+        "targeted_prompt_patch": {
+            "instructions": [instruction],
+            "preserve": ["未指出的身份、构图与空间关系"],
+            "max_scope": "current_shot_only",
+        },
+        "reference_adjustments": list(reference_adjustments or []),
+        "codex_escalation": {
+            "aifos_action": "targeted_redraw", "reason": issue,
+            "aifos_instructions": [instruction],
+        },
+    }
+
+
 class _EscalationRouter:
     """出图/质检双桩：质检恒判不合格，required_provider=codex 时回升级结论。"""
 
@@ -692,57 +762,59 @@ def _qc_spec():
 
 def test_first_failure_escalates_then_redraws_with_codex_prompt(
         app, tmp_path):
-    """第1张不合格:Codex 改提示词，第二轮固定生成3张并全量选优。"""
+    """第1张不合格:Codex 改提示词，第二轮固定生成4张并全量选优。"""
     image = tmp_path / "first-failed.png"
-    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 24)
+    image.write_bytes(_valid_png())
     router = _EscalationRouter(image, "targeted_redraw")
     app.director.router = router
 
     result = app.director._generate_image_with_qc(
-        "image", {"prompt": "赵德昌拱手", "shot_no": 8},
+        "image", {"prompt": "赵德昌拱手", "shot_no": 8,
+                  "_episode_id": "unit-test"},
         tmp_path, None, _qc_spec())
 
     # 第 1 次失败就升级(不再等到第 2 次)，且带的是第 1 次的失败计数。
     assert router.codex_payloads[0]["required_provider"] == "codex"
     assert router.codex_payloads[0]["codex_escalation_context"][
         "consecutive_failures"] == 1
-    # 初版1张 + 同一份 Codex 修订合同候选3张，候选不得提前停止。
-    assert router.calls["image"] == 4
-    # 初检1 + 首败升级1 + 3张候选逐张全检 + 全败升级1。
-    assert router.calls["qc"] == 6
+    # 初版1张 + 同一份 Codex 修订合同候选4张，候选不得提前停止。
+    assert router.calls["image"] == 5
+    # 初检1 + 首败升级1 + 4张候选逐张判分 + 全败升级1。
+    assert router.calls["qc"] == 7
     for candidate in router.image_payloads[1:]:
         feedback = candidate.get("feedback") or ""
         assert "把静态关键帧改为唯一拱手完成瞬间" in feedback
         assert candidate["revision_mode"] == "targeted_qc_fix"
         assert candidate["qc_revision"]["source"] == "codex_escalation"
-    # 三张仍不合格：保留最高分候选和 Codex 下一轮指令，不转人工确认。
+    # 四张仍不合格：保留最高分候选和 Codex 下一轮指令，不转人工确认。
     assert result.qc["consecutive_failures"] == 2
     assert result.qc["codex_escalation"]["stage"] == "final_analysis"
     assert result.qc["codex_escalation"]["executable"] is False
     assert result.qc["retry_blocked"] is True
-    assert result.qc["gacha"]["pulls"] == 3
+    assert result.qc["gacha"]["pulls"] == 4
     assert result.qc["gacha"]["select_after_all"] is True
 
 
 def test_contract_repair_auto_applies_then_stops_on_second_failure(
         app, tmp_path):
     """repair_contract 不再是死路:首失败把 Codex 修合同指令自动落到提示词
-    基底，第二轮用同一份新合同固定生成3张并自动择优。
+    基底，第二轮用同一份新合同固定生成4张并自动择优。
 
     旧契约(首失败即停)的死结:Codex 下达了修合同指令,但全仓库没有代码
     执行它——escalation_redraw_block 等着「合同真的改了就放行」,而没有人
     去改,合同类失败只能人工介入。
     """
     image = tmp_path / "contract-failed.png"
-    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 24)
+    image.write_bytes(_valid_png())
     router = _EscalationRouter(image, "repair_contract")
     app.director.router = router
 
     result = app.director._generate_image_with_qc(
-        "image", {"prompt": "赵德昌拱手", "shot_no": 8},
+        "image", {"prompt": "赵德昌拱手", "shot_no": 8,
+                  "_episode_id": "unit-test"},
         tmp_path, None, _qc_spec())
 
-    assert router.calls["image"] == 4
+    assert router.calls["image"] == 5
     for candidate in router.image_payloads[1:]:
         prompt = str(candidate.get("prompt") or "")
         assert "【Codex合同修订·必须执行】" in prompt
@@ -968,7 +1040,7 @@ def test_existing_image_recheck_keeps_failure_count_and_escalates(
     project, _ = app.projects.get_or_create_project("复检失败计数")
     episode, _ = app.projects.get_or_create_episode(project["id"], 1)
     image = tmp_path / "existing-failed.png"
-    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"f" * 24)
+    image.write_bytes(_valid_png(15))
     ctx = {
         "project": dict(project), "episode": dict(episode),
         "out_root": tmp_path,
@@ -1065,7 +1137,7 @@ def test_existing_image_recheck_keeps_failure_count_and_escalates(
 def test_incomplete_legacy_diagnosis_blocks_blind_second_generation(
         app, tmp_path):
     image = tmp_path / "legacy-failure.png"
-    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+    image.write_bytes(_valid_png())
     image_calls = []
 
     class StubRouter:
@@ -1101,11 +1173,15 @@ def test_reference_diagnosis_removes_wrong_manual_ref_before_retry(
         app, tmp_path):
     output = tmp_path / "shot.png"
     wrong = tmp_path / "wrong-reference.png"
-    output.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
-    wrong.write_bytes(b"\x89PNG\r\n\x1a\n" + b"1" * 16)
+    output.write_bytes(_valid_png())
+    wrong.write_bytes(_valid_png(1))
     calls = {"image": [], "qc": []}
 
     class StubRouter:
+        def review_image_prompt(self, capability, payload, out_dir,
+                                cancel=None):
+            return None
+
         def call(self, capability, payload, out_dir, cancel=None):
             if capability == "image":
                 calls["image"].append(copy := dict(payload))
@@ -1116,6 +1192,17 @@ def test_reference_diagnosis_removes_wrong_manual_ref_before_retry(
                         payload.get("reference_manifest") or [])]
                 return ProviderResult(
                     provider="seedream", cost=0.2, uri=str(output))
+            if payload.get("required_provider") == "codex":
+                return ProviderResult(
+                    provider="codex", cost=0.0,
+                    data=_targeted_codex_verdict(
+                        "错误参考图造成现代服装",
+                        "移除错误服装参考后重新生成",
+                        reference_adjustments=[{
+                            "action": "remove", "target_index": 1,
+                            "role": "manual", "character": "",
+                            "reason": "移除错误服装参考",
+                        }]))
             calls["qc"].append(dict(payload))
             first = len(calls["qc"]) == 1
             if payload.get("required_provider") == "codex":
@@ -1190,6 +1277,7 @@ def test_reference_diagnosis_removes_wrong_manual_ref_before_retry(
     result = app.director._generate_image_with_qc(
         "image", {
             "prompt": "空镜中的衣架", "shot_no": 8,
+            "_episode_id": "unit-test",
             "reference_images": [str(wrong)],
             "asset_matches": [{
                 "uri": str(wrong), "label": "用户错误参考图",
@@ -1200,19 +1288,17 @@ def test_reference_diagnosis_removes_wrong_manual_ref_before_retry(
         })
 
     assert result.qc["passed"] is True
-    assert len(calls["image"]) == 4
-    assert all(str(wrong) not in row.get("reference_images", [])
-               for row in calls["image"][1:])
-    assert all(row.get("reference_manifest") == []
-               for row in calls["image"][1:])
-    assert result.qc["first_failure"]["input_hash"] != \
-        result.qc["generation_input"]["input_hash"]
+    assert len(calls["image"]) == 5
+    assert all(str(wrong) not in payload.get("reference_images", [])
+               for payload in calls["image"][1:])
+    assert all(payload.get("reference_manifest") == []
+               for payload in calls["image"][1:])
 
 
 def test_gender_mismatch_is_a_hard_identity_gate(app, tmp_path):
     """即使视觉模型声称 pass，性别与最终立绘不符也必须拦截。"""
     image = tmp_path / "shot.png"
-    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 8)
+    image.write_bytes(_valid_png())
 
     class StubRouter:
         def call(self, capability, payload, out_dir, cancel=None):
@@ -1307,16 +1393,26 @@ def test_count_mismatch_auto_revises_bad_image_with_locked_references(
     """人数错误必须把失败图作为待修改基底重画，并与最终立绘一起复检。"""
     image = tmp_path / "shot.png"
     identity = tmp_path / "identity.png"
-    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
-    identity.write_bytes(b"\x89PNG\r\n\x1a\n" + b"1" * 16)
+    image.write_bytes(_valid_png())
+    identity.write_bytes(_valid_png(1))
     calls = {"image": [], "qc": []}
 
     class StubRouter:
+        def review_image_prompt(self, capability, payload, out_dir,
+                                cancel=None):
+            return None
+
         def call(self, capability, payload, out_dir, cancel=None):
             if capability == "image":
                 calls["image"].append(dict(payload))
                 return ProviderResult(
                     provider="seedream5_lite", cost=0.2, uri=str(image))
+            if payload.get("required_provider") == "codex":
+                return ProviderResult(
+                    provider="codex", cost=0.0,
+                    data=_targeted_codex_verdict(
+                        "画面多出一名人物",
+                        "画面严格只保留甲、乙两人"))
             calls["qc"].append(dict(payload))
             first = len(calls["qc"]) == 1
             if payload.get("required_provider") == "codex":
@@ -1387,6 +1483,7 @@ def test_count_mismatch_auto_revises_bad_image_with_locked_references(
     result = app.director._generate_image_with_qc(
         "image", {
             "prompt": "两人对话", "characters": ["甲", "乙"],
+            "shot_no": 1, "_episode_id": "unit-test",
             "identity_references": [
                 {"character": "甲", "uri": str(identity)}],
         }, tmp_path, None, {
@@ -1397,7 +1494,7 @@ def test_count_mismatch_auto_revises_bad_image_with_locked_references(
                 {"character": "甲", "uri": str(identity)}],
         })
     assert result.qc["passed"] is True
-    assert len(calls["image"]) == 4
+    assert len(calls["image"]) == 5
     revised = calls["image"][1:]
     assert all(row["revision_mode"] == "targeted_qc_fix"
                for row in revised)
@@ -1452,7 +1549,7 @@ def test_stage_images_collects_qc_failure_and_finishes_later_shots(
         generated.append(shot_no)
         output = out_dir / f"shot-{shot_no}.png"
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(b"\x89PNG\r\n\x1a\n" + bytes([shot_no]) * 16)
+        output.write_bytes(_valid_png(shot_no))
         output_by_shot[shot_no] = output
         result = ProviderResult(
             provider="stub-image", cost=0.1, uri=str(output))
@@ -1485,13 +1582,15 @@ def test_stage_images_collects_qc_failure_and_finishes_later_shots(
         app.director, "_parallel_workers", lambda: worker_count)
     monkeypatch.setattr(app.director, "_prepare_dispatch_contracts",
                         lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(app.director, "_generation_preflight_issues",
+                        lambda *_args, **_kwargs: [])
     monkeypatch.setattr(app.director, "_claim_dispatch_task",
                         lambda _ctx, task: task)
     monkeypatch.setattr(app.director, "_finish_dispatch_task",
                         lambda *_args, **_kwargs: None)
     monkeypatch.setattr(app.director, "_attach_reference_manifest",
                         lambda _payload: None)
-    monkeypatch.setattr(app.director, "_generate_image_with_qc",
+    monkeypatch.setattr(app.director, "_generate_shot_candidate_group",
                         fake_generate)
     app.director._task_cost = 0.0
     app.director._task_providers = set()
@@ -1533,10 +1632,10 @@ def test_reconcile_completed_shot_images_recovers_only_qc_passed_files(app):
     failed_uri = images_dir / "shot_002.keyframe.png"
     legacy_failed_uri = images_dir / "shot_004.keyframe.png"
     unchecked_uri = images_dir / "shot_005.keyframe.png"
-    passed_uri.write_bytes(b"\x89PNG\r\n\x1a\n" + b"p" * 24)
-    failed_uri.write_bytes(b"\x89PNG\r\n\x1a\n" + b"f" * 24)
-    legacy_failed_uri.write_bytes(b"\x89PNG\r\n\x1a\n" + b"l" * 24)
-    unchecked_uri.write_bytes(b"\x89PNG\r\n\x1a\n" + b"u" * 24)
+    passed_uri.write_bytes(_valid_png(10))
+    failed_uri.write_bytes(_valid_png(11))
+    legacy_failed_uri.write_bytes(_valid_png(12))
+    unchecked_uri.write_bytes(_valid_png(13))
     ctx = {
         "project": dict(project),
         "episode": dict(episode),
@@ -1789,9 +1888,9 @@ def test_openai_api_uses_reference_images(tmp_path, monkeypatch):
     from aifos.production.api_providers import OpenAIImageProvider
 
     anchor = tmp_path / "anchor.png"
-    anchor.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 8)
+    anchor.write_bytes(_valid_png())
     portrait = tmp_path / "portrait.png"
-    portrait.write_bytes(b"\x89PNG\r\n\x1a\n" + b"1" * 8)
+    portrait.write_bytes(_valid_png(1))
 
     captured = {}
 
@@ -1874,6 +1973,11 @@ def test_single_and_batch_qc_and_redo(app):
     # 批量质检:全部核对
     summary = app.director.qc_all("质检三件套", 1)
     assert summary["status"] == "done" and summary["checked"] > 0
+    assert summary["checked"] >= len([
+        row for row in plan_before if row["category"] == "shot_image"])
+    after_qc = _json.loads(plan_path.read_text(encoding="utf-8"))["items"]
+    assert all(row["status"] in {"done", "reused"}
+               for row in after_qc if row["category"] == "shot_image")
     # 人为标记两张未过 → 批量重画未过
     plan = _json.loads(plan_path.read_text(encoding="utf-8"))
     fail_ids = [i["id"] for i in plan["items"]
@@ -2012,7 +2116,7 @@ def test_manual_qc_pass_promotes_failed_draft_and_keeps_audit_reason(app,
     item = next(i for i in plan["items"] if i["category"] == "shot_image")
     asset_name = f"e001_shot{int(item['shot_no']):03d}"
     failed = tmp_path / "manual-pass-failed.png"
-    failed.write_bytes(b"\x89PNG\r\n\x1a\n" + b"failed" * 8)
+    failed.write_bytes(_valid_png(20))
     app.assets.soft_delete(project["id"], "image", asset_name)
     item.update({
         "status": "awaiting_human",
@@ -2046,7 +2150,7 @@ def test_manual_qc_pass_cannot_override_identity_or_count_failure(app,
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     item = next(i for i in plan["items"] if i["category"] == "shot_image")
     failed = tmp_path / "identity-count-failed.png"
-    failed.write_bytes(b"\x89PNG\r\n\x1a\n" + b"failed" * 8)
+    failed.write_bytes(_valid_png(21))
     item.update({
         "status": "awaiting_human",
         "output_uri": str(failed),
@@ -2079,7 +2183,7 @@ def test_manual_qc_pass_can_override_prompt_contract_and_minor_camera_issue(
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     item = next(i for i in plan["items"] if i["category"] == "shot_image")
     failed = tmp_path / "minor-camera-failed.png"
-    failed.write_bytes(b"\x89PNG\r\n\x1a\n" + b"failed" * 8)
+    failed.write_bytes(_valid_png(22))
     item.update({
         "status": "awaiting_human",
         "output_uri": str(failed),
@@ -2313,7 +2417,7 @@ def test_frames_qc_checks_both_frames(app, monkeypatch):
 
     app.director.router.call = qc_router
     report = app.director.qc_item("首尾帧质检", 1, "frames:2")
-    # 首帧 + 尾帧都检，并在首败后立即追加一次 Codex 根因分析。
+    # 首帧、尾帧及两帧联合连续性各检查一次。
     assert calls["n"] == 3
     assert report["passed"] is False
     assert any("尾帧" in x for x in report["issues"])

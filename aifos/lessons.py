@@ -20,8 +20,10 @@ import json
 import re
 import time
 
-# 注入提示词的教训上限:太多会稀释注意力,取最高频的前几条
-MAX_INJECTED = 6
+# 注入提示词的教训上限:太多会稀释注意力。用户明确要求提示词短、准，
+# 所以每个生成任务只取与当前镜头最相关的 3-5 条，而不是把项目历史
+# 失败原因整库粘贴进去。
+MAX_INJECTED = 5
 # 单条教训文字上限
 MAX_TEXT = 120
 
@@ -55,6 +57,36 @@ def _fingerprint(normalized):
 
 DOMAIN_IMAGE = "image"
 DOMAIN_SCRIPT = "script"
+DOMAIN_VIDEO = "video"
+
+
+_CATEGORY_PATTERNS = {
+    "identity": ("身份", "人脸", "脸型", "五官", "发型", "妆造", "跑脸"),
+    "people_count": ("人数", "多出人物", "新增人物", "重复人物", "复制人物"),
+    "wardrobe": ("服装", "衣服", "配饰", "头饰", "帽", "鞋"),
+    "scene": ("场景", "背景", "家具", "门窗", "建筑", "房间"),
+    "era": ("时代", "古代", "现代", "明代", "朝代", "穿越"),
+    "prop": ("道具", "物品", "马车", "马匹", "笔记本电脑", "书册", "屏幕"),
+    "text": ("文字", "错字", "乱码", "字幕", "Logo", "水印", "页面"),
+    "physics": ("物理", "重力", "漂浮", "瞬移", "穿模", "碰撞", "受力", "轨迹"),
+    "space": ("空间", "位置", "前后", "左右", "远近", "遮挡", "轴线"),
+    "camera": ("镜头", "机位", "景别", "运镜", "焦段", "构图", "越轴"),
+    "lighting": ("光影", "灯光", "光源", "色温", "曝光"),
+    "motion": ("动作", "运动", "交接", "抓取", "释放", "起点", "终点"),
+    "audio": ("配音", "口型", "音轨", "声音", "对白"),
+}
+
+
+def infer_lesson_categories(issue, category=""):
+    """把真实失败原因归入可检索维度，避免经验只剩一段不可用长文本。"""
+    text = str(issue or "")
+    found = []
+    if str(category or "").strip():
+        found.append(str(category).strip())
+    for name, patterns in _CATEGORY_PATTERNS.items():
+        if any(pattern in text for pattern in patterns):
+            found.append(name)
+    return list(dict.fromkeys(found))
 
 
 def _row_domain(meta):
@@ -85,8 +117,8 @@ def record_lessons(assets, project_id, issues, category="",
             else:
                 meta = raw or {}
         categories = dict(meta.get("categories") or {})
-        if category:
-            categories[category] = int(categories.get(category, 0)) + 1
+        for inferred in infer_lesson_categories(issue, category):
+            categories[inferred] = int(categories.get(inferred, 0)) + 1
         assets.register(
             project_id, "lesson", name,
             meta={
@@ -235,19 +267,55 @@ def _digest(text):
 
 
 def lesson_lines(assets, project_id, limit=MAX_INJECTED,
-                 domain=DOMAIN_IMAGE):
-    """只返回人工批准的项目规则；旧记录也默认不注入。"""
+                 domain=DOMAIN_IMAGE, categories=None, context=""):
+    """只返回人工批准且与当前任务相关的规则。
+
+    没有传上下文时保持旧行为；有上下文时优先类别命中和文字命中，
+    AI 归纳出的项目通用规则作为兜底。这样能利用真实失败经验，同时
+    避免把别的场景、别的角色或别的生成环节塞进当前提示词。
+    """
+    requested = {str(value).strip() for value in (categories or [])
+                 if str(value).strip()}
+    context_key = _normalize(context)
+    approved = [
+        item for item in project_lessons(
+            assets, project_id, limit=200, domain=domain)
+        if item.get("approved_for_prompt")
+        and item.get("status") == "approved"
+    ]
+    if not requested and not context_key:
+        chosen = approved[:limit]
+    else:
+        ranked = []
+        for item in approved:
+            item_categories = set((item.get("categories") or {}).keys())
+            category_hits = len(requested & item_categories)
+            issue_key = _normalize(item.get("issue"))
+            text_hit = bool(
+                issue_key and context_key
+                and (issue_key in context_key or context_key in issue_key))
+            general = item.get("scope") == DISTILLED_SCOPE
+            if not (category_hits or text_hit or general):
+                continue
+            score = (
+                category_hits * 1000
+                + int(text_hit) * 500
+                + int(general) * 50
+                + min(int(item.get("count") or 1), 49)
+            )
+            ranked.append((score, item))
+        ranked.sort(key=lambda row: -row[0])
+        chosen = [item for _score, item in ranked[:limit]]
     return [f"{item['issue']}(此前已出错{item['count']}次)"
-            for item in project_lessons(
-                assets, project_id, limit=50, domain=domain)
-            if item.get("approved_for_prompt")
-            and item.get("status") == "approved"][:limit]
+            for item in chosen]
 
 
 def lessons_block(assets, project_id, limit=MAX_INJECTED,
-                  domain=DOMAIN_IMAGE):
+                  domain=DOMAIN_IMAGE, categories=None, context=""):
     """拼接为提示词片段;没有教训时返回空串。"""
-    lines = lesson_lines(assets, project_id, limit=limit, domain=domain)
+    lines = lesson_lines(
+        assets, project_id, limit=limit, domain=domain,
+        categories=categories, context=context)
     if not lines:
         return ""
     return ("历史出错教训(本项目此前真实犯过的错误,本次严禁重犯,"
