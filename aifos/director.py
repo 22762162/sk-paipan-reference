@@ -17658,6 +17658,342 @@ class Director:
             raise AifosError(f"剧集不存在: 第{episode_number}集")
         return project, episode
 
+    def _shot_candidate_ctx(self, project_title, episode_number, shot_no):
+        """Build the minimum authoritative context for shot selection edits."""
+        project, episode = self._episode_ctx(project_title, episode_number)
+        try:
+            normalized_shot_no = int(shot_no)
+        except (TypeError, ValueError):
+            raise AifosError("shot_no 必须是有效镜头编号")
+        storyboard, _ = self.projects.latest_document(
+            episode["id"], "storyboard")
+        shot = next((
+            value for value in (storyboard or {}).get("shots", [])
+            if int(value.get("shot_no", -1)) == normalized_shot_no
+        ), None)
+        if shot is None:
+            raise AifosError(f"镜头不存在: {normalized_shot_no}")
+        script, _ = self.projects.latest_document(episode["id"], "script")
+        ctx = {
+            "project": dict(project),
+            "episode": dict(episode),
+            "out_root": self._episode_dir(project, episode),
+            "storyboard": storyboard or {"shots": []},
+            "script": script or {"scenes": [], "characters": []},
+        }
+        return ctx, shot
+
+    @staticmethod
+    def _candidate_selection_from_item(item):
+        group = (item or {}).get("candidate_group") or {}
+        selection = group.get("selection") or (item or {}).get("selection")
+        if not isinstance(group, dict) or not isinstance(selection, dict):
+            return None
+        candidates = group.get("candidates") or []
+        try:
+            current_version = CandidateSetVersion(**(group.get("version") or {}))
+            selected_index = int(selection.get("candidate_index") or 0)
+        except (TypeError, ValueError):
+            return None
+        candidate = next((
+            row for row in candidates
+            if int((row or {}).get("candidate_index") or 0) == selected_index
+        ), None)
+        if candidate is None:
+            return None
+        candidate_id = str(candidate.get("candidate_id") or "")
+        selected_uri = str(selection.get("selected_uri") or "")
+        if (str(selection.get("candidate_id") or "") != candidate_id
+                or selected_uri != str(candidate.get("uri") or "")):
+            return None
+        result = CandidateResultVersion(
+            candidate_set_token=str(
+                selection.get("candidate_set_token")
+                or selection.get("token") or ""),
+            candidate_index=selected_index,
+        )
+        decision = evaluate_candidate_promotion(
+            result, current_version,
+            selection_source=str(selection.get("source") or ""))
+        return selection if decision.allowed else None
+
+    def _shot_candidate_selection_summary(self, plan, shot_no=None):
+        """Summarize current candidate groups without trusting UI state."""
+        wanted = None if shot_no is None else int(shot_no)
+        rows = []
+        for item in plan.get("items") or []:
+            if item.get("category") != "shot_image":
+                continue
+            try:
+                current_shot = int(item.get("shot_no"))
+            except (TypeError, ValueError):
+                continue
+            if wanted is not None and current_shot != wanted:
+                continue
+            group = item.get("candidate_group") or {}
+            if not isinstance(group, dict) or not group:
+                continue
+            selection = self._candidate_selection_from_item(item)
+            complete = self._shot_candidate_group_valid(item)
+            technical_incomplete = bool(
+                group.get("technical_incomplete") is True
+                or not complete)
+            rows.append({
+                "shot_no": current_shot,
+                "status": item.get("status", "pending"),
+                "candidate_set_id": str(
+                    group.get("candidate_set_id") or ""),
+                "candidate_set_token": str(
+                    group.get("candidate_set_token") or ""),
+                "candidate_revision": int(
+                    group.get("candidate_revision") or 0),
+                "contract_revision": int(
+                    group.get("contract_revision") or 0),
+                "candidate_count": int(group.get("candidate_count") or 0),
+                "expected_count": int(group.get("expected_count") or 4),
+                "complete": bool(complete),
+                "technical_incomplete": technical_incomplete,
+                "selected": selection is not None,
+                "selection": copy.deepcopy(selection) if selection else None,
+            })
+        rows.sort(key=lambda value: value["shot_no"])
+        remaining = sum(1 for row in rows if not row["selected"])
+        all_selected = bool(rows) and remaining == 0
+        return {
+            "status": "done",
+            "total": len(rows),
+            "selected": len(rows) - remaining,
+            "remaining": remaining,
+            "all_selected": all_selected,
+            "need_resume": all_selected,
+            "items": rows,
+        }
+
+    def shot_candidate_selection_state(
+            self, project_title, episode_number, shot_no=None):
+        """Return the authoritative selection progress for one episode."""
+        project, episode = self._episode_ctx(project_title, episode_number)
+        ctx = {"project": dict(project), "episode": dict(episode),
+               "out_root": self._episode_dir(project, episode)}
+        with _PLAN_IO_LOCK:
+            plan = self._plan_read(ctx)
+            state = self._shot_candidate_selection_summary(plan, shot_no)
+            if shot_no is not None and not state["items"]:
+                raise AifosError(
+                    f"镜头{int(shot_no)}尚无可选择的四图候选组")
+            return state
+
+    def select_shot_candidate(
+            self, project_title, episode_number, shot_no,
+            expected_candidate_set_id, expected_candidate_set_token,
+            expected_candidate_revision, candidate_id, candidate_index,
+            source="manual"):
+        """CAS-promote one current candidate into the formal image chain.
+
+        The URI is always resolved from ``render_plan.json``.  A browser may
+        identify a candidate, but it can never submit a file path to promote.
+        """
+        source = str(source or "").strip().lower()
+        if source not in ("manual", "ai"):
+            raise AifosError("候选只能由 manual 或 ai 明确选中")
+        try:
+            normalized_index = int(candidate_index)
+            normalized_revision = int(expected_candidate_revision)
+        except (TypeError, ValueError):
+            raise AifosError("stale_candidate_set: 候选序号或版本无效")
+        expected_id = str(expected_candidate_set_id or "").strip()
+        expected_token = str(expected_candidate_set_token or "").strip()
+        requested_candidate_id = str(candidate_id or "").strip()
+        ctx, shot = self._shot_candidate_ctx(
+            project_title, episode_number, shot_no)
+        item_id = f"shot:{int(shot['shot_no'])}"
+
+        with _PLAN_IO_LOCK:
+            plan = self._plan_read(ctx)
+            item = next((
+                row for row in plan.get("items") or []
+                if row.get("id") == item_id
+                and row.get("category") == "shot_image"
+            ), None)
+            if item is None:
+                raise AifosError(
+                    "stale_candidate_set: 当前镜头候选组不存在，请刷新")
+            group = item.get("candidate_group") or {}
+            actual_id = str(group.get("candidate_set_id") or "")
+            actual_token = str(group.get("candidate_set_token") or "")
+            try:
+                actual_revision = int(group.get("candidate_revision") or 0)
+            except (TypeError, ValueError):
+                actual_revision = 0
+            if (not expected_id or not expected_token
+                    or expected_id != actual_id
+                    or expected_token != actual_token
+                    or normalized_revision != actual_revision):
+                raise AifosError(
+                    "stale_candidate_set: 候选组已更新，请刷新后重新选择")
+            if not self._shot_candidate_group_valid(item):
+                raise AifosError(
+                    "candidate_group_incomplete: 四张候选尚未全部技术完成，"
+                    "当前不能选片")
+            previous = self._candidate_selection_from_item(item)
+            if previous is not None:
+                same = bool(
+                    str(previous.get("candidate_id") or "")
+                    == requested_candidate_id
+                    and int(previous.get("candidate_index") or 0)
+                    == normalized_index)
+                if not same:
+                    raise AifosError(
+                        "selection_conflict: 本候选组已经选定另一张图片，"
+                        "请刷新后再操作")
+                row = self.assets.latest(
+                    ctx["project"]["id"], "image",
+                    self._shot_name(ctx, int(shot["shot_no"])))
+                if row is None:
+                    raise AifosError(
+                        "selection_asset_conflict: 选片记录存在但正式资产缺失，"
+                        "请从断点执行资产对账")
+                meta = self._asset_meta(row)
+                if (str(meta.get("candidate_set_token") or "")
+                        != actual_token
+                        or str(meta.get("candidate_id") or "")
+                        != requested_candidate_id):
+                    raise AifosError(
+                        "selection_asset_conflict: 正式资产已被其他修订替换，"
+                        "请刷新后再操作")
+                summary = self._shot_candidate_selection_summary(plan)
+                return {
+                    "status": "selected",
+                    "shot_no": int(shot["shot_no"]),
+                    "candidate_set_id": actual_id,
+                    "candidate_set_token": actual_token,
+                    "candidate_revision": actual_revision,
+                    "candidate_id": requested_candidate_id,
+                    "candidate_index": normalized_index,
+                    "selected_uri": str(previous.get("selected_uri") or ""),
+                    "source": str(previous.get("source") or source),
+                    "asset_id": row["id"], "asset_version": row["version"],
+                    "already_selected": True,
+                    "remaining": summary["remaining"],
+                    "all_selected": summary["all_selected"],
+                    "need_resume": summary["need_resume"],
+                    "last_pending": False,
+                }
+
+            candidate = next((
+                row for row in group.get("candidates") or []
+                if int((row or {}).get("candidate_index") or 0)
+                == normalized_index
+            ), None)
+            if (candidate is None
+                    or str(candidate.get("candidate_id") or "")
+                    != requested_candidate_id):
+                raise AifosError(
+                    "stale_candidate_set: 候选不属于当前四图组，请刷新")
+            result_version = CandidateResultVersion(
+                candidate_set_token=str(
+                    candidate.get("candidate_set_token") or ""),
+                candidate_index=normalized_index)
+            try:
+                current_version = CandidateSetVersion(**(
+                    group.get("version") or {}))
+            except TypeError:
+                raise AifosError(
+                    "stale_candidate_set: 当前候选版本损坏，请重新生成候选")
+            decision = evaluate_candidate_promotion(
+                result_version, current_version, selection_source=source)
+            if not decision.allowed:
+                marker = "stale_candidate_set" if decision.stale \
+                    else "candidate_promotion_denied"
+                raise AifosError(f"{marker}: {decision.reason}")
+            selected_uri = str(candidate.get("uri") or "")
+            if (not selected_uri
+                    or (not selected_uri.startswith(("http://", "https://"))
+                        and not Path(selected_uri).is_file())):
+                raise AifosError(
+                    "candidate_group_incomplete: 所选候选文件不存在，不能晋升")
+
+            before = self._shot_candidate_selection_summary(plan)
+            quality = {
+                "level": item.get("image_quality") or "medium",
+                "recommended": item.get("recommended_quality")
+                or item.get("image_quality") or "medium",
+                "source": item.get("quality_source") or "candidate_selection",
+                "rule": item.get("quality_rule") or "",
+                "reasons": list(item.get("quality_reasons") or []),
+            }
+            asset_name = self._shot_name(ctx, int(shot["shot_no"]))
+            latest = self.assets.latest(
+                ctx["project"]["id"], "image", asset_name)
+            latest_meta = self._asset_meta(latest)
+            if (latest is not None
+                    and str(latest_meta.get("candidate_set_token") or "")
+                    == actual_token
+                    and str(latest_meta.get("candidate_id") or "")
+                    == requested_candidate_id):
+                asset = latest
+            else:
+                asset = self.assets.register(
+                    ctx["project"]["id"], "image", asset_name,
+                    uri=selected_uri,
+                    meta=self._shot_image_meta(ctx, shot, quality, {
+                        "selected_from_candidate_group": True,
+                        "candidate_set_id": actual_id,
+                        "candidate_set_token": actual_token,
+                        "candidate_revision": actual_revision,
+                        "contract_revision": int(
+                            group.get("contract_revision") or 0),
+                        "candidate_id": requested_candidate_id,
+                        "candidate_index": normalized_index,
+                        "candidate_seed": candidate.get("candidate_seed"),
+                        "selection_source": source,
+                        "selected_at": now(),
+                    }),
+                    new_version=latest is not None)
+            selection = {
+                "candidate_set_id": actual_id,
+                "candidate_set_token": actual_token,
+                "token": actual_token,
+                "candidate_revision": actual_revision,
+                "candidate_id": requested_candidate_id,
+                "candidate_index": normalized_index,
+                "candidate_seed": candidate.get("candidate_seed"),
+                "selected_uri": selected_uri,
+                "source": source,
+                "selected_at": now(),
+                "asset_id": asset["id"],
+                "asset_version": asset["version"],
+            }
+            group["selection"] = copy.deepcopy(selection)
+            item["candidate_group"] = group
+            item["selection"] = copy.deepcopy(selection)
+            item["status"] = "done"
+            item["output_uri"] = selected_uri
+            item["selection_required"] = False
+            item["technical_incomplete"] = False
+            item["error"] = ""
+            item["finished_at"] = round(time.time(), 1)
+            self._plan_write(ctx, plan)
+            summary = self._shot_candidate_selection_summary(plan)
+            last_pending = before["remaining"] == 1
+            return {
+                "status": "selected",
+                "shot_no": int(shot["shot_no"]),
+                "candidate_set_id": actual_id,
+                "candidate_set_token": actual_token,
+                "candidate_revision": actual_revision,
+                "candidate_id": requested_candidate_id,
+                "candidate_index": normalized_index,
+                "selected_uri": selected_uri,
+                "source": source,
+                "asset_id": asset["id"], "asset_version": asset["version"],
+                "already_selected": False,
+                "remaining": summary["remaining"],
+                "all_selected": summary["all_selected"],
+                "need_resume": summary["need_resume"],
+                "last_pending": last_pending,
+            }
+
     def _invalidate_cast_assets(self, project, script, reason,
                                 character_name="", prop_name="",
                                 invalidate_scenes=False):
