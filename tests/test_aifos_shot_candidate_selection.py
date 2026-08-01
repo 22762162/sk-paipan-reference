@@ -3,6 +3,7 @@
 import copy
 import json
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -231,3 +232,161 @@ def test_technical_incomplete_group_cannot_be_selected(app, tmp_path):
     assert state["remaining"] == 1
     assert state["items"][0]["technical_incomplete"] is True
 
+
+def test_regenerate_requires_confirmation_and_rejects_old_cas(app, tmp_path):
+    _project, _episode, _ctx, groups = _seed_episode(app, tmp_path)
+    group = groups[1]
+    with pytest.raises(AifosError, match="再次确认"):
+        app.director.regenerate_shot_candidates(
+            "四图选片测试", 1, 1,
+            group["candidate_set_id"], group["candidate_set_token"],
+            group["candidate_revision"], "新的完整精准镜头提示词",
+            confirm=False)
+    with pytest.raises(AifosError, match="stale_candidate_set"):
+        app.director.regenerate_shot_candidates(
+            "四图选片测试", 1, 1,
+            "old-id", group["candidate_set_token"],
+            group["candidate_revision"], "新的完整精准镜头提示词",
+            confirm=True)
+
+
+def test_regenerate_archives_group_keeps_files_and_invalidates_formal_chain(
+        app, tmp_path):
+    project, _episode, ctx, groups = _seed_episode(app, tmp_path)
+    old_group = groups[1]
+    selected = _select(app, old_group, candidate_index=4)
+    original_candidate_files = [
+        row["uri"] for row in old_group["candidates"]]
+    asset_name = "e001_shot001"
+    for kind in ("first_frame", "last_frame", "video"):
+        path = tmp_path / f"old-{kind}.bin"
+        path.write_bytes(kind.encode())
+        app.assets.register(
+            project["id"], kind, asset_name, uri=str(path),
+            meta={"old_chain": True})
+    for kind, name in (
+            ("edit", "e001_final"),
+            ("review_board", "e001"),
+            ("clip", "e001_scene01")):
+        path = tmp_path / f"old-{kind}.bin"
+        path.write_bytes(kind.encode())
+        app.assets.register(project["id"], kind, name, uri=str(path))
+
+    result = app.director.regenerate_shot_candidates(
+        "四图选片测试", 1, 1,
+        old_group["candidate_set_id"], old_group["candidate_set_token"],
+        old_group["candidate_revision"],
+        "镜头1新完整提示词：沈砚在书房查看案卷，固定机位与空间关系",
+        confirm=True)
+
+    assert result["status"] == "regenerating_candidates"
+    assert result["candidate_set_id"] != old_group["candidate_set_id"]
+    assert result["candidate_set_token"] == ""
+    assert result["candidate_revision"] == 8
+    assert result["contract_revision"] == 4
+    assert result["history_count"] == 1
+    assert result["need_resume"] is True
+    assert all(Path(uri).is_file() for uri in original_candidate_files)
+    plan = app.director._plan_read(ctx)
+    item = next(row for row in plan["items"] if row["id"] == "shot:1")
+    assert item["status"] == "pending"
+    assert item["candidate_generation_status"] == "regenerating_candidates"
+    assert item["candidate_group"]["candidate_set_id"] \
+        == result["candidate_set_id"]
+    assert item["candidate_group"]["candidate_count"] == 0
+    assert item["candidate_group"]["candidate_revision"] == 8
+    assert item["candidate_group"]["contract_revision"] == 4
+    assert item["custom_prompt"] is True
+    assert item["prompt"].startswith("镜头1新完整提示词")
+    assert "selection" not in item
+    assert "output_uri" not in item
+    assert "qc" not in item
+    archived = item["candidate_group_history"][0]
+    assert archived["candidate_set_token"] == old_group["candidate_set_token"]
+    assert archived["selection"]["candidate_seed"] == 1014
+    assert archived["render_qc"]["passed"] is False
+    for kind in ("image", "first_frame", "last_frame", "video"):
+        assert app.assets.latest(project["id"], kind, asset_name) is None
+    assert app.assets.latest(project["id"], "edit", "e001_final") is None
+    assert app.assets.latest(project["id"], "review_board", "e001") is None
+    assert app.assets.latest(project["id"], "clip", "e001_scene01") is None
+    assert len(app.assets.history(
+        project["id"], "image", asset_name)) == 2
+    assert selected["asset_version"] == 1
+
+    # A duplicate browser action carrying the retired identity cannot enqueue
+    # another revision or archive the same group twice.
+    with pytest.raises(AifosError, match="stale_candidate_set"):
+        app.director.regenerate_shot_candidates(
+            "四图选片测试", 1, 1,
+            old_group["candidate_set_id"], old_group["candidate_set_token"],
+            old_group["candidate_revision"], "重复提交不应生效", confirm=True)
+
+
+def test_new_group_after_regeneration_promotes_new_asset_version(app, tmp_path):
+    project, episode, ctx, groups = _seed_episode(app, tmp_path)
+    old_group = groups[1]
+    _select(app, old_group, candidate_index=1)
+    regenerated = app.director.regenerate_shot_candidates(
+        "四图选片测试", 1, 1,
+        old_group["candidate_set_id"], old_group["candidate_set_token"],
+        old_group["candidate_revision"], "重生后完整提示词", confirm=True)
+
+    version = build_candidate_set_version(
+        episode_id=str(episode["id"]), shot_no=1,
+        contract_revision=regenerated["contract_revision"],
+        candidate_revision=regenerated["candidate_revision"],
+        prompt="重生后完整提示词", reference_manifest=[])
+    candidates = []
+    for index in range(1, 5):
+        uri = tmp_path / f"new-candidate-{index}.png"
+        uri.write_bytes(f"new-{index}".encode())
+        candidates.append({
+            "candidate_index": index,
+            "candidate_id": f"{version.token}#{index}",
+            "candidate_set_token": version.token,
+            "candidate_seed": 2000 + index,
+            "uri": str(uri),
+            "prompt_hash": version.prompt_digest,
+            "reference_hash": version.reference_digest,
+        })
+    plan = app.director._plan_read(ctx)
+    item = next(row for row in plan["items"] if row["id"] == "shot:1")
+    item["status"] = "awaiting_selection"
+    item["candidate_group"].update({
+        "version": {
+            "schema": version.schema,
+            "episode_id": version.episode_id,
+            "shot_no": version.shot_no,
+            "contract_revision": version.contract_revision,
+            "candidate_revision": version.candidate_revision,
+            "prompt_digest": version.prompt_digest,
+            "reference_digest": version.reference_digest,
+            "token": version.token,
+        },
+        "candidate_set_token": version.token,
+        "candidate_count": 4,
+        "complete": True,
+        "technical_incomplete": False,
+        "same_prompt": True,
+        "same_references": True,
+        "candidates": candidates,
+    })
+    app.director._plan_write(ctx, plan)
+
+    result = app.director.select_shot_candidate(
+        "四图选片测试", 1, 1,
+        regenerated["candidate_set_id"], version.token,
+        regenerated["candidate_revision"], candidates[1]["candidate_id"],
+        2, source="manual")
+
+    assert result["asset_version"] == 3  # v1 old, v2 tombstone, v3 selected
+    assert result["selected_uri"] == candidates[1]["uri"]
+    assert len(app.assets.history(
+        project["id"], "image", "e001_shot001")) == 3
+    final_plan = app.director._plan_read(ctx)
+    final_item = next(
+        row for row in final_plan["items"] if row["id"] == "shot:1")
+    assert final_item["candidate_group_history"][0][
+        "candidate_set_token"] == old_group["candidate_set_token"]
+    assert final_item["selection"]["candidate_seed"] == 2002

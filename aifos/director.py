@@ -3465,7 +3465,9 @@ class Director:
                             "candidate_group", "candidate_uris",
                             "candidate_count", "candidate_set_token",
                             "candidate_revision", "selection",
-                            "selection_required", "technical_incomplete"):
+                            "selection_required", "technical_incomplete",
+                            "candidate_group_history",
+                            "candidate_generation_status"):
                     if key in prev:
                         item[key] = prev[key]
                 if prev.get("custom_prompt"):
@@ -13526,6 +13528,29 @@ class Director:
             payload["_episode_id"] = ctx["episode"]["id"]
             payload["_candidate_revision"] = max(
                 1, prior_candidate_revision + 1)
+            pending_candidate_regeneration = bool(
+                stored_prior.get("candidate_generation_status")
+                == "regenerating_candidates"
+                and isinstance(prior_group, dict)
+                and prior_group.get("candidate_set_id")
+                and not (prior_group.get("candidates") or []))
+            if pending_candidate_regeneration:
+                custom_prompt = str(stored_prior.get("prompt") or "").strip()
+                if not custom_prompt:
+                    raise AifosError(
+                        f"镜头{shot['shot_no']}候选重生缺少完整自定义提示词")
+                payload.update({
+                    "prompt": custom_prompt,
+                    "prompt_compact": custom_prompt,
+                    "action": custom_prompt,
+                    "seedance_prompt": custom_prompt,
+                    "_reference_prompt_base": custom_prompt,
+                    "_candidate_set_id": prior_group["candidate_set_id"],
+                    "_candidate_revision": max(
+                        1, int(prior_group.get("candidate_revision") or 1)),
+                    "_contract_revision": max(
+                        1, int(prior_group.get("contract_revision") or 1)),
+                })
             if (stored_prior.get("status") == "technical_incomplete"
                     and isinstance(prior_group, dict)
                     and prior_group.get("candidate_set_id")):
@@ -17992,6 +18017,203 @@ class Director:
                 "all_selected": summary["all_selected"],
                 "need_resume": summary["need_resume"],
                 "last_pending": last_pending,
+            }
+
+    def regenerate_shot_candidates(
+            self, project_title, episode_number, shot_no,
+            expected_candidate_set_id, expected_candidate_set_token,
+            expected_candidate_revision, prompt, confirm=False):
+        """Retire one four-image set and queue a fresh four-image revision.
+
+        This method deliberately does not call an image provider.  It commits
+        a CAS-protected pending group which the normal production worker can
+        resume, preserving one owner for generation, billing and cancellation.
+        Candidate files are historical evidence and are never deleted here.
+        """
+        if confirm is not True:
+            raise AifosError("全部重生成候选需要再次确认(confirm=true)")
+        full_prompt = str(prompt or "").strip()
+        if not full_prompt:
+            raise AifosError("新的完整镜头提示词不能为空")
+        try:
+            normalized_revision = int(expected_candidate_revision)
+        except (TypeError, ValueError):
+            raise AifosError("stale_candidate_set: 候选版本无效")
+        expected_id = str(expected_candidate_set_id or "").strip()
+        expected_token = str(expected_candidate_set_token or "").strip()
+        ctx, shot = self._shot_candidate_ctx(
+            project_title, episode_number, shot_no)
+        shot_no = int(shot["shot_no"])
+        item_id = f"shot:{shot_no}"
+
+        with _PLAN_IO_LOCK:
+            plan = self._plan_read(ctx)
+            item = next((
+                row for row in plan.get("items") or []
+                if row.get("id") == item_id
+                and row.get("category") == "shot_image"
+            ), None)
+            if item is None:
+                raise AifosError(
+                    "stale_candidate_set: 当前镜头候选组不存在，请刷新")
+            if item.get("status") in ("generating", "retrying"):
+                raise AifosError(
+                    "candidate_set_busy: 当前候选仍在生成，请待状态稳定后重试")
+            old_group = item.get("candidate_group") or {}
+            actual_id = str(old_group.get("candidate_set_id") or "")
+            actual_token = str(old_group.get("candidate_set_token") or "")
+            try:
+                old_candidate_revision = int(
+                    old_group.get("candidate_revision") or 0)
+                old_contract_revision = int(
+                    old_group.get("contract_revision")
+                    or (old_group.get("version") or {}).get(
+                        "contract_revision") or 0)
+            except (TypeError, ValueError, AttributeError):
+                old_candidate_revision = 0
+                old_contract_revision = 0
+            if (not expected_id or not expected_token
+                    or expected_id != actual_id
+                    or expected_token != actual_token
+                    or normalized_revision != old_candidate_revision):
+                raise AifosError(
+                    "stale_candidate_set: 候选组已更新，请刷新后再全部重生成")
+
+            new_candidate_revision = max(1, old_candidate_revision + 1)
+            new_contract_revision = max(1, old_contract_revision + 1)
+            candidate_set_id = hashlib.sha256(
+                (f"{ctx['episode']['id']}:{shot_no}:"
+                 f"{new_contract_revision}:{new_candidate_revision}:"
+                 f"{full_prompt}:{time.time_ns()}").encode("utf-8")
+            ).hexdigest()[:16]
+            history = list(item.get("candidate_group_history") or [])
+            retired = copy.deepcopy(old_group)
+            retired.update({
+                "retired_at": now(),
+                "retired_reason": "user_regenerate_all_candidates",
+                "replaced_by_candidate_set_id": candidate_set_id,
+                "render_qc": copy.deepcopy(item.get("qc")),
+            })
+            history.append(retired)
+            pending_group = {
+                "schema": "aifos.shot-candidate-group/v1",
+                "version": {},
+                "candidate_set_id": candidate_set_id,
+                "candidate_set_token": "",
+                "contract_revision": new_contract_revision,
+                "candidate_revision": new_candidate_revision,
+                "candidate_count": 0,
+                "expected_count": 4,
+                "selection_required": True,
+                "complete": False,
+                "technical_incomplete": False,
+                "candidate_errors": [],
+                "candidates": [],
+                "generation_status": "regenerating_candidates",
+                "requested_at": now(),
+                "prompt_hash": self._stable_hash(full_prompt),
+            }
+
+            # Invalidate the formal chain before publishing the new pending
+            # plan.  If an asset operation fails, the old CAS identity remains
+            # retryable and no half-published candidate revision is visible.
+            project_id = ctx["project"]["id"]
+            episode_id = ctx["episode"]["id"]
+            asset_name = self._shot_name(ctx, shot_no)
+            old_image = self.assets.latest(project_id, "image", asset_name)
+            referenced_video_shots = self._sync_revised_video_references(
+                episode_id, project_id,
+                old_image["id"] if old_image is not None else None,
+                None, usable=False)
+            invalidated_assets = []
+
+            def invalidate(kind, name, *, reason_shot=shot_no):
+                if self.assets.latest(project_id, kind, name) is None:
+                    return
+                self.assets.soft_delete(
+                    project_id, kind, name,
+                    meta={
+                        "invalidated_by_candidate_regeneration": reason_shot,
+                        "retired_candidate_set_id": actual_id,
+                        "retired_candidate_set_token": actual_token,
+                    })
+                invalidated_assets.append({"kind": kind, "name": name})
+
+            invalidate("image", asset_name)
+            scene_shots = [
+                candidate for candidate in ctx["storyboard"].get("shots", [])
+                if int(candidate.get("scene_no") or 0)
+                == int(shot.get("scene_no") or 0)
+                and int(candidate.get("shot_no") or 0) >= shot_no
+            ]
+            frame_affected = []
+            for candidate in scene_shots:
+                current_no = int(candidate["shot_no"])
+                current_name = self._shot_name(ctx, current_no)
+                has_frames = bool(
+                    self.assets.latest(project_id, "first_frame", current_name)
+                    or self.assets.latest(
+                        project_id, "last_frame", current_name))
+                if not has_frames:
+                    if current_no != shot_no:
+                        break
+                else:
+                    invalidate("first_frame", current_name)
+                    invalidate("last_frame", current_name)
+                    frame_affected.append(current_no)
+            affected_shots = sorted({
+                shot_no, *frame_affected, *referenced_video_shots})
+            for affected_no in affected_shots:
+                invalidate(
+                    "video", self._shot_name(ctx, affected_no),
+                    reason_shot=shot_no)
+            delivery = self._invalidate_revised_delivery(
+                ctx, shot, formal_ready=False,
+                affected_shots=affected_shots,
+                source_kind="shot_candidates")
+
+            item["candidate_group_history"] = history
+            item["candidate_group"] = pending_group
+            item["candidate_uris"] = []
+            item["candidate_count"] = 0
+            item["candidate_set_token"] = ""
+            item["candidate_revision"] = new_candidate_revision
+            item["selection_required"] = True
+            item["technical_incomplete"] = False
+            item["candidate_generation_status"] = \
+                "regenerating_candidates"
+            item["status"] = "pending"
+            item["error"] = ""
+            item["prompt"] = full_prompt
+            item["custom_prompt"] = True
+            item["prompt_used"] = full_prompt
+            item["prompt_used_hash"] = self._stable_hash(full_prompt)
+            item["prompt_aifos_original"] = full_prompt
+            item.pop("prompt_optimized", None)
+            item.pop("prompt_review", None)
+            item.pop("selection", None)
+            item.pop("output_uri", None)
+            item.pop("qc", None)
+            item.pop("started_at", None)
+            item.pop("finished_at", None)
+            item.pop("duration", None)
+            self._plan_write(ctx, plan)
+            state = self._shot_candidate_selection_summary(plan)
+            return {
+                "status": "regenerating_candidates",
+                "shot_no": shot_no,
+                "candidate_set_id": candidate_set_id,
+                "candidate_set_token": "",
+                "candidate_revision": new_candidate_revision,
+                "contract_revision": new_contract_revision,
+                "history_count": len(history),
+                "remaining": state["remaining"],
+                "all_selected": False,
+                "need_resume": True,
+                "invalidated_assets": invalidated_assets,
+                "invalidated_outputs": delivery.get(
+                    "invalidated_outputs") or [],
+                "affected_shots": affected_shots,
             }
 
     def _invalidate_cast_assets(self, project, script, reason,
