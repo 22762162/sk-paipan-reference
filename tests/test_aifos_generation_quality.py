@@ -145,6 +145,35 @@ def test_explicit_cross_era_story_basis_allows_modern_prop():
     }) == ()
 
 
+def test_sanctioned_cross_era_item_does_not_waive_other_modern_props():
+    issues = preflight_shot_contract({
+        "shot_no": 3,
+        "era_context": "明代京城",
+        "props": ["主角随身智能手机", "无剧情依据的笔记本电脑"],
+        "sanctioned_anachronisms": ["主角随身的智能手机"],
+    })
+
+    assert [issue.code for issue in issues] == [
+        "era.modern_prop_in_ancient_scene"]
+    assert "笔记本电脑" in issues[0].message
+    assert "智能手机" not in issues[0].message
+
+
+def test_declared_spatial_and_physical_contracts_must_be_present():
+    issues = preflight_shot_contract({
+        "shot_no": 12,
+        "spatial_required": True,
+        "spatial_blocking": {"actors": [{"name": "甲"}]},
+        "physical_contract_required": True,
+        "physical_contract": {"rules": []},
+    })
+
+    assert {issue.code for issue in issues} == {
+        "spatial.required_contract_missing",
+        "physics.required_contract_missing",
+    }
+
+
 def test_reference_must_have_one_non_conflicting_responsibility():
     issues = preflight_shot_contract({
         "shot_no": 4,

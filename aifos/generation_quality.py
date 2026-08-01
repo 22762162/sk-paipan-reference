@@ -450,15 +450,26 @@ def _prop_names(value: Any) -> list[str]:
 
 
 def _era_prop_issues(shot: Mapping[str, Any], shot_id: str) -> list[BlockingIssue]:
-    era = str(shot.get("era") or shot.get("period") or "").strip().lower()
+    era = str(
+        shot.get("era") or shot.get("period")
+        or shot.get("era_context") or "").strip().lower()
     if not era or not any(token in era for token in _ANCIENT_ERAS):
         return []
     if bool(shot.get("allow_anachronism") or shot.get("cross_era_prop_allowed")):
         return []
-    haystack = " ".join(_prop_names(shot.get("props")))
-    if not haystack:
-        haystack = _prompt_text(shot)
-    conflicts = [prop for prop in _MODERN_PROPS if prop in haystack]
+    # A declared prop list is authoritative but not exhaustive: the authored
+    # main action may still mention an undeclared object. Check both instead
+    # of letting any one valid prop hide an unrelated anachronism in prose.
+    haystack = " ".join([
+        *_prop_names(shot.get("props")),
+        _prompt_text(shot),
+    ])
+    sanctioned = " ".join(_prop_names(
+        shot.get("sanctioned_anachronisms")))
+    conflicts = [
+        prop for prop in _MODERN_PROPS
+        if prop in haystack and prop not in sanctioned
+    ]
     if not conflicts:
         return []
     return [_issue(
@@ -468,6 +479,43 @@ def _era_prop_issues(shot: Mapping[str, Any], shot_id: str) -> list[BlockingIssu
         "古代镜头含现代道具：" + "、".join(conflicts[:3])
         + "；删除或显式标记跨时代剧情依据。",
     )]
+
+
+def _physical_spatial_issues(
+        shot: Mapping[str, Any], shot_id: str,
+) -> list[BlockingIssue]:
+    """Require the authored physical/spatial inputs only when declared.
+
+    This is a presence/validity check, not an aesthetic judge.  It therefore
+    cannot reject a shot merely because a blocking map is optional.
+    """
+    issues = []
+    spatial = shot.get("spatial_blocking")
+    spatial = spatial if isinstance(spatial, Mapping) else {}
+    if shot.get("spatial_required"):
+        spatial_ref = str(
+            shot.get("spatial_ref")
+            or spatial.get("spatial_reference_uri") or "").strip()
+        if not spatial or not spatial_ref:
+            issues.append(_issue(
+                shot_id,
+                "spatial.required_contract_missing",
+                "spatial_logic",
+                "本镜要求空间调度，但缺少空间合同或空间参考图。",
+            ))
+    if shot.get("physical_contract_required"):
+        physical = shot.get("physical_contract")
+        physical = physical if isinstance(physical, Mapping) else {}
+        rules = physical.get("rules")
+        if not isinstance(rules, (list, tuple)) or not any(
+                str(rule or "").strip() for rule in rules):
+            issues.append(_issue(
+                shot_id,
+                "physics.required_contract_missing",
+                "prop_physics",
+                "本镜含道具或空间运动，但缺少可执行物理合同。",
+            ))
+    return issues
 
 
 def _reference_rows(shot: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -655,6 +703,7 @@ def preflight_shot_contract(shot: Any) -> tuple[BlockingIssue, ...]:
     issues.extend(_camera_issues(shot, shot_id))
     issues.extend(_people_count_issue(shot, shot_id))
     issues.extend(_era_prop_issues(shot, shot_id))
+    issues.extend(_physical_spatial_issues(shot, shot_id))
     issues.extend(_reference_conflict_issues(shot, shot_id))
     issues.extend(_reference_budget_issues(shot, shot_id))
     issues.extend(_motion_contract_issues(shot, shot_id))

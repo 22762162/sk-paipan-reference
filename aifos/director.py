@@ -32,6 +32,12 @@ from .generation_diagnostics import (
     retry_input_decision,
     targeted_prompt_patch,
 )
+from .generation_quality import (
+    evaluate_post_generation,
+    infer_quality_categories,
+    preflight_shot_contract,
+    quality_rule_lines,
+)
 from .image_acceleration import ImageAccelerationStore
 from .identity_facts import unresolved_identity_fields
 from .quality_policy import (
@@ -60,7 +66,8 @@ from .prompt_contract import (
 )
 from .qc_feedback import optimize_qc_feedback
 from .lessons import (DISTILL_MIN_PENDING, DOMAIN_IMAGE, DOMAIN_SCRIPT,
-                      adopt_distilled_rules, lessons_block,
+                      DOMAIN_VIDEO, adopt_distilled_rules,
+                      infer_lesson_categories, lesson_lines,
                       pending_observations, project_lessons, record_lessons,
                       script_lessons_block)
 from .qc_stats import record_qc
@@ -970,6 +977,10 @@ class Director:
                 break
             if (stage == "images" and ctx.get("shot_selection_required")):
                 paused = "images"
+                break
+            if (stage == "videos"
+                    and ctx.get("video_contract_repair_required")):
+                paused = "videos"
                 break
             if pause_for_confirm and stage == CONFIRM_AFTER:
                 paused = "preflight"
@@ -10900,7 +10911,7 @@ class Director:
                 "prop_candidate_target": (
                     prop_selection["total"] * PROP_CANDIDATES),
                 "locked": selection["asset_locked"],
-                "awaiting_selection": bool(awaiting_selection),
+                "awaiting_selection": True,
                 "created": 0, "reused": 0, "scenes": 0,
             }
         ctx["cast_selection"] = selection
@@ -12471,10 +12482,6 @@ class Director:
         parts.append(
             "【NEGATIVE】禁止身份漂移、性别错误、人数错误、脸部融合、"
             "重复人物、错误服装、无关杂物、脏污皮肤、塑料脸、字幕和标签")
-        # 出错经验库:本项目此前真实犯过的错,逐条声明严禁再犯
-        lessons = lessons_block(self.assets, ctx["project"]["id"])
-        if lessons:
-            parts.append("【LESSONS·严禁再犯】" + lessons)
         return "\n".join(p for p in parts if p)
 
 
@@ -12777,6 +12784,10 @@ class Director:
         payload["prompt_contract_validation"] = (
             validate_shot_prompt_contract(
                 payload.get("prompt_contract") or {}))
+        self._append_generation_rules(
+            payload,
+            self._generation_rule_lines(
+                ctx, shot, payload, modality="image"))
         return payload
 
     def _reference_manifest(self, payload):
@@ -13084,6 +13095,303 @@ class Director:
         """便捷包装:附上参考图对照表后原样返回 payload。"""
         self._attach_reference_manifest(payload)
         return payload
+
+    _QUALITY_TO_LESSON_CATEGORIES = {
+        "identity": ("identity",),
+        "gender_age": ("identity",),
+        "count": ("people_count",),
+        "wardrobe": ("wardrobe",),
+        "era": ("era",),
+        "text": ("text",),
+        "camera_contract": ("camera",),
+        "spatial_logic": ("space", "camera"),
+        "prop_physics": ("prop", "physics", "motion"),
+        "lighting": ("lighting",),
+        "video_state_chain": ("motion", "physics"),
+        "video_camera_motion": ("camera", "motion"),
+        "video_identity_continuity": ("identity",),
+        "video_prop_state": ("prop", "physics", "motion"),
+        "reference_budget": ("identity", "prop", "scene"),
+        "audio_lipsync": ("audio",),
+    }
+
+    @staticmethod
+    def _quality_context(shot, payload, modality):
+        """Return only shot-local facts used to select concise rules.
+
+        Never rank rules against the full screenplay or the whole project
+        history.  That was the source of unrelated clauses leaking into image
+        prompts and competing with the actual camera/action contract.
+        """
+        shot = shot if isinstance(shot, dict) else {}
+        payload = payload if isinstance(payload, dict) else {}
+        return {
+            "modality": modality,
+            "characters": list(payload.get("characters") or
+                               shot.get("characters") or []),
+            "visible_figure_count": payload.get("visible_figure_count"),
+            "character_facts": payload.get("character_background") or {},
+            "era": payload.get("era_context") or shot.get("era_context")
+            or shot.get("era") or "",
+            "camera": payload.get("camera") or shot.get("camera") or
+            shot.get("shot_contract") or {},
+            "action": payload.get("action") or shot.get("description") or
+            shot.get("prompt") or "",
+            "start_state": payload.get("start_state") or
+            shot.get("start_state") or {},
+            "end_state": payload.get("end_state") or
+            shot.get("end_state") or {},
+            "readable_text": payload.get("readable_text") or
+            shot.get("readable_text") or {},
+            "physical_contract": payload.get("physical_contract") or {},
+            "spatial_blocking": payload.get("spatial_blocking") or {},
+            "references": payload.get("reference_manifest") or [],
+            "dialogue": payload.get("dialogue") or shot.get("dialogue") or {},
+        }
+
+    @staticmethod
+    def _contract_safe_copy(value):
+        """Copy JSON contract data without leaking sqlite3.Row/provider objects."""
+        if isinstance(value, dict):
+            return {
+                str(key): Director._contract_safe_copy(item)
+                for key, item in value.items()
+            }
+        if hasattr(value, "keys") and callable(value.keys):
+            return {
+                str(key): Director._contract_safe_copy(value[key])
+                for key in value.keys()
+            }
+        if isinstance(value, (list, tuple)):
+            return [Director._contract_safe_copy(item) for item in value]
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
+
+    def _generation_rule_lines(self, ctx, shot, payload, modality):
+        """Select at most five relevant built-in/project rules per request."""
+        context = self._quality_context(shot, payload, modality)
+        context_values = [
+            value for key, value in context.items() if key != "modality"]
+        categories = set(infer_quality_categories(
+            context_values, modality=modality))
+        if context["characters"]:
+            categories.update(("identity", "gender_age"))
+        if context["visible_figure_count"] is not None:
+            categories.add("count")
+        if context["era"]:
+            categories.add("era")
+        if context["camera"]:
+            categories.add("camera_contract")
+        if context["spatial_blocking"]:
+            categories.add("spatial_logic")
+        if context["physical_contract"]:
+            categories.add("prop_physics")
+        if context["references"]:
+            categories.add("reference_budget")
+        if modality == "video":
+            action = str(context.get("action") or "")
+            start_state = context.get("start_state") or {}
+            end_state = context.get("end_state") or {}
+            complex_action = bool(
+                shot.get("complex_action")
+                or str(shot.get("action_complexity") or "").lower()
+                in {"complex", "high", "复杂", "multi_stage", "multi-stage"}
+                or len(shot.get("action_steps") or []) >= 2)
+            if complex_action:
+                categories.add("video_state_chain")
+            camera_text = json.dumps(
+                context.get("camera") or {}, ensure_ascii=False,
+                default=str) + action
+            if any(token in camera_text for token in (
+                    "推镜", "拉镜", "摇镜", "跟拍", "环绕", "移动",
+                    "tracking", "pan", "dolly", "zoom")):
+                categories.add("video_camera_motion")
+            if context["characters"]:
+                categories.add("video_identity_continuity")
+            prop_text = json.dumps(
+                [start_state, end_state, context.get("physical_contract")],
+                ensure_ascii=False, default=str)
+            if any(token in prop_text for token in (
+                    "道具", "手持", "拿", "放", "递", "开合", "prop")):
+                categories.add("video_prop_state")
+            dialogue = context.get("dialogue")
+            has_dialogue = bool(
+                dialogue.get("dialogue") if isinstance(dialogue, dict)
+                else str(dialogue or "").strip())
+            if has_dialogue:
+                categories.add("audio_lipsync")
+
+        # Project history may reweight a rule that this shot already needs;
+        # it must never be the sole reason a new category enters an empty
+        # prompt contract.
+        if not categories:
+            return ()
+
+        lesson_categories = set()
+        for category in categories:
+            lesson_categories.update(
+                self._QUALITY_TO_LESSON_CATEGORIES.get(category, (category,)))
+        domain = DOMAIN_VIDEO if modality == "video" else DOMAIN_IMAGE
+        # Critical current-shot facts always win. Historical observations can
+        # fill unused positions, never evict action/physics/identity/count or
+        # camera constraints merely because they happened more often before.
+        output = []
+        if "video_state_chain" in categories:
+            output.extend(quality_rule_lines(
+                categories=["video_state_chain"], modality=modality, limit=1))
+        if "prop_physics" in categories:
+            output.extend(quality_rule_lines(
+                categories=["prop_physics"], modality=modality, limit=1))
+        if "spatial_logic" in categories:
+            output.extend(quality_rule_lines(
+                categories=["spatial_logic"], modality=modality, limit=1))
+        if {"identity", "count"} <= categories:
+            output.append(
+                "人脸发型妆造沿用锁定母图；人数严格等于镜头合同，不增人复制。")
+        else:
+            for category in ("identity", "count"):
+                if category in categories:
+                    output.extend(quality_rule_lines(
+                        categories=[category], modality=modality, limit=1))
+        if "camera_contract" in categories:
+            output.extend(quality_rule_lines(
+                categories=["camera_contract"], modality=modality, limit=1))
+        output = list(dict.fromkeys(output))[:5]
+
+        learned_candidates = lesson_lines(
+            self.assets, ctx["project"]["id"], limit=20,
+            domain=domain, categories=lesson_categories, context=context)
+        learned = [
+            line for line in learned_candidates
+            if (not lesson_categories
+                or lesson_categories.intersection(
+                    infer_lesson_categories(line)))
+        ]
+        output.extend(
+            f"历史验证：{line}" for line in learned[:5 - len(output)])
+        if len(output) < 5:
+            remaining = categories - {
+                "video_state_chain", "prop_physics", "spatial_logic",
+                "identity", "count", "camera_contract",
+            }
+            output.extend(quality_rule_lines(
+                categories=remaining, context=context_values,
+                modality=modality, limit=5 - len(output)))
+        return tuple(dict.fromkeys(output))[:5]
+
+    @staticmethod
+    def _append_generation_rules(payload, rules):
+        """Append one idempotent concise block to actual provider prompts."""
+        rules = [str(rule).strip() for rule in rules if str(rule).strip()][:5]
+        payload["generation_quality_rules"] = rules
+        if not rules:
+            return payload
+        marker = "【本镜质量规则·最多5条】"
+        block = marker + "\n" + "\n".join(
+            f"{index}. {rule}" for index, rule in enumerate(rules, 1))
+        for key in ("prompt", "prompt_compact"):
+            value = str(payload.get(key) or "").strip()
+            if marker not in value:
+                payload[key] = (value + "\n" + block).strip()
+        return payload
+
+    @staticmethod
+    def _generation_preflight_contract(shot, payload, modality):
+        """Adapt the real provider payload to the deterministic preflight."""
+        shot = shot if isinstance(shot, dict) else {}
+        payload = payload if isinstance(payload, dict) else {}
+        expected = payload.get("visible_figure_count")
+        visible = list(payload.get("characters") or shot.get("characters")
+                       or [])
+        functional = payload.get("functional_figures") or []
+        if expected is not None:
+            try:
+                missing = max(0, int(expected) - len(visible))
+            except (TypeError, ValueError):
+                missing = 0
+            visible.extend(
+                f"功能人物#{index}" for index in range(1, missing + 1))
+        manifest = []
+        for row in payload.get("reference_manifest") or []:
+            if not isinstance(row, dict):
+                continue
+            role = str(row.get("role") or row.get("kind") or
+                       "declared_binding").strip()
+            manifest.append({
+                **Director._contract_safe_copy(row),
+                "responsibilities": [role],
+                "target": row.get("character") or row.get("attach_to") or "",
+                "primary": bool(row.get("primary", role == "identity")),
+            })
+        prop_names = []
+        for row in payload.get("frame_props") or []:
+            if isinstance(row, dict):
+                name = row.get("name") or row.get("prop_name")
+                if name:
+                    prop_names.append(name)
+        physical = payload.get("physical_contract") or {}
+        spatial = payload.get("spatial_blocking") or {}
+        spatial_required = bool(
+            spatial.get("spatial_reference_required")
+            or spatial.get("requires_spatial_reference"))
+        tier = str(payload.get("video_model_tier") or "").lower()
+        model = "Seedance 2.5" if "2.5" in tier else (
+            "Seedance 2.0 Fast VIP" if modality == "video" else "image")
+        return {
+            "shot_no": payload.get("shot_no", shot.get("shot_no")),
+            # Motion checks must inspect only the authored main action.  The
+            # full compact contract contains start/end connective wording and
+            # would otherwise make every legitimate single action look like a
+            # multi-action prompt.
+            "prompt": payload.get("action") or shot.get("description")
+            or shot.get("prompt") or "",
+            "description": payload.get("action") or
+            shot.get("description") or "",
+            "camera_contract": (
+                shot.get("shot_contract") or
+                (shot.get("five_dimensions") or {}).get("camera_design") or
+                payload.get("camera") or {}),
+            "expected_people_count": expected,
+            "visible_characters": visible,
+            "era_context": payload.get("era_context") or
+            shot.get("era_context") or shot.get("era") or "",
+            "props": prop_names,
+            "sanctioned_anachronisms": payload.get(
+                "sanctioned_anachronisms") or [],
+            "references": manifest,
+            "total_reference_count": (
+                len(manifest) + (2 if modality == "video" else 0)),
+            "asset_reference_count": len(manifest),
+            "max_total_references": (
+                None if modality == "video" else IMAGE_REFERENCE_LIMIT),
+            "max_asset_references": (
+                None if modality == "video" else IMAGE_REFERENCE_LIMIT),
+            "model": model,
+            "spatial_required": spatial_required,
+            "spatial_blocking": spatial,
+            "spatial_ref": payload.get("spatial_ref") or "",
+            # Every storyboard shot, including an empty room, has gravity,
+            # support, occlusion and camera-space constraints. Mother assets
+            # do not use this adapter, so requiring the compact physical
+            # contract here is safe and deterministic.
+            "physical_contract_required": True,
+            "physical_contract": physical,
+            "single_action": bool(
+                shot.get("single_action") is True
+                or str(shot.get("action_mode") or "").lower()
+                in {"single", "single_action", "单动作", "单一动作"}),
+            "action_steps": Director._contract_safe_copy(
+                shot.get("action_steps") or []),
+            "states": [payload.get("start_state") or {},
+                       payload.get("end_state") or {}],
+            "action_complexity": shot.get("action_complexity") or "",
+            "complex_action": bool(shot.get("complex_action")),
+        }
+
+    def _generation_preflight_issues(self, shot, payload, modality):
+        return preflight_shot_contract(
+            self._generation_preflight_contract(shot, payload, modality))
 
     def _attach_reference_manifest(self, payload):
         """把参考图对照表写进 payload 与提示词(编号=实际提交顺序)。"""
@@ -13506,6 +13814,7 @@ class Director:
         skipped_awaiting = []
         awaiting_selection = []
         technical_incomplete = []
+        preflight_failures = []
         for shot in self._active_shots(ctx):
             scene_first = shot.get("scene_no") not in seen_scenes
             seen_scenes.add(shot.get("scene_no"))
@@ -13519,6 +13828,24 @@ class Director:
                 awaiting_selection.append(int(shot["shot_no"]))
                 continue
             payload = self._shot_payload(ctx, shot)
+            contract_issues = self._generation_preflight_issues(
+                shot, payload, modality="image")
+            if contract_issues:
+                reason = "；".join(
+                    issue.message for issue in contract_issues)
+                self._plan_mark(
+                    ctx, f"shot:{shot['shot_no']}",
+                    ("awaiting_contract"
+                     if self._selection_mode_enabled() else "failed"),
+                    error=("本镜生成前合同未通过，未调用生图模型："
+                           + reason))
+                preflight_failures.append((
+                    int(shot["shot_no"]), tuple(contract_issues)))
+                self.log.warn(
+                    "director",
+                    f"镜头{shot['shot_no']}生成前合同已隔离；"
+                    f"其余镜头继续并行：{reason[:500]}")
+                continue
             prior_group = stored_prior.get("candidate_group") or {}
             try:
                 prior_candidate_revision = int(
@@ -13711,6 +14038,27 @@ class Director:
         results, qc_failures = self._run_parallel(
             ctx, tasks, line="分镜画面",
             continue_on_qc_failure=True)
+        if qc_failures and self._selection_mode_enabled():
+            # Selection mode never turns a shot-local contract/content issue
+            # into an episode failure. Keep successful four-up sets, mark only
+            # the affected shot for contract repair (or technical refill), and
+            # pause at the image workbench for a precise resume.
+            for task, error in qc_failures:
+                shot_no = int(task["tag"])
+                reason = str(error)
+                if self._prompt_review_block_reason(error):
+                    self._plan_mark(
+                        ctx, task["item_id"], "awaiting_contract",
+                        error=("本镜提示词合同需修改；其他镜头不受影响："
+                               + reason[:900]))
+                    preflight_failures.append((shot_no, ()))
+                else:
+                    self._plan_mark(
+                        ctx, task["item_id"], "technical_incomplete",
+                        error=("本镜技术执行未完成；已保留其他镜头与候选："
+                               + reason[:900]))
+                    technical_incomplete.append(shot_no)
+            qc_failures = []
         for shot_no in sorted(results):
             result = results[shot_no]
             if self._candidate_group_technical_incomplete(result):
@@ -13736,17 +14084,17 @@ class Director:
                 "已停止进入下游；需要由 AIFOS 自动修复器重建状态。镜头: "
                 + "、".join(str(value) for value in skipped_awaiting))
         if qc_failures:
-            failed_shots = sorted(
-                int(task["tag"]) for task, _error in qc_failures)
+            failed_shots = sorted(set(
+                int(task["tag"]) for task, _error in qc_failures))
             self.log.warn(
                 "director",
                 f"关键帧本批已完成其余 {len(results)} 张；"
-                f"{len(failed_shots)} 张仍未通过(修订组四候选失败或提示词"
-                "审核熔断)，已隔离为自动修复失败项: "
+                f"{len(failed_shots)} 张仍未通过(生成前合同、修订组四候选"
+                "或提示词审核)，已逐镜隔离: "
                 + "、".join(f"镜头{value}" for value in failed_shots))
             raise AifosError(
-                f"{len(failed_shots)} 张关键帧经自动修复后仍未通过"
-                "(视觉质检失败或提示词审核熔断)；"
+                f"{len(failed_shots)} 张关键帧未通过本镜生成前合同或"
+                "生成任务；"
                 "失败稿及 Codex 诊断已保留，其他关键帧已继续完成；"
                 "下一断点由 AIFOS 自动重建合同后继续，不要求用户确认。"
                 "问题镜头: "
@@ -13755,13 +14103,24 @@ class Director:
                     "；另有无法自动迁移的历史镜头: "
                     + "、".join(str(value) for value in skipped_awaiting)
                     if skipped_awaiting else ""))
-        if awaiting_selection or technical_incomplete:
+        if preflight_failures and not self._selection_mode_enabled():
+            failed_shots = [
+                shot_no for shot_no, _issues in preflight_failures]
+            raise AifosError(
+                f"{len(failed_shots)} 张关键帧生成前合同未通过；"
+                "其他镜头已继续完成。问题镜头："
+                + "、".join(str(value) for value in failed_shots))
+        if awaiting_selection or technical_incomplete or preflight_failures:
             ctx["shot_selection_required"] = True
             ctx["shot_selection_shots"] = sorted(set(awaiting_selection))
             ctx["shot_candidate_repair_required"] = bool(
                 technical_incomplete)
             ctx["shot_candidate_repair_shots"] = sorted(
                 set(technical_incomplete))
+            ctx["shot_contract_repair_required"] = bool(
+                preflight_failures)
+            ctx["shot_contract_repair_shots"] = sorted(
+                shot_no for shot_no, _issues in preflight_failures)
             self.log.info(
                 "director",
                 f"{len(set(awaiting_selection))} 个镜头的4张候选已并行"
@@ -13777,6 +14136,9 @@ class Director:
                 "technical_incomplete": bool(technical_incomplete),
                 "technical_incomplete_shots": sorted(
                     set(technical_incomplete)),
+                "contract_incomplete": bool(preflight_failures),
+                "contract_incomplete_shots": sorted(
+                    shot_no for shot_no, _issues in preflight_failures),
             }
         return {
             "count": len(ctx["images"]), "reused": reused,
@@ -13928,11 +14290,15 @@ class Director:
                         or {})
                     if (self._quality_meets(
                             frame_quality, required_quality)
-                            and saved_qc.get("passed") is True):
+                            and (not self._image_qc_enabled()
+                                 or saved_qc.get("passed") is True)):
+                        content_qc_waived = not self._image_qc_enabled()
                         ctx["frames"].append({
                             "shot_no": shot["shot_no"], "first": first,
                             "last": last, "image_quality": frame_quality,
-                            "qc_passed": True})
+                            "qc_passed": bool(saved_qc.get("passed") is True),
+                            "content_qc_enabled": not content_qc_waived,
+                            "content_qc_waived": content_qc_waived})
                         reused += 1
                         self._plan_mark(ctx, f"frames:{shot['shot_no']}",
                                         "reused", only_pending=True)
@@ -13999,8 +14365,11 @@ class Director:
                 shot_no = task["tag"]
                 decision = task["payload"]["quality_decision"]
                 meta = self._quality_meta(decision)
+                content_qc_waived = not self._image_qc_enabled()
                 meta["qc_passed"] = bool(
                     (getattr(result, "qc", None) or {}).get("passed"))
+                meta["content_qc_enabled"] = not content_qc_waived
+                meta["content_qc_waived"] = content_qc_waived
                 self._register_shot_asset(
                     ctx, "first_frame", shot_no, result.data["first"],
                     meta=meta)
@@ -14013,6 +14382,8 @@ class Director:
                     "last": result.data["last"],
                     "image_quality": decision["level"],
                     "qc_passed": meta["qc_passed"],
+                    "content_qc_enabled": not content_qc_waived,
+                    "content_qc_waived": content_qc_waived,
                 })
                 last_by_scene[task["scene"]] = {
                     "uri": result.data["last"],
@@ -14069,6 +14440,7 @@ class Director:
         ctx["videos"] = []
         reused = 0
         pending = []
+        preparation_failures = []
         for shot in self._active_shots(ctx):
             name = self._shot_name(ctx, shot["shot_no"])
             existing = self._existing_asset_uri(ctx, "video", name)
@@ -14086,14 +14458,34 @@ class Director:
                         "video_resolution", "720p")})
                 reused += 1
                 continue
-            pending.append(self._prepare_video_call(ctx, shot, frames))
+            try:
+                pending.append(self._prepare_video_call(ctx, shot, frames))
+            except AifosError as exc:
+                preparation_failures.append((int(shot["shot_no"]), exc))
+                self.log.warn(
+                    "director",
+                    f"镜头{shot['shot_no']}视频生成前合同已隔离；"
+                    f"其余镜头继续并行：{str(exc)[:500]}")
         generated = self._run_videos_parallel(ctx, pending)
         ctx["videos"].extend(generated.values())
         ctx["videos"].sort(key=lambda item: int(item["shot_no"]))
+        if preparation_failures and not self._selection_mode_enabled():
+            raise AifosError(
+                f"{len(preparation_failures)} 个视频镜头生成前合同未通过；"
+                "其他可生成镜头已继续完成。问题镜头："
+                + "、".join(
+                    str(shot_no) for shot_no, _exc in preparation_failures))
+        if preparation_failures:
+            ctx["video_contract_repair_required"] = True
+            ctx["video_contract_repair_shots"] = sorted(
+                shot_no for shot_no, _exc in preparation_failures)
         return {
             "count": len(ctx["videos"]),
             "reused": reused,
             "generated": len(generated),
+            "contract_incomplete": bool(preparation_failures),
+            "contract_incomplete_shots": sorted(
+                shot_no for shot_no, _exc in preparation_failures),
             "parallel_workers": min(
                 self._video_parallel_workers(), max(1, len(pending))),
         }
@@ -14940,9 +15332,35 @@ class Director:
             + "物品、服装、建筑必须符合剧本声明的时代与世界观"
             + (f"，严禁出现:{'、'.join(drift)}" if drift else "")
             + "；物体在运动中保持真实结构与比例,严禁拉长、扭曲、穿模。")
-        lessons = lessons_block(self.assets, ctx["project"]["id"])
-        if lessons:
-            lines.append("【严禁再犯】" + lessons)
+        quality_payload = {
+            "shot_no": shot.get("shot_no"),
+            "characters": characters,
+            "visible_figure_count": shot.get(
+                "visible_figure_count", len(characters)),
+            "character_background": self._shot_character_facts(ctx, shot),
+            "era_context": "；".join(filter(None, (
+                str(world.get("name") or "").strip(),
+                str(world.get("era_and_location") or "").strip(),
+                str(shot.get("era_context") or shot.get("era") or "").strip(),
+            ))),
+            "camera": shot.get("camera") or shot.get("shot_contract") or {},
+            "action": shot.get("description") or shot.get("prompt") or "",
+            "start_state": shot.get("start_state") or {},
+            "end_state": shot.get("end_state") or {},
+            "readable_text": readable,
+            "physical_contract": build_physical_contract({
+                **shot, "spatial_blocking": spatial}),
+            "spatial_blocking": spatial,
+            "reference_manifest": reference_manifest,
+            "dialogue": dialogue,
+        }
+        quality_rules = self._generation_rule_lines(
+            ctx, shot, quality_payload, modality="video")
+        if quality_rules:
+            lines.append(
+                "【本镜质量规则·最多5条】\n" + "\n".join(
+                    f"{index}. {rule}"
+                    for index, rule in enumerate(quality_rules, 1)))
         return "\n".join(lines)
 
     def _motion_reference_uri(self, ctx, shot):
@@ -15169,6 +15587,7 @@ class Director:
         reference_rows = self._video_reference_rows(ctx, shot["shot_no"])
         spatial = self._spatial_reference_requirement(
             ctx, shot["shot_no"])
+        spatial_block = shot_blocking(ctx.get("blocking"), shot_no) or {}
         if spatial["required"] and not (
                 spatial["ready"]
                 and any(row["kind"] == "spatial_blocking"
@@ -15240,6 +15659,43 @@ class Director:
             "reference_manifest": reference_manifest,
             **prop_contract,
             "dialogue": video_dialogue,
+            "characters": list(shot.get("characters") or []),
+            "functional_figures": self._contract_safe_copy(
+                shot.get("functional_figures") or []),
+            "visible_figure_count": shot.get(
+                "visible_figure_count", len(shot.get("characters") or [])),
+            "camera": shot.get("camera") or shot.get("shot_contract") or {},
+            "action": shot.get("description") or shot.get("prompt") or "",
+            "start_state": self._contract_safe_copy(
+                shot.get("start_state") or {}),
+            "end_state": self._contract_safe_copy(
+                shot.get("end_state") or {}),
+            "readable_text": self._contract_safe_copy(
+                shot.get("readable_text") or {}),
+            "spatial_blocking": {
+                **self._contract_safe_copy(spatial_block),
+                "spatial_reference_required": bool(spatial["required"]),
+                "spatial_reference_uri": next((
+                    str(row.get("uri") or "")
+                    for row in reference_manifest
+                    if row.get("kind") == "spatial_blocking"), ""),
+            },
+            "spatial_ref": next((
+                str(row.get("uri") or "") for row in reference_manifest
+                if row.get("kind") == "spatial_blocking"), ""),
+            "physical_contract": build_physical_contract({
+                **shot, **prop_contract, "spatial_blocking": spatial_block}),
+            "era_context": "；".join(filter(None, (
+                str((((ctx.get("script") or {}).get("story_world") or {})
+                    .get("name") or "")).strip(),
+                str((((ctx.get("script") or {}).get("story_world") or {})
+                    .get("era_and_location") or "")).strip(),
+                str(shot.get("era_context") or shot.get("era") or "").strip(),
+            ))),
+            "sanctioned_anachronisms": list(
+                (((ctx.get("script") or {}).get("story_world") or {})
+                 .get("sanctioned_anachronisms") or
+                 shot.get("sanctioned_anachronisms") or [])),
             "voice": ctx["production_profile"]["voice"],
             "lip_sync": ctx["production_profile"]["lip_sync"],
             "forbid_subtitles": not ctx["production_profile"]["burn_subtitles"],
@@ -15261,6 +15717,12 @@ class Director:
                 "standard_fingerprint", ""),
             "aspect": ctx["aspect"], **ctx["dims"],
         }
+        contract_issues = self._generation_preflight_issues(
+            shot, payload, modality="video")
+        if contract_issues:
+            raise AifosError(
+                f"镜头{shot_no}视频生成前合同未通过，未调用 Seedance："
+                + "；".join(issue.message for issue in contract_issues))
         snapshot = self._video_input_snapshot(payload)
         payload["input_snapshot"] = snapshot
         payload["input_signature"] = snapshot["input_signature"]
@@ -15352,8 +15814,8 @@ class Director:
         if workers == 1:
             output = {}
             for task in tasks:
-                result = self._call(
-                    ctx, "video", task["payload"], "videos")
+                result = self._call_video_with_technical_retry(
+                    ctx, task, direct_router=False)
                 video = self._finish_video_call(ctx, task, result)
                 output[int(video["shot_no"])] = video
             return output
@@ -15385,8 +15847,8 @@ class Director:
                 except StopIteration:
                     return False
                 future = pool.submit(
-                    self.router.call, "video", task["payload"],
-                    ctx["out_root"] / "videos", cancel)
+                    self._call_video_with_technical_retry,
+                    ctx, task, direct_router=True, cancel=cancel)
                 futures[future] = task
                 return True
 
@@ -15429,6 +15891,40 @@ class Director:
         if failures:
             raise failures[0][1]
         return output
+
+    def _call_video_with_technical_retry(
+            self, ctx, task, *, direct_router=False, cancel=None):
+        """Retry one provider/transport failure; never retry content advice."""
+        attempts = 0
+        while True:
+            try:
+                if direct_router:
+                    result = self.router.call(
+                        "video", task["payload"],
+                        ctx["out_root"] / "videos", cancel)
+                else:
+                    result = self._call(
+                        ctx, "video", task["payload"], "videos")
+                if not isinstance(result.data, dict):
+                    result.data = {}
+                result.data["technical_retry_count"] = attempts
+                task["technical_retry_count"] = attempts
+                return result
+            except ProduceCancelled:
+                raise
+            except (ProviderUnavailable, ProviderError, OSError) as exc:
+                decision = evaluate_post_generation([{
+                    "category": "technical_provider",
+                    "message": str(exc),
+                }], attempts_remaining=1 - attempts)
+                if not decision.retry_allowed:
+                    raise
+                attempts += 1
+                self.log.warn(
+                    "director",
+                    f"镜头{task['shot'].get('shot_no')}视频供应商技术失败，"
+                    "保留同一合同自动重试1次；不因内容意见重拍："
+                    f"{str(exc)[:300]}")
 
     def _make_video(self, ctx, shot, frames):
         """兼容单镜调用；正式视频阶段由 4 路并行调度器执行。"""

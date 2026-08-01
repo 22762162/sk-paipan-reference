@@ -2151,6 +2151,14 @@ def _gate(gate_id, label, passed, detail):
     return {"id": gate_id, "label": label, "passed": bool(passed), "detail": detail}
 
 
+def frame_content_qc_accepted(frame):
+    """True for an actual content verdict or an explicit policy waiver."""
+    frame = frame if isinstance(frame, dict) else {}
+    return bool(
+        frame.get("qc_passed") is True
+        or frame.get("content_qc_waived") is True)
+
+
 def build_preflight(script, storyboard, continuity, text_manifest, frames,
                     profile, blocking=None, quality_policy=None,
                     character_assets=None):
@@ -2168,8 +2176,13 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
     formal_frame_quality_ok = all(
         str(frame.get("image_quality", "medium")).lower()
         in ("medium", "high") for frame in frames)
+    # Content-QC off is an explicit production policy, not a fake PASS.
+    # Technical frame existence/quality remains enforced below; the visual
+    # gate accepts either an actual verdict or an auditable waiver.
     frame_visual_qc_ok = all(
-        frame.get("qc_passed") is True for frame in frames)
+        frame_content_qc_accepted(frame) for frame in frames)
+    frame_content_qc_waived = bool(frames) and all(
+        frame.get("content_qc_waived") is True for frame in frames)
     required = (
         "unit_id", "character_count", "start_state", "end_state",
         "shot_function", "script_reference", "readable_text", "visual_hook",
@@ -2420,7 +2433,11 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
               and all(f.get("first") and f.get("last") for f in frames)
               and formal_frame_quality_ok and frame_visual_qc_ok,
               f"{len(frame_map)}/{len(shots)} 个单元首尾帧就绪；"
-              + ("均为中/高质量且已通过视觉质检"
+              + ("均为中/高质量；内容质检已按选片模式明确豁免，"
+                 "未伪造视觉PASS"
+                 if (formal_frame_quality_ok and frame_visual_qc_ok
+                     and frame_content_qc_waived)
+                 else "均为中/高质量且已通过视觉质检"
                  if formal_frame_quality_ok and frame_visual_qc_ok
                  else "含低质量试错帧或缺少视觉质检")),
         _gate("audio", "环境声与声音策略", sound_ok,
