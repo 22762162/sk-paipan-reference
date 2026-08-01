@@ -271,6 +271,48 @@ def test_fresh_assets_regenerates_all_candidates_without_old_references(
         assert app.assets.meta(row)["fresh_run_id"] == 99
 
 
+def test_auto_selection_reuses_locked_identity_without_rechecking_candidates(
+        app, tmp_path, monkeypatch):
+    project, _ = app.projects.get_or_create_project("定版复用")
+    episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+    image = tmp_path / "locked.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nlocked")
+    character = {
+        "name": "顾明昭", "role": "主角", "gender": "女",
+        "age_range": "25岁", "image_prompt": "晚明女官",
+    }
+    identity = app.assets.register(
+        project["id"], "character_identity", "顾明昭",
+        uri=str(image), meta={
+            "character": "顾明昭", "locked": True,
+            "image_quality": "high", "candidate_index": 2,
+        })
+    app.assets.register(
+        project["id"], "character_art", "顾明昭",
+        uri=str(image), meta={
+            "character": "顾明昭", "locked": True,
+            "image_quality": "high", "candidate_index": 2,
+        })
+
+    def unexpected_qc(*_args, **_kwargs):
+        raise AssertionError("已锁定人物在断点续产时不应重复视觉QC")
+
+    monkeypatch.setattr(app.router, "call", unexpected_qc)
+    ctx = {
+        "project": dict(project), "episode": dict(episode),
+        "script": {"characters": [character], "scenes": []},
+        "out_root": tmp_path / "episode", "fresh_assets": False,
+    }
+    status = app.director._auto_select_asset_candidates(
+        ctx, [character], {}, [])
+
+    assert status["passed"] is True
+    current = app.assets.latest(
+        project["id"], "character_identity", "顾明昭")
+    assert current["id"] == identity["id"]
+    assert current["version"] == identity["version"]
+
+
 def test_candidate_count_is_four_for_every_formal_role():
     assert character_candidate_target({"role": "主角"}) == 4
     assert character_candidate_target({"role": "重要配角"}) == 4

@@ -11797,6 +11797,12 @@ class Director:
         work = []
         for character in characters:
             name = character["name"]
+            # 断点续产必须复用已经锁定的正式母资产。过去每次恢复都会把
+            # 全部人物候选重新送一次视觉QC，既慢又花费重复额度；只有
+            # fresh_assets 或定版缺失时才重新排名。
+            if (not ctx.get("fresh_assets")
+                    and self._locked_identity(project_id, name) is not None):
+                continue
             for index in range(1, character_candidate_target(character) + 1):
                 row = self.assets.latest(
                     project_id, "character_candidate",
@@ -11813,6 +11819,9 @@ class Director:
                 })
         for prop in props:
             name = prop["name"]
+            if (not ctx.get("fresh_assets")
+                    and self._locked_prop(project_id, name) is not None):
+                continue
             for index in range(1, PROP_CANDIDATES + 1):
                 row = self.assets.latest(
                     project_id, "prop_candidate", f"{name}:{index:02d}")
