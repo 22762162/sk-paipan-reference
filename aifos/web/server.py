@@ -138,7 +138,7 @@ def access_payload(bound_host, port, workspace=None):
 # 它们只该互相排队,不该互相拒绝,更不该互相打断。
 PRODUCTION_ACTIONS = frozenset({
     "produce", "force_rebuild", "script_import", "series_next",
-    "confirm_script", "image_acceleration_resume",
+    "confirm_script", "image_acceleration_resume", "image_selection_resume",
 })
 
 
@@ -218,14 +218,28 @@ class JobRegistry:
         return job_id
 
     def start_task(self, title, number, task, action="adjustment",
-                   request=None, tracked=False, unique=False, queue=False):
+                   request=None, tracked=False, unique=False, queue=False,
+                   unique_action=False):
         """通用后台任务(打磨重写/重画)。
 
         普通任务签名为 ``task(app, run_id)``；tracked=True 时额外传入
         ``report(**fields)``，让长批次把逐项进度写进 job，前端无需猜测。
+        ``unique_action=True`` 只合并同一集、同一 action 的运行/排队任务，
+        用于“最后一镜选完后恢复生产”这类必须 exactly-once 排队的动作；
+        它不会像旧 ``unique`` 那样误复用本集另一个无关任务。
         """
         with self._lock:
-            if unique:
+            if unique_action:
+                existing = next((
+                    job for job in self._jobs.values()
+                    if job["status"] in {"running", "queued"}
+                    and job["title"] == title
+                    and int(job["episode"]) == int(number)
+                    and str(job.get("action") or "") == str(action)
+                ), None)
+                if existing is not None:
+                    return existing["id"]
+            elif unique:
                 existing = next((
                     job for job in self._jobs.values()
                     if job["status"] == "running"
@@ -297,6 +311,10 @@ class JobRegistry:
                             "qc_all": ("qc", "图片批量复检"),
                             "recheck_current_storyboard": (
                                 "qc", "当前分镜合同批量复检"),
+                            "image_selection_resume": (
+                                "images", "关键帧选片完成后断点续产"),
+                            "regenerate_shot_candidates": (
+                                "images", "关键帧候选整组重生成"),
                             "redo_items": ("images", "图片批量重画"),
                             "redo_video": ("videos", "视频定向修改"),
                             "redo_placeholders": ("images", "占位图片补真"),
@@ -500,6 +518,100 @@ def _artifact_url(app, uri):
     except ValueError:
         return None
     return "/artifacts/" + rel.as_posix()
+
+
+def _candidate_group_current_selection(item):
+    """返回当前候选组的有效明确选择；旧 token/迟到点击一律无效。"""
+    group = (item or {}).get("candidate_group") or {}
+    selection = group.get("selection") or {}
+    candidates = group.get("candidates") or []
+    if (not isinstance(group, dict) or not isinstance(selection, dict)
+            or group.get("complete") is not True
+            or group.get("technical_incomplete") is True):
+        return None
+    group_id = str(group.get("candidate_set_id") or "")
+    group_token = str(group.get("candidate_set_token") or "")
+    try:
+        group_revision = int(group.get("candidate_revision") or 0)
+        selected_revision = int(
+            selection.get("candidate_revision") or 0)
+        selected_index = int(selection.get("candidate_index") or 0)
+    except (TypeError, ValueError):
+        return None
+    if (not group_id or not group_token or group_revision < 1
+            or str(selection.get("candidate_set_id") or "") != group_id
+            or str(selection.get("candidate_set_token")
+                   or selection.get("token") or "") != group_token
+            or selected_revision != group_revision
+            or str(selection.get("source") or "") not in {"manual", "ai"}
+            or selected_index < 1):
+        return None
+    selected_id = str(selection.get("candidate_id") or "")
+    candidate = None
+    for row in candidates:
+        if not isinstance(row, dict):
+            continue
+        try:
+            row_index = int(row.get("candidate_index") or 0)
+        except (TypeError, ValueError):
+            continue
+        if (row_index == selected_index
+                and str(row.get("candidate_set_token") or "") == group_token
+                and (not selected_id
+                     or str(row.get("candidate_id") or "") == selected_id)):
+            candidate = row
+            break
+    if candidate is None:
+        return None
+    selected_uri = str(selection.get("selected_uri") or "")
+    if selected_uri and selected_uri != str(candidate.get("uri") or ""):
+        return None
+    return selection
+
+
+def _selection_mode_enabled(app):
+    return bool(app.config.get(
+        "defaults", "selection_mode", default=True))
+
+
+def _sanitize_candidate_group_urls(app, item):
+    """候选图只向浏览器暴露受控 URL，不泄露服务端文件系统路径。"""
+    group = item.get("candidate_group")
+    if not isinstance(group, dict):
+        return
+    for candidate in group.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        candidate["url"] = _artifact_url(app, str(candidate.get("uri") or ""))
+        candidate.pop("uri", None)
+    selection = group.get("selection")
+    if isinstance(selection, dict):
+        selection["selected_url"] = _artifact_url(
+            app, str(selection.get("selected_uri") or ""))
+        selection.pop("selected_uri", None)
+    uris = item.pop("candidate_uris", None)
+    if isinstance(uris, list):
+        item["candidate_urls"] = [
+            url for url in (
+                _artifact_url(app, str(uri or "")) for uri in uris)
+            if url
+        ]
+
+
+def _candidate_request_value(body, name, *aliases):
+    for key in (name, *aliases):
+        value = body.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _candidate_conflict(exc):
+    message = str(exc)
+    return any(marker in message for marker in (
+        "stale_candidate_set", "selection_conflict",
+        "候选组已更新", "候选组冲突",
+    ))
 
 
 _DIAGNOSTIC_FIELDS = (
@@ -1028,9 +1140,11 @@ def _production_progress(app, episode, render_plan):
     production_running = (
         running_run is not None
         and str(running_run["action"] or "") in PRODUCTION_ACTIONS)
+    selection_mode = _selection_mode_enabled(app)
     status_keys = (
         "done", "reused", "pending", "generating", "retrying",
-        "awaiting_human", "failed",
+        "awaiting_selection", "regenerating_candidates",
+        "technical_incomplete", "awaiting_human", "failed",
     )
     category_labels = {
         "character_candidate": "人物候选",
@@ -1129,6 +1243,15 @@ def _production_progress(app, episode, render_plan):
             return False
         if str(item.get("category") or "") not in {"shot_image", "frames"}:
             return True
+        if selection_mode:
+            if str(item.get("category") or "") == "shot_image":
+                # 选片模式的唯一门禁是：本轮候选 token 已被人工/AI 明确
+                # 选择，且该选择已经晋升为正式资产。内容 QC 仅作建议，
+                # 不能重新把产线变回阻断式。
+                return _candidate_group_current_selection(item) is not None
+            return not (
+                item.get("invalidated_previous_output")
+                or item.get("contract_recheck"))
         qc = item.get("qc") or {}
         if not qc:
             return not (
@@ -1173,7 +1296,9 @@ def _production_progress(app, episode, render_plan):
         }.get(raw_status, raw_status)
         if status not in status_keys:
             status = "pending"
-        if status in ("generating", "retrying") and not live_run:
+        active_statuses = {
+            "generating", "retrying", "regenerating_candidates"}
+        if status in active_statuses and not live_run:
             issues.append({
                 "item_id": item.get("id", ""),
                 "category": category,
@@ -1185,6 +1310,11 @@ def _production_progress(app, episode, render_plan):
             status = "pending"
         formal_asset = item_has_formal_asset(item)
         output_exists = valid_uri(item.get("output_uri"))
+        candidate_outputs = [
+            row for row in ((item.get("candidate_group") or {}).get(
+                "candidates") or [])
+            if isinstance(row, dict) and valid_uri(row.get("uri"))]
+        candidate_generated = bool(candidate_outputs)
         downstream_usable = item_is_downstream_usable(item, formal_asset)
         if status in ("done", "reused"):
             if formal_asset:
@@ -1206,13 +1336,17 @@ def _production_progress(app, episode, render_plan):
                 })
         else:
             stats[status] += 1
-            if output_exists:
+            if output_exists or candidate_generated:
                 stats["generated"] += 1
 
         if downstream_usable:
             pass
-        elif status in ("generating", "retrying"):
+        elif status in active_statuses:
             pass
+        elif status == "awaiting_selection":
+            stats["awaiting_review"] += 1
+        elif status == "technical_incomplete":
+            stats["needs_repair"] += 1
         elif status in ("awaiting_human", "failed"):
             stats["needs_repair"] += 1
         elif formal_asset or output_exists:
@@ -1223,7 +1357,7 @@ def _production_progress(app, episode, render_plan):
         else:
             stats["not_generated"] += 1
 
-        if status in ("generating", "retrying"):
+        if status in active_statuses:
             try:
                 started_at = float(item.get("started_at") or timestamp)
             except (TypeError, ValueError):
@@ -1242,9 +1376,15 @@ def _production_progress(app, episode, render_plan):
                 # 大概率是遗留认领——秒表继续走会误导用户"没卡住"。
                 "stale": elapsed > 1800,
             })
-        if status in ("awaiting_human", "failed"):
+        if status in ("awaiting_human", "failed", "technical_incomplete"):
             qc = item.get("qc") or {}
             item_issues = list(qc.get("issues") or [])
+            if status == "technical_incomplete" and not item_issues:
+                errors = (item.get("candidate_group") or {}).get(
+                    "candidate_errors") or []
+                item_issues = [
+                    str(row.get("error") or "候选图技术生成失败")
+                    for row in errors if isinstance(row, dict)]
             if not item_issues and item.get("error"):
                 item_issues = [item["error"]]
             issues.append({
@@ -1373,6 +1513,7 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
     current_stage = str(overall.get("current_stage") or "")
     episode_number = int(episode["number"])
     project_id = int(episode["project_id"])
+    selection_mode = _selection_mode_enabled(app)
 
     storyboard_shots = list((storyboard or {}).get("shots") or [])
     storyboard_numbers = {
@@ -1430,6 +1571,12 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
             "pending": int(source.get("pending") or 0),
             "generating": generating,
             "retrying": retrying,
+            "awaiting_selection": int(
+                source.get("awaiting_selection") or 0),
+            "regenerating_candidates": int(
+                source.get("regenerating_candidates") or 0),
+            "technical_incomplete": int(
+                source.get("technical_incomplete") or 0),
             "awaiting_human": awaiting_human,
             "failed": failed,
             "remaining": max(0, total - usable),
@@ -1454,6 +1601,12 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
             item = plan_by_stage_and_shot.get((category, int(shot_no)))
             if not item or item.get("status") not in ("done", "reused"):
                 return False
+            if selection_mode:
+                if category == "shot_image":
+                    return _candidate_group_current_selection(item) is not None
+                return not (
+                    item.get("invalidated_previous_output")
+                    or item.get("contract_recheck"))
             qc = item.get("qc") or {}
             if not qc:
                 # 兼容明确关闭图片 QC 的历史项目；一旦条目标记过期或进入
@@ -1496,6 +1649,9 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
             ) if stage["total"] else 0
             accounted = (
                 stage["generating"] + stage["retrying"]
+                + stage["awaiting_selection"]
+                + stage["regenerating_candidates"]
+                + stage["technical_incomplete"]
                 + stage["awaiting_human"] + stage["failed"])
             stage["pending"] = max(
                 stage["pending"], stage["remaining"] - accounted)
@@ -2161,6 +2317,7 @@ def _episode_payload(app, episode_id, jobs=None):
                     shot_story_contexts[shot_no])
             for ref in (item.get("reference_inputs") or {}).get("items", []):
                 ref["url"] = _artifact_url(app, ref.get("uri", ""))
+            _sanitize_candidate_group_urls(app, item)
             output_url = _artifact_url(app, item.get("output_uri", ""))
             if output_url:
                 try:
@@ -2807,6 +2964,10 @@ def make_handler(workspace, jobs):
                     return self._scene_expand()
                 if parsed.path == "/api/revise":
                     return self._revise()
+                if parsed.path == "/api/shot-candidates/select":
+                    return self._shot_candidate_select()
+                if parsed.path == "/api/shot-candidates/regenerate":
+                    return self._shot_candidates_regenerate()
                 if parsed.path == "/api/regen_image":
                     return self._regen_image()
                 if parsed.path == "/api/upload":
@@ -4049,6 +4210,211 @@ def make_handler(workspace, jobs):
                     title, number, feedback, run_id=run_id),
                 action="revise_script", request={"feedback": feedback})
             return self._json({"job_id": job_id}, status=202)
+
+        def _shot_candidate_request(self, body, *, require_contract=False):
+            """规范化候选组 CAS；兼容新 UI 与 expected_* 正式字段。"""
+            try:
+                shot_no = int(body.get("shot_no"))
+                revision = int(_candidate_request_value(
+                    body, "expected_candidate_revision",
+                    "candidate_revision", "expected_revision", "revision"))
+            except (TypeError, ValueError):
+                raise AifosError(
+                    "缺少合法 shot_no/expected_candidate_revision")
+            group_id = str(_candidate_request_value(
+                body, "expected_candidate_set_id", "candidate_set_id")
+                or "").strip()
+            token = str(_candidate_request_value(
+                body, "expected_candidate_set_token",
+                "candidate_set_token", "expected_token", "token")
+                or "").strip()
+            if shot_no < 1 or revision < 1 or not group_id or not token:
+                raise AifosError(
+                    "缺少完整候选组CAS：candidate_set_id/token/revision")
+            contract_revision = _candidate_request_value(
+                body, "expected_contract_revision", "contract_revision")
+            if require_contract and contract_revision in (None, ""):
+                raise AifosError(
+                    "整组重生成必须提供 contract_revision")
+            if contract_revision not in (None, ""):
+                try:
+                    contract_revision = int(contract_revision)
+                except (TypeError, ValueError) as exc:
+                    raise AifosError(
+                        "contract_revision 必须是正整数") from exc
+                if contract_revision < 1:
+                    raise AifosError(
+                        "contract_revision 必须是正整数")
+            return {
+                "shot_no": shot_no,
+                "candidate_set_id": group_id,
+                "candidate_set_token": token,
+                "candidate_revision": revision,
+                "contract_revision": contract_revision,
+            }
+
+        @staticmethod
+        def _assert_candidate_cas(app, title, number, expected):
+            """重生成入队前先快照校验；后台 Director 仍会再次原子校验。"""
+            state = app.director.shot_candidate_selection_state(
+                title, number, shot_no=expected["shot_no"])
+            item = next((
+                row for row in (state.get("items") or [])
+                if int(row.get("shot_no") or 0) == expected["shot_no"]
+            ), None)
+            if item is None:
+                raise AifosError(
+                    "selection_conflict: 当前镜头没有可重生成的候选组")
+            group = (item.get("candidate_group") or item.get("group")
+                     or item)
+            try:
+                actual_revision = int(
+                    group.get("candidate_revision") or 0)
+                actual_contract = int(
+                    group.get("contract_revision") or 0)
+            except (TypeError, ValueError):
+                actual_revision = 0
+                actual_contract = 0
+            stale = (
+                str(group.get("candidate_set_id") or "")
+                != expected["candidate_set_id"]
+                or str(group.get("candidate_set_token") or "")
+                != expected["candidate_set_token"]
+                or actual_revision != expected["candidate_revision"]
+                or (expected.get("contract_revision") is not None
+                    and actual_contract != expected["contract_revision"]))
+            if stale:
+                raise AifosError(
+                    "stale_candidate_set: 候选组已更新，请刷新后再操作")
+            return state
+
+        def _shot_candidate_select(self):
+            """明确选择一张当前候选；选择本身永不被旧生产门禁拦截。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            try:
+                expected = self._shot_candidate_request(body)
+                candidate_id = str(
+                    body.get("candidate_id") or "").strip()
+                candidate_index = body.get("candidate_index")
+                if candidate_index not in (None, ""):
+                    candidate_index = int(candidate_index)
+                else:
+                    candidate_index = 0
+                if not candidate_id and candidate_index < 1:
+                    raise AifosError(
+                        "缺少 candidate_id/candidate_index")
+            except (AifosError, TypeError, ValueError) as exc:
+                return self._error(400, str(exc))
+            title, number = found
+
+            def select(app):
+                result = dict(app.director.select_shot_candidate(
+                    title, number, expected["shot_no"],
+                    expected["candidate_set_id"],
+                    expected["candidate_set_token"],
+                    expected["candidate_revision"],
+                    candidate_id, candidate_index,
+                    source="manual"))
+                # 选择接口也遵守路径边界；前端刷新 episode 获取完整候选组。
+                selected_uri = str(result.pop("selected_uri", "") or "")
+                result["selected_url"] = _artifact_url(app, selected_uri)
+                result["source"] = "manual"
+                return result
+
+            try:
+                result = self._with_app(select)
+            except AifosError as exc:
+                return self._error(
+                    409 if _candidate_conflict(exc) else 400, str(exc))
+
+            # 只有“本次刚好选完最后一镜”才排断点续产。Director 的幂等
+            # 返回 + JobRegistry 的同 action 原子去重共同保证不会重复开工。
+            if (result.get("need_resume")
+                    and result.get("last_pending")
+                    and not result.get("already_selected")):
+                job_id = jobs.start_task(
+                    title, number,
+                    lambda app, run_id: app.director.produce(
+                        title, number, run_id=run_id),
+                    action="image_selection_resume",
+                    request={
+                        "source": "shot_candidate_selection",
+                        "shot_no": expected["shot_no"],
+                        "candidate_set_id": expected[
+                            "candidate_set_id"],
+                        "candidate_revision": expected[
+                            "candidate_revision"],
+                    },
+                    queue=True, unique_action=True)
+                result["resume_job_id"] = job_id
+                job = jobs.get(job_id) or {}
+                result["resume_job_status"] = (
+                    job.get("status") or "queued")
+            else:
+                result["resume_job_id"] = None
+            return self._json(result)
+
+        def _shot_candidates_regenerate(self):
+            """推翻当前候选组并排队重生成；不打断同集其他工作。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            if body.get("confirm_regenerate") is not True:
+                return self._error(
+                    400, "整组重新生成需要 confirm_regenerate=true 二次确认")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            prompt = str(
+                body.get("prompt") or body.get("feedback") or "").strip()
+            if not prompt:
+                return self._error(400, "整组重生成必须提供完整 prompt")
+            try:
+                expected = self._shot_candidate_request(
+                    body, require_contract=True)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            title, number = found
+            try:
+                self._with_app(lambda app: self._assert_candidate_cas(
+                    app, title, number, expected))
+            except AifosError as exc:
+                return self._error(
+                    409 if _candidate_conflict(exc) else 400, str(exc))
+
+            def regenerate(app, run_id):
+                result = dict(app.director.regenerate_shot_candidates(
+                    title, number, expected["shot_no"],
+                    expected["candidate_set_id"],
+                    expected["candidate_set_token"],
+                    expected["candidate_revision"], prompt,
+                    confirm=True))
+                if result.get("need_resume"):
+                    result["resume"] = app.director.produce(
+                        title, number, run_id=run_id)
+                return result
+
+            job_id = jobs.start_task(
+                title, number, regenerate,
+                action="regenerate_shot_candidates",
+                request={
+                    **expected,
+                    "prompt": prompt,
+                    "confirm_regenerate": True,
+                },
+                queue=True)
+            job = jobs.get(job_id) or {}
+            return self._json({
+                "job_id": job_id,
+                "status": job.get("status") or "queued",
+                "queue_position": job.get("queue_position") or 0,
+                "shot_no": expected["shot_no"],
+            }, status=202)
 
         def _regen_image(self):
             body = self._read_body()
