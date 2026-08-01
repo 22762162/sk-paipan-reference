@@ -384,3 +384,74 @@ def test_test_provider_reports_missing_bridge_binary(tmp_path, monkeypatch):
             app2.close()
     finally:
         app.close()
+
+
+def test_selection_mode_defaults_roundtrip(tmp_path):
+    """创作选片模式三开关+固定候选数:类型校验、持久化与非法值拒绝。"""
+    from aifos.settings import set_defaults
+    config_path = tmp_path / "config.json"
+    saved = set_defaults(config_path, {
+        "selection_mode": True,
+        "image_content_qc": False,
+        "video_content_qc": "off",
+        "shot_candidate_count": 4,
+    })
+    assert saved == {"selection_mode": True, "image_content_qc": False,
+                     "video_content_qc": False, "shot_candidate_count": 4}
+    stored = json.loads(config_path.read_text(encoding="utf-8"))["defaults"]
+    assert stored["selection_mode"] is True
+    assert stored["video_content_qc"] is False
+
+    with pytest.raises(AifosError, match="固定为 4"):
+        set_defaults(config_path, {"shot_candidate_count": 3})
+    with pytest.raises(AifosError, match="布尔值"):
+        set_defaults(config_path, {"selection_mode": "也许"})
+    with pytest.raises(AifosError, match="不支持的默认项"):
+        set_defaults(config_path, {"image_qc_retries": 2})
+
+
+def test_selection_mode_web_endpoints(tmp_path):
+    """一键接口:GET 现状→POST 开启→回显与 /api/settings 持久化一致。"""
+    ws = tmp_path / "ws"
+    App(ws).close()
+    httpd = serve(ws, host="127.0.0.1", port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", httpd.server_address[1], timeout=30)
+
+        def call(method, path, body=None):
+            conn.request(method, path,
+                         body=json.dumps(body) if body else None,
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+
+        status, view = call("GET", "/api/selection-mode")
+        assert status == 200
+        assert view == {"selection_mode": False, "image_content_qc": True,
+                        "video_content_qc": True, "shot_candidate_count": 4}
+
+        status, view = call("POST", "/api/selection-mode", {"enabled": True})
+        assert status == 200 and view["ok"] and view["selection_mode"]
+
+        status, view = call("POST", "/api/selection-mode",
+                            {"video_content_qc": False})
+        assert status == 200 and view["video_content_qc"] is False
+        assert view["selection_mode"] is True  # 已持久化,不被后续写覆盖
+
+        status, view = call("GET", "/api/settings")
+        assert status == 200
+        defaults = view["defaults"]
+        assert defaults["selection_mode"] is True
+        assert defaults["video_content_qc"] is False
+        assert defaults["shot_candidate_count"] == 4
+
+        status, err = call("POST", "/api/selection-mode",
+                           {"shot_candidate_count": 2})
+        assert status == 400 and "固定为 4" in err["error"]
+
+        status, err = call("POST", "/api/selection-mode", {})
+        assert status == 400
+    finally:
+        httpd.shutdown()

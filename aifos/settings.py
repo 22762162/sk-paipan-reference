@@ -209,6 +209,15 @@ def settings_payload(app):
                 "defaults", "parallel_images", default=3),
             "parallel_videos": app.config.get(
                 "defaults", "parallel_videos", default=4),
+            # 创作选片模式三开关+固定候选张数:必须回显,UI 才能反映持久化现状
+            "selection_mode": bool(app.config.get(
+                "defaults", "selection_mode", default=False)),
+            "image_content_qc": bool(app.config.get(
+                "defaults", "image_content_qc", default=True)),
+            "video_content_qc": bool(app.config.get(
+                "defaults", "video_content_qc", default=True)),
+            "shot_candidate_count": int(app.config.get(
+                "defaults", "shot_candidate_count", default=4)),
         },
         "icloud_sync": app.icloud_sync.status(),
         "config_path": str(app.workspace.config_path),
@@ -427,17 +436,42 @@ def set_image_strategy(config_path, strategy):
                         for cap in ("image", "frames", "cover")}}
 
 
+def _coerce_bool(key, value):
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("1", "true", "on", "yes", "开", "开启"):
+        return True
+    if text in ("0", "false", "off", "no", "关", "关闭"):
+        return False
+    raise AifosError(f"{key} 需为布尔值")
+
+
 def set_defaults(config_path, mapping):
-    """写入 defaults 配置(图片/视频并行生产路数)。"""
-    allowed = {"parallel_images", "parallel_videos"}
+    """写入 defaults 配置(并行路数/创作选片模式/内容质检开关)。"""
+    int_keys = {"parallel_images", "parallel_videos"}
+    bool_keys = {"selection_mode", "image_content_qc", "video_content_qc"}
     updates = {}
     for key, value in (mapping or {}).items():
-        if key not in allowed:
+        if key in int_keys:
+            try:
+                updates[key] = max(1, min(int(value), 8))
+            except (TypeError, ValueError):
+                raise AifosError(f"{key} 需为 1-8 的整数")
+        elif key in bool_keys:
+            updates[key] = _coerce_bool(key, value)
+        elif key == "shot_candidate_count":
+            try:
+                count = int(value)
+            except (TypeError, ValueError):
+                raise AifosError("shot_candidate_count 需为整数")
+            if count != 4:
+                raise AifosError(
+                    "shot_candidate_count 当前版本固定为 4(每镜四张候选,"
+                    "不分档);其他取值暂不支持")
+            updates[key] = 4
+        else:
             raise AifosError(f"不支持的默认项: {key}")
-        try:
-            updates[key] = max(1, min(int(value), 8))
-        except (TypeError, ValueError):
-            raise AifosError(f"{key} 需为 1-8 的整数")
     if not updates:
         raise AifosError("没有要保存的默认项")
     data = _load_file(config_path)

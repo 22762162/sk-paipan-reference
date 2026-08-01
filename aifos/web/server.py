@@ -2719,6 +2719,19 @@ def make_handler(workspace, jobs):
                 match = re.match(r"^/api/export/(\d+)$", route)
                 if match:
                     return self._export(int(match.group(1)))
+                if route == "/api/selection-mode":
+                    # 创作选片模式现状(独立内容质检开关接口,只读设置,
+                    # 不触碰生成/QC流程)
+                    return self._json(self._with_app(lambda app: {
+                        "selection_mode": bool(app.config.get(
+                            "defaults", "selection_mode", default=False)),
+                        "image_content_qc": bool(app.config.get(
+                            "defaults", "image_content_qc", default=True)),
+                        "video_content_qc": bool(app.config.get(
+                            "defaults", "video_content_qc", default=True)),
+                        "shot_candidate_count": int(app.config.get(
+                            "defaults", "shot_candidate_count", default=4)),
+                    }))
                 if route == "/api/settings":
                     from ..settings import settings_payload
                     return self._json(self._with_app(settings_payload))
@@ -2798,6 +2811,8 @@ def make_handler(workspace, jobs):
                     return self._regen_image()
                 if parsed.path == "/api/upload":
                     return self._upload()
+                if parsed.path == "/api/selection-mode":
+                    return self._selection_mode_update()
                 if parsed.path == "/api/settings":
                     return self._settings_update()
                 if parsed.path == "/api/settings/test":
@@ -4088,6 +4103,46 @@ def make_handler(workspace, jobs):
                 "status": job.get("status") or "running",
                 "queue_position": job.get("queue_position") or 0,
             }, status=202)
+
+        def _selection_mode_update(self):
+            """一键创作选片模式:{enabled} 或按键传
+            image_content_qc/video_content_qc。只写 defaults 配置并回显,
+            生成/QC 流程语义由 director 侧消费方实现。"""
+            from ..settings import set_defaults
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            updates = {}
+            if "enabled" in body:
+                updates["selection_mode"] = body.get("enabled")
+            for key in ("selection_mode", "image_content_qc",
+                        "video_content_qc", "shot_candidate_count"):
+                if key in body:
+                    updates[key] = body.get(key)
+            if not updates:
+                return self._error(
+                    400, "缺少 enabled 或任一开关键")
+
+            def task(app):
+                from ..config import Config
+                set_defaults(app.workspace.config_path, updates)
+                # app.config 在写入前加载;重读文件回显持久化后的真实现状
+                fresh = Config.load(app.workspace.config_path)
+                return {
+                    "ok": True,
+                    "selection_mode": bool(fresh.get(
+                        "defaults", "selection_mode", default=False)),
+                    "image_content_qc": bool(fresh.get(
+                        "defaults", "image_content_qc", default=True)),
+                    "video_content_qc": bool(fresh.get(
+                        "defaults", "video_content_qc", default=True)),
+                    "shot_candidate_count": int(fresh.get(
+                        "defaults", "shot_candidate_count", default=4)),
+                }
+            try:
+                return self._json(self._with_app(task))
+            except AifosError as exc:
+                return self._error(400, str(exc))
 
         def _settings_update(self):
             """设置中心保存 Provider、能力路由或整套图片策略。"""

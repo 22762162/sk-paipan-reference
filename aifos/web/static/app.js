@@ -8466,6 +8466,7 @@ async function renderAssetsCenter(selectedTitle) {
         <button class="primary" id="btn-restyle" ${ep ? "" : "disabled"}>🎨 按此画风重做全部形象</button>
       </div>
       ${imageLineControlsHtml()}
+      ${selectionModeControlsHtml()}
       <div class="dim">重做会消耗出图额度(每张一次);过程在本集页面实况可见,
         可随时暂停,已完成的保留。分镜画面如需同步新画风,重做完成后到本集点「全部重做」。</div>
     </section>
@@ -8549,6 +8550,7 @@ async function renderAssetsCenter(selectedTitle) {
     renderAssetsCenter(ev.target.value);
   bindProjectShellControls(title);
   bindImageLineControls();
+  bindSelectionModeControls();
   const restyleBtn = document.getElementById("btn-restyle");
   if (restyleBtn && ep) restyleBtn.onclick = (ev) =>
     armConfirm(ev.target, "重做", async () => {
@@ -10718,6 +10720,75 @@ function imageLineControlsHtml() {
   </div>`;
 }
 
+/* ---- 创作选片模式:一键关闭内容质检,每镜固定4张候选人工选片 ---- */
+function selectionModeControlsHtml() {
+  return `<div class="style-row selection-mode-row">
+    <label>创作选片模式</label>
+    <label class="il-label sm-toggle">
+      <input type="checkbox" id="sm-master" disabled> 一键开启
+    </label>
+    <label class="il-label sm-toggle">
+      <input type="checkbox" id="sm-image-qc" disabled> 图片内容质检
+    </label>
+    <label class="il-label sm-toggle">
+      <input type="checkbox" id="sm-video-qc" disabled> 视频内容质检
+    </label>
+    <span class="dim" id="sm-hint">加载中…</span>
+  </div>`;
+}
+
+async function bindSelectionModeControls() {
+  const master = document.getElementById("sm-master");
+  const imgQc = document.getElementById("sm-image-qc");
+  const vidQc = document.getElementById("sm-video-qc");
+  const hint = document.getElementById("sm-hint");
+  if (!master || !imgQc || !vidQc) return;
+  let st;
+  try { st = await api("/api/selection-mode"); } catch (e) { return; }
+  const render = () => {
+    master.checked = !!st.selection_mode;
+    imgQc.checked = !!st.image_content_qc;
+    vidQc.checked = !!st.video_content_qc;
+    // 选片模式开启时内容质检一律视为关闭:子开关只读展示,不误导
+    imgQc.disabled = vidQc.disabled = !!st.selection_mode;
+    master.disabled = false;
+    if (!st.selection_mode) { imgQc.disabled = vidQc.disabled = false; }
+    hint.textContent = st.selection_mode
+      ? `选片模式开启:每镜固定 ${st.shot_candidate_count} 张候选,`
+        + "内容质检不判定、不阻断、不自动返工;不满意改词重抽。"
+        + "生成前导演合同检查与技术完整性检查始终开启"
+      : `选片模式关闭(每镜候选固定 ${st.shot_candidate_count} 张;`
+        + "内容质检按左侧两个独立开关执行)";
+  };
+  const save = async (body, revert) => {
+    master.disabled = imgQc.disabled = vidQc.disabled = true;
+    try {
+      st = await api("/api/selection-mode", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      render();
+      showToast(st.selection_mode
+        ? "创作选片模式已开启:内容质检不再判定,由你选片"
+        : "设置已保存", "ok");
+    } catch (e) {
+      revert();
+      render();
+      showToast(staleServerHint(e), "error");
+    }
+  };
+  master.onchange = () => save(
+    { enabled: master.checked },
+    () => { st.selection_mode = !master.checked; });
+  imgQc.onchange = () => save(
+    { image_content_qc: imgQc.checked },
+    () => { st.image_content_qc = !imgQc.checked; });
+  vidQc.onchange = () => save(
+    { video_content_qc: vidQc.checked },
+    () => { st.video_content_qc = !vidQc.checked; });
+  render();
+}
+
 /* 界面已更新但服务进程还是旧版时,接口会报旧错误 → 给出重启指引 */
 function staleServerHint(e) {
   const msg = String((e && e.message) || e);
@@ -11086,6 +11157,7 @@ function renderScriptReview(data, episodeId) {
         <button id="style-save">保存画风</button>
       </div>
       ${imageLineControlsHtml()}
+      ${selectionModeControlsHtml()}
       <div class="style-row">
         <label>参考图</label>
         <input id="ref-name" placeholder="名称,如:女主官方设定(可留空)">
@@ -11119,6 +11191,7 @@ function renderScriptReview(data, episodeId) {
   bindImageAccelerationLivebar(episodeId);
   bindLightbox(app);
   bindImageLineControls();
+  bindSelectionModeControls();
   const post = (path, body) => api(path, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body) });
