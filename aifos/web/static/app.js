@@ -11419,6 +11419,248 @@ function collectStoryAnalysis(analysis) {
   return next;
 }
 
+const STORY_REVIEW_STATUS = {
+  ready: ["已生成建议", "ready"],
+  advisory: ["有建议 · 不阻断", "advisory"],
+  pending: ["待独立评审 · 不影响生产", "pending"],
+  stale: ["基于旧剧本 · 建议复评", "stale"],
+  not_applicable: ["无前集", "neutral"],
+  unavailable: ["暂不可用 · 不影响生产", "neutral"],
+  invalid: ["记录需核对 · 不影响生产", "advisory"],
+};
+
+function storyReviewStatusHtml(entry, fallback = "已生成建议") {
+  const status = entry?.status || "ready";
+  const [label, tone] = STORY_REVIEW_STATUS[status] || [fallback, "neutral"];
+  return `<span class="story-review-status ${esc(tone)}">${esc(label)}</span>`;
+}
+
+function storyDistributionHtml(title, rows) {
+  const values = Array.isArray(rows) ? rows : [];
+  return `<div class="story-director-stat"><b>${esc(title)}</b><div>${values.length
+    ? values.map((row) => `<span>${esc(row?.[0] || "未标注")} <strong>${Number(row?.[1]) || 0}</strong></span>`).join("")
+    : `<small>暂无数据</small>`}</div></div>`;
+}
+
+function episodeDirectorReviewHtml(review, statusEntry = null) {
+  if (!review || review.kind !== "review" || review.production_blocking !== false) {
+    return `<div class="story-review-empty">${storyReviewStatusHtml(
+      statusEntry || { status: "unavailable" })}<p>${esc(
+        statusEntry?.message || "全集导演摘要暂不可用 · 不影响生产")}</p></div>`;
+  }
+  const completeness = review.input_completeness || {};
+  const missingGroups = [
+    ["台词", completeness.dialogue_missing],
+    ["动作节拍", completeness.beat_missing],
+    ["光影", completeness.lighting_missing],
+    ["剧本故事", completeness.script_reference_missing],
+    ["五维分镜", completeness.five_dimensions_missing],
+    ["起止状态", completeness.start_end_state_missing],
+  ].filter((item) => Array.isArray(item[1]) && item[1].length);
+  return `<div class="story-director-summary">
+    <div class="story-director-kpis">
+      <span><b>${Number(review.shot_count) || 0}</b><small>镜头</small></span>
+      <span><b>${fmt(review.total_duration_seconds || 0, 1)}</b><small>秒</small></span>
+      <span><b>${(review.scenes || []).length}</b><small>场次</small></span>
+      <span><b>${(review.adjacent_repetitions || []).length}</b><small>相邻重复建议</small></span>
+    </div>
+    <div class="story-director-distributions">
+      ${storyDistributionHtml("景别分布", review.shot_scale_distribution)}
+      ${storyDistributionHtml("运镜分布", review.camera_movement_distribution)}
+      ${storyDistributionHtml("戏剧功能", review.shot_function_distribution)}
+    </div>
+    <div class="story-director-scenes">${(review.scenes || []).map((scene) => `<article>
+      <b>第${Number(scene.scene_no) || 0}场 · ${esc(scene.dramatic_function || "待补戏剧功能")}</b>
+      <span>${Number(scene.shot_count) || 0} 镜</span><small>${esc(scene.advice || "")}</small>
+    </article>`).join("") || `<p class="dim">暂无场次摘要</p>`}</div>
+    ${missingGroups.length ? `<details class="story-review-advice">
+      <summary>导演输入完整性建议（不影响生产）</summary>
+      ${missingGroups.map(([label, shots]) => `<p><b>${esc(label)}：</b>镜头 ${shots.map(Number).join("、")}</p>`).join("")}
+    </details>` : `<p class="story-review-ok">导演输入齐备，可继续人工审片。</p>`}
+  </div>`;
+}
+
+function validNineGridBrowser(browser) {
+  if (!browser || browser.kind !== "review"
+      || browser.production_blocking !== false
+      || browser.render_mode !== "independent_shot_cells"
+      || browser.generates_reference_asset !== false
+      || browser.single_image_multi_panel !== false
+      || browser.reference_chain_eligible !== false
+      || browser.view_only !== true || !Array.isArray(browser.pages)) return false;
+  const forbidden = ["composite_uri", "composite_url", "reference_images",
+    "reference_manifest", "reference_assets"];
+  const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+  return !forbidden.some((key) => hasOwn(browser, key))
+    && browser.pages.every((page) => page
+      && page.render_mode === "independent_shot_cells"
+      && page.single_image_multi_panel === false
+      && page.reference_chain_eligible === false
+      && Array.isArray(page.cells) && page.cells.length <= 9
+      && !forbidden.some((key) => hasOwn(page, key)));
+}
+
+function nineGridBrowserHtml(browser, statusEntry = null) {
+  if (!validNineGridBrowser(browser)) {
+    return `<div class="story-review-empty">${storyReviewStatusHtml(
+      statusEntry || { status: "unavailable" })}<p>${esc(
+        statusEntry?.message || "九宫格暂不可用 · 不影响生产")}</p></div>`;
+  }
+  const pages = browser.pages;
+  if (!pages.length) return `<div class="story-review-empty">
+    <span class="story-review-status neutral">尚无分镜 · 不影响生产</span>
+    <p>分镜保存后，这里会按场次生成每页最多九个独立镜头格。</p></div>`;
+  return `<div class="nine-grid-browser" data-nine-grid-page="0">
+    <div class="nine-grid-controls"><button type="button" data-nine-grid-prev aria-label="上一页">←</button>
+      <strong data-nine-grid-label></strong>
+      <button type="button" data-nine-grid-next aria-label="下一页">→</button></div>
+    <div class="nine-grid-invariant">只读审片 · 每格一镜 · 不进入参考链</div>
+    ${pages.map((page, pageIndex) => `<section class="nine-grid-page"
+      data-nine-grid-page-index="${pageIndex}" ${pageIndex ? "hidden" : ""}
+      data-scene-no="${Number(page.scene_no) || 0}" data-scene-page="${Number(page.page_no) || 1}">
+      <div class="nine-grid-cells">${(page.cells || []).slice(0, 9).map((cell) => {
+        const imageUrl = String(cell.keyframe_uri || "");
+        const safeImage = imageUrl.startsWith("/artifacts/") ? imageUrl : "";
+        const shotNo = Number(cell.shot_no) || 0;
+        return `<article class="nine-grid-cell" data-shot-no="${shotNo}"
+          aria-label="第${shotNo}镜，第${Number(cell.scene_no) || 0}场，${esc(cell.shot_scale || "未标注")}，${esc(cell.camera_movement || "固定")}">
+          <button type="button" class="nine-grid-preview" ${safeImage
+            ? `data-nine-grid-preview="${esc(safeImage)}"` : "disabled"}
+            aria-label="${safeImage ? `放大第${shotNo}镜关键帧` : `第${shotNo}镜关键帧待生成`}">
+            ${safeImage ? `<img src="${esc(thumbUrl(safeImage, 360))}" loading="lazy" alt="第${shotNo}镜关键帧">`
+              : `<span class="nine-grid-placeholder">关键帧待生成</span>`}
+            <b>镜头 ${String(shotNo).padStart(2, "0")}</b><small>${fmt(cell.duration_seconds || 0, 1)}s</small>
+          </button>
+          <button type="button" class="nine-grid-select" data-nine-grid-select="${shotNo}">
+            <span>${esc(cell.shot_scale || "未标注")} · ${esc(cell.camera_movement || "固定")}</span>
+            <small>${esc(cell.shot_function || "未标注")}</small>
+          </button>
+        </article>`;
+      }).join("")}</div></section>`).join("")}
+    <div class="nine-grid-detail" data-nine-grid-detail hidden></div>
+  </div>`;
+}
+
+function crossEpisodeContinuityHtml(entry) {
+  const review = entry?.review;
+  if (!review) return `<div class="story-review-empty">${storyReviewStatusHtml(
+    entry || { status: "unavailable" })}<p>${esc(
+      entry?.message || "跨集连续性暂不可用 · 不影响生产")}</p></div>`;
+  return `<div class="continuity-review">
+    <div class="story-review-line">${storyReviewStatusHtml(entry)}<span>来源：第${Number(entry.previous_episode_number) || "-"}集</span></div>
+    <article><b>前集出口状态</b><p>${esc(review.previous_exit_state || "待人工核对")}</p></article>
+    <article><b>未解钩子</b><div class="story-review-tags">${(review.unresolved_hooks || []).map(
+      (hook) => `<span>${esc(hook)}</span>`).join("") || `<small>暂无明确钩子</small>`}</div></article>
+    <div class="continuity-state-grid">${(review.states || []).map((state) => `<article>
+      <b>${esc(state.entity_id || "未命名")} · ${esc(state.domain || "state")}</b>
+      <p>${esc(state.state || "")}</p><small>${esc(state.evidence || "")}</small>
+    </article>`).join("") || `<p class="dim">暂无结构化状态，建议人工核对。</p>`}</div>
+  </div>`;
+}
+
+function scriptIndependentReviewHtml(entry, compact = false) {
+  const review = entry?.review;
+  if (!review) return `<section class="script-independent-review ${compact ? "compact" : ""}">
+    <header><div><b>独立剧本评审</b><small>建议视图 · 非生产门禁</small></div>
+      ${storyReviewStatusHtml(entry || { status: "pending" })}</header>
+    <p>${esc(entry?.message || "待独立评审 · 不影响生产")}</p></section>`;
+  return `<section class="script-independent-review ${compact ? "compact" : ""}">
+    <header><div><b>独立剧本评审</b><small>建议视图 · 非生产门禁</small></div>
+      ${storyReviewStatusHtml(entry)}</header>
+    <div class="script-review-scores">${(review.dimensions || []).map((item) => `<article>
+      <div><b>${esc(item.label || item.dimension || "评审维度")}</b><strong>${Number(item.score) || 0}/5</strong></div>
+      <p>${esc((item.evidence || []).join("；"))}</p>
+      <small>${esc((item.directed_revision || []).join("；"))}</small>
+    </article>`).join("")}</div>
+    <footer>剧本版本 ${esc(review.script_version || "-")} · 评审来源 ${esc(review.reviewer_source || "-")}</footer>
+  </section>`;
+}
+
+function storyIntelligenceHtml(data) {
+  const brain = data.story_intelligence;
+  if (!brain || brain.kind !== "review" || brain.production_blocking !== false) return "";
+  return `<section class="story-intelligence-panel" aria-label="AI导演建议">
+    <header class="story-intelligence-head"><div><span>火火漫剧研究室</span><h2>AI导演建议</h2>
+      <p>整集节奏、九宫格、跨集连续性与独立剧本评审 · 非生产门禁</p></div>
+      <span class="story-review-status ready">只读建议 · 不阻断</span></header>
+    <nav class="story-intelligence-tabs" aria-label="审片视图">
+      <button type="button" class="active" data-story-view-tab="director">全集导演摘要</button>
+      <button type="button" data-story-view-tab="grid">九宫格浏览板</button>
+      <button type="button" data-story-view-tab="continuity">跨集连续性</button>
+      <button type="button" data-story-view-tab="script">剧本独立评审</button>
+    </nav>
+    <div class="story-intelligence-view" data-story-view="director">${episodeDirectorReviewHtml(
+      brain.director_review, brain.director_review_status)}</div>
+    <div class="story-intelligence-view" data-story-view="grid" hidden>${nineGridBrowserHtml(
+      brain.nine_grid_browser, brain.nine_grid_status)}</div>
+    <div class="story-intelligence-view" data-story-view="continuity" hidden>${crossEpisodeContinuityHtml(
+      brain.cross_episode_continuity)}</div>
+    <div class="story-intelligence-view" data-story-view="script" hidden>${scriptIndependentReviewHtml(
+      brain.script_independent_review, true)}</div>
+  </section>`;
+}
+
+function bindStoryIntelligence(root, data, canvas) {
+  const panel = root.querySelector(".story-intelligence-panel");
+  if (!panel) return;
+  panel.querySelectorAll("[data-story-view-tab]").forEach((button) => {
+    button.onclick = () => {
+      panel.querySelectorAll("[data-story-view-tab]").forEach((item) =>
+        item.classList.toggle("active", item === button));
+      panel.querySelectorAll("[data-story-view]").forEach((view) => {
+        view.hidden = view.dataset.storyView !== button.dataset.storyViewTab;
+      });
+    };
+  });
+  const browser = data.story_intelligence?.nine_grid_browser;
+  const grid = panel.querySelector(".nine-grid-browser");
+  if (!grid || !validNineGridBrowser(browser)) return;
+  const pages = [...grid.querySelectorAll("[data-nine-grid-page-index]")];
+  const label = grid.querySelector("[data-nine-grid-label]");
+  const previous = grid.querySelector("[data-nine-grid-prev]");
+  const next = grid.querySelector("[data-nine-grid-next]");
+  const showPage = (requested) => {
+    const pageIndex = Math.max(0, Math.min(pages.length - 1, requested));
+    grid.dataset.nineGridPage = String(pageIndex);
+    pages.forEach((page, index) => { page.hidden = index !== pageIndex; });
+    const page = pages[pageIndex];
+    label.textContent = `第${page?.dataset.sceneNo || "-"}场 · 第${page?.dataset.scenePage || 1}页 · ${pageIndex + 1}/${pages.length}`;
+    previous.disabled = pageIndex === 0; next.disabled = pageIndex === pages.length - 1;
+  };
+  previous.onclick = () => showPage(Number(grid.dataset.nineGridPage) - 1);
+  next.onclick = () => showPage(Number(grid.dataset.nineGridPage) + 1);
+  showPage(0);
+  const cellByShot = new Map();
+  (browser.pages || []).forEach((page) => (page.cells || []).forEach((cell) =>
+    cellByShot.set(Number(cell.shot_no), cell)));
+  const focusShot = (shotNo) => {
+    if (canvas?.select) canvas.select(shotNo);
+    const row = root.querySelector(`.storyboard-table-row[data-shot="${shotNo}"]`)
+      || document.querySelector(`.storyboard-table-row[data-shot="${shotNo}"]`);
+    if (row) { row.scrollIntoView({ behavior: "smooth", block: "center" }); row.focus({ preventScroll: true }); }
+  };
+  const showDetail = (shotNo) => {
+    const cell = cellByShot.get(Number(shotNo));
+    const detail = grid.querySelector("[data-nine-grid-detail]");
+    if (!cell || !detail) return;
+    detail.hidden = false;
+    detail.innerHTML = `<div><b>镜头 ${Number(cell.shot_no) || 0} · 第${Number(cell.scene_no) || 0}场</b>
+      <span>${esc(cell.shot_scale || "未标注")} · ${esc(cell.camera_movement || "固定")} · ${fmt(cell.duration_seconds || 0, 1)}s</span></div>
+      <p><b>对应剧本故事：</b>${esc(cell.script_reference || "待补")}</p>
+      <p><b>台词：</b>${esc(cell.dialogue || "无")}</p>
+      <p><b>视觉钩子：</b>${esc(cell.visual_hook || "待补")}</p>
+      <button type="button" data-nine-grid-locate="${Number(cell.shot_no) || 0}">定位到分镜表</button>`;
+    detail.querySelector("[data-nine-grid-locate]").onclick = () => focusShot(Number(cell.shot_no));
+  };
+  grid.querySelectorAll("[data-nine-grid-select]").forEach((button) => {
+    button.onclick = () => showDetail(Number(button.dataset.nineGridSelect));
+  });
+  grid.querySelectorAll("[data-nine-grid-preview]").forEach((button) => {
+    button.onclick = () => showImageLightbox(button.dataset.nineGridPreview,
+      button.getAttribute("aria-label") || "关键帧预览");
+  });
+}
+
 function renderScriptReview(data, episodeId) {
   const script = data.script;
   const storyAnalysis = data.story_analysis || script.production_analysis || null;
@@ -11497,6 +11739,8 @@ function renderScriptReview(data, episodeId) {
          人物形象和画风会稳定得多;之后在「资产中心」也能管理。</div>`}
     </div>
     ${storyAnalysisEditorHtml(storyAnalysis, data.story_analysis_version)}
+    ${scriptIndependentReviewHtml(
+      data.story_intelligence?.script_independent_review)}
     <div class="script-review">${scriptBodyHtml(script, {
       skipped: (data.scene_plan || {}).skipped_scenes,
       episodeId: data.episode.id, manage: true })}</div>
@@ -12152,6 +12396,7 @@ function renderTheater(data, canvas) {
     </div>` : ""}
     ${productionLedgerHtml(data, { context: "review" })}
     ${relationCanvasHtml(data)}
+    ${storyIntelligenceHtml(data)}
     ${shotProductionTableHtml(data, {
       shotIssues: canvas.shotIssues, context: "review" })}`;
 
@@ -12163,6 +12408,7 @@ function renderTheater(data, canvas) {
     renameProject(data.project.title,
       () => renderCanvasView(data.episode.id));
   bindProductionLedger(el, data, data.episode.id);
+  bindStoryIntelligence(el, data, canvas);
   bindShotProductionTable(el, data, (shotNo) => {
     canvas.select(shotNo);
     if (window.matchMedia("(max-width: 780px)").matches) {

@@ -50,6 +50,11 @@ from ..scene_render import build_scene_render_contract
 from ..smart_input import resolve_produce_target
 from ..standard_center import StandardConflictError, StandardValidationError
 from ..story_context import attach_shot_story_context
+from ..story_intelligence import (
+    build_storyboard_review_documents,
+    derive_episode_continuity_input,
+    review_document,
+)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -1087,6 +1092,167 @@ def _collect_artifacts(app, project_id, ep_num):
         for row in latest_rows("inner_persona")]
     out["image_assets"] = _image_asset_catalog(app, project_id)
     return out
+
+
+def _nonblocking_story_status(status, message, **extra):
+    """Return one fail-soft story-intelligence view status.
+
+    These values are deliberately review-only.  They must never be reused as
+    production task, gate, or episode status values.
+    """
+    return {
+        "kind": "review",
+        "production_blocking": False,
+        "available": status in {"ready", "advisory", "stale"},
+        "status": status,
+        "message": message,
+        **extra,
+    }
+
+
+def _saved_script_review_payload(app, episode_id, script_version):
+    """Expose an independently produced review without manufacturing one.
+
+    A detail GET has no reviewer run, evidence, or model call of its own, so it
+    may only read a saved review document.  Invalid and stale documents remain
+    visible as advice states and never become production failures.
+    """
+    saved, document_version = app.projects.latest_document(
+        episode_id, "script_review")
+    if saved is None:
+        return _nonblocking_story_status(
+            "pending", "待独立评审 · 不影响生产",
+            document_version=document_version)
+    try:
+        document = review_document(saved)
+        if (document.get("schema") == "aifos.story-review-pending/v1"
+                or document.get("status") == "pending"):
+            message = str(document.get("reason") or "").strip()
+            return _nonblocking_story_status(
+                "pending",
+                ((message + " · ") if message else "")
+                + "待独立评审 · 不影响生产",
+                document_version=document_version)
+        if document.get("schema") != "aifos.story-review/v1":
+            raise ValueError("独立评审 schema 不匹配")
+        generator_run = str(document.get("generator_run_id") or "").strip()
+        reviewer_run = str(document.get("reviewer_run_id") or "").strip()
+        reviewer_source = str(document.get("reviewer_source") or "").strip()
+        if not generator_run or not reviewer_run or generator_run == reviewer_run:
+            raise ValueError("独立评审必须来自不同于编剧生成的运行")
+        if reviewer_source.lower() in {
+                "", "generator", "self", "self_report", "生成器", "自评"}:
+            raise ValueError("独立评审来源无效")
+        dimensions = document.get("dimensions")
+        if not isinstance(dimensions, list) or len(dimensions) != 5:
+            raise ValueError("独立评审必须完整提供五维")
+    except (TypeError, ValueError) as exc:
+        return _nonblocking_story_status(
+            "invalid", f"独立评审记录无效：{exc} · 不影响生产",
+            document_version=document_version)
+
+    current_version = str(script_version or "")
+    review_version = str(document.get("script_version") or "")
+    if not current_version or review_version != current_version:
+        return _nonblocking_story_status(
+            "stale", "基于旧剧本 · 建议复评 · 不影响生产",
+            document_version=document_version, review=document)
+    return _nonblocking_story_status(
+        "ready", "已完成独立评审 · 非生产门禁",
+        document_version=document_version, review=document)
+
+
+def _previous_episode_continuity_payload(app, episode, project_id):
+    """Derive advice from the exact preceding episode, never a distant one."""
+    previous_number = int(episode["number"]) - 1
+    if previous_number < 1:
+        return _nonblocking_story_status(
+            "not_applicable", "本集没有前集 · 非生产门禁")
+    previous = app.db.query_one(
+        "SELECT id, number FROM episodes WHERE project_id=? AND number=?",
+        (project_id, previous_number))
+    if previous is None:
+        return _nonblocking_story_status(
+            "unavailable", "未找到紧邻前集 · 不影响生产",
+            previous_episode_number=previous_number)
+    previous_script, _ = app.projects.latest_document(
+        previous["id"], "script")
+    previous_storyboard, _ = app.projects.latest_document(
+        previous["id"], "storyboard")
+    previous_continuity, _ = app.projects.latest_document(
+        previous["id"], "continuity")
+    try:
+        document = review_document(derive_episode_continuity_input(
+            previous_episode_id=str(previous["id"]),
+            previous_script=previous_script or {},
+            previous_storyboard=previous_storyboard or {},
+            previous_continuity=previous_continuity or {},
+        ))
+    except (TypeError, ValueError) as exc:
+        return _nonblocking_story_status(
+            "unavailable", f"前集连续性暂不可用：{exc} · 不影响生产",
+            previous_episode_id=previous["id"],
+            previous_episode_number=previous["number"])
+    has_saved_facts = bool(
+        document.get("states") or document.get("unresolved_hooks"))
+    return _nonblocking_story_status(
+        "ready" if has_saved_facts else "advisory",
+        ("已读取前集出口状态 · 非生产门禁" if has_saved_facts
+         else "前集资料不完整，请人工核对 · 不影响生产"),
+        previous_episode_id=previous["id"],
+        previous_episode_number=previous["number"], review=document)
+
+
+def _story_intelligence_payload(
+        app, episode, project, storyboard, storyboard_version,
+        script_version, artifacts):
+    """Build deterministic, read-only story views for the episode payload."""
+    result = {
+        "schema": "aifos.story-intelligence-view/v1",
+        "kind": "review",
+        "production_blocking": False,
+        "status": "partial",
+        "director_review": None,
+        "nine_grid_browser": None,
+    }
+    # The grid may only receive browser-safe artifact URLs.  Absolute paths or
+    # non-artifact URLs are omitted rather than leaking into the review model.
+    safe_keyframes = {
+        shot_no: url for shot_no, url in (artifacts.get("images") or {}).items()
+        if isinstance(url, str) and url.startswith("/artifacts/")
+    }
+    try:
+        documents = build_storyboard_review_documents(
+            episode_id=str(episode["id"]),
+            storyboard=storyboard or {"shots": []},
+            keyframes=safe_keyframes,
+            storyboard_version=storyboard_version or "unknown",
+        )
+        result["director_review"] = review_document(
+            documents["director_review"])
+        result["nine_grid_browser"] = review_document(
+            documents["nine_grid_browser"])
+        result["status"] = "ready" if storyboard else "partial"
+    except (TypeError, ValueError) as exc:
+        result["director_review_status"] = _nonblocking_story_status(
+            "unavailable", f"全集导演摘要暂不可用：{exc} · 不影响生产")
+        result["nine_grid_status"] = _nonblocking_story_status(
+            "unavailable", f"九宫格暂不可用：{exc} · 不影响生产")
+
+    try:
+        result["cross_episode_continuity"] = (
+            _previous_episode_continuity_payload(
+                app, episode, project["id"]))
+    except Exception as exc:  # review enrichment must never break production GET
+        result["cross_episode_continuity"] = _nonblocking_story_status(
+            "unavailable", f"跨集连续性暂不可用：{exc} · 不影响生产")
+    try:
+        result["script_independent_review"] = _saved_script_review_payload(
+            app, episode["id"], script_version)
+    except Exception as exc:  # corrupt advisory data also fails soft
+        result["script_independent_review"] = _nonblocking_story_status(
+            "unavailable", f"独立剧本评审暂不可用：{exc} · 不影响生产")
+    return result
 
 
 def _current_render_plan_items(render_plan):
@@ -2416,6 +2582,10 @@ def _episode_payload(app, episode_id, jobs=None):
         app, episode, render_plan)
     production_guidance = _production_guidance(
         app, episode, storyboard, render_plan, production_progress)
+    artifacts = _collect_artifacts(
+        app, project["id"], episode["number"])
+    story_intelligence = _story_intelligence_payload(
+        app, episode, project, storyboard, sb_v, script_v, artifacts)
     payload = {
         "build": BUILD,
         "episode": dict(episode),
@@ -2464,6 +2634,7 @@ def _episode_payload(app, episode_id, jobs=None):
         "production_guidance": production_guidance,
         "image_failures": image_failures,
         "relations": relations,
+        "story_intelligence": story_intelligence,
         "lessons": project_lessons(app.assets, project["id"], limit=20),
         "image_acceleration": {
             "summary": image_acceleration["summary"],
@@ -2471,8 +2642,7 @@ def _episode_payload(app, episode_id, jobs=None):
             "default_model": image_acceleration["default_model"],
             "default_quality": image_acceleration["default_quality"],
         },
-        "artifacts": _collect_artifacts(
-            app, project["id"], episode["number"]),
+        "artifacts": artifacts,
     }
     if jobs is not None:
         status = _episode_status_payload(app, episode_id, jobs)
