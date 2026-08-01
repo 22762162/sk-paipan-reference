@@ -2724,7 +2724,7 @@ def make_handler(workspace, jobs):
                     # 不触碰生成/QC流程)
                     return self._json(self._with_app(lambda app: {
                         "selection_mode": bool(app.config.get(
-                            "defaults", "selection_mode", default=False)),
+                            "defaults", "selection_mode", default=True)),
                         "image_content_qc": bool(app.config.get(
                             "defaults", "image_content_qc", default=True)),
                         "video_content_qc": bool(app.config.get(
@@ -4131,7 +4131,7 @@ def make_handler(workspace, jobs):
                 return {
                     "ok": True,
                     "selection_mode": bool(fresh.get(
-                        "defaults", "selection_mode", default=False)),
+                        "defaults", "selection_mode", default=True)),
                     "image_content_qc": bool(fresh.get(
                         "defaults", "image_content_qc", default=True)),
                     "video_content_qc": bool(fresh.get(

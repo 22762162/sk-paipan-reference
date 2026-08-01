@@ -211,7 +211,7 @@ def settings_payload(app):
                 "defaults", "parallel_videos", default=4),
             # 创作选片模式三开关+固定候选张数:必须回显,UI 才能反映持久化现状
             "selection_mode": bool(app.config.get(
-                "defaults", "selection_mode", default=False)),
+                "defaults", "selection_mode", default=True)),
             "image_content_qc": bool(app.config.get(
                 "defaults", "image_content_qc", default=True)),
             "video_content_qc": bool(app.config.get(

@@ -429,8 +429,12 @@ def test_selection_mode_web_endpoints(tmp_path):
 
         status, view = call("GET", "/api/selection-mode")
         assert status == 200
-        assert view == {"selection_mode": False, "image_content_qc": True,
+        # 升级后的新产线默认:选片模式开箱即开(旧 workspace 无键同样生效)
+        assert view == {"selection_mode": True, "image_content_qc": True,
                         "video_content_qc": True, "shot_candidate_count": 4}
+
+        status, view = call("POST", "/api/selection-mode", {"enabled": False})
+        assert status == 200 and view["ok"] and view["selection_mode"] is False
 
         status, view = call("POST", "/api/selection-mode", {"enabled": True})
         assert status == 200 and view["ok"] and view["selection_mode"]
