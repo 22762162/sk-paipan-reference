@@ -90,14 +90,26 @@ def test_default_standard_is_complete_and_active(tmp_path):
         assert text_assets["style_description_required"] is True
         assert text_assets["forbid_prompt_metadata_as_text"] is True
         assert "质检原因" in text_assets["forbidden_system_fields"]
-        assert production["preferred_segment_seconds"] == [5, 8]
+        assert production["preferred_segment_seconds"] == [8, 15]
         assert production["max_segment_seconds"] == 15
+        assert production["long_take_policy"] == {
+            "enabled": True,
+            "preferred_seconds": [8, 15],
+            "target_seconds": [10, 15],
+            "embed_environment_setup": True,
+            "embed_listener_reaction": True,
+            "embed_emotional_settle": True,
+            "embed_physical_action": True,
+            "temporal_phases_required": True,
+            "short_shot_exception_required_below_seconds": 8,
+            "max_dialogue_lines_per_shot": 1,
+        }
         upgrade = production["model_upgrade_policy"]
         assert upgrade["enabled"] is True
         assert upgrade["scope"] == "per_shot"
         assert upgrade["candidate_capability_key"] == "seedance2_5"
         assert upgrade["normal_profile"] == {
-            "preferred_segment_seconds": [5, 8],
+            "preferred_segment_seconds": [8, 15],
             "max_segment_seconds": 15,
         }
         assert upgrade["upgrade_duration_range_seconds"] == [16, 30]
@@ -197,6 +209,10 @@ def test_save_creates_immutable_version_and_persists(tmp_path):
     content["name"] = "SK 精品漫剧·高密度版"
     content["description"] = "面向高密度情绪叙事的可调版本。"
     content["rules"]["production"]["preferred_segment_seconds"] = [6, 8]
+    content["rules"]["production"]["long_take_policy"][
+        "preferred_seconds"] = [6, 8]
+    content["rules"]["production"]["long_take_policy"][
+        "target_seconds"] = [7, 8]
     second = app.standards.save(
         content, change_note="调整优选分段", expected_active_id=first["version_id"])
     assert second["version"] == 2

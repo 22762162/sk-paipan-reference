@@ -32,6 +32,9 @@ MIN_CAMERA_SEPARATION = 90
 # 成片门禁只检查真实三维机位与演员的物理净距；二维图标为了可读性
 # 使用的 90px 间距不能反过来推翻导演求出的合法特写/过肩机位。
 MIN_CAMERA_ACTOR_CLEARANCE_M = .3
+# 过肩镜头允许摄影机贴近柔焦肩背前景；仍保留 12cm 硬净距，避免机位
+# 与演员锚点完全重合。景别由主拍对象距离决定，不由这名前景演员决定。
+OVER_SHOULDER_CAMERA_CLEARANCE_M = .12
 ACTOR_COLORS = (
     "#ff5d8f", "#52b8ff", "#ffc857", "#69db9d", "#ad8cff", "#ff8c5a",
 )
@@ -88,9 +91,9 @@ def _number(value, default=0):
 
 def _position_x(value, fallback):
     text = str(value or "")
-    if "左" in text:
+    if "左" in text or "西" in text:
         return 300
-    if "右" in text:
+    if "右" in text or "东" in text:
         return 700
     if "中" in text or "中心" in text:
         return 500
@@ -708,7 +711,7 @@ def _wrap_deg(deg):
     return ((float(deg) + 180.0) % 360.0) - 180.0
 
 
-def _canvas_from_world(world_point):
+def canvas_from_world(world_point):
     """世界坐标(米) → 二维画布坐标。_world_point 的逆,让示意图与三维同源。"""
     try:
         wx = float(world_point.get("x", 0.0))
@@ -746,8 +749,8 @@ def _apply_director_camera(camera, shot, positions, world=None):
     solved = solve_camera_motion(
         solved, shot, subject_start=start_xz, subject_end=end_xz,
         world=world_dict)
-    camera["start"] = _canvas_from_world(solved["position_3d"])
-    camera["end"] = _canvas_from_world(solved["end_position_3d"])
+    camera["start"] = canvas_from_world(solved["position_3d"])
+    camera["end"] = canvas_from_world(solved["end_position_3d"])
     camera["moving"] = bool(solved.get("moving"))
     camera["movement"] = solved.get("movement") or camera.get("movement")
     direction = _direction(camera["start"], camera["end"])
@@ -945,6 +948,7 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
                  if int(s.get("scene_no", 0)) == scene_no]
         required, reasons = _needs_map(shots, int(group_threshold or 3))
         previous_end = {}
+        previous_visible = set()
         dialogue_memory = {}
         scene_shots = []
         for local_index, shot in enumerate(shots):
@@ -952,8 +956,12 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
             positions = []
             occupied_starts = []
             occupied_ends = []
-            reserved_inherited = [previous_end[name] for name in people
-                                  if name in previous_end]
+            # 相邻上一镜仍可见的人物拥有连续性优先权；
+            # 中间已出画者的旧坐标只是建议，不能抢占连续人物
+            # 在上一镜的真实终点。
+            reserved_continuing = [
+                previous_end[name] for name in people
+                if name in previous_visible and name in previous_end]
             starts = {}
             for actor_index, name in enumerate(people):
                 state_start = (shot.get("start_state") or {}).get(name, {})
@@ -961,14 +969,34 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
                 requested_x = _position_x(
                     state_start.get("position"), fallback_x)
                 inherited = previous_end.get(name)
-                start = inherited or _spread_point(
-                    _point(requested_x, 330 + (actor_index % 2) * 90),
-                    occupied_starts + reserved_inherited)
+                preferred_start = _point(
+                    requested_x, 330 + (actor_index % 2) * 90)
+                continuing = name in previous_visible
+                if inherited and continuing:
+                    # 相邻镜同一人物必须严格继承终点；新入镜/
+                    # 再入镜人物会在轮到自己时避开这个保留点。
+                    start = inherited
+                elif inherited and all(
+                        _distance(inherited, point) >= MIN_ACTOR_SEPARATION
+                        for point in (
+                            occupied_starts + reserved_continuing)):
+                    start = inherited
+                elif inherited:
+                    # 两个人可能分别从不同前镜继承到同一坐标，
+                    # 直到后续首次同框才暴露冲突。继承保证连续性，
+                    # 但不能压过“同镜人物不重合”的物理硬门禁；
+                    # 用本镜起始状态声明的左/中/右区域重新摊开。
+                    start = _spread_point(
+                        preferred_start,
+                        occupied_starts + reserved_continuing)
+                else:
+                    start = _spread_point(
+                        preferred_start,
+                        occupied_starts + reserved_continuing)
                 # 同镜中首次出现人物如果恰好占用继承人物位置，也必须避让。
-                if not inherited and any(
-                        _distance(start, point) < MIN_ACTOR_SEPARATION
-                        for point in occupied_starts):
-                    start = _spread_point(start, occupied_starts)
+                if any(_distance(start, point) < MIN_ACTOR_SEPARATION
+                       for point in occupied_starts):
+                    start = _spread_point(preferred_start, occupied_starts)
                 occupied_starts.append(start)
                 starts[name] = start
             # 终点在全员起点锁定后再计算，避免 A 的终点压住稍后出现的 B 起点。
@@ -1141,6 +1169,7 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
             }
             scene_shots.append(block)
             shot_index[str(block["shot_no"])] = block
+            previous_visible = set(people)
         scenes.append({
             "scene_no": scene_no,
             "location": _scene_location(script, continuity, scene_no),
@@ -1205,6 +1234,7 @@ def validate_spatial_plan(plan, storyboard):
         for scene in plan.get("scenes", []) for shot in scene.get("shots", [])
     }
     previous = {}
+    previous_visible = {}
     previous_dialogue = {}
     for shot in storyboard.get("shots", []):
         shot_no = str(shot.get("shot_no"))
@@ -1278,9 +1308,17 @@ def validate_spatial_plan(plan, storyboard):
         scene_no = shot.get("scene_no")
         for actor in block.get("actors", []):
             key = (scene_no, actor.get("name"))
-            if key in previous and actor.get("start") != previous[key]:
+            # 只有相邻两镜都可见的人物，才要求 N 镜终点
+            # 严格等于 N+1 镜起点。人物中间已出画时，再入镜可以
+            # 从本镜明确声明的新区域出现；强行继承“上次可见
+            # 坐标”会把分别出画的两人压到同一点。
+            was_visible_in_previous_shot = (
+                actor.get("name") in previous_visible.get(scene_no, set()))
+            if (key in previous and was_visible_in_previous_shot
+                    and actor.get("start") != previous[key]):
                 issues.append(f"镜头 {shot_no} 的 {actor.get('name')} 起点未继承上一镜终点")
             previous[key] = actor.get("end")
+        previous_visible[scene_no] = set(actual)
         camera = block.get("camera") or {}
         if (not camera.get("start") or not camera.get("end")
                 or not camera.get("target") or not camera.get("route")
@@ -1357,18 +1395,22 @@ def validate_spatial_plan(plan, storyboard):
             previous_dialogue[dialogue_key] = current
         camera_phases = (
             ("start_3d", "start_3d"), ("end_3d", "end_3d"))
+        camera_clearance = (
+            OVER_SHOULDER_CAMERA_CLEARANCE_M
+            if "过肩" in str(camera.get("position") or "")
+            else MIN_CAMERA_ACTOR_CLEARANCE_M)
         if any(
                 math.hypot(
                     float((camera.get(camera_key) or {}).get("x", math.inf))
                     - float((actor.get(actor_key) or {}).get("x", 0.0)),
                     float((camera.get(camera_key) or {}).get("z", math.inf))
                     - float((actor.get(actor_key) or {}).get("z", 0.0)),
-                ) < MIN_CAMERA_ACTOR_CLEARANCE_M
+                ) < camera_clearance
                 for camera_key, actor_key in camera_phases
                 for actor in actor_points):
             issues.append(
                 f"镜头 {shot_no} 摄影机与演员物理净距不足 "
-                f"{MIN_CAMERA_ACTOR_CLEARANCE_M}m")
+                f"{camera_clearance}m")
     return {"passed": not issues, "issues": issues,
             "checked_shots": len(storyboard.get("shots", []))}
 

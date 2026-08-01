@@ -216,6 +216,39 @@ class DurationTest(unittest.TestCase):
         ]})
         self.assertTrue(report["passed"])
 
+    def test_long_take_profile_requires_eight_seconds_or_exception(self):
+        storyboard = {
+            "profile": {
+                "long_take_policy": {
+                    "enabled": True,
+                    "preferred_seconds": [8, 15],
+                    "temporal_phases_required": True,
+                },
+            },
+            "shots": [self._shot(6)],
+        }
+        report = preflight_storyboard({}, storyboard)
+        self.assertEqual(
+            [item["kind"] for item in report["issues"]],
+            ["duration_under_preferred"])
+
+    def test_long_take_profile_accepts_three_phases(self):
+        storyboard = {
+            "profile": {
+                "long_take_policy": {
+                    "enabled": True,
+                    "preferred_seconds": [8, 15],
+                    "temporal_phases_required": True,
+                },
+            },
+            "shots": [self._shot(10, temporal_beats=[
+                {"phase": "setup"},
+                {"phase": "main"},
+                {"phase": "settle"},
+            ])],
+        }
+        self.assertTrue(preflight_storyboard({}, storyboard)["passed"])
+
 
 if __name__ == "__main__":
     unittest.main()

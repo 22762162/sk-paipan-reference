@@ -133,6 +133,70 @@ def test_qc_keeps_wording_only_input_advice_non_blocking(app):
     assert report["hard_failure"] is False
 
 
+def test_tiered_fidelity_accepts_noncritical_composition_variance(app):
+    report = app.director._assess_image_qc({
+        "identity_required": False,
+        "gender_required": False,
+        "wardrobe_required": False,
+        "count_required": True,
+        "count": 2,
+        "physical_logic_required": True,
+        "fidelity_policy": {"schema": "aifos.fidelity-tiers/v1"},
+    }, {
+        # A legacy judge may dislike the exact crop and set these false.  The
+        # tiered result is authoritative when all hard checks and technical
+        # quality pass and no critical failure is named.
+        "pass": False,
+        "visual_pass": False,
+        "input_contract_pass": True,
+        "count_checked": True,
+        "count_match": True,
+        "physical_logic_checked": True,
+        "physical_logic_match": True,
+        "spatial_logic_checked": True,
+        "spatial_logic_match": True,
+        "technical_quality_pass": True,
+        "critical_failures": [],
+        "advisory_issues": [
+            "前后重叠量略少，焦段观感更接近100mm而非135mm"],
+        "issues": [],
+    }, attempts=1)
+
+    assert report["passed"] is True
+    assert report["image_passed"] is True
+    assert report["redraw_required"] is False
+    assert report["critical_failures"] == []
+    assert report["advisory_issues"]
+    assert report["qc_policy"] == (
+        "critical_facts_with_creative_tolerance_v1")
+
+
+def test_tiered_fidelity_still_blocks_named_critical_failure(app):
+    report = app.director._assess_image_qc({
+        "identity_required": False,
+        "gender_required": False,
+        "wardrobe_required": False,
+        "count_required": True,
+        "count": 2,
+        "physical_logic_required": False,
+        "fidelity_policy": {"schema": "aifos.fidelity-tiers/v1"},
+    }, {
+        "pass": True,
+        "visual_pass": True,
+        "input_contract_pass": True,
+        "count_checked": True,
+        "count_match": True,
+        "technical_quality_pass": True,
+        "critical_failures": ["顾明昭被生成成男性，属于关键身份错误"],
+        "advisory_issues": [],
+        "issues": [],
+    }, attempts=1)
+
+    assert report["passed"] is False
+    assert report["hard_failure"] is True
+    assert report["redraw_required"] is True
+
+
 def test_qc_treats_visible_wardrobe_drift_as_hard_failure(app):
     report = app.director._assess_image_qc({
         "identity_required": False,
@@ -309,6 +373,27 @@ def test_codex_qc_checks_historical_prop_morphology(tmp_path):
     assert "时代物件锁定—油灯" in instruction
     assert "玻璃灯罩" in instruction
     assert "煤油灯" in instruction
+
+
+def test_codex_qc_treats_declared_hair_ornament_shape_as_critical(tmp_path):
+    from aifos.adapters.codex_image import build_instruction
+
+    instruction, _, _ = build_instruction("image_qc", {
+        "image_uri": "/tmp/gu.png",
+        "characters": ["顾明昭"],
+        "count": 1,
+        "expected_wardrobe": {
+            "顾明昭": (
+                "服装:沉香褐窄袖比甲；头饰:横向断纹旧银簪；"
+                "妆发:中高扁圆髻"),
+        },
+    }, tmp_path)
+
+    assert "标志性连续性锚点" in instruction
+    assert "名称、类别、主轮廓、主要材质与颜色、佩戴位置和显著纹饰端头" in instruction
+    assert "长银簪简化成短小发夹" in instruction
+    assert "wardrobe_match=false" in instruction
+    assert "不得套用“非关键配饰细差”容错" in instruction
     assert "正确结构" in instruction
 
 
@@ -447,6 +532,39 @@ def test_qc_fail_triggers_auto_redraw(app, tmp_path):
                                       uri=str(image))
             calls["qc"].append(dict(payload))
             first = len(calls["qc"]) == 1
+            if payload.get("required_provider") == "codex":
+                return ProviderResult(
+                    provider="codex", cost=0.5,
+                    data={
+                        "pass": False,
+                        "issues": ["小鹿被画成了动物"],
+                        "image_error": {
+                            "summary": "小鹿被画成了动物",
+                            "categories": ["species"],
+                            "evidence": ["画面主体不是人类"],
+                        },
+                        "prompt_diagnosis": {
+                            "status": "insufficient",
+                            "issues": ["主体物种约束不够明确"],
+                            "irrelevant_or_conflicting_sections": [],
+                        },
+                        "reference_diagnosis": {
+                            "status": "correct", "issues": [],
+                            "missing_roles": [],
+                        },
+                        "targeted_prompt_patch": {
+                            "instructions": [
+                                "小鹿是人类女性，不得生成动物或兽形"],
+                            "preserve": ["当前构图", "场景"],
+                            "max_scope": "current_shot_only",
+                        },
+                        "reference_adjustments": [],
+                        "codex_escalation": {
+                            "aifos_action": "targeted_redraw",
+                            "aifos_instructions": [
+                                "小鹿是人类女性，不得生成动物或兽形"],
+                        },
+                    })
             return ProviderResult(
                 provider="claude", cost=0.5,
                 data={"pass": not first,
@@ -480,19 +598,19 @@ def test_qc_fail_triggers_auto_redraw(app, tmp_path):
         "image", {"prompt": "x", "shot_no": 1}, tmp_path, None,
         {"characters": ["小鹿"], "count": 1, "designs": "",
          "location": "", "action": "", "forbid": []})
-    assert len(calls["image"]) == 2          # 首画 + 质检重画
-    assert "小鹿是人类女性" in calls["image"][1]["feedback"]
-    assert "【本镜定向修正】" in calls["image"][1]["feedback"]
-    assert "只修改当前镜头" in calls["image"][1]["feedback"]
-    assert "【质检原因】" not in calls["image"][1]["feedback"]
+    assert len(calls["image"]) == 4          # 首画 + 同词三抽
+    assert all("小鹿是人类女性" in row["feedback"]
+               for row in calls["image"][1:])
+    assert all(row["revision_mode"] == "targeted_qc_fix"
+               for row in calls["image"][1:])
     assert result.qc["passed"] is True
-    assert result.qc["attempts"] == 2
-    assert result.cost == 3.0        # 两次出图(2.0)+两次质检(1.0)
+    assert result.qc["generation_attempts"] == 4
+    assert result.qc["gacha"]["pulls"] == 3
+    assert result.cost == 6.5        # 四次出图+五次质检(含Codex升级)
     assert calls["qc"][0]["generation_input"]["scope"]["shot_no"] == 1
     assert calls["qc"][0]["generation_input"]["input_hash"]
-    assert len(result.qc["attempt_history"]) == 2
-    assert result.qc["attempt_history"][0][
-        "input_hash"] != result.qc["attempt_history"][1]["input_hash"]
+    assert result.qc["first_failure"]["input_hash"] != \
+        result.qc["generation_input"]["input_hash"]
 
 
 def _escalation_verdict(*, escalated=False, action="repair_contract",
@@ -590,8 +708,8 @@ def test_first_failure_escalates_then_redraws_with_codex_prompt(
         "consecutive_failures"] == 1
     # 初版1张 + 同一份 Codex 修订合同候选3张，候选不得提前停止。
     assert router.calls["image"] == 4
-    # 初检1 + 首败升级1 + 3张候选双路会诊6 + 全败升级1。
-    assert router.calls["qc"] == 9
+    # 初检1 + 首败升级1 + 3张候选逐张全检 + 全败升级1。
+    assert router.calls["qc"] == 6
     for candidate in router.image_payloads[1:]:
         feedback = candidate.get("feedback") or ""
         assert "把静态关键帧改为唯一拱手完成瞬间" in feedback
@@ -1000,6 +1118,41 @@ def test_reference_diagnosis_removes_wrong_manual_ref_before_retry(
                     provider="seedream", cost=0.2, uri=str(output))
             calls["qc"].append(dict(payload))
             first = len(calls["qc"]) == 1
+            if payload.get("required_provider") == "codex":
+                return ProviderResult(provider="codex", cost=0.1, data={
+                    "pass": False,
+                    "issues": ["错误参考图造成现代服装"],
+                    "identity_checked": True, "identity_match": True,
+                    "gender_checked": True, "gender_match": True,
+                    "count_checked": True, "count_match": True,
+                    "image_error": {
+                        "summary": "服装年代错误",
+                        "categories": ["wardrobe"],
+                        "evidence": ["画面是现代西装"],
+                    },
+                    "prompt_diagnosis": {
+                        "status": "correct", "issues": [],
+                        "irrelevant_or_conflicting_sections": [],
+                    },
+                    "reference_diagnosis": {
+                        "status": "conflicting",
+                        "issues": ["图1属于其他项目且服装错误"],
+                        "missing_roles": [],
+                    },
+                    "targeted_prompt_patch": {
+                        "instructions": [], "preserve": [],
+                        "max_scope": "current_shot_only",
+                    },
+                    "reference_adjustments": [{
+                        "action": "remove", "target_index": 1,
+                        "role": "manual", "character": "",
+                        "reason": "移除错误服装参考",
+                    }],
+                    "codex_escalation": {
+                        "aifos_action": "targeted_redraw",
+                        "aifos_instructions": ["移除错误服装参考后重新起画"],
+                    },
+                })
             return ProviderResult(provider="vision", cost=0.1, data={
                 "pass": not first,
                 "issues": ["错误参考图造成现代服装"] if first else [],
@@ -1047,12 +1200,13 @@ def test_reference_diagnosis_removes_wrong_manual_ref_before_retry(
         })
 
     assert result.qc["passed"] is True
-    assert len(calls["image"]) == 2
-    assert str(wrong) not in calls["image"][1].get("reference_images", [])
-    assert calls["image"][1].get("reference_manifest") == []
-    assert result.qc["attempt_history"][0][
-        "reference_hash"] != result.qc["attempt_history"][1][
-            "reference_hash"]
+    assert len(calls["image"]) == 4
+    assert all(str(wrong) not in row.get("reference_images", [])
+               for row in calls["image"][1:])
+    assert all(row.get("reference_manifest") == []
+               for row in calls["image"][1:])
+    assert result.qc["first_failure"]["input_hash"] != \
+        result.qc["generation_input"]["input_hash"]
 
 
 def test_gender_mismatch_is_a_hard_identity_gate(app, tmp_path):
@@ -1165,6 +1319,39 @@ def test_count_mismatch_auto_revises_bad_image_with_locked_references(
                     provider="seedream5_lite", cost=0.2, uri=str(image))
             calls["qc"].append(dict(payload))
             first = len(calls["qc"]) == 1
+            if payload.get("required_provider") == "codex":
+                return ProviderResult(provider="codex", cost=0.1, data={
+                    "pass": False,
+                    "identity_checked": True, "identity_match": True,
+                    "gender_checked": True, "gender_match": True,
+                    "count_checked": True, "count_match": False,
+                    "detected_count": 3,
+                    "issues": ["多出一名人物"],
+                    "image_error": {
+                        "summary": "画面多出一名人物",
+                        "categories": ["count"],
+                        "evidence": ["检测到3人，要求2人"],
+                    },
+                    "prompt_diagnosis": {
+                        "status": "needs_patch",
+                        "issues": ["人数边界需要强化"],
+                        "irrelevant_or_conflicting_sections": [],
+                    },
+                    "reference_diagnosis": {
+                        "status": "correct", "issues": [],
+                        "missing_roles": [],
+                    },
+                    "targeted_prompt_patch": {
+                        "instructions": ["画面严格只保留甲、乙两人"],
+                        "preserve": ["甲乙身份", "原机位"],
+                        "max_scope": "current_shot_only",
+                    },
+                    "reference_adjustments": [],
+                    "codex_escalation": {
+                        "aifos_action": "targeted_redraw",
+                        "aifos_instructions": ["画面严格只保留甲、乙两人"],
+                    },
+                })
             return ProviderResult(provider="vision", cost=0.1, data={
                 "pass": not first,
                 "identity_checked": True, "identity_match": True,
@@ -1210,16 +1397,20 @@ def test_count_mismatch_auto_revises_bad_image_with_locked_references(
                 {"character": "甲", "uri": str(identity)}],
         })
     assert result.qc["passed"] is True
-    assert len(calls["image"]) == 2
-    revised = calls["image"][1]
-    assert revised["revision_mode"] == "targeted_qc_fix"
+    assert len(calls["image"]) == 4
+    revised = calls["image"][1:]
+    assert all(row["revision_mode"] == "targeted_qc_fix"
+               for row in revised)
     # 人数/身份错误稿不能反过来成为第二次生成的参考图，否则多余人物
     # 容易被继续复制；只保留锁定人物参考并用短提示词定向重生。
-    assert str(image) not in revised.get("reference_images", [])
-    assert not any(
+    assert all(str(image) not in row.get("reference_images", [])
+               for row in revised)
+    assert all(not any(
         item["label"] == "质检未过的待修改基底"
-        for item in revised["reference_manifest"])
-    assert revised["reference_manifest"][0]["uri"] == str(identity)
+        for item in row["reference_manifest"])
+        for row in revised)
+    assert all(row["reference_manifest"][0]["uri"] == str(identity)
+               for row in revised)
 
 
 @pytest.mark.parametrize("worker_count", [1, 2])
@@ -2030,6 +2221,69 @@ def test_codex_qc_unparseable_output_fails_closed(tmp_path, monkeypatch):
     assert "未返回可解析" in reply["data"]["issues"][0]
 
 
+def test_declared_headwear_advisory_is_promoted_to_hard_failure():
+    """可见的标志发饰形制偏差不能因“仍可辨认”被降为建议。"""
+    from aifos.adapters.codex_image import _enforce_declared_headwear_qc
+
+    verdict = {
+        "pass": True,
+        "visual_pass": True,
+        "wardrobe_checked": True,
+        "wardrobe_match": True,
+        "critical_failures": [],
+        "advisory_issues": [
+            "顾明昭银簪右端叶形端头偏小，但长直簪杆仍可辨认。",
+            "背景景深可稍加强。",
+        ],
+        "image_error": {"summary": "", "categories": [], "evidence": []},
+    }
+    payload = {
+        "expected_wardrobe": {
+            "顾明昭": {
+                "headwear": {
+                    "presence": "worn",
+                    "name": "横向断纹旧银长簪",
+                    "signature_terminal": "右端大号镂刻叶形端头",
+                }
+            }
+        }
+    }
+
+    result = _enforce_declared_headwear_qc(verdict, payload)
+
+    assert result["pass"] is False
+    assert result["visual_pass"] is False
+    assert result["wardrobe_match"] is False
+    assert "叶形端头偏小" in result["critical_failures"][0]
+    assert result["advisory_issues"] == ["背景景深可稍加强。"]
+    assert "headwear" in result["image_error"]["categories"]
+
+
+def test_declared_headwear_fully_occluded_remains_exempt():
+    """当前机位完全遮挡的发饰细节按合同免验。"""
+    from aifos.adapters.codex_image import _enforce_declared_headwear_qc
+
+    verdict = {
+        "pass": True,
+        "visual_pass": True,
+        "wardrobe_checked": True,
+        "wardrobe_match": True,
+        "critical_failures": [],
+        "advisory_issues": ["银簪右端完全遮挡，当前机位无法核验。"],
+    }
+    payload = {
+        "expected_wardrobe": {
+            "顾明昭": {"headwear": {"presence": "worn", "name": "旧银簪"}}
+        }
+    }
+
+    result = _enforce_declared_headwear_qc(verdict, payload)
+
+    assert result["pass"] is True
+    assert result["wardrobe_match"] is True
+    assert result["critical_failures"] == []
+
+
 def test_frames_qc_checks_both_frames(app, monkeypatch):
     """首尾帧质检:首帧或尾帧任一不符即整组不合格。"""
     project = _preproduce(app, title="首尾帧质检")
@@ -2059,6 +2313,7 @@ def test_frames_qc_checks_both_frames(app, monkeypatch):
 
     app.director.router.call = qc_router
     report = app.director.qc_item("首尾帧质检", 1, "frames:2")
-    assert calls["n"] == 2                 # 首帧 + 尾帧都检了
+    # 首帧 + 尾帧都检，并在首败后立即追加一次 Codex 根因分析。
+    assert calls["n"] == 3
     assert report["passed"] is False
     assert any("尾帧" in x for x in report["issues"])

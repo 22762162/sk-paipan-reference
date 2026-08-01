@@ -392,6 +392,11 @@ class ProviderRouter:
         纯 mock 离线占位不消耗真实图片额度，也不冒充正式产物；只有真实
         图片会进入 Codex 提示词审核硬门禁。
         """
+        requires_refs = bool(payload.get("require_reference_images")
+                             or payload.get("identity_required"))
+        allows_text_bootstrap = bool(
+            payload.get("allow_text_to_image_bootstrap"))
+        supplied_refs = self._supplied_reference_uris(payload)
         for name in self._routing_chain(capability, payload):
             if name == "mock":
                 continue
@@ -399,9 +404,31 @@ class ProviderRouter:
             if provider is None:
                 continue
             ok, _reason = provider.available(capability)
-            if ok:
-                return True
+            if not ok:
+                continue
+            if requires_refs and not provider.reference_images:
+                continue
+            if (provider.conf.get("type") in self.API_IMAGE_TYPES
+                    and not supplied_refs and not allows_text_bootstrap):
+                continue
+            return True
         return False
+
+    @staticmethod
+    def _supplied_reference_uris(payload):
+        """Return the concrete reference inputs used by routing gates."""
+        supplied = []
+        for key in ("style_ref", "scene_ref", "chain_first_uri",
+                    "image_uri"):
+            if payload.get(key):
+                supplied.append(payload[key])
+        for key in ("character_refs", "prop_refs", "reference_images"):
+            supplied.extend(payload.get(key) or [])
+        supplied.extend(
+            ref.get("uri")
+            for ref in (payload.get("identity_references") or [])
+            if isinstance(ref, dict) and ref.get("uri"))
+        return supplied
 
     @staticmethod
     def _prompt_review_context(capability, payload):
@@ -534,7 +561,13 @@ class ProviderRouter:
         for match in re.finditer(
                 r"(?:严禁|绝不|不得|禁止)[^。；\n]{6,80}", source):
             clause = match.group(0).strip()
-            if clause:
+            # Repair feedback can say “不得同时执行被作废的旧条款：删除
+            # ‘景别锁定为近景’…”. This is governance metadata, not a visual
+            # exclusion. Requiring it verbatim re-inserts the obsolete camera
+            # phrase into the provider prompt and creates two scale contracts.
+            if clause and not any(marker in clause for marker in (
+                    "被作废的旧条款", "已作废的旧条款",
+                    "Codex 通知 AIFOS", "Codex通知 AIFOS")):
                 tokens.append(clause)
         # 服装/头饰是最容易被“优化”误删的镜头事实；若已有明确状态，
         # 优化稿必须继续逐字携带。结构标题和版本号属于审计元数据，可由
@@ -602,6 +635,25 @@ class ProviderRouter:
             total == expected
             or (expected in groups and total == expected * 2))
 
+    @staticmethod
+    def _reviewed_prompt_execution_conflicts(prompt):
+        """Return deterministic conflicts that must block the image API."""
+        text = str(prompt or "")
+        issues = []
+        if any(marker in text for marker in (
+                "被作废的旧条款", "已作废的旧条款")):
+            issues.append("仍包含已作废旧合同的审计元话术")
+        scales = set(re.findall(
+            r"景别锁定为(大特写|中近景|特写|近景|中景|大远景|全景|远景)",
+            text))
+        if len(scales) > 1:
+            issues.append("同时锁定多个景别:" + "、".join(sorted(scales)))
+        if (any(token in text for token in ("固定机位", "机位固定"))
+                and any(token in text for token in (
+                    "摄影机短跟", "镜头短跟", "侧面跟拍", "摄影机跟拍"))):
+            issues.append("固定机位与正向跟拍要求同时存在")
+        return issues
+
     def review_image_prompt(self, capability, payload, out_dir, cancel=None):
         """用 Codex 审核并优化真实出图前的最终提示词，原地冻结优化稿。
 
@@ -621,6 +673,22 @@ class ProviderRouter:
                 "approved": False,
                 "status": "not_applicable_legacy_empty_prompt",
                 "blocking_reason": "低层兼容调用未提供AIFOS生图提示词",
+            }
+            return None
+        if payload.get("director_autonomy_mode"):
+            # 用户明确授权 AI 导演使用当前冻结提示词直接生成。记录豁免
+            # 事实供审计，但不调用 Codex、不改写原稿，也不伪造 approved。
+            payload["prompt_review"] = {
+                "schema": self.PROMPT_REVIEW_SCHEMA,
+                "approved": False,
+                "status": "not_applicable_director_autonomy",
+                "original_prompt": source,
+                "optimized_prompt": source,
+                "issues_found": [],
+                "changes_made": [],
+                "blocking_reason": (
+                    "用户授权AI导演使用冻结提示词直接生成，"
+                    "不执行提示词复审"),
             }
             return None
         if payload.get("prompt_review_exempt"):
@@ -695,10 +763,23 @@ class ProviderRouter:
                 or "Codex未批准该提示词进入图片生成")
             raise ProviderError("真实图片已被阻止：" + reason)
         optimized = str(data.get("optimized_prompt") or "").strip()
+        # Current facts have already been integrated by Codex. Do not submit
+        # an audit sentence that quotes a superseded visual clause: even a
+        # negated “删除旧『近景』条款” exposes 近景 to the image model and QC.
+        optimized = re.sub(
+            r"(?:不得|禁止)?(?:同时)?执行(?:被|已)作废的旧条款"
+            r"[：:]?[^。\n]*(?:。|\n|$)",
+            "", optimized).strip()
         if not optimized:
             raise ProviderError("Codex提示词审核通过但优化稿为空")
         if "```" in optimized:
             raise ProviderError("Codex优化稿含Markdown代码围栏，拒绝生图")
+        execution_conflicts = self._reviewed_prompt_execution_conflicts(
+            optimized)
+        if execution_conflicts:
+            raise ProviderError(
+                "真实图片已被阻止：最终优化稿仍含互斥执行合同："
+                + "；".join(execution_conflicts))
         missing = [
             token for token in self._prompt_review_required_tokens(
                 source, payload)
@@ -751,7 +832,14 @@ class ProviderRouter:
             "optimized_prompt": optimized,
             "optimized_hash": self._stable_hash(optimized),
             "issues_found": list(data.get("issues_found") or []),
-            "changes_made": list(data.get("changes_made") or []),
+            "changes_made": list(dict.fromkeys([
+                *(data.get("changes_made") or []),
+                *(["移除已作废旧合同的审计元话术"]
+                  if "被作废的旧条款" in str(
+                      data.get("optimized_prompt") or "")
+                  or "已作废的旧条款" in str(
+                      data.get("optimized_prompt") or "") else []),
+            ])),
             "blocking_reason": "",
         }
         payload.setdefault("prompt_aifos_original", source)
@@ -852,10 +940,6 @@ class ProviderRouter:
                 warn=lambda message: self.log.warn("knowledge", message)):
             self.log.info(
                 "router", f"{capability} 已挂载知识大脑指令")
-        prompt_review_result = None
-        if capability in self.IMAGE_CAPABILITIES:
-            prompt_review_result = self.review_image_prompt(
-                capability, payload, out_dir, cancel=cancel)
         strict_provider = str(payload.get("strict_provider") or "").strip()
         required_provider = str(
             payload.get("required_provider") or "").strip()
@@ -863,25 +947,23 @@ class ProviderRouter:
         if strict_provider:
             self.validate_image_selection(
                 strict_provider, capability, payload, strict_model)
-        chain = self._routing_chain(capability, payload)
-        fallbacks = []
         requires_refs = bool(payload.get("require_reference_images")
                              or payload.get("identity_required"))
         allows_text_bootstrap = bool(
             payload.get("allow_text_to_image_bootstrap"))
-        supplied_refs = []
-        for key in ("style_ref", "scene_ref", "chain_first_uri",
-                    "image_uri"):
-            if payload.get(key):
-                supplied_refs.append(payload[key])
-        for key in ("character_refs", "prop_refs", "reference_images"):
-            supplied_refs.extend(payload.get(key) or [])
-        supplied_refs.extend(
-            ref.get("uri") for ref in (payload.get("identity_references") or [])
-            if isinstance(ref, dict) and ref.get("uri"))
+        supplied_refs = self._supplied_reference_uris(payload)
         if requires_refs and not supplied_refs:
             raise ProviderUnavailable(
                 f"能力 {capability} 要求真实参考图，但请求未携带任何图片")
+        # Route/model/reference failures are deterministic and free to detect.
+        # Resolve them before spending a Codex prompt-review call so the user
+        # receives the actual configuration error and no review quota is lost.
+        prompt_review_result = None
+        if capability in self.IMAGE_CAPABILITIES:
+            prompt_review_result = self.review_image_prompt(
+                capability, payload, out_dir, cancel=cancel)
+        chain = self._routing_chain(capability, payload)
+        fallbacks = []
         for name in chain:
             provider = self.providers.get(name)
             if provider is None:

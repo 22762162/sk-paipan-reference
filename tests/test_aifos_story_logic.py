@@ -141,7 +141,13 @@ def test_frame_phase_pairs_backfilled_locally():
                and r["holder"] == "阿砚" for r in s2)
     s3 = sb["shots"][1]["frame_props"]
     assert {r["phase"] for r in s3} == {"freeze", "start", "end"}
-    assert len(sb["shots"][2]["frame_props"]) == 2   # 未回填
+    # 静态关键帧还需要唯一 freeze 状态；已成对的起止态以尾态机械派生。
+    assert len(sb["shots"][2]["frame_props"]) == 3
+    assert any(
+        row["phase"] == "freeze"
+        and row.get("phase_backfilled")
+        and row.get("derived_from") == "end_state"
+        for row in sb["shots"][2]["frame_props"])
 
 
 def test_synthesized_beat_shots_inherit_scene_event_id():

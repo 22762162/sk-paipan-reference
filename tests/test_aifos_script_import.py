@@ -213,13 +213,19 @@ def test_produce_with_provided_script(tmp_path):
         # 人物从剧本自动登记为 IP 资产
         assert app.assets.latest(project["id"], "character", "林昭")
         assert app.assets.latest(project["id"], "character", "妖王")
-        # 原 6 个叙事镜完整保留，并自动补听者反应镜和场尾留白镜。
+        # 四句台词各自保留为一个8-15秒长镜头；听者反应与场尾留白
+        # 折进同镜 setup/main/settle，不再拆成3-5秒碎镜头。
         storyboard, _ = app.projects.latest_document(
             episode["id"], "storyboard")
         shots = storyboard["shots"]
         assert len([s for s in shots if s.get("dialogue")]) == 4
-        assert {"reaction", "beat"} <= {s["kind"] for s in shots}
-        assert len(shots) > 6
+        assert {s["kind"] for s in shots} == {"dialogue"}
+        assert all(8 <= float(s["duration"]) <= 15 for s in shots)
+        assert all(
+            [beat["phase"] for beat in s["temporal_beats"]]
+            == ["setup", "main", "settle"]
+            for s in shots)
+        assert len(shots) == 4
     finally:
         app.close()
 

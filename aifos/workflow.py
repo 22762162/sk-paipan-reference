@@ -187,10 +187,23 @@ def production_profile(config, standard=None):
             "resolution", jimeng.get("video_resolution", "720p")),
         "preferred_segment_seconds": production.get(
             "preferred_segment_seconds", configured.get(
-                "preferred_segment_seconds", [5, 8])),
+                "preferred_segment_seconds", [8, 15])),
         "max_segment_seconds": production.get(
             "max_segment_seconds", configured.get("max_segment_seconds", 15)),
         "time_precision_seconds": production.get("time_precision_seconds", 0.5),
+        "long_take_policy": copy.deepcopy(
+            production.get("long_take_policy") or {
+                "enabled": True,
+                "preferred_seconds": [8, 15],
+                "target_seconds": [10, 15],
+                "embed_environment_setup": True,
+                "embed_listener_reaction": True,
+                "embed_emotional_settle": True,
+                "embed_physical_action": True,
+                "temporal_phases_required": True,
+                "short_shot_exception_required_below_seconds": 8,
+                "max_dialogue_lines_per_shot": 1,
+            }),
         "voice": production.get(
             "voice", configured.get("voice", "jimeng_builtin")),
         "lip_sync": bool(production.get(
@@ -356,7 +369,7 @@ def _director_terms(values, allowed):
 
 def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
                  scene_start=False, visible_count=None,
-                 director_knowledge=None):
+                 director_knowledge=None, used_scales=None):
     library = (rules or {}).get("camera_library", {})
     storyboard_rules = (rules or {}).get("storyboard", {})
     style_knowledge = normalize_director_knowledge(
@@ -429,6 +442,22 @@ def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
         # 标准要求相邻景别变化:与上一镜相同时顺位换一档
         scale = next((s for s in ("中景", "全景", "近景", "特写")
                       if s in scales and s != prev_scale), scale)
+    # 长镜头折叠后，原始镜头中的显式机位仍会占用全局 index；未显式
+    # 镜头可能因此只命中轮换表的奇数位，整集退化为中景/全景两档。
+    # 在前三种景别尚未凑齐时，优先选择一个未使用且能容纳本镜人数的
+    # 合法景别。显式导演机位、场景定场和人数容量合同均不被覆盖。
+    used_scales = set(used_scales or ())
+    if (not explicit and not scene_start and len(used_scales) < 3):
+        for candidate in (
+                "中景", "近景", "全景", "特写", "远景", "大特写"):
+            if (candidate not in scales or candidate in used_scales
+                    or candidate == prev_scale):
+                continue
+            feasible, _note = enforce_scale_capacity(
+                candidate, visible_count, scales)
+            if feasible == candidate:
+                scale = candidate
+                break
     # 可行性门禁:景别容量 < 人数合同(严格共N人全见)时,编译出来的
     # 合同同级互斥、审核必熔断——盲轮换/显式特写都在此升到可行档。
     # 这里不知道人数(visible_count=None)就不动,由合同编译期兜底。
@@ -920,12 +949,9 @@ def _terminal_character_names(text, end_states, names):
         life_state = str(
             condition.get("life_state")
             or state.get("life_state") or "").strip().lower()
-        if life_state:
-            if life_state == "dead":
-                terminal.add(name)
-            continue
         windows = _actor_semantic_windows(text, name, names)
-        if (_condition_transition_kind(name, text, names) == "death"
+        if (life_state == "dead"
+                or _condition_transition_kind(name, text, names) == "death"
                 or any(
                     any(token in window for token in TERMINAL_STATE_TOKENS)
                     for window in windows)):
@@ -1165,7 +1191,7 @@ def _format_timecode(seconds):
 def _dialogue_duration(dialogue, rules=None, emotion="daily"):
     if not dialogue:
         preferred = (rules or {}).get("production", {}).get(
-            "preferred_segment_seconds", [5, 8])
+            "preferred_segment_seconds", [8, 15])
         return float(preferred[0])
     text = dialogue.get("dialogue", "")
     dialogue_rules = (rules or {}).get("dialogue", {})
@@ -1214,6 +1240,197 @@ def _split_dialogue_text(text, max_chars):
 SEEDANCE_MIN_SHOT_SECONDS = 4.0
 
 
+def _long_take_policy(rules):
+    production = (rules or {}).get("production", {})
+    policy = production.get("long_take_policy") or {}
+    return policy if isinstance(policy, dict) else {}
+
+
+def _preferred_shot_floor(rules):
+    policy = _long_take_policy(rules)
+    preferred = policy.get("preferred_seconds") or (
+        (rules or {}).get("production", {}).get(
+            "preferred_segment_seconds", [8, 15]))
+    try:
+        return max(SEEDANCE_MIN_SHOT_SECONDS, float(preferred[0]))
+    except (IndexError, TypeError, ValueError):
+        return 8.0
+
+
+def _long_take_enabled(rules):
+    return bool(_long_take_policy(rules).get("enabled", False))
+
+
+def _merge_unique_rows(target, source, key):
+    rows = []
+    seen = set()
+    for row in list(target.get(key) or []) + list(source.get(key) or []):
+        if not isinstance(row, dict):
+            continue
+        marker = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        rows.append(copy.deepcopy(row))
+    if rows:
+        target[key] = rows
+
+
+def _phase_row(shot, prop_id, preferred):
+    rows = [
+        row for row in (shot.get("frame_props") or [])
+        if isinstance(row, dict) and row.get("prop_id") == prop_id]
+    by_phase = {str(row.get("phase") or "").lower(): row for row in rows}
+    for phase in preferred:
+        if phase in by_phase:
+            return copy.deepcopy(by_phase[phase])
+    return None
+
+
+def _compose_prop_timeline(first, last):
+    """两段顺序事件合成一个长镜头的唯一 start/end/freeze 道具合同。"""
+    prop_ids = list(dict.fromkeys(
+        str(row.get("prop_id") or "")
+        for shot in (first, last)
+        for row in (shot.get("frame_props") or [])
+        if isinstance(row, dict) and row.get("prop_id")))
+    rows = []
+    for prop_id in prop_ids:
+        start = (_phase_row(first, prop_id, ("start", "freeze", "end"))
+                 or _phase_row(last, prop_id, ("start", "freeze", "end")))
+        end = (_phase_row(last, prop_id, ("end", "freeze", "start"))
+               or _phase_row(first, prop_id, ("end", "freeze", "start")))
+        if start:
+            start["phase"] = "start"
+            start.pop("phase_backfilled", None)
+            start.pop("derived_from", None)
+            rows.append(start)
+        if end:
+            end["phase"] = "end"
+            end.pop("phase_backfilled", None)
+            end.pop("derived_from", None)
+            rows.append(end)
+            freeze = copy.deepcopy(end)
+            freeze["phase"] = "freeze"
+            freeze["phase_backfilled"] = True
+            freeze["derived_from"] = "long_take_end"
+            rows.append(freeze)
+    transitions = []
+    for prop_id in prop_ids:
+        actions = []
+        for shot in (first, last):
+            for item in (shot.get("prop_transitions") or []):
+                if (isinstance(item, dict)
+                        and item.get("prop_id") == prop_id
+                        and str(item.get("action") or "").strip()):
+                    actions.append(str(item["action"]).strip())
+        if actions:
+            transitions.append({
+                "prop_id": prop_id,
+                "from_phase": "start",
+                "to_phase": "end",
+                "action": "，随后".join(dict.fromkeys(actions)),
+            })
+    return rows, transitions
+
+
+def _fold_shot_into_long_take(target, extra, *, before):
+    """把环境/肢体/留白折进对白长镜头，不改变对白与稳定事件号。"""
+    description = str(extra.get("description") or "").strip()
+    target_description = str(target.get("description") or "").strip()
+    if description:
+        if before:
+            target["description"] = (
+                f"{description}；随后{target_description}"
+                if target_description else description)
+        else:
+            target["description"] = (
+                f"{target_description}；随后{description}"
+                if target_description else description)
+    prompt = str(extra.get("prompt") or "").strip()
+    if prompt:
+        target_prompt = str(target.get("prompt") or "").strip()
+        target["prompt"] = "；".join(
+            item for item in (
+                prompt, target_prompt) if item) if before else "；".join(
+                    item for item in (target_prompt, prompt) if item)
+    target["characters"] = list(dict.fromkeys(
+        list(extra.get("characters") or [])
+        + list(target.get("characters") or [])))
+    for key in ("functional_figures", "narrative_overlays"):
+        _merge_unique_rows(target, extra, key)
+    first, last = (extra, target) if before else (target, extra)
+    prop_rows, transitions = _compose_prop_timeline(first, last)
+    if prop_rows:
+        target["frame_props"] = prop_rows
+        target["prop_transitions"] = transitions
+    if before and isinstance(extra.get("start_state"), dict):
+        merged_start = copy.deepcopy(target.get("start_state") or {})
+        merged_start.update(copy.deepcopy(extra["start_state"]))
+        target["start_state"] = merged_start
+    if not before and isinstance(extra.get("end_state"), dict):
+        merged_end = copy.deepcopy(target.get("end_state") or {})
+        merged_end.update(copy.deepcopy(extra["end_state"]))
+        target["end_state"] = merged_end
+    target["duration"] = float(target.get("duration") or 0) + float(
+        extra.get("duration") or 0)
+    target.setdefault("embedded_shots", []).append({
+        "kind": extra.get("kind") or (
+            "dialogue" if extra.get("dialogue") else "environment"),
+        "position": "setup" if before else "settle",
+        "description": description,
+    })
+    target_frames = target.get("frame_targets")
+    extra_frames = extra.get("frame_targets")
+    if isinstance(target_frames, dict) and isinstance(extra_frames, dict):
+        if before and extra_frames.get("first_frame"):
+            target_frames["first_frame"] = copy.deepcopy(
+                extra_frames["first_frame"])
+        elif not before and extra_frames.get("last_frame"):
+            target_frames["last_frame"] = copy.deepcopy(
+                extra_frames["last_frame"])
+            target_frames["keyframe"] = copy.deepcopy(
+                extra_frames.get("keyframe") or extra_frames["last_frame"])
+
+
+def _fold_setup_and_settle_shots(raw_shots, rules):
+    """每场保留一台词一镜，场景建立/动作/留白都折进相邻长镜头。"""
+    if not _long_take_enabled(rules):
+        return [copy.deepcopy(raw) for raw in raw_shots]
+    grouped = {}
+    scene_order = []
+    for raw in raw_shots:
+        scene_no = raw.get("scene_no")
+        if scene_no not in grouped:
+            scene_order.append(scene_no)
+            grouped[scene_no] = []
+        grouped[scene_no].append(copy.deepcopy(raw))
+    out = []
+    for scene_no in scene_order:
+        built = []
+        pending = []
+        for raw in grouped[scene_no]:
+            if raw.get("dialogue"):
+                shot = copy.deepcopy(raw)
+                for setup in pending:
+                    _fold_shot_into_long_take(shot, setup, before=True)
+                pending = []
+                built.append(shot)
+            else:
+                pending.append(raw)
+        if not built:
+            if pending:
+                merged = pending.pop(0)
+                for extra in pending:
+                    _fold_shot_into_long_take(merged, extra, before=False)
+                built.append(merged)
+        elif pending:
+            for settle in pending:
+                _fold_shot_into_long_take(built[-1], settle, before=False)
+        out.extend(built)
+    return out
+
+
 def _split_dialogue_shots(raw_shots, rules):
     dialogue_rules = rules.get("dialogue", {})
     performance_rules = rules.get("performance", {})
@@ -1221,7 +1438,9 @@ def _split_dialogue_shots(raw_shots, rules):
         return [copy.deepcopy(raw) for raw in raw_shots]
     max_chars = int(dialogue_rules.get("max_chars_per_shot", 25))
     out = []
-    for raw in raw_shots:
+    long_take = _long_take_enabled(rules)
+    preferred_floor = _preferred_shot_floor(rules)
+    for raw in _fold_setup_and_settle_shots(raw_shots, rules):
         dialogue = raw.get("dialogue")
         if not dialogue:
             out.append(copy.deepcopy(raw))
@@ -1233,6 +1452,7 @@ def _split_dialogue_shots(raw_shots, rules):
             "抓住", "摔", "冲向", "拔剑", "挥刀", "拥抱", "后退",
         )
         if (performance_rules.get("physical_action_separate_shot", True)
+                and not long_take
                 and any(cue in description for cue in physical_cues)):
             physical = copy.deepcopy(raw)
             physical["kind"] = "physical"
@@ -1259,8 +1479,12 @@ def _split_dialogue_shots(raw_shots, rules):
                 "index": part_index, "total": len(parts),
                 "source_duration": source_duration,
             }
+            explicit_duration = float(working.get("duration") or 0)
+            if len(parts) > 1:
+                explicit_duration /= len(parts)
             split["duration"] = max(
-                SEEDANCE_MIN_SHOT_SECONDS,
+                preferred_floor if long_take else SEEDANCE_MIN_SHOT_SECONDS,
+                explicit_duration,
                 _dialogue_duration(split["dialogue"], rules, emotion))
             split["speech_emotion"] = emotion
             out.append(split)
@@ -1268,7 +1492,7 @@ def _split_dialogue_shots(raw_shots, rules):
 
 
 def _append_performance_beats(raw_shots, script, rules=None):
-    """关键台词后补听者反应镜，每场结尾补有内容的留白镜。"""
+    """旧标准补独立反应/留白；长镜头标准把它们折入同一连续镜头。"""
     rules = rules or {}
     performance_rules = rules.get("performance", {})
     raw_shots = _split_dialogue_shots(raw_shots, rules)
@@ -1285,6 +1509,54 @@ def _append_performance_beats(raw_shots, script, rules=None):
     scenes = _scene_map(script)
     inner_policy = normalize_inner_persona_policy(
         script, rules.get("inner_persona"))
+    if _long_take_enabled(rules):
+        floor = _preferred_shot_floor(rules)
+        grouped = {}
+        scene_order = []
+        for raw in raw_shots:
+            scene_no = raw.get("scene_no")
+            if scene_no not in grouped:
+                scene_order.append(scene_no)
+                grouped[scene_no] = []
+            grouped[scene_no].append(raw)
+        long_out = []
+        for scene_no in scene_order:
+            scene = scenes.get(scene_no, {})
+            scene_people = physical_scene_characters(
+                list(scene.get("characters", [])), "unknown", inner_policy)
+            scene_shots = grouped[scene_no]
+            for index, raw in enumerate(scene_shots):
+                shot = copy.deepcopy(raw)
+                if not shot.get("duration_exception_reason"):
+                    shot["duration"] = max(
+                        floor, float(shot.get("duration") or 0))
+                dialogue = shot.get("dialogue") or {}
+                speaker = dialogue.get("character")
+                listeners = [name for name in scene_people if name != speaker]
+                embedded = copy.deepcopy(
+                    shot.get("embedded_performance") or {})
+                if dialogue and listeners:
+                    embedded["listener_reaction"] = {
+                        "character": listeners[0],
+                        "instruction": (
+                            f"{listeners[0]}在台词落点后保持原站位，"
+                            "用眼神、下颌与一次呼吸完成可见反应"),
+                    }
+                if index == len(scene_shots) - 1:
+                    lead = (listeners[:1] or ([speaker] if speaker else [])
+                            or scene_people[:1])
+                    if lead:
+                        embedded["emotional_settle"] = {
+                            "character": lead[0],
+                            "instruction": (
+                                f"{lead[0]}保持本场结束站位与支撑，"
+                                "用单一表情和呼吸完成情绪收束"),
+                        }
+                embedded["separate_reaction_shot"] = False
+                embedded["separate_beat_shot"] = False
+                shot["embedded_performance"] = embedded
+                long_out.append(shot)
+        return long_out
     out = []
     grouped = {}
     for raw in raw_shots:
@@ -1394,6 +1666,69 @@ def _append_performance_beats(raw_shots, script, rules=None):
     return out
 
 
+def _temporal_beats(raw, duration, dialogue, precision=0.5):
+    """把 8-15 秒单镜写成可执行的起势/主体/收束三阶段。"""
+    if duration <= 0:
+        return []
+    precision = max(0.5, float(precision or 0.5))
+    setup_end = max(precision, round(duration * 0.2 / precision) * precision)
+    settle_length = max(
+        precision * 2, round(duration * 0.2 / precision) * precision)
+    main_end = duration - settle_length
+    if main_end <= setup_end:
+        main_end = min(duration - precision, setup_end + precision)
+    setup_end = round(setup_end, 3)
+    main_end = round(main_end, 3)
+    duration = round(duration, 3)
+    embedded = raw.get("embedded_performance") or {}
+    setups = [
+        item.get("description") for item in (raw.get("embedded_shots") or [])
+        if isinstance(item, dict) and item.get("position") == "setup"
+        and item.get("description")]
+    settles = [
+        item.get("description") for item in (raw.get("embedded_shots") or [])
+        if isinstance(item, dict) and item.get("position") == "settle"
+        and item.get("description")]
+    setup_action = "；".join(setups) or (
+        "保持首帧人物站位和空间关系，完成一次呼吸与视线起势")
+    main_action = str(raw.get("description") or "完成本镜唯一主动作").strip()
+    if dialogue:
+        main_action += (
+            f"；{dialogue.get('character', '角色')}只说这一句："
+            f"{dialogue.get('dialogue', '')}")
+    settle_items = list(settles)
+    for key in ("listener_reaction", "emotional_settle"):
+        item = embedded.get(key)
+        if isinstance(item, dict) and item.get("instruction"):
+            settle_items.append(item["instruction"])
+    settle_action = "；".join(dict.fromkeys(settle_items)) or (
+        "主动作完成后保持最终站位，眼神与呼吸自然落定并锁住尾帧")
+    return [
+        {
+            "phase": "setup", "label": "起势",
+            "start_seconds": 0.0, "end_seconds": setup_end,
+            "action": setup_action,
+        },
+        {
+            "phase": "main", "label": "主体",
+            "start_seconds": setup_end, "end_seconds": main_end,
+            "action": main_action,
+        },
+        {
+            "phase": "settle", "label": "收束",
+            "start_seconds": main_end, "end_seconds": duration,
+            "action": settle_action,
+        },
+    ]
+
+
+def _temporal_beats_text(beats):
+    return "；".join(
+        f"{item['start_seconds']:g}-{item['end_seconds']:g}秒"
+        f"{item['label']}：{item['action']}"
+        for item in beats)
+
+
 def _normalize_ai_shot(raw):
     """AI 分镜的宽松产出 → 统一结构。
 
@@ -1496,6 +1831,7 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
     elapsed = 0.0
     prev_camera_scale = None
     prev_scene_no = None
+    used_camera_scales = set()
     for index, raw in enumerate(raw_shots, 1):
         scene = scenes.get(raw.get("scene_no"), {})
         scene_changed = (
@@ -1595,11 +1931,13 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             scene_start=(raw.get("scene_no") != prev_scene_no
                          and kind == "environment"),
             visible_count=visible_figure_count,
-            director_knowledge=director_knowledge)
+            director_knowledge=director_knowledge,
+            used_scales=used_camera_scales)
         style_direction = select_shot_direction(
             director_knowledge, index,
             raw=raw, camera=camera, kind=kind)
         prev_camera_scale = camera["shot_scale"]
+        used_camera_scales.add(camera["shot_scale"])
         prev_scene_no = raw.get("scene_no")
         text_asset = _text_asset(raw, rules)
         dialogue = raw.get("dialogue")
@@ -1613,6 +1951,11 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
         precision = float(profile.get("time_precision_seconds", 0.5))
         duration = min(
             profile["max_segment_seconds"], _round_duration(duration, precision))
+        long_take = _long_take_enabled(rules)
+        temporal_beats = (
+            _temporal_beats(raw, duration, dialogue, precision)
+            if long_take else [])
+        temporal_text = _temporal_beats_text(temporal_beats)
         start_time = elapsed
         elapsed = round(elapsed + duration, 3)
         timecode = f"{_format_timecode(start_time)}-{_format_timecode(elapsed)}"
@@ -1704,6 +2047,8 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             "本镜精确数量、状态和剧情功能呈现。"
             f"【起点】{station or '无人空镜，保持场景初始状态'}。"
             f"【单一主动作】{raw.get('description', '') or '环境保持自然变化'}。"
+            + (f"【时间节拍】{temporal_text}。" if temporal_text else "")
+            +
             f"【表演】{gaze}；{micro_expression}，动作连贯自然。"
             f"【运镜】只执行一次{camera['movement']}，"
             f"{camera['shot_scale']}·{camera['angle']}，"
@@ -1812,6 +2157,10 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
                 (script.get("story_world") or {}).get(
                     "sanctioned_anachronisms") or []),
             "script_reference": script_reference,
+            # 图片失败后的 Codex 修复可把 description 改成“仅生成静态
+            # 终态”的构图合同；视频动作另存一份，后续 Seedance 不得
+            # 把静帧修复文案误当成时间线动作。
+            "video_action": raw.get("description", ""),
             "readable_text": text_asset,
             "visual_hook": visual_hook,
             "style_direction": style_direction,
@@ -1820,6 +2169,8 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
                 "gaze": gaze,
                 "micro_expression": micro_expression,
                 "beat": kind if kind in ("reaction", "beat") else "acting",
+                "embedded": copy.deepcopy(
+                    raw.get("embedded_performance") or {}),
             },
             "speech_timing": ({
                 "emotion": speech_emotion,
@@ -1828,6 +2179,29 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
                 "part": copy.deepcopy(raw.get("dialogue_part", {})),
             } if dialogue else None),
             "sound_design": sound_design,
+            "temporal_beats": temporal_beats,
+            "long_take_contract": ({
+                "schema": "aifos.long-take/v1",
+                "enabled": True,
+                "duration_seconds": duration,
+                "single_primary_action": True,
+                "single_camera_move": True,
+                "dialogue_line_count": 1 if dialogue else 0,
+                "environment_setup_embedded": any(
+                    item.get("position") == "setup"
+                    for item in (raw.get("embedded_shots") or [])
+                    if isinstance(item, dict)),
+                "listener_reaction_embedded": bool(
+                    (raw.get("embedded_performance") or {}).get(
+                        "listener_reaction")),
+                "emotional_settle_embedded": bool(
+                    (raw.get("embedded_performance") or {}).get(
+                        "emotional_settle")),
+                "temporal_phases": [
+                    item["phase"] for item in temporal_beats],
+                "short_shot_exception_reason": str(
+                    raw.get("duration_exception_reason") or "").strip(),
+            } if long_take else {}),
             "shot_contract": shot_contract,
             "physical_contract": physical_contract,
             "five_dimensions": {
@@ -1838,6 +2212,7 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
                     "start": "继承上一镜结尾状态",
                     "evolution": f"{raw.get('description', '')} → {emotion}",
                     "end": end_summary,
+                    "temporal_beats": copy.deepcopy(temporal_beats),
                 },
                 "aesthetics": {
                     "style": (visual_bible.get("user_style_constraint")
@@ -2159,6 +2534,17 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
     production_rules = rules.get("production", {})
     dialogue_rules = rules.get("dialogue", {})
     performance_rules = rules.get("performance", {})
+    long_take_policy = (
+        profile.get("long_take_policy")
+        or production_rules.get("long_take_policy") or {})
+    long_take_enabled = bool(long_take_policy.get("enabled", False))
+    try:
+        preferred_min = float((
+            long_take_policy.get("preferred_seconds")
+            or profile.get("preferred_segment_seconds")
+            or [8, 15])[0])
+    except (IndexError, TypeError, ValueError):
+        preferred_min = 8.0
     storyboard_rules = rules.get("storyboard", {})
     gate_config = {
         item.get("id"): item for item in rules.get("quality_gates", [])
@@ -2399,8 +2785,25 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
             0 < float(shot.get("duration", 0)) <= profile["max_segment_seconds"]
             and abs(float(shot["duration"]) / precision
                     - round(float(shot["duration"]) / precision)) < 1e-7
+            and (not long_take_enabled
+                 or float(shot.get("duration", 0)) >= preferred_min
+                 or bool(str(shot.get("duration_exception_reason") or (
+                     shot.get("long_take_contract") or {}).get(
+                         "short_shot_exception_reason") or "").strip()))
+            and (not long_take_enabled
+                 or not long_take_policy.get(
+                     "temporal_phases_required", True)
+                 or [
+                     item.get("phase")
+                     for item in (shot.get("temporal_beats") or [])
+                     if isinstance(item, dict)
+                 ] == ["setup", "main", "settle"])
             for shot in shots),
-            f"时间码精确到{precision:g}秒，单元不超过{profile['max_segment_seconds']:g}秒"),
+            (f"时间码精确到{precision:g}秒，常规单元"
+             f"{preferred_min:g}-{profile['max_segment_seconds']:g}秒，"
+             "并含起势/主体/收束三阶段" if long_take_enabled else
+             f"时间码精确到{precision:g}秒，单元不超过"
+             f"{profile['max_segment_seconds']:g}秒")),
         _gate("dialogue", "台词保真与语速", script_dialogue == storyboard_dialogue
               and dialogue_lengths_ok,
               f"原台词逐字覆盖，单镜台词不超过 {max_chars} 字并按情绪计算语速"),
@@ -2408,7 +2811,9 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
               and (not performance_rules.get("performance_goal_required", True)
                    or all(bool((shot.get("performance") or {}).get("goal"))
                           for shot in shots)),
-              "关键台词后保留听者反应，高潮含2–4秒留白，逐镜有表演目标"),
+              ("听者反应、必要动作和情绪收束均嵌入相邻长镜头，"
+               "逐镜有表演目标" if long_take_enabled else
+               "关键台词后保留听者反应，高潮含2–4秒留白，逐镜有表演目标")),
         _gate("camera", "镜头语言与防重复", camera_ok,
               f"每段至少 {min_angles} 种纵向角度；相邻景别跳 {jump_levels} 级"
               f"或机位偏转 {axis_change:g}°"),

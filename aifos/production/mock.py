@@ -265,6 +265,26 @@ class MockProvider(Provider):
             analysis = build_story_analysis(
                 payload.get("script") or {}, payload.get("style", ""),
                 source="mock")
+            # Offline/mock runs still exercise the autonomous cast gate.  A
+            # placeholder such as “剧本未明示” would incorrectly turn a
+            # provider fallback into a manual confirmation checkpoint, so the
+            # mock acts like a successful second-pass character analyst and
+            # returns explicit drawable identity facts.
+            for index, character in enumerate(
+                    analysis.get("characters") or []):
+                if not isinstance(character, dict):
+                    continue
+                if not explicit_gender(character.get("gender")):
+                    name = str(character.get("name") or "")
+                    character["gender"] = (
+                        "女性" if any(token in name for token in (
+                            "小狐", "小鹿", "栀", "桃", "雨", "安然"))
+                        else "男性")
+                if not explicit_age_range(character.get("age_range")):
+                    character["age_range"] = (
+                        "18-24" if index < 2 else "25-35")
+                character["identity_status"] = "ready"
+                character["identity_missing_fields"] = []
             if payload.get("creative_direction"):
                 analysis["creative_direction"] = payload[
                     "creative_direction"]

@@ -29,12 +29,20 @@ if "分镜师" in prompt:
     data = {"episode_title": "T", "shots": [
         {"shot_no": 9, "scene_no": 1, "kind": "environment",
          "description": "d", "camera": "远景", "duration": 2.5,
-         "characters": ["甲"], "dialogue": None, "prompt": "p1"},
+         "characters": ["甲"], "dialogue": None, "prompt": "p1",
+         "frame_targets": {
+             "keyframe": {"phase": "freeze", "state": "甲在远景中定格", "fallback": False},
+             "first_frame": {"phase": "start", "state": "甲进入远景", "fallback": False},
+             "last_frame": {"phase": "end", "state": "甲在远景中稳定", "fallback": False}}},
         {"shot_no": 3, "scene_no": 1, "kind": "dialogue",
          "description": "d", "camera": "特写", "duration": 3.0,
          "characters": ["甲"],
          "dialogue": {"character": "甲", "dialogue": "你好"},
-         "prompt": "p2"}]}
+         "prompt": "p2",
+         "frame_targets": {
+             "keyframe": {"phase": "freeze", "state": "甲说完你好后定格", "fallback": False},
+             "first_frame": {"phase": "start", "state": "甲开口前", "fallback": False},
+             "last_frame": {"phase": "end", "state": "甲说完你好", "fallback": False}}}]}
 else:
     data = {"episode_title": "妖王之章", "logline": "一句话",
             "characters": [{"name": "甲", "role": "主角", "gender": "男",
@@ -64,7 +72,11 @@ if "分镜师" in prompt:
     data = {"episode_title": "T", "shots": [
         {"shot_no": 1, "scene_no": 1, "kind": "environment",
          "description": "d", "camera": "远景", "duration": 2.5,
-         "characters": ["甲"], "dialogue": None, "prompt": "p1"}]}
+         "characters": ["甲"], "dialogue": None, "prompt": "p1",
+         "frame_targets": {
+             "keyframe": {"phase": "freeze", "state": "甲在远景中定格", "fallback": False},
+             "first_frame": {"phase": "start", "state": "甲进入远景", "fallback": False},
+             "last_frame": {"phase": "end", "state": "甲在远景中稳定", "fallback": False}}}]}
 else:
     data = {"episode_title": "妖王之章", "logline": "一句话",
             "characters": [{"name": "甲", "role": "主角", "gender": "男",
@@ -238,7 +250,14 @@ def test_validators():
     assert ok_script["project_title"] == "T"
     assert validate_storyboard({"shots": [{"scene_no": 1}]}) is not None
     assert validate_storyboard(
-        {"shots": [{"scene_no": 1, "duration": 2.0, "prompt": "p"}]}) is None
+        {"shots": [{
+            "scene_no": 1, "duration": 2.0, "prompt": "p",
+            "frame_targets": {
+                "keyframe": {"phase": "freeze", "state": "定格", "fallback": False},
+                "first_frame": {"phase": "start", "state": "起点", "fallback": False},
+                "last_frame": {"phase": "end", "state": "终点", "fallback": False},
+            },
+        }]}) is None
 
 
 def test_script_bible_is_required_normalized_and_declared_cast_only():

@@ -83,6 +83,38 @@ def test_qc_failure_auto_records_lesson(app, tmp_path):
                                       uri=str(image))
             calls["qc"] += 1
             first = calls["qc"] == 1
+            if payload.get("required_provider") == "codex":
+                return ProviderResult(
+                    provider="codex", cost=0.1,
+                    data={
+                        "pass": False,
+                        "issues": ["古代大殿出现现代笔记本电脑"],
+                        "image_error": {
+                            "summary": "古代大殿出现现代笔记本电脑",
+                            "categories": ["era"],
+                            "evidence": ["画面可见现代笔记本电脑"],
+                        },
+                        "prompt_diagnosis": {
+                            "status": "needs_patch",
+                            "issues": ["提示词未明确禁止现代设备"],
+                            "irrelevant_or_conflicting_sections": [],
+                        },
+                        "reference_diagnosis": {
+                            "status": "correct", "issues": [],
+                            "missing_roles": [],
+                        },
+                        "targeted_prompt_patch": {
+                            "instructions": ["只删除现代笔记本电脑"],
+                            "preserve": ["人物", "构图", "古代大殿"],
+                            "max_scope": "current_shot_only",
+                        },
+                        "reference_adjustments": [],
+                        "codex_escalation": {
+                            "aifos_action": "targeted_redraw",
+                            "aifos_instructions": [
+                                "只删除现代笔记本电脑"],
+                        },
+                    })
             diagnostics = ({
                 "image_error": {
                     "summary": "古代大殿出现现代笔记本电脑",

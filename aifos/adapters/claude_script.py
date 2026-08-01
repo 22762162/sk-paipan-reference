@@ -298,8 +298,9 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
   整套粒子、滤镜和光效同时堆入一镜。`camera` 必须明确景别、角度、机位、
   焦段、一个主要运镜和构图；同时输出 `style_direction` 记录选择结果与动机;
 - 每段只承载一个主要动作或一次情绪转折；台词逐字照抄，禁止改写；
-- 每场先给 1 个环境/肢体镜头，再为每句台词给 1 个对白镜头；
-- 关键台词后的听者反应与情绪高潮留白由平台补齐，不要用空镜凑时长；
+- 常规采用一条台词一个连续长镜头；把场景建立、人物起势、必要肢体动作、
+  听者反应和情绪收束折进相邻对白镜头，不得机械拆成独立空镜、反应镜或留白镜；
+  只有没有任何对白的纯动作场才可使用独立环境/肢体镜头；
 - `characters` 只列有独立身份资产的登记角色。所有没有独立身份资产但在画面中
   可见的真人/人形（群众、路人、尸体、临时杀手、侍从等）必须逐类写入
   `functional_figures`；每项使用 `name` 或 `label` 标明功能，`count` 必须是
@@ -314,8 +315,12 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
   台词后自动插入。Q版不计真实人数、不参与站位、不被他人感知，继承当前锁定
   衣服但无默认道具，表情动作可以夸张；比例固定为大头小身，约1.8头身，
   头占总高约58%，身体与四肢明显小于头；内心发声时真人宿主闭口且不生成字幕；
-- shot_no 从 1 连续编号；duration 单位秒，优先 5-8 秒，最长 15 秒，
-  最短 4 秒(Seedance 硬下限,短于4秒的节拍并入相邻镜头或用反应拍填满)；
+- shot_no 从 1 连续编号；duration 单位秒，常规优先 8-15 秒、目标 10-15 秒，
+  最长 15 秒；低于8秒必须写 duration_exception_reason 说明不可合并的剪辑动机，
+  且绝不能低于4秒 Seedance 硬下限；
+- 每个8-15秒镜头必须输出 temporal_beats 三阶段：setup 起势、main 主体动作/对白、
+  settle 听者反应/情绪收束；三段时间连续覆盖完整 duration，不重叠、不留空，
+  全镜只允许一个主要动作弧和一次有动机的运镜；
 - 运镜要有节奏，成片不是幻灯片：同一场不得连续三镜「固定」，每场至少
   一处有效镜头运动(推/拉/摇/移/跟/升降/环绕)；情绪极点按本剧题材的
   「动势」语法从表现性运镜(甩镜/穿越/俯冲/螺旋环绕/升格)中选用，
@@ -384,7 +389,12 @@ JSON 格式:
     "shot_pattern":"从本风格高频镜头组合中选中的一项",
     "visual_effects":["只列本镜实际使用的必要视觉效果"],
     "selection_reason":"说明该镜头与效果如何服务剧情功能"}},
-  "duration": 2.5, "characters": ["角色名"], "dialogue": null,
+  "duration": 12, "duration_exception_reason":"仅低于8秒时必填，否则空字符串",
+  "temporal_beats":[
+    {{"phase":"setup","start_seconds":0,"end_seconds":2.5,"action":"人物与空间起势"}},
+    {{"phase":"main","start_seconds":2.5,"end_seconds":9.5,"action":"唯一主动作与本镜唯一台词"}},
+    {{"phase":"settle","start_seconds":9.5,"end_seconds":12,"action":"听者反应与尾帧收束"}}],
+  "characters": ["角色名"], "dialogue": null,
   "functional_figures": [{{"name":"无独立身份资产的功能人物",
     "count":2,"state":"当前可见状态","function":"本镜剧情功能"}}],
   "narrative_overlays": [{{"kind":"inner_persona_chibi",
@@ -478,8 +488,9 @@ Seedance 视频前必须锁定的“制作圣经”。
 - 人工定版后必须生成面部近景、正面、严格90度侧面、完整180度背面四张独立
   高清母资产；16:9三视图拼图只用于审核，不能代替独立参考图;
 - 输出全局图片、人物、场景、关键帧、Seedance前缀及负面提示词;
-- 台词逐字保护;每段最长15秒;关键台词后有反应镜;高潮有2-4秒留白镜;
-  重要肢体动作独立成镜;不要字幕;可读文字先在关键帧锁定;
+- 台词逐字保护；常规每镜8-15秒、一镜只说一条台词；关键台词后的听者反应、
+  高潮留白、场景建立与必要肢体动作都嵌入同一镜头的三阶段时间节拍；
+  不再自动拆独立反应镜或2-4秒留白镜；不要字幕；可读文字先在关键帧锁定;
 - 只输出一个 JSON 对象，不要解释或 Markdown。
 
 JSON 结构:
@@ -1085,8 +1096,55 @@ def validate_storyboard(storyboard):
             shot["duration"] = float(shot["duration"])
         except (TypeError, ValueError):
             return f"镜头时长非法: {shot}"
-        if shot["duration"] <= 0:
-            return f"镜头时长非法: {shot}"
+        duration = shot["duration"]
+        if duration <= 0 or duration > 15:
+            return f"镜头时长必须大于0且不超过 Seedance 2.0 的15秒上限: {shot}"
+        if (duration < 4 or (
+                duration < 8
+                and not str(shot.get(
+                    "duration_exception_reason") or "").strip())):
+            # Provider 仍可能受旧提示词/缓存影响产出2-6秒碎镜头。这里不
+            # 再让整份分镜失败重跑，而是确定性把场景起势、呼吸与收束
+            # 填回同镜，直接升级到8秒；这是无需AI猜测的节奏修复。
+            shot["duration_normalized_from"] = duration
+            shot["duration"] = duration = 8.0
+            description = str(shot.get("description") or "").strip()
+            fill = "保留首帧起势与一次呼吸停顿，主动作完成后让反应自然收束"
+            shot["description"] = (
+                f"{description}；{fill}" if description else fill)
+        temporal = shot.get("temporal_beats")
+        if not isinstance(temporal, list) or len(temporal) != 3:
+            setup_end = round(duration * 0.2 * 2) / 2
+            main_end = duration - max(1.5, round(duration * 0.2 * 2) / 2)
+            temporal = [
+                {"phase": "setup", "start_seconds": 0,
+                 "end_seconds": setup_end,
+                 "action": "继承首帧站位，完成呼吸与视线起势"},
+                {"phase": "main", "start_seconds": setup_end,
+                 "end_seconds": main_end,
+                 "action": str(shot.get("description") or "完成唯一主动作")},
+                {"phase": "settle", "start_seconds": main_end,
+                 "end_seconds": duration,
+                 "action": "保持终点站位，完成听者反应或情绪收束"},
+            ]
+            shot["temporal_beats"] = temporal
+        expected_phases = ("setup", "main", "settle")
+        cursor = 0.0
+        for phase, beat in zip(expected_phases, temporal):
+            if not isinstance(beat, dict) or beat.get("phase") != phase:
+                return f"镜头 temporal_beats 必须依次为setup/main/settle: {shot}"
+            try:
+                start = float(beat.get("start_seconds"))
+                end = float(beat.get("end_seconds"))
+            except (TypeError, ValueError):
+                return f"镜头 temporal_beats 时间非法: {shot}"
+            if abs(start - cursor) > 1e-7 or end <= start:
+                return f"镜头 temporal_beats 必须连续覆盖且不重叠: {shot}"
+            if not str(beat.get("action") or "").strip():
+                return f"镜头 temporal_beats.action 不能为空: {shot}"
+            cursor = end
+        if abs(cursor - duration) > 1e-7:
+            return f"镜头 temporal_beats 必须完整覆盖duration: {shot}"
         characters = shot.setdefault("characters", [])
         if not isinstance(characters, list):
             return f"镜头 characters 需为数组: {shot}"
@@ -1353,6 +1411,12 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 - 人物身份只在“明显不是同一人”或锁定脸型/发型发生显著改变时失败；正常生成波动
   和不同角度造成的小差异不得失败。不确定时从宽通过，交由人工抽检。
 
+分级保真政策(本条决定是否重抽):{fidelity_policy}
+只有硬一致事实错误或普通观众可见的技术质量缺陷才可写入critical_failures并令
+technical_quality_pass/visual_pass为false；允许容差与自由创作项必须写入
+advisory_issues且通过。相邻景别内轻微取景差、焦段数字、精确裁切、前后重叠量、
+衣褶发丝与背景小物不得令physical_logic_match或spatial_logic_match为false。
+
 最终立绘视觉基准(这些图片是身份事实来源，优先级高于早期文字描述):
 {identity_references}
 必须先逐人判断实际可见视角，再按视角核验，不得强迫所有人物露正脸:
@@ -1414,6 +1478,9 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 "physical_logic_checked": true或false, "physical_logic_match": true或false,
 "spatial_logic_checked": true或false, "spatial_logic_match": true或false,
 "detected_count": 画面实际人数整数,
+"technical_quality_pass": true或false,
+"critical_failures": ["只列必须重抽的硬一致/技术质量错误"],
+"advisory_issues": ["容差项、自由项和美学优化建议"],
 "issues": ["不通过的具体原因,每条一句,指出在画面哪里"],
 "image_error": {{"summary":"画面错误摘要","categories":["identity/count/camera等"],
 "evidence":["画面中可见证据"]}},
@@ -1631,6 +1698,12 @@ def build_qc_prompt(payload):
             generation_references, ensure_ascii=False,
             separators=(",", ":"))[:16000],
         identity_references=(ref_lines or "无人空镜，无需人物身份比对"),
+        fidelity_policy=json.dumps(
+            payload.get("fidelity_policy") or {
+                "critical": ["身份、人数、连续性、关键道具、动作因果、文字、时代"],
+                "tolerant": ["轻微构图、景别、表情、非关键道具位置"],
+                "creative": ["衣褶、发丝、尘雾、次级光斑、背景小物"],
+            }, ensure_ascii=False, separators=(",", ":")),
         composition_rules=composition_rules,
         overlay_rules=overlay_rules,
         characters="、".join(characters) or "无人(空镜)",
@@ -1676,6 +1749,7 @@ def validate_image_qc(data):
         "physical_logic_checked", "physical_logic_match",
         "spatial_logic_checked", "spatial_logic_match",
         "overlay_count_checked", "overlay_count_match",
+        "technical_quality_pass",
     )
     for key in boolean_fields:
         error = strict_bool(key, required=(key == "pass"))
@@ -1688,6 +1762,13 @@ def validate_image_qc(data):
     if not isinstance(issues, list):
         issues = [str(issues)] if issues else []
     data["issues"] = [str(item) for item in issues][:8]
+    for key in ("critical_failures", "advisory_issues"):
+        values = data.get(key)
+        if values is None:
+            continue
+        if not isinstance(values, list):
+            return f"{key} 必须是列表"
+        data[key] = [str(item) for item in values if str(item).strip()][:12]
     if "detected_count" in data:
         try:
             data["detected_count"] = int(data["detected_count"])

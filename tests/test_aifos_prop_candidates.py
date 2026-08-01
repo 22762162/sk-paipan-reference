@@ -108,6 +108,7 @@ def test_locked_prop_is_a_real_shot_reference_with_single_duty(app):
     ctx["storyboard"] = {"shots": [{
         "shot_no": 1, "scene_no": 1, "characters": [],
         "description": "铜制机关钥匙插入锁孔并转动",
+        "props": ["铜制机关钥匙"],
     }]}
     video_rows = app.director._auto_video_reference_rows(ctx, 1)
     assert any(row["kind"] == "prop_identity" for row in video_rows)

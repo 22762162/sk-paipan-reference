@@ -112,10 +112,12 @@ def test_shot_payload_repairs_story_logic_before_provider_input(tmp_path):
                     "hard_rules": "服化道严格符合洪武年间",
                     "sanctioned_anachronisms": [],
                 },
-                "characters": [
-                    {"name": "陈允"},
-                    {"name": "沈砚"},
-                ],
+                    "characters": [
+                        {"name": "陈允", "gender": "男性",
+                         "age_range": "40至50岁"},
+                        {"name": "沈砚", "gender": "男性",
+                         "age_range": "20至25岁"},
+                    ],
                 "scenes": [{
                     "scene_no": 1,
                     "location": "赴任途中·驿馆内室",
@@ -147,9 +149,14 @@ def test_shot_payload_repairs_story_logic_before_provider_input(tmp_path):
                 "沈砚": {"pose": "跪坐", "wardrobe": "宽松青官袍"},
             },
             "appearance_state_required": True,
-            "five_dimensions": {},
-            "readable_text": {"required": False},
-        }
+                "five_dimensions": {},
+                "readable_text": {"required": False},
+                "frame_targets": {"keyframe": {
+                    "phase": "freeze",
+                    "state": "沈砚穿布旅装跪坐榻前给卧床的陈允喂水",
+                    "fallback": False,
+                }},
+            }
 
         payload = app.director._shot_payload(ctx, shot)
 

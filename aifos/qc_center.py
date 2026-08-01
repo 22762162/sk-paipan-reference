@@ -128,6 +128,18 @@ class QcCenter:
 
         max_seconds = float(profile.get("max_segment_seconds", 15))
         precision = float(profile.get("time_precision_seconds", 0.5))
+        production_rules = rules.get("production", {})
+        long_take_policy = (
+            profile.get("long_take_policy")
+            or production_rules.get("long_take_policy") or {})
+        long_take_enabled = bool(long_take_policy.get("enabled", False))
+        try:
+            preferred_min = float((
+                long_take_policy.get("preferred_seconds")
+                or profile.get("preferred_segment_seconds")
+                or [8, 15])[0])
+        except (IndexError, TypeError, ValueError):
+            preferred_min = 8.0
         required_columns = rules.get("storyboard", {}).get(
             "required_columns", [])
         required = (
@@ -164,6 +176,32 @@ class QcCenter:
                     "message": f"{shot.get('unit_id')}时长须为{precision:g}秒粒度"
                     f"且不超过{max_seconds:g}秒",
                 })
+            if (enabled("duration") and long_take_enabled
+                    and duration < preferred_min
+                    and not str(shot.get("duration_exception_reason") or (
+                        shot.get("long_take_contract") or {}).get(
+                            "short_shot_exception_reason") or "").strip()):
+                issues.append({
+                    "check": "duration", "severity": "error",
+                    "shot_no": shot.get("shot_no"), "rerunnable": False,
+                    "message": f"{shot.get('unit_id')}低于长镜头优选下限"
+                    f"{preferred_min:g}秒且没有不可合并原因",
+                })
+            if (enabled("duration") and long_take_enabled
+                    and long_take_policy.get(
+                        "temporal_phases_required", True)):
+                phases = [
+                    item.get("phase")
+                    for item in (shot.get("temporal_beats") or [])
+                    if isinstance(item, dict)]
+                if phases != ["setup", "main", "settle"]:
+                    issues.append({
+                        "check": "duration", "severity": "error",
+                        "shot_no": shot.get("shot_no"),
+                        "rerunnable": False,
+                        "message": f"{shot.get('unit_id')}缺少长镜头"
+                        "setup/main/settle三阶段时间节拍",
+                    })
             if (enabled("people") and shot.get("character_count")
                     != len(shot.get("characters", []))):
                 issues.append({

@@ -33,7 +33,7 @@ MODEL_UPGRADE_POLICY = {
     "candidate_capability_key": "seedance2_5",
     "candidate_display_name": "Seedance 2.5",
     "normal_profile": {
-        "preferred_segment_seconds": [5, 8],
+        "preferred_segment_seconds": [8, 15],
         "max_segment_seconds": 15,
     },
     "upgrade_duration_range_seconds": [16, 30],
@@ -70,7 +70,7 @@ DEFAULT_STANDARD = {
     "source_skill": {
         "id": "sk-manju-storyboard-skill",
         "name": "SK 漫剧五维分镜制作 Skill",
-        "version": "5.4",
+        "version": "5.5",
         "reference": "five-dimension-storyboard-template-v5.txt",
         "principle": (
             "先把小说或梗概改编成因果、物理、时间、空间、人物信息与道具"
@@ -87,9 +87,21 @@ DEFAULT_STANDARD = {
             "lip_sync": True,
             "burn_subtitles": False,
             "text_lock_provider": "ChatGPT关键帧",
-            "preferred_segment_seconds": [5, 8],
+            "preferred_segment_seconds": [8, 15],
             "max_segment_seconds": 15,
             "time_precision_seconds": 0.5,
+            "long_take_policy": {
+                "enabled": True,
+                "preferred_seconds": [8, 15],
+                "target_seconds": [10, 15],
+                "embed_environment_setup": True,
+                "embed_listener_reaction": True,
+                "embed_emotional_settle": True,
+                "embed_physical_action": True,
+                "temporal_phases_required": True,
+                "short_shot_exception_required_below_seconds": 8,
+                "max_dialogue_lines_per_shot": 1,
+            },
             "prompt_strategy": "five_dimensions_per_segment",
             "model_upgrade_policy": copy.deepcopy(MODEL_UPGRADE_POLICY),
             "prompt_contract": {
@@ -306,13 +318,16 @@ DEFAULT_STANDARD = {
             },
         },
         "performance": {
-            "reaction_after_key_dialogue": True,
+            "reaction_after_key_dialogue": False,
             "listener_duration_ratio": 0.6666666667,
             "reaction_seconds": [1.5, 3],
-            "beat_at_emotional_peak": True,
+            "beat_at_emotional_peak": False,
             "beat_seconds": [2, 4],
             "beat_requires_visible_acting": True,
-            "physical_action_separate_shot": True,
+            "physical_action_separate_shot": False,
+            "listener_reaction_embedded": True,
+            "emotional_settle_embedded": True,
+            "physical_action_embedded": True,
             "performance_goal_required": True,
         },
         "storyboard": {
@@ -673,6 +688,49 @@ class StandardCenter:
                 issue(
                     "rules.production.time_precision_seconds",
                     "单段最大时长必须能被时间精度整除")
+        long_take = required_dict(
+            production, "long_take_policy",
+            "rules.production.long_take_policy")
+        for key in (
+                "enabled", "embed_environment_setup",
+                "embed_listener_reaction", "embed_emotional_settle",
+                "embed_physical_action", "temporal_phases_required"):
+            bool_field(
+                long_take, key,
+                f"rules.production.long_take_policy.{key}")
+        long_preferred = numeric_pair(
+            long_take, "preferred_seconds",
+            "rules.production.long_take_policy.preferred_seconds",
+            minimum=4, maximum=15)
+        long_target = numeric_pair(
+            long_take, "target_seconds",
+            "rules.production.long_take_policy.target_seconds",
+            minimum=4, maximum=15)
+        exception_floor = long_take.get(
+            "short_shot_exception_required_below_seconds")
+        if (not _is_number(exception_floor)
+                or not 4 <= exception_floor <= 15):
+            issue(
+                "rules.production.long_take_policy."
+                "short_shot_exception_required_below_seconds",
+                "必须是 4 到 15 秒")
+        max_lines = long_take.get("max_dialogue_lines_per_shot")
+        if (not isinstance(max_lines, int) or isinstance(max_lines, bool)
+                or max_lines != 1):
+            issue(
+                "rules.production.long_take_policy."
+                "max_dialogue_lines_per_shot",
+                "Seedance 长镜头为保证口型稳定，必须严格为 1")
+        if preferred and long_preferred and preferred != long_preferred:
+            issue(
+                "rules.production.long_take_policy.preferred_seconds",
+                "必须与 production.preferred_segment_seconds 一致")
+        if long_preferred and long_target and (
+                long_target[0] < long_preferred[0]
+                or long_target[1] > long_preferred[1]):
+            issue(
+                "rules.production.long_take_policy.target_seconds",
+                "目标区间必须落在优选区间内")
 
         story_analysis = required_dict(
             rules, "story_analysis", "rules.story_analysis")
@@ -930,6 +988,8 @@ class StandardCenter:
         for key in (
                 "reaction_after_key_dialogue", "beat_at_emotional_peak",
                 "beat_requires_visible_acting", "physical_action_separate_shot",
+                "listener_reaction_embedded", "emotional_settle_embedded",
+                "physical_action_embedded",
                 "performance_goal_required"):
             bool_field(performance, key, f"rules.performance.{key}")
         ratio = performance.get("listener_duration_ratio")
@@ -1099,6 +1159,17 @@ class StandardCenter:
         rules = content.get("rules") if isinstance(content, dict) else None
         if not isinstance(rules, dict):
             return snapshot
+        def version_tuple(value):
+            return tuple(
+                int(part) for part in str(value or "0").split(".")
+                if part.isdigit())
+
+        source = content.get("source_skill")
+        source_defaults = DEFAULT_STANDARD["source_skill"]
+        migrate_long_take = bool(
+            isinstance(source, dict)
+            and source.get("id") == source_defaults["id"]
+            and version_tuple(source.get("version")) < (5, 5))
         changed = False
         governance_defaults = DEFAULT_STANDARD["rules"]["rule_governance"]
         governance = rules.get("rule_governance")
@@ -1136,15 +1207,23 @@ class StandardCenter:
                     if key not in prompt_contract:
                         prompt_contract[key] = copy.deepcopy(value)
                         changed = True
-        source = content.get("source_skill")
-        source_defaults = DEFAULT_STANDARD["source_skill"]
+            if migrate_long_take:
+                for key in (
+                        "preferred_segment_seconds", "long_take_policy"):
+                    if production_rules.get(key) != production_defaults[key]:
+                        production_rules[key] = copy.deepcopy(
+                            production_defaults[key])
+                        changed = True
+                model_policy = production_rules.get(
+                    "model_upgrade_policy")
+                if isinstance(model_policy, dict) and model_policy.get(
+                        "normal_profile") != MODEL_UPGRADE_POLICY[
+                            "normal_profile"]:
+                    model_policy["normal_profile"] = copy.deepcopy(
+                        MODEL_UPGRADE_POLICY["normal_profile"])
+                    changed = True
         if (isinstance(source, dict)
                 and source.get("id") == source_defaults["id"]):
-            def version_tuple(value):
-                return tuple(
-                    int(part) for part in str(value or "0").split(".")
-                    if part.isdigit())
-
             if version_tuple(source.get("version")) < version_tuple(
                     source_defaults["version"]):
                 source["version"] = source_defaults["version"]
@@ -1153,6 +1232,28 @@ class StandardCenter:
                 source["principle"] = copy.deepcopy(
                     source_defaults["principle"])
                 changed = True
+        performance_rules = rules.get("performance")
+        performance_defaults = DEFAULT_STANDARD["rules"]["performance"]
+        if not isinstance(performance_rules, dict):
+            rules["performance"] = copy.deepcopy(performance_defaults)
+            changed = True
+        else:
+            for key, value in performance_defaults.items():
+                if key not in performance_rules:
+                    performance_rules[key] = copy.deepcopy(value)
+                    changed = True
+            if migrate_long_take:
+                for key in (
+                        "reaction_after_key_dialogue",
+                        "beat_at_emotional_peak",
+                        "physical_action_separate_shot",
+                        "listener_reaction_embedded",
+                        "emotional_settle_embedded",
+                        "physical_action_embedded"):
+                    if performance_rules.get(key) != performance_defaults[key]:
+                        performance_rules[key] = copy.deepcopy(
+                            performance_defaults[key])
+                        changed = True
         text_rules = rules.get("text_assets")
         text_defaults = DEFAULT_STANDARD["rules"]["text_assets"]
         if not isinstance(text_rules, dict):
@@ -1295,7 +1396,8 @@ class StandardCenter:
                 content, change_note=(
                     "自动升级：加入视觉 DNA、全剧角色去重、三视图母资产、"
                     "剧本第一道总闸门、道具生命周期、局部返编边界、"
-                    "剧本分析、剧情事实源、空间调度与非现实Q版内心人格规则"),
+                    "剧本分析、剧情事实源、空间调度、非现实Q版内心人格与"
+                    "Seedance 8-15秒长镜头三阶段连续性规则"),
                 expected_active_id=snapshot.get("version_id"))
         except StandardConflictError:
             # 多个 App 同时启动时由先完成者负责升级。

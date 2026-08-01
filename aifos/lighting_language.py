@@ -214,8 +214,24 @@ def _finish_extras(extras, text, camera, night, practical, interior):
     return list(dict.fromkeys(extras))
 
 
+def _lighting_only_genre_grammar(value):
+    """Strip genre-level camera ideas from a per-shot lighting contract."""
+    camera_tokens = (
+        "构图", "动势", "运镜", "景别", "近景", "中景", "特写", "全景",
+        "远景", "俯冲", "俯仰", "环绕", "跟拍", "甩镜", "变焦", "穿越",
+        "升格", "手持",
+    )
+    clauses = []
+    for clause in str(value or "").replace("；", ";").split(";"):
+        clause = clause.strip()
+        if clause and not any(token in clause for token in camera_tokens):
+            clauses.append(clause)
+    return "；".join(clauses)
+
+
 def lighting_clause(*, location="", time_of_day="", mood="", camera="",
-                    scene_action="", style_override="", genre=""):
+                    scene_action="", style_override="", genre="",
+                    include_genre_camera=True):
     """生成本镜的【光影】执行条款(单行,可直接进镜头合同)。"""
     key = str(style_override or "").strip()
     if key not in LIGHTING_STYLES:
@@ -241,8 +257,11 @@ def lighting_clause(*, location="", time_of_day="", mood="", camera="",
         parts.append(DEEP_FOCUS_CLAUSE)
     genre_look = GENRE_LOOKS.get(match_genre(genre)) if genre else None
     if genre_look:
+        genre_grammar = genre_look["grammar"]
+        if not include_genre_camera:
+            genre_grammar = _lighting_only_genre_grammar(genre_grammar)
         parts.append(f"本剧题材视听基调({genre_look['label']}):"
-                     + genre_look["grammar"])
+                     + genre_grammar)
     parts.append(
         "以上光影服从本场景母版已确定的主光方向与色温,同场跨镜不得"
         "忽左忽右")
@@ -310,7 +329,8 @@ GENRE_LOOKS = {
     "palace": {
         "label": "宫斗/权谋",
         "tokens": ("宫斗", "权谋", "朝堂", "宅斗", "后宫", "官场",
-                   "夺嫡", "权臣", "入仕", "官途"),
+                   "夺嫡", "权臣", "入仕", "官途", "古风", "古装",
+                   "古代", "大明", "县衙", "衙门"),
         "style": "practical_lit",
         "extras": ("rim", "volumetric", "warm_cool", "shallow_dof"),
         "grammar": (

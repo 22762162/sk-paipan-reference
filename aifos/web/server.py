@@ -2822,6 +2822,8 @@ def make_handler(workspace, jobs):
                     return self._redo_items()
                 if parsed.path == "/api/redo_video":
                     return self._redo_video()
+                if parsed.path == "/api/redo_videos":
+                    return self._redo_videos()
                 if parsed.path == "/api/image_acceleration/preflight":
                     return self._image_acceleration_preflight()
                 if parsed.path == "/api/image_acceleration/queue":
@@ -4722,6 +4724,30 @@ def make_handler(workspace, jobs):
                 action="redo_video", request={"shot_no": shot_no,
                                                "feedback": feedback},
                 unique=True)
+            return self._json({"job_id": job_id}, status=202)
+
+        def _redo_videos(self):
+            """视频提示词合同升级后批量重制，所有镜头完成后只合成一次。"""
+            body = self._read_body()
+            if body is None:
+                return self._error(400, "请求体不是合法 JSON")
+            found = self._episode_ref(body)
+            if found is None:
+                return self._error(404, "剧集不存在")
+            title, number = found
+            if jobs.running_for(title, number):
+                return self._error(409, "本集正在生产，请先等待当前任务结束")
+            shot_nos = body.get("shot_nos") or []
+            try:
+                shot_nos = [int(value) for value in shot_nos]
+            except (TypeError, ValueError):
+                return self._error(400, "shot_nos 必须是镜头编号数组")
+            job_id = jobs.start_task(
+                title, number,
+                lambda app, run_id: app.director.redo_videos(
+                    title, number, shot_nos=shot_nos),
+                action="redo_videos",
+                request={"shot_nos": shot_nos}, unique=True)
             return self._json({"job_id": job_id}, status=202)
 
         def _redo_mock(self):

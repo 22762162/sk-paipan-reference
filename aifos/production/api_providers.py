@@ -12,10 +12,12 @@
 
 import base64
 import copy
+import http.client
 import json
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -36,6 +38,17 @@ from ..errors import ProviderError
 from .base import Provider, ProviderResult
 
 
+def _urlopen(target, timeout):
+    """Open URLs while keeping loopback API routes out of system proxies."""
+    url = target.full_url if isinstance(
+        target, urllib.request.Request) else str(target)
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    if host in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return opener.open(target, timeout=timeout)
+    return urllib.request.urlopen(target, timeout=timeout)
+
+
 def _request_json(name, url, headers, body=None, timeout=300, method=None):
     """发 JSON 请求收 JSON 应答;任何网络/协议错误统一转 ProviderError。"""
     data = None
@@ -46,7 +59,7 @@ def _request_json(name, url, headers, body=None, timeout=300, method=None):
         url, data=data, headers=headers,
         method=method or ("POST" if data is not None else "GET"))
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as resp:
+        with _urlopen(request, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = ""
@@ -62,7 +75,7 @@ def _request_json(name, url, headers, body=None, timeout=300, method=None):
 
 def _download(name, url, dest, timeout=600):
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with _urlopen(url, timeout=timeout) as resp:
             dest.write_bytes(resp.read())
     except Exception as exc:
         raise ProviderError(f"{name} 下载产物失败: {exc}") from exc
@@ -75,6 +88,20 @@ def _parse_sse_data(raw):
     except ValueError:
         return None
     return event if isinstance(event, dict) else None
+
+
+def _claude_message_text(name, reply):
+    """Extract text from an ordinary Anthropic Messages JSON response."""
+    if not isinstance(reply, dict):
+        return ""
+    if reply.get("type") == "error" or "error" in reply:
+        detail = reply.get("error") or {}
+        message = detail.get("message") if isinstance(detail, dict) else detail
+        raise ProviderError(f"{name} API 错误: {message or reply}")
+    return "".join(
+        str(block.get("text") or "")
+        for block in (reply.get("content") or [])
+        if isinstance(block, dict) and block.get("type") == "text")
 
 
 def _stream_claude_text(name, url, headers, body, timeout):
@@ -94,7 +121,7 @@ def _stream_claude_text(name, url, headers, body, timeout):
     parts = []
     plain_lines = []
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as resp:
+        with _urlopen(request, timeout=timeout) as resp:
             for raw_line in resp:
                 line = raw_line.decode("utf-8", "replace").strip()
                 if not line.startswith("data:"):
@@ -134,19 +161,25 @@ def _stream_claude_text(name, url, headers, body, timeout):
         raise ProviderError(
             f"{name} API HTTP {exc.code}: {detail or exc.reason}") from exc
     except Exception as exc:
+        # Some Anthropic-compatible gateways accept ordinary Messages JSON
+        # but close the socket immediately when ``stream=true`` is present.
+        # This happens before any model output exists, so one non-streaming
+        # compatibility retry is safe and avoids classifying a usable route
+        # as offline.  Timeouts and mid-stream failures are deliberately not
+        # retried here: those may already have consumed a full generation.
+        if isinstance(exc, (http.client.RemoteDisconnected,
+                            ConnectionResetError)) and not parts:
+            fallback_body = dict(body)
+            fallback_body["stream"] = False
+            reply = _request_json(
+                name, url, headers, fallback_body, timeout=timeout)
+            return _claude_message_text(name, reply)
         raise ProviderError(f"{name} API 调用失败: {exc}") from exc
     if parts:
         return "".join(parts)
     reply = _parse_sse_data("\n".join(plain_lines))
     if isinstance(reply, dict):
-        if reply.get("type") == "error" or "error" in reply:
-            detail = (reply.get("error") or {})
-            raise ProviderError(
-                f"{name} API 错误: {detail.get('message') or reply}")
-        return "".join(block.get("text", "")
-                       for block in reply.get("content", [])
-                       if isinstance(block, dict)
-                       and block.get("type") == "text")
+        return _claude_message_text(name, reply)
     return ""
 
 
@@ -298,7 +331,7 @@ def _multipart_post(name, url, headers, fields, files, timeout):
         headers={**headers,
                  "Content-Type": f"multipart/form-data; boundary={boundary}"})
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as resp:
+        with _urlopen(request, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = ""

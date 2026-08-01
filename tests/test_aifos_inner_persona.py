@@ -101,21 +101,17 @@ def test_inner_persona_is_non_physical_and_exaggerated(tmp_path):
         if shot.get("timeline_state") == "post_transition"]
     assert post
     assert all(SOURCE not in shot["characters"] for shot in post)
-    # Ordinary listener reactions remain physical acting and do not receive a
-    # Q insert after every line.
-    ordinary_reactions = [
-        shot for shot in post
-        if shot.get("kind") == "reaction"
-        and not shot.get("narrative_overlays")]
-    assert ordinary_reactions
-    assert ordinary_reactions[0]["characters"] == ["李继周"]
+    # 8–15秒长镜头把普通听者反应收进对白镜头的收束拍，不再另切一个
+    # 3–5秒 reaction；听者仍是真实在场人物，也不会凭空获得Q版叠层。
+    assert not any(shot.get("kind") == "reaction" for shot in post)
+    assert any("李继周" in shot["characters"] for shot in post)
 
     inner = next(
         shot for shot in post if shot.get("narrative_overlays"))
     overlay = inner["narrative_overlays"][0]
-    assert inner["characters"] == [HOST]
-    assert inner["character_count"] == 1
-    assert inner["visible_figure_count"] == 1
+    assert inner["characters"] == [HOST, "李继周"]
+    assert inner["character_count"] == 2
+    assert inner["visible_figure_count"] == 2
     assert len(inner["narrative_overlays"]) == 1  # Q版叠层另计，不计真人
     assert overlay["counts_as_real_character"] is False
     assert overlay["included_in_spatial_blocking"] is False
@@ -134,7 +130,7 @@ def test_inner_persona_is_non_physical_and_exaggerated(tmp_path):
         item.get("name")
         for item in inner["character_number_map"].values()}
     assert "非现实内心Q版叠层" in inner["seedance_prompt_compact"]
-    assert "不计入上述1名真实主体" in inner["seedance_prompt_compact"]
+    assert "不计入上述2名真实主体" in inner["seedance_prompt_compact"]
     assert "表情和动作" in inner["seedance_prompt"]
     assert "约1.8头身" in inner["seedance_prompt"]
     assert "头占总高约58%" in inner["seedance_prompt"]

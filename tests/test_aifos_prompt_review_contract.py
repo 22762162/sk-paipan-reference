@@ -165,3 +165,17 @@ def test_count_preservation_accepts_component_sums(optimized, count, ok):
     from aifos.production.router import ProviderRouter
     assert ProviderRouter._prompt_review_count_preserved(
         optimized, {"character_count": count}) is ok
+
+
+def test_obsolete_repair_meta_is_not_an_immutable_exclusion():
+    """A quoted old camera clause must not be forced back into final text."""
+    source = (
+        "景别锁定为中近景。"
+        "不得同时执行被作废的旧条款：【Codex 通知 AIFOS】"
+        "删除‘景别锁定为近景’，全合同只保留中近景。"
+        "禁止出现第三人或人物复制。")
+    tokens = required(source, {})
+
+    assert not any("被作废的旧条款" in token for token in tokens)
+    assert not any("景别锁定为近景" in token for token in tokens)
+    assert any("禁止出现第三人" in token for token in tokens)

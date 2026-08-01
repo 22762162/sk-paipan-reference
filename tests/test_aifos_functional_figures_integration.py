@@ -14,6 +14,20 @@ def _shot(**overrides):
         "duration": 3,
         "prompt": "顾青回头，门边倒着两具尸体",
         "characters": ["顾青"],
+        "frame_targets": {
+            "keyframe": {
+                "phase": "freeze", "state": "顾青回头看向门边",
+                "fallback": False,
+            },
+            "first_frame": {
+                "phase": "start", "state": "顾青尚未完全转身",
+                "fallback": False,
+            },
+            "last_frame": {
+                "phase": "end", "state": "顾青完成转身并看向门边",
+                "fallback": False,
+            },
+        },
         **overrides,
     }
 

@@ -67,6 +67,14 @@ def test_episode_snapshot_survives_confirm_and_force_rebinds(tmp_path):
 
         # force 表示整集重制，并显式重新绑定当前生效标准。
         forced = app.director.produce("标准快照测试", 1, force=True)
+        # 全新重制不复用旧人物图，先停在新一轮定角；锁定新候选后续跑。
+        assert forced["status"] == "awaiting_cast"
+        rebound_script, _ = app.projects.latest_document(
+            episode["id"], "script")
+        for character in rebound_script["characters"]:
+            app.director.select_character_candidate(
+                "标准快照测试", 1, character["name"], 1)
+        forced = app.director.produce("标准快照测试", 1)
         assert forced["status"] == "done"
         assert forced["production_standard"]["version_id"] == changed[
             "version_id"]

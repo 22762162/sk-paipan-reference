@@ -19,6 +19,16 @@ log = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                    "codex_argv.jsonl")
 with open(log, "a", encoding="utf-8") as f:
     f.write(json.dumps(sys.argv[1:], ensure_ascii=False) + "\\n")
+if "你是AIFOS图片生成前的提示词审核员" in instruction:
+    source = instruction.split("【AIFOS原始提示词】\\n", 1)[1].split(
+        "\\n【冲突裁决规则】", 1)[0]
+    print(json.dumps({
+        "schema": "aifos.codex-prompt-review/v1",
+        "approved": True,
+        "optimized_prompt": source,
+        "issues_found": [], "changes_made": [], "blocking_reason": "",
+    }, ensure_ascii=False))
+    sys.exit(0)
 if "你是漫剧图片质检员" in instruction:
     print(json.dumps({
         "pass": True,

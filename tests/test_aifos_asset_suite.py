@@ -119,6 +119,29 @@ def test_character_sheet_reuse_is_bound_to_locked_candidate(app):
     assert matches(manual_sheet, manual_identity)
 
 
+def test_character_sheet_reuse_rejects_silently_overwritten_file(app,
+                                                                  tmp_path):
+    sheet_path = tmp_path / "sheet.png"
+    sheet_path.write_bytes(b"registered candidate four")
+    sheet = {
+        "uri": str(sheet_path),
+        "meta": json.dumps({
+            "source_candidate_asset_id": 11,
+            "file_sha256": app.director._file_sha256(sheet_path),
+        }),
+    }
+    identity = {
+        "id": 101,
+        "meta": json.dumps({"candidate_asset_id": 11}),
+    }
+
+    matches = app.director._character_sheet_matches_locked_identity
+    assert matches(sheet, identity)
+
+    sheet_path.write_bytes(b"interrupted candidate three overwrite")
+    assert not matches(sheet, identity)
+
+
 def test_character_sheet_prompt_and_qc_share_minimal_contract(app):
     design = {
         "species": "人类", "gender": "男", "age_range": "24岁",
@@ -293,9 +316,13 @@ def test_scene_and_character_sheets_share_one_parallel_batch(
     monkeypatch.setattr(app.director, "_run_parallel", record_batch)
     _preproduce(app, title="同批并发测试", asset_mode="full")
 
-    assert len(batches) == 1
+    # 第一批仍把无依赖的人物/场景母资产同批开工；第二批场景多视角必须
+    # 等主视角完成后才能以它为参考，属于有依赖的后续批次。
+    assert len(batches) == 2
     assert batches[0]["categories"] >= {"scene", "sheet"}
     assert batches[0]["line"] == "人物/场景独立资产"
+    assert batches[1]["categories"] == {"scene"}
+    assert batches[1]["line"] == "场景多视角母版"
 
 
 def test_auto_character_asset_policy_is_conservative():
@@ -910,7 +937,8 @@ def test_restyle_project_regenerates_all_art(app):
     # 历史候选槽位继续保留为版本记录；有效候选数量由角色重要度控制。
     assert set(before).issubset(after)
     for key, version in before.items():
-        assert after[key] == version + 1, f"{key} 未重做"
+        # 作废墓碑和新产物都保留版本审计，因此一次全新重做可能跨两版。
+        assert after[key] > version, f"{key} 未重做"
     selection = app.director.character_selection_status(
         project["id"], script["characters"])
     assert all(item["candidate_count"] == character_candidate_target(

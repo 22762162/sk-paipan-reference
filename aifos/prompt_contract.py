@@ -42,9 +42,57 @@ def _spatial_staging_block(shot):
                 or (shot.get("frame_target") or {}).get("phase")
                 or "start").lower()
     phase = phase if phase in ("start", "end") else "start"
-    return {
+    lines = {
         label: text for label, text in spatial_lines(
             block, phase=phase, declared_scale=scale)}
+    # A shot-local Codex repair can intentionally replace the earlier blocking
+    # projection.  ``build_physical_contract`` already gives an explicit
+    # ``某人屏幕左/右`` clause precedence, but the compact prompt also rendered
+    # the untouched 3D ``空间站位/屏幕方向`` lines.  That reintroduced both
+    # directions into the same provider request (shot 4: 沈左顾右 *and*
+    # 顾左沈右), so every three-draw group was doomed before generation.
+    #
+    # Keep the useful camera route/distance lines.  Only replace the stale
+    # screen projection when both final-frame sides are explicit and disagree
+    # with the old projection.  The marker is also consumed by the reference
+    # manifest so the top-down image cannot silently restore the superseded
+    # labels.
+    shot_contract = shot.get("shot_contract") or {}
+    description = " ".join(_text(value) for value in (
+        shot.get("description"), shot.get("action"), shot.get("camera"),
+        shot_contract.get("画面内容描述")
+        if isinstance(shot_contract, dict) else "",
+        shot_contract.get("站位")
+        if isinstance(shot_contract, dict) else "",
+    ) if _text(value))
+    explicit_left, explicit_right = _explicit_screen_side_names(
+        shot, description)
+    raw_direction = _text(lines.get("屏幕方向"))
+    raw_matches = bool(
+        explicit_left and explicit_right and raw_direction
+        and f"{explicit_left}在画面左侧" in raw_direction
+        and f"{explicit_right}在画面右侧" in raw_direction)
+    if (explicit_left and explicit_right
+            and explicit_left != explicit_right and not raw_matches):
+        resolution = (
+            f"最新镜头局部合同锁定：{explicit_left}固定成片屏幕左锚点，"
+            f"{explicit_right}固定成片屏幕右锚点；本条替代旧3D投影、"
+            "旧空间调度图或旧轴线文字中相反的左右/前后标签。空间图只继续"
+            "提供人物对应、相对距离、摄影机路径和视锥，不得覆盖本裁决")
+        lines = {
+            "空间裁决": resolution,
+            "空间站位": (
+                f"{explicit_left}位于画面左侧，{explicit_right}位于画面右侧；"
+                "具体前后层次、姿态、支撑和动作终态服从最新镜头描述"),
+            **{
+                label: text for label, text in lines.items()
+                if label not in {"空间站位", "屏幕方向"}
+            },
+            "屏幕方向": (
+                f"本镜最终屏幕左右关系：{explicit_left}在画面左侧、"
+                f"{explicit_right}在画面右侧；禁止被旧调度标签反向覆盖"),
+        }
+    return lines
 
 
 def lighting_lines_for_shot(shot, style, scene):
@@ -66,9 +114,10 @@ def lighting_lines_for_shot(shot, style, scene):
             shot.get("description"), shot.get("action"),
             shot.get("script_reference")) if value),
         style_override=str(shot.get("lighting_style") or ""),
+        include_genre_camera=False,
         # 题材决定视听基调:仙侠逆光体积光、悬疑低调硬光、甜宠柔光高调
         genre=" ".join(str(value) for value in (
-            style, shot.get("genre"), shot.get("kind_label"),
+            style, scene, shot.get("genre"), shot.get("kind_label"),
             shot.get("project_kind"), shot.get("era_context"),
             shot.get("script_reference")) if value))
 
@@ -333,6 +382,35 @@ def _text(value, fallback=""):
     return value or fallback
 
 
+_STYLE_CAMERA_CLAUSE_TOKENS = (
+    "焦段", "mm", "长焦", "广角", "鱼眼", "景别", "近景", "中景",
+    "特写", "全景", "远景", "俯拍", "仰拍", "微俯", "跟拍", "推镜",
+    "拉镜", "摇镜", "移镜", "环绕", "甩镜", "变焦", "手持",
+    "构图采用", "镜头组合",
+)
+
+
+def _style_without_shot_camera_directives(value):
+    """Keep visual aesthetics, but remove generic camera suggestions.
+
+    A project style is shared by every shot.  Its palette, texture and light
+    may be inherited; a sentence such as ``85mm close-up tracking shot`` may
+    not override the repaired per-shot camera.  Keeping those suggestions in
+    the rendered prompt made the image model and QC see two execution cameras.
+    """
+    kept = []
+    for clause in re.split(r"[。；;\n]+", _text(value)):
+        clause = clause.strip()
+        if not clause:
+            continue
+        lowered = clause.lower()
+        if any(token.lower() in lowered
+               for token in _STYLE_CAMERA_CLAUSE_TOKENS):
+            continue
+        kept.append(clause)
+    return "；".join(kept)
+
+
 def _text_list(value):
     if isinstance(value, str):
         value = [value]
@@ -438,10 +516,18 @@ def _frame_target(shot, mode, requested_mode=""):
         shot, "start_state") or "保持首帧状态"
     end = _registered_state_value(
         shot, "end_state") or "到达尾帧状态"
+    if mode == "video":
+        previous_contract = shot.get("prompt_contract")
+        previous_action = (
+            previous_contract.get("action")
+            if isinstance(previous_contract, dict) else "")
+        action_source = (
+            shot.get("video_action") or shot.get("action")
+            or previous_action or shot.get("description"))
+    else:
+        action_source = shot.get("description") or shot.get("action")
     action = _text(
-        shot.get("description") or shot.get("action"),
-        "环境保持稳定，只执行自然微动",
-    )
+        action_source, "环境保持稳定，只执行自然微动")
     if mode == "video":
         return {
             "phase": "timeline",
@@ -995,9 +1081,15 @@ def _actor_semantic_clause(text, actor, actors=None):
     if not match:
         return ""
     prefix = source[max(0, match.start() - 32):match.start()]
+    # Only transitive kill verbs may legally bind from before the victim's
+    # name ("刺客杀死书童").  Intransitive terminal words such as "咽气"
+    # belong to the preceding actor; carrying "陈允咽气，" into 沈砚's
+    # window falsely marks the surviving reactor as dead.
+    actor_targeting_death_tokens = (
+        "杀死", "刺死", "击毙", "处死", "害死")
     transition_hits = [
         prefix.rfind(token)
-        for token in DEATH_TRANSITION_TOKENS
+        for token in actor_targeting_death_tokens
         if token in prefix
     ]
     # “刺客杀死书童”把死亡动词写在受害者姓名之前。只把最靠近姓名
@@ -1225,6 +1317,32 @@ def _normalize_headwear(state):
         elif presence == "worn":
             hair_visibility = "partially_visible"
 
+    # A name such as ``official_hat`` or ``old silver hairpin`` is not a
+    # sufficiently precise visual contract.  Preserve optional morphology
+    # fields supplied by continuity/storyboard data so generation, reference
+    # binding and QC can agree on the same visible object.  The aliases keep
+    # older project data readable while the canonical keys make new contracts
+    # deterministic.
+    visual_fields = {}
+    visual_aliases = {
+        "shape": ("shape", "silhouette", "main_shape"),
+        "material": ("material", "main_material"),
+        "color": ("color", "main_color"),
+        "placement": ("placement", "wearing_position", "position_on_head"),
+        "signature_details": (
+            "signature_details", "ornament_details", "terminal_details"),
+        "forbidden_variants": (
+            "forbidden_variants", "negative_variants", "must_not_be"),
+    }
+    for canonical, aliases in visual_aliases.items():
+        value = next(
+            (raw.get(alias) for alias in aliases
+             if raw.get(alias) not in (None, "", [])),
+            None)
+        if value is not None:
+            visual_fields[canonical] = (
+                list(value) if isinstance(value, (list, tuple)) else value)
+
     issues = []
     visually_worn_kind = kind not in {
         "none", "hair_only", "unknown", "hair_ornament",
@@ -1262,6 +1380,7 @@ def _normalize_headwear(state):
         "hair_visibility": hair_visibility,
         "legacy_text": legacy,
         "issues": list(dict.fromkeys(issues)),
+        **visual_fields,
     }
 
 
@@ -1272,10 +1391,26 @@ def _render_headwear(value):
     kind = _text(value.get("kind"), "unknown")
     name = _text(value.get("name"))
     visibility = _text(value.get("hair_visibility"), "unknown")
-    return (
+    rendered = (
         f"presence={presence},kind={kind}"
         + (f",name={name}" if name else "")
         + f",hair_visibility={visibility}")
+    field_labels = (
+        ("shape", "shape"),
+        ("material", "material"),
+        ("color", "color"),
+        ("placement", "placement"),
+        ("signature_details", "signature_details"),
+        ("forbidden_variants", "forbidden_variants"),
+    )
+    for key, label in field_labels:
+        raw = value.get(key)
+        if raw in (None, "", []):
+            continue
+        detail = "、".join(str(item) for item in raw) \
+            if isinstance(raw, (list, tuple)) else _text(raw)
+        rendered += f",{label}={detail}"
+    return rendered
 
 
 def _condition_value(source, field):
@@ -1700,29 +1835,92 @@ def _camera(shot, visible_count=None):
     raw = _text(shot.get("camera"))
 
     def explicit(tokens):
-        return next((value for token, value in tokens if token in raw), "")
+        """Return the earliest explicit camera token in the camera sentence.
+
+        Repaired camera prose often starts with the executable scale and then
+        describes depth staging (for example ``28mm全景，沈砚舟在近景南侧``).
+        The previous priority lookup saw the later ``近景`` first and silently
+        rewrote the shot back to a medium/close view.  Source order is the only
+        safe precedence here; longer compound tokens still win at the same
+        position.
+        """
+        matches = []
+        for token, value in tokens:
+            for match in re.finditer(re.escape(token), raw):
+                matches.append((match.start(), -len(token), value))
+        return min(matches)[2] if matches else ""
+
+    def explicit_movement():
+        """Parse positive camera motion without reviving negated clauses.
+
+        ``固定，不环绕`` used to become ``环绕`` because the generic token
+        search did not distinguish a prohibition from an instruction.  Also,
+        actor locks such as ``顾明昭固定为屏幕右锚点`` are staging, not camera
+        motion, so a bare ``固定`` is accepted only in camera/movement syntax.
+        """
+        if re.search(r"(?:无|不)运镜|机位(?:全程)?锁定|锁定机位", raw):
+            return "固定"
+        candidates = []
+        tokens = (
+            ("急推", "急推"), ("缓推", "缓推"), ("推近", "推"),
+            ("上摇", "上摇"), ("下摇", "下摇"), ("环绕", "环绕"),
+            ("跟拍", "跟拍"), ("拉远", "拉"), ("横移", "移"),
+            ("固定", "固定"),
+        )
+        for token, value in tokens:
+            for match in re.finditer(re.escape(token), raw):
+                start, end = match.span()
+                prefix = raw[max(0, start - 10):start]
+                suffix = raw[end:end + 6]
+                if re.search(
+                        r"(?:不|无|未|禁止|不得|严禁|避免|没有|不再)\s*$",
+                        prefix):
+                    continue
+                if token == "固定":
+                    camera_context = (
+                        suffix.startswith("机位")
+                        or bool(re.search(
+                            r"(?:摄影机|镜头|机位)[^，。；]{0,12}$", prefix))
+                        or bool(re.search(
+                            r"(?:^|[，。；、])\s*固定(?:$|[，。；、])",
+                            raw)))
+                    actor_lock = suffix.startswith(
+                        ("为", "在", "成片", "画面", "屏幕", "位置"))
+                    if actor_lock or not camera_context:
+                        continue
+                candidates.append((start, -len(token), value))
+        return min(candidates)[2] if candidates else ""
 
     # The author/director's explicit current-shot camera text is authoritative.
     # Five-dimension defaults may fill omissions, but must never contradict it.
     raw_scale = explicit((
-        ("大特写", "大特写"), ("特写", "特写"), ("近景", "近景"),
+        ("大特写", "大特写"), ("特写", "特写"),
+        # Compound scale must be matched before its ``近景`` suffix.
+        ("中近景", "中近景"), ("近景", "近景"),
         ("中景", "中景"), ("全景", "全景"), ("远景", "远景"),
     ))
     raw_angle = explicit((
         ("顶拍", "顶拍"), ("顶视", "顶拍"), ("鸟瞰", "顶拍"),
+        ("微俯", "俯拍"),
         ("俯拍", "俯拍"), ("高机位", "俯拍"), ("高角度", "俯拍"),
         ("仰拍", "仰拍"), ("低机位", "仰拍"), ("低角度", "仰拍"),
         ("平视", "平视"),
     ))
     raw_position = explicit((
         ("过肩", "过肩"), ("背面", "背面"), ("背后", "背面"),
+        ("斜侧", "侧面"),
         ("侧面", "侧面"), ("侧脸", "侧面"), ("正面", "正面"),
     ))
-    raw_movement = explicit((
-        ("急推", "急推"), ("缓推", "缓推"), ("推近", "推"),
-        ("上摇", "上摇"), ("下摇", "下摇"), ("环绕", "环绕"),
-        ("跟拍", "跟拍"), ("拉远", "拉"), ("横移", "移"),
-        ("固定", "固定"),
+    raw_movement = explicit_movement()
+    raw_lens_match = re.search(
+        r"(?<!\d)(\d{2,3})\s*mm(?=$|[^A-Za-z])", raw, re.I)
+    raw_lens = (
+        f"{raw_lens_match.group(1)}mm" if raw_lens_match else "")
+    raw_composition = explicit((
+        ("中心对称", "中心对称"), ("框中框", "框中框"),
+        ("前景遮挡", "前景遮挡"), ("水平分割", "水平分割"),
+        ("对角线", "对角线"), ("三分", "三分法"),
+        ("引导线", "引导线"), ("留白", "留白"),
     ))
     def _strip_aspect(value):
         # 画幅比例(16:9/2.35:1…)不属于镜头语言,唯一画幅执行值是
@@ -1741,10 +1939,25 @@ def _camera(shot, visible_count=None):
         resolved_scale, visible_count)
     # 空间锚点:本镜要同框呈现「人物 + 不在其手上的道具」时,紧景别
     # 框不住两者的位置关系,模型只能拉宽再被质检判景别不符。
-    executed_scale, anchor_note = enforce_spatial_anchor_scale(
-        executed_scale, _spatial_anchor_count(shot))
+    # A repaired tabletop/detail composition may deliberately place two
+    # cropped faces/hands and one small loose prop in the same local close-up.
+    # The generic anchor rule assumes full bodies plus a separate scene prop
+    # and would silently turn ``135mm局部近景`` back into ``35mm中景``. Honour
+    # this explicit, already-Codex-repaired framing while retaining the safety
+    # upgrade for ordinary close-ups.
+    repaired_local_closeup = bool(
+        shot.get("prompt_block_repair")
+        and executed_scale in {"大特写", "特写", "近景", "中近景"}
+        and any(token in raw for token in (
+            "局部近景", "局部特写", "桌面特写", "手部特写")))
+    if repaired_local_closeup:
+        anchor_note = ""
+    else:
+        executed_scale, anchor_note = enforce_spatial_anchor_scale(
+            executed_scale, _spatial_anchor_count(shot))
     notes = [note for note in (capacity_note, anchor_note) if note]
-    lens = _strip_aspect(_text(design.get("lens") or contract.get("焦段")))
+    lens = _strip_aspect(_text(
+        raw_lens or design.get("lens") or contract.get("焦段")))
     if notes:
         # 长焦(≥85mm)绑定近景与特写;景别升档后仍写长焦会再造一对
         # 矛盾(合同要中景、焦段却宣告特写观感),模型两头不讨好。
@@ -1752,15 +1965,24 @@ def _camera(shot, visible_count=None):
         if focal and int(focal.group(1)) >= 85:
             lens = "35mm"
     composition = _strip_aspect(_text(
-        contract.get("构图") or design.get("composition"), "主体清楚"))
+        raw_composition or contract.get("构图")
+        or design.get("composition"), "主体清楚"))
     composition, composition_note = enforce_composition_scale(
         executed_scale, composition)
     if composition_note:
         notes.append(composition_note)
     position = _strip_aspect(_text(
         raw_position or contract.get("机位") or design.get("camera_position")))
-    position, position_note = enforce_position_capacity(
-        position, visible_count)
+    single_subject_over_shoulder = (
+        position == "过肩"
+        and visible_count == 1
+        and any(token in raw + " " + _text(shot.get("description"))
+                for token in ("背对镜头", "肩后", "后脑", "背影")))
+    if single_subject_over_shoulder:
+        position_note = ""
+    else:
+        position, position_note = enforce_position_capacity(
+            position, visible_count)
     if position_note:
         notes.append(position_note)
     result = {
@@ -1813,7 +2035,130 @@ def shot_local_scene(shot, fallback=""):
     return _text(fallback, "按场景基准图")
 
 
-def build_physical_contract(shot):
+_OBJECT_NEGATION_MARKERS = (
+    "不得出现", "禁止出现", "严禁出现", "不要出现", "不可出现",
+    "不得", "禁止", "严禁", "不要", "不可", "不出现", "不包含",
+    "不表示", "不存在", "排除", "删除", "移除", "避免", "没有", "无",
+)
+
+
+def _mentions_present_object(text, tokens):
+    """Return whether a shot clause asserts that an object is present.
+
+    Repair prompts often say things such as ``不得出现笔记本电脑、屏幕``.
+    Treating that negative list as evidence that the shot contains a laptop
+    re-injects the complete laptop-use contract on every repair round and makes
+    the input self-contradictory.  Work clause by clause and ignore an object
+    mention when a nearby prefix negates its presence.
+    """
+    for clause in re.split(r"[。！？!?；;\n]+", _text(text)):
+        clause = clause.strip()
+        if not clause:
+            continue
+        for token in tokens:
+            start = 0
+            while True:
+                index = clause.find(token, start)
+                if index < 0:
+                    break
+                # Delivery-view wording is not an in-scene telephone.  In
+                # particular, historical-shot repairs use ``手机端可读性`` to
+                # explain a restrained prop-size tolerance; that must not
+                # inject a hand-held screen relationship into the scene.
+                tail = clause[index:index + 16]
+                if token == "手机" and tail.startswith((
+                        "手机端", "手机竖屏", "手机观看", "手机播放")):
+                    start = index + len(token)
+                    continue
+                prefix = clause[max(0, index - 24):index]
+                if not any(marker in prefix
+                           for marker in _OBJECT_NEGATION_MARKERS):
+                    return True
+                start = index + len(token)
+    return False
+
+
+def _dialogue_gaze_clause(description):
+    """Keep the 180-degree lock without overriding an explicit gaze target."""
+    text = _text(description)
+    eye_contact = re.search(
+        r"对视|看向对方|注视对方|凝视对方|视线.{0,8}(对方|双眼)", text)
+    gaze_target = re.search(
+        r"视线|注视|凝视|目光|看向|盯住|盯着|低头看|抬眼看|"
+        r"共同看|共同望|只看", text)
+    if gaze_target and not eye_contact:
+        return (
+            "双方身体朝向服从本镜动作，视线严格落在本镜明确的动作目标上，"
+            "不得强制改成互看双眼，且画内方向互补；")
+    return "双方身体朝向彼此，视线精确落在对方双眼附近且画内方向互补；"
+
+
+def _explicit_screen_side_names(shot, description):
+    """Resolve explicit final-frame left/right before stale blocking labels.
+
+    A repaired shot can intentionally change composition while its top-down
+    blocking document still carries the earlier screen-side names.  The latest
+    shot text is the executable contract, so phrases such as ``沈砚舟屏幕左前``
+    must override those historical labels.
+    """
+    names = [
+        _text(value) for value in (shot or {}).get("characters", [])
+        if _text(value)
+    ]
+    text = _text(description)
+    resolved = {"left": "", "right": ""}
+    for side, token in (("left", "左"), ("right", "右")):
+        for name in names:
+            escaped = re.escape(name)
+            if (re.search(
+                    rf"{escaped}[^，。；！？,;!?]{{0,20}}屏幕{token}", text)
+                    or re.search(
+                        rf"屏幕{token}(?:侧|边缘|前景|后景|前|后)?"
+                        rf"(?:为|是|：|:)?{escaped}", text)):
+                resolved[side] = name
+                break
+    return resolved["left"], resolved["right"]
+
+
+def _static_terminal_physical_rules(rules):
+    """Remove timeline/camera-motion clauses from a still-image contract."""
+    stable = []
+    camera_terms = ("摄影机", "镜头", "机位", "camera")
+    camera_motion = (
+        "跟", "推", "拉", "摇", "移", "升降", "环绕", "变焦", "运动",
+    )
+    subject_motion = (
+        "后退", "前进", "走向", "走到", "靠近", "离开", "起身", "坐下",
+        "站起", "转身", "伸手", "收手", "抬手", "放下", "拿起", "掀开",
+        "打开", "关闭", "逐渐", "随后", "然后", "过程中",
+    )
+    for rule in rules:
+        # A single stored rule can mix actor state and camera movement. Split
+        # it so stable terminal relationships survive the still conversion.
+        segments = [
+            value.strip() for value in re.split(r"[。；;\n]+", _text(rule))
+            if value.strip()
+        ]
+        kept = []
+        for segment in segments:
+            lowered = segment.lower()
+            if (any(token in lowered for token in camera_terms)
+                    and any(token in segment for token in camera_motion)):
+                continue
+            # Explicitly completed states remain useful. Bare movement prose
+            # belongs to the video timeline; frame_target carries the still's
+            # authoritative end state.
+            if (any(token in segment for token in subject_motion)
+                    and not any(token in segment for token in (
+                        "已", "站稳", "停住", "保持", "不动", "静止"))):
+                continue
+            kept.append(segment)
+        if kept:
+            stable.append("；".join(kept))
+    return stable
+
+
+def build_physical_contract(shot, *, media="video"):
     """Build a short, shot-local physical/spatial contract.
 
     The image model must receive object-user-camera relationships explicitly;
@@ -1839,6 +2184,8 @@ def build_physical_contract(shot):
     else:
         rules = [_text(explicit)] if explicit else []
         objects = []
+    if str(media or "video").lower() != "video":
+        rules = _static_terminal_physical_rules(rules)
     shot_contract = shot.get("shot_contract")
     shot_contract = shot_contract if isinstance(shot_contract, dict) else {}
     description = " ".join(_text(value) for value in (
@@ -1853,17 +2200,38 @@ def build_physical_contract(shot):
         "保持自然接触；人物朝向、视线和手部动作必须指向实际使用对象；禁止漂浮、穿模、"
         "镜像反向、无支撑或无法完成动作的姿势。"
     )
-    if generic not in rules:
+    if not any(_text(rule).rstrip("。") == generic.rstrip("。")
+               for rule in rules):
         rules.insert(0, generic)
-    if any(token in object_text for token in (
-            "笔记本", "电脑", " laptop", "屏幕", "显示器")):
+    if str(media or "video").lower() == "video":
+        motion_rule = (
+            "人和物品道具的运动轨迹必须符合真实物理世界的运动轨迹和逻辑；"
+            "人物动作服从重力、惯性、关节活动范围、重心与支撑关系；物品位移、"
+            "旋转、碰撞、接触和交接连续且有明确受力来源，前后状态一致")
+        if not any("运动轨迹必须符合真实物理世界" in _text(rule)
+                   for rule in rules):
+            rules.insert(1, motion_rule)
+    # ``屏幕左/右`` is the established staging vocabulary for image-plane
+    # position, not a display device.  A bare ``屏幕`` therefore cannot prove
+    # that a laptop exists; require an actual device noun or display-specific
+    # phrase.  ``readable_text.carrier=屏幕`` remains an explicit presence
+    # declaration and is handled separately below.
+    laptop_tokens = (
+        "笔记本", "电脑", " laptop", "显示器", "显示屏",
+        "屏幕内容", "屏幕页面", "屏幕正面", "屏幕背面", "屏幕上的",
+    )
+    laptop_carrier_tokens = (*laptop_tokens, "屏幕")
+    phone_tokens = ("手机", "平板", "tablet")
+    if (any(token in carrier.lower() for token in laptop_carrier_tokens)
+            or _mentions_present_object(object_text, laptop_tokens)):
         rules.append(
             "电脑使用关系：屏幕正面、键盘和使用者必须位于同一使用侧；键盘朝向使用者，"
             "屏幕与底座由铰链连接并由桌面支撑；人物视线落在屏幕可见区域。若需要看清屏幕文字，"
             "镜头必须采用使用者同侧的越肩或侧面机位，禁止人物坐在屏幕背面却看到屏幕正面。"
         )
         objects.append("笔记本电脑：使用者↔键盘/屏幕正面↔桌面支撑")
-    elif any(token in object_text for token in ("手机", "平板", "tablet")):
+    elif (any(token in carrier.lower() for token in phone_tokens)
+          or _mentions_present_object(object_text, phone_tokens)):
         rules.append(
             "手持屏幕关系：屏幕正面必须朝向正在查看或展示的人；手指与机身接触自然，"
             "手腕、手臂和视线方向一致，禁止屏幕朝后却被人物读取。"
@@ -1893,7 +2261,12 @@ def build_physical_contract(shot):
                 if not isinstance(actor, dict):
                     continue
                 name = _text(actor.get("name") or actor.get("character"))
-                pos = _text(actor.get("start") or actor.get("position"))
+                raw_pos = actor.get("start") or actor.get("position")
+                # Top-down/pixel/world coordinate dictionaries are useful to
+                # the 3D validator but are not screen coordinates.  Rendering
+                # ``{'x': 300, 'y': 330}`` into the image prompt made models and
+                # QC treat them as a second, contradictory left/right contract.
+                pos = "" if isinstance(raw_pos, dict) else _text(raw_pos)
                 direction = _text(
                     actor.get("direction") or actor.get("facing"))
                 if name and (pos or direction):
@@ -1902,18 +2275,21 @@ def build_physical_contract(shot):
                 rules.append("人物站位与朝向：" + "；".join(positions) + "。")
         dialogue = blocking.get("dialogue_continuity") or {}
         if isinstance(dialogue, dict) and dialogue.get("axis_id"):
-            left = _text(dialogue.get("screen_left_name"))
-            right = _text(dialogue.get("screen_right_name"))
+            explicit_left, explicit_right = _explicit_screen_side_names(
+                shot, description)
+            left = explicit_left or _text(dialogue.get("screen_left_name"))
+            right = explicit_right or _text(dialogue.get("screen_right_name"))
             side = _text(dialogue.get("camera_side"))
             coverage = _text(dialogue.get("coverage"))
+            gaze_clause = _dialogue_gaze_clause(description)
             rules.append(
                 "双人对话180°轴线合同："
                 f"axis_id={dialogue.get('axis_id')}；"
-                f"{left or '左侧角色'}固定空间左锚点，"
-                f"{right or '右侧角色'}固定空间右锚点；"
+                f"{left or '左侧角色'}固定成片屏幕左锚点，"
+                f"{right or '右侧角色'}固定成片屏幕右锚点；"
                 f"摄影机起点和终点都在演员连线的{side or '指定'}半平面；"
                 f"本镜制式={coverage or '同侧对话镜头'}；"
-                "双方身体朝向彼此，视线精确落在对方双眼附近且画内方向互补；"
+                f"{gaze_clause}"
                 "禁止交换左右、并排同向、看空气、随机第三人过肩、"
                 "镜像翻转或无可见重建的越轴。"
             )
@@ -2122,10 +2498,18 @@ def build_shot_prompt_contract(
     # Never fall back to the raw storyboard prompt here. It may contain the
     # whole episode bible and unrelated scenes, which makes the provider blend
     # facts from other shots into this image.
+    if output_media == "video":
+        previous_contract = shot.get("prompt_contract")
+        previous_action = (
+            previous_contract.get("action")
+            if isinstance(previous_contract, dict) else "")
+        action_source = (
+            shot.get("video_action") or shot.get("action")
+            or previous_action or shot.get("description"))
+    else:
+        action_source = shot.get("description") or shot.get("action")
     action = _text(
-        shot.get("description") or shot.get("action"),
-        "环境保持稳定，只执行自然微动",
-    )
+        action_source, "环境保持稳定，只执行自然微动")
     target_phase = (
         target.get("phase")
         if target.get("phase") in {"start", "end", "freeze"}
@@ -2177,7 +2561,7 @@ def build_shot_prompt_contract(
     scene = shot_local_scene(shot, location)
     physical = build_physical_contract({
         **shot, "location": scene, "style": style,
-    })
+    }, media=output_media)
     physical["frame_props"] = list(frame_props)
     physical["prop_transitions"] = list(prop_transitions)
     overlays = []
@@ -2309,7 +2693,8 @@ def build_shot_prompt_contract(
         "era_object_constraints": build_era_object_constraints({
             **shot, "location": scene, "style": style,
         }),
-        "style": _text(style or shot.get("style")),
+        "style": _style_without_shot_camera_directives(
+            style or shot.get("style")),
         "style_direction": (
             dict(shot.get("style_direction"))
             if isinstance(shot.get("style_direction"), dict) else {}),
@@ -2968,6 +3353,160 @@ def compile_shot_prompt(shot, *, location="", style="", references=None, mode="i
         shot, location=location, style=style, references=references,
         mode=mode)
     return contract, render_shot_prompt(contract)
+
+
+def _without_obsolete_camera_rules(value):
+    """Keep actor/prop physics while removing an old camera execution clause."""
+    if isinstance(value, dict):
+        value = value.get("rules") or value.get("constraints") or []
+    if isinstance(value, (list, tuple, set)):
+        value = "；".join(_text(item) for item in value if _text(item))
+    camera_terms = ("摄影机", "镜头", "机位", "camera")
+    movement_terms = (
+        "固定", "跟", "推", "拉", "摇", "移", "升降", "环绕",
+        "变焦", "运动",
+    )
+    bare_camera_motion = re.compile(
+        r"^(?:不|仅|只)?(?:跟拍?|推近?|拉远?|摇|移|升降|环绕|变焦|运动)$")
+    kept = []
+    for sentence in re.split(r"[。；;\n]+", _text(value)):
+        parts = [part.strip() for part in re.split(r"[，,、]+", sentence)
+                 if part.strip()]
+        stable = [
+            part for part in parts
+            if not (
+                any(token in part.lower() for token in camera_terms)
+                and any(token in part for token in movement_terms)
+            )
+            and not bare_camera_motion.fullmatch(part)
+        ]
+        if stable:
+            kept.append("，".join(stable))
+    return kept
+
+
+def synchronize_shot_execution_contract(
+        shot, *, location="", style="", references=None):
+    """Persist one repaired camera decision into every executable shot field.
+
+    Codex repair writes the newest camera sentence first.  Older storyboards
+    also duplicate that decision in ``shot_contract``, five-dimensional
+    design, physical rules and Seedance prompts.  Leaving any copy stale makes
+    the next stage revive the rejected camera.  This function intentionally
+    updates those derived copies together and recompiles the video contract;
+    versioned documents retain the pre-repair source for audit.
+    """
+    if not isinstance(shot, dict):
+        return shot
+    previous_contract = shot.get("prompt_contract")
+    previous_action = (
+        previous_contract.get("action")
+        if isinstance(previous_contract, dict) else "")
+    shot["video_action"] = _text(
+        shot.get("video_action") or shot.get("action")
+        or previous_action or shot.get("description"),
+        "环境保持稳定，只执行自然微动")
+    characters = list(shot.get("characters") or [])
+    visible_count = shot.get("visible_figure_count")
+    if not isinstance(visible_count, int) or isinstance(visible_count, bool):
+        visible_count = len(characters)
+    camera = _camera(shot, visible_count=visible_count)
+
+    shot_contract = shot.get("shot_contract")
+    shot_contract = (dict(shot_contract)
+                     if isinstance(shot_contract, dict) else {})
+    camera_keys = ("景别", "角度", "焦段", "机位", "运镜", "构图")
+    for key in camera_keys:
+        shot_contract[key] = camera.get(key, "")
+
+    dimensions = shot.get("five_dimensions")
+    dimensions = dict(dimensions) if isinstance(dimensions, dict) else {}
+    design = dimensions.get("camera_design")
+    design = dict(design) if isinstance(design, dict) else {}
+    design.update({
+        "shot_scale": camera.get("景别", ""),
+        "angle": camera.get("角度", ""),
+        "lens": camera.get("焦段", ""),
+        "camera_position": camera.get("机位", ""),
+        "movement": camera.get("运镜", ""),
+        "composition": camera.get("构图", ""),
+        "movement_motivation": camera.get("动机", ""),
+    })
+    dimensions["camera_design"] = design
+
+    movement = _text(camera.get("运镜"), "固定")
+    if "固定" in movement:
+        movement_rule = (
+            "摄影机全程固定在当前执行机位，不跟拍、不推、不拉、不摇、"
+            "不移、不升降、不环绕、不变焦。")
+        movement_label = "固定机位"
+    else:
+        movement_rule = (
+            f"摄影机全程只执行一次{movement}，除该单一运镜外不叠加推、"
+            "拉、摇、移、升降、环绕或变焦。")
+        movement_label = movement
+    pattern = "".join(filter(None, (
+        _text(camera.get("焦段")), _text(camera.get("角度")),
+        _text(camera.get("机位")), _text(camera.get("景别")),
+    )))
+    pattern = "，".join(filter(None, (
+        pattern, movement_label, _text(camera.get("构图")),
+    )))
+    shot_contract["风格镜头组合"] = pattern
+    shot["shot_contract"] = shot_contract
+
+    direction = shot.get("style_direction")
+    direction = dict(direction) if isinstance(direction, dict) else {}
+    direction["shot_pattern"] = pattern
+    direction_camera = direction.get("camera_contract")
+    direction_camera = (
+        dict(direction_camera)
+        if isinstance(direction_camera, dict) else {})
+    direction_camera.update({
+        "shot_scale": camera.get("景别", ""),
+        "angle": camera.get("角度", ""),
+        "lens": camera.get("焦段", ""),
+        "camera_position": camera.get("机位", ""),
+        "movement": camera.get("运镜", ""),
+        "composition": camera.get("构图", ""),
+    })
+    direction["camera_contract"] = direction_camera
+    shot["style_direction"] = direction
+    aesthetics = dimensions.get("aesthetics")
+    aesthetics = dict(aesthetics) if isinstance(aesthetics, dict) else {}
+    aesthetics["shot_pattern"] = pattern
+    dimensions["aesthetics"] = aesthetics
+    shot["five_dimensions"] = dimensions
+
+    physical_source = shot.get("physical_logic")
+    if not physical_source:
+        physical_source = shot.get("physical_contract")
+    physical_rules = _without_obsolete_camera_rules(physical_source)
+    physical_rules.append(movement_rule.rstrip("。"))
+    shot["physical_logic"] = "；".join(dict.fromkeys(physical_rules)) + "。"
+    physical_input = dict(shot)
+    physical_input.pop("physical_contract", None)
+    shot["physical_contract"] = build_physical_contract(
+        physical_input, media="video")
+
+    scene = shot_local_scene(shot, location)
+    action = _text(
+        shot.get("description") or shot.get("action"), "环境保持稳定")
+    prompt_parts = [
+        f"场景：{scene}" if scene else "",
+        f"镜头：{pattern}",
+        f"动作：{action}",
+        f"空间与机位：{shot['physical_logic']}",
+        "无字幕、无Logo、无水印",
+    ]
+    shot["prompt"] = "。".join(part for part in prompt_parts if part)
+    contract, compact = compile_shot_prompt(
+        shot, location=scene, style=style, references=references,
+        mode="video")
+    shot["prompt_contract"] = contract
+    shot["seedance_prompt_compact"] = compact
+    shot["seedance_prompt"] = compact
+    return shot
 
 
 def _binding_categories(reference):

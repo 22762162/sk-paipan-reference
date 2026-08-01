@@ -1163,7 +1163,9 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
             "画面无字幕、无水印、无乱码"),
         "seedance_prefix": _text(
             raw_prompts.get("seedance_prefix"),
-            "单段不短于4秒、不超过15秒；每段单一主动作；人物数量、身份、服装、"
+            "常规单镜8-15秒、目标10-15秒；低于8秒必须有不可合并的剪辑动机；"
+            "每镜用起势、主体、收束三个连续时间阶段完成单一主动作；"
+            "人物数量、身份、服装、"
             "道具、空间、光线和起止状态连续；台词逐字保真；"
             "每镜从风格专属导演知识中只选择一个主要镜头组合和必要视觉效果，"
             "不得套用其他风格的惯用运镜，不得把整套特效同时堆入一镜；不要字幕"),
@@ -1177,7 +1179,7 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
                 "同名实体全程同一身份",
                 "段尾姿态、伤势、道具、情绪、朝向继承到下一段",
                 "镜头只出现剧本声明的在场人物",
-                "关键台词后保留听者反应镜，情绪高潮保留无台词表演镜",
+                "场景建立、听者反应、必要肢体动作和情绪收束嵌入相邻长镜头",
             ]),
     }
     return {
@@ -1201,12 +1203,15 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
         "prompt_bible": prompt_bible,
         "production_rules": {
             "dialogue_verbatim": True,
+            "preferred_segment_seconds": [8, 15],
+            "target_segment_seconds": [10, 15],
             "max_segment_seconds": 15,
             "no_burned_subtitles": True,
             "visible_text_requires_locked_keyframe": True,
             "on_stage_characters_only": True,
-            "reaction_after_key_dialogue": True,
-            "beat_at_emotional_peak": True,
+            "reaction_after_key_dialogue": False,
+            "beat_at_emotional_peak": False,
+            "embedded_temporal_phases": ["setup", "main", "settle"],
             "character_candidate_targets": {
                 "main": 4, "important_supporting": 4,
                 "non_main": 4, "background": 0,

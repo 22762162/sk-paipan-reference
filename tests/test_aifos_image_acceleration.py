@@ -7,6 +7,7 @@ import pytest
 from aifos.app import App
 from aifos.errors import AifosError, ProviderUnavailable
 from aifos.production.base import ProviderResult
+from aifos.prompt_contract import build_shot_prompt_contract
 
 
 def _png(path, marker=b"r"):
@@ -40,6 +41,14 @@ def _setup(tmp_path, *, with_reference=True):
     payload = {
         "shot_no": 1, "characters": ["林昭"],
         "prompt": "林昭在办公室看向镜头", "aspect": "9:16",
+        "frame_targets": {"keyframe": {
+            "phase": "freeze", "state": "林昭独自在办公室看向镜头",
+            "fallback": False,
+        }},
+        "character_facts": {"林昭": {
+            "gender": "女性", "age_range": "24至28岁",
+        }},
+        "prop_registry": [], "frame_props": [],
         "image_task_class": "batch", "image_quality": "medium",
         "quality_decision": {"level": "medium", "source": "auto"},
         "identity_references": ([{
@@ -47,6 +56,34 @@ def _setup(tmp_path, *, with_reference=True):
         }] if identity else []),
         "character_refs": [identity] if identity else [],
         "require_reference_images": bool(identity),
+    }
+    shot = {
+        "shot_no": 1, "scene_no": 1,
+        "characters": ["林昭"],
+        "description": "林昭在办公室看向镜头",
+        "frame_targets": {"keyframe": {
+            "phase": "freeze", "state": "林昭独自在办公室看向镜头",
+            "fallback": False,
+        }},
+        "character_facts": {"林昭": {
+            "gender": "女性", "age_range": "24至28岁",
+        }},
+        "prop_registry": [], "frame_props": [],
+    }
+    payload["prompt_contract"] = build_shot_prompt_contract(
+        shot, location="办公室", mode="image")
+    app.director._attach_reference_manifest(payload)
+    review_context = app.router._prompt_review_context("image", payload)
+    reviewed_prompt = payload.get("prompt_compact") or payload["prompt"]
+    payload["prompt_review"] = {
+        "schema": app.router.PROMPT_REVIEW_SCHEMA,
+        "approved": True, "status": "approved",
+        "optimized_hash": app.router._stable_hash(reviewed_prompt),
+        "reviewed_input_hash": app.router._stable_hash({
+            "prompt": reviewed_prompt,
+            "context": review_context,
+            "schema": app.router.PROMPT_REVIEW_SCHEMA,
+        }),
     }
     task = {"item_id": "shot:1", "capability": "image",
             "payload": payload, "sub_dir": "images", "tag": 1,
@@ -74,7 +111,8 @@ def test_preflight_locks_prompt_refs_provider_model_and_defaults_medium(
             contract_tokens={"shot:1": item["contract_token"]})
         assert report["passed"] is True
         assert report["quality"] == "medium"
-        assert report["items"][0]["prompt"] == "林昭在办公室看向镜头"
+        assert "林昭独自在办公室看向镜头" in \
+            report["items"][0]["prompt"]
     finally:
         app.close()
 
@@ -116,6 +154,33 @@ def test_removed_plan_item_cannot_reappear_in_acceleration_queue(tmp_path):
             app.director.queue_image_acceleration(
                 "加速测试", 1, ["shot:1"],
                 "image_api", "gpt-image-2")
+    finally:
+        app.close()
+
+
+def test_prune_removes_only_orphan_rows_from_the_selected_category(tmp_path):
+    app, _project, episode, _ctx, _task = _setup(tmp_path)
+    try:
+        app.director.image_acceleration.register(episode["id"], [{
+            "item_id": "shot:22", "category": "shot_image",
+            "capability": "image", "contract_token": "orphan-token",
+            "contract": {"prompt": "orphan"}, "never_started": True,
+        }, {
+            "item_id": "frames:1", "category": "frames",
+            "capability": "image", "contract_token": "frame-token",
+            "contract": {"prompt": "frame"}, "never_started": True,
+        }])
+
+        removed = app.director.image_acceleration.prune(
+            episode["id"], "shot_image", ["shot:1"])
+
+        assert removed == ["shot:22"]
+        assert app.director.image_acceleration.get(
+            episode["id"], "shot:1") is not None
+        assert app.director.image_acceleration.get(
+            episode["id"], "shot:22") is None
+        assert app.director.image_acceleration.get(
+            episode["id"], "frames:1") is not None
     finally:
         app.close()
 

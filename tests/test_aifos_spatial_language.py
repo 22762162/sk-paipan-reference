@@ -150,6 +150,15 @@ class MovementAndConflictTest(unittest.TestCase):
         self.assertIn("景别与空间调度不一致", conflict)
         self.assertIn("请调整机位距离或改写景别", conflict)
 
+    def test_over_shoulder_uses_director_subject_not_foreground_distance(self):
+        block = _block()
+        block["camera"]["position"] = "过肩"
+        block["camera"]["director_camera"] = {"distance_m": 2.8}
+        # 柔焦前景肩膀贴近镜头，但主拍对象在中景距离。
+        block["actors"][0]["start_3d"] = {
+            "x": 0.0, "y": 0.0, "z": 3.85}
+        self.assertEqual(framing_conflict(block, "中景"), "")
+
 
 class ContractInjectionTest(unittest.TestCase):
     def test_shot_contract_and_prompt_carry_spatial_lines(self):

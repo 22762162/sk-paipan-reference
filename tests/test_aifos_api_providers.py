@@ -72,7 +72,21 @@ STORYBOARD_JSON = {
     "episode_title": "夜探古镇",
     "shots": [{"shot_no": 3, "scene_no": 1, "kind": "environment",
                "description": "古镇夜景", "camera": "远景", "duration": 2.5,
-               "characters": [], "dialogue": None, "prompt": "古镇夜景"}],
+               "characters": [], "dialogue": None, "prompt": "古镇夜景",
+               "frame_targets": {
+                   "keyframe": {
+                       "phase": "freeze", "state": "古镇夜景建立镜头",
+                       "fallback": False,
+                   },
+                   "first_frame": {
+                       "phase": "start", "state": "空街灯影刚进入画面",
+                       "fallback": False,
+                   },
+                   "last_frame": {
+                       "phase": "end", "state": "空街灯影稳定收束",
+                       "fallback": False,
+                   },
+               }}],
 }
 
 

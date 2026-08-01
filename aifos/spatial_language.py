@@ -348,18 +348,31 @@ def framing_conflict(block, declared_scale, *, phase="start"):
     actors = [a for a in (block.get("actors") or []) if isinstance(a, dict)]
     if not actors:
         return ""
+    # 过肩/多人纵深构图中，离镜头最近的人往往只是柔焦肩背前景，并非
+    # 决定景别的主拍对象。导演求解器已记录“机位→主拍对象”的实际
+    # 距离，优先用它核验景别；否则会把合法中景误判成前景肩膀的特写。
+    director_camera = camera.get("director_camera") or {}
+    subject_distance = None
+    try:
+        value = director_camera.get("distance_m")
+        if value is not None:
+            subject_distance = float(value)
+    except (TypeError, ValueError):
+        subject_distance = None
     # 必须与空间站位同相位:人物在镜头内移动时,拿 start 位置去核对
     # 定格在 end 的画面,会报出根本不存在的矛盾(实测 ep24 镜头5)。
     cam = _point(camera.get(f"{phase}_3d") or camera.get("start_3d"))
-    nearest = None
-    for actor in actors:
-        point = _point(subject_point(
-            actor.get(f"{phase}_3d") or actor.get("start_3d"),
-            actor.get("height_m")))
-        distance = _distance(cam, point)
-        if distance is not None and (nearest is None or distance < nearest):
-            nearest = distance
-    natural = framing_for_distance(nearest)
+    if subject_distance is None:
+        for actor in actors:
+            point = _point(subject_point(
+                actor.get(f"{phase}_3d") or actor.get("start_3d"),
+                actor.get("height_m")))
+            distance = _distance(cam, point)
+            if (distance is not None
+                    and (subject_distance is None
+                         or distance < subject_distance)):
+                subject_distance = distance
+    natural = framing_for_distance(subject_distance)
     if not natural or natural == scale:
         return ""
     order = ["特写", "近景", "中景", "全景", "远景"]
@@ -371,8 +384,8 @@ def framing_conflict(block, declared_scale, *, phase="start"):
     gap = abs(order.index(declared) - order.index(natural))
     if gap < 2:
         return ""
-    return (f"景别与空间调度不一致:合同声明{scale},但最近人物距摄影机"
-            f"约{nearest:.1f}米,该距离自然落在{natural};"
+    return (f"景别与空间调度不一致:合同声明{scale},但主拍对象距摄影机"
+            f"约{subject_distance:.1f}米,该距离自然落在{natural};"
             "请调整机位距离或改写景别,否则成片必然对不上")
 
 

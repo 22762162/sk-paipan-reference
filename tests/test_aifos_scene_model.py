@@ -9,9 +9,12 @@ import unittest
 
 from aifos.scene_model import (DEFAULT_CAPTURE_HEIGHT_M, actor_placement_issues,
                                build_object, build_scene_model,
+                               camera_placement_issues,
                                direction_from_equirect,
                                equirect_from_direction, find_object,
-                               floor_point, height_at, overlap_issues)
+                               floor_point, height_at, overlap_issues,
+                               repair_actor_furniture_collisions,
+                               repair_camera_furniture_collisions)
 
 
 ROOM = {"floor_width_m": 10.0, "floor_depth_m": 7.0}
@@ -154,6 +157,75 @@ class ActorPlacementTest(unittest.TestCase):
             [{"name": "沈眉", "start_3d": {"x": 12.0, "y": 0, "z": 0.0}}])
         self.assertTrue(any(i["severity"] == "block"
                             and i["field"] == "actor_bounds" for i in issues))
+
+    def test_measured_furniture_collision_is_repaired_deterministically(self):
+        model = self._model()
+        model["objects"][0]["geometry_sources"].update({
+            "depth": "visual_annotation",
+            "rotation": "visual_annotation",
+        })
+        actor = {
+            "name": "沈眉",
+            "start_3d": {"x": 0.0, "y": 0, "z": 0.6},
+            "end_3d": {"x": 0.0, "y": 0, "z": 0.6},
+            "route_3d": [
+                {"x": 0.0, "y": 0, "z": 0.6, "phase": "fixed"},
+            ],
+        }
+
+        adjustments = repair_actor_furniture_collisions(model, [actor])
+
+        self.assertTrue(adjustments)
+        self.assertEqual(actor["start_3d"], actor["end_3d"])
+        self.assertEqual(
+            (actor["start_3d"]["x"], actor["start_3d"]["z"]),
+            (actor["route_3d"][0]["x"], actor["route_3d"][0]["z"]))
+        self.assertFalse(any(
+            issue["severity"] == "block"
+            for issue in actor_placement_issues(model, [actor])))
+
+
+class CameraPlacementRepairTest(unittest.TestCase):
+    def _model(self):
+        u, v = equirect_from_direction(0.0, -DEFAULT_CAPTURE_HEIGHT_M, 0.6)
+        model = build_scene_model(
+            [{"name": "书案", "category": "furniture",
+              "base_u": u, "base_v": v, "width_u": 0.12,
+              "depth_m": 1.2, "rotation_y_deg": 0}], room=ROOM)
+        model["objects"][0]["geometry_sources"].update({
+            "depth": "visual_annotation",
+            "rotation": "visual_annotation",
+        })
+        return model
+
+    def test_measured_furniture_camera_collision_is_repaired(self):
+        model = self._model()
+        camera = {
+            "start_3d": {"x": 0.0, "y": 0.5, "z": 0.6},
+            "end_3d": {"x": 0.0, "y": 0.5, "z": 0.6},
+            "target_start_3d": {"x": 0.0, "y": 1.25, "z": -0.3},
+            "target_end_3d": {"x": 0.0, "y": 1.25, "z": -0.3},
+            "target_3d": {"x": 0.0, "y": 1.25, "z": -0.3},
+            "route_3d": [
+                {"x": 0.0, "y": 0.5, "z": 0.6, "phase": "fixed"},
+            ],
+            "director_camera": {},
+        }
+
+        adjustments = repair_camera_furniture_collisions(model, camera)
+
+        self.assertTrue(adjustments)
+        self.assertEqual(camera["start_3d"], camera["end_3d"])
+        self.assertEqual(
+            (camera["start_3d"]["x"], camera["start_3d"]["y"],
+             camera["start_3d"]["z"]),
+            (camera["route_3d"][0]["x"], camera["route_3d"][0]["y"],
+             camera["route_3d"][0]["z"]))
+        self.assertFalse(any(
+            issue["severity"] == "block"
+            for issue in camera_placement_issues(model, camera)))
+        self.assertIn("orientation_start", camera)
+        self.assertIn("orientation_end", camera)
 
 
 if __name__ == "__main__":

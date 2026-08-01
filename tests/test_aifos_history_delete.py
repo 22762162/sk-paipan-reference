@@ -199,3 +199,50 @@ def test_force_rebuild_archives_old_runtime_state_before_new_plan(tmp_path):
                 "force-rebuild-*/summary.json"))
     finally:
         app.close()
+
+
+def test_fresh_assets_tombstones_only_current_episode_derived_assets(tmp_path):
+    app = App(tmp_path / "ws")
+    try:
+        project, _ = app.projects.get_or_create_project("全新镜头资产")
+        first, _ = app.projects.get_or_create_episode(project["id"], 1)
+        app.projects.get_or_create_episode(project["id"], 2)
+        old_image, old_path = _image(
+            app, project["id"], "image", "e001_shot001", "old-shot.png")
+        old_space, space_path = _image(
+            app, project["id"], "spatial_blocking",
+            "e001_shot001_space", "old-space.png")
+        other_episode, _ = _image(
+            app, project["id"], "image", "e002_shot001", "other.png")
+        character, _ = _image(
+            app, project["id"], "character_art", "林昭", "character.png")
+        ctx = {
+            "project": dict(project),
+            "episode": dict(first),
+            "run_id": 294,
+        }
+
+        result = app.director._invalidate_fresh_episode_assets(ctx)
+        repeated = app.director._invalidate_fresh_episode_assets(ctx)
+
+        assert result["count"] == 2
+        assert repeated["count"] == 0
+        assert app.assets.latest(
+            project["id"], "image", "e001_shot001") is None
+        image_tombstone = app.assets.latest(
+            project["id"], "image", "e001_shot001", include_deleted=True)
+        assert image_tombstone["version"] == old_image["version"] + 1
+        assert app.assets.meta(image_tombstone)["fresh_run_id"] == 294
+        assert app.assets.latest(
+            project["id"], "spatial_blocking",
+            "e001_shot001_space") is None
+        assert app.assets.latest(
+            project["id"], "image", "e002_shot001")["id"] == other_episode["id"]
+        assert app.assets.latest(
+            project["id"], "character_art", "林昭")["id"] == character["id"]
+        assert old_path.exists() and space_path.exists()
+        assert len(app.assets.history(
+            project["id"], "image", "e001_shot001")) == 2
+        assert old_image["id"] != image_tombstone["id"]
+    finally:
+        app.close()

@@ -9,7 +9,24 @@ import pytest
 
 from aifos.app import App
 from aifos.errors import AifosError
-from aifos.production.dreamina import REQUIRED_MODEL_VERSION, DreaminaProvider
+from aifos.production.dreamina import (
+    REQUIRED_MODEL_VERSION,
+    SEEDANCE_PHYSICS_CLAUSE,
+    SEEDANCE_PROMPT_CHAR_LIMIT,
+    SEEDANCE_PROMPT_TARGET_CHAR_LIMIT,
+    DreaminaProvider,
+)
+
+
+def test_latest_submit_id_recovers_last_remote_task(tmp_path):
+    log_path = tmp_path / "shot_009.dreamina.log"
+    log_path.write_text(
+        '{"submit_id":"old-task","gen_status":"querying"}\n'
+        '{"submit_id":"generated-task","gen_status":"querying"}\n'
+        'download video 1: context deadline exceeded\n',
+        encoding="utf-8")
+
+    assert DreaminaProvider._latest_submit_id(log_path) == "generated-task"
 
 FAKE_DREAMINA = '''#!/usr/bin/env python3
 import json, os, sys
@@ -129,7 +146,9 @@ def test_frames2video_command_shape(tmp_path, fake_dreamina):
         assert call[0] == "frames2video"
         assert f"--first={Path('/tmp/first.png').resolve()}" in call
         assert f"--last={Path('/tmp/last.png').resolve()}" in call
-        assert "--prompt=妖气翻涌的古镇长街" in call
+        prompt_arg = next(arg for arg in call if arg.startswith("--prompt="))
+        assert prompt_arg.startswith("--prompt=妖气翻涌的古镇长街")
+        assert SEEDANCE_PHYSICS_CLAUSE in prompt_arg
         assert "--duration=5" in call
         assert "--video_resolution=720p" in call
         assert "--model_version=seedance2.0fast_vip" in call
@@ -291,15 +310,18 @@ def test_full_pipeline_with_fake_dreamina(tmp_path, fake_dreamina):
         videos_stage = next(
             s for s in summary["stages"] if s["stage"] == "videos")
         assert videos_stage["providers"] == ["jimeng"]
-        # 必要参考图(分镜图/人物立绘/场景图)自动选入后,视频默认走
-        # multimodal2video(首尾帧+参考图一起提交);无参考图的镜头
-        # 仍走 frames2video。两种模式都必须锁定 fast_vip 模型。
+        # 正式导演默认走全能参考，把人物/道具/空间资产与图1起点、图2
+        # 终点一起提交；提示词必须保持精简并明确每张图的单一职责。
         calls = [c for c in _calls(fake_dreamina)
                  if c[0] in ("frames2video", "multimodal2video")]
         assert calls and all(
             "--model_version=seedance2.0fast_vip" in c for c in calls)
-        assert any(c[0] == "multimodal2video" for c in calls), \
-            "自动参考图选入后应有镜头走 multimodal2video"
+        assert any(c[0] == "multimodal2video" for c in calls)
+        for call in calls:
+            prompt = next(arg for arg in call if arg.startswith("--prompt="))
+            assert len(prompt[9:]) <= SEEDANCE_PROMPT_TARGET_CHAR_LIMIT
+            if call[0] == "multimodal2video":
+                assert "首尾帧职责" in prompt
     finally:
         app.close()
 
@@ -319,6 +341,42 @@ def test_dialogue_voiced_in_video_prompt(tmp_path, fake_dreamina):
     (call,) = _calls(fake_dreamina)
     prompt = next(a for a in call if a.startswith("--prompt="))
     assert "妖气不对劲" in prompt and "自动配音" in prompt
+
+
+def test_final_seedance_prompt_is_at_most_4000_including_all_suffixes(
+        tmp_path, fake_dreamina):
+    """长度在最后一层按完整字符串计数，配音和参考条款也不能越界。"""
+    app = _make_app(tmp_path, fake_dreamina)
+    long_sections = "\n".join(
+        f"【{label}】{label}细节" + ("甲乙丙，；？！()[]" * 160)
+        for label in (
+            "输入", "主体", "起点", "单一主动作", "镜头", "终点",
+            "道具状态变化", "物理/空间逻辑", "参考图职责", "硬约束"))
+    try:
+        result = app.router.call("video", {
+            "shot_no": 12,
+            "prompt_compact": long_sections,
+            "dialogue": {"character": "顾清让", "dialogue": "我来查清此案"},
+            "first": "/tmp/first.png", "last": "/tmp/last.png",
+            "reference_images": ["/tmp/hero.png"],
+            "reference_videos": ["/tmp/motion.mp4"],
+            "duration": 8,
+        }, app.workspace.artifacts_dir)
+    finally:
+        app.close()
+    (call,) = _calls(fake_dreamina)
+    prompt = next(arg for arg in call if arg.startswith("--prompt="))[9:]
+    assert len(prompt) <= SEEDANCE_PROMPT_CHAR_LIMIT
+    assert len(prompt) <= SEEDANCE_PROMPT_TARGET_CHAR_LIMIT
+    assert result.data["prompt_char_count"] == len(prompt)
+    assert result.data["prompt_char_limit"] == SEEDANCE_PROMPT_CHAR_LIMIT
+    assert result.data["prompt_target_char_limit"] == \
+        SEEDANCE_PROMPT_TARGET_CHAR_LIMIT
+    assert SEEDANCE_PHYSICS_CLAUSE in prompt
+    assert "人和物品道具的运动轨迹必须符合真实物理世界" in prompt
+    assert "我来查清此案" in prompt
+    assert "多图参考边界" in prompt
+    assert "参考视频边界" in prompt
 
 
 def test_produce_skips_tts_when_video_carries_audio(tmp_path, fake_dreamina):

@@ -303,6 +303,104 @@ def test_conflicting_full_body_identity_uses_face_only_anchor(
     assert "服装只服从本镜服装参考" in identity_entry["binding"]
 
 
+def test_face_only_anchor_keeps_matching_signature_hair_ornament(
+        app, monkeypatch):
+    project, episode, script = _preproduce(
+        app, title="发饰形制锚点")
+    name = script["characters"][0]["name"]
+    hairpin = {
+        "presence": "worn", "kind": "hair_ornament",
+        "name": "横向断纹旧银簪",
+        "shape": "横穿发髻的长直簪杆",
+        "material": "氧化旧银",
+        "color": "暗旧银色",
+        "placement": "横向穿过中高发髻",
+        "signature_details": "右端大号镂刻叶形端头、左端小尖饰",
+        "forbidden_variants": ["短发夹", "垂坠金钗"],
+    }
+    monkeypatch.setattr(
+        app.director, "_locked_look_variant",
+        lambda _project_id, _name: {
+            "costume": "另一场礼服",
+            "accessories": hairpin,
+        })
+
+    refs = app.director._art_refs(
+        {"project": dict(project), "episode": dict(episode)},
+        [name], "", wardrobe_states={name: "当前场常服"},
+        headwear_states={name: hairpin})
+
+    identity = refs["identity_references"][0]
+    assert identity["identity_anchor_type"] == "face_only_derived"
+    assert identity["headwear_anchor"] == hairpin
+    manifest = app.director._reference_manifest(refs)
+    entry = next(item for item in manifest if item["role"] == "identity")
+    assert "横向断纹旧银簪" in entry["binding"]
+    assert "不得简化、换款、改色或移位" in entry["binding"]
+    assert "横穿发髻的长直簪杆" in entry["binding"]
+    assert "右端大号镂刻叶形端头" in entry["binding"]
+    assert "短发夹、垂坠金钗" in entry["binding"]
+    assert "headwear_signature_details" in entry["inherits"]
+
+
+def test_rear_headwear_contract_adds_scoped_back_structure_anchor(
+        app, monkeypatch):
+    project, episode, script = _preproduce(
+        app, title="后脑发饰结构锚")
+    name = script["characters"][0]["name"]
+    back = app.assets.latest(
+        project["id"], "character_sheet", f"{name}:back")
+    closeup = app.assets.latest(
+        project["id"], "character_sheet", f"{name}:closeup")
+    profile = app.assets.latest(
+        project["id"], "character_sheet", f"{name}:profile")
+    assert back is not None and closeup is not None and profile is not None
+    headwear = {
+        "presence": "worn", "kind": "soft_hat", "name": "素黑网巾",
+        "shape": "网巾贴合头顶，后脑圆形开口露出低髻",
+        "material": "细密黑色网纱，棕黑布边",
+        "color": "烟墨黑",
+        "placement": "前缘沿发际线，低髻从后脑圆孔露出",
+        "signature_details": "后脑交叉束带，低髻中央短横固定簪",
+        "forbidden_variants": ["完全包住低髻", "顶髻突出在网巾上方"],
+    }
+    monkeypatch.setattr(
+        app.director, "_locked_look_variant",
+        lambda _project_id, _name: {
+            "costume": "深靛圆领袍", "accessories": headwear,
+        })
+    monkeypatch.setattr(
+        app.director, "_locked_identity_has_headwear_qc_conflict",
+        lambda _project_id, _name: True)
+
+    refs = app.director._art_refs(
+        {"project": dict(project), "episode": dict(episode)},
+        [name], "", wardrobe_states={name: "深靛圆领袍"},
+        headwear_states={name: headwear},
+        sheet_keys_by_character={name: ("profile",)})
+
+    assert len(refs["headwear_references"]) == 1
+    assert refs["headwear_references"][0]["uri"] == back["uri"]
+    assert refs["identity_references"][0]["uri"] == closeup["uri"]
+    assert refs["identity_references"][0]["headwear_anchor"] == headwear
+    assert profile["uri"] not in refs["character_refs"]
+    assert not [
+        item for item in refs["asset_matches"]
+        if item.get("uri") == profile["uri"]]
+    manifest = app.director._reference_manifest(refs)
+    headwear_entry = next(
+        item for item in manifest if item["role"] == "headwear")
+    identity_entry = next(
+        item for item in manifest if item["role"] == "identity")
+    assert headwear_entry["uri"] == back["uri"]
+    assert headwear_entry["index"] == identity_entry["index"] + 1
+    assert "正面身份图看不见或与本图冲突" in headwear_entry["binding"]
+    assert "后脑圆形开口露出低髻" in headwear_entry["binding"]
+    assert "顶髻突出在网巾上方" in headwear_entry["binding"]
+    assert "headwear_signature_details" in headwear_entry["inherits"]
+    assert "face_identity_override" in headwear_entry["excludes"]
+
+
 def test_headwear_conflict_cannot_reenter_through_wardrobe_reference(
         app, monkeypatch):
     project, episode, script = _preproduce(
@@ -401,7 +499,8 @@ def test_shot_provider_prompt_contains_current_frame_only(app):
     payload = app.director._shot_payload(ctx, shot)
     provider_prompt = payload["prompt_compact"]
     assert current not in provider_prompt
-    assert payload["prompt_contract"]["frame_target_source"] == "end_state"
+    assert payload["prompt_contract"]["frame_target_source"] == \
+        "frame_targets.keyframe"
     assert provider_prompt.count("【定格状态】") == 1
     assert all(
         label not in provider_prompt
@@ -471,6 +570,94 @@ def test_character_asset_reference_table_is_not_duplicated_in_provider_prompt(
     assert payload["prompt_compact"] == "CURRENT_ASSET_SENTINEL_严格90度侧面"
     assert "参考图对照表" not in payload["prompt_compact"]
     assert instruction.count("参考图对照表(") == 1
+
+
+def test_rebuilt_manifest_removes_stale_numbered_reference_duties(
+        app, tmp_path):
+    portrait = tmp_path / "portrait.png"
+    spatial = tmp_path / "spatial.png"
+    portrait.write_bytes(PNG)
+    spatial.write_bytes(PNG)
+    payload = {
+        "prompt": (
+            "冻结当前状态。参考图2只继承空间站位与机位。"
+            "参考图4只锁定门窗材质和主光。"),
+        "action": "人物停住；参考图2仅继承blocking与occlusion。",
+        "camera": "平视中景。参考图4只锁定场景光线。",
+        "prompt_contract": {
+            "action": "静态定格。图2只负责空间，不负责人物身份。",
+        },
+        "identity_references": [{
+            "character": "李继周", "uri": str(portrait),
+        }],
+        "character_refs": [str(portrait)],
+        "spatial_ref": str(spatial),
+    }
+
+    app.director._attach_reference_manifest(payload)
+
+    assert "参考图2只" not in payload["prompt"]
+    assert "参考图4只" not in payload["prompt"]
+    assert "参考图2" not in payload["action"]
+    assert "参考图4" not in payload["camera"]
+    assert "图2只负责" not in json.dumps(
+        payload.get("prompt_contract") or {}, ensure_ascii=False)
+    assert "图1=P01·李继周最终立绘" in payload["prompt"]
+    assert "图2=本镜空间调度图" in payload["prompt"]
+
+
+def test_shot_plan_hash_invalidates_when_reference_manifest_changes(
+        app, monkeypatch):
+    project, _ = app.projects.get_or_create_project("参考图变更作废旧关键帧")
+    episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+    shot = {
+        "shot_no": 1, "scene_no": 1, "characters": ["沈砚舟"],
+        "description": "同一静态镜头",
+    }
+    state = {"reference_manifest": [{
+        "index": 1, "uri": "/old-profile.png",
+        "role": "identity_detail", "character": "沈砚舟",
+    }]}
+
+    def payload_for_shot(_ctx, _shot, **_kwargs):
+        return {
+            "prompt_compact": "同一镜头提示词",
+            "prompt_contract": {},
+            "reference_manifest": state["reference_manifest"],
+        }
+
+    monkeypatch.setattr(app.director, "_shot_payload", payload_for_shot)
+    ctx = {
+        "project": dict(project), "episode": dict(episode),
+        "out_root": app.workspace.artifacts_dir
+        / f"p{project['id']:03d}" / "e001",
+        "storyboard": {"shots": [shot]},
+    }
+
+    app.director._plan_seed_shots(ctx)
+    first = next(
+        item for item in app.director._plan_read(ctx)["items"]
+        if item["id"] == "shot:1")
+    first_hash = first["content_hash"]
+    app.director._plan_mark(
+        ctx, "shot:1", "done", extra={"output_uri": "/old.png"})
+
+    state["reference_manifest"] = [{
+        "index": 1, "uri": "/face-only.png",
+        "role": "identity", "character": "沈砚舟",
+    }, {
+        "index": 2, "uri": "/correct-back.png",
+        "role": "headwear", "character": "沈砚舟",
+    }]
+    app.director._plan_seed_shots(ctx)
+
+    current = next(
+        item for item in app.director._plan_read(ctx)["items"]
+        if item["id"] == "shot:1")
+    assert current["content_hash"] != first_hash
+    assert current["status"] == "pending"
+    assert current["invalidated_previous_output"] is True
+    assert "参考图合同已变化" in current["invalidation_reason"]
 
 
 def test_legacy_unscoped_reference_does_not_pollute_every_shot(app, tmp_path):

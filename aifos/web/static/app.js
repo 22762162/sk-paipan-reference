@@ -569,7 +569,7 @@ const STANDARD_SECTIONS = [
     blurb: "控制镜头时长、生成粒度和长台词拆分，直接影响节奏与生成成本。",
     fields: [
       { path: "rules.production.preferred_segment_seconds", label: "建议单元时长", type: "range", min: 1, max: 15, step: .5, unit: "秒",
-        help: "优先把一个动作或一句台词控制在这个区间。" },
+        help: "常规镜头使用 8–15 秒；场景建立、动作、反应和收束在同一镜完成。" },
       { path: "rules.production.max_segment_seconds", label: "单元最长时长", type: "number", min: 5, max: 15, step: .5, unit: "秒",
         help: "任何 Seedance 单元不得超过此上限。" },
       { path: "rules.production.time_precision_seconds", label: "时间码精度", type: "number", min: .5, max: 2, step: .5, unit: "秒",
@@ -580,6 +580,14 @@ const STANDARD_SECTIONS = [
         help: "禁止改写、缩写、意译或同义替换。" },
       { path: "rules.dialogue.split_at_natural_pause", label: "只在自然停顿拆分", type: "boolean",
         help: "避免把词组从中间切断。" },
+      { path: "rules.production.long_take_policy.enabled", label: "启用连续长镜头规划", type: "boolean",
+        help: "开启后常规镜头按起势、主体、收束三个连续阶段执行。" },
+      { path: "rules.production.long_take_policy.target_seconds", label: "长镜头目标时长", type: "range", min: 8, max: 15, step: .5, unit: "秒" },
+      { path: "rules.production.long_take_policy.embed_environment_setup", label: "场景建立并入对白镜头", type: "boolean" },
+      { path: "rules.production.long_take_policy.embed_listener_reaction", label: "听者反应并入对白镜头", type: "boolean" },
+      { path: "rules.production.long_take_policy.embed_emotional_settle", label: "情绪收束并入对白镜头", type: "boolean" },
+      { path: "rules.production.long_take_policy.embed_physical_action", label: "必要肢体动作并入对白镜头", type: "boolean" },
+      { path: "rules.production.long_take_policy.temporal_phases_required", label: "强制三阶段时间节拍", type: "boolean" },
     ],
   },
   {
@@ -634,13 +642,14 @@ const STANDARD_SECTIONS = [
       { path: "rules.dialogue.speech_profiles.sad_gentle.buffer_seconds", label: "悲伤/温柔缓冲", type: "range", min: 0, max: 3, step: .1, unit: "秒" },
       { path: "rules.dialogue.speech_profiles.trembling.chars_per_second", label: "颤抖/哽咽语速", type: "range", min: 1, max: 10, step: .5, unit: "字/秒" },
       { path: "rules.dialogue.speech_profiles.trembling.buffer_seconds", label: "颤抖/哽咽缓冲", type: "range", min: 0, max: 3, step: .1, unit: "秒" },
-      { path: "rules.performance.reaction_after_key_dialogue", label: "关键台词后补反应镜", type: "boolean",
-        help: "有听者时，不能说完就切走。" },
+      { path: "rules.performance.reaction_after_key_dialogue", label: "关键台词后补独立反应镜", type: "boolean",
+        help: "长镜头模式保持关闭；听者反应写进同镜收束阶段。" },
       { path: "rules.performance.listener_duration_ratio", label: "听者反应镜最短比例", type: "number", min: .6667, max: 1, step: .01, unit: "×说话镜",
         help: "默认不少于说话者镜头的 2/3。" },
       { path: "rules.performance.reaction_seconds", label: "反应镜建议范围", type: "range", min: .5, max: 10, step: .5, unit: "秒", help: "作为常规范围；若与听者时长比例冲突，2/3 比例优先。" },
       { path: "rules.performance.beat_seconds", label: "情绪留白时长", type: "range", min: 2, max: 4, step: .5, unit: "秒" },
-      { path: "rules.performance.physical_action_separate_shot", label: "重要肢体动作独立成镜", type: "boolean" },
+      { path: "rules.performance.physical_action_separate_shot", label: "重要肢体动作独立成镜", type: "boolean",
+        help: "长镜头模式保持关闭；必要动作写进同镜主体阶段。" },
       { path: "rules.performance.performance_goal_required", label: "逐镜表演目标必填", type: "boolean" },
     ],
   },
@@ -745,6 +754,15 @@ function validateStandardDraft(draft) {
     add("rules.production.max_segment_seconds", "最长时长需覆盖建议区间且不能超过 15 秒");
   if (Number(p.time_precision_seconds) <= 0)
     add("rules.production.time_precision_seconds", "时间精度必须大于 0");
+  const longTake = p.long_take_policy || {};
+  const target = longTake.target_seconds || [];
+  if (longTake.enabled !== true)
+    add("rules.production.long_take_policy.enabled", "当前标准必须启用连续长镜头规划");
+  if (target.length !== 2 || Number(target[0]) < Number(preferred[0] || 0)
+      || Number(target[1]) > Number(preferred[1] || 15))
+    add("rules.production.long_take_policy.target_seconds", "目标时长必须落在建议时长区间内");
+  if (longTake.temporal_phases_required !== true)
+    add("rules.production.long_take_policy.temporal_phases_required", "长镜头必须写起势/主体/收束三阶段");
   if (Number(d.max_chars_per_shot) < 8 || Number(d.max_chars_per_shot) > 25)
     add("rules.dialogue.max_chars_per_shot", "单镜台词上限应在 8–25 字之间");
   if (Number(perf.listener_duration_ratio) < (2 / 3) || Number(perf.listener_duration_ratio) > 1)
@@ -845,8 +863,8 @@ function standardImpactHtml() {
   const perf = rules.performance || {};
   const columns = rules.storyboard?.required_columns || [];
   const enabledGates = (rules.quality_gates || []).filter((g) => g.enabled !== false).length;
-  const preferred = p.preferred_segment_seconds || [5, 8];
-  const averageSegment = (Number(preferred[0]) + Number(preferred[1])) / 2 || 6.5;
+  const preferred = p.preferred_segment_seconds || [8, 15];
+  const averageSegment = (Number(preferred[0]) + Number(preferred[1])) / 2 || 11.5;
   const estimatedUnits = Math.ceil(60 / averageSegment);
   const changes = diffCount(standardsBaseline, standardsDraft);
   const errors = validateStandardDraft(standardsDraft);
@@ -854,11 +872,11 @@ function standardImpactHtml() {
     <div class="impact-status"><span class="status-dot"></span><b>${errors.length ? `${errors.length} 项需要修正` : "规则结构有效"}</b></div>
     <dl>
       <div><dt>视频单元</dt><dd>${esc((p.preferred_segment_seconds || []).join("–"))}s · 最长 ${esc(p.max_segment_seconds)}s</dd></div>
-      <div><dt>60秒基准量</dt><dd>约 ${estimatedUnits} 个叙事单元 + 反应/留白</dd></div>
+      <div><dt>60秒基准量</dt><dd>约 ${estimatedUnits} 个连续镜头，反应/留白内嵌</dd></div>
       <div><dt>时间精度</dt><dd>${esc(p.time_precision_seconds)}s</dd></div>
       <div><dt>台词拆分</dt><dd>≤ ${esc(d.max_chars_per_shot)} 字/镜</dd></div>
-      <div><dt>反应镜</dt><dd>≥ ${fmt((perf.listener_duration_ratio || 0) * 100, 0)}% 说话镜</dd></div>
-      <div><dt>情绪留白</dt><dd>${esc((perf.beat_seconds || []).join("–"))}s</dd></div>
+      <div><dt>听者反应</dt><dd>${p.long_take_policy?.embed_listener_reaction ? "内嵌于同镜收束阶段" : "独立镜头"}</dd></div>
+      <div><dt>情绪留白</dt><dd>${p.long_take_policy?.embed_emotional_settle ? "内嵌于同镜收束阶段" : `${esc((perf.beat_seconds || []).join("–"))}s`}</dd></div>
       <div><dt>镜头合同</dt><dd>${columns.length} 列字段</dd></div>
       <div><dt>开拍门禁</dt><dd>${enabledGates} 项启用</dd></div>
       <div><dt>模型策略</dt><dd>${seedance25CapabilityText(p.model_upgrade_policy)}</dd></div>

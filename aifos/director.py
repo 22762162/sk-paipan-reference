@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -55,6 +56,7 @@ from .prompt_contract import (
     merge_frame_compacts,
     readable_text_required,
     shot_local_scene,
+    synchronize_shot_execution_contract,
     validate_shot_prompt_contract,
 )
 from .qc_feedback import optimize_qc_feedback
@@ -67,6 +69,8 @@ from .pano_slice import slice_for_block, slice_panorama
 from .relations import relation_lines, write_relations
 from .scene_model import (actor_placement_issues, build_scene_model,
                           camera_placement_issues, occlusion_issues,
+                          repair_actor_furniture_collisions,
+                          repair_camera_furniture_collisions,
                           scene_layout_clause)
 from .seedance_policy import (
     DEFAULT_TIER,
@@ -629,6 +633,15 @@ IMAGE_ASSET_KINDS = {
     "spatial_blocking", "inner_persona",
 }
 
+# ``fresh_assets`` 只隔离本集派生物，不碰项目级人物/场景母资产。后者在
+# fresh 模式下由各自生产阶段按 fresh_run_id 另起版本；本集镜头图、空间图
+# 和交付物则必须先写删除墓碑，避免旧图仍作为资产中心“当前版本”被旁路
+# 选择器或人工检查页面误用。
+FRESH_EPISODE_DERIVED_KINDS = frozenset({
+    "image", "first_frame", "last_frame", "spatial_blocking", "video",
+    "edit", "review_board", "cover", "clip", "title",
+})
+
 REFERENCE_ROLES = {
     "identity", "wardrobe", "scene", "composition", "style", "manual",
     "inner_persona",
@@ -932,8 +945,10 @@ class Director:
                 episode["id"], persist=True),
             "run_id": run_id,
         }
-        if force:
+        if force or fresh_assets:
             self._archive_force_rebuild_state(ctx)
+        if fresh_assets:
+            self._invalidate_fresh_episode_assets(ctx)
         stage_reports = []
         failed = False
         paused = ""
@@ -1136,7 +1151,8 @@ class Director:
         if budget and episode["cost"] >= budget:
             raise BudgetExceeded(
                 f"单集成本 {episode['cost']:.2f} 已达预算 {budget},停止调度")
-        if capability in ("image", "frames", "cover"):
+        if (capability in ("image", "frames", "cover")
+                and self._prompt_review_enabled()):
             review = self.router.review_image_prompt(
                 capability, payload, ctx["out_root"] / sub_dir,
                 cancel=lambda: self._cancel_requested(ctx))
@@ -1160,6 +1176,34 @@ class Director:
         报废整批:先交编剧就地修镜头(只许改景别/取景表述)后复检一次,
         仍熔断则标记失败并继续其余镜头，后续断点按失败原因自动重建；
         不再创建要求用户确认的 awaiting_human。"""
+        if not self._prompt_review_enabled():
+            autonomy = self._director_autonomy_enabled()
+            for task in tasks:
+                payload = task.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                if autonomy:
+                    payload["director_autonomy_mode"] = True
+                    payload["prompt_review"] = {
+                        "schema": self.router.PROMPT_REVIEW_SCHEMA,
+                        "approved": False,
+                        "status": "not_applicable_director_autonomy",
+                        "original_prompt": str(
+                            payload.get("prompt_compact")
+                            or payload.get("prompt") or ""),
+                        "optimized_prompt": str(
+                            payload.get("prompt_compact")
+                            or payload.get("prompt") or ""),
+                        "issues_found": [],
+                        "changes_made": [],
+                        "blocking_reason": (
+                            "用户授权AI导演使用冻结提示词直接生成，"
+                            "不执行提示词复审"),
+                    }
+            self.log.info(
+                "director",
+                "导演自主模式:跳过生成前提示词审核，直接使用现有冻结提示词")
+            return []
         review_tasks = [
             task for task in tasks
             if task.get("capability") in ("image", "frames", "cover")
@@ -1388,6 +1432,11 @@ class Director:
             "repair_summary": summary[:300],
             "repaired_at": now(),
         }
+        synchronize_shot_execution_contract(
+            shot,
+            location=self._shot_location(ctx.get("script"), shot),
+            style=ctx["project"].get("style", "") or "",
+        )
         self.projects.save_document(
             ctx["episode"]["id"], "storyboard", ctx["storyboard"])
         payload = self._shot_payload(ctx, shot)
@@ -1419,7 +1468,27 @@ class Director:
         return uri if Path(uri).exists() else None
 
     @staticmethod
-    def _character_sheet_matches_locked_identity(sheet_row, identity_row):
+    def _file_sha256(uri):
+        """Return the current digest for a local asset, or an empty string.
+
+        Image providers write to stable human-readable filenames.  A cancelled
+        generation must therefore not be allowed to overwrite a registered
+        asset silently and leave its database dependency metadata looking
+        valid.  Persisting and checking the digest turns that partial-write
+        case into an ordinary cache miss on the next run.
+        """
+        path = Path(str(uri or ""))
+        if not path.is_file():
+            return ""
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @classmethod
+    def _character_sheet_matches_locked_identity(cls, sheet_row,
+                                                   identity_row):
         """人物套件只能复用给生成它的同一锁定候选。
 
         最终立绘改选后，旧侧面/背面图即使文件和画质都完好也会变成
@@ -1433,6 +1502,11 @@ class Director:
             sheet_meta = json.loads(sheet_row["meta"] or "{}")
             identity_meta = json.loads(identity_row["meta"] or "{}")
         except (TypeError, ValueError, KeyError):
+            return False
+        registered_digest = str(sheet_meta.get("file_sha256") or "")
+        if (registered_digest
+                and cls._file_sha256(sheet_row["uri"])
+                != registered_digest):
             return False
         candidate_id = identity_meta.get("candidate_asset_id")
         if candidate_id is not None:
@@ -2645,13 +2719,15 @@ class Director:
                 f"当前全景已是 v{current_pano_version}")
         return model, row, False, ""
 
-    def _attach_scene_physics(self, ctx, blocking):
+    def _attach_scene_physics(
+            self, ctx, blocking, *, repair_actor_collisions=False):
         """把真实搭景作为 blocking 的物理门禁，而不只是查看器装饰。"""
         validation = blocking.setdefault("validation", {})
         spatial_passed = bool(validation.get(
             "spatial_passed", validation.get("passed", True)))
         validation["spatial_passed"] = spatial_passed
         issues = []
+        adjustments = []
         fingerprint_rows = []
         require_models = bool(self.config.get(
             "defaults", "space_first", default=False))
@@ -2702,6 +2778,74 @@ class Director:
             })
             for shot in (scene.get("shots") or []):
                 shot_no = shot.get("shot_no")
+                shot_adjustments = []
+                camera_adjustments = []
+                if repair_actor_collisions:
+                    shot_adjustments = repair_actor_furniture_collisions(
+                        model, shot.get("actors") or [])
+                    for adjustment in shot_adjustments:
+                        adjustment.update({
+                            "scene_no": scene.get("scene_no"),
+                            "shot_no": shot_no,
+                            "location": location,
+                        })
+                    adjustments.extend(shot_adjustments)
+                    if shot_adjustments:
+                        adjusted_actors = {
+                            item.get("actor") for item in shot_adjustments}
+                        for actor in (shot.get("actors") or []):
+                            if not isinstance(actor, dict):
+                                continue
+                            actor_name = str(
+                                actor.get("name")
+                                or actor.get("actor_id") or "角色")
+                            if actor_name not in adjusted_actors:
+                                continue
+                            if isinstance(actor.get("start_3d"), dict):
+                                actor["start"] = canvas_from_world(
+                                    actor["start_3d"])
+                            if isinstance(actor.get("end_3d"), dict):
+                                actor["end"] = canvas_from_world(
+                                    actor["end_3d"])
+                            actor["route"] = [
+                                dict(canvas_from_world(point),
+                                     phase=point.get("phase"))
+                                for point in (actor.get("route_3d") or [])
+                                if isinstance(point, dict)
+                            ]
+                        indexed = (blocking.get("shot_index") or {}).get(
+                            str(shot_no))
+                        if isinstance(indexed, dict) and indexed is not shot:
+                            indexed["actors"] = copy.deepcopy(
+                                shot.get("actors") or [])
+                    camera_adjustments = repair_camera_furniture_collisions(
+                        model, shot.get("camera") or {})
+                    for adjustment in camera_adjustments:
+                        adjustment.update({
+                            "type": "camera",
+                            "scene_no": scene.get("scene_no"),
+                            "shot_no": shot_no,
+                            "location": location,
+                        })
+                    adjustments.extend(camera_adjustments)
+                    if camera_adjustments:
+                        camera = shot.get("camera") or {}
+                        if isinstance(camera.get("start_3d"), dict):
+                            camera["start"] = canvas_from_world(
+                                camera["start_3d"])
+                        if isinstance(camera.get("end_3d"), dict):
+                            camera["end"] = canvas_from_world(
+                                camera["end_3d"])
+                        camera["route"] = [
+                            dict(canvas_from_world(point),
+                                 phase=point.get("phase"))
+                            for point in (camera.get("route_3d") or [])
+                            if isinstance(point, dict)
+                        ]
+                        indexed = (blocking.get("shot_index") or {}).get(
+                            str(shot_no))
+                        if isinstance(indexed, dict) and indexed is not shot:
+                            indexed["camera"] = copy.deepcopy(camera)
                 for item in actor_placement_issues(
                         model, shot.get("actors") or []):
                     issues.append({
@@ -2730,6 +2874,10 @@ class Director:
         fingerprint = self._stable_hash(fingerprint_rows)
         blocking["scene_model_fingerprint"] = fingerprint
         validation["scene_physics_issues"] = issues
+        if adjustments:
+            validation["scene_physics_adjustments"] = adjustments
+        else:
+            validation.setdefault("scene_physics_adjustments", [])
         validation["scene_physics_passed"] = not any(
             item.get("severity") == "block" for item in issues)
         validation["passed"] = bool(
@@ -3391,6 +3539,48 @@ class Director:
             "archive_dir": str(archive_dir),
         }
 
+    def _invalidate_fresh_episode_assets(self, ctx):
+        """为全新图片轮次隐藏本集旧派生资产，历史文件仍可审计。
+
+        render_plan 隔离只能阻止主流程把旧条目标成完成，不能阻止资产中心
+        或其它引用入口继续看到旧关键帧。这里用版本墓碑关闭所有本集派生
+        图像及其下游交付物；同名新资产稍后登记时会自动另起版本。
+        """
+        project_id = int(ctx["project"]["id"])
+        episode_number = int(ctx["episode"]["number"])
+        prefix = f"e{episode_number:03d}"
+        invalidated = []
+        for kind in FRESH_EPISODE_DERIVED_KINDS:
+            for row in self.assets.active_list(project_id, kind=kind):
+                name = str(row["name"] or "")
+                if name != prefix and not name.startswith(prefix + "_"):
+                    continue
+                tombstone = self.assets.soft_delete(
+                    project_id, kind, name,
+                    meta={
+                        "invalidated_by": "fresh_assets",
+                        "invalidated_episode_number": episode_number,
+                        "fresh_run_id": ctx.get("run_id"),
+                    })
+                if tombstone is not None:
+                    invalidated.append({
+                        "kind": kind,
+                        "name": name,
+                        "source_asset_id": int(row["id"]),
+                        "tombstone_asset_id": int(tombstone["id"]),
+                    })
+        if invalidated:
+            kinds = sorted({item["kind"] for item in invalidated})
+            self.log.info(
+                "director",
+                f"全新图片轮次已版本作废本集旧派生资产 {len(invalidated)} 项"
+                f"（{'、'.join(kinds)}）；历史文件保留但不再可复用")
+        return {
+            "count": len(invalidated),
+            "assets": invalidated,
+            "history_preserved": True,
+        }
+
     def _plan_read(self, ctx):
         with _PLAN_IO_LOCK:
             path = self._plan_path(ctx)
@@ -3758,12 +3948,16 @@ class Director:
         review_status = str(prompt_review.get("status") or "")
         if not (
                 prompt_review.get("approved") is True
-                or review_status == "not_applicable_mock_only"):
+                or review_status in {
+                    "not_applicable_mock_only",
+                    "not_applicable_director_autonomy",
+                }):
             issues.append("最终提示词尚未通过Codex审核优化")
         # 只有真正的分镜关键帧/首尾帧需要 v2.2 镜头合同。人物候选图
         # 为便于排序也带有 shot_no=0，但它不是分镜，不能被误拦成
         # “缺少镜头合同”。
-        if category in {"shot_image", "frames"}:
+        if (category in {"shot_image", "frames"}
+                and not payload.get("director_autonomy_mode")):
             validation = validate_shot_prompt_contract(
                 payload.get("prompt_contract") or {})
             if not validation["passed"]:
@@ -4003,9 +4197,11 @@ class Director:
                 raise AifosError(
                     "镜头生成合同前置校验失败，未调用生图 API："
                     + "；".join(validation["issues"]))
-        review = self.router.review_image_prompt(
-            capability, payload, ctx["out_root"] / "prompt_reviews",
-            cancel=lambda: self._cancel_requested(ctx))
+        review = (
+            self.router.review_image_prompt(
+                capability, payload, ctx["out_root"] / "prompt_reviews",
+                cancel=lambda: self._cancel_requested(ctx))
+            if self._prompt_review_enabled() else None)
         if review is not None:
             self._task_cost += review.cost
             self._task_providers.add(review.provider)
@@ -4057,8 +4253,32 @@ class Director:
         return result
 
     # ---- 图片视觉质检:生成后核对剧本要求,不合格自动带意见重画 ----
+    def _director_autonomy_enabled(self):
+        """用户是否已把视觉判断与成片决策全权交给 AI 导演。"""
+        return bool(self.config.get(
+            "defaults", "director_autonomy_mode", default=False))
+
+    def _preview_qc_bypass_enabled(self):
+        """是否旁路会触发视觉返工的内容检查。
+
+        ``preview_qc_bypass`` 保留旧版临时预览语义；
+        ``director_autonomy_mode`` 是用户明确授权的最终合成模式。二者都
+        不伪造 QC 分数，但后者产物不是临时预览片。
+        """
+        return (
+            self._director_autonomy_enabled()
+            or bool(self.config.get(
+                "defaults", "preview_qc_bypass", default=False)))
+
     def _image_qc_enabled(self):
-        return bool(self.config.get("defaults", "image_qc", default=True))
+        return (
+            not self._preview_qc_bypass_enabled()
+            and bool(self.config.get(
+                "defaults", "image_qc", default=True)))
+
+    def _prompt_review_enabled(self):
+        """预览片只使用已编译提示词，不再追加生成前的 AI 审核等待。"""
+        return not self._preview_qc_bypass_enabled()
 
     def _dual_review_enabled(self, consecutive_failures=0):
         """双路会诊开关:默认只在首检失败后启用(诊断最值钱的地方)。
@@ -5283,6 +5503,16 @@ class Director:
             not physical_required
             or checked_true(verdict.get("spatial_logic_match")))
         issues = [str(item) for item in (verdict.get("issues") or [])]
+        critical_failures = [
+            str(item) for item in (verdict.get("critical_failures") or [])
+            if str(item).strip()
+        ]
+        advisory_issues = [
+            str(item) for item in (verdict.get("advisory_issues") or [])
+            if str(item).strip()
+        ]
+        issues.extend(critical_failures)
+        issues.extend(advisory_issues)
         if not identity_checked:
             issues.append("质检未确认已逐人比对最终立绘")
         elif not identity_match:
@@ -5329,6 +5559,20 @@ class Director:
             or not overlay_checked or not overlay_match
             or not physical_checked or not physical_match
             or not spatial_checked or not spatial_match)
+        fidelity_policy = qc_spec.get("fidelity_policy")
+        tiered_fidelity = bool(
+            isinstance(fidelity_policy, dict)
+            and fidelity_policy.get("schema") == "aifos.fidelity-tiers/v1"
+            and (
+                "critical_failures" in verdict
+                or "technical_quality_pass" in verdict))
+        technical_quality_pass = (
+            checked_true(verdict.get("technical_quality_pass"))
+            if tiered_fidelity else None)
+        if tiered_fidelity:
+            visual_hard_failure = bool(
+                visual_hard_failure or critical_failures
+                or not technical_quality_pass)
         prompt_status = str(
             input_diagnosis["prompt_diagnosis"].get("status") or "").lower()
         reference_status = str(
@@ -5342,6 +5586,12 @@ class Director:
             prompt_status in {"conflicting", "insufficient"}
             or reference_status in {
                 "needs_adjustment", "conflicting", "missing"})
+        # 参考图错绑/缺失会把别人的脸、服装或场景带进当前镜头，属于
+        # 身份与连续性硬事实，不能套用“画面碰巧好看就放过”的容差。
+        # 纯提示词的机位/焦段措辞冲突仍可在画面硬检查全部通过时作为
+        # 非关键合同建议留档，交自动修订影响后续镜头。
+        reference_hard_failure = reference_status in {
+            "needs_adjustment", "conflicting", "missing"}
         if "input_contract_pass" in verdict:
             input_contract_passed = checked_true(
                 verdict["input_contract_pass"])
@@ -5358,7 +5608,16 @@ class Director:
             and overlay_checked and overlay_match
             and physical_checked and physical_match
             and spatial_checked and spatial_match)
-        if "visual_pass" in verdict:
+        if tiered_fidelity:
+            # The judge can dislike an allowed crop/overlap/detail variance
+            # and still set its legacy visual_pass=false.  In the tiered
+            # contract only a named critical failure, a failed structured
+            # hard check or inadequate technical quality may force redraw.
+            image_passed = bool(
+                technical_quality_pass
+                and not critical_failures
+                and not visual_hard_failure)
+        elif "visual_pass" in verdict:
             image_passed = (
                 checked_true(verdict["visual_pass"])
                 and not visual_hard_failure)
@@ -5377,8 +5636,9 @@ class Director:
         # 受益,没必要再把这一张合格图判死。旧口径下这类图会连重两轮后锁进
         # 待人工,而它的问题全部标着 [建议·不影响通过](ep1 shot:8 实案)。
         # hard_failure 早就按同一口径修过,这里补上 passed,两者语义统一。
-        contract_only_defect = contract_hard_failure and image_passed \
-            and visual_checks_passed
+        contract_only_defect = (
+            contract_hard_failure and not reference_hard_failure
+            and image_passed and visual_checks_passed)
         passed = (
             image_passed and visual_checks_passed
             and (not contract_hard_failure or contract_only_defect))
@@ -5408,6 +5668,10 @@ class Director:
                 "expected_overlay_count", 0),
             "narrative_overlays": qc_spec.get(
                 "narrative_overlays") or [],
+            "critical_failures": list(dict.fromkeys(critical_failures)),
+            "advisory_issues": list(dict.fromkeys(advisory_issues)),
+            "technical_quality_pass": technical_quality_pass,
+            "fidelity_policy": copy.deepcopy(fidelity_policy or {}),
             "identity_references": len(
                 qc_spec.get("identity_references") or []),
             "identity_checks": identity_checks,
@@ -5422,7 +5686,9 @@ class Director:
                 not image_passed or contract_hard_failure),
             "contract_repair_required": not input_contract_passed,
             "production_ready": passed,
-            "qc_policy": "visible_major_defects_v2",
+            "qc_policy": (
+                "critical_facts_with_creative_tolerance_v1"
+                if tiered_fidelity else "visible_major_defects_v2"),
             "input_contract_advisory": not input_contract_passed,
             # 审计:这张图是「画面达标但合同诊断不完美」被放行的,合同本身
             # 仍要靠 Codex 指令自动修,不是无声吞掉。
@@ -5437,8 +5703,10 @@ class Director:
             # 画面自身没过时,合同不一致仍并入硬伤——那才是真要重画。
             "hard_failure": bool(
                 visual_hard_failure and not image_passed
+                or reference_hard_failure
                 or (contract_hard_failure and not image_passed)),
             "contract_hard_failure": contract_hard_failure,
+            "reference_hard_failure": reference_hard_failure,
         }
         report.update({
             "input_diagnosis": input_diagnosis,
@@ -6068,8 +6336,13 @@ class Director:
         while True:
             # 每次真正出图（包括QC修订重试）都以当前最终输入重新过Codex。
             # 输入哈希未变化时路由器会复用已批准审核，不产生重复调用。
-            prompt_review = self.router.review_image_prompt(
-                capability, payload, out_dir, cancel=cancel)
+            review_image_prompt = (
+                getattr(self.router, "review_image_prompt", None)
+                if self._prompt_review_enabled() else None)
+            prompt_review = (
+                review_image_prompt(
+                    capability, payload, out_dir, cancel=cancel)
+                if callable(review_image_prompt) else None)
             if prompt_review is not None:
                 spent += float(prompt_review.cost or 0.0)
             generation_input = self._image_generation_input(
@@ -6538,6 +6811,10 @@ class Director:
                     "input_hash": generation_input.get("input_hash", ""),
                     "codex_instruction": codex_instruction[:2400],
                 }
+                selected_report["lesson_issues"] = list(dict.fromkeys([
+                    *(report.get("lesson_issues") or []),
+                    *(selected_report.get("lesson_issues") or []),
+                ]))
                 selected_report["generation_attempts"] = 4
                 selected.qc = selected_report
                 return selected
@@ -6910,7 +7187,8 @@ class Director:
                     # 镜头首图严格只出1张；失败后的修订轮才启用固定3抽。
                     generate = (
                         self._generate_repair_candidate_group
-                        if payload.get("_autonomous_repair_seeded")
+                        if (payload.get("_autonomous_repair_seeded")
+                            and self._image_qc_enabled())
                         else self._generate_image_with_qc)
                     result = generate(
                         task["capability"], task["payload"],
@@ -6930,8 +7208,9 @@ class Director:
                 self._plan_mark(ctx, task["item_id"], "pending")
                 raise
             except Exception as exc:
-                repair = self._auto_repair_prompt_review_block(
-                    ctx, task, exc)
+                repair = (
+                    self._auto_repair_prompt_review_block(ctx, task, exc)
+                    if self._prompt_review_enabled() else "")
                 if repair:
                     current = task.get("payload") or {}
                     self._plan_mark(
@@ -7246,7 +7525,8 @@ class Director:
                                     extra=generating_extra)
                     generate = (
                         self._generate_repair_candidate_group
-                        if payload.get("_autonomous_repair_seeded")
+                        if (payload.get("_autonomous_repair_seeded")
+                            and self._image_qc_enabled())
                         else self._generate_image_with_qc)
                     future = pool.submit(
                         generate, task["capability"], task["payload"],
@@ -7271,8 +7551,10 @@ class Director:
                         self._plan_mark(ctx, task["item_id"], "pending")
                         continue
                     except Exception as exc:
-                        repair = self._auto_repair_prompt_review_block(
-                            ctx, task, exc)
+                        repair = (
+                            self._auto_repair_prompt_review_block(
+                                ctx, task, exc)
+                            if self._prompt_review_enabled() else "")
                         if repair:
                             payload = task.get("payload") or {}
                             self._plan_mark(
@@ -7696,7 +7978,8 @@ class Director:
                 "shot_no": shot_no,
                 # 清单展示与模型实际收到的是同一份当前镜头短合同。
                 "prompt": shot_payload["prompt_compact"],
-                "content_hash": self._shot_content_hash(shot),
+                "content_hash": self._shot_content_hash(
+                    shot, shot_payload),
                 **self._quality_meta(image_quality),
             })
             frame_items.append({
@@ -7704,11 +7987,19 @@ class Director:
                 "label": f"镜头 {shot_no:02d} 首尾帧",
                 "shot_no": shot_no,
                 "prompt": shot_payload["prompt_compact"],
-                "content_hash": self._shot_content_hash(shot),
+                "content_hash": self._shot_content_hash(
+                    shot, shot_payload),
                 **self._quality_meta(frame_quality),
             })
         self._plan_seed(ctx, "shot_image", image_items)
         self._plan_seed(ctx, "frames", frame_items)
+        episode_id = ctx["episode"]["id"]
+        self.image_acceleration.prune(
+            episode_id, "shot_image",
+            [item["id"] for item in image_items])
+        self.image_acceleration.prune(
+            episode_id, "frames",
+            [item["id"] for item in frame_items])
 
     # ---- 各阶段实现 ----
     @staticmethod
@@ -8250,6 +8541,16 @@ class Director:
         取景表述),重建空间后复检一次;仍不过只记警告不阻断——下游门禁
         照常兜底,不能因为预检把整条产线卡死。
         """
+        if self._director_autonomy_enabled():
+            self.log.info(
+                "director",
+                "AI导演全权成片模式：跳过分镜可拍性复检与自动改写，"
+                "保持现有冻结镜头直接生产")
+            return {
+                "issues": [], "repaired": 0,
+                "inspection_waived": True,
+                "repair_skipped": "director_autonomy",
+            }
         if not self.config.get(
                 "defaults", "storyboard_preflight", default=True):
             return {"issues": [], "repaired": 0}
@@ -8333,7 +8634,8 @@ class Director:
                 self.log.warn("director", item["message"])
         # 分镜修复会重新求解人物和机位；必须再次与真实家具盒体碰撞，
         # 否则第一次合格、修镜后反而穿进桌柜也不会被发现。
-        self._attach_scene_physics(ctx, blocking)
+        self._attach_scene_physics(
+            ctx, blocking, repair_actor_collisions=True)
         write_spatial_svgs(blocking, ctx["out_root"] / "blocking")
         write_spatial_reference_pngs(
             blocking, ctx["out_root"] / "blocking" / "seedance")
@@ -8388,6 +8690,16 @@ class Director:
         (previz 页与生产同源可见)。"""
         from .previz_checks import (describe_for_repair, previz_report,
                                     shots_with_issues)
+        if self._director_autonomy_enabled():
+            self.log.info(
+                "director",
+                "AI导演全权成片模式：跳过动态预演复检与自动改写，"
+                "保持现有走位直接生产")
+            return {
+                "issues": [], "repaired": 0,
+                "inspection_waived": True,
+                "repair_skipped": "director_autonomy",
+            }
         if not self.config.get(
                 "defaults", "storyboard_preflight", default=True):
             return {"issues": [], "repaired": 0}
@@ -8412,7 +8724,16 @@ class Director:
         shots = {int(s.get("shot_no", -1)): s
                  for s in (ctx["storyboard"].get("shots") or [])
                  if isinstance(s, dict)}
-        targets = shots_with_issues(report)
+        # 只修未跳过场次的镜头(实测:曾把编剧调用浪费在暂不生成的镜7/8)
+        active_nos = {int(s.get("shot_no") or -1)
+                      for s in self._active_shots(ctx)}
+        targets = [no for no in shots_with_issues(report)
+                   if no in active_nos]
+        if not targets:
+            return {"issues": report["issues"], "repaired": 0}
+        # 修复前快照:验收不过整组撤销,绝不让"修复"把数据改得更糟
+        storyboard_before = copy.deepcopy(ctx["storyboard"])
+        blocking_before = ctx.get("blocking")
         self.log.warn(
             "director",
             f"动态预演查出 {len(report['issues'])} 条时间维度问题"
@@ -8440,9 +8761,10 @@ class Director:
                     f"镜头{shot_no}已按预演问题改走位: {summary[:160]}")
         if not repaired:
             return {"issues": report["issues"], "repaired": 0}
-        # 走位改了 → 空间重解 → 复检一次;结果与 previz 页同源
-        self.projects.save_document(
-            ctx["episode"]["id"], "storyboard", ctx["storyboard"])
+        # 走位改了 → 空间重解;**先验收再采纳**:修复绝不能引入比原问题
+        # 更严重的新硬伤(2026-07-31 实测:镜2改双人中全景后,重解把机位
+        # 顶进验牒书案盒体 0.00m,原本能过的 images 阶段反而被物理门禁
+        # 拦死)。验收不过整组撤销,保留修复前分镜与空间。
         rules = ctx["production_profile"].get("rules", {}).get(
             "storyboard", {})
         blocking = build_spatial_plan(
@@ -8452,6 +8774,34 @@ class Director:
         mark_spatial_reference_requirements(blocking)
         self._attach_scene_physics(
             ctx, blocking, repair_actor_collisions=True)
+
+        def _hard_blocks(plan):
+            return sum(
+                1 for item in ((plan or {}).get("validation") or {}).get(
+                    "scene_physics_issues") or []
+                if str(item.get("severity")) == "block")
+        gained = _hard_blocks(blocking) - _hard_blocks(blocking_before)
+        if gained > 0:
+            self.log.warn(
+                "director",
+                f"预演走位修复的重解引入 {gained} 处新的硬性物理问题"
+                "(如机位穿入家具),修复整组撤销,保留原分镜与空间调度;"
+                "残留问题以警告形式交 previz 页人工处理")
+            ctx["storyboard"] = storyboard_before
+            ctx["storyboard"]["previz_repair_state"] = {
+                "no_progress_signature": self._stable_hash(
+                    report["issues"]),
+                "issue_count": len(report["issues"]),
+                "reverted": True,
+                "updated_at": now(),
+            }
+            self.projects.save_document(
+                ctx["episode"]["id"], "storyboard", ctx["storyboard"])
+            ctx["blocking"] = blocking_before
+            return {"issues": report["issues"], "repaired": 0,
+                    "repair_reverted": True}
+        self.projects.save_document(
+            ctx["episode"]["id"], "storyboard", ctx["storyboard"])
         write_spatial_svgs(blocking, ctx["out_root"] / "blocking")
         write_spatial_reference_pngs(
             blocking, ctx["out_root"] / "blocking" / "seedance")
@@ -8516,6 +8866,11 @@ class Director:
         description = str(data.get("description") or "").strip()
         if description:
             shot["description"] = description
+        synchronize_shot_execution_contract(
+            shot,
+            location=self._shot_location(ctx.get("script"), shot),
+            style=ctx["project"].get("style", "") or "",
+        )
         summary = str(data.get("repair_summary") or "").strip()
         shot["shootability_repair"] = {
             "issues": str(reason)[:600],
@@ -8533,7 +8888,8 @@ class Director:
         candidate = build_spatial_plan(
             ctx["script"], ctx["storyboard"], ctx["continuity"],
             group_threshold=threshold)
-        self._attach_scene_physics(ctx, candidate)
+        self._attach_scene_physics(
+            ctx, candidate, repair_actor_collisions=True)
         existing, version = self.projects.latest_document(
             ctx["episode"]["id"], "blocking")
         reused = (not ctx.get("force") and existing is not None
@@ -8544,7 +8900,8 @@ class Director:
                   and (existing.get("validation") or {}).get("passed"))
         blocking = existing if reused else candidate
         if reused:
-            self._attach_scene_physics(ctx, blocking)
+            self._attach_scene_physics(
+                ctx, blocking, repair_actor_collisions=True)
         paths = write_spatial_svgs(
             blocking, ctx["out_root"] / "blocking")
         reference_paths = write_spatial_reference_pngs(
@@ -8975,7 +9332,8 @@ class Director:
             "quality_reasons": list(decision.get("reasons") or []),
         }
 
-    def _shot_image_meta(self, ctx, shot, decision, extra=None):
+    def _shot_image_meta(self, ctx, shot, decision, extra=None,
+                         payload=None):
         """镜头图写入可检索上下文，供跨集资产匹配和复用。"""
         location = self._scene_locations(ctx).get(shot.get("scene_no"), "")
         appearance_state = {}
@@ -8990,7 +9348,7 @@ class Director:
             }
         value = {
             **self._quality_meta(decision),
-            "shot_content_hash": self._shot_content_hash(shot),
+            "shot_content_hash": self._shot_content_hash(shot, payload),
             "episode_number": ctx["episode"]["number"],
             "shot_no": shot.get("shot_no"),
             "scene_no": shot.get("scene_no"),
@@ -10264,7 +10622,22 @@ class Director:
         readiness_error = character_production_readiness_error(
             ctx["script"], ctx.get("story_analysis"))
         if readiness_error:
-            raise AifosError(readiness_error)
+            self.log.warn(
+                "director",
+                "人物身份事实不完整，AIFOS 正在自动重跑人物分析："
+                + readiness_error[:300])
+            analysis, _version, _reused = self._ensure_story_analysis(
+                ctx, force=True,
+                creative_direction=(
+                    "这是人物生产前的自动修复轮。必须逐个正式人物给出"
+                    "明确可画的 gender、age_range 和 image_prompt；"
+                    "禁止未指定、待确认、以参考图为准或要求用户确认。"))
+            readiness_error = character_production_readiness_error(
+                ctx["script"], analysis)
+            if readiness_error:
+                raise AifosError(
+                    "AIFOS 自动人物身份修复仍未通过："
+                    + readiness_error)
         project_id = ctx["project"]["id"]
         style = ctx["project"]["style"] or DEFAULT_VISUAL_STYLE
         all_characters = ctx["script"].get("characters", [])
@@ -10323,7 +10696,8 @@ class Director:
             ctx, core_prop_definitions(ctx["script"]))
         prop_selection = self._ensure_prop_candidates(
             ctx, props, style)
-        if ctx.get("auto_select_assets"):
+        if (ctx.get("auto_select_assets")
+                and not self._preview_qc_bypass_enabled()):
             self._auto_select_asset_candidates(
                 ctx, characters, designs, props)
             character_selection = self.character_selection_status(
@@ -10612,6 +10986,7 @@ class Director:
                       "source_identity_version": locked_identity["version"],
                       "source_candidate_asset_id": (
                           locked_identity_meta.get("candidate_asset_id")),
+                      "file_sha256": self._file_sha256(result.uri),
                       "fresh_run_id": (
                           ctx.get("run_id")
                           if ctx.get("fresh_assets") else None)},
@@ -11019,6 +11394,59 @@ class Director:
             return row
         return None
 
+    def _locked_identity_has_headwear_qc_conflict(self, project_id, name):
+        """Whether the selected portrait visibly violates worn headwear.
+
+        Text metadata can say ``素黑网巾`` while visual QC records a gold
+        ornament or a top bun in that same portrait.  Such a portrait remains
+        useful as an identity source, but it must be cropped to the dedicated
+        face anchor before entering a shot reference chain.
+        """
+        row = self._locked_identity(project_id, name)
+        meta = self._asset_meta(row) if row is not None else {}
+        qc = meta.get("selection_qc")
+        if not isinstance(qc, dict):
+            return False
+        image_error = qc.get("image_error")
+        categories = (
+            image_error.get("categories")
+            if isinstance(image_error, dict) else []) or []
+        if any(str(item).strip().lower() in {
+                "headwear", "hair_ornament", "hat", "hairstyle"}
+               for item in categories):
+            return True
+        evidence = "；".join(str(item) for item in (
+            (qc.get("critical_failures") or [])
+            + (qc.get("issues") or [])))
+        return bool(re.search(
+            r"头饰|发饰|网巾|帽(?:冠|檐|箍)?|发簪|发钗|顶髻|低髻|发髻",
+            evidence)) and not bool(qc.get("passed"))
+
+    @classmethod
+    def _headwear_structure_sheet_keys(cls, headwear):
+        """Return the mother-asset views needed to prove worn headwear.
+
+        A front portrait can identify a person without proving rear geometry.
+        Contracts such as a mesh scarf with a rear opening and exposed low bun
+        therefore need a dedicated back-view anchor instead of asking the
+        image model to invent the hidden structure from prose.
+        """
+        if not headwear or cls._headwear_state_is_none(headwear):
+            return ()
+        text = (
+            json.dumps(headwear, ensure_ascii=False, sort_keys=True)
+            if isinstance(headwear, dict) else str(headwear))
+        if any(token in text for token in (
+                "后脑", "脑后", "背面", "背部", "后方", "圆形开口",
+                "圆孔", "低髻", "后髻", "交叉束带")):
+            # Do not fall back to a profile asset for rear morphology: a side
+            # sheet may hide the opening or even contradict the locked back.
+            return ("back", "closeup")
+        if any(token in text for token in (
+                "侧面", "耳后", "左侧", "右侧", "侧边")):
+            return ("profile", "closeup")
+        return ("closeup",)
+
     def _art_refs(self, ctx, characters, location, shot_no=None,
                   sheet_keys=None, sheet_keys_by_character=None,
                   spatial_ref="", inner_persona_ref="", prop_names=None,
@@ -11033,6 +11461,7 @@ class Director:
         """
         project_id = ctx["project"]["id"]
         refs = {"character_refs": [], "identity_references": [],
+                "headwear_references": [],
                 "prop_refs": [], "asset_matches": [],
                 "appearance_reference_warnings": []}
         used_uris = set()
@@ -11050,6 +11479,7 @@ class Director:
         identities = self._identity_references(
             project_id, characters, required=bool(characters))
         wardrobe_bound_names = set()
+        headwear_conflict_names = set()
         if len(identities) > SHOT_BASE_REFERENCE_LIMIT:
             raise AifosError(
                 f"本镜有 {len(identities)} 位需锁定身份的人物，超过参考图"
@@ -11070,6 +11500,22 @@ class Director:
                     current_wardrobe, locked_look.get("costume"))))
             headwear_matches = self._headwear_states_compatible(
                 current_headwear, self._look_headwear_text(locked_look))
+            identity_headwear_conflict = bool(
+                current_headwear
+                and self._locked_identity_has_headwear_qc_conflict(
+                    project_id, character))
+            if identity_headwear_conflict:
+                headwear_matches = False
+                headwear_conflict_names.add(character)
+            if (current_headwear and headwear_matches
+                    and not self._headwear_state_is_none(current_headwear)):
+                # The locked portrait/derived close-up visibly contains the
+                # exact hat or hair ornament used by this shot.  Preserve that
+                # narrow responsibility even when the full-body outfit must be
+                # cropped away: text such as ``旧银簪`` cannot reliably lock
+                # its silhouette, terminal ornament and placement by itself.
+                identity["headwear_anchor"] = copy.deepcopy(
+                    current_headwear)
             if ((current_wardrobe or current_headwear)
                     and (not wardrobe_matches or not headwear_matches)):
                 # A full-body final portrait wearing another scene's outfit
@@ -11092,6 +11538,11 @@ class Director:
                         "version": face_row["version"],
                         "identity_anchor_type": "face_only_derived",
                     })
+                    if (current_headwear
+                            and not self._headwear_state_is_none(
+                                current_headwear)):
+                        identity["headwear_anchor"] = copy.deepcopy(
+                            current_headwear)
             remember(identity["uri"])
             refs["character_refs"].append(identity["uri"])
             refs["identity_references"].append(identity)
@@ -11113,6 +11564,68 @@ class Director:
                     "source_identity_asset_id"),
                 "source_identity_uri": identity.get("source_identity_uri"),
             })
+        # A face/full-body identity image is not evidence for hidden headwear
+        # geometry.  Add one narrowly scoped mother asset whenever the current
+        # worn contract calls out view-dependent structure (most importantly
+        # rear openings, low buns and fixing straps).  This runs even for
+        # three-person shots, where the generic sheet loop below is normally
+        # disabled to control reference count.
+        for identity in refs["identity_references"]:
+            character = str(identity.get("character") or "").strip()
+            headwear = copy.deepcopy(
+                (headwear_states or {}).get(character) or {})
+            keys = self._headwear_structure_sheet_keys(headwear)
+            if not character or not keys:
+                continue
+            locked_identity = self._locked_identity(project_id, character)
+            for key in keys:
+                row = self.assets.latest(
+                    project_id, "character_sheet", f"{character}:{key}")
+                meta = self._asset_meta(row) if row is not None else {}
+                uri = str(row["uri"] or "") if row is not None else ""
+                if (row is None
+                        or (ctx.get("fresh_assets")
+                            and meta.get("fresh_run_id")
+                            != ctx.get("run_id"))
+                        or (locked_identity is not None
+                            and not self._character_sheet_matches_locked_identity(
+                                row, locked_identity))
+                        or not formal_reference_allowed(
+                            self._asset_quality(row))
+                        or not uri
+                        or (not uri.startswith(("http://", "https://"))
+                            and not Path(uri).exists())):
+                    continue
+                if uri in used_uris:
+                    # The selected identity/face anchor already is the best
+                    # matching proof image, so no duplicate upload is needed.
+                    break
+                if not remember(uri):
+                    raise AifosError(
+                        f"本镜需要追加{character}的{key}发饰结构锚，但人物、"
+                        f"空间、道具参考已达到{SHOT_BASE_REFERENCE_LIMIT}张；"
+                        "请拆分镜头，禁止仅凭文字猜测关键发饰")
+                reference = {
+                    "character": character,
+                    "uri": uri,
+                    "asset_id": row["id"],
+                    "sheet": key,
+                    "headwear_anchor": headwear,
+                }
+                refs["headwear_references"].append(reference)
+                refs["character_refs"].append(uri)
+                refs["asset_matches"].append({
+                    "asset_id": row["id"],
+                    "kind": "character_headwear_structure",
+                    "name": row["name"],
+                    "label": f"{character}发饰结构锚({key})",
+                    "uri": uri,
+                    "reference_role": "headwear",
+                    "attach_to": character,
+                    "headwear_anchor": headwear,
+                    "sheet": key,
+                })
+                break
         inner_uri = str(inner_persona_ref or "").strip()
         if (inner_uri
                 and (inner_uri.startswith(("http://", "https://"))
@@ -11165,10 +11678,52 @@ class Director:
             if row is None:
                 raise AifosError(
                     f"本镜使用核心道具「{name}」，但尚未人工锁定道具母资产")
-            if not remember(row["uri"]):
+            remembered = remember(row["uri"])
+            if not remembered and self._director_autonomy_enabled():
+                # AI导演自动选优：身份锚和核心道具优先于空间示意图；
+                # 帧链已经携带本镜关键帧/上一镜尾帧，可承担基础构图。
+                # 若仍超限，再淘汰最后加入的一张发饰补充锚（人物身份锚
+                # 自身仍保留），绝不要求拆镜或重新生成既有图片。
+                victims = []
+                spatial = str(refs.get("spatial_ref") or "")
+                if spatial:
+                    victims.append(("空间调度图", spatial))
+                victims.extend(
+                    ("发饰补充锚", str(item.get("uri") or ""))
+                    for item in reversed(refs["headwear_references"])
+                    if item.get("uri"))
+                for label, victim in victims:
+                    if not victim or victim not in used_uris:
+                        continue
+                    used_uris.discard(victim)
+                    if refs.get("spatial_ref") == victim:
+                        refs.pop("spatial_ref", None)
+                    refs["headwear_references"] = [
+                        item for item in refs["headwear_references"]
+                        if str(item.get("uri") or "") != victim]
+                    refs["character_refs"] = [
+                        uri for uri in refs["character_refs"]
+                        if str(uri) != victim]
+                    refs["asset_matches"] = [
+                        item for item in refs["asset_matches"]
+                        if str(item.get("uri") or "") != victim]
+                    if remember(row["uri"]):
+                        remembered = True
+                        self.log.info(
+                            "director",
+                            f"镜头{shot_no}参考图自动选优：淘汰{label}，"
+                            f"保留核心道具「{name}」")
+                        break
+            if not remembered and not self._director_autonomy_enabled():
                 raise AifosError(
                     f"本镜人物、空间与核心道具参考图超过"
                     f"{SHOT_BASE_REFERENCE_LIMIT}张，请拆分镜头")
+            if not remembered:
+                self.log.warn(
+                    "director",
+                    f"镜头{shot_no}参考图已达上限，AI导演仅在文字合同中"
+                    f"保留核心道具「{name}」，不阻断生成")
+                continue
             refs["prop_refs"].append(row["uri"])
             prop_mode = dict(
                 (prop_reference_modes or {}).get(name) or {})
@@ -11252,6 +11807,15 @@ class Director:
                     or requested_keys)
                 # 每人只使用第一张实际存在且质量合格的视角母资产。
                 for key in per_actor_keys:
+                    if (name in headwear_conflict_names
+                            and key not in ("closeup", "features", "makeup")):
+                        # Once visual QC has proved that this identity lineage
+                        # contains obsolete/wrong headwear, a side/front/back
+                        # sheet from the same lineage must not compete with the
+                        # dedicated headwear structure anchor.  Prose saying
+                        # "ignore the hat" cannot reliably undo pixels sent to
+                        # the image model; keep only face-only detail sheets.
+                        continue
                     row = self.assets.latest(
                         project_id, "character_sheet", f"{name}:{key}")
                     row_meta = self._asset_meta(row) if row else {}
@@ -11877,7 +12441,7 @@ class Director:
         physical = build_physical_contract({
             **shot, "spatial_blocking": shot_blocking(
                 ctx.get("blocking"), shot.get("shot_no")) or {},
-        })
+        }, media="image")
         if physical.get("rules"):
             parts.append("【PHYSICAL / SPATIAL LOGIC】" + "；".join(
                 physical["rules"]))
@@ -11940,6 +12504,20 @@ class Director:
             raise AifosError(
                 f"场景「{location}」{reason}；已在关键帧出图前阻断。"
                 "请先重新建立该场景的真实三维搭景")
+        # _plan_seed_shots runs at the end of storyboard, before stage_blocking
+        # has produced per-shot actors/camera.  At that point we can and should
+        # require a current scene model, but there is no placement to collide
+        # yet.  Do not turn an absent contract into a fake origin camera.  The
+        # completed contract is hard-gated by _attach_scene_physics during
+        # stage_blocking and is checked again here before formal rendering.
+        if not isinstance(spatial, dict) or not spatial:
+            return {
+                "passed": True,
+                "deferred_until_blocking": True,
+                "issues": [],
+                "asset_version": int(row["version"] or 0),
+                "panorama_version": int(model.get("panorama_version") or 0),
+            }
         spatial = spatial if isinstance(spatial, dict) else {}
         issues = []
         issues.extend(actor_placement_issues(
@@ -11995,6 +12573,19 @@ class Director:
         # narrower than a global character design and must win before identity
         # facts, references, prompt text or QC expectations are compiled.
         shot = reconcile_shot_semantics(shot)
+        # A Codex repair persists a new camera sentence into the versioned
+        # storyboard.  Older runs may have saved that sentence while derived
+        # copies (shot_contract/five_dimensions/physical rules) were compiled
+        # by an earlier parser.  Re-synchronise the repaired copy on every
+        # resume before building the actual image payload; this is read-only
+        # with respect to the stored document and prevents a stale 35mm/环绕
+        # clause from competing with the latest 135mm/固定 repair.
+        if shot.get("prompt_block_repair"):
+            synchronize_shot_execution_contract(
+                shot,
+                location=self._shot_location(ctx.get("script"), shot),
+                style=ctx["project"].get("style", "") or "",
+            )
         self._require_valid_storyboard_prop_contract(ctx)
         prop_contract = self._shot_prop_contract(ctx, shot)
         prop_reference_rows = self._shot_core_prop_references(
@@ -12075,7 +12666,7 @@ class Director:
             "style": ctx["project"]["style"] or "",
             "era_context": era_context,
             "sanctioned_anachronisms": sanctioned_anachronisms,
-        })
+        }, media="image")
         narrative_overlays = [
             copy.deepcopy(item)
             for item in (shot.get("narrative_overlays") or [])
@@ -12250,6 +12841,14 @@ class Director:
                 ]),
             "identity_detail": (
                 ["identity_detail"], ["wardrobe", "pose", "background"]),
+            "headwear": (
+                [
+                    "headwear_shape", "headwear_material", "headwear_color",
+                    "headwear_placement", "headwear_signature_details",
+                ], [
+                    "face_identity_override", "wardrobe", "body_shape",
+                    "pose", "composition", "background", "lighting",
+                ]),
             "structure": (
                 ["body_structure", "view_structure"],
                 ["identity_override", "wardrobe", "pose", "background"]),
@@ -12320,6 +12919,44 @@ class Director:
             actor = str(ref.get("actor_id") or f"P{pos:02d}")
             face_only = (
                 ref.get("identity_anchor_type") == "face_only_derived")
+            headwear_anchor = copy.deepcopy(
+                ref.get("headwear_anchor") or {})
+            if isinstance(headwear_anchor, dict):
+                headwear_name = str(
+                    headwear_anchor.get("name")
+                    or headwear_anchor.get("legacy_text") or "").strip()
+                headwear_visual = []
+                for field, label in (
+                        ("shape", "轮廓"),
+                        ("material", "材质"),
+                        ("color", "颜色"),
+                        ("placement", "佩戴位置"),
+                        ("signature_details", "标志细节"),
+                        ("forbidden_variants", "禁止变体")):
+                    raw = headwear_anchor.get(field)
+                    if raw in (None, "", []):
+                        continue
+                    rendered = (
+                        "、".join(str(item) for item in raw)
+                        if isinstance(raw, (list, tuple)) else str(raw))
+                    headwear_visual.append(f"{label}={rendered}")
+            else:
+                headwear_name = str(headwear_anchor or "").strip()
+                headwear_visual = []
+            headwear_binding = (
+                f"；本镜已确认佩戴「{headwear_name or '该头饰/发饰'}」，"
+                "同时只锁定参考图中该头饰/发饰的类别、主轮廓、主要材质与"
+                "颜色、佩戴位置和显著纹饰端头，不得简化、换款、改色或移位"
+                + (("；视觉合同：" + "；".join(headwear_visual))
+                   if headwear_visual else "")
+                if headwear_anchor else "")
+            identity_inherits = None
+            if headwear_anchor:
+                identity_inherits = [
+                    "face", "identity", "hair_silhouette", "age", "gender",
+                    "headwear_shape", "headwear_material", "headwear_color",
+                    "headwear_placement", "headwear_signature_details",
+                ]
             add(ref["uri"], (
                     f"{actor}·{who}最终立绘面部锚"
                     if face_only else f"{actor}·{who}最终立绘"),
@@ -12328,15 +12965,60 @@ class Director:
                     f"{who}的脸型、五官骨相、年龄、性别表达、发际线与发型"
                     "轮廓；不得推断或继承图外服装、体型、姿势、构图、背景"
                     "或光线；服装只服从本镜服装参考；禁止参考他人图片"
+                    + headwear_binding
                     if face_only else
                     f"只锁定{who}的脸型、五官骨相、年龄、性别表达、发际线、"
                     "发型轮廓、体型与身份标志；不得复制此图的服装、"
-                    "姿势、构图、背景或光线；禁止参考他人图片"),
+                    "姿势、构图、背景或光线；禁止参考他人图片"
+                    + headwear_binding),
                 character=who, role="identity",
                 asset_id=ref.get("asset_id"),
+                inherits=identity_inherits,
                 kind=(
                     "character_identity_face_anchor"
                     if face_only else "character_identity"))
+        for ref in payload.get("headwear_references") or []:
+            if not isinstance(ref, dict) or not ref.get("uri"):
+                continue
+            who = str(ref.get("character") or "角色")
+            sheet = str(ref.get("sheet") or "detail")
+            anchor = ref.get("headwear_anchor") or {}
+            if isinstance(anchor, dict):
+                headwear_name = str(
+                    anchor.get("name") or anchor.get("legacy_text")
+                    or "该头饰/发饰").strip()
+                visual = []
+                for field, label in (
+                        ("shape", "轮廓"), ("material", "材质"),
+                        ("color", "颜色"), ("placement", "佩戴位置"),
+                        ("signature_details", "标志细节"),
+                        ("forbidden_variants", "禁止变体")):
+                    value = anchor.get(field)
+                    if value in (None, "", []):
+                        continue
+                    rendered = (
+                        "、".join(str(item) for item in value)
+                        if isinstance(value, (list, tuple)) else str(value))
+                    visual.append(f"{label}={rendered}")
+            else:
+                headwear_name = str(anchor or "该头饰/发饰")
+                visual = []
+            view = {
+                "back": "背面", "profile": "侧面", "closeup": "近景",
+            }.get(sheet, sheet)
+            binding = (
+                f"这是{who}当前佩戴「{headwear_name}」的{view}结构锚；"
+                "只锁定该头饰/发饰的主轮廓、材质、颜色、佩戴位置、"
+                "开口/束带/固定簪及显著端头；正面身份图看不见或与本图"
+                "冲突的背部结构，一律以本图裁决；不得用它覆盖脸、年龄、"
+                "性别、服装、体型、姿势、构图、背景或光线；不得简化、"
+                "换款、改色或移位"
+                + (("；视觉合同：" + "；".join(visual)) if visual else ""))
+            add(
+                ref["uri"], f"{who}发饰结构锚({view})", binding,
+                character=who, role="headwear",
+                asset_id=ref.get("asset_id"),
+                kind="character_headwear_structure")
         add(
             payload.get("inner_persona_ref"), "内心Q版母资产",
             "只锁定非现实内心Q版的脸、发型、当前衣着、Q版比例和材质；"
@@ -12345,11 +13027,20 @@ class Director:
             "身份、增加真实人数、进入空间站位、被其他人物看见或继承任何"
             "默认道具；透明背景不得画进成片",
             role="inner_persona", kind="inner_persona")
-        add(payload.get("spatial_ref"), "本镜空间调度图",
+        spatial_resolution = str(
+            ((payload.get("prompt_contract") or {}).get(
+                "spatial_staging") or {}).get("空间裁决") or "").strip()
+        spatial_binding = (
             "只读取人物编号与对应站位、相对距离、前后遮挡、屏幕方向、"
             "行动箭头、摄影机起终点/高度、瞄准点和视锥；不得把3D示意视角、"
-            "箭头、色块、网格或任何示意图元素画进最终画面",
-            role="spatial")
+            "箭头、色块、网格或任何示意图元素画进最终画面")
+        if spatial_resolution:
+            spatial_binding += (
+                "；本镜已有最新【空间裁决】，图中的旧左右/前后标签不再"
+                "继承，只保留人物对应、相对距离、摄影机路径与视锥；"
+                "最终画面方向严格服从该裁决：" + spatial_resolution)
+        add(payload.get("spatial_ref"), "本镜空间调度图",
+            spatial_binding, role="spatial")
         for uri in payload.get("prop_refs") or []:
             match = matches.get(uri) or {}
             name = str(match.get("name") or "核心道具")
@@ -12398,6 +13089,10 @@ class Director:
                 match.get("reference_role") or "").strip()
             scope_inherits = None
             scope_excludes = None
+            if declared_role == "headwear":
+                # Dedicated headwear anchors were already emitted immediately
+                # after identity references, before spatial/prop evidence.
+                continue
             if (declared_role == "wardrobe"
                     or sheet in ("wardrobe", "costume", "costume_detail")):
                 binding = (
@@ -12533,12 +13228,50 @@ class Director:
         self._attach_reference_manifest(payload)
         return payload
 
+    @staticmethod
+    def _without_stale_reference_numbers(value):
+        """Remove free-text ``图N`` duties before rebuilding the manifest.
+
+        Reference indexes are positional.  A retry may insert a stronger
+        identity/headwear anchor and shift every later image, so old Codex
+        repair prose such as ``参考图4只继承空间`` must never survive as an
+        independent contract.  The freshly generated reference manifest is
+        the sole source of numbered duties.
+        """
+        if isinstance(value, dict):
+            return {
+                key: Director._without_stale_reference_numbers(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [Director._without_stale_reference_numbers(item)
+                    for item in value]
+        if not isinstance(value, str) or not value:
+            return value
+        cleaned = re.sub(
+            r"(?:参考图|图)\s*\d+\s*(?:=|只|仅|应|不|需|用|作为|负责|"
+            r"继承|锁定|读取)[^。；\n]*(?:[。；]|(?=\n)|$)",
+            "", value)
+        return re.sub(r"[；。]{2,}", "。", cleaned).strip()
+
     def _attach_reference_manifest(self, payload):
         """把参考图对照表写进 payload 与提示词(编号=实际提交顺序)。"""
+        # Structured prompt-review context is audited alongside the prompt.
+        # Clear positional image duties there as well; otherwise an inserted
+        # headwear/identity anchor shifts the manifest while latest_camera or
+        # a prior repair contract keeps pointing at the old index.
+        for key in (
+                "action", "camera", "prompt_contract", "shot_contract",
+                "prompt_conflict_resolution", "feedback", "manual_feedback"):
+            if key in payload:
+                payload[key] = self._without_stale_reference_numbers(
+                    payload[key])
         # 同一 payload 可能在补入首/尾帧修图基底后再次绑定参考图。
         # 始终从未附表的原始提示词重建，避免“参考图对照表”重复叠加。
         base_prompt = payload.setdefault(
             "_reference_prompt_base", payload.get("prompt") or "")
+        base_prompt = self._without_stale_reference_numbers(base_prompt)
+        payload["_reference_prompt_base"] = base_prompt
         manifest = self._reference_manifest(payload)
         payload["reference_manifest"] = manifest
         payload["prompt"] = base_prompt
@@ -12577,10 +13310,18 @@ class Director:
                     for kind, report in frame_validations.items()
                     if not report.get("passed")
                 ]
-                if invalid:
+                if invalid and not self._director_autonomy_enabled():
                     raise AifosError(
                         "首尾帧独立静态合同校验失败，未调用生成 API："
                         + "；".join(invalid))
+                if invalid:
+                    payload["director_autonomy_mode"] = True
+                    for report in frame_validations.values():
+                        if not report.get("passed"):
+                            report["inspection_waived"] = True
+                            report["waiver_reason"] = (
+                                "用户授权AI导演直接生成首尾帧，"
+                                "不以静态合同文字冲突阻断")
                 payload["frame_prompt_contracts"] = frame_contracts
                 payload["frame_prompt_contract_validations"] = (
                     frame_validations)
@@ -12723,7 +13464,8 @@ class Director:
                 if (existing_file_ok
                         and self._asset_meta(existing_row).get(
                             "shot_content_hash")
-                        == self._shot_content_hash(shot)):
+                        == (item.get("content_hash")
+                            or self._shot_content_hash(shot))):
                     continue
             decision = {
                 "level": item.get("image_quality") or "medium",
@@ -12736,6 +13478,9 @@ class Director:
             recovered_meta = {
                 "recovered_from_render_plan": True,
                 "render_plan_item": item.get("id"),
+                "shot_content_hash": (
+                    item.get("content_hash")
+                    or self._shot_content_hash(shot)),
             }
             for key in (
                     "provider", "model", "real", "fallbacks",
@@ -12804,7 +13549,7 @@ class Director:
     def _shot_qc_spec(self, ctx, payload):
         """关键帧质检规格;镜头被就地修复后必须用新 payload 重建,
         否则质检仍按旧景别/旧构图判图。"""
-        return {**self._qc_spec(
+        spec = self._qc_spec(
             ctx["project"]["id"],
             payload.get("identity_characters",
                         payload.get("characters", [])),
@@ -12825,7 +13570,54 @@ class Director:
             physical_logic_required=True,
             era_exceptions=self._era_exceptions(ctx),
             narrative_overlays=payload.get("narrative_overlays"),
-            functional_figures=payload.get("functional_figures"))}
+            functional_figures=payload.get("functional_figures"))
+        prop_registry = {
+            str(item.get("prop_id") or ""): item
+            for item in (payload.get("prop_registry") or [])
+            if isinstance(item, dict) and item.get("prop_id")
+        }
+        critical_props = []
+        for item in payload.get("frame_props") or []:
+            if not isinstance(item, dict):
+                continue
+            prop_id = str(item.get("prop_id") or "")
+            registry = prop_registry.get(prop_id) or {}
+            if registry.get("kind") not in {
+                    "plot_sensitive", "identity_prop", "story_critical"}:
+                continue
+            label = str(registry.get("name") or prop_id)
+            if label and label not in critical_props:
+                critical_props.append(label)
+        spec["fidelity_policy"] = {
+            "schema": "aifos.fidelity-tiers/v1",
+            "critical": [
+                "人物身份、性别/年龄层、真实人数与非现实叠层数量",
+                "同场服装、头饰、妆发和伤情连续性；已声明佩戴的帽冠/网巾/"
+                "发簪/发钗须保持名称、类别、主轮廓、主要材质颜色、佩戴位置和"
+                "显著纹饰端头一致",
+                "核心道具的类别、持有人、可见/隐藏状态与剧情阶段",
+                "关键动作因果、人物左右/轴线、真实接触和重力支撑",
+                "剧情必需文字白名单、时代与无字幕/Logo/水印",
+            ] + (["本镜核心道具:" + "、".join(critical_props)]
+                 if critical_props else []),
+            "tolerant": [
+                "相邻景别内的轻微取景差、精确焦段数字、主体重心小偏移",
+                "前后错位或遮挡量的轻微差别、非关键手势/视线/表情幅度",
+                "不改变剧情含义的道具厘米级尺寸、折痕、摆放角度与材质细差",
+            ],
+            "creative": [
+                "衣褶、发丝、皮肤微纹理、尘雾、次级光斑",
+                "不影响连续性的大型结构以外的小摆件纹理和背景装饰",
+                "不改变首尾状态、人数或道具归属的自然微动作",
+            ],
+            "promotion_rule": (
+                "自由细节一旦在相邻镜头清楚可见并成为连续性事实，"
+                "后续镜头升级为连续性锁定"),
+            "camera_precedence": (
+                "景别观感、机位侧别、固定/运动和不越轴优先；"
+                "焦段数字、精确裁切与重叠比例只作实现参考"),
+        }
+        return spec
 
     def _distill_lessons(self, ctx, domain=DOMAIN_IMAGE):
         """把反复出现的原始质检观察归纳成可复用通用规则并自动采纳。
@@ -12837,6 +13629,8 @@ class Director:
         级专名、可跨镜执行的规则,这类结论才自动采纳进提示词;原始观察
         仍保持 pending,看板上可查可撤。
         """
+        if self._preview_qc_bypass_enabled():
+            return 0
         if not self.config.get("defaults", "lesson_distill", default=True):
             return 0
         project_id = ctx["project"]["id"]
@@ -12901,6 +13695,7 @@ class Director:
         reused = 0
         tasks = []
         quality_by_shot = {}
+        payload_by_shot = {}
         seen_scenes = set()
         skipped_scenes = self._skipped_scenes(ctx)
         if skipped_scenes:
@@ -12927,6 +13722,48 @@ class Director:
                 f"shot:{shot['shot_no']}") or {}
             existing = self._existing_asset_uri(
                 ctx, "image", self._shot_name(ctx, shot["shot_no"]))
+            # 用户明确禁止视觉返工后，断点里已经生成并由流水线冻结的
+            # canonical 输出就是导演选定稿。即使旧 QC 标成失败或当前
+            # 分镜哈希因自动修订变化，也不得再次消耗生图额度；只有确实
+            # 没有任何现成文件的镜头才继续创建一次生成任务。
+            if self._director_autonomy_enabled():
+                # render_plan 会在分镜版本变化时重建，资产登记则只发生在
+                # QC 放行之后；两处都可能暂时看不到已真实写盘的冻结稿。
+                # Provider 的 canonical 文件名是最后一道断点事实源。
+                canonical = (
+                    ctx["out_root"] / "images"
+                    / f"shot_{int(shot['shot_no']):03d}.keyframe.png")
+                selected = str(
+                    stored_prior.get("output_uri") or existing
+                    or (canonical if canonical.exists() else ""))
+                if selected and Path(selected).exists():
+                    row = self.assets.latest(
+                        ctx["project"]["id"], "image",
+                        self._shot_name(ctx, shot["shot_no"]))
+                    if row is None or str(row["uri"] or "") != selected:
+                        self._register_shot_asset(
+                            ctx, "image", int(shot["shot_no"]), selected,
+                            meta=self._shot_image_meta(
+                                ctx, shot, payload["quality_decision"], {
+                                    "inspection_waived": True,
+                                    "selection_basis":
+                                        "persisted_director_selection",
+                                }, payload=payload))
+                    ctx["images"].append({
+                        "shot_no": shot["shot_no"], "uri": selected,
+                        "image_quality": required_quality,
+                        "inspection_waived": True,
+                    })
+                    reused += 1
+                    self._plan_mark(
+                        ctx, f"shot:{shot['shot_no']}", "reused",
+                        extra={
+                            "output_uri": selected,
+                            "inspection_waived": True,
+                            "selection_basis":
+                                "persisted_director_selection",
+                        })
+                    continue
             if (existing
                     and self._repair_gacha_prompt_invariant_valid(
                         stored_prior)):
@@ -12936,7 +13773,7 @@ class Director:
                 actual_quality = self._asset_quality(row)
                 same_content = (
                     self._asset_meta(row).get("shot_content_hash")
-                    == self._shot_content_hash(shot))
+                    == self._shot_content_hash(shot, payload))
                 if (same_content
                         and self._quality_meets(
                             actual_quality, required_quality)):
@@ -12958,10 +13795,17 @@ class Director:
             task["on_success"] = (
                 lambda result, current_shot=shot,
                 current_quality=copy.deepcopy(
-                    payload["quality_decision"]):
+                    payload["quality_decision"]),
+                current_payload=payload:
                 self._register_completed_shot_result(
-                    ctx, current_shot, current_quality, result))
-            stored = stored_prior
+                    ctx, current_shot, current_quality, result,
+                    payload=current_payload))
+            # 预览片不承接旧 QC 失败轮次、三抽修复或 Codex 升级指令；
+            # 直接按当前已编译镜头合同生成一次，避免“已关闭质检”仍被
+            # 历史质检状态拉回编剧修复/候选选优链。
+            stored = (
+                {} if self._preview_qc_bypass_enabled()
+                else stored_prior)
             stored_qc = stored.get("qc") or {}
             stored_escalation = stored_qc.get("codex_escalation") or {}
             repair_meta = shot.get("prompt_block_repair") or {}
@@ -13068,6 +13912,7 @@ class Director:
                     "已从修订合同断点恢复并继续固定3张全量选优")
             payload = task["payload"]
             quality_by_shot[shot["shot_no"]] = payload["quality_decision"]
+            payload_by_shot[shot["shot_no"]] = payload
             tasks.append(task)
         results, qc_failures = self._run_parallel(
             ctx, tasks, line="分镜画面",
@@ -13079,7 +13924,7 @@ class Director:
                 ctx,
                 next(s for s in ctx["storyboard"]["shots"]
                      if s["shot_no"] == shot_no),
-                quality, result)
+                quality, result, payload=payload_by_shot.get(shot_no))
             ctx["images"].append({
                 "shot_no": shot_no, "uri": result.uri,
                 "image_quality": quality["level"]})
@@ -13260,14 +14105,22 @@ class Director:
                         or {})
                     if (self._quality_meets(
                             frame_quality, required_quality)
-                            and saved_qc.get("passed") is True):
+                            and (saved_qc.get("passed") is True
+                                 or self._director_autonomy_enabled())):
+                        qc_passed = saved_qc.get("passed") is True
                         ctx["frames"].append({
                             "shot_no": shot["shot_no"], "first": first,
                             "last": last, "image_quality": frame_quality,
-                            "qc_passed": True})
+                            "qc_passed": qc_passed,
+                            "inspection_waived":
+                                self._director_autonomy_enabled()})
                         reused += 1
-                        self._plan_mark(ctx, f"frames:{shot['shot_no']}",
-                                        "reused", only_pending=True)
+                        self._plan_mark(
+                            ctx, f"frames:{shot['shot_no']}", "reused",
+                            extra={
+                                "inspection_waived":
+                                    self._director_autonomy_enabled(),
+                            })
                         last_by_scene[scene_no] = {
                             "uri": last, "image_quality": frame_quality,
                             "shot_no": shot["shot_no"]}
@@ -13383,6 +14236,36 @@ class Director:
                 "policy": ctx.get("character_asset_policy") or {},
                 "selection": ctx.get("cast_selection") or {},
             })
+        if self._preview_qc_bypass_enabled():
+            # 免检模式只豁免“首尾帧已通过视觉质检”这一项；剧本、人物、
+            # 空间、时长、文字、生产规格等非 QC 门禁仍然必须真实通过。
+            autonomy = self._director_autonomy_enabled()
+            blocking_failures = [
+                gate for gate in report.get("gates", [])
+                if not gate.get("passed")
+                and gate.get("severity") != "warning"]
+            bypassed = [
+                gate for gate in blocking_failures
+                if str(gate.get("id") or "") == "frames"]
+            remaining = [
+                gate for gate in blocking_failures
+                if str(gate.get("id") or "") != "frames"]
+            report["formal_passed"] = bool(report.get("passed"))
+            report["preview_only"] = not autonomy
+            report["inspection_waived"] = autonomy
+            report["final_output_allowed"] = autonomy
+            report["preview_qc_bypass"] = {
+                "enabled": True,
+                "scope": ["frames_visual_qc"],
+                "bypassed_gates": [
+                    str(gate.get("id") or gate.get("label") or "frames")
+                    for gate in bypassed],
+                "remaining_blocking_gates": [
+                    str(gate.get("id") or gate.get("label") or "unknown")
+                    for gate in remaining],
+            }
+            if not remaining:
+                report["passed"] = True
         version = self.projects.save_document(
             ctx["episode"]["id"], "preflight", report)
         (ctx["out_root"] / "preflight_report.json").write_text(
@@ -13393,7 +14276,19 @@ class Director:
             failed = [g["label"] for g in report["gates"]
                       if not g["passed"] and g.get("severity") != "warning"]
             raise AifosError("生产门禁未通过: " + "、".join(failed))
+        if report.get("inspection_waived"):
+            self.log.warn(
+                "director",
+                "AI导演全权成片模式：首尾帧视觉质检门已由用户授权旁路；"
+                "其它生产门禁仍按成片标准执行")
+        elif report.get("preview_only"):
+            self.log.warn(
+                "director",
+                "临时预览模式：首尾帧视觉质检门已旁路；"
+                "其它生产门禁仍按正式标准执行")
         return {"version": version, "passed": True,
+                "formal_passed": report.get("formal_passed", True),
+                "preview_only": bool(report.get("preview_only")),
                 "gates": len(report["gates"]), "units": report["units"]}
 
     def _stage_videos(self, ctx):
@@ -13751,6 +14646,7 @@ class Director:
             raise AifosError(
                 "以下核心道具缺少人工锁定母资产，禁止交给 Seedance:"
                 + "、".join(missing_props))
+        rows = self._director_select_video_reference_rows(rows, shot_no)
         if len(rows) > SEEDANCE_ASSET_REFERENCE_LIMIT:
             raise AifosError(
                 f"镜头{shot_no}的空间图与人物最终立绘已占{len(rows)}张，"
@@ -14002,6 +14898,7 @@ class Director:
                     or Path(uri).exists()) and row["id"] not in seen:
                 seen.add(row["id"])
                 rows.append(row)
+        rows = self._director_select_video_reference_rows(rows, shot_no)
         if len(rows) > SEEDANCE_ASSET_REFERENCE_LIMIT:
             raise AifosError(
                 f"镜头{shot_no}的空间图、人物最终立绘与人工参考共"
@@ -14009,6 +14906,50 @@ class Director:
                 f"{SEEDANCE_ASSET_REFERENCE_LIMIT}张；"
                 "请减少人工额外参考或拆分群像镜头")
         return rows
+
+    def _director_select_video_reference_rows(self, rows, shot_no):
+        """导演自治时在 Seedance 素材上限内自动选择最有效的参考。
+
+        首尾帧已经携带本镜构图和空间关系，因此槽位不足时先舍弃重复的
+        空间/构图参考，优先保留人物身份、发饰服装和剧情核心道具母资产。
+        这里只做选择，不触发重新生成。
+        """
+        rows = list(rows or [])
+        if (not self._director_autonomy_enabled()
+                or len(rows) <= SEEDANCE_ASSET_REFERENCE_LIMIT):
+            return rows
+        priority = {
+            "character_art": 100,
+            "character_identity": 100,
+            "prop_art": 95,
+            "prop_identity": 95,
+            "inner_persona": 90,
+            "reference": 55,
+            "scene_art": 35,
+            "image": 25,
+            "spatial_blocking": 10,
+        }
+        ranked = sorted(
+            enumerate(rows),
+            key=lambda item: (
+                -priority.get(str(item[1]["kind"] or ""), 70),
+                item[0]),
+        )
+        keep_indices = {
+            index for index, _row in
+            ranked[:SEEDANCE_ASSET_REFERENCE_LIMIT]
+        }
+        selected = [
+            row for index, row in enumerate(rows) if index in keep_indices]
+        dropped = [
+            row for index, row in enumerate(rows) if index not in keep_indices]
+        dropped_labels = "、".join(
+            f"{row['name']}({row['kind']})" for row in dropped)
+        self.log.info(
+            "director",
+            f"镜头{shot_no}参考资产自动选优：保留{len(selected)}张，"
+            f"舍弃由首尾帧承载的重复参考：{dropped_labels}")
+        return selected
 
 
     # 参考位紧张时的道具让位序:穿在人物身上的服装类道具,其形象已由
@@ -14218,13 +15159,30 @@ class Director:
                 f"；{dialogue.get('character')}按自然口型说出台词，"
                 "说话时保留眼神、呼吸和细小停顿"
                 if dialogue.get("dialogue") else "")
+        if reference_manifest:
+            boundary_rule = (
+                "【首尾帧职责】全能参考中的图1是唯一动作起点、图2是唯一"
+                "动作终点；必须从图1状态开始并准确抵达图2状态，不得只"
+                "参考其中一张，不得把图1/图2当普通风格图；图3以后只按"
+                "各自单一职责补充身份、道具或空间，不得覆盖起终点")
+            appearance_rule = (
+                "脸和性别服从对应人物身份资产；服装、头饰、妆发、道具、"
+                "站位与动作状态服从图1/图2")
+        else:
+            boundary_rule = (
+                "【首尾帧硬绑定】必须从图1首帧的像素状态开始并准确抵达"
+                "图2尾帧的像素状态，不得只参考其中一张，不得把图1/图2"
+                "当普通风格图或重新设计起终点")
+            appearance_rule = (
+                "人物脸、性别、发型、服装、头饰、妆发和道具全部锁定"
+                "首尾帧")
         lines = [
-            "【输入边界】图1首帧是唯一动作起点；图2尾帧是唯一动作终点。",
+            boundary_rule + "。",
             f"【人物硬锁】{mapped}；成片从头到尾严格共{len(characters)}人，"
             "不得新增、缺失、复制、合并、换脸或换性别；"
-            "脸和性别按各自最终立绘，服装/道具按首尾帧。",
+            + appearance_rule + "。",
             f"【起点】{state_line(shot.get('start_state')) or '保持首帧可见状态'}。",
-            f"【单一主动作】{shot.get('description') or shot.get('prompt') or '环境自然变化'}。",
+            f"【单一主动作】{shot.get('video_action') or shot.get('action') or shot.get('description') or shot.get('prompt') or '环境自然变化'}。",
             f"【表演】{performance.get('gaze') or '逐角色视线严格服从condition'}；"
             f"{performance.get('micro_expression') or '逐角色表演严格服从condition'}"
             f"{dialogue_rule}。",
@@ -14271,7 +15229,10 @@ class Director:
                if sanctioned else "全程")
             + "物品、服装、建筑必须符合剧本声明的时代与世界观"
             + (f"，严禁出现:{'、'.join(drift)}" if drift else "")
-            + "；物体在运动中保持真实结构与比例,严禁拉长、扭曲、穿模。")
+            + "；人和物品道具的运动轨迹必须符合真实物理世界的运动轨迹"
+            "和逻辑；人物服从重力、惯性、关节、重心和支撑，物品位移、"
+            "旋转、碰撞、接触与交接连续且有明确受力来源；严禁漂浮、"
+            "瞬移、拉长、扭曲、穿模或无支撑运动。")
         lessons = lessons_block(self.assets, ctx["project"]["id"])
         if lessons:
             lines.append("【严禁再犯】" + lessons)
@@ -14465,15 +15426,20 @@ class Director:
         self._require_valid_storyboard_prop_contract(ctx)
         prop_contract = self._shot_prop_contract(ctx, shot)
         diagnosis = self._video_diagnosis_from_ctx(ctx, shot_no)
+        if self._director_autonomy_enabled():
+            # 历史质检结论不得污染用户本次授权的一次性导演选择。
+            diagnosis = {}
         decision = diagnosis.get("decision") or {}
-        if (decision.get("action") == "repair_frames_first"
-                or self._video_frame_diagnosis_failed(diagnosis)):
+        if (not self._director_autonomy_enabled()
+                and (decision.get("action") == "repair_frames_first"
+                     or self._video_frame_diagnosis_failed(diagnosis))):
             raise AifosError(
                 f"镜头{shot_no}的源关键帧/首尾帧诊断未通过，"
                 "必须先修复上游帧，禁止消耗 Seedance 额度")
         frame = frames[shot["shot_no"]]
-        if not formal_reference_allowed(
-                frame.get("image_quality", "medium")):
+        if (not self._director_autonomy_enabled()
+                and not formal_reference_allowed(
+                    frame.get("image_quality", "medium"))):
             raise AifosError(
                 f"镜头{shot['shot_no']}首尾帧为低质量试错图，禁止交给 Seedance")
         quality_policy = (
@@ -14498,13 +15464,31 @@ class Director:
         upgrade_policy = copy.deepcopy(
             (((ctx.get("production_profile") or {}).get("rules") or {})
              .get("production") or {}).get("model_upgrade_policy") or {})
-        reference_rows = self._video_reference_rows(ctx, shot["shot_no"])
-        spatial = self._spatial_reference_requirement(
-            ctx, shot["shot_no"])
-        if spatial["required"] and not (
+        # Seedance's two transports are mutually exclusive in the official
+        # CLI: only frames2video exposes --first/--last; multimodal2video turns
+        # every --image into an undifferentiated reference.  Default to the
+        # user's authoritative boundary frames.  A shot may explicitly opt in
+        # to all_around when additional assets matter more than a hard end.
+        reference_mode = str(
+            shot.get("seedance_reference_mode")
+            or self.config.get(
+                "defaults", "seedance_reference_mode",
+                default="all_around")
+            or "all_around").strip().lower()
+        if reference_mode not in {"first_last", "all_around"}:
+            raise AifosError(
+                "seedance_reference_mode 只允许 first_last/all_around")
+        reference_rows = (
+            self._video_reference_rows(ctx, shot["shot_no"])
+            if reference_mode == "all_around" else [])
+        spatial = self._spatial_reference_requirement(ctx, shot["shot_no"])
+        if (reference_mode == "all_around"
+                and spatial["required"]
+                and not self._director_autonomy_enabled()
+                and not (
                 spatial["ready"]
                 and any(row["kind"] == "spatial_blocking"
-                        for row in reference_rows)):
+                        for row in reference_rows))):
             detail = spatial["error"] or "空间 PNG 未生成或未上传"
             raise AifosError(
                 f"镜头{shot['shot_no']}为多人/变机位镜头，"
@@ -14528,13 +15512,22 @@ class Director:
             {"index": 2, "label": "尾帧", "kind": "last_frame"},
             *reference_manifest,
         ]
-        contract, compact = compile_shot_prompt(
+        contract, audit_prompt = compile_shot_prompt(
             {**shot, **prop_contract},
             location=self._shot_location(ctx.get("script"), shot),
             style=ctx["project"].get("style", ""), references=video_refs,
             mode="video")
-        manual_feedback = (ctx.get("video_feedback") or {}).get(
-            int(shot["shot_no"]), "")
+        # Seedance receives the complete execution contract plus the transport-
+        # specific first/last-frame role.  The provider's last-mile fitter
+        # preserves labelled, shot-critical facts while using the full 4000-
+        # character budget (including every appended suffix).
+        boundary_prompt = video_prompt.splitlines()[0].strip()
+        compact = (
+            f"{boundary_prompt}\n{audit_prompt}"
+            if boundary_prompt else audit_prompt)
+        manual_feedback = "" if self._director_autonomy_enabled() else (
+            (ctx.get("video_feedback") or {}).get(
+                int(shot["shot_no"]), ""))
         if manual_feedback:
             video_prompt += (
                 "\n【人工修订意见】这是人工检查后确认的本镜修订要求，"
@@ -14549,10 +15542,13 @@ class Director:
             video_dialogue["character"] = (
                 video_dialogue.get("performed_by")
                 or video_dialogue.get("character"))
-        motion_reference_uri = self._motion_reference_uri(ctx, shot)
+        motion_reference_uri = (
+            self._motion_reference_uri(ctx, shot)
+            if reference_mode == "all_around" else "")
         payload = {
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
+            "director_autonomy_mode": self._director_autonomy_enabled(),
             "prompt": video_prompt,
             "prompt_compact": compact,
             "prompt_contract": contract,
@@ -14570,6 +15566,7 @@ class Director:
                if motion_reference_uri else {}),
             "reference_assets": reference_assets,
             "reference_manifest": reference_manifest,
+            "seedance_reference_mode": reference_mode,
             **prop_contract,
             "dialogue": video_dialogue,
             "voice": ctx["production_profile"]["voice"],
@@ -14601,7 +15598,8 @@ class Director:
         previous_signature = str(
             self._latest_video_input_meta(ctx, shot_no).get(
                 "input_signature") or "")
-        if (decision.get("action") == "direct_video_retry"
+        if (not self._director_autonomy_enabled()
+                and decision.get("action") == "direct_video_retry"
                 and previous_signature
                 and previous_signature == snapshot["input_signature"]):
             raise AifosError(
@@ -14623,7 +15621,8 @@ class Director:
         reference_manifest = task["reference_manifest"]
         provider = self.router.providers.get(result.provider)
         audio_in_video = bool(
-            provider and provider.conf.get("audio_in_video"))
+            (provider and provider.conf.get("audio_in_video"))
+            or result.data.get("audio_in_video"))
         # mock 是正式有声产线的离线契约模拟；它会把实际执行的
         # voice/lip_sync 回写结果，用结果而不是仅凭 production profile 判定。
         if (provider and "audio_in_video" not in provider.conf
@@ -14684,8 +15683,14 @@ class Director:
         if workers == 1:
             output = {}
             for task in tasks:
-                result = self._call(
-                    ctx, "video", task["payload"], "videos")
+                try:
+                    result = self._call(
+                        ctx, "video", task["payload"], "videos")
+                except Exception as exc:
+                    if not self._director_autonomy_enabled():
+                        raise
+                    result = self._technical_frame_video_result(
+                        ctx, task, exc)
                 video = self._finish_video_call(ctx, task, result)
                 output[int(video["shot_no"])] = video
             return output
@@ -14718,7 +15723,8 @@ class Director:
                     return False
                 future = pool.submit(
                     self.router.call, "video", task["payload"],
-                    ctx["out_root"] / "videos", cancel)
+                    ctx.get("video_out_dir")
+                    or (ctx["out_root"] / "videos"), cancel)
                 futures[future] = task
                 return True
 
@@ -14736,8 +15742,15 @@ class Director:
                         cancelled = True
                         continue
                     except Exception as exc:
-                        failures.append((task, exc))
-                        continue
+                        if not self._director_autonomy_enabled():
+                            failures.append((task, exc))
+                            continue
+                        try:
+                            result = self._technical_frame_video_result(
+                                ctx, task, exc)
+                        except Exception as fallback_exc:
+                            failures.append((task, fallback_exc))
+                            continue
                     self._task_cost += result.cost
                     self._task_providers.add(result.provider)
                     self.projects.add_episode_cost(
@@ -14761,6 +15774,145 @@ class Director:
         if failures:
             raise failures[0][1]
         return output
+
+    def _technical_frame_video_result(self, ctx, task, source_error):
+        """模型没有返回视频时，用已选首尾帧完成一次无重生成合成。
+
+        该兜底只在用户明确开启导演自治时使用；它不创造新画面、不调用
+        生成模型，只把冻结首尾帧做成定长交叉淡化镜头，保证最终剪辑可
+        继续。声音由后续 voice/edit 阶段按既有合同处理。
+        """
+        payload = task["payload"]
+        shot_no = int(payload.get("shot_no") or 0)
+        first = Path(str(payload.get("first") or ""))
+        last = Path(str(payload.get("last") or ""))
+        if not first.exists() or not last.exists():
+            raise AifosError(
+                f"镜头{shot_no}模型失败且首尾帧不完整，无法技术合成")
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            candidate = Path.home() / ".local" / "bin" / "ffmpeg"
+            ffmpeg = str(candidate) if candidate.exists() else ""
+        if not ffmpeg:
+            raise AifosError(
+                f"镜头{shot_no}模型失败且本机无 ffmpeg，无法技术合成")
+        duration = max(1.0, float(payload.get("duration") or 1.0))
+        fade = min(1.0, max(0.25, duration / 4.0))
+        segment = (duration + fade) / 2.0
+        offset = (duration - fade) / 2.0
+        out_dir = Path(ctx["out_root"]) / "videos"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        output = out_dir / f"shot_{shot_no:03d}.mp4"
+        scale = (
+            "scale=720:1280:force_original_aspect_ratio=increase,"
+            "crop=720:1280,setsar=1,fps=24,format=yuv420p")
+        filter_graph = (
+            f"[0:v]{scale}[first];[1:v]{scale}[last];"
+            f"[first][last]xfade=transition=fade:duration={fade:.3f}:"
+            f"offset={offset:.3f},format=yuv420p[out]")
+        command = [
+            ffmpeg, "-y", "-loglevel", "error",
+            "-loop", "1", "-t", f"{segment:.3f}", "-i", str(first),
+            "-loop", "1", "-t", f"{segment:.3f}", "-i", str(last),
+            "-filter_complex", filter_graph,
+            "-map", "[out]", "-t", f"{duration:.3f}",
+            "-an", "-c:v", "libx264", "-preset", "medium",
+            "-crf", "18", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart", str(output),
+        ]
+        proc = subprocess.run(
+            command, capture_output=True, text=True, timeout=180,
+            check=False)
+        if proc.returncode != 0 or not output.exists() or output.stat().st_size <= 0:
+            raise AifosError(
+                f"镜头{shot_no}技术合成失败:{proc.stderr.strip()[:500]}")
+        dialogue = payload.get("dialogue") or {}
+        dialogue_text = str(
+            dialogue.get("dialogue") if isinstance(dialogue, dict)
+            else dialogue).strip()
+        voice_mode = self._add_technical_audio_track(
+            output, duration, dialogue_text)
+        self.log.warn(
+            "director",
+            f"镜头{shot_no}生成模型未返回成片，AI导演按用户授权不重生成；"
+            "已用冻结首尾帧完成定长技术镜头。"
+            f"原始错误:{str(source_error)[:240]}")
+        return SimpleNamespace(
+            provider="technical_frame_fallback",
+            cost=0.0,
+            uri=str(output),
+            model="ffmpeg-xfade",
+            data={
+                "shot_no": shot_no,
+                "duration": duration,
+                "video_quality": payload.get("video_quality", "medium"),
+                "video_resolution": "720p",
+                "voice": voice_mode,
+                "lip_sync": False,
+                "audio_in_video": True,
+                "technical_voice_mode": voice_mode,
+                "forbid_subtitles": payload.get("forbid_subtitles", True),
+                "reference_images_used": [],
+                "technical_frame_fallback": True,
+                "source_error": str(source_error)[:1000],
+            })
+
+    @staticmethod
+    def _add_technical_audio_track(output, duration, dialogue_text=""):
+        """给技术镜头补齐音轨；优先本地中文 TTS，无文本时补静音轨。"""
+        output = Path(output)
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            candidate = Path.home() / ".local" / "bin" / "ffmpeg"
+            ffmpeg = str(candidate) if candidate.exists() else ""
+        if not ffmpeg:
+            raise AifosError("技术镜头补音轨失败:本机无 ffmpeg")
+        duration = max(1.0, float(duration or 1.0))
+        muxed = output.with_name(f".{output.stem}.audio.mp4")
+        voice = output.with_name(f".{output.stem}.voice.aiff")
+        say = shutil.which("say") or "/usr/bin/say"
+        voice_ready = False
+        if dialogue_text and Path(say).exists():
+            spoken = subprocess.run(
+                [say, "-v", "Tingting", "-r", "175", "-o", str(voice),
+                 dialogue_text],
+                capture_output=True, text=True, timeout=60, check=False)
+            voice_ready = (
+                spoken.returncode == 0
+                and voice.exists() and voice.stat().st_size > 0)
+        if voice_ready:
+            command = [
+                ffmpeg, "-y", "-loglevel", "error",
+                "-i", str(output), "-i", str(voice),
+                "-filter_complex",
+                f"[1:a]adelay=350:all=1,apad=pad_dur={duration:.3f}[a]",
+                "-map", "0:v:0", "-map", "[a]", "-t", f"{duration:.3f}",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-ar", "48000", "-movflags", "+faststart", str(muxed),
+            ]
+            mode = "macos_tingting_tts"
+        else:
+            command = [
+                ffmpeg, "-y", "-loglevel", "error", "-i", str(output),
+                "-f", "lavfi", "-t", f"{duration:.3f}",
+                "-i", "anullsrc=r=48000:cl=stereo",
+                "-map", "0:v:0", "-map", "1:a:0", "-t", f"{duration:.3f}",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart", str(muxed),
+            ]
+            mode = "silent_track"
+        mux = subprocess.run(
+            command, capture_output=True, text=True, timeout=180,
+            check=False)
+        try:
+            voice.unlink(missing_ok=True)
+        except OSError:
+            pass
+        if mux.returncode != 0 or not muxed.exists() or muxed.stat().st_size <= 0:
+            raise AifosError(
+                f"技术镜头补音轨失败:{mux.stderr.strip()[:500]}")
+        muxed.replace(output)
+        return mode
 
     def _make_video(self, ctx, shot, frames):
         """兼容单镜调用；正式视频阶段由 4 路并行调度器执行。"""
@@ -14794,6 +15946,8 @@ class Director:
         ctx["lip_sync"] = ctx["production_profile"]["lip_sync"]
         lines = sum(len(scene.get("lines", []))
                     for scene in ctx["script"].get("scenes", []))
+        if self._director_autonomy_enabled():
+            self._ensure_director_autonomy_fallback_audio(ctx)
         audio_states = self._video_audio_states(ctx)
         all_videos_carry_audio = self._videos_carry_audio(ctx)
         if audio_states and any(audio_states) and not all(audio_states):
@@ -14852,6 +16006,42 @@ class Director:
                 "subtitles": len(ctx["subtitles"]),
                 "integrated_in_video": False}
 
+    def _ensure_director_autonomy_fallback_audio(self, ctx):
+        """把技术兜底镜头补成自带音轨，避免与 Seedance 有声镜头混用。"""
+        shots = {
+            int(shot.get("shot_no") or 0): shot
+            for shot in (ctx.get("storyboard") or {}).get("shots", [])}
+        for video in ctx.get("videos") or []:
+            if (video.get("provider") != "technical_frame_fallback"
+                    or video.get("audio_in_video")):
+                continue
+            shot_no = int(video.get("shot_no") or 0)
+            shot = shots.get(shot_no) or {}
+            dialogue = shot.get("dialogue") or {}
+            dialogue_text = str(
+                dialogue.get("dialogue")
+                if isinstance(dialogue, dict) else dialogue).strip()
+            mode = self._add_technical_audio_track(
+                video["uri"], video.get("duration") or shot.get("duration"),
+                dialogue_text)
+            video["audio_in_video"] = True
+            name = self._shot_name(ctx, shot_no)
+            row = self.assets.latest(ctx["project"]["id"], "video", name)
+            if row is not None:
+                meta = self._asset_meta(row)
+                meta.update({
+                    "audio_in_video": True,
+                    "technical_frame_fallback": True,
+                    "technical_voice_mode": mode,
+                })
+                self.db.execute(
+                    "UPDATE assets SET meta=? WHERE id=?",
+                    (json.dumps(meta, ensure_ascii=False), row["id"]))
+            self.log.warn(
+                "director",
+                f"镜头{shot_no}技术兜底已补齐内嵌音轨({mode})，"
+                "不触发视频重生成")
+
     def _make_voice(self, ctx, line_no, line):
         result = self._call(ctx, "voice", {
             "line_no": line_no,
@@ -14867,7 +16057,7 @@ class Director:
                 "duration": result.data.get("duration", 0)}
 
     def _stage_edit(self, ctx):
-        result = self._call(ctx, "edit", {
+        payload = {
             "shots": ctx["videos"],
             "voices": ctx["voices"],
             "subtitles": [] if not ctx["production_profile"]["burn_subtitles"]
@@ -14878,7 +16068,13 @@ class Director:
             "project_title": ctx["project"]["title"],
             "episode_number": ctx["episode"]["number"],
             "aspect": ctx["aspect"], **ctx["dims"],
-        }, "edit")
+        }
+        try:
+            result = self._call(ctx, "edit", payload, "edit")
+        except Exception as exc:
+            if not self._director_autonomy_enabled():
+                raise
+            result = self._local_final_composite(ctx, payload, exc)
         ctx["final_uri"] = result.uri
         ctx["edit_data"] = result.data
         self.assets.register(
@@ -14886,6 +16082,114 @@ class Director:
             f"e{ctx['episode']['number']:03d}_final", uri=result.uri,
             meta=result.data)
         return result.data
+
+    def _local_final_composite(self, ctx, payload, source_error):
+        """剪辑 Provider 不可用时按镜头顺序本地合成正式 MP4。"""
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            candidate = Path.home() / ".local" / "bin" / "ffmpeg"
+            ffmpeg = str(candidate) if candidate.exists() else ""
+        if not ffmpeg:
+            raise AifosError("剪辑 Provider 不可用且本机无 ffmpeg")
+        shots = sorted(
+            payload.get("shots") or [],
+            key=lambda item: int(item.get("shot_no") or 0))
+        sources = [Path(str(shot.get("uri") or "")) for shot in shots]
+        missing = [str(path) for path in sources if not path.exists()]
+        if missing:
+            raise AifosError("最终合成缺少镜头文件:" + "、".join(missing))
+        out_dir = Path(ctx["out_root"]) / "final"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        normalized_dir = out_dir / "normalized"
+        normalized_dir.mkdir(parents=True, exist_ok=True)
+        normalized = []
+        for shot, source in zip(shots, sources):
+            shot_no = int(shot.get("shot_no") or 0)
+            duration = max(0.5, float(shot.get("duration") or 0.5))
+            target = normalized_dir / f"shot_{shot_no:03d}.mp4"
+            probe = subprocess.run(
+                [ffmpeg, "-hide_banner", "-i", str(source)],
+                capture_output=True, text=True, timeout=30, check=False)
+            has_audio = "Audio:" in probe.stderr
+            video_filter = (
+                "scale=720:1280:force_original_aspect_ratio=increase,"
+                "crop=720:1280,setsar=1,fps=24,"
+                f"tpad=stop_mode=clone:stop_duration={duration:.3f},"
+                "format=yuv420p")
+            command = [
+                ffmpeg, "-y", "-loglevel", "error", "-i", str(source)]
+            if not has_audio:
+                command += [
+                    "-f", "lavfi", "-t", f"{duration:.3f}",
+                    "-i", "anullsrc=r=48000:cl=stereo"]
+            command += [
+                "-map", "0:v:0",
+                "-map", "0:a:0" if has_audio else "1:a:0",
+                "-vf", video_filter,
+                "-af", (
+                    "aresample=48000:async=1:first_pts=0,"
+                    f"apad=pad_dur={duration:.3f}"),
+                "-t", f"{duration:.3f}",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                "-pix_fmt", "yuv420p", "-r", "24",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                "-movflags", "+faststart", str(target),
+            ]
+            proc = subprocess.run(
+                command, capture_output=True, text=True, timeout=600,
+                check=False)
+            if (proc.returncode != 0 or not target.exists()
+                    or target.stat().st_size <= 0):
+                raise AifosError(
+                    f"镜头{shot_no}技术规范化失败:"
+                    + proc.stderr.strip()[:1000])
+            normalized.append(target)
+        concat_file = out_dir / "concat.txt"
+        concat_file.write_text("".join(
+            "file '" + str(path.resolve()).replace("'", "'\\''") + "'\n"
+            for path in normalized), encoding="utf-8")
+        output = out_dir / (
+            f"episode_{int(ctx['episode']['number']):03d}_final.mp4")
+        command = [
+            ffmpeg, "-y", "-loglevel", "error",
+            "-f", "concat", "-safe", "0", "-i", str(concat_file),
+            "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
+            "-c", "copy", "-movflags", "+faststart", str(output),
+        ]
+        proc = subprocess.run(
+            command, capture_output=True, text=True, timeout=600,
+            check=False)
+        if proc.returncode != 0 or not output.exists() or output.stat().st_size <= 0:
+            raise AifosError(
+                "FFmpeg最终合成失败:" + proc.stderr.strip()[:1000])
+        decode = subprocess.run(
+            [ffmpeg, "-v", "error", "-i", str(output),
+             "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=600, check=False)
+        if decode.returncode != 0 or decode.stderr.strip():
+            raise AifosError(
+                "FFmpeg最终成片解码未通过:" + decode.stderr.strip()[:1000])
+        total_duration = round(sum(
+            float(shot.get("duration") or 0) for shot in shots), 3)
+        self.log.warn(
+            "director",
+            "剪辑 Provider 不可用，AI导演已按冻结镜头顺序用 FFmpeg "
+            f"合成正式 MP4；原始错误:{str(source_error)[:240]}")
+        return SimpleNamespace(
+            provider="local_ffmpeg_edit", cost=0.0, uri=str(output),
+            model="ffmpeg-concat",
+            data={
+                "final_composite": True,
+                "provider": "local_ffmpeg_edit",
+                "clips": len(sources),
+                "total_duration": total_duration,
+                "width": 720,
+                "height": 1280,
+                "fps": 24,
+                "audio_sample_rate": 48000,
+                "audio_embedded": True,
+                "source_error": str(source_error)[:1000],
+            })
 
     def _video_qc_path(self, ctx):
         return ctx["out_root"] / "video_qc_report.json"
@@ -15516,6 +16820,97 @@ class Director:
 
     def _stage_qc(self, ctx):
         """自动检查 + 图文检查板 + 逐段内容复核 + 交付脚本。"""
+        if self._preview_qc_bypass_enabled():
+            # 让流水线继续到可播放产物，同时把“未做内容检查”写进所有
+            # 机器可读报告，绝不伪造分数或检查 PASS。导演自主模式产物
+            # 是用户授权的最终合成，不标记成临时预览。
+            autonomy = self._director_autonomy_enabled()
+            skipped_at = now()
+            content_review = {
+                "schema": "aifos.content-review/v1",
+                "passed": False,
+                "preview_only": not autonomy,
+                "inspection_waived": autonomy,
+                "skipped": True,
+                "reason": (
+                    "用户授权AI导演全权处理并直接最终合成"
+                    if autonomy else
+                    "用户要求临时关闭质检，先查看预览成片效果"),
+                "units": [],
+                "updated_at": skipped_at,
+            }
+            report = {
+                "schema": (
+                    "aifos.director-autonomy/v1" if autonomy
+                    else "aifos.preview-qc-bypass/v1"),
+                # passed=True 只表示允许生产阶段继续，不伪造内容检查。
+                "passed": True,
+                "formal_passed": False,
+                "preview_only": not autonomy,
+                "inspection_waived": autonomy,
+                "final_output_allowed": autonomy,
+                "skipped": True,
+                "score": None,
+                "issues": [],
+                "content_passed": False,
+                "content_review": content_review,
+                "review_board": "",
+                "delivery_check": {
+                    "passed": False, "skipped": True,
+                    "reason": "preview_qc_bypass",
+                },
+                "bypassed_checks": [
+                    "image_qc", "frames_qc", "video_qc",
+                    "content_review", "delivery_verifier"],
+                "updated_at": skipped_at,
+            }
+            video_qc = {
+                "schema": VIDEO_QC_SCHEMA,
+                "passed": False,
+                "formal_passed": False,
+                "preview_only": not autonomy,
+                "inspection_waived": autonomy,
+                "skipped": True,
+                "failed_shots": [],
+                "awaiting_human": False,
+                "awaiting_human_shots": [],
+                "global_issues": [
+                    "AI导演全权成片模式未执行视频质检"
+                    if autonomy else "预览模式未执行视频质检"],
+                "updated_at": skipped_at,
+            }
+            ctx["content_review"] = content_review
+            ctx["review_board"] = ""
+            ctx["qc_report"] = report
+            ctx["video_qc_report"] = video_qc
+            (ctx["out_root"] / "content_review.json").write_text(
+                json.dumps(content_review, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+            (ctx["out_root"] / "qc_report.json").write_text(
+                json.dumps(report, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+            self.projects.save_document(
+                ctx["episode"]["id"], "content_review", content_review)
+            self.projects.save_document(
+                ctx["episode"]["id"], "qc_report", report)
+            self._save_video_qc_report(ctx, video_qc)
+            self.log.warn(
+                "qc",
+                ("AI导演全权成片模式：图片、首尾帧、视频和内容检查均已"
+                 "按用户授权跳过；不触发返工，直接进入最终合成"
+                 if autonomy else
+                 "临时预览模式：已跳过图片、首尾帧、视频、内容与交付"
+                 "质检；当前产物仅供查看效果"))
+            return {
+                "score": None, "passed": True,
+                "formal_passed": False, "preview_only": not autonomy,
+                "inspection_waived": autonomy,
+                "final_output_allowed": autonomy,
+                "issues": 0, "content_passed": False,
+                "delivery_passed": False, "video_qc_passed": False,
+                "video_qc_awaiting_human": False,
+                "video_qc_auto_retry_limit": VIDEO_QC_AUTO_RETRIES,
+            }
         content_review = build_content_review(
             ctx["script"], self._active_storyboard(ctx), ctx["continuity"])
         content_path = ctx["out_root"] / "content_review.json"
@@ -15682,6 +17077,17 @@ class Director:
         self._stage_edit(ctx)
 
     def _stage_package(self, ctx):
+        if self._preview_qc_bypass_enabled():
+            autonomy = self._director_autonomy_enabled()
+            self.log.info(
+                "ops",
+                ("AI导演全权成片模式：最终视频已完成，跳过非必要的封面/"
+                 "标题/拆条" if autonomy else
+                 "临时预览模式：已有剪辑成片，跳过封面/标题/拆条"))
+            return {
+                "skipped": True, "preview_only": not autonomy,
+                "final_only": autonomy, "inspection_waived": autonomy,
+            }
         if not ctx.get("qc_report", {}).get("passed", False):
             self.log.warn("ops", "质检未通过,跳过封面/标题/拆条")
             return {"skipped": True}
@@ -15779,7 +17185,7 @@ class Director:
             meta=meta)
 
     def _register_completed_shot_result(
-            self, ctx, shot, quality, result):
+            self, ctx, shot, quality, result, payload=None):
         """每张关键帧通过即登记，整批后续失败也不会让它重复生成。"""
         data = getattr(result, "data", None)
         if not isinstance(data, dict):
@@ -15790,7 +17196,8 @@ class Director:
         extra = self._plan_done_extra(result)
         self._register_shot_asset(
             ctx, "image", int(shot["shot_no"]), result.uri,
-            meta=self._shot_image_meta(ctx, shot, quality, extra))
+            meta=self._shot_image_meta(
+                ctx, shot, quality, extra, payload=payload))
         data["_shot_asset_registered"] = True
 
     # ---- 剧本 AI 分析 / 制作圣经 ----
@@ -16469,10 +17876,20 @@ class Director:
                 payload=payload, revision_source=revision_source)
             old_sheet = self.assets.latest(
                 project["id"], "character_sheet", raw)
+            locked_identity = self._locked_identity(project["id"], name)
+            locked_identity_meta = self._asset_meta(locked_identity)
             new_sheet = self.assets.register(
                 project["id"], "character_sheet", raw, uri=result.uri,
                 meta={"character": name, "sheet": sheet_key,
-                      "label": label, **self._quality_meta(quality)},
+                      "label": label, **self._quality_meta(quality),
+                      "source_identity_asset_id": (
+                          locked_identity["id"] if locked_identity else None),
+                      "source_identity_version": (
+                          locked_identity["version"]
+                          if locked_identity else None),
+                      "source_candidate_asset_id": (
+                          locked_identity_meta.get("candidate_asset_id")),
+                      "file_sha256": self._file_sha256(result.uri)},
                 new_version=True)
             if old_sheet is not None:
                 self.assets.mark_superseded(
@@ -16610,7 +18027,7 @@ class Director:
                 project["id"], "image", asset_name, uri=result.uri,
                 meta=self._shot_image_meta(
                     ctx, shot, payload["quality_decision"],
-                    {"revision": payload["revision"]}),
+                    {"revision": payload["revision"]}, payload=payload),
                 new_version=True)
             formal_ready = formal_reference_allowed(
                 payload["image_quality"])
@@ -16925,9 +18342,18 @@ class Director:
                     },
                     new_version=True)
         if invalidate_scenes:
-            for location in dict.fromkeys(
-                    scene["location"]
-                    for scene in script.get("scenes", [])):
+            locations = list(dict.fromkeys(
+                scene["location"] for scene in script.get("scenes", [])))
+            # 反打/侧向/全景母版同样继承旧画风。只作废主场景图会让
+            # restyle 后的新关键帧继续引用旧风格派生视角。
+            scene_names = set(locations)
+            for row in self.assets.active_list(
+                    project["id"], kind="scene_art"):
+                name = str(row["name"] or "")
+                if any(name.startswith(f"{location}::view:")
+                       for location in locations):
+                    scene_names.add(name)
+            for location in sorted(scene_names):
                 self.assets.register(
                     project["id"], "scene_art", location, uri="",
                     meta={"invalidated": reason}, new_version=True)
@@ -19127,6 +20553,128 @@ class Director:
             episode["id"], "done" if qc.get("passed") else "qc_failed")
         return {"status": "done", "shot_no": shot_no,
                 "qc": qc, "video_qc": ctx.get("video_qc_report")}
+
+    def redo_videos(self, project_title, episode_number, shot_nos=None):
+        """Regenerate a selected set of videos once, then composite once.
+
+        This is the video-only batch path used when a global Seedance prompt
+        contract changes.  Existing images and first/last frames are reused;
+        each selected shot is submitted exactly once.  Director-autonomy mode
+        may choose a technical frame fallback after a provider failure, but it
+        never spends a second generation draw on the same shot.
+        """
+        project, episode = self._episode_ctx(project_title, episode_number)
+        script, _ = self.projects.latest_document(episode["id"], "script")
+        storyboard, _ = self.projects.latest_document(
+            episode["id"], "storyboard")
+        if not script or not storyboard:
+            raise AifosError("本集尚未完成剧本和分镜，不能批量重生成视频")
+        standard, _ = self.projects.latest_document(
+            episode["id"], "production_standard")
+        continuity, _ = self.projects.latest_document(
+            episode["id"], "continuity")
+        blocking, _ = self.projects.latest_document(episode["id"], "blocking")
+        preflight, _ = self.projects.latest_document(episode["id"], "preflight")
+        content_review, _ = self.projects.latest_document(
+            episode["id"], "content_review")
+        profile = production_profile(self.config, standard)
+        aspect = project["aspect"] or self.config.get(
+            "defaults", "aspect", default="9:16")
+        ctx = {
+            "project": dict(project), "episode": dict(episode),
+            "out_root": self._episode_dir(project, episode),
+            "aspect": aspect, "dims": ASPECT_DIMS.get(
+                aspect, ASPECT_DIMS["9:16"]), "script": script,
+            "storyboard": storyboard, "continuity": continuity or {},
+            "blocking": blocking or {}, "preflight": preflight or {},
+            "content_review": content_review or {},
+            "production_profile": profile,
+            "voice_mode": profile.get("voice", "jimeng_builtin"),
+            "lip_sync": bool(profile.get("lip_sync", True)),
+            "quality_policy": self._episode_quality_policy(episode["id"]),
+            "character_asset_policy": self.character_asset_policy(
+                episode["id"], script=script),
+            "images": [], "frames": [], "videos": [], "voices": [],
+            "subtitles": [], "video_feedback": {}, "force": False,
+        }
+        all_shots = list(storyboard.get("shots") or [])
+        available = {
+            int(shot["shot_no"]): shot for shot in all_shots
+            if shot.get("shot_no") is not None
+        }
+        if shot_nos:
+            requested = list(dict.fromkeys(int(value) for value in shot_nos))
+            missing = [value for value in requested if value not in available]
+            if missing:
+                raise AifosError(
+                    "以下镜头不存在:" + "、".join(map(str, missing)))
+        else:
+            requested = sorted(available)
+        if not requested:
+            raise AifosError("本集没有可重生成的视频镜头")
+
+        for value, shot in available.items():
+            first = self.assets.latest(
+                project["id"], "first_frame", self._shot_name(ctx, value))
+            last = self.assets.latest(
+                project["id"], "last_frame", self._shot_name(ctx, value))
+            if first is None or last is None:
+                raise AifosError(f"镜头{value}缺少首尾帧，不能重生成视频")
+            ctx["frames"].append({
+                "shot_no": value, "first": first["uri"], "last": last["uri"],
+                "image_quality": "high",
+            })
+            image = self.assets.latest(
+                project["id"], "image", self._shot_name(ctx, value))
+            if image is not None and image["uri"]:
+                ctx["images"].append({"shot_no": value, "uri": image["uri"]})
+            row = self.assets.latest(
+                project["id"], "video", self._shot_name(ctx, value))
+            if row is not None and row["uri"]:
+                meta = json.loads(row["meta"] or "{}")
+                ctx["videos"].append({
+                    "shot_no": value, "uri": row["uri"],
+                    "duration": shot.get("duration"),
+                    "provider": meta.get("provider", ""),
+                    "audio_in_video": meta.get("audio_in_video"),
+                    "video_quality": meta.get("video_quality", "medium"),
+                    "video_resolution": meta.get(
+                        "video_resolution", "720p"),
+                })
+
+        # A unique managed directory keeps the previous generation's physical
+        # files intact while the asset registry supersedes them by version.
+        batch_tag = time.strftime("%Y%m%dT%H%M%S")
+        ctx["video_out_dir"] = (
+            ctx["out_root"] / "videos" / "regens" / batch_tag)
+        ctx["video_out_dir"].mkdir(parents=True, exist_ok=True)
+        self._task_cost = 0.0
+        self._task_providers = set()
+        frames = {item["shot_no"]: item for item in ctx["frames"]}
+        tasks = [
+            self._prepare_video_call(ctx, available[value], frames)
+            for value in requested
+        ]
+        generated = self._run_videos_parallel(ctx, tasks)
+        by_shot = {int(item["shot_no"]): item for item in ctx["videos"]}
+        by_shot.update(generated)
+        ctx["videos"] = [by_shot[value] for value in sorted(by_shot)]
+        self._stage_voices(ctx)
+        self._stage_edit(ctx)
+        ctx["voice_carried"] = self._videos_carry_audio(ctx)
+        qc = self._stage_qc(ctx)
+        self.projects.set_episode_status(
+            episode["id"], "done" if qc.get("passed") else "qc_failed")
+        fallbacks = sorted(
+            int(item["shot_no"]) for item in generated.values()
+            if item.get("provider") == "technical_frame_fallback")
+        return {
+            "status": "done", "requested": requested,
+            "generated": len(generated), "fallback_shots": fallbacks,
+            "final_uri": ctx.get("final_uri", ""), "qc": qc,
+            "video_qc": ctx.get("video_qc_report"),
+            "video_out_dir": str(ctx["video_out_dir"]),
+        }
 
     def redo_placeholders(self, project_title, episode_number):
         """一键补真:把清单里落到占位产线的图,逐张用真实产线重画。

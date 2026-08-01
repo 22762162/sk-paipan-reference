@@ -101,6 +101,40 @@ _DEFAULT_GEOMETRY = {
 }
 
 
+def _semantic_height_cap(name, category):
+    """Return a conservative real-world cap for visually ambiguous objects.
+
+    A single panorama ray can overestimate an object's height when the visual
+    annotator puts ``top_v`` on a tall background object instead of the small
+    foreground object.  Desks in the production episode were consequently
+    reconstructed as 1.5 m walls and blocked an eye-level camera.  Semantic
+    caps are deliberately limited to unmistakable low object classes; tall
+    cabinets and architectural elements remain purely measured.
+    """
+    text = str(name or "")
+    if category == "furniture":
+        if (any(word in text for word in ("书案", "画案", "木案", "桌", "台面"))
+                and "档案" not in text):
+            return 1.1
+        if any(word in text for word in ("椅", "凳", "条凳")):
+            return 1.25
+    if category == "prop":
+        if any(word in text for word in ("纸", "书", "册", "卷", "牒", "信")):
+            return 0.45
+    return None
+
+
+def _effective_height(obj):
+    """Collision/prompt height, including migration for saved v2 models."""
+    try:
+        height = float((obj or {}).get("height_m") or 0.0)
+    except (TypeError, ValueError):
+        height = 0.0
+    cap = _semantic_height_cap(
+        (obj or {}).get("name"), (obj or {}).get("category"))
+    return min(height, cap) if cap is not None else height
+
+
 def _positive_number(value):
     try:
         number = float(value)
@@ -277,6 +311,12 @@ def build_object(annotation, *, capture_height=DEFAULT_CAPTURE_HEIGHT_M,
     measured_height = _positive_number(height)
     final_width = measured_width or float(defaults["width_m"])
     final_height = measured_height or float(defaults["height_m"])
+    semantic_height_cap = _semantic_height_cap(name, category)
+    semantic_height_clamped = bool(
+        semantic_height_cap is not None
+        and final_height > semantic_height_cap)
+    if semantic_height_clamped:
+        final_height = semantic_height_cap
     annotated_depth = _positive_number(annotation.get("depth_m"))
     final_depth = annotated_depth
     if final_depth is None:
@@ -320,15 +360,18 @@ def build_object(annotation, *, capture_height=DEFAULT_CAPTURE_HEIGHT_M,
         "inside_room": inside,
         "footprint_inside_room": _footprint_inside_room(footprint, room),
         "footprint_clamped": footprint_clamped,
-        "height_clamped": height_overflow,
+        "height_clamped": bool(height_overflow or semantic_height_clamped),
+        "semantic_height_cap_m": semantic_height_cap,
         "geometry_sources": {
             "position": "panorama_floor_intersection",
             "width": (
                 "panorama_angular_span"
                 if measured_width is not None else "category_default"),
             "height": (
-                "panorama_vertical_ray"
-                if measured_height is not None else "category_default"),
+                "semantic_cap_over_panorama_vertical_ray"
+                if semantic_height_clamped
+                else ("panorama_vertical_ray"
+                      if measured_height is not None else "category_default")),
             "depth": (
                 "visual_annotation"
                 if annotated_depth is not None else "category_default"),
@@ -447,6 +490,258 @@ def _point_box_gap(x, z, obj):
     return math.hypot(outside_x, outside_z)
 
 
+def _declared_actor_support(actor, obj):
+    """人物与桌椅的接触是否是分镜明确声明的表演关系。"""
+    pose_values = [
+        str(actor.get("pose_start") or ""),
+        str(actor.get("pose_end") or ""),
+    ]
+    support_values = [
+        str(actor.get("support_start") or ""),
+        str(actor.get("support_end") or ""),
+    ]
+    seated = any(
+        word in " ".join(pose_values).lower()
+        for word in ("sitting", "seated", "leaning"))
+    supported_object = any(
+        word in str(obj.get("name") or "")
+        for word in ("案", "桌", "椅", "凳"))
+    return bool(
+        supported_object and (
+            seated or any(
+                word in " ".join(support_values)
+                for word in ("座椅", "桌面", "案面"))))
+
+
+def _push_outside_box(x, z, obj, room, clearance_m):
+    """把盒体内的点移到最近的安全边，保留原来的表演位移最小。"""
+    center = obj.get("position_3d") or {}
+    ox, _oy, oz = _xyz_of(center)
+    yaw = math.radians(float(obj.get("rotation_y_deg") or 0.0))
+    cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
+    dx, dz = float(x) - ox, float(z) - oz
+    local_x = dx * cos_yaw - dz * sin_yaw
+    local_z = dx * sin_yaw + dz * cos_yaw
+    half_w = float(obj.get("width_m") or 0.6) / 2.0
+    half_d = float(obj.get("depth_m") or 0.4) / 2.0
+    clearance = float(clearance_m)
+    candidates = (
+        (-half_w - clearance, max(-half_d, min(half_d, local_z))),
+        (half_w + clearance, max(-half_d, min(half_d, local_z))),
+        (max(-half_w, min(half_w, local_x)), -half_d - clearance),
+        (max(-half_w, min(half_w, local_x)), half_d + clearance),
+    )
+    ranked = []
+    for candidate_x, candidate_z in candidates:
+        world_x = ox + candidate_x * cos_yaw + candidate_z * sin_yaw
+        world_z = oz - candidate_x * sin_yaw + candidate_z * cos_yaw
+        clamped_x, clamped_z, inside = _clamp_room(world_x, world_z, room)
+        # 优先留在房间内，再选择位移最小的一侧，避免角色瞬移。
+        ranked.append((
+            0 if inside and abs(clamped_x - world_x) < 1e-6
+            and abs(clamped_z - world_z) < 1e-6 else 1,
+            math.hypot(world_x - float(x), world_z - float(z)),
+            round(clamped_x, 3), round(clamped_z, 3),
+        ))
+    _room_penalty, _distance, safe_x, safe_z = min(ranked)
+    return safe_x, safe_z
+
+
+def repair_actor_furniture_collisions(
+        scene_model, actors, *, clearance_m=0.35):
+    """确定性修复站进已测量家具盒体的人物锚点。
+
+    只自动修复原本会成为硬阻断的物理穿模；合理的坐姿/伏案接触与仅因
+    深度估计产生的警告不动。相同坐标使用同一修复结果，因此相邻镜头的
+    end/start 连续锚点不会被随机拆开。
+    """
+    model = scene_model if isinstance(scene_model, dict) else {}
+    room = model.get("room") or {}
+    objects = [
+        obj for obj in (model.get("objects") or [])
+        if isinstance(obj, dict)
+        and obj.get("category") in ("furniture", "prop")
+        and (obj.get("geometry_sources") or {}).get("depth")
+        == "visual_annotation"
+        and (obj.get("geometry_sources") or {}).get("rotation")
+        == "visual_annotation"
+    ]
+    adjustments = []
+    cache = {}
+    for actor in (actors or []):
+        if not isinstance(actor, dict):
+            continue
+        actor_name = str(actor.get("name") or actor.get("actor_id") or "角色")
+        points = []
+        for field in ("start_3d", "end_3d"):
+            point = actor.get(field)
+            if isinstance(point, dict):
+                points.append((field, point))
+        for index, point in enumerate(actor.get("route_3d") or []):
+            if isinstance(point, dict):
+                points.append((f"route_3d[{index}]", point))
+        for field, point in points:
+            try:
+                original_x = float(point.get("x"))
+                original_z = float(point.get("z"))
+            except (TypeError, ValueError):
+                continue
+            original_key = (round(original_x, 4), round(original_z, 4))
+            if original_key in cache:
+                safe_x, safe_z, object_names = cache[original_key]
+            else:
+                safe_x, safe_z = original_x, original_z
+                object_names = []
+                # 修复点若落到第二个家具旁，做有限轮确定性消解。
+                for _iteration in range(max(1, len(objects) * 2)):
+                    changed = False
+                    for obj in objects:
+                        if (_declared_actor_support(actor, obj)
+                                or _point_box_gap(safe_x, safe_z, obj) > 0.02):
+                            continue
+                        safe_x, safe_z = _push_outside_box(
+                            safe_x, safe_z, obj, room, clearance_m)
+                        object_names.append(str(obj.get("name") or "家具"))
+                        changed = True
+                    if not changed:
+                        break
+                cache[original_key] = (safe_x, safe_z, object_names)
+            if (abs(safe_x - original_x) < 1e-6
+                    and abs(safe_z - original_z) < 1e-6):
+                continue
+            point["x"], point["z"] = safe_x, safe_z
+            adjustments.append({
+                "actor": actor_name,
+                "field": field,
+                "phase": str(point.get("phase") or field),
+                "from": {"x": round(original_x, 3),
+                         "z": round(original_z, 3)},
+                "to": {"x": safe_x, "z": safe_z},
+                "objects": list(dict.fromkeys(object_names)),
+                "clearance_m": float(clearance_m),
+            })
+    return adjustments
+
+
+def _orientation_to(camera_point, target_point):
+    """重定位机位后重算朝向，保持瞄准点不漂移。"""
+    cx, cy, cz = _xyz_of(camera_point)
+    tx, ty, tz = _xyz_of(target_point)
+    dx, dy, dz = tx - cx, ty - cy, tz - cz
+    horizontal = max(0.001, math.hypot(dx, dz))
+    return {
+        "heading_degrees": round(math.degrees(math.atan2(dx, dz)), 1),
+        "pitch_degrees": round(math.degrees(math.atan2(dy, horizontal)), 1),
+        "roll_degrees": 0.0,
+    }
+
+
+def repair_camera_furniture_collisions(
+        scene_model, camera, *, clearance_m=0.15):
+    """确定性把穿入已测量家具的机位移到最近安全边。
+
+    相机路线是 blocking 的派生几何，不应把一个可以精确求解的盒体碰撞
+    推回人工。修复只移动真正穿入“深度+朝向均由视觉标注测得”的盒体的
+    机位点；估算家具仍只警告。相同三维点统一映射，固定机位和运镜首尾
+    不会因字段副本不同而被拆开。瞄准点、焦段与运镜类型均保持不变。
+    """
+    model = scene_model if isinstance(scene_model, dict) else {}
+    camera = camera if isinstance(camera, dict) else {}
+    room = model.get("room") or {}
+    objects = [
+        obj for obj in (model.get("objects") or [])
+        if isinstance(obj, dict)
+        and obj.get("category") in ("furniture", "prop")
+        and (obj.get("geometry_sources") or {}).get("depth")
+        == "visual_annotation"
+        and (obj.get("geometry_sources") or {}).get("rotation")
+        == "visual_annotation"
+    ]
+    if not objects or not camera:
+        return []
+    points = []
+    for field in ("position_3d", "start_3d", "end_3d"):
+        point = camera.get(field)
+        if _valid_xyz_point(point):
+            points.append((field, point))
+    for index, point in enumerate(camera.get("route_3d") or []):
+        if _valid_xyz_point(point):
+            points.append((f"route_3d[{index}]", point))
+    adjustments = []
+    cache = {}
+    for field, point in points:
+        original_x, original_y, original_z = _xyz_of(point)
+        original_key = (
+            round(original_x, 4), round(original_y, 4),
+            round(original_z, 4))
+        if original_key in cache:
+            safe_x, safe_y, safe_z, object_names = cache[original_key]
+        else:
+            safe_x, safe_y, safe_z = original_x, original_y, original_z
+            object_names = []
+            # 一个安全边可能紧贴第二件家具；有限轮逐一消解，逻辑与人物
+            # 锚点修复相同，但相机保留原镜高和目标点。
+            for _iteration in range(max(1, len(objects) * 2)):
+                changed = False
+                for obj in objects:
+                    base_y = float(
+                        (obj.get("position_3d") or {}).get("y") or 0.0)
+                    top_y = base_y + _effective_height(obj)
+                    if safe_y > top_y + float(clearance_m):
+                        continue
+                    if _point_box_gap(safe_x, safe_z, obj) > 0.02:
+                        continue
+                    next_x, next_z = _push_outside_box(
+                        safe_x, safe_z, obj, room, clearance_m)
+                    if (abs(next_x - safe_x) < 1e-6
+                            and abs(next_z - safe_z) < 1e-6):
+                        # 房间边界使水平避让无进展时才抬高，避免死循环。
+                        safe_y = round(top_y + float(clearance_m) + 0.01, 3)
+                    else:
+                        safe_x, safe_z = next_x, next_z
+                    object_names.append(str(obj.get("name") or "家具"))
+                    changed = True
+                if not changed:
+                    break
+            cache[original_key] = (
+                safe_x, safe_y, safe_z, object_names)
+        if (abs(safe_x - original_x) < 1e-6
+                and abs(safe_y - original_y) < 1e-6
+                and abs(safe_z - original_z) < 1e-6):
+            continue
+        point.update({"x": safe_x, "y": safe_y, "z": safe_z})
+        adjustments.append({
+            "field": field,
+            "phase": str(point.get("phase") or field),
+            "from": {"x": round(original_x, 3),
+                     "y": round(original_y, 3),
+                     "z": round(original_z, 3)},
+            "to": {"x": safe_x, "y": safe_y, "z": safe_z},
+            "objects": list(dict.fromkeys(object_names)),
+            "clearance_m": float(clearance_m),
+        })
+    start = camera.get("start_3d") or camera.get("position_3d")
+    end = camera.get("end_3d") or start
+    target_start = camera.get("target_start_3d") or camera.get("target_3d")
+    target_end = camera.get("target_end_3d") or camera.get("target_3d")
+    if _valid_xyz_point(start):
+        camera["position_3d"] = dict(start)
+        camera["director_height_m"] = float(start["y"])
+        if _valid_xyz_point(target_start):
+            camera["orientation_start"] = _orientation_to(
+                start, target_start)
+    if _valid_xyz_point(end):
+        camera["director_end_height_m"] = float(end["y"])
+        if _valid_xyz_point(target_end):
+            camera["orientation_end"] = _orientation_to(end, target_end)
+    director_camera = camera.get("director_camera")
+    if isinstance(director_camera, dict) and _valid_xyz_point(start):
+        director_camera["height_m"] = float(start["y"])
+        if _valid_xyz_point(end):
+            director_camera["end_position_3d"] = dict(end)
+    return adjustments
+
+
 def actor_placement_issues(scene_model, actors, *, clearance_m=0.35):
     """人物站位与真实家具的物理校验:站进家具里、贴墙穿模,都在这里暴露。
 
@@ -496,8 +791,16 @@ def actor_placement_issues(scene_model, actors, *, clearance_m=0.35):
                         sources.get("depth") == "visual_annotation"
                         and sources.get("rotation") == "visual_annotation")
                     collision = gap <= 0.02
+                    # A seated/leaning performer at a declared desk or chair
+                    # is an intentional support relationship, not a person
+                    # standing inside solid furniture.  Keep it visible as a
+                    # warning for review, while standing/kneeling collisions
+                    # remain a hard block.
+                    declared_support = _declared_actor_support(actor, obj)
                     severity = (
-                        "block" if collision and measured_box else "warning")
+                        "block"
+                        if collision and measured_box and not declared_support
+                        else "warning")
                     issues.append({
                         "severity": severity, "field": "actor_furniture",
                         "actor": name, "object": obj["name"], "phase": phase,
@@ -507,8 +810,11 @@ def actor_placement_issues(scene_model, actors, *, clearance_m=0.35):
                             "安全余量——"
                             + ("人物会站进已测量家具盒体"
                                if severity == "block"
-                               else "可能是合理接触，也可能擦碰；"
-                               "深度/朝向未完全测准时只警告，需人工看图")),
+                               else ("坐姿/伏案与已声明支撑物接触，属于表演"
+                                     "关系，仅记录不阻断"
+                                     if declared_support
+                                     else "可能是合理接触，也可能擦碰；"
+                                     "深度/朝向未完全测准时只警告，需人工看图"))),
                     })
     return issues
 
@@ -528,6 +834,13 @@ def camera_placement_issues(scene_model, camera, *, clearance_m=0.15):
             camera.get("end_3d") or camera.get("start_3d")
             or camera.get("position_3d") or {},
         ]
+    # This validator only checks geometry that actually exists.  During the
+    # storyboard stage blocking has not been built yet; treating the missing
+    # camera as {} used to manufacture a camera at (0, 0, 0), which could then
+    # collide with furniture near the panorama capture point and abort a run
+    # before any real camera had been solved.  Missing/malformed blocking is
+    # owned by the spatial-contract validator, not by furniture collision.
+    points = [point for point in points if _valid_xyz_point(point)]
     objects = [o for o in (scene_model or {}).get("objects", [])
                if o.get("category") in ("furniture", "prop")]
     room = (scene_model or {}).get("room") or {}
@@ -550,7 +863,7 @@ def camera_placement_issues(scene_model, camera, *, clearance_m=0.15):
             })
         for obj in objects:
             base_y = float((obj.get("position_3d") or {}).get("y") or 0.0)
-            top_y = base_y + float(obj.get("height_m") or 0.8)
+            top_y = base_y + _effective_height(obj)
             if cy > top_y + clearance_m:
                 continue
             gap = _point_box_gap(cx, cz, obj)
@@ -649,8 +962,9 @@ def scene_layout_clause(scene_model, camera=None, *, max_items=8):
         size = []
         if obj.get("width_m"):
             size.append(f"宽{float(obj['width_m']):.1f}米")
-        if obj.get("height_m"):
-            size.append(f"高{float(obj['height_m']):.1f}米")
+        effective_height = _effective_height(obj)
+        if effective_height:
+            size.append(f"高{effective_height:.1f}米")
         if obj.get("depth_m"):
             size.append(f"深{float(obj['depth_m']):.1f}米")
         if obj.get("rotation_y_deg") is not None:
@@ -675,6 +989,17 @@ def _xyz_of(point):
         except (TypeError, ValueError):
             return 0.0
     return num("x"), num("y"), num("z")
+
+
+def _valid_xyz_point(point):
+    """True only for an explicit finite 3D point; never invent the origin."""
+    if not isinstance(point, dict):
+        return False
+    try:
+        values = [float(point[key]) for key in ("x", "y", "z")]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return all(math.isfinite(value) for value in values)
 
 
 def occlusion_issues(scene_model, camera, actors, *, near_margin_m=0.25):

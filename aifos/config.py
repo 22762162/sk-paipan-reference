@@ -18,6 +18,14 @@ DEFAULTS = {
         "aspect": "9:16",              # 全局默认画幅(抖音竖屏);项目可设 16:9
         # Seedance 逐镜视频默认 4 路并行；可在设置页按账号限流调低/调高。
         "parallel_videos": 4,
+        # 临时预览成片模式：跳过图片/首尾帧视觉 QC、帧质检门和最终
+        # 视频/内容 QC，但保留其它生产门禁。只用于先看成片效果；正式
+        # 交付前必须关闭并重跑严格质检。
+        "preview_qc_bypass": False,
+        # AI 导演全权成片模式：不执行提示词复审、图片/首尾帧/视频内容
+        # 质检，也不因视觉判定触发重生成；优先复用断点已有选定稿，缺失
+        # 素材只生成一次，随后直接剪辑合成。仍保留文件、时序和音轨完整性。
+        "director_autonomy_mode": False,
     },
     # Codex 多实例不注册成多个 Provider，避免破坏现有 routing。旧工作区
     # 没有 profiles 时会自动把 providers.codex 映射成一个兼容 profile；
@@ -67,7 +75,7 @@ DEFAULTS = {
     # workspace 配置改变后无法还原当时使用的生成规格。
     "production": {
         "pipeline_version": "sk-manju-v5",
-        "preferred_segment_seconds": [5, 8],
+        "preferred_segment_seconds": [8, 15],
         "max_segment_seconds": 15,
         "voice": "jimeng_builtin",
         "lip_sync": True,

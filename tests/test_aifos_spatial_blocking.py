@@ -121,6 +121,36 @@ def test_group_scene_builds_routes_camera_and_continuity(tmp_path):
     assert 'data-camera-phase="fixed"' in svg
 
 
+def test_reentering_actors_with_same_inherited_point_are_spread_apart():
+    """分别在不同前镜出现的人物，可能各自把同一左侧坐标写入
+    previous_end；之后首次同框时必须按当前站位合同重新避碰。
+    """
+    one = _shot(1, ["甲"], action="甲单独站在画面左侧")
+    two = _shot(2, ["乙"], action="乙单独站在画面左侧")
+    three = _shot(3, ["甲", "乙"], action="甲乙重新同框对峙")
+    three["start_state"]["甲"]["position"] = "画面左1/3"
+    three["start_state"]["乙"]["position"] = "画面右1/3"
+    three["end_state"] = three["start_state"]
+    storyboard = {"shots": [one, two, three]}
+
+    plan = build_spatial_plan(
+        {"scenes": [{"scene_no": 1, "location": "书房"}]},
+        storyboard,
+        {"characters": [{"name": "甲"}, {"name": "乙"}],
+         "scenes": [{"name": "书房"}]})
+
+    block = shot_blocking(plan, 3)
+    starts = [actor["start"] for actor in block["actors"]]
+    prior_end = shot_blocking(plan, 2)["actors"][0]["end"]
+    assert math.dist(
+        (starts[0]["x"], starts[0]["y"]),
+        (starts[1]["x"], starts[1]["y"])) >= MIN_ACTOR_SEPARATION
+    assert next(
+        actor["start"] for actor in block["actors"]
+        if actor["name"] == "乙") == prior_end
+    assert plan["validation"]["passed"], plan["validation"]["issues"]
+
+
 def test_seedance_spatial_png_required_for_group_and_changed_camera(
         tmp_path, monkeypatch):
     # 本容器/CI 无真实 SVG 转换器:打桩转换环节,专测"该带图的镜头

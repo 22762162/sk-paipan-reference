@@ -82,6 +82,31 @@ class ImageAccelerationStore:
             "ORDER BY created_at,item_id", (episode_id,))
         return [self._row(row) for row in rows]
 
+    def prune(self, episode_id, category, valid_item_ids):
+        """Remove derived dispatch rows absent from the current full plan.
+
+        The versioned storyboard, run logs and generated assets remain intact;
+        only the active acceleration cache is pruned so a deleted/renumbered
+        shot cannot re-enter production through an old dispatch contract.
+        """
+        valid = {str(item_id) for item_id in valid_item_ids}
+        removed = []
+        with self.db.transaction(immediate=True) as conn:
+            rows = conn.execute(
+                "SELECT item_id FROM image_dispatch_contracts "
+                "WHERE episode_id=? AND category=?",
+                (episode_id, category)).fetchall()
+            for row in rows:
+                item_id = str(row["item_id"])
+                if item_id in valid:
+                    continue
+                conn.execute(
+                    "DELETE FROM image_dispatch_contracts "
+                    "WHERE episode_id=? AND item_id=?",
+                    (episode_id, item_id))
+                removed.append(item_id)
+        return removed
+
     def get(self, episode_id, item_id):
         return self._row(self.db.query_one(
             "SELECT * FROM image_dispatch_contracts "
@@ -157,4 +182,3 @@ class ImageAccelerationStore:
              "failed" if failed else "done",
              result.get("provider", ""), result.get("model", ""),
              str(error)[:500], time.time(), episode_id, item_id))
-

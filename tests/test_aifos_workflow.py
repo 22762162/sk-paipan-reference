@@ -60,8 +60,13 @@ def test_five_dimension_preflight_and_delivery(tmp_path):
             "frames", "audio", "profile"]
 
         shots = storyboard["shots"]
-        assert {"reaction", "beat"} <= {shot["kind"] for shot in shots}
-        assert all(0 < shot["duration"] <= 15 for shot in shots)
+        assert not ({"reaction", "beat"} & {shot["kind"] for shot in shots})
+        assert all(8 <= shot["duration"] <= 15 for shot in shots)
+        assert all(
+            [beat["phase"] for beat in shot["temporal_beats"]]
+            == ["setup", "main", "settle"]
+            for shot in shots)
+        assert all(shot["long_take_contract"]["enabled"] for shot in shots)
         assert all(shot["duration"] * 2 == int(shot["duration"] * 2)
                    for shot in shots)
         assert all(shot["character_count"] == len(shot["characters"])
@@ -313,6 +318,54 @@ def test_scene_beat_never_makes_dead_character_breathe():
     assert beat["characters"] == ["沈砚"]
     assert "沈砚" in beat["description"]
     assert "陈允" not in beat["description"]
+
+
+def test_long_take_policy_folds_setup_and_reaction_into_dialogue_shots():
+    from aifos.workflow import _append_performance_beats
+
+    script = {"scenes": [{
+        "scene_no": 1,
+        "characters": ["甲", "乙"],
+        "location": "县衙签押房",
+    }]}
+    raw = [
+        {"scene_no": 1, "kind": "environment", "duration": 4,
+         "description": "晨光压在案卷和官凭上", "characters": []},
+        {"scene_no": 1, "kind": "dialogue", "duration": 6,
+         "description": "甲把官凭推到案中", "characters": ["甲", "乙"],
+         "dialogue": {"character": "甲", "dialogue": "请验官凭。"}},
+        {"scene_no": 1, "kind": "dialogue", "duration": 6,
+         "description": "乙抬眼发问", "characters": ["甲", "乙"],
+         "dialogue": {"character": "乙", "dialogue": "你惯用哪只手？"}},
+    ]
+    rules = {
+        "production": {
+            "preferred_segment_seconds": [8, 15],
+            "long_take_policy": {
+                "enabled": True,
+                "preferred_seconds": [8, 15],
+            },
+        },
+        "dialogue": {"split_at_natural_pause": True,
+                     "max_chars_per_shot": 25},
+        "performance": {
+            "reaction_after_key_dialogue": False,
+            "beat_at_emotional_peak": False,
+            "physical_action_separate_shot": False,
+        },
+    }
+
+    shots = _append_performance_beats(raw, script, rules)
+
+    assert len(shots) == 2
+    assert all(8 <= shot["duration"] <= 15 for shot in shots)
+    assert "晨光压在案卷和官凭上" in shots[0]["description"]
+    assert shots[0]["embedded_performance"]["listener_reaction"][
+        "character"] == "乙"
+    assert shots[1]["embedded_performance"]["listener_reaction"][
+        "character"] == "甲"
+    assert "emotional_settle" in shots[1]["embedded_performance"]
+    assert not any(shot.get("kind") in ("reaction", "beat") for shot in shots)
 
 
 def test_saved_dead_actor_beat_is_retargeted_without_changing_shot_number():

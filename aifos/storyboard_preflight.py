@@ -29,7 +29,9 @@ KIND_FIXERS = {
     "prop_phase": "props",
     "axis_flip": "camera",
     "duration_short": "timing",
+    "duration_under_preferred": "timing",
     "duration_long": "timing",
+    "temporal_phases": "timing",
 }
 
 # Seedance 全家族时长硬下限 4 秒;2.0 世代上限 15 秒。低于下限的镜头
@@ -131,7 +133,7 @@ def _shot_upgrade_tier(shot):
     return tier in ("seedance2_5", "seedance2.5")
 
 
-def _check_duration(shot):
+def _check_duration(shot, preferred_floor=None, temporal_required=False):
     """时长越界在分镜层就是废镜:短于4秒提交必拒,超上限禁止静默截短。"""
     raw = shot.get("duration")
     if raw is None:
@@ -147,6 +149,16 @@ def _check_duration(shot):
             "视频提交必被拒收",
             "用反应拍/呼吸感/情绪留白把表演拉满到4秒以上,"
             "或与相邻镜头合并叙事")
+    if (preferred_floor and duration < preferred_floor
+            and not str(shot.get("duration_exception_reason") or (
+                shot.get("long_take_contract") or {}).get(
+                    "short_shot_exception_reason") or "").strip()):
+        return _issue(
+            shot, "duration_under_preferred",
+            f"本镜声明{duration:g}秒,低于长镜头优选下限"
+            f"{preferred_floor:g}秒且没有不可合并原因",
+            "把场景建立、必要动作、听者反应或情绪收束折入本镜;"
+            f"确需短切则写 duration_exception_reason")
     ceiling = (DURATION_MAX_UPGRADE if _shot_upgrade_tier(shot)
                else DURATION_MAX_BASELINE)
     if duration > ceiling:
@@ -157,6 +169,16 @@ def _check_duration(shot):
             f"本镜声明{duration:g}秒,超过{label},提交层禁止静默截短",
             "拆分为多镜;确属不可分割长镜头且在16-30秒内,"
             "按镜声明 video_model_tier=seedance2_5 并写明升级理由")
+    if temporal_required:
+        beats = shot.get("temporal_beats") or []
+        phases = [
+            item.get("phase") for item in beats if isinstance(item, dict)]
+        if phases != ["setup", "main", "settle"]:
+            return _issue(
+                shot, "temporal_phases",
+                "8-15秒长镜头缺少连续的setup/main/settle三阶段时间节拍",
+                "把起势、唯一主动作/对白、听者反应/情绪收束写入"
+                "temporal_beats，并连续覆盖完整duration")
     return None
 
 
@@ -222,12 +244,30 @@ def preflight_storyboard(script, storyboard, blocking=None):
     shots = [s for s in (storyboard or {}).get("shots") or []
              if isinstance(s, dict)]
     index = ((blocking or {}).get("shot_index") or {})
+    profile = (storyboard or {}).get("profile") or {}
+    rules = profile.get("rules") or {}
+    production = rules.get("production") or {}
+    policy = (profile.get("long_take_policy")
+              or production.get("long_take_policy") or {})
+    long_take = bool(policy.get("enabled", False))
+    try:
+        preferred_floor = float((
+            policy.get("preferred_seconds")
+            or profile.get("preferred_segment_seconds")
+            or production.get("preferred_segment_seconds")
+            or [8, 15])[0]) if long_take else None
+    except (IndexError, TypeError, ValueError):
+        preferred_floor = 8.0 if long_take else None
     issues = []
     previous = None
     for shot in shots:
         block = index.get(str(shot.get("shot_no"))) or {}
         for issue in (_check_capacity(shot), _check_prop_phases(shot),
-                      _check_duration(shot)):
+                      _check_duration(
+                          shot, preferred_floor,
+                          temporal_required=bool(
+                              long_take and policy.get(
+                                  "temporal_phases_required", True)))):
             if issue:
                 issues.append(issue)
         if block:

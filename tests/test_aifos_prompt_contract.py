@@ -7,6 +7,7 @@ from aifos.prompt_contract import (
     readable_text_required,
     sanitize_text_whitelist,
     shot_local_scene,
+    synchronize_shot_execution_contract,
     validate_shot_prompt_contract,
 )
 from aifos.adapters.codex_image import build_instruction
@@ -22,6 +23,7 @@ def _shot():
             "P02": {"actor_id": "P02", "name": "白芷"},
         },
         "description": "林晚把手机转向白芷，白芷抬眼看向屏幕",
+        "frame_target_policy": "legacy",
         "start_state": {
             "林晚": {"position": "左侧", "pose": "举手机", "direction": "右"},
         },
@@ -69,6 +71,7 @@ def test_compact_contract_locks_per_actor_wardrobe_and_blocks_missing_state():
             "P01": {"actor_id": "P01", "name": "沈砚"},
         },
         "description": "沈砚微微颔首",
+        "frame_target_policy": "legacy",
         "appearance_state_required": True,
         "start_state": {
             "沈砚": {
@@ -88,7 +91,7 @@ def test_compact_contract_locks_per_actor_wardrobe_and_blocks_missing_state():
     contract, prompt = compile_shot_prompt(shot, location="清河县衙门前")
     assert validate_shot_prompt_contract(contract)["passed"]
     assert "服装青官袍、乌角革带" in prompt
-    assert "头饰乌纱帽" in prompt
+    assert "头饰presence=worn,kind=official_hat,name=乌纱帽" in prompt
     assert "未写换装/摘戴/改妆动作时不得自行改变" in prompt
 
     missing = dict(shot)
@@ -98,6 +101,48 @@ def test_compact_contract_locks_per_actor_wardrobe_and_blocks_missing_state():
     verdict = validate_shot_prompt_contract(broken)
     assert verdict["passed"] is False
     assert "沈砚缺少当前镜头唯一服装状态" in verdict["issues"]
+
+
+def test_headwear_visual_contract_survives_normalization_and_rendering():
+    shot = {
+        "shot_no": 9,
+        "characters": ["顾明昭"],
+        "character_number_map": {
+            "P01": {"actor_id": "P01", "name": "顾明昭"},
+        },
+        "description": "顾明昭端坐审视官凭",
+        "frame_target_policy": "legacy",
+        "appearance_state_required": True,
+    }
+    state = {
+        "position": "书案北侧", "pose": "端坐",
+        "direction": "朝南", "wardrobe": "沉香褐窄袖比甲",
+        "headwear": {
+            "presence": "worn", "kind": "hair_ornament",
+            "name": "横向断纹旧银簪",
+            "shape": "横穿发髻的长直簪杆",
+            "material": "氧化旧银",
+            "color": "暗旧银色",
+            "placement": "横向穿过中高发髻",
+            "signature_details": "右端大号镂刻叶形端头、左端小尖饰",
+            "forbidden_variants": ["短发夹", "垂坠金钗"],
+        },
+        "hair_visibility": "fully_visible",
+        "hair_makeup": "中高扁圆髻",
+    }
+    shot["start_state"] = {"顾明昭": state}
+    shot["end_state"] = {"顾明昭": state}
+
+    contract, prompt = compile_shot_prompt(
+        shot, location="县衙验牒书房", style="写实古风", mode="image")
+
+    headwear = contract["start_appearance"]["顾明昭"]["headwear"]
+    assert headwear["shape"] == "横穿发髻的长直簪杆"
+    assert headwear["forbidden_variants"] == ["短发夹", "垂坠金钗"]
+    assert "shape=横穿发髻的长直簪杆" in prompt
+    assert "signature_details=右端大号镂刻叶形端头、左端小尖饰" in prompt
+    assert "forbidden_variants=短发夹、垂坠金钗" in prompt
+    assert "未写换装/摘戴/改妆动作时不得自行改变" in prompt
 
 
 def test_empty_scene_is_explicitly_an_empty_shot():
@@ -254,6 +299,149 @@ def test_laptop_contract_states_user_screen_and_camera_side():
     assert "禁止人物坐在屏幕背面却看到屏幕正面" in prompt
 
 
+def test_negative_device_list_does_not_reinject_laptop_contract():
+    physical = build_physical_contract({
+        "description": (
+            "古代书房内不得出现笔记本电脑、屏幕、键盘或任何现代设备；"
+            "禁止人物坐在屏幕背面；这不表示画面中存在电脑。"),
+        "action": "两人共同注视折签末端与左袖硬折的接触点",
+    })
+
+    assert not any("电脑使用关系" in rule for rule in physical["rules"])
+    assert not any("笔记本电脑" in item for item in physical["objects"])
+
+
+def test_screen_left_and_right_are_staging_not_display_devices():
+    physical = build_physical_contract({
+        "description": (
+            "沈砚舟站在屏幕左前，顾明昭端坐屏幕右后，"
+            "两人共同注视案上铜符。"),
+    })
+
+    assert not any("电脑使用关系" in rule for rule in physical["rules"])
+    assert not any("笔记本电脑" in item for item in physical["objects"])
+
+
+def test_dialogue_axis_defers_to_explicit_non_eye_gaze_target():
+    physical = build_physical_contract({
+        "description": "两人身体相向，共同注视案上铜符的缺角",
+        "spatial_blocking": {
+            "dialogue_continuity": {
+                "axis_id": "S01-P01-P02-A01",
+                "screen_left_name": "沈砚舟",
+                "screen_right_name": "顾明昭",
+                "camera_side": "positive",
+                "coverage": "双人建立镜头",
+            },
+        },
+    })
+    axis_rule = next(
+        rule for rule in physical["rules"]
+        if "双人对话180°轴线合同" in rule)
+
+    assert "本镜明确的动作目标" in axis_rule
+    assert "不得强制改成互看双眼" in axis_rule
+    assert "视线精确落在对方双眼" not in axis_rule
+
+
+def test_dialogue_axis_keeps_eye_contact_when_shot_requests_it():
+    physical = build_physical_contract({
+        "description": "两人停住动作，隔案对视",
+        "spatial_blocking": {
+            "dialogue_continuity": {
+                "axis_id": "S01-P01-P02-A01",
+                "screen_left_name": "甲",
+                "screen_right_name": "乙",
+            },
+        },
+    })
+    axis_rule = next(
+        rule for rule in physical["rules"]
+        if "双人对话180°轴线合同" in rule)
+
+    assert "视线精确落在对方双眼附近" in axis_rule
+
+
+def test_latest_screen_sides_override_stale_blocking_coordinates():
+    physical = build_physical_contract({
+        "characters": ["顾明昭", "沈砚舟"],
+        "description": (
+            "沈砚舟在屏幕左前站立，顾明昭在屏幕右后端坐，"
+            "两人共同注视案上折签接触点。"),
+        "spatial_blocking": {
+            "actors": [
+                {"name": "顾明昭", "start": {"x": 300, "y": 330},
+                 "facing": "面向沈砚舟"},
+                {"name": "沈砚舟", "start": {"x": 700, "y": 420},
+                 "facing": "面向顾明昭"},
+            ],
+            "dialogue_continuity": {
+                "axis_id": "S02-P02-P03-A01",
+                "screen_left_name": "顾明昭",
+                "screen_right_name": "沈砚舟",
+                "camera_side": "negative",
+            },
+        },
+    })
+    axis_rule = next(
+        rule for rule in physical["rules"]
+        if "双人对话180°轴线合同" in rule)
+
+    assert "沈砚舟固定成片屏幕左锚点" in axis_rule
+    assert "顾明昭固定成片屏幕右锚点" in axis_rule
+    assert not any("{'x':" in rule for rule in physical["rules"])
+
+
+def test_compact_spatial_staging_scrubs_stale_projection_after_shot_repair():
+    shot = {
+        "shot_no": 4,
+        "characters": ["顾明昭", "沈砚舟"],
+        "description": (
+            "唯一屏幕方向锁定为：沈砚舟固定在屏幕左前，"
+            "顾明昭固定在屏幕右后，两人注视折签接触点。"),
+        "camera": "9:16平视双人中景，从沈砚舟右后肩取景",
+        "frame_target": {"phase": "end", "state": "折签轻压左袖"},
+        "start_state": {},
+        "end_state": {},
+        "spatial_blocking": {
+            "actors": [
+                {"name": "顾明昭", "start_3d": {"x": -2.44, "y": 0,
+                                                   "z": -0.3},
+                 "end_3d": {"x": -2.44, "y": 0, "z": -0.3},
+                 "height_m": 1.22, "facing": "面向沈砚舟"},
+                {"name": "沈砚舟", "start_3d": {"x": 2.44, "y": 0,
+                                                   "z": 1.04},
+                 "end_3d": {"x": 2.44, "y": 0, "z": 1.04},
+                 "height_m": 1.68, "facing": "面向顾明昭"},
+            ],
+            "camera": {
+                "start_3d": {"x": 1.02, "y": 1.43, "z": -2.23},
+                "end_3d": {"x": -1.95, "y": 1.43, "z": -1.39},
+                "target_start_3d": {"x": 0, "y": 1.12, "z": 0.37},
+                "target_end_3d": {"x": 0, "y": 1.12, "z": 0.37},
+                "target_3d": {"x": 0, "y": 1.12, "z": 0.37},
+                "fov_degrees": 23.9,
+                "movement": "环绕",
+            },
+            "dialogue_continuity": {
+                "axis_id": "S02-P02-P03-A01",
+                "screen_left_name": "顾明昭",
+                "screen_right_name": "沈砚舟",
+            },
+        },
+    }
+
+    contract, prompt = compile_shot_prompt(
+        shot, location="临江县衙验牒书房", mode="image")
+    staging = contract["spatial_staging"]
+    assert "空间裁决" in staging
+    assert "沈砚舟固定成片屏幕左锚点" in staging["空间裁决"]
+    assert "顾明昭固定成片屏幕右锚点" in staging["空间裁决"]
+    assert "顾明昭在画面左侧" not in " ".join(staging.values())
+    assert "沈砚舟在画面右侧" not in " ".join(staging.values())
+    assert "【空间裁决】" in prompt
+
+
 def test_text_asset_card_compiles_layout_style_and_perspective():
     shot = _shot()
     shot.update({
@@ -314,6 +502,7 @@ def test_explicit_camera_and_single_subject_over_shoulder_are_authoritative():
     shot = {
         "characters": ["朱慈烺"],
         "description": "朱慈烺背对镜头，肩后望向案上奏疏",
+        "frame_target_policy": "legacy",
         "camera": "低机位近景单人过肩固定镜头",
         "five_dimensions": {"camera_design": {
             "shot_scale": "全景", "angle": "平视",
@@ -399,6 +588,7 @@ def test_garment_beside_actor_is_not_misread_as_worn():
     shot = {
         "characters": ["沈砚"],
         "description": "沈砚跪坐病榻前，身旁放着崭新青官袍",
+        "frame_target_policy": "legacy",
         "appearance_state_required": True,
         "start_state": {
             "沈砚": {"pose": "跪坐", "wardrobe": "布旅装"},
@@ -419,6 +609,7 @@ def test_historical_oil_lamp_gets_executable_morphology_lock():
     shot = {
         "characters": [],
         "description": "驿馆病榻旁一盏油灯将尽",
+        "frame_target_policy": "legacy",
         "era_context": "大明洪武二十四年",
     }
 
@@ -463,6 +654,7 @@ def test_survivor_may_react_when_another_actor_dies():
     shot = {
         "characters": ["陈允", "沈砚"],
         "description": "陈允咽气，沈砚眼神骤然凝住",
+        "frame_target_policy": "legacy",
         "performance": {"micro_expression": "沈砚呼吸一滞，眼神变化"},
         "start_state": {
             "陈允": {"pose": "卧床"},
@@ -491,6 +683,7 @@ def _lin_chuan_witness_shot():
         ],
         "visible_figure_count": 5,
         "description": "林川循声走到院门，放下包袱，躲到门板后",
+        "frame_target_policy": "legacy",
         "start_state": {
             "林川": {
                 "position": "院外石阶",
@@ -697,6 +890,7 @@ def test_v21_identity_reference_default_scope_is_identity_only():
         {
             "characters": ["林川"],
             "description": "林川立在门板阴影中",
+            "frame_target_policy": "legacy",
             "end_state": {"林川": {"pose": "屏息立定"}},
         },
         references=[{
@@ -723,7 +917,8 @@ def test_v21_identity_reference_default_scope_is_identity_only():
 
 def test_v21_explicit_identity_scope_cannot_leak_nonidentity_fields():
     contract, _ = compile_shot_prompt(
-        {"characters": ["林川"], "description": "林川立在院门后"},
+        {"characters": ["林川"], "description": "林川立在院门后",
+         "frame_target_policy": "legacy"},
         references=[{
             "index": 1,
             "label": "林川身份定版",
@@ -828,7 +1023,8 @@ def test_v21_spatial_relations_are_preserved_rendered_and_validated():
 
 def test_v21_conflicting_2d_and_3d_medium_fails():
     contract, _ = compile_shot_prompt(
-        {"characters": ["林川"], "description": "林川立在门后"},
+        {"characters": ["林川"], "description": "林川立在门后",
+         "frame_target_policy": "legacy"},
         style="2D手绘平涂，同时使用3D写实渲染",
         mode="image",
     )
@@ -841,7 +1037,8 @@ def test_v21_conflicting_2d_and_3d_medium_fails():
 
 def test_v21_semi_realistic_3d_is_explicitly_not_live_action_photography():
     contract, prompt = compile_shot_prompt(
-        {"characters": ["林川"], "description": "林川立在门后"},
+        {"characters": ["林川"], "description": "林川立在门后",
+         "frame_target_policy": "legacy"},
         style="电影级半写实3D精品漫剧",
         mode="image",
     )
@@ -926,6 +1123,220 @@ def test_still_model_constraints_forbid_motion_and_skip_camera_movement():
     assert "保持起点状态" not in rendered
     assert "总可见人形严格为 1 人" in rendered
     assert "【模型约束】" in image_prompt
+
+
+def test_latest_camera_compound_scale_and_lens_override_stale_nested_fields():
+    """A repair camera is authoritative even when old nested fields remain."""
+    shot = {
+        "characters": ["沈砚舟", "顾明昭"],
+        "description": "两人以右前左后错位定格，画面严格只有两名真人。",
+        "camera": (
+            "9:16，135mm平视严格侧面双人中近景，固定机位；"
+            "右前左后纵深错位三分构图，不跟移、不越轴、不变焦。"),
+        "shot_contract": {
+            "景别": "近景", "角度": "俯拍", "焦段": "85mm",
+            "机位": "正面", "运镜": "跟", "构图": "框中框",
+        },
+        "five_dimensions": {"camera_design": {
+            "shot_scale": "近景", "angle": "俯拍", "lens": "85mm",
+            "camera_position": "正面", "movement": "跟",
+            "composition": "框中框",
+        }},
+    }
+
+    contract, prompt = compile_shot_prompt(shot, mode="image")
+
+    assert contract["camera"]["景别"] == "中近景"
+    assert contract["camera"]["角度"] == "平视"
+    assert contract["camera"]["焦段"] == "135mm"
+    assert contract["camera"]["机位"] == "侧面"
+    assert contract["camera"]["运镜"] == "固定"
+    assert contract["camera"]["构图"] == "三分法"
+    assert "景别锁定为中近景" in prompt
+    assert "景别锁定为近景" not in prompt
+
+
+def test_still_physical_contract_drops_timeline_and_camera_follow_clauses():
+    shot = {
+        "characters": ["沈砚舟", "顾明昭"],
+        "description": (
+            "仅定格静态动作终点：沈砚舟已后退半步站稳；"
+            "顾明昭端坐并持纸包不动。"),
+        "camera": "135mm平视侧面双人中近景，固定机位",
+        "physical_logic": (
+            "沈砚舟从书案南缘后退半步，双手离开案面；"
+            "顾明昭坐北侧持纸包不动。"
+            "摄影机只在轴线东侧短跟沈砚舟，不跨越对视轴。"),
+    }
+
+    physical = build_physical_contract(shot, media="image")
+    rendered = "；".join(physical["rules"])
+    _, prompt = compile_shot_prompt(shot, mode="image")
+
+    assert "短跟" not in rendered
+    assert "后退半步" not in rendered
+    assert "顾明昭坐北侧持纸包不动" in rendered
+    assert "短跟" not in prompt
+    assert "景别锁定为中近景" in prompt
+
+
+def test_repaired_camera_is_synchronized_into_all_executable_contracts():
+    shot = {
+        "characters": ["沈砚舟", "顾明昭"],
+        "visible_figure_count": 2,
+        "description": "沈砚舟已后退半步站稳，顾明昭端坐持纸包不动。",
+        "camera": (
+            "135mm平视严格侧面双人中近景，固定机位；"
+            "右前左后纵深错位三分构图，不跟移、不越轴、不变焦。"),
+        "shot_contract": {
+            "景别": "近景", "角度": "俯拍", "焦段": "85mm",
+            "机位": "正面", "运镜": "跟", "构图": "框中框",
+            "风格镜头组合": "侧面跟拍",
+        },
+        "five_dimensions": {"camera_design": {
+            "shot_scale": "近景", "angle": "俯拍", "lens": "85mm",
+            "camera_position": "正面", "movement": "跟",
+            "composition": "框中框",
+        }, "aesthetics": {"shot_pattern": "侧面跟拍"}},
+        "style_direction": {
+            "shot_pattern": "侧面跟拍",
+            "camera_contract": {
+                "shot_scale": "近景", "angle": "俯拍", "lens": "85mm",
+                "camera_position": "正面", "movement": "跟",
+                "composition": "框中框",
+            },
+        },
+        "physical_logic": (
+            "沈砚舟从书案南缘后退半步，双手离开案面；"
+            "顾明昭坐北侧持纸包不动。"
+            "摄影机只在轴线东侧短跟沈砚舟，不跨越对视轴。"),
+        "prompt": "100mm侧面近景，仅短跟。",
+        "seedance_prompt": "只执行一次跟，近景俯拍。",
+    }
+
+    synchronize_shot_execution_contract(
+        shot, location="临江县衙书房", style="超写实古装短剧")
+
+    expected = {
+        "景别": "中近景", "角度": "平视", "焦段": "135mm",
+        "机位": "侧面", "运镜": "固定", "构图": "三分法",
+    }
+    assert all(shot["shot_contract"][key] == value
+               for key, value in expected.items())
+    design = shot["five_dimensions"]["camera_design"]
+    assert design["shot_scale"] == "中近景"
+    assert design["angle"] == "平视"
+    assert design["movement"] == "固定"
+    direction_camera = shot["style_direction"]["camera_contract"]
+    assert direction_camera == {
+        "shot_scale": "中近景", "angle": "平视", "lens": "135mm",
+        "camera_position": "侧面", "movement": "固定",
+        "composition": "三分法",
+    }
+    assert "短跟" not in shot["physical_logic"]
+    assert "只在轴线东侧" not in shot["physical_logic"]
+    assert "固定在当前执行机位" in shot["physical_logic"]
+    assert "短跟" not in shot["seedance_prompt"]
+    assert "景别锁定为近景" not in shot["seedance_prompt"]
+    assert "景别锁定为中近景" in shot["seedance_prompt"]
+    assert shot["prompt_contract"]["camera"]["运镜"] == "固定"
+    assert shot["prompt_contract"]["style_direction"][
+        "camera_contract"] == direction_camera
+
+    first = shot["seedance_prompt"]
+    synchronize_shot_execution_contract(
+        shot, location="临江县衙书房", style="超写实古装短剧")
+    assert shot["seedance_prompt"] == first
+
+
+def test_static_image_repair_preserves_the_original_video_action():
+    shot = {
+        "characters": ["沈砚舟", "顾明昭"],
+        "description": (
+            "仅生成单一静态终态：沈砚舟站在左侧，顾明昭端坐右侧。"),
+        "camera": "35mm平视双人中景，固定机位",
+        "prompt_contract": {
+            "action": "顾明昭旋转官凭一角，随后看向沈砚舟双手。",
+        },
+        "shot_contract": {},
+        "five_dimensions": {"camera_design": {}},
+    }
+
+    synchronize_shot_execution_contract(shot)
+
+    assert shot["video_action"] == (
+        "顾明昭旋转官凭一角，随后看向沈砚舟双手。")
+    assert shot["prompt_contract"]["action"] == shot["video_action"]
+    assert "仅生成单一静态终态" not in shot["seedance_prompt"]
+
+
+def test_repaired_camera_uses_leading_scale_not_later_depth_label():
+    shot = {
+        "characters": ["沈砚舟", "顾明昭", "赵典吏"],
+        "visible_figure_count": 3,
+        "description": "三人围绕书案完成验牒终态。",
+        "camera": (
+            "9:16平视28mm全景，固定机位。摄影机位于书案东南侧；"
+            "沈砚舟在近景南侧、顾明昭在远景北侧，三人全身入画。"),
+        "shot_contract": {
+            "景别": "中景", "角度": "平视", "焦段": "35mm",
+            "机位": "正面", "运镜": "固定", "构图": "黄金分割",
+        },
+        "five_dimensions": {"camera_design": {}},
+    }
+
+    synchronize_shot_execution_contract(shot)
+
+    assert shot["shot_contract"]["景别"] == "全景"
+    assert shot["shot_contract"]["焦段"] == "28mm"
+    assert shot["prompt_contract"]["camera"]["景别"] == "全景"
+
+
+def test_repaired_camera_ignores_negated_or_actor_lock_movement_tokens():
+    shot = {
+        "characters": ["沈砚舟", "顾明昭"],
+        "visible_figure_count": 2,
+        "description": "只呈现铜符落案后的单一终态。",
+        "prompt_block_repair": {
+            "repair_summary": "收敛为双人边缘侧脸、双手和案上铜符局部近景",
+        },
+        "frame_props": [{
+            "prop_id": "copper_token", "visibility": "visible",
+            "holder": "none",
+        }],
+        "camera": (
+            "9:16竖幅，135mm微俯东南斜侧局部近景；"
+            "顾明昭固定为屏幕右锚点；摄影机保持原定固定机位，"
+            "不推、不拉、不摇、不移、不升降、不环绕、不变焦。"),
+        "shot_contract": {
+            "景别": "中景", "角度": "平视", "焦段": "35mm",
+            "机位": "侧面", "运镜": "环绕", "构图": "荷兰角",
+        },
+        "five_dimensions": {"camera_design": {}},
+    }
+
+    synchronize_shot_execution_contract(shot)
+
+    assert shot["shot_contract"]["景别"] == "近景"
+    assert shot["shot_contract"]["角度"] == "俯拍"
+    assert shot["shot_contract"]["焦段"] == "135mm"
+    assert shot["shot_contract"]["机位"] == "侧面"
+    assert shot["shot_contract"]["运镜"] == "固定"
+    assert shot["prompt_contract"]["camera"]["运镜"] == "固定"
+
+
+def test_mobile_viewing_policy_does_not_invent_an_in_scene_phone():
+    physical = build_physical_contract({
+        "characters": ["沈砚舟", "顾明昭"],
+        "description": (
+            "铜符平贴案面，尺寸仅略作手机端可读性调整；"
+            "严格无其他人物、道具或文字。"),
+        "shot_contract": {"画面内容描述": "铜符落案后的终点静帧"},
+    }, media="image")
+
+    rendered = "；".join(physical["rules"] + physical["objects"])
+    assert "手持屏幕" not in rendered
+    assert "屏幕正面" not in rendered
 
 
 def test_model_constraints_skip_unresolved_camera_placeholders():

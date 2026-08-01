@@ -569,6 +569,22 @@ def build_instruction(capability, payload, out_dir):
              else "仅作辅助检查；")
             + (physical_rules or "人物、镜头、道具关系按当前镜头实际构图核对")
             + (f"；对象关系：{physical_objects}" if physical_objects else ""))
+        fidelity = payload.get("fidelity_policy")
+        if (isinstance(fidelity, dict)
+                and fidelity.get("schema") == "aifos.fidelity-tiers/v1"):
+            fidelity_line = (
+                "- 分级保真政策(本条决定是否重抽):"
+                f"硬一致={json.dumps(fidelity.get('critical') or [], ensure_ascii=False)}；"
+                f"允许容差={json.dumps(fidelity.get('tolerant') or [], ensure_ascii=False)}；"
+                f"自由创作={json.dumps(fidelity.get('creative') or [], ensure_ascii=False)}；"
+                f"镜头优先级={fidelity.get('camera_precedence') or ''}。"
+                "只有硬一致事实错误或普通观众可见的技术质量缺陷才可写入"
+                "critical_failures并令technical_quality_pass/visual_pass为false；"
+                "容差项和自由项必须写入advisory_issues且通过。相邻景别内的"
+                "轻微取景差、焦段数字、精确裁切、前后重叠量、衣褶发丝和"
+                "背景小物不得让physical_logic_match或spatial_logic_match变false。\n")
+        else:
+            fidelity_line = ""
         count_rule = (
             "本图为同一角色的多视角/局部设定图(四视图/特写/服装细节等):"
             "画面中出现的每个人形、头像或局部都必须是该角色同一人,"
@@ -685,7 +701,14 @@ def build_instruction(capability, payload, out_dir):
             "缺少执行所需事实，input_contract_pass 必须为 false，pass 也必须"
             "为 false，并在 targeted_prompt_patch 中给出可直接用于第二次生成"
             "的唯一明确表述。\n"
+            "同一请求的空间事实若冲突，按以下优先级裁决：带有“唯一屏幕"
+            "方向锁定”“最新镜头局部合同”“Codex最终修复合同”或【空间裁决】"
+            "的当前镜头左右表述，优先于更早生成的3D空间调度图、旧轴线字段"
+            "和旧投影标签。此时应要求清除/降级旧空间标签，绝不能反过来用"
+            "旧调度图覆盖最新镜头修订；空间图仍可保留人物对应、相对距离、"
+            "机位路径与视锥用途。\n"
             + escalation_line
+            + fidelity_line
             + "- 质检阈值：按手机竖屏正常播放观看，禁止放大像素挑刺。只有普通观众"
             "一眼可见、会影响身份识别、剧情理解或画面可信度的明显问题才失败："
             "明显错人/错性别/错人数、严重跑脸、关键服装/道具/场景/时代错误、"
@@ -722,7 +745,13 @@ def build_instruction(capability, payload, out_dir):
                 f"{name}={wardrobe}" for name, wardrobe in
                 (payload.get("expected_wardrobe") or {}).items())
                or "本镜未声明服装状态")
-            + "\n只要声明了服装状态，就必须逐人核对；无换装动作却从官服变"
+            + "\n只要声明了服装状态，就必须逐人核对；已声明为佩戴状态的帽冠、"
+            "网巾、发簪、发钗等头饰/发饰属于标志性连续性锚点，必须逐人核对"
+            "名称、类别、主轮廓、主要材质与颜色、佩戴位置和显著纹饰端头；"
+            "把长银簪简化成短小发夹、改变帽冠形制/颜色、漏画或换到另一位置，"
+            "都必须令 wardrobe_match=false 并列入 critical_failures，不得套用"
+            "“非关键配饰细差”容错。仅当该发饰被当前机位或裁切完全遮挡时才免验，"
+            "不能把本应可见却看不清当成遮挡。无换装动作却从官服变"
             "常服、漏掉帽冠或擅自改妆发，一律判失败。侧面/背面按可见服装"
             "轮廓、背片、材质、配色、头饰和发型核对，不要求正脸。\n"
             "必须点数画面实际可见人物；多一个、少一个、角色被复制或两人合成一人"
@@ -769,6 +798,9 @@ def build_instruction(capability, payload, out_dir):
             '"physical_logic_checked": true或false, "physical_logic_match": true或false, '
             '"spatial_logic_checked": true或false, "spatial_logic_match": true或false, '
             '"detected_count": 画面实际人数整数, '
+            '"technical_quality_pass": true或false, '
+            '"critical_failures": ["只列必须重抽的硬一致/技术质量错误"], '
+            '"advisory_issues": ["容差项、自由项和美学优化建议"], '
             '"issues": ["每条一句具体原因"], '
             '"image_error": {"summary":"画面错误摘要",'
             '"categories":["identity/count/camera等"],'
@@ -827,6 +859,95 @@ def _extract_json(text):
             pass
         idx = text.find("{", idx + 1)
     return None
+
+
+def _enforce_declared_headwear_qc(verdict, payload):
+    """Promote visible declared-headwear deviations to hard QC failures.
+
+    The visual reviewer occasionally describes a clearly visible deviation
+    (for example, a signature leaf terminal rendered too small) accurately,
+    but then files it under ``advisory_issues`` because the accessory remains
+    generally recognisable.  Declared headwear is an identity/continuity
+    anchor, so that tolerance is unsafe.  This deterministic guard only acts
+    when the shot has an explicit worn headwear contract and the reviewer has
+    itself reported a visible negative deviation; fully occluded details are
+    still exempt.
+    """
+    expected = payload.get("expected_wardrobe") or {}
+    if not isinstance(expected, dict) or not expected:
+        return verdict
+    declared = json.dumps(expected, ensure_ascii=False).lower()
+    anchor_terms = (
+        "头饰", "发饰", "发簪", "银簪", "簪", "网巾", "帽", "冠",
+        "额箍", "headwear", "hairpin", "headscarf", "hat", "crown",
+    )
+    if not any(term in declared for term in anchor_terms):
+        return verdict
+
+    negative_terms = (
+        "偏小", "过小", "太小", "偏短", "过短", "太短", "偏高", "过高",
+        "偏低", "过低", "不明显", "不清楚", "不清晰", "看不清", "难以辨认",
+        "缺少", "缺失", "漏画", "未画", "未出现", "未露出", "简化", "错误",
+        "不符", "不一致", "改变", "换成", "变成", "多出", "新增", "错位",
+        "位置错误", "材质错误", "颜色错误", "圆形端头", "普通横簪", "短簪",
+        "发夹", "帽檐", "顶钮", "金属装饰", "完全覆盖", "fully covered",
+        "too small", "too short", "too tall", "missing", "omitted", "wrong",
+        "simplified", "unclear", "indistinct", "extra brim", "top button",
+    )
+
+    advisories = verdict.get("advisory_issues") or []
+    if not isinstance(advisories, list):
+        return verdict
+    promoted, kept = [], []
+    for raw in advisories:
+        issue = str(raw).strip()
+        lowered = issue.lower()
+        mentions_anchor = any(term in lowered for term in anchor_terms)
+        visible_deviation = any(term in lowered for term in negative_terms)
+        occluded = (
+            "完全遮挡" in issue or "完全出画" in issue
+            or "fully occluded" in lowered or "out of frame" in lowered
+        )
+        if mentions_anchor and visible_deviation and not occluded:
+            promoted.append(issue)
+        else:
+            kept.append(raw)
+    if not promoted:
+        return verdict
+
+    failures = verdict.get("critical_failures") or []
+    if not isinstance(failures, list):
+        failures = [str(failures)]
+    for issue in promoted:
+        if issue not in failures:
+            failures.append(issue)
+    verdict["critical_failures"] = failures
+    verdict["advisory_issues"] = kept
+    verdict["pass"] = False
+    verdict["visual_pass"] = False
+    verdict["wardrobe_checked"] = True
+    verdict["wardrobe_match"] = False
+
+    image_error = verdict.get("image_error")
+    if not isinstance(image_error, dict):
+        image_error = {}
+        verdict["image_error"] = image_error
+    categories = image_error.get("categories") or []
+    if not isinstance(categories, list):
+        categories = [str(categories)]
+    if "headwear" not in categories:
+        categories.append("headwear")
+    image_error["categories"] = categories
+    evidence = image_error.get("evidence") or []
+    if not isinstance(evidence, list):
+        evidence = [str(evidence)]
+    for issue in promoted:
+        if issue not in evidence:
+            evidence.append(issue)
+    image_error["evidence"] = evidence
+    if not str(image_error.get("summary") or "").strip():
+        image_error["summary"] = "已声明头饰/发饰出现可见硬一致偏差。"
+    return verdict
 
 
 def _flags_unsupported(stderr):
@@ -1030,6 +1151,7 @@ def run(request, codex, timeout, extra_args, plain=False):
                 fallback, issues=fallback["issues"]))
             return {"ok": True, "data": fallback, "uri": "",
                     "model": "Codex 视觉质检"}
+        verdict = _enforce_declared_headwear_qc(verdict, payload)
         verdict.setdefault("issues", [])
         verdict.update(normalize_generation_diagnostics(
             verdict, issues=verdict.get("issues")))

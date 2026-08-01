@@ -38,7 +38,117 @@ from .base import Provider, ProviderResult
 from .external import run_interruptible
 
 REQUIRED_MODEL_VERSION = "seedance2.0fast_vip"
+SEEDANCE_PROMPT_CHAR_LIMIT = 4000
+SEEDANCE_PROMPT_TARGET_CHAR_LIMIT = 4000
+SEEDANCE_PHYSICS_CLAUSE = (
+    "【物理运动硬约束】人和物品道具的运动轨迹必须符合真实物理世界的运动轨迹和逻辑；"
+    "人物动作必须服从重力、惯性、关节活动范围、重心和支撑关系；物品的位移、旋转、碰撞、"
+    "抛落、接触与交接必须连续、有明确受力来源且前后状态一致；禁止漂浮、瞬移、穿模、"
+    "无支撑运动或违背因果。"
+)
 _MP4_PATTERN = re.compile(r"(https?://\S+?\.mp4|/\S+?\.mp4)")
+_PROMPT_SECTION_PATTERN = re.compile(r"(?=【[^】\n]{1,48}】)")
+
+
+def _prompt_section_label(block):
+    match = re.match(r"【([^】\n]{1,48})】", block or "")
+    return match.group(1) if match else ""
+
+
+def _shorten_prompt_block(block, limit):
+    """Shorten one labelled block while keeping its execution label visible."""
+    block = str(block or "").strip()
+    if len(block) <= limit:
+        return block
+    match = re.match(r"(【[^】\n]{1,48}】)", block)
+    marker = match.group(1) if match else ""
+    if limit <= len(marker) + 1:
+        return marker[:limit]
+    content = block[len(marker):]
+    return marker + content[:limit - len(marker) - 1].rstrip() + "…"
+
+
+def fit_seedance_prompt(prompt, limit=SEEDANCE_PROMPT_TARGET_CHAR_LIMIT):
+    """Return the exact final Seedance prompt, including every suffix, <= limit.
+
+    The full audit contract can be much longer than the provider field.  This
+    last-mile guard keeps labelled execution facts and proportionally compacts
+    long sections; it counts Unicode characters after dialogue/reference
+    clauses have been appended, so punctuation and symbols are included.
+    """
+    limit = int(limit)
+    if limit < len(SEEDANCE_PHYSICS_CLAUSE):
+        raise ProviderError(
+            "Seedance 提示词上限小于物理运动硬约束本身，禁止提交")
+    source = str(prompt or "").strip()
+    # The final clause is appended exactly once and held outside the flexible
+    # budget, so compaction can never truncate the user's physics requirement.
+    source = re.sub(
+        r"(?:\n|^)?【物理运动硬约束】[^\n]*", "", source).strip()
+    available = limit - len(SEEDANCE_PHYSICS_CLAUSE) - 1
+    if len(source) <= available:
+        fitted = f"{source}\n{SEEDANCE_PHYSICS_CLAUSE}" if source else \
+            SEEDANCE_PHYSICS_CLAUSE
+        assert len(fitted) <= limit
+        return fitted
+
+    blocks = [
+        part.strip() for part in _PROMPT_SECTION_PATTERN.split(source)
+        if part.strip()
+    ]
+    if len(blocks) <= 1:
+        fitted = source[:max(0, available - 1)].rstrip() + "…"
+        fitted = f"{fitted}\n{SEEDANCE_PHYSICS_CLAUSE}"
+        return fitted[:limit]
+
+    # Cap repetition-heavy sections first.  Every retained labelled block gets
+    # a readable minimum; the allocator then shrinks the longest blocks until
+    # the complete prompt (newlines included) fits the hard provider limit.
+    section_caps = {
+        "镜头合同v2.2": 90, "输入": 130,
+        "首尾帧职责": 300, "首尾帧硬绑定": 260, "主体": 260,
+        "人物状态合同": 220, "硬状态·强制执行": 300,
+        "非现实内心Q版叠层": 260, "场景": 220,
+        "过肩构图": 220, "单人过肩构图": 220,
+        "起点": 420, "单一主动作": 380, "表演": 180,
+        "镜头": 360, "光影": 160, "空间裁决": 240,
+        "空间站位": 220, "屏幕方向": 180, "终点": 420,
+        "道具定格": 300, "道具状态变化": 300,
+        "物理/空间逻辑": 360, "空间关系": 260,
+        "视觉媒介": 150, "画风": 150, "风格导演执行": 180,
+        "对白": 220, "有声对白": 260, "文字": 100,
+        "参考图职责": 360, "模型约束": 340, "硬约束": 340,
+        "多图参考边界": 240, "参考视频边界": 280,
+    }
+    caps = [min(len(block), section_caps.get(
+        _prompt_section_label(block), 180)) for block in blocks]
+    minimums = []
+    for block, cap in zip(blocks, caps):
+        marker = re.match(r"(【[^】\n]{1,48}】)", block)
+        marker_len = len(marker.group(1)) if marker else 0
+        minimums.append(min(cap, marker_len + 36))
+    while sum(caps) + max(0, len(caps) - 1) > available:
+        reducible = [
+            (caps[index] - minimums[index], index)
+            for index in range(len(caps))
+            if caps[index] > minimums[index]
+        ]
+        if not reducible:
+            break
+        room, index = max(reducible)
+        overflow = sum(caps) + len(caps) - 1 - available
+        caps[index] -= min(room, max(1, overflow))
+    compact = "\n".join(
+        _shorten_prompt_block(block, cap)
+        for block, cap in zip(blocks, caps)
+    )
+    if len(compact) > available:
+        compact = compact[:max(0, available - 1)].rstrip() + "…"
+    fitted = f"{compact}\n{SEEDANCE_PHYSICS_CLAUSE}"
+    if len(fitted) > limit:
+        raise ProviderError(
+            f"Seedance 提示词压缩后仍有 {len(fitted)} 字符，超过 {limit}")
+    return fitted
 
 
 class DreaminaProvider(Provider):
@@ -135,7 +245,7 @@ class DreaminaProvider(Provider):
         dialogue = payload.get("dialogue") or {}
         if self.conf.get("audio_in_video", True) and dialogue.get("dialogue"):
             # Seedance2 有声视频:台词随视频自动配音,免单独 TTS
-            prompt += (f"。让角色开口说出这句台词并自动配音"
+            prompt += (f"\n【有声对白】让角色开口说出这句台词并自动配音"
                        f"(中文自然人声,口型对应):「{dialogue['dialogue']}」")
         requested_duration = runtime["requested_duration"]
         video_quality = str(payload.get("video_quality") or "medium")
@@ -187,7 +297,7 @@ class DreaminaProvider(Provider):
         if references or reference_videos or reference_audios:
             if references:
                 prompt += (
-                    "。多图边界：图1仅为动作起点，图2仅为动作终点；"
+                    "\n【多图参考边界】图1仅为动作起点，图2仅为动作终点；"
                     "图3及之后必须逐张服从提示词内的“资产图单一职责”，"
                     "禁止把一张图同时当人物、服装、场景和画风依据，"
                     "禁止跨人物复制属性或把参考图拼贴进画面。")
@@ -195,7 +305,7 @@ class DreaminaProvider(Provider):
                 # 多人身份泄漏实测教训:实拍参考的外观先验会压过身份图。
                 # 参考视频只授权运动骨架,外观一律以图片资产为准。
                 prompt += (
-                    "。参考视频边界：视频只授权动作节奏、运动轨迹与镜头"
+                    "\n【参考视频边界】视频只授权动作节奏、运动轨迹与镜头"
                     "运动(运动骨架)，画面外观、人物身份、发型服装、场景"
                     "与光线一律以图片资产和文字提示词为准；禁止从参考"
                     "视频复制人脸、服饰、道具或场景元素。")
@@ -214,6 +324,9 @@ class DreaminaProvider(Provider):
         else:
             cmd = self._command() + [
                 "frames2video", f"--first={first}", f"--last={last}"]
+        # 最终完整字符串才是 Seedance 真正收到的提示词。长度闸门必须放在
+        # 对白、多图与参考视频条款之后，4000 计数包含所有标点和符号。
+        prompt = fit_seedance_prompt(prompt)
         cmd += [
             f"--prompt={prompt}",
             f"--duration={duration}",
@@ -222,34 +335,49 @@ class DreaminaProvider(Provider):
             f"--poll={int(self.conf.get('poll', 30))}",
         ]
         cmd += list(self.conf.get("extra_args") or [])
-        # 可中断执行:用户点「停止生成」时 2 秒内终止即梦调用
-        returncode, stdout, stderr = run_interruptible(
-            "dreamina", cmd, None, self.conf.get("timeout", 1800),
-            cancel=cancel)
         log_path = out_dir / f"shot_{shot_no:03d}.dreamina.log"
-        log_path.write_text(
-            f"$ {' '.join(cmd)}\n--- stdout ---\n{stdout}\n"
-            f"--- stderr ---\n{stderr}\n", encoding="utf-8")
-        if returncode != 0:
-            raise ProviderError(
-                f"dreamina 退出码 {returncode}: "
-                f"{stderr.strip()[:500]}")
-        uri = self._extract_uri(stdout)
-        if not uri:
-            reply = self._json_reply(stdout)
-            submit_id = str(reply.get("submit_id") or "").strip()
-            status = str(
-                reply.get("gen_status") or reply.get("status") or "").lower()
-            if submit_id and status not in ("failed", "error", "cancelled"):
-                uri = self._wait_for_video(
-                    submit_id, out_dir, log_path, started_at, cancel)
+        recovered_existing = False
+        submit_id = ""
+        if payload.get("director_autonomy_mode"):
+            submit_id = self._latest_submit_id(log_path)
+        if submit_id and not (out_dir / f"shot_{shot_no:03d}.mp4").exists():
+            recovered_existing = True
+            with log_path.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    "\n--- recover existing submit (no regeneration) ---\n"
+                    f"submit_id={submit_id}\n")
+            uri = self._wait_for_video(
+                submit_id, out_dir, log_path, time.monotonic(), cancel)
+        else:
+            # 可中断执行:用户点「停止生成」时 2 秒内终止即梦调用
+            returncode, stdout, stderr = run_interruptible(
+                "dreamina", cmd, None, self.conf.get("timeout", 1800),
+                cancel=cancel)
+            log_path.write_text(
+                f"$ {' '.join(cmd)}\n--- stdout ---\n{stdout}\n"
+                f"--- stderr ---\n{stderr}\n", encoding="utf-8")
+            if returncode != 0:
+                raise ProviderError(
+                    f"dreamina 退出码 {returncode}: "
+                    f"{stderr.strip()[:500]}")
+            uri = self._extract_uri(stdout)
+            if not uri:
+                reply = self._json_reply(stdout)
+                submit_id = str(reply.get("submit_id") or "").strip()
+                status = str(
+                    reply.get("gen_status")
+                    or reply.get("status") or "").lower()
+                if (submit_id
+                        and status not in ("failed", "error", "cancelled")):
+                    uri = self._wait_for_video(
+                        submit_id, out_dir, log_path, started_at, cancel)
         if not uri:
             raise ProviderError(
                 f"未能从 dreamina 输出解析出视频地址(详见 {log_path})")
         uri = self._ingest(uri, out_dir, shot_no)
         return ProviderResult(
             provider=self.name,
-            cost=self.cost_per_call,
+            cost=0.0 if recovered_existing else self.cost_per_call,
             data={
                 "shot_no": shot_no,
                 "duration": duration,
@@ -271,6 +399,11 @@ class DreaminaProvider(Provider):
                     "total_reference_count"],
                 "seedance_limits": runtime["limits"],
                 "reference_assets": list(payload.get("reference_assets") or []),
+                "prompt_used": prompt,
+                "prompt_char_count": len(prompt),
+                "prompt_char_limit": SEEDANCE_PROMPT_CHAR_LIMIT,
+                "prompt_target_char_limit": SEEDANCE_PROMPT_TARGET_CHAR_LIMIT,
+                "recovered_existing_submit": recovered_existing,
                 "log": str(log_path),
             },
             uri=uri,
@@ -286,6 +419,16 @@ class DreaminaProvider(Provider):
         except (TypeError, ValueError):
             return {}
         return reply if isinstance(reply, dict) else {}
+
+    @staticmethod
+    def _latest_submit_id(log_path):
+        """从旧日志恢复已提交任务，下载超时后不得重新消耗一次生成。"""
+        try:
+            text = Path(log_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return ""
+        matches = re.findall(r'"submit_id"\s*:\s*"([^"]+)"', text)
+        return matches[-1] if matches else ""
 
     def _wait_for_video(self, submit_id, out_dir, log_path, started_at,
                         cancel=None):
@@ -318,6 +461,17 @@ class DreaminaProvider(Provider):
                     f"\n--- query_result #{query_no} ---\n{stdout}\n"
                     f"--- query stderr ---\n{stderr}\n")
             if returncode != 0:
+                transient = any(token in str(stderr).lower() for token in (
+                    "context deadline exceeded", "client.timeout",
+                    "timeout", "timed out", "connection reset"))
+                if transient and time.monotonic() < deadline:
+                    with log_path.open("a", encoding="utf-8") as stream:
+                        stream.write(
+                            "--- transient download error; retry same "
+                            f"submit_id ---\n{stderr}\n")
+                    time.sleep(min(interval, max(
+                        0.0, deadline - time.monotonic())))
+                    continue
                 raise ProviderError(
                     f"dreamina query_result 退出码 {returncode}: "
                     f"{stderr.strip()[:500]}")
@@ -327,7 +481,7 @@ class DreaminaProvider(Provider):
             reply = self._json_reply(stdout)
             status = str(
                 reply.get("gen_status") or reply.get("status") or "").lower()
-            if status in ("failed", "error", "cancelled"):
+            if status in ("fail", "failed", "error", "cancelled"):
                 detail = reply.get("message") or reply.get("error") or status
                 raise ProviderError(
                     f"dreamina 任务 {submit_id} 生成失败: {detail}")

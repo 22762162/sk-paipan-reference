@@ -295,3 +295,44 @@ def test_same_prompt_candidate_group_reuses_one_codex_optimized_prompt(
         "Codex统一优化后的初始人物提示词"}
     assert all(task["payload"]["prompt_review"]["approved"]
                for task in tasks)
+
+
+def test_review_strips_audit_sentence_that_quotes_obsolete_camera_clause(
+        tmp_path):
+    source = (
+        "严格共2人：沈砚舟、顾明昭。景别锁定为中近景。"
+        "不得同时执行被作废的旧条款：【Codex 通知 AIFOS】"
+        "删除‘景别锁定为近景’，全合同只保留中近景。")
+    optimized = source + "固定机位，平视侧面。"
+    router, codex = _router(optimized)
+    payload = {
+        "shot_no": 18,
+        "prompt": source,
+        "characters": ["沈砚舟", "顾明昭"],
+        "character_count": 2,
+    }
+
+    router.call("image", payload, tmp_path)
+
+    submitted = codex.calls[1][1]["prompt"]
+    assert "景别锁定为中近景" in submitted
+    assert "景别锁定为近景" not in submitted
+    assert "被作废的旧条款" not in submitted
+
+
+def test_review_blocks_multiple_executable_scale_locks_before_image_api(
+        tmp_path):
+    source = "严格共2人：沈砚舟、顾明昭。景别锁定为中近景。"
+    optimized = source + "另一执行条款：景别锁定为近景。"
+    router, codex = _router(optimized)
+    payload = {
+        "shot_no": 18,
+        "prompt": source,
+        "characters": ["沈砚舟", "顾明昭"],
+        "character_count": 2,
+    }
+
+    with pytest.raises(ProviderError, match="同时锁定多个景别"):
+        router.call("image", payload, tmp_path)
+
+    assert [call[0] for call in codex.calls] == ["prompt_review"]

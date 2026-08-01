@@ -135,6 +135,19 @@ class GenreLookTest(unittest.TestCase):
         self.assertIn("仙侠", clause)
         self.assertIn("题材视听基调", clause)
 
+    def test_ancient_scene_wins_over_negated_modern_device_text(self):
+        self.assertEqual(
+            match_genre("超写实古风县衙，禁止现代设备"), "palace")
+
+    def test_per_shot_lighting_drops_generic_genre_camera_ideas(self):
+        clause = lighting_clause(
+            location="县衙书房", time_of_day="夜", camera="固定平视中景",
+            genre="古风权谋", include_genre_camera=False)
+        self.assertIn("宫斗/权谋", clause)
+        self.assertIn("殿内烛火", clause)
+        self.assertNotIn("缓慢俯冲", clause)
+        self.assertNotIn("中心对称", clause)
+
 
 class CameraVocabularyTest(unittest.TestCase):
     def test_all_five_dimensions_present(self):
@@ -164,6 +177,19 @@ class ContractInjectionTest(unittest.TestCase):
             mode="image")
         self.assertTrue(contract["lighting"])
         self.assertIn("【光影】", compact)
+
+    def test_project_style_camera_suggestions_do_not_override_shot(self):
+        contract, compact = compile_shot_prompt(
+            {**SHOT, "camera": "35mm平视固定双人中景",
+             "description": "县衙书房内两人对坐"},
+            location="县衙书房",
+            style=("鎏金柔雾、超写实真人古风；85mm长焦近景跟拍；"
+                   "沉香褐与象牙白低饱和色板"),
+            mode="image")
+        self.assertIn("35mm", compact)
+        self.assertNotIn("85mm", contract["style"])
+        self.assertNotIn("跟拍", contract["style"])
+        self.assertIn("低饱和色板", contract["style"])
 
     def test_non_realistic_styles_get_no_photography_terms(self):
         """Q版/二次元不塞摄影术语(与真实感层同口径)。"""

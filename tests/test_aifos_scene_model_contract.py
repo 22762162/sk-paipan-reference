@@ -166,6 +166,92 @@ def test_blocking_scene_physics_uses_real_boxes_as_a_hard_gate(scene_app):
         for issue in issues)
 
 
+def test_generated_blocking_can_auto_repair_actor_collision(scene_app):
+    app = scene_app["app"]
+    blocking, _version = app.projects.latest_document(
+        scene_app["episode"]["id"], "blocking")
+    actor = {
+        "name": "穿越者",
+        "start": {"x": 500, "y": 350},
+        "end": {"x": 500, "y": 350},
+        "route": [{"x": 500, "y": 350, "phase": "fixed"}],
+        "start_3d": {"x": 0.4, "y": 0.0, "z": 1.2},
+        "end_3d": {"x": 0.4, "y": 0.0, "z": 1.2},
+        "route_3d": [{
+            "x": 0.4, "y": 0.0, "z": 1.2, "phase": "fixed",
+        }],
+    }
+    shot = {
+        "shot_no": 5,
+        "scene_no": 1,
+        "actors": [actor],
+        "camera": {},
+    }
+    blocking["scenes"][0]["shots"] = [shot]
+    blocking["shot_index"]["5"] = json.loads(json.dumps(shot))
+
+    issues = app.director._attach_scene_physics(
+        {"project": scene_app["project"]}, blocking,
+        repair_actor_collisions=True)
+
+    assert not any(
+        issue["severity"] == "block"
+        and issue["field"] == "actor_furniture"
+        for issue in issues)
+    assert blocking["validation"]["scene_physics_adjustments"]
+    assert actor["start_3d"] == actor["end_3d"]
+    assert actor["start"] == actor["end"]
+    assert actor["route"][0]["phase"] == "fixed"
+    assert {"x": actor["route"][0]["x"], "y": actor["route"][0]["y"]} \
+        == actor["start"]
+    assert blocking["shot_index"]["5"]["actors"] == shot["actors"]
+
+
+def test_generated_blocking_can_auto_repair_camera_collision(scene_app):
+    app = scene_app["app"]
+    blocking, _version = app.projects.latest_document(
+        scene_app["episode"]["id"], "blocking")
+    camera = {
+        "start": {"x": 500, "y": 350},
+        "end": {"x": 500, "y": 350},
+        "route": [{"x": 500, "y": 350, "phase": "fixed"}],
+        "start_3d": {"x": 0.4, "y": 0.5, "z": 1.2},
+        "end_3d": {"x": 0.4, "y": 0.5, "z": 1.2},
+        "target_start_3d": {"x": 0.0, "y": 1.2, "z": 0.0},
+        "target_end_3d": {"x": 0.0, "y": 1.2, "z": 0.0},
+        "target_3d": {"x": 0.0, "y": 1.2, "z": 0.0},
+        "route_3d": [{
+            "x": 0.4, "y": 0.5, "z": 1.2, "phase": "fixed",
+        }],
+        "director_camera": {},
+    }
+    shot = {
+        "shot_no": 6,
+        "scene_no": 1,
+        "actors": [],
+        "camera": camera,
+    }
+    blocking["scenes"][0]["shots"] = [shot]
+    blocking["shot_index"]["6"] = json.loads(json.dumps(shot))
+
+    issues = app.director._attach_scene_physics(
+        {"project": scene_app["project"]}, blocking,
+        repair_actor_collisions=True)
+
+    assert not any(
+        issue["severity"] == "block"
+        and issue["field"] == "camera_furniture"
+        for issue in issues)
+    camera_adjustments = [
+        item for item in
+        blocking["validation"]["scene_physics_adjustments"]
+        if item.get("type") == "camera"]
+    assert camera_adjustments
+    assert camera["start_3d"] == camera["end_3d"]
+    assert camera["start"] == camera["end"]
+    assert blocking["shot_index"]["6"]["camera"] == camera
+
+
 def _annotation_for_ground_point(x, z, **extra):
     u, v = equirect_from_direction(
         x, -DEFAULT_CAPTURE_HEIGHT_M, z)
@@ -353,6 +439,103 @@ def test_camera_route_through_measured_real_box_is_blocked():
         issue["severity"] == "block"
         and issue["field"] == "camera_furniture"
         for issue in issues)
+
+
+def test_legacy_overheight_desk_does_not_block_camera_above_real_desk():
+    model = {
+        "room": dict(ROOM),
+        "objects": [{
+            "name": "验牒书案(大画案)",
+            "category": "furniture",
+            "position_3d": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "width_m": 1.6,
+            "depth_m": 0.8,
+            "height_m": 1.51,
+            "rotation_y_deg": 0.0,
+            "geometry_sources": {
+                "depth": "visual_annotation",
+                "rotation": "visual_annotation",
+            },
+        }],
+    }
+
+    issues = camera_placement_issues(model, {
+        "route_3d": [{
+            "x": 0.0, "y": 1.43, "z": 0.0, "phase": "fixed",
+        }],
+    })
+
+    assert not any(issue["severity"] == "block" for issue in issues)
+
+
+def test_seated_actor_at_declared_desk_support_is_not_hard_blocked():
+    from aifos.scene_model import actor_placement_issues
+
+    model = {
+        "room": dict(ROOM),
+        "objects": [{
+            "name": "帘后木案",
+            "category": "furniture",
+            "position_3d": {"x": -2.28, "y": 0.0, "z": -0.07},
+            "width_m": 0.87,
+            "depth_m": 0.6,
+            "height_m": 1.18,
+            "rotation_y_deg": 0.0,
+            "geometry_sources": {
+                "depth": "visual_annotation",
+                "rotation": "visual_annotation",
+            },
+        }],
+    }
+    actor = {
+        "name": "顾明昭",
+        "pose_start": "sitting",
+        "pose_end": "sitting",
+        "support_start": "座椅与桌面",
+        "support_end": "座椅与桌面",
+        "route_3d": [{
+            "x": -2.44, "y": 0.0, "z": -0.3, "phase": "fixed",
+        }],
+    }
+
+    issues = actor_placement_issues(model, [actor])
+
+    assert any(issue["severity"] == "warning" for issue in issues)
+    assert not any(issue["severity"] == "block" for issue in issues)
+
+
+def test_missing_camera_contract_does_not_invent_origin_collision():
+    model = {
+        "room": dict(ROOM),
+        "objects": [{
+            "name": "书案",
+            "category": "furniture",
+            "position_3d": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "width_m": 1.6,
+            "depth_m": 0.8,
+            "height_m": 0.9,
+            "rotation_y_deg": 0.0,
+            "geometry_sources": {
+                "depth": "visual_annotation",
+                "rotation": "visual_annotation",
+            },
+        }],
+    }
+
+    assert camera_placement_issues(model, {}) == []
+
+
+def test_storyboard_scene_physics_defers_placement_until_blocking(scene_app):
+    app = scene_app["app"]
+    app.config.data.setdefault("defaults", {})["space_first"] = True
+
+    result = app.director._shot_scene_physics(
+        {"project": scene_app["project"]}, "书阁", None)
+
+    assert result["passed"] is True
+    assert result["deferred_until_blocking"] is True
+    assert result["issues"] == []
+    assert result["asset_version"] > 0
 
 
 def test_frontend_box_rotation_uses_same_right_handed_signs_as_backend():
