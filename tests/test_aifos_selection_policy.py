@@ -81,14 +81,22 @@ def test_final_settings_keys_feed_the_policy_and_selection_mode_wins():
 
 def test_legacy_image_qc_is_only_used_when_new_key_is_absent():
     legacy = selection_policy_from_config({
-        "defaults": {"image_qc": False},
+        "defaults": {"selection_mode": False, "image_qc": False},
     })
     new_key_wins = selection_policy_from_config({
-        "defaults": {"image_qc": False, "image_content_qc": True},
+        "defaults": {"selection_mode": False, "image_qc": False,
+                     "image_content_qc": True},
     })
 
     assert legacy.image_content_qc_enabled is False
     assert new_key_wins.image_content_qc_enabled is True
+
+
+def test_empty_legacy_workspace_uses_new_selection_mode_default():
+    policy = selection_policy_from_config({})
+    assert policy.selection_mode_enabled is True
+    assert policy.image_content_qc_enabled is False
+    assert policy.video_content_qc_enabled is False
 
 
 def test_candidate_count_setting_rejects_any_value_other_than_four():

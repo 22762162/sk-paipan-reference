@@ -121,7 +121,9 @@ def selection_policy_from_config(
     raw_defaults = config.get("defaults", {})
     defaults = raw_defaults if isinstance(raw_defaults, Mapping) else {}
     selection_mode = _config_bool(
-        defaults.get("selection_mode", False),
+        # 新产线默认就是创作选片模式；旧 workspace 没有保存该键时也
+        # 必须获得升级后的非阻断行为。用户显式保存 False 才恢复旧偏好。
+        defaults.get("selection_mode", True),
         field="defaults.selection_mode",
     )
     image_content_qc = _config_bool(
