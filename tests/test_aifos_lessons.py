@@ -75,11 +75,18 @@ def test_unapproved_qc_observations_do_not_enter_other_shot_prompts(app):
 
 def test_qc_failure_auto_records_lesson(app, tmp_path):
     """质检失败(即使重画后通过)自动进经验库——闭环的核心。"""
+    # 新产线默认是选片模式；本测试专门验证显式开启内容QC时的旧闭环。
+    app.config.data.setdefault("defaults", {})["selection_mode"] = False
+    app.config.data["defaults"]["image_content_qc"] = True
     image = tmp_path / "shot.png"
     image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 8)
     calls = {"qc": 0}
 
     class StubRouter:
+        def review_image_prompt(self, capability, payload, out_dir,
+                                cancel=None):
+            return None
+
         def call(self, capability, payload, out_dir, cancel=None):
             if capability == "image":
                 return ProviderResult(provider="codex", cost=1.0,
@@ -106,14 +113,29 @@ def test_qc_failure_auto_records_lesson(app, tmp_path):
                     "instructions": ["只删除现代笔记本电脑"],
                     "preserve": ["人物", "构图", "古代大殿"],
                 },
+                "codex_escalation": {
+                    "aifos_action": "targeted_redraw",
+                    "reason": "删除时代错误的现代设备",
+                    "aifos_instructions": ["只删除现代笔记本电脑"],
+                },
                 "reference_adjustments": [],
             } if first else {})
             return ProviderResult(
                 provider="codex", cost=0.1,
                 data={"pass": not first,
+                      "visual_pass": not first,
+                      "input_contract_pass": not first,
                       "identity_checked": True, "identity_match": True,
                       "gender_checked": True, "gender_match": True,
+                      "wardrobe_checked": True,
+                      "wardrobe_match": True,
                       "count_checked": True, "count_match": True,
+                      "overlay_count_checked": True,
+                      "overlay_count_match": True,
+                      "physical_logic_checked": True,
+                      "physical_logic_match": True,
+                      "spatial_logic_checked": True,
+                      "spatial_logic_match": True,
                       "issues": (["镜头1古代大殿里出现了笔记本电脑"]
                                  if first else []),
                       **diagnostics})
