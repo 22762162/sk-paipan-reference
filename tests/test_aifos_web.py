@@ -186,7 +186,7 @@ def test_index_and_static(server):
     assert "质检没有通过的原因".encode() in app_js
     assert "批量优化修改".encode() in app_js
     assert "人工通过".encode() in app_js
-    assert "打开清单批量优化".encode() in app_js
+    assert "查看系统处理与可选干预".encode() in app_js
     assert b"data-image-failure-pass" in app_js
     assert b"planSelectQcFailed" in app_js
     assert b"ensureBatchRevisionCheckpoint" in app_js
@@ -195,7 +195,8 @@ def test_index_and_static(server):
     assert "出图前剧本/逻辑纠正".encode() in app_js
     assert "逻辑修正 ×".encode() in app_js
     assert b"planSemanticCorrections" in app_js
-    assert "待人工问题清单".encode() in app_js
+    assert "图片问题由系统自动接管".encode() in app_js
+    assert "无需手机逐张处理".encode() in app_js
     assert b"imageFailurePanelHtml" in app_js
     assert b"focusImageFailureShot" in app_js
     assert b"image_failures" in app_js

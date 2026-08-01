@@ -3578,7 +3578,7 @@ const CODEX_QC_ACTION_CN = {
   repair_contract: "先修镜头合同",
   split_shot: "拆分镜头动作",
   accept_current: "建议保留当前图",
-  manual_review: "人工确认",
+  manual_review: "可选人工复核",
 };
 
 function planCodexEscalation(item) {
@@ -3590,7 +3590,7 @@ function planQcBadge(item) {
   const qc = planVisibleQc(item);
   if (!qc) return "";
   if (qc.passed && qc.manual_override)
-    return `<span class="plan-st st-manual" title="人工确认通过，原质检问题仍保留在审计记录">人工通过✓</span>`;
+    return `<span class="plan-st st-manual" title="用户可选覆盖，原质检问题仍保留在审计记录">可选人工通过✓</span>`;
   if (qc.passed)
     return `<span class="plan-st st-qc-ok" title="视觉质检通过${qc.attempts > 1 ? `(重画 ${qc.attempts - 1} 次后通过)` : ""}">质检✓</span>`;
   const codex = planCodexEscalation(item);
@@ -3606,7 +3606,7 @@ function planQcIssuesHtml(item) {
   if (!qc) return "";
   if (qc.passed && qc.manual_override) {
     const issues = qc.manual_original_issues || qc.issues || [];
-    return `<div class="qc-manual-pass"><b>人工通过：</b>${esc(qc.manual_note || "问题不影响本集观感，继续后续生产")}
+    return `<div class="qc-manual-pass"><b>可选人工通过：</b>${esc(qc.manual_note || "问题不影响本集观感，继续后续生产")}
       ${issues.length ? `<span>原质检提示（已接受）：${esc(issues.join("；"))}</span>` : ""}</div>`;
   }
   if (qc.passed || !(qc.issues || []).length) return "";
@@ -3972,7 +3972,7 @@ function planItemHtml(data, item, editable) {
           title="用 AI 视觉核对这张是否符合已锁定人物/场景设定">🔍 质检这张</button></div>` : ""}
       ${canEdit && qcFailed ? `<div class="plan-qc-row">
         <button class="plan-qc-accept" data-plan-id="${esc(item.id)}"
-          title="保留原质检问题，人工确认该问题不影响本集观感">✅ 人工通过</button>
+          title="可选覆盖：保留原质检问题，并接受当前图">✅ 人工通过（可选）</button>
       </div>` : ""}
       ${planStoryContextHtml(item)}
       <details class="plan-prompt"><summary>实际发送提示词（镜头合同短版）</summary>
@@ -4969,16 +4969,16 @@ function imageFailurePanelHtml(data) {
   if (!failures.length) return "";
   const codexReviewed = failures.filter(
     (failure) => failure.codex_escalation?.status === "completed").length;
-  return `<section class="image-failure-panel" role="alert"
-    aria-label="待人工问题清单">
+  return `<section class="image-failure-panel" role="status"
+    aria-label="图片问题由系统自动接管">
     <div class="image-failure-heading">
-      <div><b>⚠ 连续失败问题清单 · ${failures.length} 张关键帧</b>
-        <span>连续两次未通过会自动交给 Codex 联合分析原图、提示词和参考图；
-          Codex 已完成 ${codexReviewed} 张，并把定向修改指令回传给 AIFOS。</span></div>
+      <div><b>🤖 系统自动接管问题图 · ${failures.length} 张关键帧</b>
+        <span>AI 会联合分析原图、提示词和参考图，自动修正提示词、补抽3张并选优；
+          Codex 已完成 ${codexReviewed} 张诊断。无需手机逐张处理。</span></div>
       <div class="image-failure-actions">
         <button type="button" class="image-failure-batch"
-          data-image-failure-batch>🛠 打开清单批量优化</button>
-        <small>失败稿不会进入正式资产或 Seedance 参考链。</small>
+          data-image-failure-batch>查看系统处理与可选干预</button>
+        <small>失败稿不会进入正式资产或 Seedance 参考链；系统会自动选择新候选。</small>
       </div>
     </div>
     <div class="image-failure-list">${failures.map((failure) => {
@@ -5011,7 +5011,7 @@ function imageFailurePanelHtml(data) {
           ${codex.status === "completed" ? `按 Codex 指令处理 · ${esc(action)}` : "跳到镜头并展开修改"}</button>
         <button type="button" class="image-failure-pass"
           data-image-failure-pass="${esc(failure.item_id || "")}">
-          ✅ 人工通过</button>
+          ✅ 人工通过（可选）</button>
         ${generationDiagnosisHtml(failure, "image")}
       </article>`;
     }).join("")}</div>
@@ -10617,13 +10617,13 @@ async function renderCanvasView(episodeId, forceView = "") {
         <b>${lastFailed ? `上次制作在「${esc(STAGE_CN[lastFailed.stage] || lastFailed.stage)}」失败 ⚠️`
           : (ep.status === "qc_failed" ? "成片质检未通过 ⚠️" : "上次制作失败 ⚠️")}</b>
         <span>${firstImageFailure
-          ? `${data.image_failures.length} 张关键帧二次质检未过，已隔离等待人工修改；其他关键帧已经继续完成，失败稿不会进入正式资产。`
+          ? `${data.image_failures.length} 张历史问题关键帧已由系统接管：自动修正提示词、补抽3张并选优；无需手机逐张处理，其他关键帧继续生产。`
           : `${lastFailed ? esc((lastFailed.error || "").slice(0, 200)) + ";" : ""}
         已完成的剧本/人物/图片/视频全部保留,点右侧按钮从断点接着做,只补缺失部分,不重复消耗额度。`}</span>
       </div>
       <button class="primary" id="btn-resume-canvas">${
         firstImageFailure
-          ? `定位并处理 ${data.image_failures.length} 张问题图`
+          ? `查看 ${data.image_failures.length} 张系统接管图（可选）`
           : "▶ 从断点继续制作"}</button>
     </div>` : ""}
     ${awaiting ? `
@@ -12033,7 +12033,7 @@ function storyboardShotIssues(data) {
     (byShot[failure.shot_no] = byShot[failure.shot_no] || []).push({
       severity: "error",
       check: "关键帧二次质检",
-      message: messages.join("；") || "自动定向修图后仍未通过，待人工修改",
+      message: messages.join("；") || "系统将自动优化提示词、补抽3张并选优",
       shot_no: failure.shot_no,
       plan_id: failure.item_id,
       revision_feedback: failure.revision_feedback || "",
@@ -12807,7 +12807,7 @@ class StoryboardCanvas {
             <span class="dur">${esc(shot.camera || "")} · ${fmt(shot.duration, 1)}s</span></div>
           <div class="desc">${esc(shot.dialogue ? `${shot.dialogue.character}:「${shot.dialogue.dialogue}」` : shot.description)}</div>
           <div class="badges">
-            ${failedKeyframe ? `<span class="badge qc">⚠ 待人工修改</span>` : ""}
+            ${failedKeyframe ? `<span class="badge qc">🤖 系统接管</span>` : ""}
             <span class="badge ${hasVideo ? "ok" : "miss"}">${hasVideo ? "✓ 视频" : "✗ 视频"}</span>
             ${shot.dialogue ? `<span class="badge ${voiceOk ? "ok" : "miss"}">${voiceOk ? "✓ 配音/口型" : "✗ 配音/口型"}</span>` : ""}
             ${issues.length ? `<span class="badge qc">⚠ 质检${issues.length}</span>` : ""}
@@ -13010,7 +13010,7 @@ class StoryboardCanvas {
       ${keyframeUrl ? `<img class="preview" src="${esc(keyframeUrl)}" alt="${
         failedKeyframe ? "二次质检失败稿" : "关键图"}">` : ""}
       ${failedKeyframe ? `<div class="issue error">[关键帧二次质检]
-        ${esc((failedKeyframe.issues || []).join("；") || "待人工修改")}</div>` : ""}
+        ${esc((failedKeyframe.issues || []).join("；") || "系统自动修正并补抽3张")}</div>` : ""}
       ${shotInlineRevisionHtml(shotNo, !!keyframeUrl, false, this.data)}
       <h4>首尾帧</h4>
       <div class="thumbs editable-frame-thumbs">
