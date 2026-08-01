@@ -81,6 +81,7 @@ def test_probe_video_reads_streams_dimensions_fps_duration_and_audio(tmp_path):
     result = probe_video(
         video, runner=runner, binary_finder=lambda _name: "/fake/ffprobe")
 
+    assert result["probe_backend"] == "ffprobe"
     assert result["probe_ok"] is True
     assert result["has_video"] is True
     assert result["has_audio"] is True
@@ -92,6 +93,7 @@ def test_probe_video_reads_streams_dimensions_fps_duration_and_audio(tmp_path):
     assert result["audio_streams"][0]["codec"] == "aac"
     assert calls[0][0][-1] == str(video)
     assert calls[0][1]["timeout"] == 30.0
+    assert len(calls) == 1, "ffprobe 成功后不得重复调用 ffmpeg"
 
 
 def test_probe_video_applies_rotation_to_display_dimensions(tmp_path):
@@ -118,7 +120,7 @@ def test_probe_video_applies_rotation_to_display_dimensions(tmp_path):
     assert result["video_streams"][0]["rotation"] == 270
 
 
-def test_ffprobe_unavailable_is_an_explicit_failure(tmp_path):
+def test_both_media_probes_unavailable_is_an_explicit_failure(tmp_path):
     video = tmp_path / "shot.mp4"
     video.write_bytes(b"video")
 
@@ -126,9 +128,100 @@ def test_ffprobe_unavailable_is_an_explicit_failure(tmp_path):
     technical = evaluate_video_technical(result)
 
     assert result["probed"] is False
-    assert result["error_code"] == "ffprobe_unavailable"
+    assert result["error_code"] == "media_probe_unavailable"
     assert technical["passed"] is False
-    assert technical["issues"][0]["code"] == "ffprobe_unavailable"
+    assert technical["issues"][0]["code"] == "media_probe_unavailable"
+
+
+def test_ffmpeg_fallback_parses_real_stream_facts_when_ffprobe_is_missing(
+        tmp_path):
+    video = tmp_path / "final.mp4"
+    video.write_bytes(b"video")
+    ffmpeg_output = """
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'final.mp4':
+  Metadata:
+    major_brand     : isom
+  Duration: 00:02:03.02, start: 0.000000, bitrate: 2048 kb/s
+  Stream #0:0[0x1](und): Video: h264 (High), yuv420p, 720x1280, 24 fps, 24 tbr
+  Stream #0:1[0x2](und): Audio: aac (LC), 48000 Hz, stereo, fltp
+Stream mapping:
+  Stream #0:0 -> #0:0 (copy)
+  Stream #0:1 -> #0:1 (copy)
+frame= 2952 fps=0.0 q=-1.0 Lsize=N/A time=00:02:03.01 bitrate=N/A speed=2e+03x
+"""
+    calls = []
+
+    def finder(name):
+        return None if name == "ffprobe" else "/fake/ffmpeg"
+
+    def runner(command, **kwargs):
+        calls.append((command, kwargs))
+        return _completed(stderr=ffmpeg_output)
+
+    result = probe_video(
+        video, runner=runner, binary_finder=finder, timeout=45)
+
+    assert result["probe_backend"] == "ffmpeg"
+    assert result["probe_ok"] is True
+    assert result["width"] == 720
+    assert result["height"] == 1280
+    assert result["fps"] == 24.0
+    assert result["duration"] == 123.02
+    assert result["has_audio"] is True
+    assert result["audio_streams"][0]["codec"] == "aac"
+    assert result["audio_streams"][0]["channels"] == 2
+    assert result["audio_streams"][0]["sample_rate"] == 48000
+    assert calls[0][0] == [
+        "/fake/ffmpeg", "-hide_banner", "-nostdin", "-i", str(video),
+        "-map", "0:v?", "-map", "0:a?", "-c", "copy",
+        "-f", "null", "-",
+    ]
+    assert calls[0][1]["timeout"] == 45
+
+
+def test_ffprobe_failure_falls_back_to_successful_ffmpeg_probe(tmp_path):
+    video = tmp_path / "shot.mp4"
+    video.write_bytes(b"video")
+    ffmpeg_output = """
+Input #0, mov,mp4, from 'shot.mp4':
+  Duration: 00:00:08.00, start: 0.000000, bitrate: 1000 kb/s
+  Stream #0:0: Video: h264, yuv420p, 720x1280, 25 fps, 25 tbr
+  Stream #0:1: Audio: aac, 44100 Hz, mono, fltp
+frame=200 time=00:00:07.96
+"""
+    calls = []
+
+    def runner(command, **_kwargs):
+        calls.append(command)
+        if command[0] == "/fake/ffprobe":
+            return _completed(stderr="invalid atom", returncode=1)
+        return _completed(stderr=ffmpeg_output)
+
+    result = probe_video(
+        video, runner=runner,
+        binary_finder=lambda name: f"/fake/{name}")
+
+    assert len(calls) == 2
+    assert result["probe_backend"] == "ffmpeg"
+    assert result["probe_ok"] is True
+    assert result["fallback_from"]["error_code"] == "ffprobe_failed"
+
+
+def test_ffmpeg_fallback_requires_successful_execution(tmp_path):
+    video = tmp_path / "broken.mp4"
+    video.write_bytes(b"broken")
+
+    result = probe_video(
+        video,
+        runner=lambda *_args, **_kwargs: _completed(
+            stderr="Invalid data found", returncode=1),
+        binary_finder=lambda name: (
+            None if name == "ffprobe" else "/fake/ffmpeg"))
+
+    assert result["probed"] is False
+    assert result["probe_ok"] is False
+    assert result["probe_backend"] == "ffmpeg"
+    assert result["error_code"] == "ffmpeg_probe_failed"
 
 
 def test_remote_url_cannot_pass_without_real_probe():

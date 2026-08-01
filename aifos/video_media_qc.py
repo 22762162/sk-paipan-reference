@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -100,6 +101,7 @@ def _probe_failure(source: Any, code: str, message: str, *,
         "schema": PROBE_SCHEMA,
         "source": str(source or ""),
         "is_remote": _is_remote(source) if is_remote is None else is_remote,
+        "probe_backend": "",
         "probed": False,
         "probe_ok": False,
         "ok": False,
@@ -116,68 +118,8 @@ def _probe_failure(source: Any, code: str, message: str, *,
     }
 
 
-def probe_video(source: Any, *, ffprobe: str = "ffprobe",
-                runner: Optional[Callable] = None,
-                binary_finder: Optional[Callable] = None,
-                timeout: float = 30.0) -> Dict[str, Any]:
-    """Probe a local path or remote URL with ffprobe.
-
-    Remote URLs are never accepted on URL shape alone.  They must complete the
-    same ffprobe command and yield a real video stream before ``probe_ok`` can
-    be true.
-    """
-    source_text = str(source or "").strip()
-    remote = _is_remote(source_text)
-    if not source_text:
-        return _probe_failure(source_text, "source_missing", "视频地址为空")
-    if not remote:
-        path = Path(source_text).expanduser()
-        if not path.is_file():
-            return _probe_failure(
-                source_text, "source_missing", f"视频文件不存在: {path}")
-
-    executable = _resolve_binary(ffprobe, binary_finder)
-    if not executable:
-        return _probe_failure(
-            source_text, "ffprobe_unavailable",
-            "ffprobe 不可用，无法实测视频流、分辨率、时长和音轨",
-            is_remote=remote)
-
-    run = runner or subprocess.run
-    command = [
-        executable,
-        "-v", "error",
-        "-show_streams",
-        "-show_format",
-        "-of", "json",
-        source_text,
-    ]
-    try:
-        completed = run(
-            command, capture_output=True, text=True, timeout=timeout,
-            check=False)
-    except subprocess.TimeoutExpired:
-        return _probe_failure(
-            source_text, "ffprobe_timeout",
-            f"ffprobe 超过 {timeout:g} 秒未完成", is_remote=remote)
-    except (FileNotFoundError, PermissionError, OSError) as exc:
-        return _probe_failure(
-            source_text, "ffprobe_unavailable",
-            f"ffprobe 无法执行: {exc}", is_remote=remote)
-
-    if completed.returncode != 0:
-        detail = str(completed.stderr or completed.stdout or "").strip()
-        return _probe_failure(
-            source_text, "ffprobe_failed",
-            "ffprobe 探测失败" + (f": {detail[:500]}" if detail else ""),
-            is_remote=remote)
-    try:
-        payload = json.loads(completed.stdout or "{}")
-    except (TypeError, ValueError) as exc:
-        return _probe_failure(
-            source_text, "ffprobe_invalid_json",
-            f"ffprobe 未返回有效 JSON: {exc}", is_remote=remote)
-
+def _probe_from_ffprobe_payload(source_text: str, remote: bool,
+                                payload: Mapping[str, Any]) -> Dict[str, Any]:
     streams = payload.get("streams") or []
     if not isinstance(streams, list):
         streams = []
@@ -228,6 +170,7 @@ def probe_video(source: Any, *, ffprobe: str = "ffprobe",
         "schema": PROBE_SCHEMA,
         "source": source_text,
         "is_remote": remote,
+        "probe_backend": "ffprobe",
         "probed": True,
         "probe_ok": has_video,
         "ok": has_video,
@@ -247,6 +190,250 @@ def probe_video(source: Any, *, ffprobe: str = "ffprobe",
                     or None,
     }
     return result
+
+
+def _run_ffprobe(source_text: str, remote: bool, executable: str,
+                 run: Callable, timeout: float) -> Dict[str, Any]:
+    command = [
+        executable,
+        "-v", "error",
+        "-show_streams",
+        "-show_format",
+        "-of", "json",
+        source_text,
+    ]
+    try:
+        completed = run(
+            command, capture_output=True, text=True, timeout=timeout,
+            check=False)
+    except subprocess.TimeoutExpired:
+        return _probe_failure(
+            source_text, "ffprobe_timeout",
+            f"ffprobe 超过 {timeout:g} 秒未完成", is_remote=remote)
+    except (FileNotFoundError, PermissionError, OSError) as exc:
+        return _probe_failure(
+            source_text, "ffprobe_unavailable",
+            f"ffprobe 无法执行: {exc}", is_remote=remote)
+    if completed.returncode != 0:
+        detail = str(completed.stderr or completed.stdout or "").strip()
+        return _probe_failure(
+            source_text, "ffprobe_failed",
+            "ffprobe 探测失败" + (f": {detail[:500]}" if detail else ""),
+            is_remote=remote)
+    try:
+        payload = json.loads(completed.stdout or "{}")
+    except (TypeError, ValueError) as exc:
+        return _probe_failure(
+            source_text, "ffprobe_invalid_json",
+            f"ffprobe 未返回有效 JSON: {exc}", is_remote=remote)
+    return _probe_from_ffprobe_payload(source_text, remote, payload)
+
+
+def _clock_seconds(value: str) -> Optional[float]:
+    match = re.fullmatch(
+        r"\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)\s*", str(value or ""))
+    if not match:
+        return None
+    hours, minutes, seconds = match.groups()
+    return _positive_float(
+        int(hours) * 3600 + int(minutes) * 60 + float(seconds))
+
+
+def _ffmpeg_duration(output: str) -> Optional[float]:
+    declared = re.search(
+        r"Duration:\s*(\d+:\d{2}:\d{2}(?:\.\d+)?)", output)
+    if declared:
+        duration = _clock_seconds(declared.group(1))
+        if duration is not None:
+            return duration
+    # Some containers report Duration:N/A but the completed null mux exposes
+    # the final demuxed timestamp.  Only use it after a successful command.
+    times = [
+        _clock_seconds(value)
+        for value in re.findall(
+            r"\btime=\s*(\d+:\d{2}:\d{2}(?:\.\d+)?)", output)
+    ]
+    valid = [value for value in times if value is not None]
+    return max(valid) if valid else None
+
+
+def _ffmpeg_rotation(output: str) -> int:
+    match = re.search(
+        r"rotation of\s+(-?\d+(?:\.\d+)?)\s+degrees", output,
+        flags=re.IGNORECASE)
+    value = _safe_float(match.group(1)) if match else None
+    return int(round(value)) % 360 if value is not None else 0
+
+
+def _ffmpeg_streams(output: str, duration: Optional[float]):
+    video_streams = []
+    audio_streams = []
+    stream_pattern = re.compile(
+        r"^\s*Stream #\d+:(\d+)(?:\[[^\]]+\])?"
+        r"(?:\([^)]*\))?:\s*(Video|Audio):\s*(.+)$",
+        flags=re.MULTILINE)
+    rotation = _ffmpeg_rotation(output)
+    for index_text, stream_type, body in stream_pattern.findall(output):
+        index = int(index_text)
+        codec = body.split(",", 1)[0].strip().split(" ", 1)[0]
+        if stream_type == "Video":
+            dimensions = re.search(
+                r"(?<!\d)(\d{2,5})x(\d{2,5})(?!\d)", body)
+            fps_match = re.search(
+                r"(?<![\d.])(\d+(?:\.\d+)?)\s+fps\b", body)
+            coded_width = int(dimensions.group(1)) if dimensions else 0
+            coded_height = int(dimensions.group(2)) if dimensions else 0
+            width, height = coded_width, coded_height
+            if rotation in {90, 270}:
+                width, height = height, width
+            video_streams.append({
+                "index": index,
+                "codec": codec,
+                "coded_width": coded_width or None,
+                "coded_height": coded_height or None,
+                "width": width or None,
+                "height": height or None,
+                "rotation": rotation,
+                "fps": (_positive_float(fps_match.group(1))
+                        if fps_match else None),
+                "duration": duration,
+                "pix_fmt": "",
+            })
+            continue
+        sample_rate = re.search(r"(?<!\d)(\d+)\s+Hz\b", body)
+        if re.search(r"\bstereo\b", body, flags=re.IGNORECASE):
+            channels = 2
+        elif re.search(r"\bmono\b", body, flags=re.IGNORECASE):
+            channels = 1
+        else:
+            surround = re.search(r"\b(\d+)\.(\d+)\b", body)
+            channels = (int(surround.group(1)) + int(surround.group(2))
+                        if surround else None)
+        audio_streams.append({
+            "index": index,
+            "codec": codec,
+            "channels": channels,
+            "sample_rate": int(sample_rate.group(1)) if sample_rate else None,
+            "duration": duration,
+        })
+    return video_streams, audio_streams
+
+
+def _run_ffmpeg_probe(source_text: str, remote: bool, executable: str,
+                      run: Callable, timeout: float) -> Dict[str, Any]:
+    """Demux all video/audio streams into the null muxer without writing."""
+    command = [
+        executable,
+        "-hide_banner", "-nostdin",
+        "-i", source_text,
+        "-map", "0:v?", "-map", "0:a?",
+        "-c", "copy", "-f", "null", "-",
+    ]
+    try:
+        completed = run(
+            command, capture_output=True, text=True, timeout=timeout,
+            check=False)
+    except subprocess.TimeoutExpired:
+        failure = _probe_failure(
+            source_text, "ffmpeg_probe_timeout",
+            f"ffmpeg 回退探测超过 {timeout:g} 秒未完成", is_remote=remote)
+        failure["probe_backend"] = "ffmpeg"
+        return failure
+    except (FileNotFoundError, PermissionError, OSError) as exc:
+        failure = _probe_failure(
+            source_text, "ffmpeg_unavailable",
+            f"ffmpeg 回退探测无法执行: {exc}", is_remote=remote)
+        failure["probe_backend"] = "ffmpeg"
+        return failure
+    output = "\n".join(filter(None, (
+        str(completed.stderr or ""), str(completed.stdout or ""))))
+    if completed.returncode != 0:
+        failure = _probe_failure(
+            source_text, "ffmpeg_probe_failed",
+            "ffmpeg 回退探测失败"
+            + (f": {output.strip()[-500:]}" if output.strip() else ""),
+            is_remote=remote)
+        failure["probe_backend"] = "ffmpeg"
+        return failure
+    duration = _ffmpeg_duration(output)
+    video_streams, audio_streams = _ffmpeg_streams(output, duration)
+    primary = video_streams[0] if video_streams else {}
+    has_video = bool(video_streams)
+    format_match = re.search(r"^Input #0,\s*([^,\n]+(?:,[^:\n]+)*),\s*from",
+                             output, flags=re.MULTILINE)
+    return {
+        "schema": PROBE_SCHEMA,
+        "source": source_text,
+        "is_remote": remote,
+        "probe_backend": "ffmpeg",
+        "probed": True,
+        "probe_ok": has_video,
+        "ok": has_video,
+        "error_code": "" if has_video else "video_stream_missing",
+        "error": "" if has_video else "ffmpeg 结果中没有视频流",
+        "has_video": has_video,
+        "has_audio": bool(audio_streams),
+        "video_streams": video_streams,
+        "audio_streams": audio_streams,
+        "width": primary.get("width"),
+        "height": primary.get("height"),
+        "fps": primary.get("fps"),
+        "duration": duration,
+        "format_name": format_match.group(1).strip() if format_match else "",
+        "format_size": None,
+        "bit_rate": None,
+    }
+
+
+def probe_video(source: Any, *, ffprobe: str = "ffprobe",
+                ffmpeg: str = "ffmpeg", runner: Optional[Callable] = None,
+                binary_finder: Optional[Callable] = None,
+                timeout: float = 30.0) -> Dict[str, Any]:
+    """Probe real media, preferring ffprobe and falling back to ffmpeg.
+
+    The ffmpeg fallback performs a complete, read-only demux into the null
+    muxer.  Remote URLs are never accepted on URL shape or declared metadata;
+    one of the two probe commands must actually succeed.
+    """
+    source_text = str(source or "").strip()
+    remote = _is_remote(source_text)
+    if not source_text:
+        return _probe_failure(source_text, "source_missing", "视频地址为空")
+    if not remote:
+        path = Path(source_text).expanduser()
+        if not path.is_file():
+            return _probe_failure(
+                source_text, "source_missing", f"视频文件不存在: {path}")
+
+    run = runner or subprocess.run
+    ffprobe_executable = _resolve_binary(ffprobe, binary_finder)
+    ffprobe_result = None
+    if ffprobe_executable:
+        ffprobe_result = _run_ffprobe(
+            source_text, remote, ffprobe_executable, run, timeout)
+        if ffprobe_result.get("probe_ok") is True:
+            return ffprobe_result
+
+    ffmpeg_executable = _resolve_binary(ffmpeg, binary_finder)
+    if ffmpeg_executable:
+        result = _run_ffmpeg_probe(
+            source_text, remote, ffmpeg_executable, run, timeout)
+        if ffprobe_result is not None:
+            result["fallback_from"] = {
+                "backend": "ffprobe",
+                "error_code": ffprobe_result.get("error_code"),
+                "error": ffprobe_result.get("error"),
+            }
+        return result
+
+    if ffprobe_result is not None:
+        ffprobe_result["fallback_error"] = (
+            "ffmpeg 不可用，无法执行受控回退探测")
+        return ffprobe_result
+    return _probe_failure(
+        source_text, "media_probe_unavailable",
+        "ffprobe 与 ffmpeg 均不可用，无法实测视频流、分辨率、"
+        "帧率、时长和音轨", is_remote=remote)
 
 
 def build_sample_points(duration: Any, fps: Any = None,
