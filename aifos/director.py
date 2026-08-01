@@ -6840,9 +6840,9 @@ class Director:
                 getattr(qc_result, "model", "") or "")
             report["score"] = self._image_qc_selection_score(report)
             result.qc = report
-            # 修订后的三张候选只负责独立成像与判分。每张失败都再次让
-            # Codex 改合同会让三张使用不同输入，失去“同一修订合同抽卡
-            # 选优”的意义；三张全败后才对最高分候选做下一轮根因分析。
+            # 修订后的四张候选只负责独立成像与判分。每张失败都再次让
+            # Codex 改合同会让四张使用不同输入，失去“同一修订合同抽卡
+            # 选优”的意义；四张全败后才对最高分候选做下一轮根因分析。
             if payload.get("_qc_candidate_only"):
                 return result
             # 第一次失败就升级 Codex:出诊断 + 改提示词,随后本轮继续按新提示词
@@ -7032,8 +7032,8 @@ class Director:
             ]
             if (capability == "image"
                     and report["consecutive_failures"] == 1):
-                # 生产规则:首图失败→Codex 修订→第二轮固定重生三张→
-                # 三张全部质检后选最符合的一张。候选共享同一修订合同，
+                # 旧严格内容QC规则:首图失败→Codex 修订→第二轮固定重生
+                # 四张→四张全部质检后选最符合的一张。候选共享同一修订合同，
                 # 不使用失败图作逐张修图基底，确保抽的是独立随机样本。
                 candidate_payload = copy.deepcopy(next_payload)
                 candidate_payload["qc_consecutive_failures_base"] = 1
@@ -7050,7 +7050,7 @@ class Director:
                 self.log.info(
                     "director",
                     f"{qc_spec.get('item_id') or '本图'}首图质检未过，"
-                    "Codex 修订已应用；第二轮固定生成3张并全量选优")
+                    "Codex 修订已应用；第二轮固定生成4张并全量选优")
                 selected = self._generate_repair_candidate_group(
                     capability, candidate_payload, out_dir, cancel, qc_spec)
                 selected.cost += float(result.cost or 0.0)
@@ -7065,7 +7065,7 @@ class Director:
                     *(report.get("issues") or []),
                     *(selected_report.get("lesson_issues") or []),
                 ]))
-                selected_report["generation_attempts"] = 4
+                selected_report["generation_attempts"] = 5
                 selected.qc = selected_report
                 return selected
             spent = result.cost

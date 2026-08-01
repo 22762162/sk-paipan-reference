@@ -455,6 +455,8 @@ def test_stage_images_seeds_stored_codex_repair_directly_into_three_draws(
 
     monkeypatch.setattr(app.director, "_plan_seed_shots", lambda _ctx: None)
     monkeypatch.setattr(app.director, "_distill_lessons", lambda _ctx: 0)
+    monkeypatch.setattr(app.director, "_generation_preflight_issues",
+                        lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         app.director, "reconcile_completed_shot_images",
         lambda _ctx: {
