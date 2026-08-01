@@ -708,7 +708,7 @@ def _wrap_deg(deg):
     return ((float(deg) + 180.0) % 360.0) - 180.0
 
 
-def _canvas_from_world(world_point):
+def canvas_from_world(world_point):
     """世界坐标(米) → 二维画布坐标。_world_point 的逆,让示意图与三维同源。"""
     try:
         wx = float(world_point.get("x", 0.0))
@@ -746,8 +746,8 @@ def _apply_director_camera(camera, shot, positions, world=None):
     solved = solve_camera_motion(
         solved, shot, subject_start=start_xz, subject_end=end_xz,
         world=world_dict)
-    camera["start"] = _canvas_from_world(solved["position_3d"])
-    camera["end"] = _canvas_from_world(solved["end_position_3d"])
+    camera["start"] = canvas_from_world(solved["position_3d"])
+    camera["end"] = canvas_from_world(solved["end_position_3d"])
     camera["moving"] = bool(solved.get("moving"))
     camera["movement"] = solved.get("movement") or camera.get("movement")
     direction = _direction(camera["start"], camera["end"])
