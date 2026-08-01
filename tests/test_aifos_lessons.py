@@ -29,7 +29,10 @@ def test_record_and_aggregate(app):
     top = lessons[0]
     assert "笔记本电脑" in top["issue"]
     assert top["count"] == 2                      # 同类问题聚合(镜头号归一)
-    assert top["categories"] == {"shot_image": 1, "frames": 1}
+    assert top["categories"]["shot_image"] == 1
+    assert top["categories"]["frames"] == 1
+    assert top["categories"]["era"] == 2
+    assert top["categories"]["prop"] == 2
     lines = lesson_lines(app.assets, project["id"])
     assert lines == []  # 质检观察未人工批准前不得污染后续提示词
     assert top["scope"] == "qc_observation"
