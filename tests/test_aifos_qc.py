@@ -1,6 +1,7 @@
 """AI 质检中心测试:各检查项与自动重跑联动。"""
 
 import base64
+import copy
 import shutil
 from dataclasses import asdict
 from pathlib import Path
@@ -519,8 +520,8 @@ def test_all_four_explicit_failures_trigger_one_three_candidate_repair(
         queue = [initial, repaired]
         calls = []
 
-        def generate(*_args, **_kwargs):
-            calls.append(1)
+        def generate(_capability, payload, _out_dir, _cancel, qc_spec):
+            calls.append((copy.deepcopy(payload), copy.deepcopy(qc_spec)))
             return queue.pop(0)
 
         def escalate(report, *_args, **_kwargs):
@@ -549,5 +550,121 @@ def test_all_four_explicit_failures_trigger_one_three_candidate_repair(
         assert group["initial_all_failed"] is True
         assert "只修正主体动作" in group["repair_instruction"]
         assert result.cost == 7.5
+    finally:
+        app.close()
+
+
+def test_three_draw_repair_replaces_conflicting_old_static_contract(
+        tmp_path, monkeypatch):
+    """Regression: episode 29 shot 02 must not append to its five-person text."""
+    app = App(tmp_path / "ws")
+    try:
+        initial = _candidate_result(
+            tmp_path, expected=4, available=4, passed=False,
+            revision=1, cost=4.0)
+        for row in initial.data["candidate_group"]["candidates"]:
+            row["issues"] = [
+                "同一小吴的驾驶、加速、解安全带、递交四个时间状态被错误拆成四具真人",
+                "手机同时要求右手亮屏显示23:10和锁屏隐藏于右袋",
+                "画面总人数同时规定严格5人和最新严格2人",
+            ]
+        repaired = _candidate_result(
+            tmp_path, expected=3, available=3, passed=False,
+            revision=2, cost=3.0)
+        queue = [initial, repaired]
+        calls = []
+
+        def generate(_capability, payload, _out_dir, _cancel, qc_spec):
+            calls.append((copy.deepcopy(payload), copy.deepcopy(qc_spec)))
+            return queue.pop(0)
+
+        instruction = (
+            "只生成当前镜头递交完成后的唯一静态终点：画面严格仅2名真人，"
+            "虞寻歌1人、小吴1人。虞寻歌系安全带坐在右前副驾驶；"
+            "小吴双手为空，站在左前驾驶侧车外，车内驾驶位为空。"
+            "手机锁屏并完全隐藏在虞寻歌风衣右袋，不显示任何时间；"
+            "白酒完全隐藏在风衣左袋。采用现代夜间轿车场景，竖屏全景、"
+            "平视、35mm、侧面固定机位。禁止增加人物、分身、亮屏手机、"
+            "递交过程、古室宫灯、字幕、Logo和水印。")
+
+        def escalate(report, *_args, **_kwargs):
+            report = dict(report)
+            report["codex_escalation"] = {
+                "instruction_to_aifos": instruction}
+            return report, 0.5
+
+        monkeypatch.setattr(
+            app.director, "_generate_image_gacha", generate)
+        monkeypatch.setattr(
+            app.director, "_escalate_failed_image_to_codex", escalate)
+        old_prompt = (
+            "【主体】虞寻歌1人；画面可见真人严格共5人。"
+            "【功能人物】小吴清醒驾驶；小吴加速；小吴解安全带；"
+            "小吴递交白酒。【文字】虞寻歌右手持亮屏手机显示23:10。"
+            "【道具定格】手机锁屏隐藏于右袋。")
+        payload = {
+            "_episode_id": "episode-test", "shot_no": 2,
+            "_candidate_revision": 1, "_contract_revision": 1,
+            "prompt": old_prompt, "prompt_compact": old_prompt,
+            "_reference_prompt_base": old_prompt,
+            "characters": ["虞寻歌"], "character_count": 1,
+            "visible_figure_count": 5,
+            "functional_figures": [
+                {"name": "小吴", "count": 1, "state": "清醒驾驶"},
+                {"name": "小吴", "count": 1, "state": "平稳加速"},
+                {"name": "小吴", "count": 1, "state": "解开安全带"},
+                {"name": "小吴", "count": 1,
+                 "state": "站在驾驶侧车外完成递交"},
+            ],
+            "readable_text": {"whitelist": ["23:10"],
+                              "carrier": "手机锁屏"},
+            "frame_target": {"phase": "end", "state": "递交完成"},
+            "reference_manifest": [{
+                "index": 1, "role": "identity", "character": "虞寻歌",
+                "label": "虞寻歌最终立绘", "uri": "/refs/yxg.png",
+            }, {
+                "index": 2, "role": "scene", "label": "现代轿车基准图",
+                "uri": "/refs/car.png",
+            }],
+            "composition_contract": {
+                "expected_visible_figure_count": 5,
+                "functional_figure_count": 4,
+            },
+        }
+        qc_spec = {
+            "characters": ["虞寻歌"], "count": 5,
+            "functional_figures": copy.deepcopy(
+                payload["functional_figures"]),
+            "readable_text": copy.deepcopy(payload["readable_text"]),
+        }
+
+        result = app.director._generate_shot_candidate_group(
+            "image", payload, tmp_path, None, qc_spec)
+
+        assert len(calls) == 2
+        repair_payload, repair_qc = calls[1]
+        sent = repair_payload["prompt_compact"]
+        assert sent.startswith("【返工静态合同v1】")
+        assert old_prompt not in sent
+        assert "严格共5人" not in sent
+        assert "小吴清醒驾驶" not in sent
+        assert "小吴加速" not in sent
+        assert "右手持亮屏手机显示23:10" not in sent
+        assert "画面严格共2人" in sent
+        assert repair_payload["feedback"] == ""
+        assert repair_payload["visible_figure_count"] == 2
+        assert repair_payload["functional_figures"] == [{
+            "name": "小吴", "count": 1,
+            "state": "站在驾驶侧车外完成递交"}]
+        assert repair_payload["readable_text"] == {}
+        assert repair_payload["prompt_review_context"][
+            "visible_figure_count"] == 2
+        assert repair_qc["count"] == 2
+        assert repair_qc["readable_text"] == {}
+        assert result.data["candidate_group"]["expected_count"] == 3
+        assert result.data["candidate_group"]["selection"]["source"] == "ai"
+        assert result.data["candidate_group"]["selection"][
+            "best_effort_risk"] is True
+        assert result.qc["best_effort_promoted"] is True
     finally:
         app.close()

@@ -121,12 +121,45 @@ UNCONSCIOUS_STATE_TOKENS = (
 def _normalize_functional_figures(value):
     if isinstance(value, dict):
         value = [value]
-    return [
+    figures = [
         copy.deepcopy(item) for item in (value or [])
         if isinstance(item, dict)
         and (item.get("name") or item.get("label"))
         and type(item.get("count")) is int and item.get("count") > 0
     ]
+    # Long-take folding keeps the functional cast declarations contributed by
+    # every absorbed beat.  Those rows describe temporal states, not extra
+    # bodies: the driver before accelerating and the same driver after parking
+    # are still one person.  Collapse equal labels here, before camera capacity
+    # and visible-count contracts are derived.  ``max`` is the concurrent peak
+    # for that role; summing would incorrectly turn sequential appearances into
+    # simultaneous clones.  Keep every distinct state/function as an audit
+    # trail without repeating identical wording.
+    merged = {}
+    order = []
+    for item in figures:
+        label = str(item.get("name") or item.get("label") or "").strip()
+        if label not in merged:
+            merged[label] = copy.deepcopy(item)
+            merged[label]["count"] = item["count"]
+            order.append(label)
+            continue
+        target = merged[label]
+        target["count"] = max(target["count"], item["count"])
+        for field in ("state", "function"):
+            values = []
+            for raw in (target.get(field), item.get(field)):
+                for part in str(raw or "").split("；"):
+                    part = part.strip()
+                    if part and part not in values:
+                        values.append(part)
+            if values:
+                target[field] = "；".join(values)
+        if not target.get("name") and item.get("name"):
+            target["name"] = item["name"]
+        if not target.get("label") and item.get("label"):
+            target["label"] = item["label"]
+    return [merged[label] for label in order]
 
 
 def _functional_figure_count(value):

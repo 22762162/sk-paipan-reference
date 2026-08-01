@@ -605,6 +605,34 @@ def _frame_target(shot, mode, requested_mode=""):
                 "compatibility_policy": policy["name"],
                 "legacy_compatibility": policy["allow_legacy_fallback"],
             }
+    # 存量镜头可能没有 frame_target，但已把唯一静态道具状态明确写成
+    # phase=freeze。此时应把它理解为当前定格，而不能默认取 end 后又把
+    # 画面中真实可见的道具全部过滤掉。多 phase 镜头仍必须依赖显式
+    # frame_target，避免把 start 的亮屏手机带进 end 的隐藏终态。
+    raw_frame_props = shot.get("frame_props") or []
+    if isinstance(raw_frame_props, dict):
+        raw_frame_props = list(raw_frame_props.values())
+    prop_phases = {
+        _normalize_prop_phase(item.get("phase"))
+        for item in raw_frame_props
+        if isinstance(item, dict) and _text(item.get("phase"))
+    }
+    if prop_phases == {"freeze"}:
+        if _text(shot.get("description")):
+            source, state = "description", _text(shot.get("description"))
+        elif _text(shot.get("action")):
+            source, state = "action", _text(shot.get("action"))
+        else:
+            source, state = "default", "环境保持稳定"
+        return {
+            "phase": "freeze",
+            "state": state,
+            "source": source,
+            "fallback": True,
+            "explicit": False,
+            "compatibility_policy": policy["name"],
+            "legacy_compatibility": policy["allow_legacy_fallback"],
+        }
     state_source = "start_state" if phase == "start" else "end_state"
     state = _registered_state_value(shot, state_source)
     if state:
@@ -666,7 +694,93 @@ def _normalize_functional_figures(shot):
             "state": _text(item.get("state")),
             "function": _text(item.get("function")),
         })
-    return normalized, issues
+    # A folded long take may carry one row per temporal beat for the same
+    # functional person.  Equal names are sequential states of one continuous
+    # body, not additional people.  Use the largest count declared by any beat
+    # (the concurrent maximum) and retain the union of state/function wording.
+    merged = {}
+    order = []
+    for position, item in enumerate(normalized):
+        label = _text(item.get("name") or item.get("label"))
+        if not label:
+            # Preserve malformed rows so their validation issue is not hidden.
+            malformed_key = ("__malformed__", position)
+            order.append(malformed_key)
+            merged[malformed_key] = item
+            continue
+        if label not in merged:
+            merged[label] = dict(item)
+            order.append(label)
+            continue
+        target = merged[label]
+        target["count"] = max(
+            int(target.get("count") or 0), int(item.get("count") or 0))
+        for field in ("state", "function"):
+            values = []
+            for raw in (target.get(field), item.get(field)):
+                for part in _text(raw).split("；"):
+                    part = part.strip()
+                    if part and part not in values:
+                        values.append(part)
+            target[field] = "；".join(values)
+        if not target.get("name") and item.get("name"):
+            target["name"] = item["name"]
+        if not target.get("label") and item.get("label"):
+            target["label"] = item["label"]
+    return [merged[label] for label in order], issues
+
+
+def _readable_carrier_visible_at_phase(
+        readable, frame_props, target_phase, prop_registry):
+    """Whether a static frame's text carrier is visible in its target phase.
+
+    Text metadata is often authored for a whole long take (for example a phone
+    showing 23:10 at ``start``).  A terminal keyframe whose same phone is hidden
+    in a pocket must not inherit that earlier text requirement.
+    """
+    readable = readable if isinstance(readable, dict) else {}
+    target_phase = _text(target_phase).lower()
+    rows = [
+        item for item in (frame_props or [])
+        if isinstance(item, dict)
+        and _text(item.get("phase")).lower() == target_phase
+    ]
+    if not rows:
+        return True
+
+    explicit_ids = {
+        _text(readable.get(key))
+        for key in ("prop_id", "carrier_prop_id", "carrier_id", "object_id")
+        if _text(readable.get(key))
+    }
+    if explicit_ids:
+        matching = [
+            item for item in rows
+            if _text(item.get("prop_id")) in explicit_ids]
+    else:
+        carrier = _text(readable.get("carrier")).lower()
+        categories = []
+        if any(token in carrier for token in ("手机", "锁屏", "平板", "tablet")):
+            categories.append(("手机", "phone", "mobile", "平板", "tablet"))
+        if any(token in carrier for token in ("电脑", "笔记本", "显示器", "显示屏")):
+            categories.append(("电脑", "笔记本", "computer", "laptop", "显示器", "显示屏"))
+        registry_names = {
+            _text(item.get("prop_id")): _text(item.get("name")).lower()
+            for item in (prop_registry or []) if isinstance(item, dict)
+        }
+        matching = []
+        for item in rows:
+            prop_id = _text(item.get("prop_id"))
+            haystack = f"{prop_id} {registry_names.get(prop_id, '')}".lower()
+            if any(any(token in haystack for token in category)
+                   for category in categories):
+                matching.append(item)
+    if not matching:
+        return True
+    return any(
+        _text(item.get("visibility"), "visible").lower()
+        not in {"hidden", "absent"}
+        for item in matching)
 
 
 def _functional_figure_line(item):
@@ -2565,9 +2679,26 @@ def build_shot_prompt_contract(
     functional_count = sum(
         int(item.get("count") or 0) for item in functional_figures)
     visible_count = registered_count + functional_count
+    raw_functional_items = shot.get("functional_figures") or []
+    if isinstance(raw_functional_items, dict):
+        raw_functional_items = [raw_functional_items]
+    raw_functional_count = sum(
+        item.get("count")
+        for item in raw_functional_items
+        if isinstance(item, dict)
+        and isinstance(item.get("count"), int)
+        and not isinstance(item.get("count"), bool)
+        and item.get("count") > 0
+    ) if isinstance(raw_functional_items, (list, tuple)) else 0
     dialogue = shot.get("dialogue") or {}
     readable = shot.get("readable_text") or {}
-    if readable_text_required(readable):
+    readable_required = readable_text_required(readable)
+    readable_carrier_visible = (
+        output_media == "video"
+        or _readable_carrier_visible_at_phase(
+            readable, frame_props, target_phase,
+            shot.get("prop_registry") or []))
+    if readable_required and readable_carrier_visible:
         whitelist = "、".join(sanitize_text_whitelist(
             readable.get("whitelist") or [])) or "白名单"
         carrier = _text(readable.get("carrier"), "指定载体")
@@ -2590,6 +2721,10 @@ def build_shot_prompt_contract(
             text_rule = (f"{carrier}内文字只保持原样:{whitelist}；"
                          + (presentation + "；" if presentation else "")
                          + "禁止新增文字")
+    elif readable_required:
+        text_rule = (
+            "当前静态目标phase中文字载体已隐藏或不在画面；"
+            "不生成该载体文字，也不新增任何其他画面文字、字幕、Logo或水印")
     else:
         text_rule = "无画面文字、无字幕、无Logo、无水印"
     refs = []
@@ -2632,11 +2767,16 @@ def build_shot_prompt_contract(
     overlays = overlays[:1]
     visible_entity_count = visible_count + len(overlays)
     declared_visible = shot.get("visible_figure_count")
+    legacy_declared_repaired = bool(
+        isinstance(declared_visible, int)
+        and not isinstance(declared_visible, bool)
+        and raw_functional_count > functional_count
+        and declared_visible == registered_count + raw_functional_count)
     if declared_visible is not None:
         if (not isinstance(declared_visible, int)
                 or isinstance(declared_visible, bool)):
             population_issues.append("visible_figure_count 必须是整数")
-        elif declared_visible != visible_count:
+        elif declared_visible != visible_count and not legacy_declared_repaired:
             population_issues.append(
                 "人数声明冲突："
                 f"visible_figure_count={declared_visible}，"
@@ -2718,7 +2858,12 @@ def build_shot_prompt_contract(
                 "visible_entity_instances_total": visible_entity_count,
             },
             "functional_figures": functional_figures,
-            "declared_visible_figure_count": declared_visible,
+            "declared_visible_figure_count": (
+                visible_count if legacy_declared_repaired
+                else declared_visible),
+            "source_declared_visible_figure_count": (
+                declared_visible if legacy_declared_repaired else None),
+            "temporal_duplicate_count_repaired": legacy_declared_repaired,
             "issues": population_issues,
         },
         "composition": composition,
@@ -3103,6 +3248,9 @@ def render_shot_prompt(contract, *, mode=None):
             if isinstance(entry, dict)}
         for item in (contract.get("frame_props") or []):
             if not isinstance(item, dict):
+                continue
+            if _text(item.get("phase")).lower() != _text(
+                    output.get("frame_phase")).lower():
                 continue
             if str(item.get("visibility") or "") != "visible":
                 continue

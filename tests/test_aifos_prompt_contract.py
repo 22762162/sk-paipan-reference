@@ -800,6 +800,75 @@ def test_v21_registered_functional_and_visible_counts_are_distinct():
     assert "书童尸体1" in prompt
 
 
+def test_folded_functional_person_and_static_prop_text_follow_target_phase():
+    """Sequential driver beats stay one body; end frame ignores start phone."""
+    shot = {
+        "shot_no": 2,
+        "characters": ["虞寻歌"],
+        "functional_figures": [
+            {"name": "小吴", "count": 1,
+             "state": "双手控制方向盘", "function": "代驾司机"},
+            {"name": "小吴", "count": 1,
+             "state": "平稳提高车速", "function": "本镜说话者"},
+            {"name": "小吴", "count": 1,
+             "state": "车辆停稳后解开安全带", "function": "接受委托"},
+            {"name": "小吴", "count": 1,
+             "state": "站在驾驶侧车外", "function": "递交白酒"},
+        ],
+        # Legacy long-take folding stored the sequential sum.  Contract
+        # compilation repairs that stale value instead of blocking the shot.
+        "visible_figure_count": 5,
+        "description": "虞寻歌坐副驾驶，小吴站在驾驶侧车外",
+        "frame_target": {
+            "phase": "end",
+            "state": "虞寻歌坐副驾驶，小吴手中为空并站在车外",
+            "fallback": False,
+        },
+        "readable_text": {
+            "required": True,
+            "carrier": "手机锁屏",
+            "whitelist": ["23:10"],
+        },
+        "prop_registry": [{
+            "prop_id": "prop_phone_01", "name": "虞寻歌的手机",
+        }],
+        "frame_props": [
+            {
+                "prop_id": "prop_phone_01", "phase": "start",
+                "physical_state": "亮屏显示时间", "holder": "虞寻歌右手",
+                "location": "副驾驶胸腹前", "support": "右手",
+                "visibility": "visible", "representation": "physical",
+            },
+            {
+                "prop_id": "prop_phone_01", "phase": "end",
+                "physical_state": "锁屏收纳", "holder": "虞寻歌",
+                "location": "风衣右袋", "support": "口袋内衬",
+                "visibility": "hidden", "representation": "physical",
+            },
+        ],
+    }
+
+    contract, prompt = compile_shot_prompt(shot, mode="image")
+
+    figures = contract["subject"]["functional_figures"]
+    assert len(figures) == 1
+    assert figures[0]["name"] == "小吴"
+    assert figures[0]["count"] == 1
+    assert figures[0]["state"] == (
+        "双手控制方向盘；平稳提高车速；车辆停稳后解开安全带；站在驾驶侧车外")
+    assert figures[0]["function"] == "代驾司机；本镜说话者；接受委托；递交白酒"
+    assert contract["subject"]["functional_count"] == 1
+    assert contract["subject"]["visible_count"] == 2
+    assert contract["population"]["issues"] == []
+    core = prompt.split("【核心画面】", 1)[1].split("\n", 1)[0]
+    assert "亮屏显示时间" not in core
+    assert "必须清晰画出:虞寻歌的手机" not in core
+    assert "23:10" not in prompt
+    assert "中文字载体已隐藏或不在画面" in contract["text"]
+    assert "phase=end" in prompt
+    assert "phase=start" not in prompt
+
+
 def test_v21_image_prompt_renders_only_frozen_end_state_not_motion_process():
     shot = _lin_chuan_witness_shot()
     contract, prompt = compile_shot_prompt(

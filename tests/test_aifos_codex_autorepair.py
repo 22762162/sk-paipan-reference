@@ -438,6 +438,9 @@ def test_stage_images_seeds_stored_codex_repair_directly_into_three_draws(
     # 兼容旧版断点：有 triggered 与完整指令，但没有 status 字段。
     stored_qc["codex_escalation"].pop("status")
     stored_qc.update({"attempts": 2, "consecutive_failures": 2})
+    stale_canonical = out_root / "images" / "shot_015.keyframe.png"
+    stale_canonical.parent.mkdir(parents=True, exist_ok=True)
+    stale_canonical.write_bytes(b"old-failed-image")
     ctx = {
         "project": dict(project),
         "episode": dict(episode),
@@ -450,6 +453,7 @@ def test_stage_images_seeds_stored_codex_repair_directly_into_three_draws(
     app.director._plan_write(ctx, {"items": [{
         "id": "shot:15", "category": "shot_image",
         "status": "awaiting_human", "qc": stored_qc,
+        "output_uri": str(stale_canonical),
     }]})
 
     monkeypatch.setattr(app.director, "_plan_seed_shots", lambda _ctx: None)
@@ -476,6 +480,8 @@ def test_stage_images_seeds_stored_codex_repair_directly_into_three_draws(
     })
     monkeypatch.setattr(app.director, "_shot_qc_spec",
                         lambda _ctx, _payload: {})
+    monkeypatch.setattr(app.director, "_director_autonomy_enabled",
+                        lambda: True)
 
     def apply(_ctx, task, result):
         assert result.qc == stored_qc
@@ -497,6 +503,8 @@ def test_stage_images_seeds_stored_codex_repair_directly_into_three_draws(
     assert payload["_autonomous_repair_seeded"] is True
     assert payload["qc_consecutive_failures_base"] == 2
     assert "135mm" in payload["prompt"]
+    assert payload["prompt"].startswith("【返工静态合同v1】")
+    assert payload["feedback"] == ""
 
 
 def test_codex_numbered_remove_changes_actual_prop_reference_but_not_identity(

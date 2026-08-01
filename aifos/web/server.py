@@ -592,6 +592,121 @@ def _selection_mode_enabled(app):
     return _selection_mode_payload(app)["selection_mode"]
 
 
+def _selection_mode_best_effort_promoted(item):
+    """识别已由 AI 晋升的技术可用相对最优稿。
+
+    生产历史里这一标记经历过几种落盘位置。Web 层必须兼容读取，但只
+    把它解释为“非阻断风险”，不能把 ``qc.passed=false`` 再翻译成
+    二次失败或人工门禁。
+    """
+    item = item if isinstance(item, dict) else {}
+    group = item.get("candidate_group") or {}
+    group_selection = group.get("selection") or {}
+    item_selection = item.get("selection") or {}
+    qc = item.get("qc") or {}
+    selection_risk = item.get("selection_risk") or {}
+    return any(value is True for value in (
+        group.get("best_effort_promoted"),
+        group.get("best_effort_risk"),
+        group_selection.get("best_effort_promoted"),
+        group_selection.get("best_effort_risk"),
+        item_selection.get("best_effort_promoted"),
+        item_selection.get("best_effort_risk"),
+        qc.get("best_effort_promoted"),
+        qc.get("best_effort_risk"),
+        selection_risk.get("best_effort"),
+    ))
+
+
+def _selection_mode_has_technical_output(item):
+    """只判断是否至少有一张落盘/远程可读图，不做内容判断。"""
+    item = item if isinstance(item, dict) else {}
+
+    def valid(uri):
+        uri = str(uri or "").strip()
+        return bool(uri) and (
+            uri.startswith(("http://", "https://", "/artifacts/"))
+            or Path(uri).is_file())
+
+    if valid(item.get("output_uri")) or valid(item.get("output_url")):
+        return True
+    group = item.get("candidate_group") or {}
+    return any(
+        isinstance(row, dict)
+        and (valid(row.get("uri")) or valid(row.get("url")))
+        for row in group.get("candidates") or [])
+
+
+def _selection_mode_present_item(item):
+    """把旧阻断状态转换为选优模式的非人工状态（仅修改传入副本）。
+
+    有当前选片或 best-effort 晋升凭证的技术可用稿视为完成；旧版只有
+    ``qc=false``、却没有有效选片凭证的镜头交回系统自动修合同并补抽
+    3 张。零张技术产物才显示 ``technical_incomplete``。磁盘上的历史
+    计划不在这里改写，方便审计和后续 Director 续产接管。
+    """
+    if not isinstance(item, dict):
+        return item
+    category = str(item.get("category") or "")
+    if category not in {"shot_image", "frames"}:
+        return item
+    status = str(item.get("status") or "pending")
+    qc = item.get("qc") or {}
+    content_failure = (
+        status in {"awaiting_human", "failed"}
+        or qc.get("passed") is False)
+    if not content_failure:
+        return item
+
+    qc = dict(qc)
+    qc.update({
+        "awaiting_human": False,
+        "blocking": False,
+        "advisory_only": True,
+    })
+    item["qc"] = qc
+    technical_output = _selection_mode_has_technical_output(item)
+    has_selection = (
+        category == "shot_image"
+        and _candidate_group_current_selection(item) is not None)
+    best_effort = (
+        category == "shot_image"
+        and _selection_mode_best_effort_promoted(item))
+    # 正式资产是否存在由 progress 的资产中心校验负责；这里不能因为旧
+    # 清单漏写 output_uri 而抹掉已落盘的 AI 选优凭证。
+    if has_selection or best_effort:
+        if status not in {"done", "reused"}:
+            item["status"] = "done"
+        item["nonblocking_risk"] = True
+        item.pop("automatic_repair", None)
+        return item
+
+    if technical_output:
+        item["status"] = "pending"
+        strategy = (
+            "optimize_prompt_then_generate_3"
+            if category == "shot_image" else "regenerate_frames")
+        item["automatic_repair"] = {
+            "owner": "system",
+            "strategy": strategy,
+            "candidate_count": 3 if category == "shot_image" else 0,
+            "requires_human": False,
+            "label": (
+                "系统自动优化提示词并补抽3张，由AI选优"
+                if category == "shot_image" else "系统自动重生成首尾帧"),
+        }
+    else:
+        item["status"] = "technical_incomplete"
+        item["automatic_repair"] = {
+            "owner": "system",
+            "strategy": "retry_technical_generation",
+            "candidate_count": 3 if category == "shot_image" else 0,
+            "requires_human": False,
+            "label": "系统自动重试技术生成",
+        }
+    return item
+
+
 def _selection_mode_payload(app):
     return _selection_mode_payload_from_config(app.config)
 
@@ -1347,6 +1462,11 @@ def _production_progress(app, episode, render_plan):
         running_run is not None
         and str(running_run["action"] or "") in PRODUCTION_ACTIONS)
     selection_mode = _selection_mode_enabled(app)
+    if selection_mode:
+        plan_items = [
+            _selection_mode_present_item(copy.deepcopy(item))
+            for item in plan_items
+        ]
     status_keys = (
         "done", "reused", "pending", "generating", "retrying",
         "awaiting_selection", "regenerating_candidates",
@@ -1454,7 +1574,9 @@ def _production_progress(app, episode, render_plan):
                 # 选片模式的唯一门禁是：本轮候选 token 已被人工/AI 明确
                 # 选择，且该选择已经晋升为正式资产。内容 QC 仅作建议，
                 # 不能重新把产线变回阻断式。
-                return _candidate_group_current_selection(item) is not None
+                return (
+                    _candidate_group_current_selection(item) is not None
+                    or _selection_mode_best_effort_promoted(item))
             return not (
                 item.get("invalidated_previous_output")
                 or item.get("contract_recheck"))
@@ -1542,7 +1664,7 @@ def _production_progress(app, episode, render_plan):
                 })
         else:
             stats[status] += 1
-            if output_exists or candidate_generated:
+            if formal_asset or output_exists or candidate_generated:
                 stats["generated"] += 1
 
         if downstream_usable:
@@ -1713,13 +1835,19 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
         item["category"]: item
         for item in (progress or {}).get("categories", [])
     }
-    plan_items = list((render_plan or {}).get("items") or [])
+    plan_items = [
+        copy.deepcopy(item)
+        for item in (render_plan or {}).get("items") or []
+    ]
     overall = (progress or {}).get("overall") or {}
     live_run = bool(overall.get("running"))
     current_stage = str(overall.get("current_stage") or "")
     episode_number = int(episode["number"])
     project_id = int(episode["project_id"])
     selection_mode = _selection_mode_enabled(app)
+    if selection_mode:
+        plan_items = [
+            _selection_mode_present_item(item) for item in plan_items]
 
     storyboard_shots = list((storyboard or {}).get("shots") or [])
     storyboard_numbers = {
@@ -1809,7 +1937,9 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
                 return False
             if selection_mode:
                 if category == "shot_image":
-                    return _candidate_group_current_selection(item) is not None
+                    return (
+                        _candidate_group_current_selection(item) is not None
+                        or _selection_mode_best_effort_promoted(item))
                 return not (
                     item.get("invalidated_previous_output")
                     or item.get("contract_recheck"))
@@ -1939,8 +2069,9 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
             continue
         status = str(item.get("status") or "pending")
         qc = item.get("qc") or {}
-        if status in ("awaiting_human", "failed") \
-                or qc.get("passed") is False:
+        if (not selection_mode and (
+                status in ("awaiting_human", "failed")
+                or qc.get("passed") is False)):
             issue_shots.append(shot_no)
             item_id = str(item.get("id") or f"shot:{shot_no}")
             issue_item_ids.append(item_id)
@@ -2000,17 +2131,21 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
     if keyframes_ready:
         keyframes["status"] = "ready"
         keyframes["reason"] = (
-            f"{keyframe_count_text} 全部关键帧均已通过当前合同。")
+            f"{keyframe_count_text} "
+            + ("全部关键帧已由AI选优并登记；内容观察只记风险、不阻断。"
+               if selection_mode else "全部关键帧均已通过当前合同。"))
     elif image_stage_active:
         keyframes["status"] = "active"
         keyframes["reason"] = (
             f"关键帧生产任务正在运行；{keyframe_count_text}")
     elif keyframes["pending"] > 0 or pending_shots:
         keyframes["status"] = "paused"
+        pending_total = len(pending_shots) or keyframes["pending"]
         keyframes["reason"] = (
             f"{keyframe_count_text} 当前没有运行任务；还有 "
-            f"{len(pending_shots) or keyframes['pending']} "
-            "个镜头可继续生产。")
+            f"{pending_total} 个镜头"
+            + ("由系统自动优化提示词、补抽3张并AI选优。"
+               if selection_mode else "可继续生产。"))
     elif keyframes["awaiting_human"] or keyframes["failed"]:
         keyframes["status"] = "blocked"
         keyframes["reason"] = (
@@ -2072,7 +2207,11 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
             "stage": "keyframes",
             "count": pending_count,
             "shot_nos": pending_shots,
-            "message": f"还有 {pending_count} 个关键帧尚未生产。",
+            "message": (
+                f"还有 {pending_count} 个关键帧由系统自动优化提示词、"
+                "补抽3张并AI选优。"
+                if selection_mode
+                else f"还有 {pending_count} 个关键帧尚未生产。"),
         })
     if issue_count:
         severity = (
@@ -2129,7 +2268,10 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
         if phase == "keyframes" and pending_count:
             next_action = {
                 "action": "resume_keyframes",
-                "label": f"继续生产 {pending_count} 个非问题关键帧",
+                "label": (
+                    f"系统自动补抽3张并AI选优（{pending_count}镜）"
+                    if selection_mode else
+                    f"继续生产 {pending_count} 个非问题关键帧"),
                 "count": pending_count,
             }
         elif phase == "keyframes" and issue_count:
@@ -2157,7 +2299,10 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
         "shot_nos": pending_shots,
         "item_ids": pending_item_ids,
         "enabled": bool(pending_count and not live_run),
-        "label": f"继续生产 {pending_count} 个非问题关键帧",
+        "label": (
+            f"系统自动补抽3张并AI选优（{pending_count}镜）"
+            if selection_mode else
+            f"继续生产 {pending_count} 个非问题关键帧"),
     }
     resolve_image_issues = {
         "action": "resolve_image_issues",
@@ -2514,6 +2659,8 @@ def _episode_payload(app, episode_id, jobs=None):
         render_plan = copy.deepcopy(render_plan)
         render_plan["items"] = _current_render_plan_items(render_plan)
         for item in render_plan.get("items", []):
+            if _selection_mode_enabled(app):
+                _selection_mode_present_item(item)
             try:
                 shot_no = int(item.get("shot_no"))
             except (TypeError, ValueError):

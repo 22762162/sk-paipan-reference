@@ -1,4 +1,6 @@
 from pathlib import Path
+import json
+import subprocess
 
 
 ROOT = Path(__file__).parents[1]
@@ -8,6 +10,13 @@ JS = (ROOT / "aifos" / "web" / "static" / "app.js").read_text(
 CSS = (ROOT / "aifos" / "web" / "static" / "style.css").read_text(
     encoding="utf-8"
 )
+
+
+def _run_node(source):
+    completed = subprocess.run(
+        ["node", "-e", source], check=True, capture_output=True, text=True,
+    )
+    return json.loads(completed.stdout)
 
 
 def test_shot_candidate_statuses_and_ai_auto_selection_rendering_are_present():
@@ -34,6 +43,91 @@ def test_shot_candidate_statuses_and_ai_auto_selection_rendering_are_present():
     assert "Array.isArray(group.candidates)" in JS
     assert "Number(group.expected_count) === 3 ? 3 : 4" in JS
     assert 'item.status === "technical_incomplete";' in JS
+
+
+def test_best_effort_repair_is_rendered_as_nonblocking_ai_selection():
+    helper = JS[
+        JS.index("const STORYBOARD_KEYFRAME_TRANSIENT_STATUSES"):
+        JS.index("const PLAN_REWORK_STATUSES")
+    ]
+    badge = JS[
+        JS.index("function planQcBadge"):
+        JS.index("function planQcIssuesHtml")
+    ]
+    result = _run_node(helper + badge + r'''
+      const fromSelection = {
+        status: "done", candidate_group: {
+          selection: {best_effort_risk: true}
+        }
+      };
+      const fromQc = {
+        status: "reused", qc: {best_effort_promoted: true}
+      };
+      const fromGroup = {
+        status: "done", candidate_group: {best_effort_promoted: true}
+      };
+      const unfinished = {
+        status: "awaiting_selection", qc: {best_effort_promoted: true}
+      };
+      console.log(JSON.stringify({
+        labels: [
+          shotBestEffortLabel(fromSelection),
+          shotBestEffortLabel(fromQc),
+          shotBestEffortLabel(fromGroup),
+          shotBestEffortLabel(unfinished),
+        ],
+        selectionBadgeWithoutQc: planQcBadge(fromSelection),
+      }));
+    ''')
+    assert result["labels"] == [
+        "已补抽3张并AI选优（非阻断风险）",
+        "已补抽3张并AI选优（非阻断风险）",
+        "已补抽3张并AI选优（非阻断风险）",
+        "",
+    ]
+    assert "已补抽3张并AI选优（非阻断风险）" in \
+        result["selectionBadgeWithoutQc"]
+    assert "if (bestEffort)" in JS
+    assert 'if (row.bestEffort) return "已补抽3张并AI选优（非阻断风险）"' in JS
+
+
+def test_storyboard_masks_stale_failure_while_repairing_or_best_effort_done():
+    helper = JS[
+        JS.index("const STORYBOARD_KEYFRAME_TRANSIENT_STATUSES"):
+        JS.index("const PLAN_REWORK_STATUSES")
+    ]
+    storyboard = JS[
+        JS.index("function storyboardKeyframePlanItem"):
+        JS.index("function storyboardKeyframeUrl")
+    ]
+    result = _run_node(helper + storyboard + r'''
+      function probe(status, bestEffort) {
+        return storyboardKeyframeFailure({
+          render_plan: {items: [{
+            category: "shot_image", shot_no: 2, status,
+            candidate_group: {selection: {best_effort_risk: bestEffort}},
+          }]},
+          image_failures: [{shot_no: 2, issues: ["旧失败"]}],
+        }, 2);
+      }
+      console.log(JSON.stringify({
+        generating: probe("generating", false),
+        regenerating: probe("regenerating_candidates", false),
+        selecting: probe("awaiting_selection", false),
+        pending: probe("pending", false),
+        bestEffortDone: probe("done", true),
+        realFailure: probe("failed", false),
+      }));
+    ''')
+    assert result["generating"] is None
+    assert result["regenerating"] is None
+    assert result["selecting"] is None
+    assert result["pending"] is None
+    assert result["bestEffortDone"] is None
+    assert result["realFailure"]["issues"] == ["旧失败"]
+    assert "const failures = storyboardImageFailures(data);" in JS
+    assert "const currentImageFailures = storyboardImageFailures(data);" in JS
+    assert "const reportedImageFailures = storyboardImageFailures(data).length;" in JS
 
 
 def test_cast_and_prop_candidates_do_not_require_mobile_selection():

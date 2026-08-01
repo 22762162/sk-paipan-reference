@@ -3530,17 +3530,56 @@ const PLAN_STATUS_CN = {
   technical_incomplete: "候选技术未补齐",
 };
 const PLAN_QC_CATS = new Set(["shot_image", "frames"]);
+const STORYBOARD_KEYFRAME_TRANSIENT_STATUSES = new Set([
+  "generating", "regenerating_candidates", "awaiting_selection", "pending",
+]);
 function planQcEnabled(item) { return PLAN_QC_CATS.has(item.category); }
 /* 旧清单可能仍携带人物/场景母资产的历史 QC。当前规则只展示镜头
    关键帧与首尾帧 QC；刷新页面即可生效，不必打断正在运行的生产任务。 */
 function planVisibleQc(item) {
   return planQcEnabled(item) ? item.qc : null;
 }
+
+/* 内容阈值未全过但已有技术可用图时，AI 导演会从补抽候选中晋升
+   相对最优稿。这个结果是可继续生产的非阻断风险，不得再被旧版
+   image_failures / awaiting_human 文案覆盖成“二次质检失败”。 */
+function shotBestEffortPromoted(item) {
+  if (!item || !["done", "reused"].includes(String(item.status || "")))
+    return false;
+  const group = item.candidate_group || item.shot_candidate_group || {};
+  const groupSelection = group.selection || {};
+  const itemSelection = item.selection || {};
+  const qc = item.qc || {};
+  const selectionRisk = item.selection_risk || {};
+  return group.best_effort_promoted === true
+    || group.best_effort_risk === true
+    || groupSelection.best_effort_promoted === true
+    || groupSelection.best_effort_risk === true
+    || itemSelection.best_effort_promoted === true
+    || itemSelection.best_effort_risk === true
+    || qc.best_effort_promoted === true
+    || qc.best_effort_risk === true
+    || selectionRisk.best_effort === true;
+}
+
+function shotBestEffortIssues(item) {
+  const group = item?.candidate_group || item?.shot_candidate_group || {};
+  const selection = group.selection || item?.selection || {};
+  const qc = item?.qc || {};
+  return qc.nonblocking_risk?.issues || selection.risk_issues
+    || qc.issues || [];
+}
+
+function shotBestEffortLabel(item) {
+  return shotBestEffortPromoted(item)
+    ? "已补抽3张并AI选优（非阻断风险）" : "";
+}
 const PLAN_REWORK_STATUSES = new Set([
   "done", "reused", "awaiting_human", "failed", "generating",
 ]);
 function planNeedsRevision(item) {
   return planQcEnabled(item)
+    && !shotBestEffortPromoted(item)
     && (item.qc || {}).passed === false
     && PLAN_REWORK_STATUSES.has(item.status || "pending");
 }
@@ -3587,6 +3626,9 @@ function planCodexEscalation(item) {
 }
 
 function planQcBadge(item) {
+  const bestEffort = shotBestEffortLabel(item);
+  if (bestEffort)
+    return `<span class="plan-st st-auto" title="内容风险已留档，不阻断后续生产">${bestEffort}</span>`;
   const qc = planVisibleQc(item);
   if (!qc) return "";
   if (qc.passed && qc.manual_override)
@@ -3602,6 +3644,12 @@ function planQcBadge(item) {
 }
 
 function planQcIssuesHtml(item) {
+  const bestEffort = shotBestEffortLabel(item);
+  if (bestEffort) {
+    const issues = shotBestEffortIssues(item);
+    return `<div class="qc-revision qc-nonblocking-risk"><b>${bestEffort}</b>
+      ${issues.length ? `<span>保留风险记录：${esc(issues.join("；"))}</span>` : ""}</div>`;
+  }
   const qc = planVisibleQc(item);
   if (!qc) return "";
   if (qc.passed && qc.manual_override) {
@@ -3881,6 +3929,7 @@ function shotCandidateGridHtml(item, editable) {
   const selected = candidates.find((candidate) =>
     shotCandidateSelected(group, candidate));
   const selectedByAi = !!selected && String((group.selection || {}).source || "") === "ai";
+  const bestEffort = shotBestEffortLabel(item);
   const batchLabel = expected === 3 ? "问题镜头补抽3张" : `本镜${expected}张候选`;
   const errors = (group.candidate_errors || []).map((row) =>
     `候选${row.candidate_index || "?"}：${row.error || "技术生成失败"}`);
@@ -3891,12 +3940,12 @@ function shotCandidateGridHtml(item, editable) {
   }));
   return `<section class="shot-candidate-panel" aria-label="${batchLabel}">
     <div class="shot-candidate-head"><div><b>${batchLabel}</b>
-      <span>${selected ? `${selectedByAi ? "AI已自动选优" : "可选改选已生效："}候选 ${shotCandidateIndex(selected)} 为正式关键帧；其余候选保留回看`
+      <span>${bestEffort || (selected ? `${selectedByAi ? "AI已自动选优" : "可选改选已生效："}候选 ${shotCandidateIndex(selected)} 为正式关键帧；其余候选保留回看`
         : (technicalIncomplete ? `技术未补齐，当前 ${candidates.length}/${expected} 张`
-          : `${expected}张使用同一冻结提示词与参考图；AI正在自动选优，无需手机操作`)}</span></div>
+          : `${expected}张使用同一冻结提示词与参考图；AI正在自动选优，无需手机操作`))}</span></div>
       <span class="plan-st st-${technicalIncomplete ? "technical_incomplete" : (selected ? "done" : "awaiting_selection")}">
         ${technicalIncomplete ? `缺 ${missing || Math.max(1, expected - candidates.length)} 张 · 系统自动补位`
-          : (selected ? (selectedByAi ? "AI已选优" : "正式图已选") : "AI选优中")}</span></div>
+          : (bestEffort || (selected ? (selectedByAi ? "AI已选优" : "正式图已选") : "AI选优中"))}</span></div>
     ${errors.length ? `<div class="shot-candidate-technical-error">${esc(errors.join("；"))}</div>` : ""}
     <div class="shot-candidate-grid">${slots.map(({ index, candidate }) => {
       if (!candidate) return `<article class="shot-candidate missing"
@@ -3940,6 +3989,7 @@ function planItemHtml(data, item, editable) {
   const selectable = canEdit && !candidateMode
     && ["done", "reused", "awaiting_human", "failed"].includes(st);
   const qcFailed = planNeedsRevision(item);
+  const bestEffort = shotBestEffortPromoted(item);
   return `<div class="plan-item plan-selectable${candidateMode ? " has-shot-candidates" : ""} st-${st}" data-plan-select="${esc(item.id)}"
     role="button" tabindex="0" aria-pressed="false"
     aria-label="选择查看 ${esc(item.label)}">
@@ -3966,7 +4016,7 @@ function planItemHtml(data, item, editable) {
         </span>
       </div>
       ${planIsMock(item) ? planMockReasonHtml(item) : ""}
-      ${item.error ? `<div class="plan-err">${esc(item.error)}</div>` : ""}
+      ${item.error && !bestEffort ? `<div class="plan-err">${esc(item.error)}</div>` : ""}
       ${canEdit && planQcEnabled(item) && ["done", "reused"].includes(st) ? `<div class="plan-qc-row">
         <button class="plan-qc-one" data-plan-id="${esc(item.id)}"
           title="用 AI 视觉核对这张是否符合已锁定人物/场景设定">🔍 质检这张</button></div>` : ""}
@@ -4115,6 +4165,7 @@ function productionLedgerState(row) {
 }
 
 function productionLedgerStateLabel(row) {
+  if (row.bestEffort) return "已补抽3张并AI选优（非阻断风险）";
   if (row.status === "awaiting_human") return "历史失败·系统接管"
   if (row.status === "retrying") return `自动返工 ${row.autoRetriesUsed || 0}/1`;
   if (row.issue && row.issueCritical) return "需要干预";
@@ -4128,9 +4179,11 @@ function productionLedgerPlanRows(data) {
   return items.map((item) => {
     const stage = productionLedgerStage(item);
     const visibleQc = planVisibleQc(item);
-    const qcIssues = visibleQc && visibleQc.passed === false
+    const bestEffort = shotBestEffortPromoted(item);
+    const qcIssues = visibleQc && visibleQc.passed === false && !bestEffort
       ? (visibleQc.issues || []) : [];
-    const issue = item.error || (qcIssues.length ? qcIssues.join("；") : "");
+    const issue = (bestEffort ? "" : item.error)
+      || (qcIssues.length ? qcIssues.join("；") : "");
     const refs = productionLedgerRefs(data, item);
     return {
       rowId: `plan:${item.id}`, planId: item.id, category: item.category,
@@ -4145,6 +4198,7 @@ function productionLedgerPlanRows(data) {
         : item.category === "character_sheet"
           ? (item.sheet || "人物辅助设定") : (item.role || ""),
       status: item.status || "pending", selected: productionLedgerSelectedCandidate(data, item),
+      bestEffort,
       mock: planIsMock(item), issue, issueCritical: !!issue,
       refs, outputUrls: planItemThumbs(data, item),
     };
@@ -4192,7 +4246,8 @@ function productionLedgerRowIsUseful(row) {
      候选/废片仍完整保留在人物定版、图片生产状况和历史记录中，方便回退与追溯。 */
   if (row.category === "character_candidate" && !row.selected) return false;
   if (row.mock) return false;
-  if (row.item?.error || row.item?.qc?.passed === false) return false;
+  if (!row.bestEffort && (row.item?.error || row.item?.qc?.passed === false))
+    return false;
   if (["failed", "retrying", "awaiting_human"].includes(row.status)) return false;
   return true;
 }
@@ -4368,24 +4423,34 @@ function productionProgressModel(data) {
     || categories.find((row) => row.key === "images");
   const keyframeTotal = productionProgressNumber(
     keyframeCategory?.total, overall.keyframe_total, payload.keyframe_total, shots.length);
-  const keyframeDone = productionProgressNumber(
-    keyframeCategory?.completed,
-    overall.formal_assets, overall.keyframe_completed,
-    payload.formal_assets, payload.keyframe_completed,
-    Object.keys(artifacts.images || {}).length);
-  const reportedImageFailures = (data.image_failures || []).length;
+  const acceptedPlanKeyframes = plan.filter((item) =>
+    item.category === "shot_image"
+      && ["done", "reused"].includes(item.status)
+      && ((item.qc || {}).passed === true
+        || shotBestEffortPromoted(item))).length;
+  const keyframeDone = Math.max(
+    productionProgressNumber(
+      keyframeCategory?.completed,
+      overall.formal_assets, overall.keyframe_completed,
+      payload.formal_assets, payload.keyframe_completed),
+    Object.keys(artifacts.images || {}).length,
+    acceptedPlanKeyframes);
+  const reportedImageFailures = storyboardImageFailures(data).length;
+  const planKeyframeFailures = plan.filter((item) =>
+    item.category === "shot_image"
+      && ["awaiting_human", "failed"].includes(item.status)
+      && !shotBestEffortPromoted(item)).length;
   const keyframeFailed = Math.max(
-    productionProgressNumber(keyframeCategory?.awaitingHuman),
-    productionProgressNumber(overall.second_failures, payload.second_failures),
-    reportedImageFailures);
-  const keyframePending = Math.max(0, productionProgressNumber(
-    keyframeCategory
-      ? keyframeCategory.pending + keyframeCategory.hardFailed
-        + keyframeCategory.unverified
-        - Math.min(keyframeCategory.hardFailed, reportedImageFailures)
-      : null,
-    overall.keyframe_pending, payload.keyframe_pending,
-    keyframeTotal - keyframeDone - keyframeFailed));
+    reportedImageFailures, planKeyframeFailures);
+  const keyframePending = keyframeDone >= keyframeTotal && keyframeFailed === 0
+    ? 0 : Math.max(0, productionProgressNumber(
+      keyframeCategory
+        ? keyframeCategory.pending + keyframeCategory.hardFailed
+          + keyframeCategory.unverified
+          - Math.min(keyframeCategory.hardFailed, reportedImageFailures)
+        : null,
+      overall.keyframe_pending, payload.keyframe_pending,
+      keyframeTotal - keyframeDone - keyframeFailed));
   const categoryTotal = categories.reduce((sum, row) => sum + row.total, 0);
   const categoryGenerated = categories.reduce((sum, row) => sum + row.generated, 0);
   const categoryDone = categories.reduce((sum, row) => sum + row.completed, 0);
@@ -4476,14 +4541,19 @@ function productionGuidanceModel(data) {
   const buildStage = (key, label) => {
     const source = rawStages[key] || {};
     const fallback = fallbackCounts[key];
+    const suppressStaleFailure = key === "keyframes"
+      && progress.keyframeFailed === 0;
     const total = productionProgressNumber(source.total, fallback.total);
-    const usable = productionProgressNumber(
-      source.usable, source.completed, source.done, fallback.usable);
-    const generated = productionProgressNumber(
-      source.generated, source.produced, usable);
+    const usable = suppressStaleFailure ? Math.max(
+      productionProgressNumber(source.usable, source.completed, source.done),
+      productionProgressNumber(fallback.usable)) : productionProgressNumber(
+        source.usable, source.completed, source.done, fallback.usable);
+    const generated = suppressStaleFailure ? Math.max(
+      productionProgressNumber(source.generated, source.produced), usable)
+      : productionProgressNumber(source.generated, source.produced, usable);
     const awaitingReview = productionProgressNumber(
       source.awaiting_review, source.needs_review);
-    const needsRepair = productionProgressNumber(
+    const needsRepair = suppressStaleFailure ? 0 : productionProgressNumber(
       source.needs_repair, source.awaiting_human, source.failed);
     const queued = productionProgressNumber(source.queued);
     const notGenerated = productionProgressNumber(source.not_generated,
@@ -4492,11 +4562,14 @@ function productionGuidanceModel(data) {
     const generating = productionProgressNumber(
       source.generating, source.active, fallback.generating);
     const retrying = productionProgressNumber(source.retrying);
-    const awaitingHuman = productionProgressNumber(
+    const awaitingHuman = suppressStaleFailure ? 0 : productionProgressNumber(
       source.awaiting_human, fallback.awaiting_human);
-    const failed = productionProgressNumber(source.failed);
-    const remaining = productionProgressNumber(source.remaining,
-      Math.max(0, total - usable));
+    const failed = suppressStaleFailure ? 0
+      : productionProgressNumber(source.failed);
+    const remaining = suppressStaleFailure
+      ? Math.max(0, total - usable)
+      : productionProgressNumber(source.remaining,
+        Math.max(0, total - usable));
     const inferred = usable >= total && total > 0 ? "complete"
       : generating + retrying > 0 ? "active"
       : source.blocked_by ? "blocked"
@@ -4505,10 +4578,12 @@ function productionGuidanceModel(data) {
       key, label: source.label || label, total, usable, generated,
       awaitingReview, needsRepair, queued, notGenerated,
       pending, generating, retrying, awaitingHuman, failed, remaining,
-      status: statusClass(source.status, inferred),
+      status: statusClass(suppressStaleFailure
+        && ["attention", "awaiting_human", "failed"].includes(
+          String(source.status || "").toLowerCase()) ? "" : source.status, inferred),
       blockedBy: source.blocked_by || "",
-      reason: source.reason || "",
-      note: source.note || "",
+      reason: suppressStaleFailure ? "" : (source.reason || ""),
+      note: suppressStaleFailure ? "" : (source.note || ""),
       parallelCapacity: productionProgressNumber(
         source.parallel_capacity, source.parallelism),
       percent: productionProgressNumber(source.percent,
@@ -4526,7 +4601,11 @@ function productionGuidanceModel(data) {
   const inferredPhase = keyframes.remaining > 0 ? "keyframes"
     : frames.remaining > 0 ? "frames"
     : videos.remaining > 0 ? "videos" : "review";
-  const phase = raw.phase || raw.current_step || inferredPhase;
+  const reportedPhase = raw.phase || raw.current_step || "";
+  const staleKeyframeGate = reportedPhase === "keyframes"
+    && progress.keyframeFailed === 0 && keyframes.remaining === 0;
+  const phase = staleKeyframeGate ? inferredPhase
+    : reportedPhase || inferredPhase;
   const state = raw.state || (progress.active ? "active"
     : phase === "review" ? "ready" : "paused");
   const pendingSource = raw.next_actions?.resume_pending_images
@@ -4540,28 +4619,28 @@ function productionGuidanceModel(data) {
     .filter((item) => item.category === "shot_image" && item.status === "pending")
     .map((item) => item.id).filter(Boolean));
   const issueShotNos = (issueSource.shot_nos
-    || (data.image_failures || []).map((item) => Number(item.shot_no))
-      .filter(Number.isFinite));
+    || (data.image_failures || []).map((item) => Number(item.shot_no)))
+    .map(Number).filter((shotNo) => Number.isFinite(shotNo)
+      && !!storyboardKeyframeFailure(data, shotNo));
   const pendingCount = productionProgressNumber(
     pendingSource.count, keyframes.pending, pendingShotNos.length);
-  const issueCount = productionProgressNumber(
-    issueSource.count, keyframes.awaitingHuman,
-    issueShotNos.length);
+  const issueCount = issueShotNos.length;
+  const reportedReason = staleKeyframeGate ? "" : String(raw.reason || "");
   const reason = phase === "keyframes"
-    ? raw.reason || `已生成 ${keyframes.generated}/${keyframes.total}，`
+    ? reportedReason || `已生成 ${keyframes.generated}/${keyframes.total}，`
       + `可用于下游 ${keyframes.usable}/${keyframes.total}，`
       + `${pendingCount} 张待生产，${issueCount} 张已标注问题并由系统自动接管。`
       + "AI会自动补抽3张并选优；其他镜头与下游生产不被阻断。"
-    : raw.reason || (phase === "frames"
+    : reportedReason || (phase === "frames"
       ? `关键帧已齐，首尾帧为 ${frames.usable}/${frames.total}；补齐后才会进入视频。`
       : phase === "videos"
         ? `首尾帧已齐，视频为 ${videos.usable}/${videos.total}。`
         : "图片与视频资产已齐，等待最终审阅。");
-  const currentLabel = raw.current_step_label || ({
+  const currentLabel = (staleKeyframeGate ? "" : raw.current_step_label) || ({
     keyframes: "关键帧补齐", frames: "首尾帧生产", videos: "视频生产",
     review: "最终审阅",
   }[phase] || "生产准备");
-  const headline = raw.headline || (state === "active"
+  const headline = (staleKeyframeGate ? "" : raw.headline) || (state === "active"
     ? `正在${currentLabel}` : phase === "review" ? "已进入最终审阅"
       : `停在${currentLabel}`);
   const storyboardCount = shots.length;
@@ -4625,11 +4704,16 @@ function productionGuidanceModel(data) {
     state, phase, currentLabel, headline, reason,
     nextAction: raw.next_action || {},
     blockers: raw.blockers || [],
-    canStartFrames: raw.can_start_frames ?? keyframes.remaining === 0,
-    canStartVideos: raw.can_start_videos ?? (
-      keyframes.remaining === 0 && frames.remaining === 0),
-    canConfirmSeedance: raw.can_confirm_seedance ?? (
-      keyframes.remaining === 0 && frames.remaining === 0),
+    canStartFrames: staleKeyframeGate ? keyframes.remaining === 0
+      : (raw.can_start_frames ?? keyframes.remaining === 0),
+    canStartVideos: staleKeyframeGate
+      ? keyframes.remaining === 0 && frames.remaining === 0
+      : (raw.can_start_videos ?? (
+        keyframes.remaining === 0 && frames.remaining === 0)),
+    canConfirmSeedance: staleKeyframeGate
+      ? keyframes.remaining === 0 && frames.remaining === 0
+      : (raw.can_confirm_seedance ?? (
+        keyframes.remaining === 0 && frames.remaining === 0)),
     stages,
     actions: {
       pendingImages: {
@@ -4643,10 +4727,11 @@ function productionGuidanceModel(data) {
       resolveIssues: {
         count: issueCount,
         shotNos: issueShotNos,
-        mustFixCount: productionProgressNumber(issueSource.must_fix_count),
-        reviewCount: productionProgressNumber(
-          issueSource.review_or_accept_count),
-        enabled: issueSource.enabled ?? issueCount > 0,
+        mustFixCount: issueCount > 0
+          ? productionProgressNumber(issueSource.must_fix_count) : 0,
+        reviewCount: issueCount > 0 ? productionProgressNumber(
+          issueSource.review_or_accept_count) : 0,
+        enabled: issueCount > 0 && (issueSource.enabled ?? true),
         label: issueSource.label
           || `处理 ${issueCount} 张问题图`,
       },
@@ -4965,7 +5050,7 @@ function videoFailurePanelHtml(failures) {
 }
 
 function imageFailurePanelHtml(data) {
-  const failures = data.image_failures || [];
+  const failures = storyboardImageFailures(data);
   if (!failures.length) return "";
   const codexReviewed = failures.filter(
     (failure) => failure.codex_escalation?.status === "completed").length;
@@ -5176,7 +5261,7 @@ function focusImageFailureShot(root, data, shotNo) {
     return;
   }
   editor.open = true;
-  const failure = (data.image_failures || []).find(
+  const failure = storyboardImageFailures(data).find(
     (item) => Number(item.shot_no) === Number(shotNo));
   const textarea = editor.querySelector(".shot-revision-feedback");
   if (textarea && !textarea.value.trim()) {
@@ -10599,7 +10684,8 @@ async function renderCanvasView(episodeId, forceView = "") {
   const lastFailed = ["failed", "qc_failed"].includes(ep.status)
     ? [...(data.tasks || [])].reverse().find((t) => t.status === "failed")
     : null;
-  const firstImageFailure = (data.image_failures || [])[0] || null;
+  const currentImageFailures = storyboardImageFailures(data);
+  const firstImageFailure = currentImageFailures[0] || null;
   const hasPlayable = !!data.artifacts?.final
     || Object.keys(data.artifacts?.videos || {}).length > 0;
   const primaryMode = productionGuidance.progress.active ? "stop"
@@ -10617,13 +10703,13 @@ async function renderCanvasView(episodeId, forceView = "") {
         <b>${lastFailed ? `上次制作在「${esc(STAGE_CN[lastFailed.stage] || lastFailed.stage)}」失败 ⚠️`
           : (ep.status === "qc_failed" ? "成片质检未通过 ⚠️" : "上次制作失败 ⚠️")}</b>
         <span>${firstImageFailure
-          ? `${data.image_failures.length} 张历史问题关键帧已由系统接管：自动修正提示词、补抽3张并选优；无需手机逐张处理，其他关键帧继续生产。`
+          ? `${currentImageFailures.length} 张历史问题关键帧已由系统接管：自动修正提示词、补抽3张并选优；无需手机逐张处理，其他关键帧继续生产。`
           : `${lastFailed ? esc((lastFailed.error || "").slice(0, 200)) + ";" : ""}
         已完成的剧本/人物/图片/视频全部保留,点右侧按钮从断点接着做,只补缺失部分,不重复消耗额度。`}</span>
       </div>
       <button class="primary" id="btn-resume-canvas">${
         firstImageFailure
-          ? `查看 ${data.image_failures.length} 张系统接管图（可选）`
+          ? `查看 ${currentImageFailures.length} 张系统接管图（可选）`
           : "▶ 从断点继续制作"}</button>
     </div>` : ""}
     ${awaiting ? `
@@ -12029,6 +12115,7 @@ function storyboardShotIssues(data) {
   });
   (data.image_failures || []).forEach((failure) => {
     if (failure.shot_no == null) return;
+    if (!storyboardKeyframeFailure(data, failure.shot_no)) return;
     const messages = failure.issues || [];
     (byShot[failure.shot_no] = byShot[failure.shot_no] || []).push({
       severity: "error",
@@ -12049,8 +12136,17 @@ function storyboardKeyframePlanItem(data, shotNo) {
 }
 
 function storyboardKeyframeFailure(data, shotNo) {
+  const item = storyboardKeyframePlanItem(data, shotNo);
+  if (item && STORYBOARD_KEYFRAME_TRANSIENT_STATUSES.has(
+      String(item.status || "pending"))) return null;
+  if (shotBestEffortPromoted(item)) return null;
   return (data.image_failures || []).find((row) =>
     Number(row.shot_no) === Number(shotNo));
+}
+
+function storyboardImageFailures(data) {
+  return (data.image_failures || []).filter((row) =>
+    row.shot_no != null && !!storyboardKeyframeFailure(data, row.shot_no));
 }
 
 function storyboardKeyframeUrl(data, shotNo) {
@@ -12080,6 +12176,8 @@ function storyboardLineNo(data, shot) {
 function storyboardPlanState(data, category, shotNo, complete) {
   const item = (((data.render_plan || {}).items) || []).find((row) =>
     row.category === category && Number(row.shot_no) === Number(shotNo));
+  const bestEffort = shotBestEffortLabel(item);
+  if (bestEffort) return { status: "done", label: bestEffort };
   if (item?.status === "awaiting_human") {
     return {
       status: "awaiting_human",

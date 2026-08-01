@@ -4468,6 +4468,31 @@ class Director:
                 or not item_id.startswith("shot:")):
             return ""
         payload = task.get("payload") or {}
+        if payload.get("_repair_static_contract_replaced"):
+            # The aggregate QC/Codex pass has already replaced the legacy
+            # v2.2 contract with a deliberately smaller execution contract.
+            # Sending it back through the storyboard repair compiler would
+            # reconstruct the obsolete phases and defeat that replacement.
+            payload["director_autonomy_mode"] = True
+            payload["prompt_review"] = {
+                "schema": self.router.PROMPT_REVIEW_SCHEMA,
+                "approved": False,
+                "status": "not_applicable_director_autonomy",
+                "original_prompt": str(
+                    payload.get("prompt_compact")
+                    or payload.get("prompt") or ""),
+                "optimized_prompt": str(
+                    payload.get("prompt_compact")
+                    or payload.get("prompt") or ""),
+                "issues_found": [],
+                "changes_made": ["旧失败合同已由AI导演替换为唯一静态合同"],
+                "blocking_reason": "固定3张返工共享同一替换合同",
+            }
+            frozen = self._image_generation_input(payload)
+            payload["_prompt_review_frozen_input_hash"] = frozen[
+                "input_hash"]
+            task["payload"] = payload
+            return "旧失败合同已替换，直接进入固定3张返工"
         preflight_issues = [
             str(issue).strip() for issue in (
                 payload.get("_nonblocking_preflight_issues") or [])
@@ -7101,6 +7126,258 @@ class Director:
             return str((candidates[index - 1] or {}).get("uri") or "")
         return ""
 
+    @staticmethod
+    def _repair_instruction_text(value):
+        """Return only the executable part of a repair, never its old error.
+
+        ``optimize_qc_feedback`` deliberately keeps the original QC reason for
+        audit.  That is useful in the ledger, but it must not be sent back to
+        the image model: a sentence such as "old contract says five people"
+        reintroduces the very fact the repair has just replaced.  Codex
+        instructions are already executable; local compiler output is reduced
+        to its ``自动优化修订`` section.
+        """
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not text:
+            return ""
+        if "【自动优化修订】" in text:
+            text = text.split("【自动优化修订】", 1)[1]
+            text = re.split(
+                r"【(?:修订边界|本轮不修|质检原因)】", text, maxsplit=1)[0]
+        text = re.sub(r"^【Codex\s*通知\s*AIFOS】", "", text).strip()
+        text = re.sub(r"【范围】只修改当前镜头\s*$", "", text).strip()
+        return text[:1800]
+
+    @staticmethod
+    def _explicit_repair_people_count(instruction):
+        """Read an explicit total such as ``严格仅2名真人`` from a repair."""
+        text = str(instruction or "")
+        patterns = (
+            r"(?:画面)?(?:严格)?(?:只|仅|共|总共|合计)+\s*"
+            r"(\d{1,2})\s*(?:名|位|个)?(?:真人|人物|角色|人)",
+            r"(?:画面内|画面中|总可见)(?:真人|人物|人形)?(?:严格)?(?:只|仅|共)?"
+            r"\s*(\d{1,2})\s*(?:名|位|个)?(?:真人|人物|角色|人)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                return max(0, int(match.group(1)))
+        return None
+
+    @classmethod
+    def _replace_repair_static_contract(
+            cls, payload, qc_spec, instruction, *, conflict_context=""):
+        """Replace a failed shot contract with one short static contract.
+
+        This is intentionally replacement, not a feedback suffix.  Identity
+        and scene references remain as typed inputs, while historical action
+        phases, obsolete counts, camera clauses and readable-text states are
+        removed from every provider-facing prompt/review field.
+        """
+        repaired = copy.deepcopy(payload or {})
+        revised_qc = copy.deepcopy(qc_spec or {})
+        executable = cls._repair_instruction_text(instruction)
+        if not executable:
+            executable = (
+                "只定格当前镜头的唯一目标状态；人物、道具、场景和机位"
+                "以当前相位及参考图职责为准，不表现此前动作过程。")
+
+        characters = list(dict.fromkeys(
+            str(name).strip() for name in (
+                repaired.get("characters") or []) if str(name).strip()))
+        functional = [
+            copy.deepcopy(row) for row in (
+                repaired.get("functional_figures") or [])
+            if isinstance(row, dict) and str(row.get("name") or "").strip()
+        ]
+        explicit_total = cls._explicit_repair_people_count(executable)
+        evidence = executable + " " + str(conflict_context or "")
+        grouped = {}
+        order = []
+        for row in functional:
+            name = str(row.get("name") or "").strip()
+            if name not in grouped:
+                order.append(name)
+                grouped[name] = []
+            grouped[name].append(row)
+        normalized_functional = []
+        remaining = (
+            max(0, explicit_total - len(characters))
+            if explicit_total is not None else None)
+        for position, name in enumerate(order):
+            rows = grouped[name]
+            total = sum(max(1, int(row.get("count") or 1)) for row in rows)
+            named = re.search(
+                re.escape(name) + r"\s*(\d{1,2})\s*(?:名|位|个)?(?:真人|人物|角色|人)",
+                executable)
+            if named:
+                count = max(0, int(named.group(1)))
+            elif (len(rows) > 1 and remaining is not None
+                    and len(order) == 1):
+                count = remaining
+            elif (len(rows) > 1
+                    and name in evidence
+                    and any(token in evidence for token in (
+                        "同一", "重复", "分身", "时间状态", "时间阶段"))):
+                count = 1
+            else:
+                count = total
+            if remaining is not None:
+                count = min(count, remaining)
+                remaining = max(0, remaining - count)
+            if count <= 0:
+                continue
+            # The last row is normally the requested freeze/end state.  Keep
+            # its useful role label, but never the preceding temporal copies.
+            chosen = copy.deepcopy(rows[-1])
+            chosen["count"] = count
+            normalized_functional.append(chosen)
+
+        if explicit_total is None:
+            visible_count = len(characters) + sum(
+                int(row.get("count") or 0)
+                for row in normalized_functional)
+        else:
+            visible_count = explicit_total
+
+        frame_target = repaired.get("frame_target") or {}
+        phase = str(
+            frame_target.get("phase")
+            if isinstance(frame_target, dict) else "").strip().lower()
+        if phase not in {"start", "freeze", "end"}:
+            if any(token in executable for token in (
+                    "终点", "完成后", "最终状态", "已收入", "已完成")):
+                phase = "end"
+            else:
+                phase = "freeze"
+        phase_label = {"start": "起点", "freeze": "冻结点", "end": "终点"}[
+            phase]
+
+        manifest = copy.deepcopy(repaired.get("reference_manifest") or [])
+        identity_names = list(dict.fromkeys(
+            str(row.get("character") or row.get("label") or "").strip()
+            for row in manifest if isinstance(row, dict)
+            and str(row.get("role") or "") in {
+                "identity", "identity_detail", "headwear", "wardrobe"}
+            and str(row.get("character") or row.get("label") or "").strip()))
+        scene_labels = list(dict.fromkeys(
+            str(row.get("label") or "场景基准图").strip()
+            for row in manifest if isinstance(row, dict)
+            and str(row.get("role") or "") in {"scene", "spatial"}))
+        lines = [
+            "【返工静态合同v1】",
+            f"【当前相位】{phase_label}；只生成一张静态画面，不表现此前或随后动作过程。",
+            "【唯一画面】" + executable,
+        ]
+        if identity_names:
+            lines.append(
+                "【身份锚】" + "、".join(identity_names[:8])
+                + "的脸、发型、年龄、性别和妆造服从对应身份参考图。")
+        if scene_labels:
+            lines.append(
+                "【场景锚】" + "、".join(scene_labels[:4])
+                + "只锁空间结构、材质和主光方向，不带入图中人物或文字。")
+        if visible_count == 0:
+            lines.append("【人数】空镜，画面中不出现人物或人形倒影。")
+        elif visible_count == 1:
+            lines.append("【人数】严格单人，不新增、复制或生成倒影人形。")
+        else:
+            lines.append(
+                f"【人数】画面严格共{visible_count}人，不新增、复制或生成倒影人形。")
+        static_prompt = "\n".join(lines)[:2600]
+
+        repaired.update({
+            "prompt": static_prompt,
+            "prompt_compact": static_prompt,
+            "_reference_prompt_base": static_prompt,
+            "prompt_aifos_original": static_prompt,
+            "feedback": "",
+            "action": executable,
+            "characters": characters,
+            "character_count": len(characters),
+            "functional_figures": normalized_functional,
+            "visible_figure_count": visible_count,
+            "frame_target": {"phase": phase, "state": executable},
+            "prompt_contract_complete": True,
+            "_repair_static_contract_replaced": True,
+        })
+        repaired.pop("prompt_review", None)
+        repaired.pop("prompt_review_feedback_applied", None)
+        repaired.pop("_prompt_review_frozen_input_hash", None)
+
+        # The review context is explicit so old action/camera/style/contract
+        # fields elsewhere in a legacy payload cannot be reintroduced.
+        repaired["prompt_contract"] = {
+            "schema": "aifos.shot-repair-static-contract/v1",
+            "phase": phase,
+            "single_static_frame": True,
+            "instruction": executable,
+            "visible_figure_count": visible_count,
+            "reference_roles": [
+                str(row.get("role") or "") for row in manifest
+                if isinstance(row, dict) and row.get("role")],
+        }
+        repaired["shot_contract"] = {
+            "phase": phase,
+            "single_static_frame": True,
+            "action": executable,
+        }
+        repaired["prompt_review_context"] = {
+            "shot_no": repaired.get("shot_no"),
+            "frame_kind": repaired.get("frame_kind") or "keyframe",
+            "phase": phase,
+            "characters": characters,
+            "character_count": len(characters),
+            "functional_figures": copy.deepcopy(normalized_functional),
+            "visible_figure_count": visible_count,
+            "action": executable,
+            "location": repaired.get("location") or "",
+            "prompt_contract": copy.deepcopy(repaired["prompt_contract"]),
+            "reference_manifest": manifest,
+        }
+
+        # A hidden/locked carrier must not keep the old readable-text gate.
+        hidden_text = any(token in executable for token in (
+            "不显示任何时间", "不显示文字", "无可读文字", "完全隐藏",
+            "锁屏并", "屏幕不可见"))
+        if hidden_text:
+            repaired["readable_text"] = {}
+            revised_qc["readable_text"] = {}
+
+        composition = copy.deepcopy(
+            repaired.get("composition_contract") or {})
+        if isinstance(composition, dict):
+            composition["expected_primary_count"] = len(characters)
+            composition["registered_character_count"] = len(characters)
+            composition["functional_figure_count"] = sum(
+                int(row.get("count") or 0)
+                for row in normalized_functional)
+            composition["expected_visible_figure_count"] = visible_count
+            composition["functional_figures"] = copy.deepcopy(
+                normalized_functional)
+            repaired["composition_contract"] = composition
+
+        revised_qc.update({
+            "characters": list(characters),
+            "count": visible_count,
+            "functional_figures": copy.deepcopy(normalized_functional),
+            "location": repaired.get("location") or revised_qc.get(
+                "location", ""),
+            "action": executable,
+            "camera": "",
+            "composition_contract": copy.deepcopy(composition),
+            "spatial_staging": {},
+        })
+        revised_qc["physical_contract"] = build_physical_contract({
+            "description": executable,
+            "action": executable,
+            "location": repaired.get("location") or "",
+            "readable_text": repaired.get("readable_text") or {},
+        })
+        repaired["physical_contract"] = copy.deepcopy(
+            revised_qc["physical_contract"])
+        return repaired, revised_qc
+
     def _generate_shot_candidate_group(
             self, capability, payload, out_dir, cancel, qc_spec):
         """首次即生成完整4张关键帧，不因某张质检通过早停。"""
@@ -7181,9 +7458,12 @@ class Director:
                     out_dir, cancel=cancel,
                     codex_profile=candidate_payload.get(
                         "_codex_profile", ""))
+            local_instruction = (
+                targeted_prompt_patch(diagnostics)
+                or "；".join(revision.get("instructions") or []))
             instruction = str(
                 (aggregate_report.get("codex_escalation") or {}).get(
-                    "instruction_to_aifos") or revision["text"] or "")
+                    "instruction_to_aifos") or local_instruction or "")
             repair_payload = copy.deepcopy(candidate_payload)
             repair_payload["_autonomous_repair_seeded"] = True
             repair_payload["_auto_repair_batches_used"] = \
@@ -7194,14 +7474,14 @@ class Director:
                 1, int(repair_payload.get("_contract_revision") or 1) + 1)
             repair_payload.pop("_candidate_set_id", None)
             repair_payload.pop("_resume_candidate_group", None)
-            repair_payload.pop("_prompt_review_frozen_input_hash", None)
             repair_payload["qc_consecutive_failures_base"] = 1
-            repair_payload["feedback"] = (
-                "【AI导演整镜修订·首轮四候选共同问题】"
-                + "；".join(merged_issues[:8])
-                + "\n【本轮唯一修订指令】" + instruction[:1800])
+            repair_payload, repair_qc_spec = \
+                self._replace_repair_static_contract(
+                    repair_payload, qc_spec, instruction,
+                    conflict_context="；".join(merged_issues[:12]))
             repaired = self._generate_repair_candidate_group(
-                capability, repair_payload, out_dir, cancel, qc_spec)
+                capability, repair_payload, out_dir, cancel,
+                repair_qc_spec)
             repaired.cost += float(selected.cost or 0.0) + escalation_cost
             repaired_data = getattr(repaired, "data", None) or {}
             repaired_group = repaired_data.get("candidate_group") or {}
@@ -15695,6 +15975,25 @@ class Director:
                 payload["_resume_candidate_group"] = copy.deepcopy(
                     prior_group)
             required_quality = payload["quality_decision"]["level"]
+            prior_qc_for_reuse = stored_prior.get("qc") or {}
+            prior_selection = (
+                (prior_group.get("selection") or {})
+                if isinstance(prior_group, dict) else {})
+            selected_uri = str(
+                prior_selection.get("selected_uri") or "")
+            valid_prior_ai_selection = bool(
+                prior_selection.get("source") == "ai"
+                and self._shot_candidate_group_valid(stored_prior)
+                and selected_uri
+                and (selected_uri.startswith(("http://", "https://"))
+                     or Path(selected_uri).is_file()))
+            prior_best_effort = bool(
+                prior_qc_for_reuse.get("best_effort_promoted")
+                or prior_selection.get("best_effort_risk"))
+            unresolved_prior_failure = bool(
+                prior_qc_for_reuse.get("passed") is False
+                and not prior_best_effort
+                and not valid_prior_ai_selection)
             # 旧版本遗留的“等待手机选片”候选组直接交给 AI 导演晋升，
             # 不再重新生成，也不会继续制造 awaiting_selection 门禁。
             if (stored_prior.get("status") == "awaiting_selection"
@@ -15729,7 +16028,8 @@ class Director:
             # canonical 输出就是导演选定稿。即使旧 QC 标成失败或当前
             # 分镜哈希因自动修订变化，也不得再次消耗生图额度；只有确实
             # 没有任何现成文件的镜头才继续创建一次生成任务。
-            if self._director_autonomy_enabled():
+            if (self._director_autonomy_enabled()
+                    and not unresolved_prior_failure):
                 # render_plan 会在分镜版本变化时重建，资产登记则只发生在
                 # QC 放行之后；两处都可能暂时看不到已真实写盘的冻结稿。
                 # Provider 的 canonical 文件名是最后一道断点事实源。
@@ -15808,7 +16108,8 @@ class Director:
             # 直接按当前已编译镜头合同生成一次，避免“已关闭质检”仍被
             # 历史质检状态拉回编剧修复/候选选优链。
             stored = (
-                {} if self._preview_qc_bypass_enabled()
+                {} if (self._preview_qc_bypass_enabled()
+                       and not self._director_autonomy_enabled())
                 else stored_prior)
             stored_qc = stored.get("qc") or {}
             stored_escalation = stored_qc.get("codex_escalation") or {}
@@ -15914,6 +16215,36 @@ class Director:
                     "director",
                     f"{task['item_id']} 上一轮三候选因产线中断未完成，"
                     "已从修订合同断点恢复并继续固定3张并行选优")
+            if unresolved_prior_failure:
+                repair_instruction = str(
+                    stored_escalation.get("instruction_to_aifos")
+                    or targeted_prompt_patch(
+                        stored_qc.get("input_diagnosis") or {})
+                    or stored_qc.get("revision_feedback") or "").strip()
+                if not repair_instruction:
+                    local_revision = optimize_qc_feedback(
+                        stored_qc.get("issues") or [], mode="image",
+                        readable_text=task["payload"].get(
+                            "readable_text"),
+                        diagnostics=stored_qc.get("input_diagnosis"))
+                    repair_instruction = (
+                        local_revision.get("targeted_prompt_patch")
+                        or "；".join(
+                            local_revision.get("instructions") or []))
+                task["payload"], task["qc_spec"] = \
+                    self._replace_repair_static_contract(
+                        task["payload"], task.get("qc_spec") or {},
+                        repair_instruction,
+                        conflict_context="；".join(
+                            str(value) for value in (
+                                stored_qc.get("issues") or [])[:12]))
+                task["payload"]["_autonomous_repair_seeded"] = True
+                task["payload"]["qc_consecutive_failures_base"] = max(
+                    1, int(stored_qc.get("consecutive_failures") or 1))
+                self.log.info(
+                    "director",
+                    f"{task['item_id']} 历史失败稿未曾由AI选优晋升；"
+                    "已舍弃旧冲突合同并直接进入固定3张修订组")
             payload = task["payload"]
             quality_by_shot[shot["shot_no"]] = payload["quality_decision"]
             payload_by_shot[shot["shot_no"]] = payload

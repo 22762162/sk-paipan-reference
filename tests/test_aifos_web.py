@@ -529,6 +529,11 @@ def test_asset_delete_and_video_reference_api(server):
 
 def test_episode_exposes_image_failures_with_artifact_urls(server):
     """二次 QC 失败必须成为可预览、可定位到镜头的待人工问题。"""
+    # 这是旧式严格质检接口的兼容性用例；默认选优模式会把相同历史
+    # 失败自动转成交由系统补抽 3 张，不再暴露人工阻断。
+    set_defaults(server["workspace"] / "config.json", {
+        "selection_mode": False,
+    })
     app2 = App(server["workspace"])
     try:
         project, _ = app2.projects.get_or_create_project("图片待人工接口")

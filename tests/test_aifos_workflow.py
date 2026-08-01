@@ -169,6 +169,37 @@ def test_enrich_tolerates_loose_ai_storyboard(tmp_path):
     assert all(s["seedance_prompt"] for s in shots)
 
 
+def test_functional_figure_temporal_rows_collapse_to_concurrent_peak():
+    from aifos.workflow import (_functional_figure_count,
+                                _normalize_functional_figures)
+
+    figures = _normalize_functional_figures([
+        {"name": "小吴", "count": 1,
+         "state": "驾驶中", "function": "司机"},
+        {"name": "小吴", "count": 1,
+         "state": "车辆停稳", "function": "接受委托"},
+        {"name": "小吴", "count": 1,
+         "state": "站在车外", "function": "递交白酒"},
+        {"label": "保安", "count": 2,
+         "state": "门口值守", "function": "维持秩序"},
+        {"label": "保安", "count": 3,
+         "state": "大堂列队", "function": "封锁出口"},
+    ])
+
+    assert len(figures) == 2
+    assert figures[0] == {
+        "name": "小吴", "count": 1,
+        "state": "驾驶中；车辆停稳；站在车外",
+        "function": "司机；接受委托；递交白酒",
+    }
+    assert figures[1] == {
+        "label": "保安", "count": 3,
+        "state": "门口值守；大堂列队",
+        "function": "维持秩序；封锁出口",
+    }
+    assert _functional_figure_count(figures) == 4
+
+
 def test_environment_shot_remains_strictly_empty(tmp_path):
     """空镜不再从场次人物表擅自补入第一名角色。"""
     from aifos.workflow import (build_continuity_bible, enrich_storyboard,
