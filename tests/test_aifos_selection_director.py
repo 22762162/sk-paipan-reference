@@ -168,7 +168,14 @@ def test_four_candidates_share_one_reviewed_contract_and_overlap(tmp_path):
     assert len({row["prompt_hash"] for row in candidates}) == 1
     assert len({row["reference_hash"] for row in candidates}) == 1
     assert len({row["input_hash"] for row in candidates}) == 1
-    assert len({row["candidate_seed"] for row in candidates}) == 4
+    assert {row["candidate_seed"] for row in candidates} == {None}
+    assert len({row["candidate_variation_key"] for row in candidates}) == 4
+    assert all(row["seed_consumed"] is False for row in candidates)
+    assert all(row["reproducible"] is False for row in candidates)
+    assert all(
+        row["candidate_seed_semantics"]
+        == "request_variation_marker_not_reproducible"
+        for row in candidates)
     assert {row["candidate_set_token"] for row in candidates} == {
         group["candidate_set_token"]}
     assert len({row["candidate_id"] for row in candidates}) == 4

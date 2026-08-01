@@ -17,6 +17,11 @@ from aifos.errors import ProviderError
 @pytest.fixture()
 def app(tmp_path):
     instance = App(tmp_path / "ws")
+    # 这些用例覆盖严格QC后的Codex自动修订链；创作选片模式默认关闭
+    # 内容QC，故在本测试域显式启用旧严格路径。
+    instance.config.data.setdefault("defaults", {})[
+        "selection_mode"] = False
+    instance.config.data["defaults"]["image_content_qc"] = True
     yield instance
     instance.close()
 

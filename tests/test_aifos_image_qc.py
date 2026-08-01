@@ -15,6 +15,12 @@ from aifos.production.base import ProviderResult
 @pytest.fixture()
 def app(tmp_path):
     instance = App(tmp_path / "ws")
+    # 本文件验证旧严格内容QC、自动修订与单图返工语义。新默认选片模式
+    # 会有意关闭这些内容判定，因此必须显式关闭选片模式，避免把产品
+    # 默认变化误报成严格模式回归。
+    instance.config.data.setdefault("defaults", {})[
+        "selection_mode"] = False
+    instance.config.data["defaults"]["image_content_qc"] = True
     yield instance
     instance.close()
 

@@ -7,6 +7,7 @@
 """
 
 import copy
+import difflib
 import hashlib
 import json
 import re
@@ -3457,6 +3458,14 @@ class Director:
 
     def _plan_seed(self, ctx, category, items):
         """登记(或刷新)某分类要生成的全部图片;同 id 条目保留状态。"""
+        # Seeding is a read-modify-write transaction.  Locking only
+        # _plan_read/_plan_write leaves a window where another worker can
+        # publish status or candidate metadata and this refresh overwrites it.
+        with _PLAN_IO_LOCK:
+            return self._plan_seed_locked(ctx, category, items)
+
+    def _plan_seed_locked(self, ctx, category, items):
+        """Implementation for :meth:`_plan_seed`; caller holds plan lock."""
         plan = self._plan_read(ctx)
         old = {i["id"]: i for i in plan["items"]
                if i.get("category") == category}
@@ -5462,21 +5471,19 @@ class Director:
                 checked_true(verdict.get("pass"))
                 and not visual_hard_failure)
         # A merely verbose prompt stays advisory. A story/logic/reference
-        # contradiction is a hard input failure: repair it and make the second
-        # attempt from changed input instead of certifying an accidental image.
-        # 画面逐项达标(身份/性别/服装/人数/叠层/物理/空间全 True,质检自己
-        # 也判 visual_pass)时,「输入合同诊断不完美」不再判失败。
-        # 理由:contract_hard_failure 说的是「没按一份可能本来就错的合同
-        # 拍」,不是画面有错;而 Codex 的合同修改指令现在由
-        # _auto_apply_codex_escalation 自动落实,合同该修照修、后续镜头照样
-        # 受益,没必要再把这一张合格图判死。旧口径下这类图会连重两轮后锁进
-        # 待人工,而它的问题全部标着 [建议·不影响通过](ep1 shot:8 实案)。
-        # hard_failure 早就按同一口径修过,这里补上 passed,两者语义统一。
+        # contradiction is a hard input failure: repair it before certifying
+        # any render. 画面偶然“看起来对”不能掩盖一份冲突的参考图或事实
+        # 合同，否则同一合同进入首尾帧和视频后仍会复发。创作选片模式不会
+        # 调用这条内容判定链，因此这里保持严格也不会重新阻断四候选生产。
         contract_only_defect = contract_hard_failure and image_passed \
             and visual_checks_passed
+        contract_only_advisory = bool(issues) and all(
+            "[建议·不影响通过]" in issue for issue in issues)
+        effective_contract_hard_failure = (
+            contract_hard_failure and not contract_only_advisory)
         passed = (
             image_passed and visual_checks_passed
-            and (not contract_hard_failure or contract_only_defect))
+            and not effective_contract_hard_failure)
         report = {
             "passed": passed,
             "issues": issues,
@@ -5514,14 +5521,15 @@ class Director:
             "input_contract_passed": input_contract_passed,
             "input_contract_pass": input_contract_passed,
             "redraw_required": bool(
-                not image_passed or contract_hard_failure),
+                not image_passed or effective_contract_hard_failure),
             "contract_repair_required": not input_contract_passed,
             "production_ready": passed,
             "qc_policy": "visible_major_defects_v2",
             "input_contract_advisory": not input_contract_passed,
-            # 审计:这张图是「画面达标但合同诊断不完美」被放行的,合同本身
-            # 仍要靠 Codex 指令自动修,不是无声吞掉。
+            # 审计:画面可能达标，但输入合同仍必须修正；不得把偶然正确
+            # 误记成正式通过。
             "contract_only_defect": contract_only_defect,
+            "contract_only_advisory": contract_only_advisory,
             # hard_failure 的语义是「不能出街、也不允许人工放行」——身份、
             # 性别、人数这类硬伤。合同不一致(景别/焦段/机位与合同对不上)
             # 不属于这一档:画面本身可能完全达标,只是没按一份可能本来就
@@ -5532,7 +5540,7 @@ class Director:
             # 画面自身没过时,合同不一致仍并入硬伤——那才是真要重画。
             "hard_failure": bool(
                 visual_hard_failure and not image_passed
-                or (contract_hard_failure and not image_passed)),
+                or effective_contract_hard_failure),
             "contract_hard_failure": contract_hard_failure,
         }
         report.update({
@@ -5963,12 +5971,28 @@ class Director:
             if (not uri.startswith(("http://", "https://"))
                     and not Path(uri).exists()):
                 raise AifosError(f"候选图{index}产物未落盘:{uri}")
+            result_data = getattr(result, "data", None) or {}
+            # Most current image providers deliberately do not expose a seed
+            # contract (Seedream included).  Keep a stable variation key for
+            # audit/four-slot identity, but only call it a reproducible seed
+            # when the provider explicitly confirms consumption.
+            seed_consumed = bool(result_data.get("seed_consumed"))
             return index, result, {
                 "pull": index,
                 "candidate_index": index,
                 "candidate_id": f"{version.token}#{index}",
                 "candidate_set_token": result_version.candidate_set_token,
-                "candidate_seed": seed,
+                "candidate_seed": seed if seed_consumed else None,
+                "candidate_variation_key": f"variation-{seed:08x}",
+                "seed_requested": seed,
+                "seed_consumed": seed_consumed,
+                "reproducible": seed_consumed,
+                "candidate_seed_semantics": (
+                    "provider_reproducible_seed" if seed_consumed
+                    else "request_variation_marker_not_reproducible"),
+                "variation_strategy": (
+                    "provider_seed" if seed_consumed
+                    else "independent_provider_generation"),
                 "uri": uri,
                 "passed": bool(report.get("passed")),
                 "score": self._image_qc_selection_score(report),
@@ -6065,12 +6089,14 @@ class Director:
         recommended_candidate = recommended_result[1]
         recommended_index = int(
             recommended_candidate.get("candidate_index") or 0)
-        selected = next(
-            (result for result, _candidate in ordered
-             if result is not None),
+        selected = (
+            recommended_result[0]
+            if recommended_result[0] is not None else next(
+                (result for result, _candidate in ordered
+                 if result is not None), None)) or \
             SimpleNamespace(
                 provider="", model="", cost=0.0, data={}, uri="",
-                fallbacks=[]))
+                fallbacks=[])
         candidate_errors = [
             {**failures[index], "retryable": False}
             for index in sorted(failures)]
@@ -6145,6 +6171,70 @@ class Director:
                 "director",
                 f"镜头{working_payload.get('shot_no', '')} 候选技术补位后"
                 f"仍为{len(candidates)}/{pulls}；成功图已保留，缺槽位可续补")
+        return selected
+
+    def _ai_promote_generated_candidate_group(self, selected):
+        """Promote a QC-passing current candidate in legacy strict mode.
+
+        Creative selection mode always waits for an explicit later choice.
+        This helper is deliberately downstream of the immutable candidate
+        version builder and calls the same promotion policy as the public CAS
+        selector; it does not relax or bypass that validator.
+        """
+        if self._selection_mode_enabled() or not self._image_qc_enabled():
+            return selected
+        data = getattr(selected, "data", None) or {}
+        group = data.get("candidate_group") or {}
+        if not isinstance(group, dict) or not group.get("complete"):
+            return selected
+        candidates = group.get("candidates") or []
+        try:
+            index = int(group.get("recommended_candidate_index") or 0)
+            current_version = CandidateSetVersion(**(
+                group.get("version") or {}))
+        except (TypeError, ValueError):
+            return selected
+        candidate = next((
+            row for row in candidates
+            if int((row or {}).get("candidate_index") or 0) == index
+        ), None)
+        if candidate is None or candidate.get("passed") is not True:
+            return selected
+        result_version = CandidateResultVersion(
+            candidate_set_token=str(
+                candidate.get("candidate_set_token") or ""),
+            candidate_index=index)
+        decision = evaluate_candidate_promotion(
+            result_version, current_version, selection_source="ai")
+        if not decision.allowed:
+            return selected
+        selected_uri = str(candidate.get("uri") or "")
+        if (not selected_uri
+                or (not selected_uri.startswith(("http://", "https://"))
+                    and not Path(selected_uri).is_file())):
+            return selected
+        selection = {
+            "candidate_set_id": str(group.get("candidate_set_id") or ""),
+            "candidate_set_token": current_version.token,
+            "token": current_version.token,
+            "candidate_revision": current_version.candidate_revision,
+            "candidate_id": str(candidate.get("candidate_id") or ""),
+            "candidate_index": index,
+            "candidate_seed": candidate.get("candidate_seed"),
+            "candidate_variation_key": candidate.get(
+                "candidate_variation_key"),
+            "seed_consumed": bool(candidate.get("seed_consumed")),
+            "selected_uri": selected_uri,
+            "source": "ai",
+            "selected_at": now(),
+            "promotion_policy": decision.reason,
+        }
+        group["selection"] = copy.deepcopy(selection)
+        group["selection_required"] = False
+        data["candidate_group"] = group
+        data["selection"] = copy.deepcopy(selection)
+        selected.data = data
+        selected.uri = selected_uri
         return selected
 
     def _generate_image_gacha(self, capability, payload, out_dir,
@@ -6410,7 +6500,7 @@ class Director:
             capability, candidate_payload, out_dir, cancel, qc_spec)
         report = getattr(selected, "qc", None) or {}
         if not self._image_qc_enabled() or report.get("passed"):
-            return selected
+            return self._ai_promote_generated_candidate_group(selected)
         # 旧严格模式仍保留原有的 Codex 根因分析/修复链；
         # 选片模式和图片内容QC关闭时不会进入这条分支。
         generation_input = report.get("generation_input") or \
@@ -6429,42 +6519,20 @@ class Director:
 
     def _generate_repair_candidate_group(
             self, capability, payload, out_dir, cancel, qc_spec):
-        """用同一份 Codex 修订合同生成4张，全部判分后自动选优。
+        """Regenerate the current frozen contract through the four-slot path.
 
-        三张全败时，只对最高分候选再做一次 Codex 根因分析，产出下一轮
-        可执行修改指令；不会把三个候选分别改成三套互相漂移的合同。
+        Selection/content-QC-off modes must never fall back to the historical
+        single-canonical gacha path.  Strict mode uses the same four candidates
+        and promotes only a QC-passing best result through the AI promotion
+        policy.  A second failed strict batch is diagnosed but never blindly
+        redrawn again.
         """
         candidate_payload = copy.deepcopy(payload or {})
-        # 这是旧严格QC模式的“修订后自动选优”路径，不是新创作选片组。
-        # 若误标为 selection_candidate_group，会要求 episode token 且禁止
-        # 自动晋升，既破坏旧模式也会丢失首轮经验。新选片模式内容QC关闭，
-        # 不会进入本函数；它由 _generate_shot_candidate_group 单独负责。
-        candidate_payload.pop("_selection_candidate_group", None)
-        candidate_payload["_qc_candidate_only"] = True
-        candidate_payload["_gacha_pulls_override"] = \
-            self._shot_candidate_count()
-        candidate_payload["_gacha_select_best_after_all"] = True
         candidate_payload["qc_consecutive_failures_base"] = max(
             1, int(candidate_payload.get(
                 "qc_consecutive_failures_base") or 1))
-        selected = self._generate_image_gacha(
+        return self._generate_shot_candidate_group(
             capability, candidate_payload, out_dir, cancel, qc_spec)
-        report = getattr(selected, "qc", None) or {}
-        if not self._image_qc_enabled() or report.get("passed"):
-            return selected
-        generation_input = report.get("generation_input") or \
-            self._image_generation_input(
-                candidate_payload, qc_spec=qc_spec)
-        report["consecutive_failures"] = max(
-            2, int(report.get("consecutive_failures") or 0))
-        report, escalation_cost = self._escalate_failed_image_to_codex(
-            report, qc_spec, self._candidate_diagnostic_uri(selected),
-            generation_input, out_dir,
-            cancel=cancel,
-            codex_profile=candidate_payload.get("_codex_profile", ""))
-        selected.cost += escalation_cost
-        selected.qc = report
-        return selected
 
     @staticmethod
     def _repeated_core_issues(attempt_history):
@@ -7700,6 +7768,16 @@ class Director:
         # parallel_images 表示每条通道的容量，不是所有通道合计容量：
         # 单通道最多 8 路；A/B/C 三通道就合计最多 24 路。
         workers = self._total_image_workers()
+        # A shot task fans out into four provider calls.  Treat configured
+        # image workers as the global call budget rather than nesting N outer
+        # shot workers × 4 inner candidates (which previously turned 8 into
+        # 32 live calls and caused rate-limit/restart cascades).
+        candidate_fanout = self._shot_candidate_count() if any(
+            task.get("capability") == "image"
+            and str(task.get("item_id") or "").startswith("shot:")
+            for task in tasks) else 1
+        if candidate_fanout > 1:
+            workers = max(1, workers // candidate_fanout)
         if workers == 1 or len(tasks) == 1:
             out, qc_failures = {}, list(blocked)
             for task in tasks:
@@ -13701,6 +13779,15 @@ class Director:
             payload["prompt_compact"] = base_prompt
 
     def reconcile_completed_shot_images(self, ctx):
+        """Atomically reconcile render-plan shot images with formal assets."""
+        # This routine resets stale claims, mutates several plan rows and then
+        # writes the complete plan.  Hold one RMW lock for the entire pass so a
+        # live candidate/status update cannot be replaced by the snapshot read
+        # at the beginning of reconciliation.
+        with _PLAN_IO_LOCK:
+            return self._reconcile_completed_shot_images_locked(ctx)
+
+    def _reconcile_completed_shot_images_locked(self, ctx):
         """补登记旧批次已通过 QC、但因批次中途失败而遗留的关键帧。
 
         旧并行调度会先把每张图及 QC 状态写入 render_plan，随后才批量
@@ -13777,9 +13864,15 @@ class Director:
                     and not Path(uri).exists()):
                 continue
             qc = item.get("qc") or {}
-            candidate_group_valid = self._shot_candidate_group_valid(item)
-            if not image_content_qc and not candidate_group_valid:
-                # 未归档4张的历史产物只保留查看，不进入正式参考链。
+            has_candidate_group = "candidate_group" in item
+            candidate_group_valid = (
+                self._shot_candidate_group_valid(item)
+                if has_candidate_group else True)
+            if (not image_content_qc and has_candidate_group
+                    and not candidate_group_valid):
+                # 新候选记录必须证明4张均已落盘；没有 candidate_group 字段
+                # 的旧存量仍按旧资产+镜头内容哈希规则复用，不能被升级时
+                # 误判成“缺4张”而整集重画。
                 if item.get("status") != "pending":
                     item["status"] = "pending"
                     changed = True
@@ -19100,7 +19193,8 @@ class Director:
     def regenerate_shot_candidates(
             self, project_title, episode_number, shot_no,
             expected_candidate_set_id, expected_candidate_set_token,
-            expected_candidate_revision, prompt, confirm=False):
+            expected_candidate_revision, prompt, confirm=False,
+            user_feedback=""):
         """Retire one four-image set and queue a fresh four-image revision.
 
         This method deliberately does not call an image provider.  It commits
@@ -19157,6 +19251,11 @@ class Director:
                 raise AifosError(
                     "stale_candidate_set: 候选组已更新，请刷新后再全部重生成")
 
+            previous_prompt = str(
+                item.get("prompt_used") or item.get("prompt") or "")
+            regeneration_audit = self._candidate_regeneration_audit(
+                previous_prompt, full_prompt, user_feedback=user_feedback)
+
             new_candidate_revision = max(1, old_candidate_revision + 1)
             new_contract_revision = max(1, old_contract_revision + 1)
             candidate_set_id = hashlib.sha256(
@@ -19171,6 +19270,8 @@ class Director:
                 "retired_reason": "user_regenerate_all_candidates",
                 "replaced_by_candidate_set_id": candidate_set_id,
                 "render_qc": copy.deepcopy(item.get("qc")),
+                "regeneration_feedback": copy.deepcopy(
+                    regeneration_audit),
             })
             history.append(retired)
             pending_group = {
@@ -19190,6 +19291,8 @@ class Director:
                 "generation_status": "regenerating_candidates",
                 "requested_at": now(),
                 "prompt_hash": self._stable_hash(full_prompt),
+                "regeneration_feedback": copy.deepcopy(
+                    regeneration_audit),
             }
 
             # Invalidate the formal chain before publishing the new pending
@@ -19267,6 +19370,8 @@ class Director:
             item["prompt_used"] = full_prompt
             item["prompt_used_hash"] = self._stable_hash(full_prompt)
             item["prompt_aifos_original"] = full_prompt
+            item["candidate_regeneration_feedback"] = copy.deepcopy(
+                regeneration_audit)
             item.pop("prompt_optimized", None)
             item.pop("prompt_review", None)
             item.pop("selection", None)
@@ -19293,6 +19398,31 @@ class Director:
                     "invalidated_outputs") or [],
                 "affected_shots": affected_shots,
             }
+
+    def _candidate_regeneration_audit(
+            self, previous_prompt, new_prompt, *, user_feedback=""):
+        """Persist actionable user feedback without promoting it to a rule."""
+        previous_prompt = str(previous_prompt or "")
+        new_prompt = str(new_prompt or "")
+        feedback_text = re.sub(
+            r"\s+", " ", str(user_feedback or "").strip())[:1200]
+        if not feedback_text:
+            feedback_text = (
+                "用户明确要求整组重新生成，并以本次提交的新提示词"
+                "替换上一版镜头合同")
+        prompt_diff = "\n".join(difflib.unified_diff(
+            previous_prompt.splitlines(), new_prompt.splitlines(),
+            fromfile="previous_prompt", tofile="new_prompt",
+            lineterm=""))[:6000]
+        return {
+            "requested_at": now(),
+            "source": "user_regenerate_all_candidates",
+            "user_feedback": feedback_text,
+            "previous_prompt_hash": self._stable_hash(previous_prompt),
+            "new_prompt_hash": self._stable_hash(new_prompt),
+            "prompt_changed": previous_prompt != new_prompt,
+            "prompt_diff": prompt_diff,
+        }
 
     def _invalidate_cast_assets(self, project, script, reason,
                                 character_name="", prop_name="",
