@@ -6411,7 +6411,11 @@ class Director:
         可执行修改指令；不会把三个候选分别改成三套互相漂移的合同。
         """
         candidate_payload = copy.deepcopy(payload or {})
-        candidate_payload["_selection_candidate_group"] = True
+        # 这是旧严格QC模式的“修订后自动选优”路径，不是新创作选片组。
+        # 若误标为 selection_candidate_group，会要求 episode token 且禁止
+        # 自动晋升，既破坏旧模式也会丢失首轮经验。新选片模式内容QC关闭，
+        # 不会进入本函数；它由 _generate_shot_candidate_group 单独负责。
+        candidate_payload.pop("_selection_candidate_group", None)
         candidate_payload["_qc_candidate_only"] = True
         candidate_payload["_gacha_pulls_override"] = \
             self._shot_candidate_count()
