@@ -13,6 +13,7 @@ import re
 import shutil
 import threading
 import time
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -73,6 +74,13 @@ from .seedance_policy import (
     SeedancePolicyError,
     normalize_tier,
     requested_upgrade_reason,
+)
+from .selection_mode import (
+    CandidateResultVersion,
+    CandidateSetVersion,
+    build_candidate_result_versions,
+    build_candidate_set_version,
+    evaluate_candidate_promotion,
 )
 from .rule_governance import next_revision_round, stack_revision_feedback
 from .spatial_language import derive_movement_term, spatial_lines
@@ -960,6 +968,9 @@ class Director:
             if (stage == "cast" and ctx.get("cast_selection_required")):
                 paused = "cast"
                 break
+            if (stage == "images" and ctx.get("shot_selection_required")):
+                paused = "images"
+                break
             if pause_for_confirm and stage == CONFIRM_AFTER:
                 paused = "preflight"
                 break
@@ -1326,6 +1337,9 @@ class Director:
             for task in group:
                 payload = task["payload"]
                 audit = payload.get("prompt_review") or {}
+                reviewed_input = self._image_generation_input(payload)
+                payload["_prompt_review_frozen_input_hash"] = \
+                    reviewed_input["input_hash"]
                 self._plan_mark(
                     ctx, task["item_id"],
                     self._plan_read_status(ctx, task["item_id"]),
@@ -3447,7 +3461,11 @@ class Director:
                             "prompt_used_hash", "generation_input",
                             "prompt_contract_validation", "output_uri",
                             "autonomous_repair_seeded",
-                            "codex_contract_repair_count"):
+                            "codex_contract_repair_count",
+                            "candidate_group", "candidate_uris",
+                            "candidate_count", "candidate_set_token",
+                            "candidate_revision", "selection",
+                            "selection_required", "technical_incomplete"):
                     if key in prev:
                         item[key] = prev[key]
                 if prev.get("custom_prompt"):
@@ -4015,8 +4033,10 @@ class Director:
         # Codex 的 aifos_action 在这里真正分派:判「改合同/拆镜/人工」时
         # 熔断在生图 API 之前,不把升级指令当普通修改意见再烧一张。
         # 必须放在提示词审核之后——审核会改写提示词,哈希要同口径比。
-        escalation_block = self.escalation_redraw_block(
-            payload.get("qc_escalation"), generation_input)
+        escalation_block = (
+            self.escalation_redraw_block(
+                payload.get("qc_escalation"), generation_input)
+            if self._image_qc_enabled() else "")
         if escalation_block:
             self._plan_mark(
                 ctx, item_id, "awaiting_human", error=escalation_block[:300])
@@ -4057,8 +4077,59 @@ class Director:
         return result
 
     # ---- 图片视觉质检:生成后核对剧本要求,不合格自动带意见重画 ----
+    @staticmethod
+    def _setting_enabled(value, default=True):
+        """配置布尔值兼容 YAML/JSON 以及旧版字符串写法。"""
+        if value is None:
+            return bool(default)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ("", "off", "false", "0", "no", "disabled"):
+                return False
+            if normalized in (
+                    "on", "true", "1", "yes", "enabled", "selection"):
+                return True
+        return bool(value)
+
+    def _selection_mode_enabled(self):
+        return self._setting_enabled(self.config.get(
+            "defaults", "selection_mode", default=True), default=True)
+
     def _image_qc_enabled(self):
-        return bool(self.config.get("defaults", "image_qc", default=True))
+        """图片内容 QC 开关；不影响生成前提示词审核。
+
+        ``image_content_qc`` 是新设置页的权威键；未配置时才
+        回退到旧 ``image_qc``，保证历史项目语义不变。选片模式
+        只关闭生成后内容判定/返工，Codex 提示词合同仍必审。
+        """
+        if self._selection_mode_enabled():
+            return False
+        value = self.config.get(
+            "defaults", "image_content_qc", default=None)
+        if value is None:
+            value = self.config.get(
+                "defaults", "image_qc", default=True)
+        return self._setting_enabled(value, default=True)
+
+    def _video_content_qc_enabled(self):
+        if self._selection_mode_enabled():
+            return False
+        return self._setting_enabled(self.config.get(
+            "defaults", "video_content_qc", default=True), default=True)
+
+    def _shot_candidate_count(self):
+        """关键帧新产线固定四候选，配置值只用于审计兼容。"""
+        try:
+            configured = int(self.config.get(
+                "defaults", "shot_candidate_count", default=4))
+        except (TypeError, ValueError):
+            configured = 4
+        if configured != 4:
+            self.log.warn(
+                "director",
+                f"shot_candidate_count={configured} 不在当前标准内，"
+                "已按每镜固定4张执行")
+        return 4
 
     def _dual_review_enabled(self, consecutive_failures=0):
         """双路会诊开关:默认只在首检失败后启用(诊断最值钱的地方)。
@@ -5788,9 +5859,273 @@ class Director:
             pulls = default
         return max(1, min(pulls, 4))
 
+    def _generate_selection_candidates_parallel(
+            self, capability, payload, out_dir, cancel, qc_spec, pulls):
+        """四路候选真并行：一次审核冻结合同，各自写独立目录。"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        working_payload = copy.deepcopy(payload or {})
+        if not isinstance(working_payload.get("reference_manifest"), list):
+            self._attach_reference_manifest(working_payload)
+        # Prompt review 与内容 QC 是两个闸门；选片模式仍先审核
+        # 并冻结一份精准提示词，不让4个worker各自改写。
+        before_review = self._image_generation_input(
+            working_payload, qc_spec=qc_spec)
+        already_reviewed = (
+            str(working_payload.get(
+                "_prompt_review_frozen_input_hash") or "")
+            == before_review["input_hash"])
+        review = None
+        if not already_reviewed:
+            review = self.router.review_image_prompt(
+                capability, working_payload, out_dir, cancel=cancel)
+        review_cost = float(review.cost or 0.0) if review is not None else 0.0
+        frozen_input = self._image_generation_input(
+            working_payload, qc_spec=qc_spec)
+        # 候选 worker 只能复用这一次已批准的冻结合同。marker 必须与
+        # 输入哈希同时匹配；任何提示词/参考图变化都会自动失效并重新审核。
+        working_payload["_prompt_review_frozen_input_hash"] = \
+            frozen_input["input_hash"]
+        frozen_prompt_hash = frozen_input["prompt_hash"]
+        frozen_reference_hash = frozen_input["reference_hash"]
+        frozen_input_hash = frozen_input["input_hash"]
+        version = build_candidate_set_version(
+            episode_id=working_payload.get("_episode_id"),
+            shot_no=working_payload.get("shot_no"),
+            contract_revision=working_payload.get(
+                "_contract_revision") or 1,
+            candidate_revision=working_payload.get(
+                "_candidate_revision") or 1,
+            prompt=frozen_input["prompt"],
+            reference_manifest=frozen_input["reference_manifest"],
+        )
+        version_data = asdict(version)
+        result_versions = {
+            item.candidate_index: item
+            for item in build_candidate_result_versions(version)}
+        candidate_set_id = str(
+            working_payload.get("_candidate_set_id")
+            or version.token.split(":", 1)[-1][:16])
+        root = Path(out_dir) / "candidate_sets" / candidate_set_id
+        root.mkdir(parents=True, exist_ok=True)
+
+        def generate_one(index):
+            candidate_payload = copy.deepcopy(working_payload)
+            result_version = result_versions[index]
+            seed = int(hashlib.sha256(
+                f"{candidate_set_id}:{index}".encode("utf-8")
+            ).hexdigest()[:8], 16)
+            candidate_payload.update({
+                "_candidate_set_id": candidate_set_id,
+                "_candidate_index": index,
+                "_candidate_seed": seed,
+                "seed": seed,
+                "candidate_set_token": result_version.candidate_set_token,
+                "candidate_index": result_version.candidate_index,
+                # 每张可独立记录 QC，但不在候选worker内自动修图。
+                "_qc_candidate_only": True,
+            })
+            candidate_out = root / f"candidate_{index:02d}"
+            candidate_out.mkdir(parents=True, exist_ok=True)
+            result = self._generate_image_with_qc(
+                capability, candidate_payload, candidate_out,
+                cancel, qc_spec)
+            candidate_input = self._image_generation_input(
+                candidate_payload, qc_spec=qc_spec)
+            report = getattr(result, "qc", None) or {}
+            uri = str(result.uri or "")
+            if not uri:
+                raise AifosError(f"候选图{index}未返回产物地址")
+            if (not uri.startswith(("http://", "https://"))
+                    and not Path(uri).exists()):
+                raise AifosError(f"候选图{index}产物未落盘:{uri}")
+            return index, result, {
+                "pull": index,
+                "candidate_index": index,
+                "candidate_id": f"{version.token}#{index}",
+                "candidate_set_token": result_version.candidate_set_token,
+                "candidate_seed": seed,
+                "uri": uri,
+                "passed": bool(report.get("passed")),
+                "score": self._image_qc_selection_score(report),
+                "issues": list(report.get("issues") or [])[:8],
+                "prompt_hash": candidate_input["prompt_hash"],
+                "reference_hash": candidate_input["reference_hash"],
+                "input_hash": candidate_input["input_hash"],
+                "provider": getattr(result, "provider", ""),
+                "model": getattr(result, "model", ""),
+            }
+
+        results = {}
+        resume_group = working_payload.get("_resume_candidate_group") or {}
+        if (isinstance(resume_group, dict)
+                and resume_group.get("candidate_set_id") == candidate_set_id
+                and resume_group.get("candidate_set_token") == version.token
+                and resume_group.get("frozen_input_hash")
+                == frozen_input_hash):
+            for candidate in resume_group.get("candidates") or []:
+                try:
+                    index = int(candidate.get("candidate_index") or 0)
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                uri = str(candidate.get("uri") or "")
+                reusable = bool(
+                    1 <= index <= pulls
+                    and candidate.get("candidate_set_token") == version.token
+                    and candidate.get("prompt_hash") == frozen_prompt_hash
+                    and candidate.get("reference_hash")
+                    == frozen_reference_hash
+                    and uri
+                    and (uri.startswith(("http://", "https://"))
+                         or Path(uri).exists()))
+                if reusable:
+                    results[index] = (None, copy.deepcopy(candidate))
+
+        failures = {}
+
+        def run_wave(indices, attempt):
+            if not indices:
+                return
+            with ThreadPoolExecutor(
+                    max_workers=len(indices),
+                    thread_name_prefix="aifos-shot-candidate") as pool:
+                futures = {
+                    pool.submit(generate_one, index): index
+                    for index in indices}
+                for future in as_completed(futures):
+                    index = futures[future]
+                    try:
+                        got_index, result, candidate = future.result()
+                        if (candidate.get("prompt_hash") != frozen_prompt_hash
+                                or candidate.get("reference_hash")
+                                != frozen_reference_hash
+                                or candidate.get("input_hash")
+                                != frozen_input_hash):
+                            raise AifosError(
+                                f"候选图{index}偏离冻结提示词/参考图合同")
+                        candidate["technical_attempts"] = attempt
+                        results[got_index] = (result, candidate)
+                        failures.pop(index, None)
+                    except Exception as exc:
+                        failures[index] = {
+                            "candidate_index": index,
+                            "candidate_set_token": version.token,
+                            "attempts": attempt,
+                            "error": str(exc)[:600],
+                            "retryable": attempt < 2,
+                        }
+
+        missing = [
+            index for index in range(1, pulls + 1)
+            if index not in results]
+        run_wave(missing, 1)
+        # API/文件落盘等技术错误只补该槽位一次，不牵连另外三张。
+        run_wave(sorted(failures), 2)
+
+        ordered = [results[index] for index in sorted(results)]
+        candidates = [candidate for _result, candidate in ordered]
+        same_prompt = all(
+            row["prompt_hash"] == frozen_prompt_hash for row in candidates)
+        same_references = all(
+            row["reference_hash"] == frozen_reference_hash
+            for row in candidates)
+        complete = bool(
+            len(candidates) == pulls and same_prompt and same_references)
+        recommended_result = max(
+            ordered,
+            key=lambda item: (
+                1 if item[1].get("passed") else 0,
+                float(item[1].get("score") or 0.0),
+                -int(item[1].get("candidate_index") or 0)),
+            default=(None, {}))
+        recommended_candidate = recommended_result[1]
+        recommended_index = int(
+            recommended_candidate.get("candidate_index") or 0)
+        selected = next(
+            (result for result, _candidate in ordered
+             if result is not None),
+            SimpleNamespace(
+                provider="", model="", cost=0.0, data={}, uri="",
+                fallbacks=[]))
+        candidate_errors = [
+            {**failures[index], "retryable": False}
+            for index in sorted(failures)]
+        group = {
+            "schema": "aifos.shot-candidate-group/v1",
+            "version": version_data,
+            "candidate_set_id": candidate_set_id,
+            "candidate_set_token": version.token,
+            "contract_revision": version.contract_revision,
+            "candidate_revision": version.candidate_revision,
+            "candidate_count": len(candidates),
+            "expected_count": pulls,
+            "selection_required": True,
+            "complete": complete,
+            "technical_incomplete": not complete,
+            "candidate_errors": candidate_errors,
+            # 推荐只是排序信息，不是选择 token，更不伪造 QC 通过。
+            # 只有后续明确的 manual/ai selection 才能晋升正式资产。
+            "recommended_candidate_index": (
+                recommended_index
+                if self._image_qc_enabled() and recommended_index else None),
+            "recommended_candidate_id": (
+                str(recommended_candidate.get("candidate_id") or "")
+                if self._image_qc_enabled() and recommended_index else ""),
+            "frozen_prompt_hash": frozen_prompt_hash,
+            "frozen_reference_hash": frozen_reference_hash,
+            "frozen_input_hash": frozen_input_hash,
+            "same_prompt": same_prompt,
+            "same_references": same_references,
+            "parallelism": pulls,
+            "candidates": copy.deepcopy(candidates),
+        }
+        selected.cost = review_cost + sum(
+            float(result.cost or 0.0) for result, _candidate in ordered
+            if result is not None)
+        # 候选组完成不等于正式关键帧完成。禁止通过
+        # result.uri 偷偷让第一张流入首尾帧/视频参考链。
+        selected.uri = ""
+        if not isinstance(selected.data, dict):
+            selected.data = {}
+        selected.data.update({
+            "candidate_group": group,
+            "candidate_uris": [row["uri"] for row in candidates],
+            "candidate_count": len(candidates),
+            "candidate_set_token": version.token,
+            "candidate_revision": version.candidate_revision,
+        })
+        report = getattr(selected, "qc", None)
+        if isinstance(report, dict):
+            report["gacha"] = {
+                "pulls": pulls,
+                "select_after_all": True,
+                "recommended_candidate_index": recommended_index,
+                "recommended_score": float(
+                    recommended_candidate.get("score") or 0),
+                "candidate_set_id": candidate_set_id,
+                "frozen_prompt_hash": frozen_prompt_hash,
+                "frozen_reference_hash": frozen_reference_hash,
+                "same_prompt": same_prompt,
+                "same_references": same_references,
+                "candidates": copy.deepcopy(candidates),
+                "technical_incomplete": not complete,
+                "candidate_errors": copy.deepcopy(candidate_errors),
+            }
+        if complete:
+            self.log.info(
+                "director",
+                f"镜头{working_payload.get('shot_no', '')} 4张候选已"
+                f"{pulls}路并行完成，等待明确选片")
+        else:
+            self.log.warn(
+                "director",
+                f"镜头{working_payload.get('shot_no', '')} 候选技术补位后"
+                f"仍为{len(candidates)}/{pulls}；成功图已保留，缺槽位可续补")
+        return selected
+
     def _generate_image_gacha(self, capability, payload, out_dir,
                               cancel, qc_spec):
-        """连抽选优:重要/终稿类多次完整生成+质检。
+        """连抽选优:重要/终稿类多次完整生成+可选质检。
 
         常规抽卡首个通过即采纳；首次失败后的修订轮使用
         ``_gacha_select_best_after_all``，固定生成完整候选组后再按质检
@@ -5805,10 +6140,21 @@ class Director:
             override = 0
         pulls = max(1, min(override, 4)) if override else \
             self._gacha_pulls(payload)
+        selection_group = bool(
+            (payload or {}).get("_selection_candidate_group"))
         select_after_all = bool(
-            (payload or {}).get("_gacha_select_best_after_all"))
-        if (pulls <= 1 or capability != "image"
-                or not qc_spec or not self._image_qc_enabled()):
+            (payload or {}).get("_gacha_select_best_after_all")
+            or selection_group)
+        if pulls <= 1 or capability != "image":
+            return self._generate_image_with_qc(
+                capability, payload, out_dir, cancel, qc_spec)
+        if selection_group:
+            return self._generate_selection_candidates_parallel(
+                capability, payload, out_dir, cancel, qc_spec, pulls)
+        # 旧连抽依赖 QC 选优；新选片组即使关闭内容 QC，
+        # 也必须完整产出4张供人工选择。
+        if (not selection_group
+                and (not qc_spec or not self._image_qc_enabled())):
             return self._generate_image_with_qc(
                 capability, payload, out_dir, cancel, qc_spec)
         best = None                    # (score, result, snapshot)
@@ -5840,14 +6186,6 @@ class Director:
                 if isinstance(prompt_review, dict):
                     working_payload["prompt_review"] = copy.deepcopy(
                         prompt_review)
-                # review_image_prompt folds ``feedback`` into the text it
-                # hashes, then clears feedback only on its private per-call
-                # payload.  Without clearing the gacha working copy here,
-                # pulls 2/3 see "frozen prompt + old feedback" as a new input
-                # and can be non-deterministically re-reviewed into different
-                # prompts.  The feedback has already been incorporated into
-                # ``optimized_prompt``; carrying it again is both duplicate
-                # instruction and a violation of same-prompt triple draw.
                 if working_payload.get("feedback"):
                     working_payload["prompt_review_feedback_applied"] = \
                         working_payload["feedback"]
@@ -5860,13 +6198,6 @@ class Director:
                        or pull_payload.get("prompt") or ""))
             candidate_prompt_hash = hashlib.sha256(
                 candidate_prompt.encode("utf-8")).hexdigest()
-            candidates.append({
-                "pull": pull,
-                "passed": bool(report.get("passed")),
-                "score": score,
-                "issues": list(report.get("issues") or [])[:8],
-                "prompt_hash": candidate_prompt_hash,
-            })
             if report.get("passed") and not select_after_all:
                 for snap in snapshots:
                     try:
@@ -5889,6 +6220,13 @@ class Director:
                     snapshots.append(snap)
                 except OSError:
                     snap = None
+            candidates.append({
+                "pull": pull,
+                "passed": bool(report.get("passed")),
+                "score": score,
+                "issues": list(report.get("issues") or [])[:8],
+                "prompt_hash": candidate_prompt_hash,
+            })
             rank = (1 if report.get("passed") else 0, score)
             if best is None or rank > best[0]:
                 best = (rank, result, snap, pull)
@@ -5918,7 +6256,7 @@ class Director:
                     frozen_prompt_hash
                     and all(row.get("prompt_hash") == frozen_prompt_hash
                             for row in candidates)),
-                "candidates": candidates,
+                "candidates": copy.deepcopy(candidates),
             }
         if final_rank[0]:
             self.log.info(
@@ -5979,26 +6317,104 @@ class Director:
             return True
         candidates = gacha.get("candidates") or []
         frozen = str(gacha.get("frozen_prompt_hash") or "")
+        pulls = int(gacha.get("pulls") or 0)
         return bool(
-            int(gacha.get("pulls") or 0) == 3
+            pulls in (3, 4)
             and gacha.get("same_prompt") is True
-            and len(candidates) == 3
+            and len(candidates) == pulls
             and frozen
             and all(
                 isinstance(row, dict)
                 and str(row.get("prompt_hash") or "") == frozen
                 for row in candidates))
 
+    @staticmethod
+    def _shot_candidate_group_valid(plan_item):
+        """新关键帧只在4张候选都真实归档后才可断点复用。"""
+        group = (plan_item or {}).get("candidate_group") or {}
+        if not isinstance(group, dict):
+            return False
+        candidates = group.get("candidates") or []
+        token = str(group.get("candidate_set_token") or "")
+        version = group.get("version") or {}
+        if (group.get("schema") != "aifos.shot-candidate-group/v1"
+                or int(group.get("candidate_count") or 0) != 4
+                or int(group.get("expected_count") or 0) != 4
+                or len(candidates) != 4
+                or group.get("complete") is not True
+                or not token
+                or not isinstance(version, dict)
+                or str(version.get("token") or "") != token
+                or group.get("same_prompt") is not True
+                or group.get("same_references") is not True):
+            return False
+        for row in candidates:
+            if str((row or {}).get("candidate_set_token") or "") != token:
+                return False
+            uri = str((row or {}).get("uri") or "")
+            if not uri:
+                return False
+            if (not uri.startswith(("http://", "https://"))
+                    and not Path(uri).exists()):
+                return False
+        return True
+
+    @staticmethod
+    def _candidate_diagnostic_uri(result):
+        """严格QC模式用于诊断的候选，不代表已晋升正式资产。"""
+        group = ((getattr(result, "data", None) or {}).get(
+            "candidate_group") or {})
+        candidates = group.get("candidates") or []
+        try:
+            index = int(group.get("recommended_candidate_index") or 1)
+        except (TypeError, ValueError):
+            index = 1
+        if 1 <= index <= len(candidates):
+            return str((candidates[index - 1] or {}).get("uri") or "")
+        return ""
+
+    def _generate_shot_candidate_group(
+            self, capability, payload, out_dir, cancel, qc_spec):
+        """首次即生成完整4张关键帧，不因某张质检通过早停。"""
+        candidate_payload = copy.deepcopy(payload or {})
+        candidate_payload["_selection_candidate_group"] = True
+        candidate_payload["_qc_candidate_only"] = True
+        candidate_payload["_gacha_pulls_override"] = \
+            self._shot_candidate_count()
+        candidate_payload["_gacha_select_best_after_all"] = True
+        selected = self._generate_image_gacha(
+            capability, candidate_payload, out_dir, cancel, qc_spec)
+        report = getattr(selected, "qc", None) or {}
+        if not self._image_qc_enabled() or report.get("passed"):
+            return selected
+        # 旧严格模式仍保留原有的 Codex 根因分析/修复链；
+        # 选片模式和图片内容QC关闭时不会进入这条分支。
+        generation_input = report.get("generation_input") or \
+            self._image_generation_input(
+                candidate_payload, qc_spec=qc_spec)
+        report["consecutive_failures"] = max(
+            1, int(report.get("consecutive_failures") or 0))
+        report, escalation_cost = self._escalate_failed_image_to_codex(
+            report, qc_spec, self._candidate_diagnostic_uri(selected),
+            generation_input, out_dir,
+            cancel=cancel,
+            codex_profile=candidate_payload.get("_codex_profile", ""))
+        selected.cost += escalation_cost
+        selected.qc = report
+        return selected
+
     def _generate_repair_candidate_group(
             self, capability, payload, out_dir, cancel, qc_spec):
-        """用同一份 Codex 修订合同生成3张，全部判分后自动选优。
+        """用同一份 Codex 修订合同生成4张，全部判分后自动选优。
 
         三张全败时，只对最高分候选再做一次 Codex 根因分析，产出下一轮
         可执行修改指令；不会把三个候选分别改成三套互相漂移的合同。
         """
         candidate_payload = copy.deepcopy(payload or {})
+        candidate_payload["_selection_candidate_group"] = True
         candidate_payload["_qc_candidate_only"] = True
-        candidate_payload["_gacha_pulls_override"] = 3
+        candidate_payload["_gacha_pulls_override"] = \
+            self._shot_candidate_count()
         candidate_payload["_gacha_select_best_after_all"] = True
         candidate_payload["qc_consecutive_failures_base"] = max(
             1, int(candidate_payload.get(
@@ -6006,7 +6422,7 @@ class Director:
         selected = self._generate_image_gacha(
             capability, candidate_payload, out_dir, cancel, qc_spec)
         report = getattr(selected, "qc", None) or {}
-        if report.get("passed"):
+        if not self._image_qc_enabled() or report.get("passed"):
             return selected
         generation_input = report.get("generation_input") or \
             self._image_generation_input(
@@ -6014,7 +6430,8 @@ class Director:
         report["consecutive_failures"] = max(
             2, int(report.get("consecutive_failures") or 0))
         report, escalation_cost = self._escalate_failed_image_to_codex(
-            report, qc_spec, selected.uri, generation_input, out_dir,
+            report, qc_spec, self._candidate_diagnostic_uri(selected),
+            generation_input, out_dir,
             cancel=cancel,
             codex_profile=candidate_payload.get("_codex_profile", ""))
         selected.cost += escalation_cost
@@ -6068,10 +6485,19 @@ class Director:
         while True:
             # 每次真正出图（包括QC修订重试）都以当前最终输入重新过Codex。
             # 输入哈希未变化时路由器会复用已批准审核，不产生重复调用。
-            prompt_review = self.router.review_image_prompt(
-                capability, payload, out_dir, cancel=cancel)
-            if prompt_review is not None:
-                spent += float(prompt_review.cost or 0.0)
+            current_input = self._image_generation_input(
+                payload, qc_spec=qc_spec)
+            frozen_review_hash = str(
+                payload.get("_prompt_review_frozen_input_hash") or "")
+            if not (frozen_review_hash
+                    and frozen_review_hash == current_input["input_hash"]):
+                reviewer = getattr(
+                    self.router, "review_image_prompt", None)
+                prompt_review = (
+                    reviewer(capability, payload, out_dir, cancel=cancel)
+                    if callable(reviewer) else None)
+                if prompt_review is not None:
+                    spent += float(prompt_review.cost or 0.0)
             generation_input = self._image_generation_input(
                 payload, qc_spec=qc_spec)
             result = self.router.call(capability, payload, out_dir,
@@ -6538,6 +6964,11 @@ class Director:
                     "input_hash": generation_input.get("input_hash", ""),
                     "codex_instruction": codex_instruction[:2400],
                 }
+                selected_report["lesson_issues"] = list(dict.fromkeys([
+                    *(report.get("lesson_issues") or []),
+                    *(report.get("issues") or []),
+                    *(selected_report.get("lesson_issues") or []),
+                ]))
                 selected_report["generation_attempts"] = 4
                 selected.qc = selected_report
                 return selected
@@ -6558,7 +6989,10 @@ class Director:
         for key in ("first_source", "generation_calls", "model",
                     "image_task_class", "image_quality", "unit_cost",
                     "codex_profile", "prompt_review",
-                    "prompt_aifos_original", "prompt_optimized"):
+                    "prompt_aifos_original", "prompt_optimized",
+                    "candidate_group", "candidate_uris",
+                    "candidate_count", "candidate_set_token",
+                    "candidate_revision", "selection"):
             if key in data:
                 extra[key] = data[key]
         model = getattr(result, "model", "")
@@ -6579,7 +7013,58 @@ class Director:
         return extra
 
     @staticmethod
-    def _critical_qc_error(result):
+    def _candidate_group_technical_incomplete(result):
+        data = getattr(result, "data", None) or {}
+        group = data.get("candidate_group") or {}
+        return bool(
+            isinstance(group, dict)
+            and group.get("selection_required")
+            and (group.get("technical_incomplete") is True
+                 or int(group.get("candidate_count") or 0)
+                 < int(group.get("expected_count") or 4)))
+
+    @staticmethod
+    def _candidate_selection_pending(result):
+        data = getattr(result, "data", None) or {}
+        group = data.get("candidate_group") or {}
+        if not isinstance(group, dict) or not group.get("selection_required"):
+            return False
+        selection = group.get("selection") or {}
+        if not isinstance(selection, dict):
+            return True
+        selected_uri = str(selection.get("selected_uri") or "").strip()
+        selected = next((
+            row for row in group.get("candidates") or []
+            if str((row or {}).get("uri") or "") == selected_uri
+        ), None)
+        if selected is None:
+            return True
+        try:
+            current_version = CandidateSetVersion(**(
+                group.get("version") or {}))
+            selected_result = CandidateResultVersion(
+                candidate_set_token=str(
+                    selection.get("candidate_set_token")
+                    or selection.get("token") or ""),
+                candidate_index=int(
+                    selection.get("candidate_index")
+                    or selected.get("candidate_index") or 0),
+            )
+        except (TypeError, ValueError):
+            return True
+        # URI、序号、版本令牌三者必须指向同一张当前候选；旧页面的
+        # 迟到点击即使带着合法 manual/ai 来源也不能覆盖新候选组。
+        if (selected_result.candidate_index
+                != int(selected.get("candidate_index") or 0)):
+            return True
+        decision = evaluate_candidate_promotion(
+            selected_result, current_version,
+            selection_source=str(selection.get("source") or ""))
+        return not decision.allowed
+
+    def _critical_qc_error(self, result):
+        if not self._image_qc_enabled():
+            return ""
         qc = getattr(result, "qc", None) or {}
         if qc.get("passed") is False:
             codex = qc.get("codex_escalation") or {}
@@ -6907,11 +7392,12 @@ class Director:
                 payload = task.get("payload") or {}
                 if (task["capability"] == "image"
                         and str(task.get("item_id") or "").startswith("shot:")):
-                    # 镜头首图严格只出1张；失败后的修订轮才启用固定3抽。
+                    # 镜头关键帧首轮即冻结合同并4路并行；
+                    # 严格QC模式的修订轮同样保持4候选。
                     generate = (
                         self._generate_repair_candidate_group
                         if payload.get("_autonomous_repair_seeded")
-                        else self._generate_image_with_qc)
+                        else self._generate_shot_candidate_group)
                     result = generate(
                         task["capability"], task["payload"],
                         ctx["out_root"] / task["sub_dir"],
@@ -6942,7 +7428,7 @@ class Director:
                                 current.get(
                                     "_codex_contract_repair_count") or 0),
                             "autonomous_repair": True,
-                            "candidate_count": 3,
+                            "candidate_count": self._shot_candidate_count(),
                             "prompt_review_block_repaired": True,
                         })
                     continue
@@ -6956,6 +7442,17 @@ class Director:
         self._task_cost += result.cost
         self._task_providers.add(result.provider)
         self.projects.add_episode_cost(ctx["episode"]["id"], result.cost)
+        if self._candidate_group_technical_incomplete(result):
+            self._finish_dispatch_task(
+                ctx, task, error="关键帧候选技术补位未完成")
+            self._plan_mark(
+                ctx, task["item_id"], "technical_incomplete",
+                extra={
+                    **self._plan_done_extra(result),
+                    "selection_required": True,
+                    "technical_incomplete": True,
+                })
+            return result
         critical_error = self._critical_qc_error(result)
         while critical_error:
             # Codex 已经写清楚要改什么时,先自动落实再重画一轮,
@@ -6971,7 +7468,7 @@ class Director:
                            task["payload"].get(
                                "_codex_contract_repair_count") or 0),
                        "autonomous_repair": True,
-                       "candidate_count": 3})
+                       "candidate_count": self._shot_candidate_count()})
             while True:
                 try:
                     result = self._generate_repair_candidate_group(
@@ -7014,7 +7511,7 @@ class Director:
                                         "_codex_contract_repair_count")
                                     or 0),
                                 "autonomous_repair": True,
-                                "candidate_count": 3,
+                                "candidate_count": self._shot_candidate_count(),
                                 "prompt_review_block_repaired": True,
                             })
                         continue
@@ -7038,6 +7535,16 @@ class Director:
             if continue_on_qc_failure:
                 return None
             raise AifosError(critical_error)
+        if self._candidate_selection_pending(result):
+            self._finish_dispatch_task(ctx, task, result=result)
+            self._plan_mark(
+                ctx, task["item_id"], "awaiting_selection",
+                extra={
+                    **self._plan_done_extra(result),
+                    "autonomous_repair_seeded": False,
+                    "selection_required": True,
+                })
+            return result
         self._finish_dispatch_task(ctx, task, result=result)
         self._plan_mark(
             ctx, task["item_id"], "done",
@@ -7244,10 +7751,17 @@ class Director:
                             "_acceleration"]
                     self._plan_mark(ctx, task["item_id"], "generating",
                                     extra=generating_extra)
-                    generate = (
-                        self._generate_repair_candidate_group
-                        if payload.get("_autonomous_repair_seeded")
-                        else self._generate_image_with_qc)
+                    is_shot = (
+                        task.get("capability") == "image"
+                        and str(task.get("item_id") or "").startswith(
+                            "shot:"))
+                    if is_shot:
+                        generate = (
+                            self._generate_repair_candidate_group
+                            if payload.get("_autonomous_repair_seeded")
+                            else self._generate_shot_candidate_group)
+                    else:
+                        generate = self._generate_image_with_qc
                     future = pool.submit(
                         generate, task["capability"], task["payload"],
                         ctx["out_root"] / task["sub_dir"], cancel,
@@ -7284,7 +7798,8 @@ class Director:
                                             "_codex_contract_repair_count")
                                         or 0),
                                     "autonomous_repair": True,
-                                    "candidate_count": 3,
+                                    "candidate_count":
+                                        self._shot_candidate_count(),
                                     "prompt_review_block_repaired": True,
                                 })
                             retry_future = pool.submit(
@@ -7306,11 +7821,24 @@ class Director:
                     self._task_providers.add(result.provider)
                     self.projects.add_episode_cost(
                         ctx["episode"]["id"], result.cost)
+                    if self._candidate_group_technical_incomplete(result):
+                        self._finish_dispatch_task(
+                            ctx, task,
+                            error="关键帧候选技术补位未完成")
+                        self._plan_mark(
+                            ctx, task["item_id"], "technical_incomplete",
+                            extra={
+                                **self._plan_done_extra(result),
+                                "selection_required": True,
+                                "technical_incomplete": True,
+                            })
+                        results[task["tag"]] = result
+                        continue
                     critical_error = self._critical_qc_error(result)
                     if critical_error:
                         # 并行关键帧入口此前漏掉了串行入口已有的自动执行：
                         # Codex 指令写进报告后直接落 awaiting_human。现在
-                        # 主线程先落实合同修订，再把同一镜头以“三抽全量
+                        # 主线程先落实合同修订，再把同一镜头以“四候选全量
                         # 选优”重新放回 worker 池，无需人工确认。
                         repair = self._auto_apply_codex_escalation(
                             ctx, task, result)
@@ -7328,7 +7856,8 @@ class Director:
                                             "_codex_contract_repair_count")
                                         or 0),
                                     "autonomous_repair": True,
-                                    "candidate_count": 3,
+                                    "candidate_count":
+                                        self._shot_candidate_count(),
                                 })
                             retry_future = pool.submit(
                                 self._generate_repair_candidate_group,
@@ -7348,6 +7877,18 @@ class Director:
                             "failed",
                             error=critical_error[:300],
                             extra=self._plan_done_extra(result))
+                        continue
+                    if self._candidate_selection_pending(result):
+                        self._finish_dispatch_task(
+                            ctx, task, result=result)
+                        self._plan_mark(
+                            ctx, task["item_id"], "awaiting_selection",
+                            extra={
+                                **self._plan_done_extra(result),
+                                "autonomous_repair_seeded": False,
+                                "selection_required": True,
+                            })
+                        results[task["tag"]] = result
                         continue
                     self._finish_dispatch_task(ctx, task, result=result)
                     self._plan_mark(
@@ -8191,6 +8732,7 @@ class Director:
                         "已为复用分镜补齐服装/头饰/妆发连续性，并修复"
                         "死亡后表演等确定性语义冲突；未改镜头号、台词或时长")
                 ctx["storyboard"] = existing
+                ctx["storyboard_version"] = version
                 self._plan_seed_shots(ctx)
                 self.log.info("director", f"复用已有五维分镜 v{version}")
                 return {"version": version, "reused": True,
@@ -8227,6 +8769,7 @@ class Director:
         version = self.projects.save_document(
             ctx["episode"]["id"], "storyboard", storyboard)
         ctx["storyboard"] = storyboard
+        ctx["storyboard_version"] = version
         # 分镜变了 → 旧的关键帧/首尾帧/视频全部作废重做
         ctx["force"] = True
         for shot in storyboard["shots"]:
@@ -10351,7 +10894,7 @@ class Director:
                 "prop_candidate_target": (
                     prop_selection["total"] * PROP_CANDIDATES),
                 "locked": selection["asset_locked"],
-                "awaiting_selection": True,
+                "awaiting_selection": bool(awaiting_selection),
                 "created": 0, "reused": 0, "scenes": 0,
             }
         ctx["cast_selection"] = selection
@@ -12093,6 +12636,9 @@ class Director:
                     inner_persona_ref = str(row["uri"] or "").strip()
                     overlay["asset_uri"] = inner_persona_ref
         payload = {
+            "_episode_id": ctx["episode"]["id"],
+            "_contract_revision": max(
+                1, int(ctx.get("storyboard_version") or 1)),
             "shot_no": shot["shot_no"],
             "unit_id": shot.get("unit_id"),
             # 导演台意见:走既有 feedback 修订机制(审核与生成都会带上),
@@ -12631,6 +13177,7 @@ class Director:
         """
         plan = self._plan_read(ctx)
         by_id = {item.get("id"): item for item in plan.get("items", [])}
+        image_content_qc = self._image_qc_enabled()
         recovered = 0
         exposed_failures = 0
         changed = False
@@ -12648,6 +13195,28 @@ class Director:
                 }
                 item["status"] = "pending"
                 stale_reset += 1
+                changed = True
+            if (not image_content_qc
+                    and item.get("category") == "shot_image"
+                    and item.get("status") in ("awaiting_human", "failed")):
+                # 关闭内容QC后，历史红牌不得继续作为隐形闸门。
+                # 旧单图不伪装成新四候选，回到 pending 后按新标准重生。
+                previous = item.get("status")
+                item["status"] = "pending"
+                item["error"] = ""
+                qc = dict(item.get("qc") or {})
+                if qc:
+                    qc.update({
+                        "advisory_only": True,
+                        "blocking": False,
+                        "awaiting_human": False,
+                        "waived_by": "selection_mode_or_image_content_qc",
+                    })
+                    item["qc"] = qc
+                item["content_qc_migration"] = {
+                    "previous_status": previous,
+                    "reset_at": now(),
+                }
                 changed = True
         if stale_reset:
             self.log.warn(
@@ -12673,6 +13242,13 @@ class Director:
                     and not Path(uri).exists()):
                 continue
             qc = item.get("qc") or {}
+            candidate_group_valid = self._shot_candidate_group_valid(item)
+            if not image_content_qc and not candidate_group_valid:
+                # 未归档4张的历史产物只保留查看，不进入正式参考链。
+                if item.get("status") != "pending":
+                    item["status"] = "pending"
+                    changed = True
+                continue
             if (qc.get("passed") is True
                     and not self._repair_gacha_prompt_invariant_valid(item)):
                 item["status"] = "failed"
@@ -12682,14 +13258,14 @@ class Director:
                 qc["retry_blocked"] = False
                 qc["issues"] = list(dict.fromkeys([
                     *(qc.get("issues") or []),
-                    "修订组三张候选未证明使用同一冻结提示词，"
+                    "修订组候选未证明使用同一冻结提示词，"
                     "该批作废并由AIFOS自动重抽",
                 ]))
                 item["qc"] = qc
                 exposed_failures += 1
                 changed = True
                 continue
-            if qc.get("passed") is False:
+            if image_content_qc and qc.get("passed") is False:
                 if item.get("status") != "failed":
                     item["status"] = "failed"
                     changed = True
@@ -12704,8 +13280,11 @@ class Director:
                 exposed_failures += 1
                 changed = True
                 continue
+            acceptable = (
+                qc.get("passed") is True if image_content_qc
+                else candidate_group_valid)
             if (item.get("status") not in ("done", "reused")
-                    or qc.get("passed") is not True):
+                    or not acceptable):
                 continue
             asset_name = self._shot_name(ctx, shot_no)
             existing_row = self.assets.latest(
@@ -12741,6 +13320,7 @@ class Director:
                     "provider", "model", "real", "fallbacks",
                     "image_task_class", "unit_cost", "qc",
                     "reference_inputs", "prompt_used", "prompt_used_hash",
+                    "candidate_group", "candidate_uris", "candidate_count",
                     "started_at", "finished_at", "duration"):
                 if key in item:
                     recovered_meta[key] = item[key]
@@ -12782,8 +13362,11 @@ class Director:
             category = item.get("category")
             if category not in ("shot_image", "frames"):
                 continue
+            qc_failed = (
+                self._image_qc_enabled()
+                and (item.get("qc") or {}).get("passed") is False)
             if (item.get("status") not in ("done", "reused")
-                    or (item.get("qc") or {}).get("passed") is False):
+                    or qc_failed):
                 return True
             shot_no = item.get("shot_no")
             if shot_no is None:
@@ -12915,19 +13498,46 @@ class Director:
         awaiting_shots = set(
             reconciliation.get("awaiting_human_shots") or [])
         skipped_awaiting = []
+        awaiting_selection = []
+        technical_incomplete = []
         for shot in self._active_shots(ctx):
             scene_first = shot.get("scene_no") not in seen_scenes
             seen_scenes.add(shot.get("scene_no"))
             if int(shot.get("shot_no") or 0) in awaiting_shots:
                 skipped_awaiting.append(int(shot["shot_no"]))
                 continue
-            payload = self._shot_payload(ctx, shot)
-            required_quality = payload["quality_decision"]["level"]
             stored_prior = prior_plan.get(
                 f"shot:{shot['shot_no']}") or {}
+            if (stored_prior.get("status") == "awaiting_selection"
+                    and self._shot_candidate_group_valid(stored_prior)):
+                awaiting_selection.append(int(shot["shot_no"]))
+                continue
+            payload = self._shot_payload(ctx, shot)
+            prior_group = stored_prior.get("candidate_group") or {}
+            try:
+                prior_candidate_revision = int(
+                    prior_group.get("candidate_revision") or 0)
+            except (TypeError, ValueError, AttributeError):
+                prior_candidate_revision = 0
+            payload["_episode_id"] = ctx["episode"]["id"]
+            payload["_candidate_revision"] = max(
+                1, prior_candidate_revision + 1)
+            if (stored_prior.get("status") == "technical_incomplete"
+                    and isinstance(prior_group, dict)
+                    and prior_group.get("candidate_set_id")):
+                payload["_candidate_set_id"] = prior_group[
+                    "candidate_set_id"]
+                payload["_candidate_revision"] = max(
+                    1, prior_candidate_revision)
+                payload["_contract_revision"] = max(
+                    1, int(prior_group.get("contract_revision") or 1))
+                payload["_resume_candidate_group"] = copy.deepcopy(
+                    prior_group)
+            required_quality = payload["quality_decision"]["level"]
             existing = self._existing_asset_uri(
                 ctx, "image", self._shot_name(ctx, shot["shot_no"]))
             if (existing
+                    and self._shot_candidate_group_valid(stored_prior)
                     and self._repair_gacha_prompt_invariant_valid(
                         stored_prior)):
                 row = self.assets.latest(
@@ -12984,7 +13594,7 @@ class Director:
                 repair_meta.get("blocking_reason") or "")
             # v28 之前没有把修复轮次写入 render_plan，但编剧就地修过的
             # Codex blocking_reason 会持久化在 storyboard。当前项又在
-            # 修订组三抽中，说明至少两轮已失败，恢复时应直接进入第三轮
+            # 修订候选组中，说明至少两轮已失败，恢复时应直接进入第三轮
             # 深度瘦身，而不是把前两轮重新烧一遍。
             if (not persisted_repair_count
                     and stored.get("autonomous_repair_seeded")
@@ -13060,12 +13670,12 @@ class Director:
                     self.log.info(
                         "director",
                         f"{task['item_id']} 已承接断点中的 Codex 修改指令，"
-                        "本轮直接生成3张候选并全部质检选优")
+                        "本轮直接生成4张候选并全部选优")
             elif resumed_repair_group:
                 self.log.info(
                     "director",
-                    f"{task['item_id']} 上一轮三候选因产线中断未完成，"
-                    "已从修订合同断点恢复并继续固定3张全量选优")
+                    f"{task['item_id']} 上一轮四候选因产线中断未完成，"
+                    "已从修订合同断点恢复并继续固定4张并行选优")
             payload = task["payload"]
             quality_by_shot[shot["shot_no"]] = payload["quality_decision"]
             tasks.append(task)
@@ -13074,6 +13684,12 @@ class Director:
             continue_on_qc_failure=True)
         for shot_no in sorted(results):
             result = results[shot_no]
+            if self._candidate_group_technical_incomplete(result):
+                technical_incomplete.append(int(shot_no))
+                continue
+            if self._candidate_selection_pending(result):
+                awaiting_selection.append(int(shot_no))
+                continue
             quality = quality_by_shot[shot_no]
             self._register_completed_shot_result(
                 ctx,
@@ -13096,7 +13712,7 @@ class Director:
             self.log.warn(
                 "director",
                 f"关键帧本批已完成其余 {len(results)} 张；"
-                f"{len(failed_shots)} 张仍未通过(修订组三抽失败或提示词"
+                f"{len(failed_shots)} 张仍未通过(修订组四候选失败或提示词"
                 "审核熔断)，已隔离为自动修复失败项: "
                 + "、".join(f"镜头{value}" for value in failed_shots))
             raise AifosError(
@@ -13110,6 +13726,29 @@ class Director:
                     "；另有无法自动迁移的历史镜头: "
                     + "、".join(str(value) for value in skipped_awaiting)
                     if skipped_awaiting else ""))
+        if awaiting_selection or technical_incomplete:
+            ctx["shot_selection_required"] = True
+            ctx["shot_selection_shots"] = sorted(set(awaiting_selection))
+            ctx["shot_candidate_repair_required"] = bool(
+                technical_incomplete)
+            ctx["shot_candidate_repair_shots"] = sorted(
+                set(technical_incomplete))
+            self.log.info(
+                "director",
+                f"{len(set(awaiting_selection))} 个镜头的4张候选已并行"
+                "落盘，等待人工或AI明确选片；"
+                f"{len(set(technical_incomplete))} 个镜头仍需技术补位；"
+                "均未晋升正式关键帧")
+            return {
+                "count": len(ctx["images"]), "reused": reused,
+                "recovered": reconciliation["recovered"],
+                "awaiting_selection": bool(awaiting_selection),
+                "awaiting_selection_shots": sorted(
+                    set(awaiting_selection)),
+                "technical_incomplete": bool(technical_incomplete),
+                "technical_incomplete_shots": sorted(
+                    set(technical_incomplete)),
+            }
         return {
             "count": len(ctx["images"]), "reused": reused,
             "recovered": reconciliation["recovered"],
@@ -15502,6 +16141,96 @@ class Director:
             "last_total_qc_passed": bool(qc_report.get("passed")),
         }
 
+    def _build_technical_video_qc_report(
+            self, ctx, qc_report, previous=None):
+        """关闭视频内容QC后只保留产物/媒体健全性，永不待人工。"""
+        previous = previous or {}
+        previous_shots = {
+            str(item.get("shot_no")): item
+            for item in previous.get("shots", [])
+            if isinstance(item, dict) and item.get("shot_no") is not None
+        }
+        issues = qc_report.get("issues") or []
+        shot_checks = {"video", "media_sanity"}
+        global_checks = {
+            "video", "media_sanity", "voice", "integrated_audio",
+            "subtitle",
+        }
+        shots = []
+        for shot in (ctx.get("storyboard") or {}).get("shots", []):
+            shot_no = int(shot.get("shot_no"))
+            related = [
+                issue for issue in issues
+                if issue.get("check") in shot_checks
+                and issue.get("shot_no") == shot_no
+                and issue.get("severity") == "error"]
+            messages = list(dict.fromkeys(
+                str(issue.get("message") or issue.get("check"))
+                for issue in related))
+            old = previous_shots.get(str(shot_no), {})
+            used = int(old.get("auto_retries_used") or 0)
+            retry_available = bool(
+                messages
+                and any(issue.get("rerunnable") for issue in related)
+                and used < VIDEO_QC_AUTO_RETRIES)
+            decision = {
+                "action": (
+                    "direct_video_retry" if retry_available else "none"),
+                "safe_to_auto_retry": retry_available,
+                "input_changed": retry_available,
+                "prompt_patch": (
+                    "技术恢复：严格沿用已冻结的本镜首尾帧、"
+                    "提示词和参考图，重新生成并完整落盘"
+                    if retry_available else ""),
+                "reason": (
+                    "视频文件缺失或损坏，只执行一次技术恢复"
+                    if retry_available else
+                    ("技术产物仍不完整，不再自动重试"
+                     if messages else "")),
+            }
+            shots.append({
+                "shot_no": shot_no,
+                "passed": not messages,
+                "status": "passed" if not messages else "failed",
+                "issues": messages,
+                "generation_attempts": int(
+                    old.get("generation_attempts") or 1),
+                "auto_retries_used": used,
+                "auto_retry_limit": VIDEO_QC_AUTO_RETRIES,
+                "revision_feedback": "",
+                "revision_categories": ["technical"] if messages else [],
+                "decision": decision,
+                "awaiting_human": False,
+                "content_qc_enabled": False,
+            })
+        failed = [item for item in shots if not item["passed"]]
+        global_issues = list(dict.fromkeys(
+            str(issue.get("message") or issue.get("check"))
+            for issue in issues
+            if issue.get("check") in global_checks
+            and issue.get("shot_no") is None
+            and issue.get("severity") == "error"))
+        content_observations = [
+            copy.deepcopy(issue) for issue in issues
+            if issue.get("check") not in global_checks
+            and issue.get("check") not in shot_checks]
+        return {
+            "schema": VIDEO_QC_SCHEMA,
+            "passed": not failed and not global_issues,
+            "shots": shots,
+            "failed_shots": [item["shot_no"] for item in failed],
+            "awaiting_human": False,
+            "awaiting_human_shots": [],
+            "repair_frames_first_shots": [],
+            "global_issues": global_issues,
+            "global_status": "failed" if global_issues else "passed",
+            "auto_retry_limit": VIDEO_QC_AUTO_RETRIES,
+            "last_total_qc_passed": bool(qc_report.get("passed")),
+            "content_qc_enabled": False,
+            "content_qc_waived": True,
+            "content_observations": content_observations,
+        }
+
     @staticmethod
     def _video_retry_candidates(video_qc_report):
         return [item["shot_no"] for item in video_qc_report.get("shots", [])
@@ -15516,8 +16245,14 @@ class Director:
 
     def _stage_qc(self, ctx):
         """自动检查 + 图文检查板 + 逐段内容复核 + 交付脚本。"""
+        video_content_qc = self._video_content_qc_enabled()
         content_review = build_content_review(
             ctx["script"], self._active_storyboard(ctx), ctx["continuity"])
+        if not video_content_qc:
+            content_review["advisory_only"] = True
+            content_review["blocking"] = False
+            content_review["waived_by"] = (
+                "selection_mode_or_video_content_qc")
         content_path = ctx["out_root"] / "content_review.json"
         content_path.write_text(
             json.dumps(content_review, ensure_ascii=False, indent=2),
@@ -15544,8 +16279,12 @@ class Director:
         for attempt in range(max_rounds):
             report = self.qc.run(
                 ctx["script"], self._active_storyboard(ctx), ctx)
-            video_qc = self._build_video_qc_report(
-                ctx, report, previous=video_qc)
+            video_qc = (
+                self._build_video_qc_report(
+                    ctx, report, previous=video_qc)
+                if video_content_qc else
+                self._build_technical_video_qc_report(
+                    ctx, report, previous=video_qc))
             self._save_video_qc_report(ctx, video_qc)
             self.log.info(
                 "qc", f"质检第{attempt + 1}轮:得分 {report['score']}"
@@ -15591,8 +16330,13 @@ class Director:
                     int(item.get("auto_retries_used") or 0)
                     for item in video_qc.get("shots", []))
                 self._save_video_qc_report(ctx, video_qc)
+        delivery_review = content_review
+        if not video_content_qc:
+            # 交付脚本仍校验文件、数量、成片和标准指纹；
+            # 只把已关闭的内容判定从「passed」计算中豁免。
+            delivery_review = {**content_review, "passed": True}
         delivery = write_delivery_verifier(
-            ctx, review_board, content_review)
+            ctx, review_board, delivery_review)
         if not delivery.get("passed"):
             report["issues"].append({
                 "check": "delivery", "severity": "error",
@@ -15604,10 +16348,49 @@ class Director:
         report["content_review"] = content_review
         report["review_board"] = review_board
         report["delivery_check"] = delivery
-        report["technical_passed"] = not any(
-            i["severity"] == "error" and i["check"] not in ("content",)
-            for i in report["issues"])
-        report["content_passed"] = content_review["passed"]
+        if not video_content_qc:
+            technical_checks = {
+                "video", "media_sanity", "voice", "integrated_audio",
+                "subtitle", "delivery",
+            }
+            observations = []
+            normalized_issues = []
+            for issue in report["issues"]:
+                item = copy.deepcopy(issue)
+                if item.get("check") not in technical_checks:
+                    observations.append(copy.deepcopy(item))
+                    item["severity"] = "warn"
+                    item["blocking"] = False
+                    item["advisory_only"] = True
+                normalized_issues.append(item)
+            report["issues"] = normalized_issues
+            technical_errors = [
+                issue for issue in normalized_issues
+                if issue.get("check") in technical_checks
+                and issue.get("severity") == "error"]
+            report["technical_passed"] = not technical_errors
+            report["content_observations"] = observations
+            report["content_observed_passed"] = bool(
+                content_review.get("passed"))
+            report["content_passed"] = True
+            report["content_qc_enabled"] = False
+            report["content_qc_waived"] = True
+            report["score"] = max(0, 100 - 15 * len(technical_errors))
+            report["passed"] = bool(
+                report["technical_passed"] and delivery.get("passed"))
+            report["rerun_shots"] = sorted({
+                int(issue["shot_no"]) for issue in technical_errors
+                if issue.get("shot_no") is not None
+                and issue.get("rerunnable")})
+            report["rerun_lines"] = sorted({
+                int(issue["line_no"]) for issue in technical_errors
+                if issue.get("line_no") is not None
+                and issue.get("rerunnable")})
+        else:
+            report["technical_passed"] = not any(
+                i["severity"] == "error" and i["check"] not in ("content",)
+                for i in report["issues"])
+            report["content_passed"] = content_review["passed"]
         ctx["qc_report"] = report
         # 交付复核完成后再写一次，让前端拿到最终的总质检状态与“待人工”
         # 镜头，而不是停留在返工前的中间快照。
@@ -15615,9 +16398,10 @@ class Director:
         video_qc["passed"] = (
             not bool(video_qc.get("failed_shots"))
             and not bool(video_qc.get("global_issues")))
-        video_qc["awaiting_human"] = bool(
-            video_qc.get("awaiting_human_shots")
-            or video_qc.get("global_issues"))
+        video_qc["awaiting_human"] = (
+            bool(video_qc.get("awaiting_human_shots")
+                 or video_qc.get("global_issues"))
+            if video_content_qc else False)
         self._save_video_qc_report(ctx, video_qc)
         self.projects.set_qc_score(ctx["episode"]["id"], report["score"])
         report_path = ctx["out_root"] / "qc_report.json"
@@ -18103,6 +18887,15 @@ class Director:
 
     def _auto_repair_qc_item(self, project, episode, ctx, item, report):
         """身份/性别/人数硬错误：以失败图为基底自动修图并立即复检。"""
+        if not self._image_qc_enabled():
+            report = dict(report or {})
+            report.update({
+                "advisory_only": True,
+                "blocking": False,
+                "awaiting_human": False,
+                "auto_repaired": 0,
+            })
+            return report, 0
         if report.get("passed") or not report.get("hard_failure"):
             return report, 0
         escalation = report.get("codex_escalation") or {}
@@ -18366,6 +19159,13 @@ class Director:
         镜头也必须重新检查；auto_repair=False 可先得到完整失败清单，再
         交给 Codex 多通道只重画失败项。
         """
+        if not self._image_qc_enabled():
+            return {
+                "status": "done", "checked": 0, "passed": 0,
+                "failed": 0, "auto_repaired": 0,
+                "skipped": True,
+                "reason": "选片模式或图片内容质检已关闭",
+            }
         project, episode = self._episode_ctx(project_title, episode_number)
         ctx = {"project": dict(project), "episode": dict(episode),
                "out_root": self._episode_dir(project, episode)}
