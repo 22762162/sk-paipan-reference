@@ -29,6 +29,7 @@ from ..adapters.codex_image import _style_line as _api_style_line
 from ..adapters.codex_image import _space_line as _api_space_line
 from ..adapters.claude_script import (build_prompt, extract_json,
                                       validate_script, validate_storyboard)
+from ..config import is_official_deepseek_endpoint
 from ..script_import import sanitize_script_entities
 from ..story_analysis import validate_story_analysis
 from ..errors import ProviderError
@@ -533,7 +534,38 @@ class OpenAIChatProvider(Provider):
     """
 
     DEFAULT_ENDPOINT = "https://api.deepseek.com"
-    DEFAULT_MODEL = "deepseek-chat"
+    DEFAULT_MODEL = "deepseek-v4-flash"
+    LEGACY_MODEL_MODES = {
+        "deepseek-chat": "disabled",
+        "deepseek-reasoner": "enabled",
+    }
+
+    def _model_and_thinking(self, endpoint=None):
+        """返回实际请求型号，并保留旧 DeepSeek 别名的思考语义。"""
+        endpoint = str(
+            endpoint or self.conf.get("endpoint")
+            or self.DEFAULT_ENDPOINT).rstrip("/")
+        model = str(
+            self.conf.get("model") or self.DEFAULT_MODEL).strip()
+        official = is_official_deepseek_endpoint(endpoint)
+        legacy_mode = self.LEGACY_MODEL_MODES.get(model) if official else None
+        if legacy_mode:
+            model = self.DEFAULT_MODEL
+        raw_mode = self.conf.get("thinking_mode")
+        if raw_mode is None:
+            raw_mode = legacy_mode
+        if raw_mode is None and official and model == self.DEFAULT_MODEL:
+            # deepseek-v4-flash 默认会开启思考；AIFOS 旧 deepseek-chat
+            # 通道是秒级非思考回退，升级时保持行为、延迟与成本稳定。
+            raw_mode = "disabled"
+        if isinstance(raw_mode, bool):
+            mode = "enabled" if raw_mode else "disabled"
+        else:
+            mode = str(raw_mode or "").strip().lower()
+        if mode not in ("", "enabled", "disabled"):
+            raise ProviderError(
+                "thinking_mode 只允许 enabled 或 disabled")
+        return model, mode or None
 
     def available(self, capability):
         ok, reason = super().available(capability)
@@ -541,6 +573,10 @@ class OpenAIChatProvider(Provider):
             return ok, reason
         if not self.conf.get("api_key"):
             return False, "未配置 api_key"
+        try:
+            self._model_and_thinking()
+        except ProviderError as exc:
+            return False, str(exc)
         return True, ""
 
     def ping(self):
@@ -555,23 +591,30 @@ class OpenAIChatProvider(Provider):
         except ProviderError as exc:
             if "max_tokens 上限被截断" not in str(exc):
                 return False, str(exc)
-        model = self.conf.get("model") or self.DEFAULT_MODEL
+        model, _ = self._model_and_thinking()
         return True, f"真实连通成功(model={model})"
 
     def _chat(self, messages, max_tokens=None, timeout=None):
         endpoint = (self.conf.get("endpoint")
                     or self.DEFAULT_ENDPOINT).rstrip("/")
-        url = (endpoint if endpoint.endswith("/chat/completions")
-               else f"{endpoint}/v1/chat/completions")
+        if endpoint.endswith("/chat/completions"):
+            url = endpoint
+        elif endpoint.endswith("/v1"):
+            url = f"{endpoint}/chat/completions"
+        else:
+            url = f"{endpoint}/v1/chat/completions"
+        model, thinking_mode = self._model_and_thinking(endpoint)
         body = {
-            "model": self.conf.get("model") or self.DEFAULT_MODEL,
+            "model": model,
             "messages": messages,
             "max_tokens": int(max_tokens
-                              or self.conf.get("max_tokens", 8192)),
+                              or self.conf.get("max_tokens", 32768)),
             "stream": False,
         }
+        if thinking_mode:
+            body["thinking"] = {"type": thinking_mode}
         temperature = self.conf.get("temperature")
-        if temperature is not None:
+        if temperature is not None and thinking_mode != "enabled":
             body["temperature"] = float(temperature)
         reply = _request_json(
             self.name, url,
@@ -657,7 +700,7 @@ class OpenAIChatProvider(Provider):
             data = fixed
         return ProviderResult(
             provider=self.name, cost=self.cost_per_call, data=data,
-            model=self.conf.get("model") or self.DEFAULT_MODEL)
+            model=self._model_and_thinking()[0])
 
     @staticmethod
     def _error_shot_positions(error):

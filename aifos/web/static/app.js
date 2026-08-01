@@ -2020,7 +2020,7 @@ function icloudSyncHtml(sync = {}) {
 function providerCostHint(provider) {
   const id = `${provider.name || ""} ${provider.type || ""} ${provider.model || ""}`.toLowerCase();
   if (provider.name === "deepseek" || id.includes("deepseek-v4-flash"))
-    return `<div class="pc-cost subscription"><b>DeepSeek V4 Flash（0731）</b> · 1M 上下文 · AIFOS 默认非思考模式，保持原备用通道速度</div>`;
+    return `<div class="pc-cost subscription"><b>DeepSeek V4 Flash（官方滚动版本）</b> · 1M 上下文 · AIFOS 默认非思考模式，保持原备用通道速度</div>`;
   if (id.includes("seedream"))
     return `<div class="pc-cost batch"><b>¥0.22/张</b> · Seedream 5.0 Lite 批量优先</div>`;
   if (provider.name === "codex")

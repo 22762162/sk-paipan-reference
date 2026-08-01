@@ -23,6 +23,7 @@ CAPABILITY_CN = {
 PROVIDER_CN = {
     "claude": "Claude CLI · 编剧",
     "claude_api": "Claude API · 编剧",
+    "deepseek": "DeepSeek API · 编剧/分镜",
     "codex": "Codex CLI · 出图",
     "image_api": "出图 API · OpenAI 兼容",
     "seedream5_lite": "Seedream 5.0 Lite · 批量出图",
@@ -37,7 +38,8 @@ PROVIDER_CN = {
 
 MODE_CN = {
     "cli": "CLI", "dreamina": "CLI",
-    "api": "API", "claude_api": "API", "image_api": "API",
+    "api": "API", "claude_api": "API", "openai_chat": "API",
+    "image_api": "API",
     "seedream_image": "API",
     "ark_video": "API", "doubao_tts": "API",
     "jianying_draft": "本机", "mock": "内置",
@@ -71,6 +73,7 @@ EDITABLE_FIELDS = {
     "max_tokens", "video_resolution", "duration", "poll", "timeout",
     "cost_per_call", "quota", "appid", "cluster", "voice_type",
     "speed_ratio", "audio_in_video", "draft_dir", "codex_home",
+    "thinking_mode",
 }
 _INT_FIELDS = {"max_tokens", "duration", "quota", "timeout"}
 _FLOAT_FIELDS = {"cost_per_call", "poll"}
@@ -174,6 +177,7 @@ def settings_payload(app):
             "endpoint": conf.get("endpoint", ""),
             "model": conf.get("model", ""),
             "model_version": conf.get("model_version", ""),
+            "thinking_mode": conf.get("thinking_mode", ""),
             "appid": conf.get("appid", ""),
             "voice_type": conf.get("voice_type", ""),
             "draft_dir": conf.get("draft_dir", ""),
@@ -300,6 +304,12 @@ def update_provider(config_path, name, fields):
             clean[key] = int(value)
         elif key in _FLOAT_FIELDS:
             clean[key] = float(value)
+        elif key == "thinking_mode":
+            mode = str(value).strip().lower()
+            if mode not in ("enabled", "disabled"):
+                raise AifosError(
+                    "thinking_mode 只允许 enabled 或 disabled")
+            clean[key] = mode
         else:
             clean[key] = str(value).strip()
     if "codex_home" in clean and name != "codex":

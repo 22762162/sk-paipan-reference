@@ -27,9 +27,9 @@ def test_defaults_include_api_providers(tmp_path):
             assert name in app.router.providers
         assert app.config.get("providers", "claude_api", "model") == \
             "claude-opus-4-8"
-        # 路由:CLI → API → mock
+        # 路由:Claude CLI → Claude API → DeepSeek Flash → mock
         assert app.config.get("routing", "script") == \
-            ["claude", "claude_api", "mock"]
+            ["claude", "claude_api", "deepseek", "mock"]
         assert app.config.get("routing", "video") == \
             ["jimeng", "ark", "api", "mock"]
         assert app.config.get("routing", "image") == \
@@ -282,7 +282,8 @@ def test_web_settings_endpoints(tmp_path):
         names = [p["name"] for p in view["providers"]]
         assert {"claude", "claude_api", "image_api", "ark",
                 "jimeng", "mock"} <= set(names)
-        assert view["routing"]["script"] == ["claude", "claude_api", "mock"]
+        assert view["routing"]["script"] == [
+            "claude", "claude_api", "deepseek", "mock"]
 
         status, fresh = post("/api/settings", {
             "provider": "claude_api",

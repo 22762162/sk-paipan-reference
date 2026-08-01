@@ -139,6 +139,19 @@ DEFAULTS = {
             "reference_images": True,
             "cost_per_call": 0.8, "timeout": 600,
         },
+        "deepseek": {
+            # DeepSeek V4 Flash 官方 OpenAI 兼容接口。默认关闭；填入 Key
+            # 后作为剧本/分镜备用通道，不改变 Claude/Codex 主路由。
+            "type": "openai_chat", "enabled": False,
+            "capabilities": ["script", "storyboard"],
+            "endpoint": "https://api.deepseek.com", "api_key": "",
+            "model": "deepseek-v4-flash",
+            # 旧 deepseek-chat 是非思考模式；升级后显式保持同一语义，
+            # 避免默认思考导致响应时间、成本和 JSON 行为突然变化。
+            "thinking_mode": "disabled",
+            "max_tokens": 32768,
+            "cost_per_call": 0.05, "timeout": 1800,
+        },
         "image_api": {
             # GPT Image 2 高质量备用。普通批量只用 medium,
             # high 留给终稿/复杂文字等已明确分类的任务。
@@ -210,9 +223,9 @@ DEFAULTS = {
         # 所有真实图片在进入出图 Provider 前必须先由 Codex 审核并优化
         # 最终提示词；该能力失败时真实图片任务失败关闭，不回退 mock。
         "prompt_review": ["codex"],
-        "script": ["claude", "claude_api", "mock"],
+        "script": ["claude", "claude_api", "deepseek", "mock"],
         "image_qc": ["codex", "image_api", "claude", "claude_api", "mock"],
-        "storyboard": ["claude", "claude_api", "mock"],
+        "storyboard": ["claude", "claude_api", "deepseek", "mock"],
         # 全景图实测标注必须走支持图片附件的真实视觉 API；
         # 必须真实携带图片，禁止回退文本 CLI / mock 猜测三维坐标，
         # 避免伪造家具坐标污染后续搭景。
@@ -245,6 +258,60 @@ def _deep_merge(base, override):
         else:
             out[key] = copy.deepcopy(value)
     return out
+
+
+_DEEPSEEK_OFFICIAL_ENDPOINTS = frozenset({
+    "https://api.deepseek.com",
+    "https://api.deepseek.com/v1",
+    "https://api.deepseek.com/chat/completions",
+    "https://api.deepseek.com/v1/chat/completions",
+})
+
+
+def is_official_deepseek_endpoint(value):
+    """识别官方根地址、兼容 base URL 与完整 ChatCompletions 地址。"""
+    return str(value or "").strip().lower().rstrip("/") in \
+        _DEEPSEEK_OFFICIAL_ENDPOINTS
+
+
+def _migrate_saved_deepseek(data):
+    """只迁移磁盘旧配置；调用方显式 overrides 始终保持最高优先级。"""
+    providers = data.get("providers") or {}
+    deepseek = providers.get("deepseek")
+    if not (isinstance(deepseek, dict)
+            and deepseek.get("type") == "openai_chat"
+            and is_official_deepseek_endpoint(deepseek.get("endpoint"))):
+        return data
+    legacy_model = str(deepseek.get("model") or "").strip()
+    legacy_modes = {
+        "deepseek-chat": "disabled",
+        "deepseek-reasoner": "enabled",
+    }
+    if legacy_model not in legacy_modes:
+        return data
+    deepseek["model"] = "deepseek-v4-flash"
+    deepseek["thinking_mode"] = legacy_modes[legacy_model]
+    if deepseek.get("max_tokens") in (None, 8192):
+        deepseek["max_tokens"] = 32768
+    return data
+
+
+def _strip_inherited_custom_deepseek_thinking(
+        data, saved=None, overrides=None):
+    """自定义 OpenAI 网关未显式配置时不发送 DeepSeek 专用字段。"""
+    deepseek = (data.get("providers") or {}).get("deepseek")
+    if not isinstance(deepseek, dict) or \
+            is_official_deepseek_endpoint(deepseek.get("endpoint")):
+        return data
+    layers = (saved or {}, overrides or {})
+    explicit = any(
+        "thinking_mode" in (
+            (layer.get("providers") or {}).get("deepseek") or {})
+        for layer in layers if isinstance(layer, dict)
+    )
+    if not explicit:
+        deepseek.pop("thinking_mode", None)
+    return data
 
 
 CODEX_PROFILE_LIMIT = 3
@@ -646,8 +713,11 @@ class Config:
         if path.exists():
             saved = json.loads(path.read_text(encoding="utf-8"))
             data = _deep_merge(data, saved)
+            data = _migrate_saved_deepseek(data)
         if overrides:
             data = _deep_merge(data, overrides)
+        data = _strip_inherited_custom_deepseek_thinking(
+            data, saved=saved, overrides=overrides)
         # 旧工作区只有 providers.codex：第一路继承原命令/开关，
         # 第二路保持安全关闭并使用约定的备用 CODEX_HOME。
         explicit_profiles = (
