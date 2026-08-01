@@ -1621,7 +1621,7 @@ def build_qc_prompt(payload):
             "人物动作与视线按本镜合同变化，不参与本项对比。")
     else:
         scene_continuity = "本镜无同场对照帧，跳过本项。"
-    return IMAGE_QC_PROMPT.format(
+    prompt = IMAGE_QC_PROMPT.format(
         scene_continuity=scene_continuity,
         image=payload.get("image_uri", ""),
         generation_scope=json.dumps(
@@ -1654,6 +1654,23 @@ def build_qc_prompt(payload):
             "这些物品出现是正确的,禁止当成时代错乱判失败):"
             + "、".join(payload["era_exceptions"]))
            if payload.get("era_exceptions") else ""))
+    sequence_samples = [
+        item for item in (payload.get("video_sequence_samples") or [])
+        if isinstance(item, dict) and item.get("uri")
+    ]
+    if sequence_samples:
+        sequence = json.dumps(
+            sequence_samples, ensure_ascii=False, separators=(",", ":"))
+        prompt = (
+            "【真实视频五点抽帧联合质检】\n"
+            f"按时间顺序逐张打开并联合比较这些证据帧:{sequence}\n"
+            "检查0/25/50/75/100%之间是否出现明显跑脸、服装或场景漂移、"
+            "人物/道具瞬移、同一道具无过程消失或复制、穿模悬浮、支撑关系"
+            "断裂、屏幕/设备方向反转、起止动作阶段倒置。只有普通观众一眼"
+            "可见且影响剧情或可信度的问题才失败；轻微生成波动必须放行。"
+            "这些图片仅是质检证据，严禁登记为资产或进入后续生成参考链。\n\n"
+            + prompt)
+    return prompt
 
 
 def validate_image_qc(data):

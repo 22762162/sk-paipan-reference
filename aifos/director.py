@@ -121,6 +121,11 @@ from .story_intelligence import (
     derive_episode_continuity_input,
     review_document,
 )
+from .video_media_qc import (
+    evaluate_video_technical,
+    extract_video_qc_frames,
+    probe_video,
+)
 from .story_logic import (
     PROP_CONTRACT_SCHEMA,
     audit_prop_contract,
@@ -16308,6 +16313,336 @@ class Director:
             ctx["episode"]["id"], "video_qc_report", report)
         return report
 
+    @staticmethod
+    def _local_media_binary(name):
+        """Resolve media tools for launchd, whose PATH may omit ~/.local/bin."""
+        resolved = shutil.which(name)
+        if resolved:
+            return resolved
+        bundled = Path.home() / ".local" / "bin" / name
+        return str(bundled) if bundled.is_file() else name
+
+    def _video_sample_qc_spec(self, ctx, shot):
+        expected_characters = shot.get("characters") or []
+        return self._qc_spec(
+            ctx["project"]["id"],
+            self._video_identity_names(ctx, shot),
+            location=self._shot_location(ctx.get("script"), shot),
+            action=shot.get("description") or shot.get("prompt") or "",
+            forbid=self._FORBID + ["字幕条"],
+            expected_characters=expected_characters,
+            expected_count=shot.get(
+                "visible_figure_count", len(expected_characters)),
+            composition_contract=(
+                shot.get("composition_contract")
+                or build_composition_contract(shot)),
+            readable_text=shot.get("readable_text") or {},
+            narrative_overlays=shot.get("narrative_overlays"),
+            functional_figures=shot.get("functional_figures"))
+
+    def _run_video_media_qc(self, ctx, content_enabled):
+        """Probe every produced clip; optionally inspect five real video frames.
+
+        Technical media facts are always checked.  Turning video content QC
+        off performs no extraction and no AI calls.  Extracted frames live in
+        a review-only cache and are never registered as assets or references.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        shots = {
+            int(item.get("shot_no")): item
+            for item in self._active_shots(ctx)
+            if item.get("shot_no") is not None
+        }
+        videos = [
+            item for item in (ctx.get("videos") or [])
+            if int(item.get("shot_no") or -1) in shots
+        ]
+        ffprobe = self._local_media_binary("ffprobe")
+        ffmpeg = self._local_media_binary("ffmpeg")
+        cache_root = ctx["out_root"] / "qc_evidence"
+
+        def inspect_media(video):
+            shot_no = int(video["shot_no"])
+            shot = shots[shot_no]
+            uri = str(video.get("uri") or "")
+            # 内置 mock 用 JSON 合同模拟视频，只用于离线回归；它不是
+            # 可交付媒体，也不能喂给 ffmpeg。仅在 provider 明确为 mock
+            # 时豁免，真实 Provider 即便误返回 .json 仍会技术失败。
+            if (str(video.get("provider") or "").lower() == "mock"
+                    and Path(uri).suffix.lower() == ".json"):
+                technical = {
+                    "schema": "aifos.video-technical-qc/v1",
+                    "passed": True,
+                    "issues": [],
+                    "checks": [{
+                        "name": "mock_provider_contract",
+                        "passed": True,
+                    }],
+                    "mock_provider_contract": True,
+                    "reference_chain_eligible": False,
+                }
+                frames = ({
+                    "passed": True,
+                    "samples": [],
+                    "issues": [],
+                    "mock_provider_contract": True,
+                    "reference_chain_eligible": False,
+                    "asset_registration_allowed": False,
+                } if content_enabled else None)
+                return shot_no, technical, frames
+            probe = probe_video(
+                uri, ffprobe=ffprobe, ffmpeg=ffmpeg)
+            expected_duration = shot.get("duration")
+            try:
+                tolerance = max(0.5, float(expected_duration) * 0.1)
+            except (TypeError, ValueError):
+                tolerance = 0.5
+            profile = ctx.get("production_profile") or {}
+            require_audio = bool(
+                profile.get("voice", "jimeng_builtin") == "jimeng_builtin"
+                and profile.get("lip_sync", True))
+            technical = evaluate_video_technical(
+                probe,
+                expected_aspect=ctx.get("aspect") or "9:16",
+                expected_resolution=(
+                    video.get("video_resolution") or "720p"),
+                expected_duration=expected_duration,
+                duration_tolerance=tolerance,
+                require_audio=require_audio,
+            )
+            frames = None
+            if content_enabled and technical.get("passed"):
+                frames = extract_video_qc_frames(
+                    video.get("uri", ""), cache_root,
+                    probe=probe, ffmpeg=ffmpeg)
+            return shot_no, technical, frames
+
+        per_shot = {}
+        workers = min(max(1, self._video_parallel_workers()),
+                      max(1, len(videos)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(inspect_media, video) for video in videos]
+            for future in as_completed(futures):
+                shot_no, technical, frames = future.result()
+                per_shot[shot_no] = {
+                    "shot_no": shot_no,
+                    "technical": technical,
+                    "frame_evidence": frames,
+                    "content_qc_enabled": bool(content_enabled),
+                    "content_qc_waived": not content_enabled,
+                    "reference_chain_eligible": False,
+                    "asset_registration_allowed": False,
+                    "visual_verdicts": [],
+                }
+
+        visual_tasks = []
+        if content_enabled:
+            for shot_no, item in per_shot.items():
+                evidence = item.get("frame_evidence") or {}
+                if not evidence.get("passed"):
+                    continue
+                shot = shots[shot_no]
+                spec = self._video_sample_qc_spec(ctx, shot)
+                snapshot, signature, _history = self._video_input_for_qc(
+                    ctx, shot_no)
+                sequence_samples = [
+                    {
+                        "label": sample.get("label"),
+                        "timestamp": sample.get("timestamp"),
+                        "uri": sample.get("uri"),
+                    }
+                    for sample in evidence.get("samples") or []
+                ]
+                sequence_manifest = [
+                    {
+                        "index": index + 1,
+                        "uri": sample["uri"],
+                        "label": f"视频{sample['label']}抽帧",
+                        "role": "video_qc_sequence",
+                        "binding": (
+                            "仅作本次视频时序质检证据，不得进入生成参考链"),
+                        "reference_chain_eligible": False,
+                    }
+                    for index, sample in enumerate(sequence_samples)
+                ]
+                generation_input = {
+                    "schema": "aifos.video-frame-review-input/v1",
+                    "scope": {"shot_no": shot_no,
+                              "frame_kind": "video_qc_sequence"},
+                    "prompt": snapshot.get("prompt_sent") or "",
+                    "prompt_contract": copy.deepcopy(
+                        snapshot.get("prompt_contract") or {}),
+                    "reference_manifest": (
+                        copy.deepcopy(
+                            snapshot.get("reference_manifest") or [])
+                        + sequence_manifest),
+                    "input_signature": signature,
+                    "reference_chain_eligible": False,
+                }
+                if sequence_samples:
+                    payload = {
+                        **spec,
+                        "image_uri": sequence_samples[0]["uri"],
+                        "generation_input": generation_input,
+                        "generation_prompt": generation_input["prompt"],
+                        "reference_manifest": generation_input[
+                            "reference_manifest"],
+                        "video_sequence_samples": sequence_samples,
+                        "video_qc_focus": (
+                            "联合检查五点抽帧中明显影响剧情的身份漂移、"
+                            "道具瞬移、物理支撑、空间朝向和动作阶段；"
+                            "不要因微小美术差异失败。"),
+                    }
+                    sequence = {
+                        "label": "/".join(
+                            sample["label"] for sample in sequence_samples),
+                        "timestamp": [
+                            sample["timestamp"]
+                            for sample in sequence_samples],
+                    }
+                    visual_tasks.append((shot_no, sequence, spec, payload))
+
+        def inspect_sample(task):
+            shot_no, sample, spec, payload = task
+            try:
+                result = self.router.call(
+                    "image_qc", payload, ctx["out_root"],
+                    cancel=lambda: self._cancel_requested(ctx))
+                verdict = self._assess_image_qc(
+                    spec, result.data or {}, 1)
+            except (AifosError, ProviderUnavailable, ProviderError) as exc:
+                # 内容审片能力临时不可用时只留可见建议状态；它不能
+                # 反过来阻塞已通过本地技术检查的视频或触发盲目重拍。
+                result = SimpleNamespace(
+                    cost=0.0, provider="", data={})
+                verdict = {
+                    "passed": None,
+                    "issues": [],
+                    "unavailable": str(exc),
+                }
+            return shot_no, sample, verdict, result
+
+        if visual_tasks:
+            workers = min(max(1, self._parallel_workers()), len(visual_tasks))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(inspect_sample, task)
+                    for task in visual_tasks
+                ]
+                for future in as_completed(futures):
+                    shot_no, sample, verdict, result = future.result()
+                    if result.cost:
+                        self._task_cost = (
+                            getattr(self, "_task_cost", 0.0) + result.cost)
+                        if not hasattr(self, "_task_providers"):
+                            self._task_providers = set()
+                        self._task_providers.add(result.provider)
+                        self.projects.add_episode_cost(
+                            ctx["episode"]["id"], result.cost)
+                    per_shot[shot_no]["visual_verdicts"].append({
+                        "label": sample.get("label"),
+                        "timestamp": sample.get("timestamp"),
+                        "passed": verdict.get("passed"),
+                        "issues": list(verdict.get("issues") or []),
+                        "provider": result.provider,
+                        "unavailable": verdict.get("unavailable", ""),
+                    })
+
+        issues = []
+        for shot_no in sorted(per_shot):
+            item = per_shot[shot_no]
+            for issue in (item["technical"].get("issues") or []):
+                issues.append({
+                    **copy.deepcopy(issue),
+                    "check": "video_technical",
+                    "shot_no": shot_no,
+                    "rerunnable": True,
+                })
+            evidence = item.get("frame_evidence") or {}
+            if content_enabled:
+                for issue in evidence.get("issues") or []:
+                    issues.append({
+                        **copy.deepcopy(issue),
+                        "check": "video_technical",
+                        "shot_no": shot_no,
+                        "rerunnable": True,
+                    })
+                visual_messages = []
+                unavailable = []
+                for verdict in item.get("visual_verdicts") or []:
+                    if verdict.get("passed") is None:
+                        unavailable.append(
+                            f"{verdict.get('label')}:"
+                            f"{verdict.get('unavailable') or '内容审片不可用'}")
+                        continue
+                    if verdict.get("passed"):
+                        continue
+                    visual_messages.extend(
+                        f"{verdict.get('label')}:{message}"
+                        for message in verdict.get("issues") or [])
+                visual_messages = list(dict.fromkeys(visual_messages))
+                if visual_messages:
+                    revision = optimize_qc_feedback(
+                        visual_messages, mode="video")
+                    patch = list(revision.get("instructions") or [])
+                    diagnosis = {
+                        "schema": "aifos.generation-input-diagnosis/v1",
+                        "mode": "video",
+                        "diagnosis_complete": True,
+                        "issues": visual_messages,
+                        "targeted_prompt_patch": {"instructions": patch},
+                        "decision": {
+                            "action": ("direct_video_retry"
+                                       if patch else "awaiting_human"),
+                            "safe_to_auto_retry": bool(patch),
+                            "input_changed": bool(patch),
+                            "prompt_patch": patch,
+                            "reason": (
+                                "真实视频五点抽帧发现明确内容偏差，"
+                                "按问题定向修订后最多重拍一次"),
+                        },
+                    }
+                    issues.append({
+                        "check": "video_visual",
+                        "severity": "error",
+                        "shot_no": shot_no,
+                        "rerunnable": bool(patch),
+                        "message": "；".join(visual_messages[:8]),
+                        "input_diagnosis": diagnosis,
+                    })
+                if unavailable:
+                    issues.append({
+                        "check": "video_visual",
+                        "severity": "warn",
+                        "shot_no": shot_no,
+                        "rerunnable": False,
+                        "blocking": False,
+                        "advisory_only": True,
+                        "message": "；".join(unavailable[:5]),
+                    })
+
+        report = {
+            "schema": "aifos.video-media-qc/v1",
+            "content_qc_enabled": bool(content_enabled),
+            "content_qc_waived": not content_enabled,
+            "technical_qc_enabled": True,
+            "shots": [per_shot[key] for key in sorted(per_shot)],
+            "issues": issues,
+            "passed": not any(
+                issue.get("severity") == "error" for issue in issues),
+            "reference_chain_eligible": False,
+            "asset_registration_allowed": False,
+        }
+        ctx["video_media_qc_report"] = report
+        path = ctx["out_root"] / "video_media_qc_report.json"
+        path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        self._save_review_document(
+            ctx["episode"]["id"], "video_media_qc_report", report)
+        return report
+
     def _video_input_for_qc(self, ctx, shot_no):
         video = next((
             item for item in (ctx.get("videos") or [])
@@ -16758,7 +17093,10 @@ class Director:
             for item in previous.get("shots", [])
             if isinstance(item, dict) and item.get("shot_no") is not None
         }
-        direct_checks = {"video", "media_sanity", "integrated_audio"}
+        direct_checks = {
+            "video", "media_sanity", "integrated_audio",
+            "video_technical", "video_visual",
+        }
         all_issues = qc_report.get("issues") or []
         global_issues = [
             str(issue.get("message") or issue.get("check"))
@@ -16895,10 +17233,10 @@ class Director:
             if isinstance(item, dict) and item.get("shot_no") is not None
         }
         issues = qc_report.get("issues") or []
-        shot_checks = {"video", "media_sanity"}
+        shot_checks = {"video", "media_sanity", "video_technical"}
         global_checks = {
-            "video", "media_sanity", "voice", "integrated_audio",
-            "subtitle",
+            "video", "media_sanity", "video_technical", "voice",
+            "integrated_audio", "subtitle",
         }
         shots = []
         for shot in (ctx.get("storyboard") or {}).get("shots", []):
@@ -17023,6 +17361,26 @@ class Director:
         for attempt in range(max_rounds):
             report = self.qc.run(
                 ctx["script"], self._active_storyboard(ctx), ctx)
+            media_qc = self._run_video_media_qc(
+                ctx, content_enabled=video_content_qc)
+            media_issues = copy.deepcopy(media_qc.get("issues") or [])
+            if media_issues:
+                report["issues"].extend(media_issues)
+                hard_media_errors = [
+                    issue for issue in media_issues
+                    if issue.get("severity") == "error"]
+                report["score"] = max(
+                    0, int(report.get("score") or 0)
+                    - 15 * len(hard_media_errors))
+                if hard_media_errors:
+                    report["passed"] = False
+                report["rerun_shots"] = sorted(set(
+                    list(report.get("rerun_shots") or [])
+                    + [int(issue["shot_no"])
+                       for issue in media_issues
+                       if issue.get("shot_no") is not None
+                       and issue.get("rerunnable")]))
+            report["video_media_qc"] = media_qc
             video_qc = (
                 self._build_video_qc_report(
                     ctx, report, previous=video_qc)
@@ -17094,8 +17452,8 @@ class Director:
         report["delivery_check"] = delivery
         if not video_content_qc:
             technical_checks = {
-                "video", "media_sanity", "voice", "integrated_audio",
-                "subtitle", "delivery",
+                "video", "media_sanity", "video_technical", "voice",
+                "integrated_audio", "subtitle", "delivery",
             }
             observations = []
             normalized_issues = []
@@ -17132,9 +17490,14 @@ class Director:
                 and issue.get("rerunnable")})
         else:
             report["technical_passed"] = not any(
-                i["severity"] == "error" and i["check"] not in ("content",)
+                i["severity"] == "error"
+                and i["check"] not in ("content", "video_visual")
                 for i in report["issues"])
-            report["content_passed"] = content_review["passed"]
+            report["content_passed"] = bool(
+                content_review["passed"] and not any(
+                    i["severity"] == "error"
+                    and i["check"] == "video_visual"
+                    for i in report["issues"]))
         ctx["qc_report"] = report
         # 交付复核完成后再写一次，让前端拿到最终的总质检状态与“待人工”
         # 镜头，而不是停留在返工前的中间快照。
