@@ -249,21 +249,10 @@ def test_cli_revise_and_regen(tmp_path, capsys):
     assert main(["--workspace", ws, "revise", "--project", "万妖图录",
                  "--episode", "1", "--feedback", "更热血"]) == 0
     assert "重写" in capsys.readouterr().out
-    # 剧本确认 → 画出人物/分镜后才能重画单镜头
+    # 剧本确认 → AI 自动为人物/道具候选选优定版，无需手机逐张选择。
     assert main(["--workspace", ws, "confirm", "--project", "万妖图录",
                  "--episode", "1"]) == 0
-    capsys.readouterr()
-    locked = App(ws)
-    try:
-        script, _ = _script_of(locked, "万妖图录", 1)
-        for character in script["characters"]:
-            locked.director.select_character_candidate(
-                "万妖图录", 1, character["name"], 1)
-    finally:
-        locked.close()
-    assert main(["--workspace", ws, "confirm", "--project", "万妖图录",
-                 "--episode", "1"]) == 0
-    capsys.readouterr()
+    assert "AI 自动选优定版" in capsys.readouterr().out
     assert main(["--workspace", ws, "regen", "--project", "万妖图录",
                  "--episode", "1", "--shot", "1",
                  "--feedback", "夜晚"]) == 0

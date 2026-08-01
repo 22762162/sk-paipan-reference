@@ -207,10 +207,11 @@ def test_reconcile_resets_stale_generating_claims(app):
 
 
 def test_reconcile_migrates_recoverable_awaiting_human_to_auto_retry(app):
-    """有产物的 awaiting_human 迁移成 failed 自动重排——不再占人工。
+    """有产物的 awaiting_human 迁回 pending 自动重排——不再占人工。
 
     这是新产线的契约:人工确认点不再由断点对账创建,失败稿只要文件还在
-    就自动重新排队。旧契约(原样上报供人工)已被取代。
+    就自动重新排队。旧契约(原样上报供人工)已被取代。默认选片模式关闭
+    阻断式图片内容质检,因此旧红牌改成风险记录而不是继续计作失败。
     """
     project, episode = _preproduce(app)
     plan_path = _plan_path(app, project)
@@ -233,20 +234,27 @@ def test_reconcile_migrates_recoverable_awaiting_human_to_auto_retry(app):
            "storyboard": storyboard}
     result = app.director.reconcile_completed_shot_images(ctx)
 
-    assert result["autonomous_retry"] >= len(gated)
+    assert result["autonomous_retry"] == 0
+    assert result["awaiting_human"] == 0
+    assert result["awaiting_human_shots"] == []
     refreshed = json.loads(plan_path.read_text(encoding="utf-8"))
     by_id = {item["id"]: item for item in refreshed["items"]}
     for shot_no in gated:
         item = by_id[f"shot:{shot_no}"]
-        assert item["status"] == "failed"
+        assert item["status"] == "pending"
         assert item["qc"]["awaiting_human"] is False
-        assert item["qc"]["autonomous_repair_required"] is True
+        assert item["qc"]["advisory_only"] is True
+        assert item["qc"]["blocking"] is False
+        assert item["content_qc_migration"]["previous_status"] \
+            == "awaiting_human"
 
 
-def test_reconcile_reports_unmigratable_awaiting_human_for_gate(app):
-    """迁移不了的(产物已丢失)必须原样上报——_stage_images 靠它跳过。
+def test_reconcile_requeues_missing_awaiting_human_without_mobile_gate(app):
+    """历史产物丢失也迁回 pending，由生成阶段自动补齐而非等待手机。
 
-    写死成空清单等于把那道闸门变成死代码,历史待人工的镜头会被静默重跑。
+    断点对账本身不把“待重生”误报成 technical_incomplete；只有生成结束后
+    确认 0 张技术可用，候选组才进入 technical_incomplete（另有候选组回归
+    测试覆盖），同时其他镜头继续生产。
     """
     project, episode = _preproduce(app)
     plan_path = _plan_path(app, project)
@@ -268,8 +276,18 @@ def test_reconcile_reports_unmigratable_awaiting_human_for_gate(app):
            / f"p{project['id']:03d}" / "e001",
            "storyboard": storyboard}
     result = app.director.reconcile_completed_shot_images(ctx)
-    assert result["awaiting_human_shots"] == sorted(gated)
-    assert result["awaiting_human"] == len(gated)
+    assert result["awaiting_human_shots"] == []
+    assert result["awaiting_human"] == 0
+    refreshed = json.loads(plan_path.read_text(encoding="utf-8"))
+    by_id = {item["id"]: item for item in refreshed["items"]}
+    for shot_no in gated:
+        item = by_id[f"shot:{shot_no}"]
+        assert item["status"] == "pending"
+        assert item["output_uri"] == ""
+        assert item["qc"]["awaiting_human"] is False
+        assert item["qc"]["blocking"] is False
+        assert item["content_qc_migration"]["previous_status"] \
+            == "awaiting_human"
 
 def test_character_face_hidden_detection():
     from aifos.director import Director

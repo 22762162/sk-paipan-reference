@@ -10,7 +10,7 @@ CSS = (ROOT / "aifos" / "web" / "static" / "style.css").read_text(
 )
 
 
-def test_shot_candidate_statuses_and_four_up_rendering_are_present():
+def test_shot_candidate_statuses_and_ai_auto_selection_rendering_are_present():
     for status in (
         "awaiting_selection",
         "regenerating_candidates",
@@ -19,15 +19,58 @@ def test_shot_candidate_statuses_and_four_up_rendering_are_present():
         assert status in JS
     assert "function shotCandidateGridHtml(item, editable)" in JS
     assert 'class="shot-candidate-grid"' in JS
-    assert "本镜4张候选" in JS
+    assert 'const batchLabel = expected === 3 ? "问题镜头补抽3张"' in JS
     assert "✓ 正式关键帧" in JS
-    assert "4张均保留回看" in JS
+    assert "AI已自动选优" in JS
+    assert "无需手机操作" in JS
+    assert "改选这张（可选）" in JS
+    assert "历史失败 · 系统自动接管" in JS
     assert "缺 ${missing" in JS
-    assert "补齐4张后可选" in JS
-    assert "const slots = [1, 2, 3, 4]" in JS
+    assert "系统补齐后可改选" in JS
+    assert "Array.from({ length: expected }" in JS
     assert 'aria-label="候选 ${index} 尚未生成"' in JS
     assert "等待技术补齐" in JS
     assert "selection.selected_uri || selection.selected_url" in JS
+    assert "Array.isArray(group.candidates)" in JS
+    assert "Number(group.expected_count) === 3 ? 3 : 4" in JS
+    assert 'item.status === "technical_incomplete";' in JS
+
+
+def test_cast_and_prop_candidates_do_not_require_mobile_selection():
+    cast_view = JS[
+        JS.index("function renderCastSelection"):
+        JS.index("const VIDEO_REF_KIND_CN")
+    ]
+    for expected in (
+        "AI自动选优，无需手机逐张定版",
+        "人工改选只是可选覆盖",
+        "✓ AI已选优",
+        "AI选优中",
+        "改选这张（可选）",
+        "核心道具AI四选一",
+        "改选这套（可选）",
+        "AI选优后自动继续",
+    ):
+        assert expected in cast_view
+    for obsolete in (
+        "逐个点开大图对比，各选 1 张定版",
+        "待选 1 张",
+        "请选择1张",
+        "全部选完才能继续",
+        "手机端主选片入口",
+    ):
+        assert obsolete not in cast_view
+
+
+def test_awaiting_cast_banner_says_ai_autoselects_without_phone_work():
+    banner = JS[
+        JS.index("function renderProgressBanner"):
+        JS.index("const CARD_W")
+    ]
+    assert "人物/核心道具正在AI自动选优" in banner
+    assert "无需手机逐张确认" in banner
+    assert "查看选优结果（可选）" in banner
+    assert "去选人物/道具" not in banner
 
 
 def test_current_candidate_group_precedes_single_shot_artifact():

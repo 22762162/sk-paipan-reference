@@ -12,7 +12,6 @@ import sys
 
 from . import __version__
 from .app import App
-from .director import character_candidate_policy_text
 from .errors import AifosError
 
 PRODUCE_PATTERN = re.compile(r"《(?P<title>.+?)》\s*第\s*(?P<number>\d+)\s*集")
@@ -255,7 +254,8 @@ def _cmd_produce(app, args):
     summary = app.director.produce(
         title, number, premise=args.premise, style=args.style,
         force=args.force, script=script,
-        pause_for_confirm=args.review, kind=args.kind)
+        pause_for_confirm=args.review, kind=args.kind,
+        auto_select_assets=True)
     print(f"\n=== 《{title}》第{number}集 制作{_status_cn(summary['status'])} ===")
     print(f"质检得分: {summary['qc_score']}   "
           f"成本: {summary['cost']}/{summary['budget']}")
@@ -282,9 +282,10 @@ def _cmd_produce(app, args):
         print(f"  python3 -m aifos confirm --project {title} --episode {number}")
         return 0
     if summary["status"] == "awaiting_cast":
-        print(f"\n正式角色统一4张候选：{character_candidate_policy_text()}。"
-              "核心道具也统一四选一；请在 AIFOS 网页逐个定版。")
-        print("全部锁定后再运行 confirm；未锁定前不会生成任何后续图片。")
+        # 仅兼容尚未由新版流水线续跑的旧状态；CLI 已明确开启 AI 定版，
+        # 不再把手机/网页逐张选择作为生产门禁。
+        print("\n人物与核心道具候选将由 AI 自动选优定版，无需手机逐张操作；"
+              "再次运行 produce 即从当前断点续跑。")
         return 0
     if summary["status"] == "awaiting_confirm":
         print("\n预生产完成(剧本/人物图/场景图/分镜/首尾帧)。检查满意后运行:")
@@ -298,7 +299,7 @@ def _status_cn(status):
     return {"done": "完成", "failed": "失败", "qc_failed": "完成(质检未过)",
             "awaiting_confirm": "待确认",
             "awaiting_script": "剧本待确认",
-            "awaiting_cast": "人物/道具待选"}.get(status, status)
+            "awaiting_cast": "人物/道具AI选优中"}.get(status, status)
 
 
 def _cmd_tunnel(args):
@@ -356,31 +357,29 @@ def _cmd_confirm(app, args):
         "SELECT * FROM episodes WHERE project_id=? AND number=?",
         (project["id"], args.episode))
     if episode is not None and episode["status"] == "awaiting_script":
-        # 第一道确认:剧本 OK → 人物/核心道具各生成4张候选，再停下来人工定版。
+        # 第一道确认:剧本 OK → 人物/核心道具各生成4张候选，由AI自动选优定版。
         print(f"剧本已确认,开始画《{args.project}》第{args.episode}集"
               "的人物与核心道具候选 …")
         summary = app.director.produce(
-            args.project, args.episode, pause_for_confirm=True)
-        print(f"{_status_cn(summary['status'])};请先在网页中为每名正式角色和核心道具各选1张，"
-              "再运行 confirm")
+            args.project, args.episode, pause_for_confirm=True,
+            auto_select_assets=True)
+        print(f"{_status_cn(summary['status'])};人物与核心道具已由 AI 自动选优定版，"
+              "无需手机逐张操作；满意后再运行 confirm 开始视频生产")
         return 0
     if episode is not None and episode["status"] == "awaiting_cast":
-        script_doc, _ = app.projects.latest_document(episode["id"], "script")
-        selection = app.director.production_asset_selection_status(
-            project["id"], script_doc or {})
-        if not selection["passed"]:
-            print("人物或核心道具尚未全部选定。请先在 AIFOS 网页逐一选定。",
-                  file=sys.stderr)
-            return 1
-        print(f"人物与核心道具已锁定,开始画《{args.project}》第{args.episode}集"
-              "的场景/分镜/首尾帧 …")
+        # 兼容升级前遗留的 awaiting_cast：直接让 AI 对现有候选自动定版，
+        # 然后继续预生产；不再要求用户去网页或手机逐张选择。
+        print(f"检测到旧版人物/道具待选断点，AI 将自动选优并继续画"
+              f"《{args.project}》第{args.episode}集的场景/分镜/首尾帧 …")
         summary = app.director.produce(
-            args.project, args.episode, pause_for_confirm=True)
+            args.project, args.episode, pause_for_confirm=True,
+            auto_select_assets=True)
         print(f"{_status_cn(summary['status'])};满意后再运行一次 "
               "confirm 即开始视频生产")
         return 0
     print(f"已确认,继续生产《{args.project}》第{args.episode}集 …")
-    summary = app.director.produce(args.project, args.episode)
+    summary = app.director.produce(
+        args.project, args.episode, auto_select_assets=True)
     print(f"制作{_status_cn(summary['status'])},"
           f"质检 {summary['qc_score']},成本 {summary['cost']}")
     return 0 if summary["status"] == "done" else 1
@@ -397,7 +396,8 @@ def _cmd_batch(app, args):
         print(f"—— 制作《{args.title}》第{number}集 ——")
         try:
             summary = app.director.produce(
-                args.title, number, style=args.style, force=args.force)
+                args.title, number, style=args.style, force=args.force,
+                auto_select_assets=True)
             rows.append((number, summary["status"], summary["qc_score"],
                          summary["cost"]))
         except Exception as exc:
@@ -408,8 +408,8 @@ def _cmd_batch(app, args):
         score_s = "-" if score is None else f"{score:.0f}"
         cost_s = "-" if cost is None else f"{cost:.2f}"
         print(f"{number:<6}{_status_cn(status):<12}{score_s:<8}{cost_s:<8}")
-    # 批量命令也必须尊重人工定角门禁：候选立绘生成完成即算本轮成功，
-    # 待用户在网页完成逐角色定版后再继续，不得自动猜选人物。
+    # 批量命令同样由 AI 自动定版人物/道具；awaiting_cast 只作为升级前
+    # 遗留状态兼容，不是要求手机人工操作的生产门禁。
     successful = {"done", "awaiting_script", "awaiting_cast",
                   "awaiting_confirm"}
     return 0 if all(r[1] in successful for r in rows) else 1

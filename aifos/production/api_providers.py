@@ -14,6 +14,9 @@ import base64
 import http.client
 import json
 import re
+import shutil
+import struct
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -212,6 +215,232 @@ def sniff_image_media(data, fallback="image/png"):
     if head.startswith((b"GIF87a", b"GIF89a")):
         return "image/gif"
     return fallback
+
+
+_CANONICAL_IMAGE_SIZES = {
+    "9:16": (1080, 1920),
+}
+
+
+def _image_dimensions(path):
+    """Read PNG/JPEG geometry from real bytes, regardless of suffix."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return None
+    if (len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n"
+            and data[12:16] == b"IHDR"):
+        return struct.unpack(">II", data[16:24])
+    if len(data) < 4 or not data.startswith(b"\xff\xd8"):
+        return None
+    offset = 2
+    sof_markers = {
+        0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+        0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+    }
+    while offset + 4 <= len(data):
+        if data[offset] != 0xFF:
+            offset += 1
+            continue
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            break
+        marker = data[offset]
+        offset += 1
+        if marker in (0x01, *range(0xD0, 0xDA)):
+            continue
+        if offset + 2 > len(data):
+            break
+        length = struct.unpack(">H", data[offset:offset + 2])[0]
+        if length < 2 or offset + length > len(data):
+            break
+        if marker in sof_markers and length >= 7:
+            height, width = struct.unpack(">HH", data[offset + 3:offset + 7])
+            return int(width), int(height)
+        offset += length
+    return None
+
+
+def _center_crop_box(source_width, source_height, target_width,
+                     target_height):
+    """Return an integer center crop with the target orientation/ratio."""
+    if source_width * target_height > source_height * target_width:
+        crop_height = source_height
+        crop_width = max(
+            1, round(source_height * target_width / target_height))
+        crop_width = min(source_width, crop_width)
+        crop_x = (source_width - crop_width) // 2
+        crop_y = 0
+    elif source_width * target_height < source_height * target_width:
+        crop_width = source_width
+        crop_height = max(
+            1, round(source_width * target_height / target_width))
+        crop_height = min(source_height, crop_height)
+        crop_x = 0
+        crop_y = (source_height - crop_height) // 2
+    else:
+        crop_x = crop_y = 0
+        crop_width, crop_height = source_width, source_height
+    return crop_x, crop_y, crop_width, crop_height
+
+
+def _image_converter():
+    """Return a deterministic local raster converter; macOS stays zero-install."""
+    sips = shutil.which("sips")
+    if sips:
+        return "sips", sips
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        bundled = Path.home() / ".local" / "bin" / "ffmpeg"
+        ffmpeg = str(bundled) if bundled.is_file() else ""
+    if ffmpeg:
+        return "ffmpeg", ffmpeg
+    return "", ""
+
+
+def _run_image_conversion(source, target, crop_box, target_size):
+    """Center-crop then resize to a lossless PNG, returning converter name."""
+    converter, executable = _image_converter()
+    if not executable:
+        raise ProviderError(
+            "图片已生成，但本机没有 sips/ffmpeg，无法自动归一化为标准9:16；"
+            "这是本地确定性后处理问题，禁止用同一提示词重复付费抽图")
+    crop_x, crop_y, crop_width, crop_height = crop_box
+    target_width, target_height = target_size
+    target = Path(target)
+    source = Path(source)
+    token = uuid.uuid4().hex
+    crop_stage = target.with_name(f".{target.name}.{token}.crop.png")
+    output_stage = target.with_name(f".{target.name}.{token}.normalized.png")
+    try:
+        if converter == "sips":
+            first = subprocess.run([
+                executable, "--cropToHeightWidth", str(crop_height),
+                str(crop_width), "--cropOffset", str(crop_y), str(crop_x),
+                str(source), "--out", str(crop_stage),
+            ], capture_output=True, text=True, timeout=120, check=False)
+            if first.returncode != 0:
+                raise ProviderError(
+                    "sips 图片安全区裁切失败: "
+                    + (first.stderr or first.stdout or "未知错误")[-500:])
+            second = subprocess.run([
+                executable, "--resampleHeightWidth", str(target_height),
+                str(target_width), str(crop_stage), "--out",
+                str(output_stage),
+            ], capture_output=True, text=True, timeout=120, check=False)
+            if second.returncode != 0:
+                raise ProviderError(
+                    "sips 图片标准化失败: "
+                    + (second.stderr or second.stdout or "未知错误")[-500:])
+        else:
+            crop_filter = (
+                f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y},"
+                f"scale={target_width}:{target_height}:flags=lanczos")
+            completed = subprocess.run([
+                executable, "-y", "-loglevel", "error", "-i", str(source),
+                "-vf", crop_filter, "-frames:v", "1", str(output_stage),
+            ], capture_output=True, text=True, timeout=120, check=False)
+            if completed.returncode != 0:
+                raise ProviderError(
+                    "ffmpeg 图片标准化失败: "
+                    + (completed.stderr or completed.stdout or "未知错误")[-500:])
+        actual = _image_dimensions(output_stage)
+        if actual != target_size:
+            raise ProviderError(
+                f"图片后处理应输出 {target_width}x{target_height}，"
+                f"实际为 {actual or '无法读取'}；禁止盲目重复付费生成")
+        output_stage.replace(target)
+        return converter
+    except subprocess.TimeoutExpired as exc:
+        raise ProviderError(
+            "图片9:16标准化超过120秒；这是本地后处理失败，"
+            "禁止用同一提示词重复付费生成") from exc
+    finally:
+        for stage in (crop_stage, output_stage):
+            try:
+                stage.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _normalize_generated_image(path, payload):
+    """Make formal 9:16 artifacts canonical before returning downstream.
+
+    OpenAI's portrait-native 1024x1536 is 2:3, not 9:16.  The paid source is
+    retained in a hidden audit directory, while callers only receive the
+    deterministic center-safe crop standardized to 1080x1920.
+    """
+    aspect = str((payload or {}).get("aspect") or "9:16")
+    target_size = _CANONICAL_IMAGE_SIZES.get(aspect)
+    if target_size is None:
+        return {
+            "applied": False, "requested_aspect": aspect,
+            "policy": "provider_native",
+        }
+    path = Path(path)
+    dimensions = _image_dimensions(path)
+    if dimensions is None:
+        raise ProviderError(
+            "图片供应商已返回产物，但无法读取真实宽高；"
+            "禁止登记或用同一提示词盲目重复生成")
+    source_width, source_height = dimensions
+    crop_box = _center_crop_box(
+        source_width, source_height, *target_size)
+    crop_x, crop_y, crop_width, crop_height = crop_box
+    retained_width = crop_width / source_width
+    retained_height = crop_height / source_height
+    metadata = {
+        "applied": dimensions != target_size,
+        "requested_aspect": aspect,
+        "policy": "center_safe_crop_then_standard_scale",
+        "source_dimensions": {
+            "width": source_width, "height": source_height,
+        },
+        "crop_box": {
+            "x": crop_x, "y": crop_y,
+            "width": crop_width, "height": crop_height,
+        },
+        "safe_area": {
+            "retained_width_fraction": round(retained_width, 6),
+            "retained_height_fraction": round(retained_height, 6),
+            "discard_left_fraction": round(crop_x / source_width, 6),
+            "discard_right_fraction": round(
+                (source_width - crop_x - crop_width) / source_width, 6),
+            "discard_top_fraction": round(crop_y / source_height, 6),
+            "discard_bottom_fraction": round(
+                (source_height - crop_y - crop_height) / source_height, 6),
+        },
+        "target_dimensions": {
+            "width": target_size[0], "height": target_size[1],
+        },
+        "original_uri": str(path),
+        "formal_uri": str(path),
+        "converter": "none",
+    }
+    if dimensions == target_size:
+        return metadata
+
+    try:
+        media = sniff_image_media(path.read_bytes(), "image/png")
+    except OSError as exc:
+        raise ProviderError(f"读取图片供应商原始产物失败: {exc}") from exc
+    suffix = {"image/jpeg": ".jpg", "image/webp": ".webp"}.get(
+        media, ".png")
+    audit_dir = path.parent / ".provider-originals"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    audit_path = audit_dir / (
+        f"{path.stem}.{uuid.uuid4().hex}.provider-original{suffix}")
+    path.replace(audit_path)
+    metadata["original_uri"] = str(audit_path)
+    try:
+        metadata["converter"] = _run_image_conversion(
+            audit_path, path, crop_box, target_size)
+    except Exception:
+        # The paid source remains in audit storage.  No nonconforming formal
+        # path is exposed to downstream consumers.
+        raise
+    return metadata
 
 
 def _local_refs(payload):
@@ -1023,13 +1252,68 @@ class OpenAIImageProvider(Provider):
                     "禁止脸和发型漂移,禁止漂移。服装、服装颜色与材质、动作、场景和光影按本镜"
                     "剧本及当集造型执行,允许与人物参考图服装不同;除非提示词明确要求"
                     "保留参考图服装,不得把参考图服装当作必须复制的身份条件。")
+        safe_area = self._native_crop_safe_area_directive(payload)
+        if safe_area:
+            parts.append(safe_area)
         return "".join(p for p in parts if p)
+
+    def _native_crop_safe_area_directive(self, payload):
+        """Tell the model which native margins post-processing will remove."""
+        aspect = str((payload or {}).get("aspect") or "9:16")
+        target_size = _CANONICAL_IMAGE_SIZES.get(aspect)
+        if target_size is None:
+            return ""
+        size = str(self._size(payload or {}))
+        match = re.fullmatch(r"(\d+)x(\d+)", size)
+        if not match:
+            return ""
+        source_width, source_height = map(int, match.groups())
+        crop_x, crop_y, crop_width, crop_height = _center_crop_box(
+            source_width, source_height, *target_size)
+        if (crop_x, crop_y, crop_width, crop_height) == (
+                0, 0, source_width, source_height):
+            return ""
+        if crop_x:
+            retained = crop_width / source_width * 100
+            margin = crop_x / source_width * 100
+            return (
+                f"画幅安全区硬约束:接口原生画布为{source_width}x{source_height}，"
+                f"落盘时会确定性中心裁切为9:16；所有人物脸、手、关键道具和"
+                f"可读文字必须完整位于中央{retained:.1f}%宽度内，左右各约"
+                f"{margin:.1f}%仅为可丢弃背景，不得放置关键内容。")
+        retained = crop_height / source_height * 100
+        margin = crop_y / source_height * 100
+        return (
+            f"画幅安全区硬约束:接口原生画布为{source_width}x{source_height}，"
+            f"落盘时会确定性中心裁切为9:16；所有人物脸、手、关键道具和"
+            f"可读文字必须完整位于中央{retained:.1f}%高度内，上下各约"
+            f"{margin:.1f}%仅为可丢弃背景，不得放置关键内容。")
+
+    def _normalize_output(self, path, payload):
+        return _normalize_generated_image(path, payload)
+
+    def _normalization_preflight(self, payload):
+        """Refuse a paid call before dispatch when local canonicalization cannot run."""
+        aspect = str((payload or {}).get("aspect") or "9:16")
+        target_size = _CANONICAL_IMAGE_SIZES.get(aspect)
+        if target_size is None:
+            return
+        size = str(self._size(payload or {}))
+        requested = re.fullmatch(r"(\d+)x(\d+)", size)
+        if requested and tuple(map(int, requested.groups())) == target_size:
+            return
+        if not _image_converter()[1]:
+            raise ProviderError(
+                f"{self.name} 原生输出 {size} 需要本地归一化为"
+                f"{target_size[0]}x{target_size[1]}，但本机没有 sips/ffmpeg；"
+                "已在调用图片 API 前停止，禁止重复付费抽图")
 
     def _gen_image(self, prompt, size, dest, payload=None):
         endpoint = (self.conf.get("endpoint")
                     or self.DEFAULT_ENDPOINT).rstrip("/")
         timeout = self.conf.get("timeout", 300)
         payload = payload or {}
+        self._normalization_preflight(payload)
         model = self._request_model(payload)
         refs = _local_refs(payload)
         _quality, api_quality = self._quality(payload)
@@ -1071,6 +1355,7 @@ class OpenAIImageProvider(Provider):
             _download(self.name, item["url"], dest, timeout)
         else:
             raise ProviderError(f"{self.name} 应答缺少 b64_json/url")
+        return self._normalize_output(dest, payload)
 
     def generate(self, capability, payload, out_dir, cancel=None):
         out_dir = Path(out_dir)
@@ -1110,7 +1395,8 @@ class OpenAIImageProvider(Provider):
                 prompt = (f"{prompt}。出场角色:"
                           f"{'、'.join(payload.get('characters', []))}")
                 data = {"shot_no": shot_no}
-            self._gen_image(prompt, size, target, payload)
+            normalization = self._gen_image(prompt, size, target, payload)
+            data["image_normalization"] = normalization
             return ProviderResult(provider=self.name,
                                   cost=call_cost,
                                   data=self._audit_data(
@@ -1124,11 +1410,14 @@ class OpenAIImageProvider(Provider):
             chain_first = payload.get("chain_first_uri", "")
             first_source = "generated"
             calls = 0
+            normalizations = {}
             if chain_first and Path(chain_first).exists():
                 # 帧链:首帧固定为上一镜尾帧,只生成尾帧(拼接连贯)
                 import shutil as _sh
                 _sh.copyfile(chain_first, first)
                 first_source = "previous_tail"
+                normalizations["first"] = self._normalize_output(
+                    first, payload)
             else:
                 keyframe = Path(payload.get("image_uri", ""))
                 if (keyframe.exists() and keyframe.suffix.lower()
@@ -1136,8 +1425,10 @@ class OpenAIImageProvider(Provider):
                     import shutil as _sh
                     _sh.copyfile(keyframe, first)
                     first_source = "keyframe"
+                    normalizations["first"] = self._normalize_output(
+                        first, payload)
                 else:
-                    self._gen_image(
+                    normalizations["first"] = self._gen_image(
                         f"{prompt}。首帧:动作起始瞬间,构图稳定", size,
                         first, payload)
                     calls += 1
@@ -1145,7 +1436,7 @@ class OpenAIImageProvider(Provider):
                 from ..errors import ProduceCancelled
                 raise ProduceCancelled("已手动停止")
             # 尾帧以首帧为参考,保证同角色同场景连贯
-            self._gen_image(
+            normalizations["last"] = self._gen_image(
                 f"{prompt}。尾帧:动作结束瞬间,与首帧同场景同角色、"
                 "人物服装道具一致",
                 size, last, {**payload, "chain_first_uri": str(first)})
@@ -1156,11 +1447,12 @@ class OpenAIImageProvider(Provider):
                     "first": str(first), "last": str(last),
                     "first_source": first_source,
                     "generation_calls": calls,
+                    "image_normalization": normalizations,
                 }, payload, call_cost),
                 uri=str(first), model=self._request_model(payload))
         if capability == "cover":
             target = out_dir / "cover.png"
-            self._gen_image(
+            normalization = self._gen_image(
                 f"短视频封面:《{payload.get('title', '')}》"
                 f"第{payload.get('episode', 0)}集,"
                 f"{payload.get('tagline', '')}。{prompt}", size, target,
@@ -1168,7 +1460,8 @@ class OpenAIImageProvider(Provider):
             return ProviderResult(provider=self.name,
                                   cost=call_cost,
                                   data=self._audit_data(
-                                      {}, payload, call_cost),
+                                      {"image_normalization": normalization},
+                                      payload, call_cost),
                                   uri=str(target),
                                   model=self._request_model(payload))
         raise ProviderError(f"{self.name} 不支持能力: {capability}")
@@ -1305,6 +1598,7 @@ class SeedreamImageProvider(OpenAIImageProvider):
 
     def _gen_image(self, prompt, size, dest, payload=None):
         payload = payload or {}
+        self._normalization_preflight(payload)
         endpoint = (self.conf.get("endpoint")
                     or self.DEFAULT_ENDPOINT).rstrip("/")
         timeout = self.conf.get("timeout", 300)
@@ -1335,6 +1629,7 @@ class SeedreamImageProvider(OpenAIImageProvider):
             _download(self.name, item["url"], dest, timeout)
         else:
             raise ProviderError(f"{self.name} 应答缺少 b64_json/url")
+        return self._normalize_output(dest, payload)
 
 
 class DoubaoTtsProvider(Provider):

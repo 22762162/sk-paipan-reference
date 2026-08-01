@@ -16,17 +16,10 @@ from aifos.web.server import serve
 
 
 def _finish(app, title="万妖图录", number=1):
-    summary = app.director.produce(title, number)
-    assert summary["status"] == "awaiting_cast"
-    project = app.projects.get_project(title)
-    episode = app.db.query_one(
-        "SELECT * FROM episodes WHERE project_id=? AND number=?",
-        (project["id"], number))
-    script, _ = app.projects.latest_document(episode["id"], "script")
-    for character in script["characters"]:
-        app.director.select_character_candidate(
-            title, number, character["name"], 1)
-    return app.director.produce(title, number)
+    summary = app.director.produce(
+        title, number, auto_select_assets=True)
+    assert summary["status"] == "done"
+    return summary
 
 
 def test_export_zip_contents(tmp_path):

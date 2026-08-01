@@ -221,6 +221,10 @@ def settings_payload(app):
                     "defaults", "video_content_qc", default=True)),
             "shot_candidate_count": int(app.config.get(
                 "defaults", "shot_candidate_count", default=4)),
+            "shot_repair_candidate_count": int(app.config.get(
+                "defaults", "shot_repair_candidate_count", default=3)),
+            "shot_auto_repair_batches": int(app.config.get(
+                "defaults", "shot_auto_repair_batches", default=1)),
         },
         "icloud_sync": app.icloud_sync.status(),
         "config_path": str(app.workspace.config_path),
@@ -473,6 +477,26 @@ def set_defaults(config_path, mapping):
                     "shot_candidate_count 当前版本固定为 4(每镜四张候选,"
                     "不分档);其他取值暂不支持")
             updates[key] = 4
+        elif key == "shot_repair_candidate_count":
+            try:
+                count = int(value)
+            except (TypeError, ValueError):
+                raise AifosError("shot_repair_candidate_count 需为整数")
+            if isinstance(value, bool) or count != 3:
+                raise AifosError(
+                    "shot_repair_candidate_count 当前版本固定为 3"
+                    "(问题镜头同词补抽3张)")
+            updates[key] = 3
+        elif key == "shot_auto_repair_batches":
+            try:
+                batches = int(value)
+            except (TypeError, ValueError):
+                raise AifosError("shot_auto_repair_batches 需为整数")
+            if isinstance(value, bool) or batches != 1:
+                raise AifosError(
+                    "shot_auto_repair_batches 当前版本固定为 1"
+                    "(最多自动补抽一批)")
+            updates[key] = 1
         else:
             raise AifosError(f"不支持的默认项: {key}")
     if not updates:

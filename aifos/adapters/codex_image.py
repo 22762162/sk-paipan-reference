@@ -405,7 +405,7 @@ def build_instruction(capability, payload, out_dir):
             target = out_dir / f"prop_{safe}.png"
             instruction = (
                 f"为核心道具生成单件候选图并保存到 {target}(PNG,{size})。"
-                f"{prompt_text}。这是供人工四选一的道具母资产候选，"
+                f"{prompt_text}。这是供AI四选一自动定版的道具母资产候选，"
                 "不得画成人物立绘或场景图。"
                 f"{_ref_line(payload, prompt_text)}{common}只产出该文件。")
             return instruction, [target], {
@@ -413,7 +413,7 @@ def build_instruction(capability, payload, out_dir):
                 "prop": payload.get("prop_name", "")}
         if payload.get("portrait"):
             target = out_dir / f"portrait_{safe}.png"
-            purpose = ("这只是供人工挑选的定妆候选，尚不是最终身份锚点"
+            purpose = ("这是供AI自动比较选优的定妆候选，尚不是最终身份锚点"
                        if payload.get("portrait_candidate") else
                        "这张立绘是全剧的人物设定基准，之后所有镜头都会参考它")
             instruction = (

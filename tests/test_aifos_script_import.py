@@ -239,22 +239,8 @@ def test_cli_script_file(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 0
     assert "已导入剧本:2 场,3 个角色" in out
-    assert "制作人物/道具待选" in out
-    app = App(ws)
-    try:
-        project = app.projects.get_project("万妖图录")
-        episode = app.db.query_one(
-            "SELECT * FROM episodes WHERE project_id=? AND number=20",
-            (project["id"],))
-        saved, _ = app.projects.latest_document(episode["id"], "script")
-        for character in saved["characters"]:
-            app.director.select_character_candidate(
-                "万妖图录", 20, character["name"], 1)
-    finally:
-        app.close()
-    assert main(["--workspace", ws, "produce", "--title", "万妖图录",
-                 "--episode", "20"]) == 0
-    assert "制作完成" in capsys.readouterr().out
+    assert "制作人物/道具待选" not in out
+    assert "制作完成" in out
 
     bad = tmp_path / "bad.txt"
     bad.write_text("没有台词", encoding="utf-8")

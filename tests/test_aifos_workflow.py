@@ -76,7 +76,15 @@ def test_five_dimension_preflight_and_delivery(tmp_path):
                    for shot in shots)
 
         out = Path(paused["artifacts_dir"])
-        first_keyframe = out / "images" / "shot_001.keyframe.svg"
+        render_plan = json.loads(
+            (out / "render_plan.json").read_text(encoding="utf-8"))
+        first_shot = next(
+            item for item in render_plan["items"] if item["id"] == "shot:1")
+        assert first_shot["status"] == "done"
+        assert first_shot["candidate_group"]["candidate_count"] == 4
+        selection = first_shot["candidate_group"]["selection"]
+        assert selection["source"] == "ai"
+        first_keyframe = Path(selection["selected_uri"])
         # Mock 预览也遵守正式产线：镜头画面无名牌、说明文字和对白字幕。
         assert "<text" not in first_keyframe.read_text(encoding="utf-8")
 

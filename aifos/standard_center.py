@@ -75,7 +75,7 @@ DEFAULT_STANDARD = {
         "principle": (
             "先把小说或梗概改编成因果、物理、时间、空间、人物信息与道具"
             "生命周期完整的可拍剧本，再推导人物视觉 DNA、完成全剧角色去重"
-            "和人工定版，最后建立母资产、五维分镜与 Seedance 生产。"),
+            "和AI自动选优定版，最后建立母资产、五维分镜与 Seedance 生产。"),
     },
     "rules": {
         "rule_governance": default_rule_governance(),
@@ -380,7 +380,7 @@ DEFAULT_STANDARD = {
         },
         "quality_gates": [
             {"id": "script_bible", "label": "剧本第一道总闸门", "enabled": True, "severity": "block", "mandatory": True, "owner": "script_development", "description": "小说/梗概已完成影视化改编；世界、人物、因果、信息、物理、时间、空间、道具生命周期、可拍性及局部返编边界完整且不冲突。"},
-            {"id": "character_assets", "label": "人物与核心道具母资产", "enabled": True, "severity": "block", "mandatory": True, "owner": "character_asset_policy", "description": "所有正式角色与核心道具都已从4张候选中人工锁定；简化模式只豁免人物四视图与细节资产。"},
+            {"id": "character_assets", "label": "人物与核心道具母资产", "enabled": True, "severity": "block", "mandatory": True, "owner": "character_asset_policy", "description": "所有正式角色与核心道具都已由AI从4张候选中自动选优锁定；人工仅可选覆盖，简化模式只豁免人物四视图与细节资产。"},
             {"id": "continuity", "label": "连续性", "enabled": True, "severity": "block", "mandatory": True, "owner": "continuity", "description": "人物、服装、道具、站位及段间状态无跳变。"},
             {"id": "spatial", "label": "空间调度", "enabled": True, "severity": "block", "mandatory": True, "owner": "blocking", "description": "逐场锁定人物走位、机位、视锥和屏幕轴线，防止多人漂移或增殖。"},
             {"id": "spatial_seedance", "label": "Seedance 空间参考图", "enabled": True, "severity": "block", "mandatory": True, "owner": "blocking", "description": "多人走位或变机位镜头必须生成并绑定空间示意图。"},

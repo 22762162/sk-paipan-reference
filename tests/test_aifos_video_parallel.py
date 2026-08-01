@@ -106,6 +106,8 @@ def test_video_stage_runs_four_in_parallel_and_accounts_once(
             "reused": 0,
             "generated": 6,
             "parallel_workers": 4,
+            "contract_incomplete": False,
+            "contract_incomplete_shots": [],
         }
         assert max_active == 4
         assert [item["shot_no"] for item in ctx["videos"]] == list(range(1, 7))
@@ -120,4 +122,3 @@ def test_video_stage_runs_four_in_parallel_and_accounts_once(
         assert len(app.assets.list(project["id"], "video")) == 6
     finally:
         app.close()
-

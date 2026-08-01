@@ -211,22 +211,10 @@ def test_cli_review_and_confirm(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 0
     assert "剧本已确认" in out
-    assert "人物/道具待选" in out
-    # 人工定角门禁:未选不能继续。
-    assert main(["--workspace", ws, "confirm", "--project", "万妖图录",
-                 "--episode", "1"]) == 1
-    assert "尚未全部选定" in capsys.readouterr().err
-    locked = App(ws)
-    try:
-        _lock_all(locked, "万妖图录", 1)
-    finally:
-        locked.close()
-    # 第二停:人物已定版，完成预生产 → 再确认开拍
-    code = main(["--workspace", ws, "confirm", "--project", "万妖图录",
-                 "--episode", "1"])
-    out = capsys.readouterr().out
-    assert code == 0
-    assert "待确认" in out
+    assert "AI 自动选优定版" in out
+    assert "无需手机逐张操作" in out
+    # 人物/道具已由 AI 定版；第二次确认直接继续生产，不再增加图片
+    # 选择或放行门禁。
     code = main(["--workspace", ws, "confirm", "--project", "万妖图录",
                  "--episode", "1"])
     out = capsys.readouterr().out

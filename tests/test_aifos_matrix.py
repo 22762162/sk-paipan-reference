@@ -17,17 +17,10 @@ def app(tmp_path):
 
 
 def _finish(app, title, number, **kwargs):
+    kwargs.setdefault("auto_select_assets", True)
     summary = app.director.produce(title, number, **kwargs)
-    assert summary["status"] == "awaiting_cast"
-    project = app.projects.get_project(title)
-    episode = app.db.query_one(
-        "SELECT * FROM episodes WHERE project_id=? AND number=?",
-        (project["id"], number))
-    script, _ = app.projects.latest_document(episode["id"], "script")
-    for character in script["characters"]:
-        app.director.select_character_candidate(
-            title, number, character["name"], 1)
-    return app.director.produce(title, number)
+    assert summary["status"] == "done"
+    return summary
 
 
 def test_project_matrix_fields(app):

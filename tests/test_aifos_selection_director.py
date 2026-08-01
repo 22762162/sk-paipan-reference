@@ -202,14 +202,16 @@ def test_four_candidates_share_one_reviewed_contract_and_overlap(tmp_path):
     assert {p["prompt_compact"] for p in director.router.payloads} == {
         "冻结后的精准镜头提示词"}
 
-    # 候选完成不等于选片完成，不能偷偷生成 canonical 或 selected 字段。
+    # 底层候选组提供 AI 推荐；上层导演据此自动晋升当前版本。
     assert result.uri == ""
     assert "selected_pull" not in group
     assert "selected_uri" not in group
     assert "canonical_uri" not in group
-    assert group["recommended_candidate_id"] == ""
+    assert group["recommended_candidate_id"].endswith("#1")
+    assert group["recommended_candidate_index"] == 1
     assert not (tmp_path / "shot_007.keyframe.png").exists()
     assert Director._candidate_selection_pending(result) is True
+    assert group["selection_required"] is True
     assert result.cost == 4.25
 
 
@@ -300,7 +302,7 @@ def test_one_candidate_technical_failure_is_retried_and_fills_slot(tmp_path):
     assert Director._candidate_group_technical_incomplete(result) is False
 
 
-def test_unfilled_candidate_slot_keeps_successes_for_resume(tmp_path):
+def test_unfilled_candidate_slot_promotes_best_usable_without_mobile_gate(tmp_path):
     director = _director({"selection_mode": True})
     director.router = _ParallelRouter(persistent_failures={3})
     result = director._generate_selection_candidates_parallel(
@@ -315,41 +317,25 @@ def test_unfilled_candidate_slot_keeps_successes_for_resume(tmp_path):
     group = result.data["candidate_group"]
     success_uris = [row["uri"] for row in group["candidates"]]
     assert director.router.image_calls == 5
-    assert group["complete"] is False
-    assert group["technical_incomplete"] is True
+    assert group["complete"] is True
+    assert group["slot_complete"] is False
+    assert group["missing_slot_count"] == 1
+    assert group["technical_incomplete"] is False
     assert group["candidate_count"] == 3
     assert [row["candidate_index"] for row in group["candidate_errors"]] == [3]
     assert len(success_uris) == 3
     assert result.data["candidate_uris"] == success_uris
     assert all(Path(uri).exists() for uri in success_uris)
-    assert Director._candidate_group_technical_incomplete(result) is True
+    assert Director._candidate_group_technical_incomplete(result) is False
     assert Director._candidate_selection_pending(result) is True
+    assert group["selection_required"] is True
     assert result.uri == ""
-
-    # 续产沿用同一不可变版本，只补失败的第3槽，不重烧成功的三张。
-    director.router = _ParallelRouter(first_wave_size=1)
-    resumed = director._generate_selection_candidates_parallel(
-        "image", {
-            "_episode_id": "episode-1",
-            "_contract_revision": group["contract_revision"],
-            "_candidate_revision": group["candidate_revision"],
-            "_candidate_set_id": group["candidate_set_id"],
-            "_resume_candidate_group": copy.deepcopy(group),
-            "item_id": "shot:9", "shot_no": 9, "prompt": "冻结镜头",
-            "reference_manifest": [],
-        }, tmp_path, None, {"item_id": "shot:9"}, 4)
-    resumed_group = resumed.data["candidate_group"]
-    assert director.router.image_calls == 1
-    assert resumed_group["candidate_count"] == 4
-    assert resumed_group["candidate_set_token"] == group[
-        "candidate_set_token"]
-    assert {
-        row["candidate_index"]: row["uri"]
-        for row in resumed_group["candidates"] if row["candidate_index"] != 3
-    } == {
-        row["candidate_index"]: row["uri"]
-        for row in group["candidates"]
-    }
+    promoted = director._ai_promote_generated_candidate_group(result)
+    promoted_group = promoted.data["candidate_group"]
+    assert promoted_group["selection_required"] is False
+    assert promoted_group["selection"]["source"] == "ai"
+    assert promoted.uri in success_uris
+    assert Director._candidate_selection_pending(promoted) is False
 
 
 def test_disabled_image_content_qc_never_blocks_or_auto_repairs():

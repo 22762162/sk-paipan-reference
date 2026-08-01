@@ -96,21 +96,23 @@ def test_deterministic_script(app):
     assert s1["status"] == "done"
 
 
-def test_sensitive_premise_fails_qc(tmp_path):
+def test_sensitive_premise_is_advisory_and_does_not_block(tmp_path):
     app = App(tmp_path / "ws", config_overrides={
         "qc": {"pass_score": 95, "sensitive_words": ["禁忌之血"]}})
     try:
         summary = _finish(
             app, "万妖图录", 7, premise="主角误饮禁忌之血,妖化失控")
-        assert summary["status"] == "qc_failed"
-        assert summary["qc_score"] < 95
+        assert summary["status"] == "done"
         report = json.loads(
             (Path(summary["artifacts_dir"]) / "qc_report.json").read_text(
                 encoding="utf-8"))
-        assert any(i["check"] == "sensitive" for i in report["issues"])
-        # 质检未过 → 跳过运营包装,沉淀为失败案例
-        assert summary["outputs"]["cover"] == ""
-        assert app.data.cases(label="failure", kind="case")
+        sensitive = next(
+            i for i in report["issues"] if i["check"] == "sensitive")
+        assert sensitive["blocking"] is False
+        assert sensitive["advisory_only"] is True
+        # 内容质检只标风险，不阻断运营包装和交付。
+        assert summary["outputs"]["cover"]
+        assert app.data.cases(label="success", kind="case")
     finally:
         app.close()
 

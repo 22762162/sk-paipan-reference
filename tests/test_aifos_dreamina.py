@@ -110,7 +110,10 @@ def _make_app(tmp_path, binary, extra=None):
     conf = {"enabled": True, "command": [str(binary)]}
     conf.update(extra or {})
     return App(tmp_path / "ws", config_overrides={
-        "providers": {"jimeng": conf}})
+        "providers": {"jimeng": conf},
+        # 假 CLI 只写最小 ftyp 字节来验证命令/路由，并非可解码成片；
+        # 端到端适配器测试显式开启免检，避免把假媒体当正式技术质检样本。
+        "defaults": {"preview_qc_bypass": True}})
 
 
 def _lock_cast_and_continue(app, title, number):

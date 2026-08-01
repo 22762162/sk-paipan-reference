@@ -15,7 +15,8 @@ def test_batch_cli(tmp_path, capsys):
                  "--from", "1", "--to", "2"])
     out = capsys.readouterr().out
     assert code == 0
-    assert out.count("人物/道具待选") >= 2
+    assert "人物/道具待选" not in out
+    assert out.count("完成") >= 2
     assert main(["--workspace", ws, "batch", "万妖图录",
                  "--from", "3", "--to", "2"]) == 2
 

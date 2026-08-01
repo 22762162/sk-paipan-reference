@@ -242,8 +242,9 @@ def test_index_and_static(server):
     assert "后续人物、分镜和镜头统一以此为准".encode() in app_js
     assert b"storyBibleHtml(script)" in app_js
     assert "人物介绍".encode() in app_js
-    assert "所有正式角色统一4张候选".encode() in app_js
-    assert "跑龙套/背景路人不做独立设定".encode() in app_js
+    assert "每名正式角色统一4张候选".encode() in app_js
+    assert "AI自动选优，无需手机逐张定版".encode() in app_js
+    assert "仅按场次人数与功能受控".encode() in app_js
     assert "不建立独立人物设定，不生成候选图、立绘或四视图".encode() in app_js
     for heading in ("序号", "时长", "参考分镜", "首尾帧", "运镜",
                     "画面描述", "声音", "生产状态"):
@@ -1446,8 +1447,8 @@ def test_standard_center_api_lifecycle(server):
 
 def test_produce_flow_and_episode_api(server):
     port = server["port"]
-    # Web 默认流程:剧本 → 正式人物/核心道具四选一 → 预生产 →
-    # 开拍确认 → 每镜四候选明确选片 → 自动续产成片。
+    # Web 默认流程:剧本 → 人物候选四抽 AI 自动定版 → 预生产 →
+    # 开拍确认 → 每镜四候选 AI 自动选优 → 直接续产成片。
     status, reply = _json_request(port, "POST", "/api/produce", {
         "sentence": "开始制作《万妖图录》第15集"})
     assert status == 202
@@ -1483,17 +1484,17 @@ def test_produce_flow_and_episode_api(server):
     assert pre["storyboard"] is None
     assert pre["artifacts"]["cast_art"] == []
 
-    # 第一道确认(剧本 OK)→ 按角色重要度生成候选后停下。
+    # 第一道确认(剧本 OK)→ 人物候选四抽由 AI 自动定版，并进入开拍确认。
     status, reply = _json_request(port, "POST", "/api/confirm", {
         "episode_id": episode_id})
     assert status == 202 and reply["phase"] == "awaiting_script"
     job = _wait_job(port, reply["job_id"])
-    assert job["summary"]["status"] == "awaiting_cast"
+    assert job["summary"]["status"] == "awaiting_confirm"
 
     status, pre = _json_request(port, "GET", f"/api/episode/{episode_id}")
-    assert pre["storyboard"] is None
+    assert pre["storyboard"]["shots"]
     selection = pre["cast_selection"]
-    assert not selection["passed"]
+    assert selection["passed"]
     assert all(len(c["candidates"]) == character_candidate_target(c)
                for c in selection["characters"])
     assert all(candidate["url"].startswith("/artifacts/")
@@ -1508,88 +1509,25 @@ def test_produce_flow_and_episode_api(server):
     assert all(candidate["variant_label"] and candidate["look_variant"]
                for c in selection["characters"]
                for candidate in c["candidates"])
-    assert pre["artifacts"]["cast_art"] == []
-    assert pre["artifacts"]["scene_art"] == []
-    assert pre["character_asset_policy"]["mode"] == "auto"
-    policy_version = pre["character_asset_policy_version"]
-    status, missing_version = _json_request(
-        port, "POST", "/api/character/assets-policy", {
-            "episode_id": episode_id, "mode": "simple",
-        })
-    assert status == 400 and "expected_version" in missing_version["error"]
-    status, null_version = _json_request(
-        port, "POST", "/api/character/assets-policy", {
-            "episode_id": episode_id, "mode": "simple",
-            "expected_version": None,
-        })
-    assert status == 400 and "非负整数" in null_version["error"]
-    status, saved_policy = _json_request(
-        port, "POST", "/api/character/assets-policy", {
-            "episode_id": episode_id, "mode": "simple",
-            "expected_version": policy_version,
-        })
-    assert status == 200
-    assert saved_policy["policy"]["resolved_mode"] == "simple"
-    assert saved_policy["policy"]["generate_sheets"] is False
-    status, stale = _json_request(
-        port, "POST", "/api/character/assets-policy", {
-            "episode_id": episode_id, "mode": "full",
-            "expected_version": policy_version,
-        })
-    assert status == 409 and "刷新" in stale["error"]
-    # 未完成四选一，后端也必须拒绝绕过门禁。
-    status, blocked = _json_request(port, "POST", "/api/confirm", {
-        "episode_id": episode_id})
-    assert status == 409 and "最终立绘" in blocked["error"]
-
-    # 人物定版页允许放弃当前选择并回到候选生成;旧版本仍保留在历史中。
-    status, reply = _json_request(port, "POST", "/api/character/regenerate", {
-        "episode_id": episode_id})
-    assert status == 202 and reply["job_id"]
-    job = _wait_job(port, reply["job_id"])
-    assert job["summary"]["status"] == "awaiting_cast"
-    status, pre = _json_request(port, "GET", f"/api/episode/{episode_id}")
-    assert status == 200
-    selection = pre["cast_selection"]
-    assert selection["locked"] == 0 and not selection["passed"]
-    assert all(len(c["candidates"]) == character_candidate_target(c)
+    assert all(c["locked"] for c in selection["characters"])
+    assert all(sum(bool(candidate["selected"])
+                   for candidate in c["candidates"]) == 1
                for c in selection["characters"])
-
-    for character in selection["characters"]:
-        status, selected = _json_request(
-            port, "POST", "/api/character/select", {
-                "episode_id": episode_id,
-                "character": character["character"],
-                "candidate_index": 1,
-            })
-        assert status == 200
-    assert selected["passed"] is True
-
-    # 人物已锁定 → 才生成场景/分镜/首尾帧，再停等开拍。
-    status, reply = _json_request(port, "POST", "/api/confirm", {
-        "episode_id": episode_id})
-    assert status == 202 and reply["phase"] == "awaiting_cast"
-    job = _wait_job(port, reply["job_id"])
-    assert job["summary"]["status"] == "awaiting_confirm"
-    status, pre = _json_request(port, "GET", f"/api/episode/{episode_id}")
-    assert pre["storyboard"]["shots"]
-    assert pre["character_asset_policy"]["resolved_mode"] == "simple"
-    assert not [item for item in pre["render_plan"]["items"]
-                if item["category"] == "character_sheet"]
     assert pre["artifacts"]["cast_art"], "确认页需要最终人物立绘"
     assert pre["artifacts"]["scene_art"], "确认页需要场景概念图"
     assert pre["artifacts"]["videos"] == {}, "确认前不应生产视频"
 
-    # 开拍确认 → 每镜固定生成4张并停在选片，不得把推荐稿偷偷晋升。
+    # 开拍确认 → 每镜固定生成4张并由 AI 选优，不停在手机选片页。
     status, reply = _json_request(port, "POST", "/api/confirm", {
         "episode_id": episode_id, "video_quality": "high"})
     assert status == 202
     job = _wait_job(port, reply["job_id"])
-    assert job["summary"]["status"] == "awaiting_confirm"
+    assert job["summary"]["status"] == "done", json.dumps(
+        job["summary"], ensure_ascii=False)
     image_stage = next(
         stage for stage in job["summary"]["stages"]
         if stage["stage"] == "images")
-    assert image_stage["detail"]["awaiting_selection"] is True
+    assert image_stage["detail"].get("awaiting_selection") is not True
 
     status, selecting = _json_request(
         port, "GET", f"/api/episode/{episode_id}")
@@ -1599,35 +1537,14 @@ def test_produce_flow_and_episode_api(server):
          if item.get("category") == "shot_image"),
         key=lambda item: int(item["shot_no"]))
     assert candidate_items
-    assert all(item["status"] == "awaiting_selection"
+    assert all(item["status"] == "done"
                for item in candidate_items)
     assert all(len(item["candidate_group"]["candidates"]) == 4
                for item in candidate_items)
-
-    # 每一镜都明确选择当前版本候选；只有最后一镜会原子排一次续产任务。
-    resume_job_id = None
-    for item in candidate_items:
-        group = item["candidate_group"]
-        candidate = group["candidates"][0]
-        status, selected_shot = _json_request(
-            port, "POST", "/api/shot-candidates/select", {
-                "episode_id": episode_id,
-                "shot_no": item["shot_no"],
-                "candidate_set_id": group["candidate_set_id"],
-                "candidate_set_token": group["candidate_set_token"],
-                "contract_revision": group["contract_revision"],
-                "candidate_revision": group["candidate_revision"],
-                "candidate_id": candidate["candidate_id"],
-                "candidate_index": candidate["candidate_index"],
-            })
-        assert status == 200
-        if selected_shot.get("resume_job_id"):
-            assert resume_job_id is None
-            resume_job_id = selected_shot["resume_job_id"]
-    assert resume_job_id
-    job = _wait_job(port, resume_job_id)
-    assert job["summary"]["status"] == "done", json.dumps(
-        job["summary"], ensure_ascii=False)
+    assert all(item["candidate_group"]["selection"]["source"] == "ai"
+               for item in candidate_items)
+    assert all(item.get("selection_required") is not True
+               for item in candidate_items)
 
     status, detail = _json_request(port, "GET", f"/api/episode/{episode_id}")
     assert status == 200

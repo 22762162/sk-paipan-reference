@@ -264,9 +264,11 @@ def test_original_scheduler_claims_queued_api_without_fallback(tmp_path):
         assert dispatch["acceleration_status"] == "done"
         plan = json.loads((ctx["out_root"] / "render_plan.json").read_text())
         plan_item = plan["items"][0]
-        assert plan_item["status"] == "awaiting_selection"
+        assert plan_item["status"] == "done"
         assert plan_item["candidate_group"]["candidate_count"] == 4
-        assert plan_item["selection_required"] is True
+        assert plan_item.get("selection_required") is not True
+        assert plan_item["candidate_group"]["selection"]["source"] == "ai"
+        assert plan_item["candidate_group"]["selection"]["candidate_id"]
         assert plan_item["acceleration"]["provider"] == "image_api"
     finally:
         app.close()

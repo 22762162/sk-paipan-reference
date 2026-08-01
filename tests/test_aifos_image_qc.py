@@ -1,5 +1,6 @@
 """图片视觉质检:核对剧本要求,不合格自动重画;镜头景别多样性。"""
 
+import base64
 import copy
 import json
 import struct
@@ -541,7 +542,7 @@ def test_over_shoulder_qc_uses_face_for_front_and_silhouette_for_back(app):
 
 
 def test_qc_fail_triggers_auto_redraw(app, tmp_path):
-    """严格QC首败经Codex定向修订后固定生成四候选。"""
+    """严格QC首败经Codex定向修订后固定生成三候选。"""
     image = tmp_path / "shot.png"
     image.write_bytes(_valid_png())
     calls = {"image": [], "qc": []}
@@ -631,14 +632,14 @@ def test_qc_fail_triggers_auto_redraw(app, tmp_path):
                   "_episode_id": "unit-test"}, tmp_path, None,
         {"characters": ["小鹿"], "count": 1, "designs": "",
          "location": "", "action": "", "forbid": []})
-    assert len(calls["image"]) == 5          # 首画 + 同合同四候选
+    assert len(calls["image"]) == 4          # 首画 + 同合同三候选
     for candidate in calls["image"][1:]:
         assert "小鹿是人类女性" in candidate["feedback"]
         assert "【Codex 通知 AIFOS】" in candidate["feedback"]
         assert "只修改当前镜头" in candidate["feedback"]
         assert "【质检原因】" not in candidate["feedback"]
     assert result.qc["passed"] is True
-    assert result.qc["gacha"]["pulls"] == 4
+    assert result.qc["gacha"]["pulls"] == 3
     assert calls["qc"][0]["generation_input"]["scope"]["shot_no"] == 1
     assert calls["qc"][0]["generation_input"]["input_hash"]
     assert result.qc["first_failure"]["input_hash"]
@@ -762,7 +763,7 @@ def _qc_spec():
 
 def test_first_failure_escalates_then_redraws_with_codex_prompt(
         app, tmp_path):
-    """第1张不合格:Codex 改提示词，第二轮固定生成4张并全量选优。"""
+    """第1张不合格:Codex 改提示词，第二轮固定生成3张并全量选优。"""
     image = tmp_path / "first-failed.png"
     image.write_bytes(_valid_png())
     router = _EscalationRouter(image, "targeted_redraw")
@@ -777,28 +778,27 @@ def test_first_failure_escalates_then_redraws_with_codex_prompt(
     assert router.codex_payloads[0]["required_provider"] == "codex"
     assert router.codex_payloads[0]["codex_escalation_context"][
         "consecutive_failures"] == 1
-    # 初版1张 + 同一份 Codex 修订合同候选4张，候选不得提前停止。
-    assert router.calls["image"] == 5
-    # 初检1 + 首败升级1 + 4张候选逐张判分 + 全败升级1。
-    assert router.calls["qc"] == 7
+    # 初版1张 + 同一份 Codex 修订合同候选3张，候选不得提前停止。
+    assert router.calls["image"] == 4
+    # 初检1 + 首败升级1 + 3张候选逐张判分；不再启动第二轮升级。
+    assert router.calls["qc"] == 5
     for candidate in router.image_payloads[1:]:
         feedback = candidate.get("feedback") or ""
         assert "把静态关键帧改为唯一拱手完成瞬间" in feedback
         assert candidate["revision_mode"] == "targeted_qc_fix"
         assert candidate["qc_revision"]["source"] == "codex_escalation"
-    # 四张仍不合格：保留最高分候选和 Codex 下一轮指令，不转人工确认。
+    # 三张仍不合格：晋升相对最高分候选并记风险，不转人工确认。
     assert result.qc["consecutive_failures"] == 2
-    assert result.qc["codex_escalation"]["stage"] == "final_analysis"
-    assert result.qc["codex_escalation"]["executable"] is False
-    assert result.qc["retry_blocked"] is True
-    assert result.qc["gacha"]["pulls"] == 4
+    assert result.qc["best_effort_promoted"] is True
+    assert result.qc["nonblocking_risk"]["best_effort"] is True
+    assert result.qc["gacha"]["pulls"] == 3
     assert result.qc["gacha"]["select_after_all"] is True
 
 
 def test_contract_repair_auto_applies_then_stops_on_second_failure(
         app, tmp_path):
     """repair_contract 不再是死路:首失败把 Codex 修合同指令自动落到提示词
-    基底，第二轮用同一份新合同固定生成4张并自动择优。
+    基底，第二轮用同一份新合同固定生成3张并自动择优。
 
     旧契约(首失败即停)的死结:Codex 下达了修合同指令,但全仓库没有代码
     执行它——escalation_redraw_block 等着「合同真的改了就放行」,而没有人
@@ -814,19 +814,15 @@ def test_contract_repair_auto_applies_then_stops_on_second_failure(
                   "_episode_id": "unit-test"},
         tmp_path, None, _qc_spec())
 
-    assert router.calls["image"] == 5
+    assert router.calls["image"] == 4
     for candidate in router.image_payloads[1:]:
         prompt = str(candidate.get("prompt") or "")
         assert "【Codex合同修订·必须执行】" in prompt
         assert "把静态关键帧改为唯一拱手完成瞬间" in prompt
     assert result.qc["consecutive_failures"] == 2
-    assert result.qc["codex_escalation"]["stage"] == "final_analysis"
-    assert result.qc["codex_escalation"]["executable"] is False
-    assert result.qc["codex_escalation"]["aifos_action"] == "repair_contract"
+    assert result.qc["best_effort_promoted"] is True
+    assert result.qc["nonblocking_risk"]["best_effort"] is True
     assert result.qc["contract_repair_required"] is True
-    assert result.qc["retry_blocked"] is True
-    # 升级结论记住了当时的生成输入指纹，供后续重画闸门比对。
-    assert result.qc["codex_escalation"]["contract_input_hash"]
 
 
 def _escalation_qc(action="targeted_redraw",
@@ -954,15 +950,14 @@ def test_regen_image_applies_codex_instruction(app, monkeypatch):
     class _Stop(Exception):
         pass
 
-    def fake_plan_run(self, ctx, item_id, fn, prompt=None, payload=None,
-                      revision_source="manual", capability="image"):
-        captured["item_id"] = item_id
-        captured["payload"] = payload or {}
-        captured["revision_source"] = revision_source
+    def fake_run_one(self, ctx, task, **_kwargs):
+        captured["item_id"] = task["item_id"]
+        captured["payload"] = task["payload"]
+        captured["revision_source"] = task["revision_source"]
         raise _Stop()
 
     from aifos.director import Director
-    monkeypatch.setattr(Director, "_plan_run", fake_plan_run)
+    monkeypatch.setattr(Director, "_run_one_task", fake_run_one)
 
     with pytest.raises(_Stop):
         app.director.regen_image(
@@ -990,13 +985,12 @@ def test_regen_image_passes_human_override_into_escalation(app, monkeypatch):
     class _Stop(Exception):
         pass
 
-    def fake_plan_run(self, ctx, item_id, fn, prompt=None, payload=None,
-                      revision_source="manual", capability="image"):
-        captured["payload"] = payload or {}
+    def fake_run_one(self, ctx, task, **_kwargs):
+        captured["payload"] = task["payload"]
         raise _Stop()
 
     from aifos.director import Director
-    monkeypatch.setattr(Director, "_plan_run", fake_plan_run)
+    monkeypatch.setattr(Director, "_run_one_task", fake_run_one)
 
     with pytest.raises(_Stop):
         app.director.regen_image(
@@ -1288,7 +1282,7 @@ def test_reference_diagnosis_removes_wrong_manual_ref_before_retry(
         })
 
     assert result.qc["passed"] is True
-    assert len(calls["image"]) == 5
+    assert len(calls["image"]) == 4
     assert all(str(wrong) not in payload.get("reference_images", [])
                for payload in calls["image"][1:])
     assert all(payload.get("reference_manifest") == []
@@ -1494,7 +1488,7 @@ def test_count_mismatch_auto_revises_bad_image_with_locked_references(
                 {"character": "甲", "uri": str(identity)}],
         })
     assert result.qc["passed"] is True
-    assert len(calls["image"]) == 5
+    assert len(calls["image"]) == 4
     revised = calls["image"][1:]
     assert all(row["revision_mode"] == "targeted_qc_fix"
                for row in revised)
@@ -1511,9 +1505,9 @@ def test_count_mismatch_auto_revises_bad_image_with_locked_references(
 
 
 @pytest.mark.parametrize("worker_count", [1, 2])
-def test_stage_images_collects_qc_failure_and_finishes_later_shots(
+def test_stage_images_promotes_best_effort_and_finishes_all_shots(
         app, monkeypatch, worker_count):
-    """单镜二次 QC 失败不能阻断后续镜头，也不能污染正式图片资产。"""
+    """三抽最优稿未达线只记风险，仍晋升并让整批进入下游。"""
     project, _ = app.projects.get_or_create_project(
         f"关键帧失败不中断-{worker_count}")
     episode, _ = app.projects.get_or_create_episode(project["id"], 1)
@@ -1559,6 +1553,11 @@ def test_stage_images_collects_qc_failure_and_finishes_later_shots(
             "attempts": 2 if failed else 1,
             "issues": ["镜头2人物多出一人"] if failed else [],
             "hard_failure": failed,
+            "best_effort_promoted": failed,
+            "nonblocking_risk": {
+                "best_effort": failed,
+                "issues": ["镜头2人物多出一人"] if failed else [],
+            },
         }
         return result
 
@@ -1595,29 +1594,30 @@ def test_stage_images_collects_qc_failure_and_finishes_later_shots(
     app.director._task_cost = 0.0
     app.director._task_providers = set()
 
-    with pytest.raises(AifosError) as caught:
-        app.director._stage_images(ctx)
+    report = app.director._stage_images(ctx)
 
     assert sorted(generated) == [1, 2, 3, 4], \
         "二次 QC 失败后仍应派发并完成本集剩余关键帧"
-    assert "问题镜头: 2" in str(caught.value)
-    assert [item["shot_no"] for item in ctx["images"]] == [1, 3, 4]
+    assert report["count"] == 4
+    assert report.get("awaiting_selection") is not True
+    assert [item["shot_no"] for item in ctx["images"]] == [1, 2, 3, 4]
 
     formal = app.assets.active_list(project["id"], kind="image")
     assert {row["name"] for row in formal} == {
-        "e001_shot001", "e001_shot003", "e001_shot004"}
-    assert not any(row["uri"] == str(output_by_shot[2]) for row in formal)
-    assert output_by_shot[2].exists(), "失败图必须保留给下一轮自动分析"
+        "e001_shot001", "e001_shot002", "e001_shot003",
+        "e001_shot004"}
+    assert any(row["uri"] == str(output_by_shot[2]) for row in formal)
 
     plan = app.director._plan_read(ctx)
     by_id = {item["id"]: item for item in plan["items"]}
-    assert by_id["shot:2"]["status"] == "failed"
+    assert by_id["shot:2"]["status"] == "done"
     assert by_id["shot:2"]["output_uri"] == str(output_by_shot[2])
     assert by_id["shot:2"]["qc"]["passed"] is False
+    assert by_id["shot:2"]["qc"]["best_effort_promoted"] is True
     assert by_id["shot:2"]["qc"]["attempts"] == 2
     assert by_id["shot:2"]["qc"]["issues"] == ["镜头2人物多出一人"]
     assert all(by_id[f"shot:{n}"]["status"] == "done"
-               for n in (1, 3, 4))
+               for n in (1, 2, 3, 4))
 
 
 def test_reconcile_completed_shot_images_recovers_only_qc_passed_files(app):
@@ -1898,11 +1898,13 @@ def test_openai_api_uses_reference_images(tmp_path, monkeypatch):
         captured["url"] = url
         captured["files"] = [f[1].name for f in files]
         captured["prompt"] = fields["prompt"]
-        return {"data": [{"b64_json": "aGk="}]}
+        return {"data": [{"b64_json": base64.b64encode(
+            _valid_png(width=1024, height=1536)).decode()}]}
 
     def fake_json(*a, **k):
         captured["fell_back_to_generations"] = True
-        return {"data": [{"b64_json": "aGk="}]}
+        return {"data": [{"b64_json": base64.b64encode(
+            _valid_png(width=1024, height=1536)).decode()}]}
 
     monkeypatch.setattr(api_providers, "_multipart_post", fake_multipart)
     monkeypatch.setattr(api_providers, "_request_json", fake_json)
@@ -1934,11 +1936,13 @@ def test_openai_api_no_reference_falls_back_to_generations(tmp_path,
 
     def fake_gen(*a, **k):
         used["gen"] = True
-        return {"data": [{"b64_json": "aGk="}]}
+        return {"data": [{"b64_json": base64.b64encode(
+            _valid_png(width=1024, height=1536)).decode()}]}
 
     def fake_edit(*a, **k):
         used["edit"] = True
-        return {"data": [{"b64_json": "aGk="}]}
+        return {"data": [{"b64_json": base64.b64encode(
+            _valid_png(width=1024, height=1536)).decode()}]}
 
     monkeypatch.setattr(api_providers, "_request_json", fake_gen)
     monkeypatch.setattr(api_providers, "_multipart_post", fake_edit)
@@ -2005,7 +2009,10 @@ def test_single_and_batch_qc_and_redo(app):
     redrawn = [i for i in final_plan["items"] if i["id"] in fail_ids]
     assert all(i["revision"]["source"] == "batch_qc" for i in redrawn)
     assert all(i["revision"]["prompt_modified"] for i in redrawn)
-    assert all("测试标记未过" in i["prompt"] for i in redrawn)
+    # prompt 保留基础/用户可编辑原文；系统修订原因单独写入 revision，
+    # 避免下次打开编辑框时把系统补丁当成用户原稿。
+    assert all("测试标记未过" in i["revision"]["feedback"]
+               for i in redrawn)
     assert all(i["reference_inputs"]["attached"] for i in redrawn)
     assert all(i["reference_inputs"]["count"] >= 1 for i in redrawn)
 

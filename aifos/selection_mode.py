@@ -6,8 +6,12 @@
 * 内容视觉质检只提供非阻断观察，不能自动返工或卡住生产；
 * 创作选片模式开启时，图片和视频内容视觉质检均关闭；
 * 提示词、导演合同和技术完整性检查始终开启；
-* 每个镜头固定产生四个同合同候选，人工或 AI 选中当前版本后才可进入下游；
-* 网络/API 等技术失败可以重试，内容评价不能触发重试；
+* 首次每镜固定产生四个同合同候选，AI 自动选优晋升；
+  人工仍可覆盖选择，但不再是生产门禁；
+* 内容/合同问题允许自动修复后补抽三张，但最多只补一批；
+* 补抽后 AI 始终自动选最高分继续；都未过时标记风险后仍晋升最优张；
+* 只有零张技术可用图时记 ``technical_incomplete``，且不阻断其他镜头；
+* 网络/API 等技术失败仍可以做候选槽位级重试；
 * 旧版本任务迟到时不得覆盖当前正式资产。
 """
 
@@ -22,6 +26,8 @@ from typing import Any, Mapping, Optional, Union
 
 SELECTION_POLICY_SCHEMA = "aifos.selection-policy/v1"
 CANDIDATES_PER_SHOT = 4
+REPAIR_CANDIDATES_PER_BATCH = 3
+MAX_AUTO_REPAIR_BATCHES = 1
 CANDIDATE_VERSION_SCHEMA = "aifos.candidate-set/v1"
 SELECTION_SOURCES = frozenset(("manual", "ai"))
 
@@ -35,6 +41,7 @@ class FailureClass(str, Enum):
     RATE_LIMIT = "rate_limit"
     TECHNICAL_INTEGRITY = "technical_integrity"
     CONTENT = "content"
+    CONTRACT = "contract"
 
 
 _RETRYABLE_FAILURES = frozenset((
@@ -42,6 +49,12 @@ _RETRYABLE_FAILURES = frozenset((
     FailureClass.API,
     FailureClass.TIMEOUT,
     FailureClass.RATE_LIMIT,
+    FailureClass.TECHNICAL_INTEGRITY,
+))
+
+_REPAIR_BATCH_FAILURES = frozenset((
+    FailureClass.CONTENT,
+    FailureClass.CONTRACT,
     FailureClass.TECHNICAL_INTEGRITY,
 ))
 
@@ -59,7 +72,22 @@ class SelectionModePolicy:
     prompt_review_enabled: bool
     director_contract_review_enabled: bool
     technical_integrity_checks_enabled: bool
+    initial_candidates_per_shot: int
     candidates_per_shot: int
+    repair_candidates_per_batch: int
+    max_auto_repair_batches: int
+    candidate_ai_ranking_enabled: bool
+    auto_select_best: bool
+    manual_selection_override_allowed: bool
+    ranking_failure_fallback: str
+    ranking_failure_marks_risk: bool
+    repair_auto_select_best: bool
+    failed_after_repair_auto_select_best: bool
+    failed_after_repair_marks_risk: bool
+    zero_usable_status: str
+    failure_blocks_pipeline: bool
+    failure_blocks_other_shots: bool
+    failure_blocks_downstream_stage: bool
     downstream_requires_selection: bool
 
 
@@ -68,6 +96,9 @@ def build_selection_policy(
         *,
         image_content_qc_requested: bool = True,
         video_content_qc_requested: bool = True,
+        initial_candidates_per_shot: int = CANDIDATES_PER_SHOT,
+        repair_candidates_per_batch: int = REPAIR_CANDIDATES_PER_BATCH,
+        max_auto_repair_batches: int = MAX_AUTO_REPAIR_BATCHES,
 ) -> SelectionModePolicy:
     """解析选片策略，同时保护不可关闭的前置与技术检查。
 
@@ -75,6 +106,20 @@ def build_selection_policy(
     触发自动返工。开启选片模式则强制关闭两种内容视觉质检。
     """
     selection_mode_enabled = bool(selection_mode_enabled)
+    initial_candidates = _positive_int(
+        initial_candidates_per_shot, field="initial_candidates_per_shot")
+    if initial_candidates != CANDIDATES_PER_SHOT:
+        raise ValueError("首轮候选当前固定为4张")
+    repair_candidates = _positive_int(
+        repair_candidates_per_batch,
+        field="repair_candidates_per_batch",
+    )
+    if repair_candidates != REPAIR_CANDIDATES_PER_BATCH:
+        raise ValueError("问题镜头自动补抽当前固定为3张")
+    repair_batches = _nonnegative_int(
+        max_auto_repair_batches, field="max_auto_repair_batches")
+    if repair_batches != MAX_AUTO_REPAIR_BATCHES:
+        raise ValueError("自动修复/补抽当前固定为1批")
     return SelectionModePolicy(
         schema=SELECTION_POLICY_SCHEMA,
         selection_mode_enabled=selection_mode_enabled,
@@ -87,8 +132,26 @@ def build_selection_policy(
         prompt_review_enabled=True,
         director_contract_review_enabled=True,
         technical_integrity_checks_enabled=True,
-        candidates_per_shot=CANDIDATES_PER_SHOT,
-        downstream_requires_selection=True,
+        initial_candidates_per_shot=initial_candidates,
+        # 保留旧字段，避免已有消费方误把补抽张数当成首轮张数。
+        candidates_per_shot=initial_candidates,
+        repair_candidates_per_batch=repair_candidates,
+        max_auto_repair_batches=repair_batches,
+        # 候选视觉排名与“质检是否通过”是两件事。关闭内容
+        # QC 只关闭通过/返工门禁，不关闭 AI 在4张或3张里选优。
+        candidate_ai_ranking_enabled=True,
+        auto_select_best=True,
+        manual_selection_override_allowed=True,
+        ranking_failure_fallback="first_technically_usable",
+        ranking_failure_marks_risk=True,
+        repair_auto_select_best=True,
+        failed_after_repair_auto_select_best=True,
+        failed_after_repair_marks_risk=True,
+        zero_usable_status="technical_incomplete",
+        failure_blocks_pipeline=False,
+        failure_blocks_other_shots=False,
+        failure_blocks_downstream_stage=False,
+        downstream_requires_selection=False,
     )
 
 
@@ -113,7 +176,9 @@ def selection_policy_from_config(
 
     正式键位于 ``defaults``：``selection_mode``、
     ``image_content_qc``、``video_content_qc``、
-    ``shot_candidate_count``。旧工作区没有 ``image_content_qc`` 时才回退
+    ``shot_candidate_count``、``shot_repair_candidate_count`` 和
+    ``shot_auto_repair_batches``。旧工作区没有
+    ``image_content_qc`` 时才回退
     到 ``image_qc``；候选数不是 4 时拒绝启动新策略，避免静默回到不同
     镜头不同张数的旧行为。
     """
@@ -144,10 +209,29 @@ def selection_policy_from_config(
     if candidate_count != CANDIDATES_PER_SHOT:
         raise ValueError(
             "defaults.shot_candidate_count 当前只允许固定为4")
+    repair_candidate_count = _positive_int(
+        defaults.get(
+            "shot_repair_candidate_count", REPAIR_CANDIDATES_PER_BATCH),
+        field="defaults.shot_repair_candidate_count",
+    )
+    if repair_candidate_count != REPAIR_CANDIDATES_PER_BATCH:
+        raise ValueError(
+            "defaults.shot_repair_candidate_count 当前只允许固定为3")
+    auto_repair_batches = _nonnegative_int(
+        defaults.get(
+            "shot_auto_repair_batches", MAX_AUTO_REPAIR_BATCHES),
+        field="defaults.shot_auto_repair_batches",
+    )
+    if auto_repair_batches != MAX_AUTO_REPAIR_BATCHES:
+        raise ValueError(
+            "defaults.shot_auto_repair_batches 当前只允许固定为1")
     return build_selection_policy(
         selection_mode,
         image_content_qc_requested=image_content_qc,
         video_content_qc_requested=video_content_qc,
+        initial_candidates_per_shot=candidate_count,
+        repair_candidates_per_batch=repair_candidate_count,
+        max_auto_repair_batches=auto_repair_batches,
     )
 
 
@@ -162,6 +246,34 @@ def should_retry_failure(
     except (TypeError, ValueError):
         return False
     return attempts_remaining > 0 and failure_class in _RETRYABLE_FAILURES
+
+
+def should_start_repair_batch(
+        failure: Union[FailureClass, str],
+        *,
+        completed_repair_batches: int,
+        policy: Optional[SelectionModePolicy] = None,
+) -> bool:
+    """内容/合同/技术完整性问题是否应再补抽一批。
+
+    这与 ``should_retry_failure`` 的网络槽位级重试分开：一批中的
+    某个 API 请求失败可以补槽，但同一问题镜头最多只能再启动
+    ``max_auto_repair_batches`` 批，防止无限抽卡。
+    """
+    try:
+        failure_class = FailureClass(failure)
+    except (TypeError, ValueError):
+        return False
+    try:
+        completed = _nonnegative_int(
+            completed_repair_batches, field="completed_repair_batches")
+    except ValueError:
+        return False
+    effective = policy or build_selection_policy(True)
+    return (
+        failure_class in _REPAIR_BATCH_FAILURES
+        and completed < effective.max_auto_repair_batches
+    )
 
 
 def _stable_digest(value: Any) -> str:
@@ -184,6 +296,18 @@ def _positive_int(value: Any, *, field: str) -> int:
         raise ValueError(f"{field} 必须是正整数") from exc
     if number < 1 or str(value).strip() != str(number):
         raise ValueError(f"{field} 必须是正整数")
+    return number
+
+
+def _nonnegative_int(value: Any, *, field: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} 必须是非负整数")
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} 必须是非负整数") from exc
+    if number < 0 or str(value).strip() != str(number):
+        raise ValueError(f"{field} 必须是非负整数")
     return number
 
 

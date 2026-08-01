@@ -2,7 +2,9 @@
 
 import base64
 import shutil
+from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,6 +12,7 @@ from aifos.app import App
 from aifos.config import Config
 from aifos.errors import AifosError
 from aifos.qc_center import QcCenter
+from aifos.selection_mode import build_candidate_set_version
 
 SCRIPT = {
     "project_title": "测试剧",
@@ -416,8 +419,11 @@ def test_auto_rerun_repairs_missing_video(tmp_path):
                 for s in storyboard["shots"]]
         ctx["images"] = [
             {"shot_no": s["shot_no"],
-             "uri": str(out_root / "images" /
-                        f"shot_{s['shot_no']:03d}.keyframe.svg")}
+             # 关键帧进入四候选自动选优后，正式 URI 来自资产中心，
+             # 不再假定旧版固定 canonical 文件名。
+             "uri": app.assets.latest(
+                 project["id"], "image",
+                 app.director._shot_name(ctx, s["shot_no"]))["uri"]}
             for s in storyboard["shots"]]
         ctx["videos"] = [
             {"shot_no": s["shot_no"],
@@ -429,5 +435,119 @@ def test_auto_rerun_repairs_missing_video(tmp_path):
         result = app.director._stage_qc(ctx)
         assert result["passed"]
         assert pathlib.Path(ctx["videos"][0]["uri"]).exists()
+    finally:
+        app.close()
+
+
+def _candidate_result(tmp_path, *, expected, available, passed=False,
+                      revision=1, cost=0.0):
+    version = build_candidate_set_version(
+        episode_id="episode-test", shot_no=1, contract_revision=revision,
+        candidate_revision=revision, prompt=f"prompt-{revision}",
+        reference_manifest=[])
+    candidates = []
+    for index in range(1, available + 1):
+        uri = tmp_path / f"r{revision}-candidate-{index}.svg"
+        uri.write_text("<svg xmlns='http://www.w3.org/2000/svg'/>",
+                       encoding="utf-8")
+        candidates.append({
+            "candidate_index": index,
+            "candidate_id": f"{version.token}#{index}",
+            "candidate_set_token": version.token,
+            "uri": str(uri),
+            "passed": bool(passed),
+            "score": float(100 - index),
+            "issues": [] if passed else ["主体动作与镜头合同不一致"],
+            "ranking_unavailable": False,
+        })
+    group = {
+        "schema": "aifos.shot-candidate-group/v1",
+        "version": asdict(version),
+        "candidate_set_id": f"set-{revision}",
+        "candidate_set_token": version.token,
+        "contract_revision": revision,
+        "candidate_revision": revision,
+        "candidate_count": available,
+        "expected_count": expected,
+        "selection_required": available > 0,
+        "complete": available > 0,
+        "slot_complete": available == expected,
+        "technical_incomplete": available == 0,
+        "candidate_errors": [],
+        "same_prompt": True,
+        "same_references": True,
+        "ranking_unavailable": False,
+        "recommended_candidate_index": 1 if available else None,
+        "candidates": candidates,
+    }
+    return SimpleNamespace(
+        provider="mock", model="mock", cost=cost, fallbacks=[], uri="",
+        data={"candidate_group": group}, qc={"passed": bool(passed)})
+
+
+def test_partial_candidate_group_ai_selects_and_only_zero_is_incomplete(
+        tmp_path):
+    app = App(tmp_path / "ws")
+    try:
+        partial = _candidate_result(
+            tmp_path, expected=4, available=3, passed=True)
+        selected = app.director._ai_promote_generated_candidate_group(
+            partial)
+        assert selected.uri.endswith("r1-candidate-1.svg")
+        assert selected.data["candidate_group"]["selection"]["source"] == "ai"
+        assert app.director._candidate_group_technical_incomplete(
+            selected) is False
+
+        empty = _candidate_result(
+            tmp_path, expected=4, available=0, passed=False)
+        assert app.director._candidate_group_technical_incomplete(empty) is True
+        assert app.director._ai_promote_generated_candidate_group(empty).uri == ""
+    finally:
+        app.close()
+
+
+def test_all_four_explicit_failures_trigger_one_three_candidate_repair(
+        tmp_path, monkeypatch):
+    app = App(tmp_path / "ws")
+    try:
+        initial = _candidate_result(
+            tmp_path, expected=4, available=4, passed=False,
+            revision=1, cost=4.0)
+        repaired = _candidate_result(
+            tmp_path, expected=3, available=3, passed=False,
+            revision=2, cost=3.0)
+        queue = [initial, repaired]
+        calls = []
+
+        def generate(*_args, **_kwargs):
+            calls.append(1)
+            return queue.pop(0)
+
+        def escalate(report, *_args, **_kwargs):
+            report = dict(report)
+            report["codex_escalation"] = {
+                "instruction_to_aifos": "只修正主体动作，不改变人物场景构图"}
+            return report, 0.5
+
+        monkeypatch.setattr(
+            app.director, "_generate_image_gacha", generate)
+        monkeypatch.setattr(
+            app.director, "_escalate_failed_image_to_codex", escalate)
+        result = app.director._generate_shot_candidate_group(
+            "image", {
+                "_episode_id": "episode-test", "shot_no": 1,
+                "_candidate_revision": 1, "_contract_revision": 1,
+                "prompt": "主体执行镜头动作",
+            }, tmp_path, None, {})
+
+        assert len(calls) == 2
+        assert result.uri.endswith("r2-candidate-1.svg")
+        group = result.data["candidate_group"]
+        assert group["repair_batch"] is True
+        assert group["expected_count"] == 3
+        assert group["initial_candidate_count"] == 4
+        assert group["initial_all_failed"] is True
+        assert "只修正主体动作" in group["repair_instruction"]
+        assert result.cost == 7.5
     finally:
         app.close()

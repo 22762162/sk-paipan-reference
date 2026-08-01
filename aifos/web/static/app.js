@@ -192,7 +192,7 @@ const STATUS_CN = {
   done: "完成", failed: "失败", qc_failed: "质检未过", created: "已建",
   queued_script: "已排队",
   awaiting_confirm: "待确认", awaiting_script: "剧本待确认",
-  awaiting_cast: "人物待定版",
+  awaiting_cast: "人物/道具AI选优中",
   paused: "制作已暂停",
   cancelling: "正在暂停…",
   script: "剧本中", continuity: "锁连续性",
@@ -218,7 +218,7 @@ const RUN_STATUS_CN = {
 const ACTION_CN = {
   produce: "开始制作", script_import: "导入剧本制作",
   series_import: "多集文档导入", series_next: "串行准备下一集",
-  confirm_script: "确认剧本后续产", confirm_cast: "确认人物定版后续产",
+  confirm_script: "确认剧本后续产", confirm_cast: "人物AI选优后续产",
   confirm_preflight: "确认开拍后续产",
   force_rebuild: "全部重做", revise_script: "修改剧本",
   regen_image: "重画图片", adjustment: "制作调整",
@@ -3524,8 +3524,8 @@ const PLAN_CATS = ["character_candidate", "character_art", "character_sheet", "s
 const PLAN_STATUS_CN = {
   pending: "排队中", generating: "生成中", done: "已完成",
   failed: "失败", reused: "复用已有", selected: "已选定",
-  awaiting_human: "二次质检未过 · 待人工修改",
-  awaiting_selection: "4张已齐 · 待选正式图",
+  awaiting_human: "历史失败 · 系统自动接管",
+  awaiting_selection: "4张已齐 · AI选优中",
   regenerating_candidates: "正在并行换4张",
   technical_incomplete: "候选技术未补齐",
 };
@@ -3757,7 +3757,10 @@ function thumbUrl(url, w = 480) {
 function shotCandidateGroup(item) {
   if (!item || item.category !== "shot_image") return null;
   const group = item.candidate_group || item.shot_candidate_group;
-  return group && typeof group === "object" && group.selection_required
+  // AI 自动选优后 selection_required 会变成 false，但四张/三张候选仍要
+  // 留在画布供回看和可选改选，不能因为已经自动晋升就把候选组藏掉。
+  return group && typeof group === "object"
+    && (Array.isArray(group.candidates) || Number(group.candidate_count || 0) > 0)
     ? group : null;
 }
 
@@ -3803,12 +3806,11 @@ function shotCandidateState(item) {
   const group = shotCandidateGroup(item);
   if (!group) return null;
   const candidates = shotCandidates(item);
-  // 当前产品合同固定四候选；服务端即便遇到旧/损坏计数也钳制为4，
-  // 前端同样不能因为脏字段扩成5格或缩成3格。
-  const expected = 4;
+  // 首轮固定4张，问题镜头自动修订后固定补抽3张；其他脏值仍钳制为4。
+  const expected = Number(group.expected_count) === 3 ? 3 : 4;
   const missing = Math.max(0, expected - candidates.length);
   const technicalIncomplete = group.technical_incomplete === true
-    || item.status === "technical_incomplete" || missing > 0;
+    || item.status === "technical_incomplete";
   return { group, candidates, expected, missing, technicalIncomplete };
 }
 
@@ -3878,21 +3880,23 @@ function shotCandidateGridHtml(item, editable) {
   const { group, candidates, expected, missing, technicalIncomplete } = state;
   const selected = candidates.find((candidate) =>
     shotCandidateSelected(group, candidate));
+  const selectedByAi = !!selected && String((group.selection || {}).source || "") === "ai";
+  const batchLabel = expected === 3 ? "问题镜头补抽3张" : `本镜${expected}张候选`;
   const errors = (group.candidate_errors || []).map((row) =>
     `候选${row.candidate_index || "?"}：${row.error || "技术生成失败"}`);
   const byIndex = new Map(candidates.map((candidate) =>
     [shotCandidateIndex(candidate), candidate]));
-  const slots = [1, 2, 3, 4].map((index) => ({
+  const slots = Array.from({ length: expected }, (_, offset) => offset + 1).map((index) => ({
     index, candidate: byIndex.get(index) || null,
   }));
-  return `<section class="shot-candidate-panel" aria-label="本镜4张候选">
-    <div class="shot-candidate-head"><div><b>本镜4张候选</b>
-      <span>${selected ? `已选候选 ${shotCandidateIndex(selected)} 为正式关键帧；4张均保留回看`
+  return `<section class="shot-candidate-panel" aria-label="${batchLabel}">
+    <div class="shot-candidate-head"><div><b>${batchLabel}</b>
+      <span>${selected ? `${selectedByAi ? "AI已自动选优" : "可选改选已生效："}候选 ${shotCandidateIndex(selected)} 为正式关键帧；其余候选保留回看`
         : (technicalIncomplete ? `技术未补齐，当前 ${candidates.length}/${expected} 张`
-          : "4张使用同一冻结提示词与参考图；请选择1张正式关键帧")}</span></div>
+          : `${expected}张使用同一冻结提示词与参考图；AI正在自动选优，无需手机操作`)}</span></div>
       <span class="plan-st st-${technicalIncomplete ? "technical_incomplete" : (selected ? "done" : "awaiting_selection")}">
-        ${technicalIncomplete ? `缺 ${missing || Math.max(1, expected - candidates.length)} 张 · 暂不可选`
-          : (selected ? "正式图已选" : "待人工选片")}</span></div>
+        ${technicalIncomplete ? `缺 ${missing || Math.max(1, expected - candidates.length)} 张 · 系统自动补位`
+          : (selected ? (selectedByAi ? "AI已选优" : "正式图已选") : "AI选优中")}</span></div>
     ${errors.length ? `<div class="shot-candidate-technical-error">${esc(errors.join("；"))}</div>` : ""}
     <div class="shot-candidate-grid">${slots.map(({ index, candidate }) => {
       if (!candidate) return `<article class="shot-candidate missing"
@@ -3914,7 +3918,7 @@ function shotCandidateGridHtml(item, editable) {
           <button type="button" class="${isSelected ? "selected" : "primary"} shot-candidate-pick"
             data-plan-id="${esc(item.id)}" data-candidate-index="${index}"
             ${(!editable || technicalIncomplete || isSelected) ? "disabled" : ""}>
-            ${isSelected ? "✓ 已选为正式图" : (technicalIncomplete ? "补齐4张后可选" : "选定这张")}</button>
+            ${isSelected ? (selectedByAi ? "✓ AI当前正式图" : "✓ 可选改选已生效") : (technicalIncomplete ? "系统补齐后可改选" : "改选这张（可选）")}</button>
         </div></article>`;
     }).join("")}</div>
     ${editable ? `<div class="shot-candidate-controls">
@@ -4111,10 +4115,10 @@ function productionLedgerState(row) {
 }
 
 function productionLedgerStateLabel(row) {
-  if (row.status === "awaiting_human") return "二次失败·待人工"
+  if (row.status === "awaiting_human") return "历史失败·系统接管"
   if (row.status === "retrying") return `自动返工 ${row.autoRetriesUsed || 0}/1`;
   if (row.issue && row.issueCritical) return "需要干预";
-  if (row.selected) return "已定版";
+  if (row.selected) return "AI已选优";
   if (row.status === "done" && row.mock) return "占位图·需补画";
   return PLAN_STATUS_CN[row.status] || row.status || "待生成";
 }
@@ -4546,8 +4550,8 @@ function productionGuidanceModel(data) {
   const reason = phase === "keyframes"
     ? raw.reason || `已生成 ${keyframes.generated}/${keyframes.total}，`
       + `可用于下游 ${keyframes.usable}/${keyframes.total}，`
-      + `${pendingCount} 张待生产，${issueCount} 张待人工处理。`
-      + "首尾帧必须基于全部合格关键帧，所以门禁尚未开放。"
+      + `${pendingCount} 张待生产，${issueCount} 张已标注问题并由系统自动接管。`
+      + "AI会自动补抽3张并选优；其他镜头与下游生产不被阻断。"
     : raw.reason || (phase === "frames"
       ? `关键帧已齐，首尾帧为 ${frames.usable}/${frames.total}；补齐后才会进入视频。`
       : phase === "videos"
@@ -5039,14 +5043,14 @@ function productionIssueCenterHtml(data) {
       <article class="${imageAction.count ? "has-issue" : "is-clear"}">
         <small>单张画面 / 视觉质检</small>
         <b>${imageAction.count
-          ? `${imageAction.count} 张需要修正或人工复核`
+          ? `${imageAction.count} 张已由系统接管修正`
           : "没有待处理的画面问题"}</b>
         <p>${imageAction.count
-          ? `${imageAction.mustFixCount || 0} 张必须修复，${imageAction.reviewCount || 0} 张可人工复核后放行。`
-          : "当前关键帧均无待人工视觉问题。"}</p>
+          ? `AI会自动优化提示词、补抽3张并选优；${imageAction.reviewCount || 0} 张支持可选人工查看或放行。`
+          : "当前关键帧均无已标注视觉问题。"}</p>
         ${imageAction.count ? `<button type="button" class="guidance-issue-action"
           data-guidance-issues data-first-shot="${imageAction.shotNos[0] || ""}">
-          处理画面问题</button>` : ""}
+          查看问题与可选干预</button>` : ""}
       </article>
     </div>
   </section>`;
@@ -5999,13 +6003,13 @@ async function selectShotCandidate(episodeId, item, candidate, btn, onDone) {
         source: "manual",
       }),
     });
-    showToast(`镜头 ${item.shot_no} 已选候选 ${shotCandidateIndex(candidate)} 为正式关键帧；其余3张保留回看`, "ok");
+    showToast(`镜头 ${item.shot_no} 已改选候选 ${shotCandidateIndex(candidate)} 为正式关键帧；其余候选保留回看`, "ok");
     if (panel) delete panel.dataset.shotCandidateMutation;
     await refreshShotCandidatePlan(episodeId, onDone, true);
   } catch (error) {
     if (panel) delete panel.dataset.shotCandidateMutation;
     if (error.status === 409) {
-      showToast("这组候选已经更新，正在刷新到最新4张，请重新选择", "error");
+      showToast("这组候选已经更新，正在刷新最新结果", "error");
       await refreshShotCandidatePlan(episodeId, onDone, true);
       return;
     }
@@ -6019,12 +6023,12 @@ function showShotCandidateCompare(
     episodeId, item, startIndex, editable, onDone) {
   const state = shotCandidateState(item);
   if (!state || !state.candidates.length) return;
-  const { group, candidates, technicalIncomplete } = state;
+  const { group, candidates, expected, technicalIncomplete } = state;
   const overlay = document.createElement("div");
   overlay.className = "cast-compare-overlay shot-candidate-compare";
   overlay.innerHTML = `
     <div class="cast-compare-head">
-      <b>${esc(item.label)} · 4张候选</b>
+      <b>${esc(item.label)} · ${expected}张候选</b>
       <span class="cast-compare-counter"></span>
       <button type="button" class="cast-compare-close">关闭 ✕</button>
     </div>
@@ -6059,8 +6063,8 @@ function showShotCandidateCompare(
     label.textContent = `候选 ${slide.dataset.index}${selected ? " · 当前正式关键帧" : ""}`;
     pick.disabled = !editable || technicalIncomplete || selected;
     pick.textContent = selected ? "✓ 已选为正式图"
-      : (technicalIncomplete ? "技术补齐4张后才能选"
-        : `✓ 选定这张（候选 ${slide.dataset.index}）`);
+      : (technicalIncomplete ? "系统补齐后可改选"
+        : `可选：改用候选 ${slide.dataset.index}`);
     dots.forEach((dot, index) => dot.classList.toggle("on", index === current));
   };
   const close = () => overlay.remove();
@@ -6535,7 +6539,7 @@ const PC_LIGHTING_STYLES = {
 
 const PC_STATUS_LABEL = {
   done: "完成", reused: "复用", generating: "生成中",
-  retrying: "自动修图", awaiting_human: "待人工", failed: "失败",
+  retrying: "自动修图", awaiting_human: "系统接管", failed: "失败",
   pending: "排队",
 };
 
@@ -7012,8 +7016,8 @@ async function showPlanOverlay(episodeId, focusId = "", focusCategory = "") {
         <button class="close">关闭 Esc</button>
       </div>
       <div class="dim" style="margin:4px 0 10px">每张图的分类、状态与提示词都在这里;
-        可勾选多张执行「批量优化修改」，系统会把每张质检原因自动编译进提示词；
-        轻微问题也可单张或批量「人工通过」，原问题会保留在审计记录。
+        质检问题由AI自动编译进提示词、补抽3张并选优，不阻断其他镜头；
+        「批量优化修改」和「人工通过」仅作为可选覆盖，原问题会保留在审计记录。
         镜头画面重画后会自动重做首尾帧并作废旧视频。</div>
       <div class="batch-job-progress" hidden></div>
       <div class="plan-overlay-content">${renderPlanHtml(data, true)
@@ -8113,7 +8117,7 @@ const ASSET_BOARD_GROUPS = [
   { key: "production", label: "主生产资产", hint: "会直接进入镜头、首尾帧或视频" },
   { key: "studio", label: "自建资产库", hint: "自己在资产工坊生产的人物/风格/场景/物品" },
   { key: "character_support", label: "人物辅助设定", hint: "四视图、服装、妆容和细节参考" },
-  { key: "candidate", label: "候选与历史", hint: "未定版候选只用于挑选，不进入镜头" },
+  { key: "candidate", label: "候选与历史", hint: "AI选优图自动进入镜头，其余候选仅供回看或可选改选" },
   { key: "reference", label: "上传参考图", hint: "按角色或场景关联调用" },
   { key: "other", label: "其他资产", hint: "暂未归入生产链的资产" },
 ];
@@ -9121,9 +9125,9 @@ function renderProgressBanner(data) {
       <button class="primary" onclick="location.hash='#/episode/${e.id}'">去看剧本 →</button>
     </div>`).join("") + awaitingCast.map((e) => `
     <div class="progress-card confirm">
-      <div class="progress-text">《${esc(e.project)}》第${e.number}集 人物/核心道具候选已就绪 👤
-        <span>所有正式角色统一4张候选；每名角色用同一份首次登场基础定妆提示词随机生成，不展示后续换装、淋湿或伤情；跑龙套/背景路人不做独立设定；全部定版后才生成后续图片</span></div>
-      <button class="primary" onclick="location.hash='#/episode/${e.id}'">去选人物/道具 →</button>
+      <div class="progress-text">《${esc(e.project)}》第${e.number}集 人物/核心道具正在AI自动选优 👤
+        <span>每组4张由AI自动比较并锁定最优图，系统会继续后续生产；无需手机逐张确认，仍可随时查看或改选。</span></div>
+      <button class="primary" onclick="location.hash='#/episode/${e.id}'">查看选优结果（可选） →</button>
     </div>`).join("") + awaiting.map((e) => `
     <div class="progress-card confirm">
       <div class="progress-text">《${esc(e.project)}》第${e.number}集 预生产完成,等你过目
@@ -9413,7 +9417,7 @@ function renderCastSelection(data, episodeId) {
     ? `自动判断结果：${resolvedLabel}${(assetPolicy.reasons || []).length
       ? ` · ${assetPolicy.reasons.join("；")}` : ""}`
     : (assetMode === "simple"
-      ? "已选择简化版：人工豁免三视图门禁，不生成独立正侧背和细节图"
+      ? "已选择简化版：可选豁免三视图门禁，不生成独立正侧背和细节图"
       : "已选择完整版：生成视觉DNA、三视图审核板及独立高清正侧背母资产");
   const policy = selection.candidate_policy
     || "每名正式角色统一4张候选；四张复用同一份首次登场基础定妆提示词，只靠模型随机采样";
@@ -9421,11 +9425,11 @@ function renderCastSelection(data, episodeId) {
   const lockTotal = selection.asset_total || characters.length + props.length;
   app.innerHTML = `<div class="canvas-view cast-select-view">
     <div class="confirm-banner cast-slim-banner">
-      <div><b>逐个点开大图对比，各选 1 张定版 👤</b>
-        <span>点候选图进入全屏对比：左右滑动看4张，底部一键选定。已定版 ${lockedCount}/${lockTotal}。</span>
+      <div><b>AI自动选优，无需手机逐张定版 👤</b>
+        <span>系统自动比较每组4张并选出正式母资产；已选优 ${lockedCount}/${lockTotal}。你可点开放大查看，人工改选只是可选覆盖。</span>
         <details class="cast-rules">
-          <summary>ℹ️ 定版规则与资产说明</summary>
-          <p>${esc(policy)}；${esc(selection.prop_candidate_policy || "核心道具统一4张候选并人工定版")}。有参考图时人物脸和发型是最高标准，职业角色必须穿工作服；人物候选统一使用纯背景，不得出现文字或场景。
+          <summary>ℹ️ AI选优规则与资产说明</summary>
+          <p>${esc(policy)}；${esc(selection.prop_candidate_policy || "核心道具统一4张候选并由AI自动选优")}。有参考图时人物脸和发型是最高标准，职业角色必须穿工作服；人物候选统一使用纯背景，不得出现文字或场景。
           同一人物4张图复用同一份经过Codex审核优化的初始状态最终提示词，只靠图片模型随机采样比较人物形象；
           不得换装、换妆、换动作，也不得带入官服、淋湿、泥污、受伤、死亡等后续剧情状态。
           定版后完整版会生成面部、正面、严格90°侧面和完整180°背面独立母资产；
@@ -9447,7 +9451,7 @@ function renderCastSelection(data, episodeId) {
     ${imageAccelerationLivebarHtml(data)}
     <div class="canvas-toolbar">
       <button id="cast-back">← 仪表盘</button>
-      <span class="title">《${esc(data.project.title)}》第${data.episode.number}集 · 人物定版</span>
+      <span class="title">《${esc(data.project.title)}》第${data.episode.number}集 · 人物/道具AI选优</span>
       ${chip(data.episode.status)}<span class="spacer"></span>
       <button id="cast-script">📖 看剧本</button>
     </div>
@@ -9459,8 +9463,8 @@ function renderCastSelection(data, episodeId) {
       <section class="cast-choice panel">
         <div class="cast-choice-head"><div><h2>${esc(character.character)}
           <strong class="${character.candidate_target === 0 ? "cast-locked" : (character.locked ? "cast-locked" : "cast-unlocked")}">
-            ${character.candidate_target === 0 ? "无需单独立绘" : (character.locked ? "✓ 已定版" : "待选 1 张")}</strong></h2>
-          <span class="dim">${esc(character.role || "角色")} · ${character.candidate_count || 0}/${character.candidate_target || selection.candidate_target || 4} 张候选 · 点图放大对比</span></div>
+            ${character.candidate_target === 0 ? "无需单独立绘" : (character.locked ? "✓ AI已选优" : "AI选优中")}</strong></h2>
+          <span class="dim">${esc(character.role || "角色")} · ${character.candidate_count || 0}/${character.candidate_target || selection.candidate_target || 4} 张候选 · 可选点开放大或改选</span></div>
           <span class="cast-choice-tools">
             <button type="button" class="cast-refine-one" data-character="${esc(character.character)}">✎ 提意见改形象</button>
             <button type="button" class="cast-regenerate-one" data-character="${esc(character.character)}">↻ 换4张</button>
@@ -9485,18 +9489,18 @@ function renderCastSelection(data, episodeId) {
               <button type="button" class="${candidate.selected ? "selected" : "primary"} cast-pick"
                 data-character="${esc(character.character)}" data-index="${candidate.index}"
                 aria-pressed="${candidate.selected ? "true" : "false"}" ${(candidate.selected || outdated) ? "disabled" : ""}>
-                ${candidate.selected ? "✓ 当前最终立绘" : (outdated ? "等待新规则候选" : "选定这张")}</button></div>
+                ${candidate.selected ? "✓ AI当前正式立绘" : (outdated ? "等待新规则候选" : "改选这张（可选）")}</button></div>
           </article>`;
         }).join("")}</div>
       </section>`).join("")}</div>
-    ${props.length ? `<h2 class="cast-section-title">核心道具四选一</h2>
+    ${props.length ? `<h2 class="cast-section-title">核心道具AI四选一</h2>
     <div class="cast-selection-list">${props.map((prop) => `
       <section class="cast-choice panel">
         <div class="cast-choice-head"><div><h2>${esc(prop.prop)}</h2>
           <span class="dim">核心道具 · ${prop.candidate_count || 0}/${prop.candidate_target || 4} 张候选</span></div>
           <button type="button" class="prop-regenerate-one" data-prop="${esc(prop.prop)}">↻ 不满意，换4张</button>
           <strong class="${prop.locked ? "cast-locked" : "cast-unlocked"}">
-            ${prop.locked ? "✓ 已锁定道具母资产" : "请选择1张"}</strong></div>
+            ${prop.locked ? "✓ AI已锁定道具母资产" : "AI选优中"}</strong></div>
         ${(prop.story_function || prop.visual_design) ? `<details class="cast-look"><summary>查看道具设计依据</summary>
           ${prop.story_function ? `<p><b>剧情功能：</b>${esc(prop.story_function)}</p>` : ""}
           ${prop.visual_design ? `<p><b>视觉结构：</b>${esc(prop.visual_design)}</p>` : ""}
@@ -9516,15 +9520,15 @@ function renderCastSelection(data, episodeId) {
               <button type="button" class="${candidate.selected ? "selected" : "primary"} prop-pick"
                 data-prop="${esc(prop.prop)}" data-index="${candidate.index}"
                 aria-pressed="${candidate.selected ? "true" : "false"}" ${candidate.selected ? "disabled" : ""}>
-                ${candidate.selected ? "✓ 当前道具母资产" : "选定这套道具"}</button></div>
+                ${candidate.selected ? "✓ AI当前道具母资产" : "改选这套（可选）"}</button></div>
           </article>`;
         }).join("")}</div>
       </section>`).join("")}</div>` : ""}
     <div class="cast-bottom-bar">
       <span class="cast-bottom-progress">${selection.passed
-        ? "✅ 全部定版完成" : `已定版 ${lockedCount}/${lockTotal}`}</span>
+        ? "✅ AI自动选优完成" : `AI已选优 ${lockedCount}/${lockTotal}，系统处理中`}</span>
       <button class="primary" id="cast-continue" ${selection.passed ? "" : "disabled"}>
-        ${selection.passed ? "继续预生产 →" : "全部选完才能继续"}</button>
+        ${selection.passed ? "现在继续（可选） →" : "AI选优后自动继续"}</button>
     </div>
   </div>`;
   bindImageAccelerationLivebar(episodeId);
@@ -9558,10 +9562,10 @@ function renderCastSelection(data, episodeId) {
     await api(path, { method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body) });
-    showToast(`${name} 已锁定候选 ${index}`, "ok");
+    showToast(`${name} 已按你的可选覆盖改用候选 ${index}`, "ok");
     renderCanvasView(episodeId);
   };
-  /* 全屏4张对比:左右滑动看大图,底部一键选定——手机端主选片入口 */
+  /* 全屏4张对比:AI 已默认选优；这里仅供查看和可选人工覆盖。 */
   const showCandidateCompare = (kind, name, startIndex) => {
     const source = kind === "prop"
       ? (props.find((p) => p.prop === name) || {})
@@ -9611,7 +9615,7 @@ function renderCastSelection(data, episodeId) {
       const selected = slide.dataset.selected === "1";
       pick.disabled = outdated || selected;
       pick.textContent = selected
-        ? "✓ 已是当前定版" : (outdated ? "旧规则候选,不可选" : `✓ 选定这张(候选 ${slide.dataset.index})`);
+        ? "✓ AI当前选优" : (outdated ? "旧规则候选,不可选" : `可选：改用候选 ${slide.dataset.index}`);
       dots.forEach((dot, i) => dot.classList.toggle("on", i === current));
     };
     const close = () => overlay.remove();
@@ -9655,7 +9659,7 @@ function renderCastSelection(data, episodeId) {
         group.forEach((item) => {
           item.disabled = item.getAttribute("aria-pressed") === "true";
         });
-        button.textContent = "选定这张";
+        button.textContent = "改选这张（可选）";
       }
     };
   });
@@ -9670,7 +9674,7 @@ function renderCastSelection(data, episodeId) {
       } catch (e) {
         showToast(e.message, "error");
         group.forEach((item) => { item.disabled = false; });
-        button.textContent = "选定这套道具";
+        button.textContent = "改选这套（可选）";
       }
     };
   });
@@ -9731,19 +9735,19 @@ function renderCastSelection(data, episodeId) {
     }
   };
   if (next && selection.passed) next.onclick = async () => {
-    next.disabled = true; next.textContent = "已确认，继续生产中…";
+    next.disabled = true; next.textContent = "正在继续生产…";
     try {
       await api("/api/confirm", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ episode_id: data.episode.id }),
       });
       showToast(assetPolicy.generate_sheets
-        ? "人物已全部定版，开始生成三视图审核板与独立高清母资产"
-        : "人物已全部定版；按人工选择豁免三视图，开始后续图片", "ok");
+        ? "人物AI选优完成，开始生成三视图审核板与独立高清母资产"
+        : "人物AI选优完成；按可选设置豁免三视图，开始后续图片", "ok");
       pollCanvas(episodeId);
     } catch (e) {
       showToast(e.message, "error");
-      next.disabled = false; next.textContent = "✅ 全部定版，继续预生产";
+      next.disabled = false; next.textContent = "现在继续（可选） →";
     }
   };
 }
@@ -11075,7 +11079,7 @@ function imageLineControlsHtml() {
   </div>`;
 }
 
-/* ---- 创作选片模式:一键关闭内容质检,每镜固定4张候选人工选片 ---- */
+/* ---- 创作选片模式:一键关闭阻断式内容质检,候选由AI自动选优 ---- */
 function selectionModeControlsHtml() {
   return `<div class="style-row selection-mode-row">
     <label>创作选片模式</label>
@@ -11110,7 +11114,8 @@ async function bindSelectionModeControls() {
     if (!st.selection_mode) { imgQc.disabled = vidQc.disabled = false; }
     hint.textContent = st.selection_mode
       ? `选片模式开启:每镜固定 ${st.shot_candidate_count} 张候选,`
-        + "内容质检不判定、不阻断、不自动返工;不满意改词重抽。"
+        + "AI自动选优并继续，无需手机逐张确认；问题镜头自动补抽3张。"
+        + "内容质检不阻断；不满意仍可事后改词重抽。"
         + "生成前导演合同检查与技术完整性检查始终开启"
       : `选片模式关闭(每镜候选固定 ${st.shot_candidate_count} 张;`
         + "内容质检按左侧两个独立开关执行)";
@@ -11124,7 +11129,7 @@ async function bindSelectionModeControls() {
       });
       render();
       showToast(st.selection_mode
-        ? "创作选片模式已开启:内容质检不再判定,由你选片"
+        ? "创作选片模式已开启：AI自动选优，无需手机逐张确认"
         : "设置已保存", "ok");
     } catch (e) {
       revert();

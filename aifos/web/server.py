@@ -183,7 +183,7 @@ class JobRegistry:
 
     def start(self, title, number, premise="", style="", force=False,
               script=None, review=False, kind=None, action="produce",
-              unique=False, style_pack_id="", auto_select_assets=False,
+              unique=False, style_pack_id="", auto_select_assets=True,
               fresh_assets=False):
         """启动生产；unique=True 时同一集重复提交复用正在运行的任务。
 
@@ -3966,8 +3966,7 @@ def make_handler(workspace, jobs):
                         "script_import" if script is not None else
                         "produce"),
                 auto_select_assets=bool(
-                    body.get("auto_select_assets",
-                             not bool(body.get("review", True)))),
+                    body.get("auto_select_assets", True)),
                 fresh_assets=bool(
                     body.get("fresh_assets", body.get("force", False))),
                 unique=True)
@@ -4042,16 +4041,9 @@ def make_handler(workspace, jobs):
                             video_default=video_quality))
                 except AifosError as exc:
                     return self._error(400, str(exc))
-            if status == "awaiting_cast":
-                selection = self._with_app(
-                    lambda app: app.director.production_asset_selection_status(
-                        project_id,
-                        app.projects.latest_document(
-                            found_episode_id, "script")[0] or {}))
-                if not selection.get("passed"):
-                    return self._error(
-                        409, "请先为每名正式角色选定最终立绘，并为每件核心道具"
-                        "选定最终图，再继续生产")
+            # 旧版本会在人物/核心道具候选处要求用户逐张手机确认。现在由
+            # AI 对所有候选做视觉排序并自动锁定最高分；人工改选只作为事后
+            # 可选覆盖，因此旧 awaiting_cast 状态也可直接续跑完成自动定版。
             # 剧本确认 → 继续预生产(画完人物/分镜再停一次);
             # 开拍确认 → 自动完成视频/配音/剪辑/质检
             job_id = jobs.start(
@@ -4060,6 +4052,7 @@ def make_handler(workspace, jobs):
                 action=("confirm_script" if status == "awaiting_script"
                         else "confirm_cast" if status == "awaiting_cast"
                         else "confirm_preflight"),
+                auto_select_assets=True,
                 unique=True)
             return self._json(
                 {"job_id": job_id, "phase": status}, status=202)

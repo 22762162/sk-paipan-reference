@@ -6,6 +6,8 @@ import pytest
 
 from aifos.selection_mode import (
     CANDIDATES_PER_SHOT,
+    MAX_AUTO_REPAIR_BATCHES,
+    REPAIR_CANDIDATES_PER_BATCH,
     CandidateResultVersion,
     FailureClass,
     build_candidate_result_versions,
@@ -15,6 +17,7 @@ from aifos.selection_mode import (
     evaluate_candidate_promotion,
     is_stale_candidate_result,
     selection_policy_from_config,
+    should_start_repair_batch,
     should_retry_failure,
 )
 
@@ -47,7 +50,23 @@ def test_selection_mode_closes_content_qc_but_never_preflight_or_integrity():
     assert policy.director_contract_review_enabled is True
     assert policy.technical_integrity_checks_enabled is True
     assert policy.candidates_per_shot == CANDIDATES_PER_SHOT == 4
-    assert policy.downstream_requires_selection is True
+    assert policy.initial_candidates_per_shot == CANDIDATES_PER_SHOT == 4
+    assert policy.repair_candidates_per_batch == \
+        REPAIR_CANDIDATES_PER_BATCH == 3
+    assert policy.max_auto_repair_batches == MAX_AUTO_REPAIR_BATCHES == 1
+    assert policy.candidate_ai_ranking_enabled is True
+    assert policy.auto_select_best is True
+    assert policy.manual_selection_override_allowed is True
+    assert policy.ranking_failure_fallback == "first_technically_usable"
+    assert policy.ranking_failure_marks_risk is True
+    assert policy.repair_auto_select_best is True
+    assert policy.failed_after_repair_auto_select_best is True
+    assert policy.failed_after_repair_marks_risk is True
+    assert policy.zero_usable_status == "technical_incomplete"
+    assert policy.failure_blocks_pipeline is False
+    assert policy.failure_blocks_other_shots is False
+    assert policy.failure_blocks_downstream_stage is False
+    assert policy.downstream_requires_selection is False
 
 
 def test_content_qc_remains_observational_when_selection_mode_is_off():
@@ -122,6 +141,44 @@ def test_content_or_unknown_failure_never_triggers_automatic_retry():
     assert should_retry_failure(
         FailureClass.CONTENT, attempts_remaining=2) is False
     assert should_retry_failure("bad_composition", attempts_remaining=2) is False
+
+
+@pytest.mark.parametrize("failure", [
+    FailureClass.CONTENT,
+    FailureClass.CONTRACT,
+    FailureClass.TECHNICAL_INTEGRITY,
+])
+def test_problem_shot_gets_exactly_one_nonblocking_repair_batch(failure):
+    policy = build_selection_policy(True)
+
+    assert should_start_repair_batch(
+        failure, completed_repair_batches=0, policy=policy) is True
+    assert should_start_repair_batch(
+        failure, completed_repair_batches=1, policy=policy) is False
+    assert policy.repair_candidates_per_batch == 3
+    assert policy.failed_after_repair_auto_select_best is True
+    assert policy.failed_after_repair_marks_risk is True
+    assert policy.failure_blocks_pipeline is False
+    assert policy.failure_blocks_other_shots is False
+    assert policy.failure_blocks_downstream_stage is False
+
+
+def test_repair_batch_policy_is_fixed_to_one_batch():
+    with pytest.raises(ValueError, match="固定为1"):
+        selection_policy_from_config({
+            "defaults": {"shot_auto_repair_batches": 2},
+        })
+    with pytest.raises(ValueError, match="固定为1"):
+        selection_policy_from_config({
+            "defaults": {"shot_auto_repair_batches": 0},
+        })
+
+
+def test_repair_candidate_count_is_fixed_to_three():
+    with pytest.raises(ValueError, match="固定为3"):
+        selection_policy_from_config({
+            "defaults": {"shot_repair_candidate_count": 2},
+        })
 
 
 def test_candidate_version_is_deterministic_and_ignores_mapping_order():

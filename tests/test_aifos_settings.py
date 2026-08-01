@@ -414,12 +414,18 @@ def test_selection_mode_defaults_roundtrip(tmp_path):
         "image_content_qc": False,
         "video_content_qc": "off",
         "shot_candidate_count": 4,
+        "shot_repair_candidate_count": 3,
+        "shot_auto_repair_batches": 1,
     })
     assert saved == {"selection_mode": True, "image_content_qc": False,
-                     "video_content_qc": False, "shot_candidate_count": 4}
+                     "video_content_qc": False, "shot_candidate_count": 4,
+                     "shot_repair_candidate_count": 3,
+                     "shot_auto_repair_batches": 1}
     stored = json.loads(config_path.read_text(encoding="utf-8"))["defaults"]
     assert stored["selection_mode"] is True
     assert stored["video_content_qc"] is False
+    assert stored["shot_repair_candidate_count"] == 3
+    assert stored["shot_auto_repair_batches"] == 1
 
     with pytest.raises(AifosError, match="固定为 4"):
         set_defaults(config_path, {"shot_candidate_count": 3})
@@ -427,6 +433,10 @@ def test_selection_mode_defaults_roundtrip(tmp_path):
         set_defaults(config_path, {"selection_mode": "也许"})
     with pytest.raises(AifosError, match="不支持的默认项"):
         set_defaults(config_path, {"image_qc_retries": 2})
+    with pytest.raises(AifosError, match="固定为 3"):
+        set_defaults(config_path, {"shot_repair_candidate_count": 5})
+    with pytest.raises(AifosError, match="固定为 1"):
+        set_defaults(config_path, {"shot_auto_repair_batches": 2})
 
 
 def test_selection_mode_web_endpoints(tmp_path):
@@ -489,6 +499,8 @@ def test_selection_mode_web_endpoints(tmp_path):
         assert defaults["selection_mode"] is True
         assert defaults["video_content_qc"] is False
         assert defaults["shot_candidate_count"] == 4
+        assert defaults["shot_repair_candidate_count"] == 3
+        assert defaults["shot_auto_repair_batches"] == 1
 
         status, err = call("POST", "/api/selection-mode",
                            {"shot_candidate_count": 2})

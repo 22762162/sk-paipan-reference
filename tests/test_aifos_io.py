@@ -25,18 +25,10 @@ def app(tmp_path):
 
 
 def _to_preflight(app, title="万妖图录", number=1, finish=False):
-    summary = app.director.produce(title, number)
-    assert summary["status"] == "awaiting_cast"
-    project = app.projects.get_project(title)
-    episode = app.db.query_one(
-        "SELECT * FROM episodes WHERE project_id=? AND number=?",
-        (project["id"], number))
-    script, _ = app.projects.latest_document(episode["id"], "script")
-    for character in script["characters"]:
-        app.director.select_character_candidate(
-            title, number, character["name"], 1)
-    return app.director.produce(
-        title, number, pause_for_confirm=not finish)
+    summary = app.director.produce(
+        title, number, auto_select_assets=True)
+    assert summary["status"] == "done"
+    return summary
 
 
 def test_import_character_art(app):

@@ -107,21 +107,31 @@ def test_shot_content_hash_ignores_derived_continuity_reference():
         director._shot_content_hash(shot, changed_identity)
 
 
-def test_repair_group_delegates_to_four_candidate_path_when_qc_off():
+def test_repair_group_generates_three_and_ai_promotes_when_qc_off(tmp_path):
     director = _director({
         "selection_mode": True, "image_content_qc": True})
     seen = {}
 
+    group = _complete_group(tmp_path)
+    group["candidates"] = group["candidates"][:3]
+    group["candidate_count"] = group["expected_count"] = 3
+
     def generate(_capability, payload, _out_dir, _cancel, _qc_spec):
         seen.update(copy.deepcopy(payload))
-        return ProviderResult(provider="fake", cost=0, data={}, uri="")
+        return ProviderResult(
+            provider="fake", cost=0,
+            data={"candidate_group": copy.deepcopy(group)}, uri="")
 
-    director._generate_shot_candidate_group = generate
-    director._generate_repair_candidate_group(
+    director._generate_image_gacha = generate
+    result = director._generate_repair_candidate_group(
         "image", {"prompt": "revised"}, Path("/tmp"), None, {})
 
     assert seen["prompt"] == "revised"
     assert seen["qc_consecutive_failures_base"] == 1
+    assert seen["_gacha_pulls_override"] == 3
+    assert result.uri == group["candidates"][1]["uri"]
+    assert result.data["candidate_group"]["repair_batch"] is True
+    assert result.data["selection"]["source"] == "ai"
 
 
 def test_strict_mode_ai_promotes_only_qc_passing_current_candidate(tmp_path):
@@ -164,18 +174,20 @@ def test_strict_shot_group_finishes_through_ai_promotion(tmp_path):
     assert result.data["selection"]["candidate_index"] == 2
 
 
-def test_selection_mode_never_auto_promotes_candidate(tmp_path):
+def test_selection_mode_ai_promotes_highest_score_candidate(tmp_path):
     director = _director({
         "selection_mode": True, "image_content_qc": True})
     result = ProviderResult(
         provider="fake", cost=4,
         data={"candidate_group": _complete_group(tmp_path)}, uri="")
 
-    unchanged = director._ai_promote_generated_candidate_group(result)
+    promoted = director._ai_promote_generated_candidate_group(result)
 
-    assert unchanged.uri == ""
-    assert "selection" not in unchanged.data["candidate_group"]
-    assert Director._candidate_selection_pending(unchanged) is True
+    assert promoted.uri == result.data["candidate_group"]["candidates"][1][
+        "uri"]
+    assert promoted.data["selection"]["source"] == "ai"
+    assert promoted.data["selection"]["candidate_index"] == 2
+    assert Director._candidate_selection_pending(promoted) is False
 
 
 def test_plan_seed_holds_one_lock_for_read_modify_write():

@@ -13,7 +13,22 @@ from aifos.app import App
 
 # 假 codex:记录完整参数,从指令文本中提取目标 png 路径并创建之
 FAKE_CODEX = '''#!/usr/bin/env python3
-import json, os, re, sys
+import json, os, re, struct, sys, zlib
+
+def write_test_png(path, width=9, height=16):
+    """Write a genuinely decodable 9:16 PNG for production probe tests."""
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff))
+    scanline = b"\\x00" + (b"\\x28\\x78\\xc8" * width)
+    payload = b"\\x89PNG\\r\\n\\x1a\\n"
+    payload += chunk(
+        b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    payload += chunk(b"IDAT", zlib.compress(scanline * height))
+    payload += chunk(b"IEND", b"")
+    with open(path, "wb") as image_file:
+        image_file.write(payload)
+
 instruction = sys.argv[-1]
 log = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                    "codex_argv.jsonl")
@@ -40,7 +55,7 @@ if "你是漫剧图片质检员" in instruction:
     sys.exit(0)
 paths = re.findall(r"(/\\S+?\\.png)", instruction)
 for p in paths:
-    open(p, "wb").write(b"fake-png")
+    write_test_png(p)
 print("codex done:", len(paths), "files")
 '''
 

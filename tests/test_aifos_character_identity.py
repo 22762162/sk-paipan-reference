@@ -1,6 +1,8 @@
 """正式人物统一4选1定版、参考图硬门禁与视觉身份质检。"""
 
 import json
+import struct
+import zlib
 from pathlib import Path
 
 import pytest
@@ -212,13 +214,30 @@ def test_fresh_assets_regenerates_all_candidates_without_old_references(
 
     captured = []
 
+    def write_valid_nine_sixteen_png(path, tone):
+        width, height = 9, 16
+
+        def chunk(kind, payload):
+            return (struct.pack(">I", len(payload)) + kind + payload
+                    + struct.pack(">I", zlib.crc32(kind + payload)
+                                  & 0xffffffff))
+
+        rgb = bytes((tone, 80, 120)) * width
+        pixels = b"".join(b"\x00" + rgb for _ in range(height))
+        path.write_bytes(
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height,
+                                          8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(pixels))
+            + chunk(b"IEND", b""))
+
     def fake_parallel(ctx, tasks, line="", **kwargs):
         captured.extend(tasks)
         results = {}
         for task in tasks:
             fresh = tmp_path / f"fresh-{task['tag'][1]}.png"
-            fresh.write_bytes(
-                b"\x89PNG\r\n\x1a\n" + bytes([task["tag"][1]]) * 32)
+            write_valid_nine_sixteen_png(
+                fresh, 30 + task["tag"][1] * 20)
             results[task["tag"]] = ProviderResult(
                 provider="image_api", cost=1.0, uri=str(fresh), data={})
         return results
@@ -784,8 +803,8 @@ def test_visual_qc_requires_identity_ack_and_reuses_signature(app, tmp_path):
     assert calls[0]["identity_references"][0]["character"] == name
 
 
-def test_systemic_identity_failures_trip_redraw_circuit_breaker(app):
-    title = "人物漂移熔断"
+def test_systemic_identity_failures_are_reported_without_blocking(app):
+    title = "人物漂移非阻断"
     project, episode, script = _to_cast_selection(app, title)
     ctx = {"episode": dict(episode),
            "out_root": app.director._episode_dir(project, episode)}
@@ -798,6 +817,9 @@ def test_systemic_identity_failures_trip_redraw_circuit_breaker(app):
                              "issues": ["发型和脸与最终立绘不一致"]}})
     app.director._plan_write(ctx, {"items": items})
     result = app.director.redo_items(title, 1, only_failed=True)
-    assert result["status"] == "blocked"
-    assert result["reason"] == "systemic_identity_failure"
+    assert result["status"] == "done"
+    assert "reason" not in result
+    # 该人工构造计划没有可重画的正式分镜任务；即使三镜都发生身份漂移，
+    # 也只能记录逐镜失败，不能再触发整集熔断或等待手机处理。
     assert result["redone"] == 0
+    assert result["failed"] == 3

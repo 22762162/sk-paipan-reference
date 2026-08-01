@@ -124,6 +124,6 @@ def test_codex_adapter_has_dedicated_prop_candidate_output(tmp_path):
             "prompt_contract_complete": True,
             "aspect": "1:1", "width": 1024, "height": 1024,
         }, tmp_path)
-    assert "供人工四选一" in instruction
+    assert "供AI四选一自动定版" in instruction
     assert targets[0].name.startswith("prop_")
     assert data["prop"] == "铜制机关钥匙"

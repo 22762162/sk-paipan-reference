@@ -15,6 +15,11 @@ from aifos.production.base import ProviderResult
 from aifos.production.router import ProviderRouter
 
 
+PNG_1PX = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
+    "z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+
+
 def _png(path, marker=b"0"):
     path.write_bytes(b"\x89PNG\r\n\x1a\n" + marker * 16)
     return str(path)
@@ -303,7 +308,7 @@ def test_gpt_quality_gate_allows_high_for_classified_important_assets(
 
     def fake_request(name, url, headers, body=None, timeout=300, method=None):
         captured.update(body)
-        return {"data": [{"b64_json": base64.b64encode(b"png").decode()}]}
+        return {"data": [{"b64_json": base64.b64encode(PNG_1PX).decode()}]}
 
     monkeypatch.setattr(api_providers, "_request_json", fake_request)
     provider = OpenAIImageProvider("image_api", {
@@ -332,7 +337,7 @@ def test_gpt_reference_edit_keeps_classified_important_high(tmp_path,
 
     def fake_multipart(name, url, headers, fields, files, timeout):
         captured.update(fields)
-        return {"data": [{"b64_json": base64.b64encode(b"png").decode()}]}
+        return {"data": [{"b64_json": base64.b64encode(PNG_1PX).decode()}]}
 
     monkeypatch.setattr(api_providers, "_multipart_post", fake_multipart)
     provider = OpenAIImageProvider("image_api", {
@@ -356,7 +361,7 @@ def test_seedream_uploads_ordered_identity_refs_and_forces_one_image(
     def fake_request(name, url, headers, body=None, timeout=300, method=None):
         captured.update({"name": name, "url": url, "headers": headers,
                          "body": body})
-        return {"data": [{"b64_json": base64.b64encode(b"seedream").decode()}]}
+        return {"data": [{"b64_json": base64.b64encode(PNG_1PX).decode()}]}
 
     monkeypatch.setattr(api_providers, "_request_json", fake_request)
     provider = SeedreamImageProvider("seedream5_lite", {
@@ -407,8 +412,8 @@ def test_seedream_uploads_ordered_identity_refs_and_forces_one_image(
     assert result.data["image_task_class"] == "batch"
     assert result.data["image_quality"] == "medium"
     assert result.data["unit_cost"] == 0.22
-    assert (tmp_path / "out" / "shot_008.keyframe.png").read_bytes() == \
-        b"seedream"
+    assert result.data["image_normalization"]["target_dimensions"] == {
+        "width": 1080, "height": 1920}
 
 
 def test_seedream_required_reference_never_degrades_to_text(tmp_path,

@@ -288,7 +288,10 @@ def test_image_api_portrait_and_shot(fake_api, tmp_path):
         "aspect": "9:16", "width": 1080, "height": 1920,
     }, tmp_path)
     assert result.uri.endswith(".png")
-    assert (tmp_path / "portrait_林昭.png").read_bytes() == PNG_1PX
+    assert result.data["image_normalization"]["target_dimensions"] == {
+        "width": 1080, "height": 1920}
+    original = Path(result.data["image_normalization"]["original_uri"])
+    assert original.read_bytes() == PNG_1PX
     call = fake.calls[0]
     assert call["headers"]["authorization"] == "Bearer sk-img-test"
     assert call["body"]["model"] == "gpt-image-1"
@@ -324,8 +327,10 @@ def test_image_api_frames_url_mode(fake_api, tmp_path):
     result = provider.generate("frames", {
         "shot_no": 2, "prompt": "镜头", "aspect": "9:16",
     }, tmp_path)
-    assert (tmp_path / "shot_002.first.png").read_bytes() == PNG_1PX
-    assert (tmp_path / "shot_002.last.png").read_bytes() == PNG_1PX
+    assert result.data["image_normalization"]["first"][
+        "target_dimensions"] == {"width": 1080, "height": 1920}
+    assert result.data["image_normalization"]["last"][
+        "target_dimensions"] == {"width": 1080, "height": 1920}
     assert result.data["first"].endswith("shot_002.first.png")
     # 首尾两张 → 双倍单价
     assert result.cost == 3.0
@@ -343,7 +348,8 @@ def test_image_api_frames_reuse_keyframe_charges_one_call(fake_api, tmp_path):
         "image_uri": str(keyframe),
         "spatial_constraint": "空间调度锁：严格 2 人，保持轴线。",
     }, tmp_path / "frames")
-    assert Path(result.data["first"]).read_bytes() == PNG_1PX
+    assert result.data["image_normalization"]["first"][
+        "target_dimensions"] == {"width": 1080, "height": 1920}
     assert result.data["first_source"] == "keyframe"
     assert result.data["generation_calls"] == 1
     assert result.cost == 1.5

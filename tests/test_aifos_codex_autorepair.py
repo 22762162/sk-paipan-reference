@@ -135,8 +135,7 @@ def test_escalation_without_a_concrete_instruction_still_goes_to_human(
         ctx, task, _Result(_escalation_qc(instruction=""))) == ""
 
 
-def test_repair_is_bounded_but_can_continue_after_third_round(
-        app, monkeypatch):
+def test_repair_is_bounded_to_one_three_draw_batch(app, monkeypatch):
     ctx, task = _ctx_and_task(app, monkeypatch)
     # Codex 每轮给的是不同诊断,合同每次都真的变;这样才走得到上限,
     # 否则第二次修出同一份合同会先被「输入未变化」挡掉。
@@ -153,13 +152,11 @@ def test_repair_is_bounded_but_can_continue_after_third_round(
         return R()
 
     monkeypatch.setattr(Director, "_call", varying_call)
-    for _ in range(Director.CODEX_CONTRACT_REPAIR_LIMIT):
-        assert app.director._auto_apply_codex_escalation(
-            ctx, task, _Result(_escalation_qc()))
-    # 第三轮起走深度合同瘦身；明确的第4轮指令仍会自动执行，但最终
-    # 仍受有界上限保护，不会无限烧额度。
-    assert task["payload"]["_codex_contract_repair_count"] == (
-        Director.CODEX_CONTRACT_REPAIR_LIMIT)
+    assert app.director._auto_apply_codex_escalation(
+        ctx, task, _Result(_escalation_qc()))
+    assert task["payload"]["_codex_contract_repair_count"] == 1
+    assert task["payload"]["_auto_repair_batches_used"] == 1
+    # 失败内容不再触发第二轮合同修改/抽卡；三张里直接晋升相对最优稿。
     assert app.director._auto_apply_codex_escalation(
         ctx, task, _Result(_escalation_qc())) == ""
 
@@ -264,7 +261,7 @@ def test_repair_that_does_not_change_the_input_uses_codex_override(
     assert "50mm" in task["payload"]["feedback"]
 
 
-def test_nested_prompt_review_block_is_repaired_and_keeps_three_draw_mode(
+def test_nested_prompt_review_block_is_repaired_and_keeps_four_draw_mode(
         app, monkeypatch):
     """合同改完后的内层预审冲突也必须自动修，不能把镜头直接标失败。"""
     ctx, task = _ctx_and_task(app, monkeypatch, item_id="shot:12", shot_no=12)
@@ -303,7 +300,9 @@ def test_nested_prompt_review_block_is_repaired_and_keeps_three_draw_mode(
     assert summary
     payload = task["payload"]
     assert payload["_codex_contract_repair_count"] == 4
-    assert payload["_autonomous_repair_seeded"] is True
+    # 合同预审修复发生在首次出图前；不能误标成“视觉失败后的三张
+    # 返工批”，否则会跳过首次四张候选。
+    assert "_autonomous_repair_seeded" not in payload
     assert payload["prompt_conflict_resolution"]["shot_contract"]["景别"] \
         == "近景"
     assert "替代并作废旧提示词" in payload["feedback"]

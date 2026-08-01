@@ -124,7 +124,7 @@ python3 -m aifos tunnel --record https://xxxx.trycloudflare.com/
 ## 生产流程
 
 ```
-需求/剧本 → 人物分析/视觉DNA/角色去重 → 候选与人工定版
+需求/剧本 → 人物分析/视觉DNA/角色去重 → 四张候选与AI自动选优定版
          → 独立三视图母资产 → 连续性圣经 → 五维分镜 → 角色/场景资产 → 关键帧
          → 文字锁定 → 首尾帧 → 14项开拍门禁 → Seedance视频
          → Seedance2 随视频配音/口型 → 无字幕母版剪辑 → 三层质检
