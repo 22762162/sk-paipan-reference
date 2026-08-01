@@ -42,6 +42,7 @@ async function api(path, opts) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const error = new Error(data.message || data.error || `HTTP ${res.status}`);
+    error.status = res.status;
     error.details = data;
     throw error;
   }
@@ -3506,6 +3507,9 @@ const PLAN_STATUS_CN = {
   pending: "排队中", generating: "生成中", done: "已完成",
   failed: "失败", reused: "复用已有", selected: "已选定",
   awaiting_human: "二次质检未过 · 待人工修改",
+  awaiting_selection: "4张已齐 · 待选正式图",
+  regenerating_candidates: "正在并行换4张",
+  technical_incomplete: "候选技术未补齐",
 };
 const PLAN_QC_CATS = new Set(["shot_image", "frames"]);
 function planQcEnabled(item) { return PLAN_QC_CATS.has(item.category); }
@@ -3732,6 +3736,56 @@ function thumbUrl(url, w = 480) {
   return url + (url.includes("?") ? "&" : "?") + "w=" + w;
 }
 
+function shotCandidateGroup(item) {
+  if (!item || item.category !== "shot_image") return null;
+  const group = item.candidate_group || item.shot_candidate_group;
+  return group && typeof group === "object" && group.selection_required
+    ? group : null;
+}
+
+function shotCandidateUrl(candidate) {
+  return String((candidate || {}).uri || (candidate || {}).url || "").trim();
+}
+
+function shotCandidates(item) {
+  const group = shotCandidateGroup(item);
+  if (!group) return [];
+  return (group.candidates || []).filter((candidate) =>
+    candidate && shotCandidateUrl(candidate)).sort((left, right) =>
+      Number(left.candidate_index || left.index || 0)
+      - Number(right.candidate_index || right.index || 0)).slice(0, 4);
+}
+
+function shotCandidateIndex(candidate) {
+  return Number((candidate || {}).candidate_index || (candidate || {}).index || 0);
+}
+
+function shotCandidateSelected(group, candidate) {
+  const selection = (group || {}).selection || {};
+  if (!selection || typeof selection !== "object") return false;
+  const candidateId = String(candidate.candidate_id || "");
+  const selectedId = String(selection.candidate_id || "");
+  if (candidateId && selectedId) return candidateId === selectedId;
+  const selectedIndex = Number(selection.candidate_index || 0);
+  const currentToken = String(group.candidate_set_token || "");
+  const selectedToken = String(selection.candidate_set_token || selection.token || "");
+  if (selectedIndex && currentToken && selectedToken)
+    return currentToken === selectedToken
+      && shotCandidateIndex(candidate) === selectedIndex;
+  return String(selection.selected_uri || "") === shotCandidateUrl(candidate);
+}
+
+function shotCandidateState(item) {
+  const group = shotCandidateGroup(item);
+  if (!group) return null;
+  const candidates = shotCandidates(item);
+  const expected = Math.max(4, Number(group.expected_count || 4));
+  const missing = Math.max(0, expected - candidates.length);
+  const technicalIncomplete = group.technical_incomplete === true
+    || item.status === "technical_incomplete" || missing > 0;
+  return { group, candidates, expected, missing, technicalIncomplete };
+}
+
 function planItemThumbs(data, item) {
   const art = data.artifacts || {};
   let urls = [];
@@ -3752,7 +3806,9 @@ function planItemThumbs(data, item) {
     const row = (art.scene_art || []).find((s) => s.name === item.name);
     if (row && row.url) urls = [row.url];
   } else if (item.category === "shot_image") {
-    if ((art.images || {})[item.shot_no]) urls = [art.images[item.shot_no]];
+    const candidates = shotCandidates(item).map(shotCandidateUrl);
+    if (candidates.length) urls = candidates;
+    else if ((art.images || {})[item.shot_no]) urls = [art.images[item.shot_no]];
     else if (item.output_url) urls = [item.output_url];
   } else if (item.category === "frames") {
     if ((art.first || {})[item.shot_no]) urls.push(art.first[item.shot_no]);
@@ -3774,13 +3830,77 @@ function planTargetOf(item) {
   return { kind: "shot", shot_no: item.shot_no };
 }
 
+function shotCandidateSetPayload(episodeId, item, candidate = null) {
+  const group = shotCandidateGroup(item) || {};
+  const version = group.version || {};
+  return {
+    episode_id: Number(episodeId),
+    item_id: item.id,
+    shot_no: Number(item.shot_no),
+    candidate_set_id: String(group.candidate_set_id || ""),
+    candidate_set_token: String(group.candidate_set_token || version.token || ""),
+    contract_revision: Number(group.contract_revision || version.contract_revision || 1),
+    candidate_revision: Number(group.candidate_revision || version.candidate_revision || 1),
+    candidate_id: candidate ? String(candidate.candidate_id || "") : "",
+    candidate_index: candidate ? shotCandidateIndex(candidate) : 0,
+  };
+}
+
+function shotCandidateGridHtml(item, editable) {
+  const state = shotCandidateState(item);
+  if (!state) return "";
+  const { group, candidates, expected, missing, technicalIncomplete } = state;
+  const selected = candidates.find((candidate) =>
+    shotCandidateSelected(group, candidate));
+  const errors = (group.candidate_errors || []).map((row) =>
+    `候选${row.candidate_index || "?"}：${row.error || "技术生成失败"}`);
+  return `<section class="shot-candidate-panel" aria-label="本镜4张候选">
+    <div class="shot-candidate-head"><div><b>本镜4张候选</b>
+      <span>${selected ? `已选候选 ${shotCandidateIndex(selected)} 为正式关键帧；4张均保留回看`
+        : (technicalIncomplete ? `技术未补齐，当前 ${candidates.length}/${expected} 张`
+          : "4张使用同一冻结提示词与参考图；请选择1张正式关键帧")}</span></div>
+      <span class="plan-st st-${technicalIncomplete ? "technical_incomplete" : (selected ? "done" : "awaiting_selection")}">
+        ${technicalIncomplete ? `缺 ${missing || Math.max(1, expected - candidates.length)} 张 · 暂不可选`
+          : (selected ? "正式图已选" : "待人工选片")}</span></div>
+    ${errors.length ? `<div class="shot-candidate-technical-error">${esc(errors.join("；"))}</div>` : ""}
+    <div class="shot-candidate-grid">${candidates.map((candidate) => {
+      const index = shotCandidateIndex(candidate);
+      const isSelected = shotCandidateSelected(group, candidate);
+      const url = shotCandidateUrl(candidate);
+      return `<article class="shot-candidate${isSelected ? " selected" : ""}">
+        <button type="button" class="shot-candidate-image shot-candidate-open"
+          data-plan-id="${esc(item.id)}" data-candidate-index="${index}"
+          title="点开放大候选 ${index}" aria-label="放大候选 ${index}">
+          <img src="${esc(thumbUrl(url, 520))}" loading="lazy" alt="${esc(item.label)} · 候选${index}">
+          ${isSelected ? `<span class="shot-candidate-selected">✓ 正式关键帧</span>` : ""}
+        </button>
+        <div class="shot-candidate-foot"><span>候选 ${index}</span>
+          <button type="button" class="${isSelected ? "selected" : "primary"} shot-candidate-pick"
+            data-plan-id="${esc(item.id)}" data-candidate-index="${index}"
+            ${(!editable || technicalIncomplete || isSelected) ? "disabled" : ""}>
+            ${isSelected ? "✓ 已选为正式图" : (technicalIncomplete ? "补齐4张后可选" : "选定这张")}</button>
+        </div></article>`;
+    }).join("")}</div>
+    ${editable ? `<div class="shot-candidate-controls">
+      <button type="button" class="shot-candidate-edit-toggle">✎ 修改提示词，整组换4张</button>
+      <div class="shot-candidate-regenerate-form" hidden>
+        <textarea class="shot-candidate-prompt" rows="3">${esc(item.prompt_used || item.prompt || "")}</textarea>
+        <button type="button" class="primary shot-candidate-regenerate"
+          data-plan-id="${esc(item.id)}">整组并行换4张</button>
+        <small>会作废当前选择并生成新的候选组；其他镜头继续生产，不会暂停整集。</small>
+      </div></div>` : ""}
+  </section>`;
+}
+
 function planItemHtml(data, item, editable) {
   const thumbs = planItemThumbs(data, item);
   const st = item.status || "pending";
+  const candidateMode = !!shotCandidateGroup(item);
   const canEdit = editable && item.category !== "character_candidate";
-  const selectable = canEdit && ["done", "reused", "awaiting_human", "failed"].includes(st);
+  const selectable = canEdit && !candidateMode
+    && ["done", "reused", "awaiting_human", "failed"].includes(st);
   const qcFailed = planNeedsRevision(item);
-  return `<div class="plan-item plan-selectable st-${st}" data-plan-select="${esc(item.id)}"
+  return `<div class="plan-item plan-selectable${candidateMode ? " has-shot-candidates" : ""} st-${st}" data-plan-select="${esc(item.id)}"
     role="button" tabindex="0" aria-pressed="false"
     aria-label="选择查看 ${esc(item.label)}">
     <div class="plan-thumbs">${thumbs.length
@@ -3821,7 +3941,8 @@ function planItemHtml(data, item, editable) {
       ${planQcIssuesHtml(item)}
       ${planQcReferenceGalleryHtml(item)}
       ${planTraceHtml(item)}
-      ${canEdit ? `<div class="plan-edit" data-target="${esc(JSON.stringify(planTargetOf(item)))}">
+      ${shotCandidateGridHtml(item, editable)}
+      ${canEdit && !candidateMode ? `<div class="plan-edit" data-target="${esc(JSON.stringify(planTargetOf(item)))}">
         <button class="plan-edit-toggle">🔄 修改提示词/重画这张</button>
         <div class="plan-edit-form" hidden>
           <textarea class="plan-edit-prompt" rows="3">${esc(item.prompt_used || item.prompt || "")}</textarea>
@@ -5670,8 +5791,11 @@ async function refreshOpenPlanOverlay(episodeId, force = false) {
   const panel = overlay?.querySelector(".plan-overlay-content");
   if (!panel) return false;
   const active = document.activeElement;
-  if (!force && (panel.querySelector(".plan-edit-form:not([hidden])")
-      || active?.closest(".plan-edit-form"))) {
+  if (!force && (panel.dataset.shotCandidateMutation === "1"
+      || panel.querySelector(".plan-edit-form:not([hidden])")
+      || panel.querySelector(".shot-candidate-regenerate-form:not([hidden])")
+      || panel.querySelector('.shot-candidate-regenerate[data-armed="1"]')
+      || active?.closest(".plan-edit-form, .shot-candidate-regenerate-form"))) {
     // 用户正在改词时不替换 DOM；否则 textarea 会失焦、滚动位置也会跳走。
     return false;
   }
@@ -5692,7 +5816,8 @@ async function refreshOpenPlanOverlay(episodeId, force = false) {
     panel.innerHTML = renderPlanHtml(data, true)
       || `<div class="dim">本集还没有图片生产计划。</div>`;
     bindPlanSelection(panel, data, episodeId);
-    bindPlanRegen(panel, episodeId, () => refreshOpenPlanOverlay(episodeId));
+    bindPlanRegen(panel, episodeId,
+      () => refreshOpenPlanOverlay(episodeId), data);
     panel.querySelectorAll(".plan-pick-box").forEach((box) => {
       box.checked = checked.has(box.dataset.pick);
     });
@@ -5817,7 +5942,200 @@ function manualPassSelected(episodeId, btn) {
   manualPassItems(episodeId, ids, btn, () => refreshOpenPlanOverlay(episodeId));
 }
 
-function bindPlanRegen(container, episodeId, onDone) {
+async function refreshShotCandidatePlan(episodeId, onDone, force = true) {
+  if (document.querySelector(`.plan-overlay[data-episode="${episodeId}"]`))
+    return refreshOpenPlanOverlay(episodeId, force);
+  if (onDone) return onDone();
+  return renderCanvasView(episodeId);
+}
+
+async function selectShotCandidate(episodeId, item, candidate, btn, onDone) {
+  const panel = btn.closest(".plan-overlay-content");
+  const original = btn.textContent;
+  if (panel) panel.dataset.shotCandidateMutation = "1";
+  btn.disabled = true;
+  btn.textContent = "正在锁定…";
+  try {
+    await api("/api/shot-candidates/select", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...shotCandidateSetPayload(episodeId, item, candidate),
+        source: "manual",
+      }),
+    });
+    showToast(`镜头 ${item.shot_no} 已选候选 ${shotCandidateIndex(candidate)} 为正式关键帧；其余3张保留回看`, "ok");
+    if (panel) delete panel.dataset.shotCandidateMutation;
+    await refreshShotCandidatePlan(episodeId, onDone, true);
+  } catch (error) {
+    if (panel) delete panel.dataset.shotCandidateMutation;
+    if (error.status === 409) {
+      showToast("这组候选已经更新，正在刷新到最新4张，请重新选择", "error");
+      await refreshShotCandidatePlan(episodeId, onDone, true);
+      return;
+    }
+    showToast(error.message, "error");
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+}
+
+function showShotCandidateCompare(
+    episodeId, item, startIndex, editable, onDone) {
+  const state = shotCandidateState(item);
+  if (!state || !state.candidates.length) return;
+  const { group, candidates, technicalIncomplete } = state;
+  const overlay = document.createElement("div");
+  overlay.className = "cast-compare-overlay shot-candidate-compare";
+  overlay.innerHTML = `
+    <div class="cast-compare-head">
+      <b>${esc(item.label)} · 4张候选</b>
+      <span class="cast-compare-counter"></span>
+      <button type="button" class="cast-compare-close">关闭 ✕</button>
+    </div>
+    <div class="cast-compare-track">${candidates.map((candidate) => {
+      const index = shotCandidateIndex(candidate);
+      return `<figure class="cast-compare-slide" data-index="${index}"
+        data-selected="${shotCandidateSelected(group, candidate) ? "1" : "0"}">
+        <img src="${esc(shotCandidateUrl(candidate))}"
+          alt="${esc(item.label)} · 候选${index}">
+      </figure>`;
+    }).join("")}</div>
+    <div class="cast-compare-foot">
+      <div class="cast-compare-dots">${candidates.map((candidate) =>
+        `<i data-index="${shotCandidateIndex(candidate)}"></i>`).join("")}</div>
+      <div class="cast-compare-label"></div>
+      <button type="button" class="primary cast-compare-pick"></button>
+    </div>`;
+  document.body.appendChild(overlay);
+  const track = overlay.querySelector(".cast-compare-track");
+  const slides = [...overlay.querySelectorAll(".cast-compare-slide")];
+  const counter = overlay.querySelector(".cast-compare-counter");
+  const label = overlay.querySelector(".cast-compare-label");
+  const pick = overlay.querySelector(".cast-compare-pick");
+  const dots = [...overlay.querySelectorAll(".cast-compare-dots i")];
+  let current = Math.max(0, slides.findIndex(
+    (slide) => Number(slide.dataset.index) === Number(startIndex)));
+  const sync = () => {
+    const slide = slides[current];
+    if (!slide) return;
+    const selected = slide.dataset.selected === "1";
+    counter.textContent = `${current + 1} / ${slides.length}`;
+    label.textContent = `候选 ${slide.dataset.index}${selected ? " · 当前正式关键帧" : ""}`;
+    pick.disabled = !editable || technicalIncomplete || selected;
+    pick.textContent = selected ? "✓ 已选为正式图"
+      : (technicalIncomplete ? "技术补齐4张后才能选"
+        : `✓ 选定这张（候选 ${slide.dataset.index}）`);
+    dots.forEach((dot, index) => dot.classList.toggle("on", index === current));
+  };
+  const close = () => overlay.remove();
+  overlay.querySelector(".cast-compare-close").onclick = close;
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay || event.target === track) close();
+  });
+  track.addEventListener("scroll", () => {
+    const index = Math.round(track.scrollLeft / track.clientWidth);
+    if (index !== current && slides[index]) { current = index; sync(); }
+  }, { passive: true });
+  pick.onclick = async () => {
+    const candidate = candidates.find((row) =>
+      shotCandidateIndex(row) === Number(slides[current].dataset.index));
+    if (!candidate) return;
+    await selectShotCandidate(episodeId, item, candidate, pick, onDone);
+    if (!document.body.contains(pick) || pick.disabled) close();
+  };
+  requestAnimationFrame(() => {
+    track.scrollLeft = current * track.clientWidth;
+    sync();
+  });
+}
+
+function bindShotCandidateControls(container, data, episodeId, onDone) {
+  const items = ((data || {}).render_plan || {}).items || [];
+  const byId = new Map(items.map((item) => [String(item.id), item]));
+  const resolve = (button) => {
+    const item = byId.get(String(button.dataset.planId || ""));
+    if (!item) return {};
+    const candidate = shotCandidates(item).find((row) =>
+      shotCandidateIndex(row) === Number(button.dataset.candidateIndex || 0));
+    return { item, candidate };
+  };
+  container.querySelectorAll(".shot-candidate-open").forEach((button) => {
+    button.onclick = (event) => {
+      event.stopPropagation();
+      const { item, candidate } = resolve(button);
+      if (item && candidate) showShotCandidateCompare(
+        episodeId, item, shotCandidateIndex(candidate), true, onDone);
+    };
+  });
+  container.querySelectorAll(".shot-candidate-pick").forEach((button) => {
+    button.onclick = async (event) => {
+      event.stopPropagation();
+      const { item, candidate } = resolve(button);
+      if (item && candidate)
+        await selectShotCandidate(episodeId, item, candidate, button, onDone);
+    };
+  });
+  container.querySelectorAll(".shot-candidate-controls").forEach((controls) => {
+    const form = controls.querySelector(".shot-candidate-regenerate-form");
+    const toggle = controls.querySelector(".shot-candidate-edit-toggle");
+    toggle.onclick = (event) => {
+      event.stopPropagation();
+      form.hidden = !form.hidden;
+      toggle.textContent = form.hidden ? "✎ 修改提示词，整组换4张" : "收起整组修改";
+      if (!form.hidden) form.querySelector("textarea").focus();
+    };
+    const button = controls.querySelector(".shot-candidate-regenerate");
+    button.onclick = (event) => {
+      event.stopPropagation();
+      armConfirm(button, "整组换4张", async () => {
+        const item = byId.get(String(button.dataset.planId || ""));
+        if (!item) return;
+        const panel = button.closest(".plan-overlay-content");
+        const prompt = form.querySelector(".shot-candidate-prompt").value.trim();
+        if (!prompt) {
+          showToast("提示词不能为空", "error");
+          return;
+        }
+        if (panel) panel.dataset.shotCandidateMutation = "1";
+        button.disabled = true;
+        button.textContent = "正在提交4路并行生成…";
+        try {
+          const reply = await api("/api/shot-candidates/regenerate", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              ...shotCandidateSetPayload(episodeId, item),
+              prompt, confirm_regenerate: true,
+            }),
+          });
+          showToast(`镜头 ${item.shot_no} 已开始整组换4张；其他镜头继续生产`, "ok");
+          if (panel) delete panel.dataset.shotCandidateMutation;
+          await refreshShotCandidatePlan(episodeId, onDone, true);
+          if (reply.job_id) pollJob(reply.job_id, async (job) => {
+            if (job.status === "done")
+              showToast(`镜头 ${item.shot_no} 的新4张候选已生成完毕`, "ok");
+            else if (job.status === "failed")
+              showToast(job.error || "整组候选生成失败", "error");
+            await refreshShotCandidatePlan(episodeId, onDone, true);
+          });
+          pollCanvas(episodeId);
+        } catch (error) {
+          if (panel) delete panel.dataset.shotCandidateMutation;
+          if (error.status === 409) {
+            showToast("候选组已变化，已刷新到最新版本；请重新提交修改", "error");
+            await refreshShotCandidatePlan(episodeId, onDone, true);
+            return;
+          }
+          showToast(error.message, "error");
+          button.disabled = false;
+          button.textContent = "整组并行换4张";
+        }
+      });
+    };
+  });
+}
+
+function bindPlanRegen(container, episodeId, onDone, data = null) {
+  if (data) bindShotCandidateControls(container, data, episodeId, onDone);
   container.querySelectorAll(".plan-pick-box").forEach((box) => {
     box.onchange = planUpdateSelCount;
   });
@@ -6678,7 +6996,8 @@ async function showPlanOverlay(episodeId, focusId = "", focusCategory = "") {
   document.addEventListener("keydown", onKey);
   document.body.appendChild(overlay);
   bindPlanSelection(overlay, data, episodeId);
-  bindPlanRegen(overlay, episodeId, () => { close(); showPlanOverlay(episodeId); });
+  bindPlanRegen(overlay, episodeId,
+    () => refreshOpenPlanOverlay(episodeId), data);
   if (focusId) {
     const target = [...overlay.querySelectorAll("[data-plan-select]")]
       .find((card) => card.dataset.planSelect === focusId);
