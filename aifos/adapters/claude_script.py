@@ -2452,6 +2452,26 @@ def _build_prompt_body(capability, payload):
                 style=(payload.get("style", "")
                        or "未指定；根据剧本自动分析，不套用固定画风"),
                 premise=payload.get("premise", "") or "自由发挥")
+        previous_continuity = payload.get("previous_episode_continuity")
+        if isinstance(previous_continuity, dict):
+            # 只给编剧上一集出口事实、未决钩子和仍有效状态；绝不把
+            # 前集全文或审查文档整包塞进提示词，避免噪声改写当前剧情。
+            compact_continuity = {
+                "previous_episode_number": previous_continuity.get(
+                    "previous_episode_number"),
+                "previous_exit_state": previous_continuity.get(
+                    "previous_exit_state", ""),
+                "unresolved_hooks": list(
+                    previous_continuity.get("unresolved_hooks") or [])[:6],
+                "states": list(previous_continuity.get("states") or [])[:12],
+            }
+            prompt = (
+                f"{prompt}\n\n【紧邻前集连续性硬约束】\n"
+                f"{json.dumps(compact_continuity, ensure_ascii=False)}\n"
+                "本集开场必须承接上述已发生事实；不得复活已毁坏道具、"
+                "改变人物伤势/位置/持有关系，或跳过未决钩子。若本集剧情"
+                "明确写出改变过程，才可在过程完成后更新状态。"
+            )
         if feedback:
             previous = json.dumps(
                 payload.get("previous_script", {}), ensure_ascii=False)
