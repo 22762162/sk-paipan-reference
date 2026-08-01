@@ -14,6 +14,7 @@ from aifos.app import App
 from aifos.db import now
 from aifos.director import character_candidate_target
 from aifos.prompt_contract import build_shot_prompt_contract
+from aifos.settings import set_defaults
 from aifos.story_analysis import build_story_analysis, validate_story_analysis
 from aifos.web.server import JobRegistry, _current_render_plan_items, serve
 
@@ -760,6 +761,11 @@ def test_manual_qc_override_api_promotes_problem_image(server, monkeypatch):
 
 def test_episode_production_progress_uses_verified_formal_assets(server):
     """完成进度只认正式资产，并准确列出正在生产和待处理问题。"""
+    # 本用例验证旧式「正式资产 + QC」进度语义，不构造新版候选组 token；
+    # 显式关闭默认开启的选片模式，避免把两套互斥门禁混在同一夹具中。
+    set_defaults(server["workspace"] / "config.json", {
+        "selection_mode": False,
+    })
     app2 = App(server["workspace"])
     try:
         project, _ = app2.projects.get_or_create_project("真实生产进度")
@@ -925,6 +931,10 @@ def test_episode_progress_multiplies_per_channel_codex_capacity(server):
 
 def test_episode_guidance_pauses_at_incomplete_keyframe_gate(server):
     """错误的 awaiting_confirm 不能越过正式关键帧和首尾帧门禁。"""
+    # 该历史门禁用例只构造正式图和 QC，不构造四候选组的明确选片凭证。
+    set_defaults(server["workspace"] / "config.json", {
+        "selection_mode": False,
+    })
     app2 = App(server["workspace"])
     try:
         project, _ = app2.projects.get_or_create_project("智能生产引导")
@@ -1435,6 +1445,11 @@ def test_standard_center_api_lifecycle(server):
 
 
 def test_produce_flow_and_episode_api(server):
+    # 这里覆盖传统自动完成整集的兼容流程；新版默认选片模式会在关键帧
+    # 四候选齐全后等待人工/AI 明确选择，已由独立候选 API/UI 用例覆盖。
+    set_defaults(server["workspace"] / "config.json", {
+        "selection_mode": False,
+    })
     port = server["port"]
     # Web 默认流程:剧本 → 正式人物/核心道具四选一 → 预生产 → 开拍确认
     status, reply = _json_request(port, "POST", "/api/produce", {
