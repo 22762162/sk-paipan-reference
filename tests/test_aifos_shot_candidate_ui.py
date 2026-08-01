@@ -24,6 +24,10 @@ def test_shot_candidate_statuses_and_four_up_rendering_are_present():
     assert "4张均保留回看" in JS
     assert "缺 ${missing" in JS
     assert "补齐4张后可选" in JS
+    assert "const slots = [1, 2, 3, 4]" in JS
+    assert 'aria-label="候选 ${index} 尚未生成"' in JS
+    assert "等待技术补齐" in JS
+    assert "selection.selected_uri || selection.selected_url" in JS
 
 
 def test_current_candidate_group_precedes_single_shot_artifact():
@@ -74,4 +78,3 @@ def test_candidate_editor_and_mutation_protect_live_overlay_from_dom_replacement
     assert "shot-candidate-compare" in JS
     assert "scroll-snap-type: x mandatory" in CSS
     assert "flex: 0 0 min(68vw, 260px)" in CSS
-

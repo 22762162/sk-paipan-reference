@@ -45,6 +45,7 @@ from ..updater import (check_and_update, current_build, repo_root,
                        restart_process, start_auto_updater)
 from ..errors import AifosError
 from ..quality_policy import normalize_quality, normalize_quality_policy
+from ..selection_mode import CANDIDATES_PER_SHOT
 from ..prompt_review import build_episode_prompt_review
 from ..scene_render import build_scene_render_contract
 from ..smart_input import resolve_produce_target
@@ -144,6 +145,9 @@ def access_payload(bound_host, port, workspace=None):
 PRODUCTION_ACTIONS = frozenset({
     "produce", "force_rebuild", "script_import", "series_next",
     "confirm_script", "image_acceleration_resume", "image_selection_resume",
+    # 整组候选重生会作废当前正式关键帧及其下游链，必须与整集生产、
+    # 旧单图重画等入口互斥；同一集内仍由串行队列按提交顺序执行。
+    "regenerate_shot_candidates",
 })
 
 
@@ -568,15 +572,48 @@ def _candidate_group_current_selection(item):
             break
     if candidate is None:
         return None
-    selected_uri = str(selection.get("selected_uri") or "")
-    if selected_uri and selected_uri != str(candidate.get("uri") or ""):
+    selected_locations = {
+        str(selection.get(key) or "").strip()
+        for key in ("selected_uri", "selected_url")
+        if str(selection.get(key) or "").strip()
+    }
+    candidate_locations = {
+        str(candidate.get(key) or "").strip()
+        for key in ("uri", "url")
+        if str(candidate.get(key) or "").strip()
+    }
+    if (selected_locations and candidate_locations
+            and selected_locations.isdisjoint(candidate_locations)):
         return None
     return selection
 
 
 def _selection_mode_enabled(app):
-    return bool(app.config.get(
-        "defaults", "selection_mode", default=True))
+    return _selection_mode_payload(app)["selection_mode"]
+
+
+def _selection_mode_payload(app):
+    return _selection_mode_payload_from_config(app.config)
+
+
+def _selection_mode_payload_from_config(config):
+    """用设置层唯一布尔解析器回显选片设置，候选数永远钳制为四。"""
+    # 延迟导入避免 Web 启动时扩大 settings 的导入链；这里复用保存接口的
+    # 唯一布尔语义，不能再用 bool("false") 这种会误判为 True 的写法。
+    from ..settings import _coerce_bool
+
+    def flag(key, default):
+        return _coerce_bool(
+            key, config.get("defaults", key, default=default))
+
+    return {
+        "selection_mode": flag("selection_mode", True),
+        "image_content_qc": flag("image_content_qc", True),
+        "video_content_qc": flag("video_content_qc", True),
+        # 当前契约固定四图。即使旧配置被手工写坏，API/UI 也不能回显出
+        # 一个 Director 不会执行的数量；保存非法值仍由 set_defaults 拒绝。
+        "shot_candidate_count": CANDIDATES_PER_SHOT,
+    }
 
 
 def _sanitize_candidate_group_urls(app, item):
@@ -587,12 +624,15 @@ def _sanitize_candidate_group_urls(app, item):
     for candidate in group.get("candidates") or []:
         if not isinstance(candidate, dict):
             continue
-        candidate["url"] = _artifact_url(app, str(candidate.get("uri") or ""))
+        candidate["url"] = (
+            _artifact_url(app, str(candidate.get("uri") or ""))
+            or candidate.get("url"))
         candidate.pop("uri", None)
     selection = group.get("selection")
     if isinstance(selection, dict):
-        selection["selected_url"] = _artifact_url(
-            app, str(selection.get("selected_uri") or ""))
+        selection["selected_url"] = (
+            _artifact_url(app, str(selection.get("selected_uri") or ""))
+            or selection.get("selected_url"))
         selection.pop("selected_uri", None)
     uris = item.pop("candidate_uris", None)
     if isinstance(uris, list):
@@ -3049,19 +3089,16 @@ def make_handler(workspace, jobs):
                 if route == "/api/selection-mode":
                     # 创作选片模式现状(独立内容质检开关接口,只读设置,
                     # 不触碰生成/QC流程)
-                    return self._json(self._with_app(lambda app: {
-                        "selection_mode": bool(app.config.get(
-                            "defaults", "selection_mode", default=True)),
-                        "image_content_qc": bool(app.config.get(
-                            "defaults", "image_content_qc", default=True)),
-                        "video_content_qc": bool(app.config.get(
-                            "defaults", "video_content_qc", default=True)),
-                        "shot_candidate_count": int(app.config.get(
-                            "defaults", "shot_candidate_count", default=4)),
-                    }))
+                    return self._json(self._with_app(
+                        _selection_mode_payload))
                 if route == "/api/settings":
                     from ..settings import settings_payload
-                    return self._json(self._with_app(settings_payload))
+                    def settings_view(app):
+                        payload = settings_payload(app)
+                        payload.setdefault("defaults", {}).update(
+                            _selection_mode_payload(app))
+                        return payload
+                    return self._json(self._with_app(settings_view))
                 if route == "/api/doctor":
                     from ..doctor import run_doctor
                     ping = query.get("ping", ["0"])[0] == "1"
@@ -4492,7 +4529,9 @@ def make_handler(workspace, jobs):
                     source="manual"))
                 # 选择接口也遵守路径边界；前端刷新 episode 获取完整候选组。
                 selected_uri = str(result.pop("selected_uri", "") or "")
-                result["selected_url"] = _artifact_url(app, selected_uri)
+                result["selected_url"] = (
+                    _artifact_url(app, selected_uri)
+                    or result.get("selected_url"))
                 result["source"] = "manual"
                 return result
 
@@ -4602,6 +4641,16 @@ def make_handler(workspace, jobs):
             if found is None:
                 return self._error(404, "剧集不存在")
             title, number = found
+            if (target.get("kind") == "shot"
+                    and self._with_app(_selection_mode_enabled)):
+                return self._error(
+                    409,
+                    "创作选片模式下禁止使用旧的单镜头重画接口；"
+                    "请在本镜候选区修改完整提示词，并调用 "
+                    "/api/shot-candidates/regenerate 携带当前候选组的 "
+                    "candidate_set_id、candidate_set_token、"
+                    "candidate_revision 和 contract_revision，整组重新生成4张。"
+                    "只有 /api/shot-candidates/select 可把其中1张晋升为正式图")
             # 整集生产时并行 worker 正在改整份 render_plan,改单张不安全,
             # 仍要求先暂停。但"另一张图正在重画"不该拦住这一张——排队即可,
             # 否则用户改完一张必须盯着等它跑完才能提交下一张。
@@ -4664,17 +4713,9 @@ def make_handler(workspace, jobs):
                 set_defaults(app.workspace.config_path, updates)
                 # app.config 在写入前加载;重读文件回显持久化后的真实现状
                 fresh = Config.load(app.workspace.config_path)
-                return {
-                    "ok": True,
-                    "selection_mode": bool(fresh.get(
-                        "defaults", "selection_mode", default=True)),
-                    "image_content_qc": bool(fresh.get(
-                        "defaults", "image_content_qc", default=True)),
-                    "video_content_qc": bool(fresh.get(
-                        "defaults", "video_content_qc", default=True)),
-                    "shot_candidate_count": int(fresh.get(
-                        "defaults", "shot_candidate_count", default=4)),
-                }
+                result = _selection_mode_payload_from_config(fresh)
+                result["ok"] = True
+                return result
             try:
                 return self._json(self._with_app(task))
             except AifosError as exc:

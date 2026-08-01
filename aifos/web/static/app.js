@@ -3750,10 +3750,15 @@ function shotCandidateUrl(candidate) {
 function shotCandidates(item) {
   const group = shotCandidateGroup(item);
   if (!group) return [];
-  return (group.candidates || []).filter((candidate) =>
-    candidate && shotCandidateUrl(candidate)).sort((left, right) =>
-      Number(left.candidate_index || left.index || 0)
-      - Number(right.candidate_index || right.index || 0)).slice(0, 4);
+  const seen = new Set();
+  return (group.candidates || []).filter((candidate) => {
+    const index = shotCandidateIndex(candidate);
+    if (!candidate || !shotCandidateUrl(candidate)
+        || index < 1 || index > 4 || seen.has(index)) return false;
+    seen.add(index);
+    return true;
+  }).sort((left, right) =>
+    shotCandidateIndex(left) - shotCandidateIndex(right));
 }
 
 function shotCandidateIndex(candidate) {
@@ -3772,14 +3777,17 @@ function shotCandidateSelected(group, candidate) {
   if (selectedIndex && currentToken && selectedToken)
     return currentToken === selectedToken
       && shotCandidateIndex(candidate) === selectedIndex;
-  return String(selection.selected_uri || "") === shotCandidateUrl(candidate);
+  return String(selection.selected_uri || selection.selected_url || "")
+    === shotCandidateUrl(candidate);
 }
 
 function shotCandidateState(item) {
   const group = shotCandidateGroup(item);
   if (!group) return null;
   const candidates = shotCandidates(item);
-  const expected = Math.max(4, Number(group.expected_count || 4));
+  // 当前产品合同固定四候选；服务端即便遇到旧/损坏计数也钳制为4，
+  // 前端同样不能因为脏字段扩成5格或缩成3格。
+  const expected = 4;
   const missing = Math.max(0, expected - candidates.length);
   const technicalIncomplete = group.technical_incomplete === true
     || item.status === "technical_incomplete" || missing > 0;
@@ -3854,6 +3862,11 @@ function shotCandidateGridHtml(item, editable) {
     shotCandidateSelected(group, candidate));
   const errors = (group.candidate_errors || []).map((row) =>
     `候选${row.candidate_index || "?"}：${row.error || "技术生成失败"}`);
+  const byIndex = new Map(candidates.map((candidate) =>
+    [shotCandidateIndex(candidate), candidate]));
+  const slots = [1, 2, 3, 4].map((index) => ({
+    index, candidate: byIndex.get(index) || null,
+  }));
   return `<section class="shot-candidate-panel" aria-label="本镜4张候选">
     <div class="shot-candidate-head"><div><b>本镜4张候选</b>
       <span>${selected ? `已选候选 ${shotCandidateIndex(selected)} 为正式关键帧；4张均保留回看`
@@ -3863,8 +3876,13 @@ function shotCandidateGridHtml(item, editable) {
         ${technicalIncomplete ? `缺 ${missing || Math.max(1, expected - candidates.length)} 张 · 暂不可选`
           : (selected ? "正式图已选" : "待人工选片")}</span></div>
     ${errors.length ? `<div class="shot-candidate-technical-error">${esc(errors.join("；"))}</div>` : ""}
-    <div class="shot-candidate-grid">${candidates.map((candidate) => {
-      const index = shotCandidateIndex(candidate);
+    <div class="shot-candidate-grid">${slots.map(({ index, candidate }) => {
+      if (!candidate) return `<article class="shot-candidate missing"
+        aria-label="候选 ${index} 尚未生成">
+        <div class="shot-candidate-image plan-thumb-empty" aria-hidden="true">🖼</div>
+        <div class="shot-candidate-foot"><span>候选 ${index}</span>
+          <button type="button" disabled>等待技术补齐</button></div>
+      </article>`;
       const isSelected = shotCandidateSelected(group, candidate);
       const url = shotCandidateUrl(candidate);
       return `<article class="shot-candidate${isSelected ? " selected" : ""}">

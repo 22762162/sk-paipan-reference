@@ -10,7 +10,12 @@ import pytest
 from aifos.app import App
 from aifos.director import Director
 from aifos.errors import AifosError
-from aifos.web.server import PRODUCTION_ACTIONS, serve
+from aifos.web.server import (
+    PRODUCTION_ACTIONS,
+    _candidate_group_current_selection,
+    _sanitize_candidate_group_urls,
+    serve,
+)
 
 
 @pytest.fixture()
@@ -176,6 +181,41 @@ def test_select_is_manual_idempotent_and_resumes_only_once(
     assert sum(job.get("action") == "image_selection_resume"
                for job in jobs) == 1
     assert "image_selection_resume" in PRODUCTION_ACTIONS
+    assert "regenerate_shot_candidates" in PRODUCTION_ACTIONS
+
+
+def test_selection_mode_rejects_legacy_single_shot_regen(
+        server, monkeypatch):
+    calls = []
+
+    def legacy_regen(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"status": "done"}
+
+    monkeypatch.setattr(Director, "regen_image", legacy_regen)
+    status, result = _request(server, "POST", "/api/regen_image", {
+        "episode_id": server["episode_id"],
+        "target": {"kind": "shot", "shot_no": 1},
+        "prompt": "旧接口不应生成单张正式图",
+    })
+
+    assert status == 409
+    assert "/api/shot-candidates/regenerate" in result["error"]
+    assert "/api/shot-candidates/select" in result["error"]
+    assert "整组重新生成4张" in result["error"]
+    assert calls == []
+
+    status, setting = _request(
+        server, "POST", "/api/selection-mode", {"enabled": False})
+    assert status == 200 and setting["selection_mode"] is False
+    status, queued = _request(server, "POST", "/api/regen_image", {
+        "episode_id": server["episode_id"],
+        "target": {"kind": "shot", "shot_no": 1},
+        "prompt": "关闭选片模式后保留旧接口兼容",
+    })
+    assert status == 202
+    assert _wait_job(server, queued["job_id"])["status"] == "done"
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("marker", [
@@ -355,3 +395,42 @@ def test_episode_candidate_urls_are_sanitized_and_progress_uses_selection(
     assert shots["regenerating_candidates"] == 1
     assert shots["awaiting_review"] >= 1
     assert shots["needs_repair"] >= 1
+
+
+def test_candidate_selection_and_sanitizer_accept_url_only_payload(server):
+    """刷新后的浏览器数据只有 URL，也必须保持选择态，不能误判为未选。"""
+    app = App(server["workspace"])
+    try:
+        remote = "https://cdn.example/candidate-2.png"
+        candidates = [{
+            "candidate_id": f"token-url#{index}",
+            "candidate_index": index,
+            "candidate_set_token": "token-url",
+            "url": (remote if index == 2
+                    else f"https://cdn.example/candidate-{index}.png"),
+        } for index in range(1, 5)]
+        item = {"candidate_group": {
+            "complete": True,
+            "technical_incomplete": False,
+            "candidate_set_id": "set-url",
+            "candidate_set_token": "token-url",
+            "candidate_revision": 1,
+            "candidates": candidates,
+            "selection": {
+                "candidate_set_id": "set-url",
+                "candidate_set_token": "token-url",
+                "candidate_revision": 1,
+                "candidate_id": "token-url#2",
+                "candidate_index": 2,
+                "selected_url": remote,
+                "source": "manual",
+            },
+        }}
+
+        selection = _candidate_group_current_selection(item)
+        assert selection is not None
+        _sanitize_candidate_group_urls(app, item)
+        assert item["candidate_group"]["selection"]["selected_url"] == remote
+        assert item["candidate_group"]["candidates"][1]["url"] == remote
+    finally:
+        app.close()

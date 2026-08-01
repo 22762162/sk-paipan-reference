@@ -433,6 +433,26 @@ def test_selection_mode_web_endpoints(tmp_path):
         assert view == {"selection_mode": True, "image_content_qc": True,
                         "video_content_qc": True, "shot_candidate_count": 4}
 
+        # 兼容手工写入的旧布尔字符串，并钳制损坏的候选数回显；UI 不得
+        # 把字符串 "false" 当真，也不能展示 Director 不会执行的 99 张。
+        config_path = ws / "config.json"
+        raw = (json.loads(config_path.read_text(encoding="utf-8"))
+               if config_path.exists() else {})
+        raw.setdefault("defaults", {}).update({
+            "selection_mode": "false",
+            "shot_candidate_count": 99,
+        })
+        config_path.write_text(
+            json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        status, view = call("GET", "/api/selection-mode")
+        assert status == 200
+        assert view["selection_mode"] is False
+        assert view["shot_candidate_count"] == 4
+        status, settings = call("GET", "/api/settings")
+        assert status == 200
+        assert settings["defaults"]["selection_mode"] is False
+        assert settings["defaults"]["shot_candidate_count"] == 4
+
         status, view = call("POST", "/api/selection-mode", {"enabled": False})
         assert status == 200 and view["ok"] and view["selection_mode"] is False
 
