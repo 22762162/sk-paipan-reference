@@ -105,6 +105,63 @@ def test_image_capability(tmp_path, fake_codex):
     assert Path(reply["uri"]).exists()
 
 
+def test_repair_static_contract_is_final_provider_prompt(tmp_path, fake_codex):
+    """返工短合同后不得再回灌旧文字、动作或镜头字段。"""
+    out = tmp_path / "out"
+    new_prompt = (
+        "【返工静态合同v1】\n"
+        "【当前相位】终点；只生成一张静态画面。\n"
+        "【唯一画面】NEW_UNIQUE_FRAME；手机隐藏，不显示任何文字。\n"
+        "【人数】画面严格共2人。"
+    )
+    identity = tmp_path / "identity.png"
+    identity.write_bytes(b"reference")
+    reply = _bridge({
+        "capability": "image",
+        "payload": {
+            "shot_no": 2,
+            "prompt": new_prompt,
+            "prompt_compact": new_prompt,
+            "_repair_static_contract_replaced": True,
+            "prompt_contract_complete": True,
+            "characters": ["甲"],
+            "functional_figures": [{
+                "name": "乙", "count": 1,
+                "state": "OLD_ACTION_SENTINEL",
+            }],
+            "visible_figure_count": 5,
+            "camera": "OLD_CAMERA_SENTINEL",
+            "readable_text": {
+                "carrier": "OLD_TEXT_CARRIER_SENTINEL电脑屏幕",
+                "whitelist": ["OLD_SCREEN_TEXT_SENTINEL"],
+            },
+            "feedback": "OLD_FEEDBACK_SENTINEL",
+            "reference_manifest": [{
+                "index": 1,
+                "role": "identity",
+                "label": "身份参考",
+                "binding": "REFERENCE_IDENTITY_DUTY_SENTINEL",
+                "uri": str(identity),
+            }],
+        },
+        "out_dir": str(out),
+    }, fake_codex)
+    assert reply["ok"], reply
+
+    argv_log = fake_codex.parent / "codex_argv.jsonl"
+    args = json.loads(argv_log.read_text(encoding="utf-8").splitlines()[-1])
+    instruction = args[-1]
+    assert "【返工静态合同v1】" in instruction
+    assert "NEW_UNIQUE_FRAME" in instruction
+    assert "REFERENCE_IDENTITY_DUTY_SENTINEL" in instruction
+    assert str(identity) in instruction
+    for stale in (
+            "OLD_ACTION_SENTINEL", "OLD_CAMERA_SENTINEL",
+            "OLD_TEXT_CARRIER_SENTINEL", "OLD_SCREEN_TEXT_SENTINEL",
+            "OLD_FEEDBACK_SENTINEL", "【屏幕/页面文字硬锁】"):
+        assert stale not in instruction
+
+
 def test_existing_target_must_be_updated_by_current_codex_call(tmp_path):
     binary = tmp_path / "bin" / "codex-noop"
     binary.parent.mkdir(parents=True)

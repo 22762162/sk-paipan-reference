@@ -7227,10 +7227,13 @@ class Director:
                 remaining = max(0, remaining - count)
             if count <= 0:
                 continue
-            # The last row is normally the requested freeze/end state.  Keep
-            # its useful role label, but never the preceding temporal copies.
+            # 返工短合同里的【唯一画面】已经声明当前相位状态。功能人物
+            # 这里只保留姓名与数量供人数核验；任何旧 state/function 都
+            # 可能经 provider 适配层重新拼回最终提示词。
             chosen = copy.deepcopy(rows[-1])
             chosen["count"] = count
+            chosen["state"] = ""
+            chosen["function"] = ""
             normalized_functional.append(chosen)
 
         if explicit_total is None:
@@ -7293,6 +7296,8 @@ class Director:
             "prompt_aifos_original": static_prompt,
             "feedback": "",
             "action": executable,
+            "camera": "",
+            "readable_text": {},
             "characters": characters,
             "character_count": len(characters),
             "functional_figures": normalized_functional,
@@ -7300,6 +7305,7 @@ class Director:
             "frame_target": {"phase": phase, "state": executable},
             "prompt_contract_complete": True,
             "_repair_static_contract_replaced": True,
+            "reference_manifest": manifest,
         })
         repaired.pop("prompt_review", None)
         repaired.pop("prompt_review_feedback_applied", None)
@@ -7336,13 +7342,9 @@ class Director:
             "reference_manifest": manifest,
         }
 
-        # A hidden/locked carrier must not keep the old readable-text gate.
-        hidden_text = any(token in executable for token in (
-            "不显示任何时间", "不显示文字", "无可读文字", "完全隐藏",
-            "锁屏并", "屏幕不可见"))
-        if hidden_text:
-            repaired["readable_text"] = {}
-            revised_qc["readable_text"] = {}
+        # 精确文字要求已经包含在新的【唯一画面】中。旧 readable_text
+        # 往往描述的是 start/中间相位，不能再进入生成或 QC 白名单。
+        revised_qc["readable_text"] = {}
 
         composition = copy.deepcopy(
             repaired.get("composition_contract") or {})

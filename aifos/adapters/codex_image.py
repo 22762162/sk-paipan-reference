@@ -372,10 +372,11 @@ def build_instruction(capability, payload, out_dir):
     height = int(payload.get("height", 1920))
     size = f"{width}x{height},画幅 {payload.get('aspect', '9:16')}"
     feedback = payload.get("feedback", "")
+    repair_static = bool(payload.get("_repair_static_contract_replaced"))
     # 镜头类请求优先使用导演编译的短合同；完整 prompt 仍随 payload
     # 保存，供审计和人工复核，不让它重复占用模型的注意力。
     prompt_text = payload.get("prompt_compact") or payload.get("prompt", "")
-    if feedback:
+    if feedback and not repair_static:
         prompt_text = f"{prompt_text}。修改意见(必须落实):{feedback}"
     # A complete visual contract already carries style/composition/background.
     # Keep only universal safety and execution rules instead of repeating the
@@ -448,6 +449,19 @@ def build_instruction(capability, payload, out_dir):
             return instruction, [target], {"name": payload.get("art_name")}
         shot_no = int(payload["shot_no"])
         target = out_dir / f"shot_{shot_no:03d}.keyframe.png"
+        # 返工静态合同是一次“替换”而不是给旧合同追加修订。它已经把
+        # 当前相位、人数、文字、镜位和动作写成唯一可执行事实；这里若再
+        # 从 payload 的历史 readable_text/camera/functional_figures 拼接
+        # 通用后缀，就会把刚删除的冲突重新送进真正的 Codex CLI 指令。
+        # 参考图职责与调用 imagegen 的传输指令仍保留。
+        if repair_static:
+            instruction = (
+                f"为漫剧分镜生成一张关键图并保存到 {target}"
+                f"(PNG,{size})。画面内容:{prompt_text}。"
+                f"{_ref_line(payload, prompt_text)}{GEN_DIRECTIVE}"
+                "只产出该文件,不要改动其他文件。"
+            )
+            return instruction, [target], {"shot_no": shot_no}
         text_asset = payload.get("readable_text") or {}
         text_rule = (
             f"画面文字载体:{text_asset.get('carrier', '')};只允许逐字出现:"

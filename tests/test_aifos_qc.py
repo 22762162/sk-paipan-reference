@@ -655,7 +655,8 @@ def test_three_draw_repair_replaces_conflicting_old_static_contract(
         assert repair_payload["visible_figure_count"] == 2
         assert repair_payload["functional_figures"] == [{
             "name": "小吴", "count": 1,
-            "state": "站在驾驶侧车外完成递交"}]
+            "state": "", "function": ""}]
+        assert repair_payload["camera"] == ""
         assert repair_payload["readable_text"] == {}
         assert repair_payload["prompt_review_context"][
             "visible_figure_count"] == 2
