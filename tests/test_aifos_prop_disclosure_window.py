@@ -145,7 +145,9 @@ def test_repair_shots_sends_only_broken_shots_and_merges():
 
     def fake_chat(messages):
         sent["payload"] = messages[-1]["content"]
-        return ('{"shots":[{"_position":2,"shot_no":2,"fixed":true}]}')
+        return ('{"shots":[{"_position":2,"shot_no":2,'
+                '"frame_props":[{"prop_id":"prop_x","phase":"start",'
+                '"representation":"physical","fixed":true}]}]}')
 
     provider._chat = fake_chat
     provider._postprocess = lambda capability, value: value
@@ -159,7 +161,16 @@ def test_repair_shots_sends_only_broken_shots_and_merges():
     merged, note = provider._repair_shots(
         {}, data, "镜头2.frame_props[1] 在首次可披露事件之前出现")
 
-    assert merged["shots"][1] == {"shot_no": 2, "fixed": True}
+    assert merged["shots"][1] == {
+        "shot_no": 2,
+        "keep": "b",
+        "frame_props": [{
+            "prop_id": "prop_x",
+            "phase": "start",
+            "representation": "physical",
+            "fixed": True,
+        }],
+    }
     # 未点名的镜头一字不动。
     assert merged["shots"][0] == {"shot_no": 1, "keep": "a"}
     assert merged["shots"][2] == {"shot_no": 3, "keep": "c"}

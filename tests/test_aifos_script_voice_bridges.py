@@ -232,9 +232,9 @@ def test_storyboard_repair_targets_only_reported_shots_and_merges():
     merged = _merge_storyboard_shot_repairs(
         source, repaired, positions=[1, 6])
     assert merged["shots"][0] == {
-        "shot_no": 1, "fixed": True}
+        "shot_no": 1, "keep": "source-1", "fixed": True}
     assert merged["shots"][5] == {
-        "shot_no": 6, "fixed": True}
+        "shot_no": 6, "keep": "source-6", "fixed": True}
     assert merged["shots"][1] == {
         "shot_no": 2, "keep": "source-2"}
     assert source["shots"][0]["keep"] == "source-1"

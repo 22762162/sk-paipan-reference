@@ -368,6 +368,87 @@ def test_long_take_policy_folds_setup_and_reaction_into_dialogue_shots():
     assert not any(shot.get("kind") in ("reaction", "beat") for shot in shots)
 
 
+def test_long_take_prop_timeline_canonicalizes_only_static_wording_drift():
+    from aifos.workflow import _compose_prop_timeline
+
+    def row(state, location):
+        return {
+            "prop_id": "phone",
+            "phase": "freeze",
+            "physical_state": state,
+            "holder": "虞寻歌双手",
+            "location": location,
+            "support": "双手掌与手指",
+            "visibility": "visible",
+            "representation": "physical",
+        }
+
+    rows, transitions = _compose_prop_timeline(
+        {"frame_props": [row("同一深蓝金属玻璃手机，完整", "沙发上胸腹前")]},
+        {"frame_props": [row(
+            "同一深蓝金属玻璃手机完整，透明旧壳不变", "沙发胸腹前")]},
+    )
+
+    start = next(item for item in rows if item["phase"] == "start")
+    end = next(item for item in rows if item["phase"] == "end")
+    assert start["physical_state"] == end["physical_state"]
+    assert start["location"] == end["location"]
+    assert transitions == []
+
+
+def test_long_take_prop_timeline_does_not_hide_real_unsupported_change():
+    from aifos.workflow import _compose_prop_timeline
+
+    base = {
+        "prop_id": "letter",
+        "phase": "freeze",
+        "support": "书案",
+        "visibility": "visible",
+        "representation": "physical",
+    }
+    rows, transitions = _compose_prop_timeline(
+        {"frame_props": [{
+            **base, "physical_state": "完好合拢", "holder": "none",
+            "location": "书案中央"}]},
+        {"frame_props": [{
+            **base, "physical_state": "已打开", "holder": "陆沉",
+            "location": "陆沉手中"}]},
+    )
+
+    start = next(item for item in rows if item["phase"] == "start")
+    end = next(item for item in rows if item["phase"] == "end")
+    assert start["physical_state"] != end["physical_state"]
+    assert start["holder"] != end["holder"]
+    assert transitions == []
+
+
+def test_static_wording_equivalence_rejects_hidden_changes_before_not_changed():
+    from aifos.workflow import _folded_static_prop_rows_equivalent
+
+    def row(state):
+        return {
+            "physical_state": state,
+            "holder": "虞寻歌双手",
+            "location": "沙发胸腹前",
+            "support": "双手掌与手指",
+            "visibility": "visible",
+            "representation": "physical",
+        }
+
+    cases = [
+        ("手机完整", "手机完整，屏幕变黑但外壳不变"),
+        ("白酒瓶完整", "白酒瓶完整，酒液变浑浊但瓶身不变"),
+        ("手机完整", "手机完整，电量耗尽但外壳保持不变"),
+        ("手机完整", "手机完整，屏幕黑，外壳不变"),
+        ("白酒瓶完整", "白酒瓶完整，酒液浑浊，瓶身不变"),
+        ("手机完整", "手机完整，电量零，外壳不变"),
+    ]
+
+    for before, after in cases:
+        assert not _folded_static_prop_rows_equivalent(
+            row(before), row(after))
+
+
 def test_saved_dead_actor_beat_is_retargeted_without_changing_shot_number():
     from aifos.workflow import repair_storyboard_appearance_continuity
 

@@ -133,11 +133,11 @@ from .video_media_qc import (
     probe_video,
 )
 from .story_logic import (
-    PROP_CONTRACT_SCHEMA,
     audit_prop_contract,
     audit_storyboard_prop_contract,
     normalize_prop_contract,
     normalize_storyboard_frame_phase_pairs,
+    reconcile_storyboard_prop_registry,
 )
 from .style_director import compile_director_style
 from .script_import import sanitize_script_entities
@@ -13060,8 +13060,13 @@ class Director:
                 shot.get("prop_transitions") or []),
         }]}
         normalize_storyboard_frame_phase_pairs(normalized)
+        audited_storyboard = copy.deepcopy(ctx.get("storyboard") or {})
+        reconcile_storyboard_prop_registry(
+            audited_storyboard, copy.deepcopy(ctx.get("script") or {}))
         return {
-            "prop_registry": self._prop_registry(ctx.get("script") or {}),
+            "prop_registry": (
+                self._prop_registry(audited_storyboard)
+                or self._prop_registry(ctx.get("script") or {})),
             "frame_props": normalized["shots"][0]["frame_props"],
             "prop_transitions": normalized["shots"][0]["prop_transitions"],
         }
@@ -13122,9 +13127,7 @@ class Director:
                     f"镜头{position}.scene_event_id 与剧本 scene_no="
                     f"{scene_no} 的稳定事件不一致：{actual} != {expected}")
 
-        storyboard["prop_contract_schema"] = PROP_CONTRACT_SCHEMA
-        storyboard["prop_registry"] = copy.deepcopy(
-            script.get("prop_registry") or [])
+        reconcile_storyboard_prop_registry(storyboard, script)
         report = audit_storyboard_prop_contract(storyboard)
         issues.extend(report.get("issues") or [])
         issues = list(dict.fromkeys(issues))

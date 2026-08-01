@@ -41,7 +41,8 @@ from ..story_logic import (
     audit_storyboard_prop_contract,
     normalize_prop_contract,
     normalize_script_logic,
-    normalize_storyboard_frame_phase_pairs,
+    normalize_storyboard_contract,
+    reconcile_storyboard_prop_registry,
 )
 from ..story_analysis import (
     STORY_ANALYSIS_SCHEMA,
@@ -330,7 +331,8 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
   三种静态用途；每项只含一个 phase(start/end/freeze) 和一个可见、可拍、
   无时间过程的 state，并明确 fallback:false。人物镜可引用已经写清的起止状态，
   空镜也必须写场景、光线、陈设和环境变化完成后的唯一静态结果；禁止把“走过去、
-  拿起来、从躺到坐”等动作过程直接当静态定格；
+  拿起来、从躺到坐”等动作过程直接当静态定格；setup/main/settle 只属于
+  temporal_beats，绝不能填进 frame_targets 或 frame_props；
 - prompt 只含本镜头真正可见且会影响生成的世界状态、场景、准确人物名单、主体动作、
   光影、机位与结尾状态；不得复制整集前情、其他镜头、人物传记或无关道具；
 - 保留剧本 `prop_registry` 的 prop_id、名称、实例身份和场次生命周期边界；
@@ -341,7 +343,9 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
   每项必须写 prop_id、phase(start/end/freeze)、physical_state、holder、location、
   support、visibility(visible/occluded/hidden/absent) 和
   representation(physical/reflection/screen/painting/overlay)。反射、屏幕、画中画
-  和叠层都算剧情披露，但不算第二件物理实例；hidden/absent 不得偷画成背景露角;
+  和叠层都算剧情披露，但不算第二件物理实例；hidden/absent 不得偷画成背景露角；
+  availability_start_event 必须精确等于同场最早一条 visible/occluded 的
+  frame_props 所在 event_id 与 phase，不得晚于画面实际首次出现；
 - 同一道具在 start/end 的持有人、位置、支撑、可见性、呈现方式或物理状态发生
   变化时，必须输出 `prop_transitions`，写明 prop_id、from_phase、to_phase 和
   唯一可见 action。静态 freeze 不写跨时间动作；同一 phase 的 physical 实体数
@@ -1073,16 +1077,16 @@ def validate_storyboard(storyboard):
     if not isinstance(storyboard["shots"], list):
         return "shots 需为数组"
     normalize_prop_contract(storyboard)
-    # 本地就地修:道具时间线缺失端(start/end 不成对、仅 freeze)按
-    # "该镜内无状态变化"克隆回填,不为几行显式条目丢弃整份分镜。
-    normalize_storyboard_frame_phase_pairs(storyboard)
+    # 本地就地修:静态帧相位别名、缺失 transition 和 start/end 不成对
+    # 都由确定性合同规范化处理;同场披露点已在带源剧本的后处理阶段校准。
+    normalize_storyboard_contract(storyboard)
     prop_registry_report = audit_prop_contract(storyboard)
     if not prop_registry_report["passed"]:
         return "分镜 prop_registry 无效: " + "；".join(
             prop_registry_report["issues"])
     for shot_position, shot in enumerate(storyboard["shots"], 1):
         if not isinstance(shot, dict):
-            return f"镜头需为对象,收到: {str(shot)[:80]}"
+            return f"镜头{shot_position}需为对象,收到: {str(shot)[:80]}"
         shot.setdefault(
             "event_id",
             str(shot.get("unit_id") or f"shot:{shot_position}"))
@@ -1091,14 +1095,15 @@ def validate_storyboard(storyboard):
             f"scene:{shot.get('scene_no')}")
         for field in ("scene_no", "duration", "prompt"):
             if field not in shot:
-                return f"镜头缺少字段 {field}: {shot}"
+                return f"镜头{shot_position}缺少字段 {field}: {shot}"
         try:
             shot["duration"] = float(shot["duration"])
         except (TypeError, ValueError):
-            return f"镜头时长非法: {shot}"
+            return f"镜头{shot_position}时长非法: {shot}"
         duration = shot["duration"]
         if duration <= 0 or duration > 15:
-            return f"镜头时长必须大于0且不超过 Seedance 2.0 的15秒上限: {shot}"
+            return (f"镜头{shot_position}时长必须大于0且不超过 "
+                    f"Seedance 2.0 的15秒上限: {shot}")
         if (duration < 4 or (
                 duration < 8
                 and not str(shot.get(
@@ -1132,44 +1137,51 @@ def validate_storyboard(storyboard):
         cursor = 0.0
         for phase, beat in zip(expected_phases, temporal):
             if not isinstance(beat, dict) or beat.get("phase") != phase:
-                return f"镜头 temporal_beats 必须依次为setup/main/settle: {shot}"
+                return (f"镜头{shot_position} temporal_beats 必须依次为"
+                        f"setup/main/settle: {shot}")
             try:
                 start = float(beat.get("start_seconds"))
                 end = float(beat.get("end_seconds"))
             except (TypeError, ValueError):
-                return f"镜头 temporal_beats 时间非法: {shot}"
+                return f"镜头{shot_position} temporal_beats 时间非法: {shot}"
             if abs(start - cursor) > 1e-7 or end <= start:
-                return f"镜头 temporal_beats 必须连续覆盖且不重叠: {shot}"
+                return (f"镜头{shot_position} temporal_beats 必须连续覆盖"
+                        f"且不重叠: {shot}")
             if not str(beat.get("action") or "").strip():
-                return f"镜头 temporal_beats.action 不能为空: {shot}"
+                return (f"镜头{shot_position} temporal_beats.action "
+                        f"不能为空: {shot}")
             cursor = end
         if abs(cursor - duration) > 1e-7:
-            return f"镜头 temporal_beats 必须完整覆盖duration: {shot}"
+            return (f"镜头{shot_position} temporal_beats 必须完整覆盖"
+                    f"duration: {shot}")
         characters = shot.setdefault("characters", [])
         if not isinstance(characters, list):
-            return f"镜头 characters 需为数组: {shot}"
+            return f"镜头{shot_position} characters 需为数组: {shot}"
         shot["characters"] = list(dict.fromkeys(
             str(name).strip() for name in characters
             if str(name).strip()))
         functional_figures = shot.setdefault("functional_figures", [])
         if not isinstance(functional_figures, list):
-            return f"镜头 functional_figures 需为数组: {shot}"
+            return f"镜头{shot_position} functional_figures 需为数组: {shot}"
         normalized_figures = []
         fuzzy_counts = ("几名", "数名", "一群", "多人", "若干")
         for figure in functional_figures:
             if not isinstance(figure, dict):
-                return f"功能人物需为对象: {figure}"
+                return f"镜头{shot_position}功能人物需为对象: {figure}"
             label = str(
                 figure.get("name") or figure.get("label") or "").strip()
             if not label:
-                return f"功能人物缺少 name/label: {figure}"
+                return (f"镜头{shot_position}功能人物缺少 name/label: "
+                        f"{figure}")
             count = figure.get("count")
             if type(count) is not int or count <= 0:
-                return f"功能人物 count 必须为精确正整数: {figure}"
+                return (f"镜头{shot_position}功能人物 count 必须为精确"
+                        f"正整数: {figure}")
             wording = " ".join(str(figure.get(key) or "") for key in (
                 "name", "label", "state", "function"))
             if any(token in wording for token in fuzzy_counts):
-                return f"功能人物禁止模糊数量词，必须使用精确 count: {figure}"
+                return (f"镜头{shot_position}功能人物禁止模糊数量词，"
+                        f"必须使用精确 count: {figure}")
             normalized = dict(figure)
             normalized["count"] = count
             normalized_figures.append(normalized)
@@ -1183,17 +1195,19 @@ def validate_storyboard(storyboard):
         shot.setdefault("camera", "")
         style_direction = shot.setdefault("style_direction", {})
         if not isinstance(style_direction, dict):
-            return f"镜头 style_direction 需为对象: {shot}"
+            return f"镜头{shot_position} style_direction 需为对象: {shot}"
         if style_direction:
             if style_direction.get("schema") not in (
                     None, "", "firefire.director-style/v1"):
-                return f"镜头 style_direction.schema 非法: {shot}"
+                return (f"镜头{shot_position} style_direction.schema "
+                        f"非法: {shot}")
             style_direction["schema"] = "firefire.director-style/v1"
             style_direction["shot_pattern"] = str(
                 style_direction.get("shot_pattern") or "").strip()
             effects = style_direction.get("visual_effects") or []
             if not isinstance(effects, list):
-                return f"镜头 style_direction.visual_effects 需为数组: {shot}"
+                return (f"镜头{shot_position} style_direction.visual_effects "
+                        f"需为数组: {shot}")
             style_direction["visual_effects"] = list(dict.fromkeys(
                 str(item).strip() for item in effects if str(item).strip()))
             style_direction["selection_reason"] = str(
@@ -1205,30 +1219,33 @@ def validate_storyboard(storyboard):
         shot.setdefault("readable_text", None)
         frame_targets = shot.get("frame_targets")
         if not isinstance(frame_targets, dict):
-            return f"镜头缺少显式 frame_targets: {shot}"
+            return f"镜头{shot_position}缺少显式 frame_targets: {shot}"
         for target_name, expected_phase in (
                 ("keyframe", {"start", "end", "freeze"}),
                 ("first_frame", {"start", "freeze"}),
                 ("last_frame", {"end", "freeze"})):
             target = frame_targets.get(target_name)
             if not isinstance(target, dict):
-                return f"镜头 frame_targets.{target_name} 必须是对象: {shot}"
+                return (f"镜头{shot_position} frame_targets.{target_name} "
+                        f"必须是对象: {shot}")
             phase = str(target.get("phase") or "").strip().lower()
             if phase not in expected_phase:
                 return (
-                    f"镜头 frame_targets.{target_name}.phase 非法: "
+                    f"镜头{shot_position} frame_targets.{target_name}.phase 非法: "
                     f"{phase or '空'}")
             target_state = target.get("state")
             if (_missing(target_state)
                     or (isinstance(target_state, (dict, list))
                         and not target_state)):
-                return f"镜头 frame_targets.{target_name}.state 不能为空"
+                return (f"镜头{shot_position} frame_targets.{target_name}.state "
+                        "不能为空")
             if target.get("fallback") is not False:
                 return (
-                    f"镜头 frame_targets.{target_name}.fallback 必须明确为 false")
+                    f"镜头{shot_position} frame_targets.{target_name}.fallback "
+                    "必须明确为 false")
         frame_props = shot.setdefault("frame_props", [])
         if not isinstance(frame_props, list):
-            return f"镜头 frame_props 需为数组: {shot}"
+            return f"镜头{shot_position} frame_props 需为数组: {shot}"
         for frame_prop in frame_props:
             if not isinstance(frame_prop, dict):
                 continue
@@ -1239,7 +1256,7 @@ def validate_storyboard(storyboard):
                     frame_prop.get(field) or "").strip().lower()
         transitions = shot.setdefault("prop_transitions", [])
         if not isinstance(transitions, list):
-            return f"镜头 prop_transitions 需为数组: {shot}"
+            return f"镜头{shot_position} prop_transitions 需为数组: {shot}"
         for transition in transitions:
             if not isinstance(transition, dict):
                 continue
@@ -2809,65 +2826,12 @@ def _postprocess_and_validate(capability, payload, data):
             and isinstance(data.get("scenes"), list)):
         sanitize_script_entities(data)
     if capability == "storyboard" and isinstance(data, dict):
-        # The script registry is authoritative. The storyboard model may assign
-        # frame-local states and refine a scene boundary to one exact shot in
-        # that same scene, but it may not rename, delete, duplicate or move a
-        # tracked prop lifecycle into another scene.
         source_script = json.loads(json.dumps(
             payload.get("script") or {}, ensure_ascii=False))
-        normalize_prop_contract(source_script)
-        scene_events = {
-            str(scene.get("scene_no")): str(
-                scene.get("event_id") or f"scene:{scene.get('scene_no')}")
-            for scene in source_script.get("scenes") or []
-            if isinstance(scene, dict) and scene.get("scene_no") is not None
-        }
-        for shot in data.get("shots") or []:
-            if not isinstance(shot, dict):
-                continue
-            scene_no = str(shot.get("scene_no"))
-            shot["scene_event_id"] = scene_events.get(
-                scene_no, f"scene:{scene_no}")
-        shot_event_scenes = {
-            str(shot.get("event_id")): str(shot.get("scene_event_id"))
-            for shot in data.get("shots") or []
-            if isinstance(shot, dict) and shot.get("event_id")
-            and shot.get("scene_event_id")
-        }
-        proposed_registry = {
-            str(item.get("prop_id")): item
-            for item in data.get("prop_registry") or []
-            if isinstance(item, dict) and item.get("prop_id")
-        }
-        refined_registry = []
-        for source_prop in source_script["prop_registry"]:
-            item = json.loads(json.dumps(
-                source_prop, ensure_ascii=False))
-            proposed = proposed_registry.get(str(item.get("prop_id"))) or {}
-            for field, alias in (
-                    ("availability_start_event", "introduced_at"),
-                    ("availability_end_event", "retired_at")):
-                source_ref = item.get(field) or item.get(alias)
-                proposed_ref = proposed.get(field) or proposed.get(alias)
-                if not (isinstance(source_ref, dict)
-                        and isinstance(proposed_ref, dict)):
-                    continue
-                source_event = str(
-                    source_ref.get("event_id") or "").strip()
-                proposed_event = str(
-                    proposed_ref.get("event_id") or "").strip()
-                # An exact shot refinement is valid only inside the source
-                # scene boundary. episode-start/end remain immutable.
-                if (source_event not in {"episode-start", "episode-end"}
-                        and shot_event_scenes.get(proposed_event)
-                        == source_event):
-                    item[field] = json.loads(json.dumps(
-                        proposed_ref, ensure_ascii=False))
-                    item[alias] = json.loads(json.dumps(
-                        proposed_ref, ensure_ascii=False))
-            refined_registry.append(item)
-        data["prop_contract_schema"] = PROP_CONTRACT_SCHEMA
-        data["prop_registry"] = refined_registry
+        # The source registry owns identity and scene membership. Coarse scene
+        # boundaries are refined only from explicit in-scene frame rows; exact
+        # shot/episode facts can never be widened by a model repair.
+        reconcile_storyboard_prop_registry(data, source_script)
     if capability == "scene_annotate":
         error = validate_scene_annotation(data)
     elif capability == "image_qc":
@@ -2920,8 +2884,95 @@ def _storyboard_error_shot_positions(error, shot_count):
     return positions
 
 
-def _merge_storyboard_shot_repairs(data, repaired, positions):
+def _storyboard_error_fields(error):
+    """Return only shot fields explicitly named by a validator error."""
+    text = str(error or "")
+    # Several validators append the complete offending shot after ``: {``.
+    # Never infer permissions from keys merely present in that diagnostic dump.
+    text = re.split(r"(?::|：)\s*\{", text, maxsplit=1)[0]
+    patterns = {
+        "frame_targets": ("frame_targets",),
+        "frame_props": ("frame_props",),
+        "prop_transitions": ("prop_transitions", "start→end"),
+        "temporal_beats": ("temporal_beats",),
+        "duration": ("duration", "镜头时长"),
+        "duration_exception_reason": ("duration_exception_reason",),
+        "functional_figures": ("functional_figures", "功能人物"),
+        "characters": ("characters",),
+        "style_direction": ("style_direction",),
+        "readable_text": ("readable_text",),
+        "start_state": ("start_state",),
+        "end_state": ("end_state",),
+        "physical_logic": ("physical_logic",),
+    }
+    fields = {
+        field for field, cues in patterns.items()
+        if any(cue in text for cue in cues)
+    }
+    if "duration" in fields:
+        fields.update({"duration_exception_reason", "temporal_beats"})
+    return fields
+
+
+def _merge_storyboard_shot_repairs(
+        data, repaired, positions, allowed_fields=None):
     """把模型返回的少量坏镜头合并回原分镜，其余镜头保持不动。"""
+    contract_list_keys = {
+        "frame_props": ("prop_id", "phase", "representation"),
+        "prop_transitions": ("prop_id", "from_phase", "to_phase"),
+    }
+
+    def item_identity(item, identity_fields):
+        if not isinstance(item, dict):
+            return None
+        identity = tuple(
+            str(item.get(field) or "").strip().lower()
+            for field in identity_fields)
+        return identity if all(identity) else None
+
+    def merge_contract_rows(source, patch, identity_fields):
+        """Merge contract rows without permitting a repair to erase rows."""
+        source_rows = source if isinstance(source, list) else []
+        # Empty/non-array model output is never a deletion instruction.
+        # Deletion needs a separate explicit operation, not an overloaded
+        # model-generated replacement array.
+        if not isinstance(patch, list) or not patch:
+            return json.loads(json.dumps(source_rows, ensure_ascii=False))
+        result = json.loads(json.dumps(source_rows, ensure_ascii=False))
+        by_identity = {}
+        for index, row in enumerate(result):
+            identity = item_identity(row, identity_fields)
+            if identity is not None and identity not in by_identity:
+                by_identity[identity] = index
+        for row in patch:
+            identity = item_identity(row, identity_fields)
+            if identity is None:
+                continue
+            if identity in by_identity:
+                index = by_identity[identity]
+                result[index] = merge_fields(result[index], row)
+            else:
+                by_identity[identity] = len(result)
+                result.append(json.loads(json.dumps(
+                    row, ensure_ascii=False)))
+        return result
+
+    def merge_fields(source, patch):
+        result = json.loads(json.dumps(
+            source if isinstance(source, dict) else {}, ensure_ascii=False))
+        for key, value in patch.items():
+            if key in {"_position", "shots"}:
+                continue
+            if key in contract_list_keys:
+                result[key] = merge_contract_rows(
+                    result.get(key), value, contract_list_keys[key])
+            elif isinstance(result.get(key), dict) and isinstance(value, dict):
+                result[key] = merge_fields(result[key], value)
+            else:
+                result[key] = json.loads(json.dumps(
+                    value, ensure_ascii=False))
+        return result
+
     if isinstance(repaired, list):
         rows = repaired
     elif isinstance(repaired, dict) and isinstance(
@@ -2958,13 +3009,36 @@ def _merge_storyboard_shot_repairs(data, repaired, positions):
             continue
         clean = json.loads(json.dumps(row, ensure_ascii=False))
         clean.pop("_position", None)
+        clean.pop("shots", None)
+        if allowed_fields is not None:
+            clean = {
+                key: value for key, value in clean.items()
+                if key in allowed_fields
+            }
+            if not clean:
+                continue
         assigned[position] = clean
     if not assigned:
         return None
     merged = json.loads(json.dumps(data, ensure_ascii=False))
     for position, row in assigned.items():
-        merged["shots"][position - 1] = row
+        source = merged["shots"][position - 1]
+        if not isinstance(source, dict):
+            source = {}
+        merged["shots"][position - 1] = merge_fields(source, row)
     return merged
+
+
+def _merge_storyboard_full_repair(
+        data, repaired, positions=None, allowed_fields=None):
+    """Apply a full-model repair without ever replacing the source shot list."""
+    shots = data.get("shots") if isinstance(data, dict) else None
+    if not isinstance(shots, list) or not shots:
+        return None
+    if positions is None or allowed_fields is None:
+        return None
+    return _merge_storyboard_shot_repairs(
+        data, repaired, positions, allowed_fields=allowed_fields)
 
 
 def _repair_storyboard_shots_with_engine(
@@ -3002,7 +3076,9 @@ def _repair_storyboard_shots_with_engine(
     repaired = extract_json(text)
     if repaired is None:
         return None, "(镜头级就地修复输出中未找到 JSON)"
-    merged = _merge_storyboard_shot_repairs(data, repaired, positions)
+    merged = _merge_storyboard_shot_repairs(
+        data, repaired, positions,
+        allowed_fields=_storyboard_error_fields(error))
     if merged is None:
         return None, "(镜头级就地修复未返回可合并的 shots)"
     fixed, fixed_error = _postprocess_and_validate(
@@ -3050,6 +3126,14 @@ def _repair_with_engine(engine, binary, capability, payload, data, error,
     fixed = extract_json(text)
     if fixed is None:
         return None, "(就地修复输出中未找到 JSON)"
+    if capability == "storyboard":
+        shots = data.get("shots") if isinstance(data, dict) else []
+        positions = _storyboard_error_shot_positions(error, len(shots))
+        fixed = _merge_storyboard_full_repair(
+            data, fixed, positions=positions,
+            allowed_fields=_storyboard_error_fields(error))
+        if fixed is None:
+            return None, "(就地修复输出未返回可安全合并的 shots)"
     fixed, fixed_error = _postprocess_and_validate(capability, payload, fixed)
     if fixed_error:
         return None, f"(就地修复复检仍未通过: {str(fixed_error)[:300]})"

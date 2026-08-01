@@ -41,6 +41,7 @@ from .style_director import (
     normalize_director_knowledge,
     select_shot_direction,
 )
+from .story_logic import reconcile_storyboard_prop_registry
 
 
 PIPELINE_VERSION = "sk-manju-v5"
@@ -1295,6 +1296,63 @@ def _phase_row(shot, prop_id, preferred):
     return None
 
 
+def _folded_static_prop_rows_equivalent(start, end):
+    """Recognize only conservative wording drift for an unchanged prop.
+
+    Long-take folding can join several individually valid freeze-only shots.
+    The first and last descriptions may say ``手机完整`` versus
+    ``手机完整，透明旧壳不变`` even though no physical action
+    occurred.  This helper deliberately rejects holder/support/visibility or
+    material state changes; it is not a semantic transition guesser.
+    """
+    if not isinstance(start, dict) or not isinstance(end, dict):
+        return False
+
+    def compact(value):
+        return re.sub(
+            r"[\s\u3000，,;；。.!！？?、]", "", str(value or "").strip())
+
+    for field in ("holder", "support", "visibility", "representation"):
+        if compact(start.get(field)).lower() != compact(end.get(field)).lower():
+            return False
+
+    def location_key(value):
+        text = compact(value)
+        # ``沙发上胸腹前`` and ``沙发胸腹前`` describe the same
+        # supported position; remove only this narrow grammatical localizer.
+        return re.sub(
+            r"上(?=(?:胸腹|胸|腹|身)(?:部)?(?:前|后))", "", text)
+
+    if location_key(start.get("location")) != location_key(end.get("location")):
+        return False
+
+    left = compact(start.get("physical_state")).replace("同一", "")
+    right = compact(end.get("physical_state")).replace("同一", "")
+    if left == right:
+        return True
+    shorter, longer = sorted((left, right), key=len)
+    if not shorter or shorter not in longer:
+        return False
+    extra = longer.replace(shorter, "", 1)
+    extra = re.sub(r"^(?:且|并且|同时|并|仍|依旧)+", "", extra)
+    if extra in {"完整", "保持完整", "仍然完整"}:
+        return True
+    # Full-string finite whitelist: exactly one known passive shell component
+    # may add an unchanged qualifier.  An arbitrary Chinese prefix is unsafe:
+    # ``屏幕黑，外壳不变`` would otherwise look like one large
+    # "component name" after punctuation compaction.
+    stable_components = {
+        "透明旧壳", "透明手机壳", "手机壳", "外壳", "机身",
+        "瓶身", "封面", "封套",
+    }
+    stable_suffixes = ("不变", "未变", "保持完整", "仍然完整")
+    return extra in {
+        component + suffix
+        for component in stable_components
+        for suffix in stable_suffixes
+    }
+
+
 def _compose_prop_timeline(first, last):
     """两段顺序事件合成一个长镜头的唯一 start/end/freeze 道具合同。"""
     prop_ids = list(dict.fromkeys(
@@ -1308,6 +1366,21 @@ def _compose_prop_timeline(first, last):
                  or _phase_row(last, prop_id, ("start", "freeze", "end")))
         end = (_phase_row(last, prop_id, ("end", "freeze", "start"))
                or _phase_row(first, prop_id, ("end", "freeze", "start")))
+        has_authored_transition = any(
+            isinstance(item, dict)
+            and item.get("prop_id") == prop_id
+            and str(item.get("action") or "").strip()
+            for shot in (first, last)
+            for item in (shot.get("prop_transitions") or []))
+        if (start and end and not has_authored_transition
+                and _folded_static_prop_rows_equivalent(start, end)):
+            # Canonicalize harmless wording drift before strict auditing. Use
+            # the final wording for both endpoints; no action or state change
+            # is invented and the actual last-frame description is preserved.
+            for field in (
+                    "physical_state", "holder", "location", "support",
+                    "visibility", "representation"):
+                start[field] = copy.deepcopy(end.get(field))
         if start:
             start["phase"] = "start"
             start.pop("phase_backfilled", None)
@@ -1794,6 +1867,12 @@ def _normalize_ai_shot(raw):
 
 def enrich_storyboard(script, storyboard, continuity, profile, style=""):
     """把 Provider 的轻量分镜升级为五维生产分镜。"""
+    storyboard = copy.deepcopy(storyboard or {})
+    reconcile_storyboard_prop_registry(storyboard, script)
+    effective_prop_registry = copy.deepcopy(
+        storyboard.get("prop_registry")
+        or script.get("prop_registry")
+        or script.get("core_props") or [])
     rules = profile.get("rules", {})
     production_analysis = (
         script.get("production_analysis")
@@ -1828,6 +1907,18 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
     raw_shots = _append_performance_beats(normalized, script, rules)
     raw_shots, inner_policy = apply_inner_persona_to_shots(
         script, raw_shots, rules.get("inner_persona"))
+    # Long-take folding can absorb several source shots into one dialogue shot
+    # and therefore retire their event_ids. Re-refine lifecycle boundaries on
+    # the final shot list so no registry entry points at a folded-away event.
+    final_prop_board = {
+        "prop_contract_schema": "aifos.prop-contract/v2.2",
+        "prop_registry": copy.deepcopy(effective_prop_registry),
+        "shots": raw_shots,
+    }
+    reconcile_storyboard_prop_registry(final_prop_board, script)
+    raw_shots = final_prop_board["shots"]
+    effective_prop_registry = copy.deepcopy(
+        final_prop_board.get("prop_registry") or effective_prop_registry)
     character_number_map = build_character_number_map(
         continuity, {"shots": raw_shots})
     character_by_name = {
@@ -2132,8 +2223,7 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             "unit_id": f"U{index:02d}",
             "pipeline_version": PIPELINE_VERSION,
             "prop_registry": copy.deepcopy(
-                script.get("prop_registry")
-                or script.get("core_props") or []),
+                effective_prop_registry),
             "kind": kind,
             "duration": duration,
             "timecode": timecode,
@@ -2248,9 +2338,7 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
         "episode_title": storyboard.get("episode_title", script.get("episode_title", "")),
         "pipeline_version": PIPELINE_VERSION,
         "prop_contract_schema": "aifos.prop-contract/v2.2",
-        "prop_registry": copy.deepcopy(
-            script.get("prop_registry")
-            or script.get("core_props") or []),
+        "prop_registry": copy.deepcopy(effective_prop_registry),
         "appearance_state_version": APPEARANCE_STATE_VERSION,
         "style_director_schema": (
             director_knowledge.get("schema")

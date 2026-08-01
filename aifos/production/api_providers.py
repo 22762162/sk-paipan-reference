@@ -11,7 +11,6 @@
 """
 
 import base64
-import copy
 import http.client
 import json
 import re
@@ -29,11 +28,19 @@ from ..adapters.codex_image import (
 from ..adapters.codex_image import STUDIO_ASSET_RULES as _STUDIO_ASSET_RULES
 from ..adapters.codex_image import _style_line as _api_style_line
 from ..adapters.codex_image import _space_line as _api_space_line
-from ..adapters.claude_script import (build_prompt, extract_json,
-                                      validate_script, validate_storyboard)
+from ..adapters.claude_script import (
+    _merge_storyboard_full_repair,
+    _merge_storyboard_shot_repairs,
+    _storyboard_error_fields,
+    build_prompt,
+    extract_json,
+    validate_script,
+    validate_storyboard,
+)
 from ..config import is_official_deepseek_endpoint
 from ..script_import import sanitize_script_entities
 from ..story_analysis import validate_story_analysis
+from ..story_logic import reconcile_storyboard_prop_registry
 from ..errors import ProviderError
 from .base import Provider, ProviderResult
 
@@ -509,6 +516,9 @@ class ClaudeApiProvider(Provider):
         if (capability == "script" and isinstance(data, dict)
                 and isinstance(data.get("scenes"), list)):
             sanitize_script_entities(data)
+        if capability == "storyboard" and isinstance(data, dict):
+            reconcile_storyboard_prop_registry(
+                data, payload.get("script") or {})
         try:
             if capability == "scene_annotate":
                 from ..adapters.claude_script import validate_scene_annotation
@@ -698,10 +708,13 @@ class OpenAIChatProvider(Provider):
             return validate_script(data, payload)
         return validate_storyboard(data)
 
-    def _postprocess(self, capability, data):
+    def _postprocess(self, capability, data, payload=None):
         if (capability == "script" and isinstance(data, dict)
                 and isinstance(data.get("scenes"), list)):
             sanitize_script_entities(data)
+        if capability == "storyboard" and isinstance(data, dict):
+            reconcile_storyboard_prop_registry(
+                data, (payload or {}).get("script") or {})
         return data
 
     def generate(self, capability, payload, out_dir, cancel=None):
@@ -718,7 +731,7 @@ class OpenAIChatProvider(Provider):
         data = extract_json(text)
         if data is None:
             raise ProviderError(f"{self.name} 应答中未找到 JSON 对象")
-        data = self._postprocess(capability, data)
+        data = self._postprocess(capability, data, payload)
         try:
             error = self._validate(capability, payload, data)
         except Exception as exc:
@@ -781,20 +794,15 @@ class OpenAIChatProvider(Provider):
         rows = (patch or {}).get("shots")
         if not isinstance(rows, list) or not rows:
             return None, "(镜头级就地修复未返回 shots)"
-        merged = copy.deepcopy(data)
-        applied = 0
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            try:
-                position = int(row.pop("_position"))
-            except (TypeError, ValueError, KeyError):
-                continue
-            if 1 <= position <= len(merged["shots"]):
-                merged["shots"][position - 1] = row
-                applied += 1
-        if not applied:
+        merged = _merge_storyboard_shot_repairs(
+            data, patch, positions,
+            allowed_fields=_storyboard_error_fields(error))
+        if merged is None:
             return None, "(镜头级就地修复没有可合并的镜头)"
+        applied = sum(
+            1 for position in positions
+            if 1 <= position <= len(merged["shots"])
+            and merged["shots"][position - 1] != data["shots"][position - 1])
         return merged, f"(镜头级就地修复合并 {applied} 个镜头)"
 
     def _repair(self, capability, payload, data, error):
@@ -802,7 +810,7 @@ class OpenAIChatProvider(Provider):
         if capability == "storyboard" and isinstance(data, dict):
             patched, note = self._repair_shots(payload, data, error)
             if patched is not None:
-                fixed = self._postprocess(capability, patched)
+                fixed = self._postprocess(capability, patched, payload)
                 if not self._validate(capability, payload, fixed):
                     return fixed, note
         try:
@@ -824,7 +832,14 @@ class OpenAIChatProvider(Provider):
         fixed = extract_json(text)
         if fixed is None:
             return None, "(就地修复输出中未找到 JSON)"
-        fixed = self._postprocess(capability, fixed)
+        if capability == "storyboard":
+            positions = self._error_shot_positions(error)
+            fixed = _merge_storyboard_full_repair(
+                data, fixed, positions=positions,
+                allowed_fields=_storyboard_error_fields(error))
+            if fixed is None:
+                return None, "(就地修复输出未返回可安全合并的 shots)"
+        fixed = self._postprocess(capability, fixed, payload)
         try:
             fixed_error = self._validate(capability, payload, fixed)
         except Exception as exc:

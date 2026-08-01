@@ -122,6 +122,14 @@ _PROP_PHASE_ALIASES = {
 # 都是分隔),再与合法枚举取交集;恰好命中一个才归一。
 _PROP_PHASE_WORD_RE = re.compile(r"[a-z]+")
 
+# 分镜模型偶尔把三段视频节拍(setup/main/settle)误填进静态帧相位。
+# 三者到首帧/代表帧/尾帧的对应关系是确定的，不需要再调用模型猜测。
+_STORYBOARD_PHASE_ALIASES = {
+    "setup": "start",
+    "main": "freeze",
+    "settle": "end",
+}
+
 
 def _normalize_phase(phase):
     """phase 同义词/复合写法(scene_start、at_end…)归一到合法枚举。
@@ -576,6 +584,306 @@ def normalize_storyboard_frame_phase_pairs(storyboard: dict) -> dict:
                     clone["phase_backfilled"] = True
                     clone["derived_from"] = "end_state"
                     rows.append(clone)
+    return storyboard
+
+
+def _normalize_storyboard_phase(value) -> str:
+    """Normalize a storyboard-frame phase without weakening strict enums."""
+    phase = _text(value).lower()
+    return _STORYBOARD_PHASE_ALIASES.get(phase, _normalize_phase(phase))
+
+
+def _prop_state_signature(rows) -> list[tuple[str, ...]]:
+    """Return the exact state signature used by the strict prop audit."""
+    fields = (
+        "physical_state", "holder", "location", "support",
+        "visibility", "representation",
+    )
+    return sorted(
+        tuple(_text(item.get(field)).lower() for field in fields)
+        for item in rows if isinstance(item, dict)
+    )
+
+
+def _backfill_storyboard_prop_transitions(storyboard: dict) -> None:
+    """Add only transitions already proven by explicit start/end states.
+
+    A transition is backfilled only when the shot already contains a named,
+    explicit action for that prop; otherwise the strict physical audit remains.
+    """
+    prop_names = {
+        _text(item.get("prop_id")): _text(item.get("name"))
+        for item in storyboard.get("prop_registry") or []
+        if isinstance(item, dict) and _text(item.get("prop_id"))
+    }
+    transition_cues = (
+        "拿起", "取出", "拾起", "握住", "接过", "递给", "递交", "交给",
+        "放入", "放到", "移到", "移入", "塞进", "收进", "藏入", "装入",
+        "戴上", "摘下", "掉落", "滑落", "倒入", "灌入", "喝下", "打开",
+        "合上", "关闭", "点亮", "熄灭", "启动", "停止", "撕开", "拆开",
+        "折断", "打碎", "烧毁", "浸湿", "显现", "显示", "露出", "遮住",
+        "切换为", "变为",
+    )
+    negative_cues = (
+        "保持不动", "未移动", "没有移动", "不移动", "仍在原位",
+        "位置不变", "禁止", "不得", "不可", "不能", "不要", "无需",
+        "并未", "从未", "尚未", "未曾", "没有", "未拿", "不拿",
+        "未打开",
+    )
+
+    def transition_evidence(shot, prop_id):
+        candidates = []
+        for beat in shot.get("temporal_beats") or []:
+            if isinstance(beat, dict):
+                candidates.append(beat.get("action"))
+        candidates.extend(shot.get(key) for key in (
+            "description", "physical_logic", "video_action", "prompt"))
+        tokens = [prop_id, prop_names.get(prop_id, "")]
+        for candidate in candidates:
+            text = _text(candidate)
+            for clause in re.split(r"[，,；;。.!！？?]", text):
+                clause = clause.strip()
+                if (not clause or any(cue in clause for cue in negative_cues)):
+                    continue
+                for token in tokens:
+                    if not token or token not in clause:
+                        continue
+                    token_pattern = re.escape(token)
+                    cue_pattern = "|".join(
+                        re.escape(cue) for cue in transition_cues)
+                    # Require a grammatical object/action binding. A loose
+                    # character window launders unrelated actions such as
+                    # ``密函旁的房门被打开`` into a transition for the
+                    # letter. Conservative under-filling is intentional: an
+                    # uncertain action must remain a strict-audit failure.
+                    relation_suffix = (
+                        r"(?!(?:旁|旁边|附近|周围|上|下|前|后|里|内|外)的)")
+                    cue_before_prop = re.search(
+                        rf"(?:{cue_pattern})(?:了|着|过|一下)?"
+                        rf"(?:这封|那封|该|此)?{token_pattern}"
+                        rf"{relation_suffix}", clause)
+                    prop_before_cue = re.search(
+                        rf"{token_pattern}{relation_suffix}(?:已|正|随即|终于|"
+                        rf"重新|再次)?(?:被|由|让|给)?"
+                        rf"[\u4e00-\u9fffA-Za-z0-9·]{{0,8}}?(?:{cue_pattern})",
+                        clause)
+                    if cue_before_prop or prop_before_cue:
+                        return clause[:300]
+        return ""
+
+    for shot in storyboard.get("shots") or []:
+        if not isinstance(shot, dict):
+            continue
+        rows = shot.get("frame_props")
+        transitions = shot.get("prop_transitions")
+        if not isinstance(rows, list):
+            continue
+        if not isinstance(transitions, list):
+            transitions = []
+            shot["prop_transitions"] = transitions
+        by_prop: dict[str, dict[str, list[dict]]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            prop_id = _text(row.get("prop_id"))
+            phase = _text(row.get("phase")).lower()
+            if prop_id and phase in {"start", "end"}:
+                by_prop.setdefault(prop_id, {}).setdefault(
+                    phase, []).append(row)
+        transition_keys = {
+            (_text(item.get("prop_id")),
+             _text(item.get("from_phase")).lower(),
+             _text(item.get("to_phase")).lower())
+            for item in transitions if isinstance(item, dict)
+        }
+        for prop_id, phases in by_prop.items():
+            starts = phases.get("start") or []
+            ends = phases.get("end") or []
+            if (not starts or not ends
+                    or _prop_state_signature(starts)
+                    == _prop_state_signature(ends)
+                    or (prop_id, "start", "end") in transition_keys):
+                continue
+            evidence = transition_evidence(shot, prop_id)
+            if not evidence:
+                # A state delta without an authored action may be teleportation
+                # or an impossible handoff. Keep the strict audit failure rather
+                # than laundering it into a valid transition.
+                continue
+            transitions.append({
+                "prop_id": prop_id,
+                "from_phase": "start",
+                "to_phase": "end",
+                "action": f"依据本镜已写明动作：{evidence}",
+                "transition_backfilled": True,
+            })
+
+
+def _storyboard_prop_disclosure_bounds(storyboard: dict):
+    """Return first/last visible prop events on the validated shot timeline."""
+    shots = storyboard.get("shots") or []
+    order, _issues = _event_order(storyboard)
+    earliest: dict[str, tuple[int, str, str, str]] = {}
+    latest: dict[str, tuple[int, str, str, str]] = {}
+    for shot in shots:
+        if not isinstance(shot, dict):
+            continue
+        event_id = _text(shot.get("event_id") or shot.get("unit_id"))
+        scene_event_id = _text(shot.get("scene_event_id"))
+        for row in shot.get("frame_props") or []:
+            if not isinstance(row, dict):
+                continue
+            if _text(row.get("visibility")).lower() not in {
+                    "visible", "occluded"}:
+                continue
+            prop_id = _text(row.get("prop_id"))
+            phase = _text(row.get("phase")).lower()
+            lookup_phase = "end" if phase == "freeze" else phase
+            position = order.get((event_id, lookup_phase))
+            if not prop_id or position is None:
+                continue
+            candidate = (position, event_id, lookup_phase, scene_event_id)
+            if prop_id not in earliest or candidate[0] < earliest[prop_id][0]:
+                earliest[prop_id] = candidate
+            if prop_id not in latest or candidate[0] > latest[prop_id][0]:
+                latest[prop_id] = candidate
+    return earliest, latest
+
+
+def reconcile_storyboard_prop_registry(
+        storyboard: dict, source_script: dict) -> dict:
+    """Reconcile coarse script lifecycle bounds with exact storyboard events.
+
+    Script prop identity and scene membership remain authoritative. A scene
+    boundary is intentionally coarse, so it is refined to the first/last
+    visible row already declared by the storyboard inside that same scene.
+    Exact-shot and episode boundaries are never widened; real early disclosure
+    therefore remains a strict audit failure.
+    """
+    if not isinstance(storyboard, dict) or not isinstance(source_script, dict):
+        return storyboard
+    source = copy.deepcopy(source_script)
+    normalize_prop_contract(source)
+    if not source.get("prop_registry"):
+        return normalize_storyboard_contract(storyboard)
+    scene_events = {
+        _text(scene.get("scene_no")): _text(
+            scene.get("event_id"), f"scene:{scene.get('scene_no')}")
+        for scene in source.get("scenes") or []
+        if isinstance(scene, dict) and scene.get("scene_no") is not None
+    }
+    for position, shot in enumerate(storyboard.get("shots") or [], 1):
+        if not isinstance(shot, dict):
+            continue
+        scene_no = _text(shot.get("scene_no"))
+        shot.setdefault(
+            "event_id", _text(shot.get("unit_id"), f"shot:{position}"))
+        expected_scene_event = scene_events.get(scene_no)
+        if expected_scene_event:
+            shot["scene_event_id"] = expected_scene_event
+        else:
+            shot.setdefault("scene_event_id", f"scene:{scene_no}")
+
+    # Phase aliases and missing transitions must be normalized before visible
+    # disclosure bounds are measured. Install the authoritative registry first
+    # so action evidence can resolve human prop names even if the model omitted
+    # or corrupted its own registry copy.
+    storyboard["prop_contract_schema"] = PROP_CONTRACT_SCHEMA
+    storyboard["prop_registry"] = copy.deepcopy(source["prop_registry"])
+    normalize_storyboard_contract(storyboard)
+    event_scenes = {
+        _text(shot.get("event_id") or shot.get("unit_id")):
+        _text(shot.get("scene_event_id"))
+        for shot in storyboard.get("shots") or []
+        if isinstance(shot, dict)
+        and _text(shot.get("event_id") or shot.get("unit_id"))
+    }
+    scene_event_ids = set(scene_events.values())
+    earliest, latest = _storyboard_prop_disclosure_bounds(storyboard)
+    refined = []
+    for source_prop in source.get("prop_registry") or []:
+        if not isinstance(source_prop, dict):
+            refined.append(copy.deepcopy(source_prop))
+            continue
+        item = copy.deepcopy(source_prop)
+        prop_id = _text(item.get("prop_id"))
+        for field, alias, bound_name in (
+                ("availability_start_event", "introduced_at", "start"),
+                ("availability_end_event", "retired_at", "end")):
+            source_ref = item.get(field) or item.get(alias)
+            if not isinstance(source_ref, dict):
+                continue
+            source_event = _event_ref_id(source_ref)
+            if source_event in {"episode-start", "episode-end"}:
+                continue
+            source_scene = (
+                source_event if source_event in scene_event_ids
+                else event_scenes.get(source_event))
+            if not source_scene:
+                continue
+
+            # A source scene boundary is coarse by design. Derive its exact
+            # in-scene point from already-authored visible frame rows. This is
+            # how run348's "scene end" bottle became shot8 start without
+            # loosening a genuinely exact reveal such as shot5 end.
+            disclosure = (
+                earliest.get(prop_id) if bound_name == "start"
+                else latest.get(prop_id))
+            replacement = None
+            if (source_event in scene_event_ids and disclosure is not None
+                    and disclosure[3] == source_scene):
+                replacement = {
+                    "event_id": disclosure[1], "phase": disclosure[2]}
+            if replacement is not None:
+                item[field] = copy.deepcopy(replacement)
+                item[alias] = copy.deepcopy(replacement)
+                item[f"{field}_refined_from"] = copy.deepcopy(source_ref)
+        refined.append(item)
+    storyboard["prop_contract_schema"] = PROP_CONTRACT_SCHEMA
+    storyboard["prop_registry"] = refined
+    return storyboard
+
+
+def normalize_storyboard_contract(storyboard: dict) -> dict:
+    """Deterministically repair common storyboard contract-shape mistakes.
+
+    Creative facts stay untouched. The function only reconciles static phase
+    names, explicit prop-state pairs and transitions already proven by an
+    authored action. Source-owned disclosure metadata is handled separately by
+    :func:`reconcile_storyboard_prop_registry`.
+    """
+    if not isinstance(storyboard, dict):
+        return storyboard
+    for position, shot in enumerate(storyboard.get("shots") or [], 1):
+        if not isinstance(shot, dict):
+            continue
+        shot.setdefault(
+            "event_id", _text(shot.get("unit_id"), f"shot:{position}"))
+        shot.setdefault("scene_event_id", f"scene:{shot.get('scene_no')}")
+        targets = shot.get("frame_targets")
+        if isinstance(targets, dict):
+            for target in targets.values():
+                if isinstance(target, dict):
+                    target["phase"] = _normalize_storyboard_phase(
+                        target.get("phase"))
+        rows = shot.get("frame_props")
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict):
+                    row["phase"] = _normalize_storyboard_phase(
+                        row.get("phase"))
+        transitions = shot.get("prop_transitions")
+        if isinstance(transitions, list):
+            for transition in transitions:
+                if not isinstance(transition, dict):
+                    continue
+                transition["from_phase"] = _normalize_storyboard_phase(
+                    transition.get("from_phase"))
+                transition["to_phase"] = _normalize_storyboard_phase(
+                    transition.get("to_phase"))
+
+    normalize_storyboard_frame_phase_pairs(storyboard)
+    _backfill_storyboard_prop_transitions(storyboard)
     return storyboard
 
 
