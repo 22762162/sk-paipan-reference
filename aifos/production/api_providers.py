@@ -1851,7 +1851,15 @@ class ArkVideoProvider(Provider):
         for key, role in (("first", "first_frame"), ("last", "last_frame")):
             if payload.get(key):
                 content.append(self._frame_content(payload[key], role))
-        for uri in (payload.get("reference_images") or [])[:7]:
+        requested_references = list(payload.get("reference_images") or [])[:7]
+        # Ark/Seedance rejects a last-frame boundary mixed with generic
+        # reference_image or draft_task content.  In a first+last contract the
+        # two authored boundaries are the stronger continuity source, so keep
+        # both boundaries and defer generic identity/scene references instead
+        # of submitting an invalid request that can never start.
+        submitted_references = (
+            [] if payload.get("last") else requested_references)
+        for uri in submitted_references:
             content.append(self._frame_content(uri, "reference_image"))
         tasks_url = f"{endpoint}/api/v3/contents/generations/tasks"
         if not self.conf.get("model"):
@@ -1899,8 +1907,14 @@ class ArkVideoProvider(Provider):
             data={"task_id": task_id, "duration": duration,
                   "video_quality": video_quality,
                   "video_resolution": video_resolution,
-                  "reference_images_used": list(
-                      (payload.get("reference_images") or [])[:7]),
+                  "reference_images_used": submitted_references,
+                  "reference_images_deferred": [
+                      uri for uri in requested_references
+                      if uri not in submitted_references],
+                  "reference_policy": (
+                      "first_last_boundaries_exclusive"
+                      if payload.get("last") else
+                      "generic_references_allowed"),
                   "reference_assets": list(
                       payload.get("reference_assets") or [])},
             uri=str(dest))

@@ -567,11 +567,26 @@ def test_ark_video_task_flow(fake_api, tmp_path):
     assert result.data["video_quality"] == "high"
     assert result.data["video_resolution"] == "1080p"
     roles = [c.get("role") for c in create["body"]["content"][1:]]
-    assert roles == ["first_frame", "last_frame", "reference_image"]
+    assert roles == ["first_frame", "last_frame"]
     assert create["body"]["content"][1]["image_url"]["url"].startswith(
         "data:image/png;base64,")
     assert polls["n"] == 2
     assert result.data["reference_assets"][0]["asset_id"] == 9
+    assert result.data["reference_images_used"] == []
+    assert result.data["reference_images_deferred"] == [str(reference)]
+    assert result.data["reference_policy"] == "first_last_boundaries_exclusive"
+
+    fake.calls.clear()
+    first_only = provider.generate("video", {
+        "shot_no": 4, "prompt": "仅首帧图生视频", "duration": 8,
+        "first": str(first), "reference_images": [str(reference)],
+        "video_quality": "medium", "video_resolution": "720p",
+    }, tmp_path / "videos_first_only")
+    create = fake.calls[0]
+    assert [c.get("role") for c in create["body"]["content"][1:]] == [
+        "first_frame", "reference_image"]
+    assert first_only.data["reference_images_used"] == [str(reference)]
+    assert first_only.data["reference_images_deferred"] == []
 
 
 def test_ark_requires_real_model_id(fake_api, tmp_path):
