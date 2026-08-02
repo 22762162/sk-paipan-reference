@@ -365,6 +365,52 @@ def test_preview_qc_bypass_only_waives_frames_qc_gate(
         app.close()
 
 
+def test_director_autonomy_records_dialogue_mapping_risk_without_stopping(
+        tmp_path, monkeypatch):
+    app = App(
+        tmp_path / "ws",
+        config_overrides={"defaults": {
+            "preview_qc_bypass": True,
+            "director_autonomy_mode": True,
+        }})
+    try:
+        project, _ = app.projects.get_or_create_project("导演自动台词映射")
+        episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+        out_root = tmp_path / "artifacts"
+        out_root.mkdir()
+        ctx = {
+            "project": dict(project), "episode": dict(episode),
+            "out_root": out_root, "script": {}, "storyboard": {"shots": []},
+            "continuity": {}, "text_assets": {}, "frames": [],
+            "production_profile": {}, "blocking": {},
+            "quality_policy": {}, "character_asset_policy": {},
+            "cast_selection": {},
+        }
+        monkeypatch.setattr(
+            "aifos.director.build_preflight",
+            lambda *_args, **_kwargs: {
+                "passed": False, "units": 4,
+                "gates": [{
+                    "id": "dialogue", "label": "台词与语速",
+                    "passed": False, "severity": "block",
+                }, {
+                    "id": "people", "label": "人物数量",
+                    "passed": True, "severity": "block",
+                }],
+            })
+
+        result = app.director._stage_preflight(ctx)
+
+        assert result["passed"] is True
+        assert result["formal_passed"] is False
+        assert result["preview_only"] is False
+        bypass = ctx["preflight"]["preview_qc_bypass"]
+        assert bypass["bypassed_gates"] == ["dialogue"]
+        assert "dialogue_editorial_mapping" in bypass["scope"]
+    finally:
+        app.close()
+
+
 def test_auto_rerun_repairs_missing_video(tmp_path):
     """删除一个镜头视频后重跑质检阶段,导演中心应自动重生成并通过。"""
     app = App(tmp_path / "ws")

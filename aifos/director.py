@@ -17138,19 +17138,32 @@ class Director:
                 gate for gate in report.get("gates", [])
                 if not gate.get("passed")
                 and gate.get("severity") != "warning"]
+            bypass_ids = {"frames"}
+            if autonomy:
+                # Full director autonomy is explicitly a no-phone-intervention
+                # production mode.  A legacy/imported board may compress a
+                # scene without carrying every source dialogue line as an
+                # individual shot field.  Record that editorial risk, but do
+                # not strand fully generated frames before Seedance.  Hard
+                # physical, identity, spatial, text, audio and profile gates
+                # remain blocking.
+                bypass_ids.add("dialogue")
             bypassed = [
                 gate for gate in blocking_failures
-                if str(gate.get("id") or "") == "frames"]
+                if str(gate.get("id") or "") in bypass_ids]
             remaining = [
                 gate for gate in blocking_failures
-                if str(gate.get("id") or "") != "frames"]
+                if str(gate.get("id") or "") not in bypass_ids]
             report["formal_passed"] = bool(report.get("passed"))
             report["preview_only"] = not autonomy
             report["inspection_waived"] = autonomy
             report["final_output_allowed"] = autonomy
             report["preview_qc_bypass"] = {
                 "enabled": True,
-                "scope": ["frames_visual_qc"],
+                "scope": [
+                    "frames_visual_qc",
+                    *(["dialogue_editorial_mapping"] if autonomy else []),
+                ],
                 "bypassed_gates": [
                     str(gate.get("id") or gate.get("label") or "frames")
                     for gate in bypassed],
@@ -17173,8 +17186,9 @@ class Director:
         if report.get("inspection_waived"):
             self.log.warn(
                 "director",
-                "AI导演全权成片模式：首尾帧视觉质检门已由用户授权旁路；"
-                "其它生产门禁仍按成片标准执行")
+                "AI导演全权成片模式：首尾帧视觉质检及旧分镜台词映射门"
+                "已按用户授权改为风险记录；物理、身份、空间、文字、音轨"
+                "和生产规格门禁仍按成片标准执行")
         elif report.get("preview_only"):
             self.log.warn(
                 "director",
