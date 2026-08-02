@@ -336,17 +336,30 @@ def test_image_api_frames_url_mode(fake_api, tmp_path):
     assert result.cost == 3.0
 
 
-def test_image_api_frames_reuse_keyframe_charges_one_call(fake_api, tmp_path):
+def test_image_api_frames_reuse_keyframe_charges_one_call(
+        fake_api, tmp_path, monkeypatch):
     endpoint, fake = fake_api
     fake.routes[("POST", "/v1/images/edits")] = lambda body: {
         "data": [{"b64_json": base64.b64encode(PNG_1PX).decode()}]}
     keyframe = tmp_path / "shot_004.keyframe.png"
     keyframe.write_bytes(PNG_1PX)
     provider = OpenAIImageProvider("image_api", _image_conf(endpoint))
+    sent_prompts = []
+    original_gen = provider._gen_image
+
+    def capture_prompt(prompt, *args, **kwargs):
+        sent_prompts.append(prompt)
+        return original_gen(prompt, *args, **kwargs)
+
+    monkeypatch.setattr(provider, "_gen_image", capture_prompt)
     result = provider.generate("frames", {
         "shot_no": 4, "prompt": "镜头", "aspect": "9:16",
         "image_uri": str(keyframe),
         "frame_target": {"phase": "start", "state": "动作起点"},
+        "frame_prompt_compacts": {
+            "first_frame": "FIRST_PHASE_ONLY_未穿风衣",
+            "last_frame": "LAST_PHASE_ONLY_穿风衣离开",
+        },
         "spatial_constraint": "空间调度锁：严格 2 人，保持轴线。",
     }, tmp_path / "frames")
     assert result.data["image_normalization"]["first"][
@@ -357,18 +370,29 @@ def test_image_api_frames_reuse_keyframe_charges_one_call(fake_api, tmp_path):
     assert result.data["generation_calls"] == 1
     assert result.cost == 1.5
     assert len(fake.calls) == 1
+    sent = sent_prompts[0]
+    assert "LAST_PHASE_ONLY_穿风衣离开" in sent
+    assert "FIRST_PHASE_ONLY_未穿风衣" not in sent
     assert "空间调度锁" in provider._semantic_prompt(
         "镜头", {"spatial_constraint": "空间调度锁：严格 2 人。"}, [])
 
 
 def test_image_api_end_keyframe_is_reused_as_last_and_first_is_generated(
-        fake_api, tmp_path):
+        fake_api, tmp_path, monkeypatch):
     endpoint, fake = fake_api
     fake.routes[("POST", "/v1/images/edits")] = lambda body: {
         "data": [{"b64_json": base64.b64encode(PNG_1PX).decode()}]}
     keyframe = tmp_path / "shot_005.keyframe.png"
     keyframe.write_bytes(PNG_1PX)
     provider = OpenAIImageProvider("image_api", _image_conf(endpoint))
+    sent_prompts = []
+    original_gen = provider._gen_image
+
+    def capture_prompt(prompt, *args, **kwargs):
+        sent_prompts.append(prompt)
+        return original_gen(prompt, *args, **kwargs)
+
+    monkeypatch.setattr(provider, "_gen_image", capture_prompt)
 
     payload = {
         "shot_no": 5,
@@ -379,6 +403,10 @@ def test_image_api_end_keyframe_is_reused_as_last_and_first_is_generated(
         "keyframe_boundary_phase": "end",
         # 新导演的显式边界裁决必须压过可能残留的旧代表帧字段。
         "frame_target": {"phase": "freeze", "state": "旧代表帧字段"},
+        "frame_prompt_compacts": {
+            "first_frame": "FIRST_PHASE_ONLY_床上仰躺且未穿鞋",
+            "last_frame": "LAST_PHASE_ONLY_穿风衣走向电梯",
+        },
         "start_state": {"女人": {"position": "刚站在车门外"}},
         "end_state": {"女人": {"position": "已经走远"}},
     }
@@ -392,6 +420,9 @@ def test_image_api_end_keyframe_is_reused_as_last_and_first_is_generated(
     assert result.data["generation_calls"] == 1
     assert result.cost == 1.5
     assert len(fake.calls) == 1
+    sent = sent_prompts[0]
+    assert "FIRST_PHASE_ONLY_床上仰躺且未穿鞋" in sent
+    assert "LAST_PHASE_ONLY_穿风衣走向电梯" not in sent
 
 
 @pytest.mark.parametrize("phase", ["freeze", "", "unexpected"])

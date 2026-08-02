@@ -525,6 +525,22 @@ def build_instruction(capability, payload, out_dir):
         shot_no = int(payload["shot_no"])
         first = out_dir / f"shot_{shot_no:03d}.first.png"
         last = out_dir / f"shot_{shot_no:03d}.last.png"
+        frame_prompts = payload.get("frame_prompt_compacts") or {}
+        frame_manifests = payload.get("frame_reference_manifests") or {}
+        first_prompt = str(
+            frame_prompts.get("first_frame") or prompt_text)
+        last_prompt = str(
+            frame_prompts.get("last_frame") or prompt_text)
+        first_ref_payload = {
+            **payload,
+            "reference_manifest": frame_manifests.get(
+                "first_frame", payload.get("reference_manifest") or []),
+        }
+        last_ref_payload = {
+            **payload,
+            "reference_manifest": frame_manifests.get(
+                "last_frame", payload.get("reference_manifest") or []),
+        }
         keyframe_phase = _keyframe_phase(payload)
         image_uri = _keyframe_uri(payload, keyframe_phase)
         # 协议测试或人工恢复时可能给一个尚未挂载的占位路径；不要让
@@ -560,11 +576,12 @@ def build_instruction(capability, payload, out_dir):
                 "不要改动它)。请基于该首帧与关键图 "
                 f"{image_uri}(均可直接读取)只生成本镜尾帧,"
                 f"保存到 {last}(PNG,{size})。"
-                f"镜头内容:{prompt_text}。"
+                f"尾帧独立合同:{last_prompt}。"
                 f"结尾状态:{_state_brief(payload.get('end_state'))};"
                 "画面从首帧状态自然演进到结尾状态,"
-                "人物、服装、道具、场景与首帧完全一致,"
-                f"不新增字幕条。{_ref_line(payload, prompt_text)}{common}"
+                "人物身份和不可变场景结构与首帧一致；服装、发型、持物和"
+                "位置严格服从尾帧合同，剧本明确变化时不得强行沿用首帧。"
+                f"不新增字幕条。{_ref_line(last_ref_payload, last_prompt)}{common}"
                 "只产出尾帧这一个文件。"
             )
             return instruction, [first, last], {
@@ -580,10 +597,12 @@ def build_instruction(capability, payload, out_dir):
                     f"本镜首帧已直接复用动作起点关键图(文件已就位:{first},"
                     "不要改动它)。请基于该首帧只生成本镜尾帧,"
                     f"保存到 {last}(PNG,{size})。"
-                    f"镜头内容:{prompt_text}。"
+                    f"尾帧独立合同:{last_prompt}。"
                     f"结尾状态:{_state_brief(payload.get('end_state'))};"
-                    "画面从首帧自然演进到结尾状态，人物、服装、道具、场景与"
-                    f"首帧完全一致，不新增字幕条。{_ref_line(payload, prompt_text)}{common}"
+                    "画面从首帧自然演进到结尾状态；人物身份和不可变场景"
+                    "结构连续，服装、发型、持物和位置严格服从尾帧合同，"
+                    "不得把首帧造型强压到尾帧。"
+                    f"不新增字幕条。{_ref_line(last_ref_payload, last_prompt)}{common}"
                     "只产出尾帧这一个文件。")
                 return instruction, [first, last], {
                     "first": str(first), "last": str(last),
@@ -596,14 +615,16 @@ def build_instruction(capability, payload, out_dir):
                 shutil.copyfile(keyframe, last)
                 instruction = (
                     f"本镜尾帧已直接复用动作终点关键图(文件已就位:{last},"
-                    "不要改动它)。请参考该尾帧的人物身份、服装、场景与构图，"
+                    "不要改动它)。该尾帧只用于锁定人物身份、不可变场景"
+                    "结构和空间方位；不得把尾帧服装、鞋、发型、情绪、持物"
+                    "或完成后的动作倒灌进首帧。"
                     "独立生成发生在它之前的本镜首帧,"
                     f"保存到 {first}(PNG,{size})。"
-                    f"镜头内容:{prompt_text}。"
+                    f"首帧独立合同:{first_prompt}。"
                     f"起始状态:{_state_brief(payload.get('start_state'))};"
                     "首帧必须是真实动作起点，尾帧才是动作终点；不得把尾帧"
                     "状态倒置、换名或复制成首帧，不新增字幕条。"
-                    f"{_ref_line(payload, prompt_text)}{common}"
+                    f"{_ref_line(first_ref_payload, first_prompt)}{common}"
                     "只产出首帧这一个文件。")
                 return instruction, [first, last], {
                     "first": str(first), "last": str(last),
@@ -616,12 +637,15 @@ def build_instruction(capability, payload, out_dir):
             f"基于关键图 {image_uri}(文件可直接读取)"
             "为镜头生成首帧与尾帧,"
             f"分别保存到 {first} 和 {last}(PNG,{size})。"
-            f"镜头内容:{prompt_text}。"
+            f"首帧独立合同:{first_prompt}。"
+            f"尾帧独立合同:{last_prompt}。"
             f"起始状态:{_state_brief(payload.get('start_state'))};"
             f"结尾状态:{_state_brief(payload.get('end_state'))};"
             "首帧为动作起始、尾帧为动作结束，构图与关键图连贯，"
-            "保持人物、服装、道具、场景与任何已锁定文字完全一致，"
-            f"不新增字幕条。{_ref_line(payload, prompt_text)}{common}"
+            "只保持人物身份和不可变场景结构连续；服装、发型、持物、位置"
+            "分别服从各自边界合同，禁止跨相位复制。"
+            f"首帧参考:{_ref_line(first_ref_payload, first_prompt)}"
+            f"尾帧参考:{_ref_line(last_ref_payload, last_prompt)}{common}"
             "只产出这两个文件。"
         )
         return instruction, [first, last], {

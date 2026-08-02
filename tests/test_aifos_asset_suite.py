@@ -764,6 +764,10 @@ def test_codex_frames_end_keyframe_is_last_never_first(tmp_path):
         "shot_no": 2,
         "image_uri": str(keyframe),
         "prompt": "女人从车门外走向远处",
+        "frame_prompt_compacts": {
+            "first_frame": "FIRST_PHASE_ONLY_未穿外套在床上仰躺",
+            "last_frame": "LAST_PHASE_ONLY_穿外套走向远处",
+        },
         "frame_target": {"phase": "end", "state": "女人已经走远"},
         "start_state": {"女人": {"position": "刚站在车门外"}},
         "end_state": {"女人": {"position": "已经走远"}},
@@ -780,6 +784,9 @@ def test_codex_frames_end_keyframe_is_last_never_first(tmp_path):
     assert "尾帧已直接复用动作终点关键图" in instruction
     assert "只产出首帧这一个文件" in instruction
     assert "首帧已直接复用" not in instruction
+    assert "FIRST_PHASE_ONLY_未穿外套在床上仰躺" in instruction
+    assert "LAST_PHASE_ONLY_穿外套走向远处" not in instruction
+    assert "不得把尾帧服装" in instruction
 
 
 @pytest.mark.parametrize("phase", ["freeze", "", "unexpected"])

@@ -11081,12 +11081,11 @@ class Director:
                     collect(nested)
 
         collect(meta)
-        if any(
-                node.get("best_effort_promoted") is True
-                or node.get("best_effort_risk") is True
-                or node.get("best_effort") is True
-                for node in nodes):
-            return "资产仅为未达线候选中的相对最优稿，不能固化到视频参考"
+        # ``best_effort`` is historical selection provenance, not a permanent
+        # defect.  A later repair/version may have current visual, physical
+        # and spatial checks all passing while retaining that audit trail.
+        # Reject only concrete current failures below; otherwise shots can be
+        # stranded forever despite having a safe formal reference.
         if any(
                 node.get("physical_invalid") is True
                 or node.get("physical_logic_match") is False
@@ -13335,7 +13334,7 @@ class Director:
                   spatial_ref="", inner_persona_ref="", prop_names=None,
                   prop_reference_modes=None,
                   wardrobe_states=None, headwear_states=None,
-                  camera=None):
+                  camera=None, identity_face_only_names=None):
         """最终立绘/人物套件/场景图/用户参考 → 真实多图参考输入。
 
         含人物画面缺任何一个最终立绘都直接阻断；禁止静默退化为文字生图。
@@ -13348,6 +13347,7 @@ class Director:
                 "prop_refs": [], "asset_matches": [],
                 "appearance_reference_warnings": []}
         used_uris = set()
+        identity_face_only_names = set(identity_face_only_names or [])
 
         def room():
             return len(used_uris) < SHOT_BASE_REFERENCE_LIMIT
@@ -13399,8 +13399,9 @@ class Director:
                 # its silhouette, terminal ornament and placement by itself.
                 identity["headwear_anchor"] = copy.deepcopy(
                     current_headwear)
-            if ((current_wardrobe or current_headwear)
-                    and (not wardrobe_matches or not headwear_matches)):
+            if (character in identity_face_only_names
+                    or ((current_wardrobe or current_headwear)
+                        and (not wardrobe_matches or not headwear_matches))):
                 # A full-body final portrait wearing another scene's outfit
                 # visually overpowers a clothes-only reference even when the
                 # prompt says "identity only". Replace the submitted image
@@ -14343,6 +14344,7 @@ class Director:
                 "本镜终点关键图" if phase == "end" else
                 "本镜代表关键图（不充当首尾边界）"),
             "reference_role": "composition",
+            "reference_phase": phase,
         })
         payload["asset_matches"] = matches
         payload["require_reference_images"] = True
@@ -14424,10 +14426,34 @@ class Director:
             # Identity is locked by the final portrait. The selected candidate
             # may depict a later story outfit; never flatten that candidate's
             # costume/makeup/headwear into every shot.
-            current_state = (
-                (shot.get("end_state") or {}).get(name)
-                or (shot.get("start_state") or {}).get(name)
-                or {})
+            frame_target = shot.get("frame_target") or {}
+            target_phase = (
+                str(frame_target.get("phase") or "").strip().lower()
+                if isinstance(frame_target, dict) else "")
+            if target_phase in {"start", "freeze", "end"}:
+                # A first/key/last-frame payload is one static phase.  The old
+                # end-first fallback leaked the tail wardrobe, hair and mood
+                # into every first frame (for example a sleeping character was
+                # rendered half-reclined in the shoes and coat worn only after
+                # leaving the room).  Phase state is authoritative; missing
+                # fields may fall back to the opposite boundary only for
+                # legacy sparse storyboards.
+                phase_states = shot.get(f"{target_phase}_state") or {}
+                current_state = (
+                    phase_states.get(name)
+                    if isinstance(phase_states, dict) else None)
+                # An explicitly selected boundary is authoritative.  Missing
+                # phase data means stable identity only; never borrow the
+                # opposite boundary's clothes, hair, mood or held props.
+            else:
+                end_states = shot.get("end_state") or {}
+                start_states = shot.get("start_state") or {}
+                current_state = (
+                    (end_states.get(name)
+                     if isinstance(end_states, dict) else None)
+                    or (start_states.get(name)
+                        if isinstance(start_states, dict) else None))
+            current_state = current_state or {}
             facts = {
                 key: copy.deepcopy(merged.get(key))
                 for key in (
@@ -14888,6 +14914,57 @@ class Director:
                 if row is not None:
                     inner_persona_ref = str(row["uri"] or "").strip()
                     overlay["asset_uri"] = inner_persona_ref
+        target_phase = str(
+            (static_shot.get("frame_target") or {}).get("phase") or ""
+        ).strip().lower()
+
+        def phase_appearance(name, phase, key):
+            states = static_shot.get(f"{phase}_state") or {}
+            state = states.get(name) if isinstance(states, dict) else None
+            return copy.deepcopy(
+                state.get(key) if isinstance(state, dict) else None)
+
+        def appearance_text(value):
+            if value is None:
+                return ""
+            if isinstance(value, (dict, list)):
+                return json.dumps(
+                    value, ensure_ascii=False, sort_keys=True).strip()
+            return str(value).strip()
+
+        wardrobe_states = {}
+        headwear_states = {}
+        variable_appearance_names = set()
+        for name in identity_characters:
+            start_wardrobe = phase_appearance(name, "start", "wardrobe")
+            end_wardrobe = phase_appearance(name, "end", "wardrobe")
+            start_headwear = phase_appearance(name, "start", "headwear")
+            end_headwear = phase_appearance(name, "end", "headwear")
+            if frame_kind == "frames":
+                # A joint boundary request may span a costume/headwear change.
+                # Only attach an appearance reference when both boundaries
+                # agree.  Otherwise force a face-only identity anchor and let
+                # each boundary's own state contract control appearance.
+                if (appearance_text(start_wardrobe)
+                        != appearance_text(end_wardrobe)
+                        or appearance_text(start_headwear)
+                        != appearance_text(end_headwear)):
+                    variable_appearance_names.add(name)
+                else:
+                    wardrobe_states[name] = appearance_text(
+                        start_wardrobe or end_wardrobe)
+                    headwear_states[name] = copy.deepcopy(
+                        start_headwear or end_headwear or {})
+            elif target_phase in {"start", "end", "freeze"}:
+                wardrobe_states[name] = appearance_text(
+                    phase_appearance(name, target_phase, "wardrobe"))
+                headwear_states[name] = copy.deepcopy(
+                    phase_appearance(name, target_phase, "headwear") or {})
+            else:
+                wardrobe_states[name] = appearance_text(
+                    end_wardrobe or start_wardrobe)
+                headwear_states[name] = copy.deepcopy(
+                    end_headwear or start_headwear or {})
         payload = {
             "_episode_id": ctx["episode"]["id"],
             "_contract_revision": max(
@@ -14973,24 +15050,9 @@ class Director:
                 prop_names=[
                     item["name"] for item in prop_reference_rows],
                 prop_reference_modes=prop_reference_modes,
-                wardrobe_states={
-                    name: str(
-                        ((static_shot.get("end_state") or {}).get(name)
-                         or {}).get("wardrobe")
-                        or ((static_shot.get("start_state") or {}).get(name)
-                            or {}).get("wardrobe")
-                        or "")
-                    for name in identity_characters
-                },
-                headwear_states={
-                    name: copy.deepcopy(
-                        ((static_shot.get("end_state") or {}).get(name)
-                         or {}).get("headwear")
-                        or ((static_shot.get("start_state") or {}).get(name)
-                            or {}).get("headwear")
-                        or {})
-                    for name in identity_characters
-                }),
+                wardrobe_states=wardrobe_states,
+                headwear_states=headwear_states,
+                identity_face_only_names=variable_appearance_names),
         }
         actor_ids = {
             actor.get("name"): actor.get("actor_id")
@@ -15121,6 +15183,9 @@ class Director:
                 "index": len(entries) + 1, "uri": value,
                 "label": label, "binding": binding,
                 "character": character, "role": role,
+                "phase": str(
+                    match.get("reference_phase")
+                    or match.get("prop_phase") or "").strip().lower(),
                 "inherits": list(
                     inherits or match.get("inherits") or default_inherits),
                 "excludes": list(
@@ -15813,14 +15878,46 @@ class Director:
                 frame_contracts = {}
                 frame_compacts = {}
                 frame_validations = {}
+                frame_manifests = {}
                 for kind in ("first_frame", "last_frame"):
                     variant = copy.deepcopy(payload)
                     variant["frame_kind"] = kind
                     self._select_explicit_frame_target(variant)
+                    target = variant.get("frame_target") or {}
+                    target_characters = set(
+                        target.get("characters") or variant.get("characters")
+                        or [])
+                    target_phase = str(
+                        target.get("phase") or "").strip().lower()
+                    phase_manifest = []
+                    for entry in manifest:
+                        role = str(entry.get("role") or "").lower()
+                        character = str(
+                            entry.get("character") or "").strip()
+                        person_bound = role in {
+                            "identity", "identity_detail", "headwear",
+                            "wardrobe", "costume", "structure",
+                        }
+                        if (person_bound and character
+                                and character not in target_characters):
+                            continue
+                        phases = {
+                            value.strip().lower()
+                            for value in str(
+                                entry.get("phase") or "").split(",")
+                            if value.strip()
+                        }
+                        if (target_phase in {"start", "end", "freeze"}
+                                and phases and target_phase not in phases):
+                            continue
+                        copied = copy.deepcopy(entry)
+                        copied["index"] = len(phase_manifest) + 1
+                        phase_manifest.append(copied)
+                    frame_manifests[kind] = phase_manifest
                     contract, compact = compile_shot_prompt(
                         variant, location=payload.get("location", ""),
                         style=payload.get("style", ""),
-                        references=manifest, mode="image")
+                        references=phase_manifest, mode="image")
                     frame_contracts[kind] = contract
                     frame_compacts[kind] = compact
                     frame_validations[kind] = (
@@ -15843,6 +15940,12 @@ class Director:
                                 "用户授权AI导演直接生成首尾帧，"
                                 "不以静态合同文字冲突阻断")
                 payload["frame_prompt_contracts"] = frame_contracts
+                # Providers must execute the two boundary contracts
+                # independently.  Keeping only the merged audit prompt made
+                # first-frame generation inherit tail wardrobe/actions and
+                # made tail generation inherit start props.
+                payload["frame_prompt_compacts"] = frame_compacts
+                payload["frame_reference_manifests"] = frame_manifests
                 payload["frame_prompt_contract_validations"] = (
                     frame_validations)
                 payload["prompt_contract"] = frame_contracts["first_frame"]

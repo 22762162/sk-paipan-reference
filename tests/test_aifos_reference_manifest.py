@@ -118,6 +118,75 @@ def test_shot_payload_preserves_functional_population_without_identity_refs(
         "expected_visible_figure_count"] == payload["visible_figure_count"]
 
 
+def test_joint_frames_keep_phase_prompts_and_drop_cross_phase_wardrobe_ref(
+        app, tmp_path):
+    """换装镜头的首尾合同与视觉参考必须按边界隔离。"""
+    project, episode, _ = _preproduce(app, title="首尾换装隔离")
+    storyboard, _ = app.projects.latest_document(
+        episode["id"], "storyboard")
+    script, _ = app.projects.latest_document(episode["id"], "script")
+    shot = next(item for item in storyboard["shots"]
+                if item.get("characters"))
+    hero = shot["characters"][0]
+    shot["start_state"] = {hero: {
+        "position": "床中央仰躺", "wardrobe": "象牙白衬衫，未穿鞋",
+        "hair_makeup": "长发散在枕面", "emotion": "闭眼梦魇",
+    }}
+    shot["end_state"] = {hero: {
+        "position": "走廊远端", "wardrobe": "浅卡其风衣、米色平底鞋",
+        "hair_makeup": "长发随步伐轻动", "emotion": "急迫离开",
+    }}
+    shot["frame_targets"] = {
+        "keyframe": {
+            "phase": "end", "state": f"{hero}穿风衣走向走廊远端",
+            "characters": [hero], "visible_figure_count": 1,
+            "fallback": False,
+        },
+        "first_frame": {
+            "phase": "start", "state": f"{hero}在床中央仰躺",
+            "characters": [hero], "visible_figure_count": 1,
+            "fallback": False,
+        },
+        "last_frame": {
+            "phase": "end", "state": f"{hero}穿风衣走向走廊远端",
+            "characters": [hero], "visible_figure_count": 1,
+            "fallback": False,
+        },
+    }
+    ctx = {
+        "project": dict(project), "episode": dict(episode),
+        "out_root": app.workspace.artifacts_dir
+        / f"p{project['id']:03d}" / "e001",
+        "script": script, "storyboard": storyboard,
+        "aspect": "9:16", "dims": {"width": 1080, "height": 1920},
+    }
+
+    payload = app.director._shot_payload(ctx, shot, frame_kind="frames")
+    first = payload["frame_prompt_compacts"]["first_frame"]
+    last = payload["frame_prompt_compacts"]["last_frame"]
+
+    assert "象牙白衬衫" in first and "浅卡其风衣" not in first
+    assert "浅卡其风衣" in last and "象牙白衬衫" not in last
+    assert not any(
+        item.get("role") == "wardrobe" and item.get("character") == hero
+        for item in payload["reference_manifest"])
+
+    keyframe = tmp_path / "authored-end.png"
+    keyframe.write_bytes(PNG)
+    row = app.assets.register(
+        project["id"], "image", "authored-end", uri=str(keyframe),
+        meta={"image_quality": "high"})
+    assert app.director._bind_keyframe_for_frames(payload, shot, row) == "end"
+    first_uris = {
+        item["uri"] for item in
+        payload["frame_reference_manifests"]["first_frame"]}
+    last_uris = {
+        item["uri"] for item in
+        payload["frame_reference_manifests"]["last_frame"]}
+    assert str(keyframe) not in first_uris
+    assert str(keyframe) in last_uris
+
+
 def test_later_qc_prefers_immutable_generation_snapshot(app):
     snapshot = {
         "schema": "aifos.image-generation-input/v1",
@@ -269,6 +338,46 @@ def test_selected_later_outfit_cannot_pollute_current_shot(app, monkeypatch):
     assert facts["temperament"] == "镇定内紧"
     assert "旧月白直裰" not in json.dumps(facts, ensure_ascii=False)
     assert "夜探书房相" not in json.dumps(facts, ensure_ascii=False)
+
+
+def test_static_frame_character_facts_follow_selected_phase(app, monkeypatch):
+    """First-frame subject styling must not inherit the tail appearance."""
+    monkeypatch.setattr(
+        app.director, "_character_design",
+        lambda _project_id, _name: {
+            "species": "人类", "gender": "女", "costume": "身份图旧服装",
+        })
+    monkeypatch.setattr(
+        app.director, "_locked_look_variant",
+        lambda _project_id, _name: {})
+    shot = {
+        "characters": ["虞寻歌"],
+        "start_state": {"虞寻歌": {
+            "wardrobe": "象牙白衬衫、深灰西裤，未穿风衣与鞋",
+            "hair_makeup": "长卷发散在枕面",
+            "emotion": "惊惧梦魇",
+        }},
+        "end_state": {"虞寻歌": {
+            "wardrobe": "浅卡其风衣、米色平底鞋",
+            "hair_makeup": "长卷发随步伐轻动",
+            "emotion": "表面镇定、步伐急迫",
+        }},
+    }
+    ctx = {"project": {"id": 1}, "script": {"characters": []}}
+
+    first = app.director._shot_character_facts(
+        ctx, {**shot, "frame_target": {"phase": "start"}})["虞寻歌"]
+    last = app.director._shot_character_facts(
+        ctx, {**shot, "frame_target": {"phase": "end"}})["虞寻歌"]
+
+    assert first["costume"] == "象牙白衬衫、深灰西裤，未穿风衣与鞋"
+    assert first["hair"] == "长卷发散在枕面"
+    assert first["temperament"] == "惊惧梦魇"
+    assert "浅卡其风衣" not in first["costume"]
+    assert "米色平底鞋" not in first["costume"]
+    assert last["costume"] == "浅卡其风衣、米色平底鞋"
+    assert last["hair"] == "长卷发随步伐轻动"
+    assert last["temperament"] == "表面镇定、步伐急迫"
 
 
 def test_conflicting_full_body_identity_uses_face_only_anchor(

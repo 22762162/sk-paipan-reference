@@ -469,6 +469,11 @@ def after_assertions(storyboard):
     shot3_subject = shot3_contract.get("subject") or {}
     shot3_actors = shot3_subject.get("actors") or []
     shot3_refs = shot3_contract.get("references") or []
+
+    def actor_name(value):
+        """Extract the registered name from phase-rich actor render lines."""
+        text = str(value or "")
+        return text.split("=", 1)[-1].split("（", 1)[0].strip()
     checks = {
         "all_locations_authoritative": all(
             shot.get("location") == LOCATIONS[number]
@@ -494,8 +499,8 @@ def after_assertions(storyboard):
             shot1_first_contract.get("scene") == "酒店房间内"
             and len(shot1_first_contract.get("subject", {}).get(
                 "actors") or []) == 1
-            and (shot1_first_contract.get("subject", {}).get(
-                "actors") or [""])[0].endswith("虞寻歌")
+            and actor_name((shot1_first_contract.get("subject", {}).get(
+                "actors") or [""])[0]) == "虞寻歌"
             and len(shot1_first_contract.get("references") or []) == 1
             and (shot1_first_contract.get("references") or [{}])[0].get(
                 "character") == "虞寻歌"
@@ -544,7 +549,7 @@ def after_assertions(storyboard):
             and shot3_subject.get("count") == 1
             and shot3_subject.get("visible_count") == 1
             and len(shot3_actors) == 1
-            and str(shot3_actors[0]).endswith("虞寻歌")
+            and actor_name(shot3_actors[0]) == "虞寻歌"
             and len(shot3_refs) == 1
             and shot3_refs[0].get("character") == "虞寻歌"
             and "虞寻欢" not in " ".join(str(item) for item in shot3_actors)

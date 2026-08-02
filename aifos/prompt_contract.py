@@ -3215,23 +3215,82 @@ def build_physical_contract(shot, *, media="video", target_phase=""):
     }
 
 
-def _character_lines(shot):
+def _character_lines(shot, *, media="video", target_phase=""):
     characters = list(shot.get("characters") or [])
     number_map = shot.get("character_number_map") or {}
     visuals = shot.get("character_visuals") or {}
+    backgrounds = shot.get("character_background") or {}
     actor_by_name = {
         item.get("name"): actor_id
         for actor_id, item in number_map.items()
         if isinstance(item, dict) and item.get("name")
     }
-    return [
-        (
+
+    def phase_state(name):
+        phase = _text(target_phase).lower()
+        if phase in {"start", "end"}:
+            states = shot.get(f"{phase}_state") or {}
+            return (
+                states.get(name) if isinstance(states, dict) else None)
+        if phase == "freeze":
+            states = shot.get("freeze_state") or {}
+            current = states.get(name) if isinstance(states, dict) else None
+            if isinstance(current, dict):
+                return current
+            start_states = shot.get("start_state") or {}
+            end_states = shot.get("end_state") or {}
+            start = (
+                start_states.get(name)
+                if isinstance(start_states, dict) else {}) or {}
+            end = (
+                end_states.get(name)
+                if isinstance(end_states, dict) else {}) or {}
+            dynamic = (
+                "wardrobe", "hair_makeup", "headwear", "prop", "emotion")
+            if all(_text(start.get(key)) == _text(end.get(key))
+                   for key in dynamic):
+                return start
+            return None
+        return None
+
+    def visual_line(name):
+        facts = backgrounds.get(name)
+        facts = facts if isinstance(facts, dict) else {}
+        pieces = []
+        for keys, label in (
+                (("species",), "形态"),
+                (("gender", "sex"), "性别"),
+                (("age_range",), "年龄段"),
+                (("identity",), "身份"),
+                (("occupation",), "职业身份")):
+            value = next((_text(facts.get(key)) for key in keys
+                          if _text(facts.get(key))), "")
+            if value:
+                pieces.append(f"{label}:{value}")
+        current = phase_state(name)
+        if isinstance(current, dict):
+            for key, label in (
+                    ("hair_makeup", "发型/妆造"),
+                    ("emotion", "气质"),
+                    ("wardrobe", "服装"),
+                    ("headwear", "头饰"),
+                    ("prop", "标志道具")):
+                if _text(current.get(key)):
+                    pieces.append(f"{label}:{_text(current.get(key))}")
+        # Old persisted payloads may have only the rendered visual string.
+        # Preserve compatibility when there is no structured identity/state;
+        # otherwise never reintroduce its unscoped tail wardrobe.
+        if not pieces:
+            return _text(visuals.get(name))
+        return ",".join(pieces)
+
+    output = []
+    for index, name in enumerate(characters, 1):
+        line = visual_line(name)
+        output.append(
             f"{actor_by_name.get(name) or f'P{index:02d}'}={name}"
-            + (f"（{_text(visuals.get(name))}）"
-               if _text(visuals.get(name)) else "")
-        )
-        for index, name in enumerate(characters, 1)
-    ]
+            + (f"（{line}）" if line else ""))
+    return output
 
 
 def _character_identity_facts(shot):
@@ -3672,7 +3731,16 @@ def build_shot_prompt_contract(
             "registered_count": registered_count,
             "functional_count": functional_count,
             "visible_count": visible_count,
-            "actors": _character_lines(shot),
+            "actors": _character_lines(
+                shot, media=output_media,
+                # A video spans both boundaries.  Its subject line must lock
+                # only stable identity; start/end wardrobe, hair, emotion and
+                # props belong to their timeline state sections.  Passing the
+                # normalized end phase here pinned the whole take to the tail
+                # appearance and also polluted jointly generated first frames.
+                target_phase=(
+                    "timeline" if output_media == "video"
+                    else target_phase)),
             "identity_facts": _character_identity_facts(shot),
             "identity_facts_required": identity_facts_required,
             "functional_figures": functional_figures,

@@ -150,13 +150,6 @@ def test_low_quality_shot_image_is_not_a_formal_video_reference(app):
     {"physical_invalid": True},
     {"selection_qc_passed": False},
     {"qc": {
-        "best_effort_promoted": True,
-        "nonblocking_risk": {
-            "best_effort": True,
-            "issues": ["安全带从错误方向穿过人物身体"],
-        },
-    }},
-    {"qc": {
         "physical_logic_checked": True,
         "physical_logic_match": False,
     }},
@@ -174,6 +167,33 @@ def test_unfit_asset_meta_is_rejected_by_unified_video_policy(
         meta={"image_quality": "high", **bad_meta})
 
     assert app.director._video_reference_rejection(row)
+
+
+def test_historical_best_effort_is_allowed_after_current_physical_pass(
+        app, tmp_path):
+    """历史相对最优标记不能永久误伤已经修好的正式参考图。"""
+    project, _ = app.projects.get_or_create_project("修复后参考资格")
+    image = tmp_path / "repaired-reference.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+    row = app.assets.register(
+        project["id"], "image", "repaired-reference", uri=str(image),
+        meta={
+            "image_quality": "high",
+            "qc": {
+                "best_effort_promoted": True,
+                "nonblocking_risk": {
+                    "best_effort": True,
+                    "issues": ["历史候选曾需人工复核"],
+                },
+                "visual_pass": True,
+                "technical_quality_pass": True,
+                "physical_logic_match": True,
+                "spatial_logic_match": True,
+                "critical_failures": [],
+            },
+        })
+
+    assert app.director._video_reference_rejection(row) == ""
 
 
 def test_auto_reference_skips_physical_failure_and_accepts_clean_new_version(

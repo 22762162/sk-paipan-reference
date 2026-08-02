@@ -2097,6 +2097,63 @@ def test_static_end_phase_overrides_stale_dialogue_gaze_and_start_facing():
     assert "推=摄影机沿视线方向" not in prompt
 
 
+def test_static_subject_appearance_comes_from_selected_phase_not_shared_visual():
+    """Joint-frame payloads cannot leak tail clothes into the first frame."""
+    shot = {
+        "characters": ["虞寻歌"],
+        "character_background": {"虞寻歌": {
+            "species": "人类", "gender": "女", "age_range": "25岁",
+            "identity": "演员", "occupation": "演员",
+            "costume": "浅卡其风衣、米色平底鞋",
+        }},
+        "character_visuals": {"虞寻歌": (
+            "形态:人类,性别:女,发型:长卷发随步伐轻动,"
+            "气质:表面镇定、步伐急迫,服装:浅卡其风衣、米色平底鞋")},
+        "start_state": {"虞寻歌": {
+            "wardrobe": "象牙白衬衫、深灰西裤，未穿风衣与鞋",
+            "hair_makeup": "长卷发散在枕面",
+            "emotion": "惊惧梦魇",
+            "prop": "双手未持物",
+        }},
+        "end_state": {"虞寻歌": {
+            "wardrobe": "浅卡其风衣、米色平底鞋",
+            "hair_makeup": "长卷发随步伐轻动",
+            "emotion": "表面镇定、步伐急迫",
+            "prop": "双手空置",
+        }},
+        "frame_targets": {
+            "first_frame": {
+                "phase": "start", "state": "虞寻歌仰躺在床上",
+                "characters": ["虞寻歌"], "visible_figure_count": 1,
+            },
+            "last_frame": {
+                "phase": "end", "state": "虞寻歌穿好衣服离开房间",
+                "characters": ["虞寻歌"], "visible_figure_count": 1,
+            },
+        },
+    }
+
+    _, first = compile_shot_prompt(shot, mode="first_frame")
+    _, last = compile_shot_prompt(shot, mode="last_frame")
+    _, video = compile_shot_prompt(shot, mode="video")
+    first_subject = first.split("【场景】", 1)[0]
+    last_subject = last.split("【场景】", 1)[0]
+    video_subject = video.split("【场景】", 1)[0]
+
+    assert "未穿风衣与鞋" in first_subject
+    assert "长卷发散在枕面" in first_subject
+    assert "惊惧梦魇" in first_subject
+    for tail_only in ("浅卡其风衣", "米色平底鞋", "步伐急迫", "随步伐轻动"):
+        assert tail_only not in first_subject
+    assert "浅卡其风衣" in last_subject
+    assert "米色平底鞋" in last_subject
+    assert "步伐急迫" in last_subject
+    # Video subject is identity-only; start/end appearance remains in the
+    # existing timeline state sections instead of pinning the whole take.
+    assert "浅卡其风衣" not in video_subject
+    assert "未穿风衣与鞋" not in video_subject
+
+
 def test_latest_camera_compound_scale_and_lens_override_stale_nested_fields():
     """A repair camera is authoritative even when old nested fields remain."""
     shot = {

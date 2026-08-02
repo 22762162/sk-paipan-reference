@@ -245,7 +245,8 @@ def test_apply_writes_v14_and_exact_authoritative_phase_contracts(
              "character": "柳争流"},
         ])
     assert len(contract["subject"]["actors"]) == 1
-    assert contract["subject"]["actors"][0].endswith("虞寻歌")
+    assert (contract["subject"]["actors"][0]
+            .split("=", 1)[-1].split("（", 1)[0]) == "虞寻歌"
     assert contract["subject"]["visible_count"] == 1
     assert contract["scene"] == "酒店房间内"
     assert [ref["character"] for ref in contract["references"]] == ["虞寻歌"]
@@ -265,7 +266,8 @@ def test_apply_writes_v14_and_exact_authoritative_phase_contracts(
     contract, prompt = compile_shot_prompt(
         shot2_first, location=shots[2]["location"], mode="image")
     assert len(contract["subject"]["actors"]) == 1
-    assert contract["subject"]["actors"][0].endswith("虞寻歌")
+    assert (contract["subject"]["actors"][0]
+            .split("=", 1)[-1].split("（", 1)[0]) == "虞寻歌"
     assert contract["subject"]["visible_count"] == 2
     assert len(contract["subject"]["functional_figures"]) == 1
     assert "左前驾驶位" in prompt
@@ -286,7 +288,8 @@ def test_apply_writes_v14_and_exact_authoritative_phase_contracts(
     assert contract["subject"]["count"] == 1
     assert contract["subject"]["visible_count"] == 1
     assert len(contract["subject"]["actors"]) == 1
-    assert contract["subject"]["actors"][0].endswith("虞寻歌")
+    assert (contract["subject"]["actors"][0]
+            .split("=", 1)[-1].split("（", 1)[0]) == "虞寻歌"
     assert [ref["character"] for ref in contract["references"]] == ["虞寻歌"]
     assert "虞寻欢" not in contract["subject"]["actors"]
     assert "虞寻欢" not in prompt

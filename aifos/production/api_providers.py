@@ -1420,6 +1420,12 @@ class OpenAIImageProvider(Provider):
             calls = 0
             normalizations = {}
             keyframe_phase = _api_keyframe_phase(payload)
+            frame_prompts = payload.get("frame_prompt_compacts") or {}
+            frame_manifests = payload.get("frame_reference_manifests") or {}
+            first_prompt = str(
+                frame_prompts.get("first_frame") or prompt)
+            last_prompt = str(
+                frame_prompts.get("last_frame") or prompt)
             keyframe = Path(_api_keyframe_uri(payload, keyframe_phase))
             keyframe_valid = (
                 keyframe.exists() and keyframe.suffix.lower() in _IMG_MEDIA)
@@ -1448,12 +1454,17 @@ class OpenAIImageProvider(Provider):
 
             if first_source == "generated":
                 first_payload = dict(payload)
-                if keyframe_valid:
+                first_payload["prompt_compact"] = first_prompt
+                first_payload["reference_manifest"] = (
+                    frame_manifests["first_frame"]
+                    if "first_frame" in frame_manifests
+                    else payload.get("reference_manifest") or [])
+                if keyframe_valid and keyframe_phase != "end":
                     # end/freeze/未知关键图只能作身份、场景、构图参考；
                     # 绝不能通过文件换名冒充动作起点。
                     first_payload["frame_keyframe_uri"] = str(keyframe)
                 normalizations["first"] = self._gen_image(
-                    f"{prompt}。首帧:动作起始瞬间，发生在动作终点之前；"
+                    f"{first_prompt}。首帧:动作起始瞬间，发生在动作终点之前；"
                     "严格按起始状态生成，不得复制或倒置终点状态，构图稳定",
                     size, first, first_payload)
                 calls += 1
@@ -1464,11 +1475,17 @@ class OpenAIImageProvider(Provider):
                 # 尾帧以首帧为参考,保证同角色同场景连贯。freeze/未知
                 # 关键图仍可作为非边界构图参考，但不能替代任一端点。
                 last_payload = {**payload, "chain_first_uri": str(first)}
+                last_payload["prompt_compact"] = last_prompt
+                last_payload["reference_manifest"] = (
+                    frame_manifests["last_frame"]
+                    if "last_frame" in frame_manifests
+                    else payload.get("reference_manifest") or [])
                 if keyframe_valid and keyframe_phase not in {"start", "end"}:
                     last_payload["frame_keyframe_uri"] = str(keyframe)
                 normalizations["last"] = self._gen_image(
-                    f"{prompt}。尾帧:动作结束瞬间,与首帧同场景同角色、"
-                    "人物服装道具一致",
+                    f"{last_prompt}。尾帧:动作结束瞬间；与首帧保持人物身份"
+                    "和不可变场景结构连续，服装、发型、持物及位置严格服从"
+                    "尾帧合同；剧本明确变化时不得强行沿用首帧",
                     size, last, last_payload)
                 calls += 1
             return ProviderResult(
