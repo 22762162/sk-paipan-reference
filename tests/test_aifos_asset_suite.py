@@ -789,6 +789,67 @@ def test_codex_frames_end_keyframe_is_last_never_first(tmp_path):
     assert "不得把尾帧服装" in instruction
 
 
+def test_codex_final_still_instruction_does_not_revive_hidden_prop_or_old_text(
+        tmp_path):
+    """发送层不得把整镜审计字段重新追加到当前静态相位合同。"""
+    projected = (
+        "【镜头合同v1】当前相位=终点；虞寻歌看向床上的弟弟；"
+        "画面中不出现手机，不显示任何可读文字。"
+    )
+    instruction, _, _ = build_instruction("image", {
+        "shot_no": 4,
+        "prompt": "整镜原文",
+        "prompt_compact": projected,
+        "prompt_contract_complete": True,
+        "characters": ["虞寻歌", "虞寻欢"],
+        "camera": "整镜旧机位",
+        "readable_text": {
+            "required": True,
+            "carrier": "手机锁屏",
+            "whitelist": ["02:21:59"],
+        },
+        "end_state": {
+            "虞寻歌": {"prop": "手机已收入口袋"},
+        },
+    }, tmp_path)
+
+    assert projected in instruction
+    assert "手机已收入口袋" not in instruction
+    assert "02:21:59" not in instruction
+    assert "整镜旧机位" not in instruction
+
+
+def test_codex_final_frame_instructions_do_not_append_whole_take_prop_or_text(
+        tmp_path):
+    """独立首尾帧合同后不能再拼接跨相位 start/end/readable_text。"""
+    instruction, _, _ = build_instruction("frames", {
+        "shot_no": 4,
+        "prompt": "整镜原文包含旧手机时间",
+        "prompt_compact": "合并审计提示，不用于边界事实补写",
+        "prompt_contract_complete": True,
+        "frame_prompt_compacts": {
+            "first_frame": "首帧合同：人物看向床；手机不可见，无可读文字",
+            "last_frame": "尾帧合同：人物走向门口；手机不可见，无可读文字",
+        },
+        "start_state": {
+            "虞寻歌": {"prop": "手机锁屏显示02:21:59"},
+        },
+        "end_state": {
+            "虞寻歌": {"prop": "手机已收入口袋"},
+        },
+        "readable_text": {
+            "required": True,
+            "carrier": "手机锁屏",
+            "whitelist": ["02:21:59"],
+        },
+    }, tmp_path)
+
+    assert "首帧合同：人物看向床" in instruction
+    assert "尾帧合同：人物走向门口" in instruction
+    assert "手机已收入口袋" not in instruction
+    assert "02:21:59" not in instruction
+
+
 @pytest.mark.parametrize("phase", ["freeze", "", "unexpected"])
 def test_codex_frames_non_boundary_keyframe_generates_both_frames(
         tmp_path, phase):

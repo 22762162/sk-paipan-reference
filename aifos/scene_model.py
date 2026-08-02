@@ -21,6 +21,7 @@ from __future__ import annotations
 import math
 
 SCHEMA = "aifos.scene-model/v2"
+SCALE_POLICY = "semantic-realworld-scale/v1"
 DEFAULT_CAPTURE_HEIGHT_M = 1.55
 # 视线过于接近水平时,地面交点会跑到无穷远——超过这个距离一律判为
 # 「看不出落地点」,而不是给一个荒谬的坐标。
@@ -99,6 +100,145 @@ _DEFAULT_GEOMETRY = {
     "decor": {"width_m": 0.5, "height_m": 1.2, "depth_ratio": 0.12,
               "min_depth_m": 0.08, "max_depth_m": 0.35},
 }
+
+
+# 单张全景中的像素跨度很容易把远处实体压成厘米级，或把贴近镜头的实体
+# 放大成整面墙。射线求交只能证明落地点，不能保证视觉模型标出的跨度语义
+# 正确。以下基线只覆盖尺寸高度稳定、不会因风格而改变数量级的物类；命中
+# 异常时使用保守真实值，并保留 scale_adjustments/issue，绝不继续把异常值
+# 标成“全景实测”。
+_PERSONAL_VEHICLE_ROOM = {
+    "name": "乘用车车厢",
+    "dimensions": {
+        "floor_width_m": {"min": 1.35, "max": 2.6, "fallback": 1.85},
+        "floor_depth_m": {"min": 2.5, "max": 6.5, "fallback": 4.4},
+        "wall_height_m": {"min": 1.05, "max": 2.3, "fallback": 1.55},
+    },
+}
+
+
+def _semantic_object_profile(name, category):
+    """返回只针对稳定物类的真实尺寸基线；未知物体不擅自修正。"""
+    text = str(name or "").lower()
+
+    if any(word in text for word in ("床头柜", "床边柜", "床侧柜")):
+        return {
+            "label": "床头柜",
+            "width_m": (0.3, 1.0, 0.5),
+            "depth_m": (0.25, 0.8, 0.45),
+            "height_m": (0.3, 0.95, 0.55),
+        }
+    if "床" in text and not any(
+            word in text for word in ("床头", "床架", "床垫", "床单")):
+        if any(word in text for word in ("双人", "大床", "queen", "king")):
+            width_range = (1.35, 2.5, 1.8)
+        elif "单人" in text:
+            width_range = (0.75, 1.5, 1.0)
+        else:
+            width_range = (0.75, 2.5, 1.5)
+        return {
+            "label": "床",
+            "width_m": width_range,
+            "depth_m": (1.7, 2.6, 2.0),
+            # 含床头板时顶部可高于床面，故这里只拦截数量级错误。
+            "height_m": (0.3, 2.0, 0.65),
+        }
+    if any(word in text for word in ("门框", "门套")):
+        return {
+            "label": "门框",
+            "width_m": (0.62, 3.2, 0.95),
+            "height_m": (1.75, 4.5, 2.2),
+            "depth_m": (0.03, 0.4, 0.12),
+        }
+    if "车门" in text:
+        return {
+            "label": "乘用车车门",
+            "width_m": (0.6, 1.6, 0.9),
+            "height_m": (0.75, 1.8, 1.25),
+            "depth_m": (0.025, 0.35, 0.1),
+        }
+    if category == "opening" and "门" in text:
+        return {
+            "label": "门",
+            "width_m": (0.65, 2.6, 0.9),
+            "height_m": (1.75, 3.5, 2.1),
+            "depth_m": (0.025, 0.45, 0.08),
+        }
+    if "车窗" in text:
+        return {
+            "label": "车窗",
+            "width_m": (0.4, 2.2, 0.9),
+            "height_m": (0.35, 1.6, 0.75),
+            "depth_m": (0.01, 0.25, 0.06),
+        }
+    return None
+
+
+def _personal_vehicle_room_profile(location):
+    text = str(location or "").lower()
+    # “火车内/马车内”虽然也包含“车内”，尺度完全不同，必须先排除。
+    excluded = ("火车", "列车", "高铁", "地铁", "轻轨", "公交",
+                "大巴", "客车", "马车")
+    if any(word in text for word in excluded):
+        return None
+    personal = ("轿车", "汽车", "suv", "越野车", "私家车", "出租车",
+                "网约车", "商务车", "面包车", "驾驶室", "副驾驶", "车内")
+    return _PERSONAL_VEHICLE_ROOM if any(
+        word in text for word in personal) else None
+
+
+def _normalise_semantic_room(room, location):
+    """阻止乘用车被通用 10x7x4.2m 房间盒冒充真实车厢。"""
+    source = dict(room or {})
+    effective = dict(source)
+    profile = _personal_vehicle_room_profile(location)
+    adjustments = []
+    if profile is None:
+        return effective, adjustments
+    for field, limits in profile["dimensions"].items():
+        measured = _positive_number(source.get(field))
+        if (measured is not None
+                and limits["min"] <= measured <= limits["max"]):
+            effective[field] = measured
+            continue
+        replacement = float(limits["fallback"])
+        effective[field] = replacement
+        adjustments.append({
+            "field": field,
+            "original_m": measured,
+            "replacement_m": replacement,
+            "allowed_min_m": float(limits["min"]),
+            "allowed_max_m": float(limits["max"]),
+            "semantic_class": profile["name"],
+        })
+    return effective, adjustments
+
+
+def _normalise_semantic_object_dimensions(name, category, dimensions):
+    profile = _semantic_object_profile(name, category)
+    effective = dict(dimensions)
+    adjustments = []
+    if profile is None:
+        return effective, adjustments
+    for field in ("width_m", "depth_m", "height_m"):
+        limits = profile.get(field)
+        if limits is None:
+            continue
+        lower, upper, fallback = limits
+        measured = _positive_number(effective.get(field))
+        if measured is not None and lower <= measured <= upper:
+            continue
+        replacement = float(fallback)
+        effective[field] = replacement
+        adjustments.append({
+            "field": field,
+            "original_m": measured,
+            "replacement_m": replacement,
+            "allowed_min_m": float(lower),
+            "allowed_max_m": float(upper),
+            "semantic_class": profile["label"],
+        })
+    return effective, adjustments
 
 
 def _semantic_height_cap(name, category):
@@ -324,6 +464,35 @@ def build_object(annotation, *, capture_height=DEFAULT_CAPTURE_HEIGHT_M,
             float(defaults["min_depth_m"]),
             min(float(defaults["max_depth_m"]),
                 final_width * float(defaults["depth_ratio"])))
+    geometry_sources = {
+        "position": "panorama_floor_intersection",
+        "width": (
+            "panorama_angular_span"
+            if measured_width is not None else "category_default"),
+        "height": (
+            "semantic_cap_over_panorama_vertical_ray"
+            if semantic_height_clamped
+            else ("panorama_vertical_ray"
+                  if measured_height is not None else "category_default")),
+        "depth": (
+            "visual_annotation"
+            if annotated_depth is not None else "category_default"),
+    }
+    dimensions, scale_adjustments = _normalise_semantic_object_dimensions(
+        name, category, {
+            "width_m": final_width,
+            "height_m": final_height,
+            "depth_m": final_depth,
+        })
+    final_width = dimensions["width_m"]
+    final_height = dimensions["height_m"]
+    final_depth = dimensions["depth_m"]
+    for adjustment in scale_adjustments:
+        source_field = adjustment["field"].removesuffix("_m")
+        adjustment["replaced_source"] = geometry_sources.get(source_field)
+        # 下游已把 category_default 视为低置信度并展示告警；语义类别和
+        # 原测量来源留在 adjustment 中，不能创造一个被误打中等分的新源。
+        geometry_sources[source_field] = "category_default"
     annotated_rotation = (
         annotation.get("rotation_y_deg")
         if annotation.get("rotation_y_deg") is not None
@@ -360,21 +529,15 @@ def build_object(annotation, *, capture_height=DEFAULT_CAPTURE_HEIGHT_M,
         "inside_room": inside,
         "footprint_inside_room": _footprint_inside_room(footprint, room),
         "footprint_clamped": footprint_clamped,
-        "height_clamped": bool(height_overflow or semantic_height_clamped),
+        "height_clamped": bool(
+            height_overflow or semantic_height_clamped
+            or any(item["field"] == "height_m"
+                   for item in scale_adjustments)),
+        "scale_adjusted": bool(scale_adjustments),
+        "scale_adjustments": scale_adjustments,
         "semantic_height_cap_m": semantic_height_cap,
         "geometry_sources": {
-            "position": "panorama_floor_intersection",
-            "width": (
-                "panorama_angular_span"
-                if measured_width is not None else "category_default"),
-            "height": (
-                "semantic_cap_over_panorama_vertical_ray"
-                if semantic_height_clamped
-                else ("panorama_vertical_ray"
-                      if measured_height is not None else "category_default")),
-            "depth": (
-                "visual_annotation"
-                if annotated_depth is not None else "category_default"),
+            **geometry_sources,
             "rotation": (
                 "visual_annotation"
                 if annotated_rotation is not None else "radial_fallback"),
@@ -391,10 +554,30 @@ def build_scene_model(annotations, *, location="",
                       capture_height=DEFAULT_CAPTURE_HEIGHT_M, room=None,
                       panorama_uri=""):
     """一组标注 → 场景物体表 + 自检问题清单。"""
+    source_room = dict(room or {})
+    effective_room, room_adjustments = _normalise_semantic_room(
+        source_room, location)
     objects, issues = [], []
+    for adjustment in room_adjustments:
+        original = adjustment["original_m"]
+        original_text = "缺失" if original is None else f"{original:.3f}m"
+        issues.append({
+            "severity": "warning",
+            "code": "semantic_room_scale_fallback",
+            "field": "room_scale",
+            "dimension": adjustment["field"],
+            "message": (
+                f"场景「{location or '未命名场景'}」被识别为"
+                f"{adjustment['semantic_class']}，"
+                f"{adjustment['field']}={original_text} 超出合理范围"
+                f" {adjustment['allowed_min_m']:.2f}–"
+                f"{adjustment['allowed_max_m']:.2f}m；已改用"
+                f" {adjustment['replacement_m']:.2f}m，禁止把通用房间"
+                "盒当作真实车厢"),
+        })
     for index, annotation in enumerate(annotations or [], 1):
         built = build_object(annotation, capture_height=capture_height,
-                             room=room)
+                             room=effective_room)
         if built is None:
             issues.append({
                 "severity": "warning", "field": "annotation",
@@ -423,14 +606,35 @@ def build_scene_model(annotations, *, location="",
                     "画出的完整盒体会越墙,已整体钳回室内;"
                     "请复核深度、朝向或底边中心"),
             })
+        for adjustment in built.get("scale_adjustments") or []:
+            original = adjustment["original_m"]
+            original_text = "缺失" if original is None else f"{original:.3f}m"
+            issues.append({
+                "severity": "warning",
+                "code": "semantic_object_scale_fallback",
+                "field": "object_scale",
+                "dimension": adjustment["field"],
+                "object": built["name"],
+                "message": (
+                    f"「{built['name']}」{adjustment['field']}="
+                    f"{original_text} 超出{adjustment['semantic_class']}"
+                    f"合理范围 {adjustment['allowed_min_m']:.2f}–"
+                    f"{adjustment['allowed_max_m']:.2f}m；已改用"
+                    f" {adjustment['replacement_m']:.2f}m，原"
+                    f"{adjustment.get('replaced_source') or '未知'}测量"
+                    "不再作为真实尺度"),
+            })
         objects.append(built)
     issues.extend(overlap_issues(objects))
     return {
         "schema": SCHEMA,
+        "scale_policy": SCALE_POLICY,
         "location": location,
         "panorama_uri": panorama_uri,
         "capture": {"x": 0.0, "y": round(float(capture_height), 2), "z": 0.0},
-        "room": dict(room or {}),
+        "room": effective_room,
+        "source_room": source_room if room_adjustments else None,
+        "room_scale_adjustments": room_adjustments,
         "objects": objects,
         "issues": issues,
     }
@@ -561,6 +765,7 @@ def repair_actor_furniture_collisions(
         obj for obj in (model.get("objects") or [])
         if isinstance(obj, dict)
         and obj.get("category") in ("furniture", "prop")
+        and not obj.get("scale_adjusted")
         and (obj.get("geometry_sources") or {}).get("depth")
         == "visual_annotation"
         and (obj.get("geometry_sources") or {}).get("rotation")
@@ -652,6 +857,7 @@ def repair_camera_furniture_collisions(
         obj for obj in (model.get("objects") or [])
         if isinstance(obj, dict)
         and obj.get("category") in ("furniture", "prop")
+        and not obj.get("scale_adjusted")
         and (obj.get("geometry_sources") or {}).get("depth")
         == "visual_annotation"
         and (obj.get("geometry_sources") or {}).get("rotation")
@@ -788,7 +994,8 @@ def actor_placement_issues(scene_model, actors, *, clearance_m=0.35):
                 if gap < clearance_m:
                     sources = obj.get("geometry_sources") or {}
                     measured_box = (
-                        sources.get("depth") == "visual_annotation"
+                        not obj.get("scale_adjusted")
+                        and sources.get("depth") == "visual_annotation"
                         and sources.get("rotation") == "visual_annotation")
                     collision = gap <= 0.02
                     # A seated/leaning performer at a declared desk or chair
@@ -870,7 +1077,8 @@ def camera_placement_issues(scene_model, camera, *, clearance_m=0.15):
             if gap < clearance_m:
                 sources = obj.get("geometry_sources") or {}
                 measured_box = (
-                    sources.get("depth") == "visual_annotation"
+                    not obj.get("scale_adjusted")
+                    and sources.get("depth") == "visual_annotation"
                     and sources.get("rotation") == "visual_annotation")
                 collision = gap <= 0.02
                 severity = (

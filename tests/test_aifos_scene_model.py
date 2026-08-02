@@ -129,6 +129,83 @@ class SceneModelTest(unittest.TestCase):
             room=ROOM)
         self.assertTrue(any(i["field"] == "overlap" for i in model["issues"]))
 
+    def test_centimetre_bed_and_door_are_replaced_and_reported(self):
+        """远处像素跨度不能把床/门压成厘米级后继续冒充真实尺度。"""
+        model = build_scene_model([
+            self._annot("床", 0.0, 2.0, width_u=0.001, depth_m=2.1),
+            self._annot(
+                "客房入户门", 2.0, 2.0, category="opening",
+                width_u=0.001, depth_m=0.05),
+        ], location="酒店客房", room=ROOM)
+
+        bed = find_object(model, "床")
+        door = find_object(model, "客房入户门")
+        self.assertEqual(bed["width_m"], 1.5)
+        self.assertEqual(door["width_m"], 0.9)
+        self.assertEqual(
+            bed["geometry_sources"]["width"], "category_default")
+        self.assertEqual(
+            door["geometry_sources"]["width"], "category_default")
+        scale_issues = [
+            issue for issue in model["issues"]
+            if issue.get("code") == "semantic_object_scale_fallback"]
+        self.assertEqual(
+            {issue.get("object") for issue in scale_issues},
+            {"床", "客房入户门"})
+        self.assertTrue(all(
+            "不再作为真实尺度" in issue["message"]
+            for issue in scale_issues))
+
+    def test_valid_bed_dimensions_remain_panorama_measured(self):
+        distance = 2.0
+        target_width = 1.8
+        width_u = math.atan(target_width / (2.0 * distance)) / math.pi
+        model = build_scene_model([
+            self._annot(
+                "双人床", 0.0, distance, width_u=width_u, depth_m=2.1),
+        ], location="卧室", room=ROOM)
+
+        bed = find_object(model, "双人床")
+        self.assertAlmostEqual(bed["width_m"], target_width, places=2)
+        self.assertEqual(
+            bed["geometry_sources"]["width"], "panorama_angular_span")
+        self.assertFalse(bed["scale_adjusted"])
+        self.assertFalse(any(
+            issue.get("code") == "semantic_object_scale_fallback"
+            for issue in model["issues"]))
+
+    def test_personal_car_cabin_rejects_generic_room_box(self):
+        generic_room = {
+            "floor_width_m": 10.0,
+            "floor_depth_m": 7.0,
+            "wall_height_m": 4.2,
+        }
+        model = build_scene_model(
+            [], location="轿车内·高速公路", room=generic_room)
+
+        self.assertEqual(model["room"], {
+            "floor_width_m": 1.85,
+            "floor_depth_m": 4.4,
+            "wall_height_m": 1.55,
+        })
+        self.assertEqual(model["source_room"], generic_room)
+        room_issues = [
+            issue for issue in model["issues"]
+            if issue.get("code") == "semantic_room_scale_fallback"]
+        self.assertEqual(len(room_issues), 3)
+        self.assertTrue(all(
+            "禁止把通用房间盒当作真实车厢" in issue["message"]
+            for issue in room_issues))
+
+    def test_normal_room_and_non_personal_vehicle_are_not_reclassified(self):
+        bedroom = build_scene_model([], location="酒店客房", room=ROOM)
+        train = build_scene_model([], location="火车内", room=ROOM)
+
+        self.assertEqual(bedroom["room"], ROOM)
+        self.assertEqual(train["room"], ROOM)
+        self.assertEqual(bedroom["room_scale_adjustments"], [])
+        self.assertEqual(train["room_scale_adjustments"], [])
+
 
 class ActorPlacementTest(unittest.TestCase):
     """真实三维场景的兑现点:人物位置从此可被物理校验。"""

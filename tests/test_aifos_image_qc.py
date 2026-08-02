@@ -372,6 +372,91 @@ def test_codex_qc_prompt_uses_same_structured_input_diagnosis_contract(
     assert "第二次生成" in instruction
 
 
+def test_final_image_qc_prompt_uses_static_phase_projection_not_raw_payload(
+        tmp_path):
+    """最终两条 QC 适配链都不得复活 hidden/absent 与隐藏文字。"""
+    from aifos.adapters.claude_script import build_prompt
+    from aifos.adapters.codex_image import build_instruction
+
+    compiled = {
+        "schema": "aifos.shot-prompt/v2.2",
+        "output": {
+            "media": "image", "frame_phase": "end",
+            "temporal_policy": "terminal_only",
+        },
+        "frame_target": {
+            "phase": "end", "state": "虞寻歌站在酒店门口看向走廊",
+        },
+        "frame_target_state": "虞寻歌站在酒店门口看向走廊",
+        "scene": "现代酒店门口",
+        "camera": {"景别": "中景", "机位": "侧面"},
+        # Current-phase executable projection: there is nothing to draw/read.
+        "frame_props": [],
+        "readable_text_current": {"required": False},
+        "physical": {
+            "rules": ["PROJECTED_PHYSICAL：双脚由地面支撑"],
+            "objects": [], "frame_props": [],
+            # Older compiled contracts may still carry this nested audit copy.
+            "frame_props_audit": [{
+                "prop_id": "phone", "phase": "end",
+                "visibility": "hidden", "location": "风衣右袋",
+            }],
+        },
+        # Source facts stay visible for audit, never as visual requirements.
+        "frame_props_audit": [
+            {"prop_id": "wine", "name": "未开封小瓶白酒",
+             "phase": "end", "visibility": "hidden",
+             "location": "风衣左侧口袋"},
+            {"prop_id": "phone", "name": "虞寻歌的手机",
+             "phase": "end", "visibility": "absent"},
+        ],
+        "readable_text_audit": {
+            "required": True, "carrier": "手机锁屏",
+            "whitelist": ["02:21:59"],
+        },
+    }
+    payload = {
+        "image_uri": "/tmp/end.png", "characters": ["虞寻歌"],
+        "count": 1,
+        # These legacy whole-take fields deliberately contradict the compiled
+        # end phase and must not be rendered back into the QC requirements.
+        "action": "RAW_ACTION_MUST_SHOW_HIDDEN_WINE",
+        "readable_text": {
+            "required": True, "carrier": "手机锁屏",
+            "whitelist": ["RAW_TEXT_MUST_BE_READABLE"],
+        },
+        "physical_contract": {
+            "rules": ["RAW_PHYSICAL_MUST_SHOW_PHONE_SCREEN"],
+            "objects": ["RAW_PHONE_SCREEN_OBJECT"],
+        },
+        "generation_input": {
+            "scope": {"item_id": "frames:1", "shot_no": 1,
+                      "frame_kind": "last_frame"},
+            "prompt": "真实提交的当前终点提示词：人物看向走廊",
+            "reference_manifest": [],
+            "prompt_contract": compiled,
+        },
+    }
+
+    claude_prompt = build_prompt("image_qc", payload)
+    codex_prompt, targets, _ = build_instruction(
+        "image_qc", payload, tmp_path)
+    assert targets == []
+    for final_prompt in (claude_prompt, codex_prompt):
+        assert "【当前静态相位唯一画面判项】" in final_prompt
+        assert "frame_props=[]" in final_prompt
+        assert 'readable_text_current={"required":false}' in final_prompt
+        assert "PROJECTED_PHYSICAL：双脚由地面支撑" in final_prompt
+        assert "RAW_ACTION_MUST_SHOW_HIDDEN_WINE" not in final_prompt
+        assert "RAW_PHYSICAL_MUST_SHOW_PHONE_SCREEN" not in final_prompt
+        assert "RAW_PHONE_SCREEN_OBJECT" not in final_prompt
+        assert "【仅审计，不是画面判项】" in final_prompt
+        assert "未开封小瓶白酒" in final_prompt
+        assert "02:21:59" in final_prompt
+        assert "完全不可见是正确" in final_prompt
+        assert "不能要求待检图" in final_prompt
+
+
 def test_codex_qc_checks_historical_prop_morphology(tmp_path):
     from aifos.adapters.codex_image import build_instruction
 

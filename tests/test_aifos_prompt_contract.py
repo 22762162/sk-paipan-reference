@@ -1032,8 +1032,10 @@ def test_folded_functional_person_and_static_prop_text_follow_target_phase():
         contract["physical"]["rules"] + contract["physical"]["objects"])
     assert "手持屏幕关系" not in physical
     assert "手持屏幕：使用者/观看者" not in physical
-    assert "phase=end" in prompt
+    assert "phase=end" not in prompt
     assert "phase=start" not in prompt
+    assert contract["frame_props"] == []
+    assert contract["frame_props_audit"][1]["visibility"] == "hidden"
 
     start_shot = dict(shot)
     start_shot["frame_target"] = {
@@ -1175,6 +1177,98 @@ def test_hidden_phase_prop_overrides_stale_whole_take_device_description():
     assert "手持屏幕关系" not in physical
     assert "手持屏幕：使用者/观看者" not in physical
     assert "手持手机查看屏幕" not in prompt
+    assert "手机已收好" not in prompt
+    assert "physical_state=完全收纳" not in prompt
+    assert "location=风衣口袋内" not in prompt
+    assert contract["frame_props"] == []
+    assert contract["frame_props_audit"][0]["visibility"] == "hidden"
+    assert contract["frame_target_audit"]["state"].endswith("手机已收好")
+    assert contract["frame_target"]["state"] == "虞寻歌目光看向床上的弟弟"
+
+
+def test_fully_invisible_props_are_audit_only_for_static_generation_and_qc():
+    shot = {
+        "characters": ["虞寻歌"],
+        "end_state": {"虞寻歌": {
+            "pose": "站在门口看向走廊",
+            "prop": "未开封小瓶白酒已完全收纳于风衣左侧口袋",
+        }},
+        "frame_target": {
+            "phase": "end",
+            "state": (
+                "虞寻歌站在门口看向走廊，"
+                "未开封小瓶白酒已完全收纳于风衣左侧口袋，"
+                "手机不在画面"),
+            "fallback": False,
+        },
+        "prop_registry": [
+            {"prop_id": "phone", "name": "虞寻歌的手机"},
+        ],
+        "frame_props": [
+            {"prop_id": "wine", "name": "未开封小瓶白酒",
+             "phase": "end",
+             "physical_state": "完全收纳", "holder": "虞寻歌",
+             "location": "风衣左侧口袋内", "visibility": "hidden",
+             "representation": "physical"},
+            {"prop_id": "phone", "phase": "end",
+             "physical_state": "不在画面", "visibility": "absent",
+             "representation": "physical"},
+        ],
+        "readable_text": {
+            "required": True, "carrier": "手机锁屏",
+            "whitelist": ["02:21:59"],
+        },
+    }
+
+    contract, prompt = compile_shot_prompt(
+        shot, location="现代酒店房间门口", mode="image")
+
+    assert contract["frame_props"] == []
+    assert [row["visibility"] for row in contract["frame_props_audit"]] == [
+        "hidden", "absent"]
+    assert contract["frame_props_audit"][0]["name"] == "未开封小瓶白酒"
+    assert contract["physical"]["frame_props"] == []
+    assert len(contract["physical"]["frame_props_audit"]) == 2
+    assert contract["readable_text_current"] == {"required": False}
+    assert contract["readable_text_audit"]["whitelist"] == ["02:21:59"]
+    assert "虞寻歌站在门口看向走廊" in prompt
+    for invisible_fact in (
+            "未开封小瓶白酒", "完全收纳", "风衣左侧口袋",
+            "手机不在画面", "02:21:59", "【道具定格】", "手持屏幕关系"):
+        assert invisible_fact not in prompt
+
+
+def test_same_phase_visible_disclosure_prevents_false_hidden_prop_removal():
+    shot = {
+        "characters": ["甲"],
+        "frame_target": {
+            "phase": "end",
+            "state": "甲站在监控墙前，监控画面清楚显示手机正面",
+            "fallback": False,
+        },
+        "prop_registry": [{"prop_id": "phone", "name": "甲的手机"}],
+        "frame_props": [
+            {"prop_id": "phone", "phase": "end",
+             "physical_state": "实体收入口袋", "holder": "甲",
+             "location": "外套口袋内", "visibility": "hidden",
+             "representation": "physical"},
+            {"prop_id": "phone", "phase": "end",
+             "physical_state": "监控画面中的既有影像",
+             "location": "墙面监控屏内", "visibility": "visible",
+             "representation": "screen"},
+        ],
+    }
+
+    contract, prompt = compile_shot_prompt(
+        shot, location="现代监控室", mode="image")
+
+    assert contract["frame_target"]["state"].endswith("监控画面清楚显示手机正面")
+    assert len(contract["frame_props"]) == 1
+    assert contract["frame_props"][0]["representation"] == "screen"
+    assert len(contract["frame_props_audit"]) == 2
+    assert "监控画面清楚显示手机正面" in prompt
+    assert "representation=screen" in prompt
+    assert "实体收入口袋" not in prompt
 
 
 def test_static_frame_character_subset_does_not_leak_whole_take_cast():
@@ -1484,9 +1578,10 @@ def test_static_frame_provider_prompt_drops_routes_and_whole_take_physics():
         },
         "last_frame": {
             "present": (
-                "虞寻欢躺在床上，虞寻歌站在床边",
+                "虞寻欢躺在床上，虞寻歌站在床边",),
+            "absent": (
+                "手机在右手", "手机在床边柜", "双方对视",
                 "physical_state=完全收纳", "location=风衣口袋内"),
-            "absent": ("手机在右手", "手机在床边柜", "双方对视"),
         },
     }
     for mode, expected in cases.items():

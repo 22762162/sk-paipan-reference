@@ -77,7 +77,8 @@ from .lessons import (DISTILL_MIN_PENDING, DOMAIN_IMAGE, DOMAIN_SCRIPT,
 from .qc_stats import record_qc
 from .pano_slice import slice_for_block, slice_panorama
 from .relations import relation_lines, write_relations
-from .scene_model import (actor_placement_issues, build_scene_model,
+from .scene_model import (SCALE_POLICY, actor_placement_issues,
+                          build_scene_model,
                           camera_placement_issues, occlusion_issues,
                           repair_actor_furniture_collisions,
                           repair_camera_furniture_collisions,
@@ -2638,6 +2639,112 @@ class Director:
                    / "scenes" / "slices")
         return slice_for_block(pano["uri"], out_dir, block)
 
+    @staticmethod
+    def _saved_scene_annotations(model):
+        """Recover the original visual annotations from a saved scene model.
+
+        ``scene_model`` deliberately keeps every object's source panorama
+        coordinates.  Scale-policy upgrades can therefore be applied locally
+        without asking a vision model to annotate the unchanged panorama a
+        second time.  The migration is all-or-nothing: silently dropping an
+        object would produce a clean-looking but physically incomplete set.
+        """
+        objects = model.get("objects")
+        if not isinstance(objects, list):
+            raise AifosError("旧三维搭景缺少可迁移的物体表")
+        annotations = []
+        missing = []
+        for index, obj in enumerate(objects, 1):
+            if not isinstance(obj, dict):
+                missing.append(f"第{index}件物体")
+                continue
+            source = obj.get("source")
+            name = str(obj.get("name") or "").strip()
+            if (not isinstance(source, dict) or not name
+                    or source.get("base_u") is None
+                    or source.get("base_v") is None):
+                missing.append(name or f"第{index}件物体")
+                continue
+            annotation = copy.deepcopy(source)
+            annotation["name"] = name
+            annotation["category"] = str(
+                obj.get("category") or "furniture")
+            annotations.append(annotation)
+        if missing:
+            raise AifosError(
+                "旧三维搭景缺少原始全景标注，无法无损本地迁移："
+                + "、".join(missing)
+                + "。旧版本已保留；如需重新视觉标注请显式强制重建")
+        return annotations
+
+    def _migrate_saved_scene_model(self, project, location, pano, existing,
+                                   saved, out_dir):
+        """Register a scale-policy revision using saved annotations only."""
+        annotations = self._saved_scene_annotations(saved)
+        source_room = saved.get("source_room")
+        if not isinstance(source_room, dict):
+            source_room = saved.get("room")
+        if not isinstance(source_room, dict):
+            source_room = {}
+        build_options = {
+            "location": location,
+            "room": source_room,
+            "panorama_uri": str(pano["uri"]),
+        }
+        capture = saved.get("capture")
+        if isinstance(capture, dict):
+            try:
+                capture_height = float(capture.get("y"))
+            except (TypeError, ValueError):
+                capture_height = 0.0
+            if capture_height > 0:
+                build_options["capture_height"] = capture_height
+        model = build_scene_model(annotations, **build_options)
+        model["provider"] = (
+            saved.get("provider")
+            or self._asset_meta(existing).get("provider")
+            or "")
+        model["panorama_version"] = pano["version"]
+        model["panorama_asset_id"] = pano["id"]
+        model["built_at"] = now()
+        model["migration"] = {
+            "mode": "local_saved_object_sources",
+            "from_asset_id": existing["id"],
+            "from_asset_version": existing["version"],
+            "from_scale_policy": str(saved.get("scale_policy") or "legacy"),
+            "to_scale_policy": SCALE_POLICY,
+        }
+        safe = "".join(
+            ch if ch.isalnum() else "_" for ch in location)[:40]
+        previous = self.assets.latest(
+            project["id"], "scene_model", location, include_deleted=True)
+        next_version = int(previous["version"] + 1) if previous else 1
+        model["asset_version"] = next_version
+        dest = out_dir / f"scene_model_{safe}_v{next_version}.json"
+        dest.write_text(json.dumps(model, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
+        row = self.assets.register(
+            project["id"], "scene_model", location, str(dest),
+            meta={
+                "objects": len(model["objects"]),
+                "issues": len(model["issues"]),
+                "panorama_version": pano["version"],
+                "panorama_asset_id": pano["id"],
+                "provider": model["provider"],
+                "real": True,
+                "scale_policy": SCALE_POLICY,
+                "migration": "local_saved_object_sources",
+                "migrated_from_asset_id": existing["id"],
+                "migrated_from_asset_version": existing["version"],
+            },
+            new_version=previous is not None)
+        self.log.info(
+            "director",
+            f"场景「{location}」三维搭景已从 v{existing['version']} 本地迁移"
+            f"到 v{row['version']}（{SCALE_POLICY}），未调用视觉标注、"
+            "未触发图片或视频重画")
+        return model
+
 
     def build_scene_model(self, project_title, location, *, force=False):
         """从本场 720° 全景反解出真实三维场景(物体位置/尺寸/落地点)。
@@ -2669,13 +2776,20 @@ class Director:
             try:
                 saved = json.loads(
                     Path(existing["uri"]).read_text(encoding="utf-8"))
+                if not isinstance(saved, dict):
+                    raise ValueError("scene model is not an object")
                 saved_pano_version = int(
                     saved.get("panorama_version")
                     or self._asset_meta(existing).get("panorama_version")
                     or 0)
-                if (isinstance(saved, dict)
-                        and saved_pano_version == int(pano["version"] or 0)):
-                    return saved
+                if saved_pano_version == int(pano["version"] or 0):
+                    if saved.get("scale_policy") == SCALE_POLICY:
+                        return saved
+                    out_dir = (self.artifacts_root
+                               / f"p{project['id']:03d}" / "scenes")
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    return self._migrate_saved_scene_model(
+                        project, location, pano, existing, saved, out_dir)
                 self.log.info(
                     "director",
                     f"场景「{location}」全景版本已变化，自动重建三维搭景")
@@ -2852,12 +2966,13 @@ class Director:
                                 continue
                             if isinstance(actor.get("start_3d"), dict):
                                 actor["start"] = canvas_from_world(
-                                    actor["start_3d"])
+                                    actor["start_3d"], scene.get("world"))
                             if isinstance(actor.get("end_3d"), dict):
                                 actor["end"] = canvas_from_world(
-                                    actor["end_3d"])
+                                    actor["end_3d"], scene.get("world"))
                             actor["route"] = [
-                                dict(canvas_from_world(point),
+                                dict(canvas_from_world(
+                                         point, scene.get("world")),
                                      phase=point.get("phase"))
                                 for point in (actor.get("route_3d") or [])
                                 if isinstance(point, dict)
@@ -2881,12 +2996,13 @@ class Director:
                         camera = shot.get("camera") or {}
                         if isinstance(camera.get("start_3d"), dict):
                             camera["start"] = canvas_from_world(
-                                camera["start_3d"])
+                                camera["start_3d"], scene.get("world"))
                         if isinstance(camera.get("end_3d"), dict):
                             camera["end"] = canvas_from_world(
-                                camera["end_3d"])
+                                camera["end_3d"], scene.get("world"))
                         camera["route"] = [
-                            dict(canvas_from_world(point),
+                            dict(canvas_from_world(
+                                     point, scene.get("world")),
                                  phase=point.get("phase"))
                             for point in (camera.get("route_3d") or [])
                             if isinstance(point, dict)
@@ -10333,7 +10449,8 @@ class Director:
         blocking = build_spatial_plan(
             ctx["script"], ctx["storyboard"], ctx["continuity"],
             group_threshold=int(rules.get(
-                "spatial_blocking_required_for_group", 3)))
+                "spatial_blocking_required_for_group", 3)),
+            scene_models=self._previz_scene_models(ctx))
         mark_spatial_reference_requirements(blocking)
         # 信息状态×空间事实交叉校验:「迟到的发现」穿帮警示(v7 实证:
         # 空间一变,「谁能看见谁」必须重推,否则发现拍点悄悄失效)。
@@ -10387,10 +10504,27 @@ class Director:
         return {"issues": again["issues"], "repaired": repaired}
 
     def _previz_scene_models(self, ctx):
-        """当前 blocking 各场景的最新有效三维模型 {location: model}。"""
+        """当前故事各场景的最新有效三维模型 {location: model}。
+
+        初次构建 blocking 时 ``ctx.blocking`` 还不存在，所以不能只从
+        旧调度图收集地点；剧本与分镜里的当前 location 也必须参与。
+        """
         models = {}
-        for scene in (ctx.get("blocking") or {}).get("scenes") or []:
-            location = str(scene.get("location") or "").strip()
+        locations = []
+        locations.extend(
+            str(scene.get("location") or scene.get("name") or "").strip()
+            for scene in ((ctx.get("script") or {}).get("scenes") or [])
+            if isinstance(scene, dict))
+        locations.extend(
+            self._shot_location(ctx.get("script"), shot)
+            for shot in ((ctx.get("storyboard") or {}).get("shots") or [])
+            if isinstance(shot, dict))
+        locations.extend(
+            str(scene.get("location") or "").strip()
+            for scene in ((ctx.get("blocking") or {}).get("scenes") or [])
+            if isinstance(scene, dict))
+        for location in locations:
+            location = str(location or "").strip()
             if not location or location in models:
                 continue
             model, _row, stale, _reason = self._scene_model_state(
@@ -10489,7 +10623,8 @@ class Director:
         blocking = build_spatial_plan(
             ctx["script"], ctx["storyboard"], ctx["continuity"],
             group_threshold=int(rules.get(
-                "spatial_blocking_required_for_group", 3)))
+                "spatial_blocking_required_for_group", 3)),
+            scene_models=models)
         mark_spatial_reference_requirements(blocking)
         self._attach_scene_physics(
             ctx, blocking, repair_actor_collisions=True)
@@ -10606,7 +10741,8 @@ class Director:
             "spatial_blocking_required_for_group", 3))
         candidate = build_spatial_plan(
             ctx["script"], ctx["storyboard"], ctx["continuity"],
-            group_threshold=threshold)
+            group_threshold=threshold,
+            scene_models=self._previz_scene_models(ctx))
         self._attach_scene_physics(
             ctx, candidate, repair_actor_collisions=True)
         existing, version = self.projects.latest_document(

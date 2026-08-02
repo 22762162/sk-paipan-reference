@@ -1217,6 +1217,12 @@ def _normalize_frame_props(shot, target_phase="end"):
                 f"frame_prop「{prop_id or index}」缺少显式 representation")
         normalized = {
             "prop_id": prop_id,
+            # Some legacy/local shots carry the only human-readable identity
+            # on frame_props and have no matching prop_registry row.  Preserve
+            # it so visibility projection can remove the named hidden object
+            # from provider prose instead of trying to infer Chinese from an
+            # opaque/English prop_id.
+            "name": _text(raw.get("name") or raw.get("prop_name")),
             "phase": phase,
             "physical_state": _text(
                 raw.get("physical_state") or raw.get("state")
@@ -1237,6 +1243,118 @@ def _normalize_frame_props(shot, target_phase="end"):
                 f"frame_prop「{prop_id or index}」是物理实例但缺少主位置")
         output.append(normalized)
     return output, issues
+
+
+_FULLY_INVISIBLE_PROP_VISIBILITIES = {"hidden", "absent"}
+
+
+def _prop_name_tokens(item, prop_registry):
+    """Return conservative words that identify one registered prop in prose."""
+    prop_id = _text((item or {}).get("prop_id"))
+    registry_names = {
+        _text(row.get("prop_id")): _text(row.get("name"))
+        for row in (prop_registry or []) if isinstance(row, dict)
+    }
+    values = [
+        _text((item or {}).get("name")), registry_names.get(prop_id, ""),
+        prop_id,
+    ]
+    haystack = " ".join(values).lower()
+    if any(token in haystack for token in (
+            "手机", "phone", "mobile", "telephone")):
+        values.extend(("手机", "电话"))
+    if any(token in haystack for token in (
+            "平板", "tablet", "pad")):
+        values.append("平板")
+    if any(token in haystack for token in (
+            "白酒", "酒瓶", "小瓶", "bottle", "liquor")):
+        values.extend(("白酒", "酒瓶", "小瓶"))
+    if any(token in haystack for token in (
+            "电脑", "笔记本", "laptop", "computer")):
+        values.extend(("电脑", "笔记本"))
+    return tuple(dict.fromkeys(
+        value for value in (_text(value) for value in values)
+        if len(value) >= 2 and not value.startswith("prop_")))
+
+
+def _static_visible_frame_props(frame_props, target_phase):
+    """Project the continuity ledger to observable still-image prop facts.
+
+    ``hidden`` and ``absent`` rows remain valid continuity/audit facts, but are
+    not image-generation or image-QC targets.  ``occluded`` is retained: it is
+    a visible composition relation (the object may be partly covered), while a
+    fully concealed object must be represented with ``hidden``.
+    """
+    phase = _text(target_phase).lower()
+    return [
+        dict(item) for item in (frame_props or [])
+        if isinstance(item, dict)
+        and _text(item.get("phase")).lower() == phase
+        and _text(item.get("visibility"), "visible").lower()
+        not in _FULLY_INVISIBLE_PROP_VISIBILITIES
+    ]
+
+
+def _static_visible_state(value, frame_props, target_phase, prop_registry):
+    """Remove fully concealed prop bookkeeping from a still's visible state.
+
+    The source ``frame_target`` remains available as ``frame_target_audit``.
+    This projection prevents phrases such as “手机完全收入口袋” from being
+    treated as something the image model should draw or the image judge should
+    inspect.  Actor pose, gaze, scene and any visible prop facts are preserved.
+    """
+    hidden_tokens = []
+    phase = _text(target_phase).lower()
+    phase_rows = [
+        item for item in (frame_props or [])
+        if isinstance(item, dict)
+        and _text(item.get("phase")).lower() == phase
+    ]
+
+    def prop_key(item):
+        return _text(item.get("prop_id") or item.get("name"))
+
+    # A physical item may be hidden while its reflection/screen/painting is
+    # deliberately visible in the same frame.  That is an observable story
+    # fact, not a fully invisible prop.  Only suppress a prop when *all* rows
+    # for that prop in the target phase are hidden/absent.
+    observable_keys = {
+        prop_key(item) for item in phase_rows
+        if prop_key(item)
+        and _text(item.get("visibility"), "visible").lower()
+        not in _FULLY_INVISIBLE_PROP_VISIBILITIES
+    }
+    for item in phase_rows:
+        if (not isinstance(item, dict)
+                or _text(item.get("visibility"), "visible").lower()
+                not in _FULLY_INVISIBLE_PROP_VISIBILITIES
+                or prop_key(item) in observable_keys):
+            continue
+        hidden_tokens.extend(_prop_name_tokens(item, prop_registry))
+    hidden_tokens = tuple(dict.fromkeys(hidden_tokens))
+    text = _text(value)
+    if not text or not hidden_tokens:
+        return text
+
+    # Split at ordinary clause boundaries and at conjunctions that introduce
+    # a second fact.  Dropping only the concealed-prop clause keeps an adjacent
+    # visible fact, e.g. “她看向床，手机已收好” -> “她看向床”.
+    clauses = [
+        clause.strip(" ，,。；;\n")
+        for clause in re.split(r"[，,。；;\n]+|(?:并且|同时|且)", text)
+        if clause.strip(" ，,。；;\n")
+    ]
+    visible = []
+    for clause in clauses:
+        mentions_hidden_prop = any(
+            token in clause for token in hidden_tokens)
+        # The structured visibility row is authoritative.  Even stale prose
+        # that says the same prop is held/used must not override hidden/absent
+        # and reintroduce it as a visible generation target.
+        if mentions_hidden_prop:
+            continue
+        visible.append(clause)
+    return "，".join(visible) or "人物姿态、场景与构图保持当前静态相位"
 
 
 def _normalize_prop_transitions(shot):
@@ -3275,8 +3393,17 @@ def _character_lines(shot, *, media="video", target_phase=""):
                     ("wardrobe", "服装"),
                     ("headwear", "头饰"),
                     ("prop", "标志道具")):
-                if _text(current.get(key)):
-                    pieces.append(f"{label}:{_text(current.get(key))}")
+                value = _text(current.get(key))
+                if key == "prop" and str(media or "video").lower() != "video":
+                    value = _static_visible_state(
+                        value,
+                        _object_items(shot.get("frame_props"), "prop_id"),
+                        target_phase,
+                        shot.get("prop_registry") or [])
+                    if value == "人物姿态、场景与构图保持当前静态相位":
+                        value = ""
+                if value:
+                    pieces.append(f"{label}:{value}")
         # Old persisted payloads may have only the rendered visual string.
         # Preserve compatibility when there is no structured identity/state;
         # otherwise never reintroduce its unscoped tail wardrobe.
@@ -3517,9 +3644,17 @@ def build_shot_prompt_contract(
         else "end")
     frame_props, frame_prop_issues = _normalize_frame_props(
         shot, target_phase)
+    target_audit = dict(target)
     all_prop_transitions, prop_transition_issues = (
         _normalize_prop_transitions(shot))
     timeline_contract = bool(output_media == "video" or joint_frames)
+    visible_frame_props = (
+        frame_props if timeline_contract
+        else _static_visible_frame_props(frame_props, target_phase))
+    if not timeline_contract:
+        target["state"] = _static_visible_state(
+            target.get("state"), frame_props, target_phase,
+            shot.get("prop_registry") or [])
     # A transition is a relationship between phases, not an observable fact
     # inside one frozen image.  Keep it only for motion / paired-frame timeline
     # contracts; otherwise it injects future actors and actions into the still.
@@ -3557,6 +3692,13 @@ def build_shot_prompt_contract(
         or _readable_carrier_visible_at_phase(
             readable, frame_props, target_phase,
             shot.get("prop_registry") or []))
+    readable_audit = dict(readable)
+    readable_current = dict(readable)
+    if (not timeline_contract and readable_required
+            and not readable_carrier_visible):
+        # Keep the authored text card for audit, but expose no carrier/words to
+        # the still generator or image judge when that carrier is fully hidden.
+        readable_current = {"required": False}
     if output_media == "video" and _readable_text_has_phases(readable_source):
         text_rule = _readable_text_timeline_rule(
             readable_source, frame_props, shot.get("prop_registry") or [])
@@ -3604,7 +3746,8 @@ def build_shot_prompt_contract(
         physical_shot["frame_target"] = dict(target)
     physical = build_physical_contract(
         physical_shot, media=output_media, target_phase=target_phase)
-    physical["frame_props"] = list(frame_props)
+    physical["frame_props"] = list(visible_frame_props)
+    physical["frame_props_audit"] = list(frame_props)
     physical["prop_transitions"] = list(prop_transitions)
     overlays = []
     for item in shot.get("narrative_overlays") or []:
@@ -3713,6 +3856,7 @@ def build_shot_prompt_contract(
                 else "terminal_only"),
         },
         "frame_target": dict(target),
+        "frame_target_audit": target_audit,
         "frame_target_state": target["state"],
         "frame_target_source": target["source"],
         "frame_target_fallback": bool(target["fallback"]),
@@ -3839,7 +3983,8 @@ def build_shot_prompt_contract(
             dict(value) for value in (shot.get("prop_registry") or [])
             if isinstance(value, dict)
         ],
-        "frame_props": frame_props,
+        "frame_props": visible_frame_props,
+        "frame_props_audit": frame_props,
         "prop_transitions": prop_transitions,
         # Non-rendering audit trail for the upstream whole-take plan.  Static
         # validation/provider prompts use ``prop_transitions`` above (empty),
@@ -3881,7 +4026,8 @@ def build_shot_prompt_contract(
             if _readable_text_has_phases(readable_source)
             else dict(readable_source)
         ),
-        "readable_text_current": dict(readable),
+        "readable_text_current": readable_current,
+        "readable_text_audit": readable_audit,
         "text": text_rule,
         "narrative_overlays": overlays,
         "references": refs,

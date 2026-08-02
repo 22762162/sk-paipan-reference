@@ -57,7 +57,7 @@ def _canonical(value):
                       separators=(",", ":"))
 
 
-def _source_fingerprint(script, storyboard, continuity):
+def _source_fingerprint(script, storyboard, continuity, scene_models=None):
     # 可读文字锁定会在关键帧之后回写 storyboard；它不改变空间关系，
     # 因此只纳入会影响人物/机位坐标的字段，避免门禁误判为调度图过期。
     blocking_shots = [{
@@ -84,6 +84,10 @@ def _source_fingerprint(script, storyboard, continuity):
             "characters": continuity.get("characters", []),
             "scenes": continuity.get("scenes", []),
         },
+        # 真实搭景的 room 尺度会改变所有人物/机位的米制坐标。必须纳入
+        # 指纹，否则 10x7 通用房间生成的旧 blocking 会被错误复用到
+        # 1.85x4.4 的车厢。
+        "scene_rooms": _scene_room_fingerprint(scene_models),
     }
     return hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
 
@@ -109,16 +113,110 @@ def _point(x, y):
             "y": int(max(115, min(HEIGHT - 115, y)))}
 
 
-def _world_point(point, height=0.0):
-    """把兼容二维画布坐标转换为右手系 Y-up 米制世界坐标。"""
+def _world_dimensions(world=None):
+    """返回合法房间宽深；缺失或坏值严格退回存量 10x7 行为。"""
+    world = world if isinstance(world, dict) else {}
+
+    def positive(key, fallback):
+        try:
+            value = float(world.get(key) or fallback)
+        except (TypeError, ValueError):
+            return fallback
+        return value if math.isfinite(value) and value > 0 else fallback
+
+    return (
+        positive("floor_width_m", WORLD_WIDTH_M),
+        positive("floor_depth_m", WORLD_DEPTH_M),
+    )
+
+
+def _scene_model_lookup(scene_models, location):
+    """兼容 location→model 映射、model 列表及单一 model。"""
+    if not scene_models:
+        return None
+    location = str(location or "").strip()
+    if isinstance(scene_models, dict):
+        if isinstance(scene_models.get("room"), dict):
+            return scene_models
+        model = scene_models.get(location)
+        if isinstance(model, dict):
+            return model
+        values = scene_models.values()
+    elif isinstance(scene_models, (list, tuple)):
+        values = scene_models
+    else:
+        return None
+    return next((
+        model for model in values
+        if isinstance(model, dict)
+        and str(model.get("location") or "").strip() == location
+    ), None)
+
+
+def _world_from_scene_model(scene_model):
+    room = (
+        scene_model.get("room")
+        if isinstance(scene_model, dict) else {}) or {}
+    width, depth = _world_dimensions(room)
     return {
-        "x": round(
+        "coordinate_system": "right-handed-y-up",
+        "unit": "meter",
+        "floor_width_m": width,
+        "floor_depth_m": depth,
+        "floor_y_m": 0.0,
+        "default_actor_height_m": DEFAULT_ACTOR_HEIGHT_M,
+        "default_camera_height_m": DEFAULT_CAMERA_HEIGHT_M,
+    }
+
+
+def _scene_room_fingerprint(scene_models):
+    if not scene_models:
+        return []
+    if isinstance(scene_models, dict) and isinstance(
+            scene_models.get("room"), dict):
+        models = [scene_models]
+    elif isinstance(scene_models, dict):
+        models = list(scene_models.values())
+    elif isinstance(scene_models, (list, tuple)):
+        models = list(scene_models)
+    else:
+        models = []
+    rows = []
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        width, depth = _world_dimensions(model.get("room") or {})
+        rows.append({
+            "location": str(model.get("location") or ""),
+            "floor_width_m": width,
+            "floor_depth_m": depth,
+        })
+    return sorted(rows, key=lambda row: (
+        row["location"], row["floor_width_m"], row["floor_depth_m"]))
+
+
+def _world_point(point, height=0.0, world=None):
+    """把兼容二维画布坐标转换为右手系 Y-up 米制世界坐标。"""
+    world_width_m, world_depth_m = _world_dimensions(world)
+
+    def bounded_round(value, extent):
+        rounded = round(value, 2)
+        half = extent / 2
+        if abs(rounded) <= half:
+            return rounded
+        # 例如 1.85m 宽的车厢半宽是 0.925m，常规 round 会得到
+        # 0.93m，反而把合法墙边画布点量化到墙外。向室内收一厘米格。
+        inward = math.floor((half + 1e-9) * 100) / 100
+        return math.copysign(inward, rounded)
+
+    return {
+        "x": bounded_round(
             (float(point.get("x", WIDTH / 2)) - WIDTH / 2)
-            / (WIDTH - 180) * WORLD_WIDTH_M, 2),
+            / (WIDTH - 180) * world_width_m, world_width_m),
         "y": round(float(height), 2),
-        "z": round(
+        "z": bounded_round(
             (float(point.get("y", HEIGHT / 2)) - HEIGHT / 2)
-            / (HEIGHT - 230) * WORLD_DEPTH_M, 2),
+            / (HEIGHT - 230) * world_depth_m, world_depth_m),
     }
 
 
@@ -267,7 +365,8 @@ def _force_camera_half_plane(camera, axis, side, actor_points):
     return camera
 
 
-def _dialogue_contract(shot, positions, camera, memory, scene_no):
+def _dialogue_contract(
+        shot, positions, camera, memory, scene_no, world=None):
     """Build one cross-shot contract for a two-person dialogue pair."""
     if not _dialogue_shot(shot, positions):
         return {}
@@ -306,7 +405,7 @@ def _dialogue_contract(shot, positions, camera, memory, scene_no):
             sum(p["end"]["x"] for p in positions) / max(1, len(positions)),
             sum(p["end"]["y"] for p in positions) / max(1, len(positions)))
         _rescale_to_declared_distance(
-            camera, target, camera["scale_distance_m"])
+            camera, target, camera["scale_distance_m"], world)
     for actor, other in ((left, right), (right, left)):
         # 双人对话镜刻意覆写朝向以锁 180° 轴线。三个键必须一起写:
         # 下游 staging_clause 优先读 facing_{phase},只改 facing 会让
@@ -460,7 +559,7 @@ def declared_scale(shot):
     return ""
 
 
-def _scale_camera_distance(camera, target, shot):
+def _scale_camera_distance(camera, target, shot, world=None):
     """把机位沿现有方向拉到声明景别应有的距离(2D 与 3D 同步)。
 
     只改距离、不改方向与高度:机位角度是分镜的创作选择,距离才是被
@@ -472,14 +571,14 @@ def _scale_camera_distance(camera, target, shot):
         return camera
     camera["scale_distance_m"] = desired
     camera["scale_for_distance"] = scale
-    return _rescale_to_declared_distance(camera, target, desired)
+    return _rescale_to_declared_distance(camera, target, desired, world)
 
 
-def _rescale_to_declared_distance(camera, target, desired):
+def _rescale_to_declared_distance(camera, target, desired, world=None):
     """沿现有方向把机位拉到 desired 米(只改距离,不改方向与高度)。"""
     # 目标点抬到主体胸眼高度:与 spatial_language 的被摄距离同口径,
     # 否则"按水平距离摆位、按三维距离核验"两边永远对不上。
-    world_target = _world_point(target, SUBJECT_EYE_HEIGHT_M)
+    world_target = _world_point(target, SUBJECT_EYE_HEIGHT_M, world)
     for key in ("start", "end"):
         point = camera.get(key)
         if not isinstance(point, dict):
@@ -488,7 +587,7 @@ def _rescale_to_declared_distance(camera, target, desired):
             point, _camera_height(
                 str(camera.get("position") or ""),
                 str(camera.get("movement") or ""),
-                "start" if key == "start" else "end"))
+                "start" if key == "start" else "end"), world)
         current = math.dist(
             (world_cam["x"], world_cam["y"], world_cam["z"]),
             (world_target["x"], world_target["y"], world_target["z"]))
@@ -597,7 +696,7 @@ def _pose_profile(state, action="", phase="start"):
 
 def _attach_camera_3d(
         camera, start_target, end_target,
-        start_target_height=1.25, end_target_height=1.25):
+        start_target_height=1.25, end_target_height=1.25, world=None):
     position = str(camera.get("position") or "")
     movement = str(camera.get("movement") or "")
     # 调度器解出的镜高是按「角度」维度算的(俯拍抬高、仰拍压低);
@@ -610,10 +709,10 @@ def _attach_camera_3d(
     end_h = (float(solved_end_h) if solved_end_h is not None
              else (float(solved_h) if solved_h is not None
                    else _camera_height(position, movement, "end")))
-    start = _world_point(camera["start"], start_h)
-    end = _world_point(camera["end"], end_h)
-    target_start = _world_point(start_target, start_target_height)
-    target_end = _world_point(end_target, end_target_height)
+    start = _world_point(camera["start"], start_h, world)
+    end = _world_point(camera["end"], end_h, world)
+    target_start = _world_point(start_target, start_target_height, world)
+    target_end = _world_point(end_target, end_target_height, world)
     # 摇/移/跟 的终点瞄准点由运镜求解决定:摇是机位不动只转机身,
     # 用「人物终点」当瞄准点会把它错算成机位平移。
     solved_target = camera.get("director_end_target_3d")
@@ -715,16 +814,17 @@ def _wrap_deg(deg):
     return ((float(deg) + 180.0) % 360.0) - 180.0
 
 
-def canvas_from_world(world_point):
+def canvas_from_world(world_point, world=None):
     """世界坐标(米) → 二维画布坐标。_world_point 的逆,让示意图与三维同源。"""
     try:
         wx = float(world_point.get("x", 0.0))
         wz = float(world_point.get("z", 0.0))
     except (TypeError, ValueError):
         return _point(WIDTH / 2, HEIGHT / 2)
+    world_width_m, world_depth_m = _world_dimensions(world)
     return _point(
-        WIDTH / 2 + wx / WORLD_WIDTH_M * (WIDTH - 180),
-        HEIGHT / 2 + wz / WORLD_DEPTH_M * (HEIGHT - 230))
+        WIDTH / 2 + wx / world_width_m * (WIDTH - 180),
+        HEIGHT / 2 + wz / world_depth_m * (HEIGHT - 230))
 
 
 def _apply_director_camera(camera, shot, positions, world=None):
@@ -753,8 +853,9 @@ def _apply_director_camera(camera, shot, positions, world=None):
     solved = solve_camera_motion(
         solved, shot, subject_start=start_xz, subject_end=end_xz,
         world=world_dict)
-    camera["start"] = canvas_from_world(solved["position_3d"])
-    camera["end"] = canvas_from_world(solved["end_position_3d"])
+    camera["start"] = canvas_from_world(solved["position_3d"], world_dict)
+    camera["end"] = canvas_from_world(
+        solved["end_position_3d"], world_dict)
     camera["moving"] = bool(solved.get("moving"))
     camera["movement"] = solved.get("movement") or camera.get("movement")
     direction = _direction(camera["start"], camera["end"])
@@ -796,7 +897,7 @@ def _apply_director_camera(camera, shot, positions, world=None):
     return camera
 
 
-def _camera_block(shot, target):
+def _camera_block(shot, target, world=None):
     design = ((shot.get("five_dimensions") or {}).get("camera_design") or {})
     movement = str(design.get("movement") or "").strip()
     if not movement:
@@ -831,7 +932,7 @@ def _camera_block(shot, target):
     start, end = _point(start_x, start_y), _point(end_x, end_y)
     block = {"start": start, "end": end}
     # 机位距离按声明景别校正:此前它只是画布布局的副产品,与景别无关。
-    _scale_camera_distance(block, target, shot)
+    _scale_camera_distance(block, target, shot, world)
     start, end = block["start"], block["end"]
     moving = start != end
     direction = _direction(start, end)
@@ -892,7 +993,7 @@ def _clear_camera_icons(camera, actor_points):
 
 
 def _clear_final_camera_actor_clearance(
-        camera, positions, dialogue_continuity=None):
+        camera, positions, dialogue_continuity=None, world=None):
     """在导演/轴线求解完成后，为最终机位执行确定性物理避障。
 
     ``_clear_camera_icons`` 只负责二维示意图可读性，而且发生在导演求解
@@ -947,8 +1048,8 @@ def _clear_final_camera_actor_clearance(
             for distance, actor in actor_clearances(world_point))
 
     def quantize(wx, wz):
-        canvas = canvas_from_world({"x": wx, "z": wz})
-        return canvas, _world_point(canvas)
+        canvas = canvas_from_world({"x": wx, "z": wz}, world)
+        return canvas, _world_point(canvas, world=world)
 
     def axis_allowed(canvas):
         return (not axis_locked
@@ -956,7 +1057,7 @@ def _clear_final_camera_actor_clearance(
 
     def choose(original):
         original_canvas = _point(original["x"], original["y"])
-        original_world = _world_point(original_canvas)
+        original_world = _world_point(original_canvas, world=world)
         if (clearance_valid(original_world, safety=True)
                 and axis_allowed(original_canvas)):
             return original_canvas, original_world
@@ -1012,7 +1113,7 @@ def _clear_final_camera_actor_clearance(
         for y in range(115, HEIGHT - 114, 20):
             for x in range(90, WIDTH - 89, 20):
                 canvas = _point(x, y)
-                world_point = _world_point(canvas)
+                world_point = _world_point(canvas, world=world)
                 if (not clearance_valid(world_point, safety=True)
                         or not axis_allowed(canvas)):
                     continue
@@ -1042,7 +1143,7 @@ def _clear_final_camera_actor_clearance(
     if changed and camera.get("movement") == "移":
         target = camera.get("director_end_target_3d")
         if isinstance(target, dict) and target:
-            old_end_world = _world_point(original_end)
+            old_end_world = _world_point(original_end, world=world)
             camera["director_end_target_3d"] = {
                 "x": round(float(target.get("x", 0.0))
                            + end_world["x"] - old_end_world["x"], 2),
@@ -1067,7 +1168,8 @@ def _clear_final_camera_actor_clearance(
     director = camera.get("director_camera")
     if isinstance(director, dict):
         before_points = (
-            _world_point(original_start), _world_point(original_end))
+            _world_point(original_start, world=world),
+            _world_point(original_end, world=world))
         director.update({
             "clearance_adjusted": changed,
             "clearance_before_m": round(min(
@@ -1132,7 +1234,9 @@ def _needs_map(shots, group_threshold):
     return bool(reasons), reasons or ["连续性参考"]
 
 
-def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
+def build_spatial_plan(
+        script, storyboard, continuity, group_threshold=3,
+        scene_models=None):
     """从剧本/分镜/连续性圣经构建可复现的空间调度计划。"""
     character_number_map = build_character_number_map(continuity, storyboard)
     character_by_name = {
@@ -1150,6 +1254,9 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
     for scene_no in scene_numbers:
         shots = [s for s in storyboard.get("shots", [])
                  if int(s.get("scene_no", 0)) == scene_no]
+        location = _scene_location(script, continuity, scene_no)
+        scene_model = _scene_model_lookup(scene_models, location)
+        world = _world_from_scene_model(scene_model)
         required, reasons = _needs_map(shots, int(group_threshold or 3))
         previous_end = {}
         previous_visible = set()
@@ -1233,8 +1340,8 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
                     state_start, action_text, "start")
                 end_pose = _pose_profile(state_end, action_text, "end")
                 route_direction = _direction(start, end)
-                start_3d = _world_point(start)
-                end_3d = _world_point(end)
+                start_3d = _world_point(start, world=world)
+                end_3d = _world_point(end, world=world)
                 positions.append({
                     "actor_id": character["actor_id"], "name": name,
                     "role": character["role"],
@@ -1296,22 +1403,23 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
             camera_2d = _apply_director_camera(
                 _scale_camera_distance(
                     _clear_camera_icons(
-                        _camera_block(shot, target), actor_markers),
-                    target, shot),
+                        _camera_block(shot, target, world), actor_markers),
+                    target, shot, world),
                 shot, positions,
-                {"floor_width_m": WORLD_WIDTH_M,
-                 "floor_depth_m": WORLD_DEPTH_M})
+                world)
             dialogue_continuity = _dialogue_contract(
-                shot, positions, camera_2d, dialogue_memory, scene_no)
+                shot, positions, camera_2d, dialogue_memory, scene_no,
+                world)
             camera_2d = _clear_final_camera_actor_clearance(
-                camera_2d, positions, dialogue_continuity)
+                camera_2d, positions, dialogue_continuity, world)
             camera = _attach_camera_3d(
                 camera_2d,
                 start_target, target,
                 sum(p["target_start_height_m"] for p in positions)
                 / max(1, len(positions)),
                 sum(p["target_end_height_m"] for p in positions)
-                / max(1, len(positions)))
+                / max(1, len(positions)),
+                world)
             compact = ";".join(
                 f"{p['display_label']}"
                 f"({p['start_3d']['x']},{p['start_3d']['y']},"
@@ -1366,8 +1474,10 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
                     if dialogue_continuity else {
                         "a": _point(120, target["y"]),
                         "b": _point(880, target["y"]),
-                        "a_3d": _world_point(_point(120, target["y"])),
-                        "b_3d": _world_point(_point(880, target["y"])),
+                        "a_3d": _world_point(
+                            _point(120, target["y"]), world=world),
+                        "b_3d": _world_point(
+                            _point(880, target["y"]), world=world),
                         "rule": "机位保持在同一轴线侧，越轴须另建镜头",
                     }),
                 "dialogue_continuity": dialogue_continuity,
@@ -1378,21 +1488,13 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
             previous_visible = set(people)
         scenes.append({
             "scene_no": scene_no,
-            "location": _scene_location(script, continuity, scene_no),
+            "location": location,
             "required": required,
             "reasons": reasons,
             "canvas": {"width": WIDTH, "height": HEIGHT,
                        "orientation": "交互3D",
                        "projection": "orbit"},
-            "world": {
-                "coordinate_system": "right-handed-y-up",
-                "unit": "meter",
-                "floor_width_m": WORLD_WIDTH_M,
-                "floor_depth_m": WORLD_DEPTH_M,
-                "floor_y_m": 0.0,
-                "default_actor_height_m": DEFAULT_ACTOR_HEIGHT_M,
-                "default_camera_height_m": DEFAULT_CAMERA_HEIGHT_M,
-            },
+            "world": world,
             "actors": [dict(character_by_name[name])
                        for name in cast_names
                        if any(name in s.get("characters", []) for s in shots)],
@@ -1401,7 +1503,7 @@ def build_spatial_plan(script, storyboard, continuity, group_threshold=3):
     plan = {
         "schema": SCHEMA,
         "source_fingerprint": _source_fingerprint(
-            script, storyboard, continuity),
+            script, storyboard, continuity, scene_models),
         "group_threshold": int(group_threshold or 3),
         "character_number_map": character_number_map,
         "character_ids_by_name": {
@@ -1429,8 +1531,10 @@ def validate_spatial_plan(plan, storyboard):
     issues = []
     if plan.get("schema") != SCHEMA:
         issues.append(f"空间调度版本不是 {SCHEMA}")
+    scene_worlds = {}
     for scene in plan.get("scenes", []):
         world = scene.get("world") or {}
+        scene_worlds[int(scene.get("scene_no") or 0)] = world
         if (world.get("coordinate_system") != "right-handed-y-up"
                 or world.get("unit") != "meter"):
             issues.append(
@@ -1449,6 +1553,16 @@ def validate_spatial_plan(plan, storyboard):
             issues.append(f"镜头 {shot_no} 缺少空间调度")
             continue
         expected = list(dict.fromkeys(shot.get("characters", [])))
+        world = scene_worlds.get(int(shot.get("scene_no") or 0)) or {}
+        room_width_m, room_depth_m = _world_dimensions(world)
+
+        def inside_room(point):
+            if not _point_3d_valid(point):
+                return False
+            return (
+                abs(float(point["x"])) <= room_width_m / 2 + .01
+                and abs(float(point["z"])) <= room_depth_m / 2 + .01)
+
         actual = [actor.get("name") for actor in block.get("actors", [])]
         if actual != expected or block.get("character_count") != len(expected):
             issues.append(f"镜头 {shot_no} 人物名单/数量与分镜不一致")
@@ -1479,6 +1593,12 @@ def validate_spatial_plan(plan, storyboard):
                     f"镜头 {shot_no} 的 "
                     f"{left.get('display_label') or left.get('name')}"
                     " 缺少合法三维站位/路线")
+            elif not all(inside_room(point) for point in (
+                    left.get("start_3d"), left.get("end_3d"),
+                    *(left.get("route_3d") or []))):
+                issues.append(
+                    f"镜头 {shot_no} 的 {left.get('name')} 超出"
+                    f" {room_width_m:g}×{room_depth_m:g}m 房间边界")
             if (left.get("pose_end") == "lying"
                     and float(left.get("target_end_height_m") or 99) > .8):
                 issues.append(
@@ -1542,6 +1662,12 @@ def validate_spatial_plan(plan, storyboard):
                 or float(camera.get("horizontal_fov_degrees") or 0) <= 0
                 or float(camera.get("vertical_fov_degrees") or 0) <= 0):
             issues.append(f"镜头 {shot_no} 缺少合法三维机位/视锥")
+        elif not all(inside_room(point) for point in (
+                camera.get("start_3d"), camera.get("end_3d"),
+                *(camera.get("route_3d") or []))):
+            issues.append(
+                f"镜头 {shot_no} 摄影机超出"
+                f" {room_width_m:g}×{room_depth_m:g}m 房间边界")
         elif camera.get("moving") and len(camera.get("route", [])) < 2:
             issues.append(f"镜头 {shot_no} 缺少摄影机移动起终点")
         elif (not camera.get("moving")

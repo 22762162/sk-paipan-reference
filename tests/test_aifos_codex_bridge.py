@@ -162,6 +162,62 @@ def test_repair_static_contract_is_final_provider_prompt(tmp_path, fake_codex):
         assert stale not in instruction
 
 
+def test_projected_phase_contract_is_the_real_codex_instruction(
+        tmp_path, fake_codex):
+    """CLI argv must not revive hidden props/text from whole-take audit data."""
+    log = fake_codex.parent / "codex_argv.jsonl"
+    shared = {
+        "prompt_contract_complete": True,
+        "readable_text": {
+            "required": True,
+            "carrier": "手机锁屏",
+            "whitelist": ["02:21:59"],
+        },
+        "start_state": {
+            "虞寻歌": {"prop": "手机锁屏显示02:21:59"},
+        },
+        "end_state": {
+            "虞寻歌": {"prop": "手机已收入口袋"},
+        },
+    }
+
+    image_reply = _bridge({
+        "capability": "image",
+        "payload": {
+            **shared,
+            "shot_no": 4,
+            "prompt": "整镜审计原文",
+            "prompt_compact": "终点静态合同：人物看向床；手机不可见，无文字",
+        },
+        "out_dir": str(tmp_path / "image"),
+    }, fake_codex)
+    assert image_reply["ok"], image_reply
+    image_instruction = json.loads(
+        log.read_text(encoding="utf-8").splitlines()[-1])[-1]
+    assert "手机已收入口袋" not in image_instruction
+    assert "02:21:59" not in image_instruction
+
+    frames_reply = _bridge({
+        "capability": "frames",
+        "payload": {
+            **shared,
+            "shot_no": 4,
+            "prompt": "整镜审计原文",
+            "prompt_compact": "合并审计稿",
+            "frame_prompt_compacts": {
+                "first_frame": "首帧静态合同：人物看向床；手机不可见，无文字",
+                "last_frame": "尾帧静态合同：人物走向门口；手机不可见，无文字",
+            },
+        },
+        "out_dir": str(tmp_path / "frames"),
+    }, fake_codex)
+    assert frames_reply["ok"], frames_reply
+    frames_instruction = json.loads(
+        log.read_text(encoding="utf-8").splitlines()[-1])[-1]
+    assert "手机已收入口袋" not in frames_instruction
+    assert "02:21:59" not in frames_instruction
+
+
 def test_existing_target_must_be_updated_by_current_codex_call(tmp_path):
     binary = tmp_path / "bin" / "codex-noop"
     binary.parent.mkdir(parents=True)

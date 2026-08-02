@@ -1414,6 +1414,12 @@ IMAGE_QC_PROMPT = """你是漫剧图片质检员。查看图片文件 {image}(�
 - 范围:{generation_scope}
 - 实际提交提示词:{generation_prompt}
 - 实际提交参考图对照表:{generation_references}
+{current_phase_contract}
+{audit_contract}
+上面的“实际提交提示词”只用于诊断生成输入是否干净，不是第二份画面事实源；
+视觉判定必须服从“当前静态相位唯一画面判项”。若实际提示词仍带有另一相位、
+hidden/absent 道具或隐藏载体文字，只能记入 prompt_diagnosis，不能要求待检图
+把它画出来，也不能据此判画面失败。
 除判断画面错误外，必须分别判断：提示词是否准确、简洁、无冲突、无无关剧情；
 参考图是否属于本镜、人物/角色/用途是否绑定正确、是否有缺失或冲突。诊断只能
 引用上述实际输入，不得虚构未提交的提示词或参考图。输入诊断是后续优化建议：
@@ -1543,6 +1549,112 @@ REVIEW_LENSES = {
 }
 
 
+_QC_INVISIBLE_PROP_VISIBILITIES = frozenset({"hidden", "absent"})
+
+
+def static_image_qc_projection(payload):
+    """Return the compiled, phase-local still contract used for visual QC.
+
+    ``Director`` keeps the original shot payload for traceability and stores
+    the exact compiled prompt contract beside the real generation input.  The
+    original payload is a whole-take ledger: it can legitimately mention a
+    phone before it is pocketed, screen text from another phase, or a prop
+    whose current visibility is ``hidden``/``absent``.  Those facts must never
+    be promoted back into visual requirements by a transport adapter.
+
+    The compiler-owned fields are deliberately split into executable and
+    audit views.  This helper preserves that boundary for every image-QC
+    adapter:
+
+    * ``frame_props`` and ``readable_text_current`` are the only visible still
+      requirements;
+    * ``physical`` is the already rebuilt current-phase physical contract;
+    * fully invisible rows from ``frame_props_audit`` and the source readable
+      text remain available only for diagnosing an upstream contract.
+
+    Legacy payloads without a compiled static prompt contract return ``None``
+    and retain the existing compatibility path.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    generation = payload.get("generation_input")
+    generation = generation if isinstance(generation, dict) else {}
+    candidates = (
+        generation.get("prompt_contract"), payload.get("prompt_contract"))
+    contract = next((
+        value for value in candidates
+        if isinstance(value, dict) and value
+    ), None)
+    if not contract:
+        return None
+    output = contract.get("output")
+    output = output if isinstance(output, dict) else {}
+    media = str(output.get("media") or "").strip().lower()
+    temporal_policy = str(
+        output.get("temporal_policy") or "").strip().lower()
+    if media == "video" or temporal_policy == "timeline":
+        return None
+
+    target = contract.get("frame_target")
+    target = target if isinstance(target, dict) else {}
+    phase = str(
+        output.get("frame_phase") or target.get("phase") or "").strip().lower()
+
+    def current_visible_props(values):
+        rows = []
+        for item in values or []:
+            if not isinstance(item, dict):
+                continue
+            item_phase = str(item.get("phase") or "").strip().lower()
+            if phase and item_phase and item_phase != phase:
+                continue
+            visibility = str(
+                item.get("visibility") or "visible").strip().lower()
+            if visibility in _QC_INVISIBLE_PROP_VISIBILITIES:
+                continue
+            rows.append(dict(item))
+        return rows
+
+    visible_props = current_visible_props(contract.get("frame_props") or [])
+    audit_props = [
+        dict(item) for item in (contract.get("frame_props_audit") or [])
+        if isinstance(item, dict)
+        and str(item.get("visibility") or "visible").strip().lower()
+        in _QC_INVISIBLE_PROP_VISIBILITIES
+        and (not phase
+             or not str(item.get("phase") or "").strip()
+             or str(item.get("phase") or "").strip().lower() == phase)
+    ]
+    readable_current = contract.get("readable_text_current")
+    readable_current = (
+        dict(readable_current)
+        if isinstance(readable_current, dict) else {"required": False})
+    physical = contract.get("physical")
+    physical = dict(physical) if isinstance(physical, dict) else {}
+    # A defensive second projection prevents an older compiled contract from
+    # leaking hidden rows through physical.frame_props.
+    physical["frame_props"] = current_visible_props(
+        physical.get("frame_props") or visible_props)
+    physical.pop("frame_props_audit", None)
+    return {
+        "phase": phase or "current",
+        "frame_target": dict(target),
+        "action": str(
+            target.get("state") or contract.get("frame_target_state") or ""),
+        "location": str(contract.get("scene") or ""),
+        "camera": contract.get("camera") or "",
+        "frame_props": visible_props,
+        "readable_text_current": readable_current,
+        "physical": physical,
+        "audit_only": {
+            "frame_props_hidden_or_absent": audit_props,
+            "readable_text_source": (
+                dict(contract.get("readable_text_audit"))
+                if isinstance(contract.get("readable_text_audit"), dict)
+                else {}),
+        },
+    }
+
+
 def build_qc_prompt(payload):
     characters = payload.get("characters") or []
     functional_figures = [
@@ -1619,7 +1731,10 @@ def build_qc_prompt(payload):
             f"功能人物{functional_count}人（{functional_line}）；"
             "身份逐人核验只覆盖登记角色，功能人物只核对数量、状态和剧情功能；"
             + (composition.get("count_rule") or "每个人物只计一次")))
-    physical = payload.get("physical_contract") or {}
+    static_projection = static_image_qc_projection(payload)
+    physical = (
+        static_projection.get("physical")
+        if static_projection else payload.get("physical_contract") or {})
     physical_rules = "；".join(physical.get("rules") or [])
     physical_objects = "；".join(physical.get("objects") or [])
     physical_text = (
@@ -1705,6 +1820,41 @@ def build_qc_prompt(payload):
             "人物动作与视线按本镜合同变化，不参与本项对比。")
     else:
         scene_continuity = "本镜无同场对照帧，跳过本项。"
+    if static_projection:
+        current_phase_contract = (
+            "【当前静态相位唯一画面判项】"
+            f"phase={static_projection['phase']}；"
+            "frame_props="
+            + json.dumps(
+                static_projection["frame_props"], ensure_ascii=False,
+                separators=(",", ":"))
+            + "；readable_text_current="
+            + json.dumps(
+                static_projection["readable_text_current"],
+                ensure_ascii=False, separators=(",", ":"))
+            + "。画面道具、可读文字与物理关系只按本段和下方投影后的"
+              "physical合同核验；不得从原始action/readable_text/"
+              "physical_contract或实际提交提示词中恢复其他相位事实。"
+        )
+        audit_contract = (
+            "【仅审计，不是画面判项】"
+            + json.dumps(
+                static_projection["audit_only"], ensure_ascii=False,
+                separators=(",", ":"))
+            + "。这里的hidden/absent道具和隐藏载体文字只用于追溯连续性；"
+              "它们在待检图中完全不可见是正确结果，不得因未画出、不可读或"
+              "无法核验而令visual_pass、physical_logic_match、"
+              "spatial_logic_match或pass为false。"
+        )
+        qc_location = static_projection.get("location") or "按当前相位合同"
+        qc_action = static_projection.get("action") or "按当前相位定格状态"
+        qc_camera = static_projection.get("camera") or "按当前相位合同"
+    else:
+        current_phase_contract = "【当前静态相位唯一画面判项】未提供编译后相位合同，按下方兼容字段核验。"
+        audit_contract = ""
+        qc_location = payload.get("location") or "按提示词"
+        qc_action = payload.get("action") or "按提示词"
+        qc_camera = payload.get("camera") or "按提示词"
     prompt = IMAGE_QC_PROMPT.format(
         scene_continuity=scene_continuity,
         image=payload.get("image_uri", ""),
@@ -1734,9 +1884,11 @@ def build_qc_prompt(payload):
             f"{name}={wardrobe}" for name, wardrobe in
             (payload.get("expected_wardrobe") or {}).items())
             or "本镜未声明服装状态，仅按可见剧情事实检查"),
-        location=payload.get("location") or "按提示词",
-        action=payload.get("action") or "按提示词",
-        camera=payload.get("camera") or "按提示词",
+        current_phase_contract=current_phase_contract,
+        audit_contract=audit_contract,
+        location=qc_location,
+        action=qc_action,
+        camera=qc_camera,
         physical_contract=physical_text,
         extra=("、" + "、".join(payload.get("forbid", []))
                if payload.get("forbid") else "")

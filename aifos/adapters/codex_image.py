@@ -28,7 +28,10 @@ import threading
 from pathlib import Path
 
 from aifos.generation_diagnostics import normalize_generation_diagnostics
-from aifos.adapters.claude_script import validate_image_qc
+from aifos.adapters.claude_script import (
+    static_image_qc_projection,
+    validate_image_qc,
+)
 from aifos.prompt_contract import readable_text_required, sanitize_text_whitelist
 
 
@@ -136,17 +139,24 @@ def _population_counts(payload):
     return registered, functional, visible
 
 
-def _population_line(payload):
+def _population_line(payload, *, contract_only=False):
     registered, functional, visible = _population_counts(payload)
-    names = "、".join(payload.get("characters") or []) or "无"
-    figures = _functional_figures(payload)
-    figure_text = "、".join(
-        f"{item.get('name') or item.get('label') or '功能人物'}"
-        f"{item['count']}人"
-        + (f"({item.get('state') or item.get('function')})"
-           if item.get("state") or item.get("function") else "")
-        for item in figures
-    ) or ("按v2.2人口合同" if functional else "无")
+    if contract_only:
+        # A phase-projected contract owns the counts.  Whole-take character
+        # names and functional-figure labels may include people from another
+        # boundary, so keep only the authoritative phase-local totals here.
+        names = "按当前相位合同" if registered else "无"
+        figure_text = "按当前相位合同" if functional else "无"
+    else:
+        names = "、".join(payload.get("characters") or []) or "无"
+        figures = _functional_figures(payload)
+        figure_text = "、".join(
+            f"{item.get('name') or item.get('label') or '功能人物'}"
+            f"{item['count']}人"
+            + (f"({item.get('state') or item.get('function')})"
+               if item.get("state") or item.get("function") else "")
+            for item in figures
+        ) or ("按v2.2人口合同" if functional else "无")
     return (
         f"登记角色{registered}人（{names}）；功能人物{functional}人"
         f"（{figure_text}）；画面可见真人严格共{visible}人。"
@@ -348,6 +358,31 @@ def _screen_prop_rule(prompt_text, text_asset=None):
     )
 
 
+def _has_projected_static_contract(payload, prompt_text):
+    """Whether ``prompt_text`` is already the authoritative still contract.
+
+    Director compiles a phase-projected ``prompt_compact`` before it reaches
+    this transport adapter.  Once marked complete, legacy whole-take fields
+    such as ``readable_text`` and ``start_state/end_state`` are audit history,
+    not additional visual facts.  Re-rendering those fields here can revive a
+    concealed phone or text from another phase after the compiler removed it.
+    """
+    return bool(
+        payload.get("prompt_contract_complete")
+        and str(payload.get("prompt_compact") or "").strip()
+        and str(prompt_text or "").strip()
+    )
+
+
+def _legacy_state_line(payload, phase, projected_prompt):
+    """Render legacy boundary state only when no projected phase prompt exists."""
+    if projected_prompt:
+        return ""
+    if phase == "start":
+        return f"起始状态:{_state_brief(payload.get('start_state'))};"
+    return f"结尾状态:{_state_brief(payload.get('end_state'))};"
+
+
 def build_instruction(capability, payload, out_dir):
     """返回 (给 codex 的指令, 期望产出的文件列表, 应答的 data 字段)。"""
     out_dir = Path(out_dir)
@@ -503,20 +538,35 @@ def build_instruction(capability, payload, out_dir):
                 "只产出该文件,不要改动其他文件。"
             )
             return instruction, [target], {"shot_no": shot_no}
-        text_asset = payload.get("readable_text") or {}
-        text_rule = (
-            f"画面文字载体:{text_asset.get('carrier', '')};只允许逐字出现:"
-            f"{'、'.join(sanitize_text_whitelist(text_asset.get('whitelist', []))) or '白名单为空'};"
-            "不得新增乱码或字幕条。"
-            if readable_text_required(text_asset) else
-            "画面中不要生成字幕条、对白字幕或无关可读文字。")
-        text_rule += _screen_prop_rule(prompt_text, text_asset)
+        projected_static = _has_projected_static_contract(
+            payload, prompt_text)
+        if projected_static:
+            # prompt_compact already contains the current phase's population,
+            # camera and readable-text projection.  The unsliced payload fields
+            # remain for audit only and must not be appended to the real model
+            # instruction a second time.
+            population_rule = (
+                f"人物总量合同:{_population_line(payload, contract_only=True)}"
+                "禁止新增、漏画、复制或合并任何真人。")
+            text_rule = ""
+            camera_rule = ""
+        else:
+            text_asset = payload.get("readable_text") or {}
+            population_rule = (
+                f"人物总量合同:{_population_line(payload)}"
+                "禁止新增、漏画、复制或合并任何真人。")
+            text_rule = (
+                f"画面文字载体:{text_asset.get('carrier', '')};只允许逐字出现:"
+                f"{'、'.join(sanitize_text_whitelist(text_asset.get('whitelist', []))) or '白名单为空'};"
+                "不得新增乱码或字幕条。"
+                if readable_text_required(text_asset) else
+                "画面中不要生成字幕条、对白字幕或无关可读文字。")
+            text_rule += _screen_prop_rule(prompt_text, text_asset)
+            camera_rule = f"镜头语言:{payload.get('camera', '')}。"
         instruction = (
             f"为漫剧分镜生成一张关键图并保存到 {target}"
             f"(PNG,{size})。画面内容:{prompt_text}。"
-            f"人物总量合同:{_population_line(payload)}"
-            f"禁止新增、漏画、复制或合并任何真人。{text_rule}"
-            f"镜头语言:{payload.get('camera', '')}。"
+            f"{population_rule}{text_rule}{camera_rule}"
             f"{_ref_line(payload, prompt_text)}{common}"
             "只产出该文件,不要改动其他文件。"
         )
@@ -531,6 +581,14 @@ def build_instruction(capability, payload, out_dir):
             frame_prompts.get("first_frame") or prompt_text)
         last_prompt = str(
             frame_prompts.get("last_frame") or prompt_text)
+        first_projected = bool(str(
+            frame_prompts.get("first_frame") or "").strip())
+        last_projected = bool(str(
+            frame_prompts.get("last_frame") or "").strip())
+        first_state_line = _legacy_state_line(
+            payload, "start", first_projected)
+        last_state_line = _legacy_state_line(
+            payload, "end", last_projected)
         first_ref_payload = {
             **payload,
             "reference_manifest": frame_manifests.get(
@@ -577,7 +635,7 @@ def build_instruction(capability, payload, out_dir):
                 f"{image_uri}(均可直接读取)只生成本镜尾帧,"
                 f"保存到 {last}(PNG,{size})。"
                 f"尾帧独立合同:{last_prompt}。"
-                f"结尾状态:{_state_brief(payload.get('end_state'))};"
+                f"{last_state_line}"
                 "画面从首帧状态自然演进到结尾状态,"
                 "人物身份和不可变场景结构与首帧一致；服装、发型、持物和"
                 "位置严格服从尾帧合同，剧本明确变化时不得强行沿用首帧。"
@@ -598,7 +656,7 @@ def build_instruction(capability, payload, out_dir):
                     "不要改动它)。请基于该首帧只生成本镜尾帧,"
                     f"保存到 {last}(PNG,{size})。"
                     f"尾帧独立合同:{last_prompt}。"
-                    f"结尾状态:{_state_brief(payload.get('end_state'))};"
+                    f"{last_state_line}"
                     "画面从首帧自然演进到结尾状态；人物身份和不可变场景"
                     "结构连续，服装、发型、持物和位置严格服从尾帧合同，"
                     "不得把首帧造型强压到尾帧。"
@@ -621,7 +679,7 @@ def build_instruction(capability, payload, out_dir):
                     "独立生成发生在它之前的本镜首帧,"
                     f"保存到 {first}(PNG,{size})。"
                     f"首帧独立合同:{first_prompt}。"
-                    f"起始状态:{_state_brief(payload.get('start_state'))};"
+                    f"{first_state_line}"
                     "首帧必须是真实动作起点，尾帧才是动作终点；不得把尾帧"
                     "状态倒置、换名或复制成首帧，不新增字幕条。"
                     f"{_ref_line(first_ref_payload, first_prompt)}{common}"
@@ -639,8 +697,7 @@ def build_instruction(capability, payload, out_dir):
             f"分别保存到 {first} 和 {last}(PNG,{size})。"
             f"首帧独立合同:{first_prompt}。"
             f"尾帧独立合同:{last_prompt}。"
-            f"起始状态:{_state_brief(payload.get('start_state'))};"
-            f"结尾状态:{_state_brief(payload.get('end_state'))};"
+            f"{first_state_line}{last_state_line}"
             "首帧为动作起始、尾帧为动作结束，构图与关键图连贯，"
             "只保持人物身份和不可变场景结构连续；服装、发型、持物、位置"
             "分别服从各自边界合同，禁止跨相位复制。"
@@ -654,6 +711,7 @@ def build_instruction(capability, payload, out_dir):
             "keyframe_phase": keyframe_phase}
     if capability == "image_qc":
         image = payload.get("image_uri", "")
+        static_projection = static_image_qc_projection(payload)
         chars = "、".join(payload.get("characters", [])) or "无人(空镜)"
         _, _, expected_real_people = _population_counts(payload)
         forbid = "、".join(payload.get("forbid", [])) or "无"
@@ -684,7 +742,9 @@ def build_instruction(capability, payload, out_dir):
             f"实际可见真人={composition_visible};"
             f"{actor_rules};{composition.get('count_rule', '')};{quality_line}"
             if composition else "标准构图；按待检图实际可见视角逐人核验")
-        physical = payload.get("physical_contract") or {}
+        physical = (
+            static_projection.get("physical")
+            if static_projection else payload.get("physical_contract") or {})
         physical_rules = "；".join(physical.get("rules") or [])
         physical_objects = "；".join(physical.get("objects") or [])
         physical_line = (
@@ -751,6 +811,36 @@ def build_instruction(capability, payload, out_dir):
             "shot_no": payload.get("shot_no"),
             "frame_kind": payload.get("frame_kind", "keyframe"),
         }
+        if static_projection:
+            current_phase_line = (
+                "- 【当前静态相位唯一画面判项】"
+                f"phase={static_projection['phase']}；frame_props="
+                + json.dumps(
+                    static_projection["frame_props"], ensure_ascii=False,
+                    separators=(",", ":"))
+                + "；readable_text_current="
+                + json.dumps(
+                    static_projection["readable_text_current"],
+                    ensure_ascii=False, separators=(",", ":"))
+                + "。画面道具、可读文字与物理关系只按本段和投影后的"
+                  "physical合同核验；不得从原始action/readable_text/"
+                  "physical_contract或实际提交提示词中恢复其他相位事实。\n"
+                "- 【仅审计，不是画面判项】"
+                + json.dumps(
+                    static_projection["audit_only"], ensure_ascii=False,
+                    separators=(",", ":"))
+                + "。其中hidden/absent道具和隐藏载体文字完全不可见是正确"
+                  "结果；不得因未画出、不可读或无法核验而令visual_pass、"
+                  "physical_logic_match、spatial_logic_match或pass为false。\n"
+            )
+            qc_location = static_projection.get("location") or "按当前相位合同"
+            qc_action = static_projection.get("action") or "按当前相位定格状态"
+            qc_camera = static_projection.get("camera") or "按当前相位合同"
+        else:
+            current_phase_line = ""
+            qc_location = payload.get("location", "按提示词")
+            qc_action = payload.get("action", "按提示词")
+            qc_camera = payload.get("camera", "不限")
         escalation = payload.get("codex_escalation_context")
         escalation = escalation if isinstance(escalation, dict) else {}
         escalation_line = ""
@@ -813,6 +903,11 @@ def build_instruction(capability, payload, out_dir):
             f"  实际提交提示词={str(generation_prompt)[:12000]}\n"
             "  实际提交参考图对照表="
             f"{json.dumps(generation_references, ensure_ascii=False)[:16000]}\n"
+            + current_phase_line
+            + "上面的实际提交提示词只用于诊断输入是否干净，不是第二份画面"
+            "事实源。若它仍带另一相位、hidden/absent道具或隐藏载体文字，"
+            "只能记入prompt_diagnosis，不能要求待检图画出，也不能据此判"
+            "画面失败。\n"
             "除判断画面错误外，必须分别判断提示词是否准确、简洁、无冲突、"
             "无无关剧情，以及参考图是否属于本镜、人物与用途绑定是否正确、"
             "是否缺失或冲突。必须逐项对照当前镜头剧本事实、起点、动作、"
@@ -881,9 +976,9 @@ def build_instruction(capability, payload, out_dir):
             "都必须判失败。过肩镜中前景半身背影/肩膀是已登记的对话者本人，"
             "只计该角色1人，不得另算成第三人、陌生人或人物复制。\n"
             + overlay_line
-            + f"- 场景:{payload.get('location', '按提示词')};"
-            f"动作:{payload.get('action', '按提示词')};"
-            f"镜头景别:{payload.get('camera', '不限')}\n"
+            + f"- 场景:{qc_location};"
+            f"动作:{qc_action};"
+            f"镜头景别:{qc_camera}\n"
             f"- 物理/空间逻辑硬检查:{physical_line}\n"
             "必须核对人物、镜头、道具的前后左右关系、朝向、视线、接触点、重力支撑和动作可达性；"
             "电脑/手机/屏幕等设备必须按真实使用方向成立，屏幕正面、键盘/手部和使用者关系不能反向。"

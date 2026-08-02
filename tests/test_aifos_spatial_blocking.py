@@ -122,6 +122,55 @@ def test_group_scene_builds_routes_camera_and_continuity(tmp_path):
     assert 'data-camera-phase="fixed"' in svg
 
 
+def test_vehicle_blocking_uses_scene_model_room_without_changing_default():
+    """Episode 29 镜2回归：车厢不能继续套用 10x7m 通用房间。"""
+    location = "轿车内/高速公路"
+    shot = _shot(2, ["虞寻歌", "司机"], "固定", "两人坐在车内交谈")
+    shot["scene_no"] = 2
+    shot["start_state"]["虞寻歌"].update({
+        "position": "画面右1/3", "pose": "坐在副驾驶座椅上"})
+    shot["end_state"]["虞寻歌"] = dict(
+        shot["start_state"]["虞寻歌"])
+    shot["start_state"]["司机"].update({
+        "position": "画面左1/3", "pose": "坐在驾驶座椅上"})
+    shot["end_state"]["司机"] = dict(shot["start_state"]["司机"])
+    script = {"scenes": [{"scene_no": 2, "location": location}]}
+    storyboard = {"shots": [shot]}
+    continuity = {
+        "characters": [{"name": "虞寻歌", "role": "主角"},
+                       {"name": "司机", "role": "配角"}],
+        "scenes": [{"name": "未使用"}, {"name": location}],
+    }
+    scene_model = {
+        "location": location,
+        "room": {"floor_width_m": 1.85, "floor_depth_m": 4.4,
+                 "wall_height_m": 1.55},
+    }
+
+    default_plan = build_spatial_plan(script, storyboard, continuity)
+    room_plan = build_spatial_plan(
+        script, storyboard, continuity,
+        scene_models={location: scene_model})
+
+    assert default_plan["scenes"][0]["world"]["floor_width_m"] == 10.0
+    assert default_plan["scenes"][0]["world"]["floor_depth_m"] == 7.0
+    assert room_plan["source_fingerprint"] != \
+        default_plan["source_fingerprint"]
+    world = room_plan["scenes"][0]["world"]
+    assert world["floor_width_m"] == 1.85
+    assert world["floor_depth_m"] == 4.4
+    block = shot_blocking(room_plan, 2)
+    room_points = [
+        point
+        for actor in block["actors"]
+        for point in (actor["start_3d"], actor["end_3d"])
+    ] + [block["camera"]["start_3d"], block["camera"]["end_3d"]]
+    assert all(abs(point["x"]) <= 1.85 / 2 for point in room_points)
+    assert all(abs(point["z"]) <= 4.4 / 2 for point in room_points)
+    assert room_plan["validation"]["passed"], \
+        room_plan["validation"]["issues"]
+
+
 def test_reentering_actors_with_same_inherited_point_are_spread_apart():
     """分别在不同前镜出现的人物，可能各自把同一左侧坐标写入
     previous_end；之后首次同框时必须按当前站位合同重新避碰。
