@@ -605,6 +605,39 @@ def test_modern_scene_filters_ancient_project_style_from_provider_prompt():
         assert forbidden not in prompt
 
 
+def test_modern_scene_drops_whole_ancient_furnishing_clause_without_fragments():
+    shot = {
+        "characters": [],
+        "description": "2078年现代高档酒店走廊，房门外可见远处电梯",
+        "frame_target_policy": "legacy",
+        "camera": "35mm俯拍斜侧固定中景",
+    }
+    style = (
+        "电影级半写实3D真人漫剧；"
+        "鎏金暖棕与冷灰蓝色板；"
+        "柔和侧逆光、冷灰环境光；"
+        "暖金中以古室、书案、香炉、纱幕、卷册构成场景陈设"
+    )
+
+    contract, prompt = compile_shot_prompt(
+        shot, location="2078年现代高档酒店走廊",
+        style=style, mode="image")
+
+    # 媒介、色板和布光仍属于项目画风，可以安全继承到现代镜头。
+    for retained in (
+            "电影级半写实3D真人漫剧", "鎏金暖棕与冷灰蓝色板",
+            "柔和侧逆光", "冷灰环境光"):
+        assert retained in contract["style"]
+        assert retained in prompt
+
+    # 古代场景陈设是一整条地点设计，不可逐词删除后把残句送给 provider。
+    for leaked in (
+            "古室", "书案", "香炉", "纱幕", "卷册", "场景陈设",
+            "暖金中以", "暖金中", "暖金中以、卷册"):
+        assert leaked not in contract["style"]
+        assert leaked not in prompt
+
+
 def test_vehicle_interior_and_worn_seatbelt_get_complete_physical_contract():
     shot = {
         "characters": ["虞寻歌"],
@@ -1371,6 +1404,161 @@ def test_static_frame_drops_timeline_prop_transitions_and_offstage_references():
         shot1, location="酒店房间外·走廊", mode="last_frame")
     assert end1["prop_transitions"] == []
     assert "枕边取手机" not in end1_prompt
+
+
+def test_static_frame_provider_prompt_drops_routes_and_whole_take_physics():
+    """A still consumes one observable phase, never the shot's motion plan."""
+    shot = {
+        "characters": ["虞寻歌", "虞寻欢"],
+        "description": "虞寻歌从门外走进卧室，最终停在床边",
+        "frame_targets": {
+            "first_frame": {
+                "phase": "start", "state": "虞寻歌独自在门外走廊",
+                "characters": ["虞寻歌"], "fallback": False,
+            },
+            "keyframe": {
+                "phase": "freeze", "state": "两人在卧室门边短暂停住",
+                "characters": ["虞寻歌", "虞寻欢"], "fallback": False,
+            },
+            "last_frame": {
+                "phase": "end", "state": "虞寻欢躺在床上，虞寻歌站在床边",
+                "characters": ["虞寻歌", "虞寻欢"], "fallback": False,
+            },
+        },
+        "frame_props": [
+            {"prop_id": "phone", "phase": "start",
+             "physical_state": "亮屏", "holder": "虞寻歌",
+             "location": "右手", "visibility": "visible",
+             "representation": "physical"},
+            {"prop_id": "phone", "phase": "freeze",
+             "physical_state": "熄屏", "location": "床边柜",
+             "visibility": "visible", "representation": "physical"},
+            {"prop_id": "phone", "phase": "end",
+             "physical_state": "完全收纳", "holder": "虞寻歌",
+             "location": "风衣口袋内", "visibility": "hidden",
+             "representation": "physical"},
+        ],
+        "physical_contract": {"rules": [
+            "start阶段：虞寻歌独自在走廊，手机在右手，视线看向房门",
+            "freeze阶段：虞寻歌与虞寻欢停在门边，手机在床边柜，双方对视",
+            "end阶段：虞寻欢躺在床上，虞寻歌看向床，手机完全收入口袋",
+        ]},
+        "spatial_blocking": {
+            "camera": {
+                "start_3d": {"x": 0.0, "y": 1.5, "z": 4.0},
+                "end_3d": {"x": 0.0, "y": 1.5, "z": 3.0},
+                "target_3d": {"x": 0.0, "y": 1.2, "z": 0.0},
+                "target_start_3d": {"x": 0.0, "y": 1.2, "z": 0.0},
+                "target_end_3d": {"x": 0.0, "y": 1.2, "z": 0.0},
+                "fov_degrees": 54.4, "movement": "缓推",
+            },
+            "actors": [
+                {"name": "虞寻歌", "moving": True,
+                 "start_3d": {"x": -1.2, "y": 0.0, "z": 0.0},
+                 "end_3d": {"x": 1.0, "y": 0.0, "z": 2.0},
+                 "pose_label_start": "站姿", "pose_label_end": "站姿",
+                 "support_start": "双脚/地面", "support_end": "双脚/地面",
+                 "facing_start": "面向房门", "facing_end": "面向虞寻欢"},
+                {"name": "虞寻欢", "moving": False,
+                 "start_3d": {"x": 1.0, "y": 0.0, "z": 1.2},
+                 "end_3d": {"x": 1.0, "y": 0.0, "z": 1.2},
+                 "pose_label_start": "站姿", "pose_label_end": "卧姿",
+                 "support_start": "双脚/地面", "support_end": "身体/床垫",
+                 "facing_start": "面向虞寻歌", "facing_end": "面向天花板"},
+            ],
+        },
+    }
+
+    cases = {
+        "first_frame": {
+            "present": (
+                "虞寻歌独自在门外走廊", "physical_state=亮屏",
+                "holder=虞寻歌", "location=右手"),
+            "absent": ("手机在床边柜", "双方对视", "躺在床上", "完全收入口袋"),
+        },
+        "image": {
+            "present": (
+                "两人在卧室门边短暂停住", "physical_state=熄屏",
+                "location=床边柜"),
+            "absent": ("手机在右手", "躺在床上", "完全收入口袋"),
+        },
+        "last_frame": {
+            "present": (
+                "虞寻欢躺在床上，虞寻歌站在床边",
+                "physical_state=完全收纳", "location=风衣口袋内"),
+            "absent": ("手机在右手", "手机在床边柜", "双方对视"),
+        },
+    }
+    for mode, expected in cases.items():
+        contract, prompt = compile_shot_prompt(
+            shot, location="虞家别墅·虞寻欢卧室", mode=mode)
+        assert "行动路线" not in contract["spatial_staging"]
+        assert "【行动路线】" not in prompt
+        for text in expected["present"]:
+            assert text in prompt
+        for text in expected["absent"]:
+            assert text not in prompt
+
+    video, video_prompt = compile_shot_prompt(
+        shot, location="虞家别墅·虞寻欢卧室", mode="video")
+    assert "行动路线" in video["spatial_staging"]
+    assert "【行动路线】" in video_prompt
+    for timeline_fact in (
+            "手机在右手", "手机在床边柜", "双方对视",
+            "虞寻欢躺在床上", "手机完全收入口袋"):
+        assert timeline_fact in video_prompt
+
+
+def test_changed_frame_location_drops_unscoped_whole_scene_layout():
+    """A bedroom model cannot place its bed in a hallway boundary frame."""
+    whole_scene_layout = (
+        "【固定场景坐标】双人床贴北墙；床头框位于床垫正上方；"
+        "床边柜紧贴床右侧；衣柜位于西墙。")
+    shot = {
+        "characters": ["虞寻歌"],
+        "description": "虞寻歌由门外走廊进入卧室",
+        "location": "虞家别墅·虞寻欢卧室",
+        "scene_layout": whole_scene_layout,
+        "frame_targets": {
+            "first_frame": {
+                "phase": "start", "state": "虞寻歌站在卧室门外走廊",
+                "location": "虞家别墅·卧室门外走廊",
+                "characters": ["虞寻歌"], "fallback": False,
+            },
+            "keyframe": {
+                "phase": "freeze", "state": "虞寻歌站在卧室门边",
+                "location": "虞家别墅·虞寻欢卧室",
+                "characters": ["虞寻歌"], "fallback": False,
+            },
+            "last_frame": {
+                "phase": "end", "state": "虞寻歌停在卧室床边",
+                "location": "虞家别墅·虞寻欢卧室",
+                "characters": ["虞寻歌"], "fallback": False,
+            },
+        },
+    }
+
+    hallway, hallway_prompt = compile_shot_prompt(
+        shot, location=shot["location"], mode="first_frame")
+    assert hallway["scene"] == "虞家别墅·卧室门外走廊"
+    assert hallway["scene_layout"] == ""
+    for bedroom_fixture in ("双人床", "床头框", "床边柜", "衣柜"):
+        assert bedroom_fixture not in hallway_prompt
+
+    keyframe, keyframe_prompt = compile_shot_prompt(
+        shot, location=shot["location"], mode="image")
+    last, last_prompt = compile_shot_prompt(
+        shot, location=shot["location"], mode="last_frame")
+    for contract in (keyframe, last):
+        for bedroom_fixture in ("双人床", "床头框", "床边柜", "衣柜"):
+            assert bedroom_fixture in contract["scene_layout"]
+    assert "床头框" in keyframe_prompt and "床头框" in last_prompt
+
+    video, video_prompt = compile_shot_prompt(
+        shot, location=shot["location"], mode="video")
+    for bedroom_fixture in ("双人床", "床头框", "床边柜", "衣柜"):
+        assert bedroom_fixture in video["scene_layout"]
+    assert "床头框" in video_prompt
 
 
 def test_static_frame_rejects_character_outside_whole_take_cast():

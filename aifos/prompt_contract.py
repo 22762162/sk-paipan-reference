@@ -22,7 +22,7 @@ from .spatial_language import spatial_lines
 from .realism_language import realism_applicable
 
 
-def _spatial_staging_block(shot):
+def _spatial_staging_block(shot, *, media="video"):
     """3D 空间调度 → {标签: 条款} 的可核验空间事实。"""
     shot = shot if isinstance(shot, dict) else {}
     block = shot.get("spatial_blocking")
@@ -45,6 +45,19 @@ def _spatial_staging_block(shot):
     lines = {
         label: text for label, text in spatial_lines(
             block, phase=phase, declared_scale=scale)}
+    if str(media or "video").lower() != "video":
+        # A still has no route.  Rendering a whole-take actor/camera path into
+        # a frozen first/key/last-frame prompt makes the model average the
+        # start and end states (an unconscious actor "walks closer", a person
+        # who already left is kept in frame, or a hidden phone reappears).
+        # Current position, occlusion and screen direction remain useful; all
+        # motion-path clauses belong exclusively to the video timeline.
+        lines = {
+            label: text for label, text in lines.items()
+            if not any(token in _text(label) for token in (
+                "行动路线", "人物路线", "摄影机路线", "相机路线", "运动路线",
+            ))
+        }
     # A shot-local Codex repair can intentionally replace the earlier blocking
     # projection.  ``build_physical_contract`` already gives an explicit
     # ``某人屏幕左/右`` clause precedence, but the compact prompt also rendered
@@ -435,6 +448,11 @@ _MODERN_INCOMPATIBLE_STYLE_TOKENS = (
     "书案", "香炉", "纱幕", "纱帐", "古室", "县衙", "驿馆", "官舍",
 )
 
+_MODERN_INCOMPATIBLE_SCENE_PROP_TOKENS = (
+    "宫殿", "宫廷", "古室", "寝殿", "殿内", "殿堂", "书案", "香炉",
+    "宫灯", "烛台", "纱幕", "纱帐", "卷册", "县衙", "驿馆", "官舍",
+)
+
 
 def _is_modern_scene(scene):
     text = _text(scene)
@@ -471,6 +489,13 @@ def _filter_modern_incompatible_style(value, scene):
     for clause in re.split(r"[。；;\n]+", text):
         fragments = []
         for fragment in re.split(r"[，,]+", clause):
+            # A furnishing/location fragment cannot be made modern by merely
+            # deleting nouns: "暖金古室中以书案、香炉..." used to become the
+            # meaningless and still highly suggestive "暖金中以、...".  Drop
+            # that complete fragment; palette/light/medium fragments survive.
+            if any(token in fragment
+                   for token in _MODERN_INCOMPATIBLE_SCENE_PROP_TOKENS):
+                continue
             cleaned = _clean_style_fragment(fragment)
             if cleaned:
                 fragments.append(cleaned)
@@ -2699,7 +2724,7 @@ def _static_terminal_physical_rules(rules):
         # A single stored rule can mix actor state and camera movement. Split
         # it so stable terminal relationships survive the still conversion.
         segments = [
-            value.strip() for value in re.split(r"[。；;\n]+", _text(rule))
+            value.strip() for value in re.split(r"[。；;，,\n]+", _text(rule))
             if value.strip()
         ]
         kept = []
@@ -2717,8 +2742,41 @@ def _static_terminal_physical_rules(rules):
                 continue
             kept.append(segment)
         if kept:
-            stable.append("；".join(kept))
+            stable.extend(kept)
     return stable
+
+
+def _static_observable_state_rules(value):
+    """Extract only support/pose facts from a frozen-state sentence.
+
+    The core frame target may legitimately say how the character arrived
+    (``已后退半步站稳``).  That provenance is useful in the audit/core line,
+    but the physical section of a still must not repeat motion verbs.
+    """
+    motion_tokens = (
+        "后退", "前进", "走向", "走到", "走近", "靠近", "离开", "进入",
+        "起身", "坐下", "站起", "转身", "伸手", "收手", "抬手", "放下",
+        "拿起", "掀开", "打开", "关闭", "移动", "移向", "递出", "接过",
+    )
+    return [
+        segment.strip() for segment in re.split(r"[。；;\n]+", _text(value))
+        if segment.strip()
+        and not any(token in segment for token in motion_tokens)
+    ]
+
+
+def _static_rule_supported_by_target(rule, target_state):
+    """Conservatively retain a stable stored rule only when target echoes it."""
+    def bigrams(value):
+        compact = "".join(re.findall(r"[\u4e00-\u9fff]+", _text(value)))
+        return {compact[index:index + 2]
+                for index in range(max(0, len(compact) - 1))}
+
+    rule_grams = bigrams(rule)
+    target_grams = bigrams(target_state)
+    return bool(
+        rule_grams and target_grams
+        and len(rule_grams & target_grams) / len(rule_grams) >= 0.45)
 
 
 def build_physical_contract(shot, *, media="video", target_phase=""):
@@ -2747,8 +2805,17 @@ def build_physical_contract(shot, *, media="video", target_phase=""):
     else:
         rules = [_text(explicit)] if explicit else []
         objects = []
+    static_rule_candidates = []
     if str(media or "video").lower() != "video":
-        rules = _static_terminal_physical_rules(rules)
+        # Stored physical_contract rules describe the whole take and commonly
+        # mix phases even after sentence splitting ("phone hidden" beside
+        # "holds phone", "driver outside" beside "driver at the wheel").  A
+        # still must be rebuilt only from its frame_target, visible frame_props
+        # and scoped blocking below.  Keep the source contract for audit, but
+        # never send its timeline prose to an image provider.
+        static_rule_candidates = _static_terminal_physical_rules(rules)
+        rules = []
+        objects = []
     shot_contract = shot.get("shot_contract")
     shot_contract = shot_contract if isinstance(shot_contract, dict) else {}
     media_name = str(media or "video").lower()
@@ -2769,6 +2836,7 @@ def build_physical_contract(shot, *, media="video", target_phase=""):
     carrier_visibility_blocked = False
     phase_phone_visibility_blocked = False
     phase_laptop_visibility_blocked = False
+    static_target_state = ""
 
     if media_name != "video" and phase_explicit:
         # A still is one frozen fact.  Do not mine the whole-take description
@@ -2786,6 +2854,7 @@ def build_physical_contract(shot, *, media="video", target_phase=""):
             frame_target.get("state") if isinstance(frame_target, dict)
             else (derived_target or {}).get("state")
             or shot.get("frame_target_state"))
+        static_target_state = target_state
         visible_prop_facts = []
         registry_names = {
             _text(item.get("prop_id")): _text(item.get("name"))
@@ -2862,6 +2931,18 @@ def build_physical_contract(shot, *, media="video", target_phase=""):
     if not any(_text(rule).rstrip("。") == generic.rstrip("。")
                for rule in rules):
         rules.insert(0, generic)
+    if media_name != "video" and static_target_state:
+        # Re-state exactly one observable freeze fact after discarding the
+        # stored whole-take physical timeline.  This preserves useful stable
+        # support/pose facts without resurrecting another phase's location,
+        # prop or gaze instructions.
+        rules.extend(
+            f"当前静态物理状态：{state_rule}"
+            for state_rule in _static_observable_state_rules(
+                static_target_state))
+        rules.extend(
+            rule for rule in static_rule_candidates
+            if _static_rule_supported_by_target(rule, static_target_state))
     if str(media or "video").lower() == "video":
         motion_rule = (
             "人和物品道具的运动轨迹必须符合真实物理世界的运动轨迹和逻辑；"
@@ -3378,9 +3459,17 @@ def build_shot_prompt_contract(
                     and bound_character not in characters):
                 continue
         refs.append(normalized)
-    physical = build_physical_contract({
+    physical_shot = {
         **shot, "location": scene, "style": scene_style,
-    }, media=output_media, target_phase=target_phase)
+    }
+    if target.get("explicit"):
+        # For frame_targets.first/key/last, force the exact selected boundary
+        # into physical compilation instead of leaving the shot-level keyframe
+        # (usually the end/freeze target) in place.  Legacy fallback shots keep
+        # their historical description/readable-text inference.
+        physical_shot["frame_target"] = dict(target)
+    physical = build_physical_contract(
+        physical_shot, media=output_media, target_phase=target_phase)
     physical["frame_props"] = list(frame_props)
     physical["prop_transitions"] = list(prop_transitions)
     overlays = []
@@ -3412,6 +3501,18 @@ def build_shot_prompt_contract(
     overlays = overlays[:1]
     visible_entity_count = visible_count + len(overlays)
     declared_target = _declared_frame_target(source_shot, target)
+    declared_scene_layout = (
+        _text(declared_target.get("scene_layout"))
+        if isinstance(declared_target, dict) else "")
+    whole_scene_layout = _strip_modern_ancient_exclusions(
+        shot.get("scene_layout"), scene)
+    static_cross_location = bool(
+        output_media == "image" and not joint_frames and target_location
+        and _text(target_location) != _text(authoritative_scene))
+    scene_layout = (
+        declared_scene_layout
+        if static_cross_location
+        else declared_scene_layout or whole_scene_layout)
     declared_visible = (
         declared_target.get("visible_figure_count")
         if (phase_population_declared
@@ -3528,8 +3629,7 @@ def build_shot_prompt_contract(
         # 场景陈设的固定坐标条款(由 blocking 层按三维场景+本镜机位算好)。
         # 没有它,【场景】只有一句地名,模型每张图重新想象家具在哪——
         # 「说在纱帐后面却画在镜前」「后面纱帐经常变」就是这么来的。
-        "scene_layout": _strip_modern_ancient_exclusions(
-            shot.get("scene_layout"), scene),
+        "scene_layout": scene_layout,
         "script_reference": _text(shot.get("script_reference")),
         "era_context": _text(shot.get("era_context")),
         "era_object_constraints": build_era_object_constraints({
@@ -3567,7 +3667,8 @@ def build_shot_prompt_contract(
         # 3D 空间调度 → 可核验文字:屏幕定位、遮挡序、朝向视线、
         # 行动路线、屏幕方向轴线。此前这些数字只画进示意图,模型得
         # "看懂图";现在图与文字各司其职,质检也按同一判据核验。
-        "spatial_staging": _spatial_staging_block(shot),
+        "spatial_staging": _spatial_staging_block(
+            shot, media=output_media),
         "camera_precedence": (
             "本合同 camera 字段是唯一执行镜位,已按「分镜原文 > 镜头"
             "合同 > 五维默认」融合完毕;上下文中任何其他来源的机位、"
