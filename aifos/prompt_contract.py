@@ -97,7 +97,9 @@ def _spatial_staging_block(shot):
 
 def lighting_lines_for_shot(shot, style, scene):
     """本镜【光影】条款:按剧本已有事实选型,非写实画风自动留空。"""
-    if not realism_applicable(style or (shot or {}).get("style")):
+    effective_style = _style_for_scene(
+        style or (shot or {}).get("style"), scene)
+    if not realism_applicable(effective_style):
         return ""
     shot = shot if isinstance(shot, dict) else {}
     camera = shot.get("camera")
@@ -110,16 +112,19 @@ def lighting_lines_for_shot(shot, style, scene):
                         or shot.get("era_context") or ""),
         mood=str(shot.get("mood") or shot.get("emotion") or ""),
         camera=camera_text,
-        scene_action=" ".join(str(value) for value in (
+        scene_action=_strip_modern_ancient_exclusions(
+            " ".join(str(value) for value in (
             shot.get("description"), shot.get("action"),
-            shot.get("script_reference")) if value),
-        style_override=str(shot.get("lighting_style") or ""),
+            shot.get("script_reference")) if value), scene),
+        style_override=_filter_modern_incompatible_style(
+            shot.get("lighting_style"), scene),
         include_genre_camera=False,
         # 题材决定视听基调:仙侠逆光体积光、悬疑低调硬光、甜宠柔光高调
-        genre=" ".join(str(value) for value in (
-            style, scene, shot.get("genre"), shot.get("kind_label"),
+        genre=_filter_modern_incompatible_style(
+            " ".join(str(value) for value in (
+            effective_style, scene, shot.get("genre"), shot.get("kind_label"),
             shot.get("project_kind"), shot.get("era_context"),
-            shot.get("script_reference")) if value))
+            shot.get("script_reference")) if value), scene))
 
 
 PROMPT_CONTRACT_SCHEMA = "aifos.shot-prompt/v2.2"
@@ -418,6 +423,98 @@ def _style_without_shot_camera_directives(value):
     return "；".join(kept)
 
 
+_MODERN_SCENE_TOKENS = (
+    "现代", "当代", "酒店", "电梯", "办公室", "便利店", "高速公路",
+    "都市", "轿车", "汽车", "驾驶座", "副驾驶", "别墅", "公寓",
+)
+
+_MODERN_INCOMPATIBLE_STYLE_TOKENS = (
+    "明代宫殿", "明代烛台", "明代", "大明", "古代", "古风", "古装",
+    "宫斗", "权谋", "朝堂", "后宫", "宅斗", "官场", "宫殿", "宫廷",
+    "东宫", "寝殿", "紫禁城", "殿内", "殿堂", "宫灯", "烛火", "烛台",
+    "书案", "香炉", "纱幕", "纱帐", "古室", "县衙", "驿馆", "官舍",
+)
+
+
+def _is_modern_scene(scene):
+    text = _text(scene)
+    return bool(
+        re.search(r"(?:19|20|21)\d{2}年", text)
+        or any(token in text for token in _MODERN_SCENE_TOKENS))
+
+
+def _clean_style_fragment(fragment):
+    cleaned = _text(fragment)
+    for token in _MODERN_INCOMPATIBLE_STYLE_TOKENS:
+        cleaned = cleaned.replace(token, "")
+    cleaned = re.sub(r"[、/]{2,}", "、", cleaned)
+    cleaned = re.sub(r"^[的以与和及、/\s]+|[的与和及、/\s]+$", "", cleaned)
+    if cleaned in {
+            "", "为光源动机", "光源动机", "本剧题材视听基调",
+            "题材", "风格"}:
+        return ""
+    return cleaned
+
+
+def _filter_modern_incompatible_style(value, scene):
+    """Keep aesthetics while removing an era/location design package.
+
+    Project style is allowed to control palette, light, material, medium and
+    cinematic finish.  It may not redesign an authoritative modern location
+    as a palace.  Mixed clauses are salvaged (``鎏金柔雾写实古风`` becomes
+    ``鎏金柔雾写实``); pure palace/furnishing clauses disappear.
+    """
+    text = _text(value)
+    if not text or not _is_modern_scene(scene):
+        return text
+    clauses = []
+    for clause in re.split(r"[。；;\n]+", text):
+        fragments = []
+        for fragment in re.split(r"[，,]+", clause):
+            cleaned = _clean_style_fragment(fragment)
+            if cleaned:
+                fragments.append(cleaned)
+        if fragments:
+            clauses.append("，".join(fragments))
+    return "；".join(clauses)
+
+
+def _style_for_scene(value, scene):
+    return _filter_modern_incompatible_style(
+        _style_without_shot_camera_directives(value), scene)
+
+
+def _strip_modern_ancient_exclusions(value, scene):
+    """Drop only negated ancient exclusion lists from a modern shot state.
+
+    They remain useful in an audit log, but naming every forbidden prop in the
+    provider-facing target primes the generator with exactly those objects.
+    Positive story facts (including a deliberate antique prop) are preserved.
+    """
+    text = _text(value)
+    if not text or not _is_modern_scene(scene):
+        return text
+    kept_sentences = []
+    for sentence in re.split(r"[。！？!?；;\n]+", text):
+        parts = []
+        for part in re.split(r"[，,]+", sentence):
+            has_ancient = any(
+                token in part for token in _MODERN_INCOMPATIBLE_STYLE_TOKENS)
+            negated = any(
+                marker in part for marker in _SCENE_NEGATION_MARKERS)
+            bare_none = re.search(
+                r"(?:^|[：:\s])(?:场景|画面)?无(?:任何|相关|一切|其他)?",
+                part,
+            )
+            if has_ancient and (negated or bare_none):
+                continue
+            if _text(part):
+                parts.append(_text(part))
+        if parts:
+            kept_sentences.append("，".join(parts))
+    return "。".join(kept_sentences)
+
+
 def _text_list(value):
     if isinstance(value, str):
         value = [value]
@@ -567,6 +664,7 @@ def _frame_target(shot, mode, requested_mode=""):
     if declared is not None:
         declared_phase = ""
         declared_state = ""
+        declared_location = ""
         declared_fallback = False
         if isinstance(declared, dict):
             declared_phase = _text(
@@ -574,11 +672,13 @@ def _frame_target(shot, mode, requested_mode=""):
             declared_state = _state_value(
                 declared.get("state")
                 if "state" in declared else declared.get("frame_state"))
+            declared_location = _text(
+                declared.get("location") or declared.get("scene_location"))
             declared_fallback = bool(declared.get("fallback"))
         else:
             declared_state = _state_value(declared)
         if declared_state:
-            return {
+            target = {
                 # Keep an invalid/missing phase invalid so validation can
                 # BLOCK it; never wash malformed upstream state into start/end.
                 "phase": declared_phase,
@@ -593,6 +693,12 @@ def _frame_target(shot, mode, requested_mode=""):
                 "compatibility_policy": policy["name"],
                 "legacy_compatibility": policy["allow_legacy_fallback"],
             }
+            if declared_location:
+                # This is a provider-facing visible sub-location only.  The
+                # Director keeps the shot's authoritative top-level location
+                # for scene_model lookup and formal scene reference assets.
+                target["location"] = declared_location
+            return target
     for source in ("freeze_state", "image_state"):
         state = _state_value(shot.get(source))
         if state:
@@ -660,6 +766,165 @@ def _frame_target(shot, mode, requested_mode=""):
         "compatibility_policy": policy["name"],
         "legacy_compatibility": policy["allow_legacy_fallback"],
     }
+
+
+def _declared_frame_target(shot, target):
+    """Return the source object that produced a normalized frame target."""
+    source = _text((target or {}).get("source"))
+    if source.startswith("frame_targets."):
+        key = source.split(".", 1)[1]
+        targets = shot.get("frame_targets")
+        value = targets.get(key) if isinstance(targets, dict) else None
+        return value if isinstance(value, dict) else None
+    if source == "frame_target":
+        value = shot.get("frame_target")
+        return value if isinstance(value, dict) else None
+    return None
+
+
+def _frame_character_scope(shot, target, output_media):
+    """Resolve an optional static-frame subset of whole-take characters."""
+    whole = []
+    for value in shot.get("characters") or []:
+        name = _text(value)
+        if name and name not in whole:
+            whole.append(name)
+    if output_media == "video":
+        return whole, [], False, "shot.characters"
+    declared = _declared_frame_target(shot, target)
+    if not isinstance(declared, dict) or "characters" not in declared:
+        return whole, [], False, "shot.characters"
+    raw = declared.get("characters")
+    source = f"{_text(target.get('source'), 'frame_target')}.characters"
+    if not isinstance(raw, (list, tuple)):
+        return whole, [f"{source} 必须是人物姓名数组"], True, source
+    selected = []
+    issues = []
+    for value in raw:
+        name = _text(value)
+        if not name:
+            issues.append(f"{source} 不得包含空人物名")
+            continue
+        if name not in whole:
+            issues.append(
+                f"{source} 包含未登记人物「{name}」；"
+                "只能从 shot.characters 选择")
+            continue
+        if name in selected:
+            issues.append(f"{source} 重复声明人物「{name}」")
+            continue
+        selected.append(name)
+    return selected, issues, True, source
+
+
+def _frame_functional_scope(shot, target, output_media):
+    """Resolve optional phase-specific non-identity people for a still."""
+    whole = shot.get("functional_figures") or []
+    if output_media == "video":
+        return whole, [], False, "shot.functional_figures"
+    declared = _declared_frame_target(shot, target)
+    if not isinstance(declared, dict) or "functional_figures" not in declared:
+        return whole, [], False, "shot.functional_figures"
+    raw = declared.get("functional_figures")
+    source = (
+        f"{_text(target.get('source'), 'frame_target')}.functional_figures")
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return whole, [f"{source} 必须是功能人物对象数组"], True, source
+    selected = [dict(item) if isinstance(item, dict) else item for item in raw]
+    return selected, [], True, source
+
+
+def _shot_with_character_scope(
+        shot, characters, functional_figures=None, target_state=""):
+    """Make one shallow, static-only view without unrelated cast/staging."""
+    scoped = dict(shot)
+    allowed = set(characters)
+    scoped["characters"] = list(characters)
+    if functional_figures is not None:
+        scoped["functional_figures"] = list(functional_figures)
+        allowed.update(
+            _text(item.get("name") or item.get("label"))
+            for item in functional_figures if isinstance(item, dict))
+        allowed.discard("")
+    if _text(target_state):
+        # Static compilation must not keep the whole-take action sentence once
+        # the producer supplied a unique frozen state.  Apart from preventing
+        # motion leakage, this removes not-yet-entered cast names from camera,
+        # lighting and physical inference.
+        scoped["description"] = _text(target_state)
+        scoped["action"] = _text(target_state)
+    for field in ("start_state", "end_state"):
+        states = shot.get(field)
+        if isinstance(states, dict):
+            scoped[field] = {
+                name: value for name, value in states.items()
+                if name in allowed}
+    # A saved whole-take composition/3D projection may contain a character who
+    # has not entered yet. Rebuild composition from the scoped cast and keep
+    # only the current actors in the spatial projection.
+    scoped.pop("composition_contract", None)
+    blocking = shot.get("spatial_blocking")
+    if isinstance(blocking, dict):
+        blocking = dict(blocking)
+        actors = blocking.get("actors")
+        if isinstance(actors, list):
+            blocking["actors"] = [
+                dict(item) for item in actors
+                if isinstance(item, dict)
+                and _text(item.get("name") or item.get("character")) in allowed
+            ]
+        dialogue = blocking.get("dialogue_continuity")
+        if isinstance(dialogue, dict):
+            names = {
+                _text(dialogue.get("screen_left_name")),
+                _text(dialogue.get("screen_right_name")),
+            } - {""}
+            if not names <= allowed or len(characters) < 2:
+                blocking.pop("dialogue_continuity", None)
+        scoped["spatial_blocking"] = blocking
+    dialogue = shot.get("dialogue")
+    if (isinstance(dialogue, dict)
+            and _text(dialogue.get("character")) not in allowed):
+        scoped["dialogue"] = {}
+    overlays = shot.get("narrative_overlays")
+    if isinstance(overlays, list):
+        scoped["narrative_overlays"] = [
+            dict(item) for item in overlays
+            if isinstance(item, dict)
+            and _text(item.get("host_character")) in allowed]
+
+    excluded = {
+        _text(value) for value in shot.get("characters") or []
+        if _text(value) and _text(value) not in allowed}
+
+    def keep_clause(value):
+        return not any(name in _text(value) for name in excluded)
+
+    for field in ("physical_contract", "physical_logic", "spatial_logic"):
+        value = shot.get(field)
+        if isinstance(value, dict):
+            filtered = dict(value)
+            for key in ("rules", "constraints", "objects", "object_relations"):
+                rows = filtered.get(key)
+                if isinstance(rows, list):
+                    filtered[key] = [item for item in rows if keep_clause(item)]
+                elif isinstance(rows, str):
+                    filtered[key] = "；".join(
+                        clause for clause in re.split(r"[。；;\n]+", rows)
+                        if _text(clause) and keep_clause(clause))
+            relations = filtered.get("spatial_relations")
+            if isinstance(relations, list):
+                filtered["spatial_relations"] = [
+                    item for item in relations
+                    if keep_clause(item)]
+            scoped[field] = filtered
+        elif isinstance(value, str):
+            scoped[field] = "；".join(
+                clause for clause in re.split(r"[。；;\n]+", value)
+                if _text(clause) and keep_clause(clause))
+    return scoped
 
 
 def _normalize_functional_figures(shot):
@@ -777,9 +1042,11 @@ def _readable_carrier_visible_at_phase(
                 matching.append(item)
     if not matching:
         return True
+    # Readable text and active device-use geometry require a directly visible
+    # carrier.  ``occluded`` is still useful as a continuity fact, but its
+    # screen cannot be read and must not create a hand/screen/gaze relation.
     return any(
-        _text(item.get("visibility"), "visible").lower()
-        not in {"hidden", "absent"}
+        _text(item.get("visibility"), "visible").lower() == "visible"
         for item in matching)
 
 
@@ -1286,6 +1553,11 @@ def build_era_object_constraints(shot):
     the object is *and* which common anachronistic form is forbidden.
     """
     shot = shot if isinstance(shot, dict) else {}
+    authoritative_scene = _text(
+        shot.get("location") or shot.get("scene_location")
+        or shot.get("scene_context") or shot.get("world_state"))
+    if _is_modern_scene(authoritative_scene):
+        return []
     context = " ".join(_text(value) for value in (
         shot.get("era_context"), shot.get("era"), shot.get("world_state"),
         shot.get("location"), shot.get("scene_context"), shot.get("style"),
@@ -1300,25 +1572,25 @@ def build_era_object_constraints(shot):
         _text(value) for value in (
             shot.get("sanctioned_anachronisms") or [])
         if _text(value))
-    historical = any(token in context for token in
-                     PREMODERN_CHINESE_ERA_TOKENS)
+    historical = _contains_affirmed_scene_hint(
+        context, PREMODERN_CHINESE_ERA_TOKENS)
     if not historical:
         return []
     rules = []
-    if "油灯" in visible and not any(
+    if _mentions_present_object(visible, ("油灯",)) and not any(
             token in sanctioned for token in (
                 "煤油灯", "玻璃灯罩", "玻璃罩灯")):
         rules.append(
             "时代物件锁定—油灯：只画明代可成立的陶制或青铜开放式浅盏"
             "油灯，灯油与棉芯可见；绝不画玻璃灯罩、煤油灯筒、现代调节"
             "旋钮、电灯泡或工业金属灯座")
-    if any(token in visible for token in ("提灯", "灯笼")) and not any(
+    if _mentions_present_object(visible, ("提灯", "灯笼")) and not any(
             token in sanctioned for token in (
                 "玻璃提灯", "煤油提灯")):
         rules.append(
             "时代物件锁定—提灯：只画明代竹木骨架配纸或薄绢灯罩的笼灯，"
             "内部烛火受罩保护；绝不画玻璃煤油提灯、现代金属提手灯或电灯")
-    if any(token in visible for token in ("烛台", "烛火", "孤烛")):
+    if _mentions_present_object(visible, ("烛台", "烛火", "孤烛")):
         rules.append(
             "时代物件锁定—烛台：使用裸露蜡烛与明代可成立的铜、铁或陶"
             "烛台；禁止套用玻璃灯罩、煤油灯芯机构或电灯结构")
@@ -1907,6 +2179,38 @@ def _appearance_map(states):
     return output
 
 
+_READABLE_TEXT_PHASES = ("start", "freeze", "end")
+_READABLE_TEXT_PHASE_LABELS = {
+    "start": "起点",
+    "freeze": "中间定格",
+    "end": "终点",
+}
+
+
+def _readable_text_for_phase(value, phase):
+    """Return only the readable-text facts belonging to ``phase``.
+
+    ``readable_text`` used to describe an entire take.  New contracts may use
+    ``readable_text.phases`` so a start clock, middle game card and unreadable
+    end screen do not get composited into every generated frame.  Once phase
+    buckets exist, a missing bucket means "no phase-specific readable text";
+    global legacy fields are not inherited because doing so would recreate the
+    cross-phase leak this schema is designed to prevent.
+    """
+    value = value if isinstance(value, dict) else {}
+    phases = value.get("phases")
+    if not isinstance(phases, dict):
+        return dict(value)
+    selected = phases.get(_text(phase).lower())
+    if not isinstance(selected, dict):
+        return {"required": False}
+    return dict(selected)
+
+
+def _readable_text_has_phases(value):
+    return isinstance(value, dict) and isinstance(value.get("phases"), dict)
+
+
 def readable_text_required(value):
     """Only treat an explicit on-screen whitelist as an image text asset.
 
@@ -1915,12 +2219,90 @@ def readable_text_required(value):
     invites invented text even though the production profile forbids subtitles.
     """
     value = value if isinstance(value, dict) else {}
+    phases = value.get("phases")
+    if isinstance(phases, dict):
+        return any(
+            readable_text_required(phases.get(phase))
+            for phase in _READABLE_TEXT_PHASES)
     if not value.get("required"):
         return False
     carrier = _text(value.get("carrier"))
     if any(label in carrier for label in NON_PICTURE_TEXT_CARRIERS):
         return False
     return bool(sanitize_text_whitelist(value.get("whitelist") or []))
+
+
+def _readable_text_rule(value):
+    """Render one phase/legacy readable-text card without device confusion."""
+    value = value if isinstance(value, dict) else {}
+    required = readable_text_required(value)
+    carrier = _text(value.get("carrier"), "指定载体")
+    if not required:
+        if _text(value.get("carrier")):
+            return (
+                f"{carrier}在本阶段不要求可读，禁止生成可识别文字；"
+                "不新增任何其他画面文字、字幕、Logo或水印")
+        return "无画面文字、无字幕、无Logo、无水印"
+
+    whitelist = "、".join(sanitize_text_whitelist(
+        value.get("whitelist") or [])) or "白名单"
+    layout = _text(value.get("layout"))
+    text_style = _text(value.get("style"))
+    perspective = _text(value.get("perspective"))
+    presentation = "；".join(filter(None, (
+        f"版式/位置:{layout}" if layout else "",
+        f"字体/颜色/层级:{text_style}" if text_style else "",
+        f"透视/反光:{perspective}" if perspective else "",
+    )))
+    carrier_lower = carrier.lower()
+    # A phone/tablet is a hand-held display, not a laptop.  Check the specific
+    # device first; the old generic ``屏幕`` branch mislabeled ``手机屏幕`` as a
+    # computer and then introduced keyboard/desk geometry into phone shots.
+    handheld = any(token in carrier_lower for token in (
+        "手机", "锁屏", "平板", "tablet", "mobile", "phone"))
+    computer = (not handheld and any(
+        token in carrier_lower for token in (
+            "电脑", "笔记本", "显示器", "显示屏", "屏幕", "laptop",
+            "computer")))
+    if computer:
+        return (
+            f"电脑屏幕必须打开并清晰显示白名单原文:{whitelist}；"
+            + (presentation + "；" if presentation else "")
+            + "屏幕不是冷白光效/空白占位面，禁止随机乱码、模糊色块和黑白占位；"
+            + "屏幕外无字幕、Logo、水印和无关文字")
+    return (
+        f"{carrier}内文字只保持原样:{whitelist}；"
+        + (presentation + "；" if presentation else "")
+        + "禁止新增文字")
+
+
+def _readable_text_timeline_rule(
+        value, frame_props, prop_registry):
+    """Render independent start/freeze/end text beats for a video."""
+    value = value if isinstance(value, dict) else {}
+    phases = value.get("phases")
+    if not isinstance(phases, dict):
+        return _readable_text_rule(value)
+    beats = []
+    for phase in _READABLE_TEXT_PHASES:
+        if phase not in phases:
+            continue
+        current = _readable_text_for_phase(value, phase)
+        label = _READABLE_TEXT_PHASE_LABELS[phase]
+        visible = _readable_carrier_visible_at_phase(
+            current, frame_props, phase, prop_registry)
+        if readable_text_required(current) and not visible:
+            carrier = _text(current.get("carrier"), "文字载体")
+            rule = f"{carrier}隐藏/遮挡/不在画面，不生成该阶段文字"
+        else:
+            rule = _readable_text_rule(current)
+        beats.append(f"{label}:{rule}")
+    if not beats:
+        return "无画面文字、无字幕、无Logo、无水印"
+    return (
+        "文字时间线（各阶段按时间先后独立执行）:"
+        + "；".join(beats)
+        + "；禁止把不同阶段的文字、屏幕状态或版式同时塞进同一帧")
 
 
 def _spatial_anchor_count(shot):
@@ -2128,10 +2510,11 @@ def _camera(shot, visible_count=None):
 def shot_local_scene(shot, fallback=""):
     """Resolve only the current shot's visible place/era.
 
-    Legacy storyboards often omitted a per-shot location and left only a raw
-    prompt such as “现代书房闪回”. Do not silently use the episode's later
-    historical scene in that case; use an explicit shot value or a narrow
-    keyword hint, then fall back to the scene baseline.
+    Structured scene data is authoritative: a shot-local location wins first,
+    followed by the caller's script ``scene_no`` lookup.  Keyword inference is
+    only a compatibility path for old storyboards that have neither.  That
+    compatibility path must ignore negative clauses: ``不得出现明代宫殿`` is
+    not evidence that the visible scene is a Ming palace.
     """
     shot = shot or {}
     explicit = _text(
@@ -2139,10 +2522,14 @@ def shot_local_scene(shot, fallback=""):
         or shot.get("scene_context") or shot.get("world_state"))
     if explicit:
         return explicit
+    authoritative = _text(fallback)
+    if authoritative:
+        return authoritative
     text = " ".join(_text(value) for value in (
         shot.get("description"), shot.get("action"), shot.get("prompt"),
     ) if _text(value))
     hints = (
+        ("现代酒店", ("现代高档酒店", "现代酒店", "酒店走廊", "酒店房间")),
         ("现代书房", ("现代书房", "现代书桌")),
         ("现代办公室", ("现代办公室", "现代办公")),
         ("现代都市", ("现代都市", "都市街道", "现代街道")),
@@ -2150,10 +2537,65 @@ def shot_local_scene(shot, fallback=""):
         ("明代宫殿内景", ("明代宫殿", "宫殿", "紫禁城")),
     )
     for label, tokens in hints:
-        if any(token in text for token in tokens):
+        if _contains_affirmed_scene_hint(text, tokens):
             return label + ("（闪回）" if "闪回" in text and "现代" in label
                             else "")
-    return _text(fallback, "按场景基准图")
+    return "按场景基准图"
+
+
+_SCENE_NEGATION_MARKERS = (
+    "不得出现", "禁止出现", "严禁出现", "不要出现", "不可出现",
+    "不得", "禁止", "严禁", "不要", "不可", "不出现", "不包含",
+    "不表示", "不存在", "排除", "删除", "移除", "避免", "没有",
+)
+
+_SCENE_AFFIRMATION_RESETS = (
+    "改为", "应为", "实际为", "场景为", "画面是", "而是", "位于",
+    "切到", "进入", "来到", "回到",
+)
+
+
+def _scene_hint_is_negated(clause, index):
+    """Check negation scoped to the comma-delimited phrase before a hint.
+
+    Chinese exclusion lists commonly use ``、`` (``禁止宫殿、宫灯``), so it
+    intentionally does not end the scope.  A comma does: this keeps an earlier
+    delivery rule such as ``无字幕、水印，画面是现代酒店`` from suppressing
+    the later, affirmative location.
+    """
+    prefix = clause[:index]
+    local_prefix = re.split(r"[，,]", prefix)[-1]
+    last_negative = max(
+        (local_prefix.rfind(marker) for marker in _SCENE_NEGATION_MARKERS),
+        default=-1,
+    )
+    bare_none = re.search(
+        r"(?:^|[：:\s])(?:场景|画面)?无(?:任何|相关|一切|其他)?"
+        r"[^，,、]{0,10}$",
+        local_prefix,
+    )
+    if bare_none:
+        last_negative = max(last_negative, bare_none.start())
+    last_reset = max(
+        (local_prefix.rfind(marker) for marker in _SCENE_AFFIRMATION_RESETS),
+        default=-1,
+    )
+    return last_negative >= 0 and last_negative > last_reset
+
+
+def _contains_affirmed_scene_hint(text, tokens):
+    """Return true only for a positive, visible-scene keyword mention."""
+    for clause in re.split(r"[。！？!?；;\n]+", _text(text)):
+        for token in tokens:
+            start = 0
+            while True:
+                index = clause.find(token, start)
+                if index < 0:
+                    break
+                if not _scene_hint_is_negated(clause, index):
+                    return True
+                start = index + len(token)
+    return False
 
 
 _OBJECT_NEGATION_MARKERS = (
@@ -2279,7 +2721,7 @@ def _static_terminal_physical_rules(rules):
     return stable
 
 
-def build_physical_contract(shot, *, media="video"):
+def build_physical_contract(shot, *, media="video", target_phase=""):
     """Build a short, shot-local physical/spatial contract.
 
     The image model must receive object-user-camera relationships explicitly;
@@ -2309,13 +2751,109 @@ def build_physical_contract(shot, *, media="video"):
         rules = _static_terminal_physical_rules(rules)
     shot_contract = shot.get("shot_contract")
     shot_contract = shot_contract if isinstance(shot_contract, dict) else {}
-    description = " ".join(_text(value) for value in (
-        shot.get("description"), shot.get("action"),
-        shot_contract.get("画面内容描述"),
-        shot_contract.get("构图"),
-    ) if _text(value))
-    carrier = _text((shot.get("readable_text") or {}).get("carrier"))
-    object_text = f"{description} {carrier}".lower()
+    media_name = str(media or "video").lower()
+    frame_target = shot.get("frame_target")
+    declared_phase = _text(target_phase).lower()
+    if not declared_phase and isinstance(frame_target, dict):
+        declared_phase = _text(frame_target.get("phase")).lower()
+    derived_target = None
+    if media_name != "video" and declared_phase not in _READABLE_TEXT_PHASES:
+        derived_target = _frame_target(
+            shot, "image", _text(shot.get("frame_kind")))
+        declared_phase = _text(derived_target.get("phase")).lower()
+    phase_explicit = declared_phase in _READABLE_TEXT_PHASES
+    readable_source = shot.get("readable_text") or {}
+    raw_frame_props = _object_items(shot.get("frame_props"), "prop_id")
+    raw_frame_props = (
+        raw_frame_props if isinstance(raw_frame_props, (list, tuple)) else [])
+    carrier_visibility_blocked = False
+    phase_phone_visibility_blocked = False
+    phase_laptop_visibility_blocked = False
+
+    if media_name != "video" and phase_explicit:
+        # A still is one frozen fact.  Do not mine the whole-take description
+        # for a phone, driving action or bed pose that belonged to another
+        # phase; use only its target state and currently visible props.
+        readable = _readable_text_for_phase(readable_source, declared_phase)
+        carrier_visible = _readable_carrier_visible_at_phase(
+            readable, raw_frame_props, declared_phase,
+            shot.get("prop_registry") or [])
+        carrier_visibility_blocked = bool(
+            _text(readable.get("carrier")) and not carrier_visible)
+        carrier = (
+            _text(readable.get("carrier")) if carrier_visible else "")
+        target_state = _state_value(
+            frame_target.get("state") if isinstance(frame_target, dict)
+            else (derived_target or {}).get("state")
+            or shot.get("frame_target_state"))
+        visible_prop_facts = []
+        registry_names = {
+            _text(item.get("prop_id")): _text(item.get("name"))
+            for item in (shot.get("prop_registry") or [])
+            if isinstance(item, dict)}
+        phase_phone_rows = []
+        phase_laptop_rows = []
+        for item in raw_frame_props:
+            if not isinstance(item, dict):
+                continue
+            if _normalize_prop_phase(item.get("phase")) != declared_phase:
+                continue
+            prop_id = _text(item.get("prop_id"))
+            prop_label = " ".join(filter(None, (
+                prop_id, _text(item.get("name")),
+                registry_names.get(prop_id, "")))).lower()
+            if any(token in prop_label for token in (
+                    "手机", "phone", "mobile", "平板", "tablet")):
+                phase_phone_rows.append(item)
+            if any(token in prop_label for token in (
+                    "电脑", "笔记本", "computer", "laptop", "显示器")):
+                phase_laptop_rows.append(item)
+            if _text(item.get("visibility"), "visible").lower() != "visible":
+                continue
+            visible_prop_facts.append(" ".join(filter(None, (
+                _text(item.get("name")) or registry_names.get(prop_id, ""),
+                _text(item.get("physical_state")),
+                _text(item.get("holder")),
+                _text(item.get("location") or item.get("position")),
+            ))))
+        phase_phone_visibility_blocked = bool(
+            phase_phone_rows and not any(
+                _text(item.get("visibility"), "visible").lower() == "visible"
+                for item in phase_phone_rows))
+        phase_laptop_visibility_blocked = bool(
+            phase_laptop_rows and not any(
+                _text(item.get("visibility"), "visible").lower() == "visible"
+                for item in phase_laptop_rows))
+        description = " ".join(filter(None, (
+            target_state,
+            " ".join(visible_prop_facts),
+            _text(shot_contract.get("构图")),
+        )))
+    else:
+        readable = readable_source
+        if media_name == "video" and _readable_text_has_phases(readable_source):
+            visible_carriers = []
+            for phase in _READABLE_TEXT_PHASES:
+                current = _readable_text_for_phase(readable_source, phase)
+                if (phase in (readable_source.get("phases") or {})
+                        and _readable_carrier_visible_at_phase(
+                            current, raw_frame_props, phase,
+                            shot.get("prop_registry") or [])):
+                    value = _text(current.get("carrier"))
+                    if value and value not in visible_carriers:
+                        visible_carriers.append(value)
+            carrier = " ".join(visible_carriers)
+        else:
+            carrier = _text(readable.get("carrier"))
+        description = " ".join(_text(value) for value in (
+            shot.get("description"), shot.get("action"),
+            shot_contract.get("画面内容描述"),
+            shot_contract.get("构图"),
+        ) if _text(value))
+    scene_text = _text(
+        shot.get("location") or shot.get("scene_location")
+        or shot.get("scene_context"))
+    object_text = f"{description} {carrier} {scene_text}".lower()
     generic = (
         "人物、镜头与道具的前后左右关系必须真实成立；道具服从重力并与桌面/地面/手部"
         "保持自然接触；人物朝向、视线和手部动作必须指向实际使用对象；禁止漂浮、穿模、"
@@ -2332,6 +2870,30 @@ def build_physical_contract(shot, *, media="video"):
         if not any("运动轨迹必须符合真实物理世界" in _text(rule)
                    for rule in rules):
             rules.insert(1, motion_rule)
+    vehicle_interior = any(token in object_text for token in (
+        "车内", "轿车内", "汽车内", "驾驶座", "驾驶位", "副驾驶",
+        "方向盘", "中控台", "车载中控",
+    ))
+    if vehicle_interior:
+        rules.append(
+            "现代乘用车车内结构完整：驾驶座与副驾驶座成对存在且方向一致，"
+            "两座均有座垫、靠背和头枕；方向盘位于驾驶座前方，中控台位于"
+            "两座前方中央，车门、仪表台、挡风玻璃和座椅不得缺失、互换、"
+            "重叠或悬空。镜头只可裁出画面，不能把未入镜结构解释成车辆不存在。")
+        objects.append(
+            "现代车内：驾驶座/方向盘↔中控台↔副驾驶座，座椅头枕结构完整")
+    seatbelt_worn = bool(re.search(
+        r"(?:系|系着|系好|系上|系住|佩戴|扣好|扣上|斜跨)[^，,。；]{0,6}安全带|"
+        r"安全带[^，,。；]{0,6}(?:系着|系好|已系|扣好|斜跨)",
+        object_text,
+    ))
+    if seatbelt_worn:
+        rules.append(
+            "三点式安全带路径：肩带从乘员座椅外侧上方固定点出发，斜跨胸口"
+            "到身体内侧锁扣；腰带从外侧下锚点横跨左右髋部接入同一锁扣。"
+            "织带贴合衣物表面但不勒入、不穿过身体、手臂或座椅，锁扣必须"
+            "落在座椅内侧且受力路径连续。")
+        objects.append("三点式安全带：外侧上锚点↔胸口↔内侧锁扣+髋部腰带")
     # ``屏幕左/右`` is the established staging vocabulary for image-plane
     # position, not a display device.  A bare ``屏幕`` therefore cannot prove
     # that a laptop exists; require an actual device noun or display-specific
@@ -2343,21 +2905,61 @@ def build_physical_contract(shot, *, media="video"):
     )
     laptop_carrier_tokens = (*laptop_tokens, "屏幕")
     phone_tokens = ("手机", "平板", "tablet")
-    if (any(token in carrier.lower() for token in laptop_carrier_tokens)
-            or _mentions_present_object(object_text, laptop_tokens)):
+    handheld_present = (
+        any(token in carrier.lower() for token in phone_tokens)
+        or _mentions_present_object(object_text, phone_tokens))
+    handheld_use = (
+        handheld_present
+        and not carrier_visibility_blocked
+        and not phase_phone_visibility_blocked
+        and (
+        media_name == "video"
+        or bool(carrier)
+        or bool(re.search(
+            r"(?:手持|拿着|握着|举着|持有|查看|低头看|看向|展示|递出|"
+            r"接过)[^，,。；]{0,10}(?:手机|平板)|"
+            r"(?:手机|平板)[^，,。；]{0,10}(?:拿|握|举|看|展示|递|接)",
+            object_text))))
+    laptop_present = (
+        not phase_laptop_visibility_blocked
+        and (any(token in carrier.lower() for token in laptop_carrier_tokens)
+             or _mentions_present_object(object_text, laptop_tokens)))
+    if media_name != "video" and phase_explicit:
+        # A persisted video physical contract may already contain relations for
+        # other beats.  Strip those derived device-use rows before rebuilding
+        # this still's one-phase contract.
+        if not handheld_use:
+            rules = [
+                rule for rule in rules
+                if "手持屏幕关系" not in _text(rule)]
+            objects = [
+                value for value in objects
+                if "手持屏幕" not in _text(value)]
+        if not laptop_present:
+            rules = [
+                rule for rule in rules
+                if "电脑使用关系" not in _text(rule)]
+            objects = [
+                value for value in objects
+                if "笔记本电脑" not in _text(value)]
+    if handheld_use:
+        rules.append(
+            "手持屏幕关系：屏幕正面必须朝向实际使用者或被展示的观看者；"
+            "若人物正在查看，屏幕只可向摄影机小角度倾斜，由使用者同侧斜角"
+            "或越肩机位保证可读，禁止为了文字清晰把屏幕完全翻向镜头、背对"
+            "使用者或造成手腕反折。若当前定格还要求人物注视床上、门口或"
+            "其他明确对象，视线只落在该对象，手机保持合理手持方向；不得让"
+            "双眼同时注视两个目标。手指与机身接触自然，手腕、手臂和持握"
+            "方向连续。"
+        )
+        objects.append("手持屏幕：使用者/观看者↔屏幕正面")
+    elif laptop_present:
         rules.append(
             "电脑使用关系：屏幕正面、键盘和使用者必须位于同一使用侧；键盘朝向使用者，"
             "屏幕与底座由铰链连接并由桌面支撑；人物视线落在屏幕可见区域。若需要看清屏幕文字，"
             "镜头必须采用使用者同侧的越肩或侧面机位，禁止人物坐在屏幕背面却看到屏幕正面。"
         )
         objects.append("笔记本电脑：使用者↔键盘/屏幕正面↔桌面支撑")
-    elif (any(token in carrier.lower() for token in phone_tokens)
-          or _mentions_present_object(object_text, phone_tokens)):
-        rules.append(
-            "手持屏幕关系：屏幕正面必须朝向正在查看或展示的人；手指与机身接触自然，"
-            "手腕、手臂和视线方向一致，禁止屏幕朝后却被人物读取。"
-        )
-        objects.append("手持屏幕：使用者/观看者↔屏幕正面")
     # “马车”不是一个可独立运动的箱体。历史失败里模型只画车厢、漏掉
     # 马匹与挽具，画面虽像马车却没有动力来源。只在本镜明确表现移动/
     # 驾驶时强制完整动力链；停放、纯车厢内景、马已死亡或逃离等剧情
@@ -2645,9 +3247,39 @@ def build_shot_prompt_contract(
     全局风格/角色经历与参考图抢控制权。
     """
     shot = shot if isinstance(shot, dict) else {}
-    characters = list(shot.get("characters") or [])
+    source_shot = shot
+    authoritative_scene = shot_local_scene(shot, location)
     output_media, requested_mode = _normalize_mode(mode)
     target = _frame_target(shot, output_media, requested_mode)
+    target = dict(target)
+    joint_frames = bool(
+        requested_mode == "frames"
+        or _text(shot.get("frame_kind")).lower() == "frames")
+    target_location = _text(target.get("location"))
+    scene = (
+        target_location
+        if output_media == "image" and not joint_frames and target_location
+        else authoritative_scene)
+    scene_style = _style_for_scene(style or shot.get("style"), scene)
+    characters, character_scope_issues, character_scope_declared, character_source = (
+        _frame_character_scope(source_shot, target, output_media))
+    functional_source, functional_scope_issues, functional_scope_declared, functional_source_name = (
+        _frame_functional_scope(source_shot, target, output_media))
+    phase_population_declared = (
+        character_scope_declared or functional_scope_declared)
+    if phase_population_declared:
+        shot = _shot_with_character_scope(
+            source_shot, characters, functional_source,
+            target_state=target.get("state"))
+    else:
+        characters = list(shot.get("characters") or [])
+    target["characters"] = list(characters)
+    if functional_scope_declared:
+        target["functional_figures"] = [
+            dict(item) if isinstance(item, dict) else item
+            for item in functional_source]
+    target["state"] = _strip_modern_ancient_exclusions(
+        target.get("state"), scene)
     # Never fall back to the raw storyboard prompt here. It may contain the
     # whole episode bible and unrelated scenes, which makes the provider blend
     # facts from other shots into this image.
@@ -2662,19 +3294,28 @@ def build_shot_prompt_contract(
     else:
         action_source = shot.get("description") or shot.get("action")
     action = _text(
-        action_source, "环境保持稳定，只执行自然微动")
+        _strip_modern_ancient_exclusions(action_source, scene),
+        "环境保持稳定，只执行自然微动")
     target_phase = (
         target.get("phase")
         if target.get("phase") in {"start", "end", "freeze"}
         else "end")
     frame_props, frame_prop_issues = _normalize_frame_props(
         shot, target_phase)
-    prop_transitions, prop_transition_issues = _normalize_prop_transitions(
-        shot)
+    all_prop_transitions, prop_transition_issues = (
+        _normalize_prop_transitions(shot))
+    timeline_contract = bool(output_media == "video" or joint_frames)
+    # A transition is a relationship between phases, not an observable fact
+    # inside one frozen image.  Keep it only for motion / paired-frame timeline
+    # contracts; otherwise it injects future actors and actions into the still.
+    prop_transitions = (
+        all_prop_transitions if timeline_contract else [])
     character_conditions = _character_condition_map(
         shot, characters, action, target_phase)
     functional_figures, population_issues = _normalize_functional_figures(
         shot)
+    population_issues.extend(character_scope_issues)
+    population_issues.extend(functional_scope_issues)
     registered_count = len(characters)
     functional_count = sum(
         int(item.get("count") or 0) for item in functional_figures)
@@ -2691,39 +3332,24 @@ def build_shot_prompt_contract(
         and item.get("count") > 0
     ) if isinstance(raw_functional_items, (list, tuple)) else 0
     dialogue = shot.get("dialogue") or {}
-    readable = shot.get("readable_text") or {}
+    readable_source = shot.get("readable_text") or {}
+    readable = (
+        readable_source if output_media == "video"
+        else _readable_text_for_phase(readable_source, target_phase))
     readable_required = readable_text_required(readable)
     readable_carrier_visible = (
         output_media == "video"
         or _readable_carrier_visible_at_phase(
             readable, frame_props, target_phase,
             shot.get("prop_registry") or []))
-    if readable_required and readable_carrier_visible:
-        whitelist = "、".join(sanitize_text_whitelist(
-            readable.get("whitelist") or [])) or "白名单"
-        carrier = _text(readable.get("carrier"), "指定载体")
-        layout = _text(readable.get("layout"))
-        text_style = _text(readable.get("style"))
-        perspective = _text(readable.get("perspective"))
-        presentation = "；".join(filter(None, (
-            f"版式/位置:{layout}" if layout else "",
-            f"字体/颜色/层级:{text_style}" if text_style else "",
-            f"透视/反光:{perspective}" if perspective else "",
-        )))
-        if any(token in carrier for token in ("电脑", "笔记本", "屏幕", "显示器")):
-            text_rule = (
-                f"电脑屏幕必须打开并清晰显示白名单原文:{whitelist}；"
-                + (presentation + "；" if presentation else "")
-                + "屏幕不是冷白光效/空白占位面，禁止随机乱码、模糊色块和黑白占位；"
-                + "屏幕外无字幕、Logo、水印和无关文字"
-            )
-        else:
-            text_rule = (f"{carrier}内文字只保持原样:{whitelist}；"
-                         + (presentation + "；" if presentation else "")
-                         + "禁止新增文字")
+    if output_media == "video" and _readable_text_has_phases(readable_source):
+        text_rule = _readable_text_timeline_rule(
+            readable_source, frame_props, shot.get("prop_registry") or [])
+    elif readable_required and readable_carrier_visible:
+        text_rule = _readable_text_rule(readable)
     elif readable_required:
         text_rule = (
-            "当前静态目标phase中文字载体已隐藏或不在画面；"
+            "当前静态目标phase中文字载体已隐藏、遮挡或不在画面；"
             "不生成该载体文字，也不新增任何其他画面文字、字幕、Logo或水印")
     else:
         text_rule = "无画面文字、无字幕、无Logo、无水印"
@@ -2731,11 +3357,30 @@ def build_shot_prompt_contract(
     for item in references or []:
         if not isinstance(item, dict):
             continue
-        refs.append(_normalize_reference(item))
-    scene = shot_local_scene(shot, location)
+        normalized = _normalize_reference(item)
+        if output_media == "image" and not joint_frames:
+            raw_role = _text(item.get("role")).lower()
+            raw_kind = _text(item.get("kind")).lower()
+            person_bound_role = bool(
+                normalized.get("role") in {
+                    "identity", "wardrobe", "costume", "headwear"}
+                or raw_role in {
+                    "identity", "character_identity", "identity_detail",
+                    "character_sheet", "wardrobe", "costume", "headwear"}
+                or raw_kind in {
+                    "identity", "character_identity", "identity_detail",
+                    "character_sheet", "wardrobe", "costume", "headwear"})
+            raw_name = _text(
+                item.get("character") or item.get("attach_to")
+                or item.get("name"))
+            bound_character = raw_name.split(":", 1)[0].strip()
+            if (person_bound_role and bound_character
+                    and bound_character not in characters):
+                continue
+        refs.append(normalized)
     physical = build_physical_contract({
-        **shot, "location": scene, "style": style,
-    }, media=output_media)
+        **shot, "location": scene, "style": scene_style,
+    }, media=output_media, target_phase=target_phase)
     physical["frame_props"] = list(frame_props)
     physical["prop_transitions"] = list(prop_transitions)
     overlays = []
@@ -2766,7 +3411,14 @@ def build_shot_prompt_contract(
         })
     overlays = overlays[:1]
     visible_entity_count = visible_count + len(overlays)
-    declared_visible = shot.get("visible_figure_count")
+    declared_target = _declared_frame_target(source_shot, target)
+    declared_visible = (
+        declared_target.get("visible_figure_count")
+        if (phase_population_declared
+            and isinstance(declared_target, dict)
+            and "visible_figure_count" in declared_target)
+        else None if phase_population_declared
+        else shot.get("visible_figure_count"))
     legacy_declared_repaired = bool(
         isinstance(declared_visible, int)
         and not isinstance(declared_visible, bool)
@@ -2848,6 +3500,11 @@ def build_shot_prompt_contract(
             "identity_facts": _character_identity_facts(shot),
             "identity_facts_required": identity_facts_required,
             "functional_figures": functional_figures,
+            "frame_scope": {
+                "declared": bool(phase_population_declared),
+                "character_source": character_source,
+                "functional_figure_source": functional_source_name,
+            },
         },
         "population": {
             "counts": {
@@ -2871,14 +3528,14 @@ def build_shot_prompt_contract(
         # 场景陈设的固定坐标条款(由 blocking 层按三维场景+本镜机位算好)。
         # 没有它,【场景】只有一句地名,模型每张图重新想象家具在哪——
         # 「说在纱帐后面却画在镜前」「后面纱帐经常变」就是这么来的。
-        "scene_layout": _text(shot.get("scene_layout")),
+        "scene_layout": _strip_modern_ancient_exclusions(
+            shot.get("scene_layout"), scene),
         "script_reference": _text(shot.get("script_reference")),
         "era_context": _text(shot.get("era_context")),
         "era_object_constraints": build_era_object_constraints({
-            **shot, "location": scene, "style": style,
+            **shot, "location": scene, "style": scene_style,
         }),
-        "style": _style_without_shot_camera_directives(
-            style or shot.get("style")),
+        "style": scene_style,
         "style_direction": (
             dict(shot.get("style_direction"))
             if isinstance(shot.get("style_direction"), dict) else {}),
@@ -2906,7 +3563,7 @@ def build_shot_prompt_contract(
             "如仍残留仅为杂讯,不构成画幅冲突,也不需要裁决"),
         # 光影执行条款:按场景时间/地点/情绪与本镜景别自动选型,
         # 非写实画风自动为空(不给二次元塞摄影术语)。
-        "lighting": lighting_lines_for_shot(shot, style, scene),
+        "lighting": lighting_lines_for_shot(shot, scene_style, scene),
         # 3D 空间调度 → 可核验文字:屏幕定位、遮挡序、朝向视线、
         # 行动路线、屏幕方向轴线。此前这些数字只画进示意图,模型得
         # "看懂图";现在图与文字各司其职,质检也按同一判据核验。
@@ -2938,9 +3595,14 @@ def build_shot_prompt_contract(
         ],
         "frame_props": frame_props,
         "prop_transitions": prop_transitions,
+        # Non-rendering audit trail for the upstream whole-take plan.  Static
+        # validation/provider prompts use ``prop_transitions`` above (empty),
+        # so this cannot re-enter image physical rules or compact instructions.
+        "prop_transitions_audit": (
+            [] if timeline_contract else all_prop_transitions),
         "prop_issues": [
             *frame_prop_issues,
-            *prop_transition_issues,
+            *(prop_transition_issues if timeline_contract else []),
         ],
         "end": _registered_state_value(
             shot, "end_state") or "到达尾帧状态",
@@ -2964,6 +3626,16 @@ def build_shot_prompt_contract(
             "" if dialogue.get("inner_voice")
             else _text(dialogue.get("character"))),
         "inner_voice": bool(dialogue.get("inner_voice")),
+        "readable_text": (
+            {"phases": {
+                phase: dict(value)
+                for phase, value in (readable_source.get("phases") or {}).items()
+                if phase in _READABLE_TEXT_PHASES and isinstance(value, dict)
+            }}
+            if _readable_text_has_phases(readable_source)
+            else dict(readable_source)
+        ),
+        "readable_text_current": dict(readable),
         "text": text_rule,
         "narrative_overlays": overlays,
         "references": refs,

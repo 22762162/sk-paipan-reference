@@ -3570,6 +3570,80 @@ function shotBestEffortIssues(item) {
     || qc.issues || [];
 }
 
+/* 旧版图片 QC 把「画面符合事实」「输入合同/参考图风险」和「画面可再
+   优化的建议」全塞进 qc.issues。直接按数组长度显示会把通过结论也染成
+   红色质检问题。这里只整理展示，不改 passed/status/生产门禁。 */
+function qcIssueText(value) {
+  if (typeof value === "string") return value.trim();
+  if (!value || typeof value !== "object") return String(value || "").trim();
+  return String(value.message || value.reason || value.summary || "").trim();
+}
+
+function qcUniqueIssues(values) {
+  const seen = new Set();
+  return (Array.isArray(values) ? values : []).map(qcIssueText).filter((text) => {
+    if (!text || seen.has(text)) return false;
+    seen.add(text);
+    return true;
+  });
+}
+
+function qcIssuePresentation(qcValue, nonblocking = false) {
+  const qc = qcValue && typeof qcValue === "object" ? qcValue : {};
+  const issues = qcUniqueIssues(qc.issues);
+  const critical = new Set(qcUniqueIssues(qc.critical_failures));
+  const advisory = new Set(qcUniqueIssues(qc.advisory_issues));
+  const visualPassed = qc.visual_pass === true || qc.image_passed === true
+    || qc.passed === true;
+  const groups = {
+    visualPassed, facts: [], contractRisks: [], suggestions: [], visualFailures: [],
+  };
+  const positivePattern = /(画面|成片|图像|人物|身份|性别|人数|服装|构图|空间|物理).*(符合|通过|一致|成立|正确|可见)|不影响(身份|剧情|观感|理解)|从宽通过/;
+  const contractPattern = /(参考图|参考表|参考合同|参考职责|输入合同|提示词|binding|基准图|场景锚|用途边界|缺少.*参考|参考.*(?:冲突|矛盾|不一致|替换|无法|未))/i;
+  const add = (bucket, issue) => {
+    if (issue && !groups[bucket].includes(issue)) groups[bucket].push(issue);
+  };
+  issues.forEach((issue) => {
+    if (critical.has(issue)) add("visualFailures", issue);
+    else if (advisory.has(issue)) add("suggestions", issue);
+    else if (contractPattern.test(issue)) add("contractRisks", issue);
+    else if ((visualPassed || nonblocking) && positivePattern.test(issue))
+      add("facts", issue);
+    else if (visualPassed || nonblocking) add("suggestions", issue);
+    else add("visualFailures", issue);
+  });
+  // 兼容新版不再把专用数组重复写回 issues 的报告结构。
+  critical.forEach((issue) => add("visualFailures", issue));
+  advisory.forEach((issue) => {
+    if (!critical.has(issue)) add("suggestions", issue);
+  });
+  // 新版报告会单独给 evidence；旧数据通常已把同一句混入 issues。
+  if (visualPassed && !groups.facts.length) {
+    const diagnosis = qc.input_diagnosis || {};
+    const evidence = qc.image_error?.evidence
+      || diagnosis.image_error?.evidence || [];
+    qcUniqueIssues(evidence).slice(0, 4).forEach((issue) => add("facts", issue));
+  }
+  if (visualPassed && !groups.facts.length)
+    add("facts", "画面视觉内容已通过核验");
+  return groups;
+}
+
+function qcIssueSectionsHtml(qc, nonblocking = false) {
+  const groups = qcIssuePresentation(qc, nonblocking);
+  const list = (values) => `<ul>${values.map((item) =>
+    `<li>${esc(item)}</li>`).join("")}</ul>`;
+  return `${groups.facts.length ? `<div class="qc-manual-pass qc-facts">
+      <b>画面通过事实</b>${list(groups.facts)}</div>` : ""}
+    ${groups.contractRisks.length ? `<div class="qc-revision qc-nonblocking-risk">
+      <b>合同或参考风险</b>${list(groups.contractRisks)}</div>` : ""}
+    ${groups.suggestions.length ? `<div class="qc-revision qc-advisory">
+      <b>非阻断优化建议</b>${list(groups.suggestions)}</div>` : ""}
+    ${groups.visualFailures.length ? `<div class="pc-issues qc-visual-failures">
+      <b>画面质检问题 ${groups.visualFailures.length} 条</b>${
+        list(groups.visualFailures)}</div>` : ""}`;
+}
+
 function shotBestEffortLabel(item) {
   return shotBestEffortPromoted(item)
     ? "已补抽3张并AI选优（非阻断风险）" : "";
@@ -3631,6 +3705,12 @@ function planQcBadge(item) {
     return `<span class="plan-st st-auto" title="内容风险已留档，不阻断后续生产">${bestEffort}</span>`;
   const qc = planVisibleQc(item);
   if (!qc) return "";
+  const presentation = qcIssuePresentation(qc);
+  if (presentation.visualPassed && !presentation.visualFailures.length) {
+    const suffix = presentation.contractRisks.length ? " · 合同待修"
+      : (presentation.suggestions.length ? " · 有非阻断建议" : "");
+    return `<span class="plan-st st-auto" title="画面内容已经通过；合同风险和优化建议另行展示，不冒充画面失败">画面通过✓${suffix}</span>`;
+  }
   if (qc.passed && qc.manual_override)
     return `<span class="plan-st st-manual" title="用户可选覆盖，原质检问题仍保留在审计记录">可选人工通过✓</span>`;
   if (qc.passed)
@@ -3646,9 +3726,8 @@ function planQcBadge(item) {
 function planQcIssuesHtml(item) {
   const bestEffort = shotBestEffortLabel(item);
   if (bestEffort) {
-    const issues = shotBestEffortIssues(item);
-    return `<div class="qc-revision qc-nonblocking-risk"><b>${bestEffort}</b>
-      ${issues.length ? `<span>保留风险记录：${esc(issues.join("；"))}</span>` : ""}</div>`;
+    return `<div class="qc-revision qc-nonblocking-risk"><b>${bestEffort}</b></div>
+      ${qcIssueSectionsHtml(planVisibleQc(item) || {issues: shotBestEffortIssues(item)}, true)}`;
   }
   const qc = planVisibleQc(item);
   if (!qc) return "";
@@ -3657,6 +3736,9 @@ function planQcIssuesHtml(item) {
     return `<div class="qc-manual-pass"><b>可选人工通过：</b>${esc(qc.manual_note || "问题不影响本集观感，继续后续生产")}
       ${issues.length ? `<span>原质检提示（已接受）：${esc(issues.join("；"))}</span>` : ""}</div>`;
   }
+  const presentation = qcIssuePresentation(qc);
+  if (presentation.visualPassed && !presentation.visualFailures.length)
+    return qcIssueSectionsHtml(qc);
   if (qc.passed || !(qc.issues || []).length) return "";
   const codex = planCodexEscalation(item);
   const failureCount = Number(qc.consecutive_failures || 0);
@@ -6564,7 +6646,11 @@ function _pcShotModel(data) {
     const plan = planByShot[no] || {};
     const frames = frameByShot[no] || {};
     const qc = plan.qc || {};
-    const issues = (qc.issues || []).length
+    const qcPresentation = qcIssuePresentation(
+      qc, shotBestEffortPromoted(plan));
+    // 卡片红点只代表真实画面失败；通过事实、参考合同风险和建议
+    // 留在详情里分组说明，不能再显示成 !6 之类的画面错误。
+    const issues = qcPresentation.visualFailures.length
       || (plan.error ? 1 : 0);
     (scenes[sceneNo] = scenes[sceneNo] || []).push({
       no, shot, plan, frames,
@@ -6824,7 +6910,8 @@ async function _pcOpenShotPanel(shotNo) {
   if (!cell) return;
   document.querySelector(".pc-shot-overlay")?.remove();
   const qc = (cell.plan || {}).qc || {};
-  const issues = qc.issues || [];
+  const qcSummary = qcIssueSectionsHtml(
+    qc, shotBestEffortPromoted(cell.plan || {}));
   const big = cell.thumbs[prodCanvasState.layer] || cell.thumbs.keyframe;
   const overlay = document.createElement("div");
   overlay.className = "pc-shot-overlay";
@@ -6841,10 +6928,7 @@ async function _pcOpenShotPanel(shotNo) {
       <div class="pc-shot-info">
         <p class="dim">${esc(String((cell.shot || {}).camera || ""))}</p>
         <p>${esc(String((cell.shot || {}).description || "").slice(0, 160))}</p>
-        ${issues.length ? `<div class="pc-issues"><b>质检问题 ${issues.length} 条</b>
-          <ul>${issues.slice(0, 5).map((i) =>
-            `<li>${esc(String(i).slice(0, 90))}</li>`).join("")}</ul></div>`
-          : (cell.plan.error
+        ${qcSummary || (cell.plan.error
              ? `<div class="pc-issues"><b>错误</b><p>${
                  esc(String(cell.plan.error).slice(0, 160))}</p></div>` : "")}
         <details><summary>查看实际提示词</summary>

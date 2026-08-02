@@ -346,16 +346,135 @@ def test_image_api_frames_reuse_keyframe_charges_one_call(fake_api, tmp_path):
     result = provider.generate("frames", {
         "shot_no": 4, "prompt": "镜头", "aspect": "9:16",
         "image_uri": str(keyframe),
+        "frame_target": {"phase": "start", "state": "动作起点"},
         "spatial_constraint": "空间调度锁：严格 2 人，保持轴线。",
     }, tmp_path / "frames")
     assert result.data["image_normalization"]["first"][
         "target_dimensions"] == {"width": 1080, "height": 1920}
     assert result.data["first_source"] == "keyframe"
+    assert result.data["last_source"] == "generated"
+    assert result.data["keyframe_phase"] == "start"
     assert result.data["generation_calls"] == 1
     assert result.cost == 1.5
     assert len(fake.calls) == 1
     assert "空间调度锁" in provider._semantic_prompt(
         "镜头", {"spatial_constraint": "空间调度锁：严格 2 人。"}, [])
+
+
+def test_image_api_end_keyframe_is_reused_as_last_and_first_is_generated(
+        fake_api, tmp_path):
+    endpoint, fake = fake_api
+    fake.routes[("POST", "/v1/images/edits")] = lambda body: {
+        "data": [{"b64_json": base64.b64encode(PNG_1PX).decode()}]}
+    keyframe = tmp_path / "shot_005.keyframe.png"
+    keyframe.write_bytes(PNG_1PX)
+    provider = OpenAIImageProvider("image_api", _image_conf(endpoint))
+
+    payload = {
+        "shot_no": 5,
+        "prompt": "女人从车门外走向远处",
+        "aspect": "9:16",
+        "keyframe_reference_uri": str(keyframe),
+        "keyframe_last_uri": str(keyframe),
+        "keyframe_boundary_phase": "end",
+        # 新导演的显式边界裁决必须压过可能残留的旧代表帧字段。
+        "frame_target": {"phase": "freeze", "state": "旧代表帧字段"},
+        "start_state": {"女人": {"position": "刚站在车门外"}},
+        "end_state": {"女人": {"position": "已经走远"}},
+    }
+    assert provider.validate_request("frames", payload) == []
+    result = provider.generate(
+        "frames", payload, tmp_path / "frames_end")
+
+    assert result.data["first_source"] == "generated"
+    assert result.data["last_source"] == "keyframe"
+    assert result.data["keyframe_phase"] == "end"
+    assert result.data["generation_calls"] == 1
+    assert result.cost == 1.5
+    assert len(fake.calls) == 1
+
+
+@pytest.mark.parametrize("phase", ["freeze", "", "unexpected"])
+def test_image_api_non_boundary_keyframe_generates_both_frames(
+        fake_api, tmp_path, phase):
+    endpoint, fake = fake_api
+    fake.routes[("POST", "/v1/images/edits")] = lambda body: {
+        "data": [{"b64_json": base64.b64encode(PNG_1PX).decode()}]}
+    keyframe = tmp_path / f"shot_{phase or 'unknown'}.keyframe.png"
+    keyframe.write_bytes(PNG_1PX)
+    provider = OpenAIImageProvider("image_api", _image_conf(endpoint))
+    frame_target = {"state": "代表性构图"}
+    if phase:
+        frame_target["phase"] = phase
+
+    result = provider.generate("frames", {
+        "shot_no": 6,
+        "prompt": "人物从站立到坐下",
+        "aspect": "9:16",
+        "image_uri": str(keyframe),
+        "frame_target": frame_target,
+    }, tmp_path / f"frames_{phase or 'unknown'}")
+
+    assert result.data["first_source"] == "generated"
+    assert result.data["last_source"] == "generated"
+    assert result.data["keyframe_phase"] == phase
+    assert result.data["generation_calls"] == 2
+    assert result.cost == 3.0
+    assert len(fake.calls) == 2
+
+
+def test_image_api_chain_start_and_end_keyframe_need_no_paid_call(
+        fake_api, tmp_path):
+    endpoint, fake = fake_api
+    previous_tail = tmp_path / "previous_tail.png"
+    end_keyframe = tmp_path / "shot_007.keyframe.png"
+    previous_tail.write_bytes(PNG_1PX)
+    end_keyframe.write_bytes(PNG_1PX)
+    provider = OpenAIImageProvider("image_api", _image_conf(endpoint))
+
+    result = provider.generate("frames", {
+        "shot_no": 7,
+        "prompt": "人物从门边走到走廊尽头",
+        "aspect": "9:16",
+        "chain_first_uri": str(previous_tail),
+        "keyframe_reference_uri": str(end_keyframe),
+        "keyframe_last_uri": str(end_keyframe),
+        "keyframe_boundary_phase": "end",
+        "frame_target": {"phase": "freeze", "state": "旧代表帧字段"},
+    }, tmp_path / "frames_chain_end")
+
+    assert result.data["first_source"] == "previous_tail"
+    assert result.data["last_source"] == "keyframe"
+    assert result.data["generation_calls"] == 0
+    assert result.cost == 0
+    assert fake.calls == []
+
+
+def test_image_api_reference_only_keyframe_never_becomes_boundary(
+        fake_api, tmp_path):
+    endpoint, fake = fake_api
+    fake.routes[("POST", "/v1/images/edits")] = lambda body: {
+        "data": [{"b64_json": base64.b64encode(PNG_1PX).decode()}]}
+    keyframe = tmp_path / "shot_reference_only.keyframe.png"
+    keyframe.write_bytes(PNG_1PX)
+    provider = OpenAIImageProvider("image_api", _image_conf(endpoint))
+
+    result = provider.generate("frames", {
+        "shot_no": 8,
+        "prompt": "人物从站立到坐下",
+        "aspect": "9:16",
+        "keyframe_reference_uri": str(keyframe),
+        "keyframe_boundary_phase": "reference_only",
+        # 旧字段即使残留 end，也不能推翻新导演的 reference_only 裁决。
+        "frame_target": {"phase": "end", "state": "旧终点字段"},
+    }, tmp_path / "frames_reference_only")
+
+    assert result.data["first_source"] == "generated"
+    assert result.data["last_source"] == "generated"
+    assert result.data["keyframe_phase"] == "reference_only"
+    assert result.data["generation_calls"] == 2
+    assert result.cost == 3.0
+    assert len(fake.calls) == 2
 
 
 def test_image_api_feedback_into_prompt(fake_api, tmp_path):

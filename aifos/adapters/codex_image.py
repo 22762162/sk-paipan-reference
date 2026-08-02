@@ -197,6 +197,47 @@ def _state_brief(state, limit=300):
     return ("；".join(parts) or "见上文合同")[:limit]
 
 
+def _keyframe_phase(payload):
+    """Return the authored semantic phase of the supplied keyframe.
+
+    A keyframe is only a reusable boundary when its authored phase says so.
+    A representative/freeze frame must never be silently renamed to the first
+    frame because that can reverse the action direction.
+    """
+    boundary = str(payload.get("keyframe_boundary_phase") or "").strip().lower()
+    if boundary:
+        # director 显式写入 reference_only 时，必须停止向旧 frame_target
+        # 回退；它正是“代表图不得冒充边界”的裁决结果。
+        return boundary
+    candidates = [payload.get("frame_target")]
+    contract = payload.get("prompt_contract")
+    if isinstance(contract, dict):
+        candidates.append(contract.get("frame_target"))
+    targets = payload.get("frame_targets")
+    if isinstance(targets, dict):
+        candidates.append(targets.get("keyframe"))
+    for target in candidates:
+        if not isinstance(target, dict):
+            continue
+        phase = str(target.get("phase") or "").strip().lower()
+        if phase:
+            return phase
+    return ""
+
+
+def _keyframe_uri(payload, phase=None):
+    """Resolve the keyframe path emitted by old and new director payloads."""
+    phase = phase if phase is not None else _keyframe_phase(payload)
+    if phase == "end":
+        keys = ("keyframe_last_uri", "keyframe_reference_uri", "image_uri")
+    elif phase == "start":
+        keys = ("image_uri", "keyframe_reference_uri")
+    else:
+        keys = ("keyframe_reference_uri", "image_uri")
+    return next((str(payload.get(key) or "") for key in keys
+                 if str(payload.get(key) or "").strip()), "")
+
+
 def _ref_line(payload, prompt_text=""):
     # 导演中心前置生成的参考图对照表:编号绑定"谁参考哪张图",
     # CLI 侧原样照读,禁止自行重排或忽略
@@ -484,17 +525,36 @@ def build_instruction(capability, payload, out_dir):
         shot_no = int(payload["shot_no"])
         first = out_dir / f"shot_{shot_no:03d}.first.png"
         last = out_dir / f"shot_{shot_no:03d}.last.png"
-        image_uri = payload.get("image_uri", "")
+        keyframe_phase = _keyframe_phase(payload)
+        image_uri = _keyframe_uri(payload, keyframe_phase)
         # 协议测试或人工恢复时可能给一个尚未挂载的占位路径；不要让
         # Codex 把它误判成目标文件。正式流水线的关键图已落盘，仍传绝对路径。
         if (image_uri and not image_uri.startswith(("http://", "https://"))
                 and not Path(image_uri).exists()):
             image_uri = Path(image_uri).name
+        keyframe = Path(image_uri) if image_uri else None
+        keyframe_valid = (
+            keyframe is not None and keyframe.exists()
+            and keyframe.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"))
         chain_first = payload.get("chain_first_uri", "")
         if chain_first and Path(chain_first).exists():
-            # 帧链:首帧固定为上一镜尾帧(平台已定),只生成尾帧,
-            # 保证两段视频拼接处画面连贯
+            # 帧链:首帧固定为上一镜尾帧(平台已定)。如果本镜关键图明确
+            # 属于动作终点，它就是合法尾帧；两端都已存在时不得再调用
+            # imagegen 重画或把终点图错误换名成首帧。
             shutil.copyfile(chain_first, first)
+            if keyframe_valid and keyframe_phase == "end":
+                shutil.copyfile(keyframe, last)
+                instruction = (
+                    f"本镜首帧已固定为上一镜尾帧:{first}；"
+                    f"本镜尾帧已固定为动作终点关键图:{last}。"
+                    "两端语义相位均已匹配并已落盘，不得修改、不得换名、"
+                    "不得调用 imagegen，也不需要生成任何新图片。")
+                return instruction, [first, last], {
+                    "first": str(first), "last": str(last),
+                    "first_source": "previous_tail",
+                    "last_source": "keyframe",
+                    "keyframe_phase": keyframe_phase,
+                    "generation_noop": True}
             instruction = (
                 f"本镜首帧已固定为上一镜的尾帧(文件已就位:{first},"
                 "不要改动它)。请基于该首帧与关键图 "
@@ -509,25 +569,49 @@ def build_instruction(capability, payload, out_dir):
             )
             return instruction, [first, last], {
                 "first": str(first), "last": str(last),
-                "first_source": "previous_tail"}
-        keyframe = Path(image_uri) if image_uri else None
-        if (keyframe and keyframe.exists()
-                and keyframe.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")):
-            # 每场第一镜已有通过质检的关键帧。复用为首帧可少生成一张图，
-            # 同时比重新绘制首帧更能锁住人物身份、服装与构图。
-            shutil.copyfile(keyframe, first)
-            instruction = (
-                f"本镜首帧已直接复用通过质检的关键图(文件已就位:{first},"
-                "不要改动它)。请基于该首帧只生成本镜尾帧,"
-                f"保存到 {last}(PNG,{size})。"
-                f"镜头内容:{prompt_text}。"
-                f"结尾状态:{_state_brief(payload.get('end_state'))};"
-                "画面从首帧自然演进到结尾状态，人物、服装、道具、场景与"
-                f"首帧完全一致，不新增字幕条。{_ref_line(payload, prompt_text)}{common}"
-                "只产出尾帧这一个文件。")
-            return instruction, [first, last], {
-                "first": str(first), "last": str(last),
-                "first_source": "keyframe"}
+                "first_source": "previous_tail",
+                "last_source": "generated",
+                "keyframe_phase": keyframe_phase}
+        if keyframe_valid:
+            if keyframe_phase == "start":
+                # 只有明确属于动作起点的关键图，才能直接成为首帧。
+                shutil.copyfile(keyframe, first)
+                instruction = (
+                    f"本镜首帧已直接复用动作起点关键图(文件已就位:{first},"
+                    "不要改动它)。请基于该首帧只生成本镜尾帧,"
+                    f"保存到 {last}(PNG,{size})。"
+                    f"镜头内容:{prompt_text}。"
+                    f"结尾状态:{_state_brief(payload.get('end_state'))};"
+                    "画面从首帧自然演进到结尾状态，人物、服装、道具、场景与"
+                    f"首帧完全一致，不新增字幕条。{_ref_line(payload, prompt_text)}{common}"
+                    "只产出尾帧这一个文件。")
+                return instruction, [first, last], {
+                    "first": str(first), "last": str(last),
+                    "first_source": "keyframe",
+                    "last_source": "generated",
+                    "keyframe_phase": keyframe_phase}
+            if keyframe_phase == "end":
+                # 终点关键图只能复用为尾帧；首帧必须按起始状态独立生成。
+                # 禁止为了省一次调用把终点图换名成首帧，造成动作倒放。
+                shutil.copyfile(keyframe, last)
+                instruction = (
+                    f"本镜尾帧已直接复用动作终点关键图(文件已就位:{last},"
+                    "不要改动它)。请参考该尾帧的人物身份、服装、场景与构图，"
+                    "独立生成发生在它之前的本镜首帧,"
+                    f"保存到 {first}(PNG,{size})。"
+                    f"镜头内容:{prompt_text}。"
+                    f"起始状态:{_state_brief(payload.get('start_state'))};"
+                    "首帧必须是真实动作起点，尾帧才是动作终点；不得把尾帧"
+                    "状态倒置、换名或复制成首帧，不新增字幕条。"
+                    f"{_ref_line(payload, prompt_text)}{common}"
+                    "只产出首帧这一个文件。")
+                return instruction, [first, last], {
+                    "first": str(first), "last": str(last),
+                    "first_source": "generated",
+                    "last_source": "keyframe",
+                    "keyframe_phase": keyframe_phase}
+            # freeze/未知相位只是身份、场景和构图参考，不等于任一边界。
+            # 首尾必须分别按 start/end 状态生成，不能为省调用任意换名。
         instruction = (
             f"基于关键图 {image_uri}(文件可直接读取)"
             "为镜头生成首帧与尾帧,"
@@ -542,7 +626,8 @@ def build_instruction(capability, payload, out_dir):
         )
         return instruction, [first, last], {
             "first": str(first), "last": str(last),
-            "first_source": "generated"}
+            "first_source": "generated", "last_source": "generated",
+            "keyframe_phase": keyframe_phase}
     if capability == "image_qc":
         image = payload.get("image_uri", "")
         chars = "、".join(payload.get("characters", [])) or "无人(空镜)"
@@ -1006,7 +1091,8 @@ def run(request, codex, timeout, extra_args, plain=False):
         declared.extend(payload.get("reference_images") or [])
         declared.extend(
             payload.get(key) for key in (
-                "spatial_ref", "image_uri", "chain_first_uri",
+                "spatial_ref", "image_uri", "keyframe_reference_uri",
+                "keyframe_last_uri", "chain_first_uri",
                 "scene_ref", "style_ref")
             if payload.get(key))
         declared = list(dict.fromkeys(str(uri) for uri in declared if uri))
@@ -1030,18 +1116,47 @@ def run(request, codex, timeout, extra_args, plain=False):
             return {"ok": False,
                     "error": "人物质检缺少可读取的最终立绘"
                              + ((":" + "、".join(missing)) if missing else "")}
-    if shutil.which(codex) is None and not Path(codex).exists():
+    # 唯一允许不启动 Codex 的 frames 情况：上一镜尾帧已经是本镜合法
+    # 首帧，同时本镜 end 关键图已经是合法尾帧。先做只读预判，避免在
+    # Codex 不存在的普通生成请求上提前复制半套帧。
+    frame_image = Path(_keyframe_uri(payload))
+    local_frame_reuse = (
+        capability == "frames"
+        and Path(str(payload.get("chain_first_uri") or "")).exists()
+        and frame_image.exists()
+        and frame_image.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+        and _keyframe_phase(payload) == "end")
+    if (shutil.which(codex) is None and not Path(codex).exists()
+            and not local_frame_reuse):
         return {"ok": False, "error": f"codex 命令不存在: {codex}"}
     instruction, targets, data = build_instruction(
         capability, payload, out_dir)
+    if data.get("generation_noop"):
+        missing = [str(target) for target in targets if not target.exists()]
+        if missing:
+            return {
+                "ok": False,
+                "error": "本地首尾帧复用未落盘: " + ", ".join(missing),
+            }
+        return {
+            "ok": True,
+            "data": data,
+            "uri": str(targets[0]),
+            "model": "AIFOS 本地首尾帧相位复用",
+            "cost": 0.0,
+        }
     # 断点续跑时 canonical 目标可能已经存在。只检查 exists 会把一次
     # “Codex 没有产出任何文件”的失败调用误认成成功，并把上一轮旧图
     # 当作本轮新候选反复质检。记录调用前指纹，调用后必须看到真正更新。
     freshness_targets = list(targets)
-    if capability == "frames" and data.get("first_source"):
+    if (capability == "frames"
+            and data.get("first_source") in {"previous_tail", "keyframe"}):
         # 帧链/关键帧复用会在 build_instruction 中主动铺好首帧；该文件
         # 按合同就是不应修改的，只要求本轮新生成的尾帧发生变化。
         freshness_targets = [Path(data["last"])]
+    elif capability == "frames" and data.get("last_source") == "keyframe":
+        # 终点关键图已铺为尾帧，只要求本轮独立生成的首帧发生变化。
+        freshness_targets = [Path(data["first"])]
     before_targets = {}
     for target in freshness_targets:
         path = Path(target)

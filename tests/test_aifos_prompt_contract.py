@@ -534,9 +534,126 @@ def test_system_prompt_fields_never_become_screen_whitelist():
     ]) == ["东宫书房"]
 
 
-def test_legacy_shot_uses_local_modern_scene_before_episode_fallback():
+def test_authoritative_script_scene_wins_over_legacy_prompt_guess():
     shot = {"description": "现代书房闪回，青年查看银色笔记本电脑"}
-    assert shot_local_scene(shot, "明代东宫寝殿") == "现代书房（闪回）"
+    assert shot_local_scene(shot, "明代东宫寝殿") == "明代东宫寝殿"
+
+
+def test_legacy_shot_without_structured_scene_still_uses_positive_hint():
+    shot = {"description": "现代书房闪回，青年查看银色笔记本电脑"}
+    assert shot_local_scene(shot) == "现代书房（闪回）"
+
+
+def test_modern_hotel_exclusion_does_not_infer_ming_palace():
+    shot = {
+        "description": (
+            "2078年现代高档酒店房间门口和走廊，"
+            "不得出现明代宫殿、宫灯、烛火或其他古代元素"
+        ),
+    }
+    assert shot_local_scene(shot) == "现代酒店"
+
+
+def test_negative_scene_hints_do_not_create_a_scene_without_positive_fact():
+    assert shot_local_scene({
+        "prompt": "禁止出现明代宫殿、宫灯；无紫禁城元素",
+    }) == "按场景基准图"
+
+
+def test_positive_historical_scene_hint_remains_compatible():
+    assert shot_local_scene({
+        "description": "人物进入明代宫殿，停在正殿门内",
+    }) == "明代宫殿内景"
+
+
+def test_unrelated_no_text_rule_does_not_hide_later_scene_fact():
+    assert shot_local_scene({
+        "prompt": "无字幕、Logo、水印，画面是现代酒店走廊",
+    }) == "现代酒店"
+
+
+def test_modern_scene_filters_ancient_project_style_from_provider_prompt():
+    shot = {
+        "characters": [],
+        "description": (
+            "2078年现代高档酒店房间门口和走廊。"
+            "不得出现明代宫殿、宫灯、烛火、明代烛台、书案、香炉、纱幕"
+        ),
+        "frame_target_policy": "legacy",
+        "camera": "35mm俯拍斜侧固定中景",
+    }
+    style = (
+        "鎏金柔雾写实古风；宫斗权谋；"
+        "以殿内烛火、宫灯为光源动机，暖光与幽深暗部并置；"
+        "明代烛台、书案、香炉、纱幕，电影级半写实3D材质"
+    )
+
+    contract, prompt = compile_shot_prompt(
+        shot, location="2078年现代高档酒店走廊",
+        style=style, mode="image")
+
+    assert contract["scene"] == "2078年现代高档酒店走廊"
+    assert "鎏金柔雾写实" in contract["style"]
+    assert "暖光与幽深暗部并置" in contract["style"]
+    assert "电影级半写实3D材质" in contract["style"]
+    assert contract["era_object_constraints"] == []
+    for forbidden in (
+            "明代宫殿", "宫斗", "权谋", "殿内烛火", "宫灯",
+            "明代烛台", "书案", "香炉", "纱幕"):
+        assert forbidden not in contract["style"]
+        assert forbidden not in contract["lighting"]
+        assert forbidden not in prompt
+
+
+def test_vehicle_interior_and_worn_seatbelt_get_complete_physical_contract():
+    shot = {
+        "characters": ["虞寻歌"],
+        "description": "虞寻歌坐在现代轿车副驾驶，系好安全带",
+        "frame_target": {
+            "phase": "end",
+            "state": "虞寻歌坐稳副驾驶并系好安全带",
+            "fallback": False,
+        },
+    }
+
+    contract, prompt = compile_shot_prompt(
+        shot, location="现代轿车车内", mode="image")
+    physical = "；".join(contract["physical"]["rules"])
+
+    for structure in ("驾驶座", "副驾驶座", "头枕", "方向盘", "中控台"):
+        assert structure in physical
+    for belt_fact in ("外侧上方固定点", "斜跨胸口", "内侧锁扣", "横跨左右髋部"):
+        assert belt_fact in physical
+    assert "不穿过身体" in physical
+    assert "现代乘用车车内结构完整" in prompt
+    assert "三点式安全带路径" in prompt
+
+
+def test_readable_handheld_screen_keeps_user_facing_geometry_with_other_gaze():
+    shot = {
+        "characters": ["虞寻歌"],
+        "description": "虞寻歌右手持亮屏手机，目光望向床上的弟弟",
+        "frame_target": {
+            "phase": "end",
+            "state": "虞寻歌持手机站在床边，目光落在弟弟身上",
+            "fallback": False,
+        },
+        "readable_text": {
+            "required": True,
+            "carrier": "手机屏幕",
+            "whitelist": ["SS级【盗神】"],
+        },
+    }
+
+    contract, prompt = compile_shot_prompt(
+        shot, location="现代卧室", mode="image")
+    physical = "；".join(contract["physical"]["rules"])
+
+    assert "屏幕正面必须朝向实际使用者" in physical
+    assert "只可向摄影机小角度倾斜" in physical
+    assert "禁止为了文字清晰把屏幕完全翻向镜头" in physical
+    assert "视线只落在该对象" in physical
+    assert "不得让双眼同时注视两个目标" in prompt
 
 
 def test_explicit_camera_and_single_subject_over_shoulder_are_authoritative():
@@ -824,11 +941,24 @@ def test_folded_functional_person_and_static_prop_text_follow_target_phase():
             "state": "虞寻歌坐副驾驶，小吴手中为空并站在车外",
             "fallback": False,
         },
-        "readable_text": {
-            "required": True,
-            "carrier": "手机锁屏",
-            "whitelist": ["23:10"],
-        },
+        "readable_text": {"phases": {
+            "start": {
+                "required": True,
+                "carrier": "手机锁屏",
+                "whitelist": ["23:10"],
+                "layout": "锁屏时间居中",
+                "style": "白色系统数字",
+                "perspective": "朝向使用者",
+            },
+            "end": {
+                "required": False,
+                "carrier": "手机锁屏",
+                "whitelist": [],
+                "layout": "",
+                "style": "",
+                "perspective": "",
+            },
+        }},
         "prop_registry": [{
             "prop_id": "prop_phone_01", "name": "虞寻歌的手机",
         }],
@@ -864,9 +994,465 @@ def test_folded_functional_person_and_static_prop_text_follow_target_phase():
     assert "亮屏显示时间" not in core
     assert "必须清晰画出:虞寻歌的手机" not in core
     assert "23:10" not in prompt
-    assert "中文字载体已隐藏或不在画面" in contract["text"]
+    assert contract["readable_text_current"]["required"] is False
+    physical = "；".join(
+        contract["physical"]["rules"] + contract["physical"]["objects"])
+    assert "手持屏幕关系" not in physical
+    assert "手持屏幕：使用者/观看者" not in physical
     assert "phase=end" in prompt
     assert "phase=start" not in prompt
+
+    start_shot = dict(shot)
+    start_shot["frame_target"] = {
+        "phase": "start",
+        "state": "虞寻歌右手持亮屏手机坐在副驾驶，锁屏时间可见",
+        "fallback": False,
+    }
+    start_contract, start_prompt = compile_shot_prompt(
+        start_shot, mode="image")
+    start_physical = "；".join(
+        start_contract["physical"]["rules"]
+        + start_contract["physical"]["objects"])
+    assert "23:10" in start_prompt
+    assert "手机锁屏内文字只保持原样" in start_prompt
+    assert "手持屏幕关系" in start_physical
+    assert "电脑使用关系" not in start_physical
+    assert "电脑屏幕必须打开" not in start_prompt
+
+
+def test_three_phase_phone_text_isolated_per_still_and_ordered_in_video():
+    base = {
+        "shot_no": 4,
+        "characters": ["虞寻歌"],
+        "description": (
+            "虞寻歌先看锁屏02:21:59，随后手机显示SS级盗神，"
+            "最后放低手机看向床上的弟弟，屏幕已不可读"),
+        "start_state": "虞寻歌坐在沙发上查看手机锁屏",
+        "end_state": "虞寻歌放低手机，目光落在床上的弟弟",
+        "prop_registry": [{
+            "prop_id": "prop_phone_04", "name": "虞寻歌的手机",
+        }],
+        "frame_props": [
+            {
+                "prop_id": "prop_phone_04", "phase": "start",
+                "physical_state": "亮屏锁屏", "holder": "虞寻歌双手",
+                "location": "胸前", "visibility": "visible",
+                "representation": "physical",
+            },
+            {
+                "prop_id": "prop_phone_04", "phase": "freeze",
+                "physical_state": "亮屏显示天赋卡", "holder": "虞寻歌双手",
+                "location": "胸前", "visibility": "visible",
+                "representation": "physical",
+            },
+            {
+                "prop_id": "prop_phone_04", "phase": "end",
+                "physical_state": "屏幕背向机位且不可读", "holder": "虞寻歌右手",
+                "location": "膝侧", "visibility": "occluded",
+                "representation": "physical",
+            },
+        ],
+        "readable_text": {"phases": {
+            "start": {
+                "required": True, "carrier": "手机锁屏",
+                "whitelist": ["02:21:59"], "layout": "时间居中",
+                "style": "白色系统数字", "perspective": "朝向使用者",
+            },
+            "freeze": {
+                "required": True, "carrier": "手机屏幕",
+                "whitelist": ["SS", "盗神"], "layout": "卡面上下排版",
+                "style": "紫红游戏卡面", "perspective": "朝向使用者",
+            },
+            "end": {
+                "required": False, "carrier": "手机屏幕",
+                "whitelist": [], "layout": "", "style": "",
+                "perspective": "背向机位",
+            },
+        }},
+    }
+
+    prompts = {}
+    contracts = {}
+    states = {
+        "start": "虞寻歌查看手机锁屏",
+        "freeze": "虞寻歌查看手机上的天赋卡",
+        "end": "虞寻歌放低手机并看向床上的弟弟",
+    }
+    for phase, state in states.items():
+        shot = dict(base)
+        shot["frame_target"] = {
+            "phase": phase, "state": state, "fallback": False,
+        }
+        contracts[phase], prompts[phase] = compile_shot_prompt(
+            shot, location="2078年现代别墅卧室", mode="image")
+
+    assert "02:21:59" in prompts["start"]
+    assert "盗神" not in prompts["start"]
+    assert "SS" not in prompts["start"]
+    assert "SS、盗神" in prompts["freeze"]
+    assert "02:21:59" not in prompts["freeze"]
+    assert "02:21:59" not in prompts["end"]
+    assert "盗神" not in prompts["end"]
+    assert contracts["end"]["readable_text_current"]["required"] is False
+    end_physical = "；".join(
+        contracts["end"]["physical"]["rules"]
+        + contracts["end"]["physical"]["objects"])
+    assert "手持屏幕关系" not in end_physical
+    for prompt in prompts.values():
+        assert "电脑屏幕必须打开" not in prompt
+        assert "电脑使用关系" not in prompt
+
+    _, video_prompt = compile_shot_prompt(
+        base, location="2078年现代别墅卧室", mode="video")
+    assert "文字时间线（各阶段按时间先后独立执行）" in video_prompt
+    assert "起点:手机锁屏内文字只保持原样:02:21:59" in video_prompt
+    assert "中间定格:手机屏幕内文字只保持原样:SS、盗神" in video_prompt
+    assert "终点:手机屏幕在本阶段不要求可读" in video_prompt
+    assert "禁止把不同阶段的文字、屏幕状态或版式同时塞进同一帧" in video_prompt
+    assert "电脑屏幕必须打开" not in video_prompt
+
+
+def test_hidden_phase_prop_overrides_stale_whole_take_device_description():
+    shot = {
+        "characters": ["虞寻歌"],
+        "description": (
+            "起点虞寻歌手持手机查看屏幕，随后把手机收入口袋，"
+            "终点目光看向床上的弟弟"),
+        "frame_target": {
+            "phase": "end",
+            "state": "虞寻歌目光看向床上的弟弟，手机已收好",
+            "fallback": False,
+        },
+        "prop_registry": [{
+            "prop_id": "prop_phone_hidden", "name": "虞寻歌的手机",
+        }],
+        "frame_props": [{
+            "prop_id": "prop_phone_hidden", "phase": "end",
+            "physical_state": "完全收纳", "holder": "虞寻歌",
+            "location": "风衣口袋内", "visibility": "hidden",
+            "representation": "physical",
+        }],
+    }
+
+    contract, prompt = compile_shot_prompt(
+        shot, location="2078年现代别墅卧室", mode="image")
+    physical = "；".join(
+        contract["physical"]["rules"] + contract["physical"]["objects"])
+
+    assert "手持屏幕关系" not in physical
+    assert "手持屏幕：使用者/观看者" not in physical
+    assert "手持手机查看屏幕" not in prompt
+
+
+def test_static_frame_character_subset_does_not_leak_whole_take_cast():
+    shot = {
+        "characters": ["虞寻歌", "柳争流"],
+        "description": "虞寻歌进入房间，随后柳争流站在门口",
+        "visible_figure_count": 2,
+        "start_state": {
+            "虞寻歌": {"pose": "独自走进房间"},
+            "柳争流": {"pose": "尚未进入画面"},
+        },
+        "end_state": {
+            "虞寻歌": {"pose": "回头"},
+            "柳争流": {"pose": "站在门口"},
+        },
+        "physical_contract": {"rules": [
+            "虞寻歌站在房间内并由地面稳定支撑",
+            "柳争流站在门外并与虞寻歌隔门相望",
+        ]},
+        "spatial_blocking": {"actors": [
+            {"name": "虞寻歌", "position": "房间内", "facing": "门口"},
+            {"name": "柳争流", "position": "门外", "facing": "房间内"},
+        ]},
+        "frame_targets": {
+            "first_frame": {
+                "phase": "start", "state": "虞寻歌独自走进房间",
+                "characters": ["虞寻歌"], "fallback": False,
+            },
+            "keyframe": {
+                "phase": "freeze", "state": "虞寻歌回头看见柳争流",
+                "characters": ["虞寻歌", "柳争流"], "fallback": False,
+            },
+            "last_frame": {
+                "phase": "end", "state": "虞寻歌与柳争流隔门相望",
+                "characters": ["虞寻歌", "柳争流"], "fallback": False,
+            },
+        },
+    }
+
+    first, first_prompt = compile_shot_prompt(
+        shot, location="2078年现代酒店房间", mode="first_frame")
+    keyframe, keyframe_prompt = compile_shot_prompt(
+        shot, location="2078年现代酒店房间", mode="image")
+    last, last_prompt = compile_shot_prompt(
+        shot, location="2078年现代酒店房间", mode="last_frame")
+    video, video_prompt = compile_shot_prompt(
+        shot, location="2078年现代酒店房间", mode="video")
+
+    assert first["subject"]["count"] == 1
+    assert first["subject"]["visible_count"] == 1
+    assert first["actor_names"] == ["虞寻歌"]
+    assert set(first["character_conditions"]) == {"虞寻歌"}
+    assert [item["character"] for item in first["composition"]["actors"]] == [
+        "虞寻歌"]
+    assert first["composition"]["expected_visible_figure_count"] == 1
+    assert first["frame_target"]["characters"] == ["虞寻歌"]
+    assert "柳争流" not in first_prompt
+
+    for contract, prompt in ((keyframe, keyframe_prompt), (last, last_prompt)):
+        assert contract["subject"]["count"] == 2
+        assert contract["subject"]["visible_count"] == 2
+        assert contract["actor_names"] == ["虞寻歌", "柳争流"]
+        assert "柳争流" in prompt
+
+    assert video["subject"]["count"] == 2
+    assert video["actor_names"] == ["虞寻歌", "柳争流"]
+    assert "虞寻歌" in video_prompt and "柳争流" in video_prompt
+
+
+def test_static_frame_uses_declared_visible_sublocation_only_for_provider_scene():
+    shot3 = {
+        "characters": [],
+        "description": "人物从门外走廊进入卧室",
+        "frame_targets": {
+            "first_frame": {
+                "phase": "start", "state": "停在卧室门外走廊",
+                # scene_location is an accepted compatibility alias.
+                "scene_location": "虞家别墅·卧室门外走廊",
+                "fallback": False,
+            },
+            "keyframe": {
+                "phase": "freeze", "state": "已经进入卧室",
+                "location": "虞家别墅·虞寻欢卧室",
+                "fallback": False,
+            },
+            "last_frame": {
+                "phase": "end", "state": "停在卧室床边",
+                "location": "虞家别墅·虞寻欢卧室",
+                "fallback": False,
+            },
+        },
+    }
+    authoritative3 = "虞家别墅·虞寻欢卧室"
+    first3, first3_prompt = compile_shot_prompt(
+        shot3, location=authoritative3, mode="first_frame")
+    key3, _ = compile_shot_prompt(
+        shot3, location=authoritative3, mode="image")
+    last3, _ = compile_shot_prompt(
+        shot3, location=authoritative3, mode="last_frame")
+    video3, video3_prompt = compile_shot_prompt(
+        shot3, location=authoritative3, mode="video")
+    joint3, _ = compile_shot_prompt(
+        {**shot3, "frame_kind": "frames"},
+        location=authoritative3, mode="frames")
+
+    assert first3["scene"] == "虞家别墅·卧室门外走廊"
+    assert first3["frame_target"]["location"] == (
+        "虞家别墅·卧室门外走廊")
+    assert "【场景】虞家别墅·卧室门外走廊" in first3_prompt
+    assert key3["scene"] == last3["scene"] == authoritative3
+    # Motion and paired-frame containers retain the authoritative whole-take
+    # scene; this static override never changes scene_model asset authority.
+    assert video3["scene"] == joint3["scene"] == authoritative3
+    assert "虞家别墅·卧室门外走廊" not in video3_prompt
+
+    shot1 = {
+        "characters": [],
+        "description": "人物由酒店房间内走到门外走廊",
+        "frame_targets": {
+            "first_frame": {
+                "phase": "start", "state": "仍在酒店房间内",
+                "location": "酒店房间内", "fallback": False,
+            },
+            "last_frame": {
+                "phase": "end", "state": "已经站在房间外走廊",
+                "location": "酒店房间外·走廊", "fallback": False,
+            },
+        },
+    }
+    first1, _ = compile_shot_prompt(
+        shot1, location="酒店房间", mode="first_frame")
+    last1, _ = compile_shot_prompt(
+        shot1, location="酒店房间", mode="last_frame")
+    assert first1["scene"] == "酒店房间内"
+    assert last1["scene"] == "酒店房间外·走廊"
+
+
+def test_static_frame_drops_timeline_prop_transitions_and_offstage_references():
+    shot3 = {
+        "characters": ["虞寻歌", "虞寻欢"],
+        "description": "虞寻歌进门后与虞寻欢碰杯饮酒，虞寻欢随后失衡",
+        "frame_targets": {
+            "first_frame": {
+                "phase": "start", "state": "虞寻歌独自站在门外走廊",
+                "characters": ["虞寻歌"], "fallback": False,
+            },
+            "last_frame": {
+                "phase": "end", "state": "两人停在卧室床边",
+                "characters": ["虞寻歌", "虞寻欢"], "fallback": False,
+            },
+        },
+        "frame_props": [
+            {"prop_id": "wine", "phase": "start",
+             "physical_state": "酒杯尚未使用", "holder": "虞寻歌",
+             "location": "右手", "visibility": "visible",
+             "representation": "physical"},
+            {"prop_id": "wine", "phase": "end",
+             "physical_state": "饮酒后酒杯放下", "holder": "虞寻欢",
+             "location": "床边柜", "visibility": "visible",
+             "representation": "physical"},
+        ],
+        "prop_transitions": [{
+            "prop_id": "wine", "from_phase": "start", "to_phase": "end",
+            "action": "虞寻欢与虞寻歌碰杯、饮酒后失衡",
+        }],
+    }
+    references = [
+        {"index": 1, "role": "identity", "character": "虞寻歌",
+         "name": "虞寻歌", "binding": "锁定虞寻歌身份"},
+        {"index": 2, "kind": "character_identity", "name": "虞寻欢",
+         "binding": "锁定虞寻欢身份"},
+        # Non-person roles must remain even when their name is not a cast name.
+        {"index": 3, "role": "scene", "name": "虞家别墅卧室",
+         "binding": "锁定空间"},
+    ]
+
+    first, first_prompt = compile_shot_prompt(
+        shot3, location="虞家别墅", references=references,
+        mode="first_frame")
+    assert first["prop_transitions"] == []
+    assert first["physical"]["prop_transitions"] == []
+    assert first["prop_transitions_audit"][0]["action"] == (
+        "虞寻欢与虞寻歌碰杯、饮酒后失衡")
+    assert [ref["role"] for ref in first["references"]] == [
+        "identity", "scene"]
+    assert first["references"][0]["character"] == "虞寻歌"
+    for forbidden in ("虞寻欢", "碰杯", "饮酒", "失衡", "道具变化审计"):
+        assert forbidden not in first_prompt
+    assert "【道具定格】" in first_prompt
+
+    video, video_prompt = compile_shot_prompt(
+        shot3, location="虞家别墅", references=references, mode="video")
+    assert len(video["prop_transitions"]) == 1
+    assert len(video["references"]) == 3
+    assert "【道具状态变化】" in video_prompt
+    assert "碰杯、饮酒后失衡" in video_prompt
+
+    paired, paired_prompt = compile_shot_prompt(
+        {**shot3, "frame_kind": "frames"}, location="虞家别墅",
+        references=references, mode="frames")
+    assert len(paired["prop_transitions"]) == 1
+    assert len(paired["references"]) == 3
+    assert "碰杯、饮酒后失衡" in paired_prompt
+
+    shot1 = {
+        "characters": ["虞寻歌"],
+        "description": "虞寻歌从枕边取手机后走出房门",
+        "frame_targets": {"last_frame": {
+            "phase": "end", "state": "虞寻歌已站在门外走廊",
+            "characters": ["虞寻歌"], "fallback": False,
+        }},
+        "frame_props": [
+            {"prop_id": "phone", "phase": "start",
+             "physical_state": "放在枕边", "location": "枕边",
+             "visibility": "visible", "representation": "physical"},
+            {"prop_id": "phone", "phase": "end",
+             "physical_state": "完全收入口袋", "holder": "虞寻歌",
+             "location": "风衣口袋内", "visibility": "hidden",
+             "representation": "physical"},
+        ],
+        "prop_transitions": [{
+            "prop_id": "phone", "from_phase": "start", "to_phase": "end",
+            "action": "虞寻歌从枕边取手机并收入口袋",
+        }],
+    }
+    end1, end1_prompt = compile_shot_prompt(
+        shot1, location="酒店房间外·走廊", mode="last_frame")
+    assert end1["prop_transitions"] == []
+    assert "枕边取手机" not in end1_prompt
+
+
+def test_static_frame_rejects_character_outside_whole_take_cast():
+    shot = {
+        "characters": ["虞寻歌"],
+        "frame_targets": {"keyframe": {
+            "phase": "freeze", "state": "虞寻歌独自在房间",
+            "characters": ["陌生配角"], "fallback": False,
+        }},
+    }
+
+    contract, _ = compile_shot_prompt(shot, mode="image")
+    report = validate_shot_prompt_contract(contract)
+
+    assert contract["subject"]["count"] == 0
+    assert not report["passed"]
+    assert any(
+        "包含未登记人物「陌生配角」" in issue
+        for issue in report["issues"])
+
+
+def test_static_frame_functional_figure_uses_only_current_phase_state():
+    shot = {
+        "characters": ["虞寻歌"],
+        "visible_figure_count": 5,
+        "description": "小吴驾车、停车、下车并递交物品的完整长镜头",
+        "functional_figures": [
+            {"name": "小吴", "count": 1,
+             "state": "双手控制方向盘", "function": "代驾司机"},
+            {"name": "小吴", "count": 1,
+             "state": "平稳提高车速", "function": "本镜说话者"},
+            {"name": "小吴", "count": 1,
+             "state": "车辆停稳后解开安全带", "function": "接受委托"},
+            {"name": "小吴", "count": 1,
+             "state": "站在驾驶侧车外", "function": "递交白酒"},
+        ],
+        "frame_targets": {
+            "first_frame": {
+                "phase": "start", "state": "虞寻歌坐副驾驶，小吴驾车",
+                "characters": ["虞寻歌"],
+                "functional_figures": [{
+                    "name": "小吴", "count": 1,
+                    "state": "左前驾驶位双手握方向盘",
+                    "function": "代驾司机",
+                }],
+                "fallback": False,
+            },
+            "last_frame": {
+                "phase": "end", "state": "虞寻歌坐副驾驶，小吴已下车",
+                "characters": ["虞寻歌"],
+                "functional_figures": [{
+                    "name": "小吴", "count": 1,
+                    "state": "驾驶侧车外双手为空",
+                    "function": "完成代驾",
+                }],
+                "fallback": False,
+            },
+        },
+    }
+
+    first, first_prompt = compile_shot_prompt(
+        shot, location="2078年现代轿车车内", mode="first_frame")
+    last, last_prompt = compile_shot_prompt(
+        shot, location="2078年现代轿车车内", mode="last_frame")
+
+    for contract in (first, last):
+        assert contract["subject"]["count"] == 1
+        assert contract["subject"]["functional_count"] == 1
+        assert contract["subject"]["visible_count"] == 2
+        assert contract["composition"]["expected_visible_figure_count"] == 2
+        assert contract["population"]["counts"]["real_people_total"] == 2
+        assert contract["population"]["issues"] == []
+    assert first["subject"]["functional_figures"][0]["state"] == (
+        "左前驾驶位双手握方向盘")
+    assert "平稳提高车速" not in first_prompt
+    assert "解开安全带" not in first_prompt
+    assert "站在驾驶侧车外" not in first_prompt
+    assert last["subject"]["functional_figures"][0]["state"] == (
+        "驾驶侧车外双手为空")
+    assert "双手控制方向盘" not in last_prompt
+    assert "平稳提高车速" not in last_prompt
+    assert "解开安全带" not in last_prompt
 
 
 def test_v21_image_prompt_renders_only_frozen_end_state_not_motion_process():

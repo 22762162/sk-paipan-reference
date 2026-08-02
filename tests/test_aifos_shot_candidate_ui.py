@@ -91,6 +91,98 @@ def test_best_effort_repair_is_rendered_as_nonblocking_ai_selection():
     assert 'if (row.bestEffort) return "已补抽3张并AI选优（非阻断风险）"' in JS
 
 
+def test_episode29_visual_pass_issues_are_grouped_without_red_false_failure():
+    helper = JS[
+        JS.index("function qcIssueText"):
+        JS.index("function shotBestEffortLabel")
+    ]
+    result = _run_node(r'''
+      function esc(value) { return String(value); }
+    ''' + helper + r'''
+      const qc = {
+        passed: false,
+        visual_pass: true,
+        image_passed: true,
+        critical_failures: [],
+        issues: [
+          "画面本身符合两名女性、离场终点、现代酒店、电梯、门框框中框等要求",
+          "参考图6仍是无法完整显示房门、走廊和远处电梯布局的旧场景基准图，与提示词明确要求替换该图不一致",
+          "提示词概括称参考图4、5只锁人物身份，但对照表又允许它们继承服装、配饰和道具位置，用途边界表述不一致",
+          "柳争流的红唇在侧面暖光下不够醒目，但不影响身份或剧情理解",
+          "提示词较长，包含多段旧阶段排除项，可进一步压缩",
+          "酒瓶与酒杯姿势成立，但可进一步强调双手分工",
+        ],
+        advisory_issues: [
+          "柳争流的红唇在侧面暖光下不够醒目，但不影响身份或剧情理解",
+          "提示词较长，包含多段旧阶段排除项，可进一步压缩",
+          "酒瓶与酒杯姿势成立，但可进一步强调双手分工",
+        ],
+      };
+      const groups = qcIssuePresentation(qc);
+      console.log(JSON.stringify({groups, html: qcIssueSectionsHtml(qc)}));
+    ''')
+    groups = result["groups"]
+    assert len(groups["facts"]) == 1
+    assert len(groups["contractRisks"]) == 2
+    assert len(groups["suggestions"]) == 3
+    assert groups["visualFailures"] == []
+    assert "画面通过事实" in result["html"]
+    assert "合同或参考风险" in result["html"]
+    assert "非阻断优化建议" in result["html"]
+    assert "画面质检问题" not in result["html"]
+    assert 'class="pc-issues"' not in result["html"]
+
+
+def test_best_effort_positive_and_advisory_lines_are_never_red_failures():
+    helper = JS[
+        JS.index("function qcIssueText"):
+        JS.index("function shotBestEffortLabel")
+    ]
+    result = _run_node(r'''
+      function esc(value) { return String(value); }
+    ''' + helper + r'''
+      const qc = {
+        passed: false,
+        issues: [
+          "画面人物身份和空间关系符合要求",
+          "参考图职责存在不一致",
+          "轮廓光可进一步加强",
+        ],
+        advisory_issues: ["轮廓光可进一步加强"],
+      };
+      const groups = qcIssuePresentation(qc, true);
+      console.log(JSON.stringify({groups, html: qcIssueSectionsHtml(qc, true)}));
+    ''')
+    assert result["groups"]["facts"] == ["画面人物身份和空间关系符合要求"]
+    assert result["groups"]["contractRisks"] == ["参考图职责存在不一致"]
+    assert result["groups"]["suggestions"] == ["轮廓光可进一步加强"]
+    assert result["groups"]["visualFailures"] == []
+    assert "画面质检问题" not in result["html"]
+
+
+def test_real_visual_failure_remains_a_red_qc_issue():
+    helper = JS[
+        JS.index("function qcIssueText"):
+        JS.index("function shotBestEffortLabel")
+    ]
+    result = _run_node(r'''
+      function esc(value) { return String(value); }
+    ''' + helper + r'''
+      const qc = {
+        passed: false,
+        visual_pass: false,
+        issues: ["人物多出一人"],
+        critical_failures: ["人物多出一人"],
+      };
+      console.log(JSON.stringify({
+        groups: qcIssuePresentation(qc), html: qcIssueSectionsHtml(qc),
+      }));
+    ''')
+    assert result["groups"]["visualFailures"] == ["人物多出一人"]
+    assert "画面质检问题 1 条" in result["html"]
+    assert 'class="pc-issues qc-visual-failures"' in result["html"]
+
+
 def test_storyboard_masks_stale_failure_while_repairing_or_best_effort_done():
     helper = JS[
         JS.index("const STORYBOARD_KEYFRAME_TRANSIENT_STATUSES"):
