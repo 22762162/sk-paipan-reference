@@ -22,7 +22,7 @@ from .spatial_language import spatial_lines
 from .realism_language import realism_applicable
 
 
-def _spatial_staging_block(shot, *, media="video"):
+def _spatial_staging_block(shot, *, media="video", target_phase=""):
     """3D 空间调度 → {标签: 条款} 的可核验空间事实。"""
     shot = shot if isinstance(shot, dict) else {}
     block = shot.get("spatial_blocking")
@@ -38,7 +38,8 @@ def _spatial_staging_block(shot, *, media="video"):
             if token in str(camera or ""):
                 scale = token
                 break
-    phase = str(shot.get("frame_phase")
+    phase = str(target_phase
+                or shot.get("frame_phase")
                 or (shot.get("frame_target") or {}).get("phase")
                 or "start").lower()
     phase = phase if phase in ("start", "end") else "start"
@@ -58,6 +59,42 @@ def _spatial_staging_block(shot, *, media="video"):
                 "行动路线", "人物路线", "摄影机路线", "相机路线", "运动路线",
             ))
         }
+        if lines.get("空间站位"):
+            lines["空间站位"] = re.sub(
+                r"[；;]\s*朝向与视线\s*[:：].*$", "",
+                _text(lines["空间站位"])).rstrip("；; ")
+        # A stored blocking map describes the whole take and can predate a
+        # shot-local frame repair. For a still, the selected phase state is
+        # authoritative for pose/facing/gaze. Keep metric placement and
+        # occlusion, but never let old dialogue eyelines turn a departure back
+        # into eye contact.
+        phase_state = shot.get(f"{phase}_state") or {}
+        target = shot.get("frame_target") or {}
+        visible_names = {
+            _text(value) for value in (
+                target.get("characters") if isinstance(target, dict) else []
+            ) or [] if _text(value)
+        }
+        directions = []
+        if isinstance(phase_state, dict):
+            for name, state in phase_state.items():
+                if (visible_names and _text(name) not in visible_names
+                        or not isinstance(state, dict)):
+                    continue
+                direction = _text(state.get("direction"))
+                position = _text(state.get("position"))
+                pose = _text(state.get("pose"))
+                if direction or position or pose:
+                    facts = "，".join(value for value in (
+                        f"位置={position}" if position else "",
+                        f"姿态={pose}" if pose else "",
+                        f"朝向/视线={direction}" if direction else "",
+                    ) if value)
+                    directions.append(f"{_text(name)}:{facts}")
+        if directions:
+            lines["朝向与视线"] = (
+                f"当前{phase}静态相位：" + "；".join(directions)
+                + "；只服从当前相位，不得回退为全镜起点朝向或强制双方互视")
     # A shot-local Codex repair can intentionally replace the earlier blocking
     # projection.  ``build_physical_contract`` already gives an explicit
     # ``某人屏幕左/右`` clause precedence, but the compact prompt also rendered
@@ -2666,15 +2703,18 @@ def _mentions_present_object(text, tokens):
     return False
 
 
-def _dialogue_gaze_clause(description):
+def _dialogue_gaze_clause(description, *, static=False):
     """Keep the 180-degree lock without overriding an explicit gaze target."""
     text = _text(description)
     eye_contact = re.search(
         r"对视|看向对方|注视对方|凝视对方|视线.{0,8}(对方|双眼)", text)
+    non_mutual = re.search(
+        r"背向|背对|背影|转身|离场|离开|走开|走向远处|移开视线|"
+        r"不再对视|不发生追视|闭眼|双眼闭合", text)
     gaze_target = re.search(
         r"视线|注视|凝视|目光|看向|盯住|盯着|低头看|抬眼看|"
         r"共同看|共同望|只看", text)
-    if gaze_target and not eye_contact:
+    if non_mutual or (static and not eye_contact) or (gaze_target and not eye_contact):
         return (
             "双方身体朝向服从本镜动作，视线严格落在本镜明确的动作目标上，"
             "不得强制改成互看双眼，且画内方向互补；")
@@ -3093,31 +3133,66 @@ def build_physical_contract(shot, *, media="video", target_phase=""):
         actors = blocking.get("actors") or []
         if actors:
             positions = []
+            current_target = shot.get("frame_target") or {}
+            visible_names = {
+                _text(value) for value in (
+                    current_target.get("characters")
+                    if isinstance(current_target, dict) else []) or []
+                if _text(value)
+            }
+            phase_state = shot.get(f"{declared_phase}_state") or {}
             for actor in actors:
                 if not isinstance(actor, dict):
                     continue
                 name = _text(actor.get("name") or actor.get("character"))
-                raw_pos = actor.get("start") or actor.get("position")
+                if (media_name != "video" and visible_names
+                        and name not in visible_names):
+                    continue
+                state = (
+                    phase_state.get(name)
+                    if isinstance(phase_state, dict) else None)
+                state = state if isinstance(state, dict) else {}
+                if media_name != "video" and phase_explicit:
+                    raw_pos = (
+                        state.get("position")
+                        or actor.get(declared_phase)
+                        or actor.get(f"position_{declared_phase}"))
+                    direction = (
+                        _text(state.get("direction"))
+                        or _text(actor.get(f"facing_{declared_phase}")))
+                else:
+                    raw_pos = actor.get("start") or actor.get("position")
+                    direction = _text(
+                        actor.get("direction") or actor.get("facing"))
                 # Top-down/pixel/world coordinate dictionaries are useful to
                 # the 3D validator but are not screen coordinates.  Rendering
                 # ``{'x': 300, 'y': 330}`` into the image prompt made models and
                 # QC treat them as a second, contradictory left/right contract.
                 pos = "" if isinstance(raw_pos, dict) else _text(raw_pos)
-                direction = _text(
-                    actor.get("direction") or actor.get("facing"))
                 if name and (pos or direction):
                     positions.append(f"{name}:{pos or '原位'}{('，朝向' + direction) if direction else ''}")
             if positions:
                 rules.append("人物站位与朝向：" + "；".join(positions) + "。")
         dialogue = blocking.get("dialogue_continuity") or {}
-        if isinstance(dialogue, dict) and dialogue.get("axis_id"):
+        current_target = shot.get("frame_target") or {}
+        visible_names = {
+            _text(value) for value in (
+                current_target.get("characters")
+                if isinstance(current_target, dict) else []) or []
+            if _text(value)
+        }
+        if (isinstance(dialogue, dict) and dialogue.get("axis_id")
+                and not (media_name != "video" and phase_explicit
+                         and visible_names and len(visible_names) < 2)):
             explicit_left, explicit_right = _explicit_screen_side_names(
                 shot, description)
             left = explicit_left or _text(dialogue.get("screen_left_name"))
             right = explicit_right or _text(dialogue.get("screen_right_name"))
             side = _text(dialogue.get("camera_side"))
             coverage = _text(dialogue.get("coverage"))
-            gaze_clause = _dialogue_gaze_clause(description)
+            gaze_clause = _dialogue_gaze_clause(
+                description,
+                static=bool(media_name != "video" and phase_explicit))
             rules.append(
                 "双人对话180°轴线合同："
                 f"axis_id={dialogue.get('axis_id')}；"
@@ -3668,7 +3743,9 @@ def build_shot_prompt_contract(
         # 行动路线、屏幕方向轴线。此前这些数字只画进示意图,模型得
         # "看懂图";现在图与文字各司其职,质检也按同一判据核验。
         "spatial_staging": _spatial_staging_block(
-            shot, media=output_media),
+            {**shot, "frame_target": dict(target)},
+            media=output_media,
+            target_phase=target_phase),
         "camera_precedence": (
             "本合同 camera 字段是唯一执行镜位,已按「分镜原文 > 镜头"
             "合同 > 五维默认」融合完毕;上下文中任何其他来源的机位、"
@@ -3977,7 +4054,14 @@ def render_shot_prompt(contract, *, mode=None):
     camera_line = "；".join(value for value in camera_values if value)
     # 抽象镜头术语(俯拍/背面/过肩…)对图像模型约束力弱,是历史视角类
     # 质检失败的主因;翻译成可见几何特征,生成与质检按同一标准执行。
-    camera_geometry = camera_geometry_clause(camera)
+    # Camera motion is a video timeline instruction.  Passing it into the
+    # geometry expander for a still used to append e.g. ``推=摄影机沿视线...``
+    # after the otherwise-correct "静态关键帧" sentence, making one prompt
+    # demand both a freeze and a movement process.
+    geometry_camera = (
+        camera if media == "video"
+        else {key: value for key, value in camera.items() if key != "运镜"})
+    camera_geometry = camera_geometry_clause(geometry_camera)
     if camera_geometry:
         camera_line = f"{camera_line}；{camera_geometry}"
     # 光影是第四维:只说机位不说布光,模型必然给平光,成片没有氛围

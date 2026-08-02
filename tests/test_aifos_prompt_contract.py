@@ -2009,6 +2009,94 @@ def test_still_model_constraints_forbid_motion_and_skip_camera_movement():
     assert "【模型约束】" in image_prompt
 
 
+def test_still_camera_geometry_never_expands_video_movement():
+    """A freeze may inherit framing, never the take's push-motion geometry."""
+    shot = {
+        "characters": ["虞寻歌"],
+        "description": "虞寻歌背向镜头站在走廊尽端",
+        "camera": "全景 俯拍 侧面",
+        "shot_contract": {"运镜": "推"},
+    }
+
+    _, image_prompt = compile_shot_prompt(shot, mode="image")
+    _, first_prompt = compile_shot_prompt(shot, mode="first_frame")
+    _, last_prompt = compile_shot_prompt(shot, mode="last_frame")
+    _, video_prompt = compile_shot_prompt(shot, mode="video")
+
+    for prompt in (image_prompt, first_prompt, last_prompt):
+        assert "推=摄影机沿视线方向" not in prompt
+        assert "俯拍=摄影机高于人物视线" in prompt
+        assert "侧面=人物呈正侧轮廓" in prompt
+    assert "推=摄影机沿视线方向" in video_prompt
+
+
+def test_static_end_phase_overrides_stale_dialogue_gaze_and_start_facing():
+    """A departing tail frame cannot be pulled back into mutual eye contact."""
+    shot = {
+        "characters": ["虞寻歌", "柳争流"],
+        "description": "两人在房门口交谈后，虞寻歌离场",
+        "camera": "全景 俯拍 侧面 推",
+        "frame_targets": {
+            "last_frame": {
+                "phase": "end",
+                "state": (
+                    "酒店走廊离场终点：虞寻歌背向镜头走向远处电梯，"
+                    "柳争流留在房门外注视她的背影"),
+                "characters": ["虞寻歌", "柳争流"],
+                "visible_figure_count": 2,
+                "location": "现代酒店走廊",
+            },
+        },
+        "start_state": {
+            "虞寻歌": {
+                "position": "房门内", "direction": "面向柳争流",
+                "pose": "站立"},
+            "柳争流": {
+                "position": "房门外", "direction": "面向虞寻歌",
+                "pose": "站立"},
+        },
+        "end_state": {
+            "虞寻歌": {
+                "position": "走廊远端", "direction": "背向柳争流、面向电梯",
+                "pose": "迈步离场"},
+            "柳争流": {
+                "position": "房门外", "direction": "注视虞寻歌背影",
+                "pose": "原地站立"},
+        },
+        "spatial_blocking": {
+            "camera": {"position": "侧面"},
+            "actors": [
+                {"name": "虞寻歌", "start": "房门内",
+                 "end": "走廊远端", "facing_start": "面向柳争流",
+                 "facing_end": "背向柳争流、面向电梯"},
+                {"name": "柳争流", "start": "房门外",
+                 "end": "房门外", "facing_start": "面向虞寻歌",
+                 "facing_end": "注视虞寻歌背影"},
+            ],
+            "dialogue_continuity": {
+                "axis_id": "S01-P01-P02-A01",
+                "screen_left_name": "柳争流",
+                "screen_right_name": "虞寻歌",
+                "camera_side": "positive",
+                "coverage": "双人建立镜头",
+            },
+        },
+    }
+
+    contract, prompt = compile_shot_prompt(
+        shot, location="现代酒店走廊", mode="last_frame")
+    physical = "；".join(contract["physical"]["rules"])
+
+    assert "当前end静态相位" in prompt
+    assert "朝向/视线=背向柳争流、面向电梯" in prompt
+    assert "人物站位与朝向：虞寻歌:走廊远端，朝向背向柳争流、面向电梯" in physical
+    assert "双方身体朝向彼此" not in prompt
+    assert "视线精确落在对方双眼" not in prompt
+    assert "视线落在对方身上" not in prompt
+    assert "不得强制改成互看双眼" in prompt
+    assert "推=摄影机沿视线方向" not in prompt
+
+
 def test_latest_camera_compound_scale_and_lens_override_stale_nested_fields():
     """A repair camera is authoritative even when old nested fields remain."""
     shot = {
