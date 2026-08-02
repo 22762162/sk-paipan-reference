@@ -29,6 +29,8 @@ from ..adapters.codex_image import (
     CHARACTER_BACKGROUND_DIRECTIVE as _CHARACTER_BACKGROUND_DIRECTIVE,
 )
 from ..adapters.codex_image import STUDIO_ASSET_RULES as _STUDIO_ASSET_RULES
+from ..adapters.codex_image import _keyframe_phase as _api_keyframe_phase
+from ..adapters.codex_image import _keyframe_uri as _api_keyframe_uri
 from ..adapters.codex_image import _style_line as _api_style_line
 from ..adapters.codex_image import _space_line as _api_space_line
 from ..adapters.claude_script import (
@@ -464,7 +466,9 @@ def _local_refs(payload):
         if isinstance(ref, dict) and ref.get("uri"))
     order.extend(payload.get("character_refs") or [])
     order.extend(payload.get("prop_refs") or [])
-    for key in ("spatial_ref", "chain_first_uri", "scene_ref", "style_ref"):
+    for key in ("spatial_ref", "chain_first_uri", "frame_keyframe_uri",
+                "keyframe_reference_uri", "keyframe_last_uri",
+                "scene_ref", "style_ref"):
         val = payload.get(key)
         if val:
             order.append(val)
@@ -525,6 +529,9 @@ def _reference_entries(payload):
     for key, label in (
             ("spatial_ref", "本镜空间调度图"),
             ("chain_first_uri", "上一镜尾帧"),
+            ("frame_keyframe_uri", "本镜关键图"),
+            ("keyframe_reference_uri", "本镜关键图"),
+            ("keyframe_last_uri", "本镜动作终点关键图"),
             ("scene_ref", "场景基准图"),
             ("style_ref", "风格基准图")):
         add(payload.get(key), label)
@@ -1409,8 +1416,13 @@ class OpenAIImageProvider(Provider):
             last = out_dir / f"shot_{shot_no:03d}.last.png"
             chain_first = payload.get("chain_first_uri", "")
             first_source = "generated"
+            last_source = "generated"
             calls = 0
             normalizations = {}
+            keyframe_phase = _api_keyframe_phase(payload)
+            keyframe = Path(_api_keyframe_uri(payload, keyframe_phase))
+            keyframe_valid = (
+                keyframe.exists() and keyframe.suffix.lower() in _IMG_MEDIA)
             if chain_first and Path(chain_first).exists():
                 # 帧链:首帧固定为上一镜尾帧,只生成尾帧(拼接连贯)
                 import shutil as _sh
@@ -1418,34 +1430,54 @@ class OpenAIImageProvider(Provider):
                 first_source = "previous_tail"
                 normalizations["first"] = self._normalize_output(
                     first, payload)
-            else:
-                keyframe = Path(payload.get("image_uri", ""))
-                if (keyframe.exists() and keyframe.suffix.lower()
-                        in _IMG_MEDIA):
-                    import shutil as _sh
-                    _sh.copyfile(keyframe, first)
-                    first_source = "keyframe"
-                    normalizations["first"] = self._normalize_output(
-                        first, payload)
-                else:
-                    normalizations["first"] = self._gen_image(
-                        f"{prompt}。首帧:动作起始瞬间,构图稳定", size,
-                        first, payload)
-                    calls += 1
+            elif keyframe_valid and keyframe_phase == "start":
+                # 关键图明确属于动作起点时，才允许直接复用为首帧。
+                import shutil as _sh
+                _sh.copyfile(keyframe, first)
+                first_source = "keyframe"
+                normalizations["first"] = self._normalize_output(
+                    first, payload)
+
+            if keyframe_valid and keyframe_phase == "end":
+                # 关键图明确属于动作终点时，只能成为尾帧。即使已有上一镜
+                # 尾帧作为本镜首帧，也保持两端各归其位，零调用即可复用。
+                import shutil as _sh
+                _sh.copyfile(keyframe, last)
+                last_source = "keyframe"
+                normalizations["last"] = self._normalize_output(last, payload)
+
+            if first_source == "generated":
+                first_payload = dict(payload)
+                if keyframe_valid:
+                    # end/freeze/未知关键图只能作身份、场景、构图参考；
+                    # 绝不能通过文件换名冒充动作起点。
+                    first_payload["frame_keyframe_uri"] = str(keyframe)
+                normalizations["first"] = self._gen_image(
+                    f"{prompt}。首帧:动作起始瞬间，发生在动作终点之前；"
+                    "严格按起始状态生成，不得复制或倒置终点状态，构图稳定",
+                    size, first, first_payload)
+                calls += 1
             if cancel is not None and cancel():
                 from ..errors import ProduceCancelled
                 raise ProduceCancelled("已手动停止")
-            # 尾帧以首帧为参考,保证同角色同场景连贯
-            normalizations["last"] = self._gen_image(
-                f"{prompt}。尾帧:动作结束瞬间,与首帧同场景同角色、"
-                "人物服装道具一致",
-                size, last, {**payload, "chain_first_uri": str(first)})
-            calls += 1
+            if last_source == "generated":
+                # 尾帧以首帧为参考,保证同角色同场景连贯。freeze/未知
+                # 关键图仍可作为非边界构图参考，但不能替代任一端点。
+                last_payload = {**payload, "chain_first_uri": str(first)}
+                if keyframe_valid and keyframe_phase not in {"start", "end"}:
+                    last_payload["frame_keyframe_uri"] = str(keyframe)
+                normalizations["last"] = self._gen_image(
+                    f"{prompt}。尾帧:动作结束瞬间,与首帧同场景同角色、"
+                    "人物服装道具一致",
+                    size, last, last_payload)
+                calls += 1
             return ProviderResult(
                 provider=self.name, cost=call_cost * calls,
                 data=self._audit_data({
                     "first": str(first), "last": str(last),
                     "first_source": first_source,
+                    "last_source": last_source,
+                    "keyframe_phase": keyframe_phase,
                     "generation_calls": calls,
                     "image_normalization": normalizations,
                 }, payload, call_cost),

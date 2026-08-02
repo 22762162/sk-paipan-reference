@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from aifos.adapters.codex_image import build_instruction
+from aifos.adapters.codex_image import build_instruction, run as run_codex_image
 from aifos.app import App
 from aifos.director import (
     CHARACTER_SHEETS,
@@ -743,6 +743,7 @@ def test_codex_frames_reuse_keyframe_and_lock_space(tmp_path):
     instruction, targets, data = build_instruction("frames", {
         "shot_no": 1, "image_uri": str(keyframe), "prompt": "三人走进大厅",
         "characters": ["甲", "乙", "丙"], "character_count": 3,
+        "frame_target": {"phase": "start", "state": "三人刚走进大厅"},
         "spatial_constraint": "空间调度锁：严格 3 人；P01 左→中；机位不越轴。",
         "width": 1080, "height": 1920,
     }, tmp_path / "frames")
@@ -751,6 +752,105 @@ def test_codex_frames_reuse_keyframe_and_lock_space(tmp_path):
     assert "只生成本镜尾帧" in instruction
     assert "最终画面不得画出坐标、节点、箭头" in instruction
     assert "$imagegen" in instruction
+
+
+def test_codex_frames_end_keyframe_is_last_never_first(tmp_path):
+    keyframe = tmp_path / "shot_002.keyframe.png"
+    keyframe.write_bytes(PNG)
+    out_dir = tmp_path / "frames"
+    out_dir.mkdir()
+
+    instruction, targets, data = build_instruction("frames", {
+        "shot_no": 2,
+        "image_uri": str(keyframe),
+        "prompt": "女人从车门外走向远处",
+        "frame_target": {"phase": "end", "state": "女人已经走远"},
+        "start_state": {"女人": {"position": "刚站在车门外"}},
+        "end_state": {"女人": {"position": "已经走远"}},
+        "width": 1080,
+        "height": 1920,
+    }, out_dir)
+
+    first, last = targets
+    assert not first.exists()
+    assert last.read_bytes() == PNG
+    assert data["first_source"] == "generated"
+    assert data["last_source"] == "keyframe"
+    assert data["keyframe_phase"] == "end"
+    assert "尾帧已直接复用动作终点关键图" in instruction
+    assert "只产出首帧这一个文件" in instruction
+    assert "首帧已直接复用" not in instruction
+
+
+@pytest.mark.parametrize("phase", ["freeze", "", "unexpected"])
+def test_codex_frames_non_boundary_keyframe_generates_both_frames(
+        tmp_path, phase):
+    keyframe = tmp_path / f"shot_{phase or 'unknown'}.keyframe.png"
+    keyframe.write_bytes(PNG)
+    out_dir = tmp_path / f"frames_{phase or 'unknown'}"
+    out_dir.mkdir()
+    target = {"state": "代表性构图"}
+    if phase:
+        target["phase"] = phase
+
+    instruction, targets, data = build_instruction("frames", {
+        "shot_no": 3,
+        "image_uri": str(keyframe),
+        "prompt": "人物从站立到坐下",
+        "frame_target": target,
+    }, out_dir)
+
+    assert not any(path.exists() for path in targets)
+    assert data["first_source"] == "generated"
+    assert data["last_source"] == "generated"
+    assert data["keyframe_phase"] == phase
+    assert "生成首帧与尾帧" in instruction
+
+
+def test_codex_frames_chain_start_and_end_keyframe_are_local_noop(tmp_path):
+    previous_tail = tmp_path / "previous_tail.png"
+    end_keyframe = tmp_path / "shot_004.keyframe.png"
+    previous_tail.write_bytes(b"previous-tail")
+    end_keyframe.write_bytes(b"authored-end")
+    out_dir = tmp_path / "frames_chain_end"
+    out_dir.mkdir()
+    payload = {
+        "shot_no": 4,
+        "prompt": "人物从门边走到走廊尽头",
+        "chain_first_uri": str(previous_tail),
+        # 新 director 不再把 end 图塞进只代表首帧的 image_uri。
+        "keyframe_reference_uri": str(end_keyframe),
+        "keyframe_last_uri": str(end_keyframe),
+        "keyframe_boundary_phase": "end",
+        # 显式边界裁决优先于可能残留的旧字段。
+        "frame_target": {"phase": "freeze", "state": "旧代表帧字段"},
+    }
+
+    instruction, targets, data = build_instruction(
+        "frames", payload, out_dir)
+
+    first, last = targets
+    assert first.read_bytes() == b"previous-tail"
+    assert last.read_bytes() == b"authored-end"
+    assert data["first_source"] == "previous_tail"
+    assert data["last_source"] == "keyframe"
+    assert data["generation_noop"] is True
+    assert "不得调用 imagegen" in instruction
+    assert "$imagegen" not in instruction
+
+    # 本地两端都已合法落盘时，即使 Codex 命令不存在也必须直接成功；
+    # 这同时证明运行层没有发起 imagegen，也没有用新鲜度规则误判旧图。
+    reply = run_codex_image({
+        "capability": "frames",
+        "payload": payload,
+        "out_dir": str(out_dir),
+    }, "/definitely/missing/codex", 1, [])
+    assert reply["ok"] is True
+    assert reply["model"] == "AIFOS 本地首尾帧相位复用"
+    assert reply["cost"] == 0.0
+    assert reply["data"]["generation_noop"] is True
+    assert Path(reply["data"]["first"]).read_bytes() == b"previous-tail"
+    assert Path(reply["data"]["last"]).read_bytes() == b"authored-end"
 
 
 def test_production_board_images_are_selectable():

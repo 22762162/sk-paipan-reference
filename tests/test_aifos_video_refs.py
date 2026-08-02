@@ -2,10 +2,12 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from aifos.app import App
+from aifos.errors import AifosError
 
 
 @pytest.fixture()
@@ -129,8 +131,8 @@ def test_locked_character_missing_candidates_not_stuck_pending(app):
     assert f"candidate:{hero}:4" not in ids
 
 
-def test_shot_example_image_always_submitted_even_low_quality(app):
-    """镜头示例图有则必交:即使被归为低质量试错图也自动选入。"""
+def test_low_quality_shot_image_is_not_a_formal_video_reference(app):
+    """低质量试错图留在资产中心，但不得固化进 Seedance 参考链。"""
     project, episode, out = _preproduce(app, "万妖图录")
     row = app.assets.latest(project["id"], "image", "e001_shot001")
     assert row is not None
@@ -140,7 +142,185 @@ def test_shot_example_image_always_submitted_even_low_quality(app):
         meta={"image_quality": "low"}, new_version=True)
     effective = app.director.effective_video_references(episode["id"])
     kinds = [item["kind"] for item in effective["shots"]["1"]["items"]]
-    assert "image" in kinds, "低质量分镜示例图被静默丢弃(应仍提交)"
+    assert "image" not in kinds
+
+
+@pytest.mark.parametrize("bad_meta", [
+    {"reference_eligible": False},
+    {"physical_invalid": True},
+    {"selection_qc_passed": False},
+    {"qc": {
+        "best_effort_promoted": True,
+        "nonblocking_risk": {
+            "best_effort": True,
+            "issues": ["安全带从错误方向穿过人物身体"],
+        },
+    }},
+    {"qc": {
+        "physical_logic_checked": True,
+        "physical_logic_match": False,
+    }},
+    {"qc": {
+        "critical_failures": ["驾驶座椅缺失，人物悬空坐在车内"],
+    }},
+])
+def test_unfit_asset_meta_is_rejected_by_unified_video_policy(
+        app, tmp_path, bad_meta):
+    project, _ = app.projects.get_or_create_project("视频参考资格统一门禁")
+    image = tmp_path / "bad-reference.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+    row = app.assets.register(
+        project["id"], "image", "bad-reference", uri=str(image),
+        meta={"image_quality": "high", **bad_meta})
+
+    assert app.director._video_reference_rejection(row)
+
+
+def test_auto_reference_skips_physical_failure_and_accepts_clean_new_version(
+        app):
+    """旧问题图仍可预览；同名干净新版本生成后自动恢复正式参考资格。"""
+    project, episode, out = _preproduce(app, "万妖图录")
+    original = app.assets.latest(project["id"], "image", "e001_shot001")
+    bad = app.assets.register(
+        project["id"], "image", "e001_shot001", uri=original["uri"],
+        meta={
+            "image_quality": "high",
+            "qc": {
+                "best_effort_promoted": True,
+                "physical_logic_match": False,
+                "issues": ["手机屏幕朝向与人物视线相反"],
+            },
+        }, new_version=True)
+
+    effective = app.director.effective_video_references(episode["id"])
+    ids = {item["asset_id"] for item in effective["shots"]["1"]["items"]}
+    assert bad["id"] not in ids
+    assert app.assets.get(bad["id"]) is not None, "问题图不应从资产/UI删除"
+
+    fixed = app.assets.register(
+        project["id"], "image", "e001_shot001", uri=original["uri"],
+        meta={"image_quality": "high", "reference_eligible": True},
+        new_version=True)
+    effective = app.director.effective_video_references(episode["id"])
+    ids = {item["asset_id"] for item in effective["shots"]["1"]["items"]}
+    assert fixed["id"] in ids
+
+
+def test_manual_video_reference_rejects_known_physical_failure(app):
+    """人工点击也不能绕过与自动装配相同的正式参考资格门禁。"""
+    project, episode, out = _preproduce(app, "万妖图录")
+    original = app.assets.latest(project["id"], "image", "e001_shot002")
+    bad = app.assets.register(
+        project["id"], "image", "e001_shot002", uri=original["uri"],
+        meta={
+            "image_quality": "high",
+            "physical_invalid": True,
+            "qc": {"issues": ["安全带没有经过肩部与胸前"]},
+        }, new_version=True)
+
+    with pytest.raises(AifosError, match="物理或空间逻辑错误"):
+        app.director.set_video_references(
+            episode["id"], 1, [bad["id"]])
+
+    # 升级前已写进文档的手选记录也必须在读取时被隔离，不能只防新点击。
+    app.projects.save_document(episode["id"], "video_references", {
+        "schema": "aifos.video-references/v1",
+        "shots": {"1": [{
+            "asset_id": bad["id"], "kind": bad["kind"],
+            "name": bad["name"], "version": bad["version"],
+        }]},
+    })
+    effective = app.director.effective_video_references(episode["id"])
+    ids = {item["asset_id"] for item in effective["shots"]["1"]["items"]}
+    assert bad["id"] not in ids
+
+
+@pytest.mark.parametrize(("phase", "first_source", "last_source"), [
+    ("start", "keyframe", None),
+    ("end", "generated", "keyframe"),
+    ("freeze", "generated", None),
+])
+def test_keyframe_reuse_matches_authored_boundary_phase(
+        app, tmp_path, phase, first_source, last_source):
+    """end/freeze 关键图绝不能再被适配器误当成本镜首帧。"""
+    project, _ = app.projects.get_or_create_project("关键图边界相位")
+    keyframe = tmp_path / f"keyframe-{phase}.png"
+    keyframe.write_bytes(b"KEYFRAME-" + phase.encode())
+    row = app.assets.register(
+        project["id"], "image", f"shot-{phase}", uri=str(keyframe),
+        meta={"image_quality": "high"})
+    payload = {
+        "reference_images": [], "asset_matches": [],
+        "frame_kind": "frames", "frame_targets": {
+            "keyframe": {"phase": phase, "state": "明确静态状态"},
+        },
+    }
+    shot = {"frame_targets": payload["frame_targets"]}
+
+    bound = app.director._bind_keyframe_for_frames(payload, shot, row)
+    if phase == "start":
+        assert bound == "start"
+        assert payload["image_uri"] == str(keyframe)
+    elif phase == "end":
+        assert bound == "end"
+        assert "image_uri" not in payload
+        assert payload["keyframe_last_uri"] == str(keyframe)
+    else:
+        assert bound == ""
+        assert "image_uri" not in payload
+        assert "keyframe_last_uri" not in payload
+
+    first = tmp_path / f"{phase}.first.png"
+    last = tmp_path / f"{phase}.last.png"
+    first.write_bytes(b"GENERATED-FIRST")
+    last.write_bytes(b"GENERATED-LAST")
+    result = SimpleNamespace(data={
+        "first": str(first), "last": str(last),
+        "first_source": "generated",
+    })
+    app.director._apply_keyframe_boundary_to_frame_result(payload, result)
+
+    assert result.data["first_source"] == first_source
+    assert result.data.get("last_source") == last_source
+    assert first.read_bytes() == (
+        keyframe.read_bytes() if phase == "start" else b"GENERATED-FIRST")
+    assert last.read_bytes() == (
+        keyframe.read_bytes() if phase == "end" else b"GENERATED-LAST")
+    assert any(
+        item["uri"] == str(keyframe)
+        for item in payload["reference_manifest"])
+
+
+def test_previous_tail_beats_start_keyframe_for_continuous_scene(
+        app, tmp_path):
+    """同场连续镜头不得用本镜 start 图覆盖上一镜真实尾帧。"""
+    project, _ = app.projects.get_or_create_project("帧链优先级")
+    keyframe = tmp_path / "start.png"
+    keyframe.write_bytes(b"KEYFRAME-START")
+    previous_tail = tmp_path / "previous-tail.png"
+    previous_tail.write_bytes(b"PREVIOUS-TAIL")
+    first = tmp_path / "first.png"
+    last = tmp_path / "last.png"
+    first.write_bytes(previous_tail.read_bytes())
+    last.write_bytes(b"GENERATED-LAST")
+    row = app.assets.register(
+        project["id"], "image", "shot-start", uri=str(keyframe),
+        meta={"image_quality": "high"})
+    payload = {"frame_kind": "frames", "frame_targets": {
+        "keyframe": {"phase": "start", "state": "开始"},
+    }}
+    app.director._bind_keyframe_for_frames(
+        payload, {"frame_targets": payload["frame_targets"]}, row)
+    payload["chain_first_uri"] = str(previous_tail)
+    result = SimpleNamespace(data={
+        "first": str(first), "last": str(last),
+        "first_source": "previous_tail",
+    })
+
+    app.director._apply_keyframe_boundary_to_frame_result(payload, result)
+
+    assert result.data["first_source"] == "previous_tail"
+    assert first.read_bytes() == b"PREVIOUS-TAIL"
 
 
 def test_reset_manual_selection_falls_back_to_auto(app):

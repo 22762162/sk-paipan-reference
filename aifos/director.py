@@ -4127,7 +4127,9 @@ class Director:
             if extra:
                 issues.append("参考图人物与提示词名单不一致: " + "、".join(extra))
         if category == "frames" and not (
-                payload.get("image_uri") or payload.get("chain_first_uri")):
+                payload.get("image_uri")
+                or payload.get("chain_first_uri")
+                or payload.get("keyframe_reference_uri")):
             issues.append("首尾帧缺少本镜关键帧/上一镜尾帧连续性参考")
         reference_facts = [{
             "kind": ref.get("kind", ""),
@@ -11046,6 +11048,61 @@ class Director:
         except AifosError:
             return default
 
+    def _video_reference_rejection(self, row):
+        """Return why an image must not enter the formal Seedance chain.
+
+        Images with a known defect remain visible in the asset/review UI, but
+        they are evidence of what to repair rather than a source of truth for
+        video generation.  Keeping the decision here prevents auto assembly,
+        fresh manual selections and persisted manual selections from drifting
+        into three different eligibility policies.
+        """
+        if row is None:
+            return "资产不存在"
+        if not formal_reference_allowed(self._asset_quality(row)):
+            return "低质量试错图不能作为 Seedance 正式参考"
+        meta = self._asset_meta(row)
+        if meta.get("reference_eligible") is False:
+            return "资产已标记为不可进入 Seedance 正式参考链"
+        if meta.get("physical_invalid") is True:
+            return "资产已标记存在物理或空间逻辑错误"
+        if meta.get("selection_qc_passed") is False:
+            return "资产选优质检未通过，不能作为 Seedance 正式参考"
+
+        nodes = []
+
+        def collect(value):
+            if isinstance(value, dict):
+                nodes.append(value)
+                for nested in value.values():
+                    collect(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    collect(nested)
+
+        collect(meta)
+        if any(
+                node.get("best_effort_promoted") is True
+                or node.get("best_effort_risk") is True
+                or node.get("best_effort") is True
+                for node in nodes):
+            return "资产仅为未达线候选中的相对最优稿，不能固化到视频参考"
+        if any(
+                node.get("physical_invalid") is True
+                or node.get("physical_logic_match") is False
+                or node.get("spatial_logic_match") is False
+                for node in nodes):
+            return "资产质检记录存在物理或空间逻辑风险"
+        critical = [
+            str(issue).strip()
+            for node in nodes
+            for issue in (node.get("critical_failures") or [])
+            if str(issue).strip()
+        ]
+        if critical:
+            return "资产仍有关键失败项，不能固化到视频参考: " + critical[0]
+        return ""
+
     def _quality_meta(self, decision):
         return {
             "image_quality": decision["level"],
@@ -11094,6 +11151,9 @@ class Director:
         row = self.assets.latest(project_id, "character_identity", name)
         if row is None or not self._asset_meta(row).get("locked"):
             return None
+        # 人物定版图即使是四抽中的相对最优稿，也必须继续作为后续图片
+        # 的身份锚并让人物阶段完成。更严格的物理/QC资格只在正式
+        # Seedance 视频参考链入口执行，不能反向把人物阶段重新锁死。
         if not formal_reference_allowed(self._asset_quality(row)):
             return None
         uri = row["uri"]
@@ -11108,6 +11168,8 @@ class Director:
         row = self.assets.latest(project_id, "prop_identity", name)
         if row is None or not self._asset_meta(row).get("locked"):
             return None
+        # 与人物定版相同：道具母资产负责图片阶段的一致性和就绪状态；
+        # 是否能进入视频正式参考链由视频装配入口另行严格裁决。
         if not formal_reference_allowed(self._asset_quality(row)):
             return None
         uri = str(row["uri"] or "")
@@ -14005,6 +14067,200 @@ class Director:
             payload["frame_target"] = copy.deepcopy(target)
 
     @staticmethod
+    def _apply_static_frame_population_scope(shot):
+        """Apply one authored frame's cast to every still-image input.
+
+        ``frame_targets`` may describe a long take whose cast changes between
+        its boundaries.  The prompt compiler already understands that schema,
+        but identity/wardrobe references and the Director payload are assembled
+        before compilation.  Without the same scope here, a not-yet-entered
+        actor is still submitted as a visual reference and can be hallucinated
+        into the first frame.
+
+        ``frame_kind=frames`` is deliberately excluded: that request contains
+        two independent boundary contracts and therefore needs the whole-take
+        cast available while each boundary is compiled separately.
+        """
+        if str(shot.get("frame_kind") or "keyframe") == "frames":
+            return shot
+        target = shot.get("frame_target")
+        if not isinstance(target, dict):
+            return shot
+        population_declared = any(
+            key in target for key in (
+                "characters", "functional_figures",
+                "visible_figure_count", "visible_count"))
+        if not population_declared:
+            return shot
+
+        whole_cast = []
+        for value in shot.get("characters") or []:
+            name = str(value or "").strip()
+            if name and name not in whole_cast:
+                whole_cast.append(name)
+        if "characters" in target:
+            raw_cast = target.get("characters")
+            raw_cast = raw_cast if isinstance(raw_cast, (list, tuple)) else []
+            characters = []
+            for value in raw_cast:
+                name = str(value or "").strip()
+                if (name and name in whole_cast
+                        and name not in characters):
+                    characters.append(name)
+        else:
+            characters = whole_cast
+
+        raw_functional = (
+            target.get("functional_figures")
+            if "functional_figures" in target
+            else shot.get("functional_figures"))
+        functional_figures = _normalize_functional_figures(raw_functional)
+        allowed = set(characters)
+        allowed.update(
+            str(item.get("name") or item.get("label") or "").strip()
+            for item in functional_figures)
+        allowed.discard("")
+
+        shot["characters"] = characters
+        shot["functional_figures"] = functional_figures
+        computed_visible = (
+            len(characters) + _functional_figure_count(functional_figures))
+        declared_visible = target.get(
+            "visible_figure_count", target.get("visible_count"))
+        # 只要当前相位明确列了人物或功能人物，实体清单就是唯一人数事实，
+        # 必须实时求和。旧 frame_target 中缓存的 visible_count 可能早于
+        # 后续功能人物补录；继续沿用会把新增配角从合同人数中吞掉。
+        # 只有“仅声明人数、未声明任何实体清单”的兼容数据才保留该数字。
+        has_population_lists = (
+            "characters" in target or "functional_figures" in target)
+        shot["visible_figure_count"] = (
+            computed_visible if has_population_lists else
+            declared_visible
+            if (isinstance(declared_visible, int)
+                and not isinstance(declared_visible, bool))
+            else computed_visible)
+
+        target_state = str(target.get("state") or "").strip()
+        if target_state:
+            # A still depicts the frozen boundary, not the long-take process.
+            shot["description"] = target_state
+            shot["action"] = target_state
+
+        number_map = shot.get("character_number_map")
+        if isinstance(number_map, dict):
+            shot["character_number_map"] = {
+                key: copy.deepcopy(value)
+                for key, value in number_map.items()
+                if str(
+                    value.get("name")
+                    if isinstance(value, dict) else key).strip() in characters
+            }
+        for field in ("start_state", "end_state"):
+            states = shot.get(field)
+            if isinstance(states, dict):
+                shot[field] = {
+                    name: copy.deepcopy(value)
+                    for name, value in states.items() if name in allowed}
+
+        dialogue = shot.get("dialogue")
+        if isinstance(dialogue, dict):
+            speaker = str(
+                dialogue.get("character") or dialogue.get("speaker")
+                or "").strip()
+            if speaker and speaker not in allowed:
+                shot["dialogue"] = {}
+        overlays = shot.get("narrative_overlays")
+        if isinstance(overlays, list):
+            shot["narrative_overlays"] = [
+                copy.deepcopy(item) for item in overlays
+                if isinstance(item, dict)
+                and str(item.get("host_character") or "").strip()
+                in allowed
+            ]
+
+        # A cached composition belongs to the whole take.  Rebuild it from
+        # the phase cast so count and over-shoulder duties cannot name an actor
+        # that is absent from this frame.
+        shot.pop("composition_contract", None)
+        return shot
+
+    @staticmethod
+    def _scope_static_spatial_blocking(spatial, shot):
+        """Remove whole-take actors that are absent from this still frame."""
+        if not isinstance(spatial, dict):
+            return spatial or {}
+        scoped = copy.deepcopy(spatial)
+        if str(shot.get("frame_kind") or "keyframe") == "frames":
+            return scoped
+        allowed = {
+            str(value or "").strip()
+            for value in shot.get("characters") or []
+            if str(value or "").strip()
+        }
+        allowed.update(
+            str(item.get("name") or item.get("label") or "").strip()
+            for item in shot.get("functional_figures") or []
+            if isinstance(item, dict))
+        actors = scoped.get("actors")
+        if isinstance(actors, list):
+            scoped["actors"] = [
+                copy.deepcopy(item) for item in actors
+                if isinstance(item, dict)
+                and str(item.get("name") or item.get("character") or "").strip()
+                in allowed
+            ]
+        dialogue = scoped.get("dialogue_continuity")
+        if isinstance(dialogue, dict):
+            names = {
+                str(dialogue.get("screen_left_name") or "").strip(),
+                str(dialogue.get("screen_right_name") or "").strip(),
+            } - {""}
+            if not names <= allowed or len(shot.get("characters") or []) < 2:
+                scoped.pop("dialogue_continuity", None)
+        return scoped
+
+    @staticmethod
+    def _readable_text_for_static_frame(shot):
+        """Resolve a phase-aware text card for one image request.
+
+        Image adapters historically read only the top-level ``carrier`` and
+        ``whitelist`` fields.  Passing the new ``readable_text.phases`` object
+        straight through therefore produced ``白名单为空`` and reintroduced
+        start-screen facts into end frames.  The prompt compiler has already
+        established the same rule: a static frame receives exactly its
+        ``frame_target.phase`` bucket.  ``frame_kind=frames`` remains a paired
+        start/end request and keeps the full timeline for its two independent
+        frame contracts.
+        """
+        source = shot.get("readable_text") or {}
+        source = source if isinstance(source, dict) else {}
+        phases = source.get("phases")
+        if not isinstance(phases, dict):
+            return {
+                key: copy.deepcopy(value)
+                for key, value in source.items()
+                if key not in {"locked_by", "keyframe_uri"}
+            }
+        if str(shot.get("frame_kind") or "keyframe") == "frames":
+            return {
+                key: copy.deepcopy(value)
+                for key, value in source.items()
+                if key not in {"locked_by", "keyframe_uri"}
+            }
+        target = shot.get("frame_target")
+        phase = str(
+            target.get("phase")
+            if isinstance(target, dict) else "").strip().lower()
+        selected = phases.get(phase)
+        if not isinstance(selected, dict):
+            return {"required": False}
+        return {
+            key: copy.deepcopy(value)
+            for key, value in selected.items()
+            if key not in {"locked_by", "keyframe_uri"}
+        }
+
+    @staticmethod
     def _shot_reference_phases(shot, frame_kind="keyframe"):
         """Return exact prop phases relevant to one image request."""
         kind = str(frame_kind or "keyframe").strip().lower()
@@ -14022,6 +14278,105 @@ class Director:
             (target or {}).get("phase")
             if isinstance(target, dict) else "").strip().lower()
         return {phase} if phase in {"start", "end", "freeze"} else set()
+
+    @staticmethod
+    def _keyframe_boundary_phase(shot):
+        """Return the authored boundary represented by the keyframe.
+
+        A representative/freeze image is useful visual evidence, but it is
+        not automatically the beginning of an action.  Only an explicit
+        ``start`` or ``end`` phase may be reused as a video boundary.
+        """
+        targets = shot.get("frame_targets")
+        target = (
+            targets.get("keyframe")
+            if isinstance(targets, dict) else None)
+        if not isinstance(target, dict):
+            target = shot.get("frame_target")
+        phase = str(
+            target.get("phase")
+            if isinstance(target, dict) else "").strip().lower()
+        return phase if phase in {"start", "end"} else ""
+
+    def _bind_keyframe_for_frames(self, payload, shot, row):
+        """Attach one formal keyframe without lying about its time boundary."""
+        if row is None or not row["uri"]:
+            return ""
+        rejection = self._video_reference_rejection(row)
+        if rejection:
+            payload["draft_image_rejected"] = row["uri"]
+            payload["keyframe_reference_rejection"] = rejection
+            return ""
+        uri = str(row["uri"])
+        if (not uri.startswith(("http://", "https://"))
+                and not Path(uri).exists()):
+            payload["draft_image_rejected"] = uri
+            payload["keyframe_reference_rejection"] = "关键图文件不存在"
+            return ""
+        phase = self._keyframe_boundary_phase(shot)
+        payload["keyframe_reference_uri"] = uri
+        payload["keyframe_boundary_phase"] = phase or "reference_only"
+        payload.pop("image_uri", None)
+        payload.pop("keyframe_last_uri", None)
+        if phase == "start":
+            # Existing frame providers understand image_uri as an exact first
+            # frame.  Do not set it for end/freeze images: that was the source
+            # of the Episode 29 reversed timeline.
+            payload["image_uri"] = uri
+        elif phase == "end":
+            payload["keyframe_last_uri"] = uri
+
+        references = [
+            str(value) for value in (payload.get("reference_images") or [])
+            if str(value)]
+        if uri not in references:
+            references.append(uri)
+        payload["reference_images"] = references
+        matches = [
+            item for item in (payload.get("asset_matches") or [])
+            if str((item or {}).get("uri") or "") != uri]
+        matches.append({
+            "asset_id": row["id"], "kind": row["kind"],
+            "name": row["name"], "uri": uri,
+            "label": (
+                "本镜起点关键图" if phase == "start" else
+                "本镜终点关键图" if phase == "end" else
+                "本镜代表关键图（不充当首尾边界）"),
+            "reference_role": "composition",
+        })
+        payload["asset_matches"] = matches
+        payload["require_reference_images"] = True
+        # image_uri is attached after _shot_payload has built its original
+        # manifest.  Rebuild now so workers and API providers receive the same
+        # keyframe that the boundary audit records.
+        self._attach_reference_manifest(payload)
+        return phase
+
+    @staticmethod
+    def _apply_keyframe_boundary_to_frame_result(payload, result):
+        """Materialize an explicitly authored start/end into frame outputs."""
+        data = getattr(result, "data", None)
+        if not isinstance(data, dict):
+            return
+        phase = str(payload.get("keyframe_boundary_phase") or "")
+        source_uri = str(payload.get("keyframe_reference_uri") or "")
+        if (not source_uri or source_uri.startswith(("http://", "https://"))
+                or not Path(source_uri).is_file()):
+            return
+        # A previous shot's tail is the only legal override of this shot's
+        # authored start: the continuous chain must remain exact.
+        if phase == "start" and not payload.get("chain_first_uri"):
+            target_uri = str(data.get("first") or "")
+            if target_uri:
+                Path(target_uri).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_uri, target_uri)
+                data["first_source"] = "keyframe"
+        elif phase == "end":
+            target_uri = str(data.get("last") or "")
+            if target_uri:
+                Path(target_uri).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_uri, target_uri)
+                data["last_source"] = "keyframe"
 
     def _relations(self, ctx):
         """画布关系图:ctx 内缓存优先,单图重画等路径从落盘文件回读。"""
@@ -14407,38 +14762,41 @@ class Director:
                 location=self._shot_location(ctx.get("script"), shot),
                 style=ctx["project"].get("style", "") or "",
             )
+        static_shot = copy.deepcopy(shot)
+        static_shot["frame_kind"] = frame_kind
+        self._select_explicit_frame_target(static_shot)
+        self._apply_static_frame_population_scope(static_shot)
         self._require_valid_storyboard_prop_contract(ctx)
-        prop_contract = self._shot_prop_contract(ctx, shot)
+        prop_contract = self._shot_prop_contract(ctx, static_shot)
         prop_reference_rows = self._shot_core_prop_references(
-            ctx, shot, phases=self._shot_reference_phases(
-                shot, frame_kind))
+            ctx, static_shot, phases=self._shot_reference_phases(
+                static_shot, frame_kind))
         prop_reference_modes = {
             item["name"]: item for item in prop_reference_rows}
         locations = self._scene_locations(ctx)
         location = shot_local_scene(
-            shot, locations.get(shot["scene_no"], ""))
+            static_shot, locations.get(static_shot["scene_no"], ""))
         profile = (ctx.get("production_profile")
                    or (ctx.get("storyboard") or {}).get("profile")
                    or production_profile(
                        self.config, ctx.get("production_standard")))
-        spatial = shot_blocking(ctx.get("blocking"), shot["shot_no"])
+        spatial = self._scope_static_spatial_blocking(
+            shot_blocking(ctx.get("blocking"), static_shot["shot_no"]),
+            static_shot)
         scene_physics = self._shot_scene_physics(ctx, location, spatial)
         # ``locked_by`` and ``keyframe_uri`` are post-generation audit
         # metadata.  Feeding them back into the next image contract changes
         # its hash after the image has already been selected and can expose a
         # local file path as irrelevant prompt text.  Visible wording/layout
         # stays; internal lock bookkeeping never enters generation.
-        readable_text = {
-            key: copy.deepcopy(value)
-            for key, value in (shot.get("readable_text", {}) or {}).items()
-            if key not in {"locked_by", "keyframe_uri"}
-        }
+        readable_text = self._readable_text_for_static_frame(static_shot)
+        static_shot["readable_text"] = copy.deepcopy(readable_text)
         text_required = readable_text_required(readable_text)
         quality = resolve_image_quality(
             recommend_shot_image_quality(
-                shot, continuity_anchor=continuity_anchor),
+                static_shot, continuity_anchor=continuity_anchor),
             ctx.get("quality_policy") or default_quality_policy(),
-            item_id or f"shot:{shot['shot_no']}",
+            item_id or f"shot:{static_shot['shot_no']}",
             explicit_override=quality_override)
         script_characters = {
             item.get("name"): item
@@ -14452,27 +14810,44 @@ class Director:
                         if item.get("name")]
         identity_characters = [
             name for name in script_order
-            if name in shot["characters"]
+            if name in static_shot["characters"]
             and not is_background_character(script_characters.get(name, {}))]
         identity_characters.extend(
-            name for name in shot["characters"]
+            name for name in static_shot["characters"]
             if name not in identity_characters
             and not is_background_character(script_characters.get(name, {})))
         functional_figures = _normalize_functional_figures(
-            shot.get("functional_figures"))
-        visible_figure_count = (
-            len(shot["characters"])
+            static_shot.get("functional_figures"))
+        computed_visible_figure_count = (
+            len(static_shot["characters"])
             + _functional_figure_count(functional_figures))
-        shot["functional_figures"] = functional_figures
-        shot["visible_figure_count"] = visible_figure_count
-        character_background = self._shot_character_facts(ctx, shot)
+        declared_visible_figure_count = static_shot.get(
+            "visible_figure_count")
+        static_target = static_shot.get("frame_target")
+        static_target = (
+            static_target if isinstance(static_target, dict) else {})
+        target_declares_count_only = (
+            any(key in static_target
+                for key in ("visible_figure_count", "visible_count"))
+            and "characters" not in static_target
+            and "functional_figures" not in static_target)
+        visible_figure_count = (
+            declared_visible_figure_count
+            if (target_declares_count_only
+                and isinstance(declared_visible_figure_count, int)
+                and not isinstance(declared_visible_figure_count, bool))
+            else computed_visible_figure_count)
+        static_shot["functional_figures"] = functional_figures
+        static_shot["visible_figure_count"] = visible_figure_count
+        character_background = self._shot_character_facts(ctx, static_shot)
         character_visuals = self._shot_character_visuals(
-            ctx, shot, character_background)
-        composition_contract = copy.deepcopy(build_composition_contract(shot))
+            ctx, static_shot, character_background)
+        composition_contract = copy.deepcopy(
+            build_composition_contract(static_shot))
         composition_contract["expected_visible_figure_count"] = (
             visible_figure_count)
         composition_contract.setdefault(
-            "registered_character_count", len(shot["characters"]))
+            "registered_character_count", len(static_shot["characters"]))
         composition_contract.setdefault(
             "functional_figure_count",
             _functional_figure_count(functional_figures))
@@ -14484,13 +14859,13 @@ class Director:
                 story_world.get("name"),
                 story_world.get("era_and_location"),
                 story_world.get("hard_rules"),
-                shot.get("era_context"),
+                static_shot.get("era_context"),
             ) if str(value or "").strip())
         sanctioned_anachronisms = list(
             story_world.get("sanctioned_anachronisms") or
-            shot.get("sanctioned_anachronisms") or [])
+            static_shot.get("sanctioned_anachronisms") or [])
         physical_contract = build_physical_contract({
-            **shot, "spatial_blocking": spatial or {},
+            **static_shot, "spatial_blocking": spatial or {},
             "readable_text": readable_text,
             "location": location,
             "style": ctx["project"]["style"] or "",
@@ -14499,7 +14874,7 @@ class Director:
         }, media="image")
         narrative_overlays = [
             copy.deepcopy(item)
-            for item in (shot.get("narrative_overlays") or [])
+            for item in (static_shot.get("narrative_overlays") or [])
             if isinstance(item, dict)
         ][:1]
         inner_persona_ref = ""
@@ -14517,51 +14892,56 @@ class Director:
             "_episode_id": ctx["episode"]["id"],
             "_contract_revision": max(
                 1, int(ctx.get("storyboard_version") or 1)),
-            "shot_no": shot["shot_no"],
-            "unit_id": shot.get("unit_id"),
+            "shot_no": static_shot["shot_no"],
+            "unit_id": static_shot.get("unit_id"),
             # 导演台意见:走既有 feedback 修订机制(审核与生成都会带上),
             # 与 QC 修订同通道;空值不产生键,行为与接线前完全一致。
-            **({"feedback": str(shot.get("director_note"))[:1200]}
-               if str(shot.get("director_note") or "").strip() else {}),
+            **({"feedback": str(static_shot.get("director_note"))[:1200]}
+               if str(static_shot.get("director_note") or "").strip()
+               else {}),
             "frame_kind": frame_kind,
-            "prompt": self._rich_shot_prompt(ctx, shot, location),
-            "seedance_prompt": shot.get("seedance_prompt", shot["prompt"]),
-            "characters": shot["characters"],
-            "character_number_map": shot.get("character_number_map", {}),
+            "prompt": self._rich_shot_prompt(ctx, static_shot, location),
+            "seedance_prompt": static_shot.get(
+                "seedance_prompt", static_shot["prompt"]),
+            "characters": static_shot["characters"],
+            "character_number_map": static_shot.get(
+                "character_number_map", {}),
             "identity_characters": identity_characters,
             "character_background": character_background,
             "character_visuals": character_visuals,
-            "character_count": len(shot["characters"]),
+            "character_count": len(static_shot["characters"]),
             "functional_figures": functional_figures,
             "visible_figure_count": visible_figure_count,
             "narrative_overlays": narrative_overlays,
             "location": location,
-            "dialogue": shot.get("dialogue"),
-            "camera": shot.get("camera", ""),
-            "action": shot.get("description", ""),
-            "start_state": shot.get("start_state", {}),
-            "end_state": shot.get("end_state", {}),
-            "identity_facts_required": bool(shot.get("characters")),
-            "appearance_state_required": bool(shot.get("characters")),
+            "dialogue": static_shot.get("dialogue"),
+            "camera": static_shot.get("camera", ""),
+            "action": static_shot.get("description", ""),
+            "start_state": static_shot.get("start_state", {}),
+            "end_state": static_shot.get("end_state", {}),
+            "identity_facts_required": bool(
+                static_shot.get("characters")),
+            "appearance_state_required": bool(
+                static_shot.get("characters")),
             "frame_targets": copy.deepcopy(
-                shot.get("frame_targets") or {}),
+                static_shot.get("frame_targets") or {}),
             "frame_target": copy.deepcopy(
-                shot.get("frame_target") or {}),
+                static_shot.get("frame_target") or {}),
             "semantic_corrections": copy.deepcopy(
-                shot.get("semantic_corrections") or []),
-            "five_dimensions": shot.get("five_dimensions", {}),
+                static_shot.get("semantic_corrections") or []),
+            "five_dimensions": static_shot.get("five_dimensions", {}),
             "readable_text": readable_text,
             # 正式关键帧默认中档；文字/群像/人脸情绪/连续性自动升高。
             "image_task_class": image_task_class_for(
                 quality["level"], readable_text=text_required),
             "image_quality": quality["level"],
             "quality_decision": quality,
-            "performance": shot.get("performance", {}),
-            "shot_contract": shot.get("shot_contract", {}),
+            "performance": static_shot.get("performance", {}),
+            "shot_contract": static_shot.get("shot_contract", {}),
             "composition_contract": composition_contract,
             "physical_contract": physical_contract,
             **prop_contract,
-            "sound_design": shot.get("sound_design", {}),
+            "sound_design": static_shot.get("sound_design", {}),
             "spatial_blocking": spatial or {},
             "spatial_constraint": (spatial or {}).get("constraint", ""),
             "scene_physics": scene_physics,
@@ -14580,12 +14960,12 @@ class Director:
             "aspect": ctx["aspect"], **ctx["dims"],
             **self._art_refs(
                 ctx, identity_characters, location,
-                shot_no=shot["shot_no"],
-                camera=shot.get("camera"),
-                sheet_keys=self._shot_reference_sheet_keys(shot),
+                shot_no=static_shot["shot_no"],
+                camera=static_shot.get("camera"),
+                sheet_keys=self._shot_reference_sheet_keys(static_shot),
                 sheet_keys_by_character=(
                     self._shot_reference_sheet_keys_by_character(
-                        shot, composition_contract)),
+                        static_shot, composition_contract)),
                 spatial_ref=(
                     (spatial or {}).get("spatial_reference_uri", "")
                     if requires_spatial_reference(spatial or {}) else ""),
@@ -14595,19 +14975,19 @@ class Director:
                 prop_reference_modes=prop_reference_modes,
                 wardrobe_states={
                     name: str(
-                        ((shot.get("end_state") or {}).get(name) or {}).get(
-                            "wardrobe")
-                        or ((shot.get("start_state") or {}).get(name) or {}).get(
-                            "wardrobe")
+                        ((static_shot.get("end_state") or {}).get(name)
+                         or {}).get("wardrobe")
+                        or ((static_shot.get("start_state") or {}).get(name)
+                            or {}).get("wardrobe")
                         or "")
                     for name in identity_characters
                 },
                 headwear_states={
                     name: copy.deepcopy(
-                        ((shot.get("end_state") or {}).get(name) or {}).get(
-                            "headwear")
-                        or ((shot.get("start_state") or {}).get(name) or {}).get(
-                            "headwear")
+                        ((static_shot.get("end_state") or {}).get(name)
+                         or {}).get("headwear")
+                        or ((static_shot.get("start_state") or {}).get(name)
+                            or {}).get("headwear")
                         or {})
                     for name in identity_characters
                 }),
@@ -14629,13 +15009,13 @@ class Director:
             "character": name,
             "uri": next((ref.get("uri") for ref in mapped_refs
                          if ref.get("character") == name), ""),
-        } for name in shot.get("characters", [])]
+        } for name in static_shot.get("characters", [])]
         # Codex may have removed a conflicting prop/blocking reference or
         # replaced a narrow scene crop after QC.  _shot_payload is rebuilt on
         # every resume, so replay those resolved same-project edits before the
         # manifest is numbered; otherwise the old reference silently returns.
         self._apply_persisted_reference_overrides(
-            ctx, payload, shot)
+            ctx, payload, static_shot)
         # 前置绑定:参考图对照表进提示词——每张图是谁的、参考什么,
         # 出图前就写死,而不是靠事后质检纠错
         self._attach_reference_manifest(payload)
@@ -14652,7 +15032,7 @@ class Director:
         self._append_generation_rules(
             payload,
             self._generation_rule_lines(
-                ctx, shot, payload, modality="image"))
+                ctx, static_shot, payload, modality="image"))
         return payload
 
     def _reference_manifest(self, payload):
@@ -16532,11 +16912,9 @@ class Director:
                             "shot_no": shot["shot_no"]}
                         continue
                 image = images[shot["shot_no"]]
-                if formal_reference_allowed(
-                        image.get("image_quality", "medium")):
-                    payload["image_uri"] = image["uri"]
-                else:
-                    payload["draft_image_rejected"] = image["uri"]
+                image_row = self.assets.latest(
+                    ctx["project"]["id"], "image", name)
+                self._bind_keyframe_for_frames(payload, shot, image_row)
                 chain_first = last_by_scene.get(scene_no)
                 if (round_no > 0 and chain_first
                         and formal_reference_allowed(
@@ -16589,6 +16967,8 @@ class Director:
                     continue
                 shot_no = task["tag"]
                 decision = task["payload"]["quality_decision"]
+                self._apply_keyframe_boundary_to_frame_result(
+                    task["payload"], result)
                 meta = self._quality_meta(decision)
                 content_qc_waived = not self._image_qc_enabled()
                 meta["qc_passed"] = bool(
@@ -16805,12 +17185,14 @@ class Director:
     def _spatial_reference_requirement(self, ctx, shot_no):
         rows = self._ensure_spatial_reference_assets(ctx)
         block = shot_blocking(ctx.get("blocking"), shot_no) or {}
+        row = rows.get(int(shot_no))
+        rejection = self._video_reference_rejection(row) if row else ""
         return {
             "required": requires_spatial_reference(block),
-            "ready": int(shot_no) in rows,
+            "ready": bool(row is not None and not rejection),
             "reason": block.get("spatial_reference_reason", ""),
-            "row": rows.get(int(shot_no)),
-            "error": block.get("spatial_reference_error", ""),
+            "row": row if not rejection else None,
+            "error": rejection or block.get("spatial_reference_error", ""),
         }
 
     def set_video_references(self, episode_id, shot_no, asset_ids,
@@ -16929,8 +17311,10 @@ class Director:
                 row, target_shot, location, script=script)
             if mismatch:
                 raise AifosError(mismatch)
-            if not formal_reference_allowed(self._asset_quality(row)):
-                raise AifosError(f"低质量候选图不能交给 Seedance: {row['name']}")
+            rejection = self._video_reference_rejection(row)
+            if rejection:
+                raise AifosError(
+                    f"资产不能交给 Seedance: {row['name']}；{rejection}")
             uri = row["uri"]
             if (not uri.startswith(("http://", "https://"))
                     and not Path(uri).exists()):
@@ -17029,7 +17413,7 @@ class Director:
             if (row is None or self.assets.is_deleted(row)
                     or not row["uri"]):
                 return False
-            if not formal_reference_allowed(self._asset_quality(row)):
+            if self._video_reference_rejection(row):
                 return False
             uri = row["uri"]
             return (uri.startswith(("http://", "https://"))
@@ -17086,14 +17470,16 @@ class Director:
                 f"镜头{shot_no}的空间图与人物最终立绘已占{len(rows)}张，"
                 f"超过 Seedance 2 资产参考上限"
                 f"{SEEDANCE_ASSET_REFERENCE_LIMIT}张；请拆分群像镜头")
-        # 本镜分镜示例图承载构图事实；它即使是低档候选也可在首尾帧之外
-        # 作为构图参考，但不能挤掉必传空间图与人物身份图。
+        # 本镜分镜示例图承载构图事实，但只有中/高质量且没有已知质检
+        # 风险的正式版本才能作为视频参考。问题图仍留在画布供复盘，
+        # 不得把错误安全带、反向手机或错误车内结构继续传给 Seedance。
         shot_image = self.assets.latest(
             project_id, "image",
             f"e{ctx['episode']['number']:03d}_shot{int(shot_no):03d}")
         if (len(rows) < 7 and shot_image is not None
                 and not self.assets.is_deleted(shot_image)
                 and shot_image["uri"]
+                and not self._video_reference_rejection(shot_image)
                 and (shot_image["uri"].startswith(("http://", "https://"))
                      or Path(shot_image["uri"]).exists())
                 and shot_image["id"] not in seen):
@@ -17153,7 +17539,7 @@ class Director:
         row = self.assets.latest(
             ctx["project"]["id"], "inner_persona", name)
         if (row is None or self.assets.is_deleted(row) or not row["uri"]
-                or not formal_reference_allowed(self._asset_quality(row))):
+                or self._video_reference_rejection(row)):
             return None
         uri = str(row["uri"])
         if not (uri.startswith(("http://", "https://"))
@@ -17323,7 +17709,7 @@ class Director:
                 row["project_id"], row["kind"], row["name"])
             if (latest is None or latest["id"] != row["id"]
                     or self.assets.is_deleted(row) or not row["uri"]
-                    or not formal_reference_allowed(self._asset_quality(row))):
+                    or self._video_reference_rejection(row)):
                 continue
             if self._video_reference_mismatch(
                     row, shot, location, script=script):
@@ -20524,10 +20910,8 @@ class Director:
                 quality_override=choice,
                 item_id=f"frames:{shot['shot_no']}",
                 frame_kind="frames")
-            if formal_reference_allowed(self._asset_quality(image_row)):
-                frames_payload["image_uri"] = image_row["uri"]
-            else:
-                frames_payload["draft_image_rejected"] = image_row["uri"]
+            self._bind_keyframe_for_frames(
+                frames_payload, shot, image_row)
             frames_payload["feedback"] = feedback if offset == 0 else ""
             prior = self.assets.latest(
                 ctx["project"]["id"], "first_frame", asset_name,
@@ -21344,6 +21728,8 @@ class Director:
                     frames_payload["prompt"], feedback),
                 payload=frames_payload, revision_source=revision_source,
                 capability="frames")
+            self._apply_keyframe_boundary_to_frame_result(
+                frames_payload, result)
             formal_ready = formal_reference_allowed(
                 frames_payload["image_quality"])
             sync_boundaries = {"last_frame"}
