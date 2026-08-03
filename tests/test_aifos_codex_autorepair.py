@@ -135,7 +135,7 @@ def test_escalation_without_a_concrete_instruction_still_goes_to_human(
         ctx, task, _Result(_escalation_qc(instruction=""))) == ""
 
 
-def test_repair_is_bounded_to_one_three_draw_batch(app, monkeypatch):
+def test_repair_is_bounded_to_nine_four_draw_batches(app, monkeypatch):
     ctx, task = _ctx_and_task(app, monkeypatch)
     # Codex 每轮给的是不同诊断,合同每次都真的变;这样才走得到上限,
     # 否则第二次修出同一份合同会先被「输入未变化」挡掉。
@@ -156,7 +156,14 @@ def test_repair_is_bounded_to_one_three_draw_batch(app, monkeypatch):
         ctx, task, _Result(_escalation_qc()))
     assert task["payload"]["_codex_contract_repair_count"] == 1
     assert task["payload"]["_auto_repair_batches_used"] == 1
-    # 失败内容不再触发第二轮合同修改/抽卡；三张里直接晋升相对最优稿。
+    # 初始四抽后允许最多 9 个自动修复批次；每批仍由外层候选器固定
+    # 生成 4 张，总上限 10 轮/40 张。超过上限后不再继续付费抽卡。
+    repair_limit = app.director._shot_auto_repair_batches()
+    assert repair_limit == 9
+    for expected in range(2, repair_limit + 1):
+        assert app.director._auto_apply_codex_escalation(
+            ctx, task, _Result(_escalation_qc()))
+        assert task["payload"]["_auto_repair_batches_used"] == expected
     assert app.director._auto_apply_codex_escalation(
         ctx, task, _Result(_escalation_qc())) == ""
 

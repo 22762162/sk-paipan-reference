@@ -853,7 +853,8 @@ def build_instruction(capability, payload, out_dir):
                 stage_line = (
                     "本次是正常质检,不预设结论。仅当你判定不通过时,"
                     "才需要附 codex_escalation:AIFOS 会立即按你给出的"
-                    "新提示词生成3张候选并自动选优,所以 aifos_instructions 必须是"
+                    "下一轮会用同一份新提示词并行生成4张候选、逐张质检后自动选优；"
+                    "总生成上限为10轮（首轮计入），所以 aifos_instructions 必须是"
                     "可以直接拼进下一次生成提示词的完整、唯一、无歧义"
                     "表述,不要写「建议」「可考虑」这类不可执行的话。"
                     "只要重画能救回来就用 targeted_redraw;判定通过则"
@@ -861,7 +862,7 @@ def build_instruction(capability, payload, out_dir):
             elif failures < 2:
                 stage_line = (
                     "本镜此前已失败 1 次:AIFOS 会按你给出的新提示词"
-                    "一次生成3张候选、全部质检后自动选最优，所以 "
+                    "每轮生成4张候选、全部质检后自动选最优，最多10轮，所以 "
                     "aifos_instructions 必须是可直接拼进下一次生成提示词的"
                     "完整、唯一、无歧义表述，不要写"
                     "「建议」「可考虑」这类不可执行的话。只要重画能救回来就用"

@@ -492,7 +492,11 @@ class QcCenter:
         for word in words:
             if word and word in blob:
                 issues.append({
-                    "check": "sensitive", "severity": "error",
+                    # 敏感词用于运营/合规提醒，不是图片、视频或物理合同
+                    # 的制作失败。保留在报告中供人工决策，但不应把一集
+                    # 已完成且技术合格的漫剧改成 qc_failed。
+                    "check": "sensitive", "severity": "warn",
+                    "blocking": False, "advisory_only": True,
                     "shot_no": None, "rerunnable": False,
                     "message": f"检测到敏感词「{word}」",
                 })

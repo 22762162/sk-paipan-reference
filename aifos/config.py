@@ -26,16 +26,17 @@ DEFAULTS = {
         # 质检，也不因视觉判定触发重生成；优先复用断点已有选定稿，缺失
         # 素材只生成一次，随后直接剪辑合成。仍保留文件、时序和音轨完整性。
         "director_autonomy_mode": False,
-        # 创作选片模式:开启后图片/视频**内容**判词不阻断生产。每镜首轮
-        # 固定出4张并由AI自动选优；若视觉排名明确判定4张都不合适，系统
-        # 自动修正提示词后只补抽1批3张，再由AI选最优继续。人工改选仅是
+        # 创作选片模式:图片/视频内容质检保留，但只负责诊断和触发自动
+        # 返修，绝不成为生产闸门。每镜每轮固定并行生成4张，由AI选优；
+        # 若本轮仍不合格，Codex 根据质检原因优化提示词和参考图后进入
+        # 下一轮，最多10轮（首轮计入，总计最多40张）。人工改选仅是
         # 可选覆盖，手机端不承担生产门禁。生成前导演合同检查与文件/解码/
         # 尺寸/音轨技术完整性检查始终开启，不属于本开关范围。
         # 默认开启=升级后的新产线形态(用户定调"不再用阻断式");旧
         # workspace 未保存本键时按新默认生效,显式关闭后按保存值生效。
         "selection_mode": True,
-        # 内容质检独立开关(非选片模式下的独立偏好;选片模式开启时
-        # 二者一律视为关闭,消费方以 selection_mode 优先)
+        # 内容质检独立开关。选片模式只改变其“非阻断、自动返修”行为，
+        # 不再隐式关闭质检；用户显式关闭某类质检时才跳过该类诊断。
         "image_content_qc": True,
         "video_content_qc": True,
         # 每镜关键帧首轮候选张数:当前版本固定 4。AI 会自动
@@ -43,12 +44,14 @@ DEFAULTS = {
         # 门禁，不关闭这个候选排名。排名服务失败时回退第一张
         # 技术可用图并记录风险。人工选择只是可选覆盖，不是生产门禁。
         "shot_candidate_count": 4,
-        # 问题镜头不阻断生产：修正合同/提示词后同词补抽3张
-        # 再选优，最多自动补一批。AI 始终自动选最高分继续；
-        # 都未过则带风险标记晋升最优张，不需要手机端逐张确认。只有
-        # 0 张技术可用图时记 technical_incomplete，仍不阻断其他镜头。
-        "shot_repair_candidate_count": 3,
-        "shot_auto_repair_batches": 1,
+        # 问题镜头不阻断生产：Codex 汇总本轮质检原因，优化提示词并
+        # 重选最合适参考图，每个返修轮仍固定补抽4张再由AI选优。
+        "shot_repair_candidate_count": 4,
+        # 正式语义是“总抽卡轮数”，首轮算第1轮，上限10轮。
+        "shot_max_candidate_rounds": 10,
+        # 兼容旧消费方的“返修批次数”；10轮总数对应最多9个返修批次。
+        # 新代码必须优先读取 shot_max_candidate_rounds，不能把二者相加。
+        "shot_auto_repair_batches": 9,
     },
     # Codex 多实例不注册成多个 Provider，避免破坏现有 routing。旧工作区
     # 没有 profiles 时会自动把 providers.codex 映射成一个兼容 profile；
@@ -289,6 +292,53 @@ def _deep_merge(base, override):
         else:
             out[key] = copy.deepcopy(value)
     return out
+
+
+def _normalize_selection_policy_defaults(data, *, saved=None, overrides=None):
+    """把旧“返修批次”升级为首轮计入的总轮数，且永不超过10轮。
+
+    上一版的正式值固定为 ``repair=3 / batches=1``，因此遇到这组旧默认
+    时直接升级为新产线的10轮，而不是把历史实现细节误当成用户偏好。
+    手工保存过其它旧批次数时仍兼容为 ``批次+1``；正式总轮数字段始终
+    优先。这里只规范内存配置，不覆写用户的 config.json。
+    """
+    defaults = data.setdefault("defaults", {})
+    saved_defaults = (
+        (saved or {}).get("defaults")
+        if isinstance((saved or {}).get("defaults"), dict) else {})
+    override_defaults = (
+        (overrides or {}).get("defaults")
+        if isinstance((overrides or {}).get("defaults"), dict) else {})
+
+    def legacy_rounds(value):
+        try:
+            batches = int(value)
+        except (TypeError, ValueError):
+            return 10
+        # 1 是上一版唯一允许保存的固定值，并非用户选择；自动升级。
+        return 10 if batches == 1 else batches + 1
+
+    if "shot_max_candidate_rounds" in override_defaults:
+        raw_rounds = override_defaults.get("shot_max_candidate_rounds")
+    elif "shot_auto_repair_batches" in override_defaults:
+        raw_rounds = legacy_rounds(
+            override_defaults.get("shot_auto_repair_batches"))
+    elif "shot_max_candidate_rounds" in saved_defaults:
+        raw_rounds = saved_defaults.get("shot_max_candidate_rounds")
+    elif "shot_auto_repair_batches" in saved_defaults:
+        raw_rounds = legacy_rounds(
+            saved_defaults.get("shot_auto_repair_batches"))
+    else:
+        raw_rounds = defaults.get("shot_max_candidate_rounds", 10)
+    try:
+        rounds = int(raw_rounds)
+    except (TypeError, ValueError):
+        rounds = 10
+    rounds = max(1, min(rounds, 10))
+    defaults["shot_repair_candidate_count"] = 4
+    defaults["shot_max_candidate_rounds"] = rounds
+    defaults["shot_auto_repair_batches"] = rounds - 1
+    return data
 
 
 _DEEPSEEK_OFFICIAL_ENDPOINTS = frozenset({
@@ -747,6 +797,8 @@ class Config:
             data = _migrate_saved_deepseek(data)
         if overrides:
             data = _deep_merge(data, overrides)
+        data = _normalize_selection_policy_defaults(
+            data, saved=saved, overrides=overrides)
         data = _strip_inherited_custom_deepseek_thinking(
             data, saved=saved, overrides=overrides)
         # 旧工作区只有 providers.codex：第一路继承原命令/开关，

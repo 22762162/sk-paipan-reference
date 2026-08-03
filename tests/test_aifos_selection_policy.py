@@ -6,6 +6,7 @@ import pytest
 
 from aifos.selection_mode import (
     CANDIDATES_PER_SHOT,
+    MAX_CANDIDATE_ROUNDS,
     MAX_AUTO_REPAIR_BATCHES,
     REPAIR_CANDIDATES_PER_BATCH,
     CandidateResultVersion,
@@ -38,22 +39,23 @@ def _version(**updates):
     return build_candidate_set_version(**facts)
 
 
-def test_selection_mode_closes_content_qc_but_never_preflight_or_integrity():
+def test_selection_mode_keeps_content_qc_nonblocking_and_auto_repairs():
     policy = build_selection_policy(True)
 
     assert policy.selection_mode_enabled is True
-    assert policy.image_content_qc_enabled is False
-    assert policy.video_content_qc_enabled is False
+    assert policy.image_content_qc_enabled is True
+    assert policy.video_content_qc_enabled is True
     assert policy.content_qc_blocking is False
-    assert policy.content_qc_auto_retry is False
+    assert policy.content_qc_auto_retry is True
     assert policy.prompt_review_enabled is True
     assert policy.director_contract_review_enabled is True
     assert policy.technical_integrity_checks_enabled is True
     assert policy.candidates_per_shot == CANDIDATES_PER_SHOT == 4
     assert policy.initial_candidates_per_shot == CANDIDATES_PER_SHOT == 4
     assert policy.repair_candidates_per_batch == \
-        REPAIR_CANDIDATES_PER_BATCH == 3
-    assert policy.max_auto_repair_batches == MAX_AUTO_REPAIR_BATCHES == 1
+        REPAIR_CANDIDATES_PER_BATCH == 4
+    assert policy.max_candidate_rounds == MAX_CANDIDATE_ROUNDS == 10
+    assert policy.max_auto_repair_batches == MAX_AUTO_REPAIR_BATCHES == 9
     assert policy.candidate_ai_ranking_enabled is True
     assert policy.auto_select_best is True
     assert policy.manual_selection_override_allowed is True
@@ -79,23 +81,30 @@ def test_content_qc_remains_observational_when_selection_mode_is_off():
     assert policy.image_content_qc_enabled is True
     assert policy.video_content_qc_enabled is False
     assert policy.content_qc_blocking is False
-    assert policy.content_qc_auto_retry is False
+    assert policy.content_qc_auto_retry is True
 
 
-def test_final_settings_keys_feed_the_policy_and_selection_mode_wins():
+def test_final_settings_keys_feed_nonblocking_qc_and_ten_round_policy():
     policy = selection_policy_from_config({
         "defaults": {
             "selection_mode": True,
             "image_content_qc": True,
             "video_content_qc": True,
             "shot_candidate_count": 4,
+            "shot_repair_candidate_count": 4,
+            "shot_max_candidate_rounds": 10,
+            "shot_auto_repair_batches": 9,
         },
     })
 
     assert policy.selection_mode_enabled is True
-    assert policy.image_content_qc_enabled is False
-    assert policy.video_content_qc_enabled is False
+    assert policy.image_content_qc_enabled is True
+    assert policy.video_content_qc_enabled is True
+    assert policy.content_qc_blocking is False
     assert policy.candidates_per_shot == 4
+    assert policy.repair_candidates_per_batch == 4
+    assert policy.max_candidate_rounds == 10
+    assert policy.max_auto_repair_batches == 9
 
 
 def test_legacy_image_qc_is_only_used_when_new_key_is_absent():
@@ -114,8 +123,9 @@ def test_legacy_image_qc_is_only_used_when_new_key_is_absent():
 def test_empty_legacy_workspace_uses_new_selection_mode_default():
     policy = selection_policy_from_config({})
     assert policy.selection_mode_enabled is True
-    assert policy.image_content_qc_enabled is False
-    assert policy.video_content_qc_enabled is False
+    assert policy.image_content_qc_enabled is True
+    assert policy.video_content_qc_enabled is True
+    assert policy.max_candidate_rounds == 10
 
 
 def test_candidate_count_setting_rejects_any_value_other_than_four():
@@ -148,14 +158,17 @@ def test_content_or_unknown_failure_never_triggers_automatic_retry():
     FailureClass.CONTRACT,
     FailureClass.TECHNICAL_INTEGRITY,
 ])
-def test_problem_shot_gets_exactly_one_nonblocking_repair_batch(failure):
+def test_problem_shot_gets_up_to_nine_nonblocking_repair_batches(failure):
     policy = build_selection_policy(True)
 
     assert should_start_repair_batch(
         failure, completed_repair_batches=0, policy=policy) is True
     assert should_start_repair_batch(
-        failure, completed_repair_batches=1, policy=policy) is False
-    assert policy.repair_candidates_per_batch == 3
+        failure, completed_repair_batches=8, policy=policy) is True
+    assert should_start_repair_batch(
+        failure, completed_repair_batches=9, policy=policy) is False
+    assert policy.repair_candidates_per_batch == 4
+    assert policy.max_candidate_rounds == 10
     assert policy.failed_after_repair_auto_select_best is True
     assert policy.failed_after_repair_marks_risk is True
     assert policy.failure_blocks_pipeline is False
@@ -163,21 +176,37 @@ def test_problem_shot_gets_exactly_one_nonblocking_repair_batch(failure):
     assert policy.failure_blocks_downstream_stage is False
 
 
-def test_repair_batch_policy_is_fixed_to_one_batch():
-    with pytest.raises(ValueError, match="固定为1"):
+def test_total_round_policy_is_capped_at_ten_including_first_round():
+    policy = selection_policy_from_config({
+        "defaults": {"shot_max_candidate_rounds": 10},
+    })
+    assert policy.max_candidate_rounds == 10
+    assert policy.max_auto_repair_batches == 9
+
+    with pytest.raises(ValueError, match="不能超过10"):
         selection_policy_from_config({
-            "defaults": {"shot_auto_repair_batches": 2},
-        })
-    with pytest.raises(ValueError, match="固定为1"):
-        selection_policy_from_config({
-            "defaults": {"shot_auto_repair_batches": 0},
+            "defaults": {"shot_max_candidate_rounds": 11},
         })
 
 
-def test_repair_candidate_count_is_fixed_to_three():
-    with pytest.raises(ValueError, match="固定为3"):
+def test_legacy_repair_batch_setting_never_creates_eleventh_round():
+    legacy = selection_policy_from_config({
+        "defaults": {"shot_auto_repair_batches": 99},
+    })
+    assert legacy.max_candidate_rounds == 10
+    assert legacy.max_auto_repair_batches == 9
+
+    shorter = selection_policy_from_config({
+        "defaults": {"shot_auto_repair_batches": 2},
+    })
+    assert shorter.max_candidate_rounds == 3
+    assert shorter.max_auto_repair_batches == 2
+
+
+def test_repair_candidate_count_is_fixed_to_four():
+    with pytest.raises(ValueError, match="固定为4"):
         selection_policy_from_config({
-            "defaults": {"shot_repair_candidate_count": 2},
+            "defaults": {"shot_repair_candidate_count": 3},
         })
 
 

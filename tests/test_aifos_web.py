@@ -340,6 +340,47 @@ def test_index_and_static(server):
     assert b'/static/app.js' in raw and b'fetch(request)' in raw
 
 
+def test_rule_scope_editor_and_shot_audit_ui_are_shipped(server):
+    status, ctype, app_js = _request(
+        server["port"], "GET", "/static/app.js")
+    assert status == 200 and "javascript" in ctype
+
+    # 剧本确认页同时提供项目级继承规则与仅本集临时规则；两层均使用
+    # API 返回版本做 CAS，不能静默覆盖另一个页面的新修改。
+    for text in (
+            "本剧贯穿规则", "本剧所有集重新生产时共用", "本集临时规则",
+            "只在当前集生效", "当前镜头", "系统基础",
+            "技术硬门不可关闭、降级或覆盖", "故事相位",
+            "显式停用下层创作规则", "data-rule-stack-modality"):
+        assert text.encode() in app_js
+    assert b"ruleScopeEditorsHtml()" in app_js
+    assert b"bindRuleScopeEditors(app, data)" in app_js
+    assert b"/api/project/${projectId}/rules" in app_js
+    assert b"/api/episode/${episodeId}/rules" in app_js
+    assert b"expected_version: state.version" in app_js
+    assert b"error.status === 409" in app_js
+
+    # 镜头表与提示词卡都挂同一规则栈审计：当前时代/相位、逐键来源、
+    # 被覆盖项和技术硬门最终裁决必须可见；接口失败则保留降级说明。
+    assert b'ruleStackAuditPlaceholder(shot, "image", "\xe5\x85\xb3\xe9\x94\xae\xe5\x9b\xbe", "shot_image")' in app_js
+    assert b'ruleStackAuditPlaceholder(shot, "image", "\xe9\xa6\x96\xe5\xb0\xbe\xe5\xb8\xa7", "frames")' in app_js
+    assert b'ruleStackAuditPlaceholder(shot, "video", "\xe8\xa7\x86\xe9\xa2\x91", "videos")' in app_js
+    assert b"ruleStackAuditPlaceholder(shot)" in app_js
+    assert b"bindRuleStackAudits(root, data.episode?.id)" in app_js
+    assert b"/rule-stack?${query}" in app_js
+    for text in ("时代", "相位", "当前生效与来源", "被覆盖项",
+                 "规则审计暂不可用；不影响当前镜头审核"):
+        assert text.encode() in app_js
+
+    status, ctype, style_css = _request(
+        server["port"], "GET", "/static/style.css")
+    assert status == 200 and "css" in ctype
+    for selector in (b".rule-scope-workbench", b".rule-scope-grid",
+                     b".rule-priority-stack", b".rule-hard-lock",
+                     b".rule-stack-audit", b".rule-stack-audit-columns"):
+        assert selector in style_css
+
+
 def test_blocking_svg_url_uses_document_version_to_bust_cache(server):
     app2 = App(server["workspace"])
     try:
@@ -530,7 +571,7 @@ def test_asset_delete_and_video_reference_api(server):
 def test_episode_exposes_image_failures_with_artifact_urls(server):
     """二次 QC 失败必须成为可预览、可定位到镜头的待人工问题。"""
     # 这是旧式严格质检接口的兼容性用例；默认选优模式会把相同历史
-    # 失败自动转成交由系统补抽 3 张，不再暴露人工阻断。
+    # 失败自动转成交由系统逐轮四抽选优，不再暴露人工阻断。
     set_defaults(server["workspace"] / "config.json", {
         "selection_mode": False,
     })

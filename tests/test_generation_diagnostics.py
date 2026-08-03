@@ -93,6 +93,22 @@ def test_hashes_are_stable_and_reference_order_is_significant():
         "当前镜头", refs)
 
 
+def test_reference_hash_changes_when_phase_or_reference_duty_changes():
+    base = [{
+        "index": 1, "uri": "/locked/role.png", "role": "wardrobe",
+        "kind": "character_sheet", "character": "乔安", "phase": "start",
+        "inherits": ["face", "hair"], "excludes": ["camera"],
+        "binding": "锁定本镜起点服装",
+    }]
+    changed_phase = [dict(base[0], phase="end")]
+    changed_duty = [dict(base[0], inherits=["face", "hair", "makeup"])]
+    changed_exclusion = [dict(base[0], excludes=["camera", "pose"])]
+
+    assert reference_hash(base) != reference_hash(changed_phase)
+    assert reference_hash(base) != reference_hash(changed_duty)
+    assert reference_hash(base) != reference_hash(changed_exclusion)
+
+
 def test_retry_decision_blocks_incomplete_or_unchanged_input():
     refs = [{"index": 1, "uri": "/a.png", "role": "identity"}]
     legacy = normalize_generation_diagnostics({

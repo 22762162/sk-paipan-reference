@@ -159,10 +159,14 @@ def test_selection_mode_promotes_best_effort_and_auto_takes_legacy_failure(
     assert items[2]["qc"]["blocking"] is False
     assert items[2]["automatic_repair"] == {
         "owner": "system",
-        "strategy": "optimize_prompt_then_generate_3",
-        "candidate_count": 3,
+        "strategy": "codex_optimize_prompt_refs_then_generate_4",
+        "candidate_count": 4,
+        "max_candidate_rounds": 10,
+        "first_round_included": True,
         "requires_human": False,
-        "label": "系统自动优化提示词并补抽3张，由AI选优",
+        "label": (
+            "Codex自动归因并优化提示词与参考图；每轮生成4张、"
+            "AI选优复检，最多10轮"),
     }
     assert detail["image_failures"] == []
 
@@ -180,10 +184,13 @@ def test_selection_mode_promotes_best_effort_and_auto_takes_legacy_failure(
     assert guidance["issues"] == []
     assert [row["code"] for row in guidance["blockers"]] == [
         "keyframes_pending"]
-    assert "系统自动优化提示词" in guidance["blockers"][0]["message"]
+    assert "Codex 自动归因并优化提示词与参考图" in (
+        guidance["blockers"][0]["message"])
+    assert "每轮并行生成4张" in guidance["blockers"][0]["message"]
+    assert "最多10轮" in guidance["blockers"][0]["message"]
     assert guidance["next_action"] == {
         "action": "resume_keyframes",
-        "label": "系统自动补抽3张并AI选优（1镜）",
+        "label": "自动四抽选优并复检（最多10轮 · 1镜）",
         "count": 1,
     }
     resolve = guidance["actions"]["resolve_image_issues"]
@@ -195,6 +202,33 @@ def test_selection_mode_promotes_best_effort_and_auto_takes_legacy_failure(
     assert "二次质检失败" not in visible_text
     assert "需人工处理" not in visible_text
     assert '"severity": "must_fix"' not in visible_text
+
+
+def test_selection_mode_api_reports_effective_nonblocking_qc_policy(
+        server_factory):
+    port, _ = server_factory(selection_mode=True, legacy_only=True)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    conn.request("GET", "/api/selection-mode")
+    response = conn.getresponse()
+    payload = json.loads(response.read().decode("utf-8"))
+    conn.close()
+
+    assert response.status == 200
+    assert payload["image_content_qc"] is True
+    assert payload["effective_image_content_qc"] is True
+    assert payload["effective_video_content_qc"] is True
+    assert payload["content_qc_blocking"] is False
+    assert payload["content_qc_auto_retry"] is True
+    assert payload["codex_repair_enabled"] is True
+    assert payload["reference_reselection_enabled"] is True
+    assert payload["shot_candidate_count"] == 4
+    assert payload["shot_repair_candidate_count"] == 4
+    assert payload["max_candidate_rounds"] == 10
+    assert payload["first_round_included"] is True
+    assert payload["failure_blocks_other_shots"] is False
+    assert payload["failure_blocks_downstream_stage"] is False
+    assert payload["limit_behavior"] == (
+        "promote_best_with_nonblocking_risk")
 
 
 def test_strict_mode_keeps_legacy_manual_qc_gate(server_factory):

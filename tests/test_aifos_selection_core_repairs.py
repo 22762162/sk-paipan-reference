@@ -107,14 +107,12 @@ def test_shot_content_hash_ignores_derived_continuity_reference():
         director._shot_content_hash(shot, changed_identity)
 
 
-def test_repair_group_generates_three_and_ai_promotes_when_qc_off(tmp_path):
+def test_repair_group_generates_four_and_ai_promotes_passing_candidate(tmp_path):
     director = _director({
         "selection_mode": True, "image_content_qc": True})
     seen = {}
 
     group = _complete_group(tmp_path)
-    group["candidates"] = group["candidates"][:3]
-    group["candidate_count"] = group["expected_count"] = 3
 
     def generate(_capability, payload, _out_dir, _cancel, _qc_spec):
         seen.update(copy.deepcopy(payload))
@@ -128,7 +126,7 @@ def test_repair_group_generates_three_and_ai_promotes_when_qc_off(tmp_path):
 
     assert seen["prompt"] == "revised"
     assert seen["qc_consecutive_failures_base"] == 1
-    assert seen["_gacha_pulls_override"] == 3
+    assert seen["_gacha_pulls_override"] == 4
     assert result.uri == group["candidates"][1]["uri"]
     assert result.data["candidate_group"]["repair_batch"] is True
     assert result.data["selection"]["source"] == "ai"

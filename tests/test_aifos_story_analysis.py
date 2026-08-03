@@ -94,6 +94,23 @@ def test_history_story_builds_its_own_style_without_modern_or_2d_default():
     assert validate_story_analysis(analysis) is None
 
 
+def test_time_travel_story_keeps_multiple_realms_instead_of_global_ming():
+    mixed = {
+        "project_title": "来回穿越",
+        "logline": "现代女主带着手机穿越大明，又回到现代酒店",
+        "characters": [],
+        "scenes": [
+            {"scene_no": 1, "location": "现代酒店", "action": "查看手机"},
+            {"scene_no": 2, "location": "明代宫门", "action": "穿越落地"},
+        ],
+    }
+    context = infer_story_visual_context(mixed)
+    assert context["key"] == "multi_realm"
+    assert {item["id"] for item in context["realms"]}.issuperset({
+        "modern", "ming_history"})
+    assert "当前镜头" in context["era"]
+
+
 def test_unresolved_gender_and_age_stay_reviewable_but_cannot_lock():
     draft = {
         "project_title": "身份待确认",

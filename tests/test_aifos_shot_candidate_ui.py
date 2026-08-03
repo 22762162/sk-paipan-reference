@@ -28,7 +28,12 @@ def test_shot_candidate_statuses_and_ai_auto_selection_rendering_are_present():
         assert status in JS
     assert "function shotCandidateGridHtml(item, editable)" in JS
     assert 'class="shot-candidate-grid"' in JS
-    assert 'const batchLabel = expected === 3 ? "问题镜头补抽3张"' in JS
+    assert "const batchLabel = state.roundLabel" in JS
+    assert "const expected = 4;" in JS
+    assert "group.generation_round" in JS
+    assert "group.max_candidate_rounds" in JS
+    assert "group.current_round_progress" in JS
+    assert "第${generationRound}/${maxCandidateRounds}轮 · ${currentRoundProgress}/4张" in JS
     assert "✓ 正式关键帧" in JS
     assert "AI已自动选优" in JS
     assert "无需手机操作" in JS
@@ -41,8 +46,45 @@ def test_shot_candidate_statuses_and_ai_auto_selection_rendering_are_present():
     assert "等待技术补齐" in JS
     assert "selection.selected_uri || selection.selected_url" in JS
     assert "Array.isArray(group.candidates)" in JS
-    assert "Number(group.expected_count) === 3 ? 3 : 4" in JS
+    assert "Number(group.expected_count) === 3 ? 3 : 4" not in JS
     assert 'item.status === "technical_incomplete";' in JS
+
+
+def test_candidate_round_progress_is_four_per_round_and_legacy_three_is_ignored():
+    helper = JS[
+        JS.index("function shotCandidateGroup"):
+        JS.index("function planItemThumbs")
+    ]
+    result = _run_node(helper + r'''
+      const item = {category: "shot_image", status: "regenerating_candidates",
+        candidate_group: {
+          expected_count: 3,
+          generation_round: 4,
+          max_candidate_rounds: 10,
+          current_round_progress: {completed: 2, total: 4},
+          candidates: [
+            {candidate_index: 1, url: "/artifacts/a.png"},
+            {candidate_index: 2, url: "/artifacts/b.png"},
+          ],
+        }};
+      const state = shotCandidateState(item);
+      console.log(JSON.stringify({
+        expected: state.expected,
+        missing: state.missing,
+        generationRound: state.generationRound,
+        maxCandidateRounds: state.maxCandidateRounds,
+        progress: state.currentRoundProgress,
+        label: state.roundLabel,
+      }));
+    ''')
+    assert result == {
+        "expected": 4,
+        "missing": 2,
+        "generationRound": 4,
+        "maxCandidateRounds": 10,
+        "progress": 2,
+        "label": "第4/10轮 · 2/4张",
+    }
 
 
 def test_best_effort_repair_is_rendered_as_nonblocking_ai_selection():
@@ -80,15 +122,31 @@ def test_best_effort_repair_is_rendered_as_nonblocking_ai_selection():
       }));
     ''')
     assert result["labels"] == [
-        "已补抽3张并AI选优（非阻断风险）",
-        "已补抽3张并AI选优（非阻断风险）",
-        "已补抽3张并AI选优（非阻断风险）",
+        "AI已选相对最优（风险留档，非阻断）",
+        "AI已选相对最优（风险留档，非阻断）",
+        "AI已选相对最优（风险留档，非阻断）",
         "",
     ]
-    assert "已补抽3张并AI选优（非阻断风险）" in \
+    assert "AI已选相对最优（风险留档，非阻断）" in \
         result["selectionBadgeWithoutQc"]
     assert "if (bestEffort)" in JS
-    assert 'if (row.bestEffort) return "已补抽3张并AI选优（非阻断风险）"' in JS
+    assert "if (row.bestEffort) return shotBestEffortLabel(row.item)" in JS
+
+
+def test_tenth_round_best_effort_is_labeled_risk_but_continues():
+    helper = JS[
+        JS.index("const STORYBOARD_KEYFRAME_TRANSIENT_STATUSES"):
+        JS.index("const PLAN_REWORK_STATUSES")
+    ]
+    result = _run_node(helper + r'''
+      const item = {status: "done", candidate_group: {
+        generation_round: 10, max_candidate_rounds: 10,
+        selection: {best_effort_risk: true},
+      }};
+      console.log(JSON.stringify({label: shotBestEffortLabel(item)}));
+    ''')
+    assert result["label"] == (
+        "已到10轮上限 · AI选相对最优（风险留档，继续生产）")
 
 
 def test_episode29_visual_pass_issues_are_grouped_without_red_false_failure():

@@ -115,6 +115,21 @@ CREATE TABLE IF NOT EXISTS documents(
   UNIQUE(episode_id, kind, version)
 );
 
+-- 项目级版本文档。与集级 documents 分表，避免用虚构 episode 承载
+-- 跨集事实，也让项目规则和本集临时规则在存储层就不可能串剧。
+CREATE TABLE IF NOT EXISTS project_documents(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  UNIQUE(project_id, kind, version)
+);
+
+CREATE INDEX IF NOT EXISTS project_documents_latest_idx
+ON project_documents(project_id, kind, version DESC);
+
 -- IP 资产:角色/场景/动作/镜头/Prompt/首尾帧/图片/视频/配音/封面/成片等
 CREATE TABLE IF NOT EXISTS assets(
   id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -627,7 +627,7 @@ def test_over_shoulder_qc_uses_face_for_front_and_silhouette_for_back(app):
 
 
 def test_qc_fail_triggers_auto_redraw(app, tmp_path):
-    """严格QC首败经Codex定向修订后固定生成三候选。"""
+    """严格QC首败经Codex定向修订后固定生成四候选。"""
     image = tmp_path / "shot.png"
     image.write_bytes(_valid_png())
     calls = {"image": [], "qc": []}
@@ -717,14 +717,14 @@ def test_qc_fail_triggers_auto_redraw(app, tmp_path):
                   "_episode_id": "unit-test"}, tmp_path, None,
         {"characters": ["小鹿"], "count": 1, "designs": "",
          "location": "", "action": "", "forbid": []})
-    assert len(calls["image"]) == 4          # 首画 + 同合同三候选
+    assert len(calls["image"]) == 5          # 首画 + 同合同四候选
     for candidate in calls["image"][1:]:
         assert "小鹿是人类女性" in candidate["feedback"]
         assert "【Codex 通知 AIFOS】" in candidate["feedback"]
         assert "只修改当前镜头" in candidate["feedback"]
         assert "【质检原因】" not in candidate["feedback"]
     assert result.qc["passed"] is True
-    assert result.qc["gacha"]["pulls"] == 3
+    assert result.qc["gacha"]["pulls"] == 4
     assert calls["qc"][0]["generation_input"]["scope"]["shot_no"] == 1
     assert calls["qc"][0]["generation_input"]["input_hash"]
     assert result.qc["first_failure"]["input_hash"]
@@ -848,7 +848,7 @@ def _qc_spec():
 
 def test_first_failure_escalates_then_redraws_with_codex_prompt(
         app, tmp_path):
-    """第1张不合格:Codex 改提示词，第二轮固定生成3张并全量选优。"""
+    """第1张不合格:Codex 改提示词，第二轮固定生成4张并全量选优。"""
     image = tmp_path / "first-failed.png"
     image.write_bytes(_valid_png())
     router = _EscalationRouter(image, "targeted_redraw")
@@ -863,27 +863,27 @@ def test_first_failure_escalates_then_redraws_with_codex_prompt(
     assert router.codex_payloads[0]["required_provider"] == "codex"
     assert router.codex_payloads[0]["codex_escalation_context"][
         "consecutive_failures"] == 1
-    # 初版1张 + 同一份 Codex 修订合同候选3张，候选不得提前停止。
-    assert router.calls["image"] == 4
-    # 初检1 + 首败升级1 + 3张候选逐张判分；不再启动第二轮升级。
-    assert router.calls["qc"] == 5
+    # 初版1张 + 同一份 Codex 修订合同候选4张，候选不得提前停止。
+    assert router.calls["image"] == 5
+    # 初检1 + 首败升级1 + 4张候选逐张判分；不再逐候选重复升级。
+    assert router.calls["qc"] == 6
     for candidate in router.image_payloads[1:]:
         feedback = candidate.get("feedback") or ""
         assert "把静态关键帧改为唯一拱手完成瞬间" in feedback
         assert candidate["revision_mode"] == "targeted_qc_fix"
         assert candidate["qc_revision"]["source"] == "codex_escalation"
-    # 三张仍不合格：晋升相对最高分候选并记风险，不转人工确认。
+    # 四张仍不合格：晋升相对最高分候选并记风险，不转人工确认。
     assert result.qc["consecutive_failures"] == 2
     assert result.qc["best_effort_promoted"] is True
     assert result.qc["nonblocking_risk"]["best_effort"] is True
-    assert result.qc["gacha"]["pulls"] == 3
+    assert result.qc["gacha"]["pulls"] == 4
     assert result.qc["gacha"]["select_after_all"] is True
 
 
 def test_contract_repair_auto_applies_then_stops_on_second_failure(
         app, tmp_path):
     """repair_contract 不再是死路:首失败把 Codex 修合同指令自动落到提示词
-    基底，第二轮用同一份新合同固定生成3张并自动择优。
+    基底，第二轮用同一份新合同固定生成4张并自动择优。
 
     旧契约(首失败即停)的死结:Codex 下达了修合同指令,但全仓库没有代码
     执行它——escalation_redraw_block 等着「合同真的改了就放行」,而没有人
@@ -899,7 +899,7 @@ def test_contract_repair_auto_applies_then_stops_on_second_failure(
                   "_episode_id": "unit-test"},
         tmp_path, None, _qc_spec())
 
-    assert router.calls["image"] == 4
+    assert router.calls["image"] == 5
     for candidate in router.image_payloads[1:]:
         prompt = str(candidate.get("prompt") or "")
         assert "【Codex合同修订·必须执行】" in prompt
@@ -1367,7 +1367,7 @@ def test_reference_diagnosis_removes_wrong_manual_ref_before_retry(
         })
 
     assert result.qc["passed"] is True
-    assert len(calls["image"]) == 4
+    assert len(calls["image"]) == 5
     assert all(str(wrong) not in payload.get("reference_images", [])
                for payload in calls["image"][1:])
     assert all(payload.get("reference_manifest") == []
@@ -1573,7 +1573,7 @@ def test_count_mismatch_auto_revises_bad_image_with_locked_references(
                 {"character": "甲", "uri": str(identity)}],
         })
     assert result.qc["passed"] is True
-    assert len(calls["image"]) == 4
+    assert len(calls["image"]) == 5
     revised = calls["image"][1:]
     assert all(row["revision_mode"] == "targeted_qc_fix"
                for row in revised)
@@ -1788,11 +1788,11 @@ def test_reconcile_completed_shot_images_recovers_only_qc_passed_files(app):
     plan = app.director._plan_read(ctx)
     by_id = {item["id"]: item for item in plan["items"]}
     assert by_id["shot:1"]["output_uri"] == str(passed_uri)
-    assert by_id["shot:2"]["status"] == "failed"
+    assert by_id["shot:2"]["status"] == "pending"
     assert by_id["shot:2"]["output_uri"] == str(failed_uri)
-    assert by_id["shot:2"]["qc"]["auto_repair_exhausted"] is True
+    assert by_id["shot:2"]["qc"]["auto_repair_exhausted"] is False
     assert "output_uri" not in by_id["shot:3"]
-    assert by_id["shot:4"]["status"] == "failed"
+    assert by_id["shot:4"]["status"] == "pending"
     assert by_id["shot:4"]["output_uri"] == str(legacy_failed_uri)
     assert by_id["shot:5"]["output_uri"] == str(unchecked_uri)
     assert app.assets.latest(

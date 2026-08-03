@@ -196,6 +196,12 @@ def settings_payload(app):
         app.config, status=codex_status)
     codex_status = dict(codex_status)
     codex_status["profiles"] = list(codex_profiles)
+    try:
+        candidate_rounds = int(app.config.get(
+            "defaults", "shot_max_candidate_rounds", default=10))
+    except (TypeError, ValueError):
+        candidate_rounds = 10
+    candidate_rounds = max(1, min(candidate_rounds, 10))
     return {
         "providers": providers,
         "codex_profiles": codex_profiles,
@@ -209,7 +215,7 @@ def settings_payload(app):
                 "defaults", "parallel_images", default=3),
             "parallel_videos": app.config.get(
                 "defaults", "parallel_videos", default=4),
-            # 创作选片模式三开关+固定候选张数:必须回显,UI 才能反映持久化现状
+            # 内容质检保留但不阻断；每轮四张、总轮数（含首轮）必须回显。
             "selection_mode": _coerce_bool(
                 "selection_mode", app.config.get(
                     "defaults", "selection_mode", default=True)),
@@ -221,10 +227,13 @@ def settings_payload(app):
                     "defaults", "video_content_qc", default=True)),
             "shot_candidate_count": int(app.config.get(
                 "defaults", "shot_candidate_count", default=4)),
-            "shot_repair_candidate_count": int(app.config.get(
-                "defaults", "shot_repair_candidate_count", default=3)),
-            "shot_auto_repair_batches": int(app.config.get(
-                "defaults", "shot_auto_repair_batches", default=1)),
+            "shot_repair_candidate_count": 4,
+            "shot_max_candidate_rounds": candidate_rounds,
+            # 兼容值由正式总轮数推导，绝不与它相加。
+            "shot_auto_repair_batches": candidate_rounds - 1,
+            # 行为位只读回显：质检参与诊断/返修，但不得成为生产闸门。
+            "content_qc_blocking": False,
+            "content_qc_auto_retry": True,
         },
         "icloud_sync": app.icloud_sync.status(),
         "config_path": str(app.workspace.config_path),
@@ -455,7 +464,7 @@ def _coerce_bool(key, value):
 
 
 def set_defaults(config_path, mapping):
-    """写入 defaults 配置(并行路数/创作选片模式/内容质检开关)。"""
+    """写入 defaults（并行度、非阻断质检、四抽与总轮数预算）。"""
     int_keys = {"parallel_images", "parallel_videos"}
     bool_keys = {"selection_mode", "image_content_qc", "video_content_qc"}
     updates = {}
@@ -482,25 +491,47 @@ def set_defaults(config_path, mapping):
                 count = int(value)
             except (TypeError, ValueError):
                 raise AifosError("shot_repair_candidate_count 需为整数")
-            if isinstance(value, bool) or count != 3:
+            if isinstance(value, bool) or count != 4:
                 raise AifosError(
-                    "shot_repair_candidate_count 当前版本固定为 3"
-                    "(问题镜头同词补抽3张)")
-            updates[key] = 3
+                    "shot_repair_candidate_count 当前版本固定为 4"
+                    "(问题镜头每个返修轮生成4张)")
+            updates[key] = 4
+        elif key == "shot_max_candidate_rounds":
+            try:
+                rounds = int(value)
+            except (TypeError, ValueError):
+                raise AifosError("shot_max_candidate_rounds 需为整数")
+            if isinstance(value, bool) or not 1 <= rounds <= 10:
+                raise AifosError(
+                    "shot_max_candidate_rounds 需为 1-10"
+                    "（首轮计入，总计最多40张）")
+            updates[key] = rounds
         elif key == "shot_auto_repair_batches":
             try:
                 batches = int(value)
             except (TypeError, ValueError):
                 raise AifosError("shot_auto_repair_batches 需为整数")
-            if isinstance(value, bool) or batches != 1:
+            if isinstance(value, bool) or not 0 <= batches <= 9:
                 raise AifosError(
-                    "shot_auto_repair_batches 当前版本固定为 1"
-                    "(最多自动补抽一批)")
-            updates[key] = 1
+                    "shot_auto_repair_batches 需为 0-9"
+                    "(兼容字段；总轮数=返修批次+首轮)")
+            updates[key] = batches
         else:
             raise AifosError(f"不支持的默认项: {key}")
     if not updates:
         raise AifosError("没有要保存的默认项")
+    # 两个键是同一预算的两种表达，不能相加。正式总轮数优先；只收到
+    # 旧字段时同步迁移为明确总轮数，避免旧客户端请求制造第11轮。
+    if "shot_max_candidate_rounds" in updates:
+        expected_batches = updates["shot_max_candidate_rounds"] - 1
+        supplied_batches = updates.get("shot_auto_repair_batches")
+        if supplied_batches is not None and supplied_batches != expected_batches:
+            raise AifosError(
+                "shot_max_candidate_rounds 与 shot_auto_repair_batches 冲突")
+        updates["shot_auto_repair_batches"] = expected_batches
+    elif "shot_auto_repair_batches" in updates:
+        updates["shot_max_candidate_rounds"] = (
+            updates["shot_auto_repair_batches"] + 1)
     data = _load_file(config_path)
     data.setdefault("defaults", {}).update(updates)
     _save_file(config_path, data)

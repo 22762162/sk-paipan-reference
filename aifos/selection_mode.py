@@ -3,13 +3,13 @@
 这个模块刻意不依赖数据库、文件系统或 Web 层。调用方可以先用这里的
 不可变决策建立任务，再自行决定如何持久化：
 
-* 内容视觉质检只提供非阻断观察，不能自动返工或卡住生产；
-* 创作选片模式开启时，图片和视频内容视觉质检均关闭；
+* 内容视觉质检保留并负责触发自动返修，但不能卡住其他镜头或阶段；
 * 提示词、导演合同和技术完整性检查始终开启；
 * 首次每镜固定产生四个同合同候选，AI 自动选优晋升；
   人工仍可覆盖选择，但不再是生产门禁；
-* 内容/合同问题允许自动修复后补抽三张，但最多只补一批；
-* 补抽后 AI 始终自动选最高分继续；都未过时标记风险后仍晋升最优张；
+* 内容/合同问题由 Codex 汇总原因、优化提示词和参考图后，每轮补抽四张；
+* 首轮也计入抽卡轮数，最多十轮（九个返修批次、四十张）；
+* 每轮 AI 自动选最高分复检，合格即收口，达到上限则标记风险并晋升最优张；
 * 只有零张技术可用图时记 ``technical_incomplete``，且不阻断其他镜头；
 * 网络/API 等技术失败仍可以做候选槽位级重试；
 * 旧版本任务迟到时不得覆盖当前正式资产。
@@ -24,10 +24,12 @@ from enum import Enum
 from typing import Any, Mapping, Optional, Union
 
 
-SELECTION_POLICY_SCHEMA = "aifos.selection-policy/v1"
+SELECTION_POLICY_SCHEMA = "aifos.selection-policy/v2"
 CANDIDATES_PER_SHOT = 4
-REPAIR_CANDIDATES_PER_BATCH = 3
-MAX_AUTO_REPAIR_BATCHES = 1
+REPAIR_CANDIDATES_PER_BATCH = 4
+MAX_CANDIDATE_ROUNDS = 10
+# 兼容旧字段。首轮计入 MAX_CANDIDATE_ROUNDS，因此最多只有9个返修批次。
+MAX_AUTO_REPAIR_BATCHES = MAX_CANDIDATE_ROUNDS - 1
 CANDIDATE_VERSION_SCHEMA = "aifos.candidate-set/v1"
 SELECTION_SOURCES = frozenset(("manual", "ai"))
 
@@ -75,6 +77,7 @@ class SelectionModePolicy:
     initial_candidates_per_shot: int
     candidates_per_shot: int
     repair_candidates_per_batch: int
+    max_candidate_rounds: int
     max_auto_repair_batches: int
     candidate_ai_ranking_enabled: bool
     auto_select_best: bool
@@ -98,12 +101,13 @@ def build_selection_policy(
         video_content_qc_requested: bool = True,
         initial_candidates_per_shot: int = CANDIDATES_PER_SHOT,
         repair_candidates_per_batch: int = REPAIR_CANDIDATES_PER_BATCH,
-        max_auto_repair_batches: int = MAX_AUTO_REPAIR_BATCHES,
+        max_candidate_rounds: int = MAX_CANDIDATE_ROUNDS,
+        max_auto_repair_batches: Optional[int] = None,
 ) -> SelectionModePolicy:
     """解析选片策略，同时保护不可关闭的前置与技术检查。
 
-    非选片模式可以保留内容观察，但内容观察在新架构里仍然不能阻断或
-    触发自动返工。开启选片模式则强制关闭两种内容视觉质检。
+    内容质检是否执行由独立开关决定；选片模式不再把质检关闭，只保证
+    质检非阻断，并允许失败镜头在自己的最多十轮预算内自动返修。
     """
     selection_mode_enabled = bool(selection_mode_enabled)
     initial_candidates = _positive_int(
@@ -115,20 +119,28 @@ def build_selection_policy(
         field="repair_candidates_per_batch",
     )
     if repair_candidates != REPAIR_CANDIDATES_PER_BATCH:
-        raise ValueError("问题镜头自动补抽当前固定为3张")
-    repair_batches = _nonnegative_int(
-        max_auto_repair_batches, field="max_auto_repair_batches")
-    if repair_batches != MAX_AUTO_REPAIR_BATCHES:
-        raise ValueError("自动修复/补抽当前固定为1批")
+        raise ValueError("问题镜头每个返修轮当前固定为4张")
+    candidate_rounds = _positive_int(
+        max_candidate_rounds, field="max_candidate_rounds")
+    if candidate_rounds > MAX_CANDIDATE_ROUNDS:
+        raise ValueError("总抽卡轮数不能超过10轮（首轮计入）")
+    # 旧调用方可能仍传 max_auto_repair_batches。它只能缩小轮数预算，
+    # 且永远钳制到9批；绝不能与总轮数相加制造第11轮。
+    if max_auto_repair_batches is not None:
+        legacy_batches = min(
+            _nonnegative_int(
+                max_auto_repair_batches, field="max_auto_repair_batches"),
+            MAX_AUTO_REPAIR_BATCHES,
+        )
+        candidate_rounds = min(candidate_rounds, legacy_batches + 1)
+    repair_batches = candidate_rounds - 1
     return SelectionModePolicy(
         schema=SELECTION_POLICY_SCHEMA,
         selection_mode_enabled=selection_mode_enabled,
-        image_content_qc_enabled=(
-            bool(image_content_qc_requested) and not selection_mode_enabled),
-        video_content_qc_enabled=(
-            bool(video_content_qc_requested) and not selection_mode_enabled),
+        image_content_qc_enabled=bool(image_content_qc_requested),
+        video_content_qc_enabled=bool(video_content_qc_requested),
         content_qc_blocking=False,
-        content_qc_auto_retry=False,
+        content_qc_auto_retry=True,
         prompt_review_enabled=True,
         director_contract_review_enabled=True,
         technical_integrity_checks_enabled=True,
@@ -136,9 +148,10 @@ def build_selection_policy(
         # 保留旧字段，避免已有消费方误把补抽张数当成首轮张数。
         candidates_per_shot=initial_candidates,
         repair_candidates_per_batch=repair_candidates,
+        max_candidate_rounds=candidate_rounds,
         max_auto_repair_batches=repair_batches,
         # 候选视觉排名与“质检是否通过”是两件事。关闭内容
-        # QC 只关闭通过/返工门禁，不关闭 AI 在4张或3张里选优。
+        # QC 只关闭生产门禁，不关闭 AI 在每轮4张里选优。
         candidate_ai_ranking_enabled=True,
         auto_select_best=True,
         manual_selection_override_allowed=True,
@@ -176,8 +189,9 @@ def selection_policy_from_config(
 
     正式键位于 ``defaults``：``selection_mode``、
     ``image_content_qc``、``video_content_qc``、
-    ``shot_candidate_count``、``shot_repair_candidate_count`` 和
-    ``shot_auto_repair_batches``。旧工作区没有
+    ``shot_candidate_count``、``shot_repair_candidate_count`` 和正式键
+    ``shot_max_candidate_rounds``。旧 ``shot_auto_repair_batches`` 只在
+    正式总轮数字段缺失时兼容读取，并钳制为最多9批。旧工作区没有
     ``image_content_qc`` 时才回退
     到 ``image_qc``；候选数不是 4 时拒绝启动新策略，避免静默回到不同
     镜头不同张数的旧行为。
@@ -216,22 +230,33 @@ def selection_policy_from_config(
     )
     if repair_candidate_count != REPAIR_CANDIDATES_PER_BATCH:
         raise ValueError(
-            "defaults.shot_repair_candidate_count 当前只允许固定为3")
-    auto_repair_batches = _nonnegative_int(
-        defaults.get(
-            "shot_auto_repair_batches", MAX_AUTO_REPAIR_BATCHES),
-        field="defaults.shot_auto_repair_batches",
-    )
-    if auto_repair_batches != MAX_AUTO_REPAIR_BATCHES:
-        raise ValueError(
-            "defaults.shot_auto_repair_batches 当前只允许固定为1")
+            "defaults.shot_repair_candidate_count 当前只允许固定为4")
+    if "shot_max_candidate_rounds" in defaults:
+        candidate_rounds = _positive_int(
+            defaults.get("shot_max_candidate_rounds"),
+            field="defaults.shot_max_candidate_rounds",
+        )
+        if candidate_rounds > MAX_CANDIDATE_ROUNDS:
+            raise ValueError(
+                "defaults.shot_max_candidate_rounds 不能超过10")
+    elif "shot_auto_repair_batches" in defaults:
+        legacy_batches = min(
+            _nonnegative_int(
+                defaults.get("shot_auto_repair_batches"),
+                field="defaults.shot_auto_repair_batches",
+            ),
+            MAX_AUTO_REPAIR_BATCHES,
+        )
+        candidate_rounds = legacy_batches + 1
+    else:
+        candidate_rounds = MAX_CANDIDATE_ROUNDS
     return build_selection_policy(
         selection_mode,
         image_content_qc_requested=image_content_qc,
         video_content_qc_requested=video_content_qc,
         initial_candidates_per_shot=candidate_count,
         repair_candidates_per_batch=repair_candidate_count,
-        max_auto_repair_batches=auto_repair_batches,
+        max_candidate_rounds=candidate_rounds,
     )
 
 

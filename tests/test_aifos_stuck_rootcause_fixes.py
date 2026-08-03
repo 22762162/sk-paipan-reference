@@ -234,7 +234,7 @@ def test_reconcile_migrates_recoverable_awaiting_human_to_auto_retry(app):
            "storyboard": storyboard}
     result = app.director.reconcile_completed_shot_images(ctx)
 
-    assert result["autonomous_retry"] == 0
+    assert result["autonomous_retry"] == 2
     assert result["awaiting_human"] == 0
     assert result["awaiting_human_shots"] == []
     refreshed = json.loads(plan_path.read_text(encoding="utf-8"))

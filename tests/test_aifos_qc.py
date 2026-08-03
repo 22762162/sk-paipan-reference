@@ -553,7 +553,7 @@ def test_partial_candidate_group_ai_selects_and_only_zero_is_incomplete(
         app.close()
 
 
-def test_all_four_explicit_failures_trigger_one_three_candidate_repair(
+def test_all_four_explicit_failures_trigger_four_candidate_repair_until_pass(
         tmp_path, monkeypatch):
     app = App(tmp_path / "ws")
     try:
@@ -561,8 +561,8 @@ def test_all_four_explicit_failures_trigger_one_three_candidate_repair(
             tmp_path, expected=4, available=4, passed=False,
             revision=1, cost=4.0)
         repaired = _candidate_result(
-            tmp_path, expected=3, available=3, passed=False,
-            revision=2, cost=3.0)
+            tmp_path, expected=4, available=4, passed=True,
+            revision=2, cost=4.0)
         queue = [initial, repaired]
         calls = []
 
@@ -591,16 +591,123 @@ def test_all_four_explicit_failures_trigger_one_three_candidate_repair(
         assert result.uri.endswith("r2-candidate-1.svg")
         group = result.data["candidate_group"]
         assert group["repair_batch"] is True
-        assert group["expected_count"] == 3
-        assert group["initial_candidate_count"] == 4
-        assert group["initial_all_failed"] is True
-        assert "只修正主体动作" in group["repair_instruction"]
-        assert result.cost == 7.5
+        assert group["expected_count"] == 4
+        assert group["generation_round"] == 2
+        assert group["max_candidate_rounds"] == 10
+        assert len(group["candidate_round_history"]) == 2
+        assert result.cost == 8.5
     finally:
         app.close()
 
 
-def test_three_draw_repair_replaces_conflicting_old_static_contract(
+def test_candidate_repair_stops_immediately_when_round_seven_has_pass(
+        tmp_path, monkeypatch):
+    app = App(tmp_path / "ws")
+    try:
+        queue = [
+            _candidate_result(
+                tmp_path, expected=4, available=4,
+                passed=round_no == 7, revision=round_no, cost=4.0)
+            for round_no in range(1, 8)
+        ]
+        calls = []
+        reference_rounds = []
+
+        def generate(_capability, payload, _out_dir, _cancel, qc_spec):
+            calls.append(copy.deepcopy(payload))
+            return queue.pop(0)
+
+        def escalate(report, *_args, **_kwargs):
+            report = dict(report)
+            round_no = int(report["consecutive_failures"])
+            report["codex_escalation"] = {
+                "instruction_to_aifos":
+                    f"第{round_no + 1}轮改用清晰可拍的静态构图"}
+            return report, 0.1
+
+        def adjust(_payload, _qc_spec, _diagnostics, **_kwargs):
+            reference_rounds.append(len(reference_rounds) + 1)
+            return {"applied": [], "skipped": []}
+
+        monkeypatch.setattr(app.director, "_generate_image_gacha", generate)
+        monkeypatch.setattr(
+            app.director, "_escalate_failed_image_to_codex", escalate)
+        monkeypatch.setattr(
+            app.director, "_apply_image_reference_adjustments", adjust)
+
+        result = app.director._generate_shot_candidate_group(
+            "image", {
+                "_episode_id": "episode-test", "shot_no": 7,
+                "_candidate_revision": 1, "_contract_revision": 1,
+                "prompt": "第1轮镜头合同",
+            }, tmp_path, None, {})
+
+        assert len(calls) == 7
+        assert len(reference_rounds) == 6
+        assert result.qc["passed"] is True
+        group = result.data["candidate_group"]
+        assert group["generation_round"] == 7
+        assert group["round_status"] == "qualified"
+        assert group["total_generated_candidates"] == 28
+        assert len(group["candidate_round_history"]) == 7
+        assert queue == []
+    finally:
+        app.close()
+
+
+def test_candidate_repair_caps_at_ten_rounds_and_promotes_best_without_gate(
+        tmp_path, monkeypatch):
+    app = App(tmp_path / "ws")
+    try:
+        queue = [
+            _candidate_result(
+                tmp_path, expected=4, available=4, passed=False,
+                revision=round_no, cost=4.0)
+            for round_no in range(1, 11)
+        ]
+        calls = []
+
+        def generate(_capability, payload, _out_dir, _cancel, _qc_spec):
+            calls.append(copy.deepcopy(payload))
+            return queue.pop(0)
+
+        def escalate(report, *_args, **_kwargs):
+            report = dict(report)
+            round_no = int(report["consecutive_failures"])
+            report["codex_escalation"] = {
+                "instruction_to_aifos":
+                    f"第{round_no + 1}轮替换为另一种物理可拍方案"}
+            return report, 0.1
+
+        monkeypatch.setattr(app.director, "_generate_image_gacha", generate)
+        monkeypatch.setattr(
+            app.director, "_escalate_failed_image_to_codex", escalate)
+
+        result = app.director._generate_shot_candidate_group(
+            "image", {
+                "_episode_id": "episode-test", "shot_no": 10,
+                "_candidate_revision": 1, "_contract_revision": 1,
+                "prompt": "高难镜头合同",
+            }, tmp_path, None, {})
+
+        assert len(calls) == 10
+        assert queue == []
+        assert [row["_candidate_generation_round"] for row in calls] == \
+            list(range(1, 11))
+        assert all(row["_gacha_pulls_override"] == 4 for row in calls)
+        assert result.uri
+        assert result.qc["best_effort_promoted"] is True
+        group = result.data["candidate_group"]
+        assert group["round_status"] == "exhausted"
+        assert group["repair_exhausted"] is True
+        assert group["max_candidate_rounds"] == 10
+        assert group["total_generated_candidates"] == 40
+        assert len(group["candidate_round_history"]) == 10
+    finally:
+        app.close()
+
+
+def test_four_draw_repair_replaces_conflicting_old_static_contract(
         tmp_path, monkeypatch):
     """Regression: episode 29 shot 02 must not append to its five-person text."""
     app = App(tmp_path / "ws")
@@ -615,8 +722,8 @@ def test_three_draw_repair_replaces_conflicting_old_static_contract(
                 "画面总人数同时规定严格5人和最新严格2人",
             ]
         repaired = _candidate_result(
-            tmp_path, expected=3, available=3, passed=False,
-            revision=2, cost=3.0)
+            tmp_path, expected=4, available=4, passed=True,
+            revision=2, cost=4.0)
         queue = [initial, repaired]
         calls = []
 
@@ -690,13 +797,14 @@ def test_three_draw_repair_replaces_conflicting_old_static_contract(
         assert len(calls) == 2
         repair_payload, repair_qc = calls[1]
         sent = repair_payload["prompt_compact"]
-        assert sent.startswith("【返工静态合同v1】")
+        assert sent.startswith("【镜头合同v2.2】")
+        assert "只生成当前镜头递交完成后的唯一静态终点" in sent
         assert old_prompt not in sent
         assert "严格共5人" not in sent
         assert "小吴清醒驾驶" not in sent
         assert "小吴加速" not in sent
         assert "右手持亮屏手机显示23:10" not in sent
-        assert "画面严格共2人" in sent
+        assert "画面严格仅2名真人" in sent
         assert repair_payload["feedback"] == ""
         assert repair_payload["visible_figure_count"] == 2
         assert repair_payload["functional_figures"] == [{
@@ -708,10 +816,10 @@ def test_three_draw_repair_replaces_conflicting_old_static_contract(
             "visible_figure_count"] == 2
         assert repair_qc["count"] == 2
         assert repair_qc["readable_text"] == {}
-        assert result.data["candidate_group"]["expected_count"] == 3
+        assert result.data["candidate_group"]["expected_count"] == 4
         assert result.data["candidate_group"]["selection"]["source"] == "ai"
         assert result.data["candidate_group"]["selection"][
-            "best_effort_risk"] is True
-        assert result.qc["best_effort_promoted"] is True
+            "best_effort_risk"] is False
+        assert result.qc["best_effort_promoted"] is False
     finally:
         app.close()

@@ -7,6 +7,9 @@ API:
   GET  /api/episode/<id>        单集详情(阶段/剧本/分镜/质检/产物索引)
   GET  /api/episode/<id>/status 单集轻量变更摘要(用于手机端轮询)
   GET  /api/episode/<id>/prompts 逐镜最高规则提示词与 PASS/WARN/BLOCK
+  GET  /api/project/<id>/rules  项目跨集创作规则包
+  GET  /api/episode/<id>/rules  本集临时创作规则包
+  GET  /api/episode/<id>/rule-stack?shot_no=N 当前镜头生效规则栈
   GET  /api/assets?project=T    项目资产列表
   GET  /api/logs?limit=N        最近日志
   GET  /api/jobs  /api/jobs/<id>后台制作任务
@@ -45,7 +48,14 @@ from ..updater import (check_and_update, current_build, repo_root,
                        restart_process, start_auto_updater)
 from ..errors import AifosError
 from ..quality_policy import normalize_quality, normalize_quality_policy
-from ..selection_mode import CANDIDATES_PER_SHOT
+from ..project_center import DocumentConflictError
+from ..rule_governance import MANDATORY_GATE_IDS
+from ..selection_mode import (
+    CANDIDATES_PER_SHOT,
+    MAX_CANDIDATE_ROUNDS,
+    REPAIR_CANDIDATES_PER_BATCH,
+    build_selection_policy,
+)
 from ..prompt_review import build_episode_prompt_review
 from ..scene_render import build_scene_render_contract
 from ..smart_input import resolve_produce_target
@@ -56,6 +66,7 @@ from ..story_intelligence import (
     derive_episode_continuity_input,
     review_document,
 )
+from ..workflow import production_profile
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -78,6 +89,205 @@ MIME = {
     ".mp3": "audio/mpeg",
     ".wav": "audio/wav",
 }
+
+CREATIVE_RULE_PACK_SCHEMA = "aifos.creative-rule-pack/v1"
+PROJECT_RULE_SCOPE = "project_series"
+EPISODE_RULE_SCOPE = "episode_temporary"
+_RULE_REQUEST_META = frozenset({
+    "expected_version", "project_id", "episode_id", "version", "content",
+})
+_PROTECTED_RULE_PREFIXES = ("technical", "provider", "quality.gate")
+_DISABLE_WORDS = frozenset({
+    "disable", "disabled", "off", "false", "skip", "bypass", "suppress",
+    "suppressed", "override", "replace", "warning", "warn", "advisory",
+})
+
+
+def _rule_identifier(value):
+    return re.sub(r"[^a-z0-9]+", ".", str(value or "").strip().lower()).strip(".")
+
+
+def _protected_rule_target(value):
+    identifier = _rule_identifier(value)
+    if not identifier:
+        return False
+    if identifier in MANDATORY_GATE_IDS:
+        return True
+    if any(identifier == prefix or identifier.startswith(prefix + ".")
+           for prefix in _PROTECTED_RULE_PREFIXES):
+        return True
+    parts = identifier.split(".")
+    return bool(set(parts) & MANDATORY_GATE_IDS
+                and any(part in ("gate", "gates", "quality", "quality_gate")
+                        for part in parts))
+
+
+def _rule_attempts_disable_or_override(rule):
+    if not isinstance(rule, dict):
+        return False
+    if rule.get("enabled") is False or rule.get("value") is False:
+        return True
+    for key in ("disabled", "disable", "bypass", "suppress", "override",
+                "replace"):
+        if rule.get(key):
+            return True
+    severity = rule.get("severity")
+    if severity is not None and str(severity).strip().lower() != "block":
+        return True
+    for key in ("action", "effect", "mode", "operation", "value"):
+        value = rule.get(key)
+        if (isinstance(value, str)
+                and value.strip().lower() in _DISABLE_WORDS):
+            return True
+    return False
+
+
+def _validate_protected_gate_overrides(value, path="content"):
+    """拒绝规则包中任何关闭/降级系统技术硬门的结构化表达。"""
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_protected_gate_overrides(item, f"{path}.{index}")
+        return
+    if not isinstance(value, dict):
+        return
+
+    target = value.get("key") or value.get("id") or value.get("target")
+    category = value.get("category")
+    if ((_protected_rule_target(target) or _protected_rule_target(category))
+            and _rule_attempts_disable_or_override(value)):
+        raise AifosError(
+            f"{path} 不能关闭、降级或覆盖系统技术硬门: "
+            f"{target or category}")
+
+    # 同时兼容 quality_gates: [{id,...}] 和 quality_gates: {people: ...}。
+    for key, child in value.items():
+        child_path = f"{path}.{key}"
+        if (_protected_rule_target(key)
+                and ((child is False)
+                     or _rule_attempts_disable_or_override(
+                         child if isinstance(child, dict)
+                         else {"value": child}))):
+            raise AifosError(
+                f"{child_path} 不能关闭、降级或覆盖系统技术硬门")
+        if key in ("quality_gates", "technical_gates", "provider_gates") \
+                and isinstance(child, dict):
+            for gate_id, setting in child.items():
+                if (_protected_rule_target(gate_id)
+                        and ((setting is False)
+                             or _rule_attempts_disable_or_override(
+                                 setting if isinstance(setting, dict)
+                                 else {"value": setting}))):
+                    raise AifosError(
+                        f"{child_path}.{gate_id} 不能关闭、降级或覆盖系统技术硬门")
+        _validate_protected_gate_overrides(child, child_path)
+
+
+def _normalize_creative_rule_pack(content, scope):
+    if not isinstance(content, dict):
+        raise AifosError("content 必须是创作规则包对象")
+    pack = copy.deepcopy(content)
+    schema = pack.get("schema", CREATIVE_RULE_PACK_SCHEMA)
+    if schema != CREATIVE_RULE_PACK_SCHEMA:
+        raise AifosError(f"规则包 schema 必须为 {CREATIVE_RULE_PACK_SCHEMA}")
+    submitted_scope = pack.get("scope", scope)
+    if submitted_scope != scope:
+        raise AifosError(f"规则包 scope 必须为 {scope}")
+    rules = pack.get("rules", [])
+    suppressions = pack.get("suppressions", [])
+    if not isinstance(rules, list):
+        raise AifosError("rules 必须是数组")
+    if not isinstance(suppressions, list):
+        raise AifosError("suppressions 必须是数组")
+    for index, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            raise AifosError(f"rules.{index} 必须是对象")
+        if "enabled" in rule and not isinstance(rule["enabled"], bool):
+            raise AifosError(f"rules.{index}.enabled 必须是布尔值")
+    for index, suppression in enumerate(suppressions):
+        target = (suppression if isinstance(suppression, str) else
+                  (suppression.get("target") or suppression.get("key")
+                   or suppression.get("rule_key") or suppression.get("id"))
+                  if isinstance(suppression, dict) else "")
+        if not isinstance(suppression, (str, dict)):
+            raise AifosError(f"suppressions.{index} 必须是字符串或对象")
+        if _protected_rule_target(target):
+            raise AifosError(
+                f"suppressions.{index} 不能抑制系统技术硬门: {target}")
+    pack["schema"] = CREATIVE_RULE_PACK_SCHEMA
+    pack["scope"] = scope
+    pack["rules"] = rules
+    pack["suppressions"] = suppressions
+    _validate_protected_gate_overrides(pack)
+    return pack
+
+
+def _creative_rule_request(body, scope):
+    if "content" in body:
+        raw = body["content"]
+    else:
+        raw = {key: value for key, value in body.items()
+               if key not in _RULE_REQUEST_META}
+    return _normalize_creative_rule_pack(raw, scope)
+
+
+def _creative_pack_binding_error(pack, project_id, episode_id=None):
+    """检查包及逐条旧式 binding；真正归属仍由数据库记录注入。"""
+    rows = [("content", pack)]
+    rows.extend(
+        (f"content.rules.{index}", rule)
+        for index, rule in enumerate(pack.get("rules") or [])
+        if isinstance(rule, dict))
+    rows.extend(
+        (f"content.suppressions.{index}", suppression)
+        for index, suppression in enumerate(pack.get("suppressions") or [])
+        if isinstance(suppression, dict))
+    for path, row in rows:
+        binding = row.get("binding")
+        binding = binding if isinstance(binding, dict) else {}
+        bound_project = row.get("project_id", binding.get("project_id"))
+        bound_episode = row.get("episode_id", binding.get("episode_id"))
+        if (bound_project is not None
+                and (isinstance(bound_project, bool)
+                     or str(bound_project).strip() != str(project_id))):
+            return f"{path}.project_id 与 URL/剧集所属项目不一致"
+        if episode_id is None:
+            if bound_episode is not None:
+                return f"{path}.episode_id 不能写入项目级规则包"
+        elif (bound_episode is not None
+              and (isinstance(bound_episode, bool)
+                   or str(bound_episode).strip() != str(episode_id))):
+            return f"{path}.episode_id 与 URL 剧集不一致"
+    return ""
+
+
+def _empty_rule_pack(scope):
+    return {
+        "schema": CREATIVE_RULE_PACK_SCHEMA,
+        "scope": scope,
+        "rules": [],
+        "suppressions": [],
+    }
+
+
+def _rule_pack_payload(content, version, *, project_id, episode_id=None,
+                       kind):
+    pack = copy.deepcopy(content) if isinstance(content, dict) \
+        else _empty_rule_pack(
+            EPISODE_RULE_SCOPE if episode_id is not None else PROJECT_RULE_SCOPE)
+    payload = {
+        "project_id": int(project_id),
+        "kind": kind,
+        "version": int(version or 0),
+        "content": pack,
+        # 展平常用字段，GET 后可直接编辑并原样 POST；content 保留稳定信封。
+        "schema": pack.get("schema", CREATIVE_RULE_PACK_SCHEMA),
+        "scope": pack.get("scope"),
+        "rules": copy.deepcopy(pack.get("rules") or []),
+        "suppressions": copy.deepcopy(pack.get("suppressions") or []),
+    }
+    if episode_id is not None:
+        payload["episode_id"] = int(episode_id)
+    return payload
 
 
 def _private_lan_addresses():
@@ -641,8 +851,9 @@ def _selection_mode_present_item(item):
     """把旧阻断状态转换为选优模式的非人工状态（仅修改传入副本）。
 
     有当前选片或 best-effort 晋升凭证的技术可用稿视为完成；旧版只有
-    ``qc=false``、却没有有效选片凭证的镜头交回系统自动修合同并补抽
-    3 张。零张技术产物才显示 ``technical_incomplete``。磁盘上的历史
+    ``qc=false``、却没有有效选片凭证的镜头交回系统：先由 Codex 汇总
+    问题、优化提示词与参考图，再进入下一轮四张候选。首轮计入总轮数，
+    最多十轮。零张技术产物才显示 ``technical_incomplete``。磁盘上的历史
     计划不在这里改写，方便审计和后续 Director 续产接管。
     """
     if not isinstance(item, dict):
@@ -684,15 +895,21 @@ def _selection_mode_present_item(item):
     if technical_output:
         item["status"] = "pending"
         strategy = (
-            "optimize_prompt_then_generate_3"
+            "codex_optimize_prompt_refs_then_generate_4"
             if category == "shot_image" else "regenerate_frames")
         item["automatic_repair"] = {
             "owner": "system",
             "strategy": strategy,
-            "candidate_count": 3 if category == "shot_image" else 0,
+            "candidate_count": (
+                REPAIR_CANDIDATES_PER_BATCH
+                if category == "shot_image" else 0),
+            "max_candidate_rounds": (
+                MAX_CANDIDATE_ROUNDS if category == "shot_image" else 0),
+            "first_round_included": category == "shot_image",
             "requires_human": False,
             "label": (
-                "系统自动优化提示词并补抽3张，由AI选优"
+                "Codex自动归因并优化提示词与参考图；每轮生成4张、"
+                "AI选优复检，最多10轮"
                 if category == "shot_image" else "系统自动重生成首尾帧"),
         }
     else:
@@ -700,7 +917,12 @@ def _selection_mode_present_item(item):
         item["automatic_repair"] = {
             "owner": "system",
             "strategy": "retry_technical_generation",
-            "candidate_count": 3 if category == "shot_image" else 0,
+            "candidate_count": (
+                REPAIR_CANDIDATES_PER_BATCH
+                if category == "shot_image" else 0),
+            "max_candidate_rounds": (
+                MAX_CANDIDATE_ROUNDS if category == "shot_image" else 0),
+            "first_round_included": category == "shot_image",
             "requires_human": False,
             "label": "系统自动重试技术生成",
         }
@@ -712,7 +934,7 @@ def _selection_mode_payload(app):
 
 
 def _selection_mode_payload_from_config(config):
-    """用设置层唯一布尔解析器回显选片设置，候选数永远钳制为四。"""
+    """回显请求值和真正生效的非阻断质检/候选策略。"""
     # 延迟导入避免 Web 启动时扩大 settings 的导入链；这里复用保存接口的
     # 唯一布尔语义，不能再用 bool("false") 这种会误判为 True 的写法。
     from ..settings import _coerce_bool
@@ -721,13 +943,37 @@ def _selection_mode_payload_from_config(config):
         return _coerce_bool(
             key, config.get("defaults", key, default=default))
 
+    selection_mode = flag("selection_mode", True)
+    image_content_qc = flag("image_content_qc", True)
+    video_content_qc = flag("video_content_qc", True)
+    policy = build_selection_policy(
+        selection_mode,
+        image_content_qc_requested=image_content_qc,
+        video_content_qc_requested=video_content_qc,
+        initial_candidates_per_shot=CANDIDATES_PER_SHOT,
+        repair_candidates_per_batch=REPAIR_CANDIDATES_PER_BATCH,
+        max_candidate_rounds=MAX_CANDIDATE_ROUNDS,
+    )
     return {
-        "selection_mode": flag("selection_mode", True),
-        "image_content_qc": flag("image_content_qc", True),
-        "video_content_qc": flag("video_content_qc", True),
-        # 当前契约固定四图。即使旧配置被手工写坏，API/UI 也不能回显出
-        # 一个 Director 不会执行的数量；保存非法值仍由 set_defaults 拒绝。
-        "shot_candidate_count": CANDIDATES_PER_SHOT,
+        "selection_mode": selection_mode,
+        # 保留旧键作为用户请求值，另给 effective 字段避免客户端继续把
+        # “非阻断”误解成“未执行质检”。
+        "image_content_qc": image_content_qc,
+        "video_content_qc": video_content_qc,
+        "effective_image_content_qc": policy.image_content_qc_enabled,
+        "effective_video_content_qc": policy.video_content_qc_enabled,
+        "content_qc_blocking": policy.content_qc_blocking,
+        "content_qc_auto_retry": policy.content_qc_auto_retry,
+        "codex_repair_enabled": policy.prompt_review_enabled,
+        "reference_reselection_enabled": True,
+        "shot_candidate_count": policy.initial_candidates_per_shot,
+        "shot_repair_candidate_count": policy.repair_candidates_per_batch,
+        "max_candidate_rounds": policy.max_candidate_rounds,
+        "first_round_included": True,
+        "failure_blocks_other_shots": policy.failure_blocks_other_shots,
+        "failure_blocks_downstream_stage": (
+            policy.failure_blocks_downstream_stage),
+        "limit_behavior": "promote_best_with_nonblocking_risk",
     }
 
 
@@ -2144,7 +2390,8 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
         keyframes["reason"] = (
             f"{keyframe_count_text} 当前没有运行任务；还有 "
             f"{pending_total} 个镜头"
-            + ("由系统自动优化提示词、补抽3张并AI选优。"
+            + ("由 Codex 自动归因、优化提示词与参考图；每轮并行生成"
+               "4张并由AI选优复检，最多10轮。"
                if selection_mode else "可继续生产。"))
     elif keyframes["awaiting_human"] or keyframes["failed"]:
         keyframes["status"] = "blocked"
@@ -2208,8 +2455,8 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
             "count": pending_count,
             "shot_nos": pending_shots,
             "message": (
-                f"还有 {pending_count} 个关键帧由系统自动优化提示词、"
-                "补抽3张并AI选优。"
+                f"还有 {pending_count} 个关键帧由 Codex 自动归因并优化"
+                "提示词与参考图；每轮并行生成4张并AI选优复检，最多10轮。"
                 if selection_mode
                 else f"还有 {pending_count} 个关键帧尚未生产。"),
         })
@@ -2269,7 +2516,7 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
             next_action = {
                 "action": "resume_keyframes",
                 "label": (
-                    f"系统自动补抽3张并AI选优（{pending_count}镜）"
+                    f"自动四抽选优并复检（最多10轮 · {pending_count}镜）"
                     if selection_mode else
                     f"继续生产 {pending_count} 个非问题关键帧"),
                 "count": pending_count,
@@ -2300,7 +2547,7 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
         "item_ids": pending_item_ids,
         "enabled": bool(pending_count and not live_run),
         "label": (
-            f"系统自动补抽3张并AI选优（{pending_count}镜）"
+            f"自动四抽选优并复检（最多10轮 · {pending_count}镜）"
             if selection_mode else
             f"继续生产 {pending_count} 个非问题关键帧"),
     }
@@ -3120,6 +3367,19 @@ def make_handler(workspace, jobs):
                         Path(workspace) / "logs", hours=hours)
                     summary["needs_rule_fix"] = rules_needing_fix(summary)
                     return self._json(summary)
+                match = re.match(r"^/api/project/(\d+)/rules$", route)
+                if match:
+                    return self._project_rules_get(
+                        int(match.group(1)))
+                match = re.match(
+                    r"^/api/episode/(\d+)/rule-stack$", route)
+                if match:
+                    return self._episode_rule_stack(
+                        int(match.group(1)), query)
+                match = re.match(r"^/api/episode/(\d+)/rules$", route)
+                if match:
+                    return self._episode_rules_get(
+                        int(match.group(1)), query)
                 if route in ("/api/firefire", "/api/firefire/overview"):
                     return self._json(self._with_app(
                         lambda app: app.firefire.overview()))
@@ -3260,6 +3520,14 @@ def make_handler(workspace, jobs):
         def do_POST(self):
             parsed = urlparse(self.path)
             try:
+                match = re.match(
+                    r"^/api/project/(\d+)/rules$", parsed.path)
+                if match:
+                    return self._project_rules_save(int(match.group(1)))
+                match = re.match(
+                    r"^/api/episode/(\d+)/rules$", parsed.path)
+                if match:
+                    return self._episode_rules_save(int(match.group(1)))
                 if parsed.path == "/api/produce":
                     return self._produce()
                 if parsed.path == "/api/firefire/session":
@@ -4381,6 +4649,248 @@ def make_handler(workspace, jobs):
                     self.rfile.read(length).decode("utf-8")) if length else {}
             except ValueError:
                 return None
+
+        @staticmethod
+        def _expected_rule_version(body):
+            value = body.get("expected_version")
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or value < 0):
+                raise AifosError("expected_version 必须是非负整数")
+            return value
+
+        @staticmethod
+        def _request_id_matches(body, key, expected):
+            if key not in body:
+                return True
+            value = body.get(key)
+            return (not isinstance(value, bool)
+                    and isinstance(value, int) and value == int(expected))
+
+        def _project_rules_get(self, project_id):
+            def load(app):
+                project = app.projects.get_project_by_id(project_id)
+                if project is None:
+                    return None
+                content, version = app.projects.latest_project_document(
+                    project_id, "project_rules")
+                return _rule_pack_payload(
+                    content, version, project_id=project_id,
+                    kind="project_rules")
+
+            payload = self._with_app(load)
+            if payload is None:
+                return self._error(404, "项目不存在")
+            return self._json(payload)
+
+        def _project_rules_save(self, project_id):
+            body = self._read_body()
+            if body is None or not isinstance(body, dict):
+                return self._error(400, "请求体不是合法 JSON 对象")
+            if not self._request_id_matches(body, "project_id", project_id):
+                return self._error(409, "请求项目与 URL 项目不一致，已拒绝保存")
+            try:
+                expected = self._expected_rule_version(body)
+                content = _creative_rule_request(body, PROJECT_RULE_SCOPE)
+                binding_error = _creative_pack_binding_error(
+                    content, project_id)
+                if binding_error:
+                    return self._error(409, binding_error + "，已拒绝保存")
+
+                def save(app):
+                    if app.projects.get_project_by_id(project_id) is None:
+                        return None
+                    version = app.projects.save_project_document_cas(
+                        project_id, "project_rules", content, expected)
+                    return _rule_pack_payload(
+                        content, version, project_id=project_id,
+                        kind="project_rules")
+
+                payload = self._with_app(save)
+            except DocumentConflictError as exc:
+                return self._json({
+                    "error": str(exc),
+                    "expected_version": exc.expected_version,
+                    "actual_version": exc.actual_version,
+                }, status=409)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            if payload is None:
+                return self._error(404, "项目不存在")
+            return self._json(payload)
+
+        def _episode_rule_binding(self, episode_id):
+            def load(app):
+                episode = app.projects.get_episode(episode_id)
+                if episode is None:
+                    return None
+                project = app.projects.get_project_by_id(
+                    episode["project_id"])
+                if project is None:
+                    return None
+                return dict(episode), dict(project)
+            return self._with_app(load)
+
+        def _episode_rules_get(self, episode_id, query):
+            binding = self._episode_rule_binding(episode_id)
+            if binding is None:
+                return self._error(404, "剧集不存在")
+            episode, project = binding
+            requested_project = query.get("project_id", [None])[0]
+            if requested_project is not None:
+                try:
+                    requested_project = int(requested_project)
+                except (TypeError, ValueError):
+                    return self._error(400, "project_id 必须是数字")
+                if requested_project != int(project["id"]):
+                    return self._error(
+                        409, "请求项目与该剧集所属项目不一致，已拒绝读取")
+
+            content, version = self._with_app(
+                lambda app: app.projects.latest_document(
+                    episode_id, "episode_rules"))
+            return self._json(_rule_pack_payload(
+                content, version, project_id=project["id"],
+                episode_id=episode_id, kind="episode_rules"))
+
+        def _episode_rule_stack(self, episode_id, query):
+            raw_shot_no = query.get("shot_no", [None])[0]
+            try:
+                shot_no = int(raw_shot_no)
+            except (TypeError, ValueError):
+                return self._error(400, "shot_no 必须是正整数")
+            if shot_no <= 0:
+                return self._error(400, "shot_no 必须是正整数")
+
+            requested_project = query.get("project_id", [None])[0]
+            if requested_project is not None:
+                try:
+                    requested_project = int(requested_project)
+                except (TypeError, ValueError):
+                    return self._error(400, "project_id 必须是数字")
+            stage = str(query.get("stage", [""])[0] or "production").strip()
+            modality = str(
+                query.get("modality", [""])[0] or "production").strip()
+
+            def resolve(app):
+                episode = app.projects.get_episode(episode_id)
+                if episode is None:
+                    return None
+                project = app.projects.get_project_by_id(
+                    episode["project_id"])
+                if project is None:
+                    return None
+                if (requested_project is not None
+                        and requested_project != int(project["id"])):
+                    return {"binding_conflict": True}
+
+                standard_snapshot, _ = app.projects.latest_document(
+                    episode_id, "production_standard")
+                if standard_snapshot is None and app.standards is not None:
+                    standard_snapshot = app.standards.active()
+                standard_snapshot = (
+                    standard_snapshot
+                    if isinstance(standard_snapshot, dict) else {})
+                script, _ = app.projects.latest_document(
+                    episode_id, "script")
+                storyboard, _ = app.projects.latest_document(
+                    episode_id, "storyboard")
+                script = script if isinstance(script, dict) else {}
+                storyboard = (
+                    storyboard if isinstance(storyboard, dict) else {})
+                shots = list(storyboard.get("shots") or [])
+                shot = None
+                for item in shots:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        item_shot_no = int(item.get("shot_no", -1))
+                    except (TypeError, ValueError):
+                        continue
+                    if item_shot_no == shot_no:
+                        shot = copy.deepcopy(item)
+                        break
+                if shot is None:
+                    if shots:
+                        return {"shot_missing": True}
+                    # 规则编辑可早于分镜；此时仍能预览 shot_nos 适用范围。
+                    shot = {"shot_no": shot_no}
+                ctx = {
+                    "project": dict(project),
+                    "episode": dict(episode),
+                    "production_standard": standard_snapshot,
+                    "production_profile": production_profile(
+                        app.config, standard_snapshot),
+                    "script": script,
+                    "storyboard": storyboard or {"shots": []},
+                }
+                ctx["rule_layers"] = app.director._load_rule_layers(
+                    ctx["project"], ctx["episode"], standard_snapshot)
+                resolved = app.director._resolve_effective_rules(
+                    ctx, shot=shot, stage=stage, modality=modality)
+                payload = resolved.as_dict()
+                payload.update({
+                    "project_id": int(project["id"]),
+                    "episode_id": int(episode["id"]),
+                    "shot_no": shot_no,
+                    "effective_rules": copy.deepcopy(resolved.rules),
+                    # 解析器以 overridden 保存被高优先级替换的审计记录；
+                    # API 兼容使用者熟悉的 suppressed 命名，但不另做裁决。
+                    "suppressed": copy.deepcopy(resolved.overridden),
+                    "project_rule_version": ctx["rule_layers"][
+                        "project_version"],
+                    "episode_rule_version": ctx["rule_layers"][
+                        "episode_version"],
+                })
+                return payload
+
+            try:
+                payload = self._with_app(resolve)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            if payload is None:
+                return self._error(404, "剧集不存在")
+            if payload.pop("binding_conflict", False):
+                return self._error(
+                    409, "请求项目与该剧集所属项目不一致，已拒绝读取")
+            if payload.pop("shot_missing", False):
+                return self._error(404, f"镜头不存在: {shot_no}")
+            return self._json(payload)
+
+        def _episode_rules_save(self, episode_id):
+            body = self._read_body()
+            if body is None or not isinstance(body, dict):
+                return self._error(400, "请求体不是合法 JSON 对象")
+            if not self._request_id_matches(body, "episode_id", episode_id):
+                return self._error(409, "请求剧集与 URL 剧集不一致，已拒绝保存")
+            binding = self._episode_rule_binding(episode_id)
+            if binding is None:
+                return self._error(404, "剧集不存在")
+            episode, project = binding
+            if not self._request_id_matches(
+                    body, "project_id", project["id"]):
+                return self._error(
+                    409, "请求项目与该剧集所属项目不一致，已拒绝保存")
+            try:
+                expected = self._expected_rule_version(body)
+                content = _creative_rule_request(body, EPISODE_RULE_SCOPE)
+                binding_error = _creative_pack_binding_error(
+                    content, project["id"], episode_id)
+                if binding_error:
+                    return self._error(409, binding_error + "，已拒绝保存")
+                version = self._with_app(
+                    lambda app: app.projects.save_document_cas(
+                        episode["id"], "episode_rules", content, expected))
+            except DocumentConflictError as exc:
+                return self._json({
+                    "error": str(exc),
+                    "expected_version": exc.expected_version,
+                    "actual_version": exc.actual_version,
+                }, status=409)
+            except AifosError as exc:
+                return self._error(400, str(exc))
+            return self._json(_rule_pack_payload(
+                content, version, project_id=project["id"],
+                episode_id=episode_id, kind="episode_rules"))
 
         def _director_statement_save(self):
             """导演阐述:{episode_id, statement{intent,tone,pacing,

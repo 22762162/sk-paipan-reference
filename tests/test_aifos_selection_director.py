@@ -61,6 +61,7 @@ class _ParallelRouter:
                  first_wave_size=4):
         self.review_calls = 0
         self.image_calls = 0
+        self.qc_calls = 0
         self.active = 0
         self.max_active = 0
         self.payloads = []
@@ -84,8 +85,25 @@ class _ParallelRouter:
         return ProviderResult(provider="review", cost=0.25)
 
     def call(self, capability, payload, out_dir, cancel=None):
-        assert capability == "image"
         assert cancel is None or not cancel()
+        if capability == "image_qc":
+            with self.lock:
+                self.qc_calls += 1
+            return ProviderResult(
+                provider="fake-qc", model="fake-qc-v1", cost=0.1,
+                data={
+                    "pass": True, "visual_pass": True, "issues": [],
+                    "identity_checked": True, "identity_match": True,
+                    "gender_checked": True, "gender_match": True,
+                    "wardrobe_checked": True, "wardrobe_match": True,
+                    "count_checked": True, "count_match": True,
+                    "physical_logic_checked": True,
+                    "physical_logic_match": True,
+                    "spatial_logic_checked": True,
+                    "spatial_logic_match": True,
+                    "input_contract_passed": True,
+                })
+        assert capability == "image"
         with self.lock:
             self.image_calls += 1
             self.active += 1
@@ -128,8 +146,8 @@ def test_selection_mode_config_switches_are_independent_and_compatible():
         "shot_candidate_count": 2,
     })
     assert director._selection_mode_enabled() is True
-    assert director._image_qc_enabled() is False
-    assert director._video_content_qc_enabled() is False
+    assert director._image_qc_enabled() is True
+    assert director._video_content_qc_enabled() is True
     assert director._shot_candidate_count() == 4
     assert director.log.warnings
 
@@ -171,6 +189,7 @@ def test_four_candidates_share_one_reviewed_contract_and_overlap(tmp_path):
 
     assert director.router.review_calls == 1
     assert director.router.image_calls == 4
+    assert director.router.qc_calls == 4
     assert director.router.max_active >= 2
     group = result.data["candidate_group"]
     candidates = group["candidates"]
@@ -212,7 +231,7 @@ def test_four_candidates_share_one_reviewed_contract_and_overlap(tmp_path):
     assert not (tmp_path / "shot_007.keyframe.png").exists()
     assert Director._candidate_selection_pending(result) is True
     assert group["selection_required"] is True
-    assert result.cost == 4.25
+    assert round(result.cost, 2) == 4.65
 
 
 def test_four_candidate_slots_respect_provider_parallel_limit(tmp_path):
@@ -338,8 +357,9 @@ def test_unfilled_candidate_slot_promotes_best_usable_without_mobile_gate(tmp_pa
     assert Director._candidate_selection_pending(promoted) is False
 
 
-def test_disabled_image_content_qc_never_blocks_or_auto_repairs():
-    director = _director({"selection_mode": True})
+def test_explicitly_disabled_image_content_qc_never_blocks_or_auto_repairs():
+    director = _director({
+        "selection_mode": True, "image_content_qc": False})
     failed = ProviderResult(provider="test", cost=0)
     failed.qc = {
         "passed": False,

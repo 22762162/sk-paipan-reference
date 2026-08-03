@@ -4800,6 +4800,174 @@ textarea:focus-visible, select:focus-visible {
 }
 .lesson-approve:hover:not(:disabled) { background: rgba(250, 178, 25, .2); }
 .lesson-approve:disabled { opacity: .5; cursor: default; }
+/* ---- 分层创作规则：剧本确认编辑器 + 逐镜来源审计 ---- */
+.rule-scope-workbench {
+  margin: 16px 18px; display: grid; gap: 12px;
+  border: 1px solid rgba(112, 160, 226, .25); border-radius: 16px;
+  background: linear-gradient(145deg, rgba(31, 42, 60, .9), rgba(22, 22, 25, .98));
+  overflow: hidden; box-shadow: 0 16px 44px rgba(0, 0, 0, .2);
+}
+.rule-scope-heading {
+  padding: 17px 18px; display: flex; align-items: flex-start;
+  justify-content: space-between; gap: 18px; border-bottom: 1px solid var(--hairline);
+}
+.rule-scope-heading h2 { margin: 3px 0 4px; font-size: 19px; }
+.rule-scope-heading p { color: var(--ink-3); font-size: 11px; line-height: 1.6; }
+.rule-priority-stack {
+  flex: none; display: grid; gap: 8px; min-width: min(100%, 530px);
+  padding: 10px 12px; border: 1px solid rgba(250, 178, 25, .28);
+  border-radius: 11px; background: rgba(250, 178, 25, .055);
+}
+.rule-priority-title { color: #ffd36b; font-size: 10px; font-weight: 800; }
+.rule-priority-stack ol {
+  list-style: none; margin: 0; padding: 0; display: grid;
+  grid-template-columns: repeat(4, minmax(90px, 1fr)); gap: 5px;
+}
+.rule-priority-stack li {
+  min-width: 0; display: flex; align-items: center; gap: 6px;
+  padding: 6px 7px; border: 1px solid var(--hairline); border-radius: 8px;
+  background: rgba(0, 0, 0, .14);
+}
+.rule-priority-stack li > b {
+  width: 19px; height: 19px; flex: none; display: grid; place-content: center;
+  border-radius: 50%; color: #9cc7ff; background: rgba(57, 135, 229, .15);
+  font-size: 9px;
+}
+.rule-priority-stack li > span { min-width: 0; font-size: 10px; font-weight: 750; }
+.rule-priority-stack li small {
+  display: block; color: var(--ink-3); font-size: 8px; font-weight: 400;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.rule-priority-stack li.highest { border-color: rgba(105, 159, 234, .36); }
+.rule-hard-lock {
+  color: #ffd390; font-size: 9.5px; font-weight: 750;
+}
+.rule-priority-stack.compact {
+  min-width: 0; width: auto; margin: 0; padding: 8px 10px;
+  grid-template-columns: auto 1fr auto; align-items: center;
+}
+.rule-priority-stack.compact ol { min-width: 440px; }
+.rule-priority-stack.compact .rule-hard-lock { text-align: right; }
+.shot-production-section > .rule-priority-stack.compact {
+  margin: 0 14px 10px; background: rgba(250, 178, 25, .04);
+}
+.rule-scope-grid {
+  padding: 0 16px 16px; display: grid; grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.rule-scope-card {
+  min-width: 0; border: 1px solid var(--hairline); border-radius: 12px;
+  background: rgba(0, 0, 0, .16); overflow: hidden;
+}
+.rule-scope-card > header {
+  padding: 13px 14px; display: flex; justify-content: space-between; gap: 12px;
+  border-bottom: 1px solid var(--hairline);
+}
+.rule-scope-card h2 { margin: 2px 0; font-size: 15px; }
+.rule-scope-card header p { color: var(--ink-3); font-size: 10.5px; line-height: 1.55; }
+.rule-scope-kicker { color: #86b9f6; font-size: 8px; font-weight: 850; letter-spacing: .16em; }
+.rule-editor-version {
+  align-self: start; flex: none; padding: 2px 7px; border-radius: 999px;
+  color: var(--ink-3); border: 1px solid var(--hairline); font-size: 9px;
+}
+.rule-editor-message { padding: 8px 14px 0; color: var(--ink-3); font-size: 10px; }
+.rule-editor-list { padding: 10px 12px; display: grid; gap: 8px; }
+.rule-editor-empty {
+  min-height: 74px; padding: 14px; display: grid; place-content: center;
+  text-align: center; color: var(--ink-3); font-size: 10.5px;
+  border: 1px dashed var(--hairline); border-radius: 9px;
+}
+.rule-editor-row {
+  display: grid; grid-template-columns: minmax(130px, .75fr) minmax(180px, 1.4fr) auto;
+  gap: 7px; padding: 9px; border: 1px solid var(--hairline); border-radius: 9px;
+  background: rgba(255, 255, 255, .018);
+}
+.rule-editor-row label { min-width: 0; display: grid; align-content: start; gap: 3px; }
+.rule-editor-row label > span { color: var(--ink-3); font-size: 8.5px; }
+.rule-editor-row input, .rule-editor-row textarea { width: 100%; box-sizing: border-box; }
+.rule-editor-row textarea { min-height: 51px; resize: vertical; }
+.rule-editor-row.disabled { opacity: .62; border-style: dashed; }
+.rule-enabled-field { display: grid; grid-template-columns: auto 1fr; align-items: center; }
+.rule-enabled-field > span { grid-column: 1 / -1; }
+.rule-enabled-field input { width: auto; }
+.rule-enabled-field small { color: var(--ink-3); font-size: 8px; }
+.rule-applicability-fields {
+  grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, minmax(110px, 1fr));
+  gap: 6px; margin: 0; padding: 8px; border: 1px solid var(--hairline); border-radius: 7px;
+}
+.rule-applicability-fields legend { color: #9fcaff; font-size: 8.5px; padding: 0 4px; }
+.rule-applicability-fields input { font-size: 9px; }
+.rule-editor-row > small {
+  grid-column: 1 / -1; color: var(--ink-3); font-size: 8.5px;
+  overflow-wrap: anywhere;
+}
+.rule-row-delete { align-self: end; color: #ff9999; padding: 7px 9px; }
+.rule-scope-card > footer {
+  padding: 10px 12px; display: flex; justify-content: flex-end; gap: 8px;
+  border-top: 1px solid var(--hairline);
+}
+.rule-suppression-editor { margin: 0 12px 10px; padding: 8px 10px;
+  border: 1px solid var(--hairline); border-radius: 8px; }
+.rule-suppression-editor summary { cursor: pointer; color: #d6e7ff; font-size: 9px; }
+.rule-suppression-editor p { color: var(--ink-3); font-size: 8.5px; }
+.rule-suppression-editor textarea { width: 100%; box-sizing: border-box; resize: vertical; }
+.rule-stack-audit {
+  margin: 10px 12px; border: 1px solid rgba(107, 157, 224, .24);
+  border-radius: 9px; background: rgba(57, 135, 229, .045); overflow: hidden;
+  text-align: left;
+}
+.storyboard-description .rule-stack-audit { margin: 9px 0; }
+.rule-stack-audit.loading, .rule-stack-audit.unavailable { padding: 8px 10px; }
+.rule-stack-audit.loading > div, .rule-stack-audit.unavailable > div,
+.rule-stack-audit-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.rule-stack-audit.loading > div > span, .rule-stack-audit.unavailable > div > span,
+.rule-stack-audit-head > div > span { margin-left: 7px; color: #a9c8ef; font-size: 9px; }
+.rule-stack-audit > small, .rule-stack-audit-head > small { color: var(--ink-3); font-size: 8.5px; }
+.rule-stack-audit.unavailable { border-color: var(--hairline); background: rgba(255, 255, 255, .015); }
+.rule-stack-audit-head { padding: 8px 10px; }
+.rule-stack-audit-head b { font-size: 10.5px; }
+.rule-stack-audit > details { border-top: 1px solid var(--hairline); }
+.rule-stack-audit > details > summary {
+  padding: 7px 10px; cursor: pointer; color: #a9c8ef; font-size: 9px;
+}
+.rule-stack-audit-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 0 9px 8px; }
+.rule-stack-audit-columns section { min-width: 0; }
+.rule-stack-audit-columns h4 { margin: 5px 0; color: var(--ink-3); font-size: 8.5px; }
+.rule-stack-audit-columns ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 5px; }
+.rule-stack-audit-columns li {
+  min-width: 0; display: grid; gap: 2px; padding: 6px;
+  border: 1px solid var(--hairline); border-radius: 7px; font-size: 8.5px;
+}
+.rule-stack-audit-columns code { color: #9fcaff; overflow-wrap: anywhere; }
+.rule-stack-audit-columns li > span { color: var(--ink-2); overflow-wrap: anywhere; }
+.rule-stack-audit-columns li > small { color: var(--ink-3); font-size: 8px; }
+.rule-hard-note {
+  margin: 0; padding: 7px 10px; color: #ffd390; font-size: 8.5px;
+  border-top: 1px solid rgba(250, 178, 25, .18);
+}
+.rule-stack-audit-label { padding: 6px 10px; color: #ffd390; font-size: 9px;
+  font-weight: 800; border-bottom: 1px solid var(--hairline); }
+.prompt-modality-rule-stacks { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+
+@media (max-width: 980px) {
+  .rule-scope-heading { display: grid; }
+  .rule-priority-stack { width: 100%; min-width: 0; }
+  .rule-priority-stack.compact { display: grid; grid-template-columns: 1fr; }
+  .rule-priority-stack.compact ol { min-width: 0; }
+  .rule-priority-stack.compact .rule-hard-lock { text-align: left; }
+  .rule-scope-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 620px) {
+  .rule-scope-workbench { margin: 10px; }
+  .rule-priority-stack ol { grid-template-columns: 1fr 1fr; }
+  .rule-editor-row { grid-template-columns: 1fr auto; }
+  .rule-editor-row .rule-value-field { grid-column: 1 / -1; grid-row: 2; }
+  .rule-applicability-fields { grid-template-columns: 1fr; }
+  .rule-row-delete { grid-column: 2; grid-row: 1; }
+  .rule-stack-audit-columns { grid-template-columns: 1fr; }
+  .prompt-modality-rule-stacks { grid-template-columns: 1fr; }
+}
+
 /* ---- 提示词区：逐镜最高规则审计 ---- */
 .prompt-review-launch {
   border-color: rgba(114, 168, 255, .55);

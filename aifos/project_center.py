@@ -6,6 +6,18 @@ from .db import now
 from .errors import AifosError
 
 
+class DocumentConflictError(AifosError):
+    """追加文档时页面版本已经落后。"""
+
+    def __init__(self, kind, expected_version, actual_version):
+        self.kind = str(kind)
+        self.expected_version = int(expected_version)
+        self.actual_version = int(actual_version)
+        super().__init__(
+            f"{self.kind} 已更新（当前版本 {self.actual_version}，"
+            f"提交基于版本 {self.expected_version}），请刷新后重试")
+
+
 class ProjectCenter:
     def __init__(self, db):
         self.db = db
@@ -59,6 +71,10 @@ class ProjectCenter:
     def get_project(self, title):
         return self.db.query_one("SELECT * FROM projects WHERE title=?", (title,))
 
+    def get_project_by_id(self, project_id):
+        return self.db.query_one(
+            "SELECT * FROM projects WHERE id=?", (project_id,))
+
     def list_projects(self):
         return self.db.query("SELECT * FROM projects ORDER BY id")
 
@@ -109,6 +125,11 @@ class ProjectCenter:
         # document at once. Allocate and insert the next version inside one
         # transaction so two workers cannot choose the same version number.
         with self.db.transaction(immediate=True) as conn:
+            episode = conn.execute(
+                "SELECT id FROM episodes WHERE id=?", (episode_id,)
+            ).fetchone()
+            if episode is None:
+                raise AifosError("剧集不存在")
             row = conn.execute(
                 "SELECT MAX(version) AS v FROM documents "
                 "WHERE episode_id=? AND kind=?", (episode_id, kind)
@@ -148,9 +169,9 @@ class ProjectCenter:
                 "WHERE episode_id=? AND kind=?", (episode_id, kind)
             ).fetchone()
             actual = int(row["v"] or 0)
-            if int(expected_version) != actual:
-                raise AifosError(
-                    "人物资产设置已在其他页面更新，请刷新后重试")
+            expected = self._expected_version(expected_version)
+            if expected != actual:
+                raise DocumentConflictError(kind, expected, actual)
             version = actual + 1
             conn.execute(
                 "INSERT INTO documents(episode_id, kind, version, content, "
@@ -164,6 +185,76 @@ class ProjectCenter:
         row = self.db.query_one(
             "SELECT * FROM documents WHERE episode_id=? AND kind=? "
             "ORDER BY version DESC LIMIT 1", (episode_id, kind))
+        if row is None:
+            return None, 0
+        return json.loads(row["content"]), row["version"]
+
+    # ---- 项目文档(版本化；项目规则/跨集事实) ----
+    @staticmethod
+    def _expected_version(value):
+        if isinstance(value, bool):
+            raise AifosError("expected_version 必须是非负整数")
+        try:
+            version = int(value)
+        except (TypeError, ValueError):
+            raise AifosError("expected_version 必须是非负整数")
+        if version < 0 or str(value).strip() != str(version):
+            raise AifosError("expected_version 必须是非负整数")
+        return version
+
+    def save_project_document(self, project_id, kind, content):
+        """为真实项目追加一版文档，不允许借不存在的项目落孤儿数据。"""
+        with self.db.transaction(immediate=True) as conn:
+            project = conn.execute(
+                "SELECT id FROM projects WHERE id=?", (project_id,)
+            ).fetchone()
+            if project is None:
+                raise AifosError("项目不存在")
+            row = conn.execute(
+                "SELECT COALESCE(MAX(version), 0) AS v "
+                "FROM project_documents WHERE project_id=? AND kind=?",
+                (project_id, kind),
+            ).fetchone()
+            version = int(row["v"] or 0) + 1
+            conn.execute(
+                "INSERT INTO project_documents(project_id, kind, version, "
+                "content, created_at) VALUES(?,?,?,?,?)",
+                (project_id, kind, version,
+                 json.dumps(content, ensure_ascii=False), now()),
+            )
+        return version
+
+    def save_project_document_cas(self, project_id, kind, content,
+                                  expected_version):
+        """仅当项目文档仍是调用方读取的版本时原子追加。"""
+        expected = self._expected_version(expected_version)
+        with self.db.transaction(immediate=True) as conn:
+            project = conn.execute(
+                "SELECT id FROM projects WHERE id=?", (project_id,)
+            ).fetchone()
+            if project is None:
+                raise AifosError("项目不存在")
+            row = conn.execute(
+                "SELECT COALESCE(MAX(version), 0) AS v "
+                "FROM project_documents WHERE project_id=? AND kind=?",
+                (project_id, kind),
+            ).fetchone()
+            actual = int(row["v"] or 0)
+            if expected != actual:
+                raise DocumentConflictError(kind, expected, actual)
+            version = actual + 1
+            conn.execute(
+                "INSERT INTO project_documents(project_id, kind, version, "
+                "content, created_at) VALUES(?,?,?,?,?)",
+                (project_id, kind, version,
+                 json.dumps(content, ensure_ascii=False), now()),
+            )
+        return version
+
+    def latest_project_document(self, project_id, kind):
+        row = self.db.query_one(
+            "SELECT * FROM project_documents WHERE project_id=? AND kind=? "
+            "ORDER BY version DESC LIMIT 1", (project_id, kind))
         if row is None:
             return None, 0
         return json.loads(row["content"]), row["version"]

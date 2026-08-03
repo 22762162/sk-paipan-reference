@@ -3540,9 +3540,9 @@ function planVisibleQc(item) {
   return planQcEnabled(item) ? item.qc : null;
 }
 
-/* 内容阈值未全过但已有技术可用图时，AI 导演会从补抽候选中晋升
-   相对最优稿。这个结果是可继续生产的非阻断风险，不得再被旧版
-   image_failures / awaiting_human 文案覆盖成“二次质检失败”。 */
+/* 内容阈值未全过但已有技术可用图时，AI 导演会在最多十轮四图候选中
+   晋升相对最优稿。这个结果是可继续生产的非阻断风险，不得再被旧版
+   image_failures / awaiting_human 文案覆盖成“失败待人工”。 */
 function shotBestEffortPromoted(item) {
   if (!item || !["done", "reused"].includes(String(item.status || "")))
     return false;
@@ -3645,8 +3645,13 @@ function qcIssueSectionsHtml(qc, nonblocking = false) {
 }
 
 function shotBestEffortLabel(item) {
-  return shotBestEffortPromoted(item)
-    ? "已补抽3张并AI选优（非阻断风险）" : "";
+  if (!shotBestEffortPromoted(item)) return "";
+  const group = item?.candidate_group || item?.shot_candidate_group || {};
+  const round = Math.max(1, Number(group.generation_round || 1));
+  const maxRounds = Math.max(1, Number(group.max_candidate_rounds || 10));
+  return round >= maxRounds
+    ? `已到${maxRounds}轮上限 · AI选相对最优（风险留档，继续生产）`
+    : "AI已选相对最优（风险留档，非阻断）";
 }
 const PLAN_REWORK_STATUSES = new Set([
   "done", "reused", "awaiting_human", "failed", "generating",
@@ -3887,7 +3892,7 @@ function thumbUrl(url, w = 480) {
 function shotCandidateGroup(item) {
   if (!item || item.category !== "shot_image") return null;
   const group = item.candidate_group || item.shot_candidate_group;
-  // AI 自动选优后 selection_required 会变成 false，但四张/三张候选仍要
+  // AI 自动选优后 selection_required 会变成 false，但当前轮四张候选仍要
   // 留在画布供回看和可选改选，不能因为已经自动晋升就把候选组藏掉。
   return group && typeof group === "object"
     && (Array.isArray(group.candidates) || Number(group.candidate_count || 0) > 0)
@@ -3936,12 +3941,33 @@ function shotCandidateState(item) {
   const group = shotCandidateGroup(item);
   if (!group) return null;
   const candidates = shotCandidates(item);
-  // 首轮固定4张，问题镜头自动修订后固定补抽3张；其他脏值仍钳制为4。
-  const expected = Number(group.expected_count) === 3 ? 3 : 4;
+  // 首轮和每个返修轮都固定4张。旧计划里的 expected_count=3 只作为
+  // 历史审计数据，不能再改变当前界面的候选槽位与策略说明。
+  const expected = 4;
   const missing = Math.max(0, expected - candidates.length);
   const technicalIncomplete = group.technical_incomplete === true
     || item.status === "technical_incomplete";
-  return { group, candidates, expected, missing, technicalIncomplete };
+  const maxCandidateRounds = Math.min(10, Math.max(1, Number(
+    group.max_candidate_rounds || 10)));
+  const generationRound = Math.min(maxCandidateRounds, Math.max(1, Number(
+    group.generation_round || group.current_round || 1)));
+  const rawProgress = group.current_round_progress;
+  const stringProgress = typeof rawProgress === "string"
+    ? Number(String(rawProgress).split("/")[0]) : NaN;
+  const progressCount = rawProgress && typeof rawProgress === "object"
+    ? Number(rawProgress.completed ?? rawProgress.generated ?? rawProgress.count)
+    : (typeof rawProgress === "number" ? rawProgress
+      : (Number.isFinite(stringProgress) ? stringProgress : candidates.length));
+  const currentRoundProgress = Math.min(4, Math.max(0,
+    Number.isFinite(progressCount) ? progressCount : candidates.length));
+  const hasRoundProgress = group.generation_round != null
+    || group.max_candidate_rounds != null
+    || group.current_round_progress != null;
+  const roundLabel = hasRoundProgress
+    ? `第${generationRound}/${maxCandidateRounds}轮 · ${currentRoundProgress}/4张`
+    : `本镜第${generationRound}轮 · ${currentRoundProgress}/4张`;
+  return { group, candidates, expected, missing, technicalIncomplete,
+    generationRound, maxCandidateRounds, currentRoundProgress, roundLabel };
 }
 
 function planItemThumbs(data, item) {
@@ -4012,7 +4038,7 @@ function shotCandidateGridHtml(item, editable) {
     shotCandidateSelected(group, candidate));
   const selectedByAi = !!selected && String((group.selection || {}).source || "") === "ai";
   const bestEffort = shotBestEffortLabel(item);
-  const batchLabel = expected === 3 ? "问题镜头补抽3张" : `本镜${expected}张候选`;
+  const batchLabel = state.roundLabel;
   const errors = (group.candidate_errors || []).map((row) =>
     `候选${row.candidate_index || "?"}：${row.error || "技术生成失败"}`);
   const byIndex = new Map(candidates.map((candidate) =>
@@ -4022,9 +4048,9 @@ function shotCandidateGridHtml(item, editable) {
   }));
   return `<section class="shot-candidate-panel" aria-label="${batchLabel}">
     <div class="shot-candidate-head"><div><b>${batchLabel}</b>
-      <span>${bestEffort || (selected ? `${selectedByAi ? "AI已自动选优" : "可选改选已生效："}候选 ${shotCandidateIndex(selected)} 为正式关键帧；其余候选保留回看`
+      <span>${bestEffort || (selected ? `${selectedByAi ? "AI已自动选优并复检" : "可选改选已生效："}候选 ${shotCandidateIndex(selected)} 为正式关键帧；其余候选保留回看`
         : (technicalIncomplete ? `技术未补齐，当前 ${candidates.length}/${expected} 张`
-          : `${expected}张使用同一冻结提示词与参考图；AI正在自动选优，无需手机操作`))}</span></div>
+          : `${expected}张使用同一轮冻结提示词与最适参考图；AI正在自动选优复检，无需手机操作`))}</span></div>
       <span class="plan-st st-${technicalIncomplete ? "technical_incomplete" : (selected ? "done" : "awaiting_selection")}">
         ${technicalIncomplete ? `缺 ${missing || Math.max(1, expected - candidates.length)} 张 · 系统自动补位`
           : (bestEffort || (selected ? (selectedByAi ? "AI已选优" : "正式图已选") : "AI选优中"))}</span></div>
@@ -4247,7 +4273,9 @@ function productionLedgerState(row) {
 }
 
 function productionLedgerStateLabel(row) {
-  if (row.bestEffort) return "已补抽3张并AI选优（非阻断风险）";
+  if (row.bestEffort) return shotBestEffortLabel(row.item);
+  if (row.category === "shot_image" && row.candidateRoundLabel)
+    return row.candidateRoundLabel;
   if (row.status === "awaiting_human") return "历史失败·系统接管"
   if (row.status === "retrying") return `自动返工 ${row.autoRetriesUsed || 0}/1`;
   if (row.issue && row.issueCritical) return "需要干预";
@@ -4281,6 +4309,7 @@ function productionLedgerPlanRows(data) {
           ? (item.sheet || "人物辅助设定") : (item.role || ""),
       status: item.status || "pending", selected: productionLedgerSelectedCandidate(data, item),
       bestEffort,
+      candidateRoundLabel: shotCandidateState(item)?.roundLabel || "",
       mock: planIsMock(item), issue, issueCritical: !!issue,
       refs, outputUrls: planItemThumbs(data, item),
     };
@@ -4712,7 +4741,8 @@ function productionGuidanceModel(data) {
     ? reportedReason || `已生成 ${keyframes.generated}/${keyframes.total}，`
       + `可用于下游 ${keyframes.usable}/${keyframes.total}，`
       + `${pendingCount} 张待生产，${issueCount} 张已标注问题并由系统自动接管。`
-      + "AI会自动补抽3张并选优；其他镜头与下游生产不被阻断。"
+      + "Codex会自动归因、优化提示词与参考图，每轮并行生成4张并由AI选优复检；"
+      + "首轮计入、最多10轮，其他镜头与下游生产不被阻断。"
     : reportedReason || (phase === "frames"
       ? `关键帧已齐，首尾帧为 ${frames.usable}/${frames.total}；补齐后才会进入视频。`
       : phase === "videos"
@@ -5140,7 +5170,8 @@ function imageFailurePanelHtml(data) {
     aria-label="图片问题由系统自动接管">
     <div class="image-failure-heading">
       <div><b>🤖 系统自动接管问题图 · ${failures.length} 张关键帧</b>
-        <span>AI 会联合分析原图、提示词和参考图，自动修正提示词、补抽3张并选优；
+        <span>Codex 会联合分析原图、提示词和参考图，自动归因并选用最合适参考图；
+          每轮并行生成4张、AI选优后复检，合格即收口，最多10轮；
           Codex 已完成 ${codexReviewed} 张诊断。无需手机逐张处理。</span></div>
       <div class="image-failure-actions">
         <button type="button" class="image-failure-batch"
@@ -5213,7 +5244,7 @@ function productionIssueCenterHtml(data) {
           ? `${imageAction.count} 张已由系统接管修正`
           : "没有待处理的画面问题"}</b>
         <p>${imageAction.count
-          ? `AI会自动优化提示词、补抽3张并选优；${imageAction.reviewCount || 0} 张支持可选人工查看或放行。`
+          ? `Codex会自动归因并优化提示词与参考图，每轮生成4张、AI选优复检，最多10轮；${imageAction.reviewCount || 0} 张支持可选人工查看。`
           : "当前关键帧均无已标注视觉问题。"}</p>
         ${imageAction.count ? `<button type="button" class="guidance-issue-action"
           data-guidance-issues data-first-shot="${imageAction.shotNos[0] || ""}">
@@ -7185,7 +7216,8 @@ async function showPlanOverlay(episodeId, focusId = "", focusCategory = "") {
         <button class="close">关闭 Esc</button>
       </div>
       <div class="dim" style="margin:4px 0 10px">每张图的分类、状态与提示词都在这里;
-        质检问题由AI自动编译进提示词、补抽3张并选优，不阻断其他镜头；
+        质检保留但不阻断；问题由 Codex 自动归因并优化提示词和参考图，
+        每轮并行生成4张、AI选优复检，合格即收口，首轮计入且最多10轮；
         「批量优化修改」和「人工通过」仅作为可选覆盖，原问题会保留在审计记录。
         镜头画面重画后会自动重做首尾帧并作废旧视频。</div>
       <div class="batch-job-progress" hidden></div>
@@ -10326,6 +10358,402 @@ function promptReviewStatusBadge(status, label = "") {
   return `<span class="prompt-status ${value.toLowerCase()}">${icon} ${esc(text)}</span>`;
 }
 
+/* ---- 四层创作规则：项目贯穿 / 本集临时 / 当前镜头 / 系统基础 ----
+   技术硬门由后端规则解析器最终裁决，前端只展示锁定状态，不提供任何
+   “关闭/降级”控件。项目与本集规则各自使用 API 返回的版本做 CAS 保存。 */
+const RULE_LAYER_CN = {
+  current_shot: "当前镜头",
+  episode_temporary: "本集临时",
+  project_series: "本剧贯穿",
+  system_base: "系统基础",
+  technical_hard: "技术硬门",
+};
+
+function ruleLayerLabel(layer) {
+  return RULE_LAYER_CN[layer] || layer || "未知来源";
+}
+
+function rulePriorityHtml(compact = false) {
+  return `<div class="rule-priority-stack${compact ? " compact" : ""}"
+      aria-label="规则优先级：当前镜头、本集临时、本剧贯穿、系统基础；技术硬门不可覆盖">
+    <span class="rule-priority-title">创作规则优先级</span>
+    <ol>
+      <li class="highest"><b>1</b><span>当前镜头<small>本镜事实优先</small></span></li>
+      <li><b>2</b><span>本集临时<small>仅当前集</small></span></li>
+      <li><b>3</b><span>本剧贯穿<small>后续各集继承</small></span></li>
+      <li><b>4</b><span>系统基础<small>默认创作规则</small></span></li>
+    </ol>
+    <span class="rule-hard-lock">🔒 技术硬门不可关闭、降级或覆盖</span>
+  </div>`;
+}
+
+function ruleScopeEditorsHtml() {
+  const card = (scope, title, subtitle) => `<section class="rule-scope-card"
+      data-rule-editor="${scope}">
+    <header><div><span class="rule-scope-kicker">${scope === "project" ? "PROJECT" : "EPISODE"}</span>
+      <h2>${title}</h2><p>${subtitle}</p></div>
+      <span class="rule-editor-version">v–</span></header>
+    <div class="rule-editor-message" role="status">正在读取规则…</div>
+    <div class="rule-editor-list"></div>
+    <details class="rule-suppression-editor">
+      <summary>显式停用下层创作规则</summary>
+      <p>只在确实需要取消基础或本剧默认时填写。技术硬门不能停用。</p>
+      <textarea data-rule-suppressions rows="4"
+        placeholder='例如：["visual.default_city"]'></textarea>
+    </details>
+    <footer>
+      <button type="button" data-rule-add disabled>＋ 添加规则</button>
+      <button type="button" class="primary" data-rule-save disabled>保存本层规则</button>
+    </footer>
+  </section>`;
+  return `<section class="rule-scope-workbench" aria-label="分层创作规则">
+    <header class="rule-scope-heading"><div><span class="eyebrow">RULE SCOPE</span>
+      <h2>分层创作规则</h2>
+      <p>同一规则键冲突时按右侧顺序裁决；每个低优先级值仍会保留在镜头审计中。</p></div>
+      ${rulePriorityHtml()}
+    </header>
+    <div class="rule-scope-grid">
+      ${card("project", "本剧贯穿规则",
+        "只属于本作品；本剧所有集重新生产时共用。不会影响其他作品。")}
+      ${card("episode", "本集临时规则",
+        "只在当前集生效；与本剧贯穿或系统基础冲突时，本集规则优先。")}
+    </div>
+  </section>`;
+}
+
+function ruleValueText(rule) {
+  const value = Object.prototype.hasOwnProperty.call(rule || {}, "value")
+    ? rule.value : (rule || {}).text;
+  if (value == null) return "";
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+function ruleApplicabilityText(rule) {
+  const applies = rule?.applicability || rule?.applies_to || {};
+  if (!applies || typeof applies !== "object" || !Object.keys(applies).length)
+    return "全部镜头";
+  return Object.entries(applies).map(([key, value]) =>
+    `${key}: ${(Array.isArray(value) ? value : [value]).join("、")}`).join(" · ");
+}
+
+const RULE_APPLICABILITY_FIELDS = [
+  ["story_phase", "故事相位", "如 present、time_travel、dream"],
+  ["era", "时代", "如 现代、明代；多个用逗号分隔"],
+  ["scene_no", "场次", "如 1,3"],
+  ["shot_no", "镜头", "如 2,5"],
+  ["stage", "生产阶段", "如 storyboard、keyframes"],
+  ["modality", "媒介", "如 image、video"],
+];
+const RULE_APPLICABILITY_ALIASES = {
+  story_phase: "story_phases", era: "eras", scene_no: "scene_nos",
+  shot_no: "shot_nos", stage: "stages", modality: "modalities",
+};
+
+function ruleApplicabilityValue(rule, field) {
+  const applies = rule?.applicability || rule?.applies_to || {};
+  const plural = RULE_APPLICABILITY_ALIASES[field];
+  const value = Object.prototype.hasOwnProperty.call(applies, field)
+    ? applies[field] : applies[plural];
+  if (value == null) return "";
+  return (Array.isArray(value) ? value : [value]).join(", ");
+}
+
+function parseRuleApplicabilityValue(field, text) {
+  const values = String(text || "").split(/[,，\n]+/)
+    .map((value) => value.trim()).filter(Boolean);
+  if (!values.length) return undefined;
+  if (field === "shot_no" || field === "scene_no") {
+    return values.map((value) => {
+      const number = Number(value);
+      if (!Number.isInteger(number) || number <= 0)
+        throw new Error(`${field === "shot_no" ? "镜头" : "场次"}范围必须是正整数`);
+      return number;
+    });
+  }
+  return values;
+}
+
+function renderRuleEditor(card, state) {
+  const list = card.querySelector(".rule-editor-list");
+  const rows = state.rules || [];
+  list.innerHTML = rows.length ? rows.map((rule, index) => `
+    <div class="rule-editor-row${rule.enabled === false ? " disabled" : ""}"
+        data-rule-index="${index}">
+      <label><span>规则键（相同键才会逐层覆盖）</span>
+        <input data-rule-key value="${esc(rule.key || "")}" placeholder="例如 visual.palette"></label>
+      <label class="rule-value-field"><span>规则内容</span>
+        <textarea data-rule-value rows="2" placeholder="写清可执行的创作约束">${esc(
+          ruleValueText(rule))}</textarea></label>
+      <button type="button" class="rule-row-delete" data-rule-delete
+        aria-label="删除规则 ${esc(rule.key || index + 1)}">删除</button>
+      <label class="rule-enabled-field"><span>是否生效</span>
+        <input type="checkbox" data-rule-enabled ${rule.enabled === false ? "" : "checked"}>
+        <small>${rule.enabled === false ? "已停用，不进入生产" : "已启用"}</small></label>
+      <fieldset class="rule-applicability-fields"><legend>适用范围（全部留空 = 本层全部镜头）</legend>
+        ${RULE_APPLICABILITY_FIELDS.map(([field, label, placeholder]) => `<label>
+          <span>${label}</span><input data-rule-app-field="${field}"
+            value="${esc(ruleApplicabilityValue(rule, field))}"
+            placeholder="${esc(placeholder)}"></label>`).join("")}
+      </fieldset>
+      <small>当前适用：${esc(ruleApplicabilityText(rule))}</small>
+    </div>`).join("") : `<div class="rule-editor-empty">
+      本层尚无自定义规则。可以保持为空，或添加一条明确的创作约束。</div>`;
+  card.querySelector(".rule-editor-version").textContent = `v${state.version}`;
+  const suppressions = card.querySelector("[data-rule-suppressions]");
+  if (suppressions) suppressions.value = JSON.stringify(
+    Array.isArray(state.suppressions) ? state.suppressions : [], null, 2);
+  card.querySelector("[data-rule-add]").disabled = false;
+  card.querySelector("[data-rule-save]").disabled = false;
+  card.querySelectorAll("[data-rule-delete]").forEach((button) => {
+    button.onclick = () => {
+      try {
+        const index = Number(button.closest("[data-rule-index]").dataset.ruleIndex);
+        state.rules = collectRuleEditor(card, state);
+        state.suppressions = collectRuleSuppressions(card);
+        state.rules.splice(index, 1);
+        renderRuleEditor(card, state);
+        card.querySelector(".rule-editor-message").textContent = "有未保存修改";
+      } catch (error) { showToast(error.message, "error"); }
+    };
+  });
+}
+
+function collectRuleEditor(card, state) {
+  const result = [];
+  const seen = new Set();
+  card.querySelectorAll(".rule-editor-row").forEach((row) => {
+    const index = Number(row.dataset.ruleIndex);
+    const original = state.rules[index] || {};
+    const key = row.querySelector("[data-rule-key]").value.trim();
+    const valueText = row.querySelector("[data-rule-value]").value.trim();
+    if (!key && !valueText) return;
+    if (!key) throw new Error("每条规则都要填写规则键");
+    if (!valueText) throw new Error(`规则 ${key} 缺少内容`);
+    if (seen.has(key)) throw new Error(`同一层不能重复规则键：${key}`);
+    seen.add(key);
+    const next = { ...original, key,
+      enabled: Boolean(row.querySelector("[data-rule-enabled]")?.checked) };
+    const originalText = ruleValueText(original);
+    const value = valueText === originalText
+      ? (Object.prototype.hasOwnProperty.call(original, "value")
+        ? original.value : original.text)
+      : valueText;
+    if (Object.prototype.hasOwnProperty.call(original, "text")
+        && !Object.prototype.hasOwnProperty.call(original, "value")) next.text = value;
+    else next.value = value;
+    const applicability = {};
+    row.querySelectorAll("[data-rule-app-field]").forEach((input) => {
+      const parsed = parseRuleApplicabilityValue(input.dataset.ruleAppField, input.value);
+      if (parsed !== undefined) applicability[input.dataset.ruleAppField] = parsed;
+    });
+    next.applicability = applicability;
+    delete next.applies_to;
+    result.push(next);
+  });
+  return result;
+}
+
+function collectRuleSuppressions(card) {
+  const input = card.querySelector("[data-rule-suppressions]");
+  const text = String(input?.value || "").trim();
+  if (!text) return [];
+  let value;
+  try { value = JSON.parse(text); }
+  catch (_) { throw new Error("显式停用项必须是合法 JSON 数组"); }
+  if (!Array.isArray(value)) throw new Error("显式停用项必须是 JSON 数组");
+  return value;
+}
+
+async function loadRuleEditor(card, config) {
+  const message = card.querySelector(".rule-editor-message");
+  try {
+    const payload = await api(config.path);
+    const state = {
+      version: Number(payload.version || 0),
+      content: payload.content || {},
+      rules: (payload.rules || payload.content?.rules || []).map((row) => ({ ...row })),
+      suppressions: (payload.suppressions || payload.content?.suppressions || [])
+        .map((row) => typeof row === "object" ? { ...row } : row),
+    };
+    card._ruleState = state;
+    message.textContent = state.rules.length
+      ? `已载入 ${state.rules.length} 条；修改后请保存` : "尚无自定义规则";
+    renderRuleEditor(card, state);
+    card.querySelector("[data-rule-add]").onclick = () => {
+      try {
+        state.rules = collectRuleEditor(card, state);
+        state.suppressions = collectRuleSuppressions(card);
+      }
+      catch (error) { showToast(error.message, "error"); return; }
+      state.rules.push({ key: "", value: "", enabled: true,
+        category: "creative", source: "user_ui" });
+      renderRuleEditor(card, state);
+      message.textContent = "已添加空规则，请填写并保存";
+      card.querySelector(".rule-editor-row:last-child [data-rule-key]")?.focus();
+    };
+    card.querySelector("[data-rule-save]").onclick = async (event) => {
+      const button = event.currentTarget;
+      try {
+        const rules = collectRuleEditor(card, state);
+        button.disabled = true; button.textContent = "保存中…";
+        const suppressions = collectRuleSuppressions(card);
+        const content = { ...state.content, schema: "aifos.creative-rule-pack/v1",
+          scope: config.scope, rules, suppressions };
+        const saved = await api(config.path, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ project_id: config.projectId,
+            episode_id: config.episodeId,
+            expected_version: state.version, content }),
+        });
+        state.version = Number(saved.version || state.version);
+        state.content = saved.content || content;
+        state.rules = (saved.rules || state.content.rules || []).map((row) => ({ ...row }));
+        state.suppressions = (saved.suppressions || state.content.suppressions || [])
+          .map((row) => typeof row === "object" ? { ...row } : row);
+        renderRuleEditor(card, state);
+        message.textContent = `已保存 v${state.version}；后续规则栈会按新版本解析`;
+        showToast(`${config.label}已保存`, "ok");
+      } catch (error) {
+        if (error.status === 409) {
+          message.textContent = "规则已在其他页面更新，正在载入最新版…";
+          showToast("规则版本冲突，已刷新最新版，请核对后再保存", "error");
+          await loadRuleEditor(card, config);
+          return;
+        }
+        message.textContent = `保存失败：${error.message}`;
+        showToast(error.message, "error");
+      } finally {
+        button.disabled = false; button.textContent = "保存本层规则";
+      }
+    };
+  } catch (error) {
+    message.textContent = `规则暂时不可用：${error.message}`;
+    card.querySelector(".rule-editor-list").innerHTML = `<div class="rule-editor-empty">
+      不影响剧本审阅；可稍后刷新页面重试。</div>`;
+  }
+}
+
+function bindRuleScopeEditors(root, data) {
+  const projectId = Number(data.project?.id || data.episode?.project_id);
+  const episodeId = Number(data.episode?.id);
+  if (!projectId || !episodeId) {
+    root.querySelectorAll(".rule-editor-message").forEach((node) => {
+      node.textContent = "缺少项目或剧集标识，规则编辑暂不可用；不影响剧本审阅。";
+    });
+    return;
+  }
+  const configs = {
+    project: { path: `/api/project/${projectId}/rules`, scope: "project_series",
+      projectId, label: "本剧贯穿规则" },
+    episode: { path: `/api/episode/${episodeId}/rules`, scope: "episode_temporary",
+      projectId, episodeId, label: "本集临时规则" },
+  };
+  root.querySelectorAll("[data-rule-editor]").forEach((card) => {
+    const config = configs[card.dataset.ruleEditor];
+    if (config) loadRuleEditor(card, config);
+  });
+}
+
+function ruleStackAuditPlaceholder(shot, modality = "production", label = "本镜",
+                                   stage = "production") {
+  const shotNo = Number(shot?.shot_no);
+  const fallbackEra = shot?.era_context || shot?.era || "待解析";
+  const fallbackPhase = shot?.story_phase || shot?.active_realm_id
+    || shot?.realm_id || "present";
+  return `<div class="rule-stack-audit loading" data-rule-stack-shot="${shotNo}"
+      data-rule-stack-modality="${esc(modality)}" data-rule-stack-stage="${esc(stage)}"
+      data-rule-stack-label="${esc(label)}"
+      data-fallback-era="${esc(fallbackEra)}" data-fallback-phase="${esc(fallbackPhase)}">
+    <div><b>${esc(label)}规则 · 时代 ${esc(fallbackEra)}</b><span>相位 ${esc(fallbackPhase)}</span></div>
+    <small>正在读取本镜规则来源与覆盖记录…</small>
+  </div>`;
+}
+
+function ruleStackAuditHtml(stack, fallbackEra = "待解析", fallbackPhase = "present") {
+  const context = stack?.context || {};
+  const sources = stack?.sources && typeof stack.sources === "object"
+    ? stack.sources : {};
+  const effective = stack?.effective_rules || stack?.final_rules || {};
+  const overridden = Array.isArray(stack?.overridden)
+    ? stack.overridden : (Array.isArray(stack?.suppressed) ? stack.suppressed : []);
+  const era = context.era || effective["world.era"] || fallbackEra;
+  const phase = context.story_phase || effective["world.story_phase"] || fallbackPhase;
+  const counts = {};
+  Object.values(sources).forEach((source) => {
+    const layer = source?.layer || "unknown";
+    counts[layer] = (counts[layer] || 0) + 1;
+  });
+  const sourceSummary = Object.entries(counts).map(([layer, count]) =>
+    `${ruleLayerLabel(layer)} ${count}`).join(" · ") || "暂无来源记录";
+  const effectiveRows = Object.entries(effective).map(([key, value]) => {
+    const source = sources[key] || {};
+    return `<li><code>${esc(key)}</code><span>${esc(
+      typeof value === "string" ? value : JSON.stringify(value))}</span>
+      <small>${esc(ruleLayerLabel(source.layer))} · ${esc(source.source || "未登记")}${
+        source.technical_hard ? " · 🔒 不可覆盖" : ""}</small></li>`;
+  }).join("");
+  const overriddenRows = overridden.map((item) => `<li>
+    <code>${esc(item.key || "未命名规则")}</code>
+    <span>${esc(ruleLayerLabel(item.source?.layer))} → ${esc(
+      ruleLayerLabel(item.overridden_by?.layer))}</span>
+    <small>${esc(item.reason === "technical_hard_constraint"
+      ? "技术硬门最终裁决" : item.reason === "higher_creative_suppression"
+        ? "被高层规则显式停用" : "被更高优先级创作规则替换")}</small></li>`).join("");
+  return `<div class="rule-stack-audit-head"><div><b>时代 ${esc(era)}</b>
+      <span>相位 ${esc(phase)}</span></div><small>来源：${esc(sourceSummary)}</small></div>
+    <details><summary>生效规则 ${Object.keys(effective).length} 条 · 被覆盖项 ${overridden.length} 条</summary>
+      <div class="rule-stack-audit-columns">
+        <section><h4>当前生效与来源</h4><ul>${effectiveRows || "<li>暂无规则记录</li>"}</ul></section>
+        <section><h4>被覆盖项</h4><ul>${overriddenRows || "<li>本镜没有同键冲突</li>"}</ul></section>
+      </div>
+      <p class="rule-hard-note">🔒 技术硬门始终最后裁决，不可被任何创作层关闭、降级或覆盖。</p>
+    </details>`;
+}
+
+async function bindRuleStackAudits(root, episodeId) {
+  const nodes = [...root.querySelectorAll("[data-rule-stack-shot]")];
+  if (!episodeId) {
+    nodes.forEach((node) => {
+      node.classList.remove("loading"); node.classList.add("unavailable");
+      node.querySelector("small").textContent = "缺少剧集标识，规则审计暂不可用。";
+    });
+    return;
+  }
+  const byShot = new Map();
+  nodes.forEach((node) => {
+    const shotNo = Number(node.dataset.ruleStackShot);
+    if (!Number.isFinite(shotNo) || shotNo <= 0) {
+      node.classList.remove("loading"); node.classList.add("unavailable");
+      node.querySelector("small").textContent = "镜头编号缺失，规则审计暂不可用。";
+      return;
+    }
+    const stage = node.dataset.ruleStackStage || "production";
+    const modality = node.dataset.ruleStackModality || "production";
+    const key = `${shotNo}:${stage}:${modality}`;
+    if (!byShot.has(key)) byShot.set(key, { shotNo, stage, modality, nodes: [] });
+    byShot.get(key).nodes.push(node);
+  });
+  await Promise.all([...byShot.values()].map(async ({ shotNo, stage, modality, nodes: targets }) => {
+    try {
+      const query = new URLSearchParams({ shot_no: String(shotNo), stage, modality });
+      const stack = await api(`/api/episode/${episodeId}/rule-stack?${query}`);
+      targets.forEach((node) => {
+        node.classList.remove("loading", "unavailable");
+        node.innerHTML = `<div class="rule-stack-audit-label">${esc(
+          node.dataset.ruleStackLabel || "本镜")}规则</div>${ruleStackAuditHtml(
+          stack, node.dataset.fallbackEra, node.dataset.fallbackPhase)}`;
+      });
+    } catch (error) {
+      targets.forEach((node) => {
+        node.classList.remove("loading"); node.classList.add("unavailable");
+        node.innerHTML = `<div><b>时代 ${esc(node.dataset.fallbackEra || "待解析")}</b>
+          <span>相位 ${esc(node.dataset.fallbackPhase || "present")}</span></div>
+          <small>规则审计暂不可用；不影响当前镜头审核。${esc(error.message)}</small>`;
+      });
+    }
+  }));
+}
+
 /* 空白必须可解释:是还没做、做了没留痕、还是这一类根本不进出图清单。 */
 const PROMPT_ACTUAL_STATE_CN = {
   produced: { label: "已生产", hint: "下面是当时真实发送的输入" },
@@ -10531,6 +10959,11 @@ async function renderPromptReviewPage(episodeId) {
         <div><b>本镜动作</b><span>${esc(
           shot.description || "未登记可见动作")}</span></div>
       </div>
+      <div class="prompt-modality-rule-stacks">
+        ${ruleStackAuditPlaceholder(shot, "image", "关键图", "shot_image")}
+        ${ruleStackAuditPlaceholder(shot, "image", "首尾帧", "frames")}
+        ${ruleStackAuditPlaceholder(shot, "video", "视频", "videos")}
+      </div>
       ${(shot.issues || []).length ? `<div class="prompt-shot-alert">
         <b>本镜有 ${shot.issues.length} 个阻断事实</b>
         <ul>${shot.issues.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>
@@ -10566,9 +10999,7 @@ async function renderPromptReviewPage(episodeId) {
           <p>逐镜检查关键帧、首帧、尾帧与 Seedance 2 视频提示词。页面与生产共用同一合同编译器。</p>
         </div>
       </div>
-      <div class="prompt-rule-priority">
-        <span>规则优先级</span><b>最高规则</b><small>${esc(data.contract_schema)}</small>
-      </div>
+      ${rulePriorityHtml(true)}
     </header>
     <section class="prompt-review-summary">
       <div class="prompt-summary-main ${esc(String(summary.status || "BLOCK").toLowerCase())}">
@@ -10617,6 +11048,7 @@ async function renderPromptReviewPage(episodeId) {
   document.getElementById("prompt-back").onclick = () => {
     location.hash = `#/episode/${episodeId}`;
   };
+  bindRuleStackAudits(app, episodeId);
   document.querySelectorAll("[data-jump-shot]").forEach((button) => {
     button.onclick = () => document.getElementById(
       `prompt-shot-${button.dataset.jumpShot}`)?.scrollIntoView({
@@ -10787,7 +11219,7 @@ async function renderCanvasView(episodeId, forceView = "") {
         <b>${lastFailed ? `上次制作在「${esc(STAGE_CN[lastFailed.stage] || lastFailed.stage)}」失败 ⚠️`
           : (ep.status === "qc_failed" ? "成片质检未通过 ⚠️" : "上次制作失败 ⚠️")}</b>
         <span>${firstImageFailure
-          ? `${currentImageFailures.length} 张历史问题关键帧已由系统接管：自动修正提示词、补抽3张并选优；无需手机逐张处理，其他关键帧继续生产。`
+          ? `${currentImageFailures.length} 张历史问题关键帧已由系统接管：Codex自动归因并优化提示词与参考图，每轮并行生成4张、AI选优复检，最多10轮；无需手机逐张处理，其他关键帧继续生产。`
           : `${lastFailed ? esc((lastFailed.error || "").slice(0, 200)) + ";" : ""}
         已完成的剧本/人物/图片/视频全部保留,点右侧按钮从断点接着做,只补缺失部分,不重复消耗额度。`}</span>
       </div>
@@ -11249,12 +11681,12 @@ function imageLineControlsHtml() {
   </div>`;
 }
 
-/* ---- 创作选片模式:一键关闭阻断式内容质检,候选由AI自动选优 ---- */
+/* ---- 创作选片模式：保留内容质检，以非阻断四抽循环自动返修 ---- */
 function selectionModeControlsHtml() {
   return `<div class="style-row selection-mode-row">
-    <label>创作选片模式</label>
+    <label>自动质检选优</label>
     <label class="il-label sm-toggle">
-      <input type="checkbox" id="sm-master" disabled> 一键开启
+      <input type="checkbox" id="sm-master" disabled> 自动选优返修
     </label>
     <label class="il-label sm-toggle">
       <input type="checkbox" id="sm-image-qc" disabled> 图片内容质检
@@ -11278,17 +11710,21 @@ async function bindSelectionModeControls() {
     master.checked = !!st.selection_mode;
     imgQc.checked = !!st.image_content_qc;
     vidQc.checked = !!st.video_content_qc;
-    // 选片模式开启时内容质检一律视为关闭:子开关只读展示,不误导
-    imgQc.disabled = vidQc.disabled = !!st.selection_mode;
-    master.disabled = false;
-    if (!st.selection_mode) { imgQc.disabled = vidQc.disabled = false; }
+    // 选片模式改变的是“是否阻断”，不是“是否执行质检”。独立开关
+    // 始终按 API 回显的请求值展示，不再把开启选片模式冒充成关闭 QC。
+    master.disabled = imgQc.disabled = vidQc.disabled = false;
+    const effectiveImageQc = st.effective_image_content_qc
+      ?? st.image_content_qc;
+    const effectiveVideoQc = st.effective_video_content_qc
+      ?? st.video_content_qc;
     hint.textContent = st.selection_mode
-      ? `选片模式开启:每镜固定 ${st.shot_candidate_count} 张候选,`
-        + "AI自动选优并继续，无需手机逐张确认；问题镜头自动补抽3张。"
-        + "内容质检不阻断；不满意仍可事后改词重抽。"
-        + "生成前导演合同检查与技术完整性检查始终开启"
+      ? `自动质检选优已开启：图片质检${effectiveImageQc ? "开启" : "关闭"}、`
+        + `视频质检${effectiveVideoQc ? "开启" : "关闭"}，但均不阻断。`
+        + `每轮固定 ${st.shot_repair_candidate_count || st.shot_candidate_count || 4} 张，`
+        + `AI选优复检；首轮计入、最多 ${st.max_candidate_rounds || 10} 轮。`
+        + "Codex自动归因、优化提示词并选用最合适参考图；到上限则留风险继续，无需手机逐张确认。"
       : `选片模式关闭(每镜候选固定 ${st.shot_candidate_count} 张;`
-        + "内容质检按左侧两个独立开关执行)";
+        + "内容质检按左侧两个独立开关执行，可能恢复旧式门禁)";
   };
   const save = async (body, revert) => {
     master.disabled = imgQc.disabled = vidQc.disabled = true;
@@ -11299,7 +11735,7 @@ async function bindSelectionModeControls() {
       });
       render();
       showToast(st.selection_mode
-        ? "创作选片模式已开启：AI自动选优，无需手机逐张确认"
+        ? "自动质检选优已开启：质检非阻断，四抽循环自动返修"
         : "设置已保存", "ok");
     } catch (e) {
       revert();
@@ -11949,6 +12385,7 @@ function renderScriptReview(data, episodeId) {
       : `<div class="dim" style="margin-top:6px">还没有参考图。有官方设定图/画风样例就传上来,
          人物形象和画风会稳定得多;之后在「资产中心」也能管理。</div>`}
     </div>
+    ${ruleScopeEditorsHtml()}
     ${storyAnalysisEditorHtml(storyAnalysis, data.story_analysis_version)}
     ${scriptIndependentReviewHtml(
       data.story_intelligence?.script_independent_review)}
@@ -11966,6 +12403,7 @@ function renderScriptReview(data, episodeId) {
   bindLightbox(app);
   bindImageLineControls();
   bindSelectionModeControls();
+  bindRuleScopeEditors(app, data);
   const post = (path, body) => api(path, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body) });
@@ -12204,7 +12642,7 @@ function storyboardShotIssues(data) {
     (byShot[failure.shot_no] = byShot[failure.shot_no] || []).push({
       severity: "error",
       check: "关键帧二次质检",
-      message: messages.join("；") || "系统将自动优化提示词、补抽3张并选优",
+      message: messages.join("；") || "Codex将自动归因并优化提示词与参考图；每轮生成4张、AI选优复检，最多10轮",
       shot_no: failure.shot_no,
       plan_id: failure.item_id,
       revision_feedback: failure.revision_feedback || "",
@@ -12450,7 +12888,7 @@ function shotProductionTableHtml(data, options = {}) {
             <b>${fmt(shot.duration, 1)}s</b><span>${esc(shot.timecode || "时间码未填")}</span></td>
           <td class="storyboard-reference" data-label="参考分镜">
             ${storyboardMediaThumb(keyframeUrl,
-              failedKeyframe ? "二次质检失败稿" : "参考分镜", no, imageState)}
+              failedKeyframe ? "质检问题·自动返修中" : "参考分镜", no, imageState)}
             ${shotInlineRevisionHtml(
               no, !!keyframeUrl, context === "live", data)}</td>
           <td class="storyboard-frames" data-label="首尾帧"><div class="storyboard-frame-pair">
@@ -12470,6 +12908,7 @@ function shotProductionTableHtml(data, options = {}) {
           <td class="storyboard-movement" data-label="运镜">${storyboardCameraHtml(shot)}</td>
           <td class="storyboard-description" data-label="画面描述">
             <p>${esc(description)}</p>${storyboardCharacterHtml(shot)}
+            ${ruleStackAuditPlaceholder(shot)}
             <details><summary>连续性与剧本依据</summary>
               <div><b>起：</b>${esc(stateInline(shot.start_state))}</div>
               <div><b>止：</b>${esc(stateInline(shot.end_state))}</div>
@@ -12501,6 +12940,7 @@ function shotProductionTableHtml(data, options = {}) {
           <option value="issues">有质检问题</option>
         </select></label>
     </div>
+    ${rulePriorityHtml(true)}
     <div class="shot-table-filter-summary" aria-live="polite">显示全部 ${shots.length} 个镜头</div>
     <div class="shot-production-table-wrap" role="region"
       aria-label="分镜头生产表，可横向滚动" tabindex="0">
@@ -12520,6 +12960,7 @@ function shotProductionTableHtml(data, options = {}) {
 
 function bindShotProductionTable(root, data, onSelect) {
   bindShotInlineRevisions(root, data);
+  bindRuleStackAudits(root, data.episode?.id);
   root.querySelectorAll(".storyboard-media-button").forEach((button) => {
     button.onclick = (event) => {
       event.stopPropagation();
@@ -12982,7 +13423,7 @@ class StoryboardCanvas {
         failedKeyframe ? " qc-needs-human" : ""}"
            data-canvas-node data-shot="${shot.shot_no}" style="left:${p.x}px;top:${p.y}px">
         ${img ? `<img src="${esc(img)}" alt="镜头${shot.shot_no}${
-          failedKeyframe ? "二次质检失败稿" : "关键图"}" draggable="false">`
+          failedKeyframe ? "质检问题·自动返修中" : "关键图"}" draggable="false">`
               : `<div class="no-img">暂无关键图</div>`}
         <div class="body">
           <div class="head"><span class="sn">#${String(shot.shot_no).padStart(2, "0")}</span>
@@ -13190,9 +13631,9 @@ class StoryboardCanvas {
     panel.innerHTML = `
       <h3>${esc(shot.unit_id || `镜头 #${String(shotNo).padStart(2, "0")}`)} · 场${shot.scene_no}</h3>
       ${keyframeUrl ? `<img class="preview" src="${esc(keyframeUrl)}" alt="${
-        failedKeyframe ? "二次质检失败稿" : "关键图"}">` : ""}
-      ${failedKeyframe ? `<div class="issue error">[关键帧二次质检]
-        ${esc((failedKeyframe.issues || []).join("；") || "系统自动修正并补抽3张")}</div>` : ""}
+        failedKeyframe ? "质检问题·自动返修中" : "关键图"}">` : ""}
+      ${failedKeyframe ? `<div class="issue error">[关键帧质检问题 · 自动返修中]
+        ${esc((failedKeyframe.issues || []).join("；") || "Codex自动归因优化；本轮并行生成4张并选优复检")}</div>` : ""}
       ${shotInlineRevisionHtml(shotNo, !!keyframeUrl, false, this.data)}
       <h4>首尾帧</h4>
       <div class="thumbs editable-frame-thumbs">
@@ -13250,7 +13691,7 @@ class StoryboardCanvas {
       <div class="prompt">${esc(shot.seedance_prompt_compact || shot.seedance_prompt || shot.prompt)}</div>
       <h4>产物</h4>
       <ul class="links">
-        ${this.link(failedKeyframe ? "二次质检失败稿" : "关键图", keyframeUrl)}
+        ${this.link(failedKeyframe ? "质检问题·自动返修中" : "关键图", keyframeUrl)}
         ${this.link("首帧", art.first[shotNo])}
         ${this.link("尾帧", art.last[shotNo])}
         ${this.link("视频", art.videos[shotNo])}

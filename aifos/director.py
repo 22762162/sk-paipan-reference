@@ -97,6 +97,7 @@ from .selection_mode import (
     evaluate_candidate_promotion,
 )
 from .rule_governance import next_revision_round, stack_revision_feedback
+from .rule_scope import RuleScopeError, resolve_rules
 from .spatial_language import derive_movement_term, spatial_lines
 from .storyboard_preflight import (describe_issues, preflight_storyboard,
                                   repairable_shots)
@@ -791,6 +792,255 @@ class Director:
             episode_id, "production_standard", snapshot)
         return snapshot
 
+    @staticmethod
+    def _normalize_rule_pack(pack, *, scope, project_id, episode_id=None,
+                             source=""):
+        """Adapt stored/user rule packs to the single rule-scope resolver.
+
+        The public editor accepts friendly ``text`` and plural selector names;
+        the resolver deliberately consumes a smaller deterministic contract.
+        Disabled rows are history, not effective rules.  Bindings are injected
+        by the server-side owner so a pasted pack cannot claim another work.
+        """
+        pack = pack if isinstance(pack, dict) else {}
+        aliases = {
+            "stages": "stage", "modalities": "modality",
+            "shot_nos": "shot_no", "scene_nos": "scene_no",
+            "story_phases": "story_phase", "eras": "era",
+        }
+        rows = []
+        for index, raw in enumerate(pack.get("rules") or []):
+            if not isinstance(raw, dict) or raw.get("enabled") is False:
+                continue
+            key = str(raw.get("key") or "").strip()
+            if not key:
+                continue
+            applicability = raw.get("applicability", raw.get("applies_to", {}))
+            applicability = (
+                dict(applicability) if isinstance(applicability, dict) else {})
+            for plural, singular in aliases.items():
+                if plural in applicability and singular not in applicability:
+                    applicability[singular] = applicability.pop(plural)
+            row = {
+                "key": key,
+                "value": copy.deepcopy(
+                    raw["value"] if "value" in raw
+                    else raw.get("text", "")),
+                "applicability": applicability,
+                "source": str(raw.get("source") or source
+                              or f"{scope}:{index + 1}"),
+            }
+            if raw.get("exception_kind") or raw.get("exception"):
+                row["exception_kind"] = (
+                    raw.get("exception_kind") or raw.get("exception"))
+            rows.append(row)
+        bundle = {
+            "rules": rows,
+            "suppressions": copy.deepcopy(pack.get("suppressions") or []),
+            "project_id": str(project_id),
+            "source": source or scope,
+        }
+        for suppression in bundle["suppressions"]:
+            if not isinstance(suppression, dict):
+                continue
+            applicability = suppression.get(
+                "applicability", suppression.get("applies_to", {}))
+            if not isinstance(applicability, dict):
+                continue
+            normalized = dict(applicability)
+            for plural, singular in aliases.items():
+                if plural in normalized and singular not in normalized:
+                    normalized[singular] = normalized.pop(plural)
+            suppression["applicability"] = normalized
+            suppression.pop("applies_to", None)
+        if episode_id is not None:
+            bundle["episode_id"] = str(episode_id)
+        return bundle
+
+    def _load_rule_layers(self, project, episode, standard_snapshot):
+        """Load isolated base/series/episode packs and record their versions."""
+        content = (standard_snapshot or {}).get("content") or {}
+        standard_rules = content.get("rules") or {}
+        base_pack = {
+            "rules": list(standard_rules.get("creative_rules") or [])
+        }
+        if not base_pack["rules"]:
+            base_pack["rules"] = [
+                {
+                    "key": "world.era_policy",
+                    "value": (
+                        "逐镜以当前剧情相位和明确时代为准；不得用整集题材"
+                        "替代本镜事实。"),
+                },
+                {
+                    "key": "physics.reality",
+                    "value": (
+                        "人物、道具、载具、家具和镜头空间必须符合真实支撑、"
+                        "遮挡、重力、惯性、接触、可达性与使用方向。"),
+                },
+            ]
+        project_pack, project_version = ({}, 0)
+        latest_project_document = getattr(
+            self.projects, "latest_project_document", None)
+        if callable(latest_project_document):
+            project_pack, project_version = latest_project_document(
+                project["id"], "project_rules")
+            project_pack = project_pack or {}
+        episode_pack, episode_version = self.projects.latest_document(
+            episode["id"], "episode_rules")
+        normalized_base = self._normalize_rule_pack(
+            base_pack, scope="system_base", project_id=project["id"],
+            source="production_standard")
+        normalized_base.pop("project_id", None)
+        return {
+            "base": normalized_base,
+            "project": self._normalize_rule_pack(
+                project_pack or {}, scope="project_series",
+                project_id=project["id"],
+                source=f"project_rules:v{project_version}"),
+            "episode": self._normalize_rule_pack(
+                episode_pack or {}, scope="episode_temporary",
+                project_id=project["id"], episode_id=episode["id"],
+                source=f"episode_rules:v{episode_version}"),
+            "project_version": project_version,
+            "episode_version": episode_version,
+        }
+
+    @staticmethod
+    def _shot_rule_phase(shot):
+        shot = shot if isinstance(shot, dict) else {}
+        return str(
+            shot.get("story_phase") or shot.get("active_realm_id")
+            or shot.get("realm_id") or "present").strip()
+
+    def _resolve_effective_rules(self, ctx, *, shot=None, stage="",
+                                 modality=""):
+        """Resolve the one effective rule stack used by prompt, QC and UI."""
+        shot = shot if isinstance(shot, dict) else {}
+        layers = ctx.get("rule_layers") or self._load_rule_layers(
+            ctx["project"], ctx["episode"], ctx.get("production_standard"))
+        world = (ctx.get("script") or {}).get("story_world") or {}
+        local_era = str(
+            shot.get("era_context") or shot.get("era")
+            or shot.get("active_realm_id") or "").strip()
+        episode_rows = list((layers.get("episode") or {}).get("rules") or [])
+        legacy_values = {
+            "world.era": world.get("era_and_location") or world.get("name"),
+            "world.hard_rules": world.get("hard_rules"),
+            "world.forbidden_drift": world.get("forbidden_drift") or [],
+            "world.sanctioned_anachronisms": (
+                world.get("sanctioned_anachronisms") or []),
+        }
+        existing_keys = {row.get("key") for row in episode_rows
+                         if isinstance(row, dict)}
+        for key, value in legacy_values.items():
+            if key not in existing_keys and value not in (None, "", []):
+                episode_rows.append({
+                    "key": key, "value": copy.deepcopy(value),
+                    "source": "episode_story_bible",
+                })
+        episode_bundle = dict(layers.get("episode") or {})
+        episode_bundle["rules"] = episode_rows
+
+        shot_rows = []
+        if local_era:
+            shot_rows.append({
+                "key": "world.era", "value": local_era,
+                "source": "current_shot.era",
+            })
+        for field, key in (
+                ("story_phase", "world.story_phase"),
+                ("active_realm_id", "world.active_realm_id"),
+                ("sanctioned_anachronisms",
+                 "world.sanctioned_anachronisms")):
+            if field in shot and shot.get(field) not in (None, ""):
+                shot_rows.append({
+                    "key": key, "value": copy.deepcopy(shot.get(field)),
+                    "source": f"current_shot.{field}",
+                })
+        for raw in shot.get("temporary_rules") or shot.get("rules") or []:
+            if isinstance(raw, dict):
+                shot_rows.append(copy.deepcopy(raw))
+        shot_bundle = self._normalize_rule_pack(
+            {"rules": shot_rows}, scope="current_shot",
+            project_id=ctx["project"]["id"],
+            episode_id=ctx["episode"]["id"],
+            source=f"shot:{shot.get('shot_no') or 0}")
+
+        profile = ctx.get("production_profile") or {}
+        technical = [
+            {"key": "technical.video_model",
+             "value": profile.get("video_model", "seedance2.0fast_vip")},
+            {"key": "technical.resolution",
+             "value": profile.get("resolution", "720p")},
+            {"key": "technical.voice",
+             "value": profile.get("voice", "jimeng_builtin")},
+            {"key": "technical.lip_sync",
+             "value": bool(profile.get("lip_sync", True))},
+            {"key": "technical.no_burned_subtitles",
+             "value": not bool(profile.get("burn_subtitles", False))},
+        ]
+        context = {
+            "project_id": str(ctx["project"]["id"]),
+            "episode_id": str(ctx["episode"]["id"]),
+            "stage": str(stage or modality or "production"),
+            "modality": str(modality or stage or "production"),
+            "shot_no": shot.get("shot_no"),
+            "scene_no": shot.get("scene_no"),
+            "story_phase": self._shot_rule_phase(shot),
+            "era": local_era or str(world.get("era_and_location") or ""),
+        }
+        try:
+            return resolve_rules(
+                context,
+                technical_hard=technical,
+                system_base=layers.get("base"),
+                project_series=layers.get("project"),
+                episode_temporary=episode_bundle,
+                current_shot=shot_bundle)
+        except RuleScopeError as exc:
+            raise AifosError(f"规则分层合同无效:{exc}") from exc
+
+    @staticmethod
+    def _effective_rule_texts(resolved):
+        texts = []
+        for key, value in resolved.rules.items():
+            if key.startswith("technical."):
+                continue
+            if isinstance(value, str):
+                text = value.strip()
+            else:
+                text = json.dumps(value, ensure_ascii=False,
+                                  separators=(",", ":"))
+            if text:
+                texts.append(f"{key}={text}")
+        return texts
+
+    def _attach_effective_rules(self, ctx, shot, payload, *, stage,
+                                modality):
+        resolved = self._resolve_effective_rules(
+            ctx, shot=shot, stage=stage, modality=modality)
+        contract = resolved.as_dict()
+        payload["effective_rule_stack"] = contract
+        payload["rule_fingerprint"] = resolved.fingerprint
+        values = resolved.rules
+        if values.get("world.era"):
+            payload["era_context"] = str(values["world.era"])
+        if "world.sanctioned_anachronisms" in values:
+            allowed = values["world.sanctioned_anachronisms"]
+            payload["sanctioned_anachronisms"] = (
+                list(allowed) if isinstance(allowed, (list, tuple))
+                else [str(allowed)] if str(allowed).strip() else [])
+        lines = self._effective_rule_texts(resolved)
+        payload["effective_rule_lines"] = lines
+        return resolved
+
+    def _storyboard_rule_payload(self, ctx):
+        payload = {}
+        self._attach_effective_rules(
+            ctx, {}, payload, stage="storyboard", modality="storyboard")
+        return payload
+
     def _episode_quality_policy(self, episode_id, *, persist=False):
         policy, _ = self.projects.latest_document(episode_id, "quality_policy")
         normalized = normalize_quality_policy(policy)
@@ -977,6 +1227,31 @@ class Director:
                 episode["id"], persist=True),
             "run_id": run_id,
         }
+        ctx["rule_layers"] = self._load_rule_layers(
+            ctx["project"], ctx["episode"], standard_snapshot)
+        rule_snapshot = {
+            "schema": "aifos.resolved-rule-binding/v1",
+            "project_id": project["id"],
+            "episode_id": episode["id"],
+            "project_rule_version": ctx["rule_layers"]["project_version"],
+            "episode_rule_version": ctx["rule_layers"]["episode_version"],
+            "standard_fingerprint": standard_snapshot.get(
+                "fingerprint", ""),
+            "layers": {
+                key: copy.deepcopy(ctx["rule_layers"][key])
+                for key in ("base", "project", "episode")
+            },
+        }
+        rule_snapshot["fingerprint"] = "sha256:" + hashlib.sha256(
+            json.dumps(rule_snapshot, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":")).encode("utf-8")).hexdigest()
+        previous_rule_snapshot, _ = self.projects.latest_document(
+            episode["id"], "resolved_rule_snapshot")
+        if (previous_rule_snapshot or {}).get("fingerprint") != (
+                rule_snapshot["fingerprint"]):
+            self.projects.save_document(
+                episode["id"], "resolved_rule_snapshot", rule_snapshot)
+        ctx["resolved_rule_snapshot"] = rule_snapshot
         if force or fresh_assets:
             self._archive_force_rebuild_state(ctx)
         if fresh_assets:
@@ -1358,7 +1633,8 @@ class Director:
                     reason = str(exc2)
             # 一次修正/复审仍被内容规则拒绝时，不再隔离、失败或等待手机。
             # 这里只冻结修订后的合同；本镜第一次真实出图仍固定四张。
-            # 唯有四张都经视觉排名明确失败后，才允许消耗一次三张补抽。
+            # 唯有本轮四张都经视觉质检明确失败后，才进入下一轮四张；
+            # 总计十轮（首轮计入），且始终只影响本镜。
             for member in group:
                 payload = member["payload"]
                 payload["director_autonomy_mode"] = True
@@ -3870,11 +4146,16 @@ class Director:
                 if only_pending and item.get("status") not in ("pending",
                                                                "failed"):
                     return
+                previous_status = item.get("status")
                 item["status"] = status
                 item["error"] = error
                 # 计时:生成中记起点,完成/失败记单张耗时(供前端估算剩余时间)
                 if status == "generating":
-                    item["started_at"] = round(time.time(), 1)
+                    # 候选四抽会逐张回写进度；重复的 generating 更新不能
+                    # 把整轮起点不断后移，否则页面耗时永远接近0。
+                    if (previous_status != "generating"
+                            or not item.get("started_at")):
+                        item["started_at"] = round(time.time(), 1)
                     item.pop("finished_at", None)
                 elif status in ("done", "failed", "awaiting_human") \
                         and item.get("started_at"):
@@ -4515,9 +4796,8 @@ class Director:
             "defaults", "selection_mode", default=True), default=True)
 
     def _image_qc_enabled(self):
-        """图片内容 QC 开关；不影响普通选片模式的生成前合同审核。"""
-        if (self._preview_qc_bypass_enabled()
-                or self._selection_mode_enabled()):
+        """图片内容 QC 开关；选片模式只取消阻断，不再取消质检。"""
+        if self._preview_qc_bypass_enabled():
             return False
         value = self.config.get(
             "defaults", "image_content_qc", default=None)
@@ -4527,8 +4807,7 @@ class Director:
         return self._setting_enabled(value, default=True)
 
     def _video_content_qc_enabled(self):
-        if (self._preview_qc_bypass_enabled()
-                or self._selection_mode_enabled()):
+        if self._preview_qc_bypass_enabled():
             return False
         return self._setting_enabled(self.config.get(
             "defaults", "video_content_qc", default=True), default=True)
@@ -4552,34 +4831,51 @@ class Director:
         return 4
 
     def _shot_repair_candidate_count(self):
-        """问题镜头只补抽三张；首轮四张规则不受影响。"""
+        """问题镜头每一轮也固定四张，与首轮保持同一抽卡合同。"""
         try:
             configured = int(self.config.get(
-                "defaults", "shot_repair_candidate_count", default=3))
+                "defaults", "shot_repair_candidate_count", default=4))
         except (TypeError, ValueError):
-            configured = 3
-        if configured != 3:
+            configured = 4
+        if configured != 4:
             self.log.warn(
                 "director",
                 f"shot_repair_candidate_count={configured} 不在当前标准内，"
-                "已按问题镜头固定3张执行")
-        return 3
+                "已按问题镜头每轮固定4张执行")
+        return 4
+
+    def _shot_max_candidate_rounds(self):
+        """单镜总抽卡轮数上限；首轮计入，最多10轮/40张。"""
+        raw = self.config.get(
+            "defaults", "shot_max_candidate_rounds", default=None)
+        if raw is None:
+            # 兼容旧键：旧值表示“首轮之后还能返修几批”。
+            try:
+                raw = 1 + int(self.config.get(
+                    "defaults", "shot_auto_repair_batches", default=9))
+            except (TypeError, ValueError):
+                raw = 10
+        try:
+            configured = int(raw)
+        except (TypeError, ValueError):
+            configured = 10
+        if configured != 10:
+            self.log.warn(
+                "director",
+                f"shot_max_candidate_rounds={configured} 不在当前标准内，"
+                "已按总计10轮（首轮计入）执行")
+        return 10
 
     def _shot_auto_repair_batches(self):
-        """每个问题镜头自动修合同并补抽的有界批次数。"""
-        try:
-            configured = int(self.config.get(
-                "defaults", "shot_auto_repair_batches", default=1))
-        except (TypeError, ValueError):
-            configured = 1
-        return max(0, min(configured, 1))
+        """兼容旧消费方：返修批数=总轮数减去首轮。"""
+        return self._shot_max_candidate_rounds() - 1
 
     def _ensure_shot_contract_nonblocking(self, ctx, task):
         """合同异常时由AI导演就地修一次，再执行首轮四候选。
 
         该检查只处理镜头局部合同，不抛出“停止整集”的门禁异常。若
         一次修订后静态校验仍有意见，意见作为风险随候选保留；本阶段
-        不消耗三候选补抽额度。只有四张真实结果全部明确失败后才补三张。
+        不消耗候选返修轮数。只有四张真实结果全部明确失败后才进入下一轮。
         """
         item_id = str(task.get("item_id") or "")
         if (task.get("capability") != "image"
@@ -4604,13 +4900,13 @@ class Director:
                     or payload.get("prompt") or ""),
                 "issues_found": [],
                 "changes_made": ["旧失败合同已由AI导演替换为唯一静态合同"],
-                "blocking_reason": "固定3张返工共享同一替换合同",
+                "blocking_reason": "本返工轮4张共享同一替换合同",
             }
             frozen = self._image_generation_input(payload)
             payload["_prompt_review_frozen_input_hash"] = frozen[
                 "input_hash"]
             task["payload"] = payload
-            return "旧失败合同已替换，直接进入固定3张返工"
+            return "旧失败合同已替换，直接进入本轮固定4张返工"
         preflight_issues = [
             str(issue).strip() for issue in (
                 payload.get("_nonblocking_preflight_issues") or [])
@@ -4883,9 +5179,25 @@ class Director:
                 break
         return refs
 
-    def _era_exceptions(self, ctx_or_episode_id):
-        """剧本声明的穿越/带入物白名单(时代判断以剧本为准)。"""
+    def _era_exceptions(self, ctx_or_episode_id, shot=None, *,
+                        modality="image"):
+        """Return the effective shot-local cross-era whitelist.
+
+        Legacy callers still receive the episode bible list.  Shot-aware
+        callers resolve all four layers, so an episode/project exception is
+        neither swallowed by ``A or B`` nor leaked into an unrelated phase.
+        """
         if isinstance(ctx_or_episode_id, dict):
+            if shot is not None and ctx_or_episode_id.get("project") \
+                    and ctx_or_episode_id.get("episode"):
+                resolved = self._resolve_effective_rules(
+                    ctx_or_episode_id, shot=shot,
+                    stage="qc", modality=modality)
+                allowed = resolved.rules.get(
+                    "world.sanctioned_anachronisms", [])
+                return (list(allowed)
+                        if isinstance(allowed, (list, tuple))
+                        else [str(allowed)] if str(allowed).strip() else [])
             script = ctx_or_episode_id.get("script")
             if script is None:
                 episode = ctx_or_episode_id.get("episode") or {}
@@ -5073,16 +5385,25 @@ class Director:
             "art_name": str(payload.get("art_name") or ""),
         }
         manifest = copy.deepcopy(payload.get("reference_manifest") or [])
+        prompt_contract = copy.deepcopy(
+            payload.get("prompt_contract") or {})
+        contract_hash = self._stable_hash(prompt_contract)
+        prompt_digest = prompt_hash(prompt_sent)
+        reference_digest = reference_hash(manifest)
         return {
             "schema": "aifos.image-generation-input/v1",
             "scope": scope,
             "prompt": prompt_sent,
-            "prompt_hash": prompt_hash(prompt_sent),
+            "prompt_hash": prompt_digest,
             "reference_manifest": manifest,
-            "reference_hash": reference_hash(manifest),
-            "input_hash": generation_input_hash(prompt_sent, manifest),
-            "prompt_contract": copy.deepcopy(
-                payload.get("prompt_contract") or {}),
+            "reference_hash": reference_digest,
+            "prompt_contract_hash": contract_hash,
+            "input_hash": self._stable_hash({
+                "prompt_hash": prompt_digest,
+                "reference_hash": reference_digest,
+                "prompt_contract_hash": contract_hash,
+            }),
+            "prompt_contract": prompt_contract,
             "prompt_review": copy.deepcopy(
                 payload.get("prompt_review") or {}),
             "prompt_aifos_original": str(
@@ -6471,6 +6792,41 @@ class Director:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         working_payload = copy.deepcopy(payload or {})
+        progress_callback = working_payload.pop(
+            "_candidate_progress_callback", None)
+        try:
+            generation_round = max(
+                1, int(working_payload.get(
+                    "_candidate_generation_round") or 1))
+        except (TypeError, ValueError):
+            generation_round = 1
+        try:
+            max_candidate_rounds = max(
+                generation_round, int(working_payload.get(
+                    "_max_candidate_rounds")
+                    or self._shot_max_candidate_rounds()))
+        except (TypeError, ValueError):
+            max_candidate_rounds = self._shot_max_candidate_rounds()
+
+        def report_progress(completed, settled, *, status="generating"):
+            if not callable(progress_callback):
+                return
+            try:
+                progress_callback({
+                    "generation_round": generation_round,
+                    "max_candidate_rounds": max_candidate_rounds,
+                    "completed_count": int(completed),
+                    "settled_count": int(settled),
+                    "expected_count": int(pulls),
+                    "status": status,
+                })
+            except Exception as exc:
+                self.log.warn(
+                    "director",
+                    "候选逐张进度回写失败，不影响实际生成: "
+                    + str(exc)[:180])
+
+        report_progress(0, 0)
         if not isinstance(working_payload.get("reference_manifest"), list):
             self._attach_reference_manifest(working_payload)
         # Prompt review 与内容 QC 是两个闸门；选片模式仍先审核
@@ -6666,6 +7022,8 @@ class Director:
                             "error": str(exc)[:600],
                             "retryable": attempt < 2,
                         }
+                    report_progress(
+                        len(results), len(results) + len(failures))
 
         missing = [
             index for index in range(1, pulls + 1)
@@ -6681,7 +7039,7 @@ class Director:
         same_references = all(
             row["reference_hash"] == frozen_reference_hash
             for row in candidates)
-        # 槽位完整度只用于审计，不能再成为镜头门禁。四抽/三抽中只要
+        # 槽位完整度只用于审计，不能再成为镜头门禁。每轮四抽中只要
         # 至少有一张通过技术完整性检查，就由 AI 在现有可用图中选优并
         # 继续；只有零张可用才是 technical_incomplete。
         usable_count = len(candidates)
@@ -6740,8 +7098,18 @@ class Director:
             "same_prompt": same_prompt,
             "same_references": same_references,
             "parallelism": min(pulls, self._total_image_workers()),
+            "generation_round": generation_round,
+            "max_candidate_rounds": max_candidate_rounds,
+            "current_round_progress": {
+                "completed_count": usable_count,
+                "settled_count": usable_count + len(candidate_errors),
+                "expected_count": pulls,
+            },
             "candidates": copy.deepcopy(candidates),
         }
+        report_progress(
+            usable_count, usable_count + len(candidate_errors),
+            status="qc_complete")
         selected.cost = review_cost + sum(
             float(result.cost or 0.0) for result, _candidate in ordered
             if result is not None)
@@ -6942,10 +7310,10 @@ class Director:
         snapshots = []
         total_cost = 0.0
         candidates = []
-        # 修订后三抽必须使用同一份最终提示词。首抽会让 Router 完成
+        # 修订后四抽必须使用同一份最终提示词。首抽会让 Router 完成
         # Codex 提示词审核；把审核后的冻结稿和审核凭据带回工作 payload，
-        # 后两抽命中 reviewed_input_hash 后不再各自重写提示词。否则三张
-        # 虽来自同一修订合同，仍可能被三次非确定性审核改成三份不同稿。
+        # 后三抽命中 reviewed_input_hash 后不再各自重写提示词。否则四张
+        # 虽来自同一修订合同，仍可能被四次非确定性审核改成四份不同稿。
         working_payload = copy.deepcopy(payload)
         frozen_prompt_hash = ""
         for pull in range(1, pulls + 1):
@@ -7057,7 +7425,7 @@ class Director:
 
         通过优先级高于一切；同为通过或同为失败时，再按画面判定、身份、
         性别、服装、人数、叠层、物理和空间八项逐项计分，最后用问题数
-        破平。这样三张候选不会按生成顺序碰运气选中。
+        破平。这样四张候选不会按生成顺序碰运气选中。
         """
         report = report if isinstance(report, dict) else {}
         score = 1000.0 if report.get("passed") else 0.0
@@ -7196,7 +7564,7 @@ class Director:
 
     @staticmethod
     def _shot_candidate_group_valid(plan_item):
-        """首轮四候选/问题返工三候选有可用图且已选片即可复用。"""
+        """首轮/问题返工四候选有可用图且已选片即可复用。"""
         group = (plan_item or {}).get("candidate_group") or {}
         if not isinstance(group, dict):
             return False
@@ -7500,34 +7868,173 @@ class Director:
 
     def _generate_shot_candidate_group(
             self, capability, payload, out_dir, cancel, qc_spec):
-        """首次即生成完整4张关键帧，不因某张质检通过早停。"""
+        """每轮四候选、最多十轮的非阻断关键帧质检/返修闭环。
+
+        首轮也计入十轮上限。每轮四张必须共享同一份冻结提示词和参考图；
+        任一候选真正通过内容 QC 即由 AI 在合格候选中选优收口。四张全败
+        时，Codex 只做一次整组归因，下一轮使用替换式短合同与安全重绑后
+        的参考图，绝不把历轮错误原文继续堆进生成提示词。第十轮仍未通过
+        时选择十轮中的相对最优稿并登记风险，但不阻断其他镜头或下游。
+        """
         candidate_payload = copy.deepcopy(payload or {})
-        candidate_payload["_selection_candidate_group"] = True
-        candidate_payload["_qc_candidate_only"] = True
-        candidate_payload["_gacha_pulls_override"] = \
-            self._shot_candidate_count()
-        candidate_payload["_gacha_select_best_after_all"] = True
-        selected = self._generate_image_gacha(
-            capability, candidate_payload, out_dir, cancel, qc_spec)
-        group = ((getattr(selected, "data", None) or {}).get(
-            "candidate_group") or {})
-        candidates = (
-            group.get("candidates") or []
-            if isinstance(group, dict) else [])
-        explicit_all_failed = bool(
-            candidates
-            and all(
-                row.get("passed") is False
-                and not row.get("ranking_unavailable")
-                for row in candidates))
-        repair_batches_used = int(
-            candidate_payload.get("_auto_repair_batches_used") or 0)
-        # 关闭阻断式质检后，非阻断排名依然承担“发现明显不对”的职责。
-        # 首轮四张若至少一张通过就直接选优；如果排名服务可用且四张全部
-        # 明确失败，则把整组问题合并成一份修订合同，只补一批三张。
-        # 排名全不可用时不盲目花钱，稳定选择技术可用的第一张。
-        if (explicit_all_failed
-                and repair_batches_used < self._shot_auto_repair_batches()):
+        max_rounds = self._shot_max_candidate_rounds()
+        try:
+            generation_round = max(
+                1, int(candidate_payload.get(
+                    "_candidate_generation_round")
+                    or (int(candidate_payload.get(
+                        "_auto_repair_batches_used") or 0) + 1)))
+        except (TypeError, ValueError):
+            generation_round = 1
+        generation_round = min(generation_round, max_rounds)
+        round_history = copy.deepcopy(
+            candidate_payload.get("_candidate_round_history") or [])
+        total_cost = 0.0
+        best_provisional = None
+        best_provisional_score = float("-inf")
+        initial_group = None
+
+        while generation_round <= max_rounds:
+            candidate_payload["_candidate_generation_round"] = \
+                generation_round
+            candidate_payload["_max_candidate_rounds"] = max_rounds
+            candidate_payload["_selection_candidate_group"] = True
+            candidate_payload["_qc_candidate_only"] = True
+            candidate_payload["_gacha_pulls_override"] = \
+                self._shot_candidate_count()
+            candidate_payload["_gacha_select_best_after_all"] = True
+            selected = self._generate_image_gacha(
+                capability, candidate_payload, out_dir, cancel, qc_spec)
+            total_cost += float(selected.cost or 0.0)
+            group = ((getattr(selected, "data", None) or {}).get(
+                "candidate_group") or {})
+            if not isinstance(group, dict):
+                selected.cost = total_cost
+                return selected
+            group.update({
+                "generation_round": generation_round,
+                "max_candidate_rounds": max_rounds,
+                "repair_round": max(0, generation_round - 1),
+                "repair_batch": generation_round > 1,
+                "auto_repair_batch": max(0, generation_round - 1),
+                "max_auto_repair_batches": max_rounds - 1,
+                "round_status": "qc_complete",
+            })
+            if initial_group is None:
+                initial_group = copy.deepcopy(group)
+            candidates = group.get("candidates") or []
+            candidate_passed = any(
+                row.get("passed") is True for row in candidates)
+            ranking_unavailable = bool(
+                candidates and all(
+                    row.get("ranking_unavailable") for row in candidates))
+            explicit_all_failed = bool(
+                candidates
+                and all(
+                    row.get("passed") is False
+                    and not row.get("ranking_unavailable")
+                    for row in candidates))
+
+            # 每一轮都留下完整候选事实，供断点、画布和“十轮全局选优”使用。
+            round_history.append(copy.deepcopy(group))
+            promoted = self._ai_promote_generated_candidate_group(selected)
+            promoted_group = ((getattr(promoted, "data", None) or {}).get(
+                "candidate_group") or {})
+            selection = promoted_group.get("selection") or {}
+            provisional_score = float(
+                selection.get("ranking_score") or 0.0)
+            if getattr(promoted, "uri", "") and (
+                    best_provisional is None
+                    or provisional_score > best_provisional_score):
+                best_provisional = promoted
+                best_provisional_score = provisional_score
+
+            if candidate_passed:
+                promoted.cost = total_cost
+                final_group = (promoted.data or {}).get(
+                    "candidate_group") or {}
+                final_group.update({
+                    "round_status": "qualified",
+                    "qualified": True,
+                    "repair_exhausted": False,
+                    "candidate_round_history": round_history,
+                    "total_generated_candidates": sum(
+                        int(row.get("candidate_count") or 0)
+                        for row in round_history),
+                })
+                promoted.data["candidate_group"] = final_group
+                promoted.data["candidate_round_history"] = round_history
+                return promoted
+
+            # QC 基础设施不可用时，继续花钱生成不会增加判断依据。保留已有
+            # 技术可用图和显式风险，让其他镜头继续，不把网络问题当画面失败。
+            if ranking_unavailable:
+                fallback = self._promote_relative_best_nonblocking(
+                    promoted, "本轮内容质检暂不可用，保留技术可用最优稿继续")
+                fallback.cost = total_cost
+                fallback_group = (fallback.data or {}).get(
+                    "candidate_group") or {}
+                fallback_group.update({
+                    "round_status": "qc_unavailable",
+                    "qualified": False,
+                    "repair_exhausted": False,
+                    "candidate_round_history": round_history,
+                })
+                fallback.data["candidate_group"] = fallback_group
+                fallback.data["candidate_round_history"] = round_history
+                return fallback
+
+            # 零张技术可用图是技术故障，不消耗内容返修轮，也不能伪装通过。
+            if not candidates:
+                selected.cost = total_cost
+                group["round_status"] = "technical_incomplete"
+                group["candidate_round_history"] = round_history
+                selected.data["candidate_group"] = group
+                selected.data["candidate_round_history"] = round_history
+                return selected
+
+            if not explicit_all_failed:
+                # 判词不完整时不凭空认定失败；保留相对最优和风险继续。
+                fallback = self._promote_relative_best_nonblocking(
+                    promoted, "候选质检结论不完整，按可用判词相对选优")
+                fallback.cost = total_cost
+                fallback_group = (fallback.data or {}).get(
+                    "candidate_group") or {}
+                fallback_group.update({
+                    "round_status": "qc_incomplete",
+                    "qualified": False,
+                    "candidate_round_history": round_history,
+                })
+                fallback.data["candidate_group"] = fallback_group
+                fallback.data["candidate_round_history"] = round_history
+                return fallback
+
+            if generation_round >= max_rounds:
+                chosen = best_provisional or promoted
+                chosen = self._promote_relative_best_nonblocking(
+                    chosen,
+                    f"已完成{max_rounds}轮、每轮4张，仍无内容质检合格稿；"
+                    "已从全部候选中选择相对最优并登记风险")
+                chosen.cost = total_cost
+                chosen_group = (chosen.data or {}).get(
+                    "candidate_group") or {}
+                chosen_group.update({
+                    "round_status": "exhausted",
+                    "qualified": False,
+                    "repair_exhausted": True,
+                    "generation_round": max_rounds,
+                    "max_candidate_rounds": max_rounds,
+                    "candidate_round_history": round_history,
+                    "total_generated_candidates": sum(
+                        int(row.get("candidate_count") or 0)
+                        for row in round_history),
+                })
+                chosen.data["candidate_group"] = chosen_group
+                chosen.data["candidate_round_history"] = round_history
+                return chosen
+
+            # 四张全败：汇总共同问题 + 相对最优稿问题，只做一次 Codex
+            # 根因分析。本轮完整判词留在审计，下一轮只带替换后的短合同。
             issue_counts = {}
             for row in candidates:
                 for issue in dict.fromkeys(
@@ -7564,8 +8071,8 @@ class Director:
             aggregate_report = {
                 "passed": False,
                 "issues": merged_issues,
-                "attempts": 1,
-                "consecutive_failures": 1,
+                "attempts": generation_round,
+                "consecutive_failures": generation_round,
                 "input_diagnosis": diagnostics,
                 "revision_feedback": revision["text"],
                 "revision_categories": revision["categories"],
@@ -7578,16 +8085,22 @@ class Director:
                     out_dir, cancel=cancel,
                     codex_profile=candidate_payload.get(
                         "_codex_profile", ""))
+            total_cost += float(escalation_cost or 0.0)
             local_instruction = (
                 targeted_prompt_patch(diagnostics)
                 or "；".join(revision.get("instructions") or []))
             instruction = str(
                 (aggregate_report.get("codex_escalation") or {}).get(
                     "instruction_to_aifos") or local_instruction or "")
+            if not instruction:
+                instruction = (
+                    "只修正本轮质检指出的决定性问题；保留剧情事实，"
+                    "将人物、道具、空间关系收敛为一张物理可拍的静态画面。")
             repair_payload = copy.deepcopy(candidate_payload)
             repair_payload["_autonomous_repair_seeded"] = True
-            repair_payload["_auto_repair_batches_used"] = \
-                repair_batches_used + 1
+            repair_payload["_auto_repair_batches_used"] = generation_round
+            repair_payload["_candidate_generation_round"] = \
+                generation_round + 1
             repair_payload["_candidate_revision"] = max(
                 1, int(repair_payload.get("_candidate_revision") or 1) + 1)
             repair_payload["_contract_revision"] = max(
@@ -7599,46 +8112,51 @@ class Director:
                 self._replace_repair_static_contract(
                     repair_payload, qc_spec, instruction,
                     conflict_context="；".join(merged_issues[:12]))
-            repaired = self._generate_repair_candidate_group(
-                capability, repair_payload, out_dir, cancel,
-                repair_qc_spec)
-            repaired.cost += float(selected.cost or 0.0) + escalation_cost
-            repaired_data = getattr(repaired, "data", None) or {}
-            repaired_group = repaired_data.get("candidate_group") or {}
-            if isinstance(repaired_group, dict):
-                repaired_group["initial_candidate_set_id"] = str(
-                    group.get("candidate_set_id") or "")
-                repaired_group["initial_candidate_count"] = len(candidates)
-                repaired_group["initial_all_failed"] = True
-                repaired_group["initial_issues"] = copy.deepcopy(
-                    merged_issues)
-                repaired_group["repair_instruction"] = instruction[:1800]
-                repaired_data["candidate_group"] = repaired_group
-                repaired.data = repaired_data
-            if self._candidate_group_technical_incomplete(repaired):
-                # 三张补抽若遭遇纯技术故障，首轮仍有可用图片，不能把整镜
-                # 错判为零产物。回退首轮相对最优并记录补抽故障。
-                fallback = self._promote_relative_best_nonblocking(
-                    selected, "三张自动补抽均发生技术故障，回退首轮相对最优")
-                fallback.cost = repaired.cost
-                fallback_data = getattr(fallback, "data", None) or {}
-                fallback_data["repair_batch_failure"] = {
-                    "technical_incomplete": True,
-                    "candidate_errors": copy.deepcopy(
-                        repaired_group.get("candidate_errors") or []),
-                    "repair_instruction": instruction[:1800],
-                }
-                fallback.data = fallback_data
-                return fallback
-            return repaired
-        # selection_mode 开关只影响是否展示内容判词，绝不能恢复旧的
-        # 阻断语义。不是“四张都明确失败”的情况（至少一张通过、判词
-        # 不完整或排名服务不可用）均直接在技术可用图中自动选优。
-        return self._ai_promote_generated_candidate_group(selected)
+            applied = self._apply_image_reference_adjustments(
+                repair_payload, repair_qc_spec,
+                aggregate_report.get("input_diagnosis") or diagnostics,
+                instruction=instruction)
+            if applied["applied"]:
+                repair_payload["qc_reference_changes"] = copy.deepcopy(
+                    applied)
+            self._attach_reference_manifest(repair_payload)
+            next_input = self._image_generation_input(
+                repair_payload, qc_spec=repair_qc_spec)
+            if next_input.get("input_hash") == generation_input.get(
+                    "input_hash"):
+                # 防止原样重抽；把失败历史留在审计，只给模型一个短的
+                # “换可拍方案”指令，确保下一轮输入确实变化。
+                alternative = (
+                    f"第{generation_round + 1}轮不得复用上一轮失败构图；"
+                    "在不改变人物身份、剧情事实和场景的前提下，改用更"
+                    "简单清晰、符合物理与空间逻辑的静态站位和道具呈现。")
+                repair_payload, repair_qc_spec = \
+                    self._replace_repair_static_contract(
+                        repair_payload, repair_qc_spec, alternative,
+                        conflict_context="；".join(merged_issues[:12]))
+                self._attach_reference_manifest(repair_payload)
+            repair_payload["_candidate_round_history"] = round_history
+            repair_payload["_last_repair_instruction"] = instruction[:1800]
+            repair_payload["_last_repair_issues"] = copy.deepcopy(
+                merged_issues)
+            if initial_group:
+                repair_payload["_initial_candidate_set_id"] = str(
+                    initial_group.get("candidate_set_id") or "")
+            candidate_payload = repair_payload
+            qc_spec = repair_qc_spec
+            generation_round += 1
+
+        # 理论不可达；保守返回已有相对最优，不制造阻断。
+        if best_provisional is not None:
+            best_provisional.cost = total_cost
+            return self._promote_relative_best_nonblocking(
+                best_provisional, "候选轮次状态异常，回退已生成相对最优稿")
+        selected.cost = total_cost
+        return selected
 
     def _generate_repair_candidate_group(
             self, capability, payload, out_dir, cancel, qc_spec):
-        """问题镜头修正合同后并行补抽三张，并由 AI 自动选优晋升。"""
+        """问题镜头修正合同后并行补抽四张；只在出现合格稿时晋升。"""
         candidate_payload = copy.deepcopy(payload or {})
         candidate_payload["qc_consecutive_failures_base"] = max(
             1, int(candidate_payload.get(
@@ -7653,12 +8171,22 @@ class Director:
         data = getattr(selected, "data", None) or {}
         group = data.get("candidate_group") or {}
         if isinstance(group, dict):
+            generation_round = max(
+                2, int(candidate_payload.get(
+                    "_candidate_generation_round") or 2))
             group["repair_batch"] = True
-            group["auto_repair_batch"] = 1
+            group["generation_round"] = generation_round
+            group["repair_round"] = generation_round - 1
+            group["auto_repair_batch"] = generation_round - 1
+            group["max_candidate_rounds"] = \
+                self._shot_max_candidate_rounds()
             group["max_auto_repair_batches"] = \
-                self._shot_auto_repair_batches()
+                self._shot_max_candidate_rounds() - 1
             data["candidate_group"] = group
             selected.data = data
+        # 独立调用方（旧严格单图QC兼容路径）仍需得到一个可用 URI；正式
+        # 镜头的十轮闭环不走本方法，而由 _generate_shot_candidate_group
+        # 统一判断何时收口。
         selected = self._ai_promote_generated_candidate_group(selected)
         group = ((getattr(selected, "data", None) or {}).get(
             "candidate_group") or {})
@@ -7666,7 +8194,9 @@ class Director:
             self.log.info(
                 "director",
                 f"镜头{candidate_payload.get('shot_no', '')} 问题合同已修正，"
-                f"{self._shot_repair_candidate_count()}张补抽完成并由AI选优晋升")
+                f"第{group.get('generation_round', 2)}/"
+                f"{self._shot_max_candidate_rounds()}轮的"
+                f"{self._shot_repair_candidate_count()}张候选已完成质检")
         return selected
 
     @staticmethod
@@ -7814,10 +8344,10 @@ class Director:
                 if payload.get("_codex_profile"):
                     qc_payload["_codex_profile"] = payload[
                         "_codex_profile"]
-                # 修订后三抽本身已经要求每张都走完整单路视觉质检。若再
-                # 对三张逐一启用双路会诊，会把一次抽卡轮放大成 6 次
+                # 修订后四抽本身已经要求每张都走完整单路视觉质检。若再
+                # 对四张逐一启用双路会诊，会把一次抽卡轮放大成 8 次
                 # Codex 视觉调用；会诊的价值是定位失败根因，不是重复给
-                # 独立随机样本判两遍。候选组三张各检一次，三张全败后再
+                # 独立随机样本判两遍。候选组四张各检一次，四张全败后再
                 # 对自动选出的最高分稿执行 Codex 升级分析，既保留全量
                 # 质检和自动修复闭环，也避免无效等待。
                 dual = (
@@ -7983,7 +8513,7 @@ class Director:
             if payload.get("_qc_candidate_only"):
                 return result
             # 第一次失败就升级 Codex:出诊断 + 改提示词,随后本轮继续按新提示词
-            # 进入三张候选抽卡;三张全败后再对最高分候选做下一轮分析。
+            # 进入四张候选抽卡;四张全败后再对最高分候选做下一轮分析。
             if (not report["passed"]
                     and report["consecutive_failures"] >= 1):
                 report, escalation_cost = \
@@ -8187,7 +8717,7 @@ class Director:
                 self.log.info(
                     "director",
                     f"{qc_spec.get('item_id') or '本图'}首图质检未过，"
-                    "Codex 修订已应用；第二轮固定生成3张并全量选优")
+                    "Codex 修订已应用；下一轮固定生成4张并全量质检选优")
                 selected = self._generate_repair_candidate_group(
                     capability, candidate_payload, out_dir, cancel, qc_spec)
                 selected.cost += float(result.cost or 0.0)
@@ -8298,8 +8828,8 @@ class Director:
         if not self._image_qc_enabled():
             return ""
         qc = getattr(result, "qc", None) or {}
-        # 问题镜头完成唯一一批三抽后，AI 已按视觉分选择相对最优稿。
-        # 判词保留为风险，但不得再把它变回阻断或触发第二批付费重画。
+        # 十轮上限到达后，AI 已从全部候选中选择相对最优稿。判词保留
+        # 为风险，但不得再把它变回阻断或触发第十一轮付费重画。
         if qc.get("best_effort_promoted"):
             return ""
         if qc.get("passed") is False:
@@ -8334,9 +8864,9 @@ class Director:
     # 指令丢在失败报告里等人工确认。十轮仍是有界自动化，同时输入哈希
     # 无变化门禁与单集预算会更早阻止无效重画。
     # Difficult multi-person/prop shots can need several contract rewrites before
-    # the fixed three-draw batch converges.  Keep the run autonomous instead of
+    # a fixed four-draw round converges.  Keep the run autonomous instead of
     # falling back to a human confirmation after an otherwise recoverable miss.
-    CODEX_CONTRACT_REPAIR_LIMIT = 20
+    CODEX_CONTRACT_REPAIR_LIMIT = 10
     DEEP_CONTRACT_SLIMMING_MARKER = "【连续失败后的深度合同瘦身】"
     DEEP_CONTRACT_SLIMMING_GUIDANCE = (
         "【连续失败后的深度合同瘦身】这是第3轮或之后的自动修复，"
@@ -8461,7 +8991,7 @@ class Director:
             # 编剧结构化改写偶尔会返回与现有镜头完全相同的
             # camera/description（实案 shot:7/18）。这不等于 Codex 没给
             # 方案：升级结果里已经有可直接执行的新合同。把它作为本轮
-            # 最高优先级覆盖层送进同词三抽，明确作废旧合同中的冲突条款，
+            # 最高优先级覆盖层送进同词四抽，明确作废旧合同中的冲突条款，
             # 不能因编剧漏改而重新推回人工确认。
             target = task.get("payload") or {}
             override = (
@@ -8471,7 +9001,7 @@ class Director:
                 "只执行这份无冲突终态，不得同时执行被作废的旧条款："
                 + instruction[:1600])
             target["feedback"] = override
-            # round marker 让输入哈希确实变化；同一轮的三张候选随后仍由
+            # round marker 让输入哈希确实变化；同一轮的四张候选随后仍由
             # _generate_repair_candidate_group 冻结成完全相同的提示词。
             after = self._image_generation_input(target)
             if before.get("input_hash") == after.get("input_hash"):
@@ -8520,7 +9050,7 @@ class Director:
         a Codex contract rewrite, then be marked failed when the nested preflight
         found one more stale clause.  This closes that gap: the block is treated
         as another shot-contract diagnosis, repaired in place, and resubmitted
-        as the required fixed three-draw group without asking a human.
+        as the required fixed four-draw group without asking a human.
         """
         reason = self._prompt_review_block_reason(exc)
         item_id = str(task.get("item_id") or "")
@@ -8600,9 +9130,38 @@ class Director:
             "director",
             f"{item_id} 生成前审核冲突已自动就地修复"
             f"(第 {next_round} 次)，继续"
-            f"{'三张补抽' if visual_repair_batch else '首轮同提示词四抽'}: "
+            f"{'本轮同提示词四抽' if visual_repair_batch else '首轮同提示词四抽'}: "
             f"{summary[:140]}")
         return summary or "生成前审核冲突已自动修复"
+
+    def _attach_candidate_progress_reporter(self, ctx, task):
+        """把候选轮次/逐张完成数实时写回生产清单。"""
+        if (task.get("capability") != "image"
+                or not str(task.get("item_id") or "").startswith("shot:")):
+            return
+        payload = task.get("payload") or {}
+        item_id = str(task.get("item_id") or "")
+
+        def report(progress):
+            progress = copy.deepcopy(progress or {})
+            self._plan_mark(
+                ctx, item_id, "generating",
+                extra={
+                    "candidate_progress": progress,
+                    "generation_round": int(
+                        progress.get("generation_round") or 1),
+                    "max_candidate_rounds": int(
+                        progress.get("max_candidate_rounds")
+                        or self._shot_max_candidate_rounds()),
+                    "candidate_completed_count": int(
+                        progress.get("completed_count") or 0),
+                    "candidate_expected_count": int(
+                        progress.get("expected_count")
+                        or self._shot_candidate_count()),
+                })
+
+        payload["_candidate_progress_callback"] = report
+        task["payload"] = payload
 
     def _run_one_task(self, ctx, task, *, continue_on_qc_failure=False):
         """串行执行单个出图任务(含质检),记账并更新清单。"""
@@ -8619,6 +9178,7 @@ class Director:
             payload["_episode_id"] = (ctx.get("episode") or {}).get("id")
             task["payload"] = payload
         self._ensure_shot_contract_nonblocking(ctx, task)
+        self._attach_candidate_progress_reporter(ctx, task)
         if task.get("capability") in ("image", "frames", "cover"):
             self._attach_reference_manifest(task["payload"])
         try:
@@ -8676,10 +9236,7 @@ class Director:
                         and str(task.get("item_id") or "").startswith("shot:")):
                     # 镜头关键帧首轮即冻结合同并4路并行；
                     # 严格QC模式的修订轮同样保持4候选。
-                    generate = (
-                        self._generate_repair_candidate_group
-                        if payload.get("_autonomous_repair_seeded")
-                        else self._generate_shot_candidate_group)
+                    generate = self._generate_shot_candidate_group
                     result = generate(
                         task["capability"], task["payload"],
                         ctx["out_root"] / task["sub_dir"],
@@ -8944,8 +9501,8 @@ class Director:
         worker 线程只做产线调用;记账/资产登记/清单状态全在主线程。
         tasks: [{"item_id","capability","payload","sub_dir","tag","priority"}]
         默认返回 {tag: ProviderResult};暂停时未完成条目回到排队并保留
-        已完成。continue_on_qc_failure=True 时，修订组三抽仍失败的单项
-        标为 failed 并继续补投剩余任务，返回
+        已完成。continue_on_qc_failure=True 时，单镜最多十轮的自动返修
+        始终不拖停剩余任务，返回
         (results, qc_failures)，失败项不进入正式资产链，也不要求用户
         确认；真正的 Provider/预算错误仍会中止整批。"""
         if not tasks:
@@ -8997,7 +9554,7 @@ class Director:
                 if result is None:
                     qc_failures.append((
                         task, AifosError(
-                            "图片修订组三抽仍未通过，等待自动重建合同")))
+                            "图片候选轮未收口，等待系统自动重建合同")))
                     continue
                 out[task["tag"]] = result
             return ((out, qc_failures)
@@ -9047,6 +9604,8 @@ class Director:
                             continue
                         return False
                     payload = task.get("payload") or {}
+                    self._attach_candidate_progress_reporter(ctx, task)
+                    payload = task.get("payload") or {}
                     generating_extra = {
                         "image_task_class": payload.get("image_task_class"),
                         "image_quality": payload.get("image_quality"),
@@ -9083,10 +9642,7 @@ class Director:
                         and str(task.get("item_id") or "").startswith(
                             "shot:"))
                     if is_shot:
-                        generate = (
-                            self._generate_repair_candidate_group
-                            if payload.get("_autonomous_repair_seeded")
-                            else self._generate_shot_candidate_group)
+                        generate = self._generate_shot_candidate_group
                     else:
                         generate = self._generate_image_with_qc
                     future = pool.submit(
@@ -9747,8 +10303,7 @@ class Director:
             ctx["story_analysis"] = analysis
             ctx["story_analysis_version"] = version
             return analysis, version, True
-        result = self._call(
-            ctx, "script", {
+        analysis_payload = {
                 "story_analysis": True,
                 "project_title": ctx["project"]["title"],
                 "episode_number": ctx["episode"]["number"],
@@ -9757,7 +10312,12 @@ class Director:
                 "creative_direction": creative_direction,
                 "analysis_rules": analysis_rules,
                 "production_profile": ctx.get("production_profile") or {},
-            }, "story_analysis")
+            }
+        self._attach_effective_rules(
+            ctx, {}, analysis_payload,
+            stage="story_analysis", modality="script")
+        result = self._call(
+            ctx, "script", analysis_payload, "story_analysis")
         imported = script.get("import_analysis")
         needs_line_resolution = (
             bool(unresolved_character_labels(script))
@@ -10180,6 +10740,8 @@ class Director:
                 episode["id"], "script")
             if previous is not None:
                 payload["previous_script"] = previous
+        self._attach_effective_rules(
+            ctx, {}, payload, stage="script", modality="script")
         result = self._call(ctx, "script", payload, "script")
         script = result.data
         self._record_script_lessons(ctx, script)
@@ -10328,6 +10890,7 @@ class Director:
                 "script": ctx["script"],
                 "continuity": ctx["continuity"],
                 "production_profile": ctx["production_profile"],
+                **self._storyboard_rule_payload(ctx),
             }, "storyboard")
         # 原始分镜落盘:加工若出错,凭这份文件即可复现定位
         raw_path = ctx["out_root"] / "storyboard" / "raw_provider.json"
@@ -15016,16 +15579,22 @@ class Director:
         composition_contract.setdefault(
             "functional_figures", copy.deepcopy(functional_figures))
         story_world = (ctx.get("script") or {}).get("story_world") or {}
-        era_context = "；".join(
-            str(value or "").strip() for value in (
-                story_world.get("name"),
-                story_world.get("era_and_location"),
-                story_world.get("hard_rules"),
-                static_shot.get("era_context"),
-            ) if str(value or "").strip())
-        sanctioned_anachronisms = list(
-            story_world.get("sanctioned_anachronisms") or
-            static_shot.get("sanctioned_anachronisms") or [])
+        effective_rules = self._resolve_effective_rules(
+            ctx, shot=static_shot, stage=frame_kind, modality="image")
+        effective_values = effective_rules.rules
+        era_context = str(effective_values.get("world.era") or "").strip()
+        if not era_context:
+            era_context = "；".join(
+                str(value or "").strip() for value in (
+                    story_world.get("name"),
+                    story_world.get("era_and_location"),
+                    story_world.get("hard_rules"),
+                ) if str(value or "").strip())
+        allowed = effective_values.get(
+            "world.sanctioned_anachronisms", [])
+        sanctioned_anachronisms = (
+            list(allowed) if isinstance(allowed, (list, tuple))
+            else [str(allowed)] if str(allowed).strip() else [])
         physical_contract = build_physical_contract({
             **static_shot, "spatial_blocking": spatial or {},
             "readable_text": readable_text,
@@ -15190,6 +15759,10 @@ class Director:
                 headwear_states=headwear_states,
                 identity_face_only_names=variable_appearance_names),
         }
+        payload["effective_rule_stack"] = effective_rules.as_dict()
+        payload["rule_fingerprint"] = effective_rules.fingerprint
+        payload["effective_rule_lines"] = self._effective_rule_texts(
+            effective_rules)
         actor_ids = {
             actor.get("name"): actor.get("actor_id")
             for actor in (spatial or {}).get("actors", [])
@@ -15867,14 +16440,27 @@ class Director:
         """Append one idempotent concise block to actual provider prompts."""
         rules = [str(rule).strip() for rule in rules if str(rule).strip()][:5]
         payload["generation_quality_rules"] = rules
-        if not rules:
-            return payload
+        blocks = []
         marker = "【本镜质量规则·最多5条】"
-        block = marker + "\n" + "\n".join(
-            f"{index}. {rule}" for index, rule in enumerate(rules, 1))
+        if rules:
+            blocks.append(marker + "\n" + "\n".join(
+                f"{index}. {rule}" for index, rule in enumerate(rules, 1)))
+        effective = [
+            str(rule).strip()
+            for rule in payload.get("effective_rule_lines") or []
+            if str(rule).strip()
+        ][:8]
+        effective_marker = "【本镜有效创作规则·按层级裁决】"
+        if effective:
+            blocks.append(effective_marker + "\n" + "\n".join(
+                f"{index}. {rule}"
+                for index, rule in enumerate(effective, 1)))
+        if not blocks:
+            return payload
+        block = "\n".join(blocks)
         for key in ("prompt", "prompt_compact"):
             value = str(payload.get(key) or "").strip()
-            if marker not in value:
+            if marker not in value and effective_marker not in value:
                 payload[key] = (value + "\n" + block).strip()
         return payload
 
@@ -16163,16 +16749,23 @@ class Director:
                     and item.get("status") in ("awaiting_human", "failed")):
                 # 历史红牌不得继续作为隐形人工闸门，不受 selection_mode
                 # 或内容质检开关影响。旧单图不伪装成新四候选，统一回到
-                # pending，按“首轮四张→必要时补三张→AI选优”迁移。
+                # pending，按“每轮四张→Codex修词/重选参考→最多十轮”迁移。
                 previous = item.get("status")
                 item["status"] = "pending"
                 item["error"] = ""
                 qc = dict(item.get("qc") or {})
                 if qc:
+                    qc["historical_passed"] = qc.get("passed")
                     qc.update({
+                        # 旧失败只作为下一轮修词依据；若仍保留 False，
+                        # 本函数下半段会在同一次对账里把刚迁回 pending 的
+                        # 条目再次判成 failed，形成无法离开的历史红牌。
+                        "passed": None,
                         "advisory_only": True,
                         "blocking": False,
                         "awaiting_human": False,
+                        "autonomous_repair_required": True,
+                        "auto_repair_exhausted": False,
                         "waived_by": "nonblocking_ai_selection_migration",
                     })
                     item["qc"] = qc
@@ -16180,6 +16773,7 @@ class Director:
                     "previous_status": previous,
                     "reset_at": now(),
                 }
+                exposed_failures += 1
                 changed = True
         if stale_reset:
             self.log.warn(
@@ -16240,15 +16834,19 @@ class Director:
                     "best_effort_risk")))
             if (image_content_qc and qc.get("passed") is False
                     and not best_effort_promoted):
-                if item.get("status") != "failed":
-                    item["status"] = "failed"
+                # 质检负责发现问题并给下一轮修词，不再把阶段锁死。
+                # 只有满 10 轮后由候选器以 best_effort_promoted 收口；
+                # 未到该状态的旧失败一律回 pending 自动四抽。
+                if item.get("status") != "pending":
+                    item["status"] = "pending"
                     changed = True
                 attempts = int(qc.get("attempts") or 1)
                 qc.update({
                     "awaiting_human": False,
                     "autonomous_repair_required": True,
                     "auto_repairs": max(0, attempts - 1),
-                    "auto_repair_exhausted": True,
+                    "auto_repair_exhausted": False,
+                    "blocking": False,
                 })
                 item["qc"] = qc
                 exposed_failures += 1
@@ -16386,7 +16984,8 @@ class Director:
             spatial_staging=(payload.get("prompt_contract") or {}).get(
                 "spatial_staging"),
             physical_logic_required=True,
-            era_exceptions=self._era_exceptions(ctx),
+            era_exceptions=list(
+                payload.get("sanctioned_anachronisms") or []),
             narrative_overlays=payload.get("narrative_overlays"),
             functional_figures=payload.get("functional_figures"))
         prop_registry = {
@@ -16503,7 +17102,7 @@ class Director:
         reconciliation = self.reconcile_completed_shot_images(ctx)
         # 断点里已经有 Codex 最终修改指令的旧失败镜头，不能重新从首图
         # 开始、更不能继续等人工。先把指令落实到当前分镜合同，随后直接
-        # 进入同一新版提示词的三候选全量抽卡。
+        # 进入同一新版提示词的四候选全量抽卡。
         # 生产画布:出图一开始就落盘人物/场景/镜头关系线,
         # 前端画布与出图/质检提示词共用,牵引人物关联性不漂移
         ctx["relations"] = write_relations(
@@ -16725,7 +17324,7 @@ class Director:
                 self._register_completed_shot_result(
                     ctx, current_shot, current_quality, result,
                     payload=current_payload))
-            # 预览片不承接旧 QC 失败轮次、三抽修复或 Codex 升级指令；
+            # 预览片不承接旧 QC 失败轮次、四抽修复或 Codex 升级指令；
             # 直接按当前已编译镜头合同生成一次，避免“已关闭质检”仍被
             # 历史质检状态拉回编剧修复/候选选优链。
             stored = (
@@ -16808,7 +17407,7 @@ class Director:
                     1, failure_base)
             # 旧版 Codex escalation 有些只写 triggered + 具体指令，没有
             # status=completed。只要质检明确失败且指令可执行，就应在断点
-            # 恢复时直接落实，不能因为一个兼容字段缺失又白画同一组三张。
+            # 恢复时直接落实，不能因为一个兼容字段缺失又白画同一轮四张。
             resumable_escalation = bool(
                 stored_escalation.get("triggered")
                 and str(stored_escalation.get(
@@ -16830,12 +17429,12 @@ class Director:
                     self.log.info(
                         "director",
                         f"{task['item_id']} 已承接断点中的 Codex 修改指令，"
-                        "本轮直接生成3张候选并全部选优")
+                        "本轮直接生成4张候选并全部质检选优")
             elif resumed_repair_group:
                 self.log.info(
                     "director",
-                    f"{task['item_id']} 上一轮三候选因产线中断未完成，"
-                    "已从修订合同断点恢复并继续固定3张并行选优")
+                    f"{task['item_id']} 上一轮四候选因产线中断未完成，"
+                    "已从修订合同断点恢复并继续固定4张并行质检选优")
             if unresolved_prior_failure:
                 repair_instruction = str(
                     stored_escalation.get("instruction_to_aifos")
@@ -16865,7 +17464,7 @@ class Director:
                 self.log.info(
                     "director",
                     f"{task['item_id']} 历史失败稿未曾由AI选优晋升；"
-                    "已舍弃旧冲突合同并直接进入固定3张修订组")
+                    "已舍弃旧冲突合同并直接进入固定4张修订组")
             payload = task["payload"]
             quality_by_shot[shot["shot_no"]] = payload["quality_decision"]
             payload_by_shot[shot["shot_no"]] = payload
@@ -17189,7 +17788,8 @@ class Director:
                         readable_text=payload.get("readable_text"),
                         physical_contract=payload.get("physical_contract"),
                         physical_logic_required=True,
-                        era_exceptions=self._era_exceptions(ctx),
+                        era_exceptions=list(
+                            payload.get("sanctioned_anachronisms") or []),
                         narrative_overlays=payload.get(
                             "narrative_overlays"),
                         functional_figures=payload.get(
@@ -18291,11 +18891,22 @@ class Director:
         # 与出图同一套时代/物理硬约束 + 出错经验库,视频端同步防错。
         # 时代判断以剧本为准:剧本明写的穿越/带入物品必须保留,不算错。
         world = (ctx.get("script") or {}).get("story_world") or {}
-        drift = [str(item).strip() for item in
-                 (world.get("forbidden_drift") or []) if str(item).strip()]
-        sanctioned = [str(item).strip() for item in
-                      (world.get("sanctioned_anachronisms") or [])
+        effective_rules = self._resolve_effective_rules(
+            ctx, shot=shot, stage="videos", modality="video")
+        effective_values = effective_rules.rules
+        raw_drift = effective_values.get(
+            "world.forbidden_drift", world.get("forbidden_drift") or [])
+        if not isinstance(raw_drift, (list, tuple)):
+            raw_drift = [raw_drift]
+        drift = [str(item).strip() for item in raw_drift if str(item).strip()]
+        raw_sanctioned = effective_values.get(
+            "world.sanctioned_anachronisms",
+            world.get("sanctioned_anachronisms") or [])
+        if not isinstance(raw_sanctioned, (list, tuple)):
+            raw_sanctioned = [raw_sanctioned]
+        sanctioned = [str(item).strip() for item in raw_sanctioned
                       if str(item).strip()]
+        effective_era = str(effective_values.get("world.era") or "").strip()
         lines.append(
             "【时代与物理】时代判断以本剧剧本为唯一标准；"
             + (f"剧情白名单优先于通用时代禁令，以下跨时代物品必须保留"
@@ -18307,17 +18918,26 @@ class Director:
             "和逻辑；人物服从重力、惯性、关节、重心和支撑，物品位移、"
             "旋转、碰撞、接触与交接连续且有明确受力来源；严禁漂浮、"
             "瞬移、拉长、扭曲、穿模或无支撑运动。")
+        effective_lines = self._effective_rule_texts(effective_rules)
+        if effective_lines:
+            lines.append(
+                "【本镜有效创作规则·按层级裁决】\n" + "\n".join(
+                    f"{index}. {rule}"
+                    for index, rule in enumerate(effective_lines[:8], 1)))
         quality_payload = {
             "shot_no": shot.get("shot_no"),
             "characters": characters,
             "visible_figure_count": shot.get(
                 "visible_figure_count", len(characters)),
             "character_background": self._shot_character_facts(ctx, shot),
-            "era_context": "；".join(filter(None, (
+            "era_context": effective_era or "；".join(filter(None, (
                 str(world.get("name") or "").strip(),
                 str(world.get("era_and_location") or "").strip(),
                 str(shot.get("era_context") or shot.get("era") or "").strip(),
             ))),
+            "sanctioned_anachronisms": sanctioned,
+            "effective_rule_stack": effective_rules.as_dict(),
+            "rule_fingerprint": effective_rules.fingerprint,
             "camera": shot.get("camera") or shot.get("shot_contract") or {},
             "action": shot.get("description") or shot.get("prompt") or "",
             "start_state": shot.get("start_state") or {},
@@ -18729,6 +19349,12 @@ class Director:
                 "standard_fingerprint", ""),
             "aspect": ctx["aspect"], **ctx["dims"],
         }
+        self._attach_effective_rules(
+            ctx, shot, payload, stage="videos", modality="video")
+        self._append_generation_rules(
+            payload,
+            self._generation_rule_lines(
+                ctx, shot, payload, modality="video"))
         contract_issues = self._generation_preflight_issues(
             shot, payload, modality="video")
         if contract_issues:
@@ -19469,7 +20095,8 @@ class Director:
             physical_contract=physical_contract,
             spatial_staging=spatial_staging,
             physical_logic_required=True,
-            era_exceptions=self._era_exceptions(ctx),
+            era_exceptions=self._era_exceptions(
+                ctx, shot, modality="video"),
             narrative_overlays=shot.get("narrative_overlays"),
             functional_figures=shot.get("functional_figures"))
 
@@ -21722,8 +22349,8 @@ class Director:
             if codex_profile:
                 payload["_codex_profile"] = str(codex_profile)
             # 问题镜头禁止再走旧版单张 ``_plan_run``。修订合同只允许
-            # 一批三张同词并行候选，AI导演非阻断排名后自动晋升最高分；
-            # 判词未达线只记风险，不等待手机操作。
+            # 每轮四张同词并行候选，AI导演逐张质检并自动选优；不合格时
+            # Codex继续修词与重选参考图，最多十轮，不等待手机操作。
             payload["_autonomous_repair_seeded"] = True
             payload["_candidate_revision"] = max(
                 1, int(payload.get("revision") or 1))
@@ -21743,7 +22370,7 @@ class Director:
                 ctx, task, continue_on_qc_failure=True)
             if result is None or not str(getattr(result, "uri", "") or ""):
                 raise AifosError(
-                    f"镜头{shot_no}三张返工候选均无技术可用产物；"
+                    f"镜头{shot_no}本轮四张返工候选均无技术可用产物；"
                     "已保留诊断，其他镜头可继续")
             if prompt_override:
                 # render_plan.prompt 是用户在修改框里提交的可编辑原文；

@@ -194,8 +194,41 @@ def infer_story_visual_context(script):
     }
     matches = [
         item for item in contexts if _has_any(text, item["tokens"])]
-    selected = min(
-        matches, key=lambda item: priority[item["key"]]) if matches else None
+    multi_realm_markers = (
+        "穿越", "时空", "回到古代", "回到现代", "现实世界", "游戏世界",
+        "副本世界", "梦境", "梦中", "戏中戏", "剧中剧", "两个时代",
+        "不同时代", "来回穿梭", "反复穿越",
+    )
+    multi_realm = (
+        len(matches) > 1 and _has_any(text, multi_realm_markers))
+    if multi_realm:
+        ordered = sorted(matches, key=lambda item: priority[item["key"]])
+        selected = {
+            "key": "multi_realm",
+            "era": (
+                "多时空/多时代叙事；每场、每镜必须明确当前世界与时代，"
+                "不得用整集题材覆盖当前镜头事实"),
+            "style": (
+                "多时空剧情自适应制作风格；角色身份与全剧画风连续，"
+                "服装、建筑、器物、技术和光线按当前场景所属世界分别锁定；"
+                "跨时代携带物只允许剧本或规则白名单明确登记的实例"),
+            "medium": "统一成片媒介下的多世界视觉体系；各世界有可辨识但连续的视觉基准",
+            "palette": ["当前世界环境本色", "跨世界连续身份色", "转场情绪重点色"],
+            "forbidden": [
+                "未按当前镜头相位混用不同时代元素",
+                "未登记的跨时代道具",
+                "把梦境、游戏或戏中戏规则污染现实层",
+            ],
+            "realms": [
+                {"id": item["key"], "era": item["era"],
+                 "basis": [token for token in item.get("tokens", ())
+                           if token in text][:8]}
+                for item in ordered
+            ],
+        }
+    else:
+        selected = min(
+            matches, key=lambda item: priority[item["key"]]) if matches else None
     if selected is None:
         selected = {
             "key": "story_adaptive",
@@ -209,9 +242,11 @@ def infer_story_visual_context(script):
             "forbidden": ["无文本依据的时代设定", "题材模板套用", "风格漂移"],
         }
     result = dict(selected)
-    result["basis"] = [
-        token for token in selected.get("tokens", ()) if token in text
-    ][:12]
+    result["basis"] = (
+        [marker for marker in multi_realm_markers if marker in text][:12]
+        if multi_realm else [
+            token for token in selected.get("tokens", ()) if token in text
+        ][:12])
     return result
 
 
@@ -968,6 +1003,12 @@ def build_story_analysis(script, style="", raw=None, source="ai"):
             raw_world.get("recurring_motifs"), ["关键道具", "关系距离", "环境光变化"]),
         "forbidden_drift": _list(
             raw_world.get("forbidden_drift"), forbidden),
+        "realms": copy.deepcopy(
+            raw_world.get("realms") or inferred.get("realms") or []),
+        "active_realm_policy": _text(
+            raw_world.get("active_realm_policy"),
+            "逐场逐镜明确 active_realm_id/era_context；当前镜头事实优先，"
+            "未命中的世界规则不得进入提示词或质检"),
     }
     style_camera_language = camera_language_summary(
         director_knowledge)
@@ -1381,6 +1422,8 @@ def apply_story_analysis(script, analysis):
             f"{visual['texture_and_render']}；"
             f"{visual.get('visual_effect_language', '')}"),
         "forbidden_drift": forbidden,
+        "realms": copy.deepcopy(world.get("realms") or []),
+        "active_realm_policy": world.get("active_realm_policy", ""),
     })
     prompt_bible = analysis["prompt_bible"]
     scene_map = {

@@ -86,7 +86,17 @@ def normalize_reference_manifest(references: Any) -> list[dict[str, Any]]:
                                  limit=300),
             "role": _clean_text(item.get("role") or item.get("kind"),
                                 limit=80),
+            "kind": _clean_text(item.get("kind"), limit=80),
             "character": _clean_text(item.get("character"), limit=120),
+            "phase": _clean_text(item.get("phase"), limit=80),
+            "attach_to": _clean_text(item.get("attach_to"), limit=120),
+            "inherits": _text_list(
+                item.get("inherits"), limit=12, item_limit=120),
+            "excludes": _text_list(
+                item.get("excludes"), limit=12, item_limit=120),
+            "responsibilities": _text_list(
+                item.get("responsibilities"), limit=12, item_limit=120),
+            "primary": bool(item.get("primary", False)),
             "binding": _clean_text(item.get("binding"), limit=1200),
         })
     return output

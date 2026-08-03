@@ -22,14 +22,26 @@ RULE_PRECEDENCE = [
         "description": "必须形成新版本；不能静默关闭合规硬门。",
     },
     {
-        "id": "episode_fact_bible",
-        "label": "本集正式剧本、制作圣经与人物定版",
-        "description": "人物、世界、道具、文字白名单和身份事实的唯一来源。",
+        "id": "shot_local_contract",
+        "label": "当前镜头明确事实与相位合同",
+        "description": (
+            "只作用于当前镜头；明确的时代、相位、可见状态和空间事实覆盖"
+            "本集与本剧的宽泛默认。"),
     },
     {
-        "id": "shot_local_contract",
-        "label": "当前镜头局部合同",
-        "description": "只能从本集事实源派生，且只描述当前镜头。",
+        "id": "episode_temporary_rules",
+        "label": "本集临时规则",
+        "description": "只在当前集有效；冲突时覆盖本剧贯穿规则。",
+    },
+    {
+        "id": "episode_fact_bible",
+        "label": "本集正式剧本、制作圣经与人物定版",
+        "description": "人物、世界、道具、文字白名单和身份事实的本集来源。",
+    },
+    {
+        "id": "project_series_rules",
+        "label": "本剧贯穿规则",
+        "description": "只在当前作品内跨集继承，绝不传播到其他作品。",
     },
     {
         "id": "episode_standard_and_policy",
@@ -43,8 +55,8 @@ RULE_PRECEDENCE = [
     },
     {
         "id": "system_default",
-        "label": "系统默认与历史兼容回退",
-        "description": "只补缺，绝不能覆盖以上已锁定事实。",
+        "label": "基础通用规则、系统默认与历史兼容回退",
+        "description": "只补缺，绝不能覆盖本剧、本集或当前镜头事实。",
     },
 ]
 
@@ -135,16 +147,21 @@ CONTEXT_FIELD_PRECEDENCE = {
         "identity_references", "reference_manifest", "locked_identity",
         "user_locked_fields", "manual_revision", "feedback",
         "master_state_precedence", "prompt_conflict_resolution"),
-    "episode_fact_bible": (
-        "story_world", "story_background", "character_background",
-        "characters", "identity_lock", "prop_facts", "style", "era"),
     "shot_local_contract": (
         "action", "camera", "location", "start_state", "end_state",
         "composition", "composition_contract", "prompt_contract",
-        "shot_contract",
-        "readable_text", "frame_kind", "shot_no", "scene_no",
-        "functional_figures", "character_count",
+        "shot_contract", "story_phase", "active_realm_id", "era_context",
+        "sanctioned_anachronisms", "readable_text", "frame_kind",
+        "shot_no", "scene_no", "functional_figures", "character_count",
         "initial_character_state", "variant_axis"),
+    "episode_temporary_rules": (
+        "episode_rules", "episode_temporary_rules"),
+    "episode_fact_bible": (
+        "story_world", "story_background", "character_background",
+        "characters", "identity_lock", "prop_facts", "style", "era"),
+    "project_series_rules": (
+        "project_rules", "series_rules", "world_realms",
+        "transition_rules", "cross_realm_props"),
     "episode_standard_and_policy": (
         "image_task_class", "image_quality", "aspect",
         "candidate_policy", "source_precedence"),
@@ -212,11 +229,19 @@ def default_rule_governance():
                 ],
             },
             {
-                "id": "project_or_episode",
-                "expires": "project_or_episode_end",
+                "id": "project_series",
+                "expires": "project_end",
                 "may_contain": [
                     "era", "style", "wardrobe", "props",
                     "sanctioned_anachronisms",
+                ],
+            },
+            {
+                "id": "episode_temporary",
+                "expires": "episode_end",
+                "may_contain": [
+                    "era", "style", "wardrobe", "props",
+                    "sanctioned_anachronisms", "story_phase",
                 ],
             },
             {

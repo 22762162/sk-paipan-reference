@@ -16,7 +16,7 @@ from .prompt_contract import (
     validate_shot_prompt_contract,
 )
 from .story_context import attach_shot_story_context
-from .workflow import reconcile_shot_semantics
+from .workflow import production_profile, reconcile_shot_semantics
 
 
 PROMPT_REVIEW_SCHEMA = "aifos.prompt-review/v1"
@@ -345,10 +345,22 @@ def build_episode_prompt_review(app, episode_id):
         for scene in (script or {}).get("scenes") or []
         if isinstance(scene, dict)
     }
+    standard_snapshot, _ = app.projects.latest_document(
+        episode_id, "production_standard")
+    if standard_snapshot is None and app.standards is not None:
+        standard_snapshot = app.standards.active()
+    standard_snapshot = (
+        standard_snapshot if isinstance(standard_snapshot, dict) else {})
     ctx = {
         "project": project,
+        "episode": dict(episode),
         "script": script or {},
+        "production_standard": standard_snapshot,
+        "production_profile": production_profile(
+            app.config, standard_snapshot),
     }
+    ctx["rule_layers"] = app.director._load_rule_layers(
+        ctx["project"], ctx["episode"], standard_snapshot)
     results = []
     for raw_shot in (storyboard or {}).get("shots") or []:
         if not isinstance(raw_shot, dict):
@@ -417,6 +429,16 @@ def build_episode_prompt_review(app, episode_id):
             for item in variants for warning in item["warnings"])
         story_context = contexts.get(shot_no, {}) if isinstance(
             contexts, dict) else {}
+        try:
+            effective_rule_stack = app.director._resolve_effective_rules(
+                ctx, shot=shot, stage="prompt_review",
+                modality="image").as_dict()
+        except Exception as exc:
+            effective_rule_stack = {
+                "schema": "aifos.rule-scope/error",
+                "final_rules": {}, "sources": {}, "overridden": [],
+                "fingerprint": "", "error": str(exc),
+            }
         results.append({
             "shot_no": shot_no,
             "unit_id": shot.get("unit_id"),
@@ -434,6 +456,11 @@ def build_episode_prompt_review(app, episode_id):
             ),
             "description": str(
                 shot.get("description") or shot.get("action") or ""),
+            "story_phase": str(shot.get("story_phase") or "present"),
+            "active_realm_id": str(shot.get("active_realm_id") or ""),
+            "era_context": str(shot.get("era_context") or shot.get("era")
+                               or ""),
+            "effective_rule_stack": effective_rule_stack,
             "raw_storyboard_prompt": str(shot.get("prompt") or ""),
             "character_facts": copy.deepcopy(facts),
             "variants": variants,

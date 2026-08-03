@@ -406,7 +406,7 @@ def test_test_provider_reports_missing_bridge_binary(tmp_path, monkeypatch):
 
 
 def test_selection_mode_defaults_roundtrip(tmp_path):
-    """创作选片模式三开关+固定候选数:类型校验、持久化与非法值拒绝。"""
+    """内容质检非阻断；每轮四张、总轮数和旧批次键保持同一预算。"""
     from aifos.settings import set_defaults
     config_path = tmp_path / "config.json"
     saved = set_defaults(config_path, {
@@ -414,18 +414,21 @@ def test_selection_mode_defaults_roundtrip(tmp_path):
         "image_content_qc": False,
         "video_content_qc": "off",
         "shot_candidate_count": 4,
-        "shot_repair_candidate_count": 3,
-        "shot_auto_repair_batches": 1,
+        "shot_repair_candidate_count": 4,
+        "shot_max_candidate_rounds": 10,
+        "shot_auto_repair_batches": 9,
     })
     assert saved == {"selection_mode": True, "image_content_qc": False,
                      "video_content_qc": False, "shot_candidate_count": 4,
-                     "shot_repair_candidate_count": 3,
-                     "shot_auto_repair_batches": 1}
+                     "shot_repair_candidate_count": 4,
+                     "shot_max_candidate_rounds": 10,
+                     "shot_auto_repair_batches": 9}
     stored = json.loads(config_path.read_text(encoding="utf-8"))["defaults"]
     assert stored["selection_mode"] is True
     assert stored["video_content_qc"] is False
-    assert stored["shot_repair_candidate_count"] == 3
-    assert stored["shot_auto_repair_batches"] == 1
+    assert stored["shot_repair_candidate_count"] == 4
+    assert stored["shot_max_candidate_rounds"] == 10
+    assert stored["shot_auto_repair_batches"] == 9
 
     with pytest.raises(AifosError, match="固定为 4"):
         set_defaults(config_path, {"shot_candidate_count": 3})
@@ -433,10 +436,50 @@ def test_selection_mode_defaults_roundtrip(tmp_path):
         set_defaults(config_path, {"selection_mode": "也许"})
     with pytest.raises(AifosError, match="不支持的默认项"):
         set_defaults(config_path, {"image_qc_retries": 2})
-    with pytest.raises(AifosError, match="固定为 3"):
-        set_defaults(config_path, {"shot_repair_candidate_count": 5})
-    with pytest.raises(AifosError, match="固定为 1"):
-        set_defaults(config_path, {"shot_auto_repair_batches": 2})
+    with pytest.raises(AifosError, match="固定为 4"):
+        set_defaults(config_path, {"shot_repair_candidate_count": 3})
+    with pytest.raises(AifosError, match="1-10"):
+        set_defaults(config_path, {"shot_max_candidate_rounds": 11})
+    with pytest.raises(AifosError, match="0-9"):
+        set_defaults(config_path, {"shot_auto_repair_batches": 10})
+    with pytest.raises(AifosError, match="冲突"):
+        set_defaults(config_path, {
+            "shot_max_candidate_rounds": 10,
+            "shot_auto_repair_batches": 8,
+        })
+
+    migrated = set_defaults(config_path, {"shot_auto_repair_batches": 2})
+    assert migrated == {
+        "shot_auto_repair_batches": 2,
+        "shot_max_candidate_rounds": 3,
+    }
+
+
+def test_config_load_upgrades_old_fixed_repair_policy_without_round_eleven(
+        tmp_path):
+    """旧固定1批不是用户偏好；升级后为10轮，新总轮数字段永远优先。"""
+    from aifos.config import Config
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "defaults": {
+            "shot_repair_candidate_count": 3,
+            "shot_auto_repair_batches": 1,
+        },
+    }), encoding="utf-8")
+    upgraded = Config.load(config_path)
+    assert upgraded.get("defaults", "shot_repair_candidate_count") == 4
+    assert upgraded.get("defaults", "shot_max_candidate_rounds") == 10
+    assert upgraded.get("defaults", "shot_auto_repair_batches") == 9
+
+    config_path.write_text(json.dumps({
+        "defaults": {
+            "shot_max_candidate_rounds": 8,
+            "shot_auto_repair_batches": 99,
+        },
+    }), encoding="utf-8")
+    explicit = Config.load(config_path)
+    assert explicit.get("defaults", "shot_max_candidate_rounds") == 8
+    assert explicit.get("defaults", "shot_auto_repair_batches") == 7
 
 
 def test_selection_mode_web_endpoints(tmp_path):
@@ -459,8 +502,17 @@ def test_selection_mode_web_endpoints(tmp_path):
         status, view = call("GET", "/api/selection-mode")
         assert status == 200
         # 升级后的新产线默认:选片模式开箱即开(旧 workspace 无键同样生效)
-        assert view == {"selection_mode": True, "image_content_qc": True,
-                        "video_content_qc": True, "shot_candidate_count": 4}
+        assert view["selection_mode"] is True
+        assert view["image_content_qc"] is True
+        assert view["video_content_qc"] is True
+        assert view["effective_image_content_qc"] is True
+        assert view["effective_video_content_qc"] is True
+        assert view["content_qc_blocking"] is False
+        assert view["content_qc_auto_retry"] is True
+        assert view["shot_candidate_count"] == 4
+        assert view["shot_repair_candidate_count"] == 4
+        assert view["max_candidate_rounds"] == 10
+        assert view["first_round_included"] is True
 
         # 兼容手工写入的旧布尔字符串，并钳制损坏的候选数回显；UI 不得
         # 把字符串 "false" 当真，也不能展示 Director 不会执行的 99 张。
@@ -499,8 +551,11 @@ def test_selection_mode_web_endpoints(tmp_path):
         assert defaults["selection_mode"] is True
         assert defaults["video_content_qc"] is False
         assert defaults["shot_candidate_count"] == 4
-        assert defaults["shot_repair_candidate_count"] == 3
-        assert defaults["shot_auto_repair_batches"] == 1
+        assert defaults["shot_repair_candidate_count"] == 4
+        assert defaults["shot_max_candidate_rounds"] == 10
+        assert defaults["shot_auto_repair_batches"] == 9
+        assert defaults["content_qc_blocking"] is False
+        assert defaults["content_qc_auto_retry"] is True
 
         status, err = call("POST", "/api/selection-mode",
                            {"shot_candidate_count": 2})

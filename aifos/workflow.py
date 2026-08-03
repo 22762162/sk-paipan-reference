@@ -2279,14 +2279,26 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             "appearance_state_required": True,
             "appearance_continuity_issues": appearance_continuity_issues,
             "semantic_corrections": semantic_corrections,
-            "era_context": "；".join(str(value or "").strip() for value in (
-                (script.get("story_world") or {}).get("name"),
-                (script.get("story_world") or {}).get("era_and_location"),
-                (script.get("story_world") or {}).get("hard_rules"),
-            ) if str(value or "").strip()),
+            # 多时空作品不能把整集命中的某一朝代灌进所有镜头。Provider
+            # /源场次若已明确当前相位，镜头局部事实直接覆盖世界宽泛默认。
+            "era_context": str(
+                raw.get("era_context") or raw.get("era")
+                or scene.get("era_context") or scene.get("era")
+                or (script.get("story_world") or {}).get(
+                    "era_and_location") or "").strip(),
+            "story_phase": str(
+                raw.get("story_phase") or scene.get("story_phase")
+                or "present").strip(),
+            "active_realm_id": str(
+                raw.get("active_realm_id") or scene.get("active_realm_id")
+                or "").strip(),
             "sanctioned_anachronisms": list(
-                (script.get("story_world") or {}).get(
-                    "sanctioned_anachronisms") or []),
+                (raw.get("sanctioned_anachronisms")
+                 if "sanctioned_anachronisms" in raw else
+                 scene.get("sanctioned_anachronisms")
+                 if "sanctioned_anachronisms" in scene else
+                 (script.get("story_world") or {}).get(
+                     "sanctioned_anachronisms") or [])),
             "script_reference": script_reference,
             # 图片失败后的 Codex 修复可把 description 改成“仅生成静态
             # 终态”的构图合同；视频动作另存一份，后续 Seedance 不得

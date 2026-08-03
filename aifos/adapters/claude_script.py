@@ -292,6 +292,10 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
   不得擅自改时代、组织、能力、技术、物种、性别、年龄段、身份与人物关系;
 - 必须读取 `production_analysis` 制作圣经；逐场继承其中的环境、布局、材质、
   时段天气、主光方向和提示词前缀；继承全局画风、负面提示词与连续性规则;
+- 多时代、穿越、梦境、游戏世界或戏中戏必须逐镜输出 `story_phase`、
+  `active_realm_id` 和准确 `era_context`；当前镜头事实优先于整集题材，禁止因
+  全文出现明代/现代关键词就把另一时空的元素灌入本镜；跨时代携带物只使用
+  本镜命中的 `sanctioned_anachronisms` 白名单;
 - 若 `production_analysis.visual.director_knowledge` 中存在
   `firefire.director-style/v1`，它就是本风格唯一的高频镜头与视觉效果库：
   每镜必须依据叙事功能从 `shot_patterns` 选择一个主要镜头组合，并从
@@ -388,6 +392,10 @@ JSON 格式:
  "shots": [{{"shot_no": 1, "scene_no": 1,
   "scene_event_id":"源剧本对应场次的稳定event_id",
   "event_id":"稳定且唯一的镜头事件ID",
+  "story_phase":"present/time_travel/dream/play_within_play 或剧本明确相位",
+  "active_realm_id":"当前镜头所属世界/时代稳定ID",
+  "era_context":"当前镜头唯一准确的时代、地域与技术/物质边界",
+  "sanctioned_anachronisms":["只列当前镜头明确允许的跨时代物品实例"],
   "kind": "environment", "description": "...", "camera": "镜头语言",
   "style_direction":{{"schema":"firefire.director-style/v1",
     "shot_pattern":"从本风格高频镜头组合中选中的一项",
@@ -2556,6 +2564,24 @@ def validate_scene_annotation(data):
     return ""
 
 
+def _effective_rule_block(payload):
+    stack = payload.get("effective_rule_stack")
+    if not isinstance(stack, dict):
+        return ""
+    final_rules = stack.get("final_rules") or {}
+    if not isinstance(final_rules, dict) or not final_rules:
+        return ""
+    return (
+        "\n\n【本次有效规则栈·已按 当前镜头>本集临时>本剧贯穿>基础 裁决】\n"
+        + json.dumps({
+            "fingerprint": stack.get("fingerprint", ""),
+            "rules": final_rules,
+            "sources": stack.get("sources") or {},
+        }, ensure_ascii=False)
+        + "\n同 key 只执行最终值；被覆盖的旧规则不得继续出现在结果中。"
+    )
+
+
 def build_prompt(capability, payload):
     """构造编剧/分镜/人物设定提示词(CLI 桥与 Claude API Provider 共用)。
 
@@ -2663,7 +2689,7 @@ def _build_prompt_body(capability, payload):
                 payload.get("analysis_rules") or {}, ensure_ascii=False),
             script=json.dumps(payload.get("script", {}),
                               ensure_ascii=False),
-            schema=STORY_ANALYSIS_SCHEMA)
+            schema=STORY_ANALYSIS_SCHEMA) + _effective_rule_block(payload)
     if capability == "script" and payload.get("character_design"):
         names = "、".join(
             f"{c.get('name')}({c.get('role') or '角色'})"
@@ -2755,10 +2781,11 @@ def _build_prompt_body(capability, payload):
         lessons = str(payload.get("lessons") or "").strip()
         if lessons:
             prompt = f"{prompt}\n\n【经验库·严禁再犯】{lessons}"
-        return prompt
+        return prompt + _effective_rule_block(payload)
     if capability == "storyboard":
         return STORYBOARD_PROMPT.format(
-            script=json.dumps(payload.get("script", {}), ensure_ascii=False))
+            script=json.dumps(payload.get("script", {}), ensure_ascii=False)
+        ) + _effective_rule_block(payload)
     if capability == "image_qc":
         return build_qc_prompt(payload)
     if capability == "scene_annotate":

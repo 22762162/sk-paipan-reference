@@ -29,9 +29,14 @@ def test_default_standard_is_complete_and_active(tmp_path):
         rules = content["rules"]
         governance = rules["rule_governance"]
         assert governance["schema"] == "aifos.rule-governance/v1"
-        assert [item["id"] for item in governance["precedence"][:3]] == [
-            "user_locked_fact", "episode_fact_bible",
-            "shot_local_contract"]
+        assert [item["id"] for item in governance["precedence"][:5]] == [
+            "user_locked_fact", "shot_local_contract",
+            "episode_temporary_rules", "episode_fact_bible",
+            "project_series_rules"]
+        assert next(
+            item for item in governance["scopes"]
+            if item["id"] == "episode_temporary"
+        )["expires"] == "episode_end"
         retry_scope = next(
             item for item in governance["scopes"]
             if item["id"] == "retry_patch")

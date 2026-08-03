@@ -239,6 +239,65 @@ def test_environment_shot_remains_strictly_empty(tmp_path):
     assert "无人空镜" in shot["seedance_prompt"]
 
 
+def test_enrich_storyboard_keeps_per_shot_realm_rules_isolated(tmp_path):
+    """穿越/多世界题材按镜头相位取值，不能把整集时代灌进每一镜。"""
+    from aifos.workflow import (build_continuity_bible, enrich_storyboard,
+                                production_profile)
+
+    script = {
+        "project_title": "双时空测试",
+        "episode_number": 1,
+        "episode_title": "往返",
+        "logline": "主角在现代与明代之间往返",
+        "story_world": {
+            "era_and_location": "现代与明代双时空",
+            "sanctioned_anachronisms": ["穿越门"],
+        },
+        "characters": [],
+        "scenes": [
+            {"scene_no": 1, "location": "现代酒店", "characters": [],
+             "action": "电梯门打开", "lines": []},
+            {"scene_no": 2, "location": "明代驿站", "characters": [],
+             "action": "驿卒点灯", "lines": []},
+        ],
+    }
+    app = App(tmp_path / "ws")
+    try:
+        profile = production_profile(app.config, app.standards.active())
+    finally:
+        app.close()
+    continuity = build_continuity_bible(
+        {"title": "双时空测试", "style": ""}, script, profile)
+    board = enrich_storyboard(script, {"shots": [
+        {
+            "scene_no": 1, "kind": "environment", "characters": [],
+            "description": "现代酒店电梯门打开",
+            "era_context": "2078年现代都市",
+            "story_phase": "present",
+            "active_realm_id": "modern_reality",
+            "sanctioned_anachronisms": [],
+        },
+        {
+            "scene_no": 2, "kind": "environment", "characters": [],
+            "description": "明代驿站内驿卒点亮油灯",
+            "era_context": "明代",
+            "story_phase": "time_travel",
+            "active_realm_id": "ming_realm",
+            "sanctioned_anachronisms": ["穿越门"],
+        },
+    ]}, continuity, profile)
+
+    modern, ming = board["shots"][:2]
+    assert modern["era_context"] == "2078年现代都市"
+    assert modern["story_phase"] == "present"
+    assert modern["active_realm_id"] == "modern_reality"
+    assert modern["sanctioned_anachronisms"] == []
+    assert ming["era_context"] == "明代"
+    assert ming["story_phase"] == "time_travel"
+    assert ming["active_realm_id"] == "ming_realm"
+    assert ming["sanctioned_anachronisms"] == ["穿越门"]
+
+
 def test_saved_storyboard_repairs_official_uniform_continuity_without_rewrite():
     from aifos.workflow import repair_storyboard_appearance_continuity
 
