@@ -869,6 +869,10 @@ class NineGridCell:
     script_reference: str
     visual_hook: str
     dialogue: str
+    high_value_event_id: str
+    event_role: str
+    event_beat_ids: tuple[str, ...]
+    must_visualize: bool
 
 
 @dataclass(frozen=True)
@@ -970,6 +974,19 @@ def build_nine_grid_pages(
             visual_hook=_text(shot.get("visual_hook")),
             dialogue=_dialogue_text(
                 shot.get("dialogue") or shot.get("lines")),
+            high_value_event_id=_text(
+                shot.get("high_value_event_id")
+                or shot.get("dramatic_sequence_id")),
+            event_role=_text(shot.get("event_role"), "routine"),
+            event_beat_ids=tuple(dict.fromkeys(
+                str(value).strip()
+                for value in (
+                    shot.get("event_beat_ids")
+                    if isinstance(shot.get("event_beat_ids"), list)
+                    else [shot.get("event_beat_id")]
+                )
+                if str(value or "").strip())),
+            must_visualize=bool(shot.get("must_visualize")),
         ))
 
     pages: list[NineGridPage] = []

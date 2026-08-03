@@ -466,6 +466,49 @@ def test_long_take_policy_folds_setup_and_reaction_into_dialogue_shots():
     assert not any(shot.get("kind") in ("reaction", "beat") for shot in shots)
 
 
+def test_long_take_never_folds_authored_action_or_high_value_sequence():
+    from aifos.workflow import _fold_setup_and_settle_shots
+
+    rules = {"production": {"long_take_policy": {"enabled": True}}}
+    raw = [
+        {"scene_no": 4, "event_id": "open", "kind": "action",
+         "description": "02:22游戏开启"},
+        {"scene_no": 4, "event_id": "first", "kind": "action",
+         "description": "A级扮演出现后删除"},
+        {"scene_no": 4, "event_id": "retry", "kind": "action",
+         "description": "C级重试蒙太奇并查看剩余时间"},
+        {"scene_no": 4, "event_id": "payoff", "kind": "action",
+         "high_value_event_id": "game_draw",
+         "event_beat_ids": ["ss_draw"], "must_visualize": True,
+         "description": "SS级盗神爆发"},
+    ]
+
+    folded = _fold_setup_and_settle_shots(raw, rules)
+
+    assert [shot["event_id"] for shot in folded] == [
+        "open", "first", "retry", "payoff"]
+
+
+def test_ai_dialogue_text_alias_and_list_are_not_silently_dropped():
+    from aifos.workflow import _expand_ai_shot_dialogue, _normalize_ai_shot
+
+    raw = {
+        "scene_no": 2, "event_id": "handoff", "duration": 12,
+        "dialogue": [
+            {"character": "小吴", "text": "遇上什么难事了吗？"},
+            {"character": "虞寻歌", "text": "没事。"},
+        ],
+    }
+
+    expanded = [
+        _normalize_ai_shot(item) for item in _expand_ai_shot_dialogue(raw)]
+
+    assert [item["dialogue"]["dialogue"] for item in expanded] == [
+        "遇上什么难事了吗？", "没事。"]
+    assert [item["event_id"] for item in expanded] == [
+        "handoff:line:1", "handoff:line:2"]
+
+
 def test_long_take_prop_timeline_canonicalizes_only_static_wording_drift():
     from aifos.workflow import _compose_prop_timeline
 

@@ -22,6 +22,10 @@ from .inner_persona import (
     physical_scene_characters,
     shot_timeline_state,
 )
+from .high_value_events import (
+    audit_high_value_event_coverage,
+    is_preserved_event_shot,
+)
 from .prompt_contract import (
     build_physical_contract,
     compile_shot_prompt,
@@ -45,6 +49,7 @@ from .story_logic import reconcile_storyboard_prop_registry
 
 
 PIPELINE_VERSION = "sk-manju-v5"
+STORYBOARD_ENRICHMENT_VERSION = 2
 TEXT_CARRIERS = (
     "弹幕", "聊天框", "直播屏", "手机屏", "电脑", "后台", "合同",
     "欠条", "门牌", "榜单", "公司标识", "大字", "屏幕", "字幕",
@@ -1507,8 +1512,25 @@ def _fold_shot_into_long_take(target, extra, *, before):
                 extra_frames.get("keyframe") or extra_frames["last_frame"])
 
 
+def _long_take_auxiliary(shot):
+    """Only genuinely auxiliary shots may be consumed by a dialogue take.
+
+    Authored action/set-piece shots are independent story events.  Treating
+    every no-dialogue row as setup used to collapse an entire game draw,
+    awakening or transformation into its final result.
+    """
+    if is_preserved_event_shot(shot):
+        return False
+    explicit = shot.get("foldable_into_long_take")
+    if explicit is not None:
+        return explicit is True
+    return str(shot.get("kind") or "").strip().lower() in {
+        "environment", "reaction", "beat",
+    }
+
+
 def _fold_setup_and_settle_shots(raw_shots, rules):
-    """每场保留一台词一镜，场景建立/动作/留白都折进相邻长镜头。"""
+    """Fold only auxiliary setup/settle rows into adjacent dialogue shots."""
     if not _long_take_enabled(rules):
         return [copy.deepcopy(raw) for raw in raw_shots]
     grouped = {}
@@ -1530,17 +1552,23 @@ def _fold_setup_and_settle_shots(raw_shots, rules):
                     _fold_shot_into_long_take(shot, setup, before=True)
                 pending = []
                 built.append(shot)
-            else:
+            elif _long_take_auxiliary(raw):
                 pending.append(raw)
+            else:
+                # A non-foldable story event is an ordering barrier.  Do not
+                # drag earlier atmosphere through it into a later dialogue,
+                # and never consume the event itself.
+                built.extend(pending)
+                pending = []
+                built.append(copy.deepcopy(raw))
         if not built:
-            if pending:
-                merged = pending.pop(0)
-                for extra in pending:
-                    _fold_shot_into_long_take(merged, extra, before=False)
-                built.append(merged)
+            built.extend(pending)
         elif pending:
-            for settle in pending:
-                _fold_shot_into_long_take(built[-1], settle, before=False)
+            if built[-1].get("dialogue"):
+                for settle in pending:
+                    _fold_shot_into_long_take(built[-1], settle, before=False)
+            else:
+                built.extend(pending)
         out.extend(built)
     return out
 
@@ -1593,6 +1621,13 @@ def _split_dialogue_shots(raw_shots, rules):
                 "index": part_index, "total": len(parts),
                 "source_duration": source_duration,
             }
+            if len(parts) > 1 and str(working.get("event_id") or "").strip():
+                source_event_id = str(
+                    working.get("source_event_id")
+                    or working.get("event_id")).strip()
+                split["source_event_id"] = source_event_id
+                split["event_id"] = (
+                    f"{working['event_id']}:part:{part_index}")
             explicit_duration = float(working.get("duration") or 0)
             if len(parts) > 1:
                 explicit_duration /= len(parts)
@@ -1843,6 +1878,67 @@ def _temporal_beats_text(beats):
         for item in beats)
 
 
+def _dialogue_rows(value):
+    """Normalize provider dialogue aliases without silently losing a line."""
+    values = value if isinstance(value, list) else [value]
+    rows = []
+    for item in values:
+        if isinstance(item, str):
+            text = item.strip()
+            character = ""
+        elif isinstance(item, dict):
+            text = str(
+                item.get("dialogue") or item.get("text")
+                or item.get("content") or item.get("line") or "").strip()
+            character = str(
+                item.get("character") or item.get("speaker") or "").strip()
+        else:
+            continue
+        if text:
+            rows.append({"character": character, "dialogue": text})
+    return rows
+
+
+def _expand_ai_shot_dialogue(raw):
+    """Split a multi-line provider row into ordered one-line shot rows."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("dialogue"), list):
+        return [raw]
+    dialogues = _dialogue_rows(raw.get("dialogue"))
+    if len(dialogues) <= 1:
+        clone = copy.deepcopy(raw)
+        clone["dialogue"] = dialogues[0] if dialogues else None
+        return [clone]
+    source_event_id = str(raw.get("event_id") or "").strip()
+    duration = raw.get("duration")
+    try:
+        divided_duration = float(duration) / len(dialogues)
+    except (TypeError, ValueError):
+        divided_duration = None
+    rows = []
+    for index, dialogue in enumerate(dialogues, 1):
+        clone = copy.deepcopy(raw)
+        clone["dialogue"] = dialogue
+        clone["dialogue_group"] = {
+            "index": index, "total": len(dialogues),
+            "source_event_id": source_event_id,
+        }
+        if source_event_id:
+            clone["source_event_id"] = source_event_id
+            clone["event_id"] = f"{source_event_id}:line:{index}"
+        if divided_duration is not None:
+            clone["duration"] = divided_duration
+        # The provider authored one physical transition around the whole
+        # exchange. Keep it on the first line; later dialogue shots inherit
+        # the already-completed endpoint instead of repeating the action.
+        if index > 1:
+            clone["prop_transitions"] = []
+            if isinstance(raw.get("end_state"), dict):
+                clone["start_state"] = copy.deepcopy(raw["end_state"])
+                clone["end_state"] = copy.deepcopy(raw["end_state"])
+        rows.append(clone)
+    return rows
+
+
 def _normalize_ai_shot(raw):
     """AI 分镜的宽松产出 → 统一结构。
 
@@ -1854,18 +1950,8 @@ def _normalize_ai_shot(raw):
     elif not isinstance(raw, dict):
         return None
     shot = dict(raw)
-    dialogue = shot.get("dialogue")
-    if isinstance(dialogue, str):
-        text = dialogue.strip()
-        shot["dialogue"] = ({"character": "", "dialogue": text}
-                            if text else None)
-    elif isinstance(dialogue, dict):
-        text = str(dialogue.get("dialogue") or "").strip()
-        shot["dialogue"] = ({"character": str(dialogue.get("character")
-                                              or ""),
-                             "dialogue": text} if text else None)
-    else:
-        shot["dialogue"] = None
+    dialogue_rows = _dialogue_rows(shot.get("dialogue"))
+    shot["dialogue"] = dialogue_rows[0] if dialogue_rows else None
     characters = shot.get("characters")
     if isinstance(characters, str):
         characters = [characters]
@@ -1926,15 +2012,16 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
         (s.get("scene_no") for s in script.get("scenes", [])), 1)
     last_scene = None
     for raw in (storyboard or {}).get("shots", []):
-        shot = _normalize_ai_shot(raw)
-        if shot is None:
-            continue
-        if shot.get("scene_no") is None:
-            # AI 忘写场次 → 继承上一镜(开头则归入第一场)
-            shot["scene_no"] = (last_scene if last_scene is not None
-                                else fallback_scene)
-        last_scene = shot["scene_no"]
-        normalized.append(shot)
+        for expanded in _expand_ai_shot_dialogue(raw):
+            shot = _normalize_ai_shot(expanded)
+            if shot is None:
+                continue
+            if shot.get("scene_no") is None:
+                # AI 忘写场次 → 继承上一镜(开头则归入第一场)
+                shot["scene_no"] = (last_scene if last_scene is not None
+                                    else fallback_scene)
+            last_scene = shot["scene_no"]
+            normalized.append(shot)
     normalized, inner_policy = apply_inner_persona_to_shots(
         script, normalized, rules.get("inner_persona"))
     raw_shots = _append_performance_beats(normalized, script, rules)
@@ -2382,6 +2469,7 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
     return {
         "episode_title": storyboard.get("episode_title", script.get("episode_title", "")),
         "pipeline_version": PIPELINE_VERSION,
+        "storyboard_enrichment_version": STORYBOARD_ENRICHMENT_VERSION,
         "prop_contract_schema": "aifos.prop-contract/v2.2",
         "prop_registry": copy.deepcopy(effective_prop_registry),
         "appearance_state_version": APPEARANCE_STATE_VERSION,
@@ -3044,11 +3132,15 @@ def build_content_review(script, storyboard, continuity):
             "drift_issue": "" if passed else "结构化映射或文字锁定缺失",
             "verdict": "PASS" if passed else "FAIL",
         })
+    high_value_coverage = audit_high_value_event_coverage(script, storyboard)
     return {
         "pipeline_version": PIPELINE_VERSION,
         "standard_fingerprint": storyboard.get("standard_fingerprint", ""),
-        "passed": bool(units) and all(u["verdict"] == "PASS" for u in units),
+        "passed": (bool(units)
+                   and all(u["verdict"] == "PASS" for u in units)
+                   and high_value_coverage["passed"]),
         "review_basis": "剧本映射 + 连续性圣经 + 关键帧/首尾帧检查板",
+        "high_value_event_coverage": high_value_coverage,
         "units": units,
     }
 

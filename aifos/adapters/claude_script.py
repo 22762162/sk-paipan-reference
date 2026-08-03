@@ -32,6 +32,11 @@ import time
 from pathlib import Path
 
 from ..generation_diagnostics import normalize_generation_diagnostics
+from ..high_value_events import (
+    audit_high_value_event_coverage,
+    normalize_high_value_events,
+    validate_high_value_event_contract,
+)
 from ..identity_facts import unresolved_identity_fields
 from ..speaker_labels import is_non_person_label
 from ..inner_persona import normalize_inner_persona_policy
@@ -56,6 +61,14 @@ SCRIPT_PROMPT = """你是兼具顶级类型片编剧、影视导演、场面调�
 制作风格输入:{style};本集前提:{premise}。
 
 要求:
+- 【AIFOS最高通用创作规则：高价值事件必须展开】凡事件会造成不可逆状态改变、
+  关键答案揭示、强不确定结果、重大选择与代价、能力获得/升级、觉醒、变身、
+  穿越、仪式、战斗反转、重大失去、伏笔兑现或标志性奇观，观众必须看到过程，
+  禁止用“随后完成/多次尝试后/最终获得”等一句结果带过。每个高价值事件先建立
+  `high_value_events` 合同，按规则建立→尝试→受挫/代价→递进或节奏蒙太奇→
+  悬念停顿→结果爆发→人物反应/后果选择所需的 3-7 个独立可见节拍展开；同构
+  重复操作可以合成一个蒙太奇节拍，坐下、取物、普通点击等连接动作不得膨胀。
+  此规则高于省镜、长镜头折叠和节奏压缩，任何高价值必看节拍都不得被吞并；
 - 如果输入来自小说、故事梗概或泛化叙述，先做影视化改编：保留核心因果、人物
   动机和关键台词，把“他很震惊、局势紧张、两人交锋”等抽象概括改写成摄影机
   能直接拍到的动作、反应、道具变化和空间结果；不得照抄小说旁白充当画面;
@@ -185,6 +198,18 @@ JSON 格式(字段必须齐全):
    "owner":"初始与主要持有人",
    "continuity_states":"出现、使用/交接、状态变化和最终去向",
    "candidate_count":4}}],
+ "high_value_event_schema":"aifos.high-value-events/v1",
+ "high_value_events":[{{"event_id":"全剧稳定高价值事件ID","scene_no":1,
+   "event_class":"high_value",
+   "story_value":"reveal/reversal/power_gain/transformation/time_travel/decision/cost/spectacle/custom",
+   "dramatic_question":"观众等待答案的核心问题",
+   "visual_progression":"视觉、声音、光线、空间和表演如何逐级升级",
+   "must_visualize":true,"minimum_independent_shots":3,
+   "routine_montage_allowed":true,
+   "required_beats":[{{"beat_id":"稳定节拍ID",
+     "role":"rule_setup/attempt/cost/escalation/suspense/payoff/reaction",
+     "visible_event":"摄影机必须拍到的单一可见事件",
+     "must_visualize":true}}]}}],
  "adaptation_review": {{
    "source_to_screen_strategy": "如何把小说/梗概改成可见戏剧行动",
    "source_material_policy": "原素材哪些必须保留、哪些允许为影视逻辑改写；正式锁定点是什么",
@@ -197,10 +222,12 @@ JSON 格式(字段必须齐全):
    "prop_lifecycle": "关键道具逐件来源、持有人、使用交接、状态变化和去向",
    "missing_detail_completion": "原素材省略但拍摄必需的服化道、动作、空间和环境细节如何补齐",
    "story_density": "逐场新信息、选择、冲突、反应或结果检查；删除无效注水",
+   "high_value_event_coverage": "逐项核对高价值事件的过程、爆发、反应和后果均已可见展开，普通连接动作未膨胀",
    "shootability": "核心事件如何由镜头直接拍出",
    "local_rewrite_policy": "逻辑返编时如何锁定前后边界、分析影响并只使受影响资产失效",
    "self_reviewed": true}},
  "scenes": [{{"scene_no": 1, "event_id":"稳定场次事件ID","location": "地点",
+   "high_value_event_ids":["本场命中的高价值事件ID；无则空数组"],
    "characters": ["出场角色名"], "action": "本场动作描述",
    "director_logic": {{
      "dramatic_function": "本场给观众带来的新信息/冲突/转折",
@@ -227,6 +254,9 @@ IDOL_PROMPT = """你是 AI 虚拟偶像「{persona}」的内容策划。为第{e
 人设风格:{style};本期主题:{premise}。
 
 要求:
+- 同样遵守 AIFOS 最高通用创作规则：若本期存在登台、揭晓、重大选择、竞赛
+  结果、关系反转或其他高价值事件，必须让观众看到过程、结果和人物反应，
+  不能只用一句口播概括；普通日常连接动作不膨胀；
 - 竖屏短视频节奏:开场 3 秒钩子 → 主体内容 → 结尾引导关注;
 - 写场次前先完整输出 `story_world`、`story_background` 和人物设定介绍,
   作为后续人物图、舞台分镜和视频的唯一事实源;
@@ -276,7 +306,15 @@ JSON 格式(字段必须齐全,characters 只含「{persona}」一人):
      "story_visual_symbol":"视觉符号","story_visual_symbol_origin":"故事来源",
      "signature_accessory":"核心配饰","temperament_keywords":["3-8个气质关键词"]}},
    "cast_dedup": {{"compared_with":["其他成员"],"status":"passed","conflicts":[]}}}}],
+ "high_value_event_schema":"aifos.high-value-events/v1",
+ "high_value_events":[{{"event_id":"稳定事件ID","scene_no":1,
+   "event_class":"high_value","story_value":"reveal/reversal/decision/spectacle/custom",
+   "dramatic_question":"观众等待答案的问题","must_visualize":true,
+   "minimum_independent_shots":3,"routine_montage_allowed":true,
+   "required_beats":[{{"beat_id":"稳定节拍ID","role":"setup/process/payoff/reaction",
+     "visible_event":"镜头必须拍到的事件","must_visualize":true}}]}}],
  "scenes": [{{"scene_no": 1, "location": "场景",
+   "high_value_event_ids":["本场命中事件ID；无则空数组"],
    "characters": ["{persona}"], "action": "画面动作描述",
    "lines": [{{"character": "{persona}", "dialogue": "口播台词"}}]}}]}}"""
 
@@ -286,6 +324,13 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
 {script}
 
 要求:
+- 【最高规则优先于长镜头】先读取剧本 `high_value_events`。每个
+  `must_visualize:true` 的事件必须按 `required_beats` 展开为不少于
+  `minimum_independent_shots` 的独立镜头，至少让观众经历规则/触发、过程或
+  递进、结果爆发、人物反应与后果；每镜只承载一个可见状态或动作。重复同构
+  尝试可合成一镜节奏蒙太奇，但不得把整个事件压成“连续操作后得到结果”。
+  每个相关镜头必须原样写 `high_value_event_id`、`event_beat_ids`、`event_role`、
+  `must_visualize:true`、`must_preserve:true`、`foldable_into_long_take:false`；
 - `story_world` 故事世界观、`story_background`、非背景角色的
   `introduction` 与背景路人的
   `crowd_function` 是硬约束,必须先读取再分镜;不得新增人物表之外的角色,
@@ -303,7 +348,7 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
   整套粒子、滤镜和光效同时堆入一镜。`camera` 必须明确景别、角度、机位、
   焦段、一个主要运镜和构图；同时输出 `style_direction` 记录选择结果与动机;
 - 每段只承载一个主要动作或一次情绪转折；台词逐字照抄，禁止改写；
-- 常规采用一条台词一个连续长镜头；把场景建立、人物起势、必要肢体动作、
+- 仅对非高价值的常规对白采用一条台词一个连续长镜头；把场景建立、人物起势、必要肢体动作、
   听者反应和情绪收束折进相邻对白镜头，不得机械拆成独立空镜、反应镜或留白镜；
   只有没有任何对白的纯动作场才可使用独立环境/肢体镜头；
 - `characters` 只列有独立身份资产的登记角色。所有没有独立身份资产但在画面中
@@ -382,6 +427,10 @@ STORYBOARD_PROMPT = """你是漫剧分镜师。基于以下剧本 JSON 生成可
 
 JSON 格式:
 {{"episode_title": "...","prop_contract_schema":"aifos.prop-contract/v2.2",
+ "high_value_event_schema":"aifos.high-value-events/v1",
+ "high_value_event_coverage":[{{"event_id":"剧本高价值事件ID",
+   "required_beat_ids":["必须节拍ID"],"covered_shot_event_ids":["镜头event_id"],
+   "coverage_status":"complete"}}],
  "prop_registry":[{{"prop_id":"稳定道具实例ID","name":"全剧唯一实例显示名称",
    "scale_reference":"用画面内参照物说明它多大;禁止只写厘米",
    "kind":"core/plot_sensitive/identity_prop","instance_count":1,
@@ -390,8 +439,13 @@ JSON 格式:
    "retired_at":null,"availability_end_event":null,
    "disclosure_policy":"explicit_frame_only"}}],
  "shots": [{{"shot_no": 1, "scene_no": 1,
-  "scene_event_id":"源剧本对应场次的稳定event_id",
+ "scene_event_id":"源剧本对应场次的稳定event_id",
   "event_id":"稳定且唯一的镜头事件ID",
+  "high_value_event_id":"命中则原样填写；普通镜头为空字符串",
+  "event_beat_ids":["本镜实际覆盖的required_beats.beat_id；普通镜头空数组"],
+  "event_role":"setup/attempt/cost/escalation/suspense/payoff/reaction/routine",
+  "must_visualize":false,"must_preserve":false,
+  "foldable_into_long_take":true,
   "story_phase":"present/time_travel/dream/play_within_play 或剧本明确相位",
   "active_realm_id":"当前镜头所属世界/时代稳定ID",
   "era_context":"当前镜头唯一准确的时代、地域与技术/物质边界",
@@ -1071,6 +1125,10 @@ def validate_script(script, payload):
     script.setdefault("episode_number", payload.get("episode_number", 0))
     script.setdefault("episode_title", "")
     script.setdefault("logline", "")
+    normalize_high_value_events(script)
+    high_value_issues = validate_high_value_event_contract(script)
+    if high_value_issues:
+        return "高价值事件合同无效: " + "；".join(high_value_issues)
     normalize_script_bible(script, payload)
     # AI 初稿即使漏写性别/年龄也必须进入制作圣经供人工补录，不能在
     # Provider 层静默回退成另一份 mock 剧本。真正锁定人物、生成候选图
@@ -1079,7 +1137,7 @@ def validate_script(script, payload):
         script, require_resolved_identity=False)
 
 
-def validate_storyboard(storyboard):
+def validate_storyboard(storyboard, source_script=None):
     if not isinstance(storyboard, dict) or not storyboard.get("shots"):
         return "缺少 shots"
     if not isinstance(storyboard["shots"], list):
@@ -1282,6 +1340,11 @@ def validate_storyboard(storyboard):
             prop_report["issues"])
     storyboard.setdefault("episode_title", "")
     storyboard["prop_contract_schema"] = PROP_CONTRACT_SCHEMA
+    coverage = audit_high_value_event_coverage(
+        source_script or {}, storyboard)
+    storyboard["high_value_event_coverage"] = coverage
+    if not coverage["passed"]:
+        return "高价值事件展开不完整: " + "；".join(coverage["issues"])
     return None
 
 
@@ -3045,7 +3108,9 @@ def _postprocess_and_validate(capability, payload, data):
     elif capability == "script":
         error = validate_script(data, payload)
     else:
-        error = validate_storyboard(data)
+        error = validate_storyboard(
+            data,
+            source_script if capability == "storyboard" else None)
     return data, error
 
 

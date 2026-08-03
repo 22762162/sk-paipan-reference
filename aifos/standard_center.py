@@ -70,7 +70,7 @@ DEFAULT_STANDARD = {
     "source_skill": {
         "id": "sk-manju-storyboard-skill",
         "name": "SK 漫剧五维分镜制作 Skill",
-        "version": "5.5",
+        "version": "5.6",
         "reference": "five-dimension-storyboard-template-v5.txt",
         "principle": (
             "先把小说或梗概改编成因果、物理、时间、空间、人物信息与道具"
@@ -79,6 +79,14 @@ DEFAULT_STANDARD = {
     },
     "rules": {
         "rule_governance": default_rule_governance(),
+        "creative_rules": [{
+            "key": "story.high_value_events_must_expand",
+            "value": (
+                "高价值事件必须让观众经历规则建立、尝试、受挫或代价、"
+                "递进、结果爆发、人物反应与后果；不得被省镜、长镜头折叠"
+                "或一句结果概括。重复同构操作可压成蒙太奇，普通连接动作"
+                "不得膨胀。"),
+        }],
         "production": {
             "pipeline_version": "sk-manju-v5",
             "video_model": "seedance2.0fast_vip",
@@ -147,6 +155,10 @@ DEFAULT_STANDARD = {
             "fast_vip_real_face_conflict": "pause_for_confirmation",
         },
         "script_development": {
+            "high_value_event_expansion_is_highest_creative_rule": True,
+            "high_value_event_contract_required": True,
+            "high_value_event_minimum_independent_shots": 3,
+            "routine_repetition_may_montage": True,
             "required_before_any_visual_asset": True,
             "source_material_is_adaptable": True,
             "auto_adapt_imported_source": True,
@@ -331,6 +343,8 @@ DEFAULT_STANDARD = {
             "performance_goal_required": True,
         },
         "storyboard": {
+            "high_value_event_beats_must_preserve": True,
+            "high_value_event_long_take_folding_forbidden": True,
             "five_dimensions": [
                 {"id": "subject_motion", "label": "主体运动", "description": "动作、表演与微表情"},
                 {"id": "environment_light", "label": "环境与光线", "description": "空间、光源与氛围变化"},
@@ -1361,6 +1375,19 @@ class StandardCenter:
                         changed = True
         story_defaults = DEFAULT_STANDARD["rules"]["story_analysis"]
         script_defaults = DEFAULT_STANDARD["rules"]["script_development"]
+        creative_defaults = DEFAULT_STANDARD["rules"]["creative_rules"]
+        creative_rules = rules.get("creative_rules")
+        if not isinstance(creative_rules, list):
+            rules["creative_rules"] = copy.deepcopy(creative_defaults)
+            changed = True
+        else:
+            keys = {
+                item.get("key") for item in creative_rules
+                if isinstance(item, dict)}
+            for item in creative_defaults:
+                if item.get("key") not in keys:
+                    creative_rules.append(copy.deepcopy(item))
+                    changed = True
         script_rules = rules.get("script_development")
         if not isinstance(script_rules, dict):
             rules["script_development"] = copy.deepcopy(script_defaults)
@@ -1397,7 +1424,8 @@ class StandardCenter:
                     "自动升级：加入视觉 DNA、全剧角色去重、三视图母资产、"
                     "剧本第一道总闸门、道具生命周期、局部返编边界、"
                     "剧本分析、剧情事实源、空间调度、非现实Q版内心人格与"
-                    "Seedance 8-15秒长镜头三阶段连续性规则"),
+                    "Seedance 8-15秒长镜头三阶段连续性规则，以及AIFOS最高"
+                    "通用创作规则：高价值事件必须展开"),
                 expected_active_id=snapshot.get("version_id"))
         except StandardConflictError:
             # 多个 App 同时启动时由先完成者负责升级。

@@ -145,6 +145,7 @@ from .style_director import compile_director_style
 from .script_import import sanitize_script_entities
 from .workflow import (
     PIPELINE_VERSION,
+    STORYBOARD_ENRICHMENT_VERSION,
     _functional_figure_count,
     _functional_figure_line,
     _normalize_functional_figures,
@@ -969,6 +970,11 @@ class Director:
 
         profile = ctx.get("production_profile") or {}
         technical = [
+            {"key": "quality.gate.high_value_event_expansion",
+             "value": (
+                 "AIFOS最高通用创作规则：高价值事件必须展开为独立可见"
+                 "过程、结果与人物反应；禁止省镜、长镜头折叠或一句结果"
+                 "概括。重复同构操作可用蒙太奇，普通连接动作不膨胀。")},
             {"key": "technical.video_model",
              "value": profile.get("video_model", "seedance2.0fast_vip")},
             {"key": "technical.resolution",
@@ -10851,11 +10857,14 @@ class Director:
 
     def _stage_storyboard(self, ctx):
         self._ensure_space_first_scenes(ctx)
+        existing = None
         if not ctx.get("force"):
             existing, version = self.projects.latest_document(
                 ctx["episode"]["id"], "storyboard")
             if (existing is not None
                     and existing.get("pipeline_version") == PIPELINE_VERSION
+                    and existing.get("storyboard_enrichment_version")
+                    == STORYBOARD_ENRICHMENT_VERSION
                     and existing.get("script_version") == ctx.get(
                         "script_version")
                     and existing.get("story_analysis_version") == ctx.get(
@@ -10885,23 +10894,46 @@ class Director:
             if existing is not None:
                 self.log.info(
                     "director", "剧本/标准已更新,重出分镜并重制后续画面")
-        result = self._call(
-            ctx, "storyboard", {
-                "script": ctx["script"],
-                "continuity": ctx["continuity"],
-                "production_profile": ctx["production_profile"],
-                **self._storyboard_rule_payload(ctx),
-            }, "storyboard")
-        # 原始分镜落盘:加工若出错,凭这份文件即可复现定位
         raw_path = ctx["out_root"] / "storyboard" / "raw_provider.json"
+        raw_storyboard = None
+        if (existing is not None
+                and existing.get("pipeline_version") == PIPELINE_VERSION
+                and existing.get("storyboard_enrichment_version")
+                != STORYBOARD_ENRICHMENT_VERSION
+                and existing.get("script_version") == ctx.get(
+                    "script_version")
+                and existing.get("story_analysis_version") == ctx.get(
+                    "story_analysis_version")
+                and raw_path.exists()):
+            try:
+                candidate = json.loads(raw_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                candidate = None
+            if isinstance(candidate, dict) and isinstance(
+                    candidate.get("shots"), list) and candidate["shots"]:
+                raw_storyboard = candidate
+                self.log.info(
+                    "director",
+                    "检测到旧版长镜头加工曾吞并原始动作镜；直接复用已保存"
+                    "的原始分镜重新加工，不重复调用编剧模型、不重复计费")
+        if raw_storyboard is None:
+            result = self._call(
+                ctx, "storyboard", {
+                    "script": ctx["script"],
+                    "continuity": ctx["continuity"],
+                    "production_profile": ctx["production_profile"],
+                    **self._storyboard_rule_payload(ctx),
+                }, "storyboard")
+            raw_storyboard = result.data
+        # 原始分镜落盘:加工若出错,凭这份文件即可复现定位
         raw_path.parent.mkdir(parents=True, exist_ok=True)
         raw_path.write_text(
-            json.dumps(result.data, ensure_ascii=False, indent=1,
+            json.dumps(raw_storyboard, ensure_ascii=False, indent=1,
                        default=str),
             encoding="utf-8")
         try:
             storyboard = enrich_storyboard(
-                ctx["script"], result.data, ctx["continuity"],
+                ctx["script"], raw_storyboard, ctx["continuity"],
                 ctx["production_profile"],
                 style=ctx["project"].get("style", ""))
         except (AttributeError, TypeError, KeyError, ValueError) as exc:

@@ -18,6 +18,7 @@
 """
 
 from .camera_language import scale_capacity
+from .high_value_events import audit_high_value_event_coverage
 from .spatial_language import framing_conflict, screen_zone, _actor_line
 
 SCHEMA = "aifos.storyboard-preflight/v1"
@@ -32,6 +33,7 @@ KIND_FIXERS = {
     "duration_under_preferred": "timing",
     "duration_long": "timing",
     "temporal_phases": "timing",
+    "high_value_event": "story",
 }
 
 # Seedance 全家族时长硬下限 4 秒;2.0 世代上限 15 秒。低于下限的镜头
@@ -283,12 +285,25 @@ def preflight_storyboard(script, storyboard, blocking=None):
     by_shot = {}
     for issue in issues:
         by_shot.setdefault(str(issue["shot_no"]), []).append(issue)
+    event_coverage = audit_high_value_event_coverage(script, storyboard)
+    for detail in event_coverage["issues"]:
+        issue = {
+            "shot_no": None,
+            "scene_no": None,
+            "kind": "high_value_event",
+            "fixer": "story",
+            "detail": detail,
+            "suggestion": "只重分该高价值事件所在场，补足独立可见节拍；禁止用长镜头折叠",
+        }
+        issues.append(issue)
+        by_shot.setdefault("None", []).append(issue)
     return {
         "schema": SCHEMA,
         "passed": not issues,
         "shots": len(shots),
         "issues": issues,
         "by_shot": by_shot,
+        "high_value_event_coverage": event_coverage,
     }
 
 

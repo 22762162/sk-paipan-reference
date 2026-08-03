@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import aifos.director as director_module
 from aifos.app import App
-from aifos.workflow import PIPELINE_VERSION
+from aifos.workflow import PIPELINE_VERSION, STORYBOARD_ENRICHMENT_VERSION
 
 
 def _script_result(*, independent_review=None):
@@ -299,6 +299,7 @@ def test_storyboard_stage_persists_director_and_grid_documents_on_reuse(
         episode, _ = app.projects.get_or_create_episode(project["id"], 1)
         storyboard = {
             "pipeline_version": PIPELINE_VERSION,
+            "storyboard_enrichment_version": STORYBOARD_ENRICHMENT_VERSION,
             "script_version": 1,
             "story_analysis_version": 2,
             "profile": {"standard_fingerprint": "standard-fp"},
