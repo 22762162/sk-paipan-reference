@@ -101,9 +101,10 @@ def test_repair_contract_instruction_is_applied_instead_of_waiting_for_human(
     # 分镜合同真的被改了,不是只记了个待办
     assert ctx["storyboard"]["shots"][0]["camera"]["焦段"] == "50mm"
     assert "50mm" in ctx["storyboard"]["shots"][0]["description"]
-    # 重建后的 payload 参与下一轮出图,且带上 Codex 指令作为修改意见
+    # 重建后的 payload 参与下一轮出图；repair_contract 是替换而非后缀。
     assert "50mm" in task["payload"]["prompt"]
-    assert "50mm" in task["payload"]["feedback"]
+    assert task["payload"]["prompt"].startswith("【返工静态合同v1】")
+    assert task["payload"]["feedback"] == ""
     # 旧的升级结论必须清掉,否则出图前会被既有熔断按旧哈希拦住
     assert "qc_escalation" not in task["payload"]
 
@@ -186,7 +187,9 @@ def test_fourth_repair_instruction_is_applied_without_human_confirmation(
         ctx, task, _Result(_escalation_qc(action="repair_contract")))
     assert summary
     assert task["payload"]["_codex_contract_repair_count"] == 4
-    assert "赵典吏移到右后层" in task["payload"]["prompt"]
+    assert task["payload"]["prompt"].startswith("【返工静态合同v1】")
+    assert "50mm" in task["payload"]["prompt"]
+    assert "赵典吏移到右后层" not in task["payload"]["prompt"]
 
 
 def test_shot_plan_content_change_preserves_repair_round_and_instruction(app):
@@ -244,9 +247,9 @@ def test_third_targeted_redraw_becomes_deep_contract_slimming(
     assert task["payload"]["_codex_contract_repair_count"] == 3
 
 
-def test_repair_that_does_not_change_the_input_uses_codex_override(
+def test_repair_that_does_not_change_writer_output_uses_clean_replacement(
         app, monkeypatch):
-    """编剧漏改时也要执行 Codex 指令，不得重新推回人工确认。"""
+    """编剧漏改时也要替换旧合同，不得挂覆盖后缀或推回人工。"""
     ctx, task = _ctx_and_task(app, monkeypatch)
     monkeypatch.setattr(Director, "_shot_payload",
                         lambda _s, _c, _shot: dict(task["payload"]))  # 合同没变
@@ -262,10 +265,12 @@ def test_repair_that_does_not_change_the_input_uses_codex_override(
             "reference_manifest": []})
     summary = app.director._auto_apply_codex_escalation(
         ctx, task, _Result(_escalation_qc()))
-    assert summary and "最终修复覆盖层" in summary
+    assert summary and "唯一静态合同替换" in summary
     assert task["payload"]["_codex_contract_repair_count"] == 1
-    assert "取代并作废" in task["payload"]["feedback"]
-    assert "50mm" in task["payload"]["feedback"]
+    assert task["payload"]["prompt"].startswith("【返工静态合同v1】")
+    assert "原提示词" not in task["payload"]["prompt"]
+    assert "50mm" in task["payload"]["prompt"]
+    assert task["payload"]["feedback"] == ""
 
 
 def test_nested_prompt_review_block_is_repaired_and_keeps_four_draw_mode(

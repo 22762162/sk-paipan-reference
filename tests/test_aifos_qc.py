@@ -11,6 +11,7 @@ import pytest
 
 from aifos.app import App
 from aifos.config import Config
+from aifos.director import Director
 from aifos.errors import AifosError
 from aifos.qc_center import QcCenter
 from aifos.selection_mode import build_candidate_set_version
@@ -772,6 +773,14 @@ def test_four_draw_repair_replaces_conflicting_old_static_contract(
             "readable_text": {"whitelist": ["23:10"],
                               "carrier": "手机锁屏"},
             "frame_target": {"phase": "end", "state": "递交完成"},
+            # These legacy fields remain in the audit payload.  The reference
+            # manifest refresh must not compile them back into the replacement
+            # prompt after Codex has deleted them.
+            "camera": "近景跟拍",
+            "start_state": {"虞寻歌": {"pose": "站姿"}},
+            "end_state": {"虞寻歌": {"pose": "卧姿",
+                                      "support": "床榻"}},
+            "spatial_staging": {"camera_motion": "跟拍"},
             "reference_manifest": [{
                 "index": 1, "role": "identity", "character": "虞寻歌",
                 "label": "虞寻歌最终立绘", "uri": "/refs/yxg.png",
@@ -797,13 +806,17 @@ def test_four_draw_repair_replaces_conflicting_old_static_contract(
         assert len(calls) == 2
         repair_payload, repair_qc = calls[1]
         sent = repair_payload["prompt_compact"]
-        assert sent.startswith("【镜头合同v2.2】")
+        assert sent.startswith("【返工静态合同v1】")
         assert "只生成当前镜头递交完成后的唯一静态终点" in sent
         assert old_prompt not in sent
         assert "严格共5人" not in sent
         assert "小吴清醒驾驶" not in sent
         assert "小吴加速" not in sent
         assert "右手持亮屏手机显示23:10" not in sent
+        assert "站姿" not in sent
+        assert "卧姿" not in sent
+        assert "床榻" not in sent
+        assert "跟拍" not in sent
         assert "画面严格仅2名真人" in sent
         assert repair_payload["feedback"] == ""
         assert repair_payload["visible_figure_count"] == 2
@@ -823,3 +836,88 @@ def test_four_draw_repair_replaces_conflicting_old_static_contract(
         assert result.qc["best_effort_promoted"] is False
     finally:
         app.close()
+
+
+def test_repair_instruction_keeps_only_codex_sole_final_wording():
+    instruction = (
+        "【Codex 通知 AIFOS】"
+        "删除虞寻歌‘卧姿、支撑=床榻’的旧空间标签；"
+        "删除跟拍、对视、贴近、耳语、指尖触碰等通用动作；"
+        "以场景图为唯一基准，清除旧坐标；"
+        "修复合同后按以下唯一表述定向重画："
+        "平视35mm全景严格侧面静态关键帧；"
+        "虞寻歌全身站在床左侧、双手空置；"
+        "虞寻欢闭眼仰躺床中央，四肢全部由床垫支撑；"
+        "禁止跟拍感、运动模糊、对视、耳语、贴近、指尖触碰、"
+        "主动表情、高脚杯和酒瓶。"
+        "旧空间调度图中的P02卧姿信息不得执行。"
+        "【范围】只修改当前镜头")
+
+    executable = Director._repair_instruction_text(instruction)
+
+    assert executable.startswith("平视35mm全景严格侧面静态关键帧")
+    assert "卧姿" not in executable
+    assert "对视" not in executable
+    assert "跟拍" not in executable
+    assert "耳语" not in executable
+    assert "贴近" not in executable
+    assert "指尖触碰" not in executable
+    assert "旧坐标" not in executable
+    assert "旧空间调度图" not in executable
+    assert "运动模糊" in executable
+    assert "主动表情" in executable
+    assert "高脚杯和酒瓶" in executable
+
+
+def test_repair_static_contract_projects_current_named_props_for_qc():
+    """返工短合同的 QC 判项必须带当前可见杯具，不能投影为空。"""
+    from aifos.adapters.claude_script import static_image_qc_projection
+
+    payload = {
+        "characters": ["虞寻歌", "虞寻欢"],
+        "location": "虞家别墅·虞寻欢卧室",
+        "frame_target": {"phase": "end", "state": "旧终点"},
+        "prop_registry": [
+            {"prop_id": "water", "name": "水杯", "kind": "story_critical"},
+            {"prop_id": "wine", "name": "白酒玻璃杯",
+             "kind": "story_critical"},
+            {"prop_id": "phone", "name": "手机", "kind": "story_critical"},
+            {"prop_id": "bottle", "name": "酒瓶", "kind": "story_critical"},
+        ],
+        "frame_props": [
+            {"prop_id": "water", "phase": "start", "visibility": "visible",
+             "holder": "虞寻歌左手", "location": "卧室门外"},
+            {"prop_id": "water", "phase": "end", "visibility": "visible",
+             "holder": "none", "location": "床头柜"},
+            {"prop_id": "wine", "phase": "end", "visibility": "visible",
+             "holder": "none", "location": "边柜"},
+            {"prop_id": "phone", "phase": "end", "visibility": "hidden",
+             "location": "风衣口袋"},
+            {"prop_id": "bottle", "phase": "end", "visibility": "absent"},
+        ],
+    }
+    instruction = (
+        "只生成终点静态画面：虞寻歌站在床左侧，虞寻欢闭眼卧床；"
+        "水杯放在床头柜，白酒玻璃杯放在边柜，手机隐藏；"
+        "严格两人，不出现酒瓶。")
+
+    repaired, revised_qc = Director._replace_repair_static_contract(
+        payload, {}, instruction)
+    projection = static_image_qc_projection({
+        "generation_input": {
+            "prompt_contract": repaired["prompt_contract"],
+        },
+    })
+
+    assert projection is not None
+    assert projection["phase"] == "end"
+    assert [row["name"] for row in projection["frame_props"]] == [
+        "水杯", "白酒玻璃杯"]
+    assert projection["frame_props"][0]["location"] == "床头柜"
+    assert projection["frame_props"][1]["location"] == "边柜"
+    assert [row["prop_id"] for row in projection["audit_only"][
+        "frame_props_hidden_or_absent"]] == ["phone", "bottle"]
+    assert [row["name"] for row in projection["physical"][
+        "frame_props"]] == ["水杯", "白酒玻璃杯"]
+    assert repaired["frame_props"] == projection["frame_props"]
+    assert revised_qc["frame_props"] == projection["frame_props"]

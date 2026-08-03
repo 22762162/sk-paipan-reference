@@ -882,8 +882,8 @@ def test_first_failure_escalates_then_redraws_with_codex_prompt(
 
 def test_contract_repair_auto_applies_then_stops_on_second_failure(
         app, tmp_path):
-    """repair_contract 不再是死路:首失败把 Codex 修合同指令自动落到提示词
-    基底，第二轮用同一份新合同固定生成4张并自动择优。
+    """repair_contract 不再是死路:首失败用 Codex 指令替换旧提示词，
+    第二轮用同一份干净合同固定生成4张并自动择优。
 
     旧契约(首失败即停)的死结:Codex 下达了修合同指令,但全仓库没有代码
     执行它——escalation_redraw_block 等着「合同真的改了就放行」,而没有人
@@ -901,9 +901,11 @@ def test_contract_repair_auto_applies_then_stops_on_second_failure(
 
     assert router.calls["image"] == 5
     for candidate in router.image_payloads[1:]:
-        prompt = str(candidate.get("prompt") or "")
-        assert "【Codex合同修订·必须执行】" in prompt
+        prompt = str(candidate.get("prompt_compact") or "")
+        assert prompt.startswith("【返工静态合同v1】")
         assert "把静态关键帧改为唯一拱手完成瞬间" in prompt
+        assert "赵德昌拱手" not in prompt
+        assert candidate.get("feedback") == ""
     assert result.qc["consecutive_failures"] == 2
     assert result.qc["best_effort_promoted"] is True
     assert result.qc["nonblocking_risk"]["best_effort"] is True

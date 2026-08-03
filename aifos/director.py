@@ -7638,6 +7638,91 @@ class Director:
                 r"【(?:修订边界|本轮不修|质检原因)】", text, maxsplit=1)[0]
         text = re.sub(r"^【Codex\s*通知\s*AIFOS】", "", text).strip()
         text = re.sub(r"【范围】只修改当前镜头\s*$", "", text).strip()
+        # Codex's repair_contract audit commonly starts with operations such
+        # as "delete the old lying pose" and ends with one complete phrase
+        # introduced by "use the following sole wording".  The operations are
+        # for AIFOS, not visual facts.  Sending them to the image model still
+        # exposes the obsolete pose/action tokens and recreates the conflict
+        # even though the surrounding prompt calls them deleted.
+        sole_wording = re.search(
+            r"(?:修复合同后)?(?:按|只按)?以下(?:唯一|最终)(?:表述|合同)"
+            r"(?:定向重画|执行|生成)?\s*[：:]\s*(.+)$",
+            text, flags=re.IGNORECASE)
+        deleted_tokens = set()
+        if sole_wording:
+            audit_prefix = text[:sole_wording.start()]
+            for clause in re.split(r"[；;。]", audit_prefix):
+                operation = re.search(
+                    r"(?:删除|移除|去掉|剔除|清除|作废|忽略|不再使用)"
+                    r"(.+)$", clause)
+                if not operation:
+                    continue
+                body = operation.group(1).strip()
+                quoted = re.findall(r"[‘“'\"]([^’”'\"]+)[’”'\"]", body)
+                values = quoted or [re.split(r"等(?:通用)?(?:动作|描述|标签)?", body)[0]]
+                for value in values:
+                    for token in re.split(r"[、，,/＋+]", value):
+                        token = re.sub(
+                            r"^(?:旧|原|此前|上轮)", "", token).strip()
+                        token = re.sub(
+                            r"(?:的旧)?(?:空间)?(?:标签|坐标|描述|动作)$",
+                            "", token).strip()
+                        if 1 < len(token) <= 16:
+                            deleted_tokens.add(token)
+            text = sole_wording.group(1).strip()
+        else:
+            # Legacy Codex replies may provide semicolon-separated edit
+            # operations without the explicit marker.  Remove only clauses
+            # whose purpose is to manipulate the old contract; preserve
+            # visual negative constraints such as "禁止高脚杯".
+            clauses = [
+                clause.strip()
+                for clause in re.split(r"[；;]", text)
+                if clause.strip()
+            ]
+            executable_clauses = [
+                clause for clause in clauses
+                if not re.match(
+                    r"^(?:删除|移除|去掉|剔除|清除|作废|忽略|不再使用|"
+                    r"重绑|修正|改写)(?:旧|原|此前|上轮|冲突|与其)?",
+                    clause)
+            ]
+            if executable_clauses:
+                text = "；".join(executable_clauses)
+        # A repair may repeat deleted legacy actions inside a negative list
+        # (for example "禁止对视、贴近、耳语").  Negative wording still puts
+        # those obsolete visual tokens back in front of the image model.  Only
+        # remove entries that Codex explicitly deleted in the audit prefix;
+        # keep genuine current negatives such as "禁止高脚杯和酒瓶".
+        if deleted_tokens:
+            def clean_negative_list(match):
+                prefix, body = match.group(1), match.group(2)
+                values = re.split(r"([、，])", body)
+                kept = []
+                for index in range(0, len(values), 2):
+                    item = values[index].strip()
+                    if not item:
+                        continue
+                    if any(token in item or item in token
+                           for token in deleted_tokens):
+                        continue
+                    kept.append(item)
+                return prefix + "、".join(kept) if kept else ""
+
+            text = re.sub(
+                r"(禁止|严禁|不得|不要)([^。；！？]+)",
+                clean_negative_list, text)
+        # Sentences that only discuss an old contract/reference are audit
+        # instructions, even when Codex placed them after the sole wording.
+        sentences = re.split(r"(?<=[。！？])", text)
+        text = "".join(
+            sentence for sentence in sentences
+            if not (
+                any(token in sentence for token in (
+                    "旧空间", "旧合同", "旧提示词", "原合同", "原提示词",
+                    "此前合同", "上轮合同"))
+                and any(token in sentence for token in (
+                    "不得执行", "不要执行", "作废", "忽略", "删除", "清除"))))
         return text[:1800]
 
     @staticmethod
@@ -7748,6 +7833,68 @@ class Director:
         phase_label = {"start": "起点", "freeze": "冻结点", "end": "终点"}[
             phase]
 
+        # Preserve only props that are both visible in the repaired static
+        # phase and named by Codex's replacement wording.  This gives the QC
+        # adapter an authoritative structured projection without reviving a
+        # different phase or an obsolete prop.  Mutable placement/state fields
+        # are carried only when their authored value is also present in the
+        # replacement text, so they cannot contradict Codex's new wording.
+        prop_registry = [
+            copy.deepcopy(row) for row in (
+                repaired.get("prop_registry") or [])
+            if isinstance(row, dict)]
+        prop_names = {
+            str(row.get("prop_id") or "").strip():
+            str(row.get("name") or "").strip()
+            for row in prop_registry
+            if str(row.get("prop_id") or "").strip()
+        }
+        source_frame_props = [
+            copy.deepcopy(row) for row in (
+                repaired.get("frame_props") or [])
+            if isinstance(row, dict)]
+        phase_rows = [
+            row for row in source_frame_props
+            if not str(row.get("phase") or "").strip()
+            or str(row.get("phase") or "").strip().lower() == phase]
+        if not phase_rows and phase == "freeze":
+            phase_rows = [
+                row for row in source_frame_props
+                if str(row.get("phase") or "").strip().lower() == "end"]
+        current_frame_props = []
+        for row in phase_rows:
+            visibility = str(
+                row.get("visibility") or "visible").strip().lower()
+            if visibility in {"hidden", "absent"}:
+                continue
+            prop_id = str(row.get("prop_id") or "").strip()
+            name = str(
+                row.get("name") or prop_names.get(prop_id) or "").strip()
+            if not any(value and value in executable
+                       for value in (name, prop_id)):
+                continue
+            projected = {
+                key: copy.deepcopy(value)
+                for key, value in row.items()
+                if key in {
+                    "prop_id", "name", "phase", "visibility",
+                    "representation"}
+            }
+            if prop_id:
+                projected["prop_id"] = prop_id
+            if name:
+                projected["name"] = name
+            projected["phase"] = phase
+            projected["visibility"] = visibility or "visible"
+            for key in (
+                    "physical_state", "holder", "location", "support",
+                    "screen_state", "readable_text"):
+                value = row.get(key)
+                rendered = str(value or "").strip()
+                if len(rendered) >= 2 and rendered in executable:
+                    projected[key] = copy.deepcopy(value)
+            current_frame_props.append(projected)
+
         manifest = copy.deepcopy(repaired.get("reference_manifest") or [])
         identity_names = list(dict.fromkeys(
             str(row.get("character") or row.get("label") or "").strip()
@@ -7795,6 +7942,7 @@ class Director:
             "functional_figures": normalized_functional,
             "visible_figure_count": visible_count,
             "frame_target": {"phase": phase, "state": executable},
+            "frame_props": copy.deepcopy(current_frame_props),
             "prompt_contract_complete": True,
             "_repair_static_contract_replaced": True,
             "reference_manifest": manifest,
@@ -7805,11 +7953,36 @@ class Director:
 
         # The review context is explicit so old action/camera/style/contract
         # fields elsewhere in a legacy payload cannot be reintroduced.
+        repair_physical = build_physical_contract({
+            "description": executable,
+            "action": executable,
+            "location": repaired.get("location") or "",
+            "readable_text": {},
+            "frame_target": {"phase": phase, "state": executable},
+            "frame_props": copy.deepcopy(current_frame_props),
+            "prop_registry": copy.deepcopy(prop_registry),
+        }, media="image", target_phase=phase)
+        repair_physical["frame_props"] = copy.deepcopy(current_frame_props)
+        repair_physical["frame_props_audit"] = copy.deepcopy(
+            source_frame_props)
         repaired["prompt_contract"] = {
             "schema": "aifos.shot-repair-static-contract/v1",
             "phase": phase,
             "single_static_frame": True,
             "instruction": executable,
+            "output": {
+                "media": "image", "frame_phase": phase,
+                "temporal_policy": "static_phase_only",
+            },
+            "frame_target": {"phase": phase, "state": executable},
+            "frame_target_state": executable,
+            "scene": repaired.get("location") or "",
+            "camera": "",
+            "frame_props": copy.deepcopy(current_frame_props),
+            "frame_props_audit": copy.deepcopy(source_frame_props),
+            "readable_text_current": {"required": False},
+            "readable_text_audit": {},
+            "physical": copy.deepcopy(repair_physical),
             "visible_figure_count": visible_count,
             "reference_roles": [
                 str(row.get("role") or "") for row in manifest
@@ -7861,15 +8034,11 @@ class Director:
             "camera": "",
             "composition_contract": copy.deepcopy(composition),
             "spatial_staging": {},
+            "frame_props": copy.deepcopy(current_frame_props),
         })
-        revised_qc["physical_contract"] = build_physical_contract({
-            "description": executable,
-            "action": executable,
-            "location": repaired.get("location") or "",
-            "readable_text": repaired.get("readable_text") or {},
-        })
+        revised_qc["physical_contract"] = copy.deepcopy(repair_physical)
         repaired["physical_contract"] = copy.deepcopy(
-            revised_qc["physical_contract"])
+            repair_physical)
         return repaired, revised_qc
 
     def _generate_shot_candidate_group(
@@ -8591,26 +8760,23 @@ class Director:
                 revision["text"] = codex_instruction
                 revision["source"] = "codex_escalation"
             escalation_ctx = report.get("codex_escalation") or {}
+            contract_replaced = False
             if (escalation_ctx.get("auto_contract_repair")
                     and codex_instruction):
-                # repair_contract 自动执行:修订落到提示词**基底**。落在
-                # feedback 会被审核清空;落在 prompt 会在下一轮被
-                # _attach_reference_manifest 用 _reference_prompt_base
-                # 整个重建回原始稿(v6 实测:上一轮修订就是这样直接丢失的)。
-                amendment = ("\n【Codex合同修订·必须执行】"
-                             + codex_instruction[:1200])
-                base = str(next_payload.get("_reference_prompt_base")
-                           or next_payload.get("prompt") or "")
-                if amendment not in base:
-                    next_payload["_reference_prompt_base"] = base + amendment
-                    next_payload["prompt"] = (
-                        str(next_payload.get("prompt") or "") + amendment)
-                    if next_payload.get("prompt_compact"):
-                        next_payload["prompt_compact"] = (
-                            str(next_payload["prompt_compact"]) + amendment)
-                    next_payload.setdefault("_applied_qc_changes", []).append(
-                        {"kind": "auto_contract_repair",
-                         "instruction": codex_instruction[:600]})
+                # repair_contract is a replacement operation.  Appending a
+                # higher-priority amendment leaves the image model reading
+                # both the failed fact and its correction (for example
+                # standing + lying, static frame + tracking shot).  Rebuild
+                # one clean still contract and keep the failed generation only
+                # in the QC audit history.
+                next_payload, qc_spec = self._replace_repair_static_contract(
+                    next_payload, qc_spec, codex_instruction,
+                    conflict_context="；".join(report.get("issues") or []))
+                next_payload.setdefault("_applied_qc_changes", []).append(
+                    {"kind": "auto_contract_repair_replacement",
+                     "instruction": codex_instruction[:600]})
+                contract_replaced = True
+                patch = ""
             if qc_spec.get("character_sheet_key"):
                 patch = self._sheet_feedback_for_key(
                     patch, qc_spec.get("character_sheet_key"))
@@ -8627,6 +8793,7 @@ class Director:
                         next_payload.get("feedback"),
                         next_payload.get("prompt_review_feedback_applied")))
             if ((patch or reference_changes["applied"])
+                    and not contract_replaced
                     and self._use_failed_image_as_revision_base(diagnostics)):
                 references = [uri]
                 references.extend(next_payload.get("reference_images") or [])
@@ -8660,7 +8827,8 @@ class Director:
             actual_changes = {
                 "prompt_changed": actual_prompt_changed,
                 "references_changed": actual_references_changed,
-                "prompt_patch": patch,
+                "prompt_patch": (
+                    codex_instruction if contract_replaced else patch),
                 "reference_changes": reference_changes["applied"],
                 "skipped_reference_changes": reference_changes["skipped"],
                 "previous_input_hash": generation_input["input_hash"],
@@ -8978,6 +9146,16 @@ class Director:
                     f"{item_id} 自动执行 Codex 修改指令失败,自动修复中止: "
                     f"{exc}")
                 return ""
+            if action == "repair_contract":
+                repaired_payload, repaired_qc = \
+                    self._replace_repair_static_contract(
+                        task.get("payload") or {},
+                        task.get("qc_spec") or {}, instruction,
+                        conflict_context="；".join(qc.get("issues") or []))
+                task["payload"] = repaired_payload
+                task["qc_spec"] = repaired_qc
+                summary = (summary + "；" if summary else "") + \
+                    "已用 Codex 唯一静态合同替换旧失败合同"
             # _repair_blocked_prompt_shot rebuilds the complete payload from
             # the storyboard, so reference edits must happen after it.
             reference_changes = self._apply_image_reference_adjustments(
@@ -8994,31 +9172,31 @@ class Director:
                 + (f"并持久化 {persisted} 项" if persisted else ""))
         after = self._image_generation_input(task.get("payload") or {})
         if before.get("input_hash") == after.get("input_hash"):
-            # 编剧结构化改写偶尔会返回与现有镜头完全相同的
-            # camera/description（实案 shot:7/18）。这不等于 Codex 没给
-            # 方案：升级结果里已经有可直接执行的新合同。把它作为本轮
-            # 最高优先级覆盖层送进同词四抽，明确作废旧合同中的冲突条款，
-            # 不能因编剧漏改而重新推回人工确认。
-            target = task.get("payload") or {}
-            override = (
-                f"【Codex第{used + 1}轮最终修复合同·最高优先级】"
-                "以下内容取代并作废上文所有与之冲突的景别、焦段、机位、"
-                "构图、站位、视线、动作、裁切、道具形态及参考图用途；"
-                "只执行这份无冲突终态，不得同时执行被作废的旧条款："
-                + instruction[:1600])
-            target["feedback"] = override
-            # round marker 让输入哈希确实变化；同一轮的四张候选随后仍由
-            # _generate_repair_candidate_group 冻结成完全相同的提示词。
+            # Never fall back to an override suffix.  If the writer returned
+            # an unchanged contract, replace it with a fresh, shorter static
+            # alternative so the failed facts are absent rather than merely
+            # declared lower priority.
+            alternative = (
+                instruction[:1400]
+                + f" 第{used + 1}轮改用更简单清晰、物理可拍的唯一静态构图；"
+                "不得复用上一轮失败站位、动作过程或冲突参考用途。")
+            target, repaired_qc = self._replace_repair_static_contract(
+                task.get("payload") or {}, task.get("qc_spec") or {},
+                alternative, conflict_context="；".join(
+                    qc.get("issues") or []))
+            task["payload"] = target
+            task["qc_spec"] = repaired_qc
+            self._attach_reference_manifest(target)
             after = self._image_generation_input(target)
             if before.get("input_hash") == after.get("input_hash"):
                 self.log.warn(
                     "director",
-                    f"{item_id} Codex 最终修复覆盖层未进入生成输入,"
+                    f"{item_id} Codex 替换合同未进入生成输入,"
                     "自动修复中止")
                 return ""
             summary = (
                 (summary + "；") if summary else ""
-            ) + "编剧结构化改写未改变合同，已直接挂载 Codex 最终修复覆盖层"
+            ) + "编剧结构化改写未改变合同，已改用 Codex 替换式静态合同"
         counters[item_id] = used + 1
         task["payload"]["_codex_contract_repair_count"] = used + 1
         task["payload"]["_auto_repair_batches_used"] = \
@@ -9026,8 +9204,9 @@ class Director:
         # 新一轮从干净状态起画:旧的升级结论已经落实,不能再随 payload
         # 下传,否则出图前会被既有的熔断逻辑按旧哈希拦住。
         task["payload"].pop("qc_escalation", None)
-        if not str(task["payload"].get("feedback") or "").startswith(
-                "【Codex第"):
+        if task["payload"].get("_repair_static_contract_replaced"):
+            task["payload"]["feedback"] = ""
+        else:
             task["payload"]["feedback"] = instruction[:1200]
         self.log.info(
             "director",
@@ -16623,6 +16802,29 @@ class Director:
                 "每张图只允许执行其绑定用途；禁止跨用途传播、张冠李戴、"
                 "把一个人的脸/服装/姿势/背景复制给另一个人):"
                 + ";".join(lines))
+        if payload.get("_repair_static_contract_replaced"):
+            # ``_replace_repair_static_contract`` has deliberately discarded
+            # the failed storyboard contract.  Compiling this payload again
+            # would read legacy start/end state, camera, composition and
+            # spatial fields that remain only for audit and resurrect the
+            # exact contradictions Codex removed.  References are transported
+            # through the typed manifest, so keep the provider-facing compact
+            # prompt equal to the clean replacement base and update only the
+            # structured reference-role audit.
+            payload["prompt_compact"] = base_prompt
+            contract = copy.deepcopy(payload.get("prompt_contract") or {})
+            contract["reference_roles"] = [
+                str(row.get("role") or "")
+                for row in manifest
+                if isinstance(row, dict) and row.get("role")
+            ]
+            payload["prompt_contract"] = contract
+            review_context = payload.get("prompt_review_context")
+            if isinstance(review_context, dict):
+                review_context["reference_manifest"] = copy.deepcopy(
+                    manifest)
+                review_context["prompt_contract"] = copy.deepcopy(contract)
+            return
         # QC 定向重画、人工换参考图会再次进入这里；同步刷新实际发送的
         # 短合同，避免新加入的“待修改基底”仍被旧提示词遮蔽。
         if ("shot_no" in payload and not payload.get("portrait")
