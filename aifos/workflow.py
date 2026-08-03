@@ -1935,6 +1935,39 @@ def _expand_ai_shot_dialogue(raw):
             if isinstance(raw.get("end_state"), dict):
                 clone["start_state"] = copy.deepcopy(raw["end_state"])
                 clone["end_state"] = copy.deepcopy(raw["end_state"])
+            # ``frame_props`` is the structured twin of start/end_state.  It
+            # must be collapsed to the same completed endpoint as well.  The
+            # old code emptied prop_transitions but left the first line's
+            # action start rows in place, creating an impossible hold shot:
+            # characters were already at the endpoint while props appeared
+            # to perform the entire action again.  Preflight correctly blocked
+            # those rows as a missing start→end transition.
+            source_props = [
+                copy.deepcopy(item) for item in (
+                    raw.get("frame_props") or [])
+                if isinstance(item, dict)]
+            endpoint_props = [
+                item for item in source_props
+                if str(item.get("phase") or "").strip().lower() == "end"]
+            if not endpoint_props:
+                endpoint_props = [
+                    item for item in source_props
+                    if str(item.get("phase") or "").strip().lower()
+                    == "freeze"]
+            if endpoint_props:
+                held_props = []
+                for phase in ("start", "end", "freeze"):
+                    for endpoint in endpoint_props:
+                        held = copy.deepcopy(endpoint)
+                        held["phase"] = phase
+                        held.pop("phase_backfilled", None)
+                        held.pop("derived_from", None)
+                        if phase == "freeze":
+                            held["phase_backfilled"] = True
+                            held["derived_from"] = (
+                                "dialogue_group_endpoint")
+                        held_props.append(held)
+                clone["frame_props"] = held_props
         rows.append(clone)
     return rows
 

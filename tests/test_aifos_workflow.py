@@ -509,6 +509,61 @@ def test_ai_dialogue_text_alias_and_list_are_not_silently_dropped():
         "handoff:line:1", "handoff:line:2"]
 
 
+def test_later_dialogue_line_holds_completed_prop_endpoint():
+    """同一动作后的第二句台词不得把整段道具动作再执行一次。"""
+    from aifos.story_logic import audit_storyboard_prop_contract
+    from aifos.workflow import _expand_ai_shot_dialogue, _normalize_ai_shot
+
+    raw = {
+        "scene_no": 3, "event_id": "ending", "duration": 12,
+        "dialogue": [
+            {"character": "虞寻欢", "line": "姐，你别走。"},
+            {"character": "虞寻歌", "line": "睡吧，我守着你。"},
+        ],
+        "start_state": {"虞寻歌": {"prop": "左手持亮屏手机"}},
+        "end_state": {"虞寻歌": {"prop": "左手持熄屏手机"}},
+        "frame_props": [
+            {"prop_id": "phone", "phase": "start",
+             "physical_state": "普通亮屏", "holder": "虞寻歌",
+             "location": "床左侧", "support": "左手",
+             "visibility": "visible", "representation": "physical"},
+            {"prop_id": "phone", "phase": "end",
+             "physical_state": "已经熄屏", "holder": "虞寻歌",
+             "location": "盥洗室门内", "support": "左手",
+             "visibility": "visible", "representation": "physical"},
+        ],
+        "prop_transitions": [{
+            "prop_id": "phone", "from_phase": "start", "to_phase": "end",
+            "action": "手机由亮屏变为熄屏",
+        }],
+    }
+
+    expanded = [
+        _normalize_ai_shot(item) for item in _expand_ai_shot_dialogue(raw)]
+    first, second = expanded
+
+    assert first["prop_transitions"] == raw["prop_transitions"]
+    assert second["prop_transitions"] == []
+    assert second["start_state"] == raw["end_state"]
+    assert second["end_state"] == raw["end_state"]
+    phase_rows = {
+        phase: [row for row in second["frame_props"]
+                if row["phase"] == phase]
+        for phase in ("start", "end", "freeze")
+    }
+    for phase in phase_rows:
+        assert phase_rows[phase][0]["physical_state"] == "已经熄屏"
+        assert phase_rows[phase][0]["location"] == "盥洗室门内"
+    board = {
+        "prop_contract_schema": "aifos.prop-contract/v2.2",
+        "prop_registry": [{
+            "prop_id": "phone", "name": "手机", "kind": "story_critical",
+        }],
+        "shots": [{**second, "shot_no": 2}],
+    }
+    assert audit_storyboard_prop_contract(board)["issues"] == []
+
+
 def test_long_take_prop_timeline_canonicalizes_only_static_wording_drift():
     from aifos.workflow import _compose_prop_timeline
 
