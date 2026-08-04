@@ -304,6 +304,72 @@ class CameraPlacementRepairTest(unittest.TestCase):
         self.assertIn("orientation_start", camera)
         self.assertIn("orientation_end", camera)
 
+    def test_adjacent_furniture_uses_global_safe_edge_without_ping_pong(self):
+        def measured(name, x, z, width, depth, height, rotation=0.0):
+            return {
+                "name": name,
+                "category": "furniture",
+                "position_3d": {"x": x, "y": 0.0, "z": z},
+                "width_m": width,
+                "depth_m": depth,
+                "height_m": height,
+                "rotation_y_deg": rotation,
+                "scale_adjusted": False,
+                "geometry_sources": {
+                    "depth": "visual_annotation",
+                    "rotation": "visual_annotation",
+                },
+            }
+
+        # Regression geometry from 游戏入侵 E01 shot 18: the nearest edge of
+        # the chair enters the sofa, so a per-object solver oscillates and
+        # eventually leaves the camera inside the chair.
+        model = {
+            "room": {
+                "floor_width_m": 10.0,
+                "floor_depth_m": 7.0,
+                "wall_height_m": 4.2,
+            },
+            "objects": [
+                measured(
+                    "办公转椅", -0.706, -0.28,
+                    0.835, 0.65, 1.25, -180.0),
+                measured(
+                    "布艺沙发", 0.029, 0.039,
+                    0.614, 1.0, 1.518),
+            ],
+        }
+        camera = {
+            "start_3d": {"x": -1.5, "y": 1.34, "z": -0.8},
+            "end_3d": {"x": -0.5, "y": 1.34, "z": -0.31},
+            "target_start_3d": {"x": 1.22, "y": 0.71, "z": 0.37},
+            "target_end_3d": {"x": 1.22, "y": 0.71, "z": 0.37},
+            "target_3d": {"x": 1.22, "y": 0.71, "z": 0.37},
+            "route_3d": [
+                {"x": -1.5, "y": 1.34, "z": -0.8,
+                 "phase": "start"},
+                {"x": -0.5, "y": 1.34, "z": -0.31,
+                 "phase": "end"},
+            ],
+            "director_camera": {},
+        }
+
+        adjustments = repair_camera_furniture_collisions(model, camera)
+
+        end_adjustment = next(
+            row for row in adjustments if row["field"] == "end_3d")
+        self.assertEqual(camera["end_3d"]["y"], 1.34)
+        self.assertLess(camera["end_3d"]["z"], -0.7)
+        self.assertEqual(
+            tuple(camera["end_3d"][axis] for axis in ("x", "y", "z")),
+            tuple(camera["route_3d"][1][axis]
+                  for axis in ("x", "y", "z")))
+        self.assertEqual(
+            end_adjustment["objects"], ["办公转椅", "布艺沙发"])
+        self.assertFalse(any(
+            issue["severity"] == "block"
+            for issue in camera_placement_issues(model, camera)))
+
 
 if __name__ == "__main__":
     unittest.main()

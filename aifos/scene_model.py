@@ -719,6 +719,14 @@ def _declared_actor_support(actor, obj):
 
 def _push_outside_box(x, z, obj, room, clearance_m):
     """把盒体内的点移到最近的安全边，保留原来的表演位移最小。"""
+    ranked = _outside_box_candidates(
+        x, z, obj, room, clearance_m)
+    _room_penalty, _distance, safe_x, safe_z = min(ranked)
+    return round(safe_x, 3), round(safe_z, 3)
+
+
+def _outside_box_candidates(x, z, obj, room, clearance_m):
+    """返回盒体四个安全边候选，供单物体和全场避碰共用。"""
     center = obj.get("position_3d") or {}
     ox, _oy, oz = _xyz_of(center)
     yaw = math.radians(float(obj.get("rotation_y_deg") or 0.0))
@@ -745,10 +753,74 @@ def _push_outside_box(x, z, obj, room, clearance_m):
             0 if inside and abs(clamped_x - world_x) < 1e-6
             and abs(clamped_z - world_z) < 1e-6 else 1,
             math.hypot(world_x - float(x), world_z - float(z)),
-            round(clamped_x, 3), round(clamped_z, 3),
+            clamped_x, clamped_z,
         ))
-    _room_penalty, _distance, safe_x, safe_z = min(ranked)
-    return safe_x, safe_z
+    return ranked
+
+
+def _nearest_camera_safe_horizontal_position(
+        x, y, z, objects, room, clearance_m):
+    """在全部已测量盒体之间寻找离原机位最近的水平安全点。
+
+    逐个推出家具会在相邻或重叠盒体间来回弹。这里把所有盒体的四个
+    安全边放进同一个候选集，只有同时避开全部盒体的点才可被采用。
+    返回参与约束的物体名，便于 blocking 保留可审计修复记录。
+    """
+    clearance = float(clearance_m)
+    original_collisions = []
+    for obj in objects:
+        base_y = float((obj.get("position_3d") or {}).get("y") or 0.0)
+        top_y = base_y + _effective_height(obj)
+        if (float(y) <= top_y + clearance
+                and _point_box_gap(x, z, obj) <= 0.02):
+            original_collisions.append(obj)
+    if not original_collisions:
+        return None, []
+
+    candidates = []
+    for obj in objects:
+        candidates.extend(_outside_box_candidates(
+            x, z, obj, room, clearance))
+    constrained = []
+    for room_penalty, distance, candidate_x, candidate_z in sorted(
+            candidates):
+        if room_penalty:
+            continue
+        conflicts = []
+        for obj in objects:
+            base_y = float(
+                (obj.get("position_3d") or {}).get("y") or 0.0)
+            top_y = base_y + _effective_height(obj)
+            if float(y) > top_y + clearance:
+                continue
+            if _point_box_gap(candidate_x, candidate_z, obj) \
+                    < clearance - 1e-6:
+                conflicts.append(obj)
+        if conflicts:
+            constrained.extend(conflicts)
+            continue
+        safe_x, safe_z = round(candidate_x, 3), round(candidate_z, 3)
+        # 千分位坐标是 blocking 合同的稳定精度；舍入后仍必须杜绝硬碰撞。
+        rounded_conflicts = []
+        for obj in objects:
+            base_y = float(
+                (obj.get("position_3d") or {}).get("y") or 0.0)
+            top_y = base_y + _effective_height(obj)
+            if (float(y) <= top_y + clearance
+                    and _point_box_gap(safe_x, safe_z, obj) <= 0.02):
+                rounded_conflicts.append(obj)
+        if rounded_conflicts:
+            constrained.extend(rounded_conflicts)
+            continue
+        names = [
+            str(obj.get("name") or "家具")
+            for obj in (*original_collisions, *constrained)]
+        return (safe_x, safe_z), list(dict.fromkeys(names))
+
+    names = [
+        str(obj.get("name") or "家具")
+        for obj in (*original_collisions, *constrained)]
+    return None, list(dict.fromkeys(names))
 
 
 def repair_actor_furniture_collisions(
@@ -884,31 +956,28 @@ def repair_camera_furniture_collisions(
             safe_x, safe_y, safe_z, object_names = cache[original_key]
         else:
             safe_x, safe_y, safe_z = original_x, original_y, original_z
-            object_names = []
-            # 一个安全边可能紧贴第二件家具；有限轮逐一消解，逻辑与人物
-            # 锚点修复相同，但相机保留原镜高和目标点。
-            for _iteration in range(max(1, len(objects) * 2)):
-                changed = False
+            horizontal, object_names = \
+                _nearest_camera_safe_horizontal_position(
+                    original_x, original_y, original_z,
+                    objects, room, clearance_m)
+            if horizontal is not None:
+                safe_x, safe_z = horizontal
+            elif object_names:
+                # 四周安全边都被家具或墙占用时，保留原水平构图并抬到
+                # 所有当前碰撞盒体上方；这是确定性、可验证的最后兜底。
+                colliding_tops = []
                 for obj in objects:
                     base_y = float(
                         (obj.get("position_3d") or {}).get("y") or 0.0)
                     top_y = base_y + _effective_height(obj)
-                    if safe_y > top_y + float(clearance_m):
-                        continue
-                    if _point_box_gap(safe_x, safe_z, obj) > 0.02:
-                        continue
-                    next_x, next_z = _push_outside_box(
-                        safe_x, safe_z, obj, room, clearance_m)
-                    if (abs(next_x - safe_x) < 1e-6
-                            and abs(next_z - safe_z) < 1e-6):
-                        # 房间边界使水平避让无进展时才抬高，避免死循环。
-                        safe_y = round(top_y + float(clearance_m) + 0.01, 3)
-                    else:
-                        safe_x, safe_z = next_x, next_z
-                    object_names.append(str(obj.get("name") or "家具"))
-                    changed = True
-                if not changed:
-                    break
+                    if (original_y <= top_y + float(clearance_m)
+                            and _point_box_gap(
+                                original_x, original_z, obj) <= 0.02):
+                        colliding_tops.append(top_y)
+                if colliding_tops:
+                    safe_y = round(
+                        max(colliding_tops)
+                        + float(clearance_m) + 0.01, 3)
             cache[original_key] = (
                 safe_x, safe_y, safe_z, object_names)
         if (abs(safe_x - original_x) < 1e-6
