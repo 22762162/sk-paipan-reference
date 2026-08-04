@@ -3891,12 +3891,15 @@ function thumbUrl(url, w = 480) {
 
 function shotCandidateGroup(item) {
   if (!item || item.category !== "shot_image") return null;
-  const group = item.candidate_group || item.shot_candidate_group;
-  // AI 自动选优后 selection_required 会变成 false，但当前轮四张候选仍要
-  // 留在画布供回看和可选改选，不能因为已经自动晋升就把候选组藏掉。
-  return group && typeof group === "object"
-    && (Array.isArray(group.candidates) || Number(group.candidate_count || 0) > 0)
-    ? group : null;
+  const finalGroup = item.candidate_group || item.shot_candidate_group;
+  if (finalGroup && typeof finalGroup === "object"
+      && (Array.isArray(finalGroup.candidates)
+        && finalGroup.candidates.length > 0)) return finalGroup;
+  const progress = item.candidate_progress;
+  // 一张候选完成质检就立即展示，不再等本轮四张或十轮返工全部结束。
+  return progress && typeof progress === "object"
+    && Array.isArray(progress.candidates) && progress.candidates.length > 0
+    ? {...progress, live_progress: true} : null;
 }
 
 function shotCandidateUrl(candidate) {
@@ -3945,13 +3948,16 @@ function shotCandidateState(item) {
   // 历史审计数据，不能再改变当前界面的候选槽位与策略说明。
   const expected = 4;
   const missing = Math.max(0, expected - candidates.length);
-  const technicalIncomplete = group.technical_incomplete === true
-    || item.status === "technical_incomplete";
+  const liveProgress = group.live_progress === true;
+  const technicalIncomplete = !liveProgress && (
+    group.technical_incomplete === true
+    || item.status === "technical_incomplete");
   const maxCandidateRounds = Math.min(10, Math.max(1, Number(
     group.max_candidate_rounds || 10)));
   const generationRound = Math.min(maxCandidateRounds, Math.max(1, Number(
     group.generation_round || group.current_round || 1)));
-  const rawProgress = group.current_round_progress;
+  const rawProgress = group.current_round_progress
+    ?? group.completed_count;
   const stringProgress = typeof rawProgress === "string"
     ? Number(String(rawProgress).split("/")[0]) : NaN;
   const progressCount = rawProgress && typeof rawProgress === "object"
@@ -3967,6 +3973,7 @@ function shotCandidateState(item) {
     ? `第${generationRound}/${maxCandidateRounds}轮 · ${currentRoundProgress}/4张`
     : `本镜第${generationRound}轮 · ${currentRoundProgress}/4张`;
   return { group, candidates, expected, missing, technicalIncomplete,
+    liveProgress,
     generationRound, maxCandidateRounds, currentRoundProgress, roundLabel };
 }
 
@@ -3990,8 +3997,12 @@ function planItemThumbs(data, item) {
     const row = (art.scene_art || []).find((s) => s.name === item.name);
     if (row && row.url) urls = [row.url];
   } else if (item.category === "shot_image") {
-    const candidates = shotCandidates(item).map(shotCandidateUrl);
-    if (candidates.length) urls = candidates;
+    const group = shotCandidateGroup(item);
+    const candidates = shotCandidates(item);
+    const selected = group && candidates.find((candidate) =>
+      shotCandidateSelected(group, candidate));
+    const visible = selected ? [selected] : candidates;
+    if (visible.length) urls = visible.map(shotCandidateUrl);
     else if ((art.images || {})[item.shot_no]) urls = [art.images[item.shot_no]];
     else if (item.output_url) urls = [item.output_url];
   } else if (item.category === "frames") {
@@ -4033,29 +4044,44 @@ function shotCandidateSetPayload(episodeId, item, candidate = null) {
 function shotCandidateGridHtml(item, editable) {
   const state = shotCandidateState(item);
   if (!state) return "";
-  const { group, candidates, expected, missing, technicalIncomplete } = state;
+  const { group, candidates, expected, missing, technicalIncomplete,
+    liveProgress } = state;
   const selected = candidates.find((candidate) =>
     shotCandidateSelected(group, candidate));
-  const selectedByAi = !!selected && String((group.selection || {}).source || "") === "ai";
+  const selection = group.selection || {};
+  const selectedByAi = !!selected && String(selection.source || "") === "ai";
+  const selectionPending = !!selected && selection.pending === true;
   const bestEffort = shotBestEffortLabel(item);
   const batchLabel = state.roundLabel;
   const errors = (group.candidate_errors || []).map((row) =>
     `候选${row.candidate_index || "?"}：${row.error || "技术生成失败"}`);
   const byIndex = new Map(candidates.map((candidate) =>
     [shotCandidateIndex(candidate), candidate]));
-  const slots = Array.from({ length: expected }, (_, offset) => offset + 1).map((index) => ({
-    index, candidate: byIndex.get(index) || null,
-  }));
+  // 一旦 AI 或人工明确选中，主界面只留正式图；未选稿仍保留在审计资产中，
+  // AI 选择可通过“人工筛选”显式打开，不再铺满日常生产视图。
+  const slots = selected
+    ? [{index: shotCandidateIndex(selected), candidate: selected}]
+    : Array.from({ length: expected }, (_, offset) => offset + 1).map((index) => ({
+      index, candidate: byIndex.get(index) || null,
+    }));
+  const headText = selected
+    ? (selectionPending
+      ? `已人工选中候选 ${shotCandidateIndex(selected)}；当前4图波次结束后锁定，未选候选已隐藏`
+      : `候选 ${shotCandidateIndex(selected)} 已作为正式关键帧；未选候选已隐藏`)
+    : (liveProgress
+      ? `已完成的候选立即显示（质检未通过也保留）；可随时人工选中，当前 ${candidates.length}/${expected} 张`
+      : (technicalIncomplete ? `技术未补齐，当前 ${candidates.length}/${expected} 张`
+        : `${expected}张使用同一轮冻结提示词与最适参考图；AI正在自动选优复检`));
   return `<section class="shot-candidate-panel" aria-label="${batchLabel}">
     <div class="shot-candidate-head"><div><b>${batchLabel}</b>
-      <span>${bestEffort || (selected ? `${selectedByAi ? "AI已自动选优并复检" : "可选改选已生效："}候选 ${shotCandidateIndex(selected)} 为正式关键帧；其余候选保留回看`
-        : (technicalIncomplete ? `技术未补齐，当前 ${candidates.length}/${expected} 张`
-          : `${expected}张使用同一轮冻结提示词与最适参考图；AI正在自动选优复检，无需手机操作`))}</span></div>
+      <span>${bestEffort || headText}</span></div>
       <span class="plan-st st-${technicalIncomplete ? "technical_incomplete" : (selected ? "done" : "awaiting_selection")}">
         ${technicalIncomplete ? `缺 ${missing || Math.max(1, expected - candidates.length)} 张 · 系统自动补位`
-          : (bestEffort || (selected ? (selectedByAi ? "AI已选优" : "正式图已选") : "AI选优中"))}</span></div>
+          : (bestEffort || (selectionPending ? "人工已选 · 正在收尾"
+            : (selected ? (selectedByAi ? "AI已选优" : "正式图已选")
+              : (liveProgress ? "生产中可人工筛选" : "AI选优中"))))}</span></div>
     ${errors.length ? `<div class="shot-candidate-technical-error">${esc(errors.join("；"))}</div>` : ""}
-    <div class="shot-candidate-grid">${slots.map(({ index, candidate }) => {
+    <div class="shot-candidate-grid${selected ? " selected-only" : ""}">${slots.map(({ index, candidate }) => {
       if (!candidate) return `<article class="shot-candidate missing"
         aria-label="候选 ${index} 尚未生成">
         <div class="shot-candidate-image plan-thumb-empty" aria-hidden="true">🖼</div>
@@ -4064,21 +4090,33 @@ function shotCandidateGridHtml(item, editable) {
       </article>`;
       const isSelected = shotCandidateSelected(group, candidate);
       const url = shotCandidateUrl(candidate);
+      const qcLabel = candidate.passed === true ? "质检通过"
+        : (candidate.passed === false ? "质检未通过 · 可人工选" : "质检待判");
+      const qcClass = candidate.passed === true ? "pass"
+        : (candidate.passed === false ? "fail" : "pending");
+      const issues = (candidate.issues || []).map(qcIssueText).filter(Boolean);
       return `<article class="shot-candidate${isSelected ? " selected" : ""}">
         <button type="button" class="shot-candidate-image shot-candidate-open"
           data-plan-id="${esc(item.id)}" data-candidate-index="${index}"
           title="点开放大候选 ${index}" aria-label="放大候选 ${index}">
           <img src="${esc(thumbUrl(url, 520))}" loading="lazy" alt="${esc(item.label)} · 候选${index}">
-          ${isSelected ? `<span class="shot-candidate-selected">✓ 正式关键帧</span>` : ""}
+          <span class="shot-candidate-qc ${qcClass}">${qcLabel}</span>
+          ${isSelected ? `<span class="shot-candidate-selected">${selectionPending ? "✓ 已人工选中" : "✓ 正式关键帧"}</span>` : ""}
         </button>
+        ${issues.length ? `<small class="shot-candidate-issues">${esc(issues.slice(0, 2).join("；"))}</small>` : ""}
         <div class="shot-candidate-foot"><span>候选 ${index}</span>
           <button type="button" class="${isSelected ? "selected" : "primary"} shot-candidate-pick"
             data-plan-id="${esc(item.id)}" data-candidate-index="${index}"
             ${(!editable || technicalIncomplete || isSelected) ? "disabled" : ""}>
-            ${isSelected ? (selectedByAi ? "✓ AI当前正式图" : "✓ 可选改选已生效") : (technicalIncomplete ? "系统补齐后可改选" : "改选这张（可选）")}</button>
+            ${isSelected ? (selectionPending ? "✓ 人工选择待锁定"
+              : (selectedByAi ? "✓ AI当前正式图" : "✓ 人工正式图"))
+              : (technicalIncomplete ? "系统补齐后可选"
+                : (candidate.passed === false ? "仍选这张" : "选中这张"))}</button>
         </div></article>`;
     }).join("")}</div>
-    ${editable ? `<div class="shot-candidate-controls">
+    ${editable && selectedByAi ? `<button type="button" class="shot-candidate-review"
+      data-plan-id="${esc(item.id)}" data-candidate-index="${shotCandidateIndex(selected)}">人工筛选（显示隐藏候选）</button>` : ""}
+    ${editable && !liveProgress ? `<div class="shot-candidate-controls">
       <button type="button" class="shot-candidate-edit-toggle">✎ 修改提示词，整组换4张</button>
       <div class="shot-candidate-regenerate-form" hidden>
         <textarea class="shot-candidate-prompt" rows="3">${esc(item.prompt_used || item.prompt || "")}</textarea>
@@ -6194,14 +6232,16 @@ async function selectShotCandidate(episodeId, item, candidate, btn, onDone) {
   btn.disabled = true;
   btn.textContent = "正在锁定…";
   try {
-    await api("/api/shot-candidates/select", {
+    const reply = await api("/api/shot-candidates/select", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         ...shotCandidateSetPayload(episodeId, item, candidate),
         source: "manual",
       }),
     });
-    showToast(`镜头 ${item.shot_no} 已改选候选 ${shotCandidateIndex(candidate)} 为正式关键帧；其余候选保留回看`, "ok");
+    showToast(reply.pending
+      ? `镜头 ${item.shot_no} 已人工选中候选 ${shotCandidateIndex(candidate)}；当前波次结束后锁定，其他候选已隐藏`
+      : `镜头 ${item.shot_no} 已选候选 ${shotCandidateIndex(candidate)} 为正式关键帧；其他候选已隐藏`, "ok");
     if (panel) delete panel.dataset.shotCandidateMutation;
     await refreshShotCandidatePlan(episodeId, onDone, true);
   } catch (error) {
@@ -6258,7 +6298,11 @@ function showShotCandidateCompare(
     if (!slide) return;
     const selected = slide.dataset.selected === "1";
     counter.textContent = `${current + 1} / ${slides.length}`;
-    label.textContent = `候选 ${slide.dataset.index}${selected ? " · 当前正式关键帧" : ""}`;
+    const candidate = candidates.find((row) =>
+      shotCandidateIndex(row) === Number(slide.dataset.index));
+    const verdict = candidate?.passed === true ? " · 质检通过"
+      : (candidate?.passed === false ? " · 质检未通过（仍可人工选）" : " · 质检待判");
+    label.textContent = `候选 ${slide.dataset.index}${verdict}${selected ? " · 当前正式关键帧" : ""}`;
     pick.disabled = !editable || technicalIncomplete || selected;
     pick.textContent = selected ? "✓ 已选为正式图"
       : (technicalIncomplete ? "系统补齐后可改选"
@@ -6298,6 +6342,14 @@ function bindShotCandidateControls(container, data, episodeId, onDone) {
     return { item, candidate };
   };
   container.querySelectorAll(".shot-candidate-open").forEach((button) => {
+    button.onclick = (event) => {
+      event.stopPropagation();
+      const { item, candidate } = resolve(button);
+      if (item && candidate) showShotCandidateCompare(
+        episodeId, item, shotCandidateIndex(candidate), true, onDone);
+    };
+  });
+  container.querySelectorAll(".shot-candidate-review").forEach((button) => {
     button.onclick = (event) => {
       event.stopPropagation();
       const { item, candidate } = resolve(button);

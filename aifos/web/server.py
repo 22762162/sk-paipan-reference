@@ -979,22 +979,29 @@ def _selection_mode_payload_from_config(config):
 
 def _sanitize_candidate_group_urls(app, item):
     """候选图只向浏览器暴露受控 URL，不泄露服务端文件系统路径。"""
-    group = item.get("candidate_group")
-    if not isinstance(group, dict):
-        return
-    for candidate in group.get("candidates") or []:
-        if not isinstance(candidate, dict):
-            continue
-        candidate["url"] = (
-            _artifact_url(app, str(candidate.get("uri") or ""))
-            or candidate.get("url"))
-        candidate.pop("uri", None)
-    selection = group.get("selection")
-    if isinstance(selection, dict):
-        selection["selected_url"] = (
-            _artifact_url(app, str(selection.get("selected_uri") or ""))
-            or selection.get("selected_url"))
-        selection.pop("selected_uri", None)
+    def sanitize(group):
+        if not isinstance(group, dict):
+            return
+        for candidate in group.get("candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            candidate["url"] = (
+                _artifact_url(app, str(candidate.get("uri") or ""))
+                or candidate.get("url"))
+            candidate.pop("uri", None)
+        selection = group.get("selection")
+        if isinstance(selection, dict):
+            selection["selected_url"] = (
+                _artifact_url(app, str(selection.get("selected_uri") or ""))
+                or selection.get("selected_url"))
+            selection.pop("selected_uri", None)
+        group.pop("manual_selection_request", None)
+
+    sanitize(item.get("candidate_group"))
+    sanitize(item.get("candidate_progress"))
+    # 生产中的人工预选在 candidate_progress.selection 已有安全副本；
+    # 顶层内部字段只供 worker 收口使用，不能把绝对路径发给浏览器。
+    item.pop("manual_candidate_selection", None)
     uris = item.pop("candidate_uris", None)
     if isinstance(uris, list):
         item["candidate_urls"] = [

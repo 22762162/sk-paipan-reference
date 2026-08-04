@@ -27,7 +27,7 @@ def test_shot_candidate_statuses_and_ai_auto_selection_rendering_are_present():
     ):
         assert status in JS
     assert "function shotCandidateGridHtml(item, editable)" in JS
-    assert 'class="shot-candidate-grid"' in JS
+    assert 'class="shot-candidate-grid${selected ? " selected-only" : ""}"' in JS
     assert "const batchLabel = state.roundLabel" in JS
     assert "const expected = 4;" in JS
     assert "group.generation_round" in JS
@@ -35,19 +35,23 @@ def test_shot_candidate_statuses_and_ai_auto_selection_rendering_are_present():
     assert "group.current_round_progress" in JS
     assert "第${generationRound}/${maxCandidateRounds}轮 · ${currentRoundProgress}/4张" in JS
     assert "✓ 正式关键帧" in JS
-    assert "AI已自动选优" in JS
-    assert "无需手机操作" in JS
-    assert "改选这张（可选）" in JS
+    assert "AI已选优" in JS
+    assert "已完成的候选立即显示（质检未通过也保留）" in JS
+    assert "人工筛选（显示隐藏候选）" in JS
+    assert "未选候选已隐藏" in JS
     assert "历史失败 · 系统自动接管" in JS
     assert "缺 ${missing" in JS
-    assert "系统补齐后可改选" in JS
+    assert "系统补齐后可选" in JS
     assert "Array.from({ length: expected }" in JS
     assert 'aria-label="候选 ${index} 尚未生成"' in JS
     assert "等待技术补齐" in JS
     assert "selection.selected_uri || selection.selected_url" in JS
-    assert "Array.isArray(group.candidates)" in JS
+    assert "Array.isArray(finalGroup.candidates)" in JS
+    assert "item.candidate_progress" in JS
+    assert "live_progress: true" in JS
+    assert 'candidate.passed === false ? "质检未通过 · 可人工选"' in JS
     assert "Number(group.expected_count) === 3 ? 3 : 4" not in JS
-    assert 'item.status === "technical_incomplete";' in JS
+    assert 'item.status === "technical_incomplete");' in JS
 
 
 def test_candidate_round_progress_is_four_per_round_and_legacy_three_is_ignored():
@@ -84,6 +88,82 @@ def test_candidate_round_progress_is_four_per_round_and_legacy_three_is_ignored(
         "maxCandidateRounds": 10,
         "progress": 2,
         "label": "第4/10轮 · 2/4张",
+    }
+
+
+def test_live_progress_is_used_before_a_complete_candidate_group_exists():
+    helper = JS[
+        JS.index("function shotCandidateGroup"):
+        JS.index("function planItemThumbs")
+    ]
+    result = _run_node(helper + r'''
+      const item = {category: "shot_image", status: "generating",
+        candidate_group: {candidates: [], candidate_count: 0},
+        candidate_progress: {
+          candidate_set_id: "live", candidate_set_token: "token",
+          candidate_revision: 2, generation_round: 3,
+          max_candidate_rounds: 10, completed_count: 1,
+          candidates: [{candidate_index: 1, url: "/artifacts/live.png",
+            passed: false}],
+        }};
+      const state = shotCandidateState(item);
+      console.log(JSON.stringify({
+        live: state.liveProgress,
+        count: state.candidates.length,
+        failedVisible: state.candidates[0].passed === false,
+        progress: state.currentRoundProgress,
+      }));
+    ''')
+    assert result == {
+        "live": True,
+        "count": 1,
+        "failedVisible": True,
+        "progress": 1,
+    }
+
+
+def test_selected_shot_grid_hides_every_unselected_candidate():
+    helper = JS[
+        JS.index("function shotCandidateGroup"):
+        JS.index("function planItemHtml")
+    ]
+    result = _run_node(r'''
+      function esc(value) { return String(value); }
+      function thumbUrl(value) { return value; }
+      function qcIssueText(value) { return String(value || ""); }
+      function shotBestEffortLabel() { return ""; }
+    ''' + helper + r'''
+      const token = "token";
+      const candidates = [1, 2, 3, 4].map((index) => ({
+        candidate_index: index, candidate_id: `${token}#${index}`,
+        candidate_set_token: token, url: `/artifacts/${index}.png`,
+        passed: index === 2,
+      }));
+      const item = {id: "shot:1", label: "镜头1", category: "shot_image",
+        status: "done", candidate_group: {
+          candidate_set_id: "set", candidate_set_token: token,
+          candidate_revision: 1, candidates,
+          selection: {candidate_set_token: token, candidate_index: 2,
+            candidate_id: `${token}#2`, selected_url: "/artifacts/2.png",
+            source: "ai"},
+        }};
+      const html = shotCandidateGridHtml(item, true);
+      console.log(JSON.stringify({
+        cards: (html.match(/<article class="shot-candidate/g) || []).length,
+        selectedVisible: html.includes("/artifacts/2.png"),
+        unselectedHidden: !html.includes("/artifacts/1.png")
+          && !html.includes("/artifacts/3.png")
+          && !html.includes("/artifacts/4.png"),
+        selectedOnly: html.includes("selected-only"),
+        review: html.includes("人工筛选（显示隐藏候选）"),
+      }));
+    ''')
+    assert result == {
+        "cards": 1,
+        "selectedVisible": True,
+        "unselectedHidden": True,
+        "selectedOnly": True,
+        "review": True,
     }
 
 
@@ -319,7 +399,7 @@ def test_awaiting_cast_banner_says_ai_autoselects_without_phone_work():
 
 def test_current_candidate_group_precedes_single_shot_artifact():
     candidates = JS.index(
-        "const candidates = shotCandidates(item).map(shotCandidateUrl);"
+        "const candidates = shotCandidates(item);"
     )
     artifact = JS.index(
         "else if ((art.images || {})[item.shot_no]) urls = "

@@ -4098,7 +4098,9 @@ class Director:
                             "candidate_revision", "selection",
                             "selection_required", "technical_incomplete",
                             "candidate_group_history",
-                            "candidate_generation_status"):
+                            "candidate_generation_status",
+                            "candidate_progress",
+                            "manual_candidate_selection"):
                     if key in prev:
                         item[key] = prev[key]
                 if prev.get("custom_prompt"):
@@ -6814,23 +6816,35 @@ class Director:
         except (TypeError, ValueError):
             max_candidate_rounds = self._shot_max_candidate_rounds()
 
-        def report_progress(completed, settled, *, status="generating"):
+        def report_progress(
+                completed, settled, *, status="generating",
+                candidates=None, candidate_errors=None, group_meta=None):
             if not callable(progress_callback):
-                return
+                return None
+            progress = {
+                "generation_round": generation_round,
+                "max_candidate_rounds": max_candidate_rounds,
+                "completed_count": int(completed),
+                "settled_count": int(settled),
+                "expected_count": int(pulls),
+                "status": status,
+            }
+            if isinstance(group_meta, dict):
+                progress.update(copy.deepcopy(group_meta))
+            if candidates is not None:
+                progress["candidates"] = copy.deepcopy(candidates)
+                progress["candidate_count"] = len(candidates)
+            if candidate_errors is not None:
+                progress["candidate_errors"] = copy.deepcopy(
+                    candidate_errors)
             try:
-                progress_callback({
-                    "generation_round": generation_round,
-                    "max_candidate_rounds": max_candidate_rounds,
-                    "completed_count": int(completed),
-                    "settled_count": int(settled),
-                    "expected_count": int(pulls),
-                    "status": status,
-                })
+                return progress_callback(progress)
             except Exception as exc:
                 self.log.warn(
                     "director",
                     "候选逐张进度回写失败，不影响实际生成: "
                     + str(exc)[:180])
+                return None
 
         report_progress(0, 0)
         if not isinstance(working_payload.get("reference_manifest"), list):
@@ -6876,6 +6890,18 @@ class Director:
             or version.token.split(":", 1)[-1][:16])
         root = Path(out_dir) / "candidate_sets" / candidate_set_id
         root.mkdir(parents=True, exist_ok=True)
+        progress_group_meta = {
+            "schema": "aifos.shot-candidate-progress/v1",
+            "live_progress": True,
+            "version": version_data,
+            "candidate_set_id": candidate_set_id,
+            "candidate_set_token": version.token,
+            "contract_revision": version.contract_revision,
+            "candidate_revision": version.candidate_revision,
+            "complete": False,
+            "technical_incomplete": False,
+        }
+        report_progress(0, 0, group_meta=progress_group_meta, candidates=[])
 
         def generate_one(index):
             candidate_payload = copy.deepcopy(working_payload)
@@ -7028,8 +7054,17 @@ class Director:
                             "error": str(exc)[:600],
                             "retryable": attempt < 2,
                         }
+                    current_candidates = [
+                        copy.deepcopy(results[current][1])
+                        for current in sorted(results)]
+                    current_errors = [
+                        copy.deepcopy(failures[current])
+                        for current in sorted(failures)]
                     report_progress(
-                        len(results), len(results) + len(failures))
+                        len(results), len(results) + len(failures),
+                        candidates=current_candidates,
+                        candidate_errors=current_errors,
+                        group_meta=progress_group_meta)
 
         missing = [
             index for index in range(1, pulls + 1)
@@ -7113,9 +7148,14 @@ class Director:
             },
             "candidates": copy.deepcopy(candidates),
         }
-        report_progress(
+        manual_selection_request = report_progress(
             usable_count, usable_count + len(candidate_errors),
-            status="qc_complete")
+            status="qc_complete", candidates=candidates,
+            candidate_errors=candidate_errors,
+            group_meta=progress_group_meta)
+        if isinstance(manual_selection_request, dict):
+            group["manual_selection_request"] = copy.deepcopy(
+                manual_selection_request)
         selected.cost = review_cost + sum(
             float(result.cost or 0.0) for result, _candidate in ordered
             if result is not None)
@@ -7275,6 +7315,95 @@ class Director:
                 selection["ranking_unavailable"])
             report["nonblocking_risk"] = copy.deepcopy(
                 data["selection_risk"])
+            selected.qc = report
+        return selected
+
+    def _manual_promote_generated_candidate_group(self, selected):
+        """在当前四图波次收尾后兑现生产中人工预选。"""
+        data = getattr(selected, "data", None) or {}
+        group = data.get("candidate_group") or {}
+        request = group.get("manual_selection_request") or {}
+        if (not isinstance(group, dict) or not group.get("complete")
+                or not isinstance(request, dict) or not request):
+            return selected
+        try:
+            index = int(request.get("candidate_index") or 0)
+            revision = int(request.get("candidate_revision") or 0)
+            current_version = CandidateSetVersion(**(
+                group.get("version") or {}))
+        except (TypeError, ValueError):
+            return selected
+        if (str(request.get("candidate_set_id") or "")
+                != str(group.get("candidate_set_id") or "")
+                or str(request.get("candidate_set_token") or "")
+                != current_version.token
+                or revision != current_version.candidate_revision):
+            return selected
+        candidate = next((
+            row for row in group.get("candidates") or []
+            if int((row or {}).get("candidate_index") or 0) == index
+            and str((row or {}).get("candidate_id") or "")
+            == str(request.get("candidate_id") or "")
+        ), None)
+        if candidate is None:
+            return selected
+        result_version = CandidateResultVersion(
+            candidate_set_token=str(
+                candidate.get("candidate_set_token") or ""),
+            candidate_index=index)
+        decision = evaluate_candidate_promotion(
+            result_version, current_version, selection_source="manual")
+        selected_uri = str(candidate.get("uri") or "")
+        if (not decision.allowed or not selected_uri
+                or (not selected_uri.startswith(("http://", "https://"))
+                    and not Path(selected_uri).is_file())):
+            return selected
+        selection = {
+            "candidate_set_id": str(group.get("candidate_set_id") or ""),
+            "candidate_set_token": current_version.token,
+            "token": current_version.token,
+            "candidate_revision": current_version.candidate_revision,
+            "candidate_id": str(candidate.get("candidate_id") or ""),
+            "candidate_index": index,
+            "candidate_seed": candidate.get("candidate_seed"),
+            "candidate_variation_key": candidate.get(
+                "candidate_variation_key"),
+            "seed_consumed": bool(candidate.get("seed_consumed")),
+            "selected_uri": selected_uri,
+            "source": "manual",
+            "selected_at": request.get("selected_at") or now(),
+            "promotion_policy": decision.reason,
+            "ranking_score": float(candidate.get("score") or 0.0),
+            "ranking_unavailable": bool(
+                candidate.get("ranking_unavailable")),
+            "candidate_passed": candidate.get("passed") is True,
+            "best_effort_risk": candidate.get("passed") is False,
+            "risk_issues": list(candidate.get("issues") or [])[:8],
+        }
+        group["selection"] = copy.deepcopy(selection)
+        group["selection_required"] = False
+        group.pop("manual_selection_request", None)
+        data["candidate_group"] = group
+        data["selection"] = copy.deepcopy(selection)
+        data["selection_risk"] = {
+            "best_effort": selection["best_effort_risk"],
+            "ranking_unavailable": selection["ranking_unavailable"],
+            "issues": copy.deepcopy(selection["risk_issues"]),
+        }
+        selected.data = data
+        selected.uri = selected_uri
+        selected.provider = str(
+            candidate.get("provider")
+            or getattr(selected, "provider", ""))
+        selected.model = str(
+            candidate.get("model") or getattr(selected, "model", ""))
+        report = getattr(selected, "qc", None)
+        if isinstance(report, dict):
+            report["nonblocking_risk"] = {
+                "best_effort": selection["best_effort_risk"],
+                "source": "manual_candidate_selection",
+                "issues": copy.deepcopy(selection["risk_issues"]),
+            }
             selected.qc = report
         return selected
 
@@ -8112,6 +8241,29 @@ class Director:
 
             # 每一轮都留下完整候选事实，供断点、画布和“十轮全局选优”使用。
             round_history.append(copy.deepcopy(group))
+            manual_promoted = \
+                self._manual_promote_generated_candidate_group(selected)
+            manual_group = ((getattr(
+                manual_promoted, "data", None) or {}).get(
+                    "candidate_group") or {})
+            manual_selection = manual_group.get("selection") or {}
+            if (getattr(manual_promoted, "uri", "")
+                    and manual_selection.get("source") == "manual"):
+                manual_promoted.cost = total_cost
+                manual_group.update({
+                    "round_status": "manual_selected",
+                    "qualified": bool(
+                        manual_selection.get("candidate_passed")),
+                    "repair_exhausted": False,
+                    "candidate_round_history": round_history,
+                    "total_generated_candidates": sum(
+                        int(row.get("candidate_count") or 0)
+                        for row in round_history),
+                })
+                manual_promoted.data["candidate_group"] = manual_group
+                manual_promoted.data["candidate_round_history"] = \
+                    round_history
+                return manual_promoted
             promoted = self._ai_promote_generated_candidate_group(selected)
             promoted_group = ((getattr(promoted, "data", None) or {}).get(
                 "candidate_group") or {})
@@ -9320,7 +9472,7 @@ class Director:
         return summary or "生成前审核冲突已自动修复"
 
     def _attach_candidate_progress_reporter(self, ctx, task):
-        """把候选轮次/逐张完成数实时写回生产清单。"""
+        """把候选轮次、逐张结果和人工预选实时写回生产清单。"""
         if (task.get("capability") != "image"
                 or not str(task.get("item_id") or "").startswith("shot:")):
             return
@@ -9329,9 +9481,48 @@ class Director:
 
         def report(progress):
             progress = copy.deepcopy(progress or {})
-            self._plan_mark(
-                ctx, item_id, "generating",
-                extra={
+            with _PLAN_IO_LOCK:
+                plan = self._plan_read(ctx)
+                item = next((
+                    row for row in plan.get("items") or []
+                    if row.get("id") == item_id
+                ), None)
+                if item is None:
+                    return None
+                previous_status = item.get("status")
+                item["status"] = "generating"
+                item["error"] = ""
+                if (previous_status != "generating"
+                        or not item.get("started_at")):
+                    item["started_at"] = round(time.time(), 1)
+                item.pop("finished_at", None)
+
+                manual = item.get("manual_candidate_selection")
+                progress_id = str(
+                    progress.get("candidate_set_id") or "")
+                progress_token = str(
+                    progress.get("candidate_set_token") or "")
+                if isinstance(manual, dict) and progress_id and progress_token:
+                    same_group = bool(
+                        str(manual.get("candidate_set_id") or "")
+                        == progress_id
+                        and str(manual.get("candidate_set_token") or "")
+                        == progress_token
+                        and int(manual.get("candidate_revision") or 0)
+                        == int(progress.get("candidate_revision") or 0))
+                    available = any(
+                        str((row or {}).get("candidate_id") or "")
+                        == str(manual.get("candidate_id") or "")
+                        and int((row or {}).get("candidate_index") or 0)
+                        == int(manual.get("candidate_index") or 0)
+                        for row in (progress.get("candidates") or []))
+                    if same_group and available:
+                        progress["selection"] = copy.deepcopy(manual)
+                    elif not same_group:
+                        item.pop("manual_candidate_selection", None)
+                        manual = None
+
+                item.update({
                     "candidate_progress": progress,
                     "generation_round": int(
                         progress.get("generation_round") or 1),
@@ -9344,6 +9535,9 @@ class Director:
                         progress.get("expected_count")
                         or self._shot_candidate_count()),
                 })
+                self._plan_write(ctx, plan)
+                return copy.deepcopy(manual) \
+                    if isinstance(manual, dict) else None
 
         payload["_candidate_progress_callback"] = report
         task["payload"] = payload
@@ -23055,19 +23249,114 @@ class Director:
             if item is None:
                 raise AifosError(
                     "stale_candidate_set: 当前镜头候选组不存在，请刷新")
-            group = item.get("candidate_group") or {}
-            actual_id = str(group.get("candidate_set_id") or "")
-            actual_token = str(group.get("candidate_set_token") or "")
-            try:
-                actual_revision = int(group.get("candidate_revision") or 0)
-            except (TypeError, ValueError):
-                actual_revision = 0
-            if (not expected_id or not expected_token
-                    or expected_id != actual_id
-                    or expected_token != actual_token
-                    or normalized_revision != actual_revision):
+            final_group = item.get("candidate_group") or {}
+            progress_group = item.get("candidate_progress") or {}
+
+            def group_matches(value):
+                try:
+                    revision = int(value.get("candidate_revision") or 0)
+                except (TypeError, ValueError, AttributeError):
+                    return False
+                return bool(
+                    expected_id and expected_token
+                    and expected_id
+                    == str(value.get("candidate_set_id") or "")
+                    and expected_token
+                    == str(value.get("candidate_set_token") or "")
+                    and normalized_revision == revision)
+
+            in_flight = False
+            if isinstance(final_group, dict) and group_matches(final_group):
+                group = final_group
+            elif (isinstance(progress_group, dict)
+                    and group_matches(progress_group)):
+                group = progress_group
+                in_flight = True
+            else:
                 raise AifosError(
                     "stale_candidate_set: 候选组已更新，请刷新后重新选择")
+            actual_id = str(group.get("candidate_set_id") or "")
+            actual_token = str(group.get("candidate_set_token") or "")
+            actual_revision = int(group.get("candidate_revision") or 0)
+
+            if in_flight:
+                candidate = next((
+                    row for row in group.get("candidates") or []
+                    if int((row or {}).get("candidate_index") or 0)
+                    == normalized_index
+                    and str((row or {}).get("candidate_id") or "")
+                    == requested_candidate_id
+                ), None)
+                if candidate is None:
+                    raise AifosError(
+                        "stale_candidate_set: 候选尚未完成或已被新一轮替换")
+                try:
+                    current_version = CandidateSetVersion(**(
+                        group.get("version") or {}))
+                except TypeError as exc:
+                    raise AifosError(
+                        "stale_candidate_set: 当前候选版本损坏，请刷新") \
+                        from exc
+                decision = evaluate_candidate_promotion(
+                    CandidateResultVersion(
+                        candidate_set_token=str(
+                            candidate.get("candidate_set_token") or ""),
+                        candidate_index=normalized_index),
+                    current_version, selection_source=source)
+                selected_uri = str(candidate.get("uri") or "")
+                if not decision.allowed:
+                    raise AifosError(
+                        "candidate_promotion_denied: " + decision.reason)
+                if (not selected_uri
+                        or (not selected_uri.startswith(
+                            ("http://", "https://"))
+                            and not Path(selected_uri).is_file())):
+                    raise AifosError(
+                        "candidate_group_incomplete: 所选候选文件不存在")
+                pending = {
+                    "candidate_set_id": actual_id,
+                    "candidate_set_token": actual_token,
+                    "token": actual_token,
+                    "candidate_revision": actual_revision,
+                    "candidate_id": requested_candidate_id,
+                    "candidate_index": normalized_index,
+                    "candidate_seed": candidate.get("candidate_seed"),
+                    "selected_uri": selected_uri,
+                    "source": "manual",
+                    "pending": True,
+                    "selected_at": now(),
+                    "candidate_passed": candidate.get("passed") is True,
+                    "best_effort_risk": candidate.get("passed") is False,
+                    "risk_issues": list(candidate.get("issues") or [])[:8],
+                }
+                previous_pending = item.get(
+                    "manual_candidate_selection") or {}
+                already_selected = bool(
+                    str(previous_pending.get("candidate_id") or "")
+                    == requested_candidate_id
+                    and int(previous_pending.get("candidate_index") or 0)
+                    == normalized_index)
+                item["manual_candidate_selection"] = copy.deepcopy(pending)
+                progress_group["selection"] = copy.deepcopy(pending)
+                item["candidate_progress"] = progress_group
+                self._plan_write(ctx, plan)
+                return {
+                    "status": "selection_pending",
+                    "shot_no": int(shot["shot_no"]),
+                    "candidate_set_id": actual_id,
+                    "candidate_set_token": actual_token,
+                    "candidate_revision": actual_revision,
+                    "candidate_id": requested_candidate_id,
+                    "candidate_index": normalized_index,
+                    "selected_uri": selected_uri,
+                    "source": "manual",
+                    "pending": True,
+                    "already_selected": already_selected,
+                    "remaining": 1,
+                    "all_selected": False,
+                    "need_resume": False,
+                    "last_pending": False,
+                }
             if not self._shot_candidate_group_valid(item):
                 raise AifosError(
                     "candidate_group_incomplete: 四张候选尚未全部技术完成，"
@@ -23079,43 +23368,49 @@ class Director:
                     == requested_candidate_id
                     and int(previous.get("candidate_index") or 0)
                     == normalized_index)
-                if not same:
+                manual_overrides_ai = bool(
+                    not same and source == "manual"
+                    and str(previous.get("source") or "") == "ai")
+                if not same and not manual_overrides_ai:
                     raise AifosError(
                         "selection_conflict: 本候选组已经选定另一张图片，"
                         "请刷新后再操作")
-                row = self.assets.latest(
-                    ctx["project"]["id"], "image",
-                    self._shot_name(ctx, int(shot["shot_no"])))
-                if row is None:
-                    raise AifosError(
-                        "selection_asset_conflict: 选片记录存在但正式资产缺失，"
-                        "请从断点执行资产对账")
-                meta = self._asset_meta(row)
-                if (str(meta.get("candidate_set_token") or "")
-                        != actual_token
-                        or str(meta.get("candidate_id") or "")
-                        != requested_candidate_id):
-                    raise AifosError(
-                        "selection_asset_conflict: 正式资产已被其他修订替换，"
-                        "请刷新后再操作")
-                summary = self._shot_candidate_selection_summary(plan)
-                return {
-                    "status": "selected",
-                    "shot_no": int(shot["shot_no"]),
-                    "candidate_set_id": actual_id,
-                    "candidate_set_token": actual_token,
-                    "candidate_revision": actual_revision,
-                    "candidate_id": requested_candidate_id,
-                    "candidate_index": normalized_index,
-                    "selected_uri": str(previous.get("selected_uri") or ""),
-                    "source": str(previous.get("source") or source),
-                    "asset_id": row["id"], "asset_version": row["version"],
-                    "already_selected": True,
-                    "remaining": summary["remaining"],
-                    "all_selected": summary["all_selected"],
-                    "need_resume": summary["need_resume"],
-                    "last_pending": False,
-                }
+                if same:
+                    row = self.assets.latest(
+                        ctx["project"]["id"], "image",
+                        self._shot_name(ctx, int(shot["shot_no"])))
+                    if row is None:
+                        raise AifosError(
+                            "selection_asset_conflict: 选片记录存在但正式资产缺失，"
+                            "请从断点执行资产对账")
+                    meta = self._asset_meta(row)
+                    if (str(meta.get("candidate_set_token") or "")
+                            != actual_token
+                            or str(meta.get("candidate_id") or "")
+                            != requested_candidate_id):
+                        raise AifosError(
+                            "selection_asset_conflict: 正式资产已被其他修订替换，"
+                            "请刷新后再操作")
+                    summary = self._shot_candidate_selection_summary(plan)
+                    return {
+                        "status": "selected",
+                        "shot_no": int(shot["shot_no"]),
+                        "candidate_set_id": actual_id,
+                        "candidate_set_token": actual_token,
+                        "candidate_revision": actual_revision,
+                        "candidate_id": requested_candidate_id,
+                        "candidate_index": normalized_index,
+                        "selected_uri": str(
+                            previous.get("selected_uri") or ""),
+                        "source": str(previous.get("source") or source),
+                        "asset_id": row["id"],
+                        "asset_version": row["version"],
+                        "already_selected": True,
+                        "remaining": summary["remaining"],
+                        "all_selected": summary["all_selected"],
+                        "need_resume": summary["need_resume"],
+                        "last_pending": False,
+                    }
 
             candidate = next((
                 row for row in group.get("candidates") or []
@@ -23219,6 +23514,7 @@ class Director:
             item["technical_incomplete"] = False
             item["error"] = ""
             item["finished_at"] = round(time.time(), 1)
+            item.pop("manual_candidate_selection", None)
             self._plan_write(ctx, plan)
             summary = self._shot_candidate_selection_summary(plan)
             last_pending = before["remaining"] == 1
@@ -23425,6 +23721,8 @@ class Director:
             item.pop("prompt_optimized", None)
             item.pop("prompt_review", None)
             item.pop("selection", None)
+            item.pop("candidate_progress", None)
+            item.pop("manual_candidate_selection", None)
             item.pop("output_uri", None)
             item.pop("qc", None)
             item.pop("started_at", None)

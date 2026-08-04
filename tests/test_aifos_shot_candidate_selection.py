@@ -4,6 +4,7 @@ import copy
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -231,6 +232,130 @@ def test_technical_incomplete_group_cannot_be_selected(app, tmp_path):
         "四图选片测试", 1, shot_no=1)
     assert state["remaining"] == 1
     assert state["items"][0]["technical_incomplete"] is True
+
+
+def test_live_progress_candidate_can_be_manually_preselected(app, tmp_path):
+    _project, _episode, ctx, groups = _seed_episode(
+        app, tmp_path, complete=False)
+    group = groups[1]
+    plan = app.director._plan_read(ctx)
+    item = plan["items"][0]
+    item.pop("candidate_group", None)
+    item["status"] = "generating"
+    item["candidate_progress"] = {
+        **copy.deepcopy(group),
+        "schema": "aifos.shot-candidate-progress/v1",
+        "live_progress": True,
+        "completed_count": len(group["candidates"]),
+        "settled_count": len(group["candidates"]),
+    }
+    app.director._plan_write(ctx, plan)
+
+    result = _select(app, group, candidate_index=1)
+
+    assert result["status"] == "selection_pending"
+    assert result["pending"] is True
+    assert result["selected_uri"] == group["candidates"][0]["uri"]
+    stored = app.director._plan_read(ctx)["items"][0]
+    assert stored["manual_candidate_selection"]["candidate_index"] == 1
+    assert stored["candidate_progress"]["selection"]["pending"] is True
+    assert app.assets.latest(
+        _project["id"], "image", "e001_shot001") is None
+
+
+def test_manual_selection_overrides_prior_ai_selection(app, tmp_path):
+    project, _episode, ctx, groups = _seed_episode(app, tmp_path)
+    group = groups[1]
+    ai = _select(app, group, candidate_index=2, source="ai")
+
+    manual = _select(app, group, candidate_index=4, source="manual")
+
+    assert ai["source"] == "ai"
+    assert manual["source"] == "manual"
+    assert manual["candidate_index"] == 4
+    assert manual["asset_version"] == 2
+    item = app.director._plan_read(ctx)["items"][0]
+    assert item["candidate_group"]["selection"]["source"] == "manual"
+    assert item["output_uri"] == group["candidates"][3]["uri"]
+    history = app.assets.history(project["id"], "image", "e001_shot001")
+    assert len(history) == 2
+
+
+def test_inflight_manual_choice_is_promoted_even_when_qc_failed(
+        app, tmp_path):
+    _project, _episode, _ctx, groups = _seed_episode(app, tmp_path)
+    group = copy.deepcopy(groups[1])
+    chosen = group["candidates"][2]
+    chosen.update({"passed": False, "score": 0.25,
+                   "issues": ["构图仍有风险"], "provider": "image-api",
+                   "model": "seedream"})
+    group["manual_selection_request"] = {
+        "candidate_set_id": group["candidate_set_id"],
+        "candidate_set_token": group["candidate_set_token"],
+        "candidate_revision": group["candidate_revision"],
+        "candidate_id": chosen["candidate_id"],
+        "candidate_index": chosen["candidate_index"],
+        "selected_at": 123.0,
+    }
+    result = SimpleNamespace(
+        data={"candidate_group": group}, uri="", provider="",
+        model="", qc={"passed": False}, cost=0.0, fallbacks=[])
+
+    promoted = app.director._manual_promote_generated_candidate_group(result)
+
+    selection = promoted.data["candidate_group"]["selection"]
+    assert promoted.uri == chosen["uri"]
+    assert selection["source"] == "manual"
+    assert selection["candidate_passed"] is False
+    assert selection["best_effort_risk"] is True
+    assert promoted.qc["nonblocking_risk"]["issues"] == ["构图仍有风险"]
+
+
+def test_candidate_progress_reporter_persists_images_and_returns_manual_pick(
+        app, tmp_path):
+    _project, _episode, ctx, groups = _seed_episode(app, tmp_path)
+    group = groups[1]
+    task = {
+        "capability": "image", "item_id": "shot:1", "payload": {},
+    }
+    app.director._attach_candidate_progress_reporter(ctx, task)
+    callback = task["payload"]["_candidate_progress_callback"]
+    progress = {
+        "candidate_set_id": group["candidate_set_id"],
+        "candidate_set_token": group["candidate_set_token"],
+        "candidate_revision": group["candidate_revision"],
+        "generation_round": 2,
+        "max_candidate_rounds": 10,
+        "completed_count": 1,
+        "settled_count": 1,
+        "expected_count": 4,
+        "status": "generating",
+        "candidates": [copy.deepcopy(group["candidates"][0])],
+    }
+
+    assert callback(progress) is None
+    plan = app.director._plan_read(ctx)
+    item = plan["items"][0]
+    assert item["candidate_progress"]["candidates"][0]["uri"] == \
+        group["candidates"][0]["uri"]
+    pending = {
+        "candidate_set_id": group["candidate_set_id"],
+        "candidate_set_token": group["candidate_set_token"],
+        "candidate_revision": group["candidate_revision"],
+        "candidate_id": group["candidates"][0]["candidate_id"],
+        "candidate_index": 1,
+        "selected_uri": group["candidates"][0]["uri"],
+        "source": "manual",
+        "pending": True,
+    }
+    item["manual_candidate_selection"] = pending
+    app.director._plan_write(ctx, plan)
+
+    returned = callback(progress)
+
+    assert returned == pending
+    stored = app.director._plan_read(ctx)["items"][0]
+    assert stored["candidate_progress"]["selection"] == pending
 
 
 def test_regenerate_requires_confirmation_and_rejects_old_cas(app, tmp_path):

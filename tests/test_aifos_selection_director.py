@@ -170,6 +170,7 @@ def test_four_candidates_share_one_reviewed_contract_and_overlap(tmp_path):
         "shot_candidate_count": 4,
     })
     director.router = _ParallelRouter()
+    progress_updates = []
     payload = {
         "_episode_id": "episode-1",
         "_contract_revision": 1,
@@ -182,6 +183,8 @@ def test_four_candidates_share_one_reviewed_contract_and_overlap(tmp_path):
             "uri": "/tmp/reference-face.png",
             "role": "identity",
         }],
+        "_candidate_progress_callback": lambda value: (
+            progress_updates.append(copy.deepcopy(value))),
     }
 
     result = director._generate_selection_candidates_parallel(
@@ -228,6 +231,17 @@ def test_four_candidates_share_one_reviewed_contract_and_overlap(tmp_path):
     assert "canonical_uri" not in group
     assert group["recommended_candidate_id"].endswith("#1")
     assert group["recommended_candidate_index"] == 1
+    visible_updates = [
+        update for update in progress_updates
+        if update.get("candidates")]
+    assert visible_updates
+    assert any(len(update["candidates"]) < 4
+               for update in visible_updates)
+    assert len(visible_updates[-1]["candidates"]) == 4
+    assert visible_updates[-1]["status"] == "qc_complete"
+    assert visible_updates[-1]["live_progress"] is True
+    assert visible_updates[-1]["candidate_set_token"] == \
+        group["candidate_set_token"]
     assert not (tmp_path / "shot_007.keyframe.png").exists()
     assert Director._candidate_selection_pending(result) is True
     assert group["selection_required"] is True

@@ -1,5 +1,6 @@
 """关键帧四候选 Web 契约：CAS、选片续产、重生成与安全 URL。"""
 
+import copy
 import http.client
 import json
 import threading
@@ -432,5 +433,40 @@ def test_candidate_selection_and_sanitizer_accept_url_only_payload(server):
         _sanitize_candidate_group_urls(app, item)
         assert item["candidate_group"]["selection"]["selected_url"] == remote
         assert item["candidate_group"]["candidates"][1]["url"] == remote
+    finally:
+        app.close()
+
+
+def test_live_candidate_progress_urls_are_sanitized(server):
+    app = App(server["workspace"])
+    try:
+        root = app.workspace.artifacts_dir / "p001" / "e001" / "live"
+        group = _candidate_group(root, selected=False, complete=False)
+        selected_uri = group["candidates"][0]["uri"]
+        group["selection"] = {
+            "candidate_set_id": group["candidate_set_id"],
+            "candidate_set_token": group["candidate_set_token"],
+            "candidate_revision": group["candidate_revision"],
+            "candidate_id": group["candidates"][0]["candidate_id"],
+            "candidate_index": 1,
+            "selected_uri": selected_uri,
+            "source": "manual",
+            "pending": True,
+        }
+        item = {
+            "candidate_progress": group,
+            "manual_candidate_selection": copy.deepcopy(group["selection"]),
+        }
+
+        _sanitize_candidate_group_urls(app, item)
+
+        assert all("uri" not in row
+                   for row in item["candidate_progress"]["candidates"])
+        assert all(row["url"].startswith("/artifacts/")
+                   for row in item["candidate_progress"]["candidates"])
+        assert "selected_uri" not in item["candidate_progress"]["selection"]
+        assert item["candidate_progress"]["selection"][
+            "selected_url"].startswith("/artifacts/")
+        assert "manual_candidate_selection" not in item
     finally:
         app.close()

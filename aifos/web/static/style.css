@@ -2765,6 +2765,9 @@ textarea:focus-visible, select:focus-visible {
   display: grid; grid-template-columns: repeat(4, minmax(112px, 1fr));
   gap: 8px;
 }
+.shot-candidate-grid.selected-only {
+  grid-template-columns: minmax(220px, 360px);
+}
 .shot-candidate {
   min-width: 0; overflow: hidden; border: 2px solid var(--hairline);
   border-radius: 9px; background: var(--surface-2);
@@ -2786,6 +2789,18 @@ textarea:focus-visible, select:focus-visible {
   border-radius: 999px; color: #eaffea; background: rgba(12, 130, 12, .85);
   font-size: 10px; font-weight: 700; pointer-events: none;
 }
+.shot-candidate-qc {
+  position: absolute; top: 6px; right: 6px; max-width: calc(100% - 12px);
+  padding: 3px 7px; border-radius: 999px; color: white;
+  background: rgba(92, 104, 122, .88); font-size: 10px; font-weight: 700;
+  pointer-events: none;
+}
+.shot-candidate-qc.pass { background: rgba(12, 130, 12, .88); }
+.shot-candidate-qc.fail { background: rgba(190, 47, 47, .9); }
+.shot-candidate-issues {
+  display: block; min-height: 34px; padding: 7px 8px 0;
+  color: #ffb6b6; font-size: 10.5px; line-height: 1.45;
+}
 .shot-candidate-foot { display: grid; gap: 6px; padding: 7px; }
 .shot-candidate-foot > span {
   color: var(--ink-3); font-size: 10.5px; text-align: center;
@@ -2793,6 +2808,7 @@ textarea:focus-visible, select:focus-visible {
 .shot-candidate-foot button { min-height: 38px; padding: 5px 7px; font-size: 11px; }
 .shot-candidate-foot button.selected { color: var(--good); border-color: var(--good); }
 .shot-candidate-controls { display: grid; gap: 7px; }
+.shot-candidate-review { justify-self: start; font-size: 12px; }
 .shot-candidate-edit-toggle { justify-self: start; font-size: 12px; }
 .shot-candidate-regenerate-form {
   display: grid; grid-template-columns: minmax(0, 1fr) minmax(180px, .55fr);
@@ -2826,7 +2842,8 @@ textarea:focus-visible, select:focus-visible {
   .shot-candidate-regenerate-form textarea,
   .shot-candidate-regenerate-form small { grid-column: 1; }
   .shot-candidate-edit-toggle,
-  .shot-candidate-regenerate { width: 100%; min-height: 44px; }
+  .shot-candidate-regenerate,
+  .shot-candidate-review { width: 100%; min-height: 44px; }
 }
 .plan-story-context {
   display: grid; gap: 5px; margin-top: 8px; padding: 8px 10px;
