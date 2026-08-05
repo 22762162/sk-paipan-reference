@@ -193,9 +193,19 @@ def validate_high_value_event_contract(script):
     for scene in script.get("scenes") or []:
         if not isinstance(scene, dict):
             continue
+        logic = scene.get("director_logic")
+        if not isinstance(logic, dict):
+            logic = {}
+        # Only scan what happens *in this scene*.  entry/information state and
+        # immutable continuity facts routinely mention an earlier awakening,
+        # SS-rank result or reveal; treating those recap facts as a new set
+        # piece created phantom contracts and rejected otherwise valid scripts.
         text = json.dumps({
             "action": scene.get("action"),
-            "director_logic": scene.get("director_logic"),
+            "dramatic_function": logic.get("dramatic_function"),
+            "physical_actions": logic.get("physical_actions"),
+            "director_intent": logic.get("director_intent"),
+            "exit_state": logic.get("exit_state"),
         }, ensure_ascii=False, default=str).lower()
         if (any(cue.lower() in text for cue in HIGH_VALUE_CUES)
                 and _positive_int(scene.get("scene_no"), 0)

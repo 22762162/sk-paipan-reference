@@ -102,7 +102,9 @@ def test_prop_phase_aliases_normalize_before_audit():
 
     for alias, expected in (("begin", "start"), ("开场", "start"),
                             ("scene_start", "start"), ("Retired", "end"),
-                            ("尾帧", "end"), ("定格", "freeze")):
+                            ("尾帧", "end"), ("定格", "freeze"),
+                            ("setup", "start"), ("main", "freeze"),
+                            ("settle", "end"), ("payoff", "end")):
         script = registry_with(alias)
         normalize_prop_contract(script)
         got = script["prop_registry"][0][

@@ -1027,6 +1027,8 @@ class ProviderRouter:
                                                cancel=cancel)
                 self._validate_generated_image_shape(
                     capability, payload, result)
+            except ProduceCancelled:
+                raise
             except ProviderError as exc:
                 if self._is_safety_rejection(exc):
                     # 题材级拒绝:《雨夜凶杀》这类有尸体/血迹的剧,
@@ -1051,6 +1053,16 @@ class ProviderRouter:
                         f"{name} 执行失败({exc}),回退({capability})")
                 fallbacks.append(
                     {"provider": name, "reason": f"执行失败: {exc}"})
+                continue
+            except Exception as exc:
+                # A malformed provider response must be a route-local failure,
+                # never an AttributeError that aborts the entire production
+                # stage.  Keep the exact exception in the fallback ledger and
+                # let the next configured writer repair/replace the response.
+                reason = f"输出结构异常: {type(exc).__name__}: {exc}"
+                self.log.warn(
+                    "router", f"{name} {reason},回退({capability})")
+                fallbacks.append({"provider": name, "reason": reason})
                 continue
             if strict_provider and (result.provider != strict_provider
                                     or result.model != strict_model):

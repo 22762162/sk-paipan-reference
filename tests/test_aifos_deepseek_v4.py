@@ -172,6 +172,23 @@ def test_invalid_thinking_mode_fails_closed():
     assert "thinking_mode" in reason
 
 
+def test_malformed_scene_string_becomes_repairable_validation_error():
+    provider = OpenAIChatProvider.__new__(OpenAIChatProvider)
+    data = {
+        "characters": [{"name": "甲", "role": "主角"}],
+        "scenes": [
+            {"scene_no": 1, "location": "客厅", "characters": ["甲"],
+             "action": "甲起身。",
+             "lines": [{"character": "甲", "dialogue": "走吧。"}]},
+            "第2场 卧室",
+        ],
+    }
+
+    processed = provider._postprocess("script", data, {})
+    error = provider._validate("script", {}, processed)
+    assert error.startswith("场次2需为对象")
+
+
 def test_settings_expose_api_without_leaking_key(tmp_path):
     app = App(tmp_path / "ws")
     config_path = app.workspace.config_path

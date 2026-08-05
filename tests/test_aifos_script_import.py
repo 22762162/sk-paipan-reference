@@ -7,7 +7,8 @@ import pytest
 from aifos.app import App
 from aifos.cli import main
 from aifos.script_import import (
-    ScriptImportError, parse_any, parse_text_script)
+    ScriptImportError, parse_any, parse_text_script,
+    sanitize_script_entities)
 
 SAMPLE = """第1场 古镇长街
 夜色渐深,妖气翻涌。
@@ -190,6 +191,22 @@ def test_parse_json_passthrough():
     assert parsed["project_title"] == "题"
     with pytest.raises(ScriptImportError):
         parse_any('{"scenes": []}', "题", 3)
+
+
+def test_entity_cleanup_leaves_malformed_scene_for_validator_not_crash():
+    script = {
+        "characters": [{"name": "甲", "role": "主角"}],
+        "scenes": [
+            {"scene_no": 1, "location": "客厅", "characters": ["甲"],
+             "lines": [{"character": "甲", "dialogue": "开始。"}]},
+            "第2场 卧室",
+        ],
+        "import_analysis": "模型误写成字符串",
+    }
+
+    assert sanitize_script_entities(script) is script
+    assert script["scenes"][1] == "第2场 卧室"
+    assert script["import_analysis"]["character_count"] == 1
 
 
 def test_produce_with_provided_script(tmp_path):

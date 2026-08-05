@@ -117,6 +117,11 @@ _PROP_PHASE_ALIASES = {
     "hold": "freeze", "held": "freeze", "static": "freeze",
     "frozen": "freeze", "still": "freeze", "pause": "freeze",
     "定格": "freeze", "静止": "freeze", "冻结": "freeze",
+    # Models sometimes put dramatic-beat vocabulary into the frame-phase
+    # slot.  These four mappings are deterministic: setup is the entry,
+    # main is the representative still, and settle/payoff are the result.
+    "setup": "start", "main": "freeze",
+    "settle": "end", "payoff": "end",
 }
 # 按字母段切词(scene_start/at-end/startFrame 里的下划线、连字符
 # 都是分隔),再与合法枚举取交集;恰好命中一个才归一。

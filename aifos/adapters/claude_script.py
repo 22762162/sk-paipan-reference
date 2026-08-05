@@ -1099,6 +1099,10 @@ def validate_script(script, payload):
         return "缺少 scenes"
     if not script.get("characters"):
         return "缺少 characters"
+    if not isinstance(script["scenes"], list):
+        return "scenes 需为数组"
+    if not isinstance(script["characters"], list):
+        return "characters 需为数组"
     for character in script["characters"]:
         if not isinstance(character, dict) or not character.get("name"):
             return f"角色字段不全: {character}"
@@ -1110,10 +1114,21 @@ def validate_script(script, payload):
                         "character_analysis", "visual_dna", "cast_dedup")
                     else "")
                 character.setdefault(key, default)
-    for scene in script["scenes"]:
+    for scene_position, scene in enumerate(script["scenes"], 1):
+        if not isinstance(scene, dict):
+            return (
+                f"场次{scene_position}需为对象,收到: "
+                f"{str(scene)[:80]}")
         if not scene.get("location") or "scene_no" not in scene:
             return f"场次字段不全: {scene}"
-        for line in scene.get("lines", []):
+        lines = scene.get("lines", [])
+        if not isinstance(lines, list):
+            return f"场次{scene_position}.lines 需为数组"
+        for line_position, line in enumerate(lines, 1):
+            if not isinstance(line, dict):
+                return (
+                    f"场次{scene_position}台词{line_position}需为对象,收到: "
+                    f"{str(line)[:80]}")
             if not line.get("character") or not line.get("dialogue"):
                 return f"台词字段不全: {line}"
         scene.setdefault("characters", sorted(

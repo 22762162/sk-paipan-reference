@@ -48,6 +48,28 @@ def test_failing_command_falls_back(make_app):
     assert result.provider == "mock"
 
 
+def test_unexpected_provider_structure_exception_falls_back(make_app):
+    app = make_app({
+        "providers": {
+            "broken": {"type": "mock", "enabled": True,
+                       "capabilities": ["video"]},
+        },
+        "routing": {"video": ["broken", "mock"]},
+    })
+
+    def explode(*_args, **_kwargs):
+        raise AttributeError("'str' object has no attribute 'get'")
+
+    app.router.providers["broken"].generate = explode
+    result = app.router.call(
+        "video", {"shot_no": 1, "duration": 1.0},
+        app.workspace.artifacts_dir)
+
+    assert result.provider == "mock"
+    assert result.fallbacks[0]["provider"] == "broken"
+    assert "AttributeError" in result.fallbacks[0]["reason"]
+
+
 def test_enabled_cli_provider_is_used(make_app):
     app = make_app({"providers": {"codex": {
         "enabled": True, "command": OK_CLI, "quota": 10}}})

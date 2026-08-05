@@ -73,6 +73,36 @@ def test_game_draw_signal_requires_script_contract():
     assert issues == ["场4含高价值事件信号但未建立 high_value_events 合同"]
 
 
+def test_prior_high_value_fact_does_not_create_phantom_scene_contract():
+    """知识/入口状态可承接上一集SS结果，不代表本场又演一次。"""
+    script = {
+        "high_value_events": [{
+            "event_id": "current-reveal", "scene_no": 2,
+            "dramatic_question": "本场真相是什么？",
+            "minimum_independent_shots": 3,
+            "required_beats": [
+                {"beat_id": "b1", "must_visualize": True},
+                {"beat_id": "b2", "must_visualize": True},
+                {"beat_id": "b3", "must_visualize": True},
+            ],
+        }],
+        "scenes": [
+            {"scene_no": 1, "action": "她查看倒计时并起身。",
+             "director_logic": {
+                 "information_state": "她已知上一集获得SS级天赋。",
+                 "entry_state": "承接上一集的天赋揭晓后状态。",
+                 "continuity_contract": {
+                     "immutable_facts": "SS级天赋已经获得。"},
+                 "physical_actions": "她收起手机并走向床边。",
+             }},
+            {"scene_no": 2, "action": "真相揭晓。",
+             "director_logic": {"physical_actions": "她翻开资格牌。"}},
+        ],
+    }
+
+    assert validate_high_value_event_contract(script) == []
+
+
 def test_script_and_storyboard_prompts_both_carry_highest_rule():
     script_prompt = build_prompt("script", {
         "project_title": "游戏入侵", "episode_number": 1})

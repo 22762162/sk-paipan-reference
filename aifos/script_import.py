@@ -185,8 +185,11 @@ def sanitize_script_entities(script):
         item["name"] = name
         profiles.setdefault(name, item)
 
+    scenes = script.get("scenes")
+    if not isinstance(scenes, list):
+        scenes = []
     removed = 0
-    for scene in script.get("scenes", []):
+    for scene in scenes:
         if not isinstance(scene, dict):
             continue
         declared = []
@@ -250,7 +253,12 @@ def sanitize_script_entities(script):
     # often produced through set/sort operations and must not silently change
     # the protagonist or first-appearance order.
     ordered = list(profiles)
-    for scene in script.get("scenes", []):
+    for scene in scenes:
+        # Provider JSON occasionally contains a stray scene-heading string in
+        # the scenes array.  Leave it in place for validate_script to report
+        # and repair; entity cleanup itself must never crash the whole route.
+        if not isinstance(scene, dict):
+            continue
         for name in scene.get("characters", []) or []:
             if name in profiles and name not in ordered:
                 ordered.append(name)
@@ -270,7 +278,10 @@ def sanitize_script_entities(script):
         profiles[real_names[0]]["role"] = "主角"
     script["characters"] = [profiles[name] for name in ordered]
     script["declared_character_names"] = ordered
-    imported = script.setdefault("import_analysis", {})
+    imported = script.get("import_analysis")
+    if not isinstance(imported, dict):
+        imported = {}
+        script["import_analysis"] = imported
     imported["character_count"] = len(ordered)
     if removed:
         imported["non_person_cues_removed"] = max(

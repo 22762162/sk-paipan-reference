@@ -1055,7 +1055,11 @@ class OpenAIChatProvider(Provider):
         data = extract_json(text)
         if data is None:
             raise ProviderError(f"{self.name} 应答中未找到 JSON 对象")
-        data = self._postprocess(capability, data, payload)
+        try:
+            data = self._postprocess(capability, data, payload)
+        except Exception as exc:
+            raise ProviderError(
+                f"{self.name} 输出结构异常: {exc}") from exc
         try:
             error = self._validate(capability, payload, data)
         except Exception as exc:
