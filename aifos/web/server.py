@@ -464,6 +464,21 @@ class JobRegistry:
             job["progress"] = dict(row["progress"])
         if row.get("result"):
             job["summary"] = dict(row["result"])
+            # 作业状态与业务检查点是两层事实：awaiting_confirm 表示 worker
+            # 成功停在检查点，所以外层仍为 done（兼容轮询契约），同时通过
+            # outcome_status 明示真实业务终态。failed 则必须是外层 failed。
+            if str(row.get("status") or "") == "done":
+                outcome_status, summary_error = (
+                    JobRegistry._summary_job_outcome(
+                        row["result"]))
+                job["outcome_status"] = outcome_status
+                if outcome_status == "failed":
+                    # 兼容升级前遗留的“ledger=done、summary=failed”记录。
+                    # 旧数据不能继续在 /api/jobs 冒充成功，否则页面仍会
+                    # 显示假卡/已完成，真正失败原因也会消失。
+                    job["status"] = "failed"
+                    if summary_error:
+                        job["error"] = summary_error
         if row.get("error"):
             job["error"] = row["error"]
         if row.get("queue_position") is not None:
@@ -471,6 +486,45 @@ class JobRegistry:
         if row.get("cancel_requested"):
             job["cancel_requested"] = True
         return job
+
+    @staticmethod
+    def _summary_job_outcome(summary):
+        """Translate a Director summary into the Web-visible job outcome.
+
+        ``production_jobs`` intentionally has a small durable state machine,
+        while Director summaries also expose review checkpoints.  A worker
+        returning normally is therefore not synonymous with successful
+        production: ``status=failed`` must remain failed, and checkpoint
+        states are preserved separately as ``outcome_status``.
+        """
+        if not isinstance(summary, dict):
+            return "done", ""
+        result_status = str(summary.get("status") or "").strip().lower()
+        if result_status in {"failed", "qc_failed"}:
+            reason = str(summary.get("error") or "").strip()
+            if not reason:
+                for stage in reversed(list(summary.get("stages") or [])):
+                    if not isinstance(stage, dict):
+                        continue
+                    if str(stage.get("status") or "").lower() not in {
+                            "failed", "qc_failed"}:
+                        continue
+                    detail = stage.get("detail") or {}
+                    reason = str(
+                        stage.get("error")
+                        or (detail.get("error")
+                            if isinstance(detail, dict) else "")
+                        or (detail.get("reason")
+                            if isinstance(detail, dict) else "")
+                        or "").strip()
+                    if reason:
+                        break
+            return "failed", reason or "生产任务返回失败状态"
+        if result_status in {
+                "paused", "awaiting_script", "awaiting_cast",
+                "awaiting_confirm", "queued_script", "created", "stopped"}:
+            return result_status, ""
+        return "done", ""
 
     def _hydrate_jobs(self):
         """Restore visible task facts; Python closures are never replayed."""
@@ -882,11 +936,20 @@ class JobRegistry:
             follow_up = None
             try:
                 summary = task(app)
+                outcome_status, summary_error = self._summary_job_outcome(
+                    summary)
+                durable_status = (
+                    "failed" if outcome_status == "failed" else "done")
                 with self._lock:
                     self._jobs[job_id].update(
-                        status="done", summary=summary,
+                        status=durable_status, outcome_status=outcome_status,
+                        summary=summary,
                         finished_at=time.time())
-                self._persist_job_state(job_id, "done", result=summary)
+                    if summary_error:
+                        self._jobs[job_id]["error"] = summary_error
+                self._persist_job_state(
+                    job_id, durable_status, result=summary,
+                    error=summary_error or None)
                 app.history.finish_run(
                     self._jobs[job_id]["run_id"], summary=summary)
                 if isinstance(summary, dict) and summary.get("status") == "done":
@@ -1177,12 +1240,24 @@ def _selection_mode_present_item(item):
     best_effort = (
         category == "shot_image"
         and _selection_mode_best_effort_promoted(item))
+    legacy_reused = (
+        category == "shot_image"
+        and status == "reused"
+        and technical_output
+        and not item.get("invalidated_previous_output")
+        and not item.get("contract_recheck"))
     # 正式资产是否存在由 progress 的资产中心校验负责；这里不能因为旧
     # 清单漏写 output_uri 而抹掉已落盘的 AI 选优凭证。
-    if has_selection or best_effort:
+    if has_selection or best_effort or legacy_reused:
         if status not in {"done", "reused"}:
             item["status"] = "done"
         item["nonblocking_risk"] = True
+        if legacy_reused and not (has_selection or best_effort):
+            # 兼容四抽选优上线前已晋升进资产中心的正式图。旧清单没有
+            # candidate_group.selection，但 reused + 未失效技术产物仍是
+            # 明确的正式复用事实，不能把整集倒退成“待四抽”。最终是否真有
+            # 正式资产仍由 _production_progress 的资产中心核验决定。
+            item["legacy_formal_reuse"] = True
         item.pop("automatic_repair", None)
         return item
 
@@ -2123,7 +2198,11 @@ def _production_progress(app, episode, render_plan):
                 # 不能重新把产线变回阻断式。
                 return (
                     _candidate_group_current_selection(item) is not None
-                    or _selection_mode_best_effort_promoted(item))
+                    or _selection_mode_best_effort_promoted(item)
+                    or (
+                        str(item.get("status") or "") == "reused"
+                        and not item.get("invalidated_previous_output")
+                        and not item.get("contract_recheck")))
             return not (
                 item.get("invalidated_previous_output")
                 or item.get("contract_recheck"))
@@ -2371,6 +2450,99 @@ def _production_progress(app, episode, render_plan):
     }
 
 
+def _failure_reason_from_payload(value):
+    """Extract one concise failure reason from stored task/run JSON."""
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return ""
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return _safe_diagnostic_text(raw, limit=600)
+        return _failure_reason_from_payload(parsed)
+    if isinstance(value, list):
+        for row in reversed(value):
+            reason = _failure_reason_from_payload(row)
+            if reason:
+                return reason
+        return ""
+    if not isinstance(value, dict):
+        return ""
+    for key in ("error", "reason", "message", "summary"):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return _safe_diagnostic_text(candidate, limit=600)
+    for key in ("detail", "failure", "result"):
+        reason = _failure_reason_from_payload(value.get(key))
+        if reason:
+            return reason
+    for key in ("stages", "gates", "issues"):
+        rows = value.get(key)
+        if not isinstance(rows, list):
+            continue
+        failed_rows = [
+            row for row in rows if isinstance(row, dict)
+            and (str(row.get("status") or "").lower() in {
+                "failed", "qc_failed"} or row.get("passed") is False)]
+        reason = _failure_reason_from_payload(failed_rows or rows)
+        if reason:
+            return reason
+    return ""
+
+
+def _latest_production_failure(app, episode_id):
+    """Return the latest run's real failed stage, never stale plan metadata."""
+    # Single-image redraw/QC/settings jobs also create production_runs rows.
+    # They must neither masquerade as a whole-pipeline failure nor hide the
+    # latest actual production run merely because they finished afterwards.
+    guidance_actions = tuple(sorted(
+        PRODUCTION_ACTIONS - {"regenerate_shot_candidates"}))
+    placeholders = ",".join("?" for _ in guidance_actions)
+    run = app.db.query_one(
+        "SELECT id, action, status, last_stage, error, summary, updated_at "
+        f"FROM production_runs WHERE episode_id=? AND action IN "
+        f"({placeholders}) ORDER BY id DESC LIMIT 1",
+        (int(episode_id), *guidance_actions))
+    if run is None or str(run["status"] or "") != "failed":
+        return None
+    task = app.db.query_one(
+        "SELECT stage, name, error, result, updated_at FROM tasks "
+        "WHERE run_id=? AND status='failed' ORDER BY id DESC LIMIT 1",
+        (int(run["id"]),))
+    stage = str(
+        (task["stage"] if task is not None else "")
+        or run["last_stage"] or "production")
+    labels = {
+        "script": "剧本与制作圣经", "continuity": "连续性圣经",
+        "cast": "人物/场景资产", "storyboard": "五维分镜",
+        "blocking": "空间调度", "images": "关键帧",
+        "text_assets": "文字资产", "frames": "首尾帧",
+        "preflight": "生产门禁", "videos": "Seedance 视频",
+        "voices": "配音与口型", "edit": "剪辑", "qc": "成片质检",
+        "package": "交付包装", "production": "生产",
+    }
+    reason = ""
+    if task is not None:
+        reason = (
+            _failure_reason_from_payload(task["error"])
+            or _failure_reason_from_payload(task["result"]))
+    reason = (
+        reason or _failure_reason_from_payload(run["error"])
+        or _failure_reason_from_payload(run["summary"])
+        or f"{labels.get(stage, stage)}未通过，系统已停止继续消耗额度。")
+    return {
+        "run_id": int(run["id"]),
+        "stage": stage,
+        "stage_label": labels.get(stage, stage),
+        "reason": reason,
+        "action": str(run["action"] or "produce"),
+        "updated_at": (
+            float(task["updated_at"] or 0)
+            if task is not None else float(run["updated_at"] or 0)),
+    }
+
+
 def _production_guidance(app, episode, storyboard, render_plan, progress):
     """根据正式资产门禁给出下一步，而不是照抄可能过期的 episode.status。
 
@@ -2486,7 +2658,11 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
                 if category == "shot_image":
                     return (
                         _candidate_group_current_selection(item) is not None
-                        or _selection_mode_best_effort_promoted(item))
+                        or _selection_mode_best_effort_promoted(item)
+                        or (
+                            str(item.get("status") or "") == "reused"
+                            and not item.get("invalidated_previous_output")
+                            and not item.get("contract_recheck")))
                 return not (
                     item.get("invalidated_previous_output")
                     or item.get("contract_recheck"))
@@ -2871,6 +3047,38 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
             f"复核 {len(review_issues)} 个可放行关键帧"
             if issue_count else "没有待处理的问题关键帧"),
     }
+    latest_failure = (
+        None if live_run else _latest_production_failure(
+            app, int(episode["id"])))
+    recovery = {
+        "action": "resume_from_checkpoint",
+        "enabled": bool(latest_failure),
+        "label": "从断点自动修复并继续",
+        "detail": (
+            "保留已晋升正式资产；先修复失败阶段，再仅重跑其下游。"
+            if latest_failure else ""),
+    }
+    if latest_failure:
+        # 最新运行事实优先级高于 render_plan。候选组可能来自更早的批次，
+        # 绝不能用“待四抽/待选片”盖住本次真正的门禁失败。
+        resume_pending_images["enabled"] = False
+        resolve_image_issues["enabled"] = False
+        blockers.insert(0, {
+            "code": "latest_run_failed",
+            "stage": latest_failure["stage"],
+            "count": 1,
+            "message": latest_failure["reason"],
+        })
+        state = "failed"
+        phase = latest_failure["stage"]
+        current_step_label = latest_failure["stage_label"]
+        headline = f"上次生产在「{current_step_label}」失败"
+        reason = latest_failure["reason"]
+        next_action = {
+            "action": recovery["action"],
+            "label": recovery["label"],
+            "count": 1,
+        }
     return {
         "state": state,
         "phase": phase,
@@ -2882,7 +3090,9 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
         "next_actions": {
             "resume_pending_images": resume_pending_images,
             "resolve_image_issues": resolve_image_issues,
+            "recovery": recovery,
         },
+        "failure": latest_failure,
         "blockers": blockers,
         "issues": issue_details,
         "actions": {
@@ -2892,10 +3102,13 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
             "resolve_image_issues": {
                 **resolve_image_issues,
             },
+            "recovery": recovery,
         },
-        "can_start_frames": keyframes_ready,
-        "can_start_videos": keyframes_ready and frames_ready,
-        "can_confirm_seedance": keyframes_ready and frames_ready,
+        "can_start_frames": keyframes_ready and not latest_failure,
+        "can_start_videos": (
+            keyframes_ready and frames_ready and not latest_failure),
+        "can_confirm_seedance": (
+            keyframes_ready and frames_ready and not latest_failure),
         "stages": {
             "keyframes": keyframes,
             "frames": frames,

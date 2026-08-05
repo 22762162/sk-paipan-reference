@@ -54,6 +54,15 @@ def test_shot_candidate_statuses_and_ai_auto_selection_rendering_are_present():
     assert 'item.status === "technical_incomplete");' in JS
 
 
+def test_failed_stage_guidance_is_visible_and_has_checkpoint_recovery_action():
+    assert "真实失败阶段 · ${esc(guidance.failure.stage_label" in JS
+    assert "已结束，不是仍在生成" in JS
+    assert "data-guidance-recover" in JS
+    assert "resumeProductionFromGuidance" in JS
+    assert "从断点自动修复并继续" in JS
+    assert "保留已完成资产，只重跑失败阶段及其下游" in JS
+
+
 def test_candidate_round_progress_is_four_per_round_and_legacy_three_is_ignored():
     helper = JS[
         JS.index("function shotCandidateGroup"):

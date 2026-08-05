@@ -2798,7 +2798,7 @@ def frame_content_qc_accepted(frame):
 
 def build_preflight(script, storyboard, continuity, text_manifest, frames,
                     profile, blocking=None, quality_policy=None,
-                    character_assets=None):
+                    character_assets=None, scene_models=None):
     shots = storyboard.get("shots", [])
     rules = profile.get("rules", {})
     production_rules = rules.get("production", {})
@@ -2974,14 +2974,35 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
     threshold = storyboard_rules.get(
         "spatial_blocking_required_for_group", 3)
     expected_blocking = build_spatial_plan(
-        script, storyboard, continuity, group_threshold=threshold)
+        script, storyboard, continuity, group_threshold=threshold,
+        scene_models=scene_models)
     if blocking is None:
         blocking = expected_blocking
     mark_spatial_reference_requirements(blocking)
     spatial_validation = validate_spatial_plan(blocking, storyboard)
+    stored_spatial_validation = (
+        blocking.get("validation")
+        if isinstance(blocking.get("validation"), dict) else {})
+    scene_physics_issues = [
+        issue for issue in (
+            stored_spatial_validation.get("scene_physics_issues") or [])
+        if isinstance(issue, dict)
+        and str(issue.get("severity") or "").lower() == "block"
+    ]
+    # ``validate_spatial_plan`` covers the editable actor/camera topology, but
+    # it deliberately knows nothing about the real scene-model boxes attached
+    # by Director._attach_scene_physics.  Do not let a fresh topology pass hide
+    # a missing/stale 3D set, furniture collision or camera occlusion already
+    # recorded on the authoritative blocking document.
+    stored_scene_physics_ok = (
+        stored_spatial_validation.get("scene_physics_passed", True) is not False
+        and stored_spatial_validation.get("passed", True) is not False
+        and not scene_physics_issues
+    )
     spatial_ok = (spatial_validation["passed"]
                   and (blocking.get("source_fingerprint")
-                       == expected_blocking.get("source_fingerprint")))
+                       == expected_blocking.get("source_fingerprint"))
+                  and stored_scene_physics_ok)
     spatial_required = [
         block for block in (blocking.get("shot_index") or {}).values()
         if requires_spatial_reference(block)]
@@ -3046,7 +3067,12 @@ def build_preflight(script, storyboard, continuity, text_manifest, frames,
         _gate("spatial", "空间调度图", spatial_ok,
               f"{blocking.get('summary', {}).get('scenes', 0)} 场 / "
               f"{blocking.get('summary', {}).get('shots', 0)} 镜已锁定人物走位、"
-              "机位、视锥与屏幕轴线"),
+              "机位、视锥与屏幕轴线"
+              + ("；真实三维搭景问题：" + "；".join(
+                    str(issue.get("message") or issue.get("field") or
+                        "未说明的空间碰撞")
+                    for issue in scene_physics_issues[:3])
+                 if scene_physics_issues else "")),
         _gate(
             "spatial_seedance", "Seedance 空间参考图",
             spatial_references_ok,

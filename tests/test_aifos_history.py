@@ -115,6 +115,90 @@ def test_job_registry_hydrates_durable_completed_job_after_restart(tmp_path):
         app.close()
 
 
+def test_job_registry_maps_returned_failure_and_checkpoint_summaries(tmp_path):
+    """正常 return 不代表成功；业务失败/检查点不能被外层统一写成 done。"""
+    ws = tmp_path / "ws"
+    seed = App(ws)
+    project, _ = seed.projects.get_or_create_project("作业终态剧")
+    seed.projects.get_or_create_episode(project["id"], 1)
+    seed.close()
+    registry = JobRegistry(ws)
+
+    failed_id = registry.start_task(
+        "作业终态剧", 1,
+        lambda _app, _run_id: {
+            "status": "failed",
+            "stages": [{
+                "stage": "preflight", "status": "failed",
+                "error": "空间调度指纹不一致",
+            }],
+        }, action="produce")
+    for _ in range(200):
+        if registry.get(failed_id)["status"] == "failed":
+            break
+        time.sleep(0.01)
+    failed = registry.get(failed_id)
+    assert failed["status"] == "failed"
+    assert failed["error"] == "空间调度指纹不一致"
+    assert registry._job_center.get(failed_id)["status"] == "failed"
+    assert registry._history_center.get(failed["run_id"])["status"] == "failed"
+
+    checkpoint_id = registry.start_task(
+        "作业终态剧", 1,
+        lambda _app, _run_id: {"status": "awaiting_confirm"},
+        action="produce")
+    for _ in range(200):
+        if registry.get(checkpoint_id)["status"] != "running":
+            break
+        time.sleep(0.01)
+    assert registry.get(checkpoint_id)["status"] == "done"
+    assert registry.get(checkpoint_id)["outcome_status"] == "awaiting_confirm"
+    # Ledger 使用其受支持的成功终态，但 Web hydration 必须恢复业务检查点。
+    assert registry._job_center.get(checkpoint_id)["status"] == "done"
+    reopened = JobRegistry(ws)
+    assert reopened.get(checkpoint_id)["status"] == "done"
+    assert reopened.get(checkpoint_id)["outcome_status"] == "awaiting_confirm"
+    assert reopened._history_center.get(
+        registry.get(checkpoint_id)["run_id"])["status"] == "paused"
+    registry._lease_stop.set()
+    reopened._lease_stop.set()
+
+
+def test_hydrates_legacy_done_job_whose_summary_says_failed(tmp_path):
+    """升级前 ledger=done/summary=failed 的记录对外必须恢复为失败。"""
+    ws = tmp_path / "ws"
+    app = App(ws)
+    try:
+        project, _ = app.projects.get_or_create_project("旧假完成任务剧")
+        episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+        run_id = app.history.create_run(
+            "旧假完成任务剧", 1, action="produce")
+        center = JobCenter(app.db)
+        center.create(
+            "j1", run_id=run_id, episode_id=episode["id"],
+            action="produce", status="running",
+            request={"title": "旧假完成任务剧", "episode": 1})
+        center.set_state("j1", "done", result={
+            "status": "failed",
+            "stages": [{
+                "stage": "preflight", "status": "failed",
+                "error": "生产门禁未通过：空间调度",
+            }],
+        })
+    finally:
+        app.close()
+
+    registry = JobRegistry(ws)
+    restored = registry.get("j1")
+    assert restored["status"] == "failed"
+    assert restored["outcome_status"] == "failed"
+    assert restored["error"] == "生产门禁未通过：空间调度"
+    assert restored["summary"]["status"] == "failed"
+    # 这是只读兼容映射；不篡改旧 ledger，后续历史审计仍能看见原事实。
+    assert registry._job_center.get("j1")["status"] == "done"
+    registry._lease_stop.set()
+
+
 def test_job_registry_keeps_interrupted_job_visible_without_replaying(tmp_path):
     ws = tmp_path / "ws"
     app = App(ws)

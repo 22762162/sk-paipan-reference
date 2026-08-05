@@ -4761,6 +4761,10 @@ function productionGuidanceModel(data) {
     || raw.actions?.pending_images || {};
   const issueSource = raw.next_actions?.resolve_image_issues
     || raw.actions?.resolve_image_issues || {};
+  const recoverySource = raw.next_actions?.recovery
+    || raw.actions?.recovery || {};
+  const failure = raw.failure && typeof raw.failure === "object"
+    ? raw.failure : null;
   const pendingShotNos = (pendingSource.shot_nos || plan
     .filter((item) => item.category === "shot_image" && item.status === "pending")
     .map((item) => Number(item.shot_no)).filter(Number.isFinite));
@@ -4853,6 +4857,7 @@ function productionGuidanceModel(data) {
   return {
     state, phase, currentLabel, headline, reason,
     nextAction: raw.next_action || {},
+    failure,
     blockers: raw.blockers || [],
     canStartFrames: staleKeyframeGate ? keyframes.remaining === 0
       : (raw.can_start_frames ?? keyframes.remaining === 0),
@@ -4885,6 +4890,12 @@ function productionGuidanceModel(data) {
         label: issueSource.label
           || `处理 ${issueCount} 张问题图`,
       },
+      recovery: {
+        enabled: !!recoverySource.enabled,
+        label: recoverySource.label || "从断点自动修复并继续",
+        detail: recoverySource.detail
+          || "保留已完成资产，只重跑失败阶段及其下游。",
+      },
     },
     progress,
   };
@@ -4904,6 +4915,7 @@ function productionProgressPanelHtml(data) {
       + ` · 可用 ${currentStage.usable}/${currentStage.total}` : "";
   const pendingAction = guidance.actions.pendingImages;
   const issueAction = guidance.actions.resolveIssues;
+  const recoveryAction = guidance.actions.recovery;
   const stageIcon = (status) => status === "complete" ? "✓"
     : status === "active" ? "●" : status === "attention" ? "!"
       : status === "blocked" ? "🔒" : "○";
@@ -4924,7 +4936,11 @@ function productionProgressPanelHtml(data) {
       </div>
     </div>
     <div class="production-guidance-reason">
-      <b>为什么停在这里</b><p>${esc(guidance.reason)}</p>
+      <b>${guidance.failure
+        ? `真实失败阶段 · ${esc(guidance.failure.stage_label || guidance.currentLabel)}`
+        : "为什么停在这里"}</b><p>${esc(guidance.reason)}</p>
+      ${guidance.failure ? `<small>运行 #${esc(guidance.failure.run_id)} 已结束，不是仍在生成；
+        请用下方“从断点自动修复并继续”，不要等待页面自行恢复。</small>` : ""}
     </div>
     <ol class="production-stage-chain" aria-label="生产阶段链">
       ${guidance.stages.map((stage, index) => `<li class="stage-${stage.status}">
@@ -4949,10 +4965,12 @@ function productionProgressPanelHtml(data) {
       ? `<div class="production-stage-note"><b>首尾帧运行方式</b><span>${
         esc(guidance.stages.find((stage) => stage.key === "frames").note)}</span></div>`
       : ""}
-    ${(pendingAction.enabled || issueAction.enabled) ? `<div class="production-guidance-next">
+    ${(pendingAction.enabled || issueAction.enabled || recoveryAction.enabled) ? `<div class="production-guidance-next">
       <div><small>建议下一步</small><b>${esc(guidance.nextAction.label
         || (pendingAction.enabled ? pendingAction.label : issueAction.label))}</b></div>
       <div class="production-guidance-actions">
+        ${recoveryAction.enabled ? `<button type="button" class="primary"
+          data-guidance-recover>▶ ${esc(recoveryAction.label)}</button>` : ""}
         ${pendingAction.enabled ? `<button type="button" class="primary"
           data-guidance-resume data-pending-count="${pendingAction.count}">
           ▶ ${esc(pendingAction.label)}</button>` : ""}
@@ -4960,7 +4978,9 @@ function productionProgressPanelHtml(data) {
           data-guidance-issues data-first-shot="${issueAction.shotNos[0] || ""}">
           ⚠ ${esc(issueAction.label)}</button>` : ""}
       </div>
-      <small class="production-guidance-safety">只补缺失项；不会误触 Seedance，也不会重做已通过图片。</small>
+      <small class="production-guidance-safety">${esc(recoveryAction.enabled
+        ? recoveryAction.detail
+        : "只补缺失项；不会误触 Seedance，也不会重做已通过图片。")}</small>
     </div>` : ""}
     <div class="production-progress-active">
       <b>${progress.active ? `正在处理 ${progress.activeCount} 项`
@@ -5451,6 +5471,27 @@ async function submitPendingKeyframes(data, episodeId, button) {
   }
 }
 
+async function resumeProductionFromGuidance(data, episodeId, button) {
+  button.disabled = true;
+  button.textContent = "正在提交断点修复…";
+  try {
+    await api("/api/produce", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title: data.project.title,
+        episode: Number(data.episode.number),
+        force: false,
+      }),
+    });
+    showToast("已从失败断点继续：保留正式资产，只修复失败阶段及下游", "ok");
+    pollCanvas(episodeId);
+  } catch (error) {
+    showToast(`断点恢复失败：${error.message}`, "error");
+    button.disabled = false;
+    button.textContent = `▶ ${productionGuidanceModel(data).actions.recovery.label}`;
+  }
+}
+
 function bindProductionLedger(root, data, episodeId) {
   if (!root) return;
   root.querySelectorAll("[data-open-production-audit]").forEach((button) => {
@@ -5467,6 +5508,12 @@ function bindProductionLedger(root, data, episodeId) {
       event.currentTarget,
       `补齐 ${Number(event.currentTarget.dataset.pendingCount || 0)} 张`,
       () => submitPendingKeyframes(data, episodeId, event.currentTarget));
+  });
+  root.querySelectorAll("[data-guidance-recover]").forEach((button) => {
+    button.onclick = (event) => armConfirm(
+      event.currentTarget, "从断点自动修复并继续",
+      () => resumeProductionFromGuidance(
+        data, episodeId, event.currentTarget));
   });
   root.querySelectorAll("[data-guidance-issues]").forEach((button) => {
     button.onclick = () => {

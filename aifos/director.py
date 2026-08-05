@@ -1779,8 +1779,15 @@ class Director:
             location=self._shot_location(ctx.get("script"), shot),
             style=ctx["project"].get("style", "") or "",
         )
-        self.projects.save_document(
+        storyboard_version = self.projects.save_document(
             ctx["episode"]["id"], "storyboard", ctx["storyboard"])
+        ctx["storyboard_version"] = storyboard_version
+        # Several blocked tasks may be repaired during the same prompt-review
+        # pass.  Record only shot numbers here; _run_parallel performs one
+        # blocking rebuild after all repairs have been collected and before
+        # any real image request is dispatched.
+        ctx.setdefault("_blocked_prompt_spatial_repairs", set()).add(
+            shot_no)
         payload = self._shot_payload(ctx, shot)
         for key in ("_codex_profile", "_prompt_review_profile"):
             if task["payload"].get(key):
@@ -9997,6 +10004,10 @@ class Director:
                 repair = self._auto_repair_prompt_review_block(
                     ctx, task, exc)
                 if repair:
+                    refreshed, _changed = \
+                        self._refresh_runtime_spatial_repairs(
+                            ctx, [task], existing_tasks_only=True)
+                    task = refreshed[0]
                     current = task.get("payload") or {}
                     self._plan_mark(
                         ctx, task["item_id"], "generating",
@@ -10043,6 +10054,9 @@ class Director:
                     result, critical_error)
                 critical_error = self._critical_qc_error(result)
                 break
+            refreshed, _changed = self._refresh_runtime_spatial_repairs(
+                ctx, [task], existing_tasks_only=True)
+            task = refreshed[0]
             self._plan_mark(
                 ctx, task["item_id"], "generating",
                 extra={**generating_extra,
@@ -10084,6 +10098,10 @@ class Director:
                         self._auto_repair_prompt_review_block(
                             ctx, task, exc)
                     if review_repair:
+                        refreshed, _changed = \
+                            self._refresh_runtime_spatial_repairs(
+                                ctx, [task], existing_tasks_only=True)
+                        task = refreshed[0]
                         current = task.get("payload") or {}
                         self._plan_mark(
                             ctx, task["item_id"], "generating",
@@ -10221,6 +10239,220 @@ class Director:
             task["worker"] = f"codex:{profile['id']}"
         return tasks
 
+    def _refresh_repaired_image_tasks_before_dispatch(
+            self, ctx, tasks, *, existing_tasks_only=False):
+        """Batch-refresh spatial contracts after prompt-block repairs.
+
+        A repaired shot can move its camera/actors and therefore changes both
+        its own blocking and the inherited start state of later shots in the
+        same scene.  Collect every repair first, rebuild blocking once, then
+        replace only affected task payloads before dispatch.  Completed shots
+        in unrelated scenes remain untouched.
+        """
+        if not any(
+                task.get("capability") == "image"
+                and str(task.get("item_id") or "").startswith("shot:")
+                for task in tasks):
+            return tasks
+        repaired = {
+            int(value) for value in ctx.pop(
+                "_blocked_prompt_spatial_repairs", set())
+            if str(value).lstrip("-").isdigit()
+        }
+        if not repaired:
+            return tasks
+        active_storyboard = self._active_storyboard(ctx)
+        active_shots = list(active_storyboard.get("shots") or [])
+        position = {
+            int(shot.get("shot_no") or -1): index
+            for index, shot in enumerate(active_shots)
+            if isinstance(shot, dict)
+        }
+        affected = set()
+        for shot_no in repaired:
+            start_index = position.get(shot_no)
+            if start_index is None:
+                continue
+            scene_no = active_shots[start_index].get("scene_no")
+            affected.update(
+                int(shot.get("shot_no") or -1)
+                for shot in active_shots[start_index:]
+                if shot.get("scene_no") == scene_no)
+        affected.discard(-1)
+        if not affected:
+            return tasks
+
+        refresh = self._refresh_final_blocking_contract(
+            ctx, active_storyboard)
+        # Refresh the durable image/frame ledgers from the new spatial facts.
+        # _plan_seed_shots preserves same-content completed items, so unrelated
+        # scenes and already valid outputs are not cleared.
+        self._plan_seed_shots(ctx)
+
+        task_by_shot = {
+            int(task.get("tag")): task for task in tasks
+            if task.get("capability") == "image"
+            and str(task.get("item_id") or "").startswith("shot:")
+        }
+        if existing_tasks_only:
+            # The serial executor owns only its current task.  A runtime
+            # repair must refresh that task before retrying, but it must not
+            # manufacture the rest of the scene inside _run_one_task; the
+            # outer stage remains responsible for those tasks.
+            affected.intersection_update(task_by_shot)
+            if not affected:
+                return tasks
+        shot_by_no = {
+            int(shot.get("shot_no") or -1): shot for shot in active_shots}
+        first_by_scene = {}
+        for shot in active_shots:
+            first_by_scene.setdefault(
+                shot.get("scene_no"), int(shot.get("shot_no") or -1))
+        runtime_keys = (
+            "_codex_profile", "_prompt_review_profile",
+            "_candidate_generation_round", "_candidate_round_history",
+            "_candidate_best_provisional", "_initial_candidate_set_id",
+            "_autonomous_repair_seeded", "_auto_repair_batches_used",
+            "_codex_contract_repair_count", "qc_consecutive_failures_base",
+            "_last_repair_instruction", "_last_repair_issues",
+            "_pre_generation_contract_repairs_used",
+            "prompt_conflict_resolution", "qc_reference_changes",
+            "strict_provider", "model_override", "require_reference_images",
+        )
+        refreshed_tasks = []
+        for shot_no in sorted(affected, key=position.get):
+            shot = shot_by_no[shot_no]
+            task = task_by_shot.get(shot_no)
+            old_payload = copy.deepcopy(
+                (task or {}).get("payload") or {})
+            payload = self._shot_payload(ctx, shot)
+            for key in runtime_keys:
+                if key in old_payload:
+                    payload[key] = copy.deepcopy(old_payload[key])
+            try:
+                old_contract_revision = int(
+                    old_payload.get("_contract_revision") or 0)
+                old_candidate_revision = int(
+                    old_payload.get("_candidate_revision") or 0)
+            except (TypeError, ValueError):
+                old_contract_revision = old_candidate_revision = 0
+            payload["_contract_revision"] = max(
+                int(payload.get("_contract_revision") or 1),
+                old_contract_revision + 1)
+            payload["_candidate_revision"] = max(
+                1, old_candidate_revision + 1)
+
+            qc_spec = self._shot_qc_spec(ctx, payload)
+            if old_payload.get("_repair_static_contract_replaced"):
+                payload, qc_spec = self._replace_repair_static_contract(
+                    payload, qc_spec,
+                    str(old_payload.get("action") or ""),
+                    conflict_context="空间调度已按最终分镜重建")
+            if (old_payload.get("director_autonomy_mode")
+                    or old_payload.get("_repair_static_contract_replaced")
+                    or self._director_autonomy_enabled()):
+                payload["director_autonomy_mode"] = True
+            else:
+                payload.pop("director_autonomy_mode", None)
+            # A prompt review performed before this rebuild audited the old
+            # spatial reference.  Keep it only as history; the next real image
+            # call must review the newly compiled blocking/reference input.
+            previous_review = copy.deepcopy(old_payload.get("prompt_review"))
+            if previous_review:
+                payload["previous_prompt_review"] = previous_review
+            payload.pop("prompt_review", None)
+            payload.pop("_prompt_review_frozen_input_hash", None)
+            self._attach_reference_manifest(payload)
+
+            if task is None:
+                task = {
+                    "item_id": f"shot:{shot_no}",
+                    "capability": "image", "sub_dir": "images",
+                    "tag": shot_no,
+                    "priority": self._shot_priority(
+                        shot, first_by_scene.get(shot.get("scene_no"))
+                        == shot_no),
+                }
+                tasks.append(task)
+                task_by_shot[shot_no] = task
+            task["payload"] = payload
+            task["_spatial_contract_revision"] = int(
+                payload.get("_contract_revision") or 1)
+            task["qc_spec"] = qc_spec
+            task["on_success"] = (
+                lambda result, current_shot=shot,
+                current_quality=copy.deepcopy(
+                    payload["quality_decision"]),
+                current_payload=payload:
+                self._register_completed_shot_result(
+                    ctx, current_shot, current_quality, result,
+                    payload=current_payload))
+            refreshed_tasks.append(task)
+
+        # A reused image in the affected chain is no longer current; remove it
+        # only from this run's in-memory selection so the rebuilt task replaces
+        # it.  The versioned asset/file stays preserved for audit history.
+        ctx["images"] = [
+            image for image in (ctx.get("images") or [])
+            if int(image.get("shot_no") or -1) not in affected]
+
+        with _PLAN_IO_LOCK:
+            plan = self._plan_read(ctx)
+            by_id = {item.get("id"): item for item in plan.get("items", [])}
+            for task in refreshed_tasks:
+                shot_no = int(task["tag"])
+                shot = shot_by_no[shot_no]
+                payload = task["payload"]
+                item = by_id.get(task["item_id"])
+                if not isinstance(item, dict):
+                    continue
+                item["prompt"] = str(
+                    payload.get("prompt_compact")
+                    or payload.get("prompt") or "")
+                item["content_hash"] = self._shot_content_hash(
+                    shot, payload)
+                item["status"] = "pending"
+                item["error"] = ""
+                item["spatial_contract_refreshed"] = True
+            self._plan_write(ctx, plan)
+        self.log.info(
+            "director",
+            f"提示词修订已批量收敛空间合同：{len(repaired)} 个修订镜头，"
+            f"刷新 {len(affected)} 个本镜/同场后续镜；blocking "
+            + ("已重建" if refresh.get("refreshed") else "已确认一致"))
+        return tasks
+
+    def _refresh_runtime_spatial_repairs(
+            self, ctx, tasks, *, existing_tasks_only=False):
+        """Refresh an in-flight repair and report exactly which tasks changed.
+
+        The normal pre-dispatch refresh is not enough: Codex can repair a
+        storyboard after a candidate round has already started.  This wrapper
+        versions the refreshed payloads and rebuilds their dispatch contracts
+        so callers can reject late results produced from an older blocking.
+        """
+        before = {
+            str(task.get("item_id") or ""): int(
+                (task.get("payload") or {}).get("_contract_revision") or 0)
+            for task in tasks
+        }
+        tasks = self._refresh_repaired_image_tasks_before_dispatch(
+            ctx, tasks, existing_tasks_only=existing_tasks_only)
+        changed = []
+        for task in tasks:
+            item_id = str(task.get("item_id") or "")
+            revision = int(
+                (task.get("payload") or {}).get("_contract_revision") or 0)
+            if revision > before.get(item_id, -1):
+                task["_spatial_contract_revision"] = revision
+                changed.append(task)
+        if changed:
+            # The original acceleration token describes the pre-repair input.
+            # Re-register the rebuilt prompt/reference contract before another
+            # provider call can claim it.
+            self._prepare_dispatch_contracts(ctx, changed)
+        return tasks, changed
+
     def _video_parallel_workers(self):
         """Seedance 同时生成的镜头数；默认 4 路，避免串行等待。"""
         try:
@@ -10258,6 +10490,13 @@ class Director:
             tasks = [t for t in tasks if id(t) not in blocked_ids]
             if not tasks:
                 return ({}, list(blocked))
+        # Prompt review may have repaired camera/description after the normal
+        # blocking stage.  Collect all such repairs, rebuild blocking once,
+        # and replace affected payloads before acceleration contracts or image
+        # workers can observe a stale spatial reference.
+        tasks = self._refresh_repaired_image_tasks_before_dispatch(
+            ctx, tasks)
+        self._assign_codex_profiles(tasks)
         self._prepare_dispatch_contracts(ctx, tasks)
         tasks = sorted(tasks, key=lambda task: (
             -int(task.get("priority", 0)), str(task.get("item_id", ""))))
@@ -10316,6 +10555,69 @@ class Director:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             iterator = iter(tasks)
             futures = {}
+            started_item_ids = set()
+
+            def _task_contract_revision(current_task):
+                return int((current_task.get("payload") or {}).get(
+                    "_contract_revision") or 0)
+
+            def submit_retry(current_task, generate):
+                """Submit an already-claimed task under its current revision."""
+                self._attach_candidate_progress_reporter(ctx, current_task)
+                payload = current_task.get("payload") or {}
+                revision = _task_contract_revision(current_task)
+                current_task["_spatial_contract_revision"] = revision
+                started_item_ids.add(str(current_task.get("item_id") or ""))
+                future = pool.submit(
+                    generate, current_task["capability"], payload,
+                    ctx["out_root"] / current_task["sub_dir"], cancel,
+                    current_task.get("qc_spec"))
+                futures[future] = (current_task, revision)
+                return future
+
+            def refresh_after_runtime_repair(current_task, generate):
+                """Rebuild blocking, invalidate late results, and requeue."""
+                nonlocal tasks
+                tasks, changed = self._refresh_runtime_spatial_repairs(
+                    ctx, tasks)
+                by_item = {
+                    str(row.get("item_id") or ""): row for row in tasks}
+                item_id = str(current_task.get("item_id") or "")
+                current_task = by_item.get(item_id, current_task)
+                changed_ids = {
+                    str(row.get("item_id") or "") for row in changed}
+                if changed_ids:
+                    for row in changed:
+                        results.pop(row.get("tag"), None)
+                    failures[:] = [
+                        pair for pair in failures
+                        if str(pair[0].get("item_id") or "")
+                        not in changed_ids]
+                    qc_failures[:] = [
+                        pair for pair in qc_failures
+                        if str(pair[0].get("item_id") or "")
+                        not in changed_ids]
+                    inflight_ids = {
+                        str(pair[0].get("item_id") or "")
+                        for pair in futures.values()}
+                    for row in changed:
+                        row_id = str(row.get("item_id") or "")
+                        if row_id == item_id:
+                            submit_retry(row, generate)
+                        elif row_id in inflight_ids:
+                            # Its submitted revision is recorded in futures;
+                            # the late result is discarded and requeued below.
+                            continue
+                        elif row_id in started_item_ids:
+                            submit_retry(
+                                row, self._generate_shot_candidate_group)
+                        # Not-yet-started rows remain in the list iterator and
+                        # will naturally launch with their refreshed payload.
+                else:
+                    # Targeted prompt-only repairs do not change blocking but
+                    # still require another fixed four-candidate round.
+                    submit_retry(current_task, generate)
+                return current_task
 
             def submit_next():
                 while True:
@@ -10324,7 +10626,13 @@ class Director:
                     except StopIteration:
                         return False
                     try:
-                        task = self._claim_dispatch_task(ctx, task)
+                        claimed = self._claim_dispatch_task(ctx, task)
+                        if claimed is not task:
+                            # Keep the canonical task object stored in ``tasks``
+                            # so a later blocking refresh also retains an API
+                            # acceleration provider/model selected at claim.
+                            task.clear()
+                            task.update(claimed)
                     except Exception as exc:
                         is_local = bool(
                             continue_on_qc_failure
@@ -10384,11 +10692,7 @@ class Director:
                         generate = self._generate_shot_candidate_group
                     else:
                         generate = self._generate_image_with_qc
-                    future = pool.submit(
-                        generate, task["capability"], task["payload"],
-                        ctx["out_root"] / task["sub_dir"], cancel,
-                        task.get("qc_spec"))
-                    futures[future] = task
+                    submit_retry(task, generate)
                     return True
 
             for _ in range(min(workers, len(tasks))):
@@ -10397,7 +10701,41 @@ class Director:
                 done_now, _ = wait(set(futures), timeout=2,
                                    return_when=FIRST_COMPLETED)
                 for future in done_now:
-                    task = futures.pop(future)
+                    task, submitted_revision = futures.pop(future)
+                    current_task = next((
+                        row for row in tasks
+                        if str(row.get("item_id") or "")
+                        == str(task.get("item_id") or "")), task)
+                    current_revision = _task_contract_revision(current_task)
+                    if current_revision != submitted_revision:
+                        # Another shot repair rebuilt this scene while this
+                        # provider call was already in flight.  The call may
+                        # have cost money, but its pixels are not eligible for
+                        # promotion under the new spatial contract.
+                        try:
+                            stale_result = future.result()
+                        except Exception:
+                            stale_result = None
+                        if stale_result is not None:
+                            self._task_cost += stale_result.cost
+                            self._task_providers.add(stale_result.provider)
+                            self.projects.add_episode_cost(
+                                ctx["episode"]["id"], stale_result.cost)
+                        self._plan_mark(
+                            ctx, current_task["item_id"], "generating",
+                            extra={
+                                "stale_spatial_result_discarded": True,
+                                "submitted_contract_revision":
+                                    submitted_revision,
+                                "current_contract_revision": current_revision,
+                                "candidate_count":
+                                    self._shot_candidate_count(),
+                            })
+                        submit_retry(
+                            current_task,
+                            self._generate_shot_candidate_group)
+                        continue
+                    task = current_task
                     try:
                         result = future.result()
                     except ProduceCancelled:
@@ -10410,6 +10748,8 @@ class Director:
                         repair = self._auto_repair_prompt_review_block(
                             ctx, task, exc)
                         if repair:
+                            task = refresh_after_runtime_repair(
+                                task, self._generate_shot_candidate_group)
                             payload = task.get("payload") or {}
                             self._plan_mark(
                                 ctx, task["item_id"], "generating",
@@ -10424,12 +10764,6 @@ class Director:
                                         self._shot_candidate_count(),
                                     "prompt_review_block_repaired": True,
                                 })
-                            retry_future = pool.submit(
-                                self._generate_shot_candidate_group,
-                                task["capability"], task["payload"],
-                                ctx["out_root"] / task["sub_dir"],
-                                cancel, task.get("qc_spec"))
-                            futures[retry_future] = task
                             continue
                         is_local = bool(
                             continue_on_qc_failure
@@ -10475,6 +10809,8 @@ class Director:
                         repair = self._auto_apply_codex_escalation(
                             ctx, task, result)
                         if repair:
+                            task = refresh_after_runtime_repair(
+                                task, self._generate_repair_candidate_group)
                             payload = task.get("payload") or {}
                             payload["qc_consecutive_failures_base"] = max(
                                 1, int(((getattr(result, "qc", None) or {})
@@ -10491,12 +10827,6 @@ class Director:
                                     "candidate_count":
                                         self._shot_repair_candidate_count(),
                                 })
-                            retry_future = pool.submit(
-                                self._generate_repair_candidate_group,
-                                task["capability"], task["payload"],
-                                ctx["out_root"] / task["sub_dir"],
-                                cancel, task.get("qc_spec"))
-                            futures[retry_future] = task
                             continue
                         result = self._promote_relative_best_nonblocking(
                             result, critical_error)
@@ -12208,6 +12538,73 @@ class Director:
             "repaired_at": now(),
         }
         return summary or "已修正"
+
+    def _refresh_final_blocking_contract(self, ctx, storyboard):
+        """Make the persisted blocking match the final active storyboard.
+
+        Image-contract repair is intentionally allowed to revise camera and
+        staging language after the normal blocking stage.  The preflight must
+        therefore compare against the *final* storyboard and deterministically
+        rebuild stale blocking before judging it.  This is a contract refresh,
+        not a bypass: real scene boxes and physical validation are attached to
+        the rebuilt plan exactly as they are in :meth:`_stage_blocking`.
+        """
+        storyboard = storyboard if isinstance(storyboard, dict) else {
+            "shots": []}
+        rules = ctx["production_profile"].get("rules", {}).get(
+            "storyboard", {})
+        threshold = int(rules.get(
+            "spatial_blocking_required_for_group", 3))
+        scene_models = self._previz_scene_models(ctx)
+        candidate = build_spatial_plan(
+            ctx["script"], storyboard, ctx["continuity"],
+            group_threshold=threshold, scene_models=scene_models)
+        # Attach before the reuse decision: source_fingerprint intentionally
+        # hashes room dimensions, while scene_model_fingerprint also hashes
+        # furniture boxes.  A table moving inside an unchanged room must
+        # invalidate the previous collision result.
+        self._attach_scene_physics(
+            ctx, candidate, repair_actor_collisions=True)
+        stored = ctx.get("blocking")
+        if not isinstance(stored, dict) or not stored:
+            stored, _version = self.projects.latest_document(
+                ctx["episode"]["id"], "blocking")
+        stale = (
+            not isinstance(stored, dict)
+            or stored.get("source_fingerprint")
+            != candidate.get("source_fingerprint")
+            or stored.get("scene_model_fingerprint")
+            != candidate.get("scene_model_fingerprint")
+            or not (stored.get("validation") or {}).get("passed"))
+        if not stale:
+            ctx["blocking"] = stored
+            return {
+                "refreshed": False,
+                "blocking": stored,
+                "scene_models": scene_models,
+            }
+
+        # Re-run the same hard physical contract as the primary blocking
+        # stage.  Deterministic collision repair may move a camera/actor to the
+        # nearest legal point; any remaining real collision remains a hard
+        # preflight failure through validation.passed.
+        mark_spatial_reference_requirements(candidate)
+        write_spatial_svgs(candidate, ctx["out_root"] / "blocking")
+        write_spatial_reference_pngs(
+            candidate, ctx["out_root"] / "blocking" / "seedance")
+        version = self.projects.save_document(
+            ctx["episode"]["id"], "blocking", candidate)
+        ctx["blocking"] = candidate
+        self.log.info(
+            "director",
+            "最终分镜的空间字段已变化，已在生产门禁前确定性重建"
+            f"空间调度 v{version}；真实三维碰撞与连续性检查保持开启")
+        return {
+            "refreshed": True,
+            "version": version,
+            "blocking": candidate,
+            "scene_models": scene_models,
+        }
 
     def _stage_blocking(self, ctx):
         """五维分镜 → 确定性 3D 空间调度，不消耗任何出图额度。"""
@@ -18878,13 +19275,23 @@ class Director:
 
     def _stage_preflight(self, ctx):
         """确认前硬门禁：任一项未过都不能消耗 Seedance 额度。"""
+        final_storyboard = self._active_storyboard(ctx)
+        blocking_refresh = self._refresh_final_blocking_contract(
+            ctx, final_storyboard)
         report = build_preflight(
-            ctx["script"], self._active_storyboard(ctx), ctx["continuity"],
+            ctx["script"], final_storyboard, ctx["continuity"],
             ctx["text_assets"], ctx["frames"], ctx["production_profile"],
             ctx.get("blocking"), ctx.get("quality_policy"), {
                 "policy": ctx.get("character_asset_policy") or {},
                 "selection": ctx.get("cast_selection") or {},
-            })
+            }, scene_models=blocking_refresh["scene_models"])
+        report["blocking_refresh"] = {
+            "refreshed": bool(blocking_refresh.get("refreshed")),
+            "version": blocking_refresh.get("version"),
+            "source_fingerprint": str(
+                (ctx.get("blocking") or {}).get(
+                    "source_fingerprint") or ""),
+        }
         if self._preview_qc_bypass_enabled():
             # 免检模式只豁免“首尾帧已通过视觉质检”这一项；剧本、人物、
             # 空间、时长、文字、生产规格等非 QC 门禁仍然必须真实通过。

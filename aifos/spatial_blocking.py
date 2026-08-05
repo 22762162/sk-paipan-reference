@@ -233,6 +233,34 @@ def _distance(a, b):
     return math.hypot(a["x"] - b["x"], a["y"] - b["y"])
 
 
+def _same_continuity_position(previous_end, actor):
+    """Compare adjacent-shot positions in world space before canvas pixels.
+
+    Scene-physics repair stores authoritative metre coordinates and then
+    projects them back to the editable 2D canvas.  Floating-point projection
+    can make the same world point round to neighbouring pixels (for example
+    410,295 versus 409,294).  That is not an actor teleport.  Prefer the 3D
+    truth and retain a small 2D tolerance only for legacy plans without metre
+    coordinates.
+    """
+    previous_end = previous_end if isinstance(previous_end, dict) else {}
+    previous_3d = previous_end.get("position_3d")
+    current_3d = actor.get("start_3d")
+    if _point_3d_valid(previous_3d) and _point_3d_valid(current_3d):
+        return math.dist(
+            tuple(float(previous_3d[axis]) for axis in ("x", "y", "z")),
+            tuple(float(current_3d[axis]) for axis in ("x", "y", "z")),
+        ) <= .02
+    previous_2d = previous_end.get("position")
+    current_2d = actor.get("start")
+    if not isinstance(previous_2d, dict) or not isinstance(current_2d, dict):
+        return False
+    try:
+        return _distance(previous_2d, current_2d) <= 2.0
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def _spread_point(preferred, occupied):
     """把同一区域的多人摊开，同时尽量尊重左/中/右站位。"""
     preferred = _point(preferred["x"], preferred["y"])
@@ -1641,9 +1669,13 @@ def validate_spatial_plan(plan, storyboard):
             was_visible_in_previous_shot = (
                 actor.get("name") in previous_visible.get(scene_no, set()))
             if (key in previous and was_visible_in_previous_shot
-                    and actor.get("start") != previous[key]):
+                    and not _same_continuity_position(
+                        previous[key], actor)):
                 issues.append(f"镜头 {shot_no} 的 {actor.get('name')} 起点未继承上一镜终点")
-            previous[key] = actor.get("end")
+            previous[key] = {
+                "position": actor.get("end"),
+                "position_3d": actor.get("end_3d"),
+            }
         previous_visible[scene_no] = set(actual)
         camera = block.get("camera") or {}
         if (not camera.get("start") or not camera.get("end")

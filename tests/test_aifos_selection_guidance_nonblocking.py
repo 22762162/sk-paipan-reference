@@ -7,6 +7,7 @@ import threading
 import pytest
 
 from aifos.app import App
+from aifos.db import now
 from aifos.settings import set_defaults
 from aifos.web.server import serve
 
@@ -15,7 +16,9 @@ from aifos.web.server import serve
 def server_factory(tmp_path):
     servers = []
 
-    def start(*, selection_mode, legacy_only=False):
+    def start(*, selection_mode, legacy_only=False,
+              legacy_status="awaiting_human", failed_stage="",
+              failed_action="produce"):
         workspace = tmp_path / f"ws-{len(servers)}"
         app = App(workspace)
         try:
@@ -48,7 +51,7 @@ def server_factory(tmp_path):
                 "category": "shot_image",
                 "shot_no": legacy_shot,
                 "label": f"镜头 {legacy_shot:02d}",
-                "status": "awaiting_human",
+                "status": legacy_status,
                 # 兼容 API 已净化/旧计划只留下浏览器 URL 的状态；它同样
                 # 代表已有技术产物，不能被误标成 technical_incomplete。
                 ("output_url" if selection_mode else "output_uri"): (
@@ -112,6 +115,26 @@ def server_factory(tmp_path):
                 })
             app.director._plan_write(
                 {"out_root": out_root}, {"items": items})
+            if failed_stage:
+                run_id = app.history.create_run(
+                    "选优状态测试", 1, action=failed_action)
+                stamp = now()
+                reason = "生产门禁未通过：空间调度指纹与当前分镜不一致"
+                app.db.execute(
+                    "INSERT INTO tasks(episode_id, run_id, stage, name, "
+                    "status, error, created_at, updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (episode["id"], run_id, failed_stage, "生产门禁",
+                     "failed", reason, stamp, stamp))
+                app.history.finish_run(run_id, summary={
+                    "project": "选优状态测试", "episode": 1,
+                    "status": "failed",
+                    "stages": [{
+                        "stage": failed_stage, "status": "failed",
+                        "error": reason,
+                    }],
+                })
+                app.projects.set_episode_status(episode["id"], "failed")
             episode_id = int(episode["id"])
         finally:
             app.close()
@@ -229,6 +252,68 @@ def test_selection_mode_api_reports_effective_nonblocking_qc_policy(
     assert payload["failure_blocks_downstream_stage"] is False
     assert payload["limit_behavior"] == (
         "promote_best_with_nonblocking_risk")
+
+
+def test_old_reused_formal_keyframe_without_candidate_selection_stays_usable(
+        server_factory):
+    """四抽上线前的正式复用图没有 selection，也不能整集倒退待重抽。"""
+    port, episode_id = server_factory(
+        selection_mode=True, legacy_only=True, legacy_status="reused")
+
+    detail = _episode(port, episode_id)
+    item = detail["render_plan"]["items"][0]
+    assert item["status"] == "reused"
+    assert item["legacy_formal_reuse"] is True
+    shots = next(
+        stage for stage in detail["production_progress"]["categories"]
+        if stage["category"] == "shot_image")
+    assert shots["usable"] == 1
+    assert shots["pending"] == 0
+    guidance = detail["production_guidance"]
+    assert guidance["stages"]["keyframes"]["usable"] == 1
+    assert guidance["stages"]["keyframes"]["remaining"] == 0
+    assert all(row["code"] != "keyframes_pending"
+               for row in guidance["blockers"])
+
+
+def test_latest_failed_run_overrides_stale_candidate_guidance(server_factory):
+    port, episode_id = server_factory(
+        selection_mode=True, legacy_only=True,
+        legacy_status="awaiting_human", failed_stage="preflight")
+
+    detail = _episode(port, episode_id)
+    guidance = detail["production_guidance"]
+    assert guidance["state"] == "failed"
+    assert guidance["phase"] == "preflight"
+    assert guidance["headline"] == "上次生产在「生产门禁」失败"
+    assert guidance["reason"] == (
+        "生产门禁未通过：空间调度指纹与当前分镜不一致")
+    assert guidance["failure"]["stage"] == "preflight"
+    assert guidance["next_action"] == {
+        "action": "resume_from_checkpoint",
+        "label": "从断点自动修复并继续",
+        "count": 1,
+    }
+    assert guidance["actions"]["recovery"]["enabled"] is True
+    assert guidance["actions"]["pending_images"]["enabled"] is False
+    assert guidance["actions"]["resolve_image_issues"]["enabled"] is False
+    assert guidance["blockers"][0]["code"] == "latest_run_failed"
+    assert guidance["can_start_frames"] is False
+    assert guidance["can_confirm_seedance"] is False
+
+
+def test_failed_adjustment_does_not_masquerade_as_pipeline_failure(
+        server_factory):
+    port, episode_id = server_factory(
+        selection_mode=True, legacy_only=True,
+        legacy_status="awaiting_human", failed_stage="qc",
+        failed_action="qc_all")
+
+    guidance = _episode(port, episode_id)["production_guidance"]
+
+    assert guidance["failure"] is None
+    assert guidance["state"] != "failed"
+    assert guidance["actions"]["recovery"]["enabled"] is False
 
 
 def test_strict_mode_keeps_legacy_manual_qc_gate(server_factory):

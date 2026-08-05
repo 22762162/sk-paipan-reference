@@ -122,6 +122,49 @@ def test_group_scene_builds_routes_camera_and_continuity(tmp_path):
     assert 'data-camera-phase="fixed"' in svg
 
 
+def test_continuity_prefers_world_coordinates_over_canvas_rounding():
+    """A one-pixel reprojection difference must not become a fake teleport."""
+    storyboard = {"shots": [
+        _shot(1, ["甲"], action="甲保持原位"),
+        _shot(2, ["甲"], action="甲继续保持原位"),
+    ]}
+    plan = build_spatial_plan(
+        {"scenes": [{"scene_no": 1, "location": "酒店客房"}]},
+        storyboard,
+        {"characters": [{"name": "甲"}], "scenes": []})
+    first = shot_blocking(plan, 1)["actors"][0]
+    second = shot_blocking(plan, 2)["actors"][0]
+    second["start"] = {
+        "x": first["end"]["x"] - 1,
+        "y": first["end"]["y"] - 1,
+    }
+    second["start_3d"] = dict(first["end_3d"])
+
+    report = validate_spatial_plan(plan, storyboard)
+
+    assert report["passed"], report["issues"]
+
+
+def test_continuity_still_rejects_a_real_world_space_jump():
+    storyboard = {"shots": [
+        _shot(1, ["甲"], action="甲保持原位"),
+        _shot(2, ["甲"], action="甲继保持原位"),
+    ]}
+    plan = build_spatial_plan(
+        {"scenes": [{"scene_no": 1, "location": "酒店客房"}]},
+        storyboard,
+        {"characters": [{"name": "甲"}], "scenes": []})
+    second = shot_blocking(plan, 2)["actors"][0]
+    second["start_3d"] = dict(second["start_3d"], x=(
+        float(second["start_3d"]["x"]) + .5))
+
+    report = validate_spatial_plan(plan, storyboard)
+
+    assert not report["passed"]
+    assert any("起点未继承上一镜终点" in issue
+               for issue in report["issues"])
+
+
 def test_vehicle_blocking_uses_scene_model_room_without_changing_default():
     """Episode 29 镜2回归：车厢不能继续套用 10x7m 通用房间。"""
     location = "轿车内/高速公路"
