@@ -1310,6 +1310,14 @@ class Director:
             if (stage == "cast" and ctx.get("cast_selection_required")):
                 paused = "cast"
                 break
+            # 内容质检失败可以继续四抽返修，但“零张技术可用图”不是
+            # 可被下游忽略的视觉意见。图片通道无额度、超时或落盘失败时，
+            # 必须停留在关键帧技术补位，不能继续让首尾帧按不存在的
+            # shot_no 索引并以 ``KeyError: 1`` 之类的无意义错误结束整集。
+            if (stage == "images"
+                    and ctx.get("shot_candidate_repair_required")):
+                paused = "images_technical"
+                break
             if (stage == "images" and ctx.get("shot_selection_required")):
                 paused = "images"
                 break
@@ -1373,6 +1381,17 @@ class Director:
                 "人物候选已生成，等待逐个选定最终立绘；"
                 "全部锁定前不生成后续图片"
                 f"(episode_id={episode['id']})")
+        elif paused == "images_technical":
+            self.projects.set_episode_status(episode["id"], "paused")
+            missing = sorted(set(
+                int(value) for value in
+                (ctx.get("shot_candidate_repair_shots") or [])))
+            self.log.warn(
+                "director",
+                "关键帧技术补位未完成，已安全停在图片阶段；"
+                "不会进入首尾帧，也不等待手机逐张处理。缺图镜头："
+                + ("、".join(map(str, missing)) if missing else "待对账")
+                + "。恢复可用图片通道后从断点继续，只补缺失镜头")
         elif paused:
             self.projects.set_episode_status(
                 episode["id"], "awaiting_confirm")
@@ -19291,6 +19310,23 @@ class Director:
 
     def _stage_frames_impl(self, ctx):
         images = {i["shot_no"]: i for i in ctx["images"]}
+        active_shots = list(self._active_shots(ctx))
+        missing_keyframes = sorted({
+            int(shot["shot_no"])
+            for shot in active_shots
+            if int(shot["shot_no"]) not in images
+        })
+        if missing_keyframes:
+            for shot_no in missing_keyframes:
+                self._plan_mark(
+                    ctx, f"frames:{shot_no}", "pending",
+                    error=("等待镜头关键帧形成技术可用正式资产；"
+                           "首尾帧尚未调用生图模型"))
+            raise AifosError(
+                "首尾帧未开工：缺少技术可用关键帧（镜头"
+                + "、".join(map(str, missing_keyframes))
+                + "）。已有资产全部保留；恢复可用图片通道后从断点继续，"
+                  "系统只补缺图，不会重复生成已完成镜头")
         ctx["frames"] = []
         reused = 0
         frame_plan = {
@@ -19298,7 +19334,7 @@ class Director:
                 ctx).get("items", [])
             if item.get("category") == "frames"}
         chains = {}
-        for shot in self._active_shots(ctx):
+        for shot in active_shots:
             chains.setdefault(shot.get("scene_no"), []).append(shot)
         chain_list = list(chains.values())
         last_by_scene = {}

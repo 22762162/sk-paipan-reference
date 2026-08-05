@@ -11296,9 +11296,13 @@ async function renderCanvasView(episodeId, forceView = "") {
   const profile = data.production_profile || {};
   const videoDefault = (data.quality_policy || {}).video_default || "auto";
   const gates = data.preflight?.gates || [];
-  const lastFailed = ["failed", "qc_failed"].includes(ep.status)
-    ? [...(data.tasks || [])].reverse().find((t) => t.status === "failed")
+  const lastFailed = productionGuidance.failure
+    ? [...(data.tasks || [])].reverse().find((task) =>
+      task.status === "failed"
+      && task.stage === productionGuidance.failure.stage) || null
     : null;
+  const showFailureBanner = ep.status === "qc_failed"
+    || (ep.status === "failed" && !!productionGuidance.failure);
   const currentImageFailures = storyboardImageFailures(data);
   const firstImageFailure = currentImageFailures[0] || null;
   const hasPlayable = !!data.artifacts?.final
@@ -11312,7 +11316,7 @@ async function renderCanvasView(episodeId, forceView = "") {
   app.innerHTML = `
   <div class="canvas-view">
     ${pausedProductionAccessHtml(pausedProduction)}
-    ${["failed", "qc_failed"].includes(ep.status) ? `
+    ${showFailureBanner ? `
     <div class="confirm-banner fail-banner">
       <div>
         <b>${lastFailed ? `上次制作在「${esc(STAGE_CN[lastFailed.stage] || lastFailed.stage)}」失败 ⚠️`

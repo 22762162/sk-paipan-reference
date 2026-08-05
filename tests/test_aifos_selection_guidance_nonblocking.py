@@ -18,7 +18,8 @@ def server_factory(tmp_path):
 
     def start(*, selection_mode, legacy_only=False,
               legacy_status="awaiting_human", failed_stage="",
-              failed_action="produce"):
+              failed_action="produce", technical_missing=False,
+              failed_reason=""):
         workspace = tmp_path / f"ws-{len(servers)}"
         app = App(workspace)
         try:
@@ -41,11 +42,13 @@ def server_factory(tmp_path):
             image_dir.mkdir(parents=True, exist_ok=True)
 
             legacy_uri = image_dir / "legacy.png"
-            legacy_uri.write_bytes(b"legacy-image")
+            if not technical_missing:
+                legacy_uri.write_bytes(b"legacy-image")
             legacy_shot = 1 if legacy_only else 2
-            app.assets.register(
-                project["id"], "image",
-                f"e001_shot{legacy_shot:03d}", uri=str(legacy_uri))
+            if not technical_missing:
+                app.assets.register(
+                    project["id"], "image",
+                    f"e001_shot{legacy_shot:03d}", uri=str(legacy_uri))
             legacy = {
                 "id": f"shot:{legacy_shot}",
                 "category": "shot_image",
@@ -54,9 +57,6 @@ def server_factory(tmp_path):
                 "status": legacy_status,
                 # 兼容 API 已净化/旧计划只留下浏览器 URL 的状态；它同样
                 # 代表已有技术产物，不能被误标成 technical_incomplete。
-                ("output_url" if selection_mode else "output_uri"): (
-                    "/artifacts/legacy.png"
-                    if selection_mode else str(legacy_uri)),
                 "qc": {
                     "passed": False,
                     "hard_failure": True,
@@ -64,6 +64,17 @@ def server_factory(tmp_path):
                     "issues": ["旧内容判词未过"],
                 },
             }
+            if not technical_missing:
+                legacy[
+                    "output_url" if selection_mode else "output_uri"] = (
+                        "/artifacts/legacy.png"
+                        if selection_mode else str(legacy_uri))
+            if technical_missing:
+                legacy["candidate_group"] = {
+                    "complete": False,
+                    "technical_incomplete": True,
+                    "candidates": [],
+                }
             items = [legacy]
 
             if not legacy_only:
@@ -119,7 +130,8 @@ def server_factory(tmp_path):
                 run_id = app.history.create_run(
                     "选优状态测试", 1, action=failed_action)
                 stamp = now()
-                reason = "生产门禁未通过：空间调度指纹与当前分镜不一致"
+                reason = (failed_reason
+                          or "生产门禁未通过：空间调度指纹与当前分镜不一致")
                 app.db.execute(
                     "INSERT INTO tasks(episode_id, run_id, stage, name, "
                     "status, error, created_at, updated_at) "
@@ -314,6 +326,26 @@ def test_failed_adjustment_does_not_masquerade_as_pipeline_failure(
     assert guidance["failure"] is None
     assert guidance["state"] != "failed"
     assert guidance["actions"]["recovery"]["enabled"] is False
+
+
+def test_legacy_frame_keyerror_yields_to_real_technical_keyframe_gap(
+        server_factory):
+    port, episode_id = server_factory(
+        selection_mode=True, legacy_only=True,
+        legacy_status="technical_incomplete", technical_missing=True,
+        failed_stage="frames", failed_reason="1")
+
+    detail = _episode(port, episode_id)
+    guidance = detail["production_guidance"]
+
+    assert detail["episode"]["status"] == "failed"
+    assert guidance["failure"] is None
+    assert guidance["state"] == "paused"
+    assert guidance["phase"] == "keyframes"
+    assert guidance["actions"]["pending_images"]["enabled"] is True
+    assert guidance["blockers"][0]["code"] == "keyframes_pending"
+    assert "latest_run_failed" not in {
+        blocker["code"] for blocker in guidance["blockers"]}
 
 
 def test_strict_mode_keeps_legacy_manual_qc_gate(server_factory):

@@ -3050,6 +3050,26 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
     latest_failure = (
         None if live_run else _latest_production_failure(
             app, int(episode["id"])))
+    # 旧版本会在零张技术可用关键帧时仍然进入 frames，随后以数字
+    # ``KeyError`` 结束。历史运行事实仍保留在审计表，但当前生产引导
+    # 必须指向更早、也更真实的关键帧技术缺口，不能让“首尾帧失败: 1”
+    # 盖住可恢复的缺图清单。
+    technical_keyframe_gap = any(
+        item.get("category") == "shot_image"
+        and (
+            str(item.get("status") or "") == "technical_incomplete"
+            or bool((item.get("candidate_group") or {}).get(
+                "technical_incomplete"))
+            or bool((item.get("shot_candidate_group") or {}).get(
+                "technical_incomplete"))
+        )
+        for item in plan_items
+    )
+    if (latest_failure and technical_keyframe_gap
+            and latest_failure.get("stage") in {
+                "text_assets", "frames", "preflight", "videos", "voices",
+                "edit", "qc", "package", "archive"}):
+        latest_failure = None
     recovery = {
         "action": "resume_from_checkpoint",
         "enabled": bool(latest_failure),
