@@ -56,6 +56,7 @@ from .quality_policy import (
     set_policy_choices,
 )
 from .camera_language import scene_view_for_camera
+from .continuity_graph import build_keyframe_continuity_plan
 from .lighting_language import lighting_lines
 from .realism_language import realism_lines
 from .prompt_contract import (
@@ -4412,6 +4413,14 @@ class Director:
             if isinstance(item, dict)
             and str(item.get("role") or "") not in derived_reference_roles
         ]
+        for index, item in enumerate(stable_references, 1):
+            # Inserting the exact predecessor before scene/style references
+            # shifts their upload positions.  Position is transport state, not
+            # semantic shot content; renumber after filtering derived refs so
+            # a valid downstream image does not invalidate itself on resume.
+            item["index"] = index
+            if "image_index" in item:
+                item["image_index"] = index
         # The compiled prompt contract contains a second, URI-free copy of
         # the same reference manifest.  Filtering only reference_manifest is
         # insufficient: once a generated keyframe is attached as a
@@ -4432,6 +4441,8 @@ class Director:
             ]
             for index, item in enumerate(contract_references, 1):
                 item["index"] = index
+                if "image_index" in item:
+                    item["image_index"] = index
             if "references" in stable_prompt_contract:
                 stable_prompt_contract["references"] = contract_references
         # prompt_compact is a rendered duplicate of prompt_contract.  Hash it
@@ -10318,6 +10329,9 @@ class Director:
             "_pre_generation_contract_repairs_used",
             "prompt_conflict_resolution", "qc_reference_changes",
             "strict_provider", "model_override", "require_reference_images",
+            "chain_first_uri", "previous_shot_reference_uri",
+            "previous_shot_reference_required", "continuity_dependency",
+            "continuity_group_id",
         )
         refreshed_tasks = []
         for shot_no in sorted(affected, key=position.get):
@@ -10464,7 +10478,8 @@ class Director:
 
     def _run_parallel(self, ctx, tasks, line="出图产线",
                       *, continue_on_qc_failure=False,
-                      isolate_task_failures=False):
+                      isolate_task_failures=False,
+                      preserve_task_scope=False):
         """有界并行出图:只把 worker 数量的任务标为生成中。
 
         多人/文字/场首等高风险镜头可通过 priority 提前；尚未真正开工的
@@ -10495,7 +10510,7 @@ class Director:
         # and replace affected payloads before acceleration contracts or image
         # workers can observe a stale spatial reference.
         tasks = self._refresh_repaired_image_tasks_before_dispatch(
-            ctx, tasks)
+            ctx, tasks, existing_tasks_only=preserve_task_scope)
         self._assign_codex_profiles(tasks)
         self._prepare_dispatch_contracts(ctx, tasks)
         tasks = sorted(tasks, key=lambda task: (
@@ -10579,7 +10594,8 @@ class Director:
                 """Rebuild blocking, invalidate late results, and requeue."""
                 nonlocal tasks
                 tasks, changed = self._refresh_runtime_spatial_repairs(
-                    ctx, tasks)
+                    ctx, tasks,
+                    existing_tasks_only=preserve_task_scope)
                 by_item = {
                     str(row.get("item_id") or ""): row for row in tasks}
                 item_id = str(current_task.get("item_id") or "")
@@ -10675,6 +10691,13 @@ class Director:
                         "codex_contract_repair_count": int(
                             payload.get(
                                 "_codex_contract_repair_count") or 0),
+                        "continuity_group_id": str(
+                            payload.get("continuity_group_id") or ""),
+                        "continuity_predecessor_shot": (
+                            (payload.get("continuity_dependency") or {}).get(
+                                "previous_shot_no")),
+                        "continuity_reference_uri": str(
+                            payload.get("previous_shot_reference_uri") or ""),
                     }
                     if task.get("_codex_profile"):
                         generating_extra["codex_profile"] = task[
@@ -13145,9 +13168,95 @@ class Director:
             "location": location,
             "appearance_state": appearance_state,
         }
+        if ctx.get("fresh_assets") and ctx.get("run_id") is not None:
+            value["fresh_run_id"] = ctx.get("run_id")
+        dependency = copy.deepcopy(
+            (payload or {}).get("continuity_dependency") or {})
+        if dependency:
+            value["continuity_dependency"] = dependency
+            value["continuity_group_id"] = str(
+                (payload or {}).get("continuity_group_id") or "")
         if extra:
             value.update(extra)
         return value
+
+    def _keyframe_continuity_dependency(
+            self, ctx, previous_shot_no, uri=""):
+        """Fingerprint the exact selected upstream keyframe.
+
+        Asset rows use stable human-readable filenames and may be updated in
+        place.  The file digest is therefore part of the dependency token; a
+        regenerated upstream shot invalidates downstream reuse even when its
+        asset id/version/path did not change.
+        """
+        previous_shot_no = int(previous_shot_no or 0)
+        if previous_shot_no <= 0:
+            return {}
+        row = self.assets.latest(
+            ctx["project"]["id"], "image",
+            self._shot_name(ctx, previous_shot_no))
+        selected_uri = str(uri or (row["uri"] if row is not None else ""))
+        if not selected_uri:
+            return {}
+        if (not selected_uri.startswith(("http://", "https://"))
+                and not Path(selected_uri).is_file()):
+            return {}
+        row_meta = self._asset_meta(row) if row is not None else {}
+        digest = str(row_meta.get("file_sha256") or "")
+        if not digest:
+            digest = self._file_sha256(selected_uri)
+        facts = {
+            "previous_shot_no": previous_shot_no,
+            "asset_id": row["id"] if row is not None else None,
+            "asset_version": row["version"] if row is not None else None,
+            "uri": selected_uri,
+            "file_sha256": digest,
+            "fresh_run_id": row_meta.get("fresh_run_id"),
+            "candidate_set_token": row_meta.get("candidate_set_token"),
+            "candidate_revision": row_meta.get("candidate_revision"),
+            "shot_content_hash": row_meta.get("shot_content_hash"),
+        }
+        facts["token"] = self._stable_hash(facts)
+        return facts
+
+    def _continuity_dependency_matches(
+            self, current_row, expected_dependency):
+        if not expected_dependency:
+            return False
+        current = self._asset_meta(current_row).get(
+            "continuity_dependency") if current_row is not None else None
+        return bool(
+            isinstance(current, dict)
+            and current.get("token")
+            and current.get("token") == expected_dependency.get("token"))
+
+    def _bind_keyframe_continuity(
+            self, ctx, task, shot, previous_shot_no, previous_uri,
+            group_id=""):
+        """Attach one exact predecessor without inheriting its camera."""
+        payload = task.get("payload") or {}
+        dependency = self._keyframe_continuity_dependency(
+            ctx, previous_shot_no, previous_uri)
+        if not dependency:
+            return False
+        previous_review = copy.deepcopy(payload.get("prompt_review"))
+        if previous_review:
+            payload["previous_prompt_review"] = previous_review
+        payload.pop("prompt_review", None)
+        payload.pop("_prompt_review_frozen_input_hash", None)
+        payload["chain_first_uri"] = dependency["uri"]
+        payload["previous_shot_reference_uri"] = dependency["uri"]
+        payload["previous_shot_reference_required"] = True
+        payload["continuity_dependency"] = dependency
+        payload["continuity_group_id"] = str(group_id or "")
+        self._attach_reference_manifest(payload)
+        self._append_generation_rules(
+            payload,
+            self._generation_rule_lines(
+                ctx, shot, payload, modality="image"))
+        task["payload"] = payload
+        task["qc_spec"] = self._shot_qc_spec(ctx, payload)
+        return True
 
     @staticmethod
     def _quality_meets(actual, required):
@@ -14905,8 +15014,11 @@ class Director:
                 "character_sheets_per_character": len(sheet_definitions)}
 
     def _scene_locations(self, ctx):
-        return {s["scene_no"]: s["location"]
-                for s in ctx["script"]["scenes"]}
+        return {
+            scene["scene_no"]: scene.get("location", "")
+            for scene in (ctx.get("script") or {}).get("scenes", [])
+            if isinstance(scene, dict) and scene.get("scene_no") is not None
+        }
 
     def _character_reference_uris(self, project_id, name):
         """只取明确关联到该角色的人物/服装参考图。"""
@@ -17220,7 +17332,10 @@ class Director:
                 "mandatory": bool(match.get("mandatory")) or role in {
                     "identity", "identity_detail", "headwear", "wardrobe",
                     "prop", "spatial", "scene", "revision_base",
-                },
+                } or (
+                    role == "continuity"
+                    and bool(payload.get(
+                        "previous_shot_reference_required"))),
                 "era_context": str(
                     match.get("era_context") or "").strip(),
                 "story_phase": str(
@@ -17476,9 +17591,26 @@ class Director:
             "只锁定本镜构图、人物站位、场景、道具、服装和已锁定文字；"
             "人物脸和性别仍以各自最终立绘为准，不得复制关键图中的错误",
             role="keyframe")
-        add(payload.get("chain_first_uri"), "上一镜结尾画面",
-            "只承接屏幕方向、构图、光线、人物站位、服装、道具和状态；"
-            "不得用它覆盖各角色最终立绘身份", role="continuity")
+        if payload.get("previous_shot_reference_required"):
+            add(
+                payload.get("chain_first_uri"), "紧邻上一镜AI定稿图",
+                "这是跨镜头状态锚：只承接人物外观/妆发、服装、道具状态、"
+                "场景材质、光线连续性和人物/物品相对位置；本镜景别、机位、"
+                "视角、构图和动作必须服从当前分镜合同，禁止复制上一镜机位；"
+                "人物身份仍以各角色最终立绘为准",
+                role="continuity",
+                inherits=[
+                    "appearance_state", "wardrobe", "props", "scene_state",
+                    "relative_positions", "lighting_continuity",
+                ],
+                excludes=[
+                    "identity_override", "camera_override",
+                    "composition_override", "pose_freeze",
+                ])
+        else:
+            add(payload.get("chain_first_uri"), "上一镜结尾画面",
+                "只承接屏幕方向、构图、光线、人物站位、服装、道具和状态；"
+                "不得用它覆盖各角色最终立绘身份", role="continuity")
         location = payload.get("location", "")
         add(payload.get("scene_ref"),
             f"场景「{location}」基准图" if location else "场景基准图",
@@ -18494,6 +18626,19 @@ class Director:
         quality_by_shot = {}
         payload_by_shot = {}
         seen_scenes = set()
+        active_shots = list(self._active_shots(ctx))
+        scene_locations = {
+            scene.get("scene_no"): scene.get("location", "")
+            for scene in (ctx.get("script") or {}).get("scenes", [])
+            if isinstance(scene, dict)
+        }
+        continuity_plan = build_keyframe_continuity_plan(
+            active_shots, scene_locations)
+        predecessor_by_shot = continuity_plan["predecessor_by_shot"]
+        group_by_shot = continuity_plan["group_by_shot"]
+        shot_by_no = {
+            int(shot.get("shot_no") or 0): shot for shot in active_shots}
+        planned_regeneration = set()
         skipped_scenes = self._skipped_scenes(ctx)
         if skipped_scenes:
             self.log.info(
@@ -18510,7 +18655,7 @@ class Director:
         awaiting_selection = []
         technical_incomplete = []
         preflight_failures = []
-        for shot in self._active_shots(ctx):
+        for shot in active_shots:
             scene_first = shot.get("scene_no") not in seen_scenes
             seen_scenes.add(shot.get("scene_no"))
             if int(shot.get("shot_no") or 0) in awaiting_shots:
@@ -18519,6 +18664,35 @@ class Director:
             stored_prior = prior_plan.get(
                 f"shot:{shot['shot_no']}") or {}
             payload = self._shot_payload(ctx, shot)
+            shot_no = int(shot["shot_no"])
+            predecessor_no = predecessor_by_shot.get(shot_no)
+            existing = self._existing_asset_uri(
+                ctx, "image", self._shot_name(ctx, shot_no))
+            current_asset_row = self.assets.latest(
+                ctx["project"]["id"], "image",
+                self._shot_name(ctx, shot_no))
+            selected_upstream = next((
+                image for image in ctx["images"]
+                if int(image.get("shot_no") or 0)
+                == int(predecessor_no or 0)), None)
+            expected_dependency = (
+                self._keyframe_continuity_dependency(
+                    ctx, predecessor_no, selected_upstream.get("uri"))
+                if predecessor_no and selected_upstream
+                and predecessor_no not in planned_regeneration else {})
+            continuity_reuse_ok = bool(
+                predecessor_no is None
+                or self._continuity_dependency_matches(
+                    current_asset_row, expected_dependency))
+            if predecessor_no is not None and continuity_reuse_ok:
+                payload.update({
+                    "chain_first_uri": expected_dependency["uri"],
+                    "previous_shot_reference_uri":
+                        expected_dependency["uri"],
+                    "previous_shot_reference_required": True,
+                    "continuity_dependency": expected_dependency,
+                    "continuity_group_id": group_by_shot.get(shot_no, ""),
+                })
             contract_issues = self._generation_preflight_issues(
                 shot, payload, modality="image")
             if contract_issues:
@@ -18632,7 +18806,8 @@ class Director:
                 and not valid_prior_ai_selection)
             # 旧版本遗留的“等待手机选片”候选组直接交给 AI 导演晋升，
             # 不再重新生成，也不会继续制造 awaiting_selection 门禁。
-            if (stored_prior.get("status") == "awaiting_selection"
+            if (continuity_reuse_ok
+                    and stored_prior.get("status") == "awaiting_selection"
                     and self._shot_candidate_group_valid(stored_prior)):
                 resumed = SimpleNamespace(
                     provider=str(stored_prior.get("provider") or "resume"),
@@ -18658,13 +18833,12 @@ class Director:
                     })
                     reused += 1
                     continue
-            existing = self._existing_asset_uri(
-                ctx, "image", self._shot_name(ctx, shot["shot_no"]))
             # 用户明确禁止视觉返工后，断点里已经生成并由流水线冻结的
             # canonical 输出就是导演选定稿。即使旧 QC 标成失败或当前
             # 分镜哈希因自动修订变化，也不得再次消耗生图额度；只有确实
             # 没有任何现成文件的镜头才继续创建一次生成任务。
-            if (self._director_autonomy_enabled()
+            if (continuity_reuse_ok
+                    and self._director_autonomy_enabled()
                     and not unresolved_prior_failure):
                 # render_plan 会在分镜版本变化时重建，资产登记则只发生在
                 # QC 放行之后；两处都可能暂时看不到已真实写盘的冻结稿。
@@ -18703,7 +18877,7 @@ class Director:
                                 "persisted_director_selection",
                         })
                     continue
-            if (existing
+            if (continuity_reuse_ok and existing
                     and self._shot_candidate_group_valid(stored_prior)
                     and self._repair_gacha_prompt_invariant_valid(
                         stored_prior)):
@@ -18885,77 +19059,108 @@ class Director:
             quality_by_shot[shot["shot_no"]] = payload["quality_decision"]
             payload_by_shot[shot["shot_no"]] = payload
             tasks.append(task)
-        results, qc_failures = self._run_parallel(
-            ctx, tasks, line="分镜画面",
-            continue_on_qc_failure=True)
-        if qc_failures:
-            # 镜头级生成/审核故障只标记本镜技术未完成；不能把整集或其他
-            # 镜头停在合同/人工确认页。后续断点仅补这一个镜头。
-            for task, error in qc_failures:
-                shot_no = int(task["tag"])
+            planned_regeneration.add(shot_no)
+        # ArcReel-style dependency wavefront: independent world-state groups
+        # run in parallel; within one group, the immediately preceding AI
+        # selection is a mandatory state reference.  Each task still fans out
+        # to the configured four candidates, so this removes blind all-shot
+        # parallelism without serialising the whole episode.
+        task_by_shot = {int(task["tag"]): task for task in tasks}
+        selected_by_shot = {
+            int(image["shot_no"]): image for image in ctx["images"]}
+        chains = continuity_plan["groups"]
+        max_depth = max(
+            (len(group["shot_nos"]) for group in chains), default=0)
+        for depth in range(max_depth):
+            wave_tasks = []
+            for group in chains:
+                if depth >= len(group["shot_nos"]):
+                    continue
+                current_no = int(group["shot_nos"][depth])
+                task = task_by_shot.get(current_no)
+                if task is None:
+                    continue
+                task["payload"]["continuity_group_id"] = group["group_id"]
+                previous_no = predecessor_by_shot.get(current_no)
+                if previous_no is not None:
+                    upstream = selected_by_shot.get(int(previous_no))
+                    if (not upstream or not self._bind_keyframe_continuity(
+                            ctx, task, shot_by_no[current_no], previous_no,
+                            upstream.get("uri"), group["group_id"])):
+                        self._plan_mark(
+                            ctx, task["item_id"], "pending",
+                            error=(f"等待同一连续动作链的紧邻上一镜"
+                                   f"(镜{previous_no})AI定稿图；本镜未调用"
+                                   "生图模型"),
+                            extra={
+                                "continuity_waiting": True,
+                                "continuity_group_id": group["group_id"],
+                                "continuity_predecessor_shot": previous_no,
+                            })
+                        technical_incomplete.append(current_no)
+                        continue
+                payload_by_shot[current_no] = task["payload"]
+                wave_tasks.append(task)
+            if not wave_tasks:
+                continue
+            wave_results, wave_failures = self._run_parallel(
+                ctx, wave_tasks,
+                line=(f"关键帧连续性链第{depth + 1}轮·"
+                      f"{len(wave_tasks)}组并行·每镜四候选"),
+                continue_on_qc_failure=True,
+                preserve_task_scope=True)
+            for task, error in wave_failures:
+                current_no = int(task["tag"])
                 reason = str(error)
                 self._plan_mark(
                     ctx, task["item_id"], "technical_incomplete",
-                    error=("本镜技术执行未完成；已保留其他镜头与候选："
-                           + reason[:900]),
+                    error=("本镜技术执行未完成；同组后续等待，其他连续性组"
+                           "继续：" + reason[:900]),
                     extra={
                         "selection_required": False,
                         "technical_retry_required": True,
+                        "continuity_group_id": group_by_shot.get(
+                            current_no, ""),
                     })
-                technical_incomplete.append(shot_no)
-            qc_failures = []
-        for shot_no in sorted(results):
-            result = results[shot_no]
-            if self._candidate_group_technical_incomplete(result):
-                technical_incomplete.append(int(shot_no))
-                continue
-            if self._candidate_selection_pending(result):
-                result = self._ai_promote_generated_candidate_group(result)
-            if self._candidate_selection_pending(result):
-                technical_incomplete.append(int(shot_no))
-                self._plan_mark(
-                    ctx, f"shot:{shot_no}", "technical_incomplete",
-                    error="AI选优无法晋升任何技术可用候选",
-                    extra={
-                        **self._plan_done_extra(result),
-                        "selection_required": False,
-                        "technical_retry_required": True,
-                    })
-                continue
-            quality = quality_by_shot[shot_no]
-            self._register_completed_shot_result(
-                ctx,
-                next(s for s in ctx["storyboard"]["shots"]
-                     if s["shot_no"] == shot_no),
-                quality, result, payload=payload_by_shot.get(shot_no))
-            ctx["images"].append({
-                "shot_no": shot_no, "uri": result.uri,
-                "image_quality": quality["level"]})
+                technical_incomplete.append(current_no)
+            for current_no in sorted(wave_results):
+                result = wave_results[current_no]
+                if self._candidate_group_technical_incomplete(result):
+                    technical_incomplete.append(int(current_no))
+                    continue
+                if self._candidate_selection_pending(result):
+                    result = self._ai_promote_generated_candidate_group(result)
+                if self._candidate_selection_pending(result):
+                    technical_incomplete.append(int(current_no))
+                    self._plan_mark(
+                        ctx, f"shot:{current_no}", "technical_incomplete",
+                        error="AI选优无法晋升任何技术可用候选",
+                        extra={
+                            **self._plan_done_extra(result),
+                            "selection_required": False,
+                            "technical_retry_required": True,
+                        })
+                    continue
+                current_task = task_by_shot[int(current_no)]
+                current_payload = current_task["payload"]
+                quality = current_payload.get("quality_decision") or \
+                    quality_by_shot[current_no]
+                self._register_completed_shot_result(
+                    ctx, shot_by_no[int(current_no)], quality, result,
+                    payload=current_payload)
+                image = {
+                    "shot_no": int(current_no), "uri": result.uri,
+                    "image_quality": quality["level"],
+                    "continuity_group_id": group_by_shot.get(
+                        int(current_no), ""),
+                }
+                ctx["images"].append(image)
+                selected_by_shot[int(current_no)] = image
         ctx["images"].sort(key=lambda i: i["shot_no"])
         # 只把已经正式选中的关键帧 URI 写回浏览板。候选图、拼贴图和
         # 未晋升结果不会进入九宫格，更不会因此被注册成生成参考资产。
         self._persist_storyboard_reviews(ctx, keyframes=ctx["images"])
         technical_incomplete.extend(skipped_awaiting)
-        if qc_failures:
-            failed_shots = sorted(set(
-                int(task["tag"]) for task, _error in qc_failures))
-            self.log.warn(
-                "director",
-                f"关键帧本批已完成其余 {len(results)} 张；"
-                f"{len(failed_shots)} 张仍未通过(生成前合同、修订组四候选"
-                "或提示词审核)，已逐镜隔离: "
-                + "、".join(f"镜头{value}" for value in failed_shots))
-            raise AifosError(
-                f"{len(failed_shots)} 张关键帧未通过本镜生成前合同或"
-                "生成任务；"
-                "失败稿及 Codex 诊断已保留，其他关键帧已继续完成；"
-                "下一断点由 AIFOS 自动重建合同后继续，不要求用户确认。"
-                "问题镜头: "
-                + "、".join(str(value) for value in failed_shots)
-                + (
-                    "；另有无法自动迁移的历史镜头: "
-                    + "、".join(str(value) for value in skipped_awaiting)
-                    if skipped_awaiting else ""))
         if preflight_failures:
             # 关闭创作选片模式也不能恢复旧版“某一镜合同问题拖停整集”
             # 的行为。合同未完成只进入逐镜技术补位台账，其余镜头继续；
@@ -18983,6 +19188,8 @@ class Director:
             return {
                 "count": len(ctx["images"]), "reused": reused,
                 "recovered": reconciliation["recovered"],
+                "continuity_mode": "dependency_wavefront_v1",
+                "continuity_groups": len(continuity_plan["groups"]),
                 "awaiting_selection": bool(awaiting_selection),
                 "awaiting_selection_shots": sorted(
                     set(awaiting_selection)),
@@ -18996,6 +19203,8 @@ class Director:
         return {
             "count": len(ctx["images"]), "reused": reused,
             "recovered": reconciliation["recovered"],
+            "continuity_mode": "dependency_wavefront_v1",
+            "continuity_groups": len(continuity_plan["groups"]),
         }
 
     def _stage_text_assets(self, ctx):
