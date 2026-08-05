@@ -7122,7 +7122,7 @@ class Director:
         }
         report_progress(0, 0, group_meta=progress_group_meta, candidates=[])
 
-        def generate_one(index):
+        def candidate_payload_for(index):
             candidate_payload = copy.deepcopy(working_payload)
             result_version = result_versions[index]
             seed = int(hashlib.sha256(
@@ -7138,13 +7138,60 @@ class Director:
                 # 每张可独立记录 QC，但不在候选worker内自动修图。
                 "_qc_candidate_only": True,
             })
+            return candidate_payload, result_version, seed
+
+        def build_candidate(index, result, candidate_payload,
+                            result_version, seed, technical_probe, *,
+                            recovered_from_disk=False):
+            candidate_input = self._image_generation_input(
+                candidate_payload, qc_spec=qc_spec)
+            uri = str(result.uri or "")
+            result_data = getattr(result, "data", None) or {}
+            provider_name = str(getattr(result, "provider", "") or "")
+            report = self._rank_image_candidate_nonblocking(
+                result, candidate_payload, qc_spec,
+                root / f"candidate_{index:02d}", cancel)
+            seed_consumed = bool(result_data.get("seed_consumed"))
+            return {
+                "pull": index,
+                "candidate_index": index,
+                "candidate_id": f"{version.token}#{index}",
+                "candidate_set_token": result_version.candidate_set_token,
+                "candidate_seed": seed if seed_consumed else None,
+                "candidate_variation_key": f"variation-{seed:08x}",
+                "seed_requested": seed,
+                "seed_consumed": seed_consumed,
+                "reproducible": seed_consumed,
+                "candidate_seed_semantics": (
+                    "provider_reproducible_seed" if seed_consumed
+                    else "request_variation_marker_not_reproducible"),
+                "variation_strategy": (
+                    "provider_seed" if seed_consumed
+                    else "independent_provider_generation"),
+                "uri": uri,
+                "passed": bool(report.get("passed")),
+                "score": self._image_qc_selection_score(report),
+                "issues": list(report.get("issues") or [])[:8],
+                "ranking_unavailable": bool(
+                    report.get("ranking_unavailable")),
+                "qc_disabled": bool(report.get("qc_disabled")),
+                "prompt_hash": candidate_input["prompt_hash"],
+                "reference_hash": candidate_input["reference_hash"],
+                "input_hash": candidate_input["input_hash"],
+                "provider": provider_name,
+                "model": getattr(result, "model", ""),
+                "technical_probe": technical_probe,
+                "recovered_from_disk": bool(recovered_from_disk),
+            }
+
+        def generate_one(index):
+            candidate_payload, result_version, seed = \
+                candidate_payload_for(index)
             candidate_out = root / f"candidate_{index:02d}"
             candidate_out.mkdir(parents=True, exist_ok=True)
             result = self._generate_image_with_qc(
                 capability, candidate_payload, candidate_out,
                 cancel, qc_spec)
-            candidate_input = self._image_generation_input(
-                candidate_payload, qc_spec=qc_spec)
             uri = str(result.uri or "")
             if not uri:
                 raise AifosError(f"候选图{index}未返回产物地址")
@@ -7174,51 +7221,19 @@ class Director:
                     raise AifosError(
                         f"候选图{index}技术完整性未通过:"
                         f"{technical_probe.get('error') or technical_probe.get('status')}")
-            report = self._rank_image_candidate_nonblocking(
-                result, candidate_payload, qc_spec, candidate_out, cancel)
-            # Most current image providers deliberately do not expose a seed
-            # contract (Seedream included).  Keep a stable variation key for
-            # audit/four-slot identity, but only call it a reproducible seed
-            # when the provider explicitly confirms consumption.
-            seed_consumed = bool(result_data.get("seed_consumed"))
-            return index, result, {
-                "pull": index,
-                "candidate_index": index,
-                "candidate_id": f"{version.token}#{index}",
-                "candidate_set_token": result_version.candidate_set_token,
-                "candidate_seed": seed if seed_consumed else None,
-                "candidate_variation_key": f"variation-{seed:08x}",
-                "seed_requested": seed,
-                "seed_consumed": seed_consumed,
-                "reproducible": seed_consumed,
-                "candidate_seed_semantics": (
-                    "provider_reproducible_seed" if seed_consumed
-                    else "request_variation_marker_not_reproducible"),
-                "variation_strategy": (
-                    "provider_seed" if seed_consumed
-                    else "independent_provider_generation"),
-                "uri": uri,
-                "passed": bool(report.get("passed")),
-                "score": self._image_qc_selection_score(report),
-                "issues": list(report.get("issues") or [])[:8],
-                "ranking_unavailable": bool(
-                    report.get("ranking_unavailable")),
-                "qc_disabled": bool(report.get("qc_disabled")),
-                "prompt_hash": candidate_input["prompt_hash"],
-                "reference_hash": candidate_input["reference_hash"],
-                "input_hash": candidate_input["input_hash"],
-                "provider": provider_name,
-                "model": getattr(result, "model", ""),
-                "technical_probe": technical_probe,
-            }
+            return index, result, build_candidate(
+                index, result, candidate_payload, result_version, seed,
+                technical_probe)
 
         results = {}
         resume_group = working_payload.get("_resume_candidate_group") or {}
-        if (isinstance(resume_group, dict)
+        resume_contract_matches = bool(
+            isinstance(resume_group, dict)
                 and resume_group.get("candidate_set_id") == candidate_set_id
                 and resume_group.get("candidate_set_token") == version.token
                 and resume_group.get("frozen_input_hash")
-                == frozen_input_hash):
+                == frozen_input_hash)
+        if resume_contract_matches:
             for candidate in resume_group.get("candidates") or []:
                 try:
                     index = int(candidate.get("candidate_index") or 0)
@@ -7235,6 +7250,62 @@ class Director:
                     and self._candidate_file_technically_usable(candidate))
                 if reusable:
                     results[index] = (None, copy.deepcopy(candidate))
+
+            # A provider may have fully written the paid candidate before a
+            # local decoder/runtime error was raised.  Older code persisted
+            # only candidate_errors in that case, so restart regenerated all
+            # four slots and charged again.  Recover files only from this
+            # exact frozen candidate-set directory, re-probe their real
+            # pixels, and rerun only the nonblocking visual ranking.
+            for index in range(1, pulls + 1):
+                if index in results:
+                    continue
+                candidate_out = root / f"candidate_{index:02d}"
+                try:
+                    shot_no = int(working_payload.get("shot_no") or 0)
+                except (TypeError, ValueError):
+                    shot_no = 0
+                expected = (
+                    candidate_out / f"shot_{shot_no:03d}.keyframe.png"
+                    if shot_no else None)
+                if expected is None or not expected.is_file():
+                    direct_images = sorted(
+                        path for path in candidate_out.iterdir()
+                        if path.is_file() and path.suffix.lower() in {
+                            ".png", ".jpg", ".jpeg", ".webp", ".gif"}) \
+                        if candidate_out.is_dir() else []
+                    expected = direct_images[0] if len(
+                        direct_images) == 1 else None
+                if expected is None:
+                    continue
+                technical_probe = probe_image(
+                    expected, expected_aspect=(
+                        working_payload.get("aspect") or None))
+                if not image_is_technically_usable(technical_probe):
+                    continue
+                candidate_payload, result_version, seed = \
+                    candidate_payload_for(index)
+                recovered_provider = (
+                    "codex" if (candidate_out / "codex_image.log").is_file()
+                    else "recovered_local")
+                recovered = SimpleNamespace(
+                    provider=recovered_provider,
+                    model="",
+                    cost=0.0,
+                    data={"recovered_existing_candidate": True},
+                    uri=str(expected),
+                    fallbacks=[],
+                    qc=None,
+                )
+                candidate = build_candidate(
+                    index, recovered, candidate_payload, result_version,
+                    seed, technical_probe, recovered_from_disk=True)
+                candidate["technical_attempts"] = 0
+                results[index] = (recovered, candidate)
+                self.log.info(
+                    "director",
+                    f"镜头{shot_no}候选{index}已从冻结候选目录恢复，"
+                    "未再次调用生图模型")
 
         failures = {}
 
@@ -9509,6 +9580,44 @@ class Director:
                  or int(group.get("candidate_count") or 0) <= 0))
 
     @staticmethod
+    def _candidate_group_technical_error(result):
+        """Return a concise, durable reason for a zero-output candidate set."""
+        data = getattr(result, "data", None) or {}
+        group = data.get("candidate_group") or {}
+        errors = []
+        if isinstance(group, dict):
+            for row in group.get("candidate_errors") or []:
+                if not isinstance(row, dict):
+                    continue
+                value = str(row.get("error") or "").strip()
+                if value and value not in errors:
+                    errors.append(value)
+        if not errors:
+            return "关键帧候选技术补位未完成"
+        labels = []
+        for value in errors:
+            lowered = value.lower()
+            if ("pillow" in lowered or "图片解码器" in value
+                    or "像素解码" in value):
+                label = "图片已落盘但本地像素解码器不可用"
+            elif ("没有可用 provider" in lowered
+                  or "没有可用provider" in lowered):
+                label = "图片通道当前没有可用 Provider"
+            elif ("credit_balance_exhausted" in lowered
+                  or "no credits remaining" in lowered):
+                label = "OpenAI 图片 API 余额已耗尽"
+            elif "billing_hard_limit_reached" in lowered:
+                label = "OpenAI 图片 API 已达账单硬上限"
+            elif ("incompleteread" in lowered
+                  or "timed out" in lowered or "timeout" in lowered):
+                label = "图片通道传输中断或超时"
+            else:
+                label = value[:300]
+            if label not in labels:
+                labels.append(label)
+        return "零张技术可用候选：" + "；".join(labels)[:850]
+
+    @staticmethod
     def _candidate_selection_pending(result):
         data = getattr(result, "data", None) or {}
         group = data.get("candidate_group") or {}
@@ -10063,10 +10172,12 @@ class Director:
         self._task_providers.add(result.provider)
         self.projects.add_episode_cost(ctx["episode"]["id"], result.cost)
         if self._candidate_group_technical_incomplete(result):
+            technical_error = self._candidate_group_technical_error(result)
             self._finish_dispatch_task(
-                ctx, task, error="关键帧候选技术补位未完成")
+                ctx, task, error=technical_error)
             self._plan_mark(
                 ctx, task["item_id"], "technical_incomplete",
+                error=technical_error[:900],
                 extra={
                     **self._plan_done_extra(result),
                     "selection_required": False,
@@ -10829,11 +10940,13 @@ class Director:
                     self.projects.add_episode_cost(
                         ctx["episode"]["id"], result.cost)
                     if self._candidate_group_technical_incomplete(result):
+                        technical_error = \
+                            self._candidate_group_technical_error(result)
                         self._finish_dispatch_task(
-                            ctx, task,
-                            error="关键帧候选技术补位未完成")
+                            ctx, task, error=technical_error)
                         self._plan_mark(
                             ctx, task["item_id"], "technical_incomplete",
+                            error=technical_error[:900],
                             extra={
                                 **self._plan_done_extra(result),
                                 "selection_required": False,

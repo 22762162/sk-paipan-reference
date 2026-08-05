@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import io
 import math
+import shutil
 import struct
+import subprocess
 import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -232,6 +234,42 @@ def _jpeg_dimensions(data: bytes) -> Tuple[Optional[int], Optional[int]]:
     return None, None
 
 
+def _decode_jpeg_with_ffmpeg(path: Path, data: bytes
+                             ) -> Tuple[str, int, int]:
+    """Fully decode a JPEG when Pillow is absent.
+
+    AIFOS already bundles/uses ffmpeg for video and image normalization.  The
+    previous probe nevertheless treated every JPEG as undecodable whenever
+    Pillow was not installed, even after the provider had successfully
+    written a real 1080x1920 frame.  Decode one complete still frame into the
+    null muxer and use the JPEG SOF geometry only after that decode succeeds.
+    This keeps the no-header-only safety contract without adding a mandatory
+    Python dependency.
+    """
+    executable = shutil.which("ffmpeg")
+    if not executable:
+        bundled = Path.home() / ".local" / "bin" / "ffmpeg"
+        executable = str(bundled) if bundled.is_file() else ""
+    if not executable:
+        raise RuntimeError("ffmpeg_unavailable")
+    width, height = _jpeg_dimensions(data)
+    if not width or not height:
+        raise ValueError("JPEG SOF geometry is missing or invalid")
+    try:
+        completed = subprocess.run([
+            executable, "-v", "error", "-i", str(path),
+            "-map", "0:v:0", "-frames:v", "1", "-f", "null", "-",
+        ], capture_output=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("ffmpeg_unavailable") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or b"")[-500:]
+        raise ValueError(
+            "ffmpeg JPEG pixel decode failed: "
+            + detail.decode("utf-8", errors="replace"))
+    return "jpeg", int(width), int(height)
+
+
 def _parse_expected_aspect(value: Any) -> Tuple[str, float]:
     if isinstance(value, (tuple, list)) and len(value) == 2:
         left, right = value
@@ -326,12 +364,14 @@ def probe_image(source: Any, *, expected_aspect: Optional[Any] = None,
             width, height = _png_stdlib_decode(data)
             decoded_format = "png"
             result["decode_backend"] = "stdlib_png"
+        elif magic == "jpeg":
+            decoded_format, width, height = _decode_jpeg_with_ffmpeg(
+                path, data)
+            result["decode_backend"] = "ffmpeg"
         else:
-            if magic == "jpeg":
-                width, height = _jpeg_dimensions(data)
             result.update({"width": width, "height": height})
             message = (
-                f"当前环境没有 Pillow，不能对 {magic.upper()} 执行真实像素解码；"
+                f"当前环境没有可用解码器，不能对 {magic.upper()} 执行真实像素解码；"
                 "不得仅凭文件头放行")
             result["checks"].append({
                 "name": "pixel_decode", "passed": False,

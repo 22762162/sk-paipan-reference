@@ -2,6 +2,7 @@
 
 import base64
 import struct
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -129,3 +130,28 @@ def test_missing_converter_stops_before_paid_provider_call(
         }, tmp_path)
 
     assert calls == []
+
+
+def test_sips_normalization_forces_real_png_encoding(
+        tmp_path, monkeypatch):
+    source = tmp_path / "source.jpg"
+    target = tmp_path / "formal.png"
+    source.write_bytes(b"jpeg")
+    commands = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        output = Path(command[command.index("--out") + 1])
+        output.write_bytes(_png_header(1080, 1920))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        api_providers, "_image_converter", lambda: ("sips", "/usr/bin/sips"))
+    monkeypatch.setattr(api_providers.subprocess, "run", fake_run)
+
+    converter = api_providers._run_image_conversion(
+        source, target, (0, 0, 1024, 1536), (1080, 1920))
+
+    assert converter == "sips"
+    assert target.is_file()
+    assert ["--setProperty", "format", "png"] == commands[1][1:4]

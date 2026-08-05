@@ -165,6 +165,10 @@ def test_without_pillow_non_png_header_is_not_enough_to_pass(
     path = tmp_path / "header-only.jpg"
     path.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00" + b"\x00" * 20)
     monkeypatch.setattr(image_media_qc, "_PIL_IMAGE", None)
+    monkeypatch.setattr(
+        image_media_qc, "_decode_jpeg_with_ffmpeg",
+        lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("ffmpeg_unavailable")))
 
     result = probe_image(path)
 
@@ -172,3 +176,25 @@ def test_without_pillow_non_png_header_is_not_enough_to_pass(
     assert result["decoded"] is False
     assert result["probe_ok"] is False
     assert result["error_code"] == "image_decoder_unavailable"
+
+
+def test_without_pillow_valid_jpeg_uses_full_ffmpeg_decode(
+        tmp_path, monkeypatch):
+    path = tmp_path / "provider-output.png"
+    # The provider historically wrote JPEG bytes under a .png extension.
+    path.write_bytes(b"\xff\xd8\xff\xe0provider-jpeg-fixture")
+    monkeypatch.setattr(image_media_qc, "_PIL_IMAGE", None)
+    monkeypatch.setattr(
+        image_media_qc, "_decode_jpeg_with_ffmpeg",
+        lambda candidate, data: (
+            "jpeg", 1080, 1920)
+        if candidate == path and data.startswith(b"\xff\xd8\xff")
+        else (_ for _ in ()).throw(ValueError("wrong fixture")))
+
+    result = probe_image(path, expected_aspect="9:16")
+
+    assert result["probe_ok"] is True
+    assert result["decoded"] is True
+    assert result["decode_backend"] == "ffmpeg"
+    assert result["decoded_format"] == "jpeg"
+    assert (result["width"], result["height"]) == (1080, 1920)

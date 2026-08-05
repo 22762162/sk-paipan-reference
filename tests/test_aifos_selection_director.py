@@ -414,7 +414,10 @@ def test_interrupted_candidate_progress_reuses_finished_slots(tmp_path):
         "image", resumed_payload, tmp_path, None,
         {"item_id": "shot:10"}, 4)
 
-    assert director.router.image_calls == 2
+    # All four files had already reached the frozen candidate directory before
+    # the simulated progress write was interrupted, so restart recovers slots
+    # 3/4 from disk instead of paying to generate them again.
+    assert director.router.image_calls == 0
     group = resumed.data["candidate_group"]
     assert group["candidate_count"] == 4
     assert [row["candidate_index"] for row in group["candidates"]] == [
@@ -423,6 +426,9 @@ def test_interrupted_candidate_progress_reuses_finished_slots(tmp_path):
         interrupted["candidates"][0]["uri"]
     assert group["candidates"][1]["uri"] == \
         interrupted["candidates"][1]["uri"]
+    assert all(
+        row["recovered_from_disk"] is True
+        for row in group["candidates"][2:])
 
 
 def test_candidate_progress_persists_exact_round_resume_state(tmp_path):
@@ -650,6 +656,72 @@ def test_unfilled_candidate_slot_promotes_best_usable_without_mobile_gate(tmp_pa
     assert promoted_group["selection"]["source"] == "ai"
     assert promoted.uri in success_uris
     assert Director._candidate_selection_pending(promoted) is False
+
+
+def test_decoder_failure_resume_recovers_paid_files_without_regeneration(
+        tmp_path, monkeypatch):
+    director = _director({"selection_mode": True})
+    director.router = _ParallelRouter()
+    payload = {
+        "_episode_id": "episode-1",
+        "_contract_revision": 1,
+        "_candidate_revision": 1,
+        "item_id": "shot:10", "shot_no": 10, "prompt": "冻结镜头",
+        "reference_manifest": [], "aspect": "9:16",
+    }
+    real_probe = __import__(
+        "aifos.image_media_qc", fromlist=["probe_image"]).probe_image
+    monkeypatch.setattr(
+        "aifos.director.probe_image",
+        lambda *_args, **_kwargs: {
+            "ok": False, "probe_ok": False,
+            "error": "当前环境没有图片解码器",
+        })
+
+    first = director._generate_selection_candidates_parallel(
+        "image", payload, tmp_path, None, {"item_id": "shot:10"}, 4)
+    first_group = first.data["candidate_group"]
+    calls_after_failure = director.router.image_calls
+    assert first_group["technical_incomplete"] is True
+    assert first_group["candidate_count"] == 0
+    assert calls_after_failure == 8
+
+    monkeypatch.setattr("aifos.director.probe_image", real_probe)
+    resumed_payload = {
+        **payload,
+        "_candidate_set_id": first_group["candidate_set_id"],
+        "_resume_candidate_group": copy.deepcopy(first_group),
+    }
+    resumed = director._generate_selection_candidates_parallel(
+        "image", resumed_payload, tmp_path, None,
+        {"item_id": "shot:10"}, 4)
+    resumed_group = resumed.data["candidate_group"]
+
+    assert director.router.image_calls == calls_after_failure
+    assert resumed_group["candidate_count"] == 4
+    assert resumed_group["technical_incomplete"] is False
+    assert all(
+        row["recovered_from_disk"] is True
+        for row in resumed_group["candidates"])
+
+
+def test_zero_candidate_error_is_deduplicated_and_actionable():
+    result = ProviderResult(provider="", cost=0.0, data={
+        "candidate_group": {
+            "technical_incomplete": True,
+            "candidate_errors": [
+                {"error": "当前环境没有 Pillow，不能执行真实像素解码"},
+                {"error": "当前环境没有 Pillow，不能执行真实像素解码"},
+                {"error": "能力 image 没有可用 Provider(链: [])"},
+            ],
+        },
+    })
+
+    reason = Director._candidate_group_technical_error(result)
+
+    assert reason.startswith("零张技术可用候选：")
+    assert reason.count("图片已落盘但本地像素解码器不可用") == 1
+    assert "图片通道当前没有可用 Provider" in reason
 
 
 def test_explicitly_disabled_image_content_qc_never_blocks_or_auto_repairs():

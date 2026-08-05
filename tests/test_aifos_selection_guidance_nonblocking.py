@@ -9,7 +9,7 @@ import pytest
 from aifos.app import App
 from aifos.db import now
 from aifos.settings import set_defaults
-from aifos.web.server import serve
+from aifos.web.server import _keyframe_technical_reason_summary, serve
 
 
 @pytest.fixture()
@@ -74,6 +74,11 @@ def server_factory(tmp_path):
                     "complete": False,
                     "technical_incomplete": True,
                     "candidates": [],
+                    "candidate_errors": [{
+                        "error": (
+                            "当前环境没有 Pillow，不能对 JPEG 执行"
+                            "真实像素解码"),
+                    }],
                 }
             items = [legacy]
 
@@ -344,8 +349,26 @@ def test_legacy_frame_keyerror_yields_to_real_technical_keyframe_gap(
     assert guidance["phase"] == "keyframes"
     assert guidance["actions"]["pending_images"]["enabled"] is True
     assert guidance["blockers"][0]["code"] == "keyframes_pending"
+    assert "1镜候选图片已落盘" in guidance["reason"]
+    assert guidance["blockers"][0]["technical_reasons"][0][
+        "shot_nos"] == [1]
     assert "latest_run_failed" not in {
         blocker["code"] for blocker in guidance["blockers"]}
+
+
+def test_keyframe_technical_reason_summary_classifies_prompt_review():
+    summary = _keyframe_technical_reason_summary([{
+        "category": "shot_image",
+        "shot_no": 12,
+        "status": "technical_incomplete",
+        "error": "最终提示词尚未通过Codex审核优化",
+    }])
+
+    assert summary == [{
+        "reason": "图片提示词审核尚未完成",
+        "count": 1,
+        "shot_nos": [12],
+    }]
 
 
 def test_strict_mode_keeps_legacy_manual_qc_gate(server_factory):

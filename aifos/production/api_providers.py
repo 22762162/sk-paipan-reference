@@ -327,9 +327,9 @@ def _run_image_conversion(source, target, crop_box, target_size):
                     "sips 图片安全区裁切失败: "
                     + (first.stderr or first.stdout or "未知错误")[-500:])
             second = subprocess.run([
-                executable, "--resampleHeightWidth", str(target_height),
-                str(target_width), str(crop_stage), "--out",
-                str(output_stage),
+                executable, "--setProperty", "format", "png",
+                "--resampleHeightWidth", str(target_height),
+                str(target_width), str(crop_stage), "--out", str(output_stage),
             ], capture_output=True, text=True, timeout=120, check=False)
             if second.returncode != 0:
                 raise ProviderError(

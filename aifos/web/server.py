@@ -2543,6 +2543,57 @@ def _latest_production_failure(app, episode_id):
     }
 
 
+def _keyframe_technical_reason_summary(plan_items):
+    """Summarize technical image failures by affected shots for the UI."""
+    buckets = {}
+    for item in plan_items or []:
+        if (not isinstance(item, dict)
+                or item.get("category") != "shot_image"):
+            continue
+        try:
+            shot_no = int(item.get("shot_no"))
+        except (TypeError, ValueError):
+            continue
+        values = []
+        if item.get("error"):
+            values.append(str(item["error"]))
+        group = item.get("candidate_group") or {}
+        if isinstance(group, dict):
+            values.extend(
+                str(row.get("error") or "")
+                for row in group.get("candidate_errors") or []
+                if isinstance(row, dict))
+        for value in values:
+            lowered = value.lower()
+            if ("pillow" in lowered or "像素解码" in value
+                    or "图片解码器" in value):
+                key = "候选图片已落盘，但旧版缺少本地像素解码器"
+            elif ("没有可用 provider" in lowered
+                  or "没有可用provider" in lowered):
+                key = "图片通道当前没有可用 Provider"
+            elif ("credit_balance_exhausted" in lowered
+                  or "no credits remaining" in lowered):
+                key = "OpenAI 图片 API 余额耗尽"
+            elif "billing_hard_limit_reached" in lowered:
+                key = "OpenAI 图片 API 达到账单硬上限"
+            elif ("incompleteread" in lowered
+                  or "timed out" in lowered or "timeout" in lowered):
+                key = "图片通道传输中断或超时"
+            elif ("codex审核" in value
+                  or ("提示词" in value and "审核" in value)):
+                key = "图片提示词审核尚未完成"
+            elif "等待同一连续" in value:
+                key = "等待上一镜 AI 定稿图作为连续性参考"
+            else:
+                continue
+            buckets.setdefault(key, set()).add(shot_no)
+    return [
+        {"reason": reason, "count": len(shots),
+         "shot_nos": sorted(shots)}
+        for reason, shots in buckets.items()
+    ]
+
+
 def _production_guidance(app, episode, storyboard, render_plan, progress):
     """根据正式资产门禁给出下一步，而不是照抄可能过期的 episode.status。
 
@@ -2567,6 +2618,10 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
     if selection_mode:
         plan_items = [
             _selection_mode_present_item(item) for item in plan_items]
+    technical_reason_summary = _keyframe_technical_reason_summary(plan_items)
+    technical_reason_text = "；".join(
+        f"{row['count']}镜{row['reason']}"
+        for row in technical_reason_summary)
 
     storyboard_shots = list((storyboard or {}).get("shots") or [])
     storyboard_numbers = {
@@ -2869,7 +2924,9 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
             f"{pending_total} 个镜头"
             + ("由 Codex 自动归因、优化提示词与参考图；每轮并行生成"
                "4张并由AI选优复检，最多10轮。"
-               if selection_mode else "可继续生产。"))
+               if selection_mode else "可继续生产。")
+            + (f" 当前归因：{technical_reason_text}。"
+               if technical_reason_text else ""))
     elif keyframes["awaiting_human"] or keyframes["failed"]:
         keyframes["status"] = "blocked"
         keyframes["reason"] = (
@@ -2935,7 +2992,10 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
                 f"还有 {pending_count} 个关键帧由 Codex 自动归因并优化"
                 "提示词与参考图；每轮并行生成4张并AI选优复检，最多10轮。"
                 if selection_mode
-                else f"还有 {pending_count} 个关键帧尚未生产。"),
+                else f"还有 {pending_count} 个关键帧尚未生产。")
+                + (f" 当前归因：{technical_reason_text}。"
+                   if technical_reason_text else ""),
+            "technical_reasons": technical_reason_summary,
         })
     if issue_count:
         severity = (
