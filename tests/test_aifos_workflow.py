@@ -169,6 +169,68 @@ def test_enrich_tolerates_loose_ai_storyboard(tmp_path):
     assert all(s["seedance_prompt"] for s in shots)
 
 
+def test_open_eyes_repairs_stale_asleep_end_condition():
+    """A visible wake-up beats an AI-copied asleep end state.
+
+    This is the production regression from 游戏入侵 episode 2: the actor
+    opened his eyes and spoke, but the structured end state still said asleep
+    and immobile.  Prompt repair then hid his face instead of fixing the story
+    state, leaving the later video contract impossible.
+    """
+    from aifos.workflow import _merge_shot_state
+
+    continuity = {"characters": [
+        {"name": "虞寻歌"}, {"name": "虞寻欢"},
+    ]}
+    asleep = {
+        "pose": "仰躺于床中央",
+        "condition": {
+            "life_state": "alive",
+            "consciousness_state": "asleep",
+            "embodiment": "physical",
+            "mobility": "immobile",
+        },
+    }
+    stale_end = {
+        "pose": "仰躺，眼睛睁开",
+        "condition": dict(asleep["condition"]),
+    }
+    text = "虞寻歌托住右腕；虞寻欢先皱眉再睁眼发问"
+
+    start = _merge_shot_state(
+        "虞寻欢", continuity, asleep, text, previous=asleep)
+    end = _merge_shot_state(
+        "虞寻欢", continuity, stale_end, text,
+        previous=start, ending=True)
+
+    assert start["condition"]["consciousness_state"] == "asleep"
+    assert start["condition"]["mobility"] == "immobile"
+    assert end["condition"]["consciousness_state"] == "awake"
+    assert end["condition"]["mobility"] == "limited"
+
+
+def test_open_eyes_transition_is_actor_local():
+    """One actor waking must not silently wake another sleeping actor."""
+    from aifos.workflow import _merge_shot_state
+
+    continuity = {"characters": [{"name": "甲"}, {"name": "乙"}]}
+    asleep = {
+        "pose": "仰躺",
+        "condition": {
+            "life_state": "alive",
+            "consciousness_state": "asleep",
+            "embodiment": "physical",
+            "mobility": "immobile",
+        },
+    }
+    end = _merge_shot_state(
+        "甲", continuity, asleep, "乙睁眼发问；甲仍在一旁熟睡",
+        previous=asleep, ending=True)
+
+    assert end["condition"]["consciousness_state"] == "asleep"
+    assert end["condition"]["mobility"] == "immobile"
+
+
 def test_functional_figure_temporal_rows_collapse_to_concurrent_peak():
     from aifos.workflow import (_functional_figure_count,
                                 _normalize_functional_figures)

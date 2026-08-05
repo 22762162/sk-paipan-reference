@@ -60,7 +60,7 @@ SHOT_FUNCTIONS = {
 }
 APPEARANCE_STATE_FIELDS = (
     "wardrobe", "headwear", "hair_visibility", "hair_makeup")
-APPEARANCE_STATE_VERSION = 2
+APPEARANCE_STATE_VERSION = 3
 APPEARANCE_STATE_ALIASES = {
     "wardrobe": ("wardrobe", "costume", "clothing", "服装", "衣着"),
     "headwear": ("headwear", "hat", "头饰", "帽冠", "冠帽"),
@@ -113,7 +113,8 @@ TERMINAL_STATE_TOKENS = (
     "被刺死", "刺死", "被砍死", "砍死", "中刀而亡",
 )
 WAKE_STATE_TOKENS = (
-    "醒来", "惊醒", "苏醒", "转醒", "恢复意识", "清醒过来",
+    "醒来", "惊醒", "苏醒", "转醒", "醒转", "恢复意识", "清醒过来",
+    "睁开眼睛", "睁开双眼", "睁开眼", "睁眼",
 )
 SLEEP_STATE_TOKENS = (
     "睡着", "入睡", "沉睡", "闭眼睡去", "陷入睡眠",
@@ -1015,6 +1016,11 @@ def _merge_shot_state(name, continuity, explicit, text, *, previous=None,
             name, continuity, text, previous=inherited,
             emotion=emotion, ending=ending)
 
+    actors = [
+        item.get("name") for item in (continuity.get("characters") or [])
+        if isinstance(item, dict) and item.get("name")
+    ]
+    transition = _condition_transition_kind(name, text, actors=actors)
     inherited_condition = (
         _condition_from_state(inherited, default=NORMAL_CONDITION)
         if inherited else {})
@@ -1035,15 +1041,27 @@ def _merge_shot_state(name, continuity, explicit, text, *, previous=None,
                 candidate
                 if _condition_change_allowed(
                     name, text, inherited_condition, candidate,
-                    actors=[
-                        item.get("name") for item in (
-                            continuity.get("characters") or [])
-                        if isinstance(item, dict) and item.get("name")
-                    ])
+                    actors=actors)
                 else copy.deepcopy(inherited_condition))
     elif declared_condition:
         state_condition = _condition_from_state(
             declared, default=NORMAL_CONDITION)
+    # AI sometimes copies the start condition into the end state even though
+    # the same actor visibly wakes (for example "先皱眉再睁眼发问").  Merely
+    # rejecting that contradiction made prompt repair hide the eyes/mouth from
+    # the still frame, while the later video contract remained impossible.
+    # The explicit actor-local transition is the stronger story fact: keep the
+    # inherited state at frame zero, then deterministically publish an awake,
+    # minimally mobile end state.  ``limited`` is intentional here—waking in
+    # bed does not imply standing or changing the established body support.
+    if (ending and transition == "wake"
+            and state_condition.get("life_state") not in {
+                "dead", "nonliving"}):
+        state_condition["life_state"] = "alive"
+        state_condition["consciousness_state"] = "awake"
+        if state_condition.get("mobility") in {
+                "", "unknown", "not_applicable", "immobile"}:
+            state_condition["mobility"] = "limited"
     state["condition"] = state_condition
 
     current = _visible_appearance(name, text, declared)
@@ -2115,7 +2133,10 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
         visible_figure_count = len(characters) + functional_count
         action_text = "；".join(str(value or "") for value in (
             raw.get("description"), raw.get("physical_logic"),
-            raw.get("prompt")))
+            raw.get("video_action"), raw.get("prompt"),
+            json.dumps(raw.get("temporal_beats") or [], ensure_ascii=False),
+            json.dumps(raw.get("dialogue") or {}, ensure_ascii=False),
+            json.dumps(raw.get("end_state") or {}, ensure_ascii=False)))
         declared_start = raw.get("start_state")
         declared_start = (
             declared_start if isinstance(declared_start, dict) else {})
@@ -2663,7 +2684,13 @@ def repair_storyboard_appearance_continuity(storyboard, continuity,
         scene_changed = previous_scene is None or scene_no != previous_scene
         before = copy.deepcopy(previous)
         action_text = "；".join(str(value or "") for value in (
-            shot.get("description"), shot.get("action"), shot.get("prompt")))
+            shot.get("description"), shot.get("action"),
+            shot.get("physical_logic"), shot.get("video_action"),
+            shot.get("prompt"),
+            json.dumps(shot.get("temporal_beats") or [],
+                       ensure_ascii=False),
+            json.dumps(shot.get("dialogue") or {}, ensure_ascii=False),
+            json.dumps(shot.get("end_state") or {}, ensure_ascii=False)))
         declared_start = (
             shot.get("start_state")
             if isinstance(shot.get("start_state"), dict) else {})
