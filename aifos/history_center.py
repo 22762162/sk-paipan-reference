@@ -21,6 +21,7 @@ STABLE_EPISODE_STATUSES = {
     "awaiting_script", "awaiting_cast", "awaiting_confirm", "queued_script",
     "paused",
 }
+ACTIVE_RUN_STATUSES = {"running", "cancelling"}
 
 
 def _loads(value, fallback):
@@ -206,7 +207,8 @@ class HistoryCenter:
         self.db.execute(
             "UPDATE tasks SET status='interrupted', "
             "error=CASE WHEN error='' THEN ? ELSE error END, updated_at=? "
-            "WHERE episode_id=? AND status='running'",
+            "WHERE episode_id=? AND status IN "
+            "('running','queued','cancelling')",
             (reason, ts, episode_id))
         self.db.execute(
             "UPDATE episodes SET status=?, updated_at=? WHERE id=?",
@@ -219,24 +221,112 @@ class HistoryCenter:
             (landing, reason, ts, ts, episode_id))
         return landing
 
-    def bootstrap(self):
-        """只在 Web 服务启动时调用：恢复失联任务并回填旧数据。"""
+    def _settle_episode_if_idle(self, episode_id):
+        if episode_id is None:
+            return "interrupted"
+        episode = self.db.query_one(
+            "SELECT status FROM episodes WHERE id=?", (episode_id,))
+        if episode is None:
+            return "interrupted"
+        active = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM production_runs WHERE episode_id=? "
+            "AND status IN ('running','cancelling')", (episode_id,))
+        if active and active["n"]:
+            return str(episode["status"] or "")
+        if str(episode["status"] or "") in STABLE_EPISODE_STATUSES:
+            return str(episode["status"] or "")
+        landing = self._landing_status(episode_id)
+        self.db.execute(
+            "UPDATE episodes SET status=?, updated_at=? WHERE id=?",
+            (landing, now(), episode_id))
+        return landing
+
+    def recover_run(self, run_id, reason="任务 owner 已失联，运行已中断"):
+        """Land one lease-proven stale run without touching sibling runs."""
+        run = self._bind_episode(run_id)
+        if run is None or str(run["status"]) not in ACTIVE_RUN_STATUSES:
+            return None
         ts = now()
         self.db.execute(
+            "UPDATE tasks SET status='interrupted', "
+            "error=CASE WHEN error='' THEN ? ELSE error END, updated_at=? "
+            "WHERE run_id=? AND status IN "
+            "('running','queued','cancelling')", (reason, ts, run_id))
+        self.db.execute(
             "UPDATE production_runs SET status='interrupted', "
-            "error=CASE WHEN error='' THEN '服务重启，原运行已中断' "
-            "ELSE error END, finished_at=COALESCE(finished_at, ?), "
-            "updated_at=? WHERE status IN ('running','cancelling')",
-            (ts, ts))
-        active = self.db.query(
-            "SELECT id FROM episodes WHERE status NOT IN "
+            "error=CASE WHEN error='' THEN ? ELSE error END, "
+            "finished_at=COALESCE(finished_at, ?), updated_at=? "
+            "WHERE id=? AND status IN ('running','cancelling')",
+            (reason, ts, ts, run_id))
+        landing = self._settle_episode_if_idle(run["episode_id"])
+        self.db.execute(
+            "UPDATE production_runs SET result_status=? WHERE id=?",
+            (landing, run_id))
+        return self.get(run_id)
+
+    def cancel_run(self, run_id, reason="用户取消排队任务"):
+        """Cancel a never-started durable run and its queued task facts."""
+        run = self._bind_episode(run_id)
+        if run is None or str(run["status"]) not in ACTIVE_RUN_STATUSES:
+            return None
+        ts = now()
+        self.db.execute(
+            "UPDATE tasks SET status='cancelled', "
+            "error=CASE WHEN error='' THEN ? ELSE error END, updated_at=? "
+            "WHERE run_id=? AND status IN "
+            "('running','queued','cancelling')", (reason, ts, run_id))
+        self.db.execute(
+            "UPDATE production_runs SET status='cancelled', "
+            "result_status='cancelled', "
+            "error=CASE WHEN error='' THEN ? ELSE error END, "
+            "finished_at=COALESCE(finished_at, ?), updated_at=? "
+            "WHERE id=? AND status IN ('running','cancelling')",
+            (reason, ts, ts, run_id))
+        self._settle_episode_if_idle(run["episode_id"])
+        return self.get(run_id)
+
+    def recover_stale(self, *, protected_run_ids=(), stale_before):
+        """Recover legacy active facts not protected by a live job lease."""
+        protected = {int(value) for value in protected_run_ids
+                     if value is not None}
+        recovered_runs = []
+        for row in self.db.query(
+                "SELECT id FROM production_runs WHERE status IN "
+                "('running','cancelling') AND updated_at<=? ORDER BY id",
+                (float(stale_before),)):
+            if int(row["id"]) in protected:
+                continue
+            if self.recover_run(
+                    row["id"], "任务租约已过期，运行已安全中断"):
+                recovered_runs.append(int(row["id"]))
+
+        recovered_episodes = []
+        legacy = self.db.query(
+            "SELECT e.id FROM episodes e WHERE e.status NOT IN "
             "('done','failed','qc_failed','created','awaiting_script',"
-            "'awaiting_cast','awaiting_confirm','queued_script','paused')")
-        for episode in active:
+            "'awaiting_cast','awaiting_confirm','queued_script','paused') "
+            "AND EXISTS (SELECT 1 FROM tasks t WHERE t.episode_id=e.id "
+            "AND t.run_id IS NULL AND t.status IN "
+            "('running','queued','cancelling') "
+            "AND t.updated_at<=?) AND NOT EXISTS (SELECT 1 FROM "
+            "production_runs r WHERE r.episode_id=e.id AND r.status IN "
+            "('running','cancelling'))", (float(stale_before),))
+        for episode in legacy:
             self.recover_episode(
-                episode["id"], "服务重启，生成任务已安全恢复")
+                episode["id"], "旧版任务超过租约窗口，已安全恢复")
+            recovered_episodes.append(int(episode["id"]))
+        return {"runs": recovered_runs, "episodes": recovered_episodes}
+
+    def bootstrap(self, *, protected_run_ids=(), stale_before=None):
+        """Bind/backfill history and recover only lease-proven stale facts."""
         self._bind_unbound_runs()
+        recovered = {"runs": [], "episodes": []}
+        if stale_before is not None:
+            recovered = self.recover_stale(
+                protected_run_ids=protected_run_ids,
+                stale_before=stale_before)
         self._backfill_legacy()
+        return recovered
 
     def _bind_unbound_runs(self):
         for row in self.db.query(
@@ -372,6 +462,12 @@ class HistoryCenter:
             item["tasks"] = [dict(task) for task in tasks]
         else:
             item["tasks"] = []
+        # Web background jobs are a separate durable fact stream from stage
+        # accounting tasks.  Expose both without mixing job rows into cost or
+        # stage_count, and include shot/output links for traceability.
+        from .job_center import JobCenter
+        item["jobs"] = JobCenter(self.db).list(
+            run_id=item["id"], limit=50, include_links=True)
         return item
 
     def delete_work(self, run_id, delete_assets=False):

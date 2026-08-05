@@ -269,6 +269,129 @@ def test_claude_image_qc_uploads_actual_reference_manifest_in_order(tmp_path):
     assert labels[-1] == "检查本镜输入是否正确"
 
 
+def test_claude_candidate_comparison_labels_actual_eligible_candidates(
+        tmp_path):
+    provider = ClaudeApiProvider(
+        "claude_api", _claude_conf("http://127.0.0.1:1"))
+    candidates = [tmp_path / f"candidate-{index}.png" for index in range(1, 6)]
+    identity = tmp_path / "identity.png"
+    for path in [*candidates, identity]:
+        path.write_bytes(PNG_1PX)
+
+    content = provider._qc_content("四图比较", {
+        "candidate_comparison": {
+            "candidate_set_token": "set-1",
+            "candidates": [{
+                "candidate_id": f"set-1#{index}",
+                "candidate_index": index,
+                "uri": str(candidates[index - 1]),
+            } for index in (2, 3, 4, 5)],
+        },
+        # Candidate #1 was ineligible; the first uploaded block is #2.
+        "image_uri": str(candidates[1]),
+        "reference_manifest": [
+            *[
+                {
+                    "index": upload_index,
+                    "uri": str(path),
+                    "label": f"候选#{candidate_index}",
+                    "role": "candidate_comparison",
+                    "candidate_id": f"set-1#{candidate_index}",
+                    "candidate_index": candidate_index,
+                    "binding": "同轮候选",
+                }
+                for upload_index, (candidate_index, path) in enumerate(
+                    zip((3, 4, 5), candidates[2:]), 2)
+            ],
+            {
+                "index": 5,
+                "uri": str(identity),
+                "label": "人物最终立绘",
+                "role": "identity",
+                "binding": "身份基准",
+            },
+        ],
+    })
+
+    images = [item for item in content if item.get("type") == "image"]
+    labels = [item["text"] for item in content if item.get("type") == "text"]
+    assert len(images) == 5
+    assert "实际候选#2" in labels[0]
+    assert "candidate_id=set-1#2" in labels[0]
+    assert sum("职责=candidate_comparison" in label for label in labels) == 3
+    assert any("实际候选#3" in label and "candidate_id=set-1#3" in label
+               for label in labels)
+    assert all("set-1#1" not in label for label in labels)
+    assert any("职责=identity" in label for label in labels)
+
+
+def test_candidate_comparison_validator_binds_id_to_original_index():
+    from aifos.adapters.claude_script import validate_candidate_comparison
+
+    payload = {"candidate_comparison": {
+        "candidate_set_token": "set-1",
+        "target_input_hash": "target",
+        "reference_selection_hash": "refs",
+        "ranking_input_hash": "rank",
+        "candidates": [{
+            "candidate_id": "set-1#2", "candidate_index": 2,
+            "uri": "/tmp/candidate-2.png",
+        }, {
+            "candidate_id": "set-1#4", "candidate_index": 4,
+            "uri": "/tmp/candidate-4.png",
+        }],
+    }}
+    result = {
+        "candidate_set_token": "set-1",
+        "target_input_hash": "target",
+        "reference_selection_hash": "refs",
+        "ranking_input_hash": "rank",
+        "candidates": [{
+            "candidate_id": "set-1#2", "candidate_index": 2,
+        }, {
+            "candidate_id": "set-1#4", "candidate_index": 4,
+        }],
+        "winner_candidate_id": "set-1#2",
+    }
+
+    assert validate_candidate_comparison(result, payload) is None
+    result["candidates"][0]["candidate_index"] = 1
+    assert "candidate_id/index" in validate_candidate_comparison(
+        result, payload)
+
+
+def test_claude_candidate_comparison_rejects_mislabeled_image_block(
+        tmp_path):
+    provider = ClaudeApiProvider(
+        "claude_api", _claude_conf("http://127.0.0.1:1"))
+    candidate_2 = tmp_path / "candidate-2.png"
+    candidate_4 = tmp_path / "candidate-4.png"
+    candidate_2.write_bytes(PNG_1PX)
+    candidate_4.write_bytes(PNG_1PX)
+    payload = {
+        "candidate_comparison": {
+            "candidates": [{
+                "candidate_id": "set#2", "candidate_index": 2,
+                "uri": str(candidate_2),
+            }, {
+                "candidate_id": "set#4", "candidate_index": 4,
+                "uri": str(candidate_4),
+            }],
+        },
+        "image_uri": str(candidate_2),
+        "reference_manifest": [{
+            "index": 2, "uri": str(candidate_4),
+            "role": "candidate_comparison",
+            "candidate_id": "set#4",
+            # The actual frozen candidate is #4, not upload block #2.
+            "candidate_index": 2,
+        }],
+    }
+
+    with pytest.raises(ProviderError, match="candidate_id/index"):
+        provider._qc_content("比较", payload)
+
+
 # ---------------- OpenAI 兼容出图 API ----------------
 
 def _image_conf(endpoint):

@@ -220,25 +220,33 @@ def test_director_autonomy_mode_is_final_composite_not_preview(tmp_path):
         app.close()
 
 
-def test_director_autonomy_skips_storyboard_repair_gates(
+def test_director_autonomy_still_runs_storyboard_physics_preflight(
         tmp_path, monkeypatch):
     app = App(
         tmp_path / "ws",
         config_overrides={"defaults": {"director_autonomy_mode": True}})
     try:
+        calls = []
+
+        def shootability(*_args, **_kwargs):
+            calls.append("shootability")
+            return {"passed": True, "issues": [], "by_shot": {}}
+
+        def temporal(*_args, **_kwargs):
+            calls.append("temporal")
+            return {"passed": True, "issues": [], "by_shot": {}}
+
         monkeypatch.setattr(
-            "aifos.director.preflight_storyboard",
-            lambda *_args, **_kwargs: pytest.fail(
-                "导演自主模式不应执行分镜可拍性复检"))
+            "aifos.director.preflight_storyboard", shootability)
+        monkeypatch.setattr("aifos.previz_checks.previz_report", temporal)
         ctx = {"storyboard": {}, "blocking": {}}
 
         shootability = app.director._preflight_storyboard_shootability(ctx)
         temporal = app.director._preflight_temporal_previz(ctx)
 
-        assert shootability["repair_skipped"] == "director_autonomy"
-        assert temporal["repair_skipped"] == "director_autonomy"
-        assert shootability["inspection_waived"] is True
-        assert temporal["inspection_waived"] is True
+        assert shootability == {"issues": [], "repaired": 0}
+        assert temporal == {"issues": [], "repaired": 0}
+        assert calls == ["shootability", "temporal"]
     finally:
         app.close()
 
@@ -704,6 +712,80 @@ def test_candidate_repair_caps_at_ten_rounds_and_promotes_best_without_gate(
         assert group["max_candidate_rounds"] == 10
         assert group["total_generated_candidates"] == 40
         assert len(group["candidate_round_history"]) == 10
+    finally:
+        app.close()
+
+
+def test_candidate_repair_resume_keeps_round_cap_history_and_prior_best(
+        tmp_path, monkeypatch):
+    """A restart in round 7 must not redraw rounds 1-6 or lose their winner."""
+    app = App(tmp_path / "ws")
+    try:
+        history = []
+        best_result = None
+        for round_no in range(1, 7):
+            prior = _candidate_result(
+                tmp_path, expected=4, available=4, passed=False,
+                revision=round_no, cost=4.0)
+            if round_no == 2:
+                prior.data["candidate_group"]["candidates"][0][
+                    "score"] = 250.0
+            promoted = app.director._ai_promote_generated_candidate_group(
+                prior)
+            group = copy.deepcopy(promoted.data["candidate_group"])
+            group["generation_round"] = round_no
+            group["max_candidate_rounds"] = 10
+            history.append(group)
+            if round_no == 2:
+                best_result = promoted
+
+        best_snapshot = \
+            app.director._candidate_best_provisional_snapshot(
+                best_result, 250.0)
+        queue = [
+            _candidate_result(
+                tmp_path, expected=4, available=4, passed=False,
+                revision=round_no, cost=4.0)
+            for round_no in range(7, 11)
+        ]
+        calls = []
+
+        def generate(_capability, payload, _out_dir, _cancel, _qc_spec):
+            calls.append(copy.deepcopy(payload))
+            return queue.pop(0)
+
+        def escalate(report, *_args, **_kwargs):
+            report = dict(report)
+            round_no = int(report["consecutive_failures"])
+            report["codex_escalation"] = {
+                "instruction_to_aifos":
+                    f"第{round_no + 1}轮使用新的物理可拍静态方案"}
+            return report, 0.1
+
+        monkeypatch.setattr(app.director, "_generate_image_gacha", generate)
+        monkeypatch.setattr(
+            app.director, "_escalate_failed_image_to_codex", escalate)
+
+        result = app.director._generate_shot_candidate_group(
+            "image", {
+                "_episode_id": "episode-test", "shot_no": 1,
+                "_candidate_generation_round": 7,
+                "_candidate_revision": 7, "_contract_revision": 7,
+                "_candidate_round_history": history,
+                "_candidate_best_provisional": best_snapshot,
+                "prompt": "第7轮重启前已修订的镜头合同",
+            }, tmp_path, None, {})
+
+        assert len(calls) == 4
+        assert [row["_candidate_generation_round"] for row in calls] == \
+            [7, 8, 9, 10]
+        assert calls[0]["prompt"] == "第7轮重启前已修订的镜头合同"
+        assert result.uri.endswith("r2-candidate-1.svg")
+        group = result.data["candidate_group"]
+        assert group["round_status"] == "exhausted"
+        assert group["total_generated_candidates"] == 40
+        assert len(group["candidate_round_history"]) == 10
+        assert queue == []
     finally:
         app.close()
 

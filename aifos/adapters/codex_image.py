@@ -29,7 +29,9 @@ from pathlib import Path
 
 from aifos.generation_diagnostics import normalize_generation_diagnostics
 from aifos.adapters.claude_script import (
+    build_candidate_comparison_prompt,
     static_image_qc_projection,
+    validate_candidate_comparison,
     validate_image_qc,
 )
 from aifos.prompt_contract import readable_text_required, sanitize_text_whitelist
@@ -710,6 +712,28 @@ def build_instruction(capability, payload, out_dir):
             "first_source": "generated", "last_source": "generated",
             "keyframe_phase": keyframe_phase}
     if capability == "image_qc":
+        if payload.get("candidate_comparison"):
+            request = payload.get("candidate_comparison") or {}
+            candidates = [
+                row for row in request.get("candidates") or []
+                if isinstance(row, dict)]
+            if not candidates:
+                raise ValueError("Codex 候选比较缺少冻结 candidates")
+            upload_map = "；".join(
+                "实际候选"
+                f"#{row.get('candidate_index')} "
+                f"candidate_id={row.get('candidate_id')} "
+                f"uri={row.get('uri')}"
+                for row in candidates)
+            instruction = (
+                build_candidate_comparison_prompt(payload)
+                + "\n【实际图片读取映射】"
+                + upload_map
+                + "。必须逐个打开这些 URI 对应的图片；不能只检查第一张，"
+                  "不能把上传位置序号当成 candidate_index，也不能返回普通"
+                  "单图质检 pass/visual_pass 结构。"
+            )
+            return instruction, [], {"candidate_comparison": True}
         image = payload.get("image_uri", "")
         static_projection = static_image_qc_projection(payload)
         chars = "、".join(payload.get("characters", [])) or "无人(空镜)"
@@ -1371,6 +1395,27 @@ def run(request, codex, timeout, extra_args, plain=False):
         }
     if capability == "image_qc":
         verdict = _extract_json(proc.stdout)
+        if payload.get("candidate_comparison"):
+            if verdict is None:
+                return {
+                    "ok": False,
+                    "error": "Codex 未返回可解析的候选四图比较 JSON",
+                }
+            validation_error = validate_candidate_comparison(
+                verdict, payload)
+            if validation_error:
+                return {
+                    "ok": False,
+                    "error": (
+                        "Codex 候选四图比较结构无效："
+                        + validation_error),
+                }
+            return {
+                "ok": True,
+                "data": verdict,
+                "uri": "",
+                "model": "Codex 候选四图比较导演",
+            }
         if verdict is None or "pass" not in verdict:
             # 看不到可靠的结构化结论就失败关闭。伪造 checked/match=true
             # 会让换性别、人数错误或串脸图片绕过导演层硬门槛。

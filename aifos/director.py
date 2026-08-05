@@ -97,7 +97,8 @@ from .selection_mode import (
     evaluate_candidate_promotion,
 )
 from .rule_governance import next_revision_round, stack_revision_feedback
-from .rule_scope import RuleScopeError, resolve_rules
+from .rule_scope import (
+    RuleScopeError, normalize_rule_applicability, resolve_rules)
 from .spatial_language import derive_movement_term, spatial_lines
 from .storyboard_preflight import (describe_issues, preflight_storyboard,
                                   repairable_shots)
@@ -804,11 +805,6 @@ class Director:
         by the server-side owner so a pasted pack cannot claim another work.
         """
         pack = pack if isinstance(pack, dict) else {}
-        aliases = {
-            "stages": "stage", "modalities": "modality",
-            "shot_nos": "shot_no", "scene_nos": "scene_no",
-            "story_phases": "story_phase", "eras": "era",
-        }
         rows = []
         for index, raw in enumerate(pack.get("rules") or []):
             if not isinstance(raw, dict) or raw.get("enabled") is False:
@@ -816,12 +812,16 @@ class Director:
             key = str(raw.get("key") or "").strip()
             if not key:
                 continue
-            applicability = raw.get("applicability", raw.get("applies_to", {}))
-            applicability = (
-                dict(applicability) if isinstance(applicability, dict) else {})
-            for plural, singular in aliases.items():
-                if plural in applicability and singular not in applicability:
-                    applicability[singular] = applicability.pop(plural)
+            if "applicability" in raw and "applies_to" in raw:
+                raise RuleScopeError(
+                    f"{scope} rule {key!r} supplies both applicability and "
+                    "applies_to")
+            raw_applicability = raw.get(
+                "applicability", raw.get("applies_to", {}))
+            if not isinstance(raw_applicability, dict):
+                raise RuleScopeError(
+                    f"{scope} rule {key!r} applicability must be a mapping")
+            applicability = normalize_rule_applicability(raw_applicability)
             row = {
                 "key": key,
                 "value": copy.deepcopy(
@@ -844,14 +844,17 @@ class Director:
         for suppression in bundle["suppressions"]:
             if not isinstance(suppression, dict):
                 continue
+            if ("applicability" in suppression
+                    and "applies_to" in suppression):
+                raise RuleScopeError(
+                    f"{scope} suppression supplies both applicability and "
+                    "applies_to")
             applicability = suppression.get(
                 "applicability", suppression.get("applies_to", {}))
             if not isinstance(applicability, dict):
-                continue
-            normalized = dict(applicability)
-            for plural, singular in aliases.items():
-                if plural in normalized and singular not in normalized:
-                    normalized[singular] = normalized.pop(plural)
+                raise RuleScopeError(
+                    f"{scope} suppression applicability must be a mapping")
+            normalized = normalize_rule_applicability(applicability)
             suppression["applicability"] = normalized
             suppression.pop("applies_to", None)
         if episode_id is not None:
@@ -911,8 +914,8 @@ class Director:
     def _shot_rule_phase(shot):
         shot = shot if isinstance(shot, dict) else {}
         return str(
-            shot.get("story_phase") or shot.get("active_realm_id")
-            or shot.get("realm_id") or "present").strip()
+            shot.get("active_story_phase") or shot.get("story_phase")
+            or "present").strip()
 
     def _resolve_effective_rules(self, ctx, *, shot=None, stage="",
                                  modality=""):
@@ -923,7 +926,13 @@ class Director:
         world = (ctx.get("script") or {}).get("story_world") or {}
         local_era = str(
             shot.get("era_context") or shot.get("era")
-            or shot.get("active_realm_id") or "").strip()
+            or "").strip()
+        active_realm_id = str(
+            shot.get("active_realm_id") or shot.get("realm_id")
+            or "").strip()
+        event_id = str(
+            shot.get("event_id") or shot.get("scene_event_id")
+            or shot.get("story_event_id") or "").strip()
         episode_rows = list((layers.get("episode") or {}).get("rules") or [])
         legacy_values = {
             "world.era": world.get("era_and_location") or world.get("name"),
@@ -951,7 +960,6 @@ class Director:
             })
         for field, key in (
                 ("story_phase", "world.story_phase"),
-                ("active_realm_id", "world.active_realm_id"),
                 ("sanctioned_anachronisms",
                  "world.sanctioned_anachronisms")):
             if field in shot and shot.get(field) not in (None, ""):
@@ -959,6 +967,17 @@ class Director:
                     "key": key, "value": copy.deepcopy(shot.get(field)),
                     "source": f"current_shot.{field}",
                 })
+        if active_realm_id:
+            shot_rows.append({
+                "key": "world.active_realm_id",
+                "value": active_realm_id,
+                "source": "current_shot.active_realm_id",
+            })
+        if event_id:
+            shot_rows.append({
+                "key": "world.event_id", "value": event_id,
+                "source": "current_shot.event_id",
+            })
         for raw in shot.get("temporary_rules") or shot.get("rules") or []:
             if isinstance(raw, dict):
                 shot_rows.append(copy.deepcopy(raw))
@@ -995,6 +1014,8 @@ class Director:
             "scene_no": shot.get("scene_no"),
             "story_phase": self._shot_rule_phase(shot),
             "era": local_era or str(world.get("era_and_location") or ""),
+            "active_realm_id": active_realm_id or None,
+            "event_id": event_id or None,
         }
         try:
             return resolve_rules(
@@ -6783,6 +6804,151 @@ class Director:
     DEFAULT_IMAGE_GACHA = {
         "batch": 1, "important": 2, "final": 3, "complex_text": 3}
 
+    CANDIDATE_RESUME_SCHEMA = "aifos.shot-candidate-resume/v1"
+
+    @staticmethod
+    def _candidate_resume_payload_snapshot(payload):
+        """Return a JSON-safe exact-round payload without runtime callbacks.
+
+        ``render_plan.json`` is the durable checkpoint.  A repaired round must
+        restart with the same prompt/reference contract, but callbacks and the
+        current live group are process-local and would either fail JSON
+        serialization or recursively embed the checkpoint inside itself.
+        """
+        snapshot = copy.deepcopy(payload or {})
+        for key in (
+                "_candidate_progress_callback", "_candidate_resume_state",
+                "_resume_candidate_group", "_candidate_round_history",
+                "_candidate_best_provisional"):
+            snapshot.pop(key, None)
+        return json.loads(json.dumps(
+            snapshot, ensure_ascii=False, default=str))
+
+    @staticmethod
+    def _candidate_best_provisional_snapshot(selected, score=None):
+        """Serialize the best candidate across completed rounds."""
+        if selected is None or not getattr(selected, "uri", ""):
+            return {}
+        data = copy.deepcopy(getattr(selected, "data", None) or {})
+        group = data.get("candidate_group") or {}
+        selection = group.get("selection") or data.get("selection") or {}
+        if score is None:
+            score = selection.get("ranking_score") or 0.0
+        snapshot = {
+            "schema": "aifos.shot-best-provisional/v1",
+            "uri": str(getattr(selected, "uri", "") or ""),
+            "provider": str(getattr(selected, "provider", "") or ""),
+            "model": str(getattr(selected, "model", "") or ""),
+            "fallbacks": copy.deepcopy(
+                getattr(selected, "fallbacks", None) or []),
+            "qc": copy.deepcopy(getattr(selected, "qc", None) or {}),
+            "data": data,
+            "ranking_score": float(score or 0.0),
+        }
+        return json.loads(json.dumps(
+            snapshot, ensure_ascii=False, default=str))
+
+    @staticmethod
+    def _candidate_best_provisional_from_snapshot(snapshot):
+        """Rebuild a provider-like result used by ten-round global ranking."""
+        if (not isinstance(snapshot, dict)
+                or snapshot.get("schema")
+                != "aifos.shot-best-provisional/v1"
+                or not str(snapshot.get("uri") or "")):
+            return None
+        uri = str(snapshot.get("uri") or "")
+        if (not uri.startswith(("http://", "https://"))
+                and not Path(uri).is_file()):
+            return None
+        try:
+            score = float(snapshot.get("ranking_score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        result = SimpleNamespace(
+            provider=str(snapshot.get("provider") or ""),
+            model=str(snapshot.get("model") or ""),
+            cost=0.0,
+            fallbacks=copy.deepcopy(snapshot.get("fallbacks") or []),
+            uri=uri,
+            qc=copy.deepcopy(snapshot.get("qc") or {}),
+            data=copy.deepcopy(snapshot.get("data") or {}),
+        )
+        return result, score
+
+    @classmethod
+    def _candidate_payload_from_resume_progress(
+            cls, fresh_payload, live_group, *, max_rounds=10):
+        """Restore one exact candidate round from its durable progress row.
+
+        The current live group's candidates are restored separately by the
+        candidate worker after frozen-hash/file checks.  This method restores
+        the outer-loop facts that used to be lost: round number, prior-round
+        history, best prior image and the repaired prompt/reference payload.
+        """
+        if not isinstance(live_group, dict):
+            return copy.deepcopy(fresh_payload or {}), False
+        state = live_group.get("resume_state") or {}
+        if (not isinstance(state, dict)
+                or state.get("schema") != cls.CANDIDATE_RESUME_SCHEMA
+                or not isinstance(state.get("resume_payload"), dict)
+                or not isinstance(state.get("round_history"), list)):
+            return copy.deepcopy(fresh_payload or {}), False
+        try:
+            generation_round = int(state.get("generation_round") or 0)
+            configured_max = int(
+                state.get("max_candidate_rounds") or max_rounds)
+        except (TypeError, ValueError):
+            return copy.deepcopy(fresh_payload or {}), False
+        max_rounds = max(1, min(int(max_rounds or 10), configured_max))
+        history = copy.deepcopy(state.get("round_history") or [])
+        if (generation_round < 1 or generation_round > max_rounds
+                or len(history) > generation_round - 1):
+            return copy.deepcopy(fresh_payload or {}), False
+        history_rounds = []
+        for group in history:
+            if not isinstance(group, dict):
+                return copy.deepcopy(fresh_payload or {}), False
+            try:
+                value = int(group.get("generation_round") or 0)
+            except (TypeError, ValueError):
+                return copy.deepcopy(fresh_payload or {}), False
+            if value < 1 or value >= generation_round:
+                return copy.deepcopy(fresh_payload or {}), False
+            history_rounds.append(value)
+        if len(set(history_rounds)) != len(history_rounds):
+            return copy.deepcopy(fresh_payload or {}), False
+
+        restored = cls._candidate_resume_payload_snapshot(
+            state["resume_payload"])
+        fresh = fresh_payload or {}
+        # Run identity is authoritative at restart; the generation contract is
+        # authoritative for every other field in this round.
+        if (fresh.get("_episode_id") and restored.get("_episode_id")
+                and str(fresh["_episode_id"])
+                != str(restored["_episode_id"])):
+            return copy.deepcopy(fresh), False
+        if fresh.get("_episode_id"):
+            restored["_episode_id"] = fresh["_episode_id"]
+        if (fresh.get("shot_no") is not None
+                and restored.get("shot_no") is not None):
+            try:
+                shot_mismatch = (
+                    int(fresh["shot_no"]) != int(restored["shot_no"]))
+            except (TypeError, ValueError):
+                shot_mismatch = (
+                    str(fresh["shot_no"]) != str(restored["shot_no"]))
+            if shot_mismatch:
+                return copy.deepcopy(fresh), False
+        restored["_candidate_generation_round"] = generation_round
+        restored["_max_candidate_rounds"] = max_rounds
+        restored["_candidate_round_history"] = history
+        best = copy.deepcopy(state.get("best_provisional") or {})
+        if best:
+            restored["_candidate_best_provisional"] = best
+        else:
+            restored.pop("_candidate_best_provisional", None)
+        return restored, True
+
     def _gacha_pulls(self, payload):
         table = self.config.get(
             "defaults", "image_gacha", default=None) or {}
@@ -6802,6 +6968,8 @@ class Director:
         working_payload = copy.deepcopy(payload or {})
         progress_callback = working_payload.pop(
             "_candidate_progress_callback", None)
+        resume_state = working_payload.pop(
+            "_candidate_resume_state", None)
         try:
             generation_round = max(
                 1, int(working_payload.get(
@@ -6829,6 +6997,8 @@ class Director:
                 "expected_count": int(pulls),
                 "status": status,
             }
+            if isinstance(resume_state, dict):
+                progress["resume_state"] = copy.deepcopy(resume_state)
             if isinstance(group_meta, dict):
                 progress.update(copy.deepcopy(group_meta))
             if candidates is not None:
@@ -6846,7 +7016,6 @@ class Director:
                     + str(exc)[:180])
                 return None
 
-        report_progress(0, 0)
         if not isinstance(working_payload.get("reference_manifest"), list):
             self._attach_reference_manifest(working_payload)
         # Prompt review 与内容 QC 是两个闸门；选片模式仍先审核
@@ -6858,7 +7027,7 @@ class Director:
                 "_prompt_review_frozen_input_hash") or "")
             == before_review["input_hash"])
         review = None
-        if not already_reviewed:
+        if not already_reviewed and self._prompt_review_enabled():
             review = self.router.review_image_prompt(
                 capability, working_payload, out_dir, cancel=cancel)
         review_cost = float(review.cost or 0.0) if review is not None else 0.0
@@ -6868,6 +7037,14 @@ class Director:
         # 输入哈希同时匹配；任何提示词/参考图变化都会自动失效并重新审核。
         working_payload["_prompt_review_frozen_input_hash"] = \
             frozen_input["input_hash"]
+        if isinstance(resume_state, dict):
+            # Prompt review may replace the provider-facing prompt.  Persist
+            # that frozen post-review contract (plus its approval hash), not
+            # the pre-review draft prepared by the outer loop; otherwise a
+            # restart could review it differently and invalidate completed
+            # slots from this very round.
+            resume_state["resume_payload"] = \
+                self._candidate_resume_payload_snapshot(working_payload)
         frozen_prompt_hash = frozen_input["prompt_hash"]
         frozen_reference_hash = frozen_input["reference_hash"]
         frozen_input_hash = frozen_input["input_hash"]
@@ -6898,6 +7075,11 @@ class Director:
             "candidate_set_token": version.token,
             "contract_revision": version.contract_revision,
             "candidate_revision": version.candidate_revision,
+            # 中途重启后只有这三个冻结哈希都匹配，已落盘槽位才允许
+            # 复用；否则宁可重抽，也不能把旧提示词/旧参考图混进新组。
+            "frozen_prompt_hash": frozen_prompt_hash,
+            "frozen_reference_hash": frozen_reference_hash,
+            "frozen_input_hash": frozen_input_hash,
             "complete": False,
             "technical_incomplete": False,
         }
@@ -6984,6 +7166,7 @@ class Director:
                 "issues": list(report.get("issues") or [])[:8],
                 "ranking_unavailable": bool(
                     report.get("ranking_unavailable")),
+                "qc_disabled": bool(report.get("qc_disabled")),
                 "prompt_hash": candidate_input["prompt_hash"],
                 "reference_hash": candidate_input["reference_hash"],
                 "input_hash": candidate_input["input_hash"],
@@ -7088,13 +7271,129 @@ class Director:
             usable_count == pulls and same_prompt and same_references)
         complete = bool(
             usable_count > 0 and same_prompt and same_references)
-        recommended_result = max(
+        from .candidate_ranking import (
+            build_candidate_comparison_request, build_candidate_ranking)
+        reference_decision = working_payload.get(
+            "reference_selection_decision") or {}
+        reference_selection_hash = str(
+            reference_decision.get("selection_hash")
+            or frozen_reference_hash)
+        comparative_ranking = build_candidate_ranking(
+            candidates,
+            candidate_set_token=version.token,
+            target_input_hash=frozen_input_hash,
+            reference_selection_hash=reference_selection_hash)
+        comparison_cost = 0.0
+        comparison_provider = ""
+        if (len(comparative_ranking.get("eligible_candidate_ids") or []) > 1
+                and self._image_qc_enabled()):
+            request = build_candidate_comparison_request(
+                comparative_ranking,
+                reference_bindings=(
+                    reference_decision.get("bindings")
+                    or working_payload.get("reference_manifest") or []),
+                target_facts={
+                    "shot_no": working_payload.get("shot_no"),
+                    "visible_characters": list(
+                        working_payload.get("characters") or []),
+                    "location": working_payload.get("location") or "",
+                    "era_context": working_payload.get("era_context") or "",
+                    "frame_kind": working_payload.get("frame_kind")
+                    or "keyframe",
+                })
+            try:
+                candidate_by_id = {
+                    str(candidate.get("candidate_id") or ""): candidate
+                    for candidate in candidates
+                    if str(candidate.get("candidate_id") or "")
+                }
+                eligible_candidates = [
+                    candidate_by_id[str(row.get("candidate_id") or "")]
+                    for row in request.get("candidates") or []
+                    if str(row.get("candidate_id") or "") in candidate_by_id
+                ]
+                if len(eligible_candidates) != len(
+                        request.get("candidates") or []):
+                    raise AifosError(
+                        "候选比较清单与本轮 eligible_candidate_ids 不一致")
+                comparison_manifest = []
+                # 远端多模态判官无法读取提示词里的本机路径。第一张候选
+                # 必须是首个 eligible 候选并走 image_uri，剩余 eligible
+                # 候选作为真实图片块加入 manifest；failed/stale/技术坏图
+                # 不得因固定 candidates[0] 而被上传或参与比较。
+                # 之后才附本轮身份/场景/空间参考，确保是“四图同屏比较”
+                # 而不是只看第一张、凭路径猜另外三张。
+                for position, candidate in enumerate(
+                        eligible_candidates[1:], 2):
+                    candidate_index = int(
+                        candidate.get("candidate_index") or position)
+                    candidate_id = str(
+                        candidate.get("candidate_id") or candidate_index)
+                    comparison_manifest.append({
+                        # image_uri is upload position 1; these are the exact
+                        # subsequent image-block positions.
+                        "index": position,
+                        "uri": candidate.get("uri", ""),
+                        "label": (
+                            f"候选#{candidate_index}/{candidate_id}"),
+                        "role": "candidate_comparison",
+                        "candidate_id": candidate_id,
+                        "candidate_index": candidate_index,
+                        "binding": "与第一张候选做同轮相对比较，不是生成参考图",
+                    })
+                comparison_references = copy.deepcopy(
+                    working_payload.get("reference_manifest") or [])
+                for reference in comparison_references:
+                    reference["index"] = len(comparison_manifest) + 2
+                    comparison_manifest.append(reference)
+                # 候选图占据前面的真实上传位置后，参考职责中的 image_index
+                # 也必须重基，不得继续声称是生成阶段的图1/图2。
+                request["reference_bindings"] = [{
+                    "image_index": reference.get("index"),
+                    "selection_key": reference.get("selection_key", ""),
+                    "asset_id": reference.get("asset_id"),
+                    "uri": reference.get("uri", ""),
+                    "role": reference.get("role", ""),
+                    "target": reference.get("character", ""),
+                    "instruction": reference.get("binding", ""),
+                } for reference in comparison_manifest
+                    if reference.get("role") != "candidate_comparison"]
+                comparison = self.router.call(
+                    "image_qc", {
+                        "candidate_comparison": request,
+                        "image_uri": eligible_candidates[0].get("uri", ""),
+                        "reference_manifest": comparison_manifest,
+                        "image_quality": working_payload.get(
+                            "image_quality"),
+                        "quality": working_payload.get("quality"),
+                        "quality_decision": copy.deepcopy(
+                            working_payload.get("quality_decision") or {}),
+                    }, out_dir, cancel=cancel)
+                comparison_cost = float(comparison.cost or 0.0)
+                comparison_provider = str(comparison.provider or "")
+                comparative_ranking = build_candidate_ranking(
+                    candidates,
+                    candidate_set_token=version.token,
+                    target_input_hash=frozen_input_hash,
+                    reference_selection_hash=reference_selection_hash,
+                    model_result=comparison.data or {},
+                    model=str(getattr(comparison, "model", "") or ""))
+            except (AifosError, ProviderUnavailable, ProviderError) as exc:
+                self.log.warn(
+                    "director", "四图同屏比较暂不可用，已用冻结单图分数稳定"
+                    f"回退且不阻断：{str(exc)[:180]}")
+        winner_id = str(
+            comparative_ranking.get("winner_candidate_id") or "")
+        recommended_result = next((
+            item for item in ordered
+            if str(item[1].get("candidate_id") or "") == winner_id
+        ), max(
             ordered,
             key=lambda item: (
                 1 if item[1].get("passed") else 0,
                 float(item[1].get("score") or 0.0),
                 -int(item[1].get("candidate_index") or 0)),
-            default=(None, {}))
+            default=(None, {})))
         recommended_candidate = recommended_result[1]
         recommended_index = int(
             recommended_candidate.get("candidate_index") or 0)
@@ -7131,8 +7430,9 @@ class Director:
             "recommended_candidate_id": str(
                 recommended_candidate.get("candidate_id") or ""),
             "ranking_unavailable": bool(
-                candidates and all(
-                    row.get("ranking_unavailable") for row in candidates)),
+                comparative_ranking.get("ranking_unavailable")),
+            "candidate_ranking": comparative_ranking,
+            "comparative_ranking_provider": comparison_provider,
             "frozen_prompt_hash": frozen_prompt_hash,
             "frozen_reference_hash": frozen_reference_hash,
             "frozen_input_hash": frozen_input_hash,
@@ -7156,7 +7456,7 @@ class Director:
         if isinstance(manual_selection_request, dict):
             group["manual_selection_request"] = copy.deepcopy(
                 manual_selection_request)
-        selected.cost = review_cost + sum(
+        selected.cost = review_cost + comparison_cost + sum(
             float(result.cost or 0.0) for result, _candidate in ordered
             if result is not None)
         # 候选组完成不等于正式关键帧完成。禁止通过
@@ -7587,10 +7887,21 @@ class Director:
             self, result, payload, qc_spec, out_dir, cancel):
         """让 AI 导演给候选排序，但判词永远不成为生产门禁。
 
-        关闭阻断式图片 QC 只关闭“判败即停/自动返工”，不等于盲选。
-        候选仍以同一镜头合同做一次视觉评分；评分服务不可用时保留
-        技术可用图并返回显式风险，由调用方确定性选择第一张。
+        内容质检开启时，候选仍以同一镜头合同做一次视觉评分；评分服务
+        不可用时保留技术可用图并返回显式风险。用户明确关闭图片内容质检
+        时则绝不暗中调用 image_qc，也不允许该缺席判词触发返修抽卡。
         """
+        if not self._image_qc_enabled():
+            report = {
+                "passed": None,
+                "issues": ["图片内容质检已关闭，仅按技术完整性确定性选片"],
+                "score": 0.0,
+                "nonblocking_ranking": True,
+                "ranking_unavailable": True,
+                "qc_disabled": True,
+            }
+            result.qc = report
+            return report
         existing = getattr(result, "qc", None)
         if isinstance(existing, dict) and existing:
             ranked = copy.deepcopy(existing)
@@ -8196,6 +8507,10 @@ class Director:
         total_cost = 0.0
         best_provisional = None
         best_provisional_score = float("-inf")
+        restored_best = self._candidate_best_provisional_from_snapshot(
+            candidate_payload.get("_candidate_best_provisional") or {})
+        if restored_best is not None:
+            best_provisional, best_provisional_score = restored_best
         initial_group = None
 
         while generation_round <= max_rounds:
@@ -8207,6 +8522,30 @@ class Director:
             candidate_payload["_gacha_pulls_override"] = \
                 self._shot_candidate_count()
             candidate_payload["_gacha_select_best_after_all"] = True
+            candidate_payload["_candidate_round_history"] = copy.deepcopy(
+                round_history)
+            best_snapshot = self._candidate_best_provisional_snapshot(
+                best_provisional, best_provisional_score)
+            if best_snapshot:
+                candidate_payload["_candidate_best_provisional"] = \
+                    best_snapshot
+            else:
+                candidate_payload.pop(
+                    "_candidate_best_provisional", None)
+            # Persist the exact input for this round before any slot starts.
+            # Progress rows carry this opaque state alongside independently
+            # completed candidates, so restart resumes this round rather than
+            # silently returning to round 1/the original prompt contract.
+            resume_payload = self._candidate_resume_payload_snapshot(
+                candidate_payload)
+            candidate_payload["_candidate_resume_state"] = {
+                "schema": self.CANDIDATE_RESUME_SCHEMA,
+                "generation_round": generation_round,
+                "max_candidate_rounds": max_rounds,
+                "round_history": copy.deepcopy(round_history),
+                "best_provisional": copy.deepcopy(best_snapshot),
+                "resume_payload": resume_payload,
+            }
             selected = self._generate_image_gacha(
                 capability, candidate_payload, out_dir, cancel, qc_spec)
             total_cost += float(selected.cost or 0.0)
@@ -8255,11 +8594,14 @@ class Director:
                     "qualified": bool(
                         manual_selection.get("candidate_passed")),
                     "repair_exhausted": False,
-                    "candidate_round_history": round_history,
                     "total_generated_candidates": sum(
                         int(row.get("candidate_count") or 0)
                         for row in round_history),
                 })
+                history_entry = copy.deepcopy(manual_group)
+                history_entry.pop("candidate_round_history", None)
+                round_history[-1] = history_entry
+                manual_group["candidate_round_history"] = round_history
                 manual_promoted.data["candidate_group"] = manual_group
                 manual_promoted.data["candidate_round_history"] = \
                     round_history
@@ -8268,6 +8610,12 @@ class Director:
             promoted_group = ((getattr(promoted, "data", None) or {}).get(
                 "candidate_group") or {})
             selection = promoted_group.get("selection") or {}
+            # The durable round history must contain the actual AI choice,
+            # not the pre-promotion raw group.  This keeps audit/restart facts
+            # aligned with the image that became the cross-round best.
+            history_entry = copy.deepcopy(promoted_group)
+            history_entry.pop("candidate_round_history", None)
+            round_history[-1] = history_entry
             provisional_score = float(
                 selection.get("ranking_score") or 0.0)
             if getattr(promoted, "uri", "") and (
@@ -8275,6 +8623,11 @@ class Director:
                     or provisional_score > best_provisional_score):
                 best_provisional = promoted
                 best_provisional_score = provisional_score
+            best_snapshot = self._candidate_best_provisional_snapshot(
+                best_provisional, best_provisional_score)
+            if best_snapshot:
+                candidate_payload["_candidate_best_provisional"] = \
+                    best_snapshot
 
             if candidate_passed:
                 promoted.cost = total_cost
@@ -8284,11 +8637,14 @@ class Director:
                     "round_status": "qualified",
                     "qualified": True,
                     "repair_exhausted": False,
-                    "candidate_round_history": round_history,
                     "total_generated_candidates": sum(
                         int(row.get("candidate_count") or 0)
                         for row in round_history),
                 })
+                history_entry = copy.deepcopy(final_group)
+                history_entry.pop("candidate_round_history", None)
+                round_history[-1] = history_entry
+                final_group["candidate_round_history"] = round_history
                 promoted.data["candidate_group"] = final_group
                 promoted.data["candidate_round_history"] = round_history
                 return promoted
@@ -8434,6 +8790,7 @@ class Director:
                 1, int(repair_payload.get("_contract_revision") or 1) + 1)
             repair_payload.pop("_candidate_set_id", None)
             repair_payload.pop("_resume_candidate_group", None)
+            repair_payload.pop("_candidate_resume_state", None)
             repair_payload["qc_consecutive_failures_base"] = 1
             repair_payload, repair_qc_spec = \
                 self._replace_repair_static_contract(
@@ -8463,6 +8820,9 @@ class Director:
                         conflict_context="；".join(merged_issues[:12]))
                 self._attach_reference_manifest(repair_payload)
             repair_payload["_candidate_round_history"] = round_history
+            if best_snapshot:
+                repair_payload["_candidate_best_provisional"] = \
+                    copy.deepcopy(best_snapshot)
             repair_payload["_last_repair_instruction"] = instruction[:1800]
             repair_payload["_last_repair_issues"] = copy.deepcopy(
                 merged_issues)
@@ -10907,7 +11267,9 @@ class Director:
                 f"{str(exc)[:240]}")
             return None
 
-    def _persist_script_review(self, ctx, result=None):
+    def _persist_script_review(
+            self, ctx, result=None, *, independent_review=None,
+            generator_source="", generator_run_id="", pending_reason=""):
         """只接受真正独立的五维审稿；否则明确保存待评审建议。"""
         episode_id = ctx["episode"]["id"]
         script_version = str(ctx.get("script_version") or "unknown")
@@ -10919,6 +11281,7 @@ class Director:
                 "director", "剧本独立评审状态读取失败，已跳过且不阻断："
                 f"{str(exc)[:240]}")
             return 0
+
         current_dimensions = (
             current.get("dimensions") if isinstance(current, dict) else None)
         current_ready = bool(
@@ -10944,23 +11307,27 @@ class Director:
             # 复用同一版剧本时不得用“本轮没有 reviewer result”把已经
             # 成立的独立审稿降级成 pending。
             return current_version
-        if (result is None and isinstance(current, dict)
+        if (result is None and independent_review is None
+                and not generator_source and not generator_run_id
+                and not pending_reason and isinstance(current, dict)
                 and current.get("status") == "pending"
                 and str(current.get("script_version") or "")
                 == script_version):
             return current_version
-        provider = str(getattr(result, "provider", "") or "").strip()
+        provider = str(
+            generator_source or getattr(result, "provider", "") or ""
+        ).strip()
         data = getattr(result, "data", None)
-        raw = (
-            data.get("independent_review")
-            if isinstance(data, dict)
-            and isinstance(data.get("independent_review"), dict)
-            else None)
-        generator_run_id = ""
-        if raw is not None:
-            generator_run_id = str(
-                raw.get("generator_run_id") or ctx.get("run_id") or ""
-            ).strip()
+        raw = independent_review if isinstance(
+            independent_review, dict) else (
+                data.get("independent_review")
+                if isinstance(data, dict)
+                and isinstance(data.get("independent_review"), dict)
+                else None)
+        generator_run_id = str(
+            generator_run_id
+            or ((raw or {}).get("generator_run_id") if raw else "")
+            or ctx.get("run_id") or "").strip()
         try:
             if raw is None:
                 raise ValueError("当前编剧 Provider 未返回独立评审运行")
@@ -10990,7 +11357,7 @@ class Director:
                 "generator_run_id": generator_run_id,
                 "generator_source": provider,
                 "scores_available": False,
-                "reason": str(exc),
+                "reason": str(pending_reason or exc),
                 "advice": [
                     "等待与剧本生成运行独立的审稿来源返回完整五维证据后复评。",
                     "本记录只作提示，不阻断分镜与后续生产。",
@@ -11010,6 +11377,143 @@ class Director:
                 "director", "剧本独立评审文档保存失败，已跳过且不阻断："
                 f"{str(exc)[:240]}")
             return 0
+
+    def _run_independent_script_review(self, ctx, generator_result=None):
+        """Run a true second model invocation; advice never blocks production."""
+        episode_id = ctx["episode"]["id"]
+        script_version = str(ctx.get("script_version") or "unknown")
+        # A result for this exact frozen script is reusable.  In particular,
+        # a pending advisory must not spend another model call every time the
+        # user resumes the same production run; a new script version gets its
+        # own review attempt automatically.
+        current, current_version = self.projects.latest_document(
+            episode_id, "script_review")
+        if (isinstance(current, dict)
+                and current.get("status") in {"ready", "pending"}
+                and str(current.get("script_version") or "")
+                == script_version):
+            return current_version
+
+        generator_source = str(
+            getattr(generator_result, "provider", "")
+            or "imported_or_saved_script")
+        # IDs are system-owned.  The reviewer model is never allowed to claim
+        # either identity, which prevents self-reported scores being promoted.
+        generator_run_id = (
+            f"script-generator:{episode_id}:v{script_version}")
+        payload = {
+            "independent_script_review": True,
+            "script": copy.deepcopy(ctx.get("script") or {}),
+            "script_version": script_version,
+            "story_event_graph": copy.deepcopy(
+                ctx.get("story_event_graph") or {}),
+            "generator_run_id": generator_run_id,
+        }
+        self._attach_effective_rules(
+            ctx, {}, payload, stage="script_review", modality="script")
+        try:
+            result = self._call(
+                ctx, "script", payload, "script_review")
+            token_source = "|".join((
+                str(ctx.get("run_id") or ""), script_version,
+                str(getattr(result, "provider", "") or ""),
+                str(time.time_ns()),
+            ))
+            reviewer_run_id = "script-review:" + hashlib.sha256(
+                token_source.encode("utf-8")).hexdigest()[:20]
+            raw = {
+                "generator_run_id": generator_run_id,
+                "reviewer_run_id": reviewer_run_id,
+                "reviewer_source": str(
+                    getattr(result, "provider", "")
+                    or "independent-review-provider"),
+                "dimension_reviews": (
+                    (result.data or {}).get("dimension_reviews")
+                    if isinstance(result.data, dict) else None),
+            }
+            return self._persist_script_review(
+                ctx, independent_review=raw,
+                generator_source=generator_source,
+                generator_run_id=generator_run_id)
+        except Exception as exc:
+            # Review quality is advisory.  Provider/configuration failures are
+            # recorded for observability but never turn back into a story gate.
+            self.log.warn(
+                "director", "独立剧本复审暂不可用，已记录待复审且继续生产："
+                f"{str(exc)[:240]}")
+            return self._persist_script_review(
+                ctx, generator_source=generator_source,
+                generator_run_id=generator_run_id,
+                pending_reason=f"独立复审调用失败: {str(exc)[:300]}")
+
+    def _persist_story_event_graph(self, ctx):
+        """Persist one deterministic event/causality fact source per script.
+
+        It does not invent missing drama.  Validation findings remain visible
+        and are consumed by the storyboard supervisor as local repair scopes;
+        they never turn image/video QC back into a blocking gate.
+        """
+        from .story_event_graph import (
+            build_story_event_graph, validate_story_event_graph)
+
+        graph = build_story_event_graph(
+            ctx.get("script") or {},
+            project_id=ctx["project"]["id"],
+            episode_id=ctx["episode"]["id"],
+            source_document_ref="script",
+            source_version=ctx.get("script_version") or "")
+        graph["script_version"] = ctx.get("script_version")
+        graph["validation"] = {
+            "passed": True,
+            "issues": validate_story_event_graph(graph),
+            "production_blocking": False,
+        }
+        graph["validation"]["passed"] = not graph[
+            "validation"]["issues"]
+        current, version = self.projects.latest_document(
+            ctx["episode"]["id"], "story_event_graph")
+        if (isinstance(current, dict)
+                and current.get("fingerprint") == graph.get("fingerprint")
+                and str(current.get("script_version") or "")
+                == str(ctx.get("script_version") or "")):
+            stored = current
+        else:
+            version = self.projects.save_document(
+                ctx["episode"]["id"], "story_event_graph", graph)
+            stored = graph
+        ctx["story_event_graph"] = stored
+        ctx["story_event_graph_version"] = version
+        if stored.get("validation", {}).get("issues"):
+            self.log.warn(
+                "director", "故事事件图发现结构问题，已保留局部修订范围，"
+                "不阻断生产：" + "；".join(
+                    stored["validation"]["issues"][:4]))
+        return stored, version
+
+    def _persist_story_event_supervision(self, ctx):
+        """Compare the storyboard with event beats and persist repair facts."""
+        from .story_event_graph import supervise_story_event_coverage
+
+        graph = ctx.get("story_event_graph")
+        if not isinstance(graph, dict):
+            graph, _version = self._persist_story_event_graph(ctx)
+        report = supervise_story_event_coverage(
+            graph, ctx.get("storyboard") or {})
+        report.update({
+            "script_version": ctx.get("script_version"),
+            "storyboard_version": ctx.get("storyboard_version"),
+            "story_event_graph_version": ctx.get(
+                "story_event_graph_version"),
+        })
+        version = self._save_review_document(
+            ctx["episode"]["id"], "story_event_supervision", report)
+        ctx["story_event_supervision"] = report
+        if report.get("issues"):
+            self.log.warn(
+                "director", "事件监督发现分镜展开问题，已按 event/beat 留下"
+                "局部返编范围，不阻断其他镜头：" + "；".join(
+                    report["issues"][:4]))
+        return report, version
 
     def _persist_storyboard_reviews(self, ctx, keyframes=()):
         """保存导演审片与浏览九宫格；二者永不进入资产/参考图链。"""
@@ -11054,13 +11558,15 @@ class Director:
                 ctx, force=True)
             ctx["script_is_new"] = True
             version = ctx["script_version"]
-            self._persist_script_review(ctx)
+            _graph, graph_version = self._persist_story_event_graph(ctx)
+            self._run_independent_script_review(ctx)
             self.log.info(
                 "director", f"使用用户自带剧本(v{version})，"
                 f"AI 制作圣经(v{analysis_version})已完成，等待确认")
             return {"version": version, "provided": True,
                     "scenes": len(provided["scenes"]),
                     "story_analysis_version": analysis_version,
+                    "story_event_graph_version": graph_version,
                     "world": analysis["world"]["name"]}
         if not ctx.get("force"):
             existing, version = self.projects.latest_document(
@@ -11082,7 +11588,8 @@ class Director:
                     self._ensure_story_analysis(
                         ctx, force=normalized_changed)
                 version = ctx["script_version"]
-                self._persist_script_review(ctx)
+                _graph, graph_version = self._persist_story_event_graph(ctx)
+                self._run_independent_script_review(ctx)
                 if normalized_changed:
                     self.log.info(
                         "director",
@@ -11094,6 +11601,7 @@ class Director:
                         "scenes": len(existing["scenes"]),
                         "story_analysis_version": analysis_version,
                         "story_analysis_reused": reused,
+                        "story_event_graph_version": graph_version,
                         "world": analysis["world"]["name"]}
         payload = {
             "project_title": ctx["project"]["title"],
@@ -11136,13 +11644,15 @@ class Director:
             ctx, force=True)
         version = ctx["script_version"]
         ctx["script_is_new"] = True     # 新写的剧本 → 触发剧本确认暂停
-        self._persist_script_review(ctx, result)
+        _graph, graph_version = self._persist_story_event_graph(ctx)
+        self._run_independent_script_review(ctx, result)
         self.data.record(
             "prompt", "success", prompt=f"script:{ctx['project']['title']}"
             f":e{episode['number']}", uri=result.uri,
             meta={"version": version}, episode_id=episode["id"])
         return {"version": version, "scenes": len(script["scenes"]),
                 "story_analysis_version": analysis_version,
+                "story_event_graph_version": graph_version,
                 "world": analysis["world"]["name"]}
 
     def _record_script_lessons(self, ctx, script):
@@ -11261,9 +11771,15 @@ class Director:
                 ctx["storyboard"] = existing
                 ctx["storyboard_version"] = version
                 self._persist_storyboard_reviews(ctx)
+                event_review, event_review_version = \
+                    self._persist_story_event_supervision(ctx)
                 self.log.info("director", f"复用已有五维分镜 v{version}")
                 return {"version": version, "reused": True,
-                        "shots": len(existing["shots"])}
+                        "shots": len(existing["shots"]),
+                        "story_event_supervision_version":
+                            event_review_version,
+                        "story_event_supervision_passed":
+                            event_review.get("passed")}
             if existing is not None:
                 self.log.info(
                     "director", "剧本/标准已更新,重出分镜并重制后续画面")
@@ -11295,6 +11811,8 @@ class Director:
                     "script": ctx["script"],
                     "continuity": ctx["continuity"],
                     "production_profile": ctx["production_profile"],
+                    "story_event_graph": copy.deepcopy(
+                        ctx.get("story_event_graph") or {}),
                     **self._storyboard_rule_payload(ctx),
                 }, "storyboard")
             raw_storyboard = result.data
@@ -11331,8 +11849,13 @@ class Director:
                       "seedance_prompt": shot["seedance_prompt"],
                       "unit_id": shot["unit_id"]})
         self._persist_storyboard_reviews(ctx)
+        event_review, event_review_version = \
+            self._persist_story_event_supervision(ctx)
         return {"version": version, "shots": len(storyboard["shots"]),
-                "pipeline_version": storyboard["pipeline_version"]}
+                "pipeline_version": storyboard["pipeline_version"],
+                "story_event_supervision_version": event_review_version,
+                "story_event_supervision_passed": event_review.get(
+                    "passed")}
 
     def _preflight_storyboard_shootability(self, ctx):
         """分镜可拍性预检 + 就地修:分镜出厂即可拍,下游只做翻译。
@@ -11344,16 +11867,9 @@ class Director:
         取景表述),重建空间后复检一次;仍不过只记警告不阻断——下游门禁
         照常兜底,不能因为预检把整条产线卡死。
         """
-        if self._director_autonomy_enabled():
-            self.log.info(
-                "director",
-                "AI导演全权成片模式：跳过分镜可拍性复检与自动改写，"
-                "保持现有冻结镜头直接生产")
-            return {
-                "issues": [], "repaired": 0,
-                "inspection_waived": True,
-                "repair_skipped": "director_autonomy",
-            }
+        # “导演自主”表示发现问题后由系统自行处理、不等待人工，并不
+        # 表示免除可拍性检查。旧逻辑在自主模式下直接跳过这里，恰好会把
+        # 手机朝向、安全带、座椅/床位和人物站位等穿帮一路放到出图层。
         if not self.config.get(
                 "defaults", "storyboard_preflight", default=True):
             return {"issues": [], "repaired": 0}
@@ -11511,16 +12027,8 @@ class Director:
         (previz 页与生产同源可见)。"""
         from .previz_checks import (describe_for_repair, previz_report,
                                     shots_with_issues)
-        if self._director_autonomy_enabled():
-            self.log.info(
-                "director",
-                "AI导演全权成片模式：跳过动态预演复检与自动改写，"
-                "保持现有走位直接生产")
-            return {
-                "issues": [], "repaired": 0,
-                "inspection_waived": True,
-                "repair_skipped": "director_autonomy",
-            }
+        # 自主模式仍须检查运动路径和空间过程；区别只在于问题由导演
+        # 自动局部修正并继续生产，不再转成人工阻断。
         if not self.config.get(
                 "defaults", "storyboard_preflight", default=True):
             return {"issues": [], "repaired": 0}
@@ -15449,6 +15957,10 @@ class Director:
                 "本镜代表关键图（不充当首尾边界）"),
             "reference_role": "composition",
             "reference_phase": phase,
+            # Authored start/end keyframes are exact video boundaries, not
+            # optional aesthetic references.  The selector may rank other
+            # composition images, but it must never drop this one.
+            "mandatory": bool(phase in {"start", "end"}),
         })
         payload["asset_matches"] = matches
         payload["require_reference_images"] = True
@@ -16308,6 +16820,22 @@ class Director:
                     asset_id if asset_id is not None
                     else match.get("asset_id")),
                 "kind": kind or match.get("kind") or role,
+                "mandatory": bool(match.get("mandatory")) or role in {
+                    "identity", "identity_detail", "headwear", "wardrobe",
+                    "prop", "spatial", "scene", "revision_base",
+                },
+                "era_context": str(
+                    match.get("era_context") or "").strip(),
+                "story_phase": str(
+                    match.get("story_phase") or "").strip(),
+                "scene_id": str(
+                    match.get("scene_id") or match.get("location")
+                    or "").strip(),
+                "camera_id": str(
+                    match.get("camera_id") or "").strip(),
+                "view": str(
+                    match.get("view") or match.get("camera_view")
+                    or "").strip(),
             })
 
         for pos, ref in enumerate(
@@ -16617,13 +17145,40 @@ class Director:
                     "人物身份、性别、人数、服装、场景或已锁定文字")
                 ref_role = "manual"
             add(uri, label, binding, character=attach, role=ref_role)
-        if len(entries) > IMAGE_REFERENCE_LIMIT:
+        from .reference_selection import (
+            build_reference_selection_decision,
+            materialize_reference_upload_manifest,
+        )
+        decision = build_reference_selection_decision(
+            entries,
+            max_references=IMAGE_REFERENCE_LIMIT,
+            provider="image",
+            target_facts={
+                "visible_characters": list(
+                    payload.get("characters") or []),
+                "frame_phase": str(
+                    payload.get("frame_phase")
+                    or payload.get("frame_kind") or ""),
+                "scene_id": str(
+                    payload.get("scene_id")
+                    or payload.get("location") or ""),
+                "camera_id": str(payload.get("camera_id") or ""),
+                "view": str(payload.get("camera") or ""),
+                "story_phase": str(payload.get("story_phase") or ""),
+                "era_context": str(payload.get("era_context") or ""),
+            })
+        payload["reference_selection_decision"] = decision
+        if not decision.get("ready"):
             labels = "、".join(entry["label"] for entry in entries)
             raise AifosError(
-                f"本次需要 {len(entries)} 张参考图，超过图片模型公共上限 "
+                f"本次强制参考图需要 "
+                f"{decision.get('budget', {}).get('mandatory_count', 0)} 张，"
+                f"超过图片模型公共上限 "
                 f"{IMAGE_REFERENCE_LIMIT} 张；请拆分任务或删除低优先级参考:"
                 f"{labels}")
-        return entries
+        # binding.image_index 是实际上传位置合同，不能再用 URI set 回到
+        # 原 pool 顺序过滤；可选参考被重排后，那会令“图N职责”指向别图。
+        return materialize_reference_upload_manifest(entries, decision)
 
     def _with_reference_manifest(self, payload):
         """便捷包装:附上参考图对照表后原样返回 payload。"""
@@ -17580,6 +18135,18 @@ class Director:
                     f"已交AI导演就地修正一次，首轮仍固定四抽；"
                     f"不停止其他镜头：{reason[:500]}")
             prior_group = stored_prior.get("candidate_group") or {}
+            live_group = stored_prior.get("candidate_progress") or {}
+            resumable_live_group = bool(
+                isinstance(live_group, dict)
+                and live_group.get("schema")
+                == "aifos.shot-candidate-progress/v1"
+                and live_group.get("candidate_set_id")
+                and live_group.get("candidate_set_token")
+                and live_group.get("frozen_prompt_hash")
+                and live_group.get("frozen_reference_hash")
+                and live_group.get("frozen_input_hash")
+                and isinstance(live_group.get("candidates"), list)
+                and live_group.get("candidates"))
             try:
                 prior_candidate_revision = int(
                     prior_group.get("candidate_revision") or 0)
@@ -17588,6 +18155,30 @@ class Director:
             payload["_episode_id"] = ctx["episode"]["id"]
             payload["_candidate_revision"] = max(
                 1, prior_candidate_revision + 1)
+            payload, resumed_round_contract = \
+                self._candidate_payload_from_resume_progress(
+                    payload, live_group,
+                    max_rounds=self._shot_max_candidate_rounds())
+            if resumed_round_contract:
+                resumable_live_group = True
+                self.log.info(
+                    "director",
+                    f"镜头{shot['shot_no']} 已恢复第"
+                    f"{payload.get('_candidate_generation_round')}轮精准"
+                    "返修合同、前轮历史与跨轮最佳稿")
+            if resumable_live_group:
+                # 上次进程若已完成 0–3 个槽位，先恢复本轮精准合同；已
+                # 落盘槽位再由候选器逐一核验，避免服务重启重复扣费。
+                # 真正复用仍由候选器核对 token、三项冻结哈希、文件解码
+                # 与槽位版本；任一不符就自然回退成全新四抽。
+                payload["_candidate_set_id"] = live_group[
+                    "candidate_set_id"]
+                payload["_candidate_revision"] = max(
+                    1, int(live_group.get("candidate_revision") or 1))
+                payload["_contract_revision"] = max(
+                    1, int(live_group.get("contract_revision") or 1))
+                payload["_resume_candidate_group"] = copy.deepcopy(
+                    live_group)
             pending_candidate_regeneration = bool(
                 stored_prior.get("candidate_generation_status")
                 == "regenerating_candidates"
@@ -20289,7 +20880,33 @@ class Director:
         return {"line_no": line_no, "uri": result.uri,
                 "duration": result.data.get("duration", 0)}
 
+    def _persist_timeline_exchange(self, ctx):
+        """Freeze the editor-neutral shot/media timeline before composing."""
+        from .timeline_exchange import build_timeline, export_timeline_json
+
+        timeline = build_timeline(
+            self._active_storyboard(ctx), ctx.get("videos") or [],
+            timeline_id=(
+                f"project:{ctx['project']['id']}:episode:"
+                f"{ctx['episode']['id']}:storyboard:"
+                f"{ctx.get('storyboard_version') or 0}"),
+            name=(
+                f"《{ctx['project']['title']}》第"
+                f"{ctx['episode']['number']}集"),
+            frame_rate=24,
+        )
+        path = export_timeline_json(
+            timeline, Path(ctx["out_root"]) / "edit" / "timeline.json")
+        version = self.projects.save_document(
+            ctx["episode"]["id"], "timeline_exchange", timeline)
+        ctx["timeline_exchange"] = timeline
+        ctx["timeline_exchange_uri"] = str(path)
+        ctx["timeline_exchange_version"] = version
+        return timeline, path, version
+
     def _stage_edit(self, ctx):
+        timeline, timeline_path, timeline_version = (
+            self._persist_timeline_exchange(ctx))
         payload = {
             "shots": ctx["videos"],
             "voices": ctx["voices"],
@@ -20300,6 +20917,8 @@ class Director:
             "forbid_subtitles": not ctx["production_profile"]["burn_subtitles"],
             "project_title": ctx["project"]["title"],
             "episode_number": ctx["episode"]["number"],
+            "timeline_exchange": timeline,
+            "timeline_exchange_uri": str(timeline_path),
             "aspect": ctx["aspect"], **ctx["dims"],
         }
         try:
@@ -20310,6 +20929,10 @@ class Director:
             result = self._local_final_composite(ctx, payload, exc)
         ctx["final_uri"] = result.uri
         ctx["edit_data"] = result.data
+        result.data.setdefault("timeline_exchange_uri", str(timeline_path))
+        result.data.setdefault("timeline_exchange_version", timeline_version)
+        result.data.setdefault(
+            "timeline_hash", timeline.get("timeline_hash") or {})
         self.assets.register(
             ctx["project"]["id"], "edit",
             f"e{ctx['episode']['number']:03d}_final", uri=result.uri,
@@ -20578,7 +21201,7 @@ class Director:
                     "reference_chain_eligible": False,
                     "asset_registration_allowed": False,
                 } if content_enabled else None)
-                return shot_no, technical, frames
+                return shot_no, technical, frames, None
             probe = probe_video(
                 uri, ffprobe=ffprobe, ffmpeg=ffmpeg)
             expected_duration = shot.get("duration")
@@ -20600,11 +21223,16 @@ class Director:
                 require_audio=require_audio,
             )
             frames = None
+            temporal = None
             if content_enabled and technical.get("passed"):
                 frames = extract_video_qc_frames(
                     video.get("uri", ""), cache_root,
                     probe=probe, ffmpeg=ffmpeg)
-            return shot_no, technical, frames
+                if frames.get("passed"):
+                    from .video_temporal_qc import analyze_temporal_samples
+                    temporal = analyze_temporal_samples(
+                        frames.get("samples") or [], ffmpeg=ffmpeg)
+            return shot_no, technical, frames, temporal
 
         per_shot = {}
         workers = min(max(1, self._video_parallel_workers()),
@@ -20612,11 +21240,12 @@ class Director:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(inspect_media, video) for video in videos]
             for future in as_completed(futures):
-                shot_no, technical, frames = future.result()
+                shot_no, technical, frames, temporal = future.result()
                 per_shot[shot_no] = {
                     "shot_no": shot_no,
                     "technical": technical,
                     "frame_evidence": frames,
+                    "temporal_evidence": temporal,
                     "content_qc_enabled": bool(content_enabled),
                     "content_qc_waived": not content_enabled,
                     "reference_chain_eligible": False,
@@ -20678,9 +21307,13 @@ class Director:
                         "reference_manifest": generation_input[
                             "reference_manifest"],
                         "video_sequence_samples": sequence_samples,
+                        "video_temporal_evidence": copy.deepcopy(
+                            item.get("temporal_evidence") or {}),
                         "video_qc_focus": (
                             "联合检查五点抽帧中明显影响剧情的身份漂移、"
                             "道具瞬移、物理支撑、空间朝向和动作阶段；"
+                            "结合确定性时序证据重点复核近乎冻结或全画面"
+                            "突变，但不要把正常运镜/动作误判为漂移；"
                             "不要因微小美术差异失败。"),
                     }
                     sequence = {
@@ -20817,6 +21450,24 @@ class Director:
                         "blocking": False,
                         "advisory_only": True,
                         "message": "；".join(unavailable[:5]),
+                    })
+                # 像素签名只提供“可能冻结/可能全景跳变”的客观线索，
+                # 由同一次多模态审片结合正常运镜、剧情动作再判断。它永不
+                # 单独触发重拍，也不改变内容质检的非阻断策略。
+                temporal = item.get("temporal_evidence") or {}
+                for warning in temporal.get("warnings") or []:
+                    issues.append({
+                        "check": "video_temporal_evidence",
+                        "code": warning.get(
+                            "code", "temporal_warning"),
+                        "severity": "warn",
+                        "shot_no": shot_no,
+                        "rerunnable": False,
+                        "blocking": False,
+                        "advisory_only": True,
+                        "message": str(warning.get("message") or ""),
+                        "labels": list(warning.get("labels") or []),
+                        "delta": warning.get("delta"),
                     })
 
         report = {

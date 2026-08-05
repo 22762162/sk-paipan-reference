@@ -94,6 +94,116 @@ def _bridge(request, codex):
     return json.loads(proc.stdout.strip().splitlines()[-1])
 
 
+def _candidate_comparison_payload(tmp_path):
+    candidates = [tmp_path / f"candidate-{index}.png" for index in (2, 3)]
+    for path in candidates:
+        path.write_bytes(b"candidate")
+    request = {
+        "candidate_set_token": "set-eligible",
+        "target_input_hash": "target-hash",
+        "reference_selection_hash": "reference-hash",
+        "ranking_input_hash": "ranking-hash",
+        "candidates": [{
+            "candidate_id": f"set-eligible#{index}",
+            "candidate_index": index,
+            "uri": str(path),
+        } for index, path in zip((2, 3), candidates)],
+    }
+    return {
+        "candidate_comparison": request,
+        "image_uri": str(candidates[0]),
+        "reference_manifest": [{
+            "index": 2,
+            "uri": str(candidates[1]),
+            "label": "候选#3",
+            "role": "candidate_comparison",
+            "candidate_id": "set-eligible#3",
+            "candidate_index": 3,
+            "binding": "与首个 eligible 候选比较",
+        }],
+    }
+
+
+def test_codex_candidate_comparison_uses_dedicated_prompt_and_validation(
+        tmp_path, monkeypatch):
+    from aifos.adapters import codex_image
+
+    payload = _candidate_comparison_payload(tmp_path)
+    rows = [{
+        "candidate_id": f"set-eligible#{index}",
+        "candidate_index": index,
+        "dimension_scores": {"identity": 90 - index},
+        "evidence": [], "fatal_issues": [], "soft_issues": [],
+        "total_score": 90 - index,
+    } for index in (2, 3)]
+    verdict = {
+        "schema": "aifos.candidate-comparison-result/v1",
+        "candidate_set_token": "set-eligible",
+        "target_input_hash": "target-hash",
+        "reference_selection_hash": "reference-hash",
+        "ranking_input_hash": "ranking-hash",
+        "candidates": rows,
+        "winner_candidate_id": "set-eligible#2",
+        "winner_reason": "候选#2更符合身份",
+        "confidence": 0.8,
+    }
+    captured = {}
+
+    class FakePopen:
+        returncode = 0
+
+        def __init__(self, *args, **_kwargs):
+            self.args = args[0]
+            captured["instruction"] = self.args[-1]
+
+        def communicate(self, timeout=None):
+            return json.dumps(verdict, ensure_ascii=False), ""
+
+    monkeypatch.setattr(codex_image.shutil, "which",
+                        lambda _command: "/usr/bin/codex")
+    monkeypatch.setattr(codex_image.subprocess, "Popen", FakePopen)
+    reply = codex_image.run({
+        "capability": "image_qc", "payload": payload,
+        "out_dir": str(tmp_path / "out"),
+    }, "codex", 30, [])
+
+    assert reply["ok"] is True
+    assert reply["data"]["winner_candidate_id"] == "set-eligible#2"
+    assert reply["model"] == "Codex 候选四图比较导演"
+    assert "候选图比较导演" in captured["instruction"]
+    assert "实际候选#2 candidate_id=set-eligible#2" in captured[
+        "instruction"]
+    assert "不能返回普通单图质检" in captured["instruction"]
+
+
+def test_codex_candidate_comparison_rejects_single_image_qc_shape(
+        tmp_path, monkeypatch):
+    from aifos.adapters import codex_image
+
+    payload = _candidate_comparison_payload(tmp_path)
+
+    class FakePopen:
+        returncode = 0
+
+        def __init__(self, *args, **_kwargs):
+            self.args = args[0]
+
+        def communicate(self, timeout=None):
+            return '{"pass":true,"visual_pass":true,"issues":[]}', ""
+
+    monkeypatch.setattr(codex_image.shutil, "which",
+                        lambda _command: "/usr/bin/codex")
+    monkeypatch.setattr(codex_image.subprocess, "Popen", FakePopen)
+    reply = codex_image.run({
+        "capability": "image_qc", "payload": payload,
+        "out_dir": str(tmp_path / "out"),
+    }, "codex", 30, [])
+
+    assert reply["ok"] is False
+    assert "候选四图比较结构无效" in reply["error"]
+    assert "candidate_set_token" in reply["error"]
+
+
 def test_image_capability(tmp_path, fake_codex):
     out = tmp_path / "out"
     reply = _bridge({

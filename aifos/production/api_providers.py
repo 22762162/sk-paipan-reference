@@ -654,7 +654,44 @@ class ClaudeApiProvider(Provider):
                 "type": "base64", "media_type": media,
                 "data": base64.b64encode(data).decode()}}
 
-        content = [{"type": "text", "text": "下面第一张是待检图。"},
+        comparison_request = payload.get("candidate_comparison") or {}
+        comparison_rows = [
+            row for row in comparison_request.get("candidates") or []
+            if isinstance(row, dict)]
+        comparison_by_uri = {}
+        comparison_ids = set()
+        comparison_indexes = set()
+        for row in comparison_rows:
+            uri = str(row.get("uri") or "").strip()
+            candidate_id = str(row.get("candidate_id") or "").strip()
+            try:
+                candidate_index = int(row.get("candidate_index"))
+            except (TypeError, ValueError):
+                candidate_index = 0
+            if (not uri or not candidate_id or candidate_index <= 0
+                    or uri in comparison_by_uri
+                    or candidate_id in comparison_ids
+                    or candidate_index in comparison_indexes):
+                raise ProviderError(
+                    "候选比较请求的 candidate_id/index/uri 无效或重复")
+            comparison_ids.add(candidate_id)
+            comparison_indexes.add(candidate_index)
+            comparison_by_uri[uri] = {
+                "candidate_id": candidate_id,
+                "candidate_index": candidate_index,
+            }
+        primary_uri = str(payload.get("image_uri") or "").strip()
+        primary_candidate = comparison_by_uri.get(primary_uri)
+        if payload.get("candidate_comparison") and primary_candidate is None:
+            raise ProviderError(
+                "候选比较第一图片块不属于冻结 eligible candidates")
+        first_label = (
+            "下面第1个候选图片块对应实际候选"
+            f"#{primary_candidate['candidate_index']}，candidate_id="
+            f"{primary_candidate['candidate_id']}；请与后续"
+            " role=candidate_comparison 图片同屏比较。"
+            if primary_candidate else "下面第一张是待检图。")
+        content = [{"type": "text", "text": first_label},
                    image_block(payload.get("image_uri", ""), "待检图")]
         manifest = [
             ref for ref in (payload.get("reference_manifest") or [])
@@ -671,6 +708,8 @@ class ClaudeApiProvider(Provider):
             if isinstance(ref, dict) and ref.get("uri")
         ]
         seen = set()
+        uploaded_candidate_ids = {
+            primary_candidate["candidate_id"]} if primary_candidate else set()
         for ref in references:
             if not isinstance(ref, dict) or not ref.get("uri"):
                 continue
@@ -683,12 +722,43 @@ class ClaudeApiProvider(Provider):
             role = str(ref.get("role") or "reference")
             binding = str(ref.get("binding") or "按标签职责使用")
             index = ref.get("index")
-            prefix = f"图{index}" if index is not None else "参考图"
+            if role == "candidate_comparison":
+                candidate = comparison_by_uri.get(uri)
+                if candidate is None:
+                    raise ProviderError(
+                        "candidate_comparison 图片不属于冻结 eligible candidates")
+                declared_id = str(ref.get("candidate_id") or "").strip()
+                declared_index = ref.get("candidate_index")
+                try:
+                    declared_index = (
+                        int(declared_index)
+                        if declared_index not in (None, "") else None)
+                except (TypeError, ValueError) as exc:
+                    raise ProviderError(
+                        "candidate_comparison candidate_index 无效") from exc
+                if (declared_id and declared_id != candidate["candidate_id"]
+                        or declared_index is not None
+                        and declared_index != candidate["candidate_index"]):
+                    raise ProviderError(
+                        "candidate_comparison 标签与冻结 candidate_id/index 不一致")
+                uploaded_candidate_ids.add(candidate["candidate_id"])
+                prefix = (
+                    f"第{index}个候选图片块对应实际候选"
+                    f"#{candidate['candidate_index']}，candidate_id="
+                    f"{candidate['candidate_id']}")
+            else:
+                prefix = f"图{index}" if index is not None else "参考图"
             content.append({
                 "type": "text",
                 "text": f"下面是{prefix}「{label}」，职责={role}：{binding}",
             })
             content.append(image_block(uri, label))
+        expected_candidate_ids = {
+            row["candidate_id"] for row in comparison_by_uri.values()}
+        if (payload.get("candidate_comparison")
+                and uploaded_candidate_ids != expected_candidate_ids):
+            raise ProviderError(
+                "候选比较实际上传图片集合与 eligible candidates 不一致")
         content.append({"type": "text", "text": prompt})
         return content
 
@@ -762,8 +832,12 @@ class ClaudeApiProvider(Provider):
                 if error:
                     raise ProviderError(f"场景标注无效: {error}")
             elif capability == "image_qc":
-                from ..adapters.claude_script import validate_image_qc
-                error = validate_image_qc(data)
+                from ..adapters.claude_script import (
+                    validate_candidate_comparison, validate_image_qc)
+                error = (
+                    validate_candidate_comparison(data, payload)
+                    if payload.get("candidate_comparison")
+                    else validate_image_qc(data))
             elif capability == "script" and payload.get("prompt_refine"):
                 from ..adapters.claude_script import validate_prompt_refine
                 error = validate_prompt_refine(data)
@@ -791,6 +865,11 @@ class ClaudeApiProvider(Provider):
                 # 否则永远"缺少 scenes"并静默回退 mock 污染事实源。
                 error = validate_story_analysis(
                     data, require_resolved_identity=False)
+            elif (capability == "script"
+                  and payload.get("independent_script_review")):
+                from ..adapters.claude_script import (
+                    validate_independent_script_review)
+                error = validate_independent_script_review(data, payload)
             elif capability == "script":
                 error = validate_script(data, payload)
             else:
@@ -913,11 +992,15 @@ class OpenAIChatProvider(Provider):
         return text
 
     def _validate(self, capability, payload, data):
-        from ..adapters.claude_script import (validate_image_qc,
+        from ..adapters.claude_script import (validate_candidate_comparison,
+                                              validate_image_qc,
                                               validate_prompt_refine,
                                               validate_shot_repair)
         if capability == "image_qc":
-            return validate_image_qc(data)
+            return (
+                validate_candidate_comparison(data, payload)
+                if payload.get("candidate_comparison")
+                else validate_image_qc(data))
         if capability == "script" and payload.get("prompt_refine"):
             return validate_prompt_refine(data)
         if capability == "script" and payload.get("asset_prompt"):
@@ -940,6 +1023,11 @@ class OpenAIChatProvider(Provider):
         if capability == "script" and payload.get("story_analysis"):
             return validate_story_analysis(
                 data, require_resolved_identity=False)
+        if (capability == "script"
+                and payload.get("independent_script_review")):
+            from ..adapters.claude_script import (
+                validate_independent_script_review)
+            return validate_independent_script_review(data, payload)
         if capability == "script":
             return validate_script(data, payload)
         return validate_storyboard(data)

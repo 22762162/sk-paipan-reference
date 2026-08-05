@@ -175,6 +175,103 @@ def test_rules_api_rejects_suppressing_mandatory_gate(rule_server):
     assert "不能抑制系统技术硬门" in result["error"]
 
 
+@pytest.mark.parametrize("selector", [
+    [],
+    "shot 2",
+    2,
+    None,
+    {"shot_nos": {"bad": 2}},
+    {"unknown_dimension": ["image"]},
+    {"shot_nos": [0]},
+    {"modalities": [True]},
+])
+def test_rules_api_rejects_malformed_applicability_without_saving(
+        rule_server, selector):
+    port = rule_server["port"]
+    project_id = rule_server["first_project"]
+    status, result = _json_request(
+        port, "POST", f"/api/project/{project_id}/rules", {
+            "expected_version": 0,
+            "content": _pack("project_series", {
+                "key": "visual.local_only",
+                "text": "只在指定镜头生效",
+                "applicability": selector,
+            }),
+        })
+
+    assert status == 400
+    assert "applicability" in result["error"]
+    status, current = _json_request(
+        port, "GET", f"/api/project/{project_id}/rules")
+    assert status == 200
+    assert current["version"] == 0
+    assert current["rules"] == []
+
+
+def test_rules_api_rejects_conflicting_or_malformed_suppression_scope(
+        rule_server):
+    port = rule_server["port"]
+    project_id = rule_server["first_project"]
+    bad_rows = [
+        {"key": "visual.local_only", "applicability": ["shot 2"]},
+        {"key": "visual.local_only", "applicability": {"shot_no": [2]},
+         "applies_to": {"shot_no": [3]}},
+    ]
+    for suppression in bad_rows:
+        status, result = _json_request(
+            port, "POST", f"/api/project/{project_id}/rules", {
+                "expected_version": 0,
+                "content": _pack(
+                    "project_series", suppressions=[suppression]),
+            })
+        assert status == 400
+        assert "suppressions.0" in result["error"]
+
+
+def test_rules_api_keeps_legal_project_episode_and_shot_scopes(rule_server):
+    port = rule_server["port"]
+    project_id = rule_server["first_project"]
+    episode_id = rule_server["first_episode"]
+    project_pack = _pack("project_series", {
+        "key": "visual.series_palette",
+        "text": "全剧冷青色",
+    })
+    episode_pack = _pack("episode_temporary", {
+        "key": "visual.local_accent",
+        "text": "本集第三镜暖红色",
+        "applicability": {
+            "shot_nos": [3],
+            "stages": ["keyframes"],
+            "modalities": ["image"],
+        },
+    })
+
+    assert _json_request(
+        port, "POST", f"/api/project/{project_id}/rules", {
+            "expected_version": 0, "content": project_pack,
+        })[0] == 200
+    assert _json_request(
+        port, "POST", f"/api/episode/{episode_id}/rules", {
+            "project_id": project_id,
+            "expected_version": 0,
+            "content": episode_pack,
+        })[0] == 200
+
+    status, matching = _json_request(
+        port, "GET", f"/api/episode/{episode_id}/rule-stack"
+        "?shot_no=3&stage=keyframes&modality=image")
+    assert status == 200
+    assert matching["effective_rules"]["visual.series_palette"] == "全剧冷青色"
+    assert matching["effective_rules"]["visual.local_accent"] == "本集第三镜暖红色"
+
+    status, another_shot = _json_request(
+        port, "GET", f"/api/episode/{episode_id}/rule-stack"
+        "?shot_no=4&stage=keyframes&modality=image")
+    assert status == 200
+    assert another_shot["effective_rules"]["visual.series_palette"] == "全剧冷青色"
+    assert "visual.local_accent" not in another_shot["effective_rules"]
+
+
 def test_project_rules_api_rejects_episode_bound_suppression(rule_server):
     port = rule_server["port"]
     project_id = rule_server["first_project"]

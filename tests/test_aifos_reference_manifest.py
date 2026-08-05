@@ -657,6 +657,39 @@ def test_frame_edit_base_is_always_in_reference_manifest(app, tmp_path):
     assert "图1=本镜已通过的关键图" in payload["prompt"]
 
 
+def test_selected_binding_order_is_the_actual_provider_upload_order(
+        app, tmp_path):
+    keyframe = tmp_path / "current-keyframe.png"
+    scene = tmp_path / "scene-master.png"
+    keyframe.write_bytes(PNG)
+    scene.write_bytes(PNG)
+    payload = {
+        "prompt": "保持场景结构并修正当前镜头",
+        # keyframe enters the raw pool first but is optional; the scene master
+        # enters later and is mandatory, so the selector intentionally moves
+        # it to frozen upload position 1.
+        "image_uri": str(keyframe),
+        "scene_ref": str(scene),
+        "location": "酒店套房",
+    }
+
+    app.director._attach_reference_manifest(payload)
+
+    manifest = payload["reference_manifest"]
+    bindings = payload["reference_selection_decision"]["bindings"]
+    assert [row["role"] for row in manifest] == ["scene", "keyframe"]
+    assert [row["index"] for row in manifest] == [1, 2]
+    assert [row["uri"] for row in manifest] == [
+        row["uri"] for row in bindings]
+    assert [row["binding"] for row in manifest] == [
+        row["instruction"] for row in bindings]
+    assert [row["image_index"] for row in bindings] == [1, 2]
+    assert [row["uri"] for row in _reference_entries(payload)] == [
+        str(scene), str(keyframe)]
+    assert "图1=场景「酒店套房」基准图" in payload["prompt"]
+    assert "图2=本镜已通过的关键图" in payload["prompt"]
+
+
 def test_character_asset_reference_table_is_not_duplicated_in_provider_prompt(
         app, tmp_path):
     portrait = tmp_path / "portrait.png"

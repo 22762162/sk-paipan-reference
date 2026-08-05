@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import aifos.director as director_module
 from aifos.app import App
+from aifos.errors import ProviderUnavailable
 from aifos.workflow import PIPELINE_VERSION, STORYBOARD_ENRICHMENT_VERSION
 
 
@@ -39,7 +40,8 @@ def _dimension_reviews():
     }
 
 
-def _prepare_script_stage(app, monkeypatch, tmp_path, result):
+def _prepare_script_stage(
+        app, monkeypatch, tmp_path, result, *, review_result=None):
     project, _ = app.projects.get_or_create_project(
         "连续性接线", style="电影半写实", kind="drama")
     previous, _ = app.projects.get_or_create_episode(
@@ -70,7 +72,15 @@ def _prepare_script_stage(app, monkeypatch, tmp_path, result):
     captured = {}
 
     def fake_call(_ctx, capability, payload, sub_dir):
-        assert (capability, sub_dir) == ("script", "script")
+        assert capability == "script"
+        if sub_dir == "script_review":
+            assert payload["independent_script_review"] is True
+            captured["review_calls"] = captured.get("review_calls", 0) + 1
+            captured["review_payload"] = payload
+            if review_result is None:
+                raise ProviderUnavailable("independent reviewer offline")
+            return review_result
+        assert sub_dir == "script"
         captured["payload"] = payload
         return result
 
@@ -126,7 +136,7 @@ def test_script_stage_records_pending_instead_of_fake_self_scores(
         tmp_path, monkeypatch):
     app = App(tmp_path / "ws")
     try:
-        ctx, _captured, current = _prepare_script_stage(
+        ctx, captured, current = _prepare_script_stage(
             app, monkeypatch, tmp_path, _script_result())
 
         app.director._stage_script(ctx)
@@ -137,12 +147,14 @@ def test_script_stage_records_pending_instead_of_fake_self_scores(
         assert review["production_blocking"] is False
         assert review["scores_available"] is False
         assert "dimensions" not in review
-        assert "未返回独立评审运行" in review["reason"]
+        assert "independent reviewer offline" in review["reason"]
+        app.director._run_independent_script_review(ctx)
+        assert captured["review_calls"] == 1
     finally:
         app.close()
 
 
-def test_script_stage_accepts_complete_independent_review_only(
+def test_script_stage_rejects_generator_embedded_self_review(
         tmp_path, monkeypatch):
     app = App(tmp_path / "ws")
     try:
@@ -160,11 +172,36 @@ def test_script_stage_accepts_complete_independent_review_only(
 
         review, _ = app.projects.latest_document(
             current["id"], "script_review")
-        assert review["status"] == "ready"
-        assert review["generator_run_id"] == "writer-run-22"
-        assert review["reviewer_run_id"] == "reviewer-run-91"
-        assert len(review["dimensions"]) == 5
+        assert review["status"] == "pending"
+        assert review["generator_run_id"].startswith("script-generator:")
+        assert "dimensions" not in review
         assert review["production_blocking"] is False
+    finally:
+        app.close()
+
+
+def test_script_stage_accepts_only_real_second_invocation_review(
+        tmp_path, monkeypatch):
+    app = App(tmp_path / "ws")
+    try:
+        reviewer = SimpleNamespace(
+            provider="independent-reviewer", cost=0.0,
+            data={"dimension_reviews": _dimension_reviews()}, uri="")
+        ctx, captured, current = _prepare_script_stage(
+            app, monkeypatch, tmp_path, _script_result(),
+            review_result=reviewer)
+
+        app.director._stage_script(ctx)
+
+        review, _ = app.projects.latest_document(
+            current["id"], "script_review")
+        assert review["status"] == "ready"
+        assert review["generator_run_id"].startswith("script-generator:")
+        assert review["reviewer_run_id"].startswith("script-review:")
+        assert review["generator_run_id"] != review["reviewer_run_id"]
+        assert review["reviewer_source"] == "independent-reviewer"
+        assert len(review["dimensions"]) == 5
+        assert captured["review_payload"]["script_version"] == "1"
     finally:
         app.close()
 

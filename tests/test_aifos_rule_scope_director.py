@@ -1,6 +1,9 @@
 """Director uses one isolated rule stack across project, episode and shot."""
 
+import pytest
+
 from aifos.app import App
+from aifos.rule_scope import RuleScopeError
 from aifos.workflow import production_profile
 
 
@@ -25,6 +28,26 @@ def _pack(scope, rules, suppressions=None):
         "rules": rules,
         "suppressions": suppressions or [],
     }
+
+
+@pytest.mark.parametrize("pack", [
+    _pack("project_series", [{
+        "key": "visual.bad", "value": "不得扩大",
+        "applicability": ["shot 2"],
+    }]),
+    _pack("episode_temporary", [], [{
+        "key": "visual.bad", "applicability": "shot 2",
+    }]),
+])
+def test_director_fails_closed_on_malformed_stored_applicability(pack):
+    with pytest.raises(RuleScopeError, match="applicability"):
+        from aifos.director import Director
+        Director._normalize_rule_pack(
+            pack,
+            scope=pack["scope"],
+            project_id=1,
+            episode_id=(2 if pack["scope"] == "episode_temporary" else None),
+        )
 
 
 def test_episode_overrides_series_and_shot_overrides_episode(tmp_path):
@@ -115,5 +138,41 @@ def test_episode_suppression_removes_series_creative_default(tmp_path):
         assert any(item["reason"] == "higher_creative_suppression"
                    for item in resolved.overridden)
         assert resolved["technical.resolution"] == "720p"
+    finally:
+        app.close()
+
+
+def test_director_keeps_realm_event_phase_and_era_as_distinct_facts(tmp_path):
+    app = App(tmp_path / "ws")
+    try:
+        project, _ = app.projects.get_or_create_project("梦境穿越")
+        episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+        app.projects.save_project_document(
+            project["id"], "project_rules", _pack("project_series", [{
+                "key": "visual.event_marker",
+                "value": "盗神觉醒使用蓝紫神光",
+                "applicability": {
+                    "active_story_phases": ["awakening"],
+                    "active_realm_ids": ["game-lobby"],
+                    "event_ids": ["event-theft-god"],
+                    "eras": ["2078现代"],
+                },
+            }]))
+        resolved = app.director._resolve_effective_rules(
+            _ctx(app, project, episode), shot={
+                "shot_no": 4,
+                "active_story_phase": "awakening",
+                "realm_id": "game-lobby",
+                "scene_event_id": "event-theft-god",
+                "era_context": "2078现代",
+            }, stage="images", modality="image")
+
+        assert resolved["visual.event_marker"] == "盗神觉醒使用蓝紫神光"
+        assert resolved.context.story_phase == "awakening"
+        assert resolved.context.active_realm_id == "game-lobby"
+        assert resolved.context.event_id == "event-theft-god"
+        assert resolved.context.era == "2078现代"
+        assert resolved["world.active_realm_id"] == "game-lobby"
+        assert resolved["world.event_id"] == "event-theft-god"
     finally:
         app.close()

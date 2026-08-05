@@ -865,8 +865,9 @@ def test_first_failure_escalates_then_redraws_with_codex_prompt(
         "consecutive_failures"] == 1
     # 初版1张 + 同一份 Codex 修订合同候选4张，候选不得提前停止。
     assert router.calls["image"] == 5
-    # 初检1 + 首败升级1 + 4张候选逐张判分；不再逐候选重复升级。
-    assert router.calls["qc"] == 6
+    # 初检1 + 首败升级1 + 4张候选逐张判分 + 四图同屏比较1；
+    # 不再逐候选重复升级。
+    assert router.calls["qc"] == 7
     for candidate in router.image_payloads[1:]:
         feedback = candidate.get("feedback") or ""
         assert "把静态关键帧改为唯一拱手完成瞬间" in feedback

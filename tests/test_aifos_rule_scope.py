@@ -10,6 +10,7 @@ from aifos.rule_scope import (
     RuleResolver,
     RuleScopeError,
     ScopeBindingError,
+    resolve_rule_stack,
     resolve_rules,
 )
 
@@ -204,6 +205,75 @@ class ApplicabilityTest(unittest.TestCase):
                     "camera.motion", "push", {"location": "office"})],
             )
 
+    def test_realm_phase_and_event_are_exact_selectors(self):
+        scoped = Rule(
+            "world.allowed_prop",
+            "梦中怀表",
+            applicability={
+                "active_realm_ids": ["dream-hotel"],
+                "active_story_phases": ["梦境"],
+                "event_ids": ["event-7"],
+            },
+            exception_kind="dream",
+        )
+        matching = resolve_rules(
+            _context(
+                story_phase=None,
+                active_story_phase="dream",
+                active_realm_id="dream-hotel",
+                event_id="event-7",
+            ),
+            system_base=[scoped],
+        )
+        another_event = resolve_rules(
+            _context(
+                story_phase=None,
+                active_story_phase="dream",
+                active_realm_id="dream-hotel",
+                event_id="event-8",
+            ),
+            system_base=[scoped],
+        )
+        self.assertEqual(matching["world.allowed_prop"], "梦中怀表")
+        self.assertNotIn("world.allowed_prop", another_event)
+        self.assertEqual(
+            matching.context.active_story_phase, matching.context.story_phase)
+
+    def test_context_aliases_are_normalized_before_fingerprinting(self):
+        aliases = resolve_rules(
+            {
+                "project_id": PROJECT,
+                "episode_id": EPISODE,
+                "active_story_phase": "梦境",
+                "realm_id": "dream-hotel",
+                "scene_event_id": "event-7",
+                "era_context": "民国",
+            },
+            system_base=[Rule("visual.palette", "blue")],
+        )
+        canonical = resolve_rules(
+            {
+                "project_id": PROJECT,
+                "episode_id": EPISODE,
+                "story_phase": "dream",
+                "active_realm_id": "dream-hotel",
+                "event_id": "event-7",
+                "era": "民国",
+            },
+            system_base=[Rule("visual.palette", "blue")],
+        )
+        self.assertEqual(aliases.fingerprint, canonical.fingerprint)
+
+    def test_conflicting_story_phase_aliases_are_rejected(self):
+        with self.assertRaisesRegex(
+                RuleScopeError, "story_phase conflicts"):
+            RuleContext(
+                project_id=PROJECT,
+                episode_id=EPISODE,
+                story_phase="dream",
+                active_story_phase="time_travel",
+            )
+
 
 class ContextBindingTest(unittest.TestCase):
     def test_project_rule_requires_and_matches_project_binding(self):
@@ -345,6 +415,91 @@ class FingerprintAndFacadeTest(unittest.TestCase):
             result.rules,
             {"camera.motion": "push", "frame.no_subtitles": True},
         )
+
+    def test_storage_compatibility_facade_accepts_friendly_rule_packs(self):
+        stack = resolve_rule_stack(
+            context={
+                "project_id": 101,
+                "episode_id": 12,
+                "stage": "storyboard",
+                "modality": "image",
+                "shot_no": 7,
+                "scene_no": 2,
+                "active_story_phase": "梦境",
+                "active_realm_id": "dream-hotel",
+                "event_id": "event-7",
+                "era": "民国",
+            },
+            technical_rules=[
+                {"key": "technical.no_subtitles", "value": True},
+            ],
+            base_rules={
+                "scope": "system_base",
+                "rules": [
+                    {"key": "camera.motion", "text": "static"},
+                    {"key": "creative.base_text", "text": "基础文本"},
+                    {"key": "disabled.rule", "text": "不生效",
+                     "enabled": False},
+                ],
+            },
+            project_rules={
+                "scope": "project_series",
+                "version": 3,
+                "rules": [{
+                    "key": "camera.motion",
+                    "text": "project push",
+                }, {
+                    "key": "world.phase_marker",
+                    "text": "梦境酒店事件",
+                    "applicability": {
+                        "stages": ["storyboard"],
+                        "modalities": ["image"],
+                        "shot_nos": [7],
+                        "scene_nos": [2],
+                        "story_phases": ["梦境"],
+                        "eras": ["民国"],
+                        "active_realm_ids": ["dream-hotel"],
+                        "event_ids": ["event-7"],
+                    },
+                }],
+            },
+            episode_rules={
+                "scope": "episode_temporary",
+                "rules": [{"key": "camera.motion", "value": "episode pan"}],
+            },
+            shot_rules={
+                "scope": "current_shot",
+                "rules": [
+                    {"key": "camera.motion", "text": "shot closeup"},
+                    {"key": "technical.no_subtitles", "value": False},
+                ],
+            },
+        )
+
+        self.assertEqual(stack["effective_rules"]["camera.motion"],
+                         "shot closeup")
+        self.assertEqual(stack["effective_rules"]["creative.base_text"],
+                         "基础文本")
+        self.assertEqual(stack["effective_rules"]["world.phase_marker"],
+                         "梦境酒店事件")
+        self.assertIs(stack["effective_rules"]["technical.no_subtitles"], True)
+        self.assertNotIn("disabled.rule", stack["effective_rules"])
+        self.assertEqual(stack["sources"]["world.phase_marker"]["source"],
+                         "project_series:v3")
+        self.assertEqual(stack["suppressed"], stack["overridden"])
+        self.assertEqual(stack["effective_rules"], stack["final_rules"])
+        self.assertRegex(stack["fingerprint"], r"^sha256:[0-9a-f]{64}$")
+
+    def test_storage_facade_rejects_explicit_foreign_binding(self):
+        with self.assertRaises(ScopeBindingError):
+            resolve_rule_stack(
+                context={"project_id": PROJECT, "episode_id": EPISODE},
+                project_rules={
+                    "scope": "project_series",
+                    "project_id": "foreign-project",
+                    "rules": [{"key": "visual.palette", "text": "red"}],
+                },
+            )
 
 
 if __name__ == "__main__":

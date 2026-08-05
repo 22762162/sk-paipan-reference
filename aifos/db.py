@@ -104,6 +104,67 @@ ON production_runs(episode_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS production_runs_status_idx
 ON production_runs(status, started_at DESC);
 
+-- Web/后台作业的持久事实源。production_runs 记录一次业务运行的汇总，
+-- production_jobs 则记录可轮询、排队和取消的实际后台作业；二者分表避免
+-- 把细粒度作业混入现有流水线阶段 tasks，污染成本和 stage_count。
+CREATE TABLE IF NOT EXISTS production_jobs(
+  id TEXT PRIMARY KEY,
+  run_id INTEGER REFERENCES production_runs(id) ON DELETE SET NULL,
+  episode_id INTEGER REFERENCES episodes(id) ON DELETE SET NULL,
+  idempotency_key TEXT NOT NULL DEFAULT '',
+  action TEXT NOT NULL DEFAULT 'adjustment',
+  status TEXT NOT NULL DEFAULT 'queued',
+  queue_key TEXT NOT NULL DEFAULT '',
+  queue_position INTEGER,
+  progress TEXT NOT NULL DEFAULT '{}',
+  request TEXT NOT NULL DEFAULT '{}',
+  result TEXT NOT NULL DEFAULT '{}',
+  error TEXT NOT NULL DEFAULT '',
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
+  cancel_reason TEXT NOT NULL DEFAULT '',
+  owner_id TEXT NOT NULL DEFAULT '',
+  owner_pid INTEGER,
+  owner_host TEXT NOT NULL DEFAULT '',
+  heartbeat_at REAL,
+  lease_expires_at REAL,
+  started_at REAL,
+  finished_at REAL,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS production_jobs_run_unique_idx
+ON production_jobs(run_id) WHERE run_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS production_jobs_idempotency_unique_idx
+ON production_jobs(idempotency_key) WHERE idempotency_key <> '';
+CREATE INDEX IF NOT EXISTS production_jobs_status_updated_idx
+ON production_jobs(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS production_jobs_episode_updated_idx
+ON production_jobs(episode_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS production_jobs_queue_idx
+ON production_jobs(queue_key, status, queue_position, created_at);
+
+-- 通用作业关系：episode/shot 标识业务归属，artifact/output 标识生成产物。
+-- relation_id 使用 TEXT，因为镜头当前是 render-plan item id，而资产可使用
+-- 数字 id；uri/meta 保存尚未晋升为正式 assets 行的候选输出事实。
+CREATE TABLE IF NOT EXISTS production_job_links(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL REFERENCES production_jobs(id) ON DELETE CASCADE,
+  relation_type TEXT NOT NULL,
+  relation_id TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL DEFAULT '',
+  uri TEXT NOT NULL DEFAULT '',
+  meta TEXT NOT NULL DEFAULT '{}',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  UNIQUE(job_id, relation_type, relation_id, role)
+);
+
+CREATE INDEX IF NOT EXISTS production_job_links_job_idx
+ON production_job_links(job_id, relation_type);
+CREATE INDEX IF NOT EXISTS production_job_links_relation_idx
+ON production_job_links(relation_type, relation_id, updated_at DESC);
+
 -- 剧本 / 分镜等结构化文档,按版本沉淀
 CREATE TABLE IF NOT EXISTS documents(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -390,6 +451,11 @@ MIGRATIONS = [
     ("projects", "style_pack_id", "TEXT NOT NULL DEFAULT ''"),
     ("tasks", "run_id", "INTEGER REFERENCES production_runs(id)"),
     ("firefire_styles", "director_knowledge", "TEXT NOT NULL DEFAULT '{}'"),
+    ("production_jobs", "owner_id", "TEXT NOT NULL DEFAULT ''"),
+    ("production_jobs", "owner_pid", "INTEGER"),
+    ("production_jobs", "owner_host", "TEXT NOT NULL DEFAULT ''"),
+    ("production_jobs", "heartbeat_at", "REAL"),
+    ("production_jobs", "lease_expires_at", "REAL"),
 ]
 
 

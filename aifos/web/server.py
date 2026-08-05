@@ -30,19 +30,25 @@ import copy
 import hashlib
 import ipaddress
 import json
-import shutil
-import subprocess
+import os
 import re
+import shutil
 import socket
+import sqlite3
+import subprocess
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import __version__
-from ..app import App
+from ..app import App, Workspace
 from ..asset_center import IMAGE_KINDS
+from ..db import Database
+from ..history_center import HistoryCenter
+from ..job_center import ACTIVE_JOB_STATUSES, JobCenter
 from ..lessons import project_lessons, set_lesson_approval
 from ..updater import (check_and_update, current_build, repo_root,
                        restart_process, start_auto_updater)
@@ -50,6 +56,7 @@ from ..errors import AifosError
 from ..quality_policy import normalize_quality, normalize_quality_policy
 from ..project_center import DocumentConflictError
 from ..rule_governance import MANDATORY_GATE_IDS
+from ..rule_scope import RuleScopeError, normalize_rule_applicability
 from ..selection_mode import (
     CANDIDATES_PER_SHOT,
     MAX_CANDIDATE_ROUNDS,
@@ -203,6 +210,22 @@ def _normalize_creative_rule_pack(content, scope):
             raise AifosError(f"rules.{index} 必须是对象")
         if "enabled" in rule and not isinstance(rule["enabled"], bool):
             raise AifosError(f"rules.{index}.enabled 必须是布尔值")
+        if "applicability" in rule and "applies_to" in rule:
+            raise AifosError(
+                f"rules.{index} 只能使用 applicability 或 applies_to 其中一个")
+        selector_key = (
+            "applicability" if "applicability" in rule else
+            "applies_to" if "applies_to" in rule else None)
+        if selector_key is not None:
+            selector = rule[selector_key]
+            if not isinstance(selector, dict):
+                raise AifosError(
+                    f"rules.{index}.{selector_key} 必须是对象")
+            try:
+                normalize_rule_applicability(selector)
+            except RuleScopeError as exc:
+                raise AifosError(
+                    f"rules.{index}.{selector_key} 无效: {exc}") from exc
     for index, suppression in enumerate(suppressions):
         target = (suppression if isinstance(suppression, str) else
                   (suppression.get("target") or suppression.get("key")
@@ -210,6 +233,26 @@ def _normalize_creative_rule_pack(content, scope):
                   if isinstance(suppression, dict) else "")
         if not isinstance(suppression, (str, dict)):
             raise AifosError(f"suppressions.{index} 必须是字符串或对象")
+        if isinstance(suppression, dict):
+            if ("applicability" in suppression
+                    and "applies_to" in suppression):
+                raise AifosError(
+                    f"suppressions.{index} 只能使用 applicability 或 "
+                    "applies_to 其中一个")
+            selector_key = (
+                "applicability" if "applicability" in suppression else
+                "applies_to" if "applies_to" in suppression else None)
+            if selector_key is not None:
+                selector = suppression[selector_key]
+                if not isinstance(selector, dict):
+                    raise AifosError(
+                        f"suppressions.{index}.{selector_key} 必须是对象")
+                try:
+                    normalize_rule_applicability(selector)
+                except RuleScopeError as exc:
+                    raise AifosError(
+                        f"suppressions.{index}.{selector_key} 无效: "
+                        f"{exc}") from exc
         if _protected_rule_target(target):
             raise AifosError(
                 f"suppressions.{index} 不能抑制系统技术硬门: {target}")
@@ -365,6 +408,8 @@ class JobRegistry:
     """produce 后台任务:制作可能耗时(真实产线更久),Web 端异步执行。"""
 
     PRODUCTION_ACTIONS = PRODUCTION_ACTIONS
+    LEASE_SECONDS = 120.0
+    HEARTBEAT_SECONDS = 20.0
 
     def __init__(self, workspace):
         self.workspace = workspace
@@ -375,11 +420,185 @@ class JobRegistry:
         self._queues = {}
         self._lock = threading.Lock()
         self._seq = 0
-        app = App(self.workspace)
+        ledger_workspace = Workspace(self.workspace)
+        ledger_workspace.ensure()
+        self._ledger_db = Database(ledger_workspace.db_path)
+        self._history_center = HistoryCenter(
+            self._ledger_db, artifacts_root=ledger_workspace.artifacts_dir)
+        owner_host = socket.gethostname()
+        self._owner_id = (
+            f"{owner_host}:{os.getpid()}:{uuid.uuid4().hex}")
+        self._job_center = JobCenter(
+            self._ledger_db, owner_id=self._owner_id,
+            owner_pid=os.getpid(), owner_host=owner_host,
+            lease_seconds=self.LEASE_SECONDS)
+        recovered = self._job_center.bootstrap_interrupt(return_jobs=True)
+        self._hydrate_jobs()
+        self._lease_stop = threading.Event()
+        self._lease_thread = None
+        if recovered:
+            self._refresh_recovered_jobs(recovered)
+        self._history_center.bootstrap(
+            protected_run_ids=self._active_durable_run_ids(),
+            stale_before=time.time() - self.LEASE_SECONDS)
+        self._ensure_lease_heartbeat()
+
+    @staticmethod
+    def _durable_job_payload(row):
+        request = dict(row.get("request") or {})
+        job = {
+            "id": row["id"],
+            "status": row["status"],
+            "title": str(request.get("title") or ""),
+            "episode": int(request.get("episode") or 0),
+            "action": row.get("action") or "adjustment",
+            "force": bool(request.get("force", False)),
+            "started_at": row.get("started_at") or row.get("created_at")
+            or time.time(),
+            "run_id": row.get("run_id"),
+            "recoverable": row.get("status") == "interrupted",
+        }
+        if row.get("finished_at") is not None:
+            job["finished_at"] = row["finished_at"]
+        if row.get("progress"):
+            job["progress"] = dict(row["progress"])
+        if row.get("result"):
+            job["summary"] = dict(row["result"])
+        if row.get("error"):
+            job["error"] = row["error"]
+        if row.get("queue_position") is not None:
+            job["queue_position"] = row["queue_position"]
+        if row.get("cancel_requested"):
+            job["cancel_requested"] = True
+        return job
+
+    def _hydrate_jobs(self):
+        """Restore visible task facts; Python closures are never replayed."""
+        rows = self._job_center.list(limit=500, include_links=True)
+        for row in rows:
+            job = self._durable_job_payload(row)
+            self._jobs[job["id"]] = job
+            match = re.fullmatch(r"j(\d+)", str(job["id"]))
+            if match:
+                self._seq = max(self._seq, int(match.group(1)))
+
+    def _active_durable_run_ids(self):
+        return {
+            int(row["run_id"])
+            for row in self._job_center.list(
+                statuses=ACTIVE_JOB_STATUSES, limit=500,
+                include_links=False)
+            if row.get("run_id") is not None
+        }
+
+    @staticmethod
+    def _job_request(title, number, request=None, **extra):
+        return {
+            "title": str(title), "episode": int(number),
+            **dict(request or {}), **extra,
+        }
+
+    def _persist_job_create(self, job, request):
+        links = []
+        run_row = (
+            self._ledger_db.query_one(
+                "SELECT episode_id FROM production_runs WHERE id=?",
+                (job.get("run_id"),))
+            if job.get("run_id") is not None else None)
+        episode_id = (
+            int(run_row["episode_id"])
+            if run_row is not None and run_row["episode_id"] is not None
+            else None)
+        shot = (request or {}).get("shot_no")
+        item_id = str((request or {}).get("item_id") or "")
+        if shot is not None or item_id.startswith(("shot:", "frames:")):
+            links.append({
+                "relation_type": "shot",
+                "relation_id": str(shot if shot is not None else item_id),
+                "role": str(job.get("action") or ""),
+            })
+        self._job_center.create(
+            job["id"], run_id=job.get("run_id"),
+            episode_id=episode_id,
+            action=job.get("action") or "adjustment",
+            status=job.get("status") or "queued",
+            request=request, progress=job.get("progress") or {},
+            queue_key=f"{job.get('title')}:{int(job.get('episode') or 0)}",
+            queue_position=job.get("queue_position"), links=links)
+        self._ensure_lease_heartbeat()
+
+    def _ensure_lease_heartbeat(self):
+        """Renew owned leases and retire foreign rows once they turn stale."""
+        thread = self._lease_thread
+        if thread is not None and thread.is_alive():
+            return
+
+        def heartbeat():
+            while not self._lease_stop.wait(self.HEARTBEAT_SECONDS):
+                try:
+                    self._job_center.renew_owned_leases()
+                    recovered = self._job_center.bootstrap_interrupt(
+                        "任务 owner 已死亡或租约过期，后台任务已中断",
+                        return_jobs=True)
+                    if recovered:
+                        self._refresh_recovered_jobs(recovered)
+                    self._history_center.recover_stale(
+                        protected_run_ids=self._active_durable_run_ids(),
+                        stale_before=time.time() - self.LEASE_SECONDS)
+                except (AifosError, sqlite3.Error, TypeError, ValueError):
+                    # A transient SQLite error must not terminate production.
+                    # The next heartbeat retries before the 120-second lease.
+                    continue
+
+        self._lease_thread = threading.Thread(
+            target=heartbeat, daemon=True,
+            name="aifos-job-lease-heartbeat")
+        self._lease_thread.start()
+
+    def _refresh_recovered_jobs(self, rows):
+        """Sync lease recovery into history, memory and the serial queue."""
+        queue_keys = set()
+        for row in rows:
+            if row.get("run_id") is not None:
+                self._history_center.recover_run(
+                    row["run_id"], row.get("error")
+                    or "任务 owner 已失联，运行已中断")
+        with self._lock:
+            for row in rows:
+                current = self._jobs.get(row["id"])
+                if (current is not None
+                        and current.get("status") in {"queued", "running",
+                                                      "cancelling"}):
+                    queue_keys.add((
+                        current.get("title"), int(current.get("episode") or 0)))
+                    self._jobs[row["id"]] = self._durable_job_payload(row)
+                for key, pending in list(self._queues.items()):
+                    filtered = [entry for entry in pending
+                                if entry[0] != row["id"]]
+                    if len(filtered) != len(pending):
+                        queue_keys.add(key)
+                    if filtered:
+                        self._queues[key] = filtered
+                        self._renumber_queue(key)
+                    else:
+                        self._queues.pop(key, None)
+        for title, episode in queue_keys:
+            if title:
+                self._drain_serial(title, episode)
+
+    def _persist_job_state(self, job_id, status, *, result=None, error=None):
         try:
-            app.history.bootstrap()
-        finally:
-            app.close()
+            kwargs = {}
+            if result is not None:
+                kwargs["result"] = result if isinstance(result, dict) else {
+                    "result": result}
+            if error is not None:
+                kwargs["error"] = str(error)
+            self._job_center.set_state(job_id, status, **kwargs)
+        except Exception as exc:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                job["ledger_error"] = str(exc)[:300]
 
     def _create_history(self, title, number, action, force=False,
                         request=None):
@@ -419,11 +638,22 @@ class JobRegistry:
                          "fresh_assets": bool(fresh_assets)})
             self._seq += 1
             job_id = f"j{self._seq}"
-            self._jobs[job_id] = {
+            job = {
                 "id": job_id, "status": "running",
                 "title": title, "episode": number, "force": force,
+                "action": action,
                 "started_at": time.time(), "run_id": run_id,
             }
+            self._jobs[job_id] = job
+            self._persist_job_create(job, self._job_request(
+                title, number, {
+                    "premise": premise, "style": style,
+                    "style_pack_id": style_pack_id,
+                    "review": bool(review), "kind": kind,
+                    "script_supplied": script is not None,
+                    "auto_select_assets": bool(auto_select_assets),
+                    "fresh_assets": bool(fresh_assets),
+                }, force=bool(force)))
 
         def task(app):
             return app.director.produce(
@@ -470,11 +700,15 @@ class JobRegistry:
                 title, number, action, request=request)
             self._seq += 1
             job_id = f"j{self._seq}"
-            self._jobs[job_id] = {
+            job = {
                 "id": job_id, "status": "queued" if queue else "running",
                 "title": title, "episode": number, "action": action,
                 "started_at": time.time(), "run_id": run_id,
             }
+            self._jobs[job_id] = job
+            durable_request = self._job_request(
+                title, number, request, force=False)
+            self._persist_job_create(job, durable_request)
         def report(**fields):
             with self._lock:
                 job = self._jobs.get(job_id)
@@ -484,6 +718,10 @@ class JobRegistry:
                 progress.update(fields)
                 progress["updated_at"] = time.time()
                 job["progress"] = progress
+                try:
+                    self._job_center.set_progress(job_id, progress)
+                except Exception as exc:
+                    job["ledger_error"] = str(exc)[:300]
 
         callback = ((lambda app: task(app, run_id, report))
                     if tracked else (lambda app: task(app, run_id)))
@@ -585,6 +823,11 @@ class JobRegistry:
             job = self._jobs.get(queued_id)
             if job is not None:
                 job["queue_position"] = index + 1
+                try:
+                    self._job_center.set_queue_position(
+                        queued_id, index + 1)
+                except Exception as exc:
+                    job["ledger_error"] = str(exc)[:300]
 
     def _submit_serial(self, job_id, title, number, runner):
         """本集空闲就立刻跑,否则排队,等前一个任务结束后自动接上。"""
@@ -597,6 +840,7 @@ class JobRegistry:
                 return
             self._jobs[job_id]["status"] = "running"
             self._jobs[job_id]["started_at"] = time.time()
+            self._persist_job_state(job_id, "running")
         self._run(job_id, runner)
 
     def _drain_serial(self, title, number):
@@ -615,11 +859,13 @@ class JobRegistry:
                     self._queues.pop(key, None)
                 self._renumber_queue(key)
                 job = self._jobs.get(job_id)
-                if job is None:
+                if (job is None or job.get("status") != "queued"
+                        or job.get("cancel_requested")):
                     continue
                 job["status"] = "running"
                 job["started_at"] = time.time()
                 job.pop("queue_position", None)
+                self._persist_job_state(job_id, "running")
             self._run(job_id, runner)
             return
 
@@ -636,8 +882,11 @@ class JobRegistry:
             follow_up = None
             try:
                 summary = task(app)
-                self._jobs[job_id].update(
-                    status="done", summary=summary, finished_at=time.time())
+                with self._lock:
+                    self._jobs[job_id].update(
+                        status="done", summary=summary,
+                        finished_at=time.time())
+                self._persist_job_state(job_id, "done", result=summary)
                 app.history.finish_run(
                     self._jobs[job_id]["run_id"], summary=summary)
                 if isinstance(summary, dict) and summary.get("status") == "done":
@@ -655,8 +904,11 @@ class JobRegistry:
                             # 不能把已经交付成功的本集和历史记录反写成失败。
                             self._jobs[job_id]["series_advance_error"] = str(exc)
             except Exception as exc:  # 后台任务兜底,错误进任务状态
-                self._jobs[job_id].update(
-                    status="failed", error=str(exc), finished_at=time.time())
+                with self._lock:
+                    self._jobs[job_id].update(
+                        status="failed", error=str(exc),
+                        finished_at=time.time())
+                self._persist_job_state(job_id, "failed", error=str(exc))
                 app.history.finish_run(
                     self._jobs[job_id]["run_id"], error=str(exc))
             finally:
@@ -700,6 +952,48 @@ class JobRegistry:
 
     def get(self, job_id):
         return self._jobs.get(job_id)
+
+    def request_cancel(self, job_id, reason="用户请求停止生产"):
+        """Persist cancellation intent while the live worker remains active."""
+        queue_keys = set()
+        cancelled_while_queued = False
+        run_id = None
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            previous_status = str(job.get("status") or "")
+            run_id = job.get("run_id")
+            job["cancel_requested"] = True
+            job["cancel_reason"] = str(reason)
+            try:
+                durable = self._job_center.request_cancel(job_id, reason)
+            except Exception as exc:
+                job["ledger_error"] = str(exc)[:300]
+                durable = None
+            if previous_status == "queued":
+                cancelled_while_queued = True
+                for key, pending in list(self._queues.items()):
+                    filtered = [entry for entry in pending
+                                if entry[0] != job_id]
+                    if len(filtered) != len(pending):
+                        queue_keys.add(key)
+                    if filtered:
+                        self._queues[key] = filtered
+                        self._renumber_queue(key)
+                    else:
+                        self._queues.pop(key, None)
+                if durable is not None:
+                    self._jobs[job_id] = self._durable_job_payload(durable)
+                else:
+                    job.update(status="cancelled", finished_at=time.time())
+                    job.pop("queue_position", None)
+            result = dict(self._jobs[job_id])
+        if cancelled_while_queued:
+            self._history_center.cancel_run(run_id, reason)
+            for title, episode in queue_keys:
+                self._drain_serial(title, episode)
+        return result
 
     def list(self):
         return sorted(self._jobs.values(),
@@ -5588,6 +5882,7 @@ def make_handler(workspace, jobs):
             def cancel(app):
                 app.projects.set_episode_status(episode["id"], "cancelling")
                 for job in active:
+                    jobs.request_cancel(job["id"])
                     app.history.mark_cancelling(job.get("run_id"))
 
             self._with_app(cancel)

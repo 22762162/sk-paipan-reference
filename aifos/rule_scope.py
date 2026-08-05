@@ -5,6 +5,9 @@ another by stable ``key`` using this precedence (high to low)::
 
     current_shot > episode_temporary > project_series > system_base
 
+Technical hard rules are evaluated after that creative stack and are always
+the final winner for a colliding key.
+
 The resolver deliberately does not concatenate values for the same key: one
 key has one effective value and an auditable source.  Project and episode
 bindings are checked before applicability so a mixed rule store cannot leak a
@@ -40,9 +43,34 @@ _APPLICABILITY_FIELDS = (
     "scene_no",
     "story_phase",
     "era",
+    "active_realm_id",
+    "event_id",
 )
+_APPLICABILITY_ALIASES = {
+    "stages": "stage",
+    "modalities": "modality",
+    "shot_nos": "shot_no",
+    "scene_nos": "scene_no",
+    "story_phases": "story_phase",
+    "active_story_phase": "story_phase",
+    "active_story_phases": "story_phase",
+    "eras": "era",
+    "era_context": "era",
+    "era_contexts": "era",
+    "active_realm_ids": "active_realm_id",
+    "active_realms": "active_realm_id",
+    "realm_id": "active_realm_id",
+    "realm_ids": "active_realm_id",
+    "realms": "active_realm_id",
+    "event_ids": "event_id",
+    "events": "event_id",
+    "scene_event_id": "event_id",
+    "scene_event_ids": "event_id",
+    "story_event_ids": "event_id",
+}
 _EPISODE_BOUND_LAYERS = {"episode_temporary", "current_shot"}
-_PROTECTED_TECHNICAL_PREFIXES = ("technical.", "provider.", "quality.gate.")
+_PROTECTED_TECHNICAL_PREFIXES = (
+    "technical.", "provider.", "quality.gate.", "quality_gate.")
 
 _EXCEPTION_ALIASES = {
     "time_travel": {
@@ -72,13 +100,16 @@ class DuplicateRuleError(RuleScopeError):
 
 
 def _required_identifier(name: str, value: Any) -> str:
-    if not isinstance(value, str) or not value.strip():
+    if isinstance(value, bool) or value is None:
         raise RuleScopeError(f"{name} must be a non-empty string")
-    return value.strip()
+    normalized = str(value).strip()
+    if not normalized:
+        raise RuleScopeError(f"{name} must be a non-empty string")
+    return normalized
 
 
 def _optional_identifier(name: str, value: Any) -> str | None:
-    if value is None:
+    if value is None or (isinstance(value, str) and not value.strip()):
         return None
     return _required_identifier(name, value)
 
@@ -94,19 +125,39 @@ class RuleContext:
     shot_no: int | str | None = None
     scene_no: int | str | None = None
     story_phase: str | None = None
+    active_story_phase: str | None = None
     era: str | None = None
+    active_realm_id: str | None = None
+    event_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
             self, "project_id", _required_identifier("project_id", self.project_id))
         object.__setattr__(
             self, "episode_id", _required_identifier("episode_id", self.episode_id))
+        story_phase = self.story_phase
+        active_story_phase = self.active_story_phase
+        if story_phase is not None and active_story_phase is not None:
+            if _normalized_phase(story_phase) != _normalized_phase(
+                    active_story_phase):
+                raise RuleScopeError(
+                    "story_phase conflicts with active_story_phase")
+        normalized_phase = _normalized_phase(
+            active_story_phase if active_story_phase is not None
+            else story_phase)
+        object.__setattr__(self, "story_phase", normalized_phase)
+        object.__setattr__(self, "active_story_phase", normalized_phase)
+        object.__setattr__(self, "active_realm_id", _optional_identifier(
+            "active_realm_id", self.active_realm_id))
+        object.__setattr__(self, "event_id", _optional_identifier(
+            "event_id", self.event_id))
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "project_id": self.project_id,
             "episode_id": self.episode_id,
             **{name: getattr(self, name) for name in _APPLICABILITY_FIELDS},
+            "active_story_phase": self.active_story_phase,
         }
 
 
@@ -183,6 +234,18 @@ class ResolvedRuleSet(Mapping[str, Any]):
 
         return copy.deepcopy(self.final_rules)
 
+    @property
+    def effective_rules(self) -> dict[str, Any]:
+        """Compatibility name used by the rule-stack API."""
+
+        return self.rules
+
+    @property
+    def suppressed(self) -> list[dict[str, Any]]:
+        """Compatibility name for overridden/suppressed audit records."""
+
+        return copy.deepcopy(self.overridden)
+
     def __getitem__(self, key: str) -> Any:
         return self.final_rules[key]
 
@@ -197,8 +260,10 @@ class ResolvedRuleSet(Mapping[str, Any]):
             "schema": RULE_SCOPE_SCHEMA,
             "context": self.context.as_dict(),
             "final_rules": copy.deepcopy(self.final_rules),
+            "effective_rules": copy.deepcopy(self.final_rules),
             "sources": copy.deepcopy(self.sources),
             "overridden": copy.deepcopy(self.overridden),
+            "suppressed": copy.deepcopy(self.overridden),
             "fingerprint": self.fingerprint,
         }
 
@@ -208,13 +273,36 @@ def _context(value: RuleContext | Mapping[str, Any]) -> RuleContext:
         return value
     if not isinstance(value, Mapping):
         raise RuleScopeError("context must be RuleContext or a mapping")
-    allowed = {"project_id", "episode_id", *_APPLICABILITY_FIELDS}
+    aliases = {
+        "realm_id": "active_realm_id",
+        "scene_event_id": "event_id",
+        "era_context": "era",
+    }
+    allowed = {
+        "project_id", "episode_id", "active_story_phase",
+        *_APPLICABILITY_FIELDS, *aliases,
+    }
     unknown = set(value) - allowed
     if unknown:
         raise RuleScopeError(
             f"unknown context fields: {', '.join(sorted(map(str, unknown)))}")
+    normalized = dict(value)
+    for alias, canonical in aliases.items():
+        if alias not in normalized:
+            continue
+        if canonical in normalized:
+            left = _normalized_applicability_value(
+                canonical, normalized[canonical])
+            right = _normalized_applicability_value(
+                canonical, normalized[alias])
+            if left != right:
+                raise RuleScopeError(
+                    f"context {alias} conflicts with {canonical}")
+        else:
+            normalized[canonical] = normalized[alias]
+        normalized.pop(alias, None)
     try:
-        return RuleContext(**dict(value))
+        return RuleContext(**normalized)
     except TypeError as exc:
         raise RuleScopeError(str(exc)) from exc
 
@@ -247,6 +335,10 @@ def _normalized_applicability_value(field_name: str, value: Any) -> Any:
             return value
     if field_name == "story_phase":
         return _normalized_phase(value)
+    if field_name in {"active_realm_id", "event_id"}:
+        if value is None:
+            return None
+        return str(value).strip().casefold()
     return _normalized_text(value)
 
 
@@ -255,6 +347,57 @@ def _value_list(value: Any) -> list[Any]:
             value, (list, tuple, set, frozenset)):
         return [value]
     return list(value)
+
+
+def _validated_applicability_values(
+        field_name: str, value: Any) -> list[Any]:
+    """Validate one selector before normalization.
+
+    Applicability is a routing contract.  Treating malformed JSON as a value
+    that merely does not match is unsafe because callers may later coerce the
+    whole contract to ``{}``, accidentally turning a local rule into a global
+    one.  Selectors therefore accept only one scalar or a non-empty collection
+    of scalars; mappings, nested collections, booleans and null are invalid.
+    """
+    if isinstance(value, Mapping):
+        raise RuleScopeError(
+            f"applicability selector {field_name} must be a scalar or list")
+    values = _value_list(value)
+    if not values:
+        raise RuleScopeError(
+            f"applicability selector {field_name} cannot be empty")
+    validated = []
+    for item in values:
+        if (item is None or isinstance(item, bool)
+                or isinstance(item, Mapping)
+                or (not isinstance(item, (str, bytes))
+                    and isinstance(item, (list, tuple, set, frozenset)))):
+            raise RuleScopeError(
+                f"applicability selector {field_name} contains invalid value")
+        if field_name in {"shot_no", "scene_no"}:
+            if item == "*":
+                validated.append(item)
+                continue
+            if isinstance(item, int):
+                number = item
+            elif isinstance(item, str) and item.strip().isdigit():
+                number = int(item.strip())
+            else:
+                raise RuleScopeError(
+                    f"applicability selector {field_name} must contain "
+                    "positive integers or *")
+            if number <= 0:
+                raise RuleScopeError(
+                    f"applicability selector {field_name} must contain "
+                    "positive integers or *")
+            validated.append(number)
+            continue
+        if not isinstance(item, str) or not item.strip():
+            raise RuleScopeError(
+                f"applicability selector {field_name} must contain "
+                "non-empty strings")
+        validated.append(item)
+    return validated
 
 
 def _canonical_json(value: Any) -> str:
@@ -273,22 +416,54 @@ def _normalized_applicability(
         return {}
     if not isinstance(applicability, Mapping):
         raise RuleScopeError("applicability must be a mapping")
-    unknown = set(applicability) - set(_APPLICABILITY_FIELDS)
+    non_string_fields = [
+        key for key in applicability if not isinstance(key, str)]
+    if non_string_fields:
+        raise RuleScopeError("applicability field names must be strings")
+    unknown = (
+        set(applicability)
+        - set(_APPLICABILITY_FIELDS)
+        - set(_APPLICABILITY_ALIASES)
+    )
     if unknown:
         raise RuleScopeError(
             "unknown applicability fields: "
             + ", ".join(sorted(map(str, unknown))))
 
     result: dict[str, tuple[Any, ...]] = {}
-    for field_name in sorted(applicability):
+    for supplied_name in sorted(applicability):
+        field_name = _APPLICABILITY_ALIASES.get(
+            supplied_name, supplied_name)
         values = [
             _normalized_applicability_value(field_name, item)
-            for item in _value_list(applicability[field_name])
+            for item in _validated_applicability_values(
+                field_name, applicability[supplied_name])
         ]
         unique = {_canonical_json(item): item for item in values}
-        result[field_name] = tuple(
+        normalized_values = tuple(
             unique[token] for token in sorted(unique))
+        if (field_name in result
+                and result[field_name] != normalized_values):
+            raise RuleScopeError(
+                f"applicability supplies conflicting selectors for "
+                f"{field_name}")
+        result[field_name] = normalized_values
     return result
+
+
+def normalize_rule_applicability(
+        applicability: Mapping[str, Any] | None) -> dict[str, list[Any]]:
+    """Validate and canonicalize a public rule applicability contract.
+
+    The returned mapping uses canonical selector names and JSON-safe lists.
+    API and Director callers share this entry point so invalid stored data is
+    rejected consistently instead of being widened to a global rule.
+    """
+    normalized = _normalized_applicability(applicability)
+    return {
+        name: list(values)
+        for name, values in sorted(normalized.items())
+    }
 
 
 def _canonical_exception(value: Any) -> str | None:
@@ -317,8 +492,10 @@ def _validate_exception(
 
 
 def _rule_from_mapping(value: Mapping[str, Any]) -> Rule:
-    if "key" not in value or "value" not in value:
-        raise RuleScopeError("each rule requires key and value")
+    if "key" not in value:
+        raise RuleScopeError("each rule requires key")
+    if "value" not in value and "text" not in value:
+        raise RuleScopeError("each rule requires value or text")
     if "applicability" in value and "applies_to" in value:
         raise RuleScopeError("use only one of applicability and applies_to")
     applicability = value.get("applicability", value.get("applies_to", {}))
@@ -330,7 +507,7 @@ def _rule_from_mapping(value: Mapping[str, Any]) -> Rule:
         raise RuleScopeError("rule binding must be a mapping")
     return Rule(
         key=value["key"],
-        value=value["value"],
+        value=(value["value"] if "value" in value else value["text"]),
         applicability=applicability,
         project_id=value.get("project_id", binding.get("project_id")),
         episode_id=value.get("episode_id", binding.get("episode_id")),
@@ -359,6 +536,8 @@ def _payload_parts(
 ) -> tuple[list[Rule | Mapping[str, Any]], dict[str, Any]]:
     if payload is None:
         return [], {}
+    if isinstance(payload, Rule):
+        return [payload], {}
     if isinstance(payload, RuleBundle):
         return list(payload.rules), {
             "project_id": payload.project_id,
@@ -495,6 +674,8 @@ def _candidate_rules(
         if isinstance(raw_rule, Rule):
             rule = raw_rule
         elif isinstance(raw_rule, Mapping):
+            if raw_rule.get("enabled") is False:
+                continue
             rule = _rule_from_mapping(raw_rule)
         else:
             raise RuleScopeError("rules must be Rule instances or mappings")
@@ -712,6 +893,106 @@ def resolve_rules(
     )
 
 
+def _compat_bound_payload(
+    payload: Rule | RuleBundle | Mapping[str, Any]
+    | Iterable[Rule | Mapping[str, Any]] | None,
+    *,
+    layer: str,
+    context: RuleContext,
+) -> RuleBundle | Mapping[str, Any] | Iterable[Rule | Mapping[str, Any]] | None:
+    """Inject caller-owned scope IDs while preserving conflicting IDs to fail."""
+
+    if payload is None:
+        return None
+    project_id = (
+        context.project_id
+        if layer in {"project_series", "episode_temporary", "current_shot"}
+        else None
+    )
+    episode_id = (
+        context.episode_id if layer in _EPISODE_BOUND_LAYERS else None)
+    if isinstance(payload, RuleBundle):
+        return RuleBundle(
+            rules=payload.rules,
+            project_id=(
+                payload.project_id
+                if payload.project_id is not None else project_id),
+            episode_id=(
+                payload.episode_id
+                if payload.episode_id is not None else episode_id),
+            source=payload.source or layer,
+        )
+    if isinstance(payload, Rule):
+        rows: list[Rule | Mapping[str, Any]] = [payload]
+        bundle: dict[str, Any] = {"rules": rows}
+    elif isinstance(payload, Mapping):
+        if "key" in payload:
+            bundle = {"rules": [copy.deepcopy(dict(payload))]}
+        else:
+            bundle = copy.deepcopy(dict(payload))
+            scope = str(bundle.get("scope") or "").strip()
+            if scope and scope != layer:
+                raise ScopeBindingError(
+                    f"{layer} input declares incompatible scope {scope!r}")
+            bundle.setdefault("rules", [])
+    else:
+        if isinstance(payload, (str, bytes)) or not isinstance(
+                payload, Iterable):
+            raise RuleScopeError(
+                f"{layer} rules must be a rule pack or iterable")
+        bundle = {"rules": list(payload)}
+    if project_id is not None:
+        bundle.setdefault("project_id", project_id)
+    if episode_id is not None:
+        bundle.setdefault("episode_id", episode_id)
+    if not bundle.get("source"):
+        version = bundle.get("version")
+        bundle["source"] = (
+            f"{layer}:v{version}" if version not in (None, "") else layer)
+    return bundle
+
+
+def resolve_rule_stack(
+    *,
+    context: RuleContext | Mapping[str, Any],
+    technical_rules: Rule | RuleBundle | Mapping[str, Any]
+    | Iterable[Rule | Mapping[str, Any]] | None = None,
+    base_rules: Rule | RuleBundle | Mapping[str, Any]
+    | Iterable[Rule | Mapping[str, Any]] | None = None,
+    project_rules: Rule | RuleBundle | Mapping[str, Any]
+    | Iterable[Rule | Mapping[str, Any]] | None = None,
+    episode_rules: Rule | RuleBundle | Mapping[str, Any]
+    | Iterable[Rule | Mapping[str, Any]] | None = None,
+    shot_rules: Rule | RuleBundle | Mapping[str, Any]
+    | Iterable[Rule | Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Compatibility facade for storage/Web callers using friendly pack names.
+
+    Project and episode bindings omitted from a pack are supplied from the
+    required context.  Explicit conflicting bindings remain intact and are
+    rejected by :func:`resolve_rules`.
+    """
+
+    resolved_context = _context(context)
+    resolved = resolve_rules(
+        resolved_context,
+        technical_hard=_compat_bound_payload(
+            technical_rules, layer="technical_hard", context=resolved_context),
+        system_base=_compat_bound_payload(
+            base_rules, layer="system_base", context=resolved_context),
+        project_series=_compat_bound_payload(
+            project_rules, layer="project_series", context=resolved_context),
+        episode_temporary=_compat_bound_payload(
+            episode_rules,
+            layer="episode_temporary",
+            context=resolved_context,
+        ),
+        current_shot=_compat_bound_payload(
+            shot_rules, layer="current_shot", context=resolved_context),
+    )
+    return resolved.as_dict()
+
+
 class RuleResolver:
     """Small reusable facade for Director's persistent hard/base rules."""
 
@@ -748,5 +1029,6 @@ __all__ = [
     "RuleResolver",
     "RuleScopeError",
     "ScopeBindingError",
+    "resolve_rule_stack",
     "resolve_rules",
 ]

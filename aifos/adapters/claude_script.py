@@ -1623,6 +1623,169 @@ REVIEW_LENSES = {
 _QC_INVISIBLE_PROP_VISIBILITIES = frozenset({"hidden", "absent"})
 
 
+def build_candidate_comparison_prompt(payload):
+    """Ask one visual judge to compare a frozen four-image wave together."""
+    request = payload.get("candidate_comparison") or {}
+    candidates = request.get("candidates") or []
+    references = request.get("reference_bindings") or []
+    return """你是漫剧候选图比较导演。必须实际查看下面同一轮候选图，
+并结合参考图职责做相对比较。技术损坏图不会出现在此处；若存在
+qc_passed=true，只能在这些已通过图中选优。不要把任何 failed 改成通过，
+全部 failed 时只选最接近合同的一张供下一轮定向返修。
+
+冻结比较合同:
+{request}
+
+候选图路径:
+{candidates}
+
+参考图职责:
+{references}
+
+按 visible_facts、identity、spatial、prop_physics、text、continuity、
+composition 七维逐张给0-100分；只写从画面能观察到的证据。总分最高者
+必须等于 winner_candidate_id。每行 candidate_id 与 candidate_index 必须按
+冻结请求原样成对回传；不得把上传顺序误写成原始候选序号。原样回传四个
+绑定字段。严格只输出 JSON:
+{{"schema":"aifos.candidate-comparison-result/v1",
+"candidate_set_token":"...","target_input_hash":"...",
+"reference_selection_hash":"...","ranking_input_hash":"...",
+"candidates":[{{"candidate_id":"...","candidate_index":1,"dimension_scores":{{
+"visible_facts":0,"identity":0,"spatial":0,"prop_physics":0,
+"text":0,"continuity":0,"composition":0}},"evidence":[{{
+"dimension":"identity","finding":"可见证据",
+"reference_asset_id":""}}],"fatal_issues":[],"soft_issues":[],
+"total_score":0}}],"winner_candidate_id":"...",
+"winner_reason":"明确的相对优势","confidence":0.0}}""".format(
+        request=json.dumps(request, ensure_ascii=False),
+        candidates=json.dumps(candidates, ensure_ascii=False),
+        references=json.dumps(references, ensure_ascii=False))
+
+
+def validate_candidate_comparison(data, payload):
+    """Cheap adapter-side shape check; Director performs frozen-hash checks."""
+    if not isinstance(data, dict):
+        return "候选比较输出必须是 JSON 对象"
+    request = payload.get("candidate_comparison") or {}
+    for key in (
+            "candidate_set_token", "target_input_hash",
+            "reference_selection_hash", "ranking_input_hash"):
+        if str(data.get(key) or "") != str(request.get(key) or ""):
+            return f"候选比较 {key} 与冻结请求不一致"
+    request_rows = [
+        item for item in request.get("candidates") or []
+        if isinstance(item, dict)]
+    if not request_rows:
+        return "候选比较请求 candidates 必须是非空数组"
+    expected_by_id = {}
+    expected_indexes = set()
+    for item in request_rows:
+        candidate_id = str(item.get("candidate_id") or "")
+        try:
+            candidate_index = int(item.get("candidate_index"))
+        except (TypeError, ValueError):
+            return "候选比较请求 candidate_index 必须是正整数"
+        if not candidate_id or candidate_id in expected_by_id:
+            return "候选比较请求 candidate_id 为空或重复"
+        if candidate_index <= 0 or candidate_index in expected_indexes:
+            return "候选比较请求 candidate_index 为空或重复"
+        if not str(item.get("uri") or "").strip():
+            return "候选比较请求缺少候选图片 URI"
+        expected_by_id[candidate_id] = candidate_index
+        expected_indexes.add(candidate_index)
+    rows = data.get("candidates")
+    if not isinstance(rows, list) or not rows:
+        return "候选比较 candidates 必须是非空数组"
+    actual_ids = []
+    for item in rows:
+        if not isinstance(item, dict):
+            return "候选比较返回行必须是 JSON 对象"
+        candidate_id = str(item.get("candidate_id") or "")
+        try:
+            candidate_index = int(item.get("candidate_index"))
+        except (TypeError, ValueError):
+            return "候选比较返回缺少 candidate_index"
+        if expected_by_id.get(candidate_id) != candidate_index:
+            return "候选比较 candidate_id/index 与冻结请求不一致"
+        actual_ids.append(candidate_id)
+    expected = set(expected_by_id)
+    if len(actual_ids) != len(set(actual_ids)):
+        return "候选比较返回 candidate_id 重复"
+    if set(actual_ids) != expected:
+        return "候选比较返回的候选集合与冻结请求不一致"
+    if str(data.get("winner_candidate_id") or "") not in expected:
+        return "winner_candidate_id 不在冻结候选集合中"
+    return None
+
+
+SCRIPT_REVIEW_DIMENSIONS = (
+    "causal_chain",
+    "conflict_density",
+    "character_arc",
+    "dialogue_quality",
+    "hook_strength",
+)
+
+
+def build_independent_script_review_prompt(payload):
+    """Build a second-run review prompt that cannot rewrite the script."""
+    request = {
+        "script_version": str(payload.get("script_version") or ""),
+        "script": payload.get("script") or {},
+        "story_event_graph": payload.get("story_event_graph") or {},
+    }
+    return """你是独立剧本评审，不是本稿生成器。只审查，不续写、不改写，
+不返回 scenes/characters，也不自报运行ID。按五维分别给1-5分；每维必须
+引用剧本中可核对的具体事件或台词作为 evidence，并给至少一条可直接执行的
+directed_revision。低分只形成建议，不得宣告停止生产。
+
+待审合同:
+{request}
+
+严格只输出下面结构的 JSON:
+{{"dimension_reviews":{{
+"causal_chain":{{"score":1,"evidence":["具体证据"],
+"directed_revision":["定向修改"]}},
+"conflict_density":{{"score":1,"evidence":["具体证据"],
+"directed_revision":["定向修改"]}},
+"character_arc":{{"score":1,"evidence":["具体证据"],
+"directed_revision":["定向修改"]}},
+"dialogue_quality":{{"score":1,"evidence":["具体证据"],
+"directed_revision":["定向修改"]}},
+"hook_strength":{{"score":1,"evidence":["具体证据"],
+"directed_revision":["定向修改"]}}
+}}}}""".format(request=json.dumps(request, ensure_ascii=False))
+
+
+def validate_independent_script_review(data, _payload=None):
+    if not isinstance(data, dict):
+        return "独立剧本评审输出必须是 JSON 对象"
+    reviews = data.get("dimension_reviews")
+    if not isinstance(reviews, dict):
+        return "独立剧本评审缺少 dimension_reviews"
+    if set(reviews) != set(SCRIPT_REVIEW_DIMENSIONS):
+        return "独立剧本评审必须且只能完整返回固定五维"
+    for dimension in SCRIPT_REVIEW_DIMENSIONS:
+        row = reviews.get(dimension)
+        if not isinstance(row, dict):
+            return f"{dimension} 必须是评审对象"
+        score = row.get("score")
+        if isinstance(score, bool):
+            return f"{dimension}.score 必须为1至5"
+        try:
+            score = int(score)
+        except (TypeError, ValueError):
+            return f"{dimension}.score 必须为1至5"
+        if score < 1 or score > 5:
+            return f"{dimension}.score 必须为1至5"
+        for field in ("evidence", "directed_revision"):
+            values = row.get(field)
+            if (not isinstance(values, list)
+                    or not any(str(item or "").strip() for item in values)):
+                return f"{dimension}.{field} 必须提供非空文本证据"
+    return None
+
+
 def static_image_qc_projection(payload):
     """Return the compiled, phase-local still contract used for visual QC.
 
@@ -2753,6 +2916,8 @@ def _build_prompt_body(capability, payload):
             script=json.dumps(payload.get("script", {}),
                               ensure_ascii=False),
             schema=STORY_ANALYSIS_SCHEMA) + _effective_rule_block(payload)
+    if capability == "script" and payload.get("independent_script_review"):
+        return build_independent_script_review_prompt(payload)
     if capability == "script" and payload.get("character_design"):
         names = "、".join(
             f"{c.get('name')}({c.get('role') or '角色'})"
@@ -2850,6 +3015,8 @@ def _build_prompt_body(capability, payload):
             script=json.dumps(payload.get("script", {}), ensure_ascii=False)
         ) + _effective_rule_block(payload)
     if capability == "image_qc":
+        if payload.get("candidate_comparison"):
+            return build_candidate_comparison_prompt(payload)
         return build_qc_prompt(payload)
     if capability == "scene_annotate":
         return SCENE_ANNOTATE_PROMPT.format(
@@ -3076,6 +3243,8 @@ def _postprocess_and_validate(capability, payload, data):
         reconcile_storyboard_prop_registry(data, source_script)
     if capability == "scene_annotate":
         error = validate_scene_annotation(data)
+    elif capability == "image_qc" and payload.get("candidate_comparison"):
+        error = validate_candidate_comparison(data, payload)
     elif capability == "image_qc":
         error = validate_image_qc(data)
     elif capability == "script" and payload.get("prompt_refine"):
@@ -3105,6 +3274,8 @@ def _postprocess_and_validate(capability, payload, data):
         )
         error = validate_story_analysis(
             data, require_resolved_identity=False)
+    elif capability == "script" and payload.get("independent_script_review"):
+        error = validate_independent_script_review(data, payload)
     elif capability == "script":
         error = validate_script(data, payload)
     else:
