@@ -12,6 +12,7 @@ import pytest
 from aifos.app import App
 from aifos.camera_language import (
     CAMERA_SCALE_CAPACITY,
+    allows_partial_multi_subject_scale,
     enforce_scale_capacity,
     scale_capacity,
 )
@@ -44,6 +45,18 @@ def test_enforce_scale_capacity_upgrades_only_when_needed():
     assert enforce_scale_capacity("特写", 0) == ("特写", "")
 
 
+def test_partial_closeup_never_overrides_explicit_full_body_or_three_faces():
+    assert not allows_partial_multi_subject_scale(
+        "双人面部大特写，但二人全身都在画面中", 2)
+    assert not allows_partial_multi_subject_scale(
+        "三名人物均只以局部入画，头部躯干出画；"
+        "同时要求三名人物完整面孔清晰同框", 3)
+    # 否定式不是正向全身要求，明确的手腕局部仍应放行。
+    assert allows_partial_multi_subject_scale(
+        "双手大特写，不要求两人全身入画；"
+        "两名人物均只以手腕局部入画，完整人形出画", 2)
+
+
 def test_camera_plan_never_emits_infeasible_scale():
     # 盲轮换曾把 85mm 特写配给多人镜头 → 同级互斥 → 审核必熔断。
     for index in range(1, 9):
@@ -59,6 +72,16 @@ def test_camera_plan_never_emits_infeasible_scale():
     # 单人镜头不受影响,特写仍是特写。
     plan = _camera_plan("特写", "reaction", 1, visible_count=1)
     assert plan["shot_scale"] == "特写"
+    assert "capacity_note" not in plan
+
+
+def test_camera_plan_keeps_explicit_two_person_detail_closeup():
+    plan = _camera_plan(
+        "微俯双手大特写，135mm", "physical", 1,
+        visible_count=2,
+        framing_text="两名人物均只以手腕局部入画，完整人形出画")
+    assert plan["shot_scale"] == "大特写"
+    assert plan["lens"] == "135mm"
     assert "capacity_note" not in plan
 
 
@@ -105,6 +128,51 @@ def test_compile_keeps_feasible_closeup_untouched():
     assert contract["camera"]["景别"] == "特写"
     assert contract["camera"]["焦段"] == "85mm"
     assert "容量修正" not in contract["camera"]
+
+
+def test_compile_keeps_two_person_hand_detail_as_large_closeup():
+    shot = {
+        "shot_no": 4, "scene_no": 1, "kind": "physical",
+        "camera": "微俯双手大特写，135mm，固定机位",
+        "characters": ["虞寻歌", "虞寻欢"],
+        "visible_figure_count": 2,
+        "description": (
+            "两名人物均只以手腕局部入画，不出现任何完整人形；"
+            "头部、面部、躯干及其余身体明确出画"),
+        "frame_targets": {"keyframe": {
+            "phase": "end", "state": "两人的手腕保持接触",
+            "fallback": False, "explicit": True}},
+        "start_state": {}, "end_state": {},
+    }
+    contract, _prompt = compile_shot_prompt(
+        shot, location="现代卧室", style="写实", references=[],
+        mode="image")
+    assert contract["camera"]["景别"] == "大特写"
+    assert contract["camera"]["焦段"] == "135mm"
+    assert "容量修正" not in contract["camera"]
+
+
+def test_partial_people_do_not_hide_distant_prop_anchor_conflict():
+    shot = {
+        "shot_no": 5, "scene_no": 1, "kind": "dialogue",
+        "camera": "双人贴面大特写，135mm，固定机位",
+        "characters": ["甲", "乙"], "visible_figure_count": 2,
+        "description": "两张脸贴近对话，同时要求远处墙钟清晰入画",
+        "frame_props": [{
+            "prop_id": "wall_clock", "phase": "freeze",
+            "visibility": "visible", "holder": "none",
+        }],
+        "frame_targets": {"keyframe": {
+            "phase": "freeze", "state": "甲乙两张脸与远处墙钟同框",
+            "fallback": False, "explicit": True}},
+        "start_state": {}, "end_state": {},
+    }
+    contract, _prompt = compile_shot_prompt(
+        shot, location="现代卧室", style="写实", references=[],
+        mode="image")
+    assert contract["camera"]["景别"] == "中景"
+    assert contract["camera"]["焦段"] == "35mm"
+    assert "空间锚点修正" in contract["camera"]["容量修正"]
 
 
 # ---------- 根因5:media_type 按真实字节 ----------

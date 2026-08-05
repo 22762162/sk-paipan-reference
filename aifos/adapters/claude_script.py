@@ -2413,7 +2413,9 @@ def validate_ai_director(data, payload):
     """AI 导演输出校验:词条必须在词典内、景别必须装得下人数。"""
     from ..camera_language import (ANGLE_GEOMETRY, COMPOSITION_GEOMETRY,
                                    MOVEMENT_GEOMETRY, POSITION_GEOMETRY,
-                                   SCALE_GEOMETRY, scale_capacity)
+                                   SCALE_GEOMETRY,
+                                   allows_partial_multi_subject_scale,
+                                   scale_capacity)
     from ..lighting_language import LIGHTING_STYLES
     if not isinstance(data, dict):
         return "输出必须是 JSON 对象"
@@ -2441,7 +2443,10 @@ def validate_ai_director(data, payload):
             count = int((payload or {}).get("visible_count") or 0)
         except (TypeError, ValueError):
             count = 0
-        if count > 0 and scale_capacity(scale) < count:
+        partial_multi_subject = allows_partial_multi_subject_scale(
+            f"{scale}；{(payload or {}).get('framing_text') or ''}", count)
+        if (count > 0 and scale_capacity(scale) < count
+                and not partial_multi_subject):
             return (f"景别{scale}装不下本镜必须可见的{count}人——"
                     "导演不能违反容量物理")
     data["camera"] = cleaned

@@ -25673,6 +25673,9 @@ class Director:
             "spatial": spatial_text,
             "qc_issues": qc_issues,
             "visible_count": visible_count,
+            "framing_text": "；".join(str(value or "") for value in (
+                shot.get("camera"), shot.get("description"),
+                shot.get("frame_targets"))),
             "vocabulary": {
                 "景别": list(SCALE_GEOMETRY), "角度": list(ANGLE_GEOMETRY),
                 "机位": list(POSITION_GEOMETRY),

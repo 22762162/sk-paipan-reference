@@ -17,7 +17,8 @@
 零副作用叶子模块:只读入,只返回问题清单,不改任何文档。
 """
 
-from .camera_language import scale_capacity
+from .camera_language import (allows_partial_multi_subject_scale,
+                              scale_capacity)
 from .high_value_events import audit_high_value_event_coverage
 from .spatial_language import framing_conflict, screen_zone, _actor_line
 
@@ -94,6 +95,14 @@ def _check_capacity(shot):
         return None
     capacity = scale_capacity(scale)
     if capacity >= count:
+        return None
+    frame_targets = shot.get("frame_targets")
+    frame_targets = frame_targets if isinstance(frame_targets, dict) else {}
+    framing_text = "；".join(str(value or "") for value in (
+        shot.get("camera"), shot.get("description"),
+        frame_targets.get("keyframe"), frame_targets.get("first_frame"),
+        frame_targets.get("last_frame")))
+    if allows_partial_multi_subject_scale(framing_text, count):
         return None
     return _issue(
         shot, "scale_capacity",

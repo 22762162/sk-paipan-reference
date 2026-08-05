@@ -1798,6 +1798,355 @@ def test_v21_video_prompt_keeps_start_action_end_progression():
     assert "【终点定格】" not in prompt
 
 
+def test_static_end_frame_ignores_video_dialogue_and_start_consciousness():
+    """关键帧只审定格终态，不能把视频的起点与对白塞回静态审核。"""
+    shot = {
+        "shot_no": 12,
+        "characters": ["虞寻欢"],
+        "description": (
+            "静态终点：虞寻欢仰躺床中央，双眼已经张开，开口发问"),
+        "camera": "近景",
+        "start_state": {
+            "虞寻欢": {
+                "pose": "仰躺闭眼",
+                "condition": {
+                    "life_state": "alive",
+                    "consciousness_state": "asleep",
+                    "embodiment": "physical",
+                    "mobility": "immobile",
+                },
+            },
+        },
+        "end_state": {
+            "虞寻欢": {
+                "pose": "仰躺睁眼",
+                "condition": {
+                    "life_state": "alive",
+                    "consciousness_state": "awake",
+                    "embodiment": "physical",
+                    "mobility": "limited",
+                },
+            },
+        },
+        "frame_targets": {
+            "keyframe": {
+                "phase": "end",
+                "state": "虞寻欢仰躺床中央，双眼已经张开，正看向姐姐",
+                "fallback": False,
+                "explicit": True,
+            },
+        },
+        "dialogue": {
+            "character": "虞寻欢",
+            "dialogue": "姐，你在做什么？",
+        },
+    }
+
+    image_contract, image_prompt = compile_shot_prompt(shot, mode="image")
+    image_report = validate_shot_prompt_contract(image_contract)
+
+    assert image_report["passed"], image_report["issues"]
+    assert "【对白】" not in image_prompt
+    assert "【单一主动作】" not in image_prompt
+
+    # The same data is still invalid as a moving timeline: asleep→awake needs
+    # an explicit waking action before dialogue and gaze can happen.
+    video_contract, _ = compile_shot_prompt(shot, mode="video")
+    video_report = validate_shot_prompt_contract(video_contract)
+    assert not video_report["passed"]
+    assert any(
+        "consciousness_state=awake" in issue and "说话" in issue
+        for issue in video_report["issues"])
+
+
+def test_static_end_frame_ignores_non_target_pose_wardrobe_and_headwear():
+    """静态终帧只审终点造型，视频仍必须交代起止变化。"""
+    shot = {
+        "shot_no": 13,
+        "characters": ["虞寻欢"],
+        "description": "虞寻欢穿现代黑色西装、戴黑色帽子仰躺床上",
+        "camera": "近景",
+        "appearance_state_required": True,
+        "start_state": {
+            "虞寻欢": {
+                "pose": "站立",
+                "wardrobe": "明代青色官袍",
+                "headwear": "无头饰",
+            },
+        },
+        "end_state": {
+            "虞寻欢": {
+                "pose": "仰躺",
+                "wardrobe": "现代黑色西装",
+                "headwear": "黑色帽子",
+            },
+        },
+        "frame_targets": {
+            "keyframe": {
+                "phase": "end",
+                "state": "虞寻欢穿现代黑色西装、戴黑色帽子仰躺床上",
+                "fallback": False,
+                "explicit": True,
+            },
+        },
+    }
+
+    image_contract, image_prompt = compile_shot_prompt(shot, mode="image")
+    image_report = validate_shot_prompt_contract(image_contract)
+    assert image_report["passed"], image_report["issues"]
+    assert "现代黑色西装" in image_prompt
+    assert "明代青色官袍" not in image_prompt
+
+    video_contract, _ = compile_shot_prompt(shot, mode="video")
+    video_report = validate_shot_prompt_contract(video_contract)
+    assert not video_report["passed"]
+    assert any(
+        "起点与终点服装不同" in issue
+        or "headwear/hair_visibility 不同" in issue
+        for issue in video_report["issues"])
+
+
+def test_static_kinship_alias_is_bound_to_registered_actor_condition():
+    """姐姐/弟弟称谓不得让多人镜头的睡眠冲突漏检。"""
+    shot = {
+        "shot_no": 14,
+        "characters": ["虞寻歌", "虞寻欢"],
+        "character_background": {
+            "虞寻歌": {
+                "gender": "女", "age_range": "25-30", "identity": "姐姐",
+            },
+            "虞寻欢": {
+                "gender": "男", "age_range": "18-22", "identity": "弟弟",
+            },
+        },
+        "description": "姐姐坐在床边，弟弟睡在床上",
+        "camera": "中景",
+        "start_state": {
+            "虞寻歌": {"condition": {
+                "life_state": "alive", "consciousness_state": "awake",
+                "embodiment": "physical", "mobility": "active",
+            }},
+            "虞寻欢": {"condition": {
+                "life_state": "alive", "consciousness_state": "asleep",
+                "embodiment": "physical", "mobility": "immobile",
+            }},
+        },
+        "end_state": {
+            "虞寻歌": {"condition": {
+                "life_state": "alive", "consciousness_state": "awake",
+                "embodiment": "physical", "mobility": "active",
+            }},
+            "虞寻欢": {"condition": {
+                "life_state": "alive", "consciousness_state": "asleep",
+                "embodiment": "physical", "mobility": "immobile",
+            }},
+        },
+        "frame_targets": {
+            "keyframe": {
+                "phase": "end",
+                "state": "姐姐坐在床边，弟弟睡眠中睡眼开口说话",
+                "fallback": False,
+                "explicit": True,
+            },
+        },
+    }
+
+    contract, _ = compile_shot_prompt(shot, mode="image")
+    report = validate_shot_prompt_contract(contract)
+
+    assert not report["passed"]
+    assert any(
+        "虞寻欢" in issue
+        and "consciousness_state=asleep" in issue
+        and "说话" in issue
+        for issue in report["issues"])
+
+
+def test_static_unbound_kinship_action_cannot_bypass_restrictive_state():
+    shot = {
+        "shot_no": 15,
+        "characters": ["甲", "乙"],
+        "description": "姐姐坐在床边，弟弟睡在床上",
+        "camera": "中景",
+        "start_state": {
+            "甲": {"condition": {
+                "life_state": "alive", "consciousness_state": "awake",
+                "embodiment": "physical", "mobility": "active",
+            }},
+            "乙": {"condition": {
+                "life_state": "alive", "consciousness_state": "asleep",
+                "embodiment": "physical", "mobility": "immobile",
+            }},
+        },
+        "end_state": {
+            "甲": {"condition": {
+                "life_state": "alive", "consciousness_state": "awake",
+                "embodiment": "physical", "mobility": "active",
+            }},
+            "乙": {"condition": {
+                "life_state": "alive", "consciousness_state": "asleep",
+                "embodiment": "physical", "mobility": "immobile",
+            }},
+        },
+        "frame_targets": {
+            "keyframe": {
+                "phase": "end",
+                "state": "姐姐坐在床边，弟弟睡眼开口说话",
+                "fallback": False,
+                "explicit": True,
+            },
+        },
+    }
+
+    contract, _ = compile_shot_prompt(shot, mode="image")
+    report = validate_shot_prompt_contract(contract)
+
+    assert not report["passed"]
+    assert any("未绑定称谓" in issue for issue in report["issues"])
+
+
+def test_static_explicit_nickname_binds_restrictive_actor_behavior():
+    shot = {
+        "shot_no": 16,
+        "characters": ["虞寻欢", "虞寻歌"],
+        "character_background": {
+            "虞寻欢": {
+                "gender": "男", "age_range": "18-22", "identity": "弟弟",
+                "aliases": ["欢欢"],
+            },
+            "虞寻歌": {
+                "gender": "女", "age_range": "25-30", "identity": "姐姐",
+            },
+        },
+        "camera": "中景",
+        "start_state": {
+            "虞寻欢": {"condition": {
+                "life_state": "alive", "consciousness_state": "asleep",
+                "embodiment": "physical", "mobility": "immobile",
+            }},
+            "虞寻歌": {"condition": {
+                "life_state": "alive", "consciousness_state": "awake",
+                "embodiment": "physical", "mobility": "active",
+            }},
+        },
+        "end_state": {
+            "虞寻欢": {"condition": {
+                "life_state": "alive", "consciousness_state": "asleep",
+                "embodiment": "physical", "mobility": "immobile",
+            }},
+            "虞寻歌": {"condition": {
+                "life_state": "alive", "consciousness_state": "awake",
+                "embodiment": "physical", "mobility": "active",
+            }},
+        },
+        "frame_targets": {"keyframe": {
+            "phase": "end", "fallback": False, "explicit": True,
+            "state": "欢欢睡眼睁开并开口说话，虞寻歌站在床边",
+        }},
+    }
+
+    contract, _ = compile_shot_prompt(shot, mode="image")
+    report = validate_shot_prompt_contract(contract)
+
+    assert not report["passed"]
+    assert any(
+        "虞寻欢" in issue
+        and "consciousness_state=asleep" in issue
+        and "说话" in issue
+        for issue in report["issues"])
+
+
+def test_static_nickname_wardrobe_conflict_binds_to_registered_actor():
+    shot = {
+        "shot_no": 17,
+        "characters": ["虞寻欢", "虞寻歌"],
+        "appearance_state_required": True,
+        "character_background": {
+            "虞寻欢": {
+                "gender": "男", "age_range": "18-22", "identity": "弟弟",
+                "aliases": ["欢欢"],
+            },
+            "虞寻歌": {
+                "gender": "女", "age_range": "25-30", "identity": "姐姐",
+            },
+        },
+        "camera": "中景",
+        "start_state": {
+            "虞寻欢": {"wardrobe": "白色睡衣", "pose": "仰躺"},
+            "虞寻歌": {"wardrobe": "蓝色长裙", "pose": "站立"},
+        },
+        "end_state": {
+            "虞寻欢": {"wardrobe": "白色睡衣", "pose": "仰躺"},
+            "虞寻歌": {"wardrobe": "蓝色长裙", "pose": "站立"},
+        },
+        "frame_targets": {"keyframe": {
+            "phase": "end", "fallback": False, "explicit": True,
+            "state": "欢欢身穿黑色西装闭眼躺床，虞寻歌穿蓝色长裙站在床边",
+        }},
+    }
+
+    contract, _ = compile_shot_prompt(shot, mode="image")
+    report = validate_shot_prompt_contract(contract)
+
+    assert not report["passed"]
+    assert any(
+        "虞寻欢当前动作服装" in issue and "白色睡衣" in issue
+        for issue in report["issues"])
+
+
+def test_identity_relation_only_binds_terminal_kinship_title():
+    """“姐姐的丈夫”只能让丈夫归属该角色，不得抢占姐姐称谓。"""
+    shot = {
+        "shot_no": 18,
+        "characters": ["阿姐", "姐夫"],
+        "character_background": {
+            "阿姐": {
+                "gender": "女", "age_range": "25-30", "identity": "姐姐",
+            },
+            "姐夫": {
+                "gender": "男", "age_range": "28-35", "identity": "姐姐的丈夫",
+            },
+        },
+        "camera": "中景",
+        "start_state": {
+            "阿姐": {"condition": {
+                "life_state": "alive", "consciousness_state": "asleep",
+                "embodiment": "physical", "mobility": "immobile",
+            }},
+            "姐夫": {"condition": {
+                "life_state": "alive", "consciousness_state": "awake",
+                "embodiment": "physical", "mobility": "active",
+            }},
+        },
+        "end_state": {
+            "阿姐": {"condition": {
+                "life_state": "alive", "consciousness_state": "asleep",
+                "embodiment": "physical", "mobility": "immobile",
+            }},
+            "姐夫": {"condition": {
+                "life_state": "alive", "consciousness_state": "awake",
+                "embodiment": "physical", "mobility": "active",
+            }},
+        },
+        "frame_targets": {"keyframe": {
+            "phase": "end", "fallback": False, "explicit": True,
+            "state": "姐姐睁眼开口说话，丈夫站在床边",
+        }},
+    }
+
+    contract, _ = compile_shot_prompt(shot, mode="image")
+    report = validate_shot_prompt_contract(contract)
+
+    assert not report["passed"]
+    assert any(
+        "阿姐" in issue
+        and "consciousness_state=asleep" in issue
+        and "说话" in issue
+        for issue in report["issues"])
+    assert not any("称谓「姐姐」同时归属" in issue
+                   for issue in report["issues"])
+
+
 def test_v21_vague_functional_figure_count_fails_before_generation():
     for vague_count in ("几名", "数名"):
         shot = _lin_chuan_witness_shot()

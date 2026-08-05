@@ -63,6 +63,28 @@ class CapacityTest(unittest.TestCase):
                          "characters": ["甲", "乙", "丙"]}]}
         self.assertTrue(preflight_storyboard({}, sb)["passed"])
 
+    def test_two_people_as_cropped_hands_keep_detail_closeup(self):
+        """可见真人=2 不等于两具完整人物；手腕局部不能被升成中景。"""
+        sb = {"shots": [{
+            "shot_no": 4, "scene_no": 1,
+            "camera": "135mm微俯双手大特写，只框入接触点",
+            "characters": ["甲", "乙"], "visible_figure_count": 2,
+            "description": (
+                "两名人物均只以手腕局部入画，不出现任何完整人形；"
+                "头部、面部、躯干及其余身体明确出画"),
+        }]}
+        self.assertTrue(preflight_storyboard({}, sb)["passed"])
+
+    def test_weak_partial_word_does_not_bypass_capacity(self):
+        sb = {"shots": [{
+            "shot_no": 5, "scene_no": 1, "camera": "85mm特写",
+            "characters": ["甲", "乙", "丙"],
+            "description": "三名人物完整面孔同时入画，局部焦点锐利",
+        }]}
+        report = preflight_storyboard({}, sb)
+        self.assertIn("scale_capacity", {
+            issue["kind"] for issue in report["issues"]})
+
 
 class PropPhaseTest(unittest.TestCase):
     def test_transition_without_freeze_is_caught(self):

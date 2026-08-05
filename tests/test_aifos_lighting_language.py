@@ -283,6 +283,16 @@ class AiDirectorTest(unittest.TestCase):
         error = validate_ai_director(data, self._payload(3))
         self.assertIn("装不下", error)
 
+    def test_partial_two_person_closeup_is_not_treated_as_two_full_bodies(self):
+        from aifos.adapters.claude_script import validate_ai_director
+        data = {"schema": "aifos.ai_director.v1",
+                "camera": {"景别": "大特写"},
+                "rationale": "两只手腕交接的细节镜承接关键动作"}
+        payload = self._payload(2)
+        payload["framing_text"] = (
+            "两名人物均只以手腕局部入画，完整人形出画")
+        self.assertIsNone(validate_ai_director(data, payload))
+
     def test_rationale_is_mandatory(self):
         from aifos.adapters.claude_script import validate_ai_director
         data = {"schema": "aifos.ai_director.v1",

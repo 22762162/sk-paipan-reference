@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 
 from .camera_language import (
+    allows_partial_multi_subject_scale,
     camera_geometry_clause,
     enforce_composition_scale,
     enforce_position_capacity,
@@ -1684,6 +1685,62 @@ def _actor_semantic_clause(text, actor, actors=None):
     return tail.strip(" ，,；。")
 
 
+def _terminal_identity_aliases(value, candidates):
+    """Return only kinship titles that are the identity's terminal role.
+
+    A free-form identity such as ``姐姐的丈夫`` identifies the actor as the
+    husband, not as the sister.  Substring mining therefore cannot safely
+    create aliases.  Terminal matching still accepts common authored forms
+    such as ``虞寻歌的亲弟弟`` and exposes both ``亲弟弟`` and its shorter
+    natural address ``弟弟``; duplicate relatives remain ambiguous in the owner map.
+    """
+    identity = _text(value).strip(" ，,。；;:：/|（）()[]【】")
+    if not identity:
+        return set()
+    aliases = set()
+    for candidate in candidates:
+        alias = _text(candidate)
+        if not alias or not identity.endswith(alias):
+            continue
+        prefix = identity[:-len(alias)].rstrip()
+        if any(prefix.endswith(marker) for marker in (
+                "不是", "并非", "不", "非")):
+            continue
+        aliases.add(alias)
+    return aliases
+
+
+def _canonicalize_actor_aliases(text, actor_names, alias_owners,
+                                extra_aliases=()):
+    """Bind unique aliases in one frame sentence to registered actor names.
+
+    Longest-token matching protects a canonical name such as ``虞寻欢`` from a
+    shorter alias ``寻欢``.  Ambiguous and unbound labels remain untouched so the
+    caller can block or audit them instead of silently choosing an actor.
+    """
+    source = _text(text)
+    candidates = {
+        _text(value) for value in (
+            *actor_names, *alias_owners, *extra_aliases)
+        if _text(value)
+    }
+    if not source or not candidates:
+        return source, []
+    pattern = re.compile("|".join(
+        re.escape(value)
+        for value in sorted(candidates, key=lambda item: (-len(item), item))))
+    mentions = []
+
+    def replace(match):
+        alias = match.group(0)
+        if alias not in mentions:
+            mentions.append(alias)
+        owners = alias_owners.get(alias) or set()
+        return next(iter(owners)) if len(owners) == 1 else alias
+
+    return pattern.sub(replace, source), mentions
+
+
 def _actor_death_transition(text, actor, actors=None):
     """Recognize that this actor dies without assigning the killer's verb."""
     local = _actor_semantic_clause(text, actor, actors)
@@ -2619,8 +2676,15 @@ def _camera(shot, visible_count=None):
     # 可行性门禁(编译侧兜底):已保存的旧分镜可能带着「特写×N人全见」
     # 这类同级互斥合同;裁决体系(条款(c))对同级互斥只能熔断,唯一
     # 可行方向是编译时把景别升到装得下人数合同的档位。
-    executed_scale, capacity_note = enforce_scale_capacity(
-        resolved_scale, visible_count)
+    framing_text = "；".join(str(value or "") for value in (
+        raw, shot.get("description"), shot.get("frame_targets")))
+    partial_multi_subject = allows_partial_multi_subject_scale(
+        framing_text, visible_count)
+    if partial_multi_subject:
+        executed_scale, capacity_note = resolved_scale, ""
+    else:
+        executed_scale, capacity_note = enforce_scale_capacity(
+            resolved_scale, visible_count)
     # 空间锚点:本镜要同框呈现「人物 + 不在其手上的道具」时,紧景别
     # 框不住两者的位置关系,模型只能拉宽再被质检判景别不符。
     # A repaired tabletop/detail composition may deliberately place two
@@ -2634,6 +2698,10 @@ def _camera(shot, visible_count=None):
         and executed_scale in {"大特写", "特写", "近景", "中近景"}
         and any(token in raw for token in (
             "局部近景", "局部特写", "桌面特写", "手部特写")))
+    # 人物只露局部只豁免“完整人物容量”，不自动豁免离身道具的空间
+    # 锚点。双人脸特写若还要求远处墙钟/桌上道具同框，仍必须放宽；
+    # 只有已经过 Codex 就地修订、明确把道具收进同一局部关系的旧合同
+    # 保留原来的安全特例。
     if repaired_local_closeup:
         anchor_note = ""
     else:
@@ -3446,6 +3514,15 @@ def _character_identity_facts(shot):
             "age_range": _text(value.get("age_range")),
             "identity": _text(
                 value.get("identity") or value.get("occupation")),
+            # ``aliases`` is audit-only structured metadata.  It lets the
+            # validator bind a frozen-frame kinship label such as “弟弟” back
+            # to its registered actor instead of silently dropping that
+            # actor's visible behaviour.  Free-form relationships are kept
+            # separately and are not treated as aliases because “A 的弟弟”
+            # describes another person, not necessarily A.
+            "aliases": _text_list(
+                value.get("aliases") or value.get("alias")
+                or value.get("称谓")),
         })
     return facts
 
@@ -3932,6 +4009,7 @@ def build_shot_prompt_contract(
         "start": _registered_state_value(
             shot, "start_state") or "保持首帧状态",
         "start_appearance": _appearance_map(shot.get("start_state")),
+        "freeze_appearance": _appearance_map(shot.get("freeze_state")),
         "character_conditions": character_conditions,
         # subject.actors 已被渲染成「P01=林川（外观）」,取不到裸名;
         # 逐镜负向清单要按名字点出该静止的角色,所以另存一份原始名单。
@@ -4972,15 +5050,99 @@ def validate_shot_prompt_contract(contract):
                 f" {role} inherit_scope 明显冲突")
 
     action = _text(contract.get("action"))
+    validation_output = contract.get("output") or {}
+    frame_target = contract.get("frame_target") or {}
+    static_target_only = bool(
+        isinstance(validation_output, dict)
+        and validation_output.get("media") == "image"
+        and validation_output.get("temporal_policy") == "terminal_only"
+        # A legacy fallback may have copied a whole action/description into
+        # frame_target instead of declaring a trustworthy boundary.  Keep the
+        # historical full-shot safety checks for that compatibility path;
+        # target-only validation is reserved for an explicit frozen state.
+        and isinstance(frame_target, dict)
+        and frame_target.get("explicit")
+        and not frame_target.get("fallback"))
+    static_target_phase = _text(
+        validation_output.get("frame_phase"), "end")
+    if static_target_phase not in {"start", "end", "freeze"}:
+        static_target_phase = "end"
+    raw_static_frame_state = _text(
+        frame_target.get("state")
+        if isinstance(frame_target, dict)
+        else contract.get("frame_target_state"))
     start_appearance = contract.get("start_appearance") or {}
     end_appearance = contract.get("end_appearance") or {}
+    freeze_appearance = contract.get("freeze_appearance") or {}
     actor_names = registered_names
+    kinship_alias_tokens = (
+        "亲姐姐", "亲妹妹", "亲哥哥", "亲弟弟", "胞姐", "胞妹", "胞兄", "胞弟",
+        "姐姐", "妹妹", "哥哥", "弟弟", "兄长", "长兄", "大姐", "小妹",
+        "妈妈", "母亲", "爸爸", "父亲", "妻子", "丈夫", "女儿", "儿子",
+    )
+    # Canonical names participate in ownership too: an alias that equals a
+    # different registered name is ambiguous and must never be auto-bound.
+    alias_owners = {name: {name} for name in actor_names}
+    for actor_name in actor_names:
+        facts = identity_by_name.get(actor_name) or {}
+        declared_aliases = set(_text_list(facts.get("aliases")))
+        declared_aliases.update(_terminal_identity_aliases(
+            facts.get("identity"), kinship_alias_tokens))
+        for alias in declared_aliases:
+            if alias:
+                alias_owners.setdefault(alias, set()).add(actor_name)
+    static_frame_state, frame_aliases = _canonicalize_actor_aliases(
+        raw_static_frame_state, actor_names, alias_owners,
+        kinship_alias_tokens)
+    ambiguous_frame_aliases = {
+        alias: alias_owners.get(alias) or set()
+        for alias in frame_aliases
+        if len(alias_owners.get(alias) or ()) > 1
+    }
+    for alias, owners in ambiguous_frame_aliases.items():
+        issues.append(
+            f"静态目标称谓「{alias}」同时归属"
+            + "、".join(sorted(owners))
+            + "，必须改用唯一登记角色姓名")
+    alias_scope = [*actor_names, *frame_aliases]
+    alias_clauses = {
+        alias: _actor_semantic_clause(
+            raw_static_frame_state, alias, alias_scope)
+        for alias in frame_aliases
+    }
+    unresolved_alias_hits = {
+        alias: _behavior_hits(clause)
+        for alias, clause in alias_clauses.items()
+        if not (alias_owners.get(alias) or set())
+        and _behavior_hits(clause)
+    }
+    if static_target_phase == "start":
+        target_appearance = start_appearance
+    elif static_target_phase == "freeze":
+        target_appearance = dict(freeze_appearance)
+        # Older contracts do not carry freeze_appearance.  A stable look that
+        # is identical at both boundaries is nevertheless an unambiguous
+        # freeze look; differing boundaries must be declared explicitly.
+        for name in actor_names:
+            if name not in target_appearance:
+                start_look = start_appearance.get(name) or {}
+                end_look = end_appearance.get(name) or {}
+                if start_look == end_look:
+                    target_appearance[name] = start_look
+    else:
+        target_appearance = end_appearance
     if contract.get("appearance_state_required"):
         for name in actor_names:
-            start_look = start_appearance.get(name) or {}
-            end_look = end_appearance.get(name) or {}
-            if not _text(
-                    start_look.get("wardrobe") or end_look.get("wardrobe")):
+            if static_target_only:
+                wardrobe = _text(
+                    (target_appearance.get(name) or {}).get("wardrobe"))
+            else:
+                start_look = start_appearance.get(name) or {}
+                end_look = end_appearance.get(name) or {}
+                wardrobe = _text(
+                    start_look.get("wardrobe")
+                    or end_look.get("wardrobe"))
+            if not wardrobe:
                 issues.append(f"{name}缺少当前镜头唯一服装状态")
     headwear_change_tokens = (
         "戴上", "戴好", "摘下", "摘去", "取下", "脱下", "去掉",
@@ -4988,8 +5150,11 @@ def validate_shot_prompt_contract(contract):
     )
     for name in actor_names:
         phase_headwear = {}
-        for phase, appearances in (
-                ("start", start_appearance), ("end", end_appearance)):
+        appearance_phases = (
+            ((static_target_phase, target_appearance),)
+            if static_target_only else
+            (("start", start_appearance), ("end", end_appearance)))
+        for phase, appearances in appearance_phases:
             look = appearances.get(name) or {}
             raw_headwear = look.get("headwear")
             if raw_headwear is None and look.get("hair_visibility") is None:
@@ -5009,7 +5174,44 @@ def validate_shot_prompt_contract(contract):
                 if _text(value))
         start_headwear = phase_headwear.get("start")
         end_headwear = phase_headwear.get("end")
-        if start_headwear and end_headwear:
+        if static_target_only:
+            expected_headwear = phase_headwear.get(static_target_phase)
+            local_frame_clause = _actor_semantic_clause(
+                static_frame_state, name, actor_names)
+            if len(actor_names) == 1 and not local_frame_clause:
+                local_frame_clause = static_frame_state
+            headwear_tokens = (
+                *HEADWEAR_NONE_TOKENS,
+                *(token for _, tokens in HEADWEAR_KIND_TOKENS
+                  for token in tokens),
+            )
+            if (expected_headwear
+                    and any(token in local_frame_clause
+                            for token in headwear_tokens)):
+                visible_headwear = _normalize_headwear({
+                    "headwear": local_frame_clause,
+                })
+                presence_conflict = (
+                    visible_headwear.get("presence")
+                    in {"none", "worn"}
+                    and expected_headwear.get("presence")
+                    in {"none", "worn"}
+                    and visible_headwear.get("presence")
+                    != expected_headwear.get("presence"))
+                kind_conflict = (
+                    visible_headwear.get("presence") == "worn"
+                    and expected_headwear.get("presence") == "worn"
+                    and visible_headwear.get("kind")
+                    not in {"", "unknown", "other"}
+                    and expected_headwear.get("kind")
+                    not in {"", "unknown", "other"}
+                    and visible_headwear.get("kind")
+                    != expected_headwear.get("kind"))
+                if presence_conflict or kind_conflict:
+                    issues.append(
+                        f"{name}静态目标头饰「{local_frame_clause}」"
+                        "与当前相位 headwear/hair_visibility 冲突")
+        if not static_target_only and start_headwear and end_headwear:
             start_signature = (
                 start_headwear.get("presence"),
                 start_headwear.get("kind"),
@@ -5038,10 +5240,15 @@ def validate_shot_prompt_contract(contract):
         if _text(value))
     start = _text(contract.get("start"))
     end = _text(contract.get("end"))
-    state_text = f"{start} {end}"
-    lie = any(token in action for token in (
+    target_state_text = (
+        start if static_target_phase == "start"
+        else end if static_target_phase == "end"
+        else static_frame_state)
+    state_text = target_state_text if static_target_only else f"{start} {end}"
+    pose_text = static_frame_state if static_target_only else action
+    lie = any(token in pose_text for token in (
         "仰卧", "卧榻", "卧床", "躺下", "躺在", "睡在"))
-    sit = any(token in action for token in (
+    sit = any(token in pose_text for token in (
         "坐在", "坐于", "伏案", "趴向", "趴在"))
     if "站立" in state_text and lie:
         issues.append("人物状态要求站立，但当前动作要求仰卧")
@@ -5052,15 +5259,21 @@ def validate_shot_prompt_contract(contract):
     # Reject contracts such as “沈砚布旅装” + “沈砚穿青官袍” before any
     # billable generation call.
     for name in actor_names:
-        local_clause = _actor_local_clause(action, name)
+        appearance_text = static_frame_state if static_target_only else action
+        local_clause = _actor_local_clause(appearance_text, name)
         appearance_change = any(
             token in local_clause
             for token in SEMANTIC_APPEARANCE_CHANGE_TOKENS)
         local_signature = _semantic_wardrobe_signature(local_clause)
-        start_wardrobe = _text(
-            (start_appearance.get(name) or {}).get("wardrobe"))
-        end_wardrobe = _text(
-            (end_appearance.get(name) or {}).get("wardrobe"))
+        if static_target_only:
+            target_wardrobe = _text(
+                (target_appearance.get(name) or {}).get("wardrobe"))
+            start_wardrobe = end_wardrobe = target_wardrobe
+        else:
+            start_wardrobe = _text(
+                (start_appearance.get(name) or {}).get("wardrobe"))
+            end_wardrobe = _text(
+                (end_appearance.get(name) or {}).get("wardrobe"))
         start_signature = _semantic_wardrobe_signature(start_wardrobe)
         end_signature = _semantic_wardrobe_signature(end_wardrobe)
         if (local_signature and start_signature
@@ -5076,7 +5289,8 @@ def validate_shot_prompt_contract(contract):
             issues.append(
                 f"{name}当前动作服装「{local_clause}」与终点服装"
                 f"「{end_wardrobe}」冲突")
-        if (start_signature and end_signature
+        if (not static_target_only
+                and start_signature and end_signature
                 and _semantic_wardrobes_conflict(
                     start_wardrobe, end_wardrobe)
                 and not appearance_change):
@@ -5084,10 +5298,10 @@ def validate_shot_prompt_contract(contract):
                 f"{name}起点与终点服装不同，但本镜没有换装动作")
         placed_signature = {
             token for token in start_signature | end_signature
-            if _has_placed_object_mention(action, token)
+            if _has_placed_object_mention(appearance_text, token)
         }
         duplicate_is_explicit = any(
-            marker in action for marker in (
+            marker in appearance_text for marker in (
                 "另一件", "另有一件", "第二件", "两件", "备用"))
         if (placed_signature and not duplicate_is_explicit
                 and not local_signature.isdisjoint(placed_signature)):
@@ -5139,12 +5353,10 @@ def validate_shot_prompt_contract(contract):
             if isinstance(raw_end_condition, dict)
             else {"pose": state_clauses.get("end", "")},
             local_action)
-        phase_conditions = [
-            ("start", start_condition), ("end", end_condition)]
-        condition_output = contract.get("output") or {}
-        if (isinstance(condition_output, dict)
-                and condition_output.get("media") == "image"
-                and condition_output.get("frame_phase") == "freeze"):
+        target_condition = (
+            start_condition if static_target_phase == "start"
+            else end_condition)
+        if static_target_only and static_target_phase == "freeze":
             raw_freeze_condition = phases.get("freeze")
             if not isinstance(raw_freeze_condition, dict):
                 issues.append(
@@ -5155,27 +5367,53 @@ def validate_shot_prompt_contract(contract):
                     f"{name}freeze condition 冲突：{_text(value)}"
                     for value in raw_freeze_condition.get("issues") or []
                     if _text(value))
-                phase_conditions.append((
-                    "freeze",
-                    _normalize_character_condition({
-                        "condition": raw_freeze_condition})))
+                target_condition = _normalize_character_condition({
+                    "condition": raw_freeze_condition})
+        phase_conditions = (
+            [(static_target_phase, target_condition)]
+            if static_target_only else
+            [("start", start_condition), ("end", end_condition)])
         for phase, condition in phase_conditions:
             issues.extend(
                 f"{name}{phase} condition 冲突：{_text(value)}"
                 for value in condition.get("issues") or []
                 if _text(value))
 
-        action_hits = _behavior_hits(local_action)
-        performance_hits = _behavior_hits(local_performance)
-        state_hits = _behavior_hits(
-            " ".join(state_clauses.values()))
-        dialogue_hits = {"说话"} if speaker == name and dialogue else set()
+        if static_target_only:
+            # A still-image provider receives only the frozen frame target;
+            # render_shot_prompt deliberately omits the timeline action,
+            # performance and dialogue.  Validating those hidden video facts
+            # against the start state made an asleep→awake scene fail as
+            # "awake but speaking", and prompt repair responded by cropping
+            # out the actor's eyes and mouth.  Judge exactly what is rendered:
+            # the selected phase and its visible frozen state.
+            frame_state = static_frame_state
+            local_frame_state = _actor_semantic_clause(
+                frame_state, name, actor_names)
+            if len(actor_names) == 1 and not local_frame_state:
+                local_frame_state = frame_state
+            action_hits = _behavior_hits(local_frame_state)
+            performance_hits = set()
+            state_hits = _behavior_hits(
+                state_clauses.get(static_target_phase, ""))
+            dialogue_hits = set()
+        else:
+            action_hits = _behavior_hits(local_action)
+            performance_hits = _behavior_hits(local_performance)
+            state_hits = _behavior_hits(
+                " ".join(state_clauses.values()))
+            dialogue_hits = (
+                {"说话"} if speaker == name and dialogue else set())
         all_hits = (
             action_hits | performance_hits | state_hits | dialogue_hits)
-        start_life = start_condition.get("life_state")
-        end_life = end_condition.get("life_state")
-        death_transition = _actor_death_transition(
-            action, name, actor_names)
+        if static_target_only:
+            start_life = end_life = target_condition.get("life_state")
+            death_transition = False
+        else:
+            start_life = start_condition.get("life_state")
+            end_life = end_condition.get("life_state")
+            death_transition = _actor_death_transition(
+                action, name, actor_names)
         if death_transition and end_life != "dead":
             issues.append(
                 f"{name}发生明确死亡过程，但 end.condition.life_state"
@@ -5210,15 +5448,33 @@ def validate_shot_prompt_contract(contract):
                     f"{name}的 life_state={end_life or start_life}，"
                     "却仍被要求" + "、".join(sorted(forbidden)))
 
-        start_consciousness = start_condition.get("consciousness_state")
-        end_consciousness = end_condition.get("consciousness_state")
+        if static_target_only:
+            start_consciousness = end_consciousness = (
+                target_condition.get("consciousness_state"))
+        else:
+            start_consciousness = start_condition.get("consciousness_state")
+            end_consciousness = end_condition.get("consciousness_state")
         restrictive_states = {"asleep", "unconscious"}
-        wake_transition = any(
-            token in local_action for token in WAKE_TRANSITION_TOKENS)
-        sleep_transition = any(
-            token in local_action for token in SLEEP_TRANSITION_TOKENS)
-        loses_consciousness = any(
-            token in local_action for token in UNCONSCIOUS_TRANSITION_TOKENS)
+        if (static_target_only
+                and name not in static_frame_state
+                and target_condition.get("consciousness_state")
+                in restrictive_states
+                and unresolved_alias_hits):
+            aliases = "、".join(sorted(unresolved_alias_hits))
+            issues.append(
+                f"{name}的静态目标行为可能使用未绑定称谓"
+                f"「{aliases}」描述；必须改用登记角色姓名，"
+                "否则无法核实睡眠/昏迷角色是否被要求主动行为")
+        wake_transition = bool(
+            not static_target_only and any(
+                token in local_action for token in WAKE_TRANSITION_TOKENS))
+        sleep_transition = bool(
+            not static_target_only and any(
+                token in local_action for token in SLEEP_TRANSITION_TOKENS))
+        loses_consciousness = bool(
+            not static_target_only and any(
+                token in local_action
+                for token in UNCONSCIOUS_TRANSITION_TOKENS))
         active_mind_hits = all_hits & {
             "注视/眨眼", "说话", "微表情", "主动动作",
         }
@@ -5249,10 +5505,12 @@ def validate_shot_prompt_contract(contract):
                 "却仍被要求"
                 + "、".join(sorted(consciousness_forbidden)))
 
-        mobility_values = {
-            start_condition.get("mobility"),
-            end_condition.get("mobility"),
-        }
+        mobility_values = (
+            {target_condition.get("mobility")}
+            if static_target_only else {
+                start_condition.get("mobility"),
+                end_condition.get("mobility"),
+            })
         if ("immobile" in mobility_values
                 and "主动动作" in all_hits
                 and not (wake_transition or sleep_transition

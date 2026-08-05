@@ -14,7 +14,8 @@ from pathlib import Path
 
 from .adapters.claude_script import (is_background_role,
                                      validate_script_bible)
-from .camera_language import enforce_scale_capacity
+from .camera_language import (allows_partial_multi_subject_scale,
+                              enforce_scale_capacity)
 from .quality_policy import default_quality_policy, resolve_video_quality
 from .inner_persona import (
     apply_inner_persona_to_shots,
@@ -409,7 +410,8 @@ def _director_terms(values, allowed):
 
 def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
                  scene_start=False, visible_count=None,
-                 director_knowledge=None, used_scales=None):
+                 director_knowledge=None, used_scales=None,
+                 framing_text=""):
     library = (rules or {}).get("camera_library", {})
     storyboard_rules = (rules or {}).get("storyboard", {})
     style_knowledge = normalize_director_knowledge(
@@ -457,6 +459,11 @@ def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
     if style_compositions:
         compositions = style_compositions
     camera = camera or ""
+    capacity_count = (
+        1 if allows_partial_multi_subject_scale(
+            "；".join((str(camera), str(framing_text or ""))),
+            visible_count)
+        else visible_count)
     explicit = next((mark for mark in ("大特写", "特写", "近景", "中景",
                                        "全景", "远景") if mark in camera),
                     None)
@@ -494,7 +501,7 @@ def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
                     or candidate == prev_scale):
                 continue
             feasible, _note = enforce_scale_capacity(
-                candidate, visible_count, scales)
+                candidate, capacity_count, scales)
             if feasible == candidate:
                 scale = candidate
                 break
@@ -502,7 +509,7 @@ def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
     # 合同同级互斥、审核必熔断——盲轮换/显式特写都在此升到可行档。
     # 这里不知道人数(visible_count=None)就不动,由合同编译期兜底。
     scale, capacity_note = enforce_scale_capacity(
-        scale, visible_count, scales)
+        scale, capacity_count, scales)
     if any(token in camera for token in ("顶拍", "顶视", "鸟瞰")):
         angle = "顶拍"
     elif any(token in camera for token in ("俯拍", "高机位", "高角度")):
@@ -539,13 +546,19 @@ def _camera_plan(camera, kind, index, rules=None, prev_scale=None,
         value for value in positions if value not in ("低机位", "高机位")]
     if not lateral_positions:
         lateral_positions = ["正面", "斜侧", "过肩", "侧面"]
+    explicit_lens_match = re.search(
+        r"(?<!\d)(\d{2,3})\s*mm(?=$|[^A-Za-z])", str(camera), re.I)
+    explicit_lens = (
+        f"{explicit_lens_match.group(1)}mm" if explicit_lens_match else "")
+    resolved_lens = explicit_lens or (
+        style_lenses[(index - 1) % len(style_lenses)]
+        if style_lenses else
+        "85mm" if scale in (
+            "大特写", "特写", "近景", "中近景") else "35mm")
     plan = {
         "shot_scale": scale,
         "angle": angle,
-        "lens": (
-            style_lenses[(index - 1) % len(style_lenses)]
-            if style_lenses else
-            "85mm" if scale in ("近景", "特写") else "35mm"),
+        "lens": resolved_lens,
         "camera_position": (
             explicit_position
             or lateral_positions[(index - 1) % len(lateral_positions)]),
@@ -2204,6 +2217,9 @@ def enrich_storyboard(script, storyboard, continuity, profile, style=""):
             scene_start=(raw.get("scene_no") != prev_scene_no
                          and kind == "environment"),
             visible_count=visible_figure_count,
+            framing_text="；".join(str(value or "") for value in (
+                raw.get("description"), raw.get("physical_logic"),
+                raw.get("frame_targets"))),
             director_knowledge=director_knowledge,
             used_scales=used_camera_scales)
         style_direction = select_shot_direction(

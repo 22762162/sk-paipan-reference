@@ -9,6 +9,8 @@
 零依赖叶子模块:prompt_contract 与 qc_feedback 都可安全引用。
 """
 
+import re
+
 # 景别 → 画面可见特征(取景边界)
 SCALE_GEOMETRY = {
     "大特写": "面部局部或指定细节占满画面,肩部以下全部出画",
@@ -430,6 +432,100 @@ def enforce_spatial_anchor_scale(scale, anchor_count, allowed=None):
 def scale_capacity(scale):
     """该景别在全员必见合同下的最大真人数;未知景别视为不设限。"""
     return CAMERA_SCALE_CAPACITY.get(str(scale or "").strip(), 10 ** 6)
+
+
+def allows_partial_multi_subject_scale(framing_text, visible_count):
+    """明确的局部/双人紧景别不套用“完整人物容量”。
+
+    ``visible_figure_count`` 是画面里能辨认来源的真人实例数，不是从
+    头到脚完整入画的人数。两个人各露一只手仍然必须登记为 2 人，供
+    身份与人数质检使用；但不能因此把手腕大特写强制改成中景。
+
+    这里只接受强导演证据，避免一个宽泛的“局部焦点”把真正的三人
+    完整特写放过去：
+    - 明确双人贴面/双人紧特写（最多两人）；或
+    - 明确指定手、腕、眼等局部，且为紧景别；或
+    - 明确说所有人物只以局部入画、完整人物/其余身体出画。
+    """
+    try:
+        count = int(visible_count)
+    except (TypeError, ValueError):
+        return False
+    if count <= 1:
+        return False
+    text = str(framing_text or "")
+    if not text:
+        return False
+
+    def positive_requirement(pattern):
+        """匹配正向取景要求，忽略“不要求/禁止/无需”等否定句。"""
+        for match in re.finditer(pattern, text):
+            prefix = text[max(0, match.start() - 12):match.start()]
+            if re.search(
+                    r"(?:不|无|未|禁止|不得|严禁|避免|无需)"
+                    r"(?:要求|允许|呈现|显示)?[^，。；]{0,6}$",
+                    prefix):
+                continue
+            return True
+        return False
+
+    # 明确要求完整人物/全身同框时绝不豁免。先判矛盾合同，保证后面的
+    # “局部/双人特写”提示不能掩盖同时出现的全身要求。
+    full_body_required = positive_requirement(
+        r"(?:全部人物|所有人物|全员|每人|任何一人|两人|二人|两名人物|"
+        r"三人|三名人物|多人).{0,10}"
+        r"(?:全身|完整身体|完整人形|完整人物|从头到脚|头顶到脚底)"
+        r".{0,10}(?:入画|入框|同框|可见|画面中)")
+    complete_faces_required = bool(
+        count >= 3 and positive_requirement(
+            r"(?:三人|三名人物|多人|全员).{0,10}"
+            r"(?:完整面孔|完整脸部|正脸清晰|清晰同框)"
+            r".{0,10}(?:入画|入框|同框|可见|画面中)"))
+    if full_body_required or complete_faces_required:
+        return False
+
+    tight_scale = any(token in text for token in (
+        "大特写", "特写", "近景", "中近景"))
+    if not tight_scale:
+        return False
+
+    explicit_all_partial = bool(re.search(
+        r"(?:均|全部|所有|两名|三名|人物).*?(?:只|仅).*?"
+        r"(?:局部|手|腕|肩臂|肢体).*?(?:入画|入框)", text))
+    explicit_crop_out = (
+        any(token in text for token in (
+        "完整人形出画", "完整人物出画", "完整人物明确出画",
+        "不出现任何完整人形", "不呈现任何完整人物",
+        "不完整呈现任何人物",
+        "不要求完整人形", "不允许任何一人完整入框",
+        "其余身体明确出画", "其余身体始终出画",
+        "头部、面部、躯干", "头部、面部、眼睛"))
+        or bool(re.search(r"不要求.{0,12}完整入框", text)))
+    enumerated_local_parts = bool(
+        ("仅框入" in text or "只框入" in text)
+        and len(re.findall(r"局部", text)) >= 2)
+    if (explicit_all_partial or enumerated_local_parts) and explicit_crop_out:
+        return True
+
+    # 两张脸/过肩前景也是两名“可见真人”，但不是两具完整人物。
+    # 只对明确写成双人紧景别的两人镜放行，三人及以上仍按容量闸门。
+    explicit_two_subject_closeup = bool(
+        count == 2
+        and ("双人" in text or "两张脸" in text)
+        and any(token in text for token in (
+            "贴面", "面部", "过肩", "大特写", "特写", "近景")))
+    if explicit_two_subject_closeup:
+        return True
+
+    # 细节插入镜通常只看两个人相互作用的手/腕。限制为两人且要求
+    # 紧景别与明确的解剖局部，单独出现“局部锐利焦点”不会命中。
+    explicit_detail_insert = bool(
+        count == 2
+        and any(token in text for token in (
+            "手部大特写", "双手大特写", "手腕大特写", "腕部大特写",
+            "手部特写", "腕部特写", "腕部插入特写", "掌纹特写",
+            "眼部特写", "嘴部特写", "肩臂局部特写")))
+    return explicit_detail_insert
 
 
 def enforce_scale_capacity(scale, visible_count, allowed=None):
