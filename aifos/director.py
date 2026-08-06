@@ -1539,31 +1539,12 @@ class Director:
         仍熔断则标记失败并继续其余镜头，后续断点按失败原因自动重建；
         不再创建要求用户确认的 awaiting_human。"""
         if not self._prompt_review_enabled():
-            autonomy = self._director_autonomy_enabled()
             for task in tasks:
                 payload = task.get("payload")
                 if not isinstance(payload, dict):
                     continue
                 if self._preview_qc_bypass_enabled():
-                    payload["director_autonomy_mode"] = True
-                    payload["prompt_review"] = {
-                        "schema": self.router.PROMPT_REVIEW_SCHEMA,
-                        "approved": False,
-                        "status": (
-                            "not_applicable_director_autonomy" if autonomy
-                            else "not_applicable_preview_qc_bypass"),
-                        "original_prompt": str(
-                            payload.get("prompt_compact")
-                            or payload.get("prompt") or ""),
-                        "optimized_prompt": str(
-                            payload.get("prompt_compact")
-                            or payload.get("prompt") or ""),
-                        "issues_found": [],
-                        "changes_made": [],
-                        "blocking_reason": (
-                            "用户已一键关闭质检，使用冻结提示词直接生成，"
-                            "不执行提示词复审"),
-                    }
+                    self._mark_prompt_review_not_applicable(payload)
             self.log.info(
                 "director",
                 "一键免检模式:跳过生成前提示词审核，直接使用现有冻结提示词")
@@ -1758,6 +1739,36 @@ class Director:
                 f"覆盖{len(review_tasks)}张图；同词组复用同一优化稿后进入"
                 "图片生成")
         return quarantined
+
+    def _mark_prompt_review_not_applicable(self, payload):
+        """Freeze the current prompt under an explicit inspection bypass.
+
+        Spatial repairs rebuild the complete shot payload.  A bypass marker
+        therefore has to be reproducible after that rebuild; otherwise a
+        later dispatch contract sees a missing prompt-review record and
+        incorrectly blocks before any image provider is called.
+        """
+        autonomy = self._director_autonomy_enabled()
+        payload["director_autonomy_mode"] = True
+        prompt = str(
+            payload.get("prompt_compact") or payload.get("prompt") or "")
+        payload["prompt_review"] = {
+            "schema": self.router.PROMPT_REVIEW_SCHEMA,
+            "approved": False,
+            "status": (
+                "not_applicable_director_autonomy" if autonomy
+                else "not_applicable_preview_qc_bypass"),
+            "original_prompt": prompt,
+            "optimized_prompt": prompt,
+            "issues_found": [],
+            "changes_made": [],
+            "blocking_reason": (
+                "用户已一键关闭质检，使用冻结提示词直接生成，"
+                "不执行提示词复审"),
+        }
+        frozen = self._image_generation_input(payload)
+        payload["_prompt_review_frozen_input_hash"] = frozen["input_hash"]
+        return payload["prompt_review"]
 
     def _repair_blocked_prompt_shot(self, ctx, task, blocking_reason):
         """审核熔断镜头的编剧就地修:只改景别/取景表述,存回分镜文档。
@@ -4499,6 +4510,15 @@ class Director:
         """从即将交给 worker 的真实 payload 构造不可变预检契约。"""
         payload = json.loads(json.dumps(
             task.get("payload") or {}, ensure_ascii=False, default=str))
+        # Defense in depth for resumable production: an explicit one-click
+        # bypass is itself the review decision.  Older/refreshed task payloads
+        # may predate the audit marker, but must not be stopped by a gate the
+        # user has deliberately disabled.  This path never applies while
+        # prompt review is enabled.
+        if (not payload.get("prompt_review")
+                and self._preview_qc_bypass_enabled()
+                and not self._prompt_review_enabled()):
+            self._mark_prompt_review_not_applicable(payload)
         prompt_used = self._prompt_with_feedback(
             payload.get("prompt_compact") or payload.get("prompt", ""),
             payload.get("feedback", ""))
@@ -10514,6 +10534,11 @@ class Director:
                 payload["previous_prompt_review"] = previous_review
             payload.pop("prompt_review", None)
             payload.pop("_prompt_review_frozen_input_hash", None)
+            if self._preview_qc_bypass_enabled():
+                # No new AI review is expected in this mode.  Re-freeze the
+                # newly compiled spatial input so dispatch cannot mistake a
+                # legitimate blocking refresh for an unaudited prompt.
+                self._mark_prompt_review_not_applicable(payload)
             self._attach_reference_manifest(payload)
 
             if task is None:

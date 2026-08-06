@@ -153,6 +153,16 @@ def test_preview_qc_bypass_skips_image_and_total_qc(tmp_path):
             "capability": "image", "payload": {"prompt": "测试"},
             "item_id": "shot:1", "sub_dir": "images", "tag": 1,
         }]) == []
+        dispatch = app.director._build_dispatch_contract(
+            {"item_id": "shot:1", "capability": "image", "payload": {
+                "prompt": "免检恢复镜头",
+                "director_autonomy_mode": True,
+                "prompt_contract": {},
+            }},
+            {"category": "shot_image"})
+        assert dispatch["passed"] is True
+        assert dispatch["prompt_review"]["status"] == \
+            "not_applicable_preview_qc_bypass"
         result = app.director._stage_qc(ctx)
 
         assert result["passed"] is True
