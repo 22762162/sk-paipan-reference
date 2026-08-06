@@ -894,3 +894,44 @@ def test_spatial_diagram_is_uploaded_for_keyframe_with_single_role(
     identity = payload["reference_manifest"][0]
     assert {"face", "hair_silhouette", "makeup", "stable_makeup"} <= set(
         identity["inherits"])
+
+
+def test_crowded_keyframe_refs_cannot_evict_scene_or_spatial_anchors(
+        app, tmp_path, monkeypatch):
+    """The eight-image ceiling must drop optional detail, never room truth."""
+    project, episode, script = _preproduce(app, title="场景硬槽位")
+    characters = [row["name"] for row in script["characters"][:2]]
+    scene = tmp_path / "scene-slice.png"
+    spatial = tmp_path / "shot-space.png"
+    scene.write_bytes(PNG)
+    spatial.write_bytes(PNG)
+    monkeypatch.setattr(
+        app.director, "_scene_slice_for_shot",
+        lambda *_args, **_kwargs: str(scene))
+
+    prop_rows = {}
+    for index in range(4):
+        uri = tmp_path / f"prop-{index}.png"
+        uri.write_bytes(PNG)
+        prop_rows[f"道具{index}"] = {
+            "id": 9000 + index, "kind": "prop_identity",
+            "name": f"道具{index}", "uri": str(uri), "version": 1,
+            "meta": "{}",
+        }
+    monkeypatch.setattr(
+        app.director, "_locked_prop",
+        lambda _project_id, name: prop_rows.get(name))
+
+    refs = app.director._art_refs(
+        {"project": dict(project), "episode": dict(episode),
+         "script": script,
+         "character_asset_policy": {"generate_sheets": True}},
+        characters, "同一卧室", shot_no=1,
+        spatial_ref=str(spatial), prop_names=list(prop_rows))
+
+    assert refs["scene_ref"] == str(scene)
+    assert refs["spatial_ref"] == str(spatial)
+    assert len({item["uri"] for item in refs["asset_matches"]}) == 8
+    roles = {item.get("reference_role")
+             for item in refs["asset_matches"]}
+    assert {"scene", "spatial"} <= roles

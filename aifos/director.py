@@ -15854,6 +15854,77 @@ class Director:
                     "source_identity_asset_id"),
                 "source_identity_uri": identity.get("source_identity_uri"),
             })
+        # Physical scene truth and this shot's spatial solution are structural
+        # anchors, not optional decoration.  Reserve their slots immediately
+        # after immutable character identities so later costume/detail/prop
+        # references cannot crowd them out at the provider's eight-image
+        # ceiling.  Losing either anchor is what previously let one bedroom
+        # turn into a different room from shot to shot.
+        if location:
+            slice_uri = self._scene_slice_for_shot(ctx, location, shot_no)
+            if slice_uri and remember(slice_uri):
+                refs["scene_ref"] = slice_uri
+                refs["asset_matches"].append({
+                    "asset_id": None, "kind": "scene_slice",
+                    "name": f"{location}::view:slice",
+                    "label": f"场景:{location}(本镜机位全景切片)",
+                    "uri": slice_uri,
+                    "reference_role": "scene",
+                    "attach_to": location,
+                })
+            else:
+                row, scene_label = self._scene_view_reference(
+                    project_id, location, camera,
+                    fresh_run_id=(
+                        ctx.get("run_id")
+                        if ctx.get("fresh_assets") else None),
+                    script=ctx.get("script") or {})
+                if (row and formal_reference_allowed(
+                        self._asset_quality(row))
+                        and row["uri"] and Path(row["uri"]).exists()
+                        and remember(row["uri"])):
+                    refs["scene_ref"] = row["uri"]
+                    refs["asset_matches"].append({
+                        "asset_id": row["id"], "kind": row["kind"],
+                        "name": row["name"], "label": scene_label,
+                        "uri": row["uri"],
+                        "reference_role": "scene",
+                        "attach_to": location,
+                    })
+            # Pure contract/unit callers may intentionally omit the artifact
+            # root while checking wording or phase projection.  A real
+            # production payload always has ``out_root`` and must fail closed
+            # before any paid image call when its scene anchor is absent.
+            if not refs.get("scene_ref") and ctx.get("out_root"):
+                raise AifosError(
+                    f"镜头{shot_no or 0}缺少可用场景母图「{location}」；"
+                    "禁止在没有空间基准的情况下生成关键帧")
+        spatial_uri = str(spatial_ref or "").strip()
+        if (spatial_uri
+                and (spatial_uri.startswith(("http://", "https://"))
+                     or Path(spatial_uri).exists())
+                and remember(spatial_uri)):
+            refs["spatial_ref"] = spatial_uri
+            spatial_row = next((
+                row for row in self.assets.active_list(
+                    project_id, kind="spatial_blocking")
+                if row["uri"] == spatial_uri), None)
+            refs["asset_matches"].append({
+                "asset_id": (
+                    spatial_row["id"] if spatial_row is not None else None),
+                "kind": "spatial_blocking",
+                "name": (
+                    spatial_row["name"] if spatial_row is not None
+                    else f"shot_{shot_no or 0}_space"),
+                "label": "本镜空间调度图",
+                "uri": spatial_uri,
+                "reference_role": "spatial",
+                "attach_to": f"shot:{shot_no}" if shot_no is not None else "",
+            })
+        elif spatial_uri:
+            raise AifosError(
+                f"镜头{shot_no or 0}的空间调度图无法进入参考图硬槽位；"
+                "禁止降级为无空间锚生成")
         # A face/full-body identity image is not evidence for hidden headwear
         # geometry.  Add one narrowly scoped mother asset whenever the current
         # worn contract calls out view-dependent structure (most importantly
@@ -15938,31 +16009,6 @@ class Director:
                 "reference_role": "inner_persona",
                 "attach_to": f"shot:{shot_no}" if shot_no is not None else "",
             })
-        # 多人走位/变机位镜头的 3D 空间图不仅要给 Seedance，也要在
-        # 关键帧阶段先把人数、站位和屏幕方向锁准。它只承担空间职责，
-        # 绝不能把编号、箭头或示意图样式画进成片。
-        spatial_uri = str(spatial_ref or "").strip()
-        if (spatial_uri
-                and (spatial_uri.startswith(("http://", "https://"))
-                     or Path(spatial_uri).exists())
-                and remember(spatial_uri)):
-            refs["spatial_ref"] = spatial_uri
-            spatial_row = next((
-                row for row in self.assets.active_list(
-                    project_id, kind="spatial_blocking")
-                if row["uri"] == spatial_uri), None)
-            refs["asset_matches"].append({
-                "asset_id": (
-                    spatial_row["id"] if spatial_row is not None else None),
-                "kind": "spatial_blocking",
-                "name": (
-                    spatial_row["name"] if spatial_row is not None
-                    else f"shot_{shot_no or 0}_space"),
-                "label": "本镜空间调度图",
-                "uri": spatial_uri,
-                "reference_role": "spatial",
-                "attach_to": f"shot:{shot_no}" if shot_no is not None else "",
-            })
         for name in prop_names or []:
             row = self._locked_prop(project_id, name)
             if row is None:
@@ -15971,14 +16017,10 @@ class Director:
                     "技术可用的道具母资产")
             remembered = remember(row["uri"])
             if not remembered and self._director_autonomy_enabled():
-                # AI导演自动选优：身份锚和核心道具优先于空间示意图；
-                # 帧链已经携带本镜关键帧/上一镜尾帧，可承担基础构图。
-                # 若仍超限，再淘汰最后加入的一张发饰补充锚（人物身份锚
-                # 自身仍保留），绝不要求拆镜或重新生成既有图片。
+                # AI导演自动选优：身份、物理母场景和空间调度是不可淘汰
+                # 的结构锚。核心道具超限时只可淘汰重复的发饰补充锚；
+                # 仍无槽位则保留精确文字合同，不得牺牲场景一致性。
                 victims = []
-                spatial = str(refs.get("spatial_ref") or "")
-                if spatial:
-                    victims.append(("空间调度图", spatial))
                 victims.extend(
                     ("发饰补充锚", str(item.get("uri") or ""))
                     for item in reversed(refs["headwear_references"])
@@ -16139,38 +16181,6 @@ class Director:
                         "uri": row["uri"],
                     })
                     break
-        if location:
-            # 空间前置:优先用全景按**本镜机位**切出的背景基准(确定性
-            # 数学投影,零成本零漂移);没有全景/blocking 数据时回退到
-            # 四向静态母版,再回退主视角——行为向下兼容。
-            slice_uri = self._scene_slice_for_shot(ctx, location, shot_no)
-            if slice_uri and remember(slice_uri):
-                refs["scene_ref"] = slice_uri
-                refs["asset_matches"].append({
-                    "asset_id": None, "kind": "scene_slice",
-                    "name": f"{location}::view:slice",
-                    "label": f"场景:{location}(本镜机位全景切片)",
-                    "uri": slice_uri,
-                })
-            else:
-                # 按本镜机位选最贴近的场景母版视角(反打/侧向),缺则回退
-                # 主视角——同一空间不同机位不再各画各的。
-                row, scene_label = self._scene_view_reference(
-                    project_id, location, camera,
-                    fresh_run_id=(
-                        ctx.get("run_id")
-                        if ctx.get("fresh_assets") else None),
-                    script=ctx.get("script") or {})
-                if (row and formal_reference_allowed(
-                        self._asset_quality(row))
-                        and row["uri"] and Path(row["uri"]).exists()
-                        and remember(row["uri"])):
-                    refs["scene_ref"] = row["uri"]
-                    refs["asset_matches"].append({
-                        "asset_id": row["id"], "kind": row["kind"],
-                        "name": row["name"], "label": scene_label,
-                        "uri": row["uri"],
-                    })
         matched_rows = (
             [] if ctx.get("fresh_assets")
             else (self._matching_produced_image_rows(
