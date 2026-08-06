@@ -102,17 +102,82 @@ def test_script_confirm_pauses_before_video(app):
 def test_confirm_continues_to_done(app):
     summary = _to_preflight(app, "万妖图录", 2)
     assert summary["status"] == "awaiting_confirm"
-    summary = app.director.produce("万妖图录", 2)  # 开拍确认 = 无暂停再次调用
+    project = app.projects.get_project("万妖图录")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=2",
+        (project["id"],))
+    checkpoint, checkpoint_version = app.projects.latest_document(
+        episode["id"], "preflight_checkpoint")
+    assert checkpoint_version == 1
+    assert checkpoint["schema"] == "aifos.preflight-checkpoint/v1"
+    upstream = {
+        "script", "continuity", "cast", "storyboard", "blocking",
+        "images", "text_assets", "frames", "preflight",
+    }
+    task_counts = {
+        stage: app.db.query_one(
+            "SELECT COUNT(*) AS n FROM tasks WHERE episode_id=? AND stage=?",
+            (episode["id"], stage))["n"]
+        for stage in upstream
+    }
+    summary = app.director.produce(
+        "万妖图录", 2, resume_after_preflight=True)
     assert summary["status"] == "done"
-    # 预生产产物全部复用,只补视频之后的部分
+    # 预生产产物从冻结快照复用；确认后不允许再次创建任何上游任务。
     for stage in ("images", "frames"):
         report = next(s for s in summary["stages"] if s["stage"] == stage)
         assert report["cost"] == 0
+        assert report["detail"]["frozen_checkpoint"] is True
+    for stage, count in task_counts.items():
+        assert app.db.query_one(
+            "SELECT COUNT(*) AS n FROM tasks WHERE episode_id=? AND stage=?",
+            (episode["id"], stage))["n"] == count
     videos = next(s for s in summary["stages"] if s["stage"] == "videos")
     assert videos["cost"] > 0
-    project = app.projects.get_project("万妖图录")
     assert Path(app.assets.latest(
         project["id"], "video", "e002_shot001")["uri"]).exists()
+
+
+def test_confirm_uses_frozen_storyboard_even_if_latest_document_drifts(app):
+    summary = _to_preflight(app, "冻结开拍", 1)
+    assert summary["status"] == "awaiting_confirm"
+    project = app.projects.get_project("冻结开拍")
+    episode = app.db.query_one(
+        "SELECT * FROM episodes WHERE project_id=? AND number=1",
+        (project["id"],))
+    checkpoint, _ = app.projects.latest_document(
+        episode["id"], "preflight_checkpoint")
+    frozen_version = checkpoint["document_versions"]["storyboard"]
+    frozen = app.projects.document_version(
+        episode["id"], "storyboard", frozen_version)
+    drifted = {**frozen, "shots": [
+        *frozen["shots"],
+        {"shot_no": 999, "scene_no": 1, "duration": 1,
+         "description": "确认后误写入的镜头，绝不能进入视频"},
+    ]}
+    drifted_version = app.projects.save_document(
+        episode["id"], "storyboard", drifted)
+
+    summary = app.director.produce(
+        "冻结开拍", 1, resume_after_preflight=True)
+
+    assert summary["status"] == "done"
+    latest, latest_version = app.projects.latest_document(
+        episode["id"], "storyboard")
+    assert latest_version == drifted_version
+    assert latest["shots"][-1]["shot_no"] == 999
+    assert app.assets.latest(
+        project["id"], "video", "e001_shot999") is None
+
+
+def test_fake_awaiting_confirm_cannot_resume_without_passed_preflight(app):
+    project, _ = app.projects.get_or_create_project("伪确认")
+    episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+    app.projects.set_episode_status(episode["id"], "awaiting_confirm")
+
+    with pytest.raises(AifosError, match="没有真实通过的生产门禁"):
+        app.director.produce(
+            "伪确认", 1, resume_after_preflight=True)
 
 
 def test_provided_script_pauses_for_story_analysis(app):

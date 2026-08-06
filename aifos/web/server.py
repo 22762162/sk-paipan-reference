@@ -667,7 +667,7 @@ class JobRegistry:
     def start(self, title, number, premise="", style="", force=False,
               script=None, review=False, kind=None, action="produce",
               unique=False, style_pack_id="", auto_select_assets=True,
-              fresh_assets=False):
+              fresh_assets=False, resume_after_preflight=False):
         """启动生产；unique=True 时同一集重复提交复用正在运行的任务。
 
         检查、创建历史和登记 job 必须处在同一把锁内，否则两个浏览器标签
@@ -689,7 +689,9 @@ class JobRegistry:
                          "review": bool(review), "kind": kind,
                          "script_supplied": script is not None,
                          "auto_select_assets": bool(auto_select_assets),
-                         "fresh_assets": bool(fresh_assets)})
+                         "fresh_assets": bool(fresh_assets),
+                         "resume_after_preflight": bool(
+                             resume_after_preflight)})
             self._seq += 1
             job_id = f"j{self._seq}"
             job = {
@@ -707,6 +709,8 @@ class JobRegistry:
                     "script_supplied": script is not None,
                     "auto_select_assets": bool(auto_select_assets),
                     "fresh_assets": bool(fresh_assets),
+                    "resume_after_preflight": bool(
+                        resume_after_preflight),
                 }, force=bool(force)))
 
         def task(app):
@@ -715,7 +719,8 @@ class JobRegistry:
                 script=script, pause_for_confirm=review, kind=kind,
                 run_id=run_id, style_pack_id=style_pack_id,
                 auto_select_assets=auto_select_assets,
-                fresh_assets=fresh_assets)
+                fresh_assets=fresh_assets,
+                resume_after_preflight=resume_after_preflight)
 
         self._run(job_id, task)
         return job_id
@@ -5062,6 +5067,7 @@ def make_handler(workspace, jobs):
                         else "confirm_cast" if status == "awaiting_cast"
                         else "confirm_preflight"),
                 auto_select_assets=True,
+                resume_after_preflight=(status == "awaiting_confirm"),
                 unique=True)
             return self._json(
                 {"job_id": job_id, "phase": status}, status=202)

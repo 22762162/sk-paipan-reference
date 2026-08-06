@@ -189,6 +189,21 @@ class ProjectCenter:
             return None, 0
         return json.loads(row["content"]), row["version"]
 
+    def document_version(self, episode_id, kind, version):
+        """Read one immutable document revision.
+
+        Production checkpoints bind exact revisions.  Falling back to
+        ``latest_document`` while resuming would silently mix a confirmed
+        storyboard with a later blocking map, which is precisely the kind of
+        cross-run drift the checkpoint is meant to prevent.
+        """
+        row = self.db.query_one(
+            "SELECT * FROM documents WHERE episode_id=? AND kind=? "
+            "AND version=? LIMIT 1", (episode_id, kind, int(version)))
+        if row is None:
+            return None
+        return json.loads(row["content"])
+
     # ---- 项目文档(版本化；项目规则/跨集事实) ----
     @staticmethod
     def _expected_version(value):

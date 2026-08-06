@@ -244,6 +244,12 @@ STAGES = [
 # 预生产检查点:此阶段完成后可暂停等待用户确认,
 # 确认后才进入视频生产(真实产线从这里开始消耗即梦额度)
 CONFIRM_AFTER = "preflight"
+PREFLIGHT_CHECKPOINT_SCHEMA = "aifos.preflight-checkpoint/v1"
+PREFLIGHT_CHECKPOINT_DOCUMENTS = (
+    "script", "continuity", "storyboard", "blocking", "text_assets",
+    "preflight", "production_standard", "resolved_rule_snapshot",
+    "scene_plan", "character_asset_policy", "video_references",
+)
 # 视频是按镜头计费的成品资产。生成后必须经过视频质检；质检失败只允许
 # 自动返工一次，第二次仍失败时必须停在人工检查点，不能继续烧额度。
 VIDEO_QC_AUTO_RETRIES = 1
@@ -1179,7 +1185,8 @@ class Director:
     def produce(self, project_title, episode_number, premise="", style="",
                 force=False, script=None, pause_for_confirm=False,
                 kind=None, feedback="", run_id=None, style_pack_id="",
-                auto_select_assets=False, fresh_assets=False):
+                auto_select_assets=False, fresh_assets=False,
+                resume_after_preflight=False):
         """force=False 时增量生产:已有且落盘完好的产物直接复用,
         只补齐缺失部分——真实产线(即梦按镜头计费)断点续产的关键。
         script:用户自带剧本(标准 JSON);提供时跳过 AI 编剧,
@@ -1221,6 +1228,20 @@ class Director:
             project = self.projects.update_project(project_title, **updates)
         episode, _ = self.projects.get_or_create_episode(
             project["id"], episode_number, premise=premise)
+        # Plain incremental callers historically used ``produce()`` again as
+        # the second confirmation.  Preserve that API, but route it through
+        # the immutable lower-half resume path instead of silently rerunning
+        # every upstream stage.
+        if (not resume_after_preflight
+                and episode["status"] == "awaiting_confirm"
+                and not force and script is None and not fresh_assets
+                and not pause_for_confirm):
+            resume_after_preflight = True
+        if resume_after_preflight and (
+                force or script is not None or fresh_assets
+                or pause_for_confirm):
+            raise AifosError(
+                "确认开拍续产不能同时重写剧本、强制重建、清空资产或再次暂停")
         self.log.info(
             "director",
             f"开始制作《{project_title}》第{episode_number}集 "
@@ -1242,6 +1263,7 @@ class Director:
             # fresh_assets=True:本轮不读取项目内任何历史图片资产或参考图。
             # 历史版本仍保留审计，但不能成为本轮输入或完成项。
             "fresh_assets": bool(fresh_assets),
+            "pause_for_confirm": bool(pause_for_confirm),
             "aspect": aspect,
             "dims": ASPECT_DIMS.get(aspect, ASPECT_DIMS["9:16"]),
             "provided_script": script,
@@ -1285,10 +1307,38 @@ class Director:
             self._archive_force_rebuild_state(ctx)
         if fresh_assets:
             self._invalidate_fresh_episode_assets(ctx)
+        stage_plan = STAGES
         stage_reports = []
+        if resume_after_preflight:
+            checkpoint = self._hydrate_preflight_checkpoint(ctx)
+            standard_snapshot = ctx["production_standard"]
+            stage_plan = STAGES[
+                next(index for index, item in enumerate(STAGES)
+                     if item[0] == "videos"):]
+            stage_reports = [
+                {
+                    "stage": stage,
+                    "name": stage_cn,
+                    "status": "done",
+                    "cost": 0.0,
+                    "providers": [],
+                    "detail": {
+                        "reused": True,
+                        "frozen_checkpoint": True,
+                        "checkpoint_version": checkpoint["version"],
+                    },
+                }
+                for stage, stage_cn in STAGES
+                if stage not in {item[0] for item in stage_plan}
+            ]
+            self.log.info(
+                "director",
+                "开拍确认已加载冻结预生产快照 v"
+                f"{checkpoint['version']}；从 Seedance 视频继续，"
+                "不重跑剧本、分镜、空间、图片或首尾帧")
         failed = False
         paused = ""
-        for stage, stage_cn in STAGES:
+        for stage, stage_cn in stage_plan:
             if self._cancel_requested(ctx):
                 paused = "cancelled"
                 break
@@ -1790,13 +1840,7 @@ class Director:
             "blocking_reason": str(blocking_reason)[:2000],
         }, "storyboard")
         data = result.data or {}
-        camera = data.get("camera")
-        if isinstance(shot.get("camera"), dict):
-            if isinstance(camera, dict) and camera:
-                shot["camera"] = camera
-        elif str(camera or "").strip():
-            shot["camera"] = (
-                camera if isinstance(camera, str) else str(camera))
+        self._apply_repaired_camera(shot, data.get("camera"))
         description = str(data.get("description") or "").strip()
         if description:
             shot["description"] = description
@@ -12704,13 +12748,7 @@ class Director:
                 shot["duration"] = round(float(data["duration"]) * 2) / 2
             except (TypeError, ValueError):
                 pass  # 适配器已校验;异常输出宁可保留原时长交下游门禁
-        camera = data.get("camera")
-        if isinstance(shot.get("camera"), dict):
-            if isinstance(camera, dict) and camera:
-                shot["camera"] = camera
-        elif str(camera or "").strip():
-            shot["camera"] = (
-                camera if isinstance(camera, str) else str(camera))
+        self._apply_repaired_camera(shot, data.get("camera"))
         description = str(data.get("description") or "").strip()
         if description:
             shot["description"] = description
@@ -12726,6 +12764,28 @@ class Director:
             "repaired_at": now(),
         }
         return summary or "已修正"
+
+    @staticmethod
+    def _apply_repaired_camera(shot, camera):
+        """Accept the repair result as authoritative regardless of shape.
+
+        Storyboards may store ``camera`` as a structured object while the
+        writer adapter returns one precise sentence (and vice versa).  The old
+        type-preserving branch silently discarded that valid repair, leaving
+        every derived field at the rejected framing and causing the same shot
+        to be repaired again on every resume.
+        """
+        if not isinstance(shot, dict):
+            return False
+        if isinstance(camera, dict):
+            if not camera:
+                return False
+            shot["camera"] = copy.deepcopy(camera)
+            return True
+        if isinstance(camera, str) and camera.strip():
+            shot["camera"] = camera.strip()
+            return True
+        return False
 
     def _refresh_final_blocking_contract(self, ctx, storyboard):
         """Make the persisted blocking match the final active storyboard.
@@ -19745,6 +19805,10 @@ class Director:
             failed = [g["label"] for g in report["gates"]
                       if not g["passed"] and g.get("severity") != "warning"]
             raise AifosError("生产门禁未通过: " + "、".join(failed))
+        checkpoint_version = None
+        if ctx.get("pause_for_confirm"):
+            checkpoint_version = self._capture_preflight_checkpoint(
+                ctx, preflight_version=version)
         if report.get("inspection_waived"):
             self.log.warn(
                 "director",
@@ -19756,10 +19820,359 @@ class Director:
                 "director",
                 "临时预览模式：首尾帧视觉质检门已旁路；"
                 "其它生产门禁仍按正式标准执行")
-        return {"version": version, "passed": True,
+        detail = {"version": version, "passed": True,
                 "formal_passed": report.get("formal_passed", True),
                 "preview_only": bool(report.get("preview_only")),
                 "gates": len(report["gates"]), "units": report["units"]}
+        if checkpoint_version is not None:
+            detail["checkpoint_version"] = checkpoint_version
+        return detail
+
+    @staticmethod
+    def _checkpoint_uri_ready(uri):
+        value = str(uri or "").strip()
+        return bool(value) and (
+            value.startswith(("http://", "https://"))
+            or Path(value).is_file())
+
+    def _checkpoint_document_versions(self, episode_id, *, cutoff=None):
+        versions = {}
+        for kind in PREFLIGHT_CHECKPOINT_DOCUMENTS:
+            if cutoff is None:
+                _document, version = self.projects.latest_document(
+                    episode_id, kind)
+                if version:
+                    versions[kind] = int(version)
+                continue
+            row = self.db.query_one(
+                "SELECT version FROM documents WHERE episode_id=? "
+                "AND kind=? AND created_at<=? ORDER BY version DESC LIMIT 1",
+                (episode_id, kind, float(cutoff)))
+            if row is not None:
+                versions[kind] = int(row["version"])
+        return versions
+
+    def _checkpoint_documents(self, episode_id, versions):
+        documents = {}
+        for kind, version in (versions or {}).items():
+            document = self.projects.document_version(
+                episode_id, kind, version)
+            if document is None:
+                raise AifosError(
+                    f"冻结预生产快照缺少 {kind} v{version}，禁止混用最新版本")
+            documents[kind] = document
+        required = {"script", "continuity", "storyboard", "blocking",
+                    "text_assets", "preflight", "production_standard"}
+        missing = sorted(required - set(documents))
+        if missing:
+            raise AifosError(
+                "冻结预生产快照不完整，缺少：" + "、".join(missing))
+        return documents
+
+    def _asset_checkpoint_record(self, row, shot_no):
+        if row is None or self.assets.is_deleted(row):
+            return None
+        if not self._checkpoint_uri_ready(row["uri"]):
+            return None
+        return {
+            "asset_id": int(row["id"]),
+            "shot_no": int(shot_no),
+            "kind": str(row["kind"]),
+            "name": str(row["name"]),
+            "version": int(row["version"]),
+            "uri": str(row["uri"]),
+        }
+
+    def _capture_preflight_checkpoint(
+            self, ctx, *, preflight_version=None, document_versions=None,
+            source="native"):
+        """Freeze the exact preproduction inputs approved for Seedance.
+
+        A checkpoint owns immutable document revisions and concrete asset ids.
+        Confirmation therefore cannot re-enter writer/storyboard/blocking or
+        silently pick a newer frame/reference from another run.
+        """
+        episode_id = int(ctx["episode"]["id"])
+        versions = dict(document_versions or
+                        self._checkpoint_document_versions(episode_id))
+        if preflight_version:
+            versions["preflight"] = int(preflight_version)
+        documents = self._checkpoint_documents(episode_id, versions)
+        if not bool((documents.get("preflight") or {}).get("passed")):
+            raise AifosError("生产门禁尚未通过，不能冻结开拍快照")
+
+        original = {
+            key: ctx.get(key) for key in (
+                "script", "continuity", "storyboard", "blocking",
+                "text_assets", "preflight", "production_standard",
+                "scene_plan")
+        }
+        try:
+            for key in original:
+                if key in documents:
+                    ctx[key] = documents[key]
+            shots = list(self._active_shots(ctx))
+            assets = {"images": [], "first_frames": [], "last_frames": []}
+            reference_ids = {}
+            missing = []
+            for shot in shots:
+                shot_no = int(shot["shot_no"])
+                name = self._shot_name(ctx, shot_no)
+                rows = {
+                    "images": self.assets.latest(
+                        ctx["project"]["id"], "image", name),
+                    "first_frames": self.assets.latest(
+                        ctx["project"]["id"], "first_frame", name),
+                    "last_frames": self.assets.latest(
+                        ctx["project"]["id"], "last_frame", name),
+                }
+                for category, row in rows.items():
+                    record = self._asset_checkpoint_record(row, shot_no)
+                    if record is None:
+                        missing.append(f"镜头{shot_no}:{category}")
+                    else:
+                        assets[category].append(record)
+                references = self._video_reference_rows(ctx, shot_no)
+                invalid_references = [
+                    str(row["name"]) for row in references
+                    if (row is None or self.assets.is_deleted(row)
+                        or not self._checkpoint_uri_ready(row["uri"]))]
+                if invalid_references:
+                    missing.extend(
+                        f"镜头{shot_no}:参考图:{name}"
+                        for name in invalid_references)
+                reference_ids[str(shot_no)] = [
+                    int(row["id"]) for row in references]
+            if missing:
+                raise AifosError(
+                    "预生产资产未完整落盘，不能冻结开拍快照："
+                    + "、".join(missing[:24]))
+        finally:
+            for key, value in original.items():
+                if value is None:
+                    ctx.pop(key, None)
+                else:
+                    ctx[key] = value
+
+        checkpoint = {
+            "schema": PREFLIGHT_CHECKPOINT_SCHEMA,
+            "source": str(source or "native"),
+            "episode_id": episode_id,
+            "document_versions": versions,
+            "shot_nos": [int(shot["shot_no"]) for shot in shots],
+            "assets": assets,
+            "video_reference_asset_ids": reference_ids,
+            "production_standard_fingerprint": str(
+                (documents.get("production_standard") or {}).get(
+                    "fingerprint") or ""),
+            "rule_fingerprint": str(
+                (documents.get("resolved_rule_snapshot") or {}).get(
+                    "fingerprint") or ""),
+        }
+        checkpoint["fingerprint"] = "sha256:" + hashlib.sha256(
+            json.dumps(checkpoint, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":")).encode("utf-8")).hexdigest()
+        existing, existing_version = self.projects.latest_document(
+            episode_id, "preflight_checkpoint")
+        if (existing or {}).get("fingerprint") == checkpoint["fingerprint"]:
+            return int(existing_version)
+        checkpoint["created_at"] = now()
+        return self.projects.save_document(
+            episode_id, "preflight_checkpoint", checkpoint)
+
+    def _legacy_preflight_checkpoint(self, ctx):
+        """Migrate a genuine pre-upgrade awaiting-confirm checkpoint once."""
+        episode = self.projects.get_episode(ctx["episode"]["id"])
+        if episode is None or episode["status"] != "awaiting_confirm":
+            raise AifosError(
+                "没有可恢复的冻结预生产快照；请先从断点补齐预生产门禁")
+        rows = self.db.query(
+            "SELECT version, content, created_at FROM documents "
+            "WHERE episode_id=? AND kind='preflight' "
+            "ORDER BY version DESC",
+            (episode["id"],))
+        passed_row = None
+        for row in rows:
+            try:
+                report = json.loads(row["content"])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(report, dict) and report.get("passed") is True:
+                passed_row = row
+                break
+        if passed_row is None:
+            raise AifosError(
+                "历史记录中没有真实通过的生产门禁，不能直接进入视频")
+        versions = self._checkpoint_document_versions(
+            episode["id"], cutoff=passed_row["created_at"])
+        versions["preflight"] = int(passed_row["version"])
+        checkpoint_version = self._capture_preflight_checkpoint(
+            ctx, preflight_version=passed_row["version"],
+            document_versions=versions, source="legacy_migration")
+        checkpoint, _ = self.projects.latest_document(
+            episode["id"], "preflight_checkpoint")
+        return checkpoint, checkpoint_version
+
+    def _checkpoint_asset_row(self, record):
+        row = self.assets.get(int(record.get("asset_id") or 0))
+        if (row is None or self.assets.is_deleted(row)
+                or str(row["kind"]) != str(record.get("kind") or "")
+                or str(row["name"]) != str(record.get("name") or "")
+                or str(row["uri"]) != str(record.get("uri") or "")
+                or not self._checkpoint_uri_ready(row["uri"])):
+            raise AifosError(
+                "冻结预生产资产已缺失或被替换："
+                f"{record.get('kind')} / {record.get('name')}")
+        return row
+
+    def _refresh_checkpoint_video_references(
+            self, ctx, checkpoint, checkpoint_version):
+        """Apply only explicit post-preflight reference selections.
+
+        The confirmation page intentionally lets the user refine Seedance
+        reference images after preproduction is frozen.  That is not a
+        storyboard mutation: preserve every frozen document/asset binding and
+        advance only ``video_references`` plus the resulting per-shot ids.
+        """
+        episode_id = int(ctx["episode"]["id"])
+        _manual, current_version = self.projects.latest_document(
+            episode_id, "video_references")
+        bound_version = int(
+            (checkpoint.get("document_versions") or {}).get(
+                "video_references") or 0)
+        if int(current_version or 0) == bound_version:
+            return checkpoint, int(checkpoint_version)
+        previous_frozen = ctx.pop(
+            "frozen_video_reference_asset_ids", None)
+        try:
+            reference_ids = {}
+            for shot in self._active_shots(ctx):
+                shot_no = int(shot["shot_no"])
+                rows = self._video_reference_rows(ctx, shot_no)
+                invalid = [
+                    str(row["name"]) for row in rows
+                    if (row is None or self.assets.is_deleted(row)
+                        or not self._checkpoint_uri_ready(row["uri"]))]
+                if invalid:
+                    raise AifosError(
+                        f"镜头{shot_no}新选择的参考图不可用："
+                        + "、".join(invalid))
+                reference_ids[str(shot_no)] = [
+                    int(row["id"]) for row in rows]
+        finally:
+            if previous_frozen is not None:
+                ctx["frozen_video_reference_asset_ids"] = previous_frozen
+        updated = copy.deepcopy(checkpoint)
+        updated["video_reference_asset_ids"] = reference_ids
+        updated.setdefault("document_versions", {})[
+            "video_references"] = int(current_version or 0)
+        # Version 0 means “no manual selection document”; do not manufacture
+        # a non-existent document binding that the strict loader would reject.
+        if not current_version:
+            updated["document_versions"].pop("video_references", None)
+        updated["source"] = "post_preflight_reference_selection"
+        updated.pop("created_at", None)
+        updated.pop("fingerprint", None)
+        updated["fingerprint"] = "sha256:" + hashlib.sha256(
+            json.dumps(updated, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":")).encode("utf-8")).hexdigest()
+        latest, latest_version = self.projects.latest_document(
+            episode_id, "preflight_checkpoint")
+        if (latest or {}).get("fingerprint") == updated["fingerprint"]:
+            return latest, int(latest_version)
+        updated["created_at"] = now()
+        version = self.projects.save_document(
+            episode_id, "preflight_checkpoint", updated)
+        return updated, int(version)
+
+    def _hydrate_preflight_checkpoint(self, ctx):
+        checkpoint, version = self.projects.latest_document(
+            ctx["episode"]["id"], "preflight_checkpoint")
+        if checkpoint is None:
+            checkpoint, version = self._legacy_preflight_checkpoint(ctx)
+        if checkpoint.get("schema") != PREFLIGHT_CHECKPOINT_SCHEMA:
+            raise AifosError("冻结预生产快照格式无效，禁止直接进入视频")
+        documents = self._checkpoint_documents(
+            ctx["episode"]["id"], checkpoint.get("document_versions") or {})
+        if not bool((documents.get("preflight") or {}).get("passed")):
+            raise AifosError("冻结快照中的生产门禁未通过，禁止进入视频")
+        for key in ("script", "continuity", "storyboard", "blocking",
+                    "text_assets", "preflight", "production_standard",
+                    "resolved_rule_snapshot", "scene_plan"):
+            if key in documents:
+                ctx[key] = copy.deepcopy(documents[key])
+        ctx["production_profile"] = production_profile(
+            self.config, ctx["production_standard"])
+        ctx["voice_mode"] = ctx["production_profile"].get(
+            "voice", "jimeng_builtin")
+        ctx["lip_sync"] = bool(
+            ctx["production_profile"].get("lip_sync", True))
+        ctx["storyboard_version"] = int(
+            (checkpoint.get("document_versions") or {}).get(
+                "storyboard") or 0)
+        ctx["script_version"] = int(
+            (checkpoint.get("document_versions") or {}).get("script") or 0)
+        checkpoint, version = self._refresh_checkpoint_video_references(
+            ctx, checkpoint, version)
+        ctx["images"] = []
+        ctx["frames"] = []
+        asset_groups = checkpoint.get("assets") or {}
+        for record in asset_groups.get("images") or []:
+            row = self._checkpoint_asset_row(record)
+            ctx["images"].append({
+                "shot_no": int(record["shot_no"]), "uri": row["uri"]})
+        first = {}
+        last = {}
+        for record in asset_groups.get("first_frames") or []:
+            row = self._checkpoint_asset_row(record)
+            first[int(record["shot_no"])] = row
+        for record in asset_groups.get("last_frames") or []:
+            row = self._checkpoint_asset_row(record)
+            last[int(record["shot_no"])] = row
+        shot_nos = [int(value) for value in checkpoint.get("shot_nos") or []]
+        current_shots = [
+            int(shot["shot_no"]) for shot in self._active_shots(ctx)]
+        if shot_nos != current_shots:
+            raise AifosError(
+                "冻结快照镜头清单与绑定分镜不一致，禁止混合版本续产")
+        missing = [value for value in shot_nos
+                   if value not in first or value not in last]
+        if missing:
+            raise AifosError(
+                "冻结快照缺少首尾帧：" + "、".join(map(str, missing)))
+        ctx["frames"] = [{
+            "shot_no": value,
+            "first": first[value]["uri"],
+            "last": last[value]["uri"],
+            "image_quality": "high",
+            "frozen_checkpoint": True,
+        } for value in shot_nos]
+        image_shots = {int(item["shot_no"]) for item in ctx["images"]}
+        missing_images = [value for value in shot_nos
+                          if value not in image_shots]
+        if missing_images:
+            raise AifosError(
+                "冻结快照缺少关键帧："
+                + "、".join(map(str, missing_images)))
+        frozen_references = checkpoint.get("video_reference_asset_ids") or {}
+        for values in frozen_references.values():
+            for asset_id in values or []:
+                row = self.assets.get(int(asset_id))
+                if (row is None or self.assets.is_deleted(row)
+                        or not self._checkpoint_uri_ready(row["uri"])):
+                    raise AifosError(
+                        f"冻结视频参考图资产已缺失：asset_id={asset_id}")
+        ctx["frozen_video_reference_asset_ids"] = copy.deepcopy(
+            frozen_references)
+        ctx["videos"] = []
+        ctx["voices"] = []
+        ctx["subtitles"] = []
+        ctx["content_review"], _ = self.projects.latest_document(
+            ctx["episode"]["id"], "content_review")
+        ctx["cast_selection"] = self.production_asset_selection_status(
+            ctx["project"]["id"], ctx["script"])
+        ctx["preflight_checkpoint"] = copy.deepcopy(checkpoint)
+        return {**checkpoint, "version": int(version)}
 
     def _stage_videos(self, ctx):
         frames = {f["shot_no"]: f for f in ctx["frames"]}
@@ -20324,6 +20737,18 @@ class Director:
         return ""
 
     def _video_reference_rows(self, ctx, shot_no):
+        frozen = ctx.get("frozen_video_reference_asset_ids") or {}
+        frozen_key = str(int(shot_no))
+        if frozen_key in frozen:
+            rows = []
+            for asset_id in frozen.get(frozen_key) or []:
+                row = self.assets.get(int(asset_id))
+                if (row is None or self.assets.is_deleted(row)
+                        or not self._checkpoint_uri_ready(row["uri"])):
+                    raise AifosError(
+                        f"镜头{shot_no}冻结参考图已缺失：asset_id={asset_id}")
+                rows.append(row)
+            return rows
         document, _ = self.projects.latest_document(
             ctx["episode"]["id"], "video_references")
         shots_doc = (document or {}).get("shots", {})

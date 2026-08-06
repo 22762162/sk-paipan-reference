@@ -379,7 +379,10 @@ def _cmd_confirm(app, args):
         return 0
     print(f"已确认,继续生产《{args.project}》第{args.episode}集 …")
     summary = app.director.produce(
-        args.project, args.episode, auto_select_assets=True)
+        args.project, args.episode, auto_select_assets=True,
+        resume_after_preflight=(
+            episode is not None
+            and episode["status"] == "awaiting_confirm"))
     print(f"制作{_status_cn(summary['status'])},"
           f"质检 {summary['qc_score']},成本 {summary['cost']}")
     return 0 if summary["status"] == "done" else 1

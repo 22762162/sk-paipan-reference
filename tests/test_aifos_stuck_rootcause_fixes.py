@@ -6,6 +6,7 @@
 """
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -84,6 +85,48 @@ def test_camera_plan_keeps_explicit_two_person_detail_closeup():
     assert plan["shot_scale"] == "大特写"
     assert plan["lens"] == "135mm"
     assert "capacity_note" not in plan
+
+
+def test_shootability_repair_accepts_string_camera_over_old_dict(
+        app, monkeypatch):
+    """适配器改成一句精准机位时，不能因旧 camera 是 dict 而丢弃。"""
+    shot = {
+        "shot_no": 1,
+        "scene_no": 1,
+        "characters": ["甲", "乙"],
+        "visible_figure_count": 2,
+        "description": "两人站在房间中央。",
+        "camera": {
+            "shot_scale": "中景", "angle": "平视", "lens": "35mm",
+            "camera_position": "正面", "movement": "固定",
+            "composition": "三分法",
+        },
+        "shot_contract": {"景别": "中景", "焦段": "35mm"},
+        "five_dimensions": {"camera_design": {"shot_scale": "中景"}},
+        "style_direction": {
+            "camera_contract": {"shot_scale": "中景", "lens": "35mm"}},
+    }
+    monkeypatch.setattr(
+        app.director, "_call",
+        lambda *_args, **_kwargs: SimpleNamespace(data={
+            "camera": "9:16竖幅，135mm微俯斜侧局部近景，固定机位",
+            "description": "两人仅以手部和侧脸局部入画。",
+            "repair_summary": "收紧为可拍局部近景",
+        }))
+    ctx = {
+        "project": {"title": "修复测试", "style": ""},
+        "script": {"scenes": [{"scene_no": 1, "location": "房间"}]},
+    }
+
+    app.director._repair_shot_for_shootability(
+        ctx, shot, "中景机位距离超出房间净深")
+
+    assert isinstance(shot["camera"], str)
+    assert shot["shot_contract"]["景别"] == "近景"
+    assert shot["shot_contract"]["焦段"] == "135mm"
+    assert shot["five_dimensions"]["camera_design"]["shot_scale"] == "近景"
+    assert shot["style_direction"]["camera_contract"]["shot_scale"] == "近景"
+    assert shot["prompt_contract"]["camera"]["景别"] == "近景"
 
 
 def test_compile_shot_prompt_fixes_saved_infeasible_contract():
