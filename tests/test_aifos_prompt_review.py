@@ -247,9 +247,83 @@ def test_complete_shot_review_context_excludes_raw_audit_fields():
     })
 
     packed = str(context)
-    assert "虞寻歌坐在现代沙发上" in packed
+    assert "坐在沙发上" in packed
+    assert "虞寻歌坐在现代沙发上" not in packed
+    assert "action" not in context["prompt_contract"]
+    assert "start" not in context["prompt_contract"]
+    assert "end" not in context["prompt_contract"]
     for leaked in ("半垂纱幕", "视线越过纱幕", "书案香炉", "整集背景"):
         assert leaked not in packed
+
+
+def test_complete_review_persists_canonical_prompt_and_is_idempotent(
+        tmp_path):
+    source = (
+        "【镜头合同v2.2】只执行事实。"
+        "【主体】严格共1人：虞寻歌。"
+        "【场景】现代卧室。")
+    optimized = (
+        "【镜头合同v2.2】只执行事实。\n\n"
+        "【主体】严格共1人：虞寻歌。  \n"
+        "【场景】现代卧室。")
+    router, codex = _router(optimized)
+    payload = {
+        "shot_no": 1,
+        "frame_kind": "keyframe",
+        "prompt": source,
+        "prompt_compact": source,
+        "prompt_contract_complete": True,
+        "characters": ["虞寻歌"],
+        "character_count": 1,
+        "location": "现代卧室",
+        "active_realm_id": "modern",
+        "prompt_contract": {
+            "schema": "aifos.shot-prompt/v2.2",
+            "scene": "现代卧室",
+            "frame_target": {"phase": "freeze", "state": "坐在沙发"},
+        },
+    }
+
+    router.call("image", payload, tmp_path)
+    canonical = payload["prompt_compact"]
+    assert "\n" not in canonical
+    assert payload["prompt_review"]["optimized_prompt"] == canonical
+
+    router.call("image", payload, tmp_path)
+
+    assert [call[0] for call in codex.calls] == [
+        "prompt_review", "image", "image"]
+
+
+def test_frozen_candidate_uses_one_approved_prompt_without_re_review(
+        tmp_path):
+    source = (
+        "【镜头合同v2.2】只执行事实。"
+        "【主体】严格共1人：虞寻歌。"
+        "【场景】现代卧室。")
+    router, codex = _router(source)
+    payload = {
+        "shot_no": 1,
+        "prompt": source,
+        "prompt_compact": source,
+        "prompt_contract_complete": True,
+        "characters": ["虞寻歌"],
+        "character_count": 1,
+        "location": "现代卧室",
+        "_candidate_prompt_review_locked": True,
+        "_prompt_review_frozen_input_hash": "frozen-director-input",
+        "prompt_review": {
+            "schema": "aifos.codex-prompt-review/v1",
+            "approved": True,
+            "status": "approved",
+            "optimized_prompt": source,
+            "optimized_hash": router._stable_hash(source),
+        },
+    }
+
+    router.call("image", payload, tmp_path)
+
+    assert [call[0] for call in codex.calls] == ["image"]
 
 
 def test_prompt_review_scene_guard_falls_back_instead_of_changing_set(

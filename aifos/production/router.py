@@ -459,9 +459,9 @@ class ProviderRouter:
                 key: contract.get(key)
                 for key in (
                     "schema", "output", "frame_target", "subject",
-                    "population", "scene", "scene_layout", "style",
-                    "style_direction", "start", "action", "performance",
-                    "camera", "lighting", "spatial_staging", "end",
+                    "population", "scene", "scene_layout",
+                    "style_direction", "camera", "lighting",
+                    "spatial_staging",
                     "physical", "frame_props", "readable_text_current",
                     "text_rule", "reference_roles",
                 )
@@ -752,6 +752,26 @@ class ProviderRouter:
                 "blocking_reason": "低层兼容调用未提供AIFOS生图提示词",
             }
             return None
+        if payload.get("_candidate_prompt_review_locked"):
+            # A four-draw candidate round is reviewed once before fan-out.
+            # Every slot must execute that exact frozen result; letting each
+            # worker ask Codex again produced four slightly different prompts
+            # and even contradictory pass/block decisions for the same shot.
+            # Director-side generation-input hashes additionally lock the
+            # reference manifest and structured contract before this branch.
+            audit = payload.get("prompt_review") or {}
+            optimized = str(audit.get("optimized_prompt") or "").strip()
+            if not (
+                    audit.get("approved") is True
+                    and str(payload.get(
+                        "_prompt_review_frozen_input_hash") or "")
+                    and optimized == source
+                    and str(audit.get("optimized_hash") or "")
+                    == self._stable_hash(source)
+                    and not str(payload.get("feedback") or "").strip()):
+                raise ProviderError(
+                    "冻结候选提示词审核凭据不完整，拒绝绕过统一审核")
+            return None
         if payload.get("director_autonomy_mode"):
             # 用户明确授权 AI 导演使用当前冻结提示词直接生成。记录豁免
             # 事实供审计，但不调用 Codex、不改写原稿，也不伪造 approved。
@@ -861,6 +881,15 @@ class ProviderRouter:
             # physical set.  Fall back to the deterministic clean contract
             # instead of blocking production or sending the invented objects.
             optimized = source
+        elif payload.get("prompt_contract_complete"):
+            # Persist the reviewed prompt in the exact same canonical form
+            # used at the next review entry.  Previously Codex's multiline
+            # whitespace was stored verbatim; the next candidate worker's
+            # entry sanitizer collapsed it, changed the review hash and made
+            # all four slots independently re-review the same frozen shot.
+            optimized = sanitize_scene_prompt_value(
+                optimized, payload.get("location") or "", payload,
+                allowed_text=scene_allowed_text)
         execution_conflicts = self._reviewed_prompt_execution_conflicts(
             optimized)
         if execution_conflicts:

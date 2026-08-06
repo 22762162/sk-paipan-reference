@@ -1,6 +1,8 @@
 """四候选选片模式：冻结合同、真并行和非阻断内容质检。"""
 
 import copy
+import hashlib
+import json
 import struct
 import threading
 import zlib
@@ -78,13 +80,26 @@ class _ParallelRouter:
     def review_image_prompt(self, _capability, payload, _out_dir,
                             cancel=None):
         assert cancel is None or not cancel()
+        audit = payload.get("prompt_review") or {}
+        if (audit.get("approved") is True
+                and audit.get("optimized_prompt")
+                == payload.get("prompt_compact")):
+            return None
         with self.lock:
             self.review_calls += 1
         payload["prompt_aifos_original"] = payload.get("prompt", "")
         payload["prompt"] = "冻结后的精准镜头提示词"
         payload["prompt_compact"] = "冻结后的精准镜头提示词"
+        optimized_hash = hashlib.sha256(json.dumps(
+            "冻结后的精准镜头提示词", ensure_ascii=False,
+            sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
         payload["prompt_review"] = {
-            "schema": "aifos.prompt-review/v1", "status": "approved"}
+            "schema": "aifos.prompt-review/v1", "status": "approved",
+            "approved": True,
+            "optimized_prompt": "冻结后的精准镜头提示词",
+            "optimized_hash": optimized_hash,
+        }
         return ProviderResult(provider="review", cost=0.25)
 
     def call(self, capability, payload, out_dir, cancel=None):
@@ -275,6 +290,10 @@ def test_four_candidates_share_one_reviewed_contract_and_overlap(tmp_path):
     assert all(Path(row["uri"]).exists() for row in candidates)
     assert {p["prompt_compact"] for p in director.router.payloads} == {
         "冻结后的精准镜头提示词"}
+    assert all(p["_candidate_prompt_review_locked"] is True
+               for p in director.router.payloads)
+    assert all(p["_prompt_review_frozen_input_hash"]
+               for p in director.router.payloads)
 
     # 底层候选组提供 AI 推荐；上层导演据此自动晋升当前版本。
     assert result.uri == ""
@@ -431,6 +450,49 @@ def test_interrupted_candidate_progress_reuses_finished_slots(tmp_path):
         for row in group["candidates"][2:])
 
 
+def test_review_normalization_starts_new_set_without_overwriting_old_dir(
+        tmp_path):
+    """旧断点提示词被统一审核改写后不得复用或覆盖旧候选目录。"""
+    director = _director({"selection_mode": True, "parallel_images": 4})
+    director.router = _ParallelRouter()
+    old_set_id = "legacy-multiline-set"
+    old_root = tmp_path / "candidate_sets" / old_set_id
+    old_root.mkdir(parents=True)
+    sentinel = old_root / "keep-old-candidates.txt"
+    sentinel.write_text("historical pixels stay immutable", encoding="utf-8")
+    payload = {
+        "_episode_id": "episode-1",
+        "_contract_revision": 1,
+        "_candidate_revision": 1,
+        "_candidate_set_id": old_set_id,
+        "_resume_candidate_group": {
+            "candidate_set_id": old_set_id,
+            "candidate_set_token": "cset-v1:old-pre-review-token",
+            "complete": False,
+            "candidates": [],
+        },
+        "item_id": "shot:10",
+        "shot_no": 10,
+        "prompt": "旧断点中尚未规范化的\n多行镜头提示词",
+        "prompt_compact": "旧断点中尚未规范化的\n多行镜头提示词",
+        "reference_manifest": [],
+    }
+
+    result = director._generate_selection_candidates_parallel(
+        "image", payload, tmp_path, None, {"item_id": "shot:10"}, 4)
+
+    group = result.data["candidate_group"]
+    assert director.router.review_calls == 1
+    assert director.router.image_calls == 4
+    assert group["candidate_set_id"] != old_set_id
+    assert sentinel.read_text(encoding="utf-8") == \
+        "historical pixels stay immutable"
+    assert list(old_root.iterdir()) == [sentinel]
+    assert all(
+        old_set_id not in str(Path(row["uri"]).parent)
+        for row in group["candidates"])
+
+
 def test_candidate_progress_persists_exact_round_resume_state(tmp_path):
     director = _director({"selection_mode": True, "parallel_images": 4})
     director.router = _ParallelRouter()
@@ -443,6 +505,7 @@ def test_candidate_progress_persists_exact_round_resume_state(tmp_path):
         "shot_no": 11,
         "prompt": "第3轮替换后的精准静态合同",
         "prompt_compact": "第3轮替换后的精准静态合同",
+        "seedance_prompt": "旧纱幕与沉香烟雾只属于历史视频草稿",
         "reference_manifest": [{
             "index": 1, "uri": "/tmp/round-3-face.png",
             "role": "identity",
@@ -487,6 +550,7 @@ def test_candidate_progress_persists_exact_round_resume_state(tmp_path):
     assert frozen_resume["prompt"] == "冻结后的精准镜头提示词"
     assert frozen_resume["prompt_compact"] == "冻结后的精准镜头提示词"
     assert frozen_resume["_prompt_review_frozen_input_hash"]
+    assert "seedance_prompt" not in frozen_resume
     assert updates[-1]["status"] == "qc_complete"
 
     # Simulate a service restart after all four files landed but before the

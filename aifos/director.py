@@ -7010,7 +7010,7 @@ class Director:
         for key in (
                 "_candidate_progress_callback", "_candidate_resume_state",
                 "_resume_candidate_group", "_candidate_round_history",
-                "_candidate_best_provisional"):
+                "_candidate_best_provisional", "seedance_prompt"):
             snapshot.pop(key, None)
         return json.loads(json.dumps(
             snapshot, ensure_ascii=False, default=str))
@@ -7211,14 +7211,13 @@ class Director:
             self._attach_reference_manifest(working_payload)
         # Prompt review 与内容 QC 是两个闸门；选片模式仍先审核
         # 并冻结一份精准提示词，不让4个worker各自改写。
-        before_review = self._image_generation_input(
-            working_payload, qc_spec=qc_spec)
-        already_reviewed = (
-            str(working_payload.get(
-                "_prompt_review_frozen_input_hash") or "")
-            == before_review["input_hash"])
         review = None
-        if not already_reviewed and self._prompt_review_enabled():
+        if self._prompt_review_enabled():
+            # Always enter the single group-level review funnel once.  The
+            # router is idempotent for an already canonical approved prompt,
+            # while old checkpoints whose stored multiline prompt is not a
+            # sanitizer fixed point are normalized/reviewed here before the
+            # four workers are forked.
             review = self.router.review_image_prompt(
                 capability, working_payload, out_dir, cancel=cancel)
         review_cost = float(review.cost or 0.0) if review is not None else 0.0
@@ -7253,8 +7252,17 @@ class Director:
         result_versions = {
             item.candidate_index: item
             for item in build_candidate_result_versions(version)}
+        resume_group = working_payload.get("_resume_candidate_group") or {}
+        requested_candidate_set_id = str(
+            working_payload.get("_candidate_set_id") or "")
+        if (isinstance(resume_group, dict) and resume_group
+                and resume_group.get("candidate_set_token")
+                != version.token):
+            # A canonicalized/repaired prompt creates a new immutable set.
+            # Never overwrite or silently reuse the old set's directories.
+            requested_candidate_set_id = ""
         candidate_set_id = str(
-            working_payload.get("_candidate_set_id")
+            requested_candidate_set_id
             or version.token.split(":", 1)[-1][:16])
         root = Path(out_dir) / "candidate_sets" / candidate_set_id
         root.mkdir(parents=True, exist_ok=True)
@@ -7292,6 +7300,26 @@ class Director:
                 # 每张可独立记录 QC，但不在候选worker内自动修图。
                 "_qc_candidate_only": True,
             })
+            review_audit = candidate_payload.get("prompt_review") or {}
+            reviewed_prompt = str(
+                review_audit.get("optimized_prompt") or "").strip()
+            frozen_prompt = str(
+                candidate_payload.get("prompt_compact")
+                or candidate_payload.get("prompt") or "").strip()
+            if (
+                    review_audit.get("approved") is True
+                    and reviewed_prompt
+                    and reviewed_prompt == frozen_prompt
+                    and str(review_audit.get("optimized_hash") or "")
+                    == self._stable_hash(frozen_prompt)
+                    and not str(candidate_payload.get(
+                        "feedback") or "").strip()):
+                # 本轮已经在 fan-out 前完成一次真实统一审核。四个 worker
+                # 必须执行同一冻结稿，严禁各自随机复审、改词或分叉判定。
+                # 旧兼容断点可能只有 approved/hash 而没有完整优化稿；
+                # 这种不完整审计仍走路由器幂等校验，不冒充冻结锁。
+                candidate_payload[
+                    "_candidate_prompt_review_locked"] = True
             return candidate_payload, result_version, seed
 
         def build_candidate(index, result, candidate_payload,
@@ -7380,7 +7408,6 @@ class Director:
                 technical_probe)
 
         results = {}
-        resume_group = working_payload.get("_resume_candidate_group") or {}
         resume_contract_matches = bool(
             isinstance(resume_group, dict)
                 and resume_group.get("candidate_set_id") == candidate_set_id
@@ -9199,7 +9226,12 @@ class Director:
                 payload, qc_spec=qc_spec)
             frozen_review_hash = str(
                 payload.get("_prompt_review_frozen_input_hash") or "")
+            if (payload.get("_candidate_prompt_review_locked")
+                    and frozen_review_hash != current_input["input_hash"]):
+                raise AifosError(
+                    "候选worker输入偏离统一审核冻结合同，已在生图前阻止")
             if (self._prompt_review_enabled()
+                    and not payload.get("_candidate_prompt_review_locked")
                     and not (frozen_review_hash
                              and frozen_review_hash
                              == current_input["input_hash"])):
