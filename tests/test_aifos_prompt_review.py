@@ -226,6 +226,98 @@ def test_regular_shot_review_keeps_full_character_background():
         == "青色圆领官袍"
 
 
+def test_complete_shot_review_context_excludes_raw_audit_fields():
+    context = ProviderRouter._prompt_review_context("image", {
+        "prompt_contract_complete": True,
+        "shot_no": 1,
+        "frame_kind": "keyframe",
+        "characters": ["虞寻歌"],
+        "character_count": 1,
+        "location": "现代卧室",
+        "action": "旧字段把半垂纱幕塞回画面",
+        "start_state": {"虞寻歌": {"direction": "视线越过纱幕"}},
+        "shot_contract": {"画面内容描述": "书案香炉"},
+        "character_background": {"虞寻歌": {"identity": "整集背景"}},
+        "prompt_contract": {
+            "schema": "aifos.shot-prompt/v2.2",
+            "scene": "现代卧室",
+            "action": "虞寻歌坐在现代沙发上",
+            "frame_target": {"phase": "freeze", "state": "坐在沙发上"},
+        },
+    })
+
+    packed = str(context)
+    assert "虞寻歌坐在现代沙发上" in packed
+    for leaked in ("半垂纱幕", "视线越过纱幕", "书案香炉", "整集背景"):
+        assert leaked not in packed
+
+
+def test_prompt_review_scene_guard_falls_back_instead_of_changing_set(
+        tmp_path):
+    source = (
+        "【镜头合同v2.2】只执行事实。"
+        "【主体】严格共1人：虞寻歌。"
+        "【场景】现代卧室。")
+    router, codex = _router(
+        lambda value: value + "左缘新增半垂纱幕作为虚化前景。")
+    payload = {
+        "shot_no": 1,
+        "frame_kind": "keyframe",
+        "prompt": source,
+        "prompt_compact": source,
+        "prompt_contract_complete": True,
+        "characters": ["虞寻歌"],
+        "character_count": 1,
+        "location": "现代卧室",
+        "active_realm_id": "modern",
+        "prompt_contract": {
+            "schema": "aifos.shot-prompt/v2.2",
+            "scene": "现代卧室",
+            "action": "虞寻歌坐在沙发上",
+        },
+    }
+
+    router.call("image", payload, tmp_path)
+
+    assert payload["prompt"] == source
+    assert payload["prompt_review"]["status"] \
+        == "approved_scene_guard_fallback"
+    assert "纱幕" not in payload["prompt"]
+    assert [call[0] for call in codex.calls] == ["prompt_review", "image"]
+
+
+def test_director_autonomy_dispatches_clean_scene_projection(tmp_path):
+    source = (
+        "【镜头合同v2.2】现代卧室内严格共1人：虞寻歌。"
+        "手机厚度明显小于书案上的线装册。"
+        "左缘有半垂纱幕和铜香炉，沉香烟雾形成丁达尔光。")
+    router, codex = _router(source)
+    payload = {
+        "shot_no": 1,
+        "prompt": source,
+        "prompt_compact": source,
+        "prompt_contract_complete": True,
+        "director_autonomy_mode": True,
+        "characters": ["虞寻歌"],
+        "character_count": 1,
+        "location": "现代卧室",
+        "active_realm_id": "modern",
+        "prompt_contract": {
+            "schema": "aifos.shot-prompt/v2.2",
+            "scene": "现代卧室",
+        },
+    }
+
+    router.call("image", payload, tmp_path)
+
+    assert [call[0] for call in codex.calls] == ["image"]
+    dispatched = codex.calls[0][1]["prompt_compact"]
+    for forbidden in ("书案", "线装册", "纱幕", "香炉", "沉香烟雾"):
+        assert forbidden not in dispatched
+    assert payload["prompt_review"]["status"] \
+        == "not_applicable_director_autonomy"
+
+
 def test_same_prompt_candidate_group_reuses_one_codex_optimized_prompt(
         tmp_path, monkeypatch):
     app = App(tmp_path / "ws")

@@ -570,6 +570,10 @@ _MODERN_INCOMPATIBLE_STYLE_TOKENS = (
 _MODERN_INCOMPATIBLE_SCENE_PROP_TOKENS = (
     "宫殿", "宫廷", "古室", "寝殿", "殿内", "殿堂", "书案", "香炉",
     "宫灯", "烛台", "纱幕", "纱帐", "卷册", "县衙", "驿馆", "官舍",
+    # 只禁完整历史氛围短语，不泛禁现代剧情里可能合法的
+    # 普通“烟雾”。《游戏入侵》的旧风格包把“沉香烟雾”反复
+    # 注入已定版的纯现代卧室，导致同一母场景逐镜变装。
+    "沉香烟雾",
 )
 
 _ANCIENT_SCENE_TOKENS = (
@@ -735,6 +739,132 @@ def _strip_modern_ancient_exclusions(value, scene, context=None):
         if parts:
             kept_sentences.append("，".join(parts))
     return "。".join(kept_sentences)
+
+
+def _scene_prompt_allowed_text(shot, authoritative_scene_layout=""):
+    """Return only *current visible* exceptions to era sanitation.
+
+    A script's early production design is not an execution allow-list after a
+    canonical scene image and 3D inventory have been approved.  At render
+    time an otherwise era-incompatible object survives only when it is in the
+    canonical layout, is a prop used by this shot, or is an explicit
+    shot/episode exception.  This preserves deliberate antiques and
+    time-travel props without letting a stale global style redesign the set.
+    """
+    shot = shot if isinstance(shot, dict) else {}
+    values = [_text(authoritative_scene_layout)]
+    sanctioned = shot.get("sanctioned_anachronisms") or []
+    if isinstance(sanctioned, str):
+        sanctioned = [sanctioned]
+    values.extend(_text(value) for value in sanctioned)
+
+    used_ids = set()
+    for item in (
+            list(shot.get("frame_props") or [])
+            + list(shot.get("prop_transitions") or [])):
+        if not isinstance(item, dict):
+            continue
+        prop_id = _text(item.get("prop_id"))
+        if prop_id:
+            used_ids.add(prop_id)
+        # A frame row may carry the human-readable name even when an older
+        # storyboard omitted the corresponding registry entry.
+        values.append(_text(item.get("name")))
+    for item in shot.get("prop_registry") or []:
+        if not isinstance(item, dict):
+            continue
+        prop_id = _text(item.get("prop_id"))
+        if prop_id and prop_id in used_ids:
+            # Names identify intentional objects.  Descriptions and scale
+            # comparisons are deliberately excluded: those are the polluted
+            # fields this boundary is meant to clean.
+            values.append(_text(item.get("name")))
+    return " ".join(value for value in values if value)
+
+
+def _unauthorized_modern_scene_tokens(value, scene, context=None,
+                                      allowed_text=""):
+    text = _text(value)
+    if not text or not _is_modern_scene(scene, context):
+        return []
+    allowed = _text(allowed_text)
+    candidates = dict.fromkeys((
+        *_MODERN_INCOMPATIBLE_STYLE_TOKENS,
+        *_MODERN_INCOMPATIBLE_SCENE_PROP_TOKENS,
+    ))
+    return [
+        token for token in candidates
+        if token in text and token not in allowed
+    ]
+
+
+def sanitize_scene_prompt_value(value, scene, context=None, *,
+                                allowed_text=""):
+    """Project provider-facing values onto the locked current scene.
+
+    Source documents remain untouched for audit.  Only their executable
+    projection is cleaned.  For a modern shot, the smallest comma-delimited
+    fragment that names an unapproved historical set object is removed.  A
+    useful gaze target is retained (``视线越过纱幕看某人`` ->
+    ``视线看某人``), while an off-screen size comparison such as
+    ``厚度小于书案上的线装册`` disappears instead of priming the model.
+    """
+    if isinstance(value, dict):
+        return {
+            key: sanitize_scene_prompt_value(
+                item, scene, context, allowed_text=allowed_text)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            sanitize_scene_prompt_value(
+                item, scene, context, allowed_text=allowed_text)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            sanitize_scene_prompt_value(
+                item, scene, context, allowed_text=allowed_text)
+            for item in value
+        )
+    if not isinstance(value, str):
+        return value
+    text = _text(value)
+    unauthorized = _unauthorized_modern_scene_tokens(
+        text, scene, context, allowed_text)
+    if not unauthorized:
+        return text
+
+    # Keep the real target of a gaze sentence while deleting the stale
+    # foreground object it was said to pass through.
+    cleaned = text
+    for token in sorted(unauthorized, key=len, reverse=True):
+        cleaned = re.sub(
+            rf"(?:越过|透过)(?:半垂)?{re.escape(token)}"
+            r"(?=(?:看|望向|注视|望着))",
+            "", cleaned)
+
+    kept_clauses = []
+    for clause in re.split(r"[。！？!?；;\n]+", cleaned):
+        kept_parts = []
+        for part in re.split(r"[，,]+", clause):
+            part = _text(part)
+            if not part:
+                continue
+            if _unauthorized_modern_scene_tokens(
+                    part, scene, context, allowed_text):
+                continue
+            kept_parts.append(part)
+        if kept_parts:
+            kept_clauses.append("，".join(kept_parts))
+    return "；".join(kept_clauses)
+
+
+def scene_prompt_contaminants(value, scene, context=None, *,
+                              allowed_text=""):
+    """Public deterministic guard used after an LLM prompt review."""
+    return _unauthorized_modern_scene_tokens(
+        value, scene, context, allowed_text)
 
 
 def _text_list(value):
@@ -4303,6 +4433,8 @@ def build_shot_prompt_contract(
         target_location
         if output_media == "image" and not joint_frames and target_location
         else authoritative_scene)
+    provider_allowed_text = _scene_prompt_allowed_text(
+        shot, shot.get("scene_layout"))
     scene_style = _style_for_scene(
         style or shot.get("style"), scene, source_shot)
     characters, character_scope_issues, character_scope_declared, character_source = (
@@ -4322,8 +4454,10 @@ def build_shot_prompt_contract(
         target["functional_figures"] = [
             dict(item) if isinstance(item, dict) else item
             for item in functional_source]
-    target["state"] = _strip_modern_ancient_exclusions(
-        target.get("state"), scene, source_shot)
+    target["state"] = sanitize_scene_prompt_value(
+        _strip_modern_ancient_exclusions(
+            target.get("state"), scene, source_shot),
+        scene, source_shot, allowed_text=provider_allowed_text)
     # Never fall back to the raw storyboard prompt here. It may contain the
     # whole episode bible and unrelated scenes, which makes the provider blend
     # facts from other shots into this image.
@@ -4338,7 +4472,10 @@ def build_shot_prompt_contract(
     else:
         action_source = shot.get("description") or shot.get("action")
     action = _text(
-        _strip_modern_ancient_exclusions(action_source, scene, source_shot),
+        sanitize_scene_prompt_value(
+            _strip_modern_ancient_exclusions(
+                action_source, scene, source_shot),
+            scene, source_shot, allowed_text=provider_allowed_text),
         "环境保持稳定，只执行自然微动")
     target_phase = (
         target.get("phase")
@@ -4563,7 +4700,10 @@ def build_shot_prompt_contract(
             **shot, "functional_figures": functional_figures,
         }))
     composition["expected_visible_figure_count"] = visible_count
-    medium = _normalize_visual_medium(shot, style)
+    # Medium detection needs the scene-valid aesthetic, not the raw project
+    # style package; otherwise the audit contract itself keeps forbidden set
+    # nouns that a downstream reviewer may accidentally quote back.
+    medium = _normalize_visual_medium(shot, scene_style)
     identity_facts_required = bool(
         shot.get("identity_facts_required")
         or isinstance(shot.get("character_facts"), dict)
@@ -4587,6 +4727,33 @@ def build_shot_prompt_contract(
     compiled_style_direction = _style_direction_for_media(
         shot.get("style_direction"), media=output_media,
         camera=compiled_camera, partial_parts=partial_body_parts)
+    compiled_style_direction = sanitize_scene_prompt_value(
+        compiled_style_direction, scene, source_shot,
+        allowed_text=provider_allowed_text)
+    compiled_start = sanitize_scene_prompt_value(
+        (_registered_partial_state_value(
+            shot, "start_state", partial_body_parts)
+         if partial_body_parts else
+         _registered_state_value(shot, "start_state"))
+        or "保持首帧状态",
+        scene, source_shot, allowed_text=provider_allowed_text)
+    compiled_end = sanitize_scene_prompt_value(
+        (_registered_partial_state_value(
+            shot, "end_state", partial_body_parts)
+         if partial_body_parts else
+         _registered_state_value(shot, "end_state"))
+        or "到达尾帧状态",
+        scene, source_shot, allowed_text=provider_allowed_text)
+    compiled_prop_registry = []
+    for value in shot.get("prop_registry") or []:
+        if not isinstance(value, dict):
+            continue
+        item = dict(value)
+        if item.get("scale_reference"):
+            item["scale_reference"] = sanitize_scene_prompt_value(
+                item.get("scale_reference"), scene, source_shot,
+                allowed_text=provider_allowed_text)
+        compiled_prop_registry.append(item)
     contract = {
         "schema": PROMPT_CONTRACT_SCHEMA,
         # ``mode=shot`` is a legacy discriminator. Media/output semantics live
@@ -4682,12 +4849,7 @@ def build_shot_prompt_contract(
         "style_direction": compiled_style_direction,
         "visual_medium": medium["dimension"],
         "medium": medium,
-        "start": (
-            _registered_partial_state_value(
-                shot, "start_state", partial_body_parts)
-            if partial_body_parts else
-            _registered_state_value(shot, "start_state")
-        ) or "保持首帧状态",
+        "start": compiled_start,
         "start_appearance": _appearance_map(shot.get("start_state")),
         "freeze_appearance": _appearance_map(shot.get("freeze_state")),
         "character_conditions": character_conditions,
@@ -4743,10 +4905,7 @@ def build_shot_prompt_contract(
             "在任何景别都必须正确,不在免验之列"),
         "physical": physical,
         "spatial_relations": list(physical.get("spatial_relations") or []),
-        "prop_registry": [
-            dict(value) for value in (shot.get("prop_registry") or [])
-            if isinstance(value, dict)
-        ],
+        "prop_registry": compiled_prop_registry,
         "frame_props": visible_frame_props,
         "frame_props_audit": frame_props,
         "prop_transitions": prop_transitions,
@@ -4759,12 +4918,7 @@ def build_shot_prompt_contract(
             *frame_prop_issues,
             *(prop_transition_issues if timeline_contract else []),
         ],
-        "end": (
-            _registered_partial_state_value(
-                shot, "end_state", partial_body_parts)
-            if partial_body_parts else
-            _registered_state_value(shot, "end_state")
-        ) or "到达尾帧状态",
+        "end": compiled_end,
         "end_appearance": _appearance_map(shot.get("end_state")),
         "appearance_state_required": bool(
             shot.get("appearance_state_required")),

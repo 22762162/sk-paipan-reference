@@ -1658,6 +1658,89 @@ def test_changed_frame_location_drops_unscoped_whole_scene_layout():
     assert "床头框" in video_prompt
 
 
+def test_modern_provider_contract_removes_unapproved_legacy_set_objects():
+    """Locked modern set wins over stale style/action/prop comparisons."""
+    shot = {
+        "characters": ["虞寻歌"],
+        "location": "虞家别墅·现代卧室",
+        "active_realm_id": "modern",
+        "era_context": "2078年现代现实世界",
+        "description": (
+            "虞寻歌坐在现代沙发上，左缘可有半垂纱幕作为虚化前景；"
+            "她的视线越过纱幕看向手机"),
+        "frame_targets": {"keyframe": {
+            "phase": "freeze",
+            "state": "虞寻歌坐在沙发上，左手持亮屏手机",
+            "fallback": False,
+        }},
+        "prop_registry": [{
+            "prop_id": "phone", "name": "深蓝手机",
+            "scale_reference": (
+                "长度略短于她从掌根到中指尖的距离，"
+                "单手可完整托住，厚度明显小于书案上的线装册"),
+        }],
+        "frame_props": [{
+            "prop_id": "phone", "name": "深蓝手机",
+            "phase": "freeze", "physical_state": "亮屏",
+            "holder": "虞寻歌", "location": "左手", "support": "左手",
+            "visibility": "visible", "representation": "physical",
+        }],
+        "style_direction": {
+            "visual_effects": ["沉香烟雾形成柔和丁达尔光", "窗外冷光"],
+        },
+    }
+    style = (
+        "镏金柔雾、超写实真人；暖金古室中以书案、香炉和纱幕构图；"
+        "沉香烟雾与细碎光尘在人物之间形成丁达尔光；"
+        "现代电影级真实材质")
+
+    contract, prompt = compile_shot_prompt(
+        shot, location=shot["location"], style=style, mode="image")
+
+    for forbidden in ("书案", "线装册", "香炉", "纱幕", "沉香烟雾", "古室"):
+        assert forbidden not in prompt
+        assert forbidden not in str(contract)
+    assert "长度略短于她从掌根到中指尖的距离" in prompt
+    assert "单手可完整托住" in prompt
+    assert "视线看向手机" in contract["action"]
+    assert "窗外冷光" in str(contract["style_direction"])
+
+
+def test_scene_sanitation_preserves_ancient_and_locked_antique_props():
+    ancient = {
+        "characters": ["甲"],
+        "description": "甲站在明代宫殿书案前，旁边有铜香炉",
+        "frame_targets": {"keyframe": {
+            "phase": "freeze", "state": "甲站在书案前", "fallback": False,
+        }},
+    }
+    _, ancient_prompt = compile_shot_prompt(
+        ancient, location="明代宫殿内景", mode="image")
+    assert "明代宫殿" in ancient_prompt
+    assert "书案" in ancient_prompt
+
+    modern_antique = {
+        "characters": ["甲"],
+        "location": "现代古董商店",
+        "active_realm_id": "modern",
+        "description": "甲查看柜台上的铜香炉",
+        "scene_layout": "【场景陈设定位】铜香炉固定在玻璃展柜中层",
+        "frame_targets": {"keyframe": {
+            "phase": "freeze", "state": "甲查看铜香炉", "fallback": False,
+        }},
+        "prop_registry": [{"prop_id": "incense", "name": "铜香炉"}],
+        "frame_props": [{
+            "prop_id": "incense", "name": "铜香炉", "phase": "freeze",
+            "physical_state": "完整静置", "holder": "none", "location": "展柜中层",
+            "support": "展柜层板", "visibility": "visible",
+            "representation": "physical",
+        }],
+    }
+    _, antique_prompt = compile_shot_prompt(
+        modern_antique, location=modern_antique["location"], mode="image")
+    assert "铜香炉" in antique_prompt
+
+
 def test_static_frame_rejects_character_outside_whole_take_cast():
     shot = {
         "characters": ["虞寻歌"],

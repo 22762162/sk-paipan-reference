@@ -15,6 +15,8 @@ from pathlib import Path
 
 from .. import knowledge_apply
 from ..errors import ProduceCancelled, ProviderError, ProviderUnavailable
+from ..prompt_contract import (sanitize_scene_prompt_value,
+                               scene_prompt_contaminants)
 from .api_providers import (ArkVideoProvider, ClaudeApiProvider,
                             DoubaoTtsProvider, OpenAIChatProvider,
                             OpenAIImageProvider, SeedreamImageProvider)
@@ -444,6 +446,46 @@ class ProviderRouter:
                 if value not in (None, "", [], {}) and key not in context:
                     context[key] = value
             return context
+        if payload.get("prompt_contract_complete"):
+            # The compact prompt is the executable projection.  Raw action,
+            # start/end state, shot_contract and character biography remain
+            # useful audit data, but an LLM reviewer must not see them: old
+            # episode fields once reintroduced a half-hung gauze curtain into
+            # a compact contract that had correctly removed it.  Pass only
+            # provider-visible, already-sanitized contract fields.
+            contract = payload.get("prompt_contract") or {}
+            contract = contract if isinstance(contract, dict) else {}
+            executable_contract = {
+                key: contract.get(key)
+                for key in (
+                    "schema", "output", "frame_target", "subject",
+                    "population", "scene", "scene_layout", "style",
+                    "style_direction", "start", "action", "performance",
+                    "camera", "lighting", "spatial_staging", "end",
+                    "physical", "frame_props", "readable_text_current",
+                    "text_rule", "reference_roles",
+                )
+                if contract.get(key) not in (None, "", [], {})
+            }
+            return {
+                "capability": capability,
+                "shot_no": payload.get("shot_no"),
+                "frame_kind": payload.get("frame_kind"),
+                "characters": list(payload.get("characters") or []),
+                "character_count": payload.get("character_count"),
+                "functional_figures": payload.get(
+                    "functional_figures") or [],
+                "visible_figure_count": payload.get(
+                    "visible_figure_count"),
+                "location": contract.get("scene")
+                or payload.get("location"),
+                "era_context": payload.get("era_context"),
+                "sanctioned_anachronisms": payload.get(
+                    "sanctioned_anachronisms") or [],
+                "prompt_contract": executable_contract,
+                "reference_manifest": payload.get(
+                    "reference_manifest") or [],
+            }
         keys = (
             "title", "episode", "tagline",
             "art_name", "role", "shot_no", "scene_no", "frame_kind",
@@ -495,6 +537,29 @@ class ProviderRouter:
                     "prompt_conflict_resolution") or {},
             }
         return context
+
+    @staticmethod
+    def _scene_execution_allowed_text(payload):
+        """Locked scene inventory and current props that may name exceptions."""
+        values = [str(payload.get("scene_layout") or "")]
+        values.extend(
+            str(value or "")
+            for value in payload.get("sanctioned_anachronisms") or [])
+        used_ids = {
+            str(item.get("prop_id") or "").strip()
+            for item in payload.get("frame_props") or []
+            if isinstance(item, dict) and item.get("prop_id")
+        }
+        values.extend(
+            str(item.get("name") or "")
+            for item in payload.get("frame_props") or []
+            if isinstance(item, dict))
+        values.extend(
+            str(item.get("name") or "")
+            for item in payload.get("prop_registry") or []
+            if isinstance(item, dict)
+            and str(item.get("prop_id") or "").strip() in used_ids)
+        return " ".join(value for value in values if value.strip())
 
     def _build_review_payload(self, source, context, payload):
         """审核请求 = 提示词 + 事实上下文 + 必留词 + 统一裁决条款。
@@ -665,6 +730,18 @@ class ProviderRouter:
         source = self._prompt_with_feedback(
             payload.get("prompt_compact") or payload.get("prompt") or "",
             payload.get("feedback"))
+        scene_allowed_text = self._scene_execution_allowed_text(payload)
+        if payload.get("prompt_contract_complete"):
+            source = sanitize_scene_prompt_value(
+                source, payload.get("location") or "", payload,
+                allowed_text=scene_allowed_text)
+            # All later branches, including director-autonomy and mock-only
+            # execution, must dispatch this clean projection.  Previously the
+            # sanitized local variable was only used by Codex review while
+            # the early-return autonomy path left the polluted payload intact.
+            payload["prompt"] = source
+            if "prompt_compact" in payload:
+                payload["prompt_compact"] = source
         if not source:
             # 兼容仅测试Provider路由/额度的历史低层调用；正式AIFOS任务在
             # dispatch contract处仍会因“最终提示词为空”失败关闭。
@@ -774,6 +851,16 @@ class ProviderRouter:
             raise ProviderError("Codex提示词审核通过但优化稿为空")
         if "```" in optimized:
             raise ProviderError("Codex优化稿含Markdown代码围栏，拒绝生图")
+        scene_guard_tokens = []
+        if payload.get("prompt_contract_complete"):
+            scene_guard_tokens = scene_prompt_contaminants(
+                optimized, payload.get("location") or "", payload,
+                allowed_text=scene_allowed_text)
+        if scene_guard_tokens:
+            # Prompt review is advisory, never an authority to invent a new
+            # physical set.  Fall back to the deterministic clean contract
+            # instead of blocking production or sending the invented objects.
+            optimized = source
         execution_conflicts = self._reviewed_prompt_execution_conflicts(
             optimized)
         if execution_conflicts:
@@ -824,7 +911,9 @@ class ProviderRouter:
         audit_record = {
             "schema": self.PROMPT_REVIEW_SCHEMA,
             "approved": True,
-            "status": "approved",
+            "status": (
+                "approved_scene_guard_fallback"
+                if scene_guard_tokens else "approved"),
             "provider": result.provider,
             "model": result.model or "Codex 提示词审核优化",
             "input_hash": input_hash,
@@ -834,6 +923,11 @@ class ProviderRouter:
             "issues_found": list(data.get("issues_found") or []),
             "changes_made": list(dict.fromkeys([
                 *(data.get("changes_made") or []),
+                *([(
+                    "审核稿越权新增未在场景母图/3D清单中的物件，"
+                    "已自动回退AIFOS干净执行合同:"
+                    + "、".join(scene_guard_tokens))]
+                  if scene_guard_tokens else []),
                 *(["移除已作废旧合同的审计元话术"]
                   if "被作废的旧条款" in str(
                       data.get("optimized_prompt") or "")

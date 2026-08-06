@@ -18383,7 +18383,14 @@ class Director:
         if rules:
             blocks.append(marker + "\n" + "\n".join(
                 f"{index}. {rule}" for index, rule in enumerate(rules, 1)))
-        effective = [
+        # A complete shot contract is already the current-shot projection of
+        # the layered rule stack.  Appending the raw stack again used to feed
+        # story-wide writing rules and ``world.forbidden_drift`` object lists
+        # to the image model (for example "禁止宫殿/古装/法袍").  Negative
+        # lists prime those objects and are not visible-frame facts.  Keep the
+        # full resolved stack in payload metadata for audit, never in the
+        # provider prompt once a complete executable contract exists.
+        effective = [] if payload.get("prompt_contract_complete") else [
             str(rule).strip()
             for rule in payload.get("effective_rule_lines") or []
             if str(rule).strip()
@@ -19286,8 +19293,32 @@ class Director:
                     f"镜头{shot['shot_no']}生成前合同有问题，"
                     f"已交AI导演就地修正一次，首轮仍固定四抽；"
                     f"不停止其他镜头：{reason[:500]}")
-            prior_group = stored_prior.get("candidate_group") or {}
-            live_group = stored_prior.get("candidate_progress") or {}
+            current_content_hash = self._shot_content_hash(shot, payload)
+            stored_content_hash = str(
+                stored_prior.get("content_hash") or "").strip()
+            candidate_contract_current = bool(
+                stored_content_hash
+                and stored_content_hash == current_content_hash)
+            # ``prior_plan`` is intentionally captured before seeding so its
+            # QC/Codex repair evidence survives a storyboard refresh.  That
+            # does *not* authorize its candidate pixels or frozen generation
+            # payload to cross a semantic content-hash boundary.  Otherwise a
+            # progress-only interrupted group can resurrect the exact stale
+            # prompt that _plan_seed_shots just invalidated.
+            if (not candidate_contract_current
+                    and (stored_prior.get("candidate_group")
+                         or stored_prior.get("candidate_progress"))):
+                self.log.info(
+                    "director",
+                    f"镜头{shot['shot_no']} 候选合同哈希已变，"
+                    "旧候选图与冻结提示词仅保留历史，"
+                    "本轮重新四抽")
+            prior_group = (
+                stored_prior.get("candidate_group") or {}
+                if candidate_contract_current else {})
+            live_group = (
+                stored_prior.get("candidate_progress") or {}
+                if candidate_contract_current else {})
             resumable_live_group = bool(
                 isinstance(live_group, dict)
                 and live_group.get("schema")
@@ -19420,6 +19451,7 @@ class Director:
             # 没有任何现成文件的镜头才继续创建一次生成任务。
             if (continuity_reuse_ok
                     and self._director_autonomy_enabled()
+                    and candidate_contract_current
                     and not unresolved_prior_failure):
                 # render_plan 会在分镜版本变化时重建，资产登记则只发生在
                 # QC 放行之后；两处都可能暂时看不到已真实写盘的冻结稿。

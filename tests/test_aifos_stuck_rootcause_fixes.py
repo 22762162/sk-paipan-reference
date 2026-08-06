@@ -226,6 +226,27 @@ def test_scene_style_uses_authoritative_era_for_ambiguous_locations():
     assert ancient == ancient_style
 
 
+def test_complete_shot_contract_keeps_rule_stack_audit_out_of_provider_prompt(
+        app):
+    payload = {
+        "prompt": "【镜头合同v2.2】现代卧室内严格共1人",
+        "prompt_compact": "【镜头合同v2.2】现代卧室内严格共1人",
+        "prompt_contract_complete": True,
+        "effective_rule_lines": [
+            "world.forbidden_drift=[\"不得出现宫殿\",\"不得出现古装\"]",
+            "story.high_value_events_must_expand=高价值事件必须展开",
+        ],
+    }
+
+    app.director._append_generation_rules(
+        payload, ["人物、镜头与道具的物理关系必须成立"])
+
+    assert "物理关系必须成立" in payload["prompt_compact"]
+    for forbidden in ("world.forbidden_drift", "宫殿", "古装", "高价值事件"):
+        assert forbidden not in payload["prompt_compact"]
+    # Governance remains complete and auditable outside the provider string.
+    assert len(payload["effective_rule_lines"]) == 2
+
 def test_inherently_modern_location_filters_ancient_furnishings_without_label():
     style = "写实3D；古室中以书案、香炉和纱幕构图"
     for location in ("直播间·夜", "高档套房·夜", "私人病房", "城市摄影棚"):

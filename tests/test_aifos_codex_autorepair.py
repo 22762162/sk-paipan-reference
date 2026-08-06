@@ -519,6 +519,82 @@ def test_stage_images_seeds_stored_codex_repair_directly_into_three_draws(
     assert payload["feedback"] == ""
 
 
+def test_stage_images_never_resumes_candidates_across_content_hash_change(
+        app, monkeypatch):
+    project, _ = app.projects.get_or_create_project("候选哈希失效")
+    episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+    out_root = app.workspace.artifacts_dir / f"p{project['id']:03d}" / "e001"
+    out_root.mkdir(parents=True, exist_ok=True)
+    shot = {"shot_no": 1, "scene_no": 1, "characters": [],
+            "description": "现代卧室干净新合同"}
+    ctx = {
+        "project": dict(project), "episode": dict(episode),
+        "out_root": out_root,
+        "script": {"scenes": [{"scene_no": 1, "location": "现代卧室"}]},
+        "storyboard": {"shots": [shot]},
+    }
+    stale_progress = {
+        "schema": "aifos.shot-candidate-progress/v1",
+        "candidate_set_id": "old-set",
+        "candidate_set_token": "old-token",
+        "frozen_prompt_hash": "old-prompt",
+        "frozen_reference_hash": "old-refs",
+        "frozen_input_hash": "old-input",
+        "candidates": [{"index": 1, "uri": "/tmp/old.png"}],
+        "resume_state": {
+            "schema": "aifos.shot-candidate-resume/v1",
+            "resume_payload": {
+                "prompt": "旧提示词含半垂纱幕",
+                "prompt_compact": "旧提示词含半垂纱幕",
+            },
+        },
+    }
+    app.director._plan_write(ctx, {"items": [{
+        "id": "shot:1", "category": "shot_image", "status": "technical_incomplete",
+        "content_hash": "stale-content-hash",
+        "candidate_progress": stale_progress,
+    }]})
+
+    monkeypatch.setattr(app.director, "_plan_seed_shots", lambda _ctx: None)
+    monkeypatch.setattr(app.director, "_distill_lessons", lambda _ctx: 0)
+    monkeypatch.setattr(
+        app.director, "reconcile_completed_shot_images",
+        lambda _ctx: {"awaiting_human_shots": [], "recovered": 0})
+    monkeypatch.setattr("aifos.director.write_relations",
+                        lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(app.director, "_generation_preflight_issues",
+                        lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(app.director, "_shot_payload", lambda _ctx, _shot: {
+        "shot_no": 1,
+        "prompt": "现代卧室干净新合同",
+        "prompt_compact": "现代卧室干净新合同",
+        "prompt_contract": {"scene": "现代卧室", "action": "保持干净布局"},
+        "characters": [], "character_count": 0,
+        "quality_decision": {
+            "level": "medium", "recommended": "medium",
+            "source": "test", "rule": "", "reasons": [],
+        },
+    })
+    monkeypatch.setattr(app.director, "_shot_qc_spec",
+                        lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(app.director, "_director_autonomy_enabled",
+                        lambda: False)
+    captured = {}
+
+    def run(_ctx, tasks, **_kwargs):
+        captured["payload"] = tasks[0]["payload"]
+        return {}, []
+
+    monkeypatch.setattr(app.director, "_run_parallel", run)
+
+    app.director._stage_images(ctx)
+
+    payload = captured["payload"]
+    assert "_resume_candidate_group" not in payload
+    assert "_candidate_generation_round" not in payload
+    assert "纱幕" not in payload["prompt_compact"]
+
+
 def test_codex_numbered_remove_changes_actual_prop_reference_but_not_identity(
         app, tmp_path):
     identity = tmp_path / "identity.png"
