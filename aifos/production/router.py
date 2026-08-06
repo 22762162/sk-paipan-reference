@@ -983,6 +983,17 @@ class ProviderRouter:
                 reason = "本集题材已被该产线安全策略整体拒收"
                 fallbacks.append({"provider": name, "reason": reason})
                 continue
+            if (capability == "video"
+                    and payload.get("canonical_scene_reference_required")
+                    and payload.get("last")
+                    and isinstance(provider, ArkVideoProvider)):
+                reason = (
+                    "Ark 首尾帧模式无法同时提交统一场景母图，"
+                    "禁止无场景锚回退成片")
+                self.log.info(
+                    "router", f"{name} {reason},回退({capability})")
+                fallbacks.append({"provider": name, "reason": reason})
+                continue
             if (name, capability) in self._capability_blocked:
                 reason = "本服务进程已确认该产线缺少此生成能力"
                 fallbacks.append({"provider": name, "reason": reason})

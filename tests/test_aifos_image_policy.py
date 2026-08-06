@@ -61,6 +61,36 @@ def test_shot_payload_separates_batch_from_complex_text(tmp_path):
         app.close()
 
 
+def test_shot_payload_review_style_is_scene_era_safe(tmp_path):
+    app = App(tmp_path / "ws")
+    try:
+        raw_style = (
+            "鎏金柔雾、电影级半写实3D；"
+            "暖金古室中以书案、卷册、香炉和半垂纱幕构图")
+        project, _ = app.projects.get_or_create_project(
+            "镜头时代隔离", style=raw_style)
+        episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+        ctx = {
+            "project": dict(project), "episode": dict(episode),
+            "script": {"scenes": [{
+                "scene_no": 1, "location": "2078年现代豪宅卧室"}]},
+            "storyboard": {"shots": []}, "blocking": {},
+            "aspect": "9:16", "dims": {"width": 1080, "height": 1920},
+        }
+        shot = _shot()
+        shot["characters"] = []
+        payload = app.director._shot_payload(ctx, shot)
+
+        assert "鎏金柔雾" in payload["style"]
+        assert "电影级半写实3D" in payload["style"]
+        for forbidden in ("古室", "书案", "卷册", "香炉", "纱幕"):
+            assert forbidden not in payload["style"]
+            assert forbidden not in json.dumps(
+                payload["physical_contract"], ensure_ascii=False)
+    finally:
+        app.close()
+
+
 def test_shot_payload_flattens_phase_text_for_each_static_frame(tmp_path):
     app = App(tmp_path / "ws")
     try:

@@ -346,6 +346,120 @@ def test_prepare_video_rejects_claimed_change_when_signature_is_identical(
         app.close()
 
 
+def test_finish_video_rejects_provider_that_dropped_canonical_scene(tmp_path):
+    app = App(tmp_path / "ws")
+    try:
+        ctx = _ctx(app, tmp_path / "artifacts")
+        app.router.providers["jimeng"] = type("ProviderStub", (), {
+            "conf": {"type": "dreamina", "audio_in_video": True},
+        })()
+        task = {
+            "shot": {"shot_no": 1, "duration": 2.5},
+            "quality": {
+                "level": "medium", "resolution": "720p", "source": "auto"},
+            "reference_assets": [], "reference_manifest": [],
+            "payload": {
+                "canonical_scene_reference_required": True,
+                "canonical_scene_reference_uri": "/tmp/room-master.png",
+            },
+        }
+        result = ProviderResult(
+            provider="jimeng", model="seedance2", cost=0.0,
+            uri=str(ctx["out_root"] / "bad.mp4"),
+            data={"reference_images_used": []})
+
+        with pytest.raises(AifosError, match="没有实际使用统一场景母图"):
+            app.director._finish_video_call(ctx, task, result)
+        assert app.assets.latest(
+            ctx["project"]["id"], "video", "e001_shot001") is None
+    finally:
+        app.close()
+
+
+def test_finish_video_accepts_technical_fallback_inheriting_frozen_frames(
+        tmp_path):
+    """技术兜底不直传参考图，但其画面已由冻结首尾帧继承场景。"""
+    app = App(tmp_path / "ws")
+    try:
+        ctx = _ctx(app, tmp_path / "artifacts")
+        video = ctx["out_root"] / "fallback.mp4"
+        video.write_bytes(b"technical-video")
+        task = {
+            "shot": {"shot_no": 1, "duration": 2.5},
+            "quality": {
+                "level": "medium", "resolution": "720p", "source": "auto"},
+            "reference_assets": [], "reference_manifest": [],
+            "payload": {
+                "shot_no": 1, "duration": 2.5,
+                "first": ctx["frames"][0]["first"],
+                "last": ctx["frames"][0]["last"],
+                "canonical_scene_reference_required": True,
+                "canonical_scene_reference_uri": "/tmp/room-master.png",
+                "video_quality": "medium", "video_resolution": "720p",
+            },
+        }
+        result = ProviderResult(
+            provider="technical_frame_fallback", model="ffmpeg-xfade",
+            cost=0.0, uri=str(video), data={
+                "technical_frame_fallback": True,
+                "reference_images_used": [], "audio_in_video": True,
+            })
+
+        saved = app.director._finish_video_call(ctx, task, result)
+
+        assert saved["provider"] == "technical_frame_fallback"
+        assert result.data["canonical_scene_reference_enforced"] == (
+            "inherited_from_frozen_first_last_frames")
+        assert app.assets.latest(
+            ctx["project"]["id"], "video", "e001_shot001") is not None
+    finally:
+        app.close()
+
+
+def test_checkpoint_refreshes_missing_canonical_scene_without_manual_version(
+        tmp_path):
+    """旧快照即使选择版本未变，也要补入当前统一场景母图。"""
+    app = App(tmp_path / "ws")
+    try:
+        ctx = _ctx(app, tmp_path / "artifacts")
+        scene = app.assets.latest(
+            ctx["project"]["id"], "scene_art", "测试室内")
+        legacy = {
+            "schema": "aifos.preflight-checkpoint/v1",
+            "document_versions": {},
+            "video_reference_asset_ids": {"1": []},
+        }
+
+        refreshed, version = app.director._refresh_checkpoint_video_references(
+            ctx, legacy, 0)
+
+        assert version == 1
+        assert refreshed["source"] == "canonical_scene_reference_refresh"
+        assert scene["id"] in refreshed["video_reference_asset_ids"]["1"]
+    finally:
+        app.close()
+
+
+def test_video_scene_anchor_prefers_one_shared_wide_master(tmp_path):
+    app = App(tmp_path / "ws")
+    try:
+        ctx = _ctx(app, tmp_path / "artifacts")
+        wide = tmp_path / "wide-room.png"
+        wide.write_bytes(b"\x89PNG\r\n\x1a\n" + b"1" * 16)
+        panorama = app.assets.register(
+            ctx["project"]["id"], "scene_art",
+            "测试室内::view:panorama", uri=str(wide),
+            meta={"image_quality": "high", "base_location": "测试室内",
+                  "equirectangular_validated": False})
+
+        selected = app.director._required_video_scene_reference(
+            ctx, ctx["storyboard"]["shots"][0])
+
+        assert selected["id"] == panorama["id"]
+    finally:
+        app.close()
+
+
 def test_video_qc_accepts_shared_generation_diagnostics_contract(tmp_path):
     app = App(tmp_path / "ws")
     try:

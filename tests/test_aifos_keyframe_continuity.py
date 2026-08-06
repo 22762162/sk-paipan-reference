@@ -38,6 +38,35 @@ def test_continuity_plan_keeps_reverse_angles_in_one_chain():
         1: None, 2: 1, 3: None, 4: None}
 
 
+def test_continuity_plan_crosses_scene_numbers_in_same_physical_set():
+    plan = build_keyframe_continuity_plan([
+        {"shot_no": 5, "scene_no": 1,
+         "era_context": "现代卧室，能力印记尚未出现"},
+        {"shot_no": 6, "scene_no": 2,
+         "era_context": "现代卧室，能力印记已经形成"},
+        {"shot_no": 12, "scene_no": 2},
+        {"shot_no": 13, "scene_no": 3},
+    ], {
+        1: "虞家别墅·虞寻欢卧室",
+        2: "虞家别墅·虞寻欢卧室",
+        3: "虞家别墅·虞寻欢卧室",
+    })
+
+    assert [group["shot_nos"] for group in plan["groups"]] == [
+        [5, 6, 12, 13]]
+    assert plan["predecessor_by_shot"] == {
+        5: None, 6: 5, 12: 6, 13: 12}
+
+
+def test_continuity_plan_explicit_break_still_wins_in_same_set():
+    plan = build_keyframe_continuity_plan([
+        {"shot_no": 1, "scene_no": 1},
+        {"shot_no": 2, "scene_no": 2, "time_jump": True},
+    ], {1: "同一卧室", 2: "同一卧室"})
+
+    assert [group["shot_nos"] for group in plan["groups"]] == [[1], [2]]
+
+
 def _stage_fixture(tmp_path, monkeypatch, *, fail_shot=0):
     app = App(tmp_path / "ws")
     project, _ = app.projects.get_or_create_project("关键帧依赖波次")

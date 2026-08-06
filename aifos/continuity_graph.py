@@ -43,13 +43,21 @@ def _continuity_key(shot, scene_locations):
     realm = _text(
         shot.get("active_realm_id") or shot.get("realm_id")
         or shot.get("world_id"))
+    # ``era_context`` is commonly a full per-shot world-rule sentence and may
+    # legitimately vary on every beat ("印记尚未出现" → "印记已形成").
+    # It is not a continuity identifier.  Only stable authored ids/periods or
+    # an explicit era_transition flag may split a physical frame chain.
     era = _text(
-        shot.get("era_context") or shot.get("era")
-        or shot.get("time_period"))
-    # A normal hard cut/reverse angle is still the same world state.  Only an
-    # explicit continuity group or a change in place/realm/era creates a new
-    # dependency chain.
-    return (explicit or f"scene:{scene_no}", location, realm, era)
+        shot.get("active_era_id") or shot.get("era_id")
+        or shot.get("era") or shot.get("time_period"))
+    # ``scene_no`` is an editorial subdivision, not a physical reset.  One
+    # continuous performance is often split into several scene numbers while
+    # remaining in the same room (for example action → dialogue → reaction).
+    # Key the default chain by the canonical physical location so those cuts
+    # still inherit the exact preceding frame.  Explicit groups and authored
+    # realm/era transitions retain authority.
+    default_group = f"location:{location}" if location else f"scene:{scene_no}"
+    return (explicit or default_group, location, realm, era)
 
 
 def build_keyframe_continuity_plan(shots, scene_locations=None):
@@ -115,4 +123,3 @@ def build_keyframe_continuity_plan(shots, scene_locations=None):
         "predecessor_by_shot": predecessor_by_shot,
         "group_by_shot": group_by_shot,
     }
-

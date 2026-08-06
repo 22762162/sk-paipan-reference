@@ -201,6 +201,31 @@ def test_historical_best_effort_is_allowed_after_current_physical_pass(
     assert app.director._video_reference_rejection(row) == ""
 
 
+def test_contract_only_identity_warning_does_not_drop_visual_identity(
+        app, tmp_path):
+    """已通过画面选优的身份图不能因旧提示词冲突被视频链静默丢弃。"""
+    project, _ = app.projects.get_or_create_project("身份参考合同迁移")
+    image = tmp_path / "identity.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+    row = app.assets.register(
+        project["id"], "character_identity", "虞寻歌", uri=str(image),
+        meta={
+            "image_quality": "high", "selection_qc_passed": True,
+            "selection_qc": {
+                "production_ready": True,
+                "visual_pass": True,
+                "image_passed": True,
+                "hard_failure": False,
+                "reference_hard_failure": False,
+                "physical_logic_match": True,
+                "spatial_logic_match": True,
+                "critical_failures": ["旧项目风格与棚拍背景合同冲突"],
+            },
+        })
+
+    assert app.director._video_reference_rejection(row) == ""
+
+
 def test_auto_reference_skips_physical_failure_and_accepts_clean_new_version(
         app):
     """旧问题图仍可预览；同名干净新版本生成后自动恢复正式参考资格。"""
@@ -344,7 +369,7 @@ def test_previous_tail_beats_start_keyframe_for_continuous_scene(
 
     app.director._apply_keyframe_boundary_to_frame_result(payload, result)
 
-    assert result.data["first_source"] == "previous_tail"
+    assert result.data["first_source"] == "previous_shot_last_exact"
     assert first.read_bytes() == b"PREVIOUS-TAIL"
 
 

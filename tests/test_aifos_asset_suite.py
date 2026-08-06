@@ -86,6 +86,21 @@ def test_scene_prompt_preserves_full_location_name_with_separator(app):
     assert "时间与天气:驿馆内室（闪回，数日前夜）" in prompt
 
 
+def test_scene_prompt_filters_ancient_furnishings_only_for_modern_location(app):
+    style = (
+        "鎏金柔雾、电影级半写实3D；"
+        "暖金古室中以书案、卷册、香炉和半垂纱幕构图")
+    modern = app.director._scene_prompt(
+        "2078年现代豪宅卧室", style, scene={})
+    historical = app.director._scene_prompt(
+        "明代宫殿内景", style, scene={})
+
+    assert "鎏金柔雾" in modern and "电影级半写实3D" in modern
+    for forbidden in ("古室", "书案", "卷册", "香炉", "纱幕"):
+        assert forbidden not in modern
+        assert forbidden in historical
+
+
 def test_character_sheet_contract_is_single_subject(app):
     contract = app.director._character_sheet_composition_contract(
         "林川", "closeup")

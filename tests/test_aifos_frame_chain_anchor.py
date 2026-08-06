@@ -1,6 +1,6 @@
 """帧链锚点必须来自紧邻的上一镜，不能是几镜之前的旧尾帧。
 
-真实病理：`last_by_scene` 只在成功时写入、从不删除，而旧门禁只问
+真实病理：旧 `last_by_scene` 只在成功时写入、从不删除，而旧门禁只问
 「这一场有没有过尾帧」。镜3 失败后字典里还留着镜2 的尾帧，镜4 就把
 镜2 的尾帧当成自己的首帧，静默跳过镜3——合同声称「上一镜尾帧=本镜
 首帧」，实际接的是两镜之前的画面，且全程不报错。
@@ -18,10 +18,10 @@ class FrameChainAnchorTest(unittest.TestCase):
 
     def test_anchor_records_its_source_shot(self):
         """两个写入点都必须记下锚点属于哪一镜，否则无从判断是否紧邻。"""
-        # 两个写入点的下标写法不同(scene_no 与 task["scene"]),
+        # 两个写入点的下标写法不同(group_id 与 task["scene"]),
         # 嵌套方括号不能用 [^\]]+ 匹配。
         writes = re.findall(
-            r"last_by_scene\[.+?\]\s*=\s*\{(.{0,240}?)\}",
+            r"last_by_chain\[.+?\]\s*=\s*\{(.{0,240}?)\}",
             self.src, re.S)
         self.assertGreaterEqual(len(writes), 2,
                                 "复用与新生成两条路径都要写锚点")
@@ -44,6 +44,11 @@ class FrameChainAnchorTest(unittest.TestCase):
         window = self.src[idx:idx + 900]
         self.assertIn("不是紧邻的上一镜", window)
         self.assertIn("_plan_mark", window)
+
+    def test_generated_first_frame_is_exact_previous_tail(self):
+        """参考模型不够：连续段首帧必须物理复制上一镜尾帧。"""
+        self.assertIn("previous_shot_last_exact", self.src)
+        self.assertIn("shutil.copy2(chain_path, target_first)", self.src)
 
 
 if __name__ == "__main__":

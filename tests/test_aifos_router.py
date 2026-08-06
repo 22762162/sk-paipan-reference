@@ -70,6 +70,26 @@ def test_unexpected_provider_structure_exception_falls_back(make_app):
     assert "AttributeError" in result.fallbacks[0]["reason"]
 
 
+def test_ark_cannot_fallback_without_canonical_scene_anchor(make_app):
+    app = make_app({
+        "providers": {"ark": {
+            "enabled": True, "api_key": "test", "model": "seedance-test",
+        }},
+        "routing": {"video": ["ark", "mock"]},
+    })
+    result = app.router.call("video", {
+        "shot_no": 1, "duration": 1.0,
+        "first": "/tmp/first.png", "last": "/tmp/last.png",
+        "reference_images": ["/tmp/canonical-scene.png"],
+        "require_reference_images": True,
+        "canonical_scene_reference_required": True,
+    }, app.workspace.artifacts_dir)
+
+    assert result.provider == "mock"
+    assert result.fallbacks[0]["provider"] == "ark"
+    assert "统一场景母图" in result.fallbacks[0]["reason"]
+
+
 def test_enabled_cli_provider_is_used(make_app):
     app = make_app({"providers": {"codex": {
         "enabled": True, "command": OK_CLI, "quota": 10}}})

@@ -66,6 +66,7 @@ from .prompt_contract import (
     merge_frame_compacts,
     readable_text_required,
     shot_local_scene,
+    style_for_scene,
     synchronize_shot_execution_contract,
     validate_shot_prompt_contract,
 )
@@ -1837,12 +1838,15 @@ class Director:
         shot = next(
             s for s in ctx["storyboard"]["shots"]
             if int(s.get("shot_no", -1)) == shot_no)
+        location = self._shot_location(ctx.get("script"), shot)
+        effective_style = style_for_scene(
+            ctx["project"].get("style", "") or "", location, shot)
         result = self._call(ctx, "script", {
             "shot_repair": True,
             "project_title": ctx["project"]["title"],
-            "style": ctx["project"].get("style", "") or "",
+            "style": effective_style,
             "shot": shot,
-            "location": self._shot_location(ctx.get("script"), shot),
+            "location": location,
             "blocking_reason": str(blocking_reason)[:2000],
         }, "storyboard")
         data = result.data or {}
@@ -1858,8 +1862,8 @@ class Director:
         }
         synchronize_shot_execution_contract(
             shot,
-            location=self._shot_location(ctx.get("script"), shot),
-            style=ctx["project"].get("style", "") or "",
+            location=location,
+            style=effective_style,
         )
         storyboard_version = self.projects.save_document(
             ctx["episode"]["id"], "storyboard", ctx["storyboard"])
@@ -2857,6 +2861,7 @@ class Director:
         裁决条款(全局裁决第(a)级直接执行)。
         """
         scene = scene or {}
+        effective_style = style_for_scene(style, location, scene)
         production_design = (
             scene.get("production_design")
             if isinstance(scene.get("production_design"), dict) else {})
@@ -2883,7 +2888,7 @@ class Director:
             "composition": (
                 "环境建立镜头:前景/主体区/背景层次清楚,预留角色进出"
                 "与表演动线,机位高度与光线方向稳定,后续镜头可复用"),
-            "style": style,
+            "style": effective_style,
         }
 
     # 高复用场景(出现 ≥ 该值场次)生成多视角母版:主视角出图后,
@@ -3563,6 +3568,7 @@ class Director:
         for location, scene in scene_by_location.items():
             if location_reuse.get(location, 0) < self.SCENE_VIEW_MIN_REUSE:
                 continue
+            scene_style = style_for_scene(style, location, scene)
             # 已经做过 720° 扩展的场景优先拿全景当基准:它是整个空间的
             # 几何真相,比单张主视角更能锁住跨机位一致。
             panorama_row = (
@@ -3598,7 +3604,7 @@ class Director:
                     "label": f"{location} · {label}",
                     "name": asset_name,
                     "prompt": self._scene_view_prompt(
-                        location, style, scene, art_name, label, desc),
+                        location, scene_style, scene, art_name, label, desc),
                     **self._quality_meta(scene_quality[location]),
                 })
                 tasks.append({
@@ -3613,12 +3619,12 @@ class Director:
                         "shot_no": 0, "characters": [],
                         "location": location,
                         "prompt": self._scene_view_prompt(
-                            location, style, scene, art_name, label, desc),
-                        "style": style,
+                            location, scene_style, scene, art_name, label, desc),
+                        "style": scene_style,
                         "prompt_contract_complete": True,
                         "prompt_review_context":
                             self._scene_view_review_context(
-                                location, style, scene, label),
+                                location, scene_style, scene, label),
                         "scene_ref": main_uri,
                         "style_ref": self._style_anchor_uri(project_id),
                         "require_reference_images": True,
@@ -3665,6 +3671,7 @@ class Director:
         """场景概念图提示词:只建立可复用环境,不把人物画风误当场景内容。"""
         scene = scene or {}
         place = str(location or scene.get("location") or "未命名地点")
+        effective_style = style_for_scene(style, place, scene)
         time_state = (scene.get("time_of_day") or scene.get("time") or "")
         if "·" in place and not time_state:
             # “·”既可能分隔时间，也常属于完整场景名（如
@@ -3690,7 +3697,7 @@ class Director:
         negative = str(scene.get("negative_prompt") or "").strip()
         return ";".join(filter(None, (
             f"场景概念图/环境基准:{place.strip()}",
-            f"项目视觉媒介与材质:{self._scene_style_line(style)}",
+            f"项目视觉媒介与材质:{self._scene_style_line(effective_style)}",
             (f"AI制作圣经:{analysis_line}" if analysis_line else ""),
             f"空间功能与布局:{self._scene_environment_line(place)}",
             f"时间与天气:{time_state}",
@@ -3700,14 +3707,14 @@ class Director:
             # 场景母版就是全场光影的基准:这里定了调,后续镜头才有得继承。
             # 母版是空镜,只给环境布光,不给人物布光条款。
             *[line for line in lighting_lines(
-                style,
+                effective_style,
                 location=place,
                 time_of_day=time_state,
                 mood=str(scene.get("mood") or ""),
                 camera="全景",
                 scene_action=str(scene.get("action") or ""),
                 genre=" ".join(str(value) for value in (
-                    style, scene.get("genre"), premise) if value))
+                    effective_style, scene.get("genre"), premise) if value))
               if "负面" not in line[:8]],
             "空镜:画面中不出现人物、人体局部、剪影、倒影中的人或随机路人",
             "场景只保留与剧情有关的设备、道具和陈设；所有屏幕、纸张、招牌和包装"
@@ -12819,12 +12826,15 @@ class Director:
         压缩的表演写进 description,不是只改数字。走位同理:只有
         previz 时间维度判定的走位类问题(路径穿模/跨镜传送/交叉相撞)
         才授权改写 description 里的站位与行走路线。"""
+        location = self._shot_location(ctx.get("script"), shot)
+        effective_style = style_for_scene(
+            ctx["project"].get("style", "") or "", location, shot)
         result = self._call(ctx, "script", {
             "shot_repair": True,
             "project_title": ctx["project"]["title"],
-            "style": ctx["project"].get("style", "") or "",
+            "style": effective_style,
             "shot": shot,
-            "location": self._shot_location(ctx.get("script"), shot),
+            "location": location,
             "allow_duration_change": bool(allow_duration_change),
             "allow_staging_change": bool(allow_staging_change),
             "blocking_reason": (
@@ -12843,8 +12853,8 @@ class Director:
             shot["description"] = description
         synchronize_shot_execution_contract(
             shot,
-            location=self._shot_location(ctx.get("script"), shot),
-            style=ctx["project"].get("style", "") or "",
+            location=location,
+            style=effective_style,
         )
         summary = str(data.get("repair_summary") or "").strip()
         shot["shootability_repair"] = {
@@ -13444,7 +13454,18 @@ class Director:
             for issue in (node.get("critical_failures") or [])
             if str(issue).strip()
         ]
-        if critical:
+        selection_qc = (
+            meta.get("selection_qc")
+            if isinstance(meta.get("selection_qc"), dict) else {})
+        contract_only_production_ready = bool(
+            selection_qc.get("production_ready") is True
+            and selection_qc.get("visual_pass") is True
+            and selection_qc.get("image_passed") is True
+            and selection_qc.get("hard_failure") is False
+            and selection_qc.get("reference_hard_failure") is False
+            and selection_qc.get("physical_logic_match") is not False
+            and selection_qc.get("spatial_logic_match") is not False)
+        if critical and not contract_only_production_ready:
             return "资产仍有关键失败项，不能固化到视频参考: " + critical[0]
         return ""
 
@@ -15133,6 +15154,7 @@ class Director:
         # 会以 KeyError 崩掉整条 cast(2026-07-31 端到端测试首镜即中)。
         for location in locations:
             scene = scene_context_by_location[location]
+            scene_style = style_for_scene(style, location, scene)
             existing_scene = (
                 "" if ctx.get("fresh_assets")
                 else self._existing_asset_uri(
@@ -15176,13 +15198,13 @@ class Director:
                     # 环境事实——进入空镜合同会构成同级互斥,已移除;
                     # 环境线索经 production_design 与场景提示词传递。
                     "prompt": self._scene_prompt(
-                        location, style, scene,
+                        location, scene_style, scene,
                         premise=ctx["episode"].get("premise", "")),
-                    "style": style,
+                    "style": scene_style,
                     "prompt_contract_complete": True,
                     "prompt_review_context":
                         self._scene_art_review_context(
-                            location, style, scene),
+                            location, scene_style, scene),
                     **scene_references,
                     "style_ref": style_reference,
                     "require_reference_images": bool(
@@ -16875,6 +16897,13 @@ class Director:
         data = getattr(result, "data", None)
         if not isinstance(data, dict):
             return
+        chain_uri = str(payload.get("chain_first_uri") or "")
+        chain_path = Path(chain_uri)
+        target_first = str(data.get("first") or "")
+        if chain_uri and chain_path.is_file() and target_first:
+            Path(target_first).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(chain_path, target_first)
+            data["first_source"] = "previous_shot_last_exact"
         phase = str(payload.get("keyframe_boundary_phase") or "")
         source_uri = str(payload.get("keyframe_reference_uri") or "")
         if (not source_uri or source_uri.startswith(("http://", "https://"))
@@ -16882,7 +16911,7 @@ class Director:
             return
         # A previous shot's tail is the only legal override of this shot's
         # authored start: the continuous chain must remain exact.
-        if phase == "start" and not payload.get("chain_first_uri"):
+        if phase == "start" and not chain_uri:
             target_uri = str(data.get("first") or "")
             if target_uri:
                 Path(target_uri).parent.mkdir(parents=True, exist_ok=True)
@@ -17302,10 +17331,13 @@ class Director:
         # with respect to the stored document and prevents a stale 35mm/环绕
         # clause from competing with the latest 135mm/固定 repair.
         if shot.get("prompt_block_repair"):
+            location = self._shot_location(ctx.get("script"), shot)
             synchronize_shot_execution_contract(
                 shot,
-                location=self._shot_location(ctx.get("script"), shot),
-                style=ctx["project"].get("style", "") or "",
+                location=location,
+                style=style_for_scene(
+                    ctx["project"].get("style", "") or "", location,
+                    shot),
             )
         static_shot = copy.deepcopy(shot)
         static_shot["frame_kind"] = frame_kind
@@ -17321,6 +17353,8 @@ class Director:
         locations = self._scene_locations(ctx)
         location = shot_local_scene(
             static_shot, locations.get(static_shot["scene_no"], ""))
+        effective_style = style_for_scene(
+            ctx["project"].get("style", "") or "", location, static_shot)
         profile = (ctx.get("production_profile")
                    or (ctx.get("storyboard") or {}).get("profile")
                    or production_profile(
@@ -17419,7 +17453,7 @@ class Director:
             **static_shot, "spatial_blocking": spatial or {},
             "readable_text": readable_text,
             "location": location,
-            "style": ctx["project"]["style"] or "",
+            "style": effective_style,
             "era_context": era_context,
             "sanctioned_anachronisms": sanctioned_anachronisms,
         }, media="image")
@@ -17564,7 +17598,7 @@ class Director:
             "sanctioned_anachronisms": sanctioned_anachronisms,
             "standard_fingerprint": profile.get("standard_fingerprint", ""),
             "forbid_subtitles": not profile["burn_subtitles"],
-            "style": ctx["project"]["style"] or "",
+            "style": effective_style,
             # The shot contract below is the complete provider instruction.
             # Providers must not append biography or episode-level context.
             "prompt_contract_complete": True,
@@ -19173,10 +19207,10 @@ class Director:
         tasks = []
         quality_by_shot = {}
         payload_by_shot = {}
-        seen_scenes = set()
         active_shots = list(self._active_shots(ctx))
         scene_locations = {
-            scene.get("scene_no"): scene.get("location", "")
+            scene.get("scene_no"): self._physical_scene_location(
+                ctx, scene.get("location", ""))
             for scene in (ctx.get("script") or {}).get("scenes", [])
             if isinstance(scene, dict)
         }
@@ -19204,8 +19238,6 @@ class Director:
         technical_incomplete = []
         preflight_failures = []
         for shot in active_shots:
-            scene_first = shot.get("scene_no") not in seen_scenes
-            seen_scenes.add(shot.get("scene_no"))
             if int(shot.get("shot_no") or 0) in awaiting_shots:
                 skipped_awaiting.append(int(shot["shot_no"]))
                 continue
@@ -19214,6 +19246,7 @@ class Director:
             payload = self._shot_payload(ctx, shot)
             shot_no = int(shot["shot_no"])
             predecessor_no = predecessor_by_shot.get(shot_no)
+            scene_first = predecessor_no is None
             existing = self._existing_asset_uri(
                 ctx, "image", self._shot_name(ctx, shot_no))
             current_asset_row = self.assets.latest(
@@ -19862,20 +19895,32 @@ class Director:
             item.get("id"): item for item in self._plan_read(
                 ctx).get("items", [])
             if item.get("category") == "frames"}
-        chains = {}
-        for shot in active_shots:
-            chains.setdefault(shot.get("scene_no"), []).append(shot)
-        chain_list = list(chains.values())
-        last_by_scene = {}
-        max_len = max((len(c) for c in chain_list), default=0)
+        scene_locations = {
+            scene.get("scene_no"): self._physical_scene_location(
+                ctx, scene.get("location", ""))
+            for scene in (ctx.get("script") or {}).get("scenes", [])
+            if isinstance(scene, dict)
+        }
+        continuity_plan = build_keyframe_continuity_plan(
+            active_shots, scene_locations)
+        shots_by_no = {
+            int(shot["shot_no"]): shot for shot in active_shots}
+        chain_list = [
+            (group["group_id"], [
+                shots_by_no[shot_no] for shot_no in group["shot_nos"]
+                if shot_no in shots_by_no])
+            for group in continuity_plan["groups"]
+        ]
+        last_by_chain = {}
+        max_len = max(
+            (len(chain) for _group_id, chain in chain_list), default=0)
         for round_no in range(max_len):
             round_tasks = []
-            for chain in chain_list:
+            for group_id, chain in chain_list:
                 if round_no >= len(chain):
                     continue
                 shot = chain[round_no]
-                scene_no = shot.get("scene_no")
-                # 锚点必须来自**紧邻的上一镜**。last_by_scene 只在成功时
+                # 锚点必须来自**紧邻的上一镜**。last_by_chain 只在成功时
                 # 写入、从不删除,而旧门禁只问「这一场有没有过尾帧」——
                 # 于是镜3 失败后,镜4 会拿到还留在字典里的镜2 尾帧当首帧,
                 # 静默跳过镜3。合同声称「上一镜尾帧=本镜首帧」,实际接的是
@@ -19883,7 +19928,7 @@ class Director:
                 expected_prev = (
                     chain[round_no - 1].get("shot_no") if round_no > 0
                     else None)
-                anchor = last_by_scene.get(scene_no)
+                anchor = last_by_chain.get(group_id)
                 if round_no > 0 and (
                         not anchor
                         or anchor.get("shot_no") != expected_prev):
@@ -19891,7 +19936,7 @@ class Director:
                              "不是紧邻的上一镜，不能接" if anchor else "")
                     self._plan_mark(
                         ctx, f"frames:{shot['shot_no']}", "pending",
-                        error=(f"等待同场上一镜(镜{expected_prev})尾帧"
+                        error=(f"等待同一连续段上一镜(镜{expected_prev})尾帧"
                                f"通过质检；本镜未调用生图模型{stale}"))
                     continue
                 name = self._shot_name(ctx, shot["shot_no"])
@@ -19915,8 +19960,15 @@ class Director:
                         frame_plan.get(
                             f"frames:{shot['shot_no']}", {}).get("qc")
                         or {})
+                    exact_chain_match = bool(
+                        round_no == 0
+                        or (anchor
+                            and self._file_sha256(first)
+                            and self._file_sha256(first)
+                            == self._file_sha256(anchor.get("uri"))))
                     if (self._quality_meets(
                             frame_quality, required_quality)
+                            and exact_chain_match
                             and (not self._image_qc_enabled()
                                  or saved_qc.get("passed") is True)):
                         content_qc_waived = not self._image_qc_enabled()
@@ -19935,7 +19987,7 @@ class Director:
                                 "inspection_waived":
                                     self._director_autonomy_enabled(),
                             })
-                        last_by_scene[scene_no] = {
+                        last_by_chain[group_id] = {
                             "uri": last, "image_quality": frame_quality,
                             "shot_no": shot["shot_no"]}
                         continue
@@ -19943,12 +19995,14 @@ class Director:
                 image_row = self.assets.latest(
                     ctx["project"]["id"], "image", name)
                 self._bind_keyframe_for_frames(payload, shot, image_row)
-                chain_first = last_by_scene.get(scene_no)
+                chain_first = last_by_chain.get(group_id)
                 if (round_no > 0 and chain_first
                         and formal_reference_allowed(
                             chain_first.get("image_quality", "medium"))
                         and Path(chain_first["uri"]).exists()):
                     payload["chain_first_uri"] = chain_first["uri"]
+                    payload["continuity_predecessor_shot"] = expected_prev
+                    payload["continuity_group_id"] = group_id
                 # chain_first_uri is discovered after the keyframe was bound;
                 # rebuild the frozen five-slot manifest so the predecessor is
                 # truly attached and the optional spatial/prop aid yields.
@@ -19960,7 +20014,7 @@ class Director:
                     "sub_dir": "frames", "tag": shot["shot_no"],
                     "priority": self._shot_priority(
                         shot, scene_first=round_no == 0),
-                    "scene": scene_no,
+                    "scene": group_id,
                     "qc_spec": {**self._qc_spec(
                         ctx["project"]["id"],
                         payload.get(
@@ -19992,7 +20046,7 @@ class Director:
                 continue
             results, qc_failures = self._run_parallel(
                 ctx, round_tasks,
-                line=f"首尾帧帧链(第{round_no + 1}轮·各场并行)",
+                line=f"首尾帧帧链(第{round_no + 1}轮·各连续段并行)",
                 continue_on_qc_failure=True)
             for task in round_tasks:
                 result = results.get(task["tag"])
@@ -20003,6 +20057,11 @@ class Director:
                 self._apply_keyframe_boundary_to_frame_result(
                     task["payload"], result)
                 meta = self._quality_meta(decision)
+                meta["continuity_predecessor_shot"] = task["payload"].get(
+                    "continuity_predecessor_shot")
+                meta["continuity_group_id"] = task["payload"].get(
+                    "continuity_group_id", "")
+                meta["first_source"] = result.data.get("first_source", "")
                 content_qc_waived = not self._image_qc_enabled()
                 meta["qc_passed"] = bool(
                     (getattr(result, "qc", None) or {}).get("passed"))
@@ -20023,7 +20082,7 @@ class Director:
                     "content_qc_enabled": not content_qc_waived,
                     "content_qc_waived": content_qc_waived,
                 })
-                last_by_scene[task["scene"]] = {
+                last_by_chain[task["scene"]] = {
                     "uri": result.data["last"],
                     "image_quality": decision["level"],
                     "shot_no": shot_no,
@@ -20358,7 +20417,16 @@ class Director:
         bound_version = int(
             (checkpoint.get("document_versions") or {}).get(
                 "video_references") or 0)
-        if int(current_version or 0) == bound_version:
+        frozen_ids = checkpoint.get("video_reference_asset_ids") or {}
+        canonical_drift = []
+        for shot in self._active_shots(ctx):
+            shot_no = int(shot["shot_no"])
+            canonical = self._required_video_scene_reference(ctx, shot)
+            if int(canonical["id"]) not in {
+                    int(value) for value in frozen_ids.get(str(shot_no), [])}:
+                canonical_drift.append(shot_no)
+        if (int(current_version or 0) == bound_version
+                and not canonical_drift):
             return checkpoint, int(checkpoint_version)
         previous_frozen = ctx.pop(
             "frozen_video_reference_asset_ids", None)
@@ -20388,7 +20456,10 @@ class Director:
         # a non-existent document binding that the strict loader would reject.
         if not current_version:
             updated["document_versions"].pop("video_references", None)
-        updated["source"] = "post_preflight_reference_selection"
+        updated["source"] = (
+            "canonical_scene_reference_refresh"
+            if canonical_drift
+            else "post_preflight_reference_selection")
         updated.pop("created_at", None)
         updated.pop("fingerprint", None)
         updated["fingerprint"] = "sha256:" + hashlib.sha256(
@@ -20806,10 +20877,37 @@ class Director:
         visible_location = self._shot_location(script, shot)
         physical_location = self._physical_scene_location(
             ctx, visible_location)
-        row, _label = self._scene_view_reference(
-            ctx["project"]["id"], visible_location,
-            shot.get("camera") or {}, script=script)
-        rejection = self._video_reference_rejection(row) if row else ""
+        # Every shot in one physical set must carry the exact same root asset.
+        # A reverse/side view may additionally help composition, but it cannot
+        # replace this canonical geometry/material/light anchor.
+        panorama = self.assets.latest(
+            ctx["project"]["id"], "scene_art",
+            self._scene_view_asset_name(
+                physical_location, self.SCENE_PANORAMA_KEY))
+        root = self.assets.latest(
+            ctx["project"]["id"], "scene_art", physical_location)
+        row, rejection = None, ""
+        for candidate in (panorama, root):
+            candidate_rejection = (
+                self._video_reference_rejection(candidate)
+                if candidate else "资产不存在")
+            if (candidate is not None and ctx.get("fresh_assets")
+                    and self._asset_meta(candidate).get("fresh_run_id")
+                    != ctx.get("run_id")):
+                candidate_rejection = "不是本次全量重建生成的场景母图"
+            candidate_uri = str(
+                candidate["uri"] if candidate is not None else "")
+            candidate_ready = bool(
+                candidate_uri
+                and (candidate_uri.startswith(("http://", "https://"))
+                     or Path(candidate_uri).exists()))
+            if candidate is not None and not candidate_ready:
+                candidate_rejection = "场景母图文件缺失"
+            if (candidate is not None and not candidate_rejection
+                    and candidate_ready):
+                row, rejection = candidate, ""
+                break
+            rejection = candidate_rejection
         if (row is None or rejection
                 or not formal_reference_allowed(self._asset_quality(row))
                 or not row["uri"]
@@ -20910,6 +21008,13 @@ class Director:
                 f"镜头{shot_no}的空间图与人物最终立绘已占{len(rows)}张，"
                 f"超过 Seedance 2 资产参考上限"
                 f"{SEEDANCE_ASSET_REFERENCE_LIMIT}张；请拆分群像镜头")
+        # The shot-facing view is optional composition help.  The canonical
+        # root above remains first and wins the asset budget; unsafe panorama
+        # derivatives are already rejected by _scene_view_reference.
+        if len(rows) < SEEDANCE_ASSET_REFERENCE_LIMIT:
+            view_row, _view_label = self._scene_view_reference(
+                project_id, location, shot.get("camera") or {}, script=script)
+            add(view_row)
         # 本镜分镜示例图承载构图事实，但只有中/高质量且没有已知质检
         # 风险的正式版本才能作为视频参考。问题图仍留在画布供复盘，
         # 不得把错误安全带、反向手机或错误车内结构继续传给 Seedance。
@@ -21673,6 +21778,16 @@ class Director:
             "reference_manifest": manifest,
             "reference_images": requested_references,
             "reference_images_used": used_references,
+            "physical_scene_id": str(
+                payload.get("physical_scene_id") or ""),
+            "canonical_scene_asset_id": payload.get(
+                "canonical_scene_asset_id"),
+            "canonical_scene_asset_version": payload.get(
+                "canonical_scene_asset_version"),
+            "canonical_scene_reference_uri": str(
+                payload.get("canonical_scene_reference_uri") or ""),
+            "canonical_scene_fingerprint": str(
+                payload.get("canonical_scene_fingerprint") or ""),
             # 运动参考视频(2.0 即支持):进签名——挂/摘参考都算输入变化
             "reference_videos": list(dict.fromkeys(
                 str(uri) for uri in (payload.get("reference_videos") or []))),
@@ -21697,6 +21812,10 @@ class Director:
             key: snapshot[key] for key in (
                 "prompt_sent", "keyframe", "first_frame", "last_frame",
                 "reference_manifest", "reference_images",
+                "physical_scene_id", "canonical_scene_asset_id",
+                "canonical_scene_asset_version",
+                "canonical_scene_reference_uri",
+                "canonical_scene_fingerprint",
                 "reference_videos",
                 "material_reference_count_requested",
                 "total_reference_count_requested", "duration",
@@ -21837,6 +21956,16 @@ class Director:
         reference_rows = (
             self._video_reference_rows(ctx, shot["shot_no"])
             if reference_mode == "all_around" else [])
+        canonical_scene_row = self._required_video_scene_reference(ctx, shot)
+        physical_scene_id = self._physical_scene_location(
+            ctx, self._shot_location(ctx.get("script") or {}, shot))
+        if (reference_mode == "all_around"
+                and canonical_scene_row["id"] not in {
+                    row["id"] for row in reference_rows}):
+            raise AifosError(
+                f"镜头{shot_no}冻结的 Seedance 参考链缺少统一物理母场景"
+                f"「{physical_scene_id}」asset_id={canonical_scene_row['id']}；"
+                "禁止使用旧快照生成换布景视频，请重新冻结生产快照")
         spatial = self._spatial_reference_requirement(ctx, shot["shot_no"])
         spatial_block = shot_blocking(ctx.get("blocking"), shot_no) or {}
         if (reference_mode == "all_around"
@@ -21924,6 +22053,20 @@ class Director:
             "reference_assets": reference_assets,
             "reference_manifest": reference_manifest,
             "seedance_reference_mode": reference_mode,
+            "require_reference_images": reference_mode == "all_around",
+            "canonical_scene_reference_required": (
+                reference_mode == "all_around"),
+            "physical_scene_id": physical_scene_id,
+            "canonical_scene_asset_id": int(canonical_scene_row["id"]),
+            "canonical_scene_asset_version": int(
+                canonical_scene_row["version"]),
+            "canonical_scene_reference_uri": str(
+                canonical_scene_row["uri"]),
+            "canonical_scene_fingerprint": self._stable_hash({
+                "asset_id": int(canonical_scene_row["id"]),
+                "version": int(canonical_scene_row["version"]),
+                "uri": str(canonical_scene_row["uri"]),
+            }),
             **prop_contract,
             "dialogue": video_dialogue,
             "characters": list(shot.get("characters") or []),
@@ -22027,6 +22170,24 @@ class Director:
         reference_assets = task["reference_assets"]
         reference_manifest = task["reference_manifest"]
         provider = self.router.providers.get(result.provider)
+        canonical_uri = str(
+            task["payload"].get("canonical_scene_reference_uri") or "")
+        technical_fallback = bool(
+            (result.data or {}).get("technical_frame_fallback"))
+        if canonical_uri and task["payload"].get(
+                "canonical_scene_reference_required") and not technical_fallback:
+            used = list((result.data or {}).get(
+                "reference_images_used") or [])
+            provider_type = str((provider.conf if provider else {}).get(
+                "type") or "")
+            if provider_type != "mock" and canonical_uri not in used:
+                raise AifosError(
+                    f"镜头{shot['shot_no']}视频 Provider {result.provider}"
+                    "没有实际使用统一场景母图，结果已拒绝登记；"
+                    "禁止把换布景视频混入资产")
+        if technical_fallback and canonical_uri:
+            result.data["canonical_scene_reference_enforced"] = (
+                "inherited_from_frozen_first_last_frames")
         audio_in_video = bool(
             (provider and provider.conf.get("audio_in_video"))
             or result.data.get("audio_in_video"))
@@ -24926,18 +25087,19 @@ class Director:
                     reason="character_sheet_revision")
         elif kind == "scene_art":
             name = target["name"]
-            scene = next((s for s in script["scenes"]
-                          if s["location"] == name), {})
+            scene = self._scene_fact_for_location(script, name)
+            scene_style = style_for_scene(style, name, scene)
             prompt = prompt_override or self._scene_prompt(
-                name, style, scene,
+                name, scene_style, scene,
                 premise=episode["premise"] if episode else "")
             reference_payload = self._user_reference_payload(
                 project["id"], [name],
                 allowed_roles={"scene", "composition"})
             references = reference_payload["reference_images"]
             style_ref = self._style_anchor_uri(project["id"])
-            reuse_count = sum(1 for value in script["scenes"]
-                              if value.get("location") == name)
+            reuse_count = sum(
+                1 for value in script["scenes"]
+                if self._scene_matches_location(script, value, name))
             quality = resolve_image_quality(
                 recommend_asset_quality("scene_art", reuse_count=reuse_count),
                 policy, f"scene:{name}", explicit_override=quality_choice)
@@ -24950,7 +25112,7 @@ class Director:
                     "shot_no": 0, "characters": [], "location": name,
                     "action": scene.get("action", ""),
                     "prompt": prompt,
-                    "style": style, "feedback": feedback,
+                    "style": scene_style, "feedback": feedback,
                     "prompt_contract_complete": True,
                     "revision": next_revision("scene_art", name),
                     **reference_payload,
@@ -26456,7 +26618,9 @@ class Director:
             raise AifosError(f"镜头{shot_no}不存在")
         shot = shots[index]
         script, _sv = self.projects.latest_document(episode["id"], "script")
-        style = str(project.get("style") or "")
+        location = self._shot_location(script or {}, shot)
+        style = style_for_scene(
+            str(project.get("style") or ""), location, shot)
         premise = str((script or {}).get("logline")
                       or episode.get("premise") or "")
         from .lighting_language import GENRE_LOOKS, match_genre
@@ -28444,14 +28608,48 @@ class Director:
     # ---- 参考图管理:上传的参考图会自动进入出图提示(关联角色/场景) ----
     # ---- 场景扩展:720°全景母版 + 四向视角 ----
 
+    @staticmethod
+    def _scene_matches_location(script, scene, location):
+        """Match a visible scene or any of its canonical physical-set ids."""
+        if not isinstance(scene, dict):
+            return False
+        target = str(location or "").strip()
+        if not target:
+            return False
+        visible = str(
+            scene.get("location") or scene.get("name") or "").strip()
+        direct = {
+            str(scene.get(key) or "").strip()
+            for key in ("location", "name", "base_location",
+                        "physical_scene_id", "scene_family")
+        }
+        direct.discard("")
+        return bool(
+            target in direct
+            or (visible and canonical_scene_location(script, visible) == target))
+
+    @classmethod
+    def _scene_fact_for_location(cls, script, location):
+        scenes = (script or {}).get("scenes") or []
+        # An exact visible-location row is the most specific authored fact.
+        exact = next((
+            scene for scene in scenes if isinstance(scene, dict)
+            and str(scene.get("location") or scene.get("name") or "").strip()
+            == str(location or "").strip()), None)
+        if exact is not None:
+            return exact
+        return next((
+            scene for scene in scenes
+            if cls._scene_matches_location(script, scene, location)), {})
+
     def _scene_facts(self, project, location):
         """跨集找这个场景的剧本事实;自建场景找不到就按空事实走。"""
         for episode in self.projects.list_episodes(project["id"]):
             script, _ = self.projects.latest_document(
                 episode["id"], "script")
-            for scene in (script or {}).get("scenes") or []:
-                if str(scene.get("location") or "") == location:
-                    return scene
+            scene = self._scene_fact_for_location(script, location)
+            if scene:
+                return scene
         return {}
 
     def scene_expansion_state(self, project_title, location):
@@ -28558,6 +28756,7 @@ class Director:
         scene = self._scene_facts(project, location)
         style_text = (str(style).strip() if style is not None
                       else (project["style"] or ""))
+        style_text = style_for_scene(style_text, location, scene)
         out_dir = (self.artifacts_root / f"p{project['id']:03d}" / "scenes")
         out_dir.mkdir(parents=True, exist_ok=True)
         style_ref = self._style_anchor_uri(project["id"])

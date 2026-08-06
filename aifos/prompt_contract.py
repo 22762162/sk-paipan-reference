@@ -173,7 +173,7 @@ def _spatial_staging_block(shot, *, media="video", target_phase=""):
 def lighting_lines_for_shot(shot, style, scene):
     """本镜【光影】条款:按剧本已有事实选型,非写实画风自动留空。"""
     effective_style = _style_for_scene(
-        style or (shot or {}).get("style"), scene)
+        style or (shot or {}).get("style"), scene, shot)
     if not realism_applicable(effective_style):
         return ""
     shot = shot if isinstance(shot, dict) else {}
@@ -190,16 +190,16 @@ def lighting_lines_for_shot(shot, style, scene):
         scene_action=_strip_modern_ancient_exclusions(
             " ".join(str(value) for value in (
             shot.get("description"), shot.get("action"),
-            shot.get("script_reference")) if value), scene),
+            shot.get("script_reference")) if value), scene, shot),
         style_override=_filter_modern_incompatible_style(
-            shot.get("lighting_style"), scene),
+            shot.get("lighting_style"), scene, shot),
         include_genre_camera=False,
         # 题材决定视听基调:仙侠逆光体积光、悬疑低调硬光、甜宠柔光高调
         genre=_filter_modern_incompatible_style(
             " ".join(str(value) for value in (
             effective_style, scene, shot.get("genre"), shot.get("kind_label"),
             shot.get("project_kind"), shot.get("era_context"),
-            shot.get("script_reference")) if value), scene))
+            shot.get("script_reference")) if value), scene, shot))
 
 
 PROMPT_CONTRACT_SCHEMA = "aifos.shot-prompt/v2.2"
@@ -553,6 +553,11 @@ def _style_direction_for_media(
 _MODERN_SCENE_TOKENS = (
     "现代", "当代", "酒店", "电梯", "办公室", "便利店", "高速公路",
     "都市", "轿车", "汽车", "驾驶座", "副驾驶", "别墅", "公寓",
+    "现实世界", "现实线", "直播间", "演播厅", "摄影棚", "影棚", "录音棚",
+    "套房", "客房", "病房", "医院", "诊室", "手术室", "急诊", "学校",
+    "教室", "宿舍", "公司", "会议室", "写字楼", "商场", "超市", "地铁",
+    "机场", "火车站", "高铁站", "停车场", "警局", "派出所", "监控室",
+    "机房", "服务器", "咖啡厅", "酒吧", "健身房", "体育馆",
 )
 
 _MODERN_INCOMPATIBLE_STYLE_TOKENS = (
@@ -567,12 +572,78 @@ _MODERN_INCOMPATIBLE_SCENE_PROP_TOKENS = (
     "宫灯", "烛台", "纱幕", "纱帐", "卷册", "县衙", "驿馆", "官舍",
 )
 
+_ANCIENT_SCENE_TOKENS = (
+    "古代", "古风", "古装", "明代", "大明", "崇祯", "清代", "大清",
+    "唐代", "大唐", "宋代", "大宋", "汉代", "秦代", "战国", "民国",
+    "宫殿", "宫廷", "寝殿", "东宫", "紫禁城", "县衙", "驿馆", "官舍",
+    "古室", "书案", "香炉", "宫灯", "烛台", "纱幕", "纱帐",
+)
 
-def _is_modern_scene(scene):
-    text = _text(scene)
-    return bool(
-        re.search(r"(?:19|20|21)\d{2}年", text)
-        or any(token in text for token in _MODERN_SCENE_TOKENS))
+_MODERN_REALM_TOKENS = (
+    "现代", "当代", "现实", "reality", "modern", "present",
+)
+
+_ANCIENT_REALM_TOKENS = (
+    "古代", "历史", "明代", "大明", "崇祯", "清代", "唐代", "宋代",
+    "汉代", "秦代", "战国", "ming", "ancient", "historical",
+)
+
+
+def _context_values(value, keys):
+    if not isinstance(value, dict):
+        return ""
+    return " ".join(
+        _text(value.get(key)) for key in keys if _text(value.get(key)))
+
+
+def _has_any(text, tokens):
+    lowered = _text(text).lower()
+    return any(token.lower() in lowered for token in tokens)
+
+
+def _is_modern_scene(scene, context=None):
+    """Classify the *current* scene, not the project's mixed-world summary.
+
+    Time-travel bibles often say ``现代都市与明代双时空`` on every shot.
+    Such a mixed sentence is not evidence that an explicitly Ming location is
+    modern.  Current location and active realm/era ids therefore win; a broad
+    mixed era string is used only when it points in one direction.
+    """
+    if isinstance(scene, dict):
+        location_text = _context_values(
+            scene, ("location", "base_location", "physical_scene_id",
+                    "visible_location"))
+    else:
+        location_text = _text(scene)
+    location_modern = bool(
+        re.search(r"(?:19|20|21)\d{2}年", location_text)
+        or _has_any(location_text, _MODERN_SCENE_TOKENS))
+    location_ancient = _has_any(location_text, _ANCIENT_SCENE_TOKENS)
+    if location_modern != location_ancient:
+        return location_modern
+
+    local = context if isinstance(context, dict) else {}
+    if isinstance(scene, dict):
+        local = {**scene, **local}
+    active_text = _context_values(
+        local, ("active_realm_id", "active_era_id", "realm_id", "era_id"))
+    active_modern = _has_any(active_text, _MODERN_REALM_TOKENS)
+    active_ancient = _has_any(active_text, _ANCIENT_REALM_TOKENS)
+    if active_modern != active_ancient:
+        return active_modern
+
+    era_text = _context_values(
+        local, ("era_context", "era", "time_period", "era_and_location"))
+    era_modern = bool(
+        re.search(r"(?:19|20|21)\d{2}年", era_text)
+        or _has_any(era_text, _MODERN_REALM_TOKENS))
+    era_ancient = _has_any(era_text, _ANCIENT_REALM_TOKENS)
+    if era_modern != era_ancient:
+        return era_modern
+
+    # Ambiguous or explicitly mixed worlds fail closed: retain the authored
+    # style instead of stripping a valid historical design package.
+    return False
 
 
 def _clean_style_fragment(fragment):
@@ -588,7 +659,7 @@ def _clean_style_fragment(fragment):
     return cleaned
 
 
-def _filter_modern_incompatible_style(value, scene):
+def _filter_modern_incompatible_style(value, scene, context=None):
     """Keep aesthetics while removing an era/location design package.
 
     Project style is allowed to control palette, light, material, medium and
@@ -597,7 +668,7 @@ def _filter_modern_incompatible_style(value, scene):
     ``鎏金柔雾写实``); pure palace/furnishing clauses disappear.
     """
     text = _text(value)
-    if not text or not _is_modern_scene(scene):
+    if not text or not _is_modern_scene(scene, context):
         return text
     clauses = []
     for clause in re.split(r"[。；;\n]+", text):
@@ -618,12 +689,24 @@ def _filter_modern_incompatible_style(value, scene):
     return "；".join(clauses)
 
 
-def _style_for_scene(value, scene):
+def _style_for_scene(value, scene, context=None):
     return _filter_modern_incompatible_style(
-        _style_without_shot_camera_directives(value), scene)
+        _style_without_shot_camera_directives(value), scene, context)
 
 
-def _strip_modern_ancient_exclusions(value, scene):
+def style_for_scene(value, scene, context=None):
+    """Return the project aesthetic that is valid for one physical scene.
+
+    Shot-repair writers live outside this module but must receive the same
+    era-safe style that the final image/video prompt compiler uses.  Keeping
+    this small public boundary prevents a modern storyboard repair from
+    reintroducing an ancient furnishing package that the provider prompt would
+    only remove later.
+    """
+    return _style_for_scene(value, scene, context)
+
+
+def _strip_modern_ancient_exclusions(value, scene, context=None):
     """Drop only negated ancient exclusion lists from a modern shot state.
 
     They remain useful in an audit log, but naming every forbidden prop in the
@@ -631,7 +714,7 @@ def _strip_modern_ancient_exclusions(value, scene):
     Positive story facts (including a deliberate antique prop) are preserved.
     """
     text = _text(value)
-    if not text or not _is_modern_scene(scene):
+    if not text or not _is_modern_scene(scene, context):
         return text
     kept_sentences = []
     for sentence in re.split(r"[。！？!?；;\n]+", text):
@@ -4220,7 +4303,8 @@ def build_shot_prompt_contract(
         target_location
         if output_media == "image" and not joint_frames and target_location
         else authoritative_scene)
-    scene_style = _style_for_scene(style or shot.get("style"), scene)
+    scene_style = _style_for_scene(
+        style or shot.get("style"), scene, source_shot)
     characters, character_scope_issues, character_scope_declared, character_source = (
         _frame_character_scope(source_shot, target, output_media))
     functional_source, functional_scope_issues, functional_scope_declared, functional_source_name = (
@@ -4239,7 +4323,7 @@ def build_shot_prompt_contract(
             dict(item) if isinstance(item, dict) else item
             for item in functional_source]
     target["state"] = _strip_modern_ancient_exclusions(
-        target.get("state"), scene)
+        target.get("state"), scene, source_shot)
     # Never fall back to the raw storyboard prompt here. It may contain the
     # whole episode bible and unrelated scenes, which makes the provider blend
     # facts from other shots into this image.
@@ -4254,7 +4338,7 @@ def build_shot_prompt_contract(
     else:
         action_source = shot.get("description") or shot.get("action")
     action = _text(
-        _strip_modern_ancient_exclusions(action_source, scene),
+        _strip_modern_ancient_exclusions(action_source, scene, source_shot),
         "环境保持稳定，只执行自然微动")
     target_phase = (
         target.get("phase")
@@ -4421,7 +4505,7 @@ def build_shot_prompt_contract(
         _text(declared_target.get("scene_layout"))
         if isinstance(declared_target, dict) else "")
     whole_scene_layout = _strip_modern_ancient_exclusions(
-        shot.get("scene_layout"), scene)
+        shot.get("scene_layout"), scene, source_shot)
     static_cross_location = bool(
         output_media == "image" and not joint_frames and target_location
         and _text(target_location) != _text(authoritative_scene))

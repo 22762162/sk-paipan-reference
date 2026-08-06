@@ -46,6 +46,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from .. import __version__
 from ..app import App, Workspace
 from ..asset_center import IMAGE_KINDS
+from ..continuity_graph import build_keyframe_continuity_plan
 from ..db import Database
 from ..history_center import HistoryCenter
 from ..job_center import ACTIVE_JOB_STATUSES, JobCenter
@@ -2785,11 +2786,19 @@ def _production_guidance(app, episode, storyboard, render_plan, progress):
                 + stage["not_generated"])
             if bucketed < stage["total"]:
                 stage["not_generated"] += stage["total"] - bucketed
-    continuity_keys = {
-        str(shot.get("scene_no") or f"shot:{shot.get('shot_no')}")
-        for shot in storyboard_shots
+    script, _script_version = app.projects.latest_document(
+        int(episode["id"]), "script")
+    scene_locations = {
+        scene.get("scene_no"): str(
+            scene.get("physical_scene_id")
+            or scene.get("base_location")
+            or scene.get("location")
+            or "")
+        for scene in (script or {}).get("scenes", [])
+        if isinstance(scene, dict)
     }
-    continuity_chains = len(continuity_keys)
+    continuity_chains = len(build_keyframe_continuity_plan(
+        storyboard_shots, scene_locations)["groups"])
     image_limit = int(
         ((overall.get("parallelism") or {}).get("image") or {}).get(
             "limit") or 1)

@@ -244,6 +244,49 @@ def test_shot_zone_inherits_the_root_scene_master(app):
     assert "物理母场景:虞家别墅·虞寻欢卧室" in label
 
 
+def test_physical_scene_id_recovers_modern_era_context_for_expansion(app):
+    """母场景资产名不是可见地点时，扩展也不能丢失逐场现代时代。"""
+    project, _ = app.projects.get_or_create_project(
+        "母场景时代测试",
+        style="写实3D；古室中以书案、香炉和纱幕构图")
+    episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+    script = {"scenes": [{
+        "scene_no": 1, "location": "直播间·夜",
+        "physical_scene_id": "set-A", "base_location": "set-A",
+        "era_context": "2078年现代现实世界",
+    }]}
+    app.projects.save_document(episode["id"], "script", script)
+
+    scene = app.director._scene_facts(project, "set-A")
+    prompt = app.director._scene_prompt(
+        "set-A", project["style"], scene)
+
+    assert scene["location"] == "直播间·夜"
+    assert "写实3D" in prompt
+    assert all(word not in prompt for word in ("古室", "书案", "香炉", "纱幕"))
+
+
+def test_physical_scene_id_preserves_ancient_context_for_expansion(app):
+    """同一查找机制在古代母场景上必须保留合法古风陈设。"""
+    project, _ = app.projects.get_or_create_project(
+        "古代母场景时代测试",
+        style="鎏金柔雾古风；明代宫殿内以书案和香炉构图")
+    episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+    script = {"scenes": [{
+        "scene_no": 1, "location": "寝殿内室·夜",
+        "physical_scene_id": "set-M", "base_location": "set-M",
+        "era_context": "明代崇祯年间", "active_realm_id": "ming",
+    }]}
+    app.projects.save_document(episode["id"], "script", script)
+
+    scene = app.director._scene_facts(project, "set-M")
+    prompt = app.director._scene_prompt(
+        "set-M", project["style"], scene)
+
+    assert scene["location"] == "寝殿内室·夜"
+    assert all(word in prompt for word in ("古风", "明代宫殿", "书案", "香炉"))
+
+
 def test_camera_language_distinguishes_left_and_right_side():
     assert scene_view_for_camera("左侧面") == "side_left"
     assert scene_view_for_camera("侧面") == "side"

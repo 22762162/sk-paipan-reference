@@ -146,6 +146,9 @@ DEFAULTS = {
             # 即梦官方 CLI(dreamina)原生适配
             "type": "dreamina", "enabled": False,
             "capabilities": ["video"],
+            # multimodal2video truly submits first/last plus material images;
+            # router reference gates must therefore keep this provider eligible.
+            "reference_images": True,
             "command": ["dreamina"],
             "model_version": "seedance2.0fast_vip",  # 必须 fast_vip,勿用旧 seedance2.0_vip
             "video_resolution": "720p",

@@ -17,7 +17,7 @@ from aifos.camera_language import (
     enforce_scale_capacity,
     scale_capacity,
 )
-from aifos.prompt_contract import compile_shot_prompt
+from aifos.prompt_contract import compile_shot_prompt, style_for_scene
 from aifos.production.api_providers import sniff_image_media
 from aifos.workflow import _camera_plan
 
@@ -127,6 +127,127 @@ def test_shootability_repair_accepts_string_camera_over_old_dict(
     assert shot["five_dimensions"]["camera_design"]["shot_scale"] == "近景"
     assert shot["style_direction"]["camera_contract"]["shot_scale"] == "近景"
     assert shot["prompt_contract"]["camera"]["景别"] == "近景"
+
+
+def test_shootability_repair_does_not_reinject_ancient_style_into_modern_scene(
+        app, monkeypatch):
+    """Modern repair writers receive aesthetics, never ancient furnishings."""
+    captured = {}
+
+    def fake_call(_ctx, _stage, payload, _kind):
+        captured.update(payload)
+        return SimpleNamespace(data={
+            "camera": "35mm平视中景，固定机位",
+            "description": "现代别墅卧室内，人物站在床边。",
+            "repair_summary": "保持现代场景并修正机位",
+        })
+
+    monkeypatch.setattr(app.director, "_call", fake_call)
+    shot = {
+        "shot_no": 1,
+        "scene_no": 1,
+        "characters": ["甲"],
+        "description": "人物站在现代卧室床边。",
+        "camera": "35mm平视中景，固定机位",
+    }
+    ctx = {
+        "project": {
+            "title": "时代隔离测试",
+            "style": (
+                "鎏金柔雾、超写实真人古风女频短剧；"
+                "暖金古室中以书案、卷册、香炉和半垂纱幕构图；"
+                "电影级半写实3D"),
+        },
+        "script": {
+            "scenes": [{"scene_no": 1, "location": "现代豪宅卧室"}]},
+    }
+
+    app.director._repair_shot_for_shootability(
+        ctx, shot, "修正机位距离")
+
+    assert captured["location"] == "现代豪宅卧室"
+    assert "鎏金柔雾" in captured["style"]
+    assert "电影级半写实3D" in captured["style"]
+    for forbidden in ("古风", "古室", "书案", "卷册", "香炉", "纱幕"):
+        assert forbidden not in captured["style"]
+
+
+def test_shootability_repair_keeps_ancient_style_in_ancient_scene(
+        app, monkeypatch):
+    """Time-travel/historical scenes keep their episode-authoritative style."""
+    captured = {}
+
+    def fake_call(_ctx, _stage, payload, _kind):
+        captured.update(payload)
+        return SimpleNamespace(data={
+            "camera": "35mm平视中景，固定机位",
+            "description": "明代宫殿内人物立于书案前。",
+            "repair_summary": "修正机位",
+        })
+
+    monkeypatch.setattr(app.director, "_call", fake_call)
+    shot = {
+        "shot_no": 1,
+        "scene_no": 1,
+        "characters": ["甲"],
+        "description": "明代宫殿内人物立于书案前。",
+        "camera": "35mm平视中景，固定机位",
+    }
+    ancient_style = "鎏金柔雾古风；明代宫殿内以书案和香炉构图"
+    ctx = {
+        "project": {"title": "穿越测试", "style": ancient_style},
+        "script": {
+            "scenes": [{"scene_no": 1, "location": "明代宫殿内景"}]},
+    }
+
+    app.director._repair_shot_for_shootability(
+        ctx, shot, "修正机位距离")
+
+    assert captured["style"] == ancient_style
+
+
+def test_scene_style_uses_authoritative_era_for_ambiguous_locations():
+    """地点没写“现代”时也必须服从逐镜时代，不能靠有限地名猜。"""
+    ancient_style = (
+        "鎏金柔雾、电影级半写实3D；"
+        "暖金古室中以书案、卷册、香炉和半垂纱幕构图")
+
+    modern = style_for_scene(
+        ancient_style, "高层内厅·夜",
+        {"era_context": "2078年现代现实世界", "active_realm_id": "reality"})
+    assert "鎏金柔雾" in modern
+    assert "电影级半写实3D" in modern
+    for forbidden in ("古室", "书案", "卷册", "香炉", "纱幕"):
+        assert forbidden not in modern
+
+    ancient = style_for_scene(
+        ancient_style, "内室·夜",
+        {"era_context": "明代崇祯年间", "active_realm_id": "ming"})
+    assert ancient == ancient_style
+
+
+def test_inherently_modern_location_filters_ancient_furnishings_without_label():
+    style = "写实3D；古室中以书案、香炉和纱幕构图"
+    for location in ("直播间·夜", "高档套房·夜", "私人病房", "城市摄影棚"):
+        filtered = style_for_scene(style, location)
+        assert "写实3D" in filtered
+        assert all(word not in filtered for word in ("古室", "书案", "香炉", "纱幕"))
+
+
+def test_mixed_time_travel_world_never_overrides_current_ancient_scene():
+    """全剧双时空只作背景；明确的当前古代场景/realm 必须保留古风。"""
+    style = "鎏金柔雾古风；明代宫殿内以书案和香炉构图"
+
+    palace = style_for_scene(
+        style, "明代宫殿内景",
+        {"era_context": "现代都市与明代崇祯双时空"})
+    assert palace == style
+
+    ming_room = style_for_scene(
+        style, "内室·夜",
+        {"era_context": "现代都市与明代崇祯双时空",
+         "active_realm_id": "ming"})
+    assert ming_room == style
 
 
 def test_compile_shot_prompt_fixes_saved_infeasible_contract():
