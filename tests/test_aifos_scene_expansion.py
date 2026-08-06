@@ -230,6 +230,20 @@ def test_missing_left_view_falls_back_to_side_then_main(app):
     assert row["name"].endswith("::view:main")     # 再缺 → 退正向
 
 
+def test_shot_zone_inherits_the_root_scene_master(app):
+    app.director.expand_scene_views("雨夜凶杀", "虞家别墅·虞寻欢卧室")
+    project = app.projects.get_project("雨夜凶杀")
+    script = {"scenes": [
+        {"location": "虞家别墅·虞寻欢卧室"},
+        {"location": "虞家别墅·虞寻欢卧室床侧"},
+    ]}
+    row, label = app.director._scene_view_reference(
+        project["id"], "虞家别墅·虞寻欢卧室床侧", "正面平视",
+        script=script)
+    assert row["name"].startswith("虞家别墅·虞寻欢卧室::view:")
+    assert "物理母场景:虞家别墅·虞寻欢卧室" in label
+
+
 def test_camera_language_distinguishes_left_and_right_side():
     assert scene_view_for_camera("左侧面") == "side_left"
     assert scene_view_for_camera("侧面") == "side"

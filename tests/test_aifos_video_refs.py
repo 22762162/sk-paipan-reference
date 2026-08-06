@@ -57,6 +57,8 @@ def test_auto_video_references_include_necessary_images(app):
             assert entry["spatial_reference_ready"]
             assert "spatial_blocking" in kinds, \
                 f"镜头{shot['shot_no']}缺 Seedance 必传空间图"
+        assert "scene_art" in kinds, \
+            f"镜头{shot['shot_no']}缺统一物理场景母图"
         assert len(entry["items"]) <= 7
 
 
@@ -74,8 +76,9 @@ def test_manual_selection_overrides_auto(app):
         app.director._locked_identity(project["id"], name)["id"]
         for name in shot["characters"]}
     manual_ids = [item["asset_id"] for item in entry["items"]
-                  if item["kind"] != "spatial_blocking"]
+                  if item["kind"] not in {"spatial_blocking", "scene_art"}]
     assert set(manual_ids) == identity_ids | {row["id"]}
+    assert any(item["kind"] == "scene_art" for item in entry["items"])
     if entry["spatial_reference_required"]:
         assert entry["items"][0]["kind"] == "spatial_blocking"
     # 清空 = 不再使用额外参考，但硬身份图与空间图仍保留。
@@ -86,6 +89,8 @@ def test_manual_selection_overrides_auto(app):
     if effective["shots"]["1"]["spatial_reference_required"]:
         assert remaining[0]["kind"] == "spatial_blocking"
         remaining = remaining[1:]
+    assert any(item["kind"] == "scene_art" for item in remaining)
+    remaining = [item for item in remaining if item["kind"] != "scene_art"]
     assert {item["asset_id"] for item in remaining} == identity_ids
     # 其他镜头仍是自动
     assert effective["shots"]["2"]["mode"] == "auto"

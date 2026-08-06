@@ -110,8 +110,15 @@ def test_locked_prop_is_a_real_shot_reference_with_single_duty(app):
         "description": "铜制机关钥匙插入锁孔并转动",
         "props": ["铜制机关钥匙"],
     }]}
+    scene = ctx["out_root"] / "scene.png"
+    scene.parent.mkdir(parents=True, exist_ok=True)
+    scene.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+    app.assets.register(
+        project["id"], "scene_art", "断桥残雪", uri=str(scene),
+        meta={"image_quality": "high", "base_location": "断桥残雪"})
     video_rows = app.director._auto_video_reference_rows(ctx, 1)
     assert any(row["kind"] == "prop_identity" for row in video_rows)
+    assert any(row["kind"] == "scene_art" for row in video_rows)
 
 
 def test_codex_adapter_has_dedicated_prop_candidate_output(tmp_path):

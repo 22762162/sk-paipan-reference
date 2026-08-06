@@ -524,14 +524,18 @@ def test_asset_delete_and_video_reference_api(server):
     try:
         project, _ = app2.projects.get_or_create_project("资产接口测试")
         episode, _ = app2.projects.get_or_create_episode(project["id"], 1)
+        app2.projects.save_document(episode["id"], "script", {
+            "characters": [],
+            "scenes": [{"scene_no": 1, "location": "会议室"}],
+        })
         app2.projects.save_document(episode["id"], "storyboard", {
-            "shots": [{"shot_no": 1}]})
+            "shots": [{"shot_no": 1, "scene_no": 1}]})
         path = app2.workspace.artifacts_dir / "p001" / "scene.png"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
         row = app2.assets.register(
             project["id"], "scene_art", "会议室", uri=str(path),
-            meta={"image_quality": "medium"})
+            meta={"image_quality": "high", "base_location": "会议室"})
         asset_id = row["id"]
         episode_id = episode["id"]
     finally:
@@ -542,11 +546,14 @@ def test_asset_delete_and_video_reference_api(server):
             "episode_id": episode_id, "shot_no": 1,
             "asset_ids": [asset_id]})
     assert status == 200
-    assert saved["shots"]["1"][0]["asset_id"] == asset_id
+    # 场景母图是自动硬参考，人工重复选择会被去重为“无额外参考”。
+    assert saved["shots"]["1"] == []
     status, detail = _json_request(
         server["port"], "GET", f"/api/episode/{episode_id}")
     assert status == 200
-    assert detail["video_references"]["shots"]["1"][0]["asset_id"] == asset_id
+    assert detail["video_references"]["shots"]["1"] == []
+    effective = detail["video_references_effective"]["shots"]["1"]["items"]
+    assert any(item["asset_id"] == asset_id for item in effective)
     catalog = detail["artifacts"]["image_assets"]
     assert catalog[0]["asset_id"] == asset_id
     assert catalog[0]["usable_for_video"] is True

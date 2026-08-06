@@ -1674,7 +1674,15 @@ def _clear_final_camera_actor_clearance(
 def _scene_location(script, continuity, scene_no):
     for scene in script.get("scenes", []):
         if int(scene.get("scene_no", 0)) == int(scene_no):
-            return scene.get("location") or scene.get("name") or f"第{scene_no}场"
+            # Blocking describes one physical set.  A writer's narrower zone
+            # label (床侧/门内/窗边) remains in the script and shot prompt, but
+            # must inherit the room's single geometry and panorama here.
+            return (
+                scene.get("physical_scene_id")
+                or scene.get("base_location")
+                or scene.get("location")
+                or scene.get("name")
+                or f"第{scene_no}场")
     scenes = continuity.get("scenes", [])
     if 0 < int(scene_no) <= len(scenes):
         return scenes[int(scene_no) - 1].get("name") or f"第{scene_no}场"

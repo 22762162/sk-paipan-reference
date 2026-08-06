@@ -17,6 +17,7 @@ from .adapters.claude_script import (is_background_role,
 from .camera_language import (allows_partial_multi_subject_scale,
                               enforce_scale_capacity)
 from .quality_policy import default_quality_policy, resolve_video_quality
+from .scene_identity import canonical_scene_location
 from .inner_persona import (
     apply_inner_persona_to_shots,
     normalize_inner_persona_policy,
@@ -326,12 +327,21 @@ def build_continuity_bible(project, script, profile):
     scenes = []
     for scene in script.get("scenes", []):
         location = scene.get("location", "")
-        if location in seen:
+        physical_location = canonical_scene_location(script, location)
+        if physical_location in seen:
+            existing = next(
+                item for item in scenes
+                if item["physical_scene_id"] == physical_location)
+            if location and location not in existing["zones"]:
+                existing["zones"].append(location)
             continue
-        seen.add(location)
+        seen.add(physical_location)
         scenes.append({
-            "name": location,
-            "layout_anchor": f"{location}空间布局在本集内固定",
+            "name": physical_location,
+            "physical_scene_id": physical_location,
+            "base_location": physical_location,
+            "zones": [location] if location else [],
+            "layout_anchor": f"{physical_location}空间布局在本集内固定",
             "equipment_anchor": "设备现代且统一；旧空间也必须干净、可拍摄",
             "light_anchor": "主光方向与色温跨镜保持一致",
         })

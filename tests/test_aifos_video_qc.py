@@ -15,7 +15,7 @@ def _ctx(app, root):
     episode, _ = app.projects.get_or_create_episode(project["id"], 1)
     script = {
         "characters": [{"name": "甲"}],
-        "scenes": [{"scene_no": 1, "lines": []}],
+        "scenes": [{"scene_no": 1, "location": "测试室内", "lines": []}],
     }
     storyboard = {"shots": [{
         "shot_no": 1, "scene_no": 1, "unit_id": "U01",
@@ -28,6 +28,11 @@ def _ctx(app, root):
     last = root / "shot-001.last.svg"
     first.write_text("<svg></svg>", encoding="utf-8")
     last.write_text("<svg></svg>", encoding="utf-8")
+    scene = root / "scene.png"
+    scene.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+    app.assets.register(
+        project["id"], "scene_art", "测试室内", uri=str(scene),
+        meta={"image_quality": "high", "base_location": "测试室内"})
     return {
         "project": dict(project), "episode": dict(episode),
         "out_root": root, "script": script, "storyboard": storyboard,

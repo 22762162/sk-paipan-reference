@@ -284,10 +284,12 @@ def test_director_autonomy_selects_best_video_references_once(tmp_path):
             rows, 13)
 
         assert len(selected) == 7
-        assert all(row["kind"] != "spatial_blocking" for row in selected)
+        # Scene geometry/blocking is no longer a disposable low-priority
+        # reference: dropping it lets Seedance redesign the set per shot.
+        assert any(row["kind"] == "spatial_blocking" for row in selected)
         assert [row["name"] for row in selected] == [
-            "人物0", "人物1", "人物2",
-            "核心道具0", "核心道具1", "核心道具2", "核心道具3"]
+            "空间调度图", "人物0", "人物1", "人物2",
+            "核心道具0", "核心道具1", "核心道具2"]
     finally:
         app.close()
 

@@ -84,6 +84,8 @@ from .scene_model import (SCALE_POLICY, actor_placement_issues,
                           repair_actor_furniture_collisions,
                           repair_camera_furniture_collisions,
                           scene_layout_clause)
+from .scene_identity import (annotate_scene_families,
+                             canonical_scene_location)
 from .seedance_policy import (
     DEFAULT_TIER,
     SeedancePolicyError,
@@ -3012,6 +3014,7 @@ class Director:
             return ""
         if not location or shot_no is None:
             return ""
+        location = self._physical_scene_location(ctx, location)
         blocking = (ctx or {}).get("blocking") or {}
         block = (blocking.get("shot_index") or {}).get(str(int(shot_no)))
         if not block:
@@ -3443,12 +3446,14 @@ class Director:
         return issues
 
     def _scene_view_reference(self, project_id, location, camera,
-                              fresh_run_id=None):
+                              fresh_run_id=None, script=None):
         """按镜头机位选最贴近的场景母版视角;缺视角图按回退链降级。
 
         左侧向缺席时退通用侧向,再退主视角——四向扩展只是把可选项变多,
         没扩展过的场景行为与以前完全一致。
         """
+        visible_location = str(location or "").strip()
+        location = canonical_scene_location(script or {}, visible_location)
         view = scene_view_for_camera(camera)
         if view != "main":
             for candidate in self.SCENE_VIEW_FALLBACK.get(view, (view,)):
@@ -3459,7 +3464,7 @@ class Director:
                     row = None
                 if row is not None:
                     label = self.SCENE_VIEW_LABELS.get(candidate, candidate)
-                    return row, f"场景:{location}({label})"
+                    return row, f"场景:{visible_location}→物理母场景:{location}({label})"
         # 做过四向扩展的场景,正向母版与全景同源;没扩展过的照旧用概念图。
         row = self._scene_view_row(project_id, location, "main")
         if (row is not None and fresh_run_id is not None
@@ -3467,13 +3472,15 @@ class Director:
                     "fresh_run_id") != fresh_run_id):
             row = None
         if row is not None:
-            return row, f"场景:{location}({self.SCENE_VIEW_LABELS['main']})"
+            return row, (
+                f"场景:{visible_location}→物理母场景:{location}"
+                f"({self.SCENE_VIEW_LABELS['main']})")
         row = self.assets.latest(project_id, "scene_art", location)
         if (row is not None and fresh_run_id is not None
                 and self._asset_meta(row).get(
                     "fresh_run_id") != fresh_run_id):
             row = None
-        return row, f"场景:{location}"
+        return row, f"场景:{visible_location}→物理母场景:{location}"
 
     def _ensure_scene_view_masters(self, ctx, scene_quality,
                                    location_reuse, style):
@@ -3481,7 +3488,17 @@ class Director:
         project_id = ctx["project"]["id"]
         scene_by_location = {}
         for scene in ctx["script"]["scenes"]:
-            scene_by_location.setdefault(scene["location"], scene)
+            location = str(
+                scene.get("physical_scene_id")
+                or scene.get("base_location")
+                or scene.get("location") or "").strip()
+            if not location:
+                continue
+            # Prefer the scene whose visible name is itself the root; it has
+            # the broadest production-design facts for the shared set.
+            if (location not in scene_by_location
+                    or str(scene.get("location") or "") == location):
+                scene_by_location[location] = scene
         tasks, seed = [], []
         for location, scene in scene_by_location.items():
             if location_reuse.get(location, 0) < self.SCENE_VIEW_MIN_REUSE:
@@ -11533,6 +11550,10 @@ class Director:
             "premise": premise,
             "style": style,
         })
+        # A location such as “卧室床侧” is a staging zone, not a licence to
+        # invent a second bedroom.  Persist one physical-scene id before any
+        # scene art, blocking map, keyframe or video reference is compiled.
+        annotate_scene_families(script)
         # Drafts with unresolved identity must remain reviewable so the user
         # can fill the two fields.  The lock/cast gates call the strict
         # validator and cannot advance to image generation.
@@ -12285,10 +12306,17 @@ class Director:
         if not self.config.get("defaults", "space_first", default=False):
             return
         project = ctx["project"]
+        seen = set()
         for scene in (ctx.get("script") or {}).get("scenes", []):
-            location = str(scene.get("location") or "").strip()
+            location = str(
+                scene.get("physical_scene_id")
+                or scene.get("base_location")
+                or scene.get("location") or "").strip()
             if not location:
                 continue
+            if location in seen:
+                continue
+            seen.add(location)
             pano = self._scene_view_row(
                 project["id"], location, self.SCENE_PANORAMA_KEY)
             if not (pano is not None and pano["uri"]
@@ -12558,11 +12586,14 @@ class Director:
         models = {}
         locations = []
         locations.extend(
-            str(scene.get("location") or scene.get("name") or "").strip()
+            str(scene.get("physical_scene_id")
+                or scene.get("base_location")
+                or scene.get("location") or scene.get("name") or "").strip()
             for scene in ((ctx.get("script") or {}).get("scenes") or [])
             if isinstance(scene, dict))
         locations.extend(
-            self._shot_location(ctx.get("script"), shot)
+            self._physical_scene_location(
+                ctx, self._shot_location(ctx.get("script"), shot))
             for shot in ((ctx.get("storyboard") or {}).get("shots") or [])
             if isinstance(shot, dict))
         locations.extend(
@@ -14885,13 +14916,24 @@ class Director:
                               if c["name"] in needed_names]
         locations = []
         scene_context_by_location = {}
+        scene_members_by_location = {}
         for scene in active_scenes:
-            if scene["location"] not in locations:
-                locations.append(scene["location"])
-                scene_context_by_location[scene["location"]] = dict(scene)
+            visible_location = str(scene.get("location") or "").strip()
+            location = self._physical_scene_location(ctx, visible_location)
+            if not location:
+                continue
+            scene_members_by_location.setdefault(location, []).append(
+                visible_location)
+            if location not in locations:
+                locations.append(location)
+                scene_context_by_location[location] = dict(scene)
+            if visible_location == location:
+                scene_context_by_location[location] = dict(scene)
         location_reuse = {
-            location: sum(1 for scene in active_scenes
-                          if scene.get("location") == location)
+            location: sum(
+                1 for scene in active_scenes
+                if self._physical_scene_location(
+                    ctx, scene.get("location")) == location)
             for location in locations
         }
         scene_quality = {
@@ -14899,9 +14941,17 @@ class Director:
                 recommend_asset_quality(
                     "scene_art", reuse_count=location_reuse[location]),
                 ctx.get("quality_policy") or default_quality_policy(),
-                f"scene:{location}")
+                f"scene:{location}", explicit_override="high")
             for location in locations
         }
+        # Count every scene occurrence as a reuse of the physical set even
+        # though generation is deduplicated to one mother asset per root.
+        # This preserves asset analytics across repeated scenes/episodes.
+        for scene in active_scenes:
+            location = self._physical_scene_location(
+                ctx, scene.get("location"))
+            if location:
+                self.assets.acquire(project_id, "scene", location)
         # 先由编剧 AI 写人物设定(性格/外貌/妆容/服装细节),
         # 立绘与全部资产套件的提示词据此丰富;项目级一次,跨集复用
         designs = self._ensure_character_designs(ctx, characters)
@@ -15023,9 +15073,8 @@ class Director:
         # 只为未跳过的场次备场景资产:locations/scene_quality 都按
         # active_scenes 构建,这里若遍历全量 scenes,跳过场次的地点
         # 会以 KeyError 崩掉整条 cast(2026-07-31 端到端测试首镜即中)。
-        for scene in active_scenes:
-            location = scene["location"]
-            self.assets.acquire(project_id, "scene", location)
+        for location in locations:
+            scene = scene_context_by_location[location]
             existing_scene = (
                 "" if ctx.get("fresh_assets")
                 else self._existing_asset_uri(
@@ -15045,7 +15094,10 @@ class Director:
                 {"reference_images": [], "asset_matches": []}
                 if ctx.get("fresh_assets")
                 else self._user_reference_payload(
-                    project_id, [location],
+                    project_id,
+                    list(dict.fromkeys(
+                        [location]
+                        + scene_members_by_location.get(location, []))),
                     allowed_roles={"scene", "composition"}))
             style_reference = (
                 None if ctx.get("fresh_assets")
@@ -15177,6 +15229,8 @@ class Director:
                     project_id, "scene_art", name, uri=result.uri,
                     meta={
                         **self._quality_meta(scene_quality[name]),
+                        "physical_scene_id": name,
+                        "base_location": name,
                         "fresh_run_id": (
                             ctx.get("run_id")
                             if ctx.get("fresh_assets") else None),
@@ -15233,7 +15287,7 @@ class Director:
         ctx["cast"] = cast
         return {"reused": reused, "created": created,
                 "characters": len(cast),
-                "scenes": len(ctx["script"]["scenes"]),
+                "scenes": len(locations),
                 "character_asset_mode": asset_policy["mode"],
                 "character_asset_resolved": asset_policy["resolved_mode"],
                 "character_sheets_per_character": len(sheet_definitions)}
@@ -15244,6 +15298,12 @@ class Director:
             for scene in (ctx.get("script") or {}).get("scenes", [])
             if isinstance(scene, dict) and scene.get("scene_no") is not None
         }
+
+    @staticmethod
+    def _physical_scene_location(ctx, location):
+        """Resolve a visible shot zone to the single reusable physical set."""
+        return canonical_scene_location(
+            (ctx or {}).get("script") or {}, location)
 
     def _character_reference_uris(self, project_id, name):
         """只取明确关联到该角色的人物/服装参考图。"""
@@ -16099,7 +16159,8 @@ class Director:
                     project_id, location, camera,
                     fresh_run_id=(
                         ctx.get("run_id")
-                        if ctx.get("fresh_assets") else None))
+                        if ctx.get("fresh_assets") else None),
+                    script=ctx.get("script") or {})
                 if (row and formal_reference_allowed(
                         self._asset_quality(row))
                         and row["uri"] and Path(row["uri"]).exists()
@@ -17059,11 +17120,14 @@ class Director:
         if not self.config.get(
                 "defaults", "space_first", default=False):
             return {"passed": True, "issues": [], "asset_version": 0}
+        visible_location = location
+        location = self._physical_scene_location(ctx, location)
         model, row, stale, reason = self._scene_model_state(
             ctx["project"]["id"], location)
         if model is None or stale:
             raise AifosError(
-                f"场景「{location}」{reason}；已在关键帧出图前阻断。"
+                f"场景区域「{visible_location}」绑定的物理母场景"
+                f"「{location}」{reason}；已在关键帧出图前阻断。"
                 "请先重新建立该场景的真实三维搭景")
         # _plan_seed_shots runs at the end of storyboard, before stage_blocking
         # has produced per-shot actors/camera.  At that point we can and should
@@ -17114,6 +17178,7 @@ class Director:
         location = str(location or "").strip()
         if not location:
             return ""
+        location = self._physical_scene_location(ctx, location)
         try:
             row = self.assets.latest(
                 ctx["project"]["id"], "scene_model", location)
@@ -17330,6 +17395,14 @@ class Director:
                     end_wardrobe or start_wardrobe)
                 headwear_states[name] = copy.deepcopy(
                     end_headwear or start_headwear or {})
+        physical_location = self._physical_scene_location(ctx, location)
+        shot_prompt = self._rich_shot_prompt(ctx, static_shot, location)
+        shot_prompt += (
+            "\n【PHYSICAL SCENE LOCK】当前表演区域=" + location
+            + "；唯一物理母场景=" + physical_location
+            + "；户型、门窗、固定家具位置与朝向、墙地材质、主光方向"
+              "必须严格服从所附场景母图和三维场景表；只允许机位、人物"
+              "动作与可移动道具变化，禁止重设计或替换场景。")
         payload = {
             "_episode_id": ctx["episode"]["id"],
             "_contract_revision": max(
@@ -17342,7 +17415,7 @@ class Director:
                if str(static_shot.get("director_note") or "").strip()
                else {}),
             "frame_kind": frame_kind,
-            "prompt": self._rich_shot_prompt(ctx, static_shot, location),
+            "prompt": shot_prompt,
             "seedance_prompt": static_shot.get(
                 "seedance_prompt", static_shot["prompt"]),
             "characters": static_shot["characters"],
@@ -17356,6 +17429,7 @@ class Director:
             "visible_figure_count": visible_figure_count,
             "narrative_overlays": narrative_overlays,
             "location": location,
+            "physical_scene_id": physical_location,
             "dialogue": static_shot.get("dialogue"),
             "camera": static_shot.get("camera", ""),
             "action": static_shot.get("description", ""),
@@ -20332,6 +20406,8 @@ class Director:
         mandatory_ids = set()
         if spatial["row"] is not None:
             mandatory_ids.add(spatial["row"]["id"])
+        scene_row = self._required_video_scene_reference(ctx, target_shot)
+        mandatory_ids.add(scene_row["id"])
         missing_identities = []
         for name in self._video_identity_names(ctx, target_shot):
             row = self._locked_identity(episode["project_id"], name)
@@ -20475,6 +20551,33 @@ class Director:
         return {"schema": "aifos.video-references-effective/v1",
                 "shots": shots}
 
+    def _required_video_scene_reference(self, ctx, shot):
+        """Return the shot's canonical scene master or fail before Seedance.
+
+        Spatial blocking explains where actors and cameras move; it does not
+        contain the room's materials, doors, furniture or lighting.  A real
+        scene master is therefore mandatory even when first/last frames exist.
+        """
+        script = ctx.get("script") or {}
+        visible_location = self._shot_location(script, shot)
+        physical_location = self._physical_scene_location(
+            ctx, visible_location)
+        row, _label = self._scene_view_reference(
+            ctx["project"]["id"], visible_location,
+            shot.get("camera") or {}, script=script)
+        rejection = self._video_reference_rejection(row) if row else ""
+        if (row is None or rejection
+                or not formal_reference_allowed(self._asset_quality(row))
+                or not row["uri"]
+                or (not str(row["uri"]).startswith(("http://", "https://"))
+                    and not Path(row["uri"]).exists())):
+            raise AifosError(
+                f"镜头{shot.get('shot_no')}的场景区域「{visible_location}」"
+                f"没有可交给 Seedance 的统一物理母场景「{physical_location}」"
+                f"参考图{('：' + rejection) if rejection else ''}；"
+                "禁止只带人物/空间图生成视频")
+        return row
+
     def _auto_video_reference_rows(self, ctx, shot_no):
         """人工未选择时,按剧本/分镜自动集合本镜必要参考图。
 
@@ -20495,10 +20598,8 @@ class Director:
         if script is None:
             script, _ = self.projects.latest_document(
                 ctx["episode"]["id"], "script")
-        location = next(
-            (scene.get("location", "")
-             for scene in (script or {}).get("scenes", [])
-             if scene.get("scene_no") == shot.get("scene_no")), "")
+            ctx["script"] = script or {}
+        location = self._shot_location(script, shot)
         rows, seen = [], set()
 
         def usable(row):
@@ -20519,6 +20620,9 @@ class Director:
         # 空间图是多人/变机位镜头的硬参考，优先占位且不可被人工选择覆盖。
         spatial = self._spatial_reference_requirement(ctx, shot_no)
         add(spatial["row"])
+        # 场景母图同样是硬参考，并且必须在道具让位/总槽位计算之前
+        # 占位；否则非导演自治模式会在最后一刻因 7→8 张而失败。
+        add(self._required_video_scene_reference(ctx, shot))
         missing = []
         for name in self._video_identity_names(ctx, shot):
             identity = self._locked_identity(project_id, name)
@@ -20577,8 +20681,6 @@ class Director:
                 and shot_image["id"] not in seen):
             seen.add(shot_image["id"])
             rows.append(shot_image)
-        if location and len(rows) < 7:
-            add(self.assets.latest(project_id, "scene_art", location))
         wanted = list(shot.get("characters") or [])
         if location:
             wanted.append(location)
@@ -20720,12 +20822,27 @@ class Director:
                     f"道具资产「{prop}」未在本镜结构化 frame_props 的"
                     "可见/遮挡相位中出现，"
                     "禁止作为本镜参考")
+        if kind == "scene_art":
+            meta = self._asset_meta(row)
+            asset_location = str(
+                meta.get("physical_scene_id")
+                or meta.get("base_location")
+                or str(row["name"]).split("::view:", 1)[0]).strip()
+            expected_location = canonical_scene_location(
+                script or {}, location)
+            if asset_location != expected_location:
+                return (
+                    f"场景资产「{row['name']}」属于物理场景"
+                    f"「{asset_location}」，本镜必须使用"
+                    f"「{expected_location}」的统一母图")
         if kind == "reference":
             meta = self._asset_meta(row)
             attach = str(meta.get("attach_to") or "").strip()
             valid_targets = set(characters)
             if location:
                 valid_targets.add(location)
+                valid_targets.add(canonical_scene_location(
+                    script or {}, location))
             if attach and attach not in valid_targets:
                 return (
                     f"参考图「{row['name']}」关联到{attach}，"
@@ -20770,8 +20887,14 @@ class Director:
         if script is None:
             script, _ = self.projects.latest_document(
                 ctx["episode"]["id"], "script")
+            ctx["script"] = script or {}
         location = self._shot_location(script, shot)
-        # 人工选择只能调整“额外参考”，不能取消每位出场人物的最终立绘。
+        # 人工选择只能调整“额外参考”，不能取消统一场景母图或每位
+        # 出场人物的最终立绘。
+        scene_row = self._required_video_scene_reference(ctx, shot)
+        if scene_row["id"] not in seen:
+            seen.add(scene_row["id"])
+            rows.append(scene_row)
         missing = []
         for name in self._video_identity_names(ctx, shot):
             row = self._locked_identity(ctx["project"]["id"], name)
@@ -20835,24 +20958,27 @@ class Director:
     def _director_select_video_reference_rows(self, rows, shot_no):
         """导演自治时在 Seedance 素材上限内自动选择最有效的参考。
 
-        首尾帧已经携带本镜构图和空间关系，因此槽位不足时先舍弃重复的
-        空间/构图参考，优先保留人物身份、发饰服装和剧情核心道具母资产。
-        这里只做选择，不触发重新生成。
+        场景母图与空间调度分别锁定“房间长什么样”和“人物/相机怎么走”，
+        两者都不可舍弃。槽位不足时先舍弃普通构图参考和已由人物立绘
+        承载的弱重复参考，再保留人物身份与剧情核心道具。这里只做选择，
+        不触发重新生成。
         """
         rows = list(rows or [])
         if (not self._director_autonomy_enabled()
                 or len(rows) <= SEEDANCE_ASSET_REFERENCE_LIMIT):
             return rows
         priority = {
+            # The room master is the geometry/material truth.  Dropping it
+            # caused the exact failure where each video invented a new set.
+            "scene_art": 120,
+            "spatial_blocking": 110,
             "character_art": 100,
             "character_identity": 100,
             "prop_art": 95,
             "prop_identity": 95,
             "inner_persona": 90,
             "reference": 55,
-            "scene_art": 35,
             "image": 25,
-            "spatial_blocking": 10,
         }
         ranked = sorted(
             enumerate(rows),
@@ -20985,9 +21111,16 @@ class Director:
                 "磨损和识别细节；尺寸、持有人、动作及状态服从首尾帧，"
                 f"不得带入棚拍背景或额外物件{carrier_rule}")
         if kind == "scene_art":
+            physical_scene = str(
+                meta.get("physical_scene_id")
+                or meta.get("base_location")
+                or name.split("::view:", 1)[0])
             return (
-                "只锁定场景空间、陈设、材质与主光方向；忽略图中人物、"
-                "动作、服装和文字")
+                f"这是物理母场景「{physical_scene}」的唯一空间真相；"
+                "必须锁定户型、门窗、床/桌/椅等固定陈设的位置与朝向、"
+                "墙地材质、色彩和主光方向；只允许机位与人物动作变化，"
+                "禁止重设计房间、搬动固定家具或生成另一个相似场景；"
+                "忽略图中人物、动作、服装和文字")
         if kind in ("image", "first_frame", "last_frame"):
             return (
                 "只参考构图、人物站位、服装/道具状态、屏幕方向和光线"
@@ -21054,6 +21187,10 @@ class Director:
                        or (shot.get("shot_contract") or {}).get("运镜")
                        or "固定")
         performance = shot.get("performance") or {}
+        visible_location = self._shot_location(
+            ctx.get("script") or {}, shot)
+        physical_location = self._physical_scene_location(
+            ctx, visible_location)
         spatial = shot_blocking(ctx.get("blocking"), shot["shot_no"]) or {}
         spatial_rule = str(spatial.get("constraint") or "").strip()
         # 运镜:分镜只给一个词(如"缓推"),对视频模型约束力弱。用 3D 机位
@@ -21103,6 +21240,10 @@ class Director:
                 "首尾帧")
         lines = [
             boundary_rule + "。",
+            f"【场景硬锁】当前表演区域={visible_location}；唯一物理母场景="
+            f"{physical_location}。所有镜头共享同一户型、门窗、固定家具、"
+            "材质和主光方向；只允许机位、景别、人物与可移动道具变化，"
+            "禁止重设计或替换场景。",
             f"【人物硬锁】{mapped}；成片从头到尾严格共{len(characters)}人，"
             "不得新增、缺失、复制、合并、换脸或换性别；"
             + appearance_rule + "。",
