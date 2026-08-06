@@ -627,7 +627,9 @@ def _backfill_storyboard_prop_transitions(storyboard: dict) -> None:
         "戴上", "摘下", "掉落", "滑落", "倒入", "灌入", "喝下", "打开",
         "合上", "关闭", "点亮", "熄灭", "启动", "停止", "撕开", "拆开",
         "折断", "打碎", "烧毁", "浸湿", "显现", "显示", "露出", "遮住",
-        "切换为", "变为",
+        "切换为", "变为", "变成", "转为", "形成", "闭合", "凝成",
+        "熄成", "熄为", "褪成", "变色", "发光", "亮起", "暗下",
+        "托住", "托起", "支撑", "侧动", "抬起", "移动", "调整",
     )
     negative_cues = (
         "保持不动", "未移动", "没有移动", "不移动", "仍在原位",
@@ -676,6 +678,68 @@ def _backfill_storyboard_prop_transitions(storyboard: dict) -> None:
                         return clause[:300]
         return ""
 
+    def attached_transition_evidence(shot, starts, ends):
+        """Return authored evidence for a prop fixed to the same body support.
+
+        Wearables and body-attached effects move with their support.  Models
+        commonly describe the visible wrist/hand action without repeating the
+        registry display name (for example ``黑色腕绳`` becomes simply
+        ``右腕`` or ``暗金环痕``).  Requiring the exact prop name therefore
+        rejects an otherwise explicit start/end action.  This fallback stays
+        fail-closed for handoffs and teleportation: holder, support and
+        representation must remain identical, and the authored action must
+        contain both a real transition cue and the same anatomical anchor (or
+        the holder's name).
+        """
+        rows = [item for item in starts + ends if isinstance(item, dict)]
+        if not rows:
+            return ""
+        fixed_fields = ("holder", "support", "representation")
+        fixed = {
+            field: {_text(item.get(field)).lower() for item in rows}
+            for field in fixed_fields
+        }
+        if any(len(values) != 1 or not next(iter(values), "")
+               for values in fixed.values()):
+            return ""
+        holder = next(iter(fixed["holder"]), "")
+        support = next(iter(fixed["support"]), "")
+        if holder in {"none", "无", "无人", "unknown", "未知"}:
+            return ""
+
+        # Only expose anatomical anchors already authored in the physical
+        # rows.  A generic actor action elsewhere in the shot must not
+        # authorize a change to an unrelated carried prop.
+        body_parts = (
+            "右腕", "左腕", "手腕", "腕", "右手", "左手", "手掌", "掌心",
+            "手指", "指尖", "右臂", "左臂", "手臂", "上臂", "前臂", "肩",
+            "颈", "脖", "胸", "腰", "腿", "脚", "头", "发", "耳",
+        )
+        anchor_source = " ".join(
+            _text(item.get(field)) for item in rows
+            for field in ("support", "location", "physical_state"))
+        anchors = [part for part in body_parts if part in anchor_source]
+        anchors.append(holder)
+
+        candidates = []
+        for beat in shot.get("temporal_beats") or []:
+            if isinstance(beat, dict):
+                candidates.append(beat.get("action"))
+        candidates.extend(shot.get(key) for key in (
+            "description", "physical_logic", "video_action", "prompt"))
+        for candidate in candidates:
+            text = _text(candidate)
+            for clause in re.split(r"[，,；;。.!！？?]", text):
+                clause = clause.strip()
+                if (not clause
+                        or any(cue in clause for cue in negative_cues)
+                        or not any(cue in clause for cue in transition_cues)
+                        or not any(anchor and anchor in clause
+                                   for anchor in anchors)):
+                    continue
+                return clause[:300]
+        return ""
+
     for shot in storyboard.get("shots") or []:
         if not isinstance(shot, dict):
             continue
@@ -710,6 +774,8 @@ def _backfill_storyboard_prop_transitions(storyboard: dict) -> None:
                     or (prop_id, "start", "end") in transition_keys):
                 continue
             evidence = transition_evidence(shot, prop_id)
+            if not evidence:
+                evidence = attached_transition_evidence(shot, starts, ends)
             if not evidence:
                 # A state delta without an authored action may be teleportation
                 # or an impossible handoff. Keep the strict audit failure rather

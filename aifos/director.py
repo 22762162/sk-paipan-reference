@@ -141,7 +141,7 @@ from .story_logic import (
     audit_prop_contract,
     audit_storyboard_prop_contract,
     normalize_prop_contract,
-    normalize_storyboard_frame_phase_pairs,
+    normalize_storyboard_contract,
     reconcile_storyboard_prop_registry,
 )
 from .style_director import compile_director_style
@@ -16232,21 +16232,30 @@ class Director:
         已保存的分镜可能缺 freeze 定格行或起止对(旧文档没经过最新
         归一化);在合同装配的唯一咽喉做每镜机械回填(定格=尾态既定
         裁决),覆盖续跑/导入等一切来源,不改动分镜文档本体。"""
-        normalized = {"shots": [{
-            "frame_props": copy.deepcopy(shot.get("frame_props") or []),
-            "prop_transitions": copy.deepcopy(
-                shot.get("prop_transitions") or []),
-        }]}
-        normalize_storyboard_frame_phase_pairs(normalized)
         audited_storyboard = copy.deepcopy(ctx.get("storyboard") or {})
         reconcile_storyboard_prop_registry(
             audited_storyboard, copy.deepcopy(ctx.get("script") or {}))
+        registry = (
+            self._prop_registry(audited_storyboard)
+            or self._prop_registry(ctx.get("script") or {}))
+        # Preserve the complete authored shot while normalizing.  Transition
+        # repair needs its description/video action as evidence; the old
+        # props-only copy silently discarded that evidence and could pass the
+        # global audit yet send an empty transition list to image/video calls.
+        normalized = {
+            "prop_registry": copy.deepcopy(registry),
+            "shots": [copy.deepcopy(shot)],
+        }
+        normalize_storyboard_contract(normalized)
+        normalized_shot = normalized["shots"][0]
         return {
-            "prop_registry": (
-                self._prop_registry(audited_storyboard)
-                or self._prop_registry(ctx.get("script") or {})),
-            "frame_props": normalized["shots"][0]["frame_props"],
-            "prop_transitions": normalized["shots"][0]["prop_transitions"],
+            "prop_registry": registry,
+            # Legacy/mock storyboards legitimately have no structured props.
+            # Keep the old empty-contract compatibility while retaining the
+            # complete-shot normalization path for modern boards.
+            "frame_props": normalized_shot.get("frame_props") or [],
+            "prop_transitions": (
+                normalized_shot.get("prop_transitions") or []),
         }
 
     def _require_valid_storyboard_prop_contract(self, ctx):

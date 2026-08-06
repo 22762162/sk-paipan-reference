@@ -231,6 +231,75 @@ def test_state_delta_without_authored_action_is_not_laundered_into_transition():
         for issue in report["issues"])
 
 
+def test_body_attached_prop_uses_explicit_wrist_action_as_transition_evidence():
+    """Episode 30: wrist action need not repeat the wrist-cord display name."""
+    from aifos.director import Director
+
+    prop_id = "prop_yxh_black_wristcord_01"
+    prop = {
+        "prop_id": prop_id,
+        "name": "虞寻欢黑色腕绳",
+        "kind": "core",
+        "instance_count": 1,
+        "introduced_at": {"event_id": "shot-001", "phase": "start"},
+        "availability_start_event": {
+            "event_id": "shot-001", "phase": "start"},
+        "retired_at": None,
+        "availability_end_event": None,
+        "disclosure_policy": "explicit_frame_only",
+    }
+    shot = {
+        "shot_no": 1,
+        "scene_no": 1,
+        "scene_event_id": "scene:1",
+        "event_id": "shot-001",
+        "description": "第二次脉搏到来，暗金细线从右腕内侧闭合成一圈。",
+        "video_action": "暗金环痕在右腕闭合。",
+        "characters": ["虞寻欢"],
+        "frame_props": [{
+            "prop_id": prop_id,
+            "phase": "start",
+            "physical_state": "偏移，腕内侧为正常皮肤",
+            "holder": "虞寻欢",
+            "location": "右腕腕骨上方",
+            "support": "右腕皮肤",
+            "visibility": "visible",
+            "representation": "physical",
+        }, {
+            "prop_id": prop_id,
+            "phase": "end",
+            "physical_state": "偏移，暗金环痕闭合",
+            "holder": "虞寻欢",
+            "location": "右腕腕骨上方",
+            "support": "右腕皮肤",
+            "visibility": "visible",
+            "representation": "physical",
+        }],
+        "prop_transitions": [],
+    }
+    storyboard = {"prop_registry": [copy.deepcopy(prop)], "shots": [shot]}
+    script = {
+        "scenes": [{"scene_no": 1, "event_id": "scene:1"}],
+        "prop_registry": [copy.deepcopy(prop)],
+    }
+
+    reconcile_storyboard_prop_registry(storyboard, script)
+
+    transitions = storyboard["shots"][0]["prop_transitions"]
+    assert len(transitions) == 1
+    assert transitions[0]["prop_id"] == prop_id
+    assert transitions[0]["transition_backfilled"] is True
+    assert "右腕" in transitions[0]["action"]
+    report = audit_storyboard_prop_contract(storyboard)
+    assert report["passed"] is True, report["issues"]
+
+    director = Director.__new__(Director)
+    ctx = {"script": script, "storyboard": storyboard}
+    director._require_valid_storyboard_prop_contract(ctx)
+    contract = director._shot_prop_contract(ctx, storyboard["shots"][0])
+    assert contract["prop_transitions"][0]["prop_id"] == prop_id
+
+
 @pytest.mark.parametrize("description", [
     "朱漆密函保持不动，陆沉推开房门离开",
     "禁止打开朱漆密函",
