@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import html
 import json
 import math
@@ -32,6 +33,8 @@ MIN_CAMERA_SEPARATION = 90
 # 成片门禁只检查真实三维机位与演员的物理净距；二维图标为了可读性
 # 使用的 90px 间距不能反过来推翻导演求出的合法特写/过肩机位。
 MIN_CAMERA_ACTOR_CLEARANCE_M = .3
+ACTOR_ROUTE_CLEARANCE_M = .22
+ACTOR_ROUTE_GRID_M = .2
 # 过肩镜头允许摄影机贴近柔焦肩背前景；仍保留 12cm 硬净距，避免机位
 # 与演员锚点完全重合。景别由主拍对象距离决定，不由这名前景演员决定。
 OVER_SHOULDER_CAMERA_CLEARANCE_M = .12
@@ -44,7 +47,8 @@ ACTOR_COLORS = (
 )
 MOTION_WORDS = (
     "走", "跑", "冲", "追", "进入", "进门", "离开", "起身", "靠近",
-    "后退", "转身", "移动", "绕", "穿过", "上前", "退到", "跟随",
+    "后退", "退入", "转身", "移动", "平移", "绕", "穿过", "上前",
+    "退到", "跟随",
 )
 DIALOGUE_WORDS = (
     "对话", "交谈", "谈话", "对视", "问话", "回答", "质问", "争辩",
@@ -99,6 +103,12 @@ def _number(value, default=0):
 
 def _position_x(value, fallback):
     text = str(value or "")
+    # Anatomical left/right is not a room coordinate. ``右腕旁`` used to be
+    # placed on the room's right edge and then jump to ``床左侧腕部旁`` in the
+    # next phase even though both phrases describe the same bedside contact.
+    text = re.sub(
+        r"[左右](?=(?:手|腕|臂|肘|肩|腿|膝|脚|足|眼|耳|脸|掌|指))",
+        "", text)
     if "左" in text or "西" in text:
         return 300
     if "右" in text or "东" in text:
@@ -190,9 +200,322 @@ def _scene_room_fingerprint(scene_models):
             "location": str(model.get("location") or ""),
             "floor_width_m": width,
             "floor_depth_m": depth,
+            # Actor routes are solved around these boxes.  Furniture moving
+            # inside an unchanged room must invalidate an older straight-line
+            # blocking plan just as a room-size change does.
+            "route_obstacles": sorted((
+                {
+                    "name": str(item.get("name") or ""),
+                    "category": str(item.get("category") or ""),
+                    "position_3d": item.get("position_3d") or {},
+                    "width_m": item.get("width_m"),
+                    "depth_m": item.get("depth_m"),
+                    "height_m": item.get("height_m"),
+                    "rotation_y_deg": item.get("rotation_y_deg"),
+                }
+                for item in (model.get("objects") or [])
+                if isinstance(item, dict)
+            ), key=lambda item: (
+                item["name"], _canonical(item["position_3d"]))),
         })
     return sorted(rows, key=lambda row: (
         row["location"], row["floor_width_m"], row["floor_depth_m"]))
+
+
+def _route_obstacles(scene_model):
+    """Return solid scene boxes used by deterministic actor path finding."""
+    rows = []
+    for item in ((scene_model or {}).get("objects") or []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "场景物体")
+        lowered = name.lower()
+        explicit_blocking = item.get("blocking")
+        if explicit_blocking is False:
+            continue
+        # Floor textiles and visual dressing may overlap a walking footprint;
+        # they are not waist-high solids and must never force a detour.
+        if explicit_blocking is not True and any(
+                token in lowered for token in (
+                    "地毯", "地垫", "脚垫", "rug", "carpet", "mat")):
+            continue
+        category = str(item.get("category") or "").lower()
+        if (explicit_blocking is not True
+                and category in {"decor", "decoration", "light", "lighting",
+                                 "opening", "surface"}):
+            continue
+        position = item.get("position_3d")
+        if not isinstance(position, dict):
+            continue
+        try:
+            cx = float(position.get("x"))
+            cz = float(position.get("z"))
+            width = float(item.get("width_m") or 0)
+            depth = float(item.get("depth_m") or width)
+            height = float(item.get("height_m") or 0)
+            yaw = math.radians(float(item.get("rotation_y_deg") or 0))
+        except (TypeError, ValueError):
+            continue
+        if (width <= 0 or depth <= 0
+                or (height < .4 and explicit_blocking is not True)):
+            continue
+        rows.append((cx, cz, width / 2, depth / 2, yaw, name))
+    return rows
+
+
+def _route_point_hits_box(x, z, box, clearance=ACTOR_ROUTE_CLEARANCE_M):
+    cx, cz, half_w, half_d, yaw, _name = box
+    dx, dz = x - cx, z - cz
+    cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+    local_x = dx * cos_y - dz * sin_y
+    local_z = dx * sin_y + dz * cos_y
+    return (abs(local_x) <= half_w + clearance
+            and abs(local_z) <= half_d + clearance)
+
+
+def _route_segment_clear(left, right, obstacles):
+    distance = math.hypot(right[0] - left[0], right[1] - left[1])
+    samples = max(1, int(math.ceil(distance / .08)))
+    for index in range(samples + 1):
+        ratio = index / samples
+        x = left[0] + (right[0] - left[0]) * ratio
+        z = left[1] + (right[1] - left[1]) * ratio
+        if any(_route_point_hits_box(x, z, box) for box in obstacles):
+            return False
+    return True
+
+
+def _collision_free_actor_route(start, end, scene_model, world=None):
+    """Solve a deterministic polyline around real furniture boxes.
+
+    A route is production geometry, not descriptive prose.  When the direct
+    chord intersects a table or chair, an A* grid finds a valid walkable path
+    and then line-of-sight smoothing removes staircase noise.  The exact start
+    and end remain authoritative so adjacent-shot continuity is preserved.
+    """
+    if not (_point_3d_valid(start) and _point_3d_valid(end)):
+        return [dict(start, phase="start"), dict(end, phase="end")]
+    source = (float(start["x"]), float(start["z"]))
+    target = (float(end["x"]), float(end["z"]))
+    if math.hypot(target[0] - source[0], target[1] - source[1]) <= .05:
+        return [dict(start, phase="fixed")]
+    obstacles = _route_obstacles(scene_model)
+    if not obstacles or _route_segment_clear(source, target, obstacles):
+        return [dict(start, phase="start"), dict(end, phase="end")]
+
+    # If an endpoint intentionally touches its declared support (chair/bed),
+    # allow the actor to leave/enter that support rather than making the graph
+    # unsolvable. Other furniture continues to block the path.
+    endpoint_boxes = [
+        box for box in obstacles
+        if _route_point_hits_box(*source, box, clearance=0.0)
+        or _route_point_hits_box(*target, box, clearance=0.0)]
+    obstacles = [box for box in obstacles if box not in endpoint_boxes]
+    if not obstacles or _route_segment_clear(source, target, obstacles):
+        return [dict(start, phase="start"), dict(end, phase="end")]
+
+    width, depth = _world_dimensions(world)
+    margin = ACTOR_ROUTE_CLEARANCE_M + .08
+    min_x, max_x = -width / 2 + margin, width / 2 - margin
+    min_z, max_z = -depth / 2 + margin, depth / 2 - margin
+    step = ACTOR_ROUTE_GRID_M
+
+    def to_node(point):
+        return (int(round((point[0] - min_x) / step)),
+                int(round((point[1] - min_z) / step)))
+
+    def to_world(node):
+        return (min_x + node[0] * step, min_z + node[1] * step)
+
+    max_i = max(0, int(math.floor((max_x - min_x) / step)))
+    max_j = max(0, int(math.floor((max_z - min_z) / step)))
+    start_node, goal_node = to_node(source), to_node(target)
+
+    def valid(node):
+        if node in (start_node, goal_node):
+            return True
+        if not (0 <= node[0] <= max_i and 0 <= node[1] <= max_j):
+            return False
+        x, z = to_world(node)
+        return not any(_route_point_hits_box(x, z, box)
+                       for box in obstacles)
+
+    frontier = [(0.0, 0.0, start_node)]
+    came_from = {}
+    cost = {start_node: 0.0}
+    directions = (
+        (-1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0), (1, 0, 1.0),
+        (-1, -1, math.sqrt(2)), (-1, 1, math.sqrt(2)),
+        (1, -1, math.sqrt(2)), (1, 1, math.sqrt(2)),
+    )
+    reached = False
+    while frontier:
+        _estimate, current_cost, current = heapq.heappop(frontier)
+        if current == goal_node:
+            reached = True
+            break
+        if current_cost > cost.get(current, float("inf")) + 1e-9:
+            continue
+        current_world = (source if current == start_node
+                         else to_world(current))
+        for dx, dz, multiplier in directions:
+            neighbour = (current[0] + dx, current[1] + dz)
+            if not valid(neighbour):
+                continue
+            neighbour_world = (target if neighbour == goal_node
+                               else to_world(neighbour))
+            if not _route_segment_clear(
+                    current_world, neighbour_world, obstacles):
+                continue
+            new_cost = current_cost + multiplier * step
+            if new_cost + 1e-9 >= cost.get(neighbour, float("inf")):
+                continue
+            cost[neighbour] = new_cost
+            came_from[neighbour] = current
+            heuristic = math.hypot(
+                neighbour_world[0] - target[0],
+                neighbour_world[1] - target[1])
+            heapq.heappush(
+                frontier, (new_cost + heuristic, new_cost, neighbour))
+    if not reached:
+        # Preserve the contract and make the unresolved collision visible to
+        # previz rather than inventing an off-room detour.
+        return [dict(start, phase="start"), dict(end, phase="end")]
+
+    nodes = [goal_node]
+    while nodes[-1] != start_node:
+        nodes.append(came_from[nodes[-1]])
+    nodes.reverse()
+    raw = [source]
+    raw.extend(to_world(node) for node in nodes[1:-1])
+    raw.append(target)
+
+    # Greedy visibility smoothing: keep the farthest reachable waypoint.
+    smoothed = [raw[0]]
+    cursor = 0
+    while cursor < len(raw) - 1:
+        candidate = len(raw) - 1
+        while candidate > cursor + 1 and not _route_segment_clear(
+                raw[cursor], raw[candidate], obstacles):
+            candidate -= 1
+        smoothed.append(raw[candidate])
+        cursor = candidate
+
+    y_start, y_end = float(start.get("y", 0.0)), float(end.get("y", 0.0))
+    last = max(1, len(smoothed) - 1)
+    result = []
+    for index, (x, z) in enumerate(smoothed):
+        phase = ("start" if index == 0 else
+                 "end" if index == len(smoothed) - 1 else
+                 f"waypoint_{index}")
+        result.append({
+            "x": round(x, 2),
+            "y": round(y_start + (y_end - y_start) * index / last, 2),
+            "z": round(z, 2),
+            "phase": phase,
+        })
+    return result
+
+
+def _route_clear_endpoint(point, obstacles, world=None):
+    """Move a standing actor centre just outside expanded solid footprints."""
+    x, z = float(point["x"]), float(point["z"])
+    touched = []
+    for _iteration in range(max(1, len(obstacles) * 2)):
+        changed = False
+        for box in obstacles:
+            if not _route_point_hits_box(x, z, box):
+                continue
+            cx, cz, half_w, half_d, yaw, name = box
+            cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+            dx, dz = x - cx, z - cz
+            local_x = dx * cos_y - dz * sin_y
+            local_z = dx * sin_y + dz * cos_y
+            bound_x = half_w + ACTOR_ROUTE_CLEARANCE_M + .02
+            bound_z = half_d + ACTOR_ROUTE_CLEARANCE_M + .02
+            candidates = (
+                (abs(bound_x - local_x), bound_x, local_z),
+                (abs(-bound_x - local_x), -bound_x, local_z),
+                (abs(bound_z - local_z), local_x, bound_z),
+                (abs(-bound_z - local_z), local_x, -bound_z),
+            )
+            _distance_to_edge, new_local_x, new_local_z = min(candidates)
+            x = cx + new_local_x * cos_y + new_local_z * sin_y
+            z = cz - new_local_x * sin_y + new_local_z * cos_y
+            touched.append(name)
+            changed = True
+        if not changed:
+            break
+    width, depth = _world_dimensions(world)
+    margin = ACTOR_ROUTE_CLEARANCE_M + .02
+    x = max(-width / 2 + margin, min(width / 2 - margin, x))
+    z = max(-depth / 2 + margin, min(depth / 2 - margin, z))
+    return round(x, 3), round(z, 3), list(dict.fromkeys(touched))
+
+
+def rebuild_actor_routes(actors, scene_model, world=None):
+    """Re-solve endpoints and polylines after real-box collision repair."""
+    adjustments = []
+    obstacles = _route_obstacles(scene_model)
+    for actor in actors or []:
+        if not isinstance(actor, dict):
+            continue
+        start = actor.get("start_3d")
+        end = actor.get("end_3d") or start
+        if not (_point_3d_valid(start) and _point_3d_valid(end)):
+            continue
+        # A standing marker is a body centre with non-zero radius, not a
+        # dimensionless dot.  Scene collision repair historically moved only
+        # centres *inside* furniture, leaving a person 6cm from an armchair;
+        # the first video frame therefore still intersected it.  Ground-
+        # supported actors are nudged to the nearest clearance boundary.
+        for field, support_field in (
+                ("start_3d", "support_start"),
+                ("end_3d", "support_end")):
+            point = actor.get(field)
+            support = str(actor.get(support_field) or "")
+            if (not _point_3d_valid(point)
+                    or not any(token in support for token in (
+                        "地面", "双脚", "ground", "floor"))):
+                continue
+            old_x, old_z = float(point["x"]), float(point["z"])
+            new_x, new_z, names = _route_clear_endpoint(
+                point, obstacles, world)
+            if abs(new_x - old_x) < 1e-6 and abs(new_z - old_z) < 1e-6:
+                continue
+            point["x"], point["z"] = new_x, new_z
+            adjustments.append({
+                "type": "actor_route_clearance",
+                "actor": str(actor.get("name") or actor.get("actor_id")),
+                "field": field,
+                "from": {"x": round(old_x, 3), "z": round(old_z, 3)},
+                "to": {"x": new_x, "z": new_z},
+                "objects": names,
+                "clearance_m": ACTOR_ROUTE_CLEARANCE_M,
+            })
+        start = actor.get("start_3d")
+        end = actor.get("end_3d") or start
+        actor["start"] = canvas_from_world(start, world)
+        actor["end"] = canvas_from_world(end, world)
+        route_3d = _collision_free_actor_route(
+            start, end, scene_model, world)
+        actor["route_3d"] = route_3d
+        actor["route"] = [
+            dict(canvas_from_world(point, world), phase=point.get("phase"))
+            for point in route_3d
+        ]
+        moving = len(route_3d) > 1
+        actor["moving"] = moving
+        if not moving:
+            actor["route_direction"] = "静止"
+            actor["route_label"] = "原地静止"
+            continue
+        direction = _direction(actor["route"][0], actor["route"][-1])
+        actor["route_direction"] = direction
+        actor["route_label"] = (
+            f"起点→{len(route_3d) - 2}个避障点→终点，{direction}"
+            if len(route_3d) > 2 else f"起点→终点，{direction}")
+    return adjustments
 
 
 def _world_point(point, height=0.0, world=None):
@@ -509,26 +832,83 @@ def _dialogue_contract(
     return contract
 
 
-def _actor_is_moving(name, people, shot, state_start, state_end):
-    if (state_start.get("position") and state_end.get("position")
-            and state_start.get("position") != state_end.get("position")):
-        return True
-    state_text = " ".join((str(state_start.get("pose") or ""),
-                           str(state_end.get("pose") or "")))
-    if any(word in state_text for word in MOTION_WORDS):
-        return True
-    action_text = " ".join((str(shot.get("description") or ""),
-                            str(shot.get("prompt") or "")))
-    if not any(word in action_text for word in MOTION_WORDS):
+def _positive_actor_motion(text):
+    """Whether prose contains a non-negated whole-body movement verb."""
+    text = str(text or "")
+    for word in MOTION_WORDS:
+        start = 0
+        while True:
+            index = text.find(word, start)
+            if index < 0:
+                break
+            prefix = text[max(0, index - 20):index]
+            if not re.search(
+                    r"(?:不再|没有|无需|不必|未|不|无|禁止|不得|严禁|"
+                    r"避免|不可|不能)[^，。；,;]{0,12}$", prefix):
+                return True
+            start = index + len(word)
+    return False
+
+
+def _same_local_position(start, end):
+    """Recognise wording variants for the same local actor anchor."""
+    left = str(start or "").strip()
+    right = str(end or "").strip()
+    if not left or not right:
         return False
+    if left == right:
+        return True
+    # ``右腕`` is an anatomical object, while ``床左侧`` is the room side.
+    # Both clauses below still resolve to the same wrist-side working spot.
+    if ("腕" in left and "腕" in right
+            and any(token in left for token in ("旁", "侧", "上方"))
+            and any(token in right for token in ("旁", "侧", "上方"))):
+        return True
+    anchors = (
+        "床中央", "床左侧", "床右侧", "床尾", "床头", "沙发",
+        "盥洗室门内", "卧室门内", "房门外", "书桌", "电脑桌",
+    )
+    return any(anchor in left and anchor in right for anchor in anchors)
+
+
+def _actor_is_moving(name, people, shot, state_start, state_end):
+    # Keep fields as separate clauses.  A plain space used to concatenate
+    # ``弟弟保持不动`` with the next prompt's ``姐姐走到床边`` and made the
+    # sibling inherit the heroine's movement.
+    action_text = "；".join((str(shot.get("description") or ""),
+                             str(shot.get("prompt") or "")))
     clauses = re.split(r"[，。；,;]", action_text)
     named_people = [person for person in people if person in action_text]
-    if named_people:
-        return any(
-            name in clause and any(word in clause for word in MOTION_WORDS)
-            for clause in clauses
-        )
-    return True
+    local_clauses = [clause for clause in clauses if name in clause]
+    local_text = "；".join(local_clauses)
+
+    condition = state_end.get("condition") or state_start.get("condition") or {}
+    if isinstance(condition, dict) and str(
+            condition.get("mobility") or "").lower() in {
+                "immobile", "static", "fixed", "不可移动", "不能移动"}:
+        return False
+
+    # Explicit whole-body locks must win before generic token mining:
+    # ``地面移动路径为空`` contains “移动” but declares no movement.
+    explicit_static = any(token in local_text for token in (
+        "起点与终点均锁定", "起点和终点均锁定", "地面移动路径为空",
+        "保持不动", "身体静止", "位置保持不动", "不再平移", "不再移动",
+        "原地不动", "固定在", "始终仰躺", "始终静止"))
+    if explicit_static:
+        return False
+
+    # Actor-local positive action is authoritative. Never let another actor's
+    # walk/retreat turn a sleeping person into a moving blocking marker.
+    if local_clauses and _positive_actor_motion(local_text):
+        return True
+    if (not named_people and _positive_actor_motion(action_text)):
+        return True
+
+    start_position = state_start.get("position")
+    end_position = state_end.get("position")
+    return bool(
+        start_position and end_position
+        and not _same_local_position(start_position, end_position))
 
 
 def build_character_number_map(continuity, storyboard=None):
@@ -570,21 +950,78 @@ SUBJECT_EYE_HEIGHT_M = 1.43   # 1.68m 主体的胸眼高度
 SCALE_TARGET_DISTANCE_M = {
     "大特写": 0.8, "特写": 1.0, "近景": 1.7, "中近景": 1.9,
     "中景": 2.8, "膝上景": 3.0, "七分身": 3.2,
-    "全景": 4.6, "远景": 7.5, "大远景": 10.0,
+    "中全景": 3.8, "全景": 4.6, "远景": 7.5, "大远景": 10.0,
 }
-_SCALE_TOKENS = tuple(SCALE_TARGET_DISTANCE_M)
+# Composite scales contain their shorter neighbours (``中近景`` contains
+# ``近景``, ``中全景`` contains ``全景``).  Always match the most specific
+# token first rather than depending on dict insertion order.
+_SCALE_TOKENS = tuple(sorted(
+    SCALE_TARGET_DISTANCE_M, key=lambda token: (-len(token), token)))
 
 
 def declared_scale(shot):
     """镜头声明的景别(五维优先,退回镜头原文);未命中返回空串。"""
     design = ((shot.get("five_dimensions") or {}).get("camera_design") or {})
-    for source in (design.get("shot_size"), design.get("scale"),
+    for source in (design.get("shot_scale"), design.get("shot_size"),
+                   design.get("scale"),
                    shot.get("camera")):
         text = str(source or "")
         for token in _SCALE_TOKENS:
             if token in text:
                 return token
     return ""
+
+
+def _apply_specific_scale_to_solved_camera(solved, shot, world=None):
+    """Reconcile the 3D solver with this module's specific scale contract.
+
+    The standalone director solver may be older than the blocking vocabulary.
+    In particular, an unknown ``中全景`` can be shortened to ``全景`` before
+    returning here.  Rebuild the solved camera on the same yaw/pitch at the
+    authoritative distance so the fix changes physical staging, not only its
+    label.
+    """
+    if not isinstance(solved, dict):
+        return solved
+    scale = declared_scale(shot)
+    desired = SCALE_TARGET_DISTANCE_M.get(scale)
+    if not scale or desired is None:
+        return solved
+    declared = solved.get("declared") or {}
+    if (declared.get("shot_size") == scale
+            and solved.get("desired_distance_m") == desired):
+        return solved
+    target = solved.get("target_3d") or {}
+    try:
+        tx = float(target.get("x", 0.0))
+        ty = float(target.get("y", SUBJECT_EYE_HEIGHT_M))
+        tz = float(target.get("z", 0.0))
+        yaw = float(solved.get("yaw_deg", 0.0))
+        pitch = float(solved.get("pitch_deg", 0.0))
+    except (TypeError, ValueError):
+        return solved
+    horizontal = desired * math.cos(math.radians(pitch))
+    height = max(.35, min(
+        MAX_SOLVED_CAMERA_HEIGHT_M,
+        ty + desired * math.sin(math.radians(pitch))))
+    cx = tx + horizontal * math.sin(math.radians(yaw))
+    cz = tz + horizontal * math.cos(math.radians(yaw))
+    width, depth = _world_dimensions(world)
+    half_w, half_d = max(.0, width / 2 - .15), max(.0, depth / 2 - .15)
+    wall_clamped = abs(cx) > half_w or abs(cz) > half_d
+    cx = max(-half_w, min(half_w, cx))
+    cz = max(-half_d, min(half_d, cz))
+    actual = math.dist((cx, height, cz), (tx, ty, tz))
+    solved.update({
+        "position_3d": {
+            "x": round(cx, 2), "y": round(height, 2), "z": round(cz, 2)},
+        "height_m": round(height, 2),
+        "distance_m": round(actual, 2),
+        "desired_distance_m": desired,
+        "declared": {**declared, "shot_size": scale},
+        "wall_clamped": wall_clamped,
+    })
+    return solved
 
 
 def _scale_camera_distance(camera, target, shot, world=None):
@@ -675,16 +1112,27 @@ def _camera_orientation(camera_point, target_point):
 def _pose_profile(state, action="", phase="start"):
     """Resolve support and eye/torso target height from visible body state."""
     state = state if isinstance(state, dict) else {}
-    explicit = " ".join(str(state.get(key) or "") for key in (
+    # ``action`` is the legacy *whole-shot* prose supplied by the caller.  It
+    # can describe several actors at once (for example, "虞寻歌站在床边，
+    # 虞寻欢仰躺").  Using it as a fallback lets one actor's pose leak into
+    # another actor's blocking.  Pose truth must therefore come exclusively
+    # from this actor's phase-local state, including its local ``action``.
+    # Keep the argument for API compatibility, but deliberately do not read it.
+    del action, phase
+    text = " ".join(str(state.get(key) or "") for key in (
         "pose", "position", "support", "action"))
-    pose_tokens = (
-        "仰卧", "俯卧", "侧卧", "卧床", "卧榻", "躺", "平卧",
-        "伏案", "趴桌", "趴在", "趴向", "坐", "落座", "跪", "蹲",
-        "蜷缩", "站立", "站姿",
+    standing_words = (
+        "站姿", "站立", "站在", "站着", "站稳", "站起", "直立",
+        "直起", "立于",
     )
-    text = (
-        explicit if any(token in explicit for token in pose_tokens)
-        else f"{explicit} {action}")
+    # A direct standing declaration wins over relational wording in the same
+    # local state, e.g. "站在仰躺的弟弟旁边" still describes a standing actor.
+    if any(word in text for word in standing_words):
+        return {
+            "pose": "standing", "pose_label": "站姿",
+            "support": "双脚/地面", "height_m": DEFAULT_ACTOR_HEIGHT_M,
+            "target_height_m": 1.25,
+        }
     if any(word in text for word in (
             "仰卧", "俯卧", "侧卧", "卧床", "卧榻", "躺", "平卧")):
         support = "床榻" if any(
@@ -870,6 +1318,8 @@ def _apply_director_camera(camera, shot, positions, world=None):
         world=world_dict)
     if not solved:
         return camera
+    solved = _apply_specific_scale_to_solved_camera(
+        solved, shot, world_dict)
     # 运镜也求解:此前终点只是画布像素位移(end_x += 150 之类),既没有米制
     # 依据,也和 MOVEMENT_GEOMETRY 写死的几何对不上——提示词说「沿视线
     # 推近」,三维里可能是斜着平移。现在每个运镜词有确定的几何解。
@@ -1355,8 +1805,9 @@ def build_spatial_plan(
                 end = (start if not moving else
                        _spread_point(
                            preferred_end, occupied_ends + occupied_starts))
-                if any(_distance(end, point) < MIN_ACTOR_SEPARATION
-                       for point in occupied_ends):
+                if (moving and any(
+                        _distance(end, point) < MIN_ACTOR_SEPARATION
+                        for point in occupied_ends)):
                     end = _spread_point(end, occupied_ends)
                 occupied_ends.append(end)
                 previous_end[name] = end
@@ -1370,23 +1821,28 @@ def build_spatial_plan(
                 route_direction = _direction(start, end)
                 start_3d = _world_point(start, world=world)
                 end_3d = _world_point(end, world=world)
+                route_3d = _collision_free_actor_route(
+                    start_3d, end_3d, scene_model, world)
+                route = [
+                    dict(canvas_from_world(point, world),
+                         phase=point.get("phase"))
+                    for point in route_3d
+                ]
+                route_label = (
+                    (f"起点→{len(route_3d) - 2}个避障点→终点，"
+                     f"{route_direction}")
+                    if len(route_3d) > 2 else
+                    (f"起点→终点，{route_direction}"
+                     if start != end else "原地静止"))
                 positions.append({
                     "actor_id": character["actor_id"], "name": name,
                     "role": character["role"],
                     "display_label": character["display_label"],
                     "is_protagonist": character["is_protagonist"],
                     "color": character["color"], "start": start, "end": end,
-                    "route": [dict(start, phase="start"),
-                              dict(end, phase="end")]
-                             if start != end
-                             else [dict(start, phase="fixed")],
+                    "route": route,
                     "start_3d": start_3d, "end_3d": end_3d,
-                    "route_3d": (
-                        [dict(start_3d, phase="start"),
-                         dict(end_3d, phase="end")]
-                        if start != end
-                        else [dict(start_3d, phase="fixed")]
-                    ),
+                    "route_3d": route_3d,
                     "height_m": end_pose["height_m"],
                     "start_height_m": start_pose["height_m"],
                     "end_height_m": end_pose["height_m"],
@@ -1401,8 +1857,7 @@ def build_spatial_plan(
                     "support_end": end_pose["support"],
                     "moving": start != end,
                     "route_direction": route_direction,
-                    "route_label": (f"起点→终点，{route_direction}"
-                                    if start != end else "原地静止"),
+                    "route_label": route_label,
                     # 朝向必须分相位。只留一个 facing 会让首帧合同拿到
                     # 尾帧视线——实测本集 7/8 镜命中:镜6 首帧一边写
                     # 「银铃仍由木面承托、右拳尚未成形」,一边写「视线仍落

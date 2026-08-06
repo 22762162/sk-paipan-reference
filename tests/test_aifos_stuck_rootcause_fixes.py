@@ -28,8 +28,9 @@ def test_scale_capacity_matches_geometry():
     # 覆盖镜头词汇扩展后的全部收紧景别(中近景/七分身/膝上景)。
     assert CAMERA_SCALE_CAPACITY == {
         "大特写": 1, "特写": 1, "近景": 2, "中近景": 2,
-        "七分身": 3, "中景": 4, "膝上景": 4}
+        "七分身": 3, "中景": 4, "膝上景": 4, "中全景": 6}
     assert scale_capacity("全景") > 100
+    assert scale_capacity("中全景") == 6
     assert scale_capacity("") > 100  # 未知景别不设限,宁可漏修不误改
 
 
@@ -173,6 +174,185 @@ def test_partial_people_do_not_hide_distant_prop_anchor_conflict():
     assert contract["camera"]["景别"] == "中景"
     assert contract["camera"]["焦段"] == "35mm"
     assert "空间锚点修正" in contract["camera"]["容量修正"]
+
+
+def test_explicitly_off_frame_occluded_prop_does_not_widen_hand_closeup():
+    """镜11实况:手机已明确出画，不得再把135mm手部特写升成中景。"""
+    shot = {
+        "shot_no": 11,
+        "camera": "135mm微俯手部大特写，固定机位，中心对称构图",
+        "characters": ["虞寻歌", "虞寻欢"],
+        "visible_figure_count": 2,
+        "description": (
+            "画面只框入两人的手腕局部，不出现完整人形；"
+            "床沿手机全部明确出画。"),
+        "frame_targets": {"keyframe": {
+            "phase": "end", "state": "两人的手腕保持接触，手机全部明确出画",
+            "fallback": False, "explicit": True}},
+        "frame_props": [{
+            "prop_id": "prop_game_phone_01", "phase": "end",
+            "visibility": "occluded", "representation": "physical",
+            "holder": "none", "location": "床沿", "support": "床垫",
+        }],
+        "start_state": {}, "end_state": {},
+    }
+
+    contract, prompt = compile_shot_prompt(
+        shot, location="现代卧室", style="写实", references=[],
+        mode="image")
+
+    assert contract["camera"]["景别"] == "大特写"
+    assert contract["camera"]["焦段"] == "135mm"
+    assert "容量修正" not in contract["camera"]
+    assert contract["frame_props"] == []
+    assert "prop_game_phone_01" not in prompt
+    assert "手机" not in prompt
+
+
+def test_out_of_frame_parser_respects_prohibited_out_language():
+    for state in (
+            "手机不得出画", "手机不能出画", "手机禁止出画",
+            "手机必须不出画", "手机应保持画面内，不可出画"):
+        shot = {
+            "camera": "135mm手机与手部特写",
+            "characters": ["甲"],
+            "frame_targets": {"keyframe": {
+                "phase": "freeze", "state": state,
+                "fallback": False, "explicit": True}},
+            "frame_props": [{
+                "prop_id": "phone_main", "name": "手机", "phase": "freeze",
+                "visibility": "visible", "holder": "甲",
+            }],
+        }
+        contract, _prompt = compile_shot_prompt(shot, mode="image")
+        assert contract["frame_props"], state
+
+
+def test_out_of_frame_filter_is_bound_to_current_static_phase():
+    shot = {
+        "camera": "50mm近景",
+        "characters": ["甲"],
+        "frame_kind": "last_frame",
+        "frame_targets": {
+            "first_frame": {
+                "phase": "start", "state": "手机保持画外",
+                "fallback": False, "explicit": True},
+            "last_frame": {
+                "phase": "end", "state": "甲举起手机，屏幕保持可见",
+                "fallback": False, "explicit": True},
+        },
+        "frame_props": [
+            {"prop_id": "phone_main", "name": "手机", "phase": "start",
+             "visibility": "absent", "holder": "none"},
+            {"prop_id": "phone_main", "name": "手机", "phase": "end",
+             "visibility": "visible", "holder": "甲"},
+        ],
+    }
+
+    contract, prompt = compile_shot_prompt(shot, mode="last_frame")
+
+    assert contract["frame_target"]["phase"] == "end"
+    assert contract["frame_props"][0]["prop_id"] == "phone_main"
+    assert "手机" in prompt
+
+
+def test_absent_unheld_phone_does_not_trigger_handheld_screen_rule_in_video():
+    shot = {
+        "camera": "135mm手部大特写",
+        "characters": ["甲", "乙"],
+        "description": "甲握住乙的手腕，手机保持本镜画外",
+        "frame_props": [
+            {"prop_id": "phone_main", "name": "手机", "phase": phase,
+             "visibility": "absent", "holder": "none"}
+            for phase in ("start", "end")
+        ],
+        "physical_contract": {
+            "rules": ["手持屏幕关系：屏幕正面朝向使用者"],
+            "objects": ["手持屏幕：使用者↔屏幕正面"],
+        },
+    }
+
+    contract, prompt = compile_shot_prompt(shot, mode="video")
+
+    assert all("手持屏幕关系" not in rule
+               for rule in contract["physical"]["rules"])
+    assert "手持屏幕关系" not in prompt
+
+
+def test_ordinary_occluded_loose_prop_still_counts_as_spatial_anchor():
+    """没有明确出画声明时，部分遮挡的离身道具仍参与构图关系。"""
+    shot = {
+        "camera": "135mm双手大特写",
+        "characters": ["甲", "乙"], "visible_figure_count": 2,
+        "description": "两人的手腕局部与桌边被手臂遮住一半的手机同框",
+        "frame_targets": {"keyframe": {
+            "phase": "end", "state": "双手和部分被挡手机同框",
+            "fallback": False, "explicit": True}},
+        "frame_props": [{
+            "prop_id": "prop_game_phone_01", "phase": "end",
+            "visibility": "occluded", "representation": "physical",
+            "holder": "none", "location": "桌边", "support": "桌面",
+        }],
+        "start_state": {}, "end_state": {},
+    }
+
+    contract, _prompt = compile_shot_prompt(
+        shot, location="现代卧室", mode="image")
+
+    assert contract["camera"]["景别"] == "中景"
+    assert "空间锚点修正" in contract["camera"]["容量修正"]
+    assert contract["frame_props"][0]["visibility"] == "occluded"
+
+
+def test_short_or_slow_move_camera_language_is_not_revived_as_fixed():
+    for raw in ("35mm全景，短移", "50mm中景，缓移"):
+        contract, _prompt = compile_shot_prompt({
+            "camera": raw,
+            "characters": ["甲"],
+            "description": "人物保持原位，摄影机横向移动",
+            "shot_contract": {"运镜": "固定"},
+        }, mode="video")
+        assert contract["camera"]["运镜"] == "移"
+
+
+def test_hand_insert_does_not_reintroduce_face_or_full_body_geometry():
+    shot = {
+        "camera": "135mm微俯侧面手部大特写",
+        "characters": ["甲", "乙"],
+        "visible_figure_count": 2,
+        "description": "仅框入甲的两指和乙的右腕，不出现完整人形",
+        "frame_targets": {"keyframe": {
+            "phase": "freeze", "state": "两指悬停在右腕上方",
+            "fallback": False, "explicit": True}},
+    }
+
+    contract, prompt = compile_shot_prompt(shot, mode="image")
+
+    assert contract["partial_body_framing"] is True
+    assert "看见头顶" not in prompt
+    assert "单侧眼睛" not in prompt
+    assert "画面可见真人严格共2人" not in prompt
+    assert "不生成完整真人" in prompt
+    assert all(token in prompt for token in ("头部", "面孔", "躯干"))
+
+
+def test_false_screen_carrier_without_text_does_not_create_computer_rule():
+    shot = {
+        "camera": "135mm手部大特写",
+        "characters": ["甲"],
+        "description": "只框手腕",
+        "readable_text": {
+            "required": False, "carrier": "屏幕", "whitelist": []},
+        "frame_targets": {"keyframe": {
+            "phase": "freeze", "state": "手腕保持静止",
+            "fallback": False, "explicit": True}},
+    }
+
+    contract, prompt = compile_shot_prompt(shot, mode="image")
+
+    assert all("电脑使用关系" not in rule
+               for rule in contract["physical"]["rules"])
+    assert "电脑使用关系" not in prompt
 
 
 # ---------- 根因5:media_type 按真实字节 ----------

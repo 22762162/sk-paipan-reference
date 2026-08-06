@@ -945,7 +945,7 @@ def test_v21_registered_functional_and_visible_counts_are_distinct():
     assert validate_shot_prompt_contract(contract)["passed"]
     assert (
         "总可见人形严格为5" in prompt
-        or "画面可见真人严格共5人" in prompt)
+        or "画面可见真人身份严格共5人" in prompt)
     assert "黑衣人3名" in prompt
     assert "书童尸体1" in prompt
 
@@ -1129,6 +1129,8 @@ def test_three_phase_phone_text_isolated_per_still_and_ordered_in_video():
     assert "02:21:59" not in prompts["end"]
     assert "盗神" not in prompts["end"]
     assert contracts["end"]["readable_text_current"]["required"] is False
+    assert contracts["end"]["frame_props"] == []
+    assert "膝侧" not in prompts["end"]
     end_physical = "；".join(
         contracts["end"]["physical"]["rules"]
         + contracts["end"]["physical"]["objects"])
@@ -1859,6 +1861,74 @@ def test_static_end_frame_ignores_video_dialogue_and_start_consciousness():
         for issue in video_report["issues"])
 
 
+def test_dialogue_text_alias_is_rendered_and_cannot_silently_disappear():
+    """修订分镜的 ``text`` 台词也必须进入视频配音/口型合同。"""
+    shot = {
+        "shot_no": 12,
+        "characters": ["虞寻歌", "虞寻欢"],
+        "description": "虞寻欢睁眼看向姐姐并发问",
+        "camera": "35mm双人中景",
+        "dialogue": {
+            "character": "虞寻欢",
+            "text": "姐……你在做什么？",
+            "lip_sync": True,
+            "no_burned_subtitles": True,
+        },
+    }
+
+    contract, prompt = compile_shot_prompt(shot, mode="video")
+
+    assert contract["dialogue"] == "姐……你在做什么？"
+    assert contract["dialogue_source_declared"] is True
+    assert "【对白】虞寻欢说出「姐……你在做什么？」" in prompt
+    assert validate_shot_prompt_contract(contract)["passed"]
+
+    # Even if a later compiler refactor accidentally clears the normalized
+    # line, the audit bit makes validation fail instead of approving silence.
+    contract["dialogue"] = ""
+    report = validate_shot_prompt_contract(contract)
+    assert not report["passed"]
+    assert any("禁止静默丢失台词" in issue for issue in report["issues"])
+
+
+def test_legacy_dialogue_field_remains_supported():
+    shot = {
+        "characters": ["虞寻歌"],
+        "description": "虞寻歌看向弟弟",
+        "camera": "35mm中景",
+        "dialogue": {
+            "character": "虞寻歌",
+            "dialogue": "睡吧，我守着你。",
+        },
+    }
+
+    contract, prompt = compile_shot_prompt(shot, mode="video")
+
+    assert contract["dialogue"] == "睡吧，我守着你。"
+    assert contract["dialogue_source_declared"] is True
+    assert "【对白】虞寻歌说出「睡吧，我守着你。」" in prompt
+    assert validate_shot_prompt_contract(contract)["passed"]
+
+
+def test_blank_legacy_dialogue_falls_back_to_text_alias():
+    shot = {
+        "characters": ["虞寻欢"],
+        "description": "虞寻欢睁眼发问",
+        "camera": "50mm近景",
+        "dialogue": {
+            "character": "虞寻欢",
+            "dialogue": "   ",
+            "text": "姐，你在做什么？",
+        },
+    }
+
+    contract, prompt = compile_shot_prompt(shot, mode="video")
+
+    assert contract["dialogue"] == "姐，你在做什么？"
+    assert contract["dialogue_source_declared"] is True
+    assert "姐，你在做什么？" in prompt
+
+
 def test_static_end_frame_ignores_non_target_pose_wardrobe_and_headwear():
     """静态终帧只审终点造型，视频仍必须交代起止变化。"""
     shot = {
@@ -2003,6 +2073,41 @@ def test_static_unbound_kinship_action_cannot_bypass_restrictive_state():
 
     assert not report["passed"]
     assert any("未绑定称谓" in issue for issue in report["issues"])
+
+
+def test_awake_start_gaze_is_legal_before_declared_sleep_transition():
+    shot = {
+        "shot_no": 151,
+        "characters": ["虞寻歌", "虞寻欢"],
+        "camera": "双人中景固定",
+        "video_action": (
+            "虞寻歌站在门内看向床铺并说‘睡吧’；"
+            "虞寻欢听完后缓慢闭眼入睡"),
+        "description": "虞寻歌与虞寻欢保持原位，虞寻欢闭眼入睡",
+        "start_state": {
+            "虞寻歌": {"direction": "看向床铺", "condition": {
+                "life_state": "alive", "consciousness_state": "awake",
+                "embodiment": "physical", "mobility": "active"}},
+            "虞寻欢": {"pose": "仰躺睁眼", "direction": "望向虞寻歌",
+                "condition": {
+                    "life_state": "alive", "consciousness_state": "awake",
+                    "embodiment": "physical", "mobility": "limited"}},
+        },
+        "end_state": {
+            "虞寻歌": {"direction": "看向床铺", "condition": {
+                "life_state": "alive", "consciousness_state": "awake",
+                "embodiment": "physical", "mobility": "active"}},
+            "虞寻欢": {"pose": "仰躺双眼闭合安睡",
+                "direction": "闭眼面部朝向虞寻歌一侧", "condition": {
+                    "life_state": "alive", "consciousness_state": "asleep",
+                    "embodiment": "physical", "mobility": "limited"}},
+        },
+    }
+
+    contract, _ = compile_shot_prompt(shot, mode="video")
+    report = validate_shot_prompt_contract(contract)
+
+    assert report["passed"], report["issues"]
 
 
 def test_static_explicit_nickname_binds_restrictive_actor_behavior():
@@ -2670,6 +2775,7 @@ def test_repaired_camera_is_synchronized_into_all_executable_contracts():
             "shot_scale": "近景", "angle": "俯拍", "lens": "85mm",
             "camera_position": "正面", "movement": "跟",
             "composition": "框中框",
+            "capacity_note": "旧3人构图需要升档",
         }, "aesthetics": {"shot_pattern": "侧面跟拍"}},
         "style_direction": {
             "shot_pattern": "侧面跟拍",
@@ -2700,6 +2806,7 @@ def test_repaired_camera_is_synchronized_into_all_executable_contracts():
     assert design["shot_scale"] == "中近景"
     assert design["angle"] == "平视"
     assert design["movement"] == "固定"
+    assert "capacity_note" not in design
     direction_camera = shot["style_direction"]["camera_contract"]
     assert direction_camera == {
         "shot_scale": "中近景", "angle": "平视", "lens": "135mm",
@@ -2720,6 +2827,28 @@ def test_repaired_camera_is_synchronized_into_all_executable_contracts():
     synchronize_shot_execution_contract(
         shot, location="临江县衙书房", style="超写实古装短剧")
     assert shot["seedance_prompt"] == first
+
+
+def test_synchronized_camera_refreshes_current_capacity_note():
+    shot = {
+        "characters": ["甲", "乙", "丙"],
+        "visible_figure_count": 3,
+        "description": "三人同框，均需保留可辨认身份。",
+        "camera": "85mm平视三人近景，固定机位，三分法",
+        "shot_contract": {},
+        "five_dimensions": {"camera_design": {
+            "capacity_note": "旧2人备注",
+        }},
+    }
+
+    synchronize_shot_execution_contract(shot)
+
+    design = shot["five_dimensions"]["camera_design"]
+    executed = shot["prompt_contract"]["camera"]
+    assert executed["景别"] == "中景"
+    assert "容量修正" in executed
+    assert design["capacity_note"] == executed["容量修正"]
+    assert "旧2人备注" not in design["capacity_note"]
 
 
 def test_static_image_repair_preserves_the_original_video_action():
@@ -2793,7 +2922,7 @@ def test_repaired_camera_ignores_negated_or_actor_lock_movement_tokens():
     assert shot["shot_contract"]["景别"] == "近景"
     assert shot["shot_contract"]["角度"] == "俯拍"
     assert shot["shot_contract"]["焦段"] == "135mm"
-    assert shot["shot_contract"]["机位"] == "侧面"
+    assert shot["shot_contract"]["机位"] == "斜侧"
     assert shot["shot_contract"]["运镜"] == "固定"
     assert shot["prompt_contract"]["camera"]["运镜"] == "固定"
 
@@ -2868,3 +2997,322 @@ def test_all_unknown_character_conditions_are_dropped_from_prompt():
     assert "书童:start(life=dead" in stated_prompt
     # 全 unknown 的林川不该混进这一行
     assert "林川:start(life=unknown" not in stated_prompt
+
+
+def test_freeze_target_preserves_explicit_blocking_phase():
+    shot = {
+        "characters": ["虞寻歌"],
+        "camera": "35mm平视中景固定机位",
+        "frame_target": {
+            "phase": "freeze", "blocking_phase": "end",
+            "state": "虞寻歌停在盥洗室门内", "fallback": False,
+        },
+        "start_state": {"虞寻歌": {
+            "position": "床边", "pose": "站立", "direction": "看向床"}},
+        "end_state": {"虞寻歌": {
+            "position": "盥洗室门内", "pose": "站稳", "direction": "看向房门"}},
+        "spatial_blocking": {"actors": [{
+            "name": "虞寻歌", "start": "床边", "end": "盥洗室门内",
+            "facing_start": "看向床", "facing_end": "看向房门",
+        }]},
+    }
+
+    contract, prompt = compile_shot_prompt(shot, mode="image")
+
+    assert contract["frame_target"]["blocking_phase"] == "end"
+    assert "盥洗室门内" in prompt
+    assert "虞寻歌:床边" not in prompt
+
+
+def test_partial_body_detection_requires_part_specific_crop_not_raised_wrist():
+    portrait = {
+        "characters": ["虞寻歌", "虞寻欢"],
+        "camera": "50mm平视双人中景，人物面部清晰",
+        "description": "虞寻歌抬腕后俯身查看弟弟",
+        "frame_target": {
+            "phase": "end", "state": "虞寻歌抬腕站在床边，完整面部清晰",
+            "fallback": False},
+    }
+    local_hand = {
+        "characters": ["虞寻歌", "虞寻欢"],
+        "camera": "135mm微俯腕部大特写，只框入两人的手腕和手指局部",
+        "description": "不出现完整人形",
+        "start_state": {
+            "虞寻歌": {
+                "wardrobe": "白衬衫、深灰长裤、米色平底鞋",
+                "hair_makeup": "深黑长卷发、淡妆",
+            },
+            "虞寻欢": {
+                "wardrobe": "黑衬衫、浅灰长裤、赤脚",
+                "hair_makeup": "深黑短发",
+            },
+        },
+        "frame_target": {
+            "phase": "end", "state": "两只手腕和相触手指构成局部特写",
+            "fallback": False},
+    }
+    local_foot = {
+        "characters": ["虞寻歌"],
+        "camera": "100mm低机位脚部特写，只框入脚踝、鞋面和地面",
+        "description": "头部、面部、躯干出画",
+        "frame_target": {
+            "phase": "end", "state": "双脚站稳，鞋底由地面支撑",
+            "fallback": False},
+    }
+
+    portrait_contract, portrait_prompt = compile_shot_prompt(
+        portrait, mode="image")
+    hand_contract, hand_prompt = compile_shot_prompt(local_hand, mode="image")
+    foot_contract, foot_prompt = compile_shot_prompt(local_foot, mode="image")
+
+    assert portrait_contract["partial_body_framing"] is False
+    assert "局部身份关联" not in portrait_prompt
+    assert hand_contract["partial_body_parts"] == ["hand"]
+    assert "双眼、嘴唇" not in hand_prompt
+    for outside_crop in ("长卷发", "淡妆", "长裤", "平底鞋", "赤脚"):
+        assert outside_crop not in hand_prompt
+    assert foot_contract["partial_body_parts"] == ["foot"]
+    assert "脚、足踝、鞋袜" in foot_prompt
+    assert "头颈几何" in foot_prompt
+    assert "鞋底必须由地面" in foot_prompt
+
+
+def test_video_hand_insert_keeps_local_crop_without_face_or_full_body_geometry():
+    shot = {
+        "characters": ["甲", "乙"],
+        "visible_figure_count": 2,
+        "camera": (
+            "135mm微俯斜侧手部大特写，缓推；"
+            "只框入甲的两指与乙的右腕局部"),
+        "description": "甲两指从画面左侧伸入，乙右腕由桌面支撑",
+        "style_direction": {
+            "shot_pattern": "135mm俯拍斜侧手部大特写，缓推",
+            "visual_effects": ["双眼、嘴唇、发丝、手指保持局部锐利"],
+            "selection_reason": "缓推聚焦两指与腕部接触",
+            "camera_contract": {"movement": "缓推"},
+        },
+        # Complete actor ledgers are still required for continuity, but they
+        # must not override the lens's deliberately cropped visible area.
+        "start_state": {
+            "甲": {
+                "position": "桌边", "pose": "俯身站立，右手两指悬停",
+                "wardrobe": "黑色衬衫、长裤", "hair_makeup": "短发",
+            },
+            "乙": {
+                "position": "座椅", "pose": "坐稳，右腕由桌面支撑",
+                "wardrobe": "白色衬衫、长裤", "hair_makeup": "长发",
+            },
+        },
+        "end_state": {
+            "甲": {
+                "position": "桌边", "pose": "俯身站立，右手两指接触手腕",
+                "wardrobe": "黑色衬衫、长裤", "hair_makeup": "短发",
+            },
+            "乙": {
+                "position": "座椅", "pose": "坐稳，右腕由桌面支撑",
+                "wardrobe": "白色衬衫、长裤", "hair_makeup": "长发",
+            },
+        },
+        "performance": {"micro_expression": "甲眉眼紧张，乙嘴唇发抖"},
+    }
+
+    contract, prompt = compile_shot_prompt(shot, mode="video")
+
+    assert contract["partial_body_framing"] is True
+    assert contract["partial_body_parts"] == ["hand"]
+    assert "局部身份关联严格共2人" in prompt
+    assert "画面可见真人严格共2人" not in prompt
+    assert "均为完整身体" not in prompt
+    for forbidden in (
+            "可见头顶与双肩", "只见单侧眼睛", "兼见面部正面",
+            "胸口以上入画", "双眼", "嘴唇", "发丝"):
+        assert forbidden not in prompt
+    assert "手指保持局部锐利" in prompt
+    assert "缓推聚焦两指与腕部接触" in prompt
+    assert "眉眼紧张" not in prompt
+    assert "嘴唇发抖" not in prompt
+    assert "hair_makeup" not in prompt
+    assert "妆发短发" not in prompt
+    assert "头饰presence" not in prompt
+    assert "长裤" not in prompt
+    assert "镜内表演只由已声明的手、腕、手指、袖口或足部局部完成" in prompt
+    assert "人物头顶、头颈、双肩、眼耳鼻口、面孔及完整躯干必须出画" in prompt
+    assert "禁止补出完整人物、头部、头颈、面孔、躯干" in prompt
+
+
+def test_static_first_frame_does_not_inherit_later_functional_shadow():
+    shot = {
+        "characters": ["甲"],
+        "visible_figure_count": 1,
+        "camera": "35mm平视中景固定机位",
+        "functional_figures": [{
+            "name": "门外来客", "count": 1, "partial_only": True,
+            "visible_parts": ["门下单一人影"],
+            "state": "身体始终在门外；室内仅可见门下单一人影",
+            "function": "门下人影制造压力",
+        }],
+        "frame_targets": {
+            "first_frame": {
+                "phase": "start", "state": "门下尚无人影，甲看向房门",
+                "fallback": False,
+            },
+            "last_frame": {
+                "phase": "end", "state": "门下出现单一人影",
+                "fallback": False,
+            },
+        },
+    }
+
+    first_contract, first_prompt = compile_shot_prompt(
+        shot, mode="first_frame")
+    last_contract, last_prompt = compile_shot_prompt(
+        shot, mode="last_frame")
+
+    assert first_contract["subject"]["partial_visible_count"] == 0
+    assert first_contract["subject"]["off_camera_count"] == 1
+    assert "门下尚无人影" in first_prompt
+    assert "室内仅可见门下单一人影" not in first_prompt
+    assert "门下人影制造压力" not in first_prompt
+    assert last_contract["subject"]["partial_visible_count"] == 1
+    assert "只允许出现局部=门下单一人影" in last_prompt
+
+
+def test_video_ordinary_mid_shot_with_raised_wrist_is_not_partial():
+    shot = {
+        "characters": ["甲", "乙"],
+        "camera": "50mm平视双人中景，固定机位",
+        "description": "甲抬腕看表，乙坐在桌边，两人面部清晰",
+        "start_state": {"甲": {"pose": "站立"}, "乙": {"pose": "坐在桌边"}},
+        "end_state": {"甲": {"pose": "抬腕站立"}, "乙": {"pose": "坐在桌边"}},
+    }
+
+    contract, prompt = compile_shot_prompt(shot, mode="video")
+
+    assert contract["partial_body_framing"] is False
+    assert "局部身份关联" not in prompt
+    assert "画面可见真人身份严格共2人" in prompt
+    assert "可按执行景别合规裁切" in prompt
+    assert "均为完整身体" not in prompt
+
+
+def test_static_style_direction_is_terminal_and_motion_free():
+    shot = {
+        "characters": ["虞寻歌"],
+        "camera": "50mm平视中景跟拍",
+        "description": "虞寻歌从沙发走到床边并伸手拨绳",
+        "frame_target": {
+            "phase": "end", "state": "虞寻歌站在床边，两指停在皮绳旁",
+            "fallback": False},
+        "style_direction": {
+            "shot_pattern": "50mm平视中景，跟拍，三分法",
+            "visual_effects": ["暖金轮廓光"],
+            "selection_reason": "短跟从沙发移动到床边，再完成拨绳动作",
+            "camera_contract": {"movement": "跟拍"},
+        },
+    }
+
+    contract, prompt = compile_shot_prompt(shot, mode="image")
+
+    style_line = next(
+        line for line in prompt.splitlines() if line.startswith("【风格导演执行】"))
+    assert "静态定格" in style_line
+    for leaked in ("跟拍", "短跟", "从沙发", "移动到", "拨绳动作"):
+        assert leaked not in style_line
+    assert "movement" not in contract["style_direction"]["camera_contract"]
+
+
+def test_inactive_devices_do_not_create_user_screen_geometry():
+    off_phone = {
+        "characters": ["虞寻歌"],
+        "description": "虞寻歌握着熄屏手机看向房门",
+        "frame_target": {
+            "phase": "end", "state": "虞寻歌握熄屏手机看向房门",
+            "fallback": False},
+        "prop_registry": [{"prop_id": "phone", "name": "手机"}],
+        "frame_props": [{
+            "prop_id": "phone", "phase": "end", "holder": "虞寻歌",
+            "physical_state": "完全熄屏、左手持握", "visibility": "visible",
+        }],
+    }
+    passes_computer = {
+        "characters": ["虞寻歌"],
+        "description": "虞寻歌沿电脑桌外侧净空走道经过，不接触电脑桌",
+        "video_action": "虞寻歌绕过电脑桌走到床边",
+    }
+
+    _, phone_prompt = compile_shot_prompt(off_phone, mode="image")
+    _, computer_prompt = compile_shot_prompt(passes_computer, mode="video")
+
+    assert "手持屏幕关系" not in phone_prompt
+    assert "电脑使用关系" not in computer_prompt
+
+
+def test_functional_figures_distinguish_full_partial_and_off_camera_sources():
+    shot = {
+        "characters": ["虞寻歌"],
+        "camera": "35mm平视中景固定",
+        "description": "虞寻歌看向半压门把；门外只有一只手和一道人影",
+        "frame_target": {
+            "phase": "end", "state": "虞寻歌看向门；门外一只手压住门把",
+            "fallback": False},
+        "functional_figures": [
+            {"name": "门外家佣", "count": 1, "partial_only": True,
+             "visible_parts": ["一只手", "门下影子"]},
+            {"name": "画外呼喊者", "count": 1, "off_camera": True},
+        ],
+    }
+
+    contract, prompt = compile_shot_prompt(shot, mode="image")
+
+    subject = contract["subject"]
+    assert subject["functional_count"] == 2
+    assert subject["visible_count"] == 1
+    assert subject["source_count"] == 3
+    assert subject["partial_visible_count"] == 1
+    assert subject["off_camera_count"] == 1
+    assert contract["population"]["figure_accounting"] == {
+        "person_sources_total": 3,
+        "complete_visible_people": 1,
+        "functional_full_visible": 0,
+        "functional_partial_visible": 1,
+        "functional_off_camera": 1,
+    }
+    assert "只允许出现局部=一只手、门下影子" in prompt
+    assert "严格在画外，不生成身体、头部或面孔" in prompt
+    assert "不得把局部手/影子补成第三具完整身体或完整脸" in prompt
+    assert validate_shot_prompt_contract(contract)["passed"]
+
+
+def test_medium_wide_scale_is_not_swallowed_by_wide_suffix():
+    shot = {
+        "characters": ["虞寻歌"],
+        "camera": "35mm平视中全景固定机位，框中框",
+        "description": "虞寻歌贴墙站定，房门、床和墙面边界同框",
+        "frame_target": {
+            "phase": "end", "state": "虞寻歌贴墙站定，房门与床保持可见",
+            "fallback": False},
+    }
+
+    contract, prompt = compile_shot_prompt(shot, mode="image")
+
+    assert contract["camera"]["景别"] == "中全景"
+    assert "【镜头】中全景" in prompt
+    assert "中全景=人物从头部至少取到小腿或完整全身" in prompt
+    assert contract["camera"]["构图"] == "框中框"
+
+
+def test_oblique_side_camera_is_not_collapsed_to_ninety_degree_profile():
+    shot = {
+        "characters": ["虞寻歌"],
+        "camera": "35mm平视斜侧中全景固定机位",
+        "description": "虞寻歌站在距墙有安全余量的门内",
+        "frame_target": {
+            "phase": "end", "state": "虞寻歌站在门内，身体斜向房门",
+            "fallback": False},
+    }
+
+    contract, prompt = compile_shot_prompt(shot, mode="image")
+
+    assert contract["camera"]["机位"] == "斜侧"
+    assert "斜侧=摄影机位于人物正面轴线侧偏约35至45度" in prompt
+    assert "90度纯侧面" in prompt

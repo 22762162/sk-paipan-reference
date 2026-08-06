@@ -16,6 +16,15 @@ def _actor(name, start, end=None):
             "end_3d": {"x": end[0], "y": 0.0, "z": end[1]}}
 
 
+def _route(points, y=0.0):
+    return [
+        {"x": point[0], "y": y, "z": point[1],
+         "phase": ("start" if index == 0 else
+                   "end" if index == len(points) - 1 else f"waypoint_{index}")}
+        for index, point in enumerate(points)
+    ]
+
+
 def _blocking(shots, locations=None):
     scenes = {}
     for shot in shots:
@@ -83,6 +92,93 @@ class PathCollisionTest(unittest.TestCase):
         self.assertTrue(
             previz_report(blocking, scene_models=models)["passed"])
 
+    def test_route_3d_bend_around_table_overrides_endpoint_chord(self):
+        actor = _actor("林川", (-2.0, 0.0), (2.0, 0.0))
+        actor["route_3d"] = _route([
+            (-2.0, 0.0), (-2.0, 1.2), (2.0, 1.2), (2.0, 0.0)])
+        blocking = _blocking(
+            [_shot(1, 1, [actor])], locations={1: "书房"})
+        models = {"书房": _model([
+            ("长桌", 0, 0, 1.2, 0.8, 0.8, 0)])}
+
+        self.assertTrue(
+            previz_report(blocking, scene_models=models)["passed"])
+
+    def test_collision_on_middle_route_3d_segment_is_caught(self):
+        actor = _actor("林川", (-2.0, 1.2), (2.0, 1.2))
+        actor["route_3d"] = _route([
+            (-2.0, 1.2), (-2.0, 0.0), (2.0, 0.0), (2.0, 1.2)])
+        blocking = _blocking(
+            [_shot(1, 1, [actor])], locations={1: "书房"})
+        models = {"书房": _model([
+            ("长桌", 0, 0, 1.2, 0.8, 0.8, 0)])}
+
+        report = previz_report(blocking, scene_models=models)
+
+        self.assertEqual(
+            [item["kind"] for item in report["issues"]], ["path_collision"])
+        self.assertIn("route_3d 第2/3段", report["issues"][0]["detail"])
+
+    def test_tall_decor_rug_and_curtain_are_not_solid_obstacles(self):
+        blocking = _blocking([_shot(
+            1, 1, [_actor("林川", (-2.0, 0.0), (2.0, 0.0))])],
+            locations={1: "书房"})
+        models = {"书房": {"objects": [
+            {"name": "厚地毯", "category": "decor",
+             "position_3d": {"x": -0.6, "y": 0, "z": 0},
+             "width_m": 1.0, "depth_m": 1.0, "height_m": 0.8},
+            {"name": "落地纱帘", "category": "decor",
+             "position_3d": {"x": 0.8, "y": 0, "z": 0},
+             "width_m": 1.0, "depth_m": 0.2, "height_m": 2.5},
+        ]}}
+
+        self.assertTrue(
+            previz_report(blocking, scene_models=models)["passed"])
+
+    def test_explicit_nonblocking_overrides_furniture_category(self):
+        blocking = _blocking([_shot(
+            1, 1, [_actor("林川", (-2.0, 0.0), (2.0, 0.0))])],
+            locations={1: "客厅"})
+        models = {"客厅": {"objects": [{
+            "name": "软装展示面", "category": "furniture",
+            "blocking": False,
+            "position_3d": {"x": 0, "y": 0, "z": 0},
+            "width_m": 1.0, "depth_m": 0.5, "height_m": 2.0,
+        }]}}
+
+        self.assertTrue(
+            previz_report(blocking, scene_models=models)["passed"])
+
+    def test_explicit_blocking_can_make_decor_a_real_partition(self):
+        blocking = _blocking([_shot(
+            1, 1, [_actor("林川", (-2.0, 0.0), (2.0, 0.0))])],
+            locations={1: "客厅"})
+        models = {"客厅": {"objects": [{
+            "name": "硬质装饰隔墙", "category": "decor", "blocking": True,
+            "position_3d": {"x": 0, "y": 0, "z": 0},
+            "width_m": 1.0, "depth_m": 0.2, "height_m": 2.0,
+        }]}}
+
+        report = previz_report(blocking, scene_models=models)
+
+        self.assertEqual(
+            [item["kind"] for item in report["issues"]], ["path_collision"])
+
+    def test_explicit_blocking_overrides_low_height_soft_default(self):
+        blocking = _blocking([_shot(
+            1, 1, [_actor("林川", (-2.0, 0.0), (2.0, 0.0))])],
+            locations={1: "舞台"})
+        models = {"舞台": {"objects": [{
+            "name": "禁行区域", "category": "decor", "blocking": True,
+            "position_3d": {"x": 0, "y": 0, "z": 0},
+            "width_m": 1.0, "depth_m": 0.5, "height_m": 0.05,
+        }]}}
+
+        report = previz_report(blocking, scene_models=models)
+
+        self.assertEqual(
+            [item["kind"] for item in report["issues"]], ["path_collision"])
+
 
 class CrossingTest(unittest.TestCase):
     def test_two_actors_colliding_mid_shot_is_caught(self):
@@ -99,6 +195,18 @@ class CrossingTest(unittest.TestCase):
             _actor("林川", (-2.0, 0.0), (2.0, 0.0)),
             _actor("阿砚", (-2.0, 1.5), (2.0, 1.5)),
         ])])
+        self.assertTrue(previz_report(blocking)["passed"])
+
+    def test_separate_route_3d_detours_do_not_false_cross(self):
+        left = _actor("林川", (-2.0, 0.0), (2.0, 0.0))
+        right = _actor("阿砚", (2.0, 0.0), (-2.0, 0.0))
+        left["route_3d"] = _route([
+            (-2.0, 0.0), (-2.0, 1.2), (2.0, 1.2), (2.0, 0.0)])
+        right["route_3d"] = _route([
+            (2.0, 0.0), (2.0, -1.2), (-2.0, -1.2), (-2.0, 0.0)])
+
+        blocking = _blocking([_shot(1, 1, [left, right])])
+
         self.assertTrue(previz_report(blocking)["passed"])
 
 
@@ -127,6 +235,37 @@ class CameraTest(unittest.TestCase):
         models = {"书房": _model([("立柜", 0, 0, 1.0, 0.6, 2.0, 0)])}
         self.assertTrue(
             previz_report(blocking, scene_models=models)["passed"])
+
+    def test_camera_route_3d_bends_around_cabinet(self):
+        camera = self._camera((-3.0, 0.0), (3.0, 0.0), y=1.2)
+        camera["route_3d"] = _route([
+            (-3.0, 0.0), (-3.0, 1.0), (3.0, 1.0), (3.0, 0.0)],
+            y=1.2)
+        blocking = _blocking([_shot(
+            1, 1, [_actor("林川", (3.0, 3.0))], camera=camera)],
+            locations={1: "书房"})
+        models = {"书房": _model([
+            ("立柜", 0, 0, 1.0, 0.6, 2.0, 0)])}
+
+        self.assertTrue(
+            previz_report(blocking, scene_models=models)["passed"])
+
+    def test_camera_collision_reports_middle_route_3d_segment(self):
+        camera = self._camera((-3.0, 1.0), (3.0, 1.0), y=1.2)
+        camera["route_3d"] = _route([
+            (-3.0, 1.0), (-3.0, 0.0), (3.0, 0.0), (3.0, 1.0)],
+            y=1.2)
+        blocking = _blocking([_shot(
+            1, 1, [_actor("林川", (3.0, 3.0))], camera=camera)],
+            locations={1: "书房"})
+        models = {"书房": _model([
+            ("立柜", 0, 0, 1.0, 0.6, 2.0, 0)])}
+
+        report = previz_report(blocking, scene_models=models)
+
+        self.assertEqual(
+            [item["kind"] for item in report["issues"]], ["camera_through"])
+        self.assertIn("route_3d 第2/3段", report["issues"][0]["detail"])
 
 
 class ReportShapeTest(unittest.TestCase):

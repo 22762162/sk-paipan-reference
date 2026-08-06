@@ -26,7 +26,7 @@ import math
 SHOT_SIZE_DISTANCE_M = {
     "大特写": 0.8, "特写": 1.0, "近景": 1.7, "中近景": 1.9,
     "中景": 2.8, "膝上景": 3.0, "七分身": 3.2,
-    "全景": 4.6, "远景": 7.5, "大远景": 10.0,
+    "中全景": 3.8, "全景": 4.6, "远景": 7.5, "大远景": 10.0,
 }
 
 # 角度 → 俯仰角(度,正=机位高于主体向下拍)。此前整个维度是死的。
@@ -70,7 +70,12 @@ def _match_token(text, table):
 def declared_shot_size(shot):
     design = ((shot or {}).get("five_dimensions") or {}).get(
         "camera_design") or {}
-    for source in (design.get("shot_size"), design.get("scale"),
+    # ``shot_scale`` is the executable field emitted by workflow.camera_plan.
+    # The other names are legacy aliases; raw prose is only the final fallback.
+    # Without this priority a stale camera label can silently override the
+    # already-reviewed five-dimensional director contract.
+    for source in (design.get("shot_scale"), design.get("shot_size"),
+                   design.get("scale"),
                    (shot or {}).get("camera")):
         token = _match_token(source, SHOT_SIZE_DISTANCE_M)
         if token:

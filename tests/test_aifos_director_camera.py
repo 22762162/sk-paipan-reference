@@ -47,22 +47,53 @@ class DeclaredFieldTest(unittest.TestCase):
         self.assertEqual(declared_shot_size(shot), "大特写")
         self.assertEqual(declared_angle(shot), "俯拍")
 
+    def test_executable_shot_scale_wins_over_aliases_and_raw_camera(self):
+        shot = {
+            "shot_no": 1,
+            "camera": "85mm中近景",
+            "five_dimensions": {"camera_design": {
+                "shot_scale": "中全景",
+                "shot_size": "特写",
+                "scale": "近景",
+            }},
+        }
+
+        self.assertEqual(declared_shot_size(shot), "中全景")
+        camera = solve_camera(
+            shot, [_actor()],
+            world={"floor_width_m": 30, "floor_depth_m": 30})
+        self.assertEqual(camera["declared"]["shot_size"], "中全景")
+        self.assertEqual(camera["desired_distance_m"], 3.8)
+
+    def test_invalid_shot_scale_falls_back_to_raw_camera(self):
+        shot = {
+            "shot_no": 1,
+            "camera": "50mm中近景",
+            "five_dimensions": {"camera_design": {
+                "shot_scale": "按导演判断",
+            }},
+        }
+
+        self.assertEqual(declared_shot_size(shot), "中近景")
+
     def test_position_tokens(self):
         self.assertEqual(declared_position(_shot("特写，平视，过肩")), "过肩")
         self.assertEqual(declared_position(_shot("特写，平视，侧面")), "侧面")
 
 
 class DistanceTest(unittest.TestCase):
-    def _distance(self, text):
-        cam = solve_camera(_shot(text), [_actor()])
+    def _distance(self, text, world=None):
+        cam = solve_camera(_shot(text), [_actor()], world=world)
         p, t = cam["position_3d"], cam["target_3d"]
         return math.dist((p["x"], p["y"], p["z"]), (t["x"], t["y"], t["z"]))
 
     def test_every_declared_size_lands_on_its_distance(self):
         for size, want in SHOT_SIZE_DISTANCE_M.items():
-            if want > 4.0:
-                continue          # 大于半间屋的景别会贴墙,单独测
-            got = self._distance(f"{size}，平视，正面")
+            # Use a deliberately large room here so this test measures the
+            # declared scale itself. Wall-clamp behaviour is covered below.
+            got = self._distance(
+                f"{size}，平视，正面",
+                world={"floor_width_m": 30, "floor_depth_m": 30})
             self.assertAlmostEqual(got, want, delta=0.12,
                                    msg=f"{size} 应 {want}m,实得 {got:.2f}m")
 

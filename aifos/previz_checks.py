@@ -23,7 +23,14 @@ ACTOR_RADIUS_M = 0.22          # 人身半径(路径碰撞判定)
 CROSSING_MIN_GAP_M = 0.35      # 两人路径最小安全间距
 CAMERA_RADIUS_M = 0.12         # 相机体积半径
 SOLID_MIN_HEIGHT_M = 0.4      # 低于此高度的物体(地毯/门槛)不算碰撞体
-PATH_SAMPLES = 9               # 每条路径的插值采样数
+
+# scene_model 现有类别中只有 furniture/prop 作为家具碰撞体。
+# decor/opening/light 是外观或开口参考，不能因为默认高度较大就阻挡路线。
+_SOLID_CATEGORIES = frozenset({"furniture", "prop", "structure", "structural"})
+_NON_SOLID_NAMES = (
+    "地毯", "地垫", "窗帘", "纱帘", "门帘", "帘幕", "帷幔", "纱帐",
+    "挂毯", "床单", "床罩", "被褥", "抱枕", "靠垫", "软垫", "桌布",
+)
 
 
 def _point(value, default_y=0.0):
@@ -44,11 +51,51 @@ def _dist_xz(a, b):
     return math.hypot(a[0] - b[0], a[2] - b[2])
 
 
+def _dist_3d(a, b):
+    return math.sqrt(sum((a[i] - b[i]) ** 2 for i in range(3)))
+
+
+def _explicit_bool(value):
+    """只解析明确的布尔值；None 表示 schema 未声明。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "yes", "1", "on"}:
+            return True
+        if text in {"false", "no", "0", "off"}:
+            return False
+    return None
+
+
+def _solid_obstacle(obj):
+    """scene_model 物体是否可作为路线碰撞体。
+
+    显式 ``blocking`` 是最高优先级，与可编辑调度图 schema 一致；
+    未声明时再沿用 scene_model 的 category 语义。对无 category 的
+    存量文档保持兼容，但排除明确可踩踏/可穿过的软饰名称。
+    """
+    declared = _explicit_bool(obj.get("blocking"))
+    if declared is not None:
+        return declared
+    category = str(obj.get("category") or "").strip().lower()
+    if category and category not in _SOLID_CATEGORIES:
+        return False
+    name = str(obj.get("name") or "")
+    if any(token in name for token in _NON_SOLID_NAMES):
+        return False
+    return True
+
+
 def _boxes(scene_model):
     """场景模型 → 碰撞盒列表 (cx, cz, half_w, half_d, yaw_rad, height)。"""
     rows = []
     for obj in (scene_model or {}).get("objects") or []:
         if not isinstance(obj, dict):
+            continue
+        if not _solid_obstacle(obj):
             continue
         pos = obj.get("position_3d")
         if not isinstance(pos, dict):
@@ -61,22 +108,158 @@ def _boxes(scene_model):
             yaw = math.radians(float(obj.get("rotation_y_deg") or 0.0))
         except (TypeError, ValueError):
             continue
-        if width <= 0 or depth <= 0 or height < SOLID_MIN_HEIGHT_M:
+        explicitly_blocking = _explicit_bool(obj.get("blocking")) is True
+        if (width <= 0 or depth <= 0
+                or (height < SOLID_MIN_HEIGHT_M and not explicitly_blocking)):
             continue
         rows.append((cx, cz, width / 2.0, depth / 2.0, yaw,
                      height, str(obj.get("name") or "场景物体")))
     return rows
 
 
-def _hits_box(point, box, radius):
-    """点(带半径)是否落入旋转矩形足迹内。"""
+def _segment_box_interval_xz(start, end, box, radius):
+    """线段与旋转盒扩张足迹的参数交集 [enter, exit]。
+
+    比每段固定采样更稳定：窄桌腿/薄隔断也不会从采样点之间漏过。
+    """
     cx, cz, half_w, half_d, yaw, _height, _name = box
-    dx, dz = point[0] - cx, point[2] - cz
     cos_y, sin_y = math.cos(yaw), math.sin(yaw)
-    local_x = dx * cos_y - dz * sin_y
-    local_z = dx * sin_y + dz * cos_y
-    return (abs(local_x) <= half_w + radius
-            and abs(local_z) <= half_d + radius)
+
+    def local(point):
+        dx, dz = point[0] - cx, point[2] - cz
+        return (dx * cos_y - dz * sin_y,
+                dx * sin_y + dz * cos_y)
+
+    start_xz, end_xz = local(start), local(end)
+    lower = (-half_w - radius, -half_d - radius)
+    upper = (half_w + radius, half_d + radius)
+    enter, exit_ = 0.0, 1.0
+    for axis in range(2):
+        origin = start_xz[axis]
+        delta = end_xz[axis] - origin
+        if abs(delta) <= 1e-12:
+            if origin < lower[axis] or origin > upper[axis]:
+                return None
+            continue
+        first = (lower[axis] - origin) / delta
+        second = (upper[axis] - origin) / delta
+        if first > second:
+            first, second = second, first
+        enter, exit_ = max(enter, first), min(exit_, second)
+        if enter > exit_:
+            return None
+    return (max(0.0, enter), min(1.0, exit_))
+
+
+def _route_points(entity, default_y=0.0):
+    """route_3d 优先，存量数据回退 start_3d→end_3d。"""
+    route = [point for point in (
+        _point(value, default_y) for value in (entity or {}).get("route_3d") or [])
+             if point is not None]
+    start = _point((entity or {}).get("start_3d"), default_y)
+    end = _point((entity or {}).get("end_3d"), default_y) or start
+    if len(route) >= 2:
+        return route
+    if start is not None:
+        if end is not None and _dist_3d(start, end) > 1e-9:
+            return [start, end]
+        return [start]
+    return route
+
+
+def _route_length(route, distance=_dist_xz):
+    return sum(distance(left, right) for left, right in zip(route, route[1:]))
+
+
+def _timed_route(route):
+    """把无时标 route_3d 按路程归一化，等速参与交叉检查。"""
+    if not route:
+        return []
+    if len(route) == 1:
+        return [(0.0, route[0]), (1.0, route[0])]
+    lengths = [_dist_xz(left, right)
+               for left, right in zip(route, route[1:])]
+    total = sum(lengths)
+    if total <= 1e-9:
+        return [(index / (len(route) - 1), point)
+                for index, point in enumerate(route)]
+    elapsed = 0.0
+    result = [(0.0, route[0])]
+    for length, point in zip(lengths, route[1:]):
+        elapsed += length
+        result.append((min(1.0, elapsed / total), point))
+    result[-1] = (1.0, result[-1][1])
+    return result
+
+
+def _point_at(timed_route, t):
+    if not timed_route:
+        return None
+    for (left_t, left), (right_t, right) in zip(
+            timed_route, timed_route[1:]):
+        if t <= right_t + 1e-9:
+            span = right_t - left_t
+            ratio = 0.0 if span <= 1e-9 else (t - left_t) / span
+            return _lerp(left, right, max(0.0, min(1.0, ratio)))
+    return timed_route[-1][1]
+
+
+def _closest_routes_xz(route_a, route_b):
+    """按同一归一化时间轴检查两条折线的最近距离。"""
+    timed_a, timed_b = _timed_route(route_a), _timed_route(route_b)
+    if not timed_a or not timed_b:
+        return math.inf
+    breakpoints = sorted({t for t, _point_value in (*timed_a, *timed_b)})
+    closest = math.inf
+    for start_t, end_t in zip(breakpoints, breakpoints[1:]):
+        a_start, a_end = _point_at(timed_a, start_t), _point_at(timed_a, end_t)
+        b_start, b_end = _point_at(timed_b, start_t), _point_at(timed_b, end_t)
+        closest = min(closest, _closest_approach_xz(
+            a_start, a_end, b_start, b_end))
+    return closest
+
+
+def _route_box_hit(route, box, radius, *, camera=False):
+    """返回折线首个穿盒点；全路线首末点留给端点校验。"""
+    if len(route) < 2:
+        return None
+    segment_lengths = [_dist_3d(left, right) if camera else _dist_xz(left, right)
+                       for left, right in zip(route, route[1:])]
+    total = sum(segment_lengths)
+    elapsed = 0.0
+    last_segment = len(route) - 2
+    for index, (start, end) in enumerate(zip(route, route[1:])):
+        interval = _segment_box_interval_xz(start, end, box, radius)
+        if interval is None:
+            elapsed += segment_lengths[index]
+            continue
+        enter, exit_ = interval
+        # 旧逻辑不复审全路线的首末站位，但中间转角必须审。
+        if index == 0:
+            enter = max(enter, 1e-7)
+        if index == last_segment:
+            exit_ = min(exit_, 1.0 - 1e-7)
+        if enter > exit_:
+            elapsed += segment_lengths[index]
+            continue
+        hit_t = enter
+        if camera:
+            height = box[5]
+            y_enter = start[1] + (end[1] - start[1]) * enter
+            y_exit = start[1] + (end[1] - start[1]) * exit_
+            if min(y_enter, y_exit) > height:
+                elapsed += segment_lengths[index]
+                continue
+            if y_enter > height and abs(end[1] - start[1]) > 1e-12:
+                hit_t = max(enter, min(exit_,
+                    (height - start[1]) / (end[1] - start[1])))
+        point = _lerp(start, end, hit_t)
+        distance_at_hit = elapsed + segment_lengths[index] * hit_t
+        percent = 0 if total <= 1e-9 else int(round(
+            100 * distance_at_hit / total))
+        return {"point": point, "percent": percent,
+                "segment": index + 1, "segments": len(route) - 1}
+    return None
 
 
 def _closest_approach_xz(a_start, a_end, b_start, b_end):
@@ -99,10 +282,10 @@ def _actor_states(block):
         if not isinstance(actor, dict):
             continue
         name = str(actor.get("name") or "").strip()
-        start = _point(actor.get("start_3d"))
-        end = _point(actor.get("end_3d")) or start
-        if name and start:
-            states[name] = (start, end)
+        route = _route_points(actor)
+        if name and route:
+            states[name] = {"start": route[0], "end": route[-1],
+                            "route": route}
     return states
 
 
@@ -170,70 +353,69 @@ def previz_report(blocking, storyboard=None, scene_models=None):
 
         # 1) 跨镜传送:同场相邻镜共有角色的站位跳变
         if previous and previous[1] == scene_no:
-            for name, (start, _end) in states.items():
+            for name, state in states.items():
                 prev_state = previous[2].get(name)
                 if not prev_state:
                     continue
-                gap = _dist_xz(prev_state[1], start)
+                start = state["start"]
+                previous_end = prev_state["end"]
+                gap = _dist_xz(previous_end, start)
                 if gap > TELEPORT_THRESHOLD_M:
                     issues.append(_issue(
                         shot_no, scene_no, "teleport",
                         f"{name}上一镜(镜{previous[0]})结束在"
-                        f"({prev_state[1][0]:.1f},{prev_state[1][2]:.1f}),"
+                        f"({previous_end[0]:.1f},{previous_end[2]:.1f}),"
                         f"本镜开始在({start[0]:.1f},{start[2]:.1f}),"
                         f"瞬移{gap:.1f}米;若剧情确有走位,应在上一镜"
                         "写出移动或在本镜开头交代"))
 
         moving = {
-            name: (start, end) for name, (start, end) in states.items()
-            if _dist_xz(start, end) > 0.05}
+            name: state for name, state in states.items()
+            if _route_length(state["route"]) > 0.05}
 
-        # 2) 中途碰撞:移动路径扫过家具
-        for name, (start, end) in moving.items():
-            for step in range(1, PATH_SAMPLES):
-                t = step / PATH_SAMPLES
-                point = _lerp(start, end, t)
-                hit = next((box for box in boxes
-                            if _hits_box(point, box, ACTOR_RADIUS_M)), None)
-                if hit is not None:
+        # 2) 中途碰撞:按 route_3d 的每个折线段扫过家具。
+        # 禁止再用 start→end 弦线代替真实绕行路线。
+        for name, state in moving.items():
+            route = state["route"]
+            for box in boxes:
+                hit = _route_box_hit(route, box, ACTOR_RADIUS_M)
+                if hit:
                     issues.append(_issue(
                         shot_no, scene_no, "path_collision",
-                        f"{name}的移动路径在{int(t * 100)}%处穿过"
-                        f"「{hit[6]}」;起终点都合法,但直线走不过去,"
+                        f"{name}的 route_3d 第{hit['segment']}/"
+                        f"{hit['segments']}段在全程{hit['percent']}%处穿过"
+                        f"「{box[6]}」;起终点都合法,但该分段走不过去,"
                         "需要绕行或改起终点"))
                     break
 
-        # 3) 交叉相撞:两人同一时间窗路径交汇
+        # 3) 交叉相撞:两人同一时间窗的分段路线交汇。
+        # 无显式时标时按各自路程归一化,视为全镜等速。
         names = sorted(moving)
         for i, name_a in enumerate(names):
             for name_b in names[i + 1:]:
-                a_start, a_end = moving[name_a]
-                b_start, b_end = moving[name_b]
-                closest = _closest_approach_xz(
-                    a_start, a_end, b_start, b_end)
+                closest = _closest_routes_xz(
+                    moving[name_a]["route"], moving[name_b]["route"])
                 if closest < CROSSING_MIN_GAP_M:
                     issues.append(_issue(
                         shot_no, scene_no, "crossing",
-                        f"{name_a}与{name_b}的移动路径在同一时间窗交汇,"
+                        f"{name_a}与{name_b}的 route_3d 分段在同一时间窗交汇,"
                         f"最近仅{closest:.2f}米;错开出发时机或改走位"))
 
-        # 4) 相机穿模:运镜路径中途撞实体
+        # 4) 相机穿模:运镜 route_3d 每段中途撞实体
         camera = block.get("camera") or {}
-        cam_start = _point(camera.get("start_3d"), 1.55)
-        cam_end = _point(camera.get("end_3d"), 1.55) or cam_start
-        if cam_start and _dist_xz(cam_start, cam_end) > 0.05:
-            for step in range(1, PATH_SAMPLES):
-                t = step / PATH_SAMPLES
-                point = _lerp(cam_start, cam_end, t)
-                hit = next(
-                    (box for box in boxes
-                     if point[1] <= box[5]
-                     and _hits_box(point, box, CAMERA_RADIUS_M)), None)
-                if hit is not None:
+        camera_route = _route_points(camera, 1.55)
+        if _route_length(camera_route, _dist_3d) > 0.05:
+            for box in boxes:
+                hit = _route_box_hit(
+                    camera_route, box, CAMERA_RADIUS_M, camera=True)
+                if hit:
+                    point = hit["point"]
                     issues.append(_issue(
                         shot_no, scene_no, "camera_through",
-                        f"运镜路径在{int(t * 100)}%处以{point[1]:.1f}米"
-                        f"高度穿过「{hit[6]}」(高{hit[5]:.1f}米);"
+                        f"运镜 route_3d 第{hit['segment']}/"
+                        f"{hit['segments']}段在全程{hit['percent']}%处以"
+                        f"{point[1]:.1f}米高度穿过「{box[6]}」"
+                        f"(高{box[5]:.1f}米);"
                         "抬高机位、绕行或缩短运动距离"))
                     break
 

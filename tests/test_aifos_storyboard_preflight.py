@@ -10,6 +10,7 @@
 import unittest
 
 from aifos.storyboard_preflight import (describe_issues,
+                                        _scale_of,
                                         preflight_storyboard,
                                         repairable_shots)
 
@@ -37,6 +38,26 @@ def _actor(name, x, z=0.0):
 
 
 class CapacityTest(unittest.TestCase):
+    def test_medium_wide_is_an_independent_scale_before_wide(self):
+        self.assertEqual(_scale_of({"camera": "35mm中全景·平视"}), "中全景")
+
+    def test_medium_wide_holds_at_least_two_complete_people(self):
+        sb = {"shots": [{
+            "shot_no": 6, "scene_no": 1, "camera": "中全景",
+            "characters": ["甲", "乙"], "visible_figure_count": 2,
+        }]}
+        self.assertNotIn("scale_capacity", {
+            item["kind"] for item in preflight_storyboard({}, sb)["issues"]})
+
+    def test_medium_wide_keeps_a_finite_group_capacity(self):
+        sb = {"shots": [{
+            "shot_no": 7, "scene_no": 1, "camera": "中全景",
+            "characters": list("甲乙丙丁戊己庚"),
+            "visible_figure_count": 7,
+        }]}
+        self.assertIn("scale_capacity", {
+            item["kind"] for item in preflight_storyboard({}, sb)["issues"]})
+
     def test_closeup_cannot_hold_three_people(self):
         """实测原型:85mm特写要求三人全部可见 → 出图必熔断。"""
         sb = {"shots": [{"shot_no": 1, "scene_no": 1, "camera": "85mm特写",
@@ -158,6 +179,174 @@ class AxisFlipTest(unittest.TestCase):
                 if i["kind"] == "axis_flip"]
         self.assertEqual(axis, [])
 
+    def test_partial_hand_insert_does_not_infer_axis_from_hidden_bodies(self):
+        sb, blocking = self._two_shots(
+            [_actor("甲", 1.6), _actor("乙", -1.6)])
+        sb["shots"][1].update({
+            "camera": "135mm双手大特写",
+            "description": (
+                "甲乙均只以手腕局部入画，面部、躯干和完整人形出画；"
+                "只表现两只手腕的接触关系，不声明可见左右位置"),
+            "visible_figure_count": 2,
+        })
+
+        axis = [
+            item for item in preflight_storyboard({}, sb, blocking)["issues"]
+            if item["kind"] == "axis_flip"]
+
+        self.assertEqual(axis, [])
+
+    def test_partial_insert_still_catches_explicit_visible_axis_reversal(self):
+        sb, blocking = self._two_shots(
+            [_actor("甲", 1.6), _actor("乙", -1.6)])
+        sb["shots"][0]["camera"] = "甲在画面左侧，乙在画面右侧"
+        sb["shots"][1].update({
+            "camera": "135mm手部大特写，甲在画面右侧，乙在画面左侧",
+            "description": "两人只露手腕局部，不出现完整人形",
+            "visible_figure_count": 2,
+        })
+
+        axis = [
+            item for item in preflight_storyboard({}, sb, blocking)["issues"]
+            if item["kind"] == "axis_flip"]
+
+        self.assertEqual(len(axis), 1)
+
+    def test_unobservable_insert_does_not_erase_last_visible_axis(self):
+        sb = {"shots": [
+            {"shot_no": 1, "scene_no": 1, "camera": "双人中景",
+             "characters": ["甲", "乙"]},
+            {"shot_no": 2, "scene_no": 1, "camera": "135mm手部大特写",
+             "characters": ["甲", "乙"], "visible_figure_count": 2,
+             "description": "只框入两人手腕，面部、躯干和完整人形出画"},
+            {"shot_no": 3, "scene_no": 1, "camera": "双人中景",
+             "characters": ["甲", "乙"]},
+        ]}
+        blocking = {"shot_index": {}}
+        for no, actors in (
+                (1, [_actor("甲", -1.6), _actor("乙", 1.6)]),
+                (2, [_actor("甲", -1.6), _actor("乙", 1.6)]),
+                (3, [_actor("甲", 1.6), _actor("乙", -1.6)])):
+            blocking["shot_index"].update(
+                _blocking(no, actors)["shot_index"])
+
+        axis = [
+            item for item in preflight_storyboard({}, sb, blocking)["issues"]
+            if item["kind"] == "axis_flip"]
+
+        self.assertEqual([item["shot_no"] for item in axis], [3])
+
+    def test_two_face_closeup_remains_axis_observable(self):
+        sb, blocking = self._two_shots(
+            [_actor("甲", 1.6), _actor("乙", -1.6)])
+        sb["shots"][1].update({
+            "camera": "85mm双人贴面特写",
+            "description": "两张脸同时清楚入画，甲乙左右位置可辨",
+            "visible_figure_count": 2,
+        })
+
+        axis = [
+            item for item in preflight_storyboard({}, sb, blocking)["issues"]
+            if item["kind"] == "axis_flip"]
+
+        self.assertEqual(len(axis), 1)
+
+    def test_explicit_zero_visible_people_never_uses_hidden_actor_centres(self):
+        sb, blocking = self._two_shots(
+            [_actor("甲", 1.6), _actor("乙", -1.6)])
+        sb["shots"][1].update({
+            "visible_figure_count": 0,
+            "description": "空镜，两人均在画外",
+        })
+
+        axis = [
+            item for item in preflight_storyboard({}, sb, blocking)["issues"]
+            if item["kind"] == "axis_flip"]
+
+        self.assertEqual(axis, [])
+
+    def test_adjacent_scene_numbers_in_same_room_keep_axis_continuity(self):
+        sb, blocking = self._two_shots(
+            [_actor("甲", 1.6), _actor("乙", -1.6)])
+        sb["shots"][1]["scene_no"] = 2
+        script = {"scenes": [
+            {"scene_no": 1, "location": "虞家别墅·卧室"},
+            {"scene_no": 2, "location": "虞家别墅·卧室床侧"},
+        ]}
+
+        axis = [
+            item for item in preflight_storyboard(
+                script, sb, blocking)["issues"]
+            if item["kind"] == "axis_flip"]
+
+        self.assertEqual(len(axis), 1)
+
+    def test_cut_compares_previous_end_to_current_start(self):
+        sb, blocking = self._two_shots(
+            [_actor("甲", 1.6), _actor("乙", -1.6)])
+        previous = blocking["shot_index"]["1"]["actors"]
+        previous[0]["end_3d"] = {"x": 1.6, "y": 0.0, "z": 0.0}
+        previous[1]["end_3d"] = {"x": -1.6, "y": 0.0, "z": 0.0}
+
+        axis = [
+            item for item in preflight_storyboard({}, sb, blocking)["issues"]
+            if item["kind"] == "axis_flip"]
+
+        self.assertEqual(axis, [])
+
+    def test_explicit_screen_side_lock_overrides_hidden_route_projection(self):
+        sb, blocking = self._two_shots(
+            [_actor("甲", 1.6), _actor("乙", -1.6)])
+        sb["shots"][1]["camera"] = (
+            "保持上一镜轴线同侧，甲固定在画面左侧，乙固定在画面右侧")
+
+        axis = [
+            item for item in preflight_storyboard({}, sb, blocking)["issues"]
+            if item["kind"] == "axis_flip"]
+
+        self.assertEqual(axis, [])
+
+    def test_negated_screen_positions_do_not_manufacture_axis_flip(self):
+        sb, blocking = self._two_shots(
+            [_actor("甲", -1.6), _actor("乙", 1.6)])
+        sb["shots"][0]["camera"] = "甲在画面左侧，乙在画面右侧"
+        for wording in ("不在", "禁止在", "不得在", "不应在"):
+            with self.subTest(wording=wording):
+                sb["shots"][1]["camera"] = (
+                    f"甲{wording}画面右侧，乙{wording}画面左侧")
+                axis = [
+                    item for item in preflight_storyboard(
+                        {}, sb, blocking)["issues"]
+                    if item["kind"] == "axis_flip"]
+                self.assertEqual(axis, [])
+
+    def test_realm_phase_or_era_change_resets_axis_in_same_room(self):
+        sb, blocking = self._two_shots(
+            [_actor("甲", 1.6), _actor("乙", -1.6)])
+        script = {"scenes": [
+            {"scene_no": 1, "location": "虞家别墅·卧室"},
+        ]}
+        cases = (
+            ({"active_realm_id": "reality"},
+             {"active_realm_id": "game"}),
+            ({"story_phase": "present"},
+             {"story_phase": "flashback"}),
+            ({"era_context": "2078年现代"},
+             {"era_context": "明代"}),
+        )
+        for before, after in cases:
+            with self.subTest(before=before, after=after):
+                sb["shots"][0].update(before)
+                sb["shots"][1].update(after)
+                axis = [
+                    item for item in preflight_storyboard(
+                        script, sb, blocking)["issues"]
+                    if item["kind"] == "axis_flip"]
+                self.assertEqual(axis, [])
+                for key in set(before) | set(after):
+                    sb["shots"][0].pop(key, None)
+                    sb["shots"][1].pop(key, None)
+
 
 class FramingDistanceTest(unittest.TestCase):
     def test_declared_scale_far_from_camera_distance_is_caught(self):
@@ -167,6 +356,111 @@ class FramingDistanceTest(unittest.TestCase):
         report = preflight_storyboard({}, sb, blocking)
         kinds = [i["kind"] for i in report["issues"]]
         self.assertIn("framing_distance", kinds)
+
+    def test_end_frame_uses_end_geometry_for_framing(self):
+        actor = _actor("甲", 0.0, -3.0)
+        actor["moving"] = True
+        actor["end_3d"] = {"x": 0.0, "y": 0.0, "z": 3.2}
+        sb = {"shots": [{
+            "shot_no": 1, "scene_no": 1, "camera": "特写",
+            "characters": ["甲"],
+            "frame_target": {"phase": "end", "state": "甲停在机位前"},
+        }]}
+        report = preflight_storyboard({}, sb, _blocking(1, [actor]))
+        self.assertNotIn("framing_distance", {
+            item["kind"] for item in report["issues"]})
+
+    def test_freeze_blocking_phase_overrides_freeze_label(self):
+        actor = _actor("甲", 0.0, -3.0)
+        actor["moving"] = True
+        actor["end_3d"] = {"x": 0.0, "y": 0.0, "z": 3.2}
+        sb = {"shots": [{
+            "shot_no": 1, "scene_no": 1, "camera": "特写",
+            "characters": ["甲"],
+            "frame_target": {
+                "phase": "freeze", "blocking_phase": "end",
+                "state": "甲停在机位前",
+            },
+        }]}
+        report = preflight_storyboard({}, sb, _blocking(1, [actor]))
+        self.assertNotIn("framing_distance", {
+            item["kind"] for item in report["issues"]})
+
+    def test_medium_wide_matches_spatial_blocking_3_8_metres(self):
+        block = _blocking(1, [_actor("甲", 0.0)])
+        block["shot_index"]["1"]["camera"]["director_camera"] = {
+            "declared": {"shot_size": "中全景"},
+            "distance_m": 3.8,
+            "desired_distance_m": 3.8,
+            "yaw_deg": 0.0,
+        }
+        sb = {"shots": [{
+            "shot_no": 1, "scene_no": 1, "camera": "中全景",
+            "characters": ["甲"],
+        }]}
+        report = preflight_storyboard({}, sb, block)
+        self.assertNotIn("framing_distance", {
+            item["kind"] for item in report["issues"]})
+
+    def test_medium_wide_still_rejects_closeup_distance(self):
+        block = _blocking(1, [_actor("甲", 0.0)])
+        block["shot_index"]["1"]["camera"]["director_camera"] = {
+            "declared": {"shot_size": "中全景"},
+            "distance_m": 1.0,
+            "desired_distance_m": 1.0,
+            "yaw_deg": 0.0,
+        }
+        sb = {"shots": [{
+            "shot_no": 1, "scene_no": 1, "camera": "中全景",
+            "characters": ["甲"],
+        }]}
+        report = preflight_storyboard({}, sb, block)
+        framing = [item for item in report["issues"]
+                   if item["kind"] == "framing_distance"]
+        self.assertEqual(len(framing), 1)
+        self.assertIn("合同声明中全景", framing[0]["detail"])
+
+
+class DirectorCameraClampTest(unittest.TestCase):
+    @staticmethod
+    def _report(**camera_flags):
+        director_camera = {
+            "declared": {"shot_size": "中景"},
+            "yaw_deg": 0.0,
+            "desired_distance_m": 4.2,
+            "distance_m": 2.8,
+            "movement": "拉",
+            "movement_amount": "1.2米",
+            **camera_flags,
+        }
+        blocking = {"shot_index": {"1": {
+            "shot_no": 1, "scene_no": 1,
+            "camera": {"director_camera": director_camera},
+            "actors": [],
+        }}}
+        storyboard = {"shots": [{
+            "shot_no": 1, "scene_no": 1, "camera": "中景",
+            "characters": [],
+        }]}
+        return preflight_storyboard({}, storyboard, blocking)
+
+    def test_wall_clamped_camera_is_a_preflight_issue(self):
+        report = self._report(wall_clamped=True)
+        self.assertIn("camera_wall_clamped", {
+            item["kind"] for item in report["issues"]})
+
+    def test_wall_clamped_movement_is_a_preflight_issue(self):
+        report = self._report(movement_wall_clamped=True)
+        self.assertIn("camera_movement_wall_clamped", {
+            item["kind"] for item in report["issues"]})
+
+    def test_other_camera_warnings_are_not_promoted_by_this_gate(self):
+        report = self._report(wall_clamped=False,
+                              movement_wall_clamped=False)
+        self.assertNotIn("camera_wall_clamped", {
+            item["kind"] for item in report["issues"]})
+        self.assertNotIn("camera_movement_wall_clamped", {
+            item["kind"] for item in report["issues"]})
 
 
 class ReportShapeTest(unittest.TestCase):

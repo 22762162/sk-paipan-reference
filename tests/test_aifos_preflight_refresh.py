@@ -245,7 +245,10 @@ def test_blocking_refresh_detects_furniture_change_inside_same_room(tmp_path):
             ctx, storyboard)
 
         assert refreshed["refreshed"] is True
-        assert refreshed["blocking"]["source_fingerprint"] == old_source
+        # Furniture geometry participates in the blocking source contract: a
+        # moved/added obstacle must invalidate routes even when the script and
+        # storyboard text are unchanged.
+        assert refreshed["blocking"]["source_fingerprint"] != old_source
         assert refreshed["blocking"]["scene_model_fingerprint"] != old_scene
     finally:
         app.close()

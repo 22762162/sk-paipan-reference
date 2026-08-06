@@ -19,6 +19,7 @@ from aifos.scene_model import (DEFAULT_CAPTURE_HEIGHT_M, build_object,
                                equirect_from_direction,
                                scene_layout_clause)
 from aifos.web.server import _episode_payload, _scene3d_payload
+from aifos.previz_checks import previz_report
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -205,6 +206,46 @@ def test_generated_blocking_can_auto_repair_actor_collision(scene_app):
     assert {"x": actor["route"][0]["x"], "y": actor["route"][0]["y"]} \
         == actor["start"]
     assert blocking["shot_index"]["5"]["actors"] == shot["actors"]
+
+
+def test_scene_physics_replans_route_around_furniture(scene_app):
+    app = scene_app["app"]
+    blocking, _version = app.projects.latest_document(
+        scene_app["episode"]["id"], "blocking")
+    actor = {
+        "name": "穿越者",
+        "start": {"x": 250, "y": 350},
+        "end": {"x": 750, "y": 350},
+        "route": [
+            {"x": 250, "y": 350, "phase": "start"},
+            {"x": 750, "y": 350, "phase": "end"},
+        ],
+        "start_3d": {"x": -1.8, "y": 0.0, "z": 1.2},
+        "end_3d": {"x": 2.2, "y": 0.0, "z": 1.2},
+        "route_3d": [
+            {"x": -1.8, "y": 0.0, "z": 1.2, "phase": "start"},
+            {"x": 2.2, "y": 0.0, "z": 1.2, "phase": "end"},
+        ],
+        "moving": True,
+    }
+    shot = {
+        "shot_no": 7, "scene_no": 1, "actors": [actor], "camera": {}}
+    blocking["scenes"][0]["shots"] = [shot]
+    blocking["shot_index"]["7"] = json.loads(json.dumps(shot))
+
+    app.director._attach_scene_physics(
+        {"project": scene_app["project"]}, blocking,
+        repair_actor_collisions=True)
+
+    assert len(actor["route_3d"]) >= 3
+    report = previz_report(
+        blocking,
+        {"shots": [{"shot_no": 7}]},
+        {"书阁": scene_app["model"]},
+    )
+    assert not [
+        issue for issue in report["issues"]
+        if issue["kind"] == "path_collision"]
 
 
 def test_generated_blocking_can_auto_repair_camera_collision(scene_app):

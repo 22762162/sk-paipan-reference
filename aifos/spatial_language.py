@@ -57,6 +57,10 @@ def _distance(a, b):
 
 def screen_zone(offset):
     """归一化横向偏移 → 画面分区名。"""
+    if offset < -1.01:
+        return "画面外左侧"
+    if offset >= 1.01:
+        return "画面外右侧"
     for low, high, label in _H_ZONES:
         if low <= offset < high:
             return label
@@ -285,7 +289,7 @@ def screen_direction_clause(block, *, phase="start"):
     ordered = []
     for actor in actors:
         _line, offset, _distance = _actor_line(actor, camera, phase)
-        if offset is not None:
+        if offset is not None and -1.01 <= offset < 1.01:
             ordered.append((offset, str(actor.get("name") or "")))
     if len(ordered) < 2:
         return ""

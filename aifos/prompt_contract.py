@@ -35,14 +35,38 @@ def _spatial_staging_block(shot, *, media="video", target_phase=""):
         scale = str(camera.get("景别") or "")
     else:
         for token in ("大特写", "特写", "中近景", "近景", "膝上景",
-                      "七分身", "中景", "大远景", "全景", "远景"):
+                      "七分身", "中全景", "中景", "大远景", "全景", "远景"):
             if token in str(camera or ""):
                 scale = token
                 break
-    phase = str(target_phase
-                or shot.get("frame_phase")
-                or (shot.get("frame_target") or {}).get("phase")
-                or "start").lower()
+    target = shot.get("frame_target") or {}
+    target = target if isinstance(target, dict) else {}
+    requested_phase = str(target_phase
+                          or shot.get("frame_phase")
+                          or target.get("phase")
+                          or "start").lower()
+    blocking_phase = str(
+        target.get("blocking_phase")
+        or shot.get("blocking_phase")
+        or "").lower()
+    # ``freeze`` describes the temporal kind of the exported still, not a 3D
+    # coordinate.  When its author binds that still to start/end blocking, the
+    # explicit binding must win over the generic target_phase="freeze" passed
+    # by the image compiler.
+    phase = (
+        blocking_phase
+        if (str(media or "video").lower() != "video"
+            and requested_phase == "freeze"
+            and blocking_phase in ("start", "end"))
+        else requested_phase)
+    # A freeze/keyframe has no truthful start/end 3D coordinate unless the
+    # author explicitly binds it with blocking_phase.  Silently mapping it to
+    # start previously resurrected old poses and gaze directions.  Scene
+    # layout is rendered elsewhere, so omitting phase-sensitive actor staging
+    # is safer and more precise than inventing a coordinate.
+    if (str(media or "video").lower() != "video"
+            and phase not in ("start", "end")):
+        return {}
     phase = phase if phase in ("start", "end") else "start"
     lines = {
         label: text for label, text in spatial_lines(
@@ -475,6 +499,57 @@ def _style_without_shot_camera_directives(value):
     return "；".join(kept)
 
 
+def _style_direction_for_media(
+        value, *, media="video", camera=None, partial_parts=None):
+    """Project director style to provider-observable facts for one medium."""
+    direction = dict(value) if isinstance(value, dict) else {}
+    is_video = str(media or "video").lower() == "video"
+
+    # Face/hair beauty language is not an aesthetic neutral in a hand/foot
+    # insert: it actively asks the model to widen the crop until a face exists.
+    # Apply the same local-scope sanitation to video while leaving its authored
+    # camera movement and temporal motivation intact.
+    effects = direction.get("visual_effects") or []
+    if isinstance(effects, str):
+        effects = [effects]
+    cleaned_effects = []
+    face_tokens = (
+        "双眼", "眼睛", "眼神", "嘴唇", "嘴形", "面部", "五官",
+        "脸部", "发丝", "头发", "头颈", "双肩")
+    for effect in effects if isinstance(effects, (list, tuple)) else []:
+        parts = [part.strip() for part in re.split(r"[、，,]+", _text(effect))
+                 if part.strip()]
+        if partial_parts:
+            parts = [part for part in parts
+                     if not any(token in part for token in face_tokens)]
+        if parts:
+            cleaned_effects.append("、".join(parts))
+    direction["visual_effects"] = cleaned_effects
+    if is_video:
+        return direction
+
+    camera = camera if isinstance(camera, dict) else {}
+    # A still has no tracking/push/pan or A→B story beat.  Rebuild the pattern
+    # from the already-resolved static camera instead of trying to remove a
+    # growing vocabulary of motion prose from the director's video sentence.
+    fixed_pattern = "".join(filter(None, (
+        _text(camera.get("焦段")), _text(camera.get("角度")),
+        _text(camera.get("机位")), _text(camera.get("景别")),
+    )))
+    composition = _text(camera.get("构图"))
+    direction["shot_pattern"] = "，".join(filter(None, (
+        fixed_pattern, "静态定格", composition)))
+    direction["selection_reason"] = (
+        "只服务当前定格构图、光影与可见终态，不描述到达过程")
+
+    camera_contract = direction.get("camera_contract")
+    if isinstance(camera_contract, dict):
+        camera_contract = dict(camera_contract)
+        camera_contract.pop("movement", None)
+        direction["camera_contract"] = camera_contract
+    return direction
+
+
 _MODERN_SCENE_TOKENS = (
     "现代", "当代", "酒店", "电梯", "办公室", "便利店", "高速公路",
     "都市", "轿车", "汽车", "驾驶座", "副驾驶", "别墅", "公寓",
@@ -630,6 +705,80 @@ def _registered_state_value(shot, key):
     return _state_value(filtered)
 
 
+def _registered_partial_state_value(shot, key, partial_parts):
+    """Render only state facts observable inside a hand/foot insert.
+
+    Full start/end ledgers remain on the source shot for continuity and audit,
+    but copying hair, makeup, gaze and whole-body posture into a cropped video
+    prompt invites the model to widen the frame until those facts are visible.
+    Keep only local pose/support, nearby clothing and local injury facts.
+    Structured prop rows are rendered separately by ``frame_props``.
+    """
+    value = shot.get(key)
+    if not isinstance(value, dict):
+        return "镜内身体局部保持首尾帧连续"
+    characters = {_text(name) for name in shot.get("characters") or []}
+    state_fields = {
+        "position", "pose", "direction", "wardrobe", "headwear",
+        "hair_visibility", "hair_makeup", "prop", "injury", "emotion",
+        "condition", "character_condition", "life_state",
+        "consciousness_state", "embodiment", "mobility",
+    }
+    if state_fields & set(value):
+        # Legacy flat state has no actor label.  Do not pass its unscoped prose
+        # into a local insert; the action, frame props and physical rules carry
+        # the executable local facts.
+        return "镜内身体局部保持首尾帧连续"
+    filtered = {
+        name: state for name, state in value.items()
+        if _text(name) in characters and isinstance(state, dict)
+    }
+    scopes = set(partial_parts or [])
+    body_tokens = []
+    wardrobe_tokens = []
+    if "hand" in scopes:
+        body_tokens.extend((
+            "手部", "手腕", "腕部", "右腕", "左腕", "腕骨", "手掌",
+            "掌心", "掌纹", "手背", "手指", "两指", "指腹", "指尖",
+            "右手", "左手", "双手", "手臂", "前臂", "右臂", "左臂",
+            "袖口", "衣袖", "皮绳", "灼纹", "环痕"))
+        wardrobe_tokens.extend((
+            "袖", "衬衫", "上衣", "外套", "风衣", "衣袍", "长袍",
+            "手套", "护腕"))
+    if "foot" in scopes:
+        body_tokens.extend((
+            "脚部", "足部", "脚掌", "足底", "脚背", "脚踝", "足踝",
+            "脚趾", "脚尖", "右脚", "左脚", "双脚", "小腿", "右腿",
+            "左腿", "膝", "鞋面", "鞋底", "鞋袜"))
+        wardrobe_tokens.extend((
+            "裤脚", "裤", "裙摆", "裙", "鞋", "袜", "靴", "绑腿"))
+
+    def local_fragments(raw, tokens):
+        return "，".join(
+            clause.strip()
+            for clause in re.split(r"[，,、。；;\n]+", _text(raw))
+            if clause.strip() and any(token in clause for token in tokens))
+
+    rendered = []
+    for name, state in filtered.items():
+        details = []
+        for field in ("position", "pose"):
+            local = local_fragments(state.get(field), body_tokens)
+            if local:
+                details.append(local)
+        wardrobe = local_fragments(state.get("wardrobe"), wardrobe_tokens)
+        if wardrobe:
+            details.append(f"镜内服装局部{wardrobe}")
+        injury = local_fragments(state.get("injury"), body_tokens)
+        if injury:
+            details.append(f"镜内伤势{injury}")
+        rendered.append(
+            f"{_text(name)}:" + (
+                "，".join(details) if details
+                else "镜内声明的身体局部保持首尾帧连续"))
+    return "；".join(rendered) or "镜内身体局部保持首尾帧连续"
+
+
 def _normalize_mode(mode):
     requested = _text(mode, "image").lower()
     if requested in {"video", "motion", "seedance"}:
@@ -739,8 +888,11 @@ def _frame_target(shot, mode, requested_mode=""):
             declared_location = _text(
                 declared.get("location") or declared.get("scene_location"))
             declared_fallback = bool(declared.get("fallback"))
+            declared_blocking_phase = _text(
+                declared.get("blocking_phase")).lower()
         else:
             declared_state = _state_value(declared)
+            declared_blocking_phase = ""
         if declared_state:
             target = {
                 # Keep an invalid/missing phase invalid so validation can
@@ -762,6 +914,11 @@ def _frame_target(shot, mode, requested_mode=""):
                 # Director keeps the shot's authoritative top-level location
                 # for scene_model lookup and formal scene reference assets.
                 target["location"] = declared_location
+            if declared_blocking_phase:
+                # Preserve the authored 3D phase on the normalized target.
+                # Without this copy, a freeze target reached spatial staging
+                # as a bare ``phase=freeze`` and silently lost all coordinates.
+                target["blocking_phase"] = declared_blocking_phase
             return target
     for source in ("freeze_state", "image_state"):
         state = _state_value(shot.get(source))
@@ -1016,12 +1173,25 @@ def _normalize_functional_figures(shot):
         if not valid_count:
             issues.append(
                 f"功能人物「{label or position}」的 count 必须是精确正整数")
+        visibility = _text(item.get("visibility")).lower()
+        off_camera = bool(
+            item.get("off_camera") or visibility in {
+                "off_camera", "off-camera", "offscreen", "off_screen",
+                "画外", "不入画"})
+        visible_parts = _text_list(item.get("visible_parts"))
+        partial_only = bool(
+            item.get("partial_only") or visible_parts
+            or visibility in {
+                "partial_only", "partial", "parts_only", "局部"})
         normalized.append({
             "name": _text(item.get("name")),
             "label": _text(item.get("label")) or label,
             "count": raw_count if valid_count else 0,
             "state": _text(item.get("state")),
             "function": _text(item.get("function")),
+            "partial_only": partial_only,
+            "off_camera": off_camera,
+            "visible_parts": visible_parts,
         })
     # A folded long take may carry one row per temporal beat for the same
     # functional person.  Equal names are sequential states of one continuous
@@ -1052,11 +1222,40 @@ def _normalize_functional_figures(shot):
                     if part and part not in values:
                         values.append(part)
             target[field] = "；".join(values)
+        target["partial_only"] = bool(
+            target.get("partial_only") or item.get("partial_only"))
+        target["off_camera"] = bool(
+            target.get("off_camera") or item.get("off_camera"))
+        target["visible_parts"] = list(dict.fromkeys(
+            list(target.get("visible_parts") or [])
+            + list(item.get("visible_parts") or [])))
         if not target.get("name") and item.get("name"):
             target["name"] = item["name"]
         if not target.get("label") and item.get("label"):
             target["label"] = item["label"]
     return [merged[label] for label in order], issues
+
+
+def _functional_population_counts(functional_figures):
+    """Return source/full/partial/off-camera counts for anonymous people."""
+    source = full = partial = off_camera = 0
+    for item in functional_figures or []:
+        if not isinstance(item, dict):
+            continue
+        count = int(item.get("count") or 0)
+        source += count
+        if item.get("off_camera"):
+            off_camera += count
+        elif item.get("partial_only") or item.get("visible_parts"):
+            partial += count
+        else:
+            full += count
+    return {
+        "source": source,
+        "full_visible": full,
+        "partial_visible": partial,
+        "off_camera": off_camera,
+    }
 
 
 def _readable_carrier_visible_at_phase(
@@ -1069,30 +1268,34 @@ def _readable_carrier_visible_at_phase(
     """
     readable = readable if isinstance(readable, dict) else {}
     target_phase = _text(target_phase).lower()
+    explicit_ids = {
+        _text(readable.get(key))
+        for key in ("prop_id", "carrier_prop_id", "carrier_id", "object_id")
+        if _text(readable.get(key))
+    }
+    carrier = _text(readable.get("carrier")).lower()
+    categories = []
+    if any(token in carrier for token in ("手机", "锁屏", "平板", "tablet")):
+        categories.append(("手机", "phone", "mobile", "平板", "tablet"))
+    if any(token in carrier for token in ("电脑", "笔记本", "显示器", "显示屏")):
+        categories.append(("电脑", "笔记本", "computer", "laptop", "显示器", "显示屏"))
+    # Legacy shots without any structured prop ledger may still describe a
+    # device in prose.  Once a ledger exists, however, same-phase presence is
+    # authoritative: missing/hidden rows must not let text revive the carrier.
+    requires_bound_device = bool(
+        explicit_ids or (categories and bool(frame_props)))
     rows = [
         item for item in (frame_props or [])
         if isinstance(item, dict)
         and _text(item.get("phase")).lower() == target_phase
     ]
     if not rows:
-        return True
-
-    explicit_ids = {
-        _text(readable.get(key))
-        for key in ("prop_id", "carrier_prop_id", "carrier_id", "object_id")
-        if _text(readable.get(key))
-    }
+        return not requires_bound_device
     if explicit_ids:
         matching = [
             item for item in rows
             if _text(item.get("prop_id")) in explicit_ids]
     else:
-        carrier = _text(readable.get("carrier")).lower()
-        categories = []
-        if any(token in carrier for token in ("手机", "锁屏", "平板", "tablet")):
-            categories.append(("手机", "phone", "mobile", "平板", "tablet"))
-        if any(token in carrier for token in ("电脑", "笔记本", "显示器", "显示屏")):
-            categories.append(("电脑", "笔记本", "computer", "laptop", "显示器", "显示屏"))
         registry_names = {
             _text(item.get("prop_id")): _text(item.get("name")).lower()
             for item in (prop_registry or []) if isinstance(item, dict)
@@ -1105,7 +1308,7 @@ def _readable_carrier_visible_at_phase(
                    for category in categories):
                 matching.append(item)
     if not matching:
-        return True
+        return not requires_bound_device
     # Readable text and active device-use geometry require a directly visible
     # carrier.  ``occluded`` is still useful as a continuity fact, but its
     # screen cannot be read and must not create a hand/screen/gaze relation.
@@ -1119,12 +1322,72 @@ def _functional_figure_line(item):
     count = int(item.get("count") or 0)
     counter = "具" if any(token in f"{label}{item.get('state', '')}"
                           for token in CORPSE_TOKENS) else "名"
+    visible_parts = "、".join(_text_list(item.get("visible_parts")))
+    if item.get("off_camera"):
+        visibility = "严格在画外，不生成身体、头部或面孔"
+    elif item.get("partial_only") or visible_parts:
+        visibility = (
+            f"只允许出现局部={visible_parts or '已声明局部'}；"
+            "禁止补出完整身体、头部或面孔")
+    else:
+        visibility = "完整可见真人"
     details = "；".join(filter(None, (
         f"状态={_text(item.get('state'))}" if _text(item.get("state")) else "",
         f"功能={_text(item.get('function'))}"
         if _text(item.get("function")) else "",
+        visibility,
     )))
     return f"{label}{count}{counter}" + (f"（{details}）" if details else "")
+
+
+def _static_functional_figures(functional_figures, target_state):
+    """Project whole-shot extras onto the selected still-image phase.
+
+    A functional figure can enter during a take (for example a shadow appears
+    below a closed door).  Its whole-shot ledger must remain available to the
+    video contract, but a first frame that explicitly says ``尚无人影`` must
+    not inherit the later shadow as a positive generation requirement.
+    """
+    state = _text(target_state)
+    if not state:
+        return list(functional_figures or [])
+    absence = re.compile(
+        r"(?:尚无|没有|并无|未见|不见|尚未出现|未出现|不出现|不可见|"
+        r"不入画|已出画|在画外|严格画外)")
+    semantic_parts = (
+        "人影", "影子", "剪影", "倒影", "轮廓", "手", "脚", "足",
+        "头部", "面孔", "身体", "躯干")
+    clauses = re.split(r"[，,。；;\n]+", state)
+    output = []
+    for raw in functional_figures or []:
+        if not isinstance(raw, dict) or raw.get("off_camera"):
+            output.append(raw)
+            continue
+        visible_parts = _text_list(raw.get("visible_parts"))
+        suppressed = []
+        for part in visible_parts:
+            keywords = [token for token in semantic_parts if token in part]
+            if not keywords:
+                keywords = [part]
+            if any(
+                    absence.search(clause)
+                    and any(keyword and keyword in clause
+                            for keyword in keywords)
+                    for clause in clauses):
+                suppressed.append(part)
+        if visible_parts and len(suppressed) == len(visible_parts):
+            item = dict(raw)
+            item.update({
+                "off_camera": True,
+                "partial_only": False,
+                "visible_parts": [],
+                "state": "当前静态相位严格在画外，不生成身体、头部、面孔或任何局部迹象",
+                "function": "",
+            })
+            output.append(item)
+        else:
+            output.append(raw)
+    return output
 
 
 def _object_items(value, identity_key):
@@ -1279,25 +1542,145 @@ def _prop_name_tokens(item, prop_registry):
         if len(value) >= 2 and not value.startswith("prop_")))
 
 
-def _static_visible_frame_props(frame_props, target_phase):
+def _phase_target_state(shot, target_phase):
+    """Return only the authored state for one requested static phase."""
+    shot = shot if isinstance(shot, dict) else {}
+    phase = _normalize_prop_phase(target_phase)
+    preferred = {
+        "start": "first_frame", "freeze": "keyframe", "end": "last_frame",
+    }.get(phase, "")
+    targets = shot.get("frame_targets")
+    if isinstance(targets, dict):
+        candidates = []
+        if preferred and preferred in targets:
+            candidates.append(targets.get(preferred))
+        candidates.extend(
+            value for key, value in targets.items() if key != preferred)
+        for value in candidates:
+            if not isinstance(value, dict):
+                continue
+            declared = _normalize_prop_phase(
+                value.get("phase") or value.get("frame_phase"))
+            if declared == phase:
+                return _state_value(
+                    value.get("state") if "state" in value
+                    else value.get("frame_state"))
+    value = shot.get("frame_target")
+    if isinstance(value, dict) and _normalize_prop_phase(
+            value.get("phase") or value.get("frame_phase")) == phase:
+        return _state_value(
+            value.get("state") if "state" in value
+            else value.get("frame_state"))
+    return ""
+
+
+def _prop_explicitly_out_of_frame(
+        shot, item, target_phase="", target_state=""):
+    """Return True when the current shot explicitly excludes this prop.
+
+    Providers sometimes encode a fully off-camera continuity prop as
+    ``occluded``.  ``occluded`` normally means the object still participates
+    in the composition, but an explicit sentence such as ``手机全部明确出画``
+    is stronger and must win.  Otherwise the camera compiler widens a hand
+    close-up merely to fit an object the director explicitly removed.
+    """
+    shot = shot if isinstance(shot, dict) else {}
+    tokens = _prop_name_tokens(
+        item, shot.get("prop_registry") or [])
+    if not tokens:
+        return False
+    prose = _text(target_state) or _phase_target_state(shot, target_phase)
+    if not prose and not _text(target_phase):
+        prose = "；".join(filter(None, (
+            _text(shot.get("description")), _text(shot.get("action")))))
+    if not prose:
+        return False
+    positive_out = (
+        r"(?:全(?:部)?|完全|明确|严格|始终)?(?:在|留在|保持在)画外|"
+        r"(?:已|完全|明确|全部|严格)出画|不入画|不在画面(?:内)?|不可见")
+    prohibited_out = (
+        r"(?:不得|不能|禁止|严禁|避免|不可|不应|不许|不准|切勿|不要|"
+        r"必须不|应当不|保持不)[^，,。；;\n]{0,8}(?:出画|在画外|"
+        r"不入画|不可见)|(?:保持|必须保持|应保持)[^，,。；;\n]{0,8}"
+        r"(?:画面内|入画|可见)")
+    for token in tokens:
+        escaped = re.escape(token)
+        for clause in re.split(r"[，,。；;\n]+", prose):
+            if not re.search(escaped, clause, re.I):
+                continue
+            if re.search(prohibited_out, clause, re.I):
+                continue
+            if (re.search(rf"{escaped}[^，,。；;\n]{{0,18}}(?:{positive_out})",
+                          clause, re.I)
+                    or re.search(
+                        rf"(?:{positive_out})[^，,。；;\n]{{0,18}}{escaped}",
+                        clause, re.I)
+                    or re.search(
+                        rf"画面(?:内)?(?:没有|不包含|不出现)"
+                        rf"[^，,。；;\n]{{0,12}}{escaped}", clause, re.I)):
+                return True
+    return False
+
+
+def _occluded_prop_explicitly_visible(
+        shot, item, target_phase="", target_state=""):
+    """Whether an ``occluded`` row has an authored visible fragment.
+
+    ``occluded`` is historically ambiguous: some rows mean "half covered but
+    visibly in frame", others mean "kept only for continuity, not visible".
+    A still may draw it only when the selected phase explicitly says the prop
+    is partly visible/in frame.  This preserves intentional foreground
+    occlusion without reviving unrelated off-camera phones or glasses.
+    """
+    tokens = _prop_name_tokens(item, (shot or {}).get("prop_registry") or [])
+    if not tokens:
+        return False
+    prose = _text(target_state) or _phase_target_state(shot, target_phase)
+    visible_fragment = re.compile(
+        r"(?:部分|局部|一角|一半|半幅|边缘|侧缘|被挡|遮住|遮挡)"
+        r"[^，,。；;\n]{0,20}(?:可见|露出|入画|同框|框入)|"
+        r"(?:可见|露出|入画|同框|框入)[^，,。；;\n]{0,20}"
+        r"(?:部分|局部|一角|一半|边缘|被挡|遮住|遮挡)")
+    return any(
+        any(token in clause for token in tokens)
+        and visible_fragment.search(clause)
+        for clause in re.split(r"[，,。；;\n]+", prose))
+
+
+def _prop_drawable_in_static(shot, item, target_phase="", target_state=""):
+    visibility = _text(item.get("visibility"), "visible").lower()
+    if visibility in _FULLY_INVISIBLE_PROP_VISIBILITIES:
+        return False
+    if _prop_explicitly_out_of_frame(
+            shot, item, target_phase, target_state):
+        return False
+    if visibility == "occluded":
+        return _occluded_prop_explicitly_visible(
+            shot, item, target_phase, target_state)
+    return True
+
+
+def _static_visible_frame_props(
+        frame_props, target_phase, shot=None, target_state=""):
     """Project the continuity ledger to observable still-image prop facts.
 
-    ``hidden`` and ``absent`` rows remain valid continuity/audit facts, but are
-    not image-generation or image-QC targets.  ``occluded`` is retained: it is
-    a visible composition relation (the object may be partly covered), while a
-    fully concealed object must be represented with ``hidden``.
+    ``hidden``/``absent`` stay audit-only. ``occluded`` is drawable only when
+    the selected frame explicitly describes its visible fragment; otherwise
+    it is also audit-only rather than a noun that widens the composition.
     """
     phase = _text(target_phase).lower()
     return [
         dict(item) for item in (frame_props or [])
         if isinstance(item, dict)
         and _text(item.get("phase")).lower() == phase
-        and _text(item.get("visibility"), "visible").lower()
-        not in _FULLY_INVISIBLE_PROP_VISIBILITIES
+        and _prop_drawable_in_static(
+            shot, item, target_phase, target_state)
     ]
 
 
-def _static_visible_state(value, frame_props, target_phase, prop_registry):
+def _static_visible_state(
+        value, frame_props, target_phase, prop_registry, shot=None,
+        target_state=""):
     """Remove fully concealed prop bookkeeping from a still's visible state.
 
     The source ``frame_target`` remains available as ``frame_target_audit``.
@@ -1323,13 +1706,13 @@ def _static_visible_state(value, frame_props, target_phase, prop_registry):
     observable_keys = {
         prop_key(item) for item in phase_rows
         if prop_key(item)
-        and _text(item.get("visibility"), "visible").lower()
-        not in _FULLY_INVISIBLE_PROP_VISIBILITIES
+        and _prop_drawable_in_static(
+            shot, item, target_phase, target_state or value)
     }
     for item in phase_rows:
         if (not isinstance(item, dict)
-                or _text(item.get("visibility"), "visible").lower()
-                not in _FULLY_INVISIBLE_PROP_VISIBILITIES
+                or _prop_drawable_in_static(
+                    shot, item, target_phase, target_state or value)
                 or prop_key(item) in observable_keys):
             continue
         hidden_tokens.extend(_prop_name_tokens(item, prop_registry))
@@ -1357,6 +1740,78 @@ def _static_visible_state(value, frame_props, target_phase, prop_registry):
             continue
         visible.append(clause)
     return "，".join(visible) or "人物姿态、场景与构图保持当前静态相位"
+
+
+_PARTIAL_HAND_TOKENS = (
+    "手部", "腕部", "手腕", "手掌", "掌心", "手背", "手指", "两指",
+    "指腹", "指尖", "袖口")
+_PARTIAL_FOOT_TOKENS = (
+    "脚部", "足部", "脚掌", "足底", "脚背", "脚踝", "足踝", "脚趾",
+    "脚尖", "鞋袜", "鞋面")
+
+
+def _partial_body_scope(shot, target_state=""):
+    """Return deliberately cropped body-part groups for the executed shot.
+
+    Mentioning a wrist inside an ordinary portrait action (``抬腕``) is not a
+    crop contract.  We require a part-specific camera/crop declaration and a
+    static target that does not also demand a face, head, torso or full person.
+    Video timeline states describe the actors' complete off-frame posture, so
+    callers deliberately omit ``target_state`` for video and let the explicit
+    camera/crop declaration remain authoritative throughout the take.
+    """
+    shot = shot if isinstance(shot, dict) else {}
+    camera = _text(shot.get("camera"))
+    description = _text(shot.get("description"))
+    target = _text(target_state)
+    combined = "；".join(filter(None, (camera, description, target)))
+    groups = []
+    if any(token in combined for token in _PARTIAL_HAND_TOKENS):
+        groups.append("hand")
+    if any(token in combined for token in _PARTIAL_FOOT_TOKENS):
+        groups.append("foot")
+    if not groups:
+        return []
+
+    face_or_full = any(token in target for token in (
+        "脸", "面孔", "面部", "眼睛", "双眼", "嘴", "头部", "后脑",
+        "上半身", "半身", "膝上", "全身", "完整人形", "完整人物",
+        "站立", "坐在", "躺在"))
+    part_camera_tokens = tuple(
+        f"{part}{scale}"
+        for part in (*_PARTIAL_HAND_TOKENS, *_PARTIAL_FOOT_TOKENS)
+        for scale in ("大特写", "特写", "近景", "局部特写", "局部近景"))
+    explicit_part_camera = any(
+        token in camera for token in part_camera_tokens)
+    explicit_part_camera = explicit_part_camera or bool(re.search(
+        r"(?:大特写|特写|近景|局部)[^，。；]{0,12}"
+        r"(?:手|腕|掌|指|脚|足|踝|鞋)|"
+        r"(?:手|腕|掌|指|脚|足|踝|鞋)[^，。；]{0,12}"
+        r"(?:大特写|特写|近景|局部)", camera))
+    explicit_part_crop = bool(re.search(
+        r"(?:仅|只|严格只)(?:框入|容纳|出现|呈现)"
+        r"[^。；]{0,36}(?:手|腕|掌|指|脚|足|踝|鞋)"
+        r"[^。；]{0,36}(?:局部|出画|不出现完整|不含头|不含脸)",
+        combined)) or any(token in combined for token in (
+            "不出现完整人形", "不完整呈现任何人物",
+            "面部、躯干出画", "面部躯干出画"))
+    if face_or_full or not (explicit_part_camera or explicit_part_crop):
+        return []
+    return groups
+
+
+def _partial_body_only_framing(shot, target_state=""):
+    return bool(_partial_body_scope(shot, target_state))
+
+
+def _scale_of_text_for_partial(value):
+    text = _text(value)
+    for token in (
+            "大特写", "特写", "中近景", "近景", "中全景", "中景",
+            "全景", "远景"):
+        if token in text:
+            return token
+    return ""
 
 
 def _normalize_prop_transitions(shot):
@@ -2543,7 +2998,7 @@ def _readable_text_timeline_rule(
         + "；禁止把不同阶段的文字、屏幕状态或版式同时塞进同一帧")
 
 
-def _spatial_anchor_count(shot):
+def _spatial_anchor_count(shot, target_phase="", target_state=""):
     """本镜必须同框呈现的空间锚点数:人物 + 不在任何人手上的可见道具。
 
     「沈眉站在书案右侧、银铃静止在书案上」这类空间指向,取景要同时
@@ -2558,6 +3013,13 @@ def _spatial_anchor_count(shot):
     for row in (shot.get("frame_props") or []):
         if not isinstance(row, dict):
             continue
+        if (_text(target_phase)
+                and _normalize_prop_phase(row.get("phase"))
+                != _normalize_prop_phase(target_phase)):
+            continue
+        if (_text(target_phase) and _prop_explicitly_out_of_frame(
+                shot, row, target_phase, target_state)):
+            continue
         if _text(row.get("visibility")).lower() not in ("visible", "occluded"):
             continue
         holder = _text(row.get("holder")).lower()
@@ -2569,7 +3031,8 @@ def _spatial_anchor_count(shot):
     return anchors + len(seen)
 
 
-def _camera(shot, visible_count=None):
+def _camera(
+        shot, visible_count=None, *, target_phase="", target_state=""):
     dimensions = shot.get("five_dimensions") or {}
     design = dimensions.get("camera_design") or {}
     contract = shot.get("shot_contract") or {}
@@ -2606,6 +3069,7 @@ def _camera(shot, visible_count=None):
             ("急推", "急推"), ("缓推", "缓推"), ("推近", "推"),
             ("上摇", "上摇"), ("下摇", "下摇"), ("环绕", "环绕"),
             ("跟拍", "跟拍"), ("拉远", "拉"), ("横移", "移"),
+            ("缓移", "移"), ("短移", "移"),
             ("固定", "固定"),
         )
         for token, value in tokens:
@@ -2638,6 +3102,8 @@ def _camera(shot, visible_count=None):
         ("大特写", "大特写"), ("特写", "特写"),
         # Compound scale must be matched before its ``近景`` suffix.
         ("中近景", "中近景"), ("近景", "近景"),
+        # ``中全景`` likewise must beat its ``全景`` suffix.
+        ("中全景", "中全景"),
         ("中景", "中景"), ("全景", "全景"), ("远景", "远景"),
     ))
     raw_angle = explicit((
@@ -2649,7 +3115,7 @@ def _camera(shot, visible_count=None):
     ))
     raw_position = explicit((
         ("过肩", "过肩"), ("背面", "背面"), ("背后", "背面"),
-        ("斜侧", "侧面"),
+        ("斜侧", "斜侧"),
         ("侧面", "侧面"), ("侧脸", "侧面"), ("正面", "正面"),
     ))
     raw_movement = explicit_movement()
@@ -2706,7 +3172,8 @@ def _camera(shot, visible_count=None):
         anchor_note = ""
     else:
         executed_scale, anchor_note = enforce_spatial_anchor_scale(
-            executed_scale, _spatial_anchor_count(shot))
+            executed_scale, _spatial_anchor_count(
+                shot, target_phase, target_state))
     notes = [note for note in (capacity_note, anchor_note) if note]
     lens = _strip_aspect(_text(
         raw_lens or design.get("lens") or contract.get("焦段")))
@@ -2719,8 +3186,14 @@ def _camera(shot, visible_count=None):
     composition = _strip_aspect(_text(
         raw_composition or contract.get("构图")
         or design.get("composition"), "主体清楚"))
-    composition, composition_note = enforce_composition_scale(
-        executed_scale, composition)
+    if executed_scale == "中全景":
+        # Medium-wide deliberately carries both full actor geography and room
+        # structure; generic camera_language versions that predate this scale
+        # otherwise treat it as a tight unknown and erase frame-within-frame.
+        composition_note = ""
+    else:
+        composition, composition_note = enforce_composition_scale(
+            executed_scale, composition)
     if composition_note:
         notes.append(composition_note)
     position = _strip_aspect(_text(
@@ -3076,7 +3549,8 @@ def build_physical_contract(shot, *, media="video", target_phase=""):
         carrier_visibility_blocked = bool(
             _text(readable.get("carrier")) and not carrier_visible)
         carrier = (
-            _text(readable.get("carrier")) if carrier_visible else "")
+            _text(readable.get("carrier"))
+            if carrier_visible and readable_text_required(readable) else "")
         target_state = _state_value(
             frame_target.get("state") if isinstance(frame_target, dict)
             else (derived_target or {}).get("state")
@@ -3104,7 +3578,10 @@ def build_physical_contract(shot, *, media="video", target_phase=""):
             if any(token in prop_label for token in (
                     "电脑", "笔记本", "computer", "laptop", "显示器")):
                 phase_laptop_rows.append(item)
-            if _text(item.get("visibility"), "visible").lower() != "visible":
+            item_out = _prop_explicitly_out_of_frame(
+                shot, item, declared_phase, target_state)
+            if (item_out or _text(
+                    item.get("visibility"), "visible").lower() != "visible"):
                 continue
             visible_prop_facts.append(" ".join(filter(None, (
                 _text(item.get("name")) or registry_names.get(prop_id, ""),
@@ -3115,10 +3592,14 @@ def build_physical_contract(shot, *, media="video", target_phase=""):
         phase_phone_visibility_blocked = bool(
             phase_phone_rows and not any(
                 _text(item.get("visibility"), "visible").lower() == "visible"
+                and not _prop_explicitly_out_of_frame(
+                    shot, item, declared_phase, target_state)
                 for item in phase_phone_rows))
         phase_laptop_visibility_blocked = bool(
             phase_laptop_rows and not any(
                 _text(item.get("visibility"), "visible").lower() == "visible"
+                and not _prop_explicitly_out_of_frame(
+                    shot, item, declared_phase, target_state)
                 for item in phase_laptop_rows))
         description = " ".join(filter(None, (
             target_state,
@@ -3213,26 +3694,82 @@ def build_physical_contract(shot, *, media="video", target_phase=""):
     )
     laptop_carrier_tokens = (*laptop_tokens, "屏幕")
     phone_tokens = ("手机", "平板", "tablet")
+    registry_names = {
+        _text(item.get("prop_id")): _text(item.get("name"))
+        for item in (shot.get("prop_registry") or [])
+        if isinstance(item, dict)}
+
+    def phone_row(item):
+        prop_id = _text(item.get("prop_id"))
+        label = " ".join(filter(None, (
+            prop_id, _text(item.get("name")),
+            registry_names.get(prop_id, "")))).lower()
+        return any(token in label for token in phone_tokens)
+
+    structured_phone_rows = [
+        item for item in raw_frame_props
+        if isinstance(item, dict) and phone_row(item)
+        and (media_name == "video"
+             or _normalize_prop_phase(item.get("phase")) == declared_phase)]
+
+    def actually_held_and_visible(item):
+        if _text(item.get("visibility"), "visible").lower() != "visible":
+            return False
+        holder = _text(item.get("holder")).lower()
+        if not holder or holder in ("none", "无", "无人", "无人持有", "-"):
+            return False
+        phase = _normalize_prop_phase(item.get("phase"))
+        return not _prop_explicitly_out_of_frame(
+            shot, item, phase if media_name == "video" else declared_phase,
+            _phase_target_state(shot, phase) if media_name == "video"
+            else static_target_state)
+
+    structured_handheld = any(
+        actually_held_and_visible(item) for item in structured_phone_rows)
+    screen_off_tokens = (
+        "熄屏", "黑屏", "关屏", "屏幕关闭", "屏幕已关", "未亮屏")
+    structured_screen_active = any(
+        actually_held_and_visible(item)
+        and not any(token in _text(item.get("physical_state")).lower()
+                    for token in screen_off_tokens)
+        for item in structured_phone_rows)
     handheld_present = (
         any(token in carrier.lower() for token in phone_tokens)
         or _mentions_present_object(object_text, phone_tokens))
+    phone_use_intent = bool(
+        readable_text_required(readable)
+        or re.search(
+            r"(?:查看|看向|注视|阅读|操作|点击|点按|滑动|输入|浏览|"
+            r"展示|给.{0,5}看)[^，,。；]{0,14}(?:手机|平板|屏幕)|"
+            r"(?:手机|平板|屏幕)[^，,。；]{0,14}"
+            r"(?:查看|阅读|操作|点击|点按|滑动|输入|浏览|展示|可读)",
+            object_text))
     handheld_use = (
         handheld_present
         and not carrier_visibility_blocked
         and not phase_phone_visibility_blocked
-        and (
-        media_name == "video"
-        or bool(carrier)
-        or bool(re.search(
-            r"(?:手持|拿着|握着|举着|持有|查看|低头看|看向|展示|递出|"
-            r"接过)[^，,。；]{0,10}(?:手机|平板)|"
-            r"(?:手机|平板)[^，,。；]{0,10}(?:拿|握|举|看|展示|递|接)",
-            object_text))))
-    laptop_present = (
+        and (structured_screen_active if structured_phone_rows else True)
+        and phone_use_intent)
+    # A desk named “电脑桌” is furniture, not evidence of a laptop/display.
+    # Likewise merely walking past a visible computer does not establish the
+    # user/keyboard/screen geometry that this contract asserts.
+    laptop_use_text = re.sub(r"电脑桌", "书桌", object_text)
+    laptop_use_intent = bool(
+        readable_text_required(readable)
+        or re.search(
+            r"(?:使用|操作|敲击|打字|输入|查看|阅读|注视|盯着|面对|"
+            r"打开|合上)[^，,。；]{0,14}"
+            r"(?:笔记本电脑|笔记本|电脑|显示器|显示屏)|"
+            r"(?:笔记本电脑|笔记本|电脑|显示器|显示屏)"
+            r"[^，,。；]{0,14}(?:使用|操作|打字|输入|查看|阅读|"
+            r"注视|可读)", laptop_use_text))
+    laptop_use = (
         not phase_laptop_visibility_blocked
         and (any(token in carrier.lower() for token in laptop_carrier_tokens)
-             or _mentions_present_object(object_text, laptop_tokens)))
-    if media_name != "video" and phase_explicit:
+             or _mentions_present_object(laptop_use_text, laptop_tokens))
+        and laptop_use_intent)
+    if ((media_name != "video" and phase_explicit)
+            or bool(structured_phone_rows)):
         # A persisted video physical contract may already contain relations for
         # other beats.  Strip those derived device-use rows before rebuilding
         # this still's one-phase contract.
@@ -3243,7 +3780,7 @@ def build_physical_contract(shot, *, media="video", target_phase=""):
             objects = [
                 value for value in objects
                 if "手持屏幕" not in _text(value)]
-        if not laptop_present:
+        if not laptop_use:
             rules = [
                 rule for rule in rules
                 if "电脑使用关系" not in _text(rule)]
@@ -3261,7 +3798,7 @@ def build_physical_contract(shot, *, media="video", target_phase=""):
             "方向连续。"
         )
         objects.append("手持屏幕：使用者/观看者↔屏幕正面")
-    elif laptop_present:
+    elif laptop_use:
         rules.append(
             "电脑使用关系：屏幕正面、键盘和使用者必须位于同一使用侧；键盘朝向使用者，"
             "屏幕与底座由铰链连接并由桌面支撑；人物视线落在屏幕可见区域。若需要看清屏幕文字，"
@@ -3468,7 +4005,8 @@ def _character_lines(shot, *, media="video", target_phase=""):
                         value,
                         _object_items(shot.get("frame_props"), "prop_id"),
                         target_phase,
-                        shot.get("prop_registry") or [])
+                        shot.get("prop_registry") or [],
+                        shot=shot)
                     if value == "人物姿态、场景与构图保持当前静态相位":
                         value = ""
                 if value:
@@ -3537,9 +4075,10 @@ def build_composition_contract(shot):
     shot = shot or {}
     characters = list(shot.get("characters") or [])
     functional_figures, _ = _normalize_functional_figures(shot)
-    functional_count = sum(
-        int(item.get("count") or 0) for item in functional_figures)
-    visible_count = len(characters) + functional_count
+    functional_counts = _functional_population_counts(functional_figures)
+    # A hand through a doorway is one human source, not one complete visible
+    # body; an off-camera voice is not a visible figure at all.
+    visible_count = len(characters) + functional_counts["full_visible"]
     dialogue = shot.get("dialogue") or {}
     contract = shot.get("shot_contract") or {}
     dimensions = shot.get("five_dimensions") or {}
@@ -3590,7 +4129,8 @@ def build_composition_contract(shot):
     over_shoulder = ("过肩" in framing_text and len(characters) >= 2) or (
         ("背面" in framing_text or "背影" in framing_text)
         and len(characters) >= 2
-        and bool(dialogue.get("dialogue")))
+        and isinstance(dialogue, dict)
+        and bool(dialogue.get("dialogue") or dialogue.get("text")))
     profile = any(
         word in camera_text for word in ("侧面", "侧脸", "profile"))
     back = any(
@@ -3728,11 +4268,14 @@ def build_shot_prompt_contract(
     timeline_contract = bool(output_media == "video" or joint_frames)
     visible_frame_props = (
         frame_props if timeline_contract
-        else _static_visible_frame_props(frame_props, target_phase))
+        else _static_visible_frame_props(
+            frame_props, target_phase, shot=shot,
+            target_state=target.get("state")))
     if not timeline_contract:
         target["state"] = _static_visible_state(
             target.get("state"), frame_props, target_phase,
-            shot.get("prop_registry") or [])
+            shot.get("prop_registry") or [], shot=shot,
+            target_state=target.get("state"))
     # A transition is a relationship between phases, not an observable fact
     # inside one frozen image.  Keep it only for motion / paired-frame timeline
     # contracts; otherwise it injects future actors and actions into the still.
@@ -3742,12 +4285,19 @@ def build_shot_prompt_contract(
         shot, characters, action, target_phase)
     functional_figures, population_issues = _normalize_functional_figures(
         shot)
+    if not timeline_contract:
+        functional_figures = _static_functional_figures(
+            functional_figures, target.get("state"))
     population_issues.extend(character_scope_issues)
     population_issues.extend(functional_scope_issues)
     registered_count = len(characters)
-    functional_count = sum(
-        int(item.get("count") or 0) for item in functional_figures)
-    visible_count = registered_count + functional_count
+    functional_counts = _functional_population_counts(functional_figures)
+    functional_count = functional_counts["source"]
+    full_functional_count = functional_counts["full_visible"]
+    partial_functional_count = functional_counts["partial_visible"]
+    off_camera_functional_count = functional_counts["off_camera"]
+    visible_count = registered_count + full_functional_count
+    person_source_count = registered_count + functional_count
     raw_functional_items = shot.get("functional_figures") or []
     if isinstance(raw_functional_items, dict):
         raw_functional_items = [raw_functional_items]
@@ -3760,6 +4310,16 @@ def build_shot_prompt_contract(
         and item.get("count") > 0
     ) if isinstance(raw_functional_items, (list, tuple)) else 0
     dialogue = shot.get("dialogue") or {}
+    if not isinstance(dialogue, dict):
+        dialogue = {}
+    # Storyboard providers historically emitted the spoken line as
+    # ``dialogue``; newer repaired rows may use the equally common ``text``
+    # key.  Normalize both here so a schema spelling difference cannot
+    # silently remove lip-sync text from the video provider prompt.
+    source_dialogue_text = (
+        _text(dialogue.get("dialogue")) or _text(dialogue.get("text")))
+    source_dialogue_declared = bool(
+        source_dialogue_text and not dialogue.get("inner_voice"))
     readable_source = shot.get("readable_text") or {}
     readable = (
         readable_source if output_media == "video"
@@ -3854,7 +4414,8 @@ def build_shot_prompt_contract(
             "host_mouth_closed": True,
         })
     overlays = overlays[:1]
-    visible_entity_count = visible_count + len(overlays)
+    visible_entity_count = (
+        visible_count + partial_functional_count + len(overlays))
     declared_target = _declared_frame_target(source_shot, target)
     declared_scene_layout = (
         _text(declared_target.get("scene_layout"))
@@ -3888,8 +4449,10 @@ def build_shot_prompt_contract(
             population_issues.append(
                 "人数声明冲突："
                 f"visible_figure_count={declared_visible}，"
-                f"登记角色={registered_count}，功能人物={functional_count}，"
-                f"求和={visible_count}")
+                f"登记角色={registered_count}，完整可见功能人物="
+                f"{full_functional_count}，局部功能人物="
+                f"{partial_functional_count}，画外功能人物="
+                f"{off_camera_functional_count}，完整可见求和={visible_count}")
     population_text = " ".join(_text(value) for value in (
         shot.get("description"), shot.get("action"), shot.get("prompt"),
         shot.get("camera"),
@@ -3921,6 +4484,25 @@ def build_shot_prompt_contract(
         shot.get("identity_facts_required")
         or isinstance(shot.get("character_facts"), dict)
         or isinstance(shot.get("character_background"), dict))
+    partial_body_parts = _partial_body_scope(
+        source_shot,
+        # A video start/end ledger must retain whole-actor continuity even when
+        # the lens only sees hands or feet.  Feeding those full-body ledger
+        # states into the crop detector used to disable the local framing and
+        # then render "complete bodies" plus face/head geometry into Seedance.
+        # The authored camera/crop sentence is the executable framing for a
+        # timeline; a frozen still may additionally use its exact target state
+        # to reject false positives such as an ordinary portrait that raises a
+        # wrist.
+        "" if timeline_contract else target_audit.get("state"))
+    compiled_camera = _camera(
+        shot, visible_count=visible_count,
+        target_phase=("" if timeline_contract else target_phase),
+        target_state=("" if timeline_contract
+                      else target_audit.get("state")))
+    compiled_style_direction = _style_direction_for_media(
+        shot.get("style_direction"), media=output_media,
+        camera=compiled_camera, partial_parts=partial_body_parts)
     contract = {
         "schema": PROMPT_CONTRACT_SCHEMA,
         # ``mode=shot`` is a legacy discriminator. Media/output semantics live
@@ -3953,6 +4535,9 @@ def build_shot_prompt_contract(
             "registered_count": registered_count,
             "functional_count": functional_count,
             "visible_count": visible_count,
+            "source_count": person_source_count,
+            "partial_visible_count": partial_functional_count,
+            "off_camera_count": off_camera_functional_count,
             "actors": _character_lines(
                 shot, media=output_media,
                 # A video spans both boundaries.  Its subject line must lock
@@ -3976,9 +4561,16 @@ def build_shot_prompt_contract(
             "counts": {
                 "named_characters": registered_count,
                 "functional_people": functional_count,
-                "real_people_total": visible_count,
+                "real_people_total": person_source_count,
                 "non_real_overlays": len(overlays),
                 "visible_entity_instances_total": visible_entity_count,
+            },
+            "figure_accounting": {
+                "person_sources_total": person_source_count,
+                "complete_visible_people": visible_count,
+                "functional_full_visible": full_functional_count,
+                "functional_partial_visible": partial_functional_count,
+                "functional_off_camera": off_camera_functional_count,
             },
             "functional_figures": functional_figures,
             "declared_visible_figure_count": (
@@ -3989,6 +4581,8 @@ def build_shot_prompt_contract(
             "temporal_duplicate_count_repaired": legacy_declared_repaired,
             "issues": population_issues,
         },
+        "partial_body_framing": bool(partial_body_parts),
+        "partial_body_parts": list(partial_body_parts),
         "composition": composition,
         "scene": scene,
         # 场景陈设的固定坐标条款(由 blocking 层按三维场景+本镜机位算好)。
@@ -4001,13 +4595,15 @@ def build_shot_prompt_contract(
             **shot, "location": scene, "style": scene_style,
         }),
         "style": scene_style,
-        "style_direction": (
-            dict(shot.get("style_direction"))
-            if isinstance(shot.get("style_direction"), dict) else {}),
+        "style_direction": compiled_style_direction,
         "visual_medium": medium["dimension"],
         "medium": medium,
-        "start": _registered_state_value(
-            shot, "start_state") or "保持首帧状态",
+        "start": (
+            _registered_partial_state_value(
+                shot, "start_state", partial_body_parts)
+            if partial_body_parts else
+            _registered_state_value(shot, "start_state")
+        ) or "保持首帧状态",
         "start_appearance": _appearance_map(shot.get("start_state")),
         "freeze_appearance": _appearance_map(shot.get("freeze_state")),
         "character_conditions": character_conditions,
@@ -4015,11 +4611,16 @@ def build_shot_prompt_contract(
         # 逐镜负向清单要按名字点出该静止的角色,所以另存一份原始名单。
         "actor_names": list(characters),
         "action": action,
-        "performance": _text(
-            (shot.get("performance") or {}).get("micro_expression"),
-            "表演严格服从逐角色 condition，不自行增加任何行为",
+        "performance": (
+            "镜内表演只由已声明的手、腕、手指、袖口或足部局部完成，"
+            "只表现局部张力、接触、支撑和重量变化，不增加取景外表演"
+            if partial_body_parts else
+            _text(
+                (shot.get("performance") or {}).get("micro_expression"),
+                "表演严格服从逐角色 condition，不自行增加任何行为",
+            )
         ),
-        "camera": _camera(shot, visible_count=visible_count),
+        "camera": compiled_camera,
         # 镜位显式裁决条款:_camera 已按「分镜原文 > 镜头合同 > 五维
         # 默认」融合出唯一执行值;审核上下文里若还残留其他来源的机位
         # /构图描述,以融合值为准,不构成需要裁决的同级冲突。
@@ -4074,8 +4675,12 @@ def build_shot_prompt_contract(
             *frame_prop_issues,
             *(prop_transition_issues if timeline_contract else []),
         ],
-        "end": _registered_state_value(
-            shot, "end_state") or "到达尾帧状态",
+        "end": (
+            _registered_partial_state_value(
+                shot, "end_state", partial_body_parts)
+            if partial_body_parts else
+            _registered_state_value(shot, "end_state")
+        ) or "到达尾帧状态",
         "end_appearance": _appearance_map(shot.get("end_state")),
         "appearance_state_required": bool(
             shot.get("appearance_state_required")),
@@ -4091,7 +4696,10 @@ def build_shot_prompt_contract(
         ],
         "dialogue": (
             "" if dialogue.get("inner_voice")
-            else _text(dialogue.get("dialogue"))),
+            else source_dialogue_text),
+        # Audit invariant: validation must reject a contract if a declared
+        # spoken line disappears during any future normalization/refactor.
+        "dialogue_source_declared": source_dialogue_declared,
         "speaker": (
             "" if dialogue.get("inner_voice")
             else _text(dialogue.get("character"))),
@@ -4117,16 +4725,28 @@ def build_shot_prompt_contract(
                 "video", "motion", "seedance",
             } else []),
         "hard": (
-            "视频只执行一个主动作和一个运镜；静态图只定格 frame_target；"
-            "人物身份、服装、场景、构图分别服从"
-            "对应参考图；不得重新设计人物，不得新增/复制真实人物或把参考图内容"
-            "贴进成片（已声明的功能人物除外）；服装、头饰、妆发必须逐人服从"
-            "本镜起止状态，未写换装/"
-            "摘戴/改妆动作时不得自行改变；非现实Q版叠层不得转化成真人、"
-            "实体角色或空间站位；逐角色生命、意识、存在形态和行动能力必须"
-            "服从 condition；同一 physical prop_id 在同一 phase 只能有一个"
-            "物理主位置，reflection/screen/painting/overlay 只作披露，"
-            "visibility=absent 不计物理实例"
+            (
+                "视频只执行一个主动作和一个运镜；静态图只定格 frame_target；"
+                "局部镜只展示合同声明的身体局部、服装局部和道具接触关系，"
+                "可见局部服从对应参考图，不得扩展取景或补出完整人物；不得"
+                "新增/复制真实人物或把参考图内容贴进成片（已声明的功能人物"
+                "除外）；非现实Q版叠层不得转化成真人、实体角色或空间站位；"
+                "逐角色生命、意识、存在形态和行动能力必须服从 condition；"
+                "同一 physical prop_id 在同一 phase 只能有一个物理主位置，"
+                "reflection/screen/painting/overlay 只作披露，"
+                "visibility=absent 不计物理实例"
+            ) if partial_body_parts else (
+                "视频只执行一个主动作和一个运镜；静态图只定格 frame_target；"
+                "人物身份、服装、场景、构图分别服从"
+                "对应参考图；不得重新设计人物，不得新增/复制真实人物或把参考图内容"
+                "贴进成片（已声明的功能人物除外）；服装、头饰、妆发必须逐人服从"
+                "本镜起止状态，未写换装/"
+                "摘戴/改妆动作时不得自行改变；非现实Q版叠层不得转化成真人、"
+                "实体角色或空间站位；逐角色生命、意识、存在形态和行动能力必须"
+                "服从 condition；同一 physical prop_id 在同一 phase 只能有一个"
+                "物理主位置，reflection/screen/painting/overlay 只作披露，"
+                "visibility=absent 不计物理实例"
+            )
         ),
     }
     return contract
@@ -4268,7 +4888,17 @@ def build_model_constraints(contract, *, media="video"):
     # 加人,但同一句把上限写成具体数字,两个方向一起封。
     visible_count = int(subject.get(
         "visible_count", subject.get("count", 0)) or 0)
-    if visible_count > 0:
+    if contract.get("partial_body_framing"):
+        body_parts = set(contract.get("partial_body_parts") or [])
+        allowed = []
+        if "hand" in body_parts:
+            allowed.append("手、腕、手指、袖口")
+        if "foot" in body_parts:
+            allowed.append("脚、足踝、鞋袜")
+        clauses.append(
+            f"只显示镜头合同指定的{'、'.join(allowed) or '身体局部'}或道具局部，"
+            "禁止补出完整人物、头部、头颈、面孔、躯干或额外身体")
+    elif visible_count > 0:
         clauses.append(
             f"总可见人形严格为 {visible_count} 人,"
             f"禁止出现第 {visible_count + 1} 人,"
@@ -4316,6 +4946,19 @@ def build_model_constraints(contract, *, media="video"):
     else:
         clauses.append("只定格当前状态,不表现任何动作过程或运动拖影")
 
+    for item in subject.get("functional_figures") or []:
+        if not isinstance(item, dict):
+            continue
+        label = _text(item.get("name") or item.get("label"), "功能人物")
+        if item.get("off_camera"):
+            clauses.append(
+                f"{label}严格在画外，不得生成其身体、头部、面孔或倒影")
+        elif item.get("partial_only") or item.get("visible_parts"):
+            parts = "、".join(_text_list(item.get("visible_parts")))
+            clauses.append(
+                f"{label}只出现{parts or '合同声明的局部'}，"
+                "不得补成第三具完整身体或完整脸")
+
     return clauses
 
 
@@ -4333,6 +4976,19 @@ def render_shot_prompt(contract, *, mode=None):
         media = _text(output.get("media"), "image").lower()
     else:
         media, _ = _normalize_mode(mode)
+    if contract.get("partial_body_framing"):
+        # A hand/foot insert needs identity binding, but full portrait facts
+        # (hair, makeup, trousers, shoes, headwear) are outside this crop.  If
+        # they remain in the positive subject sentence, image models often
+        # widen the shot to satisfy them and invent a face/full body.  Keep
+        # only the stable Pxx=name binding; visible sleeve/shoe fragments are
+        # already governed by the local crop and reference contracts.
+        partial_subject = []
+        for actor in subject_contract.get("actors") or []:
+            identifier = re.split(r"[（(]", _text(actor), maxsplit=1)[0].strip()
+            if identifier:
+                partial_subject.append(identifier)
+        subject = "、".join(partial_subject) or subject
     camera = contract.get("camera") or {}
     camera_values = [
         camera.get("景别"), camera.get("角度"), camera.get("焦段"),
@@ -4355,6 +5011,44 @@ def render_shot_prompt(contract, *, mode=None):
         camera if media == "video"
         else {key: value for key, value in camera.items() if key != "运镜"})
     camera_geometry = camera_geometry_clause(geometry_camera)
+    if _text(camera.get("机位")) == "斜侧":
+        oblique_geometry = (
+            "斜侧=摄影机位于人物正面轴线侧偏约35至45度，兼见面部正面与"
+            "侧向轮廓；不得擅自改成90度纯侧面或压缩贴墙安全距离")
+        camera_geometry = "；".join(filter(None, (
+            oblique_geometry, camera_geometry)))
+    if _text(camera.get("景别")) == "中全景":
+        medium_wide_geometry = (
+            "中全景=人物从头部至少取到小腿或完整全身，主要动作和支撑关系"
+            "可读，同时保留足够室内墙面、家具边界、门窗与纵深来核验空间")
+        camera_geometry = "；".join(filter(None, (
+            medium_wide_geometry, camera_geometry)))
+    if camera_geometry and contract.get("partial_body_framing"):
+        # Generic angle/position dictionaries are written for complete human
+        # figures (俯拍=看见头顶双肩, 侧面=看见眼耳鼻).  They are physically
+        # wrong for a wrist/hand insert and used to force faces back into the
+        # image.  Keep scale/composition, replace whole-body geometry with the
+        # actual local surface relation.
+        parts = [
+            part for part in camera_geometry.split("；")
+            if not re.search(
+                r"(?:眼|耳|鼻|口|嘴|脸|面部|头|颈|肩|胸|腰|膝|"
+                r"全身|上半身|躯干)", part)]
+        scopes = set(contract.get("partial_body_parts") or [])
+        visible_parts = []
+        if "hand" in scopes:
+            visible_parts.append("手腕、手掌、手指、袖口")
+        if "foot" in scopes:
+            visible_parts.append("脚、足踝、鞋袜")
+        surface_rule = (
+            "；脚掌/鞋底必须由地面或已声明接触面真实支撑，足踝关节方向自然"
+            if "foot" in scopes else "")
+        parts.append(
+            "局部取景裁决=只核验当前"
+            f"{'、'.join(visible_parts) or '身体局部'}或道具的可见表面、侧缘、"
+            "支撑和接触关系；人物头顶、头颈、双肩、眼耳鼻口、面孔及完整"
+            f"躯干必须出画，不适用完整人物的面部/头颈几何{surface_rule}")
+        camera_geometry = "；".join(parts)
     if camera_geometry:
         camera_line = f"{camera_line}；{camera_geometry}"
     # 光影是第四维:只说机位不说布光,模型必然给平光,成片没有氛围
@@ -4443,15 +5137,36 @@ def render_shot_prompt(contract, *, mode=None):
         lines.append(
             "【输入】图1是唯一动作起点，图2是唯一动作终点；"
             "只让已锁定画面动起来。")
-    lines.append(
-        f"【主体】严格共{count}人：{subject}（登记角色，均为真实人物）；"
-        f"画面可见真人严格共{visible_count}人。")
+    source_count = int(subject_contract.get("source_count", visible_count) or 0)
+    partial_visible_count = int(
+        subject_contract.get("partial_visible_count", 0) or 0)
+    off_camera_count = int(subject_contract.get("off_camera_count", 0) or 0)
+    if contract.get("partial_body_framing"):
+        body_parts = set(contract.get("partial_body_parts") or [])
+        allowed = []
+        if "hand" in body_parts:
+            allowed.append("手、腕、手指、袖口")
+        if "foot" in body_parts:
+            allowed.append("脚、足踝、鞋袜")
+        lines.append(
+            f"【主体】局部身份关联严格共{count}人：{subject}；"
+            f"只出现镜头声明的{'、'.join(allowed) or '身体局部'}或道具局部，"
+            "不生成完整真人、头部、头颈、面孔或躯干，也不增加第三人的身体局部。")
+    else:
+        lines.append(
+            f"【主体】严格共{count}人：{subject}（登记角色，均为真实人物）；"
+            f"画面可见真人身份严格共{visible_count}人，每个身份只出现"
+            "一次；身体可见范围严格服从本镜景别与构图，可按执行景别"
+            "合规裁切，不额外强制完整全身入画；人物来源总数"
+            f"{source_count}人，其中局部可见来源{partial_visible_count}人、"
+            f"严格画外来源{off_camera_count}人。")
     if functional_figures:
         lines.append(
             "【功能人物】"
             + "；".join(_functional_figure_line(item)
                        for item in functional_figures)
-            + "；功能人物不锁身份，但每具真人身体都计入总可见真人。")
+            + "；功能人物不锁身份；完整身体、局部来源与画外来源分别计数，"
+            "不得把局部手/影子补成第三具完整身体或完整脸。")
     condition_lines = []
     target_phase = _text(output.get("frame_phase"), "end")
     for name, phases in (
@@ -4493,6 +5208,7 @@ def render_shot_prompt(contract, *, mode=None):
     # (life=dead)约束力近零——实测阿砚"已死亡"被画成睁眼注视的活人。
     # 翻译成强制性视觉判据,与质检同一口径。
     hard_state_lines = []
+    local_body_state = bool(contract.get("partial_body_framing"))
     for name, phases in (
             contract.get("character_conditions") or {}).items():
         if not isinstance(phases, dict):
@@ -4502,7 +5218,14 @@ def render_shot_prompt(contract, *, mode=None):
         life = str(condition.get("life_state") or "")
         consciousness = str(condition.get("consciousness_state") or "")
         mobility = str(condition.get("mobility") or "")
-        if life in ("dead", "nonliving"):
+        if local_body_state and (
+                life in ("dead", "nonliving")
+                or consciousness in ("unconscious", "none")
+                or mobility in ("immobile", "none")):
+            hard_state_lines.append(
+                f"{name}镜内声明的身体局部完全无自主动作，位置与姿态"
+                "只由重力、接触面和已声明支撑决定")
+        elif life in ("dead", "nonliving"):
             hard_state_lines.append(
                 f"{name}已死亡:双眼完全闭合,无任何眼神、注视方向或"
                 "表情张力,面部肌肉彻底松弛静止;身体无自主支撑,姿态"
@@ -4769,6 +5492,16 @@ def synchronize_shot_execution_contract(
         "composition": camera.get("构图", ""),
         "movement_motivation": camera.get("动机", ""),
     })
+    capacity_note = _text(camera.get("容量修正"))
+    if capacity_note:
+        design["capacity_note"] = capacity_note
+    else:
+        # ``camera_design`` may carry a capacity repair produced for an older
+        # character count or framing.  Once the current authoritative camera
+        # needs no upgrade, keeping that stale note makes later stages believe
+        # the old count still applies (episode 30 shot 18 retained a 3-person
+        # note after it had become a 2-person composition).
+        design.pop("capacity_note", None)
     dimensions["camera_design"] = design
 
     movement = _text(camera.get("运镜"), "固定")
@@ -4901,6 +5634,9 @@ def validate_shot_prompt_contract(contract):
     registered_count = subject.get("registered_count", count)
     functional_figures = subject.get("functional_figures") or []
     normalized_functional_count = 0
+    normalized_full_visible_count = 0
+    normalized_partial_visible_count = 0
+    normalized_off_camera_count = 0
     for position, item in enumerate(functional_figures, 1):
         if not isinstance(item, dict):
             issues.append(f"第{position}个功能人物不是对象")
@@ -4916,22 +5652,44 @@ def validate_shot_prompt_contract(contract):
         if not _text(item.get("name") or item.get("label")):
             issues.append(f"第{position}个功能人物缺少 name/label")
         normalized_functional_count += value
+        if item.get("off_camera"):
+            normalized_off_camera_count += value
+        elif item.get("partial_only") or item.get("visible_parts"):
+            normalized_partial_visible_count += value
+        else:
+            normalized_full_visible_count += value
     functional_count = subject.get(
         "functional_count", normalized_functional_count)
     visible_count = subject.get(
-        "visible_count", count + normalized_functional_count)
+        "visible_count", count + normalized_full_visible_count)
+    source_count = subject.get(
+        "source_count", count + normalized_functional_count)
+    partial_visible_count = subject.get(
+        "partial_visible_count", normalized_partial_visible_count)
+    off_camera_count = subject.get(
+        "off_camera_count", normalized_off_camera_count)
     for label, value in (
             ("subject.registered_count", registered_count),
             ("subject.functional_count", functional_count),
-            ("subject.visible_count", visible_count)):
+            ("subject.visible_count", visible_count),
+            ("subject.source_count", source_count),
+            ("subject.partial_visible_count", partial_visible_count),
+            ("subject.off_camera_count", off_camera_count)):
         if not isinstance(value, int) or isinstance(value, bool):
             issues.append(f"{label} 必须是整数")
     if registered_count != count:
         issues.append("subject.count 与 registered_count 不一致")
     if functional_count != normalized_functional_count:
         issues.append("subject.functional_count 与 functional_figures 求和不一致")
-    if visible_count != count + normalized_functional_count:
-        issues.append("subject.visible_count 与登记角色数和功能人物数之和不一致")
+    if visible_count != count + normalized_full_visible_count:
+        issues.append(
+            "subject.visible_count 与登记角色数和完整可见功能人物数之和不一致")
+    if source_count != count + normalized_functional_count:
+        issues.append("subject.source_count 与全部人物来源数不一致")
+    if partial_visible_count != normalized_partial_visible_count:
+        issues.append("subject.partial_visible_count 与局部功能人物数不一致")
+    if off_camera_count != normalized_off_camera_count:
+        issues.append("subject.off_camera_count 与画外功能人物数不一致")
     population = contract.get("population") or {}
     population_counts = population.get("counts") or {}
     expected_population_counts = {
@@ -4940,26 +5698,40 @@ def validate_shot_prompt_contract(contract):
         "real_people_total": count + normalized_functional_count,
         "non_real_overlays": len(contract.get("narrative_overlays") or []),
         "visible_entity_instances_total": (
-            count + normalized_functional_count
+            count + normalized_full_visible_count
+            + normalized_partial_visible_count
             + len(contract.get("narrative_overlays") or [])),
     }
     for key, expected in expected_population_counts.items():
         if key in population_counts and population_counts.get(key) != expected:
             issues.append(f"population.counts.{key} 与镜头实体求和不一致")
+    figure_accounting = population.get("figure_accounting") or {}
+    expected_figure_accounting = {
+        "person_sources_total": count + normalized_functional_count,
+        "complete_visible_people": count + normalized_full_visible_count,
+        "functional_full_visible": normalized_full_visible_count,
+        "functional_partial_visible": normalized_partial_visible_count,
+        "functional_off_camera": normalized_off_camera_count,
+    }
+    for key, expected in expected_figure_accounting.items():
+        if (key in figure_accounting
+                and figure_accounting.get(key) != expected):
+            issues.append(
+                f"population.figure_accounting.{key} 与人物来源/可见性不一致")
     issues.extend(
         _text(value) for value in population.get("issues") or []
         if _text(value))
     declared_visible = population.get("declared_visible_figure_count")
     if (declared_visible is not None
-            and declared_visible != count + normalized_functional_count):
+            and declared_visible != count + normalized_full_visible_count):
         issues.append(
-            "显式 visible_figure_count 与登记角色数和功能人物数之和不一致")
+            "显式 visible_figure_count 与登记角色数和完整可见功能人物数之和不一致")
     composition = contract.get("composition") or {}
     if composition.get(
             "expected_visible_figure_count",
-            count + normalized_functional_count,
-    ) != count + normalized_functional_count:
-        issues.append("构图可见人数与登记角色数和功能人物数之和不一致")
+            count + normalized_full_visible_count,
+    ) != count + normalized_full_visible_count:
+        issues.append("构图可见人数与登记角色数和完整可见功能人物数之和不一致")
     if (composition.get("composition_type") == "over_shoulder_dialogue"
             and count < 2):
         issues.append("单人镜头不得使用双人过肩对话合同")
@@ -5324,6 +6096,10 @@ def validate_shot_prompt_contract(contract):
     performance = _text(contract.get("performance"))
     speaker = _text(contract.get("speaker"))
     dialogue = _text(contract.get("dialogue"))
+    if contract.get("dialogue_source_declared") and not dialogue:
+        issues.append(
+            "源分镜已声明对白，但提示词合同中的对白为空；"
+            "禁止静默丢失台词或对口型文本")
     for name in actor_names:
         local_action = _actor_semantic_clause(action, name, actor_names)
         if len(actor_names) == 1 and not local_action:
@@ -5379,6 +6155,8 @@ def validate_shot_prompt_contract(contract):
                 for value in condition.get("issues") or []
                 if _text(value))
 
+        start_state_hits = set()
+        end_state_hits = set()
         if static_target_only:
             # A still-image provider receives only the frozen frame target;
             # render_shot_prompt deliberately omits the timeline action,
@@ -5396,12 +6174,19 @@ def validate_shot_prompt_contract(contract):
             performance_hits = set()
             state_hits = _behavior_hits(
                 state_clauses.get(static_target_phase, ""))
+            if static_target_phase == "start":
+                start_state_hits = set(state_hits)
+            else:
+                end_state_hits = set(state_hits)
             dialogue_hits = set()
         else:
             action_hits = _behavior_hits(local_action)
             performance_hits = _behavior_hits(local_performance)
-            state_hits = _behavior_hits(
-                " ".join(state_clauses.values()))
+            start_state_hits = _behavior_hits(
+                state_clauses.get("start", ""))
+            end_state_hits = _behavior_hits(
+                state_clauses.get("end", ""))
+            state_hits = start_state_hits | end_state_hits
             dialogue_hits = (
                 {"说话"} if speaker == name and dialogue else set())
         all_hits = (
@@ -5494,8 +6279,11 @@ def validate_shot_prompt_contract(contract):
             if not expected_transition:
                 consciousness_forbidden |= active_mind_hits
             else:
-                # End-state performance belongs after the transition.
-                consciousness_forbidden |= performance_hits & {
+                # Start-state gaze/speech happens before the declared sleep
+                # transition and is legal.  Only the final frozen state and
+                # unphased performance belong after it.
+                consciousness_forbidden |= (
+                    performance_hits | end_state_hits) & {
                     "注视/眨眼", "说话", "微表情", "主动动作",
                 }
         if consciousness_forbidden:

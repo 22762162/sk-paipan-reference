@@ -66,6 +66,10 @@ class ProjectionTest(unittest.TestCase):
         self.assertIsNone(offset)
         self.assertIsNone(distance)
 
+    def test_offsets_beyond_view_are_reported_outside_not_center(self):
+        self.assertEqual(screen_zone(-1.2), "画面外左侧")
+        self.assertEqual(screen_zone(1.2), "画面外右侧")
+
     def test_distance_maps_to_framing_band(self):
         self.assertEqual(framing_for_distance(0.8), "特写")
         self.assertEqual(framing_for_distance(2.8), "中景")

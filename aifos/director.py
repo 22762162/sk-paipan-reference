@@ -112,6 +112,7 @@ from .spatial_blocking import (
     canvas_from_world,
     director_camera_issues,
     mark_spatial_reference_requirements,
+    rebuild_actor_routes,
     requires_spatial_reference,
     shot_blocking,
     write_spatial_reference_pngs,
@@ -3300,18 +3301,25 @@ class Director:
                             if isinstance(actor.get("end_3d"), dict):
                                 actor["end"] = canvas_from_world(
                                     actor["end_3d"], scene.get("world"))
-                            actor["route"] = [
-                                dict(canvas_from_world(
-                                         point, scene.get("world")),
-                                     phase=point.get("phase"))
-                                for point in (actor.get("route_3d") or [])
-                                if isinstance(point, dict)
-                            ]
-                        indexed = (blocking.get("shot_index") or {}).get(
-                            str(shot_no))
-                        if isinstance(indexed, dict) and indexed is not shot:
-                            indexed["actors"] = copy.deepcopy(
-                                shot.get("actors") or [])
+                    # Endpoint repair alone is insufficient: the old direct
+                    # chord may still cut through a desk/chair even after both
+                    # endpoints are legal. Re-plan every moving actor against
+                    # the same real boxes and persist its detour polyline.
+                    route_adjustments = rebuild_actor_routes(
+                        shot.get("actors") or [], model,
+                        scene.get("world"))
+                    for adjustment in route_adjustments:
+                        adjustment.update({
+                            "scene_no": scene.get("scene_no"),
+                            "shot_no": shot_no,
+                            "location": location,
+                        })
+                    adjustments.extend(route_adjustments)
+                    indexed = (blocking.get("shot_index") or {}).get(
+                        str(shot_no))
+                    if isinstance(indexed, dict) and indexed is not shot:
+                        indexed["actors"] = copy.deepcopy(
+                            shot.get("actors") or [])
                     camera_adjustments = repair_camera_furniture_collisions(
                         model, shot.get("camera") or {})
                     for adjustment in camera_adjustments:
