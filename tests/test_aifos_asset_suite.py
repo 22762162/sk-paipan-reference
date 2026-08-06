@@ -705,6 +705,41 @@ def test_codex_bridge_declares_managed_model(monkeypatch, tmp_path):
     assert reply["model"] == "gpt-image-2 (Codex 内置 image_gen)"
 
 
+def test_codex_bridge_accepts_fresh_image_when_prompt_warning_is_echoed(
+        monkeypatch, tmp_path):
+    """A rendered PNG wins over capability-warning text echoed from input."""
+    from aifos.adapters import codex_image
+
+    target = tmp_path / "portrait_周鹿.png"
+
+    class FakePopen:
+        def __init__(self, args, **_kwargs):
+            self.args = args
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            target.write_bytes(PNG)
+            return (
+                "提示词回显：如果完全没有图像生成能力，打印错误并退出。"
+                "\n已使用内置 imagegen 生成目标图片。",
+                "",
+            )
+
+    monkeypatch.setattr(codex_image.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(codex_image.shutil, "which",
+                        lambda _cmd: "/usr/bin/codex")
+
+    reply = codex_image.run({
+        "capability": "image",
+        "payload": {"portrait": True, "art_name": "周鹿"},
+        "out_dir": str(tmp_path),
+    }, "codex", 30, [])
+
+    assert reply["ok"] is True
+    assert reply["uri"] == str(target)
+    assert reply["model"] == "gpt-image-2 (Codex 内置 image_gen)"
+
+
 def test_codex_bridge_surfaces_missing_imagegen_capability(
         monkeypatch, tmp_path):
     from aifos.adapters import codex_image

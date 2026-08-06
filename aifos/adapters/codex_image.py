@@ -1451,22 +1451,27 @@ def run(request, codex, timeout, extra_args, plain=False):
             verdict, issues=verdict.get("issues")))
         return {"ok": True, "data": verdict, "uri": "",
                 "model": "Codex 视觉质检"}
-    generation_output = f"{proc.stdout}\n{proc.stderr}".lower()
-    imagegen_unavailable_signals = (
-        "built-in `image_gen` capability is unavailable",
-        "built-in image_gen capability is unavailable",
-        "未提供可调用的内置 `image_gen`",
-        "未提供内置 `image_gen`",
-        "没有图像生成能力",
-    )
-    if any(signal.lower() in generation_output
-           for signal in imagegen_unavailable_signals):
-        return {
-            "ok": False,
-            "error": "codex 子会话缺少内置 image_gen 图像生成能力",
-        }
     missing = [str(t) for t in targets if not t.exists()]
     if missing:
+        # Codex transcripts may echo the complete input prompt.  The prompt
+        # itself deliberately says "如果没有图像生成能力则报错", so scanning
+        # stdout before checking the real file falsely circuit-breaks every
+        # successful image call.  A fresh decoded target is authoritative;
+        # capability text is meaningful only when no target was produced.
+        generation_output = f"{proc.stdout}\n{proc.stderr}".lower()
+        imagegen_unavailable_signals = (
+            "built-in `image_gen` capability is unavailable",
+            "built-in image_gen capability is unavailable",
+            "未提供可调用的内置 `image_gen`",
+            "未提供内置 `image_gen`",
+            "没有图像生成能力",
+        )
+        if any(signal.lower() in generation_output
+               for signal in imagegen_unavailable_signals):
+            return {
+                "ok": False,
+                "error": "codex 子会话缺少内置 image_gen 图像生成能力",
+            }
         return {"ok": False,
                 "error": f"codex 未产出期望文件: {', '.join(missing)}"}
     stale = []
