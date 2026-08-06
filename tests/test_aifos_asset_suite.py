@@ -506,7 +506,12 @@ def test_reference_upload_and_injection(app):
     # 画风作为独立 style_ref，不得伪装成人物/服装参考。
     ctx = {"project": dict(project)}
     refs = app.director._art_refs(ctx, [hero], "")
-    assert len(refs.get("reference_images", [])) == 1
+    # 用户身份图是脸/发型/妆造的最高标准，直接替换最终立绘所占的
+    # 唯一身份槽，不能作为第六张可选 reference_images 被预算淘汰。
+    assert not refs.get("reference_images")
+    assert refs["identity_references"][0]["uri"] == uris[0]
+    assert refs["identity_references"][0][
+        "identity_anchor_type"] == "user_reference"
     assert refs.get("style_ref")
     # 删除后不再注入
     app.director.delete_reference(project["title"], "画风参考")
@@ -603,7 +608,8 @@ def test_video_references_are_versioned_and_used(app):
         assert meta["reference_manifest"][0]["index"] == 3
 
 
-def test_shot_generation_prioritizes_matching_asset_center_images(app):
+def test_shot_generation_keeps_structural_anchors_before_old_matched_images(
+        app):
     project = _preproduce(app)
     episode = app.db.query_one(
         "SELECT * FROM episodes WHERE project_id=? AND number=1",
@@ -616,10 +622,17 @@ def test_shot_generation_prioritizes_matching_asset_center_images(app):
     ctx = {"project": dict(project)}
     refs = app.director._art_refs(
         ctx, shot["characters"], location, shot_no=9999)
-    matches = [item for item in refs["asset_matches"]
-               if item["kind"] in ("image", "first_frame", "last_frame")]
-    assert matches, "应优先匹配同人物/同场景的已生产资产"
-    assert refs["reference_images"][0] == matches[0]["uri"]
+    assert refs["scene_ref"]
+    assert refs["identity_references"]
+    # 任意“同人物/同场景”旧图不再优先于人物身份和物理场景母图；跨镜
+    # 连续性由紧邻上一镜的显式 chain_first_uri 负责，避免旧合同污染。
+    assert len({
+        *(refs.get("character_refs") or []),
+        *(refs.get("reference_images") or []),
+        *(refs.get("prop_refs") or []),
+        refs.get("scene_ref"),
+        *(row["uri"] for row in refs["identity_references"]),
+    } - {None, ""}) <= 5
     trace = app.director._reference_inputs(refs)
     assert any(item["source"] == "asset_center" for item in trace["items"])
 

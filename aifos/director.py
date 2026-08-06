@@ -750,8 +750,12 @@ STUDIO_KIND_ROLES = {
 STUDIO_MAX_COUNT = 4
 # Seedream 5 Lite 当前最多接收 10 张参考图。导演层按最小公共上限组织
 # 参考图，避免同一任务切换模型时图序、人物或构图语义发生漂移。
-IMAGE_REFERENCE_LIMIT = 10
-SHOT_BASE_REFERENCE_LIMIT = 8
+# Codex built-in imagegen currently accepts at most five attached images.
+# Keep the shared image contract at the real transport ceiling: declaring
+# eight references and letting a downstream agent improvise which three to
+# drop silently evicted the room master and made every shot a different set.
+IMAGE_REFERENCE_LIMIT = 5
+SHOT_BASE_REFERENCE_LIMIT = 5
 # Seedance 2 图片总上限 9 张 = 首帧 + 尾帧 + 7 张资产参考;
 # 资产位紧张时按镜内可见性收敛(absent 道具不占位),而非硬拆群像。
 SEEDANCE_ASSET_REFERENCE_LIMIT = 7
@@ -15798,8 +15802,8 @@ class Director:
         """最终立绘/人物套件/场景图/用户参考 → 真实多图参考输入。
 
         含人物画面缺任何一个最终立绘都直接阻断；禁止静默退化为文字生图。
-        基础参考最多 8 张，为首/尾帧阶段的本镜关键图与上一镜尾帧预留
-        2 个槽位；任何人物最终立绘都不会被低优先级参考挤掉。
+        基础参考最多 5 张，与 Codex 内置 imagegen 的真实附件上限一致；
+        任何人物最终立绘和场景母版都不会被低优先级参考挤掉。
         """
         project_id = ctx["project"]["id"]
         refs = {"character_refs": [], "identity_references": [],
@@ -15830,6 +15834,30 @@ class Director:
         for identity in identities:
             identity = dict(identity)
             character = identity.get("character")
+            # A user-uploaded identity reference is the highest authority for
+            # face, hair and make-up.  Do not append it as a sixth optional
+            # image (where the provider budget could discard it); replace the
+            # generated locked portrait in the one identity slot and keep the
+            # generated source only for audit.  Clothing is deliberately not
+            # inherited from this reference and remains governed by the
+            # per-shot wardrobe contract below.
+            user_identity_rows = self._reference_rows(
+                project_id, [character], allowed_roles={"identity"})
+            user_identity = max(
+                user_identity_rows,
+                key=lambda row: int(row["id"] or 0),
+                default=None)
+            if user_identity is not None:
+                identity.update({
+                    "source_identity_asset_id": identity.get("asset_id"),
+                    "source_identity_uri": identity.get("uri"),
+                    "source_identity_version": identity.get("version"),
+                    "asset_id": user_identity["id"],
+                    "uri": user_identity["uri"],
+                    "version": user_identity["version"],
+                    "identity_anchor_type": "user_reference",
+                    "user_reference_name": user_identity["name"],
+                })
             current_wardrobe = str(
                 (wardrobe_states or {}).get(
                     character) or "").strip()
@@ -15859,9 +15887,10 @@ class Director:
                 # its silhouette, terminal ornament and placement by itself.
                 identity["headwear_anchor"] = copy.deepcopy(
                     current_headwear)
-            if (character in identity_face_only_names
+            if (identity.get("identity_anchor_type") != "user_reference"
+                    and (character in identity_face_only_names
                     or ((current_wardrobe or current_headwear)
-                        and (not wardrobe_matches or not headwear_matches))):
+                        and (not wardrobe_matches or not headwear_matches)))):
                 # A full-body final portrait wearing another scene's outfit
                 # visually overpowers a clothes-only reference even when the
                 # prompt says "identity only". Replace the submitted image
@@ -15896,12 +15925,18 @@ class Director:
                     "character_identity_face_anchor"
                     if identity.get("identity_anchor_type")
                     == "face_only_derived"
+                    else "character_identity_user_reference"
+                    if identity.get("identity_anchor_type")
+                    == "user_reference"
                     else "character_identity"),
                 "name": character or "",
                 "label": (
                     f"{character or '角色'}最终立绘面部锚"
                     if identity.get("identity_anchor_type")
                     == "face_only_derived"
+                    else f"{character or '角色'}用户上传人脸/发型最高锚"
+                    if identity.get("identity_anchor_type")
+                    == "user_reference"
                     else f"{character or '角色'}最终立绘"),
                 "uri": identity["uri"],
                 "source_identity_asset_id": identity.get(
@@ -15911,7 +15946,7 @@ class Director:
         # Physical scene truth and this shot's spatial solution are structural
         # anchors, not optional decoration.  Reserve their slots immediately
         # after immutable character identities so later costume/detail/prop
-        # references cannot crowd them out at the provider's eight-image
+        # references cannot crowd them out at the provider's five-image
         # ceiling.  Losing either anchor is what previously let one bedroom
         # turn into a different room from shot to shot.
         if location:
@@ -16101,10 +16136,6 @@ class Director:
                             f"镜头{shot_no}参考图自动选优：淘汰{label}，"
                             f"保留核心道具「{name}」")
                         break
-            if not remembered and not self._director_autonomy_enabled():
-                raise AifosError(
-                    f"本镜人物、空间与核心道具参考图超过"
-                    f"{SHOT_BASE_REFERENCE_LIMIT}张，请拆分镜头")
             if not remembered:
                 self.log.warn(
                     "director",
@@ -17730,6 +17761,8 @@ class Director:
             actor = str(ref.get("actor_id") or f"P{pos:02d}")
             face_only = (
                 ref.get("identity_anchor_type") == "face_only_derived")
+            user_identity = (
+                ref.get("identity_anchor_type") == "user_reference")
             headwear_anchor = copy.deepcopy(
                 ref.get("headwear_anchor") or {})
             if isinstance(headwear_anchor, dict):
@@ -17771,7 +17804,9 @@ class Director:
                 ]
             add(ref["uri"], (
                     f"{actor}·{who}最终立绘面部锚"
-                    if face_only else f"{actor}·{who}最终立绘"),
+                    if face_only else
+                    f"{actor}·{who}用户上传人脸/发型最高锚"
+                    if user_identity else f"{actor}·{who}最终立绘"),
                 (
                     f"本图是从人工锁定的{who}最终立绘派生的面部锚；只锁定"
                     f"{who}的脸型、五官骨相、年龄、性别表达、发际线与发型"
@@ -17780,6 +17815,12 @@ class Director:
                     "或光线；服装只服从本镜服装参考；禁止参考他人图片"
                     + headwear_binding
                     if face_only else
+                    f"本图是用户上传的{who}身份最高锚；只锁定{who}的脸型、"
+                    "五官骨相、年龄、性别表达、发际线、发型轮廓、妆造与"
+                    "身份标志；不得复制此图的服装、姿势、构图、背景或"
+                    "光线；禁止参考他人图片"
+                    + headwear_binding
+                    if user_identity else
                     f"只锁定{who}的脸型、五官骨相、年龄、性别表达、发际线、"
                     "发型轮廓、眉眼、眼线、睫毛、唇妆、稳定妆造、体型与"
                     "身份标志；不得复制此图的服装、"
@@ -17790,7 +17831,9 @@ class Director:
                 inherits=identity_inherits,
                 kind=(
                     "character_identity_face_anchor"
-                    if face_only else "character_identity"))
+                    if face_only else
+                    "character_identity_user_reference"
+                    if user_identity else "character_identity"))
         for ref in payload.get("headwear_references") or []:
             if not isinstance(ref, dict) or not ref.get("uri"):
                 continue
@@ -18422,8 +18465,141 @@ class Director:
         return preflight_shot_contract(
             self._generation_preflight_contract(shot, payload, modality))
 
+    def _cap_image_reference_inputs(self, payload):
+        """Freeze the exact five attachments before prompt numbering.
+
+        Codex imagegen rejects a sixth attachment.  Previously the CLI agent
+        saw an eight-image manifest, hit that runtime error, then improvised a
+        smaller list; for some shots it kept two props but dropped the scene
+        master.  Select deterministically upstream so prompt, UI manifest and
+        actual imagegen attachments describe the same five files.
+        """
+        if not isinstance(payload, dict):
+            return
+
+        selected = []
+        selected_set = set()
+
+        def add(uri):
+            value = str(uri or "").strip()
+            if not value or value in selected_set:
+                return
+            selected.append(value)
+            selected_set.add(value)
+
+        identities = [
+            row for row in (payload.get("identity_references") or [])
+            if isinstance(row, dict) and row.get("uri")]
+        for row in identities:
+            add(row["uri"])
+
+        # The physical room is mandatory for every shot and must be reserved
+        # before props, detail sheets or continuity conveniences.
+        add(payload.get("scene_ref"))
+
+        # Only identity + room are truly non-negotiable.  A three-person frame
+        # already consumes four of the provider's five slots; in that case the
+        # current keyframe wins the final slot and the adjacent tail is omitted
+        # instead of stopping the entire episode.  The keyframe itself was
+        # produced through the dependency wavefront and already carries the
+        # preceding visual state.
+        hard_count = len(selected)
+        if hard_count > IMAGE_REFERENCE_LIMIT:
+            raise AifosError(
+                f"人物身份与统一场景共需 {hard_count} 张参考图，"
+                f"超过 Codex imagegen 硬上限 {IMAGE_REFERENCE_LIMIT} 张；"
+                "请拆分五人以上群像镜头，禁止静默丢弃场景或人物身份")
+
+        matches = {
+            str(row.get("uri") or ""): row
+            for row in (payload.get("asset_matches") or [])
+            if isinstance(row, dict) and row.get("uri")}
+        revision_bases = []
+        for uri in payload.get("reference_images") or []:
+            match = matches.get(str(uri)) or {}
+            if (str(match.get("reference_role") or "")
+                    == "revision_base"
+                    or "待修改基底" in str(match.get("label") or "")):
+                revision_bases.append(uri)
+        for uri in revision_bases:
+            add(uri)
+
+        # Boundary/continuity pixels are stronger than prose for frame chains.
+        for key in ("keyframe_reference_uri", "image_uri",
+                    "keyframe_last_uri", "chain_first_uri"):
+            add(payload.get(key))
+
+        # Fill remaining slots in quality order.  A keyframe already carries
+        # blocking/props, so frame generation naturally leaves those optional
+        # aids behind when identity + room + adjacent boundaries occupy five.
+        add(payload.get("spatial_ref"))
+        add(payload.get("inner_persona_ref"))
+        for uri in payload.get("prop_refs") or []:
+            add(uri)
+        for row in payload.get("headwear_references") or []:
+            if isinstance(row, dict):
+                add(row.get("uri"))
+        for uri in payload.get("character_refs") or []:
+            add(uri)
+        for uri in payload.get("reference_images") or []:
+            add(uri)
+        add(payload.get("style_ref"))
+
+        chosen = selected[:IMAGE_REFERENCE_LIMIT]
+        chosen_set = set(chosen)
+        all_uris = selected
+        dropped = [uri for uri in all_uris if uri not in chosen_set]
+
+        payload["identity_references"] = [
+            row for row in identities
+            if str(row.get("uri") or "") in chosen_set]
+        payload["headwear_references"] = [
+            row for row in (payload.get("headwear_references") or [])
+            if isinstance(row, dict)
+            and str(row.get("uri") or "") in chosen_set]
+        for key in ("character_refs", "prop_refs", "reference_images"):
+            payload[key] = [
+                uri for uri in (payload.get(key) or [])
+                if str(uri or "") in chosen_set]
+        payload["asset_matches"] = [
+            row for row in (payload.get("asset_matches") or [])
+            if not isinstance(row, dict)
+            or not row.get("uri")
+            or str(row.get("uri") or "") in chosen_set]
+        for key in (
+                "spatial_ref", "inner_persona_ref", "image_uri",
+                "keyframe_reference_uri", "keyframe_last_uri",
+                "chain_first_uri", "previous_shot_reference_uri",
+                "scene_ref", "style_ref"):
+            value = str(payload.get(key) or "").strip()
+            if value and value not in chosen_set:
+                payload.pop(key, None)
+        if (payload.get("previous_shot_reference_required")
+                and not payload.get("chain_first_uri")):
+            payload["previous_shot_reference_required"] = False
+            payload["continuity_reference_budget_dropped"] = True
+
+        payload["reference_budget"] = {
+            "schema": "aifos.image-reference-budget/v1",
+            "provider_limit": IMAGE_REFERENCE_LIMIT,
+            "selected_count": len(chosen),
+            "selected_uris": chosen,
+            "dropped_count": len(dropped),
+            "dropped": [{
+                "uri": uri,
+                "label": str((matches.get(uri) or {}).get("label") or ""),
+                "role": str((matches.get(uri) or {}).get(
+                    "reference_role") or ""),
+                "reason": "codex_imagegen_five_attachment_limit",
+            } for uri in dropped],
+            "scene_anchor_preserved": bool(
+                payload.get("scene_ref")
+                and str(payload.get("scene_ref")) in chosen_set),
+        }
+
     def _attach_reference_manifest(self, payload):
         """把参考图对照表写进 payload 与提示词(编号=实际提交顺序)。"""
+        self._cap_image_reference_inputs(payload)
         # Structured prompt-review context is audited alongside the prompt.
         # Clear positional image duties there as well; otherwise an inserted
         # headwear/identity anchor shifts the manifest while latest_camera or
@@ -19773,6 +19949,10 @@ class Director:
                             chain_first.get("image_quality", "medium"))
                         and Path(chain_first["uri"]).exists()):
                     payload["chain_first_uri"] = chain_first["uri"]
+                # chain_first_uri is discovered after the keyframe was bound;
+                # rebuild the frozen five-slot manifest so the predecessor is
+                # truly attached and the optional spatial/prop aid yields.
+                self._attach_reference_manifest(payload)
                 round_tasks.append({
                     "item_id": f"frames:{shot['shot_no']}",
                     "capability": "frames",
@@ -24322,6 +24502,7 @@ class Director:
                 frames_payload["seedance_prompt"] = prompt_override
             if previous_last:
                 frames_payload["chain_first_uri"] = previous_last
+            self._attach_reference_manifest(frames_payload)
             if codex_profile:
                 frames_payload["_codex_profile"] = str(codex_profile)
             frame_result = self._plan_run(
@@ -25103,6 +25284,7 @@ class Director:
                 frames_payload["prompt_compact"] = prompt_override
                 frames_payload["action"] = prompt_override
                 frames_payload["seedance_prompt"] = prompt_override
+                frames_payload["_reference_prompt_base"] = prompt_override
             prev = None
             for candidate in storyboard["shots"]:
                 if candidate["shot_no"] >= shot_no:
@@ -25116,6 +25298,7 @@ class Director:
                 if (row and formal_reference_allowed(self._asset_quality(row))
                         and row["uri"] and Path(row["uri"]).exists()):
                     frames_payload["chain_first_uri"] = row["uri"]
+            self._attach_reference_manifest(frames_payload)
             if codex_profile:
                 frames_payload["_codex_profile"] = str(codex_profile)
             result = self._plan_run(

@@ -898,7 +898,7 @@ def test_spatial_diagram_is_uploaded_for_keyframe_with_single_role(
 
 def test_crowded_keyframe_refs_cannot_evict_scene_or_spatial_anchors(
         app, tmp_path, monkeypatch):
-    """The eight-image ceiling must drop optional detail, never room truth."""
+    """The five-image ceiling must drop props, never room/blocking truth."""
     project, episode, script = _preproduce(app, title="场景硬槽位")
     characters = [row["name"] for row in script["characters"][:2]]
     scene = tmp_path / "scene-slice.png"
@@ -931,10 +931,128 @@ def test_crowded_keyframe_refs_cannot_evict_scene_or_spatial_anchors(
 
     assert refs["scene_ref"] == str(scene)
     assert refs["spatial_ref"] == str(spatial)
-    assert len({item["uri"] for item in refs["asset_matches"]}) == 8
+    assert len({item["uri"] for item in refs["asset_matches"]}) == 5
     roles = {item.get("reference_role")
              for item in refs["asset_matches"]}
     assert {"scene", "spatial"} <= roles
+
+
+def test_codex_five_reference_budget_never_drops_scene_master(
+        app, tmp_path):
+    """Prompt/UI attachments are frozen before Codex can improvise drops."""
+    paths = []
+    for name in ("person-a", "person-b", "scene", "space", "prop-a",
+                 "prop-b", "detail"):
+        uri = tmp_path / f"{name}.png"
+        uri.write_bytes(PNG)
+        paths.append(uri)
+    person_a, person_b, scene, space, prop_a, prop_b, detail = paths
+    payload = {
+        "prompt": "同一卧室内的双人静态关键帧",
+        "characters": ["甲", "乙"],
+        "identity_references": [
+            {"character": "甲", "uri": str(person_a)},
+            {"character": "乙", "uri": str(person_b)},
+        ],
+        "character_refs": [str(person_a), str(person_b), str(detail)],
+        "scene_ref": str(scene),
+        "spatial_ref": str(space),
+        "prop_refs": [str(prop_a), str(prop_b)],
+        "asset_matches": [
+            {"uri": str(scene), "label": "统一卧室母版",
+             "reference_role": "scene"},
+            {"uri": str(space), "label": "本镜空间调度图",
+             "reference_role": "spatial"},
+            {"uri": str(prop_a), "label": "核心道具A",
+             "reference_role": "prop"},
+            {"uri": str(prop_b), "label": "核心道具B",
+             "reference_role": "prop"},
+        ],
+    }
+
+    app.director._attach_reference_manifest(payload)
+
+    assert len(payload["reference_manifest"]) == 5
+    uris = [row["uri"] for row in payload["reference_manifest"]]
+    assert str(scene) in uris
+    assert str(space) in uris
+    assert str(person_a) in uris and str(person_b) in uris
+    assert payload["reference_budget"]["scene_anchor_preserved"] is True
+    assert payload["reference_budget"]["dropped_count"] == 2
+    assert "共5张" in payload["prompt"]
+    assert "图6=" not in payload["prompt"]
+
+
+def test_frame_budget_keeps_room_keyframe_and_adjacent_tail(
+        app, tmp_path):
+    paths = {}
+    for name in ("person-a", "person-b", "scene", "space", "key", "tail"):
+        uri = tmp_path / f"{name}.png"
+        uri.write_bytes(PNG)
+        paths[name] = str(uri)
+    payload = {
+        "prompt": "同一卧室的连续首尾帧",
+        "frame_kind": "frames",
+        "characters": ["甲", "乙"],
+        "identity_references": [
+            {"character": "甲", "uri": paths["person-a"]},
+            {"character": "乙", "uri": paths["person-b"]},
+        ],
+        "character_refs": [paths["person-a"], paths["person-b"]],
+        "scene_ref": paths["scene"],
+        "spatial_ref": paths["space"],
+        "keyframe_reference_uri": paths["key"],
+        "image_uri": paths["key"],
+        "chain_first_uri": paths["tail"],
+        "previous_shot_reference_required": True,
+    }
+
+    app.director._attach_reference_manifest(payload)
+
+    uris = {row["uri"] for row in payload["reference_manifest"]}
+    assert uris == {
+        paths["person-a"], paths["person-b"], paths["scene"],
+        paths["key"], paths["tail"],
+    }
+    assert "spatial_ref" not in payload
+    assert payload["reference_budget"]["scene_anchor_preserved"] is True
+
+
+def test_three_person_frame_drops_adjacent_tail_without_blocking(
+        app, tmp_path):
+    paths = {}
+    for name in ("person-a", "person-b", "person-c", "scene", "key", "tail"):
+        uri = tmp_path / f"{name}.png"
+        uri.write_bytes(PNG)
+        paths[name] = str(uri)
+    payload = {
+        "prompt": "同一房间的三人连续首尾帧",
+        "frame_kind": "frames",
+        "characters": ["甲", "乙", "丙"],
+        "identity_references": [
+            {"character": "甲", "uri": paths["person-a"]},
+            {"character": "乙", "uri": paths["person-b"]},
+            {"character": "丙", "uri": paths["person-c"]},
+        ],
+        "character_refs": [
+            paths["person-a"], paths["person-b"], paths["person-c"]],
+        "scene_ref": paths["scene"],
+        "image_uri": paths["key"],
+        "chain_first_uri": paths["tail"],
+        "previous_shot_reference_required": True,
+    }
+
+    app.director._attach_reference_manifest(payload)
+
+    uris = {row["uri"] for row in payload["reference_manifest"]}
+    assert uris == {
+        paths["person-a"], paths["person-b"], paths["person-c"],
+        paths["scene"], paths["key"],
+    }
+    assert "chain_first_uri" not in payload
+    assert payload["previous_shot_reference_required"] is False
+    assert payload["continuity_reference_budget_dropped"] is True
+    assert payload["reference_budget"]["scene_anchor_preserved"] is True
 
 
 def test_unvalidated_wide_scene_master_is_never_v360_sliced(
