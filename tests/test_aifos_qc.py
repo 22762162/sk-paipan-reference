@@ -177,55 +177,16 @@ def test_preview_qc_bypass_skips_image_and_total_qc(tmp_path):
         app.close()
 
 
-def test_director_autonomy_mode_is_final_composite_not_preview(tmp_path):
+def test_director_autonomy_keeps_nonblocking_content_qc_enabled(tmp_path):
     app = App(
         tmp_path / "ws",
         config_overrides={"defaults": {"director_autonomy_mode": True}})
     try:
-        project, _ = app.projects.get_or_create_project("导演自主成片测试")
-        episode, _ = app.projects.get_or_create_episode(project["id"], 1)
-        out_root = tmp_path / "artifacts"
-        out_root.mkdir()
-        ctx = {
-            "project": dict(project), "episode": dict(episode),
-            "out_root": out_root,
-        }
-
-        assert app.director._image_qc_enabled() is False
-        assert app.director._prompt_review_enabled() is False
-        task = {
-            "capability": "image",
-            "payload": {"prompt": "使用冻结稿直接生成"},
-            "item_id": "shot:1",
-        }
-        assert app.director._review_image_tasks(ctx, [task]) == []
-        assert task["payload"]["director_autonomy_mode"] is True
-        assert task["payload"]["prompt_review"]["status"] == \
-            "not_applicable_director_autonomy"
-        task["payload"].pop("prompt_review")
-        assert app.director.router.review_image_prompt(
-            "image", task["payload"], out_root) is None
-        assert task["payload"]["prompt_review"]["approved"] is False
-        dispatch = app.director._build_dispatch_contract(
-            {"item_id": "shot:1", "capability": "image", "payload": {
-                "prompt": "冻结镜头直接生成",
-                "director_autonomy_mode": True,
-                "prompt_review": {
-                    "status": "not_applicable_director_autonomy"},
-                "prompt_contract": {},
-            }},
-            {"category": "shot_image"})
-        assert dispatch["passed"] is True
-        result = app.director._stage_qc(ctx)
-
-        assert result["passed"] is True
-        assert result["preview_only"] is False
-        assert result["inspection_waived"] is True
-        assert result["final_output_allowed"] is True
-        assert ctx["qc_report"]["schema"] == \
-            "aifos.director-autonomy/v1"
-        assert ctx["qc_report"]["formal_passed"] is False
-        assert ctx["video_qc_report"]["inspection_waived"] is True
+        assert app.director._director_autonomy_enabled() is True
+        assert app.director._preview_qc_bypass_enabled() is False
+        assert app.director._image_qc_enabled() is True
+        assert app.director._video_content_qc_enabled() is True
+        assert app.director._prompt_review_enabled() is True
     finally:
         app.close()
 

@@ -4936,15 +4936,13 @@ class Director:
     def _preview_qc_bypass_enabled(self):
         """是否旁路会触发视觉返工的内容检查。
 
-        ``preview_qc_bypass`` 保留旧版临时预览语义；
-        ``director_autonomy_mode`` 是用户明确授权的最终合成模式。二者都
-        不伪造 QC 分数，但后者产物不是临时预览片。
+        只有用户显式开启 ``preview_qc_bypass`` 才允许旁路。AI 导演
+        自主模式只代表无需手机逐张确认，不能再被解释成“关闭质检”；
+        否则四候选会退化为机械选第一张，场景、人物和物理错误都无法
+        触发非阻断返修。
         """
-        return (
-            self._director_autonomy_enabled()
-            or self._setting_enabled(self.config.get(
-                "defaults", "preview_qc_bypass", default=False),
-                default=False))
+        return self._setting_enabled(self.config.get(
+            "defaults", "preview_qc_bypass", default=False), default=False)
 
     def _selection_mode_enabled(self):
         return self._setting_enabled(self.config.get(

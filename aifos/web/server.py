@@ -1320,10 +1320,13 @@ def _selection_mode_payload_from_config(config):
     selection_mode = flag("selection_mode", True)
     image_content_qc = flag("image_content_qc", True)
     video_content_qc = flag("video_content_qc", True)
+    preview_qc_bypass = flag("preview_qc_bypass", False)
     policy = build_selection_policy(
         selection_mode,
-        image_content_qc_requested=image_content_qc,
-        video_content_qc_requested=video_content_qc,
+        image_content_qc_requested=(
+            image_content_qc and not preview_qc_bypass),
+        video_content_qc_requested=(
+            video_content_qc and not preview_qc_bypass),
         initial_candidates_per_shot=CANDIDATES_PER_SHOT,
         repair_candidates_per_batch=REPAIR_CANDIDATES_PER_BATCH,
         max_candidate_rounds=MAX_CANDIDATE_ROUNDS,
@@ -1334,6 +1337,7 @@ def _selection_mode_payload_from_config(config):
         # “非阻断”误解成“未执行质检”。
         "image_content_qc": image_content_qc,
         "video_content_qc": video_content_qc,
+        "preview_qc_bypass": preview_qc_bypass,
         "effective_image_content_qc": policy.image_content_qc_enabled,
         "effective_video_content_qc": policy.video_content_qc_enabled,
         "content_qc_blocking": policy.content_qc_blocking,
