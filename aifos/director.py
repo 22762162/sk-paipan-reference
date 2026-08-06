@@ -23778,6 +23778,7 @@ class Director:
         """数据沉淀:Prompt、图片、视频、配音、成/败案例入库。"""
         episode_id = ctx["episode"]["id"]
         passed = ctx.get("qc_report", {}).get("passed", False)
+        content_review = ctx.get("content_review") or {}
         label = "success" if passed else "failure"
         for shot in ctx["storyboard"]["shots"]:
             self.data.record(
@@ -23802,7 +23803,7 @@ class Director:
                       "integrated_in_video": True}, episode_id=episode_id)
         self.data.record(
             "review", label, uri=ctx.get("review_board", ""),
-            meta={"content_passed": ctx.get("content_review", {}).get("passed"),
+            meta={"content_passed": content_review.get("passed"),
                   "delivery_passed": ctx.get("qc_report", {}).get(
                       "delivery_check", {}).get("passed")},
             episode_id=episode_id)

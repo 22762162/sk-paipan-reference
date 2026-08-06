@@ -187,6 +187,7 @@ class DreaminaProvider(Provider):
         if capability != "video":
             raise ProviderError(f"dreamina 适配器不支持能力: {capability}")
         started_at = time.monotonic()
+        submitted_at = time.time()
         out_dir = Path(out_dir).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
         first = payload.get("first", "")
@@ -342,18 +343,36 @@ class DreaminaProvider(Provider):
             submit_id = self._latest_submit_id(log_path)
         if submit_id and not (out_dir / f"shot_{shot_no:03d}.mp4").exists():
             recovered_existing = True
+            original_submitted_at = self._latest_submit_started_at(log_path)
+            configured_timeout = float(
+                self.conf.get("timeout", 1800) or 1800)
+            if original_submitted_at is None:
+                # 旧日志没有提交墙钟，不能把同一远端任务重新等待完整一轮。
+                # 只留一个很短的下载窗口，既能捞回已经完成的成片，又不会
+                # 把一次 30 分钟上限静默扩成 60 分钟。
+                recovery_timeout = min(
+                    configured_timeout,
+                    float(self.conf.get("legacy_recovery_timeout", 60) or 60))
+            else:
+                elapsed = max(0.0, time.time() - original_submitted_at)
+                recovery_timeout = max(0.1, configured_timeout - elapsed)
             with log_path.open("a", encoding="utf-8") as stream:
                 stream.write(
                     "\n--- recover existing submit (no regeneration) ---\n"
-                    f"submit_id={submit_id}\n")
+                    f"submit_id={submit_id}\n"
+                    f"remaining_timeout={recovery_timeout:.3f}\n")
             uri = self._wait_for_video(
-                submit_id, out_dir, log_path, time.monotonic(), cancel)
+                submit_id, out_dir, log_path, time.monotonic(), cancel,
+                timeout=recovery_timeout,
+                total_timeout=configured_timeout)
         else:
             # 可中断执行:用户点「停止生成」时 2 秒内终止即梦调用
             returncode, stdout, stderr = run_interruptible(
                 "dreamina", cmd, None, self.conf.get("timeout", 1800),
                 cancel=cancel)
             log_path.write_text(
+                f"--- submit metadata ---\n"
+                f"submitted_at={submitted_at:.6f}\n"
                 f"$ {' '.join(cmd)}\n--- stdout ---\n{stdout}\n"
                 f"--- stderr ---\n{stderr}\n", encoding="utf-8")
             if returncode != 0:
@@ -430,14 +449,34 @@ class DreaminaProvider(Provider):
         matches = re.findall(r'"submit_id"\s*:\s*"([^"]+)"', text)
         return matches[-1] if matches else ""
 
+    @staticmethod
+    def _latest_submit_started_at(log_path):
+        """读取远端任务首次提交墙钟，恢复查询时不得重置总等待上限。"""
+        try:
+            text = Path(log_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return None
+        matches = re.findall(
+            r"^submitted_at=([0-9]+(?:\.[0-9]+)?)$", text, re.MULTILINE)
+        if not matches:
+            return None
+        try:
+            return float(matches[-1])
+        except (TypeError, ValueError):
+            return None
+
     def _wait_for_video(self, submit_id, out_dir, log_path, started_at,
-                        cancel=None):
+                        cancel=None, *, timeout=None, total_timeout=None):
         """异步任务返回 querying 时持续查到成片，不把排队误判为失败。
 
         dreamina 的 ``--poll`` 只会短暂等待，超时后正常返回 submit_id；
         这里接管后续查询，并把每次状态写入同一个镜头日志。
         """
-        timeout = float(self.conf.get("timeout", 1800) or 1800)
+        configured_timeout = float(self.conf.get("timeout", 1800) or 1800)
+        timeout = configured_timeout if timeout is None else max(
+            0.1, float(timeout))
+        total_timeout = (configured_timeout if total_timeout is None
+                         else float(total_timeout))
         interval = max(
             0.05, float(self.conf.get("query_interval", 5) or 5))
         deadline = started_at + timeout
@@ -490,9 +529,13 @@ class DreaminaProvider(Provider):
                 if cancel is not None and cancel():
                     raise ProduceCancelled(
                         "已手动停止(终止 dreamina 异步视频查询)")
-                time.sleep(min(0.5, sleep_until - time.monotonic()))
+                sleep_for = max(0.0, sleep_until - time.monotonic())
+                if sleep_for <= 0:
+                    break
+                time.sleep(min(0.5, sleep_for))
         raise ProviderError(
-            f"dreamina 异步视频等待超时({int(timeout)}s): {submit_id}")
+            f"dreamina 异步视频总等待超时({int(total_timeout)}s): "
+            f"{submit_id}")
 
     @staticmethod
     def _ingest(uri, out_dir, shot_no):

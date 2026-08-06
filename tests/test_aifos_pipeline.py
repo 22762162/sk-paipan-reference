@@ -72,6 +72,34 @@ def test_full_pipeline_produces_episode(app):
     assert app.data.cases(label="success", kind="case")
 
 
+def test_archive_accepts_disabled_content_review(app):
+    """一键关闭内容质检时 review=None，归档仍必须成功。"""
+    project, _ = app.projects.get_or_create_project("免检归档测试")
+    episode, _ = app.projects.get_or_create_episode(project["id"], 1)
+    ctx = {
+        "project": project,
+        "episode": episode,
+        "storyboard": {"shots": []},
+        "images": [],
+        "videos": [],
+        "voices": [],
+        "voice_mode": "jimeng_builtin",
+        "final_uri": "/tmp/final.mp4",
+        "content_review": None,
+        "qc_report": {
+            "passed": True,
+            "score": 100,
+            "delivery_check": {"passed": False},
+        },
+        "production_profile": {},
+    }
+
+    assert app.director._stage_archive(ctx) == {"label": "success"}
+    review = app.data.cases(
+        label="success", kind="review", episode_id=episode["id"])[0]
+    assert json.loads(review["meta"])["content_passed"] is None
+
+
 def test_asset_reuse_across_episodes(app):
     _finish(app, "万妖图录", 1)
     _finish(app, "万妖图录", 2)

@@ -28,6 +28,84 @@ def test_latest_submit_id_recovers_last_remote_task(tmp_path):
 
     assert DreaminaProvider._latest_submit_id(log_path) == "generated-task"
 
+
+def test_submit_started_at_is_persisted_for_total_recovery_budget(tmp_path):
+    log_path = tmp_path / "shot_009.dreamina.log"
+    log_path.write_text(
+        "--- submit metadata ---\n"
+        "submitted_at=1785986707.304000\n"
+        '{"submit_id":"generated-task","gen_status":"querying"}\n',
+        encoding="utf-8")
+
+    assert DreaminaProvider._latest_submit_started_at(log_path) == pytest.approx(
+        1785986707.304)
+
+
+def test_recovered_submit_uses_only_remaining_total_timeout(
+        tmp_path, monkeypatch):
+    from aifos.production import dreamina as dreamina_module
+
+    provider = DreaminaProvider("jimeng", {
+        "enabled": True, "capabilities": ["video"], "timeout": 1800})
+    log_path = tmp_path / "shot_018.dreamina.log"
+    log_path.write_text(
+        "--- submit metadata ---\nsubmitted_at=1000.0\n"
+        '{"submit_id":"same-paid-task","gen_status":"querying"}\n',
+        encoding="utf-8")
+    captured = {}
+
+    def fake_wait(submit_id, _out_dir, _log_path, _started_at,
+                  cancel=None, *, timeout=None, total_timeout=None):
+        captured.update({
+            "submit_id": submit_id,
+            "timeout": timeout,
+            "total_timeout": total_timeout,
+        })
+        return "https://example.invalid/shot18.mp4"
+
+    monkeypatch.setattr(dreamina_module.time, "time", lambda: 1100.0)
+    monkeypatch.setattr(provider, "_wait_for_video", fake_wait)
+    result = provider.generate("video", {
+        "shot_no": 18,
+        "prompt": "只执行一个动作",
+        "first": "/tmp/first.png",
+        "last": "/tmp/last.png",
+        "duration": 5,
+        "video_resolution": "720p",
+        "director_autonomy_mode": True,
+    }, tmp_path)
+
+    assert captured == {
+        "submit_id": "same-paid-task",
+        "timeout": pytest.approx(1700.0),
+        "total_timeout": 1800.0,
+    }
+    assert result.data["recovered_existing_submit"] is True
+    assert result.cost == 0.0
+
+
+def test_wait_boundary_never_sleeps_negative(tmp_path, monkeypatch):
+    from aifos.production import dreamina as dreamina_module
+
+    provider = DreaminaProvider("jimeng", {
+        "enabled": True, "capabilities": ["video"],
+        "timeout": 0.1, "query_interval": 0.1})
+    ticks = iter([0.0, 0.0, 0.0, 0.05, 0.2, 1.0])
+    monkeypatch.setattr(
+        dreamina_module.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(
+        dreamina_module, "run_interruptible",
+        lambda *_args, **_kwargs: (
+            0, '{"submit_id":"slow","gen_status":"querying"}', ""))
+    monkeypatch.setattr(
+        dreamina_module.time, "sleep",
+        lambda seconds: (_ for _ in ()).throw(
+            AssertionError(f"unexpected sleep: {seconds}")))
+
+    with pytest.raises(Exception, match="总等待超时"):
+        provider._wait_for_video(
+            "slow", tmp_path, tmp_path / "slow.log", 0.0)
+
 FAKE_DREAMINA = '''#!/usr/bin/env python3
 import json, os, sys
 here = os.path.dirname(os.path.abspath(__file__))
