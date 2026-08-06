@@ -3000,6 +3000,23 @@ class Director:
             return row
         return None
 
+    def _panorama_projection_validated(self, row):
+        """Only true 360 equirectangular masters may enter v360 slicing.
+
+        A generated 2:1 wide establishing image is not automatically a 360°
+        panorama.  Treating one as equirectangular makes ffmpeg wrap unrelated
+        left/right walls together and produces the stitched, furniture-swapped
+        scene anchors that caused one bedroom to change between shots.
+        """
+        if row is None:
+            return False
+        meta = self._asset_meta(row)
+        return (
+            meta.get("equirectangular_validated") is True
+            and str(meta.get("projection_type") or "")
+            == "equirectangular_360x180"
+        )
+
     def _scene_slice_for_shot(self, ctx, location, shot_no):
         """本镜机位的全景切片(空间前置核心):失败一律静默返 ""。
 
@@ -3023,6 +3040,8 @@ class Director:
         pano = self._scene_view_row(
             project_id, location, self.SCENE_PANORAMA_KEY)
         if pano is None or not pano["uri"] or not Path(pano["uri"]).exists():
+            return ""
+        if not self._panorama_projection_validated(pano):
             return ""
         out_dir = (self.artifacts_root / f"p{project_id:03d}"
                    / "scenes" / "slices")
@@ -3454,6 +3473,39 @@ class Director:
         """
         visible_location = str(location or "").strip()
         location = canonical_scene_location(script or {}, visible_location)
+        panorama = self._scene_view_row(
+            project_id, location, self.SCENE_PANORAMA_KEY)
+        panorama_available = bool(
+            panorama is not None
+            and (fresh_run_id is None
+                 or self._asset_meta(panorama).get(
+                     "fresh_run_id") == fresh_run_id))
+        unvalidated_panorama = bool(
+            panorama_available
+            and not self._panorama_projection_validated(panorama))
+
+        def direction_is_safe(row):
+            """Reject legacy/derived views that contradict a wide master.
+
+            AI direction masters generated with the complete wide master as
+            their explicit reference remain usable.  Mathematical panorama
+            slices, or older orphaned direction images with no provenance,
+            are unsafe when the source was never verified as equirectangular.
+            """
+            if row is None or not unvalidated_panorama:
+                return row is not None
+            meta = self._asset_meta(row)
+            try:
+                same_panorama = int(
+                    meta.get("panorama_asset_id") or 0) == int(
+                        panorama["id"])
+            except (TypeError, ValueError):
+                same_panorama = False
+            return bool(
+                meta.get("from_panorama") is True
+                and same_panorama
+                and meta.get("deterministic_projection") is not True)
+
         view = scene_view_for_camera(camera)
         if view != "main":
             for candidate in self.SCENE_VIEW_FALLBACK.get(view, (view,)):
@@ -3462,7 +3514,7 @@ class Director:
                         and self._asset_meta(row).get(
                             "fresh_run_id") != fresh_run_id):
                     row = None
-                if row is not None:
+                if direction_is_safe(row):
                     label = self.SCENE_VIEW_LABELS.get(candidate, candidate)
                     return row, f"场景:{visible_location}→物理母场景:{location}({label})"
         # 做过四向扩展的场景,正向母版与全景同源;没扩展过的照旧用概念图。
@@ -3471,10 +3523,14 @@ class Director:
                 and self._asset_meta(row).get(
                     "fresh_run_id") != fresh_run_id):
             row = None
-        if row is not None:
+        if direction_is_safe(row):
             return row, (
                 f"场景:{visible_location}→物理母场景:{location}"
                 f"({self.SCENE_VIEW_LABELS['main']})")
+        if unvalidated_panorama:
+            return panorama, (
+                f"场景:{visible_location}→物理母场景:{location}"
+                "(统一广角空间母版；禁止按360全景切片)")
         row = self.assets.latest(project_id, "scene_art", location)
         if (row is not None and fresh_run_id is not None
                 and self._asset_meta(row).get(
@@ -28402,9 +28458,21 @@ class Director:
                 project, "全景母版", payload, out_dir)
             total_cost += float(result.cost or 0.0)
             providers.add(result.provider)
+            result_data = (result.data
+                           if isinstance(result.data, dict) else {})
+            projection_validated = bool(
+                result_data.get("equirectangular_validated") is True)
             panorama_row, panorama_uri = register(
                 panorama_name, art_name, self.SCENE_PANORAMA_KEY, result,
-                extra={"panorama": True, "aspect": PANORAMA_ASPECT})
+                extra={
+                    "panorama": True,
+                    "aspect": PANORAMA_ASPECT,
+                    "projection_type": (
+                        "equirectangular_360x180"
+                        if projection_validated else
+                        "wide_scene_master_unvalidated"),
+                    "equirectangular_validated": projection_validated,
+                })
             created.append({"view": self.SCENE_PANORAMA_KEY,
                             "label": self.SCENE_VIEW_LABELS[
                                 self.SCENE_PANORAMA_KEY],
@@ -28422,6 +28490,7 @@ class Director:
             self._asset_meta(panorama_row) if panorama_row else {})
         deterministic_slices = bool(
             from_panorama
+            and self._panorama_projection_validated(panorama_row)
             and str(panorama_meta.get("provider") or "") != "mock")
         if not base_uri:
             _main_row, base_uri = base_image()

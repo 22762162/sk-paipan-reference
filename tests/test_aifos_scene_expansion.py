@@ -112,7 +112,7 @@ def test_real_panorama_uses_deterministic_four_direction_projection(
         source.write_bytes(b"\x89PNG\r\n\x1a\nreal")
         return SimpleNamespace(
             provider="seedream5_lite", model="seedream", cost=1.0,
-            data={}, uri=str(source))
+            data={"equirectangular_validated": True}, uri=str(source))
 
     def fake_slice(pano_path, out_dir, yaw, pitch, h_fov, size):
         projected_yaws.append((yaw, pitch, h_fov, size, pano_path))

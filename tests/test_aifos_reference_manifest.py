@@ -935,3 +935,39 @@ def test_crowded_keyframe_refs_cannot_evict_scene_or_spatial_anchors(
     roles = {item.get("reference_role")
              for item in refs["asset_matches"]}
     assert {"scene", "spatial"} <= roles
+
+
+def test_unvalidated_wide_scene_master_is_never_v360_sliced(
+        app, tmp_path, monkeypatch):
+    """A 2:1 establishing image must stay whole instead of becoming seams."""
+    project, episode, script = _preproduce(
+        app, title="非全景母版禁止切片")
+    location = "同一卧室"
+    wide = tmp_path / "wide-master.png"
+    wide.write_bytes(PNG)
+    panorama = app.assets.register(
+        project["id"], "scene_art",
+        app.director._scene_view_asset_name(location, "panorama"),
+        uri=str(wide), meta={
+            "image_quality": "high",
+            "view": "panorama",
+            "aspect": "2:1",
+            # Legacy scene masters only recorded their 2:1 aspect.  That is
+            # not proof of an equirectangular projection and must fail closed.
+        })
+    sliced = []
+    monkeypatch.setattr(
+        "aifos.director.slice_for_block",
+        lambda *_args, **_kwargs: sliced.append(True) or "bad-slice.png")
+    ctx = {
+        "project": dict(project), "episode": dict(episode),
+        "script": script,
+        "blocking": {"shot_index": {"1": {"camera": {}}}},
+    }
+
+    assert app.director._scene_slice_for_shot(ctx, location, 1) == ""
+    assert sliced == []
+    row, label = app.director._scene_view_reference(
+        project["id"], location, {}, script=script)
+    assert row["id"] == panorama["id"]
+    assert "禁止按360全景切片" in label
