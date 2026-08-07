@@ -802,7 +802,12 @@ def build_instruction(capability, payload, out_dir):
                 "critical_failures并令technical_quality_pass/visual_pass为false；"
                 "容差项和自由项必须写入advisory_issues且通过。相邻景别内的"
                 "轻微取景差、焦段数字、精确裁切、前后重叠量、衣褶发丝和"
-                "背景小物不得让physical_logic_match或spatial_logic_match变false。\n")
+                "背景小物不得让physical_logic_match或spatial_logic_match变false。"
+                "非剧情关键鞋履的鞋楦、鞋头、平底与低矮粗跟差别只算建议；"
+                "透明空杯的杯底、桌面高光、反射和折射不能凭一条暗线猜成液面，"
+                "只有看见明确液体体积和真实水位，且该杯是本镜高价值物证时才可"
+                "升为硬错。反之，局部近景被画成全身宽景、关键脸/手/腕绳/物证"
+                "因此小到失去叙事可读性，属于显著镜头合同错误。\n")
         else:
             fidelity_line = ""
         count_rule = (
@@ -970,8 +975,10 @@ def build_instruction(capability, payload, out_dir):
             "明显错人/错性别/错人数、严重跑脸、关键服装/道具/场景/时代错误、"
             "剧情必需文字错误，以及明显肢体畸形、穿模、悬浮、设备反向或空间"
             "关系不可能。轻微肤质噪点、细小色差、衣物旧化程度、发丝/皱纹/"
-            "妆效、轻微表情或视线偏差、非关键配饰细差和背景小物只记建议，"
-            "必须通过。不确定时从宽通过，交由人工抽检。\n"
+            "妆效、轻微表情或非剧情关键视线偏差、非关键配饰细差和背景小物只记建议，"
+            "必须通过。非剧情关键鞋履的鞋楦、鞋头、平底与低矮粗跟差别"
+            "不得失败；透明空杯的杯底、桌面高光、反射和折射不能凭一条暗线"
+            "猜成液面。不确定时从宽通过，交由人工抽检。\n"
             f"- 出场角色:{chars}({count_rule};"
             "角色形态必须与人物设定一致——名字不代表物种,"
             "设定是人类就必须是人类)\n"
@@ -1017,6 +1024,11 @@ def build_instruction(capability, payload, out_dir):
             + f"- 场景:{qc_location};"
             f"动作:{qc_action};"
             f"镜头景别:{qc_camera}\n"
+            "- 镜头合同判级:必须返回 camera_checked、camera_match 和"
+            "camera_deviation(none/minor/major)。相邻景别内的轻微裁切或焦段"
+            "观感差只算 minor 且通过；要求斜侧局部近景却画成全身/大宽景，"
+            "或关键面部、双手、腕绳、物证因主体太小无法读懂，必须标 major、"
+            "camera_match=false 并列入 critical_failures。\n"
             f"- 物理/空间逻辑硬检查:{physical_line}\n"
             + topology_line
             + "必须核对人物、镜头、道具的前后左右关系、朝向、视线、接触点、重力支撑和动作可达性；"
@@ -1055,6 +1067,8 @@ def build_instruction(capability, payload, out_dir):
             '"physical_logic_checked": true或false, "physical_logic_match": true或false, '
             '"spatial_logic_checked": true或false, "spatial_logic_match": true或false, '
             '"scene_topology_checked": true或false, "scene_topology_match": true或false, '
+            '"camera_checked": true或false, "camera_match": true或false, '
+            '"camera_deviation": "none/minor/major", '
             '"detected_count": 画面实际人数整数, '
             '"technical_quality_pass": true或false, '
             '"critical_failures": ["只列必须重抽的硬一致/技术质量错误"], '

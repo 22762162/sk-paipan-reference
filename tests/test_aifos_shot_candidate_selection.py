@@ -358,6 +358,138 @@ def test_candidate_progress_reporter_persists_images_and_returns_manual_pick(
     assert stored["candidate_progress"]["selection"] == pending
 
 
+def test_new_repair_round_atomically_replaces_old_group_and_prompt(
+        app, tmp_path):
+    _project, _episode, ctx, groups = _seed_episode(app, tmp_path)
+    old_group = groups[1]
+    task = {
+        "capability": "image", "item_id": "shot:1", "payload": {},
+    }
+    app.director._attach_candidate_progress_reporter(ctx, task)
+    callback = task["payload"]["_candidate_progress_callback"]
+    new_token = "cset-v1:round-6-targeted"
+    candidates = copy.deepcopy(old_group["candidates"][:2])
+    for index, candidate in enumerate(candidates, 1):
+        candidate.update({
+            "candidate_id": f"{new_token}#{index}",
+            "candidate_set_token": new_token,
+        })
+    prompt = "第6轮精准合同：只保留唯一可拍终态"
+    progress = {
+        "schema": "aifos.shot-candidate-progress/v1",
+        "candidate_set_id": "set-round-6",
+        "candidate_set_token": new_token,
+        "candidate_revision": 12,
+        "contract_revision": 9,
+        "generation_round": 6,
+        "max_candidate_rounds": 10,
+        "completed_count": 2,
+        "settled_count": 2,
+        "expected_count": 4,
+        "candidate_count": 2,
+        "status": "generating",
+        "prompt": prompt,
+        "prompt_optimized": prompt,
+        "prompt_used": prompt,
+        "candidates": candidates,
+        "resume_state": {
+            "schema": app.director.CANDIDATE_RESUME_SCHEMA,
+            "generation_round": 6,
+            "max_candidate_rounds": 10,
+            "round_history": [
+                {"generation_round": value, "candidate_count": 4}
+                for value in range(1, 6)
+            ],
+            "best_provisional": {},
+            "resume_payload": {
+                "_episode_id": _episode["id"],
+                "shot_no": 1,
+                "prompt": prompt,
+                "prompt_compact": prompt,
+                "_candidate_generation_round": 6,
+            },
+        },
+    }
+
+    callback(progress)
+
+    item = app.director._plan_read(ctx)["items"][0]
+    assert item["status"] == "generating"
+    assert item["generation_round"] == 6
+    assert item["candidate_set_token"] == new_token
+    assert item["candidate_count"] == 2
+    assert item["candidate_group"]["candidate_set_token"] == new_token
+    assert item["candidate_group"]["candidate_count"] == 2
+    assert item["candidate_group"]["candidates"] == candidates
+    assert item["prompt"] == item["prompt_optimized"] == prompt
+    assert "qc" not in item
+    archived = item["candidate_group_history"][-1]
+    assert archived["candidate_set_token"] == \
+        old_group["candidate_set_token"]
+    assert archived["render_qc"]["passed"] is False
+    assert len(item["candidate_round_history"]) == 5
+
+
+def test_paused_plan_reconcile_resumes_newest_round_not_old_group(
+        app, tmp_path):
+    _project, episode, ctx, groups = _seed_episode(app, tmp_path)
+    old_group = groups[1]
+    prompt = "第7轮恢复合同：手机只在左手，腕绳只在右腕"
+    progress = {
+        "schema": "aifos.shot-candidate-progress/v1",
+        "candidate_set_id": "set-round-7",
+        "candidate_set_token": "cset-v1:round-7",
+        "candidate_revision": 13,
+        "contract_revision": 10,
+        "generation_round": 7,
+        "max_candidate_rounds": 10,
+        "completed_count": 1,
+        "settled_count": 1,
+        "expected_count": 4,
+        "candidate_count": 1,
+        "status": "generating",
+        "candidates": [copy.deepcopy(old_group["candidates"][0])],
+        "resume_state": {
+            "schema": app.director.CANDIDATE_RESUME_SCHEMA,
+            "generation_round": 7,
+            "max_candidate_rounds": 10,
+            "round_history": [
+                {"generation_round": value, "candidate_count": 4}
+                for value in range(1, 7)
+            ],
+            "best_provisional": {},
+            "resume_payload": {
+                "_episode_id": episode["id"],
+                "shot_no": 1,
+                "prompt": prompt,
+                "prompt_compact": prompt,
+                "_candidate_generation_round": 7,
+            },
+        },
+    }
+    plan = app.director._plan_read(ctx)
+    item = plan["items"][0]
+    item["status"] = "technical_incomplete"
+    item["generation_round"] = 7
+    item["candidate_progress"] = progress
+    app.director._plan_write(ctx, plan)
+
+    assert app.director._reconcile_candidate_progress_plan(ctx) == 1
+    stored = app.director._plan_read(ctx)["items"][0]
+    assert stored["candidate_group"]["candidate_set_token"] == \
+        progress["candidate_set_token"]
+    assert stored["candidate_set_token"] == progress["candidate_set_token"]
+    assert stored["prompt"] == stored["prompt_optimized"] == prompt
+    restored, resumed = \
+        app.director._candidate_payload_from_resume_progress(
+            {"_episode_id": episode["id"], "shot_no": 1,
+             "prompt": "旧第2轮失败合同"},
+            stored["candidate_progress"], max_rounds=10)
+    assert resumed is True
+    assert restored["prompt"] == prompt
+    assert restored["_candidate_generation_round"] == 7
+
+
 def test_regenerate_requires_confirmation_and_rejects_old_cas(app, tmp_path):
     _project, _episode, _ctx, groups = _seed_episode(app, tmp_path)
     group = groups[1]

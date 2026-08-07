@@ -79,6 +79,113 @@ def test_legacy_fifth_character_candidate_is_hidden_from_current_plan():
     assert "qc" in plan["items"][2], "API 过滤不能改写磁盘历史计划"
 
 
+def test_episode_payload_projects_newest_candidate_progress_as_current_round():
+    old_group = {
+        "schema": "aifos.shot-candidate-group/v1",
+        "candidate_set_id": "old-round-2",
+        "candidate_set_token": "cset-v1:old-round-2",
+        "candidate_revision": 2,
+        "generation_round": 2,
+        "candidate_count": 4,
+        "candidates": [{"candidate_index": index}
+                       for index in range(1, 5)],
+    }
+    current_prompt = "第7轮精准合同：只显示当前可见事实"
+    progress = {
+        "schema": "aifos.shot-candidate-progress/v1",
+        "candidate_set_id": "current-round-7",
+        "candidate_set_token": "cset-v1:current-round-7",
+        "candidate_revision": 7,
+        "contract_revision": 7,
+        "generation_round": 7,
+        "candidate_count": 2,
+        "completed_count": 2,
+        "expected_count": 4,
+        "status": "generating",
+        "candidates": [
+            {"candidate_index": 1, "uri": "/tmp/current-1.png"},
+            {"candidate_index": 2, "uri": "/tmp/current-2.png"},
+        ],
+        "resume_state": {
+            "round_history": [
+                {"generation_round": value, "candidate_count": 4}
+                for value in range(1, 7)
+            ],
+            "resume_payload": {
+                "prompt": current_prompt,
+                "prompt_compact": current_prompt,
+            },
+        },
+    }
+    plan = {"items": [{
+        "id": "shot:1", "category": "shot_image", "shot_no": 1,
+        "status": "technical_incomplete",
+        "prompt": "旧第2轮失败合同",
+        "prompt_optimized": "旧第2轮失败合同",
+        "candidate_set_token": old_group["candidate_set_token"],
+        "candidate_count": 0,
+        "candidate_group": old_group,
+        "candidate_progress": progress,
+        "qc": {"passed": False, "issues": ["旧轮失败"]},
+    }]}
+
+    visible = _current_render_plan_items(plan)[0]
+
+    assert visible["generation_round"] == 7
+    assert visible["prompt"] == visible["prompt_optimized"] == \
+        current_prompt
+    assert visible["candidate_set_token"] == \
+        progress["candidate_set_token"]
+    assert visible["candidate_count"] == 2
+    assert visible["candidate_group"]["candidate_set_token"] == \
+        progress["candidate_set_token"]
+    assert visible["candidate_group"]["candidate_count"] == 2
+    assert visible["candidate_group_history"][-1][
+        "candidate_set_token"] == old_group["candidate_set_token"]
+    assert "qc" not in visible
+    assert plan["items"][0]["prompt"] == "旧第2轮失败合同"
+
+
+def test_episode_payload_keeps_final_selection_over_last_live_snapshot():
+    token = "cset-v1:final"
+    final_group = {
+        "schema": "aifos.shot-candidate-group/v1",
+        "candidate_set_id": "set-final",
+        "candidate_set_token": token,
+        "candidate_revision": 4,
+        "generation_round": 4,
+        "candidate_count": 4,
+        "complete": True,
+        "candidates": [{"candidate_index": index}
+                       for index in range(1, 5)],
+        "selection": {
+            "candidate_set_token": token,
+            "candidate_index": 3,
+            "source": "ai",
+        },
+    }
+    last_progress = {
+        "schema": "aifos.shot-candidate-progress/v1",
+        "candidate_set_id": "set-final",
+        "candidate_set_token": token,
+        "candidate_revision": 4,
+        "generation_round": 4,
+        "candidate_count": 4,
+        "complete": False,
+        "candidates": copy.deepcopy(final_group["candidates"]),
+    }
+    plan = {"items": [{
+        "id": "shot:1", "category": "shot_image", "shot_no": 1,
+        "status": "done", "candidate_group": final_group,
+        "candidate_progress": last_progress,
+    }]}
+
+    visible = _current_render_plan_items(plan)[0]
+
+    assert visible["candidate_group"]["complete"] is True
+    assert visible["candidate_group"]["selection"]["source"] == "ai"
+
+
 def test_index_and_static(server):
     status, ctype, raw = _request(server["port"], "GET", "/")
     assert status == 200 and "text/html" in ctype

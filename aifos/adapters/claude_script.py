@@ -1515,7 +1515,7 @@ hidden/absent 道具或隐藏载体文字，只能记入 prompt_diagnosis，不�
 - 只有普通观众一眼可见、会影响身份识别、剧情理解或画面可信度的明显问题才失败：
   明显错人/错性别/错人数，人物严重跑脸，关键服装、道具、场景或时代明显错误，
   剧情必需文字错误，以及明显肢体畸形、穿模、悬浮、设备反向或空间关系不可能。
-- 轻微肤质噪点、细小色差、衣物旧化程度、发丝/皱纹/妆效细节、轻微表情或视线
+- 轻微肤质噪点、细小色差、衣物旧化程度、发丝/皱纹/妆效细节、轻微表情或非剧情关键视线
   偏差、非关键配饰细差、看不清且不影响剧情的背景小物，只记录为建议，必须通过。
 - 人物身份只在“明显不是同一人”或锁定脸型/发型发生显著改变时失败；正常生成波动
   和不同角度造成的小差异不得失败。不确定时从宽通过，交由人工抽检。
@@ -1525,6 +1525,10 @@ hidden/absent 道具或隐藏载体文字，只能记入 prompt_diagnosis，不�
 technical_quality_pass/visual_pass为false；允许容差与自由创作项必须写入
 advisory_issues且通过。相邻景别内轻微取景差、焦段数字、精确裁切、前后重叠量、
 衣褶发丝与背景小物不得令physical_logic_match或spatial_logic_match为false。
+非剧情关键鞋履的鞋楦、鞋头、平底与低矮粗跟差别只算建议；透明空杯的杯底、
+桌面高光、反射和折射不能凭一条暗线猜成液面。只有看见明确液体体积和真实水位，
+且该杯是本镜高价值物证时才可升为硬错。反之，局部近景被画成全身宽景，或关键
+脸、手、腕绳、物证因主体过小失去叙事可读性，属于必须重抽的显著镜头合同错误。
 
 最终立绘视觉基准(这些图片是身份事实来源，优先级高于早期文字描述):
 {identity_references}
@@ -1559,6 +1563,10 @@ advisory_issues且通过。相邻景别内轻微取景差、焦段数字、精�
 - 角色性别硬事实:{expected_genders}
 - 场景:{location};动作:{action};镜头:{camera}
   (景别需大致相符:要求全景/远景不能给成特写,反之亦然)
+- 镜头合同判级:必须返回 camera_checked、camera_match 和
+  camera_deviation(none/minor/major)。相邻景别内的轻微裁切或焦段观感差只算
+  minor 且通过；要求斜侧局部近景却画成全身/大宽景，或关键面部、双手、腕绳、
+  物证因主体太小无法读懂，必须标 major、camera_match=false 并列入critical_failures。
 - 物理/空间逻辑硬检查:{physical_contract}
   必须核对人物、镜头、道具的前后左右关系、朝向、视线、接触点、重力支撑和动作可达性；
   电脑/手机/屏幕等设备必须按真实使用方向成立，屏幕正面、键盘/手部和使用者关系不能反向。
@@ -1587,6 +1595,8 @@ advisory_issues且通过。相邻景别内轻微取景差、焦段数字、精�
 "physical_logic_checked": true或false, "physical_logic_match": true或false,
 "spatial_logic_checked": true或false, "spatial_logic_match": true或false,
 "scene_topology_checked": true或false, "scene_topology_match": true或false,
+"camera_checked": true或false, "camera_match": true或false,
+"camera_deviation": "none/minor/major",
 "detected_count": 画面实际人数整数,
 "technical_quality_pass": true或false,
 "critical_failures": ["只列必须重抽的硬一致/技术质量错误"],
@@ -2199,6 +2209,7 @@ def validate_image_qc(data):
         "physical_logic_checked", "physical_logic_match",
         "spatial_logic_checked", "spatial_logic_match",
         "scene_topology_checked", "scene_topology_match",
+        "camera_checked", "camera_match",
         "overlay_count_checked", "overlay_count_match",
         "technical_quality_pass",
     )
@@ -2209,6 +2220,11 @@ def validate_image_qc(data):
     for key in ("visual_pass", "input_contract_pass"):
         if key in data and type(data[key]) is not bool:
             return f"{key} 必须是真正的 JSON 布尔值"
+    if "camera_deviation" in data:
+        deviation = str(data.get("camera_deviation") or "").lower()
+        if deviation not in {"none", "minor", "major"}:
+            return "camera_deviation 必须是 none/minor/major"
+        data["camera_deviation"] = deviation
     issues = data.get("issues")
     if not isinstance(issues, list):
         issues = [str(issues)] if issues else []

@@ -220,6 +220,194 @@ def test_tiered_fidelity_still_blocks_named_critical_failure(app):
     assert report["redraw_required"] is True
 
 
+def test_tiered_fidelity_demotes_noncritical_shoe_profile_and_glass_optics(
+        app):
+    """低粗跟和空杯底部反光不能把剧情正确的图送去继续抽卡。"""
+    report = app.director._assess_image_qc({
+        "identity_required": False,
+        "gender_required": False,
+        "wardrobe_required": True,
+        "count_required": True,
+        "count": 2,
+        "physical_logic_required": True,
+        "fidelity_policy": {
+            "schema": "aifos.fidelity-tiers/v1",
+            "critical_prop_names": ["右腕黑色单圈皮绳", "手机"],
+        },
+    }, {
+        "pass": False,
+        "visual_pass": False,
+        "input_contract_pass": True,
+        "wardrobe_checked": True,
+        "wardrobe_match": False,
+        "count_checked": True,
+        "count_match": True,
+        "physical_logic_checked": True,
+        "physical_logic_match": False,
+        "spatial_logic_checked": True,
+        "spatial_logic_match": False,
+        "camera_checked": True,
+        "camera_match": True,
+        "camera_deviation": "none",
+        "technical_quality_pass": True,
+        "critical_failures": [
+            "浅米色鞋为低矮粗跟，与平底鞋存在鞋型细差",
+            "透明玻璃杯底部折射形成疑似水平液面",
+        ],
+        "advisory_issues": [],
+        "issues": [],
+    }, attempts=1)
+
+    assert report["passed"] is True
+    assert report["critical_failures"] == []
+    assert len(report["advisory_issues"]) == 2
+    assert report["wardrobe_match"] is True
+    assert report["physical_logic_match"] is True
+    assert report["spatial_logic_match"] is True
+    assert report["redraw_required"] is False
+
+
+def test_tiered_fidelity_keeps_hands_wrist_marker_and_story_gaze_hard(app):
+    """小细节可降级，但左右手、关键腕绳和关键视线绝不随之放宽。"""
+    report = app.director._assess_image_qc({
+        "identity_required": False,
+        "gender_required": False,
+        "wardrobe_required": True,
+        "count_required": True,
+        "count": 2,
+        "physical_logic_required": True,
+        "fidelity_policy": {
+            "schema": "aifos.fidelity-tiers/v1",
+            "critical_prop_names": ["右腕黑色单圈皮绳", "手机"],
+        },
+    }, {
+        "pass": False,
+        "visual_pass": False,
+        "input_contract_pass": True,
+        "wardrobe_checked": True,
+        "wardrobe_match": False,
+        "count_checked": True,
+        "count_match": True,
+        "physical_logic_checked": True,
+        "physical_logic_match": False,
+        "spatial_logic_checked": True,
+        "spatial_logic_match": False,
+        "camera_checked": True,
+        "camera_match": True,
+        "camera_deviation": "none",
+        "technical_quality_pass": True,
+        "critical_failures": [
+            "鞋型为低矮粗跟而非平底鞋",
+            "透明杯底反光疑似液面",
+            "虞寻歌左右手镜像，且视线未落在虞寻欢右腕黑绳",
+        ],
+        "advisory_issues": [],
+        "issues": [],
+    }, attempts=1)
+
+    assert report["passed"] is False
+    assert len(report["critical_failures"]) == 1
+    assert "左右手镜像" in report["critical_failures"][0]
+    assert len(report["advisory_issues"]) == 2
+    assert report["physical_logic_match"] is False
+    assert report["hard_failure"] is True
+
+
+def test_tiered_fidelity_keeps_story_critical_vessel_state_hard(app):
+    report = app.director._assess_image_qc({
+        "identity_required": False,
+        "gender_required": False,
+        "wardrobe_required": False,
+        "count_required": True,
+        "count": 1,
+        "physical_logic_required": True,
+        "fidelity_policy": {
+            "schema": "aifos.fidelity-tiers/v1",
+            "critical_prop_names": ["下毒酒杯"],
+        },
+    }, {
+        "pass": False,
+        "visual_pass": False,
+        "input_contract_pass": True,
+        "count_checked": True,
+        "count_match": True,
+        "physical_logic_checked": True,
+        "physical_logic_match": False,
+        "spatial_logic_checked": True,
+        "spatial_logic_match": True,
+        "technical_quality_pass": True,
+        "critical_failures": ["剧情关键下毒酒杯内缺失明确液面"],
+        "advisory_issues": [],
+        "issues": [],
+    }, attempts=1)
+
+    assert report["passed"] is False
+    assert report["critical_failures"] == ["剧情关键下毒酒杯内缺失明确液面"]
+    assert report["physical_logic_match"] is False
+
+
+def test_major_camera_contract_drift_is_hard_but_minor_crop_is_advisory(app):
+    spec = {
+        "identity_required": False,
+        "gender_required": False,
+        "wardrobe_required": False,
+        "count_required": True,
+        "count": 2,
+        "physical_logic_required": False,
+        "fidelity_policy": {"schema": "aifos.fidelity-tiers/v1"},
+    }
+    base = {
+        "pass": True,
+        "visual_pass": True,
+        "input_contract_pass": True,
+        "count_checked": True,
+        "count_match": True,
+        "technical_quality_pass": True,
+        "critical_failures": [],
+        "advisory_issues": [],
+        "issues": [],
+        "camera_checked": True,
+    }
+
+    major = app.director._assess_image_qc(spec, {
+        **base,
+        "camera_match": False,
+        "camera_deviation": "major",
+    }, attempts=1)
+    assert major["passed"] is False
+    assert major["camera_match"] is False
+    assert major["critical_failures"]
+
+    minor = app.director._assess_image_qc(spec, {
+        **base,
+        "camera_match": False,
+        "camera_deviation": "minor",
+        "advisory_issues": ["相邻景别内裁切略宽"],
+    }, attempts=1)
+    assert minor["passed"] is True
+    assert minor["camera_match"] is True
+    assert minor["redraw_required"] is False
+
+
+def test_image_qc_schema_validates_camera_contract_fields():
+    from aifos.adapters.claude_script import validate_image_qc
+
+    assert validate_image_qc({
+        "pass": True,
+        "camera_checked": "true",
+        "camera_match": True,
+        "camera_deviation": "none",
+        "issues": [],
+    }) == "camera_checked 必须是真正的 JSON 布尔值，不能是字符串或数字"
+    assert validate_image_qc({
+        "pass": True,
+        "camera_checked": True,
+        "camera_match": True,
+        "camera_deviation": "large",
+        "issues": [],
+    }) == "camera_deviation 必须是 none/minor/major"
+
+
 def test_qc_treats_visible_wardrobe_drift_as_hard_failure(app):
     report = app.director._assess_image_qc({
         "identity_required": False,
@@ -340,6 +528,10 @@ def test_qc_prompt_audits_exact_current_prompt_and_reference_manifest():
     assert "targeted_prompt_patch" in prompt
     assert "reference_adjustments" in prompt
     assert "禁止补写整集剧情或其他镜头" in prompt
+    assert "camera_deviation" in prompt
+    assert "低矮粗跟" in prompt
+    assert "不能凭一条暗线猜成液面" in prompt
+    assert "局部近景被画成全身宽景" in prompt
 
 
 def test_codex_qc_prompt_uses_same_structured_input_diagnosis_contract(
@@ -370,6 +562,10 @@ def test_codex_qc_prompt_uses_same_structured_input_diagnosis_contract(
     assert "同一人物不能同时穿两套互斥服装" in instruction
     assert "已死亡人物不能继续呼吸" in instruction
     assert "第二次生成" in instruction
+    assert "camera_deviation" in instruction
+    assert "低矮粗跟" in instruction
+    assert "不能凭一条暗线猜成液面" in instruction
+    assert "斜侧局部近景却画成全身/大宽景" in instruction
 
 
 def test_final_image_qc_prompt_uses_static_phase_projection_not_raw_payload(

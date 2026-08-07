@@ -539,6 +539,11 @@ def test_all_four_explicit_failures_trigger_four_candidate_repair_until_pass(
         tmp_path, monkeypatch):
     app = App(tmp_path / "ws")
     try:
+        ref_paths = {}
+        for name in ("identity-a", "identity-b", "scene", "spatial", "prop"):
+            path = tmp_path / f"{name}.png"
+            path.write_bytes(name.encode("utf-8"))
+            ref_paths[name] = str(path)
         initial = _candidate_result(
             tmp_path, expected=4, available=4, passed=False,
             revision=1, cost=4.0)
@@ -566,10 +571,42 @@ def test_all_four_explicit_failures_trigger_four_candidate_repair_until_pass(
             "image", {
                 "_episode_id": "episode-test", "shot_no": 1,
                 "_candidate_revision": 1, "_contract_revision": 1,
+                "location": "现代酒店客房",
+                "physical_scene_id": "现代酒店客房",
+                "scene_ref": ref_paths["scene"],
+                "canonical_scene_reference_uri": ref_paths["scene"],
+                "canonical_scene_asset_id": 31,
+                "identity_references": [
+                    {"character": "虞寻歌", "uri": ref_paths["identity-a"]},
+                    {"character": "柳争流", "uri": ref_paths["identity-b"]},
+                ],
+                "spatial_ref": ref_paths["spatial"],
+                "prop_refs": [ref_paths["prop"]],
+                "asset_matches": [
+                    {"uri": ref_paths["spatial"],
+                     "label": "本镜空间调度图",
+                     "reference_role": "spatial"},
+                    {"uri": ref_paths["prop"], "label": "核心手机",
+                     "reference_role": "prop"},
+                ],
                 "prompt": "主体执行镜头动作",
             }, tmp_path, None, {})
 
         assert len(calls) == 2
+        second_round = calls[1][0]
+        first_best = str(tmp_path / "r1-candidate-1.svg")
+        assert second_round["reference_images"].count(first_best) == 1
+        manifest = second_round["reference_manifest"]
+        assert [row["role"] for row in manifest] == [
+            "identity", "identity", "spatial", "scene", "revision_base"]
+        assert next(
+            row for row in manifest if row["role"] == "revision_base"
+        )["uri"] == first_best
+        assert second_round["scene_ref"] == ref_paths["scene"]
+        assert second_round["reference_budget"][
+            "revision_base_preserved"] is True
+        assert ref_paths["prop"] not in second_round[
+            "reference_budget"]["selected_uris"]
         assert result.uri.endswith("r2-candidate-1.svg")
         group = result.data["candidate_group"]
         assert group["repair_batch"] is True
@@ -578,6 +615,44 @@ def test_all_four_explicit_failures_trigger_four_candidate_repair_until_pass(
         assert group["max_candidate_rounds"] == 10
         assert len(group["candidate_round_history"]) == 2
         assert result.cost == 8.5
+    finally:
+        app.close()
+
+
+def test_candidate_revision_base_never_crosses_scene_or_shot(tmp_path):
+    app = App(tmp_path / "ws")
+    try:
+        old_base = tmp_path / "old-scene-failure.png"
+        old_base.write_bytes(b"old")
+        current_scene = tmp_path / "current-scene.png"
+        current_scene.write_bytes(b"scene")
+        payload = {
+            "shot_no": 9,
+            "physical_scene_id": "现代酒店客房",
+            "scene_ref": str(current_scene),
+            "canonical_scene_reference_uri": str(current_scene),
+            "canonical_scene_asset_id": 99,
+            "reference_images": [str(old_base)],
+            "asset_matches": [{
+                "uri": str(old_base),
+                "label": "旧场景待修改基底",
+                "reference_role": "revision_base",
+                "scene_id": "明代宫殿内景",
+                "shot_no": 1,
+                "canonical_scene_asset_id": 12,
+            }],
+        }
+
+        app.director._cap_image_reference_inputs(payload)
+
+        assert str(old_base) not in payload["reference_images"]
+        assert all(
+            row.get("uri") != str(old_base)
+            for row in payload["asset_matches"])
+        assert payload["reference_budget"][
+            "revision_base_preserved"] is False
+        assert payload["reference_budget"][
+            "scene_anchor_preserved"] is True
     finally:
         app.close()
 
@@ -619,13 +694,21 @@ def test_candidate_repair_stops_immediately_when_round_seven_has_pass(
 
         result = app.director._generate_shot_candidate_group(
             "image", {
-                "_episode_id": "episode-test", "shot_no": 7,
+                "_episode_id": "episode-test", "shot_no": 1,
                 "_candidate_revision": 1, "_contract_revision": 1,
                 "prompt": "第1轮镜头合同",
             }, tmp_path, None, {})
 
         assert len(calls) == 7
         assert len(reference_rounds) == 6
+        for round_no, payload in enumerate(calls[1:], start=2):
+            bases = [
+                row for row in payload.get("asset_matches") or []
+                if row.get("reference_role") == "revision_base"]
+            assert len(bases) == 1
+            assert bases[0]["uri"].endswith(
+                f"r{round_no - 1}-candidate-1.svg")
+            assert payload["reference_images"].count(bases[0]["uri"]) == 1
         assert result.qc["passed"] is True
         group = result.data["candidate_group"]
         assert group["generation_round"] == 7
@@ -752,7 +835,12 @@ def test_candidate_repair_resume_keeps_round_cap_history_and_prior_best(
         assert len(calls) == 4
         assert [row["_candidate_generation_round"] for row in calls] == \
             [7, 8, 9, 10]
-        assert calls[0]["prompt"] == "第7轮重启前已修订的镜头合同"
+        assert calls[0]["prompt"].startswith(
+            "第7轮重启前已修订的镜头合同")
+        assert calls[0]["reference_manifest"][0]["role"] == \
+            "revision_base"
+        assert calls[0]["reference_manifest"][0]["uri"] == \
+            best_snapshot["uri"]
         assert result.uri.endswith("r2-candidate-1.svg")
         group = result.data["candidate_group"]
         assert group["round_status"] == "exhausted"

@@ -1378,6 +1378,16 @@ def _sanitize_candidate_group_urls(app, item):
 
     sanitize(item.get("candidate_group"))
     sanitize(item.get("candidate_progress"))
+    for history_key in (
+            "candidate_group_history", "candidate_round_history"):
+        for group in item.get(history_key) or []:
+            sanitize(group)
+    progress = item.get("candidate_progress")
+    if isinstance(progress, dict):
+        # Exact resume payloads may contain local paths and internal callbacks'
+        # audit fields.  The browser needs the promoted prompt/token/count,
+        # not the process checkpoint itself.
+        progress.pop("resume_state", None)
     # 生产中的人工预选在 candidate_progress.selection 已有安全副本；
     # 顶层内部字段只供 worker 收口使用，不能把绝对路径发给浏览器。
     item.pop("manual_candidate_selection", None)
@@ -2056,7 +2066,9 @@ def _current_render_plan_items(render_plan):
                     continue
             except (TypeError, ValueError):
                 pass
-        visible = dict(item)
+        visible = copy.deepcopy(item)
+        if visible.get("category") == "shot_image":
+            _promote_visible_candidate_progress(visible)
         if visible.get("category") in {
                 "character_candidate", "character_art",
                 "character_sheet", "scene_art"}:
@@ -2065,6 +2077,159 @@ def _current_render_plan_items(render_plan):
             visible.pop("qc", None)
         current.append(visible)
     return current
+
+
+def _promote_visible_candidate_progress(item):
+    """Project a legacy stale plan row onto its newest resumable round.
+
+    This is read-only API reconciliation.  New workers persist the same
+    projection atomically in Director; this compatibility path makes already
+    paused episodes immediately truthful before their first resume.
+    """
+    progress = item.get("candidate_progress") or {}
+    if not isinstance(progress, dict):
+        return False
+    progress_id = str(progress.get("candidate_set_id") or "").strip()
+    progress_token = str(
+        progress.get("candidate_set_token") or "").strip()
+    if not progress_id or not progress_token:
+        return False
+    group = item.get("candidate_group") or {}
+    if not isinstance(group, dict):
+        group = {}
+    group_id = str(group.get("candidate_set_id") or "").strip()
+    group_token = str(
+        group.get("candidate_set_token")
+        or item.get("candidate_set_token") or "").strip()
+    try:
+        progress_round = max(
+            1, int(progress.get("generation_round") or 1))
+        group_round = max(
+            0, int(group.get("generation_round") or 0))
+        progress_revision = max(
+            1, int(progress.get("candidate_revision") or 1))
+        group_revision = max(
+            0, int(group.get("candidate_revision") or 0))
+    except (TypeError, ValueError):
+        return False
+    same_group = bool(
+        group_id == progress_id and group_token == progress_token)
+    if (str(item.get("status") or "") in {"done", "reused"}
+            and group.get("complete") is True):
+        # Final promotion happens after the last live callback and adds the
+        # authoritative AI/manual selection.  Never replace that completed
+        # group with its immediately preceding progress snapshot.
+        return False
+    active = str(item.get("status") or "") in {
+        "pending", "generating", "retrying", "technical_incomplete",
+        "failed",
+    }
+    if (not same_group and not (
+            active and (
+                progress_round > group_round
+                or progress_revision > group_revision))):
+        return False
+
+    if group and not same_group and group_id != progress_id:
+        history = list(item.get("candidate_group_history") or [])
+        identity = (group_id, group_token)
+        if not any(
+                isinstance(row, dict)
+                and (
+                    str(row.get("candidate_set_id") or ""),
+                    str(row.get("candidate_set_token") or ""),
+                ) == identity for row in history):
+            retired = copy.deepcopy(group)
+            retired.update({
+                "retired_reason": "superseded_by_new_candidate_round",
+                "replaced_by_candidate_set_id": progress_id,
+                "replaced_by_candidate_set_token": progress_token,
+                "render_qc": copy.deepcopy(item.get("qc")),
+            })
+            history.append(retired)
+            item["candidate_group_history"] = history
+
+    candidates = [
+        copy.deepcopy(row)
+        for row in (progress.get("candidates") or [])
+        if isinstance(row, dict)
+    ]
+    try:
+        count = int(progress.get("candidate_count")) \
+            if "candidate_count" in progress else len(candidates)
+    except (TypeError, ValueError):
+        count = len(candidates)
+    live_group = copy.deepcopy(progress)
+    state = live_group.pop("resume_state", None) or {}
+    live_group["progress_schema"] = str(
+        live_group.get("schema") or "")
+    live_group["schema"] = "aifos.shot-candidate-group/v1"
+    live_group["live_progress"] = True
+    live_group["candidate_count"] = count
+    live_group["candidates"] = candidates
+    round_history = (
+        state.get("round_history") if isinstance(state, dict) else []) or []
+    if round_history:
+        live_group["candidate_round_history"] = copy.deepcopy(
+            round_history)
+        item["candidate_round_history"] = copy.deepcopy(round_history)
+
+    resume_payload = (
+        state.get("resume_payload") if isinstance(state, dict) else {}) or {}
+    if not isinstance(resume_payload, dict):
+        resume_payload = {}
+    prompt = str(
+        progress.get("prompt_optimized")
+        or progress.get("prompt_used")
+        or progress.get("prompt")
+        or resume_payload.get("prompt_compact")
+        or resume_payload.get("prompt") or "").strip()
+    original = str(
+        progress.get("prompt_aifos_original")
+        or resume_payload.get("prompt_aifos_original")
+        or resume_payload.get("_reference_prompt_base")
+        or resume_payload.get("prompt") or prompt).strip()
+    item.update({
+        "candidate_group": live_group,
+        "candidate_set_id": progress_id,
+        "candidate_set_token": progress_token,
+        "candidate_revision": progress_revision,
+        "contract_revision": int(
+            progress.get("contract_revision") or 1),
+        "candidate_count": count,
+        "candidate_uris": [
+            str(row.get("uri") or "") for row in candidates
+            if str(row.get("uri") or "")],
+        "generation_round": progress_round,
+        "candidate_completed_count": int(
+            progress.get("completed_count") or 0),
+        "candidate_expected_count": int(
+            progress.get("expected_count") or 4),
+        "candidate_generation_status": str(
+            progress.get("status") or "generating"),
+        "technical_incomplete": bool(
+            progress.get("technical_incomplete")),
+        "selection_required": bool(
+            progress.get("selection_required")),
+    })
+    if prompt:
+        item.update({
+            "prompt": prompt,
+            "prompt_optimized": prompt,
+            "prompt_used": prompt,
+            "prompt_aifos_original": original,
+            "prompt_used_hash": hashlib.sha256(json.dumps(
+                prompt, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":")).encode("utf-8")).hexdigest(),
+        })
+    if isinstance(progress.get("selection"), dict):
+        item["selection"] = copy.deepcopy(progress["selection"])
+    elif not same_group:
+        item.pop("selection", None)
+    if not same_group:
+        item.pop("qc", None)
+        item.pop("output_uri", None)
+    return True
 
 
 def _production_progress(app, episode, render_plan):

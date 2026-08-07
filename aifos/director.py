@@ -6477,9 +6477,136 @@ class Director:
             action.get("action") == "drop_revision_base"
             for action in reference_actions(diagnostics))
 
+    @staticmethod
+    def _apply_tiered_qc_tolerances(qc_spec, verdict):
+        """Keep phone-visible hard facts hard without paying for pixel trivia.
+
+        The visual judge occasionally recognises a harmless detail correctly
+        but files it under ``critical_failures`` and also flips a legacy hard
+        boolean.  Episode 30 exposed two repeat offenders: a low block heel was
+        treated as a wardrobe break, and the base/reflection of an empty clear
+        tumbler was treated as a liquid level.  Those are advisory unless the
+        shot explicitly promotes that shoe/vessel to a story-critical prop.
+
+        This is deliberately narrow.  Identity, topology, handedness, a
+        plot-critical wrist marker, a plot-critical gaze target, impossible
+        contact/support and major camera/composition drift are never demoted.
+        """
+        verdict = copy.deepcopy(verdict or {})
+        policy = qc_spec.get("fidelity_policy") or {}
+        if (not isinstance(policy, dict)
+                or policy.get("schema") != "aifos.fidelity-tiers/v1"):
+            return verdict
+
+        failures = verdict.get("critical_failures") or []
+        if not isinstance(failures, list):
+            return verdict
+        critical_prop_names = {
+            str(value).strip().lower()
+            for value in (policy.get("critical_prop_names") or [])
+            if str(value).strip()
+        }
+
+        hard_relation_terms = (
+            "身份", "性别", "人数", "错人", "换脸", "左右手", "左手",
+            "右手", "镜像", "腕绳", "皮绳", "视线", "凝视", "目光",
+            "拓扑", "换房", "门窗", "墙体", "大型家具", "穿模", "悬浮",
+            "漂浮", "支撑", "接触", "反向", "方向错误", "不可能",
+            "identity", "gender", "count", "handedness", "wrist",
+            "gaze", "topology", "floating", "intersection",
+        )
+        footwear_terms = (
+            "鞋型", "鞋楦", "鞋跟", "低跟", "粗跟", "平底",
+            "heel profile", "low heel", "shoe shape",
+        )
+        footwear_major_terms = (
+            "缺失", "没穿", "赤脚", "颜色错误", "明显换色", "靴", "运动鞋",
+            "拖鞋", "高跟鞋", "剧情关键", "高价值", "物证", "身份标志",
+            "missing", "barefoot", "wrong color", "story-critical",
+        )
+        vessel_terms = (
+            "玻璃杯", "透明杯", "杯底", "空杯", "液面", "水位线", "杯内液体",
+            "反光", "折射", "clear glass", "tumbler", "liquid line",
+            "reflection", "refraction",
+        )
+        vessel_major_terms = (
+            "悬浮", "漂浮", "穿模", "打碎", "碎裂", "泼洒", "倒置",
+            "剧情关键", "高价值", "物证", "毒", "血", "药", "明显盛有",
+            "清楚盛有", "装满", "半杯", "可见液体体积", "有色液体",
+            "液体颜色",
+            "floating", "intersection", "shattered", "spill",
+            "story-critical",
+        )
+
+        def mentions_critical_prop(text):
+            lowered = text.lower()
+            return any(name in lowered for name in critical_prop_names)
+
+        demoted = []
+        kept = []
+        demoted_kinds = set()
+        for raw in failures:
+            issue = str(raw).strip()
+            lowered = issue.lower()
+            footwear_minor = (
+                any(term in lowered for term in footwear_terms)
+                and not any(term in lowered for term in footwear_major_terms)
+                and not mentions_critical_prop(lowered))
+            vessel_minor = (
+                any(term in lowered for term in vessel_terms)
+                and not any(term in lowered for term in vessel_major_terms)
+                and not any(term in lowered for term in hard_relation_terms)
+                and not mentions_critical_prop(lowered))
+            if footwear_minor or vessel_minor:
+                demoted.append(issue)
+                demoted_kinds.add(
+                    "footwear_profile" if footwear_minor
+                    else "transparent_vessel_optics")
+            else:
+                kept.append(raw)
+        if not demoted:
+            return verdict
+
+        advisory = verdict.get("advisory_issues") or []
+        if not isinstance(advisory, list):
+            advisory = [str(advisory)]
+        for issue in demoted:
+            rendered = "[建议·不影响通过]" + issue
+            if rendered not in advisory:
+                advisory.append(rendered)
+        verdict["critical_failures"] = kept
+        verdict["advisory_issues"] = advisory
+        verdict["fidelity_demotions"] = [
+            {"kind": kind, "reason": "非剧情关键且手机正常观看不明显"}
+            for kind in sorted(demoted_kinds)
+        ]
+
+        remaining = "；".join(str(value).lower() for value in kept)
+        if ("footwear_profile" in demoted_kinds
+                and not any(term in remaining for term in (
+                    "服装", "衣服", "裤", "裙", "鞋", "头饰", "妆发",
+                    "wardrobe", "outfit"))):
+            verdict["wardrobe_checked"] = True
+            verdict["wardrobe_match"] = True
+        if ("transparent_vessel_optics" in demoted_kinds
+                and not any(term in remaining for term in hard_relation_terms)):
+            verdict["physical_logic_checked"] = True
+            verdict["physical_logic_match"] = True
+            verdict["spatial_logic_checked"] = True
+            verdict["spatial_logic_match"] = True
+        if (not kept and all(
+                verdict.get(key) is not False for key in (
+                    "identity_match", "gender_match", "count_match",
+                    "overlay_count_match", "wardrobe_match",
+                    "physical_logic_match", "spatial_logic_match",
+                    "scene_topology_match", "camera_match"))):
+            verdict["technical_quality_pass"] = True
+        return verdict
+
     def _assess_image_qc(self, qc_spec, verdict, attempts):
         """Separate rendered-image truth from prompt/reference contract truth."""
-        verdict = verdict or {}
+        verdict = self._apply_tiered_qc_tolerances(
+            qc_spec, verdict or {})
 
         def checked_true(value):
             # 视觉模型偶尔返回字符串 "false"；Python 的 bool("false")
@@ -6581,6 +6708,23 @@ class Director:
         scene_topology_match = (
             not scene_topology_required
             or checked_true(verdict.get("scene_topology_match")))
+        # New judges explicitly separate a harmless adjacent crop from a
+        # narrative-breaking camera miss.  Keep old provider payloads
+        # backward compatible: only enforce these booleans when the judge
+        # actually returned the camera-contract fields.
+        camera_contract_reported = any(
+            key in verdict for key in (
+                "camera_checked", "camera_match", "camera_deviation"))
+        camera_checked = (
+            not camera_contract_reported
+            or checked_true(verdict.get("camera_checked")))
+        camera_deviation = str(
+            verdict.get("camera_deviation") or "none").strip().lower()
+        camera_match = (
+            not camera_contract_reported
+            or camera_deviation == "minor"
+            or (checked_true(verdict.get("camera_match"))
+                and camera_deviation != "major"))
         issues = [str(item) for item in (verdict.get("issues") or [])]
         critical_failures = [
             str(item) for item in (verdict.get("critical_failures") or [])
@@ -6631,6 +6775,13 @@ class Director:
             issues.append("质检未对照统一场景母图和相邻同场镜头核对空间拓扑")
         elif not scene_topology_match:
             issues.append("视频场景结构与统一母场景或相邻同场镜头不一致")
+        if not camera_checked:
+            issues.append("质检未核对本镜景别与叙事构图合同")
+        elif not camera_match:
+            issues.append("镜头景别/构图与合同存在普通观众可见的显著偏差")
+            if not critical_failures:
+                critical_failures.append(
+                    "镜头景别/构图显著偏离合同，关键叙事对象未按要求突出")
         issues = list(dict.fromkeys(issues))
         # 是否触发硬失败只认结构化核验字段，不能因为 issues 中出现
         # “人物形象轻微偏差”“提示词身份说明重复”等字样就误判重画。
@@ -6642,7 +6793,8 @@ class Director:
             or not overlay_checked or not overlay_match
             or not physical_checked or not physical_match
             or not spatial_checked or not spatial_match
-            or not scene_topology_checked or not scene_topology_match)
+            or not scene_topology_checked or not scene_topology_match
+            or not camera_checked or not camera_match)
         fidelity_policy = qc_spec.get("fidelity_policy")
         tiered_fidelity = bool(
             isinstance(fidelity_policy, dict)
@@ -6692,7 +6844,8 @@ class Director:
             and overlay_checked and overlay_match
             and physical_checked and physical_match
             and spatial_checked and spatial_match
-            and scene_topology_checked and scene_topology_match)
+            and scene_topology_checked and scene_topology_match
+            and camera_checked and camera_match)
         if tiered_fidelity:
             # The judge can dislike an allowed crop/overlap/detail variance
             # and still set its legacy visual_pass=false.  In the tiered
@@ -6757,6 +6910,9 @@ class Director:
             "scene_topology_checked": scene_topology_checked,
             "scene_topology_match": scene_topology_match,
             "scene_topology_required": scene_topology_required,
+            "camera_checked": camera_checked,
+            "camera_match": camera_match,
+            "camera_deviation": camera_deviation,
             "detected_count": detected_count,
             "detected_overlay_count": detected_overlay_count,
             "expected_overlay_count": qc_spec.get(
@@ -6767,6 +6923,8 @@ class Director:
             "advisory_issues": list(dict.fromkeys(advisory_issues)),
             "technical_quality_pass": technical_quality_pass,
             "fidelity_policy": copy.deepcopy(fidelity_policy or {}),
+            "fidelity_demotions": copy.deepcopy(
+                verdict.get("fidelity_demotions") or []),
             "identity_references": len(
                 qc_spec.get("identity_references") or []),
             "identity_checks": identity_checks,
@@ -7161,7 +7319,8 @@ class Director:
             snapshot, ensure_ascii=False, default=str))
 
     @staticmethod
-    def _candidate_best_provisional_snapshot(selected, score=None):
+    def _candidate_best_provisional_snapshot(
+            selected, score=None, source_payload=None):
         """Serialize the best candidate across completed rounds."""
         if selected is None or not getattr(selected, "uri", ""):
             return {}
@@ -7170,6 +7329,34 @@ class Director:
         selection = group.get("selection") or data.get("selection") or {}
         if score is None:
             score = selection.get("ranking_score") or 0.0
+        existing_provenance = data.get("_candidate_provenance") or {}
+        source_payload = (
+            source_payload if isinstance(source_payload, dict) else {})
+        provenance = {
+            "shot_no": existing_provenance.get(
+                "shot_no", source_payload.get("shot_no")),
+            "physical_scene_id": str(
+                existing_provenance.get("physical_scene_id")
+                or source_payload.get("physical_scene_id")
+                or source_payload.get("scene_id")
+                or source_payload.get("location")
+                or ""),
+            "canonical_scene_asset_id": existing_provenance.get(
+                "canonical_scene_asset_id",
+                source_payload.get("canonical_scene_asset_id")),
+            "canonical_scene_asset_version": existing_provenance.get(
+                "canonical_scene_asset_version",
+                source_payload.get("canonical_scene_asset_version")),
+            "canonical_scene_reference_uri": str(
+                existing_provenance.get("canonical_scene_reference_uri")
+                or source_payload.get("canonical_scene_reference_uri")
+                or source_payload.get("scene_ref")
+                or ""),
+            "canonical_scene_file_sha256": str(
+                existing_provenance.get("canonical_scene_file_sha256")
+                or source_payload.get("canonical_scene_file_sha256")
+                or ""),
+        }
         snapshot = {
             "schema": "aifos.shot-best-provisional/v1",
             "uri": str(getattr(selected, "uri", "") or ""),
@@ -7180,6 +7367,7 @@ class Director:
             "qc": copy.deepcopy(getattr(selected, "qc", None) or {}),
             "data": data,
             "ranking_score": float(score or 0.0),
+            "source_provenance": provenance,
         }
         return json.loads(json.dumps(
             snapshot, ensure_ascii=False, default=str))
@@ -7200,6 +7388,11 @@ class Director:
             score = float(snapshot.get("ranking_score") or 0.0)
         except (TypeError, ValueError):
             score = 0.0
+        data = copy.deepcopy(snapshot.get("data") or {})
+        provenance = copy.deepcopy(
+            snapshot.get("source_provenance") or {})
+        if provenance:
+            data["_candidate_provenance"] = provenance
         result = SimpleNamespace(
             provider=str(snapshot.get("provider") or ""),
             model=str(snapshot.get("model") or ""),
@@ -7207,9 +7400,342 @@ class Director:
             fallbacks=copy.deepcopy(snapshot.get("fallbacks") or []),
             uri=uri,
             qc=copy.deepcopy(snapshot.get("qc") or {}),
-            data=copy.deepcopy(snapshot.get("data") or {}),
+            data=data,
         )
         return result, score
+
+    @staticmethod
+    def _candidate_progress_prompt_fields(progress):
+        """Return the exact current-round prompt facts from live progress.
+
+        Old render plans stored the repaired prompt only inside the opaque
+        resume payload.  Keeping this compatibility lookup lets a paused run
+        promote its real round-6/7 contract instead of displaying (or later
+        reviving) the round-2 failure group's prompt.
+        """
+        progress = progress if isinstance(progress, dict) else {}
+        state = progress.get("resume_state") or {}
+        resume_payload = (
+            state.get("resume_payload")
+            if isinstance(state, dict) else {}) or {}
+        if not isinstance(resume_payload, dict):
+            resume_payload = {}
+        optimized = str(
+            progress.get("prompt_optimized")
+            or progress.get("prompt_used")
+            or progress.get("prompt")
+            or resume_payload.get("prompt_compact")
+            or resume_payload.get("prompt") or "").strip()
+        original = str(
+            progress.get("prompt_aifos_original")
+            or resume_payload.get("prompt_aifos_original")
+            or resume_payload.get("_reference_prompt_base")
+            or resume_payload.get("prompt")
+            or optimized).strip()
+        return {
+            "prompt": optimized,
+            "prompt_optimized": optimized,
+            "prompt_used": optimized,
+            "prompt_aifos_original": original,
+        }
+
+    @classmethod
+    def _promote_candidate_progress_item(
+            cls, item, progress, *, authoritative=False):
+        """Atomically make one live candidate round the plan's current view.
+
+        ``candidate_progress`` is the crash-safe checkpoint.  The former
+        implementation updated only that nested field while top-level prompt,
+        token/count and ``candidate_group`` kept describing an older failed
+        round.  UI, stop/resume and CAS actions then disagreed about which
+        four-up set was current.  Promote every current-round field together;
+        retain the displaced group only as immutable audit history.
+        """
+        if not isinstance(item, dict) or not isinstance(progress, dict):
+            return False
+        progress_id = str(progress.get("candidate_set_id") or "").strip()
+        progress_token = str(
+            progress.get("candidate_set_token") or "").strip()
+        if not progress_id or not progress_token:
+            return False
+        try:
+            progress_round = max(
+                1, int(progress.get("generation_round") or 1))
+            progress_revision = max(
+                1, int(progress.get("candidate_revision") or 1))
+        except (TypeError, ValueError):
+            return False
+
+        old_group = item.get("candidate_group") or {}
+        if not isinstance(old_group, dict):
+            old_group = {}
+        old_id = str(old_group.get("candidate_set_id") or "").strip()
+        old_token = str(
+            old_group.get("candidate_set_token")
+            or item.get("candidate_set_token") or "").strip()
+        try:
+            old_round = max(
+                0, int(old_group.get("generation_round") or 0))
+            old_revision = max(
+                0, int(old_group.get("candidate_revision") or 0))
+        except (TypeError, ValueError):
+            old_round = old_revision = 0
+
+        same_group = bool(
+            old_id == progress_id and old_token == progress_token)
+        if (not authoritative
+                and str(item.get("status") or "") in {"done", "reused"}
+                and old_group.get("complete") is True):
+            # The final promoted group carries the AI/manual selection that
+            # the last pre-promotion progress callback cannot yet know.
+            return False
+        active_status = str(item.get("status") or "") in {
+            "pending", "generating", "retrying", "technical_incomplete",
+            "failed",
+        }
+        newer = bool(
+            progress_round > old_round
+            or progress_revision > old_revision)
+        if (not authoritative and not same_group
+                and not (active_status and newer)):
+            return False
+
+        if old_group and not same_group and old_id != progress_id:
+            history = list(item.get("candidate_group_history") or [])
+            old_identity = (old_id, old_token)
+            already_archived = any(
+                isinstance(row, dict)
+                and (
+                    str(row.get("candidate_set_id") or ""),
+                    str(row.get("candidate_set_token") or ""),
+                ) == old_identity
+                for row in history)
+            if not already_archived:
+                retired = copy.deepcopy(old_group)
+                retired.update({
+                    "retired_at": now(),
+                    "retired_reason":
+                        "superseded_by_new_candidate_round",
+                    "replaced_by_candidate_set_id": progress_id,
+                    "replaced_by_candidate_set_token": progress_token,
+                    "render_qc": copy.deepcopy(item.get("qc")),
+                })
+                history.append(retired)
+                item["candidate_group_history"] = history
+
+        candidates = [
+            copy.deepcopy(row)
+            for row in (progress.get("candidates") or [])
+            if isinstance(row, dict)
+        ]
+        try:
+            candidate_count = int(progress.get("candidate_count")) \
+                if "candidate_count" in progress else len(candidates)
+        except (TypeError, ValueError):
+            candidate_count = len(candidates)
+        live_group = copy.deepcopy(progress)
+        live_group.pop("resume_state", None)
+        live_group["progress_schema"] = str(
+            live_group.get("schema") or "")
+        live_group["schema"] = "aifos.shot-candidate-group/v1"
+        live_group["live_progress"] = True
+        live_group["candidate_count"] = candidate_count
+        live_group["candidates"] = candidates
+        round_history = copy.deepcopy(
+            ((progress.get("resume_state") or {}).get("round_history")
+             if isinstance(progress.get("resume_state"), dict) else [])
+            or [])
+        if round_history:
+            live_group["candidate_round_history"] = round_history
+            item["candidate_round_history"] = copy.deepcopy(round_history)
+
+        item["candidate_progress"] = copy.deepcopy(progress)
+        item["candidate_group"] = live_group
+        item["candidate_set_id"] = progress_id
+        item["candidate_set_token"] = progress_token
+        item["candidate_revision"] = progress_revision
+        item["contract_revision"] = int(
+            progress.get("contract_revision") or 1)
+        item["candidate_count"] = candidate_count
+        item["candidate_uris"] = [
+            str(row.get("uri") or "") for row in candidates
+            if str(row.get("uri") or "")]
+        item["generation_round"] = progress_round
+        item["max_candidate_rounds"] = int(
+            progress.get("max_candidate_rounds") or 10)
+        item["candidate_completed_count"] = int(
+            progress.get("completed_count") or 0)
+        item["candidate_expected_count"] = int(
+            progress.get("expected_count") or 4)
+        item["candidate_generation_status"] = str(
+            progress.get("status") or "generating")
+        item["technical_incomplete"] = bool(
+            progress.get("technical_incomplete"))
+        item["selection_required"] = bool(
+            progress.get("selection_required"))
+        prompt_fields = cls._candidate_progress_prompt_fields(progress)
+        if prompt_fields["prompt"]:
+            item.update(prompt_fields)
+            item["prompt_used_hash"] = cls._stable_hash(
+                prompt_fields["prompt_used"])
+        if isinstance(progress.get("prompt_review"), dict):
+            item["prompt_review"] = copy.deepcopy(
+                progress["prompt_review"])
+        if isinstance(progress.get("reference_inputs"), dict):
+            item["reference_inputs"] = copy.deepcopy(
+                progress["reference_inputs"])
+        selection = progress.get("selection")
+        if isinstance(selection, dict) and selection:
+            item["selection"] = copy.deepcopy(selection)
+        elif not same_group:
+            item.pop("selection", None)
+            item.pop("manual_candidate_selection", None)
+        if not same_group:
+            # Old-round verdict/output stays inside the archived group and
+            # must not be rendered as the current round's diagnosis.
+            item.pop("qc", None)
+            item.pop("output_uri", None)
+        return True
+
+    def _reconcile_candidate_progress_plan(self, ctx):
+        """Repair durable stale plan rows before a paused image run resumes."""
+        changed = 0
+        with _PLAN_IO_LOCK:
+            plan = self._plan_read(ctx)
+            for item in plan.get("items") or []:
+                if item.get("category") != "shot_image":
+                    continue
+                if self._promote_candidate_progress_item(
+                        item, item.get("candidate_progress") or {}):
+                    changed += 1
+            if changed:
+                self._plan_write(ctx, plan)
+        return changed
+
+    @staticmethod
+    def _candidate_revision_base_uris(payload):
+        """Return all explicitly typed repair bases in a payload."""
+        matches = {
+            str(row.get("uri") or ""): row
+            for row in (payload or {}).get("asset_matches") or []
+            if isinstance(row, dict) and row.get("uri")}
+        return [
+            str(uri) for uri in (payload or {}).get("reference_images") or []
+            if str(uri) and (
+                str((matches.get(str(uri)) or {}).get(
+                    "reference_role") or "") == "revision_base"
+                or "待修改基底" in str(
+                    (matches.get(str(uri)) or {}).get("label") or ""))]
+
+    def _bind_candidate_revision_base(
+            self, payload, selected, *, generation_round, replace=True):
+        """Make one same-shot candidate the next round's actual edit base.
+
+        Cross-round ranking previously kept the winning failed image only as
+        audit metadata.  It never entered ``reference_images``, so every repair
+        round regenerated hands, gaze and blocking from scratch.  This binding
+        is deliberately replacement-only: one current-round base may survive,
+        and every older repair base is removed before the five-slot budget is
+        frozen.
+        """
+        if not isinstance(payload, dict) or selected is None:
+            return {"applied": False, "reason": "missing_payload_or_result"}
+        uri = str(getattr(selected, "uri", "") or "").strip()
+        if not uri:
+            return {"applied": False, "reason": "selected_uri_missing"}
+        data = getattr(selected, "data", None) or {}
+        group = data.get("candidate_group") or {}
+        candidates = group.get("candidates") or []
+        candidate = next((
+            row for row in candidates
+            if isinstance(row, dict) and str(row.get("uri") or "") == uri
+        ), None)
+        if candidate is None:
+            return {"applied": False, "reason": "uri_not_in_candidate_group"}
+
+        version = group.get("version") or {}
+        source_shot = version.get("shot_no")
+        target_shot = payload.get("shot_no")
+        if (source_shot not in (None, "") and target_shot not in (None, "")
+                and str(source_shot) != str(target_shot)):
+            return {"applied": False, "reason": "shot_mismatch"}
+        provenance = data.get("_candidate_provenance") or {}
+        target_scene = str(
+            payload.get("physical_scene_id") or payload.get("scene_id")
+            or payload.get("location") or "").strip()
+        source_scene = str(
+            provenance.get("physical_scene_id") or "").strip()
+        target_scene_uri = str(
+            payload.get("canonical_scene_reference_uri")
+            or payload.get("scene_ref") or "").strip()
+        source_scene_uri = str(
+            provenance.get("canonical_scene_reference_uri") or "").strip()
+        target_scene_asset = payload.get("canonical_scene_asset_id")
+        source_scene_asset = provenance.get("canonical_scene_asset_id")
+        if (source_scene and target_scene and source_scene != target_scene):
+            return {"applied": False, "reason": "scene_mismatch"}
+        if (source_scene_uri and target_scene_uri
+                and source_scene_uri != target_scene_uri):
+            return {"applied": False, "reason": "scene_reference_mismatch"}
+        if (source_scene_asset not in (None, "")
+                and target_scene_asset not in (None, "")
+                and str(source_scene_asset) != str(target_scene_asset)):
+            return {"applied": False, "reason": "scene_asset_mismatch"}
+
+        old_bases = set(self._candidate_revision_base_uris(payload))
+        if old_bases and not replace and uri not in old_bases:
+            return {"applied": False, "reason": "revision_base_exists"}
+        references = [
+            str(value) for value in payload.get("reference_images") or []
+            if str(value) and str(value) not in old_bases and str(value) != uri]
+        payload["reference_images"] = [uri, *references]
+        matches = [
+            row for row in payload.get("asset_matches") or []
+            if not isinstance(row, dict)
+            or (str(row.get("uri") or "") not in old_bases
+                and str(row.get("uri") or "") != uri
+                and str(row.get("reference_role") or "")
+                != "revision_base")]
+        matches.append({
+            "asset_id": None,
+            "kind": "candidate_revision_base",
+            "name": f"candidate_round_{generation_round}_best_failed",
+            "label": "上一轮相对最优失败图（待修改基底）",
+            "uri": uri,
+            "reference_role": "revision_base",
+            "mandatory": True,
+            "scene_id": target_scene,
+            "shot_no": target_shot,
+            "source_candidate_set_id": str(
+                group.get("candidate_set_id") or ""),
+            "source_candidate_index": candidate.get("candidate_index"),
+            "source_generation_round": int(generation_round or 0),
+            "canonical_scene_asset_id": target_scene_asset,
+            "canonical_scene_asset_version": payload.get(
+                "canonical_scene_asset_version"),
+            "canonical_scene_reference_uri": target_scene_uri,
+            "canonical_scene_file_sha256": str(
+                payload.get("canonical_scene_file_sha256") or ""),
+        })
+        payload["asset_matches"] = matches
+        payload["source_qc_uri"] = uri
+        payload["revision_mode"] = "candidate_best_targeted_repair"
+        payload["candidate_revision_base"] = {
+            "schema": "aifos.candidate-revision-base/v1",
+            "uri": uri,
+            "source_generation_round": int(generation_round or 0),
+            "source_candidate_set_id": str(
+                group.get("candidate_set_id") or ""),
+            "source_candidate_index": candidate.get("candidate_index"),
+            "physical_scene_id": target_scene,
+            "canonical_scene_reference_uri": target_scene_uri,
+        }
+        return {
+            "applied": True,
+            "uri": uri,
+            "replaced": sorted(old_bases - {uri}),
+            "source_candidate_index": candidate.get("candidate_index"),
+        }
 
     @classmethod
     def _candidate_payload_from_resume_progress(
@@ -7424,6 +7950,19 @@ class Director:
             "frozen_prompt_hash": frozen_prompt_hash,
             "frozen_reference_hash": frozen_reference_hash,
             "frozen_input_hash": frozen_input_hash,
+            # Current-round UI/audit fields travel in the same locked update
+            # as the candidate token.  They must never lag behind in a prior
+            # failed group's top-level render-plan fields.
+            "prompt": frozen_input["prompt"],
+            "prompt_optimized": frozen_input["prompt"],
+            "prompt_used": frozen_input["prompt"],
+            "prompt_aifos_original": str(
+                working_payload.get("prompt_aifos_original")
+                or working_payload.get("_reference_prompt_base")
+                or working_payload.get("prompt") or ""),
+            "prompt_review": copy.deepcopy(
+                working_payload.get("prompt_review") or {}),
+            "reference_inputs": self._reference_inputs(working_payload),
             "complete": False,
             "technical_incomplete": False,
         }
@@ -8948,6 +9487,22 @@ class Director:
         initial_group = None
 
         while generation_round <= max_rounds:
+            # Migrate old in-flight checkpoints as well: prior builds persisted
+            # the best failed candidate snapshot but never attached it.  If an
+            # exact repaired payload already carries a base, leave it intact;
+            # otherwise bind the persisted same-shot winner before this round's
+            # resume contract is frozen.
+            if (generation_round > 1 and best_provisional is not None
+                    and not self._candidate_revision_base_uris(
+                        candidate_payload)):
+                restored_binding = self._bind_candidate_revision_base(
+                    candidate_payload, best_provisional,
+                    generation_round=generation_round - 1,
+                    replace=False)
+                if restored_binding.get("applied"):
+                    candidate_payload["candidate_revision_base_binding"] = \
+                        restored_binding
+                    self._attach_reference_manifest(candidate_payload)
             candidate_payload["_candidate_generation_round"] = \
                 generation_round
             candidate_payload["_max_candidate_rounds"] = max_rounds
@@ -8959,7 +9514,8 @@ class Director:
             candidate_payload["_candidate_round_history"] = copy.deepcopy(
                 round_history)
             best_snapshot = self._candidate_best_provisional_snapshot(
-                best_provisional, best_provisional_score)
+                best_provisional, best_provisional_score,
+                source_payload=candidate_payload)
             if best_snapshot:
                 candidate_payload["_candidate_best_provisional"] = \
                     best_snapshot
@@ -9058,7 +9614,8 @@ class Director:
                 best_provisional = promoted
                 best_provisional_score = provisional_score
             best_snapshot = self._candidate_best_provisional_snapshot(
-                best_provisional, best_provisional_score)
+                best_provisional, best_provisional_score,
+                source_payload=candidate_payload)
             if best_snapshot:
                 candidate_payload["_candidate_best_provisional"] = \
                     best_snapshot
@@ -9237,6 +9794,11 @@ class Director:
             if applied["applied"]:
                 repair_payload["qc_reference_changes"] = copy.deepcopy(
                     applied)
+            base_binding = self._bind_candidate_revision_base(
+                repair_payload, promoted,
+                generation_round=generation_round, replace=True)
+            repair_payload["candidate_revision_base_binding"] = \
+                copy.deepcopy(base_binding)
             self._attach_reference_manifest(repair_payload)
             next_input = self._image_generation_input(
                 repair_payload, qc_spec=repair_qc_spec)
@@ -10359,19 +10921,8 @@ class Director:
                         item.pop("manual_candidate_selection", None)
                         manual = None
 
-                item.update({
-                    "candidate_progress": progress,
-                    "generation_round": int(
-                        progress.get("generation_round") or 1),
-                    "max_candidate_rounds": int(
-                        progress.get("max_candidate_rounds")
-                        or self._shot_max_candidate_rounds()),
-                    "candidate_completed_count": int(
-                        progress.get("completed_count") or 0),
-                    "candidate_expected_count": int(
-                        progress.get("expected_count")
-                        or self._shot_candidate_count()),
-                })
+                self._promote_candidate_progress_item(
+                    item, progress, authoritative=True)
                 self._plan_write(ctx, plan)
                 return copy.deepcopy(manual) \
                     if isinstance(manual, dict) else None
@@ -10557,7 +11108,6 @@ class Director:
                     self._plan_mark(
                         ctx, task["item_id"], "pending",
                         extra={
-                            **self._plan_done_extra(result),
                             "autonomous_repair_seeded": True,
                             "codex_contract_repair_count": int(
                                 task["payload"].get(
@@ -18868,45 +19418,104 @@ class Director:
         # before props, detail sheets or continuity conveniences.
         add(payload.get("scene_ref"))
 
-        # Only identity + room are truly non-negotiable.  A three-person frame
-        # already consumes four of the provider's five slots; in that case the
-        # current keyframe wins the final slot and the adjacent tail is omitted
-        # instead of stopping the entire episode.  The keyframe itself was
-        # produced through the dependency wavefront and already carries the
-        # preceding visual state.
-        hard_count = len(selected)
-        if hard_count > IMAGE_REFERENCE_LIMIT:
-            raise AifosError(
-                f"人物身份与统一场景共需 {hard_count} 张参考图，"
-                f"超过 Codex imagegen 硬上限 {IMAGE_REFERENCE_LIMIT} 张；"
-                "请拆分五人以上群像镜头，禁止静默丢弃场景或人物身份")
-
         matches = {
             str(row.get("uri") or ""): row
             for row in (payload.get("asset_matches") or [])
             if isinstance(row, dict) and row.get("uri")}
+        target_scene = str(
+            payload.get("physical_scene_id") or payload.get("scene_id")
+            or payload.get("location") or "").strip()
+        target_scene_uri = str(
+            payload.get("canonical_scene_reference_uri")
+            or payload.get("scene_ref") or "").strip()
+        target_scene_asset = payload.get("canonical_scene_asset_id")
         revision_bases = []
+        typed_revision_bases = []
         for uri in payload.get("reference_images") or []:
             match = matches.get(str(uri)) or {}
-            if (str(match.get("reference_role") or "")
-                    == "revision_base"
-                    or "待修改基底" in str(match.get("label") or "")):
-                revision_bases.append(uri)
+            is_revision_base = (
+                str(match.get("reference_role") or "") == "revision_base"
+                or "待修改基底" in str(match.get("label") or ""))
+            if not is_revision_base:
+                continue
+            typed_revision_bases.append(str(uri))
+            source_scene = str(match.get("scene_id") or "").strip()
+            source_scene_uri = str(
+                match.get("canonical_scene_reference_uri") or "").strip()
+            source_scene_asset = match.get("canonical_scene_asset_id")
+            source_shot = match.get("shot_no")
+            target_shot = payload.get("shot_no")
+            incompatible = (
+                bool(source_scene and target_scene
+                     and source_scene != target_scene)
+                or bool(source_scene_uri and target_scene_uri
+                        and source_scene_uri != target_scene_uri)
+                or bool(source_scene_asset not in (None, "")
+                        and target_scene_asset not in (None, "")
+                        and str(source_scene_asset)
+                        != str(target_scene_asset))
+                or bool(source_shot not in (None, "")
+                        and target_shot not in (None, "")
+                        and str(source_shot) != str(target_shot)))
+            if incompatible:
+                continue
+            revision_bases.append(uri)
+        # A repair request has exactly one edit base.  Newest binding is placed
+        # first by _bind_candidate_revision_base; duplicate/stale bases must not
+        # consume attachment slots or import pixels from an older scene.
+        revision_bases = list(dict.fromkeys(revision_bases))[:1]
+        kept_revision_bases = set(str(uri) for uri in revision_bases)
+        rejected_revision_bases = set(typed_revision_bases) \
+            - kept_revision_bases
+        if rejected_revision_bases:
+            payload["reference_images"] = [
+                uri for uri in payload.get("reference_images") or []
+                if str(uri) not in rejected_revision_bases]
+            payload["asset_matches"] = [
+                row for row in payload.get("asset_matches") or []
+                if not isinstance(row, dict)
+                or str(row.get("uri") or "")
+                not in rejected_revision_bases]
+            for uri in rejected_revision_bases:
+                matches.pop(uri, None)
         for uri in revision_bases:
             add(uri)
 
-        # Boundary/continuity pixels are stronger than prose for frame chains.
-        for key in ("keyframe_reference_uri", "image_uri",
-                    "keyframe_last_uri", "chain_first_uri"):
-            add(payload.get(key))
+        # Identity + canonical room + one repair base are hard requirements.
+        # If those alone exceed the provider contract there is no honest
+        # five-image selection: silently dropping any one of them causes face
+        # drift, scene drift, or another from-scratch repair.
+        hard_count = len(selected)
+        if hard_count > IMAGE_REFERENCE_LIMIT:
+            raise AifosError(
+                f"人物身份、统一场景与待修改基底共需 {hard_count} 张参考图，"
+                f"超过 Codex imagegen 硬上限 {IMAGE_REFERENCE_LIMIT} 张；"
+                "请拆分多人群像镜头，禁止静默丢弃人物、场景或返修基底")
 
-        # Fill remaining slots in quality order.  A keyframe already carries
-        # blocking/props, so frame generation naturally leaves those optional
-        # aids behind when identity + room + adjacent boundaries occupy five.
-        add(payload.get("spatial_ref"))
-        add(payload.get("inner_persona_ref"))
-        for uri in payload.get("prop_refs") or []:
-            add(uri)
+        if revision_bases:
+            # The failed image already carries the preceding composition,
+            # wardrobe and prop pixels.  Under the five-slot cap, preserve the
+            # editable base and use the remaining slot for physical blocking;
+            # core props come next, then old boundary frames.  This deterministic
+            # order prevents optional detail/style images from evicting the
+            # actual repair target.
+            add(payload.get("spatial_ref"))
+            for uri in payload.get("prop_refs") or []:
+                add(uri)
+            for key in ("keyframe_reference_uri", "image_uri",
+                        "keyframe_last_uri", "chain_first_uri"):
+                add(payload.get(key))
+            add(payload.get("inner_persona_ref"))
+        else:
+            # Boundary/continuity pixels are stronger than prose for normal
+            # frame chains that do not have a targeted edit base.
+            for key in ("keyframe_reference_uri", "image_uri",
+                        "keyframe_last_uri", "chain_first_uri"):
+                add(payload.get(key))
+            add(payload.get("spatial_ref"))
+            add(payload.get("inner_persona_ref"))
+            for uri in payload.get("prop_refs") or []:
+                add(uri)
         for row in payload.get("headwear_references") or []:
             if isinstance(row, dict):
                 add(row.get("uri"))
@@ -18966,6 +19575,13 @@ class Director:
             "scene_anchor_preserved": bool(
                 payload.get("scene_ref")
                 and str(payload.get("scene_ref")) in chosen_set),
+            "revision_base_preserved": bool(
+                revision_bases
+                and str(revision_bases[0]) in chosen_set),
+            "selection_policy": (
+                "identity_scene_revision_spatial_prop_continuity"
+                if revision_bases else
+                "identity_scene_continuity_spatial_prop"),
         }
 
     def _attach_reference_manifest(self, payload):
@@ -19448,6 +20064,9 @@ class Director:
                 "显著纹饰端头一致",
                 "核心道具的类别、持有人、可见/隐藏状态与剧情阶段",
                 "关键动作因果、人物左右/轴线、真实接触和重力支撑",
+                "剧情指定的关键视线落点、左右手分工、关键腕绳/标记所在腕侧",
+                "显著景别或叙事构图偏差：局部近景被画成全身宽景，或关键"
+                "脸、手、腕绳、物证因主体过小而失去可读性",
                 "剧情必需文字白名单、时代与无字幕/Logo/水印",
             ] + (["本镜核心道具:" + "、".join(critical_props)]
                  if critical_props else []),
@@ -19455,6 +20074,9 @@ class Director:
                 "相邻景别内的轻微取景差、精确焦段数字、主体重心小偏移",
                 "前后错位或遮挡量的轻微差别、非关键手势/视线/表情幅度",
                 "不改变剧情含义的道具厘米级尺寸、折痕、摆放角度与材质细差",
+                "非剧情关键鞋履的鞋楦、鞋头及平底与低矮粗跟等鞋型细差",
+                "非剧情关键透明杯的杯底/桌面反光、折射或疑似液面；只有"
+                "清楚可见的液体体积与真实水位才算状态证据",
             ],
             "creative": [
                 "衣褶、发丝、皮肤微纹理、尘雾、次级光斑",
@@ -19467,6 +20089,13 @@ class Director:
             "camera_precedence": (
                 "景别观感、机位侧别、固定/运动和不越轴优先；"
                 "焦段数字、精确裁切与重叠比例只作实现参考"),
+            "critical_prop_names": critical_props,
+            "detail_tolerance": {
+                "footwear_profile": "advisory_unless_story_critical",
+                "transparent_vessel_optics":
+                    "advisory_unless_story_critical",
+                "major_camera_or_composition_drift": "critical",
+            },
         }
         return spec
 
@@ -19522,6 +20151,11 @@ class Director:
         return written
 
     def _stage_images(self, ctx):
+        # A stopped older worker may have durably checkpointed the newest
+        # repaired round only in candidate_progress while the primary plan
+        # fields still point at an earlier failure group.  Reconcile first so
+        # resume selection and UI both start from the same current CAS token.
+        self._reconcile_candidate_progress_plan(ctx)
         # Capture failure/QC evidence before _plan_seed_shots refreshes items.
         # A repaired storyboard changes content_hash by design; seeding may
         # reset the current item to pending, but the Codex diagnosis from the
